@@ -1,0 +1,16 @@
+build/
+build-*/
+out/
+.cache/
+.vscode/
+.idea/
+.git/
+*.o
+*.so
+*.a
+compile_commands.json
+.DS_Store
+doc/
+README.md
+CLAUDE.md
+.mcp.json

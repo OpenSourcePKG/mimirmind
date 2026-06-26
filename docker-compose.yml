@@ -1,0 +1,99 @@
+# Mimirmind — Docker-only dev + runtime.
+#
+# Goal: the developer machine stays free of Intel SDK packages. All build
+# and run happens inside containers; only the source lives on the host.
+#
+# Workflows
+# ---------
+#
+#   # Build the binary (toolchain in container, source from host, artefacts
+#   # written into ./build on the host):
+#   docker compose run --rm builder
+#
+#   # Interactive shell in the build toolchain:
+#   docker compose run --rm builder bash
+#
+#   # Build the runtime image (multi-stage, fully reproducible, no host
+#   # ./build needed):
+#   docker compose build mimirmind
+#
+#   # Run the M1 smoke test out of the runtime image:
+#   docker compose run --rm mimirmind
+#
+# The GPU pass-through (/dev/dri + group_add 44/104) is set on both
+# services so the builder can also run a quick post-build verification
+# against the local iGPU if one is present.
+
+services:
+
+    # ------------------------------------------------------------------
+    # builder — toolchain image. Source is bind-mounted from host.
+    #           Use this for iterative dev: edit source on host, rebuild
+    #           in container, binary lands in ./build on host.
+    # ------------------------------------------------------------------
+    builder:
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: builder
+        image: mimirmind:builder
+        container_name: mimirmind-builder
+
+        # iGPU access (optional for the builder — only needed if you want
+        # to run the freshly built binary inside this same container).
+        devices:
+            - /dev/dri:/dev/dri
+        group_add:
+            - "44"     # video
+            - "104"   # render
+
+        environment:
+            UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
+            UR_L0_USE_RELAXED_ALLOCATION_LIMITS: "1"
+            BUILD_TYPE: ${BUILD_TYPE:-Release}
+
+        volumes:
+            # Host source tree, read-write so cmake can populate ./build
+            - ./:/src
+
+        working_dir: /src
+
+        # No restart — one-shot builds
+        restart: "no"
+        stdin_open: true
+        tty: true
+
+    # ------------------------------------------------------------------
+    # mimirmind — runtime image. Binary baked in via multi-stage build.
+    #             No source, no toolchain, ~250 MB image.
+    # ------------------------------------------------------------------
+    mimirmind:
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: runtime
+        image: mimirmind:dev
+        container_name: mimirmind
+
+        devices:
+            - /dev/dri:/dev/dri
+        group_add:
+            - "44"     # video
+            - "104"   # render
+
+        environment:
+            UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
+            UR_L0_USE_RELAXED_ALLOCATION_LIMITS: "1"
+
+        # Models live on the host — read-only mount.
+        # Symlink / bind ./models to wherever the GGUFs actually sit.
+        volumes:
+            - ./models:/models:ro
+
+        # M7+ — OpenAI-compatible HTTP API
+        # ports:
+        #     - "8090:8090"
+
+        restart: "no"
+        stdin_open: true
+        tty: true

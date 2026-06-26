@@ -1,0 +1,12 @@
+build/
+build-*/
+out/
+.cache/
+.vscode/
+.idea/
+*.o
+*.so
+*.a
+compile_commands.json
+.DS_Store
+models/
