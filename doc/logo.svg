@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Mimirmind">
+  <title>Mimirmind</title>
+  <desc>The preserved head of Mimir within a runic medallion — Norse-themed inference engine logo.</desc>
+
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="65%">
+      <stop offset="0%"   stop-color="#1A2A4A"/>
+      <stop offset="100%" stop-color="#06091A"/>
+    </radialGradient>
+
+    <linearGradient id="bronze" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"   stop-color="#E8B968"/>
+      <stop offset="50%"  stop-color="#C8923D"/>
+      <stop offset="100%" stop-color="#8C5E20"/>
+    </linearGradient>
+
+    <radialGradient id="aura" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"   stop-color="#E8B968" stop-opacity="0.20"/>
+      <stop offset="100%" stop-color="#E8B968" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Medallion -->
+  <circle cx="128" cy="128" r="122" fill="url(#bg)" stroke="url(#bronze)" stroke-width="3"/>
+  <circle cx="128" cy="128" r="110" fill="none"     stroke="url(#bronze)" stroke-width="0.8" opacity="0.55"/>
+
+  <!-- Cardinal runic marks -->
+  <g stroke="url(#bronze)" stroke-width="2" stroke-linecap="round" fill="none">
+    <!-- top: Ansuz-like (knowledge / divine breath) -->
+    <line x1="128" y1="18" x2="128" y2="32"/>
+    <line x1="128" y1="22" x2="134" y2="26"/>
+    <line x1="128" y1="27" x2="134" y2="31"/>
+    <!-- right: arrow inward (sight) -->
+    <line x1="238" y1="128" x2="222" y2="128"/>
+    <line x1="232" y1="122" x2="222" y2="128"/>
+    <line x1="232" y1="134" x2="222" y2="128"/>
+    <!-- left: arrow inward (sight) -->
+    <line x1="18"  y1="128" x2="34"  y2="128"/>
+    <line x1="24"  y1="122" x2="34"  y2="128"/>
+    <line x1="24"  y1="134" x2="34"  y2="128"/>
+  </g>
+  <!-- bottom: a sealed dot -->
+  <circle cx="128" cy="238" r="3" fill="url(#bronze)"/>
+
+  <!-- Filler dots between cardinal marks -->
+  <g fill="url(#bronze)" opacity="0.75">
+    <circle cx="80"  cy="34"  r="1.8"/>
+    <circle cx="176" cy="34"  r="1.8"/>
+    <circle cx="220" cy="80"  r="1.8"/>
+    <circle cx="220" cy="176" r="1.8"/>
+    <circle cx="176" cy="222" r="1.8"/>
+    <circle cx="80"  cy="222" r="1.8"/>
+    <circle cx="36"  cy="176" r="1.8"/>
+    <circle cx="36"  cy="80"  r="1.8"/>
+  </g>
+
+  <!-- Soft aura behind the head -->
+  <circle cx="128" cy="120" r="80" fill="url(#aura)"/>
+
+  <!-- Skull / forehead -->
+  <ellipse cx="128" cy="104" rx="42" ry="40" fill="url(#bronze)"/>
+
+  <!-- Beard: flowing triangular fan -->
+  <path d="
+    M 96 122
+    Q 92 140 96 156
+    L 100 170
+    L 108 186
+    L 120 198
+    L 128 204
+    L 136 198
+    L 148 186
+    L 156 170
+    L 160 156
+    Q 164 140 160 122
+    Z" fill="url(#bronze)"/>
+
+  <!-- Mustache strip (bridge between face and beard) -->
+  <rect x="96" y="120" width="64" height="6" fill="url(#bronze)"/>
+
+  <!-- Closed eyes — wisdom inward -->
+  <g stroke="#06091A" stroke-width="3" stroke-linecap="round">
+    <line x1="108" y1="100" x2="120" y2="100"/>
+    <line x1="136" y1="100" x2="148" y2="100"/>
+  </g>
+
+  <!-- Brow lines -->
+  <g stroke="#5A3D14" stroke-width="2" stroke-linecap="round" fill="none">
+    <path d="M 106 92 Q 114 88 122 92"/>
+    <path d="M 134 92 Q 142 88 150 92"/>
+  </g>
+
+  <!-- Third-eye / mind marker on the forehead (the "mind" in mimirmind) -->
+  <circle cx="128" cy="84" r="3.4" fill="#1A2A4A" stroke="url(#bronze)" stroke-width="1.6"/>
+</svg>
