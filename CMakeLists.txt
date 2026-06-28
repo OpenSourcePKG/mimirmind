@@ -64,8 +64,11 @@ message(STATUS "Level Zero library: ${LEVEL_ZERO_LIBRARY}")
 
 add_executable(mimirmind
     src/main.cpp
+    src/model/GgufReader.cpp
+    src/model/GgufTypes.cpp
     src/runtime/L0Context.cpp
     src/runtime/Log.cpp
+    src/runtime/MappedFile.cpp
     src/runtime/UsmAllocator.cpp
 )
 

@@ -50,6 +50,9 @@ services:
         environment:
             UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
             UR_L0_USE_RELAXED_ALLOCATION_LIMITS: "1"
+            MIMIRMIND_LOG_LEVEL: ${MIMIRMIND_LOG_LEVEL:-info}
+            MIMIRMIND_LOG_FILE:  ${MIMIRMIND_LOG_FILE:-}
+            MIMIRMIND_MODEL_PATH: ${MIMIRMIND_MODEL_PATH:-}
             BUILD_TYPE: ${BUILD_TYPE:-Release}
 
         volumes:
@@ -84,6 +87,9 @@ services:
         environment:
             UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
             UR_L0_USE_RELAXED_ALLOCATION_LIMITS: "1"
+            MIMIRMIND_LOG_LEVEL: ${MIMIRMIND_LOG_LEVEL:-info}
+            MIMIRMIND_LOG_FILE:  ${MIMIRMIND_LOG_FILE:-}
+            MIMIRMIND_MODEL_PATH: ${MIMIRMIND_MODEL_PATH:-}
 
         # Models live on the host — read-only mount.
         # Symlink / bind ./models to wherever the GGUFs actually sit.
