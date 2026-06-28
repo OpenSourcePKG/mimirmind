@@ -98,11 +98,21 @@ MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
 void MappedFile::close() noexcept {
     if (_data != nullptr) {
         MM_LOG_DEBUG("mmap", "munmap({} bytes) for {}", _size, _path);
+        // Hint the kernel that we don't need these pages cached anymore.
+        // Without this, even after munmap the file pages linger in the
+        // page cache (counted as buff/cache by free/top) until memory
+        // pressure forces eviction. On a 6.5 GiB-USM-resident process
+        // this shows up as ~4 GiB phantom "used" memory.
+        ::madvise(_data, _size, MADV_DONTNEED);
         ::munmap(_data, _size);
         _data = nullptr;
         _size = 0;
     }
     if (_fd >= 0) {
+        // Same hint at the fd level — POSIX_FADV_DONTNEED on (0, 0)
+        // means the whole file. Best-effort; some filesystems ignore it
+        // (tmpfs in particular) but ext4 / xfs respect it.
+        ::posix_fadvise(_fd, 0, 0, POSIX_FADV_DONTNEED);
         ::close(_fd);
         _fd = -1;
     }
