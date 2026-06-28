@@ -66,6 +66,8 @@ add_executable(mimirmind
     src/main.cpp
     src/model/GgufReader.cpp
     src/model/GgufTypes.cpp
+    src/model/LlmConfig.cpp
+    src/model/Tokenizer.cpp
     src/runtime/L0Context.cpp
     src/runtime/Log.cpp
     src/runtime/MappedFile.cpp

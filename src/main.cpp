@@ -1,4 +1,6 @@
 #include "model/GgufReader.hpp"
+#include "model/LlmConfig.hpp"
+#include "model/Tokenizer.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
 #include "runtime/UsmAllocator.hpp"
@@ -217,6 +219,60 @@ int main() {
                           << "  elems=" << t.nelements
                           << "  bytes=" << formatBytes(t.nbytes) << "\n";
             }
+
+            // --- [M3b] LlmConfig + Tokenizer ----------------------------
+
+            mimirmind::model::LlmConfig config;
+            config.parseFromGguf(reader);
+
+            std::cout << "  config:\n";
+            std::cout << "    architecture     : " << config.architecture << "\n";
+            std::cout << "    blocks           : " << config.blockCount << "\n";
+            std::cout << "    context_length   : " << config.contextLength << "\n";
+            std::cout << "    embedding_length : " << config.embeddingLength << "\n";
+            std::cout << "    ffn_length       : " << config.feedForwardLength << "\n";
+            std::cout << "    heads            : " << config.headCount
+                      << " (kv " << config.headCountKv
+                      << ", head_dim " << config.headDim() << ")\n";
+            std::cout << "    rope_freq_base   : " << config.ropeFreqBase << "\n";
+            std::cout << "    rms_norm_eps     : " << config.rmsNormEps << "\n";
+            if (config.slidingWindow > 0) {
+                std::cout << "    sliding_window   : " << config.slidingWindow << "\n";
+            }
+
+            mimirmind::model::Tokenizer tok;
+            tok.loadFromGguf(reader);
+
+            std::cout << "  tokenizer:\n";
+            std::cout << "    model      : " << tok.modelType() << "\n";
+            std::cout << "    vocab_size : " << tok.vocabSize() << "\n";
+            std::cout << "    bos/eos    : " << tok.bosId() << " / " << tok.eosId() << "\n";
+            std::cout << "    unk/pad    : " << tok.unknownId() << " / " << tok.padId() << "\n";
+
+            const std::string sample = "Hello, world!";
+            const auto ids = tok.encode(sample, true);
+            std::cout << "    encode('" << sample << "') = [";
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                if (i > 0) {
+                    std::cout << ", ";
+                }
+                std::cout << ids[i];
+            }
+            std::cout << "] (" << ids.size() << " tokens)\n";
+
+            std::cout << "    pieces     = [";
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                if (i > 0) {
+                    std::cout << ", ";
+                }
+                std::cout << "'" << tok.tokenText(ids[i]) << "'";
+            }
+            std::cout << "]\n";
+
+            const std::string round = tok.decode(ids, true);
+            std::cout << "    decode     = '" << round << "'\n";
+
+            // --- [M3c] Tensor payload load --------------------------------
 
             MM_LOG_INFO("main", "[M3] loading tensors into USM");
             reader.loadTensors(allocator);
