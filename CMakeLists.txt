@@ -89,10 +89,15 @@ foreach(src IN LISTS KERNEL_SOURCES)
     set(spv ${SPV_OUTPUT_DIR}/${kname}.spv)
     add_custom_command(
         OUTPUT ${spv}
+        # ocloc -spv_only writes <name>_<device>.spv by default; without
+        # -device the suffix is just "_" so we'd get rmsnorm_.spv.
+        # -output_no_suffix drops that, but it still uses the input file's
+        # basename — exactly what we want.
         COMMAND ${OCLOC_EXECUTABLE} compile
                 -file ${CMAKE_CURRENT_SOURCE_DIR}/${src}
                 -options "-cl-std=CL3.0"
                 -spv_only
+                -output_no_suffix
                 -out_dir ${SPV_OUTPUT_DIR}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${src}
         WORKING_DIRECTORY ${SPV_OUTPUT_DIR}
