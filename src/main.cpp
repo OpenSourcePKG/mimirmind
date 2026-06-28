@@ -8,6 +8,9 @@
 #include "model/LlmConfig.hpp"
 #include "model/Tokenizer.hpp"
 #include "model/WeightsMap.hpp"
+#include "runtime/CommandQueue.hpp"
+#include "runtime/GpuKernel.hpp"
+#include "runtime/GpuModule.hpp"
 #include "runtime/KvCache.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
@@ -34,7 +37,7 @@ namespace {
 constexpr const char* kBanner =
     "+------------------------------------------------------------+\n"
     "|                          Mimirmind                         |\n"
-    "|   smoke: M1-M3 + M4 prefill + M4e autoregressive (CPU)     |\n"
+    "|  smoke: M1-M4 (CPU forward) + M5 GPU RMSNorm (Envoy boot)  |\n"
     "+------------------------------------------------------------+\n";
 
 std::string formatBytes(std::size_t bytes) {
@@ -380,6 +383,97 @@ int main() {
         std::cout << "  peak live bytes   : " << formatBytes(st.peakBytes) << "\n";
         std::cout << "  live at end       : " << st.liveAllocations
                   << " allocs / " << formatBytes(st.liveBytes) << "\n";
+
+        // --- [M5] GPU RMSNorm kernel — parity vs CPU ------------------------
+
+        std::cout << "\n[M5] GPU RMSNorm kernel (SPIR-V via Level Zero)\n";
+        std::cout.flush();
+        MM_LOG_INFO("main", "[M5] starting GPU RMSNorm parity test");
+        try {
+            mimirmind::runtime::GpuModule modRms{ctx, "rmsnorm"};
+            mimirmind::runtime::GpuKernel knRms{modRms.kernel("rmsnorm")};
+            mimirmind::runtime::CommandQueue queue{ctx};
+
+            // Single row of length K = 3584 (Qwen2.5-7B d_model). Same K
+            // we will actually use during forward — exercises the same
+            // workgroup layout.
+            constexpr std::uint32_t kLocalSize = 128;
+            constexpr int           kK         = 3584;
+            const std::size_t       bytesK     = static_cast<std::size_t>(kK) * sizeof(float);
+
+            void* xUsm = allocator.allocate(bytesK);
+            void* wUsm = allocator.allocate(bytesK);
+            void* yUsm = allocator.allocate(bytesK);
+
+            float* x = static_cast<float*>(xUsm);
+            float* w = static_cast<float*>(wUsm);
+            for (int i = 0; i < kK; ++i) {
+                // Bounded pseudo-random; deterministic across runs.
+                x[i] = std::sin(static_cast<float>(i) * 0.013F) * 0.5F;
+                w[i] = 1.0F + std::cos(static_cast<float>(i) * 0.007F) * 0.1F;
+            }
+
+            // GPU launch
+            knRms.setPtr(0, xUsm);
+            knRms.setPtr(1, wUsm);
+            knRms.setPtr(2, yUsm);
+            knRms.setValue<float>(3, 1e-6F);
+            knRms.setValue<std::int32_t>(4, kK);
+            knRms.setGroupSize(kLocalSize, 1, 1);
+
+            const auto g0 = std::chrono::steady_clock::now();
+            queue.dispatch(knRms, /* groupCountX = M = 1 row */ 1, 1, 1);
+            const auto g1 = std::chrono::steady_clock::now();
+
+            // CPU reference (same numerical recipe)
+            std::vector<float> cpuRef(kK);
+            const auto c0 = std::chrono::steady_clock::now();
+            mimirmind::compute::rmsNorm(x, 1, kK, w, 1e-6F, cpuRef.data());
+            const auto c1 = std::chrono::steady_clock::now();
+
+            const float* y = static_cast<const float*>(yUsm);
+            float maxAbsDiff = 0.0F;
+            float maxAbsCpu  = 0.0F;
+            for (std::size_t i = 0; i < static_cast<std::size_t>(kK); ++i) {
+                const float d = std::fabs(y[i] - cpuRef[i]);
+                if (d > maxAbsDiff) {
+                    maxAbsDiff = d;
+                }
+                const float a = std::fabs(cpuRef[i]);
+                if (a > maxAbsCpu) {
+                    maxAbsCpu = a;
+                }
+            }
+
+            const double gpuMs = std::chrono::duration<double, std::milli>(g1 - g0).count();
+            const double cpuMs = std::chrono::duration<double, std::milli>(c1 - c0).count();
+
+            std::cout << "  shape         : [1, " << kK
+                      << "]  local_size=" << kLocalSize << "\n";
+            std::cout << "  gpu time      : " << gpuMs
+                      << " ms (incl. queue sync)\n";
+            std::cout << "  cpu time      : " << cpuMs << " ms\n";
+            std::cout << "  max |GPU-CPU| : " << maxAbsDiff
+                      << "  (max |CPU| = " << maxAbsCpu << ")\n";
+            std::cout << "  first 5 GPU   :  " << y[0] << "  " << y[1]
+                      << "  " << y[2] << "  " << y[3] << "  " << y[4] << "\n";
+            std::cout << "  first 5 CPU   :  " << cpuRef[0] << "  " << cpuRef[1]
+                      << "  " << cpuRef[2] << "  " << cpuRef[3] << "  "
+                      << cpuRef[4] << "\n";
+
+            MM_LOG_INFO("main",
+                        "[M5] gpu={:.3f}ms cpu={:.3f}ms max_diff={:.3e} max_cpu={:.3e}",
+                        gpuMs, cpuMs,
+                        static_cast<double>(maxAbsDiff),
+                        static_cast<double>(maxAbsCpu));
+
+            allocator.deallocate(yUsm, bytesK);
+            allocator.deallocate(wUsm, bytesK);
+            allocator.deallocate(xUsm, bytesK);
+        } catch (const std::exception& e) {
+            std::cout << "  GPU RMSNorm failed: " << e.what() << "\n";
+            MM_LOG_ERROR("main", "[M5] failed: {}", e.what());
+        }
 
         // --- [M3] GGUF reader smoke test ------------------------------------
 
