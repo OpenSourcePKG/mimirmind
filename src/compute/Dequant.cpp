@@ -103,6 +103,71 @@ void getScaleMinK4(int j,
     }
 }
 
+// ----- Q6_K --------------------------------------------------------------
+//
+// Super-block of 256 elements, 210 bytes:
+//   uint8 ql[128]    — lower 4 bits of 256 6-bit quants
+//   uint8 qh[64]     — upper 2 bits of 256 6-bit quants (4 quants/byte)
+//   int8  scales[16] — 16 signed scales, one per 16-element sub-block
+//   fp16  d          — super-block scale
+//
+// Per element: q = ((ql_nibble) | (qh_pair << 4)) - 32  in [-32..31]
+// value = d * scale[sub_block] * q
+
+constexpr std::size_t kQ6KBlockElements = 256;
+constexpr std::size_t kQ6KBlockBytes    = 210;
+
+void dequantQ6K(const void* src, std::size_t nelements, float* dst) {
+    if (nelements % kQ6KBlockElements != 0) {
+        throw std::runtime_error(
+            "dequant Q6_K: nelements=" + std::to_string(nelements) +
+            " is not a multiple of " + std::to_string(kQ6KBlockElements));
+    }
+    const std::size_t nblocks = nelements / kQ6KBlockElements;
+    const auto* base = static_cast<const std::uint8_t*>(src);
+
+    for (std::size_t b = 0; b < nblocks; ++b) {
+        const auto* block = base + b * kQ6KBlockBytes;
+
+        const std::uint8_t* ql = block;            // 128 bytes
+        const std::uint8_t* qh = block + 128;      // 64 bytes
+        const auto*         sc = reinterpret_cast<const std::int8_t*>(block + 192); // 16 bytes
+        std::uint16_t dHalf;
+        std::memcpy(&dHalf, block + 208, sizeof(std::uint16_t));
+        const float d = halfToFloat(dHalf);
+
+        float*       y          = dst;
+        const std::uint8_t* qlp = ql;
+        const std::uint8_t* qhp = qh;
+        const std::int8_t*  scp = sc;
+
+        // Two 128-element halves per super-block.
+        for (int half = 0; half < 2; ++half) {
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const auto q1 = static_cast<std::int8_t>(
+                    (qlp[l +  0] & 0x0FU) | (((qhp[l] >> 0) & 0x03U) << 4)) - 32;
+                const auto q2 = static_cast<std::int8_t>(
+                    (qlp[l + 32] & 0x0FU) | (((qhp[l] >> 2) & 0x03U) << 4)) - 32;
+                const auto q3 = static_cast<std::int8_t>(
+                    (qlp[l +  0] >> 4U)   | (((qhp[l] >> 4) & 0x03U) << 4)) - 32;
+                const auto q4 = static_cast<std::int8_t>(
+                    (qlp[l + 32] >> 4U)   | (((qhp[l] >> 6) & 0x03U) << 4)) - 32;
+                y[l +  0] = d * static_cast<float>(scp[is + 0]) * static_cast<float>(q1);
+                y[l + 32] = d * static_cast<float>(scp[is + 2]) * static_cast<float>(q2);
+                y[l + 64] = d * static_cast<float>(scp[is + 4]) * static_cast<float>(q3);
+                y[l + 96] = d * static_cast<float>(scp[is + 6]) * static_cast<float>(q4);
+            }
+            y   += 128;
+            qlp += 64;
+            qhp += 32;
+            scp += 8;
+        }
+
+        dst += kQ6KBlockElements;
+    }
+}
+
 void dequantQ4K(const void* src, std::size_t nelements, float* dst) {
     if (nelements % kQ4KBlockElements != 0) {
         throw std::runtime_error(
@@ -157,6 +222,7 @@ void dequantToF32(model::GgmlType type,
         case model::GgmlType::F16:  dequantF16(src,  nelements, dst); return;
         case model::GgmlType::BF16: dequantBf16(src, nelements, dst); return;
         case model::GgmlType::Q4_K: dequantQ4K(src,  nelements, dst); return;
+        case model::GgmlType::Q6_K: dequantQ6K(src,  nelements, dst); return;
 
         case model::GgmlType::F64:
         case model::GgmlType::I8:
@@ -172,7 +238,6 @@ void dequantToF32(model::GgmlType type,
         case model::GgmlType::Q2_K:
         case model::GgmlType::Q3_K:
         case model::GgmlType::Q5_K:
-        case model::GgmlType::Q6_K:
         case model::GgmlType::Q8_K:
         case model::GgmlType::Unknown:
         default:
