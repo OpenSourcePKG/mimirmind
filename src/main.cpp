@@ -594,11 +594,116 @@ int main() {
 
             // --- [M4a] Embedding lookup ----------------------------------
 
+            // --- [M5b] GPU Q4_K matmul (vec) — parity vs CPU ---------------
+
+            mimirmind::model::WeightsMap weights{reader};
+
+            std::cout << "\n[M5b] GPU Q4_K matvec kernel parity\n";
+            std::cout.flush();
+            MM_LOG_INFO("main", "[M5b] starting GPU Q4_K matvec parity test");
+            try {
+                const auto* qW = weights.find("blk.0.attn_q.weight");
+                if (qW == nullptr ||
+                    qW->type != mimirmind::model::GgmlType::Q4_K ||
+                    qW->dimensions.size() < 2) {
+                    std::cout << "  blk.0.attn_q.weight not Q4_K or missing — skipping\n";
+                } else {
+                    const std::size_t K = qW->dimensions[0];
+                    const std::size_t N = qW->dimensions[1];
+                    std::cout << "  weight        : " << qW->name
+                              << "  type=Q4_K  K=" << K << "  N=" << N << "\n";
+
+                    mimirmind::runtime::GpuModule modMm{ctx, "matmul_q4k_vec"};
+                    mimirmind::runtime::GpuKernel knMm{modMm.kernel("matmul_q4k_vec")};
+                    mimirmind::runtime::CommandQueue queueMm{ctx};
+
+                    const std::size_t xBytes = K * sizeof(float);
+                    const std::size_t yBytes = N * sizeof(float);
+                    void* xUsm = allocator.allocate(xBytes);
+                    void* yUsmGpu = allocator.allocate(yBytes);
+                    std::vector<float> yCpuRef(N);
+                    std::vector<float> scratch(K);
+
+                    // Deterministic pseudo-random X vector.
+                    float* x = static_cast<float*>(xUsm);
+                    for (std::size_t i = 0; i < K; ++i) {
+                        x[i] = std::sin(static_cast<float>(i) * 0.017F) * 0.3F;
+                    }
+
+                    constexpr std::uint32_t kLocalN = 64;
+                    const std::uint32_t groups =
+                        static_cast<std::uint32_t>((N + kLocalN - 1) / kLocalN);
+
+                    knMm.setPtr(0, xUsm);
+                    knMm.setPtr(1, qW->usmPtr);
+                    knMm.setPtr(2, yUsmGpu);
+                    knMm.setValue<std::int32_t>(3, static_cast<std::int32_t>(K));
+                    knMm.setValue<std::int32_t>(4, static_cast<std::int32_t>(N));
+                    knMm.setGroupSize(kLocalN, 1, 1);
+
+                    using clock = std::chrono::steady_clock;
+                    const auto g0 = clock::now();
+                    queueMm.dispatch(knMm, groups, 1, 1);
+                    const auto g1 = clock::now();
+
+                    const auto c0 = clock::now();
+                    mimirmind::compute::matmul(
+                        qW->type, qW->usmPtr, N, K,
+                        static_cast<const float*>(xUsm), 1,
+                        yCpuRef.data(), scratch.data());
+                    const auto c1 = clock::now();
+
+                    const float* yGpu = static_cast<const float*>(yUsmGpu);
+                    float maxDiff = 0.0F;
+                    float maxRef  = 0.0F;
+                    for (std::size_t i = 0; i < N; ++i) {
+                        const float d = std::fabs(yGpu[i] - yCpuRef[i]);
+                        if (d > maxDiff) {
+                            maxDiff = d;
+                        }
+                        const float a = std::fabs(yCpuRef[i]);
+                        if (a > maxRef) {
+                            maxRef = a;
+                        }
+                    }
+                    const double gpuMs = std::chrono::duration<double, std::milli>(g1 - g0).count();
+                    const double cpuMs = std::chrono::duration<double, std::milli>(c1 - c0).count();
+
+                    std::cout << "  launch        : groups=" << groups
+                              << " x local=" << kLocalN << " => " << (groups * kLocalN)
+                              << " threads (N=" << N << ")\n";
+                    std::cout << "  gpu time      : " << gpuMs << " ms\n";
+                    std::cout << "  cpu time      : " << cpuMs << " ms\n";
+                    std::cout << "  speedup       : " << (cpuMs / gpuMs) << "x\n";
+                    std::cout << "  max |GPU-CPU| : " << maxDiff
+                              << "  (max |CPU| = " << maxRef
+                              << ", rel = "
+                              << (maxRef > 0.0F ? (maxDiff / maxRef) : 0.0F) << ")\n";
+                    std::cout << "  first 5 GPU   :  " << yGpu[0] << "  " << yGpu[1]
+                              << "  " << yGpu[2] << "  " << yGpu[3] << "  " << yGpu[4] << "\n";
+                    std::cout << "  first 5 CPU   :  " << yCpuRef[0] << "  " << yCpuRef[1]
+                              << "  " << yCpuRef[2] << "  " << yCpuRef[3] << "  "
+                              << yCpuRef[4] << "\n";
+
+                    MM_LOG_INFO("main",
+                                "[M5b] gpu={:.2f}ms cpu={:.2f}ms speedup={:.2f}x "
+                                "max_diff={:.3e} max_cpu={:.3e}",
+                                gpuMs, cpuMs,
+                                cpuMs / gpuMs,
+                                static_cast<double>(maxDiff),
+                                static_cast<double>(maxRef));
+
+                    allocator.deallocate(yUsmGpu, yBytes);
+                    allocator.deallocate(xUsm,    xBytes);
+                }
+            } catch (const std::exception& e) {
+                std::cout << "  Q4_K matmul failed: " << e.what() << "\n";
+                MM_LOG_ERROR("main", "[M5b] failed: {}", e.what());
+            }
+
             std::cout << "\n[M4a] Embedding lookup smoke test\n";
             std::cout.flush();
             MM_LOG_INFO("main", "[M4a] starting embedding lookup");
-
-            mimirmind::model::WeightsMap weights{reader};
 
             const auto* tokEmb = weights.find("token_embd.weight");
             if (tokEmb == nullptr) {

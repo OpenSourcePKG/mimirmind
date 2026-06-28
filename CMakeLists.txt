@@ -78,6 +78,7 @@ message(STATUS "ocloc: ${OCLOC_EXECUTABLE}")
 
 set(KERNEL_SOURCES
     kernels/rmsnorm.cl
+    kernels/matmul_q4k_vec.cl
 )
 
 set(KERNEL_SPV_FILES "")
