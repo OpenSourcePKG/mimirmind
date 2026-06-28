@@ -119,6 +119,7 @@ add_executable(mimirmind
     src/compute/Attention.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
+    src/compute/GpuMatmul.cpp
     src/compute/Matmul.cpp
     src/compute/Norm.cpp
     src/compute/Rope.cpp
