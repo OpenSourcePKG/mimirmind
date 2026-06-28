@@ -1,15 +1,19 @@
+#include "model/GgufReader.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
 #include "runtime/UsmAllocator.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iomanip>
 #include <iostream>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -17,7 +21,7 @@ namespace {
 constexpr const char* kBanner =
     "+------------------------------------------------------------+\n"
     "|                          Mimirmind                         |\n"
-    "|   Project Well startup smoke test (M1+M2 ctx/USM/pool)     |\n"
+    "|   Project Well startup smoke (M1 ctx + M2 USM + M3 GGUF)   |\n"
     "+------------------------------------------------------------+\n";
 
 std::string formatBytes(std::size_t bytes) {
@@ -161,6 +165,70 @@ int main() {
         std::cout << "  peak live bytes   : " << formatBytes(st.peakBytes) << "\n";
         std::cout << "  live at end       : " << st.liveAllocations
                   << " allocs / " << formatBytes(st.liveBytes) << "\n";
+
+        // --- [M3] GGUF reader smoke test ------------------------------------
+
+        const char* modelPath = std::getenv("MIMIRMIND_MODEL_PATH");
+        if (modelPath == nullptr || modelPath[0] == '\0') {
+            std::cout << "\n[M3] GGUF reader — skipped "
+                         "(set MIMIRMIND_MODEL_PATH to a .gguf file to enable)\n";
+            MM_LOG_INFO("main", "[M3] MIMIRMIND_MODEL_PATH not set; skipping");
+        } else {
+            std::cout << "\n[M3] GGUF reader (" << modelPath << ")\n";
+            std::cout.flush();
+            MM_LOG_INFO("main", "[M3] opening model '{}'", modelPath);
+
+            mimirmind::model::GgufReader reader;
+            reader.open(modelPath);
+
+            std::cout << "  version       : " << reader.version() << "\n";
+            std::cout << "  metadata      : " << reader.metadataCount() << " entries\n";
+            std::cout << "  tensors       : " << reader.tensorCount() << " entries\n";
+            std::cout << "  alignment     : " << reader.alignment() << " bytes\n";
+            std::cout << "  data offset   : " << reader.tensorDataOffset() << " bytes\n";
+            std::cout << "  payload total : " << formatBytes(reader.totalTensorBytes())
+                      << "\n";
+
+            // A few well-known metadata keys — print whichever are present.
+            static constexpr std::array<const char*, 9> kProbeKeys = {
+                "general.architecture",
+                "general.name",
+                "general.file_type",
+                "general.quantization_version",
+                "tokenizer.ggml.model",
+                "llama.context_length",
+                "gemma.context_length",
+                "gemma3.context_length",
+                "gemma4.context_length",
+            };
+            std::cout << "  known meta    :\n";
+            for (const char* k : kProbeKeys) {
+                if (reader.findMetadata(k) != nullptr) {
+                    std::cout << "    " << k << "\n";
+                }
+            }
+
+            std::cout << "  first tensors :\n";
+            const auto& ts = reader.tensors();
+            for (std::size_t i = 0; i < std::min<std::size_t>(3, ts.size()); ++i) {
+                const auto& t = ts[i];
+                std::cout << "    " << t.name
+                          << "  type=" << mimirmind::model::typeInfo(t.type).name
+                          << "  elems=" << t.nelements
+                          << "  bytes=" << formatBytes(t.nbytes) << "\n";
+            }
+
+            MM_LOG_INFO("main", "[M3] loading tensors into USM");
+            reader.loadTensors(allocator);
+
+            const auto st3 = allocator.stats();
+            std::cout << "  loaded        : " << reader.tensorCount()
+                      << " tensors, " << formatBytes(st3.liveBytes) << " live in USM\n";
+            std::cout << "  ze alloc/free : " << st3.zeAllocCalls
+                      << " / " << st3.zeFreeCalls << "\n";
+
+            allocator.logStats(mimirmind::runtime::LogLevel::Info);
+        }
 
         MM_LOG_INFO("main",
                     "smoke test passed — perAllocMax={} bytes totalAllocatable={} bytes "
