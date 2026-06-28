@@ -77,6 +77,7 @@ add_executable(mimirmind
     src/model/LlmConfig.cpp
     src/model/Tokenizer.cpp
     src/model/WeightsMap.cpp
+    src/runtime/KvCache.cpp
     src/runtime/L0Context.cpp
     src/runtime/Log.cpp
     src/runtime/MappedFile.cpp
