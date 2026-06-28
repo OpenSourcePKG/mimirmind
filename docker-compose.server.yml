@@ -1,0 +1,62 @@
+# docker-compose.server.yml — Dev-Test gegen das gepushte Registry-Image.
+#
+# Im Gegensatz zu docker-compose.yml wird hier nichts lokal gebaut; das
+# Image kommt aus docker-registry.xd-pi.de/mimirmind. Logs landen sowohl
+# auf stdout (via tty) als auch in ./run-logs/run.log auf dem Host
+# (über den /logs-Mount + MIMIRMIND_LOG_FILE).
+#
+# Voraussetzungen:
+#   - GGUFs liegen unter ${MIMIRMIND_MODELS_DIR} (default: ./models)
+#   - Intel iGPU/dGPU unter /dev/dri verfügbar
+#
+# Typischer Run:
+#
+#   export MIMIRMIND_MODELS_DIR=/srv/llm-models
+#   export MIMIRMIND_MODEL_PATH=/models/gemma-3-4b-it-q4_k_m.gguf
+#   export MIMIRMIND_RENDER_GID=$(getent group render | cut -d: -f3)
+#   export MIMIRMIND_VIDEO_GID=$(getent group video  | cut -d: -f3)
+#
+#   docker compose -f docker-compose.server.yml pull
+#   rm -f ./run-logs/run.log                                    # frischer Log
+#   docker compose -f docker-compose.server.yml run --rm mimirmind 2>&1 \
+#       | tee ./run-logs/stdout.log
+#
+# Danach mir den Inhalt von ./run-logs/run.log (strukturierter MM_LOG)
+# plus ./run-logs/stdout.log (Banner + Tabellen) zurückreichen.
+
+services:
+
+    mimirmind:
+        image: docker-registry.xd-pi.de/mimirmind:${MIMIRMIND_IMAGE_TAG:-latest}
+        container_name: mimirmind-devtest
+        pull_policy: always
+
+        devices:
+            - /dev/dri:/dev/dri
+
+        # GIDs müssen denen des Hosts entsprechen — sonst kein /dev/dri-
+        # Zugriff. Default 104/44 sind Ubuntu/Debian; per env überschreiben.
+        group_add:
+            - "${MIMIRMIND_RENDER_GID:-104}"
+            - "${MIMIRMIND_VIDEO_GID:-44}"
+
+        environment:
+            # Level Zero: 4-GiB-Cap aufheben (sonst sieht der Probe bei
+            # 4 GiB einen ze_RESULT_ERROR_OUT_OF_DEVICE_MEMORY).
+            UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
+            UR_L0_USE_RELAXED_ALLOCATION_LIMITS:    "1"
+
+            # Volle Spur per Default — für Dev-Tests wollen wir alles.
+            MIMIRMIND_LOG_LEVEL:  ${MIMIRMIND_LOG_LEVEL:-trace}
+            MIMIRMIND_LOG_FILE:   ${MIMIRMIND_LOG_FILE:-/logs/run.log}
+
+            # Pflicht: ohne kein M3-Smoke. `?` lässt compose früh failen.
+            MIMIRMIND_MODEL_PATH: ${MIMIRMIND_MODEL_PATH:?set MIMIRMIND_MODEL_PATH=/models/<file>.gguf}
+
+        volumes:
+            - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
+            - ./run-logs:/logs:rw
+
+        restart: "no"
+        stdin_open: true
+        tty: true

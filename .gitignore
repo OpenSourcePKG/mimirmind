@@ -10,3 +10,4 @@ out/
 compile_commands.json
 .DS_Store
 models/
+run-logs/
