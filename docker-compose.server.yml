@@ -50,6 +50,11 @@ services:
             MIMIRMIND_LOG_LEVEL:  ${MIMIRMIND_LOG_LEVEL:-trace}
             MIMIRMIND_LOG_FILE:   ${MIMIRMIND_LOG_FILE:-/logs/run.log}
 
+            # Phase 2 USM probe cap in GiB. Default 4, set 0 to skip.
+            # Phase 2 holds *all* the probed memory simultaneously, so on UMA
+            # systems this directly translates to host-RAM usage during probe.
+            MIMIRMIND_USM_PROBE_TOTAL_GIB: ${MIMIRMIND_USM_PROBE_TOTAL_GIB:-4}
+
             # Pflicht: ohne kein M3-Smoke. `?` lässt compose früh failen.
             MIMIRMIND_MODEL_PATH: ${MIMIRMIND_MODEL_PATH:?set MIMIRMIND_MODEL_PATH=/models/<file>.gguf}
 
