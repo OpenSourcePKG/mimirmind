@@ -311,6 +311,19 @@ void GgufReader::loadTensors(runtime::UsmAllocator& allocator) {
     MM_LOG_INFO("gguf",
                 "load complete: {} tensor(s), {:.2f} MiB now in USM",
                 loadedCount, bytesToMiB(loadedBytes));
+
+    // The mmap'd file is no longer needed — every byte we care about is
+    // either in the metadata map (parsed) or in USM (copied). Dropping it
+    // here releases ~file_size of Linux page cache that would otherwise
+    // double-bill alongside the USM copy. Subsequent reads of t.fileOffset
+    // would be invalid; nothing in the engine does that.
+    if (_file.isOpen()) {
+        const std::size_t freed = _file.size();
+        _file.close();
+        MM_LOG_INFO("gguf",
+                    "dropped mmap of source GGUF, freed ~{:.2f} MiB of page cache",
+                    static_cast<double>(freed) / (1024.0 * 1024.0));
+    }
 }
 
 void GgufReader::close() noexcept {
