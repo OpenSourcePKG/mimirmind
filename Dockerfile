@@ -102,10 +102,6 @@ https://repositories.intel.com/gpu/ubuntu noble client" \
         level-zero \
         intel-level-zero-gpu \
         intel-opencl-icd \
-        libigc1 \
-        libigc2 \
-        libigdgmm12 \
-        libigdfcl1 \
     && apt-get purge -y wget gnupg \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
