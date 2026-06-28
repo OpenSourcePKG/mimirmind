@@ -62,23 +62,37 @@ CommandQueue::~CommandQueue() {
     }
 }
 
-void CommandQueue::dispatch(GpuKernel&    kernel,
-                            std::uint32_t groupCountX,
-                            std::uint32_t groupCountY,
-                            std::uint32_t groupCountZ) {
+void CommandQueue::appendLaunch(GpuKernel&    kernel,
+                                std::uint32_t groupCountX,
+                                std::uint32_t groupCountY,
+                                std::uint32_t groupCountZ) {
     ze_group_count_t groups{groupCountX, groupCountY, groupCountZ};
-
     ZE_CHECK(zeCommandListAppendLaunchKernel(
         _cmdList, kernel.handle(), &groups,
         nullptr, 0, nullptr));
+    _hasPending = true;
+}
 
+void CommandQueue::flush() {
+    if (!_hasPending) {
+        return;
+    }
     ZE_CHECK(zeCommandListClose(_cmdList));
     ZE_CHECK(zeCommandQueueExecuteCommandLists(
         _queue, 1, &_cmdList, nullptr));
     ZE_CHECK(zeCommandQueueSynchronize(
         _queue, std::numeric_limits<std::uint64_t>::max()));
     ZE_CHECK(zeCommandListReset(_cmdList));
+    _hasPending = false;
+    MM_LOG_DEBUG("gpu", "queue flushed");
+}
 
+void CommandQueue::dispatch(GpuKernel&    kernel,
+                            std::uint32_t groupCountX,
+                            std::uint32_t groupCountY,
+                            std::uint32_t groupCountZ) {
+    appendLaunch(kernel, groupCountX, groupCountY, groupCountZ);
+    flush();
     MM_LOG_DEBUG("gpu",
                  "dispatch done — kernel={} groups=({},{},{})",
                  static_cast<const void*>(kernel.handle()),

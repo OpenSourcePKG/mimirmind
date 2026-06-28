@@ -204,26 +204,34 @@ void runTransformerBlock(std::size_t                         blockIdx,
                          cfg.rmsNormEps,
                          static_cast<float*>(s.normBuf));
 
-    auto project = [&](const mm::model::GgufTensor* W,
-                       const mm::model::GgufTensor* B,
-                       std::size_t N, void* dst) {
-        gmm.matmul(W->type, W->usmPtr, N, d_model,
-                   static_cast<const float*>(s.normBuf), T,
-                   static_cast<float*>(dst),
-                   static_cast<float*>(s.matmulScratch));
+    auto projectAsync = [&](const mm::model::GgufTensor* W,
+                            std::size_t N, void* dst) {
+        gmm.matmulAsync(W->type, W->usmPtr, N, d_model,
+                        static_cast<const float*>(s.normBuf), T,
+                        static_cast<float*>(dst),
+                        static_cast<float*>(s.matmulScratch));
+    };
+    auto addBiasIf = [&](const mm::model::GgufTensor* B,
+                         std::size_t N, void* dst) {
         if (B != nullptr && B->type == mm::model::GgmlType::F32) {
             mm::compute::addBias(static_cast<float*>(dst), T, N,
                                  static_cast<const float*>(B->usmPtr));
         }
     };
 
-    project(qW, qB, q_dim, s.qBuf);
-
     // K and V project straight into the KV cache at offset curLen.
     float* kSlot = cache.writeSlotK(blockIdx);
     float* vSlot = cache.writeSlotV(blockIdx);
-    project(kW, kB, kv_dim, kSlot);
-    project(vW, vB, kv_dim, vSlot);
+
+    // Q/K/V are independent and all needed before RoPE — batch into one
+    // GPU submission, sync once, then run the CPU bias adds.
+    projectAsync(qW, q_dim,  s.qBuf);
+    projectAsync(kW, kv_dim, kSlot);
+    projectAsync(vW, kv_dim, vSlot);
+    gmm.sync();
+    addBiasIf(qB, q_dim,  s.qBuf);
+    addBiasIf(kB, kv_dim, kSlot);
+    addBiasIf(vB, kv_dim, vSlot);
 
     // RoPE on Q and the freshly-written K rows; startPos == curLen so the
     // absolute positions in decode mode line up with what's already cached.
@@ -258,15 +266,16 @@ void runTransformerBlock(std::size_t                         blockIdx,
                          cfg.rmsNormEps,
                          static_cast<float*>(s.normBuf));
 
-    gmm.matmul(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
-               static_cast<const float*>(s.normBuf), T,
-               static_cast<float*>(s.gateOut),
-               static_cast<float*>(s.matmulScratch));
-
-    gmm.matmul(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
-               static_cast<const float*>(s.normBuf), T,
-               static_cast<float*>(s.upOut),
-               static_cast<float*>(s.matmulScratch));
+    // gate and up read the same normBuf and are independent — batch.
+    gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
+                    static_cast<const float*>(s.normBuf), T,
+                    static_cast<float*>(s.gateOut),
+                    static_cast<float*>(s.matmulScratch));
+    gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
+                    static_cast<const float*>(s.normBuf), T,
+                    static_cast<float*>(s.upOut),
+                    static_cast<float*>(s.matmulScratch));
+    gmm.sync();
 
     mm::compute::siluInPlace(static_cast<float*>(s.gateOut), T * ff_dim);
     mm::compute::mulInPlace(static_cast<float*>(s.gateOut),
