@@ -109,9 +109,13 @@ public:
     // --- Bucket layout helpers (exposed for tests and diagnostics) -------
 
     static constexpr std::size_t kAlignment              = 4096;
-    static constexpr std::size_t kMinBucketBytes         = 4096;        // 4 KiB
-    static constexpr std::size_t kMaxBucketBytes         = 256ULL << 20; // 256 MiB
-    static constexpr std::size_t kBucketCount            = 17;          // 4K..256M inclusive
+    static constexpr std::size_t kMinBucketBytes         = 4096;       // 4 KiB
+    static constexpr std::size_t kMaxBucketBytes         = 1ULL << 20; // 1 MiB
+    static constexpr std::size_t kBucketCount            = 9;          // 4K..1M inclusive
+    // Anything > kMaxBucketBytes is allocated at exact size (no rounding,
+    // no free-list reuse). Power-of-two rounding above 1 MiB wastes up to
+    // 50% — fatal for FFN weights (Qwen2.5-7B: 38 MiB ffn rows in 64 MiB
+    // buckets cost ~2 GiB of phantom resident).
     static constexpr std::size_t kFreeListCapPerBucket   = 4;
 
     [[nodiscard]] static std::size_t bucketIndexFor(std::size_t bytes) noexcept;
