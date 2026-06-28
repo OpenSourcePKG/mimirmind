@@ -64,6 +64,7 @@ message(STATUS "Level Zero library: ${LEVEL_ZERO_LIBRARY}")
 
 add_executable(mimirmind
     src/main.cpp
+    src/compute/Activations.cpp
     src/compute/Attention.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp

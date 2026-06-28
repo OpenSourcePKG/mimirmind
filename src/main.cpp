@@ -1,3 +1,4 @@
+#include "compute/Activations.hpp"
 #include "compute/Attention.hpp"
 #include "compute/Embedding.hpp"
 #include "compute/Matmul.hpp"
@@ -32,7 +33,7 @@ namespace {
 constexpr const char* kBanner =
     "+------------------------------------------------------------+\n"
     "|                          Mimirmind                         |\n"
-    "|   smoke: M1 ctx | M2 USM | M3 GGUF | M4 embed/norm/attn    |\n"
+    "|   smoke: M1 ctx | M2 USM | M3 GGUF | M4 full forward CPU   |\n"
     "+------------------------------------------------------------+\n";
 
 std::string formatBytes(std::size_t bytes) {
@@ -69,6 +70,191 @@ void printDevice(const mimirmind::runtime::DeviceInfo& info, bool selected) {
               << info.coreClockRate << " MHz\n";
     std::cout << "      local mem: " << formatBytes(info.totalLocalMem) << "\n";
     std::cout << "      sub-devs : " << info.numSubDevices << "\n";
+}
+
+// ---- Transformer-block scratch + forward (used by [M4d]) -----------------
+
+struct BlockBuffers {
+    std::size_t T{};
+    std::size_t d_model{};
+    std::size_t q_dim{};
+    std::size_t kv_dim{};
+    std::size_t ff_dim{};
+
+    void* qBuf{};
+    void* kBuf{};
+    void* vBuf{};
+    void* normBuf{};
+    void* attnOut{};
+    void* projOut{};
+    void* gateOut{};
+    void* upOut{};
+    void* matmulScratch{};
+    void* scoreScratch{};
+
+    std::size_t qBytes{};
+    std::size_t kvBytes{};
+    std::size_t normBytes{};
+    std::size_t attnOutBytes{};
+    std::size_t projOutBytes{};
+    std::size_t gateOutBytes{};
+    std::size_t upOutBytes{};
+    std::size_t matmulScratchBytes{};
+    std::size_t scoreScratchBytes{};
+};
+
+BlockBuffers allocBlockBuffers(mimirmind::runtime::UsmAllocator& alloc,
+                               std::size_t T,
+                               const mimirmind::model::LlmConfig& cfg) {
+    BlockBuffers b{};
+    b.T       = T;
+    b.d_model = cfg.embeddingLength;
+    b.q_dim   = cfg.headCount   * cfg.headDim();
+    b.kv_dim  = cfg.headCountKv * cfg.headDim();
+    b.ff_dim  = cfg.feedForwardLength;
+
+    b.qBytes             = T * b.q_dim   * sizeof(float);
+    b.kvBytes            = T * b.kv_dim  * sizeof(float);
+    b.normBytes          = T * b.d_model * sizeof(float);
+    b.attnOutBytes       = T * b.q_dim   * sizeof(float);
+    b.projOutBytes       = T * b.d_model * sizeof(float);
+    b.gateOutBytes       = T * b.ff_dim  * sizeof(float);
+    b.upOutBytes         = T * b.ff_dim  * sizeof(float);
+    b.scoreScratchBytes  = T             * sizeof(float);
+    b.matmulScratchBytes =
+        std::max({b.d_model, b.q_dim, b.ff_dim}) * sizeof(float);
+
+    b.qBuf          = alloc.allocate(b.qBytes);
+    b.kBuf          = alloc.allocate(b.kvBytes);
+    b.vBuf          = alloc.allocate(b.kvBytes);
+    b.normBuf       = alloc.allocate(b.normBytes);
+    b.attnOut       = alloc.allocate(b.attnOutBytes);
+    b.projOut       = alloc.allocate(b.projOutBytes);
+    b.gateOut       = alloc.allocate(b.gateOutBytes);
+    b.upOut         = alloc.allocate(b.upOutBytes);
+    b.matmulScratch = alloc.allocate(b.matmulScratchBytes);
+    b.scoreScratch  = alloc.allocate(b.scoreScratchBytes);
+    return b;
+}
+
+void freeBlockBuffers(mimirmind::runtime::UsmAllocator& alloc, BlockBuffers& b) {
+    alloc.deallocate(b.scoreScratch,  b.scoreScratchBytes);
+    alloc.deallocate(b.matmulScratch, b.matmulScratchBytes);
+    alloc.deallocate(b.upOut,         b.upOutBytes);
+    alloc.deallocate(b.gateOut,       b.gateOutBytes);
+    alloc.deallocate(b.projOut,       b.projOutBytes);
+    alloc.deallocate(b.attnOut,       b.attnOutBytes);
+    alloc.deallocate(b.normBuf,       b.normBytes);
+    alloc.deallocate(b.vBuf,          b.kvBytes);
+    alloc.deallocate(b.kBuf,          b.kvBytes);
+    alloc.deallocate(b.qBuf,          b.qBytes);
+}
+
+void runTransformerBlock(std::size_t blockIdx,
+                         const mimirmind::model::LlmConfig&  cfg,
+                         const mimirmind::model::WeightsMap& weights,
+                         float*                              x,
+                         BlockBuffers&                       s) {
+    namespace mm = mimirmind;
+
+    const auto* attnNorm = weights.findBlock(blockIdx, "attn_norm.weight");
+    const auto* qW = weights.findBlock(blockIdx, "attn_q.weight");
+    const auto* qB = weights.findBlock(blockIdx, "attn_q.bias");
+    const auto* kW = weights.findBlock(blockIdx, "attn_k.weight");
+    const auto* kB = weights.findBlock(blockIdx, "attn_k.bias");
+    const auto* vW = weights.findBlock(blockIdx, "attn_v.weight");
+    const auto* vB = weights.findBlock(blockIdx, "attn_v.bias");
+    const auto* oW = weights.findBlock(blockIdx, "attn_output.weight");
+
+    const auto* ffnNorm = weights.findBlock(blockIdx, "ffn_norm.weight");
+    const auto* ffnGate = weights.findBlock(blockIdx, "ffn_gate.weight");
+    const auto* ffnUp   = weights.findBlock(blockIdx, "ffn_up.weight");
+    const auto* ffnDown = weights.findBlock(blockIdx, "ffn_down.weight");
+
+    if (attnNorm == nullptr || qW == nullptr || kW == nullptr ||
+        vW == nullptr || oW == nullptr ||
+        ffnNorm == nullptr || ffnGate == nullptr ||
+        ffnUp == nullptr || ffnDown == nullptr) {
+        throw std::runtime_error(
+            "transformer block " + std::to_string(blockIdx) + " missing a tensor");
+    }
+
+    const std::size_t T        = s.T;
+    const std::size_t d_model  = s.d_model;
+    const std::size_t q_dim    = s.q_dim;
+    const std::size_t kv_dim   = s.kv_dim;
+    const std::size_t ff_dim   = s.ff_dim;
+    const std::size_t head_dim = cfg.headDim();
+
+    // attn_norm(x) -> normBuf
+    mm::compute::rmsNorm(x, T, d_model,
+                         static_cast<const float*>(attnNorm->usmPtr),
+                         cfg.rmsNormEps,
+                         static_cast<float*>(s.normBuf));
+
+    auto project = [&](const mm::model::GgufTensor* W,
+                       const mm::model::GgufTensor* B,
+                       std::size_t N, void* dst) {
+        mm::compute::matmul(W->type, W->usmPtr, N, d_model,
+                            static_cast<const float*>(s.normBuf), T,
+                            static_cast<float*>(dst),
+                            static_cast<float*>(s.matmulScratch));
+        if (B != nullptr && B->type == mm::model::GgmlType::F32) {
+            mm::compute::addBias(static_cast<float*>(dst), T, N,
+                                 static_cast<const float*>(B->usmPtr));
+        }
+    };
+
+    project(qW, qB, q_dim,  s.qBuf);
+    project(kW, kB, kv_dim, s.kBuf);
+    project(vW, vB, kv_dim, s.vBuf);
+
+    mm::compute::applyRopeInPlace(static_cast<float*>(s.qBuf), T,
+                                  cfg.headCount,   head_dim, 0, cfg.ropeFreqBase);
+    mm::compute::applyRopeInPlace(static_cast<float*>(s.kBuf), T,
+                                  cfg.headCountKv, head_dim, 0, cfg.ropeFreqBase);
+
+    mm::compute::multiHeadAttentionPrefill(
+        static_cast<const float*>(s.qBuf),
+        static_cast<const float*>(s.kBuf),
+        static_cast<const float*>(s.vBuf),
+        T, cfg.headCount, cfg.headCountKv, head_dim,
+        static_cast<float*>(s.scoreScratch),
+        static_cast<float*>(s.attnOut));
+
+    mm::compute::matmul(oW->type, oW->usmPtr, d_model, q_dim,
+                        static_cast<const float*>(s.attnOut), T,
+                        static_cast<float*>(s.projOut),
+                        static_cast<float*>(s.matmulScratch));
+
+    mm::compute::addResidual(x, static_cast<const float*>(s.projOut), T * d_model);
+
+    // ffn_norm(x) -> normBuf
+    mm::compute::rmsNorm(x, T, d_model,
+                         static_cast<const float*>(ffnNorm->usmPtr),
+                         cfg.rmsNormEps,
+                         static_cast<float*>(s.normBuf));
+
+    mm::compute::matmul(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
+                        static_cast<const float*>(s.normBuf), T,
+                        static_cast<float*>(s.gateOut),
+                        static_cast<float*>(s.matmulScratch));
+
+    mm::compute::matmul(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
+                        static_cast<const float*>(s.normBuf), T,
+                        static_cast<float*>(s.upOut),
+                        static_cast<float*>(s.matmulScratch));
+
+    mm::compute::siluInPlace(static_cast<float*>(s.gateOut), T * ff_dim);
+    mm::compute::mulInPlace(static_cast<float*>(s.gateOut),
+                            static_cast<const float*>(s.upOut), T * ff_dim);
+
+    mm::compute::matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
+                        static_cast<const float*>(s.gateOut), T,
+                        static_cast<float*>(s.projOut),
+                        static_cast<float*>(s.matmulScratch));
+
+    mm::compute::addResidual(x, static_cast<const float*>(s.projOut), T * d_model);
 }
 
 } // namespace
@@ -672,6 +858,135 @@ int main() {
                         allocator.deallocate(kBuf,       kvBufBytes);
                         allocator.deallocate(qBuf,       qBufBytes);
                         allocator.deallocate(xBuf,       xBytes);
+                    }
+
+                    // --- [M4d] Full 28-block forward + lm_head -> sample ---
+
+                    std::cout << "\n[M4d] Full forward (28 blocks + norm + lm_head) -> top-5\n";
+                    std::cout.flush();
+                    MM_LOG_INFO("main", "[M4d] starting full forward");
+
+                    const std::string fwdPrompt = "Hello, world!";
+                    const auto fwdIds = tok.encode(fwdPrompt, false);
+                    const std::size_t Tf = fwdIds.size();
+
+                    const auto* outNormD = weights.find("output_norm.weight");
+                    const auto* lmHeadD  = weights.find("output.weight");
+                    if (lmHeadD == nullptr) {
+                        lmHeadD = weights.find("token_embd.weight");
+                    }
+
+                    if (Tf == 0 || outNormD == nullptr || lmHeadD == nullptr) {
+                        std::cout << "  prerequisites missing, skipping\n";
+                    } else if (outNormD->type != mimirmind::model::GgmlType::F32) {
+                        std::cout << "  output_norm not F32, skipping\n";
+                    } else {
+                        const std::size_t vocab_lm =
+                            lmHeadD->dimensions.size() >= 2
+                            ? lmHeadD->dimensions[1]
+                            : vocab_size;
+
+                        std::cout << "  prompt        : \"" << fwdPrompt
+                                  << "\" -> " << Tf << " tokens\n";
+                        std::cout << "  blocks        : " << config.blockCount << "\n";
+
+                        BlockBuffers buffersD =
+                            allocBlockBuffers(allocator, Tf, config);
+                        const std::size_t xBytesD =
+                            Tf * config.embeddingLength * sizeof(float);
+                        const std::size_t normFinalBytes =
+                            Tf * config.embeddingLength * sizeof(float);
+                        const std::size_t logitsBytesD =
+                            vocab_lm * sizeof(float);
+                        const std::size_t logitsScratchBytes =
+                            config.embeddingLength * sizeof(float);
+
+                        void* xBufD     = allocator.allocate(xBytesD);
+                        void* normFinal = allocator.allocate(normFinalBytes);
+                        void* logitsD   = allocator.allocate(logitsBytesD);
+                        void* logitsSc  = allocator.allocate(logitsScratchBytes);
+
+                        using clock = std::chrono::steady_clock;
+                        const auto fwdT0 = clock::now();
+
+                        mimirmind::compute::embeddingLookup(
+                            tokEmb->type, tokEmb->usmPtr,
+                            config.embeddingLength, vocab_size,
+                            fwdIds, static_cast<float*>(xBufD));
+
+                        for (std::uint32_t b = 0; b < config.blockCount; ++b) {
+                            const auto bT0 = clock::now();
+                            runTransformerBlock(b, config, weights,
+                                                static_cast<float*>(xBufD),
+                                                buffersD);
+                            const auto bT1 = clock::now();
+                            const double bMs =
+                                std::chrono::duration<double, std::milli>(bT1 - bT0).count();
+                            MM_LOG_DEBUG("main", "[M4d] block {} done in {:.1f}ms", b, bMs);
+                        }
+
+                        const auto fwdT1 = clock::now();
+
+                        // output_norm on last token only
+                        const float* lastX =
+                            static_cast<const float*>(xBufD) +
+                            (Tf - 1) * config.embeddingLength;
+                        mimirmind::compute::rmsNorm(
+                            lastX, 1, config.embeddingLength,
+                            static_cast<const float*>(outNormD->usmPtr),
+                            config.rmsNormEps,
+                            static_cast<float*>(normFinal));
+
+                        // lm_head matmul -> logits (vocab)
+                        mimirmind::compute::matmul(
+                            lmHeadD->type, lmHeadD->usmPtr,
+                            vocab_lm, config.embeddingLength,
+                            static_cast<const float*>(normFinal), 1,
+                            static_cast<float*>(logitsD),
+                            static_cast<float*>(logitsSc));
+
+                        const auto fwdT2 = clock::now();
+
+                        const double blocksMs = std::chrono::duration<double, std::milli>(fwdT1 - fwdT0).count();
+                        const double headMs   = std::chrono::duration<double, std::milli>(fwdT2 - fwdT1).count();
+                        const double totalMs  = std::chrono::duration<double, std::milli>(fwdT2 - fwdT0).count();
+                        std::cout << "  28 blocks     : " << blocksMs << " ms\n";
+                        std::cout << "  norm+lm_head  : " << headMs   << " ms\n";
+                        std::cout << "  total forward : " << totalMs  << " ms\n";
+
+                        // Greedy argmax / top-5
+                        const float* lg = static_cast<const float*>(logitsD);
+                        std::vector<std::int32_t> idxD(vocab_lm);
+                        std::iota(idxD.begin(), idxD.end(), 0);
+                        const std::size_t kTop = std::min<std::size_t>(5, vocab_lm);
+                        std::partial_sort(
+                            idxD.begin(),
+                            idxD.begin() + static_cast<std::ptrdiff_t>(kTop),
+                            idxD.end(),
+                            [lg](std::int32_t a, std::int32_t b) {
+                                return lg[a] > lg[b];
+                            });
+
+                        std::cout << "  prompt decoded: '" << tok.decode(fwdIds, false) << "'\n";
+                        std::cout << "  next-token top-5:\n";
+                        for (std::size_t i = 0; i < kTop; ++i) {
+                            const std::int32_t v = idxD[i];
+                            std::cout << "    " << i << ": id=" << v
+                                      << "  logit=" << lg[v]
+                                      << "  piece='" << tok.tokenText(v) << "'\n";
+                        }
+
+                        MM_LOG_INFO("main",
+                                    "[M4d] forward done in {:.1f}ms — top1 id={} logit={:.4f} piece='{}'",
+                                    totalMs, idxD[0],
+                                    static_cast<double>(lg[idxD[0]]),
+                                    tok.tokenText(idxD[0]));
+
+                        allocator.deallocate(logitsSc,  logitsScratchBytes);
+                        allocator.deallocate(logitsD,   logitsBytesD);
+                        allocator.deallocate(normFinal, normFinalBytes);
+                        allocator.deallocate(xBufD,     xBytesD);
+                        freeBlockBuffers(allocator, buffersD);
                     }
 
                     allocator.deallocate(embPtr, outBytes);
