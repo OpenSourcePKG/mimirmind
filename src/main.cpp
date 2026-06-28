@@ -1,6 +1,8 @@
+#include "compute/Attention.hpp"
 #include "compute/Embedding.hpp"
 #include "compute/Matmul.hpp"
 #include "compute/Norm.hpp"
+#include "compute/Rope.hpp"
 #include "model/GgufReader.hpp"
 #include "model/LlmConfig.hpp"
 #include "model/Tokenizer.hpp"
@@ -30,7 +32,7 @@ namespace {
 constexpr const char* kBanner =
     "+------------------------------------------------------------+\n"
     "|                          Mimirmind                         |\n"
-    "|   Project Well smoke (M1 ctx | M2 USM | M3 GGUF | M4 embed)|\n"
+    "|   smoke: M1 ctx | M2 USM | M3 GGUF | M4 embed/norm/attn    |\n"
     "+------------------------------------------------------------+\n";
 
 std::string formatBytes(std::size_t bytes) {
@@ -488,6 +490,188 @@ int main() {
                         allocator.deallocate(scratchPtr, scratchBytes);
                         allocator.deallocate(logitsPtr,  logitsBytes);
                         allocator.deallocate(normedPtr,  normBytes);
+                    }
+
+                    // --- [M4c] Block-0 self-attention (prefill, GQA) ----
+
+                    std::cout << "\n[M4c] Block 0 self-attention smoke (prefill)\n";
+                    std::cout.flush();
+                    MM_LOG_INFO("main", "[M4c] starting block-0 attention");
+
+                    const std::string promptStr = "Hello, world!";
+                    const auto promptIds = tok.encode(promptStr, false);
+                    const std::size_t T = promptIds.size();
+
+                    const auto* attnNorm = weights.findBlock(0, "attn_norm.weight");
+                    const auto* qW = weights.findBlock(0, "attn_q.weight");
+                    const auto* qB = weights.findBlock(0, "attn_q.bias");
+                    const auto* kW = weights.findBlock(0, "attn_k.weight");
+                    const auto* kB = weights.findBlock(0, "attn_k.bias");
+                    const auto* vW = weights.findBlock(0, "attn_v.weight");
+                    const auto* vB = weights.findBlock(0, "attn_v.bias");
+                    const auto* oW = weights.findBlock(0, "attn_output.weight");
+
+                    if (T == 0 || attnNorm == nullptr || qW == nullptr ||
+                        kW == nullptr || vW == nullptr || oW == nullptr) {
+                        std::cout << "  prerequisites missing, skipping\n";
+                    } else {
+                        const std::size_t n_heads    = config.headCount;
+                        const std::size_t n_kv_heads = config.headCountKv;
+                        const std::size_t head_dim   = config.headDim();
+                        const std::size_t kv_dim     = n_kv_heads * head_dim;
+                        const std::size_t q_dim      = n_heads    * head_dim;
+
+                        std::cout << "  prompt        : \"" << promptStr
+                                  << "\" -> " << T << " tokens\n";
+                        std::cout << "  shapes        : Q=[" << T << "," << q_dim
+                                  << "] KV=[" << T << "," << kv_dim
+                                  << "] heads=" << n_heads
+                                  << " (kv=" << n_kv_heads
+                                  << ", head_dim=" << head_dim << ")\n";
+
+                        const std::size_t xBytes        = T * d_model * sizeof(float);
+                        const std::size_t qBufBytes     = T * q_dim   * sizeof(float);
+                        const std::size_t kvBufBytes    = T * kv_dim  * sizeof(float);
+                        const std::size_t normedC_Bytes = T * d_model * sizeof(float);
+                        const std::size_t attnOutBytes  = T * q_dim   * sizeof(float);
+                        const std::size_t oProjBytes    = T * d_model * sizeof(float);
+                        const std::size_t scoreBytes    = T           * sizeof(float);
+                        // Matmul row scratch: needs K floats, where K is the
+                        // input feature dim (d_model for Q/K/V/Onorm, q_dim for o_proj).
+                        const std::size_t scratchC_Bytes =
+                            std::max(d_model, q_dim) * sizeof(float);
+
+                        void* xBuf       = allocator.allocate(xBytes);
+                        void* qBuf       = allocator.allocate(qBufBytes);
+                        void* kBuf       = allocator.allocate(kvBufBytes);
+                        void* vBuf       = allocator.allocate(kvBufBytes);
+                        void* normedC    = allocator.allocate(normedC_Bytes);
+                        void* attnOutBuf = allocator.allocate(attnOutBytes);
+                        void* oProjBuf   = allocator.allocate(oProjBytes);
+                        void* scratchC   = allocator.allocate(scratchC_Bytes);
+                        void* scoreBuf   = allocator.allocate(scoreBytes);
+
+                        using clock = std::chrono::steady_clock;
+                        const auto t0 = clock::now();
+
+                        // 1. Embedding lookup -> xBuf
+                        mimirmind::compute::embeddingLookup(
+                            tokEmb->type, tokEmb->usmPtr, d_model, vocab_size,
+                            promptIds, static_cast<float*>(xBuf));
+
+                        // 2. attn_norm -> normedC
+                        mimirmind::compute::rmsNorm(
+                            static_cast<const float*>(xBuf), T, d_model,
+                            static_cast<const float*>(attnNorm->usmPtr),
+                            config.rmsNormEps,
+                            static_cast<float*>(normedC));
+
+                        auto projectAndBias = [&](
+                            const mimirmind::model::GgufTensor* W,
+                            const mimirmind::model::GgufTensor* B,
+                            std::size_t N, void* dst)
+                        {
+                            mimirmind::compute::matmul(
+                                W->type, W->usmPtr,
+                                N, d_model,
+                                static_cast<const float*>(normedC), T,
+                                static_cast<float*>(dst),
+                                static_cast<float*>(scratchC));
+                            if (B != nullptr &&
+                                B->type == mimirmind::model::GgmlType::F32) {
+                                mimirmind::compute::addBias(
+                                    static_cast<float*>(dst), T, N,
+                                    static_cast<const float*>(B->usmPtr));
+                            }
+                        };
+
+                        // 3-5. Q, K, V projections
+                        projectAndBias(qW, qB, q_dim,  qBuf);
+                        projectAndBias(kW, kB, kv_dim, kBuf);
+                        projectAndBias(vW, vB, kv_dim, vBuf);
+
+                        // 6. RoPE on Q and K (V untouched)
+                        mimirmind::compute::applyRopeInPlace(
+                            static_cast<float*>(qBuf), T, n_heads,
+                            head_dim, 0, config.ropeFreqBase);
+                        mimirmind::compute::applyRopeInPlace(
+                            static_cast<float*>(kBuf), T, n_kv_heads,
+                            head_dim, 0, config.ropeFreqBase);
+
+                        // 7. Multi-head attention (causal, GQA)
+                        mimirmind::compute::multiHeadAttentionPrefill(
+                            static_cast<const float*>(qBuf),
+                            static_cast<const float*>(kBuf),
+                            static_cast<const float*>(vBuf),
+                            T, n_heads, n_kv_heads, head_dim,
+                            static_cast<float*>(scoreBuf),
+                            static_cast<float*>(attnOutBuf));
+
+                        // 8. attn_output projection (no bias in Qwen2)
+                        mimirmind::compute::matmul(
+                            oW->type, oW->usmPtr,
+                            d_model, q_dim,
+                            static_cast<const float*>(attnOutBuf), T,
+                            static_cast<float*>(oProjBuf),
+                            static_cast<float*>(scratchC));
+
+                        // 9. Residual: xBuf += oProjBuf
+                        mimirmind::compute::addResidual(
+                            static_cast<float*>(xBuf),
+                            static_cast<const float*>(oProjBuf),
+                            T * d_model);
+
+                        const auto t1 = clock::now();
+                        const double ms =
+                            std::chrono::duration<double, std::milli>(t1 - t0).count();
+                        std::cout << "  block-0 time  : " << ms << " ms (incl. embed + 4 matmuls)\n";
+
+                        // Last-token hidden state
+                        const float* last = static_cast<const float*>(xBuf) +
+                                            (T - 1) * d_model;
+                        std::cout << "  last token id : " << promptIds.back()
+                                  << "  piece='" << tok.tokenText(promptIds.back()) << "'\n";
+
+                        std::cout << "  first 10 f32  :";
+                        std::cout << std::setprecision(6) << std::fixed;
+                        for (std::size_t i = 0; i < 10; ++i) {
+                            std::cout << "  " << last[i];
+                        }
+                        std::cout << "\n";
+                        std::cout.unsetf(std::ios::floatfield);
+
+                        double sumSqC = 0.0;
+                        float vMinL = last[0];
+                        float vMaxL = last[0];
+                        for (std::size_t i = 0; i < d_model; ++i) {
+                            const float v = last[i];
+                            sumSqC += static_cast<double>(v) * static_cast<double>(v);
+                            if (v < vMinL) {
+                                vMinL = v;
+                            }
+                            if (v > vMaxL) {
+                                vMaxL = v;
+                            }
+                        }
+                        std::cout << "  L2 norm       : " << std::sqrt(sumSqC) << "\n";
+                        std::cout << "  min / max     : " << vMinL << " / " << vMaxL << "\n";
+
+                        MM_LOG_INFO("main",
+                                    "[M4c] block-0 attn done in {:.1f}ms — "
+                                    "last-token L2={:.4f} min={:.4f} max={:.4f}",
+                                    ms, std::sqrt(sumSqC),
+                                    static_cast<double>(vMinL),
+                                    static_cast<double>(vMaxL));
+
+                        allocator.deallocate(scoreBuf,   scoreBytes);
+                        allocator.deallocate(scratchC,   scratchC_Bytes);
+                        allocator.deallocate(oProjBuf,   oProjBytes);
+                        allocator.deallocate(attnOutBuf, attnOutBytes);
+                        allocator.deallocate(normedC,    normedC_Bytes);
+                        allocator.deallocate(vBuf,       kvBufBytes);
+                        allocator.deallocate(kBuf,       kvBufBytes);
+                        allocator.deallocate(qBuf,       qBufBytes);
+                        allocator.deallocate(xBuf,       xBytes);
                     }
 
                     allocator.deallocate(embPtr, outBytes);

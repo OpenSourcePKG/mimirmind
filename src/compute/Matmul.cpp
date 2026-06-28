@@ -69,4 +69,19 @@ void matmul(model::GgmlType weightType,
     MM_LOG_DEBUG("matmul", "done — {} output rows produced", N);
 }
 
+void addBias(float* y, std::size_t M, std::size_t K, const float* bias) noexcept {
+    for (std::size_t m = 0; m < M; ++m) {
+        float* row = y + m * K;
+        for (std::size_t k = 0; k < K; ++k) {
+            row[k] += bias[k];
+        }
+    }
+}
+
+void addResidual(float* y, const float* x, std::size_t N) noexcept {
+    for (std::size_t i = 0; i < N; ++i) {
+        y[i] += x[i];
+    }
+}
+
 } // namespace mimirmind::compute

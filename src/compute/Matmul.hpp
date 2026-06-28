@@ -35,4 +35,12 @@ void matmul(model::GgmlType weightType,
             float*          Y,
             float*          scratch);
 
+/// In-place broadcast bias add: y[m,k] += bias[k] for all m in [0,M),
+/// k in [0,K). Used after a projection matmul that has a per-feature
+/// bias (Qwen2 has them on Q/K/V; Llama-family typically doesn't).
+void addBias(float* y, std::size_t M, std::size_t K, const float* bias) noexcept;
+
+/// In-place row-major residual add: y[i] += x[i] for i in [0, N).
+void addResidual(float* y, const float* x, std::size_t N) noexcept;
+
 } // namespace mimirmind::compute
