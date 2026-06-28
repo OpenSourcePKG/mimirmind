@@ -4,20 +4,18 @@
 //
 //   X:  [K]     F32 dense vector (single token / M=1)
 //   W:  [N, K]  Q4_K — each row is (K/256) super-blocks of 144 bytes
-//                in the layout matching ggml's block_q4_K.
 //   Y:  [N]     F32 dense vector
 //
-// Launch: global = N work-items, local = MATMUL_Q4K_LOCAL.
-//   One work-item produces one Y[n]. Each work-item walks its row of
-//   W super-block by super-block, decodes scale + mins, and dots
-//   against the matching slice of X. No intra-workgroup cooperation
-//   yet — pure data-parallel per output. X is re-read by every thread;
-//   first optimisation pass should be a __local cache of an X tile.
+// Launch: global = N work-items in groups of MATMUL_Q4K_LOCAL.
+//
+// Optimisation vs the first naive version: X is cooperatively cached
+// into __local memory in tiles of X_TILE_ELEMENTS (= 4 super-blocks).
+// Without this each of the 64 threads in a workgroup re-reads the full
+// X vector independently — for d_model=3584 that's ~900 KB of redundant
+// global reads per workgroup; tiling drops it to ~14 KB.
 //
 // Reference: ggml-quants.c dequantize_row_q4_K. Sub-block iteration
-// matches our compute/Dequant.cpp dequantQ4K (paired sub-blocks
-// j, j+1 share one 32-byte qs chunk: lower nibble -> sub-block j,
-// upper nibble -> sub-block j+1).
+// matches compute/Dequant.cpp dequantQ4K.
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
@@ -27,6 +25,10 @@
 
 #define Q4K_BLOCK_ELEMENTS 256
 #define Q4K_BLOCK_BYTES    144
+
+// Must be a multiple of Q4K_BLOCK_ELEMENTS (256). 1024 = 4 super-blocks
+// = 4 KiB SLM per workgroup, well within Intel iGPU SLM (>=64 KiB).
+#define X_TILE_ELEMENTS 1024
 
 inline uchar2 q4k_scale_min(int j, __global const uchar* sc) {
     uchar s, m;
@@ -48,51 +50,76 @@ __kernel void matmul_q4k_vec(
     const int             K,
     const int             N)
 {
-    const int n = (int)get_global_id(0);
-    if (n >= N) {
-        return;
-    }
+    __local float xTile[X_TILE_ELEMENTS];
 
-    const int nSuper = K / Q4K_BLOCK_ELEMENTS;
-
-    __global const uchar* row =
-        W + (size_t)n * (size_t)nSuper * Q4K_BLOCK_BYTES;
+    const int  n      = (int)get_global_id(0);
+    const int  tid    = (int)get_local_id(0);
+    const int  lsize  = (int)get_local_size(0);
+    const bool active = (n < N);
+    const int  nSuper = K / Q4K_BLOCK_ELEMENTS;
 
     float sum = 0.0f;
-    for (int sb = 0; sb < nSuper; ++sb) {
-        __global const uchar* block = row + sb * Q4K_BLOCK_BYTES;
 
-        const float d    = vload_half(0, (__global const half*)block);
-        const float dmin = vload_half(1, (__global const half*)block);
+    // Iterate K in X_TILE_ELEMENTS-sized tiles. Each tile is loaded
+    // cooperatively by the whole workgroup, then each (active) thread
+    // walks its row of W over the super-blocks that map into this tile.
+    for (int tile = 0; tile < K; tile += X_TILE_ELEMENTS) {
 
-        __global const uchar* scales = block + 4;    // 12 bytes
-        __global const uchar* qs     = block + 16;   // 128 bytes (256 nibbles)
+        // All threads participate in the cooperative load (barriers
+        // require uniform control flow).
+        const int tileK = min(X_TILE_ELEMENTS, K - tile);
+        for (int i = tid; i < tileK; i += lsize) {
+            xTile[i] = X[tile + i];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
 
-        const int sbBase = sb * Q4K_BLOCK_ELEMENTS;
+        if (active) {
+            __global const uchar* row =
+                W + (size_t)n * (size_t)nSuper * Q4K_BLOCK_BYTES;
 
-        // Eight sub-blocks of 32 elements, processed two at a time
-        // (paired: lower nibble -> sub-block j, upper nibble -> j+1).
-        for (int j = 0; j < 8; j += 2) {
-            const uchar2 sm0 = q4k_scale_min(j,     scales);
-            const uchar2 sm1 = q4k_scale_min(j + 1, scales);
-            const float  d1  = d    * (float)sm0.x;
-            const float  m1  = dmin * (float)sm0.y;
-            const float  d2  = d    * (float)sm1.x;
-            const float  m2  = dmin * (float)sm1.y;
+            const int sbStart    = tile / Q4K_BLOCK_ELEMENTS;
+            const int sbInTile   = X_TILE_ELEMENTS / Q4K_BLOCK_ELEMENTS;
+            const int sbEnd      = min(sbStart + sbInTile, nSuper);
 
-            const int qsOffset = (j / 2) * 32;
-            const int xLoBase  = sbBase + j * 32;
-            const int xHiBase  = sbBase + (j + 1) * 32;
+            for (int sb = sbStart; sb < sbEnd; ++sb) {
+                __global const uchar* block = row + sb * Q4K_BLOCK_BYTES;
 
-            for (int l = 0; l < 32; ++l) {
-                const uchar q   = qs[qsOffset + l];
-                const float qLo = (float)(q & 0x0F);
-                const float qHi = (float)(q >> 4);
-                sum = mad(X[xLoBase + l], d1 * qLo - m1, sum);
-                sum = mad(X[xHiBase + l], d2 * qHi - m2, sum);
+                const float d    = vload_half(0, (__global const half*)block);
+                const float dmin = vload_half(1, (__global const half*)block);
+
+                __global const uchar* scales = block + 4;    // 12 bytes
+                __global const uchar* qs     = block + 16;   // 128 bytes
+
+                const int xLocalBase = (sb - sbStart) * Q4K_BLOCK_ELEMENTS;
+
+                for (int j = 0; j < 8; j += 2) {
+                    const uchar2 sm0 = q4k_scale_min(j,     scales);
+                    const uchar2 sm1 = q4k_scale_min(j + 1, scales);
+                    const float  d1  = d    * (float)sm0.x;
+                    const float  m1  = dmin * (float)sm0.y;
+                    const float  d2  = d    * (float)sm1.x;
+                    const float  m2  = dmin * (float)sm1.y;
+
+                    const int qsOffset = (j / 2) * 32;
+                    const int xLoBase  = xLocalBase + j * 32;
+                    const int xHiBase  = xLocalBase + (j + 1) * 32;
+
+                    for (int l = 0; l < 32; ++l) {
+                        const uchar q   = qs[qsOffset + l];
+                        const float qLo = (float)(q & 0x0F);
+                        const float qHi = (float)(q >> 4);
+                        sum = mad(xTile[xLoBase + l], d1 * qLo - m1, sum);
+                        sum = mad(xTile[xHiBase + l], d2 * qHi - m2, sum);
+                    }
+                }
             }
         }
+
+        // All threads wait before the next tile is overwritten.
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    Y[n] = sum;
+    if (active) {
+        Y[n] = sum;
+    }
 }
