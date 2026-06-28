@@ -3,6 +3,8 @@
 #include "runtime/Log.hpp"
 
 #include <bit>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace mimirmind::runtime {
@@ -14,6 +16,32 @@ constexpr std::size_t   kProbeBlockBytes      = 256ULL << 20;   // 256 MiB
 constexpr std::uint32_t kProbeMaxBlocks       = 256;            // 256 × 256 MiB = 64 GiB ceiling
 constexpr std::size_t   kProbeBisectStep      = 64ULL << 20;    // 64 MiB resolution
 constexpr std::size_t   kProbeFallbackCeiling = 32ULL << 30;    // 32 GiB if device reports 0
+// Default cap for Phase 2 (total-allocatable sweep). The result is only
+// diagnostic; running the sweep to the full device-reported ceiling can
+// occupy *all* of host RAM on UMA systems for a few seconds, which is
+// risky on shared hosts. Override with MIMIRMIND_USM_PROBE_TOTAL_GIB.
+// Set the env var to 0 to skip Phase 2 entirely.
+constexpr std::size_t   kProbeTotalDefaultGiB = 4;
+
+std::size_t probeTotalCapBytes(std::size_t deviceCeiling) {
+    if (const char* env = std::getenv("MIMIRMIND_USM_PROBE_TOTAL_GIB");
+        env != nullptr && env[0] != '\0') {
+        try {
+            const long v = std::stol(env);
+            if (v <= 0) {
+                return 0; // skip phase 2 entirely
+            }
+            const std::size_t bytes =
+                static_cast<std::size_t>(v) * (1ULL << 30);
+            return std::min(bytes, deviceCeiling);
+        } catch (...) {
+            // fall through to default
+        }
+    }
+    return std::min(
+        static_cast<std::size_t>(kProbeTotalDefaultGiB * (1ULL << 30)),
+        deviceCeiling);
+}
 
 double bytesToMiB(std::size_t b) noexcept {
     return static_cast<double>(b) / (1024.0 * 1024.0);
@@ -420,21 +448,35 @@ void UsmAllocator::probeLimits() {
 
     // --- Phase 2 — total allocatable -----------------------------------------
 
+    const std::size_t phase2Cap = probeTotalCapBytes(hardCeiling);
+    if (phase2Cap == 0) {
+        MM_LOG_INFO("usm",
+                    "phase 2 — skipped (MIMIRMIND_USM_PROBE_TOTAL_GIB=0); "
+                    "totalAllocatable left at 0");
+        _limits.probed = true;
+        return;
+    }
+
     MM_LOG_INFO("usm",
-                "phase 2 — total allocatable: {} MiB blocks, cap={} blocks "
-                "({} MiB ceiling)",
-                kProbeBlockBytes >> 20, kProbeMaxBlocks, hardCeiling >> 20);
+                "phase 2 — total allocatable: {} MiB blocks, cap={} MiB "
+                "(env MIMIRMIND_USM_PROBE_TOTAL_GIB overrides; "
+                "device ceiling is {} MiB)",
+                kProbeBlockBytes >> 20, phase2Cap >> 20, hardCeiling >> 20);
+
+    const std::uint32_t maxBlocks = std::min<std::uint32_t>(
+        kProbeMaxBlocks,
+        static_cast<std::uint32_t>(phase2Cap / kProbeBlockBytes));
 
     std::vector<void*> blocks;
-    blocks.reserve(kProbeMaxBlocks);
+    blocks.reserve(maxBlocks);
 
-    while (blocks.size() < kProbeMaxBlocks) {
+    while (blocks.size() < maxBlocks) {
         const std::size_t soFar = blocks.size() * kProbeBlockBytes;
-        if (soFar + kProbeBlockBytes > hardCeiling) {
+        if (soFar + kProbeBlockBytes > phase2Cap) {
             MM_LOG_DEBUG("usm",
-                         "phase 2 — stopped at ceiling: {} blocks held, "
+                         "phase 2 — stopped at cap: {} blocks held, "
                          "next would exceed {} bytes",
-                         blocks.size(), hardCeiling);
+                         blocks.size(), phase2Cap);
             break;
         }
         void* ptr = rawAlloc(kProbeBlockBytes);
