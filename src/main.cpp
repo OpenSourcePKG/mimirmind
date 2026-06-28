@@ -701,6 +701,110 @@ int main() {
                 MM_LOG_ERROR("main", "[M5b] failed: {}", e.what());
             }
 
+            // --- [M5c] GPU Q6_K matmul (vec) — parity vs CPU (lm_head sized) -
+
+            std::cout << "\n[M5c] GPU Q6_K matvec kernel parity (lm_head)\n";
+            std::cout.flush();
+            MM_LOG_INFO("main", "[M5c] starting GPU Q6_K matvec parity test");
+            try {
+                const auto* outW = weights.find("output.weight");
+                if (outW == nullptr ||
+                    outW->type != mimirmind::model::GgmlType::Q6_K ||
+                    outW->dimensions.size() < 2) {
+                    std::cout << "  output.weight not Q6_K or missing — skipping\n";
+                } else {
+                    const std::size_t K = outW->dimensions[0];
+                    const std::size_t N = outW->dimensions[1];
+                    std::cout << "  weight        : " << outW->name
+                              << "  type=Q6_K  K=" << K << "  N=" << N << "\n";
+
+                    mimirmind::runtime::GpuModule modMm6{ctx, "matmul_q6k_vec"};
+                    mimirmind::runtime::GpuKernel knMm6{modMm6.kernel("matmul_q6k_vec")};
+                    mimirmind::runtime::CommandQueue queueMm6{ctx};
+
+                    const std::size_t xBytes6 = K * sizeof(float);
+                    const std::size_t yBytes6 = N * sizeof(float);
+                    void* xUsm6 = allocator.allocate(xBytes6);
+                    void* yUsm6 = allocator.allocate(yBytes6);
+                    std::vector<float> yCpu6(N);
+                    std::vector<float> scratch6(K);
+
+                    float* x6 = static_cast<float*>(xUsm6);
+                    for (std::size_t i = 0; i < K; ++i) {
+                        x6[i] = std::sin(static_cast<float>(i) * 0.011F) * 0.4F;
+                    }
+
+                    constexpr std::uint32_t kLocalN6 = 64;
+                    const std::uint32_t groups6 =
+                        static_cast<std::uint32_t>((N + kLocalN6 - 1) / kLocalN6);
+
+                    knMm6.setPtr(0, xUsm6);
+                    knMm6.setPtr(1, outW->usmPtr);
+                    knMm6.setPtr(2, yUsm6);
+                    knMm6.setValue<std::int32_t>(3, static_cast<std::int32_t>(K));
+                    knMm6.setValue<std::int32_t>(4, static_cast<std::int32_t>(N));
+                    knMm6.setGroupSize(kLocalN6, 1, 1);
+
+                    using clock = std::chrono::steady_clock;
+                    const auto g0 = clock::now();
+                    queueMm6.dispatch(knMm6, groups6, 1, 1);
+                    const auto g1 = clock::now();
+
+                    const auto c0 = clock::now();
+                    mimirmind::compute::matmul(
+                        outW->type, outW->usmPtr, N, K,
+                        static_cast<const float*>(xUsm6), 1,
+                        yCpu6.data(), scratch6.data());
+                    const auto c1 = clock::now();
+
+                    const float* yG = static_cast<const float*>(yUsm6);
+                    float maxDiff6 = 0.0F;
+                    float maxRef6  = 0.0F;
+                    for (std::size_t i = 0; i < N; ++i) {
+                        const float d = std::fabs(yG[i] - yCpu6[i]);
+                        if (d > maxDiff6) {
+                            maxDiff6 = d;
+                        }
+                        const float a = std::fabs(yCpu6[i]);
+                        if (a > maxRef6) {
+                            maxRef6 = a;
+                        }
+                    }
+                    const double gpuMs6 = std::chrono::duration<double, std::milli>(g1 - g0).count();
+                    const double cpuMs6 = std::chrono::duration<double, std::milli>(c1 - c0).count();
+
+                    std::cout << "  launch        : groups=" << groups6
+                              << " x local=" << kLocalN6 << " => "
+                              << (groups6 * kLocalN6) << " threads (N=" << N << ")\n";
+                    std::cout << "  gpu time      : " << gpuMs6 << " ms\n";
+                    std::cout << "  cpu time      : " << cpuMs6 << " ms\n";
+                    std::cout << "  speedup       : " << (cpuMs6 / gpuMs6) << "x\n";
+                    std::cout << "  max |GPU-CPU| : " << maxDiff6
+                              << "  (max |CPU| = " << maxRef6
+                              << ", rel = "
+                              << (maxRef6 > 0.0F ? (maxDiff6 / maxRef6) : 0.0F) << ")\n";
+                    std::cout << "  first 5 GPU   :  " << yG[0] << "  " << yG[1]
+                              << "  " << yG[2] << "  " << yG[3] << "  " << yG[4] << "\n";
+                    std::cout << "  first 5 CPU   :  " << yCpu6[0] << "  " << yCpu6[1]
+                              << "  " << yCpu6[2] << "  " << yCpu6[3] << "  "
+                              << yCpu6[4] << "\n";
+
+                    MM_LOG_INFO("main",
+                                "[M5c] gpu={:.2f}ms cpu={:.2f}ms speedup={:.2f}x "
+                                "max_diff={:.3e} max_cpu={:.3e}",
+                                gpuMs6, cpuMs6,
+                                cpuMs6 / gpuMs6,
+                                static_cast<double>(maxDiff6),
+                                static_cast<double>(maxRef6));
+
+                    allocator.deallocate(yUsm6, yBytes6);
+                    allocator.deallocate(xUsm6, xBytes6);
+                }
+            } catch (const std::exception& e) {
+                std::cout << "  Q6_K matmul failed: " << e.what() << "\n";
+                MM_LOG_ERROR("main", "[M5c] failed: {}", e.what());
+            }
+
             std::cout << "\n[M4a] Embedding lookup smoke test\n";
             std::cout.flush();
             MM_LOG_INFO("main", "[M4a] starting embedding lookup");
