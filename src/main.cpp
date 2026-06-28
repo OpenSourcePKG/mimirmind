@@ -1,12 +1,15 @@
+#include "compute/Embedding.hpp"
 #include "model/GgufReader.hpp"
 #include "model/LlmConfig.hpp"
 #include "model/Tokenizer.hpp"
+#include "model/WeightsMap.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
 #include "runtime/UsmAllocator.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,7 +26,7 @@ namespace {
 constexpr const char* kBanner =
     "+------------------------------------------------------------+\n"
     "|                          Mimirmind                         |\n"
-    "|   Project Well startup smoke (M1 ctx + M2 USM + M3 GGUF)   |\n"
+    "|   Project Well smoke (M1 ctx | M2 USM | M3 GGUF | M4 embed)|\n"
     "+------------------------------------------------------------+\n";
 
 std::string formatBytes(std::size_t bytes) {
@@ -284,6 +287,102 @@ int main() {
                       << " / " << st3.zeFreeCalls << "\n";
 
             allocator.logStats(mimirmind::runtime::LogLevel::Info);
+
+            // --- [M4a] Embedding lookup ----------------------------------
+
+            std::cout << "\n[M4a] Embedding lookup smoke test\n";
+            std::cout.flush();
+            MM_LOG_INFO("main", "[M4a] starting embedding lookup");
+
+            mimirmind::model::WeightsMap weights{reader};
+
+            const auto* tokEmb = weights.find("token_embd.weight");
+            if (tokEmb == nullptr) {
+                tokEmb = weights.find("tok_embeddings.weight");
+            }
+            if (tokEmb == nullptr) {
+                std::cout << "  no token-embedding tensor found, skipping\n";
+                MM_LOG_WARN("main",
+                            "[M4a] no token_embd.weight / tok_embeddings.weight");
+            } else {
+                std::cout << "  embed tensor  : " << tokEmb->name
+                          << "  type=" << mimirmind::model::typeInfo(tokEmb->type).name
+                          << "  dims=[";
+                for (std::size_t i = 0; i < tokEmb->dimensions.size(); ++i) {
+                    if (i > 0) {
+                        std::cout << ",";
+                    }
+                    std::cout << tokEmb->dimensions[i];
+                }
+                std::cout << "]\n";
+
+                const auto sampleIds = tok.encode("Hello", false);
+                std::cout << "  sample tokens : [";
+                for (std::size_t i = 0; i < sampleIds.size(); ++i) {
+                    if (i > 0) {
+                        std::cout << ", ";
+                    }
+                    std::cout << sampleIds[i];
+                }
+                std::cout << "]\n";
+
+                const std::size_t d_model    = config.embeddingLength;
+                const std::size_t vocab_size = tokEmb->dimensions.size() >= 2
+                                                ? tokEmb->dimensions[1]
+                                                : tok.vocabSize();
+                const std::size_t seqLen     = sampleIds.size();
+                const std::size_t outBytes   = seqLen * d_model * sizeof(float);
+
+                if (seqLen == 0) {
+                    std::cout << "  encode returned 0 tokens, nothing to embed\n";
+                } else {
+                    void* embPtr = allocator.allocate(outBytes);
+                    mimirmind::compute::embeddingLookup(
+                        tokEmb->type, tokEmb->usmPtr,
+                        d_model, vocab_size,
+                        sampleIds,
+                        static_cast<float*>(embPtr));
+
+                    const float* emb = static_cast<const float*>(embPtr);
+
+                    std::cout << "  d_model       : " << d_model << "\n";
+                    std::cout << "  output bytes  : " << formatBytes(outBytes) << "\n";
+                    std::cout << "  first id      : " << sampleIds[0]
+                              << "  piece='" << tok.tokenText(sampleIds[0]) << "'\n";
+
+                    std::cout << "  first 10 f32  :";
+                    std::cout << std::setprecision(6) << std::fixed;
+                    for (std::size_t i = 0; i < std::min<std::size_t>(10, d_model); ++i) {
+                        std::cout << "  " << emb[i];
+                    }
+                    std::cout << "\n";
+                    std::cout.unsetf(std::ios::floatfield);
+
+                    double sumSq = 0.0;
+                    float  vMin  = emb[0];
+                    float  vMax  = emb[0];
+                    for (std::size_t i = 0; i < d_model; ++i) {
+                        const float v = emb[i];
+                        sumSq += static_cast<double>(v) * static_cast<double>(v);
+                        if (v < vMin) {
+                            vMin = v;
+                        }
+                        if (v > vMax) {
+                            vMax = v;
+                        }
+                    }
+                    std::cout << "  L2 norm       : " << std::sqrt(sumSq) << "\n";
+                    std::cout << "  min / max     : " << vMin << " / " << vMax << "\n";
+
+                    MM_LOG_INFO("main",
+                                "[M4a] first token id={} L2={:.6f} min={:.6f} max={:.6f}",
+                                sampleIds[0], std::sqrt(sumSq),
+                                static_cast<double>(vMin),
+                                static_cast<double>(vMax));
+
+                    allocator.deallocate(embPtr, outBytes);
+                }
+            }
         }
 
         MM_LOG_INFO("main",
