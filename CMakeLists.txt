@@ -60,6 +60,50 @@ endif()
 message(STATUS "Level Zero headers: ${LEVEL_ZERO_INCLUDE_DIR}")
 message(STATUS "Level Zero library: ${LEVEL_ZERO_LIBRARY}")
 
+# ---- SPIR-V kernel compilation (ocloc) --------------------------------------
+
+find_program(OCLOC_EXECUTABLE
+    NAMES ocloc
+    DOC "Intel OpenCL Offline Compiler — compiles .cl to .spv")
+
+if(NOT OCLOC_EXECUTABLE)
+    message(FATAL_ERROR
+        "\n  ocloc not found.\n"
+        "  On Debian/Ubuntu via Intel repo: apt install intel-ocloc\n"
+        "  (or the Intel client driver bundle from\n"
+        "   https://dgpu-docs.intel.com/driver/client/overview.html)\n")
+endif()
+
+message(STATUS "ocloc: ${OCLOC_EXECUTABLE}")
+
+set(KERNEL_SOURCES
+    kernels/rmsnorm.cl
+)
+
+set(KERNEL_SPV_FILES "")
+set(SPV_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/spv)
+file(MAKE_DIRECTORY ${SPV_OUTPUT_DIR})
+
+foreach(src IN LISTS KERNEL_SOURCES)
+    get_filename_component(kname ${src} NAME_WE)
+    set(spv ${SPV_OUTPUT_DIR}/${kname}.spv)
+    add_custom_command(
+        OUTPUT ${spv}
+        COMMAND ${OCLOC_EXECUTABLE} compile
+                -file ${CMAKE_CURRENT_SOURCE_DIR}/${src}
+                -options "-cl-std=CL3.0"
+                -spv_only
+                -out_dir ${SPV_OUTPUT_DIR}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${src}
+        WORKING_DIRECTORY ${SPV_OUTPUT_DIR}
+        COMMENT "ocloc -> ${kname}.spv"
+        VERBATIM
+    )
+    list(APPEND KERNEL_SPV_FILES ${spv})
+endforeach()
+
+add_custom_target(spv_kernels ALL DEPENDS ${KERNEL_SPV_FILES})
+
 # ---- Targets ----------------------------------------------------------------
 
 add_executable(mimirmind
@@ -77,12 +121,17 @@ add_executable(mimirmind
     src/model/LlmConfig.cpp
     src/model/Tokenizer.cpp
     src/model/WeightsMap.cpp
+    src/runtime/CommandQueue.cpp
+    src/runtime/GpuKernel.cpp
+    src/runtime/GpuModule.cpp
     src/runtime/KvCache.cpp
     src/runtime/L0Context.cpp
     src/runtime/Log.cpp
     src/runtime/MappedFile.cpp
     src/runtime/UsmAllocator.cpp
 )
+
+add_dependencies(mimirmind spv_kernels)
 
 target_include_directories(mimirmind PRIVATE
     src

@@ -41,11 +41,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
     && rm -rf /var/lib/apt/lists/*
 
-# Intel GPU repo for current Level Zero (Ubuntu 24.04 = "noble")
-# NOTE: ocloc (SPIR-V offline compiler) is NOT installed here — its package
-# name in the Intel repo changed and we will only need it at milestone M5.
-# When adding it, probe the right name with:
-#   apt-cache search ocloc; apt-cache search intel-ocl
+# Intel GPU repo for current Level Zero (Ubuntu 24.04 = "noble").
+# intel-ocloc compiles OpenCL C to SPIR-V at build time; required from M5
+# onward where the GPU kernels live in kernels/*.cl.
 RUN wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
         | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
@@ -56,6 +54,7 @@ https://repositories.intel.com/gpu/ubuntu noble client" \
         level-zero-dev \
         intel-opencl-icd \
         intel-level-zero-gpu \
+        intel-ocloc \
     && rm -rf /var/lib/apt/lists/*
 
 # Default working dir for the bind-mounted source path
@@ -76,7 +75,7 @@ FROM builder AS build
 # CMake config first (only file that triggers a re-configure)
 COPY CMakeLists.txt ./
 COPY src ./src
-# COPY kernels ./kernels   # enabled at M5
+COPY kernels ./kernels
 
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build --parallel
@@ -114,6 +113,8 @@ ENV UR_L0_USE_RELAXED_ALLOCATION_LIMITS=1
 ENV MIMIRMIND_MODELS_DIR=/models
 
 COPY --from=build /src/build/mimirmind /usr/local/bin/mimirmind
-# COPY --from=build /src/build/spv /usr/local/share/mimirmind/spv   # enabled at M5
+COPY --from=build /src/build/spv       /usr/local/share/mimirmind/spv
+
+ENV MIMIRMIND_SPV_DIR=/usr/local/share/mimirmind/spv
 
 ENTRYPOINT ["/usr/local/bin/mimirmind"]
