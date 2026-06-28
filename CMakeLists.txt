@@ -66,6 +66,8 @@ add_executable(mimirmind
     src/main.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
+    src/compute/Matmul.cpp
+    src/compute/Norm.cpp
     src/model/GgufReader.cpp
     src/model/GgufTypes.cpp
     src/model/LlmConfig.cpp

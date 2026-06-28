@@ -1,4 +1,6 @@
 #include "compute/Embedding.hpp"
+#include "compute/Matmul.hpp"
+#include "compute/Norm.hpp"
 #include "model/GgufReader.hpp"
 #include "model/LlmConfig.hpp"
 #include "model/Tokenizer.hpp"
@@ -9,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +19,7 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <string>
 #include <utility>
 #include <variant>
@@ -379,6 +383,112 @@ int main() {
                                 sampleIds[0], std::sqrt(sumSq),
                                 static_cast<double>(vMin),
                                 static_cast<double>(vMax));
+
+                    // --- [M4b] output_norm + lm_head matmul -> top-K ----
+
+                    std::cout << "\n[M4b] Final norm + lm_head matmul -> top-5\n";
+                    std::cout.flush();
+                    MM_LOG_INFO("main", "[M4b] starting final-norm + lm_head");
+
+                    const auto* outNorm = weights.find("output_norm.weight");
+                    const auto* lmHead  = weights.find("output.weight");
+                    if (lmHead == nullptr) {
+                        // Many models tie the lm_head to the embedding.
+                        lmHead = weights.find("token_embd.weight");
+                    }
+
+                    if (outNorm == nullptr) {
+                        std::cout << "  output_norm.weight missing, skipping\n";
+                    } else if (lmHead == nullptr) {
+                        std::cout << "  no lm_head tensor found, skipping\n";
+                    } else {
+                        const std::size_t vocab_lm = lmHead->dimensions.size() >= 2
+                            ? lmHead->dimensions[1] : vocab_size;
+
+                        std::cout << "  output_norm   : " << outNorm->name
+                                  << "  type=" << mimirmind::model::typeInfo(outNorm->type).name << "\n";
+                        std::cout << "  lm_head       : " << lmHead->name
+                                  << "  type=" << mimirmind::model::typeInfo(lmHead->type).name
+                                  << "  dims=[" << lmHead->dimensions[0]
+                                  << "," << vocab_lm << "]\n";
+
+                        const std::size_t normBytes    = d_model * sizeof(float);
+                        const std::size_t logitsBytes  = vocab_lm * sizeof(float);
+                        const std::size_t scratchBytes = d_model * sizeof(float);
+
+                        void* normedPtr  = allocator.allocate(normBytes);
+                        void* logitsPtr  = allocator.allocate(logitsBytes);
+                        void* scratchPtr = allocator.allocate(scratchBytes);
+
+                        // Every production Llama/Qwen/Gemma stores norm weights
+                        // as F32; we'd add dequant-on-load here if that ever
+                        // stops being true.
+                        if (outNorm->type != mimirmind::model::GgmlType::F32) {
+                            std::cout << "  (output_norm weight is "
+                                      << mimirmind::model::typeInfo(outNorm->type).name
+                                      << ", not F32 — unsupported for now, skipping)\n";
+                            allocator.deallocate(scratchPtr, scratchBytes);
+                            allocator.deallocate(logitsPtr,  logitsBytes);
+                            allocator.deallocate(normedPtr,  normBytes);
+                            allocator.deallocate(embPtr,     outBytes);
+                            std::cout << "\nProject Well startup smoke test passed.\n";
+                            return 0;
+                        }
+                        const auto* normWeight = static_cast<const float*>(outNorm->usmPtr);
+
+                        using clock = std::chrono::steady_clock;
+                        auto t0 = clock::now();
+
+                        mimirmind::compute::rmsNorm(
+                            emb, seqLen, d_model,
+                            normWeight, config.rmsNormEps,
+                            static_cast<float*>(normedPtr));
+
+                        auto t1 = clock::now();
+                        mimirmind::compute::matmul(
+                            lmHead->type, lmHead->usmPtr,
+                            vocab_lm, d_model,
+                            static_cast<const float*>(normedPtr), seqLen,
+                            static_cast<float*>(logitsPtr),
+                            static_cast<float*>(scratchPtr));
+                        auto t2 = clock::now();
+
+                        const double normMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                        const double mmMs   = std::chrono::duration<double, std::milli>(t2 - t1).count();
+                        std::cout << "  rmsNorm time  : " << normMs << " ms\n";
+                        std::cout << "  matmul time   : " << mmMs   << " ms\n";
+
+                        // top-5 across the last row of logits (seqLen=1 -> row 0)
+                        const float* logitsRow = static_cast<const float*>(logitsPtr)
+                                                + (seqLen - 1) * vocab_lm;
+
+                        std::vector<std::int32_t> idx(vocab_lm);
+                        std::iota(idx.begin(), idx.end(), 0);
+                        const std::size_t topK = std::min<std::size_t>(5, vocab_lm);
+                        std::partial_sort(
+                            idx.begin(), idx.begin() + static_cast<std::ptrdiff_t>(topK),
+                            idx.end(),
+                            [logitsRow](std::int32_t a, std::int32_t b) {
+                                return logitsRow[a] > logitsRow[b];
+                            });
+
+                        std::cout << "  top-5 (no attention/FFN — embed -> norm -> lm_head):\n";
+                        for (std::size_t i = 0; i < topK; ++i) {
+                            const std::int32_t v = idx[i];
+                            std::cout << "    " << i << ": id=" << v
+                                      << "  logit=" << logitsRow[v]
+                                      << "  piece='" << tok.tokenText(v) << "'\n";
+                        }
+
+                        MM_LOG_INFO("main",
+                                    "[M4b] norm={:.1f}ms matmul={:.1f}ms top1_id={} logit={:.4f}",
+                                    normMs, mmMs,
+                                    idx[0], static_cast<double>(logitsRow[idx[0]]));
+
+                        allocator.deallocate(scratchPtr, scratchBytes);
+                        allocator.deallocate(logitsPtr,  logitsBytes);
+                        allocator.deallocate(normedPtr,  normBytes);
+                    }
 
                     allocator.deallocate(embPtr, outBytes);
                 }
