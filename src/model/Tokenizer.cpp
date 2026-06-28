@@ -4,6 +4,8 @@
 #include "runtime/Log.hpp"
 
 #include <algorithm>
+#include <array>
+#include <climits>
 #include <cstring>
 #include <optional>
 #include <queue>
@@ -72,6 +74,59 @@ std::size_t utf8CodepointLen(unsigned char c) noexcept {
     return 1; // malformed leading byte — treat as a single byte
 }
 
+std::string codepointToUtf8(int cp) {
+    std::string out;
+    if (cp < 0x80) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+    return out;
+}
+
+// GPT-2 byte-to-unicode mapping (Karpathy / OpenAI). Printable ASCII +
+// Latin-1 byte values stay as themselves; control / unicode-conflicting
+// bytes get remapped to U+0100..U+0142 so the entire 0..255 byte range
+// has a visible unicode representation.
+struct ByteUnicodeMap {
+    std::array<std::string, 256>            byteToUtf8;
+    std::unordered_map<std::string, std::uint8_t> utf8ToByte;
+};
+
+const ByteUnicodeMap& byteMap() {
+    static const ByteUnicodeMap m = [] {
+        std::vector<int> bs;
+        std::vector<int> cs;
+        for (int i = '!';  i <= '~';  ++i) { bs.push_back(i); cs.push_back(i); }
+        for (int i = 0xa1; i <= 0xac; ++i) { bs.push_back(i); cs.push_back(i); }
+        for (int i = 0xae; i <= 0xff; ++i) { bs.push_back(i); cs.push_back(i); }
+
+        int n = 0;
+        for (int b = 0; b < 256; ++b) {
+            if (std::find(bs.begin(), bs.end(), b) == bs.end()) {
+                bs.push_back(b);
+                cs.push_back(256 + n);
+                ++n;
+            }
+        }
+
+        ByteUnicodeMap out;
+        out.utf8ToByte.reserve(256);
+        for (std::size_t i = 0; i < bs.size(); ++i) {
+            const std::string s = codepointToUtf8(cs[i]);
+            out.byteToUtf8[static_cast<std::size_t>(bs[i])] = s;
+            out.utf8ToByte.emplace(s, static_cast<std::uint8_t>(bs[i]));
+        }
+        return out;
+    }();
+    return m;
+}
+
 std::string normalizeForSpm(std::string_view text) {
     // SentencePiece (and llama.cpp's SPM tokenizer) prepends a single ▁
     // and replaces internal ASCII spaces with ▁.
@@ -89,6 +144,10 @@ std::string normalizeForSpm(std::string_view text) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Loader
+// ---------------------------------------------------------------------------
 
 void Tokenizer::loadFromGguf(const GgufReader& reader) {
     if (const auto* v = reader.findMetadata("tokenizer.ggml.model")) {
@@ -144,17 +203,57 @@ void Tokenizer::loadFromGguf(const GgufReader& reader) {
     readSpecialId("tokenizer.ggml.unknown_token_id", _unknownId);
     readSpecialId("tokenizer.ggml.padding_token_id", _padId);
 
+    // For GPT-2 the merges array is what drives encoding — load it.
+    if (const auto* mergesArr = asArray(reader.findMetadata("tokenizer.ggml.merges"))) {
+        if (mergesArr->elementType == GgufValueType::String) {
+            _mergesRank.reserve(mergesArr->strings.size());
+            for (std::size_t i = 0; i < mergesArr->strings.size(); ++i) {
+                _mergesRank.emplace(mergesArr->strings[i],
+                                    static_cast<std::int32_t>(i));
+            }
+        }
+    }
+
     MM_LOG_INFO("tok",
-                "vocab loaded: {} tokens, bos={} eos={} unk={} pad={}",
-                _tokens.size(), _bosId, _eosId, _unknownId, _padId);
+                "vocab loaded: {} tokens, {} merges, bos={} eos={} unk={} pad={}",
+                _tokens.size(), _mergesRank.size(),
+                _bosId, _eosId, _unknownId, _padId);
 }
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
 
 std::vector<std::int32_t> Tokenizer::encode(std::string_view text, bool addBos) const {
     if (_tokens.empty()) {
         MM_LOG_WARN("tok", "encode called before loadFromGguf");
         return {};
     }
+    if (_modelType == "gpt2") {
+        return encodeGpt2(text, addBos);
+    }
+    // Default to SPM for "llama", empty, or anything else we haven't
+    // taught the dispatcher about yet.
+    if (_modelType != "llama" && !_modelType.empty()) {
+        MM_LOG_WARN("tok",
+                    "tokenizer model '{}' not recognised — falling back to SPM",
+                    _modelType);
+    }
+    return encodeSpm(text, addBos);
+}
 
+std::string Tokenizer::decode(std::span<const std::int32_t> ids, bool skipSpecial) const {
+    if (_modelType == "gpt2") {
+        return decodeGpt2(ids, skipSpecial);
+    }
+    return decodeSpm(ids, skipSpecial);
+}
+
+// ---------------------------------------------------------------------------
+// SentencePiece path (llama / gemma / mistral)
+// ---------------------------------------------------------------------------
+
+std::vector<std::int32_t> Tokenizer::encodeSpm(std::string_view text, bool addBos) const {
     const std::string normalized = normalizeForSpm(text);
 
     // Initial segmentation: one segment per UTF-8 codepoint, looked up in
@@ -249,8 +348,6 @@ std::vector<std::int32_t> Tokenizer::encode(std::string_view text, bool addBos) 
         }
         auto& right = segs[rIdx];
 
-        // Verify the candidate still describes the current adjacency
-        // (could be stale after intervening merges changed neighbours).
         std::string combined = left.text + right.text;
         auto it = _byText.find(combined);
         if (it == _byText.end() || it->second != c.id) {
@@ -285,7 +382,7 @@ std::vector<std::int32_t> Tokenizer::encode(std::string_view text, bool addBos) 
     }
 
     MM_LOG_DEBUG("tok",
-                 "encode('{}{}') -> {} tokens (after {} merges, addBos={})",
+                 "encodeSpm('{}{}') -> {} tokens (after {} merges, addBos={})",
                  text.substr(0, std::min<std::size_t>(text.size(), 40)),
                  text.size() > 40 ? "..." : "",
                  out.size(), merges, addBos);
@@ -293,8 +390,8 @@ std::vector<std::int32_t> Tokenizer::encode(std::string_view text, bool addBos) 
     return out;
 }
 
-std::string Tokenizer::decode(std::span<const std::int32_t> ids,
-                              bool skipSpecial) const {
+std::string Tokenizer::decodeSpm(std::span<const std::int32_t> ids,
+                                 bool skipSpecial) const {
     std::string raw;
     raw.reserve(ids.size() * 4);
 
@@ -308,7 +405,6 @@ std::string Tokenizer::decode(std::span<const std::int32_t> ids,
         raw.append(_tokens[static_cast<std::size_t>(id)].text);
     }
 
-    // Replace SentencePiece space marker with ASCII space.
     std::string out;
     out.reserve(raw.size());
     for (std::size_t i = 0; i < raw.size();) {
@@ -323,6 +419,120 @@ std::string Tokenizer::decode(std::span<const std::int32_t> ids,
     }
     return out;
 }
+
+// ---------------------------------------------------------------------------
+// GPT-2 byte-level BPE path (qwen2 / gpt-neox / ...)
+// ---------------------------------------------------------------------------
+
+std::vector<std::int32_t> Tokenizer::encodeGpt2(std::string_view text, bool addBos) const {
+    if (_mergesRank.empty()) {
+        MM_LOG_WARN("tok",
+                    "gpt2 tokenizer has no merges loaded — falling back to "
+                    "per-byte lookup");
+    }
+
+    const auto& bm = byteMap();
+
+    // Byte-encode: each input byte becomes its UTF-8 representation under
+    // the GPT-2 byte-to-unicode mapping. Each entry of `word` is a piece
+    // (which may grow during merging).
+    std::vector<std::string> word;
+    word.reserve(text.size());
+    for (char c : text) {
+        word.push_back(bm.byteToUtf8[static_cast<unsigned char>(c)]);
+    }
+
+    // Greedy best-rank-pair BPE. Iteratively pick the adjacent pair with
+    // the lowest rank in `_mergesRank` and merge it; stop when no
+    // adjacent pair maps to a merge.
+    while (word.size() > 1) {
+        std::int32_t bestRank = INT32_MAX;
+        std::size_t  bestIdx  = SIZE_MAX;
+        for (std::size_t i = 0; i + 1 < word.size(); ++i) {
+            std::string key;
+            key.reserve(word[i].size() + 1 + word[i + 1].size());
+            key.append(word[i]);
+            key.push_back(' ');
+            key.append(word[i + 1]);
+            auto it = _mergesRank.find(key);
+            if (it != _mergesRank.end() && it->second < bestRank) {
+                bestRank = it->second;
+                bestIdx  = i;
+            }
+        }
+        if (bestIdx == SIZE_MAX) {
+            break;
+        }
+        word[bestIdx] = word[bestIdx] + word[bestIdx + 1];
+        word.erase(word.begin() + static_cast<std::ptrdiff_t>(bestIdx) + 1);
+    }
+
+    std::vector<std::int32_t> out;
+    out.reserve(word.size() + 1);
+    if (addBos && _bosId >= 0) {
+        out.push_back(_bosId);
+    }
+    std::size_t oov = 0;
+    for (const auto& w : word) {
+        auto it = _byText.find(w);
+        if (it != _byText.end()) {
+            out.push_back(it->second);
+        } else {
+            out.push_back(_unknownId);
+            ++oov;
+        }
+    }
+
+    MM_LOG_DEBUG("tok",
+                 "encodeGpt2('{}{}') -> {} tokens ({} oov, addBos={})",
+                 text.substr(0, std::min<std::size_t>(text.size(), 40)),
+                 text.size() > 40 ? "..." : "",
+                 out.size(), oov, addBos);
+
+    return out;
+}
+
+std::string Tokenizer::decodeGpt2(std::span<const std::int32_t> ids,
+                                  bool skipSpecial) const {
+    const auto& bm = byteMap();
+
+    // Concatenate token text (in GPT-2 byte-encoded form), then walk
+    // codepoint-by-codepoint and invert the byte mapping. Unknown
+    // codepoints are passed through verbatim — that surfaces special
+    // tokens like <|endoftext|> rather than silently dropping them.
+    std::string raw;
+    raw.reserve(ids.size() * 4);
+    for (auto id : ids) {
+        if (id < 0 || static_cast<std::size_t>(id) >= _tokens.size()) {
+            continue;
+        }
+        if (skipSpecial && (id == _bosId || id == _eosId || id == _padId)) {
+            continue;
+        }
+        raw.append(_tokens[static_cast<std::size_t>(id)].text);
+    }
+
+    std::string out;
+    out.reserve(raw.size());
+    std::size_t i = 0;
+    while (i < raw.size()) {
+        const std::size_t cpLen = utf8CodepointLen(
+            static_cast<unsigned char>(raw[i]));
+        const std::size_t take = std::min(cpLen, raw.size() - i);
+        std::string cp = raw.substr(i, take);
+        if (auto it = bm.utf8ToByte.find(cp); it != bm.utf8ToByte.end()) {
+            out.push_back(static_cast<char>(it->second));
+        } else {
+            out.append(cp);
+        }
+        i += take;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Misc
+// ---------------------------------------------------------------------------
 
 std::string_view Tokenizer::tokenText(std::int32_t id) const noexcept {
     if (id < 0 || static_cast<std::size_t>(id) >= _tokens.size()) {

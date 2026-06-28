@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace mimirmind::model {
@@ -12,23 +13,27 @@ namespace mimirmind::model {
 class GgufReader;
 
 /**
- * SentencePiece-style BPE tokenizer driven directly off GGUF metadata.
- * The vocab + per-token scores live in `tokenizer.ggml.tokens` and
- * `tokenizer.ggml.scores` — no external SentencePiece library involved.
+ * BPE tokenizer that dispatches on `tokenizer.ggml.model`:
  *
- * Encode uses the canonical SP algorithm: split into UTF-8 code points,
- * then repeatedly merge the adjacent pair whose combined token has the
- * highest score, with leftmost-wins tiebreak. Decode concatenates token
- * text and converts the SentencePiece space marker (U+2581) back to ASCII
- * space.
+ *   - `llama` — SentencePiece-style: ▁-normalisation, per-token scores,
+ *     best-score-pair merging with leftmost-on-tie. Used by Llama/Gemma.
+ *   - `gpt2`  — Byte-level BPE: GPT-2 byte-to-unicode mapping, merges
+ *     ranked by their order in `tokenizer.ggml.merges`, lowest-rank-pair
+ *     wins. Used by Qwen2/3, GPT-NeoX, etc.
+ *   - `bert`  — Loaded but not encodeable (WordPiece, no plan to support).
  *
- * Known limitations (will be revisited when parity testing kicks in):
- *   - Byte-fallback for OOV characters is recognised but not yet
- *     synthesised — unknown code points map to `unknownId` instead.
- *   - Decode does not yet reconstitute raw bytes from `<0xXX>` byte
- *     tokens — they are emitted as-is.
- *   - Only the "llama" (SPM) model type is exercised; "gpt2" (merges
- *     array) and "bert" (WordPiece) are loaded but not encoded.
+ * Vocab + special tokens come straight from GGUF metadata — no external
+ * SentencePiece or HuggingFace tokenizer library involved.
+ *
+ * Known limitations (revisit when llama-cli parity testing kicks in):
+ *   - Llama: byte-fallback for OOV codepoints not synthesised — they
+ *     map to `unknownId` instead.
+ *   - GPT-2: no pre-tokenization regex split. The full input string is
+ *     byte-encoded then BPE'd in one go. For most inputs this matches
+ *     because merges built during training already respect the trainer's
+ *     pre-split — but edge cases (long whitespace runs, mixed
+ *     punctuation) may diverge from `llama-tokenize`.
+ *   - Decode does not yet expand `<0xXX>` byte tokens for llama vocabs.
  */
 class Tokenizer {
 public:
@@ -47,6 +52,7 @@ public:
 
     [[nodiscard]] std::size_t      vocabSize() const noexcept { return _tokens.size(); }
     [[nodiscard]] std::string_view modelType() const noexcept { return _modelType; }
+    [[nodiscard]] std::size_t      mergesCount() const noexcept { return _mergesRank.size(); }
 
     [[nodiscard]] std::int32_t bosId()     const noexcept { return _bosId;     }
     [[nodiscard]] std::int32_t eosId()     const noexcept { return _eosId;     }
@@ -60,9 +66,18 @@ private:
         std::int32_t type{1};
     };
 
-    std::vector<TokenInfo>                       _tokens{};
+    [[nodiscard]] std::vector<std::int32_t> encodeSpm (std::string_view text, bool addBos) const;
+    [[nodiscard]] std::vector<std::int32_t> encodeGpt2(std::string_view text, bool addBos) const;
+    [[nodiscard]] std::string                decodeSpm (std::span<const std::int32_t> ids, bool skipSpecial) const;
+    [[nodiscard]] std::string                decodeGpt2(std::span<const std::int32_t> ids, bool skipSpecial) const;
+
+    std::vector<TokenInfo>                        _tokens{};
     std::unordered_map<std::string, std::int32_t> _byText{};
-    std::string                                  _modelType{};
+    std::string                                   _modelType{};
+
+    // Populated only for the gpt2 model. Maps "first second" (the merges
+    // file format with a literal space separator) to its rank (lower = preferred).
+    std::unordered_map<std::string, std::int32_t> _mergesRank{};
 
     std::int32_t _bosId    {-1};
     std::int32_t _eosId    {-1};
