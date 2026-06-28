@@ -1,6 +1,7 @@
 #include "compute/Activations.hpp"
 #include "compute/Attention.hpp"
 #include "compute/Embedding.hpp"
+#include "compute/GpuMatmul.hpp"
 #include "compute/Matmul.hpp"
 #include "compute/Norm.hpp"
 #include "compute/Rope.hpp"
@@ -37,7 +38,7 @@ namespace {
 constexpr const char* kBanner =
     "+------------------------------------------------------------+\n"
     "|                          Mimirmind                         |\n"
-    "|  smoke: M1-M4 (CPU forward) + M5 GPU RMSNorm (Envoy boot)  |\n"
+    "|   smoke: M1-M4 + M5 GPU matmul integrated (Envoy in-path)  |\n"
     "+------------------------------------------------------------+\n";
 
 std::string formatBytes(std::size_t bytes) {
@@ -163,7 +164,8 @@ void runTransformerBlock(std::size_t                         blockIdx,
                          float*                              x,
                          std::size_t                         T,
                          mimirmind::runtime::KvCache&        cache,
-                         BlockBuffers&                       s) {
+                         BlockBuffers&                       s,
+                         mimirmind::compute::GpuMatmul&      gmm) {
     namespace mm = mimirmind;
 
     const auto* attnNorm = weights.findBlock(blockIdx, "attn_norm.weight");
@@ -205,10 +207,10 @@ void runTransformerBlock(std::size_t                         blockIdx,
     auto project = [&](const mm::model::GgufTensor* W,
                        const mm::model::GgufTensor* B,
                        std::size_t N, void* dst) {
-        mm::compute::matmul(W->type, W->usmPtr, N, d_model,
-                            static_cast<const float*>(s.normBuf), T,
-                            static_cast<float*>(dst),
-                            static_cast<float*>(s.matmulScratch));
+        gmm.matmul(W->type, W->usmPtr, N, d_model,
+                   static_cast<const float*>(s.normBuf), T,
+                   static_cast<float*>(dst),
+                   static_cast<float*>(s.matmulScratch));
         if (B != nullptr && B->type == mm::model::GgmlType::F32) {
             mm::compute::addBias(static_cast<float*>(dst), T, N,
                                  static_cast<const float*>(B->usmPtr));
@@ -243,10 +245,10 @@ void runTransformerBlock(std::size_t                         blockIdx,
         static_cast<float*>(s.scoreScratch),
         static_cast<float*>(s.attnOut));
 
-    mm::compute::matmul(oW->type, oW->usmPtr, d_model, q_dim,
-                        static_cast<const float*>(s.attnOut), T,
-                        static_cast<float*>(s.projOut),
-                        static_cast<float*>(s.matmulScratch));
+    gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,
+               static_cast<const float*>(s.attnOut), T,
+               static_cast<float*>(s.projOut),
+               static_cast<float*>(s.matmulScratch));
 
     mm::compute::addResidual(x, static_cast<const float*>(s.projOut), T * d_model);
 
@@ -256,24 +258,24 @@ void runTransformerBlock(std::size_t                         blockIdx,
                          cfg.rmsNormEps,
                          static_cast<float*>(s.normBuf));
 
-    mm::compute::matmul(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
-                        static_cast<const float*>(s.normBuf), T,
-                        static_cast<float*>(s.gateOut),
-                        static_cast<float*>(s.matmulScratch));
+    gmm.matmul(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
+               static_cast<const float*>(s.normBuf), T,
+               static_cast<float*>(s.gateOut),
+               static_cast<float*>(s.matmulScratch));
 
-    mm::compute::matmul(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
-                        static_cast<const float*>(s.normBuf), T,
-                        static_cast<float*>(s.upOut),
-                        static_cast<float*>(s.matmulScratch));
+    gmm.matmul(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
+               static_cast<const float*>(s.normBuf), T,
+               static_cast<float*>(s.upOut),
+               static_cast<float*>(s.matmulScratch));
 
     mm::compute::siluInPlace(static_cast<float*>(s.gateOut), T * ff_dim);
     mm::compute::mulInPlace(static_cast<float*>(s.gateOut),
                             static_cast<const float*>(s.upOut), T * ff_dim);
 
-    mm::compute::matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
-                        static_cast<const float*>(s.gateOut), T,
-                        static_cast<float*>(s.projOut),
-                        static_cast<float*>(s.matmulScratch));
+    gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
+               static_cast<const float*>(s.gateOut), T,
+               static_cast<float*>(s.projOut),
+               static_cast<float*>(s.matmulScratch));
 
     mm::compute::addResidual(x, static_cast<const float*>(s.projOut), T * d_model);
 }
@@ -593,6 +595,13 @@ int main() {
             allocator.logStats(mimirmind::runtime::LogLevel::Info);
 
             // --- [M4a] Embedding lookup ----------------------------------
+
+            // GPU matmul dispatcher: owns the SPIR-V modules + command
+            // queue and is reused by [M4b] lm_head, all transformer-block
+            // matmuls in [M4d/M4e], and the in-decode lm_head sampler.
+            // Constructed here (after tensors are in USM) so we have a
+            // single instance to thread through everything.
+            mimirmind::compute::GpuMatmul gmm{ctx};
 
             // --- [M5b] GPU Q4_K matmul (vec) — parity vs CPU ---------------
 
@@ -954,7 +963,7 @@ int main() {
                             static_cast<float*>(normedPtr));
 
                         auto t1 = clock::now();
-                        mimirmind::compute::matmul(
+                        gmm.matmul(
                             lmHead->type, lmHead->usmPtr,
                             vocab_lm, d_model,
                             static_cast<const float*>(normedPtr), seqLen,
@@ -1062,7 +1071,7 @@ int main() {
                                 static_cast<const float*>(outNormD->usmPtr),
                                 config.rmsNormEps,
                                 static_cast<float*>(normFinal));
-                            mm::compute::matmul(
+                            gmm.matmul(
                                 lmHeadD->type, lmHeadD->usmPtr,
                                 vocab_lm, config.embeddingLength,
                                 static_cast<const float*>(normFinal), 1,
@@ -1090,7 +1099,7 @@ int main() {
                         for (std::uint32_t b = 0; b < config.blockCount; ++b) {
                             runTransformerBlock(b, config, weights,
                                                 static_cast<float*>(xBufD), Tp,
-                                                cache, buffersD);
+                                                cache, buffersD, gmm);
                         }
                         cache.commit(Tp);
                         const auto preT1 = clock::now();
@@ -1137,7 +1146,7 @@ int main() {
                             for (std::uint32_t b = 0; b < config.blockCount; ++b) {
                                 runTransformerBlock(b, config, weights,
                                                     static_cast<float*>(xBufD), 1,
-                                                    cache, buffersD);
+                                                    cache, buffersD, gmm);
                             }
                             cache.commit(1);
 
