@@ -35,13 +35,12 @@ public:
     /// True if this dispatcher will run `type` on the GPU.
     [[nodiscard]] bool supports(model::GgmlType type) const noexcept;
 
-    /// Y [M, N] = X [M, K] * W [N, K]^T. Mirrors compute::matmul signature.
-    /// For supported `type` and M==1 the dispatch goes straight to the GPU
-    /// kernel; M>1 currently loops the matvec M times (one dispatch per
-    /// row of X). For unsupported types the call falls back to CPU.
+    /// Y [M, N] = X [M, K] * W [N, K]^T. Synchronous version (mirrors
+    /// compute::matmul signature). For supported `type` the dispatch goes
+    /// to the GPU kernel and we sync immediately. For unsupported types
+    /// the call falls back to CPU.
     ///
-    /// `scratch` (K floats) is only consumed on the CPU fallback path;
-    /// GPU path ignores it.
+    /// `scratch` (K floats) is only consumed on the CPU fallback path.
     void matmul(model::GgmlType type,
                 const void*     W,
                 std::size_t     N,
@@ -50,6 +49,29 @@ public:
                 std::size_t     M,
                 float*          Y,
                 float*          scratch);
+
+    /**
+     * Same as matmul() but doesn't sync. The Y buffer is NOT yet valid
+     * when this returns; call sync() before the CPU reads from it. Use
+     * to batch independent matmul calls into a single Level-Zero
+     * submission and save the per-dispatch sync cost.
+     *
+     * For unsupported types we transparently flush any pending GPU work
+     * first (to preserve ordering vs prior async appends), then run the
+     * CPU fallback synchronously.
+     */
+    void matmulAsync(model::GgmlType type,
+                     const void*     W,
+                     std::size_t     N,
+                     std::size_t     K,
+                     const float*    X,
+                     std::size_t     M,
+                     float*          Y,
+                     float*          scratch);
+
+    /// Flush any pending appends (close + execute + sync + reset). Safe
+    /// to call when there's no pending work — cheap no-op.
+    void sync();
 
 private:
     runtime::L0Context&    _ctx;

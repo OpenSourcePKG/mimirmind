@@ -29,22 +29,41 @@ public:
     CommandQueue& operator=(CommandQueue&&)      = delete;
 
     /**
-     * Launch `kernel` with `groupCountX/Y/Z` workgroups. The per-workgroup
-     * thread layout must be set on the kernel beforehand via
-     * GpuKernel::setGroupSize.
-     *
-     * Blocks until completion (zeCommandQueueSynchronize).
+     * Append a launch to the current command list. Does not execute or
+     * sync — the launch sits on the open list until flush() is called.
+     * Kernel arguments are captured at append time (per Level Zero spec),
+     * so subsequent setArgumentValue calls on the same handle for the
+     * *next* appendLaunch do not affect prior commands.
      */
-    void dispatch(GpuKernel& kernel,
+    void appendLaunch(GpuKernel&    kernel,
+                      std::uint32_t groupCountX,
+                      std::uint32_t groupCountY = 1,
+                      std::uint32_t groupCountZ = 1);
+
+    /**
+     * Close the list, execute on the queue, wait for completion, reset
+     * the list. Idempotent and cheap when no work is pending.
+     */
+    void flush();
+
+    /// True if appendLaunch has been called since the last flush().
+    [[nodiscard]] bool hasPending() const noexcept { return _hasPending; }
+
+    /**
+     * Convenience for single-shot dispatch (one append + flush). Blocks
+     * until completion. Equivalent to appendLaunch + flush.
+     */
+    void dispatch(GpuKernel&    kernel,
                   std::uint32_t groupCountX,
                   std::uint32_t groupCountY = 1,
                   std::uint32_t groupCountZ = 1);
 
 private:
     L0Context&                _ctx;
-    ze_command_queue_handle_t _queue   {nullptr};
-    ze_command_list_handle_t  _cmdList {nullptr};
-    std::uint32_t             _ordinal {0};
+    ze_command_queue_handle_t _queue     {nullptr};
+    ze_command_list_handle_t  _cmdList   {nullptr};
+    std::uint32_t             _ordinal   {0};
+    bool                      _hasPending{false};
 };
 
 } // namespace mimirmind::runtime

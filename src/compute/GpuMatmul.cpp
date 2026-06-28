@@ -25,16 +25,18 @@ bool GpuMatmul::supports(model::GgmlType type) const noexcept {
     return type == model::GgmlType::Q4_K || type == model::GgmlType::Q6_K;
 }
 
-void GpuMatmul::matmul(model::GgmlType type,
-                       const void*     W,
-                       std::size_t     N,
-                       std::size_t     K,
-                       const float*    X,
-                       std::size_t     M,
-                       float*          Y,
-                       float*          scratch) {
+void GpuMatmul::matmulAsync(model::GgmlType type,
+                            const void*     W,
+                            std::size_t     N,
+                            std::size_t     K,
+                            const float*    X,
+                            std::size_t     M,
+                            float*          Y,
+                            float*          scratch) {
     if (!supports(type)) {
-        // CPU fallback path.
+        // CPU fallback. If async GPU work is pending, sync it first so
+        // ordering vs prior matmulAsync calls is preserved.
+        _queue.flush();
         compute::matmul(type, W, N, K, X, M, Y, scratch);
         return;
     }
@@ -46,8 +48,9 @@ void GpuMatmul::matmul(model::GgmlType type,
         static_cast<std::uint32_t>((N + kLocalSize - 1) / kLocalSize);
     kern.setGroupSize(kLocalSize, 1, 1);
 
-    // One dispatch per row of X (M=1 dominates because decode is the hot
-    // path; batched M>1 kernel can come later).
+    // One appendLaunch per row of X. Per the Level Zero spec, args are
+    // captured at append time, so each loop iteration's setPtr/setValue
+    // do not affect the previously-recorded commands.
     for (std::size_t m = 0; m < M; ++m) {
         const float* xRow = X + m * K;
         float*       yRow = Y + m * N;
@@ -58,8 +61,24 @@ void GpuMatmul::matmul(model::GgmlType type,
         kern.setValue<std::int32_t>(3, static_cast<std::int32_t>(K));
         kern.setValue<std::int32_t>(4, static_cast<std::int32_t>(N));
 
-        _queue.dispatch(kern, groups, 1, 1);
+        _queue.appendLaunch(kern, groups, 1, 1);
     }
+}
+
+void GpuMatmul::matmul(model::GgmlType type,
+                       const void*     W,
+                       std::size_t     N,
+                       std::size_t     K,
+                       const float*    X,
+                       std::size_t     M,
+                       float*          Y,
+                       float*          scratch) {
+    matmulAsync(type, W, N, K, X, M, Y, scratch);
+    sync();
+}
+
+void GpuMatmul::sync() {
+    _queue.flush();
 }
 
 } // namespace mimirmind::compute
