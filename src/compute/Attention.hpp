@@ -5,40 +5,43 @@
 namespace mimirmind::compute {
 
 /**
- * Multi-head self-attention in prefill mode (no KV-cache, all positions
- * processed at once with a causal mask). GQA-aware: Q has `nHeads`
- * heads, K and V have `nKvHeads`, and Q head `h` reads from KV head
- * `h * nKvHeads / nHeads`.
+ * Multi-head self-attention, GQA-aware, causal. Unified entry point for
+ * both prefill and decode modes.
  *
- * Tensor layouts (all row-major, contiguous):
- *   q:   [seqLen, nHeads,    headDim]
- *   k:   [seqLen, nKvHeads,  headDim]
- *   v:   [seqLen, nKvHeads,  headDim]
- *   out: [seqLen, nHeads,    headDim]
+ * Layouts (all row-major, contiguous):
+ *   q:   [T_q, nHeads,    headDim]
+ *   k:   [T_k, nKvHeads,  headDim]    — read-only, may be the KV cache
+ *   v:   [T_k, nKvHeads,  headDim]    — read-only, may be the KV cache
+ *   out: [T_q, nHeads,    headDim]
  *
- * Scratch buffer: `seqLen` floats — reused per (head, query-position)
- * for the attention score row.
+ * Position math: query row p (0..T_q) corresponds to absolute position
+ * `positionOffset + p`. It attends to keys at positions
+ *   [0, min(positionOffset + p + 1, T_k))
  *
- * Math per (query position p, query head h_q, dimension d):
+ * Modes by parameter combination:
+ *   - Prefill:  T_q == T_k, positionOffset == 0
+ *               (q,k,v all from this forward pass)
+ *   - Decode:   T_q == 1, T_k == cache_length + 1,
+ *               positionOffset == cache_length
+ *               (q from this step; k,v from cache base pointer)
  *
- *   scale = 1 / sqrt(headDim)
- *   h_kv  = (h_q * nKvHeads) / nHeads
+ * scratch: T_k floats, reused per (head, query-position) for the score row.
  *
- *   for kk in 0..seqLen:
- *     scores[kk] = (kk <= p) ? dot(q[p, h_q], k[kk, h_kv]) * scale
- *                            : -inf      // (effectively masked)
- *   scores = softmax(scores)
+ * GQA: query head h_q reads from KV head (h_q * nKvHeads) / nHeads.
  *
- *   out[p, h_q, d] = sum_{kk <= p} scores[kk] * v[kk, h_kv, d]
+ * Softmax is numerically stable (max-subtract). Scores are scaled by
+ * 1/sqrt(headDim) before softmax.
  */
-void multiHeadAttentionPrefill(const float* q,
-                               const float* k,
-                               const float* v,
-                               std::size_t  seqLen,
-                               std::size_t  nHeads,
-                               std::size_t  nKvHeads,
-                               std::size_t  headDim,
-                               float*       scratch,
-                               float*       out);
+void multiHeadAttention(const float* q,
+                        const float* k,
+                        const float* v,
+                        std::size_t  T_q,
+                        std::size_t  T_k,
+                        std::size_t  nHeads,
+                        std::size_t  nKvHeads,
+                        std::size_t  headDim,
+                        std::size_t  positionOffset,
+                        float*       scratch,
+                        float*       out);
 
 } // namespace mimirmind::compute

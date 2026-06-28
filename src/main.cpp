@@ -8,6 +8,7 @@
 #include "model/LlmConfig.hpp"
 #include "model/Tokenizer.hpp"
 #include "model/WeightsMap.hpp"
+#include "runtime/KvCache.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
 #include "runtime/UsmAllocator.hpp"
@@ -33,7 +34,7 @@ namespace {
 constexpr const char* kBanner =
     "+------------------------------------------------------------+\n"
     "|                          Mimirmind                         |\n"
-    "|   smoke: M1 ctx | M2 USM | M3 GGUF | M4 full forward CPU   |\n"
+    "|   smoke: M1-M3 + M4 prefill + M4e autoregressive (CPU)     |\n"
     "+------------------------------------------------------------+\n";
 
 std::string formatBytes(std::size_t bytes) {
@@ -72,28 +73,25 @@ void printDevice(const mimirmind::runtime::DeviceInfo& info, bool selected) {
     std::cout << "      sub-devs : " << info.numSubDevices << "\n";
 }
 
-// ---- Transformer-block scratch + forward (used by [M4d]) -----------------
+// ---- Transformer-block scratch + forward (shared by M4c / M4d / M4e) -----
 
 struct BlockBuffers {
-    std::size_t T{};
+    std::size_t maxT{};
+    std::size_t maxSeq{};
     std::size_t d_model{};
     std::size_t q_dim{};
-    std::size_t kv_dim{};
     std::size_t ff_dim{};
 
-    void* qBuf{};
-    void* kBuf{};
-    void* vBuf{};
-    void* normBuf{};
-    void* attnOut{};
-    void* projOut{};
-    void* gateOut{};
-    void* upOut{};
-    void* matmulScratch{};
-    void* scoreScratch{};
+    void* qBuf{};           // maxT * q_dim   (K and V go straight into the KV cache)
+    void* normBuf{};        // maxT * d_model
+    void* attnOut{};        // maxT * q_dim
+    void* projOut{};        // maxT * d_model
+    void* gateOut{};        // maxT * ff_dim
+    void* upOut{};          // maxT * ff_dim
+    void* matmulScratch{};  // max(d_model, q_dim, ff_dim)
+    void* scoreScratch{};   // maxSeq   (full attention row including KV history)
 
     std::size_t qBytes{};
-    std::size_t kvBytes{};
     std::size_t normBytes{};
     std::size_t attnOutBytes{};
     std::size_t projOutBytes{};
@@ -104,29 +102,27 @@ struct BlockBuffers {
 };
 
 BlockBuffers allocBlockBuffers(mimirmind::runtime::UsmAllocator& alloc,
-                               std::size_t T,
+                               std::size_t maxT,
+                               std::size_t maxSeq,
                                const mimirmind::model::LlmConfig& cfg) {
     BlockBuffers b{};
-    b.T       = T;
+    b.maxT    = maxT;
+    b.maxSeq  = maxSeq;
     b.d_model = cfg.embeddingLength;
-    b.q_dim   = cfg.headCount   * cfg.headDim();
-    b.kv_dim  = cfg.headCountKv * cfg.headDim();
+    b.q_dim   = cfg.headCount * cfg.headDim();
     b.ff_dim  = cfg.feedForwardLength;
 
-    b.qBytes             = T * b.q_dim   * sizeof(float);
-    b.kvBytes            = T * b.kv_dim  * sizeof(float);
-    b.normBytes          = T * b.d_model * sizeof(float);
-    b.attnOutBytes       = T * b.q_dim   * sizeof(float);
-    b.projOutBytes       = T * b.d_model * sizeof(float);
-    b.gateOutBytes       = T * b.ff_dim  * sizeof(float);
-    b.upOutBytes         = T * b.ff_dim  * sizeof(float);
-    b.scoreScratchBytes  = T             * sizeof(float);
+    b.qBytes             = maxT * b.q_dim   * sizeof(float);
+    b.normBytes          = maxT * b.d_model * sizeof(float);
+    b.attnOutBytes       = maxT * b.q_dim   * sizeof(float);
+    b.projOutBytes       = maxT * b.d_model * sizeof(float);
+    b.gateOutBytes       = maxT * b.ff_dim  * sizeof(float);
+    b.upOutBytes         = maxT * b.ff_dim  * sizeof(float);
+    b.scoreScratchBytes  = maxSeq           * sizeof(float);
     b.matmulScratchBytes =
         std::max({b.d_model, b.q_dim, b.ff_dim}) * sizeof(float);
 
     b.qBuf          = alloc.allocate(b.qBytes);
-    b.kBuf          = alloc.allocate(b.kvBytes);
-    b.vBuf          = alloc.allocate(b.kvBytes);
     b.normBuf       = alloc.allocate(b.normBytes);
     b.attnOut       = alloc.allocate(b.attnOutBytes);
     b.projOut       = alloc.allocate(b.projOutBytes);
@@ -145,15 +141,25 @@ void freeBlockBuffers(mimirmind::runtime::UsmAllocator& alloc, BlockBuffers& b) 
     alloc.deallocate(b.projOut,       b.projOutBytes);
     alloc.deallocate(b.attnOut,       b.attnOutBytes);
     alloc.deallocate(b.normBuf,       b.normBytes);
-    alloc.deallocate(b.vBuf,          b.kvBytes);
-    alloc.deallocate(b.kBuf,          b.kvBytes);
     alloc.deallocate(b.qBuf,          b.qBytes);
 }
 
-void runTransformerBlock(std::size_t blockIdx,
+/**
+ * One transformer block forward — prefill OR decode.
+ *
+ *   x:     [T, d_model] in/out residual stream — overwritten with x + attn + ffn
+ *   T:     new tokens this call (T <= s.maxT)
+ *   cache: K/V cache. This block writes layer `blockIdx`'s new K/V at
+ *          cache.length(); attention reads cache.baseK/V with
+ *          T_k = cache.length() + T, positionOffset = cache.length().
+ *          Caller must commit(T) once per forward pass (after all layers).
+ */
+void runTransformerBlock(std::size_t                         blockIdx,
                          const mimirmind::model::LlmConfig&  cfg,
                          const mimirmind::model::WeightsMap& weights,
                          float*                              x,
+                         std::size_t                         T,
+                         mimirmind::runtime::KvCache&        cache,
                          BlockBuffers&                       s) {
     namespace mm = mimirmind;
 
@@ -179,12 +185,13 @@ void runTransformerBlock(std::size_t blockIdx,
             "transformer block " + std::to_string(blockIdx) + " missing a tensor");
     }
 
-    const std::size_t T        = s.T;
     const std::size_t d_model  = s.d_model;
     const std::size_t q_dim    = s.q_dim;
-    const std::size_t kv_dim   = s.kv_dim;
+    const std::size_t kv_dim   = cfg.headCountKv * cfg.headDim();
     const std::size_t ff_dim   = s.ff_dim;
     const std::size_t head_dim = cfg.headDim();
+    const std::size_t curLen   = cache.length();
+    const std::size_t totalLen = curLen + T;
 
     // attn_norm(x) -> normBuf
     mm::compute::rmsNorm(x, T, d_model,
@@ -205,20 +212,31 @@ void runTransformerBlock(std::size_t blockIdx,
         }
     };
 
-    project(qW, qB, q_dim,  s.qBuf);
-    project(kW, kB, kv_dim, s.kBuf);
-    project(vW, vB, kv_dim, s.vBuf);
+    project(qW, qB, q_dim, s.qBuf);
 
+    // K and V project straight into the KV cache at offset curLen.
+    float* kSlot = cache.writeSlotK(blockIdx);
+    float* vSlot = cache.writeSlotV(blockIdx);
+    project(kW, kB, kv_dim, kSlot);
+    project(vW, vB, kv_dim, vSlot);
+
+    // RoPE on Q and the freshly-written K rows; startPos == curLen so the
+    // absolute positions in decode mode line up with what's already cached.
     mm::compute::applyRopeInPlace(static_cast<float*>(s.qBuf), T,
-                                  cfg.headCount,   head_dim, 0, cfg.ropeFreqBase);
-    mm::compute::applyRopeInPlace(static_cast<float*>(s.kBuf), T,
-                                  cfg.headCountKv, head_dim, 0, cfg.ropeFreqBase);
+                                  cfg.headCount,   head_dim, curLen,
+                                  cfg.ropeFreqBase);
+    mm::compute::applyRopeInPlace(kSlot, T,
+                                  cfg.headCountKv, head_dim, curLen,
+                                  cfg.ropeFreqBase);
 
-    mm::compute::multiHeadAttentionPrefill(
+    // Attention: T_q = T, T_k = totalLen (cached + new), causal w/ position offset.
+    mm::compute::multiHeadAttention(
         static_cast<const float*>(s.qBuf),
-        static_cast<const float*>(s.kBuf),
-        static_cast<const float*>(s.vBuf),
-        T, cfg.headCount, cfg.headCountKv, head_dim,
+        cache.baseK(blockIdx),
+        cache.baseV(blockIdx),
+        T, totalLen,
+        cfg.headCount, cfg.headCountKv, head_dim,
+        curLen,
         static_cast<float*>(s.scoreScratch),
         static_cast<float*>(s.attnOut));
 
@@ -678,197 +696,26 @@ int main() {
                         allocator.deallocate(normedPtr,  normBytes);
                     }
 
-                    // --- [M4c] Block-0 self-attention (prefill, GQA) ----
+                    // --- [M4d/M4e] Prefill + autoregressive generation ---
+                    //
+                    // Single combined pipeline: prefill the prompt (28-block
+                    // forward populates the KV cache), greedy-sample the
+                    // first new token, then loop decode-mode forwards (T=1)
+                    // for N more tokens. Streams the generated text token by
+                    // token to stdout.
 
-                    std::cout << "\n[M4c] Block 0 self-attention smoke (prefill)\n";
+                    namespace mm = mimirmind;
+                    using clock = std::chrono::steady_clock;
+
+                    std::cout << "\n[M4d/M4e] Prefill + autoregressive generation\n";
                     std::cout.flush();
-                    MM_LOG_INFO("main", "[M4c] starting block-0 attention");
-
-                    const std::string promptStr = "Hello, world!";
-                    const auto promptIds = tok.encode(promptStr, false);
-                    const std::size_t T = promptIds.size();
-
-                    const auto* attnNorm = weights.findBlock(0, "attn_norm.weight");
-                    const auto* qW = weights.findBlock(0, "attn_q.weight");
-                    const auto* qB = weights.findBlock(0, "attn_q.bias");
-                    const auto* kW = weights.findBlock(0, "attn_k.weight");
-                    const auto* kB = weights.findBlock(0, "attn_k.bias");
-                    const auto* vW = weights.findBlock(0, "attn_v.weight");
-                    const auto* vB = weights.findBlock(0, "attn_v.bias");
-                    const auto* oW = weights.findBlock(0, "attn_output.weight");
-
-                    if (T == 0 || attnNorm == nullptr || qW == nullptr ||
-                        kW == nullptr || vW == nullptr || oW == nullptr) {
-                        std::cout << "  prerequisites missing, skipping\n";
-                    } else {
-                        const std::size_t n_heads    = config.headCount;
-                        const std::size_t n_kv_heads = config.headCountKv;
-                        const std::size_t head_dim   = config.headDim();
-                        const std::size_t kv_dim     = n_kv_heads * head_dim;
-                        const std::size_t q_dim      = n_heads    * head_dim;
-
-                        std::cout << "  prompt        : \"" << promptStr
-                                  << "\" -> " << T << " tokens\n";
-                        std::cout << "  shapes        : Q=[" << T << "," << q_dim
-                                  << "] KV=[" << T << "," << kv_dim
-                                  << "] heads=" << n_heads
-                                  << " (kv=" << n_kv_heads
-                                  << ", head_dim=" << head_dim << ")\n";
-
-                        const std::size_t xBytes        = T * d_model * sizeof(float);
-                        const std::size_t qBufBytes     = T * q_dim   * sizeof(float);
-                        const std::size_t kvBufBytes    = T * kv_dim  * sizeof(float);
-                        const std::size_t normedC_Bytes = T * d_model * sizeof(float);
-                        const std::size_t attnOutBytes  = T * q_dim   * sizeof(float);
-                        const std::size_t oProjBytes    = T * d_model * sizeof(float);
-                        const std::size_t scoreBytes    = T           * sizeof(float);
-                        // Matmul row scratch: needs K floats, where K is the
-                        // input feature dim (d_model for Q/K/V/Onorm, q_dim for o_proj).
-                        const std::size_t scratchC_Bytes =
-                            std::max(d_model, q_dim) * sizeof(float);
-
-                        void* xBuf       = allocator.allocate(xBytes);
-                        void* qBuf       = allocator.allocate(qBufBytes);
-                        void* kBuf       = allocator.allocate(kvBufBytes);
-                        void* vBuf       = allocator.allocate(kvBufBytes);
-                        void* normedC    = allocator.allocate(normedC_Bytes);
-                        void* attnOutBuf = allocator.allocate(attnOutBytes);
-                        void* oProjBuf   = allocator.allocate(oProjBytes);
-                        void* scratchC   = allocator.allocate(scratchC_Bytes);
-                        void* scoreBuf   = allocator.allocate(scoreBytes);
-
-                        using clock = std::chrono::steady_clock;
-                        const auto t0 = clock::now();
-
-                        // 1. Embedding lookup -> xBuf
-                        mimirmind::compute::embeddingLookup(
-                            tokEmb->type, tokEmb->usmPtr, d_model, vocab_size,
-                            promptIds, static_cast<float*>(xBuf));
-
-                        // 2. attn_norm -> normedC
-                        mimirmind::compute::rmsNorm(
-                            static_cast<const float*>(xBuf), T, d_model,
-                            static_cast<const float*>(attnNorm->usmPtr),
-                            config.rmsNormEps,
-                            static_cast<float*>(normedC));
-
-                        auto projectAndBias = [&](
-                            const mimirmind::model::GgufTensor* W,
-                            const mimirmind::model::GgufTensor* B,
-                            std::size_t N, void* dst)
-                        {
-                            mimirmind::compute::matmul(
-                                W->type, W->usmPtr,
-                                N, d_model,
-                                static_cast<const float*>(normedC), T,
-                                static_cast<float*>(dst),
-                                static_cast<float*>(scratchC));
-                            if (B != nullptr &&
-                                B->type == mimirmind::model::GgmlType::F32) {
-                                mimirmind::compute::addBias(
-                                    static_cast<float*>(dst), T, N,
-                                    static_cast<const float*>(B->usmPtr));
-                            }
-                        };
-
-                        // 3-5. Q, K, V projections
-                        projectAndBias(qW, qB, q_dim,  qBuf);
-                        projectAndBias(kW, kB, kv_dim, kBuf);
-                        projectAndBias(vW, vB, kv_dim, vBuf);
-
-                        // 6. RoPE on Q and K (V untouched)
-                        mimirmind::compute::applyRopeInPlace(
-                            static_cast<float*>(qBuf), T, n_heads,
-                            head_dim, 0, config.ropeFreqBase);
-                        mimirmind::compute::applyRopeInPlace(
-                            static_cast<float*>(kBuf), T, n_kv_heads,
-                            head_dim, 0, config.ropeFreqBase);
-
-                        // 7. Multi-head attention (causal, GQA)
-                        mimirmind::compute::multiHeadAttentionPrefill(
-                            static_cast<const float*>(qBuf),
-                            static_cast<const float*>(kBuf),
-                            static_cast<const float*>(vBuf),
-                            T, n_heads, n_kv_heads, head_dim,
-                            static_cast<float*>(scoreBuf),
-                            static_cast<float*>(attnOutBuf));
-
-                        // 8. attn_output projection (no bias in Qwen2)
-                        mimirmind::compute::matmul(
-                            oW->type, oW->usmPtr,
-                            d_model, q_dim,
-                            static_cast<const float*>(attnOutBuf), T,
-                            static_cast<float*>(oProjBuf),
-                            static_cast<float*>(scratchC));
-
-                        // 9. Residual: xBuf += oProjBuf
-                        mimirmind::compute::addResidual(
-                            static_cast<float*>(xBuf),
-                            static_cast<const float*>(oProjBuf),
-                            T * d_model);
-
-                        const auto t1 = clock::now();
-                        const double ms =
-                            std::chrono::duration<double, std::milli>(t1 - t0).count();
-                        std::cout << "  block-0 time  : " << ms << " ms (incl. embed + 4 matmuls)\n";
-
-                        // Last-token hidden state
-                        const float* last = static_cast<const float*>(xBuf) +
-                                            (T - 1) * d_model;
-                        std::cout << "  last token id : " << promptIds.back()
-                                  << "  piece='" << tok.tokenText(promptIds.back()) << "'\n";
-
-                        std::cout << "  first 10 f32  :";
-                        std::cout << std::setprecision(6) << std::fixed;
-                        for (std::size_t i = 0; i < 10; ++i) {
-                            std::cout << "  " << last[i];
-                        }
-                        std::cout << "\n";
-                        std::cout.unsetf(std::ios::floatfield);
-
-                        double sumSqC = 0.0;
-                        float vMinL = last[0];
-                        float vMaxL = last[0];
-                        for (std::size_t i = 0; i < d_model; ++i) {
-                            const float v = last[i];
-                            sumSqC += static_cast<double>(v) * static_cast<double>(v);
-                            if (v < vMinL) {
-                                vMinL = v;
-                            }
-                            if (v > vMaxL) {
-                                vMaxL = v;
-                            }
-                        }
-                        std::cout << "  L2 norm       : " << std::sqrt(sumSqC) << "\n";
-                        std::cout << "  min / max     : " << vMinL << " / " << vMaxL << "\n";
-
-                        MM_LOG_INFO("main",
-                                    "[M4c] block-0 attn done in {:.1f}ms — "
-                                    "last-token L2={:.4f} min={:.4f} max={:.4f}",
-                                    ms, std::sqrt(sumSqC),
-                                    static_cast<double>(vMinL),
-                                    static_cast<double>(vMaxL));
-
-                        allocator.deallocate(scoreBuf,   scoreBytes);
-                        allocator.deallocate(scratchC,   scratchC_Bytes);
-                        allocator.deallocate(oProjBuf,   oProjBytes);
-                        allocator.deallocate(attnOutBuf, attnOutBytes);
-                        allocator.deallocate(normedC,    normedC_Bytes);
-                        allocator.deallocate(vBuf,       kvBufBytes);
-                        allocator.deallocate(kBuf,       kvBufBytes);
-                        allocator.deallocate(qBuf,       qBufBytes);
-                        allocator.deallocate(xBuf,       xBytes);
-                    }
-
-                    // --- [M4d] Full 28-block forward + lm_head -> sample ---
-
-                    std::cout << "\n[M4d] Full forward (28 blocks + norm + lm_head) -> top-5\n";
-                    std::cout.flush();
-                    MM_LOG_INFO("main", "[M4d] starting full forward");
+                    MM_LOG_INFO("main", "[M4d/M4e] starting full forward + decode");
 
                     const std::string fwdPrompt = "Hello, world!";
                     const auto fwdIds = tok.encode(fwdPrompt, false);
-                    const std::size_t Tf = fwdIds.size();
+                    const std::size_t Tp = fwdIds.size();
+
+                    constexpr std::size_t kMaxGen = 20;
 
                     const auto* outNormD = weights.find("output_norm.weight");
                     const auto* lmHeadD  = weights.find("output.weight");
@@ -876,113 +723,146 @@ int main() {
                         lmHeadD = weights.find("token_embd.weight");
                     }
 
-                    if (Tf == 0 || outNormD == nullptr || lmHeadD == nullptr) {
+                    if (Tp == 0 || outNormD == nullptr || lmHeadD == nullptr ||
+                        outNormD->type != mm::model::GgmlType::F32) {
                         std::cout << "  prerequisites missing, skipping\n";
-                    } else if (outNormD->type != mimirmind::model::GgmlType::F32) {
-                        std::cout << "  output_norm not F32, skipping\n";
                     } else {
                         const std::size_t vocab_lm =
                             lmHeadD->dimensions.size() >= 2
-                            ? lmHeadD->dimensions[1]
-                            : vocab_size;
+                            ? lmHeadD->dimensions[1] : vocab_size;
+                        const std::size_t cacheMax = Tp + kMaxGen + 4;
+                        const std::size_t maxT    = std::max<std::size_t>(Tp, 1);
 
-                        std::cout << "  prompt        : \"" << fwdPrompt
-                                  << "\" -> " << Tf << " tokens\n";
-                        std::cout << "  blocks        : " << config.blockCount << "\n";
+                        std::cout << "  prompt   : \"" << fwdPrompt
+                                  << "\" -> " << Tp << " tokens (max_gen=" << kMaxGen << ")\n";
+
+                        mm::runtime::KvCache cache(
+                            allocator, config.blockCount, cacheMax,
+                            config.headCountKv, config.headDim());
 
                         BlockBuffers buffersD =
-                            allocBlockBuffers(allocator, Tf, config);
-                        const std::size_t xBytesD =
-                            Tf * config.embeddingLength * sizeof(float);
-                        const std::size_t normFinalBytes =
-                            Tf * config.embeddingLength * sizeof(float);
-                        const std::size_t logitsBytesD =
-                            vocab_lm * sizeof(float);
-                        const std::size_t logitsScratchBytes =
-                            config.embeddingLength * sizeof(float);
+                            allocBlockBuffers(allocator, maxT, cacheMax, config);
+
+                        const std::size_t xBytesD      = maxT * config.embeddingLength * sizeof(float);
+                        const std::size_t normFinalBytes = config.embeddingLength * sizeof(float);
+                        const std::size_t logitsBytesD = vocab_lm * sizeof(float);
+                        const std::size_t logitsScBytes = config.embeddingLength * sizeof(float);
 
                         void* xBufD     = allocator.allocate(xBytesD);
                         void* normFinal = allocator.allocate(normFinalBytes);
                         void* logitsD   = allocator.allocate(logitsBytesD);
-                        void* logitsSc  = allocator.allocate(logitsScratchBytes);
+                        void* logitsSc  = allocator.allocate(logitsScBytes);
 
-                        using clock = std::chrono::steady_clock;
-                        const auto fwdT0 = clock::now();
+                        auto sampleArgmax = [&](const float* hidden) -> std::int32_t {
+                            mm::compute::rmsNorm(
+                                hidden, 1, config.embeddingLength,
+                                static_cast<const float*>(outNormD->usmPtr),
+                                config.rmsNormEps,
+                                static_cast<float*>(normFinal));
+                            mm::compute::matmul(
+                                lmHeadD->type, lmHeadD->usmPtr,
+                                vocab_lm, config.embeddingLength,
+                                static_cast<const float*>(normFinal), 1,
+                                static_cast<float*>(logitsD),
+                                static_cast<float*>(logitsSc));
+                            const float* lg = static_cast<const float*>(logitsD);
+                            std::int32_t best = 0;
+                            float bestV = lg[0];
+                            for (std::size_t i = 1; i < vocab_lm; ++i) {
+                                if (lg[i] > bestV) {
+                                    bestV = lg[i];
+                                    best  = static_cast<std::int32_t>(i);
+                                }
+                            }
+                            return best;
+                        };
 
-                        mimirmind::compute::embeddingLookup(
+                        // -- Prefill -----------------------------------------
+
+                        const auto preT0 = clock::now();
+                        mm::compute::embeddingLookup(
                             tokEmb->type, tokEmb->usmPtr,
                             config.embeddingLength, vocab_size,
                             fwdIds, static_cast<float*>(xBufD));
-
                         for (std::uint32_t b = 0; b < config.blockCount; ++b) {
-                            const auto bT0 = clock::now();
                             runTransformerBlock(b, config, weights,
-                                                static_cast<float*>(xBufD),
-                                                buffersD);
-                            const auto bT1 = clock::now();
-                            const double bMs =
-                                std::chrono::duration<double, std::milli>(bT1 - bT0).count();
-                            MM_LOG_DEBUG("main", "[M4d] block {} done in {:.1f}ms", b, bMs);
+                                                static_cast<float*>(xBufD), Tp,
+                                                cache, buffersD);
                         }
+                        cache.commit(Tp);
+                        const auto preT1 = clock::now();
+                        const double preMs =
+                            std::chrono::duration<double, std::milli>(preT1 - preT0).count();
 
-                        const auto fwdT1 = clock::now();
-
-                        // output_norm on last token only
-                        const float* lastX =
+                        // Sample first new token from the last prefill row.
+                        const float* lastRow =
                             static_cast<const float*>(xBufD) +
-                            (Tf - 1) * config.embeddingLength;
-                        mimirmind::compute::rmsNorm(
-                            lastX, 1, config.embeddingLength,
-                            static_cast<const float*>(outNormD->usmPtr),
-                            config.rmsNormEps,
-                            static_cast<float*>(normFinal));
+                            (Tp - 1) * config.embeddingLength;
+                        std::int32_t nextId = sampleArgmax(lastRow);
 
-                        // lm_head matmul -> logits (vocab)
-                        mimirmind::compute::matmul(
-                            lmHeadD->type, lmHeadD->usmPtr,
-                            vocab_lm, config.embeddingLength,
-                            static_cast<const float*>(normFinal), 1,
-                            static_cast<float*>(logitsD),
-                            static_cast<float*>(logitsSc));
+                        std::cout << "  prefill  : " << preMs << " ms ("
+                                  << Tp << " tokens, " << config.blockCount << " blocks)\n";
+                        std::cout << "  text     : '" << tok.decode(fwdIds, false)
+                                  << "' >>>" << std::flush;
 
-                        const auto fwdT2 = clock::now();
+                        std::vector<std::int32_t> genIds;
+                        genIds.reserve(kMaxGen);
+                        genIds.push_back(nextId);
+                        std::cout << tok.decode(std::span<const std::int32_t>(&nextId, 1), true)
+                                  << std::flush;
 
-                        const double blocksMs = std::chrono::duration<double, std::milli>(fwdT1 - fwdT0).count();
-                        const double headMs   = std::chrono::duration<double, std::milli>(fwdT2 - fwdT1).count();
-                        const double totalMs  = std::chrono::duration<double, std::milli>(fwdT2 - fwdT0).count();
-                        std::cout << "  28 blocks     : " << blocksMs << " ms\n";
-                        std::cout << "  norm+lm_head  : " << headMs   << " ms\n";
-                        std::cout << "  total forward : " << totalMs  << " ms\n";
+                        // -- Decode loop -------------------------------------
 
-                        // Greedy argmax / top-5
-                        const float* lg = static_cast<const float*>(logitsD);
-                        std::vector<std::int32_t> idxD(vocab_lm);
-                        std::iota(idxD.begin(), idxD.end(), 0);
-                        const std::size_t kTop = std::min<std::size_t>(5, vocab_lm);
-                        std::partial_sort(
-                            idxD.begin(),
-                            idxD.begin() + static_cast<std::ptrdiff_t>(kTop),
-                            idxD.end(),
-                            [lg](std::int32_t a, std::int32_t b) {
-                                return lg[a] > lg[b];
-                            });
+                        const auto decT0 = clock::now();
+                        std::size_t generated = 1;
+                        bool hitEos = false;
+                        for (std::size_t step = 1;
+                             step < kMaxGen && cache.length() < cacheMax;
+                             ++step)
+                        {
+                            if (nextId == tok.eosId()) {
+                                hitEos = true;
+                                break;
+                            }
 
-                        std::cout << "  prompt decoded: '" << tok.decode(fwdIds, false) << "'\n";
-                        std::cout << "  next-token top-5:\n";
-                        for (std::size_t i = 0; i < kTop; ++i) {
-                            const std::int32_t v = idxD[i];
-                            std::cout << "    " << i << ": id=" << v
-                                      << "  logit=" << lg[v]
-                                      << "  piece='" << tok.tokenText(v) << "'\n";
+                            std::array<std::int32_t, 1> oneId{nextId};
+                            mm::compute::embeddingLookup(
+                                tokEmb->type, tokEmb->usmPtr,
+                                config.embeddingLength, vocab_size,
+                                oneId, static_cast<float*>(xBufD));
+
+                            for (std::uint32_t b = 0; b < config.blockCount; ++b) {
+                                runTransformerBlock(b, config, weights,
+                                                    static_cast<float*>(xBufD), 1,
+                                                    cache, buffersD);
+                            }
+                            cache.commit(1);
+
+                            nextId = sampleArgmax(static_cast<const float*>(xBufD));
+                            genIds.push_back(nextId);
+                            std::cout << tok.decode(std::span<const std::int32_t>(&nextId, 1), true)
+                                      << std::flush;
+                            ++generated;
                         }
+                        const auto decT1 = clock::now();
+                        const double decMs =
+                            std::chrono::duration<double, std::milli>(decT1 - decT0).count();
+                        const double perTok = generated > 1
+                            ? decMs / static_cast<double>(generated - 1)
+                            : 0.0;
+
+                        std::cout << "<<<\n";
+                        std::cout << "  generated: " << generated << " token(s)"
+                                  << (hitEos ? " (hit EOS)" : "") << "\n";
+                        std::cout << "  decode   : " << decMs << " ms ("
+                                  << perTok << " ms/token avg)\n";
 
                         MM_LOG_INFO("main",
-                                    "[M4d] forward done in {:.1f}ms — top1 id={} logit={:.4f} piece='{}'",
-                                    totalMs, idxD[0],
-                                    static_cast<double>(lg[idxD[0]]),
-                                    tok.tokenText(idxD[0]));
+                                    "[M4d/M4e] prefill={:.1f}ms decode={:.1f}ms "
+                                    "({} new tokens, {:.1f}ms/token)",
+                                    preMs, decMs, generated, perTok);
 
-                        allocator.deallocate(logitsSc,  logitsScratchBytes);
+                        allocator.deallocate(logitsSc,  logitsScBytes);
                         allocator.deallocate(logitsD,   logitsBytesD);
                         allocator.deallocate(normFinal, normFinalBytes);
                         allocator.deallocate(xBufD,     xBytesD);
