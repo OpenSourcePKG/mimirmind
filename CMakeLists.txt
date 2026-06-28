@@ -65,6 +65,8 @@ message(STATUS "Level Zero library: ${LEVEL_ZERO_LIBRARY}")
 add_executable(mimirmind
     src/main.cpp
     src/runtime/L0Context.cpp
+    src/runtime/Log.cpp
+    src/runtime/UsmAllocator.cpp
 )
 
 target_include_directories(mimirmind PRIVATE

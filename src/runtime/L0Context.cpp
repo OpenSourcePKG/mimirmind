@@ -1,5 +1,7 @@
 #include "runtime/L0Context.hpp"
 
+#include "runtime/Log.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -13,6 +15,10 @@ namespace {
     do {                                                                \
         const ze_result_t _r = (call);                                  \
         if (_r != ZE_RESULT_SUCCESS) {                                  \
+            MM_LOG_ERROR("l0", "{} failed: {} (0x{:x})",                \
+                         #call,                                         \
+                         L0Context::resultToString(_r),                 \
+                         static_cast<unsigned>(_r));                    \
             throw L0Error(#call, _r);                                   \
         }                                                               \
     } while (false)
@@ -93,16 +99,32 @@ L0Error::L0Error(const std::string& call, ze_result_t code)
 // --- L0Context ---------------------------------------------------------------
 
 L0Context::L0Context() {
+    MM_LOG_INFO("l0", "zeInit(GPU_ONLY) — calling loader");
     ze_init_flags_t flags = ZE_INIT_FLAG_GPU_ONLY;
     ZE_CHECK(zeInit(flags));
+    MM_LOG_DEBUG("l0", "zeInit OK");
 
     _enumerate();
     _createContext();
+
+    MM_LOG_INFO("l0",
+                "L0Context ready — driver={} device={} ctx={} target='{}'",
+                static_cast<const void*>(_driver),
+                static_cast<const void*>(_device),
+                static_cast<const void*>(_context),
+                _info.name);
 }
 
 L0Context::~L0Context() {
     if (_context != nullptr) {
-        zeContextDestroy(_context);
+        MM_LOG_DEBUG("l0", "zeContextDestroy(ctx={})",
+                     static_cast<const void*>(_context));
+        const ze_result_t r = zeContextDestroy(_context);
+        if (r != ZE_RESULT_SUCCESS) {
+            MM_LOG_WARN("l0", "zeContextDestroy returned {} (0x{:x})",
+                        resultToString(r),
+                        static_cast<unsigned>(r));
+        }
         _context = nullptr;
     }
     // Drivers and devices are global handles, no destroy.
@@ -111,7 +133,11 @@ L0Context::~L0Context() {
 void L0Context::_enumerate() {
     std::uint32_t driverCount = 0;
     ZE_CHECK(zeDriverGet(&driverCount, nullptr));
+    MM_LOG_INFO("l0", "zeDriverGet — {} driver(s) reported", driverCount);
     if (driverCount == 0) {
+        MM_LOG_ERROR("l0",
+                     "no Level Zero drivers — intel-level-zero-gpu missing "
+                     "or /dev/dri/renderD128 not accessible");
         throw std::runtime_error{
             "Level Zero reported 0 drivers. Check that intel-level-zero-gpu "
             "is installed and /dev/dri/renderD128 is accessible."};
@@ -120,28 +146,53 @@ void L0Context::_enumerate() {
     std::vector<ze_driver_handle_t> drivers(driverCount);
     ZE_CHECK(zeDriverGet(&driverCount, drivers.data()));
 
-    for (auto* drv : drivers) {
+    for (std::size_t di = 0; di < drivers.size(); ++di) {
+        auto* drv = drivers[di];
+        MM_LOG_DEBUG("l0", "driver[{}]={} — enumerating devices",
+                     di, static_cast<const void*>(drv));
+
         std::uint32_t deviceCount = 0;
         ZE_CHECK(zeDeviceGet(drv, &deviceCount, nullptr));
+        MM_LOG_DEBUG("l0", "driver[{}] exposes {} device(s)", di, deviceCount);
         if (deviceCount == 0) {
             continue;
         }
         std::vector<ze_device_handle_t> devs(deviceCount);
         ZE_CHECK(zeDeviceGet(drv, &deviceCount, devs.data()));
 
-        for (auto* dev : devs) {
+        for (std::size_t i = 0; i < devs.size(); ++i) {
+            auto* dev = devs[i];
             DeviceInfo info = describeDevice(dev);
+            MM_LOG_INFO("l0",
+                        "device[{}/{}] type={} name='{}' vendor=0x{:04x} "
+                        "device=0x{:04x} local_mem={} bytes "
+                        "max_alloc_declared={} bytes uuid={}",
+                        di, i,
+                        L0Context::typeToString(info.type),
+                        info.name,
+                        info.vendorId,
+                        info.deviceId,
+                        info.totalLocalMem,
+                        info.maxMemAllocSize,
+                        info.uuid);
             _allDevices.push_back(info);
 
             if (_device == nullptr && info.type == ZE_DEVICE_TYPE_GPU) {
                 _driver = drv;
                 _device = dev;
                 _info   = info;
+                MM_LOG_INFO("l0",
+                            "selected target device — driver[{}] device[{}] '{}'",
+                            di, i, info.name);
             }
         }
     }
 
     if (_device == nullptr) {
+        MM_LOG_ERROR("l0",
+                     "no GPU device — {} non-GPU device(s) seen; verify "
+                     "intel-level-zero-gpu and /dev/dri/renderD128 access",
+                     _allDevices.size());
         throw std::runtime_error{
             "No GPU device found by Level Zero. On Meteor Lake, verify:\n"
             "  - intel-level-zero-gpu package installed\n"
@@ -151,11 +202,15 @@ void L0Context::_enumerate() {
 }
 
 void L0Context::_createContext() {
+    MM_LOG_DEBUG("l0", "zeContextCreate — driver={}",
+                 static_cast<const void*>(_driver));
     ze_context_desc_t desc{};
     desc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
     desc.flags = 0;
     desc.pNext = nullptr;
     ZE_CHECK(zeContextCreate(_driver, &desc, &_context));
+    MM_LOG_DEBUG("l0", "zeContextCreate OK — ctx={}",
+                 static_cast<const void*>(_context));
 }
 
 std::string L0Context::typeToString(ze_device_type_t t) {
