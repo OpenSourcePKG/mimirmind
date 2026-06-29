@@ -3,6 +3,7 @@
 #include "compute/Attention.hpp"
 #include "compute/GpuMatmul.hpp"
 #include "compute/GpuOps.hpp"
+#include "compute/MoeRouting.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
 #include "model/GgufTypes.hpp"
@@ -17,7 +18,6 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -415,41 +415,8 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
 
     std::vector<std::int32_t> topKIdx(T * K);
     std::vector<float>        topKWeight(T * K);
-    {
-        std::vector<float> probs(nExperts);
-        for (std::size_t t = 0; t < T; ++t) {
-            const float* row = upOutBuf + t * nExperts;
-            float maxL = row[0];
-            for (std::size_t e = 1; e < nExperts; ++e) {
-                if (row[e] > maxL) maxL = row[e];
-            }
-            double sum = 0.0;
-            for (std::size_t e = 0; e < nExperts; ++e) {
-                probs[e] = std::exp(row[e] - maxL);
-                sum += static_cast<double>(probs[e]);
-            }
-            const float invSum = static_cast<float>(1.0 / sum);
-            for (auto& p : probs) p *= invSum;
-
-            std::vector<std::size_t> idx(nExperts);
-            std::iota(idx.begin(), idx.end(), 0);
-            std::partial_sort(idx.begin(),
-                              idx.begin() + static_cast<std::ptrdiff_t>(K),
-                              idx.end(),
-                              [&](std::size_t a, std::size_t b) {
-                                  return probs[a] > probs[b];
-                              });
-            double kept = 0.0;
-            for (std::size_t k = 0; k < K; ++k) {
-                kept += static_cast<double>(probs[idx[k]]);
-            }
-            const float invKept = kept > 0.0 ? static_cast<float>(1.0 / kept) : 1.0F;
-            for (std::size_t k = 0; k < K; ++k) {
-                topKIdx[t * K + k]    = static_cast<std::int32_t>(idx[k]);
-                topKWeight[t * K + k] = probs[idx[k]] * invKept;
-            }
-        }
-    }
+    cmp::moeTopKRoute(upOutBuf, T, nExperts, K,
+                      topKIdx.data(), topKWeight.data());
 
     trace("path B: zero accumulator");
     _ops.mulScalarAsync(moeAccumBuf, 0.0F, T * d_model);
