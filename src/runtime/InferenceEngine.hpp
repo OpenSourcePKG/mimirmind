@@ -121,10 +121,14 @@ private:
         UsmHandle normBuf;       // [maxT, d_model]
         UsmHandle attnOut;       // [maxT, q_dim]
         UsmHandle projOut;       // [maxT, d_model]
-        UsmHandle gateOut;       // [maxT, ff_dim]
+        UsmHandle gateOut;       // [maxT, max(ff_dim, gate_up_per_expert)]
         UsmHandle upOut;         // [maxT, ff_dim]
         UsmHandle matmulScratch; // max(d_model, q_dim, ff_dim)
         UsmHandle scoreScratch;  // [maxSeq]
+
+        // Gemma 4 Path B (MoE) scratch. Zero-sized for non-MoE blocks.
+        UsmHandle moeAccumBuf;   // [maxT, d_model]   weighted sum of experts
+        UsmHandle expertOutBuf;  // [maxT, d_model]   per-expert down output
     };
 
     BlockBuffers allocBlockBuffers(std::size_t maxT, std::size_t maxSeq);

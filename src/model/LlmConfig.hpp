@@ -38,6 +38,10 @@ struct LlmConfig {
     float         ropeFreqBase      {10000.0F};
     std::uint32_t slidingWindow     {0};        // 0 = disabled (Gemma 3+ uses 4096)
 
+    // MoE (Gemma 4). 0 = dense model (no expert routing).
+    std::uint32_t expertCount       {0};        // total experts per block
+    std::uint32_t expertUsedCount   {0};        // top-K experts activated per token
+
     [[nodiscard]] std::uint32_t headDim() const noexcept {
         if (keyLength > 0) {
             return keyLength;
