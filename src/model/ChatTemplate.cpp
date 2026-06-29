@@ -20,8 +20,11 @@ constexpr std::string_view kQwenImEnd   = "<|im_end|>";
 constexpr std::string_view kQwenDefaultSystem =
     "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
 
-constexpr std::string_view kGemmaStartOfTurn = "<start_of_turn>";
-constexpr std::string_view kGemmaEndOfTurn   = "<end_of_turn>";
+// Gemma 4 introduced its own asymmetric turn markers (different from
+// Gemma 2/3's <start_of_turn>/<end_of_turn>). The official HF Jinja
+// template emits these literal tokens:
+constexpr std::string_view kGemmaStartOfTurn = "<|turn>";
+constexpr std::string_view kGemmaEndOfTurn   = "<turn|>";
 
 /// Gemma 3/4 chat roles. The HF Jinja template emits "user" / "model"
 /// (NOT "assistant"). System messages are prepended to the first user
