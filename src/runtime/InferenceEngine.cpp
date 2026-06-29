@@ -246,16 +246,16 @@ void InferenceEngine::runTransformerBlock(std::size_t   blockIdx,
     addBiasIf(qB, q_dim,  qBuf);
     addBiasIf(kB, kv_dim, kSlot);
     addBiasIf(vB, kv_dim, vSlot);
-    trace("QKV+bias sync");
-    _gmm.sync();
 
-    trace("RoPE Q+K");
-    cmp::applyRopeInPlace(qBuf, T,
+    trace("RoPE Q+K (async)");
+    _ops.ropeInPlaceAsync(qBuf, T,
                           _config.headCount,   head_dim, curLen,
                           _config.ropeFreqBase);
-    cmp::applyRopeInPlace(kSlot, T,
+    _ops.ropeInPlaceAsync(kSlot, T,
                           _config.headCountKv, head_dim, curLen,
                           _config.ropeFreqBase);
+    trace("QKV+bias+RoPE sync");
+    _gmm.sync();
 
     trace("attention");
     cmp::multiHeadAttention(

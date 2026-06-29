@@ -41,12 +41,14 @@ GpuOps::GpuOps(runtime::L0Context& ctx, runtime::CommandQueue& queue)
       _addResidualModule{ctx, "add_residual"},
       _addResidualKernel{_addResidualModule.kernel("add_residual")},
       _siluMulModule    {ctx, "silu_mul"},
-      _siluMulKernel    {_siluMulModule.kernel("silu_mul")}
+      _siluMulKernel    {_siluMulModule.kernel("silu_mul")},
+      _ropeModule       {ctx, "rope_inplace"},
+      _ropeKernel       {_ropeModule.kernel("rope_inplace")}
 {
     MM_LOG_INFO("gpuops",
-                "GpuOps ready — rmsnorm/add_bias/add_residual/silu_mul loaded "
-                "(rms local={}, elementwise local={})",
-                kRmsnormLocalSize, kElementwiseLocalSize);
+                "GpuOps ready — rmsnorm/add_bias/add_residual/silu_mul/rope "
+                "loaded (rms local={}, elementwise local={}, rope local={})",
+                kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize);
 }
 
 void GpuOps::rmsNormAsync(const float* x,
@@ -116,6 +118,33 @@ void GpuOps::siluMulAsync(float*       gate,
     _siluMulKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
     _queue.appendLaunch(_siluMulKernel,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::ropeInPlaceAsync(float*       x,
+                              std::size_t  seqLen,
+                              std::size_t  numHeads,
+                              std::size_t  headDim,
+                              std::size_t  startPos,
+                              float        base) {
+    if (seqLen == 0 || numHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (headDim % 2 != 0) {
+        throw std::runtime_error(
+            "GpuOps::ropeInPlace: headDim must be even");
+    }
+    const std::size_t halfDim = headDim / 2;
+    const std::size_t total   = seqLen * numHeads * halfDim;
+
+    _ropeKernel.setPtr(0, x);
+    _ropeKernel.setValue<std::int32_t>(1, toInt32(seqLen,   "rope seqLen"));
+    _ropeKernel.setValue<std::int32_t>(2, toInt32(numHeads, "rope numHeads"));
+    _ropeKernel.setValue<std::int32_t>(3, toInt32(headDim,  "rope headDim"));
+    _ropeKernel.setValue<std::int32_t>(4, toInt32(startPos, "rope startPos"));
+    _ropeKernel.setValue<float>(5, base);
+    _ropeKernel.setGroupSize(kRopeLocalSize, 1, 1);
+    _queue.appendLaunch(_ropeKernel,
+                        groupsForN(total, kRopeLocalSize), 1, 1);
 }
 
 } // namespace mimirmind::compute
