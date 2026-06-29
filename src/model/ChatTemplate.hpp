@@ -46,6 +46,7 @@ class ChatTemplate {
 public:
     enum class Style {
         QwenChatML,   ///< Qwen2 / Qwen2.5 / Qwen3 — <|im_start|>/<|im_end|>.
+        Gemma4,       ///< Gemma 3/4 — <start_of_turn>/<end_of_turn> + bos + role.
     };
 
     /// Pick a template style by GGUF `general.architecture`. Throws
