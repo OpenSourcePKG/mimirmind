@@ -100,6 +100,16 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     // One-shot architecture diagnostic.
     logBlockTensorInventory(_reader, 0);
 
+    // Pin the internal architecture tag so generate()'s hot-path
+    // dispatch can switch on an enum instead of string-compare.
+    if (_config.architecture == "qwen2") {
+        _arch = Architecture::Qwen2;
+    } else if (_config.architecture == "gemma4") {
+        _arch = Architecture::Gemma4;
+    } else {
+        _arch = Architecture::Unsupported;
+    }
+
     _modelLoaded = true;
     MM_LOG_INFO("engine",
                 "loadModel: ready — arch={} blocks={} d_model={} ff={} heads={} kv={}",
@@ -138,11 +148,11 @@ InferenceEngine::allocBlockBuffers(std::size_t maxT, std::size_t maxSeq) {
     return b;
 }
 
-void InferenceEngine::runTransformerBlock(std::size_t   blockIdx,
-                                          float*        x,
-                                          std::size_t   T,
-                                          KvCache&      cache,
-                                          BlockBuffers& s) {
+void InferenceEngine::runQwen2Block(std::size_t   blockIdx,
+                                    float*        x,
+                                    std::size_t   T,
+                                    KvCache&      cache,
+                                    BlockBuffers& s) {
     namespace cmp = mimirmind::compute;
 
     // Block-0 INFO trace fires only on the very first call after load
@@ -303,6 +313,25 @@ void InferenceEngine::runTransformerBlock(std::size_t   blockIdx,
     // command-list ordering covers the hand-off.
 }
 
+void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
+                                     float*        /*x*/,
+                                     std::size_t   /*T*/,
+                                     KvCache&      /*cache*/,
+                                     BlockBuffers& /*s*/) {
+    // M8.3+ will fill this in. Per Memory/mimirmind/research/m8-gemma4-staging.md:
+    //   - M8.3: Q-K-norm + multi-norm choreography (post_attention_norm,
+    //           pre/post_ffw_norm_1/2) + layer_output_scale
+    //   - M8.4: per-layer sliding-window attention (hybrid local/global)
+    //   - M8.5: dense FFN (SwiGLU like Qwen but with Q8_0 ffn_down)
+    //   - M8.6: MoE router + top-K expert dispatch (128 experts)
+    //   - M8.7: integration + optional CPU‖GPU hybrid FFN split
+    throw std::runtime_error(
+        "runGemma4Block: not implemented yet (block " +
+        std::to_string(blockIdx) +
+        "). See Memory/mimirmind/research/m8-gemma4-staging.md for the "
+        "M8.3-M8.7 staging plan.");
+}
+
 std::int32_t
 InferenceEngine::sampleNext(const float*                   hidden,
                             std::size_t                    vocab_lm,
@@ -346,21 +375,16 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
         throw std::runtime_error("InferenceEngine::generate: empty prompt");
     }
 
-    // M8: only Qwen2/Llama-style transformer blocks are wired into
-    // runTransformerBlock today. Anything else (gemma4 in particular)
-    // would silently produce garbage because of missing Q-K-norm,
-    // hybrid dense+MoE FFN, sliding-window attention, and the deeper
-    // norm choreography. Refuse loudly with a pointer to the staging
-    // plan; load itself succeeds so the user can still inspect tensors.
-    if (_config.architecture != "qwen2") {
+    // Architecture-specific block forward is dispatched per-layer
+    // below via _arch. Refuse early for genuinely unknown arches so
+    // the failure mode is clear (vs. running with a wrong handler).
+    if (_arch == Architecture::Unsupported) {
         throw std::runtime_error(
-            "generate: forward path for architecture '" +
-            _config.architecture +
-            "' is not implemented yet — see "
-            "Memory/mimirmind/research/m8-gemma4-staging.md. "
-            "Model is loaded into USM and config/tokenizer/lm_head all "
-            "work, but the transformer block needs arch-specific "
-            "handling. Use Qwen2.5 for now.");
+            "generate: architecture '" + _config.architecture +
+            "' is not recognised. Model is loaded into USM but the "
+            "engine has no handler for it. See "
+            "Memory/mimirmind/research/m8-gemma4-staging.md for the "
+            "list of supported architectures.");
     }
 
     const auto* tokEmb = _weights->find("token_embd.weight");
@@ -417,6 +441,19 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
     float* const logits    = logitsH.as<float>();
     float* const logitsSc  = logitsScH.as<float>();
 
+    // Per-architecture block forward, picked once per generate() to
+    // keep the inner loops simple. Throws from inside the variant if
+    // the handler is a skeleton (Gemma4 today).
+    auto runBlock = [this](std::size_t blockIdx, float* xb, std::size_t Tb,
+                           KvCache& cb, BlockBuffers& sb) {
+        switch (_arch) {
+            case Architecture::Qwen2:       runQwen2Block (blockIdx, xb, Tb, cb, sb); break;
+            case Architecture::Gemma4:      runGemma4Block(blockIdx, xb, Tb, cb, sb); break;
+            case Architecture::Unsupported:
+                throw std::runtime_error("runBlock: unsupported architecture");
+        }
+    };
+
     // -- Prefill ---------------------------------------------------------
 
     const auto preT0 = clock::now();
@@ -426,7 +463,7 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
         promptIds, xBuf);
 
     for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
-        runTransformerBlock(b, xBuf, Tp, cache, buffers);
+        runBlock(b, xBuf, Tp, cache, buffers);
     }
     cache.commit(Tp);
     const auto preT1 = clock::now();
@@ -488,7 +525,7 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
             oneId, xBuf);
 
         for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
-            runTransformerBlock(b, xBuf, 1, cache, buffers);
+            runBlock(b, xBuf, 1, cache, buffers);
         }
         cache.commit(1);
 

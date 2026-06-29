@@ -129,11 +129,35 @@ private:
 
     BlockBuffers allocBlockBuffers(std::size_t maxT, std::size_t maxSeq);
 
-    void runTransformerBlock(std::size_t   blockIdx,
-                             float*        x,
-                             std::size_t   T,
-                             KvCache&      cache,
-                             BlockBuffers& s);
+    /// Internal architecture tag. Set at loadModel based on
+    /// _config.architecture; controls which runXxxBlock variant
+    /// generate() dispatches per layer.
+    enum class Architecture {
+        Qwen2,       ///< Qwen2 / Qwen2.5 / llama-family decoder block
+        Gemma4,      ///< Gemma 4 26B-A4B-it — hybrid dense+MoE, Q-K-norm
+        Unsupported, ///< Loader works but forward is not implemented
+    };
+
+    /// Qwen2 / Qwen2.5 / llama-family block forward. RMSNorm → Q/K/V
+    /// proj → RoPE → causal multi-head attention (GQA) → O proj →
+    /// residual → RMSNorm → SwiGLU FFN (gate * silu(up)) → residual.
+    void runQwen2Block(std::size_t   blockIdx,
+                       float*        x,
+                       std::size_t   T,
+                       KvCache&      cache,
+                       BlockBuffers& s);
+
+    /// Gemma 4 hybrid dense+MoE block forward — skeleton, throws.
+    /// Real implementation lands incrementally in M8.3 (Q-K-norm +
+    /// multi-norm choreography), M8.4 (sliding-window attention),
+    /// M8.5 (dense FFN), M8.6 (MoE routing + experts), M8.7
+    /// (integration + CPU‖GPU split). See
+    /// Memory/mimirmind/research/m8-gemma4-staging.md.
+    void runGemma4Block(std::size_t   blockIdx,
+                        float*        x,
+                        std::size_t   T,
+                        KvCache&      cache,
+                        BlockBuffers& s);
 
     /// Compute logits over the last hidden state row via final-norm +
     /// lm_head, then draw one token id using `_sampler` and `params`.
@@ -157,6 +181,7 @@ private:
     model::LlmConfig                   _config;
     model::Tokenizer                   _tokenizer;
     std::optional<model::WeightsMap>   _weights;
+    Architecture                       _arch{Architecture::Unsupported};
     bool                               _modelLoaded{false};
 
     // One-shot block-0 trace. Default off so production serve mode is
