@@ -98,8 +98,15 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
 
     _weights.emplace(_reader);
 
-    // One-shot architecture diagnostic.
+    // One-shot architecture diagnostic. For gemma4 also dump the first
+    // shared-KV block (block 5 in the standard 26B-A4B layout) — we
+    // need to see if its Q tensor has a different output dim than block 0,
+    // which would tell us full-attention layers use head_dim_full while
+    // SWA layers use head_dim_swa.
     logBlockTensorInventory(_reader, 0);
+    if (_config.architecture == "gemma4" && _config.blockCount > 5) {
+        logBlockTensorInventory(_reader, 5);
+    }
 
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
