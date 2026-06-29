@@ -185,3 +185,30 @@ target_link_libraries(mimirmind PRIVATE
     ${LEVEL_ZERO_LIBRARY}
     Threads::Threads
 )
+
+# ---- quant_tests — pure-CPU unit tests for compute::QuantType ---------------
+#
+# Standalone test binary. No Level Zero, no SPV kernels — exercises the
+# dequant logic via hand-crafted byte blocks. Useful to verify the
+# refactor preserves behaviour and to catch regressions in new quant
+# types without needing the iGPU.
+#
+# Run via:   cmake --build build --target quant_tests && build/quant_tests
+
+add_executable(quant_tests
+    tests/quant_tests.cpp
+    src/compute/Dequant.cpp
+    src/compute/QuantTypeRegistry.cpp
+    src/compute/quant/Bfloat16.cpp
+    src/compute/quant/Float16.cpp
+    src/compute/quant/Float32.cpp
+    src/compute/quant/Q4K.cpp
+    src/compute/quant/Q6K.cpp
+    src/compute/quant/Q8_0.cpp
+    src/model/GgufTypes.cpp
+    src/runtime/Log.cpp
+)
+
+target_include_directories(quant_tests PRIVATE src)
+
+target_link_libraries(quant_tests PRIVATE Threads::Threads)
