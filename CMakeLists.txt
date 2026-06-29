@@ -238,6 +238,36 @@ target_include_directories(arch_tests PRIVATE src tests)
 
 target_link_libraries(arch_tests PRIVATE Threads::Threads)
 
+# ---- compute_tests — pure-CPU tests for CPU compute primitives -------------
+#
+# Covers what's testable in compute/ without GPU or model file:
+#   - Sampler              (greedy / top-k / top-p / seed determinism)
+#   - matmul (CPU)         (F32 / Q8_0 / Q6_K hand-crafted blocks)
+#   - embeddingLookup      (F32 / Q6_K / out-of-range zero-fill)
+#
+# Run via:   cmake --build build --target compute_tests && build/compute_tests
+
+add_executable(compute_tests
+    tests/compute_tests.cpp
+    src/compute/Dequant.cpp
+    src/compute/Embedding.cpp
+    src/compute/Matmul.cpp
+    src/compute/QuantTypeRegistry.cpp
+    src/compute/Sampling.cpp
+    src/compute/quant/Bfloat16.cpp
+    src/compute/quant/Float16.cpp
+    src/compute/quant/Float32.cpp
+    src/compute/quant/Q4K.cpp
+    src/compute/quant/Q6K.cpp
+    src/compute/quant/Q8_0.cpp
+    src/model/GgufTypes.cpp
+    src/runtime/Log.cpp
+)
+
+target_include_directories(compute_tests PRIVATE src tests)
+
+target_link_libraries(compute_tests PRIVATE Threads::Threads)
+
 # ---- gpu_tests — verify GPU kernels match CPU reference math ---------------
 #
 # Integration-level: requires an Intel iGPU reachable via /dev/dri plus the
