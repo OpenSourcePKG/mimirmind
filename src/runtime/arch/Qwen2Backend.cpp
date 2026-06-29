@@ -1,0 +1,189 @@
+#include "runtime/arch/Qwen2Backend.hpp"
+
+#include "compute/Attention.hpp"
+#include "compute/GpuMatmul.hpp"
+#include "compute/GpuOps.hpp"
+#include "model/GgufTypes.hpp"
+#include "model/LlmConfig.hpp"
+#include "model/WeightsMap.hpp"
+#include "runtime/BlockBuffers.hpp"
+#include "runtime/KvCache.hpp"
+#include "runtime/Log.hpp"
+
+#include <stdexcept>
+#include <string>
+
+namespace mimirmind::runtime::arch {
+
+Qwen2Backend::Qwen2Backend(const model::LlmConfig&   config,
+                           const model::WeightsMap&  weights,
+                           compute::GpuOps&          ops,
+                           compute::GpuMatmul&       gmm)
+    : _config{config}, _weights{weights}, _ops{ops}, _gmm{gmm} {
+    MM_LOG_INFO("qwen2", "Qwen2Backend ready — blocks={} d_model={} ff={} "
+                         "heads={} kv={}",
+                _config.blockCount, _config.embeddingLength,
+                _config.feedForwardLength, _config.headCount,
+                _config.headCountKv);
+}
+
+void Qwen2Backend::runBlock(std::size_t   blockIdx,
+                            float*        x,
+                            std::size_t   T,
+                            KvCache&      cache,
+                            BlockBuffers& s,
+                            bool          traceBlock0) {
+    namespace cmp = mimirmind::compute;
+
+    const bool diag = (blockIdx == 0 && cache.length() == 0 && traceBlock0);
+    auto trace = [&](const char* tag) {
+        if (diag) {
+            MM_LOG_INFO("blkdiag", "blk0 {}", tag);
+        }
+    };
+
+    trace("enter");
+
+    const auto& w = _weights;
+    const auto* attnNorm = w.findBlock(blockIdx, "attn_norm.weight");
+    const auto* qW       = w.findBlock(blockIdx, "attn_q.weight");
+    const auto* qB       = w.findBlock(blockIdx, "attn_q.bias");
+    const auto* kW       = w.findBlock(blockIdx, "attn_k.weight");
+    const auto* kB       = w.findBlock(blockIdx, "attn_k.bias");
+    const auto* vW       = w.findBlock(blockIdx, "attn_v.weight");
+    const auto* vB       = w.findBlock(blockIdx, "attn_v.bias");
+    const auto* oW       = w.findBlock(blockIdx, "attn_output.weight");
+
+    const auto* ffnNorm = w.findBlock(blockIdx, "ffn_norm.weight");
+    const auto* ffnGate = w.findBlock(blockIdx, "ffn_gate.weight");
+    const auto* ffnUp   = w.findBlock(blockIdx, "ffn_up.weight");
+    const auto* ffnDown = w.findBlock(blockIdx, "ffn_down.weight");
+
+    if (diag) {
+        auto t = [](const model::GgufTensor* p) {
+            return p == nullptr ? "MISSING" : model::typeInfo(p->type).name.data();
+        };
+        MM_LOG_INFO("blkdiag",
+                    "blk0 lookups: attn_norm={} qW={} kW={} vW={} oW={} "
+                    "ffn_norm={} ffn_gate={} ffn_up={} ffn_down={} qB={} kB={} vB={}",
+                    t(attnNorm), t(qW), t(kW), t(vW), t(oW),
+                    t(ffnNorm), t(ffnGate), t(ffnUp), t(ffnDown),
+                    t(qB), t(kB), t(vB));
+    }
+
+    if (attnNorm == nullptr || qW == nullptr || kW == nullptr ||
+        vW == nullptr || oW == nullptr ||
+        ffnNorm == nullptr || ffnGate == nullptr ||
+        ffnUp == nullptr || ffnDown == nullptr) {
+        throw std::runtime_error(
+            "Qwen2Backend: transformer block " + std::to_string(blockIdx) +
+            " missing a tensor");
+    }
+
+    const std::size_t d_model  = s.d_model;
+    const std::size_t q_dim    = s.q_dim;
+    const std::size_t kv_dim   = _config.headCountKv * _config.headDim();
+    const std::size_t ff_dim   = s.ff_dim;
+    const std::size_t head_dim = _config.headDim();
+    const std::size_t curLen   = cache.length();
+    const std::size_t totalLen = curLen + T;
+
+    float* const normBuf       = s.normBuf.as<float>();
+    float* const qBuf          = s.qBuf.as<float>();
+    float* const attnOutBuf    = s.attnOut.as<float>();
+    float* const projOutBuf    = s.projOut.as<float>();
+    float* const gateOutBuf    = s.gateOut.as<float>();
+    float* const upOutBuf      = s.upOut.as<float>();
+    float* const matmulScratch = s.matmulScratch.as<float>();
+    float* const scoreScratch  = s.scoreScratch.as<float>();
+
+    trace("attn rmsNorm");
+    _ops.rmsNormAsync(x, T, d_model,
+                      static_cast<const float*>(attnNorm->usmPtr),
+                      _config.rmsNormEps,
+                      normBuf);
+
+    auto projectAsync = [&](const model::GgufTensor* W,
+                            std::size_t N, float* dst) {
+        _gmm.matmulAsync(W->type, W->usmPtr, N, d_model,
+                         normBuf, T, dst, matmulScratch);
+    };
+    auto addBiasIf = [&](const model::GgufTensor* B,
+                         std::size_t N, float* dst) {
+        if (B != nullptr && B->type == model::GgmlType::F32) {
+            _ops.addBiasAsync(dst, T, N,
+                              static_cast<const float*>(B->usmPtr));
+        }
+    };
+
+    float* kSlot = cache.writeSlotK(blockIdx);
+    float* vSlot = cache.writeSlotV(blockIdx);
+
+    trace("Q projection (matmulAsync)");
+    projectAsync(qW, q_dim,  qBuf);
+    trace("K projection (matmulAsync)");
+    projectAsync(kW, kv_dim, kSlot);
+    trace("V projection (matmulAsync)");
+    projectAsync(vW, kv_dim, vSlot);
+    trace("QKV bias add (async)");
+    addBiasIf(qB, q_dim,  qBuf);
+    addBiasIf(kB, kv_dim, kSlot);
+    addBiasIf(vB, kv_dim, vSlot);
+
+    trace("RoPE Q+K (async)");
+    _ops.ropeInPlaceAsync(qBuf, T,
+                          _config.headCount,   head_dim, curLen,
+                          _config.ropeFreqBase);
+    _ops.ropeInPlaceAsync(kSlot, T,
+                          _config.headCountKv, head_dim, curLen,
+                          _config.ropeFreqBase);
+    trace("QKV+bias+RoPE sync");
+    _gmm.sync();
+
+    trace("attention");
+    cmp::multiHeadAttention(
+        qBuf,
+        cache.baseK(blockIdx),
+        cache.baseV(blockIdx),
+        T, totalLen,
+        _config.headCount, _config.headCountKv, head_dim,
+        curLen,
+        scoreScratch,
+        attnOutBuf);
+
+    trace("O projection (matmul)");
+    _gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,
+                attnOutBuf, T,
+                projOutBuf, matmulScratch);
+
+    trace("attn residual (async)");
+    _ops.addResidualAsync(x, projOutBuf, T * d_model);
+
+    trace("ffn rmsNorm (async)");
+    _ops.rmsNormAsync(x, T, d_model,
+                      static_cast<const float*>(ffnNorm->usmPtr),
+                      _config.rmsNormEps,
+                      normBuf);
+
+    trace("FFN gate+up (matmulAsync)");
+    _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
+                     normBuf, T, gateOutBuf, matmulScratch);
+    _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
+                     normBuf, T, upOutBuf, matmulScratch);
+
+    trace("FFN silu+mul (async, fused)");
+    _ops.siluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
+
+    trace("FFN down (matmul)");
+    _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
+                gateOutBuf, T,
+                projOutBuf, matmulScratch);
+
+    trace("ffn residual (async, exit)");
+    _ops.addResidualAsync(x, projOutBuf, T * d_model);
+    // No sync here — the next block's rmsNormAsync (or sampleNext's
+    // final-norm) reads x on the GPU through the same queue, so
+    // command-list ordering covers the hand-off.
+}
+
+} // namespace mimirmind::runtime::arch

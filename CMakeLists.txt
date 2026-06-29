@@ -140,6 +140,7 @@ add_executable(mimirmind
     src/model/LlmConfig.cpp
     src/model/Tokenizer.cpp
     src/model/WeightsMap.cpp
+    src/runtime/BlockBuffers.cpp
     src/runtime/CommandQueue.cpp
     src/runtime/GpuKernel.cpp
     src/runtime/GpuModule.cpp
@@ -149,6 +150,9 @@ add_executable(mimirmind
     src/runtime/Log.cpp
     src/runtime/MappedFile.cpp
     src/runtime/UsmAllocator.cpp
+    src/runtime/arch/ArchBackend.cpp
+    src/runtime/arch/Gemma4Backend.cpp
+    src/runtime/arch/Qwen2Backend.cpp
     src/server/ApiServer.cpp
 )
 

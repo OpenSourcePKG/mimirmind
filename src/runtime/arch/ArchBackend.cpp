@@ -1,0 +1,23 @@
+#include "runtime/arch/ArchBackend.hpp"
+
+#include "runtime/arch/Gemma4Backend.hpp"
+#include "runtime/arch/Qwen2Backend.hpp"
+
+namespace mimirmind::runtime::arch {
+
+std::unique_ptr<ArchBackend>
+createArchBackend(const std::string&        architecture,
+                  const model::LlmConfig&   config,
+                  const model::WeightsMap&  weights,
+                  compute::GpuOps&          ops,
+                  compute::GpuMatmul&       gmm) {
+    if (architecture == "qwen2") {
+        return std::make_unique<Qwen2Backend>(config, weights, ops, gmm);
+    }
+    if (architecture == "gemma4") {
+        return std::make_unique<Gemma4Backend>(config, weights, ops, gmm);
+    }
+    return nullptr;
+}
+
+} // namespace mimirmind::runtime::arch
