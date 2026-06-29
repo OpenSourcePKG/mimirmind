@@ -10,17 +10,20 @@ namespace mimirmind::compute::quant {
  *   int8  qs[32]   32 signed 8-bit quants (32 B)
  * value[i] = d * qs[i].
  *
- * No GPU matmul kernel yet — falls back to the CPU matmul (which uses
- * a double accumulator and is bit-exact vs llama.cpp's CPU dequant).
+ * GPU matmul kernel: matmul_q8_0_vec (M8.G). Pre-M8.G the type fell
+ * back to compute::matmul (CPU, double-acc). Per-block precision is
+ * substantially higher than Q4_K/Q6_K (single scale, no sub-bands)
+ * so plain FP32 per-thread accumulation is used in the kernel.
  */
 class Q8_0 final : public QuantType {
 public:
     [[nodiscard]] static const Q8_0& instance() noexcept;
 
-    [[nodiscard]] model::GgmlType  ggmlType()      const noexcept override;
-    [[nodiscard]] std::string_view name()          const noexcept override;
-    [[nodiscard]] std::size_t      blockElements() const noexcept override;
-    [[nodiscard]] std::size_t      blockBytes()    const noexcept override;
+    [[nodiscard]] model::GgmlType  ggmlType()        const noexcept override;
+    [[nodiscard]] std::string_view name()            const noexcept override;
+    [[nodiscard]] std::size_t      blockElements()   const noexcept override;
+    [[nodiscard]] std::size_t      blockBytes()      const noexcept override;
+    [[nodiscard]] std::string_view gpuMatmulModule() const noexcept override;
 
     void dequantToF32(const void* src,
                       std::size_t nelements,
