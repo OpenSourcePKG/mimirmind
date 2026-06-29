@@ -50,6 +50,11 @@ public:
 
     [[nodiscard]] std::string_view tokenText(std::int32_t id) const noexcept;
 
+    /// Look up a token id by its exact text. Returns -1 if no vocab entry
+    /// matches. Useful for special tokens like `<|im_start|>` where the
+    /// id is model-specific and we want to bypass BPE for them.
+    [[nodiscard]] std::int32_t     findToken(std::string_view text) const noexcept;
+
     [[nodiscard]] std::size_t      vocabSize() const noexcept { return _tokens.size(); }
     [[nodiscard]] std::string_view modelType() const noexcept { return _modelType; }
     [[nodiscard]] std::size_t      mergesCount() const noexcept { return _mergesRank.size(); }

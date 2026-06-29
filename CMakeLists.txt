@@ -125,6 +125,7 @@ add_executable(mimirmind
     src/compute/Rope.cpp
     src/compute/Sampling.cpp
     src/compute/Softmax.cpp
+    src/model/ChatTemplate.cpp
     src/model/GgufReader.cpp
     src/model/GgufTypes.cpp
     src/model/LlmConfig.cpp

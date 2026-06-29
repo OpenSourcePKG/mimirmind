@@ -2,6 +2,7 @@
 #include "compute/GpuMatmul.hpp"
 #include "compute/Matmul.hpp"
 #include "compute/Norm.hpp"
+#include "model/ChatTemplate.hpp"
 #include "model/GgufReader.hpp"
 #include "model/LlmConfig.hpp"
 #include "model/Tokenizer.hpp"
@@ -57,6 +58,8 @@ constexpr const char* kUsage =
     "  --top-k N          Top-K cutoff, 0 = disabled (default 0)\n"
     "  --top-p F          Top-P (nucleus) cutoff, 1.0 = disabled (default 1.0)\n"
     "  --seed N           RNG seed, 0 = random_device (default 0)\n"
+    "  --chat             Wrap --prompt as a user message via the chat template\n"
+    "  --system TEXT      System message for --chat (default: Qwen2.5 default)\n"
     "  -h, --help         Show this help and exit\n";
 
 enum class Mode {
@@ -74,6 +77,8 @@ struct CliArgs {
     std::size_t   topK{0};
     float         topP{1.0F};
     std::uint64_t seed{0};
+    bool          chat{false};
+    std::string   systemMessage{};
 };
 
 [[nodiscard]] bool parseArgs(int argc, char** argv, CliArgs& out) {
@@ -140,6 +145,12 @@ struct CliArgs {
             const char* v = needValue("--seed");
             if (v == nullptr) return false;
             out.seed = std::strtoull(v, nullptr, 10);
+        } else if (a == "--chat") {
+            out.chat = true;
+        } else if (a == "--system") {
+            const char* v = needValue("--system");
+            if (v == nullptr) return false;
+            out.systemMessage = v;
         } else {
             std::cerr << "unknown argument '" << a << "'\n" << kUsage;
             return false;
@@ -824,6 +835,83 @@ void runM4aEmbedAndM4bLmHead(mimirmind::runtime::InferenceEngine& engine) {
                 idx[0], static_cast<double>(logitsRow[idx[0]]));
 }
 
+// ---- M7c chat-template smoke -----------------------------------------------
+
+void runM7cChatTemplate(const mimirmind::runtime::InferenceEngine& engine) {
+    namespace mm = mimirmind;
+
+    std::cout << "\n[M7c] Chat template (Qwen ChatML)\n";
+    std::cout.flush();
+    MM_LOG_INFO("main", "[M7c] starting chat-template diagnostics");
+
+    const auto& tok    = engine.tokenizer();
+    const auto& reader = engine.reader();
+
+    // Log the embedded Jinja chat_template (first ~160 chars) for
+    // divergence-spotting. We do NOT interpret it — M7c hardcodes Qwen.
+    if (const auto* v = reader.findMetadata("tokenizer.chat_template")) {
+        if (std::holds_alternative<std::string>(*v)) {
+            const auto& s = std::get<std::string>(*v);
+            std::cout << "  embedded jinja (first 160 chars):\n    "
+                      << s.substr(0, 160) << "\n";
+        }
+    } else {
+        std::cout << "  embedded jinja: <none in GGUF>\n";
+    }
+
+    mm::model::ChatTemplate::Style style;
+    try {
+        style = mm::model::ChatTemplate::detectFromArch(
+            engine.config().architecture);
+    } catch (const std::exception& e) {
+        std::cout << "  detect: " << e.what() << "\n";
+        MM_LOG_WARN("main", "[M7c] detect failed: {}", e.what());
+        return;
+    }
+    std::cout << "  style    : Qwen ChatML (arch="
+              << engine.config().architecture << ")\n";
+
+    const auto imStart = tok.findToken("<|im_start|>");
+    const auto imEnd   = tok.findToken("<|im_end|>");
+    std::cout << "  specials : <|im_start|>=" << imStart
+              << "  <|im_end|>=" << imEnd << "\n";
+    if (imStart < 0 || imEnd < 0) {
+        std::cout << "  -> Qwen specials missing from vocab; chat won't work.\n";
+        MM_LOG_WARN("main",
+                    "[M7c] Qwen special tokens not in vocab "
+                    "(im_start={}, im_end={})", imStart, imEnd);
+        return;
+    }
+
+    std::vector<mm::model::ChatMessage> sample{
+        {mm::model::ChatRole::User, "Hello, world!"},
+    };
+    const auto ids = mm::model::ChatTemplate::encode(
+        style, tok, sample, /*addGenerationPrompt=*/true);
+
+    std::cout << "  rendered : " << ids.size() << " tokens, first 24:\n   ";
+    for (std::size_t i = 0; i < std::min<std::size_t>(24, ids.size()); ++i) {
+        std::cout << " " << ids[i];
+    }
+    std::cout << "\n";
+    std::cout << "  decode (with specials): '"
+              << tok.decode(ids, /*skipSpecial=*/false) << "'\n";
+
+    const auto stops = mm::model::ChatTemplate::stopIds(style, tok);
+    std::cout << "  stop ids : [";
+    for (std::size_t i = 0; i < stops.size(); ++i) {
+        if (i > 0) std::cout << ", ";
+        std::cout << stops[i];
+    }
+    std::cout << "] (in addition to eos=" << tok.eosId() << ")\n";
+
+    MM_LOG_INFO("main",
+                "[M7c] qwen template rendered {} tokens, stop_ids[0]={}, eos={}",
+                ids.size(),
+                stops.empty() ? -1 : stops[0],
+                tok.eosId());
+}
+
 // ---- M4d/M4e prefill + autoregressive generation ---------------------------
 
 void runM4deGenerate(mimirmind::runtime::InferenceEngine& engine,
@@ -835,7 +923,38 @@ void runM4deGenerate(mimirmind::runtime::InferenceEngine& engine,
     MM_LOG_INFO("main", "[M4d/M4e] starting full forward + decode");
 
     const auto& tok = engine.tokenizer();
-    const auto promptIds = tok.encode(args.prompt, false);
+
+    std::vector<std::int32_t>  promptIds;
+    std::vector<std::int32_t>  chatStops;
+    std::string                displayPrompt = args.prompt;
+
+    if (args.chat) {
+        mm::model::ChatTemplate::Style style;
+        try {
+            style = mm::model::ChatTemplate::detectFromArch(
+                engine.config().architecture);
+        } catch (const std::exception& e) {
+            std::cout << "  --chat: " << e.what() << "\n";
+            MM_LOG_ERROR("main", "[M4d/M4e] chat template detect failed: {}",
+                         e.what());
+            return;
+        }
+
+        std::vector<mm::model::ChatMessage> messages;
+        if (!args.systemMessage.empty()) {
+            messages.push_back({mm::model::ChatRole::System, args.systemMessage});
+        }
+        messages.push_back({mm::model::ChatRole::User, args.prompt});
+
+        promptIds = mm::model::ChatTemplate::encode(
+            style, tok, messages, /*addGenerationPrompt=*/true);
+        chatStops = mm::model::ChatTemplate::stopIds(style, tok);
+        displayPrompt = tok.decode(promptIds, /*skipSpecial=*/false);
+    } else {
+        promptIds = tok.encode(args.prompt, /*addBos=*/false);
+        displayPrompt = tok.decode(promptIds, /*skipSpecial=*/false);
+    }
+
     if (promptIds.empty()) {
         std::cout << "  empty prompt, skipping\n";
         return;
@@ -844,6 +963,10 @@ void runM4deGenerate(mimirmind::runtime::InferenceEngine& engine,
     std::cout << "  prompt   : \"" << args.prompt
               << "\" -> " << promptIds.size() << " tokens (max_gen="
               << args.maxNew << ")\n";
+    if (args.chat) {
+        std::cout << "  chat     : on (stop ids beyond EOS: " << chatStops.size()
+                  << ")\n";
+    }
     if (args.temperature > 0.0F) {
         std::cout << "  sampling : temp=" << args.temperature
                   << " top_k=" << args.topK
@@ -852,8 +975,7 @@ void runM4deGenerate(mimirmind::runtime::InferenceEngine& engine,
     } else {
         std::cout << "  sampling : greedy (argmax)\n";
     }
-    std::cout << "  text     : '" << tok.decode(promptIds, false)
-              << "' >>>" << std::flush;
+    std::cout << "  text     : '" << displayPrompt << "' >>>" << std::flush;
 
     mm::runtime::GenerateParams params{};
     params.maxNewTokens         = args.maxNew;
@@ -861,6 +983,7 @@ void runM4deGenerate(mimirmind::runtime::InferenceEngine& engine,
     params.sampling.topK        = args.topK;
     params.sampling.topP        = args.topP;
     params.sampling.seed        = args.seed;
+    params.stopIds              = chatStops;
 
     auto onToken = [&](std::int32_t id) -> bool {
         std::cout << tok.decode(std::span<const std::int32_t>(&id, 1), true)
@@ -927,6 +1050,8 @@ int runSmoke(const CliArgs& args) {
         runM5cQ6KParity(engine.ctx(), engine.allocator(), engine.weights());
 
         runM4aEmbedAndM4bLmHead(engine);
+
+        runM7cChatTemplate(engine);
 
         runM4deGenerate(engine, args);
     }
