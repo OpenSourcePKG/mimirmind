@@ -184,6 +184,13 @@ private:
     Architecture                       _arch{Architecture::Unsupported};
     bool                               _modelLoaded{false};
 
+    // Gemma 4 has KV-sharing: some blocks don't carry attn_k.weight /
+    // attn_v.weight and instead read K/V from an earlier block's cache.
+    // _gemma4KvSource[b] is `b` if block has its own K/V, else the
+    // most recent block index that does. Populated at loadModel only
+    // when arch == Gemma4; empty for other architectures.
+    std::vector<std::size_t>           _gemma4KvSource;
+
     // One-shot block-0 trace. Default off so production serve mode is
     // quiet; set MIMIRMIND_TRACE_BLOCK0=1 to enable when bringing up a
     // new architecture handler. Flips to false after the first call so

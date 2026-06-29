@@ -14,6 +14,7 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -108,6 +109,38 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
         _arch = Architecture::Gemma4;
     } else {
         _arch = Architecture::Unsupported;
+    }
+
+    // Gemma 4 KV-sharing pattern. Some blocks omit attn_k/v.weight and
+    // read K/V from an earlier block's cache. Walk the blocks once and
+    // build the per-block source map.
+    if (_arch == Architecture::Gemma4) {
+        _gemma4KvSource.assign(_config.blockCount, 0);
+        std::optional<std::size_t> lastKv;
+        std::string pattern;
+        pattern.reserve(_config.blockCount);
+        for (std::size_t b = 0; b < _config.blockCount; ++b) {
+            const bool hasOwn =
+                _weights->findBlock(b, "attn_k.weight") != nullptr &&
+                _weights->findBlock(b, "attn_v.weight") != nullptr;
+            if (hasOwn) {
+                _gemma4KvSource[b] = b;
+                lastKv             = b;
+                pattern.push_back('K');
+            } else if (lastKv) {
+                _gemma4KvSource[b] = *lastKv;
+                pattern.push_back('.');
+            } else {
+                throw std::runtime_error(
+                    "gemma4: block " + std::to_string(b) +
+                    " has no K/V and no earlier source — model is malformed");
+            }
+        }
+        MM_LOG_INFO("engine",
+                    "gemma4 KV-share pattern: {} ({} owns, {} shared)",
+                    pattern,
+                    std::count(pattern.begin(), pattern.end(), 'K'),
+                    std::count(pattern.begin(), pattern.end(), '.'));
     }
 
     _modelLoaded = true;
@@ -353,10 +386,7 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
 
     const auto* attnNorm    = require("attn_norm.weight");
     const auto* qW          = require("attn_q.weight");
-    const auto* kW          = require("attn_k.weight");
-    const auto* vW          = require("attn_v.weight");
     const auto* qNorm       = require("attn_q_norm.weight");
-    const auto* kNorm       = require("attn_k_norm.weight");
     const auto* oW          = require("attn_output.weight");
     const auto* attnPost    = require("post_attention_norm.weight");
     const auto* ffnNorm     = require("ffn_norm.weight");
@@ -366,6 +396,16 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
     const auto* ffwPost1    = require("post_ffw_norm_1.weight");
     const auto* ffwPost     = require("post_ffw_norm.weight");
     const auto* outScale    = require("layer_output_scale.weight");
+
+    // KV-sharing: only blocks that own K/V do the K/V projection +
+    // K-norm + K-RoPE. Other blocks read K/V from the source block's
+    // cache slot (already RoPE'd by the source block earlier in this
+    // forward pass).
+    const std::size_t kvLayer  = _gemma4KvSource[blockIdx];
+    const bool        hasOwnKv = (kvLayer == blockIdx);
+    const auto* kW    = hasOwnKv ? require("attn_k.weight")      : nullptr;
+    const auto* vW    = hasOwnKv ? require("attn_v.weight")      : nullptr;
+    const auto* kNorm = hasOwnKv ? require("attn_k_norm.weight") : nullptr;
 
     const std::size_t d_model  = s.d_model;
     const std::size_t q_dim    = s.q_dim;
@@ -384,9 +424,6 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
     float* const matmulScratch = s.matmulScratch.as<float>();
     float* const scoreScratch  = s.scoreScratch.as<float>();
 
-    float* kSlot = cache.writeSlotK(blockIdx);
-    float* vSlot = cache.writeSlotV(blockIdx);
-
     // --- pre-attention RMSNorm ----------------------------------------
 
     trace("attn rmsNorm");
@@ -395,7 +432,7 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
                       _config.rmsNormEps,
                       normBuf);
 
-    // --- Q/K/V projections (Q8_0 -> CPU fallback today) ----------------
+    // --- Q projection (always own; only K/V are shared across layers) --
 
     auto projectAsync = [&](const model::GgufTensor* W,
                             std::size_t N, float* dst) {
@@ -405,10 +442,32 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
 
     trace("Q projection");
     projectAsync(qW, q_dim,  qBuf);
-    trace("K projection");
-    projectAsync(kW, kv_dim, kSlot);
-    trace("V projection");
-    projectAsync(vW, kv_dim, vSlot);
+
+    // --- K/V projections only if this block owns them ------------------
+
+    if (hasOwnKv) {
+        float* const kSlot = cache.writeSlotK(blockIdx);
+        float* const vSlot = cache.writeSlotV(blockIdx);
+        trace("K projection");
+        projectAsync(kW, kv_dim, kSlot);
+        trace("V projection");
+        projectAsync(vW, kv_dim, vSlot);
+
+        // K-norm BEFORE RoPE (per-head, like Q-norm below).
+        trace("K-norm");
+        _ops.rmsNormAsync(kSlot, T * _config.headCountKv, head_dim,
+                          static_cast<const float*>(kNorm->usmPtr),
+                          _config.rmsNormEps,
+                          kSlot);                  // in-place
+
+        // RoPE on the freshly-written K rows.
+        trace("RoPE K");
+        _ops.ropeInPlaceAsync(kSlot, T,
+                              _config.headCountKv, head_dim, curLen,
+                              _config.ropeFreqBase);
+    } else {
+        trace("KV reused from earlier layer");
+    }
 
     // --- Q-K-norm BEFORE RoPE (per-head RMSNorm over head_dim) ---------
     //
@@ -422,20 +481,10 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
                       static_cast<const float*>(qNorm->usmPtr),
                       _config.rmsNormEps,
                       qBuf);                       // in-place
-    trace("K-norm");
-    _ops.rmsNormAsync(kSlot, T * _config.headCountKv, head_dim,
-                      static_cast<const float*>(kNorm->usmPtr),
-                      _config.rmsNormEps,
-                      kSlot);                      // in-place
 
-    // --- RoPE on Q and the newly-written K rows ------------------------
-
-    trace("RoPE Q+K");
+    trace("RoPE Q");
     _ops.ropeInPlaceAsync(qBuf, T,
                           _config.headCount,   head_dim, curLen,
-                          _config.ropeFreqBase);
-    _ops.ropeInPlaceAsync(kSlot, T,
-                          _config.headCountKv, head_dim, curLen,
                           _config.ropeFreqBase);
 
     // --- Attention is still CPU (M8.4 will replace this) ---------------
@@ -443,11 +492,15 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
     trace("QKV sync (before CPU attention)");
     _gmm.sync();
 
+    // K/V come from the source layer's cache. For own-KV blocks that's
+    // the same as `blockIdx`; for shared blocks it points back at the
+    // closest earlier own-KV layer (which has already RoPE'd this same
+    // forward's new K rows by the time we get here).
     trace("multiHeadAttention (CPU)");
     cmp::multiHeadAttention(
         qBuf,
-        cache.baseK(blockIdx),
-        cache.baseV(blockIdx),
+        cache.baseK(kvLayer),
+        cache.baseV(kvLayer),
         T, totalLen,
         _config.headCount, _config.headCountKv, head_dim,
         curLen,
