@@ -237,3 +237,57 @@ add_executable(arch_tests
 target_include_directories(arch_tests PRIVATE src tests)
 
 target_link_libraries(arch_tests PRIVATE Threads::Threads)
+
+# ---- gpu_tests — verify GPU kernels match CPU reference math ---------------
+#
+# Integration-level: requires an Intel iGPU reachable via /dev/dri plus the
+# SPV kernels under /usr/local/share/mimirmind/spv. We're NOT testing the
+# GPU hardware — we verify our SPV kernels compute the same values as the
+# CPU references in compute::rmsNorm / siluInPlace / applyRopeInPlace /
+# compute::matmul. Each test allocates USM, dispatches the kernel, and
+# compares output element-wise with a tolerance.
+#
+# Run via:   docker compose run --rm mimirmind /usr/local/bin/gpu_tests
+
+add_executable(gpu_tests
+    tests/gpu_tests.cpp
+    src/compute/Activations.cpp
+    src/compute/Attention.cpp
+    src/compute/Dequant.cpp
+    src/compute/Embedding.cpp
+    src/compute/GpuMatmul.cpp
+    src/compute/GpuOps.cpp
+    src/compute/Matmul.cpp
+    src/compute/MoeRouting.cpp
+    src/compute/Norm.cpp
+    src/compute/QuantTypeRegistry.cpp
+    src/compute/Rope.cpp
+    src/compute/Sampling.cpp
+    src/compute/Softmax.cpp
+    src/compute/quant/Bfloat16.cpp
+    src/compute/quant/Float16.cpp
+    src/compute/quant/Float32.cpp
+    src/compute/quant/Q4K.cpp
+    src/compute/quant/Q6K.cpp
+    src/compute/quant/Q8_0.cpp
+    src/model/GgufTypes.cpp
+    src/runtime/CommandQueue.cpp
+    src/runtime/GpuKernel.cpp
+    src/runtime/GpuModule.cpp
+    src/runtime/L0Context.cpp
+    src/runtime/Log.cpp
+    src/runtime/UsmAllocator.cpp
+)
+
+add_dependencies(gpu_tests spv_kernels)
+
+target_include_directories(gpu_tests PRIVATE
+    src
+    tests
+    ${LEVEL_ZERO_INCLUDE_DIR}
+)
+
+target_link_libraries(gpu_tests PRIVATE
+    ${LEVEL_ZERO_LIBRARY}
+    Threads::Threads
+)

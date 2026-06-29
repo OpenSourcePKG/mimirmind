@@ -143,8 +143,9 @@ ENV UR_L0_USE_RELAXED_ALLOCATION_LIMITS=1
 # Models live on a host volume (mounted read-only in docker-compose.yml)
 ENV MIMIRMIND_MODELS_DIR=/models
 
-COPY --from=build /src/build/mimirmind /usr/local/bin/mimirmind
-COPY --from=build /src/build/spv       /usr/local/share/mimirmind/spv
+COPY --from=build /src/build/mimirmind  /usr/local/bin/mimirmind
+COPY --from=build /src/build/gpu_tests  /usr/local/bin/gpu_tests
+COPY --from=build /src/build/spv        /usr/local/share/mimirmind/spv
 
 # llama.cpp parity-test oracle: binaries + their shared libs.
 COPY --from=llamacpp /llamacpp/build/bin/llama-cli           /usr/local/bin/llama-cli
