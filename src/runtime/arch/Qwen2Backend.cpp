@@ -27,6 +27,17 @@ Qwen2Backend::Qwen2Backend(const model::LlmConfig&   config,
                 _config.headCountKv);
 }
 
+std::vector<std::size_t> Qwen2Backend::kvDimPerLayer() const {
+    const std::size_t kvDim = _config.headCountKv * _config.headDim();
+    return std::vector<std::size_t>(_config.blockCount, kvDim);
+}
+
+std::pair<std::size_t, std::size_t> Qwen2Backend::maxQKVDims() const {
+    const std::size_t qDim  = _config.headCount   * _config.headDim();
+    const std::size_t kvDim = _config.headCountKv * _config.headDim();
+    return {qDim, kvDim};
+}
+
 void Qwen2Backend::runBlock(std::size_t   blockIdx,
                             float*        x,
                             std::size_t   T,

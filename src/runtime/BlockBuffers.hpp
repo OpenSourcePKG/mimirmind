@@ -11,17 +11,20 @@ namespace mimirmind::runtime {
 /**
  * Per-call transformer-block scratch in USM. Shared by every architecture
  * backend — the dense fields cover Qwen2 / Llama-family inference, the
- * trailing MoE fields are only allocated when `config.expertCount > 0`
+ * trailing MoE fields are only allocated when the model is MoE
  * (currently Gemma 4 26B-A4B).
  *
- * Sized for the largest expected T (prefill width) so the same buffer is
- * reused across prefill + every decode step without reallocation.
+ * `q_dim` / `kv_dim` are sized for the LARGEST layer the backend will
+ * dispatch — Gemma 4's full-attention layers can need double the SWA
+ * Q/K stride. Block buffers therefore use the backend-reported
+ * `maxQKVDims()` instead of derived `headCount * headDim`.
  */
 struct BlockBuffers {
     std::size_t maxT{0};
     std::size_t maxSeq{0};
     std::size_t d_model{0};
     std::size_t q_dim{0};
+    std::size_t kv_dim{0};
     std::size_t ff_dim{0};
 
     UsmHandle qBuf;          // [maxT, q_dim]
@@ -38,12 +41,14 @@ struct BlockBuffers {
     UsmHandle expertOutBuf;  // [maxT, d_model]   per-expert down output
 };
 
-/// Allocate a single BlockBuffers sized for `maxT` tokens and `maxSeq`
-/// KV cache rows. The MoE scratch is only allocated when the model is
-/// MoE (config.expertCount > 0) — dense models pay no overhead.
+/// Allocate a single BlockBuffers. `qDimMax`/`kvDimMax` come from the
+/// arch backend (`maxQKVDims()`); they must accommodate every layer's
+/// Q/KV stride. MoE scratch is only allocated when the model is MoE.
 BlockBuffers allocBlockBuffers(UsmAllocator&           allocator,
                                const model::LlmConfig& config,
                                std::size_t             maxT,
-                               std::size_t             maxSeq);
+                               std::size_t             maxSeq,
+                               std::size_t             qDimMax,
+                               std::size_t             kvDimMax);
 
 } // namespace mimirmind::runtime

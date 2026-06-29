@@ -7,12 +7,15 @@ namespace mimirmind::runtime {
 BlockBuffers allocBlockBuffers(UsmAllocator&           allocator,
                                const model::LlmConfig& config,
                                std::size_t             maxT,
-                               std::size_t             maxSeq) {
+                               std::size_t             maxSeq,
+                               std::size_t             qDimMax,
+                               std::size_t             kvDimMax) {
     BlockBuffers b{};
     b.maxT    = maxT;
     b.maxSeq  = maxSeq;
     b.d_model = config.embeddingLength;
-    b.q_dim   = config.headCount * config.headDim();
+    b.q_dim   = qDimMax;
+    b.kv_dim  = kvDimMax;
     b.ff_dim  = config.feedForwardLength;
 
     const std::size_t qBytes            = maxT * b.q_dim   * sizeof(float);

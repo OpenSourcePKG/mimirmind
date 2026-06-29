@@ -35,6 +35,8 @@ struct LlmConfig {
     // Optional — defaults applied + logged.
     std::uint32_t keyLength         {0};        // 0 = derive embedding/head_count
     std::uint32_t valueLength       {0};        // 0 = same as keyLength
+    std::uint32_t keyLengthSwa      {0};        // SWA-layer key length (Gemma 4)
+    std::uint32_t valueLengthSwa    {0};        // SWA-layer value length (Gemma 4)
     float         rmsNormEps        {1e-6F};
     float         ropeFreqBase      {10000.0F}; // global / full-attention layers
     float         ropeFreqBaseSwa   {10000.0F}; // sliding-window layers (Gemma 3/4)
@@ -45,6 +47,11 @@ struct LlmConfig {
     // block b is SWA, false if it's a global-attention block.
     std::vector<bool> slidingWindowPattern{};
 
+    // Per-layer KV head count. Empty = uniform headCountKv across layers
+    // (Qwen / Llama). On Gemma 4 it's typically e.g. 8 for SWA layers and
+    // 2 for the (sparser) full-attention layers.
+    std::vector<std::uint32_t> headCountKvPerLayer{};
+
     // MoE (Gemma 4). 0 = dense model (no expert routing).
     std::uint32_t expertCount       {0};        // total experts per block
     std::uint32_t expertUsedCount   {0};        // top-K experts activated per token
@@ -54,6 +61,26 @@ struct LlmConfig {
             return keyLength;
         }
         return headCount > 0 ? embeddingLength / headCount : 0;
+    }
+
+    /// Per-layer head_dim. For Gemma 4 returns `keyLengthSwa` on SWA
+    /// layers and `keyLength` (full) on global-attention layers. For
+    /// every other arch (uniform attention) it just returns `headDim()`.
+    [[nodiscard]] std::uint32_t headDim(std::size_t blockIdx) const noexcept {
+        if (blockIdx < slidingWindowPattern.size() && keyLengthSwa > 0) {
+            return slidingWindowPattern[blockIdx] ? keyLengthSwa : keyLength;
+        }
+        return headDim();
+    }
+
+    /// Per-layer KV head count. Reads `headCountKvPerLayer[blockIdx]` if
+    /// the model ships a per-layer array, else falls back to the global
+    /// `headCountKv` value.
+    [[nodiscard]] std::uint32_t headCountKvFor(std::size_t blockIdx) const noexcept {
+        if (blockIdx < headCountKvPerLayer.size()) {
+            return headCountKvPerLayer[blockIdx];
+        }
+        return headCountKv;
     }
 
     /// Populate from the reader's metadata. Throws on missing required

@@ -3,6 +3,7 @@
 #include "model/GgufReader.hpp"
 #include "runtime/Log.hpp"
 
+#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -102,32 +103,51 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
     keyLength       = optionalU32("attention.key_length",   0);
     valueLength     = optionalU32("attention.value_length", keyLength);
 
-    // Gemma 4 ships separate full/SWA head_dim under
-    //   <arch>.attention.key_length_swa / value_length_swa
-    // Read for diagnostics; we'll wire per-layer head_dim in the next step.
-    if (const auto* v = reader.findMetadata(a + ".attention.key_length_swa");
-        v != nullptr) {
-        if (auto n = asNumeric<std::uint32_t>(*v)) {
-            MM_LOG_INFO("config", "{}.attention.key_length_swa = {}",
-                        a, *n);
-        }
-    }
-    if (const auto* v = reader.findMetadata(a + ".attention.value_length_swa");
-        v != nullptr) {
-        if (auto n = asNumeric<std::uint32_t>(*v)) {
-            MM_LOG_INFO("config", "{}.attention.value_length_swa = {}",
-                        a, *n);
-        }
-    }
-    // head_count_kv may be an array (one entry per layer) on gemma4.
+    // Gemma 4 ships separate full / SWA head_dim. `key_length` already
+    // holds the FULL value; `key_length_swa` is the SWA one.
+    keyLengthSwa   = optionalU32("attention.key_length_swa",   0);
+    valueLengthSwa = optionalU32("attention.value_length_swa", keyLengthSwa);
+
+    // head_count_kv may be an array (one entry per layer) on Gemma 4 —
+    // SWA layers and full-attention layers can have different KV head
+    // counts (e.g. 8 / 2). Parse element type matching GgufValueType:
+    //   UInt32=4, Int32=5 (most common writers).
     if (const auto* v = reader.findMetadata(a + ".attention.head_count_kv");
         v != nullptr && std::holds_alternative<GgufArray>(*v)) {
         const auto& arr = std::get<GgufArray>(*v);
-        MM_LOG_INFO("config",
-                    "{}.attention.head_count_kv is an array ({} entries, "
-                    "elementType={}, raw={} bytes) — per-layer KV head split",
-                    a, arr.count, static_cast<int>(arr.elementType),
-                    arr.raw.size());
+        const std::size_t elemBytes = valueElementWidth(arr.elementType);
+        if (arr.raw.size() == arr.count * elemBytes &&
+            (arr.elementType == GgufValueType::UInt32 ||
+             arr.elementType == GgufValueType::Int32)) {
+            headCountKvPerLayer.resize(arr.count);
+            for (std::uint64_t i = 0; i < arr.count; ++i) {
+                std::uint32_t value = 0;
+                std::memcpy(&value, arr.raw.data() + i * elemBytes,
+                            sizeof(std::uint32_t));
+                headCountKvPerLayer[i] = value;
+            }
+            // Pick the most-common entry for the global headCountKv so
+            // any code paths that still use the scalar see a reasonable
+            // default (matches what we'd get with the legacy scalar key).
+            std::uint32_t modeVal   = headCountKvPerLayer[0];
+            std::uint32_t modeCount = 1;
+            for (auto v2 : headCountKvPerLayer) {
+                std::uint32_t c = 0;
+                for (auto v3 : headCountKvPerLayer) if (v3 == v2) ++c;
+                if (c > modeCount) { modeVal = v2; modeCount = c; }
+            }
+            MM_LOG_INFO("config",
+                        "{}.attention.head_count_kv = array[{}], most-common "
+                        "value {} ({} layers)",
+                        a, arr.count, modeVal, modeCount);
+            headCountKv = modeVal;
+        } else {
+            MM_LOG_WARN("config",
+                        "{}.attention.head_count_kv array has unexpected "
+                        "type/size (type={}, count={}, raw={} bytes) — ignored",
+                        a, static_cast<int>(arr.elementType),
+                        arr.count, arr.raw.size());
+        }
     }
     rmsNormEps      = optionalF32("attention.layer_norm_rms_epsilon", 1e-6F);
     ropeFreqBase    = optionalF32("rope.freq_base", 10000.0F);
@@ -181,39 +201,51 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
 
     // --- Architecture-specific shape corrections -------------------------
 
-    // Gemma 4 26B-A4B's metadata is wrong on two critical fields:
-    //   key_length      claims 512 but real head_dim is 256
-    //   head_count_kv   is unset (defaults to head_count=16) but real
-    //                   is 8 (GQA 2:1)
-    // Both are recoverable from tensor shapes loaded later, but
-    // LlmConfig is parsed *before* the matmul launches that would crash
-    // on the inflated q_dim/kv_dim. Override here so downstream code
-    // stays generic.
+    // Gemma 4 26B-A4B's metadata declares two distinct head dimensions
+    // (`key_length` = head_dim_full, `key_length_swa` = head_dim_swa).
+    // We trust the metadata when both arrays are set. Otherwise the
+    // legacy tensor-shape override below picks the SWA value from
+    // attn_q_norm.weight — fine for models without the SWA split.
     if (architecture == "gemma4") {
-        if (const auto* qNorm = reader.findTensor("blk.0.attn_q_norm.weight");
-            qNorm != nullptr && !qNorm->dimensions.empty()) {
-            const auto inferred =
-                static_cast<std::uint32_t>(qNorm->dimensions[0]);
-            if (inferred > 0 && inferred != keyLength) {
-                MM_LOG_WARN("config",
-                            "gemma4 override: key_length {} -> {} "
-                            "(from attn_q_norm.weight dim[0])",
-                            keyLength, inferred);
-                keyLength   = inferred;
-                valueLength = inferred;
+        const bool haveSplit = (keyLength > 0 && keyLengthSwa > 0 &&
+                                 !slidingWindowPattern.empty() &&
+                                 !headCountKvPerLayer.empty());
+        if (!haveSplit) {
+            if (const auto* qNorm = reader.findTensor("blk.0.attn_q_norm.weight");
+                qNorm != nullptr && !qNorm->dimensions.empty()) {
+                const auto inferred =
+                    static_cast<std::uint32_t>(qNorm->dimensions[0]);
+                if (inferred > 0 && inferred != keyLength) {
+                    MM_LOG_WARN("config",
+                                "gemma4 override (no SWA split): key_length "
+                                "{} -> {} (from attn_q_norm.weight dim[0])",
+                                keyLength, inferred);
+                    keyLength   = inferred;
+                    valueLength = inferred;
+                }
             }
+        } else {
+            MM_LOG_INFO("config",
+                        "gemma4 per-layer attention dims active: full "
+                        "head_dim={}, swa head_dim={}",
+                        keyLength, keyLengthSwa);
         }
-        if (const auto* kW = reader.findTensor("blk.0.attn_k.weight");
-            kW != nullptr && kW->dimensions.size() >= 2 && headDim() > 0) {
-            const auto inferredKv =
-                static_cast<std::uint32_t>(kW->dimensions[1] / headDim());
-            if (inferredKv > 0 && inferredKv != headCountKv) {
-                MM_LOG_WARN("config",
-                            "gemma4 override: head_count_kv {} -> {} "
-                            "(from attn_k.weight dim[1]={} / head_dim={})",
-                            headCountKv, inferredKv,
-                            kW->dimensions[1], headDim());
-                headCountKv = inferredKv;
+        // Only fall back to tensor-shape inference for headCountKv when we
+        // don't have the per-layer array from metadata.
+        if (headCountKvPerLayer.empty()) {
+            if (const auto* kW = reader.findTensor("blk.0.attn_k.weight");
+                kW != nullptr && kW->dimensions.size() >= 2 && headDim() > 0) {
+                const auto inferredKv =
+                    static_cast<std::uint32_t>(kW->dimensions[1] / headDim());
+                if (inferredKv > 0 && inferredKv != headCountKv) {
+                    MM_LOG_WARN("config",
+                                "gemma4 override (no array): head_count_kv "
+                                "{} -> {} (from attn_k.weight dim[1]={} / "
+                                "head_dim={})",
+                                headCountKv, inferredKv,
+                                kW->dimensions[1], headDim());
+                    headCountKv = inferredKv;
+                }
             }
         }
     }
@@ -234,13 +266,15 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
 
     MM_LOG_INFO("config",
                 "summary — arch={} blocks={} ctx={} d_model={} ff={} "
-                "heads={} kv_heads={} head_dim={} rope_base={} rope_base_swa={} "
-                "rms_eps={} experts={} top_k={} swa_layers={}",
+                "heads={} kv_heads={} head_dim={}/{} rope_base={}/{} "
+                "rms_eps={} experts={} top_k={} swa_layers={} kv_per_layer={}",
                 architecture, blockCount, contextLength, embeddingLength,
-                feedForwardLength, headCount, headCountKv, headDim(),
+                feedForwardLength, headCount, headCountKv,
+                headDim(), keyLengthSwa,
                 ropeFreqBase, ropeFreqBaseSwa, rmsNormEps,
                 expertCount, expertUsedCount,
-                slidingWindowPattern.size());
+                slidingWindowPattern.size(),
+                headCountKvPerLayer.size());
 }
 
 } // namespace mimirmind::model

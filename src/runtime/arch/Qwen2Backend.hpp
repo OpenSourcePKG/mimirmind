@@ -38,6 +38,11 @@ public:
     [[nodiscard]] bool        scalesEmbedding() const noexcept override { return false; }
     [[nodiscard]] const char* name()            const noexcept override { return "qwen2"; }
 
+    [[nodiscard]] std::vector<std::size_t>
+        kvDimPerLayer() const override;
+    [[nodiscard]] std::pair<std::size_t, std::size_t>
+        maxQKVDims() const override;
+
 private:
     const model::LlmConfig&   _config;
     const model::WeightsMap&  _weights;

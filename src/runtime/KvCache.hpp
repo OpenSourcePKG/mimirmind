@@ -10,9 +10,11 @@ class UsmAllocator;
 /**
  * Per-layer rolling K/V cache for the autoregressive decoder.
  *
- * Storage layout per layer:
- *   K: [maxSeq, nKvHeads, headDim] F32 in USM
- *   V: [maxSeq, nKvHeads, headDim] F32 in USM
+ * Each layer stores its own [maxSeq, kvDim] f32 buffer for K and V.
+ * Layers can have *different* kvDim values (e.g. Gemma 4 has SWA layers
+ * with 8 × 256 KV heads and full-attention layers with 2 × 512). Pass
+ * a per-layer kvDim vector at construction; uniform Qwen-style models
+ * just fill all entries with the same value.
  *
  * Caller flow per forward pass:
  *   for each new chunk of T tokens (T == prompt length on prefill, == 1
@@ -23,7 +25,6 @@ class UsmAllocator;
  *         apply RoPE in place over those new T rows using startPos = length()
  *         run attention reading baseK(L)/baseV(L) with T_k = length() + T,
  *             positionOffset = length()
- *         ...
  *     cache.commit(T)
  *
  * The cache itself never auto-advances — `commit(T)` is the explicit
@@ -32,11 +33,18 @@ class UsmAllocator;
  */
 class KvCache {
 public:
+    /// Per-layer dims. kvDimPerLayer[L] == nKvHeads(L) * headDim(L).
+    KvCache(UsmAllocator&            alloc,
+            std::size_t              maxSeq,
+            std::vector<std::size_t> kvDimPerLayer);
+
+    /// Uniform (Qwen/Llama) convenience: fills every layer with the same dim.
     KvCache(UsmAllocator& alloc,
             std::size_t   nLayers,
             std::size_t   maxSeq,
             std::size_t   nKvHeads,
             std::size_t   headDim);
+
     ~KvCache();
 
     KvCache(const KvCache&)            = delete;
@@ -58,23 +66,20 @@ public:
     void commit(std::size_t T) noexcept { _length += T; }
     void reset() noexcept                { _length = 0; }
 
-    [[nodiscard]] std::size_t length()   const noexcept { return _length; }
-    [[nodiscard]] std::size_t maxSeq()   const noexcept { return _maxSeq; }
-    [[nodiscard]] std::size_t nKvHeads() const noexcept { return _nKvHeads; }
-    [[nodiscard]] std::size_t headDim()  const noexcept { return _headDim; }
-    [[nodiscard]] std::size_t kvDim()    const noexcept { return _kvDim; }
+    [[nodiscard]] std::size_t length()           const noexcept { return _length; }
+    [[nodiscard]] std::size_t maxSeq()           const noexcept { return _maxSeq; }
+    [[nodiscard]] std::size_t kvDim(std::size_t l) const noexcept { return _kvDim[l]; }
 
 private:
-    UsmAllocator&       _alloc;
-    std::size_t         _nLayers;
-    std::size_t         _maxSeq;
-    std::size_t         _nKvHeads;
-    std::size_t         _headDim;
-    std::size_t         _kvDim;
-    std::size_t         _layerBytes;
-    std::size_t         _length{0};
-    std::vector<void*>  _kBuf;
-    std::vector<void*>  _vBuf;
+    void allocateLayers();
+
+    UsmAllocator&            _alloc;
+    std::size_t              _maxSeq;
+    std::vector<std::size_t> _kvDim;
+    std::vector<std::size_t> _layerBytes;
+    std::size_t              _length{0};
+    std::vector<void*>       _kBuf;
+    std::vector<void*>       _vBuf;
 };
 
 } // namespace mimirmind::runtime
