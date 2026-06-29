@@ -416,6 +416,10 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
     const auto* routerW     = require("ffn_gate_inp.weight");
     const auto* expGateUp   = require("ffn_gate_up_exps.weight");
     const auto* expDown     = require("ffn_down_exps.weight");
+    // Per-expert scalar applied to the down projection output. Mirrors
+    // build_lora_mm_id(down_exps, ..., down_exps_s) in
+    // llama.cpp/src/llama-graph.cpp: res *= w_s[selected_expert].
+    const auto* expDownScale = require("ffn_down_exps.scale");
 
     // KV-sharing: only blocks that own K/V do the K/V projection +
     // K-norm + K-RoPE. Other blocks read K/V from the source block's
@@ -716,6 +720,8 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
         static_cast<const std::uint8_t*>(expGateUp->usmPtr);
     auto* const expDownBase =
         static_cast<const std::uint8_t*>(expDown->usmPtr);
+    const float* const expDownScalePtr =
+        static_cast<const float*>(expDownScale->usmPtr);
 
     trace("path B: per-token expert dispatch");
     for (std::size_t t = 0; t < T; ++t) {
@@ -746,8 +752,14 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
                         gateOutBuf, 1,
                         expertOutBuf, matmulScratch);
 
-            // 6d. scale by router weight and accumulate.
-            _ops.mulScalarAsync(expertOutBuf, routerWeight, d_model);
+            // 6d. scale by per-expert down scalar AND router weight, then
+            //     accumulate. ffn_down_exps.scale[e] is the per-expert
+            //     `w_s` from build_lora_mm_id (see llama-graph.cpp:1411-
+            //     1418): res *= w_s[selected_expert]. The matmul above
+            //     synced via _gmm.matmul(...) so reading USM-host F32 is
+            //     safe here.
+            const float combined = routerWeight * expDownScalePtr[e];
+            _ops.mulScalarAsync(expertOutBuf, combined, d_model);
             _ops.addResidualAsync(accumT, expertOutBuf, d_model);
         }
     }
