@@ -71,6 +71,14 @@ public:
     /// Short identifier for logs ("qwen2", "gemma4").
     [[nodiscard]] virtual const char* name() const noexcept = 0;
 
+    /// Enable per-stage parity dumps. PREFIX is the same string carried by
+    /// the MIMIRMIND_PARITY_DUMP env: each stage writes a file at
+    ///   <prefix>-blk{N}-<stage>.bin
+    /// matching the layout llama-parity-dump produces. Empty string =
+    /// disabled (default). Default impl is no-op; backends that wire
+    /// intermediate dumps override.
+    virtual void setParityDumpPrefix(const std::string& /*prefix*/) noexcept {}
+
 protected:
     ArchBackend() = default;
 };
