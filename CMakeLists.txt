@@ -83,6 +83,7 @@ set(KERNEL_SOURCES
     kernels/add_bias.cl
     kernels/add_residual.cl
     kernels/silu_mul.cl
+    kernels/rope_inplace.cl
 )
 
 set(KERNEL_SPV_FILES "")

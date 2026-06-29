@@ -60,6 +60,16 @@ public:
                       const float* up,
                       std::size_t  n);
 
+    /// In-place RoPE on a [seqLen, numHeads, headDim] f32 buffer. The
+    /// per-position angle uses `startPos` as the absolute offset of
+    /// row 0 — pass cache.length() in decode mode.
+    void ropeInPlaceAsync(float*       x,
+                          std::size_t  seqLen,
+                          std::size_t  numHeads,
+                          std::size_t  headDim,
+                          std::size_t  startPos,
+                          float        base);
+
 private:
     runtime::L0Context&    _ctx;
     runtime::CommandQueue& _queue;
@@ -76,8 +86,12 @@ private:
     runtime::GpuModule     _siluMulModule;
     runtime::GpuKernel     _siluMulKernel;
 
+    runtime::GpuModule     _ropeModule;
+    runtime::GpuKernel     _ropeKernel;
+
     static constexpr std::uint32_t kRmsnormLocalSize    = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;
+    static constexpr std::uint32_t kRopeLocalSize        = 256;
 };
 
 } // namespace mimirmind::compute
