@@ -53,7 +53,9 @@ void logBlockTensorInventory(const model::GgufReader& reader,
 InferenceEngine::InferenceEngine()
     : _ctx{},
       _allocator{_ctx},
-      _gmm{_ctx} {
+      _queue{_ctx},
+      _gmm{_ctx, _queue},
+      _ops{_ctx, _queue} {
     MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");
     _allocator.probeLimits();
 
@@ -209,10 +211,10 @@ void InferenceEngine::runTransformerBlock(std::size_t   blockIdx,
     float* const scoreScratch  = s.scoreScratch.as<float>();
 
     trace("attn rmsNorm");
-    cmp::rmsNorm(x, T, d_model,
-                 static_cast<const float*>(attnNorm->usmPtr),
-                 _config.rmsNormEps,
-                 normBuf);
+    _ops.rmsNormAsync(x, T, d_model,
+                      static_cast<const float*>(attnNorm->usmPtr),
+                      _config.rmsNormEps,
+                      normBuf);
 
     auto projectAsync = [&](const model::GgufTensor* W,
                             std::size_t N, float* dst) {
@@ -222,28 +224,30 @@ void InferenceEngine::runTransformerBlock(std::size_t   blockIdx,
     auto addBiasIf = [&](const model::GgufTensor* B,
                          std::size_t N, float* dst) {
         if (B != nullptr && B->type == model::GgmlType::F32) {
-            cmp::addBias(dst, T, N,
-                         static_cast<const float*>(B->usmPtr));
+            _ops.addBiasAsync(dst, T, N,
+                              static_cast<const float*>(B->usmPtr));
         }
     };
 
     float* kSlot = cache.writeSlotK(blockIdx);
     float* vSlot = cache.writeSlotV(blockIdx);
 
-    // Q/K/V are independent and all needed before RoPE — batch into one
-    // GPU submission, sync once, then run the CPU bias adds.
+    // Q/K/V projections + bias adds all on the same queue. The bias
+    // adds depend on the matmul output but happen in append order, so
+    // GPU-side ordering is automatic. Single sync at the end so RoPE
+    // (CPU, until M5f.2) sees the final values.
     trace("Q projection (matmulAsync)");
     projectAsync(qW, q_dim,  qBuf);
     trace("K projection (matmulAsync)");
     projectAsync(kW, kv_dim, kSlot);
     trace("V projection (matmulAsync)");
     projectAsync(vW, kv_dim, vSlot);
-    trace("QKV sync");
-    _gmm.sync();
-    trace("QKV bias add");
+    trace("QKV bias add (async)");
     addBiasIf(qB, q_dim,  qBuf);
     addBiasIf(kB, kv_dim, kSlot);
     addBiasIf(vB, kv_dim, vSlot);
+    trace("QKV+bias sync");
+    _gmm.sync();
 
     trace("RoPE Q+K");
     cmp::applyRopeInPlace(qBuf, T,
@@ -269,34 +273,34 @@ void InferenceEngine::runTransformerBlock(std::size_t   blockIdx,
                 attnOutBuf, T,
                 projOutBuf, matmulScratch);
 
-    trace("attn residual");
-    cmp::addResidual(x, projOutBuf, T * d_model);
+    trace("attn residual (async)");
+    _ops.addResidualAsync(x, projOutBuf, T * d_model);
 
-    trace("ffn rmsNorm");
-    cmp::rmsNorm(x, T, d_model,
-                 static_cast<const float*>(ffnNorm->usmPtr),
-                 _config.rmsNormEps,
-                 normBuf);
+    trace("ffn rmsNorm (async)");
+    _ops.rmsNormAsync(x, T, d_model,
+                      static_cast<const float*>(ffnNorm->usmPtr),
+                      _config.rmsNormEps,
+                      normBuf);
 
     trace("FFN gate+up (matmulAsync)");
     _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
                      normBuf, T, gateOutBuf, matmulScratch);
     _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
                      normBuf, T, upOutBuf, matmulScratch);
-    trace("FFN gate+up sync");
-    _gmm.sync();
 
-    trace("FFN silu+mul");
-    cmp::siluInPlace(gateOutBuf, T * ff_dim);
-    cmp::mulInPlace(gateOutBuf, upOutBuf, T * ff_dim);
+    trace("FFN silu+mul (async, fused)");
+    _ops.siluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
 
     trace("FFN down (matmul)");
     _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
                 gateOutBuf, T,
                 projOutBuf, matmulScratch);
 
-    trace("ffn residual + exit");
-    cmp::addResidual(x, projOutBuf, T * d_model);
+    trace("ffn residual (async, exit)");
+    _ops.addResidualAsync(x, projOutBuf, T * d_model);
+    // No sync here — the next block's rmsNormAsync (or sampleNext's
+    // final-norm) reads x on the GPU through the same queue, so
+    // command-list ordering covers the hand-off.
 }
 
 std::int32_t
@@ -308,7 +312,10 @@ InferenceEngine::sampleNext(const float*                   hidden,
                             float*                         logits,
                             float*                         matmulScratch,
                             const compute::SamplingParams& sampling) {
-    compute::rmsNorm(
+    // Final-norm runs on the same queue as the residual-add that
+    // produced `hidden`. The subsequent _gmm.matmul flushes and syncs,
+    // so CPU argmax sees a fully-resolved logits buffer.
+    _ops.rmsNormAsync(
         hidden, 1, _config.embeddingLength,
         static_cast<const float*>(outNorm.usmPtr),
         _config.rmsNormEps,
