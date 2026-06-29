@@ -482,6 +482,14 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
                                _config.rmsNormEps,
                                kSlot);              // in-place
 
+        // V-norm: bare RMSNorm over head_dim, no learned weight. Gemma 4
+        // pushes V through `ggml_rms_norm` before it enters the KV cache
+        // (see ggml-org/llama.cpp src/models/gemma4.cpp ~line 256).
+        trace("V-norm (no weight)");
+        _ops.rmsNormNoWeightAsync(vSlot, T * _config.headCountKv, head_dim,
+                                  _config.rmsNormEps,
+                                  vSlot);            // in-place
+
         // RoPE on the freshly-written K rows.
         trace("RoPE K");
         _ops.ropeInPlaceAsync(kSlot, T,
@@ -508,6 +516,17 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
     _ops.ropeInPlaceAsync(qBuf, T,
                           _config.headCount,   head_dim, curLen,
                           _config.ropeFreqBase);
+
+    // Gemma 4 uses f_attention_scale = 1.0 (see gemma4.cpp line ~11):
+    // attention scores are NOT divided by sqrt(head_dim). Our CPU
+    // multiHeadAttention always divides by 1/sqrt(headDim) internally,
+    // so we pre-scale Q by sqrt(head_dim) here. The internal divide
+    // cancels and the effective score scale becomes 1.0.
+    {
+        const float qScale = std::sqrt(static_cast<float>(head_dim));
+        trace("Q pre-scale sqrt(head_dim) (gemma4 f_attention_scale=1.0)");
+        _ops.mulScalarAsync(qBuf, qScale, T * q_dim);
+    }
 
     // --- Attention is still CPU (M8.4 will replace this) ---------------
 
