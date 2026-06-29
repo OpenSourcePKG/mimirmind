@@ -6,22 +6,36 @@
 //   W:  [N, K]  Q4_K — each row is (K/256) super-blocks of 144 bytes
 //   Y:  [N]     F32 dense vector
 //
-// Launch: global = N work-items in groups of MATMUL_Q4K_LOCAL.
+// Launch geometry (M5h subgroup-reduce):
+//   local_size_x          = MATMUL_Q4K_LOCAL   (64)
+//   sub_group_size        = MATMUL_Q4K_SG      (16) via intel_reqd_sub_group_size
+//   outputs per workgroup = MATMUL_Q4K_LOCAL / MATMUL_Q4K_SG  (= 4)
+//   global_size_x         = ceil(N / 4) * 64
 //
-// Optimisation vs the first naive version: X is cooperatively cached
-// into __local memory in tiles of X_TILE_ELEMENTS (= 4 super-blocks).
-// Without this each of the 64 threads in a workgroup re-reads the full
-// X vector independently — for d_model=3584 that's ~900 KB of redundant
-// global reads per workgroup; tiling drops it to ~14 KB.
+// Each subgroup of 16 threads cooperatively computes ONE output by
+// splitting the K-reduction across its members and collapsing with
+// sub_group_reduce_add. Compared to M5e (1 thread per output), per-
+// thread compute drops ~16×, and small-N matmuls (Q/K/V projections)
+// saturate the iGPU much better.
+//
+// SLM X-tile is kept (cooperative load across all 64 threads in the
+// workgroup), since all 4 subgroups in the workgroup re-use the same X.
 //
 // Reference: ggml-quants.c dequantize_row_q4_K. Sub-block iteration
 // matches compute/Dequant.cpp dequantQ4K.
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
 
 #ifndef MATMUL_Q4K_LOCAL
 #define MATMUL_Q4K_LOCAL 64
 #endif
+
+#ifndef MATMUL_Q4K_SG
+#define MATMUL_Q4K_SG 16
+#endif
+
+#define MATMUL_Q4K_OUTPUTS_PER_GROUP (MATMUL_Q4K_LOCAL / MATMUL_Q4K_SG)
 
 #define Q4K_BLOCK_ELEMENTS 256
 #define Q4K_BLOCK_BYTES    144
@@ -43,6 +57,7 @@ inline uchar2 q4k_scale_min(int j, __global const uchar* sc) {
 }
 
 __attribute__((reqd_work_group_size(MATMUL_Q4K_LOCAL, 1, 1)))
+__attribute__((intel_reqd_sub_group_size(MATMUL_Q4K_SG)))
 __kernel void matmul_q4k_vec(
     __global const float* X,
     __global const uchar* W,
@@ -52,21 +67,22 @@ __kernel void matmul_q4k_vec(
 {
     __local float xTile[X_TILE_ELEMENTS];
 
-    const int  n      = (int)get_global_id(0);
-    const int  tid    = (int)get_local_id(0);
-    const int  lsize  = (int)get_local_size(0);
-    const bool active = (n < N);
-    const int  nSuper = K / Q4K_BLOCK_ELEMENTS;
+    const int  wg       = (int)get_group_id(0);
+    const int  sgInWg   = (int)get_sub_group_id();          // 0..3
+    const int  sgLocal  = (int)get_sub_group_local_id();    // 0..15
+    const int  tid      = (int)get_local_id(0);
+    const int  lsize    = (int)get_local_size(0);
+    const int  n        = wg * MATMUL_Q4K_OUTPUTS_PER_GROUP + sgInWg;
+    const bool active   = (n < N);
+    const int  nSuper   = K / Q4K_BLOCK_ELEMENTS;
 
     float sum = 0.0f;
 
-    // Iterate K in X_TILE_ELEMENTS-sized tiles. Each tile is loaded
-    // cooperatively by the whole workgroup, then each (active) thread
-    // walks its row of W over the super-blocks that map into this tile.
     for (int tile = 0; tile < K; tile += X_TILE_ELEMENTS) {
 
-        // All threads participate in the cooperative load (barriers
-        // require uniform control flow).
+        // Cooperative X-tile load — workgroup-wide barrier requires
+        // uniform control flow, so every thread participates even when
+        // its subgroup is past the end of N.
         const int tileK = min(X_TILE_ELEMENTS, K - tile);
         for (int i = tid; i < tileK; i += lsize) {
             xTile[i] = X[tile + i];
@@ -104,7 +120,8 @@ __kernel void matmul_q4k_vec(
                     const int xLoBase  = xLocalBase + j * 32;
                     const int xHiBase  = xLocalBase + (j + 1) * 32;
 
-                    for (int l = 0; l < 32; ++l) {
+                    // 16 threads share the 32-element half — each does 2.
+                    for (int l = sgLocal; l < 32; l += MATMUL_Q4K_SG) {
                         const uchar q   = qs[qsOffset + l];
                         const float qLo = (float)(q & 0x0F);
                         const float qHi = (float)(q >> 4);
@@ -115,11 +132,15 @@ __kernel void matmul_q4k_vec(
             }
         }
 
-        // All threads wait before the next tile is overwritten.
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    if (active) {
+    // Collapse the 16 partial sums in this subgroup into one. Every
+    // member must call this even when the subgroup is inactive
+    // (sum is 0, reduction is harmless).
+    sum = sub_group_reduce_add(sum);
+
+    if (active && sgLocal == 0) {
         Y[n] = sum;
     }
 }

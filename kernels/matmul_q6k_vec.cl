@@ -6,8 +6,11 @@
 //   W:  [N, K]  Q6_K — each row is (K/256) super-blocks of 210 bytes.
 //   Y:  [N]     F32 dense vector
 //
-// Optimisation vs the first naive version: X is cooperatively cached
-// into __local memory in tiles of X_TILE_ELEMENTS (= 4 super-blocks).
+// Launch geometry (M5h subgroup-reduce):
+//   local_size_x          = MATMUL_Q6K_LOCAL   (64)
+//   sub_group_size        = MATMUL_Q6K_SG      (16) via intel_reqd_sub_group_size
+//   outputs per workgroup = MATMUL_Q6K_LOCAL / MATMUL_Q6K_SG  (= 4)
+//   global_size_x         = ceil(N / 4) * 64
 //
 // Q6_K super-block layout (matches ggml block_q6_K):
 //   uint8  ql[128]    : lower 4 bits of 256 6-bit quants
@@ -18,10 +21,17 @@
 // Per element: q in [-32, 31], value = d * scales[is] * q
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
 
 #ifndef MATMUL_Q6K_LOCAL
 #define MATMUL_Q6K_LOCAL 64
 #endif
+
+#ifndef MATMUL_Q6K_SG
+#define MATMUL_Q6K_SG 16
+#endif
+
+#define MATMUL_Q6K_OUTPUTS_PER_GROUP (MATMUL_Q6K_LOCAL / MATMUL_Q6K_SG)
 
 #define Q6K_BLOCK_ELEMENTS 256
 #define Q6K_BLOCK_BYTES    210
@@ -30,6 +40,7 @@
 #define X_TILE_ELEMENTS 1024
 
 __attribute__((reqd_work_group_size(MATMUL_Q6K_LOCAL, 1, 1)))
+__attribute__((intel_reqd_sub_group_size(MATMUL_Q6K_SG)))
 __kernel void matmul_q6k_vec(
     __global const float* X,
     __global const uchar* W,
@@ -39,11 +50,14 @@ __kernel void matmul_q6k_vec(
 {
     __local float xTile[X_TILE_ELEMENTS];
 
-    const int  n      = (int)get_global_id(0);
-    const int  tid    = (int)get_local_id(0);
-    const int  lsize  = (int)get_local_size(0);
-    const bool active = (n < N);
-    const int  nSuper = K / Q6K_BLOCK_ELEMENTS;
+    const int  wg      = (int)get_group_id(0);
+    const int  sgInWg  = (int)get_sub_group_id();           // 0..3
+    const int  sgLocal = (int)get_sub_group_local_id();     // 0..15
+    const int  tid     = (int)get_local_id(0);
+    const int  lsize   = (int)get_local_size(0);
+    const int  n       = wg * MATMUL_Q6K_OUTPUTS_PER_GROUP + sgInWg;
+    const bool active  = (n < N);
+    const int  nSuper  = K / Q6K_BLOCK_ELEMENTS;
 
     float sum = 0.0f;
 
@@ -81,7 +95,8 @@ __kernel void matmul_q6k_vec(
                     __global const uchar* qhp = qh + hIdx * 32;
                     __global const char*  scp = sc + hIdx * 8;
 
-                    for (int l = 0; l < 32; ++l) {
+                    // 16 threads share the 32-element inner span (4 mads each).
+                    for (int l = sgLocal; l < 32; l += MATMUL_Q6K_SG) {
                         const int is = l / 16;
 
                         const char q1 = (char)((qlp[l +  0] & 0x0F) |
@@ -110,7 +125,9 @@ __kernel void matmul_q6k_vec(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    if (active) {
+    sum = sub_group_reduce_add(sum);
+
+    if (active && sgLocal == 0) {
         Y[n] = sum;
     }
 }

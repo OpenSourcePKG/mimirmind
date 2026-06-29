@@ -81,7 +81,14 @@ private:
     runtime::GpuModule     _q6kModule;
     runtime::GpuKernel     _q6kKernel;
 
-    static constexpr std::uint32_t kLocalSize = 64;
+    // M5h: workgroup of 64 threads = 4 subgroups of 16, each subgroup
+    // co-computes ONE output via sub_group_reduce_add. So a workgroup
+    // emits 4 outputs and we need ceil(N/4) workgroups (instead of
+    // ceil(N/64) as in M5e/M5g). Keep the public constants in sync with
+    // the kernel macros `MATMUL_Q4K_LOCAL` / `MATMUL_Q4K_SG`.
+    static constexpr std::uint32_t kLocalSize        = 64;
+    static constexpr std::uint32_t kSubgroupSize     = 16;
+    static constexpr std::uint32_t kOutputsPerGroup  = kLocalSize / kSubgroupSize;
 };
 
 } // namespace mimirmind::compute

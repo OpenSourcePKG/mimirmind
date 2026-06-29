@@ -501,9 +501,12 @@ void runM5bQ4KParity(mimirmind::runtime::L0Context&    ctx,
             x[i] = std::sin(static_cast<float>(i) * 0.017F) * 0.3F;
         }
 
-        constexpr std::uint32_t kLocalN = 64;
-        const std::uint32_t groups =
-            static_cast<std::uint32_t>((N + kLocalN - 1) / kLocalN);
+        // M5h: kernel has subgroup_size=16 inside a 64-thread workgroup
+        // and emits 4 outputs per workgroup via sub_group_reduce_add.
+        constexpr std::uint32_t kLocalN          = 64;
+        constexpr std::uint32_t kOutputsPerGroup = 4;
+        const std::uint32_t groups = static_cast<std::uint32_t>(
+            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
 
         knMm.setPtr(0, xH.get());
         knMm.setPtr(1, qW->usmPtr);
@@ -596,9 +599,11 @@ void runM5cQ6KParity(mimirmind::runtime::L0Context&    ctx,
             x6[i] = std::sin(static_cast<float>(i) * 0.011F) * 0.4F;
         }
 
-        constexpr std::uint32_t kLocalN6 = 64;
-        const std::uint32_t groups6 =
-            static_cast<std::uint32_t>((N + kLocalN6 - 1) / kLocalN6);
+        // M5h: 4 outputs per workgroup via sub_group_reduce_add (sg=16).
+        constexpr std::uint32_t kLocalN6          = 64;
+        constexpr std::uint32_t kOutputsPerGroup6 = 4;
+        const std::uint32_t groups6 = static_cast<std::uint32_t>(
+            (N + kOutputsPerGroup6 - 1) / kOutputsPerGroup6);
 
         knMm6.setPtr(0, xH.get());
         knMm6.setPtr(1, outW->usmPtr);
