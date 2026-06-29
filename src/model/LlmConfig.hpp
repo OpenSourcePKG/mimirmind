@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace mimirmind::model {
 
@@ -35,8 +36,14 @@ struct LlmConfig {
     std::uint32_t keyLength         {0};        // 0 = derive embedding/head_count
     std::uint32_t valueLength       {0};        // 0 = same as keyLength
     float         rmsNormEps        {1e-6F};
-    float         ropeFreqBase      {10000.0F};
+    float         ropeFreqBase      {10000.0F}; // global / full-attention layers
+    float         ropeFreqBaseSwa   {10000.0F}; // sliding-window layers (Gemma 3/4)
     std::uint32_t slidingWindow     {0};        // 0 = disabled (Gemma 3+ uses 4096)
+
+    // Gemma 3/4 sliding-window-attention pattern. Empty = all layers are
+    // full attention. Otherwise size == blockCount and entry b is true if
+    // block b is SWA, false if it's a global-attention block.
+    std::vector<bool> slidingWindowPattern{};
 
     // MoE (Gemma 4). 0 = dense model (no expert routing).
     std::uint32_t expertCount       {0};        // total experts per block
