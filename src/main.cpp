@@ -1108,11 +1108,11 @@ int runServe(const CliArgs& args) {
     std::signal(SIGINT,  signalStop);
     std::signal(SIGTERM, signalStop);
 
-    std::cout << "\n[M7d] OpenAI-compatible HTTP API listening on "
+    std::cout << "\n[M7d/M7e] OpenAI-compatible HTTP API listening on "
               << cfg.host << ":" << cfg.port
               << "\n  GET  /health\n"
                  "  GET  /v1/models\n"
-                 "  POST /v1/chat/completions  (stream=true => 501 until M7e)\n"
+                 "  POST /v1/chat/completions  (stream=true supported)\n"
                  "  model id: " << cfg.modelId << "\n  Ctrl-C to stop.\n";
     std::cout.flush();
 
