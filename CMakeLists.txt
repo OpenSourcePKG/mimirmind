@@ -84,6 +84,8 @@ set(KERNEL_SOURCES
     kernels/add_residual.cl
     kernels/silu_mul.cl
     kernels/rope_inplace.cl
+    kernels/mul_scalar.cl
+    kernels/gelu_mul.cl
 )
 
 set(KERNEL_SPV_FILES "")
