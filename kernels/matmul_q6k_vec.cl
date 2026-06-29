@@ -21,6 +21,7 @@
 // Per element: q in [-32, 31], value = d * scales[is] * q
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
 
 #ifndef MATMUL_Q6K_LOCAL
@@ -59,7 +60,9 @@ __kernel void matmul_q6k_vec(
     const bool active  = (n < N);
     const int  nSuper  = K / Q6K_BLOCK_ELEMENTS;
 
-    float sum = 0.0f;
+    // FP64 per-thread accumulator (probe): eliminates FP32 reorder noise
+    // across the ~K/16 terms each lane sums. Sub-group reduce stays FP32.
+    double sum = 0.0;
 
     for (int tile = 0; tile < K; tile += X_TILE_ELEMENTS) {
         const int tileK = min(X_TILE_ELEMENTS, K - tile);
@@ -108,15 +111,16 @@ __kernel void matmul_q6k_vec(
                         const char q4 = (char)((qlp[l + 32] >> 4) |
                                                (((qhp[l] >> 6) & 0x03) << 4)) - 32;
 
-                        const float s0 = d * (float)scp[is + 0];
-                        const float s2 = d * (float)scp[is + 2];
-                        const float s4 = d * (float)scp[is + 4];
-                        const float s6 = d * (float)scp[is + 6];
+                        const double dd = (double)d;
+                        const double s0 = dd * (double)scp[is + 0];
+                        const double s2 = dd * (double)scp[is + 2];
+                        const double s4 = dd * (double)scp[is + 4];
+                        const double s6 = dd * (double)scp[is + 6];
 
-                        sum = mad(xTile[xHalfBase + l +  0], s0 * (float)q1, sum);
-                        sum = mad(xTile[xHalfBase + l + 32], s2 * (float)q2, sum);
-                        sum = mad(xTile[xHalfBase + l + 64], s4 * (float)q3, sum);
-                        sum = mad(xTile[xHalfBase + l + 96], s6 * (float)q4, sum);
+                        sum = fma((double)xTile[xHalfBase + l +  0], s0 * (double)q1, sum);
+                        sum = fma((double)xTile[xHalfBase + l + 32], s2 * (double)q2, sum);
+                        sum = fma((double)xTile[xHalfBase + l + 64], s4 * (double)q3, sum);
+                        sum = fma((double)xTile[xHalfBase + l + 96], s6 * (double)q4, sum);
                     }
                 }
             }
@@ -125,9 +129,10 @@ __kernel void matmul_q6k_vec(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    sum = sub_group_reduce_add(sum);
+    float fsum = (float)sum;
+    fsum = sub_group_reduce_add(fsum);
 
     if (active && sgLocal == 0) {
-        Y[n] = sum;
+        Y[n] = fsum;
     }
 }
