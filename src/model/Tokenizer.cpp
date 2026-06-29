@@ -548,4 +548,12 @@ std::string_view Tokenizer::tokenText(std::int32_t id) const noexcept {
     return _tokens[static_cast<std::size_t>(id)].text;
 }
 
+std::int32_t Tokenizer::findToken(std::string_view text) const noexcept {
+    const auto it = _byText.find(std::string{text});
+    if (it == _byText.end()) {
+        return -1;
+    }
+    return it->second;
+}
+
 } // namespace mimirmind::model
