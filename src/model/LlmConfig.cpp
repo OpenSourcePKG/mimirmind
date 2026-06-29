@@ -101,6 +101,34 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
 
     keyLength       = optionalU32("attention.key_length",   0);
     valueLength     = optionalU32("attention.value_length", keyLength);
+
+    // Gemma 4 ships separate full/SWA head_dim under
+    //   <arch>.attention.key_length_swa / value_length_swa
+    // Read for diagnostics; we'll wire per-layer head_dim in the next step.
+    if (const auto* v = reader.findMetadata(a + ".attention.key_length_swa");
+        v != nullptr) {
+        if (auto n = asNumeric<std::uint32_t>(*v)) {
+            MM_LOG_INFO("config", "{}.attention.key_length_swa = {}",
+                        a, *n);
+        }
+    }
+    if (const auto* v = reader.findMetadata(a + ".attention.value_length_swa");
+        v != nullptr) {
+        if (auto n = asNumeric<std::uint32_t>(*v)) {
+            MM_LOG_INFO("config", "{}.attention.value_length_swa = {}",
+                        a, *n);
+        }
+    }
+    // head_count_kv may be an array (one entry per layer) on gemma4.
+    if (const auto* v = reader.findMetadata(a + ".attention.head_count_kv");
+        v != nullptr && std::holds_alternative<GgufArray>(*v)) {
+        const auto& arr = std::get<GgufArray>(*v);
+        MM_LOG_INFO("config",
+                    "{}.attention.head_count_kv is an array ({} entries, "
+                    "elementType={}, raw={} bytes) — per-layer KV head split",
+                    a, arr.count, static_cast<int>(arr.elementType),
+                    arr.raw.size());
+    }
     rmsNormEps      = optionalF32("attention.layer_norm_rms_epsilon", 1e-6F);
     ropeFreqBase    = optionalF32("rope.freq_base", 10000.0F);
     ropeFreqBaseSwa = optionalF32("rope.freq_base_swa", ropeFreqBase);
