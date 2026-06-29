@@ -44,6 +44,18 @@ public:
                       float        eps,
                       float*       y);
 
+    /// Gemma-family variant: y = x * (1 + weight) / sqrt(mean(x^2) + eps).
+    /// Used for all proper norm weights in Gemma 2/3/4 (init at 0,
+    /// (1+w) keeps the norm starting as identity). The non-Gemma
+    /// rmsNormAsync stays in use for Qwen-family and for any
+    /// multiplicative-scale step that doesn't follow the Gemma init.
+    void rmsNormGemmaAsync(const float* x,
+                           std::size_t  M,
+                           std::size_t  K,
+                           const float* weight,
+                           float        eps,
+                           float*       y);
+
     /// In-place broadcast bias: y[m, k] += bias[k].
     void addBiasAsync(float*       y,
                       std::size_t  M,
@@ -106,6 +118,9 @@ private:
 
     runtime::GpuModule     _geluMulModule;
     runtime::GpuKernel     _geluMulKernel;
+
+    runtime::GpuModule     _rmsnormGemmaModule;
+    runtime::GpuKernel     _rmsnormGemmaKernel;
 
     static constexpr std::uint32_t kRmsnormLocalSize    = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;

@@ -86,6 +86,7 @@ set(KERNEL_SOURCES
     kernels/rope_inplace.cl
     kernels/mul_scalar.cl
     kernels/gelu_mul.cl
+    kernels/rmsnorm_gemma.cl
 )
 
 set(KERNEL_SPV_FILES "")
