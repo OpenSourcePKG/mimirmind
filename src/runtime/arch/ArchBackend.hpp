@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -82,6 +83,17 @@ public:
 protected:
     ArchBackend() = default;
 };
+
+/// True iff `architecture` matches one of the backends `createArchBackend`
+/// can build. Pure name comparison — no model / GPU dependencies. Used by
+/// the loader for early-fail diagnostics and by unit tests.
+///
+/// Inline so it can be linked into pure-CPU test binaries without dragging
+/// in Qwen2Backend / Gemma4Backend implementations.
+[[nodiscard]] inline bool
+isSupportedArchitecture(std::string_view architecture) noexcept {
+    return architecture == "qwen2" || architecture == "gemma4";
+}
 
 /// Build the backend matching `architecture` ("qwen2" / "gemma4"). Returns
 /// nullptr for unsupported architectures — callers must check.

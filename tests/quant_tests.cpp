@@ -3,9 +3,8 @@
 // Built as a standalone `quant_tests` binary. No GPU, no Level Zero,
 // no model file required — runs the dequant logic against hand-crafted
 // byte blocks with known expected outputs.
-//
-// Tiny inline TEST/EXPECT framework over <cassert> + exceptions; failure
-// throws and continues to the next test.
+
+#include "TestFramework.hpp"
 
 #include "compute/Dequant.hpp"
 #include "compute/QuantType.hpp"
@@ -21,89 +20,11 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
-#include <functional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
-#include <vector>
 
 namespace {
-
-// -----------------------------------------------------------------------
-// Tiny test framework
-// -----------------------------------------------------------------------
-
-struct TestCase {
-    const char*           name;
-    std::function<void()> fn;
-};
-
-std::vector<TestCase>& registry() {
-    static std::vector<TestCase> r;
-    return r;
-}
-
-struct Registrar {
-    Registrar(const char* name, std::function<void()> fn) {
-        registry().push_back({name, std::move(fn)});
-    }
-};
-
-#define TEST(name)                                                   \
-    static void name();                                              \
-    static const Registrar reg_##name{#name, name};                  \
-    static void name()
-
-// Print enums via their underlying type; everything else streams as-is.
-template <typename T>
-auto streamable(const T& v) {
-    if constexpr (std::is_enum_v<T>) {
-        return static_cast<std::underlying_type_t<T>>(v);
-    } else {
-        return v;
-    }
-}
-
-template <typename A, typename B>
-void expectEqImpl(const char* file, int line,
-                  const char* exprA, const char* exprB,
-                  const A& a, const B& b) {
-    if (!(a == b)) {
-        std::ostringstream os;
-        os << file << ":" << line << " EXPECT_EQ(" << exprA << ", " << exprB
-           << ") failed: lhs=" << streamable(a) << " rhs=" << streamable(b);
-        throw std::runtime_error(os.str());
-    }
-}
-
-void expectNearImpl(const char* file, int line,
-                    const char* exprA, const char* exprB,
-                    float a, float b, float tol) {
-    const float diff = std::fabs(a - b);
-    if (!(diff <= tol)) {
-        std::ostringstream os;
-        os << file << ":" << line << " EXPECT_NEAR(" << exprA << ", " << exprB
-           << ", tol=" << tol << ") failed: lhs=" << a << " rhs=" << b
-           << " diff=" << diff;
-        throw std::runtime_error(os.str());
-    }
-}
-
-void expectTrueImpl(const char* file, int line,
-                    const char* expr, bool cond) {
-    if (!cond) {
-        std::ostringstream os;
-        os << file << ":" << line << " EXPECT_TRUE(" << expr << ") failed";
-        throw std::runtime_error(os.str());
-    }
-}
-
-#define EXPECT_EQ(a, b)       expectEqImpl(  __FILE__, __LINE__, #a, #b, (a), (b))
-#define EXPECT_NEAR(a, b, t)  expectNearImpl(__FILE__, __LINE__, #a, #b, (a), (b), (t))
-#define EXPECT_TRUE(c)        expectTrueImpl(__FILE__, __LINE__, #c, (c))
 
 // -----------------------------------------------------------------------
 // Helpers
@@ -555,25 +476,6 @@ TEST(dispatch_unsupportedTypeThrows) {
     }
 }
 
-// =======================================================================
-// main
-// =======================================================================
-
 int main() {
-    int passed = 0;
-    int failed = 0;
-    for (auto& t : registry()) {
-        std::printf("[RUN ] %s\n", t.name);
-        try {
-            t.fn();
-            std::printf("[ OK ] %s\n", t.name);
-            ++passed;
-        } catch (const std::exception& e) {
-            std::printf("[FAIL] %s\n        %s\n", t.name, e.what());
-            ++failed;
-        }
-    }
-    std::printf("\n=== %d passed, %d failed (of %zu) ===\n",
-                passed, failed, registry().size());
-    return failed == 0 ? 0 : 1;
+    return mm::test::run();
 }
