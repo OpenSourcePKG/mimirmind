@@ -123,6 +123,7 @@ add_executable(mimirmind
     src/compute/Matmul.cpp
     src/compute/Norm.cpp
     src/compute/Rope.cpp
+    src/compute/Sampling.cpp
     src/compute/Softmax.cpp
     src/model/GgufReader.cpp
     src/model/GgufTypes.cpp

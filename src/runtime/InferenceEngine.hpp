@@ -1,6 +1,7 @@
 #pragma once
 
 #include "compute/GpuMatmul.hpp"
+#include "compute/Sampling.hpp"
 #include "model/GgufReader.hpp"
 #include "model/LlmConfig.hpp"
 #include "model/Tokenizer.hpp"
@@ -22,11 +23,17 @@ namespace mimirmind::runtime {
 class KvCache;
 
 /**
- * Sampling + generation knobs. M7a keeps greedy argmax — M7b extends
- * this struct with temperature/top-k/top-p/seed.
+ * Sampling + generation knobs. Default is greedy/argmax — sampling.temperature
+ * <= 0 keeps the decode loop bit-identical to plain argmax.
+ *
+ * `stopIds` is an additional list of token ids that terminate the loop
+ * (besides the tokenizer's EOS). M7c populates it with chat-template
+ * markers like Qwen's `<|im_end|>`.
  */
 struct GenerateParams {
-    std::size_t maxNewTokens{256};
+    std::size_t                  maxNewTokens{256};
+    compute::SamplingParams      sampling{};
+    std::vector<std::int32_t>    stopIds{};
 };
 
 /**
@@ -123,19 +130,21 @@ private:
                              KvCache&      cache,
                              BlockBuffers& s);
 
-    /// Compute logits over the last hidden state row and argmax-sample.
-    /// `hidden` is one F32 row of d_model.
-    std::int32_t sampleArgmax(const float* hidden,
-                              std::size_t  vocab_lm,
-                              const model::GgufTensor& outNorm,
-                              const model::GgufTensor& lmHead,
-                              float* normScratch,
-                              float* logits,
-                              float* matmulScratch);
+    /// Compute logits over the last hidden state row via final-norm +
+    /// lm_head, then draw one token id using `_sampler` and `params`.
+    std::int32_t sampleNext(const float*                  hidden,
+                            std::size_t                   vocab_lm,
+                            const model::GgufTensor&      outNorm,
+                            const model::GgufTensor&      lmHead,
+                            float*                        normScratch,
+                            float*                        logits,
+                            float*                        matmulScratch,
+                            const compute::SamplingParams& sampling);
 
     L0Context                          _ctx;
     UsmAllocator                       _allocator;
     compute::GpuMatmul                 _gmm;
+    compute::Sampler                   _sampler{};
 
     model::GgufReader                  _reader;
     model::LlmConfig                   _config;
