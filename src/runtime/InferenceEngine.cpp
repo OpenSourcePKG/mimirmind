@@ -902,6 +902,20 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
         }
     };
 
+    // Gemma family scales the token embedding by sqrt(d_model) before
+    // it enters the first block — the per-token vectors are otherwise
+    // in the ~0.05 range and attention/FFN expects them at unit-ish
+    // scale. Qwen/Llama don't do this. Centralise here so prefill and
+    // decode paths share the same scaling.
+    const bool        gemmaEmbedScale = (_arch == Architecture::Gemma4);
+    const float       embedScale =
+        gemmaEmbedScale ? std::sqrt(static_cast<float>(d_model)) : 1.0F;
+    auto scaleEmbeddingIfGemma = [&](float* dst, std::size_t T) {
+        if (gemmaEmbedScale && T > 0) {
+            _ops.mulScalarAsync(dst, embedScale, T * d_model);
+        }
+    };
+
     // -- Prefill ---------------------------------------------------------
 
     const auto preT0 = clock::now();
@@ -909,6 +923,7 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
         tokEmb->type, tokEmb->usmPtr,
         d_model, vocab_emb,
         promptIds, xBuf);
+    scaleEmbeddingIfGemma(xBuf, Tp);
 
     for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
         runBlock(b, xBuf, Tp, cache, buffers);
@@ -971,6 +986,7 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
             tokEmb->type, tokEmb->usmPtr,
             d_model, vocab_emb,
             oneId, xBuf);
+        scaleEmbeddingIfGemma(xBuf, 1);
 
         for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
             runBlock(b, xBuf, 1, cache, buffers);
