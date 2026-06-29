@@ -77,6 +77,36 @@ void printDevice(const mimirmind::runtime::DeviceInfo& info, bool selected) {
     std::cout << "      sub-devs : " << info.numSubDevices << "\n";
 }
 
+// ---- Diagnostics --------------------------------------------------------
+
+/// Log every tensor whose name starts with `blk.<idx>.`. Truth for the
+/// architecture handler: shows the exact suffix names, quant types, and
+/// dimensions of one transformer block. Cheap one-shot — call only at
+/// startup, only for block 0.
+void logBlockTensorInventory(const mimirmind::model::GgufReader& reader,
+                             std::size_t blockIdx) {
+    const std::string prefix = "blk." + std::to_string(blockIdx) + ".";
+    std::size_t hits = 0;
+    for (const auto& t : reader.tensors()) {
+        if (t.name.compare(0, prefix.size(), prefix) != 0) {
+            continue;
+        }
+        ++hits;
+        std::string dims;
+        for (std::size_t i = 0; i < t.dimensions.size(); ++i) {
+            if (i > 0) {
+                dims += ',';
+            }
+            dims += std::to_string(t.dimensions[i]);
+        }
+        MM_LOG_INFO("inventory",
+                    "  {} type={} dims=[{}] bytes={}",
+                    t.name, mimirmind::model::typeInfo(t.type).name,
+                    dims, t.nbytes);
+    }
+    MM_LOG_INFO("inventory", "block {} has {} tensor(s)", blockIdx, hits);
+}
+
 // ---- USM RAII handle ----------------------------------------------------
 
 /// Scope-bound USM allocation. Frees on destruction so an exception
@@ -205,6 +235,18 @@ void runTransformerBlock(std::size_t                         blockIdx,
                          mimirmind::compute::GpuMatmul&      gmm) {
     namespace mm = mimirmind;
 
+    // INFO-level trace only for the very first block in the very first
+    // forward — enough to localise a crash to one operation. Higher
+    // blocks would just spam.
+    const bool diag = (blockIdx == 0 && cache.length() == 0);
+    auto trace = [&](const char* tag) {
+        if (diag) {
+            MM_LOG_INFO("blkdiag", "blk0 {}", tag);
+        }
+    };
+
+    trace("enter");
+
     const auto* attnNorm = weights.findBlock(blockIdx, "attn_norm.weight");
     const auto* qW = weights.findBlock(blockIdx, "attn_q.weight");
     const auto* qB = weights.findBlock(blockIdx, "attn_q.bias");
@@ -218,6 +260,18 @@ void runTransformerBlock(std::size_t                         blockIdx,
     const auto* ffnGate = weights.findBlock(blockIdx, "ffn_gate.weight");
     const auto* ffnUp   = weights.findBlock(blockIdx, "ffn_up.weight");
     const auto* ffnDown = weights.findBlock(blockIdx, "ffn_down.weight");
+
+    if (diag) {
+        auto t = [](const mm::model::GgufTensor* p) {
+            return p == nullptr ? "MISSING" : mm::model::typeInfo(p->type).name.data();
+        };
+        MM_LOG_INFO("blkdiag",
+                    "blk0 lookups: attn_norm={} qW={} kW={} vW={} oW={} "
+                    "ffn_norm={} ffn_gate={} ffn_up={} ffn_down={} qB={} kB={} vB={}",
+                    t(attnNorm), t(qW), t(kW), t(vW), t(oW),
+                    t(ffnNorm), t(ffnGate), t(ffnUp), t(ffnDown),
+                    t(qB), t(kB), t(vB));
+    }
 
     if (attnNorm == nullptr || qW == nullptr || kW == nullptr ||
         vW == nullptr || oW == nullptr ||
@@ -244,6 +298,7 @@ void runTransformerBlock(std::size_t                         blockIdx,
     float* const matmulScratch = s.matmulScratch.as<float>();
     float* const scoreScratch  = s.scoreScratch.as<float>();
 
+    trace("attn rmsNorm");
     // attn_norm(x) -> normBuf
     mm::compute::rmsNorm(x, T, d_model,
                          static_cast<const float*>(attnNorm->usmPtr),
@@ -269,14 +324,20 @@ void runTransformerBlock(std::size_t                         blockIdx,
 
     // Q/K/V are independent and all needed before RoPE — batch into one
     // GPU submission, sync once, then run the CPU bias adds.
+    trace("Q projection (matmulAsync)");
     projectAsync(qW, q_dim,  qBuf);
+    trace("K projection (matmulAsync)");
     projectAsync(kW, kv_dim, kSlot);
+    trace("V projection (matmulAsync)");
     projectAsync(vW, kv_dim, vSlot);
+    trace("QKV sync");
     gmm.sync();
+    trace("QKV bias add");
     addBiasIf(qB, q_dim,  qBuf);
     addBiasIf(kB, kv_dim, kSlot);
     addBiasIf(vB, kv_dim, vSlot);
 
+    trace("RoPE Q+K");
     // RoPE on Q and the freshly-written K rows; startPos == curLen so the
     // absolute positions in decode mode line up with what's already cached.
     mm::compute::applyRopeInPlace(qBuf, T,
@@ -286,6 +347,7 @@ void runTransformerBlock(std::size_t                         blockIdx,
                                   cfg.headCountKv, head_dim, curLen,
                                   cfg.ropeFreqBase);
 
+    trace("attention");
     // Attention: T_q = T, T_k = totalLen (cached + new), causal w/ position offset.
     mm::compute::multiHeadAttention(
         qBuf,
@@ -297,32 +359,40 @@ void runTransformerBlock(std::size_t                         blockIdx,
         scoreScratch,
         attnOutBuf);
 
+    trace("O projection (matmul)");
     gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,
                attnOutBuf, T,
                projOutBuf, matmulScratch);
 
+    trace("attn residual");
     mm::compute::addResidual(x, projOutBuf, T * d_model);
 
+    trace("ffn rmsNorm");
     // ffn_norm(x) -> normBuf
     mm::compute::rmsNorm(x, T, d_model,
                          static_cast<const float*>(ffnNorm->usmPtr),
                          cfg.rmsNormEps,
                          normBuf);
 
+    trace("FFN gate+up (matmulAsync)");
     // gate and up read the same normBuf and are independent — batch.
     gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
                     normBuf, T, gateOutBuf, matmulScratch);
     gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
                     normBuf, T, upOutBuf, matmulScratch);
+    trace("FFN gate+up sync");
     gmm.sync();
 
+    trace("FFN silu+mul");
     mm::compute::siluInPlace(gateOutBuf, T * ff_dim);
     mm::compute::mulInPlace(gateOutBuf, upOutBuf, T * ff_dim);
 
+    trace("FFN down (matmul)");
     gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
                gateOutBuf, T,
                projOutBuf, matmulScratch);
 
+    trace("ffn residual + exit");
     mm::compute::addResidual(x, projOutBuf, T * d_model);
 }
 
@@ -652,6 +722,11 @@ int main() {
             // --- [M5b] GPU Q4_K matmul (vec) — parity vs CPU ---------------
 
             mimirmind::model::WeightsMap weights{reader};
+
+            // One-shot diagnostic so the architecture-handler design is
+            // grounded in what the GGUF actually contains for block 0
+            // (suffix names, quants, dims) — not in assumptions.
+            logBlockTensorInventory(reader, 0);
 
             std::cout << "\n[M5b] GPU Q4_K matvec kernel parity\n";
             std::cout.flush();
