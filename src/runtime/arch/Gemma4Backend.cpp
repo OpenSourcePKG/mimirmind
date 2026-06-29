@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -145,6 +146,32 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     };
     trace("enter");
 
+    // Per-stage parity dump (writes only when MIMIRMIND_PARITY_DUMP is set).
+    // Matches the binary layout llama-parity-dump produces so parity-diff
+    // can pair files by name.
+    auto dumpStage = [&](const char* stage,
+                         const float* p, std::size_t Trow, std::size_t dim) {
+        if (_parityDumpPrefix.empty()) {
+            return;
+        }
+        _gmm.sync();
+        const std::string fname =
+            _parityDumpPrefix + "-blk" + std::to_string(blockIdx) +
+            "-" + stage + ".bin";
+        std::ofstream f(fname, std::ios::binary);
+        if (!f) {
+            return;
+        }
+        const std::uint32_t header[3] = {
+            static_cast<std::uint32_t>(blockIdx),
+            static_cast<std::uint32_t>(Trow),
+            static_cast<std::uint32_t>(dim),
+        };
+        f.write(reinterpret_cast<const char*>(header), sizeof(header));
+        f.write(reinterpret_cast<const char*>(p),
+                static_cast<std::streamsize>(Trow * dim * sizeof(float)));
+    };
+
     const auto& li = _layers[blockIdx];
 
     auto require = [&](const char* suffix) {
@@ -216,6 +243,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                       static_cast<const float*>(attnNorm->usmPtr),
                       _config.rmsNormEps,
                       normBuf);
+    dumpStage("attn_norm", normBuf, T, d_model);
 
     auto projectAsync = [&](const model::GgufTensor* W,
                             std::size_t N, float* dst) {
@@ -265,6 +293,8 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
         _ops.ropeInPlaceAsync(kSlot, T, li.nKvHeads, head_dim, curLen,
                               li.ropeBase);
     }
+    dumpStage("Kcur_pos",    kSlot, T, kv_dim);
+    dumpStage("Vcur_normed", vSlot, T, kv_dim);
 
     // Q-K-norm BEFORE RoPE (per-head RMSNorm over head_dim).
     trace("Q-norm");
@@ -282,6 +312,10 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
         _ops.ropeInPlaceAsync(qBuf, T, li.nHeads, head_dim, curLen,
                               li.ropeBase);
     }
+    // Dump Q BEFORE the gemma4-specific sqrt(head_dim) pre-scale so we
+    // match llama's Qcur_pos (llama's f_attention_scale handles the
+    // 1/sqrt internally via soft_max_ext instead).
+    dumpStage("Qcur_pos", qBuf, T, q_dim);
 
     // f_attention_scale = 1.0 (gemma4.cpp:11). multiHeadAttention divides
     // Q·K by 1/sqrt(headDim); pre-scale Q by sqrt(head_dim) so it cancels.
@@ -315,10 +349,12 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                       static_cast<const float*>(attnPost->usmPtr),
                       _config.rmsNormEps,
                       projOutBuf);            // in-place
+    dumpStage("attn_post_norm", projOutBuf, T, d_model);
 
     trace("attn residual");
     _ops.addResidualAsync(x, projOutBuf, T * d_model);
     // x now holds sa_out = inpL + attn_post_norm(attn_out).
+    dumpStage("attn_out", x, T, d_model);
 
     // --- FFN path A — dense SwiGLU with GELU ---------------------------
 
@@ -348,6 +384,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                       static_cast<const float*>(ffwPost1->usmPtr),
                       _config.rmsNormEps,
                       projOutBuf);            // in-place
+    dumpStage("ffn_mlp", projOutBuf, T, d_model);
 
     // --- Path B — MoE -------------------------------------------------
 
@@ -477,15 +514,18 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                       static_cast<const float*>(postNorm2->usmPtr),
                       _config.rmsNormEps,
                       moeAccumBuf);
+    dumpStage("ffn_moe", moeAccumBuf, T, d_model);
 
     trace("combined = pathA_out + pathB_out");
     _ops.addResidualAsync(moeAccumBuf, projOutBuf, T * d_model);
+    dumpStage("ffn_moe_combined", moeAccumBuf, T, d_model);
 
     trace("post_ffw_norm (combined)");
     _ops.rmsNormAsync(moeAccumBuf, T, d_model,
                       static_cast<const float*>(ffwPost->usmPtr),
                       _config.rmsNormEps,
                       moeAccumBuf);
+    dumpStage("ffn_post_norm", moeAccumBuf, T, d_model);
 
     trace("ffn residual");
     _ops.addResidualAsync(x, moeAccumBuf, T * d_model);
@@ -493,6 +533,8 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     const float scaleVal = *static_cast<const float*>(outScale->usmPtr);
     trace("layer_output_scale");
     _ops.mulScalarAsync(x, scaleVal, T * d_model);
+    dumpStage("out_scaled", x, T, d_model);
+    dumpStage("l_out",      x, T, d_model);
 }
 
 } // namespace mimirmind::runtime::arch

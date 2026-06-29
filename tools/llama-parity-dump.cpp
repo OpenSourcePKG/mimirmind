@@ -35,7 +35,9 @@ namespace {
 
 struct ParityCtx {
     std::string dumpDir;
-    std::regex  pattern;   // matches tensor names like "l_out-12"
+    // Tensor name → stage tag for the filename (e.g. "Qcur_pos" → "Qcur_pos").
+    // The trailing layer index is captured by the regex.
+    std::regex  pattern;
     int         dumped{0};
 };
 
@@ -48,19 +50,31 @@ bool parity_cb(struct ggml_tensor* t, bool ask, void* user_data) {
     const bool match = std::regex_match(t->name, m, ctx->pattern);
 
     if (ask) {
-        return match;  // schedule a follow-up call only for the tensors we want
+        return match;
     }
     if (!match) {
         return true;
     }
 
-    const int blockIdx = std::atoi(m[1].str().c_str());
+    const std::string stage    = m[1].str();   // "attn_norm" / "Qcur_pos" / ...
+    const int         blockIdx = std::atoi(m[2].str().c_str());
 
-    // ggml: ne[0] is the fastest-varying (d_model), ne[1] is n_tokens.
-    const std::uint32_t d = static_cast<std::uint32_t>(t->ne[0]);
-    const std::uint32_t T = static_cast<std::uint32_t>(t->ne[1]);
-    const std::size_t   nBytes = ggml_nbytes(t);
+    // ggml: ne[0] is fastest-varying. The "per-token width" is the product
+    // of all dims except the last (which is n_tokens for these tensors).
+    // Tensors here are either 2D [d_model, T] or 3D [head_dim, n_head, T].
+    std::uint32_t T = 1, d = 1;
+    if (ggml_n_dims(t) == 2) {
+        d = static_cast<std::uint32_t>(t->ne[0]);
+        T = static_cast<std::uint32_t>(t->ne[1]);
+    } else if (ggml_n_dims(t) == 3) {
+        d = static_cast<std::uint32_t>(t->ne[0] * t->ne[1]);
+        T = static_cast<std::uint32_t>(t->ne[2]);
+    } else {
+        d = static_cast<std::uint32_t>(ggml_nelements(t));
+        T = 1;
+    }
 
+    const std::size_t nBytes = ggml_nbytes(t);
     std::vector<std::uint8_t> buf(nBytes);
     if (ggml_backend_buffer_is_host(t->buffer)) {
         std::memcpy(buf.data(), t->data, nBytes);
@@ -69,7 +83,8 @@ bool parity_cb(struct ggml_tensor* t, bool ask, void* user_data) {
     }
 
     const std::string fname =
-        ctx->dumpDir + "/blk" + std::to_string(blockIdx) + ".bin";
+        ctx->dumpDir + "/blk" + std::to_string(blockIdx) +
+        "-" + stage + ".bin";
     std::ofstream f(fname, std::ios::binary);
     if (!f) {
         std::fprintf(stderr, "parity-dump: cannot open %s for writing\n",
@@ -120,9 +135,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Stage tensors to capture (alternation in regex). One per execution
+    // landmark inside a Gemma 4 block. Group 1 = stage name, group 2 = il.
     ParityCtx ctx{
         /*.dumpDir =*/ dumpDir,
-        /*.pattern =*/ std::regex(R"(^l_out-(\d+)$)"),
+        /*.pattern =*/ std::regex(
+            R"(^(attn_norm|Qcur_pos|Kcur_pos|Vcur_normed|attn_post_norm|attn_out|ffn_mlp|ffn_moe|ffn_moe_combined|ffn_post_norm|out_scaled|l_out)-(\d+)$)"),
         /*.dumped  =*/ 0,
     };
 

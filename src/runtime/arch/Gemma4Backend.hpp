@@ -62,6 +62,10 @@ public:
     [[nodiscard]] std::pair<std::size_t, std::size_t>
         maxQKVDims() const override;
 
+    void setParityDumpPrefix(const std::string& prefix) noexcept override {
+        _parityDumpPrefix = prefix;
+    }
+
 private:
     /// Per-layer config snapshot, resolved once at construction.
     struct LayerInfo {
@@ -88,6 +92,10 @@ private:
     /// USM pointer to the global `rope_freqs.weight` (F32 [head_dim/2])
     /// used as `freq_factors` for full-attention layers only.
     const float*              _ropeFreqsForFullAttn{nullptr};
+
+    /// Active when InferenceEngine resolves MIMIRMIND_PARITY_DUMP and
+    /// passes the value via setParityDumpPrefix(). Empty = disabled.
+    std::string               _parityDumpPrefix{};
 };
 
 } // namespace mimirmind::runtime::arch

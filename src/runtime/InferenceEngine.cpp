@@ -254,34 +254,13 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
 
     // -- Prefill ---------------------------------------------------------
     //
-    // Optional parity-test dump. `MIMIRMIND_PARITY_DUMP=PREFIX` writes
-    // PREFIX-blk{N}.bin after each block during prefill. Format matches
-    // llama-parity-dump: u32 block_idx, u32 T, u32 d_model, f32 data[T*d].
+    // Optional parity-test dump. `MIMIRMIND_PARITY_DUMP=PREFIX` makes
+    // the backend write PREFIX-blk{N}-<stage>.bin at multiple stages
+    // inside each block during prefill. Format matches llama-parity-dump.
 
-    const char* dumpPrefix = std::getenv("MIMIRMIND_PARITY_DUMP");
-    auto dumpBlock = [&](std::uint32_t b) {
-        if (dumpPrefix == nullptr) {
-            return;
-        }
-        _gmm.sync();
-        const std::string fname = std::string{dumpPrefix} +
-            "-blk" + std::to_string(b) + ".bin";
-        std::ofstream f(fname, std::ios::binary);
-        if (!f) {
-            MM_LOG_WARN("parity",
-                        "cannot open '{}' for dump — skipping block {}",
-                        fname, b);
-            return;
-        }
-        const std::uint32_t header[3] = {
-            b,
-            static_cast<std::uint32_t>(Tp),
-            static_cast<std::uint32_t>(d_model),
-        };
-        f.write(reinterpret_cast<const char*>(header), sizeof(header));
-        f.write(reinterpret_cast<const char*>(xBuf),
-                static_cast<std::streamsize>(Tp * d_model * sizeof(float)));
-    };
+    if (const char* dumpPrefix = std::getenv("MIMIRMIND_PARITY_DUMP")) {
+        _backend->setParityDumpPrefix(dumpPrefix);
+    }
 
     const auto preT0 = clock::now();
     cmp::embeddingLookup(
@@ -292,7 +271,6 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
 
     for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
         _backend->runBlock(b, xBuf, Tp, cache, buffers, _traceBlock0);
-        dumpBlock(b);
     }
     cache.commit(Tp);
     const auto preT1 = clock::now();
