@@ -70,6 +70,19 @@ void CommandQueue::appendLaunch(GpuKernel&    kernel,
     ZE_CHECK(zeCommandListAppendLaunchKernel(
         _cmdList, kernel.handle(), &groups,
         nullptr, 0, nullptr));
+
+    // Level Zero does NOT insert an implicit memory barrier between
+    // consecutive kernel launches in the same command list — execution
+    // order is preserved but memory writes from kernel N may not be
+    // visible to kernel N+1 without explicit synchronization. Append
+    // a generic barrier here so every appendLaunch is safely orderable
+    // with respect to subsequent launches on the same queue. Cost is
+    // negligible vs the kernel work itself; the alternative (events +
+    // explicit dependency tracking per call site) is much more code
+    // for the same memory guarantees, and matmul-only batches (M5g)
+    // already used independent output buffers where this would no-op.
+    ZE_CHECK(zeCommandListAppendBarrier(_cmdList, nullptr, 0, nullptr));
+
     _hasPending = true;
 }
 
