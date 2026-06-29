@@ -9,20 +9,47 @@
 #   - GGUFs liegen unter ${MIMIRMIND_MODELS_DIR} (default: ./models)
 #   - Intel iGPU/dGPU unter /dev/dri verfügbar
 #
-# Typischer Run:
+# Gemeinsame Env-Variablen (für beide Workflows unten):
 #
 #   export MIMIRMIND_MODELS_DIR=/srv/llm-models
-#   export MIMIRMIND_MODEL_PATH=/models/gemma-3-4b-it-q4_k_m.gguf
+#   export MIMIRMIND_MODEL_PATH=/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
 #   export MIMIRMIND_RENDER_GID=$(getent group render | cut -d: -f3)
 #   export MIMIRMIND_VIDEO_GID=$(getent group video  | cut -d: -f3)
 #
+# Standard-Command in diesem File ist `serve` (Production-Pfad). Smoke
+# muss man explizit anstoßen — siehe unten.
+#
+# ── Serve-Workflow (M7d/M7e OpenAI HTTP-API) ──────────────────────────────
+#
+#   docker compose -f docker-compose.server.yml up                  # foreground
+#   docker compose -f docker-compose.server.yml up -d               # daemon
+#
+# Endpoints am Host auf Port ${MIMIRMIND_PORT:-8080}:
+#   GET  /health
+#   GET  /v1/models
+#   POST /v1/chat/completions   (auch mit stream:true)
+#
+#   curl -N http://localhost:8080/v1/chat/completions \
+#     -H 'Content-Type: application/json' \
+#     -d '{"messages":[{"role":"user","content":"Hi!"}],"stream":true}'
+#
+# ── Smoke-Workflow (M1-M5 Diagnostics + ein 20-Token-Generate) ────────────
+#
+# Smoke überschreibt das default-`command` durch Argv hinter dem Service-Namen:
+#
 #   docker compose -f docker-compose.server.yml pull
 #   rm -f ./run-logs/run.log                                    # frischer Log
-#   docker compose -f docker-compose.server.yml run --rm mimirmind 2>&1 \
+#   docker compose -f docker-compose.server.yml run --rm mimirmind smoke 2>&1 \
 #       | tee ./run-logs/stdout.log
 #
-# Danach mir den Inhalt von ./run-logs/run.log (strukturierter MM_LOG)
-# plus ./run-logs/stdout.log (Banner + Tabellen) zurückreichen.
+# Mit Chat-Template (M7c) und/oder Sampling (M7b):
+#
+#   docker compose -f docker-compose.server.yml run --rm mimirmind \
+#       smoke --chat --prompt "Wer hat den Mond entdeckt?"
+#   docker compose -f docker-compose.server.yml run --rm mimirmind \
+#       smoke --temperature 0.8 --top-p 0.95 --seed 42
+#
+# Logs in ./run-logs/run.log (strukturierter MM_LOG).
 
 services:
 
@@ -30,6 +57,15 @@ services:
         image: docker-registry.xd-pi.de/mimirmind:${MIMIRMIND_IMAGE_TAG:-latest}
         container_name: mimirmind-devtest
         pull_policy: always
+
+        # Default treibt den Serve-Modus, weil das der Production-Pfad ist.
+        # Smoke startet man explizit per `compose run --rm mimirmind smoke ...`
+        # — die Argv-Override hinter dem Service-Namen ersetzt dieses
+        # `command`.
+        command:
+            - serve
+            - --port
+            - "8080"
 
         devices:
             - /dev/dri:/dev/dri
@@ -40,14 +76,20 @@ services:
             - "${MIMIRMIND_RENDER_GID:-104}"
             - "${MIMIRMIND_VIDEO_GID:-44}"
 
+        # M7d/M7e — OpenAI-compatible HTTP API. Host-Port via
+        # MIMIRMIND_PORT env, Container-Port ist fest 8080 (siehe `command`).
+        ports:
+            - "${MIMIRMIND_PORT:-8080}:8080"
+
         environment:
             # Level Zero: 4-GiB-Cap aufheben (sonst sieht der Probe bei
             # 4 GiB einen ze_RESULT_ERROR_OUT_OF_DEVICE_MEMORY).
             UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
             UR_L0_USE_RELAXED_ALLOCATION_LIMITS:    "1"
 
-            # Volle Spur per Default — für Dev-Tests wollen wir alles.
-            MIMIRMIND_LOG_LEVEL:  ${MIMIRMIND_LOG_LEVEL:-trace}
+            # Default info — trace ist für gezielte Smoke-Runs nützlich
+            # aber spammt im Serve-Modus die run.log voll.
+            MIMIRMIND_LOG_LEVEL:  ${MIMIRMIND_LOG_LEVEL:-info}
             MIMIRMIND_LOG_FILE:   ${MIMIRMIND_LOG_FILE:-/logs/run.log}
 
             # Phase 2 USM probe cap in GiB. Default 4, set 0 to skip.
@@ -55,7 +97,7 @@ services:
             # systems this directly translates to host-RAM usage during probe.
             MIMIRMIND_USM_PROBE_TOTAL_GIB: ${MIMIRMIND_USM_PROBE_TOTAL_GIB:-4}
 
-            # Pflicht: ohne kein M3-Smoke. `?` lässt compose früh failen.
+            # Pflicht: ohne kein M3-Load. `?` lässt compose früh failen.
             MIMIRMIND_MODEL_PATH: ${MIMIRMIND_MODEL_PATH:?set MIMIRMIND_MODEL_PATH=/models/<file>.gguf}
 
         volumes:
