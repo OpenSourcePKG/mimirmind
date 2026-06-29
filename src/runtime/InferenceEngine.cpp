@@ -346,6 +346,23 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
         throw std::runtime_error("InferenceEngine::generate: empty prompt");
     }
 
+    // M8: only Qwen2/Llama-style transformer blocks are wired into
+    // runTransformerBlock today. Anything else (gemma4 in particular)
+    // would silently produce garbage because of missing Q-K-norm,
+    // hybrid dense+MoE FFN, sliding-window attention, and the deeper
+    // norm choreography. Refuse loudly with a pointer to the staging
+    // plan; load itself succeeds so the user can still inspect tensors.
+    if (_config.architecture != "qwen2") {
+        throw std::runtime_error(
+            "generate: forward path for architecture '" +
+            _config.architecture +
+            "' is not implemented yet — see "
+            "Memory/mimirmind/research/m8-gemma4-staging.md. "
+            "Model is loaded into USM and config/tokenizer/lm_head all "
+            "work, but the transformer block needs arch-specific "
+            "handling. Use Qwen2.5 for now.");
+    }
+
     const auto* tokEmb = _weights->find("token_embd.weight");
     if (tokEmb == nullptr) {
         tokEmb = _weights->find("tok_embeddings.weight");

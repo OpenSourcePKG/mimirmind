@@ -105,6 +105,45 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
     ropeFreqBase  = optionalF32("rope.freq_base", 10000.0F);
     slidingWindow = optionalU32("attention.sliding_window", 0);
 
+    // --- Architecture-specific shape corrections -------------------------
+
+    // Gemma 4 26B-A4B's metadata is wrong on two critical fields:
+    //   key_length      claims 512 but real head_dim is 256
+    //   head_count_kv   is unset (defaults to head_count=16) but real
+    //                   is 8 (GQA 2:1)
+    // Both are recoverable from tensor shapes loaded later, but
+    // LlmConfig is parsed *before* the matmul launches that would crash
+    // on the inflated q_dim/kv_dim. Override here so downstream code
+    // stays generic.
+    if (architecture == "gemma4") {
+        if (const auto* qNorm = reader.findTensor("blk.0.attn_q_norm.weight");
+            qNorm != nullptr && !qNorm->dimensions.empty()) {
+            const auto inferred =
+                static_cast<std::uint32_t>(qNorm->dimensions[0]);
+            if (inferred > 0 && inferred != keyLength) {
+                MM_LOG_WARN("config",
+                            "gemma4 override: key_length {} -> {} "
+                            "(from attn_q_norm.weight dim[0])",
+                            keyLength, inferred);
+                keyLength   = inferred;
+                valueLength = inferred;
+            }
+        }
+        if (const auto* kW = reader.findTensor("blk.0.attn_k.weight");
+            kW != nullptr && kW->dimensions.size() >= 2 && headDim() > 0) {
+            const auto inferredKv =
+                static_cast<std::uint32_t>(kW->dimensions[1] / headDim());
+            if (inferredKv > 0 && inferredKv != headCountKv) {
+                MM_LOG_WARN("config",
+                            "gemma4 override: head_count_kv {} -> {} "
+                            "(from attn_k.weight dim[1]={} / head_dim={})",
+                            headCountKv, inferredKv,
+                            kW->dimensions[1], headDim());
+                headCountKv = inferredKv;
+            }
+        }
+    }
+
     // --- Sanity ----------------------------------------------------------
 
     if (headCount == 0 || embeddingLength % headCount != 0) {
