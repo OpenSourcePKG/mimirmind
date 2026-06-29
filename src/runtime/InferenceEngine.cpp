@@ -13,8 +13,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace mimirmind::runtime {
 
@@ -54,6 +56,18 @@ InferenceEngine::InferenceEngine()
       _gmm{_ctx} {
     MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");
     _allocator.probeLimits();
+
+    // Opt-in block-0 trace. Anything non-empty / non-"0" enables it.
+    if (const char* env = std::getenv("MIMIRMIND_TRACE_BLOCK0")) {
+        std::string_view v{env};
+        if (!v.empty() && v != "0" && v != "false" && v != "off") {
+            _traceBlock0 = true;
+            MM_LOG_INFO("engine",
+                        "MIMIRMIND_TRACE_BLOCK0={} — block-0 trace enabled "
+                        "for first forward only",
+                        env);
+        }
+    }
 }
 
 InferenceEngine::~InferenceEngine() = default;
@@ -432,14 +446,14 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
     // -- Decode loop -----------------------------------------------------
 
     const auto decT0 = clock::now();
-    bool hitEos = false;
+    bool hitStop = false;
 
     for (std::size_t step = 1;
          !aborted && step < maxNew && cache.length() < cacheMax;
          ++step)
     {
         if (isStop(nextId)) {
-            hitEos = true;
+            hitStop = true;
             break;
         }
 
@@ -474,7 +488,7 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
         outStats->generatedTokens = generated.size();
         outStats->prefillMs       = preMs;
         outStats->decodeMs        = decMs;
-        outStats->hitEos          = hitEos;
+        outStats->hitStop         = hitStop;
     }
 
     return generated;

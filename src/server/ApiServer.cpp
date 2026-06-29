@@ -252,6 +252,43 @@ json buildFinishChunk(const std::string& id, std::int64_t created,
     return sink.write(kDone.data(), kDone.size());
 }
 
+/// Index of the first byte of an incomplete UTF-8 codepoint at the end
+/// of `s`, or `s.size()` if the buffer ends on a codepoint boundary.
+/// Used to split a token-stream into "safe-to-emit" prefix + "buffer
+/// for next token" suffix — GPT-2 BPE can put a multi-byte UTF-8 char
+/// across two tokens, and SSE consumers choke on partial codepoints.
+[[nodiscard]] std::size_t utf8IncompleteTailStart(const std::string& s) {
+    if (s.empty()) return 0;
+
+    // Walk back over continuation bytes (10xxxxxx). Max 3 trailing
+    // continuations are legal in UTF-8 (4-byte codepoint).
+    std::size_t i        = s.size();
+    std::size_t contSeen = 0;
+    while (i > 0 && (static_cast<unsigned char>(s[i - 1]) & 0xC0) == 0x80
+                 && contSeen < 3) {
+        --i;
+        ++contSeen;
+    }
+    if (i == 0) {
+        // Pathological: buffer is all continuation bytes. Emit and let
+        // the receiver deal with it — we can't keep buffering forever.
+        return s.size();
+    }
+
+    const auto lead = static_cast<unsigned char>(s[i - 1]);
+    std::size_t expectedCont;
+    if      ((lead & 0x80) == 0)    expectedCont = 0;  // ASCII
+    else if ((lead & 0xE0) == 0xC0) expectedCont = 1;
+    else if ((lead & 0xF0) == 0xE0) expectedCont = 2;
+    else if ((lead & 0xF8) == 0xF0) expectedCont = 3;
+    else                            return s.size();   // malformed lead
+
+    if (contSeen >= expectedCont) {
+        return s.size();        // last codepoint is complete
+    }
+    return i - 1;               // last codepoint starts here and is partial
+}
+
 } // namespace
 
 struct ApiServer::Impl {
@@ -412,23 +449,20 @@ struct ApiServer::Impl {
             }
         }
 
-        // Strip a trailing stop token from the rendered text so clients
-        // don't see "<|im_end|>" tacked onto the answer.
+        // Strip trailing stop tokens from the rendered text so clients
+        // don't see "<|im_end|>" tacked onto the answer. Loop because at
+        // low temperatures the model could in theory sample several stop
+        // tokens in a row before the engine's stop-check breaks the loop.
         std::vector<std::int32_t> visible = generated;
-        bool hitStop = false;
-        if (!visible.empty()) {
-            const auto last = visible.back();
-            if (last == tok.eosId() ||
-                std::find(stopIds.begin(), stopIds.end(), last) != stopIds.end()) {
-                visible.pop_back();
-                hitStop = true;
-            }
+        bool hitStop = stats.hitStop;
+        auto isStop = [&](std::int32_t id) {
+            if (id == tok.eosId()) return true;
+            return std::find(stopIds.begin(), stopIds.end(), id) != stopIds.end();
+        };
+        while (!visible.empty() && isStop(visible.back())) {
+            visible.pop_back();
+            hitStop = true;
         }
-        // hitEos in stats means we broke out of the decode loop early
-        // because the *previously* sampled token was a stop. The token
-        // itself is still in `generated` (added before the check). Mirror
-        // that behaviour for the simple last-token strip above.
-        hitStop = hitStop || stats.hitEos;
 
         const std::string text = tok.decode(visible, /*skipSpecial=*/true);
 
@@ -504,6 +538,9 @@ struct ApiServer::Impl {
             std::string               respId;
             std::int64_t              created{};
             std::string               echoModel;
+            // Buffers a trailing incomplete UTF-8 codepoint between
+            // tokens so SSE deltas always carry valid UTF-8.
+            std::string               utf8Pending;
             bool                      done{false};
         };
         auto state = std::make_shared<StreamState>();
@@ -563,10 +600,21 @@ struct ApiServer::Impl {
                     if (txt.empty()) {
                         return true;
                     }
+
+                    state->utf8Pending.append(txt);
+                    const std::size_t cut =
+                        utf8IncompleteTailStart(state->utf8Pending);
+                    if (cut == 0) {
+                        return true;     // entire buffer is partial; keep waiting
+                    }
+
+                    std::string emit = state->utf8Pending.substr(0, cut);
+                    state->utf8Pending.erase(0, cut);
+
                     if (!writeSseEvent(
                             sink,
                             buildContentChunk(state->respId, state->created,
-                                              state->echoModel, txt))) {
+                                              state->echoModel, emit))) {
                         clientGone = true;
                         return false;   // abort generate()
                     }
@@ -615,10 +663,22 @@ struct ApiServer::Impl {
                     return false;
                 }
 
+                // Flush any UTF-8 buffer leftover (partial codepoint at
+                // the end — rare but possible when the model stops mid-
+                // grapheme on length cutoff). Receivers may show U+FFFD.
+                if (!state->utf8Pending.empty()) {
+                    (void)writeSseEvent(
+                        sink,
+                        buildContentChunk(state->respId, state->created,
+                                          state->echoModel,
+                                          state->utf8Pending));
+                    state->utf8Pending.clear();
+                }
+
                 // 3. Finish chunk + DONE sentinel. finish_reason is "stop"
                 //    if a stop token broke the decode loop, "length" if we
                 //    exhausted maxNewTokens.
-                const bool hitStop = stats.hitEos
+                const bool hitStop = stats.hitStop
                     || (!generated.empty() && isStop(generated.back()));
                 const std::string finish = hitStop ? "stop" : "length";
 
