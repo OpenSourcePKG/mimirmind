@@ -83,6 +83,34 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 
 
 # ============================================================================
+# Stage 2b — llama.cpp CPU build (reference oracle for parity tests)
+# ============================================================================
+FROM builder AS llamacpp
+
+WORKDIR /llamacpp
+ARG LLAMACPP_REF=master
+RUN git clone --depth 1 --branch ${LLAMACPP_REF} \
+        https://github.com/ggml-org/llama.cpp.git src
+
+# Inject our parity-dump tool as a new example under examples/parity-dump.
+COPY tools/llama-parity-dump.cpp        /llamacpp/src/examples/parity-dump/main.cpp
+COPY tools/parity-dump-CMakeLists.txt   /llamacpp/src/examples/parity-dump/CMakeLists.txt
+RUN echo 'add_subdirectory(parity-dump)' >> /llamacpp/src/examples/CMakeLists.txt
+
+# CPU-only build of just the targets we need. Skipping CUDA/Vulkan/Metal
+# keeps the build under a minute and the runtime image lean.
+RUN cmake -S src -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DGGML_NATIVE=OFF \
+        -DGGML_CUDA=OFF \
+        -DGGML_VULKAN=OFF \
+        -DGGML_METAL=OFF \
+        -DGGML_OPENMP=OFF \
+    && cmake --build build --target llama-cli llama-parity-dump --parallel
+
+
+# ============================================================================
 # Stage 3 — Runtime (no toolchain, no source, just runtime libs + binary)
 # ============================================================================
 FROM ubuntu:24.04 AS runtime
@@ -102,6 +130,8 @@ https://repositories.intel.com/gpu/ubuntu noble client" \
         level-zero \
         intel-level-zero-gpu \
         intel-opencl-icd \
+        python3 \
+        python3-numpy \
     && apt-get purge -y wget gnupg \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
@@ -115,6 +145,14 @@ ENV MIMIRMIND_MODELS_DIR=/models
 
 COPY --from=build /src/build/mimirmind /usr/local/bin/mimirmind
 COPY --from=build /src/build/spv       /usr/local/share/mimirmind/spv
+
+# llama.cpp parity-test oracle binaries (CPU build).
+COPY --from=llamacpp /llamacpp/build/bin/llama-cli           /usr/local/bin/llama-cli
+COPY --from=llamacpp /llamacpp/build/bin/llama-parity-dump   /usr/local/bin/llama-parity-dump
+
+# Python diff helper.
+COPY tools/parity-diff.py /usr/local/bin/parity-diff
+RUN chmod +x /usr/local/bin/parity-diff
 
 ENV MIMIRMIND_SPV_DIR=/usr/local/share/mimirmind/spv
 

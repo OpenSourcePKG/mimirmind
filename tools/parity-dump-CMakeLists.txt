@@ -1,0 +1,8 @@
+# Build the parity-dump tool inside llama.cpp's CMake tree. The directory
+# is wired in by the Dockerfile (it patches examples/CMakeLists.txt to
+# `add_subdirectory(parity-dump)`).
+set(TARGET llama-parity-dump)
+add_executable(${TARGET} main.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

@@ -47,11 +47,13 @@ constexpr const char* kBanner =
 
 constexpr const char* kUsage =
     "Usage:\n"
-    "  mimirmind [smoke|serve] [options]\n"
+    "  mimirmind [smoke|serve|parity] [options]\n"
     "\n"
     "Modes:\n"
     "  smoke              Run M1-M5 diagnostics + end-to-end generate (default)\n"
     "  serve              Start the OpenAI-compatible HTTP server (M7d, stub)\n"
+    "  parity             Tensor-parity test: run llama.cpp + mimirmind on\n"
+    "                     the same prompt, dump per-block hidden state, diff\n"
     "\n"
     "Options:\n"
     "  --model PATH       GGUF model file (overrides MIMIRMIND_MODEL_PATH)\n"
@@ -69,6 +71,7 @@ constexpr const char* kUsage =
 enum class Mode {
     Smoke,
     Serve,
+    Parity,
 };
 
 struct CliArgs {
@@ -94,6 +97,8 @@ struct CliArgs {
             out.mode = Mode::Smoke;
         } else if (m == "serve") {
             out.mode = Mode::Serve;
+        } else if (m == "parity") {
+            out.mode = Mode::Parity;
         } else if (m == "-h" || m == "--help") {
             std::cout << kUsage;
             std::exit(0);
@@ -1159,6 +1164,82 @@ int runServe(const CliArgs& args) {
     return 0;
 }
 
+/**
+ * Tensor parity-test orchestrator. Drives three sub-steps:
+ *   1. llama-parity-dump (CPU reference)   → /tmp/dumps/llama/blk{N}.bin
+ *   2. mimirmind own prefill (this binary) → /tmp/dumps/mimir-blk{N}.bin
+ *   3. parity-diff (Python)                → prints first divergence
+ *
+ * All three live in the Docker runtime image (see Dockerfile stage 2b
+ * "llamacpp" + runtime COPY). Container exits with the diff's return
+ * code so callers can scripts on it (0 = parity, 1 = divergence).
+ */
+[[nodiscard]] int runParity(const CliArgs& argsIn) {
+    if (argsIn.modelPath.empty()) {
+        std::cerr << "parity: --model PATH is required "
+                     "(or set MIMIRMIND_MODEL_PATH)\n";
+        return 2;
+    }
+
+    const std::string dumpRoot = "/tmp/dumps";
+    const std::string llamaDir = dumpRoot + "/llama";
+    const std::string mimirPfx = dumpRoot + "/mimir";
+
+    // Wipe + recreate dump dirs.
+    std::filesystem::remove_all(dumpRoot);
+    std::filesystem::create_directories(llamaDir);
+
+    auto shellQuote = [](const std::string& s) {
+        std::string out{"'"};
+        for (char c : s) {
+            if (c == '\'') { out += "'\\''"; } else { out += c; }
+        }
+        out += "'";
+        return out;
+    };
+
+    // --- 1. llama-parity-dump --------------------------------------------
+    {
+        std::cout << "\n=== [1/3] llama-parity-dump (reference oracle) ===\n";
+        std::string cmd = "llama-parity-dump";
+        cmd += " --model "    + shellQuote(argsIn.modelPath);
+        cmd += " --prompt "   + shellQuote(argsIn.prompt);
+        cmd += " --dump-dir " + shellQuote(llamaDir);
+        cmd += " --n-predict 0";  // prefill-only, no generation
+        std::cout << "$ " << cmd << "\n" << std::flush;
+        const int rc = std::system(cmd.c_str());
+        if (rc != 0) {
+            std::cerr << "parity: llama-parity-dump exited " << rc << "\n";
+            return 1;
+        }
+    }
+
+    // --- 2. mimirmind own forward dump -----------------------------------
+    {
+        std::cout << "\n=== [2/3] mimirmind dump ===\n" << std::flush;
+        setenv("MIMIRMIND_PARITY_DUMP", mimirPfx.c_str(), 1);
+
+        mimirmind::runtime::InferenceEngine engine;
+        engine.loadModel(argsIn.modelPath);
+
+        const auto promptIds = engine.tokenizer().encode(argsIn.prompt, true);
+        mimirmind::runtime::GenerateParams gp{};
+        gp.maxNewTokens = 1;  // only need prefill; one token is fine
+        engine.generate(std::span<const std::int32_t>{promptIds.data(),
+                                                       promptIds.size()},
+                        gp);
+    }
+
+    // --- 3. parity-diff ---------------------------------------------------
+    {
+        std::cout << "\n=== [3/3] parity-diff ===\n" << std::flush;
+        const std::string cmd = "parity-diff " +
+            shellQuote(llamaDir) + " " + shellQuote(mimirPfx);
+        std::cout << "$ " << cmd << "\n" << std::flush;
+        return std::system(cmd.c_str());
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1169,10 +1250,17 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    if (args.modelPath.empty()) {
+        if (const char* env = std::getenv("MIMIRMIND_MODEL_PATH")) {
+            args.modelPath = env;
+        }
+    }
+
     try {
         switch (args.mode) {
-            case Mode::Smoke: return runSmoke(args);
-            case Mode::Serve: return runServe(args);
+            case Mode::Smoke:  return runSmoke(args);
+            case Mode::Serve:  return runServe(args);
+            case Mode::Parity: return runParity(args);
         }
         return 0;
     } catch (const mimirmind::runtime::L0Error& e) {
