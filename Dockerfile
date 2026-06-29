@@ -76,6 +76,7 @@ FROM builder AS build
 COPY CMakeLists.txt ./
 COPY src ./src
 COPY kernels ./kernels
+COPY third_party ./third_party
 
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build --parallel
