@@ -1102,6 +1102,23 @@ int runServe(const CliArgs& args) {
     mimirmind::runtime::InferenceEngine engine;
     engine.loadModel(args.modelPath);
 
+    // M8.1: only Qwen2 has a working forward path. Refuse other
+    // architectures up-front so the user finds out at serve startup
+    // (not on the first chat request) and gets an actionable hint.
+    if (engine.config().architecture != "qwen2") {
+        const std::string msg =
+            "serve: architecture '" + engine.config().architecture +
+            "' is not implemented yet. The model loaded fine and the "
+            "tokenizer is ready, but the transformer block needs "
+            "architecture-specific code (Q-K-norm, hybrid dense+MoE FFN, "
+            "sliding-window attention). See "
+            "Memory/mimirmind/research/m8-gemma4-staging.md. "
+            "Use a Qwen2.5 GGUF for now.";
+        MM_LOG_ERROR("main", "{}", msg);
+        std::cerr << msg << "\n";
+        return 2;
+    }
+
     mimirmind::server::ServerConfig cfg{};
     cfg.host    = "0.0.0.0";
     cfg.port    = args.port;
