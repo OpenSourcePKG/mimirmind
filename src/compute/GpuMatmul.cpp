@@ -1,29 +1,53 @@
 #include "compute/GpuMatmul.hpp"
 
 #include "compute/Matmul.hpp"
+#include "compute/QuantType.hpp"
+#include "compute/QuantTypeRegistry.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
 
 #include <cstdint>
+#include <sstream>
+#include <string>
 
 namespace mimirmind::compute {
 
 GpuMatmul::GpuMatmul(runtime::L0Context& ctx, runtime::CommandQueue& queue)
     : _ctx{ctx},
-      _queue{queue},
-      _q4kModule{ctx, "matmul_q4k_vec"},
-      _q4kKernel{_q4kModule.kernel("matmul_q4k_vec")},
-      _q6kModule{ctx, "matmul_q6k_vec"},
-      _q6kKernel{_q6kModule.kernel("matmul_q6k_vec")}
+      _queue{queue}
 {
+    std::ostringstream loaded;
+    bool first = true;
+
+    for (const QuantType* qt : allQuantTypes()) {
+        const auto moduleName = qt->gpuMatmulModule();
+        if (moduleName.empty()) {
+            continue;
+        }
+
+        // GpuModule wants a string_view; the kernel-lookup wants c_str.
+        const std::string nameStr{moduleName};
+        auto module = std::make_unique<runtime::GpuModule>(_ctx, moduleName);
+        runtime::GpuKernel kernel{module->kernel(nameStr.c_str())};
+
+        _entries.emplace(qt->ggmlType(),
+                         Entry{std::move(module), kernel});
+
+        if (!first) {
+            loaded << " + ";
+        }
+        loaded << qt->name();
+        first = false;
+    }
+
     MM_LOG_INFO("gpummm",
-                "GpuMatmul ready — Q4_K + Q6_K kernels loaded, local_size={} "
+                "GpuMatmul ready — {} kernels loaded, local_size={} "
                 "(sg={}, {} outputs/group)",
-                kLocalSize, kSubgroupSize, kOutputsPerGroup);
+                loaded.str(), kLocalSize, kSubgroupSize, kOutputsPerGroup);
 }
 
 bool GpuMatmul::supports(model::GgmlType type) const noexcept {
-    return type == model::GgmlType::Q4_K || type == model::GgmlType::Q6_K;
+    return _entries.contains(type);
 }
 
 void GpuMatmul::matmulAsync(model::GgmlType type,
@@ -34,7 +58,8 @@ void GpuMatmul::matmulAsync(model::GgmlType type,
                             std::size_t     M,
                             float*          Y,
                             float*          scratch) {
-    if (!supports(type)) {
+    const auto it = _entries.find(type);
+    if (it == _entries.end()) {
         // CPU fallback. If async GPU work is pending, sync it first so
         // ordering vs prior matmulAsync calls is preserved.
         _queue.flush();
@@ -42,8 +67,7 @@ void GpuMatmul::matmulAsync(model::GgmlType type,
         return;
     }
 
-    runtime::GpuKernel& kern = (type == model::GgmlType::Q4_K)
-        ? _q4kKernel : _q6kKernel;
+    runtime::GpuKernel& kern = it->second.kernel;
 
     // M5h: 4 outputs per workgroup (4 subgroups × 16 threads).
     const std::uint32_t groups = static_cast<std::uint32_t>(

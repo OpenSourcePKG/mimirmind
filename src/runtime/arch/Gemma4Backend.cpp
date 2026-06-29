@@ -3,6 +3,8 @@
 #include "compute/Attention.hpp"
 #include "compute/GpuMatmul.hpp"
 #include "compute/GpuOps.hpp"
+#include "compute/QuantType.hpp"
+#include "compute/QuantTypeRegistry.hpp"
 #include "model/GgufTypes.hpp"
 #include "model/LlmConfig.hpp"
 #include "model/WeightsMap.hpp"
@@ -461,15 +463,17 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
             std::to_string(gateUpFused));
     }
 
-    constexpr std::size_t kQ6KBlockElems = 256;
-    constexpr std::size_t kQ6KBlockBytes = 210;
-    constexpr std::size_t kQ8_0BlockElems = 32;
-    constexpr std::size_t kQ8_0BlockBytes = 34;
+    const compute::QuantType* const qtGateUp = compute::quantType(expGateUp->type);
+    const compute::QuantType* const qtDown   = compute::quantType(expDown->type);
+    if (qtGateUp == nullptr || qtDown == nullptr) {
+        throw std::runtime_error(
+            "Gemma4Backend: expert weight type(s) not in QuantType registry");
+    }
 
     const std::size_t expertBytesGateUp =
-        gateUpFused * (d_model / kQ6KBlockElems) * kQ6KBlockBytes;
+        gateUpFused * (d_model / qtGateUp->blockElements()) * qtGateUp->blockBytes();
     const std::size_t expertBytesDown =
-        d_model * (ffPerExpert / kQ8_0BlockElems) * kQ8_0BlockBytes;
+        d_model * (ffPerExpert / qtDown->blockElements()) * qtDown->blockBytes();
 
     auto* const expGateUpBase =
         static_cast<const std::uint8_t*>(expGateUp->usmPtr);
