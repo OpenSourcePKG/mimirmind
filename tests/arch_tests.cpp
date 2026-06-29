@@ -13,12 +13,16 @@
 #include "TestFramework.hpp"
 
 #include "compute/Attention.hpp"
+#include "compute/MoeRouting.hpp"
 #include "compute/Softmax.hpp"
 #include "runtime/arch/ArchBackend.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <set>
 #include <string_view>
 #include <vector>
 
@@ -265,6 +269,177 @@ TEST(mha_decodeMode) {
     // All three K rows are 1.0 and Q=1.0, scores = [1, 1, 1] / sqrt(1) = 1,1,1
     // softmax → uniform 1/3, out = (10+20+30)/3 = 20.0
     EXPECT_NEAR(out[0], 20.0F, 1e-5F);
+}
+
+// =======================================================================
+// compute::moeTopKRoute (Gemma 4 path B routing)
+// =======================================================================
+
+TEST(moe_singleToken_clearWinners) {
+    // 4 experts, K=2. logits = [10, 1, 8, 3]
+    //   max = 10
+    //   exp shift: [1, e^-9, e^-2, e^-7] ≈ [1, 1.23e-4, 0.1353, 9.12e-4]
+    //   sum  = 1.13642...
+    //   probs ≈ [0.8799, 1.08e-4, 0.1191, 8.02e-4]
+    //   top-2 by descending = expert 0 then 2
+    //   kept = 0.9990, weights = [0.8799/0.9990, 0.1191/0.9990] ≈ [0.8807, 0.1193]
+    const std::array<float, 4> logits{10.0F, 1.0F, 8.0F, 3.0F};
+    std::array<std::int32_t, 2> idx{};
+    std::array<float, 2>        w{};
+
+    mimirmind::compute::moeTopKRoute(logits.data(), 1, 4, 2,
+                                     idx.data(), w.data());
+
+    EXPECT_EQ(idx[0], 0);
+    EXPECT_EQ(idx[1], 2);
+
+    // Hand-compute expected renormalised weights:
+    const float p0 = 1.0F;                     // exp(10-10)
+    const float p2 = std::exp(8.0F - 10.0F);   // exp(-2)
+    const float wsum = p0 + p2;
+    EXPECT_NEAR(w[0], p0 / wsum, 1e-5F);
+    EXPECT_NEAR(w[1], p2 / wsum, 1e-5F);
+    EXPECT_NEAR(w[0] + w[1], 1.0F, 1e-5F);
+}
+
+TEST(moe_singleToken_uniformLogits_K1) {
+    // All equal logits → softmax uniform → top-1 picks SOMEONE with weight 1.0.
+    // Tie-breaking is implementation-defined; we just check validity.
+    const std::array<float, 4> logits{2.5F, 2.5F, 2.5F, 2.5F};
+    std::array<std::int32_t, 1> idx{};
+    std::array<float, 1>        w{};
+
+    mimirmind::compute::moeTopKRoute(logits.data(), 1, 4, 1,
+                                     idx.data(), w.data());
+
+    EXPECT_TRUE(idx[0] >= 0 && idx[0] < 4);
+    EXPECT_NEAR(w[0], 1.0F, 1e-5F);
+}
+
+TEST(moe_singleToken_uniformLogits_topKEqualsN) {
+    // K = nExperts, uniform logits → every expert selected with weight 1/N.
+    // After partial_sort all indices are present; collect them as a set.
+    const std::array<float, 4> logits{0.0F, 0.0F, 0.0F, 0.0F};
+    std::array<std::int32_t, 4> idx{};
+    std::array<float, 4>        w{};
+
+    mimirmind::compute::moeTopKRoute(logits.data(), 1, 4, 4,
+                                     idx.data(), w.data());
+
+    std::set<std::int32_t> seen(idx.begin(), idx.end());
+    EXPECT_EQ(seen.size(), 4U);   // all distinct
+    EXPECT_TRUE(seen.contains(0));
+    EXPECT_TRUE(seen.contains(1));
+    EXPECT_TRUE(seen.contains(2));
+    EXPECT_TRUE(seen.contains(3));
+
+    float sumW = 0.0F;
+    for (float wi : w) {
+        EXPECT_NEAR(wi, 0.25F, 1e-5F);
+        sumW += wi;
+    }
+    EXPECT_NEAR(sumW, 1.0F, 1e-5F);
+}
+
+TEST(moe_weightsSumToOne_renormalised) {
+    // Even when topK < nExperts, the K chosen weights MUST sum to ~1
+    // because we renormalise. This guards against drift in the divisor.
+    const std::array<float, 6> logits{5.0F, 1.0F, 3.0F, 7.0F, 2.0F, 4.0F};
+    std::array<std::int32_t, 3> idx{};
+    std::array<float, 3>        w{};
+
+    mimirmind::compute::moeTopKRoute(logits.data(), 1, 6, 3,
+                                     idx.data(), w.data());
+
+    const float sumW = w[0] + w[1] + w[2];
+    EXPECT_NEAR(sumW, 1.0F, 1e-5F);
+
+    // Top-3 should be experts 3, 0, 5 in descending order of logit.
+    EXPECT_EQ(idx[0], 3);
+    EXPECT_EQ(idx[1], 0);
+    EXPECT_EQ(idx[2], 5);
+}
+
+TEST(moe_numericallyStable_largeLogits) {
+    // Without max-subtract, exp(1000) would overflow.
+    const std::array<float, 3> logits{1000.0F, 1003.0F, 999.0F};
+    std::array<std::int32_t, 2> idx{};
+    std::array<float, 2>        w{};
+
+    mimirmind::compute::moeTopKRoute(logits.data(), 1, 3, 2,
+                                     idx.data(), w.data());
+
+    EXPECT_EQ(idx[0], 1);   // 1003 is largest
+    EXPECT_EQ(idx[1], 0);   // 1000 is second
+    EXPECT_NEAR(w[0] + w[1], 1.0F, 1e-5F);
+    EXPECT_TRUE(std::isfinite(w[0]));
+    EXPECT_TRUE(std::isfinite(w[1]));
+}
+
+TEST(moe_multipleTokens_independent) {
+    // T=2 with different rows; verify each row is routed independently.
+    // Row 0: [9, 0, 5]  → top-2 = (0, 2)
+    // Row 1: [1, 4, 2]  → top-2 = (1, 2)
+    const std::array<float, 6> logits{
+        9.0F, 0.0F, 5.0F,
+        1.0F, 4.0F, 2.0F,
+    };
+    std::array<std::int32_t, 4> idx{};
+    std::array<float, 4>        w{};
+
+    mimirmind::compute::moeTopKRoute(logits.data(), 2, 3, 2,
+                                     idx.data(), w.data());
+
+    EXPECT_EQ(idx[0], 0);
+    EXPECT_EQ(idx[1], 2);
+    EXPECT_NEAR(w[0] + w[1], 1.0F, 1e-5F);
+
+    EXPECT_EQ(idx[2], 1);
+    EXPECT_EQ(idx[3], 2);
+    EXPECT_NEAR(w[2] + w[3], 1.0F, 1e-5F);
+}
+
+TEST(moe_descendingOrder) {
+    // Routing returns indices in descending probability order.
+    // logits = [3, 8, 1, 5, 9] → top-3 = (4, 1, 3)
+    const std::array<float, 5> logits{3.0F, 8.0F, 1.0F, 5.0F, 9.0F};
+    std::array<std::int32_t, 3> idx{};
+    std::array<float, 3>        w{};
+
+    mimirmind::compute::moeTopKRoute(logits.data(), 1, 5, 3,
+                                     idx.data(), w.data());
+
+    EXPECT_EQ(idx[0], 4);
+    EXPECT_EQ(idx[1], 1);
+    EXPECT_EQ(idx[2], 3);
+    EXPECT_TRUE(w[0] >= w[1]);
+    EXPECT_TRUE(w[1] >= w[2]);
+}
+
+TEST(moe_topKZeroThrows) {
+    const std::array<float, 3>  logits{1.0F, 2.0F, 3.0F};
+    std::array<std::int32_t, 1> idx{};
+    std::array<float, 1>        w{};
+    try {
+        mimirmind::compute::moeTopKRoute(logits.data(), 1, 3, 0,
+                                         idx.data(), w.data());
+        EXPECT_TRUE(false && "expected throw");
+    } catch (const std::runtime_error&) {
+        // expected
+    }
+}
+
+TEST(moe_topKExceedsNExpertsThrows) {
+    const std::array<float, 3>  logits{1.0F, 2.0F, 3.0F};
+    std::array<std::int32_t, 4> idx{};
+    std::array<float, 4>        w{};
+    try {
+        mimirmind::compute::moeTopKRoute(logits.data(), 1, 3, 4,
+                                         idx.data(), w.data());
+        EXPECT_TRUE(false && "expected throw");
+    } catch (const std::runtime_error&) {
+        // expected
+    }
 }
 
 int main() {

@@ -131,6 +131,7 @@ add_executable(mimirmind
     src/compute/GpuMatmul.cpp
     src/compute/GpuOps.cpp
     src/compute/Matmul.cpp
+    src/compute/MoeRouting.cpp
     src/compute/Norm.cpp
     src/compute/QuantTypeRegistry.cpp
     src/compute/Rope.cpp
@@ -228,6 +229,7 @@ target_link_libraries(quant_tests PRIVATE Threads::Threads)
 add_executable(arch_tests
     tests/arch_tests.cpp
     src/compute/Attention.cpp
+    src/compute/MoeRouting.cpp
     src/compute/Softmax.cpp
     src/runtime/Log.cpp
 )
