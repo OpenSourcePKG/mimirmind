@@ -467,6 +467,93 @@ TEST(matmul_q4k_singleRow) {
 }
 
 // =======================================================================
+// Q8_0 matmul (GPU vs CPU) — new in M8.G
+// =======================================================================
+
+// Q8_0 row: 32 elements per block, 34 bytes. d=1.0, qs alternating
+// +5/-5 → dequant values alternate +5/-5. With X = all 1.0 → Y = 0.
+// Sums every term but they cancel, exercising precision near zero.
+TEST(matmul_q8_0_singleRow_alternating) {
+    constexpr std::size_t K = 32;
+    constexpr std::size_t N = 1;
+
+    constexpr std::uint16_t kHalfOne = 0x3C00U;
+    std::array<std::uint8_t, 34> wRow{};
+    std::memcpy(wRow.data(), &kHalfOne, sizeof(std::uint16_t));
+    for (std::size_t i = 0; i < 32; ++i) {
+        wRow[2 + i] = (i % 2 == 0) ? static_cast<std::uint8_t>(5)
+                                   : static_cast<std::uint8_t>(static_cast<std::int8_t>(-5));
+    }
+
+    const std::vector<float> x(K, 1.0F);
+
+    UsmBuf bufW(wRow.size());
+    UsmBuf bufX(K * sizeof(float));
+    UsmBuf bufY(N * sizeof(float));
+    UsmBuf bufScratch(K * sizeof(float));
+    std::memcpy(bufW.raw(), wRow.data(), wRow.size());
+    std::memcpy(bufX.raw(), x.data(),    x.size() * sizeof(float));
+
+    fx().gmm.matmul(mimirmind::model::GgmlType::Q8_0,
+                    bufW.raw(), N, K,
+                    bufX.as<float>(), 1,
+                    bufY.as<float>(),
+                    bufScratch.as<float>());
+
+    EXPECT_NEAR(bufY.as<float>()[0], 0.0F, 1e-5F);
+}
+
+// Larger matmul: K=2816 (Gemma 4 d_model), N=64. Verify GPU output
+// matches CPU compute::matmul element-wise within tolerance.
+TEST(matmul_q8_0_64rows_K2816) {
+    constexpr std::size_t K = 2816;
+    constexpr std::size_t N = 64;
+    constexpr std::size_t blocksPerRow = K / 32;
+    constexpr std::size_t bytesPerRow  = blocksPerRow * 34;
+
+    constexpr std::uint16_t kHalfHalf = 0x3800U;  // 0.5
+
+    std::vector<std::uint8_t> wAll(N * bytesPerRow, 0);
+    for (std::size_t n = 0; n < N; ++n) {
+        std::uint8_t* row = wAll.data() + n * bytesPerRow;
+        for (std::size_t b = 0; b < blocksPerRow; ++b) {
+            std::uint8_t* block = row + b * 34;
+            std::memcpy(block, &kHalfHalf, sizeof(std::uint16_t));
+            for (std::size_t l = 0; l < 32; ++l) {
+                block[2 + l] = static_cast<std::uint8_t>(
+                    static_cast<std::int8_t>((n + b + l) % 19 - 9));
+            }
+        }
+    }
+
+    const auto x = generateFloats(K, 0x90);
+
+    UsmBuf bufW(wAll.size());
+    UsmBuf bufX(K * sizeof(float));
+    UsmBuf bufY(N * sizeof(float));
+    UsmBuf bufScratch(K * sizeof(float));
+    std::memcpy(bufW.raw(), wAll.data(), wAll.size());
+    std::memcpy(bufX.raw(), x.data(),    x.size() * sizeof(float));
+
+    fx().gmm.matmul(mimirmind::model::GgmlType::Q8_0,
+                    bufW.raw(), N, K,
+                    bufX.as<float>(), 1,
+                    bufY.as<float>(),
+                    bufScratch.as<float>());
+
+    std::vector<float> cpuY(N);
+    std::vector<float> scratchCpu(K);
+    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q8_0,
+                               wAll.data(), N, K,
+                               x.data(), 1,
+                               cpuY.data(),
+                               scratchCpu.data());
+
+    EXPECT_ARRAY_NEAR("matmul_q8_0_64rows", bufY.as<float>(), cpuY.data(),
+                      N, 5e-3F);
+}
+
+// =======================================================================
 // Q6_K matmul (GPU vs CPU) — exercises the Kahan-accumulated kernel
 // =======================================================================
 

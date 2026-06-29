@@ -30,6 +30,10 @@ std::size_t Q8_0::blockBytes() const noexcept {
     return kBlockBytes;
 }
 
+std::string_view Q8_0::gpuMatmulModule() const noexcept {
+    return "matmul_q8_0_vec";
+}
+
 void Q8_0::dequantToF32(const void* src,
                         std::size_t nelements,
                         float*      dst) const {

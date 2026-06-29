@@ -96,8 +96,7 @@ TEST(blockLayout_Q8_0) {
     EXPECT_EQ(qt.ggmlType(),        mimirmind::model::GgmlType::Q8_0);
     EXPECT_EQ(qt.blockElements(),   32U);
     EXPECT_EQ(qt.blockBytes(),      34U);
-    // No GPU kernel yet — CPU fallback.
-    EXPECT_EQ(qt.gpuMatmulModule(), std::string_view{});
+    EXPECT_EQ(qt.gpuMatmulModule(), std::string_view{"matmul_q8_0_vec"});
 }
 
 // =======================================================================

@@ -80,6 +80,7 @@ set(KERNEL_SOURCES
     kernels/rmsnorm.cl
     kernels/matmul_q4k_vec.cl
     kernels/matmul_q6k_vec.cl
+    kernels/matmul_q8_0_vec.cl
     kernels/add_bias.cl
     kernels/add_residual.cl
     kernels/silu_mul.cl
