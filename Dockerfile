@@ -146,9 +146,18 @@ ENV MIMIRMIND_MODELS_DIR=/models
 COPY --from=build /src/build/mimirmind /usr/local/bin/mimirmind
 COPY --from=build /src/build/spv       /usr/local/share/mimirmind/spv
 
-# llama.cpp parity-test oracle binaries (CPU build).
+# llama.cpp parity-test oracle: binaries + their shared libs.
 COPY --from=llamacpp /llamacpp/build/bin/llama-cli           /usr/local/bin/llama-cli
 COPY --from=llamacpp /llamacpp/build/bin/llama-parity-dump   /usr/local/bin/llama-parity-dump
+# Shared libs (libllama.so, libggml*.so, libllama-common.so, ...) live next
+# to the binaries in llama.cpp's build tree. Park them under /usr/local/lib
+# and refresh the dynamic linker cache so the binaries pick them up.
+COPY --from=llamacpp /llamacpp/build/bin/libllama.so.0           /usr/local/lib/
+COPY --from=llamacpp /llamacpp/build/bin/libllama-common.so.0    /usr/local/lib/
+COPY --from=llamacpp /llamacpp/build/bin/libggml.so.0            /usr/local/lib/
+COPY --from=llamacpp /llamacpp/build/bin/libggml-base.so.0       /usr/local/lib/
+COPY --from=llamacpp /llamacpp/build/bin/libggml-cpu.so.0        /usr/local/lib/
+RUN ldconfig
 
 # Python diff helper.
 COPY tools/parity-diff.py /usr/local/bin/parity-diff
