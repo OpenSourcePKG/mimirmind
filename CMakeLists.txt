@@ -132,6 +132,7 @@ add_executable(mimirmind
     src/runtime/CommandQueue.cpp
     src/runtime/GpuKernel.cpp
     src/runtime/GpuModule.cpp
+    src/runtime/InferenceEngine.cpp
     src/runtime/KvCache.cpp
     src/runtime/L0Context.cpp
     src/runtime/Log.cpp
