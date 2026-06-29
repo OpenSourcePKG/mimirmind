@@ -1102,21 +1102,28 @@ int runServe(const CliArgs& args) {
     mimirmind::runtime::InferenceEngine engine;
     engine.loadModel(args.modelPath);
 
-    // M8.1: only Qwen2 has a working forward path. Refuse other
-    // architectures up-front so the user finds out at serve startup
-    // (not on the first chat request) and gets an actionable hint.
-    if (engine.config().architecture != "qwen2") {
+    // Refuse architectures without a working forward path so the user
+    // finds out at serve startup, not on the first chat request.
+    // Qwen2 has been production since M7; Gemma 4 is in M8 verification
+    // (forward runs end-to-end but generation quality is still being
+    // dialled in — see Memory/mimirmind/research/m8-gemma4-staging.md).
+    const auto& arch = engine.config().architecture;
+    if (arch != "qwen2" && arch != "gemma4") {
         const std::string msg =
-            "serve: architecture '" + engine.config().architecture +
+            "serve: architecture '" + arch +
             "' is not implemented yet. The model loaded fine and the "
             "tokenizer is ready, but the transformer block needs "
-            "architecture-specific code (Q-K-norm, hybrid dense+MoE FFN, "
-            "sliding-window attention). See "
-            "Memory/mimirmind/research/m8-gemma4-staging.md. "
-            "Use a Qwen2.5 GGUF for now.";
+            "architecture-specific code. See "
+            "Memory/mimirmind/research/m8-gemma4-staging.md.";
         MM_LOG_ERROR("main", "{}", msg);
         std::cerr << msg << "\n";
         return 2;
+    }
+    if (arch == "gemma4") {
+        MM_LOG_WARN("main",
+                    "serve: gemma4 forward runs but chat-template support "
+                    "is not implemented yet — /v1/chat/completions will "
+                    "fail at template formatting until M8.x lands.");
     }
 
     mimirmind::server::ServerConfig cfg{};
