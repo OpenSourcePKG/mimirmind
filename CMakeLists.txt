@@ -132,9 +132,16 @@ add_executable(mimirmind
     src/compute/GpuOps.cpp
     src/compute/Matmul.cpp
     src/compute/Norm.cpp
+    src/compute/QuantTypeRegistry.cpp
     src/compute/Rope.cpp
     src/compute/Sampling.cpp
     src/compute/Softmax.cpp
+    src/compute/quant/Bfloat16.cpp
+    src/compute/quant/Float16.cpp
+    src/compute/quant/Float32.cpp
+    src/compute/quant/Q4K.cpp
+    src/compute/quant/Q6K.cpp
+    src/compute/quant/Q8_0.cpp
     src/model/ChatTemplate.cpp
     src/model/GgufReader.cpp
     src/model/GgufTypes.cpp

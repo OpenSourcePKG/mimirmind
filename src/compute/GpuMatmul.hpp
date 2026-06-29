@@ -6,6 +6,9 @@
 #include "runtime/GpuModule.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <unordered_map>
 
 namespace mimirmind::runtime {
 class L0Context;
@@ -15,8 +18,8 @@ namespace mimirmind::compute {
 
 /**
  * Drop-in replacement for compute::matmul that dispatches to GPU kernels
- * for the weight types we have kernels for (Q4_K, Q6_K). For unsupported
- * types it falls back to the scalar CPU compute::matmul.
+ * for weight types whose QuantType advertises a `gpuMatmulModule()`. For
+ * unsupported types it falls back to the scalar CPU compute::matmul.
  *
  * Owns the SPIR-V modules + kernels. The command queue is shared with
  * the rest of the engine (passed in by reference) so element-wise GPU
@@ -76,18 +79,22 @@ public:
     void sync();
 
 private:
+    struct Entry {
+        std::unique_ptr<runtime::GpuModule> module;
+        runtime::GpuKernel                  kernel;
+    };
+
     runtime::L0Context&    _ctx;
     runtime::CommandQueue& _queue;
-    runtime::GpuModule     _q4kModule;
-    runtime::GpuKernel     _q4kKernel;
-    runtime::GpuModule     _q6kModule;
-    runtime::GpuKernel     _q6kKernel;
+
+    // One Entry per GgmlType that has a `gpuMatmulModule()` registered.
+    // Populated at construction by iterating the QuantType registry.
+    std::unordered_map<model::GgmlType, Entry> _entries;
 
     // M5h: workgroup of 64 threads = 4 subgroups of 16, each subgroup
     // co-computes ONE output via sub_group_reduce_add. So a workgroup
-    // emits 4 outputs and we need ceil(N/4) workgroups (instead of
-    // ceil(N/64) as in M5e/M5g). Keep the public constants in sync with
-    // the kernel macros `MATMUL_Q4K_LOCAL` / `MATMUL_Q4K_SG`.
+    // emits 4 outputs and we need ceil(N/4) workgroups. Keep in sync
+    // with the kernel macros `MATMUL_*_LOCAL` / `MATMUL_*_SG`.
     static constexpr std::uint32_t kLocalSize        = 64;
     static constexpr std::uint32_t kSubgroupSize     = 16;
     static constexpr std::uint32_t kOutputsPerGroup  = kLocalSize / kSubgroupSize;
