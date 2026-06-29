@@ -87,6 +87,7 @@ set(KERNEL_SOURCES
     kernels/mul_scalar.cl
     kernels/gelu_mul.cl
     kernels/rmsnorm_gemma.cl
+    kernels/rmsnorm_no_weight.cl
 )
 
 set(KERNEL_SPV_FILES "")

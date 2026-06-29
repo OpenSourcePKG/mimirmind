@@ -49,12 +49,14 @@ GpuOps::GpuOps(runtime::L0Context& ctx, runtime::CommandQueue& queue)
       _geluMulModule    {ctx, "gelu_mul"},
       _geluMulKernel    {_geluMulModule.kernel("gelu_mul")},
       _rmsnormGemmaModule{ctx, "rmsnorm_gemma"},
-      _rmsnormGemmaKernel{_rmsnormGemmaModule.kernel("rmsnorm_gemma")}
+      _rmsnormGemmaKernel{_rmsnormGemmaModule.kernel("rmsnorm_gemma")},
+      _rmsnormNoWeightModule{ctx, "rmsnorm_no_weight"},
+      _rmsnormNoWeightKernel{_rmsnormNoWeightModule.kernel("rmsnorm_no_weight")}
 {
     MM_LOG_INFO("gpuops",
-                "GpuOps ready — rmsnorm/rmsnorm_gemma/add_bias/add_residual/"
-                "silu_mul/rope/mul_scalar/gelu_mul loaded (rms local={}, "
-                "elementwise local={}, rope local={})",
+                "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
+                "add_bias/add_residual/silu_mul/rope/mul_scalar/gelu_mul "
+                "loaded (rms local={}, elementwise local={}, rope local={})",
                 kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize);
 }
 
@@ -96,6 +98,24 @@ void GpuOps::rmsNormGemmaAsync(const float* x,
     _rmsnormGemmaKernel.setValue<std::int32_t>(4, Ki);
     _rmsnormGemmaKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
     _queue.appendLaunch(_rmsnormGemmaKernel,
+                        static_cast<std::uint32_t>(M), 1, 1);
+}
+
+void GpuOps::rmsNormNoWeightAsync(const float* x,
+                                  std::size_t  M,
+                                  std::size_t  K,
+                                  float        eps,
+                                  float*       y) {
+    if (M == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t Ki = toInt32(K, "rmsNormNoWeight K");
+    _rmsnormNoWeightKernel.setPtr(0, x);
+    _rmsnormNoWeightKernel.setPtr(1, y);
+    _rmsnormNoWeightKernel.setValue<float>(2, eps);
+    _rmsnormNoWeightKernel.setValue<std::int32_t>(3, Ki);
+    _rmsnormNoWeightKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
+    _queue.appendLaunch(_rmsnormNoWeightKernel,
                         static_cast<std::uint32_t>(M), 1, 1);
 }
 

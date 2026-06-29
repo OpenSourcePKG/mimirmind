@@ -56,6 +56,15 @@ public:
                            float        eps,
                            float*       y);
 
+    /// Bare RMS-normalize without a learned scale: y = x / sqrt(mean(x^2) + eps).
+    /// Used by Gemma 4 for the V projection (V passes through ggml_rms_norm
+    /// before going into the KV cache, with no per-element weight).
+    void rmsNormNoWeightAsync(const float* x,
+                              std::size_t  M,
+                              std::size_t  K,
+                              float        eps,
+                              float*       y);
+
     /// In-place broadcast bias: y[m, k] += bias[k].
     void addBiasAsync(float*       y,
                       std::size_t  M,
@@ -121,6 +130,9 @@ private:
 
     runtime::GpuModule     _rmsnormGemmaModule;
     runtime::GpuKernel     _rmsnormGemmaKernel;
+
+    runtime::GpuModule     _rmsnormNoWeightModule;
+    runtime::GpuKernel     _rmsnormNoWeightKernel;
 
     static constexpr std::uint32_t kRmsnormLocalSize    = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;
