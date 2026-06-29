@@ -105,6 +105,18 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
     ropeFreqBase  = optionalF32("rope.freq_base", 10000.0F);
     slidingWindow = optionalU32("attention.sliding_window", 0);
 
+    // MoE hyperparameters. Absent (0) means the model isn't MoE; Gemma 4
+    // 26B-A4B sets both. If used_count is 0 but expert_count is set we
+    // default top-K to 4 (common Mixtral/Qwen-MoE convention).
+    expertCount     = optionalU32("expert_count",      0);
+    expertUsedCount = optionalU32("expert_used_count", 0);
+    if (expertCount > 0 && expertUsedCount == 0) {
+        expertUsedCount = 4;
+        MM_LOG_WARN("config",
+                    "{}.expert_used_count not set, defaulting top-K to {}",
+                    a, expertUsedCount);
+    }
+
     // --- Architecture-specific shape corrections -------------------------
 
     // Gemma 4 26B-A4B's metadata is wrong on two critical fields:
@@ -160,10 +172,11 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
 
     MM_LOG_INFO("config",
                 "summary — arch={} blocks={} ctx={} d_model={} ff={} "
-                "heads={} kv_heads={} head_dim={} rope_base={} rms_eps={}",
+                "heads={} kv_heads={} head_dim={} rope_base={} rms_eps={} "
+                "experts={} top_k={}",
                 architecture, blockCount, contextLength, embeddingLength,
                 feedForwardLength, headCount, headCountKv, headDim(),
-                ropeFreqBase, rmsNormEps);
+                ropeFreqBase, rmsNormEps, expertCount, expertUsedCount);
 }
 
 } // namespace mimirmind::model

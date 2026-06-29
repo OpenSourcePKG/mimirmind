@@ -13,11 +13,15 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace mimirmind::runtime {
 
@@ -178,6 +182,14 @@ InferenceEngine::allocBlockBuffers(std::size_t maxT, std::size_t maxSeq) {
     b.upOut         = UsmHandle{_allocator, upOutBytes};
     b.matmulScratch = UsmHandle{_allocator, matmulScratchBytes};
     b.scoreScratch  = UsmHandle{_allocator, scoreScratchBytes};
+
+    // MoE scratch (gemma4 Path B). Skip allocation for dense models so
+    // the per-call setup cost stays the same as Qwen2.
+    if (_config.expertCount > 0) {
+        const std::size_t moeBytes = maxT * b.d_model * sizeof(float);
+        b.moeAccumBuf  = UsmHandle{_allocator, moeBytes};
+        b.expertOutBuf = UsmHandle{_allocator, moeBytes};
+    }
     return b;
 }
 
@@ -397,6 +409,14 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
     const auto* ffwPost     = require("post_ffw_norm.weight");
     const auto* outScale    = require("layer_output_scale.weight");
 
+    // Path B (MoE) tensors. Required for gemma4 26B-A4B; every block has them.
+    const auto* preNorm2    = require("pre_ffw_norm_2.weight");
+    const auto* postNorm2   = require("post_ffw_norm_2.weight");
+    const auto* routerScale = require("ffn_gate_inp.scale");
+    const auto* routerW     = require("ffn_gate_inp.weight");
+    const auto* expGateUp   = require("ffn_gate_up_exps.weight");
+    const auto* expDown     = require("ffn_down_exps.weight");
+
     // KV-sharing: only blocks that own K/V do the K/V projection +
     // K-norm + K-RoPE. Other blocks read K/V from the source block's
     // cache slot (already RoPE'd by the source block earlier in this
@@ -423,6 +443,8 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
     float* const upOutBuf      = s.upOut.as<float>();
     float* const matmulScratch = s.matmulScratch.as<float>();
     float* const scoreScratch  = s.scoreScratch.as<float>();
+    float* const moeAccumBuf   = s.moeAccumBuf.as<float>();
+    float* const expertOutBuf  = s.expertOutBuf.as<float>();
 
     // --- pre-attention RMSNorm ----------------------------------------
 
@@ -555,23 +577,183 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
                       _config.rmsNormEps,
                       projOutBuf);                 // in-place
 
-    // --- Path B (MoE) skipped — TODO M8.6 ------------------------------
+    // --- Path B — MoE (M8.6) ------------------------------------------
     //
-    // combined = path_A_out + path_B_out (gemma4 spec)
-    // For M8.3+5 we set combined := path_A_out alone. Path B carries the
-    // bulk of FFN compute so output will be off, but structurally clean.
+    // pathB_in    = RMSNorm(x, pre_ffw_norm_2)
+    // router_in   = RMSNorm(x, ffn_gate_inp.scale) * 1/sqrt(d_model)
+    // logits      = ffn_gate_inp.weight · router_in            -> [T, n_exp]
+    // weights, e  = softmax(top_K(logits))                     (CPU)
+    // pathB[t]    = Σ_e weights[t,e] *
+    //               (down_exps[e] · gelu_swiglu(gate_up_exps[e] · pathB_in[t]))
+    // pathB_out   = RMSNorm(pathB, post_ffw_norm_2)
 
-    // --- post_ffw_norm (final norm before residual) --------------------
+    // Step 1: pathB_in (overwrites normBuf — pathA already consumed it).
+    trace("path B: pre_ffw_norm_2");
+    _ops.rmsNormAsync(x, T, d_model,
+                      static_cast<const float*>(preNorm2->usmPtr),
+                      _config.rmsNormEps,
+                      normBuf);
+
+    // Step 2: router input = RMSNorm(x, ffn_gate_inp.scale) * 1/√d_model.
+    // attnOutBuf is unused from here on; reuse it for routerIn (size
+    // T*d_model fits because attnOut is sized T*q_dim with q_dim >= d_model).
+    trace("path B: router rmsNorm + scale");
+    _ops.rmsNormAsync(x, T, d_model,
+                      static_cast<const float*>(routerScale->usmPtr),
+                      _config.rmsNormEps,
+                      attnOutBuf);
+    const float invSqrtDm = 1.0F /
+        std::sqrt(static_cast<float>(d_model));
+    _ops.mulScalarAsync(attnOutBuf, invSqrtDm, T * d_model);
+
+    // Step 3: router projection. ffn_gate_inp is F32, so this goes to
+    // CPU fallback inside _gmm.matmul (which also syncs the queue).
+    // Output layout: [T, n_experts] floats into upOutBuf (large enough:
+    // upOut is sized T*ff_dim, with ff_dim >= n_experts here).
+    const std::size_t nExperts = _config.expertCount;
+    const std::size_t K        = _config.expertUsedCount;
+    trace("path B: router matmul (CPU)");
+    _gmm.matmul(routerW->type, routerW->usmPtr,
+                nExperts, d_model,
+                attnOutBuf, T,
+                upOutBuf, matmulScratch);
+
+    // Step 4: CPU softmax + top-K per token. The previous matmul.sync()
+    // means upOutBuf is up-to-date for the CPU read.
+    std::vector<std::int32_t> topKIdx(T * K);
+    std::vector<float>        topKWeight(T * K);
+    {
+        std::vector<float> probs(nExperts);
+        for (std::size_t t = 0; t < T; ++t) {
+            const float* row = upOutBuf + t * nExperts;
+            // Numerically-stable softmax.
+            float maxL = row[0];
+            for (std::size_t e = 1; e < nExperts; ++e) {
+                if (row[e] > maxL) maxL = row[e];
+            }
+            double sum = 0.0;
+            for (std::size_t e = 0; e < nExperts; ++e) {
+                probs[e] = std::exp(row[e] - maxL);
+                sum += static_cast<double>(probs[e]);
+            }
+            const float invSum = static_cast<float>(1.0 / sum);
+            for (auto& p : probs) p *= invSum;
+
+            // Top-K by probability.
+            std::vector<std::size_t> idx(nExperts);
+            std::iota(idx.begin(), idx.end(), 0);
+            std::partial_sort(idx.begin(),
+                              idx.begin() + static_cast<std::ptrdiff_t>(K),
+                              idx.end(),
+                              [&](std::size_t a, std::size_t b) {
+                                  return probs[a] > probs[b];
+                              });
+            // Renormalise selected weights so the kept K probs sum to 1.
+            double kept = 0.0;
+            for (std::size_t k = 0; k < K; ++k) {
+                kept += static_cast<double>(probs[idx[k]]);
+            }
+            const float invKept = kept > 0.0 ? static_cast<float>(1.0 / kept) : 1.0F;
+            for (std::size_t k = 0; k < K; ++k) {
+                topKIdx[t * K + k]    = static_cast<std::int32_t>(idx[k]);
+                topKWeight[t * K + k] = probs[idx[k]] * invKept;
+            }
+        }
+    }
+
+    // Step 5: zero the per-block MoE accumulator.
+    trace("path B: zero accumulator");
+    _ops.mulScalarAsync(moeAccumBuf, 0.0F, T * d_model);
+
+    // Step 6: per-token, per-expert dispatch. Expert pointer offsets
+    // mirror the GGUF storage layout for 3D quantised tensors.
+    //
+    //   gate_up_exps: Q6_K [K=d_model, N=gate_up_fused, n_exp]
+    //                  per-expert bytes = N * (K/256) * 210
+    //   down_exps:    Q8_0 [K=ff_per_expert, N=d_model, n_exp]
+    //                  per-expert bytes = N * (K/32)  * 34
+    //
+    // For gemma4 26B-A4B: gate_up_fused=1408, ff_per_expert=704.
+    const std::size_t gateUpFused = expGateUp->dimensions.size() >= 2
+                                      ? expGateUp->dimensions[1] : 0;
+    const std::size_t ffPerExpert = gateUpFused / 2;
+    if (gateUpFused == 0 || (gateUpFused % 2) != 0) {
+        throw std::runtime_error(
+            "runGemma4Block: ffn_gate_up_exps has unexpected fused dim " +
+            std::to_string(gateUpFused));
+    }
+
+    constexpr std::size_t kQ6KBlockElems = 256;
+    constexpr std::size_t kQ6KBlockBytes = 210;
+    constexpr std::size_t kQ8_0BlockElems = 32;
+    constexpr std::size_t kQ8_0BlockBytes = 34;
+
+    const std::size_t expertBytesGateUp =
+        gateUpFused * (d_model / kQ6KBlockElems) * kQ6KBlockBytes;
+    const std::size_t expertBytesDown =
+        d_model * (ffPerExpert / kQ8_0BlockElems) * kQ8_0BlockBytes;
+
+    auto* const expGateUpBase =
+        static_cast<const std::uint8_t*>(expGateUp->usmPtr);
+    auto* const expDownBase =
+        static_cast<const std::uint8_t*>(expDown->usmPtr);
+
+    trace("path B: per-token expert dispatch");
+    for (std::size_t t = 0; t < T; ++t) {
+        float* const pathBInT  = normBuf      + t * d_model;
+        float* const accumT    = moeAccumBuf  + t * d_model;
+        for (std::size_t k = 0; k < K; ++k) {
+            const std::size_t e =
+                static_cast<std::size_t>(topKIdx[t * K + k]);
+            const float       routerWeight = topKWeight[t * K + k];
+
+            const void* Wgu = expGateUpBase + e * expertBytesGateUp;
+            const void* Wd  = expDownBase   + e * expertBytesDown;
+
+            // 6a. gate+up: [1, gate_up_fused] = Q6_K [d_model, fused] @ x
+            _gmm.matmulAsync(expGateUp->type, Wgu,
+                             gateUpFused, d_model,
+                             pathBInT, 1,
+                             gateOutBuf, matmulScratch);
+
+            // 6b. fused gelu * up: split halves in place — first half is
+            //     gate, second half is up. Output goes into gate slot.
+            _ops.geluMulAsync(gateOutBuf, gateOutBuf + ffPerExpert,
+                              ffPerExpert);
+
+            // 6c. down: [1, d_model] = Q8_0 [ff_per_expert, d_model] @ silu_out
+            _gmm.matmul(expDown->type, Wd,
+                        d_model, ffPerExpert,
+                        gateOutBuf, 1,
+                        expertOutBuf, matmulScratch);
+
+            // 6d. scale by router weight and accumulate.
+            _ops.mulScalarAsync(expertOutBuf, routerWeight, d_model);
+            _ops.addResidualAsync(accumT, expertOutBuf, d_model);
+        }
+    }
+
+    // Step 7: post-norm of path B output.
+    trace("path B: post_ffw_norm_2");
+    _ops.rmsNormAsync(moeAccumBuf, T, d_model,
+                      static_cast<const float*>(postNorm2->usmPtr),
+                      _config.rmsNormEps,
+                      moeAccumBuf);
+
+    // --- Combine paths + post_ffw_norm + residual ----------------------
+
+    trace("combined = pathA_out + pathB_out");
+    _ops.addResidualAsync(moeAccumBuf, projOutBuf, T * d_model);
 
     trace("post_ffw_norm (combined)");
-    _ops.rmsNormAsync(projOutBuf, T, d_model,
+    _ops.rmsNormAsync(moeAccumBuf, T, d_model,
                       static_cast<const float*>(ffwPost->usmPtr),
                       _config.rmsNormEps,
-                      projOutBuf);                 // in-place
+                      moeAccumBuf);
 
     trace("ffn residual");
-    _ops.addResidualAsync(x, projOutBuf, T * d_model);
-    // x = sa_out + ffn_out
+    _ops.addResidualAsync(x, moeAccumBuf, T * d_model);
+    // x = sa_out + post_ffw_norm(pathA_out + pathB_out)
 
     // --- layer_output_scale (F32 scalar per block) ---------------------
     //
