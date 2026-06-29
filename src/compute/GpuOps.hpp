@@ -70,6 +70,18 @@ public:
                           std::size_t  startPos,
                           float        base);
 
+    /// In-place scalar multiply: y[i] *= s for i in [0, n).
+    /// Used by Gemma 4 for layer_output_scale.
+    void mulScalarAsync(float*       y,
+                        float        s,
+                        std::size_t  n);
+
+    /// GELU-flavoured SwiGLU: gate[i] = gelu_tanh(gate[i]) * up[i].
+    /// Used by Gemma 4's FFN paths (vs Qwen's siluMulAsync).
+    void geluMulAsync(float*       gate,
+                      const float* up,
+                      std::size_t  n);
+
 private:
     runtime::L0Context&    _ctx;
     runtime::CommandQueue& _queue;
@@ -88,6 +100,12 @@ private:
 
     runtime::GpuModule     _ropeModule;
     runtime::GpuKernel     _ropeKernel;
+
+    runtime::GpuModule     _mulScalarModule;
+    runtime::GpuKernel     _mulScalarKernel;
+
+    runtime::GpuModule     _geluMulModule;
+    runtime::GpuKernel     _geluMulKernel;
 
     static constexpr std::uint32_t kRmsnormLocalSize    = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;

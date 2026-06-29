@@ -43,11 +43,16 @@ GpuOps::GpuOps(runtime::L0Context& ctx, runtime::CommandQueue& queue)
       _siluMulModule    {ctx, "silu_mul"},
       _siluMulKernel    {_siluMulModule.kernel("silu_mul")},
       _ropeModule       {ctx, "rope_inplace"},
-      _ropeKernel       {_ropeModule.kernel("rope_inplace")}
+      _ropeKernel       {_ropeModule.kernel("rope_inplace")},
+      _mulScalarModule  {ctx, "mul_scalar"},
+      _mulScalarKernel  {_mulScalarModule.kernel("mul_scalar")},
+      _geluMulModule    {ctx, "gelu_mul"},
+      _geluMulKernel    {_geluMulModule.kernel("gelu_mul")}
 {
     MM_LOG_INFO("gpuops",
-                "GpuOps ready — rmsnorm/add_bias/add_residual/silu_mul/rope "
-                "loaded (rms local={}, elementwise local={}, rope local={})",
+                "GpuOps ready — rmsnorm/add_bias/add_residual/silu_mul/rope/"
+                "mul_scalar/gelu_mul loaded (rms local={}, elementwise local={}, "
+                "rope local={})",
                 kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize);
 }
 
@@ -117,6 +122,36 @@ void GpuOps::siluMulAsync(float*       gate,
     _siluMulKernel.setValue<std::int32_t>(2, ni);
     _siluMulKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
     _queue.appendLaunch(_siluMulKernel,
+                        groupsForN(n, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::mulScalarAsync(float*       y,
+                            float        s,
+                            std::size_t  n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "mulScalar n");
+    _mulScalarKernel.setPtr(0, y);
+    _mulScalarKernel.setValue<float>(1, s);
+    _mulScalarKernel.setValue<std::int32_t>(2, ni);
+    _mulScalarKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_mulScalarKernel,
+                        groupsForN(n, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::geluMulAsync(float*       gate,
+                          const float* up,
+                          std::size_t  n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "geluMul n");
+    _geluMulKernel.setPtr(0, gate);
+    _geluMulKernel.setPtr(1, up);
+    _geluMulKernel.setValue<std::int32_t>(2, ni);
+    _geluMulKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_geluMulKernel,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 

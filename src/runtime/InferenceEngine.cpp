@@ -314,22 +314,223 @@ void InferenceEngine::runQwen2Block(std::size_t   blockIdx,
 }
 
 void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
-                                     float*        /*x*/,
-                                     std::size_t   /*T*/,
-                                     KvCache&      /*cache*/,
-                                     BlockBuffers& /*s*/) {
-    // M8.3+ will fill this in. Per Memory/mimirmind/research/m8-gemma4-staging.md:
-    //   - M8.3: Q-K-norm + multi-norm choreography (post_attention_norm,
-    //           pre/post_ffw_norm_1/2) + layer_output_scale
-    //   - M8.4: per-layer sliding-window attention (hybrid local/global)
-    //   - M8.5: dense FFN (SwiGLU like Qwen but with Q8_0 ffn_down)
-    //   - M8.6: MoE router + top-K expert dispatch (128 experts)
-    //   - M8.7: integration + optional CPU‖GPU hybrid FFN split
-    throw std::runtime_error(
-        "runGemma4Block: not implemented yet (block " +
-        std::to_string(blockIdx) +
-        "). See Memory/mimirmind/research/m8-gemma4-staging.md for the "
-        "M8.3-M8.7 staging plan.");
+                                     float*        x,
+                                     std::size_t   T,
+                                     KvCache&      cache,
+                                     BlockBuffers& s) {
+    namespace cmp = mimirmind::compute;
+
+    // M8.3 + M8.5 — partial gemma4 block forward.
+    // Implements: attn-norm, Q/K/V proj, Q-K-norm BEFORE RoPE, RoPE,
+    // attention, O proj, attn_post_norm, dense FFN path A with GELU,
+    // multi-norm choreography (post_ffw_norm_1, post_ffw_norm),
+    // layer_output_scale.
+    // Skips: sliding-window attention (M8.4), MoE path B (M8.6),
+    // and any explicit f_attention_scale (multiHeadAttention does
+    // 1/sqrt(head_dim) internally — adequate for the structure smoke,
+    // parity polish lands in M8.7).
+    //
+    // Output is expected to be garbage because path B is ~80% of the
+    // FFN compute and is currently skipped. The point is "forward runs
+    // end-to-end without crashing" — concrete baseline for M8.6.
+
+    const bool diag = (blockIdx == 0 && cache.length() == 0 && _traceBlock0);
+    auto trace = [&](const char* tag) {
+        if (diag) MM_LOG_INFO("blkdiag-g4", "blk0 {}", tag);
+    };
+    trace("enter");
+
+    const auto& w = *_weights;
+    auto require = [&](const char* suffix) {
+        const auto* t = w.findBlock(blockIdx, suffix);
+        if (t == nullptr) {
+            throw std::runtime_error(
+                "runGemma4Block: missing tensor blk." +
+                std::to_string(blockIdx) + "." + suffix);
+        }
+        return t;
+    };
+
+    const auto* attnNorm    = require("attn_norm.weight");
+    const auto* qW          = require("attn_q.weight");
+    const auto* kW          = require("attn_k.weight");
+    const auto* vW          = require("attn_v.weight");
+    const auto* qNorm       = require("attn_q_norm.weight");
+    const auto* kNorm       = require("attn_k_norm.weight");
+    const auto* oW          = require("attn_output.weight");
+    const auto* attnPost    = require("post_attention_norm.weight");
+    const auto* ffnNorm     = require("ffn_norm.weight");
+    const auto* ffnGate     = require("ffn_gate.weight");
+    const auto* ffnUp       = require("ffn_up.weight");
+    const auto* ffnDown     = require("ffn_down.weight");
+    const auto* ffwPost1    = require("post_ffw_norm_1.weight");
+    const auto* ffwPost     = require("post_ffw_norm.weight");
+    const auto* outScale    = require("layer_output_scale.weight");
+
+    const std::size_t d_model  = s.d_model;
+    const std::size_t q_dim    = s.q_dim;
+    const std::size_t kv_dim   = _config.headCountKv * _config.headDim();
+    const std::size_t ff_dim   = s.ff_dim;
+    const std::size_t head_dim = _config.headDim();
+    const std::size_t curLen   = cache.length();
+    const std::size_t totalLen = curLen + T;
+
+    float* const normBuf       = s.normBuf.as<float>();
+    float* const qBuf          = s.qBuf.as<float>();
+    float* const attnOutBuf    = s.attnOut.as<float>();
+    float* const projOutBuf    = s.projOut.as<float>();
+    float* const gateOutBuf    = s.gateOut.as<float>();
+    float* const upOutBuf      = s.upOut.as<float>();
+    float* const matmulScratch = s.matmulScratch.as<float>();
+    float* const scoreScratch  = s.scoreScratch.as<float>();
+
+    float* kSlot = cache.writeSlotK(blockIdx);
+    float* vSlot = cache.writeSlotV(blockIdx);
+
+    // --- pre-attention RMSNorm ----------------------------------------
+
+    trace("attn rmsNorm");
+    _ops.rmsNormAsync(x, T, d_model,
+                      static_cast<const float*>(attnNorm->usmPtr),
+                      _config.rmsNormEps,
+                      normBuf);
+
+    // --- Q/K/V projections (Q8_0 -> CPU fallback today) ----------------
+
+    auto projectAsync = [&](const model::GgufTensor* W,
+                            std::size_t N, float* dst) {
+        _gmm.matmulAsync(W->type, W->usmPtr, N, d_model,
+                         normBuf, T, dst, matmulScratch);
+    };
+
+    trace("Q projection");
+    projectAsync(qW, q_dim,  qBuf);
+    trace("K projection");
+    projectAsync(kW, kv_dim, kSlot);
+    trace("V projection");
+    projectAsync(vW, kv_dim, vSlot);
+
+    // --- Q-K-norm BEFORE RoPE (per-head RMSNorm over head_dim) ---------
+    //
+    // The trick: virtual reshape from [T, n_heads, head_dim] to
+    // [T*n_heads, head_dim]. Our row-RMSNorm kernel processes one row
+    // (head_dim elements) per workgroup, weight is broadcast across
+    // rows — exactly what we want for per-head normalisation.
+
+    trace("Q-norm");
+    _ops.rmsNormAsync(qBuf, T * _config.headCount, head_dim,
+                      static_cast<const float*>(qNorm->usmPtr),
+                      _config.rmsNormEps,
+                      qBuf);                       // in-place
+    trace("K-norm");
+    _ops.rmsNormAsync(kSlot, T * _config.headCountKv, head_dim,
+                      static_cast<const float*>(kNorm->usmPtr),
+                      _config.rmsNormEps,
+                      kSlot);                      // in-place
+
+    // --- RoPE on Q and the newly-written K rows ------------------------
+
+    trace("RoPE Q+K");
+    _ops.ropeInPlaceAsync(qBuf, T,
+                          _config.headCount,   head_dim, curLen,
+                          _config.ropeFreqBase);
+    _ops.ropeInPlaceAsync(kSlot, T,
+                          _config.headCountKv, head_dim, curLen,
+                          _config.ropeFreqBase);
+
+    // --- Attention is still CPU (M8.4 will replace this) ---------------
+
+    trace("QKV sync (before CPU attention)");
+    _gmm.sync();
+
+    trace("multiHeadAttention (CPU)");
+    cmp::multiHeadAttention(
+        qBuf,
+        cache.baseK(blockIdx),
+        cache.baseV(blockIdx),
+        T, totalLen,
+        _config.headCount, _config.headCountKv, head_dim,
+        curLen,
+        scoreScratch,
+        attnOutBuf);
+
+    // --- O projection (Q8_0 -> CPU) ------------------------------------
+
+    trace("O projection");
+    _gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,
+                attnOutBuf, T,
+                projOutBuf, matmulScratch);
+
+    // --- attn_post_norm + attention residual ---------------------------
+
+    trace("attn_post_norm");
+    _ops.rmsNormAsync(projOutBuf, T, d_model,
+                      static_cast<const float*>(attnPost->usmPtr),
+                      _config.rmsNormEps,
+                      projOutBuf);                 // in-place
+
+    trace("attn residual");
+    _ops.addResidualAsync(x, projOutBuf, T * d_model);
+    // x now holds sa_out = inpL + attn_post_norm(attn_out).
+
+    // --- FFN path A — dense SwiGLU with GELU ---------------------------
+
+    trace("ffn_norm (path A pre)");
+    _ops.rmsNormAsync(x, T, d_model,
+                      static_cast<const float*>(ffnNorm->usmPtr),
+                      _config.rmsNormEps,
+                      normBuf);
+
+    trace("FFN gate proj");
+    _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
+                     normBuf, T, gateOutBuf, matmulScratch);
+    trace("FFN up proj");
+    _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
+                     normBuf, T, upOutBuf, matmulScratch);
+
+    trace("GELU + mul (fused)");
+    _ops.geluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
+
+    trace("FFN down proj");
+    _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
+                gateOutBuf, T,
+                projOutBuf, matmulScratch);
+
+    trace("post_ffw_norm_1 (path A post)");
+    _ops.rmsNormAsync(projOutBuf, T, d_model,
+                      static_cast<const float*>(ffwPost1->usmPtr),
+                      _config.rmsNormEps,
+                      projOutBuf);                 // in-place
+
+    // --- Path B (MoE) skipped — TODO M8.6 ------------------------------
+    //
+    // combined = path_A_out + path_B_out (gemma4 spec)
+    // For M8.3+5 we set combined := path_A_out alone. Path B carries the
+    // bulk of FFN compute so output will be off, but structurally clean.
+
+    // --- post_ffw_norm (final norm before residual) --------------------
+
+    trace("post_ffw_norm (combined)");
+    _ops.rmsNormAsync(projOutBuf, T, d_model,
+                      static_cast<const float*>(ffwPost->usmPtr),
+                      _config.rmsNormEps,
+                      projOutBuf);                 // in-place
+
+    trace("ffn residual");
+    _ops.addResidualAsync(x, projOutBuf, T * d_model);
+    // x = sa_out + ffn_out
+
+    // --- layer_output_scale (F32 scalar per block) ---------------------
+    //
+    // layer_output_scale.weight is a USM-shared F32[1] — read directly
+    // from CPU. Weights are loaded once at startup and never mutated,
+    // so no GPU↔CPU fence is needed.
+
+    const float scaleVal = *static_cast<const float*>(outScale->usmPtr);
+    trace("layer_output_scale");
+    _ops.mulScalarAsync(x, scaleVal, T * d_model);
+    // No sync here — the next block's rmsNormAsync (or sampleNext's
+    // final-norm) reads x on the GPU through the same queue.
 }
 
 std::int32_t
