@@ -91,6 +91,19 @@ public:
                           std::size_t  startPos,
                           float        base);
 
+    /// In-place RoPE with per-pair frequency factors (ggml_rope_ext's
+    /// `freq_factors` argument). `freqFactors` points at [headDim/2] f32
+    /// values; the rotation angle becomes
+    ///   theta_i = pos * base^(-2i/headDim) / freqFactors[i]
+    /// Used by Gemma 3/4 global-attention layers for proportional RoPE.
+    void ropeInPlaceWithFactorsAsync(float*       x,
+                                     const float* freqFactors,
+                                     std::size_t  seqLen,
+                                     std::size_t  numHeads,
+                                     std::size_t  headDim,
+                                     std::size_t  startPos,
+                                     float        base);
+
     /// In-place scalar multiply: y[i] *= s for i in [0, n).
     /// Used by Gemma 4 for layer_output_scale.
     void mulScalarAsync(float*       y,
@@ -133,6 +146,9 @@ private:
 
     runtime::GpuModule     _rmsnormNoWeightModule;
     runtime::GpuKernel     _rmsnormNoWeightKernel;
+
+    runtime::GpuModule     _ropeFfModule;
+    runtime::GpuKernel     _ropeFfKernel;
 
     static constexpr std::uint32_t kRmsnormLocalSize    = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;

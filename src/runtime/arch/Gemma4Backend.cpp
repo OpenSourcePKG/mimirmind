@@ -27,13 +27,48 @@ Gemma4Backend::Gemma4Backend(const model::LlmConfig&   config,
                              compute::GpuMatmul&       gmm)
     : _config{config}, _weights{weights}, _ops{ops}, _gmm{gmm} {
     buildKvSharePattern();
+
+    // Optional global `rope_freqs.weight` (F32 [head_dim/2]) — used as
+    // `freq_factors` in proportional RoPE for non-SWA (global) layers.
+    // The 26B-A4B Q6_K we run during M8 bring-up ships this tensor with
+    // count = head_dim (256), but ggml_rope_ext expects [head_dim/2]:
+    // we accept any tensor that has *at least* halfDim usable floats and
+    // ignore the trailing slots.
+    if (const auto* rf = _weights.find("rope_freqs.weight");
+        rf != nullptr && rf->type == model::GgmlType::F32) {
+        const std::size_t halfDim = _config.headDim() / 2;
+        if (rf->nelements >= halfDim) {
+            _ropeFreqsForFullAttn = static_cast<const float*>(rf->usmPtr);
+            MM_LOG_INFO("gemma4",
+                        "proportional RoPE enabled — rope_freqs.weight has "
+                        "{} float(s), using first {} for non-SWA layers",
+                        rf->nelements, halfDim);
+        } else {
+            MM_LOG_WARN("gemma4",
+                        "rope_freqs.weight has {} float(s) < halfDim={} — "
+                        "proportional RoPE disabled, falling back to plain "
+                        "base for non-SWA layers", rf->nelements, halfDim);
+        }
+    } else {
+        MM_LOG_INFO("gemma4",
+                    "no rope_freqs.weight — non-SWA layers use plain RoPE "
+                    "with base={}", _config.ropeFreqBase);
+    }
+
     MM_LOG_INFO("gemma4",
                 "Gemma4Backend ready — blocks={} d_model={} ff={} heads={} "
-                "kv={} experts={} top_k={}",
+                "kv={} experts={} top_k={} rope_base={}/{} swa_layers={}",
                 _config.blockCount, _config.embeddingLength,
                 _config.feedForwardLength, _config.headCount,
                 _config.headCountKv, _config.expertCount,
-                _config.expertUsedCount);
+                _config.expertUsedCount,
+                _config.ropeFreqBase, _config.ropeFreqBaseSwa,
+                _config.slidingWindowPattern.size());
+}
+
+bool Gemma4Backend::isSwaLayer(std::size_t blockIdx) const noexcept {
+    return blockIdx < _config.slidingWindowPattern.size() &&
+           _config.slidingWindowPattern[blockIdx];
 }
 
 void Gemma4Backend::buildKvSharePattern() {
@@ -120,6 +155,16 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     const auto* vW    = hasOwnKv ? require("attn_v.weight")      : nullptr;
     const auto* kNorm = hasOwnKv ? require("attn_k_norm.weight") : nullptr;
 
+    // SWA layers use a different RoPE base AND no freq_factors.
+    // Global-attention layers use the long-context base AND proportional
+    // RoPE freq_factors (if the model shipped them). Mirrors gemma4.cpp:
+    //   freq_base_l = is_swa(il) ? rope_freq_base_train_swa : rope_freq_base;
+    //   freq_factors = is_swa(il) ? nullptr : layer.rope_freqs;
+    const bool   isSwa    = isSwaLayer(blockIdx);
+    const float  ropeBase = isSwa ? _config.ropeFreqBaseSwa
+                                  : _config.ropeFreqBase;
+    const float* freqFactors = isSwa ? nullptr : _ropeFreqsForFullAttn;
+
     const std::size_t d_model  = s.d_model;
     const std::size_t q_dim    = s.q_dim;
     const std::size_t kv_dim   = _config.headCountKv * _config.headDim();
@@ -180,9 +225,15 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                                   vSlot);            // in-place
 
         trace("RoPE K");
-        _ops.ropeInPlaceAsync(kSlot, T,
-                              _config.headCountKv, head_dim, curLen,
-                              _config.ropeFreqBase);
+        if (freqFactors != nullptr) {
+            _ops.ropeInPlaceWithFactorsAsync(kSlot, freqFactors, T,
+                                             _config.headCountKv, head_dim,
+                                             curLen, ropeBase);
+        } else {
+            _ops.ropeInPlaceAsync(kSlot, T,
+                                  _config.headCountKv, head_dim, curLen,
+                                  ropeBase);
+        }
     } else {
         trace("KV reused from earlier layer");
     }
@@ -195,9 +246,15 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                       qBuf);                   // in-place
 
     trace("RoPE Q");
-    _ops.ropeInPlaceAsync(qBuf, T,
-                          _config.headCount,   head_dim, curLen,
-                          _config.ropeFreqBase);
+    if (freqFactors != nullptr) {
+        _ops.ropeInPlaceWithFactorsAsync(qBuf, freqFactors, T,
+                                         _config.headCount, head_dim,
+                                         curLen, ropeBase);
+    } else {
+        _ops.ropeInPlaceAsync(qBuf, T,
+                              _config.headCount, head_dim, curLen,
+                              ropeBase);
+    }
 
     // f_attention_scale = 1.0 (gemma4.cpp:11). Our multiHeadAttention
     // divides Q·K by 1/sqrt(headDim) internally; pre-scale Q by

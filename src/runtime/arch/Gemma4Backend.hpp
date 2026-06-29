@@ -56,6 +56,10 @@ private:
     /// (model would be malformed).
     void buildKvSharePattern();
 
+    /// Resolve the per-layer SWA flag. Returns false (i.e., full attention)
+    /// if `slidingWindowPattern` is empty or doesn't cover this block.
+    [[nodiscard]] bool isSwaLayer(std::size_t blockIdx) const noexcept;
+
     const model::LlmConfig&   _config;
     const model::WeightsMap&  _weights;
     compute::GpuOps&          _ops;
@@ -64,6 +68,12 @@ private:
     /// _kvSource[b] = b if block b carries its own attn_k/v.weight;
     /// otherwise the most recent earlier block that does.
     std::vector<std::size_t>  _kvSource;
+
+    /// USM pointer to the global `rope_freqs.weight` (F32 [head_dim/2])
+    /// used as `freq_factors` for non-SWA layers (proportional RoPE).
+    /// Null when the model doesn't ship one or when the shape doesn't
+    /// match the expected head_dim/2 — runBlock falls back to plain RoPE.
+    const float*              _ropeFreqsForFullAttn{nullptr};
 };
 
 } // namespace mimirmind::runtime::arch

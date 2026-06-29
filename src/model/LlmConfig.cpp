@@ -99,11 +99,45 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
 
     // --- Optional --------------------------------------------------------
 
-    keyLength     = optionalU32("attention.key_length",   0);
-    valueLength   = optionalU32("attention.value_length", keyLength);
-    rmsNormEps    = optionalF32("attention.layer_norm_rms_epsilon", 1e-6F);
-    ropeFreqBase  = optionalF32("rope.freq_base", 10000.0F);
-    slidingWindow = optionalU32("attention.sliding_window", 0);
+    keyLength       = optionalU32("attention.key_length",   0);
+    valueLength     = optionalU32("attention.value_length", keyLength);
+    rmsNormEps      = optionalF32("attention.layer_norm_rms_epsilon", 1e-6F);
+    ropeFreqBase    = optionalF32("rope.freq_base", 10000.0F);
+    ropeFreqBaseSwa = optionalF32("rope.freq_base_swa", ropeFreqBase);
+    slidingWindow   = optionalU32("attention.sliding_window", 0);
+
+    // Sliding-window-attention pattern. Stored in GGUF as an array of
+    // bools (one per layer) under `<arch>.attention.sliding_window_pattern`.
+    // Older Gemma-3 GGUFs used a uniform "every nth layer is SWA" scheme;
+    // Gemma 4 spells out the full per-layer mask. Absent ⇒ no SWA.
+    if (const auto* swp = reader.findMetadata(a + ".attention.sliding_window_pattern");
+        swp != nullptr && std::holds_alternative<GgufArray>(*swp)) {
+        const auto& arr = std::get<GgufArray>(*swp);
+        if (arr.elementType == GgufValueType::Bool &&
+            arr.raw.size() == arr.count) {
+            slidingWindowPattern.resize(arr.count);
+            for (std::uint64_t i = 0; i < arr.count; ++i) {
+                slidingWindowPattern[i] = (arr.raw[i] != 0);
+            }
+            std::size_t swaCount = 0;
+            for (bool s : slidingWindowPattern) if (s) ++swaCount;
+            MM_LOG_INFO("config",
+                        "{}.attention.sliding_window_pattern = [{} entries, "
+                        "{} SWA / {} full]",
+                        a, slidingWindowPattern.size(),
+                        swaCount, slidingWindowPattern.size() - swaCount);
+        } else {
+            MM_LOG_WARN("config",
+                        "{}.attention.sliding_window_pattern present but "
+                        "unexpected (elementType={}, count={}, bytes={}) — ignoring",
+                        a, static_cast<int>(arr.elementType),
+                        arr.count, arr.raw.size());
+        }
+    } else {
+        MM_LOG_INFO("config",
+                    "{}.attention.sliding_window_pattern not set — all layers "
+                    "treated as full attention", a);
+    }
 
     // MoE hyperparameters. Absent (0) means the model isn't MoE; Gemma 4
     // 26B-A4B sets both. If used_count is 0 but expert_count is set we
@@ -172,11 +206,13 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
 
     MM_LOG_INFO("config",
                 "summary — arch={} blocks={} ctx={} d_model={} ff={} "
-                "heads={} kv_heads={} head_dim={} rope_base={} rms_eps={} "
-                "experts={} top_k={}",
+                "heads={} kv_heads={} head_dim={} rope_base={} rope_base_swa={} "
+                "rms_eps={} experts={} top_k={} swa_layers={}",
                 architecture, blockCount, contextLength, embeddingLength,
                 feedForwardLength, headCount, headCountKv, headDim(),
-                ropeFreqBase, rmsNormEps, expertCount, expertUsedCount);
+                ropeFreqBase, ropeFreqBaseSwa, rmsNormEps,
+                expertCount, expertUsedCount,
+                slidingWindowPattern.size());
 }
 
 } // namespace mimirmind::model

@@ -51,12 +51,15 @@ GpuOps::GpuOps(runtime::L0Context& ctx, runtime::CommandQueue& queue)
       _rmsnormGemmaModule{ctx, "rmsnorm_gemma"},
       _rmsnormGemmaKernel{_rmsnormGemmaModule.kernel("rmsnorm_gemma")},
       _rmsnormNoWeightModule{ctx, "rmsnorm_no_weight"},
-      _rmsnormNoWeightKernel{_rmsnormNoWeightModule.kernel("rmsnorm_no_weight")}
+      _rmsnormNoWeightKernel{_rmsnormNoWeightModule.kernel("rmsnorm_no_weight")},
+      _ropeFfModule    {ctx, "rope_inplace_ff"},
+      _ropeFfKernel    {_ropeFfModule.kernel("rope_inplace_ff")}
 {
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
-                "add_bias/add_residual/silu_mul/rope/mul_scalar/gelu_mul "
-                "loaded (rms local={}, elementwise local={}, rope local={})",
+                "add_bias/add_residual/silu_mul/rope/rope_ff/mul_scalar/"
+                "gelu_mul loaded (rms local={}, elementwise local={}, "
+                "rope local={})",
                 kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize);
 }
 
@@ -221,6 +224,39 @@ void GpuOps::ropeInPlaceAsync(float*       x,
     _ropeKernel.setValue<float>(5, base);
     _ropeKernel.setGroupSize(kRopeLocalSize, 1, 1);
     _queue.appendLaunch(_ropeKernel,
+                        groupsForN(total, kRopeLocalSize), 1, 1);
+}
+
+void GpuOps::ropeInPlaceWithFactorsAsync(float*       x,
+                                         const float* freqFactors,
+                                         std::size_t  seqLen,
+                                         std::size_t  numHeads,
+                                         std::size_t  headDim,
+                                         std::size_t  startPos,
+                                         float        base) {
+    if (seqLen == 0 || numHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (headDim % 2 != 0) {
+        throw std::runtime_error(
+            "GpuOps::ropeInPlaceWithFactors: headDim must be even");
+    }
+    if (freqFactors == nullptr) {
+        throw std::runtime_error(
+            "GpuOps::ropeInPlaceWithFactors: freqFactors is null");
+    }
+    const std::size_t halfDim = headDim / 2;
+    const std::size_t total   = seqLen * numHeads * halfDim;
+
+    _ropeFfKernel.setPtr(0, x);
+    _ropeFfKernel.setPtr(1, freqFactors);
+    _ropeFfKernel.setValue<std::int32_t>(2, toInt32(seqLen,   "rope_ff seqLen"));
+    _ropeFfKernel.setValue<std::int32_t>(3, toInt32(numHeads, "rope_ff numHeads"));
+    _ropeFfKernel.setValue<std::int32_t>(4, toInt32(headDim,  "rope_ff headDim"));
+    _ropeFfKernel.setValue<std::int32_t>(5, toInt32(startPos, "rope_ff startPos"));
+    _ropeFfKernel.setValue<float>(6, base);
+    _ropeFfKernel.setGroupSize(kRopeLocalSize, 1, 1);
+    _queue.appendLaunch(_ropeFfKernel,
                         groupsForN(total, kRopeLocalSize), 1, 1);
 }
 
