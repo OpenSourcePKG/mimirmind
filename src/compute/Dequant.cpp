@@ -70,6 +70,39 @@ void dequantBf16(const void* src, std::size_t nelements, float* dst) {
     }
 }
 
+// ----- Q8_0 --------------------------------------------------------------
+//
+// Block of 32 elements, 34 bytes:
+//   fp16  d        — block scale (2 B)
+//   int8  qs[32]   — 32 signed 8-bit quants (32 B)
+// value[i] = d * qs[i]
+
+constexpr std::size_t kQ80BlockElements = 32;
+constexpr std::size_t kQ80BlockBytes    = 34;
+
+void dequantQ80(const void* src, std::size_t nelements, float* dst) {
+    if (nelements % kQ80BlockElements != 0) {
+        throw std::runtime_error(
+            "dequant Q8_0: nelements=" + std::to_string(nelements) +
+            " is not a multiple of " + std::to_string(kQ80BlockElements));
+    }
+    const std::size_t nblocks = nelements / kQ80BlockElements;
+    const auto* base = static_cast<const std::uint8_t*>(src);
+
+    for (std::size_t b = 0; b < nblocks; ++b) {
+        const auto* block = base + b * kQ80BlockBytes;
+
+        std::uint16_t dHalf;
+        std::memcpy(&dHalf, block, sizeof(std::uint16_t));
+        const float d = halfToFloat(dHalf);
+
+        const auto* qs = reinterpret_cast<const std::int8_t*>(block + 2);
+        for (std::size_t l = 0; l < kQ80BlockElements; ++l) {
+            *dst++ = d * static_cast<float>(qs[l]);
+        }
+    }
+}
+
 // ----- Q4_K --------------------------------------------------------------
 //
 // Super-block of 256 elements, 144 bytes:
@@ -221,6 +254,7 @@ void dequantToF32(model::GgmlType type,
         case model::GgmlType::F32:  dequantF32(src,  nelements, dst); return;
         case model::GgmlType::F16:  dequantF16(src,  nelements, dst); return;
         case model::GgmlType::BF16: dequantBf16(src, nelements, dst); return;
+        case model::GgmlType::Q8_0: dequantQ80(src,  nelements, dst); return;
         case model::GgmlType::Q4_K: dequantQ4K(src,  nelements, dst); return;
         case model::GgmlType::Q6_K: dequantQ6K(src,  nelements, dst); return;
 
@@ -233,7 +267,6 @@ void dequantToF32(model::GgmlType type,
         case model::GgmlType::Q4_1:
         case model::GgmlType::Q5_0:
         case model::GgmlType::Q5_1:
-        case model::GgmlType::Q8_0:
         case model::GgmlType::Q8_1:
         case model::GgmlType::Q2_K:
         case model::GgmlType::Q3_K:
