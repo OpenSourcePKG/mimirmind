@@ -127,12 +127,15 @@ const ByteUnicodeMap& byteMap() {
     return m;
 }
 
-std::string normalizeForSpm(std::string_view text) {
-    // SentencePiece (and llama.cpp's SPM tokenizer) prepends a single ▁
-    // and replaces internal ASCII spaces with ▁.
+std::string normalizeForSpm(std::string_view text, bool addSpacePrefix) {
+    // SentencePiece replaces internal ASCII spaces with ▁. Whether it also
+    // *prepends* a ▁ to the very first character depends on the model:
+    // Llama/Mistral/Gemma 3 default to yes, Gemma 4's GGUF sets it to no.
     std::string out;
     out.reserve(text.size() + kSpaceMarker.size());
-    out.append(kSpaceMarker);
+    if (addSpacePrefix) {
+        out.append(kSpaceMarker);
+    }
     for (char c : text) {
         if (c == ' ') {
             out.append(kSpaceMarker);
@@ -217,6 +220,16 @@ void Tokenizer::loadFromGguf(const GgufReader& reader) {
     readSpecialId("tokenizer.ggml.unknown_token_id", _unknownId);
     readSpecialId("tokenizer.ggml.padding_token_id", _padId);
 
+    // `tokenizer.ggml.add_space_prefix` — SentencePiece "prepend ▁ at the
+    // start of the input" flag. Defaults to true (legacy Llama/Mistral
+    // behaviour); Gemma 4 sets it to false in its converter
+    // (conversion/gemma.py: `add_add_space_prefix(False)`).
+    if (const auto* v = reader.findMetadata("tokenizer.ggml.add_space_prefix")) {
+        if (std::holds_alternative<bool>(*v)) {
+            _addSpacePrefix = std::get<bool>(*v);
+        }
+    }
+
     // For GPT-2 the merges array is what drives encoding — load it.
     if (const auto* mergesArr = asArray(reader.findMetadata("tokenizer.ggml.merges"))) {
         if (mergesArr->elementType == GgufValueType::String) {
@@ -229,9 +242,10 @@ void Tokenizer::loadFromGguf(const GgufReader& reader) {
     }
 
     MM_LOG_INFO("tok",
-                "vocab loaded: {} tokens, {} merges, bos={} eos={} unk={} pad={}",
+                "vocab loaded: {} tokens, {} merges, bos={} eos={} unk={} "
+                "pad={} add_space_prefix={}",
                 _tokens.size(), _mergesRank.size(),
-                _bosId, _eosId, _unknownId, _padId);
+                _bosId, _eosId, _unknownId, _padId, _addSpacePrefix);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +275,7 @@ std::string Tokenizer::decode(std::span<const std::int32_t> ids, bool skipSpecia
 // ---------------------------------------------------------------------------
 
 std::vector<std::int32_t> Tokenizer::encodeSpm(std::string_view text, bool addBos) const {
-    const std::string normalized = normalizeForSpm(text);
+    const std::string normalized = normalizeForSpm(text, _addSpacePrefix);
 
     // Initial segmentation: one segment per UTF-8 codepoint, looked up in
     // the vocab. Anything not in the vocab becomes _unknownId (proper

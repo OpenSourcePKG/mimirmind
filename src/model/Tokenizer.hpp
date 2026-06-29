@@ -88,6 +88,12 @@ private:
     std::int32_t _eosId    {-1};
     std::int32_t _unknownId{-1};
     std::int32_t _padId    {-1};
+
+    /// SentencePiece's "add a ▁ to the very front of the input" behaviour.
+    /// Defaults to true (legacy SPM). Gemma 4's GGUF sets it to false via
+    /// `tokenizer.ggml.add_space_prefix` so "Hello, world!" tokenises to
+    /// [Hello][,][▁world][!] instead of [▁Hello][,][▁world][!].
+    bool         _addSpacePrefix{true};
 };
 
 } // namespace mimirmind::model
