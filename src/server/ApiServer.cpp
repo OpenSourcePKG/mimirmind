@@ -187,6 +187,71 @@ void extendStopIds(const model::Tokenizer&         tok,
     }
 }
 
+// ---- SSE / streaming chunk builders ---------------------------------------
+
+json streamChunkSkeleton(const std::string& id,
+                         std::int64_t       created,
+                         const std::string& model) {
+    return json{
+        {"id",      id},
+        {"object",  "chat.completion.chunk"},
+        {"created", created},
+        {"model",   model},
+    };
+}
+
+json buildRoleChunk(const std::string& id, std::int64_t created,
+                    const std::string& model) {
+    json out = streamChunkSkeleton(id, created, model);
+    out["choices"] = json::array({
+        json{
+            {"index",         0},
+            {"delta",         json{{"role", "assistant"}}},
+            {"finish_reason", nullptr},
+        },
+    });
+    return out;
+}
+
+json buildContentChunk(const std::string& id, std::int64_t created,
+                       const std::string& model, std::string_view text) {
+    json out = streamChunkSkeleton(id, created, model);
+    out["choices"] = json::array({
+        json{
+            {"index",         0},
+            {"delta",         json{{"content", std::string{text}}}},
+            {"finish_reason", nullptr},
+        },
+    });
+    return out;
+}
+
+json buildFinishChunk(const std::string& id, std::int64_t created,
+                      const std::string& model, std::string_view finishReason) {
+    json out = streamChunkSkeleton(id, created, model);
+    out["choices"] = json::array({
+        json{
+            {"index",         0},
+            {"delta",         json::object()},
+            {"finish_reason", std::string{finishReason}},
+        },
+    });
+    return out;
+}
+
+/// Format `payload` as one SSE event and push it onto `sink`. Returns
+/// false if the sink refused the write — caller should treat that as
+/// "client disconnected".
+[[nodiscard]] bool writeSseEvent(httplib::DataSink& sink, const json& payload) {
+    const std::string line = "data: " + payload.dump() + "\n\n";
+    return sink.write(line.data(), line.size());
+}
+
+[[nodiscard]] bool writeSseDone(httplib::DataSink& sink) {
+    static constexpr std::string_view kDone = "data: [DONE]\n\n";
+    return sink.write(kDone.data(), kDone.size());
+}
+
 } // namespace
 
 struct ApiServer::Impl {
@@ -262,6 +327,38 @@ struct ApiServer::Impl {
         });
     }
 
+    /// Common pre-generation work shared by streaming and non-streaming.
+    /// Mutates `params` and `stopIds` in place. Returns false (and writes
+    /// the error response) if the request is invalid.
+    [[nodiscard]] bool prepareChatRequest(const ChatRequest&             cr,
+                                          httplib::Response&             res,
+                                          std::vector<std::int32_t>&     promptIds,
+                                          std::vector<std::int32_t>&     stopIds,
+                                          runtime::GenerateParams&       params) {
+        if (cr.messages.empty()) {
+            sendError(res, 400, "invalid_request_error",
+                      "messages must not be empty");
+            return false;
+        }
+
+        const auto& tok = engine.tokenizer();
+        promptIds = model::ChatTemplate::encode(
+            chatStyle, tok, cr.messages, /*addGenerationPrompt=*/true);
+
+        stopIds = model::ChatTemplate::stopIds(chatStyle, tok);
+        extendStopIds(tok, cr.stopStrings, stopIds);
+
+        params.maxNewTokens = cr.maxTokens > 0 ? cr.maxTokens : cfg.defaultMaxNew;
+        params.stopIds      = stopIds;
+        if (cr.hasTemperature) {
+            params.sampling.temperature = cr.temperature;
+        }
+        params.sampling.topP = cr.topP;
+        params.sampling.topK = cr.topK;
+        params.sampling.seed = cr.seed;
+        return true;
+    }
+
     void handleChatCompletions(const httplib::Request& req,
                                httplib::Response&       res) {
         json body;
@@ -282,33 +379,22 @@ struct ApiServer::Impl {
         }
 
         if (cr.stream) {
-            sendError(res, 501, "server_error",
-                      "stream=true is not implemented yet (M7e)");
-            return;
+            handleChatCompletionsStream(cr, res);
+        } else {
+            handleChatCompletionsBlocking(cr, res);
         }
-        if (cr.messages.empty()) {
-            sendError(res, 400, "invalid_request_error",
-                      "messages must not be empty");
+    }
+
+    void handleChatCompletionsBlocking(const ChatRequest& cr,
+                                       httplib::Response& res) {
+        std::vector<std::int32_t> promptIds;
+        std::vector<std::int32_t> stopIds;
+        runtime::GenerateParams   params;
+        if (!prepareChatRequest(cr, res, promptIds, stopIds, params)) {
             return;
         }
 
         const auto& tok = engine.tokenizer();
-        const auto promptIds = model::ChatTemplate::encode(
-            chatStyle, tok, cr.messages, /*addGenerationPrompt=*/true);
-
-        std::vector<std::int32_t> stopIds =
-            model::ChatTemplate::stopIds(chatStyle, tok);
-        extendStopIds(tok, cr.stopStrings, stopIds);
-
-        runtime::GenerateParams params;
-        params.maxNewTokens = cr.maxTokens > 0 ? cr.maxTokens : cfg.defaultMaxNew;
-        params.stopIds      = stopIds;
-        if (cr.hasTemperature) {
-            params.sampling.temperature = cr.temperature;
-        }
-        params.sampling.topP = cr.topP;
-        params.sampling.topK = cr.topK;
-        params.sampling.seed = cr.seed;
 
         runtime::GenerateStats stats;
         std::vector<std::int32_t> generated;
@@ -382,6 +468,176 @@ struct ApiServer::Impl {
                     stats.prefillMs, stats.decodeMs, finish);
 
         sendJson(res, 200, response);
+    }
+
+    void handleChatCompletionsStream(const ChatRequest& cr,
+                                     httplib::Response& res) {
+        std::vector<std::int32_t> promptIds;
+        std::vector<std::int32_t> stopIds;
+        runtime::GenerateParams   params;
+        if (!prepareChatRequest(cr, res, promptIds, stopIds, params)) {
+            return;
+        }
+
+        const std::string respId    = makeRequestId();
+        const std::int64_t created  = unixNow();
+        const std::string echoModel = cr.model.empty() ? cfg.modelId : cr.model;
+
+        // Disable proxy buffering / browser caching so SSE chunks reach the
+        // client as they are produced.
+        res.set_header("Cache-Control", "no-cache");
+        res.set_header("Connection", "keep-alive");
+        res.set_header("X-Accel-Buffering", "no");
+
+        // The provider lambda owns the heavy work — taking the engine
+        // mutex, running generate, writing chunks. The HTTP response
+        // headers (200 + content-type) go out as soon as cpp-httplib
+        // starts invoking the provider, so the client gets immediate
+        // feedback that the request was accepted.
+        //
+        // Shared state lives on the heap so the provider lambda can be
+        // re-entered safely if cpp-httplib calls it more than once.
+        struct StreamState {
+            std::vector<std::int32_t> promptIds;
+            std::vector<std::int32_t> stopIds;
+            runtime::GenerateParams   params;
+            std::string               respId;
+            std::int64_t              created{};
+            std::string               echoModel;
+            bool                      done{false};
+        };
+        auto state = std::make_shared<StreamState>();
+        state->promptIds = std::move(promptIds);
+        state->stopIds   = std::move(stopIds);
+        state->params    = std::move(params);
+        state->respId    = respId;
+        state->created   = created;
+        state->echoModel = echoModel;
+
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [this, state](std::size_t /*offset*/,
+                          httplib::DataSink& sink) -> bool {
+                if (state->done) {
+                    return false;
+                }
+                state->done = true;
+
+                const auto& tok = engine.tokenizer();
+
+                // 1. Initial role chunk so clients see {role:"assistant"}.
+                if (!writeSseEvent(
+                        sink,
+                        buildRoleChunk(state->respId, state->created,
+                                       state->echoModel))) {
+                    MM_LOG_INFO("server",
+                                "stream {}: client closed before role chunk",
+                                state->respId);
+                    return false;
+                }
+
+                // 2. Generate under the engine mutex; emit each non-stop
+                //    token as a delta-content chunk. The onToken returning
+                //    false causes generate() to abort cleanly.
+                std::size_t              emittedTokens = 0;
+                runtime::GenerateStats   stats;
+                bool                     clientGone    = false;
+
+                auto isStop = [&](std::int32_t id) {
+                    if (id == tok.eosId()) return true;
+                    for (auto s : state->stopIds) {
+                        if (id == s) return true;
+                    }
+                    return false;
+                };
+
+                auto onToken = [&](std::int32_t id) -> bool {
+                    if (isStop(id)) {
+                        // Do not surface the stop token's text. The engine
+                        // checks isStop on the next iteration and exits.
+                        return true;
+                    }
+                    const std::string txt = tok.decode(
+                        std::span<const std::int32_t>{&id, 1},
+                        /*skipSpecial=*/true);
+                    if (txt.empty()) {
+                        return true;
+                    }
+                    if (!writeSseEvent(
+                            sink,
+                            buildContentChunk(state->respId, state->created,
+                                              state->echoModel, txt))) {
+                        clientGone = true;
+                        return false;   // abort generate()
+                    }
+                    ++emittedTokens;
+                    return true;
+                };
+
+                std::vector<std::int32_t> generated;
+                std::string               errorMessage;
+                {
+                    std::lock_guard<std::mutex> lk{engineMutex};
+                    try {
+                        generated = engine.generate(state->promptIds,
+                                                    state->params,
+                                                    onToken,
+                                                    &stats);
+                    } catch (const std::exception& e) {
+                        errorMessage = e.what();
+                    }
+                }
+
+                if (clientGone) {
+                    MM_LOG_INFO("server",
+                                "stream {}: aborted mid-decode "
+                                "(emitted={}, prefill={:.0f}ms)",
+                                state->respId, emittedTokens, stats.prefillMs);
+                    sink.done();
+                    return false;
+                }
+
+                if (!errorMessage.empty()) {
+                    // Surface the error as an SSE event so the client sees
+                    // a structured failure rather than just a half-stream.
+                    json errChunk = streamChunkSkeleton(state->respId,
+                                                        state->created,
+                                                        state->echoModel);
+                    errChunk["error"] = json{
+                        {"message", errorMessage},
+                        {"type",    "server_error"},
+                    };
+                    (void)writeSseEvent(sink, errChunk);
+                    MM_LOG_ERROR("server",
+                                 "stream {}: generate failed: {}",
+                                 state->respId, errorMessage);
+                    sink.done();
+                    return false;
+                }
+
+                // 3. Finish chunk + DONE sentinel. finish_reason is "stop"
+                //    if a stop token broke the decode loop, "length" if we
+                //    exhausted maxNewTokens.
+                const bool hitStop = stats.hitEos
+                    || (!generated.empty() && isStop(generated.back()));
+                const std::string finish = hitStop ? "stop" : "length";
+
+                (void)writeSseEvent(
+                    sink,
+                    buildFinishChunk(state->respId, state->created,
+                                     state->echoModel, finish));
+                (void)writeSseDone(sink);
+
+                MM_LOG_INFO("server",
+                            "stream {} model={} prompt={} emitted={} "
+                            "prefill={:.0f}ms decode={:.0f}ms finish={}",
+                            state->respId, state->echoModel,
+                            state->promptIds.size(), emittedTokens,
+                            stats.prefillMs, stats.decodeMs, finish);
+
+                sink.done();
+                return false;
+            });
     }
 
     void run() {
