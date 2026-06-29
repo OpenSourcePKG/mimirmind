@@ -13,8 +13,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <numeric>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -26,78 +26,109 @@ Gemma4Backend::Gemma4Backend(const model::LlmConfig&   config,
                              compute::GpuOps&          ops,
                              compute::GpuMatmul&       gmm)
     : _config{config}, _weights{weights}, _ops{ops}, _gmm{gmm} {
-    buildKvSharePattern();
+    buildLayerInfos();
 
-    // Optional global `rope_freqs.weight` (F32 [head_dim/2]) — used as
-    // `freq_factors` in proportional RoPE for non-SWA (global) layers.
-    // The 26B-A4B Q6_K we run during M8 bring-up ships this tensor with
-    // count = head_dim (256), but ggml_rope_ext expects [head_dim/2]:
-    // we accept any tensor that has *at least* halfDim usable floats and
-    // ignore the trailing slots.
     if (const auto* rf = _weights.find("rope_freqs.weight");
         rf != nullptr && rf->type == model::GgmlType::F32) {
-        const std::size_t halfDim = _config.headDim() / 2;
-        if (rf->nelements >= halfDim) {
+        // ggml_rope_ext expects [head_dim/2]; the 26B-A4B GGUF stores 256
+        // floats (full head_dim/2 = 256). Accept any tensor whose element
+        // count is at least the largest layer's halfDim and use the first
+        // halfDim entries per layer.
+        std::size_t maxHalfDim = 0;
+        for (const auto& li : _layers) {
+            maxHalfDim = std::max(maxHalfDim, li.headDim / 2);
+        }
+        if (rf->nelements >= maxHalfDim) {
             _ropeFreqsForFullAttn = static_cast<const float*>(rf->usmPtr);
             MM_LOG_INFO("gemma4",
-                        "proportional RoPE enabled — rope_freqs.weight has "
-                        "{} float(s), using first {} for non-SWA layers",
-                        rf->nelements, halfDim);
+                        "proportional RoPE enabled — rope_freqs.weight "
+                        "has {} float(s), using first {} for full-attn layers",
+                        rf->nelements, maxHalfDim);
         } else {
             MM_LOG_WARN("gemma4",
                         "rope_freqs.weight has {} float(s) < halfDim={} — "
-                        "proportional RoPE disabled, falling back to plain "
-                        "base for non-SWA layers", rf->nelements, halfDim);
+                        "proportional RoPE disabled, full-attn layers will "
+                        "use plain RoPE", rf->nelements, maxHalfDim);
         }
     } else {
         MM_LOG_INFO("gemma4",
-                    "no rope_freqs.weight — non-SWA layers use plain RoPE "
-                    "with base={}", _config.ropeFreqBase);
+                    "no rope_freqs.weight — full-attn layers use plain RoPE");
     }
 
     MM_LOG_INFO("gemma4",
-                "Gemma4Backend ready — blocks={} d_model={} ff={} heads={} "
-                "kv={} experts={} top_k={} rope_base={}/{} swa_layers={}",
+                "Gemma4Backend ready — blocks={} d_model={} ff={} "
+                "experts={} top_k={} swa head_dim={} kv={}, "
+                "full head_dim={} kv={}",
                 _config.blockCount, _config.embeddingLength,
-                _config.feedForwardLength, _config.headCount,
-                _config.headCountKv, _config.expertCount,
-                _config.expertUsedCount,
-                _config.ropeFreqBase, _config.ropeFreqBaseSwa,
-                _config.slidingWindowPattern.size());
+                _config.feedForwardLength,
+                _config.expertCount, _config.expertUsedCount,
+                _config.keyLengthSwa,
+                _config.headCountKvFor(0),
+                _config.keyLength,
+                _layers.empty() ? 0 : _layers.front().nKvHeads);
 }
 
-bool Gemma4Backend::isSwaLayer(std::size_t blockIdx) const noexcept {
-    return blockIdx < _config.slidingWindowPattern.size() &&
-           _config.slidingWindowPattern[blockIdx];
-}
+void Gemma4Backend::buildLayerInfos() {
+    _layers.reserve(_config.blockCount);
 
-void Gemma4Backend::buildKvSharePattern() {
-    _kvSource.assign(_config.blockCount, 0);
-    std::optional<std::size_t> lastKv;
+    std::size_t swaCount = 0, fullCount = 0, altCount = 0;
     std::string pattern;
     pattern.reserve(_config.blockCount);
+
     for (std::size_t b = 0; b < _config.blockCount; ++b) {
-        const bool hasOwn =
-            _weights.findBlock(b, "attn_k.weight") != nullptr &&
-            _weights.findBlock(b, "attn_v.weight") != nullptr;
-        if (hasOwn) {
-            _kvSource[b] = b;
-            lastKv       = b;
-            pattern.push_back('K');
-        } else if (lastKv) {
-            _kvSource[b] = *lastKv;
-            pattern.push_back('.');
-        } else {
+        LayerInfo li{};
+        li.isSwa = (b < _config.slidingWindowPattern.size())
+                     ? _config.slidingWindowPattern[b]
+                     : true; // default to SWA if pattern missing
+        li.headDim  = _config.headDim(b);
+        li.nHeads   = _config.headCount;
+        li.nKvHeads = _config.headCountKvFor(b);
+        li.qDim     = li.nHeads   * li.headDim;
+        li.kvDim    = li.nKvHeads * li.headDim;
+        li.ropeBase = li.isSwa ? _config.ropeFreqBaseSwa
+                                : _config.ropeFreqBase;
+
+        // Alternative attention: layer omits attn_v.weight, so V is
+        // taken from the raw K projection. Every gemma4 layer must
+        // still own attn_k.weight (the assumption that some layers
+        // share K from earlier ones was wrong).
+        const bool hasV = _weights.findBlock(b, "attn_v.weight") != nullptr;
+        const bool hasK = _weights.findBlock(b, "attn_k.weight") != nullptr;
+        if (!hasK) {
             throw std::runtime_error(
                 "gemma4: block " + std::to_string(b) +
-                " has no K/V and no earlier source — model is malformed");
+                " missing attn_k.weight — model is malformed");
         }
+        li.altAttention = !hasV;
+
+        _layers.push_back(li);
+        pattern.push_back(li.isSwa ? (li.altAttention ? 'a' : 's')
+                                   : (li.altAttention ? 'A' : 'F'));
+        if (li.isSwa) ++swaCount; else ++fullCount;
+        if (li.altAttention) ++altCount;
     }
+
     MM_LOG_INFO("gemma4",
-                "KV-share pattern: {} ({} owns, {} shared)",
-                pattern,
-                std::count(pattern.begin(), pattern.end(), 'K'),
-                std::count(pattern.begin(), pattern.end(), '.'));
+                "layer map: {} ({} SWA, {} full, {} alt-attn V=K)",
+                pattern, swaCount, fullCount, altCount);
+}
+
+std::vector<std::size_t> Gemma4Backend::kvDimPerLayer() const {
+    std::vector<std::size_t> out;
+    out.reserve(_layers.size());
+    for (const auto& li : _layers) {
+        out.push_back(li.kvDim);
+    }
+    return out;
+}
+
+std::pair<std::size_t, std::size_t> Gemma4Backend::maxQKVDims() const {
+    std::size_t qMax = 0, kvMax = 0;
+    for (const auto& li : _layers) {
+        qMax  = std::max(qMax,  li.qDim);
+        kvMax = std::max(kvMax, li.kvDim);
+    }
+    return {qMax, kvMax};
 }
 
 void Gemma4Backend::runBlock(std::size_t   blockIdx,
@@ -114,6 +145,8 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     };
     trace("enter");
 
+    const auto& li = _layers[blockIdx];
+
     auto require = [&](const char* suffix) {
         const auto* t = _weights.findBlock(blockIdx, suffix);
         if (t == nullptr) {
@@ -127,6 +160,8 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     const auto* attnNorm    = require("attn_norm.weight");
     const auto* qW          = require("attn_q.weight");
     const auto* qNorm       = require("attn_q_norm.weight");
+    const auto* kW          = require("attn_k.weight");
+    const auto* kNorm       = require("attn_k_norm.weight");
     const auto* oW          = require("attn_output.weight");
     const auto* attnPost    = require("post_attention_norm.weight");
     const auto* ffnNorm     = require("ffn_norm.weight");
@@ -137,7 +172,6 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     const auto* ffwPost     = require("post_ffw_norm.weight");
     const auto* outScale    = require("layer_output_scale.weight");
 
-    // Path B (MoE) tensors. Required for gemma4 26B-A4B; every block has them.
     const auto* preNorm2     = require("pre_ffw_norm_2.weight");
     const auto* postNorm2    = require("post_ffw_norm_2.weight");
     const auto* routerScale  = require("ffn_gate_inp.scale");
@@ -146,30 +180,18 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     const auto* expDown      = require("ffn_down_exps.weight");
     const auto* expDownScale = require("ffn_down_exps.scale");
 
-    // KV-sharing: only blocks that own K/V do the K/V projection +
-    // K-norm + K-RoPE. Other blocks read K/V from the source block's
-    // cache slot.
-    const std::size_t kvLayer  = _kvSource[blockIdx];
-    const bool        hasOwnKv = (kvLayer == blockIdx);
-    const auto* kW    = hasOwnKv ? require("attn_k.weight")      : nullptr;
-    const auto* vW    = hasOwnKv ? require("attn_v.weight")      : nullptr;
-    const auto* kNorm = hasOwnKv ? require("attn_k_norm.weight") : nullptr;
-
-    // SWA layers use a different RoPE base AND no freq_factors.
-    // Global-attention layers use the long-context base AND proportional
-    // RoPE freq_factors (if the model shipped them). Mirrors gemma4.cpp:
-    //   freq_base_l = is_swa(il) ? rope_freq_base_train_swa : rope_freq_base;
-    //   freq_factors = is_swa(il) ? nullptr : layer.rope_freqs;
-    const bool   isSwa    = isSwaLayer(blockIdx);
-    const float  ropeBase = isSwa ? _config.ropeFreqBaseSwa
-                                  : _config.ropeFreqBase;
-    const float* freqFactors = isSwa ? nullptr : _ropeFreqsForFullAttn;
+    // vW is optional — when the layer uses alternative attention,
+    // V is derived from the raw K projection (see Gemma 4 reference).
+    const model::GgufTensor* vW = nullptr;
+    if (!li.altAttention) {
+        vW = require("attn_v.weight");
+    }
 
     const std::size_t d_model  = s.d_model;
-    const std::size_t q_dim    = s.q_dim;
-    const std::size_t kv_dim   = _config.headCountKv * _config.headDim();
     const std::size_t ff_dim   = s.ff_dim;
-    const std::size_t head_dim = _config.headDim();
+    const std::size_t q_dim    = li.qDim;
+    const std::size_t kv_dim   = li.kvDim;
+    const std::size_t head_dim = li.headDim;
     const std::size_t curLen   = cache.length();
     const std::size_t totalLen = curLen + T;
 
@@ -183,6 +205,9 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     float* const scoreScratch  = s.scoreScratch.as<float>();
     float* const moeAccumBuf   = s.moeAccumBuf.as<float>();
     float* const expertOutBuf  = s.expertOutBuf.as<float>();
+
+    float* const kSlot = cache.writeSlotK(blockIdx);
+    float* const vSlot = cache.writeSlotV(blockIdx);
 
     // --- pre-attention RMSNorm ----------------------------------------
 
@@ -199,66 +224,67 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     };
 
     trace("Q projection");
-    projectAsync(qW, q_dim,  qBuf);
+    projectAsync(qW, q_dim, qBuf);
 
-    if (hasOwnKv) {
-        float* const kSlot = cache.writeSlotK(blockIdx);
-        float* const vSlot = cache.writeSlotV(blockIdx);
-        trace("K projection");
-        projectAsync(kW, kv_dim, kSlot);
+    trace("K projection");
+    projectAsync(kW, kv_dim, kSlot);
+
+    if (li.altAttention) {
+        // V = raw K projection. We need a copy of K *before* K-norm and
+        // RoPE so V keeps its raw layout. KvCache writes V into vSlot;
+        // copy the raw K rows there now (sync first so the K matmul has
+        // settled on USM).
+        trace("alt-attn V = raw K (memcpy)");
+        _gmm.sync();
+        std::memcpy(vSlot, kSlot, T * kv_dim * sizeof(float));
+    } else {
         trace("V projection");
         projectAsync(vW, kv_dim, vSlot);
+    }
 
-        // K-norm BEFORE RoPE (per-head, like Q-norm below).
-        trace("K-norm");
-        _ops.rmsNormAsync(kSlot, T * _config.headCountKv, head_dim,
-                          static_cast<const float*>(kNorm->usmPtr),
-                          _config.rmsNormEps,
-                          kSlot);              // in-place
+    // K-norm BEFORE RoPE (per-head, like Q-norm below).
+    trace("K-norm");
+    _ops.rmsNormAsync(kSlot, T * li.nKvHeads, head_dim,
+                      static_cast<const float*>(kNorm->usmPtr),
+                      _config.rmsNormEps,
+                      kSlot);              // in-place
 
-        // V-norm: bare RMSNorm over head_dim, no learned weight. Gemma 4
-        // pushes V through `ggml_rms_norm` before it enters the KV cache
-        // (gemma4.cpp ~line 256).
-        trace("V-norm (no weight)");
-        _ops.rmsNormNoWeightAsync(vSlot, T * _config.headCountKv, head_dim,
-                                  _config.rmsNormEps,
-                                  vSlot);            // in-place
+    // V-norm: bare RMSNorm over head_dim, no learned weight.
+    trace("V-norm (no weight)");
+    _ops.rmsNormNoWeightAsync(vSlot, T * li.nKvHeads, head_dim,
+                              _config.rmsNormEps,
+                              vSlot);            // in-place
 
-        trace("RoPE K");
-        if (freqFactors != nullptr) {
-            _ops.ropeInPlaceWithFactorsAsync(kSlot, freqFactors, T,
-                                             _config.headCountKv, head_dim,
-                                             curLen, ropeBase);
-        } else {
-            _ops.ropeInPlaceAsync(kSlot, T,
-                                  _config.headCountKv, head_dim, curLen,
-                                  ropeBase);
-        }
+    // RoPE K only (V never gets RoPE).
+    trace("RoPE K");
+    if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
+        _ops.ropeInPlaceWithFactorsAsync(kSlot, _ropeFreqsForFullAttn, T,
+                                         li.nKvHeads, head_dim, curLen,
+                                         li.ropeBase);
     } else {
-        trace("KV reused from earlier layer");
+        _ops.ropeInPlaceAsync(kSlot, T, li.nKvHeads, head_dim, curLen,
+                              li.ropeBase);
     }
 
     // Q-K-norm BEFORE RoPE (per-head RMSNorm over head_dim).
     trace("Q-norm");
-    _ops.rmsNormAsync(qBuf, T * _config.headCount, head_dim,
+    _ops.rmsNormAsync(qBuf, T * li.nHeads, head_dim,
                       static_cast<const float*>(qNorm->usmPtr),
                       _config.rmsNormEps,
                       qBuf);                   // in-place
 
     trace("RoPE Q");
-    if (freqFactors != nullptr) {
-        _ops.ropeInPlaceWithFactorsAsync(qBuf, freqFactors, T,
-                                         _config.headCount, head_dim,
-                                         curLen, ropeBase);
+    if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
+        _ops.ropeInPlaceWithFactorsAsync(qBuf, _ropeFreqsForFullAttn, T,
+                                         li.nHeads, head_dim, curLen,
+                                         li.ropeBase);
     } else {
-        _ops.ropeInPlaceAsync(qBuf, T,
-                              _config.headCount, head_dim, curLen,
-                              ropeBase);
+        _ops.ropeInPlaceAsync(qBuf, T, li.nHeads, head_dim, curLen,
+                              li.ropeBase);
     }
 
-    // f_attention_scale = 1.0 (gemma4.cpp:11). Our multiHeadAttention
-    // divides Q·K by 1/sqrt(headDim) internally; pre-scale Q by
-    // sqrt(head_dim) so it cancels and effective scale = 1.0.
+    // f_attention_scale = 1.0 (gemma4.cpp:11). multiHeadAttention divides
+    // Q·K by 1/sqrt(headDim); pre-scale Q by sqrt(head_dim) so it cancels.
     {
         const float qScale = std::sqrt(static_cast<float>(head_dim));
         trace("Q pre-scale sqrt(head_dim)");
@@ -271,10 +297,10 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     trace("multiHeadAttention (CPU)");
     cmp::multiHeadAttention(
         qBuf,
-        cache.baseK(kvLayer),
-        cache.baseV(kvLayer),
+        cache.baseK(blockIdx),
+        cache.baseV(blockIdx),
         T, totalLen,
-        _config.headCount, _config.headCountKv, head_dim,
+        li.nHeads, li.nKvHeads, head_dim,
         curLen,
         scoreScratch,
         attnOutBuf);
@@ -331,7 +357,6 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                       _config.rmsNormEps,
                       normBuf);
 
-    // router_in = RMSNorm(x, ffn_gate_inp.scale) * 1/sqrt(d_model).
     trace("path B: router rmsNorm + scale");
     _ops.rmsNormAsync(x, T, d_model,
                       static_cast<const float*>(routerScale->usmPtr),
@@ -349,7 +374,6 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                 attnOutBuf, T,
                 upOutBuf, matmulScratch);
 
-    // CPU softmax + top-K per token (renormalised so kept K sums to 1).
     std::vector<std::int32_t> topKIdx(T * K);
     std::vector<float>        topKWeight(T * K);
     {
@@ -391,10 +415,6 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     trace("path B: zero accumulator");
     _ops.mulScalarAsync(moeAccumBuf, 0.0F, T * d_model);
 
-    //   gate_up_exps: Q6_K [K=d_model, N=gate_up_fused, n_exp]
-    //                  per-expert bytes = N * (K/256) * 210
-    //   down_exps:    Q8_0 [K=ff_per_expert, N=d_model, n_exp]
-    //                  per-expert bytes = N * (K/32)  * 34
     const std::size_t gateUpFused = expGateUp->dimensions.size() >= 2
                                       ? expGateUp->dimensions[1] : 0;
     const std::size_t ffPerExpert = gateUpFused / 2;
@@ -446,7 +466,6 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                         gateOutBuf, 1,
                         expertOutBuf, matmulScratch);
 
-            // ffn_down_exps.scale[e] · routerWeight, fused into one mulScalar.
             const float combined = routerWeight * expDownScalePtr[e];
             _ops.mulScalarAsync(expertOutBuf, combined, d_model);
             _ops.addResidualAsync(accumT, expertOutBuf, d_model);
@@ -471,7 +490,6 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     trace("ffn residual");
     _ops.addResidualAsync(x, moeAccumBuf, T * d_model);
 
-    // layer_output_scale.weight is a USM F32[1] — read directly from CPU.
     const float scaleVal = *static_cast<const float*>(outScale->usmPtr);
     trace("layer_output_scale");
     _ops.mulScalarAsync(x, scaleVal, T * d_model);

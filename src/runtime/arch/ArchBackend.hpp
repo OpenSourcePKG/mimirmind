@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace mimirmind::compute {
 class GpuMatmul;
@@ -54,6 +56,17 @@ public:
     /// sqrt(d_model) before the first block (Gemma family). InferenceEngine
     /// reads this to centralise the scale on prefill + decode.
     [[nodiscard]] virtual bool scalesEmbedding() const noexcept = 0;
+
+    /// KV-cache row width per layer (nKvHeads(l) * headDim(l)). Used by
+    /// InferenceEngine to size the KV cache. Length must == blockCount.
+    [[nodiscard]] virtual std::vector<std::size_t>
+        kvDimPerLayer() const = 0;
+
+    /// Maximum hidden-state dim across layers for any of: Q output, KV
+    /// output. BlockBuffers is sized for this so scratch survives the
+    /// largest layer. Returns a pair {qDimMax, kvDimMax}.
+    [[nodiscard]] virtual std::pair<std::size_t, std::size_t>
+        maxQKVDims() const = 0;
 
     /// Short identifier for logs ("qwen2", "gemma4").
     [[nodiscard]] virtual const char* name() const noexcept = 0;

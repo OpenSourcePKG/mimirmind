@@ -215,10 +215,12 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
     const std::size_t maxT      = std::max<std::size_t>(Tp, 1);
     const std::size_t d_model   = _config.embeddingLength;
 
-    KvCache cache(_allocator, _config.blockCount, cacheMax,
-                  _config.headCountKv, _config.headDim());
+    KvCache cache(_allocator, cacheMax, _backend->kvDimPerLayer());
 
-    BlockBuffers buffers = allocBlockBuffers(_allocator, _config, maxT, cacheMax);
+    const auto [qDimMax, kvDimMax] = _backend->maxQKVDims();
+    BlockBuffers buffers = allocBlockBuffers(_allocator, _config,
+                                             maxT, cacheMax,
+                                             qDimMax, kvDimMax);
 
     const std::size_t xBytes         = maxT * d_model * sizeof(float);
     const std::size_t normFinalBytes = d_model * sizeof(float);
