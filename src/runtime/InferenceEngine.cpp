@@ -453,7 +453,7 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
     // --- pre-attention RMSNorm ----------------------------------------
 
     trace("attn rmsNorm");
-    _ops.rmsNormGemmaAsync(x, T, d_model,
+    _ops.rmsNormAsync(x, T, d_model,
                            static_cast<const float*>(attnNorm->usmPtr),
                            _config.rmsNormEps,
                            normBuf);
@@ -481,7 +481,7 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
 
         // K-norm BEFORE RoPE (per-head, like Q-norm below).
         trace("K-norm");
-        _ops.rmsNormGemmaAsync(kSlot, T * _config.headCountKv, head_dim,
+        _ops.rmsNormAsync(kSlot, T * _config.headCountKv, head_dim,
                                static_cast<const float*>(kNorm->usmPtr),
                                _config.rmsNormEps,
                                kSlot);              // in-place
@@ -511,7 +511,7 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
     // rows — exactly what we want for per-head normalisation.
 
     trace("Q-norm");
-    _ops.rmsNormGemmaAsync(qBuf, T * _config.headCount, head_dim,
+    _ops.rmsNormAsync(qBuf, T * _config.headCount, head_dim,
                            static_cast<const float*>(qNorm->usmPtr),
                            _config.rmsNormEps,
                            qBuf);                   // in-place
@@ -562,7 +562,7 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
     // --- attn_post_norm + attention residual ---------------------------
 
     trace("attn_post_norm");
-    _ops.rmsNormGemmaAsync(projOutBuf, T, d_model,
+    _ops.rmsNormAsync(projOutBuf, T, d_model,
                            static_cast<const float*>(attnPost->usmPtr),
                            _config.rmsNormEps,
                            projOutBuf);            // in-place
@@ -574,7 +574,7 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
     // --- FFN path A — dense SwiGLU with GELU ---------------------------
 
     trace("ffn_norm (path A pre)");
-    _ops.rmsNormGemmaAsync(x, T, d_model,
+    _ops.rmsNormAsync(x, T, d_model,
                            static_cast<const float*>(ffnNorm->usmPtr),
                            _config.rmsNormEps,
                            normBuf);
@@ -595,7 +595,7 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
                 projOutBuf, matmulScratch);
 
     trace("post_ffw_norm_1 (path A post)");
-    _ops.rmsNormGemmaAsync(projOutBuf, T, d_model,
+    _ops.rmsNormAsync(projOutBuf, T, d_model,
                            static_cast<const float*>(ffwPost1->usmPtr),
                            _config.rmsNormEps,
                            projOutBuf);            // in-place
@@ -612,7 +612,7 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
 
     // Step 1: pathB_in (overwrites normBuf — pathA already consumed it).
     trace("path B: pre_ffw_norm_2");
-    _ops.rmsNormGemmaAsync(x, T, d_model,
+    _ops.rmsNormAsync(x, T, d_model,
                            static_cast<const float*>(preNorm2->usmPtr),
                            _config.rmsNormEps,
                            normBuf);
@@ -766,7 +766,7 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
 
     // Step 7: post-norm of path B output.
     trace("path B: post_ffw_norm_2");
-    _ops.rmsNormGemmaAsync(moeAccumBuf, T, d_model,
+    _ops.rmsNormAsync(moeAccumBuf, T, d_model,
                            static_cast<const float*>(postNorm2->usmPtr),
                            _config.rmsNormEps,
                            moeAccumBuf);
@@ -777,7 +777,7 @@ void InferenceEngine::runGemma4Block(std::size_t   blockIdx,
     _ops.addResidualAsync(moeAccumBuf, projOutBuf, T * d_model);
 
     trace("post_ffw_norm (combined)");
-    _ops.rmsNormGemmaAsync(moeAccumBuf, T, d_model,
+    _ops.rmsNormAsync(moeAccumBuf, T, d_model,
                            static_cast<const float*>(ffwPost->usmPtr),
                            _config.rmsNormEps,
                            moeAccumBuf);
@@ -812,22 +812,17 @@ InferenceEngine::sampleNext(const float*                   hidden,
     // produced `hidden`. The subsequent _gmm.matmul flushes and syncs,
     // so CPU argmax sees a fully-resolved logits buffer.
     //
-    // Gemma family uses (1 + weight); everything else uses plain
-    // weight. _arch is set at loadModel, so this branch only fires
-    // once per token.
-    if (_arch == Architecture::Gemma4) {
-        _ops.rmsNormGemmaAsync(
-            hidden, 1, _config.embeddingLength,
-            static_cast<const float*>(outNorm.usmPtr),
-            _config.rmsNormEps,
-            normScratch);
-    } else {
-        _ops.rmsNormAsync(
-            hidden, 1, _config.embeddingLength,
-            static_cast<const float*>(outNorm.usmPtr),
-            _config.rmsNormEps,
-            normScratch);
-    }
+    // Both Qwen and Gemma 4 use plain `w * rms_norm(x)` at runtime:
+    // Gemma 3 stored (1+w) in HF and the converter shifts w_gguf =
+    // w_hf + 1; Gemma 4's converter (gemma.py:621-623) returns
+    // norm_shift = 0.0 because the HF reference uses standard weight
+    // (init at 1.0) — so the GGUF weight is already the multiplicative
+    // scale.
+    _ops.rmsNormAsync(
+        hidden, 1, _config.embeddingLength,
+        static_cast<const float*>(outNorm.usmPtr),
+        _config.rmsNormEps,
+        normScratch);
 
     _gmm.matmul(
         lmHead.type, lmHead.usmPtr,
