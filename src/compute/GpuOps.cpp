@@ -47,12 +47,14 @@ GpuOps::GpuOps(runtime::L0Context& ctx, runtime::CommandQueue& queue)
       _mulScalarModule  {ctx, "mul_scalar"},
       _mulScalarKernel  {_mulScalarModule.kernel("mul_scalar")},
       _geluMulModule    {ctx, "gelu_mul"},
-      _geluMulKernel    {_geluMulModule.kernel("gelu_mul")}
+      _geluMulKernel    {_geluMulModule.kernel("gelu_mul")},
+      _rmsnormGemmaModule{ctx, "rmsnorm_gemma"},
+      _rmsnormGemmaKernel{_rmsnormGemmaModule.kernel("rmsnorm_gemma")}
 {
     MM_LOG_INFO("gpuops",
-                "GpuOps ready — rmsnorm/add_bias/add_residual/silu_mul/rope/"
-                "mul_scalar/gelu_mul loaded (rms local={}, elementwise local={}, "
-                "rope local={})",
+                "GpuOps ready — rmsnorm/rmsnorm_gemma/add_bias/add_residual/"
+                "silu_mul/rope/mul_scalar/gelu_mul loaded (rms local={}, "
+                "elementwise local={}, rope local={})",
                 kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize);
 }
 
@@ -74,6 +76,26 @@ void GpuOps::rmsNormAsync(const float* x,
     _rmsnormKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
     // One workgroup per row.
     _queue.appendLaunch(_rmsnormKernel,
+                        static_cast<std::uint32_t>(M), 1, 1);
+}
+
+void GpuOps::rmsNormGemmaAsync(const float* x,
+                               std::size_t  M,
+                               std::size_t  K,
+                               const float* weight,
+                               float        eps,
+                               float*       y) {
+    if (M == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t Ki = toInt32(K, "rmsNormGemma K");
+    _rmsnormGemmaKernel.setPtr(0, x);
+    _rmsnormGemmaKernel.setPtr(1, weight);
+    _rmsnormGemmaKernel.setPtr(2, y);
+    _rmsnormGemmaKernel.setValue<float>(3, eps);
+    _rmsnormGemmaKernel.setValue<std::int32_t>(4, Ki);
+    _rmsnormGemmaKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
+    _queue.appendLaunch(_rmsnormGemmaKernel,
                         static_cast<std::uint32_t>(M), 1, 1);
 }
 
