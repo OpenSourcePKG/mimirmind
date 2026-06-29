@@ -17,8 +17,9 @@ GpuMatmul::GpuMatmul(runtime::L0Context& ctx)
       _q6kKernel{_q6kModule.kernel("matmul_q6k_vec")}
 {
     MM_LOG_INFO("gpummm",
-                "GpuMatmul ready — Q4_K + Q6_K kernels loaded, local_size={}",
-                kLocalSize);
+                "GpuMatmul ready — Q4_K + Q6_K kernels loaded, local_size={} "
+                "(sg={}, {} outputs/group)",
+                kLocalSize, kSubgroupSize, kOutputsPerGroup);
 }
 
 bool GpuMatmul::supports(model::GgmlType type) const noexcept {
@@ -44,8 +45,9 @@ void GpuMatmul::matmulAsync(model::GgmlType type,
     runtime::GpuKernel& kern = (type == model::GgmlType::Q4_K)
         ? _q4kKernel : _q6kKernel;
 
-    const std::uint32_t groups =
-        static_cast<std::uint32_t>((N + kLocalSize - 1) / kLocalSize);
+    // M5h: 4 outputs per workgroup (4 subgroups × 16 threads).
+    const std::uint32_t groups = static_cast<std::uint32_t>(
+        (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
     kern.setGroupSize(kLocalSize, 1, 1);
 
     // One appendLaunch per row of X. Per the Level Zero spec, args are
