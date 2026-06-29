@@ -46,7 +46,10 @@ class ChatTemplate {
 public:
     enum class Style {
         QwenChatML,   ///< Qwen2 / Qwen2.5 / Qwen3 — <|im_start|>/<|im_end|>.
-        Gemma4,       ///< Gemma 3/4 — <start_of_turn>/<end_of_turn> + bos + role.
+        Gemma3,       ///< Gemma 2/3 — symmetric <start_of_turn>/<end_of_turn>.
+        Gemma4,       ///< Gemma 4 — asymmetric <|turn>/<turn|>. Also has the
+                      ///<              thinking-channel markup <|channel>/<channel|>
+                      ///<              wrapping the model's response.
     };
 
     /// Pick a template style by GGUF `general.architecture`. Throws
@@ -79,6 +82,23 @@ public:
      */
     [[nodiscard]] static std::vector<std::int32_t>
     stopIds(Style style, const Tokenizer& tok);
+
+    /**
+     * Strip style-specific control markup from a freshly-decoded model
+     * response so that what reaches an OpenAI-compatible client is just
+     * the visible content.
+     *
+     *   QwenChatML: no-op, the model's output is already plain text.
+     *   Gemma3:     trim trailing <end_of_turn> if it slipped through.
+     *   Gemma4:     drop the leading <|channel>thought\n<channel|> wrapper
+     *               (Gemma 4 emits an empty thinking channel even when
+     *               thinking mode is off), drop a trailing <turn|>.
+     *
+     * Safe to call on partial / streaming chunks: leading wrapper is only
+     * removed when fully present in the input.
+     */
+    [[nodiscard]] static std::string
+    cleanResponse(Style style, std::string_view text);
 };
 
 } // namespace mimirmind::model

@@ -20,13 +20,22 @@ constexpr std::string_view kQwenImEnd   = "<|im_end|>";
 constexpr std::string_view kQwenDefaultSystem =
     "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
 
-// Gemma 4 introduced its own asymmetric turn markers (different from
-// Gemma 2/3's <start_of_turn>/<end_of_turn>). The official HF Jinja
-// template emits these literal tokens:
-constexpr std::string_view kGemmaStartOfTurn = "<|turn>";
-constexpr std::string_view kGemmaEndOfTurn   = "<turn|>";
+// Gemma 2/3 use the symmetric <start_of_turn>/<end_of_turn> tokens;
+// Gemma 4 dropped these in favour of the asymmetric <|turn>/<turn|>
+// pair, plus a thinking-channel wrapper. Keep both — the chat-template
+// dispatch picks the right pair per Style.
+constexpr std::string_view kGemma3StartOfTurn = "<start_of_turn>";
+constexpr std::string_view kGemma3EndOfTurn   = "<end_of_turn>";
 
-/// Gemma 3/4 chat roles. The HF Jinja template emits "user" / "model"
+constexpr std::string_view kGemma4StartOfTurn = "<|turn>";
+constexpr std::string_view kGemma4EndOfTurn   = "<turn|>";
+
+/// Markup that Gemma 4 emits at the start of every model response,
+/// wrapping an (often empty) thinking-channel block.
+constexpr std::string_view kGemma4ChannelStart = "<|channel>";
+constexpr std::string_view kGemma4ChannelEnd   = "<channel|>";
+
+/// Gemma 3/4 chat roles. The HF Jinja templates emit "user" / "model"
 /// (NOT "assistant"). System messages are prepended to the first user
 /// message because Gemma's training data does not natively use a
 /// separate system turn.
@@ -110,22 +119,27 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     return ids;
 }
 
-/// Gemma 3 / Gemma 4 chat template (mirrors the HF Jinja template).
+/// Shared encoder for Gemma 2/3 and Gemma 4 chat templates — they only
+/// differ in the literal turn-marker token strings, so the algorithm
+/// is identical. The caller passes the right pair via `startOfTurnText`
+/// / `endOfTurnText`.
 ///
-/// Format:
+/// Format (with placeholders substituted):
 ///   <bos>
-///   <start_of_turn>user\n{user_content}<end_of_turn>\n
-///   <start_of_turn>model\n{model_content}<end_of_turn>\n
+///   {sot}user\n{user_content}{eot}\n
+///   {sot}model\n{model_content}{eot}\n
 ///   ...
-///   <start_of_turn>model\n              (when addGenerationPrompt)
+///   {sot}model\n                                (when addGenerationPrompt)
 ///
 /// System messages are prepended to the first user turn separated by a
 /// blank line — Gemma was not trained with a separate system role.
-std::vector<std::int32_t> encodeGemma4(const Tokenizer&             tok,
-                                       std::span<const ChatMessage> messages,
-                                       bool                         addGenerationPrompt) {
-    const std::int32_t startOfTurn = requireToken(tok, kGemmaStartOfTurn);
-    const std::int32_t endOfTurn   = requireToken(tok, kGemmaEndOfTurn);
+std::vector<std::int32_t> encodeGemmaImpl(const Tokenizer&             tok,
+                                          std::span<const ChatMessage> messages,
+                                          bool                         addGenerationPrompt,
+                                          std::string_view             startOfTurnText,
+                                          std::string_view             endOfTurnText) {
+    const std::int32_t startOfTurn = requireToken(tok, startOfTurnText);
+    const std::int32_t endOfTurn   = requireToken(tok, endOfTurnText);
     const std::int32_t bosId       = tok.bosId();
 
     std::vector<std::int32_t> ids;
@@ -181,6 +195,20 @@ std::vector<std::int32_t> encodeGemma4(const Tokenizer&             tok,
     return ids;
 }
 
+std::vector<std::int32_t> encodeGemma3(const Tokenizer&             tok,
+                                       std::span<const ChatMessage> messages,
+                                       bool                         addGenerationPrompt) {
+    return encodeGemmaImpl(tok, messages, addGenerationPrompt,
+                           kGemma3StartOfTurn, kGemma3EndOfTurn);
+}
+
+std::vector<std::int32_t> encodeGemma4(const Tokenizer&             tok,
+                                       std::span<const ChatMessage> messages,
+                                       bool                         addGenerationPrompt) {
+    return encodeGemmaImpl(tok, messages, addGenerationPrompt,
+                           kGemma4StartOfTurn, kGemma4EndOfTurn);
+}
+
 } // namespace
 
 std::string_view chatRoleName(ChatRole r) noexcept {
@@ -207,14 +235,20 @@ ChatTemplate::detectFromArch(std::string_view architecture) {
     if (arch.rfind("qwen", 0) == 0) {
         return Style::QwenChatML;
     }
-    // Gemma 3 and Gemma 4 share the <start_of_turn>/<end_of_turn> template.
-    if (arch == "gemma4" || arch == "gemma3") {
+    // Gemma 2 and Gemma 3 share <start_of_turn>/<end_of_turn> — they
+    // also share the role/role naming. Gemma 2 GGUFs report arch
+    // "gemma2"; Gemma 3 reports "gemma3".
+    if (arch == "gemma2" || arch == "gemma3") {
+        return Style::Gemma3;
+    }
+    // Gemma 4 dropped the symmetric tokens for <|turn>/<turn|>.
+    if (arch == "gemma4") {
         return Style::Gemma4;
     }
     throw std::runtime_error(
         "ChatTemplate: no hardcoded chat template for architecture '" +
         std::string{architecture} +
-        "' yet — supported: qwen*, gemma3, gemma4");
+        "' yet — supported: qwen*, gemma2, gemma3, gemma4");
 }
 
 std::vector<std::int32_t>
@@ -225,6 +259,8 @@ ChatTemplate::encode(Style                        style,
     switch (style) {
         case Style::QwenChatML:
             return encodeQwen(tok, messages, addGenerationPrompt);
+        case Style::Gemma3:
+            return encodeGemma3(tok, messages, addGenerationPrompt);
         case Style::Gemma4:
             return encodeGemma4(tok, messages, addGenerationPrompt);
     }
@@ -242,8 +278,15 @@ ChatTemplate::stopIds(Style style, const Tokenizer& tok) {
             }
             break;
         }
+        case Style::Gemma3: {
+            const std::int32_t endOfTurn = tok.findToken(kGemma3EndOfTurn);
+            if (endOfTurn >= 0) {
+                ids.push_back(endOfTurn);
+            }
+            break;
+        }
         case Style::Gemma4: {
-            const std::int32_t endOfTurn = tok.findToken(kGemmaEndOfTurn);
+            const std::int32_t endOfTurn = tok.findToken(kGemma4EndOfTurn);
             if (endOfTurn >= 0) {
                 ids.push_back(endOfTurn);
             }
@@ -251,6 +294,77 @@ ChatTemplate::stopIds(Style style, const Tokenizer& tok) {
         }
     }
     return ids;
+}
+
+namespace {
+
+/// Drop one occurrence of `needle` from the start of `s`, then drop any
+/// leading whitespace that follows. Returns true if removed.
+bool stripLeading(std::string& s, std::string_view needle) {
+    if (s.size() < needle.size() ||
+        std::string_view(s).substr(0, needle.size()) != needle) {
+        return false;
+    }
+    s.erase(0, needle.size());
+    while (!s.empty() && (s.front() == '\n' || s.front() == ' ' || s.front() == '\t')) {
+        s.erase(0, 1);
+    }
+    return true;
+}
+
+/// Drop one trailing occurrence of `needle`, plus any trailing whitespace.
+bool stripTrailing(std::string& s, std::string_view needle) {
+    while (!s.empty() && (s.back() == '\n' || s.back() == ' ' || s.back() == '\t')) {
+        s.pop_back();
+    }
+    if (s.size() < needle.size()) {
+        return false;
+    }
+    const auto offset = s.size() - needle.size();
+    if (std::string_view(s).substr(offset, needle.size()) != needle) {
+        return false;
+    }
+    s.erase(offset);
+    while (!s.empty() && (s.back() == '\n' || s.back() == ' ' || s.back() == '\t')) {
+        s.pop_back();
+    }
+    return true;
+}
+
+} // namespace
+
+std::string
+ChatTemplate::cleanResponse(Style style, std::string_view text) {
+    std::string out{text};
+    switch (style) {
+        case Style::QwenChatML:
+            // Decoder already drops <|im_end|> via stopIds; nothing else
+            // structural sits in the visible content.
+            return out;
+        case Style::Gemma3:
+            stripTrailing(out, kGemma3EndOfTurn);
+            return out;
+        case Style::Gemma4: {
+            // Gemma 4 emits <|channel>thought\n<channel|> at the very
+            // start of every response, even when thinking mode is off
+            // (then the channel is empty). Drop the whole wrapper.
+            if (stripLeading(out, kGemma4ChannelStart)) {
+                // Now skip the channel-tag name + newline up to <channel|>.
+                const auto end = out.find(kGemma4ChannelEnd);
+                if (end != std::string::npos) {
+                    out.erase(0, end + kGemma4ChannelEnd.size());
+                }
+                while (!out.empty() && (out.front() == '\n' ||
+                                        out.front() == ' '  ||
+                                        out.front() == '\t')) {
+                    out.erase(0, 1);
+                }
+            }
+            stripTrailing(out, kGemma4EndOfTurn);
+            return out;
+        }
+    }
+    return out;
 }
 
 } // namespace mimirmind::model

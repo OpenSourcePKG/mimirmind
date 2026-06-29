@@ -464,7 +464,9 @@ struct ApiServer::Impl {
             hitStop = true;
         }
 
-        const std::string text = tok.decode(visible, /*skipSpecial=*/true);
+        const std::string rawText  = tok.decode(visible, /*skipSpecial=*/true);
+        const std::string text     = model::ChatTemplate::cleanResponse(
+            chatStyle, rawText);
 
         const std::string respId = makeRequestId();
         const std::int64_t now   = unixNow();
