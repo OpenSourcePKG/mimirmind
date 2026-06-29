@@ -8,9 +8,9 @@
 
 namespace mimirmind::compute {
 
-GpuMatmul::GpuMatmul(runtime::L0Context& ctx)
+GpuMatmul::GpuMatmul(runtime::L0Context& ctx, runtime::CommandQueue& queue)
     : _ctx{ctx},
-      _queue{ctx},
+      _queue{queue},
       _q4kModule{ctx, "matmul_q4k_vec"},
       _q4kKernel{_q4kModule.kernel("matmul_q4k_vec")},
       _q6kModule{ctx, "matmul_q6k_vec"},

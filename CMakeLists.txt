@@ -80,6 +80,9 @@ set(KERNEL_SOURCES
     kernels/rmsnorm.cl
     kernels/matmul_q4k_vec.cl
     kernels/matmul_q6k_vec.cl
+    kernels/add_bias.cl
+    kernels/add_residual.cl
+    kernels/silu_mul.cl
 )
 
 set(KERNEL_SPV_FILES "")
@@ -120,6 +123,7 @@ add_executable(mimirmind
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
     src/compute/GpuMatmul.cpp
+    src/compute/GpuOps.cpp
     src/compute/Matmul.cpp
     src/compute/Norm.cpp
     src/compute/Rope.cpp

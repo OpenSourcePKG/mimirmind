@@ -1,11 +1,13 @@
 #pragma once
 
 #include "compute/GpuMatmul.hpp"
+#include "compute/GpuOps.hpp"
 #include "compute/Sampling.hpp"
 #include "model/GgufReader.hpp"
 #include "model/LlmConfig.hpp"
 #include "model/Tokenizer.hpp"
 #include "model/WeightsMap.hpp"
+#include "runtime/CommandQueue.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/UsmAllocator.hpp"
 #include "runtime/UsmHandle.hpp"
@@ -146,7 +148,9 @@ private:
 
     L0Context                          _ctx;
     UsmAllocator                       _allocator;
+    CommandQueue                       _queue;
     compute::GpuMatmul                 _gmm;
+    compute::GpuOps                    _ops;
     compute::Sampler                   _sampler{};
 
     model::GgufReader                  _reader;

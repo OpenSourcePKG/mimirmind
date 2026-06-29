@@ -18,13 +18,15 @@ namespace mimirmind::compute {
  * for the weight types we have kernels for (Q4_K, Q6_K). For unsupported
  * types it falls back to the scalar CPU compute::matmul.
  *
- * Owns the SPIR-V modules + kernels + a single command queue. Not
+ * Owns the SPIR-V modules + kernels. The command queue is shared with
+ * the rest of the engine (passed in by reference) so element-wise GPU
+ * ops can be appended into the same command list as matmuls. Not
  * thread-safe (the underlying ze_kernel_handle_t is mutated by
  * setArgumentValue). Construct once at startup, share across the engine.
  */
 class GpuMatmul {
 public:
-    explicit GpuMatmul(runtime::L0Context& ctx);
+    GpuMatmul(runtime::L0Context& ctx, runtime::CommandQueue& queue);
     ~GpuMatmul() = default;
 
     GpuMatmul(const GpuMatmul&)            = delete;
@@ -75,7 +77,7 @@ public:
 
 private:
     runtime::L0Context&    _ctx;
-    runtime::CommandQueue  _queue;
+    runtime::CommandQueue& _queue;
     runtime::GpuModule     _q4kModule;
     runtime::GpuKernel     _q4kKernel;
     runtime::GpuModule     _q6kModule;
