@@ -286,13 +286,14 @@ void InferenceEngine::runTransformerBlock(std::size_t   blockIdx,
 }
 
 std::int32_t
-InferenceEngine::sampleArgmax(const float*             hidden,
-                              std::size_t              vocab_lm,
-                              const model::GgufTensor& outNorm,
-                              const model::GgufTensor& lmHead,
-                              float*                   normScratch,
-                              float*                   logits,
-                              float*                   matmulScratch) {
+InferenceEngine::sampleNext(const float*                   hidden,
+                            std::size_t                    vocab_lm,
+                            const model::GgufTensor&       outNorm,
+                            const model::GgufTensor&       lmHead,
+                            float*                         normScratch,
+                            float*                         logits,
+                            float*                         matmulScratch,
+                            const compute::SamplingParams& sampling) {
     compute::rmsNorm(
         hidden, 1, _config.embeddingLength,
         static_cast<const float*>(outNorm.usmPtr),
@@ -305,15 +306,8 @@ InferenceEngine::sampleArgmax(const float*             hidden,
         normScratch, 1,
         logits, matmulScratch);
 
-    std::int32_t best  = 0;
-    float        bestV = logits[0];
-    for (std::size_t i = 1; i < vocab_lm; ++i) {
-        if (logits[i] > bestV) {
-            bestV = logits[i];
-            best  = static_cast<std::int32_t>(i);
-        }
-    }
-    return best;
+    return _sampler.sample(
+        std::span<const float>{logits, vocab_lm}, sampling);
 }
 
 std::vector<std::int32_t>
@@ -403,11 +397,28 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
 
     _traceBlock0 = false;  // diagnostic done; mute for further calls
 
+    // Reseed the sampler per generate() call so deterministic seeds
+    // produce reproducible streams. seed == 0 ⇒ random_device internally.
+    _sampler.reseed(params.sampling.seed);
+
+    auto isStop = [&](std::int32_t id) -> bool {
+        if (id == _tokenizer.eosId()) {
+            return true;
+        }
+        for (auto s : params.stopIds) {
+            if (id == s) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     // Sample first new token from the last prefill row.
     const float* lastRow = xBuf + (Tp - 1) * d_model;
-    std::int32_t nextId = sampleArgmax(lastRow, vocab_lm,
-                                       *outNorm, *lmHead,
-                                       normFinal, logits, logitsSc);
+    std::int32_t nextId = sampleNext(lastRow, vocab_lm,
+                                     *outNorm, *lmHead,
+                                     normFinal, logits, logitsSc,
+                                     params.sampling);
 
     std::vector<std::int32_t> generated;
     generated.reserve(maxNew);
@@ -427,7 +438,7 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
          !aborted && step < maxNew && cache.length() < cacheMax;
          ++step)
     {
-        if (nextId == _tokenizer.eosId()) {
+        if (isStop(nextId)) {
             hitEos = true;
             break;
         }
@@ -443,9 +454,10 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
         }
         cache.commit(1);
 
-        nextId = sampleArgmax(xBuf, vocab_lm,
-                              *outNorm, *lmHead,
-                              normFinal, logits, logitsSc);
+        nextId = sampleNext(xBuf, vocab_lm,
+                            *outNorm, *lmHead,
+                            normFinal, logits, logitsSc,
+                            params.sampling);
         generated.push_back(nextId);
 
         if (onToken && !onToken(nextId)) {

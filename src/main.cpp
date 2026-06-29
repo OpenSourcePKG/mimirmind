@@ -53,6 +53,10 @@ constexpr const char* kUsage =
     "  --port N           HTTP port for serve mode (default 8080)\n"
     "  --prompt TEXT      Prompt for smoke generate (default \"Hello, world!\")\n"
     "  --max-new N        Max new tokens for smoke generate (default 20)\n"
+    "  --temperature F    Sampling temperature, 0 = greedy (default 0)\n"
+    "  --top-k N          Top-K cutoff, 0 = disabled (default 0)\n"
+    "  --top-p F          Top-P (nucleus) cutoff, 1.0 = disabled (default 1.0)\n"
+    "  --seed N           RNG seed, 0 = random_device (default 0)\n"
     "  -h, --help         Show this help and exit\n";
 
 enum class Mode {
@@ -61,11 +65,15 @@ enum class Mode {
 };
 
 struct CliArgs {
-    Mode        mode{Mode::Smoke};
-    std::string modelPath;
-    std::string prompt{"Hello, world!"};
-    std::size_t maxNew{20};
+    Mode          mode{Mode::Smoke};
+    std::string   modelPath;
+    std::string   prompt{"Hello, world!"};
+    std::size_t   maxNew{20};
     std::uint16_t port{8080};
+    float         temperature{0.0F};
+    std::size_t   topK{0};
+    float         topP{1.0F};
+    std::uint64_t seed{0};
 };
 
 [[nodiscard]] bool parseArgs(int argc, char** argv, CliArgs& out) {
@@ -116,6 +124,22 @@ struct CliArgs {
             const char* v = needValue("--port");
             if (v == nullptr) return false;
             out.port = static_cast<std::uint16_t>(std::strtoul(v, nullptr, 10));
+        } else if (a == "--temperature") {
+            const char* v = needValue("--temperature");
+            if (v == nullptr) return false;
+            out.temperature = std::strtof(v, nullptr);
+        } else if (a == "--top-k") {
+            const char* v = needValue("--top-k");
+            if (v == nullptr) return false;
+            out.topK = static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
+        } else if (a == "--top-p") {
+            const char* v = needValue("--top-p");
+            if (v == nullptr) return false;
+            out.topP = std::strtof(v, nullptr);
+        } else if (a == "--seed") {
+            const char* v = needValue("--seed");
+            if (v == nullptr) return false;
+            out.seed = std::strtoull(v, nullptr, 10);
         } else {
             std::cerr << "unknown argument '" << a << "'\n" << kUsage;
             return false;
@@ -803,8 +827,7 @@ void runM4aEmbedAndM4bLmHead(mimirmind::runtime::InferenceEngine& engine) {
 // ---- M4d/M4e prefill + autoregressive generation ---------------------------
 
 void runM4deGenerate(mimirmind::runtime::InferenceEngine& engine,
-                     const std::string&                   prompt,
-                     std::size_t                          maxNew) {
+                     const CliArgs&                       args) {
     namespace mm = mimirmind;
 
     std::cout << "\n[M4d/M4e] Prefill + autoregressive generation\n";
@@ -812,19 +835,32 @@ void runM4deGenerate(mimirmind::runtime::InferenceEngine& engine,
     MM_LOG_INFO("main", "[M4d/M4e] starting full forward + decode");
 
     const auto& tok = engine.tokenizer();
-    const auto promptIds = tok.encode(prompt, false);
+    const auto promptIds = tok.encode(args.prompt, false);
     if (promptIds.empty()) {
         std::cout << "  empty prompt, skipping\n";
         return;
     }
 
-    std::cout << "  prompt   : \"" << prompt
-              << "\" -> " << promptIds.size() << " tokens (max_gen=" << maxNew << ")\n";
+    std::cout << "  prompt   : \"" << args.prompt
+              << "\" -> " << promptIds.size() << " tokens (max_gen="
+              << args.maxNew << ")\n";
+    if (args.temperature > 0.0F) {
+        std::cout << "  sampling : temp=" << args.temperature
+                  << " top_k=" << args.topK
+                  << " top_p=" << args.topP
+                  << " seed=" << args.seed << "\n";
+    } else {
+        std::cout << "  sampling : greedy (argmax)\n";
+    }
     std::cout << "  text     : '" << tok.decode(promptIds, false)
               << "' >>>" << std::flush;
 
     mm::runtime::GenerateParams params{};
-    params.maxNewTokens = maxNew;
+    params.maxNewTokens         = args.maxNew;
+    params.sampling.temperature = args.temperature;
+    params.sampling.topK        = args.topK;
+    params.sampling.topP        = args.topP;
+    params.sampling.seed        = args.seed;
 
     auto onToken = [&](std::int32_t id) -> bool {
         std::cout << tok.decode(std::span<const std::int32_t>(&id, 1), true)
@@ -892,7 +928,7 @@ int runSmoke(const CliArgs& args) {
 
         runM4aEmbedAndM4bLmHead(engine);
 
-        runM4deGenerate(engine, args.prompt, args.maxNew);
+        runM4deGenerate(engine, args);
     }
 
     const auto lim = engine.allocator().limits();
