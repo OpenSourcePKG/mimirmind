@@ -96,9 +96,10 @@ services:
         volumes:
             - ./models:/models:ro
 
-        # M7+ — OpenAI-compatible HTTP API
-        # ports:
-        #     - "8090:8090"
+        # M7d — OpenAI-compatible HTTP API. Default container port is 8080;
+        # remap on the host as needed.
+        ports:
+            - "8080:8080"
 
         restart: "no"
         stdin_open: true

@@ -140,6 +140,7 @@ add_executable(mimirmind
     src/runtime/Log.cpp
     src/runtime/MappedFile.cpp
     src/runtime/UsmAllocator.cpp
+    src/server/ApiServer.cpp
 )
 
 add_dependencies(mimirmind spv_kernels)
@@ -149,6 +150,17 @@ target_include_directories(mimirmind PRIVATE
     ${LEVEL_ZERO_INCLUDE_DIR}
 )
 
+# Vendored single-header libraries (cpp-httplib, nlohmann/json). SYSTEM
+# so upstream code does not trip our strict warning flags.
+target_include_directories(mimirmind SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+)
+
+# cpp-httplib pulls in <thread> and <pthread> for its server loop.
+find_package(Threads REQUIRED)
+
 target_link_libraries(mimirmind PRIVATE
     ${LEVEL_ZERO_LIBRARY}
+    Threads::Threads
 )
