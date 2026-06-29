@@ -1010,7 +1010,7 @@ void runM4deGenerate(mimirmind::runtime::InferenceEngine& engine,
 
     std::cout << "<<<\n";
     std::cout << "  generated: " << stats.generatedTokens << " token(s)"
-              << (stats.hitEos ? " (hit EOS)" : "") << "\n";
+              << (stats.hitStop ? " (hit stop)" : "") << "\n";
     std::cout << "  prefill  : " << stats.prefillMs << " ms ("
               << stats.promptTokens << " tokens, "
               << engine.config().blockCount << " blocks)\n";

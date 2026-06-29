@@ -44,7 +44,10 @@ struct GenerateStats {
     std::size_t generatedTokens{0};
     double      prefillMs{0.0};
     double      decodeMs{0.0};
-    bool        hitEos{false};
+    /// True if the decode loop broke because of a stop token (tokenizer
+    /// EOS, chat-template stop, or user-supplied stop). False means we
+    /// hit `maxNewTokens`.
+    bool        hitStop{false};
 };
 
 /**
@@ -152,9 +155,11 @@ private:
     std::optional<model::WeightsMap>   _weights;
     bool                               _modelLoaded{false};
 
-    // One-shot block-0 trace, gated to first call after load so server
-    // mode doesn't spam per-request.
-    bool                               _traceBlock0{true};
+    // One-shot block-0 trace. Default off so production serve mode is
+    // quiet; set MIMIRMIND_TRACE_BLOCK0=1 to enable when bringing up a
+    // new architecture handler. Flips to false after the first call so
+    // even an enabled trace only fires once per process.
+    bool                               _traceBlock0{false};
 };
 
 } // namespace mimirmind::runtime
