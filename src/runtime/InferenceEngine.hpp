@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -23,6 +24,10 @@
 namespace mimirmind::runtime {
 
 class KvCache;
+
+namespace arch {
+class ArchBackend;
+} // namespace arch
 
 /**
  * Sampling + generation knobs. Default is greedy/argmax — sampling.temperature
@@ -55,8 +60,9 @@ struct GenerateStats {
 /**
  * Long-lived inference state: Level-Zero context, USM allocator, GPU
  * matmul dispatcher, plus the currently loaded model (GGUF tensors,
- * config, tokenizer, weights index). Constructed once, serves many
- * generate() calls (one at a time — KV cache is built per call for now).
+ * config, tokenizer, weights index, per-arch backend). Constructed once,
+ * serves many generate() calls (one at a time — KV cache is built per
+ * call for now).
  *
  * Lifetime + ownership:
  *   ctor: brings up L0 + USM (probeLimits) + GpuMatmul. Does NOT load
@@ -109,60 +115,6 @@ public:
     [[nodiscard]] const model::WeightsMap& weights()   const;
 
 private:
-    /// Per-call transformer-block scratch in USM.
-    struct BlockBuffers {
-        std::size_t maxT{0};
-        std::size_t maxSeq{0};
-        std::size_t d_model{0};
-        std::size_t q_dim{0};
-        std::size_t ff_dim{0};
-
-        UsmHandle qBuf;          // [maxT, q_dim]
-        UsmHandle normBuf;       // [maxT, d_model]
-        UsmHandle attnOut;       // [maxT, q_dim]
-        UsmHandle projOut;       // [maxT, d_model]
-        UsmHandle gateOut;       // [maxT, max(ff_dim, gate_up_per_expert)]
-        UsmHandle upOut;         // [maxT, ff_dim]
-        UsmHandle matmulScratch; // max(d_model, q_dim, ff_dim)
-        UsmHandle scoreScratch;  // [maxSeq]
-
-        // Gemma 4 Path B (MoE) scratch. Zero-sized for non-MoE blocks.
-        UsmHandle moeAccumBuf;   // [maxT, d_model]   weighted sum of experts
-        UsmHandle expertOutBuf;  // [maxT, d_model]   per-expert down output
-    };
-
-    BlockBuffers allocBlockBuffers(std::size_t maxT, std::size_t maxSeq);
-
-    /// Internal architecture tag. Set at loadModel based on
-    /// _config.architecture; controls which runXxxBlock variant
-    /// generate() dispatches per layer.
-    enum class Architecture {
-        Qwen2,       ///< Qwen2 / Qwen2.5 / llama-family decoder block
-        Gemma4,      ///< Gemma 4 26B-A4B-it — hybrid dense+MoE, Q-K-norm
-        Unsupported, ///< Loader works but forward is not implemented
-    };
-
-    /// Qwen2 / Qwen2.5 / llama-family block forward. RMSNorm → Q/K/V
-    /// proj → RoPE → causal multi-head attention (GQA) → O proj →
-    /// residual → RMSNorm → SwiGLU FFN (gate * silu(up)) → residual.
-    void runQwen2Block(std::size_t   blockIdx,
-                       float*        x,
-                       std::size_t   T,
-                       KvCache&      cache,
-                       BlockBuffers& s);
-
-    /// Gemma 4 hybrid dense+MoE block forward — skeleton, throws.
-    /// Real implementation lands incrementally in M8.3 (Q-K-norm +
-    /// multi-norm choreography), M8.4 (sliding-window attention),
-    /// M8.5 (dense FFN), M8.6 (MoE routing + experts), M8.7
-    /// (integration + CPU‖GPU split). See
-    /// Memory/mimirmind/research/m8-gemma4-staging.md.
-    void runGemma4Block(std::size_t   blockIdx,
-                        float*        x,
-                        std::size_t   T,
-                        KvCache&      cache,
-                        BlockBuffers& s);
-
     /// Compute logits over the last hidden state row via final-norm +
     /// lm_head, then draw one token id using `_sampler` and `params`.
     std::int32_t sampleNext(const float*                  hidden,
@@ -185,15 +137,8 @@ private:
     model::LlmConfig                   _config;
     model::Tokenizer                   _tokenizer;
     std::optional<model::WeightsMap>   _weights;
-    Architecture                       _arch{Architecture::Unsupported};
+    std::unique_ptr<arch::ArchBackend> _backend;
     bool                               _modelLoaded{false};
-
-    // Gemma 4 has KV-sharing: some blocks don't carry attn_k.weight /
-    // attn_v.weight and instead read K/V from an earlier block's cache.
-    // _gemma4KvSource[b] is `b` if block has its own K/V, else the
-    // most recent block index that does. Populated at loadModel only
-    // when arch == Gemma4; empty for other architectures.
-    std::vector<std::size_t>           _gemma4KvSource;
 
     // One-shot block-0 trace. Default off so production serve mode is
     // quiet; set MIMIRMIND_TRACE_BLOCK0=1 to enable when bringing up a
