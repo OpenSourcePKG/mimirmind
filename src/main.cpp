@@ -15,15 +15,19 @@
 #include "runtime/Log.hpp"
 #include "runtime/UsmAllocator.hpp"
 #include "runtime/UsmHandle.hpp"
+#include "server/ApiServer.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -1069,7 +1073,16 @@ int runSmoke(const CliArgs& args) {
     return 0;
 }
 
-// ---- Serve driver (M7d stub) -----------------------------------------------
+// ---- Serve driver (M7d) ----------------------------------------------------
+
+// Held in the SIGINT handler so a Ctrl-C asks the listener to drain.
+std::atomic<mimirmind::server::ApiServer*> g_runningServer{nullptr};
+
+extern "C" void signalStop(int /*sig*/) {
+    if (auto* s = g_runningServer.load(std::memory_order_acquire)) {
+        s->stop();
+    }
+}
 
 int runServe(const CliArgs& args) {
     std::cout << kBanner;
@@ -1084,11 +1097,36 @@ int runServe(const CliArgs& args) {
     mimirmind::runtime::InferenceEngine engine;
     engine.loadModel(args.modelPath);
 
-    MM_LOG_WARN("main",
-                "serve: HTTP listener not implemented yet (M7d). Engine is "
-                "loaded; exiting cleanly. Use 'mimirmind smoke' for now.");
-    std::cout << "\n[M7d] HTTP server not implemented yet — "
-                 "model loaded OK on port " << args.port << " (intended).\n";
+    mimirmind::server::ServerConfig cfg{};
+    cfg.host    = "0.0.0.0";
+    cfg.port    = args.port;
+    cfg.modelId = std::filesystem::path{args.modelPath}.stem().string();
+
+    mimirmind::server::ApiServer server{engine, cfg};
+
+    g_runningServer.store(&server, std::memory_order_release);
+    std::signal(SIGINT,  signalStop);
+    std::signal(SIGTERM, signalStop);
+
+    std::cout << "\n[M7d] OpenAI-compatible HTTP API listening on "
+              << cfg.host << ":" << cfg.port
+              << "\n  GET  /health\n"
+                 "  GET  /v1/models\n"
+                 "  POST /v1/chat/completions  (stream=true => 501 until M7e)\n"
+                 "  model id: " << cfg.modelId << "\n  Ctrl-C to stop.\n";
+    std::cout.flush();
+
+    try {
+        server.run();
+    } catch (const std::exception& e) {
+        g_runningServer.store(nullptr, std::memory_order_release);
+        MM_LOG_ERROR("main", "serve: {}", e.what());
+        std::cerr << "serve failed: " << e.what() << "\n";
+        return 1;
+    }
+    g_runningServer.store(nullptr, std::memory_order_release);
+
+    MM_LOG_INFO("main", "serve: stopped cleanly");
     return 0;
 }
 
