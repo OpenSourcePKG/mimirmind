@@ -209,6 +209,29 @@ add_executable(quant_tests
     src/runtime/Log.cpp
 )
 
-target_include_directories(quant_tests PRIVATE src)
+target_include_directories(quant_tests PRIVATE src tests)
 
 target_link_libraries(quant_tests PRIVATE Threads::Threads)
+
+# ---- arch_tests — pure-CPU tests for arch-related logic ---------------------
+#
+# Covers the testable surface of the architecture backends without GPU:
+#   - isSupportedArchitecture()  string predicate
+#   - compute::softmaxRows       row-wise stable softmax + causal mask
+#   - compute::multiHeadAttention  GQA causal MHA (pure CPU, double-acc)
+#
+# Building runBlock() of the concrete backends would need real USM + SPV
+# modules — that stays an integration test, not in this binary.
+#
+# Run via:   cmake --build build --target arch_tests && build/arch_tests
+
+add_executable(arch_tests
+    tests/arch_tests.cpp
+    src/compute/Attention.cpp
+    src/compute/Softmax.cpp
+    src/runtime/Log.cpp
+)
+
+target_include_directories(arch_tests PRIVATE src tests)
+
+target_link_libraries(arch_tests PRIVATE Threads::Threads)
