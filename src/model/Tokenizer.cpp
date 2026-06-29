@@ -157,6 +157,20 @@ void Tokenizer::loadFromGguf(const GgufReader& reader) {
     }
     MM_LOG_INFO("tok", "tokenizer.ggml.model = '{}'", _modelType);
 
+    // Decide dispatcher once. Anything not 'gpt2' goes through SPM —
+    // 'llama', 'gemma', 'gemma4' all use SentencePiece with the ▁ marker
+    // and produce identical encodings via our SPM path. Log unknown
+    // models exactly once so the encode loop stays quiet.
+    if (_modelType != "gpt2" &&
+        _modelType != "llama" &&
+        _modelType != "gemma" &&
+        _modelType != "gemma4" &&
+        !_modelType.empty()) {
+        MM_LOG_INFO("tok",
+                    "tokenizer model '{}' not in recognised list — using SPM dispatch",
+                    _modelType);
+    }
+
     const auto* tokensArr = asArray(reader.findMetadata("tokenizer.ggml.tokens"));
     if (tokensArr == nullptr || tokensArr->elementType != GgufValueType::String) {
         MM_LOG_ERROR("tok", "tokenizer.ggml.tokens missing or not a string array");
@@ -231,13 +245,6 @@ std::vector<std::int32_t> Tokenizer::encode(std::string_view text, bool addBos) 
     }
     if (_modelType == "gpt2") {
         return encodeGpt2(text, addBos);
-    }
-    // Default to SPM for "llama", empty, or anything else we haven't
-    // taught the dispatcher about yet.
-    if (_modelType != "llama" && !_modelType.empty()) {
-        MM_LOG_WARN("tok",
-                    "tokenizer model '{}' not recognised — falling back to SPM",
-                    _modelType);
     }
     return encodeSpm(text, addBos);
 }
