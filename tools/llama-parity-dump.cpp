@@ -12,9 +12,10 @@
 //   f32  data[T * d_model]   // token-major (row 0 = first token)
 //
 // Invocation:
-//   llama-parity-dump --model PATH --prompt "Hello, world!" \
-//       --dump-dir /tmp/dumps/llama
+//   llama-parity-dump --model PATH --prompt "Hello, world!"
+//                     --dump-dir /tmp/dumps/llama
 
+#include "arg.h"
 #include "common.h"
 #include "llama.h"
 #include "log.h"
