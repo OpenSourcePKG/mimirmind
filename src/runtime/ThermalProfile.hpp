@@ -36,8 +36,21 @@ struct ThermalProfile {
     // Cap on the pacing pause when the package is at or beyond hard.
     int                        package_throttle_max_ms{200};
 
+    // Target package temperature for the GPU clock governor. When set
+    // AND a writable /sys/class/drm/card*/gt_max_freq_mhz is available,
+    // mimirmind dynamically lowers the iGPU's max frequency to keep
+    // the package at or below this temperature. Lives in the same
+    // profile as the soft/hard thresholds because tuning all three
+    // together is the natural workflow: target should sit below soft,
+    // so the per-token pacing only triggers if the governor cannot
+    // keep up.
+    std::optional<float>       gpu_target_temp_c;
+
     [[nodiscard]] bool hasPackageLimits() const noexcept {
         return package_temp_soft_c.has_value() && package_temp_hard_c.has_value();
+    }
+    [[nodiscard]] bool hasGpuClockTarget() const noexcept {
+        return gpu_target_temp_c.has_value();
     }
 };
 

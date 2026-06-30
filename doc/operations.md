@@ -176,6 +176,121 @@ Two example profiles live under `examples/`:
   a tower with proper cooling, intended as a "trust the silicon"
   baseline.
 
+## GPU clock governor
+
+The per-token pacing in the thermal guard works, but the latency
+profile is bursty — full-speed compute then idle pauses. For
+sustained workloads (long generations, RAG with big context) the
+nicer answer is to **lower the iGPU max frequency continuously**
+so the chip generates less heat per second to begin with. That is
+what the GPU clock governor does.
+
+The governor reads the iGPU's hardware frequency envelope from
+`/sys/class/drm/cardN/gt_RP0_freq_mhz` (max) and `gt_RPn_freq_mhz`
+(min) at startup, then writes `gt_max_freq_mhz` dynamically based
+on the package temperature. The control loop is a P-controller:
+
+```
+error = current_temp_c - target_temp_c
+new_cap_mhz = current_cap_mhz - error * 50
+new_cap_mhz = clamp(new_cap_mhz, rpn_mhz, rp0_mhz)
+```
+
+50 MHz of correction per degree of error. Above target it dials
+the cap down; below target it dials it back up. Steady state sits
+right at the target temperature.
+
+The governor ticks every 8 decode tokens (~1.2 s at typical
+Gemma 4 decode rates) — fast enough to react to a thermal climb,
+slow enough that sysfs write cost is negligible.
+
+### Enabling
+
+Add `gpu_target_temp_c` to the thermal profile JSON:
+
+```json
+{
+  "name": "nuc14-attic",
+  "package_temp_soft_c":     78,
+  "package_temp_hard_c":     85,
+  "package_throttle_max_ms": 200,
+  "gpu_target_temp_c":       72
+}
+```
+
+The loader rejects `gpu_target_temp_c >= package_temp_soft_c`
+because the governor is meant to keep the chip below soft — the
+per-token pause is only a safety net behind it.
+
+Two prerequisites for the governor to actually run:
+
+1. **Sysfs is writable**: the LXC + Docker config exposes
+   `/sys/class/drm/cardN/gt_max_freq_mhz` rw to the engine.
+   See [`setup-ct.md`](./setup-ct.md#lxc--docker-configuration-for-mimirmind-features).
+2. **`gpu_target_temp_c`** is set in the active profile.
+
+If either is missing, the engine logs a clear WARN and continues
+without the governor; the per-token pace acts as the fallback
+thermal management.
+
+### Status
+
+`/v1/system/status` reports a `gpu_clock` block when the governor
+is installed:
+
+```json
+"gpu_clock": {
+  "available": true,
+  "card_path": "/sys/class/drm/card1",
+  "rp0_mhz": 2350,
+  "rpn_mhz": 800,
+  "current_cap_mhz": 1850,
+  "target_temp_c": 72.0
+}
+```
+
+The current cap is the live state — polling this every few seconds
+gives a fairly accurate picture of how hard the chip is being pushed.
+At steady state under heavy load you should see the cap settle some
+hundred MHz below RP0, with package temp near target.
+
+### Tuning notes
+
+- **Default target 72 °C.** Conservative for a chip rated to
+  Tjmax ~110 °C; about 6-10 °C below typical thermal-paste
+  inflection. If your chassis has actual airflow, 80-85 °C is
+  fine and gives more throughput.
+- **Profile-soft / hard above target.** The intent is that the
+  governor keeps temp at or below `gpu_target_temp_c`; the
+  per-token pace only kicks in when something prevents the
+  governor from doing its job (workload pinning the iGPU at min
+  freq while CPU cores also hammer, ambient temperature spike).
+  Set soft = target + 5-10°C, hard = target + 12-15°C.
+- **What happens on power outage / reboot.** `gt_max_freq_mhz` is
+  kernel-runtime state — not persisted to NVRAM. After any
+  hardware reset the kernel re-initializes the i915 driver and
+  starts at RP0 (the hardware envelope max from the GPU PROM).
+  The engine's destructor also restores RP0 on clean shutdown so
+  a Docker stop without engine restart still leaves the chip
+  unconstrained.
+
+### Interaction with the thermal guard
+
+Both layers can be active at once and they're designed to
+cooperate:
+
+| Layer | When it acts | What it does |
+|---|---|---|
+| GPU clock governor | proactively, every 8 tokens | nudges iGPU max-freq toward keeping package at target |
+| Thermal guard pacing | reactively, every 4 tokens above soft | inserts a per-token sleep proportional to (current - soft) / (hard - soft) |
+| Thermal guard admission | per request | returns 503 if current >= hard at request start |
+
+Under normal operation only the governor is active — package stays
+below soft, pacing computes 0 ms pause, admission stays open. If
+the governor cannot keep up (cap already at RPn but temp still
+climbs), pacing kicks in. If even pacing can't hold the line and
+hard is breached, new requests are refused.
+
 ## Power telemetry (RAPL)
 
 The engine snapshots Intel RAPL energy counters around every

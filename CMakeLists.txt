@@ -159,6 +159,7 @@ add_executable(mimirmind
     src/runtime/KvCache.cpp
     src/runtime/L0Context.cpp
     src/runtime/Log.cpp
+    src/runtime/GpuClockGovernor.cpp
     src/runtime/MappedFile.cpp
     src/runtime/PowerMonitor.cpp
     src/runtime/SystemMonitor.cpp
@@ -238,6 +239,7 @@ add_executable(arch_tests
     src/compute/MoeRouting.cpp
     src/compute/Softmax.cpp
     src/model/ResponseCleaner.cpp
+    src/runtime/GpuClockGovernor.cpp
     src/runtime/Log.cpp
     src/runtime/PowerMonitor.cpp
     src/runtime/SystemMonitor.cpp

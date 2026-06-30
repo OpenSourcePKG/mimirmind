@@ -10,6 +10,7 @@
 #include "runtime/CommandQueue.hpp"
 #include "runtime/GpuKernel.hpp"
 #include "runtime/GpuModule.hpp"
+#include "runtime/GpuClockGovernor.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
@@ -1191,8 +1192,29 @@ int runServe(const CliArgs& args) {
             return 1;
         }
         guard = std::make_unique<mimirmind::runtime::ThermalGuard>(
-            std::move(profile), *monitor);
+            profile, *monitor);
         engine.setThermalGuard(guard.get());
+
+        // GPU clock governor lives in the same profile (field
+        // gpu_target_temp_c). If present AND the iGPU sysfs is
+        // writable, we install it. Otherwise we move on without one —
+        // the per-token thermal pace still runs as a safety net.
+        static std::unique_ptr<mimirmind::runtime::GpuClockGovernor> governor;
+        if (profile.hasGpuClockTarget()) {
+            governor = std::make_unique<mimirmind::runtime::GpuClockGovernor>();
+            governor->setTargetTempC(*profile.gpu_target_temp_c);
+            if (governor->available()) {
+                engine.setGpuClockGovernor(governor.get(), monitor.get());
+            } else {
+                MM_LOG_WARN("main",
+                            "thermal profile asks for GPU clock governor "
+                            "(gpu_target_temp_c={:.1f}) but it is not "
+                            "available: {}",
+                            *profile.gpu_target_temp_c,
+                            governor->unavailableReason());
+                governor.reset();
+            }
+        }
     }
 
     // Power telemetry — always-on attempt, never fatal. If RAPL is
@@ -1231,6 +1253,15 @@ int runServe(const CliArgs& args) {
                   << " RAPL domain(s))";
     } else {
         std::cout << "off (" << powerMonitor->unavailableReason() << ")";
+    }
+    std::cout << "\n  gpu clock governor: ";
+    if (auto* gov = engine.gpuClockGovernor()) {
+        std::cout << "on (target=" << gov->targetTempC()
+                  << "°C, " << gov->rpnMhz() << ".."
+                  << gov->rp0Mhz() << " MHz on "
+                  << gov->cardPath() << ")";
+    } else {
+        std::cout << "off";
     }
     std::cout << "\n  max context tokens: " << engine.maxContextTokens()
               << "\n  Ctrl-C to stop.\n";

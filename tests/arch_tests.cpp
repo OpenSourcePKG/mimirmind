@@ -16,6 +16,7 @@
 #include "compute/MoeRouting.hpp"
 #include "compute/Softmax.hpp"
 #include "model/ResponseCleaner.hpp"
+#include "runtime/GpuClockGovernor.hpp"
 #include "runtime/Lcp.hpp"
 #include "runtime/PowerMonitor.hpp"
 #include "runtime/SystemMonitor.hpp"
@@ -973,6 +974,147 @@ TEST(powerMonitor_averageWattsBetween) {
     // 0.1 J / >=0.02 s = at most 5 W; sanity-check shape rather than
     // value because steady_clock resolution varies.
     EXPECT_TRUE(watts[0] > 0.0 && watts[0] < 50.0);
+}
+
+// =======================================================================
+// runtime::GpuClockGovernor — probe + P-controller against a synthetic
+// /sys/class/drm tree.
+// =======================================================================
+
+namespace {
+
+struct FakeDrm {
+    std::string root;
+
+    FakeDrm() {
+        char templ[] = "/tmp/mimirmind-drm-XXXXXX";
+        root = ::mkdtemp(templ);
+    }
+    ~FakeDrm() {
+        const std::string cmd = "rm -rf " + root;
+        const int rc = std::system(cmd.c_str());
+        (void)rc;
+    }
+    FakeDrm(const FakeDrm&) = delete;
+    FakeDrm& operator=(const FakeDrm&) = delete;
+
+    void addCard(const std::string& cardName,
+                 std::uint32_t      rp0,
+                 std::uint32_t      rpn,
+                 std::uint32_t      currentMax) const {
+        const std::string dir = root + "/" + cardName;
+        ::mkdir(dir.c_str(), 0755);
+        std::ofstream{dir + "/gt_RP0_freq_mhz"} << rp0;
+        std::ofstream{dir + "/gt_RPn_freq_mhz"} << rpn;
+        std::ofstream{dir + "/gt_max_freq_mhz"} << currentMax;
+    }
+
+    std::uint32_t readMax(const std::string& cardName) const {
+        std::ifstream in{root + "/" + cardName + "/gt_max_freq_mhz"};
+        std::uint32_t v = 0;
+        in >> v;
+        return v;
+    }
+};
+
+} // namespace
+
+TEST(gpuGovernor_unavailableOnEmptyTree) {
+    FakeDrm d;
+    mimirmind::runtime::GpuClockGovernor g{d.root};
+    EXPECT_TRUE(!g.available());
+    EXPECT_TRUE(!g.unavailableReason().empty());
+}
+
+TEST(gpuGovernor_findsCard1NotCard0) {
+    // Real-world layout from a NUC14 — iGPU is card1, card0 is missing
+    // (or is a virtual DRM device without gt_*_freq_mhz).
+    FakeDrm d;
+    d.addCard("card1", 2350, 800, 2350);
+    mimirmind::runtime::GpuClockGovernor g{d.root};
+    EXPECT_TRUE(g.available());
+    EXPECT_EQ(g.rp0Mhz(), std::uint32_t{2350});
+    EXPECT_EQ(g.rpnMhz(), std::uint32_t{800});
+    EXPECT_EQ(g.currentCapMhz(), std::uint32_t{2350});
+}
+
+TEST(gpuGovernor_setMaxClampsToBounds) {
+    FakeDrm d;
+    d.addCard("card1", 2350, 800, 2350);
+    mimirmind::runtime::GpuClockGovernor g{d.root};
+
+    // Below RPn → clamp up to RPn.
+    EXPECT_EQ(g.setMaxFreqMhz(100), std::uint32_t{800});
+    EXPECT_EQ(d.readMax("card1"), std::uint32_t{800});
+
+    // Above RP0 → clamp down to RP0.
+    EXPECT_EQ(g.setMaxFreqMhz(9999), std::uint32_t{2350});
+    EXPECT_EQ(d.readMax("card1"), std::uint32_t{2350});
+
+    // In-range → applies as-is.
+    EXPECT_EQ(g.setMaxFreqMhz(1500), std::uint32_t{1500});
+    EXPECT_EQ(d.readMax("card1"), std::uint32_t{1500});
+}
+
+TEST(gpuGovernor_adjustForTempLowersCapWhenHot) {
+    FakeDrm d;
+    d.addCard("card1", 2350, 800, 2000);
+    mimirmind::runtime::GpuClockGovernor g{d.root};
+    g.setTargetTempC(72.0F);
+
+    // Temp 8 °C above target → delta = -400 MHz, new cap = 1600.
+    EXPECT_EQ(g.adjustForTemp(80.0F), std::uint32_t{1600});
+}
+
+TEST(gpuGovernor_adjustForTempRaisesCapWhenCool) {
+    FakeDrm d;
+    d.addCard("card1", 2350, 800, 1500);
+    mimirmind::runtime::GpuClockGovernor g{d.root};
+    g.setTargetTempC(72.0F);
+
+    // Temp 5 °C below target → delta = +250 MHz, new cap = 1750.
+    EXPECT_EQ(g.adjustForTemp(67.0F), std::uint32_t{1750});
+}
+
+TEST(gpuGovernor_destructorRestoresRP0) {
+    FakeDrm d;
+    d.addCard("card1", 2350, 800, 2350);
+    {
+        mimirmind::runtime::GpuClockGovernor g{d.root};
+        g.setMaxFreqMhz(1200);
+        EXPECT_EQ(d.readMax("card1"), std::uint32_t{1200});
+    }
+    // After dtor — should be back to RP0.
+    EXPECT_EQ(d.readMax("card1"), std::uint32_t{2350});
+}
+
+TEST(thermalProfile_loadsGpuTargetTempC) {
+    TempJsonFile f{R"({
+        "name": "test",
+        "package_temp_soft_c": 78,
+        "package_temp_hard_c": 85,
+        "gpu_target_temp_c": 72
+    })"};
+    const auto p = mimirmind::runtime::loadThermalProfile(f.path);
+    EXPECT_TRUE(p.hasGpuClockTarget());
+    EXPECT_NEAR(*p.gpu_target_temp_c, 72.0F, 0.001F);
+}
+
+TEST(thermalProfile_rejectsGpuTargetAboveSoft) {
+    // Sanity: target above soft means the per-token pause would fire
+    // before the governor — defeats the point.
+    TempJsonFile f{R"({
+        "name": "bad",
+        "package_temp_soft_c": 75,
+        "package_temp_hard_c": 82,
+        "gpu_target_temp_c": 80
+    })"};
+    try {
+        (void)mimirmind::runtime::loadThermalProfile(f.path);
+        EXPECT_TRUE(false && "expected throw");
+    } catch (const std::runtime_error&) {
+        // expected
+    }
 }
 
 int main() {
