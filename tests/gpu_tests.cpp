@@ -17,6 +17,7 @@
 #include "TestFramework.hpp"
 
 #include "compute/Activations.hpp"
+#include "compute/Attention.hpp"
 #include "compute/GpuMatmul.hpp"
 #include "compute/GpuOps.hpp"
 #include "compute/Matmul.hpp"
@@ -414,6 +415,129 @@ TEST(rope_inplace_decodeOffset) {
 
     EXPECT_ARRAY_NEAR("rope_decode_offset", bufX.as<float>(), cpu.data(),
                       n, 1e-4F);
+}
+
+// =======================================================================
+// Multi-head causal attention (GPU vs CPU)
+// =======================================================================
+
+namespace {
+
+// Run GPU attention into `outGpu`, CPU attention into `outCpu`, then
+// compare. q, k, v come from generateFloats. All buffers are USM so the
+// kernel can read them directly.
+void runAttentionParity(const char* label,
+                        std::size_t T_q,
+                        std::size_t T_k,
+                        std::size_t nHeads,
+                        std::size_t nKvHeads,
+                        std::size_t headDim,
+                        std::size_t positionOffset,
+                        float       scale,
+                        std::uint32_t seed,
+                        float       tol)
+{
+    const std::size_t qN  = T_q * nHeads   * headDim;
+    const std::size_t kvN = T_k * nKvHeads * headDim;
+    const std::size_t oN  = T_q * nHeads   * headDim;
+
+    auto qHost = generateFloats(qN,  seed + 0);
+    auto kHost = generateFloats(kvN, seed + 1);
+    auto vHost = generateFloats(kvN, seed + 2);
+
+    UsmBuf qBuf(qN  * sizeof(float));
+    UsmBuf kBuf(kvN * sizeof(float));
+    UsmBuf vBuf(kvN * sizeof(float));
+    UsmBuf oBuf(oN  * sizeof(float));
+    std::memcpy(qBuf.raw(), qHost.data(), qN  * sizeof(float));
+    std::memcpy(kBuf.raw(), kHost.data(), kvN * sizeof(float));
+    std::memcpy(vBuf.raw(), vHost.data(), kvN * sizeof(float));
+    std::memset(oBuf.raw(), 0,            oN  * sizeof(float));
+
+    fx().ops.attentionAsync(qBuf.as<float>(), kBuf.as<float>(),
+                            vBuf.as<float>(),
+                            T_q, T_k, nHeads, nKvHeads, headDim,
+                            positionOffset, scale,
+                            oBuf.as<float>());
+    fx().queue.flush();
+
+    // CPU reference. compute::multiHeadAttention has the 1/sqrt(headDim)
+    // baked in; the GPU kernel takes `scale` as a parameter. Pre-scale Q
+    // by (scale * sqrt(headDim)) before calling the CPU reference so the
+    // net Q·K scaling matches what the GPU did.
+    const float cpuExpectedScale = 1.0F / std::sqrt(
+        static_cast<float>(headDim));
+    const float qPreScale        = scale / cpuExpectedScale;
+    std::vector<float> qScaled = qHost;
+    for (auto& x : qScaled) x *= qPreScale;
+
+    std::vector<float> scratch(T_k);
+    std::vector<float> outCpu(oN, 0.0F);
+    mimirmind::compute::multiHeadAttention(
+        qScaled.data(), kHost.data(), vHost.data(),
+        T_q, T_k, nHeads, nKvHeads, headDim, positionOffset,
+        scratch.data(), outCpu.data());
+
+    EXPECT_ARRAY_NEAR(label, oBuf.as<float>(), outCpu.data(), oN, tol);
+}
+
+} // namespace
+
+TEST(attention_prefill_mha) {
+    // Plain multi-head (no GQA): nHeads == nKvHeads. Covers the prefill
+    // path with positionOffset=0 and causal mask sweeping kMax = pq+1.
+    runAttentionParity("attn_prefill_mha",
+                       /*T_q=*/8, /*T_k=*/8,
+                       /*nHeads=*/4, /*nKvHeads=*/4, /*headDim=*/32,
+                       /*positionOffset=*/0,
+                       /*scale=*/1.0F / std::sqrt(32.0F),
+                       /*seed=*/0x71, /*tol=*/5e-5F);
+}
+
+TEST(attention_decode_mha) {
+    // Single new query attending to a 7-position prefix already in KV
+    // cache. T_q=1, positionOffset = cache_length, kMax = T_k.
+    runAttentionParity("attn_decode_mha",
+                       /*T_q=*/1, /*T_k=*/8,
+                       /*nHeads=*/4, /*nKvHeads=*/4, /*headDim=*/32,
+                       /*positionOffset=*/7,
+                       /*scale=*/1.0F / std::sqrt(32.0F),
+                       /*seed=*/0x72, /*tol=*/5e-5F);
+}
+
+TEST(attention_prefill_gqa) {
+    // GQA: 4 query heads share 2 KV heads (2:1). Exercises the
+    // hkv = (hq * nKvHeads) / nHeads index rewrite.
+    runAttentionParity("attn_prefill_gqa",
+                       /*T_q=*/4, /*T_k=*/4,
+                       /*nHeads=*/4, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/0,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0x73, /*tol=*/5e-5F);
+}
+
+TEST(attention_decode_gqa_long_context) {
+    // Decode with a longer cache (256 entries) and Gemma-like geometry
+    // (nHeads=8, nKvHeads=2). Verifies the score row + softmax behaves
+    // for non-trivial T_k.
+    runAttentionParity("attn_decode_gqa_long",
+                       /*T_q=*/1, /*T_k=*/256,
+                       /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/255,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0x74, /*tol=*/1e-4F);
+}
+
+TEST(attention_decode_gemma_scale_one) {
+    // Gemma 4 mode: backend passes scale = 1.0 (the model's
+    // f_attention_scale). Same numerical behaviour as if Q had been
+    // pre-scaled by sqrt(headDim) before a 1/sqrt(headDim) attention.
+    runAttentionParity("attn_decode_gemma_scale1",
+                       /*T_q=*/1, /*T_k=*/16,
+                       /*nHeads=*/4, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/15,
+                       /*scale=*/1.0F,
+                       /*seed=*/0x75, /*tol=*/1e-4F);
 }
 
 // =======================================================================

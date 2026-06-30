@@ -1,6 +1,5 @@
 #include "runtime/arch/Qwen2Backend.hpp"
 
-#include "compute/Attention.hpp"
 #include "compute/GpuMatmul.hpp"
 #include "compute/GpuOps.hpp"
 #include "model/GgufTypes.hpp"
@@ -10,6 +9,7 @@
 #include "runtime/KvCache.hpp"
 #include "runtime/Log.hpp"
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -44,8 +44,6 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                             KvCache&      cache,
                             BlockBuffers& s,
                             bool          traceBlock0) {
-    namespace cmp = mimirmind::compute;
-
     const bool diag = (blockIdx == 0 && cache.length() == 0 && traceBlock0);
     auto trace = [&](const char* tag) {
         if (diag) {
@@ -106,7 +104,9 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     float* const gateOutBuf    = s.gateOut.as<float>();
     float* const upOutBuf      = s.upOut.as<float>();
     float* const matmulScratch = s.matmulScratch.as<float>();
-    float* const scoreScratch  = s.scoreScratch.as<float>();
+    // scoreScratch was the CPU-attention softmax row buffer; the GPU
+    // attention kernel keeps the score row in SLM, so it's unused here.
+    (void)s.scoreScratch;
 
     trace("attn rmsNorm");
     _ops.rmsNormAsync(x, T, d_model,
@@ -148,19 +148,21 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     _ops.ropeInPlaceAsync(kSlot, T,
                           _config.headCountKv, head_dim, curLen,
                           _config.ropeFreqBase);
-    trace("QKV+bias+RoPE sync");
-    _gmm.sync();
 
-    trace("attention");
-    cmp::multiHeadAttention(
-        qBuf,
-        cache.baseK(blockIdx),
-        cache.baseV(blockIdx),
-        T, totalLen,
-        _config.headCount, _config.headCountKv, head_dim,
-        curLen,
-        scoreScratch,
-        attnOutBuf);
+    // M5f.3: attention is on the GPU. No sync needed before it — the
+    // command-list barriers chain RoPE → attention. O-projection
+    // (synchronous matmul below) flushes the queue so attnOutBuf is
+    // visible to it by the time it executes.
+    trace("attention (GPU)");
+    const float attnScale = 1.0F /
+        std::sqrt(static_cast<float>(head_dim));
+    _ops.attentionAsync(qBuf,
+                        cache.baseK(blockIdx),
+                        cache.baseV(blockIdx),
+                        T, totalLen,
+                        _config.headCount, _config.headCountKv, head_dim,
+                        curLen, attnScale,
+                        attnOutBuf);
 
     trace("O projection (matmul)");
     _gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,

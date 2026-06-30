@@ -1,6 +1,5 @@
 #include "runtime/arch/Gemma4Backend.hpp"
 
-#include "compute/Attention.hpp"
 #include "compute/GpuMatmul.hpp"
 #include "compute/GpuOps.hpp"
 #include "compute/MoeRouting.hpp"
@@ -231,7 +230,9 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     float* const gateOutBuf    = s.gateOut.as<float>();
     float* const upOutBuf      = s.upOut.as<float>();
     float* const matmulScratch = s.matmulScratch.as<float>();
-    float* const scoreScratch  = s.scoreScratch.as<float>();
+    // scoreScratch was the CPU-attention softmax row buffer; the GPU
+    // attention kernel keeps the score row in SLM, so it's unused here.
+    (void)s.scoreScratch;
     float* const moeAccumBuf   = s.moeAccumBuf.as<float>();
     float* const expertOutBuf  = s.expertOutBuf.as<float>();
 
@@ -314,32 +315,22 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
         _ops.ropeInPlaceAsync(qBuf, T, li.nHeads, head_dim, curLen,
                               li.ropeBase);
     }
-    // Dump Q BEFORE the gemma4-specific sqrt(head_dim) pre-scale so we
-    // match llama's Qcur_pos (llama's f_attention_scale handles the
-    // 1/sqrt internally via soft_max_ext instead).
     dumpStage("Qcur_pos", qBuf, T, q_dim);
 
-    // f_attention_scale = 1.0 (gemma4.cpp:11). multiHeadAttention divides
-    // Q·K by 1/sqrt(headDim); pre-scale Q by sqrt(head_dim) so it cancels.
-    {
-        const float qScale = std::sqrt(static_cast<float>(head_dim));
-        trace("Q pre-scale sqrt(head_dim)");
-        _ops.mulScalarAsync(qBuf, qScale, T * q_dim);
-    }
-
-    trace("QKV sync (before CPU attention)");
-    _gmm.sync();
-
-    trace("multiHeadAttention (CPU)");
-    cmp::multiHeadAttention(
-        qBuf,
-        cache.baseK(blockIdx),
-        cache.baseV(blockIdx),
-        T, totalLen,
-        li.nHeads, li.nKvHeads, head_dim,
-        curLen,
-        scoreScratch,
-        attnOutBuf);
+    // M5f.3: attention on the GPU. Gemma 4's f_attention_scale = 1.0
+    // (gemma4.cpp:11), so we pass scale=1.0 directly — no sqrt(head_dim)
+    // pre-scale needed anymore. The old CPU path had to pre-scale Q
+    // because compute::multiHeadAttention bakes in 1/sqrt(headDim);
+    // the GPU kernel takes scale as a parameter, which makes the Gemma
+    // branch one mulScalarAsync + one sync cheaper than before.
+    trace("attention (GPU, scale=1)");
+    _ops.attentionAsync(qBuf,
+                        cache.baseK(blockIdx),
+                        cache.baseV(blockIdx),
+                        T, totalLen,
+                        li.nHeads, li.nKvHeads, head_dim,
+                        curLen, /*scale=*/1.0F,
+                        attnOutBuf);
 
     trace("O projection");
     _gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,

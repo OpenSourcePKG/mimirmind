@@ -90,6 +90,7 @@ set(KERNEL_SOURCES
     kernels/rmsnorm_gemma.cl
     kernels/rmsnorm_no_weight.cl
     kernels/rope_inplace_ff.cl
+    kernels/attention.cl
 )
 
 set(KERNEL_SPV_FILES "")
