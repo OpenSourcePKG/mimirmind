@@ -1137,11 +1137,15 @@ int runServe(const CliArgs& args) {
         std::cerr << msg << "\n";
         return 2;
     }
-    if (arch == "gemma4") {
-        MM_LOG_WARN("main",
-                    "serve: gemma4 forward runs but chat-template support "
-                    "is not implemented yet — /v1/chat/completions will "
-                    "fail at template formatting until M8.x lands.");
+    // Optional KV-cache pre-allocation size. The cache is sized once
+    // and never reallocated for request growth, so this is the upper
+    // bound on (prompt + max_new) any single generate() can hold.
+    // Larger = bigger upfront memory commitment but multi-turn prefix
+    // reuse keeps working as conversations grow.
+    if (const char* env = std::getenv("MIMIRMIND_MAX_CONTEXT_TOKENS")) {
+        if (const auto n = std::strtoull(env, nullptr, 10); n > 0) {
+            engine.setMaxContextTokens(static_cast<std::size_t>(n));
+        }
     }
 
     mimirmind::server::ServerConfig cfg{};
@@ -1228,7 +1232,8 @@ int runServe(const CliArgs& args) {
     } else {
         std::cout << "off (" << powerMonitor->unavailableReason() << ")";
     }
-    std::cout << "\n  Ctrl-C to stop.\n";
+    std::cout << "\n  max context tokens: " << engine.maxContextTokens()
+              << "\n  Ctrl-C to stop.\n";
     std::cout.flush();
 
     if (!guard) {
