@@ -140,31 +140,92 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1782774169
 data: [DONE]
 ```
 
-If you are running the server behind nginx or another reverse proxy,
-SSE streaming requires:
+### Running behind a reverse proxy
+
+SSE breaks easily behind a reverse proxy with default settings. The
+two failure modes are:
+
+- **Buffering**: the proxy collects 30-50 tokens worth of chunks
+  before flushing, killing the live-stream experience.
+- **HTTP/1.0 fallback**: the proxy speaks HTTP/1.0 to the upstream,
+  which has no chunked transfer encoding, so the proxy buffers the
+  full response in memory and the client sees nothing until the
+  generation is complete.
+
+The server sets `X-Accel-Buffering: no` and `Cache-Control: no-cache`
+on every SSE response, which nginx and other proxies honour — but a
+handful of explicit knobs are still required for things to work
+end-to-end:
 
 ```nginx
-location / {
-    proxy_pass http://mimirmind:8080;
-    proxy_buffering off;          # critical for SSE
-    proxy_cache off;
-    proxy_set_header Connection "";
+upstream mimirmind {
+    server 127.0.0.1:8080;
+    keepalive 16;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name mimirmind.example.com;
+
+    # ... ssl_certificate / ssl_certificate_key ...
+
+    # Talk HTTP/1.1 to the upstream so chunked transfer works.
+    # Default is 1.0 — without this the proxy buffers the whole body.
     proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    location /v1/chat/completions {
+        proxy_pass http://mimirmind;
+
+        # Buffering off — the actual SSE-critical knob.
+        proxy_buffering           off;
+        proxy_request_buffering   off;   # forward POST body immediately
+        proxy_cache               off;
+
+        # Empty Connection header lets nginx do upstream keep-alive.
+        proxy_set_header Connection "";
+
+        # Long generations stall the stream — extend timeouts.
+        proxy_read_timeout        3600s;
+        proxy_send_timeout        3600s;
+        proxy_connect_timeout     30s;
+
+        chunked_transfer_encoding on;
+    }
+
+    location / {
+        proxy_pass http://mimirmind;
+        proxy_read_timeout 60s;
+    }
 }
 ```
 
-Without `proxy_buffering off` the proxy will batch the SSE chunks and
-the client only sees the response after the full generation completes,
-which defeats the point.
+#### Common pitfalls
 
-### What the streaming path does NOT do (yet)
+1. **`proxy_http_version 1.1` omitted.** Default is HTTP/1.0. No
+   chunked encoding → full-response buffering → tokens arrive in one
+   delayed burst at the end. Easy to spot: time-to-first-byte ≈
+   total-generation-time.
+2. **`proxy_buffering` left on.** Even with HTTP/1.1, the default
+   4-8 KiB output buffers coalesce chunks. Symptom: tokens arrive in
+   visible bursts of ~30-50 instead of streaming one at a time.
+3. **`proxy_read_timeout` too low.** Default 60 s. Long prompts +
+   slow generations → 504 mid-stream. Bump it to 3600 s.
 
-The Gemma 4 thinking-channel markup (`<|channel>thought\n<channel|>`)
-that appears at the start of every response is stripped from the
-non-streaming response in `ChatTemplate::cleanResponse`. The
-streaming path emits raw deltas — the wrapper is contained in the
-first few tokens, so most clients can ignore it, but a stateful
-streaming stripper is on the TODO list.
+#### Cloudflare in front
+
+Cloudflare's default proxying buffers SSE responses and strips
+`X-Accel-Buffering`. Workarounds:
+
+- Set `Cache-Control: no-transform` on the response (CF respects
+  this) — the server does *not* currently set it; either add an
+  `add_header` directive in nginx or proxy through a `cloudflared`
+  tunnel with the gRPC/SSE-aware mode enabled.
+- Or terminate Cloudflare with a "DNS only" record for the API
+  hostname and let nginx do everything itself.
 
 ## Error responses
 
@@ -211,8 +272,18 @@ trained with a separate system role.
 Asymmetric `<|turn>` / `<turn|>` markers. Roles same as Gemma 2/3.
 Plus a thinking-channel wrapper that the model emits at the start of
 every response: `<|channel>thought\n<channel|>`. With thinking mode
-off the channel is empty; the wrapper is stripped from the
-non-streaming response content before it reaches the wire.
+off the channel is empty.
+
+The wrapper is stripped on both paths so OpenAI-compatible clients
+never see it:
+
+- **Non-streaming**: `ChatTemplate::cleanResponse` runs over the
+  finished string and removes the wrapper.
+- **Streaming**: `ResponseCleaner` is a stateful per-token filter in
+  the SSE callback that swallows the wrapper tokens and the trailing
+  whitespace before any `delta.content` chunk is emitted.
+
+Both paths produce the same visible content.
 
 ## Client compatibility
 
