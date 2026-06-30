@@ -332,10 +332,12 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                         curLen, /*scale=*/1.0F,
                         attnOutBuf);
 
-    trace("O projection");
-    _gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,
-                attnOutBuf, T,
-                projOutBuf, matmulScratch);
+    // M5f.5: async — attn_post_norm below reads projOutBuf, ordered
+    // by the auto-barrier.
+    trace("O projection (async)");
+    _gmm.matmulAsync(oW->type, oW->usmPtr, d_model, q_dim,
+                     attnOutBuf, T,
+                     projOutBuf, matmulScratch);
 
     trace("attn_post_norm");
     _ops.rmsNormAsync(projOutBuf, T, d_model,
@@ -370,10 +372,11 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     trace("GELU + mul (fused)");
     _ops.geluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
 
-    trace("FFN down proj");
-    _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
-                gateOutBuf, T,
-                projOutBuf, matmulScratch);
+    // M5f.5: async — post_ffw_norm_1 below reads projOutBuf.
+    trace("FFN down proj (async)");
+    _gmm.matmulAsync(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
+                     gateOutBuf, T,
+                     projOutBuf, matmulScratch);
 
     trace("post_ffw_norm_1 (path A post)");
     _ops.rmsNormAsync(projOutBuf, T, d_model,
@@ -466,10 +469,17 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
             _ops.geluMulAsync(gateOutBuf, gateOutBuf + ffPerExpert,
                               ffPerExpert);
 
-            _gmm.matmul(expDown->type, Wd,
-                        d_model, ffPerExpert,
-                        gateOutBuf, 1,
-                        expertOutBuf, matmulScratch);
+            // M5f.5 — async expert-down. THIS is the big Gemma 4 win:
+            // K=8 experts × 30 layers = 240 syncs per token previously,
+            // now zero. The next op (mulScalarAsync on expertOutBuf)
+            // depends RAW; the auto-barrier serialises the chain. The
+            // following iteration's gate_up writes gateOutBuf which is
+            // a WAW against this expert's down read — also handled by
+            // the auto-barrier on the gate_up launch.
+            _gmm.matmulAsync(expDown->type, Wd,
+                             d_model, ffPerExpert,
+                             gateOutBuf, 1,
+                             expertOutBuf, matmulScratch);
 
             const float combined = routerWeight * expDownScalePtr[e];
             _ops.mulScalarAsync(expertOutBuf, combined, d_model);

@@ -181,10 +181,14 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                         curLen, attnScale,
                         attnOutBuf);
 
-    trace("O projection (matmul)");
-    _gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,
-                attnOutBuf, T,
-                projOutBuf, matmulScratch);
+    // M5f.5: async — the auto-barrier after this launch is enough for
+    // the next op (addResidualAsync) to see projOutBuf. The previous
+    // synchronous matmul flushed the queue at every block which is a
+    // ~0.5 ms ping-pong with no semantic benefit.
+    trace("O projection (matmulAsync)");
+    _gmm.matmulAsync(oW->type, oW->usmPtr, d_model, q_dim,
+                     attnOutBuf, T,
+                     projOutBuf, matmulScratch);
 
     trace("attn residual (async)");
     _ops.addResidualAsync(x, projOutBuf, T * d_model);
@@ -210,10 +214,12 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     trace("FFN silu+mul (async, fused)");
     _ops.siluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
 
-    trace("FFN down (matmul)");
-    _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
-                gateOutBuf, T,
-                projOutBuf, matmulScratch);
+    // M5f.5: async — addResidualAsync below reads projOutBuf, the
+    // auto-barrier orders the chain.
+    trace("FFN down (matmulAsync)");
+    _gmm.matmulAsync(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
+                     gateOutBuf, T,
+                     projOutBuf, matmulScratch);
 
     trace("ffn residual (async, exit)");
     _ops.addResidualAsync(x, projOutBuf, T * d_model);
