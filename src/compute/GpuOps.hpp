@@ -119,6 +119,15 @@ public:
                       const float* up,
                       std::size_t  n);
 
+    /// Fused scaled accumulate: dst[i] += scale * src[i]. Replaces a
+    /// mulScalarAsync(src, scale) + addResidualAsync(dst, src) pair
+    /// where the intermediate scaled src is not read elsewhere. Used by
+    /// the Gemma 4 MoE per-expert loop.
+    void scaledAddResidualAsync(float*       dst,
+                                const float* src,
+                                float        scale,
+                                std::size_t  n);
+
     /// Multi-head GQA causal attention on the GPU. Layout-equivalent to
     /// compute::multiHeadAttention. q/k/v/out are all f32 USM:
     ///   q   [T_q, nHeads,    headDim]
@@ -195,6 +204,9 @@ private:
 
     runtime::GpuModule     _attentionFlashMergeModule;
     runtime::GpuKernel     _attentionFlashMergeKernel;
+
+    runtime::GpuModule     _scaledAddResidualModule;
+    runtime::GpuKernel     _scaledAddResidualKernel;
 
     // Persistent USM scratch for the FlashAttention partial/merge
     // pipeline. Sized at construction for the worst case across the

@@ -65,7 +65,10 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
           _attentionFlashPartialModule.kernel("attention_flash_partial")},
       _attentionFlashMergeModule  {ctx, "attention_flash_merge"},
       _attentionFlashMergeKernel  {
-          _attentionFlashMergeModule.kernel("attention_flash_merge")}
+          _attentionFlashMergeModule.kernel("attention_flash_merge")},
+      _scaledAddResidualModule    {ctx, "scaled_add_residual"},
+      _scaledAddResidualKernel    {
+          _scaledAddResidualModule.kernel("scaled_add_residual")}
 {
     // Persistent FlashAttention partial-tile scratch. Sized for the
     // worst case across our target models; reused across every decode
@@ -78,7 +81,8 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
                 "add_bias/add_residual/silu_mul/rope/rope_ff/mul_scalar/"
-                "gelu_mul/attention/attention_flash loaded (rms local={}, "
+                "gelu_mul/attention/attention_flash/scaled_add_residual "
+                "loaded (rms local={}, "
                 "elementwise local={}, rope local={}, attention local={}, "
                 "attention max T_k={}, flash kTile={}, flash maxHeads={}, "
                 "flash maxHeadDim={}, flash partial scratch={} bytes)",
@@ -290,6 +294,23 @@ void GpuOps::ropeInPlaceWithFactorsAsync(float*       x,
     _ropeFfKernel.setGroupSize(kRopeLocalSize, 1, 1);
     _queue.appendLaunch(_ropeFfKernel,
                         groupsForN(total, kRopeLocalSize), 1, 1);
+}
+
+void GpuOps::scaledAddResidualAsync(float*       dst,
+                                    const float* src,
+                                    float        scale,
+                                    std::size_t  n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "scaledAddResidual n");
+    _scaledAddResidualKernel.setPtr(0, dst);
+    _scaledAddResidualKernel.setPtr(1, src);
+    _scaledAddResidualKernel.setValue<float>(2, scale);
+    _scaledAddResidualKernel.setValue<std::int32_t>(3, ni);
+    _scaledAddResidualKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_scaledAddResidualKernel,
+                        groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 
 void GpuOps::attentionAsync(const float* q,

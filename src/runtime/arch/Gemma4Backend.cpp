@@ -471,9 +471,14 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                         gateOutBuf, 1,
                         expertOutBuf, matmulScratch);
 
+            // M9.6.4: fused scale-and-accumulate. expertOutBuf is
+            // overwritten by the next iteration's down-projection so
+            // there's no downstream reader of the post-scale buffer —
+            // safe to do dst[i] += scale * src[i] in one kernel
+            // instead of two passes.
             const float combined = routerWeight * expDownScalePtr[e];
-            _ops.mulScalarAsync(expertOutBuf, combined, d_model);
-            _ops.addResidualAsync(accumT, expertOutBuf, d_model);
+            _ops.scaledAddResidualAsync(accumT, expertOutBuf, combined,
+                                        d_model);
         }
     }
 
