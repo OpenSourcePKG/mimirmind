@@ -292,3 +292,147 @@ rsync -av --delete \
 
 `ocloc` lives only inside the builder image — the runtime target only
 sees the produced `.spv` files and the `mimirmind` binary that loads them.
+
+---
+
+## LXC + Docker configuration for Mimirmind features
+
+When the runtime target is a Proxmox LXC container running Docker
+(typical Pegenaut deployment), the engine relies on several host
+resources beyond the iGPU itself: package thermal sensors, RAPL energy
+counters, and the iGPU's frequency control interface. Each of those
+sysfs paths is masked by **both** the LXC layer and the Docker layer
+by default. Granting access is a one-time host-side config step per
+feature.
+
+This section is the canonical "what to put where" for the full feature
+set. Adjust to taste — every feature is optional and the engine
+degrades gracefully (status endpoint reports unavailability with a
+reason; chat completions keep working).
+
+### Feature matrix
+
+| Feature | Host sysfs path | LXC mount entry | Docker addition | What happens without it |
+|---|---|---|---|---|
+| iGPU compute | `/dev/dri` | `bind` (already standard) | `devices` + `group_add` | Engine cannot start (no Level-Zero device) |
+| Package temperature (thermal guard) | `/sys/class/thermal/` | none — Proxmox passes it through | none — Docker passes it through | Thermal guard refuses to start with the configured profile |
+| RAPL energy counters (`/v1/system/status` power + per-request `package_joules`) | `/sys/devices/virtual/powercap/` | `bind,ro` | `security_opt: systempaths=unconfined` | Status endpoint shows `"power.available": false`; chat usage has no `package_joules` |
+| GPU frequency governor (dynamic clock control) | `/sys/class/drm/card0/gt_*_freq_mhz` | `bind,rw` | `volumes: - /sys/class/drm:/sys/class/drm:rw` | Engine falls back to per-token thermal pacing (slower under heat but still works) |
+
+### LXC config (`/etc/pve/lxc/<CTID>.conf`)
+
+Append to the existing CT config:
+
+```
+# iGPU device passthrough (required for compute)
+lxc.cgroup2.devices.allow: c 226:* rwm
+lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir
+
+# RAPL energy counters (read-only — counters wrap, never written by us)
+lxc.mount.entry: /sys/devices/virtual/powercap sys/devices/virtual/powercap none bind,ro,create=dir 0 0
+
+# GPU frequency control (read-write — governor writes gt_max_freq_mhz)
+lxc.mount.entry: /sys/class/drm sys/class/drm none bind,rw,create=dir 0 0
+```
+
+Plus, for the engine's serve workload to feel responsive in a
+container, `nesting=1` is required (Docker needs it):
+
+```
+features: nesting=1
+```
+
+Apply with `pct reboot <CTID>` — LXC mount entries take effect at
+container start, not via live reload.
+
+### Docker config (`docker-compose.server.yml`)
+
+The `mimirmind` service stanza gathers all four runtime-side knobs:
+
+```yaml
+services:
+    mimirmind:
+        # ... image, command, etc ...
+
+        # iGPU passthrough (mirror of the LXC entries above)
+        devices:
+            - /dev/dri:/dev/dri
+        group_add:
+            - "${MIMIRMIND_RENDER_GID:-104}"
+            - "${MIMIRMIND_VIDEO_GID:-44}"
+
+        # Unmask /sys/devices/virtual/powercap (Platypus mitigation that
+        # does not apply to LLM inference). Required for RAPL telemetry.
+        security_opt:
+            - systempaths=unconfined
+
+        # Bind-mount the GPU clock control path read-write.
+        # security_opt above unmasks; this explicit rw mount enables
+        # writes (Docker keeps /sys read-only by default even when
+        # unmasked).
+        volumes:
+            - /sys/class/drm:/sys/class/drm:rw
+            # ... model bind, log bind, thermal profile bind ...
+```
+
+### Verification
+
+Once both layers are configured, restart the CT then the Docker
+container. From inside the running mimirmind container:
+
+```bash
+# Test 1 — iGPU compute
+docker compose -f docker-compose.server.yml run --rm \
+    --entrypoint /usr/local/bin/gpu_tests mimirmind
+# expected: "16 passed, 0 failed"
+
+# Test 2 — RAPL readable
+docker compose -f docker-compose.server.yml exec mimirmind /bin/sh -c \
+    'cat /sys/devices/virtual/powercap/intel-rapl/intel-rapl:0/energy_uj'
+# expected: a 12+ digit microjoule counter
+
+# Test 3 — GPU clock writeable
+docker compose -f docker-compose.server.yml exec mimirmind /bin/sh -c \
+    'CUR=$(cat /sys/class/drm/card0/gt_max_freq_mhz); \
+     echo "current: $CUR MHz"; \
+     echo "$CUR" > /sys/class/drm/card0/gt_max_freq_mhz \
+       && echo "WRITE OK" || echo "WRITE FAILED ($?)"'
+# expected: "WRITE OK"
+```
+
+And, after a chat completion, `/v1/system/status` should report
+`profile_active: true`, `power.available: true`, and contain a
+`gpu` block with the current frequency cap (once the governor lands).
+
+### Troubleshooting
+
+**Unprivileged LXC + sysfs writes**: by default Proxmox CTs are
+unprivileged, which means `root` inside the CT maps to host uid
+~100000. Sysfs files are owned by host uid 0. Writes therefore fail
+with EACCES even with `bind,rw` mount. Two ways out:
+
+1. **Make the CT privileged.** Edit `/etc/pve/lxc/<CTID>.conf` to
+   add `unprivileged: 0`, then re-create the rootfs or migrate. This
+   is the simplest path and is generally acceptable for a
+   dedicated-purpose host LLM appliance, but raises blast radius if
+   the container is compromised.
+2. **Keep unprivileged and skip the GPU governor.** The thermal
+   guard falls back to per-token pacing, which works but produces
+   bursty latency under load. Power telemetry and RAPL still work
+   because they only need read access; thermal sensors still work
+   because the kernel exposes them world-readable.
+
+**`security_opt: systempaths=unconfined` alone is not enough for
+writes.** It unmasks Docker's hidden-path list but does not remount
+/sys as rw. The explicit `volumes:` line for `/sys/class/drm` is what
+gets the rw access through.
+
+**`/sys/class/drm/card0` is a symlink.** Bind-mounting `/sys/class/drm`
+(the parent class view) follows the symlinks correctly and is
+preferred over trying to bind the specific resolved device path.
+
+### Cross-reference
+
+- Thermal profile content + per-host tuning: [`operations.md`](./operations.md#thermal-profile)
+- Power telemetry details + status endpoint shape: [`operations.md`](./operations.md#power-telemetry-rapl)
+- GPU clock governor (when shipped): [`operations.md`](./operations.md#gpu-clock-governor)
