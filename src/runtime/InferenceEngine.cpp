@@ -4,7 +4,9 @@
 #include "model/GgufTypes.hpp"
 #include "runtime/Lcp.hpp"
 #include "runtime/Log.hpp"
+#include "runtime/GpuClockGovernor.hpp"
 #include "runtime/PowerMonitor.hpp"
+#include "runtime/SystemMonitor.hpp"
 #include "runtime/ThermalGuard.hpp"
 #include "runtime/arch/ArchBackend.hpp"
 
@@ -422,6 +424,13 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
         // decode while still reacting to a fast temperature climb
         // within ~500 ms.
         constexpr std::size_t kPaceWindow = 4;
+        // The GPU clock governor adjusts the iGPU max-freq cap; this
+        // happens at a slower cadence than the per-token pacing
+        // because a fresh sysfs write costs ~200 µs and reaches the
+        // hardware on the next dispatch. 8 tokens at ~145 ms each is
+        // ~1.2 s between adjustments — well within the package
+        // thermal time constant.
+        constexpr std::size_t kGovernorWindow = 8;
 
         for (std::size_t step = 1;
              !aborted && step < maxNew && cache.length() < _maxContextTokens;
@@ -437,6 +446,11 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
                 if (pause.count() > 0) {
                     std::this_thread::sleep_for(pause);
                 }
+            }
+
+            if (_gpuGovernor != nullptr && _governorMonitor != nullptr &&
+                (step % kGovernorWindow) == 0) {
+                (void)_gpuGovernor->tick(*_governorMonitor);
             }
 
             std::array<std::int32_t, 1> oneId{nextId};

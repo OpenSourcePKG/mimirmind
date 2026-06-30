@@ -4,6 +4,7 @@
 #include "model/LlmConfig.hpp"
 #include "model/ResponseCleaner.hpp"
 #include "model/Tokenizer.hpp"
+#include "runtime/GpuClockGovernor.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/Log.hpp"
 #include "runtime/PowerMonitor.hpp"
@@ -448,7 +449,38 @@ struct ApiServer::Impl {
                                        : json{decision.reason}},
         };
         body["power"]     = buildPowerBlock();
+        body["gpu_clock"] = buildGpuClockBlock();
         sendJson(res, 200, body);
+    }
+
+    /// Compose the "gpu_clock" sub-object of /v1/system/status.
+    /// Reports the current iGPU max-freq cap, the hardware envelope,
+    /// the target temperature, and which sysfs card the governor
+    /// landed on. Absent (= "available": false with reason) when the
+    /// LXC/Docker mount config does not let us write the freq file.
+    json buildGpuClockBlock() {
+        auto* gov = engine.gpuClockGovernor();
+        if (gov == nullptr) {
+            return json{
+                {"available", false},
+                {"reason",    "no GPU clock governor installed (profile "
+                              "has no gpu_target_temp_c)"},
+            };
+        }
+        if (!gov->available()) {
+            return json{
+                {"available", false},
+                {"reason",    std::string{gov->unavailableReason()}},
+            };
+        }
+        return json{
+            {"available",       true},
+            {"card_path",       std::string{gov->cardPath()}},
+            {"rp0_mhz",         gov->rp0Mhz()},
+            {"rpn_mhz",         gov->rpnMhz()},
+            {"current_cap_mhz", gov->currentCapMhz()},
+            {"target_temp_c",   gov->targetTempC()},
+        };
     }
 
     /// Compose the "power" sub-object of /v1/system/status.

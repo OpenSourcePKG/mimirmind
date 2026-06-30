@@ -89,6 +89,22 @@ ThermalProfile loadThermalProfile(std::string_view path) {
         p.package_throttle_max_ms = v;
     }
 
+    p.gpu_target_temp_c = readOptional<float>(j, "gpu_target_temp_c");
+    if (p.gpu_target_temp_c.has_value() && p.hasPackageLimits()) {
+        // Sanity: target should sit below soft so the per-token pause
+        // is only a safety net behind the governor.
+        if (*p.gpu_target_temp_c >= *p.package_temp_soft_c) {
+            std::ostringstream os;
+            os << "gpu_target_temp_c (" << *p.gpu_target_temp_c
+               << ") must be strictly less than package_temp_soft_c ("
+               << *p.package_temp_soft_c
+               << ") — the governor is meant to keep the chip below "
+                  "the soft threshold so per-token pacing only kicks in "
+                  "if the governor cannot keep up";
+            fail(path, os.str());
+        }
+    }
+
     return p;
 }
 

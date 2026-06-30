@@ -15,7 +15,9 @@
 #include "runtime/UsmHandle.hpp"
 
 namespace mimirmind::runtime {
+class GpuClockGovernor;
 class PowerMonitor;
+class SystemMonitor;
 class ThermalGuard;
 } // namespace mimirmind::runtime
 
@@ -158,6 +160,21 @@ public:
     void setPowerMonitor(PowerMonitor* monitor) noexcept { _powerMonitor = monitor; }
     [[nodiscard]] PowerMonitor* powerMonitor() const noexcept { return _powerMonitor; }
 
+    /// Install (or remove with nullptr) the GPU clock governor + the
+    /// system monitor it reads temperatures from. Both must be
+    /// non-null for the governor to tick during decode. The engine
+    /// owns neither. When set, every kGovernorTickWindow decode tokens
+    /// the engine reads package temp from the monitor and lets the
+    /// governor adjust the iGPU max-freq cap toward its target.
+    void setGpuClockGovernor(GpuClockGovernor* governor,
+                             SystemMonitor*    monitor) noexcept {
+        _gpuGovernor    = governor;
+        _governorMonitor = monitor;
+    }
+    [[nodiscard]] GpuClockGovernor* gpuClockGovernor() const noexcept {
+        return _gpuGovernor;
+    }
+
     // --- Accessors (used by smoke path + diagnostics) -------------------
 
     [[nodiscard]] L0Context&               ctx()              noexcept { return _ctx; }
@@ -227,6 +244,10 @@ private:
     // Optional non-owning power monitor. Engine snapshots counters
     // around each generate() call to populate GenerateStats.packageJoules.
     PowerMonitor*                      _powerMonitor{nullptr};
+    // Optional non-owning GPU clock governor + system monitor for
+    // dynamic iGPU frequency control during decode.
+    GpuClockGovernor*                  _gpuGovernor{nullptr};
+    SystemMonitor*                     _governorMonitor{nullptr};
 
     // One-shot block-0 trace. Default off so production serve mode is
     // quiet; set MIMIRMIND_TRACE_BLOCK0=1 to enable when bringing up a

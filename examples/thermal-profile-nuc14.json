@@ -1,8 +1,9 @@
 {
   "name": "nuc14-attic",
-  "description": "ASUS NUC14RVS-B (Core Ultra 9 185H, 64 GiB) in a passive enclosure. Tuned conservatively after a thermal-trip hard freeze under sustained Gemma 4 26B decode (2026-06-30). Re-tune after BIOS fan-curve fix or chassis upgrade.",
+  "description": "ASUS NUC14RVS-B (Core Ultra 9 185H, 64 GiB) in a passive enclosure. Tuned after a 2026-06-30 thermal-trip hard freeze under sustained Gemma 4 26B decode. The GPU clock governor is the primary brake (drives the package toward 72 °C by dialing gt_max_freq_mhz down to 800 MHz when needed); the soft/hard pacing thresholds are the safety net behind it.",
 
-  "package_temp_soft_c":     75,
-  "package_temp_hard_c":     82,
-  "package_throttle_max_ms": 200
+  "package_temp_soft_c":     78,
+  "package_temp_hard_c":     85,
+  "package_throttle_max_ms": 200,
+  "gpu_target_temp_c":       72
 }
