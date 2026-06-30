@@ -116,6 +116,33 @@ public:
                       const float* up,
                       std::size_t  n);
 
+    /// Multi-head GQA causal attention on the GPU. Layout-equivalent to
+    /// compute::multiHeadAttention. q/k/v/out are all f32 USM:
+    ///   q   [T_q, nHeads,    headDim]
+    ///   k   [T_k, nKvHeads,  headDim]
+    ///   v   [T_k, nKvHeads,  headDim]
+    ///   out [T_q, nHeads,    headDim]
+    /// scale is applied to Q·K before softmax (Qwen passes
+    /// 1/sqrt(headDim); Gemma 4 passes 1.0 since it pre-scaled Q nowhere
+    /// — see backend). Throws if T_k > kAttentionMaxTk (8192) or if
+    /// nHeads is not a positive multiple of nKvHeads.
+    void attentionAsync(const float* q,
+                        const float* k,
+                        const float* v,
+                        std::size_t  T_q,
+                        std::size_t  T_k,
+                        std::size_t  nHeads,
+                        std::size_t  nKvHeads,
+                        std::size_t  headDim,
+                        std::size_t  positionOffset,
+                        float        scale,
+                        float*       out);
+
+    /// Compile-time bound on T_k matching ATTN_MAX_TK in attention.cl.
+    /// Exposed so callers (and the engine config validator) can check
+    /// max-context budgets up front.
+    static constexpr std::size_t kAttentionMaxTk = 8192;
+
 private:
     runtime::L0Context&    _ctx;
     runtime::CommandQueue& _queue;
@@ -150,9 +177,14 @@ private:
     runtime::GpuModule     _ropeFfModule;
     runtime::GpuKernel     _ropeFfKernel;
 
-    static constexpr std::uint32_t kRmsnormLocalSize    = 128;
+    runtime::GpuModule     _attentionModule;
+    runtime::GpuKernel     _attentionKernel;
+
+    static constexpr std::uint32_t kRmsnormLocalSize     = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;
     static constexpr std::uint32_t kRopeLocalSize        = 256;
+    // Must match ATTN_LOCAL / ATTN_SG in kernels/attention.cl.
+    static constexpr std::uint32_t kAttentionLocalSize   = 16;
 };
 
 } // namespace mimirmind::compute

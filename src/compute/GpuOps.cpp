@@ -53,14 +53,18 @@ GpuOps::GpuOps(runtime::L0Context& ctx, runtime::CommandQueue& queue)
       _rmsnormNoWeightModule{ctx, "rmsnorm_no_weight"},
       _rmsnormNoWeightKernel{_rmsnormNoWeightModule.kernel("rmsnorm_no_weight")},
       _ropeFfModule    {ctx, "rope_inplace_ff"},
-      _ropeFfKernel    {_ropeFfModule.kernel("rope_inplace_ff")}
+      _ropeFfKernel    {_ropeFfModule.kernel("rope_inplace_ff")},
+      _attentionModule {ctx, "attention"},
+      _attentionKernel {_attentionModule.kernel("attention")}
 {
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
                 "add_bias/add_residual/silu_mul/rope/rope_ff/mul_scalar/"
-                "gelu_mul loaded (rms local={}, elementwise local={}, "
-                "rope local={})",
-                kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize);
+                "gelu_mul/attention loaded (rms local={}, elementwise "
+                "local={}, rope local={}, attention local={}, attention "
+                "max T_k={})",
+                kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize,
+                kAttentionLocalSize, kAttentionMaxTk);
 }
 
 void GpuOps::rmsNormAsync(const float* x,
@@ -258,6 +262,53 @@ void GpuOps::ropeInPlaceWithFactorsAsync(float*       x,
     _ropeFfKernel.setGroupSize(kRopeLocalSize, 1, 1);
     _queue.appendLaunch(_ropeFfKernel,
                         groupsForN(total, kRopeLocalSize), 1, 1);
+}
+
+void GpuOps::attentionAsync(const float* q,
+                            const float* k,
+                            const float* v,
+                            std::size_t  T_q,
+                            std::size_t  T_k,
+                            std::size_t  nHeads,
+                            std::size_t  nKvHeads,
+                            std::size_t  headDim,
+                            std::size_t  positionOffset,
+                            float        scale,
+                            float*       out) {
+    if (T_q == 0 || T_k == 0 || nHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (nKvHeads == 0 || nHeads % nKvHeads != 0) {
+        throw std::runtime_error(
+            "GpuOps::attentionAsync: nHeads (" + std::to_string(nHeads) +
+            ") must be a positive multiple of nKvHeads (" +
+            std::to_string(nKvHeads) + ")");
+    }
+    if (T_k > kAttentionMaxTk) {
+        throw std::runtime_error(
+            "GpuOps::attentionAsync: T_k=" + std::to_string(T_k) +
+            " exceeds compile-time bound ATTN_MAX_TK=" +
+            std::to_string(kAttentionMaxTk) +
+            " — bump ATTN_MAX_TK in kernels/attention.cl + kAttentionMaxTk "
+            "in GpuOps.hpp together");
+    }
+    _attentionKernel.setPtr(0, q);
+    _attentionKernel.setPtr(1, k);
+    _attentionKernel.setPtr(2, v);
+    _attentionKernel.setPtr(3, out);
+    _attentionKernel.setValue<std::int32_t>(4, toInt32(T_q,            "attention T_q"));
+    _attentionKernel.setValue<std::int32_t>(5, toInt32(T_k,            "attention T_k"));
+    _attentionKernel.setValue<std::int32_t>(6, toInt32(nHeads,         "attention nHeads"));
+    _attentionKernel.setValue<std::int32_t>(7, toInt32(nKvHeads,       "attention nKvHeads"));
+    _attentionKernel.setValue<std::int32_t>(8, toInt32(headDim,        "attention headDim"));
+    _attentionKernel.setValue<std::int32_t>(9, toInt32(positionOffset, "attention positionOffset"));
+    _attentionKernel.setValue<float>(10, scale);
+    _attentionKernel.setGroupSize(kAttentionLocalSize, 1, 1);
+    // One workgroup per (head, query-position).
+    _queue.appendLaunch(_attentionKernel,
+                        static_cast<std::uint32_t>(nHeads),
+                        static_cast<std::uint32_t>(T_q),
+                        1);
 }
 
 } // namespace mimirmind::compute
