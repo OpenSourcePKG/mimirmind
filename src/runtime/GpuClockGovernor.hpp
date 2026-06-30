@@ -97,9 +97,18 @@ private:
     // sustained) reaches steady-state in ~5-10 s, cool-down takes
     // 30-60 s once heat is in the heatsink. A symmetric controller
     // overshoots on the cool side and re-spikes on the next workload
-    // burst. Drop fast (kGainDown), creep up (kGainUp) — ratio 1:10.
-    static constexpr float kGainUpMhzPerC      = 10.0F;
-    static constexpr float kGainDownMhzPerC    = 100.0F;
+    // burst. Drop faster (kGainDown), creep up (kGainUp) — ratio 1:2.
+    //
+    // M9.6 shipped at 1:10 (100/10) because there was no inter-request
+    // recovery — once we hit RPn we stayed there. M9.6.1 added a
+    // per-request resetToMax(), which catches the worst case at the
+    // request boundary; the in-run controller can afford to be less
+    // paranoid. M9.6.2 retunes to 50/25 so a 5 °C overshoot drops the
+    // cap by 250 MHz instead of 500, keeping the iGPU at a usable
+    // mid-frequency through ~6-7 ticks of sustained load instead of
+    // floor-clamping after 3.
+    static constexpr float kGainUpMhzPerC      = 25.0F;
+    static constexpr float kGainDownMhzPerC    = 50.0F;
     // Deadband around target — within this band the cap doesn't move.
     // Stops the 1-MHz-per-tick wiggle when the chip is sitting near
     // target. ±0.5 °C is below the resolution of x86_pkg_temp anyway.
