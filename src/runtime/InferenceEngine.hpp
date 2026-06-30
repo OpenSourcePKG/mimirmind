@@ -14,6 +14,10 @@
 #include "runtime/UsmAllocator.hpp"
 #include "runtime/UsmHandle.hpp"
 
+namespace mimirmind::runtime {
+class ThermalGuard;
+} // namespace mimirmind::runtime
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -119,6 +123,14 @@ public:
         return _cachedTokens.size();
     }
 
+    /// Install (or remove with nullptr) the thermal guard the decode
+    /// loop should consult. The engine does not own the guard. If set,
+    /// generate() will call checkAdmission() before prefill (which may
+    /// throw ThermalLimitExceeded) and pace the decode loop based on
+    /// paceForCurrentReading() between every few tokens.
+    void setThermalGuard(ThermalGuard* guard) noexcept { _thermalGuard = guard; }
+    [[nodiscard]] ThermalGuard* thermalGuard() const noexcept { return _thermalGuard; }
+
     // --- Accessors (used by smoke path + diagnostics) -------------------
 
     [[nodiscard]] L0Context&               ctx()              noexcept { return _ctx; }
@@ -182,6 +194,10 @@ private:
     std::size_t                        _cacheMaxT    {0};   // max prompt-chunk it was sized for
     std::size_t                        _cacheVocabLm {0};   // lm-head vocab the logits buf fits
     std::vector<std::int32_t>          _cachedTokens;
+
+    // Optional non-owning thermal guard. Engine consults it once before
+    // prefill (admission) and every few decode tokens (pacing).
+    ThermalGuard*                      _thermalGuard{nullptr};
 
     // One-shot block-0 trace. Default off so production serve mode is
     // quiet; set MIMIRMIND_TRACE_BLOCK0=1 to enable when bringing up a

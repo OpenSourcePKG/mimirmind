@@ -1,0 +1,8 @@
+{
+  "name": "workstation",
+  "description": "Tower workstation with active cooling, can sustain Tjmax-adjacent temperatures for hours. Mostly here as a 'I trust my cooling' example — throttle only kicks in just before the kernel would itself.",
+
+  "package_temp_soft_c":     90,
+  "package_temp_hard_c":    100,
+  "package_throttle_max_ms": 100
+}

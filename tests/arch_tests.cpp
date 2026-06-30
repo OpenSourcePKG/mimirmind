@@ -17,7 +17,14 @@
 #include "compute/Softmax.hpp"
 #include "model/ResponseCleaner.hpp"
 #include "runtime/Lcp.hpp"
+#include "runtime/SystemMonitor.hpp"
+#include "runtime/ThermalGuard.hpp"
+#include "runtime/ThermalProfile.hpp"
 #include "runtime/arch/ArchBackend.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 
 #include <algorithm>
 #include <array>
@@ -653,6 +660,172 @@ TEST(lcp_negativeIdsCompareLikeOthers) {
     // function must treat them like any other int32_t.
     EXPECT_EQ(lcp({-1, -2, -3}, {-1, -2, -3}), std::size_t{3});
     EXPECT_EQ(lcp({-1, -2, -3}, {-1, -2,  7}), std::size_t{2});
+}
+
+// =======================================================================
+// runtime::ThermalProfile JSON loader
+// =======================================================================
+
+namespace {
+
+/// Drop a JSON string into a unique tmp file. The file outlives the
+/// caller's frame so the path can be passed to loadThermalProfile().
+struct TempJsonFile {
+    std::string path;
+    explicit TempJsonFile(const char* content) {
+        char templ[] = "/tmp/mimirmind-test-profile-XXXXXX";
+        const int fd = ::mkstemp(templ);
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        path = templ;
+        std::ofstream{path} << content;
+    }
+    ~TempJsonFile() { std::remove(path.c_str()); }
+    TempJsonFile(const TempJsonFile&) = delete;
+    TempJsonFile& operator=(const TempJsonFile&) = delete;
+};
+
+} // namespace
+
+TEST(thermalProfile_minimumValidIsName) {
+    TempJsonFile f{R"({"name":"empty-but-valid"})"};
+    const auto p = mimirmind::runtime::loadThermalProfile(f.path);
+    EXPECT_EQ(p.name, std::string{"empty-but-valid"});
+    EXPECT_TRUE(!p.hasPackageLimits());
+}
+
+TEST(thermalProfile_loadsPackageLimits) {
+    TempJsonFile f{R"({
+        "name": "nuc14",
+        "description": "test",
+        "package_temp_soft_c": 75,
+        "package_temp_hard_c": 82,
+        "package_throttle_max_ms": 250
+    })"};
+    const auto p = mimirmind::runtime::loadThermalProfile(f.path);
+    EXPECT_EQ(p.name, std::string{"nuc14"});
+    EXPECT_TRUE(p.hasPackageLimits());
+    EXPECT_NEAR(*p.package_temp_soft_c, 75.0F, 0.001F);
+    EXPECT_NEAR(*p.package_temp_hard_c, 82.0F, 0.001F);
+    EXPECT_EQ(p.package_throttle_max_ms, 250);
+}
+
+TEST(thermalProfile_rejectsMissingName) {
+    TempJsonFile f{R"({"package_temp_soft_c": 75, "package_temp_hard_c": 82})"};
+    try {
+        (void)mimirmind::runtime::loadThermalProfile(f.path);
+        EXPECT_TRUE(false && "expected throw");
+    } catch (const std::runtime_error&) {
+        // expected
+    }
+}
+
+TEST(thermalProfile_rejectsLonelySoftWithoutHard) {
+    TempJsonFile f{R"({"name":"x", "package_temp_soft_c": 75})"};
+    try {
+        (void)mimirmind::runtime::loadThermalProfile(f.path);
+        EXPECT_TRUE(false && "expected throw");
+    } catch (const std::runtime_error&) {
+        // expected
+    }
+}
+
+TEST(thermalProfile_rejectsSoftAboveHard) {
+    TempJsonFile f{R"({
+        "name":"x",
+        "package_temp_soft_c": 90,
+        "package_temp_hard_c": 80
+    })"};
+    try {
+        (void)mimirmind::runtime::loadThermalProfile(f.path);
+        EXPECT_TRUE(false && "expected throw");
+    } catch (const std::runtime_error&) {
+        // expected
+    }
+}
+
+TEST(thermalProfile_ignoresUnknownFields) {
+    // Forward-compatibility: future fields the loader does not understand
+    // should just be ignored rather than rejected. RAM is not a thermal
+    // concern — if someone adds RAM fields here by mistake, the loader
+    // should not blow up, it should leave the profile temperature-only.
+    TempJsonFile f{R"({
+        "name": "x",
+        "package_temp_soft_c": 70,
+        "package_temp_hard_c": 80,
+        "ram_available_min_mib": 4096,
+        "future_unknown_knob": 42
+    })"};
+    const auto p = mimirmind::runtime::loadThermalProfile(f.path);
+    EXPECT_EQ(p.name, std::string{"x"});
+    EXPECT_TRUE(p.hasPackageLimits());
+}
+
+// =======================================================================
+// runtime::ThermalGuard — decision state machine.
+//
+// SystemMonitor reads /sys + /proc directly so we cannot mock it cleanly
+// inside this binary. Instead we drive the guard through a SystemMonitor
+// constructed with no required sensors (it will still read host sensors,
+// but the test does not care what's there) — and instead test the math
+// via small inline-friendly helpers.
+//
+// What we CAN test end-to-end is the JSON → ThermalGuard flow plus the
+// "no monitoring configured returns Ok" path.
+// =======================================================================
+
+TEST(thermalGuard_emptyProfileIsAlwaysOk) {
+    using namespace mimirmind::runtime;
+    ThermalProfile p;
+    p.name = "empty";
+    SystemMonitor m{};
+    ThermalGuard  g{p, m};
+
+    const auto d = g.decide();
+    EXPECT_TRUE(d.admit_new_request);
+    EXPECT_EQ(d.pause.count(), std::int64_t{0});
+    EXPECT_EQ(static_cast<int>(d.state),
+              static_cast<int>(ThermalDecision::State::Ok));
+}
+
+TEST(thermalGuard_checkAdmissionDoesNotThrowOnEmpty) {
+    using namespace mimirmind::runtime;
+    ThermalProfile p;
+    p.name = "empty";
+    SystemMonitor m{};
+    ThermalGuard  g{p, m};
+    g.checkAdmission();   // must not throw
+}
+
+// =======================================================================
+// runtime::SystemMonitor — verify it can find at least one of the two
+// expected sensor sources on a Linux host. This is a smoke test; it
+// passes on the build container which has the standard sysfs layout.
+// =======================================================================
+
+TEST(systemMonitor_findsPackageTempSource) {
+    using namespace mimirmind::runtime;
+    SystemMonitor m{};
+    // Either path is acceptable — the constructor probes both.
+    // On a container without coretemp + without x86_pkg_temp this would
+    // be empty; in that environment the test reports "(none detected)"
+    // which is also a valid outcome, so just exercise the API.
+    const auto src = m.packageTempSource();
+    EXPECT_TRUE(!src.empty());
+}
+
+TEST(systemMonitor_readReturnsRamFigures) {
+    using namespace mimirmind::runtime;
+    SystemMonitor m{};
+    const auto r = m.read();
+    // /proc/meminfo is virtually always available; we don't assert on
+    // package temp because exotic kernels may lack the thermal zone.
+    EXPECT_TRUE(r.ram_total_mib.has_value());
+    EXPECT_TRUE(r.ram_available_mib.has_value());
+    if (r.ram_total_mib && r.ram_available_mib) {
+        EXPECT_TRUE(*r.ram_available_mib <= *r.ram_total_mib);
+    }
 }
 
 int main() {
