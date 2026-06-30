@@ -898,6 +898,30 @@ TEST(powerMonitor_findsPackageAndPsys) {
     EXPECT_EQ(names.size(), std::size_t{3});
 }
 
+TEST(powerMonitor_dedupesByName) {
+    // Reproduces the observed Meteor Lake layout: package-0 is exposed
+    // both at the top level (intel-rapl:0) AND as a sub-domain of psys
+    // (intel-rapl:1:0). Both read the same physical counter — keeping
+    // only one is the right behavior.
+    FakeRapl r;
+    r.addDomain("intel-rapl:0",   "package-0", 1'000'000ULL, 65'536'000'000ULL);
+    r.addDomain("intel-rapl:0:0", "core",        500'000ULL, 65'536'000'000ULL);
+    r.addDomain("intel-rapl:0:1", "uncore",      100'000ULL, 65'536'000'000ULL);
+    r.addDomain("intel-rapl:1",   "psys",      3'000'000ULL, 65'536'000'000ULL);
+    r.addDomain("intel-rapl:1:0", "package-0", 1'000'000ULL, 65'536'000'000ULL);
+
+    mimirmind::runtime::PowerMonitor m{r.root};
+    EXPECT_TRUE(m.available());
+    const auto names = m.domainNames();
+    // 4 distinct names — package-0 only counted once.
+    EXPECT_EQ(names.size(), std::size_t{4});
+    int packageCount = 0;
+    for (const auto& n : names) {
+        if (n == "package-0") ++packageCount;
+    }
+    EXPECT_EQ(packageCount, 1);
+}
+
 TEST(powerMonitor_energyBetweenSimpleDelta) {
     FakeRapl r;
     r.addDomain("intel-rapl:0", "package-0", 0ULL, 65'536'000'000ULL);

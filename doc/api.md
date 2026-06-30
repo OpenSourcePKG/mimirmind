@@ -373,6 +373,14 @@ controls both ends of the conversation.
 
 ### Cache scope and lifecycle
 
+- **Pre-allocated, fixed size.** On first generate() the engine
+  allocates KV state for `MIMIRMIND_MAX_CONTEXT_TOKENS` (default
+  8192) tokens. This is the per-request hard cap on
+  `prompt_tokens + max_tokens`; exceeding it returns an error
+  rather than silently dropping the cache. The fixed size is
+  what makes multi-turn prefix reuse actually work — without it,
+  a growing prompt across turns would reallocate-and-reset the
+  cache every turn.
 - **One slot.** The engine holds the KV state of exactly one
   conversation at a time. A request whose prompt does not share a
   prefix with the cached tokens evicts the previous slot
@@ -381,7 +389,28 @@ controls both ends of the conversation.
   Restarting the server wipes it.
 - **Concurrency.** The handler mutex serialises generate() calls,
   so the cache is naturally consistent. Multi-slot cache + per-
-  request KV is M9.2 (not yet implemented).
+  request KV is M9.3 (not yet implemented).
 - **Errors.** If `generate()` throws partway through, the cache is
   reset before the exception propagates — no half-written KV
   survives into the next request.
+
+### Sizing the cache
+
+KV-cache size grows linearly with `MIMIRMIND_MAX_CONTEXT_TOKENS`.
+For Gemma 4 26B (30 layers, hybrid SWA/full attention with
+1024/2048 kv-dim), the rough cost is **~430 KiB per token**
+across all layers:
+
+| MAX_CONTEXT_TOKENS | KV cache size | Good for |
+|---|---|---|
+| 2048 | ~870 MiB | Short single-turn prompts only |
+| 4096 | ~1.7 GiB | Default-ish chat history |
+| **8192** (default) | **~3.4 GiB** | **Long chat, modest RAG context** |
+| 16384 | ~6.9 GiB | RAG with large doc context |
+| 32768 | ~13.7 GiB | Long-document analysis |
+
+The number is rough — actual cost depends on the model's KV head
+dimensions. The exact bytes are logged at startup
+(`kvcache: pre-allocated for N tokens`). For mimirmind running
+alongside ~22 GiB of Gemma 4 26B weights on a 64 GiB UMA host,
+sizes up to ~16K are comfortable.

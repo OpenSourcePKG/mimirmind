@@ -129,6 +129,20 @@ public:
         return _cachedTokens.size();
     }
 
+    /// Maximum total prompt + max_new_tokens any single generate() call
+    /// can hold in the persistent KV-cache. The cache is sized to this
+    /// number once and never reallocated for growth — that's what makes
+    /// multi-turn prefix reuse actually work, since growing requests
+    /// would otherwise reset the cache between turns.
+    ///
+    /// Setting a new value AFTER the cache is already allocated takes
+    /// effect on the next loadModel()/resetCache cycle. Setting it
+    /// before the first generate() is the normal path.
+    void setMaxContextTokens(std::size_t n) noexcept { _maxContextTokens = n; }
+    [[nodiscard]] std::size_t maxContextTokens() const noexcept {
+        return _maxContextTokens;
+    }
+
     /// Install (or remove with nullptr) the thermal guard the decode
     /// loop should consult. The engine does not own the guard. If set,
     /// generate() will call checkAdmission() before prefill (which may
@@ -169,13 +183,12 @@ private:
                             float*                        matmulScratch,
                             const compute::SamplingParams& sampling);
 
-    /// Allocate or grow the persistent KV-cache, BlockBuffers, and the
-    /// reusable xBuf/normFinal/logits/logitsSc scratch buffers so they
-    /// fit a request of `Tp` prompt tokens with a cache capacity of
-    /// `cacheMax`. Invalidates `_cachedTokens` (the data is being
-    /// thrown away if the buffers grow). No-op if the existing
-    /// allocations already fit.
-    void ensureCapacity(std::size_t Tp, std::size_t cacheMax,
+    /// Allocate (lazily on first call) the persistent KV-cache at the
+    /// configured `_maxContextTokens`. Validates that the request fits.
+    /// Reallocates the chunk-sized scratch (BlockBuffers, xBuf, logits)
+    /// only when the request grew — these are state-free and can be
+    /// thrown out without losing cached tokens.
+    void ensureCapacity(std::size_t maxT, std::size_t Tp, std::size_t maxNew,
                        std::size_t vocab_lm, std::size_t d_model);
 
     L0Context                          _ctx;
@@ -203,8 +216,8 @@ private:
     UsmHandle                          _normFinalH;
     UsmHandle                          _logitsH;
     UsmHandle                          _logitsScH;
-    std::size_t                        _cacheCapacity{0};   // cacheMax it was sized for
-    std::size_t                        _cacheMaxT    {0};   // max prompt-chunk it was sized for
+    std::size_t                        _maxContextTokens{8192}; // see setMaxContextTokens
+    std::size_t                        _cacheMaxT    {0};   // max prompt-chunk scratch was sized for
     std::size_t                        _cacheVocabLm {0};   // lm-head vocab the logits buf fits
     std::vector<std::int32_t>          _cachedTokens;
 

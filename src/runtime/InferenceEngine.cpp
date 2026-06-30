@@ -136,37 +136,60 @@ void InferenceEngine::resetCache() noexcept {
     _cachedTokens.clear();
 }
 
-void InferenceEngine::ensureCapacity(std::size_t Tp, std::size_t cacheMax,
+void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
+                                     std::size_t maxNew,
                                      std::size_t vocab_lm, std::size_t d_model) {
-    const bool needGrow =
-        (_kvCache == nullptr) ||
-        (cacheMax > _cacheCapacity) ||
-        (Tp       > _cacheMaxT)     ||
-        (vocab_lm > _cacheVocabLm);
+    // KvCache + cachedTokens: lifetime-critical. Allocate once at the
+    // configured _maxContextTokens; never realloc on request growth.
+    // This is the change that makes multi-turn prefix reuse actually
+    // work — previously a growing prompt or max_tokens would trip the
+    // realloc-and-reset path and lose every cached token.
+    if (_kvCache == nullptr) {
+        _kvCache = std::make_unique<KvCache>(
+            _allocator, _maxContextTokens, _backend->kvDimPerLayer());
+        MM_LOG_INFO("kvcache",
+                    "pre-allocated for {} tokens (set via "
+                    "MIMIRMIND_MAX_CONTEXT_TOKENS)",
+                    _maxContextTokens);
+    }
 
-    if (!needGrow) {
+    // Hard cap: a request that doesn't fit gets a clear error rather
+    // than silently overflowing the cache. Operator can raise
+    // MIMIRMIND_MAX_CONTEXT_TOKENS if the workload needs it.
+    if (Tp + maxNew + 4 > _maxContextTokens) {
+        throw std::runtime_error(
+            "generate: request needs " + std::to_string(Tp + maxNew + 4) +
+            " tokens of KV (prompt " + std::to_string(Tp) +
+            " + max_new " + std::to_string(maxNew) +
+            " + slack 4) but the engine is configured for "
+            + std::to_string(_maxContextTokens) +
+            " — raise MIMIRMIND_MAX_CONTEXT_TOKENS or shrink the request");
+    }
+
+    // BlockBuffers + scratch: purely transient, safe to realloc on
+    // demand. scoreScratch inside BlockBuffers is sized to the cache
+    // capacity (not the request chunk) so attention can scan the full
+    // current KV length even when the chunk is just 1 decode token.
+    const bool needScratchGrow =
+        !_blockBuffers.has_value() ||
+        maxT      > _cacheMaxT ||
+        vocab_lm  > _cacheVocabLm;
+
+    if (!needScratchGrow) {
         return;
     }
 
-    // Drop the cached tokens — buffers grow, the KV data they held
-    // is no longer where the new layers expect it (different maxSeq
-    // layout for the per-layer buffers).
-    _cachedTokens.clear();
-
-    _kvCache = std::make_unique<KvCache>(
-        _allocator, cacheMax, _backend->kvDimPerLayer());
-
     const auto [qDimMax, kvDimMax] = _backend->maxQKVDims();
     _blockBuffers = allocBlockBuffers(_allocator, _config,
-                                      Tp, cacheMax, qDimMax, kvDimMax);
+                                      maxT, _maxContextTokens,
+                                      qDimMax, kvDimMax);
 
-    _xBufH      = UsmHandle{_allocator, Tp        * d_model  * sizeof(float)};
+    _xBufH      = UsmHandle{_allocator, maxT      * d_model  * sizeof(float)};
     _normFinalH = UsmHandle{_allocator, d_model   * sizeof(float)};
     _logitsH    = UsmHandle{_allocator, vocab_lm  * sizeof(float)};
     _logitsScH  = UsmHandle{_allocator, d_model   * sizeof(float)};
 
-    _cacheCapacity = cacheMax;
-    _cacheMaxT     = Tp;
+    _cacheMaxT     = maxT;
     _cacheVocabLm  = vocab_lm;
 }
 
@@ -275,11 +298,10 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
     const std::size_t vocab_emb = tokEmb->dimensions.size() >= 2
                                     ? tokEmb->dimensions[1]
                                     : _tokenizer.vocabSize();
-    const std::size_t cacheMax  = Tp + maxNew + 4;
     const std::size_t maxT      = std::max<std::size_t>(Tp, 1);
     const std::size_t d_model   = _config.embeddingLength;
 
-    ensureCapacity(maxT, cacheMax, vocab_lm, d_model);
+    ensureCapacity(maxT, Tp, maxNew, vocab_lm, d_model);
     KvCache&      cache   = *_kvCache;
     BlockBuffers& buffers = *_blockBuffers;
 
@@ -402,7 +424,7 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
         constexpr std::size_t kPaceWindow = 4;
 
         for (std::size_t step = 1;
-             !aborted && step < maxNew && cache.length() < cacheMax;
+             !aborted && step < maxNew && cache.length() < _maxContextTokens;
              ++step)
         {
             if (isStop(nextId)) {

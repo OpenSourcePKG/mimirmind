@@ -118,6 +118,18 @@ void PowerMonitor::probe(std::string_view sysfsRoot) {
         if (d.name.empty()) {
             d.name = std::move(fallbackName);
         }
+
+        // Dedupe by name. Some Intel platforms expose the package
+        // counter twice — once as a top-level intel-rapl:0 (package-0)
+        // and once as a sub-domain intel-rapl:1:0 of psys (also named
+        // "package-0"). Both read the same physical counter, so keeping
+        // both inflates the domain list without adding information.
+        for (const auto& existing : _domains) {
+            if (existing.name == d.name) {
+                return;
+            }
+        }
+
         d.energyUjPath = energyPath;
         d.maxRangeUj   = maxRange;
         _domains.push_back(std::move(d));
