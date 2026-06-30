@@ -8,6 +8,11 @@
 # Voraussetzungen:
 #   - GGUFs liegen unter ${MIMIRMIND_MODELS_DIR} (default: ./models)
 #   - Intel iGPU/dGPU unter /dev/dri verfügbar
+#   - Thermal-Profile-JSON unter ${MIMIRMIND_THERMAL_PROFILE_HOST}
+#     (default ./thermal-profile.json) — siehe doc/operations.md
+#   - LXC-Layer reicht /sys/devices/virtual/powercap durch (für RAPL),
+#     wenn dieser Container in einem Proxmox-CT läuft:
+#       lxc.mount.entry: /sys/devices/virtual/powercap sys/devices/virtual/powercap none bind,ro,create=dir 0 0
 #
 # Gemeinsame Env-Variablen (für beide Workflows unten):
 #
@@ -15,6 +20,7 @@
 #   export MIMIRMIND_MODEL_PATH=/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
 #   export MIMIRMIND_RENDER_GID=$(getent group render | cut -d: -f3)
 #   export MIMIRMIND_VIDEO_GID=$(getent group video  | cut -d: -f3)
+#   export MIMIRMIND_THERMAL_PROFILE_HOST=/etc/mimirmind/thermal-nuc14.json
 #
 # Standard-Command in diesem File ist `serve` (Production-Pfad). Smoke
 # muss man explizit anstoßen — siehe unten.
@@ -76,6 +82,14 @@ services:
             - "${MIMIRMIND_RENDER_GID:-104}"
             - "${MIMIRMIND_VIDEO_GID:-44}"
 
+        # Hebt die Docker-Default-Maskierung von /sys/devices/virtual/powercap
+        # auf, damit der Engine die Intel-RAPL-Energy-Counters lesen kann.
+        # Ohne das melden /v1/system/status und die per-request usage einfach
+        # "power unavailable". Platypus-Side-Channel ist für eine LLM-
+        # Inferenz-Workload nicht relevant.
+        security_opt:
+            - systempaths=unconfined
+
         # M7d/M7e — OpenAI-compatible HTTP API. Host-Port via
         # MIMIRMIND_PORT env, Container-Port ist fest 8080 (siehe `command`).
         ports:
@@ -100,9 +114,15 @@ services:
             # Pflicht: ohne kein M3-Load. `?` lässt compose früh failen.
             MIMIRMIND_MODEL_PATH: ${MIMIRMIND_MODEL_PATH:?set MIMIRMIND_MODEL_PATH=/models/<file>.gguf}
 
+            # Thermal-Profile-Pfad im Container. Bind-mounted aus
+            # ${MIMIRMIND_THERMAL_PROFILE_HOST}. Falls die Host-Datei nicht
+            # existiert, weigert sich compose mit klarem "no such file".
+            MIMIRMIND_THERMAL_PROFILE: /etc/mimirmind/thermal-profile.json
+
         volumes:
             - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
             - ./run-logs:/logs:rw
+            - ${MIMIRMIND_THERMAL_PROFILE_HOST:-./thermal-profile.json}:/etc/mimirmind/thermal-profile.json:ro
 
         restart: "no"
         stdin_open: true
