@@ -148,6 +148,7 @@ add_executable(mimirmind
     src/model/GgufReader.cpp
     src/model/GgufTypes.cpp
     src/model/LlmConfig.cpp
+    src/model/ResponseCleaner.cpp
     src/model/Tokenizer.cpp
     src/model/WeightsMap.cpp
     src/runtime/BlockBuffers.cpp
@@ -232,6 +233,7 @@ add_executable(arch_tests
     src/compute/Attention.cpp
     src/compute/MoeRouting.cpp
     src/compute/Softmax.cpp
+    src/model/ResponseCleaner.cpp
     src/runtime/Log.cpp
 )
 

@@ -15,6 +15,7 @@
 #include "compute/Attention.hpp"
 #include "compute/MoeRouting.hpp"
 #include "compute/Softmax.hpp"
+#include "model/ResponseCleaner.hpp"
 #include "runtime/arch/ArchBackend.hpp"
 
 #include <algorithm>
@@ -23,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <set>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -440,6 +442,159 @@ TEST(moe_topKExceedsNExpertsThrows) {
     } catch (const std::runtime_error&) {
         // expected
     }
+}
+
+// =======================================================================
+// model::ResponseCleaner — Gemma 4 channel-wrapper strip at token level.
+//
+// The cleaner is the SSE-streaming counterpart to ChatTemplate::cleanResponse.
+// It consumes (id, text) pairs and decides which to surface to the client.
+//
+// Token IDs in these tests are arbitrary fixtures — the cleaner only cares
+// about equality against the constructor-supplied channel-start / channel-end
+// ids. We use 1000 and 1001 to keep them distinct from any "real text" id.
+// =======================================================================
+
+namespace {
+constexpr std::int32_t kFakeChannelStart = 1000;
+constexpr std::int32_t kFakeChannelEnd   = 1001;
+constexpr std::int32_t kFakeTextId       = 42;  // any non-special token
+
+bool feedAndCapture(mimirmind::model::ResponseCleaner& c,
+                    std::int32_t                       id,
+                    std::string                        text,
+                    std::string&                       captured) {
+    const bool emit = c.feed(id, text);
+    if (emit) {
+        captured.append(text);
+    }
+    return emit;
+}
+} // namespace
+
+TEST(responseCleaner_qwen_passThrough) {
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::QwenChatML, -1, -1};
+
+    std::string out;
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId, "Hello", out));
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId, ", ",    out));
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId, "world", out));
+    EXPECT_EQ(out, std::string{"Hello, world"});
+}
+
+TEST(responseCleaner_qwen_dropsEmptyText) {
+    // Even in pass-through mode, an empty token text should not be emitted —
+    // matches the existing onToken behaviour of skipping empty decodes.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::QwenChatML, -1, -1};
+
+    std::string empty;
+    EXPECT_TRUE(!c.feed(kFakeTextId, empty));
+}
+
+TEST(responseCleaner_gemma3_passThrough) {
+    // Gemma 3 has no thinking-channel wrapper, so the cleaner is a no-op
+    // even though the IDs were supplied.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::Gemma3,
+                      kFakeChannelStart, kFakeChannelEnd};
+
+    std::string out;
+    // Even if the model somehow emitted the channel-start id, Gemma 3 mode
+    // surfaces it as visible text (the id is just text in this style).
+    EXPECT_TRUE(feedAndCapture(c, kFakeChannelStart, "<|channel>", out));
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId,       "hi",         out));
+    EXPECT_EQ(out, std::string{"<|channel>hi"});
+}
+
+TEST(responseCleaner_gemma4_stripsChannelWrapper) {
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::Gemma4,
+                      kFakeChannelStart, kFakeChannelEnd};
+
+    std::string out;
+
+    // Replay the exact sequence seen on the wire from the live Gemma 4 26B
+    // smoke test against REDACTED_HOST:
+    //
+    //   <|channel>  thought  \n  <channel|>  The  capital ...
+    //
+    // Expected: only "The capital..." reaches `out`.
+    EXPECT_TRUE(!feedAndCapture(c, kFakeChannelStart, "<|channel>", out));
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId,       "thought",    out));
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId,       "\n",         out));
+    EXPECT_TRUE(!feedAndCapture(c, kFakeChannelEnd,   "<channel|>", out));
+    EXPECT_TRUE(feedAndCapture (c, kFakeTextId,       "The",        out));
+    EXPECT_TRUE(feedAndCapture (c, kFakeTextId,       " capital",   out));
+    EXPECT_EQ(out, std::string{"The capital"});
+}
+
+TEST(responseCleaner_gemma4_stripsTrailingWhitespaceAfterChannel) {
+    // Even if the channel close is immediately followed by several
+    // whitespace-only tokens, all of them get dropped until visible
+    // content arrives.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::Gemma4,
+                      kFakeChannelStart, kFakeChannelEnd};
+
+    std::string out;
+    EXPECT_TRUE(!feedAndCapture(c, kFakeChannelStart, "<|channel>", out));
+    EXPECT_TRUE(!feedAndCapture(c, kFakeChannelEnd,   "<channel|>", out));
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId,       "\n",         out));
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId,       " ",          out));
+    EXPECT_TRUE(feedAndCapture (c, kFakeTextId,       "Hi",         out));
+    EXPECT_EQ(out, std::string{"Hi"});
+}
+
+TEST(responseCleaner_gemma4_partialLeadingWhitespaceInToken) {
+    // If the first non-whitespace token starts with whitespace bytes
+    // (e.g. " Paris"), only the leading whitespace is stripped — the
+    // rest is emitted.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::Gemma4,
+                      kFakeChannelStart, kFakeChannelEnd};
+
+    std::string out;
+    EXPECT_TRUE(!feedAndCapture(c, kFakeChannelStart, "<|channel>", out));
+    EXPECT_TRUE(!feedAndCapture(c, kFakeChannelEnd,   "<channel|>", out));
+    EXPECT_TRUE(feedAndCapture (c, kFakeTextId,       "  Paris",    out));
+    EXPECT_TRUE(feedAndCapture (c, kFakeTextId,       ".",          out));
+    EXPECT_EQ(out, std::string{"Paris."});
+}
+
+TEST(responseCleaner_gemma4_missingIdsDisablesStrip) {
+    // If the tokenizer does not have the channel-start/end specials, the
+    // cleaner cannot recognise them and falls back to pass-through. This
+    // mirrors the safety guarantee in forStyle() when findToken returns -1.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::Gemma4, -1, -1};
+
+    std::string out;
+    EXPECT_TRUE(feedAndCapture(c, kFakeChannelStart, "<|channel>", out));
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId,       "thought",    out));
+    EXPECT_EQ(out, std::string{"<|channel>thought"});
+}
+
+TEST(responseCleaner_gemma4_noChannelInOutput) {
+    // If the model never emits the wrapper at all, the cleaner is fully
+    // transparent — first token reaches the client unchanged.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::Gemma4,
+                      kFakeChannelStart, kFakeChannelEnd};
+
+    std::string out;
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId, "Direct", out));
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId, " answer", out));
+    EXPECT_EQ(out, std::string{"Direct answer"});
 }
 
 int main() {
