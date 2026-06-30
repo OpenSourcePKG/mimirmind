@@ -8,6 +8,7 @@
 
 namespace mimirmind::runtime {
 class L0Context;
+class UsmAllocator;
 }
 
 namespace mimirmind::compute {
@@ -26,8 +27,10 @@ namespace mimirmind::compute {
  */
 class GpuOps {
 public:
-    GpuOps(runtime::L0Context& ctx, runtime::CommandQueue& queue);
-    ~GpuOps() = default;
+    GpuOps(runtime::L0Context&    ctx,
+           runtime::UsmAllocator& alloc,
+           runtime::CommandQueue& queue);
+    ~GpuOps();
 
     GpuOps(const GpuOps&)            = delete;
     GpuOps& operator=(const GpuOps&) = delete;
@@ -152,6 +155,7 @@ public:
 private:
     runtime::L0Context&    _ctx;
     runtime::CommandQueue& _queue;
+    runtime::UsmAllocator& _alloc;
 
     runtime::GpuModule     _rmsnormModule;
     runtime::GpuKernel     _rmsnormKernel;
@@ -186,11 +190,58 @@ private:
     runtime::GpuModule     _attentionModule;
     runtime::GpuKernel     _attentionKernel;
 
+    runtime::GpuModule     _attentionFlashPartialModule;
+    runtime::GpuKernel     _attentionFlashPartialKernel;
+
+    runtime::GpuModule     _attentionFlashMergeModule;
+    runtime::GpuKernel     _attentionFlashMergeKernel;
+
+    // Persistent USM scratch for the FlashAttention partial/merge
+    // pipeline. Sized at construction for the worst case across the
+    // models we run; reused across every decode call (the engine
+    // serialises calls via engineMutex so no aliasing is possible).
+    void*                  _flashPartialUsm{nullptr};
+    std::size_t            _flashPartialBytes{0};
+
     static constexpr std::uint32_t kRmsnormLocalSize     = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;
     static constexpr std::uint32_t kRopeLocalSize        = 256;
     // Must match ATTN_LOCAL / ATTN_SG in kernels/attention.cl.
     static constexpr std::uint32_t kAttentionLocalSize   = 16;
+
+    // Must match ATTN_FLASH_KTILE in kernels/attention_flash_partial.cl
+    // and ATTN_FLASH_MAX_KTILES in kernels/attention_flash_merge.cl.
+    static constexpr std::size_t kFlashKTileSize    = 256;
+    static constexpr std::size_t kFlashMaxKTiles    = kAttentionMaxTk /
+                                                      kFlashKTileSize;
+    // Worst-case dims sized for Gemma 4 26B full-attention layers.
+    // Bumping these only costs the static USM allocation size below.
+    static constexpr std::size_t kFlashMaxHeads     = 64;
+    static constexpr std::size_t kFlashMaxHeadDim   = 256;
+
+    // Internal dispatch — variant (a) for T_q > 1, FlashAttention for
+    // T_q == 1. Hidden behind attentionAsync.
+    void attentionPlainAsync(const float* q,
+                             const float* k,
+                             const float* v,
+                             std::size_t  T_q,
+                             std::size_t  T_k,
+                             std::size_t  nHeads,
+                             std::size_t  nKvHeads,
+                             std::size_t  headDim,
+                             std::size_t  positionOffset,
+                             float        scale,
+                             float*       out);
+    void attentionDecodeFlashAsync(const float* q,
+                                   const float* k,
+                                   const float* v,
+                                   std::size_t  T_k,
+                                   std::size_t  nHeads,
+                                   std::size_t  nKvHeads,
+                                   std::size_t  headDim,
+                                   std::size_t  positionOffset,
+                                   float        scale,
+                                   float*       out);
 };
 
 } // namespace mimirmind::compute
