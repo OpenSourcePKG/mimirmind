@@ -239,6 +239,61 @@ TEST(rmsnorm_no_weight) {
 // Element-wise: add_bias, add_residual, mul_scalar
 // =======================================================================
 
+TEST(commandQueue_unorderedScopeBarrierPublishesWrites) {
+    // Two independent silu_mul launches inside an UnorderedScope, then
+    // an addResidual that READS one of the scope's outputs. If the
+    // pop's barrier didn't land, the addResidual could see stale data
+    // and the output would mismatch the CPU reference.
+    constexpr std::size_t N = 4096;
+
+    auto a = generateFloats(N, 0xA1);   // gate input for scope op 1
+    auto b = generateFloats(N, 0xA2);   // up input for scope op 1
+    auto c = generateFloats(N, 0xA3);   // gate input for scope op 2
+    auto d = generateFloats(N, 0xA4);   // up input for scope op 2
+    auto e = generateFloats(N, 0xA5);   // residual target (read+written)
+
+    UsmBuf bufA(N * sizeof(float));
+    UsmBuf bufB(N * sizeof(float));
+    UsmBuf bufC(N * sizeof(float));
+    UsmBuf bufD(N * sizeof(float));
+    UsmBuf bufE(N * sizeof(float));
+    std::memcpy(bufA.raw(), a.data(), N * sizeof(float));
+    std::memcpy(bufB.raw(), b.data(), N * sizeof(float));
+    std::memcpy(bufC.raw(), c.data(), N * sizeof(float));
+    std::memcpy(bufD.raw(), d.data(), N * sizeof(float));
+    std::memcpy(bufE.raw(), e.data(), N * sizeof(float));
+
+    EXPECT_EQ(fx().queue.unorderedDepth(), std::uint32_t{0});
+    {
+        mimirmind::runtime::UnorderedScope u{fx().queue};
+        EXPECT_EQ(fx().queue.unorderedDepth(), std::uint32_t{1});
+        fx().ops.siluMulAsync(bufA.as<float>(), bufB.as<float>(), N);
+        fx().ops.siluMulAsync(bufC.as<float>(), bufD.as<float>(), N);
+    }
+    EXPECT_EQ(fx().queue.unorderedDepth(), std::uint32_t{0});
+
+    // addResidual reads bufC which the second silu_mul wrote. With the
+    // scope-pop barrier, bufC's writes are published before this read.
+    fx().ops.addResidualAsync(bufE.as<float>(), bufC.as<float>(), N);
+    fx().queue.flush();
+
+    std::vector<float> aRef(N), cRef(N), eRef(N);
+    for (std::size_t i = 0; i < N; ++i) {
+        const float g1 = a[i];
+        aRef[i] = (g1 / (1.0F + std::exp(-g1))) * b[i];
+        const float g2 = c[i];
+        cRef[i] = (g2 / (1.0F + std::exp(-g2))) * d[i];
+        eRef[i] = e[i] + cRef[i];
+    }
+
+    EXPECT_ARRAY_NEAR("scope_siluA", bufA.as<float>(), aRef.data(),
+                      N, 1e-5F);
+    EXPECT_ARRAY_NEAR("scope_siluC", bufC.as<float>(), cRef.data(),
+                      N, 1e-5F);
+    EXPECT_ARRAY_NEAR("scope_residual_reads_scope_output",
+                      bufE.as<float>(), eRef.data(), N, 1e-5F);
+}
+
 TEST(add_residual_basic) {
     constexpr std::size_t N = 8192;
 

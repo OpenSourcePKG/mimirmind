@@ -5,6 +5,7 @@
 #include "runtime/Log.hpp"
 
 #include <limits>
+#include <stdexcept>
 
 namespace mimirmind::runtime {
 
@@ -72,23 +73,56 @@ void CommandQueue::appendLaunch(GpuKernel&    kernel,
         nullptr, 0, nullptr));
 
     // Level Zero does NOT insert an implicit memory barrier between
-    // consecutive kernel launches in the same command list — execution
-    // order is preserved but memory writes from kernel N may not be
-    // visible to kernel N+1 without explicit synchronization. Append
-    // a generic barrier here so every appendLaunch is safely orderable
-    // with respect to subsequent launches on the same queue. Cost is
-    // negligible vs the kernel work itself; the alternative (events +
-    // explicit dependency tracking per call site) is much more code
-    // for the same memory guarantees, and matmul-only batches (M5g)
-    // already used independent output buffers where this would no-op.
-    ZE_CHECK(zeCommandListAppendBarrier(_cmdList, nullptr, 0, nullptr));
+    // consecutive kernel launches — execution order is preserved but
+    // memory writes from kernel N may not be visible to kernel N+1
+    // without explicit synchronisation (see commit `40db230`). In the
+    // default "ordered" mode we append a generic barrier here so the
+    // caller doesn't have to track dependencies. Within an unordered
+    // scope the caller has asserted that the writes are independent
+    // and we skip the barrier; the matching popUnordered() inserts
+    // exactly one barrier at the end of the group.
+    if (_unorderedDepth == 0) {
+        ZE_CHECK(zeCommandListAppendBarrier(_cmdList, nullptr, 0, nullptr));
+    }
 
     _hasPending = true;
+}
+
+void CommandQueue::pushUnordered() {
+    ++_unorderedDepth;
+}
+
+void CommandQueue::popUnordered() {
+    if (_unorderedDepth == 0) {
+        MM_LOG_ERROR("gpu",
+                     "CommandQueue::popUnordered called with depth=0");
+        throw std::logic_error(
+            "CommandQueue::popUnordered without matching pushUnordered");
+    }
+    --_unorderedDepth;
+    if (_unorderedDepth == 0 && _hasPending) {
+        ZE_CHECK(zeCommandListAppendBarrier(_cmdList, nullptr, 0, nullptr));
+    }
+}
+
+void CommandQueue::appendBarrier() {
+    ZE_CHECK(zeCommandListAppendBarrier(_cmdList, nullptr, 0, nullptr));
 }
 
 void CommandQueue::flush() {
     if (!_hasPending) {
         return;
+    }
+    if (_unorderedDepth != 0) {
+        // Flushing inside an unordered scope drops the trailing
+        // barrier that would have been inserted at pop. Whoever flushes
+        // is reading results on the CPU after sync, which carries its
+        // own ordering guarantee — but the scope is logically broken;
+        // log loud.
+        MM_LOG_ERROR("gpu",
+                     "CommandQueue::flush while unorderedDepth={} — "
+                     "missing popUnordered before flush", _unorderedDepth);
+        _unorderedDepth = 0;
     }
     ZE_CHECK(zeCommandListClose(_cmdList));
     ZE_CHECK(zeCommandQueueExecuteCommandLists(

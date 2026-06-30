@@ -254,68 +254,68 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                          normBuf, T, dst, matmulScratch);
     };
 
-    trace("Q projection");
-    projectAsync(qW, q_dim, qBuf);
-
-    trace("K projection");
-    projectAsync(kW, kv_dim, kSlot);
+    // M5f.4: Q/K/V projections write disjoint buffers. The pop inserts
+    // a single barrier so the norms below see all three matmul outputs.
+    trace("Q+K+V projections (matmulAsync, unordered)");
+    {
+        runtime::UnorderedScope u{_ops.queue()};
+        projectAsync(qW, q_dim, qBuf);
+        projectAsync(kW, kv_dim, kSlot);
+        if (!li.altAttention) {
+            projectAsync(vW, kv_dim, vSlot);
+        }
+    }
 
     if (li.altAttention) {
         // V = raw K projection. We need a copy of K *before* K-norm and
-        // RoPE so V keeps its raw layout. KvCache writes V into vSlot;
-        // copy the raw K rows there now (sync first so the K matmul has
-        // settled on USM).
+        // RoPE so V keeps its raw layout. The unordered pop above
+        // already issued a barrier; flush so the host memcpy reads a
+        // settled USM region.
         trace("alt-attn V = raw K (memcpy)");
         _gmm.sync();
         std::memcpy(vSlot, kSlot, T * kv_dim * sizeof(float));
-    } else {
-        trace("V projection");
-        projectAsync(vW, kv_dim, vSlot);
     }
 
-    // K-norm BEFORE RoPE (per-head, like Q-norm below).
-    trace("K-norm");
-    _ops.rmsNormAsync(kSlot, T * li.nKvHeads, head_dim,
-                      static_cast<const float*>(kNorm->usmPtr),
-                      _config.rmsNormEps,
-                      kSlot);              // in-place
+    // Q-norm, K-norm, V-norm — three in-place norms on three different
+    // buffers, each depends on its own projection (visible via the
+    // projections' pop barrier above).
+    trace("Q+K+V norms (rmsNorm, unordered)");
+    {
+        runtime::UnorderedScope u{_ops.queue()};
+        _ops.rmsNormAsync(qBuf, T * li.nHeads, head_dim,
+                          static_cast<const float*>(qNorm->usmPtr),
+                          _config.rmsNormEps,
+                          qBuf);                   // in-place
+        _ops.rmsNormAsync(kSlot, T * li.nKvHeads, head_dim,
+                          static_cast<const float*>(kNorm->usmPtr),
+                          _config.rmsNormEps,
+                          kSlot);              // in-place
+        _ops.rmsNormNoWeightAsync(vSlot, T * li.nKvHeads, head_dim,
+                                  _config.rmsNormEps,
+                                  vSlot);            // in-place
+    }
 
-    // V-norm: bare RMSNorm over head_dim, no learned weight.
-    trace("V-norm (no weight)");
-    _ops.rmsNormNoWeightAsync(vSlot, T * li.nKvHeads, head_dim,
-                              _config.rmsNormEps,
-                              vSlot);            // in-place
-
-    // RoPE K only (V never gets RoPE).
-    trace("RoPE K");
-    if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
-        _ops.ropeInPlaceWithFactorsAsync(kSlot, _ropeFreqsForFullAttn, T,
-                                         li.nKvHeads, head_dim, curLen,
-                                         li.ropeBase);
-    } else {
-        _ops.ropeInPlaceAsync(kSlot, T, li.nKvHeads, head_dim, curLen,
-                              li.ropeBase);
+    // RoPE Q and RoPE K — independent buffers, V skipped (no RoPE).
+    trace("RoPE Q+K (unordered)");
+    {
+        runtime::UnorderedScope u{_ops.queue()};
+        if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
+            _ops.ropeInPlaceWithFactorsAsync(qBuf, _ropeFreqsForFullAttn, T,
+                                             li.nHeads, head_dim, curLen,
+                                             li.ropeBase);
+            _ops.ropeInPlaceWithFactorsAsync(kSlot, _ropeFreqsForFullAttn, T,
+                                             li.nKvHeads, head_dim, curLen,
+                                             li.ropeBase);
+        } else {
+            _ops.ropeInPlaceAsync(qBuf, T, li.nHeads, head_dim, curLen,
+                                  li.ropeBase);
+            _ops.ropeInPlaceAsync(kSlot, T, li.nKvHeads, head_dim, curLen,
+                                  li.ropeBase);
+        }
     }
     dumpStage("Kcur_pos",    kSlot, T, kv_dim);
     dumpStage("Vcur_normed", vSlot, T, kv_dim);
-
-    // Q-K-norm BEFORE RoPE (per-head RMSNorm over head_dim).
-    trace("Q-norm");
-    _ops.rmsNormAsync(qBuf, T * li.nHeads, head_dim,
-                      static_cast<const float*>(qNorm->usmPtr),
-                      _config.rmsNormEps,
-                      qBuf);                   // in-place
-
-    trace("RoPE Q");
-    if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
-        _ops.ropeInPlaceWithFactorsAsync(qBuf, _ropeFreqsForFullAttn, T,
-                                         li.nHeads, head_dim, curLen,
-                                         li.ropeBase);
-    } else {
-        _ops.ropeInPlaceAsync(qBuf, T, li.nHeads, head_dim, curLen,
-                              li.ropeBase);
-    }
-    dumpStage("Qcur_pos", qBuf, T, q_dim);
+    dumpStage("Qcur_pos",    qBuf,  T, q_dim);
 
     // M5f.3: attention on the GPU. Gemma 4's f_attention_scale = 1.0
     // (gemma4.cpp:11), so we pass scale=1.0 directly — no sqrt(head_dim)
@@ -357,12 +357,15 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                       _config.rmsNormEps,
                       normBuf);
 
-    trace("FFN gate proj");
-    _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
-                     normBuf, T, gateOutBuf, matmulScratch);
-    trace("FFN up proj");
-    _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
-                     normBuf, T, upOutBuf, matmulScratch);
+    // M5f.4: FFN gate + up read normBuf, write disjoint outputs.
+    trace("FFN gate+up proj (unordered)");
+    {
+        runtime::UnorderedScope u{_ops.queue()};
+        _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
+                         normBuf, T, gateOutBuf, matmulScratch);
+        _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
+                         normBuf, T, upOutBuf, matmulScratch);
+    }
 
     trace("GELU + mul (fused)");
     _ops.geluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
@@ -381,17 +384,20 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
 
     // --- Path B — MoE -------------------------------------------------
 
-    trace("path B: pre_ffw_norm_2");
-    _ops.rmsNormAsync(x, T, d_model,
-                      static_cast<const float*>(preNorm2->usmPtr),
-                      _config.rmsNormEps,
-                      normBuf);
-
-    trace("path B: router rmsNorm + scale");
-    _ops.rmsNormAsync(x, T, d_model,
-                      static_cast<const float*>(routerScale->usmPtr),
-                      _config.rmsNormEps,
-                      attnOutBuf);
+    // M5f.4: two rmsNorms on the same input x with different weights and
+    // different output buffers — fully independent, can pipeline.
+    trace("path B: pre_ffw_norm_2 + router rmsNorm (unordered)");
+    {
+        runtime::UnorderedScope u{_ops.queue()};
+        _ops.rmsNormAsync(x, T, d_model,
+                          static_cast<const float*>(preNorm2->usmPtr),
+                          _config.rmsNormEps,
+                          normBuf);
+        _ops.rmsNormAsync(x, T, d_model,
+                          static_cast<const float*>(routerScale->usmPtr),
+                          _config.rmsNormEps,
+                          attnOutBuf);
+    }
     const float invSqrtDm = 1.0F /
         std::sqrt(static_cast<float>(d_model));
     _ops.mulScalarAsync(attnOutBuf, invSqrtDm, T * d_model);

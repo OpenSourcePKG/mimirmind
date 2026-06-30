@@ -58,12 +58,57 @@ public:
                   std::uint32_t groupCountY = 1,
                   std::uint32_t groupCountZ = 1);
 
+    // -- M5f.4 — selective-barrier API ---------------------------------
+    //
+    // By default appendLaunch inserts a memory barrier after every kernel
+    // launch so subsequent launches see its writes (Level Zero does not
+    // do this implicitly — see M5f.1 + commit `40db230`). Within an
+    // "unordered" scope the caller asserts that the launches inside it
+    // write to DISJOINT memory regions and so can pipeline freely. The
+    // pop() inserts a single barrier so the group's collective output is
+    // visible to subsequent ordered launches. Use the RAII
+    // UnorderedScope helper below in 99% of cases.
+
+    /// Mark the start of an unordered launch group. While at depth > 0
+    /// appendLaunch skips its post-launch barrier.
+    void pushUnordered();
+
+    /// End an unordered launch group. When depth drops to 0, a single
+    /// barrier is appended so the group's writes are visible to the
+    /// next ordered launch. Assert-fires if called more often than push.
+    void popUnordered();
+
+    /// Append a one-shot memory barrier. Useful when you need a barrier
+    /// between two ordered launches that live in different functions.
+    void appendBarrier();
+
+    /// Test helper / sanity probe.
+    [[nodiscard]] std::uint32_t unorderedDepth() const noexcept { return _unorderedDepth; }
+
 private:
     L0Context&                _ctx;
-    ze_command_queue_handle_t _queue     {nullptr};
-    ze_command_list_handle_t  _cmdList   {nullptr};
-    std::uint32_t             _ordinal   {0};
-    bool                      _hasPending{false};
+    ze_command_queue_handle_t _queue         {nullptr};
+    ze_command_list_handle_t  _cmdList       {nullptr};
+    std::uint32_t             _ordinal       {0};
+    std::uint32_t             _unorderedDepth{0};
+    bool                      _hasPending    {false};
+};
+
+/// RAII helper around pushUnordered() / popUnordered(). Construct a
+/// scope around a sequence of provably-independent kernel launches; the
+/// destructor inserts the trailing barrier.
+class UnorderedScope {
+public:
+    explicit UnorderedScope(CommandQueue& q) : _q{q} { _q.pushUnordered(); }
+    ~UnorderedScope() { _q.popUnordered(); }
+
+    UnorderedScope(const UnorderedScope&)            = delete;
+    UnorderedScope& operator=(const UnorderedScope&) = delete;
+    UnorderedScope(UnorderedScope&&)                 = delete;
+    UnorderedScope& operator=(UnorderedScope&&)      = delete;
+
+private:
+    CommandQueue& _q;
 };
 
 } // namespace mimirmind::runtime

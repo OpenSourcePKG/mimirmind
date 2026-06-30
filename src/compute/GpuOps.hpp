@@ -143,6 +143,12 @@ public:
     /// max-context budgets up front.
     static constexpr std::size_t kAttentionMaxTk = 8192;
 
+    /// Accessor to the underlying command queue. Backends use this to
+    /// construct UnorderedScope around clearly-parallel kernel groups
+    /// (M5f.4). The queue is also shared with GpuMatmul, so wrapping
+    /// matmul + GpuOps launches in the same scope works as expected.
+    [[nodiscard]] runtime::CommandQueue& queue() noexcept { return _queue; }
+
 private:
     runtime::L0Context&    _ctx;
     runtime::CommandQueue& _queue;
