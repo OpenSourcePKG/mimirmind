@@ -93,6 +93,7 @@ set(KERNEL_SOURCES
     kernels/attention.cl
     kernels/attention_flash_partial.cl
     kernels/attention_flash_merge.cl
+    kernels/scaled_add_residual.cl
 )
 
 set(KERNEL_SPV_FILES "")

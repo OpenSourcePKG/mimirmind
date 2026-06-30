@@ -294,6 +294,52 @@ TEST(commandQueue_unorderedScopeBarrierPublishesWrites) {
                       bufE.as<float>(), eRef.data(), N, 1e-5F);
 }
 
+TEST(scaled_add_residual_basic) {
+    // Fused dst[i] += scale * src[i]. Replaces a mulScalar(src,scale) +
+    // addResidual(dst,src) pair in the Gemma 4 MoE per-expert loop.
+    constexpr std::size_t N    = 4096;
+    constexpr float       SCAL = 0.375F;
+
+    auto dst = generateFloats(N, 0xB1);
+    auto src = generateFloats(N, 0xB2);
+
+    UsmBuf bufDst(N * sizeof(float));
+    UsmBuf bufSrc(N * sizeof(float));
+    std::memcpy(bufDst.raw(), dst.data(), N * sizeof(float));
+    std::memcpy(bufSrc.raw(), src.data(), N * sizeof(float));
+
+    fx().ops.scaledAddResidualAsync(bufDst.as<float>(), bufSrc.as<float>(),
+                                    SCAL, N);
+    fx().queue.flush();
+
+    std::vector<float> cpu(N);
+    for (std::size_t i = 0; i < N; ++i) {
+        cpu[i] = dst[i] + SCAL * src[i];
+    }
+
+    EXPECT_ARRAY_NEAR("scaled_add_residual", bufDst.as<float>(), cpu.data(),
+                      N, 1e-5F);
+}
+
+TEST(scaled_add_residual_zeroScale) {
+    // scale=0 should leave dst unchanged. Edge case worth pinning.
+    constexpr std::size_t N = 1024;
+    auto dst = generateFloats(N, 0xB3);
+    auto src = generateFloats(N, 0xB4);
+
+    UsmBuf bufDst(N * sizeof(float));
+    UsmBuf bufSrc(N * sizeof(float));
+    std::memcpy(bufDst.raw(), dst.data(), N * sizeof(float));
+    std::memcpy(bufSrc.raw(), src.data(), N * sizeof(float));
+
+    fx().ops.scaledAddResidualAsync(bufDst.as<float>(), bufSrc.as<float>(),
+                                    0.0F, N);
+    fx().queue.flush();
+
+    EXPECT_ARRAY_NEAR("scaled_add_residual_zeroScale",
+                      bufDst.as<float>(), dst.data(), N, 0.0F);
+}
+
 TEST(add_residual_basic) {
     constexpr std::size_t N = 8192;
 
