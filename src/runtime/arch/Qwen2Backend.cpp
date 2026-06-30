@@ -130,24 +130,41 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     float* kSlot = cache.writeSlotK(blockIdx);
     float* vSlot = cache.writeSlotV(blockIdx);
 
-    trace("Q projection (matmulAsync)");
-    projectAsync(qW, q_dim,  qBuf);
-    trace("K projection (matmulAsync)");
-    projectAsync(kW, kv_dim, kSlot);
-    trace("V projection (matmulAsync)");
-    projectAsync(vW, kv_dim, vSlot);
-    trace("QKV bias add (async)");
-    addBiasIf(qB, q_dim,  qBuf);
-    addBiasIf(kB, kv_dim, kSlot);
-    addBiasIf(vB, kv_dim, vSlot);
+    // M5f.4: Q/K/V projections write disjoint buffers and depend only
+    // on normBuf (already published by the rmsnorm above). They can
+    // pipeline freely inside the unordered scope; the scope's pop
+    // emits a single barrier that the bias adds + RoPE read against.
+    trace("Q+K+V projections (matmulAsync, unordered)");
+    {
+        runtime::UnorderedScope u{_ops.queue()};
+        projectAsync(qW, q_dim,  qBuf);
+        projectAsync(kW, kv_dim, kSlot);
+        projectAsync(vW, kv_dim, vSlot);
+    }
 
-    trace("RoPE Q+K (async)");
-    _ops.ropeInPlaceAsync(qBuf, T,
-                          _config.headCount,   head_dim, curLen,
-                          _config.ropeFreqBase);
-    _ops.ropeInPlaceAsync(kSlot, T,
-                          _config.headCountKv, head_dim, curLen,
-                          _config.ropeFreqBase);
+    // QKV bias adds — each adds to its own buffer, independent of the
+    // others. The bias add does read its own projection output, so
+    // this scope's preceding barrier (from the Q/K/V projection pop
+    // above) is what makes the chain safe.
+    trace("QKV bias add (async, unordered)");
+    {
+        runtime::UnorderedScope u{_ops.queue()};
+        addBiasIf(qB, q_dim,  qBuf);
+        addBiasIf(kB, kv_dim, kSlot);
+        addBiasIf(vB, kv_dim, vSlot);
+    }
+
+    // RoPE on Q and K — independent buffers, no V-dependency.
+    trace("RoPE Q+K (async, unordered)");
+    {
+        runtime::UnorderedScope u{_ops.queue()};
+        _ops.ropeInPlaceAsync(qBuf, T,
+                              _config.headCount,   head_dim, curLen,
+                              _config.ropeFreqBase);
+        _ops.ropeInPlaceAsync(kSlot, T,
+                              _config.headCountKv, head_dim, curLen,
+                              _config.ropeFreqBase);
+    }
 
     // M5f.3: attention is on the GPU. No sync needed before it — the
     // command-list barriers chain RoPE → attention. O-projection
@@ -178,11 +195,17 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                       _config.rmsNormEps,
                       normBuf);
 
-    trace("FFN gate+up (matmulAsync)");
-    _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
-                     normBuf, T, gateOutBuf, matmulScratch);
-    _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
-                     normBuf, T, upOutBuf, matmulScratch);
+    // M5f.4: FFN gate and up are independent — both read normBuf, write
+    // to different output buffers. silu_mul (the next op) reads BOTH so
+    // the pop's barrier is what protects it.
+    trace("FFN gate+up (matmulAsync, unordered)");
+    {
+        runtime::UnorderedScope u{_ops.queue()};
+        _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
+                         normBuf, T, gateOutBuf, matmulScratch);
+        _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
+                         normBuf, T, upOutBuf, matmulScratch);
+    }
 
     trace("FFN silu+mul (async, fused)");
     _ops.siluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
