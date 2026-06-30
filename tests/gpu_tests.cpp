@@ -47,7 +47,7 @@ struct GpuFixture {
     mimirmind::runtime::L0Context    ctx;
     mimirmind::runtime::UsmAllocator usm{ctx};
     mimirmind::runtime::CommandQueue queue{ctx};
-    mimirmind::compute::GpuOps       ops{ctx, queue};
+    mimirmind::compute::GpuOps       ops{ctx, usm, queue};
     mimirmind::compute::GpuMatmul    gmm{ctx, queue};
 };
 
@@ -593,6 +593,69 @@ TEST(attention_decode_gemma_scale_one) {
                        /*positionOffset=*/15,
                        /*scale=*/1.0F,
                        /*seed=*/0x75, /*tol=*/1e-4F);
+}
+
+// -- M5f.3.2 Flash-only stress cases ------------------------------------
+//
+// Decode (T_q == 1) routes through the K-tiled FlashAttention path. These
+// cases push past the single-tile boundary (K_TILE_SIZE = 256) so the
+// online-softmax merge across multiple tiles actually runs and gets
+// compared to the CPU reference.
+
+TEST(attention_decode_flash_twoTiles) {
+    // T_k = 512 → 2 tiles. Position right at the end so kMax spans both.
+    runAttentionParity("attn_flash_2tiles",
+                       /*T_q=*/1, /*T_k=*/512,
+                       /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/511,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0x81, /*tol=*/2e-4F);
+}
+
+TEST(attention_decode_flash_tileBoundary) {
+    // positionOffset = 255 → kMax = 256, exactly fills tile 0; tile 1
+    // is entirely past kMax and must emit a neutral partial that the
+    // merge correctly ignores.
+    runAttentionParity("attn_flash_boundary",
+                       /*T_q=*/1, /*T_k=*/512,
+                       /*nHeads=*/4, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/255,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0x82, /*tol=*/1e-4F);
+}
+
+TEST(attention_decode_flash_eightTiles) {
+    // T_k = 2048 → 8 tiles. Larger headDim (128) covers the Qwen-like
+    // shape under flash.
+    runAttentionParity("attn_flash_8tiles",
+                       /*T_q=*/1, /*T_k=*/2048,
+                       /*nHeads=*/16, /*nKvHeads=*/4, /*headDim=*/128,
+                       /*positionOffset=*/2047,
+                       /*scale=*/1.0F / std::sqrt(128.0F),
+                       /*seed=*/0x83, /*tol=*/5e-4F);
+}
+
+TEST(attention_decode_flash_maxKTiles) {
+    // T_k = 8192 → 32 tiles, the compile-time MAX_K_TILES bound. Also
+    // exercises a Gemma-4-style 8q→2kv GQA group with headDim=128.
+    runAttentionParity("attn_flash_maxTiles",
+                       /*T_q=*/1, /*T_k=*/8192,
+                       /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                       /*positionOffset=*/8191,
+                       /*scale=*/1.0F / std::sqrt(128.0F),
+                       /*seed=*/0x84, /*tol=*/2e-3F);
+}
+
+TEST(attention_decode_flash_partialKTileTail) {
+    // kMax = 1300 → tile 0..4 fully populated, tile 5 holds 1300-1280
+    // = 20 keys, tiles 6+ are neutral. Mixed populated + partial +
+    // empty exercises every branch of the partial kernel.
+    runAttentionParity("attn_flash_partialTail",
+                       /*T_q=*/1, /*T_k=*/2048,
+                       /*nHeads=*/4, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/1299,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0x85, /*tol=*/5e-4F);
 }
 
 // =======================================================================

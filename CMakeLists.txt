@@ -91,6 +91,8 @@ set(KERNEL_SOURCES
     kernels/rmsnorm_no_weight.cl
     kernels/rope_inplace_ff.cl
     kernels/attention.cl
+    kernels/attention_flash_partial.cl
+    kernels/attention_flash_merge.cl
 )
 
 set(KERNEL_SPV_FILES "")

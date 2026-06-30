@@ -2,6 +2,7 @@
 
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
+#include "runtime/UsmAllocator.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -31,9 +32,12 @@ std::uint32_t groupsForN(std::size_t n, std::uint32_t local) {
 
 } // namespace
 
-GpuOps::GpuOps(runtime::L0Context& ctx, runtime::CommandQueue& queue)
+GpuOps::GpuOps(runtime::L0Context&    ctx,
+               runtime::UsmAllocator& alloc,
+               runtime::CommandQueue& queue)
     : _ctx{ctx},
       _queue{queue},
+      _alloc{alloc},
       _rmsnormModule    {ctx, "rmsnorm"},
       _rmsnormKernel    {_rmsnormModule.kernel("rmsnorm")},
       _addBiasModule    {ctx, "add_bias"},
@@ -55,16 +59,40 @@ GpuOps::GpuOps(runtime::L0Context& ctx, runtime::CommandQueue& queue)
       _ropeFfModule    {ctx, "rope_inplace_ff"},
       _ropeFfKernel    {_ropeFfModule.kernel("rope_inplace_ff")},
       _attentionModule {ctx, "attention"},
-      _attentionKernel {_attentionModule.kernel("attention")}
+      _attentionKernel {_attentionModule.kernel("attention")},
+      _attentionFlashPartialModule{ctx, "attention_flash_partial"},
+      _attentionFlashPartialKernel{
+          _attentionFlashPartialModule.kernel("attention_flash_partial")},
+      _attentionFlashMergeModule  {ctx, "attention_flash_merge"},
+      _attentionFlashMergeKernel  {
+          _attentionFlashMergeModule.kernel("attention_flash_merge")}
 {
+    // Persistent FlashAttention partial-tile scratch. Sized for the
+    // worst case across our target models; reused across every decode
+    // call. Layout: [nHeads, K_TILES, (2 + headDim)] f32.
+    _flashPartialBytes =
+        kFlashMaxHeads * kFlashMaxKTiles *
+        (2 + kFlashMaxHeadDim) * sizeof(float);
+    _flashPartialUsm = _alloc.allocate(_flashPartialBytes);
+
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
                 "add_bias/add_residual/silu_mul/rope/rope_ff/mul_scalar/"
-                "gelu_mul/attention loaded (rms local={}, elementwise "
-                "local={}, rope local={}, attention local={}, attention "
-                "max T_k={})",
+                "gelu_mul/attention/attention_flash loaded (rms local={}, "
+                "elementwise local={}, rope local={}, attention local={}, "
+                "attention max T_k={}, flash kTile={}, flash maxHeads={}, "
+                "flash maxHeadDim={}, flash partial scratch={} bytes)",
                 kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize,
-                kAttentionLocalSize, kAttentionMaxTk);
+                kAttentionLocalSize, kAttentionMaxTk,
+                kFlashKTileSize, kFlashMaxHeads, kFlashMaxHeadDim,
+                _flashPartialBytes);
+}
+
+GpuOps::~GpuOps() {
+    if (_flashPartialUsm != nullptr) {
+        _alloc.deallocate(_flashPartialUsm, _flashPartialBytes);
+        _flashPartialUsm = nullptr;
+    }
 }
 
 void GpuOps::rmsNormAsync(const float* x,
@@ -292,6 +320,41 @@ void GpuOps::attentionAsync(const float* q,
             " — bump ATTN_MAX_TK in kernels/attention.cl + kAttentionMaxTk "
             "in GpuOps.hpp together");
     }
+
+    // M5f.3.2: dispatch by query length. Decode (T_q == 1) goes through
+    // the FlashAttention K-tiled path which launches nHeads × K_TILES
+    // workgroups, getting the iGPU off the under-saturated nHeads-only
+    // geometry of variant (a). Prefill keeps variant (a) because T_q ×
+    // nHeads is already plenty of workgroups, and the scratch buffer
+    // for partials would scale quadratically with context length.
+    if (T_q == 1) {
+        if (nHeads > kFlashMaxHeads || headDim > kFlashMaxHeadDim) {
+            throw std::runtime_error(
+                "GpuOps::attentionAsync: flash path needs nHeads<=" +
+                std::to_string(kFlashMaxHeads) + " and headDim<=" +
+                std::to_string(kFlashMaxHeadDim) + " (got " +
+                std::to_string(nHeads) + " / " + std::to_string(headDim) +
+                "); bump kFlashMax* and the kernel constants together");
+        }
+        attentionDecodeFlashAsync(q, k, v, T_k, nHeads, nKvHeads, headDim,
+                                  positionOffset, scale, out);
+    } else {
+        attentionPlainAsync(q, k, v, T_q, T_k, nHeads, nKvHeads, headDim,
+                            positionOffset, scale, out);
+    }
+}
+
+void GpuOps::attentionPlainAsync(const float* q,
+                                 const float* k,
+                                 const float* v,
+                                 std::size_t  T_q,
+                                 std::size_t  T_k,
+                                 std::size_t  nHeads,
+                                 std::size_t  nKvHeads,
+                                 std::size_t  headDim,
+                                 std::size_t  positionOffset,
+                                 float        scale,
+                                 float*       out) {
     _attentionKernel.setPtr(0, q);
     _attentionKernel.setPtr(1, k);
     _attentionKernel.setPtr(2, v);
@@ -308,6 +371,62 @@ void GpuOps::attentionAsync(const float* q,
     _queue.appendLaunch(_attentionKernel,
                         static_cast<std::uint32_t>(nHeads),
                         static_cast<std::uint32_t>(T_q),
+                        1);
+}
+
+void GpuOps::attentionDecodeFlashAsync(const float* q,
+                                       const float* k,
+                                       const float* v,
+                                       std::size_t  T_k,
+                                       std::size_t  nHeads,
+                                       std::size_t  nKvHeads,
+                                       std::size_t  headDim,
+                                       std::size_t  positionOffset,
+                                       float        scale,
+                                       float*       out) {
+    // kMax = positionOffset + 1 in decode mode. Cap to T_k just in
+    // case a caller passes a positionOffset >= T_k - 1.
+    const std::size_t kMax =
+        (positionOffset + 1 < T_k) ? (positionOffset + 1) : T_k;
+    const std::size_t nKTiles =
+        (kMax + kFlashKTileSize - 1) / kFlashKTileSize;
+    if (nKTiles == 0 || nKTiles > kFlashMaxKTiles) {
+        throw std::runtime_error(
+            "GpuOps::attentionDecodeFlashAsync: nKTiles=" +
+            std::to_string(nKTiles) + " out of [1, " +
+            std::to_string(kFlashMaxKTiles) + "]");
+    }
+
+    // Pass 1 — per-tile partial (m, l, o_unnorm) into the persistent
+    // USM scratch.
+    _attentionFlashPartialKernel.setPtr(0, q);
+    _attentionFlashPartialKernel.setPtr(1, k);
+    _attentionFlashPartialKernel.setPtr(2, v);
+    _attentionFlashPartialKernel.setPtr(3, _flashPartialUsm);
+    _attentionFlashPartialKernel.setValue<std::int32_t>(4, toInt32(T_k,            "flash T_k"));
+    _attentionFlashPartialKernel.setValue<std::int32_t>(5, toInt32(nHeads,         "flash nHeads"));
+    _attentionFlashPartialKernel.setValue<std::int32_t>(6, toInt32(nKvHeads,       "flash nKvHeads"));
+    _attentionFlashPartialKernel.setValue<std::int32_t>(7, toInt32(headDim,        "flash headDim"));
+    _attentionFlashPartialKernel.setValue<std::int32_t>(8, toInt32(positionOffset, "flash positionOffset"));
+    _attentionFlashPartialKernel.setValue<std::int32_t>(9, toInt32(nKTiles,        "flash nKTiles"));
+    _attentionFlashPartialKernel.setValue<float>(10, scale);
+    _attentionFlashPartialKernel.setGroupSize(kAttentionLocalSize, 1, 1);
+    _queue.appendLaunch(_attentionFlashPartialKernel,
+                        static_cast<std::uint32_t>(nHeads),
+                        static_cast<std::uint32_t>(nKTiles),
+                        1);
+
+    // Pass 2 — merge the per-tile partials into the final output. The
+    // auto-barrier between launches makes partials visible to the merge.
+    _attentionFlashMergeKernel.setPtr(0, _flashPartialUsm);
+    _attentionFlashMergeKernel.setPtr(1, out);
+    _attentionFlashMergeKernel.setValue<std::int32_t>(2, toInt32(nHeads,  "flash_merge nHeads"));
+    _attentionFlashMergeKernel.setValue<std::int32_t>(3, toInt32(headDim, "flash_merge headDim"));
+    _attentionFlashMergeKernel.setValue<std::int32_t>(4, toInt32(nKTiles, "flash_merge nKTiles"));
+    _attentionFlashMergeKernel.setGroupSize(kAttentionLocalSize, 1, 1);
+    _queue.appendLaunch(_attentionFlashMergeKernel,
+                        static_cast<std::uint32_t>(nHeads),
+                        1,
                         1);
 }
 
