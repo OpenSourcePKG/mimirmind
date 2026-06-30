@@ -362,6 +362,20 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
     bool                      hitStop = false;
     bool                      aborted = false;
 
+    // M9.6.1: lift the GPU clock cap back to RP0 before this request
+    // starts. Between requests the asymmetric governor's slow up-gain
+    // (kGainUpMhzPerC = 10) is too sluggish to recover from a
+    // previous cap-down, and tick() only fires inside the decode
+    // loop. Without this, a request that follows a 60 °C-target
+    // throttle session would start pinned at RPn (800 MHz) and pay
+    // ~3x decode latency before the controller could ramp back up.
+    // Letting prefill + early decode run at RP0 and trusting the
+    // tick()-window in the decode loop to cap down on heat is the
+    // right interaction.
+    if (_gpuGovernor != nullptr) {
+        (void)_gpuGovernor->resetToMax();
+    }
+
     try {
         const auto preT0 = clock::now();
         const auto prefillIds = promptIds.subspan(prefillStart, prefillCount);

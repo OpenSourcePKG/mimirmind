@@ -112,6 +112,13 @@ std::uint32_t GpuClockGovernor::setMaxFreqMhz(std::uint32_t mhz) {
     return _currentCap;
 }
 
+std::uint32_t GpuClockGovernor::resetToMax() noexcept {
+    if (!_available) {
+        return 0;
+    }
+    return setMaxFreqMhz(_rp0Mhz);
+}
+
 std::uint32_t GpuClockGovernor::adjustForTemp(float current_temp_c) {
     if (!_available) {
         return 0;

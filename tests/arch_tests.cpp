@@ -1127,6 +1127,22 @@ TEST(gpuGovernor_adjustForTempClampsToRpnOnExtremeHot) {
     EXPECT_EQ(g.adjustForTemp(92.0F), std::uint32_t{800});
 }
 
+TEST(gpuGovernor_resetToMaxLiftsCapToRP0) {
+    // M9.6.1: between requests the asymmetric controller's slow up-gain
+    // means a previously cap-down state pins decode at RPn. resetToMax()
+    // is called per-request to undo that, letting fresh requests start
+    // at RP0 and trusting tick() inside the decode loop to cap down again
+    // if heat climbs.
+    FakeDrm d;
+    d.addCard("card1", 2350, 800, 1200);   // start at a non-RP0 cap
+    mimirmind::runtime::GpuClockGovernor g{d.root};
+    EXPECT_EQ(g.currentCapMhz(), std::uint32_t{1200});
+
+    EXPECT_EQ(g.resetToMax(), std::uint32_t{2350});
+    EXPECT_EQ(g.currentCapMhz(), std::uint32_t{2350});
+    EXPECT_EQ(d.readMax("card1"), std::uint32_t{2350});
+}
+
 TEST(gpuGovernor_destructorRestoresRP0) {
     FakeDrm d;
     d.addCard("card1", 2350, 800, 2350);
