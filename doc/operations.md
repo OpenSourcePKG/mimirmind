@@ -188,17 +188,27 @@ what the GPU clock governor does.
 The governor reads the iGPU's hardware frequency envelope from
 `/sys/class/drm/cardN/gt_RP0_freq_mhz` (max) and `gt_RPn_freq_mhz`
 (min) at startup, then writes `gt_max_freq_mhz` dynamically based
-on the package temperature. The control loop is a P-controller:
+on the package temperature. The control loop is an **asymmetric
+P-controller** with a deadband:
 
 ```
 error = current_temp_c - target_temp_c
-new_cap_mhz = current_cap_mhz - error * 50
+if |error| < 0.5:                 # deadband — sit still
+    new_cap_mhz = current_cap_mhz
+elif error > 0:                   # too hot — drop fast
+    new_cap_mhz = current_cap_mhz - error * 100
+else:                             # too cool — creep up
+    new_cap_mhz = current_cap_mhz - error * 10
 new_cap_mhz = clamp(new_cap_mhz, rpn_mhz, rp0_mhz)
 ```
 
-50 MHz of correction per degree of error. Above target it dials
-the cap down; below target it dials it back up. Steady state sits
-right at the target temperature.
+The 10× ratio between the down-gain and the up-gain reflects the
+package thermals: heat-up reaches steady state in seconds, cool-
+down takes 30-60 seconds once heat is in the heatsink. A symmetric
+controller overshoots on the cool side and re-spikes on the next
+workload burst. The deadband (±0.5 °C) is below the resolution of
+`x86_pkg_temp` and prevents the cap from twitching by ±1 MHz at
+steady state.
 
 The governor ticks every 8 decode tokens (~1.2 s at typical
 Gemma 4 decode rates) — fast enough to react to a thermal climb,

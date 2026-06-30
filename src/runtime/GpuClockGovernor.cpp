@@ -116,11 +116,17 @@ std::uint32_t GpuClockGovernor::adjustForTemp(float current_temp_c) {
     if (!_available) {
         return 0;
     }
-    // P-controller: positive error (too hot) ⇒ negative cap delta.
-    const float error    = current_temp_c - _targetTempC;
-    const float deltaF   = -error * kProportionalMhzPerC;
-    // Round toward zero so a steady-state error doesn't oscillate
-    // by ±1 MHz on every tick.
+    const float error = current_temp_c - _targetTempC;
+
+    // Deadband — within ±kDeadbandC of target the cap is left alone.
+    if (error >= -kDeadbandC && error <= kDeadbandC) {
+        return _currentCap;
+    }
+
+    // Asymmetric gain: drop fast on overshoot, creep up on undershoot.
+    const float gain   = (error > 0.0F) ? kGainDownMhzPerC : kGainUpMhzPerC;
+    const float deltaF = -error * gain;
+    // Round toward zero so a sub-1-MHz target doesn't churn the cap.
     const std::int32_t delta = static_cast<std::int32_t>(deltaF);
     const std::int64_t target =
         static_cast<std::int64_t>(_currentCap) + delta;
