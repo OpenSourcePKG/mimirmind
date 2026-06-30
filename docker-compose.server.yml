@@ -123,6 +123,17 @@ services:
             - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
             - ./run-logs:/logs:rw
             - ${MIMIRMIND_THERMAL_PROFILE_HOST:-./thermal-profile.json}:/etc/mimirmind/thermal-profile.json:ro
+            # iGPU sysfs view (Symlinks für /sys/class/drm/cardN, rw für
+            # den dynamischen GPU-Clock-Governor).
+            - /sys/class/drm:/sys/class/drm:rw
+            # Echtes Device-Verzeichnis hinter den Symlinks. Wir mounten
+            # den /sys/devices-Tree ganz, weil der spezifische PCI-Pfad
+            # (/sys/devices/pci0000:00/0000:00:02.0/drm) Doppelpunkte
+            # enthält und ältere `docker compose`-Versionen das selbst in
+            # der long-form als Short-Form-String an den Daemon
+            # serialisieren — der dann an den Colons stolpert. /sys/devices
+            # selbst ist colon-frei und parsed sauber.
+            - /sys/devices:/sys/devices:rw
 
         restart: "no"
         stdin_open: true
