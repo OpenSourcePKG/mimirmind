@@ -6,6 +6,7 @@
 #include "model/Tokenizer.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/Log.hpp"
+#include "runtime/PowerMonitor.hpp"
 #include "runtime/ThermalGuard.hpp"
 
 #include <httplib.h>
@@ -294,18 +295,40 @@ json buildFinishChunk(const std::string& id, std::int64_t created,
 } // namespace
 
 struct ApiServer::Impl {
-    runtime::InferenceEngine&  engine;
-    ServerConfig               cfg;
-    model::ChatTemplate::Style chatStyle;
-    httplib::Server            server;
-    std::mutex                 engineMutex;
-    std::atomic_bool           started{false};
+    runtime::InferenceEngine&             engine;
+    ServerConfig                          cfg;
+    model::ChatTemplate::Style            chatStyle;
+    httplib::Server                       server;
+    std::mutex                            engineMutex;
+    std::atomic_bool                      started{false};
+
+    // Baseline RAPL snapshot taken once after the engine reports the
+    // model is loaded — represents "engine idle, server warmed up".
+    // Total-since-start energy is computed against this; before it's
+    // captured, totals report 0.
+    std::mutex                            powerStateMutex;
+    runtime::PowerMonitor::Snapshot       powerBaseline{};
+    runtime::PowerMonitor::Snapshot       powerLastStatus{};
+    std::chrono::steady_clock::time_point baselineWallStart{};
+    bool                                  baselineCaptured{false};
 
     Impl(runtime::InferenceEngine& e, ServerConfig c)
         : engine{e}, cfg{std::move(c)},
           chatStyle{model::ChatTemplate::detectFromArch(
               engine.config().architecture)} {
         installRoutes();
+        // Engine is constructed model-loaded already (loadModel is called
+        // before ApiServer wraps it in main.cpp). Capture the baseline
+        // here so it represents "right after model load, before any
+        // requests". If the monitor is unavailable the snapshot will be
+        // empty and totals stay at 0.
+        if (auto* mon = engine.powerMonitor(); mon != nullptr && mon->available()) {
+            std::lock_guard lk{powerStateMutex};
+            powerBaseline      = mon->snapshot();
+            powerLastStatus    = powerBaseline;
+            baselineWallStart  = std::chrono::steady_clock::now();
+            baselineCaptured   = true;
+        }
     }
 
     void installRoutes() {
@@ -424,7 +447,76 @@ struct ApiServer::Impl {
                                        ? json{}
                                        : json{decision.reason}},
         };
+        body["power"]     = buildPowerBlock();
         sendJson(res, 200, body);
+    }
+
+    /// Compose the "power" sub-object of /v1/system/status.
+    ///
+    /// Three views on RAPL energy counters:
+    ///   - watts_now      Average Watts since the last poll of this endpoint
+    ///                    (rolling window — whatever cadence the operator
+    ///                    polls at sets the smoothing interval).
+    ///   - total_joules   Energy consumed since the baseline snapshot
+    ///                    (taken once just after model load).
+    ///   - uptime_s       Seconds since that same baseline.
+    ///
+    /// All are reported per RAPL domain (package / core / uncore / etc.)
+    /// so dashboards can pick what they need.
+    json buildPowerBlock() {
+        auto* mon = engine.powerMonitor();
+        if (mon == nullptr) {
+            return json{
+                {"available", false},
+                {"reason",    "no power monitor installed"},
+            };
+        }
+        if (!mon->available()) {
+            return json{
+                {"available", false},
+                {"reason",    std::string{mon->unavailableReason()}},
+            };
+        }
+
+        const auto now = mon->snapshot();
+        std::vector<double>                  totalJoules;
+        std::vector<double>                  wattsNow;
+        std::chrono::steady_clock::time_point baselineAt;
+        bool                                  haveBaseline = false;
+        {
+            std::lock_guard lk{powerStateMutex};
+            if (baselineCaptured) {
+                totalJoules   = mon->energyBetween(powerBaseline, now);
+                wattsNow      = mon->averageWattsBetween(powerLastStatus, now);
+                baselineAt    = baselineWallStart;
+                powerLastStatus = now;
+                haveBaseline  = true;
+            }
+        }
+
+        json domains = json::array();
+        const auto names = mon->domainNames();
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            json d{{"name", names[i]}};
+            if (haveBaseline && i < wattsNow.size()) {
+                d["watts_now"] = wattsNow[i];
+            }
+            if (haveBaseline && i < totalJoules.size()) {
+                d["total_joules"] = totalJoules[i];
+            }
+            domains.push_back(std::move(d));
+        }
+
+        json out{
+            {"available", true},
+            {"domains",   std::move(domains)},
+        };
+        if (haveBaseline) {
+            const auto uptime_s = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - baselineAt).count();
+            out["uptime_s"] = uptime_s;
+        }
+        return out;
     }
 
     /// Common pre-generation work shared by streaming and non-streaming.
@@ -561,6 +653,18 @@ struct ApiServer::Impl {
 
         const std::string echoModel = cr.model.empty() ? cfg.modelId : cr.model;
 
+        json usage = {
+            {"prompt_tokens",     promptIds.size()},
+            {"completion_tokens", visible.size()},
+            {"total_tokens",      promptIds.size() + visible.size()},
+        };
+        // Extension over the OpenAI shape: per-request energy delta from
+        // the RAPL package counter. Quietly omitted when no power
+        // monitor was active for this call.
+        if (stats.packageJoules > 0.0) {
+            usage["package_joules"] = stats.packageJoules;
+        }
+
         json response = {
             {"id",      respId},
             {"object",  "chat.completion"},
@@ -576,19 +680,16 @@ struct ApiServer::Impl {
                     {"finish_reason", finish},
                 },
             })},
-            {"usage", {
-                {"prompt_tokens",     promptIds.size()},
-                {"completion_tokens", visible.size()},
-                {"total_tokens",      promptIds.size() + visible.size()},
-            }},
+            {"usage", std::move(usage)},
         };
 
         MM_LOG_INFO("server",
                     "chat.completion id={} model={} prompt={} cached={} new={} "
-                    "prefill={:.0f}ms decode={:.0f}ms finish={}",
+                    "prefill={:.0f}ms decode={:.0f}ms energy={:.1f}J finish={}",
                     respId, echoModel,
                     promptIds.size(), stats.cachedTokens, visible.size(),
-                    stats.prefillMs, stats.decodeMs, finish);
+                    stats.prefillMs, stats.decodeMs, stats.packageJoules,
+                    finish);
 
         sendJson(res, 200, response);
     }
@@ -798,11 +899,13 @@ struct ApiServer::Impl {
 
                 MM_LOG_INFO("server",
                             "stream {} model={} prompt={} cached={} emitted={} "
-                            "prefill={:.0f}ms decode={:.0f}ms finish={}",
+                            "prefill={:.0f}ms decode={:.0f}ms energy={:.1f}J "
+                            "finish={}",
                             state->respId, state->echoModel,
                             state->promptIds.size(), stats.cachedTokens,
                             emittedTokens,
-                            stats.prefillMs, stats.decodeMs, finish);
+                            stats.prefillMs, stats.decodeMs,
+                            stats.packageJoules, finish);
 
                 sink.done();
                 return false;

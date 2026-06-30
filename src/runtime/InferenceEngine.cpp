@@ -4,6 +4,7 @@
 #include "model/GgufTypes.hpp"
 #include "runtime/Lcp.hpp"
 #include "runtime/Log.hpp"
+#include "runtime/PowerMonitor.hpp"
 #include "runtime/ThermalGuard.hpp"
 #include "runtime/arch/ArchBackend.hpp"
 
@@ -234,6 +235,14 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
     // guard is installed (op chose to run unprotected).
     if (_thermalGuard != nullptr) {
         _thermalGuard->checkAdmission();
+    }
+
+    // Snapshot RAPL counters at the start so generate() can report how
+    // much energy the request consumed. No-op when the monitor is
+    // unavailable or absent.
+    PowerMonitor::Snapshot powerStart{};
+    if (_powerMonitor != nullptr && _powerMonitor->available()) {
+        powerStart = _powerMonitor->snapshot();
     }
 
     const auto* tokEmb = _weights->find("token_embd.weight");
@@ -470,6 +479,18 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
         outStats->prefillMs       = preMs;
         outStats->decodeMs        = decMs;
         outStats->hitStop         = hitStop;
+
+        if (_powerMonitor != nullptr && _powerMonitor->available() &&
+            !powerStart.raw_energy_uj.empty()) {
+            const auto powerEnd = _powerMonitor->snapshot();
+            const auto joules   = _powerMonitor->energyBetween(powerStart, powerEnd);
+            // The first discovered domain is the package socket (intel-rapl:0).
+            // Report that as the headline figure. Operators who want the
+            // per-sub-domain split can scrape /v1/system/status.
+            if (!joules.empty()) {
+                outStats->packageJoules = joules.front();
+            }
+        }
     }
 
     return generated;

@@ -13,6 +13,7 @@
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
+#include "runtime/PowerMonitor.hpp"
 #include "runtime/SystemMonitor.hpp"
 #include "runtime/ThermalGuard.hpp"
 #include "runtime/ThermalProfile.hpp"
@@ -1190,6 +1191,13 @@ int runServe(const CliArgs& args) {
         engine.setThermalGuard(guard.get());
     }
 
+    // Power telemetry — always-on attempt, never fatal. If RAPL is
+    // masked (Docker / unprivileged LXC without explicit mount) the
+    // monitor reports unavailable and /v1/system/status shows the
+    // reason; the engine still runs.
+    auto powerMonitor = std::make_unique<mimirmind::runtime::PowerMonitor>();
+    engine.setPowerMonitor(powerMonitor.get());
+
     mimirmind::server::ApiServer server{engine, cfg};
 
     g_runningServer.store(&server, std::memory_order_release);
@@ -1212,6 +1220,13 @@ int runServe(const CliArgs& args) {
                   << "' (package=" << monitor->packageTempSource() << ")";
     } else {
         std::cout << "\033[1;33mNOT CONFIGURED — engine is unprotected\033[0m";
+    }
+    std::cout << "\n  power telemetry:    ";
+    if (powerMonitor->available()) {
+        std::cout << "on (" << powerMonitor->domainNames().size()
+                  << " RAPL domain(s))";
+    } else {
+        std::cout << "off (" << powerMonitor->unavailableReason() << ")";
     }
     std::cout << "\n  Ctrl-C to stop.\n";
     std::cout.flush();

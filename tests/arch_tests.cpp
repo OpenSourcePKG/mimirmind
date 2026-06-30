@@ -17,6 +17,7 @@
 #include "compute/Softmax.hpp"
 #include "model/ResponseCleaner.hpp"
 #include "runtime/Lcp.hpp"
+#include "runtime/PowerMonitor.hpp"
 #include "runtime/SystemMonitor.hpp"
 #include "runtime/ThermalGuard.hpp"
 #include "runtime/ThermalProfile.hpp"
@@ -25,6 +26,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <sys/stat.h>
+#include <thread>
 
 #include <algorithm>
 #include <array>
@@ -826,6 +829,126 @@ TEST(systemMonitor_readReturnsRamFigures) {
     if (r.ram_total_mib && r.ram_available_mib) {
         EXPECT_TRUE(*r.ram_available_mib <= *r.ram_total_mib);
     }
+}
+
+// =======================================================================
+// runtime::PowerMonitor — RAPL probing + wrap math
+//
+// The build container does not have RAPL exposed (Docker masks
+// /sys/devices/virtual/powercap by default), so the smoke test just
+// verifies the unavailable path. To test the happy path we point the
+// monitor at a synthetic powercap tree we build under /tmp.
+// =======================================================================
+
+namespace {
+
+struct FakeRapl {
+    std::string root;
+
+    FakeRapl() {
+        char templ[] = "/tmp/mimirmind-rapl-XXXXXX";
+        root = ::mkdtemp(templ);
+    }
+    ~FakeRapl() {
+        // Recursive rmdir via /bin/rm is fine in test scope.
+        const std::string cmd = "rm -rf " + root;
+        const int rc = std::system(cmd.c_str());
+        (void)rc;
+    }
+    FakeRapl(const FakeRapl&) = delete;
+    FakeRapl& operator=(const FakeRapl&) = delete;
+
+    void writeFile(const std::string& rel, const std::string& body) const {
+        const std::string full = root + "/" + rel;
+        std::ofstream{full} << body;
+    }
+    void addDomain(const std::string& dirname,
+                   const std::string& name,
+                   std::uint64_t      energyUj,
+                   std::uint64_t      maxRangeUj) const {
+        const std::string sub = root + "/" + dirname;
+        ::mkdir(sub.c_str(), 0755);
+        std::ofstream{sub + "/name"}                  << name;
+        std::ofstream{sub + "/energy_uj"}             << energyUj;
+        std::ofstream{sub + "/max_energy_range_uj"}   << maxRangeUj;
+    }
+    void setEnergy(const std::string& dirname, std::uint64_t energyUj) const {
+        std::ofstream{root + "/" + dirname + "/energy_uj"} << energyUj;
+    }
+};
+
+} // namespace
+
+TEST(powerMonitor_unavailableOnEmptyTree) {
+    FakeRapl r;
+    mimirmind::runtime::PowerMonitor m{r.root};
+    EXPECT_TRUE(!m.available());
+    EXPECT_TRUE(!m.unavailableReason().empty());
+}
+
+TEST(powerMonitor_findsPackageAndPsys) {
+    FakeRapl r;
+    r.addDomain("intel-rapl:0",   "package-0", 1'000'000ULL, 65'536'000'000ULL);
+    r.addDomain("intel-rapl:0:0", "core",        500'000ULL, 65'536'000'000ULL);
+    r.addDomain("intel-rapl:1",   "psys",      2'000'000ULL, 65'536'000'000ULL);
+
+    mimirmind::runtime::PowerMonitor m{r.root};
+    EXPECT_TRUE(m.available());
+    const auto names = m.domainNames();
+    EXPECT_EQ(names.size(), std::size_t{3});
+}
+
+TEST(powerMonitor_energyBetweenSimpleDelta) {
+    FakeRapl r;
+    r.addDomain("intel-rapl:0", "package-0", 0ULL, 65'536'000'000ULL);
+
+    mimirmind::runtime::PowerMonitor m{r.root};
+    EXPECT_TRUE(m.available());
+
+    const auto s0 = m.snapshot();
+    // Bump energy by 2 J = 2_000_000 µJ.
+    r.setEnergy("intel-rapl:0", 2'000'000ULL);
+    const auto s1 = m.snapshot();
+
+    const auto joules = m.energyBetween(s0, s1);
+    EXPECT_EQ(joules.size(), std::size_t{1});
+    EXPECT_NEAR(static_cast<float>(joules[0]), 2.0F, 1e-6F);
+}
+
+TEST(powerMonitor_energyBetweenHandlesWrap) {
+    FakeRapl r;
+    r.addDomain("intel-rapl:0", "package-0",
+                65'536'000'000ULL - 1'000'000ULL,   // start 1 J below the cap
+                65'536'000'000ULL);
+
+    mimirmind::runtime::PowerMonitor m{r.root};
+    const auto s0 = m.snapshot();
+    // Wrap: counter resets and climbs to 500_000 µJ past zero.
+    r.setEnergy("intel-rapl:0", 500'000ULL);
+    const auto s1 = m.snapshot();
+
+    const auto joules = m.energyBetween(s0, s1);
+    EXPECT_EQ(joules.size(), std::size_t{1});
+    // Expected delta = 1 J before wrap + 0.5 J after = 1.5 J.
+    EXPECT_NEAR(static_cast<float>(joules[0]), 1.5F, 1e-6F);
+}
+
+TEST(powerMonitor_averageWattsBetween) {
+    FakeRapl r;
+    r.addDomain("intel-rapl:0", "package-0", 0ULL, 65'536'000'000ULL);
+
+    mimirmind::runtime::PowerMonitor m{r.root};
+    const auto s0 = m.snapshot();
+    // Wait a little to get a measurable Δt.
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    r.setEnergy("intel-rapl:0", 100'000ULL);   // 0.1 J consumed
+    const auto s1 = m.snapshot();
+
+    const auto watts = m.averageWattsBetween(s0, s1);
+    EXPECT_EQ(watts.size(), std::size_t{1});
+    // 0.1 J / >=0.02 s = at most 5 W; sanity-check shape rather than
+    // value because steady_clock resolution varies.
+    EXPECT_TRUE(watts[0] > 0.0 && watts[0] < 50.0);
 }
 
 int main() {
