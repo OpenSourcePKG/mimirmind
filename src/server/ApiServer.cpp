@@ -466,8 +466,9 @@ struct ApiServer::Impl {
         }
 
         const std::string rawText  = tok.decode(visible, /*skipSpecial=*/true);
-        const std::string text     = model::ChatTemplate::cleanResponse(
-            chatStyle, rawText);
+        const std::string text     = cfg.preserveThinking
+            ? rawText
+            : model::ChatTemplate::cleanResponse(chatStyle, rawText);
 
         const std::string respId = makeRequestId();
         const std::int64_t now   = unixNow();
@@ -498,10 +499,10 @@ struct ApiServer::Impl {
         };
 
         MM_LOG_INFO("server",
-                    "chat.completion id={} model={} prompt={} new={} "
+                    "chat.completion id={} model={} prompt={} cached={} new={} "
                     "prefill={:.0f}ms decode={:.0f}ms finish={}",
                     respId, echoModel,
-                    promptIds.size(), visible.size(),
+                    promptIds.size(), stats.cachedTokens, visible.size(),
                     stats.prefillMs, stats.decodeMs, finish);
 
         sendJson(res, 200, response);
@@ -552,10 +553,15 @@ struct ApiServer::Impl {
             bool                          done{false};
 
             StreamState(model::ChatTemplate::Style style,
-                        const model::Tokenizer&    tok)
-                : cleaner{model::ResponseCleaner::forStyle(style, tok)} {}
+                        const model::Tokenizer&    tok,
+                        bool                       preserveThinking)
+                : cleaner{preserveThinking
+                    ? model::ResponseCleaner{
+                          model::ChatTemplate::Style::QwenChatML, -1, -1}
+                    : model::ResponseCleaner::forStyle(style, tok)} {}
         };
-        auto state = std::make_shared<StreamState>(chatStyle, engine.tokenizer());
+        auto state = std::make_shared<StreamState>(chatStyle, engine.tokenizer(),
+                                                   cfg.preserveThinking);
         state->promptIds = std::move(promptIds);
         state->stopIds   = std::move(stopIds);
         state->params    = std::move(params);
@@ -706,10 +712,11 @@ struct ApiServer::Impl {
                 (void)writeSseDone(sink);
 
                 MM_LOG_INFO("server",
-                            "stream {} model={} prompt={} emitted={} "
+                            "stream {} model={} prompt={} cached={} emitted={} "
                             "prefill={:.0f}ms decode={:.0f}ms finish={}",
                             state->respId, state->echoModel,
-                            state->promptIds.size(), emittedTokens,
+                            state->promptIds.size(), stats.cachedTokens,
+                            emittedTokens,
                             stats.prefillMs, stats.decodeMs, finish);
 
                 sink.done();

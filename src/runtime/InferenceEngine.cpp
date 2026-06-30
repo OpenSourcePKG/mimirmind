@@ -2,8 +2,7 @@
 
 #include "compute/Embedding.hpp"
 #include "model/GgufTypes.hpp"
-#include "runtime/BlockBuffers.hpp"
-#include "runtime/KvCache.hpp"
+#include "runtime/Lcp.hpp"
 #include "runtime/Log.hpp"
 #include "runtime/arch/ArchBackend.hpp"
 
@@ -116,11 +115,56 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
         _config.architecture, _config, *_weights, _ops, _gmm);
 
     _modelLoaded = true;
+    // Defensive: a previous model's KV state must not survive into the
+    // new model. The current API throws on loadModel-while-loaded so
+    // this is theoretical, but it keeps the invariant local.
+    resetCache();
     MM_LOG_INFO("engine",
                 "loadModel: ready — arch={} blocks={} d_model={} ff={} heads={} kv={}",
                 _config.architecture, _config.blockCount,
                 _config.embeddingLength, _config.feedForwardLength,
                 _config.headCount, _config.headCountKv);
+}
+
+void InferenceEngine::resetCache() noexcept {
+    if (_kvCache != nullptr) {
+        _kvCache->reset();
+    }
+    _cachedTokens.clear();
+}
+
+void InferenceEngine::ensureCapacity(std::size_t Tp, std::size_t cacheMax,
+                                     std::size_t vocab_lm, std::size_t d_model) {
+    const bool needGrow =
+        (_kvCache == nullptr) ||
+        (cacheMax > _cacheCapacity) ||
+        (Tp       > _cacheMaxT)     ||
+        (vocab_lm > _cacheVocabLm);
+
+    if (!needGrow) {
+        return;
+    }
+
+    // Drop the cached tokens — buffers grow, the KV data they held
+    // is no longer where the new layers expect it (different maxSeq
+    // layout for the per-layer buffers).
+    _cachedTokens.clear();
+
+    _kvCache = std::make_unique<KvCache>(
+        _allocator, cacheMax, _backend->kvDimPerLayer());
+
+    const auto [qDimMax, kvDimMax] = _backend->maxQKVDims();
+    _blockBuffers = allocBlockBuffers(_allocator, _config,
+                                      Tp, cacheMax, qDimMax, kvDimMax);
+
+    _xBufH      = UsmHandle{_allocator, Tp        * d_model  * sizeof(float)};
+    _normFinalH = UsmHandle{_allocator, d_model   * sizeof(float)};
+    _logitsH    = UsmHandle{_allocator, vocab_lm  * sizeof(float)};
+    _logitsScH  = UsmHandle{_allocator, d_model   * sizeof(float)};
+
+    _cacheCapacity = cacheMax;
+    _cacheMaxT     = Tp;
+    _cacheVocabLm  = vocab_lm;
 }
 
 std::int32_t
@@ -216,27 +260,34 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
     const std::size_t maxT      = std::max<std::size_t>(Tp, 1);
     const std::size_t d_model   = _config.embeddingLength;
 
-    KvCache cache(_allocator, cacheMax, _backend->kvDimPerLayer());
+    ensureCapacity(maxT, cacheMax, vocab_lm, d_model);
+    KvCache&      cache   = *_kvCache;
+    BlockBuffers& buffers = *_blockBuffers;
 
-    const auto [qDimMax, kvDimMax] = _backend->maxQKVDims();
-    BlockBuffers buffers = allocBlockBuffers(_allocator, _config,
-                                             maxT, cacheMax,
-                                             qDimMax, kvDimMax);
+    float* const xBuf      = _xBufH     .as<float>();
+    float* const normFinal = _normFinalH.as<float>();
+    float* const logits    = _logitsH   .as<float>();
+    float* const logitsSc  = _logitsScH .as<float>();
 
-    const std::size_t xBytes         = maxT * d_model * sizeof(float);
-    const std::size_t normFinalBytes = d_model * sizeof(float);
-    const std::size_t logitsBytes    = vocab_lm * sizeof(float);
-    const std::size_t logitsScBytes  = d_model * sizeof(float);
-
-    UsmHandle xBufH     {_allocator, xBytes};
-    UsmHandle normFinalH{_allocator, normFinalBytes};
-    UsmHandle logitsH   {_allocator, logitsBytes};
-    UsmHandle logitsScH {_allocator, logitsScBytes};
-
-    float* const xBuf      = xBufH.as<float>();
-    float* const normFinal = normFinalH.as<float>();
-    float* const logits    = logitsH.as<float>();
-    float* const logitsSc  = logitsScH.as<float>();
+    // --- M9.1 prefix cache ----------------------------------------------
+    //
+    // _cachedTokens holds the ids whose K/V state is currently sitting in
+    // `cache` from a previous generate() call. Compute how many leading
+    // tokens of the new prompt match — those tokens can re-use the
+    // existing KV rows.
+    //
+    // Clamp to Tp - 1: even on a perfect prefix match we still need to
+    // re-run prefill for the final prompt token, because sampleNext()
+    // reads its hidden state directly from xBuf (the cache only stores
+    // K/V, not the hidden state that feeds the lm-head).
+    std::size_t lcp = longestCommonPrefix(promptIds,
+                                          std::span<const std::int32_t>{_cachedTokens});
+    if (lcp >= Tp) {
+        lcp = Tp - 1;
+    }
+    cache.truncate(lcp);
+    const std::size_t prefillStart = lcp;
+    const std::size_t prefillCount = Tp - lcp;
 
     // Gemma family scales the token embedding by sqrt(d_model) before
     // it enters the first block — the per-token vectors are otherwise
@@ -262,99 +313,136 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
         _backend->setParityDumpPrefix(dumpPrefix);
     }
 
-    const auto preT0 = clock::now();
-    cmp::embeddingLookup(
-        tokEmb->type, tokEmb->usmPtr,
-        d_model, vocab_emb,
-        promptIds, xBuf);
-    scaleEmbeddingIfNeeded(xBuf, Tp);
-
-    for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
-        _backend->runBlock(b, xBuf, Tp, cache, buffers, _traceBlock0);
-    }
-    cache.commit(Tp);
-    const auto preT1 = clock::now();
-    const double preMs =
-        std::chrono::duration<double, std::milli>(preT1 - preT0).count();
-
-    _traceBlock0 = false;  // diagnostic done; mute for further calls
-
-    // Reseed the sampler per generate() call so deterministic seeds
-    // produce reproducible streams. seed == 0 ⇒ random_device internally.
-    _sampler.reseed(params.sampling.seed);
-
-    auto isStop = [&](std::int32_t id) -> bool {
-        if (id == _tokenizer.eosId()) {
-            return true;
-        }
-        for (auto s : params.stopIds) {
-            if (id == s) {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    // Sample first new token from the last prefill row.
-    const float* lastRow = xBuf + (Tp - 1) * d_model;
-    std::int32_t nextId = sampleNext(lastRow, vocab_lm,
-                                     *outNorm, *lmHead,
-                                     normFinal, logits, logitsSc,
-                                     params.sampling);
-
     std::vector<std::int32_t> generated;
-    generated.reserve(maxNew);
-    generated.push_back(nextId);
+    double                    preMs   = 0.0;
+    double                    decMs   = 0.0;
+    bool                      hitStop = false;
+    bool                      aborted = false;
 
-    bool aborted = false;
-    if (onToken && !onToken(nextId)) {
-        aborted = true;
-    }
-
-    // -- Decode loop -----------------------------------------------------
-
-    const auto decT0 = clock::now();
-    bool hitStop = false;
-
-    for (std::size_t step = 1;
-         !aborted && step < maxNew && cache.length() < cacheMax;
-         ++step)
-    {
-        if (isStop(nextId)) {
-            hitStop = true;
-            break;
-        }
-
-        std::array<std::int32_t, 1> oneId{nextId};
+    try {
+        const auto preT0 = clock::now();
+        const auto prefillIds = promptIds.subspan(prefillStart, prefillCount);
         cmp::embeddingLookup(
             tokEmb->type, tokEmb->usmPtr,
             d_model, vocab_emb,
-            oneId, xBuf);
-        scaleEmbeddingIfNeeded(xBuf, 1);
+            prefillIds, xBuf);
+        scaleEmbeddingIfNeeded(xBuf, prefillCount);
 
         for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
-            _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+            _backend->runBlock(b, xBuf, prefillCount, cache, buffers,
+                               _traceBlock0);
         }
-        cache.commit(1);
+        cache.commit(prefillCount);
+        const auto preT1 = clock::now();
+        preMs =
+            std::chrono::duration<double, std::milli>(preT1 - preT0).count();
 
-        nextId = sampleNext(xBuf, vocab_lm,
-                            *outNorm, *lmHead,
-                            normFinal, logits, logitsSc,
-                            params.sampling);
+        _traceBlock0 = false;  // diagnostic done; mute for further calls
+
+        // Reseed the sampler per generate() call so deterministic seeds
+        // produce reproducible streams. seed == 0 ⇒ random_device.
+        _sampler.reseed(params.sampling.seed);
+
+        auto isStop = [&](std::int32_t id) -> bool {
+            if (id == _tokenizer.eosId()) {
+                return true;
+            }
+            for (auto s : params.stopIds) {
+                if (id == s) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        // Sample first new token from the last prefill row. xBuf only
+        // holds the freshly-prefilled suffix, so the last row sits at
+        // (prefillCount - 1) * d_model — not (Tp - 1).
+        const float* lastRow = xBuf + (prefillCount - 1) * d_model;
+        std::int32_t nextId = sampleNext(lastRow, vocab_lm,
+                                         *outNorm, *lmHead,
+                                         normFinal, logits, logitsSc,
+                                         params.sampling);
+
+        generated.reserve(maxNew);
         generated.push_back(nextId);
 
         if (onToken && !onToken(nextId)) {
             aborted = true;
         }
+
+        // -- Decode loop -------------------------------------------------
+
+        const auto decT0 = clock::now();
+
+        for (std::size_t step = 1;
+             !aborted && step < maxNew && cache.length() < cacheMax;
+             ++step)
+        {
+            if (isStop(nextId)) {
+                hitStop = true;
+                break;
+            }
+
+            std::array<std::int32_t, 1> oneId{nextId};
+            cmp::embeddingLookup(
+                tokEmb->type, tokEmb->usmPtr,
+                d_model, vocab_emb,
+                oneId, xBuf);
+            scaleEmbeddingIfNeeded(xBuf, 1);
+
+            for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
+                _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+            }
+            cache.commit(1);
+
+            nextId = sampleNext(xBuf, vocab_lm,
+                                *outNorm, *lmHead,
+                                normFinal, logits, logitsSc,
+                                params.sampling);
+            generated.push_back(nextId);
+
+            if (onToken && !onToken(nextId)) {
+                aborted = true;
+            }
+        }
+
+        const auto decT1 = clock::now();
+        decMs =
+            std::chrono::duration<double, std::milli>(decT1 - decT0).count();
+    } catch (...) {
+        // Mid-flight failure leaves the KV state partially written.
+        // Discarding the cache is cheap and keeps the next call honest.
+        resetCache();
+        throw;
     }
 
-    const auto decT1 = clock::now();
-    const double decMs =
-        std::chrono::duration<double, std::milli>(decT1 - decT0).count();
+    // -- Update the prefix cache so the next generate() can resume -----
+    //
+    // Maintain the invariant `_cachedTokens.size() == cache.length()`.
+    // cache.length() at this point is: prefillStart + prefillCount +
+    // (decode steps that committed). The first sampled token is not
+    // yet committed; each subsequent loop iteration commits exactly one
+    // token (the previous step's sample) before sampling the next one.
+    {
+        const std::size_t finalLen   = cache.length();
+        const std::size_t genFromCache = (finalLen > Tp) ? (finalLen - Tp) : 0;
+        const std::size_t take       = std::min(genFromCache, generated.size());
+
+        _cachedTokens.clear();
+        _cachedTokens.reserve(finalLen);
+        _cachedTokens.insert(_cachedTokens.end(),
+                             promptIds.begin(), promptIds.end());
+        _cachedTokens.insert(_cachedTokens.end(),
+                             generated.begin(),
+                             generated.begin() +
+                                 static_cast<std::ptrdiff_t>(take));
+    }
 
     if (outStats != nullptr) {
         outStats->promptTokens    = Tp;
         outStats->generatedTokens = generated.size();
+        outStats->cachedTokens    = lcp;
         outStats->prefillMs       = preMs;
         outStats->decodeMs        = decMs;
         outStats->hitStop         = hitStop;

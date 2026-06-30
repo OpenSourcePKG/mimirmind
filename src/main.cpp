@@ -1136,6 +1136,13 @@ int runServe(const CliArgs& args) {
     cfg.port    = args.port;
     cfg.modelId = std::filesystem::path{args.modelPath}.stem().string();
 
+    if (const char* env = std::getenv("MIMIRMIND_PRESERVE_THINKING")) {
+        std::string_view v{env};
+        if (!v.empty() && v != "0" && v != "false" && v != "off") {
+            cfg.preserveThinking = true;
+        }
+    }
+
     mimirmind::server::ApiServer server{engine, cfg};
 
     g_runningServer.store(&server, std::memory_order_release);
@@ -1147,7 +1154,11 @@ int runServe(const CliArgs& args) {
               << "\n  GET  /health\n"
                  "  GET  /v1/models\n"
                  "  POST /v1/chat/completions  (stream=true supported)\n"
-                 "  model id: " << cfg.modelId << "\n  Ctrl-C to stop.\n";
+                 "  model id:  " << cfg.modelId << "\n"
+                 "  preserve-thinking: "
+              << (cfg.preserveThinking ? "on (raw deltas, KV-cache friendly)"
+                                       : "off (cleaned text, channel-wrapper stripped)")
+              << "\n  Ctrl-C to stop.\n";
     std::cout.flush();
 
     try {
