@@ -646,6 +646,19 @@ TEST(attention_decode_flash_maxKTiles) {
                        /*seed=*/0x84, /*tol=*/2e-3F);
 }
 
+TEST(attention_decode_flash_gemma4FullAttn) {
+    // Real-world geometry from Gemma 4 26B full-attention layers:
+    // nHeads=16, nKvHeads=8 (GQA 2:1), headDim=512. Caught a missing
+    // 512 in kFlashMaxHeadDim on first deploy 2026-06-30 — never let
+    // it regress again.
+    runAttentionParity("attn_flash_gemma4_full",
+                       /*T_q=*/1, /*T_k=*/1024,
+                       /*nHeads=*/16, /*nKvHeads=*/8, /*headDim=*/512,
+                       /*positionOffset=*/1023,
+                       /*scale=*/1.0F,
+                       /*seed=*/0x86, /*tol=*/1e-3F);
+}
+
 TEST(attention_decode_flash_partialKTileTail) {
     // kMax = 1300 → tile 0..4 fully populated, tile 5 holds 1300-1280
     // = 20 keys, tiles 6+ are neutral. Mixed populated + partial +
