@@ -13,6 +13,9 @@
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
+#include "runtime/SystemMonitor.hpp"
+#include "runtime/ThermalGuard.hpp"
+#include "runtime/ThermalProfile.hpp"
 #include "runtime/UsmAllocator.hpp"
 #include "runtime/UsmHandle.hpp"
 #include "server/ApiServer.hpp"
@@ -66,6 +69,10 @@ constexpr const char* kUsage =
     "  --seed N           RNG seed, 0 = random_device (default 0)\n"
     "  --chat             Wrap --prompt as a user message via the chat template\n"
     "  --system TEXT      System message for --chat (default: Qwen2.5 default)\n"
+    "  --thermal-profile PATH\n"
+    "                     JSON profile with per-host throttle limits\n"
+    "                     (or set MIMIRMIND_THERMAL_PROFILE). Without it the\n"
+    "                     engine runs unprotected — only set this for serve.\n"
     "  -h, --help         Show this help and exit\n";
 
 enum class Mode {
@@ -86,6 +93,7 @@ struct CliArgs {
     std::uint64_t seed{0};
     bool          chat{false};
     std::string   systemMessage{};
+    std::string   thermalProfilePath{};
 };
 
 [[nodiscard]] bool parseArgs(int argc, char** argv, CliArgs& out) {
@@ -160,6 +168,10 @@ struct CliArgs {
             const char* v = needValue("--system");
             if (v == nullptr) return false;
             out.systemMessage = v;
+        } else if (a == "--thermal-profile") {
+            const char* v = needValue("--thermal-profile");
+            if (v == nullptr) return false;
+            out.thermalProfilePath = v;
         } else {
             std::cerr << "unknown argument '" << a << "'\n" << kUsage;
             return false;
@@ -1143,6 +1155,41 @@ int runServe(const CliArgs& args) {
         }
     }
 
+    // Resolve thermal profile path from CLI > env. Empty means
+    // unprotected — we'll log a loud warning below.
+    std::string thermalProfilePath = args.thermalProfilePath;
+    if (thermalProfilePath.empty()) {
+        if (const char* env = std::getenv("MIMIRMIND_THERMAL_PROFILE")) {
+            thermalProfilePath = env;
+        }
+    }
+
+    std::unique_ptr<mimirmind::runtime::SystemMonitor> monitor;
+    std::unique_ptr<mimirmind::runtime::ThermalGuard>  guard;
+    if (!thermalProfilePath.empty()) {
+        mimirmind::runtime::ThermalProfile profile;
+        try {
+            profile = mimirmind::runtime::loadThermalProfile(thermalProfilePath);
+        } catch (const std::exception& e) {
+            std::cerr << "serve: failed to load thermal profile: "
+                      << e.what() << "\n";
+            return 1;
+        }
+        try {
+            monitor = std::make_unique<mimirmind::runtime::SystemMonitor>(
+                /*requirePackageTemp=*/profile.hasPackageLimits(),
+                /*requireRam=*/        false);
+        } catch (const std::exception& e) {
+            std::cerr << "serve: profile '" << profile.name
+                      << "' requires sensors the host does not expose: "
+                      << e.what() << "\n";
+            return 1;
+        }
+        guard = std::make_unique<mimirmind::runtime::ThermalGuard>(
+            std::move(profile), *monitor);
+        engine.setThermalGuard(guard.get());
+    }
+
     mimirmind::server::ApiServer server{engine, cfg};
 
     g_runningServer.store(&server, std::memory_order_release);
@@ -1153,13 +1200,29 @@ int runServe(const CliArgs& args) {
               << cfg.host << ":" << cfg.port
               << "\n  GET  /health\n"
                  "  GET  /v1/models\n"
+                 "  GET  /v1/system/status\n"
                  "  POST /v1/chat/completions  (stream=true supported)\n"
-                 "  model id:  " << cfg.modelId << "\n"
-                 "  preserve-thinking: "
+                 "  model id:           " << cfg.modelId << "\n"
+                 "  preserve-thinking:  "
               << (cfg.preserveThinking ? "on (raw deltas, KV-cache friendly)"
                                        : "off (cleaned text, channel-wrapper stripped)")
-              << "\n  Ctrl-C to stop.\n";
+              << "\n  thermal profile:    ";
+    if (guard) {
+        std::cout << "'" << guard->profile().name
+                  << "' (package=" << monitor->packageTempSource() << ")";
+    } else {
+        std::cout << "\033[1;33mNOT CONFIGURED — engine is unprotected\033[0m";
+    }
+    std::cout << "\n  Ctrl-C to stop.\n";
     std::cout.flush();
+
+    if (!guard) {
+        MM_LOG_WARN("main",
+                    "serve: no thermal profile configured. The engine will "
+                    "not throttle decode on temperature/RAM limits. Pass "
+                    "--thermal-profile PATH or set MIMIRMIND_THERMAL_PROFILE "
+                    "to protect the host.");
+    }
 
     try {
         server.run();

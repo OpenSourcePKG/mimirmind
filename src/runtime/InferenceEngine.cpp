@@ -4,6 +4,7 @@
 #include "model/GgufTypes.hpp"
 #include "runtime/Lcp.hpp"
 #include "runtime/Log.hpp"
+#include "runtime/ThermalGuard.hpp"
 #include "runtime/arch/ArchBackend.hpp"
 
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace mimirmind::runtime {
@@ -226,6 +228,14 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
             "list of supported architectures.");
     }
 
+    // M9.2 thermal admission. Throws ThermalLimitExceeded if any hard
+    // limit in the configured profile is currently breached; ApiServer
+    // turns that into HTTP 503 + Retry-After. Skips silently when no
+    // guard is installed (op chose to run unprotected).
+    if (_thermalGuard != nullptr) {
+        _thermalGuard->checkAdmission();
+    }
+
     const auto* tokEmb = _weights->find("token_embd.weight");
     if (tokEmb == nullptr) {
         tokEmb = _weights->find("tok_embeddings.weight");
@@ -375,6 +385,13 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
 
         const auto decT0 = clock::now();
 
+        // Inter-token thermal pacing — consult guard every kPaceWindow
+        // tokens so /sys reads don't dominate the inner loop. Window of
+        // 4 keeps overhead under a millisecond per token at ~145 ms/tok
+        // decode while still reacting to a fast temperature climb
+        // within ~500 ms.
+        constexpr std::size_t kPaceWindow = 4;
+
         for (std::size_t step = 1;
              !aborted && step < maxNew && cache.length() < cacheMax;
              ++step)
@@ -382,6 +399,13 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
             if (isStop(nextId)) {
                 hitStop = true;
                 break;
+            }
+
+            if (_thermalGuard != nullptr && (step % kPaceWindow) == 0) {
+                const auto pause = _thermalGuard->paceForCurrentReading();
+                if (pause.count() > 0) {
+                    std::this_thread::sleep_for(pause);
+                }
             }
 
             std::array<std::int32_t, 1> oneId{nextId};

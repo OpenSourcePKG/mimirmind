@@ -1,0 +1,8 @@
+{
+  "name": "nuc14-attic",
+  "description": "ASUS NUC14RVS-B (Core Ultra 9 185H, 64 GiB) in a passive enclosure. Tuned conservatively after a thermal-trip hard freeze under sustained Gemma 4 26B decode (2026-06-30). Re-tune after BIOS fan-curve fix or chassis upgrade.",
+
+  "package_temp_soft_c":     75,
+  "package_temp_hard_c":     82,
+  "package_throttle_max_ms": 200
+}

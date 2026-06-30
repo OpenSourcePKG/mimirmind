@@ -160,6 +160,9 @@ add_executable(mimirmind
     src/runtime/L0Context.cpp
     src/runtime/Log.cpp
     src/runtime/MappedFile.cpp
+    src/runtime/SystemMonitor.cpp
+    src/runtime/ThermalGuard.cpp
+    src/runtime/ThermalProfile.cpp
     src/runtime/UsmAllocator.cpp
     src/runtime/arch/ArchBackend.cpp
     src/runtime/arch/Gemma4Backend.cpp
@@ -235,9 +238,19 @@ add_executable(arch_tests
     src/compute/Softmax.cpp
     src/model/ResponseCleaner.cpp
     src/runtime/Log.cpp
+    src/runtime/SystemMonitor.cpp
+    src/runtime/ThermalGuard.cpp
+    src/runtime/ThermalProfile.cpp
 )
 
 target_include_directories(arch_tests PRIVATE src tests)
+
+# ThermalProfile pulls in nlohmann/json — same vendored header the main
+# target uses. SYSTEM so the test binary stays strict on our own code
+# without dragging upstream warnings into our -Wall -Wextra -Wpedantic.
+target_include_directories(arch_tests SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+)
 
 target_link_libraries(arch_tests PRIVATE Threads::Threads)
 

@@ -6,6 +6,7 @@
 #include "model/Tokenizer.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/Log.hpp"
+#include "runtime/ThermalGuard.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -316,6 +317,11 @@ struct ApiServer::Impl {
                                         httplib::Response&       res) {
             handleModels(req, res);
         });
+        server.Get("/v1/system/status",
+                   [this](const httplib::Request& req,
+                          httplib::Response&       res) {
+                       handleSystemStatus(req, res);
+                   });
         server.Post("/v1/chat/completions",
                     [this](const httplib::Request& req,
                            httplib::Response&       res) {
@@ -363,6 +369,62 @@ struct ApiServer::Impl {
             {"object", "list"},
             {"data",   json::array({entry})},
         });
+    }
+
+    void handleSystemStatus(const httplib::Request&, httplib::Response& res) {
+        auto* guard = engine.thermalGuard();
+        json body{
+            {"profile_active", guard != nullptr},
+        };
+        if (guard == nullptr) {
+            body["warning"] =
+                "no thermal profile configured — engine is unprotected. "
+                "Set --thermal-profile or MIMIRMIND_THERMAL_PROFILE.";
+            sendJson(res, 200, body);
+            return;
+        }
+
+        const auto& p        = guard->profile();
+        const auto  decision = guard->decide();
+        const auto  reading  = guard->lastReading();
+
+        json profileJson{
+            {"name",        p.name},
+            {"description", p.description},
+        };
+        if (p.hasPackageLimits()) {
+            profileJson["package_temp_soft_c"]    = *p.package_temp_soft_c;
+            profileJson["package_temp_hard_c"]    = *p.package_temp_hard_c;
+            profileJson["package_throttle_max_ms"] = p.package_throttle_max_ms;
+        }
+
+        json readingsJson = json::object();
+        if (reading.package_temp_c.has_value()) {
+            readingsJson["package_temp_c"] = *reading.package_temp_c;
+        }
+        if (reading.ram_total_mib.has_value()) {
+            readingsJson["ram_total_mib"] = *reading.ram_total_mib;
+        }
+        if (reading.ram_available_mib.has_value()) {
+            readingsJson["ram_available_mib"] = *reading.ram_available_mib;
+        }
+
+        const char* stateStr =
+            decision.state == runtime::ThermalDecision::State::Critical   ? "critical"
+            : decision.state == runtime::ThermalDecision::State::Throttling ? "throttling"
+                                                                            : "ok";
+
+        body["profile"]   = std::move(profileJson);
+        body["readings"]  = std::move(readingsJson);
+        body["throttle"]  = json{
+            {"state",                stateStr},
+            {"current_pause_ms",     static_cast<int>(decision.pause.count())},
+            {"next_request_allowed", decision.admit_new_request},
+            {"reason",               decision.reason.empty()
+                                       ? json{}
+                                       : json{decision.reason}},
+        };
+        sendJson(res, 200, body);
     }
 
     /// Common pre-generation work shared by streaming and non-streaming.
@@ -416,6 +478,23 @@ struct ApiServer::Impl {
             return;
         }
 
+        // Thermal admission BEFORE we commit to a stream: a 503 must
+        // ship as a plain JSON response, not as half a chunked SSE
+        // body. The engine repeats this check internally for callers
+        // that bypass the server, so the worst-case cost of doing it
+        // twice is two sysfs reads.
+        if (auto* guard = engine.thermalGuard(); guard != nullptr) {
+            try {
+                guard->checkAdmission();
+            } catch (const runtime::ThermalLimitExceeded& e) {
+                MM_LOG_INFO("server",
+                            "thermal refusal: {}", e.what());
+                res.set_header("Retry-After", "10");
+                sendError(res, 503, "service_unavailable", e.what());
+                return;
+            }
+        }
+
         if (cr.stream) {
             handleChatCompletionsStream(cr, res);
         } else {
@@ -442,6 +521,12 @@ struct ApiServer::Impl {
             std::lock_guard<std::mutex> lk{engineMutex};
             try {
                 generated = engine.generate(promptIds, params, {}, &stats);
+            } catch (const runtime::ThermalLimitExceeded& e) {
+                MM_LOG_INFO("server",
+                            "thermal refusal at engine entry: {}", e.what());
+                res.set_header("Retry-After", "10");
+                sendError(res, 503, "service_unavailable", e.what());
+                return;
             } catch (const std::exception& e) {
                 MM_LOG_ERROR("server", "generate failed: {}", e.what());
                 sendError(res, 500, "server_error",
