@@ -16,6 +16,7 @@
 #include "compute/MoeRouting.hpp"
 #include "compute/Softmax.hpp"
 #include "model/ResponseCleaner.hpp"
+#include "runtime/Lcp.hpp"
 #include "runtime/arch/ArchBackend.hpp"
 
 #include <algorithm>
@@ -24,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -595,6 +597,62 @@ TEST(responseCleaner_gemma4_noChannelInOutput) {
     EXPECT_TRUE(feedAndCapture(c, kFakeTextId, "Direct", out));
     EXPECT_TRUE(feedAndCapture(c, kFakeTextId, " answer", out));
     EXPECT_EQ(out, std::string{"Direct answer"});
+}
+
+// =======================================================================
+// runtime::longestCommonPrefix — M9.1 prefix-cache helper
+// =======================================================================
+
+namespace {
+std::size_t lcp(const std::vector<std::int32_t>& a,
+                const std::vector<std::int32_t>& b) {
+    return mimirmind::runtime::longestCommonPrefix(
+        std::span<const std::int32_t>{a},
+        std::span<const std::int32_t>{b});
+}
+} // namespace
+
+TEST(lcp_bothEmpty) {
+    EXPECT_EQ(lcp({}, {}), std::size_t{0});
+}
+
+TEST(lcp_oneEmpty) {
+    EXPECT_EQ(lcp({1, 2, 3}, {}),     std::size_t{0});
+    EXPECT_EQ(lcp({},        {1, 2}), std::size_t{0});
+}
+
+TEST(lcp_identical) {
+    EXPECT_EQ(lcp({1, 2, 3, 4}, {1, 2, 3, 4}), std::size_t{4});
+}
+
+TEST(lcp_partialPrefix) {
+    EXPECT_EQ(lcp({1, 2, 3, 4, 5}, {1, 2, 3, 9, 9}), std::size_t{3});
+}
+
+TEST(lcp_aIsPrefixOfB) {
+    // Caps at the shorter side. Used when the new prompt is exactly the
+    // previous prompt plus a new turn — LCP = old prompt length.
+    EXPECT_EQ(lcp({1, 2, 3}, {1, 2, 3, 4, 5, 6}), std::size_t{3});
+}
+
+TEST(lcp_bIsPrefixOfA) {
+    EXPECT_EQ(lcp({1, 2, 3, 4, 5}, {1, 2}), std::size_t{2});
+}
+
+TEST(lcp_noCommonPrefix) {
+    EXPECT_EQ(lcp({7, 8, 9}, {1, 2, 3}), std::size_t{0});
+}
+
+TEST(lcp_singleElementMatch) {
+    EXPECT_EQ(lcp({42}, {42}),    std::size_t{1});
+    EXPECT_EQ(lcp({42}, {42, 7}), std::size_t{1});
+}
+
+TEST(lcp_negativeIdsCompareLikeOthers) {
+    // Token ids are signed (-1 is a common "missing" sentinel). The
+    // function must treat them like any other int32_t.
+    EXPECT_EQ(lcp({-1, -2, -3}, {-1, -2, -3}), std::size_t{3});
+    EXPECT_EQ(lcp({-1, -2, -3}, {-1, -2,  7}), std::size_t{2});
 }
 
 int main() {

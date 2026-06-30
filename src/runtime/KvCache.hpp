@@ -66,6 +66,15 @@ public:
     void commit(std::size_t T) noexcept { _length += T; }
     void reset() noexcept                { _length = 0; }
 
+    /// Shrink the logical length to `n`. The K/V data at positions
+    /// `[0, n)` stays valid and re-usable. Caller must guarantee `n <=
+    /// length()` — used by the prefix-cache path to walk the engine
+    /// back to the longest-common-prefix length before re-prefilling
+    /// the divergent suffix.
+    void truncate(std::size_t n) noexcept {
+        _length = (n <= _length) ? n : _length;
+    }
+
     [[nodiscard]] std::size_t length()           const noexcept { return _length; }
     [[nodiscard]] std::size_t maxSeq()           const noexcept { return _maxSeq; }
     [[nodiscard]] std::size_t kvDim(std::size_t l) const noexcept { return _kvDim[l]; }

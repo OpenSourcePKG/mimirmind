@@ -25,6 +25,17 @@ struct ServerConfig {
     /// Max new tokens when the request does not specify `max_tokens` /
     /// `max_completion_tokens`.
     std::size_t   defaultMaxNew{512};
+
+    /// Preserve the architecture's internal thinking-channel markup in
+    /// the assistant response (currently only Gemma 4's
+    /// `<|channel>thought<channel|>` wrapper). Off by default so
+    /// OpenAI-compatible clients see clean text. Turn on when the
+    /// client round-trips the assistant turn back into a follow-up
+    /// prompt and you want the M9.1 prefix cache to match across
+    /// turns — the cache is keyed on raw decoded tokens, and stripping
+    /// the wrapper from the response makes the round-trip diverge
+    /// from the cached tokens at the first assistant turn.
+    bool          preserveThinking{false};
 };
 
 /**

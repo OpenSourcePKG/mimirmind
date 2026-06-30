@@ -307,3 +307,81 @@ print(resp.choices[0].message.content)
 
 LangChain `ChatOpenAI`, the LlamaIndex `OpenAI` adapter, and any
 shell-script using `curl` work the same way.
+)
+## Prefix-cache (M9.1)
+
+The engine keeps the KV state of its last request around between
+calls. When the next request's prompt starts with the same token
+sequence, those leading tokens skip prefill — only the new suffix
+runs through the transformer.
+
+In a typical chat, the OpenAI request format means every follow-up
+turn sends the *entire* conversation back to the server. The bulk
+of those tokens are unchanged, and that's where the cache pays off.
+
+Stats reported in the server log:
+
+```
+chat.completion id=... prompt=147 cached=132 new=20 prefill=480ms decode=...
+```
+
+`prompt=147` is what was tokenised; `cached=132` was reused from the
+previous turn; only the trailing 15 prompt tokens + 20 generated
+tokens hit the GPU. Prefill drops from ~15 s to ~0.5 s for a 4-turn
+follow-up against Gemma 4 26B.
+
+### When the cache does not match
+
+The cache is keyed on **decoded token ids**. Anything that makes the
+new prompt's tokens diverge from the previous turn's decoded tokens
+caps the cached length at the divergence point. The two common
+causes:
+
+1. **Different system prompt or earlier user turn.** Expected
+   behaviour — the cache should not apply across unrelated chats.
+   A single-slot cache means parallel users compete; whichever
+   request lands second only matches the shared prefix (often just
+   the system message).
+2. **Response cleaning strips the model's own markup.** For Gemma 4
+   the engine decodes `<|channel>thought<channel|>` before the
+   visible answer. By default the server strips that wrapper before
+   sending the response, but the client then echoes back only the
+   cleaned text on the next turn — the encoded prompt no longer
+   matches the cached tokens past the first assistant turn.
+
+The second case is the one to know. See **preserve-thinking** below.
+
+### `MIMIRMIND_PRESERVE_THINKING`
+
+Set this env var on the server (`MIMIRMIND_PRESERVE_THINKING=1`) to
+keep the thinking-channel wrapper in the assistant response on both
+the non-streaming and streaming paths. Clients then receive the raw
+decoded text including `<|channel>thought\n<channel|>`. When they
+send it back as part of the next turn's `messages`, the encoded
+tokens match the cache exactly and prefix reuse extends all the way
+through the previous assistant turn — typical 5× prefill speedup
+for multi-turn chats.
+
+Trade-off: clients see the wrapper and either need to know what to
+do with it or render it as-is. Pegenaut's chat UI is wrapper-aware
+and will hide it when this mode is enabled.
+
+Default (off) keeps responses clean for unsuspecting OpenAI clients
+but caps the cache reuse at the boundary of the first assistant
+turn. Either choice is correct; pick based on whether your client
+controls both ends of the conversation.
+
+### Cache scope and lifecycle
+
+- **One slot.** The engine holds the KV state of exactly one
+  conversation at a time. A request whose prompt does not share a
+  prefix with the cached tokens evicts the previous slot
+  (`cached=0` in the log) and replaces it.
+- **No cross-process state.** The cache lives in process memory.
+  Restarting the server wipes it.
+- **Concurrency.** The handler mutex serialises generate() calls,
+  so the cache is naturally consistent. Multi-slot cache + per-
+  request KV is M9.2 (not yet implemented).
+- **Errors.** If `generate()` throws partway through, the cache is
+  reset before the exception propagates — no half-written KV
+  survives into the next request.
