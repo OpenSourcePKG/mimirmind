@@ -64,9 +64,14 @@ public:
     /// write (kernel-verified via re-read).
     std::uint32_t setMaxFreqMhz(std::uint32_t mhz);
 
-    /// P-controller: nudges current cap toward keeping `current_temp_c`
-    /// at targetTempC(). Uses kProportionalMhzPerC MHz per degree as
-    /// the gain. Returns the new cap.
+    /// Asymmetric P-controller: nudges current cap toward keeping
+    /// `current_temp_c` at targetTempC(). The gain is direction-
+    /// dependent so we drop the cap fast when overshooting target
+    /// (heat-up dynamics are quick on this iGPU + UMA package) but
+    /// raise it slowly when undershooting (cool-down is much slower
+    /// than the temp swing a cap-raise causes). A small deadband
+    /// around target prevents 1-MHz-per-tick oscillation in steady
+    /// state. Returns the new cap.
     std::uint32_t adjustForTemp(float current_temp_c);
 
     /// Convenience: read current temp from `monitor` and call
@@ -78,7 +83,17 @@ private:
     void probe(std::string_view sysfsRoot);
     [[nodiscard]] static std::uint32_t readFreqFile(const std::string& path);
 
-    static constexpr float kProportionalMhzPerC = 50.0F;
+    // Asymmetric gains. Heat-up on this package (NUC14 MTL, ~15-20 W
+    // sustained) reaches steady-state in ~5-10 s, cool-down takes
+    // 30-60 s once heat is in the heatsink. A symmetric controller
+    // overshoots on the cool side and re-spikes on the next workload
+    // burst. Drop fast (kGainDown), creep up (kGainUp) — ratio 1:10.
+    static constexpr float kGainUpMhzPerC      = 10.0F;
+    static constexpr float kGainDownMhzPerC    = 100.0F;
+    // Deadband around target — within this band the cap doesn't move.
+    // Stops the 1-MHz-per-tick wiggle when the chip is sitting near
+    // target. ±0.5 °C is below the resolution of x86_pkg_temp anyway.
+    static constexpr float kDeadbandC           = 0.5F;
     static constexpr float kDefaultTargetTempC   = 72.0F;
 
     std::string   _cardPath{};

@@ -1062,8 +1062,9 @@ TEST(gpuGovernor_adjustForTempLowersCapWhenHot) {
     mimirmind::runtime::GpuClockGovernor g{d.root};
     g.setTargetTempC(72.0F);
 
-    // Temp 8 °C above target → delta = -400 MHz, new cap = 1600.
-    EXPECT_EQ(g.adjustForTemp(80.0F), std::uint32_t{1600});
+    // Temp 8 °C above target, kGainDown = 100 → delta = -800 MHz,
+    // new cap = 1200.
+    EXPECT_EQ(g.adjustForTemp(80.0F), std::uint32_t{1200});
 }
 
 TEST(gpuGovernor_adjustForTempRaisesCapWhenCool) {
@@ -1072,8 +1073,58 @@ TEST(gpuGovernor_adjustForTempRaisesCapWhenCool) {
     mimirmind::runtime::GpuClockGovernor g{d.root};
     g.setTargetTempC(72.0F);
 
-    // Temp 5 °C below target → delta = +250 MHz, new cap = 1750.
-    EXPECT_EQ(g.adjustForTemp(67.0F), std::uint32_t{1750});
+    // Temp 5 °C below target, kGainUp = 10 → delta = +50 MHz, new
+    // cap = 1550. Slow on the cool side is intentional — see
+    // GpuClockGovernor.hpp for the asymmetry rationale.
+    EXPECT_EQ(g.adjustForTemp(67.0F), std::uint32_t{1550});
+}
+
+TEST(gpuGovernor_adjustForTempAsymmetricGain) {
+    // Same |error| in either direction must produce very different
+    // deltas — that is the whole point of M9.6.
+    FakeDrm d;
+    d.addCard("card1", 2350, 800, 1500);
+    mimirmind::runtime::GpuClockGovernor g{d.root};
+    g.setTargetTempC(72.0F);
+
+    // +4 °C → delta = -400, cap → 1100.
+    EXPECT_EQ(g.adjustForTemp(76.0F), std::uint32_t{1100});
+
+    // Re-arm cap at 1500 and check the cool direction.
+    g.setMaxFreqMhz(1500);
+    // -4 °C → delta = +40, cap → 1540. Ten times smaller than the
+    // hot-side response.
+    EXPECT_EQ(g.adjustForTemp(68.0F), std::uint32_t{1540});
+}
+
+TEST(gpuGovernor_adjustForTempDeadbandHoldsCap) {
+    FakeDrm d;
+    d.addCard("card1", 2350, 800, 1500);
+    mimirmind::runtime::GpuClockGovernor g{d.root};
+    g.setTargetTempC(72.0F);
+
+    // Within ±0.5 °C of target — no movement.
+    EXPECT_EQ(g.adjustForTemp(71.6F), std::uint32_t{1500});
+    EXPECT_EQ(g.adjustForTemp(72.0F), std::uint32_t{1500});
+    EXPECT_EQ(g.adjustForTemp(72.4F), std::uint32_t{1500});
+    EXPECT_EQ(d.readMax("card1"), std::uint32_t{1500});
+
+    // Just outside the band — exact-rep float, +1.0 °C → delta = -100,
+    // cap → 1400. (Picking 72.6F here would be misleading: 72.6F-72.0F
+    // is 0.5999998F, not 0.6F, so int truncation gives -59 not -60.)
+    EXPECT_EQ(g.adjustForTemp(73.0F), std::uint32_t{1400});
+}
+
+TEST(gpuGovernor_adjustForTempClampsToRpnOnExtremeHot) {
+    // Pathological case: chip is 20 °C above target. The aggressive
+    // down-gain wants to subtract 2000 MHz, which would underflow
+    // below RPn — must clamp to RPn, not wrap.
+    FakeDrm d;
+    d.addCard("card1", 2350, 800, 1500);
+    mimirmind::runtime::GpuClockGovernor g{d.root};
+    g.setTargetTempC(72.0F);
+
+    EXPECT_EQ(g.adjustForTemp(92.0F), std::uint32_t{800});
 }
 
 TEST(gpuGovernor_destructorRestoresRP0) {
