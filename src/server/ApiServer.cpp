@@ -2,6 +2,7 @@
 
 #include "model/ChatTemplate.hpp"
 #include "model/LlmConfig.hpp"
+#include "model/ResponseCleaner.hpp"
 #include "model/Tokenizer.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/Log.hpp"
@@ -534,18 +535,27 @@ struct ApiServer::Impl {
         // Shared state lives on the heap so the provider lambda can be
         // re-entered safely if cpp-httplib calls it more than once.
         struct StreamState {
-            std::vector<std::int32_t> promptIds;
-            std::vector<std::int32_t> stopIds;
-            runtime::GenerateParams   params;
-            std::string               respId;
-            std::int64_t              created{};
-            std::string               echoModel;
+            std::vector<std::int32_t>     promptIds;
+            std::vector<std::int32_t>     stopIds;
+            runtime::GenerateParams       params;
+            std::string                   respId;
+            std::int64_t                  created{};
+            std::string                   echoModel;
             // Buffers a trailing incomplete UTF-8 codepoint between
             // tokens so SSE deltas always carry valid UTF-8.
-            std::string               utf8Pending;
-            bool                      done{false};
+            std::string                   utf8Pending;
+            // Per-stream filter that swallows the Gemma 4
+            // <|channel>thought<channel|> wrapper at the token level,
+            // matching the behaviour ChatTemplate::cleanResponse applies
+            // in the non-streaming path. No-op for other chat styles.
+            model::ResponseCleaner        cleaner;
+            bool                          done{false};
+
+            StreamState(model::ChatTemplate::Style style,
+                        const model::Tokenizer&    tok)
+                : cleaner{model::ResponseCleaner::forStyle(style, tok)} {}
         };
-        auto state = std::make_shared<StreamState>();
+        auto state = std::make_shared<StreamState>(chatStyle, engine.tokenizer());
         state->promptIds = std::move(promptIds);
         state->stopIds   = std::move(stopIds);
         state->params    = std::move(params);
@@ -596,10 +606,15 @@ struct ApiServer::Impl {
                         // checks isStop on the next iteration and exits.
                         return true;
                     }
-                    const std::string txt = tok.decode(
+                    std::string txt = tok.decode(
                         std::span<const std::int32_t>{&id, 1},
                         /*skipSpecial=*/true);
                     if (txt.empty()) {
+                        return true;
+                    }
+
+                    // Drop structural markup (Gemma 4 channel wrapper).
+                    if (!state->cleaner.feed(id, txt)) {
                         return true;
                     }
 
