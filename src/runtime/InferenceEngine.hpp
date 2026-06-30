@@ -23,6 +23,7 @@ class ThermalGuard;
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -254,6 +255,14 @@ private:
     // new architecture handler. Flips to false after the first call so
     // even an enabled trace only fires once per process.
     bool                               _traceBlock0{false};
+
+    // Per-decode-token telemetry. When MIMIRMIND_TRACE_DECODE_FILE is
+    // set, the engine opens an NDJSON sink at startup and writes one
+    // line per decoded token: {tok, wall_ms, cap_mhz, pkg_c}. Used to
+    // diagnose perf regressions (M5f.5 postmortem motivated this) and
+    // to validate optimizations after the fact instead of guessing.
+    // nullptr when the env var is unset — zero overhead in production.
+    std::FILE*                         _decodeTrace{nullptr};
 };
 
 } // namespace mimirmind::runtime

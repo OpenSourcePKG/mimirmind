@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <optional>
@@ -76,9 +77,34 @@ InferenceEngine::InferenceEngine()
                         env);
         }
     }
+
+    // Per-decode-token NDJSON telemetry sink. Opens the file truncating;
+    // the engine never rotates so a long-running process keeps appending.
+    // Operators should rotate externally if they care.
+    if (const char* path = std::getenv("MIMIRMIND_TRACE_DECODE_FILE")) {
+        if (path[0] != '\0') {
+            _decodeTrace = std::fopen(path, "w");
+            if (_decodeTrace != nullptr) {
+                MM_LOG_INFO("engine",
+                            "MIMIRMIND_TRACE_DECODE_FILE={} — per-token "
+                            "decode trace enabled (wall_ms, cap_mhz, pkg_c)",
+                            path);
+            } else {
+                MM_LOG_WARN("engine",
+                            "MIMIRMIND_TRACE_DECODE_FILE={} — could not "
+                            "open for writing, decode trace disabled",
+                            path);
+            }
+        }
+    }
 }
 
-InferenceEngine::~InferenceEngine() = default;
+InferenceEngine::~InferenceEngine() {
+    if (_decodeTrace != nullptr) {
+        std::fclose(_decodeTrace);
+        _decodeTrace = nullptr;
+    }
+}
 
 const model::WeightsMap& InferenceEngine::weights() const {
     if (!_weights.has_value()) {
@@ -467,6 +493,8 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
                 (void)_gpuGovernor->tick(*_governorMonitor);
             }
 
+            const auto tokT0 = clock::now();
+
             std::array<std::int32_t, 1> oneId{nextId};
             cmp::embeddingLookup(
                 tokEmb->type, tokEmb->usmPtr,
@@ -485,9 +513,37 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
                                 params.sampling);
             generated.push_back(nextId);
 
+            // Per-token trace, only when the env-controlled sink is open.
+            // sampleNext sync-waits on the lmHead matmul so tokT1 is real
+            // wall-time including the whole layer chain.
+            if (_decodeTrace != nullptr) {
+                const auto tokT1 = clock::now();
+                const double tokMs = std::chrono::duration<double, std::milli>(
+                    tokT1 - tokT0).count();
+                std::uint32_t cap = 0;
+                double pkg = -1.0;
+                if (_gpuGovernor != nullptr) {
+                    cap = _gpuGovernor->currentCapMhz();
+                }
+                if (_governorMonitor != nullptr) {
+                    const auto r = _governorMonitor->read();
+                    if (r.package_temp_c.has_value()) {
+                        pkg = static_cast<double>(*r.package_temp_c);
+                    }
+                }
+                std::fprintf(_decodeTrace,
+                             "{\"tok\":%zu,\"wall_ms\":%.3f,"
+                             "\"cap_mhz\":%u,\"pkg_c\":%.1f}\n",
+                             step, tokMs, cap, pkg);
+            }
+
             if (onToken && !onToken(nextId)) {
                 aborted = true;
             }
+        }
+
+        if (_decodeTrace != nullptr) {
+            std::fflush(_decodeTrace);
         }
 
         const auto decT1 = clock::now();
