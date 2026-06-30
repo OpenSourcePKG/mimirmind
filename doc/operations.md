@@ -176,6 +176,113 @@ Two example profiles live under `examples/`:
   a tower with proper cooling, intended as a "trust the silicon"
   baseline.
 
+## Power telemetry (RAPL)
+
+The engine snapshots Intel RAPL energy counters around every
+`generate()` call to report how many Joules each request consumed,
+and `/v1/system/status` exposes both rolling Watts and total Joules
+since startup per RAPL domain. This is observability only — the
+guard never throttles based on power.
+
+### What gets reported
+
+In `/v1/system/status`:
+
+```json
+"power": {
+  "available": true,
+  "uptime_s": 3812.4,
+  "domains": [
+    {"name": "package-0", "watts_now": 27.4, "total_joules": 184320.0},
+    {"name": "core",      "watts_now": 18.5, "total_joules": 102003.0},
+    {"name": "uncore",    "watts_now":  7.9, "total_joules":  47210.0},
+    {"name": "psys",      "watts_now": 31.2, "total_joules": 230500.0}
+  ]
+}
+```
+
+- `watts_now` is the average power between this `/v1/system/status` call
+  and the previous one. Poll every 5 s → 5-second smoothing window.
+- `total_joules` is energy consumed since the baseline snapshot, which
+  is taken once at server start, **immediately after the model finishes
+  loading**. Subtract before-and-after to get a request-scoped figure;
+  divide by `uptime_s` for average power.
+- `uptime_s` runs from the same baseline so the math is consistent.
+
+In `chat.completion` responses, the `usage` block gains:
+
+```json
+"usage": {
+  "prompt_tokens":     147,
+  "completion_tokens":  32,
+  "total_tokens":      179,
+  "package_joules":      4.7
+}
+```
+
+That is the energy the CPU package burned for **this specific
+generate() call** — prefill plus decode plus the bookkeeping around
+it. Streaming responses do not currently surface this in the SSE
+events (no `usage` field per OpenAI shape), but it is logged on the
+server side.
+
+The server log line for every completed request includes
+`energy=4.7J` so you can grep for it.
+
+### Container access
+
+RAPL counters live under `/sys/devices/virtual/powercap/intel-rapl/`
+on Linux. Both Docker and unprivileged LXC mask that subtree by
+default as a [Platypus side-channel] mitigation — relevant for crypto
+key recovery in SGX enclaves, not for LLM inference.
+
+[Platypus side-channel]: https://platypusattack.com/
+
+mimirmind is set up so the operator can opt in to RAPL visibility at
+two layers:
+
+- **Docker layer.** `docker-compose.yml` for the `mimirmind` service
+  sets `security_opt: systempaths=unconfined`, which unmasks the
+  whole `/sys` tree from Docker's side. Already in the file at the
+  repo root.
+- **Proxmox LXC layer.** If you run mimirmind inside an LXC
+  container, add to `/etc/pve/lxc/<CTID>.conf` on the Proxmox host:
+  ```
+  lxc.mount.entry: /sys/devices/virtual/powercap sys/devices/virtual/powercap none bind,ro,create=dir 0 0
+  ```
+  then reboot the CT.
+
+When either layer is still masking the path, the monitor reports
+unavailable instead of failing:
+
+```json
+"power": {
+  "available": false,
+  "reason": "intel-rapl directories found but energy_uj is not readable — Docker likely masks /sys/devices/virtual/powercap; set security_opt: systempaths=unconfined on the runtime service"
+}
+```
+
+The engine still serves chat completions; the per-request
+`package_joules` field is just omitted.
+
+### What you can do with the numbers
+
+- **Idle baseline.** Snapshot `total_joules` right after startup with
+  no traffic, divide by `uptime_s` after a minute — that is your
+  idle power draw. Useful for sizing PSU / UPS.
+- **Per-request cost.** `package_joules` in the response is the
+  immediate signal. At greedy Gemma 4 26B Q6_K decode with ~145 ms/tok,
+  expect roughly 4-6 J per 30-token reply, scaling with token count.
+- **Throttle correlation.** When `throttle.state == "throttling"`
+  you should see `watts_now` plateau — the pacing pauses give the
+  package room to cool. If it does not plateau, the throttle
+  `package_throttle_max_ms` is too low or the workload's idle power
+  is too close to the throttling threshold.
+- **Sanity check on the thermal profile.** If `watts_now` regularly
+  sits at half the chip's TDP rating while `package_temp_c` is at
+  your `package_temp_hard_c`, the cooling is the bottleneck (not
+  the silicon) — chassis / fan investigation needed.
+
 ## Watching it from outside
 
 The status endpoint is cheap (one sysfs read per call, capped at

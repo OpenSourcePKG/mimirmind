@@ -84,6 +84,17 @@ services:
             - "44"     # video
             - "104"   # render
 
+        # Unmask the host sysfs subtree so /sys/devices/virtual/powercap
+        # (Intel RAPL energy counters) is readable from inside the
+        # container. Docker masks this by default as a Platypus-style
+        # side-channel mitigation; mimirmind is a pure inference
+        # workload with no crypto-key handling, so the side-channel
+        # threat does not apply. Without this, /v1/system/status reports
+        # power as "unavailable: docker sysfs masking" and per-request
+        # energy is not measured.
+        security_opt:
+            - systempaths=unconfined
+
         environment:
             UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
             UR_L0_USE_RELAXED_ALLOCATION_LIMITS: "1"

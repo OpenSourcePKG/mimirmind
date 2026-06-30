@@ -15,6 +15,7 @@
 #include "runtime/UsmHandle.hpp"
 
 namespace mimirmind::runtime {
+class PowerMonitor;
 class ThermalGuard;
 } // namespace mimirmind::runtime
 
@@ -64,6 +65,11 @@ struct GenerateStats {
     /// EOS, chat-template stop, or user-supplied stop). False means we
     /// hit `maxNewTokens`.
     bool        hitStop{false};
+
+    /// Energy consumed by the CPU package (in Joules) over the full
+    /// generate() call. Only populated when a PowerMonitor is installed
+    /// and the kernel exposes RAPL counters; otherwise stays 0.
+    double      packageJoules{0.0};
 };
 
 /**
@@ -130,6 +136,13 @@ public:
     /// paceForCurrentReading() between every few tokens.
     void setThermalGuard(ThermalGuard* guard) noexcept { _thermalGuard = guard; }
     [[nodiscard]] ThermalGuard* thermalGuard() const noexcept { return _thermalGuard; }
+
+    /// Install (or remove with nullptr) the power monitor. The engine
+    /// does not own it. When set, generate() snapshots RAPL counters
+    /// before prefill and after decode, and reports packageJoules in
+    /// GenerateStats. No-op when monitor is unavailable.
+    void setPowerMonitor(PowerMonitor* monitor) noexcept { _powerMonitor = monitor; }
+    [[nodiscard]] PowerMonitor* powerMonitor() const noexcept { return _powerMonitor; }
 
     // --- Accessors (used by smoke path + diagnostics) -------------------
 
@@ -198,6 +211,9 @@ private:
     // Optional non-owning thermal guard. Engine consults it once before
     // prefill (admission) and every few decode tokens (pacing).
     ThermalGuard*                      _thermalGuard{nullptr};
+    // Optional non-owning power monitor. Engine snapshots counters
+    // around each generate() call to populate GenerateStats.packageJoules.
+    PowerMonitor*                      _powerMonitor{nullptr};
 
     // One-shot block-0 trace. Default off so production serve mode is
     // quiet; set MIMIRMIND_TRACE_BLOCK0=1 to enable when bringing up a

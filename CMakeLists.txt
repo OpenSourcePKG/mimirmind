@@ -160,6 +160,7 @@ add_executable(mimirmind
     src/runtime/L0Context.cpp
     src/runtime/Log.cpp
     src/runtime/MappedFile.cpp
+    src/runtime/PowerMonitor.cpp
     src/runtime/SystemMonitor.cpp
     src/runtime/ThermalGuard.cpp
     src/runtime/ThermalProfile.cpp
@@ -238,6 +239,7 @@ add_executable(arch_tests
     src/compute/Softmax.cpp
     src/model/ResponseCleaner.cpp
     src/runtime/Log.cpp
+    src/runtime/PowerMonitor.cpp
     src/runtime/SystemMonitor.cpp
     src/runtime/ThermalGuard.cpp
     src/runtime/ThermalProfile.cpp
