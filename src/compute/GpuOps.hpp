@@ -214,10 +214,11 @@ private:
     static constexpr std::size_t kFlashKTileSize    = 256;
     static constexpr std::size_t kFlashMaxKTiles    = kAttentionMaxTk /
                                                       kFlashKTileSize;
-    // Worst-case dims sized for Gemma 4 26B full-attention layers.
+    // Worst-case dims sized for Gemma 4 26B full-attention layers
+    // (head_dim=512 on 5 of 30 layers; SWA layers are head_dim=256).
     // Bumping these only costs the static USM allocation size below.
     static constexpr std::size_t kFlashMaxHeads     = 64;
-    static constexpr std::size_t kFlashMaxHeadDim   = 256;
+    static constexpr std::size_t kFlashMaxHeadDim   = 512;
 
     // Internal dispatch — variant (a) for T_q > 1, FlashAttention for
     // T_q == 1. Hidden behind attentionAsync.
