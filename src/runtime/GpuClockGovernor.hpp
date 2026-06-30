@@ -64,6 +64,16 @@ public:
     /// write (kernel-verified via re-read).
     std::uint32_t setMaxFreqMhz(std::uint32_t mhz);
 
+    /// Reset the cap to RP0 (hardware max). Called by InferenceEngine
+    /// at the start of each generate() call so a request that follows
+    /// an earlier cap-down isn't forced to start at the throttled cap.
+    /// The asymmetric controller's slow up-gain (kGainUpMhzPerC = 10)
+    /// would otherwise take many ticks to recover, and ticks only fire
+    /// during decode — so without a per-request reset the cap stays
+    /// pinned at wherever the previous request left it. Returns the
+    /// cap after write (= RP0 unless the kernel refused).
+    std::uint32_t resetToMax() noexcept;
+
     /// Asymmetric P-controller: nudges current cap toward keeping
     /// `current_temp_c` at targetTempC(). The gain is direction-
     /// dependent so we drop the cap fast when overshooting target
