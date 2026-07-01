@@ -146,11 +146,13 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     _fusedQkv = std::make_unique<model::FusedQkvWeights>(
         *_weights, _allocator, _config.blockCount);
 
-    // M5i.D: Autotune the GEMM-vs-matvec-loop dispatch per QuantType on
-    // the actual iGPU. Runs a short micro-bench on synthetic weights
-    // sized like a Q projection (N = K = d_model, M = 16 = a typical
-    // prefill chunk). Honours MIMIRMIND_DISABLE_GEMM / _FORCE_GEMM as
-    // overrides that skip the bench and pin the decision directly.
+    // M5i.D: Load-time self-tests of the GPU compute path. selfTest
+    // verifies every non-matmul GPU op against a CPU reference on a
+    // tiny fixed input — catches broken SPV loads and driver bugs on
+    // unfamiliar iGPU µarchs. autotune runs a matvec-vs-GEMM micro-
+    // bench (with its own parity gate) and pins the dispatch decision
+    // per QuantType. Honours MIMIRMIND_DISABLE_GEMM / _FORCE_GEMM.
+    _ops.selfTest(_allocator);
     _gmm.autotune(_allocator, _config.embeddingLength);
 
     // Pick the arch backend now that weights are available. Returns

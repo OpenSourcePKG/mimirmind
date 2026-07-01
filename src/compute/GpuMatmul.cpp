@@ -240,6 +240,65 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
             entry.useGemm = false;
         }
 
+        // Parity gate — before we let GEMM win the timing race, verify
+        // the two paths compute the same values within tolerance on
+        // this iGPU. A driver bug or a broken SPV would otherwise
+        // silently corrupt inference. Small tolerance (5e-2) because
+        // synthetic random weights can produce large accumulator
+        // magnitudes; anything above that is a genuine kernel bug.
+        {
+            std::vector<float> yVec(M * N);
+            std::vector<float> yGem(M * N);
+
+            entry.useGemm = false;
+            for (std::size_t m = 0; m < M; ++m) {
+                matmulAsync(type, wUsm, N, K,
+                            static_cast<const float*>(xUsm) + m * K,
+                            /*M=*/1,
+                            static_cast<float*>(yUsm) + m * N,
+                            static_cast<float*>(sUsm));
+            }
+            _queue.flush();
+            std::memcpy(yVec.data(), yUsm, yBytes);
+
+            entry.useGemm = true;
+            matmulAsync(type, wUsm, N, K,
+                        static_cast<const float*>(xUsm), M,
+                        static_cast<float*>(yUsm),
+                        static_cast<float*>(sUsm));
+            _queue.flush();
+            entry.useGemm = false;
+            std::memcpy(yGem.data(), yUsm, yBytes);
+
+            float maxDiff = 0.0F;
+            float maxRel  = 0.0F;
+            for (std::size_t i = 0; i < yVec.size(); ++i) {
+                const float d = std::fabs(yVec[i] - yGem[i]);
+                if (d > maxDiff) maxDiff = d;
+                const float ref = std::fabs(yVec[i]);
+                if (ref > 1e-6F) {
+                    const float r = d / ref;
+                    if (r > maxRel) maxRel = r;
+                }
+            }
+            constexpr float kAbsTol = 5e-2F;
+            constexpr float kRelTol = 5e-2F;
+            if (!(maxDiff <= kAbsTol) && !(maxRel <= kRelTol)) {
+                MM_LOG_WARN("gpummm",
+                            "autotune parity FAIL for {} — matvec vs gemm "
+                            "maxDiff={:.6g} maxRel={:.6g}. Pinning to "
+                            "matvec-loop and skipping timing bench.",
+                            qt->name(), maxDiff, maxRel);
+                entry.useGemm = false;
+                allocator.deallocate(wUsm, wBytes);
+                continue;
+            }
+            MM_LOG_INFO("gpummm",
+                        "autotune parity OK for {} — maxDiff={:.6g} "
+                        "maxRel={:.6g}",
+                        qt->name(), maxDiff, maxRel);
+        }
+
         using clk = std::chrono::steady_clock;
 
         // Timed matvec-loop: M matmulAsyncs + one flush per iteration.
