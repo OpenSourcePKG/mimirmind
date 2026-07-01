@@ -52,6 +52,15 @@ struct GpuFixture {
     mimirmind::runtime::CommandQueue queue{ctx};
     mimirmind::compute::GpuOps       ops{ctx, usm, queue};
     mimirmind::compute::GpuMatmul    gmm{ctx, queue};
+
+    GpuFixture() {
+        // Force the GEMM dispatch decision so the M>1 parity tests
+        // actually exercise the GEMM kernels regardless of what the
+        // dev-box iGPU would autotune-pick. M=1 regression tests still
+        // hit the matvec path because dispatch fast-paths M==1 to vec.
+        ::setenv("MIMIRMIND_FORCE_GEMM", "1", /*overwrite=*/1);
+        gmm.autotune(usm, /*hiddenDim=*/2816, /*mBatch=*/16);
+    }
 };
 
 GpuFixture& fx() {

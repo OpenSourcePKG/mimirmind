@@ -146,6 +146,13 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     _fusedQkv = std::make_unique<model::FusedQkvWeights>(
         *_weights, _allocator, _config.blockCount);
 
+    // M5i.D: Autotune the GEMM-vs-matvec-loop dispatch per QuantType on
+    // the actual iGPU. Runs a short micro-bench on synthetic weights
+    // sized like a Q projection (N = K = d_model, M = 16 = a typical
+    // prefill chunk). Honours MIMIRMIND_DISABLE_GEMM / _FORCE_GEMM as
+    // overrides that skip the bench and pin the decision directly.
+    _gmm.autotune(_allocator, _config.embeddingLength);
+
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
     // gracefully with the original architecture string in the error.

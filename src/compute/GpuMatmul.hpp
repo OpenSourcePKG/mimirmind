@@ -13,6 +13,7 @@
 
 namespace mimirmind::runtime {
 class L0Context;
+class UsmAllocator;
 }
 
 namespace mimirmind::compute {
@@ -40,6 +41,26 @@ public:
 
     /// True if this dispatcher will run `type` on the GPU.
     [[nodiscard]] bool supports(model::GgmlType type) const noexcept;
+
+    /// Per-QuantType micro-bench: for each type that has both a matvec
+    /// and a GEMM kernel, time both paths on a representative prefill
+    /// shape and pick the faster one. The decision is stored on the
+    /// Entry and consulted by matmulAsync at every M > 1 dispatch.
+    ///
+    /// Idempotent — call once from `InferenceEngine::loadModel` after
+    /// `_weights` is ready. The bench allocates a small temporary USM
+    /// scratch through `allocator` and releases it before returning.
+    /// `hiddenDim` is used as the (N=K) matmul dim; use the model's
+    /// d_model. `mBatch` is the batch to time (16 mirrors a typical
+    /// prefill chunk).
+    ///
+    /// Env-var overrides skip the actual bench:
+    ///   MIMIRMIND_DISABLE_GEMM=1 → force matvec-loop for every type
+    ///   MIMIRMIND_FORCE_GEMM=1   → force GEMM for every type that has one
+    /// Both set → DISABLE wins (safer default).
+    void autotune(runtime::UsmAllocator& allocator,
+                  std::size_t            hiddenDim,
+                  std::size_t            mBatch = 16);
 
     /// Y [M, N] = X [M, K] * W [N, K]^T. Synchronous version (mirrors
     /// compute::matmul signature). For supported `type` the dispatch goes
@@ -89,6 +110,7 @@ private:
         KernelSlot                vec;      // M==1 hot path (matvec)
         std::optional<KernelSlot> gemm;     // optional M>1 batched path
         std::size_t               gemmMTile{1};
+        bool                      useGemm{false};  // set by autotune()
     };
 
     runtime::L0Context&    _ctx;
