@@ -137,6 +137,15 @@ https://repositories.intel.com/gpu/ubuntu noble client" \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
+# ubuntu:24.04 ships `video` (GID 44) but not `render` (GID 104). A
+# caller that passes `--group-add 104` (see mimirmind's own compose
+# and the pegenaut server-compose) fails at runc with
+# `Unable to find group 104` when the group is absent from the
+# container's /etc/group — even if the host has it. Create both at
+# the well-known Ubuntu GIDs so DRM/render passthrough works.
+RUN groupadd -g 44  video  2>/dev/null || true \
+ && groupadd -g 104 render 2>/dev/null || true
+
 # Defensive: lift the 4-GB single-allocation cap on Level Zero
 ENV UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
 ENV UR_L0_USE_RELAXED_ALLOCATION_LIMITS=1
