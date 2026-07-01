@@ -139,11 +139,19 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
         logBlockTensorInventory(_reader, 5);
     }
 
+    // M5i.B: Try to fuse per-block attn_q/k/v weights so the QKV
+    // projections can dispatch as one matmul. The class no-ops when
+    // MIMIRMIND_DISABLE_FUSED_QKV is set or when a block doesn't
+    // qualify (missing tensors, mismatched types).
+    _fusedQkv = std::make_unique<model::FusedQkvWeights>(
+        *_weights, _allocator, _config.blockCount);
+
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
     // gracefully with the original architecture string in the error.
     _backend = arch::createArchBackend(
-        _config.architecture, _config, *_weights, _ops, _gmm);
+        _config.architecture, _config, *_weights, _fusedQkv.get(),
+        _ops, _gmm);
 
     _modelLoaded = true;
     // Defensive: a previous model's KV state must not survive into the
@@ -208,9 +216,12 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     }
 
     const auto [qDimMax, kvDimMax] = _backend->maxQKVDims();
+    const bool withFusedQkv =
+        _fusedQkv != nullptr && _fusedQkv->anyFused();
     _blockBuffers = allocBlockBuffers(_allocator, _config,
                                       maxT, _maxContextTokens,
-                                      qDimMax, kvDimMax);
+                                      qDimMax, kvDimMax,
+                                      withFusedQkv);
 
     _xBufH      = UsmHandle{_allocator, maxT      * d_model  * sizeof(float)};
     _normFinalH = UsmHandle{_allocator, d_model   * sizeof(float)};

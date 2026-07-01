@@ -36,6 +36,11 @@ struct BlockBuffers {
     UsmHandle matmulScratch; // max(d_model, q_dim, ff_dim)
     UsmHandle scoreScratch;  // [maxSeq]
 
+    // Fused QKV: staging output for the concatenated matmul, split by a
+    // downstream kernel into qBuf / kSlot / vSlot. Sized for the widest
+    // layer (Q + K + V heads). Only allocated when fused QKV is enabled.
+    UsmHandle qkvFusedScratch; // [maxT, q_dim + 2*kv_dim]
+
     // Gemma 4 Path B (MoE) scratch. Zero-sized for non-MoE blocks.
     UsmHandle moeAccumBuf;   // [maxT, d_model]   weighted sum of experts
     UsmHandle expertOutBuf;  // [maxT, d_model]   per-expert down output
@@ -49,6 +54,7 @@ BlockBuffers allocBlockBuffers(UsmAllocator&           allocator,
                                std::size_t             maxT,
                                std::size_t             maxSeq,
                                std::size_t             qDimMax,
-                               std::size_t             kvDimMax);
+                               std::size_t             kvDimMax,
+                               bool                    withFusedQkv = false);
 
 } // namespace mimirmind::runtime

@@ -2,6 +2,7 @@
 
 #include "compute/GpuMatmul.hpp"
 #include "compute/GpuOps.hpp"
+#include "model/FusedQkvWeights.hpp"
 #include "model/GgufTypes.hpp"
 #include "model/LlmConfig.hpp"
 #include "model/WeightsMap.hpp"
@@ -15,11 +16,13 @@
 
 namespace mimirmind::runtime::arch {
 
-Qwen2Backend::Qwen2Backend(const model::LlmConfig&   config,
-                           const model::WeightsMap&  weights,
-                           compute::GpuOps&          ops,
-                           compute::GpuMatmul&       gmm)
-    : _config{config}, _weights{weights}, _ops{ops}, _gmm{gmm} {
+Qwen2Backend::Qwen2Backend(const model::LlmConfig&        config,
+                           const model::WeightsMap&       weights,
+                           const model::FusedQkvWeights*  fusedQkv,
+                           compute::GpuOps&               ops,
+                           compute::GpuMatmul&            gmm)
+    : _config{config}, _weights{weights}, _fusedQkv{fusedQkv},
+      _ops{ops}, _gmm{gmm} {
     MM_LOG_INFO("qwen2", "Qwen2Backend ready — blocks={} d_model={} ff={} "
                          "heads={} kv={}",
                 _config.blockCount, _config.embeddingLength,
@@ -130,16 +133,33 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     float* kSlot = cache.writeSlotK(blockIdx);
     float* vSlot = cache.writeSlotV(blockIdx);
 
-    // M5f.4: Q/K/V projections write disjoint buffers and depend only
-    // on normBuf (already published by the rmsnorm above). They can
-    // pipeline freely inside the unordered scope; the scope's pop
-    // emits a single barrier that the bias adds + RoPE read against.
-    trace("Q+K+V projections (matmulAsync, unordered)");
-    {
-        runtime::UnorderedScope u{_ops.queue()};
-        projectAsync(qW, q_dim,  qBuf);
-        projectAsync(kW, kv_dim, kSlot);
-        projectAsync(vW, kv_dim, vSlot);
+    // M5i.B: Fused Q+K+V — single matmul into a staging buffer, then a
+    // scatter kernel routes the sub-ranges into qBuf/kSlot/vSlot. Bias
+    // adds run on the split outputs as usual, no change there.
+    const model::FusedQkvWeights::Block* fBlk =
+        (_fusedQkv != nullptr) ? _fusedQkv->find(blockIdx) : nullptr;
+
+    if (fBlk != nullptr) {
+        trace("Q+K+V projections (fused matmul + split)");
+        float* const qkvFused = s.qkvFusedScratch.as<float>();
+        const std::size_t Nfused =
+            fBlk->Nq + fBlk->Nkv * (fBlk->hasV ? 2 : 1);
+        _gmm.matmulAsync(fBlk->type, fBlk->usmPtr, Nfused, d_model,
+                         normBuf, T, qkvFused, matmulScratch);
+        _ops.qkvSplitAsync(qkvFused, qBuf, kSlot, vSlot,
+                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV);
+    } else {
+        // M5f.4: Q/K/V projections write disjoint buffers and depend only
+        // on normBuf (already published by the rmsnorm above). They can
+        // pipeline freely inside the unordered scope; the scope's pop
+        // emits a single barrier that the bias adds + RoPE read against.
+        trace("Q+K+V projections (matmulAsync, unordered)");
+        {
+            runtime::UnorderedScope u{_ops.queue()};
+            projectAsync(qW, q_dim,  qBuf);
+            projectAsync(kW, kv_dim, kSlot);
+            projectAsync(vW, kv_dim, vSlot);
+        }
     }
 
     // QKV bias adds — each adds to its own buffer, independent of the

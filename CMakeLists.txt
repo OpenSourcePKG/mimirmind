@@ -84,6 +84,7 @@ set(KERNEL_SOURCES
     kernels/matmul_q6k_gemm.cl
     kernels/matmul_q4k_gemm.cl
     kernels/matmul_q8_0_gemm.cl
+    kernels/qkv_split.cl
     kernels/add_bias.cl
     kernels/add_residual.cl
     kernels/silu_mul.cl
@@ -152,6 +153,7 @@ add_executable(mimirmind
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
     src/model/ChatTemplate.cpp
+    src/model/FusedQkvWeights.cpp
     src/model/GgufReader.cpp
     src/model/GgufTypes.cpp
     src/model/LlmConfig.cpp

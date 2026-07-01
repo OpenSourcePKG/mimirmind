@@ -1290,6 +1290,99 @@ TEST(matmul_q8_0_gemm_realistic_prefill) {
 }
 
 // =======================================================================
+// qkv_split — verify the scatter kernel routes the fused matmul output
+// into Q / K / V sub-buffers correctly, including the hasV=false path.
+// =======================================================================
+namespace {
+
+void runQkvSplitParity(const char* label,
+                       std::size_t M,
+                       std::size_t Nq,
+                       std::size_t Nkv,
+                       bool        hasV) {
+    const std::size_t Nfused = Nq + Nkv * (hasV ? 2 : 1);
+    const auto fused = generateFloats(M * Nfused, /*seed=*/0xF001U);
+
+    UsmBuf bufFused(M * Nfused * sizeof(float));
+    UsmBuf bufQ    (M * Nq     * sizeof(float));
+    UsmBuf bufK    (M * Nkv    * sizeof(float));
+    UsmBuf bufV    (M * Nkv    * sizeof(float));   // unused for !hasV
+
+    std::memcpy(bufFused.raw(), fused.data(),
+                fused.size() * sizeof(float));
+
+    // Poison the destinations so we notice under-fills.
+    std::vector<float> poison(M * Nkv, -12345.0F);
+    std::memcpy(bufQ.raw(), poison.data(), M * Nq  * sizeof(float));
+    std::memcpy(bufK.raw(), poison.data(), M * Nkv * sizeof(float));
+    if (hasV) {
+        std::memcpy(bufV.raw(), poison.data(), M * Nkv * sizeof(float));
+    }
+
+    fx().ops.qkvSplitAsync(bufFused.as<float>(),
+                           bufQ.as<float>(),
+                           bufK.as<float>(),
+                           bufV.as<float>(),
+                           M, Nq, Nkv, hasV);
+    fx().queue.flush();
+
+    // CPU reference: iterate the fused layout and check each split slot.
+    std::vector<float> cpuQ(M * Nq);
+    std::vector<float> cpuK(M * Nkv);
+    std::vector<float> cpuV(M * Nkv, 0.0F);
+    for (std::size_t m = 0; m < M; ++m) {
+        for (std::size_t i = 0; i < Nq; ++i) {
+            cpuQ[m * Nq + i] = fused[m * Nfused + i];
+        }
+        for (std::size_t j = 0; j < Nkv; ++j) {
+            cpuK[m * Nkv + j] = fused[m * Nfused + Nq + j];
+        }
+        if (hasV) {
+            for (std::size_t j = 0; j < Nkv; ++j) {
+                cpuV[m * Nkv + j] =
+                    fused[m * Nfused + Nq + Nkv + j];
+            }
+        }
+    }
+
+    EXPECT_ARRAY_NEAR((std::string{label} + "/Q").c_str(),
+                      bufQ.as<float>(), cpuQ.data(), M * Nq,  0.0F);
+    EXPECT_ARRAY_NEAR((std::string{label} + "/K").c_str(),
+                      bufK.as<float>(), cpuK.data(), M * Nkv, 0.0F);
+    if (hasV) {
+        EXPECT_ARRAY_NEAR((std::string{label} + "/V").c_str(),
+                          bufV.as<float>(), cpuV.data(), M * Nkv, 0.0F);
+    }
+}
+
+} // namespace
+
+TEST(qkv_split_full_qkv) {
+    // Standard case: Q + K + V all present.
+    runQkvSplitParity("qkv_split_full", /*M=*/8, /*Nq=*/256,
+                      /*Nkv=*/64, /*hasV=*/true);
+}
+
+TEST(qkv_split_alt_attention_qk_only) {
+    // Gemma 4 alt-attention layers: V derived downstream, kernel only
+    // scatters Q + K. hasV=false must never touch the V slot.
+    runQkvSplitParity("qkv_split_qk", /*M=*/8, /*Nq=*/256,
+                      /*Nkv=*/64, /*hasV=*/false);
+}
+
+TEST(qkv_split_gqa_ratio) {
+    // GQA-style: Nq is a multiple of Nkv (heads / kv_heads = 8/2).
+    runQkvSplitParity("qkv_split_gqa", /*M=*/4, /*Nq=*/2048,
+                      /*Nkv=*/512, /*hasV=*/true);
+}
+
+TEST(qkv_split_M1_decode) {
+    // Decode path passes M=1. Trivial but must not misalign.
+    runQkvSplitParity("qkv_split_M1", /*M=*/1, /*Nq=*/512,
+                      /*Nkv=*/128, /*hasV=*/true);
+}
+
+// =======================================================================
 // Perf micro-benchmarks — GEMM (batched) vs matvec-loop (per-token).
 //
 // Opt-in via MIMIRMIND_GPU_BENCH=1. Off by default so the regular test
