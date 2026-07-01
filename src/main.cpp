@@ -1199,13 +1199,24 @@ int runServe(const CliArgs& args) {
         // gpu_target_temp_c). If present AND the iGPU sysfs is
         // writable, we install it. Otherwise we move on without one —
         // the per-token thermal pace still runs as a safety net.
+        //
+        // MIMIRMIND_GPU_CLOCK_PIN=rp0 bypasses the governor entirely
+        // and pins the software cap to RP0 for the whole session. Meant
+        // for perf-bench runs where the M9.6.5 asymmetric gains would
+        // otherwise clock down too aggressively and confound the
+        // measurement. Package thermal safety still runs via the
+        // ThermalGuard admission check + per-token pace. Do NOT ship
+        // this to sustained workloads on a passively-cooled chassis.
         static std::unique_ptr<mimirmind::runtime::GpuClockGovernor> governor;
+        const char* clockPinEnv = std::getenv("MIMIRMIND_GPU_CLOCK_PIN");
+        const bool  clockPinRp0 =
+            clockPinEnv != nullptr && clockPinEnv[0] != '\0'
+            && std::string_view{clockPinEnv} != "0"
+            && std::string_view{clockPinEnv} != "off";
         if (profile.hasGpuClockTarget()) {
             governor = std::make_unique<mimirmind::runtime::GpuClockGovernor>();
             governor->setTargetTempC(*profile.gpu_target_temp_c);
-            if (governor->available()) {
-                engine.setGpuClockGovernor(governor.get(), monitor.get());
-            } else {
+            if (!governor->available()) {
                 MM_LOG_WARN("main",
                             "thermal profile asks for GPU clock governor "
                             "(gpu_target_temp_c={:.1f}) but it is not "
@@ -1213,7 +1224,26 @@ int runServe(const CliArgs& args) {
                             *profile.gpu_target_temp_c,
                             governor->unavailableReason());
                 governor.reset();
+            } else if (clockPinRp0) {
+                const auto rp0 = governor->rp0Mhz();
+                const auto pinned = governor->setMaxFreqMhz(rp0);
+                MM_LOG_WARN("main",
+                            "MIMIRMIND_GPU_CLOCK_PIN={} — cap pinned to "
+                            "RP0 ({} MHz), governor NOT installed. Bench "
+                            "mode. Thermal safety still via ThermalGuard.",
+                            clockPinEnv, pinned);
+                // Keep governor alive (static) so destructor restores
+                // RP0 on shutdown — but skip setGpuClockGovernor so no
+                // tick ever overrides our pin.
+            } else {
+                engine.setGpuClockGovernor(governor.get(), monitor.get());
             }
+        } else if (clockPinRp0) {
+            MM_LOG_WARN("main",
+                        "MIMIRMIND_GPU_CLOCK_PIN={} ignored — thermal "
+                        "profile has no gpu_target_temp_c so no governor "
+                        "was going to be installed anyway.",
+                        clockPinEnv);
         }
     }
 
