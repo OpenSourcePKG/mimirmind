@@ -38,8 +38,14 @@
 #define Q6K_BLOCK_BYTES    210
 
 // 1024 elements = 4 super-blocks per K-tile.
-// SLM footprint: MATMUL_Q6K_GEMM_M_TILE * X_TILE_ELEMENTS * 4 B
-//              = 8 * 1024 * 4 = 32 KiB per workgroup.
+// SLM footprint: X_TILE_ELEMENTS * MATMUL_Q6K_GEMM_M_TILE * 4 B
+//              = 1024 * 4 * 4 = 16 KiB per workgroup.
+//
+// Layout is xTile[k_slot][m_slot] so that iterating m for a fixed k
+// hits consecutive SLM addresses — no bank conflict. The reverse
+// layout [m][k] with stride 1024 * 4 = 4096 B lands every m-slot on
+// the same bank (banks are 4 B wide, 32 banks per SLM slice, 4096 %
+// 128 == 0) and serialises the M-fold inner loop.
 #define X_TILE_ELEMENTS 1024
 
 __attribute__((reqd_work_group_size(MATMUL_Q6K_LOCAL, 1, 1)))
@@ -52,7 +58,7 @@ __kernel void matmul_q6k_gemm(
     const int             N,
     const int             M)
 {
-    __local float xTile[MATMUL_Q6K_GEMM_M_TILE][X_TILE_ELEMENTS];
+    __local float xTile[X_TILE_ELEMENTS][MATMUL_Q6K_GEMM_M_TILE];
 
     const int  wgN     = (int)get_group_id(0);
     const int  wgM     = (int)get_group_id(1);
@@ -83,13 +89,15 @@ __kernel void matmul_q6k_gemm(
         // Cooperative load of all M_TILE rows for this K-tile. Rows
         // past M get zero-filled so their MACs contribute nothing;
         // guards at the write-back step drop the garbage anyway.
+        // Iteration order: k-major so global reads within one m are
+        // coalesced; scatter into the swizzled SLM layout on write.
         const int loadTotal = MATMUL_Q6K_GEMM_M_TILE * X_TILE_ELEMENTS;
         for (int idx = tid; idx < loadTotal; idx += lsize) {
             const int  mSlot = idx / X_TILE_ELEMENTS;
             const int  iSlot = idx - mSlot * X_TILE_ELEMENTS;
             const int  mAct  = mBase + mSlot;
             const bool valid = (mAct < M) && (iSlot < tileK);
-            xTile[mSlot][iSlot] =
+            xTile[iSlot][mSlot] =
                 valid ? X[(size_t)mAct * (size_t)K + tile + iSlot] : 0.0f;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -155,10 +163,10 @@ __kernel void matmul_q6k_gemm(
 
                         #pragma unroll
                         for (int mm = 0; mm < MATMUL_Q6K_GEMM_M_TILE; ++mm) {
-                            KAHAN_ADD(mm, xTile[mm][xHalfBase + l +  0] * w0);
-                            KAHAN_ADD(mm, xTile[mm][xHalfBase + l + 32] * w1);
-                            KAHAN_ADD(mm, xTile[mm][xHalfBase + l + 64] * w2);
-                            KAHAN_ADD(mm, xTile[mm][xHalfBase + l + 96] * w3);
+                            KAHAN_ADD(mm, xTile[xHalfBase + l +  0][mm] * w0);
+                            KAHAN_ADD(mm, xTile[xHalfBase + l + 32][mm] * w1);
+                            KAHAN_ADD(mm, xTile[xHalfBase + l + 64][mm] * w2);
+                            KAHAN_ADD(mm, xTile[xHalfBase + l + 96][mm] * w3);
                         }
 
                         #undef KAHAN_ADD

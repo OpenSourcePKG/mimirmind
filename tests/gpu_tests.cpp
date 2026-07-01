@@ -29,10 +29,13 @@
 #include "runtime/L0Context.hpp"
 #include "runtime/UsmAllocator.hpp"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -1284,6 +1287,208 @@ TEST(matmul_q8_0_gemm_realistic_prefill) {
     // Gemma-4 Q8_0 attention proj shape: N≈2560, K=2816, M=16.
     runQ8_0MatmulParity("matmul_q8_0_gemm_prefill", /*N=*/2560, /*K=*/2816,
                         /*M=*/16, /*seed=*/0xE005U, /*tol=*/2e-2F);
+}
+
+// =======================================================================
+// Perf micro-benchmarks — GEMM (batched) vs matvec-loop (per-token).
+//
+// Opt-in via MIMIRMIND_GPU_BENCH=1. Off by default so the regular test
+// suite stays fast and deterministic.
+//
+// !!! HARDWARE WARNING !!!
+// The dev workstation's iGPU (verify via `gpu_tests | grep 'target
+// device'`) may be a much older µarch than the production target
+// (L0_TARGET_HOST, Xe-LPG on Meteor Lake, Gen13). Numbers from a
+// Gen9.5 HD Graphics 630 do NOT predict Xe-LPG behaviour — different
+// register file, different SLM budget, different SIMD width, different
+// compiler code-gen. Only use bench numbers from L0_TARGET_HOST when
+// making kernel-design decisions.
+//
+// Bench flow per (type, N, K, M):
+//   1. Warmup: 3 iterations of GEMM to JIT-compile + warm thermals.
+//   2. Baseline: N_iter × (M × matmulAsync(M_arg=1) + 1 sync) —
+//      forces matvec path with a single flush per iteration.
+//   3. Batched:  N_iter × matmul(M_arg=M) — uses GEMM path.
+//   4. Report median-of-N_iter for each, plus speedup ratio.
+// =======================================================================
+namespace {
+
+bool benchEnabled() {
+    const char* v = std::getenv("MIMIRMIND_GPU_BENCH");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
+// Median of a small vector of doubles. Destructive (sorts in place) —
+// caller passes by value.
+double median(std::vector<double> xs) {
+    if (xs.empty()) return 0.0;
+    std::sort(xs.begin(), xs.end());
+    const std::size_t mid = xs.size() / 2;
+    return (xs.size() % 2 == 1)
+        ? xs[mid]
+        : 0.5 * (xs[mid - 1] + xs[mid]);
+}
+
+struct BenchResult {
+    double matvecMedianMs;
+    double gemmMedianMs;
+};
+
+// Times both paths for a matmul at the given shape and returns the
+// medians. `W` must already be populated on the USM buffer as GgmlType-
+// encoded blocks; X/Y/scratch are (re-)used by every iteration.
+//
+// Fair-baseline note: the matvec-loop path calls matmulAsync M times
+// but syncs only once per iteration (matching how the pre-GEMM
+// InferenceEngine actually issued matmuls — one command-list flush at
+// block end, not per-token).
+BenchResult benchMatmulShape(mimirmind::model::GgmlType type,
+                             const void* W,
+                             std::size_t N,
+                             std::size_t K,
+                             std::size_t M,
+                             const float* X,
+                             float*       Y,
+                             float*       scratch,
+                             int          nIter = 8,
+                             int          nWarmup = 3) {
+    using clk = std::chrono::steady_clock;
+    auto& gmm = fx().gmm;
+
+    // Warmup — dispatch the GEMM path a few times so the SPV is JIT'd
+    // and the iGPU clock has ramped up.
+    for (int i = 0; i < nWarmup; ++i) {
+        gmm.matmul(type, W, N, K, X, M, Y, scratch);
+    }
+
+    // Baseline: M × matmulAsync(M_arg=1) + 1 sync. Each single-row
+    // call dispatches through the matvec kernel per our M==1 fast-path.
+    // Only one flush at the end so we measure kernel throughput, not
+    // per-token command-list overhead.
+    std::vector<double> matvecMs;
+    matvecMs.reserve(static_cast<std::size_t>(nIter));
+    for (int it = 0; it < nIter; ++it) {
+        const auto t0 = clk::now();
+        for (std::size_t m = 0; m < M; ++m) {
+            gmm.matmulAsync(type, W, N, K, X + m * K, /*M=*/1,
+                            Y + m * N, scratch);
+        }
+        gmm.sync();
+        const auto t1 = clk::now();
+        const std::chrono::duration<double, std::milli> dt = t1 - t0;
+        matvecMs.push_back(dt.count());
+    }
+
+    // Batched: 1 × matmul(M_arg=M). Uses the GEMM kernel. Same one
+    // flush at the end via matmul()'s internal sync.
+    std::vector<double> gemmMs;
+    gemmMs.reserve(static_cast<std::size_t>(nIter));
+    for (int it = 0; it < nIter; ++it) {
+        const auto t0 = clk::now();
+        gmm.matmul(type, W, N, K, X, M, Y, scratch);
+        const auto t1 = clk::now();
+        const std::chrono::duration<double, std::milli> dt = t1 - t0;
+        gemmMs.push_back(dt.count());
+    }
+
+    return {median(std::move(matvecMs)), median(std::move(gemmMs))};
+}
+
+// Print a table row: "M=  16  matvec: 170.4 ms  gemm:  15.3 ms  speedup: 11.14×"
+void printBenchRow(std::size_t M, BenchResult r) {
+    const double speedup =
+        (r.gemmMedianMs > 0.0) ? (r.matvecMedianMs / r.gemmMedianMs) : 0.0;
+    std::printf("  M=%4zu  matvec: %8.2f ms   gemm: %8.2f ms   speedup: %5.2fx\n",
+                M, r.matvecMedianMs, r.gemmMedianMs, speedup);
+}
+
+} // namespace
+
+TEST(bench_matmul_q6k_prefill_shape) {
+    if (!benchEnabled()) return;
+
+    // Gemma-4 Q6_K attention-proj shape.
+    constexpr std::size_t N = 2560;
+    constexpr std::size_t K = 2816;
+
+    const auto W = buildQ6kWeights(N, K, /*seed=*/0xB001U);
+    const auto X = generateFloats(64 * K, /*seed=*/0xB101U);
+
+    UsmBuf bufW(W.size());
+    UsmBuf bufX(64 * K * sizeof(float));
+    UsmBuf bufY(64 * N * sizeof(float));
+    UsmBuf bufScratch(K * sizeof(float));
+    std::memcpy(bufW.raw(), W.data(), W.size());
+    std::memcpy(bufX.raw(), X.data(), X.size() * sizeof(float));
+
+    std::printf("\n[bench] matmul_q6k  N=%zu  K=%zu  (Xe-LPG iGPU)\n", N, K);
+    for (const std::size_t M : {std::size_t{4}, std::size_t{8},
+                                std::size_t{16}, std::size_t{64}}) {
+        const auto r = benchMatmulShape(mimirmind::model::GgmlType::Q6_K,
+                                        bufW.raw(), N, K, M,
+                                        bufX.as<float>(),
+                                        bufY.as<float>(),
+                                        bufScratch.as<float>());
+        printBenchRow(M, r);
+    }
+}
+
+TEST(bench_matmul_q4k_prefill_shape) {
+    if (!benchEnabled()) return;
+
+    // Qwen-style Q4_K attention proj shape.
+    constexpr std::size_t N = 2048;
+    constexpr std::size_t K = 3584;
+
+    const auto W = buildQ4kWeights(N, K, /*seed=*/0xB002U);
+    const auto X = generateFloats(64 * K, /*seed=*/0xB102U);
+
+    UsmBuf bufW(W.size());
+    UsmBuf bufX(64 * K * sizeof(float));
+    UsmBuf bufY(64 * N * sizeof(float));
+    UsmBuf bufScratch(K * sizeof(float));
+    std::memcpy(bufW.raw(), W.data(), W.size());
+    std::memcpy(bufX.raw(), X.data(), X.size() * sizeof(float));
+
+    std::printf("\n[bench] matmul_q4k  N=%zu  K=%zu  (Xe-LPG iGPU)\n", N, K);
+    for (const std::size_t M : {std::size_t{4}, std::size_t{8},
+                                std::size_t{16}, std::size_t{64}}) {
+        const auto r = benchMatmulShape(mimirmind::model::GgmlType::Q4_K,
+                                        bufW.raw(), N, K, M,
+                                        bufX.as<float>(),
+                                        bufY.as<float>(),
+                                        bufScratch.as<float>());
+        printBenchRow(M, r);
+    }
+}
+
+TEST(bench_matmul_q8_0_prefill_shape) {
+    if (!benchEnabled()) return;
+
+    // Gemma-4 Q8_0 attention proj shape.
+    constexpr std::size_t N = 2560;
+    constexpr std::size_t K = 2816;
+
+    const auto W = buildQ8_0Weights(N, K, /*seed=*/0xB003U);
+    const auto X = generateFloats(64 * K, /*seed=*/0xB103U);
+
+    UsmBuf bufW(W.size());
+    UsmBuf bufX(64 * K * sizeof(float));
+    UsmBuf bufY(64 * N * sizeof(float));
+    UsmBuf bufScratch(K * sizeof(float));
+    std::memcpy(bufW.raw(), W.data(), W.size());
+    std::memcpy(bufX.raw(), X.data(), X.size() * sizeof(float));
+
+    std::printf("\n[bench] matmul_q8_0  N=%zu  K=%zu  (Xe-LPG iGPU)\n", N, K);
+    for (const std::size_t M : {std::size_t{4}, std::size_t{8},
+                                std::size_t{16}, std::size_t{64}}) {
+        const auto r = benchMatmulShape(mimirmind::model::GgmlType::Q8_0,
+                                        bufW.raw(), N, K, M,
+                                        bufX.as<float>(),
+                                        bufY.as<float>(),
+                                        bufScratch.as<float>());
+        printBenchRow(M, r);
+    }
 }
 
 int main() {
