@@ -18,11 +18,13 @@ class Q4K final : public QuantType {
 public:
     [[nodiscard]] static const Q4K& instance() noexcept;
 
-    [[nodiscard]] model::GgmlType  ggmlType()        const noexcept override;
-    [[nodiscard]] std::string_view name()            const noexcept override;
-    [[nodiscard]] std::size_t      blockElements()   const noexcept override;
-    [[nodiscard]] std::size_t      blockBytes()      const noexcept override;
-    [[nodiscard]] std::string_view gpuMatmulModule() const noexcept override;
+    [[nodiscard]] model::GgmlType  ggmlType()            const noexcept override;
+    [[nodiscard]] std::string_view name()                const noexcept override;
+    [[nodiscard]] std::size_t      blockElements()       const noexcept override;
+    [[nodiscard]] std::size_t      blockBytes()          const noexcept override;
+    [[nodiscard]] std::string_view gpuMatmulModule()     const noexcept override;
+    [[nodiscard]] std::string_view gpuMatmulGemmModule() const noexcept override;
+    [[nodiscard]] std::size_t      gpuMatmulGemmMTile()  const noexcept override;
 
     void dequantToF32(const void* src,
                       std::size_t nelements,
@@ -40,6 +42,9 @@ private:
 
     static constexpr std::size_t kBlockElements = 256;
     static constexpr std::size_t kBlockBytes    = 144;
+
+    // Must match MATMUL_Q4K_GEMM_M_TILE in kernels/matmul_q4k_gemm.cl.
+    static constexpr std::size_t kGemmMTile     = 8;
 };
 
 } // namespace mimirmind::compute::quant

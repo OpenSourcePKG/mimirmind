@@ -34,6 +34,14 @@ std::string_view Q4K::gpuMatmulModule() const noexcept {
     return "matmul_q4k_vec";
 }
 
+std::string_view Q4K::gpuMatmulGemmModule() const noexcept {
+    return "matmul_q4k_gemm";
+}
+
+std::size_t Q4K::gpuMatmulGemmMTile() const noexcept {
+    return kGemmMTile;
+}
+
 void Q4K::getScaleMinK4(int j,
                         const std::uint8_t* q,
                         std::uint8_t&       outScale,

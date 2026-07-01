@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 
 namespace mimirmind::runtime {
@@ -79,9 +80,15 @@ public:
     void sync();
 
 private:
-    struct Entry {
+    struct KernelSlot {
         std::unique_ptr<runtime::GpuModule> module;
         runtime::GpuKernel                  kernel;
+    };
+
+    struct Entry {
+        KernelSlot                vec;      // M==1 hot path (matvec)
+        std::optional<KernelSlot> gemm;     // optional M>1 batched path
+        std::size_t               gemmMTile{1};
     };
 
     runtime::L0Context&    _ctx;

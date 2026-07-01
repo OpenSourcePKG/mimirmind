@@ -81,6 +81,9 @@ set(KERNEL_SOURCES
     kernels/matmul_q4k_vec.cl
     kernels/matmul_q6k_vec.cl
     kernels/matmul_q8_0_vec.cl
+    kernels/matmul_q6k_gemm.cl
+    kernels/matmul_q4k_gemm.cl
+    kernels/matmul_q8_0_gemm.cl
     kernels/add_bias.cl
     kernels/add_residual.cl
     kernels/silu_mul.cl

@@ -965,6 +965,327 @@ TEST(matmul_q6k_64rows) {
     }
 }
 
+// =======================================================================
+// Q6_K GEMM (batched M>1) — parity vs CPU reference across M values that
+// cover the M_TILE=8 tail-guard: aligned (8, 16), tail (4, 15, 17), and
+// the M=1 baseline (which dispatches through the matvec kernel and thus
+// re-tests the vec regression path via GpuMatmul::matmul).
+// =======================================================================
+namespace {
+
+// Build W of shape [N, K] as Q6_K bytes. Every row gets a distinct byte
+// pattern so N-way replication cannot hide a mis-indexed dequant.
+std::vector<std::uint8_t> buildQ6kWeights(std::size_t N,
+                                          std::size_t K,
+                                          std::uint32_t seed) {
+    const std::size_t superBlocksPerRow = K / 256;
+    const std::size_t bytesPerRow       = superBlocksPerRow * 210;
+
+    std::vector<std::uint8_t> w(N * bytesPerRow, 0);
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> distByte(0, 255);
+    std::uniform_int_distribution<int> distScale(-8, 8);
+
+    for (std::size_t n = 0; n < N; ++n) {
+        for (std::size_t sb = 0; sb < superBlocksPerRow; ++sb) {
+            auto* block = w.data() + n * bytesPerRow + sb * 210;
+            for (std::size_t i = 0; i < 128; ++i) {
+                block[i] = static_cast<std::uint8_t>(distByte(rng));
+            }
+            for (std::size_t i = 128; i < 192; ++i) {
+                block[i] = static_cast<std::uint8_t>(distByte(rng));
+            }
+            for (std::size_t i = 192; i < 208; ++i) {
+                const int s = distScale(rng);
+                block[i]    = static_cast<std::uint8_t>(static_cast<std::int8_t>(s));
+            }
+            // fp16 super-block scale — a small positive value keeps the
+            // dot products in a comfortable float32 range.
+            constexpr std::uint16_t kHalfSmall = 0x2E00U;   // ≈ 0.09
+            std::memcpy(block + 208, &kHalfSmall, sizeof(std::uint16_t));
+        }
+    }
+    return w;
+}
+
+// Run both CPU and GPU matmul for Q6_K with the given (N, K, M) and
+// compare. Rejects a tolerance mismatch via EXPECT_ARRAY_NEAR.
+void runQ6kMatmulParity(const char*   label,
+                        std::size_t   N,
+                        std::size_t   K,
+                        std::size_t   M,
+                        std::uint32_t seed,
+                        float         tol) {
+    const auto w = buildQ6kWeights(N, K, seed);
+    const auto x = generateFloats(M * K, seed ^ 0x9E3779B9U);
+
+    UsmBuf bufW(w.size());
+    UsmBuf bufX(M * K * sizeof(float));
+    UsmBuf bufY(M * N * sizeof(float));
+    UsmBuf bufScratch(K * sizeof(float));
+
+    std::memcpy(bufW.raw(), w.data(), w.size());
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+
+    fx().gmm.matmul(mimirmind::model::GgmlType::Q6_K,
+                    bufW.raw(), N, K,
+                    bufX.as<float>(), M,
+                    bufY.as<float>(),
+                    bufScratch.as<float>());
+
+    std::vector<float> cpuY(M * N);
+    std::vector<float> scratchCpu(K);
+    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q6_K,
+                               w.data(), N, K,
+                               x.data(), M,
+                               cpuY.data(),
+                               scratchCpu.data());
+
+    EXPECT_ARRAY_NEAR(label, bufY.as<float>(), cpuY.data(), M * N, tol);
+}
+
+} // namespace
+
+TEST(matmul_q6k_gemm_M1_regression) {
+    // M==1 must still dispatch through the matvec kernel and give the
+    // same result as before this change.
+    runQ6kMatmulParity("matmul_q6k_gemm_M1", /*N=*/32, /*K=*/1024,
+                       /*M=*/1, /*seed=*/0xC001U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q6k_gemm_M4_tail) {
+    // M=4 < M_TILE=8: single M-workgroup with 4 tail slots.
+    runQ6kMatmulParity("matmul_q6k_gemm_M4", /*N=*/32, /*K=*/1024,
+                       /*M=*/4, /*seed=*/0xC002U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q6k_gemm_M8_aligned) {
+    // Exactly one M-workgroup fully populated.
+    runQ6kMatmulParity("matmul_q6k_gemm_M8", /*N=*/48, /*K=*/1024,
+                       /*M=*/8, /*seed=*/0xC003U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q6k_gemm_M15_tail_almost_full) {
+    // Two M-workgroups: first full (8), second nearly-full (7 tail).
+    runQ6kMatmulParity("matmul_q6k_gemm_M15", /*N=*/32, /*K=*/1024,
+                       /*M=*/15, /*seed=*/0xC004U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q6k_gemm_M16_aligned) {
+    // Two M-workgroups, both fully populated.
+    runQ6kMatmulParity("matmul_q6k_gemm_M16", /*N=*/40, /*K=*/1024,
+                       /*M=*/16, /*seed=*/0xC005U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q6k_gemm_M17_tail_after_full) {
+    // Three M-workgroups: two full + 1-row tail.
+    runQ6kMatmulParity("matmul_q6k_gemm_M17", /*N=*/24, /*K=*/1024,
+                       /*M=*/17, /*seed=*/0xC006U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q6k_gemm_realistic_prefill) {
+    // Shape closer to a real Gemma-4-Q6_K attention projection at prefill:
+    // N=d_model≈2560, K=d_model≈2816, M=16 tokens. Bigger K means the
+    // matvec-vs-gemm precision drift shows up if we accidentally broke
+    // Kahan compensation.
+    runQ6kMatmulParity("matmul_q6k_gemm_prefill", /*N=*/2560, /*K=*/2816,
+                       /*M=*/16, /*seed=*/0xC007U, /*tol=*/2e-2F);
+}
+
+// =======================================================================
+// Q4_K GEMM (batched M>1) — same tail-coverage as Q6_K.
+// =======================================================================
+namespace {
+
+std::vector<std::uint8_t> buildQ4kWeights(std::size_t N,
+                                          std::size_t K,
+                                          std::uint32_t seed) {
+    const std::size_t superBlocksPerRow = K / 256;
+    const std::size_t bytesPerRow       = superBlocksPerRow * 144;
+
+    std::vector<std::uint8_t> w(N * bytesPerRow, 0);
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> distByte(0, 255);
+
+    // Small positive fp16 scales (~0.09) keep dot products in a
+    // comfortable float32 range.
+    constexpr std::uint16_t kHalfSmall = 0x2E00U;
+    constexpr std::uint16_t kHalfTiny  = 0x2400U;   // ~0.02, dmin
+
+    for (std::size_t n = 0; n < N; ++n) {
+        for (std::size_t sb = 0; sb < superBlocksPerRow; ++sb) {
+            auto* block = w.data() + n * bytesPerRow + sb * 144;
+
+            std::memcpy(block,     &kHalfSmall, sizeof(std::uint16_t));  // d
+            std::memcpy(block + 2, &kHalfTiny,  sizeof(std::uint16_t));  // dmin
+
+            for (std::size_t i = 4; i < 16; ++i) {
+                block[i] = static_cast<std::uint8_t>(distByte(rng));
+            }
+            for (std::size_t i = 16; i < 144; ++i) {
+                block[i] = static_cast<std::uint8_t>(distByte(rng));
+            }
+        }
+    }
+    return w;
+}
+
+void runQ4kMatmulParity(const char*   label,
+                        std::size_t   N,
+                        std::size_t   K,
+                        std::size_t   M,
+                        std::uint32_t seed,
+                        float         tol) {
+    const auto w = buildQ4kWeights(N, K, seed);
+    const auto x = generateFloats(M * K, seed ^ 0x9E3779B9U);
+
+    UsmBuf bufW(w.size());
+    UsmBuf bufX(M * K * sizeof(float));
+    UsmBuf bufY(M * N * sizeof(float));
+    UsmBuf bufScratch(K * sizeof(float));
+
+    std::memcpy(bufW.raw(), w.data(), w.size());
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+
+    fx().gmm.matmul(mimirmind::model::GgmlType::Q4_K,
+                    bufW.raw(), N, K,
+                    bufX.as<float>(), M,
+                    bufY.as<float>(),
+                    bufScratch.as<float>());
+
+    std::vector<float> cpuY(M * N);
+    std::vector<float> scratchCpu(K);
+    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q4_K,
+                               w.data(), N, K,
+                               x.data(), M,
+                               cpuY.data(),
+                               scratchCpu.data());
+
+    EXPECT_ARRAY_NEAR(label, bufY.as<float>(), cpuY.data(), M * N, tol);
+}
+
+} // namespace
+
+TEST(matmul_q4k_gemm_M1_regression) {
+    runQ4kMatmulParity("matmul_q4k_gemm_M1", /*N=*/32, /*K=*/1024,
+                       /*M=*/1, /*seed=*/0xD001U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q4k_gemm_M8_aligned) {
+    runQ4kMatmulParity("matmul_q4k_gemm_M8", /*N=*/48, /*K=*/1024,
+                       /*M=*/8, /*seed=*/0xD002U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q4k_gemm_M15_tail) {
+    runQ4kMatmulParity("matmul_q4k_gemm_M15", /*N=*/32, /*K=*/1024,
+                       /*M=*/15, /*seed=*/0xD003U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q4k_gemm_M17_tail_after_full) {
+    runQ4kMatmulParity("matmul_q4k_gemm_M17", /*N=*/24, /*K=*/1024,
+                       /*M=*/17, /*seed=*/0xD004U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q4k_gemm_realistic_prefill) {
+    // Qwen-style Q4_K attention proj at prefill: K=3584, M=16.
+    runQ4kMatmulParity("matmul_q4k_gemm_prefill", /*N=*/2048, /*K=*/3584,
+                       /*M=*/16, /*seed=*/0xD005U, /*tol=*/2e-2F);
+}
+
+// =======================================================================
+// Q8_0 GEMM (batched M>1) — Q8_0 has 32-element blocks and the simplest
+// dequant, so this variant benefits most from M-fold amortisation.
+// =======================================================================
+namespace {
+
+std::vector<std::uint8_t> buildQ8_0Weights(std::size_t N,
+                                           std::size_t K,
+                                           std::uint32_t seed) {
+    const std::size_t blocksPerRow = K / 32;
+    const std::size_t bytesPerRow  = blocksPerRow * 34;
+
+    std::vector<std::uint8_t> w(N * bytesPerRow, 0);
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> distQ(-63, 63);
+
+    // Positive fp16 scale ~0.02 so |value| stays small.
+    constexpr std::uint16_t kHalfSmall = 0x2400U;
+
+    for (std::size_t n = 0; n < N; ++n) {
+        for (std::size_t b = 0; b < blocksPerRow; ++b) {
+            auto* block = w.data() + n * bytesPerRow + b * 34;
+            std::memcpy(block, &kHalfSmall, sizeof(std::uint16_t));
+            for (std::size_t l = 0; l < 32; ++l) {
+                block[2 + l] = static_cast<std::uint8_t>(
+                    static_cast<std::int8_t>(distQ(rng)));
+            }
+        }
+    }
+    return w;
+}
+
+void runQ8_0MatmulParity(const char*   label,
+                         std::size_t   N,
+                         std::size_t   K,
+                         std::size_t   M,
+                         std::uint32_t seed,
+                         float         tol) {
+    const auto w = buildQ8_0Weights(N, K, seed);
+    const auto x = generateFloats(M * K, seed ^ 0x9E3779B9U);
+
+    UsmBuf bufW(w.size());
+    UsmBuf bufX(M * K * sizeof(float));
+    UsmBuf bufY(M * N * sizeof(float));
+    UsmBuf bufScratch(K * sizeof(float));
+
+    std::memcpy(bufW.raw(), w.data(), w.size());
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+
+    fx().gmm.matmul(mimirmind::model::GgmlType::Q8_0,
+                    bufW.raw(), N, K,
+                    bufX.as<float>(), M,
+                    bufY.as<float>(),
+                    bufScratch.as<float>());
+
+    std::vector<float> cpuY(M * N);
+    std::vector<float> scratchCpu(K);
+    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q8_0,
+                               w.data(), N, K,
+                               x.data(), M,
+                               cpuY.data(),
+                               scratchCpu.data());
+
+    EXPECT_ARRAY_NEAR(label, bufY.as<float>(), cpuY.data(), M * N, tol);
+}
+
+} // namespace
+
+TEST(matmul_q8_0_gemm_M1_regression) {
+    runQ8_0MatmulParity("matmul_q8_0_gemm_M1", /*N=*/32, /*K=*/1024,
+                        /*M=*/1, /*seed=*/0xE001U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q8_0_gemm_M8_aligned) {
+    runQ8_0MatmulParity("matmul_q8_0_gemm_M8", /*N=*/48, /*K=*/1024,
+                        /*M=*/8, /*seed=*/0xE002U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q8_0_gemm_M15_tail) {
+    runQ8_0MatmulParity("matmul_q8_0_gemm_M15", /*N=*/32, /*K=*/1024,
+                        /*M=*/15, /*seed=*/0xE003U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q8_0_gemm_M17_tail_after_full) {
+    runQ8_0MatmulParity("matmul_q8_0_gemm_M17", /*N=*/24, /*K=*/1024,
+                        /*M=*/17, /*seed=*/0xE004U, /*tol=*/1e-2F);
+}
+
+TEST(matmul_q8_0_gemm_realistic_prefill) {
+    // Gemma-4 Q8_0 attention proj shape: N≈2560, K=2816, M=16.
+    runQ8_0MatmulParity("matmul_q8_0_gemm_prefill", /*N=*/2560, /*K=*/2816,
+                        /*M=*/16, /*seed=*/0xE005U, /*tol=*/2e-2F);
+}
+
 int main() {
     return mm::test::run();
 }

@@ -52,13 +52,37 @@ public:
                               float*      dst) const = 0;
 
     /**
-     * SPV module name for the GPU matmul kernel that consumes this
+     * SPV module name for the GPU matvec kernel that consumes this
      * weight type, or empty if no GPU kernel exists. GpuMatmul uses this
      * at construction to load the corresponding SPV; at dispatch time an
      * empty name means CPU fallback.
+     *
+     * This is the M=1 (decode) hot path.
      */
     [[nodiscard]] virtual std::string_view gpuMatmulModule() const noexcept {
         return {};
+    }
+
+    /**
+     * Optional SPV module name for the GPU GEMM kernel — the batched
+     * (M > 1) variant used during prefill. When empty, GpuMatmul falls
+     * back to launching the matvec kernel once per row of X.
+     *
+     * The kernel is expected to have the signature
+     *   (const float* X, const uchar* W, float* Y, int K, int N, int M)
+     * with launch geometry (ceil(N/kOutputsPerGroup)*kLocalSize,
+     * ceil(M/gpuMatmulGemmMTile()), 1).
+     */
+    [[nodiscard]] virtual std::string_view gpuMatmulGemmModule() const noexcept {
+        return {};
+    }
+
+    /**
+     * The M-tile size baked into the GEMM kernel's per-workgroup output
+     * geometry. Only meaningful when gpuMatmulGemmModule() is non-empty.
+     */
+    [[nodiscard]] virtual std::size_t gpuMatmulGemmMTile() const noexcept {
+        return 1;
     }
 
 protected:
