@@ -140,6 +140,65 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1782774169
 data: [DONE]
 ```
 
+### Progress side-channel: `prefill_progress` + `prefill_done`
+
+The stream also carries two mimirmind-specific *named* SSE events
+that let a UI render a progress bar during the (potentially long)
+prefill phase, before the first decode token arrives:
+
+```
+event: prefill_progress
+data: {"blocks_done":8,"blocks_total":34,"elapsed_ms":1230.5,"response_id":"chatcmpl-..."}
+
+event: prefill_progress
+data: {"blocks_done":17,"blocks_total":34,"elapsed_ms":2450.2,"response_id":"chatcmpl-..."}
+
+...
+
+event: prefill_done
+data: {"prompt_tokens":220,"prefilled_tokens":220,"prefill_ms":4820.7,"response_id":"chatcmpl-..."}
+
+data: {"id":"chatcmpl-...","choices":[{"index":0,"delta":{"role":"assistant"}}]}
+data: {"id":"chatcmpl-...","choices":[{"index":0,"delta":{"content":"Honey"}}]}
+```
+
+Semantics:
+
+- `prefill_progress` — fires once per transformer block, rate-limited
+  server-side to at most one event per ~200 ms. First and last block
+  always emit. `blocks_done` is 1-indexed; when it equals
+  `blocks_total`, prefill is essentially complete.
+- `prefill_done` — fires exactly once, after all blocks, right before
+  the first decode token is sampled. `prefilled_tokens` can be smaller
+  than `prompt_tokens` when the KV-cache prefix matches (multi-turn
+  chat with an unchanged system prompt): the difference is what got
+  skipped by cache re-use.
+
+Named events use the SSE `event: <name>` field so strict OpenAI
+stream demuxers ignore them (they only look at unlabelled `data:`
+lines). Browsers pick them up via `EventSource.addEventListener`:
+
+```js
+const es = new EventSource('/v1/chat/completions', { withCredentials: false });
+
+es.addEventListener('prefill_progress', (ev) => {
+    const p = JSON.parse(ev.data);
+    ui.showPrefillProgress(p.blocks_done, p.blocks_total, p.elapsed_ms);
+});
+
+es.addEventListener('prefill_done', (ev) => {
+    const p = JSON.parse(ev.data);
+    ui.showAnsweringSpinner(p.prefill_ms);
+});
+
+es.onmessage = (ev) => { /* normal chat completion chunks */ };
+```
+
+If you're parsing SSE by hand (fetch + reader), a line starting with
+`event:` sets the event type for the following `data:` line — the
+event only "fires" at the terminating empty line. `event: message`
+(or no `event:` at all) is the default type used by the token chunks.
+
 ### Running behind a reverse proxy
 
 SSE breaks easily behind a reverse proxy with default settings. The

@@ -257,10 +257,12 @@ InferenceEngine::sampleNext(const float*                   hidden,
 }
 
 std::vector<std::int32_t>
-InferenceEngine::generate(std::span<const std::int32_t> promptIds,
-                          const GenerateParams&         params,
-                          const TokenCallback&          onToken,
-                          GenerateStats*                outStats) {
+InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
+                          const GenerateParams&           params,
+                          const TokenCallback&            onToken,
+                          GenerateStats*                  outStats,
+                          const PrefillCallback&          onPrefillDone,
+                          const PrefillProgressCallback&  onPrefillProgress) {
     namespace cmp = mimirmind::compute;
     using clock = std::chrono::steady_clock;
 
@@ -400,11 +402,26 @@ InferenceEngine::generate(std::span<const std::int32_t> promptIds,
         for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
             _backend->runBlock(b, xBuf, prefillCount, cache, buffers,
                                _traceBlock0);
+            if (onPrefillProgress) {
+                const auto now = clock::now();
+                const double elapsedMs =
+                    std::chrono::duration<double, std::milli>(now - preT0)
+                        .count();
+                onPrefillProgress(PrefillProgress{
+                    static_cast<std::size_t>(b) + 1,
+                    static_cast<std::size_t>(_config.blockCount),
+                    elapsedMs,
+                });
+            }
         }
         cache.commit(prefillCount);
         const auto preT1 = clock::now();
         preMs =
             std::chrono::duration<double, std::milli>(preT1 - preT0).count();
+
+        if (onPrefillDone) {
+            onPrefillDone(PrefillDone{Tp, prefillCount, preMs});
+        }
 
         _traceBlock0 = false;  // diagnostic done; mute for further calls
 
