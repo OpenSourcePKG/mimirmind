@@ -466,6 +466,7 @@ struct ApiServer::Impl {
         };
         body["power"]     = buildPowerBlock();
         body["gpu_clock"] = buildGpuClockBlock();
+        body["kernels"]   = buildKernelsBlock();
         sendJson(res, 200, body);
     }
 
@@ -497,6 +498,50 @@ struct ApiServer::Impl {
             {"current_cap_mhz", gov->currentCapMhz()},
             {"target_temp_c",   gov->targetTempC()},
         };
+    }
+
+    /// Compose the "kernels" sub-object of /v1/system/status.
+    ///
+    /// Reports the autotune dispatch decision per QuantType, the
+    /// selfTest state, and the FusedQkvWeights counts — enough to
+    /// diagnose an M5i regression via `curl /v1/system/status` alone,
+    /// without pulling docker logs.
+    json buildKernelsBlock() {
+        json body = json::object();
+
+        // Per-type matmul autotune.
+        json matmulByType = json::object();
+        for (const auto& r : engine.gpuMatmul().autotuneReport()) {
+            matmulByType[r.name] = json{
+                {"gemm_available", r.gemmAvailable},
+                {"gemm_picked",    r.gemmPicked},
+                {"vec_ms",         r.vecMs},
+                {"gemm_ms",        r.gemmMs},
+                {"source",         r.source},
+            };
+        }
+        body["matmul"] = std::move(matmulByType);
+
+        // Fused QKV block counts + USM footprint.
+        json fusedJson;
+        if (const auto* fq = engine.fusedQkv()) {
+            fusedJson = json{
+                {"disabled_by_env", fq->disabledByEnv()},
+                {"blocks_fused",    fq->fusedCount()},
+                {"blocks_skipped",  fq->skippedCount()},
+                {"usm_mib",         static_cast<unsigned long long>(
+                                        (fq->totalUsmBytes()
+                                         + (1ULL << 20) - 1) >> 20)},
+            };
+        } else {
+            fusedJson = json{{"available", false}};
+        }
+        body["fused_qkv"] = std::move(fusedJson);
+
+        // GpuOps self-test result.
+        body["selftest"] = std::string{engine.gpuOps().selfTestStatus()};
+
+        return body;
     }
 
     /// Compose the "power" sub-object of /v1/system/status.

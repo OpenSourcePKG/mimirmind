@@ -68,11 +68,19 @@ public:
     /// True when the env-var disable switch is set. Diagnostic-only.
     [[nodiscard]] bool disabledByEnv() const noexcept { return _disabledByEnv; }
 
+    /// Block-count telemetry for /v1/system/status.
+    [[nodiscard]] std::size_t fusedCount()   const noexcept { return _fusedCount; }
+    [[nodiscard]] std::size_t skippedCount() const noexcept { return _skippedCount; }
+    [[nodiscard]] std::size_t totalUsmBytes() const noexcept { return _totalBytes; }
+
 private:
     runtime::UsmAllocator&              _alloc;
     std::vector<std::optional<Block>>   _blocks;
     bool                                _anyFused{false};
     bool                                _disabledByEnv{false};
+    std::size_t                         _fusedCount{0};
+    std::size_t                         _skippedCount{0};
+    std::size_t                         _totalBytes{0};
 };
 
 } // namespace mimirmind::model

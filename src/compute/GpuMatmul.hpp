@@ -100,6 +100,19 @@ public:
     /// to call when there's no pending work — cheap no-op.
     void sync();
 
+    /// Report the autotune decision + timings per QuantType. Rows are
+    /// empty until autotune() has run. Used by ApiServer to expose the
+    /// kernel-dispatch choice via /v1/system/status.
+    struct AutotuneReport {
+        std::string name;                // e.g. "Q6_K"
+        bool        gemmAvailable;       // GEMM kernel loaded for this type
+        bool        gemmPicked;          // autotune picked GEMM over matvec-loop
+        double      vecMs;               // measured matvec-loop median ms (0 = not measured)
+        double      gemmMs;              // measured GEMM median ms (0 = not measured)
+        std::string source;              // "bench" | "env_force_gemm" | "env_disable_gemm" | "no_gemm" | "parity_fail"
+    };
+    [[nodiscard]] std::vector<AutotuneReport> autotuneReport() const;
+
 private:
     struct KernelSlot {
         std::unique_ptr<runtime::GpuModule> module;
@@ -111,6 +124,12 @@ private:
         std::optional<KernelSlot> gemm;     // optional M>1 batched path
         std::size_t               gemmMTile{1};
         bool                      useGemm{false};  // set by autotune()
+
+        // Autotune telemetry — populated once by autotune(), consumed by
+        // autotuneReport() for the /v1/system/status endpoint.
+        double      lastVecMs{0.0};
+        double      lastGemmMs{0.0};
+        std::string autotuneSource;   // "bench" | "env_force_gemm" | ...
     };
 
     runtime::L0Context&    _ctx;

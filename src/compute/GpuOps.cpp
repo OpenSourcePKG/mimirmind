@@ -404,6 +404,7 @@ void GpuOps::selfTest(runtime::UsmAllocator& allocator) {
     runCase(/*hasV=*/true,  "full");
     runCase(/*hasV=*/false, "qk-only");
 
+    _selfTestStatus = "ok";
     MM_LOG_INFO("gpuops",
                 "selfTest OK — qkv_split full + qk-only paths verified");
 }
