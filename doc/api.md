@@ -465,11 +465,21 @@ across all layers:
 | 2048 | ~870 MiB | Short single-turn prompts only |
 | 4096 | ~1.7 GiB | Default-ish chat history |
 | **8192** (default) | **~3.4 GiB** | **Long chat, modest RAG context** |
-| 16384 | ~6.9 GiB | RAG with large doc context |
-| 32768 | ~13.7 GiB | Long-document analysis |
+| **16384** (M9.8a max) | **~6.9 GiB** | **RAG with ~10-12 pages A4** |
+| ~~32768~~ | ~~13.7 GiB~~ | *Blocked until M9.8b — see below* |
 
 The number is rough — actual cost depends on the model's KV head
 dimensions. The exact bytes are logged at startup
 (`kvcache: pre-allocated for N tokens`). For mimirmind running
 alongside ~22 GiB of Gemma 4 26B weights on a 64 GiB UMA host,
-sizes up to ~16K are comfortable.
+sizes up to 16K are comfortable.
+
+**Hard ceiling: 16384 (M9.8a).** The plain-attention kernel in
+`kernels/attention.cl` holds the full score row for one query
+position in Shared Local Memory (`scores[ATTN_MAX_TK]`). At 16K
+that sits exactly at Intel Xe-LPG's 64 KiB SLM budget. Setting
+`MIMIRMIND_MAX_CONTEXT_TOKENS` higher than 16384 will throw at
+the first attention call with a clear error. Longer contexts
+(20 pages A4, 32K+) require the M9.8b architectural change:
+either an online-softmax rewrite of plain attention, or a
+chunked-T_q flash-prefill path.

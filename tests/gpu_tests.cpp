@@ -682,12 +682,15 @@ TEST(attention_decode_flash_eightTiles) {
 }
 
 TEST(attention_decode_flash_maxKTiles) {
-    // T_k = 8192 → 32 tiles, the compile-time MAX_K_TILES bound. Also
-    // exercises a Gemma-4-style 8q→2kv GQA group with headDim=128.
+    // T_k = 16384 → 64 tiles, the compile-time MAX_K_TILES bound after
+    // M9.8a. Exercises a Gemma-4-style 8q->2kv GQA group with
+    // headDim=128. The previous max at T_k=8192/32-tiles moved down to
+    // "half the max" — still covered indirectly by the decoder path in
+    // production but no longer the sole boundary case.
     runAttentionParity("attn_flash_maxTiles",
-                       /*T_q=*/1, /*T_k=*/8192,
+                       /*T_q=*/1, /*T_k=*/16384,
                        /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
-                       /*positionOffset=*/8191,
+                       /*positionOffset=*/16383,
                        /*scale=*/1.0F / std::sqrt(128.0F),
                        /*seed=*/0x84, /*tol=*/2e-3F);
 }

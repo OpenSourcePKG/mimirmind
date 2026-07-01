@@ -20,10 +20,12 @@
 //   One workgroup owns exactly one (hq, pq): computes the score row,
 //   does the softmax, and writes the output row. No cross-WG sync.
 //
-// SLM use: scores[ATTN_MAX_TK] = 32 KiB at MAX_TK=8192. Within Arc
-//   Xe-LPG's 64 KiB SLM budget. If max context ever exceeds 8192,
-//   bump ATTN_MAX_TK at compile time (also fail-fast guarded in
-//   GpuOps::attentionAsync).
+// SLM use: scores[ATTN_MAX_TK] = 64 KiB at MAX_TK=16384. Exactly at
+//   Arc Xe-LPG's 64 KiB per-work-group SLM budget — the plain path
+//   cannot grow further without a real refactor (M9.8b: online-softmax
+//   + tiled scores, i.e. FlashAttention semantics for T_q > 1). For
+//   sizes below MAX_TK the fail-fast guard lives in
+//   GpuOps::attentionAsync.
 //
 // Reference CPU implementation: src/compute/Attention.cpp.
 
@@ -39,7 +41,7 @@
 #endif
 
 #ifndef ATTN_MAX_TK
-#define ATTN_MAX_TK 8192
+#define ATTN_MAX_TK 16384
 #endif
 
 __attribute__((reqd_work_group_size(ATTN_LOCAL, 1, 1)))

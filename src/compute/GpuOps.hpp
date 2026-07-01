@@ -152,8 +152,12 @@ public:
 
     /// Compile-time bound on T_k matching ATTN_MAX_TK in attention.cl.
     /// Exposed so callers (and the engine config validator) can check
-    /// max-context budgets up front.
-    static constexpr std::size_t kAttentionMaxTk = 8192;
+    /// max-context budgets up front. At 16384 the plain-attention SLM
+    /// use (`scores[ATTN_MAX_TK] * 4 B`) sits at 64 KiB — the standard
+    /// Intel Xe-LPG per-work-group SLM budget. Raising further requires
+    /// the M9.8b architectural refactor (online-softmax plain attention
+    /// or chunked-T_q flash prefill).
+    static constexpr std::size_t kAttentionMaxTk = 16384;
 
     /// Accessor to the underlying command queue. Backends use this to
     /// construct UnorderedScope around clearly-parallel kernel groups
