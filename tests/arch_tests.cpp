@@ -1062,10 +1062,11 @@ TEST(gpuGovernor_adjustForTempLowersCapWhenHot) {
     mimirmind::runtime::GpuClockGovernor g{d.root};
     g.setTargetTempC(72.0F);
 
-    // Temp 8 °C above target, kGainDown = 50 → delta = -400 MHz,
-    // new cap = 1600. (M9.6 originally shipped 100 here, retuned to
-    // 50 by M9.6.2 once resetToMax handles inter-request worst-case.)
-    EXPECT_EQ(g.adjustForTemp(80.0F), std::uint32_t{1600});
+    // Temp 8 °C above target, kGainDown = 100 → delta = -800 MHz,
+    // new cap = 1200. (M9.6.2 briefly relaxed this to 50 but got
+    // rolled back after a 2026-07-01 thermal shutdown — the paranoid
+    // gain is the one that survives sustained load on NUC14.)
+    EXPECT_EQ(g.adjustForTemp(80.0F), std::uint32_t{1200});
 }
 
 TEST(gpuGovernor_adjustForTempRaisesCapWhenCool) {
@@ -1074,10 +1075,11 @@ TEST(gpuGovernor_adjustForTempRaisesCapWhenCool) {
     mimirmind::runtime::GpuClockGovernor g{d.root};
     g.setTargetTempC(72.0F);
 
-    // Temp 5 °C below target, kGainUp = 25 → delta = +125 MHz, new
-    // cap = 1625. (M9.6 originally 10; M9.6.2 bumped to 25 so a long-
-    // decode iGPU pause can recover its cap back toward RP0.)
-    EXPECT_EQ(g.adjustForTemp(67.0F), std::uint32_t{1625});
+    // Temp 5 °C below target, kGainUp = 10 → delta = +50 MHz, new
+    // cap = 1550. Slow on the cool side is intentional — heatsink
+    // takes 30-60 s to shed load, and a fast recovery re-spikes on
+    // the next burst.
+    EXPECT_EQ(g.adjustForTemp(67.0F), std::uint32_t{1550});
 }
 
 TEST(gpuGovernor_adjustForTempAsymmetricGain) {
@@ -1088,14 +1090,14 @@ TEST(gpuGovernor_adjustForTempAsymmetricGain) {
     mimirmind::runtime::GpuClockGovernor g{d.root};
     g.setTargetTempC(72.0F);
 
-    // +4 °C, kGainDown = 50 → delta = -200, cap → 1300.
-    EXPECT_EQ(g.adjustForTemp(76.0F), std::uint32_t{1300});
+    // +4 °C, kGainDown = 100 → delta = -400, cap → 1100.
+    EXPECT_EQ(g.adjustForTemp(76.0F), std::uint32_t{1100});
 
     // Re-arm cap at 1500 and check the cool direction.
     g.setMaxFreqMhz(1500);
-    // -4 °C, kGainUp = 25 → delta = +100, cap → 1600. Hot-side delta
-    // is 2x cool-side (M9.6.2's 1:2 ratio, down from M9.6's 1:10).
-    EXPECT_EQ(g.adjustForTemp(68.0F), std::uint32_t{1600});
+    // -4 °C, kGainUp = 10 → delta = +40, cap → 1540. Hot-side delta
+    // is 10x cool-side — the paranoid 1:10 ratio from M9.6.
+    EXPECT_EQ(g.adjustForTemp(68.0F), std::uint32_t{1540});
 }
 
 TEST(gpuGovernor_adjustForTempDeadbandHoldsCap) {
@@ -1110,11 +1112,11 @@ TEST(gpuGovernor_adjustForTempDeadbandHoldsCap) {
     EXPECT_EQ(g.adjustForTemp(72.4F), std::uint32_t{1500});
     EXPECT_EQ(d.readMax("card1"), std::uint32_t{1500});
 
-    // Just outside the band — exact-rep float, +1.0 °C, kGainDown = 50
-    // → delta = -50, cap → 1450. (Picking 72.6F here would be misleading:
-    // 72.6F-72.0F is 0.5999998F, not 0.6F, so int truncation gives -29
-    // not -30.)
-    EXPECT_EQ(g.adjustForTemp(73.0F), std::uint32_t{1450});
+    // Just outside the band — exact-rep float, +1.0 °C, kGainDown = 100
+    // → delta = -100, cap → 1400. (Picking 72.6F here would be misleading:
+    // 72.6F-72.0F is 0.5999998F, not 0.6F, so int truncation gives -59
+    // not -60.)
+    EXPECT_EQ(g.adjustForTemp(73.0F), std::uint32_t{1400});
 }
 
 TEST(gpuGovernor_adjustForTempClampsToRpnOnExtremeHot) {
@@ -1127,22 +1129,6 @@ TEST(gpuGovernor_adjustForTempClampsToRpnOnExtremeHot) {
     g.setTargetTempC(72.0F);
 
     EXPECT_EQ(g.adjustForTemp(92.0F), std::uint32_t{800});
-}
-
-TEST(gpuGovernor_resetToMaxLiftsCapToRP0) {
-    // M9.6.1: between requests the asymmetric controller's slow up-gain
-    // means a previously cap-down state pins decode at RPn. resetToMax()
-    // is called per-request to undo that, letting fresh requests start
-    // at RP0 and trusting tick() inside the decode loop to cap down again
-    // if heat climbs.
-    FakeDrm d;
-    d.addCard("card1", 2350, 800, 1200);   // start at a non-RP0 cap
-    mimirmind::runtime::GpuClockGovernor g{d.root};
-    EXPECT_EQ(g.currentCapMhz(), std::uint32_t{1200});
-
-    EXPECT_EQ(g.resetToMax(), std::uint32_t{2350});
-    EXPECT_EQ(g.currentCapMhz(), std::uint32_t{2350});
-    EXPECT_EQ(d.readMax("card1"), std::uint32_t{2350});
 }
 
 TEST(gpuGovernor_destructorRestoresRP0) {
