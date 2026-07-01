@@ -119,6 +119,14 @@ services:
             # existiert, weigert sich compose mit klarem "no such file".
             MIMIRMIND_THERMAL_PROFILE: /etc/mimirmind/thermal-profile.json
 
+            # KV-Cache Pre-Alloc-Größe in Tokens. Compile-Time-Ceiling nach
+            # M9.8a ist 16384 (limitiert durch Xe-LPG 64 KiB SLM in der
+            # plain-attention-Loop). Default 8192 reicht für kürzere Chats,
+            # 16384 für ~10-12 Seiten A4. Höhere Werte requiren M9.8b
+            # (plain-attention-Refactor auf online softmax).
+            #     KV-RAM ≈ tokens × 430 KiB (Gemma 4 26B).
+            MIMIRMIND_MAX_CONTEXT_TOKENS: ${MIMIRMIND_MAX_CONTEXT_TOKENS:-8192}
+
         volumes:
             - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
             - ./run-logs:/logs:rw

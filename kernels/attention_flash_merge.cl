@@ -38,7 +38,7 @@
 #endif
 
 #ifndef ATTN_FLASH_MAX_KTILES
-#define ATTN_FLASH_MAX_KTILES 32
+#define ATTN_FLASH_MAX_KTILES 64
 #endif
 
 __attribute__((reqd_work_group_size(ATTN_FLASH_LOCAL, 1, 1)))
