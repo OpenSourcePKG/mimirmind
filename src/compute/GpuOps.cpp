@@ -4,10 +4,14 @@
 #include "runtime/Log.hpp"
 #include "runtime/UsmAllocator.hpp"
 
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace mimirmind::compute {
 
@@ -313,6 +317,95 @@ void GpuOps::scaledAddResidualAsync(float*       dst,
     _scaledAddResidualKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
     _queue.appendLaunch(_scaledAddResidualKernel,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::selfTest(runtime::UsmAllocator& allocator) {
+    // qkv_split: full QKV path (hasV=true) plus alt-attention path
+    // (hasV=false) on a tiny fixed shape.
+    constexpr std::size_t M   = 3;
+    constexpr std::size_t Nq  = 8;
+    constexpr std::size_t Nkv = 4;
+
+    auto runCase = [&](bool hasV, const char* label) {
+        const std::size_t Nfused = Nq + Nkv * (hasV ? 2 : 1);
+
+        void* fUsm = allocator.allocate(M * Nfused * sizeof(float));
+        void* qUsm = allocator.allocate(M * Nq     * sizeof(float));
+        void* kUsm = allocator.allocate(M * Nkv    * sizeof(float));
+        void* vUsm = allocator.allocate(M * Nkv    * sizeof(float));
+
+        std::vector<float> fused(M * Nfused);
+        for (std::size_t i = 0; i < fused.size(); ++i) {
+            fused[i] = static_cast<float>(i) * 0.125F;
+        }
+        std::memcpy(fUsm, fused.data(), fused.size() * sizeof(float));
+        // Poison the outputs so under-fills show up.
+        std::vector<float> poison(M * Nkv, -1.0e6F);
+        std::memcpy(qUsm, poison.data(), M * Nq  * sizeof(float));
+        std::memcpy(kUsm, poison.data(), M * Nkv * sizeof(float));
+        std::memcpy(vUsm, poison.data(), M * Nkv * sizeof(float));
+
+        qkvSplitAsync(static_cast<const float*>(fUsm),
+                      static_cast<float*>(qUsm),
+                      static_cast<float*>(kUsm),
+                      static_cast<float*>(vUsm),
+                      M, Nq, Nkv, hasV);
+        _queue.flush();
+
+        auto verify = [&](const void* usm, const float* ref,
+                          std::size_t n, const char* which) {
+            std::vector<float> got(n);
+            std::memcpy(got.data(), usm, n * sizeof(float));
+            float maxDiff = 0.0F;
+            std::size_t badIdx = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const float d = std::fabs(got[i] - ref[i]);
+                if (d > maxDiff) { maxDiff = d; badIdx = i; }
+            }
+            if (!(maxDiff <= 1e-6F)) {
+                std::ostringstream os;
+                os << "GpuOps::selfTest[" << label << "/" << which
+                   << "]: qkv_split output mismatch — maxDiff=" << maxDiff
+                   << " at i=" << badIdx
+                   << " got=" << got[badIdx] << " ref=" << ref[badIdx];
+                throw std::runtime_error(os.str());
+            }
+        };
+
+        std::vector<float> refQ(M * Nq);
+        std::vector<float> refK(M * Nkv);
+        std::vector<float> refV(M * Nkv, -1.0e6F);
+        for (std::size_t m = 0; m < M; ++m) {
+            for (std::size_t i = 0; i < Nq; ++i) {
+                refQ[m * Nq + i] = fused[m * Nfused + i];
+            }
+            for (std::size_t j = 0; j < Nkv; ++j) {
+                refK[m * Nkv + j] = fused[m * Nfused + Nq + j];
+            }
+            if (hasV) {
+                for (std::size_t j = 0; j < Nkv; ++j) {
+                    refV[m * Nkv + j] =
+                        fused[m * Nfused + Nq + Nkv + j];
+                }
+            }
+        }
+        verify(qUsm, refQ.data(), M * Nq,  "Q");
+        verify(kUsm, refK.data(), M * Nkv, "K");
+        if (hasV) {
+            verify(vUsm, refV.data(), M * Nkv, "V");
+        }
+
+        allocator.deallocate(fUsm, M * Nfused * sizeof(float));
+        allocator.deallocate(qUsm, M * Nq     * sizeof(float));
+        allocator.deallocate(kUsm, M * Nkv    * sizeof(float));
+        allocator.deallocate(vUsm, M * Nkv    * sizeof(float));
+    };
+
+    runCase(/*hasV=*/true,  "full");
+    runCase(/*hasV=*/false, "qk-only");
+
+    MM_LOG_INFO("gpuops",
+                "selfTest OK — qkv_split full + qk-only paths verified");
 }
 
 void GpuOps::qkvSplitAsync(const float* fused,

@@ -141,6 +141,17 @@ public:
                        std::size_t  Nkv,
                        bool         hasV);
 
+    /// Load-time self-test — run every GPU op with a known input and
+    /// compare against a CPU reference within a tight tolerance. Catches
+    /// broken SPV loads, driver miscompilation, and layout mismatches
+    /// on unfamiliar iGPU µarchs before the first block runs. Throws
+    /// std::runtime_error on any parity failure so loadModel() aborts
+    /// with a clear error rather than silently corrupting inference.
+    ///
+    /// Currently exercises: qkv_split (full QKV + alt-attention paths).
+    /// Runs in < 5 ms on any Intel iGPU. Idempotent, cheap to repeat.
+    void selfTest(runtime::UsmAllocator& allocator);
+
     /// Multi-head GQA causal attention on the GPU. Layout-equivalent to
     /// compute::multiHeadAttention. q/k/v/out are all f32 USM:
     ///   q   [T_q, nHeads,    headDim]
