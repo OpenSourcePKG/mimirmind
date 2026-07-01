@@ -64,16 +64,6 @@ public:
     /// write (kernel-verified via re-read).
     std::uint32_t setMaxFreqMhz(std::uint32_t mhz);
 
-    /// Reset the cap to RP0 (hardware max). Called by InferenceEngine
-    /// at the start of each generate() call so a request that follows
-    /// an earlier cap-down isn't forced to start at the throttled cap.
-    /// The asymmetric controller's slow up-gain (kGainUpMhzPerC = 10)
-    /// would otherwise take many ticks to recover, and ticks only fire
-    /// during decode — so without a per-request reset the cap stays
-    /// pinned at wherever the previous request left it. Returns the
-    /// cap after write (= RP0 unless the kernel refused).
-    std::uint32_t resetToMax() noexcept;
-
     /// Asymmetric P-controller: nudges current cap toward keeping
     /// `current_temp_c` at targetTempC(). The gain is direction-
     /// dependent so we drop the cap fast when overshooting target
@@ -97,18 +87,20 @@ private:
     // sustained) reaches steady-state in ~5-10 s, cool-down takes
     // 30-60 s once heat is in the heatsink. A symmetric controller
     // overshoots on the cool side and re-spikes on the next workload
-    // burst. Drop faster (kGainDown), creep up (kGainUp) — ratio 1:2.
+    // burst. Drop fast (kGainDown), creep up (kGainUp) — ratio 1:10.
     //
-    // M9.6 shipped at 1:10 (100/10) because there was no inter-request
-    // recovery — once we hit RPn we stayed there. M9.6.1 added a
-    // per-request resetToMax(), which catches the worst case at the
-    // request boundary; the in-run controller can afford to be less
-    // paranoid. M9.6.2 retunes to 50/25 so a 5 °C overshoot drops the
-    // cap by 250 MHz instead of 500, keeping the iGPU at a usable
-    // mid-frequency through ~6-7 ticks of sustained load instead of
-    // floor-clamping after 3.
-    static constexpr float kGainUpMhzPerC      = 25.0F;
-    static constexpr float kGainDownMhzPerC    = 50.0F;
+    // M9.6.2 relaxed this to 50/25 (ratio 1:2) on the assumption that
+    // M9.6.1's per-request cap reset covered the worst case. That
+    // assumption failed under sustained decode on 2026-07-01 — the
+    // machine ran into a hard thermal shutdown that the software brakes
+    // did not catch. Rolled back to the paranoid M9.6 values *and*
+    // dropped the per-request reset: an 8 °C overshoot now drops the
+    // cap by 800 MHz per tick again, and a request that follows a
+    // cap-down inherits the throttled cap instead of starting at RP0.
+    // Slower decode, but no shutdown. The NUC14 cooling lesson still
+    // applies — physical airflow is the real fix.
+    static constexpr float kGainUpMhzPerC      = 10.0F;
+    static constexpr float kGainDownMhzPerC    = 100.0F;
     // Deadband around target — within this band the cap doesn't move.
     // Stops the 1-MHz-per-tick wiggle when the chip is sitting near
     // target. ±0.5 °C is below the resolution of x86_pkg_temp anyway.
