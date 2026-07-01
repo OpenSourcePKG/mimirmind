@@ -6,6 +6,7 @@
 #include "model/GgufReader.hpp"
 #include "model/LlmConfig.hpp"
 #include "model/Tokenizer.hpp"
+#include "model/FusedQkvWeights.hpp"
 #include "model/WeightsMap.hpp"
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/CommandQueue.hpp"
@@ -254,8 +255,9 @@ private:
     model::GgufReader                  _reader;
     model::LlmConfig                   _config;
     model::Tokenizer                   _tokenizer;
-    std::optional<model::WeightsMap>   _weights;
-    std::unique_ptr<arch::ArchBackend> _backend;
+    std::optional<model::WeightsMap>       _weights;
+    std::unique_ptr<model::FusedQkvWeights> _fusedQkv;
+    std::unique_ptr<arch::ArchBackend>      _backend;
     bool                               _modelLoaded{false};
 
     // --- Persistent inference state (M9.1 prefix cache) -----------------

@@ -5,6 +5,7 @@
 #include "compute/MoeRouting.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
+#include "model/FusedQkvWeights.hpp"
 #include "model/GgufTypes.hpp"
 #include "model/LlmConfig.hpp"
 #include "model/WeightsMap.hpp"
@@ -23,11 +24,13 @@
 
 namespace mimirmind::runtime::arch {
 
-Gemma4Backend::Gemma4Backend(const model::LlmConfig&   config,
-                             const model::WeightsMap&  weights,
-                             compute::GpuOps&          ops,
-                             compute::GpuMatmul&       gmm)
-    : _config{config}, _weights{weights}, _ops{ops}, _gmm{gmm} {
+Gemma4Backend::Gemma4Backend(const model::LlmConfig&        config,
+                             const model::WeightsMap&       weights,
+                             const model::FusedQkvWeights*  fusedQkv,
+                             compute::GpuOps&               ops,
+                             compute::GpuMatmul&            gmm)
+    : _config{config}, _weights{weights}, _fusedQkv{fusedQkv},
+      _ops{ops}, _gmm{gmm} {
     buildLayerInfos();
 
     if (const auto* rf = _weights.find("rope_freqs.weight");
@@ -254,15 +257,36 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                          normBuf, T, dst, matmulScratch);
     };
 
-    // M5f.4: Q/K/V projections write disjoint buffers. The pop inserts
-    // a single barrier so the norms below see all three matmul outputs.
-    trace("Q+K+V projections (matmulAsync, unordered)");
-    {
-        runtime::UnorderedScope u{_ops.queue()};
-        projectAsync(qW, q_dim, qBuf);
-        projectAsync(kW, kv_dim, kSlot);
-        if (!li.altAttention) {
-            projectAsync(vW, kv_dim, vSlot);
+    // M5i.B: Fused Q+K+V — one matmul into a staging buffer, then a
+    // scatter kernel routes the sub-ranges into qBuf/kSlot/vSlot. The
+    // fused block is only registered when the layer's V is separate
+    // (altAttention layers stay on the split path since the V used
+    // downstream is the *raw* K projection, not W_v @ X).
+    const model::FusedQkvWeights::Block* fBlk =
+        (_fusedQkv != nullptr && !li.altAttention)
+            ? _fusedQkv->find(blockIdx)
+            : nullptr;
+
+    if (fBlk != nullptr) {
+        trace("Q+K+V projections (fused matmul + split)");
+        float* const qkvFused = s.qkvFusedScratch.as<float>();
+        const std::size_t Nfused =
+            fBlk->Nq + fBlk->Nkv * (fBlk->hasV ? 2 : 1);
+        _gmm.matmulAsync(fBlk->type, fBlk->usmPtr, Nfused, d_model,
+                         normBuf, T, qkvFused, matmulScratch);
+        _ops.qkvSplitAsync(qkvFused, qBuf, kSlot, vSlot,
+                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV);
+    } else {
+        // M5f.4: Q/K/V projections write disjoint buffers. The pop inserts
+        // a single barrier so the norms below see all three matmul outputs.
+        trace("Q+K+V projections (matmulAsync, unordered)");
+        {
+            runtime::UnorderedScope u{_ops.queue()};
+            projectAsync(qW, q_dim, qBuf);
+            projectAsync(kW, kv_dim, kSlot);
+            if (!li.altAttention) {
+                projectAsync(vW, kv_dim, vSlot);
+            }
         }
     }
 

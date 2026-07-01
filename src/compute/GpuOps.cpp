@@ -68,7 +68,9 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
           _attentionFlashMergeModule.kernel("attention_flash_merge")},
       _scaledAddResidualModule    {ctx, "scaled_add_residual"},
       _scaledAddResidualKernel    {
-          _scaledAddResidualModule.kernel("scaled_add_residual")}
+          _scaledAddResidualModule.kernel("scaled_add_residual")},
+      _qkvSplitModule             {ctx, "qkv_split"},
+      _qkvSplitKernel             {_qkvSplitModule.kernel("qkv_split")}
 {
     // Persistent FlashAttention partial-tile scratch. Sized for the
     // worst case across our target models; reused across every decode
@@ -81,8 +83,8 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
                 "add_bias/add_residual/silu_mul/rope/rope_ff/mul_scalar/"
-                "gelu_mul/attention/attention_flash/scaled_add_residual "
-                "loaded (rms local={}, "
+                "gelu_mul/attention/attention_flash/scaled_add_residual/"
+                "qkv_split loaded (rms local={}, "
                 "elementwise local={}, rope local={}, attention local={}, "
                 "attention max T_k={}, flash kTile={}, flash maxHeads={}, "
                 "flash maxHeadDim={}, flash partial scratch={} bytes)",
@@ -311,6 +313,39 @@ void GpuOps::scaledAddResidualAsync(float*       dst,
     _scaledAddResidualKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
     _queue.appendLaunch(_scaledAddResidualKernel,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::qkvSplitAsync(const float* fused,
+                           float*       Yq,
+                           float*       Yk,
+                           float*       Yv,
+                           std::size_t  M,
+                           std::size_t  Nq,
+                           std::size_t  Nkv,
+                           bool         hasV) {
+    if (M == 0 || Nq == 0 || Nkv == 0) {
+        return;
+    }
+    const std::size_t Nfused = Nq + Nkv * (hasV ? 2 : 1);
+    const std::size_t total  = M * Nfused;
+
+    // Yv may legitimately be nullptr when hasV is false — the kernel
+    // guards against dereferencing it, but Level Zero still expects a
+    // valid pointer for the argument. Route to `fused` as a safe stub.
+    const float* YvPtr = hasV ? Yv : fused;
+
+    _qkvSplitKernel.setPtr(0, fused);
+    _qkvSplitKernel.setPtr(1, Yq);
+    _qkvSplitKernel.setPtr(2, Yk);
+    _qkvSplitKernel.setPtr(3, YvPtr);
+    _qkvSplitKernel.setValue<std::int32_t>(4, toInt32(M,      "qkvSplit M"));
+    _qkvSplitKernel.setValue<std::int32_t>(5, toInt32(Nq,     "qkvSplit Nq"));
+    _qkvSplitKernel.setValue<std::int32_t>(6, toInt32(Nkv,    "qkvSplit Nkv"));
+    _qkvSplitKernel.setValue<std::int32_t>(7, hasV ? 1 : 0);
+    _qkvSplitKernel.setValue<std::int32_t>(8, toInt32(Nfused, "qkvSplit Nfused"));
+    _qkvSplitKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_qkvSplitKernel,
+                        groupsForN(total, kElementwiseLocalSize), 1, 1);
 }
 
 void GpuOps::attentionAsync(const float* q,

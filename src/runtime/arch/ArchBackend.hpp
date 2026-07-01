@@ -13,6 +13,7 @@ class GpuOps;
 } // namespace mimirmind::compute
 
 namespace mimirmind::model {
+class FusedQkvWeights;
 class WeightsMap;
 struct LlmConfig;
 } // namespace mimirmind::model
@@ -98,10 +99,11 @@ isSupportedArchitecture(std::string_view architecture) noexcept {
 /// Build the backend matching `architecture` ("qwen2" / "gemma4"). Returns
 /// nullptr for unsupported architectures — callers must check.
 std::unique_ptr<ArchBackend>
-createArchBackend(const std::string&        architecture,
-                  const model::LlmConfig&   config,
-                  const model::WeightsMap&  weights,
-                  compute::GpuOps&          ops,
-                  compute::GpuMatmul&       gmm);
+createArchBackend(const std::string&             architecture,
+                  const model::LlmConfig&        config,
+                  const model::WeightsMap&       weights,
+                  const model::FusedQkvWeights*  fusedQkv,
+                  compute::GpuOps&               ops,
+                  compute::GpuMatmul&            gmm);
 
 } // namespace mimirmind::runtime::arch

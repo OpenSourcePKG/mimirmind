@@ -12,6 +12,7 @@ class GpuOps;
 } // namespace mimirmind::compute
 
 namespace mimirmind::model {
+class FusedQkvWeights;
 class WeightsMap;
 struct LlmConfig;
 } // namespace mimirmind::model
@@ -42,10 +43,11 @@ namespace mimirmind::runtime::arch {
  */
 class Gemma4Backend final : public ArchBackend {
 public:
-    Gemma4Backend(const model::LlmConfig&   config,
-                  const model::WeightsMap&  weights,
-                  compute::GpuOps&          ops,
-                  compute::GpuMatmul&       gmm);
+    Gemma4Backend(const model::LlmConfig&        config,
+                  const model::WeightsMap&       weights,
+                  const model::FusedQkvWeights*  fusedQkv,
+                  compute::GpuOps&               ops,
+                  compute::GpuMatmul&            gmm);
 
     void runBlock(std::size_t   blockIdx,
                   float*        x,
@@ -82,10 +84,11 @@ private:
     /// Inspect WeightsMap + config to fill per-layer info.
     void buildLayerInfos();
 
-    const model::LlmConfig&   _config;
-    const model::WeightsMap&  _weights;
-    compute::GpuOps&          _ops;
-    compute::GpuMatmul&       _gmm;
+    const model::LlmConfig&        _config;
+    const model::WeightsMap&       _weights;
+    const model::FusedQkvWeights*  _fusedQkv{nullptr};
+    compute::GpuOps&               _ops;
+    compute::GpuMatmul&            _gmm;
 
     std::vector<LayerInfo>    _layers;
 

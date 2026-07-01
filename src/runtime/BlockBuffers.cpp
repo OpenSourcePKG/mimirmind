@@ -9,7 +9,8 @@ BlockBuffers allocBlockBuffers(UsmAllocator&           allocator,
                                std::size_t             maxT,
                                std::size_t             maxSeq,
                                std::size_t             qDimMax,
-                               std::size_t             kvDimMax) {
+                               std::size_t             kvDimMax,
+                               bool                    withFusedQkv) {
     BlockBuffers b{};
     b.maxT    = maxT;
     b.maxSeq  = maxSeq;
@@ -36,6 +37,13 @@ BlockBuffers allocBlockBuffers(UsmAllocator&           allocator,
     b.upOut         = UsmHandle{allocator, upOutBytes};
     b.matmulScratch = UsmHandle{allocator, matmulScratchBytes};
     b.scoreScratch  = UsmHandle{allocator, scoreScratchBytes};
+
+    if (withFusedQkv) {
+        // Q + K + V fused output. Widest layer: Q width + two KV widths.
+        const std::size_t fusedBytes =
+            maxT * (b.q_dim + 2 * b.kv_dim) * sizeof(float);
+        b.qkvFusedScratch = UsmHandle{allocator, fusedBytes};
+    }
 
     if (config.expertCount > 0) {
         const std::size_t moeBytes = maxT * b.d_model * sizeof(float);

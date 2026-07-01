@@ -128,6 +128,19 @@ public:
                                 float        scale,
                                 std::size_t  n);
 
+    /// Scatter the output of a fused QKV matmul into the separate Q, K,
+    /// V destinations. `fused` has shape [M, Nq + Nkv * (1 + hasV)];
+    /// `Yq` [M, Nq]; `Yk` [M, Nkv]; `Yv` [M, Nkv] — the latter may be
+    /// any valid pointer if `hasV == false` (never dereferenced).
+    void qkvSplitAsync(const float* fused,
+                       float*       Yq,
+                       float*       Yk,
+                       float*       Yv,
+                       std::size_t  M,
+                       std::size_t  Nq,
+                       std::size_t  Nkv,
+                       bool         hasV);
+
     /// Multi-head GQA causal attention on the GPU. Layout-equivalent to
     /// compute::multiHeadAttention. q/k/v/out are all f32 USM:
     ///   q   [T_q, nHeads,    headDim]
@@ -211,6 +224,9 @@ private:
 
     runtime::GpuModule     _scaledAddResidualModule;
     runtime::GpuKernel     _scaledAddResidualKernel;
+
+    runtime::GpuModule     _qkvSplitModule;
+    runtime::GpuKernel     _qkvSplitKernel;
 
     // Persistent USM scratch for the FlashAttention partial/merge
     // pipeline. Sized at construction for the worst case across the
