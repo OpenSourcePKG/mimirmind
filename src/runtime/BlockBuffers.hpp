@@ -44,6 +44,16 @@ struct BlockBuffers {
     // Gemma 4 Path B (MoE) scratch. Zero-sized for non-MoE blocks.
     UsmHandle moeAccumBuf;   // [maxT, d_model]   weighted sum of experts
     UsmHandle expertOutBuf;  // [maxT, d_model]   per-expert down output
+
+    // Expert-grouping scratch (M5i.F). Compact buffers ordered by
+    // expert: row i belongs to expert experts[i]. Sized for the
+    // worst-case gather where every (token, top-k slot) fires:
+    //   nRowsMax = maxT * expertUsedCount
+    // Only allocated when the model has experts AND grouping is on.
+    UsmHandle moeXCompact;    // [nRowsMax, d_model]
+    UsmHandle moeGateCompact; // [nRowsMax, ffPerExpert]
+    UsmHandle moeUpCompact;   // [nRowsMax, ffPerExpert]
+    UsmHandle moeDownCompact; // [nRowsMax, d_model]
 };
 
 /// Allocate a single BlockBuffers. `qDimMax`/`kvDimMax` come from the
