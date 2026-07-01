@@ -54,23 +54,46 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
     std::size_t& skippedCount = _skippedCount;
     std::size_t& totalBytes   = _totalBytes;
 
+    // Per-reason skip tallies for the summary log line at the end.
+    std::size_t missingQ_or_K   = 0;
+    std::size_t typeMismatch_QK = 0;
+    std::size_t typeMismatch_QV = 0;
+    std::size_t Kmismatch       = 0;
+    std::size_t Nmismatch       = 0;
+
     for (std::size_t b = 0; b < numBlocks; ++b) {
         const auto* qT = weights.findBlock(b, "attn_q.weight");
         const auto* kT = weights.findBlock(b, "attn_k.weight");
         const auto* vT = weights.findBlock(b, "attn_v.weight");
 
+        auto typeName = [](const GgufTensor* t) {
+            return t == nullptr ? "MISSING" : typeInfo(t->type).name.data();
+        };
+
         // Both Q and K are required; V is optional (altAttention).
         if (qT == nullptr || kT == nullptr) {
+            MM_LOG_WARN("qkvfuse",
+                        "block {} skipped: attn_q={} attn_k={}",
+                        b, typeName(qT), typeName(kT));
             ++skippedCount;
+            ++missingQ_or_K;
             continue;
         }
         if (qT->type != kT->type) {
+            MM_LOG_WARN("qkvfuse",
+                        "block {} skipped: attn_q.type={} != attn_k.type={}",
+                        b, typeName(qT), typeName(kT));
             ++skippedCount;
+            ++typeMismatch_QK;
             continue;
         }
         const bool hasV = (vT != nullptr);
         if (hasV && vT->type != qT->type) {
+            MM_LOG_WARN("qkvfuse",
+                        "block {} skipped: attn_v.type={} != attn_q.type={}",
+                        b, typeName(vT), typeName(qT));
             ++skippedCount;
+            ++typeMismatch_QV;
             continue;
         }
 
@@ -79,7 +102,12 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
         const std::size_t Kk  = nCols(*kT);
         const std::size_t Kv  = hasV ? nCols(*vT) : Kq;
         if (Kq == 0 || Kq != Kk || Kq != Kv) {
+            MM_LOG_WARN("qkvfuse",
+                        "block {} skipped: K mismatch — "
+                        "Kq={} Kk={} Kv={} (hasV={})",
+                        b, Kq, Kk, Kv, hasV);
             ++skippedCount;
+            ++Kmismatch;
             continue;
         }
         // KV rows must match between K and V.
@@ -87,7 +115,12 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
         const std::size_t Nk  = nRows(*kT);
         const std::size_t Nv  = hasV ? nRows(*vT) : Nk;
         if (Nq == 0 || Nk == 0 || (hasV && Nv != Nk)) {
+            MM_LOG_WARN("qkvfuse",
+                        "block {} skipped: N check failed — "
+                        "Nq={} Nk={} Nv={} (hasV={})",
+                        b, Nq, Nk, Nv, hasV);
             ++skippedCount;
+            ++Nmismatch;
             continue;
         }
 
@@ -125,6 +158,13 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
                 "{} MiB extra USM",
                 fusedCount, skippedCount,
                 (totalBytes + (1ULL << 20) - 1) >> 20);
+    if (skippedCount > 0) {
+        MM_LOG_INFO("qkvfuse",
+                    "skip breakdown: missing_qk={} type_qk={} type_qv={} "
+                    "K_mismatch={} N_mismatch={}",
+                    missingQ_or_K, typeMismatch_QK, typeMismatch_QV,
+                    Kmismatch, Nmismatch);
+    }
 }
 
 FusedQkvWeights::~FusedQkvWeights() {
