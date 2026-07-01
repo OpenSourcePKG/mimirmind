@@ -93,6 +93,39 @@ class InferenceEngine {
 public:
     /// Called per emitted decode token. Returning false aborts the loop.
     using TokenCallback = std::function<bool(std::int32_t id)>;
+    /// Payload delivered to the prefill-done callback. `promptTokens` is
+    /// the full prompt length; `prefilledTokens` is what actually ran
+    /// through the model this call (`promptTokens` minus any prefix
+    /// cache-hit). `prefillMs` is the wall time of the prefill phase.
+    struct PrefillDone {
+        std::size_t promptTokens;
+        std::size_t prefilledTokens;
+        double      prefillMs;
+    };
+
+    /// Called once, immediately after prefill and before the first decode
+    /// token is sampled. Used by the streaming server to emit a
+    /// `prefill_done` SSE event so a client can flip its UX from "reading
+    /// your prompt" to "answering" without waiting for the first token.
+    using PrefillCallback = std::function<void(const PrefillDone&)>;
+
+    /// Payload delivered to the per-block prefill-progress callback.
+    /// `blocksDone` is 1-indexed count of transformer blocks that just
+    /// finished (so it walks 1..blocksTotal). `elapsedMs` measures wall
+    /// time since the start of the prefill phase — clients can use it to
+    /// project remaining time via linear extrapolation.
+    struct PrefillProgress {
+        std::size_t blocksDone;
+        std::size_t blocksTotal;
+        double      elapsedMs;
+    };
+
+    /// Called after every transformer block during prefill so a
+    /// streaming client can render a progress bar for long prompts.
+    /// Callbacks are cheap by design — the server should still rate-
+    /// limit outgoing SSE events since a 34-block model on a short
+    /// prompt fires this 34 times in a few hundred milliseconds.
+    using PrefillProgressCallback = std::function<void(const PrefillProgress&)>;
 
     InferenceEngine();
     ~InferenceEngine();
@@ -114,10 +147,12 @@ public:
      * false. Returns the generated ids (without the prompt).
      */
     std::vector<std::int32_t>
-    generate(std::span<const std::int32_t> promptIds,
-             const GenerateParams&         params,
-             const TokenCallback&          onToken  = {},
-             GenerateStats*                outStats = nullptr);
+    generate(std::span<const std::int32_t>   promptIds,
+             const GenerateParams&           params,
+             const TokenCallback&            onToken            = {},
+             GenerateStats*                  outStats           = nullptr,
+             const PrefillCallback&          onPrefillDone      = {},
+             const PrefillProgressCallback&  onPrefillProgress  = {});
 
     /// Drop the persistent KV-cache so the next generate() starts from
     /// scratch. Cache *buffers* stay allocated — only the logical length

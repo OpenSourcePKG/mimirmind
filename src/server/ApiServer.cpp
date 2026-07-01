@@ -251,6 +251,22 @@ json buildFinishChunk(const std::string& id, std::int64_t created,
     return sink.write(line.data(), line.size());
 }
 
+/// Named SSE event: `event: <name>\ndata: <json>\n\n`. OpenAI-style
+/// stream consumers ignore named events (they only demux `data:` lines
+/// that don't have a preceding `event:` field), so this is a safe
+/// place to publish mimirmind-specific side-channel signals like the
+/// `prefill_done` progress hint that browsers can pick up via
+/// `EventSource.addEventListener('prefill_done', ...)`.
+[[nodiscard]] bool writeSseNamedEvent(httplib::DataSink&     sink,
+                                      std::string_view       name,
+                                      const json&            payload) {
+    std::string line;
+    line.reserve(name.size() + payload.dump().size() + 16);
+    line.append("event: ").append(name).append("\n");
+    line.append("data: ").append(payload.dump()).append("\n\n");
+    return sink.write(line.data(), line.size());
+}
+
 [[nodiscard]] bool writeSseDone(httplib::DataSink& sink) {
     static constexpr std::string_view kDone = "data: [DONE]\n\n";
     return sink.write(kDone.data(), kDone.size());
@@ -863,6 +879,55 @@ struct ApiServer::Impl {
                     return true;
                 };
 
+                // Named SSE event fired between prefill and the first
+                // decode token so a streaming client can flip its UX
+                // from "reading your prompt" to "answering". The
+                // OpenAI stream demuxer ignores named events, browsers
+                // pick it up via EventSource.addEventListener.
+                auto onPrefillDone =
+                    [&](const runtime::InferenceEngine::PrefillDone& p) {
+                        const json payload = {
+                            {"prompt_tokens",    p.promptTokens},
+                            {"prefilled_tokens", p.prefilledTokens},
+                            {"prefill_ms",       p.prefillMs},
+                            {"response_id",      state->respId},
+                        };
+                        if (!writeSseNamedEvent(sink, "prefill_done", payload)) {
+                            clientGone = true;
+                        }
+                    };
+
+                // Per-block prefill progress, rate-limited so a fast
+                // prefill (~10 ms per block on Gemma 4 26B) doesn't
+                // fire 34 SSE events in half a second. First and last
+                // blocks always emit; in between we throttle to one
+                // event per ~200 ms so a browser progress bar updates
+                // smoothly on long prompts without spamming short ones.
+                double lastProgressMs = -1.0;
+                constexpr double kProgressMinIntervalMs = 200.0;
+                auto onPrefillProgress =
+                    [&](const runtime::InferenceEngine::PrefillProgress& p) {
+                        const bool isFirst = (p.blocksDone == 1);
+                        const bool isLast  = (p.blocksDone == p.blocksTotal);
+                        const bool dueByTime =
+                            (p.elapsedMs - lastProgressMs) >=
+                            kProgressMinIntervalMs;
+                        if (!isFirst && !isLast && !dueByTime) {
+                            return;
+                        }
+                        lastProgressMs = p.elapsedMs;
+                        const json payload = {
+                            {"blocks_done",  p.blocksDone},
+                            {"blocks_total", p.blocksTotal},
+                            {"elapsed_ms",   p.elapsedMs},
+                            {"response_id",  state->respId},
+                        };
+                        if (!writeSseNamedEvent(sink, "prefill_progress",
+                                                payload)) {
+                            clientGone = true;
+                        }
+                    };
+
                 std::vector<std::int32_t> generated;
                 std::string               errorMessage;
                 {
@@ -871,7 +936,9 @@ struct ApiServer::Impl {
                         generated = engine.generate(state->promptIds,
                                                     state->params,
                                                     onToken,
-                                                    &stats);
+                                                    &stats,
+                                                    onPrefillDone,
+                                                    onPrefillProgress);
                     } catch (const std::exception& e) {
                         errorMessage = e.what();
                     }
