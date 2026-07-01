@@ -39,8 +39,11 @@
 #define Q8_0_BLOCK_BYTES    34
 
 // 1024 elements = 32 blocks per K-tile.
-// SLM: MATMUL_Q8_0_GEMM_M_TILE * X_TILE_ELEMENTS * 4 B
-//    = 8 * 1024 * 4 = 32 KiB per workgroup.
+// SLM: X_TILE_ELEMENTS * MATMUL_Q8_0_GEMM_M_TILE * 4 B
+//    = 1024 * 4 * 4 = 16 KiB per workgroup.
+//
+// Layout is xTile[k_slot][m_slot] — see matmul_q6k_gemm.cl for the
+// SLM bank-conflict rationale.
 #define X_TILE_ELEMENTS 1024
 
 __attribute__((reqd_work_group_size(MATMUL_Q8_0_LOCAL, 1, 1)))
@@ -53,7 +56,7 @@ __kernel void matmul_q8_0_gemm(
     const int             N,
     const int             M)
 {
-    __local float xTile[MATMUL_Q8_0_GEMM_M_TILE][X_TILE_ELEMENTS];
+    __local float xTile[X_TILE_ELEMENTS][MATMUL_Q8_0_GEMM_M_TILE];
 
     const int  wgN     = (int)get_group_id(0);
     const int  wgM     = (int)get_group_id(1);
@@ -82,7 +85,7 @@ __kernel void matmul_q8_0_gemm(
             const int  iSlot = idx - mSlot * X_TILE_ELEMENTS;
             const int  mAct  = mBase + mSlot;
             const bool valid = (mAct < M) && (iSlot < tileK);
-            xTile[mSlot][iSlot] =
+            xTile[iSlot][mSlot] =
                 valid ? X[(size_t)mAct * (size_t)K + tile + iSlot] : 0.0f;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -113,7 +116,7 @@ __kernel void matmul_q8_0_gemm(
 
                     #pragma unroll
                     for (int mm = 0; mm < MATMUL_Q8_0_GEMM_M_TILE; ++mm) {
-                        sum[mm] = mad(xTile[mm][xLocalBase + l], w, sum[mm]);
+                        sum[mm] = mad(xTile[xLocalBase + l][mm], w, sum[mm]);
                     }
                 }
             }

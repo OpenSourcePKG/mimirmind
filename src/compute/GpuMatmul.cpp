@@ -7,16 +7,37 @@
 #include "runtime/Log.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace mimirmind::compute {
+
+namespace {
+
+// Env-var kill-switch. Set MIMIRMIND_DISABLE_GEMM=1 to force the
+// per-token matvec-loop path even for M>1. The M5i GEMM design has
+// only been validated for correctness on the dev-time HD Graphics 630
+// (Gen9.5, 2017) — a very different µarch from pegenaut-skynet's
+// Xe-LPG (Gen13, Meteor Lake). This switch lets us A/B on the target
+// without a rebuild.
+bool gemmDisabledByEnv() noexcept {
+    const char* v = std::getenv("MIMIRMIND_DISABLE_GEMM");
+    if (v == nullptr) return false;
+    const std::string_view s{v};
+    return !s.empty() && s != "0" && s != "false" && s != "off";
+}
+
+} // namespace
 
 GpuMatmul::GpuMatmul(runtime::L0Context& ctx, runtime::CommandQueue& queue)
     : _ctx{ctx},
       _queue{queue}
 {
+    const bool gemmDisabled = gemmDisabledByEnv();
+
     const auto loadSlot = [&ctx](std::string_view moduleName) {
         const std::string nameStr{moduleName};
         auto module = std::make_unique<runtime::GpuModule>(ctx, moduleName);
@@ -38,7 +59,8 @@ GpuMatmul::GpuMatmul(runtime::L0Context& ctx, runtime::CommandQueue& queue)
         std::size_t               gemmMTile = 1;
 
         const auto gemmName = qt->gpuMatmulGemmModule();
-        if (!gemmName.empty()) {
+        const bool gemmEnabled = !gemmName.empty() && !gemmDisabled;
+        if (gemmEnabled) {
             gemmSlot.emplace(loadSlot(gemmName));
             gemmMTile = qt->gpuMatmulGemmMTile();
         }
@@ -52,8 +74,10 @@ GpuMatmul::GpuMatmul(runtime::L0Context& ctx, runtime::CommandQueue& queue)
             loaded << " + ";
         }
         loaded << qt->name();
-        if (!gemmName.empty()) {
+        if (gemmEnabled) {
             loaded << "(vec+gemm)";
+        } else if (!gemmName.empty()) {
+            loaded << "(vec, gemm disabled)";
         } else {
             loaded << "(vec)";
         }
@@ -62,8 +86,9 @@ GpuMatmul::GpuMatmul(runtime::L0Context& ctx, runtime::CommandQueue& queue)
 
     MM_LOG_INFO("gpummm",
                 "GpuMatmul ready — {} kernels loaded, local_size={} "
-                "(sg={}, {} outputs/group)",
-                loaded.str(), kLocalSize, kSubgroupSize, kOutputsPerGroup);
+                "(sg={}, {} outputs/group){}",
+                loaded.str(), kLocalSize, kSubgroupSize, kOutputsPerGroup,
+                gemmDisabled ? " [MIMIRMIND_DISABLE_GEMM=1]" : "");
 }
 
 bool GpuMatmul::supports(model::GgmlType type) const noexcept {
