@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <sstream>
 #include <string>
+#include <utility>
 
 namespace mimirmind::compute {
 
@@ -16,27 +17,46 @@ GpuMatmul::GpuMatmul(runtime::L0Context& ctx, runtime::CommandQueue& queue)
     : _ctx{ctx},
       _queue{queue}
 {
+    const auto loadSlot = [&ctx](std::string_view moduleName) {
+        const std::string nameStr{moduleName};
+        auto module = std::make_unique<runtime::GpuModule>(ctx, moduleName);
+        runtime::GpuKernel kernel{module->kernel(nameStr.c_str())};
+        return KernelSlot{std::move(module), kernel};
+    };
+
     std::ostringstream loaded;
     bool first = true;
 
     for (const QuantType* qt : allQuantTypes()) {
-        const auto moduleName = qt->gpuMatmulModule();
-        if (moduleName.empty()) {
+        const auto vecName = qt->gpuMatmulModule();
+        if (vecName.empty()) {
             continue;
         }
 
-        // GpuModule wants a string_view; the kernel-lookup wants c_str.
-        const std::string nameStr{moduleName};
-        auto module = std::make_unique<runtime::GpuModule>(_ctx, moduleName);
-        runtime::GpuKernel kernel{module->kernel(nameStr.c_str())};
+        KernelSlot                vecSlot = loadSlot(vecName);
+        std::optional<KernelSlot> gemmSlot;
+        std::size_t               gemmMTile = 1;
+
+        const auto gemmName = qt->gpuMatmulGemmModule();
+        if (!gemmName.empty()) {
+            gemmSlot.emplace(loadSlot(gemmName));
+            gemmMTile = qt->gpuMatmulGemmMTile();
+        }
 
         _entries.emplace(qt->ggmlType(),
-                         Entry{std::move(module), kernel});
+                         Entry{std::move(vecSlot),
+                               std::move(gemmSlot),
+                               gemmMTile});
 
         if (!first) {
             loaded << " + ";
         }
         loaded << qt->name();
+        if (!gemmName.empty()) {
+            loaded << "(vec+gemm)";
+        } else {
+            loaded << "(vec)";
+        }
         first = false;
     }
 
@@ -67,16 +87,39 @@ void GpuMatmul::matmulAsync(model::GgmlType type,
         return;
     }
 
-    runtime::GpuKernel& kern = it->second.kernel;
+    Entry& entry = it->second;
 
     // M5h: 4 outputs per workgroup (4 subgroups × 16 threads).
-    const std::uint32_t groups = static_cast<std::uint32_t>(
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
         (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
-    kern.setGroupSize(kLocalSize, 1, 1);
 
+    // Prefill hot path — batched GEMM kernel when available and M > 1.
+    // Handles all M rows in a single Level-Zero dispatch and amortises
+    // the W dequant work M_TILE-fold. Falls through to matvec for M=1
+    // (decode) even when GEMM is available, since the matvec kernel is
+    // more launch-efficient for a single row.
+    if (M > 1 && entry.gemm.has_value()) {
+        runtime::GpuKernel& kern = entry.gemm->kernel;
+        kern.setGroupSize(kLocalSize, 1, 1);
+        kern.setPtr(0, X);
+        kern.setPtr(1, W);
+        kern.setPtr(2, Y);
+        kern.setValue<std::int32_t>(3, static_cast<std::int32_t>(K));
+        kern.setValue<std::int32_t>(4, static_cast<std::int32_t>(N));
+        kern.setValue<std::int32_t>(5, static_cast<std::int32_t>(M));
+
+        const std::uint32_t mGroups = static_cast<std::uint32_t>(
+            (M + entry.gemmMTile - 1) / entry.gemmMTile);
+        _queue.appendLaunch(kern, nGroups, mGroups, 1);
+        return;
+    }
+
+    // Matvec fallback: M=1, or a QuantType with no GEMM kernel yet.
     // One appendLaunch per row of X. Per the Level Zero spec, args are
     // captured at append time, so each loop iteration's setPtr/setValue
     // do not affect the previously-recorded commands.
+    runtime::GpuKernel& kern = entry.vec.kernel;
+    kern.setGroupSize(kLocalSize, 1, 1);
     for (std::size_t m = 0; m < M; ++m) {
         const float* xRow = X + m * K;
         float*       yRow = Y + m * N;
@@ -87,7 +130,7 @@ void GpuMatmul::matmulAsync(model::GgmlType type,
         kern.setValue<std::int32_t>(3, static_cast<std::int32_t>(K));
         kern.setValue<std::int32_t>(4, static_cast<std::int32_t>(N));
 
-        _queue.appendLaunch(kern, groups, 1, 1);
+        _queue.appendLaunch(kern, nGroups, 1, 1);
     }
 }
 

@@ -34,6 +34,14 @@ std::string_view Q8_0::gpuMatmulModule() const noexcept {
     return "matmul_q8_0_vec";
 }
 
+std::string_view Q8_0::gpuMatmulGemmModule() const noexcept {
+    return "matmul_q8_0_gemm";
+}
+
+std::size_t Q8_0::gpuMatmulGemmMTile() const noexcept {
+    return kGemmMTile;
+}
+
 void Q8_0::dequantToF32(const void* src,
                         std::size_t nelements,
                         float*      dst) const {
