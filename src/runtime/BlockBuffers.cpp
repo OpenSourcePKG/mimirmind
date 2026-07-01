@@ -49,6 +49,19 @@ BlockBuffers allocBlockBuffers(UsmAllocator&           allocator,
         const std::size_t moeBytes = maxT * b.d_model * sizeof(float);
         b.moeAccumBuf  = UsmHandle{allocator, moeBytes};
         b.expertOutBuf = UsmHandle{allocator, moeBytes};
+
+        // Expert-grouping scratch (M5i.F). Per-block worst-case row
+        // count = maxT * expertUsedCount (K_top). Feed-forward per
+        // expert is inferred from the block layout at run time —
+        // BlockBuffers is sized on ff_dim (dense path A) which is a
+        // safe upper bound: for Gemma 4 26B-A4B ff_dim == ffPerExpert.
+        const std::size_t nRowsMax  = maxT * config.expertUsedCount;
+        const std::size_t xBytes    = nRowsMax * b.d_model   * sizeof(float);
+        const std::size_t gateBytes = nRowsMax * b.ff_dim    * sizeof(float);
+        b.moeXCompact    = UsmHandle{allocator, xBytes};
+        b.moeGateCompact = UsmHandle{allocator, gateBytes};
+        b.moeUpCompact   = UsmHandle{allocator, gateBytes};
+        b.moeDownCompact = UsmHandle{allocator, xBytes};
     }
     return b;
 }
