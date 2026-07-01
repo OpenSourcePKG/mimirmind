@@ -127,6 +127,26 @@ services:
             #     KV-RAM ≈ tokens × 430 KiB (Gemma 4 26B).
             MIMIRMIND_MAX_CONTEXT_TOKENS: ${MIMIRMIND_MAX_CONTEXT_TOKENS:-8192}
 
+            # M5i Rollback-/Diagnose-Env-Vars — normalerweise leer (Default-
+            # Pfad aktiv). Bei Verdacht auf Regression pro Env-Var einzeln
+            # setzen und Container neu starten, ohne Rebuild.
+            #
+            #   DISABLE_GEMM=1       → pinnt matvec-loop für alle QuantTypes
+            #                          (skippt Autotune-Bench).
+            #   FORCE_GEMM=1         → pinnt GEMM (Diagnose, nicht Prod).
+            #   DISABLE_FUSED_QKV=1  → 3-matmul UnorderedScope-Pfad zurück,
+            #                          FusedQkvWeights baut keine Blocks auf.
+            #   DISABLE_MOE_GROUP=1  → per-Token MoE-Loop zurück (T>1).
+            #   GPU_CLOCK_PIN=rp0    → Governor umgehen, Cap pinned auf RP0.
+            #                          NUR für Bench-Runs, nicht sustained
+            #                          Multi-Request-Traffic auf passiv-
+            #                          gekühltem Chassis!
+            MIMIRMIND_DISABLE_GEMM:      ${MIMIRMIND_DISABLE_GEMM:-}
+            MIMIRMIND_FORCE_GEMM:        ${MIMIRMIND_FORCE_GEMM:-}
+            MIMIRMIND_DISABLE_FUSED_QKV: ${MIMIRMIND_DISABLE_FUSED_QKV:-}
+            MIMIRMIND_DISABLE_MOE_GROUP: ${MIMIRMIND_DISABLE_MOE_GROUP:-}
+            MIMIRMIND_GPU_CLOCK_PIN:     ${MIMIRMIND_GPU_CLOCK_PIN:-}
+
         volumes:
             - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
             - ./run-logs:/logs:rw
