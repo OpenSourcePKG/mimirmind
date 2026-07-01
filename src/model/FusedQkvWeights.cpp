@@ -50,9 +50,9 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
         return;
     }
 
-    std::size_t fusedCount = 0;
-    std::size_t skippedCount = 0;
-    std::size_t totalBytes = 0;
+    std::size_t& fusedCount   = _fusedCount;
+    std::size_t& skippedCount = _skippedCount;
+    std::size_t& totalBytes   = _totalBytes;
 
     for (std::size_t b = 0; b < numBlocks; ++b) {
         const auto* qT = weights.findBlock(b, "attn_q.weight");

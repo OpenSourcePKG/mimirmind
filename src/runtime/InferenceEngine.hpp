@@ -219,6 +219,11 @@ public:
     [[nodiscard]] UsmAllocator&            allocator()        noexcept { return _allocator; }
     [[nodiscard]] const UsmAllocator&      allocator()  const noexcept { return _allocator; }
     [[nodiscard]] compute::GpuMatmul&      gpuMatmul()        noexcept { return _gmm; }
+    [[nodiscard]] const compute::GpuMatmul& gpuMatmul()  const noexcept { return _gmm; }
+    [[nodiscard]] const compute::GpuOps&   gpuOps()     const noexcept { return _ops; }
+    [[nodiscard]] const model::FusedQkvWeights* fusedQkv() const noexcept {
+        return _fusedQkv.get();
+    }
 
     [[nodiscard]] const model::GgufReader& reader()    const noexcept { return _reader; }
     [[nodiscard]] const model::LlmConfig&  config()    const noexcept { return _config; }

@@ -5,6 +5,8 @@
 #include "runtime/GpuModule.hpp"
 
 #include <cstddef>
+#include <string>
+#include <string_view>
 
 namespace mimirmind::runtime {
 class L0Context;
@@ -152,6 +154,13 @@ public:
     /// Runs in < 5 ms on any Intel iGPU. Idempotent, cheap to repeat.
     void selfTest(runtime::UsmAllocator& allocator);
 
+    /// "pending" | "ok" — populated by selfTest(). Exposed via
+    /// /v1/system/status so the deploy can be verified without pulling
+    /// docker logs.
+    [[nodiscard]] std::string_view selfTestStatus() const noexcept {
+        return _selfTestStatus;
+    }
+
     /// Multi-head GQA causal attention on the GPU. Layout-equivalent to
     /// compute::multiHeadAttention. q/k/v/out are all f32 USM:
     ///   q   [T_q, nHeads,    headDim]
@@ -238,6 +247,8 @@ private:
 
     runtime::GpuModule     _qkvSplitModule;
     runtime::GpuKernel     _qkvSplitKernel;
+
+    std::string            _selfTestStatus{"pending"};
 
     // Persistent USM scratch for the FlashAttention partial/merge
     // pipeline. Sized at construction for the worst case across the

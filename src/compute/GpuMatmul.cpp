@@ -152,6 +152,7 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
         for (auto& [type, entry] : _entries) {
             (void)type;
             entry.useGemm = false;
+            entry.autotuneSource = "env_disable_gemm";
         }
         MM_LOG_INFO("gpummm",
                     "autotune: MIMIRMIND_DISABLE_GEMM=1 — every type "
@@ -162,6 +163,7 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
         for (auto& [type, entry] : _entries) {
             (void)type;
             entry.useGemm = entry.gemm.has_value();
+            entry.autotuneSource = "env_force_gemm";
         }
         MM_LOG_INFO("gpummm",
                     "autotune: MIMIRMIND_FORCE_GEMM=1 — every type with "
@@ -201,12 +203,14 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
         if (!entry.gemm.has_value()) {
             // No GEMM to compare against — stay on matvec-loop.
             entry.useGemm = false;
+            entry.autotuneSource = "no_gemm";
             continue;
         }
 
         const QuantType* qt = quantType(type);
         if (qt == nullptr) {
             entry.useGemm = false;
+            entry.autotuneSource = "no_gemm";
             continue;
         }
 
@@ -290,6 +294,7 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                             "matvec-loop and skipping timing bench.",
                             qt->name(), maxDiff, maxRel);
                 entry.useGemm = false;
+                entry.autotuneSource = "parity_fail";
                 allocator.deallocate(wUsm, wBytes);
                 continue;
             }
@@ -342,7 +347,10 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
         // between runs. Below that we prefer the matvec-loop as the
         // conservative default.
         const bool pickGemm = (gemmMed * 1.05 < vecMed);
-        entry.useGemm = pickGemm;
+        entry.useGemm        = pickGemm;
+        entry.lastVecMs      = vecMed;
+        entry.lastGemmMs     = gemmMed;
+        entry.autotuneSource = "bench";
 
         MM_LOG_INFO("gpummm",
                     "autotune: {} N={} K={} M={} — matvec-loop {:.2f} ms, "
@@ -444,6 +452,25 @@ void GpuMatmul::matmul(model::GgmlType type,
 
 void GpuMatmul::sync() {
     _queue.flush();
+}
+
+std::vector<GpuMatmul::AutotuneReport> GpuMatmul::autotuneReport() const {
+    std::vector<AutotuneReport> out;
+    out.reserve(_entries.size());
+    for (const auto& [type, entry] : _entries) {
+        const QuantType* qt = quantType(type);
+        out.push_back(AutotuneReport{
+            .name          = qt != nullptr ? std::string{qt->name()} : "??",
+            .gemmAvailable = entry.gemm.has_value(),
+            .gemmPicked    = entry.useGemm,
+            .vecMs         = entry.lastVecMs,
+            .gemmMs        = entry.lastGemmMs,
+            .source        = entry.autotuneSource.empty()
+                                ? std::string{"pending"}
+                                : entry.autotuneSource,
+        });
+    }
+    return out;
 }
 
 } // namespace mimirmind::compute
