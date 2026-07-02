@@ -5,6 +5,7 @@
 #include "runtime/Lcp.hpp"
 #include "runtime/Log.hpp"
 #include "runtime/GpuClockGovernor.hpp"
+#include "runtime/PerfRegressionDetector.hpp"
 #include "runtime/PowerMonitor.hpp"
 #include "runtime/SystemMonitor.hpp"
 #include "runtime/ThermalGuard.hpp"
@@ -536,10 +537,13 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                                 params.sampling);
             generated.push_back(nextId);
 
-            // Per-token trace, only when the env-controlled sink is open.
-            // sampleNext sync-waits on the lmHead matmul so tokT1 is real
-            // wall-time including the whole layer chain.
-            if (_decodeTrace != nullptr) {
+            // Per-token telemetry. Both the env-controlled NDJSON sink
+            // and the in-process perf-regression detector (when set)
+            // consume the same three numbers (wall_ms, cap_mhz, pkg_c),
+            // so the sensor reads happen once.
+            // sampleNext sync-waits on the lmHead matmul so tokT1 is
+            // real wall-time including the whole layer chain.
+            if (_decodeTrace != nullptr || _perfDetector != nullptr) {
                 const auto tokT1 = clock::now();
                 const double tokMs = std::chrono::duration<double, std::milli>(
                     tokT1 - tokT0).count();
@@ -554,10 +558,16 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                         pkg = static_cast<double>(*r.package_temp_c);
                     }
                 }
-                std::fprintf(_decodeTrace,
-                             "{\"tok\":%zu,\"wall_ms\":%.3f,"
-                             "\"cap_mhz\":%u,\"pkg_c\":%.1f}\n",
-                             step, tokMs, cap, pkg);
+                if (_decodeTrace != nullptr) {
+                    std::fprintf(_decodeTrace,
+                                 "{\"tok\":%zu,\"wall_ms\":%.3f,"
+                                 "\"cap_mhz\":%u,\"pkg_c\":%.1f}\n",
+                                 step, tokMs, cap, pkg);
+                }
+                if (_perfDetector != nullptr) {
+                    _perfDetector->onDecodeToken(
+                        PerfRegressionDetector::Sample{tokMs, cap, pkg});
+                }
             }
 
             if (onToken && !onToken(nextId)) {
@@ -572,6 +582,15 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         const auto decT1 = clock::now();
         decMs =
             std::chrono::duration<double, std::milli>(decT1 - decT0).count();
+
+        // Detector consults the ring buffer once per run — computes p50,
+        // compares against the rolling baseline, alerts + persists.
+        // Never throws (noexcept), so it stays outside the try body's
+        // hot path but inside the outer generate() try where a failure
+        // is at worst logged.
+        if (_perfDetector != nullptr) {
+            _perfDetector->onRunComplete(generated.size());
+        }
     } catch (...) {
         // Mid-flight failure leaves the KV state partially written.
         // Discarding the cache is cheap and keeps the next call honest.

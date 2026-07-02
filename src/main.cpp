@@ -14,6 +14,7 @@
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
+#include "runtime/PerfRegressionDetector.hpp"
 #include "runtime/PowerMonitor.hpp"
 #include "runtime/SystemMonitor.hpp"
 #include "runtime/ThermalGuard.hpp"
@@ -1254,6 +1255,41 @@ int runServe(const CliArgs& args) {
     auto powerMonitor = std::make_unique<mimirmind::runtime::PowerMonitor>();
     engine.setPowerMonitor(powerMonitor.get());
 
+    // In-process perf-regression detector. Feeds off the same per-token
+    // wall-time the NDJSON sink already computes, so it costs a couple
+    // of doubles per token and one median at end-of-run. Kill-switch:
+    // MIMIRMIND_REGRESSION_ALERT=off skips installation entirely for the
+    // case where the detector itself misbehaves and needs to be silenced
+    // without a redeploy.
+    std::unique_ptr<mimirmind::runtime::PerfRegressionDetector> perfDetector;
+    {
+        const char* alertEnv = std::getenv("MIMIRMIND_REGRESSION_ALERT");
+        const bool  disabled =
+            alertEnv != nullptr && std::string_view{alertEnv} == "off";
+        if (!disabled) {
+            std::string baselinePath;
+            if (const char* h = std::getenv("HOME"); h != nullptr && h[0] != '\0') {
+                baselinePath = std::string{h} +
+                               "/.cache/mimirmind/perf-baseline.json";
+            } else {
+                baselinePath = "/tmp/mimirmind-perf-baseline.json";
+            }
+            std::error_code ec;
+            std::filesystem::create_directories(
+                std::filesystem::path{baselinePath}.parent_path(), ec);
+            // create_directories failure is not fatal — the detector
+            // logs a warning on the first write and keeps running.
+            perfDetector =
+                std::make_unique<mimirmind::runtime::PerfRegressionDetector>(
+                    baselinePath);
+            engine.setPerfRegressionDetector(perfDetector.get());
+        } else {
+            MM_LOG_WARN("main",
+                        "MIMIRMIND_REGRESSION_ALERT=off — perf-regression "
+                        "detector not installed for this session");
+        }
+    }
+
     mimirmind::server::ApiServer server{engine, cfg};
 
     g_runningServer.store(&server, std::memory_order_release);
@@ -1292,6 +1328,15 @@ int runServe(const CliArgs& args) {
                   << gov->cardPath() << ")";
     } else {
         std::cout << "off";
+    }
+    std::cout << "\n  perf regression:    ";
+    if (auto* det = engine.perfRegressionDetector()) {
+        std::cout << "on (baseline=" << det->baselineSampleCount()
+                  << " samples, threshold="
+                  << mimirmind::runtime::PerfRegressionDetector::kAlertThreshold
+                  << "x)";
+    } else {
+        std::cout << "off (MIMIRMIND_REGRESSION_ALERT=off)";
     }
     std::cout << "\n  max context tokens: " << engine.maxContextTokens()
               << "\n  Ctrl-C to stop.\n";

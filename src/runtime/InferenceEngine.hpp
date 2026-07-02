@@ -17,6 +17,7 @@
 
 namespace mimirmind::runtime {
 class GpuClockGovernor;
+class PerfRegressionDetector;
 class PowerMonitor;
 class SystemMonitor;
 class ThermalGuard;
@@ -212,6 +213,18 @@ public:
         return _gpuGovernor;
     }
 
+    /// Install (or remove with nullptr) the in-process perf-regression
+    /// detector. Non-owning. When set, generate() feeds it one Sample
+    /// per decode token and calls onRunComplete() at the end. The
+    /// detector persists a rolling baseline to a JSON file and exposes
+    /// current/baseline p50 + last alert through /v1/system/status.
+    void setPerfRegressionDetector(PerfRegressionDetector* d) noexcept {
+        _perfDetector = d;
+    }
+    [[nodiscard]] PerfRegressionDetector* perfRegressionDetector() const noexcept {
+        return _perfDetector;
+    }
+
     // --- Accessors (used by smoke path + diagnostics) -------------------
 
     [[nodiscard]] L0Context&               ctx()              noexcept { return _ctx; }
@@ -291,6 +304,9 @@ private:
     // dynamic iGPU frequency control during decode.
     GpuClockGovernor*                  _gpuGovernor{nullptr};
     SystemMonitor*                     _governorMonitor{nullptr};
+    // Optional non-owning perf-regression detector. Fed per decode
+    // token; consulted from /v1/system/status.
+    PerfRegressionDetector*            _perfDetector{nullptr};
 
     // One-shot block-0 trace. Default off so production serve mode is
     // quiet; set MIMIRMIND_TRACE_BLOCK0=1 to enable when bringing up a

@@ -170,6 +170,7 @@ add_executable(mimirmind
     src/runtime/Log.cpp
     src/runtime/GpuClockGovernor.cpp
     src/runtime/MappedFile.cpp
+    src/runtime/PerfRegressionDetector.cpp
     src/runtime/PowerMonitor.cpp
     src/runtime/SystemMonitor.cpp
     src/runtime/ThermalGuard.cpp
