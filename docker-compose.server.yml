@@ -143,9 +143,22 @@ services:
             #                          gekühltem Chassis!
             MIMIRMIND_DISABLE_GEMM:      ${MIMIRMIND_DISABLE_GEMM:-}
             MIMIRMIND_FORCE_GEMM:        ${MIMIRMIND_FORCE_GEMM:-}
+            MIMIRMIND_GEMM_MIN_M:        ${MIMIRMIND_GEMM_MIN_M:-}
             MIMIRMIND_DISABLE_FUSED_QKV: ${MIMIRMIND_DISABLE_FUSED_QKV:-}
             MIMIRMIND_DISABLE_MOE_GROUP: ${MIMIRMIND_DISABLE_MOE_GROUP:-}
             MIMIRMIND_GPU_CLOCK_PIN:     ${MIMIRMIND_GPU_CLOCK_PIN:-}
+            MIMIRMIND_DISABLE_DP4A:      ${MIMIRMIND_DISABLE_DP4A:-}
+            MIMIRMIND_FORCE_DP4A:        ${MIMIRMIND_FORCE_DP4A:-}
+
+            # M8.K.1 — opt-in to the v2 Q8_0 GEMM (shrunk-SLM prototype).
+            # v2 benched 27-41 % faster than matvec-loop at every M-bucket
+            # on Xe-LPG (2026-07-02) but its dispatch stays dormant behind
+            # v1's gemmMinM=never until the operator turns it on. When
+            # set, autotune re-derives gemmMinM from the v2 vs matvec
+            # bench so Prefill starts routing through v2 automatically.
+            #
+            #   MIMIRMIND_USE_GEMM_V2=1  → activate v2 dispatch.
+            MIMIRMIND_USE_GEMM_V2:       ${MIMIRMIND_USE_GEMM_V2:-}
 
             # In-process perf-regression detector — sits next to the
             # NDJSON sink and alerts when current-run decode p50 exceeds
