@@ -497,8 +497,20 @@ struct ApiServer::Impl {
         };
         const double curP50 = det->currentP50Ms();
         const double basP50 = det->baselineP50Ms();
-        body["current_p50_ms"]  = (curP50 > 0.0) ? json{curP50} : json{};
-        body["baseline_p50_ms"] = (basP50 > 0.0) ? json{basP50} : json{};
+        // json{X} is an initializer-list ctor and produces [X] (array of one);
+        // json(X) is the function-style ctor and produces the scalar X.
+        // Same distinction for the "not available" case — json(nullptr) is
+        // null, json{} is {}. Consumers want a scalar-or-null shape here.
+        if (curP50 > 0.0) {
+            body["current_p50_ms"] = curP50;
+        } else {
+            body["current_p50_ms"] = nullptr;
+        }
+        if (basP50 > 0.0) {
+            body["baseline_p50_ms"] = basP50;
+        } else {
+            body["baseline_p50_ms"] = nullptr;
+        }
         if (auto alert = det->lastAlert()) {
             body["last_alert"] = json{
                 {"current_p50_ms",   alert->current_p50_ms},

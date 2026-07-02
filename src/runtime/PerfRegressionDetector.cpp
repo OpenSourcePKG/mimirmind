@@ -124,6 +124,11 @@ void PerfRegressionDetector::onRunComplete(std::size_t /*emittedTokens*/) noexce
                 rs.internal_version = _internalVersion;
                 _baselineSamples.push_back(std::move(rs));
                 trimBaselineToWindowLocked();
+                // Alert check above used the pre-push baseline (that is
+                // semantically right — a run should not be compared against
+                // itself). But /v1/system/status reports "baseline right now",
+                // which should include the run we just committed. Recompute.
+                _lastBaselineP50Ms = computeBaselineP50Locked();
             }
         }
 
