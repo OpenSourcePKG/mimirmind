@@ -559,11 +559,31 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
 
             // Env-var opt-in. Only fires when the v2 bench actually
             // completed for all buckets AND the operator asked for it.
+            //
+            // M8.K.1 follow-up: when the operator enables v2 AND v2
+            // wins vs matvec at some bucket where v1 lost, re-derive
+            // gemmMinM using v2's timings. Without this the dispatch
+            // stays at gemmMinM=never (v1 lost) even though v2 would
+            // win, forcing the operator to also set MIMIRMIND_GEMM_MIN_M
+            // manually. Winning is defined against matvec (vecMsAtM),
+            // not against v1, because that's the actual dispatch
+            // fallback when GEMM isn't picked.
             if (envSet("MIMIRMIND_USE_GEMM_V2")) {
                 entry.useGemmV2 = true;
+                for (std::size_t bi = 0;
+                     bi < kAutotuneMBuckets.size(); ++bi)
+                {
+                    if (entry.gemmV2MsAtM[bi] * 1.05
+                            < entry.vecMsAtM[bi])
+                    {
+                        entry.gemmMinM = kAutotuneMBuckets[bi];
+                        break;
+                    }
+                }
                 MM_LOG_INFO("gpummm",
                             "MIMIRMIND_USE_GEMM_V2=on — Q8_0 GEMM will "
-                            "dispatch through v2 when M >= gemmMinM={}",
+                            "dispatch through v2 when M >= gemmMinM={} "
+                            "(re-derived from v2 vs matvec bench)",
                             entry.gemmMinM == kGemmMinMNever
                                 ? std::string{"never"}
                                 : std::to_string(entry.gemmMinM));
