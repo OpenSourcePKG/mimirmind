@@ -738,18 +738,28 @@ struct ApiServer::Impl {
             {
                 gemmMinMJson = r.gemmMinM;
             }
+            // M8.K.1 — expose v2 GEMM bench alongside v1 so we can
+            // eyeball the crossover from /v1/system/status.
+            json gemmV2MsAtM = json::object();
+            for (std::size_t i = 0; i < r.mBuckets.size(); ++i) {
+                gemmV2MsAtM[std::to_string(r.mBuckets[i])] =
+                    r.gemmV2MsAtM[i];
+            }
             matmulByType[r.name] = json{
-                {"gemm_available", r.gemmAvailable},
-                {"gemm_picked",    r.gemmPicked},
-                {"gemm_min_m",     gemmMinMJson},
-                {"vec_ms",         r.vecMs},
-                {"gemm_ms",        r.gemmMs},
-                {"vec_ms_at_m",    std::move(vecMsAtM)},
-                {"gemm_ms_at_m",   std::move(gemmMsAtM)},
-                {"dp4a_available", r.dp4aAvailable},
-                {"dp4a_picked",    r.dp4aPicked},
-                {"dp4a_ms",        r.dp4aMs},
-                {"source",         r.source},
+                {"gemm_available",    r.gemmAvailable},
+                {"gemm_picked",       r.gemmPicked},
+                {"gemm_min_m",        gemmMinMJson},
+                {"vec_ms",            r.vecMs},
+                {"gemm_ms",           r.gemmMs},
+                {"vec_ms_at_m",       std::move(vecMsAtM)},
+                {"gemm_ms_at_m",      std::move(gemmMsAtM)},
+                {"dp4a_available",    r.dp4aAvailable},
+                {"dp4a_picked",       r.dp4aPicked},
+                {"dp4a_ms",           r.dp4aMs},
+                {"gemm_v2_available", r.gemmV2Available},
+                {"gemm_v2_picked",    r.gemmV2Picked},
+                {"gemm_v2_ms_at_m",   std::move(gemmV2MsAtM)},
+                {"source",            r.source},
             };
         }
         body["matmul"] = std::move(matmulByType);

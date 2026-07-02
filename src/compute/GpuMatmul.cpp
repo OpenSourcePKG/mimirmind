@@ -142,6 +142,10 @@ GpuMatmul::GpuMatmul(runtime::L0Context&    ctx,
                          Entry{std::move(vecSlot),
                                std::move(gemmSlot),
                                gemmMTile,
+                               /*gemmV2=*/std::nullopt,
+                               /*gemmV2MTile=*/1,
+                               /*useGemmV2=*/false,
+                               /*gemmV2MsAtM=*/{},
                                kGemmMinMNever,   // gemmMinM
                                false,            // useDp4a
                                {},               // vecMsAtM
@@ -159,6 +163,28 @@ GpuMatmul::GpuMatmul(runtime::L0Context&    ctx,
             loaded << "(vec)";
         }
         first = false;
+    }
+
+    // M8.K.1 — v2 GEMM prototype for Q8_0. Guarded because the doubled
+    // xTile pushes SLM to 64 KiB which sits right at Xe-LPG's per-WG
+    // budget; a driver refusal here just disables the v2 path.
+    if (const auto it = _entries.find(model::GgmlType::Q8_0);
+        it != _entries.end())
+    {
+        try {
+            it->second.gemmV2.emplace(loadSlot("matmul_q8_0_gemm_v2"));
+            it->second.gemmV2MTile = kGemmV2MTile;
+            MM_LOG_INFO("gpummm",
+                        "GpuMatmul: matmul_q8_0_gemm_v2 loaded (M_TILE={}) — "
+                        "v2 path benched alongside v1 in autotune",
+                        kGemmV2MTile);
+        } catch (const std::exception& e) {
+            MM_LOG_WARN("gpummm",
+                        "GpuMatmul: matmul_q8_0_gemm_v2 load failed ({}) — "
+                        "v2 path disabled, autotune benches v1 only",
+                        e.what());
+            it->second.gemmV2.reset();
+        }
     }
 
     // M8.H.1 — DP4A Q8_0 matvec. Guarded because the extension is not
@@ -471,6 +497,76 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                         ? std::string{"never"}
                         : std::to_string(entry.gemmMinM));
 
+        // M8.K.1 — v2 GEMM bench for Q8_0 only. Runs alongside v1 at
+        // every M-bucket so operators can see the crossover in the
+        // logs; the actual dispatch decision only flips to v2 when
+        // MIMIRMIND_USE_GEMM_V2=on is set (guarded below the loop so
+        // the env-var interacts cleanly with the M-threshold picked
+        // above).
+        if (type == model::GgmlType::Q8_0 && entry.gemmV2.has_value()) {
+            const std::size_t v2Tile = entry.gemmV2MTile;
+            // Temporarily route through v2 by flipping useGemmV2 for
+            // the bench, restore after.
+            const bool savedUseV2 = entry.useGemmV2;
+            entry.useGemmV2 = true;
+
+            // Force GEMM dispatch (bypass matvec) for the bench by
+            // setting gemmMinM=2. Restore afterwards.
+            const std::size_t savedMinM = entry.gemmMinM;
+            entry.gemmMinM = 2;
+
+            // Warmup — one shot at Mmax to prime the JIT.
+            matmulAsync(type, wUsm, N, K,
+                        static_cast<const float*>(xUsm), Mmax,
+                        static_cast<float*>(yUsm),
+                        static_cast<float*>(sUsm));
+            _queue.flush();
+
+            for (std::size_t bi = 0; bi < kAutotuneMBuckets.size(); ++bi) {
+                const std::size_t Mb = kAutotuneMBuckets[bi];
+                std::vector<double> v2Ms;
+                v2Ms.reserve(nTimed);
+                for (int it = 0; it < nTimed; ++it) {
+                    const auto t0 = clk::now();
+                    matmulAsync(type, wUsm, N, K,
+                                static_cast<const float*>(xUsm), Mb,
+                                static_cast<float*>(yUsm),
+                                static_cast<float*>(sUsm));
+                    _queue.flush();
+                    const auto t1 = clk::now();
+                    v2Ms.push_back(
+                        std::chrono::duration<double, std::milli>(t1 - t0)
+                            .count());
+                }
+                entry.gemmV2MsAtM[bi] = medianMs(std::move(v2Ms));
+            }
+            entry.useGemmV2 = savedUseV2;
+            entry.gemmMinM  = savedMinM;
+
+            (void)v2Tile;
+            MM_LOG_INFO("gpummm",
+                        "autotune: Q8_0 GEMM v2 (M_TILE={}) — "
+                        "M=16 v2={:.2f} ms (v1 {:.2f}) | "
+                        "M=64 v2={:.2f} ms (v1 {:.2f}) | "
+                        "M=256 v2={:.2f} ms (v1 {:.2f})",
+                        entry.gemmV2MTile,
+                        entry.gemmV2MsAtM[0], entry.gemmMsAtM[0],
+                        entry.gemmV2MsAtM[1], entry.gemmMsAtM[1],
+                        entry.gemmV2MsAtM[2], entry.gemmMsAtM[2]);
+
+            // Env-var opt-in. Only fires when the v2 bench actually
+            // completed for all buckets AND the operator asked for it.
+            if (envSet("MIMIRMIND_USE_GEMM_V2")) {
+                entry.useGemmV2 = true;
+                MM_LOG_INFO("gpummm",
+                            "MIMIRMIND_USE_GEMM_V2=on — Q8_0 GEMM will "
+                            "dispatch through v2 when M >= gemmMinM={}",
+                            entry.gemmMinM == kGemmMinMNever
+                                ? std::string{"never"}
+                                : std::to_string(entry.gemmMinM));
+            }
+        }
+
         // M8.H.3 — DP4A 3rd variant for Q8_0. Benched at M=16 only
         // (kAutotuneMBuckets[0]); the current DP4A path loses at every
         // observed M so extending the bench across all buckets would
@@ -662,7 +758,17 @@ void GpuMatmul::matmulAsync(model::GgmlType type,
     // (autotune only benches M=16 and up; the M=1 path stays on matvec
     // for launch-efficiency reasons even when GEMM would numerically win).
     if (M >= entry.gemmMinM && entry.gemm.has_value()) {
-        runtime::GpuKernel& kern = entry.gemm->kernel;
+        // M8.K.1 — if the v2 GEMM prototype is loaded AND the operator
+        // opted into it, dispatch v2 instead of v1. Signature and
+        // launch geometry are identical; only the M-tile differs, so
+        // the per-workgroup count needs the v2 M-tile.
+        const bool useV2 =
+            entry.useGemmV2 && entry.gemmV2.has_value();
+        runtime::GpuKernel& kern =
+            useV2 ? entry.gemmV2->kernel : entry.gemm->kernel;
+        const std::size_t mTile =
+            useV2 ? entry.gemmV2MTile : entry.gemmMTile;
+
         kern.setGroupSize(kLocalSize, 1, 1);
         kern.setPtr(0, X);
         kern.setPtr(1, W);
@@ -672,7 +778,7 @@ void GpuMatmul::matmulAsync(model::GgmlType type,
         kern.setValue<std::int32_t>(5, static_cast<std::int32_t>(M));
 
         const std::uint32_t mGroups = static_cast<std::uint32_t>(
-            (M + entry.gemmMTile - 1) / entry.gemmMTile);
+            (M + mTile - 1) / mTile);
         _queue.appendLaunch(kern, nGroups, mGroups, 1);
         return;
     }
@@ -799,6 +905,11 @@ std::vector<GpuMatmul::AutotuneReport> GpuMatmul::autotuneReport() const {
         r.dp4aAvailable = dp4aForThisType;
         r.dp4aPicked    = entry.useDp4a;
         r.dp4aMs        = entry.lastDp4aMs;
+        r.gemmV2Available = entry.gemmV2.has_value();
+        r.gemmV2Picked    = entry.useGemmV2;
+        for (std::size_t i = 0; i < kAutotuneMBuckets.size(); ++i) {
+            r.gemmV2MsAtM[i] = entry.gemmV2MsAtM[i];
+        }
         r.source        = entry.autotuneSource.empty()
                               ? std::string{"pending"}
                               : entry.autotuneSource;

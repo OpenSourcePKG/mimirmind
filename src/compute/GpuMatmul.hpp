@@ -170,6 +170,10 @@ public:
         bool        dp4aAvailable{false};
         bool        dp4aPicked{false};
         double      dp4aMs{0.0};
+        // M8.K.1 — v2 GEMM prototype (M_TILE=16) telemetry. Q8_0 only.
+        bool        gemmV2Available{false};
+        bool        gemmV2Picked{false};
+        std::array<double, 3> gemmV2MsAtM{};
         std::string source;              // "bench" | "env_force_gemm" | "env_disable_gemm" | "no_gemm" | "parity_fail" | "dp4a_parity_fail" | "env_force_dp4a" | "env_gemm_min_m"
     };
     [[nodiscard]] std::vector<AutotuneReport> autotuneReport() const;
@@ -184,6 +188,16 @@ private:
         KernelSlot                vec;      // M==1 hot path (matvec)
         std::optional<KernelSlot> gemm;     // optional M>1 batched path
         std::size_t               gemmMTile{1};
+
+        // M8.K.1 experimental — Q8_0 only. Set when the v2 GEMM
+        // (larger M-tile + sub-group scale broadcast) module loaded.
+        // At dispatch time, `useGemmV2` (true only when
+        // MIMIRMIND_USE_GEMM_V2 is set AND autotune picked GEMM)
+        // routes to v2's kernel instead of v1's.
+        std::optional<KernelSlot> gemmV2;
+        std::size_t               gemmV2MTile{1};
+        bool                      useGemmV2{false};
+        std::array<double, 3>     gemmV2MsAtM{};
 
         // M8.J — smallest batch size M at which the timed GEMM bench
         // beat the timed matvec-loop bench with a 5 % margin.
@@ -266,6 +280,11 @@ private:
     static constexpr std::uint32_t kDp4aSubgroupSize    = 16;
     static constexpr std::uint32_t kDp4aOutputsPerGroup =
         kDp4aLocalSize / kDp4aSubgroupSize;
+
+    // M8.K.1 v2 GEMM — must match MATMUL_Q8_0_GEMM_V2_M_TILE in
+    // kernels/matmul_q8_0_gemm_v2.cl. Doubled M-tile keeps the same
+    // WG/SG geometry as v1 so only the amortisation axis changes.
+    static constexpr std::size_t kGemmV2MTile = 16;
 
     // Worst-case shape the internal DP4A scratch is sized for. Anything
     // beyond falls back to vec/gemm at dispatch time with a one-shot log.
