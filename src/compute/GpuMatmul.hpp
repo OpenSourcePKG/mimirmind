@@ -18,6 +18,8 @@ class UsmAllocator;
 
 namespace mimirmind::compute {
 
+class GpuOps;
+
 /**
  * Drop-in replacement for compute::matmul that dispatches to GPU kernels
  * for weight types whose QuantType advertises a `gpuMatmulModule()`. For
@@ -28,11 +30,17 @@ namespace mimirmind::compute {
  * ops can be appended into the same command list as matmuls. Not
  * thread-safe (the underlying ze_kernel_handle_t is mutated by
  * setArgumentValue). Construct once at startup, share across the engine.
+ *
+ * Holds a reference to GpuOps to route the DP4A Q8_0 path (M8.H.3)
+ * through the shared x_quant_i8 kernel — no duplicated module load.
  */
 class GpuMatmul {
 public:
-    GpuMatmul(runtime::L0Context& ctx, runtime::CommandQueue& queue);
-    ~GpuMatmul() = default;
+    GpuMatmul(runtime::L0Context&    ctx,
+              GpuOps&                ops,
+              runtime::UsmAllocator& alloc,
+              runtime::CommandQueue& queue);
+    ~GpuMatmul();
 
     GpuMatmul(const GpuMatmul&)            = delete;
     GpuMatmul& operator=(const GpuMatmul&) = delete;
@@ -112,6 +120,19 @@ public:
                              std::size_t        M,
                              float*             Y);
 
+private:
+    /// Internal dispatch for the DP4A Q8_0 path — quantises `X` into
+    /// the persistent Xq/Xscale scratch via `_ops.xQuantI8Async`, then
+    /// forwards to `matmulQ8_0Dp4aAsync`. Callers must first verify
+    /// M <= kDp4aMaxM && K <= kDp4aMaxK.
+    void dispatchQ8_0Dp4aFromFloat(const float* X,
+                                   const void*  W,
+                                   std::size_t  N,
+                                   std::size_t  K,
+                                   std::size_t  M,
+                                   float*       Y);
+public:
+
     /// True when matmul_q8_0_vec_dp4a loaded successfully. False when
     /// the SPV or the DP4A extension itself was unavailable on the
     /// target iGPU; callers must fall back to the plain matvec path.
@@ -132,7 +153,12 @@ public:
         bool        gemmPicked;          // autotune picked GEMM over matvec-loop
         double      vecMs;               // measured matvec-loop median ms (0 = not measured)
         double      gemmMs;              // measured GEMM median ms (0 = not measured)
-        std::string source;              // "bench" | "env_force_gemm" | "env_disable_gemm" | "no_gemm" | "parity_fail"
+        // M8.H.3 — only meaningful for Q8_0 on iGPUs where the DP4A
+        // module loaded. Zero elsewhere.
+        bool        dp4aAvailable{false};
+        bool        dp4aPicked{false};
+        double      dp4aMs{0.0};
+        std::string source;              // "bench" | "env_force_gemm" | "env_disable_gemm" | "no_gemm" | "parity_fail" | "dp4a_parity_fail" | "env_force_dp4a"
     };
     [[nodiscard]] std::vector<AutotuneReport> autotuneReport() const;
 
@@ -148,14 +174,23 @@ private:
         std::size_t               gemmMTile{1};
         bool                      useGemm{false};  // set by autotune()
 
+        // M8.H.3 — Q8_0 only. When true, matmulAsync routes the Q8_0
+        // dispatch through the DP4A path (x_quant_i8 + DP4A matvec)
+        // instead of vec/gemm. Set by autotune() only when parity gate
+        // + timing bench both prefer DP4A on this iGPU.
+        bool                      useDp4a{false};
+
         // Autotune telemetry — populated once by autotune(), consumed by
         // autotuneReport() for the /v1/system/status endpoint.
         double      lastVecMs{0.0};
         double      lastGemmMs{0.0};
+        double      lastDp4aMs{0.0};  // 0 unless DP4A available for this type
         std::string autotuneSource;   // "bench" | "env_force_gemm" | ...
     };
 
     runtime::L0Context&    _ctx;
+    GpuOps&                _ops;
+    runtime::UsmAllocator& _alloc;
     runtime::CommandQueue& _queue;
 
     // One Entry per GgmlType that has a `gpuMatmulModule()` registered.
@@ -166,9 +201,26 @@ private:
     // nullopt when the SPV or the DP4A extension itself is unavailable
     // on the current iGPU. Kept separate from `_entries` because it
     // takes a different argument list (Xq + Xscale) so the generic
-    // matmulAsync dispatcher can't drive it — the autotune integration
-    // (M8.H.3) is what will pick it against MATVEC / GEMM per QuantType.
+    // matmulAsync dispatcher can't drive it directly — the autotune
+    // integration (M8.H.3) selects it, and matmulAsync then routes
+    // through _dp4aXqUsm / _dp4aScaleUsm.
     std::optional<KernelSlot> _q8_0Dp4aSlot;
+
+    // M8.H.3 — persistent Xq / Xscale scratch for the DP4A dispatch
+    // path. Sized once at ctor for the worst-case shape we're willing
+    // to serve without falling back to plain matvec. Reused across
+    // every DP4A call; the engine serialises calls via engineMutex so
+    // no aliasing is possible.
+    //
+    // 8192 × 2816 int8 = 23 MiB peak — trivially small vs the 24 GiB
+    // Xe-LPG DRAM budget. If a request comes in with M > kDp4aMaxM or
+    // K > kDp4aMaxK, matmulAsync logs once and falls back to vec/gemm.
+    void*       _dp4aXqUsm{nullptr};
+    void*       _dp4aScaleUsm{nullptr};
+    std::size_t _dp4aXqBytes{0};
+    std::size_t _dp4aScaleBytes{0};
+    // One-shot warning latch — never log the fallback warning twice.
+    mutable bool _dp4aScratchOverflowWarned{false};
 
     // M5h: workgroup of 64 threads = 4 subgroups of 16, each subgroup
     // co-computes ONE output via sub_group_reduce_add. So a workgroup
@@ -185,6 +237,13 @@ private:
     static constexpr std::uint32_t kDp4aSubgroupSize    = 8;
     static constexpr std::uint32_t kDp4aOutputsPerGroup =
         kDp4aLocalSize / kDp4aSubgroupSize;
+
+    // Worst-case shape the internal DP4A scratch is sized for. Anything
+    // beyond falls back to vec/gemm at dispatch time with a one-shot log.
+    // 8192 = max context we serve. 2816 = Gemma 4 d_model with headroom
+    // for future models up to that dim.
+    static constexpr std::size_t   kDp4aMaxM           = 8192;
+    static constexpr std::size_t   kDp4aMaxK           = 2816;
 };
 
 } // namespace mimirmind::compute

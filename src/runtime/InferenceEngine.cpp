@@ -62,8 +62,8 @@ InferenceEngine::InferenceEngine()
     : _ctx{},
       _allocator{_ctx},
       _queue{_ctx},
-      _gmm{_ctx, _queue},
-      _ops{_ctx, _allocator, _queue} {
+      _ops{_ctx, _allocator, _queue},
+      _gmm{_ctx, _ops, _allocator, _queue} {
     MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");
     _allocator.probeLimits();
 
