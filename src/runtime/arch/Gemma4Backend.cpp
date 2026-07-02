@@ -12,6 +12,7 @@
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
 #include "runtime/Log.hpp"
+#include "runtime/OpProfiler.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -28,9 +29,10 @@ Gemma4Backend::Gemma4Backend(const model::LlmConfig&        config,
                              const model::WeightsMap&       weights,
                              const model::FusedQkvWeights*  fusedQkv,
                              compute::GpuOps&               ops,
-                             compute::GpuMatmul&            gmm)
+                             compute::GpuMatmul&            gmm,
+                             runtime::OpProfiler&           opProfiler)
     : _config{config}, _weights{weights}, _fusedQkv{fusedQkv},
-      _ops{ops}, _gmm{gmm} {
+      _ops{ops}, _gmm{gmm}, _op{opProfiler} {
     buildLayerInfos();
 
     if (const auto* rf = _weights.find("rope_freqs.weight");
@@ -244,6 +246,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
 
     // --- pre-attention RMSNorm ----------------------------------------
 
+    _op.mark(runtime::OpProfiler::Cat::NORM);
     trace("attn rmsNorm");
     _ops.rmsNormAsync(x, T, d_model,
                       static_cast<const float*>(attnNorm->usmPtr),
@@ -267,6 +270,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
             ? _fusedQkv->find(blockIdx)
             : nullptr;
 
+    _op.mark(runtime::OpProfiler::Cat::MATMUL);
     if (fBlk != nullptr) {
         trace("Q+K+V projections (fused matmul + split)");
         float* const qkvFused = s.qkvFusedScratch.as<float>();
@@ -303,6 +307,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     // Q-norm, K-norm, V-norm — three in-place norms on three different
     // buffers, each depends on its own projection (visible via the
     // projections' pop barrier above).
+    _op.mark(runtime::OpProfiler::Cat::NORM);
     trace("Q+K+V norms (rmsNorm, unordered)");
     {
         runtime::UnorderedScope u{_ops.queue()};
@@ -320,6 +325,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     }
 
     // RoPE Q and RoPE K — independent buffers, V skipped (no RoPE).
+    _op.mark(runtime::OpProfiler::Cat::ATTENTION);
     trace("RoPE Q+K (unordered)");
     {
         runtime::UnorderedScope u{_ops.queue()};
@@ -347,6 +353,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     // because compute::multiHeadAttention bakes in 1/sqrt(headDim);
     // the GPU kernel takes scale as a parameter, which makes the Gemma
     // branch one mulScalarAsync + one sync cheaper than before.
+    _op.mark(runtime::OpProfiler::Cat::ATTENTION);
     trace("attention (GPU, scale=1)");
     _ops.attentionAsync(qBuf,
                         cache.baseK(blockIdx),
@@ -356,11 +363,13 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                         curLen, /*scale=*/1.0F,
                         attnOutBuf);
 
+    _op.mark(runtime::OpProfiler::Cat::MATMUL);
     trace("O projection");
     _gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,
                 attnOutBuf, T,
                 projOutBuf, matmulScratch);
 
+    _op.mark(runtime::OpProfiler::Cat::NORM);
     trace("attn_post_norm");
     _ops.rmsNormAsync(projOutBuf, T, d_model,
                       static_cast<const float*>(attnPost->usmPtr),
@@ -368,6 +377,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                       projOutBuf);            // in-place
     dumpStage("attn_post_norm", projOutBuf, T, d_model);
 
+    _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
     trace("attn residual");
     _ops.addResidualAsync(x, projOutBuf, T * d_model);
     // x now holds sa_out = inpL + attn_post_norm(attn_out).
@@ -375,6 +385,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
 
     // --- FFN path A — dense SwiGLU with GELU ---------------------------
 
+    _op.mark(runtime::OpProfiler::Cat::NORM);
     trace("ffn_norm (path A pre)");
     _ops.rmsNormAsync(x, T, d_model,
                       static_cast<const float*>(ffnNorm->usmPtr),
@@ -382,6 +393,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                       normBuf);
 
     // M5f.4: FFN gate + up read normBuf, write disjoint outputs.
+    _op.mark(runtime::OpProfiler::Cat::MATMUL);
     trace("FFN gate+up proj (unordered)");
     {
         runtime::UnorderedScope u{_ops.queue()};
@@ -391,14 +403,17 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                          normBuf, T, upOutBuf, matmulScratch);
     }
 
+    _op.mark(runtime::OpProfiler::Cat::ACTIVATION);
     trace("GELU + mul (fused)");
     _ops.geluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
 
+    _op.mark(runtime::OpProfiler::Cat::MATMUL);
     trace("FFN down proj");
     _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
                 gateOutBuf, T,
                 projOutBuf, matmulScratch);
 
+    _op.mark(runtime::OpProfiler::Cat::NORM);
     trace("post_ffw_norm_1 (path A post)");
     _ops.rmsNormAsync(projOutBuf, T, d_model,
                       static_cast<const float*>(ffwPost1->usmPtr),
@@ -410,6 +425,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
 
     // M5f.4: two rmsNorms on the same input x with different weights and
     // different output buffers — fully independent, can pipeline.
+    _op.mark(runtime::OpProfiler::Cat::NORM);
     trace("path B: pre_ffw_norm_2 + router rmsNorm (unordered)");
     {
         runtime::UnorderedScope u{_ops.queue()};
@@ -428,6 +444,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
 
     const std::size_t nExperts = _config.expertCount;
     const std::size_t K        = _config.expertUsedCount;
+    _op.mark(runtime::OpProfiler::Cat::ROUTER);
     trace("path B: router matmul (CPU)");
     _gmm.matmul(routerW->type, routerW->usmPtr,
                 nExperts, d_model,
@@ -439,6 +456,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     cmp::moeTopKRoute(upOutBuf, T, nExperts, K,
                       topKIdx.data(), topKWeight.data());
 
+    _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
     trace("path B: zero accumulator");
     _ops.mulScalarAsync(moeAccumBuf, 0.0F, T * d_model);
 
@@ -489,6 +507,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
         return sv.empty() || sv == "0" || sv == "false" || sv == "off";
     }();
 
+    _op.mark(runtime::OpProfiler::Cat::MATMUL);
     if (useMoeGrouping) {
         trace("path B: expert-grouped dispatch");
 
@@ -657,6 +676,7 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
         }
     }
 
+    _op.mark(runtime::OpProfiler::Cat::NORM);
     trace("path B: post_ffw_norm_2");
     _ops.rmsNormAsync(moeAccumBuf, T, d_model,
                       static_cast<const float*>(postNorm2->usmPtr),
@@ -664,10 +684,12 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                       moeAccumBuf);
     dumpStage("ffn_moe", moeAccumBuf, T, d_model);
 
+    _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
     trace("combined = pathA_out + pathB_out");
     _ops.addResidualAsync(moeAccumBuf, projOutBuf, T * d_model);
     dumpStage("ffn_moe_combined", moeAccumBuf, T, d_model);
 
+    _op.mark(runtime::OpProfiler::Cat::NORM);
     trace("post_ffw_norm (combined)");
     _ops.rmsNormAsync(moeAccumBuf, T, d_model,
                       static_cast<const float*>(ffwPost->usmPtr),
@@ -675,14 +697,20 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
                       moeAccumBuf);
     dumpStage("ffn_post_norm", moeAccumBuf, T, d_model);
 
+    _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
     trace("ffn residual");
     _ops.addResidualAsync(x, moeAccumBuf, T * d_model);
 
     const float scaleVal = *static_cast<const float*>(outScale->usmPtr);
+    _op.mark(runtime::OpProfiler::Cat::ACTIVATION);
     trace("layer_output_scale");
     _ops.mulScalarAsync(x, scaleVal, T * d_model);
     dumpStage("out_scaled", x, T, d_model);
     dumpStage("l_out",      x, T, d_model);
+
+    // Close the last phase before returning so its time lands in the
+    // accumulator. Cheap no-op when profiling is disabled.
+    _op.finish();
 }
 
 } // namespace mimirmind::runtime::arch

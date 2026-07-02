@@ -20,9 +20,10 @@ Qwen2Backend::Qwen2Backend(const model::LlmConfig&        config,
                            const model::WeightsMap&       weights,
                            const model::FusedQkvWeights*  fusedQkv,
                            compute::GpuOps&               ops,
-                           compute::GpuMatmul&            gmm)
+                           compute::GpuMatmul&            gmm,
+                           runtime::OpProfiler&           opProfiler)
     : _config{config}, _weights{weights}, _fusedQkv{fusedQkv},
-      _ops{ops}, _gmm{gmm} {
+      _ops{ops}, _gmm{gmm}, _op{opProfiler} {
     MM_LOG_INFO("qwen2", "Qwen2Backend ready — blocks={} d_model={} ff={} "
                          "heads={} kv={}",
                 _config.blockCount, _config.embeddingLength,

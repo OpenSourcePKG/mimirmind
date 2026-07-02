@@ -63,7 +63,8 @@ InferenceEngine::InferenceEngine()
       _allocator{_ctx},
       _queue{_ctx},
       _ops{_ctx, _allocator, _queue},
-      _gmm{_ctx, _ops, _allocator, _queue} {
+      _gmm{_ctx, _ops, _allocator, _queue},
+      _opProfiler{_queue} {
     MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");
     _allocator.probeLimits();
 
@@ -161,7 +162,7 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     // gracefully with the original architecture string in the error.
     _backend = arch::createArchBackend(
         _config.architecture, _config, *_weights, _fusedQkv.get(),
-        _ops, _gmm);
+        _ops, _gmm, _opProfiler);
 
     _modelLoaded = true;
     // Defensive: a previous model's KV state must not survive into the
@@ -568,6 +569,10 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                     _perfDetector->onDecodeToken(
                         PerfRegressionDetector::Sample{tokMs, cap, pkg});
                 }
+                // M8.K.0 diagnostic: emits a per-category share summary
+                // every 50 tokens when MIMIRMIND_TRACE_OP_TIMES=on.
+                // No-op otherwise.
+                _opProfiler.maybeDumpAndReset(step);
             }
 
             if (onToken && !onToken(nextId)) {

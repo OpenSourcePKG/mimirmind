@@ -11,14 +11,15 @@ createArchBackend(const std::string&             architecture,
                   const model::WeightsMap&       weights,
                   const model::FusedQkvWeights*  fusedQkv,
                   compute::GpuOps&               ops,
-                  compute::GpuMatmul&            gmm) {
+                  compute::GpuMatmul&            gmm,
+                  OpProfiler&                    opProfiler) {
     if (architecture == "qwen2") {
         return std::make_unique<Qwen2Backend>(config, weights, fusedQkv,
-                                              ops, gmm);
+                                              ops, gmm, opProfiler);
     }
     if (architecture == "gemma4") {
         return std::make_unique<Gemma4Backend>(config, weights, fusedQkv,
-                                               ops, gmm);
+                                               ops, gmm, opProfiler);
     }
     return nullptr;
 }

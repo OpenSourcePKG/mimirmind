@@ -47,7 +47,8 @@ public:
                   const model::WeightsMap&       weights,
                   const model::FusedQkvWeights*  fusedQkv,
                   compute::GpuOps&               ops,
-                  compute::GpuMatmul&            gmm);
+                  compute::GpuMatmul&            gmm,
+                  runtime::OpProfiler&           opProfiler);
 
     void runBlock(std::size_t   blockIdx,
                   float*        x,
@@ -89,6 +90,7 @@ private:
     const model::FusedQkvWeights*  _fusedQkv{nullptr};
     compute::GpuOps&               _ops;
     compute::GpuMatmul&            _gmm;
+    runtime::OpProfiler&           _op;
 
     std::vector<LayerInfo>    _layers;
 

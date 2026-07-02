@@ -12,6 +12,7 @@
 #include "runtime/CommandQueue.hpp"
 #include "runtime/KvCache.hpp"
 #include "runtime/L0Context.hpp"
+#include "runtime/OpProfiler.hpp"
 #include "runtime/UsmAllocator.hpp"
 #include "runtime/UsmHandle.hpp"
 
@@ -271,6 +272,10 @@ private:
     // GpuOps::xQuantI8Async to fill the internal Xq/Xscale scratch).
     compute::GpuOps                    _ops;
     compute::GpuMatmul                 _gmm;
+    // M8.K.0: diagnostic per-op timer. Constructed after _queue so it
+    // can hold a reference. Off by default (MIMIRMIND_TRACE_OP_TIMES
+    // env-var opt-in).
+    OpProfiler                         _opProfiler;
     compute::Sampler                   _sampler{};
 
     model::GgufReader                  _reader;

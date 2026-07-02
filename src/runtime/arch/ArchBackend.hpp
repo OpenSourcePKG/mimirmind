@@ -12,6 +12,10 @@ class GpuMatmul;
 class GpuOps;
 } // namespace mimirmind::compute
 
+namespace mimirmind::runtime {
+class OpProfiler;
+} // namespace mimirmind::runtime
+
 namespace mimirmind::model {
 class FusedQkvWeights;
 class WeightsMap;
@@ -104,6 +108,7 @@ createArchBackend(const std::string&             architecture,
                   const model::WeightsMap&       weights,
                   const model::FusedQkvWeights*  fusedQkv,
                   compute::GpuOps&               ops,
-                  compute::GpuMatmul&            gmm);
+                  compute::GpuMatmul&            gmm,
+                  OpProfiler&                    opProfiler);
 
 } // namespace mimirmind::runtime::arch
