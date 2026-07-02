@@ -266,8 +266,11 @@ private:
     L0Context                          _ctx;
     UsmAllocator                       _allocator;
     CommandQueue                       _queue;
-    compute::GpuMatmul                 _gmm;
+    // M8.H.3: _ops is constructed BEFORE _gmm so GpuMatmul can hold
+    // a reference to it (the DP4A dispatch path calls
+    // GpuOps::xQuantI8Async to fill the internal Xq/Xscale scratch).
     compute::GpuOps                    _ops;
+    compute::GpuMatmul                 _gmm;
     compute::Sampler                   _sampler{};
 
     model::GgufReader                  _reader;

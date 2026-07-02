@@ -727,6 +727,9 @@ struct ApiServer::Impl {
                 {"gemm_picked",    r.gemmPicked},
                 {"vec_ms",         r.vecMs},
                 {"gemm_ms",        r.gemmMs},
+                {"dp4a_available", r.dp4aAvailable},
+                {"dp4a_picked",    r.dp4aPicked},
+                {"dp4a_ms",        r.dp4aMs},
                 {"source",         r.source},
             };
         }

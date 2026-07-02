@@ -1,5 +1,6 @@
 #include "compute/GpuMatmul.hpp"
 
+#include "compute/GpuOps.hpp"
 #include "compute/Matmul.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
@@ -79,8 +80,13 @@ double medianMs(std::vector<double> xs) {
 
 } // namespace
 
-GpuMatmul::GpuMatmul(runtime::L0Context& ctx, runtime::CommandQueue& queue)
+GpuMatmul::GpuMatmul(runtime::L0Context&    ctx,
+                     GpuOps&                ops,
+                     runtime::UsmAllocator& alloc,
+                     runtime::CommandQueue& queue)
     : _ctx{ctx},
+      _ops{ops},
+      _alloc{alloc},
       _queue{queue}
 {
     const auto loadSlot = [&ctx](std::string_view moduleName) {
@@ -147,11 +153,36 @@ GpuMatmul::GpuMatmul(runtime::L0Context& ctx, runtime::CommandQueue& queue)
         _q8_0Dp4aSlot.reset();
     }
 
+    // M8.H.3 — persistent Xq / Xscale scratch. Only allocate when the
+    // DP4A path actually loaded; there's no point paying 23 MiB of USM
+    // for a kernel we can't dispatch.
+    if (_q8_0Dp4aSlot.has_value()) {
+        _dp4aXqBytes    = kDp4aMaxM * kDp4aMaxK;               // int8
+        _dp4aScaleBytes = kDp4aMaxM * sizeof(float);
+        _dp4aXqUsm      = _alloc.allocate(_dp4aXqBytes);
+        _dp4aScaleUsm   = _alloc.allocate(_dp4aScaleBytes);
+        MM_LOG_INFO("gpummm",
+                    "GpuMatmul: DP4A scratch reserved — Xq {} bytes "
+                    "(max M={}, K={}), Xscale {} bytes",
+                    _dp4aXqBytes, kDp4aMaxM, kDp4aMaxK, _dp4aScaleBytes);
+    }
+
     MM_LOG_INFO("gpummm",
                 "GpuMatmul ready — {} kernels loaded, local_size={} "
                 "(sg={}, {} outputs/group). Autotune pending — call "
                 "autotune() to pick between matvec-loop and GEMM per type.",
                 loaded.str(), kLocalSize, kSubgroupSize, kOutputsPerGroup);
+}
+
+GpuMatmul::~GpuMatmul() {
+    if (_dp4aXqUsm != nullptr) {
+        _alloc.deallocate(_dp4aXqUsm, _dp4aXqBytes);
+        _dp4aXqUsm = nullptr;
+    }
+    if (_dp4aScaleUsm != nullptr) {
+        _alloc.deallocate(_dp4aScaleUsm, _dp4aScaleBytes);
+        _dp4aScaleUsm = nullptr;
+    }
 }
 
 void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
@@ -163,8 +194,10 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
         mBatch = 16;
     }
 
-    const bool forceDisable = envSet("MIMIRMIND_DISABLE_GEMM");
-    const bool forceEnable  = envSet("MIMIRMIND_FORCE_GEMM");
+    const bool forceDisable       = envSet("MIMIRMIND_DISABLE_GEMM");
+    const bool forceEnable        = envSet("MIMIRMIND_FORCE_GEMM");
+    const bool forceDisableDp4a   = envSet("MIMIRMIND_DISABLE_DP4A");
+    const bool forceEnableDp4a    = envSet("MIMIRMIND_FORCE_DP4A");
 
     if (forceDisable) {
         for (auto& [type, entry] : _entries) {
@@ -187,6 +220,17 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                     "autotune: MIMIRMIND_FORCE_GEMM=1 — every type with "
                     "a GEMM kernel pinned to the GEMM path");
         return;
+    }
+
+    // MIMIRMIND_FORCE_DP4A=1 pins Q8_0 to the DP4A path without a
+    // timing bench (still parity-checked below in the loop).
+    if (forceEnableDp4a && _q8_0Dp4aSlot.has_value()) {
+        const auto it = _entries.find(model::GgmlType::Q8_0);
+        if (it != _entries.end()) {
+            MM_LOG_INFO("gpummm",
+                        "autotune: MIMIRMIND_FORCE_DP4A=1 — Q8_0 will be "
+                        "pinned to the DP4A path after parity gate");
+        }
     }
 
     // Round N and K to super-block-aligned sizes so every quant type
@@ -376,6 +420,122 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                     qt->name(), N, K, M, vecMed, gemmMed,
                     pickGemm ? "gemm" : "matvec-loop");
 
+        // M8.H.3 — DP4A 3rd variant for Q8_0. Only runs after the
+        // matvec-vs-gemm decision above so the existing telemetry stays
+        // meaningful. Overrides useGemm on win.
+        if (type == model::GgmlType::Q8_0
+            && _q8_0Dp4aSlot.has_value()
+            && !forceDisableDp4a)
+        {
+            const std::size_t xqBytes = M * K * sizeof(std::int8_t);
+            const std::size_t xsBytes = M * sizeof(float);
+            if (xqBytes > _dp4aXqBytes || xsBytes > _dp4aScaleBytes) {
+                MM_LOG_WARN("gpummm",
+                            "autotune: DP4A bench for {} skipped — "
+                            "bench shape (M={}, K={}) exceeds scratch "
+                            "bounds. Bump kDp4aMax* together.",
+                            qt->name(), M, K);
+            } else {
+                entry.useDp4a = false;
+                entry.useGemm = false;
+                std::vector<float> yVec(M * N);
+                for (std::size_t m = 0; m < M; ++m) {
+                    matmulAsync(type, wUsm, N, K,
+                                static_cast<const float*>(xUsm) + m * K,
+                                /*M=*/1,
+                                static_cast<float*>(yUsm) + m * N,
+                                static_cast<float*>(sUsm));
+                }
+                _queue.flush();
+                std::memcpy(yVec.data(), yUsm, yBytes);
+
+                entry.useDp4a = true;
+                std::vector<float> yDp4a(M * N);
+                for (int i = 0; i < nWarmup; ++i) {
+                    matmulAsync(type, wUsm, N, K,
+                                static_cast<const float*>(xUsm), M,
+                                static_cast<float*>(yUsm),
+                                static_cast<float*>(sUsm));
+                    _queue.flush();
+                }
+                matmulAsync(type, wUsm, N, K,
+                            static_cast<const float*>(xUsm), M,
+                            static_cast<float*>(yUsm),
+                            static_cast<float*>(sUsm));
+                _queue.flush();
+                std::memcpy(yDp4a.data(), yUsm, yBytes);
+
+                float maxAbs   = 0.0F;
+                float maxDiff  = 0.0F;
+                for (std::size_t i = 0; i < yVec.size(); ++i) {
+                    maxAbs  = std::max(maxAbs,  std::fabs(yVec[i]));
+                    maxDiff = std::max(maxDiff,
+                                       std::fabs(yVec[i] - yDp4a[i]));
+                }
+                // INT8-quant-of-X noise on random inputs on a synthetic
+                // weight bench: 5 % of max|ref| is the empirically-safe
+                // ceiling. Real-inference activations are much better-
+                // conditioned so a broken kernel would still overshoot
+                // this by orders of magnitude.
+                const float dp4aTol = std::max(0.05F * maxAbs, 1e-3F);
+                if (!(maxDiff <= dp4aTol)) {
+                    MM_LOG_WARN("gpummm",
+                                "autotune parity FAIL for Q8_0 DP4A — "
+                                "maxDiff={:.6g} maxRef={:.6g} tol={:.6g}. "
+                                "Pinning to previous choice ({}) and "
+                                "skipping DP4A timing bench.",
+                                maxDiff, maxAbs, dp4aTol,
+                                pickGemm ? "gemm" : "matvec-loop");
+                    entry.useDp4a        = false;
+                    entry.useGemm        = pickGemm;
+                    entry.autotuneSource = "dp4a_parity_fail";
+                } else {
+                    MM_LOG_INFO("gpummm",
+                                "autotune parity OK for Q8_0 DP4A — "
+                                "maxDiff={:.6g} maxRef={:.6g} tol={:.6g}",
+                                maxDiff, maxAbs, dp4aTol);
+
+                    std::vector<double> dp4aMs;
+                    dp4aMs.reserve(nTimed);
+                    for (int it2 = 0; it2 < nTimed; ++it2) {
+                        const auto t0 = clk::now();
+                        matmulAsync(type, wUsm, N, K,
+                                    static_cast<const float*>(xUsm), M,
+                                    static_cast<float*>(yUsm),
+                                    static_cast<float*>(sUsm));
+                        _queue.flush();
+                        const auto t1 = clk::now();
+                        std::chrono::duration<double, std::milli> dt = t1 - t0;
+                        dp4aMs.push_back(dt.count());
+                    }
+                    const double dp4aMed = medianMs(std::move(dp4aMs));
+                    entry.lastDp4aMs = dp4aMed;
+
+                    const double bestNonDp4a =
+                        pickGemm ? gemmMed : vecMed;
+                    // MIMIRMIND_FORCE_DP4A=1 skips the timing race.
+                    const bool pickDp4a =
+                        forceEnableDp4a ||
+                        (dp4aMed * 1.05 < bestNonDp4a);
+                    entry.useDp4a = pickDp4a;
+                    if (pickDp4a) {
+                        entry.useGemm = false;
+                    } else {
+                        entry.useGemm = pickGemm;
+                    }
+                    entry.autotuneSource =
+                        forceEnableDp4a ? "env_force_dp4a" : "bench";
+                    MM_LOG_INFO("gpummm",
+                                "autotune: Q8_0 DP4A {:.2f} ms vs "
+                                "best-non-dp4a {:.2f} ms → picked {}",
+                                dp4aMed, bestNonDp4a,
+                                pickDp4a
+                                    ? "dp4a"
+                                    : (pickGemm ? "gemm" : "matvec-loop"));
+                }
+            }
+        }
+
         allocator.deallocate(wUsm, wBytes);
     }
 
@@ -406,6 +566,30 @@ void GpuMatmul::matmulAsync(model::GgmlType type,
     }
 
     Entry& entry = it->second;
+
+    // M8.H.3 — DP4A hot path for Q8_0 when autotune picked it AND the
+    // request fits the persistent scratch. Bounds overflow falls
+    // through to vec/gemm below with a one-shot warn so the constants
+    // can be bumped if it keeps happening.
+    if (type == model::GgmlType::Q8_0
+        && entry.useDp4a
+        && _q8_0Dp4aSlot.has_value())
+    {
+        if (M <= kDp4aMaxM && K <= kDp4aMaxK) {
+            dispatchQ8_0Dp4aFromFloat(X, W, N, K, M, Y);
+            return;
+        }
+        if (!_dp4aScratchOverflowWarned) {
+            MM_LOG_WARN("gpummm",
+                        "GpuMatmul: DP4A dispatch declined for Q8_0 "
+                        "(M={}, K={}) — exceeds scratch bounds "
+                        "(kDp4aMaxM={}, kDp4aMaxK={}). Falling back to "
+                        "vec/gemm. Bump both constants together if this "
+                        "happens for every request.",
+                        M, K, kDp4aMaxM, kDp4aMaxK);
+            _dp4aScratchOverflowWarned = true;
+        }
+    }
 
     // M5h: 4 outputs per workgroup (4 subgroups × 16 threads).
     const std::uint32_t nGroups = static_cast<std::uint32_t>(
@@ -514,6 +698,22 @@ void GpuMatmul::matmulQ8_0Dp4aAsync(const std::int8_t* Xq,
     }
 }
 
+void GpuMatmul::dispatchQ8_0Dp4aFromFloat(const float* X,
+                                          const void*  W,
+                                          std::size_t  N,
+                                          std::size_t  K,
+                                          std::size_t  M,
+                                          float*       Y) {
+    // Bounds are the caller's responsibility (matmulAsync checks them
+    // before routing here). This method just wires the two kernels
+    // together on the shared queue.
+    auto* xq = static_cast<std::int8_t*>(_dp4aXqUsm);
+    auto* xs = static_cast<float*>(_dp4aScaleUsm);
+
+    _ops.xQuantI8Async(X, xq, xs, M, K);
+    matmulQ8_0Dp4aAsync(xq, xs, W, N, K, M, Y);
+}
+
 void GpuMatmul::sync() {
     _queue.flush();
 }
@@ -523,13 +723,18 @@ std::vector<GpuMatmul::AutotuneReport> GpuMatmul::autotuneReport() const {
     out.reserve(_entries.size());
     for (const auto& [type, entry] : _entries) {
         const QuantType* qt = quantType(type);
+        const bool dp4aForThisType =
+            type == model::GgmlType::Q8_0 && _q8_0Dp4aSlot.has_value();
         out.push_back(AutotuneReport{
-            .name          = qt != nullptr ? std::string{qt->name()} : "??",
-            .gemmAvailable = entry.gemm.has_value(),
-            .gemmPicked    = entry.useGemm,
-            .vecMs         = entry.lastVecMs,
-            .gemmMs        = entry.lastGemmMs,
-            .source        = entry.autotuneSource.empty()
+            .name           = qt != nullptr ? std::string{qt->name()} : "??",
+            .gemmAvailable  = entry.gemm.has_value(),
+            .gemmPicked     = entry.useGemm,
+            .vecMs          = entry.lastVecMs,
+            .gemmMs         = entry.lastGemmMs,
+            .dp4aAvailable  = dp4aForThisType,
+            .dp4aPicked     = entry.useDp4a,
+            .dp4aMs         = entry.lastDp4aMs,
+            .source         = entry.autotuneSource.empty()
                                 ? std::string{"pending"}
                                 : entry.autotuneSource,
         });

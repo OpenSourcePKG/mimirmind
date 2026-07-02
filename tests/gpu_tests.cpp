@@ -51,7 +51,7 @@ struct GpuFixture {
     mimirmind::runtime::UsmAllocator usm{ctx};
     mimirmind::runtime::CommandQueue queue{ctx};
     mimirmind::compute::GpuOps       ops{ctx, usm, queue};
-    mimirmind::compute::GpuMatmul    gmm{ctx, queue};
+    mimirmind::compute::GpuMatmul    gmm{ctx, ops, usm, queue};
 
     GpuFixture() {
         // Force the GEMM dispatch decision so the M>1 parity tests
