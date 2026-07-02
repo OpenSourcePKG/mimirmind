@@ -419,6 +419,174 @@ TEST(mul_scalar_basic) {
 }
 
 // =======================================================================
+// x_quant_i8 — per-row symmetric int8 quantisation (M8.H.0 input path
+// for the DP4A Q8_0 matmul).
+// =======================================================================
+
+namespace {
+
+// CPU reference for a single row: scale = max(|x|) / 127, quantise
+// with round-to-nearest ties-away-from-zero, clamp to [-127, 127].
+// Matches kernels/x_quant_i8.cl.
+void cpuXQuantI8Row(const float* x, std::int8_t* q, float& scale,
+                    std::size_t K) {
+    float amax = 0.0F;
+    for (std::size_t k = 0; k < K; ++k) {
+        amax = std::max(amax, std::fabs(x[k]));
+    }
+    scale = amax / 127.0F;
+    const float invS = (amax > 0.0F) ? (127.0F / amax) : 0.0F;
+    for (std::size_t k = 0; k < K; ++k) {
+        float v = std::round(x[k] * invS);
+        v = std::max(-127.0F, std::min(127.0F, v));
+        q[k] = static_cast<std::int8_t>(static_cast<int>(v));
+    }
+}
+
+} // namespace
+
+TEST(x_quant_i8_basic) {
+    // Single row at Gemma 4 26B-A4B hidden dim.
+    constexpr std::size_t M = 1;
+    constexpr std::size_t K = 2816;
+
+    const auto x = generateFloats(M * K, 0xB1);
+
+    UsmBuf bufX(M * K * sizeof(float));
+    UsmBuf bufQ(M * K * sizeof(std::int8_t));
+    UsmBuf bufS(M     * sizeof(float));
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+
+    fx().ops.xQuantI8Async(bufX.as<float>(), bufQ.as<std::int8_t>(),
+                           bufS.as<float>(), M, K);
+    fx().queue.flush();
+
+    std::vector<std::int8_t> cpuQ(M * K);
+    float                    cpuScale = 0.0F;
+    cpuXQuantI8Row(x.data(), cpuQ.data(), cpuScale, K);
+
+    // Scale is a single reduction — must match to the last ULP.
+    const float gotScale = bufS.as<float>()[0];
+    if (!(std::fabs(gotScale - cpuScale) <= 1e-6F * cpuScale)) {
+        std::ostringstream os;
+        os << "x_quant_i8_basic: scale mismatch — gpu=" << gotScale
+           << " cpu=" << cpuScale;
+        throw std::runtime_error(os.str());
+    }
+    // Quants match exactly (deterministic round + clamp on both sides).
+    const std::int8_t* gotQ = bufQ.as<std::int8_t>();
+    for (std::size_t k = 0; k < K; ++k) {
+        if (gotQ[k] != cpuQ[k]) {
+            std::ostringstream os;
+            os << "x_quant_i8_basic: q mismatch at k=" << k
+               << " gpu=" << static_cast<int>(gotQ[k])
+               << " cpu=" << static_cast<int>(cpuQ[k])
+               << " x=" << x[k] << " scale=" << cpuScale;
+            throw std::runtime_error(os.str());
+        }
+    }
+
+    // Dequant round-trip within 0.5 * scale.
+    const float tol = 0.5F * cpuScale + 1e-6F;
+    for (std::size_t k = 0; k < K; ++k) {
+        const float deq = static_cast<float>(gotQ[k]) * gotScale;
+        const float d   = std::fabs(deq - x[k]);
+        if (!(d <= tol)) {
+            std::ostringstream os;
+            os << "x_quant_i8_basic: dequant error at k=" << k
+               << " x=" << x[k] << " deq=" << deq
+               << " diff=" << d << " tol=" << tol;
+            throw std::runtime_error(os.str());
+        }
+    }
+}
+
+TEST(x_quant_i8_multiRow) {
+    // Multiple rows with deliberately different dynamic ranges — each
+    // row must get its own independent scale.
+    constexpr std::size_t M = 4;
+    constexpr std::size_t K = 1024;
+
+    auto x = generateFloats(M * K, 0xB2);
+    // Rescale each row so scales are visibly different.
+    const float rowMul[M] = {0.1F, 1.0F, 5.0F, 20.0F};
+    for (std::size_t m = 0; m < M; ++m) {
+        for (std::size_t k = 0; k < K; ++k) {
+            x[m * K + k] *= rowMul[m];
+        }
+    }
+
+    UsmBuf bufX(M * K * sizeof(float));
+    UsmBuf bufQ(M * K * sizeof(std::int8_t));
+    UsmBuf bufS(M     * sizeof(float));
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+
+    fx().ops.xQuantI8Async(bufX.as<float>(), bufQ.as<std::int8_t>(),
+                           bufS.as<float>(), M, K);
+    fx().queue.flush();
+
+    const std::int8_t* gotQ = bufQ.as<std::int8_t>();
+    const float*       gotS = bufS.as<float>();
+    for (std::size_t m = 0; m < M; ++m) {
+        std::vector<std::int8_t> cpuQ(K);
+        float                    cpuScale = 0.0F;
+        cpuXQuantI8Row(x.data() + m * K, cpuQ.data(), cpuScale, K);
+
+        if (!(std::fabs(gotS[m] - cpuScale) <= 1e-6F * cpuScale)) {
+            std::ostringstream os;
+            os << "x_quant_i8_multiRow: scale[" << m
+               << "] gpu=" << gotS[m] << " cpu=" << cpuScale;
+            throw std::runtime_error(os.str());
+        }
+        for (std::size_t k = 0; k < K; ++k) {
+            if (gotQ[m * K + k] != cpuQ[k]) {
+                std::ostringstream os;
+                os << "x_quant_i8_multiRow: q mismatch row=" << m
+                   << " k=" << k
+                   << " gpu=" << static_cast<int>(gotQ[m * K + k])
+                   << " cpu=" << static_cast<int>(cpuQ[k]);
+                throw std::runtime_error(os.str());
+            }
+        }
+    }
+}
+
+TEST(x_quant_i8_zeroRow) {
+    // All-zero row must produce scale=0 and all-zero quants — the DP4A
+    // matmul relies on this to produce an exactly-zero output row
+    // rather than NaN from 0/0 = 0/0.
+    constexpr std::size_t M = 1;
+    constexpr std::size_t K = 128;
+
+    std::vector<float> x(M * K, 0.0F);
+
+    UsmBuf bufX(M * K * sizeof(float));
+    UsmBuf bufQ(M * K * sizeof(std::int8_t));
+    UsmBuf bufS(M     * sizeof(float));
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+
+    fx().ops.xQuantI8Async(bufX.as<float>(), bufQ.as<std::int8_t>(),
+                           bufS.as<float>(), M, K);
+    fx().queue.flush();
+
+    if (bufS.as<float>()[0] != 0.0F) {
+        std::ostringstream os;
+        os << "x_quant_i8_zeroRow: expected scale=0, got="
+           << bufS.as<float>()[0];
+        throw std::runtime_error(os.str());
+    }
+    const std::int8_t* gotQ = bufQ.as<std::int8_t>();
+    for (std::size_t k = 0; k < K; ++k) {
+        if (gotQ[k] != 0) {
+            std::ostringstream os;
+            os << "x_quant_i8_zeroRow: q[" << k << "]="
+               << static_cast<int>(gotQ[k]) << " (expected 0)";
+            throw std::runtime_error(os.str());
+        }
+    }
+}
+
+// =======================================================================
 // Activations: silu_mul + gelu_mul
 // =======================================================================
 
@@ -1296,6 +1464,102 @@ TEST(matmul_q8_0_gemm_realistic_prefill) {
     // Gemma-4 Q8_0 attention proj shape: N≈2560, K=2816, M=16.
     runQ8_0MatmulParity("matmul_q8_0_gemm_prefill", /*N=*/2560, /*K=*/2816,
                         /*M=*/16, /*seed=*/0xE005U, /*tol=*/2e-2F);
+}
+
+// =======================================================================
+// M8.H.1 — matmul_q8_0_vec_dp4a: DP4A matvec with int8-quantised
+// activation. Compared against the plain float-X Q8_0 matmul on the
+// same weights; tolerance is driven by the int8 activation quant
+// error (≈ K * amax * mean|w_dequant| / 254 in the worst case).
+// =======================================================================
+namespace {
+
+void runQ8_0Dp4aParity(const char*   label,
+                       std::size_t   N,
+                       std::size_t   K,
+                       std::size_t   M,
+                       std::uint32_t seed) {
+    if (!fx().gmm.dp4aAvailable()) {
+        std::printf("[SKIP] %s (DP4A extension unavailable on this iGPU)\n",
+                    label);
+        return;
+    }
+
+    const auto w = buildQ8_0Weights(N, K, seed);
+    const auto x = generateFloats(M * K, seed ^ 0x9E3779B9U);
+
+    UsmBuf bufW (w.size());
+    UsmBuf bufX (M * K * sizeof(float));
+    UsmBuf bufXq(M * K * sizeof(std::int8_t));
+    UsmBuf bufXs(M     * sizeof(float));
+    UsmBuf bufYref (M * N * sizeof(float));
+    UsmBuf bufYdp4a(M * N * sizeof(float));
+    UsmBuf bufScratch(K * sizeof(float));
+
+    std::memcpy(bufW.raw(), w.data(), w.size());
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+
+    // Reference: plain float-X matmul_q8_0 (whichever variant the
+    // dispatcher picks — matvec-loop for M=1, GEMM otherwise). This is
+    // what DP4A is replacing.
+    fx().gmm.matmul(mimirmind::model::GgmlType::Q8_0,
+                    bufW.raw(), N, K,
+                    bufX.as<float>(), M,
+                    bufYref.as<float>(),
+                    bufScratch.as<float>());
+
+    // Quantise X → Xq + Xscale on the GPU, then dispatch DP4A matvec.
+    fx().ops.xQuantI8Async(bufX.as<float>(), bufXq.as<std::int8_t>(),
+                           bufXs.as<float>(), M, K);
+    fx().gmm.matmulQ8_0Dp4aAsync(bufXq.as<std::int8_t>(),
+                                 bufXs.as<float>(),
+                                 bufW.raw(), N, K, M,
+                                 bufYdp4a.as<float>());
+    fx().gmm.sync();
+
+    // Tolerance model. The DP4A output differs from the float-X output
+    // because each activation is int8-quantised (max per-element error
+    // amax/254). Accumulated over K weights the worst-case bound is
+    // K × amax/254 × max|w_deq|; the expected magnitude is closer to
+    // √K × amax/254 × rms|w_deq|. We use a mixed absolute-plus-relative
+    // bound: 5 % of max|ref| plus a small floor to catch outputs that
+    // round to near-zero.
+    float maxRefAbs = 0.0F;
+    for (std::size_t i = 0; i < M * N; ++i) {
+        maxRefAbs = std::max(maxRefAbs, std::fabs(bufYref.as<float>()[i]));
+    }
+    const float tol = std::max(0.05F * maxRefAbs, 1e-2F);
+    EXPECT_ARRAY_NEAR(label, bufYdp4a.as<float>(), bufYref.as<float>(),
+                      M * N, tol);
+}
+
+} // namespace
+
+TEST(matmul_q8_0_dp4a_M1_basic) {
+    // Single-row (decode hot path). N tail check: N=40 → 5 workgroups
+    // of 8 outputs each.
+    runQ8_0Dp4aParity("matmul_q8_0_dp4a_M1", /*N=*/40, /*K=*/1024,
+                      /*M=*/1, /*seed=*/0xF101U);
+}
+
+TEST(matmul_q8_0_dp4a_M1_gemma4_shape) {
+    // Realistic Gemma-4-Q8_0 attention proj shape at decode.
+    runQ8_0Dp4aParity("matmul_q8_0_dp4a_gemma4", /*N=*/2560, /*K=*/2816,
+                      /*M=*/1, /*seed=*/0xF102U);
+}
+
+TEST(matmul_q8_0_dp4a_M4_perRowScale) {
+    // Multiple rows — each row has its own scale, so the row loop in
+    // matmulQ8_0Dp4aAsync must advance Xscale by 1 per iteration.
+    runQ8_0Dp4aParity("matmul_q8_0_dp4a_M4", /*N=*/32, /*K=*/1024,
+                      /*M=*/4, /*seed=*/0xF103U);
+}
+
+TEST(matmul_q8_0_dp4a_N_tail) {
+    // N not a multiple of the outputs-per-group (8) — last workgroup
+    // has idle output slots.
+    runQ8_0Dp4aParity("matmul_q8_0_dp4a_Ntail", /*N=*/33, /*K=*/1024,
+                      /*M=*/1, /*seed=*/0xF104U);
 }
 
 // =======================================================================

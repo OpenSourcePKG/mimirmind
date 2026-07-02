@@ -74,7 +74,9 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
       _scaledAddResidualKernel    {
           _scaledAddResidualModule.kernel("scaled_add_residual")},
       _qkvSplitModule             {ctx, "qkv_split"},
-      _qkvSplitKernel             {_qkvSplitModule.kernel("qkv_split")}
+      _qkvSplitKernel             {_qkvSplitModule.kernel("qkv_split")},
+      _xQuantI8Module             {ctx, "x_quant_i8"},
+      _xQuantI8Kernel             {_xQuantI8Module.kernel("x_quant_i8")}
 {
     // Persistent FlashAttention partial-tile scratch. Sized for the
     // worst case across our target models; reused across every decode
@@ -88,7 +90,7 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
                 "add_bias/add_residual/silu_mul/rope/rope_ff/mul_scalar/"
                 "gelu_mul/attention/attention_flash/scaled_add_residual/"
-                "qkv_split loaded (rms local={}, "
+                "qkv_split/x_quant_i8 loaded (rms local={}, "
                 "elementwise local={}, rope local={}, attention local={}, "
                 "attention max T_k={}, flash kTile={}, flash maxHeads={}, "
                 "flash maxHeadDim={}, flash partial scratch={} bytes)",
@@ -320,6 +322,92 @@ void GpuOps::scaledAddResidualAsync(float*       dst,
 }
 
 void GpuOps::selfTest(runtime::UsmAllocator& allocator) {
+    // x_quant_i8: per-row symmetric int8 quantisation. Feeds the DP4A
+    // Q8_0 matmul (M8.H) — a broken quant kernel silently corrupts
+    // every DP4A matmul on the target iGPU, so this runs first.
+    {
+        constexpr std::size_t M    = 2;
+        constexpr std::size_t K    = 64;
+        constexpr std::size_t xBytes = M * K * sizeof(float);
+        constexpr std::size_t yBytes = M * K * sizeof(std::int8_t);
+        constexpr std::size_t sBytes = M     * sizeof(float);
+
+        void* xUsm = allocator.allocate(xBytes);
+        void* yUsm = allocator.allocate(yBytes);
+        void* sUsm = allocator.allocate(sBytes);
+
+        // Row 0: mixed positive/negative, max at k=13. Row 1: all zeros
+        // to exercise the amax=0 branch.
+        std::vector<float> xh(M * K, 0.0F);
+        for (std::size_t k = 0; k < K; ++k) {
+            xh[k] = static_cast<float>(k) * 0.125F - 3.0F;
+        }
+        xh[13] = 5.5F; // guaranteed row-0 amax
+        std::memcpy(xUsm, xh.data(), xBytes);
+        std::memset(yUsm, 0x7F, yBytes);
+        const float sPoison = -1.0e6F;
+        for (std::size_t m = 0; m < M; ++m) {
+            std::memcpy(static_cast<char*>(sUsm) + m * sizeof(float),
+                        &sPoison, sizeof(float));
+        }
+
+        xQuantI8Async(static_cast<const float*>(xUsm),
+                      static_cast<std::int8_t*>(yUsm),
+                      static_cast<float*>(sUsm),
+                      M, K);
+        _queue.flush();
+
+        std::vector<std::int8_t> qGot(M * K);
+        std::vector<float>       sGot(M);
+        std::memcpy(qGot.data(), yUsm, yBytes);
+        std::memcpy(sGot.data(), sUsm, sBytes);
+
+        // Row 0: scale = 5.5/127, dequant round-trip within 0.5*scale.
+        const float amax0 = 5.5F;
+        const float sRef0 = amax0 / 127.0F;
+        if (!(std::fabs(sGot[0] - sRef0) <= 1e-6F)) {
+            std::ostringstream os;
+            os << "GpuOps::selfTest[x_quant_i8]: scale[0] mismatch — got="
+               << sGot[0] << " ref=" << sRef0;
+            throw std::runtime_error(os.str());
+        }
+        const float tol0 = 0.5F * sRef0 + 1e-6F;
+        for (std::size_t k = 0; k < K; ++k) {
+            const float deq = static_cast<float>(qGot[k]) * sGot[0];
+            const float d   = std::fabs(deq - xh[k]);
+            if (!(d <= tol0)) {
+                std::ostringstream os;
+                os << "GpuOps::selfTest[x_quant_i8]: row 0 dequant "
+                   << "mismatch at k=" << k << " x=" << xh[k]
+                   << " q=" << static_cast<int>(qGot[k])
+                   << " deq=" << deq << " diff=" << d
+                   << " tol=" << tol0;
+                throw std::runtime_error(os.str());
+            }
+        }
+
+        // Row 1: all-zero input → scale=0, all quants=0.
+        if (!(sGot[1] == 0.0F)) {
+            std::ostringstream os;
+            os << "GpuOps::selfTest[x_quant_i8]: zero-row scale[1] "
+               << "expected 0 got=" << sGot[1];
+            throw std::runtime_error(os.str());
+        }
+        for (std::size_t k = 0; k < K; ++k) {
+            if (qGot[K + k] != 0) {
+                std::ostringstream os;
+                os << "GpuOps::selfTest[x_quant_i8]: zero-row quant "
+                   << "at k=" << k << " expected 0 got="
+                   << static_cast<int>(qGot[K + k]);
+                throw std::runtime_error(os.str());
+            }
+        }
+
+        allocator.deallocate(xUsm, xBytes);
+        allocator.deallocate(yUsm, yBytes);
+        allocator.deallocate(sUsm, sBytes);
+    }
+
     // qkv_split: full QKV path (hasV=true) plus alt-attention path
     // (hasV=false) on a tiny fixed shape.
     constexpr std::size_t M   = 3;
@@ -406,7 +494,8 @@ void GpuOps::selfTest(runtime::UsmAllocator& allocator) {
 
     _selfTestStatus = "ok";
     MM_LOG_INFO("gpuops",
-                "selfTest OK — qkv_split full + qk-only paths verified");
+                "selfTest OK — x_quant_i8 (M=2,K=64) + qkv_split full + "
+                "qk-only paths verified");
 }
 
 void GpuOps::qkvSplitAsync(const float* fused,
@@ -440,6 +529,25 @@ void GpuOps::qkvSplitAsync(const float* fused,
     _qkvSplitKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
     _queue.appendLaunch(_qkvSplitKernel,
                         groupsForN(total, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::xQuantI8Async(const float* x,
+                           std::int8_t* y,
+                           float*       scale,
+                           std::size_t  M,
+                           std::size_t  K) {
+    if (M == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t Ki = toInt32(K, "xQuantI8 K");
+    _xQuantI8Kernel.setPtr(0, x);
+    _xQuantI8Kernel.setPtr(1, y);
+    _xQuantI8Kernel.setPtr(2, scale);
+    _xQuantI8Kernel.setValue<std::int32_t>(3, Ki);
+    _xQuantI8Kernel.setGroupSize(kXQuantI8LocalSize, 1, 1);
+    // One workgroup per row.
+    _queue.appendLaunch(_xQuantI8Kernel,
+                        static_cast<std::uint32_t>(M), 1, 1);
 }
 
 void GpuOps::attentionAsync(const float* q,

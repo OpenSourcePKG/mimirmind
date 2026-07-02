@@ -98,6 +98,8 @@ set(KERNEL_SOURCES
     kernels/attention_flash_partial.cl
     kernels/attention_flash_merge.cl
     kernels/scaled_add_residual.cl
+    kernels/x_quant_i8.cl
+    kernels/matmul_q8_0_vec_dp4a.cl
 )
 
 set(KERNEL_SPV_FILES "")

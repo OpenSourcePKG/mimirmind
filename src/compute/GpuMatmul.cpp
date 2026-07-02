@@ -129,6 +129,24 @@ GpuMatmul::GpuMatmul(runtime::L0Context& ctx, runtime::CommandQueue& queue)
         first = false;
     }
 
+    // M8.H.1 — DP4A Q8_0 matvec. Guarded because the extension is not
+    // universally advertised on older Intel iGPUs; a failure here just
+    // disables the DP4A path (callers fall back to the plain matvec).
+    try {
+        _q8_0Dp4aSlot.emplace(loadSlot("matmul_q8_0_vec_dp4a"));
+        MM_LOG_INFO("gpummm",
+                    "GpuMatmul: matmul_q8_0_vec_dp4a loaded (local={}, sg={}, "
+                    "{} outputs/group)",
+                    kDp4aLocalSize, kDp4aSubgroupSize, kDp4aOutputsPerGroup);
+    } catch (const std::exception& e) {
+        MM_LOG_WARN("gpummm",
+                    "GpuMatmul: matmul_q8_0_vec_dp4a load failed ({}) — "
+                    "DP4A path disabled, Q8_0 matvec stays on the FP32-dequant "
+                    "kernel",
+                    e.what());
+        _q8_0Dp4aSlot.reset();
+    }
+
     MM_LOG_INFO("gpummm",
                 "GpuMatmul ready — {} kernels loaded, local_size={} "
                 "(sg={}, {} outputs/group). Autotune pending — call "
@@ -448,6 +466,52 @@ void GpuMatmul::matmul(model::GgmlType type,
                        float*          scratch) {
     matmulAsync(type, W, N, K, X, M, Y, scratch);
     sync();
+}
+
+void GpuMatmul::matmulQ8_0Dp4aAsync(const std::int8_t* Xq,
+                                    const float*       Xscale,
+                                    const void*        W,
+                                    std::size_t        N,
+                                    std::size_t        K,
+                                    std::size_t        M,
+                                    float*             Y) {
+    if (!_q8_0Dp4aSlot.has_value()) {
+        throw std::runtime_error(
+            "GpuMatmul::matmulQ8_0Dp4aAsync: DP4A kernel not loaded on "
+            "this iGPU — check dp4aAvailable() before calling");
+    }
+    if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
+    if (K % 32 != 0) {
+        throw std::runtime_error(
+            "GpuMatmul::matmulQ8_0Dp4aAsync: K=" + std::to_string(K) +
+            " is not a multiple of 32 (Q8_0 block size)");
+    }
+
+    runtime::GpuKernel& kern = _q8_0Dp4aSlot->kernel;
+    kern.setGroupSize(kDp4aLocalSize, 1, 1);
+    kern.setValue<std::int32_t>(4, static_cast<std::int32_t>(K));
+    kern.setValue<std::int32_t>(5, static_cast<std::int32_t>(N));
+
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (N + kDp4aOutputsPerGroup - 1) / kDp4aOutputsPerGroup);
+
+    // One appendLaunch per row of X. Same rationale as matmulAsync's
+    // matvec loop — args are captured at append time so per-row setPtr
+    // does not affect prior recorded commands.
+    for (std::size_t m = 0; m < M; ++m) {
+        const std::int8_t* xqRow = Xq + m * K;
+        const float*       xsRow = Xscale + m;
+        float*             yRow  = Y + m * N;
+
+        kern.setPtr(0, xqRow);
+        kern.setPtr(1, xsRow);
+        kern.setPtr(2, W);
+        kern.setPtr(3, yRow);
+
+        _queue.appendLaunch(kern, nGroups, 1, 1);
+    }
 }
 
 void GpuMatmul::sync() {

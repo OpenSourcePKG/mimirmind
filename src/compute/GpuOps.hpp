@@ -5,6 +5,7 @@
 #include "runtime/GpuModule.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -130,6 +131,18 @@ public:
                                 float        scale,
                                 std::size_t  n);
 
+    /// Per-row symmetric int8 quantisation of an [M, K] f32 matrix.
+    /// Writes int8 quants into `y` and per-row scales into `scale`
+    /// (scale[m] = max_k(|x[m, k]|) / 127). Feeds the DP4A Q8_0 matmul
+    /// (M8.H.1) — the matmul consumes `y` + `scale` alongside the Q8_0
+    /// weight blocks. Zero-input rows produce scale=0 and all-zero
+    /// quants, which round-trip back to zero through the matmul.
+    void xQuantI8Async(const float*   x,
+                       std::int8_t*   y,
+                       float*         scale,
+                       std::size_t    M,
+                       std::size_t    K);
+
     /// Scatter the output of a fused QKV matmul into the separate Q, K,
     /// V destinations. `fused` has shape [M, Nq + Nkv * (1 + hasV)];
     /// `Yq` [M, Nq]; `Yk` [M, Nkv]; `Yv` [M, Nkv] — the latter may be
@@ -248,6 +261,9 @@ private:
     runtime::GpuModule     _qkvSplitModule;
     runtime::GpuKernel     _qkvSplitKernel;
 
+    runtime::GpuModule     _xQuantI8Module;
+    runtime::GpuKernel     _xQuantI8Kernel;
+
     std::string            _selfTestStatus{"pending"};
 
     // Persistent USM scratch for the FlashAttention partial/merge
@@ -260,6 +276,8 @@ private:
     static constexpr std::uint32_t kRmsnormLocalSize     = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;
     static constexpr std::uint32_t kRopeLocalSize        = 256;
+    // Must match X_QUANT_I8_LOCAL in kernels/x_quant_i8.cl.
+    static constexpr std::uint32_t kXQuantI8LocalSize    = 128;
     // Must match ATTN_LOCAL / ATTN_SG in kernels/attention.cl.
     static constexpr std::uint32_t kAttentionLocalSize   = 16;
 

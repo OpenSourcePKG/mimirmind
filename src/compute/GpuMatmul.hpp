@@ -96,6 +96,29 @@ public:
                      float*          Y,
                      float*          scratch);
 
+    /// M8.H.1 — DP4A Q8_0 matvec with pre-quantised int8 activation.
+    /// Y [M, N] = Xq [M, K] (int8) × Xscale [M] × W [N, K]^T (Q8_0).
+    /// The activation is expected to already have been produced by
+    /// GpuOps::xQuantI8Async (per-row symmetric int8, scale = amax/127).
+    /// Async — call sync() before reading Y from the CPU.
+    ///
+    /// Available only when the DP4A extension resolved at module load;
+    /// query via dp4aAvailable() first. Throws if unavailable.
+    void matmulQ8_0Dp4aAsync(const std::int8_t* Xq,
+                             const float*       Xscale,
+                             const void*        W,
+                             std::size_t        N,
+                             std::size_t        K,
+                             std::size_t        M,
+                             float*             Y);
+
+    /// True when matmul_q8_0_vec_dp4a loaded successfully. False when
+    /// the SPV or the DP4A extension itself was unavailable on the
+    /// target iGPU; callers must fall back to the plain matvec path.
+    [[nodiscard]] bool dp4aAvailable() const noexcept {
+        return _q8_0Dp4aSlot.has_value();
+    }
+
     /// Flush any pending appends (close + execute + sync + reset). Safe
     /// to call when there's no pending work — cheap no-op.
     void sync();
@@ -139,6 +162,14 @@ private:
     // Populated at construction by iterating the QuantType registry.
     std::unordered_map<model::GgmlType, Entry> _entries;
 
+    // M8.H.1 — DP4A Q8_0 matvec kernel. Loaded eagerly in the ctor;
+    // nullopt when the SPV or the DP4A extension itself is unavailable
+    // on the current iGPU. Kept separate from `_entries` because it
+    // takes a different argument list (Xq + Xscale) so the generic
+    // matmulAsync dispatcher can't drive it — the autotune integration
+    // (M8.H.3) is what will pick it against MATVEC / GEMM per QuantType.
+    std::optional<KernelSlot> _q8_0Dp4aSlot;
+
     // M5h: workgroup of 64 threads = 4 subgroups of 16, each subgroup
     // co-computes ONE output via sub_group_reduce_add. So a workgroup
     // emits 4 outputs and we need ceil(N/4) workgroups. Keep in sync
@@ -146,6 +177,14 @@ private:
     static constexpr std::uint32_t kLocalSize        = 64;
     static constexpr std::uint32_t kSubgroupSize     = 16;
     static constexpr std::uint32_t kOutputsPerGroup  = kLocalSize / kSubgroupSize;
+
+    // Must match MATMUL_Q8_0_DP4A_LOCAL / _SG in
+    // kernels/matmul_q8_0_vec_dp4a.cl. SG=8 fits the 8 char4 chunks per
+    // Q8_0 block with no idle lanes; 8 outputs per workgroup.
+    static constexpr std::uint32_t kDp4aLocalSize       = 64;
+    static constexpr std::uint32_t kDp4aSubgroupSize    = 8;
+    static constexpr std::uint32_t kDp4aOutputsPerGroup =
+        kDp4aLocalSize / kDp4aSubgroupSize;
 };
 
 } // namespace mimirmind::compute
