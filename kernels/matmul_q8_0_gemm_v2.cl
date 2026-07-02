@@ -1,29 +1,23 @@
-// M8.K.1 experimental Q8_0 GEMM — v1 with a bigger M-tile and a
-// sub-group broadcast for the per-block scale.
+// M8.K.1 revised — Q8_0 GEMM with reduced SLM footprint.
 //
-// Live-Autotune data (2026-07-02): v1 GEMM lost 2.2× to matvec-loop at
-// every M-bucket (16 / 64 / 256). Per-op diagnosis showed matmul is
-// 48 % of decode-time so a GEMM that actually wins would unlock real
-// prefill headroom AND make M9.11 speculative decoding viable. Root
-// cause hypothesis: v1's per-workgroup output volume amortises W
-// dequant work over only M_TILE=8 rows, and every lane redundantly
-// loads the same fp16 block scale from global memory.
+// v2-first-attempt (2026-07-02 L0_TARGET_HOST) doubled M_TILE to 16
+// and lost 2.35× to v1 across every M-bucket. Post-hoc root cause:
+// 64 KiB SLM per workgroup halved the resident-WG count on Xe-LPG's
+// per-Vector-Engine budget, killing occupancy.
 //
-// Changes vs matmul_q8_0_gemm.cl:
-//   1. M_TILE = 16 (was 8). Doubles W-reuse per workgroup at the cost
-//      of doubling the xTile SLM (32 KiB → 64 KiB per WG) and doubling
-//      the per-lane accumulator array (sum[8] → sum[16] float).
-//      Xe-LPG's per-WG SLM budget is 64 KiB so this sits right at the
-//      edge; if the driver refuses the layout we roll back to M_TILE=8
-//      on this kernel and pick a different tuning axis.
-//   2. Sub-group broadcast for `d`. v1 has every lane in a 16-lane SG
-//      re-read the same 2-byte fp16 scale from global; v2 has lane 0
-//      read it and `sub_group_broadcast()` distribute. Removes 15/16
-//      of the block-scale global reads.
+// This revision goes the OTHER way. Everything is identical to v1
+// (matmul_q8_0_gemm.cl) except X_TILE_ELEMENTS shrinks from 1024 to
+// 256. That drops SLM from 32 KiB to 8 KiB per WG — 4× more workgroups
+// resident on the Xe-LPG scheduler than v1, and 16× more than the
+// v2-first-attempt.
 //
-// Everything else (WG=64, SG=16, 4 outputs per WG, X_TILE=1024) is
-// deliberately unchanged so any perf delta is attributable to the two
-// axes above.
+// Everything else (M_TILE=8, WG=64, SG=16, 4 outputs/WG) is deliberately
+// unchanged so any perf delta is attributable to the SLM axis alone.
+// If v2-revised wins → matvec's small SLM footprint is confirmed as
+// the real Xe-LPG scaling axis, and we chase further along that
+// direction. If it loses → GEMM is architecturally the wrong shape on
+// Xe-LPG at Governor-throttled clocks and M8.K should be shelved for
+// speculative decoding / model swap.
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
@@ -37,7 +31,7 @@
 #endif
 
 #ifndef MATMUL_Q8_0_GEMM_V2_M_TILE
-#define MATMUL_Q8_0_GEMM_V2_M_TILE 16
+#define MATMUL_Q8_0_GEMM_V2_M_TILE 8
 #endif
 
 #define MATMUL_Q8_0_V2_OUTPUTS_PER_GROUP \
@@ -46,9 +40,11 @@
 #define Q8_0_BLOCK_ELEMENTS 32
 #define Q8_0_BLOCK_BYTES    34
 
-// 1024 elements = 32 blocks per K-tile.
-// SLM: X_TILE_ELEMENTS * M_TILE * 4 B = 1024 * 16 * 4 = 64 KiB / WG.
-#define X_TILE_ELEMENTS 1024
+// 256 elements = 8 blocks per K-tile.
+// SLM: X_TILE_ELEMENTS * M_TILE * 4 B = 256 * 8 * 4 = 8 KiB / WG.
+// v1 had 32 KiB; this v2 revision has 4× smaller footprint so 4× more
+// WGs can sit resident on each Xe Vector Engine.
+#define X_TILE_ELEMENTS 256
 
 __attribute__((reqd_work_group_size(MATMUL_Q8_0_V2_LOCAL, 1, 1)))
 __attribute__((intel_reqd_sub_group_size(MATMUL_Q8_0_V2_SG)))
@@ -83,9 +79,6 @@ __kernel void matmul_q8_0_gemm_v2(
     for (int tile = 0; tile < K; tile += X_TILE_ELEMENTS) {
         const int tileK = min(X_TILE_ELEMENTS, K - tile);
 
-        // Cooperative X-tile load — one thread per (m-slot, k-slot) pair
-        // over the workgroup. Matches v1's stride pattern so any perf
-        // change here is purely from the doubled tile size.
         const int loadTotal = MATMUL_Q8_0_GEMM_V2_M_TILE * X_TILE_ELEMENTS;
         for (int idx = tid; idx < loadTotal; idx += lsize) {
             const int  mSlot = idx / X_TILE_ELEMENTS;
@@ -107,24 +100,13 @@ __kernel void matmul_q8_0_gemm_v2(
 
             for (int b = blockStart; b < blockEnd; ++b) {
                 __global const uchar* block = row + b * Q8_0_BLOCK_BYTES;
-
-                // Sub-group broadcast for the fp16 scale. Only lane 0
-                // reads global; the other 15 lanes get the value via
-                // register-file broadcast. Removes 15/16 of the block-
-                // scale global reads.
-                float d;
-                if (sgLocal == 0) {
-                    d = vload_half(0, (__global const half*)(block));
-                }
-                d = sub_group_broadcast(d, 0);
-
+                const float d =
+                    vload_half(0, (__global const half*)(block));
                 __global const char* qs =
                     (__global const char*)(block + 2);
 
                 const int xLocalBase = (b - blockStart) * Q8_0_BLOCK_ELEMENTS;
 
-                // Same 2-quants-per-lane stride as v1. Each mad fans
-                // out to M_TILE=16 accumulators (double v1's 8-fanout).
                 for (int l = sgLocal; l < Q8_0_BLOCK_ELEMENTS;
                      l += MATMUL_Q8_0_V2_SG) {
                     const float w = d * (float)qs[l];

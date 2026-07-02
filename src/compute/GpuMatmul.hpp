@@ -282,9 +282,12 @@ private:
         kDp4aLocalSize / kDp4aSubgroupSize;
 
     // M8.K.1 v2 GEMM — must match MATMUL_Q8_0_GEMM_V2_M_TILE in
-    // kernels/matmul_q8_0_gemm_v2.cl. Doubled M-tile keeps the same
-    // WG/SG geometry as v1 so only the amortisation axis changes.
-    static constexpr std::size_t kGemmV2MTile = 16;
+    // kernels/matmul_q8_0_gemm_v2.cl. The first attempt (M_TILE=16)
+    // lost 2.35× to v1 on Xe-LPG (SLM overflow → occupancy collapse).
+    // The revised v2 keeps M_TILE=8 and shrinks X_TILE_ELEMENTS to
+    // 256 so SLM drops to 8 KiB/WG (v1: 32 KiB/WG) — 4× more resident
+    // WGs on the Xe-LPG scheduler.
+    static constexpr std::size_t kGemmV2MTile = 8;
 
     // Worst-case shape the internal DP4A scratch is sized for. Anything
     // beyond falls back to vec/gemm at dispatch time with a one-shot log.

@@ -175,8 +175,10 @@ GpuMatmul::GpuMatmul(runtime::L0Context&    ctx,
             it->second.gemmV2.emplace(loadSlot("matmul_q8_0_gemm_v2"));
             it->second.gemmV2MTile = kGemmV2MTile;
             MM_LOG_INFO("gpummm",
-                        "GpuMatmul: matmul_q8_0_gemm_v2 loaded (M_TILE={}) — "
-                        "v2 path benched alongside v1 in autotune",
+                        "GpuMatmul: matmul_q8_0_gemm_v2 loaded "
+                        "(M_TILE={}, X_TILE=256, SLM=8 KiB/WG — "
+                        "shrunk from v1's 32 KiB/WG for 4× more resident "
+                        "WGs on Xe-LPG) — v2 path benched alongside v1",
                         kGemmV2MTile);
         } catch (const std::exception& e) {
             MM_LOG_WARN("gpummm",
@@ -545,7 +547,8 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
 
             (void)v2Tile;
             MM_LOG_INFO("gpummm",
-                        "autotune: Q8_0 GEMM v2 (M_TILE={}) — "
+                        "autotune: Q8_0 GEMM v2 (M_TILE={}, X_TILE=256, "
+                        "SLM=8 KiB/WG) — "
                         "M=16 v2={:.2f} ms (v1 {:.2f}) | "
                         "M=64 v2={:.2f} ms (v1 {:.2f}) | "
                         "M=256 v2={:.2f} ms (v1 {:.2f})",
