@@ -9,19 +9,29 @@
 //   Y:      [N]     F32
 //
 // Compared to matmul_q8_0_vec (M8.G), the inner accumulator stays in
-// int32 across a whole 32-element block (accumulated via DP4A
-// dot_4x8packed_ss_int in char4 chunks), and only the per-block scale
-// mult + xScale mult happens in fp32. That's 4× fewer FP32 muls in the
-// hot loop and the char4 dot maps to Xe-LPG's one-per-cycle IDPAS
-// instruction.
+// int32 across each 32-element block via DP4A (dot_4x8packed_ss_int),
+// with only one fp32 multiply per block for d × xScale. That's 4×
+// fewer FP32 muls in the hot loop and the char4 dot maps to Xe-LPG's
+// IDPAS instruction.
 //
-// Launch geometry (differs from matmul_q8_0_vec — SG=8 fits the 8
-// char4 chunks per block cleanly, so each subgroup lane handles one
-// full DP4A per block with no idle lanes):
+// Launch geometry (M8.H.3 revision): matches matmul_q8_0_vec exactly
+// so the two kernels are apples-to-apples in autotune. The SG=8
+// variant we shipped in M8.H.1 was 30 % slower than plain matvec on
+// Xe-LPG at 800 MHz (autotune bench, 2026-07-02) — the "no idle
+// lanes" argument turned out to matter less than matching the
+// hardware's preferred SG width.
+//
 //   local_size_x          = MATMUL_Q8_0_DP4A_LOCAL  (64)
-//   sub_group_size        = MATMUL_Q8_0_DP4A_SG    (8) via intel_reqd_sub_group_size
-//   outputs per workgroup = LOCAL / SG              (= 8)
-//   global_size_x         = ceil(N / 8) * 64
+//   sub_group_size        = MATMUL_Q8_0_DP4A_SG    (16) via intel_reqd_sub_group_size
+//   outputs per workgroup = LOCAL / SG              (= 4)
+//   global_size_x         = ceil(N / 4) * 64
+//
+// With 16 lanes but only 8 char4 chunks per 32-element block, each
+// outer iteration processes TWO consecutive Q8_0 blocks: lanes 0..7
+// cover block `b`, lanes 8..15 cover block `b+1`. Each lane owns one
+// char4 dot and multiplies by ITS block's d × xScale before
+// accumulating. sub_group_reduce_add at the end sums all 16 lane
+// contributions (64 element products = 2 blocks worth).
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
@@ -32,7 +42,7 @@
 #endif
 
 #ifndef MATMUL_Q8_0_DP4A_SG
-#define MATMUL_Q8_0_DP4A_SG 8
+#define MATMUL_Q8_0_DP4A_SG 16
 #endif
 
 #define MATMUL_Q8_0_DP4A_OUTPUTS_PER_GROUP \
@@ -40,8 +50,9 @@
 
 #define Q8_0_BLOCK_ELEMENTS 32
 #define Q8_0_BLOCK_BYTES    34
+#define Q8_0_BLOCK_CHAR4S   (Q8_0_BLOCK_ELEMENTS / 4)  // 8
 
-// 1024 elements = 32 blocks = 1 KiB SLM per workgroup (int8, so 4×
+// 1024 x elements = 32 blocks = 1 KiB SLM per workgroup (int8, so 4×
 // smaller than the fp32 tile in matmul_q8_0_vec).
 #define X_TILE_ELEMENTS 1024
 
@@ -58,8 +69,8 @@ __kernel void matmul_q8_0_vec_dp4a(
     __local char xTile[X_TILE_ELEMENTS];
 
     const int  wg      = (int)get_group_id(0);
-    const int  sgInWg  = (int)get_sub_group_id();           // 0..7
-    const int  sgLocal = (int)get_sub_group_local_id();     // 0..7
+    const int  sgInWg  = (int)get_sub_group_id();           // 0..3
+    const int  sgLocal = (int)get_sub_group_local_id();     // 0..15
     const int  tid     = (int)get_local_id(0);
     const int  lsize   = (int)get_local_size(0);
     const int  n       = wg * MATMUL_Q8_0_DP4A_OUTPUTS_PER_GROUP + sgInWg;
@@ -67,6 +78,12 @@ __kernel void matmul_q8_0_vec_dp4a(
     const int  nBlocks = K / Q8_0_BLOCK_ELEMENTS;
 
     const float xScale = *Xscale;
+
+    // Lane assignment for the 2-blocks-per-iteration pattern:
+    //   lanes 0..7  → block b,   char4 index sgLocal
+    //   lanes 8..15 → block b+1, char4 index sgLocal - 8
+    const int laneBlockOff = sgLocal >> 3;               // 0 or 1
+    const int laneChar4Idx = sgLocal & (Q8_0_BLOCK_CHAR4S - 1);  // 0..7
 
     float sum = 0.0f;
 
@@ -85,25 +102,27 @@ __kernel void matmul_q8_0_vec_dp4a(
             const int blocksInTile = X_TILE_ELEMENTS / Q8_0_BLOCK_ELEMENTS;
             const int blockEnd     = min(blockStart + blocksInTile, nBlocks);
 
-            for (int b = blockStart; b < blockEnd; ++b) {
-                __global const uchar* block = row + b * Q8_0_BLOCK_BYTES;
-                const float d =
-                    vload_half(0, (__global const half*)(block));
-                __global const char* wq_ptr =
-                    (__global const char*)(block + 2);
+            for (int b = blockStart; b < blockEnd; b += 2) {
+                const int bMy = b + laneBlockOff;
+                if (bMy < blockEnd) {
+                    __global const uchar* block =
+                        row + bMy * Q8_0_BLOCK_BYTES;
+                    const float d =
+                        vload_half(0, (__global const half*)(block));
+                    __global const char* wq_ptr =
+                        (__global const char*)(block + 2);
 
-                const int xLocalBase =
-                    (b - blockStart) * Q8_0_BLOCK_ELEMENTS;
-                __local const char* xq_ptr = xTile + xLocalBase;
+                    const int xLocalBase =
+                        (bMy - blockStart) * Q8_0_BLOCK_ELEMENTS;
+                    __local const char* xq_ptr = xTile + xLocalBase;
 
-                // Each of the 8 subgroup lanes covers one char4 chunk of
-                // the 32-byte block — no idle lanes, no divergence.
-                const char4 wq = vload4(sgLocal, wq_ptr);
-                const char4 xq = vload4(sgLocal, xq_ptr);
-                const int   dp =
-                    dot_4x8packed_ss_int(as_uint(wq), as_uint(xq));
+                    const char4 wq = vload4(laneChar4Idx, wq_ptr);
+                    const char4 xq = vload4(laneChar4Idx, xq_ptr);
+                    const int   dp =
+                        dot_4x8packed_ss_int(as_uint(wq), as_uint(xq));
 
-                sum = mad((float)dp, d * xScale, sum);
+                    sum = mad((float)dp, d * xScale, sum);
+                }
             }
         }
 
