@@ -1300,6 +1300,7 @@ int runServe(const CliArgs& args) {
               << cfg.host << ":" << cfg.port
               << "\n  GET  /health\n"
                  "  GET  /v1/models\n"
+                 "  GET  /v1/system/info\n"
                  "  GET  /v1/system/status\n"
                  "  POST /v1/chat/completions  (stream=true supported)\n"
                  "  model id:           " << cfg.modelId << "\n"
