@@ -9,10 +9,12 @@
 #include "runtime/UsmAllocator.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <string>
@@ -29,6 +31,24 @@ bool envSet(const char* name) noexcept {
     if (v == nullptr) return false;
     const std::string_view s{v};
     return !s.empty() && s != "0" && s != "false" && s != "off";
+}
+
+// M8.J — the M-values benched by autotune() and used to derive
+// `Entry::gemmMinM`. Must match `AutotuneReport::mBuckets`.
+constexpr std::array<std::size_t, 3> kAutotuneMBuckets = {16, 64, 256};
+constexpr std::size_t kGemmMinMNever =
+    std::numeric_limits<std::size_t>::max();
+
+// Parse MIMIRMIND_GEMM_MIN_M as a positive integer. Returns 0 (which
+// the caller interprets as "not set") on any parse failure, negative
+// value, or overflow.
+std::size_t envGemmMinM() noexcept {
+    const char* v = std::getenv("MIMIRMIND_GEMM_MIN_M");
+    if (v == nullptr || v[0] == '\0') return 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(v, &end, 10);
+    if (end == v || *end != '\0' || parsed <= 0) return 0;
+    return static_cast<std::size_t>(parsed);
 }
 
 // Synthesise a plausible block-quantised weight buffer for the given
@@ -115,13 +135,19 @@ GpuMatmul::GpuMatmul(runtime::L0Context&    ctx,
             gemmMTile = qt->gpuMatmulGemmMTile();
         }
 
-        // useGemm stays false until autotune() runs. This makes the
-        // pre-autotune default the safe matvec-loop path.
+        // gemmMinM defaults to kGemmMinMNever until autotune() runs, so
+        // the pre-autotune default is the safe matvec-loop path even
+        // for M=Mmax requests that arrive before autotune finishes.
         _entries.emplace(qt->ggmlType(),
                          Entry{std::move(vecSlot),
                                std::move(gemmSlot),
                                gemmMTile,
-                               /*useGemm=*/false});
+                               kGemmMinMNever,   // gemmMinM
+                               false,            // useDp4a
+                               {},               // vecMsAtM
+                               {},               // gemmMsAtM
+                               0.0,              // lastDp4aMs
+                               ""});             // autotuneSource
 
         if (!first) {
             loaded << " + ";
@@ -187,22 +213,37 @@ GpuMatmul::~GpuMatmul() {
 
 void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                          std::size_t            hiddenDim,
-                         std::size_t            mBatch) {
-    if (mBatch < 2) {
-        // Autotune only meaningful for M > 1 (the matvec-vs-GEMM decision
-        // only matters on the batched path).
-        mBatch = 16;
-    }
+                         std::size_t            /*mBatchDeprecated*/) {
+    // M8.J — M-buckets replace the single `mBatch` argument. The old
+    // parameter is kept in the signature for source compatibility but
+    // ignored; every bench-time decision runs against kAutotuneMBuckets.
+    const bool forceDisable     = envSet("MIMIRMIND_DISABLE_GEMM");
+    const bool forceEnable      = envSet("MIMIRMIND_FORCE_GEMM");
+    const bool forceDisableDp4a = envSet("MIMIRMIND_DISABLE_DP4A");
+    const bool forceEnableDp4a  = envSet("MIMIRMIND_FORCE_DP4A");
+    const std::size_t envMinM   = envGemmMinM();
 
-    const bool forceDisable       = envSet("MIMIRMIND_DISABLE_GEMM");
-    const bool forceEnable        = envSet("MIMIRMIND_FORCE_GEMM");
-    const bool forceDisableDp4a   = envSet("MIMIRMIND_DISABLE_DP4A");
-    const bool forceEnableDp4a    = envSet("MIMIRMIND_FORCE_DP4A");
+    // MIMIRMIND_GEMM_MIN_M=<N> — pin the crossover threshold on every
+    // type that has a GEMM kernel and skip the timing bench entirely.
+    // Wins over FORCE_GEMM / DISABLE_GEMM if set. Debug-only lever.
+    if (envMinM > 0) {
+        for (auto& [type, entry] : _entries) {
+            (void)type;
+            entry.gemmMinM =
+                entry.gemm.has_value() ? envMinM : kGemmMinMNever;
+            entry.autotuneSource = "env_gemm_min_m";
+        }
+        MM_LOG_INFO("gpummm",
+                    "autotune: MIMIRMIND_GEMM_MIN_M={} — every type with "
+                    "a GEMM kernel pinned to that threshold, timing bench "
+                    "skipped", envMinM);
+        return;
+    }
 
     if (forceDisable) {
         for (auto& [type, entry] : _entries) {
             (void)type;
-            entry.useGemm = false;
+            entry.gemmMinM = kGemmMinMNever;
             entry.autotuneSource = "env_disable_gemm";
         }
         MM_LOG_INFO("gpummm",
@@ -213,43 +254,40 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
     if (forceEnable) {
         for (auto& [type, entry] : _entries) {
             (void)type;
-            entry.useGemm = entry.gemm.has_value();
+            entry.gemmMinM =
+                entry.gemm.has_value() ? std::size_t{2} : kGemmMinMNever;
             entry.autotuneSource = "env_force_gemm";
         }
         MM_LOG_INFO("gpummm",
                     "autotune: MIMIRMIND_FORCE_GEMM=1 — every type with "
-                    "a GEMM kernel pinned to the GEMM path");
+                    "a GEMM kernel pinned to the GEMM path (gemmMinM=2)");
         return;
     }
 
-    // MIMIRMIND_FORCE_DP4A=1 pins Q8_0 to the DP4A path without a
-    // timing bench (still parity-checked below in the loop).
     if (forceEnableDp4a && _q8_0Dp4aSlot.has_value()) {
-        const auto it = _entries.find(model::GgmlType::Q8_0);
-        if (it != _entries.end()) {
-            MM_LOG_INFO("gpummm",
-                        "autotune: MIMIRMIND_FORCE_DP4A=1 — Q8_0 will be "
-                        "pinned to the DP4A path after parity gate");
-        }
+        MM_LOG_INFO("gpummm",
+                    "autotune: MIMIRMIND_FORCE_DP4A=1 — Q8_0 will be "
+                    "pinned to the DP4A path after parity gate");
     }
 
     // Round N and K to super-block-aligned sizes so every quant type
     // sees the same shape. Q4_K/Q6_K need K % 256 == 0; Q8_0 needs
     // K % 32 == 0. Aligning to 256 covers all three.
-    const std::size_t K = ((hiddenDim + 255) / 256) * 256;
-    const std::size_t N = K;
-    const std::size_t M = mBatch;
+    const std::size_t K    = ((hiddenDim + 255) / 256) * 256;
+    const std::size_t N    = K;
+    const std::size_t Mmax = kAutotuneMBuckets.back();
 
-    // Shared X / Y / scratch USM — reused across every type.
-    const std::size_t xBytes = M * K * sizeof(float);
-    const std::size_t yBytes = M * N * sizeof(float);
+    // Shared X / Y / scratch USM sized for the largest bucket; smaller
+    // buckets slice a prefix of the same buffer.
+    const std::size_t xBytes = Mmax * K * sizeof(float);
+    const std::size_t yBytes = Mmax * N * sizeof(float);
     const std::size_t sBytes = K * sizeof(float);
     void* xUsm = allocator.allocate(xBytes);
     void* yUsm = allocator.allocate(yBytes);
     void* sUsm = allocator.allocate(sBytes);
 
     {
-        std::vector<float> xInit(M * K);
+        std::vector<float> xInit(Mmax * K);
         std::mt19937 rng{0xB00BB00BU};
         std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
         for (auto& v : xInit) v = dist(rng);
@@ -261,33 +299,35 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
     constexpr int nWarmup = 2;
     constexpr int nTimed  = 5;
 
+    using clk = std::chrono::steady_clock;
+
     for (auto& [type, entry] : _entries) {
         if (!entry.gemm.has_value()) {
-            // No GEMM to compare against — stay on matvec-loop.
-            entry.useGemm = false;
+            entry.gemmMinM = kGemmMinMNever;
             entry.autotuneSource = "no_gemm";
             continue;
         }
 
         const QuantType* qt = quantType(type);
         if (qt == nullptr) {
-            entry.useGemm = false;
+            entry.gemmMinM = kGemmMinMNever;
             entry.autotuneSource = "no_gemm";
             continue;
         }
 
         // Synthesise weights of size [N, K].
-        const std::size_t nSuper  = K / qt->blockElements();
-        const std::size_t wBytes  = N * nSuper * qt->blockBytes();
+        const std::size_t nSuper = K / qt->blockElements();
+        const std::size_t wBytes = N * nSuper * qt->blockBytes();
         void* wUsm = allocator.allocate(wBytes);
         fillSyntheticWeights(type,
                              static_cast<std::uint8_t*>(wUsm),
                              wBytes);
 
-        // Warmup: run one of each so both kernels are JIT'd.
+        // Warmup at Mmax — biggest cost, primes both kernels' JIT and
+        // the GEMM SLM staging path for the timing loop below.
         for (int i = 0; i < nWarmup; ++i) {
-            // matvec-loop
-            for (std::size_t m = 0; m < M; ++m) {
+            entry.gemmMinM = kGemmMinMNever;   // force matvec-loop
+            for (std::size_t m = 0; m < Mmax; ++m) {
                 matmulAsync(type, wUsm, N, K,
                             static_cast<const float*>(xUsm) + m * K,
                             /*M=*/1,
@@ -296,28 +336,26 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
             }
             _queue.flush();
 
-            // GEMM — force it by temporarily flipping useGemm on.
-            entry.useGemm = true;
+            entry.gemmMinM = 2;                // force GEMM
             matmulAsync(type, wUsm, N, K,
-                        static_cast<const float*>(xUsm), M,
+                        static_cast<const float*>(xUsm), Mmax,
                         static_cast<float*>(yUsm),
                         static_cast<float*>(sUsm));
             _queue.flush();
-            entry.useGemm = false;
         }
 
-        // Parity gate — before we let GEMM win the timing race, verify
-        // the two paths compute the same values within tolerance on
-        // this iGPU. A driver bug or a broken SPV would otherwise
-        // silently corrupt inference. Small tolerance (5e-2) because
-        // synthetic random weights can produce large accumulator
-        // magnitudes; anything above that is a genuine kernel bug.
+        // Parity gate at Mmax — one shape, cheapest to verify at the
+        // largest realistic bench-size. If matvec and GEMM disagree
+        // beyond tolerance, the whole GEMM path is disabled for this
+        // type (gemmMinM = MAX). Wouldn't matter WHICH bucket we
+        // checked at; the kernels are shape-agnostic.
         {
-            std::vector<float> yVec(M * N);
-            std::vector<float> yGem(M * N);
+            const std::size_t elts = Mmax * N;
+            std::vector<float> yVec(elts);
+            std::vector<float> yGem(elts);
 
-            entry.useGemm = false;
-            for (std::size_t m = 0; m < M; ++m) {
+            entry.gemmMinM = kGemmMinMNever;
+            for (std::size_t m = 0; m < Mmax; ++m) {
                 matmulAsync(type, wUsm, N, K,
                             static_cast<const float*>(xUsm) + m * K,
                             /*M=*/1,
@@ -325,20 +363,19 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                             static_cast<float*>(sUsm));
             }
             _queue.flush();
-            std::memcpy(yVec.data(), yUsm, yBytes);
+            std::memcpy(yVec.data(), yUsm, elts * sizeof(float));
 
-            entry.useGemm = true;
+            entry.gemmMinM = 2;
             matmulAsync(type, wUsm, N, K,
-                        static_cast<const float*>(xUsm), M,
+                        static_cast<const float*>(xUsm), Mmax,
                         static_cast<float*>(yUsm),
                         static_cast<float*>(sUsm));
             _queue.flush();
-            entry.useGemm = false;
-            std::memcpy(yGem.data(), yUsm, yBytes);
+            std::memcpy(yGem.data(), yUsm, elts * sizeof(float));
 
             float maxDiff = 0.0F;
             float maxRel  = 0.0F;
-            for (std::size_t i = 0; i < yVec.size(); ++i) {
+            for (std::size_t i = 0; i < elts; ++i) {
                 const float d = std::fabs(yVec[i] - yGem[i]);
                 if (d > maxDiff) maxDiff = d;
                 const float ref = std::fabs(yVec[i]);
@@ -355,7 +392,7 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                             "maxDiff={:.6g} maxRel={:.6g}. Pinning to "
                             "matvec-loop and skipping timing bench.",
                             qt->name(), maxDiff, maxRel);
-                entry.useGemm = false;
+                entry.gemmMinM       = kGemmMinMNever;
                 entry.autotuneSource = "parity_fail";
                 allocator.deallocate(wUsm, wBytes);
                 continue;
@@ -366,80 +403,18 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                         qt->name(), maxDiff, maxRel);
         }
 
-        using clk = std::chrono::steady_clock;
+        // Timing loop — bench matvec-loop and GEMM at every M bucket.
+        // Buckets are held in a stack array so the per-M-medians land
+        // straight into `entry.{vec,gemm}MsAtM` at the matching index.
+        for (std::size_t bi = 0; bi < kAutotuneMBuckets.size(); ++bi) {
+            const std::size_t Mb = kAutotuneMBuckets[bi];
 
-        // Timed matvec-loop: M matmulAsyncs + one flush per iteration.
-        std::vector<double> vecMs;
-        vecMs.reserve(nTimed);
-        for (int it = 0; it < nTimed; ++it) {
-            const auto t0 = clk::now();
-            for (std::size_t m = 0; m < M; ++m) {
-                matmulAsync(type, wUsm, N, K,
-                            static_cast<const float*>(xUsm) + m * K,
-                            /*M=*/1,
-                            static_cast<float*>(yUsm) + m * N,
-                            static_cast<float*>(sUsm));
-            }
-            _queue.flush();
-            const auto t1 = clk::now();
-            std::chrono::duration<double, std::milli> dt = t1 - t0;
-            vecMs.push_back(dt.count());
-        }
-
-        // Timed GEMM.
-        entry.useGemm = true;
-        std::vector<double> gemmMs;
-        gemmMs.reserve(nTimed);
-        for (int it = 0; it < nTimed; ++it) {
-            const auto t0 = clk::now();
-            matmulAsync(type, wUsm, N, K,
-                        static_cast<const float*>(xUsm), M,
-                        static_cast<float*>(yUsm),
-                        static_cast<float*>(sUsm));
-            _queue.flush();
-            const auto t1 = clk::now();
-            std::chrono::duration<double, std::milli> dt = t1 - t0;
-            gemmMs.push_back(dt.count());
-        }
-
-        const double vecMed  = medianMs(std::move(vecMs));
-        const double gemmMed = medianMs(std::move(gemmMs));
-
-        // 5 % margin — noise floor on the iGPU shifts by more than 1-2 %
-        // between runs. Below that we prefer the matvec-loop as the
-        // conservative default.
-        const bool pickGemm = (gemmMed * 1.05 < vecMed);
-        entry.useGemm        = pickGemm;
-        entry.lastVecMs      = vecMed;
-        entry.lastGemmMs     = gemmMed;
-        entry.autotuneSource = "bench";
-
-        MM_LOG_INFO("gpummm",
-                    "autotune: {} N={} K={} M={} — matvec-loop {:.2f} ms, "
-                    "gemm {:.2f} ms → picked {}",
-                    qt->name(), N, K, M, vecMed, gemmMed,
-                    pickGemm ? "gemm" : "matvec-loop");
-
-        // M8.H.3 — DP4A 3rd variant for Q8_0. Only runs after the
-        // matvec-vs-gemm decision above so the existing telemetry stays
-        // meaningful. Overrides useGemm on win.
-        if (type == model::GgmlType::Q8_0
-            && _q8_0Dp4aSlot.has_value()
-            && !forceDisableDp4a)
-        {
-            const std::size_t xqBytes = M * K * sizeof(std::int8_t);
-            const std::size_t xsBytes = M * sizeof(float);
-            if (xqBytes > _dp4aXqBytes || xsBytes > _dp4aScaleBytes) {
-                MM_LOG_WARN("gpummm",
-                            "autotune: DP4A bench for {} skipped — "
-                            "bench shape (M={}, K={}) exceeds scratch "
-                            "bounds. Bump kDp4aMax* together.",
-                            qt->name(), M, K);
-            } else {
-                entry.useDp4a = false;
-                entry.useGemm = false;
-                std::vector<float> yVec(M * N);
-                for (std::size_t m = 0; m < M; ++m) {
+            entry.gemmMinM = kGemmMinMNever;   // force matvec-loop
+            std::vector<double> vecMs;
+            vecMs.reserve(nTimed);
+            for (int it = 0; it < nTimed; ++it) {
+                const auto t0 = clk::now();
+                for (std::size_t m = 0; m < Mb; ++m) {
                     matmulAsync(type, wUsm, N, K,
                                 static_cast<const float*>(xUsm) + m * K,
                                 /*M=*/1,
@@ -447,47 +422,122 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                                 static_cast<float*>(sUsm));
                 }
                 _queue.flush();
-                std::memcpy(yVec.data(), yUsm, yBytes);
+                const auto t1 = clk::now();
+                vecMs.push_back(
+                    std::chrono::duration<double, std::milli>(t1 - t0).count());
+            }
+            entry.vecMsAtM[bi] = medianMs(std::move(vecMs));
+
+            entry.gemmMinM = 2;                // force GEMM
+            std::vector<double> gemmMs;
+            gemmMs.reserve(nTimed);
+            for (int it = 0; it < nTimed; ++it) {
+                const auto t0 = clk::now();
+                matmulAsync(type, wUsm, N, K,
+                            static_cast<const float*>(xUsm), Mb,
+                            static_cast<float*>(yUsm),
+                            static_cast<float*>(sUsm));
+                _queue.flush();
+                const auto t1 = clk::now();
+                gemmMs.push_back(
+                    std::chrono::duration<double, std::milli>(t1 - t0).count());
+            }
+            entry.gemmMsAtM[bi] = medianMs(std::move(gemmMs));
+        }
+
+        // Derive gemmMinM: smallest bucket-M where gemm × 1.05 < vec.
+        // 5 % margin is the noise floor between iGPU runs; below that we
+        // stick with matvec-loop as the conservative default.
+        entry.gemmMinM = kGemmMinMNever;
+        for (std::size_t bi = 0; bi < kAutotuneMBuckets.size(); ++bi) {
+            if (entry.gemmMsAtM[bi] * 1.05 < entry.vecMsAtM[bi]) {
+                entry.gemmMinM = kAutotuneMBuckets[bi];
+                break;
+            }
+        }
+        entry.autotuneSource = "bench";
+
+        MM_LOG_INFO("gpummm",
+                    "autotune: {} N={} K={} — "
+                    "M=16 vec={:.2f}/gemm={:.2f} ms | "
+                    "M=64 vec={:.2f}/gemm={:.2f} ms | "
+                    "M=256 vec={:.2f}/gemm={:.2f} ms → "
+                    "gemmMinM={}",
+                    qt->name(), N, K,
+                    entry.vecMsAtM[0], entry.gemmMsAtM[0],
+                    entry.vecMsAtM[1], entry.gemmMsAtM[1],
+                    entry.vecMsAtM[2], entry.gemmMsAtM[2],
+                    entry.gemmMinM == kGemmMinMNever
+                        ? std::string{"never"}
+                        : std::to_string(entry.gemmMinM));
+
+        // M8.H.3 — DP4A 3rd variant for Q8_0. Benched at M=16 only
+        // (kAutotuneMBuckets[0]); the current DP4A path loses at every
+        // observed M so extending the bench across all buckets would
+        // just make startup slower without changing outcomes. If DP4A
+        // ever wins at M=16 it applies to all M (useDp4a is a plain
+        // bool, not per-bucket), which is fine — DP4A is inherently
+        // shape-agnostic and won't suddenly lose at larger M.
+        if (type == model::GgmlType::Q8_0
+            && _q8_0Dp4aSlot.has_value()
+            && !forceDisableDp4a)
+        {
+            const std::size_t Mdp = kAutotuneMBuckets[0];
+            const std::size_t xqBytes = Mdp * K * sizeof(std::int8_t);
+            const std::size_t xsBytes = Mdp * sizeof(float);
+            if (xqBytes > _dp4aXqBytes || xsBytes > _dp4aScaleBytes) {
+                MM_LOG_WARN("gpummm",
+                            "autotune: DP4A bench for {} skipped — "
+                            "bench shape (M={}, K={}) exceeds scratch "
+                            "bounds. Bump kDp4aMax* together.",
+                            qt->name(), Mdp, K);
+            } else {
+                entry.useDp4a  = false;
+                entry.gemmMinM = kGemmMinMNever;  // force matvec-loop ref
+                const std::size_t elts = Mdp * N;
+                std::vector<float> yVec(elts);
+                for (std::size_t m = 0; m < Mdp; ++m) {
+                    matmulAsync(type, wUsm, N, K,
+                                static_cast<const float*>(xUsm) + m * K,
+                                /*M=*/1,
+                                static_cast<float*>(yUsm) + m * N,
+                                static_cast<float*>(sUsm));
+                }
+                _queue.flush();
+                std::memcpy(yVec.data(), yUsm, elts * sizeof(float));
 
                 entry.useDp4a = true;
-                std::vector<float> yDp4a(M * N);
+                std::vector<float> yDp4a(elts);
                 for (int i = 0; i < nWarmup; ++i) {
                     matmulAsync(type, wUsm, N, K,
-                                static_cast<const float*>(xUsm), M,
+                                static_cast<const float*>(xUsm), Mdp,
                                 static_cast<float*>(yUsm),
                                 static_cast<float*>(sUsm));
                     _queue.flush();
                 }
                 matmulAsync(type, wUsm, N, K,
-                            static_cast<const float*>(xUsm), M,
+                            static_cast<const float*>(xUsm), Mdp,
                             static_cast<float*>(yUsm),
                             static_cast<float*>(sUsm));
                 _queue.flush();
-                std::memcpy(yDp4a.data(), yUsm, yBytes);
+                std::memcpy(yDp4a.data(), yUsm, elts * sizeof(float));
 
-                float maxAbs   = 0.0F;
-                float maxDiff  = 0.0F;
-                for (std::size_t i = 0; i < yVec.size(); ++i) {
+                float maxAbs  = 0.0F;
+                float maxDiff = 0.0F;
+                for (std::size_t i = 0; i < elts; ++i) {
                     maxAbs  = std::max(maxAbs,  std::fabs(yVec[i]));
                     maxDiff = std::max(maxDiff,
                                        std::fabs(yVec[i] - yDp4a[i]));
                 }
-                // INT8-quant-of-X noise on random inputs on a synthetic
-                // weight bench: 5 % of max|ref| is the empirically-safe
-                // ceiling. Real-inference activations are much better-
-                // conditioned so a broken kernel would still overshoot
-                // this by orders of magnitude.
                 const float dp4aTol = std::max(0.05F * maxAbs, 1e-3F);
                 if (!(maxDiff <= dp4aTol)) {
                     MM_LOG_WARN("gpummm",
                                 "autotune parity FAIL for Q8_0 DP4A — "
                                 "maxDiff={:.6g} maxRef={:.6g} tol={:.6g}. "
-                                "Pinning to previous choice ({}) and "
+                                "Sticking with matvec/gemm decision, "
                                 "skipping DP4A timing bench.",
-                                maxDiff, maxAbs, dp4aTol,
-                                pickGemm ? "gemm" : "matvec-loop");
+                                maxDiff, maxAbs, dp4aTol);
                     entry.useDp4a        = false;
-                    entry.useGemm        = pickGemm;
                     entry.autotuneSource = "dp4a_parity_fail";
                 } else {
                     MM_LOG_INFO("gpummm",
@@ -500,38 +550,48 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                     for (int it2 = 0; it2 < nTimed; ++it2) {
                         const auto t0 = clk::now();
                         matmulAsync(type, wUsm, N, K,
-                                    static_cast<const float*>(xUsm), M,
+                                    static_cast<const float*>(xUsm), Mdp,
                                     static_cast<float*>(yUsm),
                                     static_cast<float*>(sUsm));
                         _queue.flush();
                         const auto t1 = clk::now();
-                        std::chrono::duration<double, std::milli> dt = t1 - t0;
-                        dp4aMs.push_back(dt.count());
+                        dp4aMs.push_back(
+                            std::chrono::duration<double, std::milli>(t1 - t0)
+                                .count());
                     }
                     const double dp4aMed = medianMs(std::move(dp4aMs));
                     entry.lastDp4aMs = dp4aMed;
 
                     const double bestNonDp4a =
-                        pickGemm ? gemmMed : vecMed;
-                    // MIMIRMIND_FORCE_DP4A=1 skips the timing race.
+                        std::min(entry.vecMsAtM[0], entry.gemmMsAtM[0]);
                     const bool pickDp4a =
                         forceEnableDp4a ||
                         (dp4aMed * 1.05 < bestNonDp4a);
                     entry.useDp4a = pickDp4a;
                     if (pickDp4a) {
-                        entry.useGemm = false;
-                    } else {
-                        entry.useGemm = pickGemm;
+                        entry.autotuneSource =
+                            forceEnableDp4a ? "env_force_dp4a" : "bench";
                     }
-                    entry.autotuneSource =
-                        forceEnableDp4a ? "env_force_dp4a" : "bench";
                     MM_LOG_INFO("gpummm",
                                 "autotune: Q8_0 DP4A {:.2f} ms vs "
-                                "best-non-dp4a {:.2f} ms → picked {}",
+                                "best-non-dp4a@M=16 {:.2f} ms → picked {}",
                                 dp4aMed, bestNonDp4a,
-                                pickDp4a
-                                    ? "dp4a"
-                                    : (pickGemm ? "gemm" : "matvec-loop"));
+                                pickDp4a ? "dp4a" : "matvec-or-gemm-by-M");
+                }
+
+                // Restore the M-threshold that the timing loop derived
+                // — the DP4A bench mutated it as a dispatch-control
+                // temporarily. useDp4a takes priority at dispatch time
+                // when true, so if DP4A won the caller still hits DP4A;
+                // if it lost, the M-threshold is what applies.
+                entry.gemmMinM = kGemmMinMNever;
+                for (std::size_t bi = 0;
+                     bi < kAutotuneMBuckets.size(); ++bi)
+                {
+                    if (entry.gemmMsAtM[bi] * 1.05 < entry.vecMsAtM[bi]) {
+                        entry.gemmMinM = kAutotuneMBuckets[bi];
+                        break;
+                    }
                 }
             }
         }
@@ -595,16 +655,13 @@ void GpuMatmul::matmulAsync(model::GgmlType type,
     const std::uint32_t nGroups = static_cast<std::uint32_t>(
         (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
 
-    // Prefill hot path — batched GEMM kernel when available and M > 1.
-    // Handles all M rows in a single Level-Zero dispatch and amortises
-    // the W dequant work M_TILE-fold. Falls through to matvec for M=1
-    // (decode) even when GEMM is available, since the matvec kernel is
-    // more launch-efficient for a single row.
-    //
-    // `useGemm` is set by autotune() based on measured GEMM-vs-matvec
-    // wall time on the current iGPU. Until autotune runs it stays
-    // false, so early pre-load matmuls take the safe matvec-loop.
-    if (M > 1 && entry.gemm.has_value() && entry.useGemm) {
+    // M8.J — batched GEMM kernel wins only past a per-type threshold
+    // learned by autotune. `gemmMinM` = kGemmMinMNever means matvec-
+    // loop is always faster on this shape / iGPU / driver combination.
+    // M=1 (decode) never triggers GEMM because gemmMinM is at least 2
+    // (autotune only benches M=16 and up; the M=1 path stays on matvec
+    // for launch-efficiency reasons even when GEMM would numerically win).
+    if (M >= entry.gemmMinM && entry.gemm.has_value()) {
         runtime::GpuKernel& kern = entry.gemm->kernel;
         kern.setGroupSize(kLocalSize, 1, 1);
         kern.setPtr(0, X);
@@ -725,19 +782,27 @@ std::vector<GpuMatmul::AutotuneReport> GpuMatmul::autotuneReport() const {
         const QuantType* qt = quantType(type);
         const bool dp4aForThisType =
             type == model::GgmlType::Q8_0 && _q8_0Dp4aSlot.has_value();
-        out.push_back(AutotuneReport{
-            .name           = qt != nullptr ? std::string{qt->name()} : "??",
-            .gemmAvailable  = entry.gemm.has_value(),
-            .gemmPicked     = entry.useGemm,
-            .vecMs          = entry.lastVecMs,
-            .gemmMs         = entry.lastGemmMs,
-            .dp4aAvailable  = dp4aForThisType,
-            .dp4aPicked     = entry.useDp4a,
-            .dp4aMs         = entry.lastDp4aMs,
-            .source         = entry.autotuneSource.empty()
-                                ? std::string{"pending"}
-                                : entry.autotuneSource,
-        });
+        AutotuneReport r{};
+        r.name          = qt != nullptr ? std::string{qt->name()} : "??";
+        r.gemmAvailable = entry.gemm.has_value();
+        r.gemmPicked    = entry.gemmMinM != kGemmMinMNever;
+        // Legacy vec_ms / gemm_ms mirror the M=16 bucket for backward
+        // compat with pre-M8.J telemetry consumers.
+        r.vecMs         = entry.vecMsAtM[0];
+        r.gemmMs        = entry.gemmMsAtM[0];
+        for (std::size_t i = 0; i < kAutotuneMBuckets.size(); ++i) {
+            r.mBuckets[i]  = kAutotuneMBuckets[i];
+            r.vecMsAtM[i]  = entry.vecMsAtM[i];
+            r.gemmMsAtM[i] = entry.gemmMsAtM[i];
+        }
+        r.gemmMinM      = entry.gemmMinM;
+        r.dp4aAvailable = dp4aForThisType;
+        r.dp4aPicked    = entry.useDp4a;
+        r.dp4aMs        = entry.lastDp4aMs;
+        r.source        = entry.autotuneSource.empty()
+                              ? std::string{"pending"}
+                              : entry.autotuneSource;
+        out.push_back(std::move(r));
     }
     return out;
 }

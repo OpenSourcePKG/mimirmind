@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -722,11 +723,29 @@ struct ApiServer::Impl {
         // Per-type matmul autotune.
         json matmulByType = json::object();
         for (const auto& r : engine.gpuMatmul().autotuneReport()) {
+            // M8.J — expose per-M timings + threshold. gemm_min_m is
+            // null when GEMM never wins (matvec-loop applies at every M).
+            json vecMsAtM = json::object();
+            json gemmMsAtM = json::object();
+            for (std::size_t i = 0; i < r.mBuckets.size(); ++i) {
+                const std::string key = std::to_string(r.mBuckets[i]);
+                vecMsAtM[key]  = r.vecMsAtM[i];
+                gemmMsAtM[key] = r.gemmMsAtM[i];
+            }
+            json gemmMinMJson = nullptr;
+            if (r.gemmMinM != 0 &&
+                r.gemmMinM != std::numeric_limits<std::size_t>::max())
+            {
+                gemmMinMJson = r.gemmMinM;
+            }
             matmulByType[r.name] = json{
                 {"gemm_available", r.gemmAvailable},
                 {"gemm_picked",    r.gemmPicked},
+                {"gemm_min_m",     gemmMinMJson},
                 {"vec_ms",         r.vecMs},
                 {"gemm_ms",        r.gemmMs},
+                {"vec_ms_at_m",    std::move(vecMsAtM)},
+                {"gemm_ms_at_m",   std::move(gemmMsAtM)},
                 {"dp4a_available", r.dp4aAvailable},
                 {"dp4a_picked",    r.dp4aPicked},
                 {"dp4a_ms",        r.dp4aMs},

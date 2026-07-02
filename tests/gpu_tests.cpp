@@ -1467,6 +1467,43 @@ TEST(matmul_q8_0_gemm_realistic_prefill) {
 }
 
 // =======================================================================
+// M8.J — multi-M GEMM at Autotune-Buckets M=64 and M=256. The autotune
+// parity gate at startup only checks the largest bucket; these tests
+// belt-and-braces the intermediate + large paths against the CPU
+// reference so a GEMM regression at any bucket lights up before deploy.
+// =======================================================================
+
+TEST(matmul_q8_0_gemm_M64_bucket) {
+    runQ8_0MatmulParity("matmul_q8_0_gemm_M64", /*N=*/2560, /*K=*/2816,
+                        /*M=*/64, /*seed=*/0xE064U, /*tol=*/2e-2F);
+}
+
+TEST(matmul_q8_0_gemm_M256_bucket) {
+    runQ8_0MatmulParity("matmul_q8_0_gemm_M256", /*N=*/2560, /*K=*/2816,
+                        /*M=*/256, /*seed=*/0xE256U, /*tol=*/2e-2F);
+}
+
+TEST(matmul_q6k_gemm_M64_bucket) {
+    runQ6kMatmulParity("matmul_q6k_gemm_M64", /*N=*/2560, /*K=*/2816,
+                       /*M=*/64, /*seed=*/0xC064U, /*tol=*/2e-2F);
+}
+
+TEST(matmul_q6k_gemm_M256_bucket) {
+    runQ6kMatmulParity("matmul_q6k_gemm_M256", /*N=*/2560, /*K=*/2816,
+                       /*M=*/256, /*seed=*/0xC256U, /*tol=*/2e-2F);
+}
+
+TEST(matmul_q4k_gemm_M64_bucket) {
+    runQ4kMatmulParity("matmul_q4k_gemm_M64", /*N=*/2048, /*K=*/3584,
+                       /*M=*/64, /*seed=*/0xD064U, /*tol=*/2e-2F);
+}
+
+TEST(matmul_q4k_gemm_M256_bucket) {
+    runQ4kMatmulParity("matmul_q4k_gemm_M256", /*N=*/2048, /*K=*/3584,
+                       /*M=*/256, /*seed=*/0xD256U, /*tol=*/2e-2F);
+}
+
+// =======================================================================
 // M8.H.1 — matmul_q8_0_vec_dp4a: DP4A matvec with int8-quantised
 // activation. Compared against the plain float-X Q8_0 matmul on the
 // same weights; tolerance is driven by the int8 activation quant

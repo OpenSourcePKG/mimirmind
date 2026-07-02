@@ -5,11 +5,15 @@
 #include "runtime/GpuKernel.hpp"
 #include "runtime/GpuModule.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace mimirmind::runtime {
 class L0Context;
@@ -150,15 +154,23 @@ public:
     struct AutotuneReport {
         std::string name;                // e.g. "Q6_K"
         bool        gemmAvailable;       // GEMM kernel loaded for this type
-        bool        gemmPicked;          // autotune picked GEMM over matvec-loop
-        double      vecMs;               // measured matvec-loop median ms (0 = not measured)
-        double      gemmMs;              // measured GEMM median ms (0 = not measured)
+        bool        gemmPicked;          // GEMM will be dispatched for at least some M (i.e., gemmMinM != MAX)
+        // Legacy fields — the M=16 timing, kept so downstream consumers
+        // don't break during M8.J rollout.
+        double      vecMs;
+        double      gemmMs;
+        // M8.J — per-M-bucket timings + threshold. Buckets match
+        // kAutotuneMBuckets in GpuMatmul.cpp (16, 64, 256).
+        std::array<std::size_t, 3> mBuckets{};
+        std::array<double, 3>      vecMsAtM{};
+        std::array<double, 3>      gemmMsAtM{};
+        std::size_t                gemmMinM{0};  // 0 = "not set" (rendered as null in JSON)
         // M8.H.3 — only meaningful for Q8_0 on iGPUs where the DP4A
         // module loaded. Zero elsewhere.
         bool        dp4aAvailable{false};
         bool        dp4aPicked{false};
         double      dp4aMs{0.0};
-        std::string source;              // "bench" | "env_force_gemm" | "env_disable_gemm" | "no_gemm" | "parity_fail" | "dp4a_parity_fail" | "env_force_dp4a"
+        std::string source;              // "bench" | "env_force_gemm" | "env_disable_gemm" | "no_gemm" | "parity_fail" | "dp4a_parity_fail" | "env_force_dp4a" | "env_gemm_min_m"
     };
     [[nodiscard]] std::vector<AutotuneReport> autotuneReport() const;
 
@@ -172,20 +184,34 @@ private:
         KernelSlot                vec;      // M==1 hot path (matvec)
         std::optional<KernelSlot> gemm;     // optional M>1 batched path
         std::size_t               gemmMTile{1};
-        bool                      useGemm{false};  // set by autotune()
+
+        // M8.J — smallest batch size M at which the timed GEMM bench
+        // beat the timed matvec-loop bench with a 5 % margin.
+        // matmulAsync dispatches GEMM iff `M >= gemmMinM`. The MAX
+        // sentinel means "GEMM never wins, always take matvec".
+        //   No GEMM kernel loaded → MAX
+        //   MIMIRMIND_DISABLE_GEMM → MAX
+        //   MIMIRMIND_FORCE_GEMM   → 2 (any M > 1 dispatches GEMM)
+        //   MIMIRMIND_GEMM_MIN_M=N → N (debug override)
+        //   Otherwise              → smallest bench-bucket-M where GEMM won,
+        //                             or MAX if it never won at any bucket
+        std::size_t               gemmMinM{std::numeric_limits<std::size_t>::max()};
 
         // M8.H.3 — Q8_0 only. When true, matmulAsync routes the Q8_0
         // dispatch through the DP4A path (x_quant_i8 + DP4A matvec)
         // instead of vec/gemm. Set by autotune() only when parity gate
-        // + timing bench both prefer DP4A on this iGPU.
+        // + timing bench both prefer DP4A on this iGPU. Takes priority
+        // over the M-threshold GEMM path.
         bool                      useDp4a{false};
 
         // Autotune telemetry — populated once by autotune(), consumed by
-        // autotuneReport() for the /v1/system/status endpoint.
-        double      lastVecMs{0.0};
-        double      lastGemmMs{0.0};
-        double      lastDp4aMs{0.0};  // 0 unless DP4A available for this type
-        std::string autotuneSource;   // "bench" | "env_force_gemm" | ...
+        // autotuneReport() for the /v1/system/status endpoint. Index
+        // matches kAutotuneMBuckets in GpuMatmul.cpp; 0 = M=16, etc.
+        // 0.0 means "not measured" (env pin, no gemm, parity fail).
+        std::array<double, 3> vecMsAtM{};
+        std::array<double, 3> gemmMsAtM{};
+        double      lastDp4aMs{0.0};      // 0 unless DP4A available
+        std::string autotuneSource;       // "bench" | "env_force_gemm" | ...
     };
 
     runtime::L0Context&    _ctx;
