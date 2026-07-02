@@ -363,6 +363,11 @@ struct ApiServer::Impl {
                           httplib::Response&       res) {
                        handleSystemStatus(req, res);
                    });
+        server.Get("/v1/system/info",
+                   [this](const httplib::Request& req,
+                          httplib::Response&       res) {
+                       handleSystemInfo(req, res);
+                   });
         server.Post("/v1/chat/completions",
                     [this](const httplib::Request& req,
                            httplib::Response&       res) {
@@ -410,6 +415,156 @@ struct ApiServer::Impl {
             {"object", "list"},
             {"data",   json::array({entry})},
         });
+    }
+
+    /// Static-only companion to /v1/system/status. Everything reported
+    /// here is fixed for the lifetime of the process — model config,
+    /// KV-cache size, hardware descriptor, thermal-profile limits,
+    /// governor envelope, autotune bench results, perf-regression
+    /// constants. Clients are expected to call this ONCE at startup and
+    /// then poll /v1/system/status for the dynamic values (temp, cap,
+    /// watts, throttle state, current/baseline p50, last alert).
+    void handleSystemInfo(const httplib::Request&, httplib::Response& res) {
+        const auto& modelCfg = engine.config();
+        const auto& tok      = engine.tokenizer();
+        const auto& devInfo  = engine.ctx().info();
+        const auto& usmLim   = engine.allocator().limits();
+
+        // Model architecture + dims
+        json model = {
+            {"id",                   cfg.modelId},
+            {"arch",                 modelCfg.architecture},
+            {"block_count",          modelCfg.blockCount},
+            {"context_length",       modelCfg.contextLength},
+            {"embedding_length",     modelCfg.embeddingLength},
+            {"feed_forward_length",  modelCfg.feedForwardLength},
+            {"head_count",           modelCfg.headCount},
+            {"head_count_kv",        modelCfg.headCountKv},
+            {"key_length",           modelCfg.keyLength},
+            {"value_length",         modelCfg.valueLength},
+            {"rms_norm_eps",         modelCfg.rmsNormEps},
+            {"rope_freq_base",       modelCfg.ropeFreqBase},
+        };
+        if (modelCfg.slidingWindow > 0) {
+            model["sliding_window"]     = modelCfg.slidingWindow;
+            model["rope_freq_base_swa"] = modelCfg.ropeFreqBaseSwa;
+            model["key_length_swa"]     = modelCfg.keyLengthSwa;
+            model["value_length_swa"]   = modelCfg.valueLengthSwa;
+            std::size_t swa = 0;
+            for (bool b : modelCfg.slidingWindowPattern) {
+                if (b) ++swa;
+            }
+            model["swa_layer_count"]  = swa;
+            model["full_layer_count"] =
+                modelCfg.slidingWindowPattern.size() - swa;
+        }
+        if (modelCfg.expertCount > 0) {
+            model["expert_count"]      = modelCfg.expertCount;
+            model["expert_used_count"] = modelCfg.expertUsedCount;
+        }
+
+        // Tokenizer
+        json tokenizer = {
+            {"model",      std::string{tok.modelType()}},
+            {"vocab_size", tok.vocabSize()},
+            {"bos_id",     tok.bosId()},
+            {"eos_id",     tok.eosId()},
+            {"unk_id",     tok.unknownId()},
+            {"pad_id",     tok.padId()},
+        };
+
+        // KV cache — hard limit the engine will admit. Prompt +
+        // max_new_tokens + a small slack (4 tokens) must fit.
+        json kvCache = {
+            {"max_context_tokens", engine.maxContextTokens()},
+            {"layer_count",        modelCfg.blockCount},
+        };
+
+        // Level-Zero device descriptor
+        json hardware = {
+            {"device_name",             devInfo.name},
+            {"device_uuid",             devInfo.uuid},
+            {"vendor_id",               devInfo.vendorId},
+            {"device_id",               devInfo.deviceId},
+            {"num_compute_units",       devInfo.numComputeUnits},
+            {"core_clock_rate_mhz",     devInfo.coreClockRate},
+            {"total_local_mem_bytes",   devInfo.totalLocalMem},
+            {"usm_per_alloc_max_bytes", usmLim.perAllocMaxBytes},
+        };
+
+        // GPU clock envelope — the static parts of /system/status.gpu_clock
+        // (current_cap_mhz is dynamic and stays in /status).
+        json gpuClockEnvelope;
+        if (auto* gov = engine.gpuClockGovernor();
+            gov != nullptr && gov->available()) {
+            gpuClockEnvelope = {
+                {"card_path",     std::string{gov->cardPath()}},
+                {"rp0_mhz",       gov->rp0Mhz()},
+                {"rpn_mhz",       gov->rpnMhz()},
+                {"target_temp_c", gov->targetTempC()},
+            };
+        } else {
+            gpuClockEnvelope = nullptr;
+        }
+
+        // Thermal profile — the static limits (readings.package_temp_c and
+        // throttle state stay in /status).
+        json thermalProfile;
+        if (auto* guard = engine.thermalGuard(); guard != nullptr) {
+            const auto& p = guard->profile();
+            thermalProfile = {
+                {"name",                    p.name},
+                {"description",             p.description},
+                {"package_temp_hard_c",     p.package_temp_hard_c.has_value()
+                                              ? json(*p.package_temp_hard_c)
+                                              : json(nullptr)},
+                {"package_temp_soft_c",     p.package_temp_soft_c.has_value()
+                                              ? json(*p.package_temp_soft_c)
+                                              : json(nullptr)},
+                {"package_throttle_max_ms", p.package_throttle_max_ms},
+            };
+        } else {
+            thermalProfile = nullptr;
+        }
+
+        // Perf-regression tuning constants. Alert thresholds, windows,
+        // warmup — everything that is compile-time constexpr and can't
+        // change without a rebuild.
+        json perfRegressionConfig = {
+            {"threshold_ratio",
+             runtime::PerfRegressionDetector::kAlertThreshold},
+            {"baseline_window_days",
+             runtime::PerfRegressionDetector::kBaselineDays},
+            {"warmup_tokens",
+             runtime::PerfRegressionDetector::kWarmupTokens},
+            {"rolling_window",
+             runtime::PerfRegressionDetector::kRollingWindow},
+            {"min_run_samples",
+             runtime::PerfRegressionDetector::kMinRunSamples},
+            {"min_baseline_n",
+             runtime::PerfRegressionDetector::kMinBaselineN},
+        };
+
+        // Build / process identity. internal_version bumps on every
+        // container restart; a client that caches /system/info should
+        // key its cache on this value.
+        json build = json::object();
+        if (auto* det = engine.perfRegressionDetector()) {
+            build["internal_version"] = det->internalVersion();
+        }
+
+        json body = {
+            {"model",                  model},
+            {"tokenizer",              tokenizer},
+            {"kv_cache",               kvCache},
+            {"hardware",               hardware},
+            {"gpu_clock_envelope",     gpuClockEnvelope},
+            {"thermal_profile",        thermalProfile},
+            {"perf_regression_config", perfRegressionConfig},
+            {"kernels",                buildKernelsBlock()},
+            {"build",                  build},
+        };
+        sendJson(res, 200, body);
     }
 
     void handleSystemStatus(const httplib::Request&, httplib::Response& res) {
