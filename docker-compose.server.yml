@@ -163,6 +163,15 @@ services:
             #                                     without a redeploy.
             MIMIRMIND_REGRESSION_ALERT:  ${MIMIRMIND_REGRESSION_ALERT:-}
 
+            # M8.K.0 diagnostic — per-op-category timing (norm / attn /
+            # matmul / activation / residual / router). Adds real overhead
+            # via forced pipeline flushes between phases; only turn on for
+            # short diagnostic runs. Every 50 tokens the accumulator dumps
+            # per-category ms + share % to the log and resets.
+            #
+            #   MIMIRMIND_TRACE_OP_TIMES=1  → activate profiler.
+            MIMIRMIND_TRACE_OP_TIMES:    ${MIMIRMIND_TRACE_OP_TIMES:-}
+
         volumes:
             - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
             - ./run-logs:/logs:rw
