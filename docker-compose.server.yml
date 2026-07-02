@@ -147,9 +147,33 @@ services:
             MIMIRMIND_DISABLE_MOE_GROUP: ${MIMIRMIND_DISABLE_MOE_GROUP:-}
             MIMIRMIND_GPU_CLOCK_PIN:     ${MIMIRMIND_GPU_CLOCK_PIN:-}
 
+            # In-process perf-regression detector — sits next to the
+            # NDJSON sink and alerts when current-run decode p50 exceeds
+            # the trailing 7-day baseline p50 by 1.15x. State (rolling
+            # baseline JSON + monotonic run counter) persists via the
+            # /root/.cache/mimirmind volume mount below. Every container
+            # start bumps the internal_version counter, which stamps
+            # each baseline sample + alert so we can pinpoint "regression
+            # appeared at version N" without a git commit tag.
+            #
+            #   MIMIRMIND_REGRESSION_ALERT=off  → skip detector install.
+            #                                     Use when the detector
+            #                                     itself misfires and
+            #                                     needs to be silenced
+            #                                     without a redeploy.
+            MIMIRMIND_REGRESSION_ALERT:  ${MIMIRMIND_REGRESSION_ALERT:-}
+
         volumes:
             - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
             - ./run-logs:/logs:rw
+            # Perf-regression detector's rolling baseline. Persists
+            # across container restarts so the trailing-7d p50 does not
+            # rebuild from scratch every deploy. Without this mount the
+            # detector logs a "cannot open" warning on the first run and
+            # keeps running (in-memory only) — inference is unaffected,
+            # but a regression won't be catchable until enough runs have
+            # accumulated in the fresh container.
+            - ${MIMIRMIND_STATE_DIR:-./run-state}:/root/.cache/mimirmind:rw
             - ${MIMIRMIND_THERMAL_PROFILE_HOST:-./thermal-profile.json}:/etc/mimirmind/thermal-profile.json:ro
             # iGPU sysfs view (Symlinks für /sys/class/drm/cardN, rw für
             # den dynamischen GPU-Clock-Governor).

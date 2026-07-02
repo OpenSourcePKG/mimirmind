@@ -7,6 +7,7 @@
 #include "runtime/GpuClockGovernor.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/Log.hpp"
+#include "runtime/PerfRegressionDetector.hpp"
 #include "runtime/PowerMonitor.hpp"
 #include "runtime/ThermalGuard.hpp"
 
@@ -464,10 +465,52 @@ struct ApiServer::Impl {
                                        ? json{}
                                        : json{decision.reason}},
         };
-        body["power"]     = buildPowerBlock();
-        body["gpu_clock"] = buildGpuClockBlock();
-        body["kernels"]   = buildKernelsBlock();
+        body["power"]           = buildPowerBlock();
+        body["gpu_clock"]       = buildGpuClockBlock();
+        body["kernels"]         = buildKernelsBlock();
+        body["perf_regression"] = buildPerfRegressionBlock();
         sendJson(res, 200, body);
+    }
+
+    /// Compose the "perf_regression" sub-object of /v1/system/status.
+    /// Reports the current-run p50 decode time, the rolling baseline
+    /// p50 (median over runs in the last kBaselineDays), how many prior
+    /// runs contributed, and the most recent alert if one has fired.
+    /// Absent (= "available": false with reason) when no detector is
+    /// installed — happens in smoke/parity mode or when
+    /// MIMIRMIND_REGRESSION_ALERT=off was passed to serve.
+    json buildPerfRegressionBlock() {
+        auto* det = engine.perfRegressionDetector();
+        if (det == nullptr) {
+            return json{
+                {"available", false},
+                {"reason",    "no perf-regression detector installed"},
+            };
+        }
+        json body{
+            {"available",              true},
+            {"internal_version",       det->internalVersion()},
+            {"threshold_ratio",        runtime::PerfRegressionDetector::kAlertThreshold},
+            {"baseline_window_days",   runtime::PerfRegressionDetector::kBaselineDays},
+            {"warmup_tokens",          runtime::PerfRegressionDetector::kWarmupTokens},
+            {"baseline_sample_count",  det->baselineSampleCount()},
+        };
+        const double curP50 = det->currentP50Ms();
+        const double basP50 = det->baselineP50Ms();
+        body["current_p50_ms"]  = (curP50 > 0.0) ? json{curP50} : json{};
+        body["baseline_p50_ms"] = (basP50 > 0.0) ? json{basP50} : json{};
+        if (auto alert = det->lastAlert()) {
+            body["last_alert"] = json{
+                {"current_p50_ms",   alert->current_p50_ms},
+                {"baseline_p50_ms",  alert->baseline_p50_ms},
+                {"delta_ratio",      alert->delta_ratio},
+                {"internal_version", alert->internal_version},
+                {"detected_unix",    alert->detected_unix},
+            };
+        } else {
+            body["last_alert"] = json{};
+        }
+        return body;
     }
 
     /// Compose the "gpu_clock" sub-object of /v1/system/status.
