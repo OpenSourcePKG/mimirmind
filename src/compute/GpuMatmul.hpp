@@ -231,10 +231,13 @@ private:
     static constexpr std::uint32_t kOutputsPerGroup  = kLocalSize / kSubgroupSize;
 
     // Must match MATMUL_Q8_0_DP4A_LOCAL / _SG in
-    // kernels/matmul_q8_0_vec_dp4a.cl. SG=8 fits the 8 char4 chunks per
-    // Q8_0 block with no idle lanes; 8 outputs per workgroup.
+    // kernels/matmul_q8_0_vec_dp4a.cl. SG=16 matches Xe-LPG's preferred
+    // subgroup width — the M8.H.1 SG=8 layout benched 30 % slower than
+    // plain matvec at bench-time; SG=16 with 2 blocks per iteration
+    // keeps all lanes busy and matches the geometry of matmul_q8_0_vec.
+    // 4 outputs per workgroup.
     static constexpr std::uint32_t kDp4aLocalSize       = 64;
-    static constexpr std::uint32_t kDp4aSubgroupSize    = 8;
+    static constexpr std::uint32_t kDp4aSubgroupSize    = 16;
     static constexpr std::uint32_t kDp4aOutputsPerGroup =
         kDp4aLocalSize / kDp4aSubgroupSize;
 
