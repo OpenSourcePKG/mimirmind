@@ -1303,14 +1303,24 @@ struct ApiServer::Impl {
                 double lastProgressMs = -1.0;
                 constexpr double kProgressMinIntervalMs = 200.0;
                 auto onPrefillProgress =
-                    [&](const runtime::InferenceEngine::PrefillProgress& p) {
+                    [&](const runtime::InferenceEngine::PrefillProgress& p)
+                        -> bool {
+                        // M7g — poll for a client-side disconnect on every
+                        // block. If clientGone flipped between blocks (via
+                        // the throttle branch below OR via a broken write
+                        // from onToken during a previous prefill call —
+                        // rare but possible in edge flows), tell the engine
+                        // to stop at the next barrier.
+                        if (clientGone) {
+                            return false;
+                        }
                         const bool isFirst = (p.blocksDone == 1);
                         const bool isLast  = (p.blocksDone == p.blocksTotal);
                         const bool dueByTime =
                             (p.elapsedMs - lastProgressMs) >=
                             kProgressMinIntervalMs;
                         if (!isFirst && !isLast && !dueByTime) {
-                            return;
+                            return true;  // no SSE this tick, keep going
                         }
                         lastProgressMs = p.elapsedMs;
                         const json payload = {
@@ -1322,7 +1332,9 @@ struct ApiServer::Impl {
                         if (!writeSseNamedEvent(sink, "prefill_progress",
                                                 payload)) {
                             clientGone = true;
+                            return false;  // abort prefill at next barrier
                         }
+                        return true;
                     };
 
                 std::vector<std::int32_t> generated;
@@ -1342,10 +1354,18 @@ struct ApiServer::Impl {
                 }
 
                 if (clientGone) {
+                    // Distinguish prefill vs decode abort in the log so
+                    // the operator can spot Pegenaut cancels happening
+                    // during the (potentially long) prefill phase — those
+                    // are the highest-value ones to see, they show the
+                    // user gave up while waiting for the first token.
+                    const bool cancelledInPrefill = (emittedTokens == 0);
                     MM_LOG_INFO("server",
-                                "stream {}: aborted mid-decode "
+                                "stream {}: aborted mid-{} "
                                 "(emitted={}, prefill={:.0f}ms)",
-                                state->respId, emittedTokens, stats.prefillMs);
+                                state->respId,
+                                cancelledInPrefill ? "prefill" : "decode",
+                                emittedTokens, stats.prefillMs);
                     sink.done();
                     return false;
                 }

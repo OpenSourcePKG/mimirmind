@@ -435,7 +435,8 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     double                    preMs   = 0.0;
     double                    decMs   = 0.0;
     bool                      hitStop = false;
-    bool                      aborted = false;
+    bool                      aborted         = false;
+    bool                      prefillAborted  = false;
 
     try {
         const auto preT0 = clock::now();
@@ -454,24 +455,48 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 const double elapsedMs =
                     std::chrono::duration<double, std::milli>(now - preT0)
                         .count();
-                onPrefillProgress(PrefillProgress{
+                const bool keepGoing = onPrefillProgress(PrefillProgress{
                     static_cast<std::size_t>(b) + 1,
                     static_cast<std::size_t>(_config.blockCount),
                     elapsedMs,
                 });
+                if (!keepGoing) {
+                    // M7g client-cancel during prefill. Break at the next
+                    // block barrier — the currently-executing block has
+                    // already finished by the time we're here.
+                    prefillAborted = true;
+                    aborted        = true;
+                    break;
+                }
             }
         }
-        cache.commit(prefillCount);
+
+        // Compute the elapsed prefill time regardless of abort so the
+        // operator can see how far the client got in outStats + logs.
         const auto preT1 = clock::now();
         preMs =
             std::chrono::duration<double, std::milli>(preT1 - preT0).count();
 
-        if (onPrefillDone) {
-            onPrefillDone(PrefillDone{Tp, prefillCount, preMs});
+        if (prefillAborted) {
+            // Partial KV writes are invalid without a matching commit.
+            // Wiping keeps the next request honest and avoids any bogus
+            // prefix-cache hits on the aborted prompt.
+            resetCache();
+        } else {
+            cache.commit(prefillCount);
+            if (onPrefillDone) {
+                onPrefillDone(PrefillDone{Tp, prefillCount, preMs});
+            }
         }
 
         _traceBlock0 = false;  // diagnostic done; mute for further calls
 
+        // The rest of the try body — sampler seeding, first sample, decode
+        // loop, per-token telemetry, perf-detector run-complete — is decode
+        // work that a client cancelling during prefill has explicitly asked
+        // us not to do (M7g). Wrap it in a single conditional so control
+        // flow stays linear.
+        if (!prefillAborted) {
         // Reseed the sampler per generate() call so deterministic seeds
         // produce reproducible streams. seed == 0 ⇒ random_device.
         _sampler.reseed(params.sampling.seed);
@@ -629,6 +654,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         if (_perfDetector != nullptr) {
             _perfDetector->onRunComplete(generated.size());
         }
+        } // if (!prefillAborted) — M7g decode-phase wrapper
     } catch (...) {
         // Mid-flight failure leaves the KV state partially written.
         // Discarding the cache is cheap and keeps the next call honest.
@@ -643,7 +669,12 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     // (decode steps that committed). The first sampled token is not
     // yet committed; each subsequent loop iteration commits exactly one
     // token (the previous step's sample) before sampling the next one.
-    {
+    //
+    // M7g — skip when prefill was aborted. resetCache() has already run
+    // and cache.length() is 0; writing promptIds here anyway would make
+    // the next request see a bogus prefix-cache hit on a prompt whose
+    // KV was never actually committed.
+    if (!prefillAborted) {
         const std::size_t finalLen   = cache.length();
         const std::size_t genFromCache = (finalLen > Tp) ? (finalLen - Tp) : 0;
         const std::size_t take       = std::min(genFromCache, generated.size());

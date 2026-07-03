@@ -129,7 +129,13 @@ public:
     /// Callbacks are cheap by design — the server should still rate-
     /// limit outgoing SSE events since a 34-block model on a short
     /// prompt fires this 34 times in a few hundred milliseconds.
-    using PrefillProgressCallback = std::function<void(const PrefillProgress&)>;
+    ///
+    /// Return value: `true` to keep going, `false` to abort the prefill
+    /// at the next block barrier (M7g). Abort is best-effort — the
+    /// currently running block finishes first. The engine then rolls
+    /// back the partial KV state, skips the decode phase, and returns
+    /// an empty result set with `outStats->prefillMs` populated.
+    using PrefillProgressCallback = std::function<bool(const PrefillProgress&)>;
 
     InferenceEngine();
     ~InferenceEngine();
