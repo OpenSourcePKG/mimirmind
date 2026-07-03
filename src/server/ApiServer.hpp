@@ -56,7 +56,13 @@ struct ServerConfig {
  */
 class ApiServer {
 public:
-    ApiServer(runtime::InferenceEngine& engine, ServerConfig cfg);
+    /// `draftEngine` is optional — when non-null the server exposes
+    /// speculative-decoding metadata via /v1/system/info. The actual
+    /// speculation loop lands in M9.11.2+, until then the draft engine
+    /// is held but not called during chat/completions.
+    ApiServer(runtime::InferenceEngine& engine,
+              ServerConfig              cfg,
+              runtime::InferenceEngine* draftEngine = nullptr);
     ~ApiServer();
 
     ApiServer(const ApiServer&)            = delete;

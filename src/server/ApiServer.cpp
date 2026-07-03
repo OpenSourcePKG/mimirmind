@@ -333,6 +333,7 @@ json buildFinishChunk(const std::string& id, std::int64_t created,
 
 struct ApiServer::Impl {
     runtime::InferenceEngine&             engine;
+    runtime::InferenceEngine*             draftEngine{nullptr};
     ServerConfig                          cfg;
     model::ChatTemplate::Style            chatStyle;
     httplib::Server                       server;
@@ -349,8 +350,9 @@ struct ApiServer::Impl {
     std::chrono::steady_clock::time_point baselineWallStart{};
     bool                                  baselineCaptured{false};
 
-    Impl(runtime::InferenceEngine& e, ServerConfig c)
-        : engine{e}, cfg{std::move(c)},
+    Impl(runtime::InferenceEngine& e, ServerConfig c,
+         runtime::InferenceEngine* draft)
+        : engine{e}, draftEngine{draft}, cfg{std::move(c)},
           chatStyle{model::ChatTemplate::detectFromArch(
               engine.config().architecture)} {
         installRoutes();
@@ -603,6 +605,26 @@ struct ApiServer::Impl {
             fanEnvelope = nullptr;
         }
 
+        // M9.11.1 — Speculative-decoding readiness. `status` reflects
+        // whether a draft engine was successfully loaded AND passed the
+        // vocab-compat check in main.cpp before construction of this
+        // server. The actual speculation loop lands in M9.11.2+; until
+        // then this block just tells clients the draft is queued up.
+        json speculativeDecoding;
+        if (draftEngine != nullptr) {
+            const auto& draftCfg = draftEngine->config();
+            speculativeDecoding = {
+                {"status",           "ready"},
+                {"draft_model_arch", draftCfg.architecture},
+                {"draft_block_count", draftCfg.blockCount},
+                {"draft_embedding_length", draftCfg.embeddingLength},
+            };
+        } else {
+            speculativeDecoding = {
+                {"status", "disabled"},
+            };
+        }
+
         json body = {
             {"model",                  model},
             {"tokenizer",              tokenizer},
@@ -613,6 +635,7 @@ struct ApiServer::Impl {
             {"thermal_profile",        thermalProfile},
             {"perf_regression_config", perfRegressionConfig},
             {"kernels",                buildKernelsBlock()},
+            {"speculative_decoding",   speculativeDecoding},
             {"build",                  build},
         };
         sendJson(res, 200, body);
@@ -1446,8 +1469,10 @@ struct ApiServer::Impl {
     }
 };
 
-ApiServer::ApiServer(runtime::InferenceEngine& engine, ServerConfig cfg)
-    : _impl{std::make_unique<Impl>(engine, std::move(cfg))} {}
+ApiServer::ApiServer(runtime::InferenceEngine& engine,
+                     ServerConfig              cfg,
+                     runtime::InferenceEngine* draftEngine)
+    : _impl{std::make_unique<Impl>(engine, std::move(cfg), draftEngine)} {}
 
 ApiServer::~ApiServer() = default;
 

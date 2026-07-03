@@ -151,6 +151,7 @@ add_executable(mimirmind
     src/compute/Rope.cpp
     src/compute/Sampling.cpp
     src/compute/Softmax.cpp
+    src/compute/SpeculativeSampler.cpp
     src/compute/quant/Bfloat16.cpp
     src/compute/quant/Float16.cpp
     src/compute/quant/Float32.cpp

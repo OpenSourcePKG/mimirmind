@@ -713,4 +713,114 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     return generated;
 }
 
+std::vector<std::vector<float>>
+InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
+    namespace cmp = mimirmind::compute;
+
+    if (!_modelLoaded) {
+        throw std::runtime_error(
+            "InferenceEngine::forwardVerify: no model loaded");
+    }
+    if (newTokens.empty()) {
+        return {};
+    }
+    if (_backend == nullptr) {
+        throw std::runtime_error(
+            "forwardVerify: architecture '" + _config.architecture +
+            "' has no backend");
+    }
+
+    const auto* tokEmb = _weights->find("token_embd.weight");
+    if (tokEmb == nullptr) {
+        tokEmb = _weights->find("tok_embeddings.weight");
+    }
+    const auto* outNorm = _weights->find("output_norm.weight");
+    const auto* lmHead  = _weights->find("output.weight");
+    if (lmHead == nullptr) {
+        lmHead = _weights->find("token_embd.weight");
+    }
+    if (tokEmb == nullptr) {
+        throw std::runtime_error("forwardVerify: token embedding missing");
+    }
+    if (outNorm == nullptr || outNorm->type != model::GgmlType::F32) {
+        throw std::runtime_error(
+            "forwardVerify: output_norm.weight missing or not F32");
+    }
+    if (lmHead == nullptr) {
+        throw std::runtime_error("forwardVerify: lm_head tensor missing");
+    }
+
+    const std::size_t N        = newTokens.size();
+    const std::size_t vocab_lm = lmHead->dimensions.size() >= 2
+                                    ? lmHead->dimensions[1]
+                                    : _tokenizer.vocabSize();
+    const std::size_t vocab_emb = tokEmb->dimensions.size() >= 2
+                                     ? tokEmb->dimensions[1]
+                                     : _tokenizer.vocabSize();
+    const std::size_t d_model  = _config.embeddingLength;
+
+    // Admission + scratch sizing. Reuse the same helper as generate();
+    // Tp is where the KV would end up if we committed everything,
+    // maxNew=0 because verify never extends past N.
+    const std::size_t curLen = (_kvCache != nullptr) ? _kvCache->length() : 0;
+    ensureCapacity(N, curLen + N, 0, vocab_lm, d_model);
+
+    KvCache&      cache   = *_kvCache;
+    BlockBuffers& buffers = *_blockBuffers;
+
+    float* const xBuf      = _xBufH     .as<float>();
+    float* const normFinal = _normFinalH.as<float>();
+    float* const logits    = _logitsH   .as<float>();
+    float* const logitsSc  = _logitsScH .as<float>();
+
+    // Gemma-family sqrt(d_model) embedding scale, delegated to backend.
+    const bool  embedScaleEnabled = _backend->scalesEmbedding();
+    const float embedScale = embedScaleEnabled
+        ? std::sqrt(static_cast<float>(d_model)) : 1.0F;
+
+    cmp::embeddingLookup(tokEmb->type, tokEmb->usmPtr,
+                         d_model, vocab_emb,
+                         newTokens, xBuf);
+    if (embedScaleEnabled) {
+        _ops.mulScalarAsync(xBuf, embedScale, N * d_model);
+    }
+
+    // Batched block forward. runBlock writes provisional K/V rows to
+    // [curLen, curLen+N); commit is deferred to commitVerified().
+    for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
+        _backend->runBlock(b, xBuf, N, cache, buffers, false);
+    }
+
+    // Per-position logits. rmsNorm + lmHead matmul is cheap next to the
+    // block chain, so no need to batch M=N here — a loop keeps the
+    // scratch requirement at vocab_lm floats (M=1).
+    std::vector<std::vector<float>> out;
+    out.reserve(N);
+    for (std::size_t i = 0; i < N; ++i) {
+        const float* row = xBuf + i * d_model;
+        _ops.rmsNormAsync(row, 1, d_model,
+                          static_cast<const float*>(outNorm->usmPtr),
+                          _config.rmsNormEps, normFinal);
+        _gmm.matmul(lmHead->type, lmHead->usmPtr,
+                    vocab_lm, d_model, normFinal, 1,
+                    logits, logitsSc);
+        out.emplace_back(logits, logits + vocab_lm);
+    }
+    return out;
+}
+
+void InferenceEngine::commitVerified(
+    std::span<const std::int32_t> acceptedTokens) {
+    if (acceptedTokens.empty()) {
+        return;
+    }
+    if (_kvCache == nullptr) {
+        throw std::runtime_error(
+            "commitVerified: KV cache not allocated (forwardVerify never ran)");
+    }
+    _kvCache->commit(acceptedTokens.size());
+    _cachedTokens.insert(_cachedTokens.end(),
+                         acceptedTokens.begin(), acceptedTokens.end());
+}
+
 } // namespace mimirmind::runtime

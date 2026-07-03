@@ -1151,6 +1151,60 @@ int runServe(const CliArgs& args) {
         }
     }
 
+    // M9.11.1 — Optional speculative-decoding draft engine. Opt-in via
+    // MIMIRMIND_DRAFT_MODEL_PATH. Fully independent InferenceEngine so
+    // the target's L0 context / autotune / KV cache stay untouched;
+    // costs a second autotune pass at startup (~30 s) plus draft
+    // weights in USM. The speculation loop that actually calls the
+    // draft lands in M9.11.2+ — this step only loads and vocab-checks.
+    std::unique_ptr<mimirmind::runtime::InferenceEngine> draftEngine;
+    if (const char* draftPathEnv = std::getenv("MIMIRMIND_DRAFT_MODEL_PATH");
+        draftPathEnv != nullptr && draftPathEnv[0] != '\0') {
+        MM_LOG_INFO("main",
+                    "serve: loading draft model '{}'", draftPathEnv);
+        try {
+            draftEngine = std::make_unique<mimirmind::runtime::InferenceEngine>();
+            draftEngine->loadModel(draftPathEnv);
+
+            // Vocab compatibility. Modified rejection sampling only
+            // works when draft token-id N and target token-id N mean
+            // the same subword. vocabSize alone doesn't guarantee it,
+            // but a mismatch there is a hard disqualification. bos/eos
+            // must match too because we replay the same prompt-id stream
+            // through both engines.
+            const auto& tTok = engine.tokenizer();
+            const auto& dTok = draftEngine->tokenizer();
+            const bool sizeMatch = tTok.vocabSize() == dTok.vocabSize();
+            const bool bosMatch  = tTok.bosId()     == dTok.bosId();
+            const bool eosMatch  = tTok.eosId()     == dTok.eosId();
+            if (!sizeMatch || !bosMatch || !eosMatch) {
+                MM_LOG_WARN("main",
+                            "serve: draft model vocab incompatible with "
+                            "target — disabling speculative decoding. "
+                            "target(vocab={}, bos={}, eos={}) vs "
+                            "draft(vocab={}, bos={}, eos={})",
+                            tTok.vocabSize(), tTok.bosId(), tTok.eosId(),
+                            dTok.vocabSize(), dTok.bosId(), dTok.eosId());
+                draftEngine.reset();
+            } else {
+                MM_LOG_INFO("main",
+                            "serve: speculative decoding ready — "
+                            "target arch={} d_model={}, draft arch={} d_model={} "
+                            "(shared vocab_size={}, bos={}, eos={})",
+                            engine.config().architecture,
+                            engine.config().embeddingLength,
+                            draftEngine->config().architecture,
+                            draftEngine->config().embeddingLength,
+                            tTok.vocabSize(), tTok.bosId(), tTok.eosId());
+            }
+        } catch (const std::exception& e) {
+            MM_LOG_WARN("main",
+                        "serve: draft model load failed ({}) — "
+                        "speculative decoding disabled", e.what());
+            draftEngine.reset();
+        }
+    }
+
     mimirmind::server::ServerConfig cfg{};
     cfg.host    = "0.0.0.0";
     cfg.port    = args.port;
@@ -1467,7 +1521,7 @@ int runServe(const CliArgs& args) {
         }
     }
 
-    mimirmind::server::ApiServer server{engine, cfg};
+    mimirmind::server::ApiServer server{engine, cfg, draftEngine.get()};
 
     g_runningServer.store(&server, std::memory_order_release);
     std::signal(SIGINT,  signalStop);
@@ -1515,6 +1569,17 @@ int runServe(const CliArgs& args) {
                   << "x)";
     } else {
         std::cout << "off (MIMIRMIND_REGRESSION_ALERT=off)";
+    }
+    std::cout << "\n  spec decoding:      ";
+    if (draftEngine != nullptr) {
+        std::cout << "ready (draft arch="
+                  << draftEngine->config().architecture
+                  << ", d_model=" << draftEngine->config().embeddingLength
+                  << ")";
+    } else if (std::getenv("MIMIRMIND_DRAFT_MODEL_PATH") != nullptr) {
+        std::cout << "disabled (draft load or vocab check failed — see log)";
+    } else {
+        std::cout << "off (set MIMIRMIND_DRAFT_MODEL_PATH to enable)";
     }
     std::cout << "\n  max context tokens: " << engine.maxContextTokens()
               << "\n  Ctrl-C to stop.\n";

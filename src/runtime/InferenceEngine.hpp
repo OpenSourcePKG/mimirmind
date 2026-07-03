@@ -171,6 +171,49 @@ public:
     /// partway through.
     void resetCache() noexcept;
 
+    /**
+     * M9.11.3 — batched forward pass for speculative-decode verification.
+     *
+     * Runs a single forward over `newTokens` starting from the current
+     * KV-cache position, and returns one logits vector per input
+     * position. The accept/reject logic (M9.11.4) consumes these to
+     * decide how much of the draft's speculation to commit.
+     *
+     * Precondition: the KV cache is at position `cachedTokenCount()` —
+     * i.e. a prior generate() has run through prefill (and possibly a
+     * decode step) so the target's committed prefix already lives in
+     * the cache. The N speculative tokens ride on top of it.
+     *
+     * Semantics:
+     * - runBlock() writes provisional K/V rows at positions [len, len+N)
+     *   but this method does NOT commit — the caller decides how many
+     *   to accept and calls `commitVerified(k)` (or nothing to discard
+     *   all N). Overwrites on the next forwardVerify() replace stale
+     *   rows.
+     * - Skips thermal / fan / perf-detector telemetry — verify is a
+     *   sub-primitive inside a larger generate() call.
+     * - Per-position logits: rmsNorm(final) + lmHead matmul is looped
+     *   N times against M=1. The block matmuls dominate cost, so a
+     *   batched lm-head path is not worth the extra scratch buffer.
+     *
+     * Throws if the KV cache would overflow (`cache.length() + N` past
+     * the configured max), or if the model isn't loaded, or if
+     * newTokens is empty.
+     */
+    std::vector<std::vector<float>> forwardVerify(
+        std::span<const std::int32_t> newTokens);
+
+    /**
+     * M9.11.3 companion — commit `k` of the N speculative rows that
+     * `forwardVerify()` just wrote provisionally. `k` must be
+     * `<= last_verified_N`. Also appends the newly-committed token ids
+     * to `_cachedTokens` so the prefix-cache stays consistent.
+     *
+     * Kept separate from `forwardVerify` so the accept logic can
+     * inspect the returned logits before deciding how far to commit.
+     */
+    void commitVerified(std::span<const std::int32_t> acceptedTokens);
+
     /// Number of token ids currently cached (i.e. how long an exact
     /// prefix the next request could potentially skip-prefill).
     [[nodiscard]] std::size_t cachedTokenCount() const noexcept {
