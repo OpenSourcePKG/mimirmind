@@ -183,7 +183,10 @@ add_executable(mimirmind
     src/runtime/ThermalProfile.cpp
     src/runtime/UsmAllocator.cpp
     src/runtime/arch/ArchBackend.cpp
+    src/runtime/arch/GemmaBaseBackend.cpp
     src/runtime/arch/Gemma4Backend.cpp
+    src/runtime/arch/Gemma4DenseBackend.cpp
+    src/runtime/arch/Gemma4MoeBackend.cpp
     src/runtime/arch/Qwen2Backend.cpp
     src/server/ApiServer.cpp
 )

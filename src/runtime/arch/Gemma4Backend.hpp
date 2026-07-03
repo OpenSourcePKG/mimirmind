@@ -2,9 +2,8 @@
 
 #include "runtime/arch/ArchBackend.hpp"
 
-#include <cstddef>
-#include <utility>
-#include <vector>
+#include <memory>
+#include <string>
 
 namespace mimirmind::compute {
 class GpuMatmul;
@@ -19,27 +18,21 @@ struct LlmConfig;
 
 namespace mimirmind::runtime::arch {
 
+class GemmaBaseBackend;
+
 /**
- * Gemma 4 26B-A4B-it block.
+ * Gemma 4 architecture backend — public entry point registered with
+ * `createArchBackend("gemma4", ...)`. Owns one of two concrete
+ * implementations picked at construction from `config.expertCount`:
+ *   - expertCount > 0 → `Gemma4MoeBackend`   (26B-A4B-it target)
+ *   - expertCount == 0 → `Gemma4DenseBackend` (4B / 12B / E4B)
  *
- * Architectural quirks (vs Qwen2):
- *   - Per-layer head_dim and kv_heads — SWA layers use head_dim_swa /
- *     kv_heads_swa, full-attention layers use head_dim_full / kv_heads_full.
- *     For 26B-A4B that's (256 × 8) vs (512 × 2).
- *   - Q-K-norm per head; V is bare-RMS-normalised (no learned weight).
- *   - Alternative attention: full-attention layers may omit attn_v.weight
- *     entirely. When that happens V = raw K projection (pre-K-norm,
- *     pre-RoPE). This is the "use_alternative_attention" flag in the
- *     upstream HF/llama.cpp Gemma 4 reference code.
- *   - f_attention_scale = 1.0 (we pre-multiply Q by sqrt(head_dim) so
- *     the internal 1/sqrt(headDim) in multiHeadAttention cancels).
- *   - Per-layer RoPE base (SWA vs full) and `freq_factors` (proportional
- *     RoPE) only on full layers.
- *   - Hybrid FFN: dense path A (GELU SwiGLU) + MoE path B (128 experts,
- *     top-8 with renormalised weights + per-expert ffn_down_exps.scale).
- *   - Multi-norm choreography: attn_norm, attn_post_norm, ffn_norm,
- *     post_ffw_norm_1, pre_ffw_norm_2, post_ffw_norm_2, post_ffw_norm.
- *   - layer_output_scale F32 scalar per block (final per-layer multiply).
+ * Both concrete backends inherit from `GemmaBaseBackend`, which owns
+ * the shared attention block + per-layer info + parity dump machinery.
+ * The facade forwards every `ArchBackend` method to the chosen impl.
+ *
+ * The dispatch is decided once at construction; the impl pointer never
+ * swaps at runtime. A model-load flip requires a fresh process.
  */
 class Gemma4Backend final : public ArchBackend {
 public:
@@ -49,6 +42,8 @@ public:
                   compute::GpuOps&               ops,
                   compute::GpuMatmul&            gmm,
                   runtime::OpProfiler&           opProfiler);
+
+    ~Gemma4Backend() override;
 
     void runBlock(std::size_t   blockIdx,
                   float*        x,
@@ -65,42 +60,10 @@ public:
     [[nodiscard]] std::pair<std::size_t, std::size_t>
         maxQKVDims() const override;
 
-    void setParityDumpPrefix(const std::string& prefix) noexcept override {
-        _parityDumpPrefix = prefix;
-    }
+    void setParityDumpPrefix(const std::string& prefix) noexcept override;
 
 private:
-    /// Per-layer config snapshot, resolved once at construction.
-    struct LayerInfo {
-        bool        isSwa;            // SWA vs full-attention layer
-        bool        altAttention;     // V derived from raw K (no attn_v.weight)
-        std::size_t headDim;          // head_dim for this layer
-        std::size_t nHeads;           // Q head count (always config.headCount)
-        std::size_t nKvHeads;         // KV head count for this layer
-        std::size_t qDim;             // nHeads * headDim
-        std::size_t kvDim;            // nKvHeads * headDim
-        float       ropeBase;         // SWA vs full rope base
-    };
-
-    /// Inspect WeightsMap + config to fill per-layer info.
-    void buildLayerInfos();
-
-    const model::LlmConfig&        _config;
-    const model::WeightsMap&       _weights;
-    const model::FusedQkvWeights*  _fusedQkv{nullptr};
-    compute::GpuOps&               _ops;
-    compute::GpuMatmul&            _gmm;
-    runtime::OpProfiler&           _op;
-
-    std::vector<LayerInfo>    _layers;
-
-    /// USM pointer to the global `rope_freqs.weight` (F32 [head_dim/2])
-    /// used as `freq_factors` for full-attention layers only.
-    const float*              _ropeFreqsForFullAttn{nullptr};
-
-    /// Active when InferenceEngine resolves MIMIRMIND_PARITY_DUMP and
-    /// passes the value via setParityDumpPrefix(). Empty = disabled.
-    std::string               _parityDumpPrefix{};
+    std::unique_ptr<GemmaBaseBackend> _impl;
 };
 
 } // namespace mimirmind::runtime::arch
