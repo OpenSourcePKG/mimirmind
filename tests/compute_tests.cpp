@@ -188,6 +188,108 @@ TEST(sampler_emptyLogits_throws) {
     }
 }
 
+// -----------------------------------------------------------------------
+// M7f — repetition / frequency / presence penalties
+// -----------------------------------------------------------------------
+
+TEST(sampler_penalty_frequencyDivertsGreedyChoice) {
+    // Two logits, index 0 slightly better than index 1. Greedy picks 0
+    // when no history exists.
+    const std::array<float, 2> logits{5.0F, 4.5F};
+    mimirmind::compute::Sampler s;
+    mimirmind::compute::SamplingParams p{};
+    p.temperature       = 0.0F;   // greedy
+    p.frequencyPenalty  = 2.0F;   // strong subtractive penalty
+    p.penaltyWindow     = 64U;
+
+    // Empty history — no penalty, greedy picks 0.
+    EXPECT_EQ(s.sample(logits, p), 0);
+
+    // History has index 0 appearing once. -2.0 penalty subtracts from
+    // its logit → 5.0 - 2.0 = 3.0, less than 4.5 → argmax flips to 1.
+    const std::array<std::int32_t, 1> hist1{0};
+    EXPECT_EQ(s.sample(logits, std::span<const std::int32_t>{hist1}, p), 1);
+}
+
+TEST(sampler_penalty_repetitionDivertsGreedyChoice) {
+    // Same setup as above but using multiplicative repetition_penalty.
+    const std::array<float, 2> logits{5.0F, 3.0F};
+    mimirmind::compute::Sampler s;
+    mimirmind::compute::SamplingParams p{};
+    p.temperature       = 0.0F;
+    p.repetitionPenalty = 2.0F;   // divides positive logits by 2
+    p.penaltyWindow     = 64U;
+
+    // Empty history — greedy picks 0 (5.0 > 3.0).
+    EXPECT_EQ(s.sample(logits, p), 0);
+
+    // History has index 0 → 5.0 / 2.0 = 2.5 < 3.0, argmax flips to 1.
+    const std::array<std::int32_t, 1> hist{0};
+    EXPECT_EQ(s.sample(logits, std::span<const std::int32_t>{hist}, p), 1);
+}
+
+TEST(sampler_penalty_presenceIsBinary) {
+    // Presence penalty triggers on any count > 0, not count.
+    const std::array<float, 2> logits{5.0F, 4.5F};
+    mimirmind::compute::Sampler s;
+    mimirmind::compute::SamplingParams p{};
+    p.temperature      = 0.0F;
+    p.presencePenalty  = 1.0F;
+    p.penaltyWindow    = 64U;
+
+    // History has index 0 once. 5.0 - 1.0 = 4.0 < 4.5 → flip.
+    const std::array<std::int32_t, 1> hist1{0};
+    EXPECT_EQ(s.sample(logits, std::span<const std::int32_t>{hist1}, p), 1);
+
+    // History has index 0 five times. Presence penalty applied once (binary),
+    // not five times. Result unchanged from the single-hit case.
+    const std::array<std::int32_t, 5> hist5{0, 0, 0, 0, 0};
+    EXPECT_EQ(s.sample(logits, std::span<const std::int32_t>{hist5}, p), 1);
+}
+
+TEST(sampler_penalty_windowRestrictsHistory) {
+    // penaltyWindow=2 → only the last two tokens are considered.
+    const std::array<float, 2> logits{5.0F, 4.5F};
+    mimirmind::compute::Sampler s;
+    mimirmind::compute::SamplingParams p{};
+    p.temperature       = 0.0F;
+    p.frequencyPenalty  = 2.0F;
+    p.penaltyWindow     = 2U;
+
+    // History has index 0 way back, then only index 1 recently. Window
+    // only sees {1, 1} → count(0)==0, no penalty on 0, greedy picks 0.
+    const std::array<std::int32_t, 4> hist{0, 0, 1, 1};
+    EXPECT_EQ(s.sample(logits, std::span<const std::int32_t>{hist}, p), 0);
+}
+
+TEST(sampler_penalty_zeroWindowDisables) {
+    // penaltyWindow=0 means "no history considered" regardless of penalty
+    // strength. Verifies the operator-side kill switch.
+    const std::array<float, 2> logits{5.0F, 4.5F};
+    mimirmind::compute::Sampler s;
+    mimirmind::compute::SamplingParams p{};
+    p.temperature       = 0.0F;
+    p.frequencyPenalty  = 5.0F;     // would flip decision if applied
+    p.penaltyWindow     = 0U;
+
+    const std::array<std::int32_t, 3> hist{0, 0, 0};
+    EXPECT_EQ(s.sample(logits, std::span<const std::int32_t>{hist}, p), 0);
+}
+
+TEST(sampler_penalty_neutralParamsAreNoOp) {
+    // Default penalty values are neutral (rep=1.0, freq=0, pres=0).
+    // History with a repeat token shouldn't change greedy choice.
+    const std::array<float, 2> logits{5.0F, 4.5F};
+    mimirmind::compute::Sampler s;
+    mimirmind::compute::SamplingParams p{};
+    p.temperature   = 0.0F;
+    p.penaltyWindow = 64U;
+    // repetitionPenalty=1.0, frequencyPenalty=0, presencePenalty=0 by default
+
+    const std::array<std::int32_t, 3> hist{0, 0, 0};
+    EXPECT_EQ(s.sample(logits, std::span<const std::int32_t>{hist}, p), 0);
+}
+
 // =======================================================================
 // compute::matmul (CPU, double accumulator)
 // =======================================================================

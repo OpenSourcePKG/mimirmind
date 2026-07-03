@@ -252,6 +252,7 @@ InferenceEngine::sampleNext(const float*                   hidden,
                             float*                         normScratch,
                             float*                         logits,
                             float*                         matmulScratch,
+                            std::span<const std::int32_t>  recentTokens,
                             const compute::SamplingParams& sampling) {
     // Final-norm runs on the same queue as the residual-add that
     // produced `hidden`. The subsequent _gmm.matmul flushes and syncs,
@@ -276,7 +277,7 @@ InferenceEngine::sampleNext(const float*                   hidden,
         logits, matmulScratch);
 
     return _sampler.sample(
-        std::span<const float>{logits, vocab_lm}, sampling);
+        std::span<const float>{logits, vocab_lm}, recentTokens, sampling);
 }
 
 std::vector<std::int32_t>
@@ -490,10 +491,16 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // Sample first new token from the last prefill row. xBuf only
         // holds the freshly-prefilled suffix, so the last row sits at
         // (prefillCount - 1) * d_model — not (Tp - 1).
+        //
+        // M7f: seed the penalty window with the last stretch of the
+        // prompt so an immediate first-token repeat (e.g. echoing the
+        // prompt's last phrase) is discouraged as well. Sampler
+        // subspans to `sampling.penaltyWindow` internally.
         const float* lastRow = xBuf + (prefillCount - 1) * d_model;
         std::int32_t nextId = sampleNext(lastRow, vocab_lm,
                                          *outNorm, *lmHead,
                                          normFinal, logits, logitsSc,
+                                         promptIds,
                                          params.sampling);
 
         generated.reserve(maxNew);
@@ -560,6 +567,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             nextId = sampleNext(xBuf, vocab_lm,
                                 *outNorm, *lmHead,
                                 normFinal, logits, logitsSc,
+                                std::span<const std::int32_t>{generated},
                                 params.sampling);
             generated.push_back(nextId);
 

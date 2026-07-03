@@ -102,6 +102,18 @@ Response:
 | `max_completion_tokens` | int | (alias for `max_tokens`) | OpenAI's current name |
 | `stop` | string \| string[] | none | Decoder stops if any stop string appears |
 | `stream` | bool | false | Switches to SSE — see below |
+| `frequency_penalty` | float | **0.5** | OpenAI, [-2, 2]. Server default > 0 to prevent repetition loops. Send explicit `0` to disable. |
+| `presence_penalty` | float | 0.0 | OpenAI, [-2, 2]. |
+| `repetition_penalty` | float | **1.1** | Mimirmind extension (llama.cpp-style multiplicative), typically [1.0, 1.3]. Server default > 1.0. Send explicit `1.0` to disable. |
+
+### Repetition-control note (M7f)
+
+The server applies a mild `frequency_penalty = 0.5` and `repetition_penalty = 1.1` **by default** when the client sends none. This is a
+deliberate deviation from the OpenAI schema (which defaults both to 0) — it protects vanilla clients from token-repetition loops that the
+underlying Q6_K MoE has been observed to fall into on structured RAG prompts. The penalty window is the last 64 tokens of history.
+
+Clients that explicitly send `"frequency_penalty": 0` (or `"repetition_penalty": 1.0`) get exact-OpenAI behaviour. Both are stackable; the
+multiplicative repetition penalty is applied first, then the subtractive frequency + presence.
 
 ### `finish_reason` values
 

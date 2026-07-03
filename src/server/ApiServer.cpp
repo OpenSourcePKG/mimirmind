@@ -79,6 +79,16 @@ struct ChatRequest {
     std::vector<std::string>        stopStrings;
     bool                            stream{false};
     std::string                     model;
+
+    // M7f — repetition-control penalties. `has*` flags distinguish
+    // "client sent 0" from "client sent nothing"; the latter picks up
+    // the server-side default while the former stays at exactly 0.
+    float                           frequencyPenalty{0.0F};
+    bool                            hasFrequencyPenalty{false};
+    float                           presencePenalty{0.0F};
+    bool                            hasPresencePenalty{false};
+    float                           repetitionPenalty{1.0F};
+    bool                            hasRepetitionPenalty{false};
 };
 
 [[nodiscard]] ChatRequest parseChatRequest(const json& body) {
@@ -143,6 +153,13 @@ struct ChatRequest {
     readFloat("temperature", req.temperature, req.hasTemperature);
     readFloat("top_p", req.topP, hasTopP);
     (void)hasTopP;
+
+    // M7f — penalties. `frequency_penalty` + `presence_penalty` match
+    // the OpenAI schema; `repetition_penalty` is a mimirmind extension
+    // matching llama.cpp's convention (multiplicative, range ~1.0-1.3).
+    readFloat("frequency_penalty",  req.frequencyPenalty,  req.hasFrequencyPenalty);
+    readFloat("presence_penalty",   req.presencePenalty,   req.hasPresencePenalty);
+    readFloat("repetition_penalty", req.repetitionPenalty, req.hasRepetitionPenalty);
 
     if (body.contains("seed") && body["seed"].is_number_integer()) {
         req.seed = body["seed"].get<std::uint64_t>();
@@ -954,6 +971,28 @@ struct ApiServer::Impl {
         params.sampling.topP = cr.topP;
         params.sampling.topK = cr.topK;
         params.sampling.seed = cr.seed;
+
+        // M7f — repetition-control penalties.
+        //
+        // Server-side defaults are opinionated: we saw a 26B-A4B-it
+        // Q6_K model fall into a 1300-token repetition loop when no
+        // client-side penalty was set, because SamplingParams alone
+        // has no history-based mechanism to break out. Applying a mild
+        // frequency + repetition penalty by default protects vanilla
+        // OpenAI clients (that don't send any penalty) from the same
+        // failure mode. Clients that explicitly set a penalty value
+        // (including 0) override the default.
+        constexpr float        kDefaultFrequencyPenalty  = 0.5F;
+        constexpr float        kDefaultRepetitionPenalty = 1.10F;
+        constexpr std::uint32_t kDefaultPenaltyWindow    = 64U;
+
+        params.sampling.frequencyPenalty =
+            cr.hasFrequencyPenalty  ? cr.frequencyPenalty  : kDefaultFrequencyPenalty;
+        params.sampling.presencePenalty =
+            cr.hasPresencePenalty   ? cr.presencePenalty   : 0.0F;
+        params.sampling.repetitionPenalty =
+            cr.hasRepetitionPenalty ? cr.repetitionPenalty : kDefaultRepetitionPenalty;
+        params.sampling.penaltyWindow = kDefaultPenaltyWindow;
         return true;
     }
 

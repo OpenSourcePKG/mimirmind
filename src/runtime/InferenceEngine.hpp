@@ -260,13 +260,16 @@ public:
 private:
     /// Compute logits over the last hidden state row via final-norm +
     /// lm_head, then draw one token id using `_sampler` and `params`.
-    std::int32_t sampleNext(const float*                  hidden,
-                            std::size_t                   vocab_lm,
-                            const model::GgufTensor&      outNorm,
-                            const model::GgufTensor&      lmHead,
-                            float*                        normScratch,
-                            float*                        logits,
-                            float*                        matmulScratch,
+    /// `recentTokens` — ordered oldest-to-newest history that the
+    /// sampler subspans internally for penalty accounting (M7f).
+    std::int32_t sampleNext(const float*                   hidden,
+                            std::size_t                    vocab_lm,
+                            const model::GgufTensor&       outNorm,
+                            const model::GgufTensor&       lmHead,
+                            float*                         normScratch,
+                            float*                         logits,
+                            float*                         matmulScratch,
+                            std::span<const std::int32_t>  recentTokens,
                             const compute::SamplingParams& sampling);
 
     /// Allocate (lazily on first call) the persistent KV-cache at the
