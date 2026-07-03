@@ -4,6 +4,7 @@
 #include "model/LlmConfig.hpp"
 #include "model/ResponseCleaner.hpp"
 #include "model/Tokenizer.hpp"
+#include "runtime/FanController.hpp"
 #include "runtime/GpuClockGovernor.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/Log.hpp"
@@ -564,12 +565,34 @@ struct ApiServer::Impl {
             build["internal_version"] = det->internalVersion();
         }
 
+        // Fan controller envelope — chip identity + baseline values
+        // captured at startup. Absent (null) when no writable pwm/pwm_enable
+        // pair was found. Live pwm/rpm belong in /system/status, not here.
+        json fanEnvelope;
+        if (auto* fc = engine.fanController();
+            fc != nullptr && fc->available()) {
+            fanEnvelope = {
+                {"chip_name",         std::string{fc->chipName()}},
+                {"chip_path",         std::string{fc->chipPath()}},
+                {"pwm_path",          std::string{fc->pwmPath()}},
+                {"pwm_enable_path",   std::string{fc->pwmEnablePath()}},
+                {"fan_input_path",    std::string{fc->fanInputPath()}},
+                {"original_pwm",      fc->originalPwm()},
+                {"original_enable",   fc->originalEnableMode()},
+                {"boost_pwm",         fc->boostPwm()},
+                {"min_safe_pwm",      fc->minSafePwm()},
+            };
+        } else {
+            fanEnvelope = nullptr;
+        }
+
         json body = {
             {"model",                  model},
             {"tokenizer",              tokenizer},
             {"kv_cache",               kvCache},
             {"hardware",               hardware},
             {"gpu_clock_envelope",     gpuClockEnvelope},
+            {"fan_envelope",           fanEnvelope},
             {"thermal_profile",        thermalProfile},
             {"perf_regression_config", perfRegressionConfig},
             {"kernels",                buildKernelsBlock()},
@@ -633,6 +656,7 @@ struct ApiServer::Impl {
         };
         body["power"]           = buildPowerBlock();
         body["gpu_clock"]       = buildGpuClockBlock();
+        body["fan"]             = buildFanBlock();
         body["kernels"]         = buildKernelsBlock();
         body["perf_regression"] = buildPerfRegressionBlock();
         sendJson(res, 200, body);
@@ -727,6 +751,35 @@ struct ApiServer::Impl {
             };
         }
         return body;
+    }
+
+    /// Compose the "fan" sub-object of /v1/system/status.
+    /// Live pwm value / RPM / mode (auto vs manual) — the parts of the
+    /// FanController state that change per request. Static chip identity
+    /// stays in /system/info.fan_envelope.
+    json buildFanBlock() {
+        auto* fc = engine.fanController();
+        if (fc == nullptr) {
+            return json{
+                {"available", false},
+                {"reason",    "no FanController installed "
+                              "(MIMIRMIND_FAN_BOOST=off or probe failed)"},
+            };
+        }
+        if (!fc->available()) {
+            return json{
+                {"available", false},
+                {"reason",    std::string{fc->unavailableReason()}},
+            };
+        }
+        return json{
+            {"available",   true},
+            {"chip_name",   std::string{fc->chipName()}},
+            {"current_pwm", fc->currentPwm()},
+            {"current_rpm", fc->currentFanRpm()},
+            {"mode",        fc->currentEnableMode()},  // 1=manual, 2..=auto
+            {"boost_active", fc->boostActive()},
+        };
     }
 
     /// Compose the "kernels" sub-object of /v1/system/status.

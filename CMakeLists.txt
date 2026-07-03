@@ -173,6 +173,7 @@ add_executable(mimirmind
     src/runtime/KvCache.cpp
     src/runtime/L0Context.cpp
     src/runtime/Log.cpp
+    src/runtime/FanController.cpp
     src/runtime/GpuClockGovernor.cpp
     src/runtime/MappedFile.cpp
     src/runtime/OpProfiler.cpp

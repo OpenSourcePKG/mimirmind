@@ -10,6 +10,7 @@
 #include "runtime/CommandQueue.hpp"
 #include "runtime/GpuKernel.hpp"
 #include "runtime/GpuModule.hpp"
+#include "runtime/FanController.hpp"
 #include "runtime/GpuClockGovernor.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/L0Context.hpp"
@@ -1323,6 +1324,93 @@ int runServe(const CliArgs& args) {
     // reason; the engine still runs.
     auto powerMonitor = std::make_unique<mimirmind::runtime::PowerMonitor>();
     engine.setPowerMonitor(powerMonitor.get());
+
+    // M9.11.b chassis fan controller. Probes /sys/class/hwmon/* at
+    // construction; if a writable pwm/pwm_enable pair is found, the
+    // engine boosts the fan at the start of each generate() and
+    // releases to auto at the end. Original BIOS values captured for
+    // RAII restore on process exit.
+    //
+    // Env vars:
+    //   MIMIRMIND_FAN_BOOST=off        → do not install (kill switch)
+    //   MIMIRMIND_FAN_PWM_BOOST=<0-255>→ override boost target
+    //   MIMIRMIND_FAN_PWM_MIN=<0-255>  → override safety floor
+    // Kill switch is checked first so we can disable the whole feature
+    // without touching sysfs at all — useful when the BIOS refuses
+    // manual mode and hwmon writes are throwing kernel warnings.
+    static std::unique_ptr<mimirmind::runtime::FanController> fanController;
+    {
+        const char* boostEnv = std::getenv("MIMIRMIND_FAN_BOOST");
+        const bool  disabled =
+            boostEnv != nullptr && std::string_view{boostEnv} == "off";
+        if (!disabled) {
+            fanController = std::make_unique<mimirmind::runtime::FanController>();
+            if (!fanController->available()) {
+                MM_LOG_WARN("main",
+                            "FanController unavailable — no proactive fan "
+                            "boost. Reason: {}",
+                            fanController->unavailableReason());
+                fanController.reset();
+            } else {
+                if (const char* v = std::getenv("MIMIRMIND_FAN_PWM_BOOST");
+                    v != nullptr && v[0] != '\0') {
+                    char* end = nullptr;
+                    const unsigned long parsed = std::strtoul(v, &end, 10);
+                    if (end != v && *end == '\0' && parsed <= 255) {
+                        fanController->setBoostPwm(
+                            static_cast<std::uint8_t>(parsed));
+                    }
+                }
+                if (const char* v = std::getenv("MIMIRMIND_FAN_PWM_MIN");
+                    v != nullptr && v[0] != '\0') {
+                    char* end = nullptr;
+                    const unsigned long parsed = std::strtoul(v, &end, 10);
+                    if (end != v && *end == '\0' && parsed <= 255) {
+                        fanController->setMinSafePwm(
+                            static_cast<std::uint8_t>(parsed));
+                    }
+                }
+                MM_LOG_INFO("main",
+                            "FanController ready — chip='{}' pwm='{}' "
+                            "fan_input='{}' orig_pwm={} orig_enable={} "
+                            "boost={} min_safe={}",
+                            fanController->chipName(),
+                            fanController->pwmPath(),
+                            fanController->fanInputPath(),
+                            fanController->originalPwm(),
+                            fanController->originalEnableMode(),
+                            fanController->boostPwm(),
+                            fanController->minSafePwm());
+                engine.setFanController(fanController.get());
+            }
+        }
+    }
+
+    // Thermal-safety cross-check: MIMIRMIND_GPU_CLOCK_PIN=rp0 disables
+    // the P-controller entirely, so the FanController is the only
+    // active thermal regulator during sustained decode. Warn loudly
+    // when the operator asks for rp0 without a functioning fan-boost
+    // path — this is the exact 2026-07-01 shutdown scenario.
+    {
+        const char* pinEnv = std::getenv("MIMIRMIND_GPU_CLOCK_PIN");
+        const bool  wantsRp0 =
+            pinEnv != nullptr
+            && (std::string_view{pinEnv} == "rp0"
+                || std::string_view{pinEnv} == "RP0");
+        const bool fanActive =
+            fanController != nullptr && fanController->available();
+        if (wantsRp0 && !fanActive) {
+            MM_LOG_WARN("main",
+                        "MIMIRMIND_GPU_CLOCK_PIN=rp0 is set but the "
+                        "FanController is not active — the P-controller "
+                        "is disabled AND no proactive cooling is "
+                        "installed. Sustained decode on a passively "
+                        "cooled chassis can trigger a hardware thermal "
+                        "shutdown (see 2026-07-01 incident). Consider "
+                        "MIMIRMIND_GPU_CLOCK_PIN=<numeric MHz> as a "
+                        "safer bench mode.");
+        }
+    }
 
     // In-process perf-regression detector. Feeds off the same per-token
     // wall-time the NDJSON sink already computes, so it costs a couple

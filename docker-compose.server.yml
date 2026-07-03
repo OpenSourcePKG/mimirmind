@@ -163,6 +163,29 @@ services:
             #   MIMIRMIND_USE_GEMM_V2=1  → activate v2 dispatch.
             MIMIRMIND_USE_GEMM_V2:       ${MIMIRMIND_USE_GEMM_V2:-}
 
+            # M9.11.b — proactive chassis-fan boost during inference.
+            # FanController probes /sys/class/hwmon/hwmon* at startup;
+            # if a writable pwm/pwm_enable pair is found, generate()
+            # boosts the fan on request-start and releases to auto on
+            # request-end. Baseline BIOS values are captured for RAII
+            # restore on process exit.
+            #
+            #   MIMIRMIND_FAN_BOOST=off        → skip the whole feature
+            #   MIMIRMIND_FAN_PWM_BOOST=<0-255>→ boost target (default 255)
+            #   MIMIRMIND_FAN_PWM_MIN=<0-255>  → safety floor (default 64,
+            #                                    absolute floor 32 — never
+            #                                    less, would risk stopping
+            #                                    the fan on a passively
+            #                                    cooled chassis)
+            #
+            # Requires /sys/class/hwmon writable from inside the container.
+            # Docker default lets root inside the container write to hwmon
+            # nodes that the kernel driver marks writable; if not, the
+            # probe fails silently and the feature is a no-op.
+            MIMIRMIND_FAN_BOOST:         ${MIMIRMIND_FAN_BOOST:-}
+            MIMIRMIND_FAN_PWM_BOOST:     ${MIMIRMIND_FAN_PWM_BOOST:-}
+            MIMIRMIND_FAN_PWM_MIN:       ${MIMIRMIND_FAN_PWM_MIN:-}
+
             # In-process perf-regression detector — sits next to the
             # NDJSON sink and alerts when current-run decode p50 exceeds
             # the trailing 7-day baseline p50 by 1.15x. State (rolling

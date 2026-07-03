@@ -17,6 +17,7 @@
 #include "runtime/UsmHandle.hpp"
 
 namespace mimirmind::runtime {
+class FanController;
 class GpuClockGovernor;
 class PerfRegressionDetector;
 class PowerMonitor;
@@ -226,6 +227,18 @@ public:
         return _perfDetector;
     }
 
+    /// Install (or remove with nullptr) the chassis-fan controller.
+    /// Non-owning. When set, generate() calls boost() at the start of
+    /// each request and releaseToAuto() at the end — proactive cooling
+    /// so the GPU clock governor has headroom to hold high caps during
+    /// sustained decode. No-op when the controller reports unavailable.
+    void setFanController(FanController* c) noexcept {
+        _fanController = c;
+    }
+    [[nodiscard]] FanController* fanController() const noexcept {
+        return _fanController;
+    }
+
     // --- Accessors (used by smoke path + diagnostics) -------------------
 
     [[nodiscard]] L0Context&               ctx()              noexcept { return _ctx; }
@@ -315,6 +328,10 @@ private:
     // Optional non-owning perf-regression detector. Fed per decode
     // token; consulted from /v1/system/status.
     PerfRegressionDetector*            _perfDetector{nullptr};
+    // Optional non-owning fan controller. When present, generate()
+    // boosts the fan on entry and releases to auto on exit — proactive
+    // cooling for sustained-decode headroom.
+    FanController*                     _fanController{nullptr};
 
     // One-shot block-0 trace. Default off so production serve mode is
     // quiet; set MIMIRMIND_TRACE_BLOCK0=1 to enable when bringing up a

@@ -2,6 +2,7 @@
 
 #include "compute/Embedding.hpp"
 #include "model/GgufTypes.hpp"
+#include "runtime/FanController.hpp"
 #include "runtime/Lcp.hpp"
 #include "runtime/Log.hpp"
 #include "runtime/GpuClockGovernor.hpp"
@@ -311,6 +312,29 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     if (_thermalGuard != nullptr) {
         _thermalGuard->checkAdmission();
     }
+
+    // M9.11.b proactive fan boost. Ramp the chassis fan up before
+    // prefill so the GPU clock governor has thermal headroom when
+    // matmul starts pulling watts. RAII guard so an exception during
+    // prefill/decode still releases the fan back to auto — leaving the
+    // fan pinned at 100 % across an entire idle period would be loud
+    // and would burn power.
+    struct FanBoostGuard {
+        FanController* fc;
+        explicit FanBoostGuard(FanController* c) : fc{c} {
+            if (fc != nullptr && fc->available()) {
+                (void)fc->boost();
+            }
+        }
+        ~FanBoostGuard() {
+            if (fc != nullptr && fc->available()) {
+                fc->releaseToAuto();
+            }
+        }
+        FanBoostGuard(const FanBoostGuard&)            = delete;
+        FanBoostGuard& operator=(const FanBoostGuard&) = delete;
+    };
+    FanBoostGuard fanBoost{_fanController};
 
     // Snapshot RAPL counters at the start so generate() can report how
     // much energy the request consumed. No-op when the monitor is
