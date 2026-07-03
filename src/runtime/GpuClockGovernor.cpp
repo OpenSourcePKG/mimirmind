@@ -112,6 +112,16 @@ std::uint32_t GpuClockGovernor::setMaxFreqMhz(std::uint32_t mhz) {
     return _currentCap;
 }
 
+std::uint32_t GpuClockGovernor::pin(std::uint32_t mhz,
+                                    std::string_view intent,
+                                    std::string_view rawEnv) {
+    _pinned    = true;
+    _pinIntent = std::string{intent};
+    _pinRawEnv = std::string{rawEnv};
+    _pinnedMhz = setMaxFreqMhz(mhz);
+    return _pinnedMhz;
+}
+
 std::uint32_t GpuClockGovernor::adjustForTemp(float current_temp_c) {
     if (!_available) {
         return 0;

@@ -64,6 +64,22 @@ public:
     /// write (kernel-verified via re-read).
     std::uint32_t setMaxFreqMhz(std::uint32_t mhz);
 
+    /// Session-level clock pin (M9.11.a). Applies `mhz` (clamped by
+    /// setMaxFreqMhz) and records the intent ("rp0" / "rpn" / "numeric")
+    /// and the raw MIMIRMIND_GPU_CLOCK_PIN env value that produced it.
+    /// The InferenceEngine's decode loop consults pinned() and skips
+    /// its P-controller tick when true, so a pinned cap survives the
+    /// full session. Reported through /v1/system/info and /system/status
+    /// so any perf-bench number can be attributed to the pin it ran under.
+    std::uint32_t pin(std::uint32_t mhz,
+                      std::string_view intent,
+                      std::string_view rawEnv);
+
+    [[nodiscard]] bool             pinned()     const noexcept { return _pinned; }
+    [[nodiscard]] std::uint32_t    pinnedMhz()  const noexcept { return _pinnedMhz; }
+    [[nodiscard]] std::string_view pinIntent()  const noexcept { return _pinIntent; }
+    [[nodiscard]] std::string_view pinRawEnv()  const noexcept { return _pinRawEnv; }
+
     /// Asymmetric P-controller: nudges current cap toward keeping
     /// `current_temp_c` at targetTempC(). The gain is direction-
     /// dependent so we drop the cap fast when overshooting target
@@ -114,6 +130,14 @@ private:
     std::uint32_t _currentCap{0};
     float         _targetTempC{kDefaultTargetTempC};
     bool          _available{false};
+
+    // M9.11.a session-level pin. Set once via pin(); read by the engine's
+    // decode loop (skip P-controller tick) and by ApiServer (report to
+    // /system/info + /system/status).
+    bool          _pinned{false};
+    std::uint32_t _pinnedMhz{0};
+    std::string   _pinIntent{};
+    std::string   _pinRawEnv{};
 };
 
 } // namespace mimirmind::runtime

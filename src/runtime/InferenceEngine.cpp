@@ -513,8 +513,9 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 }
             }
 
-            if (_gpuGovernor != nullptr && _governorMonitor != nullptr &&
-                (step % kGovernorWindow) == 0) {
+            if (_gpuGovernor != nullptr && !_gpuGovernor->pinned()
+                && _governorMonitor != nullptr
+                && (step % kGovernorWindow) == 0) {
                 (void)_gpuGovernor->tick(*_governorMonitor);
             }
 

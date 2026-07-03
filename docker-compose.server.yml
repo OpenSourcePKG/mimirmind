@@ -137,10 +137,13 @@ services:
             #   DISABLE_FUSED_QKV=1  → 3-matmul UnorderedScope-Pfad zurück,
             #                          FusedQkvWeights baut keine Blocks auf.
             #   DISABLE_MOE_GROUP=1  → per-Token MoE-Loop zurück (T>1).
-            #   GPU_CLOCK_PIN=rp0    → Governor umgehen, Cap pinned auf RP0.
-            #                          NUR für Bench-Runs, nicht sustained
-            #                          Multi-Request-Traffic auf passiv-
-            #                          gekühltem Chassis!
+            #   GPU_CLOCK_PIN=<val>  → Cap pinnen, P-controller tick aus.
+            #                          Werte: rp0 (HW max), rpn (HW min ~800),
+            #                          numerisch (MHz, geklammert an [RPn,RP0]).
+            #                          M9.11.a — für Bench-Repeatability. NUR
+            #                          für Bench-Runs, nicht sustained Multi-
+            #                          Request-Traffic auf passiv-gekühltem
+            #                          Chassis!
             MIMIRMIND_DISABLE_GEMM:      ${MIMIRMIND_DISABLE_GEMM:-}
             MIMIRMIND_FORCE_GEMM:        ${MIMIRMIND_FORCE_GEMM:-}
             MIMIRMIND_GEMM_MIN_M:        ${MIMIRMIND_GEMM_MIN_M:-}

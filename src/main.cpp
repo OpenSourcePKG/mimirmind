@@ -1201,19 +1201,59 @@ int runServe(const CliArgs& args) {
         // writable, we install it. Otherwise we move on without one —
         // the per-token thermal pace still runs as a safety net.
         //
-        // MIMIRMIND_GPU_CLOCK_PIN=rp0 bypasses the governor entirely
-        // and pins the software cap to RP0 for the whole session. Meant
-        // for perf-bench runs where the M9.6.5 asymmetric gains would
-        // otherwise clock down too aggressively and confound the
+        // MIMIRMIND_GPU_CLOCK_PIN pins the software cap for the whole
+        // session and suppresses the P-controller tick. Meant for
+        // perf-bench runs where the M9.6.5 asymmetric gains would
+        // otherwise clock down aggressively and confound the
         // measurement. Package thermal safety still runs via the
         // ThermalGuard admission check + per-token pace. Do NOT ship
         // this to sustained workloads on a passively-cooled chassis.
+        //
+        // M9.11.a accepted values:
+        //   rp0            → hardware max (RP0)
+        //   rpn            → hardware min (RPn, ~800 MHz on Xe-LPG)
+        //   <MHz integer>  → arbitrary cap, clamped to [RPn, RP0]
+        //   unset / 0 / off / false / no → no pin (governor ticks as normal)
+        enum class ClockPinIntent { None, Rp0, Rpn, Numeric };
+        struct ClockPinRequest {
+            ClockPinIntent intent = ClockPinIntent::None;
+            std::uint32_t  mhz    = 0;
+            std::string    rawEnv;
+            bool           malformed = false;
+        };
+        const auto parseClockPin = [](const char* env) {
+            ClockPinRequest req;
+            if (env == nullptr || env[0] == '\0') {
+                return req;
+            }
+            std::string_view sv{env};
+            if (sv == "0" || sv == "off" || sv == "false" || sv == "no") {
+                return req; // treat as unset
+            }
+            req.rawEnv = env;
+            if (sv == "rp0" || sv == "RP0") {
+                req.intent = ClockPinIntent::Rp0;
+                return req;
+            }
+            if (sv == "rpn" || sv == "RPn" || sv == "RPN") {
+                req.intent = ClockPinIntent::Rpn;
+                return req;
+            }
+            char* end = nullptr;
+            const unsigned long v = std::strtoul(env, &end, 10);
+            if (end != env && *end == '\0' && v > 0 && v < 100000) {
+                req.intent = ClockPinIntent::Numeric;
+                req.mhz    = static_cast<std::uint32_t>(v);
+                return req;
+            }
+            req.malformed = true;
+            return req;
+        };
+
         static std::unique_ptr<mimirmind::runtime::GpuClockGovernor> governor;
-        const char* clockPinEnv = std::getenv("MIMIRMIND_GPU_CLOCK_PIN");
-        const bool  clockPinRp0 =
-            clockPinEnv != nullptr && clockPinEnv[0] != '\0'
-            && std::string_view{clockPinEnv} != "0"
-            && std::string_view{clockPinEnv} != "off";
+        const auto pinReq = parseClockPin(std::getenv("MIMIRMIND_GPU_CLOCK_PIN"));
+        const bool clockPinRequested = pinReq.intent != ClockPinIntent::None;
+
         if (profile.hasGpuClockTarget()) {
             governor = std::make_unique<mimirmind::runtime::GpuClockGovernor>();
             governor->setTargetTempC(*profile.gpu_target_temp_c);
@@ -1225,26 +1265,55 @@ int runServe(const CliArgs& args) {
                             *profile.gpu_target_temp_c,
                             governor->unavailableReason());
                 governor.reset();
-            } else if (clockPinRp0) {
-                const auto rp0 = governor->rp0Mhz();
-                const auto pinned = governor->setMaxFreqMhz(rp0);
+            } else if (clockPinRequested) {
+                std::uint32_t   requestedMhz = 0;
+                std::string_view intentName  = "";
+                switch (pinReq.intent) {
+                    case ClockPinIntent::Rp0:
+                        requestedMhz = governor->rp0Mhz();
+                        intentName   = "rp0";
+                        break;
+                    case ClockPinIntent::Rpn:
+                        requestedMhz = governor->rpnMhz();
+                        intentName   = "rpn";
+                        break;
+                    case ClockPinIntent::Numeric:
+                        requestedMhz = pinReq.mhz;
+                        intentName   = "numeric";
+                        break;
+                    case ClockPinIntent::None:
+                        break;
+                }
+                const auto pinned = governor->pin(
+                    requestedMhz, intentName, pinReq.rawEnv);
                 MM_LOG_WARN("main",
                             "MIMIRMIND_GPU_CLOCK_PIN={} — cap pinned to "
-                            "RP0 ({} MHz), governor NOT installed. Bench "
-                            "mode. Thermal safety still via ThermalGuard.",
-                            clockPinEnv, pinned);
-                // Keep governor alive (static) so destructor restores
-                // RP0 on shutdown — but skip setGpuClockGovernor so no
-                // tick ever overrides our pin.
+                            "{} MHz (intent={}, envelope [{},{}]). "
+                            "P-controller tick suppressed. Bench mode. "
+                            "Thermal safety still via ThermalGuard.",
+                            pinReq.rawEnv, pinned, intentName,
+                            governor->rpnMhz(), governor->rp0Mhz());
+                // Install the governor anyway so ApiServer can report
+                // the pin state via /system/info + /system/status. The
+                // engine's tick loop consults governor->pinned() and
+                // skips its adjust call, so the pin survives the run.
+                engine.setGpuClockGovernor(governor.get(), monitor.get());
             } else {
+                if (pinReq.malformed) {
+                    MM_LOG_WARN("main",
+                                "MIMIRMIND_GPU_CLOCK_PIN={} not recognised — "
+                                "expected rp0 / rpn / <MHz> / 0 / off. "
+                                "Installing governor as if unset.",
+                                pinReq.rawEnv);
+                }
                 engine.setGpuClockGovernor(governor.get(), monitor.get());
             }
-        } else if (clockPinRp0) {
+        } else if (clockPinRequested) {
             MM_LOG_WARN("main",
                         "MIMIRMIND_GPU_CLOCK_PIN={} ignored — thermal "
                         "profile has no gpu_target_temp_c so no governor "
                         "was going to be installed anyway.",
-                        clockPinEnv);
+                        pinReq.rawEnv);
         }
     }
 

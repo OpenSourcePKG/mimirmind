@@ -504,6 +504,16 @@ struct ApiServer::Impl {
                 {"rpn_mhz",       gov->rpnMhz()},
                 {"target_temp_c", gov->targetTempC()},
             };
+            // M9.11.a — bench-repeatability pin. When present every
+            // perf number in the same session was taken under this cap,
+            // so the ledger can attribute it correctly.
+            if (gov->pinned()) {
+                gpuClockEnvelope["pin"] = {
+                    {"intent",  std::string{gov->pinIntent()}},
+                    {"raw_env", std::string{gov->pinRawEnv()}},
+                    {"cap_mhz", gov->pinnedMhz()},
+                };
+            }
         } else {
             gpuClockEnvelope = nullptr;
         }
@@ -701,7 +711,7 @@ struct ApiServer::Impl {
                 {"reason",    std::string{gov->unavailableReason()}},
             };
         }
-        return json{
+        json body{
             {"available",       true},
             {"card_path",       std::string{gov->cardPath()}},
             {"rp0_mhz",         gov->rp0Mhz()},
@@ -709,6 +719,14 @@ struct ApiServer::Impl {
             {"current_cap_mhz", gov->currentCapMhz()},
             {"target_temp_c",   gov->targetTempC()},
         };
+        if (gov->pinned()) {
+            body["pin"] = {
+                {"intent",  std::string{gov->pinIntent()}},
+                {"raw_env", std::string{gov->pinRawEnv()}},
+                {"cap_mhz", gov->pinnedMhz()},
+            };
+        }
+        return body;
     }
 
     /// Compose the "kernels" sub-object of /v1/system/status.

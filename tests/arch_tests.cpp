@@ -1143,6 +1143,34 @@ TEST(gpuGovernor_destructorRestoresRP0) {
     EXPECT_EQ(d.readMax("card1"), std::uint32_t{2350});
 }
 
+TEST(gpuGovernor_pinRecordsIntentAndClampsMhz) {
+    // M9.11.a — pin() must clamp like setMaxFreqMhz and expose the
+    // intent + raw env for /system/info reporting.
+    FakeDrm d;
+    d.addCard("card1", 2350, 800, 2350);
+    mimirmind::runtime::GpuClockGovernor g{d.root};
+
+    EXPECT_TRUE(!g.pinned());
+
+    // Numeric in-range.
+    EXPECT_EQ(g.pin(1200, "numeric", "1200"), std::uint32_t{1200});
+    EXPECT_TRUE(g.pinned());
+    EXPECT_EQ(g.pinnedMhz(), std::uint32_t{1200});
+    EXPECT_EQ(g.pinIntent(), "numeric");
+    EXPECT_EQ(g.pinRawEnv(), "1200");
+    EXPECT_EQ(d.readMax("card1"), std::uint32_t{1200});
+
+    // Below RPn — clamped up.
+    EXPECT_EQ(g.pin(100, "numeric", "100"), std::uint32_t{800});
+    EXPECT_EQ(g.pinnedMhz(), std::uint32_t{800});
+    EXPECT_EQ(d.readMax("card1"), std::uint32_t{800});
+
+    // rpn intent.
+    EXPECT_EQ(g.pin(g.rpnMhz(), "rpn", "rpn"), std::uint32_t{800});
+    EXPECT_EQ(g.pinIntent(), "rpn");
+    EXPECT_EQ(g.pinRawEnv(), "rpn");
+}
+
 TEST(thermalProfile_loadsGpuTargetTempC) {
     TempJsonFile f{R"({
         "name": "test",
