@@ -12,10 +12,12 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <random>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -33,11 +35,27 @@ bool envSet(const char* name) noexcept {
     return !s.empty() && s != "0" && s != "false" && s != "off";
 }
 
-// M8.J — the M-values benched by autotune() and used to derive
-// `Entry::gemmMinM`. Must match `AutotuneReport::mBuckets`.
-constexpr std::array<std::size_t, 3> kAutotuneMBuckets = {16, 64, 256};
+// kAutotuneMBuckets + kAutotuneBucketCount moved to the .hpp so
+// Entry / AutotuneReport / GpuMatmul.cpp all see the same size.
 constexpr std::size_t kGemmMinMNever =
     std::numeric_limits<std::size_t>::max();
+
+// Format a multi-bucket kernel-timing row as
+//   "M=16 X.XX/M=64 X.XX/..."
+// so the two-bench-per-line "autotune:" logs scale with bucket count.
+std::string formatBucketRow(std::span<const double> ms) {
+    std::string out;
+    out.reserve(ms.size() * 16);
+    for (std::size_t i = 0; i < ms.size(); ++i) {
+        if (i > 0) out += " | ";
+        out += "M=";
+        out += std::to_string(kAutotuneMBuckets[i]);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), " %.2f", ms[i]);
+        out += buf;
+    }
+    return out;
+}
 
 // Parse MIMIRMIND_GEMM_MIN_M as a positive integer. Returns 0 (which
 // the caller interprets as "not set") on any parse failure, negative
@@ -494,15 +512,11 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
         entry.autotuneSource = "bench";
 
         MM_LOG_INFO("gpummm",
-                    "autotune: {} N={} K={} — "
-                    "M=16 vec={:.2f}/gemm={:.2f} ms | "
-                    "M=64 vec={:.2f}/gemm={:.2f} ms | "
-                    "M=256 vec={:.2f}/gemm={:.2f} ms → "
+                    "autotune: {} N={} K={} — vec:[{}] | gemm:[{}] → "
                     "gemmMinM={}",
                     qt->name(), N, K,
-                    entry.vecMsAtM[0], entry.gemmMsAtM[0],
-                    entry.vecMsAtM[1], entry.gemmMsAtM[1],
-                    entry.vecMsAtM[2], entry.gemmMsAtM[2],
+                    formatBucketRow(entry.vecMsAtM),
+                    formatBucketRow(entry.gemmMsAtM),
                     entry.gemmMinM == kGemmMinMNever
                         ? std::string{"never"}
                         : std::to_string(entry.gemmMinM));
@@ -555,14 +569,11 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
             (void)v2Tile;
             MM_LOG_INFO("gpummm",
                         "autotune: {} GEMM v2 (M_TILE={}, X_TILE=256, "
-                        "SLM=8 KiB/WG) — "
-                        "M=16 v2={:.2f} ms (v1 {:.2f}, vec {:.2f}) | "
-                        "M=64 v2={:.2f} ms (v1 {:.2f}, vec {:.2f}) | "
-                        "M=256 v2={:.2f} ms (v1 {:.2f}, vec {:.2f})",
+                        "SLM=8 KiB/WG) — v2:[{}] | v1:[{}] | vec:[{}]",
                         qt->name(), entry.gemmV2MTile,
-                        entry.gemmV2MsAtM[0], entry.gemmMsAtM[0], entry.vecMsAtM[0],
-                        entry.gemmV2MsAtM[1], entry.gemmMsAtM[1], entry.vecMsAtM[1],
-                        entry.gemmV2MsAtM[2], entry.gemmMsAtM[2], entry.vecMsAtM[2]);
+                        formatBucketRow(entry.gemmV2MsAtM),
+                        formatBucketRow(entry.gemmMsAtM),
+                        formatBucketRow(entry.vecMsAtM));
 
             // Env-var opt-in. Only fires when the v2 bench actually
             // completed for all buckets AND the operator asked for it.

@@ -24,6 +24,22 @@ namespace mimirmind::compute {
 
 class GpuOps;
 
+// M8.J.2 — M-buckets benched by autotune() and reported via
+// /v1/system/info.kernels.matmul.<type>.{vec,gemm}_ms_at_m. Small
+// values (16-64) cover single-request decode + short-prompt prefill;
+// large values (512-1024) cover realistic RAG-prompt prefill on 26B
+// where a batched matmul at M=400-500 is the dominant kernel cost.
+//
+// M8.J original was {16, 64, 256} — too low for RAG-prefill. The
+// M=256 → gemmMinM threshold underfit prefill because Q6_K v2 loses
+// at 256 but might win at 512+; without a bench data point there,
+// the auto-pick logic can't see the crossover.
+inline constexpr std::array<std::size_t, 5> kAutotuneMBuckets{
+    16, 64, 256, 512, 1024,
+};
+inline constexpr std::size_t kAutotuneBucketCount =
+    kAutotuneMBuckets.size();
+
 /**
  * Drop-in replacement for compute::matmul that dispatches to GPU kernels
  * for weight types whose QuantType advertises a `gpuMatmulModule()`. For
@@ -161,9 +177,9 @@ public:
         double      gemmMs;
         // M8.J — per-M-bucket timings + threshold. Buckets match
         // kAutotuneMBuckets in GpuMatmul.cpp (16, 64, 256).
-        std::array<std::size_t, 3> mBuckets{};
-        std::array<double, 3>      vecMsAtM{};
-        std::array<double, 3>      gemmMsAtM{};
+        std::array<std::size_t, kAutotuneBucketCount> mBuckets{};
+        std::array<double, kAutotuneBucketCount>      vecMsAtM{};
+        std::array<double, kAutotuneBucketCount>      gemmMsAtM{};
         std::size_t                gemmMinM{0};  // 0 = "not set" (rendered as null in JSON)
         // M8.H.3 — only meaningful for Q8_0 on iGPUs where the DP4A
         // module loaded. Zero elsewhere.
@@ -173,7 +189,7 @@ public:
         // M8.K.1 — v2 GEMM prototype (M_TILE=16) telemetry. Q8_0 only.
         bool        gemmV2Available{false};
         bool        gemmV2Picked{false};
-        std::array<double, 3> gemmV2MsAtM{};
+        std::array<double, kAutotuneBucketCount> gemmV2MsAtM{};
         std::string source;              // "bench" | "env_force_gemm" | "env_disable_gemm" | "no_gemm" | "parity_fail" | "dp4a_parity_fail" | "env_force_dp4a" | "env_gemm_min_m"
     };
     [[nodiscard]] std::vector<AutotuneReport> autotuneReport() const;
@@ -197,7 +213,7 @@ private:
         std::optional<KernelSlot> gemmV2;
         std::size_t               gemmV2MTile{1};
         bool                      useGemmV2{false};
-        std::array<double, 3>     gemmV2MsAtM{};
+        std::array<double, kAutotuneBucketCount> gemmV2MsAtM{};
 
         // M8.J — smallest batch size M at which the timed GEMM bench
         // beat the timed matvec-loop bench with a 5 % margin.
@@ -222,8 +238,8 @@ private:
         // autotuneReport() for the /v1/system/status endpoint. Index
         // matches kAutotuneMBuckets in GpuMatmul.cpp; 0 = M=16, etc.
         // 0.0 means "not measured" (env pin, no gemm, parity fail).
-        std::array<double, 3> vecMsAtM{};
-        std::array<double, 3> gemmMsAtM{};
+        std::array<double, kAutotuneBucketCount> vecMsAtM{};
+        std::array<double, kAutotuneBucketCount> gemmMsAtM{};
         double      lastDp4aMs{0.0};      // 0 unless DP4A available
         std::string autotuneSource;       // "bench" | "env_force_gemm" | ...
     };
