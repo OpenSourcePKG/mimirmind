@@ -3,6 +3,7 @@
 #include "runtime/SystemMonitor.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -153,7 +154,49 @@ std::uint32_t GpuClockGovernor::tick(SystemMonitor& monitor) {
     if (!reading.package_temp_c.has_value()) {
         return _currentCap;
     }
-    return adjustForTemp(*reading.package_temp_c);
+    const float         temp      = *reading.package_temp_c;
+    const std::uint32_t capBefore = _currentCap;
+    const std::uint32_t capAfter  = adjustForTemp(temp);
+
+    if (_tickLog.is_open()) {
+        const auto now = std::chrono::system_clock::now().time_since_epoch();
+        const auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+        const float error = temp - _targetTempC;
+        const int   deltaMhz =
+            static_cast<int>(capAfter) - static_cast<int>(capBefore);
+        // NDJSON — one line per tick, flushed on write so a crash keeps
+        // the trailing state on disk. Governor tick rate is a few Hz so
+        // the fsync-ish cost is trivial next to matmul.
+        _tickLog
+            << "{\"ts_ms\":"      << ms
+            << ",\"temp_c\":"     << temp
+            << ",\"cap_before\":" << capBefore
+            << ",\"cap_after\":"  << capAfter
+            << ",\"delta_mhz\":"  << deltaMhz
+            << ",\"error_c\":"    << error
+            << ",\"target_c\":"   << _targetTempC
+            << ",\"pinned\":"     << (_pinned ? "true" : "false")
+            << "}\n";
+        _tickLog.flush();
+    }
+    return capAfter;
+}
+
+bool GpuClockGovernor::setTickLogPath(const std::string& path) {
+    // Close any prior sink so setter is idempotent-ish (last one wins).
+    if (_tickLog.is_open()) {
+        _tickLog.close();
+    }
+    _tickLogPath.clear();
+    if (path.empty()) {
+        return false;
+    }
+    _tickLog.open(path, std::ios::app | std::ios::out);
+    if (!_tickLog.is_open()) {
+        return false;
+    }
+    _tickLogPath = path;
+    return true;
 }
 
 } // namespace mimirmind::runtime

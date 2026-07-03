@@ -1316,6 +1316,26 @@ int runServe(const CliArgs& args) {
                         "was going to be installed anyway.",
                         pinReq.rawEnv);
         }
+
+        // M9.6.6.0 tick sink. Opt-in per env — when set, the governor
+        // writes one NDJSON line per tick to the file, which we then
+        // consume for M9.6.6 adaptive-gain baseline analysis.
+        if (governor != nullptr) {
+            if (const char* tickLog =
+                    std::getenv("MIMIRMIND_GOVERNOR_TICK_LOG");
+                tickLog != nullptr && tickLog[0] != '\0') {
+                if (governor->setTickLogPath(tickLog)) {
+                    MM_LOG_INFO("main",
+                                "GovernorTickSink open — writing NDJSON to '{}'",
+                                tickLog);
+                } else {
+                    MM_LOG_WARN("main",
+                                "MIMIRMIND_GOVERNOR_TICK_LOG='{}' — could "
+                                "not open for append. Sink stays off.",
+                                tickLog);
+                }
+            }
+        }
     }
 
     // Power telemetry — always-on attempt, never fatal. If RAPL is

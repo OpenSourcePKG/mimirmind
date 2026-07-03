@@ -186,6 +186,18 @@ services:
             MIMIRMIND_FAN_PWM_BOOST:     ${MIMIRMIND_FAN_PWM_BOOST:-}
             MIMIRMIND_FAN_PWM_MIN:       ${MIMIRMIND_FAN_PWM_MIN:-}
 
+            # M9.6.6.0 — governor tick sink. When set to a writable path,
+            # the GpuClockGovernor writes one NDJSON line per P-controller
+            # tick with {ts_ms, temp_c, cap_before, cap_after, delta_mhz,
+            # error_c, target_c, pinned}. Used for baseline capture before
+            # M9.6.6.2 adaptive-gain rollout, and afterwards to validate
+            # the retune produced the expected cap-uphold behaviour.
+            #
+            #   MIMIRMIND_GOVERNOR_TICK_LOG=/logs/governor-ticks.ndjson
+            #
+            # Unset (default) → sink off, tick() costs one extra branch.
+            MIMIRMIND_GOVERNOR_TICK_LOG: ${MIMIRMIND_GOVERNOR_TICK_LOG:-}
+
             # In-process perf-regression detector — sits next to the
             # NDJSON sink and alerts when current-run decode p50 exceeds
             # the trailing 7-day baseline p50 by 1.15x. State (rolling

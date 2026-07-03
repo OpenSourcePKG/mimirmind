@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <fstream>
 #include <string>
 #include <string_view>
 
@@ -80,6 +81,24 @@ public:
     [[nodiscard]] std::string_view pinIntent()  const noexcept { return _pinIntent; }
     [[nodiscard]] std::string_view pinRawEnv()  const noexcept { return _pinRawEnv; }
 
+    /// M9.6.6.0 tick-sink. Opens `path` for append and writes one NDJSON
+    /// line per tick() call afterwards. Unset path (empty) or a path we
+    /// cannot open leaves the sink inactive — tick() then costs one
+    /// extra branch instead of a file write. Returns true on successful
+    /// open.
+    ///
+    /// Line format:
+    ///   {"ts_ms":..., "temp_c":..., "cap_before":..., "cap_after":...,
+    ///    "delta_mhz":..., "error_c":..., "target_c":..., "pinned":<bool>}
+    bool setTickLogPath(const std::string& path);
+
+    [[nodiscard]] std::string_view tickLogPath() const noexcept {
+        return _tickLogPath;
+    }
+    [[nodiscard]] bool tickLogOpen() const noexcept {
+        return _tickLog.is_open();
+    }
+
     /// Asymmetric P-controller: nudges current cap toward keeping
     /// `current_temp_c` at targetTempC(). The gain is direction-
     /// dependent so we drop the cap fast when overshooting target
@@ -138,6 +157,13 @@ private:
     std::uint32_t _pinnedMhz{0};
     std::string   _pinIntent{};
     std::string   _pinRawEnv{};
+
+    // M9.6.6.0 tick sink. When _tickLog is open, tick() writes one line
+    // per invocation. NDJSON so downstream analysis (jq, pandas) can
+    // consume it without a schema. Held open for the process lifetime;
+    // destructor closes it.
+    std::string   _tickLogPath{};
+    std::ofstream _tickLog{};
 };
 
 } // namespace mimirmind::runtime
