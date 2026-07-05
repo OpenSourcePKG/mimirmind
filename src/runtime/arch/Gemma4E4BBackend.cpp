@@ -143,6 +143,26 @@ void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds) {
     }
 
     _pleActiveT = T;
+
+    // One-shot sanity dump so we can see if the dequant actually produced
+    // non-zero PLE values or if the table layout guess was wrong. Fires
+    // once per process — cheap enough to leave in even in release builds.
+    if (!_pleDumpDone && T > 0) {
+        _pleDumpDone = true;
+        const float* p = pleBuf;
+        MM_LOG_INFO("gemma4-e4b",
+                    "PLE first-slice sanity: L=0 t=0 → [{:.4f} {:.4f} {:.4f} "
+                    "{:.4f} {:.4f} {:.4f} {:.4f} {:.4f}] tok0={}",
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+                    tokIds.front());
+        // Also probe layer 20 (mid-model) to confirm the layer stride is
+        // sane and not aliasing back to layer 0.
+        const float* p20 = pleBuf + 20 * (T * _perLayerDim);
+        MM_LOG_INFO("gemma4-e4b",
+                    "PLE first-slice sanity: L=20 t=0 → [{:.4f} {:.4f} {:.4f} "
+                    "{:.4f} {:.4f} {:.4f} {:.4f} {:.4f}]",
+                    p20[0], p20[1], p20[2], p20[3], p20[4], p20[5], p20[6], p20[7]);
+    }
 }
 
 void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
@@ -255,10 +275,14 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
 
         _op.mark(runtime::OpProfiler::Cat::NORM);
         trace("PLE post_norm");
-        _ops.rmsNormAsync(projOutBuf, T, d_model,
-                          static_cast<const float*>(postNorm->usmPtr),
-                          _config.rmsNormEps,
-                          projOutBuf);
+        // Gemma-shifted RMSNorm — Gemma 3n's per-block post_norm weights
+        // are stored as (w_hf - 1) so runtime applies (1 + w) * rmsnorm(x).
+        // Using plain w * rmsnorm would collapse the PLE contribution to
+        // near-zero because the trained weights sit around 0.
+        _ops.rmsNormGemmaAsync(projOutBuf, T, d_model,
+                               static_cast<const float*>(postNorm->usmPtr),
+                               _config.rmsNormEps,
+                               projOutBuf);
 
         _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
         trace("PLE residual");

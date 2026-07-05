@@ -93,6 +93,9 @@ private:
     /// Number of tokens `prepareForward` last wrote — how far runBlock
     /// can safely index into `_pleBuf` for the current forward pass.
     std::size_t      _pleActiveT{0};
+
+    /// One-shot flag so the PLE first-slice sanity log fires only once.
+    bool             _pleDumpDone{false};
 };
 
 } // namespace mimirmind::runtime::arch
