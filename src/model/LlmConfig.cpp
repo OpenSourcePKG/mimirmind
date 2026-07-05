@@ -207,9 +207,18 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
     // legacy tensor-shape override below picks the SWA value from
     // attn_q_norm.weight — fine for models without the SWA split.
     if (architecture == "gemma4") {
+        // E4B specifically has UNIFORM head_count_kv (scalar 2) across
+        // all layers but PER-LAYER-VARYING head_dim (256 SWA / 512 full).
+        // The old check required headCountKvPerLayer to be non-empty as
+        // proof of "per-layer split" which is what 26B-A4B has. That
+        // check missed E4B's split and triggered the destructive override
+        // below — pinning key_length to 256 globally, which then wrecked
+        // the 7 full-attention layers that actually want head_dim=512.
+        // The distinction we really care about is "do we have separate
+        // key_length + key_length_swa AND a sliding_window_pattern telling
+        // us which layer uses which head_dim?" — that's enough.
         const bool haveSplit = (keyLength > 0 && keyLengthSwa > 0 &&
-                                 !slidingWindowPattern.empty() &&
-                                 !headCountKvPerLayer.empty());
+                                 !slidingWindowPattern.empty());
         if (!haveSplit) {
             if (const auto* qNorm = reader.findTensor("blk.0.attn_q_norm.weight");
                 qNorm != nullptr && !qNorm->dimensions.empty()) {
