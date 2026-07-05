@@ -239,9 +239,15 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
                         "head_dim={}, swa head_dim={}",
                         keyLength, keyLengthSwa);
         }
-        // Only fall back to tensor-shape inference for headCountKv when we
-        // don't have the per-layer array from metadata.
-        if (headCountKvPerLayer.empty()) {
+        // Only fall back to tensor-shape inference for headCountKv when
+        // metadata really doesn't give us anything trustworthy. When we
+        // have the SWA/full split (haveSplit) the metadata's
+        // head_count_kv is authoritative — running the divide-by-head_dim
+        // inference here would be wrong anyway, because block 0's attn_k
+        // uses head_dim_swa (256 for E4B) while headDim() returns the
+        // full-attention value (512). That's the bug that pinned E4B's
+        // kv_heads to 1 in one earlier build.
+        if (!haveSplit && headCountKvPerLayer.empty()) {
             if (const auto* kW = reader.findTensor("blk.0.attn_k.weight");
                 kW != nullptr && kW->dimensions.size() >= 2 && headDim() > 0) {
                 const auto inferredKv =
