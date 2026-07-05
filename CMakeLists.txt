@@ -79,6 +79,7 @@ message(STATUS "ocloc: ${OCLOC_EXECUTABLE}")
 set(KERNEL_SOURCES
     kernels/rmsnorm.cl
     kernels/matmul_q4k_vec.cl
+    kernels/matmul_q5k_vec.cl
     kernels/matmul_q6k_vec.cl
     kernels/matmul_q8_0_vec.cl
     kernels/matmul_q6k_gemm.cl
@@ -156,6 +157,7 @@ add_executable(mimirmind
     src/compute/quant/Float16.cpp
     src/compute/quant/Float32.cpp
     src/compute/quant/Q4K.cpp
+    src/compute/quant/Q5K.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
     src/model/ChatTemplate.cpp
@@ -233,6 +235,7 @@ add_executable(quant_tests
     src/compute/quant/Float16.cpp
     src/compute/quant/Float32.cpp
     src/compute/quant/Q4K.cpp
+    src/compute/quant/Q5K.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
     src/model/GgufTypes.cpp
@@ -300,6 +303,7 @@ add_executable(compute_tests
     src/compute/quant/Float16.cpp
     src/compute/quant/Float32.cpp
     src/compute/quant/Q4K.cpp
+    src/compute/quant/Q5K.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
     src/model/GgufTypes.cpp
@@ -340,6 +344,7 @@ add_executable(gpu_tests
     src/compute/quant/Float16.cpp
     src/compute/quant/Float32.cpp
     src/compute/quant/Q4K.cpp
+    src/compute/quant/Q5K.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
     src/model/GgufTypes.cpp

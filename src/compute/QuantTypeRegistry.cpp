@@ -4,6 +4,7 @@
 #include "compute/quant/Float16.hpp"
 #include "compute/quant/Float32.hpp"
 #include "compute/quant/Q4K.hpp"
+#include "compute/quant/Q5K.hpp"
 #include "compute/quant/Q6K.hpp"
 #include "compute/quant/Q8_0.hpp"
 
@@ -13,18 +14,19 @@ namespace mimirmind::compute {
 
 namespace {
 
-std::array<const QuantType*, 6> makeRegistry() noexcept {
+std::array<const QuantType*, 7> makeRegistry() noexcept {
     return {
         &quant::Float32::instance(),
         &quant::Float16::instance(),
         &quant::Bfloat16::instance(),
         &quant::Q4K::instance(),
+        &quant::Q5K::instance(),
         &quant::Q6K::instance(),
         &quant::Q8_0::instance(),
     };
 }
 
-const std::array<const QuantType*, 6>& registry() noexcept {
+const std::array<const QuantType*, 7>& registry() noexcept {
     static const auto inst = makeRegistry();
     return inst;
 }
@@ -37,6 +39,7 @@ const QuantType* quantType(model::GgmlType type) noexcept {
         case model::GgmlType::F16:  return &quant::Float16::instance();
         case model::GgmlType::BF16: return &quant::Bfloat16::instance();
         case model::GgmlType::Q4_K: return &quant::Q4K::instance();
+        case model::GgmlType::Q5_K: return &quant::Q5K::instance();
         case model::GgmlType::Q6_K: return &quant::Q6K::instance();
         case model::GgmlType::Q8_0: return &quant::Q8_0::instance();
 
@@ -52,7 +55,6 @@ const QuantType* quantType(model::GgmlType type) noexcept {
         case model::GgmlType::Q8_1:
         case model::GgmlType::Q2_K:
         case model::GgmlType::Q3_K:
-        case model::GgmlType::Q5_K:
         case model::GgmlType::Q8_K:
         case model::GgmlType::Unknown:
         default:

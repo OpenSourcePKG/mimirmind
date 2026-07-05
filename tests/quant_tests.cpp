@@ -13,6 +13,7 @@
 #include "compute/quant/Float16.hpp"
 #include "compute/quant/Float32.hpp"
 #include "compute/quant/Q4K.hpp"
+#include "compute/quant/Q5K.hpp"
 #include "compute/quant/Q6K.hpp"
 #include "compute/quant/Q8_0.hpp"
 #include "model/GgufTypes.hpp"
@@ -83,6 +84,14 @@ TEST(blockLayout_Q4K) {
     EXPECT_EQ(qt.gpuMatmulModule(), std::string_view{"matmul_q4k_vec"});
 }
 
+TEST(blockLayout_Q5K) {
+    const auto& qt = mimirmind::compute::quant::Q5K::instance();
+    EXPECT_EQ(qt.ggmlType(),        mimirmind::model::GgmlType::Q5_K);
+    EXPECT_EQ(qt.blockElements(),   256U);
+    EXPECT_EQ(qt.blockBytes(),      176U);
+    EXPECT_EQ(qt.gpuMatmulModule(), std::string_view{"matmul_q5k_vec"});
+}
+
 TEST(blockLayout_Q6K) {
     const auto& qt = mimirmind::compute::quant::Q6K::instance();
     EXPECT_EQ(qt.ggmlType(),        mimirmind::model::GgmlType::Q6_K);
@@ -110,6 +119,7 @@ TEST(registry_supportedTypes) {
     EXPECT_TRUE(quantType(GgmlType::F16)  != nullptr);
     EXPECT_TRUE(quantType(GgmlType::BF16) != nullptr);
     EXPECT_TRUE(quantType(GgmlType::Q4_K) != nullptr);
+    EXPECT_TRUE(quantType(GgmlType::Q5_K) != nullptr);
     EXPECT_TRUE(quantType(GgmlType::Q6_K) != nullptr);
     EXPECT_TRUE(quantType(GgmlType::Q8_0) != nullptr);
 }
@@ -119,14 +129,13 @@ TEST(registry_unsupportedTypes) {
     using namespace mimirmind::compute;
     EXPECT_TRUE(quantType(GgmlType::Q2_K)    == nullptr);
     EXPECT_TRUE(quantType(GgmlType::Q3_K)    == nullptr);
-    EXPECT_TRUE(quantType(GgmlType::Q5_K)    == nullptr);
     EXPECT_TRUE(quantType(GgmlType::Q4_0)    == nullptr);
     EXPECT_TRUE(quantType(GgmlType::Unknown) == nullptr);
 }
 
 TEST(registry_allQuantTypes_size) {
     const auto all = mimirmind::compute::allQuantTypes();
-    EXPECT_EQ(all.size(), 6U);
+    EXPECT_EQ(all.size(), 7U);
     for (const auto* qt : all) {
         EXPECT_TRUE(qt != nullptr);
     }
@@ -447,6 +456,130 @@ TEST(q4k_misalignedNelementsThrows) {
 }
 
 // =======================================================================
+// Q5_K — hand-crafted blocks
+// =======================================================================
+//
+// Q5_K block (176 bytes): fp16 d (0..1) + fp16 dmin (2..3) + 12-byte
+// packed scales (4..15, same layout as Q4_K) + 32-byte qh (16..47) +
+// 128-byte qs (48..175).
+//
+// Per element the dequant unpacks a 5-bit value (lo-nibble in qs plus
+// a high bit from qh via a per-sub-super-block mask that shifts by 2
+// bits: 0x01/0x02, 0x04/0x08, 0x10/0x20, 0x40/0x80), then applies
+//   value = d * scale * q - dmin * min
+// per 32-element sub-block.
+
+TEST(q5k_allZeros_yieldsZero) {
+    std::array<std::uint8_t, 176> block{};
+    std::array<float, 256>        dst{};
+    mimirmind::compute::quant::Q5K::instance()
+        .dequantToF32(block.data(), 256, dst.data());
+    for (std::size_t i = 0; i < 256; ++i) {
+        EXPECT_NEAR(dst[i], 0.0F, 0.0F);
+    }
+}
+
+// d=1, dmin=0, scales all zero → every value = 1 * 0 * q - 0 = 0, no
+// matter what qs / qh contain.
+TEST(q5k_zeroScales_swallowsQuants) {
+    std::array<std::uint8_t, 176> block{};
+    writeHalfBits(block.data() + 0, kHalfOne);      // d
+    writeHalfBits(block.data() + 2, kHalfPosZero);  // dmin
+    for (std::size_t i = 16; i < 48;  ++i) block[i] = 0xFFU;   // qh
+    for (std::size_t i = 48; i < 176; ++i) block[i] = 0xFFU;   // qs
+
+    std::array<float, 256> dst{};
+    mimirmind::compute::quant::Q5K::instance()
+        .dequantToF32(block.data(), 256, dst.data());
+    for (std::size_t i = 0; i < 256; ++i) {
+        EXPECT_NEAR(dst[i], 0.0F, 0.0F);
+    }
+}
+
+// d=1, dmin=0, scale[0]=1 (via q[0]=1), qs[0]=1 (low nibble), qh[0]=0
+// → dst[0] = 1 * 1 * (1 + 0) - 0 = 1. Every other output is 0 because
+// its sub-block scale is still 0.
+TEST(q5k_singleLowNibbleContribution) {
+    std::array<std::uint8_t, 176> block{};
+    writeHalfBits(block.data() + 0, kHalfOne);      // d = 1
+    writeHalfBits(block.data() + 2, kHalfPosZero);  // dmin = 0
+    block[4]  = 0x01U;      // scales[0] low 6 bits = 1 → scale[0]=1, min[0]=0
+    block[48] = 0x01U;      // qs[0] low nibble = 1
+
+    std::array<float, 256> dst{};
+    mimirmind::compute::quant::Q5K::instance()
+        .dequantToF32(block.data(), 256, dst.data());
+
+    EXPECT_NEAR(dst[0], 1.0F, 0.0F);
+    for (std::size_t i = 1; i < 256; ++i) {
+        EXPECT_NEAR(dst[i], 0.0F, 0.0F);
+    }
+}
+
+// qh bit routing: set only bit 0 of qh[0] (u1 mask for j=0 lower half),
+// keep everything else zero. With scale[0]=1 and qs[0]=0, expect
+// dst[0] = 1 * 1 * (0 + 16) - 0 = 16. Adjacent dst[1..31] stay 0
+// because qh[1..31]=0 (the bit is per-quant), and dst[32..63] are the
+// UPPER half of the j=0 pair which reads u2=0x02 from qh[0]=0x01,
+// no contribution.
+TEST(q5k_qhBitRouting_j0_lowerHalf) {
+    std::array<std::uint8_t, 176> block{};
+    writeHalfBits(block.data() + 0, kHalfOne);      // d = 1
+    writeHalfBits(block.data() + 2, kHalfPosZero);  // dmin = 0
+    block[4]  = 0x01U;      // scale[0]=1, min[0]=0
+    block[16] = 0x01U;      // qh[0] bit 0 set — u1 mask for j=0 lower
+
+    std::array<float, 256> dst{};
+    mimirmind::compute::quant::Q5K::instance()
+        .dequantToF32(block.data(), 256, dst.data());
+
+    EXPECT_NEAR(dst[0], 16.0F, 0.0F);
+    for (std::size_t i = 1; i < 256; ++i) {
+        EXPECT_NEAR(dst[i], 0.0F, 0.0F);
+    }
+}
+
+// All quants max: qs = 0xFF (lo-nibble 0xF, hi-nibble 0xF) + qh = 0xFF
+// (every bit for every sub-super-block set). Scales all = 1, d = 1,
+// dmin = 0. Expected q for every element = (0xF + 16) = 31 → dst = 31
+// everywhere.
+//
+// Scales-all-1 packing (12 bytes):
+//   q[0..3] = 0x01  → scale[0..3] = 1 (low 6 bits), min[0..3] = 0
+//   q[4..7] = 0x00  → mins for j=0..3 stay 0
+//   q[8..11]= 0x01  → scale[4..7] low 4 bits = 1, spillover bits from
+//                     q[0..3] top 2 bits are 0, so scale[4..7] = 1;
+//                     mins[4..7] = 0
+TEST(q5k_allFives_allOnesScales) {
+    std::array<std::uint8_t, 176> block{};
+    writeHalfBits(block.data() + 0, kHalfOne);      // d = 1
+    writeHalfBits(block.data() + 2, kHalfPosZero);  // dmin = 0
+    for (std::size_t j = 0; j < 4; ++j) block[4 + j]     = 0x01U;
+    for (std::size_t j = 0; j < 4; ++j) block[4 + 8 + j] = 0x01U;
+    for (std::size_t i = 16; i < 48;  ++i) block[i] = 0xFFU;   // qh
+    for (std::size_t i = 48; i < 176; ++i) block[i] = 0xFFU;   // qs
+
+    std::array<float, 256> dst{};
+    mimirmind::compute::quant::Q5K::instance()
+        .dequantToF32(block.data(), 256, dst.data());
+    for (std::size_t i = 0; i < 256; ++i) {
+        EXPECT_NEAR(dst[i], 31.0F, 0.0F);
+    }
+}
+
+TEST(q5k_misalignedNelementsThrows) {
+    std::array<std::uint8_t, 176> block{};
+    std::array<float, 100>        dst{};
+    try {
+        mimirmind::compute::quant::Q5K::instance()
+            .dequantToF32(block.data(), 100, dst.data());
+        EXPECT_TRUE(false && "expected throw");
+    } catch (const std::runtime_error&) {
+        // expected
+    }
+}
+
+// =======================================================================
 // Top-level dequantToF32 dispatch
 // =======================================================================
 
@@ -467,7 +600,7 @@ TEST(dispatch_routesToCorrectType) {
 TEST(dispatch_unsupportedTypeThrows) {
     std::array<float, 1> dst{};
     try {
-        mimirmind::compute::dequantToF32(mimirmind::model::GgmlType::Q2_K,
+        mimirmind::compute::dequantToF32(mimirmind::model::GgmlType::Q3_K,
                                          dst.data(), 1, dst.data());
         EXPECT_TRUE(false && "expected throw");
     } catch (const std::runtime_error&) {
