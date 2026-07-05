@@ -272,6 +272,14 @@ services:
             MIMIRMIND_SPEC_DEC:          ${MIMIRMIND_SPEC_DEC:-}
             MIMIRMIND_SPEC_DEC_N:        ${MIMIRMIND_SPEC_DEC_N:-}
 
+            # E4B / gemma4 e-series: temporarily disable the PLE
+            # residual injection to A/B-test whether the base transformer
+            # output is coherent without it. When PLE is off the model
+            # quality drops (that's the whole point of PLE) but if the
+            # output stays Kauderwelsch even with PLE off the bug lives
+            # in the attention / FFN path, not in the PLE branch.
+            MIMIRMIND_E4B_DISABLE_PLE:   ${MIMIRMIND_E4B_DISABLE_PLE:-}
+
         volumes:
             - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
             - ./run-logs:/logs:rw

@@ -18,9 +18,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mimirmind::runtime::arch {
@@ -484,8 +486,19 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
     //
     // Skipped when either the PLE table or the model-proj weight is
     // missing — logs at construction already flagged that.
+    // Also opt-out via MIMIRMIND_E4B_DISABLE_PLE=1 for A/B: run the block
+    // chain without the per-layer-embedding residual so we can tell
+    // whether garbage output is coming from the base transformer or the
+    // PLE branch.
 
-    if (_pleTablePtr != nullptr && _pleActiveT >= T) {
+    static const bool ple_off = []() {
+        const char* v = std::getenv("MIMIRMIND_E4B_DISABLE_PLE");
+        if (v == nullptr || v[0] == '\0') return false;
+        const std::string_view s{v};
+        return !(s == "0" || s == "off" || s == "false" || s == "no");
+    }();
+
+    if (!ple_off && _pleTablePtr != nullptr && _pleActiveT >= T) {
         const auto* inpGate  = requireTensor(blockIdx, "inp_gate.weight",  "Gemma4E4BBackend");
         const auto* proj     = requireTensor(blockIdx, "proj.weight",      "Gemma4E4BBackend");
         const auto* postNorm = requireTensor(blockIdx, "post_norm.weight", "Gemma4E4BBackend");
