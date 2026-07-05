@@ -214,6 +214,30 @@ void Gemma4E4BBackend::requantizeModelProjToQ8_0(const model::GgufTensor& src) {
                 model::typeInfo(src.type).name,
                 _projQ8Bytes, _projQ8Bytes / (1024 * 1024),
                 src.nbytes, src.nbytes / (1024 * 1024));
+
+    // Round-trip sanity: dequant the first row of the requantized Q8_0
+    // back to F32 and compare to the source's first row. Catches the
+    // most obvious symmetric-quantize mistakes (scale-inverted values,
+    // wrong block stride, etc.).
+    {
+        std::vector<float> srcFirstRow(K);
+        std::vector<float> reFirstRow(K);
+        srcQt->dequantToF32(srcBase, K, srcFirstRow.data());
+        compute::dequantToF32(model::GgmlType::Q8_0, dst,
+                              K, reFirstRow.data());
+        float maxAbs = 0.0F, maxDiff = 0.0F;
+        for (std::size_t k = 0; k < K; ++k) {
+            maxAbs  = std::max(maxAbs,  std::fabs(srcFirstRow[k]));
+            maxDiff = std::max(maxDiff, std::fabs(srcFirstRow[k] - reFirstRow[k]));
+        }
+        MM_LOG_INFO("gemma4-e4b",
+                    "per_layer_model_proj Q8_0 roundtrip row0 — "
+                    "maxAbs={:.6g} maxDiff={:.6g} first-src=[{:.4f} {:.4f} "
+                    "{:.4f} {:.4f}] first-req=[{:.4f} {:.4f} {:.4f} {:.4f}]",
+                    maxAbs, maxDiff,
+                    srcFirstRow[0], srcFirstRow[1], srcFirstRow[2], srcFirstRow[3],
+                    reFirstRow[0],  reFirstRow[1],  reFirstRow[2],  reFirstRow[3]);
+    }
 }
 
 void Gemma4E4BBackend::ensurePleCapacity(std::size_t T) {
@@ -365,6 +389,30 @@ void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds,
                     "per-layer input sanity: L=20 t=0 → [{:.4f} {:.4f} {:.4f} "
                     "{:.4f} {:.4f} {:.4f} {:.4f} {:.4f}]",
                     p20[0], p20[1], p20[2], p20[3], p20[4], p20[5], p20[6], p20[7]);
+
+        // Diagnostics for the projection chain — separate the embed and
+        // proj contributions so we can tell which one is producing the
+        // final magnitude. Also show a hidden-state sample as sanity.
+        if (haveProj) {
+            const float* proj0  = _pleProjBuf.as<float>();
+            const float* proj20 = proj0 + 20 * _perLayerDim;
+            MM_LOG_INFO("gemma4-e4b",
+                        "proj sanity (post-rmsnorm): L=0 t=0 → [{:.4f} {:.4f} "
+                        "{:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f}]",
+                        proj0[0], proj0[1], proj0[2], proj0[3],
+                        proj0[4], proj0[5], proj0[6], proj0[7]);
+            MM_LOG_INFO("gemma4-e4b",
+                        "proj sanity (post-rmsnorm): L=20 t=0 → [{:.4f} {:.4f} "
+                        "{:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f}]",
+                        proj20[0], proj20[1], proj20[2], proj20[3],
+                        proj20[4], proj20[5], proj20[6], proj20[7]);
+            MM_LOG_INFO("gemma4-e4b",
+                        "hidden sanity t=0 → [{:.4f} {:.4f} {:.4f} {:.4f} "
+                        "{:.4f} {:.4f} {:.4f} {:.4f}]",
+                        hiddenStates[0], hiddenStates[1], hiddenStates[2],
+                        hiddenStates[3], hiddenStates[4], hiddenStates[5],
+                        hiddenStates[6], hiddenStates[7]);
+        }
     }
 }
 
