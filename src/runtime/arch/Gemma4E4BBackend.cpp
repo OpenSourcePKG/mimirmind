@@ -252,6 +252,13 @@ void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds,
     // 1. Dequant per_layer_token_embd → _pleBuf, layout [L, T, D].
     // ------------------------------------------------------------------
 
+    // Per llama.cpp/src/models/gemma4.cpp build_inp_per_layer():
+    //   tok_embd_scale = sqrt(n_embd_per_layer)
+    // Applied here directly during dequant so the combine step below
+    // just sees the already-scaled embedding.
+    const float tokEmbdScale =
+        std::sqrt(static_cast<float>(_perLayerDim));
+
     float* const pleBuf = _pleBuf.as<float>();
     if (_pleTablePtr != nullptr) {
         const std::size_t bytesPerToken =
@@ -275,6 +282,9 @@ void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds,
                 float* dstSlice = pleBuf + L * stride + t * _perLayerDim;
                 compute::dequantToF32(_pleTableType, blockPtr,
                                       _perLayerDim, dstSlice);
+                for (std::size_t i = 0; i < _perLayerDim; ++i) {
+                    dstSlice[i] *= tokEmbdScale;
+                }
             }
         }
     }
@@ -294,13 +304,18 @@ void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds,
         const std::size_t projN   = _config.blockCount * _perLayerDim;
         float* const projBuf      = _pleProjBuf.as<float>();
 
-        // Y[T, projN] = X[T, d_model] @ W[projN, d_model].
-        // Note: matmul scratch has nothing to do with our persistent
-        // scratch; we let GpuMatmul use its own DP4A path.
         _gmm.matmul(model::GgmlType::Q8_0, _projQ8.get(),
                     projN, d_model,
                     hiddenStates, T,
                     projBuf, /*scratch=*/nullptr);
+
+        // Per llama.cpp/src/models/gemma4.cpp project_per_layer_inputs():
+        //   per_layer_projection_scale = 1/sqrt(n_embd)
+        // Applied BEFORE the RMSNorm so the norm sees the correctly
+        // scaled projection.
+        const float projScale =
+            1.0F / std::sqrt(static_cast<float>(d_model));
+        _ops.mulScalarAsync(projBuf, projScale, T * projN);
 
         // RMSNorm per (t, L) slice of 256 elements — flatten to a
         // [T*num_layers, per_layer_dim] view with weight [per_layer_dim].
@@ -439,8 +454,11 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
                     pleGateBuf, matmulScratch);
 
         _op.mark(runtime::OpProfiler::Cat::ACTIVATION);
-        // Fused SiLU + element-wise mul: gate = SiLU(gate) * per_layer_input.
-        _ops.siluMulAsync(pleGateBuf, pleSliceForLayer, T * _perLayerDim);
+        // Fused GELU + element-wise mul: gate = GELU(gate) * per_layer_input.
+        // Per llama.cpp gemma4.cpp line 373 (`ggml_gelu`) — the simplified
+        // Gemma 4 path uses GELU, not SiLU (unlike the full Gemma 3n path
+        // which does use SiLU alongside AltUp/Laurel).
+        _ops.geluMulAsync(pleGateBuf, pleSliceForLayer, T * _perLayerDim);
 
         _op.mark(runtime::OpProfiler::Cat::MATMUL);
         _gmm.matmul(proj->type, proj->usmPtr,
