@@ -447,6 +447,11 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             prefillIds, xBuf);
         scaleEmbeddingIfNeeded(xBuf, prefillCount);
 
+        // Per-forward architecture hook. Non-E-series backends no-op;
+        // Gemma4E4BBackend dequantizes its PLE slices for the tokens
+        // that are about to flow through the block chain.
+        _backend->prepareForward(prefillIds);
+
         for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
             _backend->runBlock(b, xBuf, prefillCount, cache, buffers,
                                _traceBlock0);
@@ -583,6 +588,8 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 d_model, vocab_emb,
                 oneId, xBuf);
             scaleEmbeddingIfNeeded(xBuf, 1);
+
+            _backend->prepareForward(std::span<const std::int32_t>{oneId});
 
             for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
                 _backend->runBlock(b, xBuf, 1, cache, buffers, false);
@@ -784,6 +791,8 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
     if (embedScaleEnabled) {
         _ops.mulScalarAsync(xBuf, embedScale, N * d_model);
     }
+
+    _backend->prepareForward(newTokens);
 
     // Batched block forward. runBlock writes provisional K/V rows to
     // [curLen, curLen+N); commit is deferred to commitVerified().

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -61,6 +63,11 @@ public:
                           KvCache&      cache,
                           BlockBuffers& s,
                           bool          traceBlock0) = 0;
+
+    /// Forwarded from the ArchBackend facade so `Gemma4E4BBackend` can
+    /// prefetch its per-layer-embedding (PLE) slices before the block
+    /// chain runs. Default no-op — Dense and MoE variants ignore it.
+    virtual void prepareForward(std::span<const std::int32_t> /*tokIds*/) {}
 
     [[nodiscard]] std::vector<std::size_t> kvDimPerLayer() const;
     [[nodiscard]] std::pair<std::size_t, std::size_t> maxQKVDims() const;

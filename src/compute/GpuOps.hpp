@@ -211,6 +211,12 @@ public:
     /// matmul + GpuOps launches in the same scope works as expected.
     [[nodiscard]] runtime::CommandQueue& queue() noexcept { return _queue; }
 
+    /// Accessor to the USM allocator. Exposed so architecture backends
+    /// with variant-specific persistent scratch (e.g. the E-series PLE
+    /// slice buffer in `Gemma4E4BBackend`) can allocate directly instead
+    /// of receiving yet another constructor argument.
+    [[nodiscard]] runtime::UsmAllocator& allocator() noexcept { return _alloc; }
+
 private:
     runtime::L0Context&    _ctx;
     runtime::CommandQueue& _queue;

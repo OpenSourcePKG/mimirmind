@@ -2,9 +2,11 @@
 
 #include "runtime/arch/GemmaBaseBackend.hpp"
 #include "runtime/arch/Gemma4DenseBackend.hpp"
+#include "runtime/arch/Gemma4E4BBackend.hpp"
 #include "runtime/arch/Gemma4MoeBackend.hpp"
 
 #include "model/LlmConfig.hpp"
+#include "model/WeightsMap.hpp"
 
 namespace mimirmind::runtime::arch {
 
@@ -14,11 +16,17 @@ Gemma4Backend::Gemma4Backend(const model::LlmConfig&        config,
                              compute::GpuOps&               ops,
                              compute::GpuMatmul&            gmm,
                              runtime::OpProfiler&           opProfiler) {
-    if (config.expertCount == 0) {
-        _impl = std::make_unique<Gemma4DenseBackend>(
+    if (config.expertCount > 0) {
+        _impl = std::make_unique<Gemma4MoeBackend>(
+            config, weights, fusedQkv, ops, gmm, opProfiler);
+    } else if (weights.findBlock(0, "inp_gate.weight") != nullptr) {
+        // Gemma 4 E-series (E4B / E2B): MatFormer + Per-Layer Embeddings.
+        // Detected by the presence of the per-block PLE gate tensor,
+        // which the classic dense variants (4B / 12B) do not have.
+        _impl = std::make_unique<Gemma4E4BBackend>(
             config, weights, fusedQkv, ops, gmm, opProfiler);
     } else {
-        _impl = std::make_unique<Gemma4MoeBackend>(
+        _impl = std::make_unique<Gemma4DenseBackend>(
             config, weights, fusedQkv, ops, gmm, opProfiler);
     }
 }
@@ -45,6 +53,10 @@ std::pair<std::size_t, std::size_t> Gemma4Backend::maxQKVDims() const {
 
 void Gemma4Backend::setParityDumpPrefix(const std::string& prefix) noexcept {
     _impl->setParityDumpPrefix(prefix);
+}
+
+void Gemma4Backend::prepareForward(std::span<const std::int32_t> tokIds) {
+    _impl->prepareForward(tokIds);
 }
 
 } // namespace mimirmind::runtime::arch

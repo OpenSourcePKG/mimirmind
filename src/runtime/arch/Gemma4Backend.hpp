@@ -2,7 +2,9 @@
 
 #include "runtime/arch/ArchBackend.hpp"
 
+#include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 
 namespace mimirmind::compute {
@@ -61,6 +63,8 @@ public:
         maxQKVDims() const override;
 
     void setParityDumpPrefix(const std::string& prefix) noexcept override;
+
+    void prepareForward(std::span<const std::int32_t> tokIds) override;
 
 private:
     std::unique_ptr<GemmaBaseBackend> _impl;
