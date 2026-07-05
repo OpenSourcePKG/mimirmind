@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -55,6 +56,43 @@ void logBlockTensorInventory(const model::GgufReader& reader,
                     dims, t.nbytes);
     }
     MM_LOG_INFO("inventory", "block {} has {} tensor(s)", blockIdx, hits);
+}
+
+/// Dump every top-level (non-blk.*) tensor plus a canonical set of
+/// per-block suffix names sorted by frequency. Answers "does this GGUF
+/// carry the AltUp / Laurel / PLE side tensors we need for Gemma 3n"
+/// without swamping the log with 720 lines. Cheap enough to leave in
+/// for any architecture — non-E-series models just show their own set.
+void logTensorTaxonomy(const model::GgufReader& reader) {
+    std::size_t totalCount = 0;
+    std::size_t topLevelCount = 0;
+    std::map<std::string, std::size_t> suffixCount;
+    for (const auto& t : reader.tensors()) {
+        ++totalCount;
+        if (t.name.compare(0, 4, "blk.") != 0) {
+            std::string dims;
+            for (std::size_t i = 0; i < t.dimensions.size(); ++i) {
+                if (i > 0) dims += ',';
+                dims += std::to_string(t.dimensions[i]);
+            }
+            MM_LOG_INFO("taxonomy",
+                        "top-level: {} type={} dims=[{}] bytes={}",
+                        t.name, model::typeInfo(t.type).name, dims, t.nbytes);
+            ++topLevelCount;
+            continue;
+        }
+        // blk.<N>.<suffix>  →  strip the block index, keep the suffix.
+        const auto dot1 = t.name.find('.', 4);
+        if (dot1 == std::string::npos) continue;
+        const auto suffix = t.name.substr(dot1 + 1);
+        ++suffixCount[suffix];
+    }
+    MM_LOG_INFO("taxonomy",
+                "== {} tensors total, {} top-level, {} distinct per-block suffixes ==",
+                totalCount, topLevelCount, suffixCount.size());
+    for (const auto& [suffix, count] : suffixCount) {
+        MM_LOG_INFO("taxonomy", "per-block suffix: {} × {}", suffix, count);
+    }
 }
 
 } // namespace
@@ -141,6 +179,7 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     if (_config.architecture == "gemma4" && _config.blockCount > 5) {
         logBlockTensorInventory(_reader, 5);
     }
+    logTensorTaxonomy(_reader);
 
     // M5i.B: Try to fuse per-block attn_q/k/v weights so the QKV
     // projections can dispatch as one matmul. The class no-ops when
