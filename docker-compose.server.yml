@@ -223,6 +223,55 @@ services:
             #   MIMIRMIND_TRACE_OP_TIMES=1  → activate profiler.
             MIMIRMIND_TRACE_OP_TIMES:    ${MIMIRMIND_TRACE_OP_TIMES:-}
 
+            # M9.11 — speculative decoding. Off by default: without a
+            # draft-model path the server runs the target-only decode
+            # loop bit-identically to the pre-M9.11.4 baseline.
+            #
+            #   MIMIRMIND_DRAFT_MODEL_PATH=/models/<draft>.gguf
+            #       Opt-in. Loads a second InferenceEngine at startup
+            #       (~30 s additional autotune) and enables the M9.11.4
+            #       greedy accept/reject loop. The draft must be
+            #       vocab-compatible with the target (same tokenizer
+            #       family): Gemma 2 2B Q4_K_M or Gemma 3 4B Q4 work for
+            #       a Gemma 4 target. Startup log line
+            #       "serve: speculative decoding ready — ..." confirms
+            #       the vocab check passed; a mismatch disables spec-dec
+            #       for the process lifetime with a warning.
+            #
+            #   MIMIRMIND_SPEC_DEC_N=<int>   (default 4, range 1-63)
+            #       Tokens the draft speculates per verify round. Higher
+            #       N amortises the target's batched forward across more
+            #       tokens IF the accept-rate holds; too high and each
+            #       rejection wastes proportionally more draft work.
+            #       Practical range on Xe-LPG: 2 (safe) to 6 (aggressive).
+            #
+            #   MIMIRMIND_SPEC_DEC=off
+            #       Kill-switch. Forces the target-only fall-through
+            #       path even with a draft loaded. Handy for A/B runs:
+            #       stop → set → up -d takes ~seconds because the draft
+            #       weights stay hot in the model volume, only the
+            #       autotune re-runs. For a same-process toggle without
+            #       a restart, docker exec sets the env for a shell but
+            #       the C++ getenv() sees the original process env.
+            #
+            # Only greedy (temperature <= 0) engages the spec-dec loop
+            # in M9.11.4; any request with temperature > 0 falls through
+            # to target-only until M9.11.4b lands full modified
+            # rejection sampling.
+            #
+            # Observability: active runs append
+            #   spec_rounds=<R> spec_acc=<A>/<D> spec_rate=<A/D>
+            # to the per-completion server log line. Accept-rate is the
+            # headline number for the perf-regression ledger.
+            #
+            # Cost model: draft KV cache doubles per-request GPU RAM
+            # (target + draft). With MAX_CONTEXT_TOKENS=8192 and a Gemma
+            # 4 26B target + Gemma 2 2B draft, expect ~25 GiB total —
+            # tight on 24 GiB DRAM systems.
+            MIMIRMIND_DRAFT_MODEL_PATH:  ${MIMIRMIND_DRAFT_MODEL_PATH:-}
+            MIMIRMIND_SPEC_DEC:          ${MIMIRMIND_SPEC_DEC:-}
+            MIMIRMIND_SPEC_DEC_N:        ${MIMIRMIND_SPEC_DEC_N:-}
+
         volumes:
             - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
             - ./run-logs:/logs:rw
