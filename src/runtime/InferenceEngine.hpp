@@ -77,6 +77,16 @@ struct GenerateStats {
     /// generate() call. Only populated when a PowerMonitor is installed
     /// and the kernel exposes RAPL counters; otherwise stays 0.
     double      packageJoules{0.0};
+
+    /// M9.11.4 — populated by SpeculativeDecoder when the spec-dec
+    /// loop engages; stay at 0 on the target-only fall-through path.
+    /// `specDecRounds`   how many draft+verify rounds ran
+    /// `specDecDrafted`  total tokens the draft produced across all rounds
+    /// `specDecAccepted` how many of those the target accepted (excludes
+    ///                   the target's own bonus/recovery sample)
+    std::size_t specDecRounds{0};
+    std::size_t specDecDrafted{0};
+    std::size_t specDecAccepted{0};
 };
 
 /**

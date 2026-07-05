@@ -10,6 +10,7 @@
 #include "runtime/Log.hpp"
 #include "runtime/PerfRegressionDetector.hpp"
 #include "runtime/PowerMonitor.hpp"
+#include "runtime/SpeculativeDecoder.hpp"
 #include "runtime/ThermalGuard.hpp"
 
 #include <httplib.h>
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <limits>
 #include <mutex>
@@ -332,8 +334,14 @@ json buildFinishChunk(const std::string& id, std::int64_t created,
 } // namespace
 
 struct ApiServer::Impl {
-    runtime::InferenceEngine&             engine;
-    runtime::InferenceEngine*             draftEngine{nullptr};
+    runtime::InferenceEngine&                        engine;
+    runtime::InferenceEngine*                        draftEngine{nullptr};
+    // M9.11.4 — spec-dec orchestrator. Owned; only constructed when a
+    // draft engine is present. When null, all generate calls go straight
+    // to `engine.generate()`. When set, callers route through
+    // `speculativeDecoder->generate()` which falls through to
+    // target-only for sampled requests and the env kill-switch.
+    std::unique_ptr<runtime::SpeculativeDecoder>     speculativeDecoder;
     ServerConfig                          cfg;
     model::ChatTemplate::Style            chatStyle;
     httplib::Server                       server;
@@ -355,6 +363,28 @@ struct ApiServer::Impl {
         : engine{e}, draftEngine{draft}, cfg{std::move(c)},
           chatStyle{model::ChatTemplate::detectFromArch(
               engine.config().architecture)} {
+        // M9.11.4 — stand up the spec-dec orchestrator now that both
+        // engines are ready. Reads MIMIRMIND_SPEC_DEC_N from env for
+        // draft-N tuning; default 4 matches the roadmap prediction.
+        if (draftEngine != nullptr) {
+            runtime::SpeculativeDecoder::Config sdcfg{};
+            if (const char* envN = std::getenv("MIMIRMIND_SPEC_DEC_N")) {
+                if (envN[0] != '\0') {
+                    const auto n = std::strtoull(envN, nullptr, 10);
+                    if (n > 0 && n < 64) {
+                        sdcfg.draftN = static_cast<std::size_t>(n);
+                    } else {
+                        MM_LOG_WARN("server",
+                                    "MIMIRMIND_SPEC_DEC_N={} out of range "
+                                    "[1..63], keeping default {}",
+                                    envN, sdcfg.draftN);
+                    }
+                }
+            }
+            speculativeDecoder =
+                std::make_unique<runtime::SpeculativeDecoder>(
+                    engine, *draftEngine, sdcfg);
+        }
         installRoutes();
         // Engine is constructed model-loaded already (loadModel is called
         // before ApiServer wraps it in main.cpp). Capture the baseline
@@ -605,18 +635,20 @@ struct ApiServer::Impl {
             fanEnvelope = nullptr;
         }
 
-        // M9.11.1 — Speculative-decoding readiness. `status` reflects
-        // whether a draft engine was successfully loaded AND passed the
-        // vocab-compat check in main.cpp before construction of this
-        // server. The actual speculation loop lands in M9.11.2+; until
-        // then this block just tells clients the draft is queued up.
+        // M9.11.1 + M9.11.4 — Speculative-decoding readiness. `status`
+        // reflects whether the draft engine loaded AND the M9.11.4
+        // orchestrator was wired up. `draft_n` is the per-round draft
+        // token budget; `mode` is currently always "greedy" — the
+        // sampled path falls through to target-only until M9.11.4b.
         json speculativeDecoding;
-        if (draftEngine != nullptr) {
+        if (draftEngine != nullptr && speculativeDecoder != nullptr) {
             const auto& draftCfg = draftEngine->config();
             speculativeDecoding = {
-                {"status",           "ready"},
-                {"draft_model_arch", draftCfg.architecture},
-                {"draft_block_count", draftCfg.blockCount},
+                {"status",                 "ready"},
+                {"mode",                   "greedy"},
+                {"draft_n",                speculativeDecoder->config().draftN},
+                {"draft_model_arch",       draftCfg.architecture},
+                {"draft_block_count",      draftCfg.blockCount},
                 {"draft_embedding_length", draftCfg.embeddingLength},
             };
         } else {
@@ -1080,7 +1112,15 @@ struct ApiServer::Impl {
             // Engine is single-instance, mutable scratch + sampler. Serialise.
             std::lock_guard<std::mutex> lk{engineMutex};
             try {
-                generated = engine.generate(promptIds, params, {}, &stats);
+                // M9.11.4 — route through the spec-dec orchestrator when a
+                // draft is loaded. It falls through to engine.generate() bit-
+                // identically for sampled / kill-switched requests.
+                if (speculativeDecoder != nullptr) {
+                    generated = speculativeDecoder->generate(
+                        promptIds, params, {}, &stats);
+                } else {
+                    generated = engine.generate(promptIds, params, {}, &stats);
+                }
             } catch (const runtime::ThermalLimitExceeded& e) {
                 MM_LOG_INFO("server",
                             "thermal refusal at engine entry: {}", e.what());
@@ -1151,13 +1191,25 @@ struct ApiServer::Impl {
             {"usage", std::move(usage)},
         };
 
+        // Spec-dec accept-rate is the headline diagnostic for M9.11.4 —
+        // it tells operators whether the draft is earning its keep.
+        // Suffix stays empty when spec-dec was disabled or fell through.
+        std::string specSuffix;
+        if (stats.specDecRounds > 0 && stats.specDecDrafted > 0) {
+            const double acceptRate = static_cast<double>(stats.specDecAccepted)
+                                    / static_cast<double>(stats.specDecDrafted);
+            specSuffix = " spec_rounds=" + std::to_string(stats.specDecRounds)
+                       + " spec_acc=" + std::to_string(stats.specDecAccepted)
+                       + "/" + std::to_string(stats.specDecDrafted)
+                       + " spec_rate=" + std::to_string(acceptRate);
+        }
         MM_LOG_INFO("server",
                     "chat.completion id={} model={} prompt={} cached={} new={} "
-                    "prefill={:.0f}ms decode={:.0f}ms energy={:.1f}J finish={}",
+                    "prefill={:.0f}ms decode={:.0f}ms energy={:.1f}J finish={}{}",
                     respId, echoModel,
                     promptIds.size(), stats.cachedTokens, visible.size(),
                     stats.prefillMs, stats.decodeMs, stats.packageJoules,
-                    finish);
+                    finish, specSuffix);
 
         sendJson(res, 200, response);
     }
@@ -1365,12 +1417,19 @@ struct ApiServer::Impl {
                 {
                     std::lock_guard<std::mutex> lk{engineMutex};
                     try {
-                        generated = engine.generate(state->promptIds,
-                                                    state->params,
-                                                    onToken,
-                                                    &stats,
-                                                    onPrefillDone,
-                                                    onPrefillProgress);
+                        if (speculativeDecoder != nullptr) {
+                            generated = speculativeDecoder->generate(
+                                state->promptIds, state->params,
+                                onToken, &stats,
+                                onPrefillDone, onPrefillProgress);
+                        } else {
+                            generated = engine.generate(state->promptIds,
+                                                        state->params,
+                                                        onToken,
+                                                        &stats,
+                                                        onPrefillDone,
+                                                        onPrefillProgress);
+                        }
                     } catch (const std::exception& e) {
                         errorMessage = e.what();
                     }
@@ -1436,15 +1495,26 @@ struct ApiServer::Impl {
                                      state->echoModel, finish));
                 (void)writeSseDone(sink);
 
+                std::string streamSpecSuffix;
+                if (stats.specDecRounds > 0 && stats.specDecDrafted > 0) {
+                    const double acceptRate =
+                        static_cast<double>(stats.specDecAccepted)
+                      / static_cast<double>(stats.specDecDrafted);
+                    streamSpecSuffix =
+                          " spec_rounds=" + std::to_string(stats.specDecRounds)
+                        + " spec_acc="   + std::to_string(stats.specDecAccepted)
+                        + "/"            + std::to_string(stats.specDecDrafted)
+                        + " spec_rate="  + std::to_string(acceptRate);
+                }
                 MM_LOG_INFO("server",
                             "stream {} model={} prompt={} cached={} emitted={} "
                             "prefill={:.0f}ms decode={:.0f}ms energy={:.1f}J "
-                            "finish={}",
+                            "finish={}{}",
                             state->respId, state->echoModel,
                             state->promptIds.size(), stats.cachedTokens,
                             emittedTokens,
                             stats.prefillMs, stats.decodeMs,
-                            stats.packageJoules, finish);
+                            stats.packageJoules, finish, streamSpecSuffix);
 
                 sink.done();
                 return false;
