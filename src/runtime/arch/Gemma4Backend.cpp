@@ -55,8 +55,10 @@ void Gemma4Backend::setParityDumpPrefix(const std::string& prefix) noexcept {
     _impl->setParityDumpPrefix(prefix);
 }
 
-void Gemma4Backend::prepareForward(std::span<const std::int32_t> tokIds) {
-    _impl->prepareForward(tokIds);
+void Gemma4Backend::prepareForward(std::span<const std::int32_t> tokIds,
+                                   const float*                  hiddenStates,
+                                   std::size_t                   T) {
+    _impl->prepareForward(tokIds, hiddenStates, T);
 }
 
 } // namespace mimirmind::runtime::arch

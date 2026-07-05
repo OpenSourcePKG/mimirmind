@@ -64,7 +64,9 @@ public:
 
     void setParityDumpPrefix(const std::string& prefix) noexcept override;
 
-    void prepareForward(std::span<const std::int32_t> tokIds) override;
+    void prepareForward(std::span<const std::int32_t> tokIds,
+                        const float*                  hiddenStates,
+                        std::size_t                   T) override;
 
 private:
     std::unique_ptr<GemmaBaseBackend> _impl;

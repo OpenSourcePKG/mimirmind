@@ -11,32 +11,34 @@
 namespace mimirmind::runtime::arch {
 
 /**
- * Gemma 4 E-Series (E4B / E2B) variant — Matryoshka Transformer with
- * Per-Layer Embeddings (PLE).
+ * Gemma 3n E-Series (E4B / E2B) as shipped by the llama.cpp-compatible
+ * GGUF conversion. The GGUF does NOT carry AltUp / Laurel weights (see
+ * ggml-org/llama.cpp #22243) — the converter emits a simplified variant
+ * that folds those pieces away and replaces them with a small pair of
+ * model-level tensors (`per_layer_model_proj`, `per_layer_proj_norm`)
+ * plus the standard per-block PLE gate/proj/post_norm trio.
  *
- * Structurally identical to `Gemma4DenseBackend` for attention + the main
- * SwiGLU-GELU FFN. What's new is the PLE-injection branch at the tail of
- * every block:
+ * Per-forward, before the block loop starts:
  *
- *   h_ple = inp_gate  @ h                          // [d_model → per_layer_dim=256]
- *   h_ple = GELU(h_ple)
- *   h_ple *= per_layer_embd[block][token]          // element-wise
- *   h_ple = proj @ h_ple                           // [per_layer_dim → d_model]
- *   h_ple = rmsnorm(h_ple, post_norm)              // Gemma-plain w * rmsnorm(x)
+ *   proj = per_layer_model_proj(hidden_states)   // [T, d_model → num_layers*per_layer_dim]
+ *   proj = per_layer_proj_norm(proj)             // RMSNorm on per_layer_dim
+ *   embd = per_layer_token_embd(token_ids)       // [T, num_layers, per_layer_dim]
+ *   per_layer_input = (proj + embd) * (1 / sqrt(2))
+ *
+ * Per block, inside runBlock (in addition to the standard Dense-Gemma
+ * attention + SwiGLU-GELU FFN):
+ *
+ *   h_ple = inp_gate(h)                          // [d_model → per_layer_dim]
+ *   h_ple = SiLU(h_ple) * per_layer_input[block] // fused via siluMulAsync
+ *   h_ple = proj(h_ple)                          // [per_layer_dim → d_model]
+ *   h_ple = rmsnorm(h_ple, post_norm)            // plain w * rmsnorm(x)
  *   h += h_ple
  *   h *= layer_output_scale
  *
- * The per_layer_token_embd.weight table is a big [num_layers*per_layer_dim,
- * vocab_size] block-quantized weight, one column per token. Every forward
- * pass we dequant-into a USM scratch of shape [num_layers, T, per_layer_dim]
- * so per-layer slices are contiguous — that's what `prepareForward` does.
- * Then per block, `runBlock` treats its layer's slice as a plain vector
- * and reuses `geluMulAsync(gate, slice, ...)` for the fused GELU + PLE-mul.
- *
  * References:
- *   - Google AI "Gemma 3n model overview" (PLE mechanics)
- *   - Sebastian Raschka's LLM Architecture Gallery — Per-Layer Embeddings
- *   - ggml-org/llama.cpp Issue #22243 (missing PLE in llama.cpp forward graph)
+ *   - alandao.net "Gemma 4 E2B & PLE Research Notes" (combine formula)
+ *   - Google AI "Gemma 3n model overview"
+ *   - ggml-org/llama.cpp Issue #22243 (simplified conversion)
  */
 class Gemma4E4BBackend final : public GemmaBaseBackend {
 public:
@@ -54,39 +56,71 @@ public:
                   BlockBuffers& s,
                   bool          traceBlock0) override;
 
-    /// Extract the per-layer-embedding slice for every token about to run
-    /// through the block chain. Dequantizes `per_layer_token_embd.weight`
-    /// on the CPU into `_pleBuf` — the block layouts align neatly (one
-    /// Q-K block per (token, layer) since per_layer_dim == 256 == block
-    /// size). Called from InferenceEngine before prefill / decode / verify.
-    void prepareForward(std::span<const std::int32_t> tokIds) override;
+    /// Precompute the per-layer-input tensor for every token about to
+    /// run through the block chain:
+    ///   1) dequant `per_layer_token_embd` into `_pleBuf`
+    ///   2) matmul `per_layer_model_proj` on `hiddenStates` into
+    ///      `_pleProjBuf`, then RMSNorm with `per_layer_proj_norm`
+    ///   3) combine into `_pleBuf` as `(proj + embd) * 1/sqrt(2)`
+    /// runBlock's PLE branch then treats `_pleBuf[layer]` as a plain
+    /// contiguous [T × per_layer_dim] slice.
+    void prepareForward(std::span<const std::int32_t> tokIds,
+                        const float*                  hiddenStates,
+                        std::size_t                   T) override;
 
 private:
-    /// Grow the PLE-slice USM scratch to hold `T` tokens. Idempotent.
+    /// Grow the PLE-slice USM scratches (`_pleBuf`, `_pleProjBuf`,
+    /// `_pleGateBuf`) to hold `T` tokens. Idempotent.
     void ensurePleCapacity(std::size_t T);
 
-    // --- PLE table + geometry --------------------------------------------
+    /// One-time quantization of the BF16 `per_layer_model_proj.weight`
+    /// tensor into a Q8_0-formatted blob in USM. The GPU matmul kernels
+    /// don't have a BF16 path, and CPU fallback is too slow (~100 ms per
+    /// decode step at [10752, 2560]). Q8_0 is ~half the size (30 MiB
+    /// vs 55 MiB) and dispatches through the existing Q8_0 vec/gemm
+    /// kernels.
+    void requantizeModelProjToQ8_0(const model::GgufTensor& src);
 
-    /// Points at the per_layer_token_embd.weight blob in USM. When null
-    /// the model doesn't carry PLE (shouldn't happen for E-series but
-    /// we degrade gracefully — runBlock skips the PLE branch).
-    const void*      _pleTablePtr{nullptr};
-    model::GgmlType  _pleTableType{model::GgmlType::F32};
+    // --- Static geometry -------------------------------------------------
 
     std::size_t      _perLayerDim{0};   // 256 for E4B — from inp_gate dims
+
+    // --- PLE-embedding-table pointer + geometry --------------------------
+
+    const void*      _pleTablePtr{nullptr};
+    model::GgmlType  _pleTableType{model::GgmlType::F32};
     std::size_t      _pleBytesPerBlock{0};
     std::size_t      _vocabSize{0};
 
+    // --- per_layer_model_proj tensor after Q8_0 requantization -----------
+
+    /// Owned Q8_0-quantized copy of per_layer_model_proj.weight. Layout
+    /// [N=num_layers*per_layer_dim, K=d_model], one row per output
+    /// element, K/32 Q8_0 blocks per row. Null when the model doesn't
+    /// carry the tensor (defensive; disables PLE).
+    UsmHandle        _projQ8;
+    std::size_t      _projQ8Bytes{0};
+
+    /// F32 pointer to per_layer_proj_norm.weight in USM. Owned by the
+    /// weights map — this is just a non-owning cache.
+    const float*     _projNorm{nullptr};
+
     // --- Per-forward-pass scratch ----------------------------------------
 
-    /// Dequantized PLE slices in layout [num_layers, T, per_layer_dim].
-    /// Row L is a contiguous [T * per_layer_dim] float span, exactly
-    /// what `geluMulAsync` consumes as its `up` operand.
+    /// Dequantized PLE embedding slices, layout [num_layers, T, per_layer_dim].
+    /// Row L is contiguous [T * per_layer_dim] float span — exactly what
+    /// siluMulAsync consumes as its `up` operand.
     UsmHandle        _pleBuf;
     std::size_t      _pleBufCapT{0};
 
-    /// Post-inp_gate scratch [maxT, per_layer_dim] — geluMulAsync writes
-    /// its output here (gate = GELU(gate) * PLE_slice). Grows with T.
+    /// Output of per_layer_model_proj matmul + rmsnorm, layout
+    /// [T, num_layers, per_layer_dim]. Combined into `_pleBuf` after
+    /// scaling by 1/sqrt(2).
+    UsmHandle        _pleProjBuf;
+    std::size_t      _pleProjBufCapT{0};
+
+    /// Post-inp_gate scratch [maxT, per_layer_dim] — siluMulAsync writes
+    /// its output here (gate = SiLU(gate) * per_layer_input[layer]).
     UsmHandle        _pleGateBuf;
     std::size_t      _pleGateBufCapT{0};
 

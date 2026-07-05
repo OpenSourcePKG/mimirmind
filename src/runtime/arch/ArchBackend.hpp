@@ -87,20 +87,26 @@ public:
     /// intermediate dumps override.
     virtual void setParityDumpPrefix(const std::string& /*prefix*/) noexcept {}
 
-    /// Give the backend a heads-up about the token ids that are about to
-    /// run through the block chain in the next `runBlock` sequence. Called
-    /// once per forward pass — before prefill, before every decode step,
-    /// and before `forwardVerify`.
+    /// Give the backend a heads-up about the token ids AND the freshly
+    /// looked-up token embeddings that are about to run through the
+    /// block chain in the next `runBlock` sequence. Called once per
+    /// forward pass — before prefill, before every decode step, and
+    /// before `forwardVerify`. Called AFTER `embeddingLookup` +
+    /// `scaleEmbeddingIfNeeded`, so `hiddenStates` is the exact tensor
+    /// that block 0 will consume.
     ///
     /// Non-E-series backends have no per-token per-layer state, so the
     /// default is a no-op. `Gemma4E4BBackend` overrides this to
-    /// pre-fetch the per-layer-embedding (PLE) slices for the tokens
-    /// into a USM scratch that `runBlock` slices per layer.
+    /// pre-fetch PLE slices AND run the per_layer_model_proj chain on
+    /// `hiddenStates`, combining them into the per-layer-input scratch
+    /// that `runBlock` slices per layer.
     ///
-    /// The span refers to caller-owned memory that stays valid for the
-    /// duration of the block-chain call. The backend copies whatever it
-    /// needs synchronously here.
-    virtual void prepareForward(std::span<const std::int32_t> /*tokIds*/) {}
+    /// Both the span and pointer refer to caller-owned memory that stays
+    /// valid for the duration of the block-chain call. The backend
+    /// copies whatever it needs synchronously here.
+    virtual void prepareForward(std::span<const std::int32_t> /*tokIds*/,
+                                const float*                  /*hiddenStates*/,
+                                std::size_t                   /*T*/) {}
 
 protected:
     ArchBackend() = default;

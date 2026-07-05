@@ -487,9 +487,10 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         scaleEmbeddingIfNeeded(xBuf, prefillCount);
 
         // Per-forward architecture hook. Non-E-series backends no-op;
-        // Gemma4E4BBackend dequantizes its PLE slices for the tokens
-        // that are about to flow through the block chain.
-        _backend->prepareForward(prefillIds);
+        // Gemma4E4BBackend dequantizes its PLE slices AND runs the
+        // per_layer_model_proj chain on the token embeddings before
+        // the block loop starts.
+        _backend->prepareForward(prefillIds, xBuf, prefillCount);
 
         for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
             _backend->runBlock(b, xBuf, prefillCount, cache, buffers,
@@ -628,7 +629,8 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 oneId, xBuf);
             scaleEmbeddingIfNeeded(xBuf, 1);
 
-            _backend->prepareForward(std::span<const std::int32_t>{oneId});
+            _backend->prepareForward(
+                std::span<const std::int32_t>{oneId}, xBuf, 1);
 
             for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
                 _backend->runBlock(b, xBuf, 1, cache, buffers, false);
@@ -831,7 +833,7 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
         _ops.mulScalarAsync(xBuf, embedScale, N * d_model);
     }
 
-    _backend->prepareForward(newTokens);
+    _backend->prepareForward(newTokens, xBuf, N);
 
     // Batched block forward. runBlock writes provisional K/V rows to
     // [curLen, curLen+N); commit is deferred to commitVerified().

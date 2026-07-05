@@ -15,12 +15,48 @@
 #include "runtime/OpProfiler.hpp"
 #include "runtime/UsmAllocator.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace mimirmind::runtime::arch {
+
+namespace {
+
+/// IEEE-754 binary32 → binary16 (round-to-nearest-even). Only used for
+/// packing per-block scales into Q8_0 blocks at load time, so a scalar
+/// implementation is fine.
+std::uint16_t floatToHalf(float f) noexcept {
+    std::uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const std::uint32_t sign = (bits >> 16) & 0x8000U;
+    std::int32_t        exp  = static_cast<std::int32_t>((bits >> 23) & 0xFFU);
+    const std::uint32_t mant = bits & 0x7FFFFFU;
+
+    if (exp == 0xFF) {
+        // Inf / NaN
+        return static_cast<std::uint16_t>(
+            sign | 0x7C00U | (mant != 0 ? 0x0200U : 0U));
+    }
+    exp -= 127 - 15;
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<std::uint16_t>(sign);
+        const std::uint32_t m = (mant | 0x800000U) >> (14 - exp);
+        return static_cast<std::uint16_t>(sign | m);
+    }
+    if (exp >= 0x1F) {
+        return static_cast<std::uint16_t>(sign | 0x7C00U);
+    }
+    return static_cast<std::uint16_t>(sign
+        | (static_cast<std::uint32_t>(exp) << 10)
+        | (mant >> 13));
+}
+
+} // namespace
 
 Gemma4E4BBackend::Gemma4E4BBackend(const model::LlmConfig&        config,
                                    const model::WeightsMap&       weights,
@@ -38,36 +74,55 @@ Gemma4E4BBackend::Gemma4E4BBackend(const model::LlmConfig&        config,
     }
     _perLayerDim = inp0->dimensions[1];
 
-    // per_layer_token_embd is a top-level tensor storing a
-    // [num_layers * per_layer_dim, vocab_size] block-quantized weight.
-    // Missing → we still construct (so a malformed model does not crash
-    // the process) but runBlock skips the PLE branch and logs once.
-    const auto* pleT = weights.find("per_layer_token_embd.weight");
-    if (pleT != nullptr) {
+    // per_layer_token_embd — the big Q6_K embedding table.
+    if (const auto* pleT = weights.find("per_layer_token_embd.weight")) {
         _pleTablePtr  = pleT->usmPtr;
         _pleTableType = pleT->type;
         _vocabSize    = pleT->dimensions.size() >= 2 ? pleT->dimensions[1] : 0;
-        const auto* qt = compute::quantType(_pleTableType);
-        if (qt != nullptr) {
+        if (const auto* qt = compute::quantType(_pleTableType)) {
             _pleBytesPerBlock = qt->blockBytes();
         } else {
             MM_LOG_WARN("gemma4-e4b",
                         "per_layer_token_embd.weight uses unsupported quant "
-                        "type {} — PLE injection disabled, output will be "
-                        "structurally degraded",
+                        "type {} — PLE disabled",
                         model::typeInfo(_pleTableType).name);
             _pleTablePtr = nullptr;
         }
     } else {
         MM_LOG_WARN("gemma4-e4b",
-                    "per_layer_token_embd.weight missing — PLE injection "
-                    "disabled, output will be structurally degraded");
+                    "per_layer_token_embd.weight missing — PLE disabled");
+    }
+
+    // per_layer_model_proj — the new BF16 [d_model, num_layers*per_layer_dim]
+    // tensor that produces the per-layer inputs from hidden_states. GPU
+    // matmul has no BF16 path, so we requantize to Q8_0 at load time.
+    if (const auto* proj = weights.find("per_layer_model_proj.weight")) {
+        try {
+            requantizeModelProjToQ8_0(*proj);
+        } catch (const std::exception& e) {
+            MM_LOG_WARN("gemma4-e4b",
+                        "per_layer_model_proj Q8_0 requantize failed ({}) — "
+                        "PLE-input projection disabled, output degraded",
+                        e.what());
+            _projQ8 = UsmHandle{};
+            _projQ8Bytes = 0;
+        }
+    } else {
+        MM_LOG_WARN("gemma4-e4b",
+                    "per_layer_model_proj.weight missing — PLE-input "
+                    "projection disabled, output degraded");
+    }
+
+    // per_layer_proj_norm — RMSNorm weight [per_layer_dim].
+    if (const auto* n = weights.find("per_layer_proj_norm.weight");
+        n != nullptr && n->type == model::GgmlType::F32) {
+        _projNorm = static_cast<const float*>(n->usmPtr);
     }
 
     MM_LOG_INFO("gemma4-e4b",
                 "Gemma4E4BBackend ready — blocks={} d_model={} "
                 "per_layer_dim={} ff={} heads={} kv={} head_dim={} "
-                "ple_table={} vocab={}",
+                "ple_table={} proj_q8={} proj_norm={} vocab={}",
                 _config.blockCount, _config.embeddingLength,
                 _perLayerDim, _config.feedForwardLength,
                 _config.headCount, _config.headCountKvFor(0),
@@ -75,19 +130,107 @@ Gemma4E4BBackend::Gemma4E4BBackend(const model::LlmConfig&        config,
                 _pleTablePtr != nullptr
                     ? model::typeInfo(_pleTableType).name
                     : std::string_view{"none"},
+                _projQ8Bytes > 0 ? "on" : "off",
+                _projNorm != nullptr ? "on" : "off",
                 _vocabSize);
 }
 
-void Gemma4E4BBackend::ensurePleCapacity(std::size_t T) {
-    if (_pleTablePtr == nullptr) {
-        return;
+void Gemma4E4BBackend::requantizeModelProjToQ8_0(const model::GgufTensor& src) {
+    if (src.dimensions.size() < 2) {
+        throw std::runtime_error("per_layer_model_proj: expected 2D tensor");
     }
-    if (T > _pleBufCapT) {
-        // Layout: [num_layers, T, per_layer_dim]
+    const std::size_t K = src.dimensions[0];   // d_model
+    const std::size_t N = src.dimensions[1];   // num_layers * per_layer_dim
+    if (K % 32 != 0) {
+        throw std::runtime_error(
+            "per_layer_model_proj: K=" + std::to_string(K) +
+            " not divisible by Q8_0 block size 32");
+    }
+    if (N != _config.blockCount * _perLayerDim) {
+        throw std::runtime_error(
+            "per_layer_model_proj: N=" + std::to_string(N) +
+            " does not match num_layers*per_layer_dim=" +
+            std::to_string(_config.blockCount * _perLayerDim));
+    }
+
+    const auto* srcQt = compute::quantType(src.type);
+    if (srcQt == nullptr) {
+        throw std::runtime_error(
+            "per_layer_model_proj: source type " +
+            std::string{model::typeInfo(src.type).name} +
+            " not supported for dequant");
+    }
+
+    // GGUF stores weights as [rows × cols] with each ROW contiguous. For
+    // our matmul convention rows are the OUTPUT dim (N), cols are the
+    // INPUT dim (K). So one row = K floats = K/32 Q8_0 blocks. Total
+    // output size = N * K/32 * 34 bytes.
+    const std::size_t blocksPerRow = K / 32;
+    _projQ8Bytes = N * blocksPerRow * 34;
+    _projQ8 = UsmHandle{_ops.allocator(), _projQ8Bytes};
+    auto* dst = _projQ8.as<std::uint8_t>();
+
+    // Bytes per source ROW. For BF16 that's K*2; for F32 K*4; for
+    // block-quantized types K/blockSize * blockBytes.
+    const std::size_t srcRowElemBytes =
+        srcQt->blockElements() > 1
+            ? (K / srcQt->blockElements()) * srcQt->blockBytes()
+            : K * srcQt->blockBytes();
+    const auto* srcBase = static_cast<const std::uint8_t*>(src.usmPtr);
+
+    std::vector<float> rowF32(K);
+    for (std::size_t n = 0; n < N; ++n) {
+        srcQt->dequantToF32(srcBase + n * srcRowElemBytes, K, rowF32.data());
+
+        // Per-row: partition into K/32 blocks. Each block gets an
+        // fp16 scale + 32 int8 quants.
+        for (std::size_t b = 0; b < blocksPerRow; ++b) {
+            const float* srcBlock = rowF32.data() + b * 32;
+            std::uint8_t* dstBlock =
+                dst + (n * blocksPerRow + b) * 34;
+
+            float absMax = 0.0F;
+            for (int i = 0; i < 32; ++i) {
+                absMax = std::max(absMax, std::fabs(srcBlock[i]));
+            }
+            const float scale = (absMax > 0.0F) ? (absMax / 127.0F) : 0.0F;
+            const std::uint16_t dHalf = floatToHalf(scale);
+            std::memcpy(dstBlock, &dHalf, 2);
+
+            const float invScale = (scale > 0.0F) ? (1.0F / scale) : 0.0F;
+            for (int i = 0; i < 32; ++i) {
+                const int q = static_cast<int>(std::lround(srcBlock[i] * invScale));
+                const int qc = std::clamp(q, -127, 127);
+                static_cast<std::int8_t*>(
+                    static_cast<void*>(dstBlock + 2))[i] =
+                    static_cast<std::int8_t>(qc);
+            }
+        }
+    }
+
+    MM_LOG_INFO("gemma4-e4b",
+                "per_layer_model_proj: requantized {} → Q8_0, "
+                "{} bytes ({} MiB), src bytes was {} ({} MiB)",
+                model::typeInfo(src.type).name,
+                _projQ8Bytes, _projQ8Bytes / (1024 * 1024),
+                src.nbytes, src.nbytes / (1024 * 1024));
+}
+
+void Gemma4E4BBackend::ensurePleCapacity(std::size_t T) {
+    if (T == 0) return;
+
+    if (_pleTablePtr != nullptr && T > _pleBufCapT) {
         const std::size_t bytes =
             _config.blockCount * T * _perLayerDim * sizeof(float);
         _pleBuf = UsmHandle{_ops.allocator(), bytes};
         _pleBufCapT = T;
+    }
+    if (_projQ8Bytes > 0 && T > _pleProjBufCapT) {
+        // Layout [T, num_layers, per_layer_dim] = [T, N] where N = 10752.
+        const std::size_t bytes =
+            T * _config.blockCount * _perLayerDim * sizeof(float);
+        _pleProjBuf = UsmHandle{_ops.allocator(), bytes};
+        _pleProjBufCapT = T;
     }
     if (T > _pleGateBufCapT) {
         const std::size_t bytes = T * _perLayerDim * sizeof(float);
@@ -96,70 +239,115 @@ void Gemma4E4BBackend::ensurePleCapacity(std::size_t T) {
     }
 }
 
-void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds) {
-    if (_pleTablePtr == nullptr) {
-        _pleActiveT = tokIds.size();
-        return;
-    }
-
-    const std::size_t T = tokIds.size();
+void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds,
+                                      const float*                  hiddenStates,
+                                      std::size_t                   T) {
     if (T == 0) {
         _pleActiveT = 0;
         return;
     }
     ensurePleCapacity(T);
 
+    // ------------------------------------------------------------------
+    // 1. Dequant per_layer_token_embd → _pleBuf, layout [L, T, D].
+    // ------------------------------------------------------------------
+
     float* const pleBuf = _pleBuf.as<float>();
+    if (_pleTablePtr != nullptr) {
+        const std::size_t bytesPerToken =
+            _config.blockCount * _pleBytesPerBlock;
+        const auto* base = static_cast<const std::uint8_t*>(_pleTablePtr);
+        const std::size_t stride = T * _perLayerDim;
 
-    // Per-layer-dim (256) matches the K-quant super-block size, so for
-    // every (token, layer) pair we dequant exactly one contiguous block
-    // from the table. Layout on disk: [num_layers * per_layer_dim, vocab]
-    // stored column-per-token, giving `num_layers * blockBytes` bytes
-    // per token. Layer L's block sits at offset L * blockBytes within
-    // the token column.
-    const std::size_t bytesPerToken = _config.blockCount * _pleBytesPerBlock;
-    const auto* base = static_cast<const std::uint8_t*>(_pleTablePtr);
-    const std::size_t stride = T * _perLayerDim;   // [num_layers, T, per_layer_dim]
-
-    for (std::size_t t = 0; t < T; ++t) {
-        const std::int32_t tok = tokIds[t];
-        if (tok < 0 || static_cast<std::size_t>(tok) >= _vocabSize) {
-            // Out-of-range token: fill zeros for every layer of this slot.
-            for (std::size_t L = 0; L < _config.blockCount; ++L) {
-                std::memset(pleBuf + L * stride + t * _perLayerDim, 0,
-                            _perLayerDim * sizeof(float));
+        for (std::size_t t = 0; t < T; ++t) {
+            const std::int32_t tok = tokIds[t];
+            if (tok < 0 || static_cast<std::size_t>(tok) >= _vocabSize) {
+                for (std::size_t L = 0; L < _config.blockCount; ++L) {
+                    std::memset(pleBuf + L * stride + t * _perLayerDim, 0,
+                                _perLayerDim * sizeof(float));
+                }
+                continue;
             }
-            continue;
+            const std::uint8_t* tokBase =
+                base + static_cast<std::size_t>(tok) * bytesPerToken;
+            for (std::size_t L = 0; L < _config.blockCount; ++L) {
+                const std::uint8_t* blockPtr = tokBase + L * _pleBytesPerBlock;
+                float* dstSlice = pleBuf + L * stride + t * _perLayerDim;
+                compute::dequantToF32(_pleTableType, blockPtr,
+                                      _perLayerDim, dstSlice);
+            }
         }
+    }
 
-        const std::uint8_t* tokBase =
-            base + static_cast<std::size_t>(tok) * bytesPerToken;
+    // ------------------------------------------------------------------
+    // 2. per_layer_model_proj chain — matmul + RMSNorm on hidden_states.
+    // ------------------------------------------------------------------
+    // Skip when the quantized weight or the norm couldn't load — the
+    // model then runs with embedding-only per-layer inputs (degraded
+    // but coherent enough for smoke).
+
+    const bool haveProj = (_projQ8Bytes > 0)
+                          && (_projNorm != nullptr)
+                          && (hiddenStates != nullptr);
+    if (haveProj) {
+        const std::size_t d_model = _config.embeddingLength;
+        const std::size_t projN   = _config.blockCount * _perLayerDim;
+        float* const projBuf      = _pleProjBuf.as<float>();
+
+        // Y[T, projN] = X[T, d_model] @ W[projN, d_model].
+        // Note: matmul scratch has nothing to do with our persistent
+        // scratch; we let GpuMatmul use its own DP4A path.
+        _gmm.matmul(model::GgmlType::Q8_0, _projQ8.get(),
+                    projN, d_model,
+                    hiddenStates, T,
+                    projBuf, /*scratch=*/nullptr);
+
+        // RMSNorm per (t, L) slice of 256 elements — flatten to a
+        // [T*num_layers, per_layer_dim] view with weight [per_layer_dim].
+        _ops.rmsNormAsync(projBuf, T * _config.blockCount, _perLayerDim,
+                          _projNorm, _config.rmsNormEps, projBuf);
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Combine into _pleBuf as (proj + embd) * 1/sqrt(2).
+    // ------------------------------------------------------------------
+    // proj layout [T, L, D] vs embd (_pleBuf) [L, T, D] — the combine
+    // has to transpose across (T, L). Small enough loop that we do it
+    // on the CPU against USM (unified memory on Meteor Lake iGPU).
+
+    if (haveProj) {
+        // Sync the queue so the GPU rmsnorm has landed before CPU reads.
+        _ops.queue().flush();
+
+        const float invSqrt2 = 0.70710678118654752440F;
+        const float* proj    = _pleProjBuf.as<float>();
         for (std::size_t L = 0; L < _config.blockCount; ++L) {
-            const std::uint8_t* blockPtr = tokBase + L * _pleBytesPerBlock;
-            float* dstSlice = pleBuf + L * stride + t * _perLayerDim;
-            compute::dequantToF32(_pleTableType, blockPtr,
-                                  _perLayerDim, dstSlice);
+            for (std::size_t t = 0; t < T; ++t) {
+                float* dst =
+                    pleBuf + L * T * _perLayerDim + t * _perLayerDim;
+                const float* src =
+                    proj + t * _config.blockCount * _perLayerDim
+                         + L * _perLayerDim;
+                for (std::size_t i = 0; i < _perLayerDim; ++i) {
+                    dst[i] = (dst[i] + src[i]) * invSqrt2;
+                }
+            }
         }
     }
 
     _pleActiveT = T;
 
-    // One-shot sanity dump so we can see if the dequant actually produced
-    // non-zero PLE values or if the table layout guess was wrong. Fires
-    // once per process — cheap enough to leave in even in release builds.
     if (!_pleDumpDone && T > 0) {
         _pleDumpDone = true;
-        const float* p = pleBuf;
-        MM_LOG_INFO("gemma4-e4b",
-                    "PLE first-slice sanity: L=0 t=0 → [{:.4f} {:.4f} {:.4f} "
-                    "{:.4f} {:.4f} {:.4f} {:.4f} {:.4f}] tok0={}",
-                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
-                    tokIds.front());
-        // Also probe layer 20 (mid-model) to confirm the layer stride is
-        // sane and not aliasing back to layer 0.
+        const float* p0  = pleBuf;
         const float* p20 = pleBuf + 20 * (T * _perLayerDim);
         MM_LOG_INFO("gemma4-e4b",
-                    "PLE first-slice sanity: L=20 t=0 → [{:.4f} {:.4f} {:.4f} "
+                    "per-layer input sanity: L=0 t=0 → [{:.4f} {:.4f} {:.4f} "
+                    "{:.4f} {:.4f} {:.4f} {:.4f} {:.4f}] tok0={}",
+                    p0[0], p0[1], p0[2], p0[3], p0[4], p0[5], p0[6], p0[7],
+                    tokIds.front());
+        MM_LOG_INFO("gemma4-e4b",
+                    "per-layer input sanity: L=20 t=0 → [{:.4f} {:.4f} {:.4f} "
                     "{:.4f} {:.4f} {:.4f} {:.4f} {:.4f}]",
                     p20[0], p20[1], p20[2], p20[3], p20[4], p20[5], p20[6], p20[7]);
     }
@@ -177,7 +365,6 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
     };
     trace("enter (e4b)");
 
-    // Attention section unchanged — matches Dense variant.
     runAttentionSection(blockIdx, x, T, cache, s, diag);
 
     const auto* ffnNorm  = requireTensor(blockIdx, "ffn_norm.weight",           "Gemma4E4BBackend");
@@ -196,17 +383,15 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
     float* const upOutBuf      = s.upOut.as<float>();
     float* const matmulScratch = s.matmulScratch.as<float>();
 
-    // --- Dense FFN (GELU-SwiGLU) --------------------------------------
+    // --- Dense SwiGLU-GELU FFN ----------------------------------------
 
     _op.mark(runtime::OpProfiler::Cat::NORM);
-    trace("ffn_norm (e4b pre)");
     _ops.rmsNormAsync(x, T, d_model,
                       static_cast<const float*>(ffnNorm->usmPtr),
                       _config.rmsNormEps,
                       normBuf);
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
-    trace("FFN gate+up proj (unordered)");
     {
         runtime::UnorderedScope u{_ops.queue()};
         _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
@@ -216,33 +401,27 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
     }
 
     _op.mark(runtime::OpProfiler::Cat::ACTIVATION);
-    trace("GELU + mul (fused)");
     _ops.geluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
-    trace("FFN down proj");
     _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
                 gateOutBuf, T,
                 projOutBuf, matmulScratch);
 
     _op.mark(runtime::OpProfiler::Cat::NORM);
-    trace("post_ffw_norm");
     _ops.rmsNormAsync(projOutBuf, T, d_model,
                       static_cast<const float*>(ffwPost->usmPtr),
                       _config.rmsNormEps,
                       projOutBuf);
 
     _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
-    trace("ffn residual");
     _ops.addResidualAsync(x, projOutBuf, T * d_model);
 
-    // --- PLE injection --------------------------------------------------
+    // --- PLE injection -------------------------------------------------
     //
-    // Skipped when the model didn't ship a per_layer_token_embd table —
-    // the constructor already logged a warning. Skipped when the current
-    // request has zero drafted tokens (defensive; can't happen from a
-    // real generate() call but keeps a safe no-op path if a future
-    // caller flushes prepareForward with empty tokIds).
+    // Skipped when either the PLE table or the model-proj weight is
+    // missing — logs at construction already flagged that.
+
     if (_pleTablePtr != nullptr && _pleActiveT >= T) {
         const auto* inpGate  = requireTensor(blockIdx, "inp_gate.weight",  "Gemma4E4BBackend");
         const auto* proj     = requireTensor(blockIdx, "proj.weight",      "Gemma4E4BBackend");
@@ -254,46 +433,37 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
             + blockIdx * (_pleActiveT * _perLayerDim);
 
         _op.mark(runtime::OpProfiler::Cat::MATMUL);
-        trace("PLE inp_gate proj");
         _gmm.matmul(inpGate->type, inpGate->usmPtr,
                     _perLayerDim, d_model,
                     x, T,
                     pleGateBuf, matmulScratch);
 
         _op.mark(runtime::OpProfiler::Cat::ACTIVATION);
-        trace("PLE GELU * slice (fused)");
-        // geluMulAsync: gate[i] = gelu(gate[i]) * up[i]
-        // Reused here for "hidden = GELU(hidden) * PLE_slice".
-        _ops.geluMulAsync(pleGateBuf, pleSliceForLayer, T * _perLayerDim);
+        // Fused SiLU + element-wise mul: gate = SiLU(gate) * per_layer_input.
+        _ops.siluMulAsync(pleGateBuf, pleSliceForLayer, T * _perLayerDim);
 
         _op.mark(runtime::OpProfiler::Cat::MATMUL);
-        trace("PLE proj");
         _gmm.matmul(proj->type, proj->usmPtr,
                     d_model, _perLayerDim,
                     pleGateBuf, T,
                     projOutBuf, matmulScratch);
 
         _op.mark(runtime::OpProfiler::Cat::NORM);
-        trace("PLE post_norm");
-        // Gemma-shifted RMSNorm — Gemma 3n's per-block post_norm weights
-        // are stored as (w_hf - 1) so runtime applies (1 + w) * rmsnorm(x).
-        // Using plain w * rmsnorm would collapse the PLE contribution to
-        // near-zero because the trained weights sit around 0.
-        _ops.rmsNormGemmaAsync(projOutBuf, T, d_model,
-                               static_cast<const float*>(postNorm->usmPtr),
-                               _config.rmsNormEps,
-                               projOutBuf);
+        // Plain w * rmsnorm(x) — Gemma 3n uses the same convention as
+        // Gemma 4 base (no shift).
+        _ops.rmsNormAsync(projOutBuf, T, d_model,
+                          static_cast<const float*>(postNorm->usmPtr),
+                          _config.rmsNormEps,
+                          projOutBuf);
 
         _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
-        trace("PLE residual");
         _ops.addResidualAsync(x, projOutBuf, T * d_model);
     }
 
-    // --- Block-output scale --------------------------------------------
+    // --- Block output scale ------------------------------------------
 
     const float scaleVal = *static_cast<const float*>(outScale->usmPtr);
     _op.mark(runtime::OpProfiler::Cat::ACTIVATION);
-    trace("layer_output_scale");
     _ops.mulScalarAsync(x, scaleVal, T * d_model);
 
     _op.finish();
