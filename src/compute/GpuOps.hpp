@@ -246,6 +246,15 @@ public:
     /// of receiving yet another constructor argument.
     [[nodiscard]] runtime::UsmAllocator& allocator() noexcept { return _alloc; }
 
+    /// Persistent USM slot that holds the current KV-cache length (or,
+    /// for RoPE, the current decode position). Kernels take it as
+    /// `__global const int*` and dereference at execution time so a
+    /// recorded command list stays valid after the host updates the
+    /// slot. In immediate mode `ropeInPlaceAsync` etc. write the value
+    /// before every dispatch; nothing changes for callers. In replay
+    /// mode the host updates this slot between replays.
+    [[nodiscard]] std::int32_t* curLenSlot() noexcept { return _curLenSlotUsm; }
+
 private:
     runtime::L0Context&    _ctx;
     runtime::CommandQueue& _queue;
@@ -312,6 +321,11 @@ private:
     // models we run; reused across every decode call (the engine
     // serialises calls via engineMutex so no aliasing is possible).
     void*                  _flashPartialUsm{nullptr};
+
+    // M-CLR.2: single-int USM slot shared by all kernels that consume
+    // the current decode position / KV-cache length. Host-writable,
+    // device-readable, allocated once at construction.
+    std::int32_t*          _curLenSlotUsm{nullptr};
     std::size_t            _flashPartialBytes{0};
 
     static constexpr std::uint32_t kRmsnormLocalSize     = 128;

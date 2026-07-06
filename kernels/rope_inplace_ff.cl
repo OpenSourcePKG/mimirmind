@@ -15,6 +15,7 @@
 #define ROPE_LOCAL 256
 #endif
 
+// M-CLR.2: `startPos` moved to a __global int-slot — see rope_inplace.cl.
 __attribute__((reqd_work_group_size(ROPE_LOCAL, 1, 1)))
 __kernel void rope_inplace_ff(
     __global       float* x,
@@ -22,7 +23,7 @@ __kernel void rope_inplace_ff(
     const int             seqLen,
     const int             numHeads,
     const int             headDim,
-    const int             startPos,
+    __global const int*   startPosPtr,
     const float           base)
 {
     const int gid     = (int)get_global_id(0);
@@ -37,6 +38,7 @@ __kernel void rope_inplace_ff(
     const int h  = hp % numHeads;
     const int p  = hp / numHeads;
 
+    const int   startPos = startPosPtr[0];
     const float pos      = (float)(startPos + p);
     const float invDim   = 1.0f / (float)headDim;
     const float baseFreq = pow(base, -(float)(2 * i) * invDim);

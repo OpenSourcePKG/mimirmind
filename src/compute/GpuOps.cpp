@@ -90,6 +90,13 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
         (2 + kFlashMaxHeadDim) * sizeof(float);
     _flashPartialUsm = _alloc.allocate(_flashPartialBytes);
 
+    // M-CLR.2: single-int USM slot for the current decode position.
+    // Kernels bind it via setPtr; host writes the value before each
+    // dispatch in immediate mode and between replays in replay mode.
+    _curLenSlotUsm = static_cast<std::int32_t*>(
+        _alloc.allocate(sizeof(std::int32_t)));
+    *_curLenSlotUsm = 0;
+
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
                 "rmsnorm_qkv/add_rmsnorm/"
@@ -321,11 +328,16 @@ void GpuOps::ropeInPlaceAsync(float*       x,
     const std::size_t halfDim = headDim / 2;
     const std::size_t total   = seqLen * numHeads * halfDim;
 
+    // M-CLR.2: startPos goes through the shared USM slot. The write
+    // happens before appendLaunch so submit-and-wait mode sees the
+    // fresh value; recorded/replayed lists pick up whatever the host
+    // sets between replays.
+    *_curLenSlotUsm = toInt32(startPos, "rope startPos");
     _ropeKernel.setPtr(0, x);
     _ropeKernel.setValue<std::int32_t>(1, toInt32(seqLen,   "rope seqLen"));
     _ropeKernel.setValue<std::int32_t>(2, toInt32(numHeads, "rope numHeads"));
     _ropeKernel.setValue<std::int32_t>(3, toInt32(headDim,  "rope headDim"));
-    _ropeKernel.setValue<std::int32_t>(4, toInt32(startPos, "rope startPos"));
+    _ropeKernel.setPtr(4, _curLenSlotUsm);
     _ropeKernel.setValue<float>(5, base);
     _ropeKernel.setGroupSize(kRopeLocalSize, 1, 1);
     _queue.appendLaunch(_ropeKernel,
@@ -353,12 +365,14 @@ void GpuOps::ropeInPlaceWithFactorsAsync(float*       x,
     const std::size_t halfDim = headDim / 2;
     const std::size_t total   = seqLen * numHeads * halfDim;
 
+    // M-CLR.2: startPos via shared USM slot. See ropeInPlaceAsync().
+    *_curLenSlotUsm = toInt32(startPos, "rope_ff startPos");
     _ropeFfKernel.setPtr(0, x);
     _ropeFfKernel.setPtr(1, freqFactors);
     _ropeFfKernel.setValue<std::int32_t>(2, toInt32(seqLen,   "rope_ff seqLen"));
     _ropeFfKernel.setValue<std::int32_t>(3, toInt32(numHeads, "rope_ff numHeads"));
     _ropeFfKernel.setValue<std::int32_t>(4, toInt32(headDim,  "rope_ff headDim"));
-    _ropeFfKernel.setValue<std::int32_t>(5, toInt32(startPos, "rope_ff startPos"));
+    _ropeFfKernel.setPtr(5, _curLenSlotUsm);
     _ropeFfKernel.setValue<float>(6, base);
     _ropeFfKernel.setGroupSize(kRopeLocalSize, 1, 1);
     _queue.appendLaunch(_ropeFfKernel,

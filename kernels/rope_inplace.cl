@@ -17,13 +17,18 @@
 #define ROPE_LOCAL 256
 #endif
 
+// M-CLR.2: `startPos` is passed via a __global int-slot instead of a
+// by-value kernel argument so a recorded command list can be replayed
+// after the host updates the slot between decode tokens. The host
+// writes the current value before every dispatch, which keeps the
+// immediate-mode call sites bit-identical to the pre-refactor path.
 __attribute__((reqd_work_group_size(ROPE_LOCAL, 1, 1)))
 __kernel void rope_inplace(
     __global       float* x,
     const int             seqLen,
     const int             numHeads,
     const int             headDim,
-    const int             startPos,
+    __global const int*   startPosPtr,
     const float           base)
 {
     const int gid     = (int)get_global_id(0);
@@ -39,7 +44,8 @@ __kernel void rope_inplace(
     const int h  = hp % numHeads;
     const int p  = hp / numHeads;
 
-    const float pos    = (float)(startPos + p);
+    const int   startPos = startPosPtr[0];
+    const float pos      = (float)(startPos + p);
     const float invDim = 1.0f / (float)headDim;
     const float freq   = pow(base, -(float)(2 * i) * invDim);
     const float theta  = pos * freq;
