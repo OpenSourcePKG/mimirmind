@@ -66,16 +66,40 @@ void GemmaBaseBackend::buildLayerInfos() {
         }
         li.altAttention = !hasV;
 
+        // Own-KV vs reuse. First `n_layer_kv_from_start` layers compute
+        // and store their own K/V. Trailing `sharedKvLayers` layers reuse
+        // an earlier layer via `n_kv_from_start - (is_swa ? 2 : 1)` per
+        // llama.cpp/src/llama-model.cpp:2160.
+        const std::size_t nKvStart =
+            _config.sharedKvLayers > 0
+                ? _config.blockCount - _config.sharedKvLayers
+                : _config.blockCount;
+        if (b < nKvStart) {
+            li.ownsKv        = true;
+            li.kvSourceLayer = b;
+        } else {
+            li.ownsKv        = false;
+            const std::size_t offset = li.isSwa ? 2 : 1;
+            li.kvSourceLayer =
+                nKvStart > offset ? nKvStart - offset : 0;
+        }
+
         _layers.push_back(li);
-        pattern.push_back(li.isSwa ? (li.altAttention ? 'a' : 's')
-                                   : (li.altAttention ? 'A' : 'F'));
+        pattern.push_back(li.ownsKv
+                              ? (li.isSwa ? (li.altAttention ? 'a' : 's')
+                                          : (li.altAttention ? 'A' : 'F'))
+                              : (li.isSwa ? 'x' : 'X'));
         if (li.isSwa) ++swaCount; else ++fullCount;
         if (li.altAttention) ++altCount;
     }
 
+    std::size_t reuseCount = 0;
+    for (const auto& li : _layers) if (!li.ownsKv) ++reuseCount;
+
     MM_LOG_INFO("gemma",
-                "layer map: {} ({} SWA, {} full, {} alt-attn V=K)",
-                pattern, swaCount, fullCount, altCount);
+                "layer map: {} ({} SWA, {} full, {} alt-attn V=K, "
+                "{} reuse-KV [x/X])",
+                pattern, swaCount, fullCount, altCount, reuseCount);
 }
 
 void GemmaBaseBackend::loadRopeFreqs() {
@@ -179,16 +203,22 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     const auto* attnNorm = requireTensor(blockIdx, "attn_norm.weight",         "GemmaBase");
     const auto* qW       = requireTensor(blockIdx, "attn_q.weight",            "GemmaBase");
     const auto* qNorm    = requireTensor(blockIdx, "attn_q_norm.weight",       "GemmaBase");
-    const auto* kW       = requireTensor(blockIdx, "attn_k.weight",            "GemmaBase");
-    const auto* kNorm    = requireTensor(blockIdx, "attn_k_norm.weight",       "GemmaBase");
     const auto* oW       = requireTensor(blockIdx, "attn_output.weight",       "GemmaBase");
     const auto* attnPost = requireTensor(blockIdx, "post_attention_norm.weight", "GemmaBase");
 
-    // vW is optional — when the layer uses alternative attention,
-    // V is derived from the raw K projection (see Gemma 4 reference).
-    const model::GgufTensor* vW = nullptr;
-    if (!li.altAttention) {
-        vW = requireTensor(blockIdx, "attn_v.weight", "GemmaBase");
+    // K/V weights are only needed when this layer owns its K/V cache.
+    // Shared-KV layers (Gemma 4 E4B: 18 trailing) skip the K/V projection
+    // entirely and read from `kvSourceLayer`'s cache during attention.
+    const model::GgufTensor* kW    = nullptr;
+    const model::GgufTensor* kNorm = nullptr;
+    const model::GgufTensor* vW    = nullptr;
+    if (li.ownsKv) {
+        kW    = requireTensor(blockIdx, "attn_k.weight",      "GemmaBase");
+        kNorm = requireTensor(blockIdx, "attn_k_norm.weight", "GemmaBase");
+        // vW is optional — altAttention layers derive V from the raw K.
+        if (!li.altAttention) {
+            vW = requireTensor(blockIdx, "attn_v.weight", "GemmaBase");
+        }
     }
 
     const std::size_t d_model  = s.d_model;
@@ -207,8 +237,11 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // attention kernel keeps the score row in SLM, so it's unused here.
     (void)s.scoreScratch;
 
-    float* const kSlot = cache.writeSlotK(blockIdx);
-    float* const vSlot = cache.writeSlotV(blockIdx);
+    // K/V slots. Own-KV layers write to their own cache. Shared-KV
+    // layers leave the writeSlot NULL — attention will read from the
+    // source layer's `baseK` / `baseV`.
+    float* const kSlot = li.ownsKv ? cache.writeSlotK(blockIdx) : nullptr;
+    float* const vSlot = li.ownsKv ? cache.writeSlotV(blockIdx) : nullptr;
 
     // --- pre-attention RMSNorm ----------------------------------------
 
@@ -230,9 +263,10 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // scatter kernel routes the sub-ranges into qBuf/kSlot/vSlot. The
     // fused block is only registered when the layer's V is separate
     // (altAttention layers stay on the split path since the V used
-    // downstream is the *raw* K projection, not W_v @ X).
+    // downstream is the *raw* K projection, not W_v @ X). Fused QKV
+    // is also skipped for shared-KV layers — no K/V to compute.
     const model::FusedQkvWeights::Block* fBlk =
-        (_fusedQkv != nullptr && !li.altAttention)
+        (_fusedQkv != nullptr && !li.altAttention && li.ownsKv)
             ? _fusedQkv->find(blockIdx)
             : nullptr;
 
@@ -246,7 +280,7 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
                          normBuf, T, qkvFused, matmulScratch);
         _ops.qkvSplitAsync(qkvFused, qBuf, kSlot, vSlot,
                            T, fBlk->Nq, fBlk->Nkv, fBlk->hasV);
-    } else {
+    } else if (li.ownsKv) {
         // M5f.4: Q/K/V projections write disjoint buffers. The pop inserts
         // a single barrier so the norms below see all three matmul outputs.
         trace("Q+K+V projections (matmulAsync, unordered)");
@@ -258,9 +292,15 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
                 projectAsync(vW, kv_dim, vSlot);
             }
         }
+    } else {
+        // Shared-KV layer: only compute Q. K/V are read from the source
+        // layer's cache during attentionAsync below (populated earlier
+        // in this same forward pass by that layer's own compute).
+        trace("Q-only projection (shared-KV layer)");
+        projectAsync(qW, q_dim, qBuf);
     }
 
-    if (li.altAttention) {
+    if (li.altAttention && li.ownsKv) {
         // V = raw K projection. We need a copy of K *before* K-norm and
         // RoPE so V keeps its raw layout. The unordered pop above
         // already issued a barrier; flush so the host memcpy reads a
@@ -270,12 +310,10 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         std::memcpy(vSlot, kSlot, T * kv_dim * sizeof(float));
     }
 
-    // Q-norm, K-norm, V-norm — three in-place norms on three different
-    // buffers, each depends on its own projection (visible via the
-    // projections' pop barrier above).
+    // Q-norm always runs. K-norm + V-norm only when the layer owns K/V.
     _op.mark(runtime::OpProfiler::Cat::NORM);
-    trace("Q+K+V norms (rmsNorm, unordered)");
-    {
+    if (li.ownsKv) {
+        trace("Q+K+V norms (rmsNorm, unordered)");
         runtime::UnorderedScope u{_ops.queue()};
         _ops.rmsNormAsync(qBuf, T * li.nHeads, head_dim,
                           static_cast<const float*>(qNorm->usmPtr),
@@ -288,12 +326,18 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         _ops.rmsNormNoWeightAsync(vSlot, T * li.nKvHeads, head_dim,
                                   _config.rmsNormEps,
                                   vSlot);            // in-place
+    } else {
+        trace("Q-norm only (shared-KV layer)");
+        _ops.rmsNormAsync(qBuf, T * li.nHeads, head_dim,
+                          static_cast<const float*>(qNorm->usmPtr),
+                          _config.rmsNormEps,
+                          qBuf);
     }
 
-    // RoPE Q and RoPE K — independent buffers, V skipped (no RoPE).
+    // RoPE Q always runs. RoPE K only when the layer owns K/V.
     _op.mark(runtime::OpProfiler::Cat::ATTENTION);
-    trace("RoPE Q+K (unordered)");
-    {
+    if (li.ownsKv) {
+        trace("RoPE Q+K (unordered)");
         runtime::UnorderedScope u{_ops.queue()};
         if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
             _ops.ropeInPlaceWithFactorsAsync(qBuf, _ropeFreqsForFullAttn, T,
@@ -308,22 +352,35 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
             _ops.ropeInPlaceAsync(kSlot, T, li.nKvHeads, head_dim, curLen,
                                   li.ropeBase);
         }
+    } else {
+        trace("RoPE Q only (shared-KV layer)");
+        if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
+            _ops.ropeInPlaceWithFactorsAsync(qBuf, _ropeFreqsForFullAttn, T,
+                                             li.nHeads, head_dim, curLen,
+                                             li.ropeBase);
+        } else {
+            _ops.ropeInPlaceAsync(qBuf, T, li.nHeads, head_dim, curLen,
+                                  li.ropeBase);
+        }
     }
-    dumpStage("Kcur_pos",    blockIdx, kSlot, T, kv_dim);
-    dumpStage("Vcur_normed", blockIdx, vSlot, T, kv_dim);
-    dumpStage("Qcur_pos",    blockIdx, qBuf,  T, q_dim);
+    if (li.ownsKv) {
+        dumpStage("Kcur_pos",    blockIdx, kSlot, T, kv_dim);
+        dumpStage("Vcur_normed", blockIdx, vSlot, T, kv_dim);
+    }
+    dumpStage("Qcur_pos", blockIdx, qBuf, T, q_dim);
 
     // M5f.3: attention on the GPU. Gemma 4's f_attention_scale = 1.0
     // (gemma4.cpp:11), so we pass scale=1.0 directly — no sqrt(head_dim)
-    // pre-scale needed anymore. The old CPU path had to pre-scale Q
-    // because compute::multiHeadAttention bakes in 1/sqrt(headDim);
-    // the GPU kernel takes scale as a parameter, which makes the Gemma
-    // branch one mulScalarAsync + one sync cheaper than before.
+    // pre-scale needed anymore.
+    // For shared-KV layers, cache.baseK/V(kvSourceLayer) redirects
+    // attention to the K/V cache written by an earlier layer during
+    // this same prefill pass.
     _op.mark(runtime::OpProfiler::Cat::ATTENTION);
-    trace("attention (GPU, scale=1)");
+    trace(li.ownsKv ? "attention (GPU, scale=1, own K/V)"
+                    : "attention (GPU, scale=1, reuse K/V)");
     _ops.attentionAsync(qBuf,
-                        cache.baseK(blockIdx),
-                        cache.baseV(blockIdx),
+                        cache.baseK(li.kvSourceLayer),
+                        cache.baseV(li.kvSourceLayer),
                         T, totalLen,
                         li.nHeads, li.nKvHeads, head_dim,
                         curLen, /*scale=*/1.0F,

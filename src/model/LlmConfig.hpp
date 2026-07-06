@@ -56,6 +56,17 @@ struct LlmConfig {
     std::uint32_t expertCount       {0};        // total experts per block
     std::uint32_t expertUsedCount   {0};        // top-K experts activated per token
 
+    // Gemma 4 "shared KV layers": last N layers reuse an earlier layer's
+    // K/V cache instead of computing their own. GGUF key
+    // `<arch>.attention.shared_kv_layers`. 0 = every layer computes its
+    // own K/V (the historical default we've been assuming).
+    // Populated for E4B (=18) and 26B-A4B (=some value); zero elsewhere.
+    // Consumers should treat `blockCount - sharedKvLayers` as the
+    // "n_layer_kv_from_start" threshold — layers >= this reuse an
+    // earlier layer's K/V per the llama.cpp reuse callback
+    // `n_kv_from_start - (is_swa(il) ? 2 : 1)`.
+    std::uint32_t sharedKvLayers    {0};
+
     [[nodiscard]] std::uint32_t headDim() const noexcept {
         if (keyLength > 0) {
             return keyLength;

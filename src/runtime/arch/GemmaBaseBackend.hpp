@@ -100,6 +100,14 @@ protected:
         std::size_t qDim;             // nHeads * headDim
         std::size_t kvDim;            // nKvHeads * headDim
         float       ropeBase;         // SWA vs full rope base
+
+        // Gemma 4 shared-KV mechanism. `ownsKv` is false for the trailing
+        // `config.sharedKvLayers` layers — they skip the K/V projection +
+        // norm + RoPE + cache-write, and attention instead reads from
+        // `kvSourceLayer`'s cache (which was written by an earlier
+        // full-KV layer during this same prefill pass).
+        bool        ownsKv;
+        std::size_t kvSourceLayer;    // = blockIdx when ownsKv, else the reuse source
     };
 
     /// Fill `_layers` from `_config` + `_weights`. Called from constructor.

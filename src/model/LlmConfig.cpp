@@ -199,6 +199,16 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
                     a, expertUsedCount);
     }
 
+    // Gemma 4: number of trailing layers that reuse an earlier layer's
+    // K/V cache. In E4B this is 18 (n_layer_kv_from_start = 42 - 18 = 24).
+    sharedKvLayers  = optionalU32("attention.shared_kv_layers", 0);
+    if (sharedKvLayers > 0) {
+        MM_LOG_INFO("config",
+                    "{}.attention.shared_kv_layers = {} (last {} block(s) "
+                    "reuse K/V from an earlier layer)",
+                    a, sharedKvLayers, sharedKvLayers);
+    }
+
     // --- Architecture-specific shape corrections -------------------------
 
     // Gemma 4 26B-A4B's metadata declares two distinct head dimensions
