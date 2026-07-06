@@ -53,6 +53,7 @@ CommandQueue::CommandQueue(L0Context& ctx)
 }
 
 CommandQueue::~CommandQueue() {
+    resetRecording();
     if (_cmdList != nullptr) {
         zeCommandListDestroy(_cmdList);
         _cmdList = nullptr;
@@ -68,8 +69,14 @@ void CommandQueue::appendLaunch(GpuKernel&    kernel,
                                 std::uint32_t groupCountY,
                                 std::uint32_t groupCountZ) {
     ze_group_count_t groups{groupCountX, groupCountY, groupCountZ};
+    // M-CLR.3: route into the recording list while beginRecord/endRecord
+    // is active. The immediate list stays idle in that case (nothing
+    // touches _hasPending) so a stray flush() during recording is a
+    // no-op, which keeps profiler/diagnostic paths safe.
+    ze_command_list_handle_t target =
+        _recording ? _recordList : _cmdList;
     ZE_CHECK(zeCommandListAppendLaunchKernel(
-        _cmdList, kernel.handle(), &groups,
+        target, kernel.handle(), &groups,
         nullptr, 0, nullptr));
     ++_dispatchCount;
 
@@ -83,10 +90,12 @@ void CommandQueue::appendLaunch(GpuKernel&    kernel,
     // and we skip the barrier; the matching popUnordered() inserts
     // exactly one barrier at the end of the group.
     if (_unorderedDepth == 0) {
-        ZE_CHECK(zeCommandListAppendBarrier(_cmdList, nullptr, 0, nullptr));
+        ZE_CHECK(zeCommandListAppendBarrier(target, nullptr, 0, nullptr));
     }
 
-    _hasPending = true;
+    if (!_recording) {
+        _hasPending = true;
+    }
 }
 
 void CommandQueue::pushUnordered() {
@@ -101,13 +110,21 @@ void CommandQueue::popUnordered() {
             "CommandQueue::popUnordered without matching pushUnordered");
     }
     --_unorderedDepth;
-    if (_unorderedDepth == 0 && _hasPending) {
-        ZE_CHECK(zeCommandListAppendBarrier(_cmdList, nullptr, 0, nullptr));
+    // M-CLR.3: `_hasPending` is only tracked on the immediate list; a
+    // group that ended in a recording emits its trailing barrier there.
+    if (_unorderedDepth == 0) {
+        if (_recording) {
+            ZE_CHECK(zeCommandListAppendBarrier(_recordList, nullptr, 0, nullptr));
+        } else if (_hasPending) {
+            ZE_CHECK(zeCommandListAppendBarrier(_cmdList,    nullptr, 0, nullptr));
+        }
     }
 }
 
 void CommandQueue::appendBarrier() {
-    ZE_CHECK(zeCommandListAppendBarrier(_cmdList, nullptr, 0, nullptr));
+    ze_command_list_handle_t target =
+        _recording ? _recordList : _cmdList;
+    ZE_CHECK(zeCommandListAppendBarrier(target, nullptr, 0, nullptr));
 }
 
 void CommandQueue::flush() {
@@ -145,6 +162,73 @@ void CommandQueue::dispatch(GpuKernel&    kernel,
                  "dispatch done — kernel={} groups=({},{},{})",
                  static_cast<const void*>(kernel.handle()),
                  groupCountX, groupCountY, groupCountZ);
+}
+
+// -- M-CLR.3 — record / replay ------------------------------------------
+
+void CommandQueue::beginRecord() {
+    if (_recording) {
+        throw std::logic_error(
+            "CommandQueue::beginRecord already recording — call endRecord first");
+    }
+    if (_hasPending) {
+        throw std::logic_error(
+            "CommandQueue::beginRecord while immediate work is pending — "
+            "call flush() first");
+    }
+    if (_recordList == nullptr) {
+        ze_command_list_desc_t desc{};
+        desc.stype                    = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
+        desc.commandQueueGroupOrdinal = _ordinal;
+        desc.flags                    = 0;
+        ZE_CHECK(zeCommandListCreate(_ctx.context(), _ctx.device(),
+                                     &desc, &_recordList));
+    } else {
+        ZE_CHECK(zeCommandListReset(_recordList));
+    }
+    _recording      = true;
+    _recordingReady = false;
+    MM_LOG_DEBUG("gpu", "CommandQueue: recording begin (list={})",
+                 static_cast<const void*>(_recordList));
+}
+
+void CommandQueue::endRecord() {
+    if (!_recording) {
+        throw std::logic_error(
+            "CommandQueue::endRecord called outside beginRecord");
+    }
+    if (_unorderedDepth != 0) {
+        MM_LOG_ERROR("gpu",
+                     "CommandQueue::endRecord with unorderedDepth={} — "
+                     "missing popUnordered before endRecord", _unorderedDepth);
+        _unorderedDepth = 0;
+    }
+    ZE_CHECK(zeCommandListClose(_recordList));
+    _recording      = false;
+    _recordingReady = true;
+    MM_LOG_DEBUG("gpu", "CommandQueue: recording closed (list={})",
+                 static_cast<const void*>(_recordList));
+}
+
+void CommandQueue::replay() {
+    if (!_recordingReady) {
+        throw std::logic_error(
+            "CommandQueue::replay called with no closed recording — "
+            "call beginRecord/endRecord first");
+    }
+    ZE_CHECK(zeCommandQueueExecuteCommandLists(
+        _queue, 1, &_recordList, nullptr));
+    ZE_CHECK(zeCommandQueueSynchronize(
+        _queue, std::numeric_limits<std::uint64_t>::max()));
+}
+
+void CommandQueue::resetRecording() noexcept {
+    _recording      = false;
+    _recordingReady = false;
+    if (_recordList != nullptr) {
+        zeCommandListDestroy(_recordList);
+        _recordList = nullptr;
+    }
 }
 
 } // namespace mimirmind::runtime

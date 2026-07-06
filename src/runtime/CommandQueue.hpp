@@ -93,13 +93,57 @@ public:
     [[nodiscard]] std::size_t dispatchCount() const noexcept { return _dispatchCount; }
     void resetDispatchCount() noexcept { _dispatchCount = 0; }
 
+    // -- M-CLR.3 — record / replay -------------------------------------
+    //
+    // Typical use for the Gemma4E4B decode loop:
+    //
+    //   engine.runFirstDecodeStep();          // immediate mode, warms cache
+    //   queue.beginRecord();                  // arm the recording list
+    //   engine.runOneDecodeStep();            // dispatches route into it
+    //   queue.endRecord();
+    //   for (each further decode step) {
+    //     *ops.curLenSlot() = new_cur_len;    // one 4-byte host write
+    //     queue.replay();                     // reuses the recorded list
+    //   }
+    //
+    // Recording is exclusive with the immediate command list — the
+    // implementation swaps which handle appendLaunch targets, so
+    // profiler / diagnostic paths that try to flush() during a
+    // recording just early-return (hasPending stays false on the
+    // immediate list).
+
+    /// Begin a fresh recording. Any prior recording is discarded. The
+    /// immediate command list must be idle (call flush() first).
+    void beginRecord();
+
+    /// Close the recording — it is now replay-able.
+    void endRecord();
+
+    /// Execute the closed recording once. Synchronous.
+    void replay();
+
+    /// True once endRecord() has been called since the last beginRecord
+    /// / resetRecording(). Immediate replay() is only valid then.
+    [[nodiscard]] bool hasRecording() const noexcept { return _recordingReady; }
+
+    /// True while beginRecord() is active. Used by callers that want to
+    /// route diagnostics differently during recording.
+    [[nodiscard]] bool isRecording() const noexcept { return _recording; }
+
+    /// Free the recorded list handle and forget the recording. Called
+    /// implicitly by the destructor. Idempotent.
+    void resetRecording() noexcept;
+
 private:
     L0Context&                _ctx;
     ze_command_queue_handle_t _queue         {nullptr};
     ze_command_list_handle_t  _cmdList       {nullptr};
+    ze_command_list_handle_t  _recordList    {nullptr};
     std::uint32_t             _ordinal       {0};
     std::uint32_t             _unorderedDepth{0};
     bool                      _hasPending    {false};
+    bool                      _recording     {false};
+    bool                      _recordingReady{false};
     std::size_t               _dispatchCount {0};
 };
 
