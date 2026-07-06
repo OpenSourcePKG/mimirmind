@@ -23,6 +23,7 @@
 #include <ctime>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -357,6 +358,28 @@ struct ApiServer::Impl {
     runtime::PowerMonitor::Snapshot       powerLastStatus{};
     std::chrono::steady_clock::time_point baselineWallStart{};
     bool                                  baselineCaptured{false};
+
+    // In-flight request snapshot for /v1/system/status.current_request.
+    // A UI (e.g. Pegenaut) can poll this to render "prefill 24/42, decode
+    // 15/4096" instead of showing a spinner for the ~15 minutes a long
+    // prompt with a large max_tokens can take. Guarded by
+    // `currentRequestMutex`; only one chat request runs at a time thanks
+    // to `engineMutex`, so writers never contend, only the status poller
+    // reads while a writer may be updating.
+    struct CurrentRequest {
+        std::string request_id;
+        std::chrono::steady_clock::time_point started_at;
+        std::size_t prompt_tokens{0};
+        std::size_t max_new_tokens{0};
+        std::size_t prefill_blocks_done{0};
+        std::size_t prefill_blocks_total{0};
+        double      prefill_elapsed_ms{0.0};
+        bool        prefill_done{false};
+        std::size_t decode_tokens_emitted{0};
+        bool        streaming{false};
+    };
+    mutable std::mutex                    currentRequestMutex;
+    std::optional<CurrentRequest>         currentRequest;
 
     Impl(runtime::InferenceEngine& e, ServerConfig c,
          runtime::InferenceEngine* draft)
@@ -731,7 +754,95 @@ struct ApiServer::Impl {
         body["fan"]             = buildFanBlock();
         body["kernels"]         = buildKernelsBlock();
         body["perf_regression"] = buildPerfRegressionBlock();
+        body["current_request"] = buildCurrentRequestBlock();
         sendJson(res, 200, body);
+    }
+
+    // --- In-flight request tracking for status polling ------------------
+    //
+    // Called at chat-handler entry / exit so the status endpoint can
+    // report progress instead of leaving a UI stuck on a spinner for the
+    // 15 minutes a large prompt with max_tokens=4096 can take. The four
+    // updaters are cheap (a mutex + a few writes) and safe to call from
+    // per-block / per-token callbacks.
+
+    void beginCurrentRequest(std::string   id,
+                             std::size_t   promptTokens,
+                             std::size_t   maxNew,
+                             bool          streaming) {
+        std::lock_guard<std::mutex> lk{currentRequestMutex};
+        CurrentRequest r;
+        r.request_id     = std::move(id);
+        r.started_at     = std::chrono::steady_clock::now();
+        r.prompt_tokens  = promptTokens;
+        r.max_new_tokens = maxNew;
+        r.streaming      = streaming;
+        currentRequest   = std::move(r);
+    }
+
+    void endCurrentRequest() noexcept {
+        std::lock_guard<std::mutex> lk{currentRequestMutex};
+        currentRequest.reset();
+    }
+
+    void updateCurrentPrefillProgress(
+        const runtime::InferenceEngine::PrefillProgress& p) {
+        std::lock_guard<std::mutex> lk{currentRequestMutex};
+        if (!currentRequest.has_value()) return;
+        currentRequest->prefill_blocks_done  = p.blocksDone;
+        currentRequest->prefill_blocks_total = p.blocksTotal;
+        currentRequest->prefill_elapsed_ms   = p.elapsedMs;
+    }
+
+    void markCurrentPrefillDone() {
+        std::lock_guard<std::mutex> lk{currentRequestMutex};
+        if (!currentRequest.has_value()) return;
+        currentRequest->prefill_done = true;
+    }
+
+    void incrementCurrentDecodeTokens() {
+        std::lock_guard<std::mutex> lk{currentRequestMutex};
+        if (!currentRequest.has_value()) return;
+        ++currentRequest->decode_tokens_emitted;
+    }
+
+    /// RAII wrapper — clears the snapshot on scope exit even if generate()
+    /// throws. Blocking and streaming chat handlers both use this so no
+    /// exception path leaks a stale "active" entry into the status poll.
+    struct CurrentRequestGuard {
+        Impl* self;
+        explicit CurrentRequestGuard(Impl* s) noexcept : self{s} {}
+        ~CurrentRequestGuard() noexcept { if (self) self->endCurrentRequest(); }
+        CurrentRequestGuard(const CurrentRequestGuard&) = delete;
+        CurrentRequestGuard& operator=(const CurrentRequestGuard&) = delete;
+    };
+
+    json buildCurrentRequestBlock() const {
+        std::lock_guard<std::mutex> lk{currentRequestMutex};
+        if (!currentRequest.has_value()) {
+            return json{{"active", false}};
+        }
+        const auto& r = *currentRequest;
+        const double elapsedMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - r.started_at).count();
+        return json{
+            {"active",          true},
+            {"request_id",      r.request_id},
+            {"streaming",       r.streaming},
+            {"elapsed_ms",      elapsedMs},
+            {"prompt_tokens",   r.prompt_tokens},
+            {"prefill", {
+                {"blocks_done",  r.prefill_blocks_done},
+                {"blocks_total", r.prefill_blocks_total},
+                {"elapsed_ms",   r.prefill_elapsed_ms},
+                {"done",         r.prefill_done},
+            }},
+            {"decode", {
+                {"tokens_emitted", r.decode_tokens_emitted},
+                {"max_new_tokens", r.max_new_tokens},
+            }},
+        };
     }
 
     /// Compose the "perf_regression" sub-object of /v1/system/status.
@@ -1108,6 +1219,28 @@ struct ApiServer::Impl {
         runtime::GenerateStats stats;
         std::vector<std::int32_t> generated;
 
+        // Reserve the response id up-front so the /v1/system/status
+        // snapshot can carry it while the request is still running.
+        const std::string respId = makeRequestId();
+        beginCurrentRequest(respId, promptIds.size(),
+                            params.maxNewTokens, /*streaming=*/false);
+        CurrentRequestGuard requestGuard{this};
+
+        auto onPrefillProgress =
+            [this](const runtime::InferenceEngine::PrefillProgress& p)
+                -> bool {
+                updateCurrentPrefillProgress(p);
+                return true;
+            };
+        auto onPrefillDone =
+            [this](const runtime::InferenceEngine::PrefillDone&) {
+                markCurrentPrefillDone();
+            };
+        auto onToken = [this](std::int32_t) -> bool {
+            incrementCurrentDecodeTokens();
+            return true;
+        };
+
         {
             // Engine is single-instance, mutable scratch + sampler. Serialise.
             std::lock_guard<std::mutex> lk{engineMutex};
@@ -1117,9 +1250,13 @@ struct ApiServer::Impl {
                 // identically for sampled / kill-switched requests.
                 if (speculativeDecoder != nullptr) {
                     generated = speculativeDecoder->generate(
-                        promptIds, params, {}, &stats);
+                        promptIds, params, onToken, &stats,
+                        onPrefillDone, onPrefillProgress);
                 } else {
-                    generated = engine.generate(promptIds, params, {}, &stats);
+                    generated = engine.generate(promptIds, params,
+                                                onToken, &stats,
+                                                onPrefillDone,
+                                                onPrefillProgress);
                 }
             } catch (const runtime::ThermalLimitExceeded& e) {
                 MM_LOG_INFO("server",
@@ -1155,7 +1292,6 @@ struct ApiServer::Impl {
             ? rawText
             : model::ChatTemplate::cleanResponse(chatStyle, rawText);
 
-        const std::string respId = makeRequestId();
         const std::int64_t now   = unixNow();
         const std::string finish = hitStop ? "stop" : "length";
 
@@ -1318,6 +1454,9 @@ struct ApiServer::Impl {
                         // checks isStop on the next iteration and exits.
                         return true;
                     }
+                    // Snapshot the per-token progress even for stripped
+                    // tokens so /v1/system/status reflects real decode work.
+                    incrementCurrentDecodeTokens();
                     std::string txt = tok.decode(
                         std::span<const std::int32_t>{&id, 1},
                         /*skipSpecial=*/true);
@@ -1358,6 +1497,7 @@ struct ApiServer::Impl {
                 // pick it up via EventSource.addEventListener.
                 auto onPrefillDone =
                     [&](const runtime::InferenceEngine::PrefillDone& p) {
+                        markCurrentPrefillDone();
                         const json payload = {
                             {"prompt_tokens",    p.promptTokens},
                             {"prefilled_tokens", p.prefilledTokens},
@@ -1380,6 +1520,10 @@ struct ApiServer::Impl {
                 auto onPrefillProgress =
                     [&](const runtime::InferenceEngine::PrefillProgress& p)
                         -> bool {
+                        // Snapshot for /v1/system/status polling — kept
+                        // outside the SSE-rate-limit branch so the status
+                        // block sees every completed transformer layer.
+                        updateCurrentPrefillProgress(p);
                         // M7g — poll for a client-side disconnect on every
                         // block. If clientGone flipped between blocks (via
                         // the throttle branch below OR via a broken write
@@ -1414,6 +1558,15 @@ struct ApiServer::Impl {
 
                 std::vector<std::int32_t> generated;
                 std::string               errorMessage;
+                // Register this request with the status snapshot so
+                // /v1/system/status can report prefill+decode progress
+                // while it runs. The RAII guard releases on scope exit —
+                // covers early error exits and generate() throws.
+                beginCurrentRequest(state->respId,
+                                    state->promptIds.size(),
+                                    state->params.maxNewTokens,
+                                    /*streaming=*/true);
+                CurrentRequestGuard requestGuard{this};
                 {
                     std::lock_guard<std::mutex> lk{engineMutex};
                     try {
