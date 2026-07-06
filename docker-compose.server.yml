@@ -140,16 +140,18 @@ services:
             #   GPU_CLOCK_PIN=<val>  → Cap pinnen, P-controller tick aus.
             #                          Werte: rp0 (HW max), rpn (HW min ~800),
             #                          numerisch (MHz, geklammert an [RPn,RP0]).
-            #                          M9.11.a — für Bench-Repeatability. NUR
-            #                          für Bench-Runs, nicht sustained Multi-
-            #                          Request-Traffic auf passiv-gekühltem
-            #                          Chassis!
+            #                          Default rp0 seit 2026-07-07 nach BIOS-
+            #                          Turbo — Kühlung trägt sustained rp0.
+            #                          Live-Bench 218 → 199 ms/tok E4B decode
+            #                          (−9 %) mit Turbo + rp0-Pin. Zum
+            #                          Deaktivieren explizit auf leer oder
+            #                          numerisch setzen (Downshift-Bench).
             MIMIRMIND_DISABLE_GEMM:      ${MIMIRMIND_DISABLE_GEMM:-}
             MIMIRMIND_FORCE_GEMM:        ${MIMIRMIND_FORCE_GEMM:-}
             MIMIRMIND_GEMM_MIN_M:        ${MIMIRMIND_GEMM_MIN_M:-}
             MIMIRMIND_DISABLE_FUSED_QKV: ${MIMIRMIND_DISABLE_FUSED_QKV:-}
             MIMIRMIND_DISABLE_MOE_GROUP: ${MIMIRMIND_DISABLE_MOE_GROUP:-}
-            MIMIRMIND_GPU_CLOCK_PIN:     ${MIMIRMIND_GPU_CLOCK_PIN:-}
+            MIMIRMIND_GPU_CLOCK_PIN:     ${MIMIRMIND_GPU_CLOCK_PIN:-rp0}
             MIMIRMIND_DISABLE_DP4A:      ${MIMIRMIND_DISABLE_DP4A:-}
             MIMIRMIND_FORCE_DP4A:        ${MIMIRMIND_FORCE_DP4A:-}
 
