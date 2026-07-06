@@ -104,6 +104,19 @@ void fillSyntheticWeights(model::GgmlType type,
         for (std::size_t off = 0; off + bs <= nbytes; off += bs) {
             std::memcpy(dst + off, &kHalfTiny, 2);
         }
+    } else if (type == model::GgmlType::Q5_K) {
+        // 176 B super-block: fp16 d + fp16 dmin + 12 scales + 32 qh + 128 qs.
+        // Without this override, random bytes at offsets 0..3 get
+        // interpreted as fp16 by the dequant path (possibly ±Inf, NaN, or
+        // 65504), which makes the vec-parity check "pass" (CPU and GPU
+        // agree) but produces astronomical output magnitudes — the
+        // parity check then can't tell an actual layout bug from
+        // consistent-but-wrong behaviour.
+        const std::size_t bs = 176;
+        for (std::size_t off = 0; off + bs <= nbytes; off += bs) {
+            std::memcpy(dst + off,     &kHalfTiny, 2);   // d
+            std::memcpy(dst + off + 2, &kHalfTiny, 2);   // dmin
+        }
     }
 }
 
@@ -356,14 +369,75 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
     using clk = std::chrono::steady_clock;
 
     for (auto& [type, entry] : _entries) {
-        if (!entry.gemm.has_value()) {
+        const QuantType* qt = quantType(type);
+        if (qt == nullptr) {
             entry.gemmMinM = kGemmMinMNever;
             entry.autotuneSource = "no_gemm";
             continue;
         }
 
-        const QuantType* qt = quantType(type);
-        if (qt == nullptr) {
+        // CPU vs GPU vec parity — even types without a GEMM kernel get
+        // this check. Catches quantized matvec kernels whose bit-layout
+        // disagrees with the CPU dequant (Q5_K bringup for E4B lived
+        // here for a day). Sample at M=1 with the synthetic X row so
+        // the cost is minimal.
+        {
+            const std::size_t nSuper = K / qt->blockElements();
+            const std::size_t wBytes = N * nSuper * qt->blockBytes();
+            void* wUsm = allocator.allocate(wBytes);
+            fillSyntheticWeights(type,
+                                 static_cast<std::uint8_t*>(wUsm),
+                                 wBytes);
+
+            std::vector<float> yGpu(N, 0.0F);
+            std::vector<float> yCpu(N, 0.0F);
+            std::vector<float> cpuScratch(K, 0.0F);
+
+            entry.gemmMinM = kGemmMinMNever;   // force matvec-loop
+            std::memset(yUsm, 0, N * sizeof(float));
+            matmulAsync(type, wUsm, N, K,
+                        static_cast<const float*>(xUsm), /*M=*/1,
+                        static_cast<float*>(yUsm),
+                        static_cast<float*>(sUsm));
+            _queue.flush();
+            std::memcpy(yGpu.data(), yUsm, N * sizeof(float));
+
+            compute::matmul(type, wUsm, N, K,
+                            static_cast<const float*>(xUsm), /*M=*/1,
+                            yCpu.data(),
+                            cpuScratch.data());
+
+            float maxDiff = 0.0F;
+            float maxRef  = 0.0F;
+            for (std::size_t i = 0; i < N; ++i) {
+                const float d = std::fabs(yGpu[i] - yCpu[i]);
+                if (d > maxDiff) maxDiff = d;
+                const float r = std::fabs(yCpu[i]);
+                if (r > maxRef) maxRef = r;
+            }
+            const float relTol = maxRef * 1e-2F;
+            const float absTol = 5e-2F;
+            const bool ok = maxDiff <= std::max(relTol, absTol);
+            if (!ok) {
+                MM_LOG_ERROR("gpummm",
+                             "vec parity FAIL for {} — GPU vs CPU "
+                             "maxDiff={:.6g} maxRef={:.6g} (tol=max("
+                             "{:.4g},{:.4g})). Matvec kernel disagrees "
+                             "with reference dequant; this WILL produce "
+                             "garbage output on any model using this "
+                             "quant type.",
+                             qt->name(), maxDiff, maxRef, relTol, absTol);
+            } else {
+                MM_LOG_INFO("gpummm",
+                            "vec parity OK for {} — GPU vs CPU "
+                            "maxDiff={:.6g} maxRef={:.6g}",
+                            qt->name(), maxDiff, maxRef);
+            }
+
+            allocator.deallocate(wUsm, wBytes);
+        }
+
+        if (!entry.gemm.has_value()) {
             entry.gemmMinM = kGemmMinMNever;
             entry.autotuneSource = "no_gemm";
             continue;

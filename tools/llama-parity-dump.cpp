@@ -108,19 +108,24 @@ int main(int argc, char** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     std::string dumpDir;
-    // Strip --dump-dir DIR out of argv so common_params_parse doesn't see it.
+    std::string explicitTokensCsv;
+    // Strip --dump-dir DIR and --tokens CSV out of argv so
+    // common_params_parse doesn't see them.
     std::vector<char*> filteredArgv;
     filteredArgv.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump-dir") == 0 && i + 1 < argc) {
             dumpDir = argv[++i];
+        } else if (std::strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
+            explicitTokensCsv = argv[++i];
         } else {
             filteredArgv.push_back(argv[i]);
         }
     }
     if (dumpDir.empty()) {
         std::fprintf(stderr,
-                     "usage: %s --model PATH --prompt TEXT --dump-dir DIR\n",
+                     "usage: %s --model PATH --dump-dir DIR "
+                     "(--prompt TEXT | --tokens id1,id2,...)\n",
                      argv[0]);
         return 1;
     }
@@ -140,7 +145,7 @@ int main(int argc, char** argv) {
     ParityCtx ctx{
         /*.dumpDir =*/ dumpDir,
         /*.pattern =*/ std::regex(
-            R"(^(attn_norm|Qcur_pos|Kcur_pos|Vcur_normed|attn_post_norm|attn_out|ffn_mlp|ffn_moe|ffn_moe_combined|ffn_post_norm|out_scaled|l_out)-(\d+)$)"),
+            R"(^(inp_scaled|attn_norm|Qcur_pos|Kcur_pos|Vcur_normed|attn_post_norm|attn_out|ffn_mlp|ffn_moe|ffn_moe_combined|ffn_post_norm|out_scaled|l_out)(?:-(-?\d+))?$)"),
         /*.dumped  =*/ 0,
     };
 
@@ -162,10 +167,26 @@ int main(int argc, char** argv) {
     const llama_vocab* vocab = llama_model_get_vocab(model);
     const bool add_bos       = llama_vocab_get_add_bos(vocab);
 
-    std::vector<llama_token> tokens =
-        common_tokenize(lctx, params.prompt, add_bos, true);
+    std::vector<llama_token> tokens;
+    if (!explicitTokensCsv.empty()) {
+        // Feed the exact prefill sequence given by the caller. Bypasses
+        // the tokenizer + BOS injection so the token IDs match whatever
+        // mimirmind logged from its chat-template renderer.
+        std::size_t pos = 0;
+        while (pos < explicitTokensCsv.size()) {
+            std::size_t comma = explicitTokensCsv.find(',', pos);
+            if (comma == std::string::npos) comma = explicitTokensCsv.size();
+            const std::string one = explicitTokensCsv.substr(pos, comma - pos);
+            if (!one.empty()) {
+                tokens.push_back(static_cast<llama_token>(std::atoi(one.c_str())));
+            }
+            pos = comma + 1;
+        }
+    } else {
+        tokens = common_tokenize(lctx, params.prompt, add_bos, true);
+    }
     if (tokens.empty()) {
-        std::fprintf(stderr, "parity-dump: empty prompt\n");
+        std::fprintf(stderr, "parity-dump: empty prompt / tokens\n");
         return 1;
     }
 

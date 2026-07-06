@@ -272,13 +272,17 @@ services:
             MIMIRMIND_SPEC_DEC:          ${MIMIRMIND_SPEC_DEC:-}
             MIMIRMIND_SPEC_DEC_N:        ${MIMIRMIND_SPEC_DEC_N:-}
 
-            # E4B / gemma4 e-series: temporarily disable the PLE
-            # residual injection to A/B-test whether the base transformer
-            # output is coherent without it. When PLE is off the model
-            # quality drops (that's the whole point of PLE) but if the
-            # output stays Kauderwelsch even with PLE off the bug lives
-            # in the attention / FFN path, not in the PLE branch.
-            MIMIRMIND_E4B_DISABLE_PLE:   ${MIMIRMIND_E4B_DISABLE_PLE:-}
+            # Parity-dump prefix — when set, every block writes per-stage
+            # bin files at PREFIX-blk{N}-<stage>.bin (inp_scaled,
+            # attn_norm, Qcur_pos, Kcur_pos, Vcur_normed, attn_post_norm,
+            # attn_out, l_out). Companion tool inside the image:
+            # `docker exec mimirmind llama-parity-dump --model
+            # /models/<file>.gguf --tokens id1,id2,... --dump-dir
+            # /logs/parity/llama` — dumps the same stages from ggml on
+            # the same token IDs (log the mimirmind `[parity]` line for
+            # the exact IDs). Then `parity-diff /logs/parity/llama
+            # /logs/parity/mimir` prints the first divergent stage.
+            MIMIRMIND_PARITY_DUMP:           ${MIMIRMIND_PARITY_DUMP:-}
 
         volumes:
             - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro

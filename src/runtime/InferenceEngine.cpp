@@ -468,6 +468,18 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
 
     if (const char* dumpPrefix = std::getenv("MIMIRMIND_PARITY_DUMP")) {
         _backend->setParityDumpPrefix(dumpPrefix);
+        // Log the token sequence so the operator can hand the same tokens
+        // to llama-parity-dump and compare block-0 outputs.
+        std::string idsCsv;
+        const std::size_t nShow = std::min(promptIds.size(), std::size_t{48});
+        for (std::size_t i = 0; i < nShow; ++i) {
+            if (!idsCsv.empty()) idsCsv.push_back(',');
+            idsCsv += std::to_string(promptIds[i]);
+        }
+        MM_LOG_INFO("parity",
+                    "MIMIRMIND_PARITY_DUMP={} — prefill token count={}, "
+                    "first {}: [{}]",
+                    dumpPrefix, promptIds.size(), nShow, idsCsv);
     }
 
     std::vector<std::int32_t> generated;
@@ -485,6 +497,34 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             d_model, vocab_emb,
             prefillIds, xBuf);
         scaleEmbeddingIfNeeded(xBuf, prefillCount);
+
+        // Parity-dump the post-embed-scale hidden state so we can diff
+        // it against llama.cpp's `inp_scaled` tensor. Written as
+        // `<prefix>-blk0-input_scaled.bin` for parity-diff to pick up.
+        // No-op unless MIMIRMIND_PARITY_DUMP is set.
+        if (const char* dumpPrefix = std::getenv("MIMIRMIND_PARITY_DUMP")) {
+            // scaleEmbeddingIfNeeded submitted `mulScalarAsync` — it's
+            // still queued on the GPU. Flush before the CPU reads xBuf,
+            // otherwise the dump captures the un-scaled embedding and
+            // parity-diff reports a spurious factor-of-sqrt(n_embd)
+            // divergence (RMSNorm inside block 0 cancels it so the
+            // rest of the pipeline still runs on the scaled value).
+            _ops.queue().flush();
+            const std::string fname =
+                std::string{dumpPrefix} + "-blk0-inp_scaled.bin";
+            std::ofstream f(fname, std::ios::binary);
+            if (f) {
+                const std::uint32_t hdr[3] = {
+                    0U,
+                    static_cast<std::uint32_t>(prefillCount),
+                    static_cast<std::uint32_t>(d_model),
+                };
+                f.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+                f.write(reinterpret_cast<const char*>(xBuf),
+                        static_cast<std::streamsize>(prefillCount * d_model *
+                                                     sizeof(float)));
+            }
+        }
 
         // Per-forward architecture hook. Non-E-series backends no-op;
         // Gemma4E4BBackend dequantizes its PLE slices AND runs the

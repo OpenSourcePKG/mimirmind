@@ -27,6 +27,7 @@ import numpy as np
 
 
 STAGE_ORDER = [
+    "inp_scaled",
     "attn_norm",
     "Qcur_pos",
     "Kcur_pos",
