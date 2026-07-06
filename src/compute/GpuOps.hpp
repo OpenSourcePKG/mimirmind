@@ -86,6 +86,20 @@ public:
                          std::size_t  headDim,
                          float        eps);
 
+    /// Fused residual-add + RMSNorm. `x[m, k] += delta[m, k]` in place,
+    /// then `y[m, k] = x[m, k] * weight[k] / sqrt(mean(x[m, :]^2) + eps)`.
+    /// `y` may alias `x`. Every backend hits this pattern at the end of
+    /// the attention section (`x += attn_out; ffn_norm(x) → normBuf`),
+    /// so the fusion is architecture-agnostic. Saves one dispatch per
+    /// transformer block. K must be representable as int32.
+    void addRmsNormAsync(float*       x,
+                         const float* delta,
+                         std::size_t  M,
+                         std::size_t  K,
+                         const float* weight,
+                         float        eps,
+                         float*       y);
+
     /// In-place broadcast bias: y[m, k] += bias[k].
     void addBiasAsync(float*       y,
                       std::size_t  M,
@@ -266,6 +280,9 @@ private:
 
     runtime::GpuModule     _rmsnormQkvModule;
     runtime::GpuKernel     _rmsnormQkvKernel;
+
+    runtime::GpuModule     _addRmsNormModule;
+    runtime::GpuKernel     _addRmsNormKernel;
 
     runtime::GpuModule     _ropeFfModule;
     runtime::GpuKernel     _ropeFfKernel;

@@ -207,14 +207,11 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                 attnOutBuf, T,
                 projOutBuf, matmulScratch);
 
-    trace("attn residual (async)");
-    _ops.addResidualAsync(x, projOutBuf, T * d_model);
-
-    trace("ffn rmsNorm (async)");
-    _ops.rmsNormAsync(x, T, d_model,
-                      static_cast<const float*>(ffnNorm->usmPtr),
-                      _config.rmsNormEps,
-                      normBuf);
+    trace("attn residual + ffn rmsNorm (fused)");
+    _ops.addRmsNormAsync(x, projOutBuf, T, d_model,
+                         static_cast<const float*>(ffnNorm->usmPtr),
+                         _config.rmsNormEps,
+                         normBuf);
 
     // M5f.4: FFN gate and up are independent — both read normBuf, write
     // to different output buffers. silu_mul (the next op) reads BOTH so

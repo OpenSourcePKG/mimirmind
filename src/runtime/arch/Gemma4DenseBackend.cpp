@@ -63,13 +63,16 @@ void Gemma4DenseBackend::runBlock(std::size_t   blockIdx,
     float* const matmulScratch = s.matmulScratch.as<float>();
 
     // --- FFN — dense SwiGLU with GELU ---------------------------------
+    // Fused attn-residual + ffn_norm: runAttentionSection left
+    // `projOutBuf = attn_post_norm(attn_out)` for us to fold in here.
 
     _op.mark(runtime::OpProfiler::Cat::NORM);
-    trace("ffn_norm (dense pre)");
-    _ops.rmsNormAsync(x, T, d_model,
-                      static_cast<const float*>(ffnNorm->usmPtr),
-                      _config.rmsNormEps,
-                      normBuf);
+    trace("attn residual + ffn_norm (fused)");
+    _ops.addRmsNormAsync(x, projOutBuf, T, d_model,
+                         static_cast<const float*>(ffnNorm->usmPtr),
+                         _config.rmsNormEps,
+                         normBuf);
+    dumpStage("attn_out", blockIdx, x, T, d_model);
 
     // gate + up read normBuf, write disjoint outputs → can pipeline.
     _op.mark(runtime::OpProfiler::Cat::MATMUL);

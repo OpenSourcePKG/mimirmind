@@ -411,11 +411,12 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
                       projOutBuf);            // in-place
     dumpStage("attn_post_norm", blockIdx, projOutBuf, T, d_model);
 
-    _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
-    trace("attn residual");
-    _ops.addResidualAsync(x, projOutBuf, T * d_model);
-    // x now holds sa_out = inpL + attn_post_norm(attn_out).
-    dumpStage("attn_out", blockIdx, x, T, d_model);
+    // Fusion boundary: the residual add + ffn_norm rmsnorm that always
+    // follow this attention section are fused by the caller via
+    // `_ops.addRmsNormAsync(x, projOutBuf, ..., ffnNorm, normBuf)`.
+    // We leave `projOutBuf = attn_post_norm(attn_out)` for that call.
+    // The parity dump for `attn_out` runs there once x has been
+    // updated in-place with the residual.
 }
 
 } // namespace mimirmind::runtime::arch

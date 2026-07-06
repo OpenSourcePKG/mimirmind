@@ -62,6 +62,8 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
       _rmsnormNoWeightKernel{_rmsnormNoWeightModule.kernel("rmsnorm_no_weight")},
       _rmsnormQkvModule{ctx, "rmsnorm_qkv"},
       _rmsnormQkvKernel{_rmsnormQkvModule.kernel("rmsnorm_qkv")},
+      _addRmsNormModule{ctx, "add_rmsnorm"},
+      _addRmsNormKernel{_addRmsNormModule.kernel("add_rmsnorm")},
       _ropeFfModule    {ctx, "rope_inplace_ff"},
       _ropeFfKernel    {_ropeFfModule.kernel("rope_inplace_ff")},
       _attentionModule {ctx, "attention"},
@@ -90,7 +92,7 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
 
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
-                "rmsnorm_qkv/"
+                "rmsnorm_qkv/add_rmsnorm/"
                 "add_bias/add_residual/silu_mul/rope/rope_ff/mul_scalar/"
                 "gelu_mul/attention/attention_flash/scaled_add_residual/"
                 "qkv_split/x_quant_i8 loaded (rms local={}, "
@@ -201,6 +203,28 @@ void GpuOps::rmsNormQkvAsync(float*       qBuf,   const float* qWeight,
     const std::uint32_t totalRows =
         static_cast<std::uint32_t>(qRows + 2 * kvRows);
     _queue.appendLaunch(_rmsnormQkvKernel, totalRows, 1, 1);
+}
+
+void GpuOps::addRmsNormAsync(float*       x,
+                             const float* delta,
+                             std::size_t  M,
+                             std::size_t  K,
+                             const float* weight,
+                             float        eps,
+                             float*       y) {
+    if (M == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t Ki = toInt32(K, "addRmsNorm K");
+    _addRmsNormKernel.setPtr(0, x);
+    _addRmsNormKernel.setPtr(1, delta);
+    _addRmsNormKernel.setPtr(2, weight);
+    _addRmsNormKernel.setPtr(3, y);
+    _addRmsNormKernel.setValue<float>(4, eps);
+    _addRmsNormKernel.setValue<std::int32_t>(5, Ki);
+    _addRmsNormKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
+    _queue.appendLaunch(_addRmsNormKernel,
+                        static_cast<std::uint32_t>(M), 1, 1);
 }
 
 void GpuOps::addBiasAsync(float*       y,

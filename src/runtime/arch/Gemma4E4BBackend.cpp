@@ -449,12 +449,19 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
     float* const matmulScratch = s.matmulScratch.as<float>();
 
     // --- Dense SwiGLU-GELU FFN ----------------------------------------
+    //
+    // runAttentionSection intentionally does NOT do the attn residual —
+    // we do it fused with ffn_norm in a single kernel here. `projOutBuf`
+    // holds `attn_post_norm(attn_out)` on entry, and after this call:
+    //   x += projOutBuf
+    //   normBuf = rmsnorm(x, ffnNorm)
 
     _op.mark(runtime::OpProfiler::Cat::NORM);
-    _ops.rmsNormAsync(x, T, d_model,
-                      static_cast<const float*>(ffnNorm->usmPtr),
-                      _config.rmsNormEps,
-                      normBuf);
+    _ops.addRmsNormAsync(x, projOutBuf, T, d_model,
+                         static_cast<const float*>(ffnNorm->usmPtr),
+                         _config.rmsNormEps,
+                         normBuf);
+    dumpStage("attn_out", blockIdx, x, T, d_model);
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     {
