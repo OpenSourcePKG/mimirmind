@@ -10,6 +10,12 @@
 // be any valid pointer when hasV == 0 — the kernel never dereferences
 // it because Nfused is set to Nq + Nkv in that case.
 
+// M-CLR.2 Wave 3: `Yk` and `Yv` are the layer's K/V cache BASE, not
+// the per-token write slot. The row offset picks up the current
+// `curLen` from the shared USM slot so a recorded command list stays
+// valid as the cache grows between replays. `Nkv` doubles as the row
+// stride inside the cache (== kvDim) so no extra scalar is needed.
+// `Yq` still points at a stable workspace buffer.
 __kernel void qkv_split(
     __global const float* fused,
     __global       float* Yq,
@@ -19,7 +25,8 @@ __kernel void qkv_split(
     const int             Nq,
     const int             Nkv,
     const int             hasV,
-    const int             Nfused)
+    const int             Nfused,
+    __global const int*   curLenPtr)
 {
     const int idx = (int)get_global_id(0);
     const int total = M * Nfused;
@@ -27,14 +34,15 @@ __kernel void qkv_split(
 
     const int m = idx / Nfused;
     const int n = idx - m * Nfused;
+    const int curLen = curLenPtr[0];
 
     const float v = fused[idx];
 
     if (n < Nq) {
         Yq[m * Nq + n] = v;
     } else if (n < Nq + Nkv) {
-        Yk[m * Nkv + (n - Nq)] = v;
+        Yk[(curLen + m) * Nkv + (n - Nq)] = v;
     } else if (hasV != 0) {
-        Yv[m * Nkv + (n - Nq - Nkv)] = v;
+        Yv[(curLen + m) * Nkv + (n - Nq - Nkv)] = v;
     }
 }

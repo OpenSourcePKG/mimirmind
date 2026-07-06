@@ -19,20 +19,26 @@
 #define RMSNORM_QKV_LOCAL_SIZE 128
 #endif
 
+// M-CLR.2 Wave 3: `k_x`/`k_y` and `v_x`/`v_y` now point at the layer's
+// K/V cache BASE, and the kernel adds `curLen * kvDim` to reach the
+// current write slot. Q buffers stay stable (workspace). Same USM slot
+// as rope/attention — one int, host-writable.
 __attribute__((reqd_work_group_size(RMSNORM_QKV_LOCAL_SIZE, 1, 1)))
 __kernel void rmsnorm_qkv(
     __global const float* q_x,      // [T*nHeads,   head_dim]
     __global const float* q_w,      // [head_dim]
     __global       float* q_y,      // in-place OK (== q_x)
-    __global const float* k_x,      // [T*nKvHeads, head_dim]
+    __global const float* k_x,      // K cache base for this layer
     __global const float* k_w,      // [head_dim]
-    __global       float* k_y,      // in-place OK
-    __global const float* v_x,      // [T*nKvHeads, head_dim]
-    __global       float* v_y,      // in-place OK
+    __global       float* k_y,      // K cache base for this layer
+    __global const float* v_x,      // V cache base for this layer
+    __global       float* v_y,      // V cache base for this layer
     const int             qRows,    // T * nHeads
     const int             kRows,    // T * nKvHeads   (K and V share this)
     const int             K,        // head_dim
-    const float           eps)
+    const float           eps,
+    __global const int*   curLenPtr,
+    const int             kvDim)    // nKvHeads * head_dim  (row stride in cache)
 {
     __local float scratch[RMSNORM_QKV_LOCAL_SIZE];
 
@@ -42,10 +48,12 @@ __kernel void rmsnorm_qkv(
 
     // Route this workgroup to Q / K / V and pick its row within that
     // stream. The three branches diverge across workgroups, not threads,
-    // so there's no lane divergence.
+    // so there's no lane divergence. K/V paths add `curLen * kvDim` to
+    // land on the current write slot inside the layer's cache.
     __global const float* xr;
     __global const float* wr;
     __global       float* yr;
+    const size_t kvBase = (size_t)curLenPtr[0] * (size_t)kvDim;
     if (gid < qRows) {
         const int row = gid;
         xr = q_x + (size_t)row * (size_t)K;
@@ -53,14 +61,14 @@ __kernel void rmsnorm_qkv(
         yr = q_y + (size_t)row * (size_t)K;
     } else if (gid < qRows + kRows) {
         const int row = gid - qRows;
-        xr = k_x + (size_t)row * (size_t)K;
+        xr = k_x + kvBase + (size_t)row * (size_t)K;
         wr = k_w;
-        yr = k_y + (size_t)row * (size_t)K;
+        yr = k_y + kvBase + (size_t)row * (size_t)K;
     } else {
         const int row = gid - qRows - kRows;
-        xr = v_x + (size_t)row * (size_t)K;
+        xr = v_x + kvBase + (size_t)row * (size_t)K;
         wr = (__global const float*)0;   // V: no learned weight
-        yr = v_y + (size_t)row * (size_t)K;
+        yr = v_y + kvBase + (size_t)row * (size_t)K;
     }
 
     // Per-thread partial sum of squares.

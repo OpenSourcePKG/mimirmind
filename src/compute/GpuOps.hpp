@@ -78,13 +78,21 @@ public:
     /// safe (dst == src OK). Row counts differ per buffer: qRows =
     /// `T * nHeads`, kRows = vRows = `T * nKvHeads`. Saves 2 dispatch
     /// launches per own-KV attention block (Gemma family).
+    /// M-CLR.2: `kBase` / `vBase` point at the layer's K/V cache BASE
+    /// pointer (not the per-token write slot). The kernel adds
+    /// `writeOffset * kvDim` to reach the current write row. This keeps
+    /// the pointer arguments stable across replays; `writeOffset` and
+    /// `kvDim` fold into the shared USM `curLen` slot + a per-layer
+    /// scalar. `writeOffset` = `cache.length()` at the caller.
     void rmsNormQkvAsync(float*       qBuf,   const float* qWeight,
-                         float*       kBuf,   const float* kWeight,
-                         float*       vBuf,
+                         float*       kBase,  const float* kWeight,
+                         float*       vBase,
                          std::size_t  qRows,
                          std::size_t  kvRows,
                          std::size_t  headDim,
-                         float        eps);
+                         float        eps,
+                         std::size_t  writeOffset,
+                         std::size_t  kvDim);
 
     /// Fused residual-add + RMSNorm. `x[m, k] += delta[m, k]` in place,
     /// then `y[m, k] = x[m, k] * weight[k] / sqrt(mean(x[m, :]^2) + eps)`.
@@ -174,16 +182,20 @@ public:
 
     /// Scatter the output of a fused QKV matmul into the separate Q, K,
     /// V destinations. `fused` has shape [M, Nq + Nkv * (1 + hasV)];
-    /// `Yq` [M, Nq]; `Yk` [M, Nkv]; `Yv` [M, Nkv] — the latter may be
-    /// any valid pointer if `hasV == false` (never dereferenced).
+    /// `Yq` [M, Nq]; `YkBase` / `YvBase` point at the layer's K/V cache
+    /// base — the kernel adds `writeOffset * Nkv` to reach the current
+    /// write row. `Yv` may be any valid pointer when `hasV == false`.
+    /// `writeOffset` = current KV cache length (0 for the qkvSplit
+    /// self-test path).
     void qkvSplitAsync(const float* fused,
                        float*       Yq,
-                       float*       Yk,
-                       float*       Yv,
+                       float*       YkBase,
+                       float*       YvBase,
                        std::size_t  M,
                        std::size_t  Nq,
                        std::size_t  Nkv,
-                       bool         hasV);
+                       bool         hasV,
+                       std::size_t  writeOffset = 0);
 
     /// Load-time self-test — run every GPU op with a known input and
     /// compare against a CPU reference within a tight tolerance. Catches

@@ -133,6 +133,11 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
 
     float* kSlot = cache.writeSlotK(blockIdx);
     float* vSlot = cache.writeSlotV(blockIdx);
+    // M-CLR.2 Wave 3: qkv_split receives the cache BASE + curLen so its
+    // pointer arg is stable across replays. Other kernels here still use
+    // the per-token slot; refactoring rope-K is Wave 3b per the ADR.
+    float* kBase = const_cast<float*>(cache.baseK(blockIdx));
+    float* vBase = const_cast<float*>(cache.baseV(blockIdx));
 
     // M5i.B: Fused Q+K+V — single matmul into a staging buffer, then a
     // scatter kernel routes the sub-ranges into qBuf/kSlot/vSlot. Bias
@@ -147,8 +152,8 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
             fBlk->Nq + fBlk->Nkv * (fBlk->hasV ? 2 : 1);
         _gmm.matmulAsync(fBlk->type, fBlk->usmPtr, Nfused, d_model,
                          normBuf, T, qkvFused, matmulScratch);
-        _ops.qkvSplitAsync(qkvFused, qBuf, kSlot, vSlot,
-                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV);
+        _ops.qkvSplitAsync(qkvFused, qBuf, kBase, vBase,
+                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV, curLen);
     } else {
         // M5f.4: Q/K/V projections write disjoint buffers and depend only
         // on normBuf (already published by the rmsnorm above). They can

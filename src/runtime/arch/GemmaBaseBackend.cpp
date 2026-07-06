@@ -253,8 +253,22 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // K/V slots. Own-KV layers write to their own cache. Shared-KV
     // layers leave the writeSlot NULL — attention will read from the
     // source layer's `baseK` / `baseV`.
+    //
+    // M-CLR.2 Wave 3: qkv_split and rmsnorm_qkv now consume the layer's
+    // cache BASE pointer and add `curLen * kvDim` internally so the arg
+    // stays stable across replays. The other consumers (raw matmul K/V,
+    // alt-attn memcpy, rope-K, dumpStage) still use the per-token slot;
+    // rope-K's pointer indirection is Wave 3b, tracked in the ADR. The
+    // const_cast is safe: KvCache backing storage is mutable USM, the
+    // const on baseK/V is an API guardrail against read-path callers.
     float* const kSlot = li.ownsKv ? cache.writeSlotK(blockIdx) : nullptr;
     float* const vSlot = li.ownsKv ? cache.writeSlotV(blockIdx) : nullptr;
+    float* const kBase = li.ownsKv
+        ? const_cast<float*>(cache.baseK(blockIdx))
+        : nullptr;
+    float* const vBase = li.ownsKv
+        ? const_cast<float*>(cache.baseV(blockIdx))
+        : nullptr;
 
     // --- pre-attention RMSNorm ----------------------------------------
 
@@ -291,8 +305,8 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
             fBlk->Nq + fBlk->Nkv * (fBlk->hasV ? 2 : 1);
         _gmm.matmulAsync(fBlk->type, fBlk->usmPtr, Nfused, d_model,
                          normBuf, T, qkvFused, matmulScratch);
-        _ops.qkvSplitAsync(qkvFused, qBuf, kSlot, vSlot,
-                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV);
+        _ops.qkvSplitAsync(qkvFused, qBuf, kBase, vBase,
+                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV, curLen);
     } else if (li.ownsKv) {
         // M5f.4: Q/K/V projections write disjoint buffers. The pop inserts
         // a single barrier so the norms below see all three matmul outputs.
@@ -333,10 +347,11 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         trace("Q+K+V norms (rmsNorm fused)");
         _ops.rmsNormQkvAsync(
             qBuf,  static_cast<const float*>(qNorm->usmPtr),
-            kSlot, static_cast<const float*>(kNorm->usmPtr),
-            vSlot,
+            kBase, static_cast<const float*>(kNorm->usmPtr),
+            vBase,
             T * li.nHeads, T * li.nKvHeads, head_dim,
-            _config.rmsNormEps);
+            _config.rmsNormEps,
+            curLen, kv_dim);
     } else {
         trace("Q-norm only (shared-KV layer)");
         _ops.rmsNormAsync(qBuf, T * li.nHeads, head_dim,

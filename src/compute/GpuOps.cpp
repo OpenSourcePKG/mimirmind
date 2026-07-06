@@ -179,31 +179,40 @@ void GpuOps::rmsNormNoWeightAsync(const float* x,
 }
 
 void GpuOps::rmsNormQkvAsync(float*       qBuf,   const float* qWeight,
-                             float*       kBuf,   const float* kWeight,
-                             float*       vBuf,
+                             float*       kBase,  const float* kWeight,
+                             float*       vBase,
                              std::size_t  qRows,
                              std::size_t  kvRows,
                              std::size_t  headDim,
-                             float        eps) {
+                             float        eps,
+                             std::size_t  writeOffset,
+                             std::size_t  kvDim) {
     if ((qRows == 0 && kvRows == 0) || headDim == 0) {
         return;
     }
     const std::int32_t Ki      = toInt32(headDim, "rmsNormQkv headDim");
     const std::int32_t qRowsI  = toInt32(qRows,  "rmsNormQkv qRows");
     const std::int32_t kvRowsI = toInt32(kvRows, "rmsNormQkv kvRows");
+    const std::int32_t kvDimI  = toInt32(kvDim,  "rmsNormQkv kvDim");
 
+    // M-CLR.2: writeOffset (= current KV-cache length) via shared USM
+    // slot. Kernel adds `curLen * kvDim` to K/V rows so the kBase/vBase
+    // pointers stay stable across replays.
+    *_curLenSlotUsm = toInt32(writeOffset, "rmsNormQkv writeOffset");
     _rmsnormQkvKernel.setPtr(0, qBuf);
     _rmsnormQkvKernel.setPtr(1, qWeight);
     _rmsnormQkvKernel.setPtr(2, qBuf);           // in-place
-    _rmsnormQkvKernel.setPtr(3, kBuf);
+    _rmsnormQkvKernel.setPtr(3, kBase);
     _rmsnormQkvKernel.setPtr(4, kWeight);
-    _rmsnormQkvKernel.setPtr(5, kBuf);           // in-place
-    _rmsnormQkvKernel.setPtr(6, vBuf);
-    _rmsnormQkvKernel.setPtr(7, vBuf);           // in-place
+    _rmsnormQkvKernel.setPtr(5, kBase);          // in-place (same base)
+    _rmsnormQkvKernel.setPtr(6, vBase);
+    _rmsnormQkvKernel.setPtr(7, vBase);          // in-place (same base)
     _rmsnormQkvKernel.setValue<std::int32_t>(8,  qRowsI);
     _rmsnormQkvKernel.setValue<std::int32_t>(9,  kvRowsI);
     _rmsnormQkvKernel.setValue<std::int32_t>(10, Ki);
     _rmsnormQkvKernel.setValue<float>(11, eps);
+    _rmsnormQkvKernel.setPtr(12, _curLenSlotUsm);
+    _rmsnormQkvKernel.setValue<std::int32_t>(13, kvDimI);
     _rmsnormQkvKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
 
     // Total workgroups = qRows + 2 * kvRows. Q rows first, then K, then V.
@@ -575,12 +584,13 @@ void GpuOps::selfTest(runtime::UsmAllocator& allocator) {
 
 void GpuOps::qkvSplitAsync(const float* fused,
                            float*       Yq,
-                           float*       Yk,
-                           float*       Yv,
+                           float*       YkBase,
+                           float*       YvBase,
                            std::size_t  M,
                            std::size_t  Nq,
                            std::size_t  Nkv,
-                           bool         hasV) {
+                           bool         hasV,
+                           std::size_t  writeOffset) {
     if (M == 0 || Nq == 0 || Nkv == 0) {
         return;
     }
@@ -590,17 +600,21 @@ void GpuOps::qkvSplitAsync(const float* fused,
     // Yv may legitimately be nullptr when hasV is false — the kernel
     // guards against dereferencing it, but Level Zero still expects a
     // valid pointer for the argument. Route to `fused` as a safe stub.
-    const float* YvPtr = hasV ? Yv : fused;
+    const float* YvPtr = hasV ? YvBase : fused;
 
+    // M-CLR.2: curLen via shared USM slot. Kernel adds
+    // `curLen * Nkv` to reach the row inside the K/V cache.
+    *_curLenSlotUsm = toInt32(writeOffset, "qkvSplit writeOffset");
     _qkvSplitKernel.setPtr(0, fused);
     _qkvSplitKernel.setPtr(1, Yq);
-    _qkvSplitKernel.setPtr(2, Yk);
+    _qkvSplitKernel.setPtr(2, YkBase);
     _qkvSplitKernel.setPtr(3, YvPtr);
     _qkvSplitKernel.setValue<std::int32_t>(4, toInt32(M,      "qkvSplit M"));
     _qkvSplitKernel.setValue<std::int32_t>(5, toInt32(Nq,     "qkvSplit Nq"));
     _qkvSplitKernel.setValue<std::int32_t>(6, toInt32(Nkv,    "qkvSplit Nkv"));
     _qkvSplitKernel.setValue<std::int32_t>(7, hasV ? 1 : 0);
     _qkvSplitKernel.setValue<std::int32_t>(8, toInt32(Nfused, "qkvSplit Nfused"));
+    _qkvSplitKernel.setPtr(9, _curLenSlotUsm);
     _qkvSplitKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
     _queue.appendLaunch(_qkvSplitKernel,
                         groupsForN(total, kElementwiseLocalSize), 1, 1);
