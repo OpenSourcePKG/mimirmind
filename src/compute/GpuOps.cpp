@@ -782,10 +782,18 @@ void GpuOps::attentionDecodeFlashAsync(const float* q,
     _attentionFlashPartialKernel.setPtr(7, _curLenSlotUsm);
     _attentionFlashPartialKernel.setValue<float>(8, scale);
     _attentionFlashPartialKernel.setGroupSize(kAttentionLocalSize, 1, 1);
+    // M-CLR.4: always launch with kFlashMaxKTiles workgroups on the y
+    // dim so a recorded command list stays valid as curLen grows
+    // between replays. The kernel's early-exit at `kStart >= kMax`
+    // covers unused tiles with -INFINITY / 0 sentinels the merge
+    // kernel then treats as no-contribution. Overhead: ~64 empty
+    // work-groups per head per layer at low curLen; negligible next to
+    // the ~10 ms/tok replay gain we're going for.
     _queue.appendLaunch(_attentionFlashPartialKernel,
                         static_cast<std::uint32_t>(nHeads),
-                        static_cast<std::uint32_t>(nKTiles),
+                        static_cast<std::uint32_t>(kFlashMaxKTiles),
                         1);
+    (void)nKTiles;  // kept for the ADR record; kernel derives it from curLenPtr
 
     // Pass 2 — merge the per-tile partials into the final output. The
     // auto-barrier between launches makes partials visible to the merge.

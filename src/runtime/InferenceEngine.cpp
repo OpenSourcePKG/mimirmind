@@ -646,6 +646,26 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
 
         const auto decT0 = clock::now();
 
+        // M-CLR.4: opt-in Command-List-Replay for the decode block loop.
+        // Step 1 stays immediate (warms the KV cache with the first
+        // sampled token). Step 2 records the block loop into a
+        // persistent command list and executes it via replay. Steps 3+
+        // update the shared USM curLen slot and re-execute the same
+        // recorded list — no per-token appendLaunch, no per-token
+        // barrier setup, no per-kernel arg binding.
+        const bool clrEnabled = [] {
+            const char* v = std::getenv("MIMIRMIND_ENABLE_CLR");
+            if (v == nullptr || v[0] == '\0') return false;
+            const std::string_view s{v};
+            return !(s == "0" || s == "false" || s == "off");
+        }();
+        if (clrEnabled) {
+            MM_LOG_INFO("engine",
+                        "MIMIRMIND_ENABLE_CLR=on — decode uses record/replay "
+                        "from step 2 on");
+            _ops.queue().resetRecording();
+        }
+
         // Inter-token thermal pacing — consult guard every kPaceWindow
         // tokens so /sys reads don't dominate the inner loop. Window of
         // 4 keeps overhead under a millisecond per token at ~145 ms/tok
@@ -694,8 +714,31 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             _backend->prepareForward(
                 std::span<const std::int32_t>{oneId}, xBuf, 1);
 
-            for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
-                _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+            // M-CLR.4: three modes for the block loop:
+            //   step == 1                 → immediate (warm)
+            //   step == 2 && clrEnabled   → record + replay-once
+            //   step >  2 && recording    → update curLen slot + replay
+            if (clrEnabled && _ops.queue().hasRecording()) {
+                // Replay-only path. Update the shared USM slot so every
+                // recorded rope / attention / qkv_split / rmsnorm_qkv
+                // kernel sees the current KV-cache length.
+                *_ops.curLenSlot() =
+                    static_cast<std::int32_t>(cache.length());
+                _ops.queue().replay();
+            } else if (clrEnabled && step == 1) {
+                // Step 1 records into the persistent list AND executes it
+                // via a first replay(). Subsequent steps reuse the
+                // recording without re-dispatching.
+                _ops.queue().beginRecord();
+                for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
+                    _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+                }
+                _ops.queue().endRecord();
+                _ops.queue().replay();
+            } else {
+                for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
+                    _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+                }
             }
             cache.commit(1);
 
