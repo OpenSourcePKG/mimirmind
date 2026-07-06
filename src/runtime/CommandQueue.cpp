@@ -71,6 +71,7 @@ void CommandQueue::appendLaunch(GpuKernel&    kernel,
     ZE_CHECK(zeCommandListAppendLaunchKernel(
         _cmdList, kernel.handle(), &groups,
         nullptr, 0, nullptr));
+    ++_dispatchCount;
 
     // Level Zero does NOT insert an implicit memory barrier between
     // consecutive kernel launches — execution order is preserved but

@@ -72,6 +72,8 @@ private:
     std::array<double,      kNumCats>        _ms{};
     std::array<std::size_t, kNumCats>        _n{};
     std::size_t                              _tokensSinceDump{0};
+    // Baseline for `disp/tok` in the summary line. See maybeDumpAndReset().
+    std::size_t                              _dispatchBaseline{0};
 };
 
 } // namespace mimirmind::runtime

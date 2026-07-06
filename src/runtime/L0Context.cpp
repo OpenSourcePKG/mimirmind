@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdio>
 #include <sstream>
+#include <string_view>
 
 namespace mimirmind::runtime {
 
@@ -105,6 +106,7 @@ L0Context::L0Context() {
     MM_LOG_DEBUG("l0", "zeInit OK");
 
     _enumerate();
+    _probeDriverExtensions();
     _createContext();
 
     MM_LOG_INFO("l0",
@@ -199,6 +201,48 @@ void L0Context::_enumerate() {
             "  - /dev/dri/renderD128 exists and is readable by current user\n"
             "  - current user is in the 'render' group"};
     }
+}
+
+void L0Context::_probeDriverExtensions() {
+    // Preflight for the Command-List-Replay milestone (M-CLR): the primary
+    // path relies on `ZE_experimental_mutable_command_list` to update kernel
+    // arguments in a closed command list without rebuild. Log presence at
+    // boot so an operator can gate features on it; a missing extension is
+    // not an error — the milestone falls back to a Scalar-in-USM refactor.
+    if (_driver == nullptr) {
+        return;
+    }
+    std::uint32_t count = 0;
+    const ze_result_t rCount =
+        zeDriverGetExtensionProperties(_driver, &count, nullptr);
+    if (rCount != ZE_RESULT_SUCCESS || count == 0) {
+        MM_LOG_WARN("l0",
+                    "zeDriverGetExtensionProperties count returned {} n={} — "
+                    "optional-extension detection unavailable",
+                    resultToString(rCount), count);
+        return;
+    }
+    std::vector<ze_driver_extension_properties_t> exts(count);
+    const ze_result_t rList =
+        zeDriverGetExtensionProperties(_driver, &count, exts.data());
+    if (rList != ZE_RESULT_SUCCESS) {
+        MM_LOG_WARN("l0",
+                    "zeDriverGetExtensionProperties list returned {} — "
+                    "optional-extension detection unavailable",
+                    resultToString(rList));
+        return;
+    }
+    for (const auto& e : exts) {
+        // e.name is a null-terminated ZE_MAX_EXTENSION_NAME char array.
+        if (std::string_view{e.name} == "ZE_experimental_mutable_command_list") {
+            _hasMutableCmdLists = true;
+            break;
+        }
+    }
+    MM_LOG_INFO("l0",
+                "driver extensions probed — n={} mutable_command_list={}",
+                count,
+                _hasMutableCmdLists ? "yes" : "no");
 }
 
 void L0Context::_createContext() {

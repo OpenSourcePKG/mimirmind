@@ -27,7 +27,8 @@ constexpr const char* kCatNames[] = {
 
 OpProfiler::OpProfiler(CommandQueue& queue)
     : _enabled{envSet("MIMIRMIND_TRACE_OP_TIMES")},
-      _queue{queue}
+      _queue{queue},
+      _dispatchBaseline{queue.dispatchCount()}
 {
     if (_enabled) {
         MM_LOG_INFO("opprof",
@@ -73,9 +74,20 @@ void OpProfiler::maybeDumpAndReset(std::size_t tokenIdx) {
     double tot = 0.0;
     for (double m : _ms) tot += m;
     if (tot <= 0.0) {
-        _tokensSinceDump = 0;
+        _tokensSinceDump  = 0;
+        _dispatchBaseline = _queue.dispatchCount();
         return;
     }
+
+    // Dispatch-per-token estimate — feeds the Command-List-Replay preflight
+    // gate (M-CLR.0). Combined with the empirical Xe-LPG per-launch cost
+    // (~12 µs, see the xelpg-dispatch-overhead lesson), disp/tok × 12 µs
+    // is the current per-token overhead budget.
+    const std::size_t dispNow = _queue.dispatchCount();
+    const std::size_t dispDelta =
+        (dispNow >= _dispatchBaseline) ? (dispNow - _dispatchBaseline) : 0;
+    const double dispPerTok =
+        static_cast<double>(dispDelta) / static_cast<double>(_tokensSinceDump);
 
     std::string summary;
     for (std::size_t i = 0; i < kNumCats; ++i) {
@@ -89,13 +101,15 @@ void OpProfiler::maybeDumpAndReset(std::size_t tokenIdx) {
     }
     MM_LOG_INFO("opprof",
                 "over last {} tokens [ending at tok={}]: {}"
-                "total={:.1f}ms/tok",
+                "disp/tok={:.0f} total={:.1f}ms/tok",
                 _tokensSinceDump, tokenIdx, summary,
+                dispPerTok,
                 tot / static_cast<double>(_tokensSinceDump));
 
     _ms.fill(0.0);
     _n.fill(0);
-    _tokensSinceDump = 0;
+    _tokensSinceDump  = 0;
+    _dispatchBaseline = dispNow;
 }
 
 } // namespace mimirmind::runtime

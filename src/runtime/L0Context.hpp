@@ -56,12 +56,19 @@ public:
     [[nodiscard]] const DeviceInfo&         info()      const noexcept { return _info; }
     [[nodiscard]] const std::vector<DeviceInfo>& allDevices() const noexcept { return _allDevices; }
 
+    /// True when the driver advertises `ZE_experimental_mutable_command_list`.
+    /// Preflight signal for the Command-List-Replay milestone (M-CLR).
+    [[nodiscard]] bool hasMutableCommandLists() const noexcept {
+        return _hasMutableCmdLists;
+    }
+
     [[nodiscard]] static std::string typeToString(ze_device_type_t t);
     [[nodiscard]] static std::string resultToString(ze_result_t r);
 
 private:
     void _enumerate();
     void _createContext();
+    void _probeDriverExtensions();
 
     ze_driver_handle_t  _driver{nullptr};
     ze_device_handle_t  _device{nullptr};
@@ -69,6 +76,8 @@ private:
 
     DeviceInfo              _info{};
     std::vector<DeviceInfo> _allDevices{};
+
+    bool _hasMutableCmdLists{false};
 };
 
 } // namespace mimirmind::runtime

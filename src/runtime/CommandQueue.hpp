@@ -2,6 +2,7 @@
 
 #include <level_zero/ze_api.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace mimirmind::runtime {
@@ -85,6 +86,13 @@ public:
     /// Test helper / sanity probe.
     [[nodiscard]] std::uint32_t unorderedDepth() const noexcept { return _unorderedDepth; }
 
+    /// Monotonic count of `appendLaunch` calls since construction (or the
+    /// last `resetDispatchCount`). Preflight signal for the Command-List-
+    /// Replay milestone (M-CLR): dispatches × ~12 µs Xe-LPG launch overhead
+    /// approximates the per-token overhead budget.
+    [[nodiscard]] std::size_t dispatchCount() const noexcept { return _dispatchCount; }
+    void resetDispatchCount() noexcept { _dispatchCount = 0; }
+
 private:
     L0Context&                _ctx;
     ze_command_queue_handle_t _queue         {nullptr};
@@ -92,6 +100,7 @@ private:
     std::uint32_t             _ordinal       {0};
     std::uint32_t             _unorderedDepth{0};
     bool                      _hasPending    {false};
+    std::size_t               _dispatchCount {0};
 };
 
 /// RAII helper around pushUnordered() / popUnordered(). Construct a
