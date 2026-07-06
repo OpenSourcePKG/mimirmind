@@ -103,6 +103,7 @@ set(KERNEL_SOURCES
     kernels/scaled_add_residual.cl
     kernels/x_quant_i8.cl
     kernels/matmul_q8_0_vec_dp4a.cl
+    kernels/matmul_q4k_vec_dp4a.cl
     kernels/matmul_q8_0_gemm_v2.cl
     kernels/matmul_q6k_gemm_v2.cl
     kernels/matmul_q4k_gemm_v2.cl

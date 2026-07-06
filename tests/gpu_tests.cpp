@@ -1548,10 +1548,11 @@ void runQ8_0Dp4aParity(const char*   label,
     // Quantise X → Xq + Xscale on the GPU, then dispatch DP4A matvec.
     fx().ops.xQuantI8Async(bufX.as<float>(), bufXq.as<std::int8_t>(),
                            bufXs.as<float>(), M, K);
-    fx().gmm.matmulQ8_0Dp4aAsync(bufXq.as<std::int8_t>(),
-                                 bufXs.as<float>(),
-                                 bufW.raw(), N, K, M,
-                                 bufYdp4a.as<float>());
+    fx().gmm.matmulDp4aAsync(mimirmind::model::GgmlType::Q8_0,
+                             bufXq.as<std::int8_t>(),
+                             bufXs.as<float>(),
+                             bufW.raw(), N, K, M,
+                             bufYdp4a.as<float>());
     fx().gmm.sync();
 
     // Tolerance model. The DP4A output differs from the float-X output
@@ -1587,7 +1588,7 @@ TEST(matmul_q8_0_dp4a_M1_gemma4_shape) {
 
 TEST(matmul_q8_0_dp4a_M4_perRowScale) {
     // Multiple rows — each row has its own scale, so the row loop in
-    // matmulQ8_0Dp4aAsync must advance Xscale by 1 per iteration.
+    // matmulDp4aAsync must advance Xscale by 1 per iteration.
     runQ8_0Dp4aParity("matmul_q8_0_dp4a_M4", /*N=*/32, /*K=*/1024,
                       /*M=*/4, /*seed=*/0xF103U);
 }

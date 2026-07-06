@@ -124,41 +124,46 @@ public:
                      float*          Y,
                      float*          scratch);
 
-    /// M8.H.1 — DP4A Q8_0 matvec with pre-quantised int8 activation.
-    /// Y [M, N] = Xq [M, K] (int8) × Xscale [M] × W [N, K]^T (Q8_0).
+    /// M8.H.1 — DP4A matvec with pre-quantised int8 activation. The
+    /// generic dispatcher; kernel slot lives on the Entry for `type`.
+    ///   Y [M, N] = Xq [M, K] (int8) × Xscale [M] × W [N, K]^T (quantised).
     /// The activation is expected to already have been produced by
     /// GpuOps::xQuantI8Async (per-row symmetric int8, scale = amax/127).
     /// Async — call sync() before reading Y from the CPU.
     ///
-    /// Available only when the DP4A extension resolved at module load;
-    /// query via dp4aAvailable() first. Throws if unavailable.
-    void matmulQ8_0Dp4aAsync(const std::int8_t* Xq,
-                             const float*       Xscale,
-                             const void*        W,
-                             std::size_t        N,
-                             std::size_t        K,
-                             std::size_t        M,
-                             float*             Y);
+    /// Available only when the DP4A kernel for `type` resolved at module
+    /// load; query via dp4aAvailable(type) first. Throws if unavailable.
+    void matmulDp4aAsync(model::GgmlType    type,
+                         const std::int8_t* Xq,
+                         const float*       Xscale,
+                         const void*        W,
+                         std::size_t        N,
+                         std::size_t        K,
+                         std::size_t        M,
+                         float*             Y);
 
 private:
-    /// Internal dispatch for the DP4A Q8_0 path — quantises `X` into
-    /// the persistent Xq/Xscale scratch via `_ops.xQuantI8Async`, then
-    /// forwards to `matmulQ8_0Dp4aAsync`. Callers must first verify
-    /// M <= kDp4aMaxM && K <= kDp4aMaxK.
-    void dispatchQ8_0Dp4aFromFloat(const float* X,
-                                   const void*  W,
-                                   std::size_t  N,
-                                   std::size_t  K,
-                                   std::size_t  M,
-                                   float*       Y);
+    /// Internal dispatch for the DP4A path — quantises `X` into the
+    /// persistent Xq/Xscale scratch via `_ops.xQuantI8Async`, then
+    /// forwards to `matmulDp4aAsync`. Callers must first verify
+    /// `M <= kDp4aMaxM && K <= kDp4aMaxK`.
+    void dispatchDp4aFromFloat(model::GgmlType type,
+                               const float*    X,
+                               const void*     W,
+                               std::size_t     N,
+                               std::size_t     K,
+                               std::size_t     M,
+                               float*          Y);
 public:
 
-    /// True when matmul_q8_0_vec_dp4a loaded successfully. False when
-    /// the SPV or the DP4A extension itself was unavailable on the
+    /// True when at least one DP4A kernel loaded successfully. Query
+    /// dp4aAvailable(type) for a per-type check.
+    [[nodiscard]] bool dp4aAvailable() const noexcept;
+
+    /// True when the DP4A kernel for `type` loaded successfully. False
+    /// when the SPV or the DP4A extension itself was unavailable on the
     /// target iGPU; callers must fall back to the plain matvec path.
-    [[nodiscard]] bool dp4aAvailable() const noexcept {
-        return _q8_0Dp4aSlot.has_value();
-    }
+    [[nodiscard]] bool dp4aAvailable(model::GgmlType type) const noexcept;
 
     /// Flush any pending appends (close + execute + sync + reset). Safe
     /// to call when there's no pending work — cheap no-op.
@@ -227,11 +232,20 @@ private:
         //                             or MAX if it never won at any bucket
         std::size_t               gemmMinM{std::numeric_limits<std::size_t>::max()};
 
-        // M8.H.3 — Q8_0 only. When true, matmulAsync routes the Q8_0
-        // dispatch through the DP4A path (x_quant_i8 + DP4A matvec)
-        // instead of vec/gemm. Set by autotune() only when parity gate
-        // + timing bench both prefer DP4A on this iGPU. Takes priority
-        // over the M-threshold GEMM path.
+        // M8.H.3 — DP4A kernel for this type. Loaded eagerly in the
+        // ctor for any type with a `<name>_vec_dp4a.cl` module (Q8_0
+        // since M8.H.1, Q4_K since M8.M). nullopt when the SPV or the
+        // integer_dot_product extension is unavailable on the target
+        // iGPU. Argument list is (Xq int8, Xscale fp32, W quantised,
+        // Y fp32, K int32, N int32) — same across all DP4A kernels so
+        // the dispatch code is type-agnostic.
+        std::optional<KernelSlot> dp4a;
+
+        // When true, matmulAsync routes the dispatch through the DP4A
+        // path (x_quant_i8 + DP4A matvec) instead of vec/gemm. Set by
+        // autotune() only when parity gate + timing bench both prefer
+        // DP4A on this iGPU. Takes priority over the M-threshold GEMM
+        // path.
         bool                      useDp4a{false};
 
         // Autotune telemetry — populated once by autotune(), consumed by
@@ -253,14 +267,11 @@ private:
     // Populated at construction by iterating the QuantType registry.
     std::unordered_map<model::GgmlType, Entry> _entries;
 
-    // M8.H.1 — DP4A Q8_0 matvec kernel. Loaded eagerly in the ctor;
-    // nullopt when the SPV or the DP4A extension itself is unavailable
-    // on the current iGPU. Kept separate from `_entries` because it
-    // takes a different argument list (Xq + Xscale) so the generic
-    // matmulAsync dispatcher can't drive it directly — the autotune
-    // integration (M8.H.3) selects it, and matmulAsync then routes
-    // through _dp4aXqUsm / _dp4aScaleUsm.
-    std::optional<KernelSlot> _q8_0Dp4aSlot;
+    // DP4A kernel slots now live inside each Entry (Entry::dp4a) so
+    // Q4_K, Q8_0, and any future int-dot-product quant share one code
+    // path. The engine-side scratch (_dp4aXqUsm / _dp4aScaleUsm) is
+    // sized once and reused across every DP4A dispatch regardless of
+    // type — same int8 activation layout.
 
     // M8.H.3 — persistent Xq / Xscale scratch for the DP4A dispatch
     // path. Sized once at ctor for the worst-case shape we're willing

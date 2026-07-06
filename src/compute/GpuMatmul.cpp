@@ -228,28 +228,41 @@ GpuMatmul::GpuMatmul(runtime::L0Context&    ctx,
         }
     }
 
-    // M8.H.1 — DP4A Q8_0 matvec. Guarded because the extension is not
-    // universally advertised on older Intel iGPUs; a failure here just
-    // disables the DP4A path (callers fall back to the plain matvec).
-    try {
-        _q8_0Dp4aSlot.emplace(loadSlot("matmul_q8_0_vec_dp4a"));
-        MM_LOG_INFO("gpummm",
-                    "GpuMatmul: matmul_q8_0_vec_dp4a loaded (local={}, sg={}, "
-                    "{} outputs/group)",
-                    kDp4aLocalSize, kDp4aSubgroupSize, kDp4aOutputsPerGroup);
-    } catch (const std::exception& e) {
-        MM_LOG_WARN("gpummm",
-                    "GpuMatmul: matmul_q8_0_vec_dp4a load failed ({}) — "
-                    "DP4A path disabled, Q8_0 matvec stays on the FP32-dequant "
-                    "kernel",
-                    e.what());
-        _q8_0Dp4aSlot.reset();
+    // M8.H.1 / M8.M — DP4A matvec per quant type. Guarded because the
+    // integer_dot_product extension is not universally advertised on
+    // older Intel iGPUs; per-type failures leave the entry without a
+    // DP4A slot and callers fall back to plain matvec for that type.
+    struct Dp4aKernel { model::GgmlType type; const char* module; };
+    for (const auto& [dtype, module] : std::initializer_list<Dp4aKernel>{
+             {model::GgmlType::Q8_0, "matmul_q8_0_vec_dp4a"},
+             {model::GgmlType::Q4_K, "matmul_q4k_vec_dp4a"}})
+    {
+        auto it = _entries.find(dtype);
+        if (it == _entries.end()) continue;   // type not registered
+        Entry& entry = it->second;
+        try {
+            entry.dp4a.emplace(loadSlot(module));
+            MM_LOG_INFO("gpummm",
+                        "GpuMatmul: {} loaded (local={}, sg={}, {} outputs/group)",
+                        module,
+                        kDp4aLocalSize, kDp4aSubgroupSize, kDp4aOutputsPerGroup);
+        } catch (const std::exception& e) {
+            MM_LOG_WARN("gpummm",
+                        "GpuMatmul: {} load failed ({}) — DP4A path "
+                        "disabled for this type, matvec stays on the "
+                        "FP32-dequant kernel",
+                        module, e.what());
+            entry.dp4a.reset();
+        }
     }
 
-    // M8.H.3 — persistent Xq / Xscale scratch. Only allocate when the
+    // Persistent Xq / Xscale scratch. Only allocate when at least one
     // DP4A path actually loaded; there's no point paying 23 MiB of USM
     // for a kernel we can't dispatch.
-    if (_q8_0Dp4aSlot.has_value()) {
+    const bool anyDp4a = std::any_of(
+        _entries.begin(), _entries.end(),
+        [](const auto& kv) { return kv.second.dp4a.has_value(); });
+    if (anyDp4a) {
         _dp4aXqBytes    = kDp4aMaxM * kDp4aMaxK;               // int8
         _dp4aScaleBytes = kDp4aMaxM * sizeof(float);
         _dp4aXqUsm      = _alloc.allocate(_dp4aXqBytes);
@@ -331,10 +344,11 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
         return;
     }
 
-    if (forceEnableDp4a && _q8_0Dp4aSlot.has_value()) {
+    if (forceEnableDp4a && dp4aAvailable()) {
         MM_LOG_INFO("gpummm",
-                    "autotune: MIMIRMIND_FORCE_DP4A=1 — Q8_0 will be "
-                    "pinned to the DP4A path after parity gate");
+                    "autotune: MIMIRMIND_FORCE_DP4A=1 — every type with "
+                    "a DP4A kernel will be pinned to that path after "
+                    "the parity gate");
     }
 
     // Round N and K to super-block-aligned sizes so every quant type
@@ -683,17 +697,11 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
             }
         }
 
-        // M8.H.3 — DP4A 3rd variant for Q8_0. Benched at M=16 only
-        // (kAutotuneMBuckets[0]); the current DP4A path loses at every
-        // observed M so extending the bench across all buckets would
-        // just make startup slower without changing outcomes. If DP4A
-        // ever wins at M=16 it applies to all M (useDp4a is a plain
-        // bool, not per-bucket), which is fine — DP4A is inherently
-        // shape-agnostic and won't suddenly lose at larger M.
-        if (type == model::GgmlType::Q8_0
-            && _q8_0Dp4aSlot.has_value()
-            && !forceDisableDp4a)
-        {
+        // M8.H.3 / M8.M — DP4A bench for any type that has a DP4A slot
+        // (Q8_0 and Q4_K currently). Benched at M=16 only
+        // (kAutotuneMBuckets[0]); DP4A is shape-agnostic so a M=16 win
+        // covers all M.
+        if (entry.dp4a.has_value() && !forceDisableDp4a) {
             const std::size_t Mdp = kAutotuneMBuckets[0];
             const std::size_t xqBytes = Mdp * K * sizeof(std::int8_t);
             const std::size_t xsBytes = Mdp * sizeof(float);
@@ -743,19 +751,18 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                 }
                 const float dp4aTol = std::max(0.05F * maxAbs, 1e-3F);
                 if (!(maxDiff <= dp4aTol)) {
-                    MM_LOG_WARN("gpummm",
-                                "autotune parity FAIL for Q8_0 DP4A — "
+                    MM_LOG_WARN("gpummm",                                "autotune parity FAIL for {} DP4A — "
                                 "maxDiff={:.6g} maxRef={:.6g} tol={:.6g}. "
                                 "Sticking with matvec/gemm decision, "
                                 "skipping DP4A timing bench.",
-                                maxDiff, maxAbs, dp4aTol);
+                                qt->name(), maxDiff, maxAbs, dp4aTol);
                     entry.useDp4a        = false;
                     entry.autotuneSource = "dp4a_parity_fail";
                 } else {
                     MM_LOG_INFO("gpummm",
-                                "autotune parity OK for Q8_0 DP4A — "
+                                "autotune parity OK for {} DP4A — "
                                 "maxDiff={:.6g} maxRef={:.6g} tol={:.6g}",
-                                maxDiff, maxAbs, dp4aTol);
+                                qt->name(), maxDiff, maxAbs, dp4aTol);
 
                     std::vector<double> dp4aMs;
                     dp4aMs.reserve(nTimed);
@@ -785,9 +792,9 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                             forceEnableDp4a ? "env_force_dp4a" : "bench";
                     }
                     MM_LOG_INFO("gpummm",
-                                "autotune: Q8_0 DP4A {:.2f} ms vs "
+d                                "autotune: {} DP4A {:.2f} ms vs "
                                 "best-non-dp4a@M=16 {:.2f} ms → picked {}",
-                                dp4aMed, bestNonDp4a,
+                                qt->name(), dp4aMed, bestNonDp4a,
                                 pickDp4a ? "dp4a" : "matvec-or-gemm-by-M");
                 }
 
@@ -839,25 +846,24 @@ void GpuMatmul::matmulAsync(model::GgmlType type,
 
     Entry& entry = it->second;
 
-    // M8.H.3 — DP4A hot path for Q8_0 when autotune picked it AND the
-    // request fits the persistent scratch. Bounds overflow falls
-    // through to vec/gemm below with a one-shot warn so the constants
-    // can be bumped if it keeps happening.
-    if (type == model::GgmlType::Q8_0
-        && entry.useDp4a
-        && _q8_0Dp4aSlot.has_value())
-    {
+    // DP4A hot path for any type whose autotune picked it AND that has
+    // a DP4A kernel loaded. Bounds overflow falls through to vec/gemm
+    // below with a one-shot warn.
+    if (entry.useDp4a && entry.dp4a.has_value()) {
         if (M <= kDp4aMaxM && K <= kDp4aMaxK) {
-            dispatchQ8_0Dp4aFromFloat(X, W, N, K, M, Y);
+            dispatchDp4aFromFloat(type, X, W, N, K, M, Y);
             return;
         }
         if (!_dp4aScratchOverflowWarned) {
+            const QuantType* qtWarn = quantType(type);
             MM_LOG_WARN("gpummm",
-                        "GpuMatmul: DP4A dispatch declined for Q8_0 "
+                        "GpuMatmul: DP4A dispatch declined for {} "
                         "(M={}, K={}) — exceeds scratch bounds "
                         "(kDp4aMaxM={}, kDp4aMaxK={}). Falling back to "
                         "vec/gemm. Bump both constants together if this "
                         "happens for every request.",
+                        qtWarn != nullptr
+                            ? std::string{qtWarn->name()} : "type?",
                         M, K, kDp4aMaxM, kDp4aMaxK);
             _dp4aScratchOverflowWarned = true;
         }
@@ -931,28 +937,34 @@ void GpuMatmul::matmul(model::GgmlType type,
     sync();
 }
 
-void GpuMatmul::matmulQ8_0Dp4aAsync(const std::int8_t* Xq,
-                                    const float*       Xscale,
-                                    const void*        W,
-                                    std::size_t        N,
-                                    std::size_t        K,
-                                    std::size_t        M,
-                                    float*             Y) {
-    if (!_q8_0Dp4aSlot.has_value()) {
+void GpuMatmul::matmulDp4aAsync(model::GgmlType    type,
+                                const std::int8_t* Xq,
+                                const float*       Xscale,
+                                const void*        W,
+                                std::size_t        N,
+                                std::size_t        K,
+                                std::size_t        M,
+                                float*             Y) {
+    auto it = _entries.find(type);
+    if (it == _entries.end() || !it->second.dp4a.has_value()) {
         throw std::runtime_error(
-            "GpuMatmul::matmulQ8_0Dp4aAsync: DP4A kernel not loaded on "
-            "this iGPU — check dp4aAvailable() before calling");
+            "GpuMatmul::matmulDp4aAsync: DP4A kernel not loaded for "
+            "this type — check dp4aAvailable(type) before calling");
     }
     if (M == 0 || N == 0 || K == 0) {
         return;
     }
-    if (K % 32 != 0) {
+    const QuantType* qt = quantType(type);
+    const std::size_t blockElts =
+        qt != nullptr ? qt->blockElements() : 0;
+    if (blockElts == 0 || K % blockElts != 0) {
         throw std::runtime_error(
-            "GpuMatmul::matmulQ8_0Dp4aAsync: K=" + std::to_string(K) +
-            " is not a multiple of 32 (Q8_0 block size)");
+            "GpuMatmul::matmulDp4aAsync: K=" + std::to_string(K) +
+            " is not a multiple of blockElements=" +
+            std::to_string(blockElts) + " for this quant type");
     }
 
-    runtime::GpuKernel& kern = _q8_0Dp4aSlot->kernel;
+    runtime::GpuKernel& kern = it->second.dp4a->kernel;
     kern.setGroupSize(kDp4aLocalSize, 1, 1);
     kern.setValue<std::int32_t>(4, static_cast<std::int32_t>(K));
     kern.setValue<std::int32_t>(5, static_cast<std::int32_t>(N));
@@ -977,12 +989,13 @@ void GpuMatmul::matmulQ8_0Dp4aAsync(const std::int8_t* Xq,
     }
 }
 
-void GpuMatmul::dispatchQ8_0Dp4aFromFloat(const float* X,
-                                          const void*  W,
-                                          std::size_t  N,
-                                          std::size_t  K,
-                                          std::size_t  M,
-                                          float*       Y) {
+void GpuMatmul::dispatchDp4aFromFloat(model::GgmlType type,
+                                      const float*    X,
+                                      const void*     W,
+                                      std::size_t     N,
+                                      std::size_t     K,
+                                      std::size_t     M,
+                                      float*          Y) {
     // Bounds are the caller's responsibility (matmulAsync checks them
     // before routing here). This method just wires the two kernels
     // together on the shared queue.
@@ -990,7 +1003,20 @@ void GpuMatmul::dispatchQ8_0Dp4aFromFloat(const float* X,
     auto* xs = static_cast<float*>(_dp4aScaleUsm);
 
     _ops.xQuantI8Async(X, xq, xs, M, K);
-    matmulQ8_0Dp4aAsync(xq, xs, W, N, K, M, Y);
+    matmulDp4aAsync(type, xq, xs, W, N, K, M, Y);
+}
+
+bool GpuMatmul::dp4aAvailable() const noexcept {
+    for (const auto& [type, entry] : _entries) {
+        (void)type;
+        if (entry.dp4a.has_value()) return true;
+    }
+    return false;
+}
+
+bool GpuMatmul::dp4aAvailable(model::GgmlType type) const noexcept {
+    auto it = _entries.find(type);
+    return it != _entries.end() && it->second.dp4a.has_value();
 }
 
 void GpuMatmul::sync() {
@@ -1002,8 +1028,7 @@ std::vector<GpuMatmul::AutotuneReport> GpuMatmul::autotuneReport() const {
     out.reserve(_entries.size());
     for (const auto& [type, entry] : _entries) {
         const QuantType* qt = quantType(type);
-        const bool dp4aForThisType =
-            type == model::GgmlType::Q8_0 && _q8_0Dp4aSlot.has_value();
+        const bool dp4aForThisType = entry.dp4a.has_value();
         AutotuneReport r{};
         r.name          = qt != nullptr ? std::string{qt->name()} : "??";
         r.gemmAvailable = entry.gemm.has_value();
