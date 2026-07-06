@@ -44,6 +44,12 @@
 #define ATTN_MAX_TK 16384
 #endif
 
+// M-CLR.2: positionOffset moved to a __global int-slot (curLenPtr) that
+// the host updates before every dispatch. T_k was previously passed by
+// value; it was only used to cap kMax when positionOffset+pq+1 exceeded
+// it, but every current caller satisfies T_k = positionOffset + T_q, so
+// the cap is a no-op and T_k drops out of the signature. See M-CLR
+// inventory (Synaipse research/2026-07-06-mclr1-kernel-inventory.md).
 __attribute__((reqd_work_group_size(ATTN_LOCAL, 1, 1)))
 __attribute__((intel_reqd_sub_group_size(ATTN_SG)))
 __kernel void attention(
@@ -51,24 +57,23 @@ __kernel void attention(
     __global const float* k,
     __global const float* v,
     __global       float* out,
-    const int   T_q,
-    const int   T_k,
-    const int   nHeads,
-    const int   nKvHeads,
-    const int   headDim,
-    const int   positionOffset,
-    const float scale)
+    const int             T_q,
+    const int             nHeads,
+    const int             nKvHeads,
+    const int             headDim,
+    __global const int*   curLenPtr,
+    const float           scale)
 {
     const int hq  = (int)get_group_id(0);
     const int pq  = (int)get_group_id(1);
     const int lid = (int)get_local_id(0);
 
-    const int qStride  = nHeads   * headDim;
-    const int kvStride = nKvHeads * headDim;
-    const int hkv      = (hq * nKvHeads) / nHeads;
-    const int absPos   = positionOffset + pq;
-    const int kMaxRaw  = absPos + 1;
-    const int kMax     = (kMaxRaw < T_k) ? kMaxRaw : T_k;
+    const int qStride       = nHeads   * headDim;
+    const int kvStride      = nKvHeads * headDim;
+    const int hkv           = (hq * nKvHeads) / nHeads;
+    const int positionOffset = curLenPtr[0];
+    const int absPos        = positionOffset + pq;
+    const int kMax          = absPos + 1;
 
     __global const float* qVec = q   + pq * qStride + hq * headDim;
     __global       float* oVec = out + pq * qStride + hq * headDim;

@@ -253,6 +253,13 @@ public:
     /// slot. In immediate mode `ropeInPlaceAsync` etc. write the value
     /// before every dispatch; nothing changes for callers. In replay
     /// mode the host updates this slot between replays.
+    ///
+    /// **Invariant** (relied on by immediate-mode correctness): within
+    /// one flush cycle every kernel that reads this slot must want the
+    /// same value. Current callers satisfy this — every layer in a
+    /// forward pass shares the same curLen — but adding a caller that
+    /// mixes curLen values inside a single flush would silently give
+    /// all launches the last-written value.
     [[nodiscard]] std::int32_t* curLenSlot() noexcept { return _curLenSlotUsm; }
 
 private:

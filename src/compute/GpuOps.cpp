@@ -688,17 +688,25 @@ void GpuOps::attentionPlainAsync(const float* q,
                                  std::size_t  positionOffset,
                                  float        scale,
                                  float*       out) {
+    // M-CLR.2: positionOffset via shared USM slot. T_k was previously
+    // an arg used only to cap kMax; every caller satisfies
+    // T_k = positionOffset + T_q so the cap is a no-op, and the arg
+    // drops out. See kernels/attention.cl for the signature.
+    // The (void)T_k below documents that the wrapper still accepts it
+    // but no longer forwards it — callers pass totalLen for historical
+    // parity with the CPU reference.
+    (void)T_k;
+    *_curLenSlotUsm = toInt32(positionOffset, "attention positionOffset");
     _attentionKernel.setPtr(0, q);
     _attentionKernel.setPtr(1, k);
     _attentionKernel.setPtr(2, v);
     _attentionKernel.setPtr(3, out);
-    _attentionKernel.setValue<std::int32_t>(4, toInt32(T_q,            "attention T_q"));
-    _attentionKernel.setValue<std::int32_t>(5, toInt32(T_k,            "attention T_k"));
-    _attentionKernel.setValue<std::int32_t>(6, toInt32(nHeads,         "attention nHeads"));
-    _attentionKernel.setValue<std::int32_t>(7, toInt32(nKvHeads,       "attention nKvHeads"));
-    _attentionKernel.setValue<std::int32_t>(8, toInt32(headDim,        "attention headDim"));
-    _attentionKernel.setValue<std::int32_t>(9, toInt32(positionOffset, "attention positionOffset"));
-    _attentionKernel.setValue<float>(10, scale);
+    _attentionKernel.setValue<std::int32_t>(4, toInt32(T_q,      "attention T_q"));
+    _attentionKernel.setValue<std::int32_t>(5, toInt32(nHeads,   "attention nHeads"));
+    _attentionKernel.setValue<std::int32_t>(6, toInt32(nKvHeads, "attention nKvHeads"));
+    _attentionKernel.setValue<std::int32_t>(7, toInt32(headDim,  "attention headDim"));
+    _attentionKernel.setPtr(8, _curLenSlotUsm);
+    _attentionKernel.setValue<float>(9, scale);
     _attentionKernel.setGroupSize(kAttentionLocalSize, 1, 1);
     // One workgroup per (head, query-position).
     _queue.appendLaunch(_attentionKernel,
@@ -730,19 +738,25 @@ void GpuOps::attentionDecodeFlashAsync(const float* q,
             std::to_string(kFlashMaxKTiles) + "]");
     }
 
+    // M-CLR.2: T_k, positionOffset and nKTiles are all derivable from
+    // positionOffset (= curLen). The kernels dereference curLenPtr and
+    // compute the rest. Launch geometry still uses the host-computed
+    // nKTiles — M-CLR.3 will move to a max-tile launch with kernel-side
+    // early-exit so the replayed geometry doesn't need to update.
+    (void)T_k;
+    *_curLenSlotUsm = toInt32(positionOffset, "flash positionOffset");
+
     // Pass 1 — per-tile partial (m, l, o_unnorm) into the persistent
     // USM scratch.
     _attentionFlashPartialKernel.setPtr(0, q);
     _attentionFlashPartialKernel.setPtr(1, k);
     _attentionFlashPartialKernel.setPtr(2, v);
     _attentionFlashPartialKernel.setPtr(3, _flashPartialUsm);
-    _attentionFlashPartialKernel.setValue<std::int32_t>(4, toInt32(T_k,            "flash T_k"));
-    _attentionFlashPartialKernel.setValue<std::int32_t>(5, toInt32(nHeads,         "flash nHeads"));
-    _attentionFlashPartialKernel.setValue<std::int32_t>(6, toInt32(nKvHeads,       "flash nKvHeads"));
-    _attentionFlashPartialKernel.setValue<std::int32_t>(7, toInt32(headDim,        "flash headDim"));
-    _attentionFlashPartialKernel.setValue<std::int32_t>(8, toInt32(positionOffset, "flash positionOffset"));
-    _attentionFlashPartialKernel.setValue<std::int32_t>(9, toInt32(nKTiles,        "flash nKTiles"));
-    _attentionFlashPartialKernel.setValue<float>(10, scale);
+    _attentionFlashPartialKernel.setValue<std::int32_t>(4, toInt32(nHeads,   "flash nHeads"));
+    _attentionFlashPartialKernel.setValue<std::int32_t>(5, toInt32(nKvHeads, "flash nKvHeads"));
+    _attentionFlashPartialKernel.setValue<std::int32_t>(6, toInt32(headDim,  "flash headDim"));
+    _attentionFlashPartialKernel.setPtr(7, _curLenSlotUsm);
+    _attentionFlashPartialKernel.setValue<float>(8, scale);
     _attentionFlashPartialKernel.setGroupSize(kAttentionLocalSize, 1, 1);
     _queue.appendLaunch(_attentionFlashPartialKernel,
                         static_cast<std::uint32_t>(nHeads),
@@ -755,7 +769,7 @@ void GpuOps::attentionDecodeFlashAsync(const float* q,
     _attentionFlashMergeKernel.setPtr(1, out);
     _attentionFlashMergeKernel.setValue<std::int32_t>(2, toInt32(nHeads,  "flash_merge nHeads"));
     _attentionFlashMergeKernel.setValue<std::int32_t>(3, toInt32(headDim, "flash_merge headDim"));
-    _attentionFlashMergeKernel.setValue<std::int32_t>(4, toInt32(nKTiles, "flash_merge nKTiles"));
+    _attentionFlashMergeKernel.setPtr(4, _curLenSlotUsm);
     _attentionFlashMergeKernel.setGroupSize(kAttentionLocalSize, 1, 1);
     _queue.appendLaunch(_attentionFlashMergeKernel,
                         static_cast<std::uint32_t>(nHeads),

@@ -41,17 +41,28 @@
 #define ATTN_FLASH_MAX_KTILES 64
 #endif
 
+#ifndef ATTN_FLASH_KTILE
+#define ATTN_FLASH_KTILE 256
+#endif
+
+// M-CLR.2: nKTiles is derived from positionOffset (curLenPtr[0]) so the
+// argument list is replay-friendly. Formula matches the partial kernel's
+// derivation: nKTiles = ceil((positionOffset + 1) / ATTN_FLASH_KTILE).
 __attribute__((reqd_work_group_size(ATTN_FLASH_LOCAL, 1, 1)))
 __attribute__((intel_reqd_sub_group_size(ATTN_FLASH_SG)))
 __kernel void attention_flash_merge(
     __global const float* partialMlo,
     __global       float* out,
-    const int   nHeads,
-    const int   headDim,
-    const int   nKTiles)
+    const int             nHeads,
+    const int             headDim,
+    __global const int*   curLenPtr)
 {
     const int hq  = (int)get_group_id(0);
     const int lid = (int)get_local_id(0);
+
+    const int positionOffset = curLenPtr[0];
+    const int kMax           = positionOffset + 1;
+    const int nKTiles        = (kMax + ATTN_FLASH_KTILE - 1) / ATTN_FLASH_KTILE;
 
     const int stride = 2 + headDim;
     __global const float* baseMlo =

@@ -51,6 +51,10 @@
 #define ATTN_FLASH_KTILE 256
 #endif
 
+// M-CLR.2: positionOffset comes from a __global int-slot (curLenPtr).
+// T_k was previously an unused arg (kernel body never read it); it's
+// dropped. nKTiles is derived from positionOffset inside the kernel so
+// the argument list carries just one varying value. See M-CLR inventory.
 __attribute__((reqd_work_group_size(ATTN_FLASH_LOCAL, 1, 1)))
 __attribute__((intel_reqd_sub_group_size(ATTN_FLASH_SG)))
 __kernel void attention_flash_partial(
@@ -58,27 +62,27 @@ __kernel void attention_flash_partial(
     __global const float* k,
     __global const float* v,
     __global       float* partialMlo,
-    const int   T_k,
-    const int   nHeads,
-    const int   nKvHeads,
-    const int   headDim,
-    const int   positionOffset,
-    const int   nKTiles,            // = ceil(T_k / ATTN_FLASH_KTILE) at most
-    const float scale)
+    const int             nHeads,
+    const int             nKvHeads,
+    const int             headDim,
+    __global const int*   curLenPtr,
+    const float           scale)
 {
     const int hq  = (int)get_group_id(0);
     const int kt  = (int)get_group_id(1);
     const int lid = (int)get_local_id(0);
 
-    const int kvStride = nKvHeads * headDim;
-    const int hkv      = (hq * nKvHeads) / nHeads;
+    const int kvStride       = nKvHeads * headDim;
+    const int hkv            = (hq * nKvHeads) / nHeads;
+    const int positionOffset = curLenPtr[0];
 
     // Decode mode: T_q == 1. The single query position is at absPos =
     // positionOffset, attending to keys [0, positionOffset + 1).
-    const int kMax   = positionOffset + 1;
-    const int kStart = kt * ATTN_FLASH_KTILE;
-    const int kEnd   = (kStart + ATTN_FLASH_KTILE < kMax)
-                         ? (kStart + ATTN_FLASH_KTILE) : kMax;
+    const int kMax    = positionOffset + 1;
+    const int nKTiles = (kMax + ATTN_FLASH_KTILE - 1) / ATTN_FLASH_KTILE;
+    const int kStart  = kt * ATTN_FLASH_KTILE;
+    const int kEnd    = (kStart + ATTN_FLASH_KTILE < kMax)
+                          ? (kStart + ATTN_FLASH_KTILE) : kMax;
 
     __global float* mloPtr =
         partialMlo + ((size_t)hq * (size_t)nKTiles + (size_t)kt) *
