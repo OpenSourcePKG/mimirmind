@@ -181,15 +181,17 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     }
 
     // RoPE on Q and K — independent buffers, no V-dependency.
+    // M-CLR.2 Wave 3b: K-rope uses cache BASE + kv_dim stride so the
+    // kernel writes into the current slot at startPos*kv_dim internally.
     trace("RoPE Q+K (async, unordered)");
     {
         runtime::UnorderedScope u{_ops.queue()};
         _ops.ropeInPlaceAsync(qBuf, T,
                               _config.headCount,   head_dim, curLen,
                               _config.ropeFreqBase);
-        _ops.ropeInPlaceAsync(kSlot, T,
+        _ops.ropeInPlaceAsync(kBase, T,
                               _config.headCountKv, head_dim, curLen,
-                              _config.ropeFreqBase);
+                              _config.ropeFreqBase, kv_dim);
     }
 
     // M5f.3: attention is on the GPU. No sync needed before it — the

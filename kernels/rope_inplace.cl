@@ -22,14 +22,21 @@
 // after the host updates the slot between decode tokens. The host
 // writes the current value before every dispatch, which keeps the
 // immediate-mode call sites bit-identical to the pre-refactor path.
+//
+// M-CLR.2 Wave 3b: `writeOffsetStride` shifts the buffer base by
+// `startPos * writeOffsetStride` inside the kernel. Q-rope passes 0
+// (workspace stays fixed); K-rope passes the layer's kvDim so the
+// kernel writes into the CURRENT KV-cache slot while `x_base` stays
+// stable across replays (= cache.baseK for the layer).
 __attribute__((reqd_work_group_size(ROPE_LOCAL, 1, 1)))
 __kernel void rope_inplace(
-    __global       float* x,
+    __global       float* x_base,
     const int             seqLen,
     const int             numHeads,
     const int             headDim,
     __global const int*   startPosPtr,
-    const float           base)
+    const float           base,
+    const int             writeOffsetStride)
 {
     const int gid     = (int)get_global_id(0);
     const int halfDim = headDim / 2;
@@ -46,6 +53,8 @@ __kernel void rope_inplace(
 
     const int   startPos = startPosPtr[0];
     const float pos      = (float)(startPos + p);
+    __global float* x    =
+        x_base + (size_t)startPos * (size_t)writeOffsetStride;
     const float invDim = 1.0f / (float)headDim;
     const float freq   = pow(base, -(float)(2 * i) * invDim);
     const float theta  = pos * freq;

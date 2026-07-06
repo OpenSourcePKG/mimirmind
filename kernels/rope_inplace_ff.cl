@@ -16,15 +16,18 @@
 #endif
 
 // M-CLR.2: `startPos` moved to a __global int-slot — see rope_inplace.cl.
+// M-CLR.2 Wave 3b: `writeOffsetStride` shifts the base pointer by
+// `startPos * writeOffsetStride` for K-rope. See rope_inplace.cl.
 __attribute__((reqd_work_group_size(ROPE_LOCAL, 1, 1)))
 __kernel void rope_inplace_ff(
-    __global       float* x,
+    __global       float* x_base,
     __global const float* freq_factors,
     const int             seqLen,
     const int             numHeads,
     const int             headDim,
     __global const int*   startPosPtr,
-    const float           base)
+    const float           base,
+    const int             writeOffsetStride)
 {
     const int gid     = (int)get_global_id(0);
     const int halfDim = headDim / 2;
@@ -40,6 +43,8 @@ __kernel void rope_inplace_ff(
 
     const int   startPos = startPosPtr[0];
     const float pos      = (float)(startPos + p);
+    __global float* x    =
+        x_base + (size_t)startPos * (size_t)writeOffsetStride;
     const float invDim   = 1.0f / (float)headDim;
     const float baseFreq = pow(base, -(float)(2 * i) * invDim);
     const float ff       = freq_factors[i];

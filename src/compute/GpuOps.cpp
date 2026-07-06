@@ -321,12 +321,13 @@ void GpuOps::geluMulAsync(float*       gate,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 
-void GpuOps::ropeInPlaceAsync(float*       x,
+void GpuOps::ropeInPlaceAsync(float*       xBase,
                               std::size_t  seqLen,
                               std::size_t  numHeads,
                               std::size_t  headDim,
                               std::size_t  startPos,
-                              float        base) {
+                              float        base,
+                              std::size_t  writeOffsetStride) {
     if (seqLen == 0 || numHeads == 0 || headDim == 0) {
         return;
     }
@@ -341,25 +342,31 @@ void GpuOps::ropeInPlaceAsync(float*       x,
     // happens before appendLaunch so submit-and-wait mode sees the
     // fresh value; recorded/replayed lists pick up whatever the host
     // sets between replays.
+    // M-CLR.2 Wave 3b: `writeOffsetStride` == 0 means the kernel takes
+    // `xBase` as-is (Q-rope, workspace); != 0 shifts it by
+    // `startPos * stride` inside the kernel (K-rope, cache slot).
     *_curLenSlotUsm = toInt32(startPos, "rope startPos");
-    _ropeKernel.setPtr(0, x);
+    _ropeKernel.setPtr(0, xBase);
     _ropeKernel.setValue<std::int32_t>(1, toInt32(seqLen,   "rope seqLen"));
     _ropeKernel.setValue<std::int32_t>(2, toInt32(numHeads, "rope numHeads"));
     _ropeKernel.setValue<std::int32_t>(3, toInt32(headDim,  "rope headDim"));
     _ropeKernel.setPtr(4, _curLenSlotUsm);
     _ropeKernel.setValue<float>(5, base);
+    _ropeKernel.setValue<std::int32_t>(
+        6, toInt32(writeOffsetStride, "rope writeOffsetStride"));
     _ropeKernel.setGroupSize(kRopeLocalSize, 1, 1);
     _queue.appendLaunch(_ropeKernel,
                         groupsForN(total, kRopeLocalSize), 1, 1);
 }
 
-void GpuOps::ropeInPlaceWithFactorsAsync(float*       x,
+void GpuOps::ropeInPlaceWithFactorsAsync(float*       xBase,
                                          const float* freqFactors,
                                          std::size_t  seqLen,
                                          std::size_t  numHeads,
                                          std::size_t  headDim,
                                          std::size_t  startPos,
-                                         float        base) {
+                                         float        base,
+                                         std::size_t  writeOffsetStride) {
     if (seqLen == 0 || numHeads == 0 || headDim == 0) {
         return;
     }
@@ -375,14 +382,17 @@ void GpuOps::ropeInPlaceWithFactorsAsync(float*       x,
     const std::size_t total   = seqLen * numHeads * halfDim;
 
     // M-CLR.2: startPos via shared USM slot. See ropeInPlaceAsync().
+    // M-CLR.2 Wave 3b: writeOffsetStride shifts xBase for K-rope.
     *_curLenSlotUsm = toInt32(startPos, "rope_ff startPos");
-    _ropeFfKernel.setPtr(0, x);
+    _ropeFfKernel.setPtr(0, xBase);
     _ropeFfKernel.setPtr(1, freqFactors);
     _ropeFfKernel.setValue<std::int32_t>(2, toInt32(seqLen,   "rope_ff seqLen"));
     _ropeFfKernel.setValue<std::int32_t>(3, toInt32(numHeads, "rope_ff numHeads"));
     _ropeFfKernel.setValue<std::int32_t>(4, toInt32(headDim,  "rope_ff headDim"));
     _ropeFfKernel.setPtr(5, _curLenSlotUsm);
     _ropeFfKernel.setValue<float>(6, base);
+    _ropeFfKernel.setValue<std::int32_t>(
+        7, toInt32(writeOffsetStride, "rope_ff writeOffsetStride"));
     _ropeFfKernel.setGroupSize(kRopeLocalSize, 1, 1);
     _queue.appendLaunch(_ropeFfKernel,
                         groupsForN(total, kRopeLocalSize), 1, 1);

@@ -127,25 +127,35 @@ public:
     /// In-place RoPE on a [seqLen, numHeads, headDim] f32 buffer. The
     /// per-position angle uses `startPos` as the absolute offset of
     /// row 0 — pass cache.length() in decode mode.
-    void ropeInPlaceAsync(float*       x,
+    ///
+    /// M-CLR.2 Wave 3b: `writeOffsetStride` shifts `xBase` inside the
+    /// kernel by `startPos * writeOffsetStride`. Q-rope leaves it at 0
+    /// (workspace buffer, stable); K-rope passes the layer's kvDim so
+    /// `xBase = cache.baseK(L)` reaches the current write slot at
+    /// startPos*kvDim without the host having to bind a token-varying
+    /// pointer.
+    void ropeInPlaceAsync(float*       xBase,
                           std::size_t  seqLen,
                           std::size_t  numHeads,
                           std::size_t  headDim,
                           std::size_t  startPos,
-                          float        base);
+                          float        base,
+                          std::size_t  writeOffsetStride = 0);
 
     /// In-place RoPE with per-pair frequency factors (ggml_rope_ext's
     /// `freq_factors` argument). `freqFactors` points at [headDim/2] f32
     /// values; the rotation angle becomes
     ///   theta_i = pos * base^(-2i/headDim) / freqFactors[i]
     /// Used by Gemma 3/4 global-attention layers for proportional RoPE.
-    void ropeInPlaceWithFactorsAsync(float*       x,
+    /// `writeOffsetStride` semantics match `ropeInPlaceAsync`.
+    void ropeInPlaceWithFactorsAsync(float*       xBase,
                                      const float* freqFactors,
                                      std::size_t  seqLen,
                                      std::size_t  numHeads,
                                      std::size_t  headDim,
                                      std::size_t  startPos,
-                                     float        base);
+                                     float        base,
+                                     std::size_t  writeOffsetStride = 0);
 
     /// In-place scalar multiply: y[i] *= s for i in [0, n).
     /// Used by Gemma 4 for layer_output_scale.

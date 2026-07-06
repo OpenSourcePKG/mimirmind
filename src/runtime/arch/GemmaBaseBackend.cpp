@@ -361,6 +361,10 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     }
 
     // RoPE Q always runs. RoPE K only when the layer owns K/V.
+    // M-CLR.2 Wave 3b: K-rope now targets the cache BASE and passes
+    // `kv_dim` as the write-offset stride so the kernel writes into row
+    // `curLen` internally. That keeps the K-rope's `xBase` pointer
+    // stable across replays. Q-rope keeps the default stride=0.
     _op.mark(runtime::OpProfiler::Cat::ATTENTION);
     if (li.ownsKv) {
         trace("RoPE Q+K (unordered)");
@@ -369,14 +373,14 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
             _ops.ropeInPlaceWithFactorsAsync(qBuf, _ropeFreqsForFullAttn, T,
                                              li.nHeads, head_dim, curLen,
                                              li.ropeBase);
-            _ops.ropeInPlaceWithFactorsAsync(kSlot, _ropeFreqsForFullAttn, T,
+            _ops.ropeInPlaceWithFactorsAsync(kBase, _ropeFreqsForFullAttn, T,
                                              li.nKvHeads, head_dim, curLen,
-                                             li.ropeBase);
+                                             li.ropeBase, kv_dim);
         } else {
             _ops.ropeInPlaceAsync(qBuf, T, li.nHeads, head_dim, curLen,
                                   li.ropeBase);
-            _ops.ropeInPlaceAsync(kSlot, T, li.nKvHeads, head_dim, curLen,
-                                  li.ropeBase);
+            _ops.ropeInPlaceAsync(kBase, T, li.nKvHeads, head_dim, curLen,
+                                  li.ropeBase, kv_dim);
         }
     } else {
         trace("RoPE Q only (shared-KV layer)");
