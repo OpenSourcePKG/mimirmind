@@ -60,6 +60,8 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
       _rmsnormGemmaKernel{_rmsnormGemmaModule.kernel("rmsnorm_gemma")},
       _rmsnormNoWeightModule{ctx, "rmsnorm_no_weight"},
       _rmsnormNoWeightKernel{_rmsnormNoWeightModule.kernel("rmsnorm_no_weight")},
+      _rmsnormQkvModule{ctx, "rmsnorm_qkv"},
+      _rmsnormQkvKernel{_rmsnormQkvModule.kernel("rmsnorm_qkv")},
       _ropeFfModule    {ctx, "rope_inplace_ff"},
       _ropeFfKernel    {_ropeFfModule.kernel("rope_inplace_ff")},
       _attentionModule {ctx, "attention"},
@@ -88,6 +90,7 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
 
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
+                "rmsnorm_qkv/"
                 "add_bias/add_residual/silu_mul/rope/rope_ff/mul_scalar/"
                 "gelu_mul/attention/attention_flash/scaled_add_residual/"
                 "qkv_split/x_quant_i8 loaded (rms local={}, "
@@ -164,6 +167,40 @@ void GpuOps::rmsNormNoWeightAsync(const float* x,
     _rmsnormNoWeightKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
     _queue.appendLaunch(_rmsnormNoWeightKernel,
                         static_cast<std::uint32_t>(M), 1, 1);
+}
+
+void GpuOps::rmsNormQkvAsync(float*       qBuf,   const float* qWeight,
+                             float*       kBuf,   const float* kWeight,
+                             float*       vBuf,
+                             std::size_t  qRows,
+                             std::size_t  kvRows,
+                             std::size_t  headDim,
+                             float        eps) {
+    if ((qRows == 0 && kvRows == 0) || headDim == 0) {
+        return;
+    }
+    const std::int32_t Ki      = toInt32(headDim, "rmsNormQkv headDim");
+    const std::int32_t qRowsI  = toInt32(qRows,  "rmsNormQkv qRows");
+    const std::int32_t kvRowsI = toInt32(kvRows, "rmsNormQkv kvRows");
+
+    _rmsnormQkvKernel.setPtr(0, qBuf);
+    _rmsnormQkvKernel.setPtr(1, qWeight);
+    _rmsnormQkvKernel.setPtr(2, qBuf);           // in-place
+    _rmsnormQkvKernel.setPtr(3, kBuf);
+    _rmsnormQkvKernel.setPtr(4, kWeight);
+    _rmsnormQkvKernel.setPtr(5, kBuf);           // in-place
+    _rmsnormQkvKernel.setPtr(6, vBuf);
+    _rmsnormQkvKernel.setPtr(7, vBuf);           // in-place
+    _rmsnormQkvKernel.setValue<std::int32_t>(8,  qRowsI);
+    _rmsnormQkvKernel.setValue<std::int32_t>(9,  kvRowsI);
+    _rmsnormQkvKernel.setValue<std::int32_t>(10, Ki);
+    _rmsnormQkvKernel.setValue<float>(11, eps);
+    _rmsnormQkvKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
+
+    // Total workgroups = qRows + 2 * kvRows. Q rows first, then K, then V.
+    const std::uint32_t totalRows =
+        static_cast<std::uint32_t>(qRows + 2 * kvRows);
+    _queue.appendLaunch(_rmsnormQkvKernel, totalRows, 1, 1);
 }
 
 void GpuOps::addBiasAsync(float*       y,

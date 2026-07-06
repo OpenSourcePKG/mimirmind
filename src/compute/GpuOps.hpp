@@ -71,6 +71,21 @@ public:
                               float        eps,
                               float*       y);
 
+    /// Fused Q + K + V RMSNorm — one dispatch instead of three. Q and K
+    /// normalize with per-`head_dim` weights (plain rmsNorm semantics),
+    /// V normalizes without a weight (matches `rmsNormNoWeightAsync`).
+    /// Every buffer is `[rows, head_dim]` and every write is in-place-
+    /// safe (dst == src OK). Row counts differ per buffer: qRows =
+    /// `T * nHeads`, kRows = vRows = `T * nKvHeads`. Saves 2 dispatch
+    /// launches per own-KV attention block (Gemma family).
+    void rmsNormQkvAsync(float*       qBuf,   const float* qWeight,
+                         float*       kBuf,   const float* kWeight,
+                         float*       vBuf,
+                         std::size_t  qRows,
+                         std::size_t  kvRows,
+                         std::size_t  headDim,
+                         float        eps);
+
     /// In-place broadcast bias: y[m, k] += bias[k].
     void addBiasAsync(float*       y,
                       std::size_t  M,
@@ -248,6 +263,9 @@ private:
 
     runtime::GpuModule     _rmsnormNoWeightModule;
     runtime::GpuKernel     _rmsnormNoWeightKernel;
+
+    runtime::GpuModule     _rmsnormQkvModule;
+    runtime::GpuKernel     _rmsnormQkvKernel;
 
     runtime::GpuModule     _ropeFfModule;
     runtime::GpuKernel     _ropeFfKernel;

@@ -233,7 +233,9 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     // realloc-and-reset path and lose every cached token.
     if (_kvCache == nullptr) {
         _kvCache = std::make_unique<KvCache>(
-            _allocator, _maxContextTokens, _backend->kvDimPerLayer());
+            _allocator, _maxContextTokens,
+            _backend->kvDimPerLayer(),
+            _backend->kvSourceLayerPerLayer());
         MM_LOG_INFO("kvcache",
                     "pre-allocated for {} tokens (set via "
                     "MIMIRMIND_MAX_CONTEXT_TOKENS)",

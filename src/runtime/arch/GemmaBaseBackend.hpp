@@ -73,6 +73,7 @@ public:
                                 std::size_t                   /*T*/) {}
 
     [[nodiscard]] std::vector<std::size_t> kvDimPerLayer() const;
+    [[nodiscard]] std::vector<std::size_t> kvSourceLayerPerLayer() const;
     [[nodiscard]] std::pair<std::size_t, std::size_t> maxQKVDims() const;
 
     void setParityDumpPrefix(std::string prefix) noexcept {

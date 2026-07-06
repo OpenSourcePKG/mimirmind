@@ -47,6 +47,10 @@ std::vector<std::size_t> Gemma4Backend::kvDimPerLayer() const {
     return _impl->kvDimPerLayer();
 }
 
+std::vector<std::size_t> Gemma4Backend::kvSourceLayerPerLayer() const {
+    return _impl->kvSourceLayerPerLayer();
+}
+
 std::pair<std::size_t, std::size_t> Gemma4Backend::maxQKVDims() const {
     return _impl->maxQKVDims();
 }

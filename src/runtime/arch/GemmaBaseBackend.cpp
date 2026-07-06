@@ -140,6 +140,19 @@ std::vector<std::size_t> GemmaBaseBackend::kvDimPerLayer() const {
     return out;
 }
 
+std::vector<std::size_t> GemmaBaseBackend::kvSourceLayerPerLayer() const {
+    // Identity when the model doesn't use shared K/V — matches the
+    // ArchBackend default. Avoids an unnecessary allocation on 26B-A4B
+    // and on any dense Gemma-4 that has no reuse layers.
+    if (_config.sharedKvLayers == 0) return {};
+    std::vector<std::size_t> out;
+    out.reserve(_layers.size());
+    for (const auto& li : _layers) {
+        out.push_back(li.kvSourceLayer);
+    }
+    return out;
+}
+
 std::pair<std::size_t, std::size_t> GemmaBaseBackend::maxQKVDims() const {
     std::size_t qMax = 0, kvMax = 0;
     for (const auto& li : _layers) {
@@ -311,21 +324,19 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     }
 
     // Q-norm always runs. K-norm + V-norm only when the layer owns K/V.
+    // Own-KV layers fuse all three norms into a single dispatch so the
+    // decode-step doesn't pay two extra kernel-launch overheads per
+    // block (~40 μs each on Xe-LPG). Shared-KV layers keep the plain
+    // Q-only call — there's no fusion opportunity with a single row-set.
     _op.mark(runtime::OpProfiler::Cat::NORM);
     if (li.ownsKv) {
-        trace("Q+K+V norms (rmsNorm, unordered)");
-        runtime::UnorderedScope u{_ops.queue()};
-        _ops.rmsNormAsync(qBuf, T * li.nHeads, head_dim,
-                          static_cast<const float*>(qNorm->usmPtr),
-                          _config.rmsNormEps,
-                          qBuf);                   // in-place
-        _ops.rmsNormAsync(kSlot, T * li.nKvHeads, head_dim,
-                          static_cast<const float*>(kNorm->usmPtr),
-                          _config.rmsNormEps,
-                          kSlot);              // in-place
-        _ops.rmsNormNoWeightAsync(vSlot, T * li.nKvHeads, head_dim,
-                                  _config.rmsNormEps,
-                                  vSlot);            // in-place
+        trace("Q+K+V norms (rmsNorm fused)");
+        _ops.rmsNormQkvAsync(
+            qBuf,  static_cast<const float*>(qNorm->usmPtr),
+            kSlot, static_cast<const float*>(kNorm->usmPtr),
+            vSlot,
+            T * li.nHeads, T * li.nKvHeads, head_dim,
+            _config.rmsNormEps);
     } else {
         trace("Q-norm only (shared-KV layer)");
         _ops.rmsNormAsync(qBuf, T * li.nHeads, head_dim,

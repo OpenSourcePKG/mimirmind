@@ -34,9 +34,18 @@ class UsmAllocator;
 class KvCache {
 public:
     /// Per-layer dims. kvDimPerLayer[L] == nKvHeads(L) * headDim(L).
+    ///
+    /// `kvSourceLayer` is Gemma 4 E4B's shared-KV mechanism: when
+    /// `kvSourceLayer[L] != L`, layer L does NOT get its own USM buffer.
+    /// `baseK/V(L)` and `writeSlotK/V(L)` alias `kvSourceLayer[L]`'s
+    /// buffers. Passing an empty vector = identity (every layer owns its
+    /// K/V). Entries must satisfy `kvSourceLayer[L] <= L` (dependency
+    /// ordering) and both source and aliased layer must have the same
+    /// kvDim (the backend guarantees this via SWA-vs-full offset math).
     KvCache(UsmAllocator&            alloc,
             std::size_t              maxSeq,
-            std::vector<std::size_t> kvDimPerLayer);
+            std::vector<std::size_t> kvDimPerLayer,
+            std::vector<std::size_t> kvSourceLayer = {});
 
     /// Uniform (Qwen/Llama) convenience: fills every layer with the same dim.
     KvCache(UsmAllocator& alloc,
@@ -85,7 +94,13 @@ private:
     UsmAllocator&            _alloc;
     std::size_t              _maxSeq;
     std::vector<std::size_t> _kvDim;
+    /// Bytes actually owned per layer for dealloc. Aliased layers hold
+    /// 0 here so the destructor skips them (their buffer belongs to the
+    /// source layer).
     std::vector<std::size_t> _layerBytes;
+    /// kvSourceLayer[L] == L for own-KV, < L for aliased (Gemma 4 E4B).
+    /// Empty when the caller passes no override — treated as identity.
+    std::vector<std::size_t> _kvSource;
     std::size_t              _length{0};
     std::vector<void*>       _kBuf;
     std::vector<void*>       _vBuf;

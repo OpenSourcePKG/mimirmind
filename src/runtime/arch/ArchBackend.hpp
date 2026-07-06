@@ -70,6 +70,17 @@ public:
     [[nodiscard]] virtual std::vector<std::size_t>
         kvDimPerLayer() const = 0;
 
+    /// Per-layer K/V source for cache aliasing. Entry L is the layer
+    /// whose K/V buffer layer L reads/writes. Identity (L == L) means
+    /// layer L owns its own cache slot. Any entry < L means the backend
+    /// wants layer L to alias an earlier layer's buffer (Gemma 4 E4B
+    /// shared-KV). Default = identity — returns {} which KvCache treats
+    /// as "every layer owns its cache". Backends that use shared K/V
+    /// override this so InferenceEngine skips the per-layer allocation
+    /// for aliased layers.
+    [[nodiscard]] virtual std::vector<std::size_t>
+        kvSourceLayerPerLayer() const { return {}; }
+
     /// Maximum hidden-state dim across layers for any of: Q output, KV
     /// output. BlockBuffers is sized for this so scratch survives the
     /// largest layer. Returns a pair {qDimMax, kvDimMax}.

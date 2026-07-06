@@ -94,6 +94,7 @@ set(KERNEL_SOURCES
     kernels/gelu_mul.cl
     kernels/rmsnorm_gemma.cl
     kernels/rmsnorm_no_weight.cl
+    kernels/rmsnorm_qkv.cl
     kernels/rope_inplace_ff.cl
     kernels/attention.cl
     kernels/attention_flash_partial.cl

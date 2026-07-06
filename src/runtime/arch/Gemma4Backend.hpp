@@ -59,6 +59,8 @@ public:
 
     [[nodiscard]] std::vector<std::size_t>
         kvDimPerLayer() const override;
+    [[nodiscard]] std::vector<std::size_t>
+        kvSourceLayerPerLayer() const override;
     [[nodiscard]] std::pair<std::size_t, std::size_t>
         maxQKVDims() const override;
 
