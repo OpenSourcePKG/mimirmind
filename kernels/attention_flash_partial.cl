@@ -47,8 +47,14 @@
 #define ATTN_FLASH_SG 16
 #endif
 
+// M5f.3.2 — shrunk from 256 to 64. At E4B decode with curLen ~500 the
+// old geometry launched only nHeads * ceil(500/256) = 8*2 = 16
+// workgroups on a 64-VE Xe-LPG (25 % occupancy). K_TILE=64 quadruples
+// concurrent workgroups at typical decode lengths (8*8=64) — sweet
+// spot for the Xe-Core scheduler. MAX_KTILES bumped to 256 to keep
+// the 16384-token compile-time context envelope (256*64 = 16384).
 #ifndef ATTN_FLASH_KTILE
-#define ATTN_FLASH_KTILE 256
+#define ATTN_FLASH_KTILE 64
 #endif
 
 // M-CLR.2: positionOffset comes from a __global int-slot (curLenPtr).

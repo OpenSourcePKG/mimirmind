@@ -37,12 +37,16 @@
 #define ATTN_FLASH_SG 16
 #endif
 
+// M5f.3.2 — MAX_KTILES bumped from 64 to 256 (with KTILE shrunk from
+// 256 to 64) to keep the 16384-token compile-time context envelope
+// while quadrupling concurrent workgroups at typical decode lengths.
+// alphas SLM grows from 256 B to 1 KiB per WG — still trivial.
 #ifndef ATTN_FLASH_MAX_KTILES
-#define ATTN_FLASH_MAX_KTILES 64
+#define ATTN_FLASH_MAX_KTILES 256
 #endif
 
 #ifndef ATTN_FLASH_KTILE
-#define ATTN_FLASH_KTILE 256
+#define ATTN_FLASH_KTILE 64
 #endif
 
 // M-CLR.2: nKTiles is derived from positionOffset (curLenPtr[0]) so the

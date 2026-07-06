@@ -298,7 +298,12 @@ public:
 
     // FlashAttention tuning constants — publicly readable so callers can
     // compute the launch upper bound to hand to setReplayMaxKTiles().
-    static constexpr std::size_t kFlashKTileSize = 256;
+    // M5f.3.2 (2026-07-07): shrunk from 256 to 64 to quadruple concurrent
+    // workgroups at typical decode lengths on Xe-LPG (was 16 WGs for
+    // curLen=500 on 8-head E4B → 64 WGs = matches 8 Xe-Cores × 8 VEs).
+    // Compile-time context envelope stays at 16384 tokens
+    // (kFlashKTileSize × kFlashMaxKTiles).
+    static constexpr std::size_t kFlashKTileSize = 64;
     static constexpr std::size_t kFlashMaxKTiles = 16384 / kFlashKTileSize;
 
 private:
