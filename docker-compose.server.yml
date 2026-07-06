@@ -223,6 +223,24 @@ services:
             #   MIMIRMIND_TRACE_OP_TIMES=1  → activate profiler.
             MIMIRMIND_TRACE_OP_TIMES:    ${MIMIRMIND_TRACE_OP_TIMES:-}
 
+            # M-CLR.4 — Command-List-Replay for the decode block loop.
+            # Off by default: every generate() call runs the traditional
+            # immediate-mode dispatch cycle bit-identically to the
+            # pre-M-CLR baseline. When enabled, decode step 1 records
+            # the 42-block forward into a persistent Level-Zero command
+            # list and executes it once; steps 2+ update a single
+            # 4-byte USM curLen slot and re-execute the recorded list —
+            # ~936 per-token appendLaunch calls collapse to zero. All
+            # kernel-side prerequisites shipped in M-CLR.2 (rope /
+            # attention / qkv_split / rmsnorm_qkv now dereference the
+            # shared curLen slot). Prefill and sampling stay immediate.
+            #
+            #   MIMIRMIND_ENABLE_CLR=on  → activate record/replay.
+            #
+            # Rollback is soft: unset the variable and restart the
+            # container — no image change needed.
+            MIMIRMIND_ENABLE_CLR:        ${MIMIRMIND_ENABLE_CLR:-}
+
             # M9.11 — speculative decoding. Off by default: without a
             # draft-model path the server runs the target-only decode
             # loop bit-identically to the pre-M9.11.4 baseline.
