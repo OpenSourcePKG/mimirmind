@@ -178,6 +178,7 @@ GpuMatmul::GpuMatmul(runtime::L0Context&    ctx,
                                /*useGemmV2=*/false,
                                /*gemmV2MsAtM=*/{},
                                kGemmMinMNever,   // gemmMinM
+                               /*dp4a=*/std::nullopt,
                                false,            // useDp4a
                                {},               // vecMsAtM
                                {},               // gemmMsAtM
@@ -792,7 +793,7 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                             forceEnableDp4a ? "env_force_dp4a" : "bench";
                     }
                     MM_LOG_INFO("gpummm",
-d                                "autotune: {} DP4A {:.2f} ms vs "
+                                "autotune: {} DP4A {:.2f} ms vs "
                                 "best-non-dp4a@M=16 {:.2f} ms → picked {}",
                                 qt->name(), dp4aMed, bestNonDp4a,
                                 pickDp4a ? "dp4a" : "matvec-or-gemm-by-M");
