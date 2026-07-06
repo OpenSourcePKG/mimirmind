@@ -664,6 +664,24 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                         "MIMIRMIND_ENABLE_CLR=on — decode uses record/replay "
                         "from step 2 on");
             _ops.queue().resetRecording();
+            // Right-size the FlashAttention partial launch geometry to
+            // what THIS generate() call could possibly need. `kFlashMaxKTiles`
+            // is a coarse upper bound (16384 / 256 = 64) that wastes ~63/64
+            // work-groups per attention call at typical chat context. Bound
+            // by prompt + max_new saves 30-90 ms/tok on short-context E4B.
+            const std::size_t maxCurLen =
+                promptIds.size() + params.maxNewTokens;
+            const std::size_t replayKTiles = std::min(
+                (maxCurLen + compute::GpuOps::kFlashKTileSize - 1) /
+                    compute::GpuOps::kFlashKTileSize,
+                compute::GpuOps::kFlashMaxKTiles);
+            _ops.setReplayMaxKTiles(replayKTiles);
+            MM_LOG_INFO("engine",
+                        "MIMIRMIND_ENABLE_CLR right-sized flash launch "
+                        "geometry to {} k-tiles (max curLen {})",
+                        replayKTiles, maxCurLen);
+        } else {
+            _ops.setReplayMaxKTiles(0);
         }
 
         // Inter-token thermal pacing — consult guard every kPaceWindow

@@ -284,6 +284,23 @@ public:
     /// all launches the last-written value.
     [[nodiscard]] std::int32_t* curLenSlot() noexcept { return _curLenSlotUsm; }
 
+    /// M-CLR.4 follow-up: right-size the FlashAttention partial launch
+    /// geometry during recording. When 0 (default), the launch uses the
+    /// actual `nKTiles` derived from `positionOffset+1` — optimal for
+    /// immediate mode. When > 0, recording launches with this fixed
+    /// upper bound instead of `kFlashMaxKTiles`, saving 32× empty
+    /// workgroups per attention call for typical short-context chats.
+    /// The caller (InferenceEngine) sets this per-generate based on
+    /// `prompt_len + params.maxNewTokens`.
+    void setReplayMaxKTiles(std::size_t n) noexcept {
+        _replayMaxKTiles = n;
+    }
+
+    // FlashAttention tuning constants — publicly readable so callers can
+    // compute the launch upper bound to hand to setReplayMaxKTiles().
+    static constexpr std::size_t kFlashKTileSize = 256;
+    static constexpr std::size_t kFlashMaxKTiles = 16384 / kFlashKTileSize;
+
 private:
     runtime::L0Context&    _ctx;
     runtime::CommandQueue& _queue;
@@ -355,6 +372,10 @@ private:
     // the current decode position / KV-cache length. Host-writable,
     // device-readable, allocated once at construction.
     std::int32_t*          _curLenSlotUsm{nullptr};
+
+    // M-CLR.4 follow-up: right-sized flash launch bound during
+    // recording. 0 = disabled (immediate-mode uses actual nKTiles).
+    std::size_t            _replayMaxKTiles{0};
     std::size_t            _flashPartialBytes{0};
 
     static constexpr std::uint32_t kRmsnormLocalSize     = 128;
@@ -365,11 +386,9 @@ private:
     // Must match ATTN_LOCAL / ATTN_SG in kernels/attention.cl.
     static constexpr std::uint32_t kAttentionLocalSize   = 16;
 
+    // (kFlashKTileSize / kFlashMaxKTiles are declared public above.)
     // Must match ATTN_FLASH_KTILE in kernels/attention_flash_partial.cl
     // and ATTN_FLASH_MAX_KTILES in kernels/attention_flash_merge.cl.
-    static constexpr std::size_t kFlashKTileSize    = 256;
-    static constexpr std::size_t kFlashMaxKTiles    = kAttentionMaxTk /
-                                                      kFlashKTileSize;
     // Worst-case dims sized for Gemma 4 26B full-attention layers
     // (head_dim=512 on 5 of 30 layers; SWA layers are head_dim=256).
     // Bumping these only costs the static USM allocation size below.
