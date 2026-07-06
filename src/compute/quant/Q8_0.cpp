@@ -2,12 +2,46 @@
 
 #include "compute/Dequant.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 
 namespace mimirmind::compute::quant {
+
+namespace {
+
+/// IEEE-754 binary32 → binary16 (round-to-nearest-even). Scalar
+/// implementation is fine — only invoked at load time, once per Q8_0
+/// block during requantization.
+std::uint16_t floatToHalfBits(float f) noexcept {
+    std::uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const std::uint32_t sign = (bits >> 16) & 0x8000U;
+    std::int32_t        exp  = static_cast<std::int32_t>((bits >> 23) & 0xFFU);
+    const std::uint32_t mant = bits & 0x7FFFFFU;
+
+    if (exp == 0xFF) {
+        return static_cast<std::uint16_t>(
+            sign | 0x7C00U | (mant != 0 ? 0x0200U : 0U));
+    }
+    exp -= 127 - 15;
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<std::uint16_t>(sign);
+        const std::uint32_t m = (mant | 0x800000U) >> (14 - exp);
+        return static_cast<std::uint16_t>(sign | m);
+    }
+    if (exp >= 0x1F) {
+        return static_cast<std::uint16_t>(sign | 0x7C00U);
+    }
+    return static_cast<std::uint16_t>(sign
+        | (static_cast<std::uint32_t>(exp) << 10)
+        | (mant >> 13));
+}
+
+} // namespace
 
 const Q8_0& Q8_0::instance() noexcept {
     static const Q8_0 inst;
@@ -40,6 +74,36 @@ std::string_view Q8_0::gpuMatmulGemmModule() const noexcept {
 
 std::size_t Q8_0::gpuMatmulGemmMTile() const noexcept {
     return kGemmMTile;
+}
+
+void Q8_0::quantizeRow(const float* src, std::size_t K, void* dst) noexcept {
+    // K must be a multiple of 32 — caller guarantees this (typical rows
+    // are 2560/2048/512 all divisible by 32). If K is not aligned the
+    // trailing elements would be silently ignored; instead just clamp
+    // to a whole-block count here.
+    const std::size_t nblocks = K / kBlockElements;
+    auto* dstBytes = static_cast<std::uint8_t*>(dst);
+
+    for (std::size_t b = 0; b < nblocks; ++b) {
+        const float* srcBlock = src + b * kBlockElements;
+        std::uint8_t* dstBlock = dstBytes + b * kBlockBytes;
+
+        float absMax = 0.0F;
+        for (std::size_t i = 0; i < kBlockElements; ++i) {
+            absMax = std::max(absMax, std::fabs(srcBlock[i]));
+        }
+        const float scale = (absMax > 0.0F) ? (absMax / 127.0F) : 0.0F;
+        const std::uint16_t dHalf = floatToHalfBits(scale);
+        std::memcpy(dstBlock, &dHalf, 2);
+
+        const float invScale = (scale > 0.0F) ? (1.0F / scale) : 0.0F;
+        auto* qs = reinterpret_cast<std::int8_t*>(dstBlock + 2);
+        for (std::size_t i = 0; i < kBlockElements; ++i) {
+            const int q  = static_cast<int>(std::lround(srcBlock[i] * invScale));
+            const int qc = std::clamp(q, -127, 127);
+            qs[i] = static_cast<std::int8_t>(qc);
+        }
+    }
 }
 
 void Q8_0::dequantToF32(const void* src,

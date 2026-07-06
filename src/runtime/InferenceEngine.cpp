@@ -185,8 +185,16 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     // projections can dispatch as one matmul. The class no-ops when
     // MIMIRMIND_DISABLE_FUSED_QKV is set or when a block doesn't
     // qualify (missing tensors, mismatched types).
+    // Gemma 4 E4B (and any future arch with shared-KV layers) skips
+    // fusion for the trailing reuse-KV blocks. E4B also mixes attn_q
+    // (Q6_K/Q4_K) with attn_k (Q5_K) per own-KV block, which would kill
+    // fusion entirely — the requant-to-Q8_0 path rescues those blocks
+    // at load time (quality neutral-to-better, ~70 MiB overhead on E4B).
+    const bool requantToQ8_0 =
+        (_config.architecture == "gemma4") && (_config.sharedKvLayers > 0);
     _fusedQkv = std::make_unique<model::FusedQkvWeights>(
-        *_weights, _allocator, _config.blockCount);
+        *_weights, _allocator, _config.blockCount,
+        _config.sharedKvLayers, requantToQ8_0);
 
     // M5i.D: Load-time self-tests of the GPU compute path. selfTest
     // verifies every non-matmul GPU op against a CPU reference on a

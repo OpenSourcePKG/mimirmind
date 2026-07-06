@@ -31,6 +31,16 @@ public:
                       std::size_t nelements,
                       float*      dst) const override;
 
+    /// Quantize `K` f32 values from `src` into Q8_0-encoded bytes at
+    /// `dst`. `K` must be a multiple of 32. Writes `(K/32) * 34` bytes.
+    /// Per-block: max-abs symmetric scaling into int8 with an fp16 d,
+    /// matches ggml_quantize_row_q8_0. Used by the E4B backend to lift
+    /// BF16 `per_layer_model_proj` and by `FusedQkvWeights` to
+    /// requantize mismatched attn_q/k/v tensors so QKV fusion applies.
+    static void quantizeRow(const float* src,
+                            std::size_t  K,
+                            void*        dst) noexcept;
+
 private:
     Q8_0() = default;
 

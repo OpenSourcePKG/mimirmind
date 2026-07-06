@@ -47,9 +47,25 @@ public:
     /// don't qualify (missing tensors, mismatched types, env var
     /// disabled) get no allocation and `find()` returns nullptr for
     /// them.
+    ///
+    /// `sharedKvLayers` is the trailing count of blocks that reuse K/V
+    /// from an earlier layer (Gemma 4 E4B = 18). Those blocks never
+    /// touch the K/V projection at inference time and therefore don't
+    /// need a fused-QKV entry. Default 0 = every block owns K/V (the
+    /// pre-existing Qwen / non-E4B-Gemma-4 case).
+    ///
+    /// When `requantMismatchToQ8_0` is true, own-KV blocks whose
+    /// attn_q/k/v types don't match get rescued: all three tensors are
+    /// dequantized to f32 and re-quantized to Q8_0 in a new USM
+    /// allocation, and the fused block is emitted as Q8_0. Quality is
+    /// neutral-to-better (Q8_0 outranks Q4_K/Q5_K/Q6_K on per-element
+    /// error). Enables Q8_0 GEMM v2 dispatch on prefill even when the
+    /// underlying model was quantized to K-quants.
     FusedQkvWeights(const WeightsMap&      weights,
                     runtime::UsmAllocator& allocator,
-                    std::size_t            numBlocks);
+                    std::size_t            numBlocks,
+                    std::size_t            sharedKvLayers        = 0,
+                    bool                   requantMismatchToQ8_0 = false);
 
     ~FusedQkvWeights();
 
@@ -72,6 +88,7 @@ public:
     [[nodiscard]] std::size_t fusedCount()   const noexcept { return _fusedCount; }
     [[nodiscard]] std::size_t skippedCount() const noexcept { return _skippedCount; }
     [[nodiscard]] std::size_t totalUsmBytes() const noexcept { return _totalBytes; }
+    [[nodiscard]] std::size_t requantCount() const noexcept { return _requantCount; }
 
 private:
     runtime::UsmAllocator&              _alloc;
@@ -81,6 +98,7 @@ private:
     std::size_t                         _fusedCount{0};
     std::size_t                         _skippedCount{0};
     std::size_t                         _totalBytes{0};
+    std::size_t                         _requantCount{0};
 };
 
 } // namespace mimirmind::model

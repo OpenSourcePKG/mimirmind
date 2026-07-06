@@ -1,5 +1,8 @@
 #include "model/FusedQkvWeights.hpp"
 
+#include "compute/QuantType.hpp"
+#include "compute/QuantTypeRegistry.hpp"
+#include "compute/quant/Q8_0.hpp"
 #include "model/GgufReader.hpp"
 #include "model/WeightsMap.hpp"
 #include "runtime/Log.hpp"
@@ -8,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
+#include <vector>
 
 namespace mimirmind::model {
 
@@ -38,11 +42,19 @@ std::size_t nCols(const GgufTensor& t) noexcept {
 
 FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
                                  runtime::UsmAllocator& allocator,
-                                 std::size_t            numBlocks)
+                                 std::size_t            numBlocks,
+                                 std::size_t            sharedKvLayers,
+                                 bool                   requantMismatchToQ8_0)
     : _alloc{allocator}
 {
     _blocks.resize(numBlocks);
     _disabledByEnv = ::mimirmind::model::disabledByEnv();
+
+    // Layers past this index reuse an earlier layer's K/V and never
+    // touch the QKV projection, so fusion is a no-op for them.
+    const std::size_t ownKvEnd = sharedKvLayers < numBlocks
+                                     ? numBlocks - sharedKvLayers
+                                     : numBlocks;
 
     if (_disabledByEnv) {
         MM_LOG_INFO("qkvfuse",
@@ -62,6 +74,13 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
     std::size_t Nmismatch       = 0;
 
     for (std::size_t b = 0; b < numBlocks; ++b) {
+        // Shared-KV layers don't project K/V, so fusion is pointless
+        // for them — attention will read from the source layer's cache.
+        if (b >= ownKvEnd) {
+            ++skippedCount;
+            continue;
+        }
+
         const auto* qT = weights.findBlock(b, "attn_q.weight");
         const auto* kT = weights.findBlock(b, "attn_k.weight");
         const auto* vT = weights.findBlock(b, "attn_v.weight");
@@ -79,7 +98,26 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
             ++missingQ_or_K;
             continue;
         }
-        if (qT->type != kT->type) {
+
+        const bool hasV = (vT != nullptr);
+        const bool qkMismatch = (qT->type != kT->type);
+        const bool qvMismatch = hasV && (vT->type != qT->type);
+        const bool typeMismatch = qkMismatch || qvMismatch;
+
+        // Requant path: dequant Q/K/V to f32, then quantize each to
+        // Q8_0. Only kicks in when the caller opts in AND every source
+        // type has a registered dequant path. Otherwise fall through
+        // to the pre-existing skip behaviour so old models keep the
+        // same log output.
+        const auto* qQt = compute::quantType(qT->type);
+        const auto* kQt = compute::quantType(kT->type);
+        const auto* vQt = hasV ? compute::quantType(vT->type) : nullptr;
+        const bool haveDequantAll =
+            (qQt != nullptr) && (kQt != nullptr) && (!hasV || vQt != nullptr);
+        const bool doRequant =
+            requantMismatchToQ8_0 && typeMismatch && haveDequantAll;
+
+        if (!doRequant && qkMismatch) {
             MM_LOG_WARN("qkvfuse",
                         "block {} skipped: attn_q.type={} != attn_k.type={}",
                         b, typeName(qT), typeName(kT));
@@ -87,8 +125,7 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
             ++typeMismatch_QK;
             continue;
         }
-        const bool hasV = (vT != nullptr);
-        if (hasV && vT->type != qT->type) {
+        if (!doRequant && qvMismatch) {
             MM_LOG_WARN("qkvfuse",
                         "block {} skipped: attn_v.type={} != attn_q.type={}",
                         b, typeName(vT), typeName(qT));
@@ -124,22 +161,78 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
             continue;
         }
 
-        const std::size_t bytes =
-            qT->nbytes + kT->nbytes + (hasV ? vT->nbytes : 0);
+        GgmlType fusedType = qT->type;
+        std::size_t bytes = 0;
+        void* dst = nullptr;
 
-        void* dst = allocator.allocate(bytes);
-        std::uint8_t* dstBytes = static_cast<std::uint8_t*>(dst);
+        if (doRequant) {
+            // Requantize all three tensors row-by-row into Q8_0. Row K
+            // must be a Q8_0 block multiple (32) — every attention shape
+            // we care about (2560, 2048, 4096, 512, 1024) satisfies this.
+            if (Kq % 32 != 0) {
+                MM_LOG_WARN("qkvfuse",
+                            "block {} skipped: K={} not divisible by 32 "
+                            "(Q8_0 requant impossible)", b, Kq);
+                ++skippedCount;
+                continue;
+            }
+            const std::size_t rowBytesQ8 = (Kq / 32) * 34;
+            const std::size_t qBytes = Nq * rowBytesQ8;
+            const std::size_t kBytes = Nk * rowBytesQ8;
+            const std::size_t vBytes = hasV ? Nv * rowBytesQ8 : 0;
+            bytes = qBytes + kBytes + vBytes;
 
-        std::memcpy(dstBytes,                        qT->usmPtr, qT->nbytes);
-        std::memcpy(dstBytes + qT->nbytes,           kT->usmPtr, kT->nbytes);
-        if (hasV) {
-            std::memcpy(dstBytes + qT->nbytes + kT->nbytes,
-                        vT->usmPtr, vT->nbytes);
+            dst = allocator.allocate(bytes);
+            auto* dstBytes = static_cast<std::uint8_t*>(dst);
+
+            std::vector<float> rowF32(Kq);
+            auto requantRows = [&](const GgufTensor& src,
+                                   const compute::QuantType& qt,
+                                   std::size_t rowCount,
+                                   std::uint8_t* out) {
+                const std::size_t srcRowBytes =
+                    qt.blockElements() > 1
+                        ? (Kq / qt.blockElements()) * qt.blockBytes()
+                        : Kq * qt.blockBytes();
+                const auto* base = static_cast<const std::uint8_t*>(src.usmPtr);
+                for (std::size_t n = 0; n < rowCount; ++n) {
+                    qt.dequantToF32(base + n * srcRowBytes, Kq, rowF32.data());
+                    compute::quant::Q8_0::quantizeRow(
+                        rowF32.data(), Kq, out + n * rowBytesQ8);
+                }
+            };
+
+            requantRows(*qT, *qQt, Nq, dstBytes);
+            requantRows(*kT, *kQt, Nk, dstBytes + qBytes);
+            if (hasV) {
+                requantRows(*vT, *vQt, Nv, dstBytes + qBytes + kBytes);
+            }
+            fusedType = GgmlType::Q8_0;
+            ++_requantCount;
+
+            MM_LOG_INFO("qkvfuse",
+                        "block {} requantized: attn_q={} attn_k={} attn_v={} "
+                        "→ Q8_0 fused ({:.2f} MiB)",
+                        b, typeName(qT), typeName(kT),
+                        hasV ? typeName(vT) : "-",
+                        static_cast<double>(bytes) / (1024.0 * 1024.0));
+        } else {
+            // Fast path (types already match): raw memcpy of the source
+            // bytes into a single contiguous buffer.
+            bytes = qT->nbytes + kT->nbytes + (hasV ? vT->nbytes : 0);
+            dst = allocator.allocate(bytes);
+            auto* dstBytes = static_cast<std::uint8_t*>(dst);
+            std::memcpy(dstBytes,                        qT->usmPtr, qT->nbytes);
+            std::memcpy(dstBytes + qT->nbytes,           kT->usmPtr, kT->nbytes);
+            if (hasV) {
+                std::memcpy(dstBytes + qT->nbytes + kT->nbytes,
+                            vT->usmPtr, vT->nbytes);
+            }
         }
 
         Block blk;
         blk.usmPtr = dst;
-        blk.type   = qT->type;
+        blk.type   = fusedType;
         blk.Nq     = Nq;
         blk.Nkv    = Nk;
         blk.K      = Kq;
@@ -154,9 +247,9 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
     _anyFused = (fusedCount > 0);
 
     MM_LOG_INFO("qkvfuse",
-                "FusedQkvWeights: {} block(s) fused ({} skipped), "
-                "{} MiB extra USM",
-                fusedCount, skippedCount,
+                "FusedQkvWeights: {} block(s) fused ({} skipped, "
+                "{} requantized to Q8_0), {} MiB extra USM",
+                fusedCount, skippedCount, _requantCount,
                 (totalBytes + (1ULL << 20) - 1) >> 20);
     if (skippedCount > 0) {
         MM_LOG_INFO("qkvfuse",
