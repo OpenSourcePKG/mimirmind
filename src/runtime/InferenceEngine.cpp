@@ -490,6 +490,18 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                     "MIMIRMIND_PARITY_DUMP={} — prefill token count={}, "
                     "first {}: [{}]",
                     dumpPrefix, promptIds.size(), nShow, idsCsv);
+        // dumpStage() sync-flushes the GPU and writes T*d_model*4 bytes per
+        // stage. On a 42-block E4B with ~6 stages/block this scales to
+        // multi-GB per request; a 3431-token prefill has been observed to
+        // stall for >30 minutes with the flag left on in production.
+        if (prefillCount > 256) {
+            MM_LOG_WARN("parity",
+                        "MIMIRMIND_PARITY_DUMP is set with prefillCount={} — "
+                        "expect multi-GB synchronous disk writes and severely "
+                        "degraded prefill throughput. Unset the env var for "
+                        "production traffic.",
+                        prefillCount);
+        }
     }
 
     std::vector<std::int32_t> generated;
