@@ -1,11 +1,34 @@
 #pragma once
 
+#include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace mimirmind::runtime {
 
 class UsmAllocator;
+
+/**
+ * Element dtype for K/V storage. Baseline F32 today; FP16 lands in
+ * M10.2 Phase 0 as the 2× bandwidth/RAM win before Q8_0 (M10.2.1) is
+ * layered on top. See Synaipse
+ * `Memory/mimirmind/todos/m10-2-neg1-kv-cache-dtype-layer-design.md`
+ * for the full migration plan.
+ */
+enum class KvDtype : std::uint8_t {
+    F32  = 0,   // 4 B per element — baseline.
+    FP16 = 1,   // 2 B per element — Phase 0 target.
+    // Q8_0 kommt in M10.2.1
+};
+
+[[nodiscard]] constexpr std::size_t kvElementBytes(KvDtype d) noexcept {
+    switch (d) {
+        case KvDtype::F32:  return 4;
+        case KvDtype::FP16: return 2;
+    }
+    return 0;  // unreachable; enum is closed.
+}
 
 /**
  * Per-layer rolling K/V cache for the autoregressive decoder.
@@ -45,14 +68,16 @@ public:
     KvCache(UsmAllocator&            alloc,
             std::size_t              maxSeq,
             std::vector<std::size_t> kvDimPerLayer,
-            std::vector<std::size_t> kvSourceLayer = {});
+            std::vector<std::size_t> kvSourceLayer = {},
+            KvDtype                  dtype = KvDtype::F32);
 
     /// Uniform (Qwen/Llama) convenience: fills every layer with the same dim.
     KvCache(UsmAllocator& alloc,
             std::size_t   nLayers,
             std::size_t   maxSeq,
             std::size_t   nKvHeads,
-            std::size_t   headDim);
+            std::size_t   headDim,
+            KvDtype       dtype = KvDtype::F32);
 
     ~KvCache();
 
@@ -62,15 +87,42 @@ public:
     KvCache& operator=(KvCache&&)      = delete;
 
     /// Pointer to the next free K slot for `layer`. Caller will write T
-    /// rows starting here, T <= maxSeq - length().
-    [[nodiscard]] float* writeSlotK(std::size_t layer) noexcept;
-    [[nodiscard]] float* writeSlotV(std::size_t layer) noexcept;
+    /// rows starting here, T <= maxSeq - length(). Element count per
+    /// row is `kvDim(layer)`; element size is `elementBytes()`.
+    [[nodiscard]] void* writeSlotK(std::size_t layer) noexcept;
+    [[nodiscard]] void* writeSlotV(std::size_t layer) noexcept;
 
     /// Base pointer for `layer`. Attention reads from here with T_k =
     /// length() + T (the newly-written rows are physically present even
     /// before commit).
-    [[nodiscard]] const float* baseK(std::size_t layer) const noexcept;
-    [[nodiscard]] const float* baseV(std::size_t layer) const noexcept;
+    [[nodiscard]] const void* baseK(std::size_t layer) const noexcept;
+    [[nodiscard]] const void* baseV(std::size_t layer) const noexcept;
+
+    /// F32-typed convenience wrappers — asserts dtype() == F32 in dev
+    /// builds and returns the same address as the void* getters, cast
+    /// to float*. Callers that still assume F32 KV storage should use
+    /// these until they gain dtype-awareness (M10.2 Commit 5).
+    [[nodiscard]] float* writeSlotKf32(std::size_t layer) noexcept {
+        assert(_dtype == KvDtype::F32);
+        return static_cast<float*>(writeSlotK(layer));
+    }
+    [[nodiscard]] float* writeSlotVf32(std::size_t layer) noexcept {
+        assert(_dtype == KvDtype::F32);
+        return static_cast<float*>(writeSlotV(layer));
+    }
+    [[nodiscard]] const float* baseKf32(std::size_t layer) const noexcept {
+        assert(_dtype == KvDtype::F32);
+        return static_cast<const float*>(baseK(layer));
+    }
+    [[nodiscard]] const float* baseVf32(std::size_t layer) const noexcept {
+        assert(_dtype == KvDtype::F32);
+        return static_cast<const float*>(baseV(layer));
+    }
+
+    [[nodiscard]] KvDtype     dtype()        const noexcept { return _dtype; }
+    [[nodiscard]] std::size_t elementBytes() const noexcept {
+        return kvElementBytes(_dtype);
+    }
 
     void commit(std::size_t T) noexcept { _length += T; }
     void reset() noexcept                { _length = 0; }
@@ -94,6 +146,7 @@ private:
     UsmAllocator&            _alloc;
     std::size_t              _maxSeq;
     std::vector<std::size_t> _kvDim;
+    KvDtype                  _dtype{KvDtype::F32};
     /// Bytes actually owned per layer for dealloc. Aliased layers hold
     /// 0 here so the destructor skips them (their buffer belongs to the
     /// source layer).

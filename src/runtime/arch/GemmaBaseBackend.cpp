@@ -261,13 +261,13 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // rope-K's pointer indirection is Wave 3b, tracked in the ADR. The
     // const_cast is safe: KvCache backing storage is mutable USM, the
     // const on baseK/V is an API guardrail against read-path callers.
-    float* const kSlot = li.ownsKv ? cache.writeSlotK(blockIdx) : nullptr;
-    float* const vSlot = li.ownsKv ? cache.writeSlotV(blockIdx) : nullptr;
+    float* const kSlot = li.ownsKv ? cache.writeSlotKf32(blockIdx) : nullptr;
+    float* const vSlot = li.ownsKv ? cache.writeSlotVf32(blockIdx) : nullptr;
     float* const kBase = li.ownsKv
-        ? const_cast<float*>(cache.baseK(blockIdx))
+        ? const_cast<float*>(cache.baseKf32(blockIdx))
         : nullptr;
     float* const vBase = li.ownsKv
-        ? const_cast<float*>(cache.baseV(blockIdx))
+        ? const_cast<float*>(cache.baseVf32(blockIdx))
         : nullptr;
 
     // --- pre-attention RMSNorm ----------------------------------------
@@ -416,8 +416,8 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     const std::size_t slidingWindow =
         li.isSwa ? static_cast<std::size_t>(_config.slidingWindow) : 0;
     _ops.attentionAsync(qBuf,
-                        cache.baseK(li.kvSourceLayer),
-                        cache.baseV(li.kvSourceLayer),
+                        cache.baseKf32(li.kvSourceLayer),
+                        cache.baseVf32(li.kvSourceLayer),
                         T, totalLen,
                         li.nHeads, li.nKvHeads, head_dim,
                         curLen, /*scale=*/1.0F,

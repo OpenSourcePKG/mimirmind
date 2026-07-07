@@ -11,10 +11,12 @@ namespace mimirmind::runtime {
 KvCache::KvCache(UsmAllocator&            alloc,
                  std::size_t              maxSeq,
                  std::vector<std::size_t> kvDimPerLayer,
-                 std::vector<std::size_t> kvSourceLayer)
+                 std::vector<std::size_t> kvSourceLayer,
+                 KvDtype                  dtype)
     : _alloc{alloc},
       _maxSeq{maxSeq},
       _kvDim{std::move(kvDimPerLayer)},
+      _dtype{dtype},
       _kvSource{std::move(kvSourceLayer)} {
     allocateLayers();
 }
@@ -23,10 +25,12 @@ KvCache::KvCache(UsmAllocator& alloc,
                  std::size_t   nLayers,
                  std::size_t   maxSeq,
                  std::size_t   nKvHeads,
-                 std::size_t   headDim)
+                 std::size_t   headDim,
+                 KvDtype       dtype)
     : _alloc{alloc},
       _maxSeq{maxSeq},
-      _kvDim(nLayers, nKvHeads * headDim) {
+      _kvDim(nLayers, nKvHeads * headDim),
+      _dtype{dtype} {
     allocateLayers();
 }
 
@@ -42,6 +46,7 @@ void KvCache::allocateLayers() {
         for (std::size_t i = 0; i < nLayers; ++i) _kvSource[i] = i;
     }
 
+    const std::size_t elemBytes = kvElementBytes(_dtype);
     std::size_t ownedBytes  = 0;
     std::size_t savedBytes  = 0;
     std::size_t ownCount    = 0;
@@ -50,7 +55,7 @@ void KvCache::allocateLayers() {
     std::size_t maxDim = minDim;
     for (std::size_t i = 0; i < nLayers; ++i) {
         const std::size_t src = _kvSource[i];
-        const std::size_t bytes = _maxSeq * _kvDim[i] * sizeof(float);
+        const std::size_t bytes = _maxSeq * _kvDim[i] * elemBytes;
         minDim = std::min(minDim, _kvDim[i]);
         maxDim = std::max(maxDim, _kvDim[i]);
         if (src == i) {
@@ -74,13 +79,15 @@ void KvCache::allocateLayers() {
     const double savedMiB =
         static_cast<double>(savedBytes) / (1024.0 * 1024.0);
     MM_LOG_INFO("kvcache",
-                "allocated nLayers={} maxSeq={} kvDim={}{} own={} "
-                "aliased={} total {:.2f} MiB (saved {:.2f} MiB via alias)",
+                "allocated nLayers={} maxSeq={} kvDim={}{} dtype={} "
+                "own={} aliased={} total {:.2f} MiB (saved {:.2f} MiB "
+                "via alias)",
                 nLayers, _maxSeq,
                 minDim,
                 (minDim == maxDim
                      ? std::string{}
                      : std::string{".."} + std::to_string(maxDim)),
+                (_dtype == KvDtype::FP16 ? "fp16" : "f32"),
                 ownCount, aliasCount, totalMiB, savedMiB);
 }
 
@@ -92,20 +99,24 @@ KvCache::~KvCache() {
     }
 }
 
-float* KvCache::writeSlotK(std::size_t layer) noexcept {
-    return static_cast<float*>(_kBuf[layer]) + _length * _kvDim[layer];
+void* KvCache::writeSlotK(std::size_t layer) noexcept {
+    const std::size_t byteOffset =
+        _length * _kvDim[layer] * kvElementBytes(_dtype);
+    return static_cast<std::byte*>(_kBuf[layer]) + byteOffset;
 }
 
-float* KvCache::writeSlotV(std::size_t layer) noexcept {
-    return static_cast<float*>(_vBuf[layer]) + _length * _kvDim[layer];
+void* KvCache::writeSlotV(std::size_t layer) noexcept {
+    const std::size_t byteOffset =
+        _length * _kvDim[layer] * kvElementBytes(_dtype);
+    return static_cast<std::byte*>(_vBuf[layer]) + byteOffset;
 }
 
-const float* KvCache::baseK(std::size_t layer) const noexcept {
-    return static_cast<const float*>(_kBuf[layer]);
+const void* KvCache::baseK(std::size_t layer) const noexcept {
+    return _kBuf[layer];
 }
 
-const float* KvCache::baseV(std::size_t layer) const noexcept {
-    return static_cast<const float*>(_vBuf[layer]);
+const void* KvCache::baseV(std::size_t layer) const noexcept {
+    return _vBuf[layer];
 }
 
 } // namespace mimirmind::runtime

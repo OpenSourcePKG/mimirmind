@@ -131,13 +131,13 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
         }
     };
 
-    float* kSlot = cache.writeSlotK(blockIdx);
-    float* vSlot = cache.writeSlotV(blockIdx);
+    float* kSlot = cache.writeSlotKf32(blockIdx);
+    float* vSlot = cache.writeSlotVf32(blockIdx);
     // M-CLR.2 Wave 3: qkv_split receives the cache BASE + curLen so its
     // pointer arg is stable across replays. Other kernels here still use
     // the per-token slot; refactoring rope-K is Wave 3b per the ADR.
-    float* kBase = const_cast<float*>(cache.baseK(blockIdx));
-    float* vBase = const_cast<float*>(cache.baseV(blockIdx));
+    float* kBase = const_cast<float*>(cache.baseKf32(blockIdx));
+    float* vBase = const_cast<float*>(cache.baseVf32(blockIdx));
 
     // M5i.B: Fused Q+K+V — single matmul into a staging buffer, then a
     // scatter kernel routes the sub-ranges into qBuf/kSlot/vSlot. Bias
@@ -202,8 +202,8 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     const float attnScale = 1.0F /
         std::sqrt(static_cast<float>(head_dim));
     _ops.attentionAsync(qBuf,
-                        cache.baseK(blockIdx),
-                        cache.baseV(blockIdx),
+                        cache.baseKf32(blockIdx),
+                        cache.baseVf32(blockIdx),
                         T, totalLen,
                         _config.headCount, _config.headCountKv, head_dim,
                         curLen, attnScale,
