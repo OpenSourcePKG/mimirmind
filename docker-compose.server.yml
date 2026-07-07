@@ -137,6 +137,13 @@ services:
             #   DISABLE_FUSED_QKV=1  → 3-matmul UnorderedScope-Pfad zurück,
             #                          FusedQkvWeights baut keine Blocks auf.
             #   DISABLE_MOE_GROUP=1  → per-Token MoE-Loop zurück (T>1).
+            #   DISABLE_FLASH_PREFILL=1
+            #                        → M5i.J-Prefill-Rollback auf variant (a)
+            #                          `attention.cl`. Prefill wird linear in
+            #                          T_k und für T_q ≥ 1500 praktisch
+            #                          unbenutzbar (Minuten-Wall-Clock). Nur
+            #                          für Diagnose sinnvoll — bei Verdacht
+            #                          auf FA-Prefill-Numerik-Regression.
             #   GPU_CLOCK_PIN=<val>  → Cap pinnen, P-controller tick aus.
             #                          Werte: rp0 (HW max), rpn (HW min ~800),
             #                          numerisch (MHz, geklammert an [RPn,RP0]).
@@ -151,6 +158,7 @@ services:
             MIMIRMIND_GEMM_MIN_M:        ${MIMIRMIND_GEMM_MIN_M:-}
             MIMIRMIND_DISABLE_FUSED_QKV: ${MIMIRMIND_DISABLE_FUSED_QKV:-}
             MIMIRMIND_DISABLE_MOE_GROUP: ${MIMIRMIND_DISABLE_MOE_GROUP:-}
+            MIMIRMIND_DISABLE_FLASH_PREFILL: ${MIMIRMIND_DISABLE_FLASH_PREFILL:-}
             MIMIRMIND_GPU_CLOCK_PIN:     ${MIMIRMIND_GPU_CLOCK_PIN:-rp0}
             MIMIRMIND_DISABLE_DP4A:      ${MIMIRMIND_DISABLE_DP4A:-}
             MIMIRMIND_FORCE_DP4A:        ${MIMIRMIND_FORCE_DP4A:-}
