@@ -244,6 +244,14 @@ public:
         return _maxContextTokens;
     }
 
+    /// M10.2 Phase 0 — configure KV cache element dtype. Same lifecycle
+    /// caveat as setMaxContextTokens(): call once before the first
+    /// generate() (i.e. before ensureCapacity() lazy-constructs the
+    /// KvCache). Changing the value after the cache is built is a no-op
+    /// until the cache is destroyed and rebuilt.
+    void setKvDtype(KvDtype dtype) noexcept { _kvDtype = dtype; }
+    [[nodiscard]] KvDtype kvDtype() const noexcept { return _kvDtype; }
+
     /// Install (or remove with nullptr) the thermal guard the decode
     /// loop should consult. The engine does not own the guard. If set,
     /// generate() will call checkAdmission() before prefill (which may
@@ -373,6 +381,7 @@ private:
     UsmHandle                          _logitsH;
     UsmHandle                          _logitsScH;
     std::size_t                        _maxContextTokens{8192}; // see setMaxContextTokens
+    KvDtype                            _kvDtype{KvDtype::F32};    // see setKvDtype
     std::size_t                        _cacheMaxT    {0};   // max prompt-chunk scratch was sized for
     std::size_t                        _cacheVocabLm {0};   // lm-head vocab the logits buf fits
     std::vector<std::int32_t>          _cachedTokens;

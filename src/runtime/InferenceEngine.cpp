@@ -243,11 +243,14 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
         _kvCache = std::make_unique<KvCache>(
             _allocator, _maxContextTokens,
             _backend->kvDimPerLayer(),
-            _backend->kvSourceLayerPerLayer());
+            _backend->kvSourceLayerPerLayer(),
+            _kvDtype);
         MM_LOG_INFO("kvcache",
-                    "pre-allocated for {} tokens (set via "
-                    "MIMIRMIND_MAX_CONTEXT_TOKENS)",
-                    _maxContextTokens);
+                    "pre-allocated for {} tokens dtype={} "
+                    "(set via MIMIRMIND_MAX_CONTEXT_TOKENS / "
+                    "MIMIRMIND_KV_DTYPE)",
+                    _maxContextTokens,
+                    (_kvDtype == KvDtype::FP16 ? "fp16" : "f32"));
     }
 
     // Hard cap: a request that doesn't fit gets a clear error rather

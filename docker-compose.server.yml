@@ -127,6 +127,20 @@ services:
             #     KV-RAM ≈ tokens × 430 KiB (Gemma 4 26B).
             MIMIRMIND_MAX_CONTEXT_TOKENS: ${MIMIRMIND_MAX_CONTEXT_TOKENS:-8192}
 
+            # M10.2 Phase 0 — KV-Cache Element-dtype.
+            #   f32 (default)  → 4 B pro Element, bit-identisch zu vor-M10.2
+            #   fp16           → 2 B pro Element. 2× Bandwidth-Win auf
+            #                     Attention-Reads, 2× RAM-Ersparnis, ~3-5 %
+            #                     Decode-Speedup laut Roadmap-Doc. Parity
+            #                     vs F32 durch FP16-Rundungsfehler
+            #                     (~1e-3 pro Load, kohärent auf Response-
+            #                     Ebene). Kernels müssen dtype unterstützen
+            #                     (Commit 3+4 im M10.2.-1 Ticket) — bevor
+            #                     dieser Toggle live geht, muss der
+            #                     FP16-Kernel-Support gelandet und
+            #                     Parity-getestet sein.
+            MIMIRMIND_KV_DTYPE:          ${MIMIRMIND_KV_DTYPE:-}
+
             # M5i Rollback-/Diagnose-Env-Vars — normalerweise leer (Default-
             # Pfad aktiv). Bei Verdacht auf Regression pro Env-Var einzeln
             # setzen und Container neu starten, ohne Rebuild.

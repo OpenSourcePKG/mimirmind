@@ -1151,6 +1151,28 @@ int runServe(const CliArgs& args) {
         }
     }
 
+    // M10.2 Phase 0 — KV cache element dtype. Default F32 (bit-identical
+    // to pre-M10.2). `fp16` opts in to the 2x bandwidth/RAM win; other
+    // values log a warning and fall back to F32. Must be set before the
+    // first generate() so the lazy KvCache construction picks it up.
+    if (const char* env = std::getenv("MIMIRMIND_KV_DTYPE")) {
+        const std::string_view v{env};
+        if (v == "fp16") {
+            engine.setKvDtype(mimirmind::runtime::KvDtype::FP16);
+        } else if (v == "f32" || v.empty()) {
+            engine.setKvDtype(mimirmind::runtime::KvDtype::F32);
+        } else {
+            MM_LOG_WARN("main",
+                        "MIMIRMIND_KV_DTYPE='{}' unrecognised — falling "
+                        "back to f32", env);
+        }
+    }
+    MM_LOG_INFO("main",
+                "KV cache dtype: {} ({} B/elem)",
+                (engine.kvDtype() == mimirmind::runtime::KvDtype::FP16
+                     ? "fp16" : "f32"),
+                mimirmind::runtime::kvElementBytes(engine.kvDtype()));
+
     // M9.11.1 — Optional speculative-decoding draft engine. Opt-in via
     // MIMIRMIND_DRAFT_MODEL_PATH. Fully independent InferenceEngine so
     // the target's L0 context / autotune / KV cache stay untouched;

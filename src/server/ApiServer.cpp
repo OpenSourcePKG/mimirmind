@@ -698,6 +698,10 @@ struct ApiServer::Impl {
         json kvCache = {
             {"max_context_tokens", engine.maxContextTokens()},
             {"layer_count",        modelCfg.blockCount},
+            {"dtype",              (engine.kvDtype() ==
+                                        runtime::KvDtype::FP16
+                                    ? "fp16" : "f32")},
+            {"element_bytes",      runtime::kvElementBytes(engine.kvDtype())},
         };
 
         // Level-Zero device descriptor
