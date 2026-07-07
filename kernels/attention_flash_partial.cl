@@ -72,7 +72,8 @@ __kernel void attention_flash_partial(
     const int             nKvHeads,
     const int             headDim,
     __global const int*   curLenPtr,
-    const float           scale)
+    const float           scale,
+    const int             slidingWindow)
 {
     const int hq  = (int)get_group_id(0);
     const int kt  = (int)get_group_id(1);
@@ -83,21 +84,28 @@ __kernel void attention_flash_partial(
     const int positionOffset = curLenPtr[0];
 
     // Decode mode: T_q == 1. The single query position is at absPos =
-    // positionOffset, attending to keys [0, positionOffset + 1).
+    // positionOffset, attending to keys [kMin, positionOffset + 1) where
+    // kMin = max(0, positionOffset + 1 - slidingWindow) for SWA layers
+    // (0 for Full-Attention / non-SWA).
     const int kMax    = positionOffset + 1;
+    const int kMin    = (slidingWindow > 0 && kMax > slidingWindow)
+                          ? (kMax - slidingWindow) : 0;
     const int nKTiles = (kMax + ATTN_FLASH_KTILE - 1) / ATTN_FLASH_KTILE;
-    const int kStart  = kt * ATTN_FLASH_KTILE;
-    const int kEnd    = (kStart + ATTN_FLASH_KTILE < kMax)
-                          ? (kStart + ATTN_FLASH_KTILE) : kMax;
+    const int kStartRaw = kt * ATTN_FLASH_KTILE;
+    // Clamp low boundary against sliding-window.
+    const int kStart  = (kStartRaw > kMin) ? kStartRaw : kMin;
+    const int kEndRaw = kStartRaw + ATTN_FLASH_KTILE;
+    const int kEnd    = (kEndRaw < kMax) ? kEndRaw : kMax;
 
     __global float* mloPtr =
         partialMlo + ((size_t)hq * (size_t)nKTiles + (size_t)kt) *
                      (size_t)(2 + headDim);
 
-    // Past the causal mask — emit a neutral partial so the merge sees
-    // no contribution. exp(-inf - mFinal) = 0 → β_t * l_t and β_t * o_t
-    // both vanish. l = 0 and o = 0 are written for hygiene.
-    if (kStart >= kMax) {
+    // Past the causal mask OR entirely below the sliding-window low
+    // bound — emit a neutral partial so the merge sees no contribution.
+    // exp(-inf - mFinal) = 0 → β_t * l_t and β_t * o_t both vanish.
+    // l = 0 and o = 0 are written for hygiene.
+    if (kStart >= kEnd) {
         if (lid == 0) {
             mloPtr[0] = -INFINITY;
             mloPtr[1] = 0.0f;

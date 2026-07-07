@@ -8,7 +8,14 @@
 //   out: [T_q, nHeads,    headDim]
 //
 // Causal mask: query position pq attends to key positions
-//   [0, min(positionOffset + pq + 1, T_k))
+//   [kMin, min(positionOffset + pq + 1, T_k))
+// where
+//   kMax = positionOffset + pq + 1
+//   kMin = (slidingWindow > 0 && kMax > slidingWindow)
+//            ? (kMax - slidingWindow) : 0
+// so `slidingWindow == 0` degenerates to pure causal (all past keys).
+// `slidingWindow > 0` matches Gemma-family SWA layers: each query sees
+// only the last `slidingWindow` keys of its causal prefix.
 //
 // GQA: query head hq reads from KV head hkv = (hq * nKvHeads) / nHeads.
 //
@@ -62,7 +69,8 @@ __kernel void attention(
     const int             nKvHeads,
     const int             headDim,
     __global const int*   curLenPtr,
-    const float           scale)
+    const float           scale,
+    const int             slidingWindow)
 {
     const int hq  = (int)get_group_id(0);
     const int pq  = (int)get_group_id(1);
@@ -74,6 +82,15 @@ __kernel void attention(
     const int positionOffset = curLenPtr[0];
     const int absPos        = positionOffset + pq;
     const int kMax          = absPos + 1;
+    // Sliding-window low bound. Zero means "no window" (Full-Attention
+    // or non-SWA architectures).
+    const int kMin          = (slidingWindow > 0 && kMax > slidingWindow)
+                                ? (kMax - slidingWindow) : 0;
+    // scores[] is indexed by (kk - kMin) so the SLM footprint stays at
+    // slidingWindow floats — but we keep the [ATTN_MAX_TK] allocation
+    // to avoid a variable-length local; indexing writes/reads to
+    // scores[kk - kMin] instead of scores[kk] compared to the pre-SWA
+    // version.
 
     __global const float* qVec = q   + pq * qStride + hq * headDim;
     __global       float* oVec = out + pq * qStride + hq * headDim;
@@ -83,30 +100,30 @@ __kernel void attention(
     // -- Pass 1 — Q·K dot products, scaled. ---------------------------
     // Stripe k-positions across the 16-wide subgroup. Inner loop over
     // headDim stays in registers.
-    for (int kk = lid; kk < kMax; kk += ATTN_LOCAL) {
+    for (int kk = kMin + lid; kk < kMax; kk += ATTN_LOCAL) {
         __global const float* kVec = k + kk * kvStride + hkv * headDim;
         float acc = 0.0f;
         for (int d = 0; d < headDim; ++d) {
             acc += qVec[d] * kVec[d];
         }
-        scores[kk] = acc * scale;
+        scores[kk - kMin] = acc * scale;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // -- Pass 2 — stable softmax over [0, kMax). ----------------------
+    // -- Pass 2 — stable softmax over [kMin, kMax). -------------------
     // 2a) max-reduction. Per-thread partial then subgroup_reduce_max.
     float mPart = -INFINITY;
-    for (int kk = lid; kk < kMax; kk += ATTN_LOCAL) {
-        const float s = scores[kk];
+    for (int kk = kMin + lid; kk < kMax; kk += ATTN_LOCAL) {
+        const float s = scores[kk - kMin];
         if (s > mPart) mPart = s;
     }
     const float maxScore = sub_group_reduce_max(mPart);
 
     // 2b) replace scores with exp(score - max), accumulate sum.
     float lPart = 0.0f;
-    for (int kk = lid; kk < kMax; kk += ATTN_LOCAL) {
-        const float e = exp(scores[kk] - maxScore);
-        scores[kk] = e;
+    for (int kk = kMin + lid; kk < kMax; kk += ATTN_LOCAL) {
+        const float e = exp(scores[kk - kMin] - maxScore);
+        scores[kk - kMin] = e;
         lPart += e;
     }
     const float sumExp = sub_group_reduce_add(lPart);
@@ -114,13 +131,13 @@ __kernel void attention(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // -- Pass 3 — out[d] = (sum_kk softmax_unnorm[kk] * v[kk][d]) / sum.
-    // Stripe d across threads. Each thread sweeps all kMax positions to
-    // pick up the V column.
+    // Stripe d across threads. Each thread sweeps [kMin, kMax) to pick
+    // up the V column.
     for (int d = lid; d < headDim; d += ATTN_LOCAL) {
         float acc = 0.0f;
-        for (int kk = 0; kk < kMax; ++kk) {
+        for (int kk = kMin; kk < kMax; ++kk) {
             __global const float* vVec = v + kk * kvStride + hkv * headDim;
-            acc += scores[kk] * vVec[d];
+            acc += scores[kk - kMin] * vVec[d];
         }
         oVec[d] = acc * invSum;
     }

@@ -233,8 +233,15 @@ public:
     ///   out [T_q, nHeads,    headDim]
     /// scale is applied to Q·K before softmax (Qwen passes
     /// 1/sqrt(headDim); Gemma 4 passes 1.0 since it pre-scaled Q nowhere
-    /// — see backend). Throws if T_k > kAttentionMaxTk (8192) or if
-    /// nHeads is not a positive multiple of nKvHeads.
+    /// — see backend).
+    ///
+    /// `slidingWindow == 0` (default) means pure causal attention. A
+    /// positive value clamps each query's K-range to the last
+    /// `slidingWindow` causal keys — used by Gemma-family SWA layers
+    /// (Gemma 4 sw=512). Non-SWA architectures (Qwen 2.5) pass 0.
+    ///
+    /// Throws if T_k > kAttentionMaxTk (8192) or if nHeads is not a
+    /// positive multiple of nKvHeads.
     void attentionAsync(const float* q,
                         const float* k,
                         const float* v,
@@ -245,7 +252,8 @@ public:
                         std::size_t  headDim,
                         std::size_t  positionOffset,
                         float        scale,
-                        float*       out);
+                        float*       out,
+                        std::size_t  slidingWindow = 0);
 
     /// Compile-time bound on T_k matching ATTN_MAX_TK in attention.cl.
     /// Exposed so callers (and the engine config validator) can check
@@ -422,7 +430,8 @@ private:
                              std::size_t  headDim,
                              std::size_t  positionOffset,
                              float        scale,
-                             float*       out);
+                             float*       out,
+                             std::size_t  slidingWindow);
     void attentionPrefillFlashAsync(const float* q,
                                     const float* k,
                                     const float* v,
@@ -432,7 +441,8 @@ private:
                                     std::size_t  headDim,
                                     std::size_t  positionOffset,
                                     float        scale,
-                                    float*       out);
+                                    float*       out,
+                                    std::size_t  slidingWindow);
     void attentionDecodeFlashAsync(const float* q,
                                    const float* k,
                                    const float* v,
@@ -442,7 +452,8 @@ private:
                                    std::size_t  headDim,
                                    std::size_t  positionOffset,
                                    float        scale,
-                                   float*       out);
+                                   float*       out,
+                                   std::size_t  slidingWindow);
 };
 
 } // namespace mimirmind::compute

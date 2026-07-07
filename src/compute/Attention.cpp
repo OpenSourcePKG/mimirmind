@@ -1,10 +1,10 @@
 #include "compute/Attention.hpp"
 
-#include "compute/Softmax.hpp"
 #include "runtime/Log.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace mimirmind::compute {
@@ -19,7 +19,8 @@ void multiHeadAttention(const float* q,
                         std::size_t  headDim,
                         std::size_t  positionOffset,
                         float*       scratch,
-                        float*       out) {
+                        float*       out,
+                        std::size_t  slidingWindow) {
     if (nKvHeads == 0 || nHeads == 0 || nHeads % nKvHeads != 0) {
         throw std::runtime_error(
             "attention: nHeads must be a positive multiple of nKvHeads");
@@ -35,10 +36,13 @@ void multiHeadAttention(const float* q,
         for (std::size_t p = 0; p < T_q; ++p) {
             const std::size_t absPos = positionOffset + p;
             const std::size_t kMax   = std::min(absPos + 1, T_k);
+            const std::size_t kMin   =
+                (slidingWindow > 0 && kMax > slidingWindow)
+                    ? (kMax - slidingWindow) : 0;
 
             const float* qVec = q + p * qStride + hq * headDim;
 
-            for (std::size_t kk = 0; kk < kMax; ++kk) {
+            for (std::size_t kk = kMin; kk < kMax; ++kk) {
                 const float* kVec = k + kk * kvStride + hkv * headDim;
                 double acc = 0.0;
                 for (std::size_t d = 0; d < headDim; ++d) {
@@ -51,13 +55,29 @@ void multiHeadAttention(const float* q,
                 scratch[kk] = 0.0F;
             }
 
-            const std::size_t live = kMax;
-            softmaxRows(scratch, 1, T_k, &live);
+            // Numerically stable softmax over the live window
+            // [kMin, kMax). Slots outside the window stay 0 and never
+            // contribute to the V accumulation below.
+            float maxScore = -std::numeric_limits<float>::infinity();
+            for (std::size_t kk = kMin; kk < kMax; ++kk) {
+                if (scratch[kk] > maxScore) maxScore = scratch[kk];
+            }
+            double sumExp = 0.0;
+            for (std::size_t kk = kMin; kk < kMax; ++kk) {
+                const float e = std::exp(scratch[kk] - maxScore);
+                scratch[kk] = e;
+                sumExp += static_cast<double>(e);
+            }
+            const float invSum = (sumExp > 0.0)
+                ? static_cast<float>(1.0 / sumExp) : 0.0F;
+            for (std::size_t kk = kMin; kk < kMax; ++kk) {
+                scratch[kk] *= invSum;
+            }
 
             float* outVec = out + p * qStride + hq * headDim;
             for (std::size_t d = 0; d < headDim; ++d) {
                 double acc = 0.0;
-                for (std::size_t kk = 0; kk < kMax; ++kk) {
+                for (std::size_t kk = kMin; kk < kMax; ++kk) {
                     const float* vVec = v + kk * kvStride + hkv * headDim;
                     acc += static_cast<double>(scratch[kk]) *
                            static_cast<double>(vVec[d]);
@@ -69,9 +89,9 @@ void multiHeadAttention(const float* q,
 
     MM_LOG_DEBUG("attn",
                  "done — T_q={} T_k={} posOffset={} nHeads={} nKvHeads={} "
-                 "headDim={} (GQA group size {})",
+                 "headDim={} sw={} (GQA group size {})",
                  T_q, T_k, positionOffset, nHeads, nKvHeads, headDim,
-                 nHeads / nKvHeads);
+                 slidingWindow, nHeads / nKvHeads);
 }
 
 } // namespace mimirmind::compute

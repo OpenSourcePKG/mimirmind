@@ -16,7 +16,8 @@ namespace mimirmind::compute {
  *
  * Position math: query row p (0..T_q) corresponds to absolute position
  * `positionOffset + p`. It attends to keys at positions
- *   [0, min(positionOffset + p + 1, T_k))
+ *   [kMin, min(positionOffset + p + 1, T_k))
+ * where kMin = max(0, kMax - slidingWindow) if slidingWindow > 0, else 0.
  *
  * Modes by parameter combination:
  *   - Prefill:  T_q == T_k, positionOffset == 0
@@ -28,6 +29,9 @@ namespace mimirmind::compute {
  * scratch: T_k floats, reused per (head, query-position) for the score row.
  *
  * GQA: query head h_q reads from KV head (h_q * nKvHeads) / nHeads.
+ *
+ * `slidingWindow == 0` (default) = pure causal. `> 0` matches Gemma
+ * SWA layers (each query sees only the last `slidingWindow` causal keys).
  *
  * Softmax is numerically stable (max-subtract). Scores are scaled by
  * 1/sqrt(headDim) before softmax.
@@ -42,6 +46,7 @@ void multiHeadAttention(const float* q,
                         std::size_t  headDim,
                         std::size_t  positionOffset,
                         float*       scratch,
-                        float*       out);
+                        float*       out,
+                        std::size_t  slidingWindow = 0);
 
 } // namespace mimirmind::compute

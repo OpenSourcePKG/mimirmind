@@ -716,7 +716,8 @@ void runAttentionParity(const char* label,
                         std::size_t positionOffset,
                         float       scale,
                         std::uint32_t seed,
-                        float       tol)
+                        float       tol,
+                        std::size_t slidingWindow = 0)
 {
     const std::size_t qN  = T_q * nHeads   * headDim;
     const std::size_t kvN = T_k * nKvHeads * headDim;
@@ -739,7 +740,8 @@ void runAttentionParity(const char* label,
                             vBuf.as<float>(),
                             T_q, T_k, nHeads, nKvHeads, headDim,
                             positionOffset, scale,
-                            oBuf.as<float>());
+                            oBuf.as<float>(),
+                            slidingWindow);
     fx().queue.flush();
 
     // CPU reference. compute::multiHeadAttention has the 1/sqrt(headDim)
@@ -757,7 +759,8 @@ void runAttentionParity(const char* label,
     mimirmind::compute::multiHeadAttention(
         qScaled.data(), kHost.data(), vHost.data(),
         T_q, T_k, nHeads, nKvHeads, headDim, positionOffset,
-        scratch.data(), outCpu.data());
+        scratch.data(), outCpu.data(),
+        slidingWindow);
 
     EXPECT_ARRAY_NEAR(label, oBuf.as<float>(), outCpu.data(), oN, tol);
 }
@@ -994,6 +997,93 @@ TEST(attention_prefill_flash_positionOffset) {
                        /*positionOffset=*/32,
                        /*scale=*/1.0F / std::sqrt(64.0F),
                        /*seed=*/0x97, /*tol=*/1e-3F);
+}
+
+// -- M5i.J.1a Sliding-Window Attention (SWA) parity ---------------------
+//
+// SWA layers clamp each query's K-range to the last `slidingWindow`
+// causal keys. Regression coverage against the CPU oracle for both the
+// prefill-flash and decode-flash paths — the root cause of M5i.J.1 was
+// that these kernels ignored the window and integrated over the full
+// causal prefix, breaking Gemma 4 output past ~sliding_window tokens.
+
+TEST(attention_prefill_flash_swa_windowExceedsCtx) {
+    // sw >= kMax on every query row: SWA degenerates to pure causal.
+    // Bit-parity guard against introducing a slow path for window=0
+    // callers when the window is set but happens to not clamp anything.
+    runAttentionParity("attn_prefill_flash_swa_noOp",
+                       /*T_q=*/64, /*T_k=*/64,
+                       /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/0,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0xA0, /*tol=*/2e-4F,
+                       /*slidingWindow=*/128);
+}
+
+TEST(attention_prefill_flash_swa_intraTile) {
+    // Window fits inside a single K-tile (sw=32, K_TILE=128). Exercises
+    // the mid-tile kMin clamp with tileLen < K_TILE for the first live
+    // tile of every query row.
+    runAttentionParity("attn_prefill_flash_swa_intraTile",
+                       /*T_q=*/64, /*T_k=*/64,
+                       /*nHeads=*/4, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/0,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0xA1, /*tol=*/5e-4F,
+                       /*slidingWindow=*/32);
+}
+
+TEST(attention_prefill_flash_swa_midTile) {
+    // sw=200 with T_q=T_k=300 → for the last query row kMin=100, which
+    // lands mid-tile-0 (K_TILE=128). ktStart skips no tiles but the
+    // low-clamp inside tile 0 must trim scores[0..99] out of the softmax.
+    runAttentionParity("attn_prefill_flash_swa_midTile",
+                       /*T_q=*/300, /*T_k=*/300,
+                       /*nHeads=*/4, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/0,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0xA2, /*tol=*/1e-3F,
+                       /*slidingWindow=*/200);
+}
+
+TEST(attention_prefill_flash_swa_gemma4_e4b) {
+    // Real-world Gemma 4 E4B SWA-layer geometry: sliding_window=512,
+    // GQA head_count=8 / head_count_kv=2, head_dim=256. T_q=T_k=1024
+    // makes ktStart advance past tile 0 for late query rows, so both
+    // the tile-skip and mid-tile clamp branches fire on the same run.
+    runAttentionParity("attn_prefill_flash_swa_e4b",
+                       /*T_q=*/1024, /*T_k=*/1024,
+                       /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/256,
+                       /*positionOffset=*/0,
+                       /*scale=*/1.0F / std::sqrt(256.0F),
+                       /*seed=*/0xA3, /*tol=*/3e-3F,
+                       /*slidingWindow=*/512);
+}
+
+TEST(attention_decode_flash_swa) {
+    // Decode-Flash SWA: T_q=1, positionOffset=1499, T_k=1500, sw=512.
+    // kMin=988 lands in tile 15 (K_TILE=64) → tiles 0..14 must emit
+    // neutral partials, tile 15 clamps its low boundary at kMin.
+    runAttentionParity("attn_decode_flash_swa",
+                       /*T_q=*/1, /*T_k=*/1500,
+                       /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                       /*positionOffset=*/1499,
+                       /*scale=*/1.0F / std::sqrt(128.0F),
+                       /*seed=*/0xA4, /*tol=*/1e-3F,
+                       /*slidingWindow=*/512);
+}
+
+TEST(attention_decode_flash_swa_windowExceedsCtx) {
+    // sw >= kMax: decode-flash with a wide window degenerates to pure
+    // causal. Neutral-partial branch stays untouched — every tile
+    // contributes to the merge.
+    runAttentionParity("attn_decode_flash_swa_noOp",
+                       /*T_q=*/1, /*T_k=*/256,
+                       /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/255,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0xA5, /*tol=*/2e-4F,
+                       /*slidingWindow=*/1024);
 }
 
 // =======================================================================

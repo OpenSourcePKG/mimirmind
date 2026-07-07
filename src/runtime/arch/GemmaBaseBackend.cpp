@@ -408,13 +408,21 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     _op.mark(runtime::OpProfiler::Cat::ATTENTION);
     trace(li.ownsKv ? "attention (GPU, scale=1, own K/V)"
                     : "attention (GPU, scale=1, reuse K/V)");
+    // SWA layers clamp the K-loop to the last `slidingWindow` causal
+    // keys; Full-Attention layers pass 0 = unbounded causal. Without
+    // this the SWA layers integrate over K positions they never saw
+    // during training — repetition-loop garbage past ~sliding_window
+    // tokens. See M5i.J.1 Synaipse ticket.
+    const std::size_t slidingWindow =
+        li.isSwa ? static_cast<std::size_t>(_config.slidingWindow) : 0;
     _ops.attentionAsync(qBuf,
                         cache.baseK(li.kvSourceLayer),
                         cache.baseV(li.kvSourceLayer),
                         T, totalLen,
                         li.nHeads, li.nKvHeads, head_dim,
                         curLen, /*scale=*/1.0F,
-                        attnOutBuf);
+                        attnOutBuf,
+                        slidingWindow);
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     trace("O projection");

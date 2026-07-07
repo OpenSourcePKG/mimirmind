@@ -649,7 +649,8 @@ void GpuOps::selfTest(runtime::UsmAllocator& allocator) {
             static_cast<const float*>(vUsm),
             T_q, nHeads, nKvHeads, headDim,
             /*positionOffset=*/0, scale,
-            static_cast<float*>(oUsm));
+            static_cast<float*>(oUsm),
+            /*slidingWindow=*/0);
         _queue.flush();
 
         std::vector<float> outCpu(oN, 0.0F);
@@ -761,7 +762,8 @@ void GpuOps::attentionAsync(const float* q,
                             std::size_t  headDim,
                             std::size_t  positionOffset,
                             float        scale,
-                            float*       out) {
+                            float*       out,
+                            std::size_t  slidingWindow) {
     if (T_q == 0 || T_k == 0 || nHeads == 0 || headDim == 0) {
         return;
     }
@@ -799,13 +801,13 @@ void GpuOps::attentionAsync(const float* q,
                 "); bump kFlashMax* and the kernel constants together");
         }
         attentionDecodeFlashAsync(q, k, v, T_k, nHeads, nKvHeads, headDim,
-                                  positionOffset, scale, out);
+                                  positionOffset, scale, out, slidingWindow);
     } else if (!_prefillFlashDisabled && headDim <= kFlashMaxHeadDim) {
         attentionPrefillFlashAsync(q, k, v, T_q, nHeads, nKvHeads, headDim,
-                                   positionOffset, scale, out);
+                                   positionOffset, scale, out, slidingWindow);
     } else {
         attentionPlainAsync(q, k, v, T_q, T_k, nHeads, nKvHeads, headDim,
-                            positionOffset, scale, out);
+                            positionOffset, scale, out, slidingWindow);
     }
 }
 
@@ -819,7 +821,8 @@ void GpuOps::attentionPlainAsync(const float* q,
                                  std::size_t  headDim,
                                  std::size_t  positionOffset,
                                  float        scale,
-                                 float*       out) {
+                                 float*       out,
+                                 std::size_t  slidingWindow) {
     // M-CLR.2: positionOffset via shared USM slot. T_k was previously
     // an arg used only to cap kMax; every caller satisfies
     // T_k = positionOffset + T_q so the cap is a no-op, and the arg
@@ -839,6 +842,8 @@ void GpuOps::attentionPlainAsync(const float* q,
     _attentionKernel.setValue<std::int32_t>(7, toInt32(headDim,  "attention headDim"));
     _attentionKernel.setPtr(8, _curLenSlotUsm);
     _attentionKernel.setValue<float>(9, scale);
+    _attentionKernel.setValue<std::int32_t>(
+        10, toInt32(slidingWindow, "attention slidingWindow"));
     _attentionKernel.setGroupSize(kAttentionLocalSize, 1, 1);
     // One workgroup per (head, query-position).
     _queue.appendLaunch(_attentionKernel,
@@ -856,7 +861,8 @@ void GpuOps::attentionPrefillFlashAsync(const float* q,
                                         std::size_t  headDim,
                                         std::size_t  positionOffset,
                                         float        scale,
-                                        float*       out) {
+                                        float*       out,
+                                        std::size_t  slidingWindow) {
     // M-CLR.2: positionOffset comes via the shared USM slot. The kernel
     // dereferences curLenPtr[0] to compute kMax = positionOffset + pq + 1
     // per query position.
@@ -876,6 +882,8 @@ void GpuOps::attentionPrefillFlashAsync(const float* q,
         7, toInt32(headDim,  "prefill_flash headDim"));
     _attentionPrefillFlashKernel.setPtr(8, _curLenSlotUsm);
     _attentionPrefillFlashKernel.setValue<float>(9, scale);
+    _attentionPrefillFlashKernel.setValue<std::int32_t>(
+        10, toInt32(slidingWindow, "prefill_flash slidingWindow"));
     _attentionPrefillFlashKernel.setGroupSize(kAttentionLocalSize, 1, 1);
     // Same (nHeads, T_q) grid as variant (a). Streaming K-tile loop
     // stays inside each workgroup.
@@ -894,7 +902,8 @@ void GpuOps::attentionDecodeFlashAsync(const float* q,
                                        std::size_t  headDim,
                                        std::size_t  positionOffset,
                                        float        scale,
-                                       float*       out) {
+                                       float*       out,
+                                       std::size_t  slidingWindow) {
     // kMax = positionOffset + 1 in decode mode. Cap to T_k just in
     // case a caller passes a positionOffset >= T_k - 1.
     const std::size_t kMax =
@@ -927,6 +936,8 @@ void GpuOps::attentionDecodeFlashAsync(const float* q,
     _attentionFlashPartialKernel.setValue<std::int32_t>(6, toInt32(headDim,  "flash headDim"));
     _attentionFlashPartialKernel.setPtr(7, _curLenSlotUsm);
     _attentionFlashPartialKernel.setValue<float>(8, scale);
+    _attentionFlashPartialKernel.setValue<std::int32_t>(
+        9, toInt32(slidingWindow, "flash slidingWindow"));
     _attentionFlashPartialKernel.setGroupSize(kAttentionLocalSize, 1, 1);
     // M-CLR.4 follow-up: launch geometry is
     //  - `_replayMaxKTiles` during recording (right-sized upper bound

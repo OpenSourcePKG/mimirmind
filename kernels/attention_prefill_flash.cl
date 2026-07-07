@@ -15,8 +15,13 @@
 //   v   [T_k, nKvHeads,  headDim]
 //   out [T_q, nHeads,    headDim]
 //
-// Causal mask: query position pq attends to keys
-//   [0, min(positionOffset + pq + 1, T_k)).
+// Causal mask + sliding window: query position pq attends to keys
+//   [kMin, kMax) with
+//     kMax = positionOffset + pq + 1
+//     kMin = (slidingWindow > 0 && kMax > slidingWindow)
+//              ? (kMax - slidingWindow) : 0
+// so `slidingWindow == 0` degenerates to pure causal. `slidingWindow > 0`
+// matches Gemma-family SWA layers.
 //
 // GQA: query head hq reads from KV head hkv = (hq * nKvHeads) / nHeads.
 //
@@ -80,7 +85,8 @@ __kernel void attention_prefill_flash(
     const int             nKvHeads,
     const int             headDim,
     __global const int*   curLenPtr,
-    const float           scale)
+    const float           scale,
+    const int             slidingWindow)
 {
     (void)T_q;  // Reserved for future launch-geometry validation; the
                 // kernel body derives everything it needs from lid/group.
@@ -95,6 +101,13 @@ __kernel void attention_prefill_flash(
     const int positionOffset = curLenPtr[0];
     const int absPos         = positionOffset + pq;
     const int kMax           = absPos + 1;
+    // Sliding-window low bound. 0 → pure causal (Full-Attention / Qwen).
+    const int kMin           = (slidingWindow > 0 && kMax > slidingWindow)
+                                 ? (kMax - slidingWindow) : 0;
+    // Start tile: first tile whose end crosses kMin. All-below-window
+    // tiles are skipped entirely so the K-loop body only sees tiles
+    // that hold at least one live key.
+    const int ktStart        = kMin / ATTN_FLASH_PREFILL_KTILE;
     const int nKTiles        = (kMax + ATTN_FLASH_PREFILL_KTILE - 1)
                                / ATTN_FLASH_PREFILL_KTILE;
 
@@ -120,13 +133,16 @@ __kernel void attention_prefill_flash(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    for (int kt = 0; kt < nKTiles; ++kt) {
-        const int kStart  = kt * ATTN_FLASH_PREFILL_KTILE;
-        const int kEnd    = (kStart + ATTN_FLASH_PREFILL_KTILE < kMax)
-                              ? (kStart + ATTN_FLASH_PREFILL_KTILE) : kMax;
-        const int tileLen = kEnd - kStart;
-        // nKTiles is derived from kMax so kStart < kMax on every iter,
-        // hence tileLen >= 1 — no empty-tile guard needed.
+    for (int kt = ktStart; kt < nKTiles; ++kt) {
+        const int kStartRaw = kt * ATTN_FLASH_PREFILL_KTILE;
+        // Clamp low boundary against sliding-window: the first live tile
+        // may have its early entries below kMin.
+        const int kStart    = (kStartRaw > kMin) ? kStartRaw : kMin;
+        const int kEndRaw   = kStartRaw + ATTN_FLASH_PREFILL_KTILE;
+        const int kEnd      = (kEndRaw < kMax) ? kEndRaw : kMax;
+        const int tileLen   = kEnd - kStart;
+        // ktStart ensures kEndRaw > kMin, and nKTiles ensures kStartRaw <
+        // kMax, so tileLen >= 1 on every iter — no empty-tile guard needed.
 
         // -- Pass A — Q·K scaled scores for this K-tile. --------------
         for (int kk = lid; kk < tileLen; kk += ATTN_FLASH_PREFILL_LOCAL) {
