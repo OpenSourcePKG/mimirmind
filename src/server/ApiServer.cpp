@@ -188,6 +188,152 @@ struct ChatRequest {
     return req;
 }
 
+// ---- M-PT: server-side length discipline ----------------------------------
+//
+// Prompt trimming and max_new clamping so a request that doesn't fit the
+// KV cache budget gracefully degrades to a smaller-but-served response,
+// instead of the pre-M-PT behaviour where InferenceEngine::ensureCapacity
+// throws and the client sees a 500. See the M-PT Synaipse note for the
+// design rationale.
+
+struct TrimReport {
+    std::size_t droppedMessages{0};
+    std::size_t originalPromptTokens{0};
+    std::size_t effectivePromptTokens{0};
+    std::size_t maxNewClampedFrom{0};   // 0 = no clamp
+    std::size_t maxNewClampedTo{0};
+    bool        contextExtrapolated{false};
+    std::size_t contextExtrapolatedBy{0};
+
+    [[nodiscard]] bool fired() const noexcept {
+        return droppedMessages > 0
+            || maxNewClampedFrom > 0
+            || contextExtrapolated;
+    }
+};
+
+// Slack — matches InferenceEngine::ensureCapacity's `+ 4`. If those two
+// ever drift, ensureCapacity will start throwing again with a request the
+// trim helper thought was safe.
+constexpr std::size_t kMPtCapSlack = 4;
+constexpr std::size_t kMPtTrimIterLimit = 20;
+
+/// Iteratively drop the oldest non-system, non-last-user message until
+/// `promptIds.size() + maxNewTokens + slack <= maxContextTokens`. Then
+/// clamp `maxNewTokens` if the prompt alone still leaves too little
+/// budget. Emits an error message (via `errorMessage` out-param) and
+/// returns false only in the extreme case that the prompt itself is
+/// larger than the context budget minus slack.
+[[nodiscard]] bool applyPromptTrim(std::vector<model::ChatMessage>& msgs,
+                                    std::vector<std::int32_t>&       promptIds,
+                                    std::size_t&                     maxNewTokens,
+                                    std::size_t                      maxContextTokens,
+                                    std::size_t                      modelContextLength,
+                                    const model::Tokenizer&          tok,
+                                    model::ChatTemplate::Style       chatStyle,
+                                    TrimReport&                      report,
+                                    std::string&                     errorMessage) {
+    report.originalPromptTokens = promptIds.size();
+
+    // 1. Message-drop-trim loop.
+    for (std::size_t iter = 0; iter < kMPtTrimIterLimit; ++iter) {
+        if (promptIds.size() + maxNewTokens + kMPtCapSlack <= maxContextTokens) {
+            break;
+        }
+        // Find the LAST user message — must be preserved. Walk backwards.
+        std::size_t lastUserIdx = static_cast<std::size_t>(-1);
+        for (std::size_t i = msgs.size(); i-- > 0; ) {
+            if (msgs[i].role == model::ChatRole::User) {
+                lastUserIdx = i;
+                break;
+            }
+        }
+        // Pick the earliest droppable index: not system, not last-user.
+        std::size_t dropIdx = static_cast<std::size_t>(-1);
+        for (std::size_t i = 0; i < msgs.size(); ++i) {
+            if (msgs[i].role == model::ChatRole::System) continue;
+            if (i == lastUserIdx) continue;
+            dropIdx = i;
+            break;
+        }
+        if (dropIdx == static_cast<std::size_t>(-1)) {
+            // Only system + last-user left — cannot drop more.
+            break;
+        }
+        msgs.erase(msgs.begin() + static_cast<std::ptrdiff_t>(dropIdx));
+        ++report.droppedMessages;
+        promptIds = model::ChatTemplate::encode(chatStyle, tok, msgs,
+                                                /*addGenerationPrompt=*/true);
+    }
+
+    // 2. Post-trim: clamp maxNew against remaining budget if still too big.
+    const std::size_t Tp = promptIds.size();
+    if (Tp + maxNewTokens + kMPtCapSlack > maxContextTokens) {
+        if (Tp + kMPtCapSlack >= maxContextTokens) {
+            // Prompt alone exhausts the budget even without any completion.
+            // Extreme edge — reject with the clearest possible message.
+            errorMessage =
+                "prompt too long: " + std::to_string(Tp) +
+                " tokens after trimming " + std::to_string(report.droppedMessages) +
+                " message(s) + slack " + std::to_string(kMPtCapSlack) +
+                " does not fit context budget " + std::to_string(maxContextTokens) +
+                " — raise MIMIRMIND_MAX_CONTEXT_TOKENS or shorten the last "
+                "user message";
+            return false;
+        }
+        const std::size_t newMax = maxContextTokens - Tp - kMPtCapSlack;
+        report.maxNewClampedFrom = maxNewTokens;
+        report.maxNewClampedTo   = newMax;
+        maxNewTokens             = newMax;
+    }
+
+    report.effectivePromptTokens = Tp;
+
+    // 3. Model-native context-length warning (RoPE extrapolation zone).
+    //    Zero means "not populated by GGUF" — skip.
+    if (modelContextLength > 0 && Tp > modelContextLength) {
+        report.contextExtrapolated   = true;
+        report.contextExtrapolatedBy = Tp - modelContextLength;
+    }
+    return true;
+}
+
+/// Apply the M-PT report to an httplib response as `x-mimirmind-*`
+/// headers. Only headers for fields that actually fired are set —
+/// clients that never trigger the trim path see zero overhead.
+void attachTrimHeaders(httplib::Response& res, const TrimReport& r) {
+    if (r.droppedMessages > 0) {
+        res.set_header("x-mimirmind-dropped-messages",
+                       std::to_string(r.droppedMessages));
+    }
+    if (r.maxNewClampedFrom > 0) {
+        res.set_header("x-mimirmind-max-new-clamped",
+                       std::to_string(r.maxNewClampedFrom) + "->" +
+                       std::to_string(r.maxNewClampedTo));
+    }
+    if (r.contextExtrapolated) {
+        res.set_header("x-mimirmind-context-extrapolated-by",
+                       std::to_string(r.contextExtrapolatedBy));
+    }
+}
+
+/// Attach the M-PT report to a chat-completion `usage` JSON block.
+/// Fields prefixed `mimirmind_` are additive extensions over OpenAI
+/// — vanilla clients ignore unknown keys.
+void attachTrimUsage(json& usage, const TrimReport& r) {
+    if (r.droppedMessages > 0) {
+        usage["mimirmind_dropped_messages"]        = r.droppedMessages;
+        usage["mimirmind_original_prompt_tokens"]  = r.originalPromptTokens;
+    }
+    if (r.maxNewClampedFrom > 0) {
+        usage["mimirmind_max_new_clamped_from"] = r.maxNewClampedFrom;
+        usage["mimirmind_max_new_clamped_to"]   = r.maxNewClampedTo;
+    }
+    if (r.contextExtrapolated) {
+        usage["mimirmind_context_extrapolated_by"] = r.contextExtrapolatedBy;
+    }
+}
+
 /// Extend the engine's stopIds with the first token of each user-supplied
 /// stop string. Multi-token stops are flagged with a warning — robust
 /// substring matching belongs in a later iteration.
@@ -1109,13 +1255,16 @@ struct ApiServer::Impl {
     }
 
     /// Common pre-generation work shared by streaming and non-streaming.
-    /// Mutates `params` and `stopIds` in place. Returns false (and writes
-    /// the error response) if the request is invalid.
+    /// Mutates `params` and `stopIds` in place. Populates `report` with
+    /// any M-PT length-discipline actions taken. Returns false (and writes
+    /// the error response) if the request is invalid or trim cannot
+    /// recover it.
     [[nodiscard]] bool prepareChatRequest(const ChatRequest&             cr,
                                           httplib::Response&             res,
                                           std::vector<std::int32_t>&     promptIds,
                                           std::vector<std::int32_t>&     stopIds,
-                                          runtime::GenerateParams&       params) {
+                                          runtime::GenerateParams&       params,
+                                          TrimReport&                    report) {
         if (cr.messages.empty()) {
             sendError(res, 400, "invalid_request_error",
                       "messages must not be empty");
@@ -1123,14 +1272,52 @@ struct ApiServer::Impl {
         }
 
         const auto& tok = engine.tokenizer();
+        // M-PT: work on a mutable copy so the trim loop can drop entries
+        // without touching the parsed request. Also lets us report the
+        // original prompt-token count in the response.
+        std::vector<model::ChatMessage> msgs = cr.messages;
         promptIds = model::ChatTemplate::encode(
-            chatStyle, tok, cr.messages, /*addGenerationPrompt=*/true);
+            chatStyle, tok, msgs, /*addGenerationPrompt=*/true);
 
         stopIds = model::ChatTemplate::stopIds(chatStyle, tok);
         extendStopIds(tok, cr.stopStrings, stopIds);
 
         params.maxNewTokens = cr.maxTokens > 0 ? cr.maxTokens : cfg.defaultMaxNew;
         params.stopIds      = stopIds;
+
+        // M-PT — server-side length discipline. Trim messages + clamp
+        // max_new so the prompt fits _maxContextTokens without tripping
+        // InferenceEngine::ensureCapacity's throw. See the M-PT Synaipse
+        // note for the design rationale (why message-drop and not client-
+        // side, why the last user message stays intact, why system stays).
+        {
+            std::string trimErr;
+            if (!applyPromptTrim(msgs, promptIds, params.maxNewTokens,
+                                 engine.maxContextTokens(),
+                                 engine.config().contextLength,
+                                 tok, chatStyle, report, trimErr)) {
+                sendError(res, 400, "invalid_request_error", trimErr);
+                return false;
+            }
+            if (report.fired()) {
+                MM_LOG_INFO("server",
+                    "prompt-trim: dropped={} orig_tokens={} eff_tokens={} "
+                    "max_new={}→{} extrapolated_by={}",
+                    report.droppedMessages, report.originalPromptTokens,
+                    report.effectivePromptTokens,
+                    report.maxNewClampedFrom, report.maxNewClampedTo,
+                    report.contextExtrapolatedBy);
+                if (report.contextExtrapolated) {
+                    MM_LOG_WARN("server",
+                        "prompt Tp={} exceeds model-native context {} by {} "
+                        "tokens — RoPE extrapolation zone",
+                        report.effectivePromptTokens,
+                        engine.config().contextLength,
+                        report.contextExtrapolatedBy);
+                }
+            }
+            attachTrimHeaders(res, report);
+        }
         if (cr.hasTemperature) {
             params.sampling.temperature = cr.temperature;
         }
@@ -1210,7 +1397,9 @@ struct ApiServer::Impl {
         std::vector<std::int32_t> promptIds;
         std::vector<std::int32_t> stopIds;
         runtime::GenerateParams   params;
-        if (!prepareChatRequest(cr, res, promptIds, stopIds, params)) {
+        TrimReport                trimReport;
+        if (!prepareChatRequest(cr, res, promptIds, stopIds, params,
+                                trimReport)) {
             return;
         }
 
@@ -1308,6 +1497,9 @@ struct ApiServer::Impl {
         if (stats.packageJoules > 0.0) {
             usage["package_joules"] = stats.packageJoules;
         }
+        // M-PT — length-discipline metadata. Only present when trim /
+        // clamp / extrapolation-warn actually fired.
+        attachTrimUsage(usage, trimReport);
 
         json response = {
             {"id",      respId},
@@ -1355,7 +1547,15 @@ struct ApiServer::Impl {
         std::vector<std::int32_t> promptIds;
         std::vector<std::int32_t> stopIds;
         runtime::GenerateParams   params;
-        if (!prepareChatRequest(cr, res, promptIds, stopIds, params)) {
+        // M-PT — headers are attached inside prepareChatRequest before the
+        // stream body starts, so a streaming client sees the same
+        // x-mimirmind-* signals as the blocking path. We don't push the
+        // report into a usage chunk here because mimirmind's SSE format
+        // doesn't emit a terminal usage chunk (see prefill_done named
+        // event for the token-count signal instead).
+        TrimReport                trimReport;
+        if (!prepareChatRequest(cr, res, promptIds, stopIds, params,
+                                trimReport)) {
             return;
         }
 
