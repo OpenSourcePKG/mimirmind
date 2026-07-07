@@ -692,7 +692,11 @@ void GpuOps::selfTest(runtime::UsmAllocator& allocator) {
     _selfTestStatus = "ok";
     MM_LOG_INFO("gpuops",
                 "selfTest OK — x_quant_i8 (M=2,K=64) + qkv_split full + "
-                "qk-only paths + attention_prefill_flash (T_q=8) verified");
+                "qk-only paths{}",
+                _prefillFlashDisabled
+                    ? " (attention_prefill_flash skipped: "
+                      "MIMIRMIND_DISABLE_FLASH_PREFILL=1)"
+                    : " + attention_prefill_flash (T_q=8) verified");
 }
 
 void GpuOps::qkvSplitAsync(const float* fused,
