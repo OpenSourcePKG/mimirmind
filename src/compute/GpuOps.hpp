@@ -356,6 +356,9 @@ private:
     runtime::GpuModule     _attentionFlashMergeModule;
     runtime::GpuKernel     _attentionFlashMergeKernel;
 
+    runtime::GpuModule     _attentionPrefillFlashModule;
+    runtime::GpuKernel     _attentionPrefillFlashKernel;
+
     runtime::GpuModule     _scaledAddResidualModule;
     runtime::GpuKernel     _scaledAddResidualKernel;
 
@@ -383,6 +386,11 @@ private:
     std::size_t            _replayMaxKTiles{0};
     std::size_t            _flashPartialBytes{0};
 
+    // M5i.J — MIMIRMIND_DISABLE_FLASH_PREFILL rollback. Cached at
+    // construction so the dispatcher hot-path stays branch-free after
+    // startup. When true, T_q > 1 falls back to attention.cl variant (a).
+    bool                   _prefillFlashDisabled{false};
+
     static constexpr std::uint32_t kRmsnormLocalSize     = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;
     static constexpr std::uint32_t kRopeLocalSize        = 256;
@@ -400,8 +408,10 @@ private:
     static constexpr std::size_t kFlashMaxHeads     = 64;
     static constexpr std::size_t kFlashMaxHeadDim   = 512;
 
-    // Internal dispatch — variant (a) for T_q > 1, FlashAttention for
-    // T_q == 1. Hidden behind attentionAsync.
+    // Internal dispatch — variant (a) for T_q > 1 when the flash-prefill
+    // path is disabled or unsupported, single-WG streaming FlashAttention
+    // (M5i.J) for T_q > 1 by default, and two-kernel FlashAttention
+    // (M5f.3.2) for T_q == 1. All hidden behind attentionAsync.
     void attentionPlainAsync(const float* q,
                              const float* k,
                              const float* v,
@@ -413,6 +423,16 @@ private:
                              std::size_t  positionOffset,
                              float        scale,
                              float*       out);
+    void attentionPrefillFlashAsync(const float* q,
+                                    const float* k,
+                                    const float* v,
+                                    std::size_t  T_q,
+                                    std::size_t  nHeads,
+                                    std::size_t  nKvHeads,
+                                    std::size_t  headDim,
+                                    std::size_t  positionOffset,
+                                    float        scale,
+                                    float*       out);
     void attentionDecodeFlashAsync(const float* q,
                                    const float* k,
                                    const float* v,

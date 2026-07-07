@@ -1,5 +1,6 @@
 #include "compute/GpuOps.hpp"
 
+#include "compute/Attention.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
 #include "runtime/UsmAllocator.hpp"
@@ -16,6 +17,13 @@
 namespace mimirmind::compute {
 
 namespace {
+
+bool envSet(const char* name) noexcept {
+    const char* v = std::getenv(name);
+    if (v == nullptr) return false;
+    const std::string_view s{v};
+    return !s.empty() && s != "0" && s != "false" && s != "off";
+}
 
 std::int32_t toInt32(std::size_t v, const char* tag) {
     if (v > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -74,6 +82,9 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
       _attentionFlashMergeModule  {ctx, "attention_flash_merge"},
       _attentionFlashMergeKernel  {
           _attentionFlashMergeModule.kernel("attention_flash_merge")},
+      _attentionPrefillFlashModule{ctx, "attention_prefill_flash"},
+      _attentionPrefillFlashKernel{
+          _attentionPrefillFlashModule.kernel("attention_prefill_flash")},
       _scaledAddResidualModule    {ctx, "scaled_add_residual"},
       _scaledAddResidualKernel    {
           _scaledAddResidualModule.kernel("scaled_add_residual")},
@@ -97,19 +108,25 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
         _alloc.allocate(sizeof(std::int32_t)));
     *_curLenSlotUsm = 0;
 
+    // M5i.J: cache the prefill-flash rollback flag once at startup so the
+    // dispatcher hot path stays branch-cheap.
+    _prefillFlashDisabled = envSet("MIMIRMIND_DISABLE_FLASH_PREFILL");
+
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
                 "rmsnorm_qkv/add_rmsnorm/"
                 "add_bias/add_residual/silu_mul/rope/rope_ff/mul_scalar/"
-                "gelu_mul/attention/attention_flash/scaled_add_residual/"
-                "qkv_split/x_quant_i8 loaded (rms local={}, "
-                "elementwise local={}, rope local={}, attention local={}, "
-                "attention max T_k={}, flash kTile={}, flash maxHeads={}, "
-                "flash maxHeadDim={}, flash partial scratch={} bytes)",
+                "gelu_mul/attention/attention_flash/attention_prefill_flash/"
+                "scaled_add_residual/qkv_split/x_quant_i8 loaded "
+                "(rms local={}, elementwise local={}, rope local={}, "
+                "attention local={}, attention max T_k={}, flash kTile={}, "
+                "flash maxHeads={}, flash maxHeadDim={}, "
+                "flash partial scratch={} bytes, prefill_flash={})",
                 kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize,
                 kAttentionLocalSize, kAttentionMaxTk,
                 kFlashKTileSize, kFlashMaxHeads, kFlashMaxHeadDim,
-                _flashPartialBytes);
+                _flashPartialBytes,
+                _prefillFlashDisabled ? "disabled (env)" : "enabled");
 }
 
 GpuOps::~GpuOps() {
@@ -586,10 +603,95 @@ void GpuOps::selfTest(runtime::UsmAllocator& allocator) {
     runCase(/*hasV=*/true,  "full");
     runCase(/*hasV=*/false, "qk-only");
 
+    // M5i.J: verify the single-WG streaming FlashAttention prefill kernel
+    // against compute::multiHeadAttention (CPU reference) on a tiny
+    // T_q=8 case. Same SPV-regression-guard role as the qkv_split block
+    // above — catches driver/ocloc miscompilation before the first block
+    // runs and gives a targeted error rather than a mysterious model
+    // divergence later. Skipped when the rollback flag is on: there's
+    // nothing to gate.
+    if (!_prefillFlashDisabled) {
+        constexpr std::size_t T_q      = 8;
+        constexpr std::size_t T_k      = 8;
+        constexpr std::size_t nHeads   = 4;
+        constexpr std::size_t nKvHeads = 2;
+        constexpr std::size_t headDim  = 32;
+        const float scale = 1.0F / std::sqrt(
+            static_cast<float>(headDim));
+
+        const std::size_t qN  = T_q * nHeads   * headDim;
+        const std::size_t kvN = T_k * nKvHeads * headDim;
+        const std::size_t oN  = qN;
+
+        void* qUsm = allocator.allocate(qN  * sizeof(float));
+        void* kUsm = allocator.allocate(kvN * sizeof(float));
+        void* vUsm = allocator.allocate(kvN * sizeof(float));
+        void* oUsm = allocator.allocate(oN  * sizeof(float));
+
+        // Deterministic ramp inputs — same seed math wouldn't help since
+        // we have no RNG in the runtime, and this keeps the test
+        // reproducible without pulling <random> into a load-time gate.
+        std::vector<float> qHost(qN), kHost(kvN), vHost(kvN);
+        for (std::size_t i = 0; i < qN;  ++i)
+            qHost[i] = static_cast<float>((i * 7  + 1) % 17) * 0.125F - 1.0F;
+        for (std::size_t i = 0; i < kvN; ++i)
+            kHost[i] = static_cast<float>((i * 11 + 3) % 19) * 0.125F - 1.25F;
+        for (std::size_t i = 0; i < kvN; ++i)
+            vHost[i] = static_cast<float>((i * 13 + 5) % 23) * 0.0625F - 0.75F;
+        std::memcpy(qUsm, qHost.data(), qN  * sizeof(float));
+        std::memcpy(kUsm, kHost.data(), kvN * sizeof(float));
+        std::memcpy(vUsm, vHost.data(), kvN * sizeof(float));
+        std::memset(oUsm, 0,            oN  * sizeof(float));
+
+        attentionPrefillFlashAsync(
+            static_cast<const float*>(qUsm),
+            static_cast<const float*>(kUsm),
+            static_cast<const float*>(vUsm),
+            T_q, nHeads, nKvHeads, headDim,
+            /*positionOffset=*/0, scale,
+            static_cast<float*>(oUsm));
+        _queue.flush();
+
+        std::vector<float> outCpu(oN, 0.0F);
+        std::vector<float> scratch(T_k);
+        // compute::multiHeadAttention bakes 1/sqrt(headDim) into its Q·K
+        // scale — matches what we pass here, no pre-scale needed.
+        multiHeadAttention(qHost.data(), kHost.data(), vHost.data(),
+                           T_q, T_k, nHeads, nKvHeads, headDim,
+                           /*positionOffset=*/0,
+                           scratch.data(), outCpu.data());
+
+        std::vector<float> outGpu(oN);
+        std::memcpy(outGpu.data(), oUsm, oN * sizeof(float));
+
+        constexpr float kTol = 5e-4F;
+        float       maxDiff = 0.0F;
+        std::size_t badIdx  = 0;
+        for (std::size_t i = 0; i < oN; ++i) {
+            const float d = std::fabs(outGpu[i] - outCpu[i]);
+            if (d > maxDiff) { maxDiff = d; badIdx = i; }
+        }
+        if (!(maxDiff <= kTol)) {
+            std::ostringstream os;
+            os << "GpuOps::selfTest[attention_prefill_flash]: "
+               << "output mismatch — maxDiff=" << maxDiff
+               << " at i=" << badIdx
+               << " gpu=" << outGpu[badIdx]
+               << " cpu=" << outCpu[badIdx]
+               << " tol="  << kTol;
+            throw std::runtime_error(os.str());
+        }
+
+        allocator.deallocate(qUsm, qN  * sizeof(float));
+        allocator.deallocate(kUsm, kvN * sizeof(float));
+        allocator.deallocate(vUsm, kvN * sizeof(float));
+        allocator.deallocate(oUsm, oN  * sizeof(float));
+    }
+
     _selfTestStatus = "ok";
     MM_LOG_INFO("gpuops",
                 "selfTest OK — x_quant_i8 (M=2,K=64) + qkv_split full + "
-                "qk-only paths verified");
+                "qk-only paths + attention_prefill_flash (T_q=8) verified");
 }
 
 void GpuOps::qkvSplitAsync(const float* fused,
@@ -678,12 +780,15 @@ void GpuOps::attentionAsync(const float* q,
             "in GpuOps.hpp together");
     }
 
-    // M5f.3.2: dispatch by query length. Decode (T_q == 1) goes through
-    // the FlashAttention K-tiled path which launches nHeads × K_TILES
-    // workgroups, getting the iGPU off the under-saturated nHeads-only
-    // geometry of variant (a). Prefill keeps variant (a) because T_q ×
-    // nHeads is already plenty of workgroups, and the scratch buffer
-    // for partials would scale quadratically with context length.
+    // Dispatch by query length.
+    //  - T_q == 1 (M5f.3.2): FlashAttention two-kernel decode. Launches
+    //    nHeads × K_TILES workgroups, saturating the iGPU past the
+    //    variant-(a) nHeads-only geometry.
+    //  - T_q >  1 (M5i.J):   single-WG streaming FlashAttention. Same
+    //    (nHeads, T_q) launch geometry as variant (a) but the K-loop
+    //    runs tiled online-softmax intra-WG, shrinking SLM from 64 KiB
+    //    (variant (a)) to ~2.5 KiB per WG. Rollback via
+    //    MIMIRMIND_DISABLE_FLASH_PREFILL=1.
     if (T_q == 1) {
         if (nHeads > kFlashMaxHeads || headDim > kFlashMaxHeadDim) {
             throw std::runtime_error(
@@ -695,6 +800,9 @@ void GpuOps::attentionAsync(const float* q,
         }
         attentionDecodeFlashAsync(q, k, v, T_k, nHeads, nKvHeads, headDim,
                                   positionOffset, scale, out);
+    } else if (!_prefillFlashDisabled && headDim <= kFlashMaxHeadDim) {
+        attentionPrefillFlashAsync(q, k, v, T_q, nHeads, nKvHeads, headDim,
+                                   positionOffset, scale, out);
     } else {
         attentionPlainAsync(q, k, v, T_q, T_k, nHeads, nKvHeads, headDim,
                             positionOffset, scale, out);
@@ -734,6 +842,44 @@ void GpuOps::attentionPlainAsync(const float* q,
     _attentionKernel.setGroupSize(kAttentionLocalSize, 1, 1);
     // One workgroup per (head, query-position).
     _queue.appendLaunch(_attentionKernel,
+                        static_cast<std::uint32_t>(nHeads),
+                        static_cast<std::uint32_t>(T_q),
+                        1);
+}
+
+void GpuOps::attentionPrefillFlashAsync(const float* q,
+                                        const float* k,
+                                        const float* v,
+                                        std::size_t  T_q,
+                                        std::size_t  nHeads,
+                                        std::size_t  nKvHeads,
+                                        std::size_t  headDim,
+                                        std::size_t  positionOffset,
+                                        float        scale,
+                                        float*       out) {
+    // M-CLR.2: positionOffset comes via the shared USM slot. The kernel
+    // dereferences curLenPtr[0] to compute kMax = positionOffset + pq + 1
+    // per query position.
+    *_curLenSlotUsm =
+        toInt32(positionOffset, "prefill_flash positionOffset");
+    _attentionPrefillFlashKernel.setPtr(0, q);
+    _attentionPrefillFlashKernel.setPtr(1, k);
+    _attentionPrefillFlashKernel.setPtr(2, v);
+    _attentionPrefillFlashKernel.setPtr(3, out);
+    _attentionPrefillFlashKernel.setValue<std::int32_t>(
+        4, toInt32(T_q,      "prefill_flash T_q"));
+    _attentionPrefillFlashKernel.setValue<std::int32_t>(
+        5, toInt32(nHeads,   "prefill_flash nHeads"));
+    _attentionPrefillFlashKernel.setValue<std::int32_t>(
+        6, toInt32(nKvHeads, "prefill_flash nKvHeads"));
+    _attentionPrefillFlashKernel.setValue<std::int32_t>(
+        7, toInt32(headDim,  "prefill_flash headDim"));
+    _attentionPrefillFlashKernel.setPtr(8, _curLenSlotUsm);
+    _attentionPrefillFlashKernel.setValue<float>(9, scale);
+    _attentionPrefillFlashKernel.setGroupSize(kAttentionLocalSize, 1, 1);
+    // Same (nHeads, T_q) grid as variant (a). Streaming K-tile loop
+    // stays inside each workgroup.
+    _queue.appendLaunch(_attentionPrefillFlashKernel,
                         static_cast<std::uint32_t>(nHeads),
                         static_cast<std::uint32_t>(T_q),
                         1);

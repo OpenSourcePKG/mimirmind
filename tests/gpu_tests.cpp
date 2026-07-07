@@ -900,6 +900,102 @@ TEST(attention_decode_flash_partialKTileTail) {
                        /*seed=*/0x85, /*tol=*/5e-4F);
 }
 
+// -- M5i.J Flash-Prefill stress cases -----------------------------------
+//
+// Prefill (T_q > 1) routes through the single-workgroup streaming
+// FlashAttention kernel (kernels/attention_prefill_flash.cl). These
+// cases exercise the K-tile online-softmax loop across all its interesting
+// boundaries: single-tile (T_q ≤ K_TILE), multi-tile, unaligned tail, the
+// GQA index rewrite at scale, and the Gemma 4 headDim=512 upper bound.
+// Tolerance follows the decode-flash convention (2e-3 for many-tile runs)
+// because online-softmax accumulates rescale-related roundoff — see the
+// M5i.J ticket's numerics note.
+
+TEST(attention_prefill_flash_singleTile) {
+    // T_q = T_k = 64 → all within tile 0 (K_TILE = 128). No cross-tile
+    // rescale — flash reduces exactly to the plain kernel's arithmetic.
+    // Tight tolerance verifies the intra-tile path.
+    runAttentionParity("attn_prefill_flash_singleTile",
+                       /*T_q=*/64, /*T_k=*/64,
+                       /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/0,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0x91, /*tol=*/2e-4F);
+}
+
+TEST(attention_prefill_flash_tileBoundary) {
+    // Longest query row (pq = T_q-1 = 127) has kMax = 128 = exactly one
+    // K_TILE. Every earlier row also fits in tile 0. First row past the
+    // boundary appears at T_q=129 (below).
+    runAttentionParity("attn_prefill_flash_boundary",
+                       /*T_q=*/128, /*T_k=*/128,
+                       /*nHeads=*/4, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/0,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0x92, /*tol=*/5e-4F);
+}
+
+TEST(attention_prefill_flash_twoTiles) {
+    // T_q = T_k = 256 → tail rows sweep 2 K-tiles. This is the first
+    // test where the online-softmax cross-tile merge is actually
+    // exercised. Loosen tolerance vs. single-tile.
+    runAttentionParity("attn_prefill_flash_twoTiles",
+                       /*T_q=*/256, /*T_k=*/256,
+                       /*nHeads=*/4, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/0,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0x93, /*tol=*/1e-3F);
+}
+
+TEST(attention_prefill_flash_fourTiles) {
+    // T_q = T_k = 512 → 4 K-tiles. GQA 8:2 like Gemma 4 SWA layers.
+    runAttentionParity("attn_prefill_flash_fourTiles",
+                       /*T_q=*/512, /*T_k=*/512,
+                       /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                       /*positionOffset=*/0,
+                       /*scale=*/1.0F / std::sqrt(128.0F),
+                       /*seed=*/0x94, /*tol=*/2e-3F);
+}
+
+TEST(attention_prefill_flash_ragTypical) {
+    // T_q = T_k = 900 → 8 K-tiles (128 * 8 = 1024 > 900). Matches the
+    // RAG-typical baseline from f865d23 (2026-07-03) — 903-token prompt,
+    // 397 ms/prefill-token. Real-world shape that M5i.J is here to make
+    // fast.
+    runAttentionParity("attn_prefill_flash_ragTypical",
+                       /*T_q=*/900, /*T_k=*/900,
+                       /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                       /*positionOffset=*/0,
+                       /*scale=*/1.0F / std::sqrt(128.0F),
+                       /*seed=*/0x95, /*tol=*/2e-3F);
+}
+
+TEST(attention_prefill_flash_headdim512) {
+    // Gemma 4 26B full-attention layer geometry (5 of 30 blocks):
+    // nHeads=16, nKvHeads=8, headDim=512. Kept T_q small to bound the
+    // CPU-reference cost (O(T_q * T_k * nHeads * headDim)) — the point
+    // is to verify oRun[512] SLM usage and the MAX_HEADDIM upper bound.
+    runAttentionParity("attn_prefill_flash_hd512",
+                       /*T_q=*/64, /*T_k=*/64,
+                       /*nHeads=*/16, /*nKvHeads=*/8, /*headDim=*/512,
+                       /*positionOffset=*/0,
+                       /*scale=*/1.0F,
+                       /*seed=*/0x96, /*tol=*/1e-3F);
+}
+
+TEST(attention_prefill_flash_positionOffset) {
+    // Non-zero positionOffset: prefill continuation with 32 prior
+    // cached tokens. Query pq attends to keys [0, 32 + pq + 1). This
+    // matches the multi-turn prefix-reuse path where the KV cache is
+    // pre-filled from an earlier turn's tokens.
+    runAttentionParity("attn_prefill_flash_posOffset",
+                       /*T_q=*/128, /*T_k=*/160,
+                       /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/64,
+                       /*positionOffset=*/32,
+                       /*scale=*/1.0F / std::sqrt(64.0F),
+                       /*seed=*/0x97, /*tol=*/1e-3F);
+}
+
 // =======================================================================
 // Q4_K matmul (GPU vs CPU)
 // =======================================================================

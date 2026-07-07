@@ -100,6 +100,7 @@ set(KERNEL_SOURCES
     kernels/attention.cl
     kernels/attention_flash_partial.cl
     kernels/attention_flash_merge.cl
+    kernels/attention_prefill_flash.cl
     kernels/scaled_add_residual.cl
     kernels/x_quant_i8.cl
     kernels/matmul_q8_0_vec_dp4a.cl
