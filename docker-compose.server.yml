@@ -153,6 +153,15 @@ services:
             #                          (−9 %) mit Turbo + rp0-Pin. Zum
             #                          Deaktivieren explizit auf leer oder
             #                          numerisch setzen (Downshift-Bench).
+            #   DISABLE_DP4A=1       → deaktiviert DP4A-Matmul-Autotune-Picks.
+            #                          Default 1 seit 2026-07-07 nach
+            #                          Q4_K-DP4A-Quality-Collapse-Incident
+            #                          (E4B garbage-Tokens auf jeden Prompt).
+            #                          Root Cause: Q4_K DP4A Parity-Toleranz
+            #                          5 % zu locker für kumulative Drift
+            #                          über 42 Layer × ~250 Matmuls/Token.
+            #                          Auf leer setzen NUR wenn Parity-Gate
+            #                          verschärft wurde (M-Q81-Follow-Up).
             MIMIRMIND_DISABLE_GEMM:      ${MIMIRMIND_DISABLE_GEMM:-}
             MIMIRMIND_FORCE_GEMM:        ${MIMIRMIND_FORCE_GEMM:-}
             MIMIRMIND_GEMM_MIN_M:        ${MIMIRMIND_GEMM_MIN_M:-}
@@ -160,7 +169,7 @@ services:
             MIMIRMIND_DISABLE_MOE_GROUP: ${MIMIRMIND_DISABLE_MOE_GROUP:-}
             MIMIRMIND_DISABLE_FLASH_PREFILL: ${MIMIRMIND_DISABLE_FLASH_PREFILL:-}
             MIMIRMIND_GPU_CLOCK_PIN:     ${MIMIRMIND_GPU_CLOCK_PIN:-rp0}
-            MIMIRMIND_DISABLE_DP4A:      ${MIMIRMIND_DISABLE_DP4A:-}
+            MIMIRMIND_DISABLE_DP4A:      ${MIMIRMIND_DISABLE_DP4A:-1}
             MIMIRMIND_FORCE_DP4A:        ${MIMIRMIND_FORCE_DP4A:-}
 
             # M8.K.1 — opt-in to the v2 Q8_0 GEMM (shrunk-SLM prototype).
