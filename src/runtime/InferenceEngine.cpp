@@ -787,12 +787,39 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // update the shared USM curLen slot and re-execute the same
         // recorded list — no per-token appendLaunch, no per-token
         // barrier setup, no per-kernel arg binding.
-        const bool clrEnabled = [] {
+        const bool clrEnvOn = [] {
             const char* v = std::getenv("MIMIRMIND_ENABLE_CLR");
             if (v == nullptr || v[0] == '\0') return false;
             const std::string_view s{v};
             return !(s == "0" || s == "false" || s == "off");
         }();
+        // MoE models are NOT CLR-safe: `Gemma4MoeBackend::runBlock` picks
+        // top-K experts on the host per record via `cmp::moeTopKRoute`
+        // (reading the router matmul output on the CPU), and every
+        // per-expert matmul dispatch captures a fixed expert weight
+        // pointer + weight scale via setPtr/setValue at record time. At
+        // replay for steps 3+ the routing decision is frozen to step-2's
+        // hidden state — the recorded expert selection is stale, per-
+        // token attention degrades into a repetition loop, and the
+        // sampler emits noise tokens. Confirmed on L0_TARGET_HOST with
+        // Gemma 4 26B-A4B-it-Q6_K under both KvDtype::F32 and
+        // KvDtype::Q8_0. The router matmul is also synchronous
+        // (`_gmm.matmul`, not `matmulAsync`) which flushes the recording
+        // list mid-record — a second, subtler CLR breach. Both problems
+        // are structural to MoE and would need a GPU-side gather +
+        // stable-record refactor to fix cleanly; until that lands, MoE
+        // decode runs in immediate mode.
+        const bool clrEnabled =
+            clrEnvOn && (_config.expertCount == 0);
+        if (clrEnvOn && _config.expertCount > 0) {
+            MM_LOG_WARN("engine",
+                        "MIMIRMIND_ENABLE_CLR=on requested but disabled "
+                        "for this MoE model (expertCount={}) — MoE "
+                        "routing bakes host-computed expert selections "
+                        "into the recording, which stales at replay. "
+                        "Immediate-mode decode used instead.",
+                        _config.expertCount);
+        }
         if (clrEnabled) {
             MM_LOG_INFO("engine",
                         "MIMIRMIND_ENABLE_CLR=on — decode uses record/replay "
