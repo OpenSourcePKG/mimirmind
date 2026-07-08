@@ -284,10 +284,12 @@ public:
     /// (Gemma 4 sw=512). Non-SWA architectures (Qwen 2.5) pass 0.
     ///
     /// `kvDtype` selects between the f32 kernels (default, bit-parity
-    /// with pre-M10.2 behaviour) and the fp16-KV kernels landed in
-    /// M10.2 Phase 0 Commit 3. `k`/`v` are typed as `const void*`
-    /// (Commit 5) so both fp32 and fp16 KV backing storage flow through
-    /// without a cast — the fp16 kernels use `vload_half` at read time.
+    /// with pre-M10.2 behaviour), the fp16-KV kernels landed in M10.2
+    /// Phase 0 Commit 3, and the Q8_0-KV kernels landed in M10.2 Phase 1a
+    /// Commit 4. `k`/`v` are typed as `const void*` (Commit 5 of Phase 0)
+    /// so fp32, fp16 and Q8_0 KV backing storage all flow through without
+    /// a cast — the fp16 kernels use `vload_half` at read time and the
+    /// Q8_0 kernels dequantise (fp16 scale × int8) per 32-element block.
     ///
     /// Throws if T_k > kAttentionMaxTk (8192) or if nHeads is not a
     /// positive multiple of nKvHeads.
@@ -458,6 +460,23 @@ private:
     // the backend Q8_0 branch — never from the F32/FP16 hot paths.
     runtime::GpuModule     _kvQuantCommitQ8Module;
     runtime::GpuKernel     _kvQuantCommitQ8Kernel;
+
+    // M10.2 Phase 1a Commit 4 — Q8_0-KV read variants of the three
+    // attention kernels. Same launch geometry and argument layout as the
+    // f32 / fp16 variants; K/V are stored as ggml block_q8_0 (fp16 scale
+    // + 32 int8 quants per 34 B block) and the kernel body dequantises
+    // on the fly (scale × int8 → fp32) before the softmax. Only touched
+    // when attentionAsync is called with KvDtype::Q8_0; the F32 / FP16
+    // dispatches stay on the pre-existing kernels above so bit-parity is
+    // preserved by construction.
+    runtime::GpuModule     _attentionQ8Module;
+    runtime::GpuKernel     _attentionQ8Kernel;
+
+    runtime::GpuModule     _attentionFlashPartialQ8Module;
+    runtime::GpuKernel     _attentionFlashPartialQ8Kernel;
+
+    runtime::GpuModule     _attentionPrefillFlashQ8Module;
+    runtime::GpuKernel     _attentionPrefillFlashQ8Kernel;
 
     runtime::GpuModule     _scaledAddResidualModule;
     runtime::GpuKernel     _scaledAddResidualKernel;

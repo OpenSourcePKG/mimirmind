@@ -109,6 +109,17 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
       _kvQuantCommitQ8Module   {ctx, "kv_quant_commit_q8_0"},
       _kvQuantCommitQ8Kernel   {
           _kvQuantCommitQ8Module.kernel("kv_quant_commit_q8_0")},
+      _attentionQ8Module              {ctx, "attention_q8_0"},
+      _attentionQ8Kernel              {
+          _attentionQ8Module.kernel("attention_q8_0")},
+      _attentionFlashPartialQ8Module  {ctx, "attention_flash_partial_q8_0"},
+      _attentionFlashPartialQ8Kernel  {
+          _attentionFlashPartialQ8Module.kernel(
+              "attention_flash_partial_q8_0")},
+      _attentionPrefillFlashQ8Module  {ctx, "attention_prefill_flash_q8_0"},
+      _attentionPrefillFlashQ8Kernel  {
+          _attentionPrefillFlashQ8Module.kernel(
+              "attention_prefill_flash_q8_0")},
       _scaledAddResidualModule    {ctx, "scaled_add_residual"},
       _scaledAddResidualKernel    {
           _scaledAddResidualModule.kernel("scaled_add_residual")},
@@ -146,6 +157,8 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
                 "rmsnorm_qkv_fp16/qkv_split_fp16/"
                 "rope_inplace_fp16/rope_inplace_ff_fp16/"
                 "kv_quant_commit_q8_0/"
+                "attention_q8_0/attention_flash_partial_q8_0/"
+                "attention_prefill_flash_q8_0/"
                 "scaled_add_residual/qkv_split/x_quant_i8 loaded "
                 "(rms local={}, elementwise local={}, rope local={}, "
                 "attention local={}, attention max T_k={}, flash kTile={}, "
@@ -942,9 +955,15 @@ void GpuOps::attentionPlainAsync(const float*     q,
     // M10.2 Phase 0 Commit 3 — pick the fp16-KV read variant when the
     // caller signals FP16 storage. Same signature/argument layout, only
     // the K/V loads differ (vload_half + fp32 promote inside the kernel).
-    runtime::GpuKernel& kernel =
-        (kvDtype == runtime::KvDtype::FP16) ? _attentionFp16Kernel
-                                            : _attentionKernel;
+    // M10.2 Phase 1a Commit 4 — Q8_0 branch dequantises per 32-elem block
+    // (fp16 scale × int8) inline; same argument layout.
+    runtime::GpuKernel* kernelPtr = &_attentionKernel;
+    if (kvDtype == runtime::KvDtype::FP16) {
+        kernelPtr = &_attentionFp16Kernel;
+    } else if (kvDtype == runtime::KvDtype::Q8_0) {
+        kernelPtr = &_attentionQ8Kernel;
+    }
+    runtime::GpuKernel& kernel = *kernelPtr;
     *_curLenSlotUsm = toInt32(positionOffset, "attention positionOffset");
     kernel.setPtr(0, q);
     kernel.setPtr(1, k);
@@ -983,9 +1002,14 @@ void GpuOps::attentionPrefillFlashAsync(const float*     q,
     // per query position.
     // M10.2 Phase 0 Commit 3 — pick the fp16-KV read variant when the
     // caller signals FP16 storage.
-    runtime::GpuKernel& kernel =
-        (kvDtype == runtime::KvDtype::FP16) ? _attentionPrefillFlashFp16Kernel
-                                            : _attentionPrefillFlashKernel;
+    // M10.2 Phase 1a Commit 4 — Q8_0 variant dispatch.
+    runtime::GpuKernel* kernelPtr = &_attentionPrefillFlashKernel;
+    if (kvDtype == runtime::KvDtype::FP16) {
+        kernelPtr = &_attentionPrefillFlashFp16Kernel;
+    } else if (kvDtype == runtime::KvDtype::Q8_0) {
+        kernelPtr = &_attentionPrefillFlashQ8Kernel;
+    }
+    runtime::GpuKernel& kernel = *kernelPtr;
     *_curLenSlotUsm =
         toInt32(positionOffset, "prefill_flash positionOffset");
     kernel.setPtr(0, q);
@@ -1049,9 +1073,13 @@ void GpuOps::attentionDecodeFlashAsync(const float*     q,
     // Pass 1 — per-tile partial (m, l, o_unnorm) into the persistent
     // USM scratch. Kernel picked by KV dtype; partial layout stays fp32
     // regardless so the merge kernel is dtype-agnostic.
-    runtime::GpuKernel& partialKernel =
-        (kvDtype == runtime::KvDtype::FP16) ? _attentionFlashPartialFp16Kernel
-                                            : _attentionFlashPartialKernel;
+    runtime::GpuKernel* partialKernelPtr = &_attentionFlashPartialKernel;
+    if (kvDtype == runtime::KvDtype::FP16) {
+        partialKernelPtr = &_attentionFlashPartialFp16Kernel;
+    } else if (kvDtype == runtime::KvDtype::Q8_0) {
+        partialKernelPtr = &_attentionFlashPartialQ8Kernel;
+    }
+    runtime::GpuKernel& partialKernel = *partialKernelPtr;
     partialKernel.setPtr(0, q);
     partialKernel.setPtr(1, k);
     partialKernel.setPtr(2, v);
