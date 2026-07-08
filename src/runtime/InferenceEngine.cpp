@@ -273,14 +273,25 @@ void InferenceEngine::setKvDtype(KvDtype dtype) {
         if (!ownsKv) {
             continue;
         }
-        if (_fusedQkv == nullptr || _fusedQkv->find(b) == nullptr) {
+        // M10.2 Phase 1a Commit 5 relaxation: Q8_0 routes both fused and
+        // non-fused K/V writes through the fp32 staging buffers in
+        // BlockBuffers (kFp32Scratch / vFp32Scratch), then folds each
+        // row into a Q8_0 block via kv_quant_commit_q8_0. The Q8_0 slot
+        // never sees a raw fp32 matmul, so fused-QKV is NOT required
+        // for correctness under Q8_0. FP16 still needs fused-QKV
+        // because a raw fp32 K/V matmul would land bytes directly in
+        // an fp16-typed slot and corrupt it — the FP16 write path has
+        // no staging redirect.
+        if (dtype == KvDtype::FP16 &&
+            (_fusedQkv == nullptr || _fusedQkv->find(b) == nullptr)) {
             throw std::runtime_error(
                 std::string{"InferenceEngine::setKvDtype("} + dtypeName +
                 "): block " + std::to_string(b) +
                 " has no fused-QKV entry — raw fp32 matmul would corrupt "
-                "the K/V slot. Rebuild the model with fused-QKV weights "
-                "(see FusedQkvWeights) or leave MIMIRMIND_KV_DTYPE "
-                "unset for the f32 default.");
+                "the fp16 K/V slot. Rebuild the model with fused-QKV weights "
+                "(see FusedQkvWeights) or use MIMIRMIND_KV_DTYPE=q8_0 "
+                "(which routes non-fused writes through fp32 staging) or "
+                "leave MIMIRMIND_KV_DTYPE unset for the f32 default.");
         }
         if (_weights->findBlock(b, "attn_k.bias") != nullptr) {
             throw std::runtime_error(
@@ -315,14 +326,33 @@ void InferenceEngine::setKvDtype(KvDtype dtype) {
     }
 
     _kvDtype = dtype;
-    MM_LOG_INFO("engine",
-                "setKvDtype: {} enablement guard passed — "
-                "{} own-KV blocks all fused, no attn_k/v.bias tensors{}",
-                (dtype == KvDtype::FP16 ? "fp16" : "q8_0"),
-                _config.blockCount -
-                    (hasSharedKvMap ? _config.sharedKvLayers : 0),
-                (dtype == KvDtype::Q8_0
-                     ? ", all kvDim are multiples of 32" : ""));
+    const std::size_t ownKvBlocks =
+        _config.blockCount -
+        (hasSharedKvMap ? _config.sharedKvLayers : 0);
+    if (dtype == KvDtype::FP16) {
+        MM_LOG_INFO("engine",
+                    "setKvDtype: fp16 enablement guard passed — "
+                    "{} own-KV blocks all fused, no attn_k/v.bias tensors",
+                    ownKvBlocks);
+    } else {
+        // Q8_0 guard is intentionally lighter: fused-QKV is not required,
+        // the non-fused path stages through kvKFp32Scratch/kvVFp32Scratch.
+        std::size_t nFused = 0;
+        for (std::size_t b = 0; b < _config.blockCount; ++b) {
+            const bool ownsKv =
+                !hasSharedKvMap || kvSource[b] == b;
+            if (!ownsKv) continue;
+            if (_fusedQkv != nullptr && _fusedQkv->find(b) != nullptr) {
+                ++nFused;
+            }
+        }
+        MM_LOG_INFO("engine",
+                    "setKvDtype: q8_0 enablement guard passed — "
+                    "{} own-KV blocks ({} fused, {} routed through fp32 "
+                    "staging), no attn_k/v.bias tensors, "
+                    "all kvDim are multiples of 32",
+                    ownKvBlocks, nFused, ownKvBlocks - nFused);
+    }
 }
 
 void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
