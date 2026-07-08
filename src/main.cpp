@@ -1151,14 +1151,18 @@ int runServe(const CliArgs& args) {
         }
     }
 
-    // M10.2 Phase 0 — KV cache element dtype. Default F32 (bit-identical
-    // to pre-M10.2). `fp16` opts in to the 2x bandwidth/RAM win; other
-    // values log a warning and fall back to F32. Must be set before the
-    // first generate() so the lazy KvCache construction picks it up.
+    // M10.2 Phase 0 / 1a — KV cache element dtype. Default F32
+    // (bit-identical to pre-M10.2). `fp16` opts in to the 2× bandwidth
+    // / RAM win; `q8_0` layers on the block-quantised 4× win once the
+    // Q8_0 kernels land (M10.2.0 Commits 3-5). Other values log a
+    // warning and fall back to F32. Must be set before the first
+    // generate() so the lazy KvCache construction picks it up.
     if (const char* env = std::getenv("MIMIRMIND_KV_DTYPE")) {
         const std::string_view v{env};
         if (v == "fp16") {
             engine.setKvDtype(mimirmind::runtime::KvDtype::FP16);
+        } else if (v == "q8_0") {
+            engine.setKvDtype(mimirmind::runtime::KvDtype::Q8_0);
         } else if (v == "f32" || v.empty()) {
             engine.setKvDtype(mimirmind::runtime::KvDtype::F32);
         } else {

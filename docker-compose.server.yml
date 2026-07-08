@@ -127,7 +127,7 @@ services:
             #     KV-RAM ≈ tokens × 430 KiB (Gemma 4 26B).
             MIMIRMIND_MAX_CONTEXT_TOKENS: ${MIMIRMIND_MAX_CONTEXT_TOKENS:-8192}
 
-            # M10.2 Phase 0 — KV-Cache Element-dtype.
+            # M10.2 Phase 0 / 1a — KV-Cache Element-dtype.
             #   f32 (default)  → 4 B pro Element, bit-identisch zu vor-M10.2
             #   fp16           → 2 B pro Element. 2× Bandwidth-Win auf
             #                     Attention-Reads, 2× RAM-Ersparnis, ~3-5 %
@@ -135,12 +135,21 @@ services:
             #                     vs F32 durch FP16-Rundungsfehler
             #                     (~1e-3 pro Load, kohärent auf Response-
             #                     Ebene).
-            # M10.2.-1 Commit 8 — Engine wirft beim Start wenn `fp16`
-            #                     gesetzt ist und das Modell nicht komplett
+            #   q8_0           → 32-Element-Blöcke à 34 B (fp16 scale +
+            #                     32 int8) = ~1.06 B/Elem. 4× Bandwidth-
+            #                     Win vs F32, 2× vs FP16. Decode-Speedup
+            #                     5-8 % @ 500 tok, 20-30 % @ 5000 tok.
+            #                     Precision-Risiko höher als fp16 —
+            #                     Needle-in-Haystack-Test PFLICHT bevor
+            #                     Default-Flip. Kernels landen mit
+            #                     M10.2.0 Commits 3-5.
+            # M10.2.-1 Commit 8 / M10.2.0 Commit 2 — Engine wirft beim
+            #                     Start wenn ein non-F32-dtype gesetzt
+            #                     ist und das Modell nicht komplett
             #                     fused-QKV ist oder attn_k/attn_v.bias
-            #                     Tensoren carrieit (fp32-Matmul/Bias-Add
-            #                     würden fp16-Slots korruptieren). Deploy-
-            #                     Preflight: `MIMIRMIND_KV_DTYPE=fp16`
+            #                     Tensoren trägt. Q8_0 zusätzlich: jedes
+            #                     own-KV kvDim muss Multiple von 32 sein.
+            #                     Deploy-Preflight: `MIMIRMIND_KV_DTYPE=…`
             #                     setzen → Container startet oder throw't
             #                     mit spezifischer Block-Nummer im Log.
             MIMIRMIND_KV_DTYPE:          ${MIMIRMIND_KV_DTYPE:-}
