@@ -1087,6 +1087,196 @@ TEST(attention_decode_flash_swa_windowExceedsCtx) {
 }
 
 // =======================================================================
+// M10.2.-1 FP16-KV attention parity
+// =======================================================================
+//
+// Verify that the fp16-KV attention kernels (attention_fp16,
+// attention_prefill_flash_fp16, attention_flash_partial_fp16) match the
+// fp32-KV baseline on the *same* K/V source data. Baseline: run the f32
+// kernel with fp32 K/V. Comparison: quantise K/V to fp16 on the host
+// and run the fp16 kernel against the fp16 storage. Numerical delta is
+// bounded by fp16 quantisation noise accumulated through the softmax +
+// weighted V-sum. The design ticket (M10.2.-1) sets the gate at 2e-3.
+
+namespace {
+
+// IEEE-754 binary32 → binary16 (round-toward-zero on the mantissa,
+// same as Gemma4E4BBackend::floatToHalf). vload_half on the GPU
+// decodes the exact bit pattern this writes, so what the test
+// quantises on the host is what the kernel loads.
+inline std::uint16_t f32ToF16Bits(float f) noexcept {
+    std::uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const std::uint32_t sign = (bits >> 16) & 0x8000U;
+    std::int32_t        exp  = static_cast<std::int32_t>((bits >> 23) & 0xFFU);
+    const std::uint32_t mant = bits & 0x7FFFFFU;
+
+    if (exp == 0xFF) {
+        return static_cast<std::uint16_t>(
+            sign | 0x7C00U | (mant != 0 ? 0x0200U : 0U));
+    }
+    exp -= 127 - 15;
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<std::uint16_t>(sign);
+        const std::uint32_t m = (mant | 0x800000U) >> (14 - exp);
+        return static_cast<std::uint16_t>(sign | m);
+    }
+    if (exp >= 0x1F) {
+        return static_cast<std::uint16_t>(sign | 0x7C00U);
+    }
+    return static_cast<std::uint16_t>(sign
+        | (static_cast<std::uint32_t>(exp) << 10)
+        | (mant >> 13));
+}
+
+std::vector<std::uint16_t> encodeHalf(const std::vector<float>& src) {
+    std::vector<std::uint16_t> out(src.size());
+    for (std::size_t i = 0; i < src.size(); ++i) {
+        out[i] = f32ToF16Bits(src[i]);
+    }
+    return out;
+}
+
+// Baseline vs fp16-KV, same K/V source data. Both dispatches use the
+// same physical K/V numbers (the fp16 side round-trips them through
+// half-precision), so the delta is purely the accumulated fp16 rounding
+// error inside the softmax + weighted V-sum.
+void runAttentionFp16Parity(const char*  label,
+                            std::size_t  T_q,
+                            std::size_t  T_k,
+                            std::size_t  nHeads,
+                            std::size_t  nKvHeads,
+                            std::size_t  headDim,
+                            std::size_t  positionOffset,
+                            float        scale,
+                            std::uint32_t seed,
+                            float        tol,
+                            std::size_t  slidingWindow = 0)
+{
+    using mimirmind::runtime::KvDtype;
+
+    const std::size_t qN  = T_q * nHeads   * headDim;
+    const std::size_t kvN = T_k * nKvHeads * headDim;
+    const std::size_t oN  = T_q * nHeads   * headDim;
+
+    auto qHost = generateFloats(qN,  seed + 0);
+    auto kHost = generateFloats(kvN, seed + 1);
+    auto vHost = generateFloats(kvN, seed + 2);
+
+    // -- Baseline: f32 kernel on the raw fp32 K/V. -----------------------
+    UsmBuf qBufF32(qN  * sizeof(float));
+    UsmBuf kBufF32(kvN * sizeof(float));
+    UsmBuf vBufF32(kvN * sizeof(float));
+    UsmBuf oBufF32(oN  * sizeof(float));
+    std::memcpy(qBufF32.raw(), qHost.data(), qN  * sizeof(float));
+    std::memcpy(kBufF32.raw(), kHost.data(), kvN * sizeof(float));
+    std::memcpy(vBufF32.raw(), vHost.data(), kvN * sizeof(float));
+    std::memset(oBufF32.raw(), 0,            oN  * sizeof(float));
+
+    fx().ops.attentionAsync(qBufF32.as<float>(),
+                            kBufF32.raw(), vBufF32.raw(),
+                            T_q, T_k, nHeads, nKvHeads, headDim,
+                            positionOffset, scale,
+                            oBufF32.as<float>(),
+                            slidingWindow, KvDtype::F32);
+    fx().queue.flush();
+
+    // -- Comparison: fp16 kernel on host-quantised K/V. ------------------
+    const auto kHalf = encodeHalf(kHost);
+    const auto vHalf = encodeHalf(vHost);
+
+    UsmBuf qBufF16(qN  * sizeof(float));
+    UsmBuf kBufF16(kvN * sizeof(std::uint16_t));
+    UsmBuf vBufF16(kvN * sizeof(std::uint16_t));
+    UsmBuf oBufF16(oN  * sizeof(float));
+    std::memcpy(qBufF16.raw(), qHost.data(), qN  * sizeof(float));
+    std::memcpy(kBufF16.raw(), kHalf.data(), kvN * sizeof(std::uint16_t));
+    std::memcpy(vBufF16.raw(), vHalf.data(), kvN * sizeof(std::uint16_t));
+    std::memset(oBufF16.raw(), 0,            oN  * sizeof(float));
+
+    fx().ops.attentionAsync(qBufF16.as<float>(),
+                            kBufF16.raw(), vBufF16.raw(),
+                            T_q, T_k, nHeads, nKvHeads, headDim,
+                            positionOffset, scale,
+                            oBufF16.as<float>(),
+                            slidingWindow, KvDtype::FP16);
+    fx().queue.flush();
+
+    EXPECT_ARRAY_NEAR(label, oBufF16.as<float>(), oBufF32.as<float>(), oN, tol);
+}
+
+} // namespace
+
+TEST(attention_decode_flash_fp16_parity) {
+    // T_q=1 → attention_flash_partial_fp16. Single-tile decode.
+    runAttentionFp16Parity("attn_flash_partial_fp16",
+                           /*T_q=*/1, /*T_k=*/64,
+                           /*nHeads=*/4, /*nKvHeads=*/2, /*headDim=*/64,
+                           /*positionOffset=*/63,
+                           /*scale=*/1.0F / std::sqrt(64.0F),
+                           /*seed=*/0xF1, /*tol=*/2e-3F);
+}
+
+TEST(attention_decode_flash_fp16_parity_multiTile) {
+    // T_k=2048 → 32 fp16-decode tiles, GQA 4:1, headDim=128. Exercises
+    // the cross-tile merge path under fp16 loads.
+    runAttentionFp16Parity("attn_flash_partial_fp16_multiTile",
+                           /*T_q=*/1, /*T_k=*/2048,
+                           /*nHeads=*/16, /*nKvHeads=*/4, /*headDim=*/128,
+                           /*positionOffset=*/2047,
+                           /*scale=*/1.0F / std::sqrt(128.0F),
+                           /*seed=*/0xF2, /*tol=*/2e-3F);
+}
+
+TEST(attention_prefill_flash_fp16_parity_singleTile) {
+    // T_q=T_k=64 → single K-tile (K_TILE=128). No online-softmax
+    // rescale. Tightest fp16 tolerance since only per-tile softmax
+    // touches the rounded values.
+    runAttentionFp16Parity("attn_prefill_flash_fp16_singleTile",
+                           /*T_q=*/64, /*T_k=*/64,
+                           /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/64,
+                           /*positionOffset=*/0,
+                           /*scale=*/1.0F / std::sqrt(64.0F),
+                           /*seed=*/0xF3, /*tol=*/2e-3F);
+}
+
+TEST(attention_prefill_flash_fp16_parity_multiTile) {
+    // T_q=T_k=512, GQA 4:1, headDim=128 — matches Gemma-4 SWA layer
+    // dims. Multi-tile online-softmax merge under fp16-KV.
+    runAttentionFp16Parity("attn_prefill_flash_fp16_multiTile",
+                           /*T_q=*/512, /*T_k=*/512,
+                           /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                           /*positionOffset=*/0,
+                           /*scale=*/1.0F / std::sqrt(128.0F),
+                           /*seed=*/0xF4, /*tol=*/2e-3F);
+}
+
+TEST(attention_prefill_flash_fp16_parity_ragTypical) {
+    // 900-token prefill under fp16 — the RAG-typical M5i.J shape, most
+    // common real-world case for chat prompts. Loosest tolerance
+    // because 8 K-tiles compound the rescale error.
+    runAttentionFp16Parity("attn_prefill_flash_fp16_ragTypical",
+                           /*T_q=*/900, /*T_k=*/900,
+                           /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                           /*positionOffset=*/0,
+                           /*scale=*/1.0F / std::sqrt(128.0F),
+                           /*seed=*/0xF5, /*tol=*/2e-3F);
+}
+
+TEST(attention_prefill_flash_fp16_parity_swa) {
+    // SWA under fp16-KV: sw=128, T_q=T_k=512. Verifies the fp16 kernel
+    // honours the sliding-window low clamp exactly the same as the
+    // f32 variant.
+    runAttentionFp16Parity("attn_prefill_flash_fp16_swa",
+                           /*T_q=*/512, /*T_k=*/512,
+                           /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                           /*positionOffset=*/0,
+                           /*scale=*/1.0F / std::sqrt(128.0F),
+                           /*seed=*/0xF6, /*tol=*/2e-3F,
+                           /*slidingWindow=*/128);
+}
+
+// =======================================================================
 // Q4_K matmul (GPU vs CPU)
 // =======================================================================
 
