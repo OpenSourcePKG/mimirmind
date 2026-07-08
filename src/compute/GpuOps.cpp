@@ -94,6 +94,18 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
       _attentionPrefillFlashFp16Module{ctx, "attention_prefill_flash_fp16"},
       _attentionPrefillFlashFp16Kernel{
           _attentionPrefillFlashFp16Module.kernel("attention_prefill_flash_fp16")},
+      _rmsnormQkvFp16Module    {ctx, "rmsnorm_qkv_fp16"},
+      _rmsnormQkvFp16Kernel    {
+          _rmsnormQkvFp16Module.kernel("rmsnorm_qkv_fp16")},
+      _qkvSplitFp16Module      {ctx, "qkv_split_fp16"},
+      _qkvSplitFp16Kernel      {
+          _qkvSplitFp16Module.kernel("qkv_split_fp16")},
+      _ropeFp16Module          {ctx, "rope_inplace_fp16"},
+      _ropeFp16Kernel          {
+          _ropeFp16Module.kernel("rope_inplace_fp16")},
+      _ropeFfFp16Module        {ctx, "rope_inplace_ff_fp16"},
+      _ropeFfFp16Kernel        {
+          _ropeFfFp16Module.kernel("rope_inplace_ff_fp16")},
       _scaledAddResidualModule    {ctx, "scaled_add_residual"},
       _scaledAddResidualKernel    {
           _scaledAddResidualModule.kernel("scaled_add_residual")},
@@ -128,6 +140,8 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
                 "gelu_mul/attention/attention_flash/attention_prefill_flash/"
                 "attention_fp16/attention_flash_partial_fp16/"
                 "attention_prefill_flash_fp16/"
+                "rmsnorm_qkv_fp16/qkv_split_fp16/"
+                "rope_inplace_fp16/rope_inplace_ff_fp16/"
                 "scaled_add_residual/qkv_split/x_quant_i8 loaded "
                 "(rms local={}, elementwise local={}, rope local={}, "
                 "attention local={}, attention max T_k={}, flash kTile={}, "
@@ -206,15 +220,16 @@ void GpuOps::rmsNormNoWeightAsync(const float* x,
                         static_cast<std::uint32_t>(M), 1, 1);
 }
 
-void GpuOps::rmsNormQkvAsync(float*       qBuf,   const float* qWeight,
-                             float*       kBase,  const float* kWeight,
-                             float*       vBase,
-                             std::size_t  qRows,
-                             std::size_t  kvRows,
-                             std::size_t  headDim,
-                             float        eps,
-                             std::size_t  writeOffset,
-                             std::size_t  kvDim) {
+void GpuOps::rmsNormQkvAsync(float*           qBuf,   const float* qWeight,
+                             float*           kBase,  const float* kWeight,
+                             float*           vBase,
+                             std::size_t      qRows,
+                             std::size_t      kvRows,
+                             std::size_t      headDim,
+                             float            eps,
+                             std::size_t      writeOffset,
+                             std::size_t      kvDim,
+                             runtime::KvDtype kvDtype) {
     if ((qRows == 0 && kvRows == 0) || headDim == 0) {
         return;
     }
@@ -226,27 +241,34 @@ void GpuOps::rmsNormQkvAsync(float*       qBuf,   const float* qWeight,
     // M-CLR.2: writeOffset (= current KV-cache length) via shared USM
     // slot. Kernel adds `curLen * kvDim` to K/V rows so the kBase/vBase
     // pointers stay stable across replays.
+    // M10.2 Phase 0 Commit 4 — pick the fp16-KV write variant when the
+    // caller signals FP16 storage. Kernel signature is identical (setPtr
+    // is untyped); only the K/V write paths differ (vstore_half vs
+    // scalar store) inside the kernel body.
+    runtime::GpuKernel& kernel =
+        (kvDtype == runtime::KvDtype::FP16) ? _rmsnormQkvFp16Kernel
+                                            : _rmsnormQkvKernel;
     *_curLenSlotUsm = toInt32(writeOffset, "rmsNormQkv writeOffset");
-    _rmsnormQkvKernel.setPtr(0, qBuf);
-    _rmsnormQkvKernel.setPtr(1, qWeight);
-    _rmsnormQkvKernel.setPtr(2, qBuf);           // in-place
-    _rmsnormQkvKernel.setPtr(3, kBase);
-    _rmsnormQkvKernel.setPtr(4, kWeight);
-    _rmsnormQkvKernel.setPtr(5, kBase);          // in-place (same base)
-    _rmsnormQkvKernel.setPtr(6, vBase);
-    _rmsnormQkvKernel.setPtr(7, vBase);          // in-place (same base)
-    _rmsnormQkvKernel.setValue<std::int32_t>(8,  qRowsI);
-    _rmsnormQkvKernel.setValue<std::int32_t>(9,  kvRowsI);
-    _rmsnormQkvKernel.setValue<std::int32_t>(10, Ki);
-    _rmsnormQkvKernel.setValue<float>(11, eps);
-    _rmsnormQkvKernel.setPtr(12, _curLenSlotUsm);
-    _rmsnormQkvKernel.setValue<std::int32_t>(13, kvDimI);
-    _rmsnormQkvKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
+    kernel.setPtr(0, qBuf);
+    kernel.setPtr(1, qWeight);
+    kernel.setPtr(2, qBuf);           // in-place
+    kernel.setPtr(3, kBase);
+    kernel.setPtr(4, kWeight);
+    kernel.setPtr(5, kBase);          // in-place (same base)
+    kernel.setPtr(6, vBase);
+    kernel.setPtr(7, vBase);          // in-place (same base)
+    kernel.setValue<std::int32_t>(8,  qRowsI);
+    kernel.setValue<std::int32_t>(9,  kvRowsI);
+    kernel.setValue<std::int32_t>(10, Ki);
+    kernel.setValue<float>(11, eps);
+    kernel.setPtr(12, _curLenSlotUsm);
+    kernel.setValue<std::int32_t>(13, kvDimI);
+    kernel.setGroupSize(kRmsnormLocalSize, 1, 1);
 
     // Total workgroups = qRows + 2 * kvRows. Q rows first, then K, then V.
     const std::uint32_t totalRows =
         static_cast<std::uint32_t>(qRows + 2 * kvRows);
-    _queue.appendLaunch(_rmsnormQkvKernel, totalRows, 1, 1);
+    _queue.appendLaunch(kernel, totalRows, 1, 1);
 }
 
 void GpuOps::addRmsNormAsync(float*       x,
@@ -349,13 +371,14 @@ void GpuOps::geluMulAsync(float*       gate,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 
-void GpuOps::ropeInPlaceAsync(float*       xBase,
-                              std::size_t  seqLen,
-                              std::size_t  numHeads,
-                              std::size_t  headDim,
-                              std::size_t  startPos,
-                              float        base,
-                              std::size_t  writeOffsetStride) {
+void GpuOps::ropeInPlaceAsync(float*           xBase,
+                              std::size_t      seqLen,
+                              std::size_t      numHeads,
+                              std::size_t      headDim,
+                              std::size_t      startPos,
+                              float            base,
+                              std::size_t      writeOffsetStride,
+                              runtime::KvDtype kvDtype) {
     if (seqLen == 0 || numHeads == 0 || headDim == 0) {
         return;
     }
@@ -373,28 +396,36 @@ void GpuOps::ropeInPlaceAsync(float*       xBase,
     // M-CLR.2 Wave 3b: `writeOffsetStride` == 0 means the kernel takes
     // `xBase` as-is (Q-rope, workspace); != 0 shifts it by
     // `startPos * stride` inside the kernel (K-rope, cache slot).
+    // M10.2 Phase 0 Commit 4 — pick the fp16-KV in-place variant when
+    // caller signals FP16 storage. Rotation is still done in fp32 in
+    // registers (vload_half → rotate → vstore_half); only the read/write
+    // sites change dtype.
+    runtime::GpuKernel& kernel =
+        (kvDtype == runtime::KvDtype::FP16) ? _ropeFp16Kernel
+                                            : _ropeKernel;
     *_curLenSlotUsm = toInt32(startPos, "rope startPos");
-    _ropeKernel.setPtr(0, xBase);
-    _ropeKernel.setValue<std::int32_t>(1, toInt32(seqLen,   "rope seqLen"));
-    _ropeKernel.setValue<std::int32_t>(2, toInt32(numHeads, "rope numHeads"));
-    _ropeKernel.setValue<std::int32_t>(3, toInt32(headDim,  "rope headDim"));
-    _ropeKernel.setPtr(4, _curLenSlotUsm);
-    _ropeKernel.setValue<float>(5, base);
-    _ropeKernel.setValue<std::int32_t>(
+    kernel.setPtr(0, xBase);
+    kernel.setValue<std::int32_t>(1, toInt32(seqLen,   "rope seqLen"));
+    kernel.setValue<std::int32_t>(2, toInt32(numHeads, "rope numHeads"));
+    kernel.setValue<std::int32_t>(3, toInt32(headDim,  "rope headDim"));
+    kernel.setPtr(4, _curLenSlotUsm);
+    kernel.setValue<float>(5, base);
+    kernel.setValue<std::int32_t>(
         6, toInt32(writeOffsetStride, "rope writeOffsetStride"));
-    _ropeKernel.setGroupSize(kRopeLocalSize, 1, 1);
-    _queue.appendLaunch(_ropeKernel,
+    kernel.setGroupSize(kRopeLocalSize, 1, 1);
+    _queue.appendLaunch(kernel,
                         groupsForN(total, kRopeLocalSize), 1, 1);
 }
 
-void GpuOps::ropeInPlaceWithFactorsAsync(float*       xBase,
-                                         const float* freqFactors,
-                                         std::size_t  seqLen,
-                                         std::size_t  numHeads,
-                                         std::size_t  headDim,
-                                         std::size_t  startPos,
-                                         float        base,
-                                         std::size_t  writeOffsetStride) {
+void GpuOps::ropeInPlaceWithFactorsAsync(float*           xBase,
+                                         const float*     freqFactors,
+                                         std::size_t      seqLen,
+                                         std::size_t      numHeads,
+                                         std::size_t      headDim,
+                                         std::size_t      startPos,
+                                         float            base,
+                                         std::size_t      writeOffsetStride,
+                                         runtime::KvDtype kvDtype) {
     if (seqLen == 0 || numHeads == 0 || headDim == 0) {
         return;
     }
@@ -411,18 +442,23 @@ void GpuOps::ropeInPlaceWithFactorsAsync(float*       xBase,
 
     // M-CLR.2: startPos via shared USM slot. See ropeInPlaceAsync().
     // M-CLR.2 Wave 3b: writeOffsetStride shifts xBase for K-rope.
+    // M10.2 Phase 0 Commit 4 — fp16-KV variant dispatch, see
+    // ropeInPlaceAsync above.
+    runtime::GpuKernel& kernel =
+        (kvDtype == runtime::KvDtype::FP16) ? _ropeFfFp16Kernel
+                                            : _ropeFfKernel;
     *_curLenSlotUsm = toInt32(startPos, "rope_ff startPos");
-    _ropeFfKernel.setPtr(0, xBase);
-    _ropeFfKernel.setPtr(1, freqFactors);
-    _ropeFfKernel.setValue<std::int32_t>(2, toInt32(seqLen,   "rope_ff seqLen"));
-    _ropeFfKernel.setValue<std::int32_t>(3, toInt32(numHeads, "rope_ff numHeads"));
-    _ropeFfKernel.setValue<std::int32_t>(4, toInt32(headDim,  "rope_ff headDim"));
-    _ropeFfKernel.setPtr(5, _curLenSlotUsm);
-    _ropeFfKernel.setValue<float>(6, base);
-    _ropeFfKernel.setValue<std::int32_t>(
+    kernel.setPtr(0, xBase);
+    kernel.setPtr(1, freqFactors);
+    kernel.setValue<std::int32_t>(2, toInt32(seqLen,   "rope_ff seqLen"));
+    kernel.setValue<std::int32_t>(3, toInt32(numHeads, "rope_ff numHeads"));
+    kernel.setValue<std::int32_t>(4, toInt32(headDim,  "rope_ff headDim"));
+    kernel.setPtr(5, _curLenSlotUsm);
+    kernel.setValue<float>(6, base);
+    kernel.setValue<std::int32_t>(
         7, toInt32(writeOffsetStride, "rope_ff writeOffsetStride"));
-    _ropeFfKernel.setGroupSize(kRopeLocalSize, 1, 1);
-    _queue.appendLaunch(_ropeFfKernel,
+    kernel.setGroupSize(kRopeLocalSize, 1, 1);
+    _queue.appendLaunch(kernel,
                         groupsForN(total, kRopeLocalSize), 1, 1);
 }
 
@@ -711,15 +747,16 @@ void GpuOps::selfTest(runtime::UsmAllocator& allocator) {
                     : " + attention_prefill_flash (T_q=8) verified");
 }
 
-void GpuOps::qkvSplitAsync(const float* fused,
-                           float*       Yq,
-                           float*       YkBase,
-                           float*       YvBase,
-                           std::size_t  M,
-                           std::size_t  Nq,
-                           std::size_t  Nkv,
-                           bool         hasV,
-                           std::size_t  writeOffset) {
+void GpuOps::qkvSplitAsync(const float*     fused,
+                           float*           Yq,
+                           float*           YkBase,
+                           float*           YvBase,
+                           std::size_t      M,
+                           std::size_t      Nq,
+                           std::size_t      Nkv,
+                           bool             hasV,
+                           std::size_t      writeOffset,
+                           runtime::KvDtype kvDtype) {
     if (M == 0 || Nq == 0 || Nkv == 0) {
         return;
     }
@@ -733,19 +770,25 @@ void GpuOps::qkvSplitAsync(const float* fused,
 
     // M-CLR.2: curLen via shared USM slot. Kernel adds
     // `curLen * Nkv` to reach the row inside the K/V cache.
+    // M10.2 Phase 0 Commit 4 — pick fp16-KV variant when caller signals
+    // FP16. Yq stays fp32 in both paths; Yk/Yv are stored fp16 in the
+    // FP16 dispatch and the fp16 kernel uses vstore_half on the scatter.
+    runtime::GpuKernel& kernel =
+        (kvDtype == runtime::KvDtype::FP16) ? _qkvSplitFp16Kernel
+                                            : _qkvSplitKernel;
     *_curLenSlotUsm = toInt32(writeOffset, "qkvSplit writeOffset");
-    _qkvSplitKernel.setPtr(0, fused);
-    _qkvSplitKernel.setPtr(1, Yq);
-    _qkvSplitKernel.setPtr(2, YkBase);
-    _qkvSplitKernel.setPtr(3, YvPtr);
-    _qkvSplitKernel.setValue<std::int32_t>(4, toInt32(M,      "qkvSplit M"));
-    _qkvSplitKernel.setValue<std::int32_t>(5, toInt32(Nq,     "qkvSplit Nq"));
-    _qkvSplitKernel.setValue<std::int32_t>(6, toInt32(Nkv,    "qkvSplit Nkv"));
-    _qkvSplitKernel.setValue<std::int32_t>(7, hasV ? 1 : 0);
-    _qkvSplitKernel.setValue<std::int32_t>(8, toInt32(Nfused, "qkvSplit Nfused"));
-    _qkvSplitKernel.setPtr(9, _curLenSlotUsm);
-    _qkvSplitKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
-    _queue.appendLaunch(_qkvSplitKernel,
+    kernel.setPtr(0, fused);
+    kernel.setPtr(1, Yq);
+    kernel.setPtr(2, YkBase);
+    kernel.setPtr(3, YvPtr);
+    kernel.setValue<std::int32_t>(4, toInt32(M,      "qkvSplit M"));
+    kernel.setValue<std::int32_t>(5, toInt32(Nq,     "qkvSplit Nq"));
+    kernel.setValue<std::int32_t>(6, toInt32(Nkv,    "qkvSplit Nkv"));
+    kernel.setValue<std::int32_t>(7, hasV ? 1 : 0);
+    kernel.setValue<std::int32_t>(8, toInt32(Nfused, "qkvSplit Nfused"));
+    kernel.setPtr(9, _curLenSlotUsm);
+    kernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(kernel,
                         groupsForN(total, kElementwiseLocalSize), 1, 1);
 }
 

@@ -85,15 +85,22 @@ public:
     /// the pointer arguments stable across replays; `writeOffset` and
     /// `kvDim` fold into the shared USM `curLen` slot + a per-layer
     /// scalar. `writeOffset` = `cache.length()` at the caller.
-    void rmsNormQkvAsync(float*       qBuf,   const float* qWeight,
-                         float*       kBase,  const float* kWeight,
-                         float*       vBase,
-                         std::size_t  qRows,
-                         std::size_t  kvRows,
-                         std::size_t  headDim,
-                         float        eps,
-                         std::size_t  writeOffset,
-                         std::size_t  kvDim);
+    /// M10.2 Phase 0 Commit 4 — `kvDtype` selects between the f32 fused
+    /// kernel (default; K/V destinations = fp32 cache) and the fp16-KV
+    /// variant. `kBase`/`vBase` cross the ABI as `float*` but the
+    /// underlying storage must be fp16 when `kvDtype == FP16` (backend
+    /// migration lands in Commit 5). Q workspace stays fp32 in both
+    /// paths.
+    void rmsNormQkvAsync(float*           qBuf,   const float* qWeight,
+                         float*           kBase,  const float* kWeight,
+                         float*           vBase,
+                         std::size_t      qRows,
+                         std::size_t      kvRows,
+                         std::size_t      headDim,
+                         float            eps,
+                         std::size_t      writeOffset,
+                         std::size_t      kvDim,
+                         runtime::KvDtype kvDtype = runtime::KvDtype::F32);
 
     /// Fused residual-add + RMSNorm. `x[m, k] += delta[m, k]` in place,
     /// then `y[m, k] = x[m, k] * weight[k] / sqrt(mean(x[m, :]^2) + eps)`.
@@ -135,13 +142,19 @@ public:
     /// `xBase = cache.baseK(L)` reaches the current write slot at
     /// startPos*kvDim without the host having to bind a token-varying
     /// pointer.
-    void ropeInPlaceAsync(float*       xBase,
-                          std::size_t  seqLen,
-                          std::size_t  numHeads,
-                          std::size_t  headDim,
-                          std::size_t  startPos,
-                          float        base,
-                          std::size_t  writeOffsetStride = 0);
+    /// M10.2 Phase 0 Commit 4 — `kvDtype` selects between the f32 rope
+    /// kernel (default; `xBase` = fp32 buffer) and the fp16-KV variant
+    /// (`xBase` = fp16 K-cache slot base). Q-rope callers always pass
+    /// F32 because Q-rope targets the fp32 workspace regardless of KV
+    /// storage.
+    void ropeInPlaceAsync(float*           xBase,
+                          std::size_t      seqLen,
+                          std::size_t      numHeads,
+                          std::size_t      headDim,
+                          std::size_t      startPos,
+                          float            base,
+                          std::size_t      writeOffsetStride = 0,
+                          runtime::KvDtype kvDtype           = runtime::KvDtype::F32);
 
     /// In-place RoPE with per-pair frequency factors (ggml_rope_ext's
     /// `freq_factors` argument). `freqFactors` points at [headDim/2] f32
@@ -149,14 +162,17 @@ public:
     ///   theta_i = pos * base^(-2i/headDim) / freqFactors[i]
     /// Used by Gemma 3/4 global-attention layers for proportional RoPE.
     /// `writeOffsetStride` semantics match `ropeInPlaceAsync`.
-    void ropeInPlaceWithFactorsAsync(float*       xBase,
-                                     const float* freqFactors,
-                                     std::size_t  seqLen,
-                                     std::size_t  numHeads,
-                                     std::size_t  headDim,
-                                     std::size_t  startPos,
-                                     float        base,
-                                     std::size_t  writeOffsetStride = 0);
+    /// M10.2 Phase 0 Commit 4 — `kvDtype` selects between the f32 rope
+    /// kernel and the fp16-KV variant. See `ropeInPlaceAsync`.
+    void ropeInPlaceWithFactorsAsync(float*           xBase,
+                                     const float*     freqFactors,
+                                     std::size_t      seqLen,
+                                     std::size_t      numHeads,
+                                     std::size_t      headDim,
+                                     std::size_t      startPos,
+                                     float            base,
+                                     std::size_t      writeOffsetStride = 0,
+                                     runtime::KvDtype kvDtype           = runtime::KvDtype::F32);
 
     /// In-place scalar multiply: y[i] *= s for i in [0, n).
     /// Used by Gemma 4 for layer_output_scale.
@@ -198,15 +214,21 @@ public:
     /// write row. `Yv` may be any valid pointer when `hasV == false`.
     /// `writeOffset` = current KV cache length (0 for the qkvSplit
     /// self-test path).
-    void qkvSplitAsync(const float* fused,
-                       float*       Yq,
-                       float*       YkBase,
-                       float*       YvBase,
-                       std::size_t  M,
-                       std::size_t  Nq,
-                       std::size_t  Nkv,
-                       bool         hasV,
-                       std::size_t  writeOffset = 0);
+    /// M10.2 Phase 0 Commit 4 — `kvDtype` selects between the f32
+    /// scatter kernel and the fp16-KV variant. `YkBase`/`YvBase` cross
+    /// the ABI as `float*` but the underlying storage must be fp16 when
+    /// `kvDtype == FP16` (backend migration lands in Commit 5). `Yq`
+    /// stays fp32 in both paths.
+    void qkvSplitAsync(const float*     fused,
+                       float*           Yq,
+                       float*           YkBase,
+                       float*           YvBase,
+                       std::size_t      M,
+                       std::size_t      Nq,
+                       std::size_t      Nkv,
+                       bool             hasV,
+                       std::size_t      writeOffset = 0,
+                       runtime::KvDtype kvDtype     = runtime::KvDtype::F32);
 
     /// Load-time self-test — run every GPU op with a known input and
     /// compare against a CPU reference within a tight tolerance. Catches
@@ -392,6 +414,24 @@ private:
 
     runtime::GpuModule     _attentionPrefillFlashFp16Module;
     runtime::GpuKernel     _attentionPrefillFlashFp16Kernel;
+
+    // M10.2 Phase 0 Commit 4 — fp16-KV write variants of the four
+    // kernels that populate the KV cache (rmsnorm_qkv, qkv_split) or
+    // rotate its rows in place (rope_inplace, rope_inplace_ff). Only
+    // touched when the corresponding *Async call is passed
+    // KvDtype::FP16; the f32 dispatch stays on the pre-existing kernels
+    // above so bit-parity is preserved by construction.
+    runtime::GpuModule     _rmsnormQkvFp16Module;
+    runtime::GpuKernel     _rmsnormQkvFp16Kernel;
+
+    runtime::GpuModule     _qkvSplitFp16Module;
+    runtime::GpuKernel     _qkvSplitFp16Kernel;
+
+    runtime::GpuModule     _ropeFp16Module;
+    runtime::GpuKernel     _ropeFp16Kernel;
+
+    runtime::GpuModule     _ropeFfFp16Module;
+    runtime::GpuKernel     _ropeFfFp16Kernel;
 
     runtime::GpuModule     _scaledAddResidualModule;
     runtime::GpuKernel     _scaledAddResidualKernel;
