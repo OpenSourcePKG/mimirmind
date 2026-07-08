@@ -249,7 +249,18 @@ public:
     /// generate() (i.e. before ensureCapacity() lazy-constructs the
     /// KvCache). Changing the value after the cache is built is a no-op
     /// until the cache is destroyed and rebuilt.
-    void setKvDtype(KvDtype dtype) noexcept { _kvDtype = dtype; }
+    ///
+    /// M10.2 Phase 0 Commit 8 — when `dtype == FP16` this method
+    /// validates the loaded model against the F32-only paths that
+    /// remain after Commit 5: every own-KV block must have a
+    /// fused-QKV entry (so the K/V projection routes through
+    /// `qkv_split_fp16` instead of raw fp32 matmul), and no block may
+    /// carry an `attn_k.bias` or `attn_v.bias` tensor (the fp32
+    /// `addBiasAsync` would corrupt fp16 slots). Throws
+    /// `std::runtime_error` with the failing block index and reason
+    /// on violation. Requires `loadModel()` to have run first.
+    /// F32 always passes; kept `noexcept`-behaviourally by early-exit.
+    void setKvDtype(KvDtype dtype);
     [[nodiscard]] KvDtype kvDtype() const noexcept { return _kvDtype; }
 
     /// Install (or remove with nullptr) the thermal guard the decode

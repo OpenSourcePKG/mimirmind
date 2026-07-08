@@ -134,11 +134,15 @@ services:
             #                     Decode-Speedup laut Roadmap-Doc. Parity
             #                     vs F32 durch FP16-Rundungsfehler
             #                     (~1e-3 pro Load, kohärent auf Response-
-            #                     Ebene). Kernels müssen dtype unterstützen
-            #                     (Commit 3+4 im M10.2.-1 Ticket) — bevor
-            #                     dieser Toggle live geht, muss der
-            #                     FP16-Kernel-Support gelandet und
-            #                     Parity-getestet sein.
+            #                     Ebene).
+            # M10.2.-1 Commit 8 — Engine wirft beim Start wenn `fp16`
+            #                     gesetzt ist und das Modell nicht komplett
+            #                     fused-QKV ist oder attn_k/attn_v.bias
+            #                     Tensoren carrieit (fp32-Matmul/Bias-Add
+            #                     würden fp16-Slots korruptieren). Deploy-
+            #                     Preflight: `MIMIRMIND_KV_DTYPE=fp16`
+            #                     setzen → Container startet oder throw't
+            #                     mit spezifischer Block-Nummer im Log.
             MIMIRMIND_KV_DTYPE:          ${MIMIRMIND_KV_DTYPE:-}
 
             # M5i Rollback-/Diagnose-Env-Vars — normalerweise leer (Default-

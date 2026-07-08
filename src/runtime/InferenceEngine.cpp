@@ -231,6 +231,72 @@ void InferenceEngine::resetCache() noexcept {
     _cachedTokens.clear();
 }
 
+void InferenceEngine::setKvDtype(KvDtype dtype) {
+    // F32 is unconditionally safe — bit-identical to pre-M10.2 behaviour.
+    if (dtype == KvDtype::F32) {
+        _kvDtype = dtype;
+        return;
+    }
+
+    // FP16 requires the model to route every own-KV block through the
+    // fused-QKV → qkv_split_fp16 path (see the F32-only-Pfade comments
+    // in Qwen2Backend.cpp / GemmaBaseBackend.cpp added in M10.2 Commit 5).
+    // Raw fp32 matmul writes and fp32 bias adds on fp16 K/V slots would
+    // silently corrupt the cache. This guard catches the mismatch at
+    // startup instead of shipping garbage tokens.
+    if (!_modelLoaded) {
+        throw std::runtime_error(
+            "InferenceEngine::setKvDtype(FP16): loadModel() must run "
+            "first — the fp16 guard needs to inspect fused-QKV and "
+            "attn_k/v.bias coverage per block");
+    }
+
+    const auto kvSource = _backend->kvSourceLayerPerLayer();
+    const bool hasSharedKvMap = !kvSource.empty();
+    for (std::size_t b = 0; b < _config.blockCount; ++b) {
+        // Shared-KV blocks never touch the K/V projection themselves —
+        // they alias an earlier block's slot. The earlier own-KV block
+        // is what actually matters, and it will be validated on its own
+        // iteration.
+        const bool ownsKv = !hasSharedKvMap || kvSource[b] == b;
+        if (!ownsKv) {
+            continue;
+        }
+        if (_fusedQkv == nullptr || _fusedQkv->find(b) == nullptr) {
+            throw std::runtime_error(
+                "InferenceEngine::setKvDtype(FP16): block " +
+                std::to_string(b) +
+                " has no fused-QKV entry — raw fp32 matmul would corrupt "
+                "the fp16 K/V slot. Rebuild the model with fused-QKV "
+                "weights (see FusedQkvWeights) or leave MIMIRMIND_KV_DTYPE "
+                "unset for the f32 default.");
+        }
+        if (_weights->findBlock(b, "attn_k.bias") != nullptr) {
+            throw std::runtime_error(
+                "InferenceEngine::setKvDtype(FP16): block " +
+                std::to_string(b) +
+                " carries attn_k.bias — the fp32 addBiasAsync would "
+                "corrupt the fp16 K slot. Only bias-less K/V projections "
+                "(Qwen 2.5+ style, Gemma family) are safe on fp16 today.");
+        }
+        if (_weights->findBlock(b, "attn_v.bias") != nullptr) {
+            throw std::runtime_error(
+                "InferenceEngine::setKvDtype(FP16): block " +
+                std::to_string(b) +
+                " carries attn_v.bias — the fp32 addBiasAsync would "
+                "corrupt the fp16 V slot. Only bias-less K/V projections "
+                "(Qwen 2.5+ style, Gemma family) are safe on fp16 today.");
+        }
+    }
+
+    _kvDtype = dtype;
+    MM_LOG_INFO("engine",
+                "setKvDtype: fp16 enablement guard passed — "
+                "{} own-KV blocks all fused, no attn_k/v.bias tensors",
+                _config.blockCount -
+                    (hasSharedKvMap ? _config.sharedKvLayers : 0));
+}
+
 void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
                                      std::size_t maxNew,
                                      std::size_t vocab_lm, std::size_t d_model) {
