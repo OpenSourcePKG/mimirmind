@@ -1386,6 +1386,183 @@ TEST(attention_prefill_flash_fp16_parity_swa) {
 }
 
 // =======================================================================
+// M10.2.0 Commit 6 — attention_q8_0 / attention_prefill_flash_q8_0 /
+//                    attention_flash_partial_q8_0 parity
+// =======================================================================
+//
+// Verify that the Q8_0-KV attention kernels match the fp32-KV baseline
+// on the *same* K/V source data. Baseline: fp32 K/V through the f32
+// kernel. Comparison: encode K/V to Q8_0 (compute::quant::Q8_0::quantizeRow
+// — the exact byte layout the write kernel targets, so the read path
+// sees the same bytes a real deploy would) and run the Q8_0 read
+// variant. Numerical delta is bounded by per-block absmax + int8 quant
+// noise accumulated through the softmax + weighted V-sum. The design
+// ticket (M10.2.0) sets the gate at 5e-3 — 2.5× looser than fp16's
+// 2e-3 to absorb K-channel-outlier per-block magnitude bleed.
+
+namespace {
+
+std::vector<std::uint8_t> encodeQ8_0(const std::vector<float>& src,
+                                     std::size_t T_k,
+                                     std::size_t kvDim) {
+    constexpr std::size_t kBlockElems = 32;
+    constexpr std::size_t kBlockBytes = 34;
+    const std::size_t nBlocksPerRow = kvDim / kBlockElems;
+    const std::size_t rowBytes      = nBlocksPerRow * kBlockBytes;
+    std::vector<std::uint8_t> out(T_k * rowBytes, 0);
+    for (std::size_t t = 0; t < T_k; ++t) {
+        mimirmind::compute::quant::Q8_0::quantizeRow(
+            src.data() + t * kvDim, kvDim, out.data() + t * rowBytes);
+    }
+    return out;
+}
+
+// Baseline vs Q8_0-KV, same K/V source data. Both dispatches use the
+// same physical K/V numbers (the Q8_0 side round-trips them through
+// per-32-block absmax + int8), so the delta is purely the accumulated
+// Q8_0 quantisation error inside the softmax + weighted V-sum.
+void runAttentionQ8Parity(const char*  label,
+                          std::size_t  T_q,
+                          std::size_t  T_k,
+                          std::size_t  nHeads,
+                          std::size_t  nKvHeads,
+                          std::size_t  headDim,
+                          std::size_t  positionOffset,
+                          float        scale,
+                          std::uint32_t seed,
+                          float        tol,
+                          std::size_t  slidingWindow = 0)
+{
+    using mimirmind::runtime::KvDtype;
+
+    const std::size_t kvDim = nKvHeads * headDim;
+    const std::size_t qN    = T_q * nHeads * headDim;
+    const std::size_t kvN   = T_k * kvDim;
+    const std::size_t oN    = T_q * nHeads * headDim;
+
+    auto qHost = generateFloats(qN,  seed + 0);
+    auto kHost = generateFloats(kvN, seed + 1);
+    auto vHost = generateFloats(kvN, seed + 2);
+
+    // -- Baseline: f32 kernel on the raw fp32 K/V. -----------------------
+    UsmBuf qBufF32(qN  * sizeof(float));
+    UsmBuf kBufF32(kvN * sizeof(float));
+    UsmBuf vBufF32(kvN * sizeof(float));
+    UsmBuf oBufF32(oN  * sizeof(float));
+    std::memcpy(qBufF32.raw(), qHost.data(), qN  * sizeof(float));
+    std::memcpy(kBufF32.raw(), kHost.data(), kvN * sizeof(float));
+    std::memcpy(vBufF32.raw(), vHost.data(), kvN * sizeof(float));
+    std::memset(oBufF32.raw(), 0,            oN  * sizeof(float));
+
+    fx().ops.attentionAsync(qBufF32.as<float>(),
+                            kBufF32.raw(), vBufF32.raw(),
+                            T_q, T_k, nHeads, nKvHeads, headDim,
+                            positionOffset, scale,
+                            oBufF32.as<float>(),
+                            slidingWindow, KvDtype::F32);
+    fx().queue.flush();
+
+    // -- Comparison: Q8_0 kernel on host-quantised K/V. ------------------
+    const auto kQ8 = encodeQ8_0(kHost, T_k, kvDim);
+    const auto vQ8 = encodeQ8_0(vHost, T_k, kvDim);
+
+    UsmBuf qBufQ8(qN * sizeof(float));
+    UsmBuf kBufQ8(kQ8.size());
+    UsmBuf vBufQ8(vQ8.size());
+    UsmBuf oBufQ8(oN * sizeof(float));
+    std::memcpy(qBufQ8.raw(), qHost.data(), qN * sizeof(float));
+    std::memcpy(kBufQ8.raw(), kQ8.data(),   kQ8.size());
+    std::memcpy(vBufQ8.raw(), vQ8.data(),   vQ8.size());
+    std::memset(oBufQ8.raw(), 0,            oN * sizeof(float));
+
+    fx().ops.attentionAsync(qBufQ8.as<float>(),
+                            kBufQ8.raw(), vBufQ8.raw(),
+                            T_q, T_k, nHeads, nKvHeads, headDim,
+                            positionOffset, scale,
+                            oBufQ8.as<float>(),
+                            slidingWindow, KvDtype::Q8_0);
+    fx().queue.flush();
+
+    EXPECT_ARRAY_NEAR(label, oBufQ8.as<float>(), oBufF32.as<float>(), oN, tol);
+}
+
+} // namespace
+
+TEST(attention_decode_flash_q8_0_parity) {
+    // T_q=1 → attention_flash_partial_q8_0. Single-tile decode, kvDim
+    // = 2*64 = 128 = 4 Q8_0 blocks per row. Tightest Q8_0 tolerance —
+    // only per-tile softmax + V-weighted sum touches the dequant.
+    runAttentionQ8Parity("attn_flash_partial_q8_0",
+                         /*T_q=*/1, /*T_k=*/64,
+                         /*nHeads=*/4, /*nKvHeads=*/2, /*headDim=*/64,
+                         /*positionOffset=*/63,
+                         /*scale=*/1.0F / std::sqrt(64.0F),
+                         /*seed=*/0xA1, /*tol=*/5e-3F);
+}
+
+TEST(attention_decode_flash_q8_0_parity_multiTile) {
+    // T_k=2048 → 32 decode tiles, GQA 4:1, headDim=128 (= 4 blocks per
+    // head). Exercises the cross-tile online-softmax merge path under
+    // Q8_0 loads.
+    runAttentionQ8Parity("attn_flash_partial_q8_0_multiTile",
+                         /*T_q=*/1, /*T_k=*/2048,
+                         /*nHeads=*/16, /*nKvHeads=*/4, /*headDim=*/128,
+                         /*positionOffset=*/2047,
+                         /*scale=*/1.0F / std::sqrt(128.0F),
+                         /*seed=*/0xA2, /*tol=*/5e-3F);
+}
+
+TEST(attention_prefill_flash_q8_0_parity_singleTile) {
+    // T_q=T_k=64 → single K-tile (K_TILE=128). No online-softmax
+    // rescale across tiles. Tightest Q8_0 tolerance since only per-tile
+    // softmax touches the dequantised values.
+    runAttentionQ8Parity("attn_prefill_flash_q8_0_singleTile",
+                         /*T_q=*/64, /*T_k=*/64,
+                         /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/64,
+                         /*positionOffset=*/0,
+                         /*scale=*/1.0F / std::sqrt(64.0F),
+                         /*seed=*/0xA3, /*tol=*/5e-3F);
+}
+
+TEST(attention_prefill_flash_q8_0_parity_multiTile) {
+    // T_q=T_k=512, GQA 4:1, headDim=128 — matches Gemma 4 SWA layer
+    // dims. Multi-tile online-softmax merge under Q8_0-KV.
+    runAttentionQ8Parity("attn_prefill_flash_q8_0_multiTile",
+                         /*T_q=*/512, /*T_k=*/512,
+                         /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                         /*positionOffset=*/0,
+                         /*scale=*/1.0F / std::sqrt(128.0F),
+                         /*seed=*/0xA4, /*tol=*/5e-3F);
+}
+
+TEST(attention_prefill_flash_q8_0_parity_ragTypical) {
+    // 900-token prefill under Q8_0 — the RAG-typical M5i.J shape, most
+    // common real-world case for chat prompts. 8 K-tiles compound the
+    // per-tile softmax rescale error, but the block-32 absmax noise is
+    // the dominant term.
+    runAttentionQ8Parity("attn_prefill_flash_q8_0_ragTypical",
+                         /*T_q=*/900, /*T_k=*/900,
+                         /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                         /*positionOffset=*/0,
+                         /*scale=*/1.0F / std::sqrt(128.0F),
+                         /*seed=*/0xA5, /*tol=*/5e-3F);
+}
+
+TEST(attention_prefill_flash_q8_0_parity_swa) {
+    // SWA under Q8_0-KV: sw=128, T_q=T_k=512. Verifies the Q8_0 kernel
+    // honours the sliding-window low clamp exactly the same as the
+    // f32 variant, and that the block-32 index arithmetic doesn't
+    // break at the clamp boundary.
+    runAttentionQ8Parity("attn_prefill_flash_q8_0_swa",
+                         /*T_q=*/512, /*T_k=*/512,
+                         /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                         /*positionOffset=*/0,
+                         /*scale=*/1.0F / std::sqrt(128.0F),
+                         /*seed=*/0xA6, /*tol=*/5e-3F,
+                         /*slidingWindow=*/128);
+}
+
+// =======================================================================
 // Q4_K matmul (GPU vs CPU)
 // =======================================================================
 
