@@ -143,6 +143,29 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     void* vBase = const_cast<void*>(cache.baseV(blockIdx));
     const auto kvDtype = cache.dtype();
 
+    // M10.2 Phase 1a Commit 5: Q8_0 KV routes rmsnorm_qkv + RoPE through
+    // an fp32 workspace, then folds the results into 32-elem Q8_0 blocks
+    // via `kv_quant_commit_q8_0`. The workspace pointers replace kBase /
+    // vBase for the pre-quantise pipeline; the actual cache slots stay
+    // Q8_0-typed and are only written by the commit kernel below.
+    const bool q8Path = (kvDtype == KvDtype::Q8_0);
+    float* const kFp32Scratch = q8Path ? s.kvKFp32Scratch.as<float>() : nullptr;
+    float* const vFp32Scratch = q8Path ? s.kvVFp32Scratch.as<float>() : nullptr;
+    void* const kStagingBase  = q8Path
+        ? static_cast<void*>(kFp32Scratch)
+        : kBase;
+    void* const vStagingBase  = q8Path
+        ? static_cast<void*>(vFp32Scratch)
+        : vBase;
+    // Under Q8_0 the staging buffers hold exactly the T new rows starting
+    // at row 0 (no history to skip), and every write kernel that consumes
+    // them must be told KvDtype::F32 + writeOffset=0. The `curLen` value
+    // is still passed to K-RoPE via startPos for correct positional
+    // angles — only the *destination* pointer arithmetic changes.
+    const auto stagingKvDtype  = q8Path ? KvDtype::F32 : kvDtype;
+    const std::size_t stagingWriteOffset = q8Path ? 0 : curLen;
+    const std::size_t stagingWriteStride = q8Path ? 0 : kv_dim;
+
     // M5i.B: Fused Q+K+V — single matmul into a staging buffer, then a
     // scatter kernel routes the sub-ranges into qBuf/kSlot/vSlot. Bias
     // adds run on the split outputs as usual, no change there.
@@ -156,25 +179,37 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
             fBlk->Nq + fBlk->Nkv * (fBlk->hasV ? 2 : 1);
         _gmm.matmulAsync(fBlk->type, fBlk->usmPtr, Nfused, d_model,
                          normBuf, T, qkvFused, matmulScratch);
-        _ops.qkvSplitAsync(qkvFused, qBuf, kBase, vBase,
-                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV, curLen,
-                           kvDtype);
+        // M10.2 Phase 1a Commit 5: Q8_0 scatters K/V into the fp32
+        // staging buffers (writeOffset=0, dtype=F32). The subsequent
+        // rope-K + kv_quant_commit_q8_0 sequence walks the staging
+        // buffers and finalises the current-row Q8_0 blocks into the
+        // cache slot.
+        _ops.qkvSplitAsync(qkvFused, qBuf, kStagingBase, vStagingBase,
+                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV,
+                           stagingWriteOffset,
+                           stagingKvDtype);
     } else {
         // M5f.4: Q/K/V projections write disjoint buffers and depend only
         // on normBuf (already published by the rmsnorm above). They can
         // pipeline freely inside the unordered scope; the scope's pop
         // emits a single barrier that the bias adds + RoPE read against.
         // M10.2 Commit 5: matmul writes fp32 directly into K/V slots —
-        // only correct when the KV cache is fp32. fp16-KV models must
-        // ship fused-QKV weights (Commit 8 will add the enablement
-        // check on the engine side); until then the reinterpret_cast is
-        // truthful for the F32 default path.
+        // only correct when the KV cache is fp32. fp16-KV / Q8_0-KV
+        // models must ship fused-QKV weights (the engine-side guard in
+        // Commit 8 / Phase 1a Commit 2 enforces this); the K/V write
+        // destination below is the fp32 staging under Q8_0 so a future
+        // guard bypass corrupts the *staging* rather than the packed
+        // cache slot.
         trace("Q+K+V projections (matmulAsync, unordered)");
         {
             runtime::UnorderedScope u{_ops.queue()};
             projectAsync(qW, q_dim,  qBuf);
-            projectAsync(kW, kv_dim, static_cast<float*>(kSlot));
-            projectAsync(vW, kv_dim, static_cast<float*>(vSlot));
+            projectAsync(kW, kv_dim,
+                         q8Path ? kFp32Scratch
+                                : static_cast<float*>(kSlot));
+            projectAsync(vW, kv_dim,
+                         q8Path ? vFp32Scratch
+                                : static_cast<float*>(vSlot));
         }
     }
 
@@ -182,15 +217,22 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     // others. The bias add does read its own projection output, so
     // this scope's preceding barrier (from the Q/K/V projection pop
     // above) is what makes the chain safe.
-    // M10.2 Commit 5: addBiasAsync writes fp32; on fp16-KV models the
-    // K/V bias tensors must be null (Qwen2.5+ style). Guarded by the
-    // engine-side fp16-enablement check in Commit 8.
+    // M10.2 Commit 5: addBiasAsync writes fp32; on non-F32-KV models the
+    // K/V bias tensors must be null (Qwen 2.5+ style, Gemma family) —
+    // the engine-side setKvDtype guard rejects any block that carries
+    // attn_k/v.bias so this branch is safe. Under Q8_0 the K/V bias
+    // destinations point at the fp32 staging (kFp32Scratch/vFp32Scratch)
+    // for the same defence-in-depth reason as the projection above.
     trace("QKV bias add (async, unordered)");
     {
         runtime::UnorderedScope u{_ops.queue()};
         addBiasIf(qB, q_dim,  qBuf);
-        addBiasIf(kB, kv_dim, static_cast<float*>(kSlot));
-        addBiasIf(vB, kv_dim, static_cast<float*>(vSlot));
+        addBiasIf(kB, kv_dim,
+                  q8Path ? kFp32Scratch
+                         : static_cast<float*>(kSlot));
+        addBiasIf(vB, kv_dim,
+                  q8Path ? vFp32Scratch
+                         : static_cast<float*>(vSlot));
     }
 
     // RoPE on Q and K — independent buffers, no V-dependency.
@@ -200,16 +242,35 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     // when the cache is fp16 (rotation stays fp32 in registers, only
     // load/store change). Q-rope always targets the fp32 workspace, so
     // it explicitly passes KvDtype::F32.
+    // M10.2 Phase 1a Commit 5: under Q8_0 K-rope targets the fp32
+    // staging (kFp32Scratch, T rows starting at row 0). startPos still
+    // carries `curLen` for correct positional angles, but the write-
+    // offset stride is 0 because there's no history in front of row 0.
     trace("RoPE Q+K (async, unordered)");
     {
         runtime::UnorderedScope u{_ops.queue()};
         _ops.ropeInPlaceAsync(qBuf, T,
                               _config.headCount,   head_dim, curLen,
                               _config.ropeFreqBase);
-        _ops.ropeInPlaceAsync(kBase, T,
+        _ops.ropeInPlaceAsync(kStagingBase, T,
                               _config.headCountKv, head_dim, curLen,
-                              _config.ropeFreqBase, kv_dim,
-                              kvDtype);
+                              _config.ropeFreqBase, stagingWriteStride,
+                              stagingKvDtype);
+    }
+
+    // M10.2 Phase 1a Commit 5: fold the fp32 K/V staging rows into 32-
+    // element Q8_0 blocks inside the actual cache slots. Two dispatches
+    // because the layout matches [T, kv_dim] fp32 → [T, kv_dim/32, 34 B]
+    // Q8_0. Same immediate/replay semantics as ropeInPlaceAsync — the
+    // shared curLenSlot() drives the row offset.
+    if (q8Path) {
+        trace("KV commit Q8_0 (K + V)");
+        _ops.kvQuantCommitQ8Async(kFp32Scratch,
+                                  static_cast<void*>(kBase),
+                                  T, kv_dim, curLen);
+        _ops.kvQuantCommitQ8Async(vFp32Scratch,
+                                  static_cast<void*>(vBase),
+                                  T, kv_dim, curLen);
     }
 
     // M5f.3: attention is on the GPU. No sync needed before it — the

@@ -10,7 +10,8 @@ BlockBuffers allocBlockBuffers(UsmAllocator&           allocator,
                                std::size_t             maxSeq,
                                std::size_t             qDimMax,
                                std::size_t             kvDimMax,
-                               bool                    withFusedQkv) {
+                               bool                    withFusedQkv,
+                               bool                    withKvFp32Scratch) {
     BlockBuffers b{};
     b.maxT    = maxT;
     b.maxSeq  = maxSeq;
@@ -43,6 +44,17 @@ BlockBuffers allocBlockBuffers(UsmAllocator&           allocator,
         const std::size_t fusedBytes =
             maxT * (b.q_dim + 2 * b.kv_dim) * sizeof(float);
         b.qkvFusedScratch = UsmHandle{allocator, fusedBytes};
+    }
+
+    if (withKvFp32Scratch) {
+        // Persistent fp32 K/V staging for the Q8_0 KV path. Sized for
+        // the widest layer's kv_dim; every backend's Q8_0 branch writes
+        // rmsnorm_qkv + RoPE output here and then invokes
+        // kv_quant_commit_q8_0 to finalise into the cache slot.
+        const std::size_t kvFp32Bytes =
+            maxT * b.kv_dim * sizeof(float);
+        b.kvKFp32Scratch = UsmHandle{allocator, kvFp32Bytes};
+        b.kvVFp32Scratch = UsmHandle{allocator, kvFp32Bytes};
     }
 
     if (config.expertCount > 0) {

@@ -41,6 +41,16 @@ struct BlockBuffers {
     // layer (Q + K + V heads). Only allocated when fused QKV is enabled.
     UsmHandle qkvFusedScratch; // [maxT, q_dim + 2*kv_dim]
 
+    // M10.2 Phase 1a Commit 5 — persistent fp32 K/V staging for the Q8_0
+    // KV cache path. rmsnorm_qkv + RoPE stay fp32 in registers/USM; then
+    // `kv_quant_commit_q8_0` folds each row into a 32-elem Q8_0 block
+    // (fp16 scale + 32 int8) inside the cache slot. Only allocated when
+    // the engine is configured with KvDtype::Q8_0; zero-sized otherwise.
+    // Layout: [maxT, kv_dim] fp32 each. Layer-lokal reused across the
+    // forward pass (sequential runBlock), so 2 buffers cover every layer.
+    UsmHandle kvKFp32Scratch;  // [maxT, kv_dim]
+    UsmHandle kvVFp32Scratch;  // [maxT, kv_dim]
+
     // Gemma 4 Path B (MoE) scratch. Zero-sized for non-MoE blocks.
     UsmHandle moeAccumBuf;   // [maxT, d_model]   weighted sum of experts
     UsmHandle expertOutBuf;  // [maxT, d_model]   per-expert down output
@@ -65,6 +75,7 @@ BlockBuffers allocBlockBuffers(UsmAllocator&           allocator,
                                std::size_t             maxSeq,
                                std::size_t             qDimMax,
                                std::size_t             kvDimMax,
-                               bool                    withFusedQkv = false);
+                               bool                    withFusedQkv     = false,
+                               bool                    withKvFp32Scratch = false);
 
 } // namespace mimirmind::runtime

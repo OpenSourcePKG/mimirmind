@@ -273,6 +273,25 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         : nullptr;
     const auto kvDtype = cache.dtype();
 
+    // M10.2 Phase 1a Commit 5: under Q8_0 KV the entire pre-quantise
+    // pipeline (fused qkv_split → rmsnorm_qkv → RoPE) runs against the
+    // fp32 staging buffers in BlockBuffers; kv_quant_commit_q8_0 then
+    // folds each row into a 32-element Q8_0 block inside the cache slot.
+    // Shared-KV blocks skip the K/V pipeline entirely, so they never
+    // touch the staging buffers.
+    const bool q8Path = (kvDtype == KvDtype::Q8_0) && li.ownsKv;
+    float* const kFp32Scratch = q8Path ? s.kvKFp32Scratch.as<float>() : nullptr;
+    float* const vFp32Scratch = q8Path ? s.kvVFp32Scratch.as<float>() : nullptr;
+    void* const kStagingBase  = q8Path
+        ? static_cast<void*>(kFp32Scratch)
+        : kBase;
+    void* const vStagingBase  = q8Path
+        ? static_cast<void*>(vFp32Scratch)
+        : vBase;
+    const auto stagingKvDtype  = q8Path ? KvDtype::F32 : kvDtype;
+    const std::size_t stagingWriteOffset = q8Path ? 0 : curLen;
+    const std::size_t stagingWriteStride = q8Path ? 0 : kv_dim;
+
     // --- pre-attention RMSNorm ----------------------------------------
 
     _op.mark(runtime::OpProfiler::Cat::NORM);
@@ -308,24 +327,36 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
             fBlk->Nq + fBlk->Nkv * (fBlk->hasV ? 2 : 1);
         _gmm.matmulAsync(fBlk->type, fBlk->usmPtr, Nfused, d_model,
                          normBuf, T, qkvFused, matmulScratch);
-        _ops.qkvSplitAsync(qkvFused, qBuf, kBase, vBase,
-                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV, curLen,
-                           kvDtype);
+        // M10.2 Phase 1a Commit 5: Q8_0 scatters K/V into the fp32
+        // staging buffers (writeOffset=0, dtype=F32); rmsnorm_qkv +
+        // RoPE below stay on the staging pointers, and
+        // kv_quant_commit_q8_0 folds the results into the actual cache
+        // slot.
+        _ops.qkvSplitAsync(qkvFused, qBuf, kStagingBase, vStagingBase,
+                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV,
+                           stagingWriteOffset,
+                           stagingKvDtype);
     } else if (li.ownsKv) {
         // M5f.4: Q/K/V projections write disjoint buffers. The pop inserts
         // a single barrier so the norms below see all three matmul outputs.
         // M10.2 Commit 5: raw matmul writes fp32 directly into K/V slots
-        // — only correct when the cache is F32. fp16-KV Gemma variants
-        // must ship fused-QKV weights (all currently deployed variants
-        // do); the engine-side enablement check in Commit 8 will make
-        // this an invariant.
+        // — only correct when the cache is F32. Non-F32 Gemma variants
+        // must ship fused-QKV weights for own-KV layers; the engine-side
+        // setKvDtype guard enforces this for FP16 and Q8_0. Under Q8_0
+        // the K/V destinations are the fp32 staging buffers so a future
+        // guard bypass corrupts the *staging* rather than the packed
+        // cache slot.
         trace("Q+K+V projections (matmulAsync, unordered)");
         {
             runtime::UnorderedScope u{_ops.queue()};
             projectAsync(qW, q_dim, qBuf);
-            projectAsync(kW, kv_dim, static_cast<float*>(kSlot));
+            projectAsync(kW, kv_dim,
+                         q8Path ? kFp32Scratch
+                                : static_cast<float*>(kSlot));
             if (!li.altAttention) {
-                projectAsync(vW, kv_dim, static_cast<float*>(vSlot));
+                projectAsync(vW, kv_dim,
+                             q8Path ? vFp32Scratch
+                                    : static_cast<float*>(vSlot));
             }
         }
     } else {
@@ -343,13 +374,18 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // settled USM region.
         // M10.2 Phase 1a — `rowBytes(blockIdx)` returns the layer's
         // per-token storage footprint for the active KvDtype: kv_dim*4
-        // for F32, kv_dim*2 for FP16, (kv_dim/32)*34 for Q8_0. Using
-        // it instead of `elementBytes()` keeps this memcpy correct for
-        // all three dtypes without a per-dtype branch, and avoids
-        // hitting the Q8_0 `elementBytes()` throw.
+        // for F32, kv_dim*2 for FP16, (kv_dim/32)*34 for Q8_0. Under
+        // Q8_0 the copy runs on the fp32 staging (K → V, kv_dim*4 per
+        // row) so rmsnorm_qkv + rope + kv_quant_commit_q8_0 see the
+        // raw K in the V staging just like the F32 / FP16 paths.
         trace("alt-attn V = raw K (memcpy)");
         _gmm.sync();
-        std::memcpy(vSlot, kSlot, T * cache.rowBytes(blockIdx));
+        if (q8Path) {
+            std::memcpy(vFp32Scratch, kFp32Scratch,
+                        T * kv_dim * sizeof(float));
+        } else {
+            std::memcpy(vSlot, kSlot, T * cache.rowBytes(blockIdx));
+        }
     }
 
     // Q-norm always runs. K-norm + V-norm only when the layer owns K/V.
@@ -360,14 +396,18 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     _op.mark(runtime::OpProfiler::Cat::NORM);
     if (li.ownsKv) {
         trace("Q+K+V norms (rmsNorm fused)");
+        // M10.2 Phase 1a Commit 5: under Q8_0 the K/V destinations are
+        // the fp32 staging buffers (writeOffset=0, dtype=F32); the F32
+        // rmsnorm_qkv kernel body runs unchanged, we just point it at
+        // the staging rows the projection above wrote.
         _ops.rmsNormQkvAsync(
-            qBuf,  static_cast<const float*>(qNorm->usmPtr),
-            kBase, static_cast<const float*>(kNorm->usmPtr),
-            vBase,
+            qBuf,          static_cast<const float*>(qNorm->usmPtr),
+            kStagingBase,  static_cast<const float*>(kNorm->usmPtr),
+            vStagingBase,
             T * li.nHeads, T * li.nKvHeads, head_dim,
             _config.rmsNormEps,
-            curLen, kv_dim,
-            kvDtype);
+            stagingWriteOffset, kv_dim,
+            stagingKvDtype);
     } else {
         trace("Q-norm only (shared-KV layer)");
         _ops.rmsNormAsync(qBuf, T * li.nHeads, head_dim,
@@ -388,22 +428,29 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // Q-rope always uses the F32 kernel because it targets the
         // fp32 workspace regardless of KV storage — the default arg
         // handles that implicitly.
+        // M10.2 Phase 1a Commit 5: under Q8_0 K-rope targets the fp32
+        // staging (kFp32Scratch, T rows at row 0). startPos still
+        // carries `curLen` for correct positional angles; the write
+        // stride is 0 because the staging holds no history.
         trace("RoPE Q+K (unordered)");
         runtime::UnorderedScope u{_ops.queue()};
         if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
             _ops.ropeInPlaceWithFactorsAsync(qBuf, _ropeFreqsForFullAttn, T,
                                              li.nHeads, head_dim, curLen,
                                              li.ropeBase);
-            _ops.ropeInPlaceWithFactorsAsync(kBase, _ropeFreqsForFullAttn, T,
+            _ops.ropeInPlaceWithFactorsAsync(kStagingBase,
+                                             _ropeFreqsForFullAttn, T,
                                              li.nKvHeads, head_dim, curLen,
-                                             li.ropeBase, kv_dim,
-                                             kvDtype);
+                                             li.ropeBase,
+                                             stagingWriteStride,
+                                             stagingKvDtype);
         } else {
             _ops.ropeInPlaceAsync(qBuf, T, li.nHeads, head_dim, curLen,
                                   li.ropeBase);
-            _ops.ropeInPlaceAsync(kBase, T, li.nKvHeads, head_dim, curLen,
-                                  li.ropeBase, kv_dim,
-                                  kvDtype);
+            _ops.ropeInPlaceAsync(kStagingBase, T, li.nKvHeads, head_dim, curLen,
+                                  li.ropeBase,
+                                  stagingWriteStride,
+                                  stagingKvDtype);
         }
     } else {
         trace("RoPE Q only (shared-KV layer)");
@@ -421,14 +468,36 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // the cast is a lie, so we skip the dump when the cache isn't
         // fp32. Parity-dumps for fp16 land in Commit 7 alongside the
         // fp16 parity test.
+        // M10.2 Phase 1a Commit 5: under Q8_0 the raw (post-rope) K/V
+        // still lives in the fp32 staging just before quantisation —
+        // dump *that* so parity vs a CPU reference stays meaningful.
         if (kvDtype == KvDtype::F32) {
             dumpStage("Kcur_pos",    blockIdx,
                       static_cast<float*>(kSlot), T, kv_dim);
             dumpStage("Vcur_normed", blockIdx,
                       static_cast<float*>(vSlot), T, kv_dim);
+        } else if (q8Path) {
+            dumpStage("Kcur_pos",    blockIdx, kFp32Scratch, T, kv_dim);
+            dumpStage("Vcur_normed", blockIdx, vFp32Scratch, T, kv_dim);
         }
     }
     dumpStage("Qcur_pos", blockIdx, qBuf, T, q_dim);
+
+    // M10.2 Phase 1a Commit 5: fold the fp32 K/V staging rows into 32-
+    // element Q8_0 blocks inside the actual cache slots. The commit
+    // kernel handles both K and V shape identically (row = kv_dim fp32
+    // → kv_dim/32 blocks of 34 B each). Shared-KV blocks skip this —
+    // their attention reads from the source layer's cache which was
+    // already committed earlier in the same forward pass.
+    if (q8Path) {
+        trace("KV commit Q8_0 (K + V)");
+        _ops.kvQuantCommitQ8Async(kFp32Scratch,
+                                  static_cast<void*>(kBase),
+                                  T, kv_dim, curLen);
+        _ops.kvQuantCommitQ8Async(vFp32Scratch,
+                                  static_cast<void*>(vBase),
+                                  T, kv_dim, curLen);
+    }
 
     // M5f.3: attention on the GPU. Gemma 4's f_attention_scale = 1.0
     // (gemma4.cpp:11), so we pass scale=1.0 directly — no sqrt(head_dim)

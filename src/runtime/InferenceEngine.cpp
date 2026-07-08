@@ -339,12 +339,14 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
             _backend->kvDimPerLayer(),
             _backend->kvSourceLayerPerLayer(),
             _kvDtype);
+        const char* dtypeLabel = "f32";
+        if (_kvDtype == KvDtype::FP16) dtypeLabel = "fp16";
+        else if (_kvDtype == KvDtype::Q8_0) dtypeLabel = "q8_0";
         MM_LOG_INFO("kvcache",
                     "pre-allocated for {} tokens dtype={} "
                     "(set via MIMIRMIND_MAX_CONTEXT_TOKENS / "
                     "MIMIRMIND_KV_DTYPE)",
-                    _maxContextTokens,
-                    (_kvDtype == KvDtype::FP16 ? "fp16" : "f32"));
+                    _maxContextTokens, dtypeLabel);
     }
 
     // Hard cap: a request that doesn't fit gets a clear error rather
@@ -376,10 +378,15 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     const auto [qDimMax, kvDimMax] = _backend->maxQKVDims();
     const bool withFusedQkv =
         _fusedQkv != nullptr && _fusedQkv->anyFused();
+    // M10.2 Phase 1a Commit 5 — Q8_0 KV requires a persistent fp32 K/V
+    // workspace: rmsnorm_qkv + RoPE run fp32-in-place there and then
+    // `kv_quant_commit_q8_0` folds the rows into the Q8_0 cache slot.
+    const bool withKvFp32Scratch = (_kvDtype == KvDtype::Q8_0);
     _blockBuffers = allocBlockBuffers(_allocator, _config,
                                       maxT, _maxContextTokens,
                                       qDimMax, kvDimMax,
-                                      withFusedQkv);
+                                      withFusedQkv,
+                                      withKvFp32Scratch);
 
     _xBufH      = UsmHandle{_allocator, maxT      * d_model  * sizeof(float)};
     _normFinalH = UsmHandle{_allocator, d_model   * sizeof(float)};
