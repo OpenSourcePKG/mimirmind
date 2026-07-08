@@ -11,7 +11,7 @@
 namespace mimirmind::runtime::arch {
 
 /**
- * Gemma 3n E-Series (E4B / E2B) as shipped by the llama.cpp-compatible
+ * Gemma 4 E-Series (E4B / E2B) as shipped by the llama.cpp-compatible
  * GGUF conversion. The GGUF does NOT carry AltUp / Laurel weights (see
  * ggml-org/llama.cpp #22243) — the converter emits a simplified variant
  * that folds those pieces away and replaces them with a small pair of
@@ -37,7 +37,7 @@ namespace mimirmind::runtime::arch {
  *
  * References:
  *   - alandao.net "Gemma 4 E2B & PLE Research Notes" (combine formula)
- *   - Google AI "Gemma 3n model overview"
+ *   - Google AI E-Series architecture overview
  *   - ggml-org/llama.cpp Issue #22243 (simplified conversion)
  */
 class Gemma4E4BBackend final : public GemmaBaseBackend {

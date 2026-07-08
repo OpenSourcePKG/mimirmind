@@ -513,8 +513,8 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
         _op.mark(runtime::OpProfiler::Cat::ACTIVATION);
         // Fused GELU + element-wise mul: gate = GELU(gate) * per_layer_input.
         // Per llama.cpp gemma4.cpp line 373 (`ggml_gelu`) — the simplified
-        // Gemma 4 path uses GELU, not SiLU (unlike the full Gemma 3n path
-        // which does use SiLU alongside AltUp/Laurel).
+        // Gemma 4 path uses GELU, not SiLU (unlike the full Gemma 4 E-Series
+        // path which does use SiLU alongside AltUp/Laurel).
         _ops.geluMulAsync(pleGateBuf, pleSliceForLayer, T * _perLayerDim);
 
         _op.mark(runtime::OpProfiler::Cat::MATMUL);
@@ -524,8 +524,8 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
                     projOutBuf, matmulScratch);
 
         _op.mark(runtime::OpProfiler::Cat::NORM);
-        // Plain w * rmsnorm(x) — Gemma 3n uses the same convention as
-        // Gemma 4 base (no shift).
+        // Plain w * rmsnorm(x) — Gemma 4 E-Series uses the same convention
+        // as Gemma 4 base (no shift).
         _ops.rmsNormAsync(projOutBuf, T, d_model,
                           static_cast<const float*>(postNorm->usmPtr),
                           _config.rmsNormEps,

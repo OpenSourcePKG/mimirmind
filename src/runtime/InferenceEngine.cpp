@@ -60,7 +60,7 @@ void logBlockTensorInventory(const model::GgufReader& reader,
 
 /// Dump every top-level (non-blk.*) tensor plus a canonical set of
 /// per-block suffix names sorted by frequency. Answers "does this GGUF
-/// carry the AltUp / Laurel / PLE side tensors we need for Gemma 3n"
+/// carry the AltUp / Laurel / PLE side tensors we need for Gemma 4 E-Series"
 /// without swamping the log with 720 lines. Cheap enough to leave in
 /// for any architecture — non-E-series models just show their own set.
 void logTensorTaxonomy(const model::GgufReader& reader) {
