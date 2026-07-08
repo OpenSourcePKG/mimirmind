@@ -235,6 +235,27 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                          : static_cast<float*>(vSlot));
     }
 
+    // M10.2 Phase 1a Commit 5 hotfix (shared-slot race): under Q8_0 the
+    // qkv_split above bound `_curLenSlotUsm = 0` (writeOffset for the
+    // staging destination). The rope + kv_quant_commit + attention
+    // dispatches below all want `_curLenSlotUsm = curLen`. Because
+    // GpuOps' shared slot is written by the host per call and read by
+    // the GPU at kernel-execution time, letting them share a flush
+    // cycle races: the second host-write wins and qkv_split reads
+    // curLen instead of 0, then writes at row `curLen*kvDim` in the
+    // fp32 staging buffer (out-of-place or in-the-weeds), and
+    // kv_quant_commit later reads row 0 which was never written —
+    // attention consumes garbage K/V and the sampler emits noise
+    // tokens. Flushing here waits for qkv_split (+ rmsnorm/bias-add)
+    // to complete their slot reads before the rope wrappers overwrite
+    // the slot with curLen. See GpuOps.hpp's shared-slot Invariant
+    // note. Costs one submit-and-wait per Q8_0 block per token; the
+    // clean fix (a second staging-only USM slot) is deferred until
+    // bench shows the sync is a hot path.
+    if (q8Path) {
+        _ops.queue().flush();
+    }
+
     // RoPE on Q and K — independent buffers, no V-dependency.
     // M-CLR.2 Wave 3b: K-rope uses cache BASE + kv_dim stride so the
     // kernel writes into the current slot at startPos*kv_dim internally.

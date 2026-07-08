@@ -416,6 +416,26 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
                           qBuf);
     }
 
+    // M10.2 Phase 1a Commit 5 hotfix (shared-slot race): under Q8_0 the
+    // rmsnorm_qkv (and qkv_split when fused) above bound
+    // `_curLenSlotUsm = 0` — that's the writeOffset for the fp32
+    // staging destination. The rope + kv_quant_commit + attention
+    // dispatches below all want `_curLenSlotUsm = curLen`. Because
+    // GpuOps' shared slot is written by the host per call and read by
+    // the GPU at kernel-execution time, letting them share a flush
+    // cycle races: the second host-write wins and the staging writes
+    // land at row `curLen*kvDim` in the fp32 scratch, then
+    // kv_quant_commit reads row 0 which was never written —
+    // attention consumes garbage K/V. Flushing here waits for the
+    // staging writes to complete before the rope wrappers overwrite
+    // the slot with curLen. See GpuOps.hpp's shared-slot Invariant.
+    // Costs one submit-and-wait per Q8_0 own-KV block per token; the
+    // clean refactor (second staging-only USM slot) is deferred until
+    // bench shows the sync is a hot path.
+    if (q8Path) {
+        _ops.queue().flush();
+    }
+
     // RoPE Q always runs. RoPE K only when the layer owns K/V.
     // M-CLR.2 Wave 3b: K-rope now targets the cache BASE and passes
     // `kv_dim` as the write-offset stride so the kernel writes into row
