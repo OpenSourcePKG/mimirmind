@@ -261,14 +261,17 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // rope-K's pointer indirection is Wave 3b, tracked in the ADR. The
     // const_cast is safe: KvCache backing storage is mutable USM, the
     // const on baseK/V is an API guardrail against read-path callers.
-    float* const kSlot = li.ownsKv ? cache.writeSlotKf32(blockIdx) : nullptr;
-    float* const vSlot = li.ownsKv ? cache.writeSlotVf32(blockIdx) : nullptr;
-    float* const kBase = li.ownsKv
-        ? const_cast<float*>(cache.baseKf32(blockIdx))
+    // M10.2 Commit 5: slots are typed void*; ops methods branch on
+    // `kvDtype` internally to pick f32 vs fp16 kernel variants.
+    void* const kSlot = li.ownsKv ? cache.writeSlotK(blockIdx) : nullptr;
+    void* const vSlot = li.ownsKv ? cache.writeSlotV(blockIdx) : nullptr;
+    void* const kBase = li.ownsKv
+        ? const_cast<void*>(cache.baseK(blockIdx))
         : nullptr;
-    float* const vBase = li.ownsKv
-        ? const_cast<float*>(cache.baseVf32(blockIdx))
+    void* const vBase = li.ownsKv
+        ? const_cast<void*>(cache.baseV(blockIdx))
         : nullptr;
+    const auto kvDtype = cache.dtype();
 
     // --- pre-attention RMSNorm ----------------------------------------
 
@@ -306,17 +309,23 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         _gmm.matmulAsync(fBlk->type, fBlk->usmPtr, Nfused, d_model,
                          normBuf, T, qkvFused, matmulScratch);
         _ops.qkvSplitAsync(qkvFused, qBuf, kBase, vBase,
-                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV, curLen);
+                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV, curLen,
+                           kvDtype);
     } else if (li.ownsKv) {
         // M5f.4: Q/K/V projections write disjoint buffers. The pop inserts
         // a single barrier so the norms below see all three matmul outputs.
+        // M10.2 Commit 5: raw matmul writes fp32 directly into K/V slots
+        // — only correct when the cache is F32. fp16-KV Gemma variants
+        // must ship fused-QKV weights (all currently deployed variants
+        // do); the engine-side enablement check in Commit 8 will make
+        // this an invariant.
         trace("Q+K+V projections (matmulAsync, unordered)");
         {
             runtime::UnorderedScope u{_ops.queue()};
             projectAsync(qW, q_dim, qBuf);
-            projectAsync(kW, kv_dim, kSlot);
+            projectAsync(kW, kv_dim, static_cast<float*>(kSlot));
             if (!li.altAttention) {
-                projectAsync(vW, kv_dim, vSlot);
+                projectAsync(vW, kv_dim, static_cast<float*>(vSlot));
             }
         }
     } else {
@@ -332,9 +341,13 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // RoPE so V keeps its raw layout. The unordered pop above
         // already issued a barrier; flush so the host memcpy reads a
         // settled USM region.
+        // M10.2 Commit 5: memcpy width is `cache.elementBytes()` so the
+        // fp16-KV variant copies half the bytes — the raw-K bit pattern
+        // that qkvSplitAsync/matmul wrote into kSlot is preserved
+        // regardless of storage dtype.
         trace("alt-attn V = raw K (memcpy)");
         _gmm.sync();
-        std::memcpy(vSlot, kSlot, T * kv_dim * sizeof(float));
+        std::memcpy(vSlot, kSlot, T * kv_dim * cache.elementBytes());
     }
 
     // Q-norm always runs. K-norm + V-norm only when the layer owns K/V.
@@ -351,7 +364,8 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
             vBase,
             T * li.nHeads, T * li.nKvHeads, head_dim,
             _config.rmsNormEps,
-            curLen, kv_dim);
+            curLen, kv_dim,
+            kvDtype);
     } else {
         trace("Q-norm only (shared-KV layer)");
         _ops.rmsNormAsync(qBuf, T * li.nHeads, head_dim,
@@ -367,6 +381,11 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // stable across replays. Q-rope keeps the default stride=0.
     _op.mark(runtime::OpProfiler::Cat::ATTENTION);
     if (li.ownsKv) {
+        // M10.2 Commit 5: K-rope routes into the fp16-aware kernel
+        // when the cache is fp16 (rotation stays fp32 in registers).
+        // Q-rope always uses the F32 kernel because it targets the
+        // fp32 workspace regardless of KV storage — the default arg
+        // handles that implicitly.
         trace("RoPE Q+K (unordered)");
         runtime::UnorderedScope u{_ops.queue()};
         if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
@@ -375,12 +394,14 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
                                              li.ropeBase);
             _ops.ropeInPlaceWithFactorsAsync(kBase, _ropeFreqsForFullAttn, T,
                                              li.nKvHeads, head_dim, curLen,
-                                             li.ropeBase, kv_dim);
+                                             li.ropeBase, kv_dim,
+                                             kvDtype);
         } else {
             _ops.ropeInPlaceAsync(qBuf, T, li.nHeads, head_dim, curLen,
                                   li.ropeBase);
             _ops.ropeInPlaceAsync(kBase, T, li.nKvHeads, head_dim, curLen,
-                                  li.ropeBase, kv_dim);
+                                  li.ropeBase, kv_dim,
+                                  kvDtype);
         }
     } else {
         trace("RoPE Q only (shared-KV layer)");
@@ -394,8 +415,16 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         }
     }
     if (li.ownsKv) {
-        dumpStage("Kcur_pos",    blockIdx, kSlot, T, kv_dim);
-        dumpStage("Vcur_normed", blockIdx, vSlot, T, kv_dim);
+        // M10.2 Commit 5: dumpStage takes float* — for fp16-KV storage
+        // the cast is a lie, so we skip the dump when the cache isn't
+        // fp32. Parity-dumps for fp16 land in Commit 7 alongside the
+        // fp16 parity test.
+        if (kvDtype == KvDtype::F32) {
+            dumpStage("Kcur_pos",    blockIdx,
+                      static_cast<float*>(kSlot), T, kv_dim);
+            dumpStage("Vcur_normed", blockIdx,
+                      static_cast<float*>(vSlot), T, kv_dim);
+        }
     }
     dumpStage("Qcur_pos", blockIdx, qBuf, T, q_dim);
 
@@ -416,13 +445,14 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     const std::size_t slidingWindow =
         li.isSwa ? static_cast<std::size_t>(_config.slidingWindow) : 0;
     _ops.attentionAsync(qBuf,
-                        cache.baseKf32(li.kvSourceLayer),
-                        cache.baseVf32(li.kvSourceLayer),
+                        cache.baseK(li.kvSourceLayer),
+                        cache.baseV(li.kvSourceLayer),
                         T, totalLen,
                         li.nHeads, li.nKvHeads, head_dim,
                         curLen, /*scale=*/1.0F,
                         attnOutBuf,
-                        slidingWindow);
+                        slidingWindow,
+                        kvDtype);
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     trace("O projection");

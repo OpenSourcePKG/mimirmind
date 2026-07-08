@@ -131,13 +131,17 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
         }
     };
 
-    float* kSlot = cache.writeSlotKf32(blockIdx);
-    float* vSlot = cache.writeSlotVf32(blockIdx);
+    // M10.2 Commit 5: KV slots are typed void* so the same call sites
+    // service both f32 and fp16 storage; ops methods branch internally
+    // on `cache.dtype()`.
+    void* kSlot = cache.writeSlotK(blockIdx);
+    void* vSlot = cache.writeSlotV(blockIdx);
     // M-CLR.2 Wave 3: qkv_split receives the cache BASE + curLen so its
     // pointer arg is stable across replays. Other kernels here still use
     // the per-token slot; refactoring rope-K is Wave 3b per the ADR.
-    float* kBase = const_cast<float*>(cache.baseKf32(blockIdx));
-    float* vBase = const_cast<float*>(cache.baseVf32(blockIdx));
+    void* kBase = const_cast<void*>(cache.baseK(blockIdx));
+    void* vBase = const_cast<void*>(cache.baseV(blockIdx));
+    const auto kvDtype = cache.dtype();
 
     // M5i.B: Fused Q+K+V — single matmul into a staging buffer, then a
     // scatter kernel routes the sub-ranges into qBuf/kSlot/vSlot. Bias
@@ -153,18 +157,24 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
         _gmm.matmulAsync(fBlk->type, fBlk->usmPtr, Nfused, d_model,
                          normBuf, T, qkvFused, matmulScratch);
         _ops.qkvSplitAsync(qkvFused, qBuf, kBase, vBase,
-                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV, curLen);
+                           T, fBlk->Nq, fBlk->Nkv, fBlk->hasV, curLen,
+                           kvDtype);
     } else {
         // M5f.4: Q/K/V projections write disjoint buffers and depend only
         // on normBuf (already published by the rmsnorm above). They can
         // pipeline freely inside the unordered scope; the scope's pop
         // emits a single barrier that the bias adds + RoPE read against.
+        // M10.2 Commit 5: matmul writes fp32 directly into K/V slots —
+        // only correct when the KV cache is fp32. fp16-KV models must
+        // ship fused-QKV weights (Commit 8 will add the enablement
+        // check on the engine side); until then the reinterpret_cast is
+        // truthful for the F32 default path.
         trace("Q+K+V projections (matmulAsync, unordered)");
         {
             runtime::UnorderedScope u{_ops.queue()};
             projectAsync(qW, q_dim,  qBuf);
-            projectAsync(kW, kv_dim, kSlot);
-            projectAsync(vW, kv_dim, vSlot);
+            projectAsync(kW, kv_dim, static_cast<float*>(kSlot));
+            projectAsync(vW, kv_dim, static_cast<float*>(vSlot));
         }
     }
 
@@ -172,17 +182,24 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     // others. The bias add does read its own projection output, so
     // this scope's preceding barrier (from the Q/K/V projection pop
     // above) is what makes the chain safe.
+    // M10.2 Commit 5: addBiasAsync writes fp32; on fp16-KV models the
+    // K/V bias tensors must be null (Qwen2.5+ style). Guarded by the
+    // engine-side fp16-enablement check in Commit 8.
     trace("QKV bias add (async, unordered)");
     {
         runtime::UnorderedScope u{_ops.queue()};
         addBiasIf(qB, q_dim,  qBuf);
-        addBiasIf(kB, kv_dim, kSlot);
-        addBiasIf(vB, kv_dim, vSlot);
+        addBiasIf(kB, kv_dim, static_cast<float*>(kSlot));
+        addBiasIf(vB, kv_dim, static_cast<float*>(vSlot));
     }
 
     // RoPE on Q and K — independent buffers, no V-dependency.
     // M-CLR.2 Wave 3b: K-rope uses cache BASE + kv_dim stride so the
     // kernel writes into the current slot at startPos*kv_dim internally.
+    // M10.2 Commit 5: K-rope dispatches through the fp16-aware variant
+    // when the cache is fp16 (rotation stays fp32 in registers, only
+    // load/store change). Q-rope always targets the fp32 workspace, so
+    // it explicitly passes KvDtype::F32.
     trace("RoPE Q+K (async, unordered)");
     {
         runtime::UnorderedScope u{_ops.queue()};
@@ -191,7 +208,8 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                               _config.ropeFreqBase);
         _ops.ropeInPlaceAsync(kBase, T,
                               _config.headCountKv, head_dim, curLen,
-                              _config.ropeFreqBase, kv_dim);
+                              _config.ropeFreqBase, kv_dim,
+                              kvDtype);
     }
 
     // M5f.3: attention is on the GPU. No sync needed before it — the
@@ -202,12 +220,14 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     const float attnScale = 1.0F /
         std::sqrt(static_cast<float>(head_dim));
     _ops.attentionAsync(qBuf,
-                        cache.baseKf32(blockIdx),
-                        cache.baseVf32(blockIdx),
+                        cache.baseK(blockIdx),
+                        cache.baseV(blockIdx),
                         T, totalLen,
                         _config.headCount, _config.headCountKv, head_dim,
                         curLen, attnScale,
-                        attnOutBuf);
+                        attnOutBuf,
+                        /*slidingWindow=*/0,
+                        kvDtype);
 
     trace("O projection (matmul)");
     _gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,

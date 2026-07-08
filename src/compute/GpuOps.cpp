@@ -221,8 +221,8 @@ void GpuOps::rmsNormNoWeightAsync(const float* x,
 }
 
 void GpuOps::rmsNormQkvAsync(float*           qBuf,   const float* qWeight,
-                             float*           kBase,  const float* kWeight,
-                             float*           vBase,
+                             void*            kBase,  const float* kWeight,
+                             void*            vBase,
                              std::size_t      qRows,
                              std::size_t      kvRows,
                              std::size_t      headDim,
@@ -371,7 +371,7 @@ void GpuOps::geluMulAsync(float*       gate,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 
-void GpuOps::ropeInPlaceAsync(float*           xBase,
+void GpuOps::ropeInPlaceAsync(void*            xBase,
                               std::size_t      seqLen,
                               std::size_t      numHeads,
                               std::size_t      headDim,
@@ -417,7 +417,7 @@ void GpuOps::ropeInPlaceAsync(float*           xBase,
                         groupsForN(total, kRopeLocalSize), 1, 1);
 }
 
-void GpuOps::ropeInPlaceWithFactorsAsync(float*           xBase,
+void GpuOps::ropeInPlaceWithFactorsAsync(void*            xBase,
                                          const float*     freqFactors,
                                          std::size_t      seqLen,
                                          std::size_t      numHeads,
@@ -749,8 +749,8 @@ void GpuOps::selfTest(runtime::UsmAllocator& allocator) {
 
 void GpuOps::qkvSplitAsync(const float*     fused,
                            float*           Yq,
-                           float*           YkBase,
-                           float*           YvBase,
+                           void*            YkBase,
+                           void*            YvBase,
                            std::size_t      M,
                            std::size_t      Nq,
                            std::size_t      Nkv,
@@ -766,7 +766,7 @@ void GpuOps::qkvSplitAsync(const float*     fused,
     // Yv may legitimately be nullptr when hasV is false — the kernel
     // guards against dereferencing it, but Level Zero still expects a
     // valid pointer for the argument. Route to `fused` as a safe stub.
-    const float* YvPtr = hasV ? YvBase : fused;
+    const void* YvPtr = hasV ? YvBase : static_cast<const void*>(fused);
 
     // M-CLR.2: curLen via shared USM slot. Kernel adds
     // `curLen * Nkv` to reach the row inside the K/V cache.
@@ -812,8 +812,8 @@ void GpuOps::xQuantI8Async(const float* x,
 }
 
 void GpuOps::attentionAsync(const float*      q,
-                            const float*      k,
-                            const float*      v,
+                            const void*       k,
+                            const void*       v,
                             std::size_t       T_q,
                             std::size_t       T_k,
                             std::size_t       nHeads,
@@ -875,8 +875,8 @@ void GpuOps::attentionAsync(const float*      q,
 }
 
 void GpuOps::attentionPlainAsync(const float*     q,
-                                 const float*     k,
-                                 const float*     v,
+                                 const void*      k,
+                                 const void*      v,
                                  std::size_t      T_q,
                                  std::size_t      T_k,
                                  std::size_t      nHeads,
@@ -923,8 +923,8 @@ void GpuOps::attentionPlainAsync(const float*     q,
 }
 
 void GpuOps::attentionPrefillFlashAsync(const float*     q,
-                                        const float*     k,
-                                        const float*     v,
+                                        const void*      k,
+                                        const void*      v,
                                         std::size_t      T_q,
                                         std::size_t      nHeads,
                                         std::size_t      nKvHeads,
@@ -970,8 +970,8 @@ void GpuOps::attentionPrefillFlashAsync(const float*     q,
 }
 
 void GpuOps::attentionDecodeFlashAsync(const float*     q,
-                                       const float*     k,
-                                       const float*     v,
+                                       const void*      k,
+                                       const void*      v,
                                        std::size_t      T_k,
                                        std::size_t      nHeads,
                                        std::size_t      nKvHeads,

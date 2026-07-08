@@ -85,15 +85,16 @@ public:
     /// the pointer arguments stable across replays; `writeOffset` and
     /// `kvDim` fold into the shared USM `curLen` slot + a per-layer
     /// scalar. `writeOffset` = `cache.length()` at the caller.
-    /// M10.2 Phase 0 Commit 4 — `kvDtype` selects between the f32 fused
-    /// kernel (default; K/V destinations = fp32 cache) and the fp16-KV
-    /// variant. `kBase`/`vBase` cross the ABI as `float*` but the
-    /// underlying storage must be fp16 when `kvDtype == FP16` (backend
-    /// migration lands in Commit 5). Q workspace stays fp32 in both
-    /// paths.
+    /// M10.2 Phase 0 Commit 4/5 — `kvDtype` selects between the f32
+    /// fused kernel (default; K/V destinations = fp32 cache) and the
+    /// fp16-KV variant. `kBase`/`vBase` are typed as `void*` so both
+    /// fp32 and fp16 backing storage can flow through the same call
+    /// without reinterpret_cast at every site — the kernel body uses
+    /// `vload_half` / `vstore_half` when `kvDtype == FP16`. Q
+    /// workspace stays fp32 in both paths.
     void rmsNormQkvAsync(float*           qBuf,   const float* qWeight,
-                         float*           kBase,  const float* kWeight,
-                         float*           vBase,
+                         void*            kBase,  const float* kWeight,
+                         void*            vBase,
                          std::size_t      qRows,
                          std::size_t      kvRows,
                          std::size_t      headDim,
@@ -142,12 +143,13 @@ public:
     /// `xBase = cache.baseK(L)` reaches the current write slot at
     /// startPos*kvDim without the host having to bind a token-varying
     /// pointer.
-    /// M10.2 Phase 0 Commit 4 — `kvDtype` selects between the f32 rope
-    /// kernel (default; `xBase` = fp32 buffer) and the fp16-KV variant
-    /// (`xBase` = fp16 K-cache slot base). Q-rope callers always pass
-    /// F32 because Q-rope targets the fp32 workspace regardless of KV
-    /// storage.
-    void ropeInPlaceAsync(float*           xBase,
+    /// M10.2 Phase 0 Commit 4/5 — `kvDtype` selects between the f32
+    /// rope kernel (default) and the fp16-KV variant. `xBase` is
+    /// typed as `void*` so both Q-rope (fp32 workspace) and K-rope
+    /// (fp32 or fp16 cache slot base) can flow through the same call.
+    /// Q-rope callers always pass `KvDtype::F32` because Q-rope
+    /// targets the fp32 workspace regardless of KV storage.
+    void ropeInPlaceAsync(void*            xBase,
                           std::size_t      seqLen,
                           std::size_t      numHeads,
                           std::size_t      headDim,
@@ -162,9 +164,10 @@ public:
     ///   theta_i = pos * base^(-2i/headDim) / freqFactors[i]
     /// Used by Gemma 3/4 global-attention layers for proportional RoPE.
     /// `writeOffsetStride` semantics match `ropeInPlaceAsync`.
-    /// M10.2 Phase 0 Commit 4 — `kvDtype` selects between the f32 rope
-    /// kernel and the fp16-KV variant. See `ropeInPlaceAsync`.
-    void ropeInPlaceWithFactorsAsync(float*           xBase,
+    /// M10.2 Phase 0 Commit 4/5 — `kvDtype` selects between the f32
+    /// rope kernel and the fp16-KV variant. See `ropeInPlaceAsync`
+    /// for the void* rationale.
+    void ropeInPlaceWithFactorsAsync(void*            xBase,
                                      const float*     freqFactors,
                                      std::size_t      seqLen,
                                      std::size_t      numHeads,
@@ -214,15 +217,16 @@ public:
     /// write row. `Yv` may be any valid pointer when `hasV == false`.
     /// `writeOffset` = current KV cache length (0 for the qkvSplit
     /// self-test path).
-    /// M10.2 Phase 0 Commit 4 — `kvDtype` selects between the f32
-    /// scatter kernel and the fp16-KV variant. `YkBase`/`YvBase` cross
-    /// the ABI as `float*` but the underlying storage must be fp16 when
-    /// `kvDtype == FP16` (backend migration lands in Commit 5). `Yq`
-    /// stays fp32 in both paths.
+    /// M10.2 Phase 0 Commit 4/5 — `kvDtype` selects between the f32
+    /// scatter kernel and the fp16-KV variant. `YkBase`/`YvBase` are
+    /// typed as `void*` so both fp32 and fp16 backing storage flow
+    /// through without reinterpret_cast at the call site — the fp16
+    /// kernel uses `vstore_half` on the K/V destinations. `Yq` stays
+    /// fp32 in both paths.
     void qkvSplitAsync(const float*     fused,
                        float*           Yq,
-                       float*           YkBase,
-                       float*           YvBase,
+                       void*            YkBase,
+                       void*            YvBase,
                        std::size_t      M,
                        std::size_t      Nq,
                        std::size_t      Nkv,
@@ -265,17 +269,15 @@ public:
     ///
     /// `kvDtype` selects between the f32 kernels (default, bit-parity
     /// with pre-M10.2 behaviour) and the fp16-KV kernels landed in
-    /// M10.2 Phase 0 Commit 3. When FP16 is passed the `k`/`v` pointer
-    /// values still cross the ABI as `const float*` (setArg is untyped)
-    /// but the *underlying storage* must be fp16 — the fp16 kernels use
-    /// `vload_half` at read time. Backend migration to `void*` on the
-    /// call sites lands with Commit 5.
+    /// M10.2 Phase 0 Commit 3. `k`/`v` are typed as `const void*`
+    /// (Commit 5) so both fp32 and fp16 KV backing storage flow through
+    /// without a cast — the fp16 kernels use `vload_half` at read time.
     ///
     /// Throws if T_k > kAttentionMaxTk (8192) or if nHeads is not a
     /// positive multiple of nKvHeads.
     void attentionAsync(const float*      q,
-                        const float*      k,
-                        const float*      v,
+                        const void*       k,
+                        const void*       v,
                         std::size_t       T_q,
                         std::size_t       T_k,
                         std::size_t       nHeads,
@@ -487,8 +489,8 @@ private:
     // (M5i.J) for T_q > 1 by default, and two-kernel FlashAttention
     // (M5f.3.2) for T_q == 1. All hidden behind attentionAsync.
     void attentionPlainAsync(const float*     q,
-                             const float*     k,
-                             const float*     v,
+                             const void*      k,
+                             const void*      v,
                              std::size_t      T_q,
                              std::size_t      T_k,
                              std::size_t      nHeads,
@@ -500,8 +502,8 @@ private:
                              std::size_t      slidingWindow,
                              runtime::KvDtype kvDtype);
     void attentionPrefillFlashAsync(const float*     q,
-                                    const float*     k,
-                                    const float*     v,
+                                    const void*      k,
+                                    const void*      v,
                                     std::size_t      T_q,
                                     std::size_t      nHeads,
                                     std::size_t      nKvHeads,
@@ -512,8 +514,8 @@ private:
                                     std::size_t      slidingWindow,
                                     runtime::KvDtype kvDtype);
     void attentionDecodeFlashAsync(const float*     q,
-                                   const float*     k,
-                                   const float*     v,
+                                   const void*      k,
+                                   const void*      v,
                                    std::size_t      T_k,
                                    std::size_t      nHeads,
                                    std::size_t      nKvHeads,
