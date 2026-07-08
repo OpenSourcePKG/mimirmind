@@ -3,6 +3,7 @@
 #include "runtime/CommandQueue.hpp"
 #include "runtime/GpuKernel.hpp"
 #include "runtime/GpuModule.hpp"
+#include "runtime/KvCache.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -240,20 +241,29 @@ public:
     /// `slidingWindow` causal keys — used by Gemma-family SWA layers
     /// (Gemma 4 sw=512). Non-SWA architectures (Qwen 2.5) pass 0.
     ///
+    /// `kvDtype` selects between the f32 kernels (default, bit-parity
+    /// with pre-M10.2 behaviour) and the fp16-KV kernels landed in
+    /// M10.2 Phase 0 Commit 3. When FP16 is passed the `k`/`v` pointer
+    /// values still cross the ABI as `const float*` (setArg is untyped)
+    /// but the *underlying storage* must be fp16 — the fp16 kernels use
+    /// `vload_half` at read time. Backend migration to `void*` on the
+    /// call sites lands with Commit 5.
+    ///
     /// Throws if T_k > kAttentionMaxTk (8192) or if nHeads is not a
     /// positive multiple of nKvHeads.
-    void attentionAsync(const float* q,
-                        const float* k,
-                        const float* v,
-                        std::size_t  T_q,
-                        std::size_t  T_k,
-                        std::size_t  nHeads,
-                        std::size_t  nKvHeads,
-                        std::size_t  headDim,
-                        std::size_t  positionOffset,
-                        float        scale,
-                        float*       out,
-                        std::size_t  slidingWindow = 0);
+    void attentionAsync(const float*      q,
+                        const float*      k,
+                        const float*      v,
+                        std::size_t       T_q,
+                        std::size_t       T_k,
+                        std::size_t       nHeads,
+                        std::size_t       nKvHeads,
+                        std::size_t       headDim,
+                        std::size_t       positionOffset,
+                        float             scale,
+                        float*            out,
+                        std::size_t       slidingWindow = 0,
+                        runtime::KvDtype  kvDtype       = runtime::KvDtype::F32);
 
     /// Compile-time bound on T_k matching ATTN_MAX_TK in attention.cl.
     /// Exposed so callers (and the engine config validator) can check
@@ -367,6 +377,22 @@ private:
     runtime::GpuModule     _attentionPrefillFlashModule;
     runtime::GpuKernel     _attentionPrefillFlashKernel;
 
+    // M10.2 Phase 0 Commit 3 — fp16-KV read variants of the three
+    // attention kernels. Same launch geometry, same signatures except
+    // K/V are stored as fp16 in USM (kernel uses vload_half at read
+    // time to promote to fp32 before the softmax). Only touched when
+    // attentionAsync is called with KvDtype::FP16; the f32 dispatch
+    // stays on the pre-existing kernels above so bit-parity is
+    // preserved by construction.
+    runtime::GpuModule     _attentionFp16Module;
+    runtime::GpuKernel     _attentionFp16Kernel;
+
+    runtime::GpuModule     _attentionFlashPartialFp16Module;
+    runtime::GpuKernel     _attentionFlashPartialFp16Kernel;
+
+    runtime::GpuModule     _attentionPrefillFlashFp16Module;
+    runtime::GpuKernel     _attentionPrefillFlashFp16Kernel;
+
     runtime::GpuModule     _scaledAddResidualModule;
     runtime::GpuKernel     _scaledAddResidualKernel;
 
@@ -420,40 +446,43 @@ private:
     // path is disabled or unsupported, single-WG streaming FlashAttention
     // (M5i.J) for T_q > 1 by default, and two-kernel FlashAttention
     // (M5f.3.2) for T_q == 1. All hidden behind attentionAsync.
-    void attentionPlainAsync(const float* q,
-                             const float* k,
-                             const float* v,
-                             std::size_t  T_q,
-                             std::size_t  T_k,
-                             std::size_t  nHeads,
-                             std::size_t  nKvHeads,
-                             std::size_t  headDim,
-                             std::size_t  positionOffset,
-                             float        scale,
-                             float*       out,
-                             std::size_t  slidingWindow);
-    void attentionPrefillFlashAsync(const float* q,
-                                    const float* k,
-                                    const float* v,
-                                    std::size_t  T_q,
-                                    std::size_t  nHeads,
-                                    std::size_t  nKvHeads,
-                                    std::size_t  headDim,
-                                    std::size_t  positionOffset,
-                                    float        scale,
-                                    float*       out,
-                                    std::size_t  slidingWindow);
-    void attentionDecodeFlashAsync(const float* q,
-                                   const float* k,
-                                   const float* v,
-                                   std::size_t  T_k,
-                                   std::size_t  nHeads,
-                                   std::size_t  nKvHeads,
-                                   std::size_t  headDim,
-                                   std::size_t  positionOffset,
-                                   float        scale,
-                                   float*       out,
-                                   std::size_t  slidingWindow);
+    void attentionPlainAsync(const float*     q,
+                             const float*     k,
+                             const float*     v,
+                             std::size_t      T_q,
+                             std::size_t      T_k,
+                             std::size_t      nHeads,
+                             std::size_t      nKvHeads,
+                             std::size_t      headDim,
+                             std::size_t      positionOffset,
+                             float            scale,
+                             float*           out,
+                             std::size_t      slidingWindow,
+                             runtime::KvDtype kvDtype);
+    void attentionPrefillFlashAsync(const float*     q,
+                                    const float*     k,
+                                    const float*     v,
+                                    std::size_t      T_q,
+                                    std::size_t      nHeads,
+                                    std::size_t      nKvHeads,
+                                    std::size_t      headDim,
+                                    std::size_t      positionOffset,
+                                    float            scale,
+                                    float*           out,
+                                    std::size_t      slidingWindow,
+                                    runtime::KvDtype kvDtype);
+    void attentionDecodeFlashAsync(const float*     q,
+                                   const float*     k,
+                                   const float*     v,
+                                   std::size_t      T_k,
+                                   std::size_t      nHeads,
+                                   std::size_t      nKvHeads,
+                                   std::size_t      headDim,
+                                   std::size_t      positionOffset,
+                                   float            scale,
+                                   float*           out,
+                                   std::size_t      slidingWindow,
+                                   runtime::KvDtype kvDtype);
 };
 
 } // namespace mimirmind::compute
