@@ -108,6 +108,7 @@ set(KERNEL_SOURCES
     kernels/qkv_split_fp16.cl
     kernels/rope_inplace_fp16.cl
     kernels/rope_inplace_ff_fp16.cl
+    kernels/kv_quant_commit_q8_0.cl
     kernels/scaled_add_residual.cl
     kernels/x_quant_i8.cl
     kernels/matmul_q8_0_vec_dp4a.cl

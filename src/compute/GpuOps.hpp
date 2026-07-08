@@ -210,6 +210,22 @@ public:
                        std::size_t    M,
                        std::size_t    K);
 
+    /// M10.2 Phase 1a Commit 3 — write `T` fp32 rows into a Q8_0-encoded
+    /// KV cache slot. `xSrc` is a [T, kvDim] fp32 workspace (typically
+    /// the per-layer K or V after rmsnorm + RoPE); `kvDst` is the
+    /// layer's Q8_0 K or V cache base pointer; the kernel writes rows
+    /// [writeOffset, writeOffset+T) into 32-element blocks (fp16 scale
+    /// + 32 int8) matching `compute::quant::Q8_0::quantizeRow`.
+    /// `kvDim` MUST be a multiple of 32 (KvCache ctor asserts the same;
+    /// this method double-checks so a miswired caller trips loudly).
+    /// Same immediate/replay semantics as ropeInPlaceAsync — the shared
+    /// `curLenSlot()` USM int drives the row offset.
+    void kvQuantCommitQ8Async(const float* xSrc,
+                              void*        kvDst,
+                              std::size_t  T,
+                              std::size_t  kvDim,
+                              std::size_t  writeOffset);
+
     /// Scatter the output of a fused QKV matmul into the separate Q, K,
     /// V destinations. `fused` has shape [M, Nq + Nkv * (1 + hasV)];
     /// `Yq` [M, Nq]; `YkBase` / `YvBase` point at the layer's K/V cache
@@ -435,6 +451,14 @@ private:
     runtime::GpuModule     _ropeFfFp16Module;
     runtime::GpuKernel     _ropeFfFp16Kernel;
 
+    // M10.2 Phase 1a Commit 3 — fp32→Q8_0 KV commit kernel. Consumes a
+    // fp32 K or V workspace (post-rmsnorm+RoPE, Backend Commit 5 wires
+    // the workspace) and writes 32-element Q8_0 blocks into the cache
+    // slot. Only touched by kvQuantCommitQ8Async, which is called by
+    // the backend Q8_0 branch — never from the F32/FP16 hot paths.
+    runtime::GpuModule     _kvQuantCommitQ8Module;
+    runtime::GpuKernel     _kvQuantCommitQ8Kernel;
+
     runtime::GpuModule     _scaledAddResidualModule;
     runtime::GpuKernel     _scaledAddResidualKernel;
 
@@ -472,6 +496,9 @@ private:
     static constexpr std::uint32_t kRopeLocalSize        = 256;
     // Must match X_QUANT_I8_LOCAL in kernels/x_quant_i8.cl.
     static constexpr std::uint32_t kXQuantI8LocalSize    = 128;
+    // Must match KV_QUANT_COMMIT_LOCAL in kernels/kv_quant_commit_q8_0.cl
+    // AND the Q8_0 block size (32 elements per block).
+    static constexpr std::uint32_t kKvQuantCommitLocalSize = 32;
     // Must match ATTN_LOCAL / ATTN_SG in kernels/attention.cl.
     static constexpr std::uint32_t kAttentionLocalSize   = 16;
 

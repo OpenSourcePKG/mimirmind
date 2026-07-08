@@ -24,6 +24,7 @@
 #include "compute/Norm.hpp"
 #include "compute/QuantTypeRegistry.hpp"
 #include "compute/Rope.hpp"
+#include "compute/quant/Q8_0.hpp"
 #include "model/GgufTypes.hpp"
 #include "runtime/CommandQueue.hpp"
 #include "runtime/L0Context.hpp"
@@ -583,6 +584,114 @@ TEST(x_quant_i8_zeroRow) {
                << static_cast<int>(gotQ[k]) << " (expected 0)";
             throw std::runtime_error(os.str());
         }
+    }
+}
+
+// =======================================================================
+// M10.2.0 Commit 3 — kv_quant_commit_q8_0 (fp32 K/V workspace → Q8_0 slot)
+// =======================================================================
+//
+// Byte-exact parity against compute::quant::Q8_0::quantizeRow. The GPU
+// kernel writes the same 34-byte block layout (fp16 scale + 32 int8
+// quants) as the CPU reference, so `std::memcmp` gates the match.
+// Zero-row inputs must survive as (scale=0, all quants=0) so the
+// dequant path in the attention kernel round-trips to zero rather
+// than reading a NaN.
+
+TEST(kv_quant_commit_q8_0_basic) {
+    // T=4 tokens × kvDim=128 elements (4 Q8_0 blocks per row).
+    constexpr std::size_t T           = 4;
+    constexpr std::size_t kvDim       = 128;
+    constexpr std::size_t nBlocksRow  = kvDim / 32;
+    constexpr std::size_t rowBytes    = nBlocksRow * 34;
+    constexpr std::size_t writeOffset = 0;
+
+    // Rows 0-2 get scaled random data with visibly different ranges;
+    // row 3 is all-zero so the (scale=0, quants=0) branch is exercised.
+    auto x = generateFloats(T * kvDim, 0xC1);
+    const float rowMul[T] = {0.1F, 1.0F, 5.0F, 0.0F};
+    for (std::size_t t = 0; t < T; ++t) {
+        for (std::size_t k = 0; k < kvDim; ++k) {
+            x[t * kvDim + k] *= rowMul[t];
+        }
+    }
+
+    UsmBuf bufX (T * kvDim   * sizeof(float));
+    UsmBuf bufKv(T * rowBytes);
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+    std::memset(bufKv.raw(), 0xAA, T * rowBytes);  // sentinel
+
+    fx().ops.kvQuantCommitQ8Async(bufX.as<float>(), bufKv.raw(),
+                                  T, kvDim, writeOffset);
+    fx().queue.flush();
+
+    // CPU reference — Q8_0::quantizeRow packs each kvDim-long row.
+    std::vector<std::uint8_t> cpu(T * rowBytes, 0);
+    for (std::size_t t = 0; t < T; ++t) {
+        mimirmind::compute::quant::Q8_0::quantizeRow(
+            x.data() + t * kvDim, kvDim, cpu.data() + t * rowBytes);
+    }
+
+    if (std::memcmp(bufKv.raw(), cpu.data(), T * rowBytes) != 0) {
+        // Locate the first mismatching byte for the error message.
+        const auto* gpu = static_cast<const std::uint8_t*>(bufKv.raw());
+        std::size_t i = 0;
+        while (i < T * rowBytes && gpu[i] == cpu[i]) ++i;
+        const std::size_t t   = i / rowBytes;
+        const std::size_t off = i - t * rowBytes;
+        std::ostringstream os;
+        os << "kv_quant_commit_q8_0_basic: first mismatch at t=" << t
+           << " byte=" << off
+           << " gpu=" << static_cast<int>(gpu[i])
+           << " cpu=" << static_cast<int>(cpu[i]);
+        throw std::runtime_error(os.str());
+    }
+}
+
+TEST(kv_quant_commit_q8_0_writeOffset) {
+    // Same shape but with writeOffset=5 — the kernel must skip the
+    // first 5 rows and land the T new rows at slot [5, 5+T).
+    constexpr std::size_t T           = 2;
+    constexpr std::size_t kvDim       = 64;    // 2 blocks per row
+    constexpr std::size_t nBlocksRow  = kvDim / 32;
+    constexpr std::size_t rowBytes    = nBlocksRow * 34;
+    constexpr std::size_t writeOffset = 5;
+    constexpr std::size_t maxRows     = writeOffset + T;
+
+    auto x = generateFloats(T * kvDim, 0xC2);
+
+    UsmBuf bufX (T * kvDim * sizeof(float));
+    UsmBuf bufKv(maxRows * rowBytes);
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+    std::memset(bufKv.raw(), 0x77, maxRows * rowBytes);  // sentinel
+
+    fx().ops.kvQuantCommitQ8Async(bufX.as<float>(), bufKv.raw(),
+                                  T, kvDim, writeOffset);
+    fx().queue.flush();
+
+    // Rows [0, writeOffset) must be untouched (sentinel still 0x77).
+    const auto* gpu = static_cast<const std::uint8_t*>(bufKv.raw());
+    for (std::size_t b = 0; b < writeOffset * rowBytes; ++b) {
+        if (gpu[b] != 0x77) {
+            std::ostringstream os;
+            os << "kv_quant_commit_q8_0_writeOffset: pre-slot byte "
+               << b << " overwritten — got=" << static_cast<int>(gpu[b])
+               << " expected sentinel 0x77";
+            throw std::runtime_error(os.str());
+        }
+    }
+
+    // Rows [writeOffset, writeOffset+T) must match Q8_0::quantizeRow.
+    std::vector<std::uint8_t> cpu(T * rowBytes, 0);
+    for (std::size_t t = 0; t < T; ++t) {
+        mimirmind::compute::quant::Q8_0::quantizeRow(
+            x.data() + t * kvDim, kvDim, cpu.data() + t * rowBytes);
+    }
+    if (std::memcmp(gpu + writeOffset * rowBytes,
+                    cpu.data(), T * rowBytes) != 0) {
+        throw std::runtime_error(
+            "kv_quant_commit_q8_0_writeOffset: written slot does not "
+            "match Q8_0::quantizeRow output");
     }
 }
 

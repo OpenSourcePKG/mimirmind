@@ -106,6 +106,9 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
       _ropeFfFp16Module        {ctx, "rope_inplace_ff_fp16"},
       _ropeFfFp16Kernel        {
           _ropeFfFp16Module.kernel("rope_inplace_ff_fp16")},
+      _kvQuantCommitQ8Module   {ctx, "kv_quant_commit_q8_0"},
+      _kvQuantCommitQ8Kernel   {
+          _kvQuantCommitQ8Module.kernel("kv_quant_commit_q8_0")},
       _scaledAddResidualModule    {ctx, "scaled_add_residual"},
       _scaledAddResidualKernel    {
           _scaledAddResidualModule.kernel("scaled_add_residual")},
@@ -142,6 +145,7 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
                 "attention_prefill_flash_fp16/"
                 "rmsnorm_qkv_fp16/qkv_split_fp16/"
                 "rope_inplace_fp16/rope_inplace_ff_fp16/"
+                "kv_quant_commit_q8_0/"
                 "scaled_add_residual/qkv_split/x_quant_i8 loaded "
                 "(rms local={}, elementwise local={}, rope local={}, "
                 "attention local={}, attention max T_k={}, flash kTile={}, "
@@ -809,6 +813,46 @@ void GpuOps::xQuantI8Async(const float* x,
     // One workgroup per row.
     _queue.appendLaunch(_xQuantI8Kernel,
                         static_cast<std::uint32_t>(M), 1, 1);
+}
+
+void GpuOps::kvQuantCommitQ8Async(const float* xSrc,
+                                  void*        kvDst,
+                                  std::size_t  T,
+                                  std::size_t  kvDim,
+                                  std::size_t  writeOffset) {
+    if (T == 0 || kvDim == 0) {
+        return;
+    }
+    // Q8_0 is inherently block-based — a partial block would leave
+    // stale bytes in the fp16 scale slot and mis-index every following
+    // row. KvCache's ctor asserts the same; this second check trips
+    // loudly on a miswired direct caller.
+    constexpr std::size_t kBlockElems = 32;
+    if (kvDim % kBlockElems != 0) {
+        throw std::runtime_error(
+            "GpuOps::kvQuantCommitQ8Async: kvDim=" +
+            std::to_string(kvDim) +
+            " must be a multiple of " + std::to_string(kBlockElems));
+    }
+    const std::size_t nBlocksPerRow = kvDim / kBlockElems;
+
+    // M-CLR.2: writeOffset (= current KV-cache length) via the shared
+    // USM slot. The kernel adds `curLen * nBlocksPerRow * 34` to reach
+    // the row-aligned start of the T new rows, so `kvDst` stays a
+    // stable layer-base pointer across replays.
+    *_curLenSlotUsm = toInt32(writeOffset, "kvQuantCommitQ8 writeOffset");
+    _kvQuantCommitQ8Kernel.setPtr(0, xSrc);
+    _kvQuantCommitQ8Kernel.setPtr(1, kvDst);
+    _kvQuantCommitQ8Kernel.setValue<std::int32_t>(
+        2, toInt32(kvDim, "kvQuantCommitQ8 kvDim"));
+    _kvQuantCommitQ8Kernel.setPtr(3, _curLenSlotUsm);
+    _kvQuantCommitQ8Kernel.setGroupSize(kKvQuantCommitLocalSize, 1, 1);
+    // One workgroup per (t, block). Kernel LOCAL=32 matches the block
+    // size so each thread owns one element of one block.
+    _queue.appendLaunch(_kvQuantCommitQ8Kernel,
+                        static_cast<std::uint32_t>(T),
+                        static_cast<std::uint32_t>(nBlocksPerRow),
+                        1);
 }
 
 void GpuOps::attentionAsync(const float*      q,
