@@ -101,7 +101,8 @@ public:
                          float            eps,
                          std::size_t      writeOffset,
                          std::size_t      kvDim,
-                         runtime::KvDtype kvDtype = runtime::KvDtype::F32);
+                         runtime::KvDtype kvDtype         = runtime::KvDtype::F32,
+                         bool             useStagingSlot  = false);
 
     /// Fused residual-add + RMSNorm. `x[m, k] += delta[m, k]` in place,
     /// then `y[m, k] = x[m, k] * weight[k] / sqrt(mean(x[m, :]^2) + eps)`.
@@ -247,8 +248,9 @@ public:
                        std::size_t      Nq,
                        std::size_t      Nkv,
                        bool             hasV,
-                       std::size_t      writeOffset = 0,
-                       runtime::KvDtype kvDtype     = runtime::KvDtype::F32);
+                       std::size_t      writeOffset     = 0,
+                       runtime::KvDtype kvDtype         = runtime::KvDtype::F32,
+                       bool             useStagingSlot  = false);
 
     /// Load-time self-test — run every GPU op with a known input and
     /// compare against a CPU reference within a tight tolerance. Catches
@@ -499,6 +501,20 @@ private:
     // the current decode position / KV-cache length. Host-writable,
     // device-readable, allocated once at construction.
     std::int32_t*          _curLenSlotUsm{nullptr};
+
+    // M10.2 Phase 1a Commit 5 follow-up: second USM int slot, initialised
+    // to 0 at construction and NEVER touched again. Used by the Q8_0
+    // fp32-staging write path: qkv_split and rmsnorm_qkv under
+    // KvDtype::Q8_0 target the fp32 K/V scratch at row 0 (no history to
+    // skip), so they need a `writeOffset` slot pointing at a constant 0.
+    // The main `_curLenSlotUsm` advances to `curLen` per-token to drive
+    // rope/kv_quant_commit/attention, and under command-list-replay that
+    // second host-write races the earlier staging dispatches (their
+    // recording captured only the slot pointer, not the value, so
+    // replay reads the last-written value — curLen — instead of 0).
+    // Two slots eliminate the race by construction: main slot for
+    // curLen-advancing ops, staging slot for the always-0 staging ops.
+    std::int32_t*          _stagingOffsetSlotUsm{nullptr};
 
     // M-CLR.4 follow-up: right-sized flash launch bound during
     // recording. 0 = disabled (immediate-mode uses actual nKTiles).

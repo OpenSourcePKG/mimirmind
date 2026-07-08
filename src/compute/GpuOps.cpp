@@ -143,6 +143,16 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
         _alloc.allocate(sizeof(std::int32_t)));
     *_curLenSlotUsm = 0;
 
+    // M10.2 Phase 1a Commit 5 follow-up: staging offset slot for the
+    // Q8_0 fp32-staging pipeline. Set to 0 once at construction and
+    // never touched again — the shared-slot invariant collapses to a
+    // trivial constant, so qkv_split and rmsnorm_qkv under Q8_0 can
+    // safely share this slot with any command-list-replay session
+    // that keeps `_curLenSlotUsm` advancing to `curLen` per step.
+    _stagingOffsetSlotUsm = static_cast<std::int32_t*>(
+        _alloc.allocate(sizeof(std::int32_t)));
+    *_stagingOffsetSlotUsm = 0;
+
     // M5i.J: cache the prefill-flash rollback flag once at startup so the
     // dispatcher hot path stays branch-cheap.
     _prefillFlashDisabled = envSet("MIMIRMIND_DISABLE_FLASH_PREFILL");
@@ -175,6 +185,14 @@ GpuOps::~GpuOps() {
     if (_flashPartialUsm != nullptr) {
         _alloc.deallocate(_flashPartialUsm, _flashPartialBytes);
         _flashPartialUsm = nullptr;
+    }
+    if (_stagingOffsetSlotUsm != nullptr) {
+        _alloc.deallocate(_stagingOffsetSlotUsm, sizeof(std::int32_t));
+        _stagingOffsetSlotUsm = nullptr;
+    }
+    if (_curLenSlotUsm != nullptr) {
+        _alloc.deallocate(_curLenSlotUsm, sizeof(std::int32_t));
+        _curLenSlotUsm = nullptr;
     }
 }
 
@@ -246,7 +264,8 @@ void GpuOps::rmsNormQkvAsync(float*           qBuf,   const float* qWeight,
                              float            eps,
                              std::size_t      writeOffset,
                              std::size_t      kvDim,
-                             runtime::KvDtype kvDtype) {
+                             runtime::KvDtype kvDtype,
+                             bool             useStagingSlot) {
     if ((qRows == 0 && kvRows == 0) || headDim == 0) {
         return;
     }
@@ -265,7 +284,18 @@ void GpuOps::rmsNormQkvAsync(float*           qBuf,   const float* qWeight,
     runtime::GpuKernel& kernel =
         (kvDtype == runtime::KvDtype::FP16) ? _rmsnormQkvFp16Kernel
                                             : _rmsnormQkvKernel;
-    *_curLenSlotUsm = toInt32(writeOffset, "rmsNormQkv writeOffset");
+    // M10.2 Phase 1a Commit 5 follow-up: under Q8_0 fp32-staging the
+    // writeOffset is always 0. Bind the staging slot (constant 0)
+    // instead of the shared curLen slot so command-list-replay can't
+    // race a later per-step curLen host-write into this kernel's
+    // captured pointer.
+    std::int32_t* offsetSlot;
+    if (useStagingSlot) {
+        offsetSlot = _stagingOffsetSlotUsm;
+    } else {
+        *_curLenSlotUsm = toInt32(writeOffset, "rmsNormQkv writeOffset");
+        offsetSlot = _curLenSlotUsm;
+    }
     kernel.setPtr(0, qBuf);
     kernel.setPtr(1, qWeight);
     kernel.setPtr(2, qBuf);           // in-place
@@ -278,7 +308,7 @@ void GpuOps::rmsNormQkvAsync(float*           qBuf,   const float* qWeight,
     kernel.setValue<std::int32_t>(9,  kvRowsI);
     kernel.setValue<std::int32_t>(10, Ki);
     kernel.setValue<float>(11, eps);
-    kernel.setPtr(12, _curLenSlotUsm);
+    kernel.setPtr(12, offsetSlot);
     kernel.setValue<std::int32_t>(13, kvDimI);
     kernel.setGroupSize(kRmsnormLocalSize, 1, 1);
 
@@ -773,7 +803,8 @@ void GpuOps::qkvSplitAsync(const float*     fused,
                            std::size_t      Nkv,
                            bool             hasV,
                            std::size_t      writeOffset,
-                           runtime::KvDtype kvDtype) {
+                           runtime::KvDtype kvDtype,
+                           bool             useStagingSlot) {
     if (M == 0 || Nq == 0 || Nkv == 0) {
         return;
     }
@@ -793,7 +824,16 @@ void GpuOps::qkvSplitAsync(const float*     fused,
     runtime::GpuKernel& kernel =
         (kvDtype == runtime::KvDtype::FP16) ? _qkvSplitFp16Kernel
                                             : _qkvSplitKernel;
-    *_curLenSlotUsm = toInt32(writeOffset, "qkvSplit writeOffset");
+    // M10.2 Phase 1a Commit 5 follow-up: staging path routes through
+    // the const-0 slot to survive command-list-replay. See
+    // rmsNormQkvAsync for the rationale.
+    std::int32_t* offsetSlot;
+    if (useStagingSlot) {
+        offsetSlot = _stagingOffsetSlotUsm;
+    } else {
+        *_curLenSlotUsm = toInt32(writeOffset, "qkvSplit writeOffset");
+        offsetSlot = _curLenSlotUsm;
+    }
     kernel.setPtr(0, fused);
     kernel.setPtr(1, Yq);
     kernel.setPtr(2, YkBase);
@@ -803,7 +843,7 @@ void GpuOps::qkvSplitAsync(const float*     fused,
     kernel.setValue<std::int32_t>(6, toInt32(Nkv,    "qkvSplit Nkv"));
     kernel.setValue<std::int32_t>(7, hasV ? 1 : 0);
     kernel.setValue<std::int32_t>(8, toInt32(Nfused, "qkvSplit Nfused"));
-    kernel.setPtr(9, _curLenSlotUsm);
+    kernel.setPtr(9, offsetSlot);
     kernel.setGroupSize(kElementwiseLocalSize, 1, 1);
     _queue.appendLaunch(kernel,
                         groupsForN(total, kElementwiseLocalSize), 1, 1);
