@@ -137,12 +137,23 @@ services:
             #                     Ebene).
             #   q8_0           → 32-Element-Blöcke à 34 B (fp16 scale +
             #                     32 int8) = ~1.06 B/Elem. 4× Bandwidth-
-            #                     Win vs F32, 2× vs FP16. Decode-Speedup
-            #                     5-8 % @ 500 tok, 20-30 % @ 5000 tok.
-            #                     Precision-Risiko höher als fp16 —
-            #                     Needle-in-Haystack-Test PFLICHT bevor
-            #                     Default-Flip. Kernels landen mit
-            #                     M10.2.0 Commits 3-5.
+            #                     Win vs F32, 2× vs FP16, ~3.76× RAM-
+            #                     Ersparnis vs F32. Decode-Speedup 5-8 %
+            #                     @ 500 tok, 20-30 % @ 5000 tok (attention-
+            #                     share halbiert bei langen Chats laut
+            #                     Roadmap-Doc). Kernels + Backend-Wiring +
+            #                     Parity-Tests sind live seit M10.2.0
+            #                     Commits 3-6.
+            #                     Precision-Risiko: per-Block-absmax
+            #                     verschmiert K-Channel-Outliers, restliche
+            #                     Channels fallen auf ~5-6 Bits Effektiv-
+            #                     Precision. Kernel-Level-Parity (gpu_tests
+            #                     attention_*_q8_0_parity, tol 5e-3) ist
+            #                     grün-gate aber NICHT hinreichend —
+            #                     Needle-in-Haystack-Recall-Test (≥ 95 %)
+            #                     ist Pflicht vor Default-Flip. Bei
+            #                     Recall-Fail: Rezept D (fp16-K + Q8-V)
+            #                     als Fallback-Ticket.
             # M10.2.-1 Commit 8 / M10.2.0 Commit 2 — Engine wirft beim
             #                     Start wenn ein non-F32-dtype gesetzt
             #                     ist und das Modell nicht komplett
@@ -152,6 +163,7 @@ services:
             #                     Deploy-Preflight: `MIMIRMIND_KV_DTYPE=…`
             #                     setzen → Container startet oder throw't
             #                     mit spezifischer Block-Nummer im Log.
+            #                     Rollback: Var leer lassen → F32 default.
             MIMIRMIND_KV_DTYPE:          ${MIMIRMIND_KV_DTYPE:-}
 
             # M5i Rollback-/Diagnose-Env-Vars — normalerweise leer (Default-
