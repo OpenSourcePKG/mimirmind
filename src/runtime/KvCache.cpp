@@ -4,6 +4,8 @@
 #include "runtime/UsmAllocator.hpp"
 
 #include <algorithm>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace mimirmind::runtime {
@@ -34,6 +36,19 @@ KvCache::KvCache(UsmAllocator& alloc,
     allocateLayers();
 }
 
+namespace {
+
+const char* dtypeName(KvDtype d) noexcept {
+    switch (d) {
+        case KvDtype::F32:  return "f32";
+        case KvDtype::FP16: return "fp16";
+        case KvDtype::Q8_0: return "q8_0";
+    }
+    return "?";
+}
+
+} // namespace
+
 void KvCache::allocateLayers() {
     const std::size_t nLayers = _kvDim.size();
     _layerBytes.assign(nLayers, 0);
@@ -46,7 +61,25 @@ void KvCache::allocateLayers() {
         for (std::size_t i = 0; i < nLayers; ++i) _kvSource[i] = i;
     }
 
-    const std::size_t elemBytes = kvElementBytes(_dtype);
+    // M10.2 Phase 1a — Q8_0 stores in 32-element blocks. Every layer's
+    // kvDim must be a multiple of 32 so no block spans a fraction of a
+    // token's row. Enforced at construction so misconfigured models fail
+    // loudly instead of silently corrupting adjacent rows.
+    if (_dtype == KvDtype::Q8_0) {
+        const std::size_t blkE = kvBlockElements(_dtype);
+        for (std::size_t i = 0; i < nLayers; ++i) {
+            if (_kvDim[i] % blkE != 0) {
+                throw std::runtime_error(
+                    "KvCache: layer " + std::to_string(i) +
+                    " kvDim=" + std::to_string(_kvDim[i]) +
+                    " is not a multiple of " + std::to_string(blkE) +
+                    " — Q8_0 storage requires block-aligned rows. "
+                    "Use dtype=fp16 or f32 for this model, or verify "
+                    "the backend's kvDimPerLayer() computation.");
+            }
+        }
+    }
+
     std::size_t ownedBytes  = 0;
     std::size_t savedBytes  = 0;
     std::size_t ownCount    = 0;
@@ -55,7 +88,13 @@ void KvCache::allocateLayers() {
     std::size_t maxDim = minDim;
     for (std::size_t i = 0; i < nLayers; ++i) {
         const std::size_t src = _kvSource[i];
-        const std::size_t bytes = _maxSeq * _kvDim[i] * elemBytes;
+        // Row-major footprint per token, dtype-aware. For F32/FP16 the
+        // formula reduces to `_kvDim[i] * elementBytes`; for Q8_0 it is
+        // `(_kvDim[i] / 32) * 34`. `_maxSeq` rows fit end to end in the
+        // per-layer allocation.
+        const std::size_t bytesPerRow =
+            kvBytesForElements(_dtype, _kvDim[i]);
+        const std::size_t bytes = _maxSeq * bytesPerRow;
         minDim = std::min(minDim, _kvDim[i]);
         maxDim = std::max(maxDim, _kvDim[i]);
         if (src == i) {
@@ -80,14 +119,15 @@ void KvCache::allocateLayers() {
         static_cast<double>(savedBytes) / (1024.0 * 1024.0);
     MM_LOG_INFO("kvcache",
                 "allocated nLayers={} maxSeq={} kvDim={}{} dtype={} "
-                "own={} aliased={} total {:.2f} MiB (saved {:.2f} MiB "
-                "via alias)",
+                "(block {}B × {}elem) own={} aliased={} total {:.2f} MiB "
+                "(saved {:.2f} MiB via alias)",
                 nLayers, _maxSeq,
                 minDim,
                 (minDim == maxDim
                      ? std::string{}
                      : std::string{".."} + std::to_string(maxDim)),
-                (_dtype == KvDtype::FP16 ? "fp16" : "f32"),
+                dtypeName(_dtype),
+                kvBlockBytes(_dtype), kvBlockElements(_dtype),
                 ownCount, aliasCount, totalMiB, savedMiB);
 }
 
@@ -100,14 +140,18 @@ KvCache::~KvCache() {
 }
 
 void* KvCache::writeSlotK(std::size_t layer) noexcept {
+    // Dtype-aware byte stride per row. For F32/FP16 this is
+    // kvDim*elementBytes; for Q8_0 it is (kvDim/32)*34. Same call
+    // for all three dtypes keeps the slot pointer correct without
+    // per-dtype branches at every call site.
     const std::size_t byteOffset =
-        _length * _kvDim[layer] * kvElementBytes(_dtype);
+        _length * kvBytesForElements(_dtype, _kvDim[layer]);
     return static_cast<std::byte*>(_kBuf[layer]) + byteOffset;
 }
 
 void* KvCache::writeSlotV(std::size_t layer) noexcept {
     const std::size_t byteOffset =
-        _length * _kvDim[layer] * kvElementBytes(_dtype);
+        _length * kvBytesForElements(_dtype, _kvDim[layer]);
     return static_cast<std::byte*>(_vBuf[layer]) + byteOffset;
 }
 

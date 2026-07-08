@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 namespace mimirmind::runtime {
@@ -11,23 +12,65 @@ class UsmAllocator;
 
 /**
  * Element dtype for K/V storage. Baseline F32 today; FP16 lands in
- * M10.2 Phase 0 as the 2× bandwidth/RAM win before Q8_0 (M10.2.1) is
- * layered on top. See Synaipse
+ * M10.2 Phase 0 as the 2× bandwidth/RAM win, Q8_0 in Phase 1a
+ * (M10.2.0) as the 4× win with block-based storage. See Synaipse
  * `Memory/mimirmind/todos/m10-2-neg1-kv-cache-dtype-layer-design.md`
- * for the full migration plan.
+ * and `m10-2-0-kv-cache-q8-0-design.md` for the full migration plans.
  */
 enum class KvDtype : std::uint8_t {
     F32  = 0,   // 4 B per element — baseline.
     FP16 = 1,   // 2 B per element — Phase 0 target.
-    // Q8_0 kommt in M10.2.1
+    Q8_0 = 2,   // 32-element blocks × 34 B (fp16 scale + 32 int8) —
+                // Phase 1a target. NOT per-element addressable; use
+                // blockElements()/blockBytes()/rowBytes() and route
+                // through the Q8_0-aware kernels.
 };
 
+/// Uniform-dtype element size. Only defined for F32 and FP16 — Q8_0
+/// is block-based (see kvBlockBytes / kvBytesForElements). Returns 0
+/// on Q8_0 so constexpr contexts stay well-defined; the KvCache
+/// `elementBytes()` member method throws on Q8_0 for runtime callers.
 [[nodiscard]] constexpr std::size_t kvElementBytes(KvDtype d) noexcept {
     switch (d) {
         case KvDtype::F32:  return 4;
         case KvDtype::FP16: return 2;
+        case KvDtype::Q8_0: return 0;    // sentinel — use kvBlockBytes
     }
-    return 0;  // unreachable; enum is closed.
+    return 0;
+}
+
+/// Elements per storage block. 1 for uniform dtypes (F32/FP16), 32
+/// for Q8_0.
+[[nodiscard]] constexpr std::size_t kvBlockElements(KvDtype d) noexcept {
+    switch (d) {
+        case KvDtype::F32:  return 1;
+        case KvDtype::FP16: return 1;
+        case KvDtype::Q8_0: return 32;
+    }
+    return 1;
+}
+
+/// Bytes per storage block. `kvBlockBytes(d) / kvBlockElements(d)` is
+/// the *average* per-element footprint (1.0625 B for Q8_0, i.e. 34/32).
+[[nodiscard]] constexpr std::size_t kvBlockBytes(KvDtype d) noexcept {
+    switch (d) {
+        case KvDtype::F32:  return 4;
+        case KvDtype::FP16: return 2;
+        case KvDtype::Q8_0: return 34;   // fp16 scale + 32 int8
+    }
+    return 0;
+}
+
+/// Storage bytes needed to hold `nElements` values encoded as `d`.
+/// For F32/FP16 this is `nElements * elementBytes`. For Q8_0 it is
+/// `(nElements / 32) * 34`. Caller must guarantee `nElements` is a
+/// multiple of `kvBlockElements(d)` — for Q8_0 that means multiples
+/// of 32. Assertion below covers the F32/FP16 trivial case too.
+[[nodiscard]] constexpr std::size_t kvBytesForElements(
+    KvDtype d, std::size_t nElements) noexcept
+{
+    const auto be = kvBlockElements(d);
+    return (nElements / be) * kvBlockBytes(d);
 }
 
 /**
@@ -120,8 +163,37 @@ public:
     }
 
     [[nodiscard]] KvDtype     dtype()        const noexcept { return _dtype; }
-    [[nodiscard]] std::size_t elementBytes() const noexcept {
+
+    /// Bytes per element. Only defined for F32 and FP16; **throws
+    /// `std::logic_error` on Q8_0** because per-element addressing
+    /// isn't meaningful there. Callers that need dtype-agnostic byte
+    /// arithmetic should use `rowBytes(layer)` (matches the memcpy
+    /// footprint of a T=1 K/V slot).
+    [[nodiscard]] std::size_t elementBytes() const {
+        if (_dtype == KvDtype::Q8_0) {
+            throw std::logic_error(
+                "KvCache::elementBytes: not defined for Q8_0 — use "
+                "rowBytes(layer) or blockBytes()/blockElements() "
+                "instead");
+        }
         return kvElementBytes(_dtype);
+    }
+
+    /// M10.2 Phase 1a — dtype-aware block accessors. Works for all
+    /// three dtypes uniformly. For F32/FP16 blockElements() == 1 and
+    /// blockBytes() == elementBytes(); for Q8_0 blockElements() == 32
+    /// and blockBytes() == 34.
+    [[nodiscard]] std::size_t blockElements() const noexcept {
+        return kvBlockElements(_dtype);
+    }
+    [[nodiscard]] std::size_t blockBytes() const noexcept {
+        return kvBlockBytes(_dtype);
+    }
+    /// Byte footprint of one KV row (one token, kvDim(layer) elements)
+    /// in the layer's storage dtype. Correct for all dtypes; the
+    /// preferred call for any dtype-agnostic size / offset math.
+    [[nodiscard]] std::size_t rowBytes(std::size_t layer) const noexcept {
+        return kvBytesForElements(_dtype, _kvDim[layer]);
     }
 
     void commit(std::size_t T) noexcept { _length += T; }

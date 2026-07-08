@@ -695,13 +695,19 @@ struct ApiServer::Impl {
 
         // KV cache — hard limit the engine will admit. Prompt +
         // max_new_tokens + a small slack (4 tokens) must fit.
+        // M10.2 Phase 1a — element_bytes is meaningless on Q8_0
+        // (block-based). Reports block_bytes + block_elements instead
+        // so the same JSON shape covers all three dtypes.
+        const auto kvD = engine.kvDtype();
+        const char* kvDName = (kvD == runtime::KvDtype::FP16 ? "fp16"
+                             : kvD == runtime::KvDtype::Q8_0 ? "q8_0"
+                                                             : "f32");
         json kvCache = {
             {"max_context_tokens", engine.maxContextTokens()},
             {"layer_count",        modelCfg.blockCount},
-            {"dtype",              (engine.kvDtype() ==
-                                        runtime::KvDtype::FP16
-                                    ? "fp16" : "f32")},
-            {"element_bytes",      runtime::kvElementBytes(engine.kvDtype())},
+            {"dtype",              kvDName},
+            {"block_bytes",        runtime::kvBlockBytes(kvD)},
+            {"block_elements",     runtime::kvBlockElements(kvD)},
         };
 
         // Level-Zero device descriptor

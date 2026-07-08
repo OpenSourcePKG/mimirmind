@@ -1167,11 +1167,20 @@ int runServe(const CliArgs& args) {
                         "back to f32", env);
         }
     }
-    MM_LOG_INFO("main",
-                "KV cache dtype: {} ({} B/elem)",
-                (engine.kvDtype() == mimirmind::runtime::KvDtype::FP16
-                     ? "fp16" : "f32"),
-                mimirmind::runtime::kvElementBytes(engine.kvDtype()));
+    {
+        // M10.2 Phase 1a — for uniform dtypes the "B/elem" wording
+        // still fits (block_elements=1); Q8_0 has 32-element blocks
+        // so the log line reports the block footprint instead.
+        const auto d = engine.kvDtype();
+        const char* dName = (d == mimirmind::runtime::KvDtype::FP16 ? "fp16"
+                           : d == mimirmind::runtime::KvDtype::Q8_0 ? "q8_0"
+                                                                    : "f32");
+        MM_LOG_INFO("main",
+                    "KV cache dtype: {} (block {} B × {} elem)",
+                    dName,
+                    mimirmind::runtime::kvBlockBytes(d),
+                    mimirmind::runtime::kvBlockElements(d));
+    }
 
     // M9.11.1 — Optional speculative-decoding draft engine. Opt-in via
     // MIMIRMIND_DRAFT_MODEL_PATH. Fully independent InferenceEngine so

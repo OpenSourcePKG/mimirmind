@@ -341,13 +341,15 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // RoPE so V keeps its raw layout. The unordered pop above
         // already issued a barrier; flush so the host memcpy reads a
         // settled USM region.
-        // M10.2 Commit 5: memcpy width is `cache.elementBytes()` so the
-        // fp16-KV variant copies half the bytes — the raw-K bit pattern
-        // that qkvSplitAsync/matmul wrote into kSlot is preserved
-        // regardless of storage dtype.
+        // M10.2 Phase 1a — `rowBytes(blockIdx)` returns the layer's
+        // per-token storage footprint for the active KvDtype: kv_dim*4
+        // for F32, kv_dim*2 for FP16, (kv_dim/32)*34 for Q8_0. Using
+        // it instead of `elementBytes()` keeps this memcpy correct for
+        // all three dtypes without a per-dtype branch, and avoids
+        // hitting the Q8_0 `elementBytes()` throw.
         trace("alt-attn V = raw K (memcpy)");
         _gmm.sync();
-        std::memcpy(vSlot, kSlot, T * kv_dim * cache.elementBytes());
+        std::memcpy(vSlot, kSlot, T * cache.rowBytes(blockIdx));
     }
 
     // Q-norm always runs. K-norm + V-norm only when the layer owns K/V.
