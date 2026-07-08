@@ -39,20 +39,24 @@ on the desk. Along the way it turned out to be a remarkably clean way
 to use the Intel iGPU's Unified Memory Architecture for what it is good
 at, instead of treating it like a small discrete GPU.
 
-## Headline numbers (Mimir-1.0)
+## Headline numbers
 
 On an Intel Meteor Lake Core Ultra, single iGPU, 58 GiB of shared
-memory budget:
+memory budget, bench mode (`MIMIRMIND_GPU_CLOCK_PIN=rp0`,
+`MIMIRMIND_ENABLE_CLR=on`):
 
 | Model | Quant | Memory | Decode | Output verified |
 |---|---|---:|---:|---|
 | Qwen 2.5 7B Instruct | Q4_K_M | 4.4 GiB | **126 ms/tok** | Bit-exact vs llama-cli |
+| **Gemma 4 E4B Instruct** | **Q4_K_M** | **2.5 GiB** | **132 ms/tok** | Greedy match vs reference |
 | **Gemma 4 26B-A4B Instruct** | **Q6_K** | **21.3 GiB** | **148 ms/tok** | Greedy match vs reference |
 | **Gemma 4 26B-A4B Instruct** | **Q8_0** | **25.0 GiB** | **145 ms/tok** | Greedy match vs reference |
 
 That's a 26-billion-parameter MoE running at ~7 tokens per second on a
 consumer integrated GPU — about the speed of a dense 7B model, because
-only 4 B parameters are active per token.
+only 4 B parameters are active per token. The Gemma 4 E4B variant
+delivers comparable throughput at ~1/8 the memory footprint, making it
+the sweet spot for interactive workloads on constrained hardware.
 
 ## What makes it different
 
@@ -86,7 +90,7 @@ templates for Qwen (ChatML), Gemma 2/3 (`<start_of_turn>`), and
 Gemma 4 (`<|turn>` + thinking-channel markup) are wired into the
 server and dispatched by the model's reported architecture.
 
-**82+ unit tests, four binaries.** `quant_tests`, `arch_tests`,
+**210+ unit tests, four binaries.** `quant_tests`, `arch_tests`,
 `compute_tests`, and `gpu_tests` exercise the engine from
 hand-crafted Q-block byte patterns up through full GPU kernels
 on the actual iGPU. The whole suite runs in seconds.
@@ -127,10 +131,22 @@ quirks, see [`doc/build.md`](doc/build.md).
 
 ## Status
 
-**Mimir-1.0 — Release.** Gemma 4 and Qwen 2.5 both work end-to-end
-through the OpenAI HTTP API. All 82+ unit tests green; the
-Level-Zero / SPV-kernel side is verified against CPU reference math
-on real hardware.
+**Mimir-1.0 — Release.** Gemma 4 (26B-A4B MoE, E4B) and Qwen 2.5 all
+work end-to-end through the OpenAI HTTP API. All 210+ unit tests green;
+the Level-Zero / SPV-kernel side is verified against CPU reference math
+on real hardware. Command-List Replay (M-CLR) is live in production
+(−6.4 % decode on E4B, verified 2026-07-06).
+
+**Project Sleipnir** is the ongoing post-release performance and
+model-extension phase. In flight:
+
+- **M10.2 — KV-Cache dtype layer** (F32 → FP16 → Q8_0). Halves KV reads
+  per attention call — the largest bandwidth-relevant lever for long
+  contexts. Phase 0 foundation committed locally.
+- **M-Ratatoskr — Gemma 4 MTP-drafter integration**. Google's official
+  Multi-Token-Prediction drafters (released 2026-05-05) paired with our
+  E2B/E4B/26B-A4B/31B targets. Projected 3× decode speedup once the
+  batched-verify GEMM path (M8.K) lands as a prerequisite.
 
 What remains before Mimir-1.0 is "tagged" rather than just "working":
 
@@ -142,6 +158,12 @@ What remains before Mimir-1.0 is "tagged" rather than just "working":
   this engine was originally built to feed.
 
 ## What's coming
+
+**Project Sleipnir: Speed.** Odin's eight-legged mount. The
+post-Mimir-1.0 performance phase, targeting **~3× decode throughput**
+on E4B and E2B once M8.K (Xe-LPG-native GEMM) and M-Ratatoskr
+(Gemma 4 MTP-drafter integration) land. Bandwidth foundation (M10.2
+FP16 KV cache) is in flight now.
 
 **Mimir-1.1: Concurrency.** Per-request KV cache, scratch pool, and a
 non-blocking decode loop. Removes the request mutex.
