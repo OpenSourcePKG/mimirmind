@@ -370,22 +370,35 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
 
     if (li.altAttention && li.ownsKv) {
         // V = raw K projection. We need a copy of K *before* K-norm and
-        // RoPE so V keeps its raw layout. The unordered pop above
-        // already issued a barrier; flush so the host memcpy reads a
-        // settled USM region.
-        // M10.2 Phase 1a — `rowBytes(blockIdx)` returns the layer's
-        // per-token storage footprint for the active KvDtype: kv_dim*4
-        // for F32, kv_dim*2 for FP16, (kv_dim/32)*34 for Q8_0. Under
-        // Q8_0 the copy runs on the fp32 staging (K → V, kv_dim*4 per
-        // row) so rmsnorm_qkv + rope + kv_quant_commit_q8_0 see the
-        // raw K in the V staging just like the F32 / FP16 paths.
-        trace("alt-attn V = raw K (memcpy)");
-        _gmm.sync();
+        // RoPE so V keeps its raw layout.
+        //
+        // M10.2 Phase 1a Commit 5 follow-up: this copy MUST run as a
+        // device-side memory-copy command (recordable + replayable) —
+        // a host `std::memcpy` inside a runBlock invoked during
+        // command-list-replay recording fires exactly once at record
+        // time and leaves V staging stale on every subsequent replay.
+        // On Gemma 4 26B-A4B-it that stales 5 own-KV altAttention
+        // layers (blocks 5, 11, 17, 23, 29) every decode step, whose
+        // corrupted attention output cascades through the rest of the
+        // stack — the sampler collapses into a repetition loop from
+        // the very first token past the record. `appendMemoryCopy`
+        // routes into the active list (recording or immediate) so
+        // both replay and immediate mode see a fresh V=K per step.
+        //
+        // `rowBytes(blockIdx)` returns the per-token storage footprint
+        // for the active KvDtype: kv_dim*4 for F32, kv_dim*2 for FP16,
+        // (kv_dim/32)*34 for Q8_0. Under Q8_0 the copy runs on the
+        // fp32 staging (K → V, kv_dim*4 per row) so rmsnorm_qkv +
+        // rope + kv_quant_commit_q8_0 see the raw K in the V staging
+        // just like the F32 / FP16 paths.
+        trace("alt-attn V = raw K (device memcpy)");
         if (q8Path) {
-            std::memcpy(vFp32Scratch, kFp32Scratch,
-                        T * kv_dim * sizeof(float));
+            _ops.queue().appendMemoryCopy(
+                vFp32Scratch, kFp32Scratch,
+                T * kv_dim * sizeof(float));
         } else {
-            std::memcpy(vSlot, kSlot, T * cache.rowBytes(blockIdx));
+            _ops.queue().appendMemoryCopy(
+                vSlot, kSlot, T * cache.rowBytes(blockIdx));
         }
     }
 

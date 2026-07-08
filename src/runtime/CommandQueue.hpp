@@ -83,6 +83,18 @@ public:
     /// between two ordered launches that live in different functions.
     void appendBarrier();
 
+    /// Append a device-side memory copy into the current command list
+    /// (recording or immediate). Same ordering + barrier semantics as
+    /// appendLaunch. Prefer this over host `std::memcpy` for USM data
+    /// that must be re-materialised on every command-list-replay pass —
+    /// a host memcpy inside a recorded block runs exactly once (at
+    /// record time) and stale values survive into every subsequent
+    /// replay. Landed for the M10.2 Phase 1a Q8_0 altAttention V=K
+    /// staging copy.
+    void appendMemoryCopy(void*       dst,
+                          const void* src,
+                          std::size_t nBytes);
+
     /// Test helper / sanity probe.
     [[nodiscard]] std::uint32_t unorderedDepth() const noexcept { return _unorderedDepth; }
 

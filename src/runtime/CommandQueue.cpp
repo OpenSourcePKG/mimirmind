@@ -127,6 +127,24 @@ void CommandQueue::appendBarrier() {
     ZE_CHECK(zeCommandListAppendBarrier(target, nullptr, 0, nullptr));
 }
 
+void CommandQueue::appendMemoryCopy(void*       dst,
+                                    const void* src,
+                                    std::size_t nBytes) {
+    if (nBytes == 0) {
+        return;
+    }
+    ze_command_list_handle_t target =
+        _recording ? _recordList : _cmdList;
+    ZE_CHECK(zeCommandListAppendMemoryCopy(
+        target, dst, src, nBytes, nullptr, 0, nullptr));
+    if (_unorderedDepth == 0) {
+        ZE_CHECK(zeCommandListAppendBarrier(target, nullptr, 0, nullptr));
+    }
+    if (!_recording) {
+        _hasPending = true;
+    }
+}
+
 void CommandQueue::flush() {
     if (!_hasPending) {
         return;
