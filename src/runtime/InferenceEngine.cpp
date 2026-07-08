@@ -750,6 +750,17 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 // Step 1 records into the persistent list AND executes it
                 // via a first replay(). Subsequent steps reuse the
                 // recording without re-dispatching.
+                //
+                // `scaleEmbeddingIfNeeded` above dispatches `mulScalarAsync`
+                // into the immediate list whenever the backend scales its
+                // embeddings (all Gemma-4 variants do). `beginRecord()`
+                // requires the immediate list to be idle — the E4B backend
+                // used to mask this by flushing internally inside its
+                // `prepareForward`, but MoE / Dense have a no-op default
+                // and would trip the "immediate work is pending" throw.
+                // Flush the immediate list explicitly so the invariant
+                // holds independently of the backend.
+                _ops.queue().flush();
                 _ops.queue().beginRecord();
                 for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
                     _backend->runBlock(b, xBuf, 1, cache, buffers, false);
