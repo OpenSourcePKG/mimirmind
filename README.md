@@ -157,7 +157,7 @@ belong in the file.
 | `runtime` | KV dtype (`f32`/`q8_0`), max context tokens, USM probe cap, SPV dir, preserve-thinking. Per-model overrides via `models[].runtime`. |
 | `features` | `clr`, `flashPrefill`, `fusedQkv`, `moeGroup`, `gemm` (auto/force/disable), `gemmV2`, `gemmMinM`, `dp4a`. |
 | `speculative` | Enable + target/draft model ids + `n` (draft tokens per verify round). |
-| `governor` | `gpuClockPin`, tick-log, fan settings, and the inline thermal profile (formerly a separate `--thermal-profile` file). |
+| `governor` | `gpuClockPin`, `tickLog`/`tickLogFile` (per-tick NDJSON sink), fan settings, and the inline thermal profile (formerly a separate `--thermal-profile` file). |
 | `diagnostics` | `parityDump`, `traceBlock0`, `traceDecodeFile`, `traceOpTimes`, `gpuBench`, `regressionAlert`. |
 
 The compose file's header carries the complete `MIMIRMIND_*` → JSON

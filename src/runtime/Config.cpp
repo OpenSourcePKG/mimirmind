@@ -301,10 +301,12 @@ ThermalProfile parseThermalInline(std::string_view      path,
 GovernorSettings parseGovernor(std::string_view      path,
                                const nlohmann::json& j) {
     checkKnownKeys(path, "governor", j,
-                   {"gpuClockPin", "tickLog", "fan", "thermal"});
+                   {"gpuClockPin", "tickLog", "tickLogFile", "fan", "thermal"});
     GovernorSettings g{};
     g.gpuClockPin = readOpt<std::string>(path, "governor", j, "gpuClockPin");
     if (const auto v = readOpt<bool>(path, "governor", j, "tickLog"); v) g.tickLog = *v;
+    if (const auto v = readOpt<std::string>(path, "governor", j, "tickLogFile"); v)
+        g.tickLogFile = *v;
 
     if (j.contains("fan")) {
         const auto& fj = j["fan"];

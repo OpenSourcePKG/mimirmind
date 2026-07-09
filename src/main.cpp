@@ -1451,23 +1451,40 @@ int runServe(const CliArgs& args, const mimirmind::runtime::Config& cfg) {
                         pinReq.rawEnv);
         }
 
-        // M9.6.6.0 tick sink. When `governor.tickLog: true` in
-        // config.json AND `diagnostics.traceDecodeFile` is a non-empty
-        // path, the governor writes one NDJSON line per tick to the
-        // same file, which we then consume for M9.6.6 adaptive-gain
-        // baseline analysis.
-        if (governor != nullptr && cfg.governor.tickLog &&
-            !cfg.diagnostics.traceDecodeFile.empty()) {
-            const std::string& tickLog = cfg.diagnostics.traceDecodeFile;
-            if (governor->setTickLogPath(tickLog)) {
+        // M9.6.6.0 tick sink. `governor.tickLog:true` gates the sink;
+        // `governor.tickLogFile` names the NDJSON output. For one
+        // release we still honour `diagnostics.traceDecodeFile` as the
+        // path when tickLogFile is unset — that reuse conflates the
+        // decode-trace and governor-tick streams and is being retired.
+        if (governor != nullptr && cfg.governor.tickLog) {
+            std::string tickPath = cfg.governor.tickLogFile;
+            bool viaDeprecated  = false;
+            if (tickPath.empty() && !cfg.diagnostics.traceDecodeFile.empty()) {
+                tickPath      = cfg.diagnostics.traceDecodeFile;
+                viaDeprecated = true;
+            }
+            if (tickPath.empty()) {
+                MM_LOG_WARN("main",
+                            "governor.tickLog:true but governor.tickLogFile "
+                            "is empty — sink stays off. Set "
+                            "governor.tickLogFile to a writable path.");
+            } else if (governor->setTickLogPath(tickPath)) {
+                if (viaDeprecated) {
+                    MM_LOG_WARN("main",
+                                "GovernorTickSink using deprecated "
+                                "diagnostics.traceDecodeFile='{}' as its path "
+                                "— move to governor.tickLogFile in config.json "
+                                "before the next release.",
+                                tickPath);
+                }
                 MM_LOG_INFO("main",
                             "GovernorTickSink open — writing NDJSON to '{}'",
-                            tickLog);
+                            tickPath);
             } else {
                 MM_LOG_WARN("main",
-                            "governor.tickLog set with diagnostics.traceDecodeFile='{}' — "
+                            "governor.tickLog set with path '{}' — "
                             "could not open for append. Sink stays off.",
-                            tickLog);
+                            tickPath);
             }
         }
     }

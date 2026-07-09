@@ -168,14 +168,17 @@ std::uint32_t GpuClockGovernor::tick(SystemMonitor& monitor) {
         // the trailing state on disk. Governor tick rate is a few Hz so
         // the fsync-ish cost is trivial next to matmul.
         _tickLog
-            << "{\"ts_ms\":"      << ms
-            << ",\"temp_c\":"     << temp
-            << ",\"cap_before\":" << capBefore
-            << ",\"cap_after\":"  << capAfter
-            << ",\"delta_mhz\":"  << deltaMhz
-            << ",\"error_c\":"    << error
-            << ",\"target_c\":"   << _targetTempC
-            << ",\"pinned\":"     << (_pinned ? "true" : "false")
+            << "{\"ts_ms\":"                  << ms
+            << ",\"temp_c\":"                 << temp
+            << ",\"cap_before\":"             << capBefore
+            << ",\"cap_after\":"              << capAfter
+            << ",\"delta_mhz\":"              << deltaMhz
+            << ",\"error_c\":"                << error
+            << ",\"target_c\":"               << _targetTempC
+            << ",\"gain_up_mhz_per_c\":"      << kGainUpMhzPerC
+            << ",\"gain_down_mhz_per_c\":"    << kGainDownMhzPerC
+            << ",\"deadband_c\":"             << kDeadbandC
+            << ",\"pinned\":"                 << (_pinned ? "true" : "false")
             << "}\n";
         _tickLog.flush();
     }

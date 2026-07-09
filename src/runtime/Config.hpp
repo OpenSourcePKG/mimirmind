@@ -87,8 +87,16 @@ struct FanSettings {
 struct GovernorSettings {
     // "rp0" | "rpn" | "<numeric MHz>" | "off" | "0"
     std::optional<std::string>  gpuClockPin{};
-    // Append per-tick log line to `traceDecodeFile` if set.
+    // Enable per-tick NDJSON sink. When true, the governor appends one
+    // JSON line per tick to `tickLogFile`. Kept as a separate boolean
+    // (not implied by a non-empty path) so an operator can disable the
+    // sink without deleting the archived file path from config.json.
     bool                        tickLog{false};
+    // Path for the tick sink (M9.6.6.0). Falls back to
+    // `diagnostics.traceDecodeFile` for one release with a deprecation
+    // warning — that reuse conflates decode-trace and governor-tick
+    // streams, which the M9.6.6.1 baseline runbook consumes separately.
+    std::string                 tickLogFile{};
     FanSettings                 fan{};
     // Full thermal-profile struct inlined — no more separate JSON file.
     // Empty `name` means "no profile" and the guard runs unprotected.

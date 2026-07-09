@@ -46,6 +46,7 @@
   "governor": {
     "gpuClockPin": null,
     "tickLog": false,
+    "tickLogFile": "",
     "fan": {
       "boost": true,
       "pwmBoost": null,
