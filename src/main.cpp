@@ -1135,75 +1135,99 @@ int runServe(const CliArgs& args, const mimirmind::runtime::Config& cfg) {
         return 2;
     }
 
-    MM_LOG_INFO("main", "serve: loading model '{}'", args.modelPath);
-    mimirmind::runtime::InferenceEngine engine{cfg};
-    engine.loadModel(args.modelPath);
-
-    // Refuse architectures without a working forward path so the user
-    // finds out at serve startup, not on the first chat request.
-    // Qwen2 has been production since M7; Gemma 4 is in M8 verification
-    // (forward runs end-to-end but generation quality is still being
-    // dialled in — see Memory/mimirmind/research/m8-gemma4-staging.md).
-    const auto& arch = engine.config().architecture;
-    if (arch != "qwen2" && arch != "gemma4") {
-        const std::string msg =
-            "serve: architecture '" + arch +
-            "' is not implemented yet. The model loaded fine and the "
-            "tokenizer is ready, but the transformer block needs "
-            "architecture-specific code. See "
-            "Memory/mimirmind/research/m8-gemma4-staging.md.";
-        MM_LOG_ERROR("main", "{}", msg);
-        std::cerr << msg << "\n";
-        return 2;
-    }
-    // Resolve per-model runtime overrides now that we know which model
-    // loaded (defaultModel resolves to models[0] when empty).
-    const auto effRuntime = cfg.effectiveRuntime(
-        cfg.defaultModel.empty() ? cfg.defaultModelEntry().id : cfg.defaultModel);
-
-    // Optional KV-cache pre-allocation size. The cache is sized once
-    // and never reallocated for request growth, so this is the upper
-    // bound on (prompt + max_new) any single generate() can hold.
-    // Larger = bigger upfront memory commitment but multi-turn prefix
-    // reuse keeps working as conversations grow.
-    if (effRuntime.maxContextTokens.has_value() &&
-        *effRuntime.maxContextTokens > 0) {
-        engine.setMaxContextTokens(*effRuntime.maxContextTokens);
-    }
-
-    // M10.2 Phase 0 / 1a — KV cache element dtype. Default F32
-    // (bit-identical to pre-M10.2). `fp16` opts in to the 2× bandwidth
-    // / RAM win; `q8_0` layers on the block-quantised 4× win. Other
-    // values log a warning and fall back to F32. Must be set before the
-    // first generate() so the lazy KvCache construction picks it up.
-    if (effRuntime.kvDtype.has_value()) {
-        const std::string_view v{*effRuntime.kvDtype};
-        if (v == "fp16") {
-            engine.setKvDtype(mimirmind::runtime::KvDtype::FP16);
-        } else if (v == "q8_0") {
-            engine.setKvDtype(mimirmind::runtime::KvDtype::Q8_0);
-        } else if (v == "f32" || v.empty()) {
-            engine.setKvDtype(mimirmind::runtime::KvDtype::F32);
-        } else {
-            MM_LOG_WARN("main",
-                        "runtime.kvDtype='{}' unrecognised — falling "
-                        "back to f32", v);
+    // Load every loadOnStart:true model. Each gets its own InferenceEngine
+    // (own L0 context, USM, autotune) — request dispatch picks the target
+    // via `req.model`. Startup cost scales linearly with N (each model
+    // runs its own selfTest + autotune pass), and USM is shared UMA-style
+    // so N models × their footprint × ~1.2 must fit under
+    // runtime.usmProbeTotalGib.
+    auto applyRuntimeOverrides = [&](mimirmind::runtime::InferenceEngine& e,
+                                     const mimirmind::runtime::RuntimeSettings& rt) {
+        if (rt.maxContextTokens.has_value() && *rt.maxContextTokens > 0) {
+            e.setMaxContextTokens(*rt.maxContextTokens);
         }
-    }
-    {
-        // M10.2 Phase 1a — for uniform dtypes the "B/elem" wording
-        // still fits (block_elements=1); Q8_0 has 32-element blocks
-        // so the log line reports the block footprint instead.
-        const auto d = engine.kvDtype();
+        if (rt.kvDtype.has_value()) {
+            const std::string_view v{*rt.kvDtype};
+            if (v == "fp16")           e.setKvDtype(mimirmind::runtime::KvDtype::FP16);
+            else if (v == "q8_0")      e.setKvDtype(mimirmind::runtime::KvDtype::Q8_0);
+            else if (v == "f32" || v.empty())
+                                       e.setKvDtype(mimirmind::runtime::KvDtype::F32);
+            else {
+                MM_LOG_WARN("main",
+                            "runtime.kvDtype='{}' unrecognised — falling "
+                            "back to f32", v);
+            }
+        }
+    };
+
+    std::vector<std::unique_ptr<mimirmind::runtime::InferenceEngine>> ownedEngines;
+    std::vector<mimirmind::server::LoadedEngine> loadedEngines;
+
+    for (const auto& m : cfg.models) {
+        if (!m.loadOnStart) continue;
+        MM_LOG_INFO("main", "serve: loading model '{}' (id='{}')",
+                    m.path, m.id);
+        auto e = std::make_unique<mimirmind::runtime::InferenceEngine>(cfg);
+        e->loadModel(m.path);
+
+        const auto& arch = e->config().architecture;
+        if (arch != "qwen2" && arch != "gemma4") {
+            const std::string msg =
+                "serve: architecture '" + arch + "' (model id '" + m.id +
+                "') is not implemented yet. See "
+                "Memory/mimirmind/research/m8-gemma4-staging.md.";
+            MM_LOG_ERROR("main", "{}", msg);
+            std::cerr << msg << "\n";
+            return 2;
+        }
+        // setKvDtype + setMaxContextTokens inspect loaded model state
+        // (fused-QKV coverage, attn_k/v.bias presence per block), so
+        // apply the per-model runtime overrides AFTER loadModel.
+        applyRuntimeOverrides(*e, cfg.effectiveRuntime(m.id));
+        const auto d = e->kvDtype();
         const char* dName = (d == mimirmind::runtime::KvDtype::FP16 ? "fp16"
                            : d == mimirmind::runtime::KvDtype::Q8_0 ? "q8_0"
                                                                     : "f32");
         MM_LOG_INFO("main",
-                    "KV cache dtype: {} (block {} B × {} elem)",
-                    dName,
+                    "KV cache dtype for '{}': {} (block {} B × {} elem)",
+                    m.id, dName,
                     mimirmind::runtime::kvBlockBytes(d),
                     mimirmind::runtime::kvBlockElements(d));
+
+        mimirmind::server::LoadedEngine le{};
+        le.id     = m.id;
+        le.title  = m.title;
+        le.engine = e.get();
+        loadedEngines.push_back(std::move(le));
+        ownedEngines.push_back(std::move(e));
     }
+
+    if (ownedEngines.empty()) {
+        std::cerr << "serve: no model with loadOnStart:true in config.json — "
+                     "nothing to serve\n";
+        return 2;
+    }
+
+    // The default engine drives all the per-process ancillaries below
+    // (thermal guard, power monitor, governor, fan, perf-regression).
+    // Additional engines share those same monitors transparently — the
+    // hooks are stateless getters that any engine's generate() consults.
+    const std::string defaultId = cfg.defaultModel.empty()
+        ? cfg.defaultModelEntry().id
+        : cfg.defaultModel;
+    mimirmind::runtime::InferenceEngine* defaultEnginePtr = nullptr;
+    for (auto& le : loadedEngines) {
+        if (le.id == defaultId) { defaultEnginePtr = le.engine; break; }
+    }
+    if (defaultEnginePtr == nullptr) {
+        std::cerr << "serve: defaultModel='" << defaultId
+                  << "' has no loadOnStart:true entry\n";
+        return 2;
+    }
+    auto& engine = *defaultEnginePtr;
+    // Re-use the effective runtime for the DEFAULT model when reporting
+    // to the user later on (preserve_thinking flag).
+    const auto effRuntime = cfg.effectiveRuntime(defaultId);
 
     // M9.11.1 — Optional speculative-decoding draft engine. Opt-in via
     // `speculative.enabled: true` in config.json plus a `models[]` entry
@@ -1274,18 +1298,14 @@ int runServe(const CliArgs& args, const mimirmind::runtime::Config& cfg) {
     mimirmind::server::ServerConfig scfg{};
     scfg.host    = "0.0.0.0";
     scfg.port    = args.port.value_or(static_cast<std::uint16_t>(cfg.server.port));
-    // Prefer the config-declared model id (used by /v1/models + the
-    // OpenAI-compatible `model` field in requests); fall back to the
-    // GGUF filename stem when the config doesn't provide one.
-    if (!cfg.models.empty()) {
-        scfg.modelId = cfg.defaultModelEntry().id;
-    }
-    if (scfg.modelId.empty()) {
-        scfg.modelId = std::filesystem::path{args.modelPath}.stem().string();
-    }
+    // defaultModelId in the ServerConfig picks the fallback engine when a
+    // request omits `model`. Must match one of the loaded engine ids —
+    // computed above as `defaultId`.
+    scfg.modelId = defaultId;
     scfg.preserveThinking = effRuntime.preserveThinking.value_or(false);
-    scfg.speculative.enabled = cfg.speculative.enabled;
-    scfg.speculative.draftN  = static_cast<std::size_t>(cfg.speculative.n);
+    scfg.speculative.enabled  = cfg.speculative.enabled;
+    scfg.speculative.draftN   = static_cast<std::size_t>(cfg.speculative.n);
+    scfg.speculativeTargetId  = cfg.speculative.target;
 
     // Thermal profile lives inline in config.json under governor.thermal.
     // Empty `name` means "no profile" and the guard runs unprotected.
@@ -1569,7 +1589,22 @@ int runServe(const CliArgs& args, const mimirmind::runtime::Config& cfg) {
         }
     }
 
-    mimirmind::server::ApiServer server{engine, scfg, draftEngine.get()};
+    // Propagate the process-wide ancillary monitors from the default
+    // engine to any extras so their generate() paths also honour
+    // thermal admission, RAPL joule accounting, fan-boost pre-warm and
+    // perf-regression sampling. Governor propagation is intentionally
+    // skipped — its per-tick control loop is process-scoped and driven
+    // by the default engine; extras would fight for the same GPU cap.
+    for (auto& e : ownedEngines) {
+        if (e.get() == defaultEnginePtr) continue;
+        if (auto* g = engine.thermalGuard())            e->setThermalGuard(g);
+        if (auto* p = engine.powerMonitor())            e->setPowerMonitor(p);
+        if (auto* d = engine.perfRegressionDetector()) e->setPerfRegressionDetector(d);
+        if (auto* fc = engine.fanController())          e->setFanController(fc);
+    }
+
+    mimirmind::server::ApiServer server{std::move(loadedEngines), scfg,
+                                        draftEngine.get()};
 
     g_runningServer.store(&server, std::memory_order_release);
     std::signal(SIGINT,  signalStop);

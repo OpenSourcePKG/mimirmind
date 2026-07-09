@@ -178,13 +178,16 @@ ModelEntry parseModel(std::string_view      path,
     if (!j.is_object()) {
         fail(path, section + " must be an object");
     }
-    checkKnownKeys(path, section, j, {"id", "path", "loadOnStart", "runtime"});
+    checkKnownKeys(path, section, j, {"id", "title", "path", "loadOnStart", "runtime"});
 
     ModelEntry m{};
     if (!j.contains("id") || !j["id"].is_string() || j["id"].get<std::string>().empty()) {
         fail(path, section + ".id is required (non-empty string)");
     }
     m.id = j["id"].get<std::string>();
+    if (const auto v = readOpt<std::string>(path, section, j, "title"); v.has_value()) {
+        m.title = *v;
+    }
     if (!j.contains("path") || !j["path"].is_string() || j["path"].get<std::string>().empty()) {
         fail(path, section + ".path is required (non-empty string)");
     }
@@ -450,15 +453,16 @@ Config loadConfig(std::string_view path) {
             }
         }
     }
-    // Multi-load not yet wired at the engine level.
+    // Multi-load is now wired: each loadOnStart:true entry gets its own
+    // InferenceEngine and chat/completions dispatches on request.model.
+    // Duplicate ids already blocked above.
     const auto loadOnStartCount = std::count_if(
         cfg.models.begin(), cfg.models.end(),
         [](const ModelEntry& m) { return m.loadOnStart; });
-    if (loadOnStartCount > 1) {
+    if (loadOnStartCount == 0) {
         fail(path,
-             "more than one model with loadOnStart:true — multi-model concurrent "
-             "load is not yet implemented (tracked as M8.x). Set all but one to "
-             "loadOnStart:false for now");
+             "no model has loadOnStart:true — set at least one entry to "
+             "loadOnStart:true so the server has something to serve");
     }
     // Default model must resolve.
     if (!cfg.defaultModel.empty()) {

@@ -32,12 +32,14 @@ struct RuntimeSettings {
 };
 
 /**
- * One loadable model entry. Multi-model support (2-3 concurrently loaded
- * models) is not yet wired at the engine level — the loader errors if the
- * `models` array has more than one entry with `loadOnStart: true`.
+ * One loadable model entry. Multiple entries with `loadOnStart:true` are
+ * allowed — main() constructs one InferenceEngine per entry, and the
+ * chat/completions dispatch routes on the request's `model` field.
  */
 struct ModelEntry {
-    std::string       id{};              // OpenAI-facing name
+    std::string       id{};              // OpenAI-facing name (matched against request.model)
+    std::string       title{};           // Optional human-readable name for UI dropdowns.
+                                         // Falls back to `id` in /v1/models when empty.
     std::string       path{};
     bool              loadOnStart{true};
     RuntimeSettings   runtime{};         // per-model override, merged onto top-level
