@@ -2,23 +2,33 @@
 
 > Technical reference. Audience: someone reading the code.
 
-Mimirmind is a single-process inference engine: one model loaded into
-shared memory, served via an OpenAI-compatible HTTP endpoint. The
-process is split into a small number of clearly-bounded components
-that you can understand one at a time.
+Mimirmind is a single-process inference engine: one or more models
+loaded into shared memory, served via an OpenAI-compatible HTTP
+endpoint. The process is split into a small number of clearly-bounded
+components that you can understand one at a time.
 
 ## Component layout
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │                          ApiServer                             │
-│  /v1/chat/completions, /v1/models, /health, SSE streaming      │
+│  installRoutes · run · stop · owns:                            │
+│    RequestDispatcher     (engine pool, per-model mutex, spec-  │
+│                           dec wiring)                          │
+│    ChatCompletionHandler (POST /v1/chat/completions, JSON+SSE) │
+│    SystemStatusBuilder   (/v1/system/info, /v1/system/status)  │
+│    RequestTracker        (in-flight snapshot for status poll)  │
+│    ChatRequestParser · PromptTrimmer · SseEncoder · ApiHelpers │
 └────────────────────────────────────────────────────────────────┘
                                 │
-┌────────────────────────────────────────────────────────────────┐
-│                       InferenceEngine                          │
-│  loadModel · tokenize · generate · stop conditions · sampling  │
-└────────────────────────────────────────────────────────────────┘
+                     ┌──────────┴──────────┐
+                     │                     │
+┌────────────────────────────┐  ┌────────────────────────────┐
+│      InferenceEngine       │  │      InferenceEngine       │
+│  (default, `req.model=""`) │  │  (extra, `req.model=...` ) │
+│  loadModel · tokenize ·    │  │  own USM, KV cache, sampler│
+│  generate · stop · sample  │  │  independent state         │
+└────────────────────────────┘  └────────────────────────────┘
                                 │
          ┌──────────────────────┼─────────────────────┐
          │                      │                     │
@@ -71,9 +81,10 @@ oversized allocations. The largest single tensor at Q8_0 is the
 ffn_gate_up_exps weight at 539 MiB per layer × 30 layers, well under
 the cap.
 
-`MIMIRMIND_USM_PROBE_TOTAL_GIB=0` skips the optional phase-2 ceiling
-sweep on shared multi-tenant hardware so we don't OOM the host. The
-phase-1 per-allocation probe always runs because it's cheap.
+`runtime.usmProbeTotalGib: 0` in `config.json` skips the optional
+phase-2 ceiling sweep on shared multi-tenant hardware so we don't OOM
+the host. The phase-1 per-allocation probe always runs because it's
+cheap.
 
 The GGUF is `mmap`'d, tensor bytes are `memcpy`'d into USM, then the
 mmap is dropped (`madvise(DONTNEED)` + `fadvise(DONTNEED)`) so the
@@ -186,16 +197,34 @@ Tested on hand-crafted distributions in `compute_tests`.
 
 ## HTTP server
 
-`ApiServer` is `cpp-httplib` wrapped around the engine. It exposes
-`/health`, `/v1/models`, and `/v1/chat/completions` (both
-non-streaming and SSE streaming). The chat-template dispatch happens
-on the way *in* (messages → template-encoded token IDs), and the
-inverse cleanup (channel-markup stripping for Gemma 4) happens on the
-way *out* (decoded text → assistant content).
+`ApiServer` is `cpp-httplib` wrapped around one or more engines. It
+exposes `/health`, `/v1/models`, `/v1/chat/completions` (both
+non-streaming and SSE streaming), `/v1/system/info`, and
+`/v1/system/status`. The chat-template dispatch happens on the way
+*in* (messages → template-encoded token IDs), and the inverse cleanup
+(channel-markup stripping for Gemma 4) happens on the way *out*
+(decoded text → assistant content).
 
-The server currently serialises all requests through a mutex. Removing
-that mutex without breaking the shared `GpuOps` / `GpuMatmul` argument
-state is the M9 work item.
+Since the ApiServer OOP split (commit `aee941d`, formerly a 2042-line
+monolithic `ApiServer.cpp`), each concern lives in its own file under
+`src/server/`:
+
+| File | Responsibility |
+|---|---|
+| `ApiServer` | httplib routing, `installRoutes`, `run`/`stop` |
+| `RequestDispatcher` | engine pool, per-model mutex, spec-dec wiring, `resolveTarget(model)` |
+| `ChatCompletionHandler` | POST `/v1/chat/completions` — parse, prepare, blocking + SSE |
+| `SystemStatusBuilder` | `/v1/system/info` (static) + `/v1/system/status` (dynamic) |
+| `RequestTracker` | in-flight snapshot for `/v1/system/status.current_request` |
+| `ChatRequestParser` | OpenAI request-body → `ChatRequest` struct |
+| `PromptTrimmer` | M-PT length discipline: drop old messages + clamp `max_new` |
+| `SseEncoder` | SSE chunk builders + UTF-8 boundary safety |
+| `ApiHelpers` | shared `makeRequestId`, `unixNow`, `sendJson`, `sendError` |
+
+Each loaded model in `config.json`'s `models[]` gets its own
+`InferenceEngine` and its own dispatch mutex, so requests to different
+models run in parallel; requests to the *same* model still serialise
+on its engine's mutable scratch + sampler state.
 
 ## Build pipeline
 

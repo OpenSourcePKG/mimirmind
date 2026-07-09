@@ -2,7 +2,7 @@
 
 OpenAI-compatible Chat Completions, plus a tiny health endpoint and a
 model-discovery endpoint. The server listens on port 8080 by default;
-override via `MIMIRMIND_PORT` in the environment.
+override via `server.port` in `config.json`.
 
 ## `GET /health`
 
@@ -20,9 +20,9 @@ yet, so this is a meaningful readiness check: if `/health` returns
 
 ## `GET /v1/models`
 
-Lists the single model that is loaded into this process. Mimirmind is
-single-model per process by design; the response shape mirrors the
-OpenAI API so existing client libraries don't choke.
+Lists every model with `loadOnStart:true` in `config.json`. Each entry
+carries the operator-chosen `id` (used in chat-completion request
+routing) and an optional human-readable `title` for UI dropdowns.
 
 ```bash
 curl -s http://localhost:8080/v1/models | jq
@@ -33,19 +33,36 @@ curl -s http://localhost:8080/v1/models | jq
   "object": "list",
   "data": [
     {
-      "id": "google_gemma-4-26B-A4B-it-Q6_K",
-      "object": "model",
-      "created": 1782774169,
+      "id":       "primary",
+      "title":    "Gemma 4 26B-A4B (default)",
+      "object":   "model",
+      "created":  0,
+      "owned_by": "mimirmind"
+    },
+    {
+      "id":       "small",
+      "title":    "Gemma 4 E4B (fast)",
+      "object":   "model",
+      "created":  0,
       "owned_by": "mimirmind"
     }
   ]
 }
 ```
 
-The `id` is derived from the GGUF filename (stem, no extension). Use
-that as the `model` field in chat-completion requests when you want to
-echo it back in the response; the server does not verify it against
-the loaded model.
+The `id` values come from `models[].id` in the config. When a client
+sends `"model": "small"` on a chat request, the server routes to that
+engine's dispatch mutex; when the field is empty or matches the
+default id (`defaultModel` in config, or `models[0].id` when unset),
+the default engine handles it. Unknown ids return `400 model_not_found`.
+
+Each loaded engine has its own USM, KV cache, sampler state, and
+dispatch mutex — requests to different models run in parallel.
+
+When speculative decoding is enabled (`speculative.enabled: true`),
+`speculative.target` names the model id it wraps and `speculative.draft`
+names the draft model id. Only that target model uses spec-dec; other
+models fall through to plain `generate()`.
 
 ## `POST /v1/chat/completions` — non-streaming
 
@@ -317,8 +334,8 @@ Common HTTP status codes:
 - `400` — Invalid request body, missing required field, unsupported
   role, model not loaded, chat template unsupported for the model's
   architecture.
-- `500` — Engine threw mid-generation (rare; check
-  `MIMIRMIND_LOG_FILE` for the stack).
+- `500` — Engine threw mid-generation (rare; check the log file
+  configured via `server.log.file`, or stderr when empty).
 - `503` — Server is in shutdown.
 
 ## Architecture-specific notes
@@ -422,11 +439,12 @@ causes:
 
 The second case is the one to know. See **preserve-thinking** below.
 
-### `MIMIRMIND_PRESERVE_THINKING`
+### `runtime.preserveThinking`
 
-Set this env var on the server (`MIMIRMIND_PRESERVE_THINKING=1`) to
-keep the thinking-channel wrapper in the assistant response on both
-the non-streaming and streaming paths. Clients then receive the raw
+Set `runtime.preserveThinking: true` in `config.json` (or per-model
+via `models[].runtime.preserveThinking`) to keep the thinking-channel
+wrapper in the assistant response on both the non-streaming and
+streaming paths. Clients then receive the raw
 decoded text including `<|channel>thought\n<channel|>`. When they
 send it back as part of the next turn's `messages`, the encoded
 tokens match the cache exactly and prefix reuse extends all the way
@@ -445,7 +463,7 @@ controls both ends of the conversation.
 ### Cache scope and lifecycle
 
 - **Pre-allocated, fixed size.** On first generate() the engine
-  allocates KV state for `MIMIRMIND_MAX_CONTEXT_TOKENS` (default
+  allocates KV state for `runtime.maxContextTokens` (default
   8192) tokens. This is the per-request hard cap on
   `prompt_tokens + max_tokens`; exceeding it returns an error
   rather than silently dropping the cache. The fixed size is
@@ -467,12 +485,12 @@ controls both ends of the conversation.
 
 ### Sizing the cache
 
-KV-cache size grows linearly with `MIMIRMIND_MAX_CONTEXT_TOKENS`.
+KV-cache size grows linearly with `runtime.maxContextTokens`.
 For Gemma 4 26B (30 layers, hybrid SWA/full attention with
 1024/2048 kv-dim), the rough cost is **~430 KiB per token**
 across all layers:
 
-| MAX_CONTEXT_TOKENS | KV cache size | Good for |
+| maxContextTokens | KV cache size | Good for |
 |---|---|---|
 | 2048 | ~870 MiB | Short single-turn prompts only |
 | 4096 | ~1.7 GiB | Default-ish chat history |
@@ -490,7 +508,7 @@ sizes up to 16K are comfortable.
 `kernels/attention.cl` holds the full score row for one query
 position in Shared Local Memory (`scores[ATTN_MAX_TK]`). At 16K
 that sits exactly at Intel Xe-LPG's 64 KiB SLM budget. Setting
-`MIMIRMIND_MAX_CONTEXT_TOKENS` higher than 16384 will throw at
+`runtime.maxContextTokens` higher than 16384 will throw at
 the first attention call with a clear error. Longer contexts
 (20 pages A4, 32K+) require the M9.8b architectural change:
 either an online-softmax rewrite of plain attention, or a

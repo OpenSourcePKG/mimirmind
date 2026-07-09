@@ -372,8 +372,13 @@ services:
         # unmasked).
         volumes:
             - /sys/class/drm:/sys/class/drm:rw
-            # ... model bind, log bind, thermal profile bind ...
+            # ... model bind, log bind, config.json bind ...
 ```
+
+The thermal profile is no longer a separate file — it lives inline in
+`config.json` under `governor.thermal` (since commit `456bd2a`). Just
+bind-mount your `config.json` at `/etc/mimirmind/config.json` and the
+container reads everything from there.
 
 ### Verification
 

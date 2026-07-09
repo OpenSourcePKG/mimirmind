@@ -24,33 +24,33 @@ the throttle decision.
 
 ### Enabling the guard
 
-Provide a JSON profile via either the CLI flag or the env var:
+The thermal profile lives inline in `config.json` under `governor.thermal`
+(migrated from a separate `--thermal-profile` file in commit `456bd2a`).
+Run the server against the config:
 
 ```bash
-mimirmind serve \
-  --model /models/gemma-4-26B-A4B-it-Q6_K.gguf \
-  --thermal-profile /etc/mimirmind/thermal-nuc14.json
-
-# or
-
-MIMIRMIND_THERMAL_PROFILE=/etc/mimirmind/thermal-nuc14.json \
-  mimirmind serve --model ...
+mimirmind serve --config /etc/mimirmind/config.json
 ```
 
-If **neither is set**, the engine starts unprotected and logs a loud
-WARN on startup. There is no built-in default profile — every host has
-different cooling and the wrong defaults could be worse than nothing.
+If the `governor.thermal` block is missing or its `name` field is empty,
+the engine starts unprotected and logs a loud WARN on startup. There is
+no built-in default profile — every host has different cooling and the
+wrong defaults could be worse than nothing.
 
 ### Profile structure
 
-```json
-{
-  "name":        "nuc14-attic",
-  "description": "free-form notes about this host",
+Inside `config.json`:
 
-  "package_temp_soft_c":      75,
-  "package_temp_hard_c":      82,
-  "package_throttle_max_ms":  200
+```json
+"governor": {
+  "thermal": {
+    "name":                     "nuc14-attic",
+    "description":              "free-form notes about this host",
+    "package_temp_soft_c":      75,
+    "package_temp_hard_c":      82,
+    "package_throttle_max_ms":  200,
+    "gpu_target_temp_c":        65
+  }
 }
 ```
 
@@ -149,8 +149,8 @@ run without thermal protection.
 
 ## Tuning a profile for a new host
 
-1. Run the host idle with `mimirmind serve --thermal-profile
-   /tmp/dry-run.json` where the file sets *very* permissive limits
+1. Run the host idle with a temporary `config.json` whose
+   `governor.thermal` block sets *very* permissive limits
    (e.g. `soft=99, hard=110`). Poll `/v1/system/status` for a while
    to confirm the sensor source resolved to the expected zone.
 2. Pick a workload that mirrors production traffic (Gemma 4 26B Q6_K
@@ -216,15 +216,18 @@ slow enough that sysfs write cost is negligible.
 
 ### Enabling
 
-Add `gpu_target_temp_c` to the thermal profile JSON:
+Add `gpu_target_temp_c` to the `governor.thermal` block in
+`config.json`:
 
 ```json
-{
-  "name": "nuc14-attic",
-  "package_temp_soft_c":     78,
-  "package_temp_hard_c":     85,
-  "package_throttle_max_ms": 200,
-  "gpu_target_temp_c":       72
+"governor": {
+  "thermal": {
+    "name":                     "nuc14-attic",
+    "package_temp_soft_c":      78,
+    "package_temp_hard_c":      85,
+    "package_throttle_max_ms":  200,
+    "gpu_target_temp_c":        72
+  }
 }
 ```
 
@@ -300,6 +303,47 @@ below soft, pacing computes 0 ms pause, admission stays open. If
 the governor cannot keep up (cap already at RPn but temp still
 climbs), pacing kicks in. If even pacing can't hold the line and
 hard is breached, new requests are refused.
+
+### Per-tick NDJSON sink
+
+For baselining and A/B-comparing controller tunings, the governor can
+append one line of NDJSON per tick to a file on disk (M9.6.6.0). Off
+by default; enable via `config.json`:
+
+```json
+"governor": {
+  "tickLog":     true,
+  "tickLogFile": "/logs/governor-baseline.ndjson"
+}
+```
+
+One line per tick, opened in append mode and flushed on every write so
+a crash keeps the trailing state on disk:
+
+```json
+{"ts_ms":1783012345678,"temp_c":58.5,"cap_before":1850,"cap_after":1900,
+ "delta_mhz":50,"error_c":-6.5,"target_c":65.0,
+ "gain_up_mhz_per_c":10,"gain_down_mhz_per_c":100,"deadband_c":0.5,
+ "pinned":false}
+```
+
+The three controller-constant fields (`gain_up_mhz_per_c`,
+`gain_down_mhz_per_c`, `deadband_c`) mean a captured baseline can be
+unambiguously attributed to the controller version that produced it —
+essential when comparing an M9.6.6.1 baseline against an M9.6.6.2
+retune. The sink runs at whatever cadence the governor ticks
+(currently every 8 decode tokens, ~5 Hz), so one hour of sustained
+decode is on the order of ~18000 lines.
+
+The runbook for the M9.6.6.1 baseline capture (in the Synaipse vault)
+consumes this file with `jq` — cap-histogram, temp-headroom, up/down
+delta counts. Sink is intended for baseline runs only; disable in
+prod (`tickLog: false`) once the numbers are captured.
+
+Migration note: earlier images (pre-`d6b64cc`) reused
+`diagnostics.traceDecodeFile` as the sink path. That still works with
+a deprecation warning for one release, but move to `tickLogFile`
+before the next.
 
 ## Power telemetry (RAPL)
 

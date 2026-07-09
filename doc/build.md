@@ -8,8 +8,10 @@ Intel compute SDK — only the source tree lives on the host.
 - A recent Docker (≥ 24) with `docker compose`.
 - Intel iGPU exposed at `/dev/dri` (rendering passthrough).
 - Host groups `render` (typically GID 104) and `video` (typically GID 44).
-  If the host uses different GIDs, override via
-  `MIMIRMIND_RENDER_GID` / `MIMIRMIND_VIDEO_GID` in `.env`.
+  If the host uses different GIDs, override via `MIMIRMIND_RENDER_GID` /
+  `MIMIRMIND_VIDEO_GID` in `.env`. These two are the *only* env vars the
+  container still consults; every runtime knob moved into `config.json`
+  in commit `456bd2a`.
 
 If you are running this from a Proxmox LXC container, see
 [`setup-ct.md`](setup-ct.md) for the host-side configuration required
@@ -67,9 +69,9 @@ docker compose build mimirmind
 # M1 device-enumeration smoke test:
 docker compose run --rm mimirmind smoke
 
-# Same, with a model file:
-export MIMIRMIND_MODELS_DIR=/srv/llm-models
-export MIMIRMIND_MODEL_PATH=/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+# Same, with a model file. The path is set in config.json under
+# `models[<id>].path`; docker-compose maps `./models` to `/models`
+# inside the container.
 docker compose run --rm mimirmind smoke --chat \
     --prompt "Wer hat den Mond entdeckt?"
 ```
@@ -79,18 +81,29 @@ for `docker-compose.server.yml`.
 
 ## Server deployment (registry image)
 
-`docker-compose.server.yml` reads tag + paths from `.env`:
+Configuration lives in two places:
+
+- `.env` — only the container-level knobs: image tag, models directory
+  bind-mount, host GIDs. Every runtime setting moved into `config.json`.
+- `config.json` — every runtime knob (model path, port, KV dtype, thermal
+  profile, feature flags, log level and file, USM probe cap, …). Copy
+  `config.example.json` to `config.dev.json` (gitignored) and edit;
+  point the compose file at it via `MIMIRMIND_CONFIG_HOST` in `.env`.
+
+`.env` example:
 
 ```dotenv
 MIMIRMIND_IMAGE_TAG=latest
 MIMIRMIND_MODELS_DIR=/srv/llm-models
-MIMIRMIND_MODEL_PATH=/models/gemma-4-26B-A4B-it-Q6_K.gguf
 MIMIRMIND_RENDER_GID=104
 MIMIRMIND_VIDEO_GID=44
-MIMIRMIND_LOG_LEVEL=info
-MIMIRMIND_LOG_FILE=/logs/run.log
-MIMIRMIND_USM_PROBE_TOTAL_GIB=0
+MIMIRMIND_CONFIG_HOST=./config.dev.json
 ```
+
+`config.dev.json` schema: see `config.example.json` for the full shape;
+`README.md` § Config has a one-line-per-section overview. The migration
+mapping (old env var → new JSON key) is documented in the header of
+`docker-compose.server.yml`.
 
 Then:
 
@@ -128,8 +141,8 @@ file matches your host's GIDs.
 
 **`ze_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` during USM probe** — the
 phase-2 ceiling sweep is asking for more memory than the host has
-free. Set `MIMIRMIND_USM_PROBE_TOTAL_GIB=4` (or `0` to skip phase 2
-entirely) in `.env`. The model loader does not need the phase-2
+free. Set `runtime.usmProbeTotalGib: 4` in `config.json` (or `0` to
+skip phase 2 entirely). The model loader does not need the phase-2
 result; it's diagnostic only.
 
 **`Q8_0 kernels loaded` not appearing in the startup log** — you are

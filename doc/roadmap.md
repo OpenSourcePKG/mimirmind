@@ -94,7 +94,7 @@ expensive per token as decode.
 | M5i.D | Per-QuantType autotune at `loadModel()` — matvec-loop vs GEMM |
 | M5i.E | Load-time parity gates: `GpuOps::selfTest` + autotune-parity check |
 | M5i.F | MoE expert grouping — batch the T×K_top iteration into `nExperts` matmuls (T>1) |
-| M5i.I | `MIMIRMIND_GPU_CLOCK_PIN=rp0` for reproducible bench runs |
+| M5i.I | `governor.gpuClockPin: "rp0"` for reproducible bench runs |
 
 Outcome on the target hardware: the GEMM kernel loses the autotune
 race 2-3× against a matvec loop on Xe-LPG (compile-time surprise,
@@ -128,7 +128,9 @@ released for Gemma 4 in mid-2026.
 ### M-CLR — Command-List Replay ✅
 
 Delivered 2026-07-06 (image `2f3a0ea`) behind the toggle
-`MIMIRMIND_ENABLE_CLR=on`. Eliminates the per-launch dispatch overhead
+`features.clr: true` in `config.json` (formerly the
+`MIMIRMIND_ENABLE_CLR=on` env var, migrated in `456bd2a`). Eliminates
+the per-launch dispatch overhead
 on decode (936 dispatches per token × ~12 µs Xe-LPG launch cost).
 Verified live at −6.4 % on E4B Q4_K_M against the immediate path with
 the same image, same prompt. The Level-Zero mutable-command-list
@@ -142,7 +144,7 @@ KV reads per attention call. **Phase 1** (later) adds Q8_0 for a
 further 2× cut. FP16 is the largest bandwidth-relevant lever for as
 long as KV reads scale linearly with T_k — during long chats and RAG
 prompts, KV traffic dominates the read budget. Phase 0 foundation
-(KvCache API + env-var wiring) is committed locally. Attention kernels
+(KvCache API + `runtime.kvDtype` wiring) is committed locally. Attention kernels
 already ship in both F32 and FP16 variants; the read-path dispatcher
 gets wired in the next commits, followed by write-side kernels and the
 backend migration.
@@ -180,7 +182,7 @@ What Mimirmind needs to add:
 - Second `_backend` slot on `InferenceEngine`
 - Speculation loop with target-KV-shared draft state
 - Batched target verify + accept/reject sampling
-- `MIMIRMIND_ENABLE_MTP` env toggle and kill switch
+- `speculative.enabled` config toggle and kill switch
 
 Rough sizing: 5-7 days, plus M8.K running first.
 
