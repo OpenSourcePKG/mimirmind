@@ -91,7 +91,7 @@ public:
     [[nodiscard]] virtual const char* name() const noexcept = 0;
 
     /// Enable per-stage parity dumps. PREFIX is the same string carried by
-    /// the MIMIRMIND_PARITY_DUMP env: each stage writes a file at
+    /// `diagnostics.parityDump` in config.json: each stage writes a file at
     ///   <prefix>-blk{N}-<stage>.bin
     /// matching the layout llama-parity-dump produces. Empty string =
     /// disabled (default). Default impl is no-op; backends that wire
@@ -135,7 +135,8 @@ isSupportedArchitecture(std::string_view architecture) noexcept {
 }
 
 /// Build the backend matching `architecture` ("qwen2" / "gemma4"). Returns
-/// nullptr for unsupported architectures — callers must check.
+/// nullptr for unsupported architectures — callers must check. `moeGroupEnabled`
+/// maps to `features.moeGroup` in config.json — non-MoE architectures ignore it.
 std::unique_ptr<ArchBackend>
 createArchBackend(const std::string&             architecture,
                   const model::LlmConfig&        config,
@@ -143,6 +144,7 @@ createArchBackend(const std::string&             architecture,
                   const model::FusedQkvWeights*  fusedQkv,
                   compute::GpuOps&               ops,
                   compute::GpuMatmul&            gmm,
-                  OpProfiler&                    opProfiler);
+                  OpProfiler&                    opProfiler,
+                  bool                           moeGroupEnabled = true);
 
 } // namespace mimirmind::runtime::arch

@@ -27,6 +27,7 @@
 #include "compute/quant/Q8_0.hpp"
 #include "model/GgufTypes.hpp"
 #include "runtime/CommandQueue.hpp"
+#include "runtime/Config.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/UsmAllocator.hpp"
 
@@ -59,8 +60,9 @@ struct GpuFixture {
         // actually exercise the GEMM kernels regardless of what the
         // dev-box iGPU would autotune-pick. M=1 regression tests still
         // hit the matvec path because dispatch fast-paths M==1 to vec.
-        ::setenv("MIMIRMIND_FORCE_GEMM", "1", /*overwrite=*/1);
-        gmm.autotune(usm, /*hiddenDim=*/2816, /*mBatch=*/16);
+        mimirmind::runtime::FeatureSettings features{};
+        features.gemm = mimirmind::runtime::TriState::Force;
+        gmm.autotune(usm, /*hiddenDim=*/2816, features);
     }
 };
 
@@ -2358,7 +2360,7 @@ TEST(qkv_split_M1_decode) {
 // =======================================================================
 // Perf micro-benchmarks — GEMM (batched) vs matvec-loop (per-token).
 //
-// Opt-in via MIMIRMIND_GPU_BENCH=1. Off by default so the regular test
+// Test-only opt-in via MIMIRMIND_GPU_BENCH=1 (test env only, not in the mimirmind config schema). Off by default so the regular test
 // suite stays fast and deterministic.
 //
 // !!! HARDWARE WARNING !!!

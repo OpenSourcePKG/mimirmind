@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/SpeculativeDecoder.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -36,6 +38,10 @@ struct ServerConfig {
     /// the wrapper from the response makes the round-trip diverge
     /// from the cached tokens at the first assistant turn.
     bool          preserveThinking{false};
+
+    /// Speculative-decoding settings from `speculative` in config.json.
+    /// Applied inside ApiServer::Impl when a draft engine is present.
+    runtime::SpeculativeDecoder::Config speculative{};
 };
 
 /**

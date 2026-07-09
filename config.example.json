@@ -1,0 +1,71 @@
+{
+  "defaultModel": "primary",
+  "models": [
+    {
+      "id": "primary",
+      "path": "/models/gemma-4-e4b.gguf",
+      "loadOnStart": true
+    }
+  ],
+
+  "server": {
+    "port": 8080,
+    "log": {
+      "file": null,
+      "level": "info"
+    }
+  },
+
+  "runtime": {
+    "kvDtype": "q8_0",
+    "maxContextTokens": 8192,
+    "usmProbeTotalGib": null,
+    "preserveThinking": false,
+    "spvDir": null
+  },
+
+  "features": {
+    "clr": true,
+    "flashPrefill": true,
+    "fusedQkv": true,
+    "moeGroup": true,
+    "gemm": "auto",
+    "gemmV2": false,
+    "gemmMinM": null,
+    "dp4a": "disable"
+  },
+
+  "speculative": {
+    "enabled": false,
+    "target": "primary",
+    "draft": "draft",
+    "n": 4
+  },
+
+  "governor": {
+    "gpuClockPin": null,
+    "tickLog": false,
+    "fan": {
+      "boost": true,
+      "pwmBoost": null,
+      "pwmMin": null
+    },
+    "thermal": {
+      "name": "example-nuc14-ish",
+      "description": "Example values tuned for a passively-cooled Meteor Lake NUC. Replace with values calibrated for your own chassis — see examples/thermal-profile-*.json. Leave name empty and drop the soft/hard pair to disable the guard entirely.",
+      "package_temp_soft_c": 78,
+      "package_temp_hard_c": 85,
+      "package_throttle_max_ms": 200,
+      "gpu_target_temp_c": 72
+    }
+  },
+
+  "diagnostics": {
+    "parityDump": "",
+    "traceBlock0": false,
+    "traceDecodeFile": "",
+    "traceOpTimes": false,
+    "gpuBench": false,
+    "regressionAlert": true
+  }
+}

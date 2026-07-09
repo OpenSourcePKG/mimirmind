@@ -18,6 +18,7 @@
 namespace mimirmind::runtime {
 class L0Context;
 class UsmAllocator;
+struct FeatureSettings;
 }
 
 namespace mimirmind::compute {
@@ -82,13 +83,17 @@ public:
     /// d_model. `mBatch` is the batch to time (16 mirrors a typical
     /// prefill chunk).
     ///
-    /// Env-var overrides skip the actual bench:
-    ///   MIMIRMIND_DISABLE_GEMM=1 → force matvec-loop for every type
-    ///   MIMIRMIND_FORCE_GEMM=1   → force GEMM for every type that has one
-    /// Both set → DISABLE wins (safer default).
-    void autotune(runtime::UsmAllocator& allocator,
-                  std::size_t            hiddenDim,
-                  std::size_t            mBatch = 16);
+    /// Feature-flag overrides in `features` skip the actual bench:
+    ///   features.gemm    == TriState::Disable → force matvec-loop everywhere
+    ///   features.gemm    == TriState::Force   → force GEMM everywhere it exists
+    ///   features.gemmMinM.has_value()         → pin the crossover threshold
+    ///   features.dp4a    == TriState::Force   → pin DP4A path after parity
+    ///   features.dp4a    == TriState::Disable → skip the DP4A parity/bench
+    ///   features.gemmV2                       → route picked GEMM through v2 kernel
+    /// If both `gemm` and `gemmMinM` are set, `gemmMinM` wins.
+    void autotune(runtime::UsmAllocator&          allocator,
+                  std::size_t                     hiddenDim,
+                  const runtime::FeatureSettings& features);
 
     /// Y [M, N] = X [M, K] * W [N, K]^T. Synchronous version (mirrors
     /// compute::matmul signature). For supported `type` the dispatch goes
@@ -213,7 +218,7 @@ private:
         // M8.K.1 experimental — Q8_0 only. Set when the v2 GEMM
         // (larger M-tile + sub-group scale broadcast) module loaded.
         // At dispatch time, `useGemmV2` (true only when
-        // MIMIRMIND_USE_GEMM_V2 is set AND autotune picked GEMM)
+        // features.gemmV2 is true AND autotune picked GEMM)
         // routes to v2's kernel instead of v1's.
         std::optional<KernelSlot> gemmV2;
         std::size_t               gemmV2MTile{1};
@@ -224,12 +229,12 @@ private:
         // beat the timed matvec-loop bench with a 5 % margin.
         // matmulAsync dispatches GEMM iff `M >= gemmMinM`. The MAX
         // sentinel means "GEMM never wins, always take matvec".
-        //   No GEMM kernel loaded → MAX
-        //   MIMIRMIND_DISABLE_GEMM → MAX
-        //   MIMIRMIND_FORCE_GEMM   → 2 (any M > 1 dispatches GEMM)
-        //   MIMIRMIND_GEMM_MIN_M=N → N (debug override)
-        //   Otherwise              → smallest bench-bucket-M where GEMM won,
-        //                             or MAX if it never won at any bucket
+        //   No GEMM kernel loaded    → MAX
+        //   features.gemm=disable    → MAX
+        //   features.gemm=force      → 2 (any M > 1 dispatches GEMM)
+        //   features.gemmMinM = N    → N (debug override)
+        //   Otherwise                → smallest bench-bucket-M where GEMM won,
+        //                              or MAX if it never won at any bucket
         std::size_t               gemmMinM{std::numeric_limits<std::size_t>::max()};
 
         // M8.H.3 — DP4A kernel for this type. Loaded eagerly in the

@@ -31,9 +31,13 @@ namespace mimirmind::compute {
  */
 class GpuOps {
 public:
+    /// `flashPrefillEnabled` maps to `features.flashPrefill` in config.json.
+    /// When false, T_q > 1 dispatches fall back to the plain attention.cl
+    /// kernel — rollback lever for flash-prefill bugs.
     GpuOps(runtime::L0Context&    ctx,
            runtime::UsmAllocator& alloc,
-           runtime::CommandQueue& queue);
+           runtime::CommandQueue& queue,
+           bool                   flashPrefillEnabled = true);
     ~GpuOps();
 
     GpuOps(const GpuOps&)            = delete;
@@ -521,9 +525,10 @@ private:
     std::size_t            _replayMaxKTiles{0};
     std::size_t            _flashPartialBytes{0};
 
-    // M5i.J — MIMIRMIND_DISABLE_FLASH_PREFILL rollback. Cached at
-    // construction so the dispatcher hot-path stays branch-free after
-    // startup. When true, T_q > 1 falls back to attention.cl variant (a).
+    // M5i.J — flash-prefill rollback via `features.flashPrefill=false`
+    // in config.json. Cached at construction so the dispatcher hot-path
+    // stays branch-free after startup. When true, T_q > 1 falls back to
+    // attention.cl variant (a).
     bool                   _prefillFlashDisabled{false};
 
     static constexpr std::uint32_t kRmsnormLocalSize     = 128;

@@ -4,20 +4,11 @@
 #include "runtime/Log.hpp"
 
 #include <cstdio>
-#include <cstdlib>
 #include <string>
-#include <string_view>
 
 namespace mimirmind::runtime {
 
 namespace {
-
-bool envSet(const char* name) noexcept {
-    const char* v = std::getenv(name);
-    if (v == nullptr) return false;
-    const std::string_view s{v};
-    return !s.empty() && s != "0" && s != "false" && s != "off";
-}
 
 constexpr const char* kCatNames[] = {
     "norm", "attn", "matmul", "act", "resid", "router",
@@ -25,14 +16,14 @@ constexpr const char* kCatNames[] = {
 
 } // namespace
 
-OpProfiler::OpProfiler(CommandQueue& queue)
-    : _enabled{envSet("MIMIRMIND_TRACE_OP_TIMES")},
+OpProfiler::OpProfiler(CommandQueue& queue, bool enabled)
+    : _enabled{enabled},
       _queue{queue},
       _dispatchBaseline{queue.dispatchCount()}
 {
     if (_enabled) {
         MM_LOG_INFO("opprof",
-                    "MIMIRMIND_TRACE_OP_TIMES=on — per-op-category timing "
+                    "diagnostics.traceOpTimes=true — per-op-category timing "
                     "active (flushes serialise the pipeline, adds overhead). "
                     "Summary logged every {} tokens.", kDumpEvery);
     }

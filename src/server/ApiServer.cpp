@@ -277,7 +277,7 @@ constexpr std::size_t kMPtTrimIterLimit = 20;
                 " tokens after trimming " + std::to_string(report.droppedMessages) +
                 " message(s) + slack " + std::to_string(kMPtCapSlack) +
                 " does not fit context budget " + std::to_string(maxContextTokens) +
-                " — raise MIMIRMIND_MAX_CONTEXT_TOKENS or shorten the last "
+                " — raise runtime.maxContextTokens or shorten the last "
                 "user message";
             return false;
         }
@@ -533,26 +533,12 @@ struct ApiServer::Impl {
           chatStyle{model::ChatTemplate::detectFromArch(
               engine.config().architecture)} {
         // M9.11.4 — stand up the spec-dec orchestrator now that both
-        // engines are ready. Reads MIMIRMIND_SPEC_DEC_N from env for
-        // draft-N tuning; default 4 matches the roadmap prediction.
+        // engines are ready. Draft-N tuning comes from `speculative.n`
+        // in config.json (default 4 matches the roadmap prediction).
         if (draftEngine != nullptr) {
-            runtime::SpeculativeDecoder::Config sdcfg{};
-            if (const char* envN = std::getenv("MIMIRMIND_SPEC_DEC_N")) {
-                if (envN[0] != '\0') {
-                    const auto n = std::strtoull(envN, nullptr, 10);
-                    if (n > 0 && n < 64) {
-                        sdcfg.draftN = static_cast<std::size_t>(n);
-                    } else {
-                        MM_LOG_WARN("server",
-                                    "MIMIRMIND_SPEC_DEC_N={} out of range "
-                                    "[1..63], keeping default {}",
-                                    envN, sdcfg.draftN);
-                    }
-                }
-            }
             speculativeDecoder =
                 std::make_unique<runtime::SpeculativeDecoder>(
-                    engine, *draftEngine, sdcfg);
+                    engine, *draftEngine, cfg.speculative);
         }
         installRoutes();
         // Engine is constructed model-loaded already (loadModel is called
@@ -860,7 +846,7 @@ struct ApiServer::Impl {
         if (guard == nullptr) {
             body["warning"] =
                 "no thermal profile configured — engine is unprotected. "
-                "Set --thermal-profile or MIMIRMIND_THERMAL_PROFILE.";
+                "Fill the governor.thermal section in config.json.";
             sendJson(res, 200, body);
             return;
         }
@@ -1007,7 +993,7 @@ struct ApiServer::Impl {
     /// runs contributed, and the most recent alert if one has fired.
     /// Absent (= "available": false with reason) when no detector is
     /// installed — happens in smoke/parity mode or when
-    /// MIMIRMIND_REGRESSION_ALERT=off was passed to serve.
+    /// `diagnostics.regressionAlert: false` was set in config.json.
     json buildPerfRegressionBlock() {
         auto* det = engine.perfRegressionDetector();
         if (det == nullptr) {
@@ -1102,7 +1088,7 @@ struct ApiServer::Impl {
             return json{
                 {"available", false},
                 {"reason",    "no FanController installed "
-                              "(MIMIRMIND_FAN_BOOST=off or probe failed)"},
+                              "(governor.fan.boost=false or probe failed)"},
             };
         }
         if (!fc->available()) {
@@ -1178,7 +1164,7 @@ struct ApiServer::Impl {
         json fusedJson;
         if (const auto* fq = engine.fusedQkv()) {
             fusedJson = json{
-                {"disabled_by_env", fq->disabledByEnv()},
+                {"disabled", fq->disabled()},
                 {"blocks_fused",    fq->fusedCount()},
                 {"blocks_skipped",  fq->skippedCount()},
                 {"usm_mib",         static_cast<unsigned long long>(

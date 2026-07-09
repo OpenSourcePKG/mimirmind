@@ -99,7 +99,9 @@ L0Error::L0Error(const std::string& call, ze_result_t code)
 
 // --- L0Context ---------------------------------------------------------------
 
-L0Context::L0Context() {
+L0Context::L0Context(std::string spvDirOverride)
+    : _spvDirOverride{std::move(spvDirOverride)}
+{
     MM_LOG_INFO("l0", "zeInit(GPU_ONLY) — calling loader");
     ze_init_flags_t flags = ZE_INIT_FLAG_GPU_ONLY;
     ZE_CHECK(zeInit(flags));

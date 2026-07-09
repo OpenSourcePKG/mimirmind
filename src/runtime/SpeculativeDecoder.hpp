@@ -21,10 +21,10 @@ namespace mimirmind::runtime {
  * Scope of M9.11.4 — greedy only:
  *
  * - Speculative-decoding is engaged only when `params.sampling.temperature
- *   <= 0` AND the draft engine is non-null AND the env kill-switch
- *   `MIMIRMIND_SPEC_DEC=off` is unset. Any other case falls through to
- *   plain `target.generate(...)` bit-for-bit — the streaming/blocking
- *   response is identical to the target-only baseline.
+ *   <= 0` AND the draft engine is non-null AND `speculative.enabled` is
+ *   true in config.json. Any other case falls through to plain
+ *   `target.generate(...)` bit-for-bit — the streaming/blocking response
+ *   is identical to the target-only baseline.
  *
  * - Accept/reject is `argmax(target_logits[i]) == draft_token[i]`.
  *   Recovery on first mismatch is `argmax(target_logits[K])`. Correct
@@ -42,9 +42,12 @@ namespace mimirmind::runtime {
 class SpeculativeDecoder {
 public:
     struct Config {
-        /// Tokens the draft speculates per verify round. `0` disables
-        /// spec-dec entirely (same effect as `MIMIRMIND_SPEC_DEC=off`).
-        /// Typical range 2..8; default 4 matches the roadmap prediction.
+        /// From `speculative.enabled` in config.json. When false the
+        /// wrapper always falls through to plain target.generate().
+        bool        enabled{true};
+        /// Tokens the draft speculates per verify round. From
+        /// `speculative.n`. Typical range 2..8; default 4 matches the
+        /// roadmap prediction.
         std::size_t draftN{4};
     };
 

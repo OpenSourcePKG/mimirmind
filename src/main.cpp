@@ -8,6 +8,7 @@
 #include "model/Tokenizer.hpp"
 #include "model/WeightsMap.hpp"
 #include "runtime/CommandQueue.hpp"
+#include "runtime/Config.hpp"
 #include "runtime/GpuKernel.hpp"
 #include "runtime/GpuModule.hpp"
 #include "runtime/FanController.hpp"
@@ -38,6 +39,7 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -58,13 +60,18 @@ constexpr const char* kUsage =
     "\n"
     "Modes:\n"
     "  smoke              Run M1-M5 diagnostics + end-to-end generate (default)\n"
-    "  serve              Start the OpenAI-compatible HTTP server (M7d, stub)\n"
+    "  serve              Start the OpenAI-compatible HTTP server\n"
     "  parity             Tensor-parity test: run llama.cpp + mimirmind on\n"
     "                     the same prompt, dump per-block hidden state, diff\n"
     "\n"
     "Options:\n"
-    "  --model PATH       GGUF model file (overrides MIMIRMIND_MODEL_PATH)\n"
-    "  --port N           HTTP port for serve mode (default 8080)\n"
+    "  --config PATH      config.json file (default ./config.json).\n"
+    "                     Fails hard if the file is missing or malformed —\n"
+    "                     copy config.example.json and edit for your host.\n"
+    "  --model PATH       GGUF model file (overrides models[<defaultModel>].path)\n"
+    "  --port N           HTTP port for serve mode (overrides server.port)\n"
+    "  --log-level LEVEL  trace|debug|info|warn|error|off (overrides server.log.level)\n"
+    "  --log-file PATH    Append log lines here (overrides server.log.file)\n"
     "  --prompt TEXT      Prompt for smoke generate (default \"Hello, world!\")\n"
     "  --max-new N        Max new tokens for smoke generate (default 20)\n"
     "  --temperature F    Sampling temperature, 0 = greedy (default 0)\n"
@@ -73,10 +80,8 @@ constexpr const char* kUsage =
     "  --seed N           RNG seed, 0 = random_device (default 0)\n"
     "  --chat             Wrap --prompt as a user message via the chat template\n"
     "  --system TEXT      System message for --chat (default: Qwen2.5 default)\n"
-    "  --thermal-profile PATH\n"
-    "                     JSON profile with per-host throttle limits\n"
-    "                     (or set MIMIRMIND_THERMAL_PROFILE). Without it the\n"
-    "                     engine runs unprotected — only set this for serve.\n"
+    "  --dump-dir PATH    (parity only) directory for reference-oracle dumps\n"
+    "                     — sets diagnostics.parityDump for the subprocess.\n"
     "  -h, --help         Show this help and exit\n";
 
 enum class Mode {
@@ -87,17 +92,21 @@ enum class Mode {
 
 struct CliArgs {
     Mode          mode{Mode::Smoke};
+    std::string   configPath{"./config.json"};
+    // Optional overrides — empty / sentinel means "not set on CLI".
     std::string   modelPath;
     std::string   prompt{"Hello, world!"};
     std::size_t   maxNew{20};
-    std::uint16_t port{8080};
+    std::optional<std::uint16_t> port;
     float         temperature{0.0F};
     std::size_t   topK{0};
     float         topP{1.0F};
     std::uint64_t seed{0};
     bool          chat{false};
     std::string   systemMessage{};
-    std::string   thermalProfilePath{};
+    std::string   logLevel{};
+    std::string   logFile{};
+    std::string   dumpDir{};
 };
 
 [[nodiscard]] bool parseArgs(int argc, char** argv, CliArgs& out) {
@@ -134,6 +143,10 @@ struct CliArgs {
         if (a == "-h" || a == "--help") {
             std::cout << kUsage;
             std::exit(0);
+        } else if (a == "--config") {
+            const char* v = needValue("--config");
+            if (v == nullptr) return false;
+            out.configPath = v;
         } else if (a == "--model") {
             const char* v = needValue("--model");
             if (v == nullptr) return false;
@@ -150,6 +163,14 @@ struct CliArgs {
             const char* v = needValue("--port");
             if (v == nullptr) return false;
             out.port = static_cast<std::uint16_t>(std::strtoul(v, nullptr, 10));
+        } else if (a == "--log-level") {
+            const char* v = needValue("--log-level");
+            if (v == nullptr) return false;
+            out.logLevel = v;
+        } else if (a == "--log-file") {
+            const char* v = needValue("--log-file");
+            if (v == nullptr) return false;
+            out.logFile = v;
         } else if (a == "--temperature") {
             const char* v = needValue("--temperature");
             if (v == nullptr) return false;
@@ -172,19 +193,13 @@ struct CliArgs {
             const char* v = needValue("--system");
             if (v == nullptr) return false;
             out.systemMessage = v;
-        } else if (a == "--thermal-profile") {
-            const char* v = needValue("--thermal-profile");
+        } else if (a == "--dump-dir") {
+            const char* v = needValue("--dump-dir");
             if (v == nullptr) return false;
-            out.thermalProfilePath = v;
+            out.dumpDir = v;
         } else {
             std::cerr << "unknown argument '" << a << "'\n" << kUsage;
             return false;
-        }
-    }
-
-    if (out.modelPath.empty()) {
-        if (const char* env = std::getenv("MIMIRMIND_MODEL_PATH")) {
-            out.modelPath = env;
         }
     }
 
@@ -1052,13 +1067,13 @@ void runM4deGenerate(mimirmind::runtime::InferenceEngine& engine,
 
 // ---- Smoke driver ----------------------------------------------------------
 
-int runSmoke(const CliArgs& args) {
+int runSmoke(const CliArgs& args, const mimirmind::runtime::Config& cfg) {
     std::cout << kBanner;
     std::cout.flush();
 
     MM_LOG_INFO("main", "mimirmind smoke starting (M1-M5 + engine.generate)");
 
-    mimirmind::runtime::InferenceEngine engine;
+    mimirmind::runtime::InferenceEngine engine{cfg};
 
     printM1M2(engine);
     runM2bAllocatorSmoke(engine.allocator());
@@ -1066,7 +1081,7 @@ int runSmoke(const CliArgs& args) {
 
     if (args.modelPath.empty()) {
         std::cout << "\n[M3] GGUF reader — skipped "
-                     "(pass --model PATH or set MIMIRMIND_MODEL_PATH)\n";
+                     "(pass --model PATH or set models[].path in config.json)\n";
         MM_LOG_INFO("main", "[M3] no model path; skipping load");
     } else {
         std::cout << "\n[M3] GGUF reader (" << args.modelPath << ")\n";
@@ -1110,17 +1125,18 @@ extern "C" void signalStop(int /*sig*/) {
     }
 }
 
-int runServe(const CliArgs& args) {
+int runServe(const CliArgs& args, const mimirmind::runtime::Config& cfg) {
     std::cout << kBanner;
     std::cout.flush();
 
     if (args.modelPath.empty()) {
-        std::cerr << "serve: --model PATH is required (or set MIMIRMIND_MODEL_PATH)\n";
+        std::cerr << "serve: models[<defaultModel>].path is required "
+                     "(fill it in config.json or pass --model PATH)\n";
         return 2;
     }
 
     MM_LOG_INFO("main", "serve: loading model '{}'", args.modelPath);
-    mimirmind::runtime::InferenceEngine engine;
+    mimirmind::runtime::InferenceEngine engine{cfg};
     engine.loadModel(args.modelPath);
 
     // Refuse architectures without a working forward path so the user
@@ -1140,26 +1156,28 @@ int runServe(const CliArgs& args) {
         std::cerr << msg << "\n";
         return 2;
     }
+    // Resolve per-model runtime overrides now that we know which model
+    // loaded (defaultModel resolves to models[0] when empty).
+    const auto effRuntime = cfg.effectiveRuntime(
+        cfg.defaultModel.empty() ? cfg.defaultModelEntry().id : cfg.defaultModel);
+
     // Optional KV-cache pre-allocation size. The cache is sized once
     // and never reallocated for request growth, so this is the upper
     // bound on (prompt + max_new) any single generate() can hold.
     // Larger = bigger upfront memory commitment but multi-turn prefix
     // reuse keeps working as conversations grow.
-    if (const char* env = std::getenv("MIMIRMIND_MAX_CONTEXT_TOKENS")) {
-        if (const auto n = std::strtoull(env, nullptr, 10); n > 0) {
-            engine.setMaxContextTokens(static_cast<std::size_t>(n));
-        }
+    if (effRuntime.maxContextTokens.has_value() &&
+        *effRuntime.maxContextTokens > 0) {
+        engine.setMaxContextTokens(*effRuntime.maxContextTokens);
     }
 
     // M10.2 Phase 0 / 1a — KV cache element dtype. Default F32
     // (bit-identical to pre-M10.2). `fp16` opts in to the 2× bandwidth
-    // / RAM win; `q8_0` layers on the block-quantised 4× win (M10.2.0
-    // Commits 3-6 wired: write kernel, read kernels, backend integration
-    // + parity tests all live). Other values log a warning and fall
-    // back to F32. Must be set before the first generate() so the lazy
-    // KvCache construction picks it up.
-    if (const char* env = std::getenv("MIMIRMIND_KV_DTYPE")) {
-        const std::string_view v{env};
+    // / RAM win; `q8_0` layers on the block-quantised 4× win. Other
+    // values log a warning and fall back to F32. Must be set before the
+    // first generate() so the lazy KvCache construction picks it up.
+    if (effRuntime.kvDtype.has_value()) {
+        const std::string_view v{*effRuntime.kvDtype};
         if (v == "fp16") {
             engine.setKvDtype(mimirmind::runtime::KvDtype::FP16);
         } else if (v == "q8_0") {
@@ -1168,8 +1186,8 @@ int runServe(const CliArgs& args) {
             engine.setKvDtype(mimirmind::runtime::KvDtype::F32);
         } else {
             MM_LOG_WARN("main",
-                        "MIMIRMIND_KV_DTYPE='{}' unrecognised — falling "
-                        "back to f32", env);
+                        "runtime.kvDtype='{}' unrecognised — falling "
+                        "back to f32", v);
         }
     }
     {
@@ -1188,19 +1206,31 @@ int runServe(const CliArgs& args) {
     }
 
     // M9.11.1 — Optional speculative-decoding draft engine. Opt-in via
-    // MIMIRMIND_DRAFT_MODEL_PATH. Fully independent InferenceEngine so
-    // the target's L0 context / autotune / KV cache stay untouched;
-    // costs a second autotune pass at startup (~30 s) plus draft
-    // weights in USM. The speculation loop that actually calls the
-    // draft lands in M9.11.2+ — this step only loads and vocab-checks.
+    // `speculative.enabled: true` in config.json plus a `models[]` entry
+    // whose id matches `speculative.draft`. Fully independent
+    // InferenceEngine so the target's L0 context / autotune / KV cache
+    // stay untouched; costs a second autotune pass at startup (~30 s)
+    // plus draft weights in USM. The speculation loop that actually
+    // calls the draft lands in M9.11.2+ — this step only loads and
+    // vocab-checks.
     std::unique_ptr<mimirmind::runtime::InferenceEngine> draftEngine;
-    if (const char* draftPathEnv = std::getenv("MIMIRMIND_DRAFT_MODEL_PATH");
-        draftPathEnv != nullptr && draftPathEnv[0] != '\0') {
-        MM_LOG_INFO("main",
-                    "serve: loading draft model '{}'", draftPathEnv);
+    std::string draftPath;
+    if (cfg.speculative.enabled && !cfg.speculative.draft.empty()) {
         try {
-            draftEngine = std::make_unique<mimirmind::runtime::InferenceEngine>();
-            draftEngine->loadModel(draftPathEnv);
+            draftPath = cfg.model(cfg.speculative.draft).path;
+        } catch (const std::exception& e) {
+            MM_LOG_WARN("main",
+                        "serve: speculative.draft='{}' unresolved ({}) — "
+                        "speculative decoding disabled",
+                        cfg.speculative.draft, e.what());
+        }
+    }
+    if (!draftPath.empty()) {
+        MM_LOG_INFO("main",
+                    "serve: loading draft model '{}'", draftPath);
+        try {
+            draftEngine = std::make_unique<mimirmind::runtime::InferenceEngine>(cfg);
+            draftEngine->loadModel(draftPath);
 
             // Vocab compatibility. Modified rejection sampling only
             // works when draft token-id N and target token-id N mean
@@ -1241,38 +1271,31 @@ int runServe(const CliArgs& args) {
         }
     }
 
-    mimirmind::server::ServerConfig cfg{};
-    cfg.host    = "0.0.0.0";
-    cfg.port    = args.port;
-    cfg.modelId = std::filesystem::path{args.modelPath}.stem().string();
-
-    if (const char* env = std::getenv("MIMIRMIND_PRESERVE_THINKING")) {
-        std::string_view v{env};
-        if (!v.empty() && v != "0" && v != "false" && v != "off") {
-            cfg.preserveThinking = true;
-        }
+    mimirmind::server::ServerConfig scfg{};
+    scfg.host    = "0.0.0.0";
+    scfg.port    = args.port.value_or(static_cast<std::uint16_t>(cfg.server.port));
+    // Prefer the config-declared model id (used by /v1/models + the
+    // OpenAI-compatible `model` field in requests); fall back to the
+    // GGUF filename stem when the config doesn't provide one.
+    if (!cfg.models.empty()) {
+        scfg.modelId = cfg.defaultModelEntry().id;
     }
-
-    // Resolve thermal profile path from CLI > env. Empty means
-    // unprotected — we'll log a loud warning below.
-    std::string thermalProfilePath = args.thermalProfilePath;
-    if (thermalProfilePath.empty()) {
-        if (const char* env = std::getenv("MIMIRMIND_THERMAL_PROFILE")) {
-            thermalProfilePath = env;
-        }
+    if (scfg.modelId.empty()) {
+        scfg.modelId = std::filesystem::path{args.modelPath}.stem().string();
     }
+    scfg.preserveThinking = effRuntime.preserveThinking.value_or(false);
+    scfg.speculative.enabled = cfg.speculative.enabled;
+    scfg.speculative.draftN  = static_cast<std::size_t>(cfg.speculative.n);
+
+    // Thermal profile lives inline in config.json under governor.thermal.
+    // Empty `name` means "no profile" and the guard runs unprotected.
+    const bool hasThermalProfile = !cfg.governor.thermal.name.empty() ||
+                                   cfg.governor.thermal.hasPackageLimits();
 
     std::unique_ptr<mimirmind::runtime::SystemMonitor> monitor;
     std::unique_ptr<mimirmind::runtime::ThermalGuard>  guard;
-    if (!thermalProfilePath.empty()) {
-        mimirmind::runtime::ThermalProfile profile;
-        try {
-            profile = mimirmind::runtime::loadThermalProfile(thermalProfilePath);
-        } catch (const std::exception& e) {
-            std::cerr << "serve: failed to load thermal profile: "
-                      << e.what() << "\n";
-            return 1;
-        }
+    if (hasThermalProfile) {
+        const mimirmind::runtime::ThermalProfile& profile = cfg.governor.thermal;
         try {
             monitor = std::make_unique<mimirmind::runtime::SystemMonitor>(
                 /*requirePackageTemp=*/profile.hasPackageLimits(),
@@ -1292,7 +1315,7 @@ int runServe(const CliArgs& args) {
         // writable, we install it. Otherwise we move on without one —
         // the per-token thermal pace still runs as a safety net.
         //
-        // MIMIRMIND_GPU_CLOCK_PIN pins the software cap for the whole
+        // `governor.gpuClockPin` pins the software cap for the whole
         // session and suppresses the P-controller tick. Meant for
         // perf-bench runs where the M9.6.5 asymmetric gains would
         // otherwise clock down aggressively and confound the
@@ -1300,11 +1323,11 @@ int runServe(const CliArgs& args) {
         // ThermalGuard admission check + per-token pace. Do NOT ship
         // this to sustained workloads on a passively-cooled chassis.
         //
-        // M9.11.a accepted values:
-        //   rp0            → hardware max (RP0)
-        //   rpn            → hardware min (RPn, ~800 MHz on Xe-LPG)
-        //   <MHz integer>  → arbitrary cap, clamped to [RPn, RP0]
-        //   unset / 0 / off / false / no → no pin (governor ticks as normal)
+        // Accepted values (from config.json):
+        //   "rp0"            → hardware max (RP0)
+        //   "rpn"            → hardware min (RPn, ~800 MHz on Xe-LPG)
+        //   "<MHz integer>"  → arbitrary cap, clamped to [RPn, RP0]
+        //   null / "0" / "off" / "false" / "no" → no pin (governor ticks as normal)
         enum class ClockPinIntent { None, Rp0, Rpn, Numeric };
         struct ClockPinRequest {
             ClockPinIntent intent = ClockPinIntent::None;
@@ -1312,16 +1335,15 @@ int runServe(const CliArgs& args) {
             std::string    rawEnv;
             bool           malformed = false;
         };
-        const auto parseClockPin = [](const char* env) {
+        const auto parseClockPin = [](std::string_view sv) {
             ClockPinRequest req;
-            if (env == nullptr || env[0] == '\0') {
+            if (sv.empty()) {
                 return req;
             }
-            std::string_view sv{env};
             if (sv == "0" || sv == "off" || sv == "false" || sv == "no") {
                 return req; // treat as unset
             }
-            req.rawEnv = env;
+            req.rawEnv = std::string{sv};
             if (sv == "rp0" || sv == "RP0") {
                 req.intent = ClockPinIntent::Rp0;
                 return req;
@@ -1331,8 +1353,9 @@ int runServe(const CliArgs& args) {
                 return req;
             }
             char* end = nullptr;
-            const unsigned long v = std::strtoul(env, &end, 10);
-            if (end != env && *end == '\0' && v > 0 && v < 100000) {
+            const std::string zSv{sv};
+            const unsigned long v = std::strtoul(zSv.c_str(), &end, 10);
+            if (end != zSv.c_str() && *end == '\0' && v > 0 && v < 100000) {
                 req.intent = ClockPinIntent::Numeric;
                 req.mhz    = static_cast<std::uint32_t>(v);
                 return req;
@@ -1342,7 +1365,8 @@ int runServe(const CliArgs& args) {
         };
 
         static std::unique_ptr<mimirmind::runtime::GpuClockGovernor> governor;
-        const auto pinReq = parseClockPin(std::getenv("MIMIRMIND_GPU_CLOCK_PIN"));
+        const auto pinReq = parseClockPin(
+            cfg.governor.gpuClockPin.value_or(""));
         const bool clockPinRequested = pinReq.intent != ClockPinIntent::None;
 
         if (profile.hasGpuClockTarget()) {
@@ -1378,7 +1402,7 @@ int runServe(const CliArgs& args) {
                 const auto pinned = governor->pin(
                     requestedMhz, intentName, pinReq.rawEnv);
                 MM_LOG_WARN("main",
-                            "MIMIRMIND_GPU_CLOCK_PIN={} — cap pinned to "
+                            "governor.gpuClockPin={} — cap pinned to "
                             "{} MHz (intent={}, envelope [{},{}]). "
                             "P-controller tick suppressed. Bench mode. "
                             "Thermal safety still via ThermalGuard.",
@@ -1392,7 +1416,7 @@ int runServe(const CliArgs& args) {
             } else {
                 if (pinReq.malformed) {
                     MM_LOG_WARN("main",
-                                "MIMIRMIND_GPU_CLOCK_PIN={} not recognised — "
+                                "governor.gpuClockPin={} not recognised — "
                                 "expected rp0 / rpn / <MHz> / 0 / off. "
                                 "Installing governor as if unset.",
                                 pinReq.rawEnv);
@@ -1401,29 +1425,29 @@ int runServe(const CliArgs& args) {
             }
         } else if (clockPinRequested) {
             MM_LOG_WARN("main",
-                        "MIMIRMIND_GPU_CLOCK_PIN={} ignored — thermal "
+                        "governor.gpuClockPin={} ignored — thermal "
                         "profile has no gpu_target_temp_c so no governor "
                         "was going to be installed anyway.",
                         pinReq.rawEnv);
         }
 
-        // M9.6.6.0 tick sink. Opt-in per env — when set, the governor
-        // writes one NDJSON line per tick to the file, which we then
-        // consume for M9.6.6 adaptive-gain baseline analysis.
-        if (governor != nullptr) {
-            if (const char* tickLog =
-                    std::getenv("MIMIRMIND_GOVERNOR_TICK_LOG");
-                tickLog != nullptr && tickLog[0] != '\0') {
-                if (governor->setTickLogPath(tickLog)) {
-                    MM_LOG_INFO("main",
-                                "GovernorTickSink open — writing NDJSON to '{}'",
-                                tickLog);
-                } else {
-                    MM_LOG_WARN("main",
-                                "MIMIRMIND_GOVERNOR_TICK_LOG='{}' — could "
-                                "not open for append. Sink stays off.",
-                                tickLog);
-                }
+        // M9.6.6.0 tick sink. When `governor.tickLog: true` in
+        // config.json AND `diagnostics.traceDecodeFile` is a non-empty
+        // path, the governor writes one NDJSON line per tick to the
+        // same file, which we then consume for M9.6.6 adaptive-gain
+        // baseline analysis.
+        if (governor != nullptr && cfg.governor.tickLog &&
+            !cfg.diagnostics.traceDecodeFile.empty()) {
+            const std::string& tickLog = cfg.diagnostics.traceDecodeFile;
+            if (governor->setTickLogPath(tickLog)) {
+                MM_LOG_INFO("main",
+                            "GovernorTickSink open — writing NDJSON to '{}'",
+                            tickLog);
+            } else {
+                MM_LOG_WARN("main",
+                            "governor.tickLog set with diagnostics.traceDecodeFile='{}' — "
+                            "could not open for append. Sink stays off.",
+                            tickLog);
             }
         }
     }
@@ -1441,18 +1465,16 @@ int runServe(const CliArgs& args) {
     // releases to auto at the end. Original BIOS values captured for
     // RAII restore on process exit.
     //
-    // Env vars:
-    //   MIMIRMIND_FAN_BOOST=off        → do not install (kill switch)
-    //   MIMIRMIND_FAN_PWM_BOOST=<0-255>→ override boost target
-    //   MIMIRMIND_FAN_PWM_MIN=<0-255>  → override safety floor
+    // Config knobs:
+    //   governor.fan.boost:    false → do not install (kill switch)
+    //   governor.fan.pwmBoost: 0-255 override boost target
+    //   governor.fan.pwmMin:   0-255 override safety floor
     // Kill switch is checked first so we can disable the whole feature
     // without touching sysfs at all — useful when the BIOS refuses
     // manual mode and hwmon writes are throwing kernel warnings.
     static std::unique_ptr<mimirmind::runtime::FanController> fanController;
     {
-        const char* boostEnv = std::getenv("MIMIRMIND_FAN_BOOST");
-        const bool  disabled =
-            boostEnv != nullptr && std::string_view{boostEnv} == "off";
+        const bool disabled = !cfg.governor.fan.boost;
         if (!disabled) {
             fanController = std::make_unique<mimirmind::runtime::FanController>();
             if (!fanController->available()) {
@@ -1462,23 +1484,15 @@ int runServe(const CliArgs& args) {
                             fanController->unavailableReason());
                 fanController.reset();
             } else {
-                if (const char* v = std::getenv("MIMIRMIND_FAN_PWM_BOOST");
-                    v != nullptr && v[0] != '\0') {
-                    char* end = nullptr;
-                    const unsigned long parsed = std::strtoul(v, &end, 10);
-                    if (end != v && *end == '\0' && parsed <= 255) {
-                        fanController->setBoostPwm(
-                            static_cast<std::uint8_t>(parsed));
-                    }
+                if (const auto v = cfg.governor.fan.pwmBoost;
+                    v.has_value() && *v >= 0 && *v <= 255) {
+                    fanController->setBoostPwm(
+                        static_cast<std::uint8_t>(*v));
                 }
-                if (const char* v = std::getenv("MIMIRMIND_FAN_PWM_MIN");
-                    v != nullptr && v[0] != '\0') {
-                    char* end = nullptr;
-                    const unsigned long parsed = std::strtoul(v, &end, 10);
-                    if (end != v && *end == '\0' && parsed <= 255) {
-                        fanController->setMinSafePwm(
-                            static_cast<std::uint8_t>(parsed));
-                    }
+                if (const auto v = cfg.governor.fan.pwmMin;
+                    v.has_value() && *v >= 0 && *v <= 255) {
+                    fanController->setMinSafePwm(
+                        static_cast<std::uint8_t>(*v));
                 }
                 MM_LOG_INFO("main",
                             "FanController ready — chip='{}' pwm='{}' "
@@ -1496,28 +1510,28 @@ int runServe(const CliArgs& args) {
         }
     }
 
-    // Thermal-safety cross-check: MIMIRMIND_GPU_CLOCK_PIN=rp0 disables
+    // Thermal-safety cross-check: governor.gpuClockPin=rp0 disables
     // the P-controller entirely, so the FanController is the only
     // active thermal regulator during sustained decode. Warn loudly
     // when the operator asks for rp0 without a functioning fan-boost
     // path — this is the exact 2026-07-01 shutdown scenario.
     {
-        const char* pinEnv = std::getenv("MIMIRMIND_GPU_CLOCK_PIN");
-        const bool  wantsRp0 =
-            pinEnv != nullptr
-            && (std::string_view{pinEnv} == "rp0"
-                || std::string_view{pinEnv} == "RP0");
+        const std::string_view pinSv =
+            cfg.governor.gpuClockPin.has_value()
+                ? std::string_view{*cfg.governor.gpuClockPin}
+                : std::string_view{};
+        const bool  wantsRp0 = (pinSv == "rp0" || pinSv == "RP0");
         const bool fanActive =
             fanController != nullptr && fanController->available();
         if (wantsRp0 && !fanActive) {
             MM_LOG_WARN("main",
-                        "MIMIRMIND_GPU_CLOCK_PIN=rp0 is set but the "
+                        "governor.gpuClockPin=rp0 is set but the "
                         "FanController is not active — the P-controller "
                         "is disabled AND no proactive cooling is "
                         "installed. Sustained decode on a passively "
                         "cooled chassis can trigger a hardware thermal "
                         "shutdown (see 2026-07-01 incident). Consider "
-                        "MIMIRMIND_GPU_CLOCK_PIN=<numeric MHz> as a "
+                        "governor.gpuClockPin=<numeric MHz> as a "
                         "safer bench mode.");
         }
     }
@@ -1525,14 +1539,12 @@ int runServe(const CliArgs& args) {
     // In-process perf-regression detector. Feeds off the same per-token
     // wall-time the NDJSON sink already computes, so it costs a couple
     // of doubles per token and one median at end-of-run. Kill-switch:
-    // MIMIRMIND_REGRESSION_ALERT=off skips installation entirely for the
-    // case where the detector itself misbehaves and needs to be silenced
-    // without a redeploy.
+    // `diagnostics.regressionAlert: false` in config.json skips the
+    // installer entirely for the case where the detector itself
+    // misbehaves and needs to be silenced without a redeploy.
     std::unique_ptr<mimirmind::runtime::PerfRegressionDetector> perfDetector;
     {
-        const char* alertEnv = std::getenv("MIMIRMIND_REGRESSION_ALERT");
-        const bool  disabled =
-            alertEnv != nullptr && std::string_view{alertEnv} == "off";
+        const bool disabled = !cfg.diagnostics.regressionAlert;
         if (!disabled) {
             std::string baselinePath;
             if (const char* h = std::getenv("HOME"); h != nullptr && h[0] != '\0') {
@@ -1552,28 +1564,28 @@ int runServe(const CliArgs& args) {
             engine.setPerfRegressionDetector(perfDetector.get());
         } else {
             MM_LOG_WARN("main",
-                        "MIMIRMIND_REGRESSION_ALERT=off — perf-regression "
+                        "diagnostics.regressionAlert=false — perf-regression "
                         "detector not installed for this session");
         }
     }
 
-    mimirmind::server::ApiServer server{engine, cfg, draftEngine.get()};
+    mimirmind::server::ApiServer server{engine, scfg, draftEngine.get()};
 
     g_runningServer.store(&server, std::memory_order_release);
     std::signal(SIGINT,  signalStop);
     std::signal(SIGTERM, signalStop);
 
     std::cout << "\n[M7d/M7e] OpenAI-compatible HTTP API listening on "
-              << cfg.host << ":" << cfg.port
+              << scfg.host << ":" << scfg.port
               << "\n  GET  /health\n"
                  "  GET  /v1/models\n"
                  "  GET  /v1/system/info\n"
                  "  GET  /v1/system/status\n"
                  "  POST /v1/chat/completions  (stream=true supported)\n"
-                 "  model id:           " << cfg.modelId << "\n"
+                 "  model id:           " << scfg.modelId << "\n"
                  "  preserve-thinking:  "
-              << (cfg.preserveThinking ? "on (raw deltas, KV-cache friendly)"
-                                       : "off (cleaned text, channel-wrapper stripped)")
+              << (scfg.preserveThinking ? "on (raw deltas, KV-cache friendly)"
+                                        : "off (cleaned text, channel-wrapper stripped)")
               << "\n  thermal profile:    ";
     if (guard) {
         std::cout << "'" << guard->profile().name
@@ -1604,7 +1616,7 @@ int runServe(const CliArgs& args) {
                   << mimirmind::runtime::PerfRegressionDetector::kAlertThreshold
                   << "x)";
     } else {
-        std::cout << "off (MIMIRMIND_REGRESSION_ALERT=off)";
+        std::cout << "off (diagnostics.regressionAlert=false)";
     }
     std::cout << "\n  spec decoding:      ";
     if (draftEngine != nullptr) {
@@ -1612,10 +1624,10 @@ int runServe(const CliArgs& args) {
                   << draftEngine->config().architecture
                   << ", d_model=" << draftEngine->config().embeddingLength
                   << ")";
-    } else if (std::getenv("MIMIRMIND_DRAFT_MODEL_PATH") != nullptr) {
+    } else if (cfg.speculative.enabled) {
         std::cout << "disabled (draft load or vocab check failed — see log)";
     } else {
-        std::cout << "off (set MIMIRMIND_DRAFT_MODEL_PATH to enable)";
+        std::cout << "off (set speculative.enabled=true in config.json to enable)";
     }
     std::cout << "\n  max context tokens: " << engine.maxContextTokens()
               << "\n  Ctrl-C to stop.\n";
@@ -1624,9 +1636,9 @@ int runServe(const CliArgs& args) {
     if (!guard) {
         MM_LOG_WARN("main",
                     "serve: no thermal profile configured. The engine will "
-                    "not throttle decode on temperature/RAM limits. Pass "
-                    "--thermal-profile PATH or set MIMIRMIND_THERMAL_PROFILE "
-                    "to protect the host.");
+                    "not throttle decode on temperature/RAM limits. Fill "
+                    "the governor.thermal section of config.json to "
+                    "protect the host.");
     }
 
     try {
@@ -1653,10 +1665,11 @@ int runServe(const CliArgs& args) {
  * "llamacpp" + runtime COPY). Container exits with the diff's return
  * code so callers can scripts on it (0 = parity, 1 = divergence).
  */
-[[nodiscard]] int runParity(const CliArgs& argsIn) {
+[[nodiscard]] int runParity(const CliArgs& argsIn,
+                            const mimirmind::runtime::Config& cfg) {
     if (argsIn.modelPath.empty()) {
         std::cerr << "parity: --model PATH is required "
-                     "(or set MIMIRMIND_MODEL_PATH)\n";
+                     "(fill models[].path in config.json)\n";
         return 2;
     }
 
@@ -1696,9 +1709,13 @@ int runServe(const CliArgs& args) {
     // --- 2. mimirmind own forward dump -----------------------------------
     {
         std::cout << "\n=== [2/3] mimirmind dump ===\n" << std::flush;
-        setenv("MIMIRMIND_PARITY_DUMP", mimirPfx.c_str(), 1);
 
-        mimirmind::runtime::InferenceEngine engine;
+        // Override diagnostics.parityDump for the parity subcommand so
+        // the engine writes per-stage bin files under the dump prefix.
+        mimirmind::runtime::Config parityCfg = cfg;
+        parityCfg.diagnostics.parityDump = mimirPfx;
+
+        mimirmind::runtime::InferenceEngine engine{parityCfg};
         engine.loadModel(argsIn.modelPath);
 
         const auto promptIds = engine.tokenizer().encode(argsIn.prompt, true);
@@ -1722,24 +1739,55 @@ int runServe(const CliArgs& args) {
 } // namespace
 
 int main(int argc, char** argv) {
-    mimirmind::runtime::Log::initFromEnv();
-
     CliArgs args;
     if (!parseArgs(argc, argv, args)) {
         return 2;
     }
 
-    if (args.modelPath.empty()) {
-        if (const char* env = std::getenv("MIMIRMIND_MODEL_PATH")) {
-            args.modelPath = env;
-        }
+    // Load config.json — hard error if missing or malformed. `--config` (or
+    // default `./config.json`) is the single source of truth for every
+    // knob that used to live in `MIMIRMIND_*` env vars.
+    mimirmind::runtime::Config cfg;
+    try {
+        cfg = mimirmind::runtime::loadConfig(args.configPath);
+    } catch (const std::exception& e) {
+        std::cerr << "config: " << e.what() << "\n";
+        return 2;
+    }
+
+    // Apply CLI overrides (higher precedence than config.json).
+    mimirmind::runtime::CliOverrides ovr{};
+    if (!args.modelPath.empty()) ovr.modelPath = args.modelPath;
+    if (args.port.has_value())   ovr.port      = static_cast<int>(*args.port);
+    if (!args.logLevel.empty())  ovr.logLevel  = args.logLevel;
+    if (!args.logFile.empty())   ovr.logFile   = args.logFile;
+    if (!args.dumpDir.empty())   cfg.diagnostics.parityDump = args.dumpDir;
+    try {
+        mimirmind::runtime::applyCliOverrides(cfg, ovr);
+    } catch (const std::exception& e) {
+        std::cerr << "config: " << e.what() << "\n";
+        return 2;
+    }
+
+    // Log has to be initialised AFTER config load — the level/file live
+    // in the resolved server.log section.
+    mimirmind::runtime::Log::initFromConfig(cfg.server.log);
+
+    // Reflect the resolved-model path into CliArgs.modelPath so the many
+    // downstream subcommand paths that consult it keep working without
+    // being rewritten to reach into Config themselves.
+    if (args.modelPath.empty() && !cfg.models.empty()) {
+        args.modelPath = cfg.defaultModelEntry().path;
+    }
+    if (!args.port.has_value()) {
+        args.port = static_cast<std::uint16_t>(cfg.server.port);
     }
 
     try {
         switch (args.mode) {
-            case Mode::Smoke:  return runSmoke(args);
-            case Mode::Serve:  return runServe(args);
-            case Mode::Parity: return runParity(args);
+            case Mode::Smoke:  return runSmoke(args, cfg);
+            case Mode::Serve:  return runServe(args, cfg);
+            case Mode::Parity: return runParity(args, cfg);
         }
         return 0;
     } catch (const mimirmind::runtime::L0Error& e) {

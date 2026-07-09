@@ -41,7 +41,10 @@ private:
  */
 class L0Context {
 public:
-    L0Context();
+    /// `spvDirOverride`, if non-empty, is where GpuModule looks for `.spv`
+    /// files before falling back to the install / build-tree defaults. Comes
+    /// from `runtime.spvDir` in config.json.
+    explicit L0Context(std::string spvDirOverride = {});
     ~L0Context();
 
     L0Context(const L0Context&)            = delete;
@@ -55,6 +58,8 @@ public:
 
     [[nodiscard]] const DeviceInfo&         info()      const noexcept { return _info; }
     [[nodiscard]] const std::vector<DeviceInfo>& allDevices() const noexcept { return _allDevices; }
+
+    [[nodiscard]] std::string_view spvDirOverride() const noexcept { return _spvDirOverride; }
 
     /// True when the driver advertises `ZE_experimental_mutable_command_list`.
     /// Preflight signal for the Command-List-Replay milestone (M-CLR).
@@ -77,7 +82,8 @@ private:
     DeviceInfo              _info{};
     std::vector<DeviceInfo> _allDevices{};
 
-    bool _hasMutableCmdLists{false};
+    std::string _spvDirOverride{};
+    bool        _hasMutableCmdLists{false};
 };
 
 } // namespace mimirmind::runtime

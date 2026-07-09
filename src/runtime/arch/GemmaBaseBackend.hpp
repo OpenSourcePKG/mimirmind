@@ -164,8 +164,9 @@ protected:
     /// used as `freq_factors` for full-attention layers only.
     const float*              _ropeFreqsForFullAttn{nullptr};
 
-    /// Active when InferenceEngine resolves MIMIRMIND_PARITY_DUMP and
-    /// passes the value via setParityDumpPrefix(). Empty = disabled.
+    /// Active when InferenceEngine reads `diagnostics.parityDump` from
+    /// config.json and passes the value via setParityDumpPrefix().
+    /// Empty = disabled.
     std::string               _parityDumpPrefix{};
 };
 

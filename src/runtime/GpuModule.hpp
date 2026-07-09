@@ -18,7 +18,8 @@ class L0Context;
  * kernel name.
  *
  * Loaded from a `.spv` file on disk (produced by ocloc at build time).
- * The path is resolved against `MIMIRMIND_SPV_DIR` if set, else
+ * The path is resolved against `L0Context::spvDirOverride()` (from
+ * `runtime.spvDir` in config.json) if non-empty, else
  * `/usr/local/share/mimirmind/spv`, else the build-tree fallback.
  */
 class GpuModule {
@@ -39,7 +40,8 @@ public:
     [[nodiscard]] std::string_view name() const noexcept { return _name; }
 
 private:
-    static std::vector<std::uint8_t> readSpv(std::string_view name);
+    static std::vector<std::uint8_t> readSpv(std::string_view spvDirOverride,
+                                             std::string_view name);
 
     L0Context&                                       _ctx;
     std::string                                      _name;

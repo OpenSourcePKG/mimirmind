@@ -1,9 +1,10 @@
 #include "runtime/Log.hpp"
 
+#include "runtime/Config.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iostream>
@@ -119,14 +120,12 @@ bool Log::setFile(std::string_view path) {
     return g_file.is_open();
 }
 
-void Log::initFromEnv() {
-    if (const char* env = std::getenv("MIMIRMIND_LOG_LEVEL");
-        env != nullptr && env[0] != '\0') {
-        setLevel(parseLevel(env));
+void Log::initFromConfig(const LogSettings& settings) {
+    if (!settings.level.empty()) {
+        setLevel(parseLevel(settings.level));
     }
-    if (const char* env = std::getenv("MIMIRMIND_LOG_FILE");
-        env != nullptr && env[0] != '\0') {
-        setFile(env);
+    if (!settings.file.empty()) {
+        setFile(settings.file);
     }
 }
 

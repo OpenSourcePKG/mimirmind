@@ -15,10 +15,12 @@ Gemma4Backend::Gemma4Backend(const model::LlmConfig&        config,
                              const model::FusedQkvWeights*  fusedQkv,
                              compute::GpuOps&               ops,
                              compute::GpuMatmul&            gmm,
-                             runtime::OpProfiler&           opProfiler) {
+                             runtime::OpProfiler&           opProfiler,
+                             bool                           moeGroupEnabled) {
     if (config.expertCount > 0) {
         _impl = std::make_unique<Gemma4MoeBackend>(
-            config, weights, fusedQkv, ops, gmm, opProfiler);
+            config, weights, fusedQkv, ops, gmm, opProfiler,
+            moeGroupEnabled);
     } else if (weights.findBlock(0, "inp_gate.weight") != nullptr) {
         // Gemma 4 E-series (E4B / E2B): MatFormer + Per-Layer Embeddings.
         // Detected by the presence of the per-block PLE gate tensor,

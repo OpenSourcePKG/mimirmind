@@ -24,7 +24,8 @@ public:
                      const model::FusedQkvWeights*  fusedQkv,
                      compute::GpuOps&               ops,
                      compute::GpuMatmul&            gmm,
-                     runtime::OpProfiler&           opProfiler);
+                     runtime::OpProfiler&           opProfiler,
+                     bool                           moeGroupEnabled = true);
 
     void runBlock(std::size_t   blockIdx,
                   float*        x,
@@ -32,6 +33,12 @@ public:
                   KvCache&      cache,
                   BlockBuffers& s,
                   bool          traceBlock0) override;
+
+private:
+    /// `features.moeGroup` at construction — routes T>1 through the
+    /// expert-grouped batched dispatch path in runBlock(). Off falls back
+    /// to per-token dispatch even during prefill.
+    bool _moeGroupEnabled;
 };
 
 } // namespace mimirmind::runtime::arch

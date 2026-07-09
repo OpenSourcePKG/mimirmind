@@ -31,8 +31,10 @@ Gemma4MoeBackend::Gemma4MoeBackend(const model::LlmConfig&        config,
                                    const model::FusedQkvWeights*  fusedQkv,
                                    compute::GpuOps&               ops,
                                    compute::GpuMatmul&            gmm,
-                                   runtime::OpProfiler&           opProfiler)
-    : GemmaBaseBackend{config, weights, fusedQkv, ops, gmm, opProfiler} {
+                                   runtime::OpProfiler&           opProfiler,
+                                   bool                           moeGroupEnabled)
+    : GemmaBaseBackend{config, weights, fusedQkv, ops, gmm, opProfiler},
+      _moeGroupEnabled{moeGroupEnabled} {
     MM_LOG_INFO("gemma4-moe",
                 "Gemma4MoeBackend ready — blocks={} d_model={} ff={} "
                 "experts={} top_k={} swa head_dim={} kv={}, "
@@ -212,13 +214,7 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
     // Decode (T == 1) still walks the per-token loop below: with only
     // top-K work items there's no batching opportunity and the compact
     // scratch write-back would just add overhead.
-    const bool useMoeGrouping = [&]{
-        if (T <= 1) return false;
-        const char* v = std::getenv("MIMIRMIND_DISABLE_MOE_GROUP");
-        if (v == nullptr) return true;
-        std::string_view sv{v};
-        return sv.empty() || sv == "0" || sv == "false" || sv == "off";
-    }();
+    const bool useMoeGrouping = (T > 1) && _moeGroupEnabled;
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     if (useMoeGrouping) {

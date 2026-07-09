@@ -2,25 +2,27 @@
 #
 # Im Gegensatz zu docker-compose.yml wird hier nichts lokal gebaut; das
 # Image kommt aus mimirmind. Logs landen sowohl
-# auf stdout (via tty) als auch in ./run-logs/run.log auf dem Host
-# (über den /logs-Mount + MIMIRMIND_LOG_FILE).
+# auf stdout (via tty) als auch in ./run-logs/run.log auf dem Host (der
+# Log-Path steht in der config.json unter server.log.file).
 #
 # Voraussetzungen:
 #   - GGUFs liegen unter ${MIMIRMIND_MODELS_DIR} (default: ./models)
 #   - Intel iGPU/dGPU unter /dev/dri verfügbar
-#   - Thermal-Profile-JSON unter ${MIMIRMIND_THERMAL_PROFILE_HOST}
-#     (default ./thermal-profile.json) — siehe doc/operations.md
+#   - Host-config unter ${MIMIRMIND_CONFIG_HOST} (default ./config.json)
+#     — Copy-Vorlage: `cp config.example.json config.json` und für den
+#     Host tunen. Enthält alle Runtime-, Feature-, Governor-, Thermal-
+#     und Diagnostics-Knöpfe (was früher MIMIRMIND_*-env-Vars waren).
 #   - LXC-Layer reicht /sys/devices/virtual/powercap durch (für RAPL),
 #     wenn dieser Container in einem Proxmox-CT läuft:
 #       lxc.mount.entry: /sys/devices/virtual/powercap sys/devices/virtual/powercap none bind,ro,create=dir 0 0
 #
-# Gemeinsame Env-Variablen (für beide Workflows unten):
+# Gemeinsame Env-Variablen (Compose-Steuerung, NICHT Runtime-Knöpfe):
 #
 #   export MIMIRMIND_MODELS_DIR=/srv/llm-models
-#   export MIMIRMIND_MODEL_PATH=/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+#   export MIMIRMIND_CONFIG_HOST=/etc/mimirmind/config.json
 #   export MIMIRMIND_RENDER_GID=$(getent group render | cut -d: -f3)
 #   export MIMIRMIND_VIDEO_GID=$(getent group video  | cut -d: -f3)
-#   export MIMIRMIND_THERMAL_PROFILE_HOST=/etc/mimirmind/thermal-nuc14.json
+#   export MIMIRMIND_PORT=8080
 #
 # Standard-Command in diesem File ist `serve` (Production-Pfad). Smoke
 # muss man explizit anstoßen — siehe unten.
@@ -55,7 +57,45 @@
 #   docker compose -f docker-compose.server.yml run --rm mimirmind \
 #       smoke --temperature 0.8 --top-p 0.95 --seed 42
 #
-# Logs in ./run-logs/run.log (strukturierter MM_LOG).
+# Logs in ./run-logs/run.log (strukturierter MM_LOG, Pfad aus config.json).
+#
+# ── Migration hinweis (vor 2026-07-10) ────────────────────────────────────
+#
+# Bis Commit 99924d3 lebten die Runtime-Knöpfe als MIMIRMIND_*-env-Vars
+# hier im environment: Block. Diese sind ersatzlos gestrichen — der
+# Ersatz ist config.json. Mapping-Tabelle:
+#
+#   MIMIRMIND_MODEL_PATH             → models[<defaultModel>].path
+#   MIMIRMIND_LOG_LEVEL / _FILE      → server.log.level / server.log.file
+#   MIMIRMIND_MAX_CONTEXT_TOKENS     → runtime.maxContextTokens
+#   MIMIRMIND_KV_DTYPE               → runtime.kvDtype
+#   MIMIRMIND_USM_PROBE_TOTAL_GIB    → runtime.usmProbeTotalGib
+#   MIMIRMIND_PRESERVE_THINKING      → runtime.preserveThinking
+#   MIMIRMIND_SPV_DIR                → runtime.spvDir
+#   MIMIRMIND_ENABLE_CLR             → features.clr
+#   MIMIRMIND_DISABLE_FLASH_PREFILL  → features.flashPrefill: false
+#   MIMIRMIND_DISABLE_FUSED_QKV      → features.fusedQkv: false
+#   MIMIRMIND_DISABLE_MOE_GROUP      → features.moeGroup: false
+#   MIMIRMIND_DISABLE_GEMM           → features.gemm: "disable"
+#   MIMIRMIND_FORCE_GEMM             → features.gemm: "force"
+#   MIMIRMIND_GEMM_MIN_M             → features.gemmMinM
+#   MIMIRMIND_USE_GEMM_V2            → features.gemmV2
+#   MIMIRMIND_DISABLE_DP4A           → features.dp4a: "disable"
+#   MIMIRMIND_FORCE_DP4A             → features.dp4a: "force"
+#   MIMIRMIND_SPEC_DEC / _N          → speculative.enabled / speculative.n
+#   MIMIRMIND_DRAFT_MODEL_PATH       → models[].path mit id "draft"
+#                                       + speculative.draft="draft"
+#   MIMIRMIND_THERMAL_PROFILE        → governor.thermal (inline)
+#   MIMIRMIND_GPU_CLOCK_PIN          → governor.gpuClockPin
+#   MIMIRMIND_GOVERNOR_TICK_LOG      → governor.tickLog + diagnostics.traceDecodeFile
+#   MIMIRMIND_FAN_BOOST              → governor.fan.boost
+#   MIMIRMIND_FAN_PWM_BOOST          → governor.fan.pwmBoost
+#   MIMIRMIND_FAN_PWM_MIN            → governor.fan.pwmMin
+#   MIMIRMIND_REGRESSION_ALERT       → diagnostics.regressionAlert
+#   MIMIRMIND_TRACE_OP_TIMES         → diagnostics.traceOpTimes
+#   MIMIRMIND_TRACE_BLOCK0           → diagnostics.traceBlock0
+#   MIMIRMIND_TRACE_DECODE_FILE      → diagnostics.traceDecodeFile
+#   MIMIRMIND_PARITY_DUMP            → diagnostics.parityDump
 
 services:
 
@@ -67,11 +107,12 @@ services:
         # Default treibt den Serve-Modus, weil das der Production-Pfad ist.
         # Smoke startet man explizit per `compose run --rm mimirmind smoke ...`
         # — die Argv-Override hinter dem Service-Namen ersetzt dieses
-        # `command`.
+        # `command`. Der Pfad `/etc/mimirmind/config.json` kommt aus dem
+        # Bind-Mount weiter unten.
         command:
             - serve
-            - --port
-            - "8080"
+            - --config
+            - /etc/mimirmind/config.json
 
         devices:
             - /dev/dri:/dev/dri
@@ -91,278 +132,17 @@ services:
             - systempaths=unconfined
 
         # M7d/M7e — OpenAI-compatible HTTP API. Host-Port via
-        # MIMIRMIND_PORT env, Container-Port ist fest 8080 (siehe `command`).
+        # MIMIRMIND_PORT env, Container-Port sollte config.json.server.port
+        # entsprechen (default 8080).
         ports:
             - "${MIMIRMIND_PORT:-8080}:8080"
 
         environment:
             # Level Zero: 4-GiB-Cap aufheben (sonst sieht der Probe bei
-            # 4 GiB einen ze_RESULT_ERROR_OUT_OF_DEVICE_MEMORY).
+            # 4 GiB einen ze_RESULT_ERROR_OUT_OF_DEVICE_MEMORY). Das sind
+            # LZ-Loader-env-Vars, keine mimirmind-Runtime-Knöpfe.
             UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
             UR_L0_USE_RELAXED_ALLOCATION_LIMITS:    "1"
-
-            # Default info — trace ist für gezielte Smoke-Runs nützlich
-            # aber spammt im Serve-Modus die run.log voll.
-            MIMIRMIND_LOG_LEVEL:  ${MIMIRMIND_LOG_LEVEL:-info}
-            MIMIRMIND_LOG_FILE:   ${MIMIRMIND_LOG_FILE:-/logs/run.log}
-
-            # Phase 2 USM probe cap in GiB. Default 4, set 0 to skip.
-            # Phase 2 holds *all* the probed memory simultaneously, so on UMA
-            # systems this directly translates to host-RAM usage during probe.
-            MIMIRMIND_USM_PROBE_TOTAL_GIB: ${MIMIRMIND_USM_PROBE_TOTAL_GIB:-4}
-
-            # Pflicht: ohne kein M3-Load. `?` lässt compose früh failen.
-            MIMIRMIND_MODEL_PATH: ${MIMIRMIND_MODEL_PATH:?set MIMIRMIND_MODEL_PATH=/models/<file>.gguf}
-
-            # Thermal-Profile-Pfad im Container. Bind-mounted aus
-            # ${MIMIRMIND_THERMAL_PROFILE_HOST}. Falls die Host-Datei nicht
-            # existiert, weigert sich compose mit klarem "no such file".
-            MIMIRMIND_THERMAL_PROFILE: /etc/mimirmind/thermal-profile.json
-
-            # KV-Cache Pre-Alloc-Größe in Tokens. Compile-Time-Ceiling nach
-            # M9.8a ist 16384 (limitiert durch Xe-LPG 64 KiB SLM in der
-            # plain-attention-Loop). Default 8192 reicht für kürzere Chats,
-            # 16384 für ~10-12 Seiten A4. Höhere Werte requiren M9.8b
-            # (plain-attention-Refactor auf online softmax).
-            #     KV-RAM ≈ tokens × 430 KiB (Gemma 4 26B).
-            MIMIRMIND_MAX_CONTEXT_TOKENS: ${MIMIRMIND_MAX_CONTEXT_TOKENS:-8192}
-
-            # M10.2 Phase 0 / 1a — KV-Cache Element-dtype.
-            #   f32 (default)  → 4 B pro Element, bit-identisch zu vor-M10.2
-            #   fp16           → 2 B pro Element. 2× Bandwidth-Win auf
-            #                     Attention-Reads, 2× RAM-Ersparnis, ~3-5 %
-            #                     Decode-Speedup laut Roadmap-Doc. Parity
-            #                     vs F32 durch FP16-Rundungsfehler
-            #                     (~1e-3 pro Load, kohärent auf Response-
-            #                     Ebene).
-            #   q8_0           → 32-Element-Blöcke à 34 B (fp16 scale +
-            #                     32 int8) = ~1.06 B/Elem. 4× Bandwidth-
-            #                     Win vs F32, 2× vs FP16, ~3.76× RAM-
-            #                     Ersparnis vs F32. Decode-Speedup 5-8 %
-            #                     @ 500 tok, 20-30 % @ 5000 tok (attention-
-            #                     share halbiert bei langen Chats laut
-            #                     Roadmap-Doc). Kernels + Backend-Wiring +
-            #                     Parity-Tests sind live seit M10.2.0
-            #                     Commits 3-6.
-            #                     Precision-Risiko: per-Block-absmax
-            #                     verschmiert K-Channel-Outliers, restliche
-            #                     Channels fallen auf ~5-6 Bits Effektiv-
-            #                     Precision. Kernel-Level-Parity (gpu_tests
-            #                     attention_*_q8_0_parity, tol 5e-3) ist
-            #                     grün-gate aber NICHT hinreichend —
-            #                     Needle-in-Haystack-Recall-Test (≥ 95 %)
-            #                     ist Pflicht vor Default-Flip. Bei
-            #                     Recall-Fail: Rezept D (fp16-K + Q8-V)
-            #                     als Fallback-Ticket.
-            # M10.2.-1 Commit 8 / M10.2.0 Commit 2/5 — Engine-side Guard
-            #                     wirft beim Start je nach dtype:
-            #                       fp16 — Modell muss KOMPLETT fused-QKV
-            #                              sein (raw fp32 K/V-matmul in
-            #                              fp16-Slot = Corruption).
-            #                       q8_0 — fused-QKV NICHT nötig (non-
-            #                              fused Pfad routet via fp32
-            #                              staging aus M10.2.0 Commit 5).
-            #                              Nur kvDim % 32 == 0 pro own-KV
-            #                              Block + kein attn_k/v.bias.
-            #                     Deploy-Preflight: `MIMIRMIND_KV_DTYPE=…`
-            #                     setzen → Container startet oder throw't
-            #                     mit spezifischer Block-Nummer im Log.
-            #                     Rollback: Var leer lassen → F32 default.
-            MIMIRMIND_KV_DTYPE:          ${MIMIRMIND_KV_DTYPE:-}
-
-            # M5i Rollback-/Diagnose-Env-Vars — normalerweise leer (Default-
-            # Pfad aktiv). Bei Verdacht auf Regression pro Env-Var einzeln
-            # setzen und Container neu starten, ohne Rebuild.
-            #
-            #   DISABLE_GEMM=1       → pinnt matvec-loop für alle QuantTypes
-            #                          (skippt Autotune-Bench).
-            #   FORCE_GEMM=1         → pinnt GEMM (Diagnose, nicht Prod).
-            #   DISABLE_FUSED_QKV=1  → 3-matmul UnorderedScope-Pfad zurück,
-            #                          FusedQkvWeights baut keine Blocks auf.
-            #   DISABLE_MOE_GROUP=1  → per-Token MoE-Loop zurück (T>1).
-            #   DISABLE_FLASH_PREFILL=1
-            #                        → M5i.J-Prefill-Rollback auf variant (a)
-            #                          `attention.cl`. Prefill wird linear in
-            #                          T_k und für T_q ≥ 1500 praktisch
-            #                          unbenutzbar (Minuten-Wall-Clock). Nur
-            #                          für Diagnose sinnvoll — bei Verdacht
-            #                          auf FA-Prefill-Numerik-Regression.
-            #   GPU_CLOCK_PIN=<val>  → Cap pinnen, P-controller tick aus.
-            #                          Werte: rp0 (HW max), rpn (HW min ~800),
-            #                          numerisch (MHz, geklammert an [RPn,RP0]).
-            #                          Default rp0 seit 2026-07-07 nach BIOS-
-            #                          Turbo — Kühlung trägt sustained rp0.
-            #                          Live-Bench 218 → 199 ms/tok E4B decode
-            #                          (−9 %) mit Turbo + rp0-Pin. Zum
-            #                          Deaktivieren explizit auf leer oder
-            #                          numerisch setzen (Downshift-Bench).
-            #   DISABLE_DP4A=1       → deaktiviert DP4A-Matmul-Autotune-Picks.
-            #                          Default 1 seit 2026-07-07 nach
-            #                          Q4_K-DP4A-Quality-Collapse-Incident
-            #                          (E4B garbage-Tokens auf jeden Prompt).
-            #                          Root Cause: Q4_K DP4A Parity-Toleranz
-            #                          5 % zu locker für kumulative Drift
-            #                          über 42 Layer × ~250 Matmuls/Token.
-            #                          Auf leer setzen NUR wenn Parity-Gate
-            #                          verschärft wurde (M-Q81-Follow-Up).
-            MIMIRMIND_DISABLE_GEMM:      ${MIMIRMIND_DISABLE_GEMM:-}
-            MIMIRMIND_FORCE_GEMM:        ${MIMIRMIND_FORCE_GEMM:-}
-            MIMIRMIND_GEMM_MIN_M:        ${MIMIRMIND_GEMM_MIN_M:-}
-            MIMIRMIND_DISABLE_FUSED_QKV: ${MIMIRMIND_DISABLE_FUSED_QKV:-}
-            MIMIRMIND_DISABLE_MOE_GROUP: ${MIMIRMIND_DISABLE_MOE_GROUP:-}
-            MIMIRMIND_DISABLE_FLASH_PREFILL: ${MIMIRMIND_DISABLE_FLASH_PREFILL:-}
-            MIMIRMIND_GPU_CLOCK_PIN:     ${MIMIRMIND_GPU_CLOCK_PIN:-rp0}
-            MIMIRMIND_DISABLE_DP4A:      ${MIMIRMIND_DISABLE_DP4A:-1}
-            MIMIRMIND_FORCE_DP4A:        ${MIMIRMIND_FORCE_DP4A:-}
-
-            # M8.K.1 — opt-in to the v2 Q8_0 GEMM (shrunk-SLM prototype).
-            # v2 benched 27-41 % faster than matvec-loop at every M-bucket
-            # on Xe-LPG (2026-07-02) but its dispatch stays dormant behind
-            # v1's gemmMinM=never until the operator turns it on. When
-            # set, autotune re-derives gemmMinM from the v2 vs matvec
-            # bench so Prefill starts routing through v2 automatically.
-            #
-            #   MIMIRMIND_USE_GEMM_V2=1  → activate v2 dispatch.
-            MIMIRMIND_USE_GEMM_V2:       ${MIMIRMIND_USE_GEMM_V2:-}
-
-            # M9.11.b — proactive chassis-fan boost during inference.
-            # FanController probes /sys/class/hwmon/hwmon* at startup;
-            # if a writable pwm/pwm_enable pair is found, generate()
-            # boosts the fan on request-start and releases to auto on
-            # request-end. Baseline BIOS values are captured for RAII
-            # restore on process exit.
-            #
-            #   MIMIRMIND_FAN_BOOST=off        → skip the whole feature
-            #   MIMIRMIND_FAN_PWM_BOOST=<0-255>→ boost target (default 255)
-            #   MIMIRMIND_FAN_PWM_MIN=<0-255>  → safety floor (default 64,
-            #                                    absolute floor 32 — never
-            #                                    less, would risk stopping
-            #                                    the fan on a passively
-            #                                    cooled chassis)
-            #
-            # Requires /sys/class/hwmon writable from inside the container.
-            # Docker default lets root inside the container write to hwmon
-            # nodes that the kernel driver marks writable; if not, the
-            # probe fails silently and the feature is a no-op.
-            MIMIRMIND_FAN_BOOST:         ${MIMIRMIND_FAN_BOOST:-}
-            MIMIRMIND_FAN_PWM_BOOST:     ${MIMIRMIND_FAN_PWM_BOOST:-}
-            MIMIRMIND_FAN_PWM_MIN:       ${MIMIRMIND_FAN_PWM_MIN:-}
-
-            # M9.6.6.0 — governor tick sink. When set to a writable path,
-            # the GpuClockGovernor writes one NDJSON line per P-controller
-            # tick with {ts_ms, temp_c, cap_before, cap_after, delta_mhz,
-            # error_c, target_c, pinned}. Used for baseline capture before
-            # M9.6.6.2 adaptive-gain rollout, and afterwards to validate
-            # the retune produced the expected cap-uphold behaviour.
-            #
-            #   MIMIRMIND_GOVERNOR_TICK_LOG=/logs/governor-ticks.ndjson
-            #
-            # Unset (default) → sink off, tick() costs one extra branch.
-            MIMIRMIND_GOVERNOR_TICK_LOG: ${MIMIRMIND_GOVERNOR_TICK_LOG:-}
-
-            # In-process perf-regression detector — sits next to the
-            # NDJSON sink and alerts when current-run decode p50 exceeds
-            # the trailing 7-day baseline p50 by 1.15x. State (rolling
-            # baseline JSON + monotonic run counter) persists via the
-            # /root/.cache/mimirmind volume mount below. Every container
-            # start bumps the internal_version counter, which stamps
-            # each baseline sample + alert so we can pinpoint "regression
-            # appeared at version N" without a git commit tag.
-            #
-            #   MIMIRMIND_REGRESSION_ALERT=off  → skip detector install.
-            #                                     Use when the detector
-            #                                     itself misfires and
-            #                                     needs to be silenced
-            #                                     without a redeploy.
-            MIMIRMIND_REGRESSION_ALERT:  ${MIMIRMIND_REGRESSION_ALERT:-}
-
-            # M8.K.0 diagnostic — per-op-category timing (norm / attn /
-            # matmul / activation / residual / router). Adds real overhead
-            # via forced pipeline flushes between phases; only turn on for
-            # short diagnostic runs. Every 50 tokens the accumulator dumps
-            # per-category ms + share % to the log and resets.
-            #
-            #   MIMIRMIND_TRACE_OP_TIMES=1  → activate profiler.
-            MIMIRMIND_TRACE_OP_TIMES:    ${MIMIRMIND_TRACE_OP_TIMES:-}
-
-            # M-CLR.4 — Command-List-Replay for the decode block loop.
-            # Off by default: every generate() call runs the traditional
-            # immediate-mode dispatch cycle bit-identically to the
-            # pre-M-CLR baseline. When enabled, decode step 1 records
-            # the 42-block forward into a persistent Level-Zero command
-            # list and executes it once; steps 2+ update a single
-            # 4-byte USM curLen slot and re-execute the recorded list —
-            # ~936 per-token appendLaunch calls collapse to zero. All
-            # kernel-side prerequisites shipped in M-CLR.2 (rope /
-            # attention / qkv_split / rmsnorm_qkv now dereference the
-            # shared curLen slot). Prefill and sampling stay immediate.
-            #
-            #   MIMIRMIND_ENABLE_CLR=on  → activate record/replay.
-            #
-            # Rollback is soft: unset the variable and restart the
-            # container — no image change needed.
-            MIMIRMIND_ENABLE_CLR:        ${MIMIRMIND_ENABLE_CLR:-}
-
-            # M9.11 — speculative decoding. Off by default: without a
-            # draft-model path the server runs the target-only decode
-            # loop bit-identically to the pre-M9.11.4 baseline.
-            #
-            #   MIMIRMIND_DRAFT_MODEL_PATH=/models/<draft>.gguf
-            #       Opt-in. Loads a second InferenceEngine at startup
-            #       (~30 s additional autotune) and enables the M9.11.4
-            #       greedy accept/reject loop. The draft must be
-            #       vocab-compatible with the target (same tokenizer
-            #       family): Gemma 2 2B Q4_K_M or Gemma 3 4B Q4 work for
-            #       a Gemma 4 target. Startup log line
-            #       "serve: speculative decoding ready — ..." confirms
-            #       the vocab check passed; a mismatch disables spec-dec
-            #       for the process lifetime with a warning.
-            #
-            #   MIMIRMIND_SPEC_DEC_N=<int>   (default 4, range 1-63)
-            #       Tokens the draft speculates per verify round. Higher
-            #       N amortises the target's batched forward across more
-            #       tokens IF the accept-rate holds; too high and each
-            #       rejection wastes proportionally more draft work.
-            #       Practical range on Xe-LPG: 2 (safe) to 6 (aggressive).
-            #
-            #   MIMIRMIND_SPEC_DEC=off
-            #       Kill-switch. Forces the target-only fall-through
-            #       path even with a draft loaded. Handy for A/B runs:
-            #       stop → set → up -d takes ~seconds because the draft
-            #       weights stay hot in the model volume, only the
-            #       autotune re-runs. For a same-process toggle without
-            #       a restart, docker exec sets the env for a shell but
-            #       the C++ getenv() sees the original process env.
-            #
-            # Only greedy (temperature <= 0) engages the spec-dec loop
-            # in M9.11.4; any request with temperature > 0 falls through
-            # to target-only until M9.11.4b lands full modified
-            # rejection sampling.
-            #
-            # Observability: active runs append
-            #   spec_rounds=<R> spec_acc=<A>/<D> spec_rate=<A/D>
-            # to the per-completion server log line. Accept-rate is the
-            # headline number for the perf-regression ledger.
-            #
-            # Cost model: draft KV cache doubles per-request GPU RAM
-            # (target + draft). With MAX_CONTEXT_TOKENS=8192 and a Gemma
-            # 4 26B target + Gemma 2 2B draft, expect ~25 GiB total —
-            # tight on 24 GiB DRAM systems.
-            MIMIRMIND_DRAFT_MODEL_PATH:  ${MIMIRMIND_DRAFT_MODEL_PATH:-}
-            MIMIRMIND_SPEC_DEC:          ${MIMIRMIND_SPEC_DEC:-}
-            MIMIRMIND_SPEC_DEC_N:        ${MIMIRMIND_SPEC_DEC_N:-}
-
-            # Parity-dump prefix — when set, every block writes per-stage
-            # bin files at PREFIX-blk{N}-<stage>.bin (inp_scaled,
-            # attn_norm, Qcur_pos, Kcur_pos, Vcur_normed, attn_post_norm,
-            # attn_out, l_out). Companion tool inside the image:
-            # `docker exec mimirmind llama-parity-dump --model
-            # /models/<file>.gguf --tokens id1,id2,... --dump-dir
-            # /logs/parity/llama` — dumps the same stages from ggml on
-            # the same token IDs (log the mimirmind `[parity]` line for
-            # the exact IDs). Then `parity-diff /logs/parity/llama
-            # /logs/parity/mimir` prints the first divergent stage.
-            MIMIRMIND_PARITY_DUMP:           ${MIMIRMIND_PARITY_DUMP:-}
 
         volumes:
             - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
@@ -375,7 +155,11 @@ services:
             # but a regression won't be catchable until enough runs have
             # accumulated in the fresh container.
             - ${MIMIRMIND_STATE_DIR:-./run-state}:/root/.cache/mimirmind:rw
-            - ${MIMIRMIND_THERMAL_PROFILE_HOST:-./thermal-profile.json}:/etc/mimirmind/thermal-profile.json:ro
+            # config.json — Single Source of Truth für alle Runtime-,
+            # Feature-, Governor- und Diagnostics-Knöpfe. Bind-Mount aus
+            # ${MIMIRMIND_CONFIG_HOST}. Falls die Host-Datei nicht
+            # existiert, weigert sich compose mit klarem "no such file".
+            - ${MIMIRMIND_CONFIG_HOST:-./config.json}:/etc/mimirmind/config.json:ro
             # iGPU sysfs view (Symlinks für /sys/class/drm/cardN, rw für
             # den dynamischen GPU-Clock-Governor).
             - /sys/class/drm:/sys/class/drm:rw

@@ -4,6 +4,7 @@
 #include "compute/Matmul.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
+#include "runtime/Config.hpp"
 #include "runtime/L0Context.hpp"
 #include "runtime/Log.hpp"
 #include "runtime/UsmAllocator.hpp"
@@ -13,7 +14,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <random>
@@ -27,13 +27,6 @@
 namespace mimirmind::compute {
 
 namespace {
-
-bool envSet(const char* name) noexcept {
-    const char* v = std::getenv(name);
-    if (v == nullptr) return false;
-    const std::string_view s{v};
-    return !s.empty() && s != "0" && s != "false" && s != "off";
-}
 
 // kAutotuneMBuckets + kAutotuneBucketCount moved to the .hpp so
 // Entry / AutotuneReport / GpuMatmul.cpp all see the same size.
@@ -55,18 +48,6 @@ std::string formatBucketRow(std::span<const double> ms) {
         out += buf;
     }
     return out;
-}
-
-// Parse MIMIRMIND_GEMM_MIN_M as a positive integer. Returns 0 (which
-// the caller interprets as "not set") on any parse failure, negative
-// value, or overflow.
-std::size_t envGemmMinM() noexcept {
-    const char* v = std::getenv("MIMIRMIND_GEMM_MIN_M");
-    if (v == nullptr || v[0] == '\0') return 0;
-    char* end = nullptr;
-    const long parsed = std::strtol(v, &end, 10);
-    if (end == v || *end != '\0' || parsed <= 0) return 0;
-    return static_cast<std::size_t>(parsed);
 }
 
 // Synthesise a plausible block-quantised weight buffer for the given
@@ -292,30 +273,29 @@ GpuMatmul::~GpuMatmul() {
     }
 }
 
-void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
-                         std::size_t            hiddenDim,
-                         std::size_t            /*mBatchDeprecated*/) {
-    // M8.J — M-buckets replace the single `mBatch` argument. The old
-    // parameter is kept in the signature for source compatibility but
-    // ignored; every bench-time decision runs against kAutotuneMBuckets.
-    const bool forceDisable     = envSet("MIMIRMIND_DISABLE_GEMM");
-    const bool forceEnable      = envSet("MIMIRMIND_FORCE_GEMM");
-    const bool forceDisableDp4a = envSet("MIMIRMIND_DISABLE_DP4A");
-    const bool forceEnableDp4a  = envSet("MIMIRMIND_FORCE_DP4A");
-    const std::size_t envMinM   = envGemmMinM();
+void GpuMatmul::autotune(runtime::UsmAllocator&          allocator,
+                         std::size_t                     hiddenDim,
+                         const runtime::FeatureSettings& features) {
+    // M8.J — M-buckets replace the single `mBatch` argument; every
+    // bench-time decision runs against kAutotuneMBuckets.
+    const bool forceDisable     = features.gemm == runtime::TriState::Disable;
+    const bool forceEnable      = features.gemm == runtime::TriState::Force;
+    const bool forceDisableDp4a = features.dp4a == runtime::TriState::Disable;
+    const bool forceEnableDp4a  = features.dp4a == runtime::TriState::Force;
+    const std::size_t envMinM   = features.gemmMinM.value_or(std::size_t{0});
 
-    // MIMIRMIND_GEMM_MIN_M=<N> — pin the crossover threshold on every
-    // type that has a GEMM kernel and skip the timing bench entirely.
-    // Wins over FORCE_GEMM / DISABLE_GEMM if set. Debug-only lever.
+    // features.gemmMinM — pin the crossover threshold on every type
+    // that has a GEMM kernel and skip the timing bench entirely.
+    // Wins over features.gemm if set. Debug-only lever.
     if (envMinM > 0) {
         for (auto& [type, entry] : _entries) {
             (void)type;
             entry.gemmMinM =
                 entry.gemm.has_value() ? envMinM : kGemmMinMNever;
-            entry.autotuneSource = "env_gemm_min_m";
+            entry.autotuneSource = "cfg_gemm_min_m";
         }
         MM_LOG_INFO("gpummm",
-                    "autotune: MIMIRMIND_GEMM_MIN_M={} — every type with "
+                    "autotune: features.gemmMinM={} — every type with "
                     "a GEMM kernel pinned to that threshold, timing bench "
                     "skipped", envMinM);
         return;
@@ -325,10 +305,10 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
         for (auto& [type, entry] : _entries) {
             (void)type;
             entry.gemmMinM = kGemmMinMNever;
-            entry.autotuneSource = "env_disable_gemm";
+            entry.autotuneSource = "cfg_disable_gemm";
         }
         MM_LOG_INFO("gpummm",
-                    "autotune: MIMIRMIND_DISABLE_GEMM=1 — every type "
+                    "autotune: features.gemm=disable — every type "
                     "pinned to the matvec-loop path");
         return;
     }
@@ -337,17 +317,17 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
             (void)type;
             entry.gemmMinM =
                 entry.gemm.has_value() ? std::size_t{2} : kGemmMinMNever;
-            entry.autotuneSource = "env_force_gemm";
+            entry.autotuneSource = "cfg_force_gemm";
         }
         MM_LOG_INFO("gpummm",
-                    "autotune: MIMIRMIND_FORCE_GEMM=1 — every type with "
+                    "autotune: features.gemm=force — every type with "
                     "a GEMM kernel pinned to the GEMM path (gemmMinM=2)");
         return;
     }
 
     if (forceEnableDp4a && dp4aAvailable()) {
         MM_LOG_INFO("gpummm",
-                    "autotune: MIMIRMIND_FORCE_DP4A=1 — every type with "
+                    "autotune: features.dp4a=force — every type with "
                     "a DP4A kernel will be pinned to that path after "
                     "the parity gate");
     }
@@ -614,7 +594,7 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
         // v2 kernel loaded (Q8_0, Q6_K, Q4_K). Runs alongside v1 at
         // every M-bucket so operators can see the crossover in the
         // logs; the actual dispatch decision only flips to v2 when
-        // MIMIRMIND_USE_GEMM_V2=on is set.
+        // `features.gemmV2: true` is set in config.json.
         if (entry.gemmV2.has_value()) {
             const std::size_t v2Tile = entry.gemmV2MTile;
             // Temporarily route through v2 by flipping useGemmV2 for
@@ -664,18 +644,18 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                         formatBucketRow(entry.gemmMsAtM),
                         formatBucketRow(entry.vecMsAtM));
 
-            // Env-var opt-in. Only fires when the v2 bench actually
+            // Config opt-in. Only fires when the v2 bench actually
             // completed for all buckets AND the operator asked for it.
             //
             // M8.K.1 follow-up: when the operator enables v2 AND v2
             // wins vs matvec at some bucket where v1 lost, re-derive
             // gemmMinM using v2's timings. Without this the dispatch
             // stays at gemmMinM=never (v1 lost) even though v2 would
-            // win, forcing the operator to also set MIMIRMIND_GEMM_MIN_M
+            // win, forcing the operator to also set features.gemmMinM
             // manually. Winning is defined against matvec (vecMsAtM),
             // not against v1, because that's the actual dispatch
             // fallback when GEMM isn't picked.
-            if (envSet("MIMIRMIND_USE_GEMM_V2")) {
+            if (features.gemmV2) {
                 entry.useGemmV2 = true;
                 for (std::size_t bi = 0;
                      bi < kAutotuneMBuckets.size(); ++bi)
@@ -688,7 +668,7 @@ void GpuMatmul::autotune(runtime::UsmAllocator& allocator,
                     }
                 }
                 MM_LOG_INFO("gpummm",
-                            "MIMIRMIND_USE_GEMM_V2=on — {} GEMM will "
+                            "features.gemmV2=true — {} GEMM will "
                             "dispatch through v2 when M >= gemmMinM={} "
                             "(re-derived from v2 vs matvec bench)",
                             qt->name(),

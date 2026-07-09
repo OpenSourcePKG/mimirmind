@@ -7,6 +7,8 @@
 
 namespace mimirmind::runtime {
 
+struct LogSettings;
+
 enum class LogLevel : int {
     Trace = 0,
     Debug = 1,
@@ -18,17 +20,17 @@ enum class LogLevel : int {
 
 /**
  * Process-wide logger. Sinks to stderr unconditionally, optionally also
- * to a file. Level- and sink-controllable through env at process start:
- *
- *   MIMIRMIND_LOG_LEVEL = trace|debug|info|warn|error|off    (default: info)
- *   MIMIRMIND_LOG_FILE  = /path/to/log                       (default: none)
+ * to a file. Configured from `Config.server.log` at process start via
+ * `initFromConfig()`; `server.log.level` accepts trace|debug|info|warn|
+ * error|off (default: info), `server.log.file` is a path (empty = no file
+ * sink).
  *
  * Use the MM_LOG_* macros below — they capture std::source_location and
  * skip formatting when the level is filtered out.
  */
 class Log {
 public:
-    static void initFromEnv();
+    static void initFromConfig(const LogSettings& settings);
 
     static void setLevel(LogLevel lvl) noexcept;
     [[nodiscard]] static LogLevel level() noexcept;

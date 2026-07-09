@@ -5,7 +5,6 @@
 
 #include <array>
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -17,13 +16,14 @@ namespace {
 
 constexpr const char* kDefaultSpvDir = "/usr/local/share/mimirmind/spv";
 
-std::filesystem::path resolveSpvPath(std::string_view name) {
+std::filesystem::path resolveSpvPath(std::string_view spvDirOverride,
+                                     std::string_view name) {
     const std::string filename = std::string{name} + ".spv";
 
-    // 1. MIMIRMIND_SPV_DIR override (development convenience).
-    if (const char* env = std::getenv("MIMIRMIND_SPV_DIR");
-        env != nullptr && env[0] != '\0') {
-        const std::filesystem::path p = std::filesystem::path{env} / filename;
+    // 1. Config-supplied override (from runtime.spvDir in config.json).
+    if (!spvDirOverride.empty()) {
+        const std::filesystem::path p =
+            std::filesystem::path{spvDirOverride} / filename;
         if (std::filesystem::exists(p)) {
             return p;
         }
@@ -49,7 +49,7 @@ std::filesystem::path resolveSpvPath(std::string_view name) {
 
     throw std::runtime_error(
         "GpuModule: cannot find " + filename +
-        " — set MIMIRMIND_SPV_DIR or install to " + kDefaultSpvDir);
+        " — set runtime.spvDir in config.json or install to " + kDefaultSpvDir);
 }
 
 } // namespace
@@ -57,8 +57,8 @@ std::filesystem::path resolveSpvPath(std::string_view name) {
 GpuModule::GpuModule(L0Context& ctx, std::string_view name)
     : _ctx{ctx}, _name{name}
 {
-    const auto path = resolveSpvPath(_name);
-    auto bytes      = readSpv(_name);
+    const auto path = resolveSpvPath(_ctx.spvDirOverride(), _name);
+    auto bytes      = readSpv(_ctx.spvDirOverride(), _name);
 
     MM_LOG_INFO("gpu", "loading module '{}' from {} ({} bytes)",
                 _name, path.string(), bytes.size());
@@ -135,8 +135,9 @@ ze_kernel_handle_t GpuModule::kernel(const char* kernelName) {
     return k;
 }
 
-std::vector<std::uint8_t> GpuModule::readSpv(std::string_view name) {
-    const auto path = resolveSpvPath(name);
+std::vector<std::uint8_t> GpuModule::readSpv(std::string_view spvDirOverride,
+                                             std::string_view name) {
+    const auto path = resolveSpvPath(spvDirOverride, name);
     std::ifstream f{path, std::ios::binary | std::ios::ate};
     if (!f.is_open()) {
         throw std::runtime_error("GpuModule: cannot open " + path.string());

@@ -43,7 +43,8 @@ public:
                   const model::FusedQkvWeights*  fusedQkv,
                   compute::GpuOps&               ops,
                   compute::GpuMatmul&            gmm,
-                  runtime::OpProfiler&           opProfiler);
+                  runtime::OpProfiler&           opProfiler,
+                  bool                           moeGroupEnabled = true);
 
     ~Gemma4Backend() override;
 

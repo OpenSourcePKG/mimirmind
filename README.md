@@ -42,8 +42,8 @@ at, instead of treating it like a small discrete GPU.
 ## Headline numbers
 
 On an Intel Meteor Lake Core Ultra, single iGPU, 58 GiB of shared
-memory budget, bench mode (`MIMIRMIND_GPU_CLOCK_PIN=rp0`,
-`MIMIRMIND_ENABLE_CLR=on`):
+memory budget, bench mode (`governor.gpuClockPin: "rp0"`,
+`features.clr: true` in `config.json`):
 
 | Model | Quant | Memory | Decode | Output verified |
 |---|---|---:|---:|---|
@@ -105,9 +105,14 @@ A built image lives at `mimirmind:latest`. On
 a host with an Intel iGPU and a Q-quantised Gemma 4 or Qwen GGUF:
 
 ```bash
-# Point at your model file and start the server
+# Copy the example config and edit it for your host — model path,
+# governor/thermal, feature toggles, etc.
+cp config.example.json config.json
+$EDITOR config.json
+
+# Point the compose at the models dir + your config, then start.
 export MIMIRMIND_MODELS_DIR=/path/to/your/ggufs
-export MIMIRMIND_MODEL_PATH=/models/gemma-4-26B-A4B-it-Q6_K.gguf
+export MIMIRMIND_CONFIG_HOST=$PWD/config.json
 docker compose -f docker-compose.server.yml up -d
 ```
 
@@ -128,6 +133,35 @@ Streaming with `"stream": true` produces SSE just like the official API.
 
 For the full setup, including the host-side `/dev/dri` passthrough
 quirks, see [`doc/build.md`](doc/build.md).
+
+## Configuration
+
+Every runtime knob lives in `config.json`. There are no `MIMIRMIND_*`
+env vars any more — copy `config.example.json` and edit for your host.
+The loader fails fast on a missing file or unknown fields (typo
+protection).
+
+**Precedence:** CLI flag > `config.json` > compiled default.
+
+**CLI overrides** (per invocation): `--config PATH`, `--model PATH`,
+`--port N`, `--log-level`, `--log-file`. Sampling flags (`--prompt`,
+`--temperature`, `--top-k`, `--top-p`, `--seed`) are per-run and don't
+belong in the file.
+
+**Config sections:**
+
+| Section | What it controls |
+|---|---|
+| `models[]` | Loadable model entries (id + path). Multi-model is schema-ready; the loader today accepts one `loadOnStart:true` entry. |
+| `server` | Port, log level, log file. |
+| `runtime` | KV dtype (`f32`/`q8_0`), max context tokens, USM probe cap, SPV dir, preserve-thinking. Per-model overrides via `models[].runtime`. |
+| `features` | `clr`, `flashPrefill`, `fusedQkv`, `moeGroup`, `gemm` (auto/force/disable), `gemmV2`, `gemmMinM`, `dp4a`. |
+| `speculative` | Enable + target/draft model ids + `n` (draft tokens per verify round). |
+| `governor` | `gpuClockPin`, tick-log, fan settings, and the inline thermal profile (formerly a separate `--thermal-profile` file). |
+| `diagnostics` | `parityDump`, `traceBlock0`, `traceDecodeFile`, `traceOpTimes`, `gpuBench`, `regressionAlert`. |
+
+The compose file's header carries the complete `MIMIRMIND_*` → JSON
+mapping table for anyone migrating an existing deployment.
 
 ## Status
 

@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -13,17 +12,6 @@
 namespace mimirmind::runtime {
 
 namespace {
-
-/// Env kill-switch. `MIMIRMIND_SPEC_DEC=off` (or 0/false) forces the
-/// target-only path even when a draft engine was successfully loaded.
-[[nodiscard]] bool killSwitchEngaged() noexcept {
-    const char* env = std::getenv("MIMIRMIND_SPEC_DEC");
-    if (env == nullptr || env[0] == '\0') {
-        return false;
-    }
-    const std::string_view v{env};
-    return v == "off" || v == "0" || v == "false" || v == "no";
-}
 
 /// Penalty rules mirrored from compute::Sampler::applyPenalties — inline
 /// here so the accept-check argmax matches what target's own Sampler
@@ -111,22 +99,20 @@ SpeculativeDecoder::SpeculativeDecoder(InferenceEngine& target,
                                        InferenceEngine& draft,
                                        Config           cfg)
     : _target{target}, _draft{draft}, _cfg{cfg} {
-    if (_cfg.draftN == 0) {
+    if (_cfg.draftN == 0 || !_cfg.enabled) {
         MM_LOG_INFO("spec-dec",
-                    "SpeculativeDecoder: draftN=0, spec-dec loop disabled "
-                    "(target-only pass-through)");
+                    "SpeculativeDecoder: disabled (enabled={}, draftN={}) — "
+                    "target-only pass-through",
+                    _cfg.enabled, _cfg.draftN);
     } else {
         MM_LOG_INFO("spec-dec",
-                    "SpeculativeDecoder ready — draftN={}, kill_switch={}",
-                    _cfg.draftN, killSwitchEngaged() ? "on" : "off");
+                    "SpeculativeDecoder ready — draftN={}",
+                    _cfg.draftN);
     }
 }
 
 bool SpeculativeDecoder::wouldEngage(const GenerateParams& params) const noexcept {
-    if (_cfg.draftN == 0) {
-        return false;
-    }
-    if (killSwitchEngaged()) {
+    if (!_cfg.enabled || _cfg.draftN == 0) {
         return false;
     }
     // Sampled path is bit-inequivalent to modified rejection sampling

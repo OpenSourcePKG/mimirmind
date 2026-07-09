@@ -67,14 +67,15 @@ public:
 
     /// Session-level clock pin (M9.11.a). Applies `mhz` (clamped by
     /// setMaxFreqMhz) and records the intent ("rp0" / "rpn" / "numeric")
-    /// and the raw MIMIRMIND_GPU_CLOCK_PIN env value that produced it.
-    /// The InferenceEngine's decode loop consults pinned() and skips
-    /// its P-controller tick when true, so a pinned cap survives the
-    /// full session. Reported through /v1/system/info and /system/status
-    /// so any perf-bench number can be attributed to the pin it ran under.
+    /// and the raw `governor.gpuClockPin` string from config.json that
+    /// produced it. The InferenceEngine's decode loop consults pinned()
+    /// and skips its P-controller tick when true, so a pinned cap
+    /// survives the full session. Reported through /v1/system/info and
+    /// /system/status so any perf-bench number can be attributed to the
+    /// pin it ran under.
     std::uint32_t pin(std::uint32_t mhz,
                       std::string_view intent,
-                      std::string_view rawEnv);
+                      std::string_view rawSource);
 
     [[nodiscard]] bool             pinned()     const noexcept { return _pinned; }
     [[nodiscard]] std::uint32_t    pinnedMhz()  const noexcept { return _pinnedMhz; }

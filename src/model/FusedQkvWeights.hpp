@@ -22,7 +22,7 @@ class WeightsMap;
  * Fusion is enabled when:
  *   - Both attn_q.weight and attn_k.weight exist for the block
  *   - All present tensors share the same GgmlType
- *   - MIMIRMIND_DISABLE_FUSED_QKV is unset (or set to "0"/"false"/"off")
+ *   - `enabled` (from `features.fusedQkv` in config.json) is true
  *
  * When the layer's V is derived from raw K (Gemma 4 altAttention), the
  * fused block contains only [W_q | W_k] and `hasV` is false.
@@ -64,6 +64,7 @@ public:
     FusedQkvWeights(const WeightsMap&      weights,
                     runtime::UsmAllocator& allocator,
                     std::size_t            numBlocks,
+                    bool                   enabled               = true,
                     std::size_t            sharedKvLayers        = 0,
                     bool                   requantMismatchToQ8_0 = false);
 
@@ -81,8 +82,8 @@ public:
     /// and for deciding whether to allocate qkvFusedScratch.
     [[nodiscard]] bool anyFused() const noexcept { return _anyFused; }
 
-    /// True when the env-var disable switch is set. Diagnostic-only.
-    [[nodiscard]] bool disabledByEnv() const noexcept { return _disabledByEnv; }
+    /// True when `enabled=false` was passed to the constructor. Diagnostic-only.
+    [[nodiscard]] bool disabled() const noexcept { return _disabled; }
 
     /// Block-count telemetry for /v1/system/status.
     [[nodiscard]] std::size_t fusedCount()   const noexcept { return _fusedCount; }
@@ -94,7 +95,7 @@ private:
     runtime::UsmAllocator&              _alloc;
     std::vector<std::optional<Block>>   _blocks;
     bool                                _anyFused{false};
-    bool                                _disabledByEnv{false};
+    bool                                _disabled{false};
     std::size_t                         _fusedCount{0};
     std::size_t                         _skippedCount{0};
     std::size_t                         _totalBytes{0};

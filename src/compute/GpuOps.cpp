@@ -18,13 +18,6 @@ namespace mimirmind::compute {
 
 namespace {
 
-bool envSet(const char* name) noexcept {
-    const char* v = std::getenv(name);
-    if (v == nullptr) return false;
-    const std::string_view s{v};
-    return !s.empty() && s != "0" && s != "false" && s != "off";
-}
-
 std::int32_t toInt32(std::size_t v, const char* tag) {
     if (v > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::runtime_error(
@@ -46,7 +39,8 @@ std::uint32_t groupsForN(std::size_t n, std::uint32_t local) {
 
 GpuOps::GpuOps(runtime::L0Context&    ctx,
                runtime::UsmAllocator& alloc,
-               runtime::CommandQueue& queue)
+               runtime::CommandQueue& queue,
+               bool                   flashPrefillEnabled)
     : _ctx{ctx},
       _queue{queue},
       _alloc{alloc},
@@ -155,7 +149,7 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
 
     // M5i.J: cache the prefill-flash rollback flag once at startup so the
     // dispatcher hot path stays branch-cheap.
-    _prefillFlashDisabled = envSet("MIMIRMIND_DISABLE_FLASH_PREFILL");
+    _prefillFlashDisabled = !flashPrefillEnabled;
 
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
@@ -790,7 +784,7 @@ void GpuOps::selfTest(runtime::UsmAllocator& allocator) {
                 "qk-only paths{}",
                 _prefillFlashDisabled
                     ? " (attention_prefill_flash skipped: "
-                      "MIMIRMIND_DISABLE_FLASH_PREFILL=1)"
+                      "features.flashPrefill=false)"
                     : " + attention_prefill_flash (T_q=8) verified");
 }
 
@@ -947,7 +941,7 @@ void GpuOps::attentionAsync(const float*      q,
     //    (nHeads, T_q) launch geometry as variant (a) but the K-loop
     //    runs tiled online-softmax intra-WG, shrinking SLM from 64 KiB
     //    (variant (a)) to ~2.5 KiB per WG. Rollback via
-    //    MIMIRMIND_DISABLE_FLASH_PREFILL=1.
+    //    `features.flashPrefill: false` in config.json.
     if (T_q == 1) {
         if (nHeads > kFlashMaxHeads || headDim > kFlashMaxHeadDim) {
             throw std::runtime_error(

@@ -12,3 +12,5 @@ compile_commands.json
 models/
 run-logs/
 run-state/
+config.json
+config.dev.json

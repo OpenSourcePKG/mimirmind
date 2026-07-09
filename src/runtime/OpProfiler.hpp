@@ -17,12 +17,12 @@ class CommandQueue;
  * are all no-ops with zero overhead. The backend keeps its normal
  * pipelined dispatch behaviour.
  *
- * ON when MIMIRMIND_TRACE_OP_TIMES is set: begin(cat) flushes the shared
- * command queue, starts a wall-clock, and remembers `cat`. end() flushes
- * again, adds the delta to the running total for that category. Every
- * kDumpEvery tokens the accumulated shares get logged and cleared. The
- * flushes serialise the pipeline — this is diagnostic mode only, not for
- * production traffic.
+ * ON when `diagnostics.traceOpTimes: true` in config.json: begin(cat)
+ * flushes the shared command queue, starts a wall-clock, and remembers
+ * `cat`. end() flushes again, adds the delta to the running total for
+ * that category. Every kDumpEvery tokens the accumulated shares get
+ * logged and cleared. The flushes serialise the pipeline — this is
+ * diagnostic mode only, not for production traffic.
  *
  * Not thread-safe. The engine already serialises inference calls via
  * engineMutex; this class inherits that constraint.
@@ -39,7 +39,8 @@ public:
         NUM
     };
 
-    explicit OpProfiler(CommandQueue& queue);
+    /// `enabled` maps to `diagnostics.traceOpTimes` in config.json.
+    OpProfiler(CommandQueue& queue, bool enabled);
 
     [[nodiscard]] bool enabled() const noexcept { return _enabled; }
 

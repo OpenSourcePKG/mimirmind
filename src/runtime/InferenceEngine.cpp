@@ -2,6 +2,7 @@
 
 #include "compute/Embedding.hpp"
 #include "model/GgufTypes.hpp"
+#include "runtime/Config.hpp"
 #include "runtime/FanController.hpp"
 #include "runtime/Lcp.hpp"
 #include "runtime/Log.hpp"
@@ -18,7 +19,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <optional>
@@ -97,45 +97,40 @@ void logTensorTaxonomy(const model::GgufReader& reader) {
 
 } // namespace
 
-InferenceEngine::InferenceEngine()
-    : _ctx{},
-      _allocator{_ctx},
+InferenceEngine::InferenceEngine(const Config& cfg)
+    : _cfg{cfg},
+      _ctx{std::string{cfg.runtime.spvDir.value_or("")}},
+      _allocator{_ctx, cfg.runtime.usmProbeTotalGib},
       _queue{_ctx},
-      _ops{_ctx, _allocator, _queue},
+      _ops{_ctx, _allocator, _queue, cfg.features.flashPrefill},
       _gmm{_ctx, _ops, _allocator, _queue},
-      _opProfiler{_queue} {
+      _opProfiler{_queue, cfg.diagnostics.traceOpTimes} {
     MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");
     _allocator.probeLimits();
 
-    // Opt-in block-0 trace. Anything non-empty / non-"0" enables it.
-    if (const char* env = std::getenv("MIMIRMIND_TRACE_BLOCK0")) {
-        std::string_view v{env};
-        if (!v.empty() && v != "0" && v != "false" && v != "off") {
-            _traceBlock0 = true;
-            MM_LOG_INFO("engine",
-                        "MIMIRMIND_TRACE_BLOCK0={} — block-0 trace enabled "
-                        "for first forward only",
-                        env);
-        }
+    if (cfg.diagnostics.traceBlock0) {
+        _traceBlock0 = true;
+        MM_LOG_INFO("engine",
+                    "diagnostics.traceBlock0=true — block-0 trace enabled "
+                    "for first forward only");
     }
 
     // Per-decode-token NDJSON telemetry sink. Opens the file truncating;
     // the engine never rotates so a long-running process keeps appending.
     // Operators should rotate externally if they care.
-    if (const char* path = std::getenv("MIMIRMIND_TRACE_DECODE_FILE")) {
-        if (path[0] != '\0') {
-            _decodeTrace = std::fopen(path, "w");
-            if (_decodeTrace != nullptr) {
-                MM_LOG_INFO("engine",
-                            "MIMIRMIND_TRACE_DECODE_FILE={} — per-token "
-                            "decode trace enabled (wall_ms, cap_mhz, pkg_c)",
-                            path);
-            } else {
-                MM_LOG_WARN("engine",
-                            "MIMIRMIND_TRACE_DECODE_FILE={} — could not "
-                            "open for writing, decode trace disabled",
-                            path);
-            }
+    if (!cfg.diagnostics.traceDecodeFile.empty()) {
+        const std::string& path = cfg.diagnostics.traceDecodeFile;
+        _decodeTrace = std::fopen(path.c_str(), "w");
+        if (_decodeTrace != nullptr) {
+            MM_LOG_INFO("engine",
+                        "diagnostics.traceDecodeFile={} — per-token "
+                        "decode trace enabled (wall_ms, cap_mhz, pkg_c)",
+                        path);
+        } else {
+            MM_LOG_WARN("engine",
+                        "diagnostics.traceDecodeFile={} — could not open "
+                        "for writing, decode trace disabled",
+                        path);
         }
     }
 }
@@ -183,8 +178,8 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
 
     // M5i.B: Try to fuse per-block attn_q/k/v weights so the QKV
     // projections can dispatch as one matmul. The class no-ops when
-    // MIMIRMIND_DISABLE_FUSED_QKV is set or when a block doesn't
-    // qualify (missing tensors, mismatched types).
+    // `features.fusedQkv` is false or when a block doesn't qualify
+    // (missing tensors, mismatched types).
     // Gemma 4 E4B (and any future arch with shared-KV layers) skips
     // fusion for the trailing reuse-KV blocks. E4B also mixes attn_q
     // (Q6_K/Q4_K) with attn_k (Q5_K) per own-KV block, which would kill
@@ -194,6 +189,7 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
         (_config.architecture == "gemma4") && (_config.sharedKvLayers > 0);
     _fusedQkv = std::make_unique<model::FusedQkvWeights>(
         *_weights, _allocator, _config.blockCount,
+        _cfg.features.fusedQkv,
         _config.sharedKvLayers, requantToQ8_0);
 
     // M5i.D: Load-time self-tests of the GPU compute path. selfTest
@@ -201,16 +197,16 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     // tiny fixed input — catches broken SPV loads and driver bugs on
     // unfamiliar iGPU µarchs. autotune runs a matvec-vs-GEMM micro-
     // bench (with its own parity gate) and pins the dispatch decision
-    // per QuantType. Honours MIMIRMIND_DISABLE_GEMM / _FORCE_GEMM.
+    // per QuantType. Honours `features.gemm` / `features.dp4a`.
     _ops.selfTest(_allocator);
-    _gmm.autotune(_allocator, _config.embeddingLength);
+    _gmm.autotune(_allocator, _config.embeddingLength, _cfg.features);
 
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
     // gracefully with the original architecture string in the error.
     _backend = arch::createArchBackend(
         _config.architecture, _config, *_weights, _fusedQkv.get(),
-        _ops, _gmm, _opProfiler);
+        _ops, _gmm, _opProfiler, _cfg.features.moeGroup);
 
     _modelLoaded = true;
     // Defensive: a previous model's KV state must not survive into the
@@ -289,9 +285,9 @@ void InferenceEngine::setKvDtype(KvDtype dtype) {
                 "): block " + std::to_string(b) +
                 " has no fused-QKV entry — raw fp32 matmul would corrupt "
                 "the fp16 K/V slot. Rebuild the model with fused-QKV weights "
-                "(see FusedQkvWeights) or use MIMIRMIND_KV_DTYPE=q8_0 "
-                "(which routes non-fused writes through fp32 staging) or "
-                "leave MIMIRMIND_KV_DTYPE unset for the f32 default.");
+                "(see FusedQkvWeights) or set runtime.kvDtype='q8_0' in "
+                "config.json (which routes non-fused writes through fp32 "
+                "staging) or leave runtime.kvDtype unset for the f32 default.");
         }
         if (_weights->findBlock(b, "attn_k.bias") != nullptr) {
             throw std::runtime_error(
@@ -374,14 +370,13 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
         else if (_kvDtype == KvDtype::Q8_0) dtypeLabel = "q8_0";
         MM_LOG_INFO("kvcache",
                     "pre-allocated for {} tokens dtype={} "
-                    "(set via MIMIRMIND_MAX_CONTEXT_TOKENS / "
-                    "MIMIRMIND_KV_DTYPE)",
+                    "(set via runtime.maxContextTokens / runtime.kvDtype)",
                     _maxContextTokens, dtypeLabel);
     }
 
     // Hard cap: a request that doesn't fit gets a clear error rather
     // than silently overflowing the cache. Operator can raise
-    // MIMIRMIND_MAX_CONTEXT_TOKENS if the workload needs it.
+    // `runtime.maxContextTokens` in config.json if the workload needs it.
     if (Tp + maxNew + 4 > _maxContextTokens) {
         throw std::runtime_error(
             "generate: request needs " + std::to_string(Tp + maxNew + 4) +
@@ -389,7 +384,7 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
             " + max_new " + std::to_string(maxNew) +
             " + slack 4) but the engine is configured for "
             + std::to_string(_maxContextTokens) +
-            " — raise MIMIRMIND_MAX_CONTEXT_TOKENS or shrink the request");
+            " — raise runtime.maxContextTokens or shrink the request");
     }
 
     // BlockBuffers + scratch: purely transient, safe to realloc on
@@ -606,12 +601,14 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
 
     // -- Prefill ---------------------------------------------------------
     //
-    // Optional parity-test dump. `MIMIRMIND_PARITY_DUMP=PREFIX` makes
-    // the backend write PREFIX-blk{N}-<stage>.bin at multiple stages
-    // inside each block during prefill. Format matches llama-parity-dump.
+    // Optional parity-test dump. `diagnostics.parityDump: "PREFIX"` in
+    // config.json makes the backend write PREFIX-blk{N}-<stage>.bin at
+    // multiple stages inside each block during prefill. Format matches
+    // llama-parity-dump.
 
-    if (const char* dumpPrefix = std::getenv("MIMIRMIND_PARITY_DUMP")) {
-        _backend->setParityDumpPrefix(dumpPrefix);
+    if (!_cfg.diagnostics.parityDump.empty()) {
+        const std::string& dumpPrefix = _cfg.diagnostics.parityDump;
+        _backend->setParityDumpPrefix(dumpPrefix.c_str());
         // Log the token sequence so the operator can hand the same tokens
         // to llama-parity-dump and compare block-0 outputs.
         std::string idsCsv;
@@ -621,7 +618,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             idsCsv += std::to_string(promptIds[i]);
         }
         MM_LOG_INFO("parity",
-                    "MIMIRMIND_PARITY_DUMP={} — prefill token count={}, "
+                    "diagnostics.parityDump={} — prefill token count={}, "
                     "first {}: [{}]",
                     dumpPrefix, promptIds.size(), nShow, idsCsv);
         // dumpStage() sync-flushes the GPU and writes T*d_model*4 bytes per
@@ -630,9 +627,9 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // stall for >30 minutes with the flag left on in production.
         if (prefillCount > 256) {
             MM_LOG_WARN("parity",
-                        "MIMIRMIND_PARITY_DUMP is set with prefillCount={} — "
+                        "diagnostics.parityDump is set with prefillCount={} — "
                         "expect multi-GB synchronous disk writes and severely "
-                        "degraded prefill throughput. Unset the env var for "
+                        "degraded prefill throughput. Clear the field for "
                         "production traffic.",
                         prefillCount);
         }
@@ -657,8 +654,9 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // Parity-dump the post-embed-scale hidden state so we can diff
         // it against llama.cpp's `inp_scaled` tensor. Written as
         // `<prefix>-blk0-input_scaled.bin` for parity-diff to pick up.
-        // No-op unless MIMIRMIND_PARITY_DUMP is set.
-        if (const char* dumpPrefix = std::getenv("MIMIRMIND_PARITY_DUMP")) {
+        // No-op unless `diagnostics.parityDump` is non-empty.
+        if (!_cfg.diagnostics.parityDump.empty()) {
+            const std::string& dumpPrefix = _cfg.diagnostics.parityDump;
             // scaleEmbeddingIfNeeded submitted `mulScalarAsync` — it's
             // still queued on the GPU. Flush before the CPU reads xBuf,
             // otherwise the dump captures the un-scaled embedding and
@@ -667,7 +665,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             // rest of the pipeline still runs on the scaled value).
             _ops.queue().flush();
             const std::string fname =
-                std::string{dumpPrefix} + "-blk0-inp_scaled.bin";
+                dumpPrefix + "-blk0-inp_scaled.bin";
             std::ofstream f(fname, std::ios::binary);
             if (f) {
                 const std::uint32_t hdr[3] = {
@@ -787,12 +785,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // update the shared USM curLen slot and re-execute the same
         // recorded list — no per-token appendLaunch, no per-token
         // barrier setup, no per-kernel arg binding.
-        const bool clrEnvOn = [] {
-            const char* v = std::getenv("MIMIRMIND_ENABLE_CLR");
-            if (v == nullptr || v[0] == '\0') return false;
-            const std::string_view s{v};
-            return !(s == "0" || s == "false" || s == "off");
-        }();
+        const bool clrEnvOn = _cfg.features.clr;
         // MoE models are NOT CLR-safe: `Gemma4MoeBackend::runBlock` picks
         // top-K experts on the host per record via `cmp::moeTopKRoute`
         // (reading the router matmul output on the CPU), and every
@@ -813,7 +806,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             clrEnvOn && (_config.expertCount == 0);
         if (clrEnvOn && _config.expertCount > 0) {
             MM_LOG_WARN("engine",
-                        "MIMIRMIND_ENABLE_CLR=on requested but disabled "
+                        "features.clr=true requested but disabled "
                         "for this MoE model (expertCount={}) — MoE "
                         "routing bakes host-computed expert selections "
                         "into the recording, which stales at replay. "
@@ -822,7 +815,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         }
         if (clrEnabled) {
             MM_LOG_INFO("engine",
-                        "MIMIRMIND_ENABLE_CLR=on — decode uses record/replay "
+                        "features.clr=true — decode uses record/replay "
                         "from step 2 on");
             _ops.queue().resetRecording();
             // Right-size the FlashAttention partial launch geometry to
@@ -838,7 +831,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 compute::GpuOps::kFlashMaxKTiles);
             _ops.setReplayMaxKTiles(replayKTiles);
             MM_LOG_INFO("engine",
-                        "MIMIRMIND_ENABLE_CLR right-sized flash launch "
+                        "features.clr right-sized flash launch "
                         "geometry to {} k-tiles (max curLen {})",
                         replayKTiles, maxCurLen);
         } else {
@@ -971,7 +964,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                         PerfRegressionDetector::Sample{tokMs, cap, pkg});
                 }
                 // M8.K.0 diagnostic: emits a per-category share summary
-                // every 50 tokens when MIMIRMIND_TRACE_OP_TIMES=on.
+                // every 50 tokens when diagnostics.traceOpTimes=true.
                 // No-op otherwise.
                 _opProfiler.maybeDumpAndReset(step);
             }

@@ -74,6 +74,7 @@ FROM builder AS build
 
 # CMake config first (only file that triggers a re-configure)
 COPY CMakeLists.txt ./
+COPY config.example.json ./
 COPY src ./src
 COPY kernels ./kernels
 COPY tests ./tests
@@ -150,12 +151,17 @@ RUN groupadd -g 44  video  2>/dev/null || true \
 ENV UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
 ENV UR_L0_USE_RELAXED_ALLOCATION_LIMITS=1
 
-# Models live on a host volume (mounted read-only in docker-compose.yml)
-ENV MIMIRMIND_MODELS_DIR=/models
+# Models live on a host volume (mounted read-only in docker-compose.yml).
+# The config that references them lives in a bind-mounted
+# /etc/mimirmind/config.json — see docker-compose.server.yml.
 
-COPY --from=build /src/build/mimirmind  /usr/local/bin/mimirmind
-COPY --from=build /src/build/gpu_tests  /usr/local/bin/gpu_tests
-COPY --from=build /src/build/spv        /usr/local/share/mimirmind/spv
+COPY --from=build /src/build/mimirmind        /usr/local/bin/mimirmind
+COPY --from=build /src/build/gpu_tests        /usr/local/bin/gpu_tests
+COPY --from=build /src/build/spv              /usr/local/share/mimirmind/spv
+# Reference config that operators can copy + edit for their host. The
+# actual runtime config comes in through a bind-mount at
+# /etc/mimirmind/config.json (see docker-compose.server.yml).
+COPY --from=build /src/config.example.json    /usr/local/share/mimirmind/config.example.json
 
 # llama.cpp parity-test oracle: binaries + their shared libs.
 COPY --from=llamacpp /llamacpp/build/bin/llama-cli           /usr/local/bin/llama-cli
@@ -174,6 +180,8 @@ RUN ldconfig
 COPY tools/parity-diff.py /usr/local/bin/parity-diff
 RUN chmod +x /usr/local/bin/parity-diff
 
-ENV MIMIRMIND_SPV_DIR=/usr/local/share/mimirmind/spv
+# Note: `runtime.spvDir` in config.json can override this at runtime.
+# When left unset in config.json, GpuModule falls back to
+# /usr/local/share/mimirmind/spv (baked in above).
 
 ENTRYPOINT ["/usr/local/bin/mimirmind"]

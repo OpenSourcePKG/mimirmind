@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace mimirmind::runtime {
@@ -64,7 +65,10 @@ struct UsmStats {
  */
 class UsmAllocator {
 public:
-    explicit UsmAllocator(L0Context& ctx);
+    /// `probeTotalGiB`: from `runtime.usmProbeTotalGib` in config.json. Caps
+    /// how much host RAM the Phase 2 sweep is allowed to touch. `0` skips
+    /// Phase 2 entirely. `std::nullopt` uses the compiled default (4 GiB).
+    explicit UsmAllocator(L0Context& ctx, std::optional<int> probeTotalGiB = {});
     ~UsmAllocator();
 
     UsmAllocator(const UsmAllocator&)            = delete;
@@ -136,6 +140,7 @@ private:
     void  rawFree(void* ptr) noexcept;
 
     L0Context&                       _ctx;
+    std::optional<int>               _probeTotalGiB{};
     UsmLimits                        _limits{};
     mutable std::mutex               _mutex;
     std::array<Bucket, kBucketCount> _buckets{};

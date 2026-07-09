@@ -8,7 +8,6 @@
 #include "runtime/Log.hpp"
 #include "runtime/UsmAllocator.hpp"
 
-#include <cstdlib>
 #include <cstring>
 #include <string_view>
 #include <vector>
@@ -16,13 +15,6 @@
 namespace mimirmind::model {
 
 namespace {
-
-bool disabledByEnv() noexcept {
-    const char* v = std::getenv("MIMIRMIND_DISABLE_FUSED_QKV");
-    if (v == nullptr) return false;
-    const std::string_view s{v};
-    return !s.empty() && s != "0" && s != "false" && s != "off";
-}
 
 // GGUF stores weight tensor dimensions as [K, N] — dimensions[0] is
 // the fastest-varying axis (input dim), dimensions[1] is the row count.
@@ -43,12 +35,13 @@ std::size_t nCols(const GgufTensor& t) noexcept {
 FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
                                  runtime::UsmAllocator& allocator,
                                  std::size_t            numBlocks,
+                                 bool                   enabled,
                                  std::size_t            sharedKvLayers,
                                  bool                   requantMismatchToQ8_0)
     : _alloc{allocator}
 {
     _blocks.resize(numBlocks);
-    _disabledByEnv = ::mimirmind::model::disabledByEnv();
+    _disabled = !enabled;
 
     // Layers past this index reuse an earlier layer's K/V and never
     // touch the QKV projection, so fusion is a no-op for them.
@@ -56,9 +49,9 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
                                      ? numBlocks - sharedKvLayers
                                      : numBlocks;
 
-    if (_disabledByEnv) {
+    if (_disabled) {
         MM_LOG_INFO("qkvfuse",
-                    "FusedQkvWeights: skipped — MIMIRMIND_DISABLE_FUSED_QKV set");
+                    "FusedQkvWeights: skipped — features.fusedQkv=false");
         return;
     }
 

@@ -17,6 +17,7 @@
 #include "runtime/UsmHandle.hpp"
 
 namespace mimirmind::runtime {
+struct Config;
 class FanController;
 class GpuClockGovernor;
 class PerfRegressionDetector;
@@ -147,7 +148,14 @@ public:
     /// an empty result set with `outStats->prefillMs` populated.
     using PrefillProgressCallback = std::function<bool(const PrefillProgress&)>;
 
-    InferenceEngine();
+    /// `cfg` is stored by reference and consulted for the runtime section
+    /// (spvDir → L0Context, usmProbeTotalGib → UsmAllocator), the feature
+    /// section (flashPrefill → GpuOps, gemm/gemmMinM/gemmV2/dp4a → GpuMatmul
+    /// autotune, fusedQkv → FusedQkvWeights), and the diagnostics section
+    /// (traceBlock0, traceDecodeFile). Per-model runtime overrides are
+    /// applied by the operator via `setKvDtype`/`setMaxContextTokens`
+    /// after resolving `cfg.effectiveRuntime(modelId)`.
+    explicit InferenceEngine(const Config& cfg);
     ~InferenceEngine();
 
     InferenceEngine(const InferenceEngine&)            = delete;
@@ -358,6 +366,8 @@ private:
     void ensureCapacity(std::size_t maxT, std::size_t Tp, std::size_t maxNew,
                        std::size_t vocab_lm, std::size_t d_model);
 
+    // Held by reference for the whole process lifetime. Provided by main().
+    const Config&                      _cfg;
     L0Context                          _ctx;
     UsmAllocator                       _allocator;
     CommandQueue                       _queue;
@@ -367,8 +377,8 @@ private:
     compute::GpuOps                    _ops;
     compute::GpuMatmul                 _gmm;
     // M8.K.0: diagnostic per-op timer. Constructed after _queue so it
-    // can hold a reference. Off by default (MIMIRMIND_TRACE_OP_TIMES
-    // env-var opt-in).
+    // can hold a reference. Off by default; opt in via
+    // `diagnostics.traceOpTimes: true` in config.json.
     OpProfiler                         _opProfiler;
     compute::Sampler                   _sampler{};
 
@@ -416,17 +426,18 @@ private:
     FanController*                     _fanController{nullptr};
 
     // One-shot block-0 trace. Default off so production serve mode is
-    // quiet; set MIMIRMIND_TRACE_BLOCK0=1 to enable when bringing up a
-    // new architecture handler. Flips to false after the first call so
-    // even an enabled trace only fires once per process.
+    // quiet; enable via `diagnostics.traceBlock0: true` when bringing
+    // up a new architecture handler. Flips to false after the first
+    // call so even an enabled trace only fires once per process.
     bool                               _traceBlock0{false};
 
-    // Per-decode-token telemetry. When MIMIRMIND_TRACE_DECODE_FILE is
-    // set, the engine opens an NDJSON sink at startup and writes one
-    // line per decoded token: {tok, wall_ms, cap_mhz, pkg_c}. Used to
-    // diagnose perf regressions (M5f.5 postmortem motivated this) and
-    // to validate optimizations after the fact instead of guessing.
-    // nullptr when the env var is unset — zero overhead in production.
+    // Per-decode-token telemetry. When `diagnostics.traceDecodeFile`
+    // is a non-empty path, the engine opens an NDJSON sink at startup
+    // and writes one line per decoded token: {tok, wall_ms, cap_mhz,
+    // pkg_c}. Used to diagnose perf regressions (M5f.5 postmortem
+    // motivated this) and to validate optimizations after the fact
+    // instead of guessing. nullptr when unset — zero overhead in
+    // production.
     std::FILE*                         _decodeTrace{nullptr};
 };
 

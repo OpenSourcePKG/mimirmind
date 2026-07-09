@@ -185,6 +185,7 @@ add_executable(mimirmind
     src/model/WeightsMap.cpp
     src/runtime/BlockBuffers.cpp
     src/runtime/CommandQueue.cpp
+    src/runtime/Config.cpp
     src/runtime/GpuKernel.cpp
     src/runtime/GpuModule.cpp
     src/runtime/InferenceEngine.cpp
@@ -280,6 +281,7 @@ add_executable(arch_tests
     src/compute/MoeRouting.cpp
     src/compute/Softmax.cpp
     src/model/ResponseCleaner.cpp
+    src/runtime/Config.cpp
     src/runtime/GpuClockGovernor.cpp
     src/runtime/Log.cpp
     src/runtime/PowerMonitor.cpp

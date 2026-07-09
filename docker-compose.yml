@@ -50,9 +50,6 @@ services:
         environment:
             UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
             UR_L0_USE_RELAXED_ALLOCATION_LIMITS: "1"
-            MIMIRMIND_LOG_LEVEL: ${MIMIRMIND_LOG_LEVEL:-info}
-            MIMIRMIND_LOG_FILE:  ${MIMIRMIND_LOG_FILE:-}
-            MIMIRMIND_MODEL_PATH: ${MIMIRMIND_MODEL_PATH:-}
             BUILD_TYPE: ${BUILD_TYPE:-Release}
 
         volumes:
@@ -98,14 +95,20 @@ services:
         environment:
             UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
             UR_L0_USE_RELAXED_ALLOCATION_LIMITS: "1"
-            MIMIRMIND_LOG_LEVEL: ${MIMIRMIND_LOG_LEVEL:-info}
-            MIMIRMIND_LOG_FILE:  ${MIMIRMIND_LOG_FILE:-}
-            MIMIRMIND_MODEL_PATH: ${MIMIRMIND_MODEL_PATH:-}
 
+        # Runtime knobs live in config.json — copy config.example.json to
+        # config.dev.json (gitignored) and edit for the dev iGPU. If the
+        # host file is missing, compose fails with "no such file".
         # Models live on the host — read-only mount.
         # Symlink / bind ./models to wherever the GGUFs actually sit.
         volumes:
             - ./models:/models:ro
+            - ${MIMIRMIND_CONFIG_HOST:-./config.dev.json}:/etc/mimirmind/config.json:ro
+
+        command:
+            - serve
+            - --config
+            - /etc/mimirmind/config.json
 
         # M7d — OpenAI-compatible HTTP API. Default container port is 8080;
         # remap on the host as needed.
