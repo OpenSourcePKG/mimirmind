@@ -210,7 +210,15 @@ add_executable(mimirmind
     src/runtime/arch/Gemma4E4BBackend.cpp
     src/runtime/arch/Gemma4MoeBackend.cpp
     src/runtime/arch/Qwen2Backend.cpp
+    src/server/ApiHelpers.cpp
     src/server/ApiServer.cpp
+    src/server/ChatCompletionHandler.cpp
+    src/server/ChatRequestParser.cpp
+    src/server/PromptTrimmer.cpp
+    src/server/RequestDispatcher.cpp
+    src/server/RequestTracker.cpp
+    src/server/SseEncoder.cpp
+    src/server/SystemStatusBuilder.cpp
 )
 
 add_dependencies(mimirmind spv_kernels)
