@@ -352,6 +352,22 @@ void InferenceEngine::setKvDtype(KvDtype dtype) {
                     "all kvDim are multiples of 32",
                     ownKvBlocks, nFused, ownKvBlocks - nFused);
     }
+
+    // R5 — K-tile autotune for the packed Q8_0 GQA prefill kernel. Only
+    // fires when features.flashPrefillKTileQ8 == 0 (autotune requested)
+    // AND the model has a GQA shape AND we're actually running Q8_0 KV
+    // storage. Guards inside `autotuneKTileQ8` early-out with an info
+    // log for every other case. Uses SWA head_dim when available (most
+    // Gemma 4 layers) since that's the geometry the packed kernel spends
+    // most of its time on.
+    const std::size_t autotuneHeadDim = static_cast<std::size_t>(
+        _config.keyLengthSwa > 0 ? _config.keyLengthSwa
+                                 : _config.keyLength);
+    _ops.autotuneKTileQ8(_allocator,
+                         static_cast<std::size_t>(_config.headCount),
+                         static_cast<std::size_t>(_config.headCountKv),
+                         autotuneHeadDim,
+                         _kvDtype);
 }
 
 void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,

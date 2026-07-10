@@ -5,10 +5,16 @@
 #include "runtime/Log.hpp"
 #include "runtime/UsmAllocator.hpp"
 
+#include "compute/quant/Q8_0.hpp"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -164,21 +170,19 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
     _prefillFlashDisabled      = !flashPrefillEnabled;
     _prefillFlashGqaQ8Disabled = !flashPrefillGqaQ8Enabled;
 
-    // Resolve K-tile pick. 0 = autotune, which needs a bench loop that
-    // hasn't been reconstructed yet — fall back to 128 with a loud
-    // warning so operators know the pin is implicit. 64 / 128 pin
-    // directly. Any other value should have been rejected in
-    // Config.cpp parseFeatures; guard defensively.
+    // Resolve K-tile pick. 0 = autotune, resolved later by
+    // autotuneKTileQ8() once model dims are known — until then the
+    // active pick sits at the safe default (128, the M5i.J spec) so
+    // dispatch is safe from the first request. 64 / 128 pin directly
+    // and autotuneKTileQ8() will log-skip. Any other value should have
+    // been rejected in Config.cpp parseFeatures; guard defensively.
+    _prefillFlashKTileQ8Configured = flashPrefillKTileQ8;
     if (flashPrefillKTileQ8 == 0) {
-        MM_LOG_WARN(
-            "gpuops",
-            "features.flashPrefillKTileQ8=0 (autotune) requested but the "
-            "K-tile autotune bench has not been reconstructed yet — "
-            "falling back to 128. Pin explicitly to silence this warning "
-            "or wait for the follow-up commit.");
-        _prefillFlashKTileQ8 = 128;
+        _prefillFlashKTileQ8       = 128;
+        _prefillFlashKTileQ8Source = "pending (autotune)";
     } else if (flashPrefillKTileQ8 == 64 || flashPrefillKTileQ8 == 128) {
-        _prefillFlashKTileQ8 = flashPrefillKTileQ8;
+        _prefillFlashKTileQ8       = flashPrefillKTileQ8;
+        _prefillFlashKTileQ8Source = "pinned (config)";
     } else {
         throw std::runtime_error(
             "GpuOps: features.flashPrefillKTileQ8=" +
@@ -1136,6 +1140,198 @@ void GpuOps::attentionPrefillFlashAsync(const float*     q,
                         dim0,
                         static_cast<std::uint32_t>(T_q),
                         1);
+}
+
+void GpuOps::autotuneKTileQ8(runtime::UsmAllocator& allocator,
+                             std::size_t            nHeads,
+                             std::size_t            nKvHeads,
+                             std::size_t            headDim,
+                             runtime::KvDtype       kvDtype)
+{
+    // Precondition gates. When any of these trips, the K-tile pick made
+    // in the ctor stays in place and we just log why the bench skipped.
+    auto logSkip = [this](const char* why) {
+        MM_LOG_INFO("gpuops",
+                    "autotune ktile_q8: skipped ({}) — pick stays at {} "
+                    "({})",
+                    why, _prefillFlashKTileQ8,
+                    _prefillFlashKTileQ8Source);
+    };
+
+    if (_prefillFlashKTileQ8Configured != 0) {
+        logSkip("pinned via features.flashPrefillKTileQ8");
+        return;
+    }
+    if (_prefillFlashGqaQ8Disabled) {
+        _prefillFlashKTileQ8Source = "skipped (gqa_q8 disabled)";
+        logSkip("features.flashPrefillGqaQ8=false");
+        return;
+    }
+    if (kvDtype != runtime::KvDtype::Q8_0) {
+        _prefillFlashKTileQ8Source = "skipped (kvDtype != Q8_0)";
+        logSkip("kvDtype is not Q8_0");
+        return;
+    }
+    if (nHeads == 0 || nKvHeads == 0 || headDim == 0
+        || nHeads % nKvHeads != 0)
+    {
+        _prefillFlashKTileQ8Source = "skipped (bad model shape)";
+        logSkip("degenerate nHeads/nKvHeads/headDim");
+        return;
+    }
+    const std::size_t nQPerKv = nHeads / nKvHeads;
+    if (nQPerKv <= 1) {
+        _prefillFlashKTileQ8Source = "skipped (nQPerKv==1)";
+        logSkip("MHA shape, GQA kernel would not dispatch");
+        return;
+    }
+    if (nQPerKv > kFlashPrefillGqaMaxQPerKv) {
+        _prefillFlashKTileQ8Source = "skipped (nQPerKv > cap)";
+        logSkip("nQPerKv exceeds ATTN_FLASH_PREFILL_N_Q_PER_KV_MAX");
+        return;
+    }
+    if (headDim > kFlashMaxHeadDim) {
+        _prefillFlashKTileQ8Source = "skipped (headDim > cap)";
+        logSkip("headDim exceeds kFlashMaxHeadDim");
+        return;
+    }
+
+    // Bench shape. T_q=512 gives multi-tile at both variants (4 tiles at
+    // KTILE=128, 8 at KTILE=64), representative of the RAG-typical prompt
+    // range without pushing autotune startup cost above ~seconds.
+    constexpr std::size_t kBenchTq         = 512;
+    constexpr std::size_t kBlockElements   = 32;
+    constexpr std::size_t kBlockBytes      = 34;
+
+    const std::size_t kvDim         = nKvHeads * headDim;
+    const std::size_t qElems        = kBenchTq * nHeads * headDim;
+    const std::size_t oElems        = qElems;
+    const std::size_t nBlocksPerRow = kvDim / kBlockElements;
+    if (kvDim % kBlockElements != 0) {
+        _prefillFlashKTileQ8Source = "skipped (kvDim not Q8-aligned)";
+        logSkip("kvDim not a multiple of 32");
+        return;
+    }
+    const std::size_t rowBytes = nBlocksPerRow * kBlockBytes;
+    const std::size_t kvBytes  = kBenchTq * rowBytes;
+    const std::size_t qBytes   = qElems * sizeof(float);
+    const std::size_t oBytes   = oElems * sizeof(float);
+
+    // Allocate synthetic bench buffers. Freed at the end regardless of
+    // success/failure — no exceptions expected past this point.
+    void* qUsm = allocator.allocate(qBytes);
+    void* kUsm = allocator.allocate(kvBytes);
+    void* vUsm = allocator.allocate(kvBytes);
+    void* oUsm = allocator.allocate(oBytes);
+
+    // Fill Q with random floats. K/V generated in host RAM as floats,
+    // then encoded to Q8_0 (per-32-block absmax int8 + fp16 scale) so
+    // the packed kernel's dequant path sees byte-for-byte the same
+    // layout it would in real dispatches.
+    {
+        std::mt19937 rng{0xC0FFEEU};
+        std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
+        std::vector<float> qHost(qElems);
+        for (auto& x : qHost) x = dist(rng);
+        std::memcpy(qUsm, qHost.data(), qBytes);
+
+        std::vector<float>        rowScratch(kvDim);
+        std::vector<std::uint8_t> rowEncoded(rowBytes);
+        for (std::size_t t = 0; t < kBenchTq; ++t) {
+            for (auto& x : rowScratch) x = dist(rng);
+            quant::Q8_0::quantizeRow(rowScratch.data(),
+                                     kvDim, rowEncoded.data());
+            std::memcpy(static_cast<std::uint8_t*>(kUsm) + t * rowBytes,
+                        rowEncoded.data(), rowBytes);
+            for (auto& x : rowScratch) x = dist(rng);
+            quant::Q8_0::quantizeRow(rowScratch.data(),
+                                     kvDim, rowEncoded.data());
+            std::memcpy(static_cast<std::uint8_t*>(vUsm) + t * rowBytes,
+                        rowEncoded.data(), rowBytes);
+        }
+    }
+    std::memset(oUsm, 0, oBytes);
+
+    const float scale = 1.0F
+        / std::sqrt(static_cast<float>(headDim > 0 ? headDim : 1));
+
+    // Time one dispatch of the packed Q8_0 kernel for the given K-tile
+    // pin. Same launch geometry as attentionPrefillFlashAsync;
+    // positionOffset=0 and slidingWindow=0 keep the K-loop bounded by
+    // T_q so the timing is comparable across variants.
+    auto benchOnce = [&](std::size_t kTilePick) -> double {
+        _prefillFlashKTileQ8 = kTilePick;
+        using clk = std::chrono::steady_clock;
+        const auto t0 = clk::now();
+        attentionPrefillFlashAsync(static_cast<float*>(qUsm),
+                                   kUsm, vUsm,
+                                   kBenchTq, nHeads, nKvHeads, headDim,
+                                   /*positionOffset=*/0, scale,
+                                   static_cast<float*>(oUsm),
+                                   /*slidingWindow=*/0,
+                                   runtime::KvDtype::Q8_0);
+        _queue.flush();
+        const auto t1 = clk::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count();
+    };
+
+    auto medianOf = [](std::vector<double> xs) {
+        std::sort(xs.begin(), xs.end());
+        const std::size_t mid = xs.size() / 2;
+        return xs.size() % 2 == 1
+            ? xs[mid]
+            : 0.5 * (xs[mid - 1] + xs[mid]);
+    };
+
+    constexpr int nWarmup = 2;
+    constexpr int nTimed  = 5;
+
+    std::array<std::size_t, 2> kTileCandidates = {128, 64};
+    std::array<double, 2>      kTileMedians{};
+
+    try {
+        for (std::size_t ci = 0; ci < kTileCandidates.size(); ++ci) {
+            const std::size_t kTile = kTileCandidates[ci];
+            for (int i = 0; i < nWarmup; ++i) {
+                (void)benchOnce(kTile);
+            }
+            std::vector<double> samples;
+            samples.reserve(nTimed);
+            for (int i = 0; i < nTimed; ++i) {
+                samples.push_back(benchOnce(kTile));
+            }
+            kTileMedians[ci] = medianOf(std::move(samples));
+        }
+    } catch (const std::exception& e) {
+        MM_LOG_WARN("gpuops",
+                    "autotune ktile_q8: bench threw ({}) — falling back "
+                    "to KTILE=128", e.what());
+        _prefillFlashKTileQ8       = 128;
+        _prefillFlashKTileQ8Source = "bench_failed";
+        allocator.deallocate(qUsm, qBytes);
+        allocator.deallocate(kUsm, kvBytes);
+        allocator.deallocate(vUsm, kvBytes);
+        allocator.deallocate(oUsm, oBytes);
+        return;
+    }
+
+    allocator.deallocate(qUsm, qBytes);
+    allocator.deallocate(kUsm, kvBytes);
+    allocator.deallocate(vUsm, kvBytes);
+    allocator.deallocate(oUsm, oBytes);
+
+    const std::size_t winner =
+        (kTileMedians[1] < kTileMedians[0]) ? kTileCandidates[1]
+                                            : kTileCandidates[0];
+    _prefillFlashKTileQ8       = winner;
+    _prefillFlashKTileQ8Source = "bench";
+
+    MM_LOG_INFO("gpuops",
+                "autotune ktile_q8: T_q={} nHeads={} nKvHeads={} "
+                "headDim={} kv=Q8_0 — median ms KTILE=128:{:.3f} "
+                "KTILE=64:{:.3f} → picked KTILE={}",
+                kBenchTq, nHeads, nKvHeads, headDim,
+                kTileMedians[0], kTileMedians[1], winner);
 }
 
 void GpuOps::attentionDecodeFlashAsync(const float*     q,

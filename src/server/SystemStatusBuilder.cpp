@@ -457,9 +457,11 @@ json SystemStatusBuilder::buildKernelsBlock() const {
     // engine sees them post-config. Lets an operator verify a config
     // change actually took effect without diffing the startup log.
     body["prefill_flash"] = json{
-        {"enabled",        _engine.gpuOps().prefillFlashEnabled()},
-        {"gqa_q8_enabled", _engine.gpuOps().prefillFlashGqaQ8Enabled()},
-        {"k_tile_q8",      _engine.gpuOps().prefillFlashKTileQ8()},
+        {"enabled",           _engine.gpuOps().prefillFlashEnabled()},
+        {"gqa_q8_enabled",    _engine.gpuOps().prefillFlashGqaQ8Enabled()},
+        {"k_tile_q8",         _engine.gpuOps().prefillFlashKTileQ8()},
+        {"k_tile_q8_source",  std::string{
+            _engine.gpuOps().prefillFlashKTileQ8Source()}},
     };
 
     return body;

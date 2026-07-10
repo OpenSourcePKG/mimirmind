@@ -289,6 +289,23 @@ public:
     [[nodiscard]] std::size_t prefillFlashKTileQ8() const noexcept {
         return _prefillFlashKTileQ8;
     }
+    [[nodiscard]] std::string_view prefillFlashKTileQ8Source() const noexcept {
+        return _prefillFlashKTileQ8Source;
+    }
+
+    /// Post-model-load K-tile bench. Called from InferenceEngine once
+    /// model dims are known. When `features.flashPrefillKTileQ8 == 0`
+    /// (autotune requested) AND the model has a GQA shape (nQPerKv > 1)
+    /// AND kvDtype is Q8_0, run both KTILE=64 and KTILE=128 variants
+    /// against synthetic Q8_0 K/V at the model's actual head geometry,
+    /// pin the winner in `_prefillFlashKTileQ8`, and update
+    /// `_prefillFlashKTileQ8Source`. When any precondition fails, log
+    /// why and leave the ctor-time value in place.
+    void autotuneKTileQ8(runtime::UsmAllocator& allocator,
+                         std::size_t            nHeads,
+                         std::size_t            nKvHeads,
+                         std::size_t            headDim,
+                         runtime::KvDtype       kvDtype);
 
     /// Test-only. Flips the runtime rollback of the GQA-head-packed
     /// Q8_0 prefill kernel. Callers must not depend on this in
@@ -585,11 +602,19 @@ private:
     // kernel even for GQA-shaped models.
     bool                   _prefillFlashGqaQ8Disabled{false};
 
-    // K-tile size the packed Q8_0 kernel dispatch will use. Set at ctor
-    // from features.flashPrefillKTileQ8; value 0 (autotune) is not yet
-    // reconstructed and gets resolved to 128 with a startup warning.
-    // Valid post-resolution: {64, 128}.
+    // K-tile size the packed Q8_0 kernel dispatch will use.
+    // `_prefillFlashKTileQ8Configured` = raw config value {0, 64, 128}
+    // stored so autotuneKTileQ8 can tell whether the operator asked for
+    // autotune (0) or an explicit pin. `_prefillFlashKTileQ8` = resolved
+    // active pick used by the dispatcher; equals the configured value
+    // when pinned, or the autotune winner (64 or 128) after
+    // autotuneKTileQ8 runs. Between ctor and autotune the resolved
+    // value falls back to 128 silently — dispatch is safe from the
+    // first request.
+    std::size_t            _prefillFlashKTileQ8Configured{128};
     std::size_t            _prefillFlashKTileQ8{128};
+    // "pinned (config)" | "pending (autotune)" | "bench" | "skipped (no GQA)"
+    std::string            _prefillFlashKTileQ8Source{"pinned (config)"};
 
     static constexpr std::uint32_t kRmsnormLocalSize     = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;
