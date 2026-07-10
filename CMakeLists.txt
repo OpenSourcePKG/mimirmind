@@ -149,6 +149,38 @@ foreach(src IN LISTS KERNEL_SOURCES)
     list(APPEND KERNEL_SPV_FILES ${spv})
 endforeach()
 
+# Second build of attention_prefill_flash_q8_0_gqa.cl with a smaller
+# K-tile. Same source, ocloc gets `-D ATTN_FLASH_PREFILL_KTILE=64` so
+# the `#ifndef` in the kernel picks up the override. We copy the source
+# to a distinct basename first because ocloc's -output_no_suffix names
+# the SPV after the input basename — that lets both variants coexist
+# in the same spv/ directory. Dispatch picks at runtime via
+# `features.flashPrefillKTileQ8` in config.json.
+set(GQA_KTILE64_CL  ${CMAKE_CURRENT_BINARY_DIR}/attention_prefill_flash_q8_0_gqa_ktile64.cl)
+set(GQA_KTILE64_SPV ${SPV_OUTPUT_DIR}/attention_prefill_flash_q8_0_gqa_ktile64.spv)
+add_custom_command(
+    OUTPUT ${GQA_KTILE64_CL}
+    COMMAND ${CMAKE_COMMAND} -E copy
+            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/attention_prefill_flash_q8_0_gqa.cl
+            ${GQA_KTILE64_CL}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/attention_prefill_flash_q8_0_gqa.cl
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT ${GQA_KTILE64_SPV}
+    COMMAND ${OCLOC_EXECUTABLE} compile
+            -file ${GQA_KTILE64_CL}
+            -options "-cl-std=CL3.0 -D ATTN_FLASH_PREFILL_KTILE=64"
+            -spv_only
+            -output_no_suffix
+            -out_dir ${SPV_OUTPUT_DIR}
+    DEPENDS ${GQA_KTILE64_CL}
+    WORKING_DIRECTORY ${SPV_OUTPUT_DIR}
+    COMMENT "ocloc -> attention_prefill_flash_q8_0_gqa_ktile64.spv (KTILE=64)"
+    VERBATIM
+)
+list(APPEND KERNEL_SPV_FILES ${GQA_KTILE64_SPV})
+
 add_custom_target(spv_kernels ALL DEPENDS ${KERNEL_SPV_FILES})
 
 # ---- Targets ----------------------------------------------------------------

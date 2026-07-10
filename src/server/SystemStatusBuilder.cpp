@@ -459,6 +459,7 @@ json SystemStatusBuilder::buildKernelsBlock() const {
     body["prefill_flash"] = json{
         {"enabled",        _engine.gpuOps().prefillFlashEnabled()},
         {"gqa_q8_enabled", _engine.gpuOps().prefillFlashGqaQ8Enabled()},
+        {"k_tile_q8",      _engine.gpuOps().prefillFlashKTileQ8()},
     };
 
     return body;

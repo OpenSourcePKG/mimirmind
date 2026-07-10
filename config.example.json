@@ -29,6 +29,7 @@
     "clr": true,
     "flashPrefill": true,
     "flashPrefillGqaQ8": true,
+    "flashPrefillKTileQ8": 128,
     "fusedQkv": true,
     "moeGroup": true,
     "gemm": "auto",

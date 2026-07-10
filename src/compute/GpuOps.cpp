@@ -41,7 +41,8 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
                runtime::UsmAllocator& alloc,
                runtime::CommandQueue& queue,
                bool                   flashPrefillEnabled,
-               bool                   flashPrefillGqaQ8Enabled)
+               bool                   flashPrefillGqaQ8Enabled,
+               std::size_t            flashPrefillKTileQ8)
     : _ctx{ctx},
       _queue{queue},
       _alloc{alloc},
@@ -120,6 +121,11 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
       _attentionPrefillFlashQ8GqaKernel{
           _attentionPrefillFlashQ8GqaModule.kernel(
               "attention_prefill_flash_q8_0_gqa")},
+      _attentionPrefillFlashQ8GqaKtile64Module{
+          ctx, "attention_prefill_flash_q8_0_gqa_ktile64"},
+      _attentionPrefillFlashQ8GqaKtile64Kernel{
+          _attentionPrefillFlashQ8GqaKtile64Module.kernel(
+              "attention_prefill_flash_q8_0_gqa")},
       _scaledAddResidualModule    {ctx, "scaled_add_residual"},
       _scaledAddResidualKernel    {
           _scaledAddResidualModule.kernel("scaled_add_residual")},
@@ -155,8 +161,30 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
 
     // M5i.J: cache the prefill-flash rollback flag once at startup so the
     // dispatcher hot path stays branch-cheap.
-    _prefillFlashDisabled    = !flashPrefillEnabled;
+    _prefillFlashDisabled      = !flashPrefillEnabled;
     _prefillFlashGqaQ8Disabled = !flashPrefillGqaQ8Enabled;
+
+    // Resolve K-tile pick. 0 = autotune, which needs a bench loop that
+    // hasn't been reconstructed yet — fall back to 128 with a loud
+    // warning so operators know the pin is implicit. 64 / 128 pin
+    // directly. Any other value should have been rejected in
+    // Config.cpp parseFeatures; guard defensively.
+    if (flashPrefillKTileQ8 == 0) {
+        MM_LOG_WARN(
+            "gpuops",
+            "features.flashPrefillKTileQ8=0 (autotune) requested but the "
+            "K-tile autotune bench has not been reconstructed yet — "
+            "falling back to 128. Pin explicitly to silence this warning "
+            "or wait for the follow-up commit.");
+        _prefillFlashKTileQ8 = 128;
+    } else if (flashPrefillKTileQ8 == 64 || flashPrefillKTileQ8 == 128) {
+        _prefillFlashKTileQ8 = flashPrefillKTileQ8;
+    } else {
+        throw std::runtime_error(
+            "GpuOps: features.flashPrefillKTileQ8=" +
+            std::to_string(flashPrefillKTileQ8) +
+            " unexpected — Config.cpp parser should have rejected this");
+    }
 
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
@@ -171,18 +199,20 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
                 "attention_q8_0/attention_flash_partial_q8_0/"
                 "attention_prefill_flash_q8_0/"
                 "attention_prefill_flash_q8_0_gqa/"
+                "attention_prefill_flash_q8_0_gqa_ktile64/"
                 "scaled_add_residual/qkv_split/x_quant_i8 loaded "
                 "(rms local={}, elementwise local={}, rope local={}, "
                 "attention local={}, attention max T_k={}, flash kTile={}, "
                 "flash maxHeads={}, flash maxHeadDim={}, "
                 "flash partial scratch={} bytes, prefill_flash={}, "
-                "prefill_flash_gqa_q8={})",
+                "prefill_flash_gqa_q8={}, prefill_flash_ktile_q8={})",
                 kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize,
                 kAttentionLocalSize, kAttentionMaxTk,
                 kFlashKTileSize, kFlashMaxHeads, kFlashMaxHeadDim,
                 _flashPartialBytes,
-                _prefillFlashDisabled    ? "disabled (config)" : "enabled",
-                _prefillFlashGqaQ8Disabled ? "disabled (config)" : "enabled");
+                _prefillFlashDisabled      ? "disabled (config)" : "enabled",
+                _prefillFlashGqaQ8Disabled ? "disabled (config)" : "enabled",
+                _prefillFlashKTileQ8);
 }
 
 GpuOps::~GpuOps() {
@@ -1064,8 +1094,17 @@ void GpuOps::attentionPrefillFlashAsync(const float*     q,
     if (kvDtype == runtime::KvDtype::FP16) {
         kernelPtr = &_attentionPrefillFlashFp16Kernel;
     } else if (kvDtype == runtime::KvDtype::Q8_0) {
-        kernelPtr = useQ8Gqa ? &_attentionPrefillFlashQ8GqaKernel
-                             : &_attentionPrefillFlashQ8Kernel;
+        if (useQ8Gqa) {
+            // K-tile pick: 64 → smaller-SLM variant (higher occupancy on
+            // heavy per-Q-head register pressure); 128 → default M5i.J
+            // streaming amortisation. Any other value would have been
+            // resolved / rejected in the ctor.
+            kernelPtr = (_prefillFlashKTileQ8 == 64)
+                ? &_attentionPrefillFlashQ8GqaKtile64Kernel
+                : &_attentionPrefillFlashQ8GqaKernel;
+        } else {
+            kernelPtr = &_attentionPrefillFlashQ8Kernel;
+        }
     }
     runtime::GpuKernel& kernel = *kernelPtr;
     *_curLenSlotUsm =

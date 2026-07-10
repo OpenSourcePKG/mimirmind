@@ -229,12 +229,21 @@ FeatureSettings parseFeatures(std::string_view      path,
                               const nlohmann::json& j) {
     checkKnownKeys(path, "features", j,
                    {"clr", "flashPrefill", "flashPrefillGqaQ8",
+                    "flashPrefillKTileQ8",
                     "fusedQkv", "moeGroup",
                     "gemm", "gemmV2", "gemmMinM", "dp4a"});
     FeatureSettings f{};
     if (const auto v = readOpt<bool>(path, "features", j, "clr");               v) f.clr               = *v;
     if (const auto v = readOpt<bool>(path, "features", j, "flashPrefill");      v) f.flashPrefill      = *v;
     if (const auto v = readOpt<bool>(path, "features", j, "flashPrefillGqaQ8"); v) f.flashPrefillGqaQ8 = *v;
+    if (const auto v = readOpt<std::size_t>(path, "features", j, "flashPrefillKTileQ8"); v) {
+        if (*v != 0 && *v != 64 && *v != 128) {
+            fail(path,
+                 "features.flashPrefillKTileQ8 must be 0 (autotune), 64, "
+                 "or 128 (got " + std::to_string(*v) + ")");
+        }
+        f.flashPrefillKTileQ8 = *v;
+    }
     if (const auto v = readOpt<bool>(path, "features", j, "fusedQkv");          v) f.fusedQkv          = *v;
     if (const auto v = readOpt<bool>(path, "features", j, "moeGroup");     v) f.moeGroup     = *v;
     if (const auto v = readOpt<bool>(path, "features", j, "gemmV2");       v) f.gemmV2       = *v;

@@ -64,6 +64,16 @@ struct FeatureSettings {
     // the packed variant regresses on a given host. Suffix ties the flag
     // to the Q8_0-specific kernel; future dtype variants get their own.
     bool                       flashPrefillGqaQ8{true};
+    // K-tile size baked into the Q8_0 GQA prefill kernel. Compile-time
+    // constant in the .cl source; a second SPV is built alongside the
+    // default with `-D ATTN_FLASH_PREFILL_KTILE=64`. Runtime picks
+    // between the two based on this value. Valid: {0, 64, 128}.
+    //   0   — autotune (pick per host at startup). NOT YET RECONSTRUCTED
+    //         — the plumbing exists but the bench loop is a follow-up.
+    //         Falls back to 128 for now with a startup log warning.
+    //   64  — pin to KTILE=64 variant.
+    //   128 — pin to KTILE=128 variant (M5i.J default).
+    std::size_t                flashPrefillKTileQ8{128};
     bool                       fusedQkv{true};
     bool                       moeGroup{true};
     TriState                   gemm{TriState::Auto};

@@ -37,8 +37,9 @@ public:
     GpuOps(runtime::L0Context&    ctx,
            runtime::UsmAllocator& alloc,
            runtime::CommandQueue& queue,
-           bool                   flashPrefillEnabled    = true,
-           bool                   flashPrefillGqaQ8Enabled = true);
+           bool                   flashPrefillEnabled      = true,
+           bool                   flashPrefillGqaQ8Enabled = true,
+           std::size_t            flashPrefillKTileQ8      = 128);
     ~GpuOps();
 
     GpuOps(const GpuOps&)            = delete;
@@ -285,6 +286,9 @@ public:
     [[nodiscard]] bool prefillFlashGqaQ8Enabled() const noexcept {
         return !_prefillFlashGqaQ8Disabled;
     }
+    [[nodiscard]] std::size_t prefillFlashKTileQ8() const noexcept {
+        return _prefillFlashKTileQ8;
+    }
 
     /// Test-only. Flips the runtime rollback of the GQA-head-packed
     /// Q8_0 prefill kernel. Callers must not depend on this in
@@ -293,6 +297,12 @@ public:
     /// the packed variant without instantiating two GpuOps.
     void setPrefillFlashGqaQ8DisabledForTest(bool disabled) noexcept {
         _prefillFlashGqaQ8Disabled = disabled;
+    }
+    /// Test-only. Pin the K-tile variant of the packed Q8_0 kernel.
+    /// Valid: {64, 128}. Parity tests use this to exercise both SPVs
+    /// without instantiating two GpuOps.
+    void setPrefillFlashKTileQ8ForTest(std::size_t kTile) noexcept {
+        _prefillFlashKTileQ8 = kTile;
     }
 
     /// Multi-head GQA causal attention on the GPU. Layout-equivalent to
@@ -515,6 +525,13 @@ private:
     runtime::GpuModule     _attentionPrefillFlashQ8GqaModule;
     runtime::GpuKernel     _attentionPrefillFlashQ8GqaKernel;
 
+    // KTILE=64 variant of the packed kernel. Same .cl source, built by
+    // CMake with -D ATTN_FLASH_PREFILL_KTILE=64. Loaded unconditionally
+    // so features.flashPrefillKTileQ8 can flip between the two at
+    // runtime without a rebuild.
+    runtime::GpuModule     _attentionPrefillFlashQ8GqaKtile64Module;
+    runtime::GpuKernel     _attentionPrefillFlashQ8GqaKtile64Kernel;
+
     runtime::GpuModule     _scaledAddResidualModule;
     runtime::GpuKernel     _scaledAddResidualKernel;
 
@@ -567,6 +584,12 @@ private:
     // When true, the Q8_0 prefill path stays on the plain per-Q-head
     // kernel even for GQA-shaped models.
     bool                   _prefillFlashGqaQ8Disabled{false};
+
+    // K-tile size the packed Q8_0 kernel dispatch will use. Set at ctor
+    // from features.flashPrefillKTileQ8; value 0 (autotune) is not yet
+    // reconstructed and gets resolved to 128 with a startup warning.
+    // Valid post-resolution: {64, 128}.
+    std::size_t            _prefillFlashKTileQ8{128};
 
     static constexpr std::uint32_t kRmsnormLocalSize     = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;
