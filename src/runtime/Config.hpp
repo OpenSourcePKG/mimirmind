@@ -61,8 +61,9 @@ struct FeatureSettings {
     bool                       flashPrefill{true};
     // Independent rollback for the GQA-head-packed Q8_0 prefill kernel.
     // Set to false to fall back to the plain per-Q-head Q8_0 kernel when
-    // the packed variant regresses on a given host.
-    bool                       flashPrefillGqa{true};
+    // the packed variant regresses on a given host. Suffix ties the flag
+    // to the Q8_0-specific kernel; future dtype variants get their own.
+    bool                       flashPrefillGqaQ8{true};
     bool                       fusedQkv{true};
     bool                       moeGroup{true};
     TriState                   gemm{TriState::Auto};

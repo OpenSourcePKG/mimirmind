@@ -38,7 +38,7 @@ public:
            runtime::UsmAllocator& alloc,
            runtime::CommandQueue& queue,
            bool                   flashPrefillEnabled    = true,
-           bool                   flashPrefillGqaEnabled = true);
+           bool                   flashPrefillGqaQ8Enabled = true);
     ~GpuOps();
 
     GpuOps(const GpuOps&)            = delete;
@@ -276,14 +276,14 @@ public:
     }
 
     /// Runtime rollback states cached at construction from
-    /// features.flashPrefill / features.flashPrefillGqa. Surfaced via
+    /// features.flashPrefill / features.flashPrefillGqaQ8. Surfaced via
     /// /v1/system/status.kernels.prefill_flash so an operator can
     /// verify the deployed config took effect without reading logs.
     [[nodiscard]] bool prefillFlashEnabled() const noexcept {
         return !_prefillFlashDisabled;
     }
-    [[nodiscard]] bool prefillFlashGqaEnabled() const noexcept {
-        return !_prefillFlashGqaDisabled;
+    [[nodiscard]] bool prefillFlashGqaQ8Enabled() const noexcept {
+        return !_prefillFlashGqaQ8Disabled;
     }
 
     /// Test-only. Flips the runtime rollback of the GQA-head-packed
@@ -291,8 +291,8 @@ public:
     /// production paths — the ctor-time toggle is authoritative.
     /// Exposed so parity tests can pin either the plain per-Q-head or
     /// the packed variant without instantiating two GpuOps.
-    void setPrefillFlashGqaDisabledForTest(bool disabled) noexcept {
-        _prefillFlashGqaDisabled = disabled;
+    void setPrefillFlashGqaQ8DisabledForTest(bool disabled) noexcept {
+        _prefillFlashGqaQ8Disabled = disabled;
     }
 
     /// Multi-head GQA causal attention on the GPU. Layout-equivalent to
@@ -509,7 +509,7 @@ private:
     // workgroup handles ALL Q-heads of a KV-group at a query position
     // so the K/V dequant path is amortised across (nHeads / nKvHeads)
     // heads. Selected in attentionPrefillFlashAsync when
-    // (kvDtype == Q8_0) && (nQPerKv > 1) && !_prefillFlashGqaDisabled
+    // (kvDtype == Q8_0) && (nQPerKv > 1) && !_prefillFlashGqaQ8Disabled
     // && nQPerKv <= kFlashPrefillGqaMaxQPerKv; otherwise the plain
     // per-Q-head Q8_0 kernel above stays in charge.
     runtime::GpuModule     _attentionPrefillFlashQ8GqaModule;
@@ -563,10 +563,10 @@ private:
     bool                   _prefillFlashDisabled{false};
 
     // Independent rollback for the R1 GQA-head-packed Q8_0 prefill
-    // kernel via `features.flashPrefillGqa=false`. Cached at ctor time.
+    // kernel via `features.flashPrefillGqaQ8=false`. Cached at ctor time.
     // When true, the Q8_0 prefill path stays on the plain per-Q-head
     // kernel even for GQA-shaped models.
-    bool                   _prefillFlashGqaDisabled{false};
+    bool                   _prefillFlashGqaQ8Disabled{false};
 
     static constexpr std::uint32_t kRmsnormLocalSize     = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;

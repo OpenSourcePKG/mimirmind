@@ -41,7 +41,7 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
                runtime::UsmAllocator& alloc,
                runtime::CommandQueue& queue,
                bool                   flashPrefillEnabled,
-               bool                   flashPrefillGqaEnabled)
+               bool                   flashPrefillGqaQ8Enabled)
     : _ctx{ctx},
       _queue{queue},
       _alloc{alloc},
@@ -156,7 +156,7 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
     // M5i.J: cache the prefill-flash rollback flag once at startup so the
     // dispatcher hot path stays branch-cheap.
     _prefillFlashDisabled    = !flashPrefillEnabled;
-    _prefillFlashGqaDisabled = !flashPrefillGqaEnabled;
+    _prefillFlashGqaQ8Disabled = !flashPrefillGqaQ8Enabled;
 
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
@@ -176,13 +176,13 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
                 "attention local={}, attention max T_k={}, flash kTile={}, "
                 "flash maxHeads={}, flash maxHeadDim={}, "
                 "flash partial scratch={} bytes, prefill_flash={}, "
-                "prefill_flash_gqa={})",
+                "prefill_flash_gqa_q8={})",
                 kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize,
                 kAttentionLocalSize, kAttentionMaxTk,
                 kFlashKTileSize, kFlashMaxHeads, kFlashMaxHeadDim,
                 _flashPartialBytes,
                 _prefillFlashDisabled    ? "disabled (config)" : "enabled",
-                _prefillFlashGqaDisabled ? "disabled (config)" : "enabled");
+                _prefillFlashGqaQ8Disabled ? "disabled (config)" : "enabled");
 }
 
 GpuOps::~GpuOps() {
@@ -1048,7 +1048,7 @@ void GpuOps::attentionPrefillFlashAsync(const float*     q,
     // caller signals FP16 storage.
     // M10.2 Phase 1a Commit 4 — Q8_0 variant dispatch.
     // R1 — under Q8_0 with a GQA-shaped model (nQPerKv > 1), route to
-    // the head-packed kernel unless features.flashPrefillGqa is off or
+    // the head-packed kernel unless features.flashPrefillGqaQ8 is off or
     // nQPerKv exceeds the packed kernel's compile-time cap. The packed
     // kernel launches on the KV-head grid (nKvHeads, T_q) instead of
     // (nHeads, T_q) — every K/V dequant load is reused across the
@@ -1056,7 +1056,7 @@ void GpuOps::attentionPrefillFlashAsync(const float*     q,
     const std::size_t nQPerKv = nHeads / nKvHeads;
     const bool useQ8Gqa =
         (kvDtype == runtime::KvDtype::Q8_0) &&
-        !_prefillFlashGqaDisabled &&
+        !_prefillFlashGqaQ8Disabled &&
         (nQPerKv > 1) &&
         (nQPerKv <= kFlashPrefillGqaMaxQPerKv);
 

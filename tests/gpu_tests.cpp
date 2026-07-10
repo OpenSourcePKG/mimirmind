@@ -1577,7 +1577,7 @@ TEST(attention_prefill_flash_q8_0_parity_swa) {
 // runAttentionQ8Parity dispatches through attentionAsync, which picks
 // the GQA kernel automatically for (Q8_0, nQPerKv > 1). Tests below
 // exercise the auto-selected packed kernel; the final "plain_forced"
-// case flips features.flashPrefillGqa off at runtime so the plain
+// case flips features.flashPrefillGqaQ8 off at runtime so the plain
 // Q8_0 kernel keeps parity coverage even now that GQA-shaped tests
 // route around it by default.
 
@@ -1586,17 +1586,17 @@ namespace {
 // RAII: flip the GQA rollback flag for the duration of a test case,
 // restore in the destructor. Keeps the fixture-wide GpuOps state
 // consistent across tests regardless of failure paths.
-class ScopedPrefillFlashGqaDisabled {
+class ScopedPrefillFlashGqaQ8Disabled {
 public:
-    explicit ScopedPrefillFlashGqaDisabled(bool disabled)
-        : _prev{!fx().ops.prefillFlashGqaEnabled()} {
-        fx().ops.setPrefillFlashGqaDisabledForTest(disabled);
+    explicit ScopedPrefillFlashGqaQ8Disabled(bool disabled)
+        : _prev{!fx().ops.prefillFlashGqaQ8Enabled()} {
+        fx().ops.setPrefillFlashGqaQ8DisabledForTest(disabled);
     }
-    ~ScopedPrefillFlashGqaDisabled() {
-        fx().ops.setPrefillFlashGqaDisabledForTest(_prev);
+    ~ScopedPrefillFlashGqaQ8Disabled() {
+        fx().ops.setPrefillFlashGqaQ8DisabledForTest(_prev);
     }
-    ScopedPrefillFlashGqaDisabled(const ScopedPrefillFlashGqaDisabled&) = delete;
-    ScopedPrefillFlashGqaDisabled& operator=(const ScopedPrefillFlashGqaDisabled&) = delete;
+    ScopedPrefillFlashGqaQ8Disabled(const ScopedPrefillFlashGqaQ8Disabled&) = delete;
+    ScopedPrefillFlashGqaQ8Disabled& operator=(const ScopedPrefillFlashGqaQ8Disabled&) = delete;
 private:
     bool _prev;
 };
@@ -1698,10 +1698,10 @@ TEST(attention_prefill_flash_q8_0_gqa_positionOffset) {
 TEST(attention_prefill_flash_q8_0_plain_path_forced) {
     // Regression guard for the plain per-Q-head kernel now that the
     // dispatcher routes GQA shapes to the packed variant by default.
-    // Force features.flashPrefillGqa=false for this case so the plain
+    // Force features.flashPrefillGqaQ8=false for this case so the plain
     // Q8_0 kernel keeps a parity gate against the F32 baseline even
     // when nQPerKv > 1.
-    ScopedPrefillFlashGqaDisabled disable{true};
+    ScopedPrefillFlashGqaQ8Disabled disable{true};
     runAttentionQ8Parity("attn_prefill_flash_q8_0_plain_forced_gqa4",
                          /*T_q=*/256, /*T_k=*/256,
                          /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,

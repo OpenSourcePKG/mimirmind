@@ -453,12 +453,12 @@ json SystemStatusBuilder::buildKernelsBlock() const {
     body["selftest"] = std::string{_engine.gpuOps().selfTestStatus()};
 
     // Prefill-flash rollback surface — reports the two independent
-    // toggles (features.flashPrefill, features.flashPrefillGqa) as the
+    // toggles (features.flashPrefill, features.flashPrefillGqaQ8) as the
     // engine sees them post-config. Lets an operator verify a config
     // change actually took effect without diffing the startup log.
     body["prefill_flash"] = json{
-        {"enabled",     _engine.gpuOps().prefillFlashEnabled()},
-        {"gqa_enabled", _engine.gpuOps().prefillFlashGqaEnabled()},
+        {"enabled",        _engine.gpuOps().prefillFlashEnabled()},
+        {"gqa_q8_enabled", _engine.gpuOps().prefillFlashGqaQ8Enabled()},
     };
 
     return body;

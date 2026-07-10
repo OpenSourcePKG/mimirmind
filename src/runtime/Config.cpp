@@ -228,14 +228,14 @@ ServerSettings parseServer(std::string_view      path,
 FeatureSettings parseFeatures(std::string_view      path,
                               const nlohmann::json& j) {
     checkKnownKeys(path, "features", j,
-                   {"clr", "flashPrefill", "flashPrefillGqa",
+                   {"clr", "flashPrefill", "flashPrefillGqaQ8",
                     "fusedQkv", "moeGroup",
                     "gemm", "gemmV2", "gemmMinM", "dp4a"});
     FeatureSettings f{};
-    if (const auto v = readOpt<bool>(path, "features", j, "clr");             v) f.clr             = *v;
-    if (const auto v = readOpt<bool>(path, "features", j, "flashPrefill");    v) f.flashPrefill    = *v;
-    if (const auto v = readOpt<bool>(path, "features", j, "flashPrefillGqa"); v) f.flashPrefillGqa = *v;
-    if (const auto v = readOpt<bool>(path, "features", j, "fusedQkv");        v) f.fusedQkv        = *v;
+    if (const auto v = readOpt<bool>(path, "features", j, "clr");               v) f.clr               = *v;
+    if (const auto v = readOpt<bool>(path, "features", j, "flashPrefill");      v) f.flashPrefill      = *v;
+    if (const auto v = readOpt<bool>(path, "features", j, "flashPrefillGqaQ8"); v) f.flashPrefillGqaQ8 = *v;
+    if (const auto v = readOpt<bool>(path, "features", j, "fusedQkv");          v) f.fusedQkv          = *v;
     if (const auto v = readOpt<bool>(path, "features", j, "moeGroup");     v) f.moeGroup     = *v;
     if (const auto v = readOpt<bool>(path, "features", j, "gemmV2");       v) f.gemmV2       = *v;
     f.gemm     = parseTriState(path, "features", j, "gemm",  TriState::Auto);
