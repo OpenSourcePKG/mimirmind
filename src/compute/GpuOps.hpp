@@ -37,7 +37,8 @@ public:
     GpuOps(runtime::L0Context&    ctx,
            runtime::UsmAllocator& alloc,
            runtime::CommandQueue& queue,
-           bool                   flashPrefillEnabled = true);
+           bool                   flashPrefillEnabled    = true,
+           bool                   flashPrefillGqaEnabled = true);
     ~GpuOps();
 
     GpuOps(const GpuOps&)            = delete;
@@ -274,6 +275,17 @@ public:
         return _selfTestStatus;
     }
 
+    /// Runtime rollback states cached at construction from
+    /// features.flashPrefill / features.flashPrefillGqa. Surfaced via
+    /// /v1/system/status.kernels.prefill_flash so an operator can
+    /// verify the deployed config took effect without reading logs.
+    [[nodiscard]] bool prefillFlashEnabled() const noexcept {
+        return !_prefillFlashDisabled;
+    }
+    [[nodiscard]] bool prefillFlashGqaEnabled() const noexcept {
+        return !_prefillFlashGqaDisabled;
+    }
+
     /// Multi-head GQA causal attention on the GPU. Layout-equivalent to
     /// compute::multiHeadAttention. q/k/v/out are all f32 USM:
     ///   q   [T_q, nHeads,    headDim]
@@ -484,6 +496,16 @@ private:
     runtime::GpuModule     _attentionPrefillFlashQ8Module;
     runtime::GpuKernel     _attentionPrefillFlashQ8Kernel;
 
+    // R1 — GQA-head-packed variant of the Q8_0 prefill kernel. One
+    // workgroup handles ALL Q-heads of a KV-group at a query position
+    // so the K/V dequant path is amortised across (nHeads / nKvHeads)
+    // heads. Selected in attentionPrefillFlashAsync when
+    // (kvDtype == Q8_0) && (nQPerKv > 1) && !_prefillFlashGqaDisabled
+    // && nQPerKv <= kFlashPrefillGqaMaxQPerKv; otherwise the plain
+    // per-Q-head Q8_0 kernel above stays in charge.
+    runtime::GpuModule     _attentionPrefillFlashQ8GqaModule;
+    runtime::GpuKernel     _attentionPrefillFlashQ8GqaKernel;
+
     runtime::GpuModule     _scaledAddResidualModule;
     runtime::GpuKernel     _scaledAddResidualKernel;
 
@@ -531,6 +553,12 @@ private:
     // attention.cl variant (a).
     bool                   _prefillFlashDisabled{false};
 
+    // Independent rollback for the R1 GQA-head-packed Q8_0 prefill
+    // kernel via `features.flashPrefillGqa=false`. Cached at ctor time.
+    // When true, the Q8_0 prefill path stays on the plain per-Q-head
+    // kernel even for GQA-shaped models.
+    bool                   _prefillFlashGqaDisabled{false};
+
     static constexpr std::uint32_t kRmsnormLocalSize     = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;
     static constexpr std::uint32_t kRopeLocalSize        = 256;
@@ -550,6 +578,11 @@ private:
     // Bumping these only costs the static USM allocation size below.
     static constexpr std::size_t kFlashMaxHeads     = 64;
     static constexpr std::size_t kFlashMaxHeadDim   = 512;
+    // Must match ATTN_FLASH_PREFILL_N_Q_PER_KV_MAX in
+    // kernels/attention_prefill_flash_q8_0_gqa.cl. Bounds the per-Q-head
+    // register-array + SLM allocation inside the packed kernel. Dispatch
+    // falls back to the plain Q8_0 kernel when nQPerKv exceeds this.
+    static constexpr std::size_t kFlashPrefillGqaMaxQPerKv = 8;
 
     // Internal dispatch — variant (a) for T_q > 1 when the flash-prefill
     // path is disabled or unsupported, single-WG streaming FlashAttention

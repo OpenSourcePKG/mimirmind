@@ -101,8 +101,10 @@ No exceptions across the Level Zero boundary. Trivially auditable.
 
 ## Try it
 
-A built image lives at `mimirmind:latest`. On
-a host with an Intel iGPU and a Q-quantised Gemma 4 or Qwen GGUF:
+On a host with an Intel iGPU and a Q-quantised Gemma 4 or Qwen GGUF,
+either build the image locally (`docker compose build`) or point
+`MIMIRMIND_IMAGE` at a pre-built image in your own registry. The
+compose file defaults to `mimirmind:latest`.
 
 ```bash
 # Copy the example config and edit it for your host — model path,
@@ -113,6 +115,8 @@ $EDITOR config.json
 # Point the compose at the models dir + your config, then start.
 export MIMIRMIND_MODELS_DIR=/path/to/your/ggufs
 export MIMIRMIND_CONFIG_HOST=$PWD/config.json
+# Optional: pull from your own registry instead of the default local tag.
+# export MIMIRMIND_IMAGE=your-registry.example/mimirmind:latest
 docker compose -f docker-compose.server.yml up -d
 ```
 

@@ -83,8 +83,9 @@ for `docker-compose.server.yml`.
 
 Configuration lives in two places:
 
-- `.env` — only the container-level knobs: image tag, models directory
-  bind-mount, host GIDs. Every runtime setting moved into `config.json`.
+- `.env` — only the container-level knobs: image reference, models
+  directory bind-mount, host GIDs. Every runtime setting moved into
+  `config.json`.
 - `config.json` — every runtime knob (model path, port, KV dtype, thermal
   profile, feature flags, log level and file, USM probe cap, …). Copy
   `config.example.json` to `config.dev.json` (gitignored) and edit;
@@ -93,7 +94,8 @@ Configuration lives in two places:
 `.env` example:
 
 ```dotenv
-MIMIRMIND_IMAGE_TAG=latest
+# Defaults to mimirmind:latest — override to pull from your own registry.
+MIMIRMIND_IMAGE=mimirmind:latest
 MIMIRMIND_MODELS_DIR=/srv/llm-models
 MIMIRMIND_RENDER_GID=104
 MIMIRMIND_VIDEO_GID=44

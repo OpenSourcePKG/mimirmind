@@ -40,7 +40,8 @@ std::uint32_t groupsForN(std::size_t n, std::uint32_t local) {
 GpuOps::GpuOps(runtime::L0Context&    ctx,
                runtime::UsmAllocator& alloc,
                runtime::CommandQueue& queue,
-               bool                   flashPrefillEnabled)
+               bool                   flashPrefillEnabled,
+               bool                   flashPrefillGqaEnabled)
     : _ctx{ctx},
       _queue{queue},
       _alloc{alloc},
@@ -114,6 +115,11 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
       _attentionPrefillFlashQ8Kernel  {
           _attentionPrefillFlashQ8Module.kernel(
               "attention_prefill_flash_q8_0")},
+      _attentionPrefillFlashQ8GqaModule{
+          ctx, "attention_prefill_flash_q8_0_gqa"},
+      _attentionPrefillFlashQ8GqaKernel{
+          _attentionPrefillFlashQ8GqaModule.kernel(
+              "attention_prefill_flash_q8_0_gqa")},
       _scaledAddResidualModule    {ctx, "scaled_add_residual"},
       _scaledAddResidualKernel    {
           _scaledAddResidualModule.kernel("scaled_add_residual")},
@@ -149,7 +155,8 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
 
     // M5i.J: cache the prefill-flash rollback flag once at startup so the
     // dispatcher hot path stays branch-cheap.
-    _prefillFlashDisabled = !flashPrefillEnabled;
+    _prefillFlashDisabled    = !flashPrefillEnabled;
+    _prefillFlashGqaDisabled = !flashPrefillGqaEnabled;
 
     MM_LOG_INFO("gpuops",
                 "GpuOps ready — rmsnorm/rmsnorm_gemma/rmsnorm_no_weight/"
@@ -163,16 +170,19 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
                 "kv_quant_commit_q8_0/"
                 "attention_q8_0/attention_flash_partial_q8_0/"
                 "attention_prefill_flash_q8_0/"
+                "attention_prefill_flash_q8_0_gqa/"
                 "scaled_add_residual/qkv_split/x_quant_i8 loaded "
                 "(rms local={}, elementwise local={}, rope local={}, "
                 "attention local={}, attention max T_k={}, flash kTile={}, "
                 "flash maxHeads={}, flash maxHeadDim={}, "
-                "flash partial scratch={} bytes, prefill_flash={})",
+                "flash partial scratch={} bytes, prefill_flash={}, "
+                "prefill_flash_gqa={})",
                 kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize,
                 kAttentionLocalSize, kAttentionMaxTk,
                 kFlashKTileSize, kFlashMaxHeads, kFlashMaxHeadDim,
                 _flashPartialBytes,
-                _prefillFlashDisabled ? "disabled (env)" : "enabled");
+                _prefillFlashDisabled    ? "disabled (config)" : "enabled",
+                _prefillFlashGqaDisabled ? "disabled (config)" : "enabled");
 }
 
 GpuOps::~GpuOps() {
@@ -1037,11 +1047,25 @@ void GpuOps::attentionPrefillFlashAsync(const float*     q,
     // M10.2 Phase 0 Commit 3 — pick the fp16-KV read variant when the
     // caller signals FP16 storage.
     // M10.2 Phase 1a Commit 4 — Q8_0 variant dispatch.
+    // R1 — under Q8_0 with a GQA-shaped model (nQPerKv > 1), route to
+    // the head-packed kernel unless features.flashPrefillGqa is off or
+    // nQPerKv exceeds the packed kernel's compile-time cap. The packed
+    // kernel launches on the KV-head grid (nKvHeads, T_q) instead of
+    // (nHeads, T_q) — every K/V dequant load is reused across the
+    // nQPerKv Q-heads inside the workgroup.
+    const std::size_t nQPerKv = nHeads / nKvHeads;
+    const bool useQ8Gqa =
+        (kvDtype == runtime::KvDtype::Q8_0) &&
+        !_prefillFlashGqaDisabled &&
+        (nQPerKv > 1) &&
+        (nQPerKv <= kFlashPrefillGqaMaxQPerKv);
+
     runtime::GpuKernel* kernelPtr = &_attentionPrefillFlashKernel;
     if (kvDtype == runtime::KvDtype::FP16) {
         kernelPtr = &_attentionPrefillFlashFp16Kernel;
     } else if (kvDtype == runtime::KvDtype::Q8_0) {
-        kernelPtr = &_attentionPrefillFlashQ8Kernel;
+        kernelPtr = useQ8Gqa ? &_attentionPrefillFlashQ8GqaKernel
+                             : &_attentionPrefillFlashQ8Kernel;
     }
     runtime::GpuKernel& kernel = *kernelPtr;
     *_curLenSlotUsm =
@@ -1063,10 +1087,14 @@ void GpuOps::attentionPrefillFlashAsync(const float*     q,
     kernel.setValue<std::int32_t>(
         10, toInt32(slidingWindow, "prefill_flash slidingWindow"));
     kernel.setGroupSize(kAttentionLocalSize, 1, 1);
-    // Same (nHeads, T_q) grid as variant (a). Streaming K-tile loop
-    // stays inside each workgroup.
+    // Plain kernels: one WG per (query-head, query-position).
+    // R1 GQA kernel: one WG per (kv-head, query-position); nQPerKv
+    // Q-heads share the dequantised K/V inside the WG.
+    const std::uint32_t dim0 = useQ8Gqa
+        ? static_cast<std::uint32_t>(nKvHeads)
+        : static_cast<std::uint32_t>(nHeads);
     _queue.appendLaunch(kernel,
-                        static_cast<std::uint32_t>(nHeads),
+                        dim0,
                         static_cast<std::uint32_t>(T_q),
                         1);
 }

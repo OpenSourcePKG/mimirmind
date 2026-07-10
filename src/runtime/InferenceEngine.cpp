@@ -102,7 +102,9 @@ InferenceEngine::InferenceEngine(const Config& cfg)
       _ctx{std::string{cfg.runtime.spvDir.value_or("")}},
       _allocator{_ctx, cfg.runtime.usmProbeTotalGib},
       _queue{_ctx},
-      _ops{_ctx, _allocator, _queue, cfg.features.flashPrefill},
+      _ops{_ctx, _allocator, _queue,
+           cfg.features.flashPrefill,
+           cfg.features.flashPrefillGqa},
       _gmm{_ctx, _ops, _allocator, _queue},
       _opProfiler{_queue, cfg.diagnostics.traceOpTimes} {
     MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");

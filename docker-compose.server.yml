@@ -1,9 +1,11 @@
-# docker-compose.server.yml — Dev-Test gegen das gepushte Registry-Image.
+# docker-compose.server.yml — Dev-Test gegen ein vorab gebautes Image.
 #
 # Im Gegensatz zu docker-compose.yml wird hier nichts lokal gebaut; das
-# Image kommt aus mimirmind. Logs landen sowohl
-# auf stdout (via tty) als auch in ./run-logs/run.log auf dem Host (der
-# Log-Path steht in der config.json unter server.log.file).
+# Image kommt aus ${MIMIRMIND_IMAGE:-mimirmind:latest}. Setze
+# MIMIRMIND_IMAGE, wenn Du aus einer eigenen Registry ziehen willst
+# (z.B. `your-registry.example/mimirmind:sha-abcd123`). Logs landen
+# sowohl auf stdout (via tty) als auch in ./run-logs/run.log auf dem
+# Host (der Log-Path steht in der config.json unter server.log.file).
 #
 # Voraussetzungen:
 #   - GGUFs liegen unter ${MIMIRMIND_MODELS_DIR} (default: ./models)
@@ -100,7 +102,7 @@
 services:
 
     mimirmind:
-        image: mimirmind:${MIMIRMIND_IMAGE_TAG:-latest}
+        image: ${MIMIRMIND_IMAGE:-mimirmind:latest}
         container_name: mimirmind-devtest
         pull_policy: always
 

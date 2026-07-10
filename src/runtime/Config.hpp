@@ -59,6 +59,10 @@ struct FeatureSettings {
     // Command-list replay. Auto-off for MoE remains hardcoded regardless of this.
     bool                       clr{true};
     bool                       flashPrefill{true};
+    // Independent rollback for the GQA-head-packed Q8_0 prefill kernel.
+    // Set to false to fall back to the plain per-Q-head Q8_0 kernel when
+    // the packed variant regresses on a given host.
+    bool                       flashPrefillGqa{true};
     bool                       fusedQkv{true};
     bool                       moeGroup{true};
     TriState                   gemm{TriState::Auto};
