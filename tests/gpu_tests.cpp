@@ -1565,6 +1565,152 @@ TEST(attention_prefill_flash_q8_0_parity_swa) {
 }
 
 // =======================================================================
+// R1 — attention_prefill_flash_q8_0_gqa parity (packed head variant)
+// =======================================================================
+//
+// The head-packed kernel processes ALL Q-heads of a KV-group inside one
+// workgroup so K/V dequant loads amortise across nHeads/nKvHeads. Same
+// math as the plain per-Q-head kernel, different launch geometry and
+// SLM layout — parity gates against the F32 baseline catch any
+// regression in the packed dispatch path.
+//
+// runAttentionQ8Parity dispatches through attentionAsync, which picks
+// the GQA kernel automatically for (Q8_0, nQPerKv > 1). Tests below
+// exercise the auto-selected packed kernel; the final "plain_forced"
+// case flips features.flashPrefillGqa off at runtime so the plain
+// Q8_0 kernel keeps parity coverage even now that GQA-shaped tests
+// route around it by default.
+
+namespace {
+
+// RAII: flip the GQA rollback flag for the duration of a test case,
+// restore in the destructor. Keeps the fixture-wide GpuOps state
+// consistent across tests regardless of failure paths.
+class ScopedPrefillFlashGqaDisabled {
+public:
+    explicit ScopedPrefillFlashGqaDisabled(bool disabled)
+        : _prev{!fx().ops.prefillFlashGqaEnabled()} {
+        fx().ops.setPrefillFlashGqaDisabledForTest(disabled);
+    }
+    ~ScopedPrefillFlashGqaDisabled() {
+        fx().ops.setPrefillFlashGqaDisabledForTest(_prev);
+    }
+    ScopedPrefillFlashGqaDisabled(const ScopedPrefillFlashGqaDisabled&) = delete;
+    ScopedPrefillFlashGqaDisabled& operator=(const ScopedPrefillFlashGqaDisabled&) = delete;
+private:
+    bool _prev;
+};
+
+} // namespace
+
+TEST(attention_prefill_flash_q8_0_gqa_singleTile) {
+    // T_q=T_k=64 (single K-tile at K_TILE=128), GQA 4:1 (nHeads=8,
+    // nKvHeads=2, nQPerKv=4). Tightest tolerance — only per-tile
+    // softmax touches the dequantised values, and the packed inner
+    // loop reuses the same K/V bytes across the 4 Q-heads per group.
+    runAttentionQ8Parity("attn_prefill_flash_q8_0_gqa_singleTile",
+                         /*T_q=*/64, /*T_k=*/64,
+                         /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/64,
+                         /*positionOffset=*/0,
+                         /*scale=*/1.0F / std::sqrt(64.0F),
+                         /*seed=*/0xB1, /*tol=*/5e-3F);
+}
+
+TEST(attention_prefill_flash_q8_0_gqa_multiTile) {
+    // T_q=T_k=512, GQA 4:1, headDim=128. Multi-tile online-softmax
+    // merge under the packed kernel — verifies the per-Q-head
+    // (m_reg, l_reg, oRun) state stays isolated across the K-tile
+    // rescale steps.
+    runAttentionQ8Parity("attn_prefill_flash_q8_0_gqa_multiTile",
+                         /*T_q=*/512, /*T_k=*/512,
+                         /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                         /*positionOffset=*/0,
+                         /*scale=*/1.0F / std::sqrt(128.0F),
+                         /*seed=*/0xB2, /*tol=*/5e-3F);
+}
+
+TEST(attention_prefill_flash_q8_0_gqa_ratio2_gemma4) {
+    // GQA 2:1 — Gemma 4 26B-A4B primary target (16 Q-heads /
+    // 8 KV-heads = 2 per group). This is the production shape the
+    // packed kernel was built for; nQPerKv=2 means the register-
+    // array + SLM cost is exactly 2 slots, no dead per-Q-head
+    // iterations.
+    runAttentionQ8Parity("attn_prefill_flash_q8_0_gqa_ratio2_gemma4",
+                         /*T_q=*/256, /*T_k=*/256,
+                         /*nHeads=*/16, /*nKvHeads=*/8, /*headDim=*/128,
+                         /*positionOffset=*/0,
+                         /*scale=*/1.0F / std::sqrt(128.0F),
+                         /*seed=*/0xB3, /*tol=*/5e-3F);
+}
+
+TEST(attention_prefill_flash_q8_0_gqa_ratio8_qwen) {
+    // GQA 8:1 — Qwen-family shape at the upper bound of
+    // ATTN_FLASH_PREFILL_N_Q_PER_KV_MAX. Guards the register-array
+    // sizing against off-by-one when every slot is live.
+    runAttentionQ8Parity("attn_prefill_flash_q8_0_gqa_ratio8_qwen",
+                         /*T_q=*/256, /*T_k=*/256,
+                         /*nHeads=*/8, /*nKvHeads=*/1, /*headDim=*/128,
+                         /*positionOffset=*/0,
+                         /*scale=*/1.0F / std::sqrt(128.0F),
+                         /*seed=*/0xB4, /*tol=*/5e-3F);
+}
+
+TEST(attention_prefill_flash_q8_0_gqa_ragTypical) {
+    // 900-token prefill under the packed kernel with Gemma-4-shaped
+    // GQA (16 Q / 8 KV). Real-world Pegenaut-RAG shape; ~8 K-tile
+    // iterations compound the online-softmax rescale error but the
+    // block-32 absmax noise still dominates.
+    runAttentionQ8Parity("attn_prefill_flash_q8_0_gqa_ragTypical",
+                         /*T_q=*/900, /*T_k=*/900,
+                         /*nHeads=*/16, /*nKvHeads=*/8, /*headDim=*/128,
+                         /*positionOffset=*/0,
+                         /*scale=*/1.0F / std::sqrt(128.0F),
+                         /*seed=*/0xB5, /*tol=*/5e-3F);
+}
+
+TEST(attention_prefill_flash_q8_0_gqa_swa) {
+    // SWA + GQA — Gemma-4 SWA layer shape (sliding window 128 tokens,
+    // GQA 4:1). Verifies the per-Q-head accumulators clamp to the
+    // sliding-window low bound identically for every Q-head in the
+    // group, not just the leading one.
+    runAttentionQ8Parity("attn_prefill_flash_q8_0_gqa_swa",
+                         /*T_q=*/512, /*T_k=*/512,
+                         /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                         /*positionOffset=*/0,
+                         /*scale=*/1.0F / std::sqrt(128.0F),
+                         /*seed=*/0xB6, /*tol=*/5e-3F,
+                         /*slidingWindow=*/128);
+}
+
+TEST(attention_prefill_flash_q8_0_gqa_positionOffset) {
+    // Multi-turn prefix reuse: positionOffset=64 (prior turn's KV
+    // stays in cache), then a T_q=32 continuation over T_k=96.
+    // Verifies curLenPtr[0] is honoured for the absPos + kMax bounds
+    // inside the packed kernel exactly as in the plain kernel.
+    runAttentionQ8Parity("attn_prefill_flash_q8_0_gqa_positionOffset",
+                         /*T_q=*/32, /*T_k=*/96,
+                         /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                         /*positionOffset=*/64,
+                         /*scale=*/1.0F / std::sqrt(128.0F),
+                         /*seed=*/0xB7, /*tol=*/5e-3F);
+}
+
+TEST(attention_prefill_flash_q8_0_plain_path_forced) {
+    // Regression guard for the plain per-Q-head kernel now that the
+    // dispatcher routes GQA shapes to the packed variant by default.
+    // Force features.flashPrefillGqa=false for this case so the plain
+    // Q8_0 kernel keeps a parity gate against the F32 baseline even
+    // when nQPerKv > 1.
+    ScopedPrefillFlashGqaDisabled disable{true};
+    runAttentionQ8Parity("attn_prefill_flash_q8_0_plain_forced_gqa4",
+                         /*T_q=*/256, /*T_k=*/256,
+                         /*nHeads=*/8, /*nKvHeads=*/2, /*headDim=*/128,
+                         /*positionOffset=*/0,
+                         /*scale=*/1.0F / std::sqrt(128.0F),
+                         /*seed=*/0xB8, /*tol=*/5e-3F);
+}
+
+// =======================================================================
 // Q4_K matmul (GPU vs CPU)
 // =======================================================================
 

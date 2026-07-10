@@ -286,6 +286,15 @@ public:
         return !_prefillFlashGqaDisabled;
     }
 
+    /// Test-only. Flips the runtime rollback of the GQA-head-packed
+    /// Q8_0 prefill kernel. Callers must not depend on this in
+    /// production paths — the ctor-time toggle is authoritative.
+    /// Exposed so parity tests can pin either the plain per-Q-head or
+    /// the packed variant without instantiating two GpuOps.
+    void setPrefillFlashGqaDisabledForTest(bool disabled) noexcept {
+        _prefillFlashGqaDisabled = disabled;
+    }
+
     /// Multi-head GQA causal attention on the GPU. Layout-equivalent to
     /// compute::multiHeadAttention. q/k/v/out are all f32 USM:
     ///   q   [T_q, nHeads,    headDim]
