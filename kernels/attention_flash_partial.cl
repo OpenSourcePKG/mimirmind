@@ -53,6 +53,12 @@
 // concurrent workgroups at typical decode lengths (8*8=64) — sweet
 // spot for the Xe-Core scheduler. MAX_KTILES bumped to 256 to keep
 // the 16384-token compile-time context envelope (256*64 = 16384).
+// M9.8b (2026-07-12) — envelope raised to 32768 tokens (512*64).
+// This kernel has no MAX_KTILES-sized SLM (nKTiles is a runtime
+// parameter and workgroups are launched one per tile), so only the
+// merge kernel's alphas SLM and the host-side scratch allocation
+// grow. See attention_flash_merge.cl and kFlashMaxKTiles in
+// src/compute/GpuOps.hpp.
 #ifndef ATTN_FLASH_KTILE
 #define ATTN_FLASH_KTILE 64
 #endif

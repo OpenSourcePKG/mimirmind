@@ -24,7 +24,8 @@
 //
 // Launch: global = (nHeads, 1, 1), local = (16, 1, 1) — one subgroup
 //   per head. The single-threaded prelude (m_final + l_final + alphas)
-//   is cheap because K_TILES is small (≤ 32 at max context = 8192).
+//   is cheap because K_TILES is small (≤ 512 at max context = 32768,
+//   post-M9.8b).
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
@@ -41,8 +42,14 @@
 // 256 to 64) to keep the 16384-token compile-time context envelope
 // while quadrupling concurrent workgroups at typical decode lengths.
 // alphas SLM grows from 256 B to 1 KiB per WG — still trivial.
+// M9.8b (2026-07-12) — bumped from 256 to 512 to raise the compile-
+// time context envelope to 32768 tokens. `alphas` SLM grows from
+// 1 KiB to 2 KiB per WG — still trivial, well within Xe-LPG's 64 KiB
+// per-WG budget. Must stay in sync with kFlashMaxKTiles in
+// src/compute/GpuOps.hpp (kFlashKTileSize × ATTN_FLASH_MAX_KTILES =
+// compile-time T_k ceiling).
 #ifndef ATTN_FLASH_MAX_KTILES
-#define ATTN_FLASH_MAX_KTILES 256
+#define ATTN_FLASH_MAX_KTILES 512
 #endif
 
 #ifndef ATTN_FLASH_KTILE
