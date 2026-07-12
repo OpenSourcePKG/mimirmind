@@ -968,14 +968,13 @@ void GpuOps::attentionAsync(const float*      q,
             ") must be a positive multiple of nKvHeads (" +
             std::to_string(nKvHeads) + ")");
     }
-    if (T_k > kAttentionMaxTk) {
-        throw std::runtime_error(
-            "GpuOps::attentionAsync: T_k=" + std::to_string(T_k) +
-            " exceeds compile-time bound ATTN_MAX_TK=" +
-            std::to_string(kAttentionMaxTk) +
-            " — bump ATTN_MAX_TK in kernels/attention.cl + kAttentionMaxTk "
-            "in GpuOps.hpp together");
-    }
+    // M9.8b: no top-level T_k guard here. The flash paths (decode and
+    // prefill) use per-WG tile SLM (~2.5 KiB) independent of T_k, so
+    // they scale to arbitrary context length up to the KV-cache
+    // allocation itself. The plain-attention fallback still holds
+    // scores[ATTN_MAX_TK] in SLM and enforces its own T_k <=
+    // kAttentionMaxTk guard where it is dispatched (see
+    // attentionPlainAsync below).
 
     // Dispatch by query length.
     //  - T_q == 1 (M5f.3.2): FlashAttention two-kernel decode. Launches
@@ -1029,6 +1028,26 @@ void GpuOps::attentionPlainAsync(const float*     q,
     // The (void)T_k below documents that the wrapper still accepts it
     // but no longer forwards it — callers pass totalLen for historical
     // parity with the CPU reference.
+
+    // M9.8b: this is the last remaining T_k-bounded attention path
+    // because the plain kernel holds scores[ATTN_MAX_TK] in SLM.
+    // Flash prefill / decode paths (which the M9.8b design routes all
+    // Prod configs through) are unaffected. Callers only reach here
+    // when `features.prefillFlash: false` OR headDim > kFlashMaxHeadDim
+    // OR the fallback catch-all in attentionAsync triggers.
+    if (T_k > kAttentionMaxTk) {
+        throw std::runtime_error(
+            "GpuOps::attentionPlainAsync: T_k=" + std::to_string(T_k) +
+            " exceeds compile-time bound ATTN_MAX_TK=" +
+            std::to_string(kAttentionMaxTk) +
+            " — the plain-attention kernel holds scores[ATTN_MAX_TK] in "
+            "SLM. Re-enable the flash path (features.prefillFlash: true, "
+            "default) OR reduce runtime.maxContextTokens below " +
+            std::to_string(kAttentionMaxTk) +
+            " OR bump ATTN_MAX_TK in kernels/attention.cl + "
+            "kAttentionMaxTk in GpuOps.hpp together (SLM budget "
+            "permitting — 64 KiB at 16 K).");
+    }
     (void)T_k;
     // M10.2 Phase 0 Commit 3 — pick the fp16-KV read variant when the
     // caller signals FP16 storage. Same signature/argument layout, only

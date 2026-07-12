@@ -345,8 +345,15 @@ public:
     /// a cast — the fp16 kernels use `vload_half` at read time and the
     /// Q8_0 kernels dequantise (fp16 scale × int8) per 32-element block.
     ///
-    /// Throws if T_k > kAttentionMaxTk (8192) or if nHeads is not a
-    /// positive multiple of nKvHeads.
+    /// Throws if nHeads is not a positive multiple of nKvHeads.
+    ///
+    /// T_k is not bounded here: the flash prefill / decode paths (the
+    /// default for all Prod configs after M9.8b) use per-WG tile SLM
+    /// (~2.5 KiB) independent of context length. The plain-attention
+    /// fallback in `attentionPlainAsync` still enforces
+    /// `T_k <= kAttentionMaxTk` where it is dispatched — reached only
+    /// when `features.prefillFlash: false` or
+    /// `headDim > kFlashMaxHeadDim` route to it.
     void attentionAsync(const float*      q,
                         const void*       k,
                         const void*       v,
@@ -361,13 +368,18 @@ public:
                         std::size_t       slidingWindow = 0,
                         runtime::KvDtype  kvDtype       = runtime::KvDtype::F32);
 
-    /// Compile-time bound on T_k matching ATTN_MAX_TK in attention.cl.
-    /// Exposed so callers (and the engine config validator) can check
-    /// max-context budgets up front. At 16384 the plain-attention SLM
-    /// use (`scores[ATTN_MAX_TK] * 4 B`) sits at 64 KiB — the standard
-    /// Intel Xe-LPG per-work-group SLM budget. Raising further requires
-    /// the M9.8b architectural refactor (online-softmax plain attention
-    /// or chunked-T_q flash prefill).
+    /// Compile-time bound on T_k for the **plain-attention fallback**
+    /// path (kernels/attention.cl, attention_fp16.cl, attention_q8_0.cl).
+    /// At 16384 the plain-attention SLM use (`scores[ATTN_MAX_TK] * 4 B`)
+    /// sits at 64 KiB — the standard Intel Xe-LPG per-work-group SLM
+    /// budget. Not a Prod-path limit: M9.8b routes all default configs
+    /// through flash prefill / decode, which are per-WG-tile-SLM and
+    /// unaffected by this constant. The limit only matters when a caller
+    /// forces the plain path via `features.prefillFlash: false` or hits
+    /// the `headDim > kFlashMaxHeadDim` fallback in `attentionAsync`.
+    /// Raising further requires either a plain-kernel rewrite to
+    /// online-softmax (variant A of the M9.8b design) or removing the
+    /// plain path entirely.
     static constexpr std::size_t kAttentionMaxTk = 16384;
 
     /// Accessor to the underlying command queue. Backends use this to

@@ -495,21 +495,38 @@ across all layers:
 | 2048 | ~870 MiB | Short single-turn prompts only |
 | 4096 | ~1.7 GiB | Default-ish chat history |
 | **8192** (default) | **~3.4 GiB** | **Long chat, modest RAG context** |
-| **16384** (M9.8a max) | **~6.9 GiB** | **RAG with ~10-12 pages A4** |
-| ~~32768~~ | ~~13.7 GiB~~ | *Blocked until M9.8b — see below* |
+| **16384** | **~6.9 GiB** | **RAG with ~10-12 pages A4** |
+| **24576** (M9.8b live) | **~10.3 GiB** | **RAG with ~16-18 pages A4** |
+| 32768 (M9.8b ceiling) | ~13.7 GiB | 20+ pages A4, tight on 24 GiB DRAM |
 
 The number is rough — actual cost depends on the model's KV head
 dimensions. The exact bytes are logged at startup
 (`kvcache: pre-allocated for N tokens`). For mimirmind running
 alongside ~22 GiB of Gemma 4 26B weights on a 64 GiB UMA host,
-sizes up to 16K are comfortable.
+sizes up to 24K are comfortable; 32K is DRAM-tight on a 24 GiB
+shared host and requires `runtime.kvDtype: q8_0` to fit alongside
+the model weights.
 
-**Hard ceiling: 16384 (M9.8a).** The plain-attention kernel in
-`kernels/attention.cl` holds the full score row for one query
-position in Shared Local Memory (`scores[ATTN_MAX_TK]`). At 16K
-that sits exactly at Intel Xe-LPG's 64 KiB SLM budget. Setting
-`runtime.maxContextTokens` higher than 16384 will throw at
-the first attention call with a clear error. Longer contexts
-(20 pages A4, 32K+) require the M9.8b architectural change:
-either an online-softmax rewrite of plain attention, or a
-chunked-T_q flash-prefill path.
+**M9.8b — soft ceiling policy.** As of M9.8b (see
+`Memory/mimirmind/todos/m9-8b-long-context-attention-refactor.md`),
+the flash prefill / decode kernels
+(`kernels/attention_prefill_flash*.cl`, `attention_flash_partial*.cl`)
+route all default configs through per-WG-tile SLM (~2.5 KiB per WG),
+which is independent of `T_k`. The 16 384 hard ceiling that used to
+throw at the first attention call has moved onto the plain-attention
+fallback path (`attentionPlainAsync` in `src/compute/GpuOps.cpp`) and
+only triggers when a caller forces the plain path via
+`features.prefillFlash: false` or hits the `headDim > kFlashMaxHeadDim`
+fallback branch. In the default config on Gemma 4 26B-A4B and Qwen
+2.5, the ceiling is set by the KV-cache DRAM budget, not by the
+attention kernel. The **recommended step-up path** is
+`maxContextTokens: 24576` after the M9.8b live bench validates
+thermal envelope, then optionally `32768` once the 24K result lands
+in the perf-regression ledger.
+
+For a longer context than 32 K you either need to
+- lower `runtime.kvDtype` further (Q8_0 is already the smallest
+  supported dtype),
+- shrink `nHeads`/`nKvHeads` (choose a Gemma-4-E4B-style backend
+  with smaller KV heads), or
+- move to hardware with more than 24 GiB of shared memory.

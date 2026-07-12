@@ -1110,6 +1110,55 @@ TEST(attention_prefill_flash_positionOffset) {
                        /*seed=*/0x97, /*tol=*/1e-3F);
 }
 
+// -- M9.8b Long-context boundary ---------------------------------------
+//
+// The plain-attention path (kernels/attention.cl) caps out at 16 K
+// tokens because scores[ATTN_MAX_TK] sits at 64 KiB SLM. The flash
+// path uses per-WG tile SLM (~2.5 KiB) independent of T_k. These two
+// tests exercise the flash prefill and flash decode at T_k = 24 K and
+// T_k = 32 K to verify that removing the top-level T_k guard in
+// `attentionAsync` does not regress the Prod path. Gemma 4 26B-A4B
+// full-attention geometry (nHeads=16, nKvHeads=4 → GQA 4:1,
+// headDim=256) is exercised so we hit the packed Q8_0-GQA kernel where
+// applicable. T_q kept small (T_q=32) to bound the CPU-reference cost;
+// the point is the K-dimension boundary, not the query dimension.
+TEST(attention_prefill_flash_maxContext24k) {
+    // 24 576 = 24 K, the first M9.8b step-up target. Well past the
+    // 16 K plain-path SLM ceiling, still within a comfortable KV
+    // budget on 24 GiB DRAM (~1.5 GiB KV at Q8_0).
+    runAttentionParity("attn_prefill_flash_ctx24k",
+                       /*T_q=*/32, /*T_k=*/24576,
+                       /*nHeads=*/16, /*nKvHeads=*/4, /*headDim=*/256,
+                       /*positionOffset=*/24544,
+                       /*scale=*/1.0F,
+                       /*seed=*/0x98, /*tol=*/3e-3F);
+}
+
+TEST(attention_prefill_flash_maxContext32k) {
+    // 32 768 = 32 K, the M9.8b DoD ceiling. KV budget on 24 GiB DRAM
+    // is tight (~2 GiB KV at Q8_0 for 26B-A4B, plus 22 GiB weights) —
+    // Prod may pin the ceiling below this after the 24K live bench
+    // reports thermal envelope.
+    runAttentionParity("attn_prefill_flash_ctx32k",
+                       /*T_q=*/32, /*T_k=*/32768,
+                       /*nHeads=*/16, /*nKvHeads=*/4, /*headDim=*/256,
+                       /*positionOffset=*/32736,
+                       /*scale=*/1.0F,
+                       /*seed=*/0x99, /*tol=*/3e-3F);
+}
+
+TEST(attention_decode_flash_maxContext32k) {
+    // Decode path (T_q=1) at the 32 K boundary. Same GQA geometry as
+    // the prefill case. Exercises attention_flash_partial + merge with
+    // ceil(32768 / K_TILE_SIZE) tiles.
+    runAttentionParity("attn_decode_flash_ctx32k",
+                       /*T_q=*/1, /*T_k=*/32768,
+                       /*nHeads=*/16, /*nKvHeads=*/4, /*headDim=*/256,
+                       /*positionOffset=*/32767,
+                       /*scale=*/1.0F,
+                       /*seed=*/0x9A, /*tol=*/3e-3F);
+}
+
 // -- M5i.J.1a Sliding-Window Attention (SWA) parity ---------------------
 //
 // SWA layers clamp each query's K-range to the last `slidingWindow`
