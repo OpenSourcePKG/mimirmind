@@ -46,6 +46,13 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// Q8_0 block geometry. Mirrors the private constants in
+// mimirmind::compute::quant::Q8_0 — kept local here so we can read
+// them without breaking the class API. Same trick gpu_tests uses in
+// its encodeQ8_0 helper.
+constexpr std::size_t kQ8BlockElements = 32;
+constexpr std::size_t kQ8BlockBytes    = 34;
+
 struct Args {
     std::size_t tk       = 24576;
     std::size_t tq       = 32;
@@ -149,8 +156,8 @@ std::vector<std::uint8_t> encodeQ8_0KvRows(const std::vector<float>& src,
                                            std::size_t T_k,
                                            std::size_t kvDim) {
     using Q8 = mimirmind::compute::quant::Q8_0;
-    const std::size_t nBlocksPerRow = kvDim / Q8::kBlockElements;
-    const std::size_t rowBytes      = nBlocksPerRow * Q8::kBlockBytes;
+    const std::size_t nBlocksPerRow = kvDim / kQ8BlockElements;
+    const std::size_t rowBytes      = nBlocksPerRow * kQ8BlockBytes;
     std::vector<std::uint8_t> out(T_k * rowBytes, 0);
     for (std::size_t t = 0; t < T_k; ++t) {
         Q8::quantizeRow(src.data() + t * kvDim, kvDim,
@@ -182,7 +189,6 @@ int main(int argc, char** argv) {
     // (kvDim / 32) blocks per row * 34 B = ~34/128 = 27 % of the
     // f32 footprint. Matching Prod's dtype here means the ledger row
     // reflects Prod KV bandwidth, not a 4× worst-case f32 baseline.
-    using Q8 = mimirmind::compute::quant::Q8_0;
     const bool useQ8 = (args.kvDtype == "q8_0");
 
     const std::size_t kvDim  = args.nKvHeads * args.headDim;
@@ -191,7 +197,7 @@ int main(int argc, char** argv) {
     const std::size_t qBytes = qN * sizeof(float);
     const std::size_t oBytes = qN * sizeof(float);
     const std::size_t kBytes = useQ8
-        ? (args.tk * (kvDim / Q8::kBlockElements) * Q8::kBlockBytes)
+        ? (args.tk * (kvDim / kQ8BlockElements) * kQ8BlockBytes)
         : (kvNRow * sizeof(float));
     const std::size_t vBytes = kBytes;
 
@@ -290,7 +296,7 @@ int main(int argc, char** argv) {
     // storage dtype). Multiply by the model's layer count to get the
     // whole-model KV footprint at this context length.
     const std::size_t kvBytesPerTokenPerLayer = useQ8
-        ? (2 * (kvDim / Q8::kBlockElements) * Q8::kBlockBytes)
+        ? (2 * (kvDim / kQ8BlockElements) * kQ8BlockBytes)
         : (2 * kvDim * sizeof(float));
 
     // Human-readable summary.
