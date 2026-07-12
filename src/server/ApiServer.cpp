@@ -74,11 +74,27 @@ struct ApiServer::Impl {
         server.Post("/v1/chat/completions",
                     [this](const httplib::Request& req,
                            httplib::Response&       res) {
+                        // M9.8b observability follow-up: log request
+                        // acceptance BEFORE handing off to the
+                        // ChatCompletionHandler. The httplib access-log
+                        // (set_logger below) only fires when the handler
+                        // returns — for streaming responses that means
+                        // the log is silent from request-accept until the
+                        // client either receives all chunks or
+                        // disconnects. A start-log makes the request
+                        // visible in stdout the moment it arrives, so
+                        // hung/disconnected requests can be correlated
+                        // against a clear "accepted" line.
+                        MM_LOG_INFO(
+                            "server",
+                            "POST /v1/chat/completions accepted "
+                            "from {} (content-length={} B)",
+                            req.remote_addr, req.body.size());
                         chatHandler.handle(req, res);
                     });
 
         server.set_exception_handler(
-            [](const httplib::Request&,
+            [](const httplib::Request& req,
                httplib::Response& res,
                const std::exception_ptr& ep) {
                 std::string msg = "internal error";
@@ -89,14 +105,21 @@ struct ApiServer::Impl {
                 } catch (...) {
                     msg = "non-std exception in handler";
                 }
-                MM_LOG_ERROR("server", "handler exception: {}", msg);
+                MM_LOG_ERROR("server",
+                             "handler exception on {} {} from {}: {}",
+                             req.method, req.path, req.remote_addr, msg);
                 sendError(res, 500, "server_error", msg);
             });
 
         server.set_logger([](const httplib::Request& req,
                              const httplib::Response& res) {
-            MM_LOG_INFO("server", "{} {} -> {}",
-                        req.method, req.path, res.status);
+            // Access-log with remote IP so operators can correlate
+            // request-start (chat-completions POST accept-log above)
+            // with request-end. Fires when the handler returns; for
+            // streaming responses that is after the last SSE chunk or
+            // client disconnect.
+            MM_LOG_INFO("server", "{} {} -> {} (from {})",
+                        req.method, req.path, res.status, req.remote_addr);
         });
     }
 
