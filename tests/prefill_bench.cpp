@@ -24,6 +24,7 @@
 //   docker compose run --rm mimirmind /usr/local/bin/prefill_bench --tk 32768
 
 #include "compute/GpuOps.hpp"
+#include "compute/quant/Q8_0.hpp"
 #include "runtime/CommandQueue.hpp"
 #include "runtime/Config.hpp"
 #include "runtime/L0Context.hpp"
@@ -53,6 +54,10 @@ struct Args {
     std::size_t nHeads   = 16;
     std::size_t nKvHeads = 4;
     std::size_t headDim  = 256;
+    // KV storage dtype. q8_0 matches the Prod default in
+    // config.example.json (kvDtype: q8_0) — F32 mode is available as a
+    // baseline for the 4× KV-bandwidth comparison.
+    std::string kvDtype  = "q8_0";
     std::string label    = "flash_prefill_gemma4_26B_ctx24k";
 };
 
@@ -69,6 +74,7 @@ void printHelp() {
         "  --nheads N    query heads (default 16 — Gemma 4 26B-A4B)\n"
         "  --nkvheads N  KV heads (default 4)\n"
         "  --headdim N   per-head embedding (default 256)\n"
+        "  --kvdtype S   KV storage: f32 | q8_0 (default q8_0 — Prod)\n"
         "  --label STR   ledger label (default flash_prefill_gemma4_26B_ctx24k)\n"
         "  -h, --help    print this and exit\n";
 }
@@ -91,6 +97,7 @@ Args parseArgs(int argc, char** argv) {
         else if (k == "--nheads"   ) a.nHeads   = std::stoull(next());
         else if (k == "--nkvheads" ) a.nKvHeads = std::stoull(next());
         else if (k == "--headdim"  ) a.headDim  = std::stoull(next());
+        else if (k == "--kvdtype"  ) a.kvDtype  = next();
         else if (k == "--label"    ) a.label    = next();
         else if (k == "-h" || k == "--help") {
             printHelp();
@@ -118,7 +125,38 @@ Args parseArgs(int argc, char** argv) {
                   << ") must be >= T_q (" << a.tq << ")\n";
         std::exit(2);
     }
+    if (a.kvDtype != "f32" && a.kvDtype != "q8_0") {
+        std::cerr << "prefill_bench: unsupported --kvdtype '" << a.kvDtype
+                  << "' (expected: f32 | q8_0)\n";
+        std::exit(2);
+    }
+    if (a.kvDtype == "q8_0") {
+        const std::size_t kvDim = a.nKvHeads * a.headDim;
+        if (kvDim % 32 != 0) {
+            std::cerr << "prefill_bench: --kvdtype q8_0 requires "
+                         "nKvHeads*headDim to be a multiple of 32 "
+                         "(got " << kvDim << ")\n";
+            std::exit(2);
+        }
+    }
     return a;
+}
+
+// Pack a row-major [T_k × kvDim] F32 tensor into the Q8_0-KV layout
+// (per-row: (kvDim / 32) blocks of 34 bytes = fp16 scale + 32 int8s).
+// Same shape the M10.2 Q8_0 kernels read.
+std::vector<std::uint8_t> encodeQ8_0KvRows(const std::vector<float>& src,
+                                           std::size_t T_k,
+                                           std::size_t kvDim) {
+    using Q8 = mimirmind::compute::quant::Q8_0;
+    const std::size_t nBlocksPerRow = kvDim / Q8::kBlockElements;
+    const std::size_t rowBytes      = nBlocksPerRow * Q8::kBlockBytes;
+    std::vector<std::uint8_t> out(T_k * rowBytes, 0);
+    for (std::size_t t = 0; t < T_k; ++t) {
+        Q8::quantizeRow(src.data() + t * kvDim, kvDim,
+                        out.data() + t * rowBytes);
+    }
+    return out;
 }
 
 double percentile(std::vector<double>& sorted, double p) {
@@ -140,41 +178,62 @@ int main(int argc, char** argv) {
     mimirmind::runtime::CommandQueue queue{ctx};
     mimirmind::compute::GpuOps       ops{ctx, usm, queue};
 
-    // Allocation sizes match the runAttentionParity helper in
-    // gpu_tests.cpp — same F32 QKV layout regardless of KV dtype
-    // (KV block quantisation would need a separate pack step).
-    const std::size_t qBytes = args.tq * args.nHeads   * args.headDim
-                                       * sizeof(float);
-    const std::size_t kBytes = args.tk * args.nKvHeads * args.headDim
-                                       * sizeof(float);
+    // KV bytes-per-row depend on the storage dtype. Q8_0 packs
+    // (kvDim / 32) blocks per row * 34 B = ~34/128 = 27 % of the
+    // f32 footprint. Matching Prod's dtype here means the ledger row
+    // reflects Prod KV bandwidth, not a 4× worst-case f32 baseline.
+    using Q8 = mimirmind::compute::quant::Q8_0;
+    const bool useQ8 = (args.kvDtype == "q8_0");
+
+    const std::size_t kvDim  = args.nKvHeads * args.headDim;
+    const std::size_t qN     = args.tq * args.nHeads * args.headDim;
+    const std::size_t kvNRow = args.tk * kvDim;
+    const std::size_t qBytes = qN * sizeof(float);
+    const std::size_t oBytes = qN * sizeof(float);
+    const std::size_t kBytes = useQ8
+        ? (args.tk * (kvDim / Q8::kBlockElements) * Q8::kBlockBytes)
+        : (kvNRow * sizeof(float));
     const std::size_t vBytes = kBytes;
-    const std::size_t oBytes = qBytes;
+
+    // Deterministic ramp inputs. Same generator as the gpu_tests
+    // fixture (see runAttentionParity), so results are comparable
+    // across runs on the same host and dtype.
+    std::vector<float> qHost(qN), kHostF32(kvNRow), vHostF32(kvNRow);
+    for (std::size_t i = 0; i < qN;     ++i)
+        qHost[i]    = static_cast<float>((i * 7  + 1) % 17) * 0.125F - 1.0F;
+    for (std::size_t i = 0; i < kvNRow; ++i)
+        kHostF32[i] = static_cast<float>((i * 11 + 3) % 19) * 0.125F - 1.25F;
+    for (std::size_t i = 0; i < kvNRow; ++i)
+        vHostF32[i] = static_cast<float>((i * 13 + 5) % 23) * 0.0625F - 0.75F;
+
+    // Encode K/V into the storage dtype the kernel expects.
+    std::vector<std::uint8_t> kEncoded, vEncoded;
+    if (useQ8) {
+        kEncoded = encodeQ8_0KvRows(kHostF32, args.tk, kvDim);
+        vEncoded = encodeQ8_0KvRows(vHostF32, args.tk, kvDim);
+    }
 
     void* qUsm = usm.allocate(qBytes);
     void* kUsm = usm.allocate(kBytes);
     void* vUsm = usm.allocate(vBytes);
     void* oUsm = usm.allocate(oBytes);
 
-    // Deterministic ramp inputs. Same generator as the gpu_tests
-    // fixture (see runAttentionParity), so results are comparable
-    // across runs on the same host.
-    const std::size_t qN  = qBytes / sizeof(float);
-    const std::size_t kvN = kBytes / sizeof(float);
-    std::vector<float> qHost(qN), kHost(kvN), vHost(kvN);
-    for (std::size_t i = 0; i < qN;  ++i)
-        qHost[i] = static_cast<float>((i * 7  + 1) % 17) * 0.125F - 1.0F;
-    for (std::size_t i = 0; i < kvN; ++i)
-        kHost[i] = static_cast<float>((i * 11 + 3) % 19) * 0.125F - 1.25F;
-    for (std::size_t i = 0; i < kvN; ++i)
-        vHost[i] = static_cast<float>((i * 13 + 5) % 23) * 0.0625F - 0.75F;
     std::memcpy(qUsm, qHost.data(), qBytes);
-    std::memcpy(kUsm, kHost.data(), kBytes);
-    std::memcpy(vUsm, vHost.data(), vBytes);
+    if (useQ8) {
+        std::memcpy(kUsm, kEncoded.data(), kBytes);
+        std::memcpy(vUsm, vEncoded.data(), kBytes);
+    } else {
+        std::memcpy(kUsm, kHostF32.data(), kBytes);
+        std::memcpy(vUsm, vHostF32.data(), kBytes);
+    }
     std::memset(oUsm, 0, oBytes);
 
     const float       scale = 1.0F / std::sqrt(
         static_cast<float>(args.headDim));
     const std::size_t positionOffset = args.tk - args.tq;
+    const auto        kvDtypeEnum    = useQ8
+        ? mimirmind::runtime::KvDtype::Q8_0
+        : mimirmind::runtime::KvDtype::F32;
 
     // Warm-ups (SPV cache, USM residency, driver command-list build).
     for (std::size_t w = 0; w < args.warmups; ++w) {
@@ -184,7 +243,9 @@ int main(int argc, char** argv) {
             args.tq, args.tk,
             args.nHeads, args.nKvHeads, args.headDim,
             positionOffset, scale,
-            static_cast<float*>(oUsm));
+            static_cast<float*>(oUsm),
+            /*slidingWindow=*/0,
+            kvDtypeEnum);
         queue.flush();
     }
 
@@ -199,7 +260,9 @@ int main(int argc, char** argv) {
             args.tq, args.tk,
             args.nHeads, args.nKvHeads, args.headDim,
             positionOffset, scale,
-            static_cast<float*>(oUsm));
+            static_cast<float*>(oUsm),
+            /*slidingWindow=*/0,
+            kvDtypeEnum);
         queue.flush();
         const auto t1 = Clock::now();
         const double ms = std::chrono::duration<double, std::milli>(
@@ -223,11 +286,12 @@ int main(int argc, char** argv) {
     for (const double x : wallMs) mean += x;
     mean /= static_cast<double>(wallMs.size());
 
-    // KV footprint estimate (Gemma-4-A4B assumes 30 layers; we only
-    // measure a single dispatch here, so the "KV bytes / token"
-    // reported below is per-layer, per-token, both KV heads).
-    const std::size_t kvBytesPerToken =
-        2 * args.nKvHeads * args.headDim * sizeof(float);
+    // KV footprint per layer per token (both K and V, this dispatch's
+    // storage dtype). Multiply by the model's layer count to get the
+    // whole-model KV footprint at this context length.
+    const std::size_t kvBytesPerTokenPerLayer = useQ8
+        ? (2 * (kvDim / Q8::kBlockElements) * Q8::kBlockBytes)
+        : (2 * kvDim * sizeof(float));
 
     // Human-readable summary.
     std::cout << "prefill_bench " << args.label << ":\n"
@@ -235,7 +299,8 @@ int main(int argc, char** argv) {
               << " T_k="         << args.tk
               << " nHeads="      << args.nHeads
               << " nKvHeads="    << args.nKvHeads
-              << " headDim="     << args.headDim << "\n"
+              << " headDim="     << args.headDim
+              << " kvDtype="     << args.kvDtype << "\n"
               << "  warmups="    << args.warmups
               << " iters="       << args.iters   << "\n"
               << "  wall p50="   << p50 << " ms"
@@ -243,8 +308,9 @@ int main(int argc, char** argv) {
               <<     " min="     << minv << " ms"
               <<     " max="     << maxv << " ms"
               <<     " mean="    << mean << " ms\n"
-              << "  per-layer KV bytes / token (KV F32) = "
-              << kvBytesPerToken << "\n";
+              << "  per-layer KV bytes / token ("
+              << args.kvDtype << ") = "
+              << kvBytesPerTokenPerLayer << "\n";
 
     // Ledger row (Markdown) — matches the pipe-format the ledger uses.
     std::cout << "\nLedger row (paste into perf-regression-ledger.md):\n"
@@ -253,7 +319,8 @@ int main(int argc, char** argv) {
               <<   " T_k=" << args.tk
               <<   " (nH="   << args.nHeads
               <<   ",nKV="   << args.nKvHeads
-              <<   ",hd="    << args.headDim << ")"
+              <<   ",hd="    << args.headDim
+              <<   ",kv="    << args.kvDtype << ")"
               << " | p50="  << p50 << " ms"
               <<   ", p95=" << p95 << " ms"
               <<   " (min " << minv << " / max " << maxv
@@ -269,6 +336,7 @@ int main(int argc, char** argv) {
               <<   "\"nHeads\":"     << args.nHeads << ","
               <<   "\"nKvHeads\":"   << args.nKvHeads << ","
               <<   "\"headDim\":"    << args.headDim << ","
+              <<   "\"kvDtype\":\""  << args.kvDtype << "\","
               <<   "\"warmups\":"    << args.warmups << ","
               <<   "\"iters\":"      << args.iters << ","
               <<   "\"p50_ms\":"     << p50 << ","
@@ -277,7 +345,7 @@ int main(int argc, char** argv) {
               <<   "\"max_ms\":"     << maxv << ","
               <<   "\"mean_ms\":"    << mean << ","
               <<   "\"kv_bytes_per_token_per_layer\":"
-              <<   kvBytesPerToken
+              <<   kvBytesPerTokenPerLayer
               << "}\n";
 
     return 0;
