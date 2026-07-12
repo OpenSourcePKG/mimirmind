@@ -1896,6 +1896,85 @@ TEST(matmul_q8_0_64rows_K2816) {
                       N, 5e-3F);
 }
 
+// M8.K.Q8_0-Reorder parity gate — the reordered kernel must produce
+// bit-parity output vs the native Q8_0 vec kernel on identical inputs.
+// Both kernels share launch geometry (LOCAL=64, SG=16, 4 outputs per
+// WG) and identical fp32 math (same lane partition, same mad
+// accumulation) — the only difference is the row-local load pattern.
+// Any output delta signals a layout mismatch or a bug in reorderRow /
+// the reorder kernel's addressing.
+TEST(matmul_q8_0_reorderParity_K2816) {
+    constexpr std::size_t K            = 2816;
+    constexpr std::size_t N            = 64;
+    constexpr std::size_t blocksPerRow = K / 32;
+    constexpr std::size_t bytesPerRow  = blocksPerRow * 34;
+
+    constexpr std::uint16_t kHalfHalf = 0x3800U;  // 0.5
+
+    // Native-layout weights, hand-crafted with the same pattern as the
+    // matmul_q8_0_64rows_K2816 test above so both kernels get the same
+    // signal.
+    std::vector<std::uint8_t> wNative(N * bytesPerRow, 0);
+    for (std::size_t n = 0; n < N; ++n) {
+        std::uint8_t* row = wNative.data() + n * bytesPerRow;
+        for (std::size_t b = 0; b < blocksPerRow; ++b) {
+            std::uint8_t* block = row + b * 34;
+            std::memcpy(block, &kHalfHalf, sizeof(std::uint16_t));
+            for (std::size_t l = 0; l < 32; ++l) {
+                block[2 + l] = static_cast<std::uint8_t>(
+                    static_cast<std::int8_t>((n + b + l) % 19 - 9));
+            }
+        }
+    }
+
+    // Reordered-layout weights: transform per row using Phase 1's
+    // reorderRow primitive. Row size stays the same (nBlocks * 34 B),
+    // only the within-row layout switches to scales-then-quants.
+    std::vector<std::uint8_t> wReorder(N * bytesPerRow, 0);
+    for (std::size_t n = 0; n < N; ++n) {
+        mimirmind::compute::quant::Q8_0::reorderRow(
+            wNative.data()   + n * bytesPerRow, K,
+            wReorder.data()  + n * bytesPerRow);
+    }
+
+    const auto x = generateFloats(K, 0x90);
+
+    UsmBuf bufWNative (wNative.size());
+    UsmBuf bufWReorder(wReorder.size());
+    UsmBuf bufX       (K * sizeof(float));
+    UsmBuf bufYNative (N * sizeof(float));
+    UsmBuf bufYReorder(N * sizeof(float));
+    UsmBuf bufScratch (K * sizeof(float));
+
+    std::memcpy(bufWNative.raw(),  wNative.data(),  wNative.size());
+    std::memcpy(bufWReorder.raw(), wReorder.data(), wReorder.size());
+    std::memcpy(bufX.raw(),        x.data(),        x.size() * sizeof(float));
+
+    // Native path: GpuMatmul dispatch — the same production codepath
+    // the matmul_q8_0_64rows_K2816 test exercises.
+    fx().gmm.matmul(mimirmind::model::GgmlType::Q8_0,
+                    bufWNative.raw(), N, K,
+                    bufX.as<float>(), 1,
+                    bufYNative.as<float>(),
+                    bufScratch.as<float>());
+
+    // Reorder path: standalone GpuOps method (test-facing, not yet
+    // wired into GpuMatmul dispatch — that's Phase 3 of M8.K).
+    fx().ops.matmulQ8_0VecReorderAsync(bufWReorder.raw(), N, K,
+                                       bufX.as<float>(),
+                                       bufYReorder.as<float>());
+    fx().queue.flush();
+
+    // Same math, same order — expect bit-parity (or a couple of ULPs
+    // at most from register-allocation differences the compiler is
+    // free to make). 1e-4 keeps room for that without hiding a real
+    // layout bug, which would show as O(1) magnitude deltas.
+    EXPECT_ARRAY_NEAR("matmul_q8_0_reorderParity_K2816",
+                      bufYReorder.as<float>(),
+                      bufYNative.as<float>(),
+                      N, 1e-4F);
+}
+
 // =======================================================================
 // Q6_K matmul (GPU vs CPU) — exercises the Kahan-accumulated kernel
 // =======================================================================

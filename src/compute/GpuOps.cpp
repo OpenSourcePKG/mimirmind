@@ -138,7 +138,10 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
       _qkvSplitModule             {ctx, "qkv_split"},
       _qkvSplitKernel             {_qkvSplitModule.kernel("qkv_split")},
       _xQuantI8Module             {ctx, "x_quant_i8"},
-      _xQuantI8Kernel             {_xQuantI8Module.kernel("x_quant_i8")}
+      _xQuantI8Kernel             {_xQuantI8Module.kernel("x_quant_i8")},
+      _matmulQ8_0VecReorderModule {ctx, "matmul_q8_0_vec_reorder"},
+      _matmulQ8_0VecReorderKernel {
+          _matmulQ8_0VecReorderModule.kernel("matmul_q8_0_vec_reorder")}
 {
     // Persistent FlashAttention partial-tile scratch. Sized for the
     // worst case across our target models; reused across every decode
@@ -904,6 +907,37 @@ void GpuOps::xQuantI8Async(const float* x,
     // One workgroup per row.
     _queue.appendLaunch(_xQuantI8Kernel,
                         static_cast<std::uint32_t>(M), 1, 1);
+}
+
+void GpuOps::matmulQ8_0VecReorderAsync(const void*  wReordered,
+                                       std::size_t  N,
+                                       std::size_t  K,
+                                       const float* x,
+                                       float*       y) {
+    if (N == 0 || K == 0) {
+        return;
+    }
+    // Launch geometry matches matmul_q8_0_vec (see kernels/matmul_q8_0
+    // _vec_reorder.cl comment block): local=64, subgroup=16, 4 outputs
+    // per workgroup, one workgroup per group of 4 output rows. Kept in
+    // sync with GpuMatmul::kLocalSize / kOutputsPerGroup by the kernel
+    // macros MATMUL_Q8_0_LOCAL / MATMUL_Q8_0_SG.
+    constexpr std::uint32_t kLocalSize       = 64;
+    constexpr std::uint32_t kOutputsPerGroup = 4;
+
+    const std::int32_t Ki = toInt32(K, "matmulQ8_0VecReorder K");
+    const std::int32_t Ni = toInt32(N, "matmulQ8_0VecReorder N");
+
+    _matmulQ8_0VecReorderKernel.setPtr(0, x);
+    _matmulQ8_0VecReorderKernel.setPtr(1, wReordered);
+    _matmulQ8_0VecReorderKernel.setPtr(2, y);
+    _matmulQ8_0VecReorderKernel.setValue<std::int32_t>(3, Ki);
+    _matmulQ8_0VecReorderKernel.setValue<std::int32_t>(4, Ni);
+    _matmulQ8_0VecReorderKernel.setGroupSize(kLocalSize, 1, 1);
+
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+    _queue.appendLaunch(_matmulQ8_0VecReorderKernel, nGroups, 1, 1);
 }
 
 void GpuOps::kvQuantCommitQ8Async(const float* xSrc,

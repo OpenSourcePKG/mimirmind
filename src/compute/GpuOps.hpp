@@ -422,6 +422,26 @@ public:
         _replayMaxKTiles = n;
     }
 
+    /// M8.K.Q8_0-Reorder — matmul with Q8_0 weights in REORDERED row
+    /// layout (scales-then-quants, see compute::quant::Q8_0::reorderRow).
+    /// Structurally identical to the native Q8_0 vec matmul dispatched
+    /// through GpuMatmul::matmul(Q8_0, ...) but reads the reordered
+    /// layout so subgroup loads coalesce cleanly (the native 34-byte
+    /// block stride breaks Xe iGPU wide-vector loads — see llama.cpp
+    /// PR #21527 for the same fix in the SYCL backend).
+    ///
+    /// Test-facing entry point: not yet wired into the production
+    /// GpuMatmul dispatcher. Phase 3 of the M8.K.Q8_0-Reorder ticket
+    /// picks that up along with a config toggle. `wReordered` must
+    /// point at Q8_0 weights transformed via `Q8_0::reorderRow`
+    /// row-by-row; feeding a native-layout buffer yields garbage.
+    /// `M == 1` (matvec), K a multiple of 32.
+    void matmulQ8_0VecReorderAsync(const void*  wReordered,
+                                   std::size_t  N,
+                                   std::size_t  K,
+                                   const float* x,
+                                   float*       y);
+
     // FlashAttention tuning constants — publicly readable so callers can
     // compute the launch upper bound to hand to setReplayMaxKTiles().
     // M5f.3.2 (2026-07-07): shrunk from 256 to 64 to quadruple concurrent
@@ -576,6 +596,14 @@ private:
 
     runtime::GpuModule     _xQuantI8Module;
     runtime::GpuKernel     _xQuantI8Kernel;
+
+    // M8.K.Q8_0-Reorder — reordered-layout Q8_0 matvec kernel. Same
+    // launch geometry as matmul_q8_0_vec (LOCAL=64, SG=16, 4 outputs
+    // per WG) so bench comparisons only differ in the row-local load
+    // pattern. See kernels/matmul_q8_0_vec_reorder.cl for the layout
+    // contract and matmulQ8_0VecReorderAsync for the dispatcher.
+    runtime::GpuModule     _matmulQ8_0VecReorderModule;
+    runtime::GpuKernel     _matmulQ8_0VecReorderKernel;
 
     std::string            _selfTestStatus{"pending"};
 
