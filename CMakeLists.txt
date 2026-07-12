@@ -427,3 +427,59 @@ target_link_libraries(gpu_tests PRIVATE
     ${LEVEL_ZERO_LIBRARY}
     Threads::Threads
 )
+
+# ---- prefill_bench — wall-clock micro-benchmark for GpuOps::attentionAsync -
+#
+# Integration-level micro-benchmark for the flash-prefill path landed in
+# M9.8b. Not a unit test: it measures wall-clock latency at a caller-
+# configurable T_k and prints a ledger-ready Markdown row plus one NDJSON
+# line for programmatic aggregation. Same L0/USM/GpuOps stack as gpu_tests
+# so the build closure mirrors it.
+#
+# Run via:
+#   docker compose run --rm mimirmind /usr/local/bin/prefill_bench --tk 24576
+#   docker compose run --rm mimirmind /usr/local/bin/prefill_bench --tk 32768
+
+add_executable(prefill_bench
+    tests/prefill_bench.cpp
+    src/compute/Activations.cpp
+    src/compute/Attention.cpp
+    src/compute/Dequant.cpp
+    src/compute/Embedding.cpp
+    src/compute/GpuMatmul.cpp
+    src/compute/GpuOps.cpp
+    src/compute/Matmul.cpp
+    src/compute/MoeRouting.cpp
+    src/compute/Norm.cpp
+    src/compute/QuantTypeRegistry.cpp
+    src/compute/Rope.cpp
+    src/compute/Sampling.cpp
+    src/compute/Softmax.cpp
+    src/compute/quant/Bfloat16.cpp
+    src/compute/quant/Float16.cpp
+    src/compute/quant/Float32.cpp
+    src/compute/quant/Q4K.cpp
+    src/compute/quant/Q5K.cpp
+    src/compute/quant/Q6K.cpp
+    src/compute/quant/Q8_0.cpp
+    src/model/GgufTypes.cpp
+    src/runtime/CommandQueue.cpp
+    src/runtime/GpuKernel.cpp
+    src/runtime/GpuModule.cpp
+    src/runtime/L0Context.cpp
+    src/runtime/Log.cpp
+    src/runtime/UsmAllocator.cpp
+)
+
+add_dependencies(prefill_bench spv_kernels)
+
+target_include_directories(prefill_bench PRIVATE
+    src
+    tests
+    ${LEVEL_ZERO_INCLUDE_DIR}
+)
+
+target_link_libraries(prefill_bench PRIVATE
+    ${LEVEL_ZERO_LIBRARY}
+    Threads::Threads
+)

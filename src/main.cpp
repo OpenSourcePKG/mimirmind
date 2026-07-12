@@ -1,5 +1,6 @@
 #include "compute/Embedding.hpp"
 #include "compute/GpuMatmul.hpp"
+#include "compute/GpuOps.hpp"
 #include "compute/Matmul.hpp"
 #include "compute/Norm.hpp"
 #include "model/ChatTemplate.hpp"
@@ -1184,6 +1185,54 @@ int runServe(const CliArgs& args, const mimirmind::runtime::Config& cfg) {
         // (fused-QKV coverage, attn_k/v.bias presence per block), so
         // apply the per-model runtime overrides AFTER loadModel.
         applyRuntimeOverrides(*e, cfg.effectiveRuntime(m.id));
+
+        // M9.8b — cross-block sanity check on the effective runtime.
+        // The plain-attention fallback in kernels/attention.cl holds
+        // scores[ATTN_MAX_TK] in 64 KiB SLM, so if a caller forces the
+        // plain path (features.prefillFlash: false) at a context length
+        // above kAttentionMaxTk, the very first request will throw
+        // deep in GpuOps::attentionPlainAsync. Catch that combination
+        // at startup so the operator sees a clear message during boot,
+        // not a stack trace during the first prod-facing request.
+        {
+            const auto effMaxCtx = e->maxContextTokens();
+            if (effMaxCtx > mimirmind::compute::GpuOps::kAttentionMaxTk
+                && !cfg.features.flashPrefill) {
+                const std::string msg =
+                    "serve: model '" + m.id + "' has effective "
+                    "runtime.maxContextTokens=" + std::to_string(effMaxCtx) +
+                    " > kAttentionMaxTk=" +
+                    std::to_string(
+                        mimirmind::compute::GpuOps::kAttentionMaxTk) +
+                    " while features.prefillFlash=false — the "
+                    "plain-attention fallback cannot hold "
+                    "scores[ATTN_MAX_TK] in SLM at that context "
+                    "length. Set features.prefillFlash=true (default) "
+                    "OR reduce runtime.maxContextTokens below " +
+                    std::to_string(
+                        mimirmind::compute::GpuOps::kAttentionMaxTk) + ".";
+                MM_LOG_ERROR("main", "{}", msg);
+                std::cerr << msg << "\n";
+                return 2;
+            }
+            // Informational warn — long context + wide KV storage
+            // pressures a 24 GiB DRAM host running Gemma 4 26B-A4B
+            // weights (~22 GiB) alongside the KV cache. Rough per-token
+            // KV size at F32 is ~430 KiB across all 30 layers; Q8_0 is
+            // ~4× smaller. This is a warning, not an error — smaller
+            // architectures (E4B / dense 4B) fit F32 KV comfortably.
+            if (effMaxCtx > 24576
+                && e->kvDtype() == mimirmind::runtime::KvDtype::F32) {
+                MM_LOG_WARN("main",
+                            "runtime.maxContextTokens={} for model '{}' "
+                            "with kvDtype=f32: the KV cache will consume "
+                            "several GiB on Gemma-4-class geometries. "
+                            "Consider kvDtype=q8_0 or kvDtype=fp16 on "
+                            "shared-24 GiB hosts.",
+                            effMaxCtx, m.id);
+            }
+        }
+
         const auto d = e->kvDtype();
         const char* dName = (d == mimirmind::runtime::KvDtype::FP16 ? "fp16"
                            : d == mimirmind::runtime::KvDtype::Q8_0 ? "q8_0"
