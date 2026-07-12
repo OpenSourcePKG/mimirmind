@@ -464,16 +464,17 @@ json SystemStatusBuilder::buildKernelsBlock() const {
             _engine.gpuOps().prefillFlashKTileQ8Source()}},
     };
 
-    // M8.K.Q8_0-Reorder — features.q8_0Reorder as-configured. The
-    // dispatch path itself is not yet wired (Phase 4 lands the weight-
-    // preprocess pass), so the current effective behaviour is always
-    // "native" regardless of this setting. The status field is exposed
-    // early so operators can pin the config surface before the switch
-    // goes live and A/B benches can flip it without a rebuild.
+    // M8.K.Q8_0-Reorder — features.q8_0Reorder as-configured plus the
+    // number of tensors any active backend actually routed through
+    // the reorder path at load time. `active` flips true once at
+    // least one tensor was reordered — Phase 5 first hit is the E4B
+    // per_layer_model_proj weight. Prefill (M>1) still falls back to
+    // native GEMM; the reorder kernel is matvec-only.
     body["q8_0_reorder"] = json{
-        {"mode",     std::string{_engine.gpuOps().q8_0ReorderModeName()}},
-        {"active",   false},   // Phase 4 flips this once weights are reordered
-        {"reason",   "phase-4 pending: weight preprocess not yet in place"},
+        {"mode",          std::string{_engine.gpuOps().q8_0ReorderModeName()}},
+        {"active",        _engine.gpuOps().q8_0ReorderTensorCount() > 0},
+        {"tensor_count",  _engine.gpuOps().q8_0ReorderTensorCount()},
+        {"total_bytes",   _engine.gpuOps().q8_0ReorderTotalBytes()},
     };
 
     return body;

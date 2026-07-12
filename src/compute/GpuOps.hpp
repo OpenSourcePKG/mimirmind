@@ -306,6 +306,24 @@ public:
     }
     [[nodiscard]] std::string_view q8_0ReorderModeName() const noexcept;
 
+    /// Registration hook for backends: called once per tensor that was
+    /// successfully reordered at load time. Increments the internal
+    /// counter + accumulated byte total surfaced through
+    /// q8_0ReorderTensorCount() / q8_0ReorderTotalBytes(). The label
+    /// is emitted in an info log so operators can see which weights
+    /// went through the reorder path without grepping backend code.
+    /// Safe to call from any load-time context; no-op is not offered
+    /// because the caller already knows they reordered something.
+    void noteQ8_0ReorderApplied(std::size_t bytes,
+                                std::string_view label) noexcept;
+
+    [[nodiscard]] std::size_t q8_0ReorderTensorCount() const noexcept {
+        return _q8_0ReorderTensorCount;
+    }
+    [[nodiscard]] std::size_t q8_0ReorderTotalBytes() const noexcept {
+        return _q8_0ReorderTotalBytes;
+    }
+
     /// Post-model-load K-tile bench. Called from InferenceEngine once
     /// model dims are known. When `features.flashPrefillKTileQ8 == 0`
     /// (autotune requested) AND the model has a GQA shape (nQPerKv > 1)
@@ -682,6 +700,13 @@ private:
     // matvecs through the reordered kernel when the weights are
     // available. Default matches the Config default (Disable).
     runtime::TriState      _q8_0ReorderMode{runtime::TriState::Disable};
+    // M8.K.Q8_0-Reorder Phase 5 — counters bumped by
+    // noteQ8_0ReorderApplied() from each backend that actually
+    // reorders a Q8_0 tensor at load time. Zero when the feature is
+    // Disable, or when the mode is on but no backend eligible for the
+    // reorder path is currently loaded.
+    std::size_t            _q8_0ReorderTensorCount{0};
+    std::size_t            _q8_0ReorderTotalBytes{0};
 
     static constexpr std::uint32_t kRmsnormLocalSize     = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;

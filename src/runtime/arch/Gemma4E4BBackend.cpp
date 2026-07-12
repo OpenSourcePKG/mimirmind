@@ -5,6 +5,7 @@
 #include "compute/GpuOps.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
+#include "compute/quant/Q8_0.hpp"
 #include "model/GgufReader.hpp"
 #include "model/GgufTypes.hpp"
 #include "model/LlmConfig.hpp"
@@ -239,6 +240,46 @@ void Gemma4E4BBackend::requantizeModelProjToQ8_0(const model::GgufTensor& src) {
                     srcFirstRow[0], srcFirstRow[1], srcFirstRow[2], srcFirstRow[3],
                     reFirstRow[0],  reFirstRow[1],  reFirstRow[2],  reFirstRow[3]);
     }
+
+    // M8.K.Q8_0-Reorder — Phase 5 wiring for the E4B per_layer_model_proj
+    // path. When the operator has enabled features.q8_0Reorder we
+    // allocate a second USM buffer of the same size, copy the native
+    // requantized weights into it, and reorder them in place to the
+    // scales-then-quants layout that matmul_q8_0_vec_reorder consumes.
+    // The native buffer stays untouched so prefill (M>1) still hits
+    // the GEMM path through GpuMatmul; only decode (M=1) at
+    // injectPerLayerInputs dispatches through the reorder kernel.
+    // Reorder allocation is lazy: any mode == Disable, or any earlier
+    // requant failure, and this block is skipped entirely.
+    if (_ops.q8_0ReorderMode() != runtime::TriState::Disable) {
+        try {
+            _projQ8ReorderBytes = _projQ8Bytes;
+            _projQ8Reorder = UsmHandle{_ops.allocator(),
+                                       _projQ8ReorderBytes};
+            std::memcpy(_projQ8Reorder.get(), _projQ8.get(),
+                        _projQ8Bytes);
+            std::vector<std::uint8_t> scratch(blocksPerRow * 34);
+            compute::quant::Q8_0::reorderMatrixInPlace(
+                _projQ8Reorder.get(), N, K, scratch.data());
+            _ops.noteQ8_0ReorderApplied(_projQ8ReorderBytes,
+                                        "per_layer_model_proj");
+            MM_LOG_INFO("gemma4-e4b",
+                        "per_layer_model_proj reorder copy: {} bytes "
+                        "({} MiB) [mode={}] — decode (M=1) will dispatch "
+                        "matmul_q8_0_vec_reorder, prefill (M>1) stays "
+                        "on native GEMM",
+                        _projQ8ReorderBytes,
+                        _projQ8ReorderBytes / (1024 * 1024),
+                        _ops.q8_0ReorderModeName());
+        } catch (const std::exception& e) {
+            MM_LOG_WARN("gemma4-e4b",
+                        "per_layer_model_proj reorder copy failed ({}) "
+                        "— decode falls back to native Q8_0 vec kernel",
+                        e.what());
+            _projQ8Reorder = UsmHandle{};
+            _projQ8ReorderBytes = 0;
+        }
+    }
 }
 
 void Gemma4E4BBackend::ensurePleCapacity(std::size_t T) {
@@ -330,10 +371,21 @@ void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds,
         const std::size_t projN   = _config.blockCount * _perLayerDim;
         float* const projBuf      = _pleProjBuf.as<float>();
 
-        _gmm.matmul(model::GgmlType::Q8_0, _projQ8.get(),
-                    projN, d_model,
-                    hiddenStates, T,
-                    projBuf, /*scratch=*/nullptr);
+        // M8.K.Q8_0-Reorder — for T==1 (decode) and when the reorder
+        // copy was loaded, dispatch through matmul_q8_0_vec_reorder
+        // directly. The reorder kernel is matvec-only, so prefill
+        // (T>1) keeps hitting GpuMatmul's Q8_0 GEMM path against the
+        // untouched `_projQ8` buffer.
+        if (T == 1 && _projQ8ReorderBytes > 0) {
+            _ops.matmulQ8_0VecReorderAsync(_projQ8Reorder.get(),
+                                           projN, d_model,
+                                           hiddenStates, projBuf);
+        } else {
+            _gmm.matmul(model::GgmlType::Q8_0, _projQ8.get(),
+                        projN, d_model,
+                        hiddenStates, T,
+                        projBuf, /*scratch=*/nullptr);
+        }
 
         // Per llama.cpp/src/models/gemma4.cpp project_per_layer_inputs():
         //   per_layer_projection_scale = 1/sqrt(n_embd)

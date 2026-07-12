@@ -101,6 +101,19 @@ private:
     UsmHandle        _projQ8;
     std::size_t      _projQ8Bytes{0};
 
+    /// M8.K.Q8_0-Reorder — separate USM buffer holding `_projQ8` in
+    /// scales-then-quants layout (see kernels/matmul_q8_0_vec_reorder
+    /// .cl and Q8_0::reorderRow). Only populated when
+    /// GpuOps::q8_0ReorderMode() != Disable at load time; stays empty
+    /// otherwise. Dispatch at injectPerLayerInputs picks the reorder
+    /// path only for M=1 (decode) since matmul_q8_0_vec_reorder is a
+    /// matvec kernel; M>1 (prefill) always uses the native `_projQ8`
+    /// through GpuMatmul's GEMM dispatch. Dual-copy costs ~size of
+    /// `_projQ8` extra USM (~23 MiB for E4B) but avoids un-reordering
+    /// on every prefill call.
+    UsmHandle        _projQ8Reorder;
+    std::size_t      _projQ8ReorderBytes{0};
+
     /// F32 pointer to per_layer_proj_norm.weight in USM. Owned by the
     /// weights map — this is just a non-owning cache.
     const float*     _projNorm{nullptr};

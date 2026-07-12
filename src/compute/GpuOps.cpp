@@ -236,6 +236,19 @@ std::string_view GpuOps::q8_0ReorderModeName() const noexcept {
     return "unknown";
 }
 
+void GpuOps::noteQ8_0ReorderApplied(std::size_t bytes,
+                                     std::string_view label) noexcept {
+    _q8_0ReorderTensorCount += 1;
+    _q8_0ReorderTotalBytes  += bytes;
+    MM_LOG_INFO("gpuops",
+                "M8.K reorder applied — tensor='{}' bytes={} ({} MiB) "
+                "count_so_far={} total_bytes={} ({} MiB)",
+                label, bytes, bytes / (1024 * 1024),
+                _q8_0ReorderTensorCount,
+                _q8_0ReorderTotalBytes,
+                _q8_0ReorderTotalBytes / (1024 * 1024));
+}
+
 GpuOps::~GpuOps() {
     if (_flashPartialUsm != nullptr) {
         _alloc.deallocate(_flashPartialUsm, _flashPartialBytes);
