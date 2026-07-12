@@ -37,7 +37,8 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
                                  std::size_t            numBlocks,
                                  bool                   enabled,
                                  std::size_t            sharedKvLayers,
-                                 bool                   requantMismatchToQ8_0)
+                                 bool                   requantMismatchToQ8_0,
+                                 bool                   q8_0ReorderEnabled)
     : _alloc{allocator}
 {
     _blocks.resize(numBlocks);
@@ -232,6 +233,46 @@ FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
         blk.hasV   = hasV;
         blk.nbytes = bytes;
 
+        // M8.K.Q8_0-Reorder — allocate a parallel USM buffer holding
+        // the same fused bytes in scales-then-quants layout so decode
+        // (T==1) at the QKV projection can dispatch through
+        // matmul_q8_0_vec_reorder. Native `dst` stays untouched so
+        // prefill (T>1) keeps hitting GpuMatmul's Q8_0 GEMM path.
+        // Reorder is skipped entirely unless the block emitted Q8_0
+        // AND the operator opted in via features.q8_0Reorder.
+        if (q8_0ReorderEnabled && fusedType == GgmlType::Q8_0) {
+            const std::size_t Nfused = Nq + Nk + (hasV ? Nv : 0);
+            try {
+                void* rdst = allocator.allocate(bytes);
+                std::memcpy(rdst, dst, bytes);
+                std::vector<std::uint8_t> scratch(
+                    (Kq / 32) * 34);
+                compute::quant::Q8_0::reorderMatrixInPlace(
+                    rdst, Nfused, Kq, scratch.data());
+                blk.reorderUsmPtr = rdst;
+                blk.reorderBytes  = bytes;
+                ++_reorderCount;
+                _reorderTotalBytes += bytes;
+                MM_LOG_INFO("qkvfuse",
+                            "block {} Q8_0-reorder copy: {} bytes "
+                            "({:.2f} MiB, {} rows × K={})",
+                            b, bytes,
+                            static_cast<double>(bytes) / (1024.0 * 1024.0),
+                            Nfused, Kq);
+            } catch (const std::exception& e) {
+                MM_LOG_WARN("qkvfuse",
+                            "block {} Q8_0-reorder copy failed ({}) — "
+                            "decode falls back to native mmvq for this "
+                            "block", b, e.what());
+                if (blk.reorderUsmPtr != nullptr) {
+                    allocator.deallocate(blk.reorderUsmPtr,
+                                         blk.reorderBytes);
+                    blk.reorderUsmPtr = nullptr;
+                    blk.reorderBytes  = 0;
+                }
+            }
+        }
+
         _blocks[b] = blk;
         ++fusedCount;
         totalBytes += bytes;
@@ -258,6 +299,11 @@ FusedQkvWeights::~FusedQkvWeights() {
         if (!maybe.has_value()) continue;
         if (maybe->usmPtr != nullptr) {
             _alloc.deallocate(maybe->usmPtr, maybe->nbytes);
+        }
+        // M8.K.Q8_0-Reorder — Phase 5b parallel USM buffer.
+        if (maybe->reorderUsmPtr != nullptr) {
+            _alloc.deallocate(maybe->reorderUsmPtr,
+                              maybe->reorderBytes);
         }
     }
 }

@@ -325,8 +325,22 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         float* const qkvFused = s.qkvFusedScratch.as<float>();
         const std::size_t Nfused =
             fBlk->Nq + fBlk->Nkv * (fBlk->hasV ? 2 : 1);
-        _gmm.matmulAsync(fBlk->type, fBlk->usmPtr, Nfused, d_model,
-                         normBuf, T, qkvFused, matmulScratch);
+
+        // M8.K.Q8_0-Reorder Phase 5b — decode (T==1) with a populated
+        // reorder copy for this fused block dispatches straight through
+        // matmul_q8_0_vec_reorder. Prefill (T>1) keeps hitting the
+        // Q8_0 GEMM path against the native `usmPtr`. The block-level
+        // gate falls back cleanly when reorderUsmPtr is nullptr (opt-
+        // out per-block by the loader or feature.q8_0Reorder=disable).
+        if (T == 1 && fBlk->reorderUsmPtr != nullptr
+                   && fBlk->type == model::GgmlType::Q8_0) {
+            _ops.matmulQ8_0VecReorderAsync(fBlk->reorderUsmPtr,
+                                           Nfused, d_model,
+                                           normBuf, qkvFused);
+        } else {
+            _gmm.matmulAsync(fBlk->type, fBlk->usmPtr, Nfused, d_model,
+                             normBuf, T, qkvFused, matmulScratch);
+        }
         // M10.2 Phase 1a Commit 5: Q8_0 scatters K/V into the fp32
         // staging buffers (writeOffset=0, dtype=F32); rmsnorm_qkv +
         // RoPE below stay on the staging pointers, and

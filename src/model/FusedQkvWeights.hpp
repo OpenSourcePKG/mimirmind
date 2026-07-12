@@ -40,6 +40,16 @@ public:
         std::size_t K{0};         // input dim (d_model)
         bool        hasV{false};  // false → fused = [W_q | W_k] only
         std::size_t nbytes{0};    // total USM allocation size (for dealloc)
+
+        // M8.K.Q8_0-Reorder — optional second USM buffer holding the
+        // same fused block in scales-then-quants layout, populated
+        // only when the ctor was called with q8_0ReorderEnabled=true
+        // AND the block emitted Q8_0 (either natively or via requant).
+        // Consumed by matmul_q8_0_vec_reorder on decode (T==1); the
+        // native `usmPtr` is still used for prefill (T>1, GEMM path).
+        // Both regions are freed by the destructor.
+        void*       reorderUsmPtr{nullptr};
+        std::size_t reorderBytes{0};
     };
 
     /// Iterate `numBlocks` transformer blocks in `weights` and build a
@@ -66,7 +76,8 @@ public:
                     std::size_t            numBlocks,
                     bool                   enabled               = true,
                     std::size_t            sharedKvLayers        = 0,
-                    bool                   requantMismatchToQ8_0 = false);
+                    bool                   requantMismatchToQ8_0 = false,
+                    bool                   q8_0ReorderEnabled    = false);
 
     ~FusedQkvWeights();
 
@@ -90,6 +101,23 @@ public:
     [[nodiscard]] std::size_t skippedCount() const noexcept { return _skippedCount; }
     [[nodiscard]] std::size_t totalUsmBytes() const noexcept { return _totalBytes; }
     [[nodiscard]] std::size_t requantCount() const noexcept { return _requantCount; }
+    [[nodiscard]] std::size_t reorderCount() const noexcept { return _reorderCount; }
+    [[nodiscard]] std::size_t reorderTotalBytes() const noexcept { return _reorderTotalBytes; }
+
+    /// Block-level iteration for InferenceEngine to register each
+    /// reordered fused-QKV block with GpuOps::noteQ8_0ReorderApplied
+    /// once construction is complete. Kept out of `find()` because
+    /// that returns nullptr for skipped blocks — for status
+    /// registration the engine wants to walk every fused block.
+    [[nodiscard]] std::size_t numBlocks() const noexcept {
+        return _blocks.size();
+    }
+    [[nodiscard]] const Block* at(std::size_t i) const noexcept {
+        if (i >= _blocks.size() || !_blocks[i].has_value()) {
+            return nullptr;
+        }
+        return &_blocks[i].value();
+    }
 
 private:
     runtime::UsmAllocator&              _alloc;
@@ -100,6 +128,8 @@ private:
     std::size_t                         _skippedCount{0};
     std::size_t                         _totalBytes{0};
     std::size_t                         _requantCount{0};
+    std::size_t                         _reorderCount{0};
+    std::size_t                         _reorderTotalBytes{0};
 };
 
 } // namespace mimirmind::model

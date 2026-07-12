@@ -194,7 +194,23 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     _fusedQkv = std::make_unique<model::FusedQkvWeights>(
         *_weights, _allocator, _config.blockCount,
         _cfg.features.fusedQkv,
-        _config.sharedKvLayers, requantToQ8_0);
+        _config.sharedKvLayers, requantToQ8_0,
+        /*q8_0ReorderEnabled=*/
+        _cfg.features.q8_0Reorder != runtime::TriState::Disable);
+
+    // M8.K.Q8_0-Reorder Phase 5b — register every fused-QKV block that
+    // grew a reorder-layout copy with GpuOps so the /v1/system/status
+    // .kernels.q8_0_reorder counter reflects the real number of
+    // tensors on the reorder path. One note per block keeps the
+    // tensor-count accurate (~24 fused blocks in E4B post-shared-KV
+    // filtering) instead of collapsing them into a single hit.
+    for (std::size_t b = 0; b < _fusedQkv->numBlocks(); ++b) {
+        const auto* blk = _fusedQkv->at(b);
+        if (blk == nullptr || blk->reorderUsmPtr == nullptr) continue;
+        _ops.noteQ8_0ReorderApplied(
+            blk->reorderBytes,
+            "fused_qkv[" + std::to_string(b) + "]");
+    }
 
     // M5i.D: Load-time self-tests of the GPU compute path. selfTest
     // verifies every non-matmul GPU op against a CPU reference on a
