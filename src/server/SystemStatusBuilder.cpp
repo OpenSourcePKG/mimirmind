@@ -464,6 +464,18 @@ json SystemStatusBuilder::buildKernelsBlock() const {
             _engine.gpuOps().prefillFlashKTileQ8Source()}},
     };
 
+    // M8.K.Q8_0-Reorder — features.q8_0Reorder as-configured. The
+    // dispatch path itself is not yet wired (Phase 4 lands the weight-
+    // preprocess pass), so the current effective behaviour is always
+    // "native" regardless of this setting. The status field is exposed
+    // early so operators can pin the config surface before the switch
+    // goes live and A/B benches can flip it without a rebuild.
+    body["q8_0_reorder"] = json{
+        {"mode",     std::string{_engine.gpuOps().q8_0ReorderModeName()}},
+        {"active",   false},   // Phase 4 flips this once weights are reordered
+        {"reason",   "phase-4 pending: weight preprocess not yet in place"},
+    };
+
     return body;
 }
 

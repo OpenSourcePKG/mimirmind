@@ -35,7 +35,8 @@
     "gemm": "auto",
     "gemmV2": false,
     "gemmMinM": null,
-    "dp4a": "disable"
+    "dp4a": "disable",
+    "q8_0Reorder": "disable"
   },
 
   "speculative": {

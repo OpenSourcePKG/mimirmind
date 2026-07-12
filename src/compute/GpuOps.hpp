@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/CommandQueue.hpp"
+#include "runtime/Config.hpp"
 #include "runtime/GpuKernel.hpp"
 #include "runtime/GpuModule.hpp"
 #include "runtime/KvCache.hpp"
@@ -39,7 +40,9 @@ public:
            runtime::CommandQueue& queue,
            bool                   flashPrefillEnabled      = true,
            bool                   flashPrefillGqaQ8Enabled = true,
-           std::size_t            flashPrefillKTileQ8      = 128);
+           std::size_t            flashPrefillKTileQ8      = 128,
+           runtime::TriState      q8_0ReorderMode          =
+               runtime::TriState::Disable);
     ~GpuOps();
 
     GpuOps(const GpuOps&)            = delete;
@@ -292,6 +295,16 @@ public:
     [[nodiscard]] std::string_view prefillFlashKTileQ8Source() const noexcept {
         return _prefillFlashKTileQ8Source;
     }
+
+    /// M8.K.Q8_0-Reorder — how features.q8_0Reorder was resolved at
+    /// startup. Returned as an enum so callers (SystemStatusBuilder,
+    /// future GpuMatmul dispatch guard) can distinguish Auto/Force/
+    /// Disable without string-matching. String form for status JSON
+    /// via `q8_0ReorderModeName()`.
+    [[nodiscard]] runtime::TriState q8_0ReorderMode() const noexcept {
+        return _q8_0ReorderMode;
+    }
+    [[nodiscard]] std::string_view q8_0ReorderModeName() const noexcept;
 
     /// Post-model-load K-tile bench. Called from InferenceEngine once
     /// model dims are known. When `features.flashPrefillKTileQ8 == 0`
@@ -662,6 +675,13 @@ private:
     std::size_t            _prefillFlashKTileQ8{128};
     // "pinned (config)" | "pending (autotune)" | "bench" | "skipped (no GQA)"
     std::string            _prefillFlashKTileQ8Source{"pinned (config)"};
+
+    // M8.K.Q8_0-Reorder — features.q8_0Reorder as-configured. Read by
+    // SystemStatusBuilder for the /v1/system/status.kernels payload
+    // and (in Phase 4) by the GpuMatmul dispatcher to route Q8_0
+    // matvecs through the reordered kernel when the weights are
+    // available. Default matches the Config default (Disable).
+    runtime::TriState      _q8_0ReorderMode{runtime::TriState::Disable};
 
     static constexpr std::uint32_t kRmsnormLocalSize     = 128;
     static constexpr std::uint32_t kElementwiseLocalSize = 256;

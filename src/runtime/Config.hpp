@@ -82,6 +82,17 @@ struct FeatureSettings {
     std::optional<std::size_t> gemmMinM{};
     // Default is Disable per lesson_dp4a_autotune_prod_hazard.
     TriState                   dp4a{TriState::Disable};
+    // M8.K.Q8_0-Reorder — routes Q8_0 matvec through the reordered-
+    // layout kernel (matmul_q8_0_vec_reorder) which reads scales and
+    // quants as two contiguous regions instead of the native ggml
+    // 34-byte-block interleave. Default is Disable — until the load-
+    // time weight-reorder pass lands (Phase 4 of the M8.K track), the
+    // reorder kernel has no reordered weights to consume so enabling
+    // this alone is a no-op. Auto flips to the reorder path once the
+    // weight preprocess is in place; Enable forces it (fails loud if
+    // the weights weren't reordered). See kernels/matmul_q8_0_vec
+    // _reorder.cl and Q8_0::reorderRow for the layout contract.
+    TriState                   q8_0Reorder{TriState::Disable};
 };
 
 struct SpeculativeSettings {

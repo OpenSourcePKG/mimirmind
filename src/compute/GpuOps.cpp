@@ -48,7 +48,8 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
                runtime::CommandQueue& queue,
                bool                   flashPrefillEnabled,
                bool                   flashPrefillGqaQ8Enabled,
-               std::size_t            flashPrefillKTileQ8)
+               std::size_t            flashPrefillKTileQ8,
+               runtime::TriState      q8_0ReorderMode)
     : _ctx{ctx},
       _queue{queue},
       _alloc{alloc},
@@ -172,6 +173,7 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
     // dispatcher hot path stays branch-cheap.
     _prefillFlashDisabled      = !flashPrefillEnabled;
     _prefillFlashGqaQ8Disabled = !flashPrefillGqaQ8Enabled;
+    _q8_0ReorderMode           = q8_0ReorderMode;
 
     // Resolve K-tile pick. 0 = autotune, resolved later by
     // autotuneKTileQ8() once model dims are known — until then the
@@ -207,19 +209,31 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
                 "attention_prefill_flash_q8_0/"
                 "attention_prefill_flash_q8_0_gqa/"
                 "attention_prefill_flash_q8_0_gqa_ktile64/"
-                "scaled_add_residual/qkv_split/x_quant_i8 loaded "
+                "scaled_add_residual/qkv_split/x_quant_i8/"
+                "matmul_q8_0_vec_reorder loaded "
                 "(rms local={}, elementwise local={}, rope local={}, "
                 "attention local={}, attention max T_k={}, flash kTile={}, "
                 "flash maxHeads={}, flash maxHeadDim={}, "
                 "flash partial scratch={} bytes, prefill_flash={}, "
-                "prefill_flash_gqa_q8={}, prefill_flash_ktile_q8={})",
+                "prefill_flash_gqa_q8={}, prefill_flash_ktile_q8={}, "
+                "q8_0_reorder={})",
                 kRmsnormLocalSize, kElementwiseLocalSize, kRopeLocalSize,
                 kAttentionLocalSize, kAttentionMaxTk,
                 kFlashKTileSize, kFlashMaxHeads, kFlashMaxHeadDim,
                 _flashPartialBytes,
                 _prefillFlashDisabled      ? "disabled (config)" : "enabled",
                 _prefillFlashGqaQ8Disabled ? "disabled (config)" : "enabled",
-                _prefillFlashKTileQ8);
+                _prefillFlashKTileQ8,
+                q8_0ReorderModeName());
+}
+
+std::string_view GpuOps::q8_0ReorderModeName() const noexcept {
+    switch (_q8_0ReorderMode) {
+        case runtime::TriState::Auto:    return "auto";
+        case runtime::TriState::Force:   return "force";
+        case runtime::TriState::Disable: return "disable";
+    }
+    return "unknown";
 }
 
 GpuOps::~GpuOps() {
