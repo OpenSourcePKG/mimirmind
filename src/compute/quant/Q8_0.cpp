@@ -106,6 +106,62 @@ void Q8_0::quantizeRow(const float* src, std::size_t K, void* dst) noexcept {
     }
 }
 
+void Q8_0::reorderRow(const void* nativeRow,
+                      std::size_t K,
+                      void*       reorderedRow) noexcept {
+    const std::size_t nblocks = K / kBlockElements;
+    const auto* src = static_cast<const std::uint8_t*>(nativeRow);
+    auto*       dst = static_cast<std::uint8_t*>(reorderedRow);
+
+    std::uint8_t* dstScales = dst;                    // 2 * nblocks bytes
+    std::uint8_t* dstQuants = dst + 2 * nblocks;      // 32 * nblocks bytes
+
+    for (std::size_t b = 0; b < nblocks; ++b) {
+        const std::uint8_t* srcBlock = src + b * kBlockBytes;
+        std::memcpy(dstScales + b * 2,      srcBlock,       2);
+        std::memcpy(dstQuants + b * 32,     srcBlock + 2,   32);
+    }
+}
+
+void Q8_0::unreorderRow(const void* reorderedRow,
+                        std::size_t K,
+                        void*       nativeRow) noexcept {
+    const std::size_t nblocks = K / kBlockElements;
+    const auto* src = static_cast<const std::uint8_t*>(reorderedRow);
+    auto*       dst = static_cast<std::uint8_t*>(nativeRow);
+
+    const std::uint8_t* srcScales = src;
+    const std::uint8_t* srcQuants = src + 2 * nblocks;
+
+    for (std::size_t b = 0; b < nblocks; ++b) {
+        std::uint8_t* dstBlock = dst + b * kBlockBytes;
+        std::memcpy(dstBlock,     srcScales + b * 2,  2);
+        std::memcpy(dstBlock + 2, srcQuants + b * 32, 32);
+    }
+}
+
+void Q8_0::dequantRowFromReorderedToF32(const void* reorderedRow,
+                                        std::size_t K,
+                                        float*      dst) noexcept {
+    const std::size_t nblocks = K / kBlockElements;
+    const auto* src = static_cast<const std::uint8_t*>(reorderedRow);
+
+    const std::uint8_t* scales = src;
+    const auto*         quants = reinterpret_cast<const std::int8_t*>(
+        src + 2 * nblocks);
+
+    for (std::size_t b = 0; b < nblocks; ++b) {
+        std::uint16_t dHalf;
+        std::memcpy(&dHalf, scales + b * 2, sizeof(std::uint16_t));
+        const float d = halfToFloat(dHalf);
+
+        const std::int8_t* qs = quants + b * kBlockElements;
+        for (std::size_t l = 0; l < kBlockElements; ++l) {
+            *dst++ = d * static_cast<float>(qs[l]);
+        }
+    }
+}
+
 void Q8_0::dequantToF32(const void* src,
                         std::size_t nelements,
                         float*      dst) const {

@@ -41,6 +41,68 @@ public:
                             std::size_t  K,
                             void*        dst) noexcept;
 
+    // -------------------------------------------------------------------
+    // Reordered row layout (M8.K Q8_0-Reorder foundation).
+    //
+    // The native ggml Q8_0 layout interleaves the fp16 block scale with
+    // the 32 int8 quants inside every 34-byte block:
+    //
+    //   native row (nBlocks = K/32):
+    //     [d_0][qs_0[32]] [d_1][qs_1[32]] ... [d_{nBlocks-1}][qs...[32]]
+    //
+    // On Intel Xe iGPUs the 34-byte stride wrecks subgroup coalescing —
+    // each block load skips 2 bytes past the previous 32-byte quant run,
+    // breaking any wide vector load pattern. llama.cpp PR #21527 fixed
+    // this in the SYCL backend by splitting scales from quants at
+    // preprocessing time. Empirical result: Q8_0 dense mmvq bandwidth
+    // utilisation jumped from ~21 % to ~66 % on Xe2/Battlemage — 3.1x
+    // throughput on Qwen3.5-27B, a >2x on Qwen2.5-1.5B.
+    //
+    // Reordered row layout (bytes, per matmul row of length K):
+    //   [ nBlocks * fp16 scales  (2 B each, contiguous) ]
+    //   [ nBlocks * 32 int8 quants (32 B each, contiguous) ]
+    //
+    // Row size is unchanged (nBlocks * 34 B). The scales region ends at
+    // offset (2 * nBlocks) which is 2-aligned; the quants region starts
+    // there. For all K used by our production models K is a multiple of
+    // 64 (E4B: 256, 2048, 5120, 8192; 26B-A4B: 512, 2816, 5760, ...),
+    // so nBlocks is even and the quants region also starts on a 32-byte
+    // boundary — the alignment the subgroup uchar32 loads want.
+    //
+    // These functions operate on ONE row at a time. Multi-row tensors
+    // (matmul weights) call them per-row so each row lives contiguously
+    // in its reordered form — matches the mmvq access pattern where one
+    // workgroup consumes one output row's weights.
+    //
+    // Bit-parity contract: reorderRow → unreorderRow round-trips byte-
+    // identical to the native input, and dequantRowFromReorderedToF32
+    // produces the same f32 values as dequantToF32 on the native input.
+
+    /// Transform `nativeRow` from ggml native layout (interleaved
+    /// 34-byte blocks) to reordered layout (scales region followed by
+    /// quants region). K must be a multiple of 32. `nativeRow` and
+    /// `reorderedRow` must not alias.
+    static void reorderRow(const void* nativeRow,
+                           std::size_t K,
+                           void*       reorderedRow) noexcept;
+
+    /// Inverse of `reorderRow`. Transforms reordered layout back to
+    /// native interleaved 34-byte blocks. Used for parity tests, weight
+    /// dumps, and as a fallback if a specific downstream path needs the
+    /// legacy layout.
+    static void unreorderRow(const void* reorderedRow,
+                             std::size_t K,
+                             void*       nativeRow) noexcept;
+
+    /// Dequantise `K` elements from a reordered row directly to f32.
+    /// Semantically identical to `dequantToF32(nativeRow, K, dst)` when
+    /// `reorderedRow` was produced by `reorderRow(nativeRow, K, ...)`.
+    /// Provided as a CPU oracle for kernel parity tests and as a slow
+    /// but correct reference for any host-side fallback.
+    static void dequantRowFromReorderedToF32(const void* reorderedRow,
+                                             std::size_t K,
+                                             float*      dst) noexcept;
+
 private:
     Q8_0() = default;
 

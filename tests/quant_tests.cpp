@@ -290,6 +290,178 @@ TEST(q8_0_misalignedNelementsThrows) {
 }
 
 // =======================================================================
+// Q8_0 reordered row layout — M8.K foundation for coalesced Xe loads.
+// See kernels/matmul_q8_0_vec.cl and Q8_0.hpp for the layout contract.
+// =======================================================================
+
+// Explicit-layout single-block check: after reorder, byte 0-1 hold the
+// scale and bytes 2-33 hold the quants (which happens to match the
+// native single-block layout — the test verifies the reorder is a
+// no-op copy for nBlocks=1 and that the accessor offsets are right).
+TEST(q8_0_reorder_singleBlock_layout) {
+    std::array<std::uint8_t, 34> native{};
+    writeHalfBits(native.data(), kHalfHalf);  // d = 0.5
+    for (std::size_t l = 0; l < 32; ++l) {
+        native[2 + l] = static_cast<std::uint8_t>(l);
+    }
+
+    std::array<std::uint8_t, 34> reordered{};
+    mimirmind::compute::quant::Q8_0::reorderRow(
+        native.data(), 32, reordered.data());
+
+    // Scales region: bytes [0..2).
+    EXPECT_EQ(reordered[0], native[0]);
+    EXPECT_EQ(reordered[1], native[1]);
+    // Quants region: bytes [2..34).
+    for (std::size_t l = 0; l < 32; ++l) {
+        EXPECT_EQ(reordered[2 + l], native[2 + l]);
+    }
+}
+
+// Two-block check exercises the actual reorder split: the second block's
+// scale must land right after the first block's scale (offset 2), and
+// the quants for both blocks must live in a single contiguous 64-byte
+// run starting at offset 4.
+TEST(q8_0_reorder_twoBlocks_layout) {
+    std::array<std::uint8_t, 68> native{};
+    // Block 0: d = 1.0, qs[l] = l
+    writeHalfBits(native.data(), kHalfOne);
+    for (std::size_t l = 0; l < 32; ++l) {
+        native[2 + l] = static_cast<std::uint8_t>(l);
+    }
+    // Block 1: d = 2.0, qs[l] = 32 + l
+    writeHalfBits(native.data() + 34, kHalfTwo);
+    for (std::size_t l = 0; l < 32; ++l) {
+        native[34 + 2 + l] = static_cast<std::uint8_t>(32 + l);
+    }
+
+    std::array<std::uint8_t, 68> reordered{};
+    mimirmind::compute::quant::Q8_0::reorderRow(
+        native.data(), 64, reordered.data());
+
+    // Reordered layout: [d_0 (2)][d_1 (2)][qs_0 (32)][qs_1 (32)]
+    EXPECT_EQ(reordered[0], native[0]);        // d_0 low
+    EXPECT_EQ(reordered[1], native[1]);        // d_0 high
+    EXPECT_EQ(reordered[2], native[34]);       // d_1 low (was at 34)
+    EXPECT_EQ(reordered[3], native[35]);       // d_1 high
+    // qs_0 lives at reordered[4..36)
+    for (std::size_t l = 0; l < 32; ++l) {
+        EXPECT_EQ(reordered[4 + l], native[2 + l]);
+    }
+    // qs_1 lives at reordered[36..68)
+    for (std::size_t l = 0; l < 32; ++l) {
+        EXPECT_EQ(reordered[36 + l], native[34 + 2 + l]);
+    }
+}
+
+// Round-trip parity across a realistic multi-block row (K=2816 matches
+// the E4B FusedQkvWeights hot-path row length).
+TEST(q8_0_reorder_roundtrip_K2816) {
+    constexpr std::size_t K       = 2816;
+    constexpr std::size_t nblocks = K / 32;
+    constexpr std::size_t bytes   = nblocks * 34;
+
+    // Deterministic pseudo-native data: fp16 scale in low bits varies
+    // per block, quants cover the full signed int8 range.
+    std::vector<std::uint8_t> native(bytes);
+    for (std::size_t b = 0; b < nblocks; ++b) {
+        std::uint8_t* block = native.data() + b * 34;
+        const std::uint16_t half =
+            static_cast<std::uint16_t>(0x3800U + (b * 17U));  // ~0.5..
+        writeHalfBits(block, half);
+        for (std::size_t l = 0; l < 32; ++l) {
+            block[2 + l] = static_cast<std::uint8_t>(
+                static_cast<std::int8_t>((b * 7 + l * 11) % 251 - 125));
+        }
+    }
+
+    std::vector<std::uint8_t> reordered(bytes);
+    std::vector<std::uint8_t> restored(bytes);
+    mimirmind::compute::quant::Q8_0::reorderRow(
+        native.data(), K, reordered.data());
+    mimirmind::compute::quant::Q8_0::unreorderRow(
+        reordered.data(), K, restored.data());
+
+    for (std::size_t i = 0; i < bytes; ++i) {
+        if (native[i] != restored[i]) {
+            EXPECT_TRUE(false && "reorder round-trip mismatch");
+            return;
+        }
+    }
+}
+
+// Semantic parity: dequantising a reordered row must produce the same
+// f32 values as dequantising the corresponding native row.
+TEST(q8_0_reorder_dequantParity_K2816) {
+    constexpr std::size_t K       = 2816;
+    constexpr std::size_t nblocks = K / 32;
+    constexpr std::size_t bytes   = nblocks * 34;
+
+    std::vector<std::uint8_t> native(bytes);
+    for (std::size_t b = 0; b < nblocks; ++b) {
+        std::uint8_t* block = native.data() + b * 34;
+        const std::uint16_t half =
+            static_cast<std::uint16_t>(0x3800U + (b * 17U));
+        writeHalfBits(block, half);
+        for (std::size_t l = 0; l < 32; ++l) {
+            block[2 + l] = static_cast<std::uint8_t>(
+                static_cast<std::int8_t>((b * 7 + l * 11) % 251 - 125));
+        }
+    }
+
+    std::vector<std::uint8_t> reordered(bytes);
+    mimirmind::compute::quant::Q8_0::reorderRow(
+        native.data(), K, reordered.data());
+
+    std::vector<float> viaNative(K);
+    std::vector<float> viaReordered(K);
+    mimirmind::compute::quant::Q8_0::instance()
+        .dequantToF32(native.data(), K, viaNative.data());
+    mimirmind::compute::quant::Q8_0::dequantRowFromReorderedToF32(
+        reordered.data(), K, viaReordered.data());
+
+    for (std::size_t i = 0; i < K; ++i) {
+        // Bit-exact: reorder is a pure permutation of bytes, dequant is
+        // deterministic, so the two paths must agree exactly.
+        EXPECT_NEAR(viaReordered[i], viaNative[i], 0.0F);
+    }
+}
+
+// End-to-end: quantize a random f32 row, reorder it, dequant from the
+// reordered layout, and check that the round-trip stays within the
+// per-block Q8_0 quantisation error bound (1 LSB * max abs scale).
+TEST(q8_0_reorder_quantRoundtrip_K1024) {
+    constexpr std::size_t K       = 1024;
+    constexpr std::size_t nblocks = K / 32;
+    constexpr std::size_t bytes   = nblocks * 34;
+
+    std::vector<float> src(K);
+    for (std::size_t i = 0; i < K; ++i) {
+        // Deterministic pseudo-normal signal, magnitude ~[-1, 1].
+        src[i] = std::sin(static_cast<float>(i) * 0.13F)
+               + 0.25F * std::cos(static_cast<float>(i) * 0.7F);
+    }
+
+    std::vector<std::uint8_t> native(bytes);
+    mimirmind::compute::quant::Q8_0::quantizeRow(src.data(), K, native.data());
+
+    std::vector<std::uint8_t> reordered(bytes);
+    mimirmind::compute::quant::Q8_0::reorderRow(
+        native.data(), K, reordered.data());
+
+    std::vector<float> dequantized(K);
+    mimirmind::compute::quant::Q8_0::dequantRowFromReorderedToF32(
+        reordered.data(), K, dequantized.data());
+
+    // Per-block error bound: |round-off| <= 0.5 * scale, and scale =
+    // max|src|/127 per block. A comfortable 1e-2 relative tolerance is
+    // enough for this deterministic input.
+    for (std::size_t i = 0; i < K; ++i) {
+        EXPECT_NEAR(dequantized[i], src[i], 1e-2F);
+    }
+}
+
+// =======================================================================
 // Q6_K — hand-crafted blocks
 // =======================================================================
 
