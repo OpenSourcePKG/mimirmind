@@ -427,10 +427,17 @@ public:
     // M5f.3.2 (2026-07-07): shrunk from 256 to 64 to quadruple concurrent
     // workgroups at typical decode lengths on Xe-LPG (was 16 WGs for
     // curLen=500 on 8-head E4B → 64 WGs = matches 8 Xe-Cores × 8 VEs).
-    // Compile-time context envelope stays at 16384 tokens
-    // (kFlashKTileSize × kFlashMaxKTiles).
+    // M9.8b (2026-07-12): compile-time context envelope raised from
+    // 16384 to 32768 tokens by doubling `kFlashMaxKTiles`. Scratch buffer
+    // (`_flashPartialUsm`) picks up the new size automatically at
+    // GpuOps construction: kFlashMaxHeads * kFlashMaxKTiles *
+    // (2 + kFlashMaxHeadDim) * 4 B = 64 × 512 × 514 × 4 ≈ 64 MiB (was
+    // ~33 MiB). Kernels are unchanged — `nKTiles` is derived at runtime
+    // from `positionOffset+1`; the constant only bounds the persistent
+    // scratch allocation and the decode-flash dispatch guard in
+    // attentionDecodeFlashAsync.
     static constexpr std::size_t kFlashKTileSize = 64;
-    static constexpr std::size_t kFlashMaxKTiles = 16384 / kFlashKTileSize;
+    static constexpr std::size_t kFlashMaxKTiles = 32768 / kFlashKTileSize;
 
 private:
     runtime::L0Context&    _ctx;
