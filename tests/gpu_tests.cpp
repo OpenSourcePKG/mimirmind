@@ -1975,6 +1975,85 @@ TEST(matmul_q8_0_reorderParity_K2816) {
                       N, 1e-4F);
 }
 
+// M8.K.Q8_0-Reorder end-to-end chain — reorderMatrixInPlace + reorder
+// kernel dispatch on the SAME USM buffer. Simulates the Phase 4 load-
+// time preprocess: weights land in native layout in USM (as they
+// would from GgufReader::loadTensors), then a single call to
+// reorderMatrixInPlace transforms them in-place to the reorder
+// layout, then matmulQ8_0VecReorderAsync is dispatched on that same
+// buffer. Output must match the native GpuMatmul path on a separate
+// native-layout copy of the same weights. This is the parity gate
+// Phase 5 (per-weight wiring) will rely on when picking which
+// tensors to reorder in a real backend.
+TEST(matmul_q8_0_reorderInPlaceEndToEnd_K2048) {
+    constexpr std::size_t K            = 2048;
+    constexpr std::size_t N            = 32;
+    constexpr std::size_t blocksPerRow = K / 32;
+    constexpr std::size_t bytesPerRow  = blocksPerRow * 34;
+
+    constexpr std::uint16_t kHalfHalf = 0x3800U;  // 0.5
+
+    // Two identical native-layout weight tensors: one stays native
+    // (dispatched through GpuMatmul), the other gets reordered in
+    // place and dispatched through the reorder kernel.
+    std::vector<std::uint8_t> wNative(N * bytesPerRow, 0);
+    for (std::size_t n = 0; n < N; ++n) {
+        std::uint8_t* row = wNative.data() + n * bytesPerRow;
+        for (std::size_t b = 0; b < blocksPerRow; ++b) {
+            std::uint8_t* block = row + b * 34;
+            std::memcpy(block, &kHalfHalf, sizeof(std::uint16_t));
+            for (std::size_t l = 0; l < 32; ++l) {
+                block[2 + l] = static_cast<std::uint8_t>(
+                    static_cast<std::int8_t>(
+                        (n * 3 + b * 5 + l * 7) % 71 - 35));
+            }
+        }
+    }
+    std::vector<std::uint8_t> wForReorder = wNative;
+
+    const auto x = generateFloats(K, 0x91);
+
+    UsmBuf bufWNative   (wNative.size());
+    UsmBuf bufWReorder  (wForReorder.size());
+    UsmBuf bufX         (K * sizeof(float));
+    UsmBuf bufYNative   (N * sizeof(float));
+    UsmBuf bufYReorder  (N * sizeof(float));
+    UsmBuf bufScratchMm (K * sizeof(float));
+
+    std::memcpy(bufWNative.raw(),  wNative.data(),     wNative.size());
+    std::memcpy(bufWReorder.raw(), wForReorder.data(), wForReorder.size());
+    std::memcpy(bufX.raw(),        x.data(),           x.size() * sizeof(float));
+
+    // Simulate the Phase 4 load-time preprocess: reorder in place on
+    // the USM buffer using a single row-sized host scratch. USM is
+    // host-writable on our target so we can call the helper directly
+    // on the mapped pointer.
+    std::vector<std::uint8_t> reorderScratch(bytesPerRow);
+    mimirmind::compute::quant::Q8_0::reorderMatrixInPlace(
+        bufWReorder.raw(), N, K, reorderScratch.data());
+
+    // Native reference: GpuMatmul dispatch on native-layout weights.
+    fx().gmm.matmul(mimirmind::model::GgmlType::Q8_0,
+                    bufWNative.raw(), N, K,
+                    bufX.as<float>(), 1,
+                    bufYNative.as<float>(),
+                    bufScratchMm.as<float>());
+
+    // Reorder path: standalone GpuOps kernel on the in-place-reordered
+    // USM buffer (Phase 4 preprocess) — this is exactly what Phase 5
+    // will do once the backend/loader picks specific weights to route
+    // through this path.
+    fx().ops.matmulQ8_0VecReorderAsync(bufWReorder.raw(), N, K,
+                                       bufX.as<float>(),
+                                       bufYReorder.as<float>());
+    fx().queue.flush();
+
+    EXPECT_ARRAY_NEAR("matmul_q8_0_reorderInPlaceEndToEnd_K2048",
+                      bufYReorder.as<float>(),
+                      bufYNative.as<float>(),
+                      N, 1e-4F);
+}
+
 // =======================================================================
 // Q6_K matmul (GPU vs CPU) — exercises the Kahan-accumulated kernel
 // =======================================================================

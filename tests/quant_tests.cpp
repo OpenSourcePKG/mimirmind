@@ -427,6 +427,112 @@ TEST(q8_0_reorder_dequantParity_K2816) {
     }
 }
 
+// Multi-row in-place reorder: N × K matrix, all rows reordered using a
+// single row-sized scratch. Verifies the byte-for-byte round-trip via
+// unreorder over every row of a realistic matmul-weight tensor
+// (N=32, K=1024 mirrors a small FFN projection shape).
+TEST(q8_0_reorder_matrixInPlace_roundtrip) {
+    constexpr std::size_t N       = 32;
+    constexpr std::size_t K       = 1024;
+    constexpr std::size_t nblocks = K / 32;
+    constexpr std::size_t rowB    = nblocks * 34;
+
+    std::vector<std::uint8_t> native(N * rowB);
+    for (std::size_t n = 0; n < N; ++n) {
+        std::uint8_t* row = native.data() + n * rowB;
+        for (std::size_t b = 0; b < nblocks; ++b) {
+            std::uint8_t* block = row + b * 34;
+            const std::uint16_t half = static_cast<std::uint16_t>(
+                0x3800U + (n * 13U + b * 17U));
+            writeHalfBits(block, half);
+            for (std::size_t l = 0; l < 32; ++l) {
+                block[2 + l] = static_cast<std::uint8_t>(
+                    static_cast<std::int8_t>(
+                        (n * 3 + b * 7 + l * 11) % 251 - 125));
+            }
+        }
+    }
+
+    // Round-trip via in-place reorder then in-place unreorder should
+    // restore the exact original bytes for every row.
+    std::vector<std::uint8_t> working = native;
+    std::vector<std::uint8_t> scratch(rowB);
+    mimirmind::compute::quant::Q8_0::reorderMatrixInPlace(
+        working.data(), N, K, scratch.data());
+    mimirmind::compute::quant::Q8_0::unreorderMatrixInPlace(
+        working.data(), N, K, scratch.data());
+
+    for (std::size_t i = 0; i < working.size(); ++i) {
+        if (working[i] != native[i]) {
+            EXPECT_TRUE(false &&
+                "reorderMatrixInPlace round-trip mismatch");
+            return;
+        }
+    }
+}
+
+// Semantic parity: after reorderMatrixInPlace, dequantising each row
+// via dequantRowFromReorderedToF32 must produce the same values as
+// dequantising the original native rows via dequantToF32. This is the
+// contract the matmul_q8_0_vec_reorder kernel relies on and the
+// gpu_tests parity gate exercises end-to-end.
+TEST(q8_0_reorder_matrixInPlace_dequantParity) {
+    constexpr std::size_t N       = 16;
+    constexpr std::size_t K       = 2048;
+    constexpr std::size_t nblocks = K / 32;
+    constexpr std::size_t rowB    = nblocks * 34;
+
+    std::vector<std::uint8_t> native(N * rowB);
+    for (std::size_t n = 0; n < N; ++n) {
+        std::uint8_t* row = native.data() + n * rowB;
+        for (std::size_t b = 0; b < nblocks; ++b) {
+            std::uint8_t* block = row + b * 34;
+            const std::uint16_t half = static_cast<std::uint16_t>(
+                0x3800U + (n * 23U + b * 19U));
+            writeHalfBits(block, half);
+            for (std::size_t l = 0; l < 32; ++l) {
+                block[2 + l] = static_cast<std::uint8_t>(
+                    static_cast<std::int8_t>(
+                        (n * 5 + b * 11 + l * 13) % 251 - 125));
+            }
+        }
+    }
+
+    // Reorder in place using a single row-sized scratch.
+    std::vector<std::uint8_t> reordered = native;
+    std::vector<std::uint8_t> scratch(rowB);
+    mimirmind::compute::quant::Q8_0::reorderMatrixInPlace(
+        reordered.data(), N, K, scratch.data());
+
+    // Every row must dequant to the same f32 values via either layout.
+    std::vector<float> viaNative(K);
+    std::vector<float> viaReordered(K);
+    for (std::size_t n = 0; n < N; ++n) {
+        mimirmind::compute::quant::Q8_0::instance().dequantToF32(
+            native.data()    + n * rowB, K, viaNative.data());
+        mimirmind::compute::quant::Q8_0::dequantRowFromReorderedToF32(
+            reordered.data() + n * rowB, K, viaReordered.data());
+        for (std::size_t i = 0; i < K; ++i) {
+            EXPECT_NEAR(viaReordered[i], viaNative[i], 0.0F);
+        }
+    }
+}
+
+// rowBytes is used by callers sizing the reorder scratch — make sure
+// it matches the actual byte count Q8_0 emits per row for a range of
+// production-relevant K values.
+TEST(q8_0_reorder_rowBytes_formula) {
+    using Q8_0 = mimirmind::compute::quant::Q8_0;
+    // K=32 → 1 block × 34 B = 34 B
+    EXPECT_EQ(Q8_0::rowBytes(32),   34U);
+    // K=1024 → 32 blocks × 34 B = 1088 B
+    EXPECT_EQ(Q8_0::rowBytes(1024), 32U * 34U);
+    // K=2816 (E4B FusedQkv row) → 88 blocks × 34 B = 2992 B
+    EXPECT_EQ(Q8_0::rowBytes(2816), 88U * 34U);
+    // K=32768 (post-M9.8b context ceiling) → 1024 blocks × 34 B
+    EXPECT_EQ(Q8_0::rowBytes(32768), 1024U * 34U);
+}
+
 // End-to-end: quantize a random f32 row, reorder it, dequant from the
 // reordered layout, and check that the round-trip stays within the
 // per-block Q8_0 quantisation error bound (1 LSB * max abs scale).

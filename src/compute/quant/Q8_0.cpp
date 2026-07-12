@@ -140,6 +140,32 @@ void Q8_0::unreorderRow(const void* reorderedRow,
     }
 }
 
+void Q8_0::reorderMatrixInPlace(void*       base,
+                                std::size_t N,
+                                std::size_t K,
+                                void*       rowScratch) noexcept {
+    const std::size_t rowB = rowBytes(K);
+    auto* baseBytes = static_cast<std::uint8_t*>(base);
+    for (std::size_t n = 0; n < N; ++n) {
+        std::uint8_t* row = baseBytes + n * rowB;
+        std::memcpy(rowScratch, row, rowB);
+        reorderRow(rowScratch, K, row);
+    }
+}
+
+void Q8_0::unreorderMatrixInPlace(void*       base,
+                                  std::size_t N,
+                                  std::size_t K,
+                                  void*       rowScratch) noexcept {
+    const std::size_t rowB = rowBytes(K);
+    auto* baseBytes = static_cast<std::uint8_t*>(base);
+    for (std::size_t n = 0; n < N; ++n) {
+        std::uint8_t* row = baseBytes + n * rowB;
+        std::memcpy(rowScratch, row, rowB);
+        unreorderRow(rowScratch, K, row);
+    }
+}
+
 void Q8_0::dequantRowFromReorderedToF32(const void* reorderedRow,
                                         std::size_t K,
                                         float*      dst) noexcept {

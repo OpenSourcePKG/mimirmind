@@ -103,6 +103,47 @@ public:
                                              std::size_t K,
                                              float*      dst) noexcept;
 
+    /// Reorder every row of an [N, K] Q8_0 weight matrix in place.
+    /// `base` points at the native-layout weight bytes in USM (or any
+    /// host-writable memory) and is transformed byte-by-byte into the
+    /// reordered layout. `rowScratch` is a caller-owned working buffer
+    /// that must be at least `blockBytes(K)` bytes — the reorder can't
+    /// be done truly in-place because scales and quants interleave
+    /// within each 34-byte block, so we copy one row into the scratch,
+    /// reorder from the scratch back into the row, and move on.
+    ///
+    /// Use case: load-time preprocess for Q8_0 matmul weights. The
+    /// per-row scratch stays row-sized (nBlocks * 34 B, ≤ 34 KiB even
+    /// at K=32768) so a single reusable buffer suffices for a whole
+    /// model's Q8_0 tensor set.
+    ///
+    /// Bit-parity contract: after this call, running
+    /// `dequantRowFromReorderedToF32(base + n*rowBytes, K, ...)` yields
+    /// the same f32 output as running `dequantToF32` did on the same
+    /// row before the call. The matmulQ8_0VecReorderAsync kernel picks
+    /// this layout up 1:1.
+    static void reorderMatrixInPlace(void*       base,
+                                     std::size_t N,
+                                     std::size_t K,
+                                     void*       rowScratch) noexcept;
+
+    /// Inverse of `reorderMatrixInPlace`. Only needed when a downstream
+    /// path insists on native layout (e.g. the Q6_K/Q4_K matmul kernels
+    /// hitting a Q8_0 tensor that was speculatively reordered). Kept
+    /// as a safety valve so we can toggle the whole path off at any
+    /// point without touching the loader.
+    static void unreorderMatrixInPlace(void*       base,
+                                       std::size_t N,
+                                       std::size_t K,
+                                       void*       rowScratch) noexcept;
+
+    /// Byte count of one Q8_0 weight row of length `K`. Handy for
+    /// sizing the per-row scratch used by reorderMatrixInPlace / unreorderMatrixInPlace.
+    /// K must be a multiple of 32.
+    [[nodiscard]] static constexpr std::size_t rowBytes(std::size_t K) noexcept {
+        return (K / kBlockElements) * kBlockBytes;
+    }
+
 private:
     Q8_0() = default;
 
