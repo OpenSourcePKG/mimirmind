@@ -2,7 +2,7 @@
 
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <cstring>
 #include <stdexcept>

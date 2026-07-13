@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/UsmAllocator.hpp"
+#include "core/l0/UsmAllocator.hpp"
 
 #include <cstddef>
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "runtime/CommandQueue.hpp"
-#include "runtime/Config.hpp"
+#include "core/config/Config.hpp"
 #include "runtime/GpuKernel.hpp"
 #include "runtime/GpuModule.hpp"
 #include "runtime/KvCache.hpp"

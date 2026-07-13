@@ -1,7 +1,7 @@
 #include "runtime/OpProfiler.hpp"
 
 #include "runtime/CommandQueue.hpp"
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <cstdio>
 #include <string>

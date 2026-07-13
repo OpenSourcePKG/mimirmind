@@ -1,6 +1,6 @@
-#include "runtime/UsmAllocator.hpp"
+#include "core/l0/UsmAllocator.hpp"
 
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <bit>
 #include <string>

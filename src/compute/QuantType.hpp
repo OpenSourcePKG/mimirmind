@@ -1,6 +1,6 @@
 #pragma once
 
-#include "model/GgufTypes.hpp"
+#include "core/gguf/GgufTypes.hpp"
 
 #include <cstddef>
 #include <string_view>

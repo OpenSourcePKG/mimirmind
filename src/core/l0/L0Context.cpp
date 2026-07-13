@@ -1,6 +1,6 @@
-#include "runtime/L0Context.hpp"
+#include "core/l0/L0Context.hpp"
 
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <algorithm>
 #include <array>

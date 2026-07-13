@@ -1,7 +1,7 @@
 #include "runtime/SpeculativeDecoder.hpp"
 
 #include "compute/SpeculativeSampler.hpp"
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <algorithm>
 #include <chrono>

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "compute/QuantType.hpp"
-#include "model/GgufTypes.hpp"
+#include "core/gguf/GgufTypes.hpp"
 
 #include <span>
 

@@ -1,6 +1,6 @@
 #include "runtime/PerfRegressionDetector.hpp"
 
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <nlohmann/json.hpp>
 

@@ -1,7 +1,7 @@
 #include "model/LlmConfig.hpp"
 
-#include "model/GgufReader.hpp"
-#include "runtime/Log.hpp"
+#include "core/gguf/GgufReader.hpp"
+#include "core/log/Log.hpp"
 
 #include <cstring>
 #include <optional>

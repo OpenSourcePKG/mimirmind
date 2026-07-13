@@ -4,10 +4,10 @@
 #include "compute/Matmul.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
-#include "runtime/Config.hpp"
-#include "runtime/L0Context.hpp"
-#include "runtime/Log.hpp"
-#include "runtime/UsmAllocator.hpp"
+#include "core/config/Config.hpp"
+#include "core/l0/L0Context.hpp"
+#include "core/log/Log.hpp"
+#include "core/l0/UsmAllocator.hpp"
 
 #include <algorithm>
 #include <array>

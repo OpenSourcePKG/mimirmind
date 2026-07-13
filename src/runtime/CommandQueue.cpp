@@ -1,8 +1,8 @@
 #include "runtime/CommandQueue.hpp"
 
 #include "runtime/GpuKernel.hpp"
-#include "runtime/L0Context.hpp"
-#include "runtime/Log.hpp"
+#include "core/l0/L0Context.hpp"
+#include "core/log/Log.hpp"
 
 #include <limits>
 #include <stdexcept>

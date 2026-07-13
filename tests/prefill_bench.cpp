@@ -26,10 +26,10 @@
 #include "compute/GpuOps.hpp"
 #include "compute/quant/Q8_0.hpp"
 #include "runtime/CommandQueue.hpp"
-#include "runtime/Config.hpp"
-#include "runtime/L0Context.hpp"
-#include "runtime/Log.hpp"
-#include "runtime/UsmAllocator.hpp"
+#include "core/config/Config.hpp"
+#include "core/l0/L0Context.hpp"
+#include "core/log/Log.hpp"
+#include "core/l0/UsmAllocator.hpp"
 
 #include <algorithm>
 #include <chrono>

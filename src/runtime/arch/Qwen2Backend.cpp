@@ -3,12 +3,12 @@
 #include "compute/GpuMatmul.hpp"
 #include "compute/GpuOps.hpp"
 #include "model/FusedQkvWeights.hpp"
-#include "model/GgufTypes.hpp"
+#include "core/gguf/GgufTypes.hpp"
 #include "model/LlmConfig.hpp"
-#include "model/WeightsMap.hpp"
+#include "core/gguf/WeightsMap.hpp"
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <cmath>
 #include <stdexcept>

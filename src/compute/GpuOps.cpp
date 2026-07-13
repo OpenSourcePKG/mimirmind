@@ -1,9 +1,9 @@
 #include "compute/GpuOps.hpp"
 
 #include "compute/Attention.hpp"
-#include "runtime/L0Context.hpp"
-#include "runtime/Log.hpp"
-#include "runtime/UsmAllocator.hpp"
+#include "core/l0/L0Context.hpp"
+#include "core/log/Log.hpp"
+#include "core/l0/UsmAllocator.hpp"
 
 #include "compute/quant/Q8_0.hpp"
 

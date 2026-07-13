@@ -1,7 +1,7 @@
 #include "server/PromptTrimmer.hpp"
 
 #include "model/Tokenizer.hpp"
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <algorithm>
 #include <cstddef>

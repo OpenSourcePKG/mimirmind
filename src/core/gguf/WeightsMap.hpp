@@ -1,6 +1,6 @@
 #pragma once
 
-#include "model/GgufReader.hpp"
+#include "core/gguf/GgufReader.hpp"
 
 #include <cstddef>
 #include <string>

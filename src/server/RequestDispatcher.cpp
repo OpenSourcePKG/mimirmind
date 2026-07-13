@@ -1,7 +1,7 @@
 #include "server/RequestDispatcher.hpp"
 
 #include "runtime/InferenceEngine.hpp"
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <nlohmann/json.hpp>
 

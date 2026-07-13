@@ -1,6 +1,6 @@
 #include "compute/Norm.hpp"
 
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <cmath>
 

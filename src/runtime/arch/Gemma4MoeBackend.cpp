@@ -5,13 +5,13 @@
 #include "compute/MoeRouting.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
-#include "model/GgufReader.hpp"
-#include "model/GgufTypes.hpp"
+#include "core/gguf/GgufReader.hpp"
+#include "core/gguf/GgufTypes.hpp"
 #include "model/LlmConfig.hpp"
-#include "model/WeightsMap.hpp"
+#include "core/gguf/WeightsMap.hpp"
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 #include "runtime/OpProfiler.hpp"
 
 #include <cmath>

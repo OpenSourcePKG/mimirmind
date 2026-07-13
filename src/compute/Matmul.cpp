@@ -1,7 +1,7 @@
 #include "compute/Matmul.hpp"
 
 #include "compute/Dequant.hpp"
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <cstdint>
 #include <stdexcept>

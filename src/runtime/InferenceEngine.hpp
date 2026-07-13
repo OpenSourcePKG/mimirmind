@@ -3,18 +3,18 @@
 #include "compute/GpuMatmul.hpp"
 #include "compute/GpuOps.hpp"
 #include "compute/Sampling.hpp"
-#include "model/GgufReader.hpp"
+#include "core/gguf/GgufReader.hpp"
 #include "model/LlmConfig.hpp"
 #include "model/Tokenizer.hpp"
 #include "model/FusedQkvWeights.hpp"
-#include "model/WeightsMap.hpp"
+#include "core/gguf/WeightsMap.hpp"
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/CommandQueue.hpp"
 #include "runtime/KvCache.hpp"
-#include "runtime/L0Context.hpp"
+#include "core/l0/L0Context.hpp"
 #include "runtime/OpProfiler.hpp"
-#include "runtime/UsmAllocator.hpp"
-#include "runtime/UsmHandle.hpp"
+#include "core/l0/UsmAllocator.hpp"
+#include "core/l0/UsmHandle.hpp"
 
 namespace mimirmind::runtime {
 struct Config;

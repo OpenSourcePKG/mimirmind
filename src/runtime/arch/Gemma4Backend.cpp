@@ -6,7 +6,7 @@
 #include "runtime/arch/Gemma4MoeBackend.hpp"
 
 #include "model/LlmConfig.hpp"
-#include "model/WeightsMap.hpp"
+#include "core/gguf/WeightsMap.hpp"
 
 namespace mimirmind::runtime::arch {
 

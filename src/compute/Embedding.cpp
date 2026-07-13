@@ -1,7 +1,7 @@
 #include "compute/Embedding.hpp"
 
 #include "compute/Dequant.hpp"
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <cstring>
 #include <stdexcept>

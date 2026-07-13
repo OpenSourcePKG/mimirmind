@@ -1,6 +1,6 @@
 #pragma once
 
-#include "model/GgufTypes.hpp"
+#include "core/gguf/GgufTypes.hpp"
 #include "runtime/CommandQueue.hpp"
 #include "runtime/GpuKernel.hpp"
 #include "runtime/GpuModule.hpp"

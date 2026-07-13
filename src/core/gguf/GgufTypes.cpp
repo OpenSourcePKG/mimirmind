@@ -1,4 +1,4 @@
-#include "model/GgufTypes.hpp"
+#include "core/gguf/GgufTypes.hpp"
 
 namespace mimirmind::model {
 

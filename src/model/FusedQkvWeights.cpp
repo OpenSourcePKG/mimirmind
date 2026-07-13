@@ -3,10 +3,10 @@
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
 #include "compute/quant/Q8_0.hpp"
-#include "model/GgufReader.hpp"
-#include "model/WeightsMap.hpp"
-#include "runtime/Log.hpp"
-#include "runtime/UsmAllocator.hpp"
+#include "core/gguf/GgufReader.hpp"
+#include "core/gguf/WeightsMap.hpp"
+#include "core/log/Log.hpp"
+#include "core/l0/UsmAllocator.hpp"
 
 #include <cstring>
 #include <string_view>

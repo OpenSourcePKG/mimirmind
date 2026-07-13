@@ -8,7 +8,7 @@
 
 #include "model/ChatTemplate.hpp"
 #include "runtime/InferenceEngine.hpp"
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>

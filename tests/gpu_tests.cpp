@@ -25,11 +25,11 @@
 #include "compute/QuantTypeRegistry.hpp"
 #include "compute/Rope.hpp"
 #include "compute/quant/Q8_0.hpp"
-#include "model/GgufTypes.hpp"
+#include "core/gguf/GgufTypes.hpp"
 #include "runtime/CommandQueue.hpp"
-#include "runtime/Config.hpp"
-#include "runtime/L0Context.hpp"
-#include "runtime/UsmAllocator.hpp"
+#include "core/config/Config.hpp"
+#include "core/l0/L0Context.hpp"
+#include "core/l0/UsmAllocator.hpp"
 
 #include <algorithm>
 #include <array>

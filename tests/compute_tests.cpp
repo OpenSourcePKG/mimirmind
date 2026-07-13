@@ -13,7 +13,7 @@
 #include "compute/Sampling.hpp"
 #include "compute/quant/Q6K.hpp"
 #include "compute/quant/Q8_0.hpp"
-#include "model/GgufTypes.hpp"
+#include "core/gguf/GgufTypes.hpp"
 
 #include <array>
 #include <cmath>

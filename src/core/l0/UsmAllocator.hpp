@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/L0Context.hpp"
+#include "core/l0/L0Context.hpp"
 
 #include <array>
 #include <cstddef>

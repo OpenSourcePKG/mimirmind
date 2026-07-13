@@ -1,6 +1,6 @@
-#include "model/WeightsMap.hpp"
+#include "core/gguf/WeightsMap.hpp"
 
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <stdexcept>
 #include <string>

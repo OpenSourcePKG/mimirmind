@@ -1,7 +1,7 @@
-#include "model/GgufReader.hpp"
+#include "core/gguf/GgufReader.hpp"
 
-#include "runtime/Log.hpp"
-#include "runtime/UsmAllocator.hpp"
+#include "core/log/Log.hpp"
+#include "core/l0/UsmAllocator.hpp"
 
 #include <cstring>
 #include <stdexcept>

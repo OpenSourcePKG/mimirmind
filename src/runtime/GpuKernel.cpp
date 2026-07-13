@@ -1,7 +1,7 @@
 #include "runtime/GpuKernel.hpp"
 
-#include "runtime/L0Context.hpp"
-#include "runtime/Log.hpp"
+#include "core/l0/L0Context.hpp"
+#include "core/log/Log.hpp"
 
 namespace mimirmind::runtime {
 

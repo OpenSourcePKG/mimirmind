@@ -1,7 +1,7 @@
 #pragma once
 
-#include "model/GgufTypes.hpp"
-#include "runtime/UsmHandle.hpp"
+#include "core/gguf/GgufTypes.hpp"
+#include "core/l0/UsmHandle.hpp"
 #include "runtime/arch/GemmaBaseBackend.hpp"
 
 #include <cstddef>

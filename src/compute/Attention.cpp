@@ -1,6 +1,6 @@
 #include "compute/Attention.hpp"
 
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
 #include <algorithm>
 #include <cmath>

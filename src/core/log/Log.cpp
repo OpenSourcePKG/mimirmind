@@ -1,6 +1,6 @@
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 
-#include "runtime/Config.hpp"
+#include "core/config/Config.hpp"
 
 #include <atomic>
 #include <chrono>

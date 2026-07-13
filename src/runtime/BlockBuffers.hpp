@@ -1,8 +1,8 @@
 #pragma once
 
 #include "model/LlmConfig.hpp"
-#include "runtime/UsmAllocator.hpp"
-#include "runtime/UsmHandle.hpp"
+#include "core/l0/UsmAllocator.hpp"
+#include "core/l0/UsmHandle.hpp"
 
 #include <cstddef>
 

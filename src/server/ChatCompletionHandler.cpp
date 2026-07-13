@@ -9,7 +9,7 @@
 
 #include "model/ResponseCleaner.hpp"
 #include "model/Tokenizer.hpp"
-#include "runtime/Log.hpp"
+#include "core/log/Log.hpp"
 #include "runtime/SpeculativeDecoder.hpp"
 #include "runtime/ThermalGuard.hpp"
 

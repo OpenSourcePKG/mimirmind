@@ -184,6 +184,47 @@ list(APPEND KERNEL_SPV_FILES ${GQA_KTILE64_SPV})
 
 add_custom_target(spv_kernels ALL DEPENDS ${KERNEL_SPV_FILES})
 
+# cpp-httplib pulls in <thread> and <pthread> for its server loop; also
+# used by mimirmind_core::Log for its background file sink.
+find_package(Threads REQUIRED)
+
+# ---- mimirmind_core — shared static library --------------------------------
+#
+# Foundation code shared between mimirmind (the inference engine) and future
+# munin (persistent model-memory daemon, see M-Munin ADR). Contains only the
+# pieces both binaries must touch: Level-Zero context, USM allocation, GGUF
+# parsing, config loading, logging. No compute kernels, no HTTP, no
+# inference logic.
+
+add_library(mimirmind_core STATIC
+    src/core/config/Config.cpp
+    src/core/gguf/GgufReader.cpp
+    src/core/gguf/GgufTypes.cpp
+    src/core/gguf/WeightsMap.cpp
+    src/core/l0/L0Context.cpp
+    src/core/l0/MappedFile.cpp
+    src/core/l0/UsmAllocator.cpp
+    src/core/log/Log.cpp
+)
+
+# PUBLIC so consumers get the transitive header include paths (ze_api.h
+# through L0Context.hpp, nlohmann/json through Config.hpp).
+target_include_directories(mimirmind_core PUBLIC
+    src
+    ${LEVEL_ZERO_INCLUDE_DIR}
+)
+
+# Vendored nlohmann/json (Config). SYSTEM so upstream code does not trip
+# our strict warning flags in consumers of mimirmind_core.
+target_include_directories(mimirmind_core SYSTEM PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+)
+
+target_link_libraries(mimirmind_core PUBLIC
+    ${LEVEL_ZERO_LIBRARY}
+    Threads::Threads
+)
+
 # ---- Targets ----------------------------------------------------------------
 
 add_executable(mimirmind
@@ -211,32 +252,24 @@ add_executable(mimirmind
     src/compute/quant/Q8_0.cpp
     src/model/ChatTemplate.cpp
     src/model/FusedQkvWeights.cpp
-    src/model/GgufReader.cpp
-    src/model/GgufTypes.cpp
     src/model/LlmConfig.cpp
     src/model/ResponseCleaner.cpp
     src/model/Tokenizer.cpp
-    src/model/WeightsMap.cpp
     src/runtime/BlockBuffers.cpp
     src/runtime/CommandQueue.cpp
-    src/runtime/Config.cpp
     src/runtime/GpuKernel.cpp
     src/runtime/GpuModule.cpp
     src/runtime/InferenceEngine.cpp
     src/runtime/KvCache.cpp
     src/runtime/SpeculativeDecoder.cpp
-    src/runtime/L0Context.cpp
-    src/runtime/Log.cpp
     src/runtime/FanController.cpp
     src/runtime/GpuClockGovernor.cpp
-    src/runtime/MappedFile.cpp
     src/runtime/OpProfiler.cpp
     src/runtime/PerfRegressionDetector.cpp
     src/runtime/PowerMonitor.cpp
     src/runtime/SystemMonitor.cpp
     src/runtime/ThermalGuard.cpp
     src/runtime/ThermalProfile.cpp
-    src/runtime/UsmAllocator.cpp
     src/runtime/arch/ArchBackend.cpp
     src/runtime/arch/GemmaBaseBackend.cpp
     src/runtime/arch/Gemma4Backend.cpp
@@ -257,24 +290,14 @@ add_executable(mimirmind
 
 add_dependencies(mimirmind spv_kernels)
 
-target_include_directories(mimirmind PRIVATE
-    src
-    ${LEVEL_ZERO_INCLUDE_DIR}
-)
-
-# Vendored single-header libraries (cpp-httplib, nlohmann/json). SYSTEM
-# so upstream code does not trip our strict warning flags.
+# cpp-httplib is only used by the server, not by mimirmind_core. SYSTEM so
+# upstream code does not trip our strict warning flags.
 target_include_directories(mimirmind SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
-# cpp-httplib pulls in <thread> and <pthread> for its server loop.
-find_package(Threads REQUIRED)
-
 target_link_libraries(mimirmind PRIVATE
-    ${LEVEL_ZERO_LIBRARY}
-    Threads::Threads
+    mimirmind_core
 )
 
 # ---- quant_tests — pure-CPU unit tests for compute::QuantType ---------------
@@ -297,13 +320,11 @@ add_executable(quant_tests
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
-    src/model/GgufTypes.cpp
-    src/runtime/Log.cpp
 )
 
-target_include_directories(quant_tests PRIVATE src tests)
+target_include_directories(quant_tests PRIVATE tests)
 
-target_link_libraries(quant_tests PRIVATE Threads::Threads)
+target_link_libraries(quant_tests PRIVATE mimirmind_core)
 
 # ---- arch_tests — pure-CPU tests for arch-related logic ---------------------
 #
@@ -323,25 +344,16 @@ add_executable(arch_tests
     src/compute/MoeRouting.cpp
     src/compute/Softmax.cpp
     src/model/ResponseCleaner.cpp
-    src/runtime/Config.cpp
     src/runtime/GpuClockGovernor.cpp
-    src/runtime/Log.cpp
     src/runtime/PowerMonitor.cpp
     src/runtime/SystemMonitor.cpp
     src/runtime/ThermalGuard.cpp
     src/runtime/ThermalProfile.cpp
 )
 
-target_include_directories(arch_tests PRIVATE src tests)
+target_include_directories(arch_tests PRIVATE tests)
 
-# ThermalProfile pulls in nlohmann/json — same vendored header the main
-# target uses. SYSTEM so the test binary stays strict on our own code
-# without dragging upstream warnings into our -Wall -Wextra -Wpedantic.
-target_include_directories(arch_tests SYSTEM PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
-)
-
-target_link_libraries(arch_tests PRIVATE Threads::Threads)
+target_link_libraries(arch_tests PRIVATE mimirmind_core)
 
 # ---- compute_tests — pure-CPU tests for CPU compute primitives -------------
 #
@@ -366,13 +378,11 @@ add_executable(compute_tests
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
-    src/model/GgufTypes.cpp
-    src/runtime/Log.cpp
 )
 
-target_include_directories(compute_tests PRIVATE src tests)
+target_include_directories(compute_tests PRIVATE tests)
 
-target_link_libraries(compute_tests PRIVATE Threads::Threads)
+target_link_libraries(compute_tests PRIVATE mimirmind_core)
 
 # ---- gpu_tests — verify GPU kernels match CPU reference math ---------------
 #
@@ -407,27 +417,16 @@ add_executable(gpu_tests
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
-    src/model/GgufTypes.cpp
     src/runtime/CommandQueue.cpp
     src/runtime/GpuKernel.cpp
     src/runtime/GpuModule.cpp
-    src/runtime/L0Context.cpp
-    src/runtime/Log.cpp
-    src/runtime/UsmAllocator.cpp
 )
 
 add_dependencies(gpu_tests spv_kernels)
 
-target_include_directories(gpu_tests PRIVATE
-    src
-    tests
-    ${LEVEL_ZERO_INCLUDE_DIR}
-)
+target_include_directories(gpu_tests PRIVATE tests)
 
-target_link_libraries(gpu_tests PRIVATE
-    ${LEVEL_ZERO_LIBRARY}
-    Threads::Threads
-)
+target_link_libraries(gpu_tests PRIVATE mimirmind_core)
 
 # ---- prefill_bench — wall-clock micro-benchmark for GpuOps::attentionAsync -
 #
@@ -463,24 +462,13 @@ add_executable(prefill_bench
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
-    src/model/GgufTypes.cpp
     src/runtime/CommandQueue.cpp
     src/runtime/GpuKernel.cpp
     src/runtime/GpuModule.cpp
-    src/runtime/L0Context.cpp
-    src/runtime/Log.cpp
-    src/runtime/UsmAllocator.cpp
 )
 
 add_dependencies(prefill_bench spv_kernels)
 
-target_include_directories(prefill_bench PRIVATE
-    src
-    tests
-    ${LEVEL_ZERO_INCLUDE_DIR}
-)
+target_include_directories(prefill_bench PRIVATE tests)
 
-target_link_libraries(prefill_bench PRIVATE
-    ${LEVEL_ZERO_LIBRARY}
-    Threads::Threads
-)
+target_link_libraries(prefill_bench PRIVATE mimirmind_core)

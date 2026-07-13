@@ -1,7 +1,7 @@
 #pragma once
 
-#include "model/GgufTypes.hpp"
-#include "runtime/MappedFile.hpp"
+#include "core/gguf/GgufTypes.hpp"
+#include "core/l0/MappedFile.hpp"
 
 #include <cstddef>
 #include <cstdint>
