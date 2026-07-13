@@ -472,3 +472,34 @@ add_dependencies(prefill_bench spv_kernels)
 target_include_directories(prefill_bench PRIVATE tests)
 
 target_link_libraries(prefill_bench PRIVATE mimirmind_core)
+
+# ---- l0_ipc_testrig — go/no-go gate for M-Munin ----------------------------
+#
+# Standalone diagnostic: two-process test of zeMemGetIpcHandle /
+# zeMemOpenIpcHandle on the target iGPU. Independent of mimirmind_core
+# (uses raw L0 API only) so a failure here isolates the question to
+# Level Zero itself, not our wrapper.
+#
+# Not installed in the runtime image — this is a hardware-verification
+# tool, not a shipped component. Build + run inside the builder
+# container on the target host:
+#
+#   docker compose run --rm builder bash -lc '
+#       cmake --build /src/build --target l0_ipc_testrig &&
+#       /src/tools/l0-ipc-testrig.sh /src/build/l0_ipc_testrig
+#   '
+#
+# The runner in tools/l0-ipc-testrig.sh launches owner + attacher and
+# reports TESTRIG: PASS or TESTRIG: FAIL.
+
+add_executable(l0_ipc_testrig
+    tools/l0-ipc-testrig.cpp
+)
+
+target_include_directories(l0_ipc_testrig PRIVATE
+    ${LEVEL_ZERO_INCLUDE_DIR}
+)
+
+target_link_libraries(l0_ipc_testrig PRIVATE
+    ${LEVEL_ZERO_LIBRARY}
+)
