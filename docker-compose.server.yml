@@ -145,6 +145,11 @@ services:
             # LZ-Loader-env-Vars, keine mimirmind-Runtime-Knöpfe.
             UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
             UR_L0_USE_RELAXED_ALLOCATION_LIMITS:    "1"
+            # Bench-only override for the M-Munin usm-alloc-kind gate.
+            # Empty → compiled default (Shared). Set MIMIRMIND_USM_KIND
+            # in the shell before `docker compose up` for the perf
+            # comparison run (values: "shared" or "host").
+            MIMIRMIND_USM_KIND: "${MIMIRMIND_USM_KIND:-}"
 
         volumes:
             - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
