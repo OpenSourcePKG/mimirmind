@@ -228,7 +228,7 @@ target_link_libraries(mimirmind_core PUBLIC
 # ---- Targets ----------------------------------------------------------------
 
 add_executable(mimirmind
-    src/main.cpp
+    src/mimirmind/main.cpp
     src/compute/Activations.cpp
     src/compute/Attention.cpp
     src/compute/Dequant.cpp
