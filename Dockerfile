@@ -116,6 +116,21 @@ RUN cmake -S src -B build -G Ninja \
 # ============================================================================
 # Stage 3 — Runtime (no toolchain, no source, just runtime libs + binary)
 # ============================================================================
+#
+# Two runtime stages. Both live under the same base (ubuntu:24.04 + Intel
+# Level Zero) but ship different binaries:
+#
+#   - `runtime`       — the full mimirmind inference engine + SPV kernels
+#                       + llama.cpp parity oracle. Around 500 MB.
+#   - `munin_runtime` — just the Munin persistent-memory daemon. No SPV
+#                       (Munin never dispatches kernels), no httplib, no
+#                       llama-cli, no python. Around 200 MB, updated
+#                       independently from mimirmind so the model-load
+#                       downtime savings survive worker deploys.
+#
+# The M-Munin ADR (decisions/2026-07-13-m-munin-scope.md) is the source
+# of truth for what belongs where.
+
 FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -189,3 +204,55 @@ RUN chmod +x /usr/local/bin/parity-diff
 # /usr/local/share/mimirmind/spv (baked in above).
 
 ENTRYPOINT ["/usr/local/bin/mimirmind"]
+
+
+# ============================================================================
+# Stage 4 — Munin runtime (persistent model-memory daemon)
+# ============================================================================
+#
+# Ships only the `munin` binary. Munin holds model tensors in USM(host)
+# across mimirmind-worker restarts (see M-Munin ADR). No compute kernels,
+# no HTTP surface, no reference-oracle tooling — Munin's whole job is
+# owning memory and talking to attached workers over a Unix socket.
+#
+# The image is intentionally small so a Munin redeploy stays cheap; the
+# whole point of splitting Munin out of mimirmind is that its lifecycle
+# is decoupled from the compute code. Bumping mimirmind:latest does not
+# touch munin:latest.
+
+FROM ubuntu:24.04 AS munin_runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        wget \
+        gnupg \
+    && wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
+        | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
+https://repositories.intel.com/gpu/ubuntu noble client" \
+        > /etc/apt/sources.list.d/intel-gpu.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        level-zero \
+        intel-level-zero-gpu \
+    && apt-get purge -y wget gnupg \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# ubuntu:24.04 lacks the `render` GID that the compose file passes via
+# --group-add 104. Create both at the well-known Ubuntu numbers so
+# /dev/dri passthrough works — same rationale as the mimirmind runtime.
+RUN groupadd -g 44  video  2>/dev/null || true \
+ && groupadd -g 104 render 2>/dev/null || true
+
+# Level Zero: lift the 4-GiB single-allocation cap. Munin allocates one
+# USM buffer per tensor (720 for E4B, 800+ for 26B-A4B) and the largest
+# individual weight can exceed 4 GiB on 26B-A4B.
+ENV UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
+ENV UR_L0_USE_RELAXED_ALLOCATION_LIMITS=1
+
+COPY --from=build /src/build/munin              /usr/local/bin/munin
+COPY --from=build /src/config.example.json      /usr/local/share/mimirmind/config.example.json
+
+ENTRYPOINT ["/usr/local/bin/munin"]

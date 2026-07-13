@@ -18,18 +18,25 @@ If you are running this from a Proxmox LXC container, see
 to forward `/dev/dri` properly. Without that the container will see
 the device node but Level Zero will fail to initialise.
 
-## Two compose files, two workflows
+## Three compose files, three workflows
 
-The repository ships two compose files. Pick the one that matches what
-you are doing:
+The repository ships three compose files. Pick the one that matches
+what you are doing:
 
 `docker-compose.yml` — **dev**: builds the image locally from your
 checkout, runs the builder container against the host's source tree.
 Use this when you are editing the engine.
 
-`docker-compose.server.yml` — **deploy**: pulls a tagged image from
-the project registry, no build step. Use this when you are running
-against a known-good image.
+`docker-compose.server.yml` — **deploy (standalone)**: pulls a tagged
+image from the project registry, no build step. Single-process
+mimirmind that owns everything — weights, KV cache, governor.
+
+`docker-compose.munin.yml` — **deploy (attached)**: two services —
+`munin` (long-lived, holds model tensors in USM) and `mimirmind` (short-
+lived attached worker, restarted on redeploy). Use this when you want
+the deploy-downtime win of M-Munin: worker restart is ~2 s instead of
+~90 s because Munin keeps the models resident across worker
+lifecycles.
 
 ## Iterative development (builder container)
 
@@ -134,6 +141,94 @@ docker compose -f docker-compose.server.yml run --rm mimirmind \
     --prompt "What is the capital of France?"
 ```
 
+## Attached deployment (M-Munin)
+
+The M-Munin architecture splits the mimirmind runtime into two
+processes: `munin` holds the model tensors in USM(host) across
+worker restarts, and `mimirmind serve --attach` connects over a
+Unix socket and imports the tensors zero-copy via L0 IPC
+(`zeMemOpenIpcHandle` + `SCM_RIGHTS`). The full design lives in the
+Synaipse note `Memory/mimirmind/decisions/2026-07-13-m-munin-scope.md`.
+
+Two separate registry images:
+
+- `munin:latest` — small (~340 MB), just the daemon. Long-lived,
+  rarely redeployed. Runs `/usr/local/bin/munin`.
+- `mimirmind:latest` — full inference engine (~460 MB). Short-lived,
+  redeployed on every code change. Runs `mimirmind serve --attach ...`.
+
+Build both from the same source tree via multi-stage targets:
+
+```bash
+docker build --target runtime       -t mimirmind:latest .
+docker build --target munin_runtime -t munin:latest .
+```
+
+`.env` extends the standalone deployment's variables with one extra
+image reference:
+
+```dotenv
+MUNIN_IMAGE=munin:latest
+MIMIRMIND_IMAGE=mimirmind:latest
+MIMIRMIND_MODELS_DIR=/srv/llm-models
+MIMIRMIND_CONFIG_HOST=/etc/mimirmind/config.json
+MIMIRMIND_RENDER_GID=104
+MIMIRMIND_VIDEO_GID=44
+MIMIRMIND_PORT=8080
+```
+
+Both containers share a tmpfs volume mounted at `/var/run/mimirmind/`
+that carries the Unix socket (`munin.sock`) and the governor
+ownership flock (`governor.lock`).
+
+Initial bringup:
+
+```bash
+# Munin loads all loadOnStart:true models — takes as long as a
+# standalone boot (~90 s for Gemma 4 4B), once, at daemon start.
+docker compose -f docker-compose.munin.yml up -d munin
+
+# Watch for "ModelStore: N model(s) resident in USM" before starting
+# the worker.
+docker compose -f docker-compose.munin.yml logs -f munin
+
+# Worker attaches over IPC — takes ~2 s (healthz + manifest + N
+# handle imports, no tensor copy).
+docker compose -f docker-compose.munin.yml up -d mimirmind
+```
+
+Redeploy the worker (the entire business case):
+
+```bash
+docker compose -f docker-compose.munin.yml pull mimirmind
+docker compose -f docker-compose.munin.yml up -d mimirmind
+```
+
+Munin stays up. The old worker's socket closes (Munin observes
+implicit detach), the new worker connects, does one healthz probe,
+verifies the manifest fingerprint against its own local GGUF header,
+imports the handles, and starts serving. End-to-end downtime: ~2 s
+on Gemma 4 4B, plus whatever depends_on's health-poll interval adds.
+
+Munin redeploy is rare and unavoidable — every attached worker goes
+down with Munin because their USM pointers are invalidated when
+Munin's process exits. Plan a maintenance window:
+
+```bash
+docker compose -f docker-compose.munin.yml pull munin
+docker compose -f docker-compose.munin.yml up -d --force-recreate munin
+docker compose -f docker-compose.munin.yml restart mimirmind
+```
+
+Governor ownership is coordinated by an advisory `flock(2)` on
+`/var/run/mimirmind/governor.lock`. Munin acquires it at startup and
+holds it for its whole lifetime; the attached worker reads the
+governor owner from Munin's healthz response and skips its own
+`ThermalGuard` / `GpuClockGovernor` / `FanController` install. A
+second standalone `mimirmind serve` on the same host fails fast with
+a message pointing at the current holder's PID — this is the desired
+behaviour.
+
 ## Troubleshooting
 
 **`L0Context: zeInit failed`** — `/dev/dri` is not present in the
@@ -153,6 +248,32 @@ running a pre-M8.G image. Pull a newer tag.
 **Chat returns markup like `<|channel>thought\n<channel|>` in the
 content field** — you are running a pre-`e2d1f2f` image. The
 post-decode cleanup landed in that commit.
+
+**Attached worker: `Munin healthz failed: connect(...) No such file
+or directory`** — Munin's Unix socket is not visible in the worker
+container. Check that both services mount the same named volume at
+`/var/run/mimirmind/` (`docker volume inspect
+mimirmind_mimirmind_run` lists the mountpoints).
+
+**Attached worker: `Munin reports governor_owner='...', expected
+'munin'`** — the healthz response says another process owns the
+governor. Schritt 8-minimal hardcodes the owner to `"munin"` while
+the daemon runs; if you see a different value, someone bumped the
+protocol or Munin lost the flock. Check `/proc/locks` on the host.
+
+**Attached worker: `fingerprint mismatch — Munin advertised '...'
+but the local GGUF hashes to '...'`** — the model file mounted in
+the worker container is a different revision than what Munin
+loaded. Either Munin's `MIMIRMIND_MODELS_DIR` and the worker's do
+not match, or someone re-downloaded a GGUF while Munin was up. Bring
+Munin down and back up (which reloads from the current file) or fix
+the mount.
+
+**Standalone `mimirmind serve` fails with `GovernorLock: flock(...)
+failed: Resource temporarily unavailable (held by pid X)`** — Munin
+or another standalone mimirmind is already running on this host. If
+it is Munin, use `--attach unix:/var/run/mimirmind/munin.sock`
+instead. If it is stale, `kill X` and retry.
 
 ## Build dependencies (for reference)
 

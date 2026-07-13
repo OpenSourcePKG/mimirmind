@@ -1,0 +1,222 @@
+# docker-compose.munin.yml — Attached-Deploy für M-Munin.
+#
+# Zweck: den Deploy-Downtime-Case von M-Munin einlösen. Munin läuft
+# long-lived (unless-stopped), hält die Modelle in USM(host) und exportiert
+# per L0-IPC an einen attached-mimirmind-Worker. Ein Worker-Redeploy zieht
+# das kleine mimirmind:latest neu, Munin bleibt unangetastet — die 90 s
+# Load-Downtime des Standalone-Pfads werden zu ~2 s Worker-Restart.
+#
+# Voraussetzungen:
+#   - Vorbaute Images in der Registry:
+#       ${MUNIN_IMAGE:-munin:latest}       — kleine Munin-only-Image
+#       ${MIMIRMIND_IMAGE:-mimirmind:latest} — die volle Inference-Image
+#     Beide bauen aus demselben Dockerfile (target: munin_runtime vs
+#     runtime). Registry-Push macht der User selbst.
+#   - GGUFs unter ${MIMIRMIND_MODELS_DIR} (default: ./models)
+#   - Host-Config unter ${MIMIRMIND_CONFIG_HOST} (default: ./config.json)
+#   - Intel iGPU/dGPU unter /dev/dri
+#
+# Compose-Steuerung (Env-Vars):
+#   export MUNIN_IMAGE=docker-registry.example.com/munin:latest
+#   export MIMIRMIND_IMAGE=docker-registry.example.com/mimirmind:latest
+#   export MIMIRMIND_MODELS_DIR=/srv/llm-models
+#   export MIMIRMIND_CONFIG_HOST=/etc/mimirmind/config.json
+#   export MIMIRMIND_RENDER_GID=$(getent group render | cut -d: -f3)
+#   export MIMIRMIND_VIDEO_GID=$(getent group video  | cut -d: -f3)
+#   export MIMIRMIND_PORT=8080
+#
+# Workflows:
+#
+# ── Initial-Bringup ──────────────────────────────────────────────────────
+#
+#   # 1) Munin starten und Modelle laden (dauert wie ein voller Standalone-
+#   #    Boot — die 90 s sind hier, aber nur einmalig).
+#   docker compose -f docker-compose.munin.yml up -d munin
+#
+#   # 2) Prüfen dass Munin die Modelle hat.
+#   docker compose -f docker-compose.munin.yml logs -f munin
+#   # Erwartete Zeile: "ModelStore: N model(s) resident in USM"
+#
+#   # 3) Attached-Worker starten.
+#   docker compose -f docker-compose.munin.yml up -d mimirmind
+#
+#   # 4) Chat probieren.
+#   curl -s http://localhost:${MIMIRMIND_PORT:-8080}/health
+#   curl -s http://localhost:${MIMIRMIND_PORT:-8080}/v1/chat/completions \
+#       -H 'Content-Type: application/json' \
+#       -d '{"messages":[{"role":"user","content":"Hi!"}]}'
+#
+# ── Worker-Redeploy (der Business-Case) ──────────────────────────────────
+#
+#   # Munin läuft weiter. Nur der Worker wird neu geladen.
+#   docker compose -f docker-compose.munin.yml pull mimirmind
+#   docker compose -f docker-compose.munin.yml up -d mimirmind
+#
+#   # Downtime = Worker-Container-Kill + Neustart + healthz + attach = ~2 s.
+#   # Munin's healthz-Session hält die USM-Pointer verfügbar; der neue
+#   # Worker importiert direkt via SCM_RIGHTS + zeMemOpenIpcHandle.
+#
+# ── Munin-Redeploy (selten) ──────────────────────────────────────────────
+#
+#   # Wenn Munin selbst neu deployed wird, gehen alle attached-Worker mit
+#   # runter (die USM-Pointer werden invalidiert). Erwartete Downtime
+#   # entspricht dem Standalone-Boot. Wähl den Wartungsfenster
+#   # entsprechend.
+#   docker compose -f docker-compose.munin.yml pull munin
+#   docker compose -f docker-compose.munin.yml up -d --force-recreate munin
+#   docker compose -f docker-compose.munin.yml restart mimirmind
+#
+# ── Governor-Ownership ───────────────────────────────────────────────────
+#
+# Munin acquired die flock auf /var/run/mimirmind/governor.lock beim Start.
+# Der attached-Worker prüft das per healthz und skipped seinen eigenen
+# ThermalGuard/GpuClockGovernor/FanController-Install. Ein zweites
+# standalone-mimirmind auf demselben Host würde Munin's flock nicht
+# bekommen und fail-fast mit klarer Meldung — genau so ist es gewollt.
+
+services:
+
+    # ------------------------------------------------------------------
+    # munin — persistent model-memory daemon (M-Munin Tier-1).
+    #         Long-lived, hält alle loadOnStart-Modelle in USM(host)
+    #         und exportiert sie via L0-IPC an attached workers.
+    # ------------------------------------------------------------------
+    munin:
+        image: ${MUNIN_IMAGE:-munin:latest}
+        container_name: mimirmind-munin
+        pull_policy: always
+        restart: unless-stopped
+
+        # /dev/dri braucht Munin um zeMemAllocHost + zeMemGetIpcHandle
+        # aufzurufen. Kein Kernel-Dispatch — Munin hält Speicher, kompiliert
+        # nichts, rechnet nichts (siehe ADR Hard-No-Liste).
+        devices:
+            - /dev/dri:/dev/dri
+
+        group_add:
+            - "${MIMIRMIND_RENDER_GID:-104}"
+            - "${MIMIRMIND_VIDEO_GID:-44}"
+
+        # Kein systempaths=unconfined — Munin liest keine RAPL-Counter.
+        # sysfs-Governance-Writes gehen über eine separate Route (siehe
+        # unten), die der attached-Worker nicht braucht.
+
+        environment:
+            UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
+            UR_L0_USE_RELAXED_ALLOCATION_LIMITS:    "1"
+
+        volumes:
+            # Shared Socket + Governor-Lock. Beide Container sehen
+            # denselben Inode über das benannte Volume.
+            - mimirmind_run:/var/run/mimirmind
+
+            # Models read-only. Munin öffnet die GGUFs, kopiert die
+            # Tensoren in USM, und schließt die mmap — Modelle könnten
+            # danach entfernt werden, aber wir lassen den Mount für
+            # Debug-Zwecke.
+            - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
+
+            # Config bind-mount. Munin liest nur runtime.* und models.*
+            # aus derselben config.json wie mimirmind.
+            - ${MIMIRMIND_CONFIG_HOST:-./config.json}:/etc/mimirmind/config.json:ro
+
+            # iGPU sysfs für Governor-Ownership (Munin darf, Worker nicht).
+            # Auch wenn Schritt 8 den Governor-Reload noch nicht in Munin
+            # eingebaut hat, muss die Route offen sein — sonst schlägt
+            # ein späterer SIGHUP-basierter Reload im gleichen Container
+            # fehl.
+            - /sys/class/drm:/sys/class/drm:rw
+            - /sys/devices:/sys/devices:rw
+
+        command:
+            - --config
+            - /etc/mimirmind/config.json
+            - --socket
+            - /var/run/mimirmind/munin.sock
+
+        # Healthcheck über die pure Socket-Existenz. Ein voller
+        # healthz-Roundtrip bräuchte ein Client-Binary im Munin-Image,
+        # das dort nicht liegt (Munin-Image ist absichtlich minimal).
+        # Socket-Existenz ist der erste Beweis dass listen() gelaufen ist
+        # — Munin schreibt sie erst dann, sobald ModelStore fertig
+        # geladen hat.
+        healthcheck:
+            test: ["CMD", "test", "-S", "/var/run/mimirmind/munin.sock"]
+            interval: 5s
+            timeout: 2s
+            retries: 30
+            start_period: 120s   # allow slow initial model load (~90 s)
+
+    # ------------------------------------------------------------------
+    # mimirmind — attached inference worker.
+    #             Kurz-lebig, restart:no, nutzt L0-IPC über
+    #             /var/run/mimirmind/munin.sock statt eigenen
+    #             GgufReader::loadTensors.
+    # ------------------------------------------------------------------
+    mimirmind:
+        image: ${MIMIRMIND_IMAGE:-mimirmind:latest}
+        container_name: mimirmind-worker
+        pull_policy: always
+        restart: "no"
+
+        depends_on:
+            munin:
+                condition: service_healthy
+
+        devices:
+            - /dev/dri:/dev/dri
+
+        group_add:
+            - "${MIMIRMIND_RENDER_GID:-104}"
+            - "${MIMIRMIND_VIDEO_GID:-44}"
+
+        # Nur der Worker liest RAPL für die per-request-usage-Berichte.
+        security_opt:
+            - systempaths=unconfined
+
+        environment:
+            UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
+            UR_L0_USE_RELAXED_ALLOCATION_LIMITS:    "1"
+
+        volumes:
+            # Shared Volume für den Munin-Socket.
+            - mimirmind_run:/var/run/mimirmind
+
+            # Der Worker öffnet die GGUFs immer noch für Header-Parse
+            # (LlmConfig + Tokenizer + Fingerprint-Verify), kopiert aber
+            # keine Tensoren mehr — die kommen per IPC von Munin.
+            - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
+
+            # State + Logs wie im Standalone-Setup.
+            - ./run-logs:/logs:rw
+            - ${MIMIRMIND_STATE_DIR:-./run-state}:/root/.cache/mimirmind:rw
+
+            # Config identisch zu Munin's Config (gleicher Bind-Mount
+            # zwingend, sonst zieht der Fingerprint-Refuse-Pfad wenn
+            # models[].path divergieren).
+            - ${MIMIRMIND_CONFIG_HOST:-./config.json}:/etc/mimirmind/config.json:ro
+
+            # sysfs NICHT mounten — der Worker darf im attached-Modus
+            # nichts an /sys/class/drm anfassen. Munin owned das.
+
+        command:
+            - serve
+            - --config
+            - /etc/mimirmind/config.json
+            - --attach
+            - unix:/var/run/mimirmind/munin.sock
+
+        ports:
+            - "${MIMIRMIND_PORT:-8080}:8080"
+
+        stdin_open: true
+        tty: true
+
+volumes:
+    # tmpfs für schnelles fd-passing. Persistiert nicht über host-reboot,
+    # das ist genau was wir wollen — /var/run/-Semantik.
+    mimirmind_run:
+        driver: local
+        driver_opts:
+            type: tmpfs
+            device: tmpfs
