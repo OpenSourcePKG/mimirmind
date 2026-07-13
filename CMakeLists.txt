@@ -5,7 +5,12 @@ project(mimirmind
     LANGUAGES CXX
 )
 
-set(CMAKE_CXX_STANDARD 20)
+# C++23 required — std::expected in src/core/ipc/ for the M-Munin
+# error-return convention (see decisions/2026-07-13-m-munin-scope.md).
+# GCC 13+ and Clang 16+ both ship it in <expected>. If a build host
+# stalls on this, upgrading the toolchain is preferable to reverting
+# the ipc layer to an ad-hoc Result<T,E> substitute.
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -201,6 +206,10 @@ add_library(mimirmind_core STATIC
     src/core/gguf/GgufReader.cpp
     src/core/gguf/GgufTypes.cpp
     src/core/gguf/WeightsMap.cpp
+    src/core/ipc/IpcExporter.cpp
+    src/core/ipc/IpcImporter.cpp
+    src/core/ipc/TensorManifest.cpp
+    src/core/ipc/UnixSocketFrame.cpp
     src/core/l0/L0Context.cpp
     src/core/l0/MappedFile.cpp
     src/core/l0/UsmAllocator.cpp
@@ -354,6 +363,26 @@ add_executable(arch_tests
 target_include_directories(arch_tests PRIVATE tests)
 
 target_link_libraries(arch_tests PRIVATE mimirmind_core)
+
+# ---- ipc_tests — pure-CPU tests for src/core/ipc primitives ---------------
+#
+# Foundation for the M-Munin daemon (see decisions/2026-07-13-m-munin-scope.md):
+# covers UnixSocketFrame length-prefix framing + SCM_RIGHTS fd passing over a
+# socketpair, plus TensorManifest JSON serde round-trip and error paths. The
+# L0-side IPC wrappers (IpcExporter / IpcImporter) live in mimirmind_core and
+# are exercised end-to-end by the existing tools/l0-ipc-testrig on real
+# hardware; there is no way to unit-test them without a live Level Zero
+# device, so we don't try.
+#
+# Run via:   cmake --build build --target ipc_tests && build/ipc_tests
+
+add_executable(ipc_tests
+    tests/ipc_tests.cpp
+)
+
+target_include_directories(ipc_tests PRIVATE tests)
+
+target_link_libraries(ipc_tests PRIVATE mimirmind_core)
 
 # ---- compute_tests — pure-CPU tests for CPU compute primitives -------------
 #
