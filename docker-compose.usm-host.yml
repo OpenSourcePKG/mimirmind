@@ -1,0 +1,22 @@
+# M-Munin USM-alloc-kind bench override — pin to Host.
+#
+# Layered on top of docker-compose.server.yml for the one-time
+# perf-comparison run against the Shared baseline. See
+# decisions/2026-07-13-m-munin-scope.md ("Prod-Gate vor
+# M-Munin-Schritt 5") for what to measure.
+#
+# Usage:
+#   docker compose -f docker-compose.server.yml -f docker-compose.usm-host.yml \
+#       up -d --force-recreate mimirmind
+#
+# The runtime container's startup log will show:
+#   [usm] MIMIRMIND_USM_KIND='host' — bench override picks host
+#   [usm] alloc-kind=host
+#
+# Once bench parity is confirmed and HW-auto-detection lands, this
+# override file becomes obsolete.
+
+services:
+    mimirmind:
+        environment:
+            MIMIRMIND_USM_KIND: host
