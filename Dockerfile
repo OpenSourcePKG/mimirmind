@@ -78,6 +78,7 @@ COPY config.example.json ./
 COPY src ./src
 COPY kernels ./kernels
 COPY tests ./tests
+COPY tools ./tools
 COPY third_party ./third_party
 
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -158,6 +159,8 @@ ENV UR_L0_USE_RELAXED_ALLOCATION_LIMITS=1
 COPY --from=build /src/build/mimirmind        /usr/local/bin/mimirmind
 COPY --from=build /src/build/gpu_tests        /usr/local/bin/gpu_tests
 COPY --from=build /src/build/prefill_bench    /usr/local/bin/prefill_bench
+COPY --from=build /src/build/l0_ipc_testrig   /usr/local/bin/l0_ipc_testrig
+COPY --from=build /src/tools/l0-ipc-testrig.sh /usr/local/bin/l0-ipc-testrig.sh
 COPY --from=build /src/build/spv              /usr/local/share/mimirmind/spv
 # Reference config that operators can copy + edit for their host. The
 # actual runtime config comes in through a bind-mount at
