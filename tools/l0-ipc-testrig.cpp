@@ -9,11 +9,15 @@
 //
 // Usage (run BOTH commands, roughly concurrently):
 //
-//   ./l0_ipc_testrig owner    /tmp/l0ipc.sock
-//   ./l0_ipc_testrig attacher /tmp/l0ipc.sock
+//   ./l0_ipc_testrig owner    <socket> [--kind shared|host|device]
+//   ./l0_ipc_testrig attacher <socket> [--kind shared|host|device]
+//
+// Both processes must agree on --kind (shared/host is CPU-derefable;
+// device is not — attacher only exercises the IPC handshake, no
+// buffer content is verified).
 //
 // Or use the tools/l0-ipc-testrig.sh helper which launches both in
-// sequence and reports PASS/FAIL.
+// sequence for each kind and reports PASS/FAIL per variant.
 //
 // Protocol:
 //   1. Owner: zeInit -> zeContextCreate -> zeMemAllocShared (64 MiB) ->
@@ -60,6 +64,57 @@
 #include <vector>
 
 namespace {
+
+enum class AllocKind {
+    Shared,
+    Host,
+    Device,
+};
+
+const char* allocKindName(AllocKind k) {
+    switch (k) {
+        case AllocKind::Shared: return "shared";
+        case AllocKind::Host:   return "host";
+        case AllocKind::Device: return "device";
+    }
+    return "?";
+}
+
+// Decode the ze_result_t codes we're most likely to hit into a
+// readable tag. Not exhaustive — just the ones we care about
+// for IPC diagnosis.
+const char* zeResultName(ze_result_t r) {
+    switch (r) {
+        case ZE_RESULT_SUCCESS:                             return "SUCCESS";
+        case ZE_RESULT_NOT_READY:                           return "NOT_READY";
+        case ZE_RESULT_ERROR_UNINITIALIZED:                 return "UNINITIALIZED";
+        case ZE_RESULT_ERROR_DEVICE_LOST:                   return "DEVICE_LOST";
+        case ZE_RESULT_ERROR_INVALID_ARGUMENT:              return "INVALID_ARGUMENT";
+        case ZE_RESULT_ERROR_INVALID_NULL_HANDLE:           return "INVALID_NULL_HANDLE";
+        case ZE_RESULT_ERROR_INVALID_NULL_POINTER:          return "INVALID_NULL_POINTER";
+        case ZE_RESULT_ERROR_UNSUPPORTED_FEATURE:           return "UNSUPPORTED_FEATURE";
+        case ZE_RESULT_ERROR_UNSUPPORTED_VERSION:           return "UNSUPPORTED_VERSION";
+        case ZE_RESULT_ERROR_INVALID_ENUMERATION:           return "INVALID_ENUMERATION";
+        case ZE_RESULT_ERROR_UNSUPPORTED_ENUMERATION:       return "UNSUPPORTED_ENUMERATION";
+        case ZE_RESULT_ERROR_UNSUPPORTED_SIZE:              return "UNSUPPORTED_SIZE";
+        case ZE_RESULT_ERROR_UNSUPPORTED_ALIGNMENT:         return "UNSUPPORTED_ALIGNMENT";
+        case ZE_RESULT_ERROR_INVALID_SYNCHRONIZATION_OBJECT:return "INVALID_SYNCHRONIZATION_OBJECT";
+        case ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY:            return "OUT_OF_HOST_MEMORY";
+        case ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY:          return "OUT_OF_DEVICE_MEMORY";
+        case ZE_RESULT_ERROR_MODULE_BUILD_FAILURE:          return "MODULE_BUILD_FAILURE";
+        case ZE_RESULT_ERROR_UNKNOWN:                       return "UNKNOWN";
+        default:                                            return "(other)";
+    }
+}
+
+// Kernel-space canonical addresses on x86_64 Linux start at
+// 0xffff_8000_0000_0000. If zeMemOpenIpcHandle returns a pointer in
+// that range, dereferencing it segfaults — the driver mis-mapped the
+// dma_buf and there's nothing we can do with the pointer.
+bool looksLikeKernelPointer(const void* p) {
+    const auto v = reinterpret_cast<std::uintptr_t>(p);
+    return (v & 0xffff'0000'0000'0000ULL) == 0xffff'0000'0000'0000ULL;
+}
 
 // 64 MiB is large enough to force a genuine allocation path (not a
 // fast-path shortcut) but small enough that fill loops complete in
@@ -238,7 +293,7 @@ void dumpHandle(const char* tag, const ze_ipc_mem_handle_t& handle) {
     std::fprintf(stderr, "  (first int=%d)\n", firstAsInt);
 }
 
-int runOwner(const std::string& sockPath) {
+int runOwner(const std::string& sockPath, AllocKind kind) {
     ze_driver_handle_t  drv = nullptr;
     ze_device_handle_t  dev = nullptr;
     ze_context_handle_t ctx = nullptr;
@@ -246,31 +301,58 @@ int runOwner(const std::string& sockPath) {
         std::fprintf(stderr, "RESULT: FAIL (initLevelZero)\n");
         return 1;
     }
+    std::fprintf(stderr, "[owner] alloc kind: %s\n", allocKindName(kind));
 
     ze_device_mem_alloc_desc_t devDesc{};
     devDesc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
 
     ze_host_mem_alloc_desc_t hostDesc{};
     hostDesc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
-    // BIAS_INITIAL_PLACEMENT is a hint. If the L0 impl demands a
-    // different flag for IPC-exportable USM, the zeMemGetIpcHandle
-    // call below will fail with a specific error code that tells us
-    // exactly which flag to try next.
+    // BIAS_INITIAL_PLACEMENT is a hint. Only applies to Shared+Host.
     hostDesc.flags = ZE_HOST_MEM_ALLOC_FLAG_BIAS_INITIAL_PLACEMENT;
 
     void* ptr = nullptr;
-    ZE_CHECK(zeMemAllocShared(ctx, &devDesc, &hostDesc,
-                              kBufferBytes, /*alignment=*/64,
-                              dev, &ptr),
-             "owner");
+    ze_result_t allocRes = ZE_RESULT_SUCCESS;
+    switch (kind) {
+        case AllocKind::Shared:
+            allocRes = zeMemAllocShared(ctx, &devDesc, &hostDesc,
+                                        kBufferBytes, /*alignment=*/64,
+                                        dev, &ptr);
+            break;
+        case AllocKind::Host:
+            allocRes = zeMemAllocHost(ctx, &hostDesc,
+                                      kBufferBytes, /*alignment=*/64,
+                                      &ptr);
+            break;
+        case AllocKind::Device:
+            allocRes = zeMemAllocDevice(ctx, &devDesc,
+                                        kBufferBytes, /*alignment=*/64,
+                                        dev, &ptr);
+            break;
+    }
+    if (allocRes != ZE_RESULT_SUCCESS) {
+        std::fprintf(stderr,
+                     "[owner] alloc(%s) -> %s (0x%x)\n",
+                     allocKindName(kind), zeResultName(allocRes),
+                     static_cast<unsigned>(allocRes));
+        std::fprintf(stderr, "RESULT: FAIL (alloc)\n");
+        return 1;
+    }
     std::fprintf(stderr, "[owner] allocated %zu bytes at %p\n", kBufferBytes, ptr);
 
-    // Fill with owner pattern.
-    {
+    // Fill with owner pattern — only when the pointer is CPU-derefable.
+    // Device allocations return a device-only address that the CPU
+    // cannot touch; leave the buffer untouched and let the attacher
+    // side just verify the IPC handshake.
+    const bool cpuDerefable = (kind != AllocKind::Device);
+    if (cpuDerefable) {
         auto* words = static_cast<std::uint32_t*>(ptr);
         for (std::size_t i = 0; i < kBufferWords; ++i) {
             words[i] = kOwnerPattern;
         }
+    } else {
+        std::fprintf(stderr,
+                     "[owner] device-mem: skipping CPU fill (device-only pointer)\n");
     }
 
     // Extract IPC handle.
@@ -324,33 +406,40 @@ int runOwner(const std::string& sockPath) {
         return 1;
     }
 
-    // Verify: first 4 KiB should now be attacher pattern, rest
-    // untouched (still owner pattern).
-    const auto* words = static_cast<const std::uint32_t*>(ptr);
-    bool attacherWritesVisible = true;
-    for (std::size_t i = 0; i < kAttacherWriteWords; ++i) {
-        if (words[i] != kAttacherPattern) {
-            attacherWritesVisible = false;
-            std::fprintf(stderr,
-                         "[owner] word %zu = 0x%08x (expected attacher 0x%08x)\n",
-                         i, words[i], kAttacherPattern);
-            break;
+    bool passOK = true;
+    if (cpuDerefable) {
+        // Verify: first 4 KiB should now be attacher pattern, rest
+        // untouched (still owner pattern).
+        const auto* words = static_cast<const std::uint32_t*>(ptr);
+        bool attacherWritesVisible = true;
+        for (std::size_t i = 0; i < kAttacherWriteWords; ++i) {
+            if (words[i] != kAttacherPattern) {
+                attacherWritesVisible = false;
+                std::fprintf(stderr,
+                             "[owner] word %zu = 0x%08x (expected attacher 0x%08x)\n",
+                             i, words[i], kAttacherPattern);
+                break;
+            }
         }
-    }
-    bool ownerRegionIntact = true;
-    for (std::size_t i = kAttacherWriteWords; i < kBufferWords; i += 4096) {
-        if (words[i] != kOwnerPattern) {
-            ownerRegionIntact = false;
-            std::fprintf(stderr,
-                         "[owner] word %zu = 0x%08x (expected owner 0x%08x)\n",
-                         i, words[i], kOwnerPattern);
-            break;
+        bool ownerRegionIntact = true;
+        for (std::size_t i = kAttacherWriteWords; i < kBufferWords; i += 4096) {
+            if (words[i] != kOwnerPattern) {
+                ownerRegionIntact = false;
+                std::fprintf(stderr,
+                             "[owner] word %zu = 0x%08x (expected owner 0x%08x)\n",
+                             i, words[i], kOwnerPattern);
+                break;
+            }
         }
+        std::fprintf(stderr,
+                     "[owner] attacherWritesVisible=%d ownerRegionIntact=%d\n",
+                     static_cast<int>(attacherWritesVisible),
+                     static_cast<int>(ownerRegionIntact));
+        passOK = attacherWritesVisible && ownerRegionIntact;
+    } else {
+        std::fprintf(stderr,
+                     "[owner] device-mem: skipping CPU verify (attacher handshake only)\n");
     }
-    std::fprintf(stderr,
-                 "[owner] attacherWritesVisible=%d ownerRegionIntact=%d\n",
-                 static_cast<int>(attacherWritesVisible),
-                 static_cast<int>(ownerRegionIntact));
 
     // Cleanup.
     ::close(clientFd);
@@ -359,15 +448,16 @@ int runOwner(const std::string& sockPath) {
     zeMemFree(ctx, ptr);
     zeContextDestroy(ctx);
 
-    if (attacherWritesVisible && ownerRegionIntact) {
-        std::fprintf(stderr, "RESULT: PASS (owner)\n");
+    if (passOK) {
+        std::fprintf(stderr, "RESULT: PASS (owner, kind=%s)\n", allocKindName(kind));
         return 0;
     }
-    std::fprintf(stderr, "RESULT: FAIL (owner post-attach verify)\n");
+    std::fprintf(stderr, "RESULT: FAIL (owner post-attach verify, kind=%s)\n",
+                 allocKindName(kind));
     return 1;
 }
 
-int runAttacher(const std::string& sockPath) {
+int runAttacher(const std::string& sockPath, AllocKind kind) {
     ze_driver_handle_t  drv = nullptr;
     ze_device_handle_t  dev = nullptr;
     ze_context_handle_t ctx = nullptr;
@@ -375,6 +465,7 @@ int runAttacher(const std::string& sockPath) {
         std::fprintf(stderr, "RESULT: FAIL (initLevelZero)\n");
         return 1;
     }
+    std::fprintf(stderr, "[attacher] alloc kind (expected): %s\n", allocKindName(kind));
 
     const int sockFd = connectUnix(sockPath);
     if (sockFd < 0) {
@@ -411,41 +502,60 @@ int runAttacher(const std::string& sockPath) {
                                                     /*flags=*/0, &ptr);
     if (openRes != ZE_RESULT_SUCCESS) {
         std::fprintf(stderr,
-                     "[attacher] zeMemOpenIpcHandle -> 0x%x\n",
+                     "[attacher] ERROR zeMemOpenIpcHandle -> %s (0x%x)\n",
+                     zeResultName(openRes),
                      static_cast<unsigned>(openRes));
         std::fprintf(stderr, "RESULT: FAIL (zeMemOpenIpcHandle)\n");
         return 1;
     }
-    std::fprintf(stderr, "[attacher] zeMemOpenIpcHandle -> %p\n", ptr);
+    std::fprintf(stderr, "[attacher] OK    zeMemOpenIpcHandle ptr=%p\n", ptr);
 
-    // Spot-check owner pattern is visible. First 64 bytes (16 words)
-    // is enough to catch obvious "we got a completely different
-    // buffer" failures.
-    bool readOk = true;
-    {
+    // Sanity: kernel-space pointer means the driver mis-mapped the
+    // dma_buf; dereferencing would segfault. Report and abort cleanly.
+    if (looksLikeKernelPointer(ptr)) {
+        std::fprintf(stderr,
+                     "[attacher] KERNEL-SPACE POINTER (%p) — driver mapped dma_buf outside user VA range\n",
+                     ptr);
+        std::fprintf(stderr, "RESULT: FAIL (bad-ptr, kind=%s)\n", allocKindName(kind));
+        (void)zeMemCloseIpcHandle(ctx, ptr);
+        char done = 0;   // 0 = "I failed"
+        if (::write(sockFd, &done, 1) != 1) { /* best-effort */ }
+        return 1;
+    }
+
+    bool passOK = true;
+    if (kind == AllocKind::Device) {
+        // Device-only pointer — the CPU cannot read/write it. The
+        // fact that zeMemOpenIpcHandle succeeded and returned a
+        // non-kernel address is the pass criterion for this variant.
+        std::fprintf(stderr,
+                     "[attacher] device-mem: skipping CPU read/write (device-only pointer)\n");
+    } else {
+        // Spot-check owner pattern is visible. First 64 bytes (16 words)
+        // is enough to catch obvious "we got a completely different
+        // buffer" failures.
         const auto* words = static_cast<const std::uint32_t*>(ptr);
         for (std::size_t i = 0; i < 16; ++i) {
             if (words[i] != kOwnerPattern) {
-                readOk = false;
+                passOK = false;
                 std::fprintf(stderr,
                              "[attacher] word %zu = 0x%08x (expected 0x%08x)\n",
                              i, words[i], kOwnerPattern);
                 break;
             }
         }
-    }
-    std::fprintf(stderr, "[attacher] owner-pattern visible: %d\n", static_cast<int>(readOk));
+        std::fprintf(stderr, "[attacher] owner-pattern visible: %d\n",
+                     static_cast<int>(passOK));
 
-    // Write attacher pattern to first 4 KiB. Owner will verify this
-    // after we close + signal done.
-    {
-        auto* words = static_cast<std::uint32_t*>(ptr);
+        // Write attacher pattern to first 4 KiB. Owner will verify this
+        // after we close + signal done.
+        auto* mwords = static_cast<std::uint32_t*>(ptr);
         for (std::size_t i = 0; i < kAttacherWriteWords; ++i) {
-            words[i] = kAttacherPattern;
+            mwords[i] = kAttacherPattern;
         }
+        std::fprintf(stderr, "[attacher] wrote attacher pattern to first %zu bytes\n",
+                     kAttacherWriteWords * sizeof(std::uint32_t));
     }
-    std::fprintf(stderr, "[attacher] wrote attacher pattern to first %zu bytes\n",
-                 kAttacherWriteWords * sizeof(std::uint32_t));
 
     ZE_CHECK(zeMemCloseIpcHandle(ctx, ptr), "attacher");
 
@@ -457,11 +567,12 @@ int runAttacher(const std::string& sockPath) {
     ::close(sockFd);
     zeContextDestroy(ctx);
 
-    if (readOk) {
-        std::fprintf(stderr, "RESULT: PASS (attacher)\n");
+    if (passOK) {
+        std::fprintf(stderr, "RESULT: PASS (attacher, kind=%s)\n", allocKindName(kind));
         return 0;
     }
-    std::fprintf(stderr, "RESULT: FAIL (attacher owner-pattern mismatch)\n");
+    std::fprintf(stderr, "RESULT: FAIL (attacher owner-pattern mismatch, kind=%s)\n",
+                 allocKindName(kind));
     return 1;
 }
 
@@ -471,15 +582,32 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
                      "Usage:\n"
-                     "  %s owner    <socket-path>\n"
-                     "  %s attacher <socket-path>\n",
+                     "  %s owner    <socket-path> [--kind shared|host|device]\n"
+                     "  %s attacher <socket-path> [--kind shared|host|device]\n",
                      argv[0], argv[0]);
         return 2;
     }
     const std::string_view mode = argv[1];
     const std::string      sockPath = argv[2];
-    if (mode == "owner")    return runOwner(sockPath);
-    if (mode == "attacher") return runAttacher(sockPath);
+    AllocKind kind = AllocKind::Shared;
+    for (int i = 3; i < argc; ++i) {
+        const std::string_view a = argv[i];
+        if (a == "--kind" && i + 1 < argc) {
+            const std::string_view v = argv[++i];
+            if      (v == "shared") kind = AllocKind::Shared;
+            else if (v == "host")   kind = AllocKind::Host;
+            else if (v == "device") kind = AllocKind::Device;
+            else {
+                std::fprintf(stderr, "unknown --kind: %s\n", argv[i]);
+                return 2;
+            }
+        } else {
+            std::fprintf(stderr, "unknown arg: %s\n", argv[i]);
+            return 2;
+        }
+    }
+    if (mode == "owner")    return runOwner(sockPath, kind);
+    if (mode == "attacher") return runAttacher(sockPath, kind);
     std::fprintf(stderr, "unknown mode: %s\n", argv[1]);
     return 2;
 }
