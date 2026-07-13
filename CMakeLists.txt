@@ -210,6 +210,7 @@ add_library(mimirmind_core STATIC
     src/core/ipc/IpcImporter.cpp
     src/core/ipc/TensorManifest.cpp
     src/core/ipc/UnixSocketFrame.cpp
+    src/core/ipc/WireOps.cpp
     src/core/l0/L0Context.cpp
     src/core/l0/MappedFile.cpp
     src/core/l0/UsmAllocator.cpp
@@ -309,6 +310,28 @@ target_link_libraries(mimirmind PRIVATE
     mimirmind_core
 )
 
+# ---- munin — persistent model-memory daemon (M-Munin Schritt 7) -------------
+#
+# The Munin daemon holds N models in USM(host) and exports them over an
+# AF_UNIX socket to attached mimirmind workers via L0 IPC (SCM_RIGHTS +
+# zeMemOpenIpcHandle). Standalone binary; links against mimirmind_core
+# only. No SPV kernels, no httplib, no compute code — see the M-Munin
+# scope ADR (decisions/2026-07-13-m-munin-scope.md) for the tier-1
+# boundary.
+#
+# Run via:
+#   docker compose run --rm munin --config /etc/mimirmind/config.json
+
+add_executable(munin
+    src/munin/main.cpp
+    src/munin/AttachSession.cpp
+    src/munin/Daemon.cpp
+    src/munin/ModelStore.cpp
+    src/munin/SocketServer.cpp
+)
+
+target_link_libraries(munin PRIVATE mimirmind_core)
+
 # ---- quant_tests — pure-CPU unit tests for compute::QuantType ---------------
 #
 # Standalone test binary. No Level Zero, no SPV kernels — exercises the
@@ -383,6 +406,23 @@ add_executable(ipc_tests
 target_include_directories(ipc_tests PRIVATE tests)
 
 target_link_libraries(ipc_tests PRIVATE mimirmind_core)
+
+# ---- munin_tests — pure-CPU tests for Munin's wire-op layer ----------------
+#
+# Covers RequestEnvelope, HealthzResponse, and the error-envelope helpers.
+# The socket integration (AttachSession + SocketServer) needs a live L0
+# device + peer worker; that lives in the docker-based smoke tests that
+# ship with Schritt 8, not here.
+#
+# Run via:   cmake --build build --target munin_tests && build/munin_tests
+
+add_executable(munin_tests
+    tests/munin_tests.cpp
+)
+
+target_include_directories(munin_tests PRIVATE tests)
+
+target_link_libraries(munin_tests PRIVATE mimirmind_core)
 
 # ---- compute_tests — pure-CPU tests for CPU compute primitives -------------
 #
