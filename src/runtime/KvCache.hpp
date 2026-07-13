@@ -6,9 +6,11 @@
 #include <stdexcept>
 #include <vector>
 
+namespace mimirmind::core::l0 { class UsmAllocator; }
+
 namespace mimirmind::runtime {
 
-class UsmAllocator;
+using ::mimirmind::core::l0::UsmAllocator;
 
 /**
  * Element dtype for K/V storage. Baseline F32 today; FP16 lands in

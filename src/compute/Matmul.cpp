@@ -10,8 +10,8 @@ namespace mimirmind::compute {
 
 namespace {
 
-std::size_t bytesPerRow(model::GgmlType type, std::size_t K) {
-    const auto info = model::typeInfo(type);
+std::size_t bytesPerRow(core::gguf::GgmlType type, std::size_t K) {
+    const auto info = core::gguf::typeInfo(type);
     if (info.blockSize == 0 || info.typeSize == 0) {
         throw std::runtime_error("matmul: unsupported weight type");
     }
@@ -24,7 +24,7 @@ std::size_t bytesPerRow(model::GgmlType type, std::size_t K) {
 
 } // namespace
 
-void matmul(model::GgmlType weightType,
+void matmul(core::gguf::GgmlType weightType,
             const void*     W,
             std::size_t     N,
             std::size_t     K,
@@ -44,7 +44,7 @@ void matmul(model::GgmlType weightType,
 
     MM_LOG_DEBUG("matmul",
                  "start — M={} K={} N={} type={} row={} bytes",
-                 M, K, N, model::typeInfo(weightType).name, rowBytes);
+                 M, K, N, core::gguf::typeInfo(weightType).name, rowBytes);
 
     constexpr std::size_t kProgressEvery = 8192;
 

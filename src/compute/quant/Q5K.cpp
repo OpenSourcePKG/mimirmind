@@ -36,8 +36,8 @@ const Q5K& Q5K::instance() noexcept {
     return inst;
 }
 
-model::GgmlType Q5K::ggmlType() const noexcept {
-    return model::GgmlType::Q5_K;
+core::gguf::GgmlType Q5K::ggmlType() const noexcept {
+    return core::gguf::GgmlType::Q5_K;
 }
 
 std::string_view Q5K::name() const noexcept {

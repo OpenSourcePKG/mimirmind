@@ -180,8 +180,8 @@ double percentile(std::vector<double>& sorted, double p) {
 int main(int argc, char** argv) {
     const Args args = parseArgs(argc, argv);
 
-    mimirmind::runtime::L0Context    ctx;
-    mimirmind::runtime::UsmAllocator usm{ctx};
+    mimirmind::core::l0::L0Context    ctx;
+    mimirmind::core::l0::UsmAllocator usm{ctx};
     mimirmind::runtime::CommandQueue queue{ctx};
     mimirmind::compute::GpuOps       ops{ctx, usm, queue};
 

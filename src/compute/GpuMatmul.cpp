@@ -55,7 +55,7 @@ std::string formatBucketRow(std::span<const double> ms) {
 // small positive value so mat-mul dot products stay finite. The bench
 // only cares about wall-clock throughput, not numerical correctness,
 // but avoiding NaN keeps the driver happy.
-void fillSyntheticWeights(model::GgmlType type,
+void fillSyntheticWeights(core::gguf::GgmlType type,
                           std::uint8_t*   dst,
                           std::size_t     nbytes) {
     std::mt19937 rng{0xC0FFEEU};
@@ -69,23 +69,23 @@ void fillSyntheticWeights(model::GgmlType type,
     constexpr std::uint16_t kHalfSmall = 0x2E00U;  // ~0.09
     (void)kHalfSmall;
 
-    if (type == model::GgmlType::Q6_K) {
+    if (type == core::gguf::GgmlType::Q6_K) {
         const std::size_t bs = 210;
         for (std::size_t off = 0; off + bs <= nbytes; off += bs) {
             std::memcpy(dst + off + 208, &kHalfTiny, 2);
         }
-    } else if (type == model::GgmlType::Q4_K) {
+    } else if (type == core::gguf::GgmlType::Q4_K) {
         const std::size_t bs = 144;
         for (std::size_t off = 0; off + bs <= nbytes; off += bs) {
             std::memcpy(dst + off,     &kHalfTiny, 2);   // d
             std::memcpy(dst + off + 2, &kHalfTiny, 2);   // dmin
         }
-    } else if (type == model::GgmlType::Q8_0) {
+    } else if (type == core::gguf::GgmlType::Q8_0) {
         const std::size_t bs = 34;
         for (std::size_t off = 0; off + bs <= nbytes; off += bs) {
             std::memcpy(dst + off, &kHalfTiny, 2);
         }
-    } else if (type == model::GgmlType::Q5_K) {
+    } else if (type == core::gguf::GgmlType::Q5_K) {
         // 176 B super-block: fp16 d + fp16 dmin + 12 scales + 32 qh + 128 qs.
         // Without this override, random bytes at offsets 0..3 get
         // interpreted as fp16 by the dequant path (possibly ±Inf, NaN, or
@@ -112,9 +112,9 @@ double medianMs(std::vector<double> xs) {
 
 } // namespace
 
-GpuMatmul::GpuMatmul(runtime::L0Context&    ctx,
+GpuMatmul::GpuMatmul(core::l0::L0Context&    ctx,
                      GpuOps&                ops,
-                     runtime::UsmAllocator& alloc,
+                     core::l0::UsmAllocator& alloc,
                      runtime::CommandQueue& queue)
     : _ctx{ctx},
       _ops{ops},
@@ -185,11 +185,11 @@ GpuMatmul::GpuMatmul(runtime::L0Context&    ctx,
     // is the block-dequant math per type. Guarded so a driver refusal
     // (unlikely at 8 KiB but possible on quirky iGPUs) just disables
     // that type's v2 path.
-    const std::array<std::pair<model::GgmlType, const char*>, 3>
+    const std::array<std::pair<core::gguf::GgmlType, const char*>, 3>
         kV2Kernels = {{
-            {model::GgmlType::Q8_0, "matmul_q8_0_gemm_v2"},
-            {model::GgmlType::Q6_K, "matmul_q6k_gemm_v2"},
-            {model::GgmlType::Q4_K, "matmul_q4k_gemm_v2"},
+            {core::gguf::GgmlType::Q8_0, "matmul_q8_0_gemm_v2"},
+            {core::gguf::GgmlType::Q6_K, "matmul_q6k_gemm_v2"},
+            {core::gguf::GgmlType::Q4_K, "matmul_q4k_gemm_v2"},
         }};
     for (const auto& [type, moduleName] : kV2Kernels) {
         const auto it = _entries.find(type);
@@ -214,10 +214,10 @@ GpuMatmul::GpuMatmul(runtime::L0Context&    ctx,
     // integer_dot_product extension is not universally advertised on
     // older Intel iGPUs; per-type failures leave the entry without a
     // DP4A slot and callers fall back to plain matvec for that type.
-    struct Dp4aKernel { model::GgmlType type; const char* module; };
+    struct Dp4aKernel { core::gguf::GgmlType type; const char* module; };
     for (const auto& [dtype, module] : std::initializer_list<Dp4aKernel>{
-             {model::GgmlType::Q8_0, "matmul_q8_0_vec_dp4a"},
-             {model::GgmlType::Q4_K, "matmul_q4k_vec_dp4a"}})
+             {core::gguf::GgmlType::Q8_0, "matmul_q8_0_vec_dp4a"},
+             {core::gguf::GgmlType::Q4_K, "matmul_q4k_vec_dp4a"}})
     {
         auto it = _entries.find(dtype);
         if (it == _entries.end()) continue;   // type not registered
@@ -273,15 +273,15 @@ GpuMatmul::~GpuMatmul() {
     }
 }
 
-void GpuMatmul::autotune(runtime::UsmAllocator&          allocator,
+void GpuMatmul::autotune(core::l0::UsmAllocator&          allocator,
                          std::size_t                     hiddenDim,
-                         const runtime::FeatureSettings& features) {
+                         const core::config::FeatureSettings& features) {
     // M8.J — M-buckets replace the single `mBatch` argument; every
     // bench-time decision runs against kAutotuneMBuckets.
-    const bool forceDisable     = features.gemm == runtime::TriState::Disable;
-    const bool forceEnable      = features.gemm == runtime::TriState::Force;
-    const bool forceDisableDp4a = features.dp4a == runtime::TriState::Disable;
-    const bool forceEnableDp4a  = features.dp4a == runtime::TriState::Force;
+    const bool forceDisable     = features.gemm == core::config::TriState::Disable;
+    const bool forceEnable      = features.gemm == core::config::TriState::Force;
+    const bool forceDisableDp4a = features.dp4a == core::config::TriState::Disable;
+    const bool forceEnableDp4a  = features.dp4a == core::config::TriState::Force;
     const std::size_t envMinM   = features.gemmMinM.value_or(std::size_t{0});
 
     // features.gemmMinM — pin the crossover threshold on every type
@@ -804,11 +804,11 @@ void GpuMatmul::autotune(runtime::UsmAllocator&          allocator,
     allocator.deallocate(sUsm, sBytes);
 }
 
-bool GpuMatmul::supports(model::GgmlType type) const noexcept {
+bool GpuMatmul::supports(core::gguf::GgmlType type) const noexcept {
     return _entries.contains(type);
 }
 
-void GpuMatmul::matmulAsync(model::GgmlType type,
+void GpuMatmul::matmulAsync(core::gguf::GgmlType type,
                             const void*     W,
                             std::size_t     N,
                             std::size_t     K,
@@ -906,7 +906,7 @@ void GpuMatmul::matmulAsync(model::GgmlType type,
     }
 }
 
-void GpuMatmul::matmul(model::GgmlType type,
+void GpuMatmul::matmul(core::gguf::GgmlType type,
                        const void*     W,
                        std::size_t     N,
                        std::size_t     K,
@@ -918,7 +918,7 @@ void GpuMatmul::matmul(model::GgmlType type,
     sync();
 }
 
-void GpuMatmul::matmulDp4aAsync(model::GgmlType    type,
+void GpuMatmul::matmulDp4aAsync(core::gguf::GgmlType    type,
                                 const std::int8_t* Xq,
                                 const float*       Xscale,
                                 const void*        W,
@@ -970,7 +970,7 @@ void GpuMatmul::matmulDp4aAsync(model::GgmlType    type,
     }
 }
 
-void GpuMatmul::dispatchDp4aFromFloat(model::GgmlType type,
+void GpuMatmul::dispatchDp4aFromFloat(core::gguf::GgmlType type,
                                       const float*    X,
                                       const void*     W,
                                       std::size_t     N,
@@ -995,7 +995,7 @@ bool GpuMatmul::dp4aAvailable() const noexcept {
     return false;
 }
 
-bool GpuMatmul::dp4aAvailable(model::GgmlType type) const noexcept {
+bool GpuMatmul::dp4aAvailable(core::gguf::GgmlType type) const noexcept {
     auto it = _entries.find(type);
     return it != _entries.end() && it->second.dp4a.has_value();
 }

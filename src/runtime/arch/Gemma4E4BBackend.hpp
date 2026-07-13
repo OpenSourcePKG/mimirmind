@@ -10,6 +10,9 @@
 
 namespace mimirmind::runtime::arch {
 
+using ::mimirmind::core::l0::UsmHandle;
+
+
 /**
  * Gemma 4 E-Series (E4B / E2B) as shipped by the llama.cpp-compatible
  * GGUF conversion. The GGUF does NOT carry AltUp / Laurel weights (see
@@ -43,7 +46,7 @@ namespace mimirmind::runtime::arch {
 class Gemma4E4BBackend final : public GemmaBaseBackend {
 public:
     Gemma4E4BBackend(const model::LlmConfig&        config,
-                     const model::WeightsMap&       weights,
+                     const core::gguf::WeightsMap&       weights,
                      const model::FusedQkvWeights*  fusedQkv,
                      compute::GpuOps&               ops,
                      compute::GpuMatmul&            gmm,
@@ -79,7 +82,7 @@ private:
     /// decode step at [10752, 2560]). Q8_0 is ~half the size (30 MiB
     /// vs 55 MiB) and dispatches through the existing Q8_0 vec/gemm
     /// kernels.
-    void requantizeModelProjToQ8_0(const model::GgufTensor& src);
+    void requantizeModelProjToQ8_0(const core::gguf::GgufTensor& src);
 
     // --- Static geometry -------------------------------------------------
 
@@ -88,7 +91,7 @@ private:
     // --- PLE-embedding-table pointer + geometry --------------------------
 
     const void*      _pleTablePtr{nullptr};
-    model::GgmlType  _pleTableType{model::GgmlType::F32};
+    core::gguf::GgmlType  _pleTableType{core::gguf::GgmlType::F32};
     std::size_t      _pleBytesPerBlock{0};
     std::size_t      _vocabSize{0};
 

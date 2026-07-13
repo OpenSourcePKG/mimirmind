@@ -5,9 +5,11 @@
 #include <string_view>
 #include <utility>
 
-namespace mimirmind::runtime {
-
+namespace mimirmind::core::config {
 struct LogSettings;
+}
+
+namespace mimirmind::core::log {
 
 enum class LogLevel : int {
     Trace = 0,
@@ -30,7 +32,7 @@ enum class LogLevel : int {
  */
 class Log {
 public:
-    static void initFromConfig(const LogSettings& settings);
+    static void initFromConfig(const ::mimirmind::core::config::LogSettings& settings);
 
     static void setLevel(LogLevel lvl) noexcept;
     [[nodiscard]] static LogLevel level() noexcept;
@@ -70,30 +72,30 @@ inline void logFormat(LogLevel lvl,
 }
 
 } // namespace detail
-} // namespace mimirmind::runtime
+} // namespace mimirmind::core::log
 
 #define MM_LOG_TRACE(tag, ...) \
-    ::mimirmind::runtime::detail::logFormat( \
-        ::mimirmind::runtime::LogLevel::Trace, (tag), \
+    ::mimirmind::core::log::detail::logFormat( \
+        ::mimirmind::core::log::LogLevel::Trace, (tag), \
         std::source_location::current(), __VA_ARGS__)
 
 #define MM_LOG_DEBUG(tag, ...) \
-    ::mimirmind::runtime::detail::logFormat( \
-        ::mimirmind::runtime::LogLevel::Debug, (tag), \
+    ::mimirmind::core::log::detail::logFormat( \
+        ::mimirmind::core::log::LogLevel::Debug, (tag), \
         std::source_location::current(), __VA_ARGS__)
 
 #define MM_LOG_INFO(tag, ...) \
-    ::mimirmind::runtime::detail::logFormat( \
-        ::mimirmind::runtime::LogLevel::Info, (tag), \
+    ::mimirmind::core::log::detail::logFormat( \
+        ::mimirmind::core::log::LogLevel::Info, (tag), \
         std::source_location::current(), __VA_ARGS__)
 
 #define MM_LOG_WARN(tag, ...) \
-    ::mimirmind::runtime::detail::logFormat( \
-        ::mimirmind::runtime::LogLevel::Warn, (tag), \
+    ::mimirmind::core::log::detail::logFormat( \
+        ::mimirmind::core::log::LogLevel::Warn, (tag), \
         std::source_location::current(), __VA_ARGS__)
 
 #define MM_LOG_ERROR(tag, ...) \
-    ::mimirmind::runtime::detail::logFormat( \
-        ::mimirmind::runtime::LogLevel::Error, (tag), \
+    ::mimirmind::core::log::detail::logFormat( \
+        ::mimirmind::core::log::LogLevel::Error, (tag), \
         std::source_location::current(), __VA_ARGS__)
 /* trailing newline intentional — silences -Wbackslash-newline-escape at EOF */

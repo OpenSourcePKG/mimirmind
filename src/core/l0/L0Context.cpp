@@ -8,7 +8,7 @@
 #include <sstream>
 #include <string_view>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::l0 {
 
 namespace {
 
@@ -303,4 +303,4 @@ std::string L0Context::resultToString(ze_result_t r) {
     }
 }
 
-} // namespace mimirmind::runtime
+} // namespace mimirmind::core::l0

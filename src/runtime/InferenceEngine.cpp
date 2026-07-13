@@ -34,7 +34,7 @@ namespace {
 
 /// One-shot diagnostic: log the suffix names + quant types of one
 /// transformer block. Truth for the architecture handler.
-void logBlockTensorInventory(const model::GgufReader& reader,
+void logBlockTensorInventory(const core::gguf::GgufReader& reader,
                              std::size_t              blockIdx) {
     const std::string prefix = "blk." + std::to_string(blockIdx) + ".";
     std::size_t hits = 0;
@@ -52,7 +52,7 @@ void logBlockTensorInventory(const model::GgufReader& reader,
         }
         MM_LOG_INFO("inventory",
                     "  {} type={} dims=[{}] bytes={}",
-                    t.name, model::typeInfo(t.type).name,
+                    t.name, core::gguf::typeInfo(t.type).name,
                     dims, t.nbytes);
     }
     MM_LOG_INFO("inventory", "block {} has {} tensor(s)", blockIdx, hits);
@@ -63,7 +63,7 @@ void logBlockTensorInventory(const model::GgufReader& reader,
 /// carry the AltUp / Laurel / PLE side tensors we need for Gemma 4 E-Series"
 /// without swamping the log with 720 lines. Cheap enough to leave in
 /// for any architecture — non-E-series models just show their own set.
-void logTensorTaxonomy(const model::GgufReader& reader) {
+void logTensorTaxonomy(const core::gguf::GgufReader& reader) {
     std::size_t totalCount = 0;
     std::size_t topLevelCount = 0;
     std::map<std::string, std::size_t> suffixCount;
@@ -77,7 +77,7 @@ void logTensorTaxonomy(const model::GgufReader& reader) {
             }
             MM_LOG_INFO("taxonomy",
                         "top-level: {} type={} dims=[{}] bytes={}",
-                        t.name, model::typeInfo(t.type).name, dims, t.nbytes);
+                        t.name, core::gguf::typeInfo(t.type).name, dims, t.nbytes);
             ++topLevelCount;
             continue;
         }
@@ -146,7 +146,7 @@ InferenceEngine::~InferenceEngine() {
     }
 }
 
-const model::WeightsMap& InferenceEngine::weights() const {
+const core::gguf::WeightsMap& InferenceEngine::weights() const {
     if (!_weights.has_value()) {
         throw std::runtime_error("InferenceEngine: no model loaded");
     }
@@ -196,7 +196,7 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
         _cfg.features.fusedQkv,
         _config.sharedKvLayers, requantToQ8_0,
         /*q8_0ReorderEnabled=*/
-        _cfg.features.q8_0Reorder != runtime::TriState::Disable);
+        _cfg.features.q8_0Reorder != core::config::TriState::Disable);
 
     // M8.K.Q8_0-Reorder Phase 5b — register every fused-QKV block that
     // grew a reorder-layout copy with GpuOps so the /v1/system/status
@@ -461,8 +461,8 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
 std::int32_t
 InferenceEngine::sampleNext(const float*                   hidden,
                             std::size_t                    vocab_lm,
-                            const model::GgufTensor&       outNorm,
-                            const model::GgufTensor&       lmHead,
+                            const core::gguf::GgufTensor&       outNorm,
+                            const core::gguf::GgufTensor&       lmHead,
                             float*                         normScratch,
                             float*                         logits,
                             float*                         matmulScratch,
@@ -573,7 +573,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         throw std::runtime_error("generate: token embedding tensor missing");
     }
     if (outNorm == nullptr ||
-        outNorm->type != model::GgmlType::F32) {
+        outNorm->type != core::gguf::GgmlType::F32) {
         throw std::runtime_error(
             "generate: output_norm.weight missing or not F32");
     }
@@ -1115,7 +1115,7 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
     if (tokEmb == nullptr) {
         throw std::runtime_error("forwardVerify: token embedding missing");
     }
-    if (outNorm == nullptr || outNorm->type != model::GgmlType::F32) {
+    if (outNorm == nullptr || outNorm->type != core::gguf::GgmlType::F32) {
         throw std::runtime_error(
             "forwardVerify: output_norm.weight missing or not F32");
     }

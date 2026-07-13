@@ -12,6 +12,8 @@
 
 namespace mimirmind::runtime {
 
+using ::mimirmind::core::l0::L0Error;
+
 namespace {
 
 constexpr const char* kDefaultSpvDir = "/usr/local/share/mimirmind/spv";

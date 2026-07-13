@@ -8,6 +8,9 @@
 
 namespace mimirmind::runtime {
 
+using ::mimirmind::core::l0::UsmAllocator;
+using ::mimirmind::core::l0::UsmHandle;
+
 /**
  * Per-call transformer-block scratch in USM. Shared by every architecture
  * backend — the dense fields cover Qwen2 / Llama-family inference, the

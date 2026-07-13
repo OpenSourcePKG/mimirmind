@@ -55,7 +55,7 @@ constexpr std::uint16_t kHalfQNaN       = 0x7E00U;
 
 TEST(blockLayout_Float32) {
     const auto& qt = mimirmind::compute::quant::Float32::instance();
-    EXPECT_EQ(qt.ggmlType(),      mimirmind::model::GgmlType::F32);
+    EXPECT_EQ(qt.ggmlType(),      mimirmind::core::gguf::GgmlType::F32);
     EXPECT_EQ(qt.blockElements(), 1U);
     EXPECT_EQ(qt.blockBytes(),    4U);
     EXPECT_EQ(qt.name(),          std::string_view{"F32"});
@@ -64,21 +64,21 @@ TEST(blockLayout_Float32) {
 
 TEST(blockLayout_Float16) {
     const auto& qt = mimirmind::compute::quant::Float16::instance();
-    EXPECT_EQ(qt.ggmlType(),      mimirmind::model::GgmlType::F16);
+    EXPECT_EQ(qt.ggmlType(),      mimirmind::core::gguf::GgmlType::F16);
     EXPECT_EQ(qt.blockElements(), 1U);
     EXPECT_EQ(qt.blockBytes(),    2U);
 }
 
 TEST(blockLayout_Bfloat16) {
     const auto& qt = mimirmind::compute::quant::Bfloat16::instance();
-    EXPECT_EQ(qt.ggmlType(),      mimirmind::model::GgmlType::BF16);
+    EXPECT_EQ(qt.ggmlType(),      mimirmind::core::gguf::GgmlType::BF16);
     EXPECT_EQ(qt.blockElements(), 1U);
     EXPECT_EQ(qt.blockBytes(),    2U);
 }
 
 TEST(blockLayout_Q4K) {
     const auto& qt = mimirmind::compute::quant::Q4K::instance();
-    EXPECT_EQ(qt.ggmlType(),        mimirmind::model::GgmlType::Q4_K);
+    EXPECT_EQ(qt.ggmlType(),        mimirmind::core::gguf::GgmlType::Q4_K);
     EXPECT_EQ(qt.blockElements(),   256U);
     EXPECT_EQ(qt.blockBytes(),      144U);
     EXPECT_EQ(qt.gpuMatmulModule(), std::string_view{"matmul_q4k_vec"});
@@ -86,7 +86,7 @@ TEST(blockLayout_Q4K) {
 
 TEST(blockLayout_Q5K) {
     const auto& qt = mimirmind::compute::quant::Q5K::instance();
-    EXPECT_EQ(qt.ggmlType(),        mimirmind::model::GgmlType::Q5_K);
+    EXPECT_EQ(qt.ggmlType(),        mimirmind::core::gguf::GgmlType::Q5_K);
     EXPECT_EQ(qt.blockElements(),   256U);
     EXPECT_EQ(qt.blockBytes(),      176U);
     EXPECT_EQ(qt.gpuMatmulModule(), std::string_view{"matmul_q5k_vec"});
@@ -94,7 +94,7 @@ TEST(blockLayout_Q5K) {
 
 TEST(blockLayout_Q6K) {
     const auto& qt = mimirmind::compute::quant::Q6K::instance();
-    EXPECT_EQ(qt.ggmlType(),        mimirmind::model::GgmlType::Q6_K);
+    EXPECT_EQ(qt.ggmlType(),        mimirmind::core::gguf::GgmlType::Q6_K);
     EXPECT_EQ(qt.blockElements(),   256U);
     EXPECT_EQ(qt.blockBytes(),      210U);
     EXPECT_EQ(qt.gpuMatmulModule(), std::string_view{"matmul_q6k_vec"});
@@ -102,7 +102,7 @@ TEST(blockLayout_Q6K) {
 
 TEST(blockLayout_Q8_0) {
     const auto& qt = mimirmind::compute::quant::Q8_0::instance();
-    EXPECT_EQ(qt.ggmlType(),        mimirmind::model::GgmlType::Q8_0);
+    EXPECT_EQ(qt.ggmlType(),        mimirmind::core::gguf::GgmlType::Q8_0);
     EXPECT_EQ(qt.blockElements(),   32U);
     EXPECT_EQ(qt.blockBytes(),      34U);
     EXPECT_EQ(qt.gpuMatmulModule(), std::string_view{"matmul_q8_0_vec"});
@@ -113,7 +113,7 @@ TEST(blockLayout_Q8_0) {
 // =======================================================================
 
 TEST(registry_supportedTypes) {
-    using namespace mimirmind::model;
+    using namespace mimirmind::core::gguf;
     using namespace mimirmind::compute;
     EXPECT_TRUE(quantType(GgmlType::F32)  != nullptr);
     EXPECT_TRUE(quantType(GgmlType::F16)  != nullptr);
@@ -125,7 +125,7 @@ TEST(registry_supportedTypes) {
 }
 
 TEST(registry_unsupportedTypes) {
-    using namespace mimirmind::model;
+    using namespace mimirmind::core::gguf;
     using namespace mimirmind::compute;
     EXPECT_TRUE(quantType(GgmlType::Q2_K)    == nullptr);
     EXPECT_TRUE(quantType(GgmlType::Q3_K)    == nullptr);
@@ -870,7 +870,7 @@ TEST(dispatch_routesToCorrectType) {
     block[2] = static_cast<std::uint8_t>(10);
 
     std::array<float, 32> dst{};
-    mimirmind::compute::dequantToF32(mimirmind::model::GgmlType::Q8_0,
+    mimirmind::compute::dequantToF32(mimirmind::core::gguf::GgmlType::Q8_0,
                                      block.data(), 32, dst.data());
     EXPECT_NEAR(dst[0], 5.0F, 0.0F);  // d=0.5, qs[0]=10
 }
@@ -878,7 +878,7 @@ TEST(dispatch_routesToCorrectType) {
 TEST(dispatch_unsupportedTypeThrows) {
     std::array<float, 1> dst{};
     try {
-        mimirmind::compute::dequantToF32(mimirmind::model::GgmlType::Q3_K,
+        mimirmind::compute::dequantToF32(mimirmind::core::gguf::GgmlType::Q3_K,
                                          dst.data(), 1, dst.data());
         EXPECT_TRUE(false && "expected throw");
     } catch (const std::runtime_error&) {

@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::l0 {
 
 namespace {
 
@@ -286,7 +286,7 @@ UsmStats UsmAllocator::stats() const noexcept {
     return _stats;
 }
 
-void UsmAllocator::logStats(LogLevel lvl) const {
+void UsmAllocator::logStats(::mimirmind::core::log::LogLevel lvl) const {
     UsmStats s;
     std::array<Bucket, kBucketCount> bktSnap{};
     {
@@ -309,7 +309,7 @@ void UsmAllocator::logStats(LogLevel lvl) const {
                    static_cast<double>(s.totalAllocations))
         : 0.0;
 
-    ::mimirmind::runtime::detail::logFormat(
+    ::mimirmind::core::log::detail::logFormat(
         lvl, "usm", std::source_location::current(),
         "stats — live: {} allocs / {} bytes ({:.2f} MiB), peak {} bytes "
         "({:.2f} MiB), total {} allocs / {} frees, ze {} alloc / {} free, "
@@ -510,4 +510,4 @@ void UsmAllocator::probeLimits() {
     MM_LOG_INFO("usm", "probeLimits done");
 }
 
-} // namespace mimirmind::runtime
+} // namespace mimirmind::core::l0

@@ -23,7 +23,7 @@ namespace mimirmind::compute {
  * zeroes — the alternative is throwing mid-sequence, which is worse for
  * a forward pass.
  */
-void embeddingLookup(model::GgmlType                weightType,
+void embeddingLookup(core::gguf::GgmlType                weightType,
                      const void*                    weightData,
                      std::size_t                    d_model,
                      std::size_t                    vocab_size,

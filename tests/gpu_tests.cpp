@@ -49,8 +49,8 @@ namespace {
 // -----------------------------------------------------------------------
 
 struct GpuFixture {
-    mimirmind::runtime::L0Context    ctx;
-    mimirmind::runtime::UsmAllocator usm{ctx};
+    mimirmind::core::l0::L0Context    ctx;
+    mimirmind::core::l0::UsmAllocator usm{ctx};
     mimirmind::runtime::CommandQueue queue{ctx};
     mimirmind::compute::GpuOps       ops{ctx, usm, queue};
     mimirmind::compute::GpuMatmul    gmm{ctx, ops, usm, queue};
@@ -60,8 +60,8 @@ struct GpuFixture {
         // actually exercise the GEMM kernels regardless of what the
         // dev-box iGPU would autotune-pick. M=1 regression tests still
         // hit the matvec path because dispatch fast-paths M==1 to vec.
-        mimirmind::runtime::FeatureSettings features{};
-        features.gemm = mimirmind::runtime::TriState::Force;
+        mimirmind::core::config::FeatureSettings features{};
+        features.gemm = mimirmind::core::config::TriState::Force;
         gmm.autotune(usm, /*hiddenDim=*/2816, features);
     }
 };
@@ -1789,7 +1789,7 @@ TEST(matmul_q4k_singleRow) {
     std::memcpy(bufW.raw(), wRow.data(), wRow.size());
     std::memcpy(bufX.raw(), x.data(),    x.size() * sizeof(float));
 
-    fx().gmm.matmul(mimirmind::model::GgmlType::Q4_K,
+    fx().gmm.matmul(mimirmind::core::gguf::GgmlType::Q4_K,
                     bufW.raw(), N, K,
                     bufX.as<float>(), 1,
                     bufY.as<float>(),
@@ -1799,7 +1799,7 @@ TEST(matmul_q4k_singleRow) {
     std::vector<float> cpuW(K);
     std::vector<float> cpuY(N);
     std::vector<float> scratchCpu(K);
-    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q4_K,
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::Q4_K,
                                wRow.data(), N, K,
                                x.data(), 1,
                                cpuY.data(),
@@ -1837,7 +1837,7 @@ TEST(matmul_q8_0_singleRow_alternating) {
     std::memcpy(bufW.raw(), wRow.data(), wRow.size());
     std::memcpy(bufX.raw(), x.data(),    x.size() * sizeof(float));
 
-    fx().gmm.matmul(mimirmind::model::GgmlType::Q8_0,
+    fx().gmm.matmul(mimirmind::core::gguf::GgmlType::Q8_0,
                     bufW.raw(), N, K,
                     bufX.as<float>(), 1,
                     bufY.as<float>(),
@@ -1878,7 +1878,7 @@ TEST(matmul_q8_0_64rows_K2816) {
     std::memcpy(bufW.raw(), wAll.data(), wAll.size());
     std::memcpy(bufX.raw(), x.data(),    x.size() * sizeof(float));
 
-    fx().gmm.matmul(mimirmind::model::GgmlType::Q8_0,
+    fx().gmm.matmul(mimirmind::core::gguf::GgmlType::Q8_0,
                     bufW.raw(), N, K,
                     bufX.as<float>(), 1,
                     bufY.as<float>(),
@@ -1886,7 +1886,7 @@ TEST(matmul_q8_0_64rows_K2816) {
 
     std::vector<float> cpuY(N);
     std::vector<float> scratchCpu(K);
-    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q8_0,
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::Q8_0,
                                wAll.data(), N, K,
                                x.data(), 1,
                                cpuY.data(),
@@ -1952,7 +1952,7 @@ TEST(matmul_q8_0_reorderParity_K2816) {
 
     // Native path: GpuMatmul dispatch — the same production codepath
     // the matmul_q8_0_64rows_K2816 test exercises.
-    fx().gmm.matmul(mimirmind::model::GgmlType::Q8_0,
+    fx().gmm.matmul(mimirmind::core::gguf::GgmlType::Q8_0,
                     bufWNative.raw(), N, K,
                     bufX.as<float>(), 1,
                     bufYNative.as<float>(),
@@ -2033,7 +2033,7 @@ TEST(matmul_q8_0_reorderInPlaceEndToEnd_K2048) {
         bufWReorder.raw(), N, K, reorderScratch.data());
 
     // Native reference: GpuMatmul dispatch on native-layout weights.
-    fx().gmm.matmul(mimirmind::model::GgmlType::Q8_0,
+    fx().gmm.matmul(mimirmind::core::gguf::GgmlType::Q8_0,
                     bufWNative.raw(), N, K,
                     bufX.as<float>(), 1,
                     bufYNative.as<float>(),
@@ -2080,7 +2080,7 @@ TEST(matmul_q6k_singleRow) {
     std::memcpy(bufW.raw(), wRow.data(), wRow.size());
     std::memcpy(bufX.raw(), x.data(),    x.size() * sizeof(float));
 
-    fx().gmm.matmul(mimirmind::model::GgmlType::Q6_K,
+    fx().gmm.matmul(mimirmind::core::gguf::GgmlType::Q6_K,
                     bufW.raw(), N, K,
                     bufX.as<float>(), 1,
                     bufY.as<float>(),
@@ -2088,7 +2088,7 @@ TEST(matmul_q6k_singleRow) {
 
     std::vector<float> cpuY(N);
     std::vector<float> scratchCpu(K);
-    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q6_K,
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::Q6_K,
                                wRow.data(), N, K,
                                x.data(), 1,
                                cpuY.data(),
@@ -2133,7 +2133,7 @@ TEST(matmul_q6k_64rows) {
     std::memcpy(bufW.raw(), wAll.data(), wAll.size());
     std::memcpy(bufX.raw(), x.data(),    x.size() * sizeof(float));
 
-    fx().gmm.matmul(mimirmind::model::GgmlType::Q6_K,
+    fx().gmm.matmul(mimirmind::core::gguf::GgmlType::Q6_K,
                     bufW.raw(), N, K,
                     bufX.as<float>(), 1,
                     bufY.as<float>(),
@@ -2141,7 +2141,7 @@ TEST(matmul_q6k_64rows) {
 
     std::vector<float> cpuY(N);
     std::vector<float> scratchCpu(K);
-    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q6_K,
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::Q6_K,
                                wAll.data(), N, K,
                                x.data(), 1,
                                cpuY.data(),
@@ -2224,7 +2224,7 @@ void runQ6kMatmulParity(const char*   label,
     std::memcpy(bufW.raw(), w.data(), w.size());
     std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
 
-    fx().gmm.matmul(mimirmind::model::GgmlType::Q6_K,
+    fx().gmm.matmul(mimirmind::core::gguf::GgmlType::Q6_K,
                     bufW.raw(), N, K,
                     bufX.as<float>(), M,
                     bufY.as<float>(),
@@ -2232,7 +2232,7 @@ void runQ6kMatmulParity(const char*   label,
 
     std::vector<float> cpuY(M * N);
     std::vector<float> scratchCpu(K);
-    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q6_K,
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::Q6_K,
                                w.data(), N, K,
                                x.data(), M,
                                cpuY.data(),
@@ -2344,7 +2344,7 @@ void runQ4kMatmulParity(const char*   label,
     std::memcpy(bufW.raw(), w.data(), w.size());
     std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
 
-    fx().gmm.matmul(mimirmind::model::GgmlType::Q4_K,
+    fx().gmm.matmul(mimirmind::core::gguf::GgmlType::Q4_K,
                     bufW.raw(), N, K,
                     bufX.as<float>(), M,
                     bufY.as<float>(),
@@ -2352,7 +2352,7 @@ void runQ4kMatmulParity(const char*   label,
 
     std::vector<float> cpuY(M * N);
     std::vector<float> scratchCpu(K);
-    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q4_K,
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::Q4_K,
                                w.data(), N, K,
                                x.data(), M,
                                cpuY.data(),
@@ -2438,7 +2438,7 @@ void runQ8_0MatmulParity(const char*   label,
     std::memcpy(bufW.raw(), w.data(), w.size());
     std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
 
-    fx().gmm.matmul(mimirmind::model::GgmlType::Q8_0,
+    fx().gmm.matmul(mimirmind::core::gguf::GgmlType::Q8_0,
                     bufW.raw(), N, K,
                     bufX.as<float>(), M,
                     bufY.as<float>(),
@@ -2446,7 +2446,7 @@ void runQ8_0MatmulParity(const char*   label,
 
     std::vector<float> cpuY(M * N);
     std::vector<float> scratchCpu(K);
-    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q8_0,
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::Q8_0,
                                w.data(), N, K,
                                x.data(), M,
                                cpuY.data(),
@@ -2556,7 +2556,7 @@ void runQ8_0Dp4aParity(const char*   label,
     // Reference: plain float-X matmul_q8_0 (whichever variant the
     // dispatcher picks — matvec-loop for M=1, GEMM otherwise). This is
     // what DP4A is replacing.
-    fx().gmm.matmul(mimirmind::model::GgmlType::Q8_0,
+    fx().gmm.matmul(mimirmind::core::gguf::GgmlType::Q8_0,
                     bufW.raw(), N, K,
                     bufX.as<float>(), M,
                     bufYref.as<float>(),
@@ -2565,7 +2565,7 @@ void runQ8_0Dp4aParity(const char*   label,
     // Quantise X → Xq + Xscale on the GPU, then dispatch DP4A matvec.
     fx().ops.xQuantI8Async(bufX.as<float>(), bufXq.as<std::int8_t>(),
                            bufXs.as<float>(), M, K);
-    fx().gmm.matmulDp4aAsync(mimirmind::model::GgmlType::Q8_0,
+    fx().gmm.matmulDp4aAsync(mimirmind::core::gguf::GgmlType::Q8_0,
                              bufXq.as<std::int8_t>(),
                              bufXs.as<float>(),
                              bufW.raw(), N, K, M,
@@ -2763,7 +2763,7 @@ struct BenchResult {
 // but syncs only once per iteration (matching how the pre-GEMM
 // InferenceEngine actually issued matmuls — one command-list flush at
 // block end, not per-token).
-BenchResult benchMatmulShape(mimirmind::model::GgmlType type,
+BenchResult benchMatmulShape(mimirmind::core::gguf::GgmlType type,
                              const void* W,
                              std::size_t N,
                              std::size_t K,
@@ -2845,7 +2845,7 @@ TEST(bench_matmul_q6k_prefill_shape) {
     std::printf("\n[bench] matmul_q6k  N=%zu  K=%zu  (Xe-LPG iGPU)\n", N, K);
     for (const std::size_t M : {std::size_t{4}, std::size_t{8},
                                 std::size_t{16}, std::size_t{64}}) {
-        const auto r = benchMatmulShape(mimirmind::model::GgmlType::Q6_K,
+        const auto r = benchMatmulShape(mimirmind::core::gguf::GgmlType::Q6_K,
                                         bufW.raw(), N, K, M,
                                         bufX.as<float>(),
                                         bufY.as<float>(),
@@ -2874,7 +2874,7 @@ TEST(bench_matmul_q4k_prefill_shape) {
     std::printf("\n[bench] matmul_q4k  N=%zu  K=%zu  (Xe-LPG iGPU)\n", N, K);
     for (const std::size_t M : {std::size_t{4}, std::size_t{8},
                                 std::size_t{16}, std::size_t{64}}) {
-        const auto r = benchMatmulShape(mimirmind::model::GgmlType::Q4_K,
+        const auto r = benchMatmulShape(mimirmind::core::gguf::GgmlType::Q4_K,
                                         bufW.raw(), N, K, M,
                                         bufX.as<float>(),
                                         bufY.as<float>(),
@@ -2903,7 +2903,7 @@ TEST(bench_matmul_q8_0_prefill_shape) {
     std::printf("\n[bench] matmul_q8_0  N=%zu  K=%zu  (Xe-LPG iGPU)\n", N, K);
     for (const std::size_t M : {std::size_t{4}, std::size_t{8},
                                 std::size_t{16}, std::size_t{64}}) {
-        const auto r = benchMatmulShape(mimirmind::model::GgmlType::Q8_0,
+        const auto r = benchMatmulShape(mimirmind::core::gguf::GgmlType::Q8_0,
                                         bufW.raw(), N, K, M,
                                         bufX.as<float>(),
                                         bufY.as<float>(),

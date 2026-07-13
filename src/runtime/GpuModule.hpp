@@ -8,9 +8,11 @@
 #include <unordered_map>
 #include <vector>
 
+namespace mimirmind::core::l0 { class L0Context; }
+
 namespace mimirmind::runtime {
 
-class L0Context;
+using ::mimirmind::core::l0::L0Context;
 
 /**
  * A single SPIR-V module loaded into a Level Zero context. Holds the

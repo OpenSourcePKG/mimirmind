@@ -11,7 +11,7 @@
 #include <string>
 #include <string_view>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::l0 {
 class L0Context;
 class UsmAllocator;
 }
@@ -35,14 +35,14 @@ public:
     /// `flashPrefillEnabled` maps to `features.flashPrefill` in config.json.
     /// When false, T_q > 1 dispatches fall back to the plain attention.cl
     /// kernel — rollback lever for flash-prefill bugs.
-    GpuOps(runtime::L0Context&    ctx,
-           runtime::UsmAllocator& alloc,
+    GpuOps(core::l0::L0Context&    ctx,
+           core::l0::UsmAllocator& alloc,
            runtime::CommandQueue& queue,
            bool                   flashPrefillEnabled      = true,
            bool                   flashPrefillGqaQ8Enabled = true,
            std::size_t            flashPrefillKTileQ8      = 128,
-           runtime::TriState      q8_0ReorderMode          =
-               runtime::TriState::Disable);
+           core::config::TriState      q8_0ReorderMode          =
+               core::config::TriState::Disable);
     ~GpuOps();
 
     GpuOps(const GpuOps&)            = delete;
@@ -270,7 +270,7 @@ public:
     ///
     /// Currently exercises: qkv_split (full QKV + alt-attention paths).
     /// Runs in < 5 ms on any Intel iGPU. Idempotent, cheap to repeat.
-    void selfTest(runtime::UsmAllocator& allocator);
+    void selfTest(core::l0::UsmAllocator& allocator);
 
     /// "pending" | "ok" — populated by selfTest(). Exposed via
     /// /v1/system/status so the deploy can be verified without pulling
@@ -301,7 +301,7 @@ public:
     /// future GpuMatmul dispatch guard) can distinguish Auto/Force/
     /// Disable without string-matching. String form for status JSON
     /// via `q8_0ReorderModeName()`.
-    [[nodiscard]] runtime::TriState q8_0ReorderMode() const noexcept {
+    [[nodiscard]] core::config::TriState q8_0ReorderMode() const noexcept {
         return _q8_0ReorderMode;
     }
     [[nodiscard]] std::string_view q8_0ReorderModeName() const noexcept;
@@ -332,7 +332,7 @@ public:
     /// pin the winner in `_prefillFlashKTileQ8`, and update
     /// `_prefillFlashKTileQ8Source`. When any precondition fails, log
     /// why and leave the ctor-time value in place.
-    void autotuneKTileQ8(runtime::UsmAllocator& allocator,
+    void autotuneKTileQ8(core::l0::UsmAllocator& allocator,
                          std::size_t            nHeads,
                          std::size_t            nKvHeads,
                          std::size_t            headDim,
@@ -423,7 +423,7 @@ public:
     /// with variant-specific persistent scratch (e.g. the E-series PLE
     /// slice buffer in `Gemma4E4BBackend`) can allocate directly instead
     /// of receiving yet another constructor argument.
-    [[nodiscard]] runtime::UsmAllocator& allocator() noexcept { return _alloc; }
+    [[nodiscard]] core::l0::UsmAllocator& allocator() noexcept { return _alloc; }
 
     /// Persistent USM slot that holds the current KV-cache length (or,
     /// for RoPE, the current decode position). Kernels take it as
@@ -491,9 +491,9 @@ public:
     static constexpr std::size_t kFlashMaxKTiles = 32768 / kFlashKTileSize;
 
 private:
-    runtime::L0Context&    _ctx;
+    core::l0::L0Context&    _ctx;
     runtime::CommandQueue& _queue;
-    runtime::UsmAllocator& _alloc;
+    core::l0::UsmAllocator& _alloc;
 
     runtime::GpuModule     _rmsnormModule;
     runtime::GpuKernel     _rmsnormKernel;
@@ -699,7 +699,7 @@ private:
     // and (in Phase 4) by the GpuMatmul dispatcher to route Q8_0
     // matvecs through the reordered kernel when the weights are
     // available. Default matches the Config default (Disable).
-    runtime::TriState      _q8_0ReorderMode{runtime::TriState::Disable};
+    core::config::TriState      _q8_0ReorderMode{core::config::TriState::Disable};
     // M8.K.Q8_0-Reorder Phase 5 — counters bumped by
     // noteQ8_0ReorderApplied() from each backend that actually
     // reorders a Q8_0 tensor at load time. Zero when the feature is

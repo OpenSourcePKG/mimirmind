@@ -1,6 +1,6 @@
 #include "core/gguf/GgufTypes.hpp"
 
-namespace mimirmind::model {
+namespace mimirmind::core::gguf {
 
 GgmlTypeInfo typeInfo(GgmlType t) noexcept {
     // Block size + type size pairs come from ggml/src/ggml.c (ggml_type_traits).
@@ -90,4 +90,4 @@ std::size_t bytesForTensor(GgmlType t, std::uint64_t nelements) noexcept {
            static_cast<std::size_t>(info.typeSize);
 }
 
-} // namespace mimirmind::model
+} // namespace mimirmind::core::gguf

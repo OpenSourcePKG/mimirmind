@@ -6,7 +6,7 @@
 #include <string>
 #include <string_view>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::l0 {
 
 /**
  * POSIX mmap RAII wrapper. PROT_READ + MAP_PRIVATE — we never write to
@@ -42,4 +42,4 @@ private:
     std::string   _path{};
 };
 
-} // namespace mimirmind::runtime
+} // namespace mimirmind::core::l0

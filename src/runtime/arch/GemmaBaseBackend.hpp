@@ -12,10 +12,13 @@ class GpuMatmul;
 class GpuOps;
 } // namespace mimirmind::compute
 
-namespace mimirmind::model {
-class FusedQkvWeights;
+namespace mimirmind::core::gguf {
 class WeightsMap;
 struct GgufTensor;
+} // namespace mimirmind::core::gguf
+
+namespace mimirmind::model {
+class FusedQkvWeights;
 struct LlmConfig;
 } // namespace mimirmind::model
 
@@ -82,7 +85,7 @@ public:
 
 protected:
     GemmaBaseBackend(const model::LlmConfig&        config,
-                     const model::WeightsMap&       weights,
+                     const core::gguf::WeightsMap&       weights,
                      const model::FusedQkvWeights*  fusedQkv,
                      compute::GpuOps&               ops,
                      compute::GpuMatmul&            gmm,
@@ -121,7 +124,7 @@ protected:
     /// Per-block tensor lookup that throws with a labelled message so a
     /// caller can identify which backend variant failed to bind. `clsName`
     /// prefixes the runtime_error text.
-    const model::GgufTensor* requireTensor(std::size_t blockIdx,
+    const core::gguf::GgufTensor* requireTensor(std::size_t blockIdx,
                                            const char* suffix,
                                            const char* clsName) const;
 
@@ -152,7 +155,7 @@ protected:
     // Shared runtime state -----------------------------------------------
 
     const model::LlmConfig&        _config;
-    const model::WeightsMap&       _weights;
+    const core::gguf::WeightsMap&       _weights;
     const model::FusedQkvWeights*  _fusedQkv{nullptr};
     compute::GpuOps&               _ops;
     compute::GpuMatmul&            _gmm;

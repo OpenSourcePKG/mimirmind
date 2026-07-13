@@ -61,7 +61,7 @@ std::uint16_t floatToHalf(float f) noexcept {
 } // namespace
 
 Gemma4E4BBackend::Gemma4E4BBackend(const model::LlmConfig&        config,
-                                   const model::WeightsMap&       weights,
+                                   const core::gguf::WeightsMap&       weights,
                                    const model::FusedQkvWeights*  fusedQkv,
                                    compute::GpuOps&               ops,
                                    compute::GpuMatmul&            gmm,
@@ -87,7 +87,7 @@ Gemma4E4BBackend::Gemma4E4BBackend(const model::LlmConfig&        config,
             MM_LOG_WARN("gemma4-e4b",
                         "per_layer_token_embd.weight uses unsupported quant "
                         "type {} — PLE disabled",
-                        model::typeInfo(_pleTableType).name);
+                        core::gguf::typeInfo(_pleTableType).name);
             _pleTablePtr = nullptr;
         }
     } else {
@@ -117,7 +117,7 @@ Gemma4E4BBackend::Gemma4E4BBackend(const model::LlmConfig&        config,
 
     // per_layer_proj_norm — RMSNorm weight [per_layer_dim].
     if (const auto* n = weights.find("per_layer_proj_norm.weight");
-        n != nullptr && n->type == model::GgmlType::F32) {
+        n != nullptr && n->type == core::gguf::GgmlType::F32) {
         _projNorm = static_cast<const float*>(n->usmPtr);
     }
 
@@ -130,14 +130,14 @@ Gemma4E4BBackend::Gemma4E4BBackend(const model::LlmConfig&        config,
                 _config.headCount, _config.headCountKvFor(0),
                 _layers.empty() ? 0 : _layers.front().headDim,
                 _pleTablePtr != nullptr
-                    ? model::typeInfo(_pleTableType).name
+                    ? core::gguf::typeInfo(_pleTableType).name
                     : std::string_view{"none"},
                 _projQ8Bytes > 0 ? "on" : "off",
                 _projNorm != nullptr ? "on" : "off",
                 _vocabSize);
 }
 
-void Gemma4E4BBackend::requantizeModelProjToQ8_0(const model::GgufTensor& src) {
+void Gemma4E4BBackend::requantizeModelProjToQ8_0(const core::gguf::GgufTensor& src) {
     if (src.dimensions.size() < 2) {
         throw std::runtime_error("per_layer_model_proj: expected 2D tensor");
     }
@@ -159,7 +159,7 @@ void Gemma4E4BBackend::requantizeModelProjToQ8_0(const model::GgufTensor& src) {
     if (srcQt == nullptr) {
         throw std::runtime_error(
             "per_layer_model_proj: source type " +
-            std::string{model::typeInfo(src.type).name} +
+            std::string{core::gguf::typeInfo(src.type).name} +
             " not supported for dequant");
     }
 
@@ -213,7 +213,7 @@ void Gemma4E4BBackend::requantizeModelProjToQ8_0(const model::GgufTensor& src) {
     MM_LOG_INFO("gemma4-e4b",
                 "per_layer_model_proj: requantized {} → Q8_0, "
                 "{} bytes ({} MiB), src bytes was {} ({} MiB)",
-                model::typeInfo(src.type).name,
+                core::gguf::typeInfo(src.type).name,
                 _projQ8Bytes, _projQ8Bytes / (1024 * 1024),
                 src.nbytes, src.nbytes / (1024 * 1024));
 
@@ -225,7 +225,7 @@ void Gemma4E4BBackend::requantizeModelProjToQ8_0(const model::GgufTensor& src) {
         std::vector<float> srcFirstRow(K);
         std::vector<float> reFirstRow(K);
         srcQt->dequantToF32(srcBase, K, srcFirstRow.data());
-        compute::dequantToF32(model::GgmlType::Q8_0, dst,
+        compute::dequantToF32(core::gguf::GgmlType::Q8_0, dst,
                               K, reFirstRow.data());
         float maxAbs = 0.0F, maxDiff = 0.0F;
         for (std::size_t k = 0; k < K; ++k) {
@@ -251,7 +251,7 @@ void Gemma4E4BBackend::requantizeModelProjToQ8_0(const model::GgufTensor& src) {
     // injectPerLayerInputs dispatches through the reorder kernel.
     // Reorder allocation is lazy: any mode == Disable, or any earlier
     // requant failure, and this block is skipped entirely.
-    if (_ops.q8_0ReorderMode() != runtime::TriState::Disable) {
+    if (_ops.q8_0ReorderMode() != core::config::TriState::Disable) {
         try {
             _projQ8ReorderBytes = _projQ8Bytes;
             _projQ8Reorder = UsmHandle{_ops.allocator(),
@@ -381,7 +381,7 @@ void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds,
                                            projN, d_model,
                                            hiddenStates, projBuf);
         } else {
-            _gmm.matmul(model::GgmlType::Q8_0, _projQ8.get(),
+            _gmm.matmul(core::gguf::GgmlType::Q8_0, _projQ8.get(),
                         projN, d_model,
                         hiddenStates, T,
                         projBuf, /*scratch=*/nullptr);

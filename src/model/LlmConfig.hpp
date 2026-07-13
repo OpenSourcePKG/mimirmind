@@ -1,12 +1,20 @@
 #pragma once
 
+#include "core/gguf/GgufReader.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace mimirmind::model {
 
-class GgufReader;
+using ::mimirmind::core::gguf::GgufReader;
+using ::mimirmind::core::gguf::GgufTensor;
+using ::mimirmind::core::gguf::MetadataValue;
+using ::mimirmind::core::gguf::GgmlType;
+using ::mimirmind::core::gguf::GgufArray;
+using ::mimirmind::core::gguf::GgufValueType;
+using ::mimirmind::core::gguf::typeInfo;
 
 /**
  * Architecture-agnostic config for a decoder-only LLM stored in GGUF.

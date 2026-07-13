@@ -30,7 +30,7 @@ public:
     QuantType& operator=(QuantType&&)      = delete;
 
     /// The GgmlType this implementation handles.
-    [[nodiscard]] virtual model::GgmlType ggmlType() const noexcept = 0;
+    [[nodiscard]] virtual core::gguf::GgmlType ggmlType() const noexcept = 0;
 
     /// Human-readable name (matches ggml's, e.g., "F32", "Q6_K").
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;

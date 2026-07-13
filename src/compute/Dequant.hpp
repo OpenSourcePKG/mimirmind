@@ -20,7 +20,7 @@ namespace mimirmind::compute {
  * Supported now: F32 (passthrough), F16, BF16, Q4_K. Other types will be
  * added when a forward-pass step needs them.
  */
-void dequantToF32(model::GgmlType type,
+void dequantToF32(core::gguf::GgmlType type,
                   const void*     src,
                   std::size_t     nelements,
                   float*          dst);

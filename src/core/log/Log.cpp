@@ -11,7 +11,7 @@
 #include <mutex>
 #include <string>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::log {
 
 namespace {
 
@@ -120,7 +120,7 @@ bool Log::setFile(std::string_view path) {
     return g_file.is_open();
 }
 
-void Log::initFromConfig(const LogSettings& settings) {
+void Log::initFromConfig(const ::mimirmind::core::config::LogSettings& settings) {
     if (!settings.level.empty()) {
         setLevel(parseLevel(settings.level));
     }
@@ -158,4 +158,4 @@ void Log::write(LogLevel lvl,
     }
 }
 
-} // namespace mimirmind::runtime
+} // namespace mimirmind::core::log

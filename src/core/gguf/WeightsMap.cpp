@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace mimirmind::model {
+namespace mimirmind::core::gguf {
 
 WeightsMap::WeightsMap(const GgufReader& reader) {
     const auto& tensors = reader.tensors();
@@ -39,4 +39,4 @@ const GgufTensor* WeightsMap::findBlock(std::size_t blockIdx,
     return find(key);
 }
 
-} // namespace mimirmind::model
+} // namespace mimirmind::core::gguf

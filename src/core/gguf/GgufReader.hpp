@@ -11,11 +11,11 @@
 #include <variant>
 #include <vector>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::l0 {
 class UsmAllocator;
 }
 
-namespace mimirmind::model {
+namespace mimirmind::core::gguf {
 
 /// Array stored in metadata. For primitive element types `raw` holds the
 /// packed little-endian element data and `strings` is empty. For string
@@ -73,7 +73,7 @@ public:
     /// Allocate per-tensor USM via `allocator` and memcpy the payload from
     /// the mmap. Idempotent. Throws if a tensor's offset/size walks off
     /// the end of the file.
-    void loadTensors(runtime::UsmAllocator& allocator);
+    void loadTensors(core::l0::UsmAllocator& allocator);
 
     /// Release USM, drop the mmap, reset state. Idempotent.
     void close() noexcept;
@@ -92,14 +92,14 @@ public:
     [[nodiscard]] const MetadataValue* findMetadata(std::string_view key) const noexcept;
 
 private:
-    runtime::MappedFile                  _file{};
+    core::l0::MappedFile                  _file{};
     std::uint32_t                        _version{0};
     std::size_t                          _alignment{32};
     std::size_t                          _tensorDataOffset{0};
     std::size_t                          _totalTensorBytes{0};
     std::map<std::string, MetadataValue> _metadata{};
     std::vector<GgufTensor>              _tensors{};
-    runtime::UsmAllocator*               _allocator{nullptr};
+    core::l0::UsmAllocator*               _allocator{nullptr};
 };
 
-} // namespace mimirmind::model
+} // namespace mimirmind::core::gguf

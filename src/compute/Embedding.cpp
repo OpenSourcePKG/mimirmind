@@ -10,8 +10,8 @@ namespace mimirmind::compute {
 
 namespace {
 
-std::size_t bytesPerRow(model::GgmlType type, std::size_t d_model) {
-    const auto info = model::typeInfo(type);
+std::size_t bytesPerRow(core::gguf::GgmlType type, std::size_t d_model) {
+    const auto info = core::gguf::typeInfo(type);
     if (info.blockSize == 0 || info.typeSize == 0) {
         throw std::runtime_error("embeddingLookup: unknown weight type");
     }
@@ -24,7 +24,7 @@ std::size_t bytesPerRow(model::GgmlType type, std::size_t d_model) {
 
 } // namespace
 
-void embeddingLookup(model::GgmlType                weightType,
+void embeddingLookup(core::gguf::GgmlType                weightType,
                      const void*                    weightData,
                      std::size_t                    d_model,
                      std::size_t                    vocab_size,
@@ -66,7 +66,7 @@ void embeddingLookup(model::GgmlType                weightType,
     MM_LOG_DEBUG("embed",
                  "lookup done: {} token(s) x {} dims (type={}, row={} bytes)",
                  tokenIds.size(), d_model,
-                 model::typeInfo(weightType).name, rowBytes);
+                 core::gguf::typeInfo(weightType).name, rowBytes);
 }
 
 } // namespace mimirmind::compute

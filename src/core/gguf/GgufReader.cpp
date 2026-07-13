@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace mimirmind::model {
+namespace mimirmind::core::gguf {
 
 namespace {
 
@@ -146,7 +146,7 @@ GgufReader::~GgufReader() {
 void GgufReader::open(std::string_view path) {
     close();
 
-    _file = runtime::MappedFile{path};
+    _file = core::l0::MappedFile{path};
 
     Cursor c{_file.bytes()};
 
@@ -258,7 +258,7 @@ void GgufReader::open(std::string_view path) {
                 _tensorDataOffset, bytesToMiB(_totalTensorBytes));
 }
 
-void GgufReader::loadTensors(runtime::UsmAllocator& allocator) {
+void GgufReader::loadTensors(core::l0::UsmAllocator& allocator) {
     if (!_file.isOpen()) {
         throw std::runtime_error("GgufReader::loadTensors: not open");
     }
@@ -359,4 +359,4 @@ const MetadataValue* GgufReader::findMetadata(std::string_view key) const noexce
     return it == _metadata.end() ? nullptr : &it->second;
 }
 
-} // namespace mimirmind::model
+} // namespace mimirmind::core::gguf

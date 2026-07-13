@@ -5,6 +5,9 @@
 
 namespace mimirmind::runtime {
 
+using ::mimirmind::core::l0::L0Context;
+using ::mimirmind::core::l0::L0Error;
+
 void GpuKernel::setPtr(std::uint32_t index, const void* ptr) {
     const ze_result_t r = zeKernelSetArgumentValue(
         _h, index, sizeof(void*), &ptr);

@@ -11,8 +11,8 @@ const Float16& Float16::instance() noexcept {
     return inst;
 }
 
-model::GgmlType Float16::ggmlType() const noexcept {
-    return model::GgmlType::F16;
+core::gguf::GgmlType Float16::ggmlType() const noexcept {
+    return core::gguf::GgmlType::F16;
 }
 
 std::string_view Float16::name() const noexcept {

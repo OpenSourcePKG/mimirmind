@@ -226,8 +226,8 @@ std::string formatBytes(std::size_t bytes) {
     return std::string{buf};
 }
 
-void printDevice(const mimirmind::runtime::DeviceInfo& info, bool selected) {
-    using mimirmind::runtime::L0Context;
+void printDevice(const mimirmind::core::l0::DeviceInfo& info, bool selected) {
+    using mimirmind::core::l0::L0Context;
 
     std::cout << (selected ? "  * " : "    ")
               << info.name
@@ -246,7 +246,7 @@ void printDevice(const mimirmind::runtime::DeviceInfo& info, bool selected) {
 // ---- M1+M2 device + USM probe summary ---------------------------------------
 
 void printM1M2(mimirmind::runtime::InferenceEngine& engine) {
-    using mimirmind::runtime::L0Context;
+    using mimirmind::core::l0::L0Context;
 
     auto& ctx       = engine.ctx();
     auto& allocator = engine.allocator();
@@ -272,7 +272,7 @@ void printM1M2(mimirmind::runtime::InferenceEngine& engine) {
 
 // ---- M2b allocator + free-list smoke test ----------------------------------
 
-void runM2bAllocatorSmoke(mimirmind::runtime::UsmAllocator& allocator) {
+void runM2bAllocatorSmoke(mimirmind::core::l0::UsmAllocator& allocator) {
     std::cout << "\n[M2b] Allocator + free-list smoke test\n";
     std::cout.flush();
     MM_LOG_INFO("main", "[M2b] exercising allocator with mixed sizes");
@@ -309,7 +309,7 @@ void runM2bAllocatorSmoke(mimirmind::runtime::UsmAllocator& allocator) {
     exercise("cold");
     exercise("warm");
 
-    allocator.logStats(mimirmind::runtime::LogLevel::Info);
+    allocator.logStats(mimirmind::core::log::LogLevel::Info);
 
     const auto st = allocator.stats();
     std::cout << "  total alloc/free  : " << st.totalAllocations
@@ -331,8 +331,8 @@ void runM2bAllocatorSmoke(mimirmind::runtime::UsmAllocator& allocator) {
 
 // ---- M5 GPU RMSNorm parity --------------------------------------------------
 
-void runM5RmsNormParity(mimirmind::runtime::L0Context&    ctx,
-                        mimirmind::runtime::UsmAllocator& allocator) {
+void runM5RmsNormParity(mimirmind::core::l0::L0Context&    ctx,
+                        mimirmind::core::l0::UsmAllocator& allocator) {
     std::cout << "\n[M5] GPU RMSNorm kernel (SPIR-V via Level Zero)\n";
     std::cout.flush();
     MM_LOG_INFO("main", "[M5] starting GPU RMSNorm parity test");
@@ -345,9 +345,9 @@ void runM5RmsNormParity(mimirmind::runtime::L0Context&    ctx,
         constexpr int           kK         = 3584;
         const std::size_t       bytesK     = static_cast<std::size_t>(kK) * sizeof(float);
 
-        mimirmind::runtime::UsmHandle xH{allocator, bytesK};
-        mimirmind::runtime::UsmHandle wH{allocator, bytesK};
-        mimirmind::runtime::UsmHandle yH{allocator, bytesK};
+        mimirmind::core::l0::UsmHandle xH{allocator, bytesK};
+        mimirmind::core::l0::UsmHandle wH{allocator, bytesK};
+        mimirmind::core::l0::UsmHandle yH{allocator, bytesK};
 
         float* x = xH.as<float>();
         float* w = wH.as<float>();
@@ -449,7 +449,7 @@ void printM3Summary(const mimirmind::runtime::InferenceEngine& engine) {
     for (std::size_t i = 0; i < std::min<std::size_t>(3, ts.size()); ++i) {
         const auto& t = ts[i];
         std::cout << "    " << t.name
-                  << "  type=" << mimirmind::model::typeInfo(t.type).name
+                  << "  type=" << mimirmind::core::gguf::typeInfo(t.type).name
                   << "  elems=" << t.nelements
                   << "  bytes=" << formatBytes(t.nbytes) << "\n";
     }
@@ -503,16 +503,16 @@ void printM3Summary(const mimirmind::runtime::InferenceEngine& engine) {
 
 // ---- M5b GPU Q4_K matvec parity --------------------------------------------
 
-void runM5bQ4KParity(mimirmind::runtime::L0Context&    ctx,
-                     mimirmind::runtime::UsmAllocator& allocator,
-                     const mimirmind::model::WeightsMap& weights) {
+void runM5bQ4KParity(mimirmind::core::l0::L0Context&    ctx,
+                     mimirmind::core::l0::UsmAllocator& allocator,
+                     const mimirmind::core::gguf::WeightsMap& weights) {
     std::cout << "\n[M5b] GPU Q4_K matvec kernel parity\n";
     std::cout.flush();
     MM_LOG_INFO("main", "[M5b] starting GPU Q4_K matvec parity test");
     try {
         const auto* qW = weights.find("blk.0.attn_q.weight");
         if (qW == nullptr ||
-            qW->type != mimirmind::model::GgmlType::Q4_K ||
+            qW->type != mimirmind::core::gguf::GgmlType::Q4_K ||
             qW->dimensions.size() < 2) {
             std::cout << "  blk.0.attn_q.weight not Q4_K or missing — skipping\n";
             return;
@@ -528,8 +528,8 @@ void runM5bQ4KParity(mimirmind::runtime::L0Context&    ctx,
 
         const std::size_t xBytes = K * sizeof(float);
         const std::size_t yBytes = N * sizeof(float);
-        mimirmind::runtime::UsmHandle xH{allocator, xBytes};
-        mimirmind::runtime::UsmHandle yH{allocator, yBytes};
+        mimirmind::core::l0::UsmHandle xH{allocator, xBytes};
+        mimirmind::core::l0::UsmHandle yH{allocator, yBytes};
         std::vector<float> yCpuRef(N);
         std::vector<float> scratch(K);
 
@@ -601,16 +601,16 @@ void runM5bQ4KParity(mimirmind::runtime::L0Context&    ctx,
 
 // ---- M5c GPU Q6_K matvec parity --------------------------------------------
 
-void runM5cQ6KParity(mimirmind::runtime::L0Context&    ctx,
-                     mimirmind::runtime::UsmAllocator& allocator,
-                     const mimirmind::model::WeightsMap& weights) {
+void runM5cQ6KParity(mimirmind::core::l0::L0Context&    ctx,
+                     mimirmind::core::l0::UsmAllocator& allocator,
+                     const mimirmind::core::gguf::WeightsMap& weights) {
     std::cout << "\n[M5c] GPU Q6_K matvec kernel parity (lm_head)\n";
     std::cout.flush();
     MM_LOG_INFO("main", "[M5c] starting GPU Q6_K matvec parity test");
     try {
         const auto* outW = weights.find("output.weight");
         if (outW == nullptr ||
-            outW->type != mimirmind::model::GgmlType::Q6_K ||
+            outW->type != mimirmind::core::gguf::GgmlType::Q6_K ||
             outW->dimensions.size() < 2) {
             std::cout << "  output.weight not Q6_K or missing — skipping\n";
             return;
@@ -626,8 +626,8 @@ void runM5cQ6KParity(mimirmind::runtime::L0Context&    ctx,
 
         const std::size_t xBytes6 = K * sizeof(float);
         const std::size_t yBytes6 = N * sizeof(float);
-        mimirmind::runtime::UsmHandle xH{allocator, xBytes6};
-        mimirmind::runtime::UsmHandle yH{allocator, yBytes6};
+        mimirmind::core::l0::UsmHandle xH{allocator, xBytes6};
+        mimirmind::core::l0::UsmHandle yH{allocator, yBytes6};
         std::vector<float> yCpu6(N);
         std::vector<float> scratch6(K);
 
@@ -722,7 +722,7 @@ void runM4aEmbedAndM4bLmHead(mimirmind::runtime::InferenceEngine& engine) {
         return;
     }
     std::cout << "  embed tensor  : " << tokEmb->name
-              << "  type=" << mm::model::typeInfo(tokEmb->type).name
+              << "  type=" << mm::core::gguf::typeInfo(tokEmb->type).name
               << "  dims=[";
     for (std::size_t i = 0; i < tokEmb->dimensions.size(); ++i) {
         if (i > 0) std::cout << ",";
@@ -749,7 +749,7 @@ void runM4aEmbedAndM4bLmHead(mimirmind::runtime::InferenceEngine& engine) {
     }
 
     const std::size_t outBytes = seqLen * d_model * sizeof(float);
-    mm::runtime::UsmHandle embH{allocator, outBytes};
+    mm::core::l0::UsmHandle embH{allocator, outBytes};
     mm::compute::embeddingLookup(
         tokEmb->type, tokEmb->usmPtr,
         d_model, vocab_size,
@@ -812,9 +812,9 @@ void runM4aEmbedAndM4bLmHead(mimirmind::runtime::InferenceEngine& engine) {
         ? lmHead->dimensions[1] : vocab_size;
 
     std::cout << "  output_norm   : " << outNorm->name
-              << "  type=" << mm::model::typeInfo(outNorm->type).name << "\n";
+              << "  type=" << mm::core::gguf::typeInfo(outNorm->type).name << "\n";
     std::cout << "  lm_head       : " << lmHead->name
-              << "  type=" << mm::model::typeInfo(lmHead->type).name
+              << "  type=" << mm::core::gguf::typeInfo(lmHead->type).name
               << "  dims=[" << lmHead->dimensions[0]
               << "," << vocab_lm << "]\n";
 
@@ -822,13 +822,13 @@ void runM4aEmbedAndM4bLmHead(mimirmind::runtime::InferenceEngine& engine) {
     const std::size_t logitsBytes  = vocab_lm * sizeof(float);
     const std::size_t scratchBytes = d_model * sizeof(float);
 
-    mm::runtime::UsmHandle normedH {allocator, normBytes};
-    mm::runtime::UsmHandle logitsH {allocator, logitsBytes};
-    mm::runtime::UsmHandle scratchH{allocator, scratchBytes};
+    mm::core::l0::UsmHandle normedH {allocator, normBytes};
+    mm::core::l0::UsmHandle logitsH {allocator, logitsBytes};
+    mm::core::l0::UsmHandle scratchH{allocator, scratchBytes};
 
-    if (outNorm->type != mm::model::GgmlType::F32) {
+    if (outNorm->type != mm::core::gguf::GgmlType::F32) {
         std::cout << "  (output_norm weight is "
-                  << mm::model::typeInfo(outNorm->type).name
+                  << mm::core::gguf::typeInfo(outNorm->type).name
                   << ", not F32 — unsupported for now, skipping)\n";
         return;
     }
@@ -1068,7 +1068,7 @@ void runM4deGenerate(mimirmind::runtime::InferenceEngine& engine,
 
 // ---- Smoke driver ----------------------------------------------------------
 
-int runSmoke(const CliArgs& args, const mimirmind::runtime::Config& cfg) {
+int runSmoke(const CliArgs& args, const mimirmind::core::config::Config& cfg) {
     std::cout << kBanner;
     std::cout.flush();
 
@@ -1126,7 +1126,7 @@ extern "C" void signalStop(int /*sig*/) {
     }
 }
 
-int runServe(const CliArgs& args, const mimirmind::runtime::Config& cfg) {
+int runServe(const CliArgs& args, const mimirmind::core::config::Config& cfg) {
     std::cout << kBanner;
     std::cout.flush();
 
@@ -1143,7 +1143,7 @@ int runServe(const CliArgs& args, const mimirmind::runtime::Config& cfg) {
     // so N models × their footprint × ~1.2 must fit under
     // runtime.usmProbeTotalGib.
     auto applyRuntimeOverrides = [&](mimirmind::runtime::InferenceEngine& e,
-                                     const mimirmind::runtime::RuntimeSettings& rt) {
+                                     const mimirmind::core::config::RuntimeSettings& rt) {
         if (rt.maxContextTokens.has_value() && *rt.maxContextTokens > 0) {
             e.setMaxContextTokens(*rt.maxContextTokens);
         }
@@ -1767,7 +1767,7 @@ int runServe(const CliArgs& args, const mimirmind::runtime::Config& cfg) {
  * code so callers can scripts on it (0 = parity, 1 = divergence).
  */
 [[nodiscard]] int runParity(const CliArgs& argsIn,
-                            const mimirmind::runtime::Config& cfg) {
+                            const mimirmind::core::config::Config& cfg) {
     if (argsIn.modelPath.empty()) {
         std::cerr << "parity: --model PATH is required "
                      "(fill models[].path in config.json)\n";
@@ -1813,7 +1813,7 @@ int runServe(const CliArgs& args, const mimirmind::runtime::Config& cfg) {
 
         // Override diagnostics.parityDump for the parity subcommand so
         // the engine writes per-stage bin files under the dump prefix.
-        mimirmind::runtime::Config parityCfg = cfg;
+        mimirmind::core::config::Config parityCfg = cfg;
         parityCfg.diagnostics.parityDump = mimirPfx;
 
         mimirmind::runtime::InferenceEngine engine{parityCfg};
@@ -1848,23 +1848,23 @@ int main(int argc, char** argv) {
     // Load config.json — hard error if missing or malformed. `--config` (or
     // default `./config.json`) is the single source of truth for every
     // knob that used to live in `MIMIRMIND_*` env vars.
-    mimirmind::runtime::Config cfg;
+    mimirmind::core::config::Config cfg;
     try {
-        cfg = mimirmind::runtime::loadConfig(args.configPath);
+        cfg = mimirmind::core::config::loadConfig(args.configPath);
     } catch (const std::exception& e) {
         std::cerr << "config: " << e.what() << "\n";
         return 2;
     }
 
     // Apply CLI overrides (higher precedence than config.json).
-    mimirmind::runtime::CliOverrides ovr{};
+    mimirmind::core::config::CliOverrides ovr{};
     if (!args.modelPath.empty()) ovr.modelPath = args.modelPath;
     if (args.port.has_value())   ovr.port      = static_cast<int>(*args.port);
     if (!args.logLevel.empty())  ovr.logLevel  = args.logLevel;
     if (!args.logFile.empty())   ovr.logFile   = args.logFile;
     if (!args.dumpDir.empty())   cfg.diagnostics.parityDump = args.dumpDir;
     try {
-        mimirmind::runtime::applyCliOverrides(cfg, ovr);
+        mimirmind::core::config::applyCliOverrides(cfg, ovr);
     } catch (const std::exception& e) {
         std::cerr << "config: " << e.what() << "\n";
         return 2;
@@ -1872,7 +1872,7 @@ int main(int argc, char** argv) {
 
     // Log has to be initialised AFTER config load — the level/file live
     // in the resolved server.log section.
-    mimirmind::runtime::Log::initFromConfig(cfg.server.log);
+    mimirmind::core::log::Log::initFromConfig(cfg.server.log);
 
     // Reflect the resolved-model path into CliArgs.modelPath so the many
     // downstream subcommand paths that consult it keep working without
@@ -1891,7 +1891,7 @@ int main(int argc, char** argv) {
             case Mode::Parity: return runParity(args, cfg);
         }
         return 0;
-    } catch (const mimirmind::runtime::L0Error& e) {
+    } catch (const mimirmind::core::l0::L0Error& e) {
         MM_LOG_ERROR("main", "Level Zero error: {}", e.what());
         std::cerr << "Level Zero error: " << e.what() << "\n";
         return 2;

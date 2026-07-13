@@ -17,7 +17,7 @@
 namespace mimirmind::runtime::arch {
 
 Qwen2Backend::Qwen2Backend(const model::LlmConfig&        config,
-                           const model::WeightsMap&       weights,
+                           const core::gguf::WeightsMap&       weights,
                            const model::FusedQkvWeights*  fusedQkv,
                            compute::GpuOps&               ops,
                            compute::GpuMatmul&            gmm,
@@ -73,8 +73,8 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     const auto* ffnDown = w.findBlock(blockIdx, "ffn_down.weight");
 
     if (diag) {
-        auto t = [](const model::GgufTensor* p) {
-            return p == nullptr ? "MISSING" : model::typeInfo(p->type).name.data();
+        auto t = [](const core::gguf::GgufTensor* p) {
+            return p == nullptr ? "MISSING" : core::gguf::typeInfo(p->type).name.data();
         };
         MM_LOG_INFO("blkdiag",
                     "blk0 lookups: attn_norm={} qW={} kW={} vW={} oW={} "
@@ -118,14 +118,14 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                       _config.rmsNormEps,
                       normBuf);
 
-    auto projectAsync = [&](const model::GgufTensor* W,
+    auto projectAsync = [&](const core::gguf::GgufTensor* W,
                             std::size_t N, float* dst) {
         _gmm.matmulAsync(W->type, W->usmPtr, N, d_model,
                          normBuf, T, dst, matmulScratch);
     };
-    auto addBiasIf = [&](const model::GgufTensor* B,
+    auto addBiasIf = [&](const core::gguf::GgufTensor* B,
                          std::size_t N, float* dst) {
-        if (B != nullptr && B->type == model::GgmlType::F32) {
+        if (B != nullptr && B->type == core::gguf::GgmlType::F32) {
             _ops.addBiasAsync(dst, T, N,
                               static_cast<const float*>(B->usmPtr));
         }

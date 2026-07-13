@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::config {
 
 // Tri-state feature switch: bench decides, or force one path.
 enum class TriState { Auto, Force, Disable };
@@ -126,7 +126,7 @@ struct GovernorSettings {
     FanSettings                 fan{};
     // Full thermal-profile struct inlined — no more separate JSON file.
     // Empty `name` means "no profile" and the guard runs unprotected.
-    ThermalProfile              thermal{};
+    ::mimirmind::runtime::ThermalProfile thermal{};
 };
 
 struct DiagnosticsSettings {
@@ -204,4 +204,4 @@ void applyCliOverrides(Config& cfg, const CliOverrides& cli);
 [[nodiscard]] RuntimeSettings mergeRuntime(const RuntimeSettings& base,
                                            const RuntimeSettings& override_);
 
-} // namespace mimirmind::runtime
+} // namespace mimirmind::core::config

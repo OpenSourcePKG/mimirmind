@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace mimirmind::model {
+namespace mimirmind::core::gguf {
 
 /// GGUF v3 metadata value type tag (see ggml's gguf.md).
 enum class GgufValueType : std::uint32_t {
@@ -67,4 +67,4 @@ struct GgmlTypeInfo {
 [[nodiscard]] std::size_t      bytesForTensor(GgmlType t,
                                               std::uint64_t nelements) noexcept;
 
-} // namespace mimirmind::model
+} // namespace mimirmind::core::gguf

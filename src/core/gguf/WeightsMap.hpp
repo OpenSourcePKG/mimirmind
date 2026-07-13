@@ -7,7 +7,7 @@
 #include <string_view>
 #include <unordered_map>
 
-namespace mimirmind::model {
+namespace mimirmind::core::gguf {
 
 /**
  * O(1) name → tensor lookup over a parsed `GgufReader`. Thin wrapper for
@@ -37,4 +37,4 @@ private:
     std::unordered_map<std::string, const GgufTensor*> _byName;
 };
 
-} // namespace mimirmind::model
+} // namespace mimirmind::core::gguf

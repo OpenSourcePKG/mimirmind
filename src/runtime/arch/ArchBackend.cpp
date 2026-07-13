@@ -8,7 +8,7 @@ namespace mimirmind::runtime::arch {
 std::unique_ptr<ArchBackend>
 createArchBackend(const std::string&             architecture,
                   const model::LlmConfig&        config,
-                  const model::WeightsMap&       weights,
+                  const core::gguf::WeightsMap&       weights,
                   const model::FusedQkvWeights*  fusedQkv,
                   compute::GpuOps&               ops,
                   compute::GpuMatmul&            gmm,

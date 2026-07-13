@@ -48,8 +48,8 @@ const Q8_0& Q8_0::instance() noexcept {
     return inst;
 }
 
-model::GgmlType Q8_0::ggmlType() const noexcept {
-    return model::GgmlType::Q8_0;
+core::gguf::GgmlType Q8_0::ggmlType() const noexcept {
+    return core::gguf::GgmlType::Q8_0;
 }
 
 std::string_view Q8_0::name() const noexcept {

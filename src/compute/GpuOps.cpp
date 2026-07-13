@@ -43,13 +43,13 @@ std::uint32_t groupsForN(std::size_t n, std::uint32_t local) {
 
 } // namespace
 
-GpuOps::GpuOps(runtime::L0Context&    ctx,
-               runtime::UsmAllocator& alloc,
+GpuOps::GpuOps(core::l0::L0Context&    ctx,
+               core::l0::UsmAllocator& alloc,
                runtime::CommandQueue& queue,
                bool                   flashPrefillEnabled,
                bool                   flashPrefillGqaQ8Enabled,
                std::size_t            flashPrefillKTileQ8,
-               runtime::TriState      q8_0ReorderMode)
+               core::config::TriState      q8_0ReorderMode)
     : _ctx{ctx},
       _queue{queue},
       _alloc{alloc},
@@ -229,9 +229,9 @@ GpuOps::GpuOps(runtime::L0Context&    ctx,
 
 std::string_view GpuOps::q8_0ReorderModeName() const noexcept {
     switch (_q8_0ReorderMode) {
-        case runtime::TriState::Auto:    return "auto";
-        case runtime::TriState::Force:   return "force";
-        case runtime::TriState::Disable: return "disable";
+        case core::config::TriState::Auto:    return "auto";
+        case core::config::TriState::Force:   return "force";
+        case core::config::TriState::Disable: return "disable";
     }
     return "unknown";
 }
@@ -594,7 +594,7 @@ void GpuOps::scaledAddResidualAsync(float*       dst,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 
-void GpuOps::selfTest(runtime::UsmAllocator& allocator) {
+void GpuOps::selfTest(core::l0::UsmAllocator& allocator) {
     // x_quant_i8: per-row symmetric int8 quantisation. Feeds the DP4A
     // Q8_0 matmul (M8.H) — a broken quant kernel silently corrupts
     // every DP4A matmul on the target iGPU, so this runs first.
@@ -1222,7 +1222,7 @@ void GpuOps::attentionPrefillFlashAsync(const float*     q,
                         1);
 }
 
-void GpuOps::autotuneKTileQ8(runtime::UsmAllocator& allocator,
+void GpuOps::autotuneKTileQ8(core::l0::UsmAllocator& allocator,
                              std::size_t            nHeads,
                              std::size_t            nKvHeads,
                              std::size_t            headDim,

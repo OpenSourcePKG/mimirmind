@@ -5,9 +5,12 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace mimirmind::core::l0 { class L0Context; }
+
 namespace mimirmind::runtime {
 
-class L0Context;
+using ::mimirmind::core::l0::L0Context;
+
 class GpuKernel;
 
 /**

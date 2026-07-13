@@ -15,9 +15,11 @@
 #include <unordered_map>
 #include <vector>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::l0 {
 class L0Context;
 class UsmAllocator;
+}
+namespace mimirmind::core::config {
 struct FeatureSettings;
 }
 
@@ -57,9 +59,9 @@ inline constexpr std::size_t kAutotuneBucketCount =
  */
 class GpuMatmul {
 public:
-    GpuMatmul(runtime::L0Context&    ctx,
+    GpuMatmul(core::l0::L0Context&    ctx,
               GpuOps&                ops,
-              runtime::UsmAllocator& alloc,
+              core::l0::UsmAllocator& alloc,
               runtime::CommandQueue& queue);
     ~GpuMatmul();
 
@@ -69,7 +71,7 @@ public:
     GpuMatmul& operator=(GpuMatmul&&)      = delete;
 
     /// True if this dispatcher will run `type` on the GPU.
-    [[nodiscard]] bool supports(model::GgmlType type) const noexcept;
+    [[nodiscard]] bool supports(core::gguf::GgmlType type) const noexcept;
 
     /// Per-QuantType micro-bench: for each type that has both a matvec
     /// and a GEMM kernel, time both paths on a representative prefill
@@ -91,9 +93,9 @@ public:
     ///   features.dp4a    == TriState::Disable → skip the DP4A parity/bench
     ///   features.gemmV2                       → route picked GEMM through v2 kernel
     /// If both `gemm` and `gemmMinM` are set, `gemmMinM` wins.
-    void autotune(runtime::UsmAllocator&          allocator,
+    void autotune(core::l0::UsmAllocator&          allocator,
                   std::size_t                     hiddenDim,
-                  const runtime::FeatureSettings& features);
+                  const core::config::FeatureSettings& features);
 
     /// Y [M, N] = X [M, K] * W [N, K]^T. Synchronous version (mirrors
     /// compute::matmul signature). For supported `type` the dispatch goes
@@ -101,7 +103,7 @@ public:
     /// the call falls back to CPU.
     ///
     /// `scratch` (K floats) is only consumed on the CPU fallback path.
-    void matmul(model::GgmlType type,
+    void matmul(core::gguf::GgmlType type,
                 const void*     W,
                 std::size_t     N,
                 std::size_t     K,
@@ -120,7 +122,7 @@ public:
      * first (to preserve ordering vs prior async appends), then run the
      * CPU fallback synchronously.
      */
-    void matmulAsync(model::GgmlType type,
+    void matmulAsync(core::gguf::GgmlType type,
                      const void*     W,
                      std::size_t     N,
                      std::size_t     K,
@@ -138,7 +140,7 @@ public:
     ///
     /// Available only when the DP4A kernel for `type` resolved at module
     /// load; query via dp4aAvailable(type) first. Throws if unavailable.
-    void matmulDp4aAsync(model::GgmlType    type,
+    void matmulDp4aAsync(core::gguf::GgmlType    type,
                          const std::int8_t* Xq,
                          const float*       Xscale,
                          const void*        W,
@@ -152,7 +154,7 @@ private:
     /// persistent Xq/Xscale scratch via `_ops.xQuantI8Async`, then
     /// forwards to `matmulDp4aAsync`. Callers must first verify
     /// `M <= kDp4aMaxM && K <= kDp4aMaxK`.
-    void dispatchDp4aFromFloat(model::GgmlType type,
+    void dispatchDp4aFromFloat(core::gguf::GgmlType type,
                                const float*    X,
                                const void*     W,
                                std::size_t     N,
@@ -168,7 +170,7 @@ public:
     /// True when the DP4A kernel for `type` loaded successfully. False
     /// when the SPV or the DP4A extension itself was unavailable on the
     /// target iGPU; callers must fall back to the plain matvec path.
-    [[nodiscard]] bool dp4aAvailable(model::GgmlType type) const noexcept;
+    [[nodiscard]] bool dp4aAvailable(core::gguf::GgmlType type) const noexcept;
 
     /// Flush any pending appends (close + execute + sync + reset). Safe
     /// to call when there's no pending work — cheap no-op.
@@ -263,14 +265,14 @@ private:
         std::string autotuneSource;       // "bench" | "env_force_gemm" | ...
     };
 
-    runtime::L0Context&    _ctx;
+    core::l0::L0Context&    _ctx;
     GpuOps&                _ops;
-    runtime::UsmAllocator& _alloc;
+    core::l0::UsmAllocator& _alloc;
     runtime::CommandQueue& _queue;
 
     // One Entry per GgmlType that has a `gpuMatmulModule()` registered.
     // Populated at construction by iterating the QuantType registry.
-    std::unordered_map<model::GgmlType, Entry> _entries;
+    std::unordered_map<core::gguf::GgmlType, Entry> _entries;
 
     // DP4A kernel slots now live inside each Entry (Entry::dp4a) so
     // Q4_K, Q8_0, and any future int-dot-product quant share one code

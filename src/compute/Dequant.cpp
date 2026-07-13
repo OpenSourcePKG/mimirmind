@@ -52,7 +52,7 @@ float bf16ToFloat(std::uint16_t b) noexcept {
     return f;
 }
 
-void dequantToF32(model::GgmlType type,
+void dequantToF32(core::gguf::GgmlType type,
                   const void*     src,
                   std::size_t     nelements,
                   float*          dst) {
@@ -61,10 +61,10 @@ void dequantToF32(model::GgmlType type,
         return;
     }
     MM_LOG_ERROR("dequant", "type {} not yet implemented",
-                 model::typeInfo(type).name);
+                 core::gguf::typeInfo(type).name);
     throw std::runtime_error(
         "dequantToF32: ggml type '" +
-        std::string{model::typeInfo(type).name} + "' not yet implemented");
+        std::string{core::gguf::typeInfo(type).name} + "' not yet implemented");
 }
 
 } // namespace mimirmind::compute

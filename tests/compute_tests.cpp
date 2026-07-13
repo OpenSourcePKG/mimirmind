@@ -313,7 +313,7 @@ TEST(matmul_f32_simpleDotProducts) {
     std::array<float, M * N>       Y{};
     std::array<float, K>           scratch{};
 
-    mimirmind::compute::matmul(mimirmind::model::GgmlType::F32,
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::F32,
                                W.data(), N, K,
                                X.data(), M, Y.data(),
                                scratch.data());
@@ -337,7 +337,7 @@ TEST(matmul_f32_multipleRows) {
     std::array<float, M * N> Y{};
     std::array<float, K>     scratch{};
 
-    mimirmind::compute::matmul(mimirmind::model::GgmlType::F32,
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::F32,
                                W.data(), N, K,
                                X.data(), M, Y.data(),
                                scratch.data());
@@ -366,7 +366,7 @@ TEST(matmul_q8_0_singleBlock) {
     std::array<float, M * N>      Y{};
     std::array<float, K>          scratch{};
 
-    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q8_0,
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::Q8_0,
                                W.data(), N, K,
                                X.data(), M, Y.data(),
                                scratch.data());
@@ -390,7 +390,7 @@ TEST(matmul_q6k_singleSuperBlock) {
     std::array<float, M * N> Y{};
     std::vector<float>       scratch(K);
 
-    mimirmind::compute::matmul(mimirmind::model::GgmlType::Q6_K,
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::Q6_K,
                                W.data(), N, K,
                                X.data(), M, Y.data(),
                                scratch.data());
@@ -405,7 +405,7 @@ TEST(matmul_zeroN_noop) {
     std::array<float, K>        scratch{};
 
     // N=0 should just return without touching Y.
-    mimirmind::compute::matmul(mimirmind::model::GgmlType::F32,
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::F32,
                                X.data(), 0, K,
                                X.data(), 1, Y.data(),
                                scratch.data());
@@ -430,7 +430,7 @@ TEST(embedding_f32_singleToken) {
     std::array<float, d_model>        dst{};
 
     mimirmind::compute::embeddingLookup(
-        mimirmind::model::GgmlType::F32,
+        mimirmind::core::gguf::GgmlType::F32,
         table.data(), d_model, vocab_size,
         std::span<const std::int32_t>{ids},
         dst.data());
@@ -455,7 +455,7 @@ TEST(embedding_f32_multipleTokens) {
     std::array<float, 3 * d_model>    dst{};
 
     mimirmind::compute::embeddingLookup(
-        mimirmind::model::GgmlType::F32,
+        mimirmind::core::gguf::GgmlType::F32,
         table.data(), d_model, vocab_size,
         std::span<const std::int32_t>{ids},
         dst.data());
@@ -480,7 +480,7 @@ TEST(embedding_outOfRange_zeroFilled) {
     std::array<float, 3 * d_model>    dst{};
 
     mimirmind::compute::embeddingLookup(
-        mimirmind::model::GgmlType::F32,
+        mimirmind::core::gguf::GgmlType::F32,
         table.data(), d_model, vocab_size,
         std::span<const std::int32_t>{ids},
         dst.data());
@@ -526,7 +526,7 @@ TEST(embedding_q6k_dequants) {
     std::array<float, 2 * d_model>    dst{};
 
     mimirmind::compute::embeddingLookup(
-        mimirmind::model::GgmlType::Q6_K,
+        mimirmind::core::gguf::GgmlType::Q6_K,
         table.data(), d_model, vocab_size,
         std::span<const std::int32_t>{ids},
         dst.data());
@@ -545,7 +545,7 @@ TEST(embedding_zeroDModelThrows) {
     std::array<float, 1>              dst{};
     try {
         mimirmind::compute::embeddingLookup(
-            mimirmind::model::GgmlType::F32,
+            mimirmind::core::gguf::GgmlType::F32,
             table.data(), 0, 1,
             std::span<const std::int32_t>{ids},
             dst.data());

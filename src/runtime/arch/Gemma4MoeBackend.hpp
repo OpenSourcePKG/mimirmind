@@ -20,7 +20,7 @@ namespace mimirmind::runtime::arch {
 class Gemma4MoeBackend final : public GemmaBaseBackend {
 public:
     Gemma4MoeBackend(const model::LlmConfig&        config,
-                     const model::WeightsMap&       weights,
+                     const core::gguf::WeightsMap&       weights,
                      const model::FusedQkvWeights*  fusedQkv,
                      compute::GpuOps&               ops,
                      compute::GpuMatmul&            gmm,

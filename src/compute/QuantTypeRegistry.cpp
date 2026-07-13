@@ -33,30 +33,30 @@ const std::array<const QuantType*, 7>& registry() noexcept {
 
 } // namespace
 
-const QuantType* quantType(model::GgmlType type) noexcept {
+const QuantType* quantType(core::gguf::GgmlType type) noexcept {
     switch (type) {
-        case model::GgmlType::F32:  return &quant::Float32::instance();
-        case model::GgmlType::F16:  return &quant::Float16::instance();
-        case model::GgmlType::BF16: return &quant::Bfloat16::instance();
-        case model::GgmlType::Q4_K: return &quant::Q4K::instance();
-        case model::GgmlType::Q5_K: return &quant::Q5K::instance();
-        case model::GgmlType::Q6_K: return &quant::Q6K::instance();
-        case model::GgmlType::Q8_0: return &quant::Q8_0::instance();
+        case core::gguf::GgmlType::F32:  return &quant::Float32::instance();
+        case core::gguf::GgmlType::F16:  return &quant::Float16::instance();
+        case core::gguf::GgmlType::BF16: return &quant::Bfloat16::instance();
+        case core::gguf::GgmlType::Q4_K: return &quant::Q4K::instance();
+        case core::gguf::GgmlType::Q5_K: return &quant::Q5K::instance();
+        case core::gguf::GgmlType::Q6_K: return &quant::Q6K::instance();
+        case core::gguf::GgmlType::Q8_0: return &quant::Q8_0::instance();
 
-        case model::GgmlType::F64:
-        case model::GgmlType::I8:
-        case model::GgmlType::I16:
-        case model::GgmlType::I32:
-        case model::GgmlType::I64:
-        case model::GgmlType::Q4_0:
-        case model::GgmlType::Q4_1:
-        case model::GgmlType::Q5_0:
-        case model::GgmlType::Q5_1:
-        case model::GgmlType::Q8_1:
-        case model::GgmlType::Q2_K:
-        case model::GgmlType::Q3_K:
-        case model::GgmlType::Q8_K:
-        case model::GgmlType::Unknown:
+        case core::gguf::GgmlType::F64:
+        case core::gguf::GgmlType::I8:
+        case core::gguf::GgmlType::I16:
+        case core::gguf::GgmlType::I32:
+        case core::gguf::GgmlType::I64:
+        case core::gguf::GgmlType::Q4_0:
+        case core::gguf::GgmlType::Q4_1:
+        case core::gguf::GgmlType::Q5_0:
+        case core::gguf::GgmlType::Q5_1:
+        case core::gguf::GgmlType::Q8_1:
+        case core::gguf::GgmlType::Q2_K:
+        case core::gguf::GgmlType::Q3_K:
+        case core::gguf::GgmlType::Q8_K:
+        case core::gguf::GgmlType::Unknown:
         default:
             return nullptr;
     }

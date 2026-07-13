@@ -1,18 +1,21 @@
 #pragma once
 
-#include "core/gguf/GgufTypes.hpp"
+#include "core/gguf/GgufReader.hpp"
+#include "core/gguf/WeightsMap.hpp"
 
 #include <cstddef>
 #include <optional>
 #include <vector>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::l0 {
 class UsmAllocator;
 }
 
 namespace mimirmind::model {
 
-class WeightsMap;
+using ::mimirmind::core::gguf::GgmlType;
+using ::mimirmind::core::gguf::GgufTensor;
+using ::mimirmind::core::gguf::WeightsMap;
 
 /**
  * Fuses per-block attn_q / attn_k / attn_v weight tensors into a single
@@ -72,7 +75,7 @@ public:
     /// error). Enables Q8_0 GEMM v2 dispatch on prefill even when the
     /// underlying model was quantized to K-quants.
     FusedQkvWeights(const WeightsMap&      weights,
-                    runtime::UsmAllocator& allocator,
+                    core::l0::UsmAllocator& allocator,
                     std::size_t            numBlocks,
                     bool                   enabled               = true,
                     std::size_t            sharedKvLayers        = 0,
@@ -120,7 +123,7 @@ public:
     }
 
 private:
-    runtime::UsmAllocator&              _alloc;
+    core::l0::UsmAllocator&              _alloc;
     std::vector<std::optional<Block>>   _blocks;
     bool                                _anyFused{false};
     bool                                _disabled{false};

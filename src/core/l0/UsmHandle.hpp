@@ -4,7 +4,7 @@
 
 #include <cstddef>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::l0 {
 
 /**
  * Scope-bound USM allocation. Frees on destruction so an exception
@@ -66,4 +66,4 @@ private:
     std::size_t   _bytes{0};
 };
 
-} // namespace mimirmind::runtime
+} // namespace mimirmind::core::l0

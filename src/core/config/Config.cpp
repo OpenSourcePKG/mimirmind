@@ -8,7 +8,9 @@
 #include <stdexcept>
 #include <unordered_set>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::config {
+
+using ::mimirmind::runtime::ThermalProfile;
 
 namespace {
 
@@ -568,4 +570,4 @@ void applyCliOverrides(Config& cfg, const CliOverrides& cli) {
     if (cli.logLevel.has_value()) cfg.server.log.level = *cli.logLevel;
 }
 
-} // namespace mimirmind::runtime
+} // namespace mimirmind::core::config

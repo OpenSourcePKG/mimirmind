@@ -9,6 +9,8 @@
 
 namespace mimirmind::runtime {
 
+using ::mimirmind::core::l0::L0Error;
+
 namespace {
 
 #define ZE_CHECK(call)                                                  \

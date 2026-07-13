@@ -9,8 +9,8 @@ const Float32& Float32::instance() noexcept {
     return inst;
 }
 
-model::GgmlType Float32::ggmlType() const noexcept {
-    return model::GgmlType::F32;
+core::gguf::GgmlType Float32::ggmlType() const noexcept {
+    return core::gguf::GgmlType::F32;
 }
 
 std::string_view Float32::name() const noexcept {

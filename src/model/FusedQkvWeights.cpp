@@ -33,7 +33,7 @@ std::size_t nCols(const GgufTensor& t) noexcept {
 } // namespace
 
 FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
-                                 runtime::UsmAllocator& allocator,
+                                 core::l0::UsmAllocator& allocator,
                                  std::size_t            numBlocks,
                                  bool                   enabled,
                                  std::size_t            sharedKvLayers,

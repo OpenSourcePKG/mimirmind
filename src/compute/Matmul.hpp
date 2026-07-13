@@ -26,7 +26,7 @@ namespace mimirmind::compute {
  *
  * Slow but correct. GPU kernels land at M5.
  */
-void matmul(model::GgmlType weightType,
+void matmul(core::gguf::GgmlType weightType,
             const void*     W,
             std::size_t     N,
             std::size_t     K,

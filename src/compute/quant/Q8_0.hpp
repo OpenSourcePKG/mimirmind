@@ -19,7 +19,7 @@ class Q8_0 final : public QuantType {
 public:
     [[nodiscard]] static const Q8_0& instance() noexcept;
 
-    [[nodiscard]] model::GgmlType  ggmlType()            const noexcept override;
+    [[nodiscard]] core::gguf::GgmlType  ggmlType()            const noexcept override;
     [[nodiscard]] std::string_view name()                const noexcept override;
     [[nodiscard]] std::size_t      blockElements()       const noexcept override;
     [[nodiscard]] std::size_t      blockBytes()          const noexcept override;

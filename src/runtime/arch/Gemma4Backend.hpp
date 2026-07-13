@@ -12,9 +12,12 @@ class GpuMatmul;
 class GpuOps;
 } // namespace mimirmind::compute
 
+namespace mimirmind::core::gguf {
+class WeightsMap;
+} // namespace mimirmind::core::gguf
+
 namespace mimirmind::model {
 class FusedQkvWeights;
-class WeightsMap;
 struct LlmConfig;
 } // namespace mimirmind::model
 
@@ -39,7 +42,7 @@ class GemmaBaseBackend;
 class Gemma4Backend final : public ArchBackend {
 public:
     Gemma4Backend(const model::LlmConfig&        config,
-                  const model::WeightsMap&       weights,
+                  const core::gguf::WeightsMap&       weights,
                   const model::FusedQkvWeights*  fusedQkv,
                   compute::GpuOps&               ops,
                   compute::GpuMatmul&            gmm,

@@ -7,9 +7,12 @@ class GpuMatmul;
 class GpuOps;
 } // namespace mimirmind::compute
 
+namespace mimirmind::core::gguf {
+class WeightsMap;
+} // namespace mimirmind::core::gguf
+
 namespace mimirmind::model {
 class FusedQkvWeights;
-class WeightsMap;
 struct LlmConfig;
 } // namespace mimirmind::model
 
@@ -25,7 +28,7 @@ namespace mimirmind::runtime::arch {
 class Qwen2Backend final : public ArchBackend {
 public:
     Qwen2Backend(const model::LlmConfig&        config,
-                 const model::WeightsMap&       weights,
+                 const core::gguf::WeightsMap&       weights,
                  const model::FusedQkvWeights*  fusedQkv,
                  compute::GpuOps&               ops,
                  compute::GpuMatmul&            gmm,
@@ -48,7 +51,7 @@ public:
 
 private:
     const model::LlmConfig&        _config;
-    const model::WeightsMap&       _weights;
+    const core::gguf::WeightsMap&       _weights;
     const model::FusedQkvWeights*  _fusedQkv{nullptr};
     compute::GpuOps&               _ops;
     compute::GpuMatmul&            _gmm;

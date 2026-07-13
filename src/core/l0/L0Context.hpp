@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::l0 {
 
 struct DeviceInfo {
     std::string  name;
@@ -86,4 +86,4 @@ private:
     bool        _hasMutableCmdLists{false};
 };
 
-} // namespace mimirmind::runtime
+} // namespace mimirmind::core::l0

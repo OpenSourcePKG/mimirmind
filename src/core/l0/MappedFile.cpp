@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::l0 {
 
 MappedFile::MappedFile(std::string_view path)
     : _path{path}
@@ -118,4 +118,4 @@ void MappedFile::close() noexcept {
     }
 }
 
-} // namespace mimirmind::runtime
+} // namespace mimirmind::core::l0

@@ -22,7 +22,7 @@
 namespace mimirmind::runtime::arch {
 
 GemmaBaseBackend::GemmaBaseBackend(const model::LlmConfig&        config,
-                                   const model::WeightsMap&       weights,
+                                   const core::gguf::WeightsMap&       weights,
                                    const model::FusedQkvWeights*  fusedQkv,
                                    compute::GpuOps&               ops,
                                    compute::GpuMatmul&            gmm,
@@ -104,7 +104,7 @@ void GemmaBaseBackend::buildLayerInfos() {
 
 void GemmaBaseBackend::loadRopeFreqs() {
     if (const auto* rf = _weights.find("rope_freqs.weight");
-        rf != nullptr && rf->type == model::GgmlType::F32) {
+        rf != nullptr && rf->type == core::gguf::GgmlType::F32) {
         // ggml_rope_ext expects [head_dim/2]; the 26B-A4B GGUF stores 256
         // floats (full head_dim/2 = 256). Accept any tensor whose element
         // count is at least the largest layer's halfDim and use the first
@@ -162,7 +162,7 @@ std::pair<std::size_t, std::size_t> GemmaBaseBackend::maxQKVDims() const {
     return {qMax, kvMax};
 }
 
-const model::GgufTensor*
+const core::gguf::GgufTensor*
 GemmaBaseBackend::requireTensor(std::size_t blockIdx,
                                 const char* suffix,
                                 const char* clsName) const {
@@ -222,9 +222,9 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // K/V weights are only needed when this layer owns its K/V cache.
     // Shared-KV layers (Gemma 4 E4B: 18 trailing) skip the K/V projection
     // entirely and read from `kvSourceLayer`'s cache during attention.
-    const model::GgufTensor* kW    = nullptr;
-    const model::GgufTensor* kNorm = nullptr;
-    const model::GgufTensor* vW    = nullptr;
+    const core::gguf::GgufTensor* kW    = nullptr;
+    const core::gguf::GgufTensor* kNorm = nullptr;
+    const core::gguf::GgufTensor* vW    = nullptr;
     if (li.ownsKv) {
         kW    = requireTensor(blockIdx, "attn_k.weight",      "GemmaBase");
         kNorm = requireTensor(blockIdx, "attn_k_norm.weight", "GemmaBase");
@@ -302,7 +302,7 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
                       normBuf);
     dumpStage("attn_norm", blockIdx, normBuf, T, d_model);
 
-    auto projectAsync = [&](const model::GgufTensor* W,
+    auto projectAsync = [&](const core::gguf::GgufTensor* W,
                             std::size_t N, float* dst) {
         _gmm.matmulAsync(W->type, W->usmPtr, N, d_model,
                          normBuf, T, dst, matmulScratch);
@@ -333,7 +333,7 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // gate falls back cleanly when reorderUsmPtr is nullptr (opt-
         // out per-block by the loader or feature.q8_0Reorder=disable).
         if (T == 1 && fBlk->reorderUsmPtr != nullptr
-                   && fBlk->type == model::GgmlType::Q8_0) {
+                   && fBlk->type == core::gguf::GgmlType::Q8_0) {
             _ops.matmulQ8_0VecReorderAsync(fBlk->reorderUsmPtr,
                                            Nfused, d_model,
                                            normBuf, qkvFused);

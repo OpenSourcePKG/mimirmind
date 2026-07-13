@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/gguf/GgufTypes.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -18,9 +20,13 @@ namespace mimirmind::runtime {
 class OpProfiler;
 } // namespace mimirmind::runtime
 
+namespace mimirmind::core::gguf {
+class WeightsMap;
+struct GgufTensor;
+} // namespace mimirmind::core::gguf
+
 namespace mimirmind::model {
 class FusedQkvWeights;
-class WeightsMap;
 struct LlmConfig;
 } // namespace mimirmind::model
 
@@ -30,6 +36,11 @@ struct BlockBuffers;
 } // namespace mimirmind::runtime
 
 namespace mimirmind::runtime::arch {
+
+using ::mimirmind::core::gguf::GgufTensor;
+using ::mimirmind::core::gguf::GgmlType;
+using ::mimirmind::core::gguf::WeightsMap;
+using ::mimirmind::core::gguf::typeInfo;
 
 /**
  * Architecture-specific block forward + per-call hooks.
@@ -140,7 +151,7 @@ isSupportedArchitecture(std::string_view architecture) noexcept {
 std::unique_ptr<ArchBackend>
 createArchBackend(const std::string&             architecture,
                   const model::LlmConfig&        config,
-                  const model::WeightsMap&       weights,
+                  const core::gguf::WeightsMap&       weights,
                   const model::FusedQkvWeights*  fusedQkv,
                   compute::GpuOps&               ops,
                   compute::GpuMatmul&            gmm,

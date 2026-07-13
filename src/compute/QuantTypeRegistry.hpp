@@ -14,7 +14,7 @@ namespace mimirmind::compute {
  * The returned pointer is to a static singleton — never owns, never null
  * for the types we explicitly support.
  */
-[[nodiscard]] const QuantType* quantType(model::GgmlType type) noexcept;
+[[nodiscard]] const QuantType* quantType(core::gguf::GgmlType type) noexcept;
 
 /**
  * All currently-registered QuantType instances. Used by GpuMatmul at

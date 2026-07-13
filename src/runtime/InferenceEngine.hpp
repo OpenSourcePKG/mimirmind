@@ -16,8 +16,11 @@
 #include "core/l0/UsmAllocator.hpp"
 #include "core/l0/UsmHandle.hpp"
 
-namespace mimirmind::runtime {
+namespace mimirmind::core::config {
 struct Config;
+}
+
+namespace mimirmind::runtime {
 class FanController;
 class GpuClockGovernor;
 class PerfRegressionDetector;
@@ -37,6 +40,11 @@ class ThermalGuard;
 #include <vector>
 
 namespace mimirmind::runtime {
+
+using ::mimirmind::core::l0::L0Context;
+using ::mimirmind::core::l0::UsmAllocator;
+using ::mimirmind::core::l0::UsmHandle;
+using ::mimirmind::core::config::Config;
 
 namespace arch {
 class ArchBackend;
@@ -338,10 +346,10 @@ public:
         return _fusedQkv.get();
     }
 
-    [[nodiscard]] const model::GgufReader& reader()    const noexcept { return _reader; }
+    [[nodiscard]] const core::gguf::GgufReader& reader()    const noexcept { return _reader; }
     [[nodiscard]] const model::LlmConfig&  config()    const noexcept { return _config; }
     [[nodiscard]] const model::Tokenizer&  tokenizer() const noexcept { return _tokenizer; }
-    [[nodiscard]] const model::WeightsMap& weights()   const;
+    [[nodiscard]] const core::gguf::WeightsMap& weights()   const;
 
 private:
     /// Compute logits over the last hidden state row via final-norm +
@@ -350,8 +358,8 @@ private:
     /// sampler subspans internally for penalty accounting (M7f).
     std::int32_t sampleNext(const float*                   hidden,
                             std::size_t                    vocab_lm,
-                            const model::GgufTensor&       outNorm,
-                            const model::GgufTensor&       lmHead,
+                            const core::gguf::GgufTensor&       outNorm,
+                            const core::gguf::GgufTensor&       lmHead,
                             float*                         normScratch,
                             float*                         logits,
                             float*                         matmulScratch,
@@ -382,10 +390,10 @@ private:
     OpProfiler                         _opProfiler;
     compute::Sampler                   _sampler{};
 
-    model::GgufReader                  _reader;
+    core::gguf::GgufReader                  _reader;
     model::LlmConfig                   _config;
     model::Tokenizer                   _tokenizer;
-    std::optional<model::WeightsMap>       _weights;
+    std::optional<core::gguf::WeightsMap>       _weights;
     std::unique_ptr<model::FusedQkvWeights> _fusedQkv;
     std::unique_ptr<arch::ArchBackend>      _backend;
     bool                               _modelLoaded{false};

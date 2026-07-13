@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/l0/L0Context.hpp"
+#include "core/log/Log.hpp"
 
 #include <array>
 #include <cstddef>
@@ -9,9 +10,7 @@
 #include <optional>
 #include <vector>
 
-namespace mimirmind::runtime {
-
-enum class LogLevel : int;
+namespace mimirmind::core::l0 {
 
 /**
  * Empirically-discovered allocation limits on the current device/loader.
@@ -105,7 +104,7 @@ public:
     [[nodiscard]] UsmStats stats() const noexcept;
 
     /// Emit a stats summary at `lvl`, plus per-bucket detail at DEBUG.
-    void logStats(LogLevel lvl) const;
+    void logStats(::mimirmind::core::log::LogLevel lvl) const;
 
     /// Drop all cached free-list chunks back to the driver. Idempotent.
     void shrinkPool() noexcept;
@@ -147,4 +146,4 @@ private:
     UsmStats                         _stats{};
 };
 
-} // namespace mimirmind::runtime
+} // namespace mimirmind::core::l0
