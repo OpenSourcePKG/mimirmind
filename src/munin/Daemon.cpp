@@ -4,6 +4,7 @@
 #include "core/l0/L0Context.hpp"
 #include "core/l0/UsmAllocator.hpp"
 #include "core/log/Log.hpp"
+#include "core/os/GovernorLock.hpp"
 #include "munin/ModelStore.hpp"
 #include "munin/SocketServer.hpp"
 
@@ -115,6 +116,25 @@ int Daemon::run(const CliOptions& opts) noexcept {
     MM_LOG_INFO("munin",
                 "starting: config='{}' pid={}",
                 opts.configPath, static_cast<int>(::getpid()));
+
+    // ---- governor flock ----------------------------------------------
+    // Munin owns the governor while it runs — attached workers verify
+    // this via `healthz.governor_owner` and skip their own governor
+    // install. The flock catches a second process (Munin or standalone
+    // mimirmind) trying to co-own the sysfs regulators.
+    auto lockR = ::mimirmind::core::os::GovernorLock::tryAcquire();
+    if (!lockR) {
+        MM_LOG_ERROR("munin", "governor flock: {}", lockR.error());
+        std::fprintf(stderr,
+                     "munin: %s\n"
+                     "Hint: is a standalone mimirmind running on this host? "
+                     "Stop it first, or point it at Munin via --attach.\n",
+                     lockR.error().c_str());
+        return 3;
+    }
+    auto governorLock = std::move(*lockR);
+    MM_LOG_INFO("munin",
+                "acquired governor flock at '{}'", governorLock.path());
 
     // ---- L0 + allocator ----------------------------------------------
     // Munin always uses Host-USM for its allocations so it can export

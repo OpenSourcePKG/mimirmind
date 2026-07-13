@@ -205,9 +205,11 @@ add_library(mimirmind_core STATIC
     src/core/config/Config.cpp
     src/core/gguf/GgufReader.cpp
     src/core/gguf/GgufTypes.cpp
+    src/core/gguf/TensorFingerprint.cpp
     src/core/gguf/WeightsMap.cpp
     src/core/ipc/IpcExporter.cpp
     src/core/ipc/IpcImporter.cpp
+    src/core/ipc/MuninClient.cpp
     src/core/ipc/TensorManifest.cpp
     src/core/ipc/UnixSocketFrame.cpp
     src/core/ipc/WireOps.cpp
@@ -215,6 +217,7 @@ add_library(mimirmind_core STATIC
     src/core/l0/MappedFile.cpp
     src/core/l0/UsmAllocator.cpp
     src/core/log/Log.cpp
+    src/core/os/GovernorLock.cpp
 )
 
 # PUBLIC so consumers get the transitive header include paths (ze_api.h

@@ -101,11 +101,6 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return _byId.size(); }
 
 private:
-    // Compute the load-time fingerprint. See ADR: header hash + tensor count
-    // + total bytes; deliberately cheap, not a full SHA of 25 GiB.
-    static std::string computeFingerprint(
-        const ::mimirmind::core::gguf::GgufReader& reader);
-
     std::unordered_map<std::string, std::unique_ptr<LoadedModel>> _byId;
 };
 

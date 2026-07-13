@@ -16,6 +16,18 @@ WeightsMap::WeightsMap(const GgufReader& reader) {
     MM_LOG_INFO("weights", "indexed {} tensors for O(1) lookup", _byName.size());
 }
 
+WeightsMap::WeightsMap(std::vector<GgufTensor> attachedTensors)
+    : _owned{std::move(attachedTensors)} {
+    _byName.reserve(_owned.size() * 2);
+    for (const auto& t : _owned) {
+        _byName.emplace(t.name, &t);
+    }
+    MM_LOG_INFO("weights",
+                "indexed {} attached tensors for O(1) lookup "
+                "(attached-mode; usmPtrs point at Munin-owned USM)",
+                _byName.size());
+}
+
 const GgufTensor* WeightsMap::find(std::string_view name) const noexcept {
     const auto it = _byName.find(std::string{name});
     return it == _byName.end() ? nullptr : it->second;

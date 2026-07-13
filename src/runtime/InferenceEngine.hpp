@@ -175,6 +175,27 @@ public:
     /// loaded (no hot-swap in M7a) or the file is malformed.
     void loadModel(std::string_view ggufPath);
 
+    /**
+     * Attached-mode load for the M-Munin flow. Opens `ggufPath` only for
+     * header parsing (LlmConfig + tokenizer + fingerprint verification),
+     * then constructs the WeightsMap from `attachedTensors` whose
+     * `usmPtr` fields already point at Munin-owned USM. Does not call
+     * `_reader.loadTensors` — that is what the deploy-downtime win is
+     * about.
+     *
+     * `expectedFingerprint` is what the peer Munin advertised for the
+     * model in its manifest. This method recomputes the fingerprint
+     * locally from `ggufPath` and refuses the attach if they disagree
+     * — see M-Munin ADR "Modell-Fingerprint" for the reasoning ("Munin
+     * hat Q6, Worker erwartet Q8"). Throws on mismatch, with both
+     * hashes in the message.
+     *
+     * Throws if a model is already loaded on this engine.
+     */
+    void loadModelAttached(std::string_view                        ggufPath,
+                           std::string_view                        expectedFingerprint,
+                           std::vector<core::gguf::GgufTensor>&&   attachedTensors);
+
     [[nodiscard]] bool modelLoaded() const noexcept { return _modelLoaded; }
 
     /**
@@ -373,6 +394,13 @@ private:
     /// thrown out without losing cached tokens.
     void ensureCapacity(std::size_t maxT, std::size_t Tp, std::size_t maxNew,
                        std::size_t vocab_lm, std::size_t d_model);
+
+    /// Shared tail of loadModel / loadModelAttached. Runs after
+    /// `_weights` is populated (standalone: from `_reader`; attached:
+    /// from IPC-imported tensors). Builds FusedQkvWeights, autotunes,
+    /// picks the arch backend, sets `_modelLoaded` and logs the ready
+    /// line.
+    void finalizeLoad();
 
     // Held by reference for the whole process lifetime. Provided by main().
     const Config&                      _cfg;

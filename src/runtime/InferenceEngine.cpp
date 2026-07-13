@@ -2,6 +2,7 @@
 
 #include "compute/Embedding.hpp"
 #include "core/gguf/GgufTypes.hpp"
+#include "core/gguf/TensorFingerprint.hpp"
 #include "core/config/Config.hpp"
 #include "runtime/FanController.hpp"
 #include "runtime/Lcp.hpp"
@@ -170,6 +171,58 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
 
     _weights.emplace(_reader);
 
+    finalizeLoad();
+}
+
+void InferenceEngine::loadModelAttached(
+        std::string_view                          ggufPath,
+        std::string_view                          expectedFingerprint,
+        std::vector<core::gguf::GgufTensor>&&     attachedTensors) {
+    if (_modelLoaded) {
+        throw std::runtime_error("InferenceEngine: model already loaded");
+    }
+    if (attachedTensors.empty()) {
+        throw std::runtime_error("InferenceEngine::loadModelAttached: "
+                                 "attachedTensors is empty — nothing to attach");
+    }
+
+    MM_LOG_INFO("engine",
+                "loadModelAttached: opening '{}' (header only)", ggufPath);
+    _reader.open(ggufPath);
+    _config.parseFromGguf(_reader);
+    _tokenizer.loadFromGguf(_reader);
+
+    // Refuse-on-drift check. The local GGUF header must produce the
+    // same fingerprint Munin advertised for this model — otherwise
+    // the tensor list we just accepted from Munin describes a
+    // different model than our config/tokenizer expects. The whole
+    // point of the manifest protocol is to catch this at handshake
+    // time rather than during the first decode.
+    const std::string localFingerprint =
+        core::gguf::tensorFingerprint(_reader);
+    if (localFingerprint != expectedFingerprint) {
+        throw std::runtime_error(
+            std::string{"InferenceEngine::loadModelAttached: fingerprint "
+                        "mismatch — Munin advertised '"} +
+            std::string{expectedFingerprint} +
+            "' for this model but the local GGUF hashes to '" +
+            localFingerprint +
+            "'. Refusing attach. Either the wrong file is mounted on "
+            "the worker or Munin loaded a different revision. Restart "
+            "Munin with the correct file or rebuild the worker with a "
+            "matching config.");
+    }
+
+    MM_LOG_INFO("engine",
+                "loadModelAttached: fingerprint match ({}), adopting {} "
+                "attached tensors (Munin-owned USM)",
+                localFingerprint, attachedTensors.size());
+    _weights.emplace(std::move(attachedTensors));
+
+    finalizeLoad();
+}
+
+void InferenceEngine::finalizeLoad() {
     // One-shot architecture diagnostic. For gemma4 also dump the first
     // shared-KV block (block 5 in the standard 26B-A4B layout) — we
     // need to see if its Q tensor has a different output dim than block 0,

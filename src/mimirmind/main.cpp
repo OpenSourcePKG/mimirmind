@@ -8,6 +8,8 @@
 #include "model/LlmConfig.hpp"
 #include "model/Tokenizer.hpp"
 #include "core/gguf/WeightsMap.hpp"
+#include "core/ipc/MuninClient.hpp"
+#include "core/os/GovernorLock.hpp"
 #include "runtime/CommandQueue.hpp"
 #include "core/config/Config.hpp"
 #include "runtime/GpuKernel.hpp"
@@ -83,6 +85,11 @@ constexpr const char* kUsage =
     "  --system TEXT      System message for --chat (default: Qwen2.5 default)\n"
     "  --dump-dir PATH    (parity only) directory for reference-oracle dumps\n"
     "                     — sets diagnostics.parityDump for the subprocess.\n"
+    "  --attach URI       (serve only) attach to a running Munin daemon\n"
+    "                     instead of loading weights locally. URI form is\n"
+    "                     'unix:/path/to/munin.sock'. Governor ownership\n"
+    "                     stays with Munin; the worker skips thermal /\n"
+    "                     governor / fan install and the governor flock.\n"
     "  -h, --help         Show this help and exit\n";
 
 enum class Mode {
@@ -108,6 +115,12 @@ struct CliArgs {
     std::string   logLevel{};
     std::string   logFile{};
     std::string   dumpDir{};
+    // Attached mode for M-Munin. `unix:/path` means: skip local
+    // tensor load, connect to Munin over the Unix socket, import
+    // weights via SCM_RIGHTS. Governor is owned by Munin in this
+    // mode — the worker does not acquire the governor flock and
+    // does not install its own thermal/governor/fan monitors.
+    std::string   attachSocket{};
 };
 
 [[nodiscard]] bool parseArgs(int argc, char** argv, CliArgs& out) {
@@ -198,6 +211,24 @@ struct CliArgs {
             const char* v = needValue("--dump-dir");
             if (v == nullptr) return false;
             out.dumpDir = v;
+        } else if (a == "--attach") {
+            const char* v = needValue("--attach");
+            if (v == nullptr) return false;
+            // Only unix: URIs supported for now. Reject anything else
+            // up-front so a mistyped tcp: URI does not silently mean
+            // "no socket path" and drop into standalone load.
+            const std::string_view uri{v};
+            constexpr std::string_view kPrefix{"unix:"};
+            if (uri.substr(0, kPrefix.size()) != kPrefix) {
+                std::cerr << "--attach: only 'unix:PATH' URIs are supported "
+                             "(got '" << uri << "')\n";
+                return false;
+            }
+            out.attachSocket = std::string{uri.substr(kPrefix.size())};
+            if (out.attachSocket.empty()) {
+                std::cerr << "--attach: path after 'unix:' is empty\n";
+                return false;
+            }
         } else {
             std::cerr << "unknown argument '" << a << "'\n" << kUsage;
             return false;
@@ -1136,6 +1167,63 @@ int runServe(const CliArgs& args, const mimirmind::core::config::Config& cfg) {
         return 2;
     }
 
+    // ---- M-Munin attached mode -----------------------------------------
+    // Two things happen up-front:
+    //   1. Standalone workers acquire the governor flock so a second
+    //      standalone process on the same host fails fast rather than
+    //      dueling over sysfs writes.
+    //   2. Attached workers instead probe Munin's healthz to confirm the
+    //      daemon is up and the models Munin holds cover our loadOnStart
+    //      list. We refuse to start if any expected model is missing —
+    //      failing at boot beats failing on the first request.
+    const bool attachedMode = !args.attachSocket.empty();
+
+    std::optional<mimirmind::core::os::GovernorLock> governorLock;
+    if (!attachedMode) {
+        auto lk = mimirmind::core::os::GovernorLock::tryAcquire();
+        if (!lk) {
+            std::cerr << "serve: " << lk.error()
+                      << "\nHint: if Munin is running, start this "
+                         "worker with --attach unix:/var/run/munin/munin.sock "
+                         "so it does not compete for governor ownership.\n";
+            return 2;
+        }
+        governorLock = std::move(*lk);
+        MM_LOG_INFO("main",
+                    "serve: acquired governor flock at '{}'",
+                    governorLock->path());
+    }
+
+    // Probed once before the per-model attach loop so a dead Munin does
+    // not manifest as N confusing per-model attach errors.
+    if (attachedMode) {
+        MM_LOG_INFO("main",
+                    "serve: attached mode — probing Munin at '{}'",
+                    args.attachSocket);
+        auto hz = mimirmind::core::ipc::MuninClient::healthz(args.attachSocket);
+        if (!hz) {
+            std::cerr << "serve: Munin healthz failed at '"
+                      << args.attachSocket << "': " << hz.error() << "\n";
+            return 2;
+        }
+        if (hz->governorOwner != "munin") {
+            std::cerr << "serve: refusing to attach — Munin reports "
+                         "governor_owner='" << hz->governorOwner
+                      << "', expected 'munin'. Standalone-worker "
+                         "handoff back to Munin is not part of "
+                         "Schritt 8-minimal (M-Munin ADR).\n";
+            return 2;
+        }
+        MM_LOG_INFO("main",
+                    "serve: Munin healthz ok — pid={} models={} owner={}",
+                    hz->pid, hz->models.size(), hz->governorOwner);
+        for (const auto& m : hz->models) {
+            MM_LOG_INFO("main",
+                        "  munin-model id='{}' fingerprint='{}' bytes={}",
+                        m.id, m.fingerprint, m.totalBytes);
+        }
+    }
+
     // Load every loadOnStart:true model. Each gets its own InferenceEngine
     // (own L0 context, USM, autotune) — request dispatch picks the target
     // via `req.model`. Startup cost scales linearly with N (each model
@@ -1163,13 +1251,42 @@ int runServe(const CliArgs& args, const mimirmind::core::config::Config& cfg) {
 
     std::vector<std::unique_ptr<mimirmind::runtime::InferenceEngine>> ownedEngines;
     std::vector<mimirmind::server::LoadedEngine> loadedEngines;
+    // In attached mode: one MuninClient per loaded model, kept alive
+    // for the whole worker lifetime so Munin's implicit-detach logic
+    // sees the peer-close only when the worker actually shuts down.
+    std::vector<std::unique_ptr<mimirmind::core::ipc::MuninClient>> attachedClients;
 
     for (const auto& m : cfg.models) {
         if (!m.loadOnStart) continue;
-        MM_LOG_INFO("main", "serve: loading model '{}' (id='{}')",
-                    m.path, m.id);
         auto e = std::make_unique<mimirmind::runtime::InferenceEngine>(cfg);
-        e->loadModel(m.path);
+
+        if (attachedMode) {
+            MM_LOG_INFO("main",
+                        "serve: attaching to Munin for model '{}' "
+                        "(local header from '{}')", m.id, m.path);
+            auto client = std::make_unique<mimirmind::core::ipc::MuninClient>(
+                e->ctx());
+            auto result = client->attach(args.attachSocket, m.id);
+            if (!result) {
+                std::cerr << "serve: MuninClient::attach for id='"
+                          << m.id << "' failed: " << result.error() << "\n";
+                return 2;
+            }
+            try {
+                e->loadModelAttached(m.path,
+                                     result->manifest.modelFingerprint,
+                                     std::move(result->tensors));
+            } catch (const std::exception& x) {
+                std::cerr << "serve: loadModelAttached('" << m.id
+                          << "') failed: " << x.what() << "\n";
+                return 2;
+            }
+            attachedClients.push_back(std::move(client));
+        } else {
+            MM_LOG_INFO("main", "serve: loading model '{}' (id='{}')",
+                        m.path, m.id);
+            e->loadModel(m.path);
+        }
 
         const auto& arch = e->config().architecture;
         if (arch != "qwen2" && arch != "gemma4") {
@@ -1363,7 +1480,18 @@ int runServe(const CliArgs& args, const mimirmind::core::config::Config& cfg) {
 
     std::unique_ptr<mimirmind::runtime::SystemMonitor> monitor;
     std::unique_ptr<mimirmind::runtime::ThermalGuard>  guard;
-    if (hasThermalProfile) {
+    // In attached mode Munin drives every sysfs-write regulator
+    // (governor / thermal guard / fan). The worker MUST NOT install
+    // its own — see M-Munin ADR "Governor — Sonderregel". Attached
+    // workers still install PowerMonitor + PerfRegressionDetector
+    // (read-only) below so /v1/system/status stays useful.
+    if (attachedMode && hasThermalProfile) {
+        MM_LOG_INFO("main",
+                    "serve: attached mode — skipping ThermalGuard / "
+                    "GpuClockGovernor / FanController install "
+                    "(Munin owns them)");
+    }
+    if (!attachedMode && hasThermalProfile) {
         const mimirmind::runtime::ThermalProfile& profile = cfg.governor.thermal;
         try {
             monitor = std::make_unique<mimirmind::runtime::SystemMonitor>(
@@ -1560,7 +1688,10 @@ int runServe(const CliArgs& args, const mimirmind::core::config::Config& cfg) {
     // manual mode and hwmon writes are throwing kernel warnings.
     static std::unique_ptr<mimirmind::runtime::FanController> fanController;
     {
-        const bool disabled = !cfg.governor.fan.boost;
+        // Attached-mode workers never touch the fan (see M-Munin ADR
+        // Governor-Sonderregel). Munin owns the fan install; the worker
+        // just runs generate() and lets Munin cool the chassis.
+        const bool disabled = !cfg.governor.fan.boost || attachedMode;
         if (!disabled) {
             fanController = std::make_unique<mimirmind::runtime::FanController>();
             if (!fanController->available()) {
