@@ -52,15 +52,16 @@ parseUsmAllocKind(std::string_view s) noexcept;
 ///      set this when comparing the two kinds during a perf-bench —
 ///      it is intentionally undocumented in config.example.json so
 ///      operators can't fat-finger it.
-///   2. `fallback` — the compiled default. `Shared` today, may flip to
-///      `Host` once the M-Munin perf-bench on L0_TARGET_HOST confirms
-///      parity (see decisions/2026-07-13-m-munin-scope.md).
-///
-/// A future revision will also probe `ZE_DEVICE_PROPERTY_FLAG_INTEGRATED`
-/// so integrated-iGPU hosts pick `Host` automatically (the M-Munin
-/// prerequisite) while dGPU hosts stay on `Shared`.
+///   2. Hardware auto-detect via `ZE_DEVICE_PROPERTY_FLAG_INTEGRATED`:
+///      integrated iGPU → `Host` (unblocks M-Munin IPC without operator
+///      action — perf-parity to Shared verified 2026-07-13 on
+///      L0_TARGET_HOST, ledger entry #31), discrete GPU → `Shared`
+///      (Shared→Device migration remains a real perf lever on dGPU).
+///   3. `fallback` — only used when `zeDeviceGetProperties` itself
+///      fails, which should be near-impossible after L0Context is up.
 [[nodiscard]] UsmAllocKind
-selectUsmAllocKind(UsmAllocKind fallback = UsmAllocKind::Shared) noexcept;
+selectUsmAllocKind(L0Context&   ctx,
+                   UsmAllocKind fallback = UsmAllocKind::Shared) noexcept;
 
 /// Round-trip name of a kind for logs and diagnostics.
 [[nodiscard]] std::string_view toString(UsmAllocKind k) noexcept;

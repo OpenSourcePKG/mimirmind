@@ -57,7 +57,8 @@ std::optional<UsmAllocKind> parseUsmAllocKind(std::string_view s) noexcept {
     return std::nullopt;
 }
 
-UsmAllocKind selectUsmAllocKind(UsmAllocKind fallback) noexcept {
+UsmAllocKind selectUsmAllocKind(L0Context&   ctx,
+                                UsmAllocKind fallback) noexcept {
     if (const char* env = std::getenv("MIMIRMIND_USM_KIND"); env != nullptr) {
         if (const auto k = parseUsmAllocKind(std::string_view{env}); k.has_value()) {
             MM_LOG_INFO("usm",
@@ -67,9 +68,27 @@ UsmAllocKind selectUsmAllocKind(UsmAllocKind fallback) noexcept {
         }
         MM_LOG_WARN("usm",
                     "MIMIRMIND_USM_KIND='{}' — unknown value, ignoring "
-                    "(accepted: \"shared\", \"host\"); falling back to {}",
-                    env, toString(fallback));
+                    "(accepted: \"shared\", \"host\")",
+                    env);
     }
+    ze_device_properties_t props{};
+    props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+    const ze_result_t r = zeDeviceGetProperties(ctx.device(), &props);
+    if (r == ZE_RESULT_SUCCESS) {
+        if ((props.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED) != 0) {
+            MM_LOG_INFO("usm",
+                        "integrated iGPU detected — picking host "
+                        "(IPC-safe on Meteor Lake, perf-neutral to shared on UMA)");
+            return UsmAllocKind::Host;
+        }
+        MM_LOG_INFO("usm",
+                    "discrete GPU detected — picking shared "
+                    "(placement hint drives VRAM/system-RAM migration)");
+        return UsmAllocKind::Shared;
+    }
+    MM_LOG_WARN("usm",
+                "zeDeviceGetProperties failed (0x{:x}) — falling back to {}",
+                static_cast<unsigned>(r), toString(fallback));
     return fallback;
 }
 
