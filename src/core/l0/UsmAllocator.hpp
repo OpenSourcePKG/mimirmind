@@ -8,9 +8,62 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace mimirmind::core::l0 {
+
+/**
+ * Which zeMemAlloc* variant backs the free-list rawAlloc path.
+ *
+ *   Shared — zeMemAllocShared. Baseline behaviour: driver decides
+ *            placement (host-RAM vs device-RAM) and may migrate.
+ *            On UMA-iGPU (Meteor Lake, Lunar Lake, Alder/Raptor Lake)
+ *            the hint is inert because there is no discrete VRAM.
+ *
+ *   Host   — zeMemAllocHost. Always host-RAM allocation; the iGPU
+ *            still reads it via UMA-DMA on Meteor Lake, so decode
+ *            perf is identical to Shared on this class of hardware.
+ *            Required for L0 IPC on Meteor Lake — the Intel L0
+ *            driver's zeMemOpenIpcHandle path returns unusable
+ *            kernel-VA pointers for Shared and Device allocations
+ *            (verified 2026-07-13 via tools/l0-ipc-testrig; see
+ *            research/l0-ipc-host-only-meteor-lake.md).
+ *
+ * The Munin daemon must use Host so it can export model tensors
+ * via SCM_RIGHTS to attached mimirmind workers. Standalone
+ * mimirmind can pick either; Shared is the historical default.
+ */
+enum class UsmAllocKind {
+    Shared,
+    Host,
+};
+
+/// Parse a kind name ("shared" / "host") to UsmAllocKind. Returns
+/// std::nullopt for unrecognised values.
+[[nodiscard]] std::optional<UsmAllocKind>
+parseUsmAllocKind(std::string_view s) noexcept;
+
+/// Pick the kind the process should use.
+///
+/// Precedence:
+///   1. `MIMIRMIND_USM_KIND` env var (values "shared" or "host"). Only
+///      set this when comparing the two kinds during a perf-bench —
+///      it is intentionally undocumented in config.example.json so
+///      operators can't fat-finger it.
+///   2. `fallback` — the compiled default. `Shared` today, may flip to
+///      `Host` once the M-Munin perf-bench on L0_TARGET_HOST confirms
+///      parity (see decisions/2026-07-13-m-munin-scope.md).
+///
+/// A future revision will also probe `ZE_DEVICE_PROPERTY_FLAG_INTEGRATED`
+/// so integrated-iGPU hosts pick `Host` automatically (the M-Munin
+/// prerequisite) while dGPU hosts stay on `Shared`.
+[[nodiscard]] UsmAllocKind
+selectUsmAllocKind(UsmAllocKind fallback = UsmAllocKind::Shared) noexcept;
+
+/// Round-trip name of a kind for logs and diagnostics.
+[[nodiscard]] std::string_view toString(UsmAllocKind k) noexcept;
 
 /**
  * Empirically-discovered allocation limits on the current device/loader.
@@ -67,7 +120,15 @@ public:
     /// `probeTotalGiB`: from `runtime.usmProbeTotalGib` in config.json. Caps
     /// how much host RAM the Phase 2 sweep is allowed to touch. `0` skips
     /// Phase 2 entirely. `std::nullopt` uses the compiled default (4 GiB).
-    explicit UsmAllocator(L0Context& ctx, std::optional<int> probeTotalGiB = {});
+    ///
+    /// `kind` selects the underlying zeMemAlloc* variant. Default `Shared`
+    /// preserves pre-M-Munin behaviour; Munin and its attached workers
+    /// pick `Host` (see UsmAllocKind docs above).
+    explicit UsmAllocator(L0Context&                ctx,
+                          std::optional<int>        probeTotalGiB = {},
+                          UsmAllocKind              kind          = UsmAllocKind::Shared);
+
+    [[nodiscard]] UsmAllocKind kind() const noexcept { return _kind; }
     ~UsmAllocator();
 
     UsmAllocator(const UsmAllocator&)            = delete;
@@ -140,6 +201,7 @@ private:
 
     L0Context&                       _ctx;
     std::optional<int>               _probeTotalGiB{};
+    UsmAllocKind                     _kind{UsmAllocKind::Shared};
     UsmLimits                        _limits{};
     mutable std::mutex               _mutex;
     std::array<Bucket, kBucketCount> _buckets{};

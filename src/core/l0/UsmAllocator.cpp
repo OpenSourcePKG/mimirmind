@@ -3,7 +3,9 @@
 #include "core/log/Log.hpp"
 
 #include <bit>
+#include <cstdlib>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mimirmind::core::l0 {
@@ -47,6 +49,38 @@ double bytesToGiB(std::size_t b) noexcept {
 
 } // namespace
 
+// --- UsmAllocKind free helpers ----------------------------------------------
+
+std::optional<UsmAllocKind> parseUsmAllocKind(std::string_view s) noexcept {
+    if (s == "shared") return UsmAllocKind::Shared;
+    if (s == "host")   return UsmAllocKind::Host;
+    return std::nullopt;
+}
+
+UsmAllocKind selectUsmAllocKind(UsmAllocKind fallback) noexcept {
+    if (const char* env = std::getenv("MIMIRMIND_USM_KIND"); env != nullptr) {
+        if (const auto k = parseUsmAllocKind(std::string_view{env}); k.has_value()) {
+            MM_LOG_INFO("usm",
+                        "MIMIRMIND_USM_KIND='{}' — bench override picks {}",
+                        env, toString(*k));
+            return *k;
+        }
+        MM_LOG_WARN("usm",
+                    "MIMIRMIND_USM_KIND='{}' — unknown value, ignoring "
+                    "(accepted: \"shared\", \"host\"); falling back to {}",
+                    env, toString(fallback));
+    }
+    return fallback;
+}
+
+std::string_view toString(UsmAllocKind k) noexcept {
+    switch (k) {
+        case UsmAllocKind::Shared: return "shared";
+        case UsmAllocKind::Host:   return "host";
+    }
+    return "?";
+}
+
 // --- Bucket sizing ----------------------------------------------------------
 
 std::size_t UsmAllocator::bucketIndexFor(std::size_t bytes) noexcept {
@@ -74,8 +108,12 @@ std::size_t UsmAllocator::bucketSizeFor(std::size_t bytes) noexcept {
 
 // --- ctor/dtor --------------------------------------------------------------
 
-UsmAllocator::UsmAllocator(L0Context& ctx, std::optional<int> probeTotalGiB)
-    : _ctx{ctx}, _probeTotalGiB{probeTotalGiB} {}
+UsmAllocator::UsmAllocator(L0Context&          ctx,
+                           std::optional<int>  probeTotalGiB,
+                           UsmAllocKind        kind)
+    : _ctx{ctx}, _probeTotalGiB{probeTotalGiB}, _kind{kind} {
+    MM_LOG_INFO("usm", "alloc-kind={}", toString(_kind));
+}
 
 UsmAllocator::~UsmAllocator() {
     shrinkPool();
@@ -101,26 +139,34 @@ void* UsmAllocator::rawAlloc(std::size_t bytes) {
     hostDesc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
     hostDesc.flags = 0;
 
-    void* localPtr = nullptr;
-    const ze_result_t r = zeMemAllocShared(
-        _ctx.context(),
-        &deviceDesc,
-        &hostDesc,
-        bytes,
-        kAlignment,
-        _ctx.device(),
-        &localPtr);
+    void*             localPtr = nullptr;
+    ze_result_t       r        = ZE_RESULT_SUCCESS;
+    const char*       apiName  = "zeMemAllocShared";
+    switch (_kind) {
+        case UsmAllocKind::Shared:
+            apiName = "zeMemAllocShared";
+            r = zeMemAllocShared(
+                _ctx.context(), &deviceDesc, &hostDesc,
+                bytes, kAlignment, _ctx.device(), &localPtr);
+            break;
+        case UsmAllocKind::Host:
+            apiName = "zeMemAllocHost";
+            r = zeMemAllocHost(
+                _ctx.context(), &hostDesc,
+                bytes, kAlignment, &localPtr);
+            break;
+    }
 
     if (r == ZE_RESULT_SUCCESS && localPtr != nullptr) {
         MM_LOG_TRACE("usm",
-                     "zeMemAllocShared OK — size={} bytes ({:.2f} MiB) ptr={}",
-                     bytes, bytesToMiB(bytes), localPtr);
+                     "{} OK — size={} bytes ({:.2f} MiB) ptr={}",
+                     apiName, bytes, bytesToMiB(bytes), localPtr);
         return localPtr;
     }
     MM_LOG_TRACE("usm",
-                 "zeMemAllocShared FAIL — size={} bytes ({:.2f} MiB) "
+                 "{} FAIL — size={} bytes ({:.2f} MiB) "
                  "result={} (0x{:x})",
-                 bytes, bytesToMiB(bytes),
+                 apiName, bytes, bytesToMiB(bytes),
                  L0Context::resultToString(r),
                  static_cast<unsigned>(r));
     return nullptr;

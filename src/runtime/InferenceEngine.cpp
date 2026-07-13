@@ -100,7 +100,8 @@ void logTensorTaxonomy(const core::gguf::GgufReader& reader) {
 InferenceEngine::InferenceEngine(const Config& cfg)
     : _cfg{cfg},
       _ctx{std::string{cfg.runtime.spvDir.value_or("")}},
-      _allocator{_ctx, cfg.runtime.usmProbeTotalGib},
+      _allocator{_ctx, cfg.runtime.usmProbeTotalGib,
+                 ::mimirmind::core::l0::selectUsmAllocKind()},
       _queue{_ctx},
       _ops{_ctx, _allocator, _queue,
            cfg.features.flashPrefill,
