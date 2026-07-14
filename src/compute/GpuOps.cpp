@@ -785,8 +785,10 @@ void GpuOps::selfTest(core::l0::UsmAllocator& allocator) {
             fused[i] = static_cast<float>(i) * 0.125F;
         }
         std::memcpy(fUsm, fused.data(), fused.size() * sizeof(float));
-        // Poison the outputs so under-fills show up.
-        std::vector<float> poison(M * Nkv, -1.0e6F);
+        // Poison the outputs so under-fills show up. Sized to the
+        // largest destination (`M * Nq`) so the Q memcpy stays in
+        // bounds; K and V only read the first `M * Nkv` entries.
+        std::vector<float> poison(M * Nq, -1.0e6F);
         std::memcpy(qUsm, poison.data(), M * Nq  * sizeof(float));
         std::memcpy(kUsm, poison.data(), M * Nkv * sizeof(float));
         std::memcpy(vUsm, poison.data(), M * Nkv * sizeof(float));

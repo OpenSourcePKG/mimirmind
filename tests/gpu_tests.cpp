@@ -2639,8 +2639,10 @@ void runQkvSplitParity(const char* label,
     std::memcpy(bufFused.raw(), fused.data(),
                 fused.size() * sizeof(float));
 
-    // Poison the destinations so we notice under-fills.
-    std::vector<float> poison(M * Nkv, -12345.0F);
+    // Poison the destinations so we notice under-fills. Sized to the
+    // largest destination (`M * Nq`) so the Q memcpy stays in bounds;
+    // K and V only read the first `M * Nkv` entries.
+    std::vector<float> poison(M * Nq, -12345.0F);
     std::memcpy(bufQ.raw(), poison.data(), M * Nq  * sizeof(float));
     std::memcpy(bufK.raw(), poison.data(), M * Nkv * sizeof(float));
     if (hasV) {
