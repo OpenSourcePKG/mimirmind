@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "runtime/GpuKernel.hpp"
+
 #include <level_zero/ze_api.h>
 
 #include <cstdint>
@@ -26,6 +28,12 @@ using ::mimirmind::core::l0::L0Context;
  * The path is resolved against `L0Context::spvDirOverride()` (from
  * `runtime.spvDir` in config.json) if non-empty, else
  * `/usr/local/share/mimirmind/spv`, else the build-tree fallback.
+ *
+ * **Backend surface:** L0-backend implementation of the compute-module
+ * concept. Return type of `kernel()` is opaque `GpuKernel` — consumers
+ * do not see `ze_kernel_handle_t` in the API. Storage still uses
+ * L0-typed members (`ze_module_handle_t`), so this header does pull in
+ * `<level_zero/ze_api.h>`; that's intentional and mirrors CommandQueue.
  */
 class GpuModule {
 public:
@@ -39,8 +47,11 @@ public:
     GpuModule& operator=(GpuModule&&)      = delete;
 
     /// Look up (or first-time-create) a kernel by its `__kernel` symbol
-    /// name. Throws L0Error if the symbol isn't in this module.
-    [[nodiscard]] ze_kernel_handle_t kernel(const char* kernelName);
+    /// name. Returns a `GpuKernel` (opaque wrapper) by value — the
+    /// underlying `ze_kernel_handle_t` stays owned by this module and
+    /// is destroyed in the module dtor. Throws L0Error if the symbol
+    /// isn't in this module.
+    [[nodiscard]] GpuKernel kernel(const char* kernelName);
 
     [[nodiscard]] std::string_view name() const noexcept { return _name; }
 

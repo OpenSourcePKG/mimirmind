@@ -10,17 +10,31 @@
 
 namespace mimirmind::runtime {
 
+class GpuModule;
+
 /**
  * Thin RAII-less wrapper around a ze_kernel_handle_t. The handle's
  * lifetime is owned by the GpuModule that created it; this class just
  * gives us a typed builder for setArgument + setGroupSize.
+ *
+ * Construction from a raw `ze_kernel_handle_t` is intentionally private
+ * — the only legitimate producer is `GpuModule::kernel()`. This
+ * prevents backend-specific handles from leaking into consumer code
+ * that should stay backend-agnostic. `handle()` remains public because
+ * `CommandQueue` needs it to submit to L0; when a second backend lands
+ * in Phase 1c that accessor will be replaced with a backend-opaque
+ * launch path.
  *
  * Not thread-safe — argument binding lives on the kernel handle itself,
  * so two threads launching with different args would race.
  */
 class GpuKernel {
 public:
-    explicit GpuKernel(ze_kernel_handle_t handle) noexcept : _h{handle} {}
+    GpuKernel(const GpuKernel&)                = default;
+    GpuKernel(GpuKernel&&) noexcept            = default;
+    GpuKernel& operator=(const GpuKernel&)     = default;
+    GpuKernel& operator=(GpuKernel&&) noexcept = default;
+    ~GpuKernel()                               = default;
 
     [[nodiscard]] ze_kernel_handle_t handle() const noexcept { return _h; }
 
@@ -37,6 +51,10 @@ public:
     void setGroupSize(std::uint32_t x, std::uint32_t y = 1, std::uint32_t z = 1);
 
 private:
+    friend class GpuModule;
+
+    explicit GpuKernel(ze_kernel_handle_t handle) noexcept : _h{handle} {}
+
     void setRaw(std::uint32_t index, std::size_t bytes, const void* data);
 
     ze_kernel_handle_t _h;

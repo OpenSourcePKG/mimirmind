@@ -118,9 +118,9 @@ GpuModule::~GpuModule() {
     }
 }
 
-ze_kernel_handle_t GpuModule::kernel(const char* kernelName) {
+GpuKernel GpuModule::kernel(const char* kernelName) {
     if (const auto it = _kernels.find(kernelName); it != _kernels.end()) {
-        return it->second;
+        return GpuKernel{it->second};
     }
     ze_kernel_desc_t desc{};
     desc.stype       = ZE_STRUCTURE_TYPE_KERNEL_DESC;
@@ -137,7 +137,7 @@ ze_kernel_handle_t GpuModule::kernel(const char* kernelName) {
     _kernels.emplace(kernelName, k);
     MM_LOG_DEBUG("gpu", "kernel '{}/{}' created — handle={}",
                  _name, kernelName, static_cast<const void*>(k));
-    return k;
+    return GpuKernel{k};
 }
 
 std::vector<std::uint8_t> GpuModule::readSpv(std::string_view spvDirOverride,
