@@ -24,6 +24,15 @@ class GpuKernel;
  *
  * Uses ordinal 0 (the device's first command queue group, which on Intel
  * iGPUs is the compute engine).
+ *
+ * **Backend surface:** This class IS the Level-Zero impl of the compute
+ * queue concept. Consumers that include this header pull in
+ * `<level_zero/ze_api.h>` transitively and are implicitly L0-scoped.
+ * A future Vulkan/CUDA backend would ship a parallel
+ * `VulkanCommandQueue.hpp` / `CudaCommandQueue.hpp` alongside — not a
+ * shared abstract base (see `[[Mimirmind — HW-Abstraktions-Strategie
+ * für Multi-Backend-Support]]` Schicht 3, ETA when second backend
+ * work starts).
  */
 class CommandQueue {
 public:
