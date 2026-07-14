@@ -110,7 +110,30 @@ if(MIMIRMIND_ENABLE_L0)
 endif()
 
 if(MIMIRMIND_ENABLE_HIP)
-    message(STATUS "MIMIRMIND_ENABLE_HIP=ON, but no HIP backend impl on main yet — no-op.")
+    # HIP CMake package ships with ROCm at /opt/rocm/lib/cmake/hip. Consumers
+    # on non-default ROCm installs can override via -DHIP_DIR=... or by
+    # exporting HIP_PATH. Once found, `hip::host` provides the include dirs
+    # + libamdhip64 link line for host-side HIP runtime consumers.
+    #
+    # The skeleton only uses host-side HIP (hipGetDeviceCount, hipSetDevice,
+    # hipGetDeviceProperties). Actual kernel compilation (setting
+    # CMAKE_HIP_ARCHITECTURES + enabling the HIP language) comes with the
+    # first kernel port on this branch, not with the skeleton.
+    if(NOT DEFINED HIP_PATH AND NOT DEFINED ENV{HIP_PATH})
+        set(HIP_PATH "/opt/rocm" CACHE PATH "Path to the ROCm/HIP install")
+    endif()
+    list(APPEND CMAKE_PREFIX_PATH "${HIP_PATH}")
+    find_package(hip QUIET CONFIG)
+    if(NOT hip_FOUND)
+        message(FATAL_ERROR
+            "\n  HIP not found (MIMIRMIND_ENABLE_HIP=ON requested it).\n"
+            "  On Ubuntu with ROCm installed via amdgpu-install, HIP CMake\n"
+            "  configs live at /opt/rocm/lib/cmake/hip. Override with\n"
+            "    -DHIP_PATH=/path/to/rocm\n"
+            "  or export HIP_PATH before configure.\n"
+            "  Configure with -DMIMIRMIND_ENABLE_HIP=OFF to skip.\n")
+    endif()
+    message(STATUS "HIP found at: ${HIP_PATH} (version ${hip_VERSION})")
 endif()
 
 if(MIMIRMIND_ENABLE_L0)
@@ -299,6 +322,28 @@ if(MIMIRMIND_ENABLE_L0)
     # executable is migrated to explicit _common / _l0, this alias can
     # be removed.
     add_library(mimirmind_core ALIAS mimirmind_core_l0)
+endif()
+
+# ---- mimirmind_core_hip — AMD HIP-tied foundation --------------------------
+#
+# Peer to `mimirmind_core_l0`: HipContext + (later, on this branch) HIP
+# stream/module/allocator wrappers. PUBLIC-links `mimirmind_core_common`
+# so consumers only need one target to depend on for the neutral +
+# HIP-native surface. Kernels come as follow-up commits on the same
+# feat/hip-backend-skeleton branch — the skeleton only carries the
+# device-enumeration + feature-probe layer today.
+#
+# Only built when MIMIRMIND_ENABLE_HIP=ON.
+
+if(MIMIRMIND_ENABLE_HIP)
+    add_library(mimirmind_core_hip STATIC
+        src/core/gpu/hip/HipContext.cpp
+    )
+
+    target_link_libraries(mimirmind_core_hip PUBLIC
+        mimirmind_core_common
+        hip::host
+    )
 endif()
 
 # ---- L0-backed targets: mimirmind binary, munin daemon, GPU tests ---------
@@ -668,3 +713,25 @@ target_link_libraries(l0_ipc_testrig PRIVATE
 )
 
 endif() # MIMIRMIND_ENABLE_L0 (gpu_tests + prefill_bench + l0_ipc_testrig)
+
+# ---- hip_probe — HIP-side "toolchain is live end-to-end" diagnostic --------
+#
+# Enumerates all HIP-visible devices, instantiates HipContext on the
+# auto-selected one, prints the portable BackendDeviceInfo + the HIP-
+# native superset, and evaluates every BackendFeature flag. Companion to
+# l0_ipc_testrig for the AMD side.
+#
+# Not installed in any runtime image — this is a bringup diagnostic, not
+# a shipped component. Build + run once the HIP backend skeleton lands:
+#
+#   cmake --build build --target hip_probe && ./build/hip_probe
+
+if(MIMIRMIND_ENABLE_HIP)
+    add_executable(hip_probe
+        tools/hip-probe.cpp
+    )
+
+    target_link_libraries(hip_probe PRIVATE
+        mimirmind_core_hip
+    )
+endif()
