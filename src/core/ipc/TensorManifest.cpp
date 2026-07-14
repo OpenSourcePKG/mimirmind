@@ -14,6 +14,16 @@ std::string TensorManifest::toJson() const {
     j["model_id"]          = modelId;
     j["model_fingerprint"] = modelFingerprint;
 
+    auto chunkArr = nlohmann::json::array();
+    chunkArr.get_ref<nlohmann::json::array_t&>().reserve(chunks.size());
+    for (const auto& c : chunks) {
+        nlohmann::json e;
+        e["chunk_index"] = c.chunkIndex;
+        e["bytes"]       = c.bytes;
+        chunkArr.push_back(std::move(e));
+    }
+    j["chunks"] = std::move(chunkArr);
+
     auto arr = nlohmann::json::array();
     arr.get_ref<nlohmann::json::array_t&>().reserve(tensors.size());
     for (const auto& t : tensors) {
@@ -22,7 +32,8 @@ std::string TensorManifest::toJson() const {
         e["type_id"]      = static_cast<std::uint32_t>(t.type);
         e["dims"]         = t.dims;
         e["bytes"]        = t.bytes;
-        e["handle_index"] = t.handleIndex;
+        e["chunk_index"]  = t.chunkIndex;
+        e["chunk_offset"] = t.chunkOffset;
         arr.push_back(std::move(e));
     }
     j["tensors"] = std::move(arr);
@@ -93,6 +104,34 @@ TensorManifest::fromJson(std::string_view s) {
         m.modelFingerprint = (*v)->get<std::string>();
     }
     {
+        auto v = readField("chunks");
+        if (!v) return std::unexpected(v.error());
+        if (!(*v)->is_array()) {
+            return std::unexpected(std::string{"TensorManifest: chunks must be an array"});
+        }
+        const auto& arr = **v;
+        m.chunks.reserve(arr.size());
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+            const auto& e = arr[i];
+            if (!e.is_object()) {
+                std::ostringstream os;
+                os << "TensorManifest: chunks[" << i << "] is not an object";
+                return std::unexpected(os.str());
+            }
+            ChunkDesc cd{};
+            try {
+                cd.chunkIndex = e.at("chunk_index").get<std::uint32_t>();
+                cd.bytes      = e.at("bytes").get<std::uint64_t>();
+            } catch (const nlohmann::json::exception& x) {
+                std::ostringstream os;
+                os << "TensorManifest: chunks[" << i
+                   << "]: field extraction failed: " << x.what();
+                return std::unexpected(os.str());
+            }
+            m.chunks.push_back(cd);
+        }
+    }
+    {
         auto v = readField("tensors");
         if (!v) return std::unexpected(v.error());
         if (!(*v)->is_array()) {
@@ -113,11 +152,23 @@ TensorManifest::fromJson(std::string_view s) {
                 me.type        = static_cast<GgmlType>(e.at("type_id").get<std::uint32_t>());
                 me.dims        = e.at("dims").get<std::vector<std::uint64_t>>();
                 me.bytes       = e.at("bytes").get<std::uint64_t>();
-                me.handleIndex = e.at("handle_index").get<std::uint32_t>();
+                me.chunkIndex  = e.at("chunk_index").get<std::uint32_t>();
+                me.chunkOffset = e.at("chunk_offset").get<std::uint64_t>();
             } catch (const nlohmann::json::exception& x) {
                 std::ostringstream os;
                 os << "TensorManifest: tensors[" << i
                    << "]: field extraction failed: " << x.what();
+                return std::unexpected(os.str());
+            }
+            // Sanity: referenced chunk must exist. Cheap consistency check
+            // at parse-time saves the worker from a later out-of-range
+            // index-into-empty-chunks-vector crash.
+            if (me.chunkIndex >= m.chunks.size()) {
+                std::ostringstream os;
+                os << "TensorManifest: tensors[" << i << "] '" << me.name
+                   << "' references chunk_index=" << me.chunkIndex
+                   << " but manifest only declares " << m.chunks.size()
+                   << " chunk(s)";
                 return std::unexpected(os.str());
             }
             m.tensors.push_back(std::move(me));

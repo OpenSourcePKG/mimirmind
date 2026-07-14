@@ -187,6 +187,7 @@ TEST(tensorManifest_roundTripEmpty) {
     EXPECT_EQ(parsed->protocolVersion,  TensorManifest::kCurrentProtocolVersion);
     EXPECT_EQ(parsed->modelId,          "test-model");
     EXPECT_EQ(parsed->modelFingerprint, "sha256:cafe");
+    EXPECT_EQ(parsed->chunks.size(),    0U);
     EXPECT_EQ(parsed->tensors.size(),   0U);
 }
 
@@ -195,33 +196,47 @@ TEST(tensorManifest_roundTripPopulated) {
     m.modelId          = "google_gemma-4-E4B-it-Q4_K_M";
     m.modelFingerprint = "header-sum:deadbeef";
 
+    // Two chunks: one full 1 GiB packing several early tensors, one
+    // partial holding the vocab tail. Wire format carries used-bytes,
+    // not raw chunk capacity.
+    m.chunks.push_back({.chunkIndex = 0, .bytes = 1073741824ULL});
+    m.chunks.push_back({.chunkIndex = 1, .bytes = 560760832ULL});
+
     m.tensors.push_back({
         .name        = "blk.0.attn_q.weight",
         .type        = GgmlType::Q4_K,
         .dims        = {2560, 4096},
         .bytes       = 5898240,
-        .handleIndex = 0,
+        .chunkIndex  = 0,
+        .chunkOffset = 0,
     });
     m.tensors.push_back({
         .name        = "blk.0.attn_k.weight",
         .type        = GgmlType::Q5_K,
         .dims        = {2560, 1024},
         .bytes       = 1802240,
-        .handleIndex = 1,
+        .chunkIndex  = 0,
+        .chunkOffset = 5898240,
     });
     m.tensors.push_back({
         .name        = "token_embd.weight",
         .type        = GgmlType::Q6_K,
         .dims        = {2560, 262144},
         .bytes       = 550502400,
-        .handleIndex = 2,
+        .chunkIndex  = 1,
+        .chunkOffset = 0,
     });
 
     const std::string j = m.toJson();
     auto parsed = TensorManifest::fromJson(j);
     EXPECT_TRUE(static_cast<bool>(parsed));
+    EXPECT_EQ(parsed->chunks.size(),  2U);
     EXPECT_EQ(parsed->tensors.size(), 3U);
 
+    for (std::size_t i = 0; i < parsed->chunks.size(); ++i) {
+        EXPECT_EQ(parsed->chunks[i].chunkIndex, m.chunks[i].chunkIndex);
+        EXPECT_EQ(parsed->chunks[i].bytes,      m.chunks[i].bytes);
+    }
     for (std::size_t i = 0; i < parsed->tensors.size(); ++i) {
         const auto& a = m.tensors[i];
         const auto& b = parsed->tensors[i];
@@ -232,13 +247,29 @@ TEST(tensorManifest_roundTripPopulated) {
             EXPECT_EQ(a.dims[k], b.dims[k]);
         }
         EXPECT_EQ(a.bytes,       b.bytes);
-        EXPECT_EQ(a.handleIndex, b.handleIndex);
+        EXPECT_EQ(a.chunkIndex,  b.chunkIndex);
+        EXPECT_EQ(a.chunkOffset, b.chunkOffset);
     }
+}
+
+TEST(tensorManifest_tensorReferencesUnknownChunk_rejects) {
+    // Tensor points at chunk_index=2 but the manifest only declares
+    // one chunk. Consistency check should refuse at parse time so the
+    // worker never dereferences an out-of-range chunkBases[] entry.
+    std::string j = R"({"protocol_version":2,"model_id":"x","model_fingerprint":"y",)"
+                    R"("chunks":[{"chunk_index":0,"bytes":1024}],)"
+                    R"("tensors":[{"name":"t","type_id":0,"dims":[1],"bytes":4,)"
+                    R"("chunk_index":2,"chunk_offset":0}]})";
+    auto parsed = TensorManifest::fromJson(j);
+    EXPECT_TRUE(!static_cast<bool>(parsed));
+    EXPECT_TRUE(parsed.error().find("chunk_index=2") != std::string::npos);
 }
 
 TEST(tensorManifest_versionMismatch_rejects) {
     // Craft a JSON with a bumped protocol_version, verify parser refuses.
-    std::string j = R"({"protocol_version":999,"model_id":"x","model_fingerprint":"y","tensors":[]})";
+    // v1 is the retired legacy — receiver must refuse even though the
+    // rest of the payload looks superficially valid.
+    std::string j = R"({"protocol_version":1,"model_id":"x","model_fingerprint":"y","chunks":[],"tensors":[]})";
     auto parsed = TensorManifest::fromJson(j);
     EXPECT_TRUE(!static_cast<bool>(parsed));
     EXPECT_TRUE(parsed.error().find("protocol_version") != std::string::npos);
@@ -252,10 +283,20 @@ TEST(tensorManifest_malformed_rejects) {
 
 TEST(tensorManifest_missingRequiredField_rejects) {
     // Missing model_id.
-    std::string j = R"({"protocol_version":1,"model_fingerprint":"y","tensors":[]})";
+    std::string j = R"({"protocol_version":2,"model_fingerprint":"y","chunks":[],"tensors":[]})";
     auto parsed = TensorManifest::fromJson(j);
     EXPECT_TRUE(!static_cast<bool>(parsed));
     EXPECT_TRUE(parsed.error().find("model_id") != std::string::npos);
+}
+
+TEST(tensorManifest_missingChunksArray_rejects) {
+    // v2 requires the chunks field even when empty. Older senders that
+    // omit it entirely should be refused rather than silently attaching
+    // with zero chunks and mysterious runtime failures downstream.
+    std::string j = R"({"protocol_version":2,"model_id":"x","model_fingerprint":"y","tensors":[]})";
+    auto parsed = TensorManifest::fromJson(j);
+    EXPECT_TRUE(!static_cast<bool>(parsed));
+    EXPECT_TRUE(parsed.error().find("chunks") != std::string::npos);
 }
 
 TEST(tensorManifest_wireFormatIsCompactJson) {
@@ -280,9 +321,14 @@ TEST(ipc_manifestOverSocketpair_roundTrip) {
     TensorManifest sent{};
     sent.modelId          = "e4b-q4k";
     sent.modelFingerprint = "hs:1234";
+    sent.chunks.push_back({.chunkIndex = 0, .bytes = 10240});
     sent.tensors.push_back({
-        .name = "output_norm.weight", .type = GgmlType::F32,
-        .dims = {2560}, .bytes = 10240, .handleIndex = 0,
+        .name        = "output_norm.weight",
+        .type        = GgmlType::F32,
+        .dims        = {2560},
+        .bytes       = 10240,
+        .chunkIndex  = 0,
+        .chunkOffset = 0,
     });
     const std::string j = sent.toJson();
     const auto payload = makeBytes(j);

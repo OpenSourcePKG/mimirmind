@@ -20,10 +20,12 @@ namespace mimirmind::core::ipc {
  *
  * Response frames (Munin -> worker):
  *   - healthz:  1 JSON frame (HealthzResponse::toJson).
- *   - attach:   1 JSON frame (TensorManifest::toJson),
+ *   - attach:   1 JSON frame (TensorManifest::toJson, wire v2),
  *               then N frames of {64-byte handle payload, 1 SCM_RIGHTS fd},
- *               where N == manifest.tensors.size(). The order matches
- *               ManifestEntry.handleIndex.
+ *               where N == manifest.chunks.size(). The frame at index
+ *               i carries the IPC handle for `chunks[i]`; the worker
+ *               resolves each tensor's pointer as
+ *               `chunkBases[t.chunkIndex] + t.chunkOffset`.
  *   - error:    1 JSON frame `{"error": "<message>"}`.
  *
  * The kOp* constants are the on-wire values. Bumping the wire format is

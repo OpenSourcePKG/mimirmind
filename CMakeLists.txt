@@ -218,6 +218,7 @@ add_library(mimirmind_core STATIC
     src/core/l0/UsmAllocator.cpp
     src/core/log/Log.cpp
     src/core/os/GovernorLock.cpp
+    src/munin/ChunkAllocator.cpp
 )
 
 # PUBLIC so consumers get the transitive header include paths (ze_api.h

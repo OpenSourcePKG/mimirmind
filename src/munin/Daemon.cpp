@@ -160,7 +160,7 @@ int Daemon::run(const CliOptions& opts) noexcept {
     // ---- model store -------------------------------------------------
     std::unique_ptr<ModelStore> store;
     try {
-        store = std::make_unique<ModelStore>(cfg, *allocator);
+        store = std::make_unique<ModelStore>(cfg, *l0, *allocator);
     } catch (const std::exception& x) {
         MM_LOG_ERROR("munin", "ModelStore init failed: {}", x.what());
         return 4;

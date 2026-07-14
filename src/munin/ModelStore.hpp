@@ -6,6 +6,7 @@
 #include "core/ipc/TensorManifest.hpp"
 #include "core/l0/L0Context.hpp"
 #include "core/l0/UsmAllocator.hpp"
+#include "munin/ChunkAllocator.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -33,14 +34,21 @@ struct LoadedModel {
     std::string                                              path{};
     std::string                                              fingerprint{};
     std::uint64_t                                            totalBytes{0};
+    // Chunk-owned USM backing every tensor's `usmPtr`. Kept alive for
+    // the entire lifetime of the LoadedModel — dropping it releases
+    // all model memory and invalidates every attached worker's IPC
+    // pointers. Ordered before `reader` so it outlives the reader's
+    // views (declaration order == destruction order in reverse).
+    std::unique_ptr<::mimirmind::munin::ChunkAllocator>      chunks{};
     std::unique_ptr<::mimirmind::core::gguf::GgufReader>     reader{};
     std::unique_ptr<::mimirmind::core::gguf::WeightsMap>     weights{};
 
     /**
-     * Populate a `TensorManifest` from this model, filling in `handleIndex`
-     * with the position each tensor will occupy in the sequence of HANDLE
-     * frames that follow. The order matches `reader->tensors()` — the
-     * IpcExporter walks the same list to emit handles.
+     * Populate a `TensorManifest` (wire v2) from this model. Fills the
+     * `chunks` list from the ChunkAllocator's used-byte counts and, per
+     * tensor, the `chunkIndex + chunkOffset` recorded by
+     * `GgufReader::loadTensorsIntoChunks`. One IPC HANDLE is emitted
+     * per chunk, not per tensor — see M-Munin.1a ADR.
      */
     [[nodiscard]] ::mimirmind::core::ipc::TensorManifest buildManifest() const;
 };
@@ -67,8 +75,17 @@ public:
      * state because a worker attaching to model X while model Y is missing
      * would silently succeed for X and then fail an hour later when a
      * request routes to Y.
+     *
+     * Each loaded model gets its own `ChunkAllocator` (M-Munin.1a ADR):
+     * tensors are packed into ~1 GiB chunks so the IPC-Export path emits
+     * one handle per chunk instead of one per tensor. `l0Ctx` is needed
+     * to construct those chunk allocators via `zeMemAllocHost`. The
+     * `UsmAllocator` reference is retained for possible future non-chunk
+     * allocations (scratch buffers, non-tensor state); for MVP scope it
+     * is unused by the constructor itself.
      */
     ModelStore(const ::mimirmind::core::config::Config& cfg,
+               ::mimirmind::core::l0::L0Context&        l0Ctx,
                ::mimirmind::core::l0::UsmAllocator&    allocator);
 
     ~ModelStore();

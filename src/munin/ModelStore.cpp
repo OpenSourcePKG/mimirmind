@@ -9,6 +9,7 @@
 namespace mimirmind::munin {
 
 ::mimirmind::core::ipc::TensorManifest LoadedModel::buildManifest() const {
+    using ::mimirmind::core::ipc::ChunkDesc;
     using ::mimirmind::core::ipc::ManifestEntry;
     using ::mimirmind::core::ipc::TensorManifest;
 
@@ -16,23 +17,37 @@ namespace mimirmind::munin {
     m.modelId          = id;
     m.modelFingerprint = fingerprint;
 
+    // Chunks come first — the worker walks this list to size its
+    // per-chunk import loop. `bytes` is the used footprint, not the
+    // raw chunk size, so partially-filled tail chunks report the truth.
+    const std::uint32_t nChunks = chunks ? chunks->chunkCount() : 0;
+    m.chunks.reserve(nChunks);
+    for (std::uint32_t i = 0; i < nChunks; ++i) {
+        ChunkDesc cd{};
+        cd.chunkIndex = i;
+        cd.bytes      = chunks->chunkUsedBytes(i);
+        m.chunks.push_back(cd);
+    }
+
     const auto& ts = reader->tensors();
     m.tensors.reserve(ts.size());
-    for (std::size_t i = 0; i < ts.size(); ++i) {
-        const auto& t = ts[i];
+    for (const auto& t : ts) {
         ManifestEntry e{};
         e.name        = t.name;
         e.type        = t.type;
         e.dims        = t.dimensions;
         e.bytes       = static_cast<std::uint64_t>(t.nbytes);
-        e.handleIndex = static_cast<std::uint32_t>(i);
+        e.chunkIndex  = t.chunkIndex;
+        e.chunkOffset = t.chunkOffset;
         m.tensors.push_back(std::move(e));
     }
     return m;
 }
 
 ModelStore::ModelStore(const ::mimirmind::core::config::Config& cfg,
+                       ::mimirmind::core::l0::L0Context&        l0Ctx,
                        ::mimirmind::core::l0::UsmAllocator&    allocator) {
+    (void)allocator; // reserved for future non-chunk allocations
     std::size_t loaded = 0;
     for (const auto& m : cfg.models) {
         if (!m.loadOnStart) {
@@ -55,9 +70,11 @@ ModelStore::ModelStore(const ::mimirmind::core::config::Config& cfg,
         auto lm    = std::make_unique<LoadedModel>();
         lm->id     = m.id;
         lm->path   = m.path;
+        lm->chunks = std::make_unique<::mimirmind::munin::ChunkAllocator>(
+            l0Ctx, ::mimirmind::munin::ChunkAllocator::kDefaultChunkBytes);
         lm->reader = std::make_unique<::mimirmind::core::gguf::GgufReader>();
         lm->reader->open(m.path);
-        lm->reader->loadTensors(allocator);
+        lm->reader->loadTensorsIntoChunks(*lm->chunks);
         lm->weights = std::make_unique<::mimirmind::core::gguf::WeightsMap>(
             *lm->reader);
         lm->totalBytes  = lm->reader->totalTensorBytes();
@@ -65,9 +82,9 @@ ModelStore::ModelStore(const ::mimirmind::core::config::Config& cfg,
 
         MM_LOG_INFO("munin",
                     "ModelStore: loaded id='{}' tensors={} bytes={} "
-                    "fingerprint='{}'",
+                    "chunks={} fingerprint='{}'",
                     lm->id, lm->reader->tensorCount(), lm->totalBytes,
-                    lm->fingerprint);
+                    lm->chunks->chunkCount(), lm->fingerprint);
 
         _byId.emplace(m.id, std::move(lm));
         ++loaded;

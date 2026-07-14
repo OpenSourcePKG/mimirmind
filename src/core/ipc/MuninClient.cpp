@@ -9,6 +9,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <utility>
 
 namespace mimirmind::core::ipc {
@@ -191,72 +193,107 @@ MuninClient::attach(std::string_view socketPath,
         return std::unexpected(manifest.error());
     }
 
-    // Now N HANDLE frames, one per tensor. Order matches
-    // manifest.tensors[i].handleIndex — server iterates in the same
-    // order, so `i` and `handleIndex` coincide.
+    // v2 wire (M-Munin.1a): expect one HANDLE frame per entry in
+    // manifest.chunks, not per tensor. Collect all N frames first, then
+    // hand them to IpcImporter::openChunks in one call — that keeps the
+    // all-or-nothing ownership semantics (any partial failure rolls
+    // back L0 mappings and leaves fd cleanup to us).
     AttachResult out{};
     out.manifest = std::move(*manifest);
-    out.tensors.reserve(out.manifest.tensors.size());
 
-    for (std::size_t i = 0; i < out.manifest.tensors.size(); ++i) {
+    const std::size_t nChunks = out.manifest.chunks.size();
+    std::vector<std::array<std::byte, 64>> handleBlobs;
+    std::vector<int>                       receivedFds;
+    handleBlobs.reserve(nChunks);
+    receivedFds.reserve(nChunks);
+
+    // Helper: close every fd we have collected but not yet handed to
+    // IpcImporter, then close the socket. Used on any recv-side error.
+    auto abortWithCollectedFds = [&](std::string msg) {
+        for (int f : receivedFds) ::close(f);
+        ::close(sock);
+        return std::unexpected<std::string>(std::move(msg));
+    };
+
+    for (std::size_t i = 0; i < nChunks; ++i) {
         auto frame = UnixSocketFrame::recv(sock, /*maxPayloadBytes=*/128);
         if (!frame) {
-            ::close(sock);
-            return std::unexpected(frame.error());
+            return abortWithCollectedFds(frame.error());
         }
         if (frame->payload.size() != 64) {
             for (int f : frame->fds) ::close(f);
-            ::close(sock);
             std::ostringstream os;
-            os << "MuninClient: handle frame[" << i << "] has "
+            os << "MuninClient: chunk-handle frame[" << i << "] has "
                << frame->payload.size() << " payload bytes, expected 64";
-            return std::unexpected(os.str());
+            return abortWithCollectedFds(os.str());
         }
         if (frame->fds.size() != 1) {
             for (int f : frame->fds) ::close(f);
-            ::close(sock);
             std::ostringstream os;
-            os << "MuninClient: handle frame[" << i << "] has "
+            os << "MuninClient: chunk-handle frame[" << i << "] has "
                << frame->fds.size() << " SCM_RIGHTS fds, expected 1";
-            return std::unexpected(os.str());
+            return abortWithCollectedFds(os.str());
         }
 
-        std::span<const std::byte, 64> handleBytes{
-            frame->payload.data(), 64};
-        auto ptr = IpcImporter::importOne(_l0, handleBytes, frame->fds[0]);
-        if (!ptr) {
-            // IpcImporter takes ownership on success only — on failure
-            // the caller (us) must close the fd.
-            ::close(frame->fds[0]);
+        std::array<std::byte, 64> blob{};
+        std::memcpy(blob.data(), frame->payload.data(), 64);
+        handleBlobs.push_back(blob);
+        receivedFds.push_back(frame->fds[0]);
+    }
+
+    auto bases = IpcImporter::openChunks(
+        _l0,
+        std::span<const std::array<std::byte, 64>>{handleBlobs},
+        std::span<const int>{receivedFds});
+    if (!bases) {
+        // openChunks rolled back the L0 side; every fd we collected is
+        // still ours to close (per its documented failure contract).
+        for (int f : receivedFds) ::close(f);
+        ::close(sock);
+        return std::unexpected(bases.error());
+    }
+
+    // Chunk import succeeded — L0 has consumed every fd, we must not
+    // close them. Resolve each tensor's usmPtr = chunkBase + chunkOffset.
+    out.tensors.reserve(out.manifest.tensors.size());
+    for (std::size_t i = 0; i < out.manifest.tensors.size(); ++i) {
+        const auto& me = out.manifest.tensors[i];
+        if (me.chunkIndex >= bases->size()) {
+            // Parser normally refuses this — defense in depth. No fd
+            // cleanup: they are L0's now. Socket teardown only.
             ::close(sock);
             std::ostringstream os;
-            os << "MuninClient: import handle[" << i << "] ('"
-               << out.manifest.tensors[i].name << "') failed: " << ptr.error();
+            os << "MuninClient: tensor[" << i << "] '" << me.name
+               << "' references chunkIndex=" << me.chunkIndex
+               << " but only " << bases->size() << " chunk base(s) imported";
             return std::unexpected(os.str());
         }
+        void* base = (*bases)[me.chunkIndex];
 
         ::mimirmind::core::gguf::GgufTensor t{};
-        t.name       = out.manifest.tensors[i].name;
-        t.type       = out.manifest.tensors[i].type;
-        t.dimensions = out.manifest.tensors[i].dims;
+        t.name        = me.name;
+        t.type        = me.type;
+        t.dimensions  = me.dims;
         // Recompute nelements from dims for the downstream code that
         // reads it; Munin only ships bytes on the wire, but standalone
         // code paths rely on `nelements` being populated.
         std::uint64_t nel = 1;
         for (auto d : t.dimensions) nel *= d;
-        t.nelements  = nel;
-        t.nbytes     = static_cast<std::size_t>(out.manifest.tensors[i].bytes);
-        t.fileOffset = 0;   // not meaningful in attached mode
-        t.usmPtr     = *ptr;
+        t.nelements   = nel;
+        t.nbytes      = static_cast<std::size_t>(me.bytes);
+        t.fileOffset  = 0;   // not meaningful in attached mode
+        t.chunkIndex  = me.chunkIndex;
+        t.chunkOffset = me.chunkOffset;
+        t.usmPtr      = static_cast<std::byte*>(base) + me.chunkOffset;
         out.tensors.push_back(std::move(t));
     }
 
     _sessionFd = sock;
     MM_LOG_INFO("munin-client",
                 "attached to model '{}' fingerprint='{}' tensors={} "
-                "over socket '{}'",
+                "chunks={} over socket '{}'",
                 out.manifest.modelId, out.manifest.modelFingerprint,
-                out.tensors.size(), socketPath);
+                out.tensors.size(), nChunks, socketPath);
     return out;
 }
 

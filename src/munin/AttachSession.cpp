@@ -158,34 +158,54 @@ bool AttachSession::handleAttach(std::string_view modelId) noexcept {
         return false;
     }
 
-    // Build the manifest first — the client relies on this to know how
-    // many HANDLE frames to expect.
+    // v2 wire (M-Munin.1a): Munin owns N chunks of USM, exports one IPC
+    // handle per chunk (not per tensor). The manifest carries the chunk
+    // list plus per-tensor {chunkIndex, chunkOffset} so the worker can
+    // resolve each tensor's pointer without a per-tensor handshake.
+    if (!lm->chunks) {
+        // Should be impossible — ModelStore always builds a ChunkAllocator
+        // per LoadedModel. If it ever isn't, refusing the attach is much
+        // better than silently sending zero handles.
+        std::string msg{"attach: model '"};
+        msg.append(lm->id).append("' has no ChunkAllocator — Munin load is inconsistent");
+        sendErrorAndClose(msg);
+        return false;
+    }
+    if (lm->reader == nullptr || lm->reader->tensorCount() == 0) {
+        std::string msg{"attach: model '"};
+        msg.append(lm->id).append("' has no tensors — Munin load is inconsistent");
+        sendErrorAndClose(msg);
+        return false;
+    }
+
+    // Build the manifest first — the client uses `manifest.chunks.size()`
+    // to size its per-chunk receive loop.
     TensorManifest manifest = lm->buildManifest();
     const std::string manifestJson = manifest.toJson();
 
-    // Export every tensor's IPC handle up front, before touching the
+    // Export every chunk's IPC handle up front, before touching the
     // socket. If any fails, we abort the attach cleanly with an error
     // frame; the client sees no partial handoff.
     struct Exported {
         std::array<std::byte, 64> bytes{};
         int                       fd{-1};
     };
+    const std::uint32_t nChunks = lm->chunks->chunkCount();
     std::vector<Exported> exports;
-    exports.reserve(lm->reader->tensorCount());
-    const auto& ts = lm->reader->tensors();
-    for (std::size_t i = 0; i < ts.size(); ++i) {
-        void* usmPtr = ts[i].usmPtr;
-        if (usmPtr == nullptr) {
-            std::string msg{"attach: tensor '"};
-            msg.append(ts[i].name)
-               .append("' has no USM pointer — Munin load is inconsistent");
+    exports.reserve(nChunks);
+    for (std::uint32_t i = 0; i < nChunks; ++i) {
+        void* chunkPtr = lm->chunks->chunkBase(i);
+        if (chunkPtr == nullptr) {
+            std::string msg{"attach: chunk["};
+            msg.append(std::to_string(i))
+               .append("] has null base pointer — Munin load is inconsistent");
             sendErrorAndClose(msg);
             return false;
         }
-        auto e = IpcExporter::exportOne(_l0, usmPtr);
+        auto e = IpcExporter::exportOne(_l0, chunkPtr);
         if (!e) {
-            std::string msg{"attach: IpcExporter failed for tensor '"};
-            msg.append(ts[i].name).append("': ").append(e.error());
+            std::string msg{"attach: IpcExporter failed for chunk["};
+            msg.append(std::to_string(i)).append("]: ").append(e.error());
             sendErrorAndClose(msg);
             return false;
         }
@@ -196,7 +216,8 @@ bool AttachSession::handleAttach(std::string_view modelId) noexcept {
     }
 
     // Send the manifest first. This tells the worker how many HANDLE
-    // frames to expect and in what order.
+    // frames to expect (== manifest.chunks.size()) and how to resolve
+    // per-tensor pointers via {chunkIndex, chunkOffset}.
     if (auto s = UnixSocketFrame::send(_fd, asBytes(manifestJson)); !s) {
         MM_LOG_WARN("munin",
                     "session#{}: attach manifest send failed: {}",
@@ -204,7 +225,7 @@ bool AttachSession::handleAttach(std::string_view modelId) noexcept {
         return false;
     }
 
-    // Then one HANDLE frame per tensor: 64-byte payload + one SCM_RIGHTS
+    // Then one HANDLE frame per chunk: 64-byte payload + one SCM_RIGHTS
     // fd. The kernel dup's the fd across the socket into the worker's fd
     // table; the fd number we sent is only meaningful in our process, so
     // the worker's IpcImporter patches the received fd back into the
@@ -218,16 +239,18 @@ bool AttachSession::handleAttach(std::string_view modelId) noexcept {
         if (auto s = UnixSocketFrame::send(_fd, payload, std::span<const int>{fds, 1});
             !s) {
             MM_LOG_WARN("munin",
-                        "session#{}: attach handle[{}] '{}' send failed: {}",
-                        _sessionId, i, ts[i].name, s.error());
+                        "session#{}: attach chunk-handle[{}] send failed: {}",
+                        _sessionId, i, s.error());
             return false;
         }
     }
 
     _attachedModelId = std::string{modelId};
     MM_LOG_INFO("munin",
-                "session#{}: attach ok, model='{}' tensors={} fingerprint='{}'",
-                _sessionId, _attachedModelId, exports.size(), lm->fingerprint);
+                "session#{}: attach ok, model='{}' tensors={} chunks={} "
+                "fingerprint='{}'",
+                _sessionId, _attachedModelId,
+                lm->reader->tensorCount(), exports.size(), lm->fingerprint);
     return true;
 }
 

@@ -15,6 +15,10 @@ namespace mimirmind::core::l0 {
 class UsmAllocator;
 }
 
+namespace mimirmind::munin {
+class ChunkAllocator;
+}
+
 namespace mimirmind::core::gguf {
 
 /// Array stored in metadata. For primitive element types `raw` holds the
@@ -45,7 +49,14 @@ struct GgufTensor {
     std::uint64_t               nelements{0};
     std::size_t                 nbytes{0};
     std::uint64_t               fileOffset{0};   // within the tensor-data region
-    void*                       usmPtr{nullptr}; // set by loadTensors()
+    void*                       usmPtr{nullptr}; // set by loadTensors[IntoChunks]()
+
+    // Chunk placement, populated by loadTensorsIntoChunks(). Meaningless
+    // (both zero) when the tensor was loaded via the per-tensor
+    // UsmAllocator path — those callers do not need chunk coordinates
+    // because their pointer is the whole allocation.
+    std::uint32_t               chunkIndex{0};
+    std::uint64_t               chunkOffset{0};
 };
 
 /**
@@ -75,6 +86,18 @@ public:
     /// the end of the file.
     void loadTensors(core::l0::UsmAllocator& allocator);
 
+    /// Munin-side load path. Packs every tensor into `chunks` via
+    /// bump-allocation and memcpy'ies the payload from the mmap. Each
+    /// tensor's `usmPtr`, `chunkIndex`, and `chunkOffset` are populated
+    /// so the manifest builder can transport chunk coordinates over IPC
+    /// (see M-Munin.1a ADR). The mmap is closed after the last copy
+    /// exactly as in `loadTensors`.
+    ///
+    /// Idempotent. Cannot be mixed with `loadTensors` for the same
+    /// reader — the two ownership regimes (per-tensor deallocate vs
+    /// per-chunk drop) are mutually exclusive.
+    void loadTensorsIntoChunks(::mimirmind::munin::ChunkAllocator& chunks);
+
     /// Release USM, drop the mmap, reset state. Idempotent.
     void close() noexcept;
 
@@ -100,6 +123,10 @@ private:
     std::map<std::string, MetadataValue> _metadata{};
     std::vector<GgufTensor>              _tensors{};
     core::l0::UsmAllocator*               _allocator{nullptr};
+    // True once loadTensorsIntoChunks() ran successfully. Blocks close()
+    // from calling per-tensor deallocate() — chunk memory is owned by
+    // the ChunkAllocator and freed as a whole when it is destroyed.
+    bool                                  _chunkLoaded{false};
 };
 
 } // namespace mimirmind::core::gguf

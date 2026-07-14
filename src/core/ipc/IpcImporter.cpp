@@ -43,4 +43,41 @@ IpcImporter::importOne(::mimirmind::core::l0::L0Context& ctx,
     return ptr;
 }
 
+std::expected<std::vector<void*>, std::string>
+IpcImporter::openChunks(
+    ::mimirmind::core::l0::L0Context&                     ctx,
+    std::span<const std::array<std::byte, 64>>            handleBlobs,
+    std::span<const int>                                  receivedFds) noexcept {
+    if (handleBlobs.size() != receivedFds.size()) {
+        std::ostringstream os;
+        os << "IpcImporter::openChunks: size mismatch — "
+           << handleBlobs.size() << " blob(s) vs " << receivedFds.size()
+           << " fd(s)";
+        return std::unexpected(os.str());
+    }
+
+    std::vector<void*> bases;
+    bases.reserve(handleBlobs.size());
+
+    for (std::size_t i = 0; i < handleBlobs.size(); ++i) {
+        std::span<const std::byte, 64> blob{handleBlobs[i].data(),
+                                            handleBlobs[i].size()};
+        auto p = importOne(ctx, blob, receivedFds[i]);
+        if (!p) {
+            // Rollback: release every L0 mapping we already opened. The
+            // fd for chunk i was NOT taken by importOne (it failed), and
+            // fds i+1..N-1 were never touched — caller closes them all.
+            for (void* prev : bases) {
+                (void)::zeMemCloseIpcHandle(ctx.context(), prev);
+            }
+            std::ostringstream os;
+            os << "IpcImporter::openChunks: chunk[" << i << "] failed: "
+               << p.error();
+            return std::unexpected(os.str());
+        }
+        bases.push_back(*p);
+    }
+    return bases;
+}
+
 } // namespace mimirmind::core::ipc

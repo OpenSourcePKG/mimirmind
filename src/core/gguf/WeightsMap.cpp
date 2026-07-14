@@ -1,7 +1,11 @@
 #include "core/gguf/WeightsMap.hpp"
 
+#include "core/ipc/TensorManifest.hpp"
 #include "core/log/Log.hpp"
 
+#include <cstddef>
+#include <cstdint>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -26,6 +30,57 @@ WeightsMap::WeightsMap(std::vector<GgufTensor> attachedTensors)
                 "indexed {} attached tensors for O(1) lookup "
                 "(attached-mode; usmPtrs point at Munin-owned USM)",
                 _byName.size());
+}
+
+WeightsMap WeightsMap::fromAttachedChunked(
+    const ::mimirmind::core::ipc::TensorManifest& manifest,
+    std::span<void* const>                        chunkBases) {
+    std::vector<GgufTensor> owned;
+    owned.reserve(manifest.tensors.size());
+
+    for (std::size_t i = 0; i < manifest.tensors.size(); ++i) {
+        const auto& me = manifest.tensors[i];
+        if (me.chunkIndex >= chunkBases.size()) {
+            std::ostringstream os;
+            os << "WeightsMap::fromAttachedChunked: tensor[" << i << "] '"
+               << me.name << "' references chunkIndex=" << me.chunkIndex
+               << " but only " << chunkBases.size()
+               << " chunk base(s) available";
+            throw std::runtime_error(os.str());
+        }
+        void* base = chunkBases[me.chunkIndex];
+        if (base == nullptr) {
+            std::ostringstream os;
+            os << "WeightsMap::fromAttachedChunked: tensor[" << i << "] '"
+               << me.name << "' references chunkIndex=" << me.chunkIndex
+               << " whose base pointer is null";
+            throw std::runtime_error(os.str());
+        }
+
+        GgufTensor t{};
+        t.name        = me.name;
+        t.type        = me.type;
+        t.dimensions  = me.dims;
+        // Manifest ships bytes; nelements is derived downstream data
+        // some codepaths still read. Product-of-dims is the invariant
+        // used everywhere in the standalone path too.
+        std::uint64_t nel = 1;
+        for (auto d : t.dimensions) nel *= d;
+        t.nelements   = nel;
+        t.nbytes      = static_cast<std::size_t>(me.bytes);
+        t.fileOffset  = 0;
+        t.chunkIndex  = me.chunkIndex;
+        t.chunkOffset = me.chunkOffset;
+        t.usmPtr      = static_cast<std::byte*>(base) + me.chunkOffset;
+        owned.push_back(std::move(t));
+    }
+
+    MM_LOG_INFO("weights",
+                "materialised {} tensor(s) from {} chunk base(s) — "
+                "attached-chunked mode (M-Munin.1a)",
+                owned.size(), chunkBases.size());
+
+    return WeightsMap{std::move(owned)};
 }
 
 const GgufTensor* WeightsMap::find(std::string_view name) const noexcept {
