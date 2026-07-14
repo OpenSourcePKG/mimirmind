@@ -1480,32 +1480,50 @@ int runServe(const CliArgs& args, const mimirmind::core::config::Config& cfg) {
 
     std::unique_ptr<mimirmind::runtime::SystemMonitor> monitor;
     std::unique_ptr<mimirmind::runtime::ThermalGuard>  guard;
-    // In attached mode Munin drives every sysfs-write regulator
-    // (governor / thermal guard / fan). The worker MUST NOT install
-    // its own — see M-Munin ADR "Governor — Sonderregel". Attached
-    // workers still install PowerMonitor + PerfRegressionDetector
-    // (read-only) below so /v1/system/status stays useful.
-    if (attachedMode && hasThermalProfile) {
-        MM_LOG_INFO("main",
-                    "serve: attached mode — skipping ThermalGuard / "
-                    "GpuClockGovernor / FanController install "
-                    "(Munin owns them)");
-    }
-    if (!attachedMode && hasThermalProfile) {
+    // In attached mode Munin drives every sysfs-WRITE regulator —
+    // GpuClockGovernor + FanController. Per M-Munin ADR "Governor —
+    // Sonderregel" the worker MUST NOT install those. SystemMonitor
+    // and ThermalGuard are read-only (sensor read + local pacing
+    // decision), so the worker installs them in both modes. That
+    // keeps /v1/system/status (package temp, RAM, throttle state) alive
+    // for the pegenaut dashboard and lets each worker back off decode
+    // based on its own thermal reading, which is belt-and-suspenders
+    // to Munin's authoritative clock cap.
+    if (hasThermalProfile) {
         const mimirmind::runtime::ThermalProfile& profile = cfg.governor.thermal;
         try {
             monitor = std::make_unique<mimirmind::runtime::SystemMonitor>(
                 /*requirePackageTemp=*/profile.hasPackageLimits(),
                 /*requireRam=*/        false);
         } catch (const std::exception& e) {
-            std::cerr << "serve: profile '" << profile.name
-                      << "' requires sensors the host does not expose: "
-                      << e.what() << "\n";
-            return 1;
+            if (attachedMode) {
+                // Non-fatal in attached mode: Munin still runs its own
+                // regulators. Losing the local telemetry hurts the
+                // dashboard but should not refuse the worker boot.
+                std::cerr << "serve: attached mode — SystemMonitor sensor "
+                             "probe failed (" << e.what() << "); "
+                             "continuing without local thermal telemetry\n";
+            } else {
+                std::cerr << "serve: profile '" << profile.name
+                          << "' requires sensors the host does not expose: "
+                          << e.what() << "\n";
+                return 1;
+            }
         }
-        guard = std::make_unique<mimirmind::runtime::ThermalGuard>(
-            profile, *monitor);
-        engine.setThermalGuard(guard.get());
+        if (monitor) {
+            guard = std::make_unique<mimirmind::runtime::ThermalGuard>(
+                profile, *monitor);
+            engine.setThermalGuard(guard.get());
+        }
+        if (attachedMode) {
+            MM_LOG_INFO("main",
+                        "serve: attached mode — SystemMonitor + ThermalGuard "
+                        "installed (read-only); GpuClockGovernor / "
+                        "FanController skipped (Munin owns the sysfs writes)");
+        }
+    }
+    if (!attachedMode && hasThermalProfile) {
+        const mimirmind::runtime::ThermalProfile& profile = cfg.governor.thermal;
 
         // GPU clock governor lives in the same profile (field
         // gpu_target_temp_c). If present AND the iGPU sysfs is
