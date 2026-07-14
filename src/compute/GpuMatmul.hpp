@@ -175,34 +175,45 @@ public:
     /**
      * M-MoE.Fused-Decode prototype — fused K-experts down projection for
      * MoE T=1 decode. Collapses K sequential down-matmul + scaledAdd
-     * launches into one dispatch. Q6_K weight only (current MoE model
-     * `google_gemma-4-26B-A4B-it-Q6_K`). Read-modify-write on `accum`;
-     * caller pre-zeros before invoking.
+     * launches into one dispatch. Weight quant type is picked at call
+     * time — one kernel per supported type is loaded eagerly at ctor.
+     * Currently supported: Q6_K, Q8_0 (26B-A4B mixes them: gate_up=Q6_K,
+     * down=Q8_0). Read-modify-write on `accum`; caller pre-zeros before
+     * invoking.
      *
      *   accum[n] += sum_{k=0..kActive-1} kw[k] *
-     *                 sum_{l=0..ffPer-1} dequant_q6k(W[expIdx[k]], n, l)
+     *                 sum_{l=0..ffPer-1} dequant<T>(W[expIdx[k]], n, l)
      *                                   * gateAct[k, l]
      *
      * `gateAct`, `expIdx`, `kw` must live in USM the caller has already
      * populated (host-visible USM writes suffice on UMA-iGPU).
      * `expertBytes` is the byte stride between consecutive experts in W
-     * (Q6_K: `dModel * (ffPer/256) * 210`).
+     * — caller computes it from the quant type (Q6_K: `dModel *
+     * (ffPer/256) * 210`; Q8_0: `dModel * (ffPer/32) * 34`).
      *
-     * Async; call sync() before the CPU reads `accum`. Available only
-     * when the kernel loaded at ctor — query via `moeDownFusedKAvailable()`.
+     * Async; call sync() before the CPU reads `accum`. Throws if the
+     * kernel for `type` didn't load — query via
+     * `moeDownFusedKAvailable(type)` first.
      */
-    void moeDownFusedKAsync(const float*  gateAct,
-                            const void*   W,
-                            const std::int32_t* expIdx,
-                            const float*  kw,
-                            float*        accum,
-                            std::size_t   ffPer,
-                            std::size_t   dModel,
-                            std::size_t   kActive,
-                            std::size_t   expertBytes);
+    void moeDownFusedKAsync(core::gguf::GgmlType type,
+                            const float*         gateAct,
+                            const void*          W,
+                            const std::int32_t*  expIdx,
+                            const float*         kw,
+                            float*               accum,
+                            std::size_t          ffPer,
+                            std::size_t          dModel,
+                            std::size_t          kActive,
+                            std::size_t          expertBytes);
 
+    /// True when the fused-K kernel for `type` loaded at ctor.
+    [[nodiscard]] bool moeDownFusedKAvailable(core::gguf::GgmlType type) const noexcept {
+        return _moeDownFusedK.find(type) != _moeDownFusedK.end();
+    }
+
+    /// True when at least one fused-K kernel loaded (any quant type).
     [[nodiscard]] bool moeDownFusedKAvailable() const noexcept {
-        return _moeDownFusedKQ6k.has_value();
+        return !_moeDownFusedK.empty();
     }
 
     /// Flush any pending appends (close + execute + sync + reset). Safe
@@ -329,12 +340,13 @@ private:
     // One-shot warning latch — never log the fallback warning twice.
     mutable bool _dp4aScratchOverflowWarned{false};
 
-    // M-MoE.Fused-Decode prototype — dedicated fused-K down-projection
-    // kernel for the Q6_K MoE model (currently the only MoE Gemma 4
-    // variant). Optional because it may fail to load on non-Xe-LPG
-    // targets; callers fall back to the sequential per-expert path via
-    // `moeDownFusedKAvailable()`.
-    std::optional<KernelSlot> _moeDownFusedKQ6k;
+    // M-MoE.Fused-Decode — one fused-K down-projection kernel per
+    // supported expert weight quant type. Populated at ctor by trying to
+    // load each variant; kernel-load failures leave the type absent from
+    // the map and callers fall back to the sequential per-expert path via
+    // `moeDownFusedKAvailable(type)`. Gemma 4 26B-A4B mixes types
+    // (gate_up=Q6_K, ffn_down=Q8_0), so both are loaded eagerly.
+    std::unordered_map<core::gguf::GgmlType, KernelSlot> _moeDownFusedK;
 
     // M5h: workgroup of 64 threads = 4 subgroups of 16, each subgroup
     // co-computes ONE output via sub_group_reduce_add. So a workgroup

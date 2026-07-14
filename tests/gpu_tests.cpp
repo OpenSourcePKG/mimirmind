@@ -2922,7 +2922,7 @@ TEST(bench_matmul_q8_0_prefill_shape) {
 // =======================================================================
 
 TEST(moe_down_fused_k_q6k_parity) {
-    if (!fx().gmm.moeDownFusedKAvailable()) {
+    if (!fx().gmm.moeDownFusedKAvailable(mimirmind::core::gguf::GgmlType::Q6_K)) {
         std::printf("[SKIP] moe_down_fused_k_q6k kernel not loaded on this device\n");
         return;
     }
@@ -2940,7 +2940,8 @@ TEST(moe_down_fused_k_q6k_parity) {
     // silently produce the right answer.
     std::vector<std::uint8_t> bank(bankBytes);
     for (std::size_t e = 0; e < nExperts; ++e) {
-        const auto w = buildQ6kWeights(dModel, ffPer, 0xE1000000U + e);
+        const auto w = buildQ6kWeights(dModel, ffPer,
+                                       static_cast<std::uint32_t>(0xE1000000U + e));
         std::memcpy(bank.data() + e * expertBytes,
                     w.data(), expertBytes);
     }
@@ -2976,6 +2977,7 @@ TEST(moe_down_fused_k_q6k_parity) {
     std::memset(bufAccum.raw(), 0, bufAccum.bytes());
 
     fx().gmm.moeDownFusedKAsync(
+        mimirmind::core::gguf::GgmlType::Q6_K,
         bufGate.as<float>(),
         bufBank.raw(),
         bufIdx.as<std::int32_t>(),
@@ -3002,6 +3004,91 @@ TEST(moe_down_fused_k_q6k_parity) {
     }
 
     EXPECT_ARRAY_NEAR("moe_down_fused_k_q6k_parity",
+                      bufAccum.as<float>(), cpuAccum.data(), dModel, 1e-2F);
+}
+
+TEST(moe_down_fused_k_q8_0_parity) {
+    if (!fx().gmm.moeDownFusedKAvailable(mimirmind::core::gguf::GgmlType::Q8_0)) {
+        std::printf("[SKIP] moe_down_fused_k_q8_0 kernel not loaded on this device\n");
+        return;
+    }
+
+    // Mirrors the Q6_K variant with Q8_0 sizing. Uses ffPer=2816 which
+    // matches the 26B-A4B ffn_down_exps K-dim (2112 gate/up × 2 halves =
+    // matches this). Q8_0 is 32-elem blocks × 34 bytes.
+    constexpr std::size_t dModel   = 128;   // multiple of 4 (outputs/WG)
+    constexpr std::size_t ffPer    = 256;   // 8 Q8_0 blocks per row
+    constexpr std::size_t kActive  = 4;
+    constexpr std::size_t nExperts = 8;
+
+    const std::size_t bytesPerRow = (ffPer / 32) * 34;
+    const std::size_t expertBytes = dModel * bytesPerRow;
+    const std::size_t bankBytes   = nExperts * expertBytes;
+
+    std::vector<std::uint8_t> bank(bankBytes);
+    for (std::size_t e = 0; e < nExperts; ++e) {
+        const auto w = buildQ8_0Weights(dModel, ffPer,
+                                        static_cast<std::uint32_t>(0xE2000000U + e));
+        std::memcpy(bank.data() + e * expertBytes,
+                    w.data(), expertBytes);
+    }
+
+    const auto gateAct = generateFloats(kActive * ffPer, 0xF101);
+
+    const std::array<std::int32_t, kActive> topKIdx{5, 2, 7, 0};
+    const std::array<float, kActive>        topKWeight{0.33F, 0.22F, 0.27F, 0.18F};
+
+    std::vector<float> expScales(nExperts);
+    {
+        std::mt19937 rng(0xF102);
+        std::uniform_real_distribution<float> dist(0.5F, 1.5F);
+        for (auto& s : expScales) s = dist(rng);
+    }
+
+    UsmBuf bufBank(bank.size());
+    UsmBuf bufGate(gateAct.size() * sizeof(float));
+    UsmBuf bufIdx(kActive * sizeof(std::int32_t));
+    UsmBuf bufKw(kActive * sizeof(float));
+    UsmBuf bufAccum(dModel * sizeof(float));
+
+    std::memcpy(bufBank.raw(), bank.data(), bank.size());
+    std::memcpy(bufGate.raw(), gateAct.data(), gateAct.size() * sizeof(float));
+    std::memcpy(bufIdx.raw(),  topKIdx.data(), kActive * sizeof(std::int32_t));
+    std::vector<float> kwCombined(kActive);
+    for (std::size_t k = 0; k < kActive; ++k) {
+        kwCombined[k] = topKWeight[k] *
+            expScales[static_cast<std::size_t>(topKIdx[k])];
+    }
+    std::memcpy(bufKw.raw(), kwCombined.data(), kwCombined.size() * sizeof(float));
+    std::memset(bufAccum.raw(), 0, bufAccum.bytes());
+
+    fx().gmm.moeDownFusedKAsync(
+        mimirmind::core::gguf::GgmlType::Q8_0,
+        bufGate.as<float>(),
+        bufBank.raw(),
+        bufIdx.as<std::int32_t>(),
+        bufKw.as<float>(),
+        bufAccum.as<float>(),
+        ffPer, dModel, kActive, expertBytes);
+    fx().gmm.sync();
+
+    std::vector<float> cpuAccum(dModel, 0.0F);
+    std::vector<float> perExpertOut(dModel);
+    std::vector<float> scratchCpu(ffPer);
+    for (std::size_t k = 0; k < kActive; ++k) {
+        const std::size_t e = static_cast<std::size_t>(topKIdx[k]);
+        const std::uint8_t* Wd = bank.data() + e * expertBytes;
+        mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::Q8_0,
+                                   Wd, dModel, ffPer,
+                                   gateAct.data() + k * ffPer, 1,
+                                   perExpertOut.data(),
+                                   scratchCpu.data());
+        for (std::size_t n = 0; n < dModel; ++n) {
+            cpuAccum[n] += kwCombined[k] * perExpertOut[n];
+        }
+    }
+
+    EXPECT_ARRAY_NEAR("moe_down_fused_k_q8_0_parity",
                       bufAccum.as<float>(), cpuAccum.data(), dModel, 1e-2F);
 }
 

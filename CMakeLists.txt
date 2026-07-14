@@ -127,6 +127,7 @@ set(KERNEL_SOURCES
     kernels/matmul_q4k_gemm_v2.cl
     kernels/matmul_q8_0_vec_reorder.cl
     kernels/moe_down_fused_k_q6k.cl
+    kernels/moe_down_fused_k_q8_0.cl
 )
 
 set(KERNEL_SPV_FILES "")

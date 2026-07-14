@@ -348,14 +348,16 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
         }
     } else {
         // M-MoE.Fused-Decode — enable the fused-K down path when all
-        // preconditions line up: toggle on, kernel loaded on this iGPU,
-        // T == 1 (decode), expDown is Q6_K. Otherwise fall through to
-        // the sequential per-expert dispatch below.
+        // preconditions line up: toggle on, kernel loaded for this
+        // expert quant type on this iGPU, T == 1 (decode), scratches
+        // allocated. Otherwise fall through to the sequential per-expert
+        // dispatch below. 26B-A4B mixes types (gate_up=Q6_K,
+        // ffn_down=Q8_0); Q4_K/Q5_K expert downs are future-model
+        // candidates that just need their own kernel variant.
         const bool useMoeFusedDown =
             _moeFusedDownEnabled &&
-            _gmm.moeDownFusedKAvailable() &&
+            _gmm.moeDownFusedKAvailable(expDown->type) &&
             T == 1 &&
-            expDown->type == core::gguf::GgmlType::Q6_K &&
             s.moeExpIdxScratch.get() != nullptr &&
             s.moeKwScratch.get()     != nullptr &&
             s.moeGateCompact.get()   != nullptr;
@@ -405,6 +407,7 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
 
             trace("path B: fused-K down dispatch");
             _gmm.moeDownFusedKAsync(
+                expDown->type,
                 gateActAll,
                 expDownBase,
                 expIdxSlot,
