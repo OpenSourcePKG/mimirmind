@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "core/gpu/GpuBackend.hpp"
+#include "core/backend/ComputeBackend.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -18,7 +18,7 @@ namespace mimirmind::core::hip {
  * HIP-native device snapshot. Superset of `gpu::BackendDeviceInfo` —
  * carries HIP-typed fields (gfx arch string, warp size, integrated
  * flag) that only the HIP backend cares about. Consumers that only
- * need the portable subset should use `GpuBackend::deviceInfo()`.
+ * need the portable subset should use `ComputeBackend::deviceInfo()`.
  */
 struct DeviceInfo {
     std::string   name;              // vendor-supplied device name
@@ -50,9 +50,9 @@ private:
  * bit-parity against the Level Zero reference on a single device,
  * then adds multi-device once the kernel-set has landed.
  *
- * Implements `core::gpu::GpuBackend` — the backend-neutral interface.
+ * Implements `core::gpu::ComputeBackend` — the backend-neutral interface.
  * Consumers that only need device-info + feature-flags should take
- * `GpuBackend&`; consumers that touch HIP-native handles (streams,
+ * `ComputeBackend&`; consumers that touch HIP-native handles (streams,
  * events, modules, USM) go through the concrete `HipContext&` type
  * once those wrappers exist. Today the skeleton exposes the device
  * index only — no stream, no memory manager, no ops. Kernels come
@@ -61,7 +61,7 @@ private:
  * Not thread-safe by contract; wrap in a mutex at the caller level if
  * you need shared access.
  */
-class HipContext : public ::mimirmind::core::gpu::GpuBackend {
+class HipContext : public ::mimirmind::core::backend::ComputeBackend {
 public:
     /// `deviceIndex = -1` means auto-select: prefer the first
     /// non-integrated (discrete) GPU, fall back to the integrated one
@@ -74,11 +74,11 @@ public:
     HipContext(HipContext&&)                 = delete;
     HipContext& operator=(HipContext&&)      = delete;
 
-    // ---- GpuBackend interface ------------------------------------------
+    // ---- ComputeBackend interface ------------------------------------------
 
-    [[nodiscard]] ::mimirmind::core::gpu::BackendKind kind() const noexcept override;
-    [[nodiscard]] const ::mimirmind::core::gpu::BackendDeviceInfo& deviceInfo() const noexcept override;
-    [[nodiscard]] bool hasFeature(::mimirmind::core::gpu::BackendFeature f) const noexcept override;
+    [[nodiscard]] ::mimirmind::core::backend::BackendKind kind() const noexcept override;
+    [[nodiscard]] const ::mimirmind::core::backend::BackendDeviceInfo& deviceInfo() const noexcept override;
+    [[nodiscard]] bool hasFeature(::mimirmind::core::backend::BackendFeature f) const noexcept override;
 
     // ---- HIP-native accessors ------------------------------------------
 
@@ -88,7 +88,7 @@ public:
 private:
     int _deviceIdx{-1};
     DeviceInfo _info{};
-    ::mimirmind::core::gpu::BackendDeviceInfo _backendInfo{};
+    ::mimirmind::core::backend::BackendDeviceInfo _backendInfo{};
 };
 
 } // namespace mimirmind::core::hip
