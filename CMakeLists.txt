@@ -397,6 +397,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/hip_probe_kernel.hip
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/rmsnorm.hip
+        kernels_hip/rope_inplace.hip
     )
 
     set(HSACO_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/hsaco)
@@ -887,6 +888,24 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_matmul_q8_probe hip_kernels)
 
     target_link_libraries(hip_matmul_q8_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_rope_probe — RoPE (rotary embedding) parity check --------
+    #
+    # Third kernel port: element-wise, no LDS, but the first that
+    # exercises the "runtime int slot via device pointer" launch-arg
+    # pattern (startPosPtr) which the L0 side needs for CLR replay and
+    # the HIP side will need for the same reason once we bring up
+    # command-list-replay-equivalent (hipGraph capture) on RDNA3.
+
+    add_executable(hip_rope_probe
+        tools/hip-rope-probe.cpp
+    )
+
+    add_dependencies(hip_rope_probe hip_kernels)
+
+    target_link_libraries(hip_rope_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
