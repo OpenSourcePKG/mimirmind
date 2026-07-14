@@ -395,6 +395,7 @@ if(MIMIRMIND_ENABLE_HIP)
     # ships automatically if MIMIRMIND_HIP_ARCHS lists more than one arch.
     set(HIP_KERNEL_SOURCES
         kernels_hip/hip_probe_kernel.hip
+        kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/rmsnorm.hip
     )
 
@@ -867,6 +868,25 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_rmsnorm_probe hip_kernels)
 
     target_link_libraries(hip_rmsnorm_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_matmul_q8_probe — Q8_0 dequant + matmul bit-parity -------
+    #
+    # Second real HIP kernel. Loads matmul_q8_0_vec.hsaco, runs it on a
+    # random Q8_0-packed weight matrix and a random X vector, compares
+    # against a double-precision CPU reference that dequantizes the
+    # same weights + does the dot product. First tool that exercises
+    # the on-the-fly dequantization path — the bit-parity signal here
+    # covers both the fp16 scale load and the int8 quant multiply.
+
+    add_executable(hip_matmul_q8_probe
+        tools/hip-matmul-q8-probe.cpp
+    )
+
+    add_dependencies(hip_matmul_q8_probe hip_kernels)
+
+    target_link_libraries(hip_matmul_q8_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
