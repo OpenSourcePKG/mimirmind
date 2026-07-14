@@ -395,6 +395,7 @@ if(MIMIRMIND_ENABLE_HIP)
     # ships automatically if MIMIRMIND_HIP_ARCHS lists more than one arch.
     set(HIP_KERNEL_SOURCES
         kernels_hip/hip_probe_kernel.hip
+        kernels_hip/rmsnorm.hip
     )
 
     set(HSACO_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/hsaco)
@@ -847,6 +848,25 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_module_probe hip_kernels)
 
     target_link_libraries(hip_module_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_rmsnorm_probe — first real HIP kernel bit-parity test ----
+    #
+    # Loads rmsnorm.hsaco (compiled from kernels_hip/rmsnorm.hip via
+    # hipcc --genco), runs RMSNorm on synthetic M×K input, compares
+    # against an inline double-precision CPU reference within abs/rel
+    # 1e-4. First concrete "GPU output matches expected" signal from
+    # the HIP backend — foundation for the parity harness the rest of
+    # the kernel-set will be validated against.
+
+    add_executable(hip_rmsnorm_probe
+        tools/hip-rmsnorm-probe.cpp
+    )
+
+    add_dependencies(hip_rmsnorm_probe hip_kernels)
+
+    target_link_libraries(hip_rmsnorm_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
