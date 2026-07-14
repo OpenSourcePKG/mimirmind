@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace mimirmind::core::gpu {
+namespace mimirmind::core::backend {
 
 /**
  * Backend identifier — which underlying API is doing the compute.
@@ -33,7 +33,7 @@ namespace mimirmind::core::gpu {
  *
  * Each concrete backend is implemented in its own translation unit
  * under `src/core/gpu/<backend>/`. Consumers that only need
- * backend-agnostic device-info should take `GpuBackend&`; consumers
+ * backend-agnostic device-info should take `ComputeBackend&`; consumers
  * that touch backend-specific kernel APIs (CommandQueue, GpuModule,
  * UsmAllocator today) stay on the concrete `L0Context` / future
  * concrete-backend types.
@@ -144,14 +144,14 @@ struct BackendDeviceInfo {
  * Not thread-safe by contract — concrete backends may be, but no
  * consumer should assume so.
  */
-class GpuBackend {
+class ComputeBackend {
 public:
-    virtual ~GpuBackend() = default;
+    virtual ~ComputeBackend() = default;
 
-    GpuBackend(const GpuBackend&)            = delete;
-    GpuBackend& operator=(const GpuBackend&) = delete;
-    GpuBackend(GpuBackend&&)                 = delete;
-    GpuBackend& operator=(GpuBackend&&)      = delete;
+    ComputeBackend(const ComputeBackend&)            = delete;
+    ComputeBackend& operator=(const ComputeBackend&) = delete;
+    ComputeBackend(ComputeBackend&&)                 = delete;
+    ComputeBackend& operator=(ComputeBackend&&)      = delete;
 
     [[nodiscard]] virtual BackendKind kind() const noexcept = 0;
 
@@ -168,7 +168,7 @@ public:
     [[nodiscard]] virtual bool hasFeature(BackendFeature f) const noexcept = 0;
 
 protected:
-    GpuBackend() = default;
+    ComputeBackend() = default;
 };
 
-} // namespace mimirmind::core::gpu
+} // namespace mimirmind::core::backend

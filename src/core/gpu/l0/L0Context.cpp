@@ -84,7 +84,7 @@ DeviceInfo describeDevice(ze_device_handle_t dev) {
     }
 
     // Integrated flag — used by UsmAllocator's auto-detect for the
-    // Host-vs-Shared USM pick, and by the neutral GpuBackend interface
+    // Host-vs-Shared USM pick, and by the neutral ComputeBackend interface
     // to fill DeviceKind::GpuIntegrated / GpuDiscrete.
     info.isIntegrated =
         (props.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED) != 0;
@@ -96,9 +96,9 @@ DeviceInfo describeDevice(ze_device_handle_t dev) {
     return info;
 }
 
-::mimirmind::core::gpu::BackendDeviceInfo
+::mimirmind::core::backend::BackendDeviceInfo
 toNeutralInfo(const DeviceInfo& src) {
-    namespace gpu = ::mimirmind::core::gpu;
+    namespace gpu = ::mimirmind::core::backend;
     gpu::BackendDeviceInfo out{};
     out.name            = src.name;
     out.uuid            = src.uuid;
@@ -166,8 +166,8 @@ L0Context::L0Context(std::string spvDirOverride)
 }
 
 bool L0Context::hasFeature(
-        ::mimirmind::core::gpu::BackendFeature f) const noexcept {
-    namespace gpu = ::mimirmind::core::gpu;
+        ::mimirmind::core::backend::BackendFeature f) const noexcept {
+    namespace gpu = ::mimirmind::core::backend;
     switch (f) {
         case gpu::BackendFeature::MutableCommandLists:
             return _hasMutableCmdLists;

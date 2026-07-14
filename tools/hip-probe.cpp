@@ -2,7 +2,7 @@
 // Copyright 2026 Stefan Werfling
 //
 // hip_probe — enumerate all HIP-visible devices, instantiate HipContext
-// on the default pick, print the portable GpuBackend snapshot plus the
+// on the default pick, print the portable ComputeBackend snapshot plus the
 // HIP-native superset, and evaluate every BackendFeature flag. This is
 // the "toolchain is live end-to-end" smoke signal for the HIP bringup,
 // analogous to l0_ipc_testrig for the L0 side. Not installed in any
@@ -16,7 +16,7 @@
 // Run via:
 //   cmake --build build --target hip_probe && ./build/hip_probe
 
-#include "core/gpu/GpuBackend.hpp"
+#include "core/backend/ComputeBackend.hpp"
 #include "core/gpu/hip/HipContext.hpp"
 
 #include <hip/hip_runtime.h>
@@ -29,8 +29,8 @@
 
 namespace {
 
-std::string_view backendFeatureName(mimirmind::core::gpu::BackendFeature f) {
-    using F = mimirmind::core::gpu::BackendFeature;
+std::string_view backendFeatureName(mimirmind::core::backend::BackendFeature f) {
+    using F = mimirmind::core::backend::BackendFeature;
     switch (f) {
         case F::MutableCommandLists: return "MutableCommandLists";
         case F::IntegerDotProduct:   return "IntegerDotProduct";
@@ -41,8 +41,8 @@ std::string_view backendFeatureName(mimirmind::core::gpu::BackendFeature f) {
     return "Unknown";
 }
 
-std::string_view deviceKindName(mimirmind::core::gpu::DeviceKind k) {
-    using K = mimirmind::core::gpu::DeviceKind;
+std::string_view deviceKindName(mimirmind::core::backend::DeviceKind k) {
+    using K = mimirmind::core::backend::DeviceKind;
     switch (k) {
         case K::GpuIntegrated: return "GpuIntegrated";
         case K::GpuDiscrete:   return "GpuDiscrete";
@@ -98,7 +98,7 @@ int main() {
         std::printf("  coreClockRate (MHz) : %d\n", hipInfo.coreClockRateKhz / 1000);
         std::printf("  isIntegrated        : %s\n", hipInfo.isIntegrated ? "yes" : "no");
 
-        std::printf("\nPortable BackendDeviceInfo (via GpuBackend&):\n");
+        std::printf("\nPortable BackendDeviceInfo (via ComputeBackend&):\n");
         const auto& info = ctx.deviceInfo();
         std::printf("  name                : %s\n", info.name.c_str());
         std::printf("  DeviceKind          : %s\n", std::string(deviceKindName(info.kind)).c_str());
@@ -109,7 +109,7 @@ int main() {
         std::printf("  coreClockRate (MHz) : %u\n", info.coreClockRate);
 
         std::printf("\nBackendFeature flags:\n");
-        using F = mimirmind::core::gpu::BackendFeature;
+        using F = mimirmind::core::backend::BackendFeature;
         for (auto f : { F::MutableCommandLists,
                         F::IntegerDotProduct,
                         F::IpcHandleExport,

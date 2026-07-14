@@ -49,8 +49,8 @@ inline void hipCheck(const std::string& call, hipError_t code) {
         || arch.starts_with("gfx94");
 }
 
-[[nodiscard]] ::mimirmind::core::gpu::DeviceKind classifyKind(bool integrated) {
-    using ::mimirmind::core::gpu::DeviceKind;
+[[nodiscard]] ::mimirmind::core::backend::DeviceKind classifyKind(bool integrated) {
+    using ::mimirmind::core::backend::DeviceKind;
     return integrated ? DeviceKind::GpuIntegrated : DeviceKind::GpuDiscrete;
 }
 
@@ -59,7 +59,7 @@ inline void hipCheck(const std::string& call, hipError_t code) {
 void populate(const hipDeviceProp_t& p,
               int index,
               DeviceInfo& info,
-              ::mimirmind::core::gpu::BackendDeviceInfo& backendInfo)
+              ::mimirmind::core::backend::BackendDeviceInfo& backendInfo)
 {
     info.name             = p.name;
     info.gfxArch          = p.gcnArchName; // "gfx1101" etc.
@@ -142,16 +142,16 @@ HipContext::HipContext(int deviceIndex) {
 
 HipContext::~HipContext() = default;
 
-::mimirmind::core::gpu::BackendKind HipContext::kind() const noexcept {
-    return ::mimirmind::core::gpu::BackendKind::Hip;
+::mimirmind::core::backend::BackendKind HipContext::kind() const noexcept {
+    return ::mimirmind::core::backend::BackendKind::Hip;
 }
 
-const ::mimirmind::core::gpu::BackendDeviceInfo& HipContext::deviceInfo() const noexcept {
+const ::mimirmind::core::backend::BackendDeviceInfo& HipContext::deviceInfo() const noexcept {
     return _backendInfo;
 }
 
-bool HipContext::hasFeature(::mimirmind::core::gpu::BackendFeature f) const noexcept {
-    using ::mimirmind::core::gpu::BackendFeature;
+bool HipContext::hasFeature(::mimirmind::core::backend::BackendFeature f) const noexcept {
+    using ::mimirmind::core::backend::BackendFeature;
     const std::string_view arch = _info.gfxArch;
 
     switch (f) {
