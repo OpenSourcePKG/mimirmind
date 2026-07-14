@@ -7,9 +7,9 @@
 #include "core/gpu/l0/L0Context.hpp"
 #include "core/log/Log.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
-#include "runtime/CommandQueue.hpp"
-#include "runtime/GpuKernel.hpp"
-#include "runtime/GpuModule.hpp"
+#include "core/gpu/l0/CommandQueue.hpp"
+#include "core/gpu/l0/GpuKernel.hpp"
+#include "core/gpu/l0/GpuModule.hpp"
 
 #include "compute/quant/Q8_0.hpp"
 

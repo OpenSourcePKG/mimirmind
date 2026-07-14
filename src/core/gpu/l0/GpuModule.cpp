@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "runtime/GpuModule.hpp"
+#include "core/gpu/l0/GpuModule.hpp"
 
 #include "core/gpu/l0/L0Context.hpp"
 #include "core/log/Log.hpp"

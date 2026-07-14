@@ -13,7 +13,7 @@
 #include "core/gguf/WeightsMap.hpp"
 #include "core/ipc/TensorManifest.hpp"
 #include "runtime/BlockBuffers.hpp"
-#include "runtime/CommandQueue.hpp"
+#include "core/gpu/l0/CommandQueue.hpp"
 #include "runtime/KvCache.hpp"
 #include "core/gpu/l0/L0Context.hpp"
 #include "runtime/OpProfiler.hpp"

@@ -25,7 +25,7 @@
 
 #include "compute/GpuOps.hpp"
 #include "compute/quant/Q8_0.hpp"
-#include "runtime/CommandQueue.hpp"
+#include "core/gpu/l0/CommandQueue.hpp"
 #include "core/config/Config.hpp"
 #include "core/gpu/l0/L0Context.hpp"
 #include "core/log/Log.hpp"

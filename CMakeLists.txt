@@ -343,9 +343,9 @@ add_executable(mimirmind
     src/model/ResponseCleaner.cpp
     src/model/Tokenizer.cpp
     src/runtime/BlockBuffers.cpp
-    src/runtime/CommandQueue.cpp
-    src/runtime/GpuKernel.cpp
-    src/runtime/GpuModule.cpp
+    src/core/gpu/l0/CommandQueue.cpp
+    src/core/gpu/l0/GpuKernel.cpp
+    src/core/gpu/l0/GpuModule.cpp
     src/runtime/InferenceEngine.cpp
     src/runtime/KvCache.cpp
     src/runtime/SpeculativeDecoder.cpp
@@ -580,9 +580,9 @@ add_executable(gpu_tests
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
-    src/runtime/CommandQueue.cpp
-    src/runtime/GpuKernel.cpp
-    src/runtime/GpuModule.cpp
+    src/core/gpu/l0/CommandQueue.cpp
+    src/core/gpu/l0/GpuKernel.cpp
+    src/core/gpu/l0/GpuModule.cpp
 )
 
 add_dependencies(gpu_tests spv_kernels)
@@ -625,9 +625,9 @@ add_executable(prefill_bench
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
-    src/runtime/CommandQueue.cpp
-    src/runtime/GpuKernel.cpp
-    src/runtime/GpuModule.cpp
+    src/core/gpu/l0/CommandQueue.cpp
+    src/core/gpu/l0/GpuKernel.cpp
+    src/core/gpu/l0/GpuModule.cpp
 )
 
 add_dependencies(prefill_bench spv_kernels)

@@ -4,9 +4,9 @@
 #pragma once
 
 #include "core/gguf/GgufTypes.hpp"
-#include "runtime/CommandQueue.hpp"
-#include "runtime/GpuKernel.hpp"
-#include "runtime/GpuModule.hpp"
+#include "core/gpu/l0/CommandQueue.hpp"
+#include "core/gpu/l0/GpuKernel.hpp"
+#include "core/gpu/l0/GpuModule.hpp"
 
 #include <array>
 #include <cstddef>

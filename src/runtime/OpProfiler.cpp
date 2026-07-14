@@ -3,7 +3,7 @@
 
 #include "runtime/OpProfiler.hpp"
 
-#include "runtime/CommandQueue.hpp"
+#include "core/gpu/l0/CommandQueue.hpp"
 #include "core/log/Log.hpp"
 
 #include <cstdio>

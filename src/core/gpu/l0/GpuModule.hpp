@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "runtime/GpuKernel.hpp"
+#include "core/gpu/l0/GpuKernel.hpp"
 
 #include <level_zero/ze_api.h>
 
