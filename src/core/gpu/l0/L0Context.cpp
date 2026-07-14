@@ -3,13 +3,17 @@
 
 #include "core/gpu/l0/L0Context.hpp"
 
+#include "core/backend/BackendRegistry.hpp"
 #include "core/log/Log.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <sstream>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace mimirmind::core::l0 {
 
@@ -387,6 +391,73 @@ std::string L0Context::resultToString(ze_result_t r) {
         case ZE_RESULT_ERROR_UNKNOWN:                  return "ZE_RESULT_ERROR_UNKNOWN";
         default:                                       return "UNRECOGNIZED";
     }
+}
+
+// ---- backend-registry probe -----------------------------------------------
+//
+// Free function called from BackendRegistry::probeAll() in
+// mimirmind_core_common. Lightweight — does NOT construct L0Context,
+// only reaches for the driver + counts devices. Never throws (the
+// registry API is noexcept).
+//
+// Kept as a namespace-scoped free function (not a static method on
+// L0Context) so BackendRegistry.cpp can forward-declare it without
+// having to include L0Context.hpp — which would drag ze_api.h into
+// the pure-CPU common library.
+
+::mimirmind::core::backend::BackendProbe probeBackend() noexcept {
+    using ::mimirmind::core::backend::BackendKind;
+    using ::mimirmind::core::backend::BackendProbe;
+
+    BackendProbe p{ BackendKind::LevelZero, /*compiledIn=*/true, /*available=*/false, {} };
+
+    // zeInit may be called multiple times per process — the driver is
+    // ref-counted, so cheap to probe.
+    ze_result_t rc = zeInit(0);
+    if (rc != ZE_RESULT_SUCCESS) {
+        p.detail = std::string("zeInit failed: ")
+                 + L0Context::resultToString(rc);
+        return p;
+    }
+
+    std::uint32_t drvCount = 0;
+    rc = zeDriverGet(&drvCount, nullptr);
+    if (rc != ZE_RESULT_SUCCESS || drvCount == 0) {
+        p.detail = "no Level Zero driver visible";
+        return p;
+    }
+
+    std::vector<ze_driver_handle_t> drivers(drvCount);
+    if (zeDriverGet(&drvCount, drivers.data()) != ZE_RESULT_SUCCESS) {
+        p.detail = std::to_string(drvCount) + " driver(s), enumeration failed";
+        return p;
+    }
+
+    std::uint32_t totalDevices = 0;
+    std::string   firstName;
+    for (auto d : drivers) {
+        std::uint32_t n = 0;
+        if (zeDeviceGet(d, &n, nullptr) != ZE_RESULT_SUCCESS || n == 0) continue;
+        totalDevices += n;
+
+        if (firstName.empty()) {
+            std::vector<ze_device_handle_t> devs(n);
+            if (zeDeviceGet(d, &n, devs.data()) == ZE_RESULT_SUCCESS && n > 0) {
+                ze_device_properties_t props{};
+                props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+                if (zeDeviceGetProperties(devs.front(), &props) == ZE_RESULT_SUCCESS) {
+                    firstName = props.name;
+                }
+            }
+        }
+    }
+
+    p.available = totalDevices > 0;
+    if (firstName.empty()) firstName = "?";
+    p.detail = std::to_string(drvCount) + " driver(s), "
+             + std::to_string(totalDevices) + " device(s), first: "
+             + firstName;
+    return p;
 }
 
 } // namespace mimirmind::core::l0
