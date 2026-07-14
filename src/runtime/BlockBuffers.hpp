@@ -4,8 +4,8 @@
 #pragma once
 
 #include "model/LlmConfig.hpp"
-#include "core/l0/UsmAllocator.hpp"
-#include "core/l0/UsmHandle.hpp"
+#include "core/gpu/l0/UsmAllocator.hpp"
+#include "core/gpu/l0/UsmHandle.hpp"
 
 #include <cstddef>
 

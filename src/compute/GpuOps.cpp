@@ -4,9 +4,9 @@
 #include "compute/GpuOps.hpp"
 
 #include "compute/Attention.hpp"
-#include "core/l0/L0Context.hpp"
+#include "core/gpu/l0/L0Context.hpp"
 #include "core/log/Log.hpp"
-#include "core/l0/UsmAllocator.hpp"
+#include "core/gpu/l0/UsmAllocator.hpp"
 #include "runtime/CommandQueue.hpp"
 #include "runtime/GpuKernel.hpp"
 #include "runtime/GpuModule.hpp"

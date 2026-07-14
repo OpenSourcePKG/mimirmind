@@ -4,7 +4,7 @@
 #include "core/gguf/GgufReader.hpp"
 
 #include "core/log/Log.hpp"
-#include "core/l0/UsmAllocator.hpp"
+#include "core/gpu/l0/UsmAllocator.hpp"
 #include "munin/ChunkAllocator.hpp"
 
 #include <cstring>

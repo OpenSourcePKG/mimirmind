@@ -4,7 +4,7 @@
 #pragma once
 
 #include "core/gguf/GgufTypes.hpp"
-#include "core/l0/UsmHandle.hpp"
+#include "core/gpu/l0/UsmHandle.hpp"
 #include "runtime/arch/GemmaBaseBackend.hpp"
 
 #include <cstddef>

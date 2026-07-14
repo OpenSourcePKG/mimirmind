@@ -3,7 +3,7 @@
 
 #include "runtime/GpuKernel.hpp"
 
-#include "core/l0/L0Context.hpp"
+#include "core/gpu/l0/L0Context.hpp"
 #include "core/log/Log.hpp"
 
 namespace mimirmind::runtime {

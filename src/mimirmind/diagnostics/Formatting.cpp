@@ -3,7 +3,7 @@
 
 #include "mimirmind/diagnostics/Formatting.hpp"
 
-#include "core/l0/L0Context.hpp"
+#include "core/gpu/l0/L0Context.hpp"
 
 #include <cstdio>
 #include <iomanip>

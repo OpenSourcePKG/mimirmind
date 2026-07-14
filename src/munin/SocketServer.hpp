@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "core/l0/L0Context.hpp"
+#include "core/gpu/l0/L0Context.hpp"
 #include "munin/AttachSession.hpp"
 #include "munin/ModelStore.hpp"
 

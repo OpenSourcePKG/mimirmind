@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "core/l0/UsmAllocator.hpp"
+#include "core/gpu/l0/UsmAllocator.hpp"
 
 #include <cstddef>
 

@@ -9,7 +9,7 @@
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/WeightsMap.hpp"
 #include "core/log/Log.hpp"
-#include "core/l0/UsmAllocator.hpp"
+#include "core/gpu/l0/UsmAllocator.hpp"
 
 #include <cstring>
 #include <string_view>

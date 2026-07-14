@@ -5,7 +5,7 @@
 
 #include "core/ipc/TensorManifest.hpp"
 #include "core/ipc/WireOps.hpp"
-#include "core/l0/L0Context.hpp"
+#include "core/gpu/l0/L0Context.hpp"
 
 #include <expected>
 #include <string>

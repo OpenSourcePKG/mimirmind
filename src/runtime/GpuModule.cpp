@@ -3,7 +3,7 @@
 
 #include "runtime/GpuModule.hpp"
 
-#include "core/l0/L0Context.hpp"
+#include "core/gpu/l0/L0Context.hpp"
 #include "core/log/Log.hpp"
 
 #include <array>

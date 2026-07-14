@@ -27,9 +27,9 @@
 #include "compute/quant/Q8_0.hpp"
 #include "runtime/CommandQueue.hpp"
 #include "core/config/Config.hpp"
-#include "core/l0/L0Context.hpp"
+#include "core/gpu/l0/L0Context.hpp"
 #include "core/log/Log.hpp"
-#include "core/l0/UsmAllocator.hpp"
+#include "core/gpu/l0/UsmAllocator.hpp"
 
 #include <algorithm>
 #include <chrono>

@@ -8,7 +8,7 @@
 #include "mimirmind/diagnostics/SmokeSuite.hpp"
 
 #include "core/config/Config.hpp"
-#include "core/l0/UsmAllocator.hpp"
+#include "core/gpu/l0/UsmAllocator.hpp"
 #include "core/log/Log.hpp"
 #include "runtime/InferenceEngine.hpp"
 

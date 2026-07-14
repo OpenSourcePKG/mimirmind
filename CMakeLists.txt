@@ -247,7 +247,7 @@ add_library(mimirmind_core_common STATIC
     src/core/ipc/TensorManifest.cpp
     src/core/ipc/UnixSocketFrame.cpp
     src/core/ipc/WireOps.cpp
-    src/core/l0/MappedFile.cpp
+    src/core/os/MappedFile.cpp
     src/core/log/Log.cpp
     src/core/os/GovernorLock.cpp
 )
@@ -276,8 +276,8 @@ target_link_libraries(mimirmind_core_common PUBLIC
 
 if(MIMIRMIND_ENABLE_L0)
     add_library(mimirmind_core_l0 STATIC
-        src/core/l0/L0Context.cpp
-        src/core/l0/UsmAllocator.cpp
+        src/core/gpu/l0/L0Context.cpp
+        src/core/gpu/l0/UsmAllocator.cpp
         src/core/ipc/IpcExporter.cpp
         src/core/ipc/IpcImporter.cpp
         src/core/ipc/MuninClient.cpp

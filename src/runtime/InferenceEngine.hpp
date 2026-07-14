@@ -15,10 +15,10 @@
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/CommandQueue.hpp"
 #include "runtime/KvCache.hpp"
-#include "core/l0/L0Context.hpp"
+#include "core/gpu/l0/L0Context.hpp"
 #include "runtime/OpProfiler.hpp"
-#include "core/l0/UsmAllocator.hpp"
-#include "core/l0/UsmHandle.hpp"
+#include "core/gpu/l0/UsmAllocator.hpp"
+#include "core/gpu/l0/UsmHandle.hpp"
 
 namespace mimirmind::core::config {
 struct Config;

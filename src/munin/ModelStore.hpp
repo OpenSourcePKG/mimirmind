@@ -7,8 +7,8 @@
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/WeightsMap.hpp"
 #include "core/ipc/TensorManifest.hpp"
-#include "core/l0/L0Context.hpp"
-#include "core/l0/UsmAllocator.hpp"
+#include "core/gpu/l0/L0Context.hpp"
+#include "core/gpu/l0/UsmAllocator.hpp"
 #include "munin/ChunkAllocator.hpp"
 
 #include <cstdint>

@@ -4,7 +4,7 @@
 #include "runtime/KvCache.hpp"
 
 #include "core/log/Log.hpp"
-#include "core/l0/UsmAllocator.hpp"
+#include "core/gpu/l0/UsmAllocator.hpp"
 
 #include <algorithm>
 #include <stdexcept>
