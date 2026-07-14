@@ -255,6 +255,22 @@ GpuMatmul::GpuMatmul(core::l0::L0Context&    ctx,
                     _dp4aXqBytes, kDp4aMaxM, kDp4aMaxK, _dp4aScaleBytes);
     }
 
+    // M-MoE.Fused-Decode prototype — Q6_K only (Gemma 4 26B-A4B). Guarded
+    // so a driver refusal drops us back to the sequential per-expert loop
+    // via `moeDownFusedKAvailable()`.
+    try {
+        _moeDownFusedKQ6k.emplace(loadSlot("moe_down_fused_k_q6k"));
+        MM_LOG_INFO("gpummm",
+                    "GpuMatmul: moe_down_fused_k_q6k loaded (local=64, sg=16, "
+                    "4 outputs/group) — MoE decode fused-K path available");
+    } catch (const std::exception& e) {
+        MM_LOG_WARN("gpummm",
+                    "GpuMatmul: moe_down_fused_k_q6k load failed ({}) — "
+                    "fused MoE decode disabled, backend stays on the "
+                    "sequential per-expert dispatch", e.what());
+        _moeDownFusedKQ6k.reset();
+    }
+
     MM_LOG_INFO("gpummm",
                 "GpuMatmul ready — {} kernels loaded, local_size={} "
                 "(sg={}, {} outputs/group). Autotune pending — call "
@@ -985,6 +1001,47 @@ void GpuMatmul::dispatchDp4aFromFloat(core::gguf::GgmlType type,
 
     _ops.xQuantI8Async(X, xq, xs, M, K);
     matmulDp4aAsync(type, xq, xs, W, N, K, M, Y);
+}
+
+void GpuMatmul::moeDownFusedKAsync(const float*        gateAct,
+                                   const void*         W,
+                                   const std::int32_t* expIdx,
+                                   const float*        kw,
+                                   float*              accum,
+                                   std::size_t         ffPer,
+                                   std::size_t         dModel,
+                                   std::size_t         kActive,
+                                   std::size_t         expertBytes) {
+    if (!_moeDownFusedKQ6k.has_value()) {
+        throw std::runtime_error(
+            "GpuMatmul::moeDownFusedKAsync: fused-K kernel not loaded — "
+            "check moeDownFusedKAvailable() first");
+    }
+    if (kActive == 0 || dModel == 0 || ffPer == 0) {
+        return;
+    }
+    if (ffPer % 256 != 0) {
+        throw std::runtime_error(
+            "GpuMatmul::moeDownFusedKAsync: ffPer=" + std::to_string(ffPer) +
+            " is not a multiple of Q6_K block elements (256)");
+    }
+
+    runtime::GpuKernel& kern = _moeDownFusedKQ6k->kernel;
+    kern.setGroupSize(64, 1, 1);
+    kern.setPtr(0, gateAct);
+    kern.setPtr(1, W);
+    kern.setPtr(2, expIdx);
+    kern.setPtr(3, kw);
+    kern.setPtr(4, accum);
+    kern.setValue<std::int32_t>(5, static_cast<std::int32_t>(ffPer));
+    kern.setValue<std::int32_t>(6, static_cast<std::int32_t>(dModel));
+    kern.setValue<std::int32_t>(7, static_cast<std::int32_t>(kActive));
+    kern.setValue<std::int32_t>(8, static_cast<std::int32_t>(expertBytes));
+
+    // 4 outputs per workgroup — mirrors matmul_q6k_vec dispatch geometry.
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (dModel + 4 - 1) / 4);
+    _queue.appendLaunch(kern, nGroups, 1, 1);
 }
 
 bool GpuMatmul::dp4aAvailable() const noexcept {

@@ -1,6 +1,7 @@
 #include "runtime/BlockBuffers.hpp"
 
 #include <algorithm>
+#include <cstdint>
 
 namespace mimirmind::runtime {
 
@@ -74,6 +75,16 @@ BlockBuffers allocBlockBuffers(UsmAllocator&           allocator,
         b.moeGateCompact = UsmHandle{allocator, gateBytes};
         b.moeUpCompact   = UsmHandle{allocator, gateBytes};
         b.moeDownCompact = UsmHandle{allocator, xBytes};
+
+        // M-MoE.Fused-Decode — routing scratches. `blockCount *
+        // expertUsedCount` slots so each layer owns its own K-tuple
+        // across the recorded command stream.
+        const std::size_t routeSlots =
+            config.blockCount * config.expertUsedCount;
+        const std::size_t idxBytes = routeSlots * sizeof(std::int32_t);
+        const std::size_t kwBytes  = routeSlots * sizeof(float);
+        b.moeExpIdxScratch = UsmHandle{allocator, idxBytes};
+        b.moeKwScratch     = UsmHandle{allocator, kwBytes};
     }
     return b;
 }

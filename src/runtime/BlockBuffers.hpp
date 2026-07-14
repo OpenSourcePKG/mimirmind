@@ -67,6 +67,15 @@ struct BlockBuffers {
     UsmHandle moeGateCompact; // [nRowsMax, ffPerExpert]
     UsmHandle moeUpCompact;   // [nRowsMax, ffPerExpert]
     UsmHandle moeDownCompact; // [nRowsMax, d_model]
+
+    // M-MoE.Fused-Decode — per-layer routing scratches for the fused-K
+    // down kernel. The command queue records dispatches lazily, so the
+    // caller cannot reuse a single K-sized scratch across layers (the
+    // next layer's write would corrupt the earlier layer's captured
+    // pointer). Stride is `expertUsedCount` per layer; total size is
+    // `blockCount * expertUsedCount`. Only allocated for MoE models.
+    UsmHandle moeExpIdxScratch;   // [blockCount, expertUsedCount] int32
+    UsmHandle moeKwScratch;       // [blockCount, expertUsedCount] fp32
 };
 
 /// Allocate a single BlockBuffers. `qDimMax`/`kvDimMax` come from the

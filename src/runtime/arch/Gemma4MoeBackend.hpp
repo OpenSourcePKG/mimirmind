@@ -25,7 +25,8 @@ public:
                      compute::GpuOps&               ops,
                      compute::GpuMatmul&            gmm,
                      runtime::OpProfiler&           opProfiler,
-                     bool                           moeGroupEnabled = true);
+                     bool                           moeGroupEnabled     = true,
+                     bool                           moeFusedDownEnabled = false);
 
     void runBlock(std::size_t   blockIdx,
                   float*        x,
@@ -39,6 +40,13 @@ private:
     /// expert-grouped batched dispatch path in runBlock(). Off falls back
     /// to per-token dispatch even during prefill.
     bool _moeGroupEnabled;
+
+    /// `features.moeFusedDown != Disable` at construction. Enables the
+    /// fused-K down-projection kernel for the T=1 decode path (M-MoE
+    /// prototype). Effective only when the kernel actually loaded on
+    /// this iGPU AND `ffn_down_exps.weight` is Q6_K; the backend
+    /// checks both at first use and falls back silently otherwise.
+    bool _moeFusedDownEnabled;
 };
 
 } // namespace mimirmind::runtime::arch

@@ -281,7 +281,8 @@ void InferenceEngine::finalizeLoad() {
     // gracefully with the original architecture string in the error.
     _backend = arch::createArchBackend(
         _config.architecture, _config, *_weights, _fusedQkv.get(),
-        _ops, _gmm, _opProfiler, _cfg.features.moeGroup);
+        _ops, _gmm, _opProfiler, _cfg.features.moeGroup,
+        _cfg.features.moeFusedDown != core::config::TriState::Disable);
 
     _modelLoaded = true;
     // Defensive: a previous model's KV state must not survive into the

@@ -13,7 +13,8 @@ createArchBackend(const std::string&             architecture,
                   compute::GpuOps&               ops,
                   compute::GpuMatmul&            gmm,
                   OpProfiler&                    opProfiler,
-                  bool                           moeGroupEnabled) {
+                  bool                           moeGroupEnabled,
+                  bool                           moeFusedDownEnabled) {
     if (architecture == "qwen2") {
         return std::make_unique<Qwen2Backend>(config, weights, fusedQkv,
                                               ops, gmm, opProfiler);
@@ -21,7 +22,8 @@ createArchBackend(const std::string&             architecture,
     if (architecture == "gemma4") {
         return std::make_unique<Gemma4Backend>(config, weights, fusedQkv,
                                                ops, gmm, opProfiler,
-                                               moeGroupEnabled);
+                                               moeGroupEnabled,
+                                               moeFusedDownEnabled);
     }
     return nullptr;
 }

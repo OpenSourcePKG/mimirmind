@@ -172,6 +172,39 @@ public:
     /// target iGPU; callers must fall back to the plain matvec path.
     [[nodiscard]] bool dp4aAvailable(core::gguf::GgmlType type) const noexcept;
 
+    /**
+     * M-MoE.Fused-Decode prototype — fused K-experts down projection for
+     * MoE T=1 decode. Collapses K sequential down-matmul + scaledAdd
+     * launches into one dispatch. Q6_K weight only (current MoE model
+     * `google_gemma-4-26B-A4B-it-Q6_K`). Read-modify-write on `accum`;
+     * caller pre-zeros before invoking.
+     *
+     *   accum[n] += sum_{k=0..kActive-1} kw[k] *
+     *                 sum_{l=0..ffPer-1} dequant_q6k(W[expIdx[k]], n, l)
+     *                                   * gateAct[k, l]
+     *
+     * `gateAct`, `expIdx`, `kw` must live in USM the caller has already
+     * populated (host-visible USM writes suffice on UMA-iGPU).
+     * `expertBytes` is the byte stride between consecutive experts in W
+     * (Q6_K: `dModel * (ffPer/256) * 210`).
+     *
+     * Async; call sync() before the CPU reads `accum`. Available only
+     * when the kernel loaded at ctor — query via `moeDownFusedKAvailable()`.
+     */
+    void moeDownFusedKAsync(const float*  gateAct,
+                            const void*   W,
+                            const std::int32_t* expIdx,
+                            const float*  kw,
+                            float*        accum,
+                            std::size_t   ffPer,
+                            std::size_t   dModel,
+                            std::size_t   kActive,
+                            std::size_t   expertBytes);
+
+    [[nodiscard]] bool moeDownFusedKAvailable() const noexcept {
+        return _moeDownFusedKQ6k.has_value();
+    }
+
     /// Flush any pending appends (close + execute + sync + reset). Safe
     /// to call when there's no pending work — cheap no-op.
     void sync();
@@ -295,6 +328,13 @@ private:
     std::size_t _dp4aScaleBytes{0};
     // One-shot warning latch — never log the fallback warning twice.
     mutable bool _dp4aScratchOverflowWarned{false};
+
+    // M-MoE.Fused-Decode prototype — dedicated fused-K down-projection
+    // kernel for the Q6_K MoE model (currently the only MoE Gemma 4
+    // variant). Optional because it may fail to load on non-Xe-LPG
+    // targets; callers fall back to the sequential per-expert path via
+    // `moeDownFusedKAvailable()`.
+    std::optional<KernelSlot> _moeDownFusedKQ6k;
 
     // M5h: workgroup of 64 threads = 4 subgroups of 16, each subgroup
     // co-computes ONE output via sub_group_reduce_add. So a workgroup

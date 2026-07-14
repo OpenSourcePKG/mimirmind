@@ -234,7 +234,7 @@ FeatureSettings parseFeatures(std::string_view      path,
                     "flashPrefillKTileQ8",
                     "fusedQkv", "moeGroup",
                     "gemm", "gemmV2", "gemmMinM", "dp4a",
-                    "q8_0Reorder"});
+                    "q8_0Reorder", "moeFusedDown"});
     FeatureSettings f{};
     if (const auto v = readOpt<bool>(path, "features", j, "clr");               v) f.clr               = *v;
     if (const auto v = readOpt<bool>(path, "features", j, "flashPrefill");      v) f.flashPrefill      = *v;
@@ -254,6 +254,8 @@ FeatureSettings parseFeatures(std::string_view      path,
     f.dp4a     = parseTriState(path, "features", j, "dp4a",  TriState::Disable);
     f.q8_0Reorder = parseTriState(path, "features", j, "q8_0Reorder",
                                   TriState::Disable);
+    f.moeFusedDown = parseTriState(path, "features", j, "moeFusedDown",
+                                   TriState::Disable);
     f.gemmMinM = readOpt<std::size_t>(path, "features", j, "gemmMinM");
     return f;
 }

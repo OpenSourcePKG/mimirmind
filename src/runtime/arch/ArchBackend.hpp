@@ -146,8 +146,10 @@ isSupportedArchitecture(std::string_view architecture) noexcept {
 }
 
 /// Build the backend matching `architecture` ("qwen2" / "gemma4"). Returns
-/// nullptr for unsupported architectures — callers must check. `moeGroupEnabled`
-/// maps to `features.moeGroup` in config.json — non-MoE architectures ignore it.
+/// nullptr for unsupported architectures — callers must check.
+/// `moeGroupEnabled` maps to `features.moeGroup`; `moeFusedDownEnabled`
+/// maps to `features.moeFusedDown != Disable`. Non-MoE architectures
+/// ignore both.
 std::unique_ptr<ArchBackend>
 createArchBackend(const std::string&             architecture,
                   const model::LlmConfig&        config,
@@ -156,6 +158,7 @@ createArchBackend(const std::string&             architecture,
                   compute::GpuOps&               ops,
                   compute::GpuMatmul&            gmm,
                   OpProfiler&                    opProfiler,
-                  bool                           moeGroupEnabled = true);
+                  bool                           moeGroupEnabled     = true,
+                  bool                           moeFusedDownEnabled = false);
 
 } // namespace mimirmind::runtime::arch

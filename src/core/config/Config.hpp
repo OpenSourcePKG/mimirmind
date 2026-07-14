@@ -93,6 +93,18 @@ struct FeatureSettings {
     // the weights weren't reordered). See kernels/matmul_q8_0_vec
     // _reorder.cl and Q8_0::reorderRow for the layout contract.
     TriState                   q8_0Reorder{TriState::Disable};
+    // M-MoE.Fused-Decode prototype. Routes the T=1 MoE decode path
+    // through the fused-K down-projection kernel
+    // (`moe_down_fused_k_q6k`) instead of the K sequential
+    // down-matmul + scaledAdd dispatches. Currently Q6_K-only —
+    // silently disabled for any expert weight type != Q6_K, or when
+    // the kernel didn't load. Disable-default until an A/B on
+    // L0_TARGET_HOST confirms a signal.
+    //   Disable — always sequential
+    //   Auto    — use fused when kernel loaded and weight is Q6_K
+    //   Force   — same as Auto today; a future gating condition can
+    //             differ (kept distinct for symmetry with q8_0Reorder).
+    TriState                   moeFusedDown{TriState::Disable};
 };
 
 struct SpeculativeSettings {

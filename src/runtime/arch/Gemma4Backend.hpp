@@ -47,7 +47,8 @@ public:
                   compute::GpuOps&               ops,
                   compute::GpuMatmul&            gmm,
                   runtime::OpProfiler&           opProfiler,
-                  bool                           moeGroupEnabled = true);
+                  bool                           moeGroupEnabled     = true,
+                  bool                           moeFusedDownEnabled = false);
 
     ~Gemma4Backend() override;
 

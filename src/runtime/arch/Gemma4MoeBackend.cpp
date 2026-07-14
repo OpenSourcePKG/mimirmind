@@ -32,20 +32,23 @@ Gemma4MoeBackend::Gemma4MoeBackend(const model::LlmConfig&        config,
                                    compute::GpuOps&               ops,
                                    compute::GpuMatmul&            gmm,
                                    runtime::OpProfiler&           opProfiler,
-                                   bool                           moeGroupEnabled)
+                                   bool                           moeGroupEnabled,
+                                   bool                           moeFusedDownEnabled)
     : GemmaBaseBackend{config, weights, fusedQkv, ops, gmm, opProfiler},
-      _moeGroupEnabled{moeGroupEnabled} {
+      _moeGroupEnabled{moeGroupEnabled},
+      _moeFusedDownEnabled{moeFusedDownEnabled} {
     MM_LOG_INFO("gemma4-moe",
                 "Gemma4MoeBackend ready — blocks={} d_model={} ff={} "
                 "experts={} top_k={} swa head_dim={} kv={}, "
-                "full head_dim={} kv={}",
+                "full head_dim={} kv={} moeGroup={} moeFusedDown={}",
                 _config.blockCount, _config.embeddingLength,
                 _config.feedForwardLength,
                 _config.expertCount, _config.expertUsedCount,
                 _config.keyLengthSwa,
                 _config.headCountKvFor(0),
                 _config.keyLength,
-                _layers.empty() ? 0 : _layers.front().nKvHeads);
+                _layers.empty() ? 0 : _layers.front().nKvHeads,
+                _moeGroupEnabled, _moeFusedDownEnabled);
 }
 
 void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
@@ -344,43 +347,113 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
                 d_model);
         }
     } else {
-        trace("path B: per-token expert dispatch");
-        for (std::size_t t = 0; t < T; ++t) {
-            float* const pathBInT  = normBuf      + t * d_model;
-            float* const accumT    = moeAccumBuf  + t * d_model;
+        // M-MoE.Fused-Decode — enable the fused-K down path when all
+        // preconditions line up: toggle on, kernel loaded on this iGPU,
+        // T == 1 (decode), expDown is Q6_K. Otherwise fall through to
+        // the sequential per-expert dispatch below.
+        const bool useMoeFusedDown =
+            _moeFusedDownEnabled &&
+            _gmm.moeDownFusedKAvailable() &&
+            T == 1 &&
+            expDown->type == core::gguf::GgmlType::Q6_K &&
+            s.moeExpIdxScratch.get() != nullptr &&
+            s.moeKwScratch.get()     != nullptr &&
+            s.moeGateCompact.get()   != nullptr;
+
+        if (useMoeFusedDown) {
+            trace("path B: per-token expert dispatch (fused-K down)");
+            float* const pathBIn = normBuf;         // T == 1
+            float* const accumT  = moeAccumBuf;
+            float* const gateActAll = s.moeGateCompact.as<float>();
+
+            // Per-expert gate_up + gelu_mul into strided slots — kept
+            // separate so the fused down kernel sees [K, ffPer].
             for (std::size_t k = 0; k < K; ++k) {
                 const std::size_t e =
-                    static_cast<std::size_t>(topKIdx[t * K + k]);
-                const float       routerWeight = topKWeight[t * K + k];
-
+                    static_cast<std::size_t>(topKIdx[k]);
                 const void* Wgu = expGateUpBase + e * expertBytesGateUp;
-                const void* Wd  = expDownBase   + e * expertBytesDown;
 
                 _gmm.matmulAsync(expGateUp->type, Wgu,
                                  gateUpFused, d_model,
-                                 pathBInT, 1,
+                                 pathBIn, 1,
                                  gateOutBuf, matmulScratch);
-
                 _ops.geluMulAsync(gateOutBuf, gateOutBuf + ffPerExpert,
                                   ffPerExpert);
+                // Copy the ffPerExpert activations into the K-strided
+                // slot the fused kernel expects. Kept on the queue for
+                // ordering vs the next iteration's gate_up.
+                _ops.queue().appendMemoryCopy(
+                    gateActAll + k * ffPerExpert,
+                    gateOutBuf,
+                    ffPerExpert * sizeof(float));
+            }
 
-                // M5i.F prep: async instead of sync. Auto-barrier after the
-                // append keeps ordering vs the following scaledAddResidual,
-                // and expertOutBuf isn't read by the CPU inside this loop.
-                // Removes T*K_top syncs per MoE block per prefill call.
-                _gmm.matmulAsync(expDown->type, Wd,
-                                 d_model, ffPerExpert,
-                                 gateOutBuf, 1,
-                                 expertOutBuf, matmulScratch);
+            // Populate this layer's routing scratch. Direct writes to
+            // host-visible USM — no memcpy path needed on UMA.
+            auto* const expIdxSlot =
+                s.moeExpIdxScratch.as<std::int32_t>() +
+                blockIdx * K;
+            auto* const kwSlot =
+                s.moeKwScratch.as<float>() +
+                blockIdx * K;
+            for (std::size_t k = 0; k < K; ++k) {
+                const std::size_t e =
+                    static_cast<std::size_t>(topKIdx[k]);
+                expIdxSlot[k] = static_cast<std::int32_t>(e);
+                kwSlot[k]     = topKWeight[k] * expDownScalePtr[e];
+            }
 
-                // M9.6.4: fused scale-and-accumulate. expertOutBuf is
-                // overwritten by the next iteration's down-projection so
-                // there's no downstream reader of the post-scale buffer —
-                // safe to do dst[i] += scale * src[i] in one kernel
-                // instead of two passes.
-                const float combined = routerWeight * expDownScalePtr[e];
-                _ops.scaledAddResidualAsync(accumT, expertOutBuf, combined,
-                                            d_model);
+            trace("path B: fused-K down dispatch");
+            _gmm.moeDownFusedKAsync(
+                gateActAll,
+                expDownBase,
+                expIdxSlot,
+                kwSlot,
+                accumT,
+                ffPerExpert,
+                d_model,
+                K,
+                expertBytesDown);
+        } else {
+            trace("path B: per-token expert dispatch");
+            for (std::size_t t = 0; t < T; ++t) {
+                float* const pathBInT  = normBuf      + t * d_model;
+                float* const accumT    = moeAccumBuf  + t * d_model;
+                for (std::size_t k = 0; k < K; ++k) {
+                    const std::size_t e =
+                        static_cast<std::size_t>(topKIdx[t * K + k]);
+                    const float       routerWeight = topKWeight[t * K + k];
+
+                    const void* Wgu = expGateUpBase + e * expertBytesGateUp;
+                    const void* Wd  = expDownBase   + e * expertBytesDown;
+
+                    _gmm.matmulAsync(expGateUp->type, Wgu,
+                                     gateUpFused, d_model,
+                                     pathBInT, 1,
+                                     gateOutBuf, matmulScratch);
+
+                    _ops.geluMulAsync(gateOutBuf, gateOutBuf + ffPerExpert,
+                                      ffPerExpert);
+
+                    // M5i.F prep: async instead of sync. Auto-barrier after
+                    // the append keeps ordering vs the following
+                    // scaledAddResidual, and expertOutBuf isn't read by the
+                    // CPU inside this loop. Removes T*K_top syncs per MoE
+                    // block per prefill call.
+                    _gmm.matmulAsync(expDown->type, Wd,
+                                     d_model, ffPerExpert,
+                                     gateOutBuf, 1,
+                                     expertOutBuf, matmulScratch);
+
+                    // M9.6.4: fused scale-and-accumulate. expertOutBuf is
+                    // overwritten by the next iteration's down-projection
+                    // so there's no downstream reader of the post-scale
+                    // buffer — safe to do dst[i] += scale * src[i] in one
+                    // kernel instead of two passes.
+                    const float combined = routerWeight * expDownScalePtr[e];
+                    _ops.scaledAddResidualAsync(accumT, expertOutBuf, combined,
+                                                d_model);
+                }
             }
         }
     }
