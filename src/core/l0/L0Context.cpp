@@ -83,11 +83,49 @@ DeviceInfo describeDevice(ze_device_handle_t dev) {
         }
     }
 
+    // Integrated flag — used by UsmAllocator's auto-detect for the
+    // Host-vs-Shared USM pick, and by the neutral GpuBackend interface
+    // to fill DeviceKind::GpuIntegrated / GpuDiscrete.
+    info.isIntegrated =
+        (props.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED) != 0;
+
     // NOTE: props.maxMemAllocSize is the loader's declared per-allocation
     // cap. The real, observed cap may differ — M2 will probe it
     // empirically and store the result on the allocator.
 
     return info;
+}
+
+::mimirmind::core::gpu::BackendDeviceInfo
+toNeutralInfo(const DeviceInfo& src) {
+    namespace gpu = ::mimirmind::core::gpu;
+    gpu::BackendDeviceInfo out{};
+    out.name            = src.name;
+    out.uuid            = src.uuid;
+    out.vendorId        = src.vendorId;
+    out.deviceId        = src.deviceId;
+    out.numComputeUnits = src.numComputeUnits;
+    out.totalLocalMem   = src.totalLocalMem;
+    out.maxMemAllocSize = src.maxMemAllocSize;
+    out.coreClockRate   = src.coreClockRate;
+
+    switch (src.type) {
+        case ZE_DEVICE_TYPE_GPU:
+            out.kind = src.isIntegrated
+                          ? gpu::DeviceKind::GpuIntegrated
+                          : gpu::DeviceKind::GpuDiscrete;
+            break;
+        case ZE_DEVICE_TYPE_VPU:
+            out.kind = gpu::DeviceKind::Npu;
+            break;
+        case ZE_DEVICE_TYPE_CPU:
+            out.kind = gpu::DeviceKind::Cpu;
+            break;
+        default:
+            out.kind = gpu::DeviceKind::Unknown;
+            break;
+    }
+    return out;
 }
 
 } // namespace
@@ -114,12 +152,49 @@ L0Context::L0Context(std::string spvDirOverride)
     _probeDriverExtensions();
     _createContext();
 
+    // Populate the backend-neutral snapshot for `deviceInfo()`. Kept in
+    // sync with _info here so future `hasFeature()` probes stay a pure
+    // lookup, no re-derivation per call.
+    _neutralInfo = toNeutralInfo(_info);
+
     MM_LOG_INFO("l0",
                 "L0Context ready — driver={} device={} ctx={} target='{}'",
                 static_cast<const void*>(_driver),
                 static_cast<const void*>(_device),
                 static_cast<const void*>(_context),
                 _info.name);
+}
+
+bool L0Context::hasFeature(
+        ::mimirmind::core::gpu::BackendFeature f) const noexcept {
+    namespace gpu = ::mimirmind::core::gpu;
+    switch (f) {
+        case gpu::BackendFeature::MutableCommandLists:
+            return _hasMutableCmdLists;
+        case gpu::BackendFeature::IpcHandleExport:
+            // Meteor Lake exposes IPC via zeMemAllocHost only — that's
+            // the Munin-precondition documented in
+            // [[L0-IPC funktioniert auf Meteor Lake nur mit zeMemAllocHost]].
+            // On iGPU we always have the fast path; on hypothetical dGPU
+            // targets this may need explicit probing (deferred until
+            // dGPU is a real target).
+            return true;
+        case gpu::BackendFeature::UnifiedMemoryHost:
+            // UMA on iGPU means host-visible allocations are directly
+            // device-readable without copy. dGPU would require an
+            // explicit copy path — no dGPU target today, so tie the
+            // flag to isIntegrated as the honest signal.
+            return _info.isIntegrated;
+        case gpu::BackendFeature::IntegerDotProduct:
+            // Requires cl_khr_integer_dot_product on the device — the
+            // check today lives on GpuMatmul's per-kernel DP4A load
+            // (success/fail cached there). For the neutral surface we
+            // return false until an explicit device probe is added;
+            // consumers that care today already use the DP4A-slot
+            // presence, not this flag.
+            return false;
+    }
+    return false;
 }
 
 L0Context::~L0Context() {

@@ -74,25 +74,21 @@ UsmAllocKind selectUsmAllocKind(L0Context&   ctx,
                     "(accepted: \"shared\", \"host\")",
                     env);
     }
-    ze_device_properties_t props{};
-    props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
-    const ze_result_t r = zeDeviceGetProperties(ctx.device(), &props);
-    if (r == ZE_RESULT_SUCCESS) {
-        if ((props.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED) != 0) {
-            MM_LOG_INFO("usm",
-                        "integrated iGPU detected — picking host "
-                        "(IPC-safe on Meteor Lake, perf-neutral to shared on UMA)");
-            return UsmAllocKind::Host;
-        }
+    // ctx.info().isIntegrated was already probed at L0Context ctor time
+    // via ZE_DEVICE_PROPERTY_FLAG_INTEGRATED — no need to re-query the
+    // device properties here. Equivalent to
+    // `ctx.hasFeature(BackendFeature::UnifiedMemoryHost)` but expressed
+    // via the L0-native accessor since we're inside the L0 backend.
+    if (ctx.info().isIntegrated) {
         MM_LOG_INFO("usm",
-                    "discrete GPU detected — picking shared "
-                    "(placement hint drives VRAM/system-RAM migration)");
-        return UsmAllocKind::Shared;
+                    "integrated iGPU detected — picking host "
+                    "(IPC-safe on Meteor Lake, perf-neutral to shared on UMA)");
+        return UsmAllocKind::Host;
     }
-    MM_LOG_WARN("usm",
-                "zeDeviceGetProperties failed (0x{:x}) — falling back to {}",
-                static_cast<unsigned>(r), toString(fallback));
-    return fallback;
+    MM_LOG_INFO("usm",
+                "discrete GPU detected — picking shared "
+                "(placement hint drives VRAM/system-RAM migration)");
+    return UsmAllocKind::Shared;
 }
 
 std::string_view toString(UsmAllocKind k) noexcept {

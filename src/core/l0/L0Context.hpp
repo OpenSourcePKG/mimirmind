@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "core/gpu/GpuBackend.hpp"
+
 #include <level_zero/ze_api.h>
 
 #include <cstddef>
@@ -13,6 +15,13 @@
 
 namespace mimirmind::core::l0 {
 
+/**
+ * Level-Zero-native device snapshot. Superset of
+ * `gpu::BackendDeviceInfo` — carries L0-typed fields
+ * (`ze_device_type_t`, sub-device counts, max-hardware-contexts) that
+ * only the L0 backend cares about. Consumers that only need the
+ * portable subset should use `GpuBackend::deviceInfo()`.
+ */
 struct DeviceInfo {
     std::string  name;
     std::string  uuid;
@@ -25,6 +34,7 @@ struct DeviceInfo {
     std::size_t  maxMemAllocSize{0};
     std::uint32_t maxHardwareContexts{0};
     std::uint32_t coreClockRate{0};
+    bool         isIntegrated{false};
 };
 
 class L0Error : public std::runtime_error {
@@ -41,19 +51,29 @@ private:
  * available GPU device. Multi-driver / multi-GPU support is deliberately
  * out of scope for M1 — Meteor Lake exposes a single iGPU and that is what
  * Mimirmind targets first.
+ *
+ * Implements `core::gpu::GpuBackend` — the backend-neutral interface.
+ * Consumers that only need device-info + feature-flags should take
+ * `GpuBackend&`; consumers that touch raw L0 handles (CommandQueue,
+ * GpuModule, UsmAllocator, GpuOps, GpuMatmul) stay on `L0Context&`
+ * because those classes ARE the L0 backend. See
+ * [[Mimirmind — HW-Abstraktions-Strategie für Multi-Backend-Support]]
+ * for the Schicht-1..6 plan.
  */
-class L0Context {
+class L0Context : public ::mimirmind::core::gpu::GpuBackend {
 public:
     /// `spvDirOverride`, if non-empty, is where GpuModule looks for `.spv`
     /// files before falling back to the install / build-tree defaults. Comes
     /// from `runtime.spvDir` in config.json.
     explicit L0Context(std::string spvDirOverride = {});
-    ~L0Context();
+    ~L0Context() override;
 
     L0Context(const L0Context&)            = delete;
     L0Context& operator=(const L0Context&) = delete;
     L0Context(L0Context&&)                 = delete;
     L0Context& operator=(L0Context&&)      = delete;
+
+    // ---- L0-native accessors (backend-specific consumers only) ---------
 
     [[nodiscard]] ze_driver_handle_t  driver()    const noexcept { return _driver; }
     [[nodiscard]] ze_device_handle_t  device()    const noexcept { return _device; }
@@ -66,9 +86,24 @@ public:
 
     /// True when the driver advertises `ZE_experimental_mutable_command_list`.
     /// Preflight signal for the Command-List-Replay milestone (M-CLR).
+    /// Equivalent to `hasFeature(BackendFeature::MutableCommandLists)`;
+    /// kept as a named accessor for readability at existing callsites.
     [[nodiscard]] bool hasMutableCommandLists() const noexcept {
         return _hasMutableCmdLists;
     }
+
+    // ---- GpuBackend interface (backend-agnostic consumers) -------------
+
+    [[nodiscard]] ::mimirmind::core::gpu::BackendKind
+        kind() const noexcept override {
+        return ::mimirmind::core::gpu::BackendKind::LevelZero;
+    }
+
+    [[nodiscard]] const ::mimirmind::core::gpu::BackendDeviceInfo&
+        deviceInfo() const noexcept override { return _neutralInfo; }
+
+    [[nodiscard]] bool hasFeature(
+        ::mimirmind::core::gpu::BackendFeature f) const noexcept override;
 
     [[nodiscard]] static std::string typeToString(ze_device_type_t t);
     [[nodiscard]] static std::string resultToString(ze_result_t r);
@@ -84,6 +119,11 @@ private:
 
     DeviceInfo              _info{};
     std::vector<DeviceInfo> _allDevices{};
+
+    // Backend-neutral view populated at ctor time from _info. Kept as a
+    // member (rather than derived on-demand) so `deviceInfo()` returning
+    // a const reference is safe without lifetime shenanigans.
+    ::mimirmind::core::gpu::BackendDeviceInfo _neutralInfo{};
 
     std::string _spvDirOverride{};
     bool        _hasMutableCmdLists{false};
