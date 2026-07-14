@@ -1,9 +1,30 @@
 cmake_minimum_required(VERSION 3.21)
 project(mimirmind
     VERSION 0.0.1
-    DESCRIPTION "Standalone C++ inference engine for GGUF on Intel iGPU via Level Zero"
+    DESCRIPTION "Standalone C++ inference engine for GGUF, multi-backend"
     LANGUAGES CXX
 )
+
+# ---- Backend selection ------------------------------------------------------
+#
+# Each GPU backend is opt-in at configure time. Default is Level Zero ON
+# because Meteor Lake iGPU is today's production target; HIP defaults OFF
+# because the implementation lives on an isolated branch (see the
+# HW-Abstraktions-Strategie note, revision 2026-07-14). Configure with
+#   -DMIMIRMIND_ENABLE_L0=OFF   to skip the entire Level Zero build
+#                               (mimirmind binary, munin, spv_kernels,
+#                                gpu_tests, prefill_bench, l0_ipc_testrig
+#                                are omitted). Useful on hosts without
+#                                Intel HW / ocloc / IGC libs.
+#   -DMIMIRMIND_ENABLE_HIP=ON   placeholder — no HIP backend impl yet,
+#                               the option exists so callers can opt in
+#                               once the isolated branch merges. Toggling
+#                               ON without HIP sources present is a no-op
+#                               plus a status message.
+# With both OFF, only the pure-CPU test binaries build. A configure will
+# succeed but produce nothing that can run a model.
+option(MIMIRMIND_ENABLE_L0  "Build the Level Zero backend and all L0-tied consumers" ON)
+option(MIMIRMIND_ENABLE_HIP "Build the HIP backend (placeholder — no impl on main yet)" OFF)
 
 # C++23 required — std::expected in src/core/ipc/ for the M-Munin
 # error-return convention (see decisions/2026-07-13-m-munin-scope.md).
@@ -37,49 +58,62 @@ add_compile_options(
     -Wformat=2
 )
 
-# ---- Level Zero loader ------------------------------------------------------
+# ---- Level Zero loader + SPIR-V toolchain -----------------------------------
+#
+# Both blocks only run when the L0 backend is enabled. FATAL_ERROR remains
+# fatal in that case — an explicit opt-in must find its dependencies. With
+# MIMIRMIND_ENABLE_L0=OFF nothing here executes, no L0 headers or ocloc
+# need to be installed on the host.
 
-find_path(LEVEL_ZERO_INCLUDE_DIR ze_api.h
-    PATHS /usr/include /usr/local/include
-    PATH_SUFFIXES level_zero
-    DOC "Path to <level_zero/ze_api.h>"
-)
-
-find_library(LEVEL_ZERO_LIBRARY
-    NAMES ze_loader
-    PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib
-    DOC "Path to libze_loader.so"
-)
-
-if(NOT LEVEL_ZERO_INCLUDE_DIR OR NOT LEVEL_ZERO_LIBRARY)
-    message(FATAL_ERROR
-        "\n  Level Zero loader not found.\n"
-        "  On Debian/Ubuntu, install with:\n"
-        "    sudo apt install level-zero level-zero-dev\n"
-        "  For recent versions, use Intel's APT repo:\n"
-        "    https://dgpu-docs.intel.com/driver/client/overview.html\n"
-        "  Looked for headers in /usr/include/level_zero and library ze_loader in standard paths.\n"
+if(MIMIRMIND_ENABLE_L0)
+    find_path(LEVEL_ZERO_INCLUDE_DIR ze_api.h
+        PATHS /usr/include /usr/local/include
+        PATH_SUFFIXES level_zero
+        DOC "Path to <level_zero/ze_api.h>"
     )
+
+    find_library(LEVEL_ZERO_LIBRARY
+        NAMES ze_loader
+        PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib
+        DOC "Path to libze_loader.so"
+    )
+
+    if(NOT LEVEL_ZERO_INCLUDE_DIR OR NOT LEVEL_ZERO_LIBRARY)
+        message(FATAL_ERROR
+            "\n  Level Zero loader not found (MIMIRMIND_ENABLE_L0=ON requested it).\n"
+            "  On Debian/Ubuntu, install with:\n"
+            "    sudo apt install level-zero level-zero-dev\n"
+            "  For recent versions, use Intel's APT repo:\n"
+            "    https://dgpu-docs.intel.com/driver/client/overview.html\n"
+            "  Or build the loader from source (github.com/oneapi-src/level-zero) into /usr/local.\n"
+            "  Configure with -DMIMIRMIND_ENABLE_L0=OFF to skip the Level Zero build entirely.\n"
+        )
+    endif()
+
+    message(STATUS "Level Zero headers: ${LEVEL_ZERO_INCLUDE_DIR}")
+    message(STATUS "Level Zero library: ${LEVEL_ZERO_LIBRARY}")
+
+    find_program(OCLOC_EXECUTABLE
+        NAMES ocloc
+        DOC "Intel OpenCL Offline Compiler — compiles .cl to .spv")
+
+    if(NOT OCLOC_EXECUTABLE)
+        message(FATAL_ERROR
+            "\n  ocloc not found (MIMIRMIND_ENABLE_L0=ON requires it for SPV kernel build).\n"
+            "  On Debian/Ubuntu via Intel repo: apt install intel-ocloc libigc2 libigdfcl2\n"
+            "  (or the Intel client driver bundle from\n"
+            "   https://dgpu-docs.intel.com/driver/client/overview.html)\n"
+            "  Configure with -DMIMIRMIND_ENABLE_L0=OFF to skip.\n")
+    endif()
+
+    message(STATUS "ocloc: ${OCLOC_EXECUTABLE}")
 endif()
 
-message(STATUS "Level Zero headers: ${LEVEL_ZERO_INCLUDE_DIR}")
-message(STATUS "Level Zero library: ${LEVEL_ZERO_LIBRARY}")
-
-# ---- SPIR-V kernel compilation (ocloc) --------------------------------------
-
-find_program(OCLOC_EXECUTABLE
-    NAMES ocloc
-    DOC "Intel OpenCL Offline Compiler — compiles .cl to .spv")
-
-if(NOT OCLOC_EXECUTABLE)
-    message(FATAL_ERROR
-        "\n  ocloc not found.\n"
-        "  On Debian/Ubuntu via Intel repo: apt install intel-ocloc\n"
-        "  (or the Intel client driver bundle from\n"
-        "   https://dgpu-docs.intel.com/driver/client/overview.html)\n")
+if(MIMIRMIND_ENABLE_HIP)
+    message(STATUS "MIMIRMIND_ENABLE_HIP=ON, but no HIP backend impl on main yet — no-op.")
 endif()
 
-message(STATUS "ocloc: ${OCLOC_EXECUTABLE}")
+if(MIMIRMIND_ENABLE_L0)
 
 set(KERNEL_SOURCES
     kernels/rmsnorm.cl
@@ -191,57 +225,88 @@ list(APPEND KERNEL_SPV_FILES ${GQA_KTILE64_SPV})
 
 add_custom_target(spv_kernels ALL DEPENDS ${KERNEL_SPV_FILES})
 
+endif() # MIMIRMIND_ENABLE_L0 (SPV kernel block)
+
 # cpp-httplib pulls in <thread> and <pthread> for its server loop; also
-# used by mimirmind_core::Log for its background file sink.
+# used by mimirmind_core_common::Log for its background file sink.
 find_package(Threads REQUIRED)
 
-# ---- mimirmind_core — shared static library --------------------------------
+# ---- mimirmind_core_common — pure-CPU foundation library --------------------
 #
-# Foundation code shared between mimirmind (the inference engine) and future
-# munin (persistent model-memory daemon, see M-Munin ADR). Contains only the
-# pieces both binaries must touch: Level-Zero context, USM allocation, GGUF
-# parsing, config loading, logging. No compute kernels, no HTTP, no
-# inference logic.
+# The pieces that never touch Level Zero: config parsing, GGUF loading,
+# logging, on-wire IPC serde (framing, TensorManifest, WireOps), MuninClient
+# (pure serde against the wire), MappedFile (mmap wrapper), governor-lock
+# helpers. Buildable on any host, no GPU SDK required. Pure-CPU unit tests
+# link only this library.
 
-add_library(mimirmind_core STATIC
+add_library(mimirmind_core_common STATIC
     src/core/config/Config.cpp
-    src/core/gguf/GgufReader.cpp
     src/core/gguf/GgufTypes.cpp
     src/core/gguf/TensorFingerprint.cpp
     src/core/gguf/WeightsMap.cpp
-    src/core/ipc/IpcExporter.cpp
-    src/core/ipc/IpcImporter.cpp
-    src/core/ipc/MuninClient.cpp
     src/core/ipc/TensorManifest.cpp
     src/core/ipc/UnixSocketFrame.cpp
     src/core/ipc/WireOps.cpp
-    src/core/l0/L0Context.cpp
     src/core/l0/MappedFile.cpp
-    src/core/l0/UsmAllocator.cpp
     src/core/log/Log.cpp
     src/core/os/GovernorLock.cpp
-    src/munin/ChunkAllocator.cpp
 )
 
-# PUBLIC so consumers get the transitive header include paths (ze_api.h
-# through L0Context.hpp, nlohmann/json through Config.hpp).
-target_include_directories(mimirmind_core PUBLIC
-    src
-    ${LEVEL_ZERO_INCLUDE_DIR}
-)
+target_include_directories(mimirmind_core_common PUBLIC src)
 
 # Vendored nlohmann/json (Config). SYSTEM so upstream code does not trip
-# our strict warning flags in consumers of mimirmind_core.
-target_include_directories(mimirmind_core SYSTEM PUBLIC
+# our strict warning flags in consumers.
+target_include_directories(mimirmind_core_common SYSTEM PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
-target_link_libraries(mimirmind_core PUBLIC
-    ${LEVEL_ZERO_LIBRARY}
+target_link_libraries(mimirmind_core_common PUBLIC
     Threads::Threads
 )
 
-# ---- Targets ----------------------------------------------------------------
+# ---- mimirmind_core_l0 — Level Zero-tied foundation ------------------------
+#
+# Everything that touches Level Zero handles directly: L0Context, USM
+# allocation, IPC handle export/import, MuninClient's L0 wrapper surface
+# (transitively — the header includes L0Context.hpp), ChunkAllocator (same).
+# Links against libze_loader and PUBLIC-links mimirmind_core_common so
+# consumers only need one target to depend on.
+#
+# Only built when MIMIRMIND_ENABLE_L0=ON.
+
+if(MIMIRMIND_ENABLE_L0)
+    add_library(mimirmind_core_l0 STATIC
+        src/core/l0/L0Context.cpp
+        src/core/l0/UsmAllocator.cpp
+        src/core/ipc/IpcExporter.cpp
+        src/core/ipc/IpcImporter.cpp
+        src/core/ipc/MuninClient.cpp
+        src/core/gguf/GgufReader.cpp
+        src/munin/ChunkAllocator.cpp
+    )
+
+    target_include_directories(mimirmind_core_l0 PUBLIC
+        ${LEVEL_ZERO_INCLUDE_DIR}
+    )
+
+    target_link_libraries(mimirmind_core_l0 PUBLIC
+        mimirmind_core_common
+        ${LEVEL_ZERO_LIBRARY}
+    )
+
+    # Legacy alias so existing target_link_libraries(... mimirmind_core)
+    # calls below keep working during the transition. Once every
+    # executable is migrated to explicit _common / _l0, this alias can
+    # be removed.
+    add_library(mimirmind_core ALIAS mimirmind_core_l0)
+endif()
+
+# ---- L0-backed targets: mimirmind binary, munin daemon, GPU tests ---------
+#
+# All of these consume L0Context / GpuOps / GpuMatmul / CommandQueue directly
+# and cannot link without libze_loader. Gated on MIMIRMIND_ENABLE_L0.
+
+if(MIMIRMIND_ENABLE_L0)
 
 add_executable(mimirmind
     src/mimirmind/main.cpp
@@ -344,6 +409,14 @@ add_executable(munin
 
 target_link_libraries(munin PRIVATE mimirmind_core)
 
+endif() # MIMIRMIND_ENABLE_L0 (mimirmind + munin executables)
+
+# ---- Pure-CPU test binaries — always built ---------------------------------
+#
+# These need no L0, so they build on any host (Ryzen/Apple/ARM). They link
+# only mimirmind_core_common. On hosts without L0 they are the only smoke
+# signal that the build+toolchain is healthy.
+
 # ---- quant_tests — pure-CPU unit tests for compute::QuantType ---------------
 #
 # Standalone test binary. No Level Zero, no SPV kernels — exercises the
@@ -368,7 +441,7 @@ add_executable(quant_tests
 
 target_include_directories(quant_tests PRIVATE tests)
 
-target_link_libraries(quant_tests PRIVATE mimirmind_core)
+target_link_libraries(quant_tests PRIVATE mimirmind_core_common)
 
 # ---- arch_tests — pure-CPU tests for arch-related logic ---------------------
 #
@@ -397,7 +470,7 @@ add_executable(arch_tests
 
 target_include_directories(arch_tests PRIVATE tests)
 
-target_link_libraries(arch_tests PRIVATE mimirmind_core)
+target_link_libraries(arch_tests PRIVATE mimirmind_core_common)
 
 # ---- ipc_tests — pure-CPU tests for src/core/ipc primitives ---------------
 #
@@ -417,24 +490,26 @@ add_executable(ipc_tests
 
 target_include_directories(ipc_tests PRIVATE tests)
 
-target_link_libraries(ipc_tests PRIVATE mimirmind_core)
+target_link_libraries(ipc_tests PRIVATE mimirmind_core_common)
 
-# ---- munin_tests — pure-CPU tests for Munin's wire-op layer ----------------
+# ---- munin_tests — Munin wire-op layer + ChunkAllocator layout math --------
 #
-# Covers RequestEnvelope, HealthzResponse, and the error-envelope helpers.
-# The socket integration (AttachSession + SocketServer) needs a live L0
-# device + peer worker; that lives in the docker-based smoke tests that
-# ship with Schritt 8, not here.
+# Covers RequestEnvelope, HealthzResponse, error-envelope helpers, and
+# ChunkAllocator::layoutInsideChunk (arithmetic-only path, but the class
+# lives in mimirmind_core_l0 because its .hpp includes L0Context). Gated
+# on MIMIRMIND_ENABLE_L0 for that reason; the socket integration
+# (AttachSession + SocketServer) still needs a live L0 device + peer
+# worker and lives in the docker-based smoke tests from Schritt 8.
 #
 # Run via:   cmake --build build --target munin_tests && build/munin_tests
 
-add_executable(munin_tests
-    tests/munin_tests.cpp
-)
-
-target_include_directories(munin_tests PRIVATE tests)
-
-target_link_libraries(munin_tests PRIVATE mimirmind_core)
+if(MIMIRMIND_ENABLE_L0)
+    add_executable(munin_tests
+        tests/munin_tests.cpp
+    )
+    target_include_directories(munin_tests PRIVATE tests)
+    target_link_libraries(munin_tests PRIVATE mimirmind_core_l0)
+endif()
 
 # ---- compute_tests — pure-CPU tests for CPU compute primitives -------------
 #
@@ -463,7 +538,14 @@ add_executable(compute_tests
 
 target_include_directories(compute_tests PRIVATE tests)
 
-target_link_libraries(compute_tests PRIVATE mimirmind_core)
+target_link_libraries(compute_tests PRIVATE mimirmind_core_common)
+
+# ---- L0-backed integration binaries ----------------------------------------
+#
+# gpu_tests / prefill_bench / l0_ipc_testrig all need libze_loader plus the
+# compiled SPV kernels. Gated on MIMIRMIND_ENABLE_L0.
+
+if(MIMIRMIND_ENABLE_L0)
 
 # ---- gpu_tests — verify GPU kernels match CPU reference math ---------------
 #
@@ -584,3 +666,5 @@ target_include_directories(l0_ipc_testrig PRIVATE
 target_link_libraries(l0_ipc_testrig PRIVATE
     ${LEVEL_ZERO_LIBRARY}
 )
+
+endif() # MIMIRMIND_ENABLE_L0 (gpu_tests + prefill_bench + l0_ipc_testrig)
