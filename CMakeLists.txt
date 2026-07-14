@@ -263,6 +263,7 @@ find_package(Threads REQUIRED)
 # link only this library.
 
 add_library(mimirmind_core_common STATIC
+    src/core/backend/BackendRegistry.cpp
     src/core/config/Config.cpp
     src/core/gguf/GgufTypes.cpp
     src/core/gguf/TensorFingerprint.cpp
@@ -286,6 +287,20 @@ target_include_directories(mimirmind_core_common SYSTEM PUBLIC
 target_link_libraries(mimirmind_core_common PUBLIC
     Threads::Threads
 )
+
+# BackendRegistry::probeAll() forward-declares
+# `mimirmind::core::l0::probeBackend()` and
+# `mimirmind::core::hip::probeBackend()` behind these defines. Their
+# implementations live in mimirmind_core_l0 / mimirmind_core_hip
+# respectively — pure-preprocessor gating here, no header or link
+# dep on the backend libs. PUBLIC so binaries that include
+# BackendRegistry.hpp see the same picture as _common.cpp does.
+if(MIMIRMIND_ENABLE_L0)
+    target_compile_definitions(mimirmind_core_common PUBLIC MIMIRMIND_HAVE_L0=1)
+endif()
+if(MIMIRMIND_ENABLE_HIP)
+    target_compile_definitions(mimirmind_core_common PUBLIC MIMIRMIND_HAVE_HIP=1)
+endif()
 
 # ---- mimirmind_core_l0 — Level Zero-tied foundation ------------------------
 #
@@ -734,4 +749,29 @@ if(MIMIRMIND_ENABLE_HIP)
     target_link_libraries(hip_probe PRIVATE
         mimirmind_core_hip
     )
+endif()
+
+# ---- backend_probe — neutral backend enumeration diagnostic ---------------
+#
+# Prints one line per BackendKind mimirmind knows about, whether it was
+# compiled in, whether a device is visible at runtime, and a short detail
+# string. Always built (needs no backend sources beyond the common
+# BackendRegistry itself) — but only sees `available=yes` for backends
+# that were also compiled in. When both L0 and HIP are on it links to
+# both concrete backend libs so their `probeBackend()` symbols resolve.
+
+add_executable(backend_probe
+    tools/backend-probe.cpp
+)
+
+target_link_libraries(backend_probe PRIVATE
+    mimirmind_core_common
+)
+
+if(TARGET mimirmind_core_l0)
+    target_link_libraries(backend_probe PRIVATE mimirmind_core_l0)
+endif()
+
+if(TARGET mimirmind_core_hip)
+    target_link_libraries(backend_probe PRIVATE mimirmind_core_hip)
 endif()

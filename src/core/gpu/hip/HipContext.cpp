@@ -3,6 +3,7 @@
 
 #include "core/gpu/hip/HipContext.hpp"
 
+#include "core/backend/BackendRegistry.hpp"
 #include "core/log/Log.hpp"
 
 #include <hip/hip_runtime.h>
@@ -184,6 +185,44 @@ bool HipContext::hasFeature(::mimirmind::core::backend::BackendFeature f) const 
         return archIsRdna3OrNewer(arch) || archIsCdna(arch);
     }
     return false;
+}
+
+// ---- backend-registry probe -----------------------------------------------
+//
+// Free function called from BackendRegistry::probeAll() in
+// mimirmind_core_common. Lightweight — does NOT construct HipContext,
+// only counts visible HIP devices via hipGetDeviceCount. Never throws
+// (the registry API is noexcept). Kept as a namespace-scoped free
+// function so BackendRegistry.cpp can forward-declare it without
+// pulling <hip/hip_runtime.h> into the pure-CPU common library.
+
+::mimirmind::core::backend::BackendProbe probeBackend() noexcept {
+    using ::mimirmind::core::backend::BackendKind;
+    using ::mimirmind::core::backend::BackendProbe;
+
+    BackendProbe p{ BackendKind::Hip, /*compiledIn=*/true, /*available=*/false, {} };
+
+    int count = 0;
+    hipError_t rc = hipGetDeviceCount(&count);
+    if (rc != hipSuccess) {
+        p.detail = std::string("hipGetDeviceCount failed: ") + hipGetErrorString(rc);
+        return p;
+    }
+    if (count <= 0) {
+        p.detail = "no HIP devices visible";
+        return p;
+    }
+
+    // Grab the name of device 0 for the human-readable one-liner. Skip if
+    // it fails — the count is the important signal.
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, 0) == hipSuccess) {
+        p.detail = std::to_string(count) + " device(s), first: " + prop.name;
+    } else {
+        p.detail = std::to_string(count) + " device(s)";
+    }
+    p.available = true;
+    return p;
 }
 
 } // namespace mimirmind::core::hip
