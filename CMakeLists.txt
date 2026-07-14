@@ -398,6 +398,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/rmsnorm.hip
         kernels_hip/rope_inplace.hip
+        kernels_hip/silu_mul.hip
     )
 
     set(HSACO_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/hsaco)
@@ -906,6 +907,24 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_rope_probe hip_kernels)
 
     target_link_libraries(hip_rope_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_silu_mul_probe — SwiGLU fused step parity check ----------
+    #
+    # Trivial element-wise kernel (one thread per element, no LDS, no
+    # reduction), but it's the FFN backbone in Llama / Qwen / Gemma —
+    # every layer runs it. Uses the combined-tolerance pattern from
+    # rope_probe (|diff| <= abs_tol + rel_tol * |ref|) since silu
+    # passes through zero for negative inputs.
+
+    add_executable(hip_silu_mul_probe
+        tools/hip-silu-mul-probe.cpp
+    )
+
+    add_dependencies(hip_silu_mul_probe hip_kernels)
+
+    target_link_libraries(hip_silu_mul_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
