@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // FlashAttention partial-tile kernel — decode mode (T_q == 1).
 //
 // Each workgroup processes ONE K-tile of ONE head: produces a partial

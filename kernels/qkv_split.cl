@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Scatter a fused QKV matmul output into separate Q / K / V buffers.
 //
 // Fused output layout, row-major: [M, Nq + Nkv * (1 + hasV)]

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // In-place broadcast bias add:
 //   y[m, k] += bias[k]   for m in [0, M), k in [0, K)
 //

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // FP16-KV variant of attention.cl. K and V are stored as fp16 in USM
 // (halved bandwidth + halved footprint), Q and OUT stay fp32. Loads
 // promote fp16 → fp32 in registers via vload_half; all reductions and

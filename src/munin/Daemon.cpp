@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 #include "munin/Daemon.hpp"
 
 #include "core/config/Config.hpp"

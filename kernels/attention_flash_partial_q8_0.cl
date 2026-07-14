@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Q8_0-KV variant of attention_flash_partial.cl. Decode-mode
 // FlashAttention pass 1 (T_q == 1), reading K/V as Q8_0 blocks (32
 // elements per block: fp16 scale + 32 int8 quants = 34 B). Loads

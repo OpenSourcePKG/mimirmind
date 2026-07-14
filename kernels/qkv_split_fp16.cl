@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // FP16-KV variant of qkv_split.cl. Fused matmul output is fp32; Q goes
 // to an fp32 workspace (`Yq`) unchanged, K and V go to the fp16 KV
 // cache via vstore_half.

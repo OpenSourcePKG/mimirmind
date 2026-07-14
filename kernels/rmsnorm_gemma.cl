@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Gemma-style RMSNorm: y = x * (1 + weight) * invRms
 //
 // The Gemma family of models initialises norm weights at 0 and uses

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Rotary positional embedding (RoPE), in-place. llama.cpp "non-interleaved"
 // (split) layout used by Llama / Qwen / Gemma family models.
 //

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // R1 — GQA-Head-Packed variant of attention_prefill_flash_q8_0.cl.
 //
 // Colfax-style query-head packing: instead of one workgroup per

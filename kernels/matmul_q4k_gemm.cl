@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Batched matrix-matrix multiply with Q4_K weights, on-the-fly dequant.
 // M-way generalisation of matmul_q4k_vec: processes M_TILE token rows
 // per workgroup so a single W dequant amortises across M_TILE mads.

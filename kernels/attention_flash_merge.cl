@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // FlashAttention merge kernel — combine per-tile partials into the
 // final attention output for decode mode (T_q == 1).
 //

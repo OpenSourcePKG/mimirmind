@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 #include "compute/QuantTypeRegistry.hpp"
 
 #include "compute/quant/Bfloat16.hpp"

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // FP16-KV variant of attention_prefill_flash.cl. Single-workgroup
 // streaming FlashAttention for T_q > 1 (M5i.J), reading K/V as fp16
 // instead of fp32. Loads promote to fp32 in registers via vload_half,

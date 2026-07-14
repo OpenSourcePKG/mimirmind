@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // FlashAttention prefill kernel — single-workgroup streaming online-softmax
 // per Dao et al. 2022 (original formulation, not the 2-kernel partial/merge
 // variant used for decode).

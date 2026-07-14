@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // M8.K.1b — Q4_K GEMM with shrunk SLM (Xe-LPG occupancy fix).
 //
 // Same v2-idea as matmul_q8_0_gemm_v2 (see that kernel for the SLM-

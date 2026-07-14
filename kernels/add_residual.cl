@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // In-place 1D add: y[i] += x[i] for i in [0, n).
 //
 // Used for the post-attention and post-FFN residual streams.

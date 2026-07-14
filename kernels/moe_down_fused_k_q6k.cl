@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Fused MoE down-projection for T=1 decode. Collapses K sequential
 // (down-matmul + scaledAddResidual) launches into a single dispatch.
 //

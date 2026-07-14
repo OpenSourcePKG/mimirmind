@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Batched matrix-matrix multiply with Q8_0 weights, on-the-fly dequant.
 // M-way generalisation of matmul_q8_0_vec: processes M_TILE token rows
 // per workgroup so the (already cheap) Q8_0 dequant plus the per-block

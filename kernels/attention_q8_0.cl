@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Q8_0-KV variant of attention.cl. K and V are stored as ggml-style
 // Q8_0 blocks in USM (32 elements per block: fp16 scale + 32 int8 quants
 // = 34 B per block). Q and OUT stay fp32. Loads dequantise on the fly in

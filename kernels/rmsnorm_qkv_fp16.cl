@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // FP16-KV variant of rmsnorm_qkv.cl. Q stays fp32 (workspace), K and V
 // live in the fp16 KV cache. Weights (`k_w`) stay fp32; the sum of
 // squares and the invRms scalar are computed in fp32 regardless of

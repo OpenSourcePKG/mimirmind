@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Fused residual-add + RMSNorm.
 //   x[m, k] += delta[m, k]     (in-place)
 //   y[m, k] = x[m, k] * weight[k] / sqrt(mean(x[m, :]^2) + eps)

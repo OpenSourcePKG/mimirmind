@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // RMSNorm without a per-element weight: y = x * invRms.
 //
 // Used for Gemma 4 V-norm — V projection passes through a bare

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // FP16-KV variant of rope_inplace_ff.cl. K-cache slots are stored as
 // fp16; the rotation (with per-pair freq_factors, ggml_rope_ext-style)
 // is done in fp32 in registers so the storage swap doesn't cost

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // SwiGLU with GELU activation (parallel form, like llama.cpp's
 // LLM_FFN_GELU / LLM_FFN_PAR — used by Gemma 3 / Gemma 4):
 //

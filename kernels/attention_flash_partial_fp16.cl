@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // FP16-KV variant of attention_flash_partial.cl. Decode-mode
 // FlashAttention pass 1 (T_q == 1), reading K/V as fp16 instead of
 // fp32. Loads promote to fp32 in registers via vload_half; the per-tile

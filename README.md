@@ -6,6 +6,8 @@
 
 <p align="center"><em>Odin carried Mimir's preserved head with him, seeking counsel from the wisest of all beings.</em></p>
 
+<p align="center"><a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a></p>
+
 ---
 
 ## What it is
@@ -232,9 +234,10 @@ breakdown.
 
 ## License
 
-TBD — see [`LICENSE`](LICENSE) when it lands. Until then: source
-visible for reading, no production deployment outside the development
-group.
+Licensed under the [Apache License, Version 2.0](LICENSE). See also
+[`NOTICE`](NOTICE) for attribution requirements when redistributing.
+
+Copyright 2026 Stefan Werfling.
 
 ## Acknowledgements
 

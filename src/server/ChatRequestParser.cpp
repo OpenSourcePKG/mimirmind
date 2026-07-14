@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 #include "server/ChatRequestParser.hpp"
 
 #include <nlohmann/json.hpp>

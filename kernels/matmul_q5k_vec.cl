@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Matrix-vector multiply with Q5_K weights, on-the-fly dequant.
 //
 //   Y[n] = sum_{k=0..K-1} X[k] * dequant_q5k(W, n, k)

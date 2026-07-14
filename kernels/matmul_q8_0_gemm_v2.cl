@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // M8.K.1 revised — Q8_0 GEMM with reduced SLM footprint.
 //
 // v2-first-attempt (2026-07-02 L0_TARGET_HOST) doubled M_TILE to 16

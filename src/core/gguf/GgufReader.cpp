@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 #include "core/gguf/GgufReader.hpp"
 
 #include "core/log/Log.hpp"

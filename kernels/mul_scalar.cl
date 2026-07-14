@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // In-place scalar multiply: y[i] *= s   for i in [0, n).
 //
 // Used by Gemma 4 for layer_output_scale (one F32 scalar per block

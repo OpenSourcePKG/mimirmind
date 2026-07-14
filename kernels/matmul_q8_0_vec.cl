@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Matrix-vector multiply with Q8_0 weights, on-the-fly dequant.
 //
 //   Y[n] = sum_{k=0..K-1} X[k] * dequant_q8_0(W, n, k)

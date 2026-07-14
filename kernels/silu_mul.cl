@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // SwiGLU fused step: gate[i] = (silu(gate[i])) * up[i]
 //
 //   silu(x) = x / (1 + exp(-x))

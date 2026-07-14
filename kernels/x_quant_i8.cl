@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Per-row symmetric int8 quantisation of an activation matrix.
 //
 //   scale[m] = max_k(|X[m, k]|) / 127

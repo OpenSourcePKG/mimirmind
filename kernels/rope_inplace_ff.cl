@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Rotary positional embedding (RoPE) with per-pair frequency factors,
 // in-place. Mirrors ggml_rope_ext()'s `freq_factors` argument used by
 // Gemma family models for "proportional RoPE" / YaRN-style long-context

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Q8_0-KV variant of attention_prefill_flash.cl. Single-workgroup
 // streaming FlashAttention for T_q > 1 (M5i.J), reading K/V as Q8_0
 // blocks (32 elements per block: fp16 scale + 32 int8 quants = 34 B).

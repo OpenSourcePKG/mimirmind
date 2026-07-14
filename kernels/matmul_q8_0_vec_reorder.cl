@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Matrix-vector multiply with Q8_0 weights in REORDERED row layout.
 //
 // Structurally identical to matmul_q8_0_vec.cl — same launch geometry,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // FP16-KV variant of rope_inplace.cl. K-cache slots are stored as fp16;
 // the rotation is done in fp32 in registers (vload_half → rotate →
 // vstore_half) so RoPE precision doesn't degrade from the storage

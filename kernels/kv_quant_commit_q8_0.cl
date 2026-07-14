@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // FP32 → Q8_0 KV write kernel. Consumes an fp32 workspace holding
 // `T` fresh rows of K or V (one per new token, kvDim elements each,
 // post-rmsnorm + post-RoPE), splits every row into 32-element blocks

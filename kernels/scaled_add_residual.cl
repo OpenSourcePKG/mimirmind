@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Fused scaled-accumulate: dst[i] += scale * src[i]
 //
 // Replaces what the Gemma 4 MoE per-expert loop did as two passes:

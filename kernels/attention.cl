@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Multi-head self-attention, GQA-aware, causal. Drop-in equivalent of
 // compute::multiHeadAttention but resident on the iGPU.
 //

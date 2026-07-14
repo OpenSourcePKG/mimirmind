@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // DP4A matvec for Q4_K weights with pre-quantised int8 activation.
 //
 //   Y[n] = xScale × sum_{sb=0..nSuper-1} sum_{j=0..7}

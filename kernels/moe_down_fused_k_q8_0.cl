@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Fused MoE down-projection for T=1 decode — Q8_0 variant.
 //
 // Companion to moe_down_fused_k_q6k.cl; identical dispatch surface, only

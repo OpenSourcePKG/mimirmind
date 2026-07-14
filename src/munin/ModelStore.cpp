@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 #include "munin/ModelStore.hpp"
 
 #include "core/gguf/TensorFingerprint.hpp"

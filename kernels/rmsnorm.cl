@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // RMSNorm: y[m, k] = x[m, k] * weight[k] / sqrt(mean(x[m, :]^2) + eps)
 //
 // Launch: one workgroup per row m (global = (M * LOCAL_SIZE), local = LOCAL_SIZE).

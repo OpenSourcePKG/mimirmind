@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
 // Fused Q + K + V RMSNorm — one dispatch instead of three.
 //
 // Q and K normalize with per-head_dim weights (plain rmsnorm semantics,
