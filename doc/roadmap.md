@@ -276,10 +276,16 @@ See [`quants.md`](quants.md) for the implementation detail.
   "wisdom" is already in the head. We give it a voice; we do not
   teach it anything new. Adding training would change the project's
   identity.
-- **A multi-vendor abstraction.** No CUDA backend, no ROCm backend,
-  no Vulkan backend. MimirMind is built for Intel Level Zero on
-  UMA-capable iGPUs and uses that platform as a target, not as one
-  of many. Other platforms have plenty of options.
+- **A cross-vendor HAL.** MimirMind is not a portability layer.
+  Level Zero on Intel iGPU is the primary target, chosen because it
+  matches the hardware and UMA model MimirMind was built for. If AMD
+  hardware becomes a real deployment target, the plan is a native
+  HIP kernel tree next to the existing Level Zero one — not a
+  lowest-common-denominator SPIR-V/Vulkan layer that leaves 30–40 %
+  of AMD's tok/s on the table. Kernels stay vendor-specific and
+  vendor-optimal; the abstraction lives above them, not inside them.
+  Full multi-vendor CUDA + ROCm + Level Zero + Metal parity is
+  explicitly not the goal — other projects cover that ground.
 - **A wrapper around llama.cpp.** The entire point is to learn the
   problem, not to delegate it. `llama-cli` exists in the runtime
   image only as a reference oracle for the parity-test harness.
