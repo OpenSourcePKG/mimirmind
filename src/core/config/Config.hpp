@@ -62,11 +62,16 @@ struct FeatureSettings {
     // Command-list replay. Auto-off for MoE remains hardcoded regardless of this.
     bool                       clr{true};
     bool                       flashPrefill{true};
-    // Independent rollback for the GQA-head-packed Q8_0 prefill kernel.
-    // Set to false to fall back to the plain per-Q-head Q8_0 kernel when
-    // the packed variant regresses on a given host. Suffix ties the flag
-    // to the Q8_0-specific kernel; future dtype variants get their own.
-    bool                       flashPrefillGqaQ8{true};
+    // GQA-head-packed Q8_0 prefill kernel. Default false: A/B on both
+    // prod models (2026-07-12) showed a monotonic regression scaling
+    // with N_MAX register-waste ratio (26B-A4B nQPerKv=2 → 3.7 %, E4B
+    // nQPerKv=4 → 1.8 %). The kernel statically dimensions register
+    // arrays on ATTN_FLASH_PREFILL_N_Q_PER_KV_MAX=8, so any model with
+    // nQPerKv < 8 pays for unused registers. A reconstructed v2 with
+    // compile-time N_MAX specialisation would flip this back on — until
+    // then, plain per-Q-head Q8_0 wins. Suffix ties the flag to the
+    // Q8_0-specific kernel; future dtype variants get their own.
+    bool                       flashPrefillGqaQ8{false};
     // K-tile size baked into the Q8_0 GQA prefill kernel. Compile-time
     // constant in the .cl source; a second SPV is built alongside the
     // default with `-D ATTN_FLASH_PREFILL_KTILE=64`. Runtime picks

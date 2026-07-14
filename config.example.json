@@ -28,7 +28,7 @@
   "features": {
     "clr": true,
     "flashPrefill": true,
-    "flashPrefillGqaQ8": true,
+    "flashPrefillGqaQ8": false,
     "flashPrefillKTileQ8": 128,
     "fusedQkv": true,
     "moeGroup": true,
