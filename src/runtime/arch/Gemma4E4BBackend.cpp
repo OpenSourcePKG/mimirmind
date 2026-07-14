@@ -6,6 +6,7 @@
 #include "compute/Dequant.hpp"
 #include "compute/GpuMatmul.hpp"
 #include "compute/GpuOps.hpp"
+#include "runtime/CommandQueue.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
 #include "compute/quant/Q8_0.hpp"

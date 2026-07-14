@@ -3,20 +3,22 @@
 
 #pragma once
 
-#include "runtime/CommandQueue.hpp"
 #include "core/config/Config.hpp"
-#include "runtime/GpuKernel.hpp"
-#include "runtime/GpuModule.hpp"
 #include "runtime/KvCache.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 
 namespace mimirmind::core::l0 {
 class L0Context;
 class UsmAllocator;
+}
+
+namespace mimirmind::runtime {
+class CommandQueue;
 }
 
 namespace mimirmind::compute {
@@ -498,146 +500,15 @@ private:
     runtime::CommandQueue& _queue;
     core::l0::UsmAllocator& _alloc;
 
-    runtime::GpuModule     _rmsnormModule;
-    runtime::GpuKernel     _rmsnormKernel;
-
-    runtime::GpuModule     _addBiasModule;
-    runtime::GpuKernel     _addBiasKernel;
-
-    runtime::GpuModule     _addResidualModule;
-    runtime::GpuKernel     _addResidualKernel;
-
-    runtime::GpuModule     _siluMulModule;
-    runtime::GpuKernel     _siluMulKernel;
-
-    runtime::GpuModule     _ropeModule;
-    runtime::GpuKernel     _ropeKernel;
-
-    runtime::GpuModule     _mulScalarModule;
-    runtime::GpuKernel     _mulScalarKernel;
-
-    runtime::GpuModule     _geluMulModule;
-    runtime::GpuKernel     _geluMulKernel;
-
-    runtime::GpuModule     _rmsnormGemmaModule;
-    runtime::GpuKernel     _rmsnormGemmaKernel;
-
-    runtime::GpuModule     _rmsnormNoWeightModule;
-    runtime::GpuKernel     _rmsnormNoWeightKernel;
-
-    runtime::GpuModule     _rmsnormQkvModule;
-    runtime::GpuKernel     _rmsnormQkvKernel;
-
-    runtime::GpuModule     _addRmsNormModule;
-    runtime::GpuKernel     _addRmsNormKernel;
-
-    runtime::GpuModule     _ropeFfModule;
-    runtime::GpuKernel     _ropeFfKernel;
-
-    runtime::GpuModule     _attentionModule;
-    runtime::GpuKernel     _attentionKernel;
-
-    runtime::GpuModule     _attentionFlashPartialModule;
-    runtime::GpuKernel     _attentionFlashPartialKernel;
-
-    runtime::GpuModule     _attentionFlashMergeModule;
-    runtime::GpuKernel     _attentionFlashMergeKernel;
-
-    runtime::GpuModule     _attentionPrefillFlashModule;
-    runtime::GpuKernel     _attentionPrefillFlashKernel;
-
-    // M10.2 Phase 0 Commit 3 — fp16-KV read variants of the three
-    // attention kernels. Same launch geometry, same signatures except
-    // K/V are stored as fp16 in USM (kernel uses vload_half at read
-    // time to promote to fp32 before the softmax). Only touched when
-    // attentionAsync is called with KvDtype::FP16; the f32 dispatch
-    // stays on the pre-existing kernels above so bit-parity is
-    // preserved by construction.
-    runtime::GpuModule     _attentionFp16Module;
-    runtime::GpuKernel     _attentionFp16Kernel;
-
-    runtime::GpuModule     _attentionFlashPartialFp16Module;
-    runtime::GpuKernel     _attentionFlashPartialFp16Kernel;
-
-    runtime::GpuModule     _attentionPrefillFlashFp16Module;
-    runtime::GpuKernel     _attentionPrefillFlashFp16Kernel;
-
-    // M10.2 Phase 0 Commit 4 — fp16-KV write variants of the four
-    // kernels that populate the KV cache (rmsnorm_qkv, qkv_split) or
-    // rotate its rows in place (rope_inplace, rope_inplace_ff). Only
-    // touched when the corresponding *Async call is passed
-    // KvDtype::FP16; the f32 dispatch stays on the pre-existing kernels
-    // above so bit-parity is preserved by construction.
-    runtime::GpuModule     _rmsnormQkvFp16Module;
-    runtime::GpuKernel     _rmsnormQkvFp16Kernel;
-
-    runtime::GpuModule     _qkvSplitFp16Module;
-    runtime::GpuKernel     _qkvSplitFp16Kernel;
-
-    runtime::GpuModule     _ropeFp16Module;
-    runtime::GpuKernel     _ropeFp16Kernel;
-
-    runtime::GpuModule     _ropeFfFp16Module;
-    runtime::GpuKernel     _ropeFfFp16Kernel;
-
-    // M10.2 Phase 1a Commit 3 — fp32→Q8_0 KV commit kernel. Consumes a
-    // fp32 K or V workspace (post-rmsnorm+RoPE, Backend Commit 5 wires
-    // the workspace) and writes 32-element Q8_0 blocks into the cache
-    // slot. Only touched by kvQuantCommitQ8Async, which is called by
-    // the backend Q8_0 branch — never from the F32/FP16 hot paths.
-    runtime::GpuModule     _kvQuantCommitQ8Module;
-    runtime::GpuKernel     _kvQuantCommitQ8Kernel;
-
-    // M10.2 Phase 1a Commit 4 — Q8_0-KV read variants of the three
-    // attention kernels. Same launch geometry and argument layout as the
-    // f32 / fp16 variants; K/V are stored as ggml block_q8_0 (fp16 scale
-    // + 32 int8 quants per 34 B block) and the kernel body dequantises
-    // on the fly (scale × int8 → fp32) before the softmax. Only touched
-    // when attentionAsync is called with KvDtype::Q8_0; the F32 / FP16
-    // dispatches stay on the pre-existing kernels above so bit-parity is
-    // preserved by construction.
-    runtime::GpuModule     _attentionQ8Module;
-    runtime::GpuKernel     _attentionQ8Kernel;
-
-    runtime::GpuModule     _attentionFlashPartialQ8Module;
-    runtime::GpuKernel     _attentionFlashPartialQ8Kernel;
-
-    runtime::GpuModule     _attentionPrefillFlashQ8Module;
-    runtime::GpuKernel     _attentionPrefillFlashQ8Kernel;
-
-    // R1 — GQA-head-packed variant of the Q8_0 prefill kernel. One
-    // workgroup handles ALL Q-heads of a KV-group at a query position
-    // so the K/V dequant path is amortised across (nHeads / nKvHeads)
-    // heads. Selected in attentionPrefillFlashAsync when
-    // (kvDtype == Q8_0) && (nQPerKv > 1) && !_prefillFlashGqaQ8Disabled
-    // && nQPerKv <= kFlashPrefillGqaMaxQPerKv; otherwise the plain
-    // per-Q-head Q8_0 kernel above stays in charge.
-    runtime::GpuModule     _attentionPrefillFlashQ8GqaModule;
-    runtime::GpuKernel     _attentionPrefillFlashQ8GqaKernel;
-
-    // KTILE=64 variant of the packed kernel. Same .cl source, built by
-    // CMake with -D ATTN_FLASH_PREFILL_KTILE=64. Loaded unconditionally
-    // so features.flashPrefillKTileQ8 can flip between the two at
-    // runtime without a rebuild.
-    runtime::GpuModule     _attentionPrefillFlashQ8GqaKtile64Module;
-    runtime::GpuKernel     _attentionPrefillFlashQ8GqaKtile64Kernel;
-
-    runtime::GpuModule     _scaledAddResidualModule;
-    runtime::GpuKernel     _scaledAddResidualKernel;
-
-    runtime::GpuModule     _qkvSplitModule;
-    runtime::GpuKernel     _qkvSplitKernel;
-
-    runtime::GpuModule     _xQuantI8Module;
-    runtime::GpuKernel     _xQuantI8Kernel;
-
-    // M8.K.Q8_0-Reorder — reordered-layout Q8_0 matvec kernel. Same
-    // launch geometry as matmul_q8_0_vec (LOCAL=64, SG=16, 4 outputs
-    // per WG) so bench comparisons only differ in the row-local load
-    // pattern. See kernels/matmul_q8_0_vec_reorder.cl for the layout
-    // contract and matmulQ8_0VecReorderAsync for the dispatcher.
-    runtime::GpuModule     _matmulQ8_0VecReorderModule;
-    runtime::GpuKernel     _matmulQ8_0VecReorderKernel;
+    // All Level-Zero-typed GpuModule + GpuKernel handles live in an
+    // Impl struct defined in GpuOps.cpp (pimpl). Keeps GpuKernel.hpp
+    // + GpuModule.hpp — and their transitive `<level_zero/ze_api.h>`
+    // pull-in — out of the ~11 files that include this header. Ctor
+    // constructs one Impl (loads every SPV, looks up every kernel by
+    // name); dtor tears them down in reverse. Adding a new op-kernel
+    // is a one-line change inside Impl in the .cpp — no header edit.
+    struct Impl;
+    std::unique_ptr<Impl>  _pimpl;
 
     std::string            _selfTestStatus{"pending"};
 

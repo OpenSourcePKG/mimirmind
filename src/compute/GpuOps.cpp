@@ -7,6 +7,9 @@
 #include "core/l0/L0Context.hpp"
 #include "core/log/Log.hpp"
 #include "core/l0/UsmAllocator.hpp"
+#include "runtime/CommandQueue.hpp"
+#include "runtime/GpuKernel.hpp"
+#include "runtime/GpuModule.hpp"
 
 #include "compute/quant/Q8_0.hpp"
 
@@ -46,6 +49,174 @@ std::uint32_t groupsForN(std::size_t n, std::uint32_t local) {
 
 } // namespace
 
+// Pimpl body — every Level-Zero-typed handle GpuOps needs lives here so
+// consumers of GpuOps.hpp never pull in <level_zero/ze_api.h>. One
+// module per SPV file (loaded once from disk into the L0 context) with
+// exactly one kernel-name lookup — matches the pre-pimpl layout 1:1.
+// Order matters: destruction reverses the initializer list, so the
+// kernels tear down before the modules that own their handles.
+struct GpuOps::Impl {
+    runtime::GpuModule     _rmsnormModule;
+    runtime::GpuKernel     _rmsnormKernel;
+    runtime::GpuModule     _addBiasModule;
+    runtime::GpuKernel     _addBiasKernel;
+    runtime::GpuModule     _addResidualModule;
+    runtime::GpuKernel     _addResidualKernel;
+    runtime::GpuModule     _siluMulModule;
+    runtime::GpuKernel     _siluMulKernel;
+    runtime::GpuModule     _ropeModule;
+    runtime::GpuKernel     _ropeKernel;
+    runtime::GpuModule     _mulScalarModule;
+    runtime::GpuKernel     _mulScalarKernel;
+    runtime::GpuModule     _geluMulModule;
+    runtime::GpuKernel     _geluMulKernel;
+    runtime::GpuModule     _rmsnormGemmaModule;
+    runtime::GpuKernel     _rmsnormGemmaKernel;
+    runtime::GpuModule     _rmsnormNoWeightModule;
+    runtime::GpuKernel     _rmsnormNoWeightKernel;
+    runtime::GpuModule     _rmsnormQkvModule;
+    runtime::GpuKernel     _rmsnormQkvKernel;
+    runtime::GpuModule     _addRmsNormModule;
+    runtime::GpuKernel     _addRmsNormKernel;
+    runtime::GpuModule     _ropeFfModule;
+    runtime::GpuKernel     _ropeFfKernel;
+    runtime::GpuModule     _attentionModule;
+    runtime::GpuKernel     _attentionKernel;
+    runtime::GpuModule     _attentionFlashPartialModule;
+    runtime::GpuKernel     _attentionFlashPartialKernel;
+    runtime::GpuModule     _attentionFlashMergeModule;
+    runtime::GpuKernel     _attentionFlashMergeKernel;
+    runtime::GpuModule     _attentionPrefillFlashModule;
+    runtime::GpuKernel     _attentionPrefillFlashKernel;
+    runtime::GpuModule     _attentionFp16Module;
+    runtime::GpuKernel     _attentionFp16Kernel;
+    runtime::GpuModule     _attentionFlashPartialFp16Module;
+    runtime::GpuKernel     _attentionFlashPartialFp16Kernel;
+    runtime::GpuModule     _attentionPrefillFlashFp16Module;
+    runtime::GpuKernel     _attentionPrefillFlashFp16Kernel;
+    runtime::GpuModule     _rmsnormQkvFp16Module;
+    runtime::GpuKernel     _rmsnormQkvFp16Kernel;
+    runtime::GpuModule     _qkvSplitFp16Module;
+    runtime::GpuKernel     _qkvSplitFp16Kernel;
+    runtime::GpuModule     _ropeFp16Module;
+    runtime::GpuKernel     _ropeFp16Kernel;
+    runtime::GpuModule     _ropeFfFp16Module;
+    runtime::GpuKernel     _ropeFfFp16Kernel;
+    runtime::GpuModule     _kvQuantCommitQ8Module;
+    runtime::GpuKernel     _kvQuantCommitQ8Kernel;
+    runtime::GpuModule     _attentionQ8Module;
+    runtime::GpuKernel     _attentionQ8Kernel;
+    runtime::GpuModule     _attentionFlashPartialQ8Module;
+    runtime::GpuKernel     _attentionFlashPartialQ8Kernel;
+    runtime::GpuModule     _attentionPrefillFlashQ8Module;
+    runtime::GpuKernel     _attentionPrefillFlashQ8Kernel;
+    runtime::GpuModule     _attentionPrefillFlashQ8GqaModule;
+    runtime::GpuKernel     _attentionPrefillFlashQ8GqaKernel;
+    runtime::GpuModule     _attentionPrefillFlashQ8GqaKtile64Module;
+    runtime::GpuKernel     _attentionPrefillFlashQ8GqaKtile64Kernel;
+    runtime::GpuModule     _scaledAddResidualModule;
+    runtime::GpuKernel     _scaledAddResidualKernel;
+    runtime::GpuModule     _qkvSplitModule;
+    runtime::GpuKernel     _qkvSplitKernel;
+    runtime::GpuModule     _xQuantI8Module;
+    runtime::GpuKernel     _xQuantI8Kernel;
+    runtime::GpuModule     _matmulQ8_0VecReorderModule;
+    runtime::GpuKernel     _matmulQ8_0VecReorderKernel;
+
+    explicit Impl(core::l0::L0Context& ctx)
+        : _rmsnormModule    {ctx, "rmsnorm"},
+          _rmsnormKernel    {_rmsnormModule.kernel("rmsnorm")},
+          _addBiasModule    {ctx, "add_bias"},
+          _addBiasKernel    {_addBiasModule.kernel("add_bias")},
+          _addResidualModule{ctx, "add_residual"},
+          _addResidualKernel{_addResidualModule.kernel("add_residual")},
+          _siluMulModule    {ctx, "silu_mul"},
+          _siluMulKernel    {_siluMulModule.kernel("silu_mul")},
+          _ropeModule       {ctx, "rope_inplace"},
+          _ropeKernel       {_ropeModule.kernel("rope_inplace")},
+          _mulScalarModule  {ctx, "mul_scalar"},
+          _mulScalarKernel  {_mulScalarModule.kernel("mul_scalar")},
+          _geluMulModule    {ctx, "gelu_mul"},
+          _geluMulKernel    {_geluMulModule.kernel("gelu_mul")},
+          _rmsnormGemmaModule{ctx, "rmsnorm_gemma"},
+          _rmsnormGemmaKernel{_rmsnormGemmaModule.kernel("rmsnorm_gemma")},
+          _rmsnormNoWeightModule{ctx, "rmsnorm_no_weight"},
+          _rmsnormNoWeightKernel{_rmsnormNoWeightModule.kernel("rmsnorm_no_weight")},
+          _rmsnormQkvModule{ctx, "rmsnorm_qkv"},
+          _rmsnormQkvKernel{_rmsnormQkvModule.kernel("rmsnorm_qkv")},
+          _addRmsNormModule{ctx, "add_rmsnorm"},
+          _addRmsNormKernel{_addRmsNormModule.kernel("add_rmsnorm")},
+          _ropeFfModule    {ctx, "rope_inplace_ff"},
+          _ropeFfKernel    {_ropeFfModule.kernel("rope_inplace_ff")},
+          _attentionModule {ctx, "attention"},
+          _attentionKernel {_attentionModule.kernel("attention")},
+          _attentionFlashPartialModule{ctx, "attention_flash_partial"},
+          _attentionFlashPartialKernel{
+              _attentionFlashPartialModule.kernel("attention_flash_partial")},
+          _attentionFlashMergeModule  {ctx, "attention_flash_merge"},
+          _attentionFlashMergeKernel  {
+              _attentionFlashMergeModule.kernel("attention_flash_merge")},
+          _attentionPrefillFlashModule{ctx, "attention_prefill_flash"},
+          _attentionPrefillFlashKernel{
+              _attentionPrefillFlashModule.kernel("attention_prefill_flash")},
+          _attentionFp16Module        {ctx, "attention_fp16"},
+          _attentionFp16Kernel        {
+              _attentionFp16Module.kernel("attention_fp16")},
+          _attentionFlashPartialFp16Module{ctx, "attention_flash_partial_fp16"},
+          _attentionFlashPartialFp16Kernel{
+              _attentionFlashPartialFp16Module.kernel("attention_flash_partial_fp16")},
+          _attentionPrefillFlashFp16Module{ctx, "attention_prefill_flash_fp16"},
+          _attentionPrefillFlashFp16Kernel{
+              _attentionPrefillFlashFp16Module.kernel("attention_prefill_flash_fp16")},
+          _rmsnormQkvFp16Module    {ctx, "rmsnorm_qkv_fp16"},
+          _rmsnormQkvFp16Kernel    {
+              _rmsnormQkvFp16Module.kernel("rmsnorm_qkv_fp16")},
+          _qkvSplitFp16Module      {ctx, "qkv_split_fp16"},
+          _qkvSplitFp16Kernel      {
+              _qkvSplitFp16Module.kernel("qkv_split_fp16")},
+          _ropeFp16Module          {ctx, "rope_inplace_fp16"},
+          _ropeFp16Kernel          {
+              _ropeFp16Module.kernel("rope_inplace_fp16")},
+          _ropeFfFp16Module        {ctx, "rope_inplace_ff_fp16"},
+          _ropeFfFp16Kernel        {
+              _ropeFfFp16Module.kernel("rope_inplace_ff_fp16")},
+          _kvQuantCommitQ8Module   {ctx, "kv_quant_commit_q8_0"},
+          _kvQuantCommitQ8Kernel   {
+              _kvQuantCommitQ8Module.kernel("kv_quant_commit_q8_0")},
+          _attentionQ8Module              {ctx, "attention_q8_0"},
+          _attentionQ8Kernel              {
+              _attentionQ8Module.kernel("attention_q8_0")},
+          _attentionFlashPartialQ8Module  {ctx, "attention_flash_partial_q8_0"},
+          _attentionFlashPartialQ8Kernel  {
+              _attentionFlashPartialQ8Module.kernel(
+                  "attention_flash_partial_q8_0")},
+          _attentionPrefillFlashQ8Module  {ctx, "attention_prefill_flash_q8_0"},
+          _attentionPrefillFlashQ8Kernel  {
+              _attentionPrefillFlashQ8Module.kernel(
+                  "attention_prefill_flash_q8_0")},
+          _attentionPrefillFlashQ8GqaModule{
+              ctx, "attention_prefill_flash_q8_0_gqa"},
+          _attentionPrefillFlashQ8GqaKernel{
+              _attentionPrefillFlashQ8GqaModule.kernel(
+                  "attention_prefill_flash_q8_0_gqa")},
+          _attentionPrefillFlashQ8GqaKtile64Module{
+              ctx, "attention_prefill_flash_q8_0_gqa_ktile64"},
+          _attentionPrefillFlashQ8GqaKtile64Kernel{
+              _attentionPrefillFlashQ8GqaKtile64Module.kernel(
+                  "attention_prefill_flash_q8_0_gqa")},
+          _scaledAddResidualModule    {ctx, "scaled_add_residual"},
+          _scaledAddResidualKernel    {
+              _scaledAddResidualModule.kernel("scaled_add_residual")},
+          _qkvSplitModule             {ctx, "qkv_split"},
+          _qkvSplitKernel             {_qkvSplitModule.kernel("qkv_split")},
+          _xQuantI8Module             {ctx, "x_quant_i8"},
+          _xQuantI8Kernel             {_xQuantI8Module.kernel("x_quant_i8")},
+          _matmulQ8_0VecReorderModule {ctx, "matmul_q8_0_vec_reorder"},
+          _matmulQ8_0VecReorderKernel {
+              _matmulQ8_0VecReorderModule.kernel("matmul_q8_0_vec_reorder")}
+    {}
+};
+
 GpuOps::GpuOps(core::l0::L0Context&    ctx,
                core::l0::UsmAllocator& alloc,
                runtime::CommandQueue& queue,
@@ -56,96 +227,7 @@ GpuOps::GpuOps(core::l0::L0Context&    ctx,
     : _ctx{ctx},
       _queue{queue},
       _alloc{alloc},
-      _rmsnormModule    {ctx, "rmsnorm"},
-      _rmsnormKernel    {_rmsnormModule.kernel("rmsnorm")},
-      _addBiasModule    {ctx, "add_bias"},
-      _addBiasKernel    {_addBiasModule.kernel("add_bias")},
-      _addResidualModule{ctx, "add_residual"},
-      _addResidualKernel{_addResidualModule.kernel("add_residual")},
-      _siluMulModule    {ctx, "silu_mul"},
-      _siluMulKernel    {_siluMulModule.kernel("silu_mul")},
-      _ropeModule       {ctx, "rope_inplace"},
-      _ropeKernel       {_ropeModule.kernel("rope_inplace")},
-      _mulScalarModule  {ctx, "mul_scalar"},
-      _mulScalarKernel  {_mulScalarModule.kernel("mul_scalar")},
-      _geluMulModule    {ctx, "gelu_mul"},
-      _geluMulKernel    {_geluMulModule.kernel("gelu_mul")},
-      _rmsnormGemmaModule{ctx, "rmsnorm_gemma"},
-      _rmsnormGemmaKernel{_rmsnormGemmaModule.kernel("rmsnorm_gemma")},
-      _rmsnormNoWeightModule{ctx, "rmsnorm_no_weight"},
-      _rmsnormNoWeightKernel{_rmsnormNoWeightModule.kernel("rmsnorm_no_weight")},
-      _rmsnormQkvModule{ctx, "rmsnorm_qkv"},
-      _rmsnormQkvKernel{_rmsnormQkvModule.kernel("rmsnorm_qkv")},
-      _addRmsNormModule{ctx, "add_rmsnorm"},
-      _addRmsNormKernel{_addRmsNormModule.kernel("add_rmsnorm")},
-      _ropeFfModule    {ctx, "rope_inplace_ff"},
-      _ropeFfKernel    {_ropeFfModule.kernel("rope_inplace_ff")},
-      _attentionModule {ctx, "attention"},
-      _attentionKernel {_attentionModule.kernel("attention")},
-      _attentionFlashPartialModule{ctx, "attention_flash_partial"},
-      _attentionFlashPartialKernel{
-          _attentionFlashPartialModule.kernel("attention_flash_partial")},
-      _attentionFlashMergeModule  {ctx, "attention_flash_merge"},
-      _attentionFlashMergeKernel  {
-          _attentionFlashMergeModule.kernel("attention_flash_merge")},
-      _attentionPrefillFlashModule{ctx, "attention_prefill_flash"},
-      _attentionPrefillFlashKernel{
-          _attentionPrefillFlashModule.kernel("attention_prefill_flash")},
-      _attentionFp16Module        {ctx, "attention_fp16"},
-      _attentionFp16Kernel        {
-          _attentionFp16Module.kernel("attention_fp16")},
-      _attentionFlashPartialFp16Module{ctx, "attention_flash_partial_fp16"},
-      _attentionFlashPartialFp16Kernel{
-          _attentionFlashPartialFp16Module.kernel("attention_flash_partial_fp16")},
-      _attentionPrefillFlashFp16Module{ctx, "attention_prefill_flash_fp16"},
-      _attentionPrefillFlashFp16Kernel{
-          _attentionPrefillFlashFp16Module.kernel("attention_prefill_flash_fp16")},
-      _rmsnormQkvFp16Module    {ctx, "rmsnorm_qkv_fp16"},
-      _rmsnormQkvFp16Kernel    {
-          _rmsnormQkvFp16Module.kernel("rmsnorm_qkv_fp16")},
-      _qkvSplitFp16Module      {ctx, "qkv_split_fp16"},
-      _qkvSplitFp16Kernel      {
-          _qkvSplitFp16Module.kernel("qkv_split_fp16")},
-      _ropeFp16Module          {ctx, "rope_inplace_fp16"},
-      _ropeFp16Kernel          {
-          _ropeFp16Module.kernel("rope_inplace_fp16")},
-      _ropeFfFp16Module        {ctx, "rope_inplace_ff_fp16"},
-      _ropeFfFp16Kernel        {
-          _ropeFfFp16Module.kernel("rope_inplace_ff_fp16")},
-      _kvQuantCommitQ8Module   {ctx, "kv_quant_commit_q8_0"},
-      _kvQuantCommitQ8Kernel   {
-          _kvQuantCommitQ8Module.kernel("kv_quant_commit_q8_0")},
-      _attentionQ8Module              {ctx, "attention_q8_0"},
-      _attentionQ8Kernel              {
-          _attentionQ8Module.kernel("attention_q8_0")},
-      _attentionFlashPartialQ8Module  {ctx, "attention_flash_partial_q8_0"},
-      _attentionFlashPartialQ8Kernel  {
-          _attentionFlashPartialQ8Module.kernel(
-              "attention_flash_partial_q8_0")},
-      _attentionPrefillFlashQ8Module  {ctx, "attention_prefill_flash_q8_0"},
-      _attentionPrefillFlashQ8Kernel  {
-          _attentionPrefillFlashQ8Module.kernel(
-              "attention_prefill_flash_q8_0")},
-      _attentionPrefillFlashQ8GqaModule{
-          ctx, "attention_prefill_flash_q8_0_gqa"},
-      _attentionPrefillFlashQ8GqaKernel{
-          _attentionPrefillFlashQ8GqaModule.kernel(
-              "attention_prefill_flash_q8_0_gqa")},
-      _attentionPrefillFlashQ8GqaKtile64Module{
-          ctx, "attention_prefill_flash_q8_0_gqa_ktile64"},
-      _attentionPrefillFlashQ8GqaKtile64Kernel{
-          _attentionPrefillFlashQ8GqaKtile64Module.kernel(
-              "attention_prefill_flash_q8_0_gqa")},
-      _scaledAddResidualModule    {ctx, "scaled_add_residual"},
-      _scaledAddResidualKernel    {
-          _scaledAddResidualModule.kernel("scaled_add_residual")},
-      _qkvSplitModule             {ctx, "qkv_split"},
-      _qkvSplitKernel             {_qkvSplitModule.kernel("qkv_split")},
-      _xQuantI8Module             {ctx, "x_quant_i8"},
-      _xQuantI8Kernel             {_xQuantI8Module.kernel("x_quant_i8")},
-      _matmulQ8_0VecReorderModule {ctx, "matmul_q8_0_vec_reorder"},
-      _matmulQ8_0VecReorderKernel {
-          _matmulQ8_0VecReorderModule.kernel("matmul_q8_0_vec_reorder")}
+      _pimpl{std::make_unique<Impl>(ctx)}
 {
     // Persistent FlashAttention partial-tile scratch. Sized for the
     // worst case across our target models; reused across every decode
@@ -277,14 +359,14 @@ void GpuOps::rmsNormAsync(const float* x,
         return;
     }
     const std::int32_t Ki = toInt32(K, "rmsNorm K");
-    _rmsnormKernel.setPtr(0, x);
-    _rmsnormKernel.setPtr(1, weight);
-    _rmsnormKernel.setPtr(2, y);
-    _rmsnormKernel.setValue<float>(3, eps);
-    _rmsnormKernel.setValue<std::int32_t>(4, Ki);
-    _rmsnormKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
+    _pimpl->_rmsnormKernel.setPtr(0, x);
+    _pimpl->_rmsnormKernel.setPtr(1, weight);
+    _pimpl->_rmsnormKernel.setPtr(2, y);
+    _pimpl->_rmsnormKernel.setValue<float>(3, eps);
+    _pimpl->_rmsnormKernel.setValue<std::int32_t>(4, Ki);
+    _pimpl->_rmsnormKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
     // One workgroup per row.
-    _queue.appendLaunch(_rmsnormKernel,
+    _queue.appendLaunch(_pimpl->_rmsnormKernel,
                         static_cast<std::uint32_t>(M), 1, 1);
 }
 
@@ -298,13 +380,13 @@ void GpuOps::rmsNormGemmaAsync(const float* x,
         return;
     }
     const std::int32_t Ki = toInt32(K, "rmsNormGemma K");
-    _rmsnormGemmaKernel.setPtr(0, x);
-    _rmsnormGemmaKernel.setPtr(1, weight);
-    _rmsnormGemmaKernel.setPtr(2, y);
-    _rmsnormGemmaKernel.setValue<float>(3, eps);
-    _rmsnormGemmaKernel.setValue<std::int32_t>(4, Ki);
-    _rmsnormGemmaKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
-    _queue.appendLaunch(_rmsnormGemmaKernel,
+    _pimpl->_rmsnormGemmaKernel.setPtr(0, x);
+    _pimpl->_rmsnormGemmaKernel.setPtr(1, weight);
+    _pimpl->_rmsnormGemmaKernel.setPtr(2, y);
+    _pimpl->_rmsnormGemmaKernel.setValue<float>(3, eps);
+    _pimpl->_rmsnormGemmaKernel.setValue<std::int32_t>(4, Ki);
+    _pimpl->_rmsnormGemmaKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_rmsnormGemmaKernel,
                         static_cast<std::uint32_t>(M), 1, 1);
 }
 
@@ -317,12 +399,12 @@ void GpuOps::rmsNormNoWeightAsync(const float* x,
         return;
     }
     const std::int32_t Ki = toInt32(K, "rmsNormNoWeight K");
-    _rmsnormNoWeightKernel.setPtr(0, x);
-    _rmsnormNoWeightKernel.setPtr(1, y);
-    _rmsnormNoWeightKernel.setValue<float>(2, eps);
-    _rmsnormNoWeightKernel.setValue<std::int32_t>(3, Ki);
-    _rmsnormNoWeightKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
-    _queue.appendLaunch(_rmsnormNoWeightKernel,
+    _pimpl->_rmsnormNoWeightKernel.setPtr(0, x);
+    _pimpl->_rmsnormNoWeightKernel.setPtr(1, y);
+    _pimpl->_rmsnormNoWeightKernel.setValue<float>(2, eps);
+    _pimpl->_rmsnormNoWeightKernel.setValue<std::int32_t>(3, Ki);
+    _pimpl->_rmsnormNoWeightKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_rmsnormNoWeightKernel,
                         static_cast<std::uint32_t>(M), 1, 1);
 }
 
@@ -353,8 +435,8 @@ void GpuOps::rmsNormQkvAsync(float*           qBuf,   const float* qWeight,
     // is untyped); only the K/V write paths differ (vstore_half vs
     // scalar store) inside the kernel body.
     runtime::GpuKernel& kernel =
-        (kvDtype == runtime::KvDtype::FP16) ? _rmsnormQkvFp16Kernel
-                                            : _rmsnormQkvKernel;
+        (kvDtype == runtime::KvDtype::FP16) ? _pimpl->_rmsnormQkvFp16Kernel
+                                            : _pimpl->_rmsnormQkvKernel;
     // M10.2 Phase 1a Commit 5 follow-up: under Q8_0 fp32-staging the
     // writeOffset is always 0. Bind the staging slot (constant 0)
     // instead of the shared curLen slot so command-list-replay can't
@@ -400,14 +482,14 @@ void GpuOps::addRmsNormAsync(float*       x,
         return;
     }
     const std::int32_t Ki = toInt32(K, "addRmsNorm K");
-    _addRmsNormKernel.setPtr(0, x);
-    _addRmsNormKernel.setPtr(1, delta);
-    _addRmsNormKernel.setPtr(2, weight);
-    _addRmsNormKernel.setPtr(3, y);
-    _addRmsNormKernel.setValue<float>(4, eps);
-    _addRmsNormKernel.setValue<std::int32_t>(5, Ki);
-    _addRmsNormKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
-    _queue.appendLaunch(_addRmsNormKernel,
+    _pimpl->_addRmsNormKernel.setPtr(0, x);
+    _pimpl->_addRmsNormKernel.setPtr(1, delta);
+    _pimpl->_addRmsNormKernel.setPtr(2, weight);
+    _pimpl->_addRmsNormKernel.setPtr(3, y);
+    _pimpl->_addRmsNormKernel.setValue<float>(4, eps);
+    _pimpl->_addRmsNormKernel.setValue<std::int32_t>(5, Ki);
+    _pimpl->_addRmsNormKernel.setGroupSize(kRmsnormLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_addRmsNormKernel,
                         static_cast<std::uint32_t>(M), 1, 1);
 }
 
@@ -420,12 +502,12 @@ void GpuOps::addBiasAsync(float*       y,
     }
     const std::int32_t Mi = toInt32(M, "addBias M");
     const std::int32_t Ki = toInt32(K, "addBias K");
-    _addBiasKernel.setPtr(0, y);
-    _addBiasKernel.setPtr(1, bias);
-    _addBiasKernel.setValue<std::int32_t>(2, Mi);
-    _addBiasKernel.setValue<std::int32_t>(3, Ki);
-    _addBiasKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
-    _queue.appendLaunch(_addBiasKernel,
+    _pimpl->_addBiasKernel.setPtr(0, y);
+    _pimpl->_addBiasKernel.setPtr(1, bias);
+    _pimpl->_addBiasKernel.setValue<std::int32_t>(2, Mi);
+    _pimpl->_addBiasKernel.setValue<std::int32_t>(3, Ki);
+    _pimpl->_addBiasKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_addBiasKernel,
                         groupsForN(M * K, kElementwiseLocalSize), 1, 1);
 }
 
@@ -436,11 +518,11 @@ void GpuOps::addResidualAsync(float*       y,
         return;
     }
     const std::int32_t ni = toInt32(n, "addResidual n");
-    _addResidualKernel.setPtr(0, y);
-    _addResidualKernel.setPtr(1, x);
-    _addResidualKernel.setValue<std::int32_t>(2, ni);
-    _addResidualKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
-    _queue.appendLaunch(_addResidualKernel,
+    _pimpl->_addResidualKernel.setPtr(0, y);
+    _pimpl->_addResidualKernel.setPtr(1, x);
+    _pimpl->_addResidualKernel.setValue<std::int32_t>(2, ni);
+    _pimpl->_addResidualKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_addResidualKernel,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 
@@ -451,11 +533,11 @@ void GpuOps::siluMulAsync(float*       gate,
         return;
     }
     const std::int32_t ni = toInt32(n, "siluMul n");
-    _siluMulKernel.setPtr(0, gate);
-    _siluMulKernel.setPtr(1, up);
-    _siluMulKernel.setValue<std::int32_t>(2, ni);
-    _siluMulKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
-    _queue.appendLaunch(_siluMulKernel,
+    _pimpl->_siluMulKernel.setPtr(0, gate);
+    _pimpl->_siluMulKernel.setPtr(1, up);
+    _pimpl->_siluMulKernel.setValue<std::int32_t>(2, ni);
+    _pimpl->_siluMulKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_siluMulKernel,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 
@@ -466,11 +548,11 @@ void GpuOps::mulScalarAsync(float*       y,
         return;
     }
     const std::int32_t ni = toInt32(n, "mulScalar n");
-    _mulScalarKernel.setPtr(0, y);
-    _mulScalarKernel.setValue<float>(1, s);
-    _mulScalarKernel.setValue<std::int32_t>(2, ni);
-    _mulScalarKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
-    _queue.appendLaunch(_mulScalarKernel,
+    _pimpl->_mulScalarKernel.setPtr(0, y);
+    _pimpl->_mulScalarKernel.setValue<float>(1, s);
+    _pimpl->_mulScalarKernel.setValue<std::int32_t>(2, ni);
+    _pimpl->_mulScalarKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_mulScalarKernel,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 
@@ -481,11 +563,11 @@ void GpuOps::geluMulAsync(float*       gate,
         return;
     }
     const std::int32_t ni = toInt32(n, "geluMul n");
-    _geluMulKernel.setPtr(0, gate);
-    _geluMulKernel.setPtr(1, up);
-    _geluMulKernel.setValue<std::int32_t>(2, ni);
-    _geluMulKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
-    _queue.appendLaunch(_geluMulKernel,
+    _pimpl->_geluMulKernel.setPtr(0, gate);
+    _pimpl->_geluMulKernel.setPtr(1, up);
+    _pimpl->_geluMulKernel.setValue<std::int32_t>(2, ni);
+    _pimpl->_geluMulKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_geluMulKernel,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 
@@ -519,8 +601,8 @@ void GpuOps::ropeInPlaceAsync(void*            xBase,
     // registers (vload_half → rotate → vstore_half); only the read/write
     // sites change dtype.
     runtime::GpuKernel& kernel =
-        (kvDtype == runtime::KvDtype::FP16) ? _ropeFp16Kernel
-                                            : _ropeKernel;
+        (kvDtype == runtime::KvDtype::FP16) ? _pimpl->_ropeFp16Kernel
+                                            : _pimpl->_ropeKernel;
     *_curLenSlotUsm = toInt32(startPos, "rope startPos");
     kernel.setPtr(0, xBase);
     kernel.setValue<std::int32_t>(1, toInt32(seqLen,   "rope seqLen"));
@@ -563,8 +645,8 @@ void GpuOps::ropeInPlaceWithFactorsAsync(void*            xBase,
     // M10.2 Phase 0 Commit 4 — fp16-KV variant dispatch, see
     // ropeInPlaceAsync above.
     runtime::GpuKernel& kernel =
-        (kvDtype == runtime::KvDtype::FP16) ? _ropeFfFp16Kernel
-                                            : _ropeFfKernel;
+        (kvDtype == runtime::KvDtype::FP16) ? _pimpl->_ropeFfFp16Kernel
+                                            : _pimpl->_ropeFfKernel;
     *_curLenSlotUsm = toInt32(startPos, "rope_ff startPos");
     kernel.setPtr(0, xBase);
     kernel.setPtr(1, freqFactors);
@@ -588,12 +670,12 @@ void GpuOps::scaledAddResidualAsync(float*       dst,
         return;
     }
     const std::int32_t ni = toInt32(n, "scaledAddResidual n");
-    _scaledAddResidualKernel.setPtr(0, dst);
-    _scaledAddResidualKernel.setPtr(1, src);
-    _scaledAddResidualKernel.setValue<float>(2, scale);
-    _scaledAddResidualKernel.setValue<std::int32_t>(3, ni);
-    _scaledAddResidualKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
-    _queue.appendLaunch(_scaledAddResidualKernel,
+    _pimpl->_scaledAddResidualKernel.setPtr(0, dst);
+    _pimpl->_scaledAddResidualKernel.setPtr(1, src);
+    _pimpl->_scaledAddResidualKernel.setValue<float>(2, scale);
+    _pimpl->_scaledAddResidualKernel.setValue<std::int32_t>(3, ni);
+    _pimpl->_scaledAddResidualKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_scaledAddResidualKernel,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 
@@ -893,8 +975,8 @@ void GpuOps::qkvSplitAsync(const float*     fused,
     // FP16. Yq stays fp32 in both paths; Yk/Yv are stored fp16 in the
     // FP16 dispatch and the fp16 kernel uses vstore_half on the scatter.
     runtime::GpuKernel& kernel =
-        (kvDtype == runtime::KvDtype::FP16) ? _qkvSplitFp16Kernel
-                                            : _qkvSplitKernel;
+        (kvDtype == runtime::KvDtype::FP16) ? _pimpl->_qkvSplitFp16Kernel
+                                            : _pimpl->_qkvSplitKernel;
     // M10.2 Phase 1a Commit 5 follow-up: staging path routes through
     // the const-0 slot to survive command-list-replay. See
     // rmsNormQkvAsync for the rationale.
@@ -929,13 +1011,13 @@ void GpuOps::xQuantI8Async(const float* x,
         return;
     }
     const std::int32_t Ki = toInt32(K, "xQuantI8 K");
-    _xQuantI8Kernel.setPtr(0, x);
-    _xQuantI8Kernel.setPtr(1, y);
-    _xQuantI8Kernel.setPtr(2, scale);
-    _xQuantI8Kernel.setValue<std::int32_t>(3, Ki);
-    _xQuantI8Kernel.setGroupSize(kXQuantI8LocalSize, 1, 1);
+    _pimpl->_xQuantI8Kernel.setPtr(0, x);
+    _pimpl->_xQuantI8Kernel.setPtr(1, y);
+    _pimpl->_xQuantI8Kernel.setPtr(2, scale);
+    _pimpl->_xQuantI8Kernel.setValue<std::int32_t>(3, Ki);
+    _pimpl->_xQuantI8Kernel.setGroupSize(kXQuantI8LocalSize, 1, 1);
     // One workgroup per row.
-    _queue.appendLaunch(_xQuantI8Kernel,
+    _queue.appendLaunch(_pimpl->_xQuantI8Kernel,
                         static_cast<std::uint32_t>(M), 1, 1);
 }
 
@@ -958,16 +1040,16 @@ void GpuOps::matmulQ8_0VecReorderAsync(const void*  wReordered,
     const std::int32_t Ki = toInt32(K, "matmulQ8_0VecReorder K");
     const std::int32_t Ni = toInt32(N, "matmulQ8_0VecReorder N");
 
-    _matmulQ8_0VecReorderKernel.setPtr(0, x);
-    _matmulQ8_0VecReorderKernel.setPtr(1, wReordered);
-    _matmulQ8_0VecReorderKernel.setPtr(2, y);
-    _matmulQ8_0VecReorderKernel.setValue<std::int32_t>(3, Ki);
-    _matmulQ8_0VecReorderKernel.setValue<std::int32_t>(4, Ni);
-    _matmulQ8_0VecReorderKernel.setGroupSize(kLocalSize, 1, 1);
+    _pimpl->_matmulQ8_0VecReorderKernel.setPtr(0, x);
+    _pimpl->_matmulQ8_0VecReorderKernel.setPtr(1, wReordered);
+    _pimpl->_matmulQ8_0VecReorderKernel.setPtr(2, y);
+    _pimpl->_matmulQ8_0VecReorderKernel.setValue<std::int32_t>(3, Ki);
+    _pimpl->_matmulQ8_0VecReorderKernel.setValue<std::int32_t>(4, Ni);
+    _pimpl->_matmulQ8_0VecReorderKernel.setGroupSize(kLocalSize, 1, 1);
 
     const std::uint32_t nGroups = static_cast<std::uint32_t>(
         (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
-    _queue.appendLaunch(_matmulQ8_0VecReorderKernel, nGroups, 1, 1);
+    _queue.appendLaunch(_pimpl->_matmulQ8_0VecReorderKernel, nGroups, 1, 1);
 }
 
 void GpuOps::kvQuantCommitQ8Async(const float* xSrc,
@@ -996,15 +1078,15 @@ void GpuOps::kvQuantCommitQ8Async(const float* xSrc,
     // the row-aligned start of the T new rows, so `kvDst` stays a
     // stable layer-base pointer across replays.
     *_curLenSlotUsm = toInt32(writeOffset, "kvQuantCommitQ8 writeOffset");
-    _kvQuantCommitQ8Kernel.setPtr(0, xSrc);
-    _kvQuantCommitQ8Kernel.setPtr(1, kvDst);
-    _kvQuantCommitQ8Kernel.setValue<std::int32_t>(
+    _pimpl->_kvQuantCommitQ8Kernel.setPtr(0, xSrc);
+    _pimpl->_kvQuantCommitQ8Kernel.setPtr(1, kvDst);
+    _pimpl->_kvQuantCommitQ8Kernel.setValue<std::int32_t>(
         2, toInt32(kvDim, "kvQuantCommitQ8 kvDim"));
-    _kvQuantCommitQ8Kernel.setPtr(3, _curLenSlotUsm);
-    _kvQuantCommitQ8Kernel.setGroupSize(kKvQuantCommitLocalSize, 1, 1);
+    _pimpl->_kvQuantCommitQ8Kernel.setPtr(3, _curLenSlotUsm);
+    _pimpl->_kvQuantCommitQ8Kernel.setGroupSize(kKvQuantCommitLocalSize, 1, 1);
     // One workgroup per (t, block). Kernel LOCAL=32 matches the block
     // size so each thread owns one element of one block.
-    _queue.appendLaunch(_kvQuantCommitQ8Kernel,
+    _queue.appendLaunch(_pimpl->_kvQuantCommitQ8Kernel,
                         static_cast<std::uint32_t>(T),
                         static_cast<std::uint32_t>(nBlocksPerRow),
                         1);
@@ -1118,11 +1200,11 @@ void GpuOps::attentionPlainAsync(const float*     q,
     // the K/V loads differ (vload_half + fp32 promote inside the kernel).
     // M10.2 Phase 1a Commit 4 — Q8_0 branch dequantises per 32-elem block
     // (fp16 scale × int8) inline; same argument layout.
-    runtime::GpuKernel* kernelPtr = &_attentionKernel;
+    runtime::GpuKernel* kernelPtr = &_pimpl->_attentionKernel;
     if (kvDtype == runtime::KvDtype::FP16) {
-        kernelPtr = &_attentionFp16Kernel;
+        kernelPtr = &_pimpl->_attentionFp16Kernel;
     } else if (kvDtype == runtime::KvDtype::Q8_0) {
-        kernelPtr = &_attentionQ8Kernel;
+        kernelPtr = &_pimpl->_attentionQ8Kernel;
     }
     runtime::GpuKernel& kernel = *kernelPtr;
     *_curLenSlotUsm = toInt32(positionOffset, "attention positionOffset");
@@ -1177,9 +1259,9 @@ void GpuOps::attentionPrefillFlashAsync(const float*     q,
         (nQPerKv > 1) &&
         (nQPerKv <= kFlashPrefillGqaMaxQPerKv);
 
-    runtime::GpuKernel* kernelPtr = &_attentionPrefillFlashKernel;
+    runtime::GpuKernel* kernelPtr = &_pimpl->_attentionPrefillFlashKernel;
     if (kvDtype == runtime::KvDtype::FP16) {
-        kernelPtr = &_attentionPrefillFlashFp16Kernel;
+        kernelPtr = &_pimpl->_attentionPrefillFlashFp16Kernel;
     } else if (kvDtype == runtime::KvDtype::Q8_0) {
         if (useQ8Gqa) {
             // K-tile pick: 64 → smaller-SLM variant (higher occupancy on
@@ -1187,10 +1269,10 @@ void GpuOps::attentionPrefillFlashAsync(const float*     q,
             // streaming amortisation. Any other value would have been
             // resolved / rejected in the ctor.
             kernelPtr = (_prefillFlashKTileQ8 == 64)
-                ? &_attentionPrefillFlashQ8GqaKtile64Kernel
-                : &_attentionPrefillFlashQ8GqaKernel;
+                ? &_pimpl->_attentionPrefillFlashQ8GqaKtile64Kernel
+                : &_pimpl->_attentionPrefillFlashQ8GqaKernel;
         } else {
-            kernelPtr = &_attentionPrefillFlashQ8Kernel;
+            kernelPtr = &_pimpl->_attentionPrefillFlashQ8Kernel;
         }
     }
     runtime::GpuKernel& kernel = *kernelPtr;
@@ -1453,11 +1535,11 @@ void GpuOps::attentionDecodeFlashAsync(const float*     q,
     // Pass 1 — per-tile partial (m, l, o_unnorm) into the persistent
     // USM scratch. Kernel picked by KV dtype; partial layout stays fp32
     // regardless so the merge kernel is dtype-agnostic.
-    runtime::GpuKernel* partialKernelPtr = &_attentionFlashPartialKernel;
+    runtime::GpuKernel* partialKernelPtr = &_pimpl->_attentionFlashPartialKernel;
     if (kvDtype == runtime::KvDtype::FP16) {
-        partialKernelPtr = &_attentionFlashPartialFp16Kernel;
+        partialKernelPtr = &_pimpl->_attentionFlashPartialFp16Kernel;
     } else if (kvDtype == runtime::KvDtype::Q8_0) {
-        partialKernelPtr = &_attentionFlashPartialQ8Kernel;
+        partialKernelPtr = &_pimpl->_attentionFlashPartialQ8Kernel;
     }
     runtime::GpuKernel& partialKernel = *partialKernelPtr;
     partialKernel.setPtr(0, q);
@@ -1490,13 +1572,13 @@ void GpuOps::attentionDecodeFlashAsync(const float*     q,
 
     // Pass 2 — merge the per-tile partials into the final output. The
     // auto-barrier between launches makes partials visible to the merge.
-    _attentionFlashMergeKernel.setPtr(0, _flashPartialUsm);
-    _attentionFlashMergeKernel.setPtr(1, out);
-    _attentionFlashMergeKernel.setValue<std::int32_t>(2, toInt32(nHeads,  "flash_merge nHeads"));
-    _attentionFlashMergeKernel.setValue<std::int32_t>(3, toInt32(headDim, "flash_merge headDim"));
-    _attentionFlashMergeKernel.setPtr(4, _curLenSlotUsm);
-    _attentionFlashMergeKernel.setGroupSize(kAttentionLocalSize, 1, 1);
-    _queue.appendLaunch(_attentionFlashMergeKernel,
+    _pimpl->_attentionFlashMergeKernel.setPtr(0, _flashPartialUsm);
+    _pimpl->_attentionFlashMergeKernel.setPtr(1, out);
+    _pimpl->_attentionFlashMergeKernel.setValue<std::int32_t>(2, toInt32(nHeads,  "flash_merge nHeads"));
+    _pimpl->_attentionFlashMergeKernel.setValue<std::int32_t>(3, toInt32(headDim, "flash_merge headDim"));
+    _pimpl->_attentionFlashMergeKernel.setPtr(4, _curLenSlotUsm);
+    _pimpl->_attentionFlashMergeKernel.setGroupSize(kAttentionLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_attentionFlashMergeKernel,
                         static_cast<std::uint32_t>(nHeads),
                         1,
                         1);

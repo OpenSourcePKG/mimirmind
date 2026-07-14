@@ -5,6 +5,7 @@
 
 #include "compute/GpuMatmul.hpp"
 #include "compute/GpuOps.hpp"
+#include "runtime/CommandQueue.hpp"
 #include "compute/MoeRouting.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"

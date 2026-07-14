@@ -5,6 +5,7 @@
 
 #include "compute/GpuMatmul.hpp"
 #include "compute/GpuOps.hpp"
+#include "runtime/CommandQueue.hpp"
 #include "model/FusedQkvWeights.hpp"
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/GgufTypes.hpp"
