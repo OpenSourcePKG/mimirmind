@@ -254,46 +254,18 @@ MuninClient::attach(std::string_view socketPath,
     }
 
     // Chunk import succeeded — L0 has consumed every fd, we must not
-    // close them. Resolve each tensor's usmPtr = chunkBase + chunkOffset.
-    out.tensors.reserve(out.manifest.tensors.size());
-    for (std::size_t i = 0; i < out.manifest.tensors.size(); ++i) {
-        const auto& me = out.manifest.tensors[i];
-        if (me.chunkIndex >= bases->size()) {
-            // Parser normally refuses this — defense in depth. No fd
-            // cleanup: they are L0's now. Socket teardown only.
-            ::close(sock);
-            std::ostringstream os;
-            os << "MuninClient: tensor[" << i << "] '" << me.name
-               << "' references chunkIndex=" << me.chunkIndex
-               << " but only " << bases->size() << " chunk base(s) imported";
-            return std::unexpected(os.str());
-        }
-        void* base = (*bases)[me.chunkIndex];
-
-        ::mimirmind::core::gguf::GgufTensor t{};
-        t.name        = me.name;
-        t.type        = me.type;
-        t.dimensions  = me.dims;
-        // Recompute nelements from dims for the downstream code that
-        // reads it; Munin only ships bytes on the wire, but standalone
-        // code paths rely on `nelements` being populated.
-        std::uint64_t nel = 1;
-        for (auto d : t.dimensions) nel *= d;
-        t.nelements   = nel;
-        t.nbytes      = static_cast<std::size_t>(me.bytes);
-        t.fileOffset  = 0;   // not meaningful in attached mode
-        t.chunkIndex  = me.chunkIndex;
-        t.chunkOffset = me.chunkOffset;
-        t.usmPtr      = static_cast<std::byte*>(base) + me.chunkOffset;
-        out.tensors.push_back(std::move(t));
-    }
+    // close them. Per-tensor `usmPtr` resolution lives in
+    // `WeightsMap::fromAttachedChunked` — the client hands the caller
+    // the raw chunk-base table so both paths (main.cpp, tests) go
+    // through one materialisation routine.
+    out.chunkBases = std::move(*bases);
 
     _sessionFd = sock;
     MM_LOG_INFO("munin-client",
                 "attached to model '{}' fingerprint='{}' tensors={} "
                 "chunks={} over socket '{}'",
                 out.manifest.modelId, out.manifest.modelFingerprint,
-                out.tensors.size(), nChunks, socketPath);
+                out.manifest.tensors.size(), nChunks, socketPath);
     return out;
 }
 

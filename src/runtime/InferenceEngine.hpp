@@ -8,6 +8,7 @@
 #include "model/Tokenizer.hpp"
 #include "model/FusedQkvWeights.hpp"
 #include "core/gguf/WeightsMap.hpp"
+#include "core/ipc/TensorManifest.hpp"
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/CommandQueue.hpp"
 #include "runtime/KvCache.hpp"
@@ -178,23 +179,24 @@ public:
     /**
      * Attached-mode load for the M-Munin flow. Opens `ggufPath` only for
      * header parsing (LlmConfig + tokenizer + fingerprint verification),
-     * then constructs the WeightsMap from `attachedTensors` whose
-     * `usmPtr` fields already point at Munin-owned USM. Does not call
-     * `_reader.loadTensors` — that is what the deploy-downtime win is
-     * about.
+     * then constructs the WeightsMap via
+     * `WeightsMap::fromAttachedChunked(manifest, chunkBases)`. Every
+     * tensor's `usmPtr` is `chunkBases[chunkIndex] + chunkOffset` —
+     * Munin-owned USM, no copy. Does not call `_reader.loadTensors` —
+     * that is what the deploy-downtime win is about.
      *
-     * `expectedFingerprint` is what the peer Munin advertised for the
-     * model in its manifest. This method recomputes the fingerprint
-     * locally from `ggufPath` and refuses the attach if they disagree
-     * — see M-Munin ADR "Modell-Fingerprint" for the reasoning ("Munin
-     * hat Q6, Worker erwartet Q8"). Throws on mismatch, with both
-     * hashes in the message.
+     * `manifest.modelFingerprint` is what the peer Munin advertised for
+     * the model. This method recomputes the fingerprint locally from
+     * `ggufPath` and refuses the attach if they disagree — see M-Munin
+     * ADR "Modell-Fingerprint" for the reasoning ("Munin hat Q6, Worker
+     * erwartet Q8"). Throws on mismatch, with both hashes in the
+     * message.
      *
      * Throws if a model is already loaded on this engine.
      */
     void loadModelAttached(std::string_view                        ggufPath,
-                           std::string_view                        expectedFingerprint,
-                           std::vector<core::gguf::GgufTensor>&&   attachedTensors);
+                           const core::ipc::TensorManifest&        manifest,
+                           std::span<void* const>                  chunkBases);
 
     [[nodiscard]] bool modelLoaded() const noexcept { return _modelLoaded; }
 

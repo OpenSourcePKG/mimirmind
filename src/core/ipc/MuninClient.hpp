@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/gguf/GgufReader.hpp"
 #include "core/ipc/TensorManifest.hpp"
 #include "core/ipc/WireOps.hpp"
 #include "core/l0/L0Context.hpp"
@@ -21,12 +20,14 @@ namespace mimirmind::core::ipc {
  *                        connection each call and closes it on return.
  *
  *   - `attach(path, id)` — attach flow: opens a persistent connection,
- *                          sends the attach request, reads the manifest,
- *                          imports N SCM_RIGHTS handles via
- *                          `IpcImporter::importOne`, and hands back a
- *                          ready-to-use vector of `GgufTensor` structs
- *                          where each `usmPtr` field points at Munin-
- *                          owned USM in this worker's address space.
+ *                          sends the attach request, reads the v2
+ *                          manifest, imports N chunk IPC handles via
+ *                          `IpcImporter::openChunks`, and hands back
+ *                          the manifest plus the resulting per-chunk
+ *                          base pointers in this worker's address
+ *                          space. The caller resolves per-tensor
+ *                          `usmPtr` values via
+ *                          `WeightsMap::fromAttachedChunked`.
  *
  * After `attach()` succeeds the socket stays open — the worker keeps
  * this MuninClient alive for its whole run, so Munin observes the
@@ -50,15 +51,20 @@ public:
     healthz(std::string_view socketPath) noexcept;
 
     /**
-     * Successful attach payload. The `tensors` vector is ready to be
-     * moved into `WeightsMap(std::vector<GgufTensor>)`. The manifest is
-     * kept alongside so the caller can log the model id + fingerprint
-     * and — critically — verify the fingerprint against an expected
-     * value before proceeding to compute.
+     * Successful attach payload. `manifest` describes the model (id,
+     * fingerprint, chunk-layout metadata, per-tensor descriptors);
+     * `chunkBases` holds the worker-side USM pointers returned by
+     * `IpcImporter::openChunks`, in the same order as
+     * `manifest.chunks`.
+     *
+     * Pair them via `WeightsMap::fromAttachedChunked(manifest,
+     * chunkBases)` to obtain the ready-to-use tensor map. The caller
+     * verifies the fingerprint against the local GGUF header before
+     * proceeding to compute.
      */
     struct AttachResult {
-        TensorManifest                   manifest;
-        std::vector<::mimirmind::core::gguf::GgufTensor> tensors;
+        TensorManifest      manifest;
+        std::vector<void*>  chunkBases;
     };
 
     [[nodiscard]] std::expected<AttachResult, std::string>

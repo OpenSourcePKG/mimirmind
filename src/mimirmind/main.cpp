@@ -1274,8 +1274,8 @@ int runServe(const CliArgs& args, const mimirmind::core::config::Config& cfg) {
             }
             try {
                 e->loadModelAttached(m.path,
-                                     result->manifest.modelFingerprint,
-                                     std::move(result->tensors));
+                                     result->manifest,
+                                     std::span<void* const>{result->chunkBases});
             } catch (const std::exception& x) {
                 std::cerr << "serve: loadModelAttached('" << m.id
                           << "') failed: " << x.what() << "\n";

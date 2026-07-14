@@ -158,68 +158,6 @@ TEST(errorEnvelope_wrongType_rejected) {
     EXPECT_TRUE(!parsed);
 }
 
-// ---- WeightsMap attached-mode ---------------------------------------------
-
-TEST(weightsMap_fromAttached_findWorks) {
-    std::vector<GgufTensor> ts;
-    {
-        GgufTensor t{};
-        t.name       = "token_embd.weight";
-        t.type       = GgmlType::Q4_K;
-        t.dimensions = {2560, 262144};
-        t.nbytes     = 128;
-        t.usmPtr     = reinterpret_cast<void*>(0xdeadbeefULL);
-        ts.push_back(std::move(t));
-    }
-    {
-        GgufTensor t{};
-        t.name       = "blk.0.attn_q.weight";
-        t.type       = GgmlType::Q6_K;
-        t.dimensions = {2560, 2560};
-        t.nbytes     = 64;
-        t.usmPtr     = reinterpret_cast<void*>(0xcafebabeULL);
-        ts.push_back(std::move(t));
-    }
-
-    WeightsMap m{std::move(ts)};
-    EXPECT_TRUE(m.isAttached());
-    EXPECT_EQ(m.size(), 2U);
-
-    const auto* q = m.find("blk.0.attn_q.weight");
-    EXPECT_TRUE(q != nullptr);
-    EXPECT_EQ(q->name, std::string{"blk.0.attn_q.weight"});
-    EXPECT_TRUE(q->usmPtr == reinterpret_cast<void*>(0xcafebabeULL));
-
-    const auto* missing = m.find("token_embd.output");
-    EXPECT_TRUE(missing == nullptr);
-
-    // findBlock helper — same result as explicit name lookup.
-    const auto* qViaBlock = m.findBlock(0, "attn_q.weight");
-    EXPECT_TRUE(qViaBlock == q);
-}
-
-TEST(weightsMap_fromAttached_requireThrowsForMissing) {
-    // Attach one dummy tensor so the map's isAttached() (which reports
-    // "we own tensor entries") is true, then require() something that
-    // doesn't exist.
-    std::vector<GgufTensor> ts;
-    GgufTensor t{};
-    t.name       = "irrelevant";
-    t.type       = GgmlType::F32;
-    t.dimensions = {1};
-    ts.push_back(std::move(t));
-    WeightsMap m{std::move(ts)};
-    EXPECT_TRUE(m.isAttached());
-
-    bool threw = false;
-    try {
-        (void)m.require("nope");
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
-    EXPECT_TRUE(threw);
-}
-
 // ---- WeightsMap::fromAttachedChunked --------------------------------------
 //
 // Pure-CPU coverage of the chunk-attached construction path. No L0
@@ -281,6 +219,45 @@ TEST(weightsMap_fromAttachedChunked_computesTensorPointers) {
     EXPECT_TRUE(e->usmPtr == static_cast<void*>(chunk1.data() + 128));
     EXPECT_EQ(e->chunkIndex,  1U);
     EXPECT_EQ(e->chunkOffset, std::uint64_t{128});
+}
+
+TEST(weightsMap_fromAttachedChunked_findBlockAndRequire) {
+    using ::mimirmind::core::ipc::TensorManifest;
+
+    std::vector<std::byte> chunk0(1024);
+    std::vector<void*> chunkBases{static_cast<void*>(chunk0.data())};
+
+    TensorManifest m{};
+    m.modelId          = "id";
+    m.modelFingerprint = "fp";
+    m.chunks.push_back({.chunkIndex = 0, .bytes = 1024});
+    m.tensors.push_back({
+        .name        = "blk.0.attn_q.weight",
+        .type        = GgmlType::Q6_K,
+        .dims        = {2560, 2560},
+        .bytes       = 64,
+        .chunkIndex  = 0,
+        .chunkOffset = 128,
+    });
+
+    auto wm = WeightsMap::fromAttachedChunked(
+        m, std::span<void* const>{chunkBases});
+    EXPECT_TRUE(wm.isAttached());
+
+    // findBlock helper — same result as explicit name lookup.
+    const auto* q     = wm.find("blk.0.attn_q.weight");
+    const auto* qBlk  = wm.findBlock(0, "attn_q.weight");
+    EXPECT_TRUE(q != nullptr);
+    EXPECT_TRUE(qBlk == q);
+
+    // require() throws on missing.
+    bool threw = false;
+    try {
+        (void)wm.require("nope");
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
 }
 
 TEST(weightsMap_fromAttachedChunked_outOfRangeChunkIndex_throws) {

@@ -20,17 +20,12 @@ namespace mimirmind::core::gguf {
  * now; gains layer-aware accessors as soon as the forward pass needs
  * them (attnQ(blockIdx), ffnDown(blockIdx), ...).
  *
- * Three construction paths:
+ * Two construction paths:
  *   - `WeightsMap(reader)`  — standalone mode. Borrows tensor structs
  *     from `reader`; reader must outlive the map.
- *   - `WeightsMap(std::vector<GgufTensor>&&)` — legacy per-tensor
- *     attached mode. Owns the tensor list itself; the entries carry
- *     `usmPtr` values that came from one `IpcImporter::importOne` per
- *     tensor. Removed once the chunk path is proven in prod (Schritt 12
- *     of the M-Munin.1a ADR).
  *   - `WeightsMap::fromAttachedChunked(manifest, chunkBases)` — chunk
- *     attached mode. Materialises the tensor list from a v2 manifest
- *     plus the pointer table returned by
+ *     attached mode (M-Munin.1a). Materialises the tensor list from a
+ *     v2 manifest plus the pointer table returned by
  *     `IpcImporter::openChunks`. Every tensor's `usmPtr` is
  *     `chunkBases[entry.chunkIndex] + entry.chunkOffset` — no
  *     per-tensor IPC handshake happens at all.
@@ -38,10 +33,6 @@ namespace mimirmind::core::gguf {
 class WeightsMap {
 public:
     explicit WeightsMap(const GgufReader& reader);
-
-    /// Attached-mode ctor. Takes ownership of the tensor list; the map
-    /// will find/require by name against these entries directly.
-    explicit WeightsMap(std::vector<GgufTensor> attachedTensors);
 
     /**
      * Build a WeightsMap from a v2 manifest and the imported chunk base
@@ -79,6 +70,12 @@ public:
     [[nodiscard]] bool isAttached() const noexcept { return !_owned.empty(); }
 
 private:
+    /// Attached-mode ctor used internally by `fromAttachedChunked` to
+    /// take ownership of the resolved tensor list. Not part of the
+    /// public API — callers must go through the chunked factory so the
+    /// manifest → usmPtr mapping stays in one place.
+    explicit WeightsMap(std::vector<GgufTensor> attachedTensors);
+
     // Populated only in attached mode; `_byName` points into this vector
     // when set. In reader mode it stays empty and `_byName` points into
     // the reader's own `tensors()` vector.

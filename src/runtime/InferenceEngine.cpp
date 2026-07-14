@@ -175,15 +175,15 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
 }
 
 void InferenceEngine::loadModelAttached(
-        std::string_view                          ggufPath,
-        std::string_view                          expectedFingerprint,
-        std::vector<core::gguf::GgufTensor>&&     attachedTensors) {
+        std::string_view                     ggufPath,
+        const core::ipc::TensorManifest&     manifest,
+        std::span<void* const>               chunkBases) {
     if (_modelLoaded) {
         throw std::runtime_error("InferenceEngine: model already loaded");
     }
-    if (attachedTensors.empty()) {
+    if (manifest.tensors.empty()) {
         throw std::runtime_error("InferenceEngine::loadModelAttached: "
-                                 "attachedTensors is empty — nothing to attach");
+                                 "manifest.tensors is empty — nothing to attach");
     }
 
     MM_LOG_INFO("engine",
@@ -200,11 +200,11 @@ void InferenceEngine::loadModelAttached(
     // time rather than during the first decode.
     const std::string localFingerprint =
         core::gguf::tensorFingerprint(_reader);
-    if (localFingerprint != expectedFingerprint) {
+    if (localFingerprint != manifest.modelFingerprint) {
         throw std::runtime_error(
             std::string{"InferenceEngine::loadModelAttached: fingerprint "
                         "mismatch — Munin advertised '"} +
-            std::string{expectedFingerprint} +
+            manifest.modelFingerprint +
             "' for this model but the local GGUF hashes to '" +
             localFingerprint +
             "'. Refusing attach. Either the wrong file is mounted on "
@@ -214,10 +214,11 @@ void InferenceEngine::loadModelAttached(
     }
 
     MM_LOG_INFO("engine",
-                "loadModelAttached: fingerprint match ({}), adopting {} "
-                "attached tensors (Munin-owned USM)",
-                localFingerprint, attachedTensors.size());
-    _weights.emplace(std::move(attachedTensors));
+                "loadModelAttached: fingerprint match ({}), materialising {} "
+                "attached tensors from {} chunk base(s) (Munin-owned USM)",
+                localFingerprint, manifest.tensors.size(), chunkBases.size());
+    _weights.emplace(
+        core::gguf::WeightsMap::fromAttachedChunked(manifest, chunkBases));
 
     finalizeLoad();
 }
