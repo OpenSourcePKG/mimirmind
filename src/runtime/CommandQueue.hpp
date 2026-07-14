@@ -28,9 +28,9 @@ class GpuKernel;
  * **Backend surface:** This class IS the Level-Zero impl of the compute
  * queue concept. Consumers that include this header pull in
  * `<level_zero/ze_api.h>` transitively and are implicitly L0-scoped.
- * A future Vulkan/CUDA backend would ship a parallel
- * `VulkanCommandQueue.hpp` / `CudaCommandQueue.hpp` alongside — not a
- * shared abstract base (see `[[Mimirmind — HW-Abstraktions-Strategie
+ * A future HIP/CUDA backend would ship a parallel
+ * `HipCommandQueue.hpp` / `CudaCommandQueue.hpp` alongside — not a
+ * shared abstract base (see `[[MimirMind — HW-Abstraktions-Strategie
  * für Multi-Backend-Support]]` Schicht 3, ETA when second backend
  * work starts).
  */

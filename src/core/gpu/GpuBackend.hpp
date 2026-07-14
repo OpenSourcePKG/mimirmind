@@ -15,17 +15,15 @@ namespace mimirmind::core::gpu {
  *
  * `LevelZero` is today's only production impl (Intel Xe-LPG via
  * oneAPI). The other entries are placeholders for the multi-backend
- * roadmap ([[Mimirmind — HW-Abstraktions-Strategie für Multi-Backend-Support]]):
+ * roadmap ([[MimirMind — HW-Abstraktions-Strategie für Multi-Backend-Support]]):
  *
- *  - `VulkanCompute` — cross-vendor (AMD via RADV, Intel, NVIDIA)
- *                     with SPIR-V kernels; the pragmatic
- *                     home-exploration + AMD path.
- *  - `Cuda`          — NVIDIA-native; would need CUDA-C or PTX
- *                     kernels alongside our SPIR-V set.
- *  - `Hip`           — AMD ROCm; parallel kernel-set. Not on the
- *                     recommended path today (Vulkan Compute is the
- *                     lower-friction AMD route).
- *  - `Cpu`           — reference / test fallback.
+ *  - `Hip`  — AMD ROCm; parallel HIP kernel-set. The AMD path.
+ *             Cross-vendor SPIR-V/Vulkan was evaluated and dropped
+ *             on 2026-07-14 — the ~30–40 % tok/s delta vs HIP on
+ *             RDNA3 outweighs the kernel-porting cost.
+ *  - `Cuda` — NVIDIA-native; would need CUDA-C or PTX kernels
+ *             alongside our SPIR-V set.
+ *  - `Cpu`  — reference / test fallback.
  *
  * Each concrete backend is implemented in its own translation unit
  * under `src/core/gpu/<backend>/`. Consumers that only need
@@ -36,9 +34,8 @@ namespace mimirmind::core::gpu {
  */
 enum class BackendKind : std::uint8_t {
     LevelZero,
-    VulkanCompute,
-    Cuda,
     Hip,
+    Cuda,
     Cpu,
     Unknown,
 };
@@ -67,8 +64,8 @@ enum class DeviceKind : std::uint8_t {
  */
 enum class BackendFeature : std::uint8_t {
     /// Level Zero: `ZE_experimental_mutable_command_list`. Also known
-    /// as CLR-prerequisite. Vulkan has a rough analogue via secondary
-    /// command buffers but the semantics differ.
+    /// as CLR-prerequisite. HIP's analogue is `hipGraph` — semantics
+    /// close enough that the CLR use-case ports directly.
     MutableCommandLists,
 
     /// Integer dot-product intrinsics (INT8×INT8 accumulate) at
@@ -114,7 +111,7 @@ struct BackendDeviceInfo {
 
 /**
  * Pure-virtual multi-backend interface. Today's only impl is
- * `core::l0::L0Context`; a second (`VulkanBackend`, `CudaBackend`,
+ * `core::l0::L0Context`; a second (`HipBackend`, `CudaBackend`,
  * …) would be added under `src/core/gpu/<backend>/`.
  *
  * The interface is deliberately narrow — it exposes only what's
@@ -122,7 +119,7 @@ struct BackendDeviceInfo {
  * flags + backend identity. Anything that needs to construct a
  * queue, load a module, or allocate USM still goes through the
  * concrete backend type. See
- * [[Mimirmind — HW-Abstraktions-Strategie für Multi-Backend-Support]]
+ * [[MimirMind — HW-Abstraktions-Strategie für Multi-Backend-Support]]
  * for the Schicht-1..6 progression this fits into (this is
  * Schicht 1).
  *

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# Mimirmind — multi-stage build.
+# MimirMind — multi-stage build.
 #
 # Stages:
 #   1. builder  — toolchain + Intel compute SDK only. No source baked in.
