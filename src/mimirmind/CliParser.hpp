@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "cli/CliArgs.hpp"
+#include "mimirmind/CliArgs.hpp"
 
 namespace mimirmind::cli {
 

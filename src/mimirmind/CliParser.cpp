@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "cli/CliParser.hpp"
+#include "mimirmind/CliParser.hpp"
 
 #include <cstdint>
 #include <cstdlib>

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "cli/CliArgs.hpp"
-#include "cli/CliParser.hpp"
+#include "mimirmind/CliArgs.hpp"
+#include "mimirmind/CliParser.hpp"
 #include "compute/Embedding.hpp"
 #include "compute/GpuMatmul.hpp"
 #include "compute/GpuOps.hpp"
