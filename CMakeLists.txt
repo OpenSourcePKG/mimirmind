@@ -134,6 +134,28 @@ if(MIMIRMIND_ENABLE_HIP)
             "  Configure with -DMIMIRMIND_ENABLE_HIP=OFF to skip.\n")
     endif()
     message(STATUS "HIP found at: ${HIP_PATH} (version ${hip_VERSION})")
+
+    # hipcc — for compiling .hip source into standalone hsaco code
+    # objects that HipModule loads at runtime via hipModuleLoadData.
+    # `--genco` is the hipcc mode that produces one .hsaco per input.
+    find_program(HIPCC_EXECUTABLE
+        NAMES hipcc
+        HINTS "${HIP_PATH}/bin" /usr/bin /usr/local/bin
+        DOC "hipcc — compiles .hip to .hsaco (with --genco)")
+    if(NOT HIPCC_EXECUTABLE)
+        message(FATAL_ERROR
+            "\n  hipcc not found (MIMIRMIND_ENABLE_HIP=ON requires it for\n"
+            "  .hip -> .hsaco kernel builds). Install via ROCm's\n"
+            "  amdgpu-install --usecase=rocm, or add -DHIPCC_EXECUTABLE=<path>.\n")
+    endif()
+    message(STATUS "hipcc: ${HIPCC_EXECUTABLE}")
+
+    # Target arch(s) for hipcc --genco. Default targets our home-lab
+    # Radeon RX 7800 XT (Navi 32). Override with e.g.
+    #   -DMIMIRMIND_HIP_ARCHS="gfx1101;gfx1100;gfx1102"
+    # once the kernel port validates on multiple boards.
+    set(MIMIRMIND_HIP_ARCHS "gfx1101"
+        CACHE STRING "HIP offload archs for hipcc --genco (semicolon list)")
 endif()
 
 if(MIMIRMIND_ENABLE_L0)
@@ -354,7 +376,9 @@ if(MIMIRMIND_ENABLE_HIP)
     add_library(mimirmind_core_hip STATIC
         src/core/gpu/hip/HipContext.cpp
         src/core/gpu/hip/HipEvent.cpp
+        src/core/gpu/hip/HipKernel.cpp
         src/core/gpu/hip/HipMemoryAllocator.cpp
+        src/core/gpu/hip/HipModule.cpp
         src/core/gpu/hip/HipStream.cpp
     )
 
@@ -362,6 +386,47 @@ if(MIMIRMIND_ENABLE_HIP)
         mimirmind_core_common
         hip::host
     )
+
+    # ---- HIP kernel code objects (.hip → .hsaco via hipcc --genco) ---
+    #
+    # Parallel to the ocloc-based L0 spv_kernels custom target. Each .hip
+    # source lands as one .hsaco file in ${CMAKE_BINARY_DIR}/hsaco/
+    # which HipModule loads at runtime. Multi-arch fat-binary support
+    # ships automatically if MIMIRMIND_HIP_ARCHS lists more than one arch.
+    set(HIP_KERNEL_SOURCES
+        kernels_hip/hip_probe_kernel.hip
+    )
+
+    set(HSACO_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/hsaco)
+    file(MAKE_DIRECTORY ${HSACO_OUTPUT_DIR})
+
+    # Turn MIMIRMIND_HIP_ARCHS ("gfx1101" or "gfx1101;gfx1100") into the
+    # hipcc CLI form "--offload-arch=gfx1101 --offload-arch=gfx1100".
+    set(HIP_OFFLOAD_ARGS "")
+    foreach(arch IN LISTS MIMIRMIND_HIP_ARCHS)
+        list(APPEND HIP_OFFLOAD_ARGS "--offload-arch=${arch}")
+    endforeach()
+
+    set(HIP_HSACO_FILES "")
+    foreach(src IN LISTS HIP_KERNEL_SOURCES)
+        get_filename_component(kname ${src} NAME_WE)
+        set(hsaco ${HSACO_OUTPUT_DIR}/${kname}.hsaco)
+        add_custom_command(
+            OUTPUT ${hsaco}
+            COMMAND ${HIPCC_EXECUTABLE}
+                    --genco
+                    ${HIP_OFFLOAD_ARGS}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/${src}
+                    -o ${hsaco}
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${src}
+            WORKING_DIRECTORY ${HSACO_OUTPUT_DIR}
+            COMMENT "hipcc --genco -> ${kname}.hsaco"
+            VERBATIM
+        )
+        list(APPEND HIP_HSACO_FILES ${hsaco})
+    endforeach()
+
+    add_custom_target(hip_kernels ALL DEPENDS ${HIP_HSACO_FILES})
 endif()
 
 # ---- L0-backed targets: mimirmind binary, munin daemon, GPU tests ---------
@@ -764,6 +829,24 @@ if(MIMIRMIND_ENABLE_HIP)
     )
 
     target_link_libraries(hip_mem_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_module_probe — end-to-end HipModule + HipKernel sanity ---
+    #
+    # Loads the hip_probe_kernel.hsaco produced by hipcc --genco, resolves
+    # the write_pattern symbol, launches on a HipStream with HipEvent
+    # timing, and byte-compares the device output against the host
+    # reference. First tool that exercises the full HIP path: context +
+    # allocator + stream + event + module + kernel + launch.
+
+    add_executable(hip_module_probe
+        tools/hip-module-probe.cpp
+    )
+
+    add_dependencies(hip_module_probe hip_kernels)
+
+    target_link_libraries(hip_module_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
