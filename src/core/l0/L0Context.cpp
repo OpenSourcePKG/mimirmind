@@ -193,6 +193,14 @@ bool L0Context::hasFeature(
             // consumers that care today already use the DP4A-slot
             // presence, not this flag.
             return false;
+        case gpu::BackendFeature::MatrixEngine:
+            // Meteor Lake Xe-LPG has DPAS instructions but we don't
+            // dispatch a DPAS kernel path yet. Return false as the
+            // honest "no matrix fast path from this backend today"
+            // signal. Flip to true once the DPAS matmul lands (see
+            // `roadmap-dpas-matrix-engine.md`); an Arrow Lake / Xe2
+            // build would additionally gate on device-family probing.
+            return false;
     }
     return false;
 }

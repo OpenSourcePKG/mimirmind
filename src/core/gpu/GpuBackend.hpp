@@ -18,11 +18,17 @@ namespace mimirmind::core::gpu {
  * roadmap ([[MimirMind — HW-Abstraktions-Strategie für Multi-Backend-Support]]):
  *
  *  - `Hip`  — AMD ROCm; parallel HIP kernel-set. The AMD path.
- *             Cross-vendor SPIR-V/Vulkan was evaluated and dropped
- *             on 2026-07-14 — the ~30–40 % tok/s delta vs HIP on
- *             RDNA3 outweighs the kernel-porting cost.
+ *             HW targets: RDNA2+ (RX 6000-series) via ROCm 5.7+,
+ *             RDNA3 (RX 7000-series) as the sweet spot (WMMA matrix
+ *             engines + stable ROCm), RDNA4 (RX 9000-series) via
+ *             ROCm 6.4+/7.x. Cross-vendor SPIR-V/Vulkan was evaluated
+ *             and dropped on 2026-07-14 — the ~30–40 % tok/s delta
+ *             vs HIP on RDNA3 outweighs the kernel-porting cost.
+ *             Impl lives on an isolated branch, not on `main`, until
+ *             a first kernel achieves bit-parity vs L0.
  *  - `Cuda` — NVIDIA-native; would need CUDA-C or PTX kernels
- *             alongside our SPIR-V set.
+ *             alongside our SPIR-V set. No committed target today —
+ *             gated on firm/DGX-class deploy decision.
  *  - `Cpu`  — reference / test fallback.
  *
  * Each concrete backend is implemented in its own translation unit
@@ -85,6 +91,18 @@ enum class BackendFeature : std::uint8_t {
     /// Level Zero on Meteor Lake: yes via `zeMemAllocHost`. dGPU
     /// backends typically no.
     UnifiedMemoryHost,
+
+    /// Hardware matrix/systolic engines for accelerated matmul —
+    /// vendor names: Intel XMX/DPAS (Arrow Lake+, Xe2 Battlemage), AMD
+    /// WMMA (RDNA3+, RX 7000-series), NVIDIA Tensor Cores (Volta+).
+    /// The flag says "yes, there is a matrix path we can dispatch",
+    /// not which vendor's instruction. Meteor Lake Xe-LPG has DPAS
+    /// but we don't yet ship a DPAS kernel path — returned as false
+    /// on Level Zero today, honest signal (see
+    /// `roadmap-dpas-matrix-engine.md` in Synaipse). Flip to true on
+    /// the L0 impl once the DPAS matmul is wired; HIP will flip on
+    /// its own on RDNA3+ once WMMA kernels land.
+    MatrixEngine,
 };
 
 /**
