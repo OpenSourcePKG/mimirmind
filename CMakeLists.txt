@@ -353,6 +353,7 @@ endif()
 if(MIMIRMIND_ENABLE_HIP)
     add_library(mimirmind_core_hip STATIC
         src/core/gpu/hip/HipContext.cpp
+        src/core/gpu/hip/HipMemoryAllocator.cpp
     )
 
     target_link_libraries(mimirmind_core_hip PUBLIC
@@ -747,6 +748,20 @@ if(MIMIRMIND_ENABLE_HIP)
     )
 
     target_link_libraries(hip_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_mem_probe — round-trip sanity for HipMemoryAllocator -----
+    #
+    # Alloc + H2D + D2H + byte-compare per HipAllocKind. Companion to
+    # hip_probe: hip_probe proves the runtime + toolchain, this proves
+    # the memory-layer + RAII wrapper. Not installed in any runtime image.
+
+    add_executable(hip_mem_probe
+        tools/hip-mem-probe.cpp
+    )
+
+    target_link_libraries(hip_mem_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
