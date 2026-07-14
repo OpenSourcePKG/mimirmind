@@ -1,6 +1,6 @@
-<p align="center"><img src="./doc/logo.svg" alt="Mimirmind" width="180"></p>
+<p align="center"><img src="./doc/logo.svg" alt="MimirMind" width="180"></p>
 
-<h1 align="center">Mimirmind</h1>
+<h1 align="center">MimirMind</h1>
 
 <p align="center"><strong>A standalone C++20 inference engine for GGUF language models on Intel Arc integrated GPUs — written from scratch, no llama.cpp, no PyTorch, no SYCL.</strong></p>
 
@@ -12,7 +12,7 @@
 
 ## What it is
 
-Mimirmind runs large GGUF-quantised language models on the **integrated
+MimirMind runs large GGUF-quantised language models on the **integrated
 Intel Arc GPU of Meteor Lake / Lunar Lake** systems through **oneAPI
 Level Zero** with **Unified Shared Memory**. It speaks the
 **OpenAI Chat Completions API** so existing clients drop in without
@@ -36,7 +36,7 @@ should run it — a recent Core Ultra laptop with 64 GiB of shared
 DDR5 — is *capable*. The stacks just haven't shipped support for the
 gemma4 architecture yet.
 
-Mimirmind was built to close that gap on the hardware that was already
+MimirMind was built to close that gap on the hardware that was already
 on the desk. Along the way it turned out to be a remarkably clean way
 to use the Intel iGPU's Unified Memory Architecture for what it is good
 at, instead of treating it like a small discrete GPU.
@@ -65,7 +65,7 @@ the sweet spot for interactive workloads on constrained hardware.
 **Built for UMA, not adapted.** Discrete-GPU inference engines treat
 host RAM and GPU VRAM as separate worlds connected by a PCIe straw.
 On Meteor Lake there is no straw — the CPU and the iGPU read from the
-same physical DDR5. Mimirmind allocates every weight, every KV-cache
+same physical DDR5. MimirMind allocates every weight, every KV-cache
 row, and every scratch buffer through `zeMemAllocShared`, then hands
 the *same* pointer to GPU kernels and to CPU helpers. There are no
 host↔device copies.
@@ -73,7 +73,7 @@ host↔device copies.
 **Per-tensor allocation, no monolith.** The Level Zero loader on
 Meteor Lake currently caps single allocations at ~4 GiB. Many engines
 work around this by enabling relaxed-allocation env vars and praying.
-Mimirmind allocates one block per GGUF tensor — 658 of them for
+MimirMind allocates one block per GGUF tensor — 658 of them for
 Gemma 4 — through a segregated-bucket free-list allocator. The largest
 single tensor (`ffn_gate_up_exps` at 539 MiB for Q8_0) sits well under
 the cap and the model loads in 25 GiB without any
@@ -214,11 +214,43 @@ Gemma 4 31B dense variant. On UMA hardware this is mostly a
 page-table-shuffle problem, not the PCIe-bandwidth problem it is on
 discrete GPUs.
 
-**Pegenaut backend.** Mimirmind is the inference half of a TypeScript
+**Pegenaut backend.** MimirMind is the inference half of a TypeScript
 RAG stack we're building in parallel. The two will ship as a unit.
 
 See [`doc/roadmap.md`](doc/roadmap.md) for the detailed milestone
 breakdown.
+
+## The two ravens
+
+The engine is not alone. Two companion components extend it — both
+named after Odin's ravens, each aligned with what it carries.
+
+<p align="center">
+  <img src="./doc/logo-munin.svg" alt="Munin" width="120">
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="./doc/logo-hugin.svg" alt="Hugin" width="120">
+</p>
+
+**Munin — memory.** The persistent model-memory daemon. Munin loads
+GGUF weights once into shared USM and keeps them resident across
+inference-worker restarts, serving short-lived attached workers over a
+chunk-based IPC. Implemented and prod-shaped; lives in
+[`src/munin/`](src/munin/) and ships via
+[`docker-compose.munin.yml`](docker-compose.munin.yml).
+See [`doc/attached-rollout.md`](doc/attached-rollout.md) for the
+rollout runbook.
+
+**Hugin — thought.** The input-compression adapter. Hugin flies out to
+a long document, extracts its meaning, and returns with a small
+compressed representation that the base model consumes as if it were
+the original context. Targets 20k-token RAG windows compressed to
+64–256 memory tokens, cutting prefill traffic by two orders of
+magnitude on UMA hardware. Engineering design in
+[`doc/hugin.md`](doc/hugin.md); implementation is M-Hugin,
+currently unscheduled.
+
+Munin holds what has been gathered. Hugin flies out to gather it.
+Mimir is the wise counsellor they both serve.
 
 ## Documentation
 

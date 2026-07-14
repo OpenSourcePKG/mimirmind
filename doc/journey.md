@@ -4,7 +4,7 @@
 > would have saved most of them.
 
 This is a development post-mortem more than a technical reference. If
-you want to know how Mimirmind works, read [`architecture.md`](architecture.md).
+you want to know how MimirMind works, read [`architecture.md`](architecture.md).
 If you want to know what *not* to do next time you bring up a new
 model, keep reading.
 

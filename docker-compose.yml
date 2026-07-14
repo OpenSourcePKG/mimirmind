@@ -1,4 +1,4 @@
-# Mimirmind — Docker-only dev + runtime.
+# MimirMind — Docker-only dev + runtime.
 #
 # Goal: the developer machine stays free of Intel SDK packages. All build
 # and run happens inside containers; only the source lives on the host.

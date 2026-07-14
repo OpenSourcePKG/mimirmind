@@ -1,4 +1,4 @@
-# Hugin — Input-Compression-Adapter für Mimirmind auf Xe-LPG
+# Hugin — Input-Compression-Adapter für MimirMind auf Xe-LPG
 
 *System-Integrations-Design für einen Level-Zero-/USM-Inference-Runtime*
 
@@ -826,7 +826,7 @@ statt eines — siehe M-Hugin.2-Revision in §9.
 
 ---
 
-## 5. System-Integration in Mimirmind
+## 5. System-Integration in MimirMind
 
 Hugin ist eine reine Runtime-Optimierung, die in einen Codebase
 passen muss, dessen Architektur bereits festgeschrieben ist. Dieser
@@ -984,7 +984,7 @@ $0 \dots m-1$ und werden RoPE-encoded wie normale Tokens.
 
 Pegenaut ist der beabsichtigte Consumer. Zwei Integrations-Modi:
 
-**Mode 1 — transparent.** Pegenaut merkt nichts. Mimirmind bekommt
+**Mode 1 — transparent.** Pegenaut merkt nichts. MimirMind bekommt
 den vollen RAG-Prompt, Hugin komprimiert die abgerufenen Chunks
 intern, pegenaut sieht nichts davon. Kleinster Code-Change, nutzt
 aber kein Per-Chunk-Caching in Chroma.

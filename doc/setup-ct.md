@@ -1,4 +1,4 @@
-# Setting up the runtime target for Mimirmind
+# Setting up the runtime target for MimirMind
 
 > **TL;DR:** the recommended path is **Docker**. Pull / build the runtime
 > image once, pass `/dev/dri` + groups `44`/`104`, done. The native install
@@ -18,7 +18,7 @@ The runtime target is expected to be set up with:
 - Owner groups `video` (GID **44**) and `render` (GID **104**) preserved
   through any LXC / Docker boundary.
 
-Mimirmind itself is **not** built on the runtime target. We cross-build
+MimirMind itself is **not** built on the runtime target. We cross-build
 SPIR-V on the developer machine and ship the binary + `.spv` files. The
 runtime target only needs the loader, the GPU back-end and the ICD.
 
@@ -173,7 +173,7 @@ Expected first run (M1):
 
 ```
 +------------------------------------------------------------+
-|                          Mimirmind                         |
+|                          MimirMind                         |
 |       M1 - Level Zero device enumeration smoke test        |
 +------------------------------------------------------------+
 Found 1 Level-Zero device(s):
@@ -239,7 +239,7 @@ docker compose run --rm builder bash -lc '
 
 ## Known pitfalls
 
-- **4 GiB single-allocation cap on Level Zero.** Mimirmind side-steps it
+- **4 GiB single-allocation cap on Level Zero.** MimirMind side-steps it
   by design (many small per-tensor allocations). Set both
   `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1` and
   `UR_L0_USE_RELAXED_ALLOCATION_LIMITS=1` as defensive ENVs anyway. The
@@ -295,7 +295,7 @@ sees the produced `.spv` files and the `mimirmind` binary that loads them.
 
 ---
 
-## LXC + Docker configuration for Mimirmind features
+## LXC + Docker configuration for MimirMind features
 
 When the runtime target is a Proxmox LXC container running Docker
 (typical Pegenaut deployment), the engine relies on several host

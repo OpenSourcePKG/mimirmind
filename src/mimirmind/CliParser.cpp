@@ -13,7 +13,7 @@ namespace mimirmind::cli {
 
 const char* const kBanner =
     "+------------------------------------------------------------+\n"
-    "|                          Mimirmind                         |\n"
+    "|                          MimirMind                         |\n"
     "|   M1-M5 GPU matmul + M7a InferenceEngine (Envoy -> Mimir)  |\n"
     "+------------------------------------------------------------+\n";
 

@@ -1,4 +1,4 @@
-# Hugin — Input-Compression Adapter for Mimirmind on Xe-LPG
+# Hugin — Input-Compression Adapter for MimirMind on Xe-LPG
 
 *System-integration design for a Level-Zero / USM inference runtime*
 
@@ -78,7 +78,7 @@ counsellor (Mimir) can then act on.
 
 ### 1.1 The prefill bottleneck on RAG
 
-Mimirmind's target production workload is Retrieval-Augmented Generation
+MimirMind's target production workload is Retrieval-Augmented Generation
 served to the sister project *pegenaut*. In a typical RAG call, the
 user's turn is preceded by 3 to 15 retrieved document chunks totalling
 between 3 000 and 20 000 tokens. The autoregressive base model — Gemma 4
@@ -827,7 +827,7 @@ instead of one — see M-Hugin.2 revision in §9.
 
 ---
 
-## 5. System integration in Mimirmind
+## 5. System integration in MimirMind
 
 Hugin is a runtime-time-only optimisation that must fit into a
 codebase whose architecture is already fixed. This section maps
@@ -984,7 +984,7 @@ $0 \dots m-1$ and are RoPE-encoded just like ordinary tokens.
 
 Pegenaut is the intended consumer. Two integration modes:
 
-**Mode 1 — transparent.** Pegenaut sees no change. Mimirmind
+**Mode 1 — transparent.** Pegenaut sees no change. MimirMind
 receives the full RAG prompt, Hugin compresses the retrieved
 document chunks internally, and pegenaut is oblivious. This mode
 requires the smallest amount of new code but does not exploit

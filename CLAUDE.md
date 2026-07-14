@@ -1,10 +1,10 @@
 ## Project
 
-**Mimirmind** is a standalone C++ inference engine for GGUF language models,
+**MimirMind** is a standalone C++ inference engine for GGUF language models,
 targeting the integrated Intel Arc GPU on Meteor Lake via oneAPI Level Zero
 with Unified Shared Memory. Loads pre-trained models; **does not train**.
 
-Sister project: `pegenaut` (TypeScript RAG stack, separate repo). Mimirmind
+Sister project: `pegenaut` (TypeScript RAG stack, separate repo). MimirMind
 is intended to eventually serve as a drop-in OpenAI-compatible inference
 backend for Pegenaut, once Phase **Mimir-1.0** lands.
 

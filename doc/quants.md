@@ -1,6 +1,6 @@
 # Quantisation
 
-Mimirmind reads the standard GGUF quantisation formats and runs as much
+MimirMind reads the standard GGUF quantisation formats and runs as much
 of the matmul work as possible on the iGPU. This document describes
 which formats are supported, how the GPU kernels are structured, and
 what happens when a tensor's type does not have a GPU kernel.

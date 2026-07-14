@@ -2,7 +2,7 @@
 
 > Technical reference. Audience: someone reading the code.
 
-Mimirmind is a single-process inference engine: one or more models
+MimirMind is a single-process inference engine: one or more models
 loaded into shared memory, served via an OpenAI-compatible HTTP
 endpoint. The process is split into a small number of clearly-bounded
 components that you can understand one at a time.
@@ -64,13 +64,13 @@ changes; we have not benchmarked it.
 
 What the iGPU is good at: arithmetic over data that is already in
 RAM. What it is *not* good at: pretending to be a discrete GPU with a
-small fast pool. Mimirmind plays to the first; many other engines try
+small fast pool. MimirMind plays to the first; many other engines try
 to retrofit the second.
 
 ## Memory: per-tensor USM, no monolith
 
 The Level Zero loader on Meteor Lake currently caps single
-`zeMemAllocShared` calls at ~4 GiB on most driver versions. Mimirmind
+`zeMemAllocShared` calls at ~4 GiB on most driver versions. MimirMind
 takes that constraint at face value and allocates **one block per GGUF
 tensor** — 658 of them for Gemma 4 — rather than fighting it with the
 relaxed-allocation env vars.

@@ -1,7 +1,7 @@
 # Roadmap
 
 Norse-themed phase names. Each phase has to be runnable and verifiable
-before the next one starts. Mimirmind exists to query a *loaded*
+before the next one starts. MimirMind exists to query a *loaded*
 knowledge source; Mimir was the keeper of the *Well of Wisdom* whose
 preserved head whispered counsel to Odin in every crisis.
 
@@ -78,7 +78,7 @@ instruction-tuned models in general) is in
   currently re-prefills the entire context. With cache reuse only the
   *new* user turn needs to be prefilled.
 - **Pegenaut integration** — the sister TypeScript RAG project that
-  this engine was originally built to feed. Mimirmind plugs in as the
+  this engine was originally built to feed. MimirMind plugs in as the
   LLM provider via the OpenAI-compatible API.
 
 ## M5i — Prefill-Perf-Pass  ✅ Complete (2026-07-02)
@@ -177,7 +177,7 @@ double the KV budget. Expected payoff after M8.K lands:
 | E4B Q4_K_M | 7.6 tok/s | **18-23 tok/s** | 2.4-3.0× |
 | E2B Q4_K_M | ~12.8 tok/s (projected) | **30-38 tok/s** | 2.4-3.0× |
 
-What Mimirmind needs to add:
+What MimirMind needs to add:
 - GGUF loader support for the 4-layer drafter models
 - Second `_backend` slot on `InferenceEngine`
 - Speculation loop with target-KV-shared draft state
@@ -190,7 +190,7 @@ Rough sizing: 5-7 days, plus M8.K running first.
 
 Google released DiffusionGemma on 2026-06-10 — a 26B MoE (3.8B
 active) trained on text-diffusion instead of autoregression, with 4×
-generation throughput on high-end GPUs. Adapting Mimirmind for it
+generation throughput on high-end GPUs. Adapting MimirMind for it
 would need a new (bidirectional) attention kernel, a new
 denoising-refinement sampler, and a different GGUF conversion; the
 quality trade-off is explicit even in Google's own guidance ("For
@@ -272,12 +272,12 @@ See [`quants.md`](quants.md) for the implementation detail.
 
 ## What this project will *not* become
 
-- **A training framework.** Mimirmind loads pre-trained models. The
+- **A training framework.** MimirMind loads pre-trained models. The
   "wisdom" is already in the head. We give it a voice; we do not
   teach it anything new. Adding training would change the project's
   identity.
 - **A multi-vendor abstraction.** No CUDA backend, no ROCm backend,
-  no Vulkan backend. Mimirmind is built for Intel Level Zero on
+  no Vulkan backend. MimirMind is built for Intel Level Zero on
   UMA-capable iGPUs and uses that platform as a target, not as one
   of many. Other platforms have plenty of options.
 - **A wrapper around llama.cpp.** The entire point is to learn the

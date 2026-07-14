@@ -50,14 +50,14 @@ private:
  * RAII wrapper around a Level Zero driver + context, scoped to the first
  * available GPU device. Multi-driver / multi-GPU support is deliberately
  * out of scope for M1 — Meteor Lake exposes a single iGPU and that is what
- * Mimirmind targets first.
+ * MimirMind targets first.
  *
  * Implements `core::gpu::GpuBackend` — the backend-neutral interface.
  * Consumers that only need device-info + feature-flags should take
  * `GpuBackend&`; consumers that touch raw L0 handles (CommandQueue,
  * GpuModule, UsmAllocator, GpuOps, GpuMatmul) stay on `L0Context&`
  * because those classes ARE the L0 backend. See
- * [[Mimirmind — HW-Abstraktions-Strategie für Multi-Backend-Support]]
+ * [[MimirMind — HW-Abstraktions-Strategie für Multi-Backend-Support]]
  * for the Schicht-1..6 plan.
  */
 class L0Context : public ::mimirmind::core::gpu::GpuBackend {

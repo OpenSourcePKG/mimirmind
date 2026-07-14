@@ -121,7 +121,7 @@ Response:
 | `stream` | bool | false | Switches to SSE — see below |
 | `frequency_penalty` | float | **0.5** | OpenAI, [-2, 2]. Server default > 0 to prevent repetition loops. Send explicit `0` to disable. |
 | `presence_penalty` | float | 0.0 | OpenAI, [-2, 2]. |
-| `repetition_penalty` | float | **1.1** | Mimirmind extension (llama.cpp-style multiplicative), typically [1.0, 1.3]. Server default > 1.0. Send explicit `1.0` to disable. |
+| `repetition_penalty` | float | **1.1** | MimirMind extension (llama.cpp-style multiplicative), typically [1.0, 1.3]. Server default > 1.0. Send explicit `1.0` to disable. |
 
 ### Repetition-control note (M7f)
 
