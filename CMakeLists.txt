@@ -353,7 +353,9 @@ endif()
 if(MIMIRMIND_ENABLE_HIP)
     add_library(mimirmind_core_hip STATIC
         src/core/gpu/hip/HipContext.cpp
+        src/core/gpu/hip/HipEvent.cpp
         src/core/gpu/hip/HipMemoryAllocator.cpp
+        src/core/gpu/hip/HipStream.cpp
     )
 
     target_link_libraries(mimirmind_core_hip PUBLIC
