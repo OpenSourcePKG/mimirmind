@@ -246,6 +246,9 @@ target_link_libraries(mimirmind_core PUBLIC
 add_executable(mimirmind
     src/mimirmind/main.cpp
     src/mimirmind/CliParser.cpp
+    src/mimirmind/ParityMode.cpp
+    src/mimirmind/ServeMode.cpp
+    src/mimirmind/SmokeMode.cpp
     src/mimirmind/diagnostics/Formatting.cpp
     src/mimirmind/diagnostics/SmokeSuite.cpp
     src/compute/Activations.cpp
