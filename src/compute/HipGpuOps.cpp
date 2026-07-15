@@ -662,11 +662,56 @@ void HipGpuOps::kvQuantCommitQ8Async(const float* xSrc, void* kvDst,
              kKvQuantCommitLocalSize, 1, 1);
 }
 
-void HipGpuOps::qkvSplitAsync(const float*, float*, void*, void*,
-                              std::size_t, std::size_t, std::size_t,
-                              bool,
-                              std::size_t, runtime::KvDtype, bool) {
-    throwNotImplemented("qkvSplitAsync");
+void HipGpuOps::qkvSplitAsync(const float* fused, float* Yq,
+                              void* YkBase, void* YvBase,
+                              std::size_t M, std::size_t Nq, std::size_t Nkv,
+                              bool hasV,
+                              std::size_t writeOffset,
+                              runtime::KvDtype kvDtype,
+                              bool useStagingSlot) {
+    if (M == 0 || Nq == 0 || Nkv == 0) {
+        return;
+    }
+    const std::size_t Nfused = Nq + Nkv * (hasV ? 2 : 1);
+    const std::size_t total  = M * Nfused;
+
+    // Yv may legitimately be nullptr when hasV is false. The kernel
+    // guards against dereferencing it, but the HIP launch API still
+    // expects a valid pointer for slot 3 — route to `fused` as a
+    // safe non-null stub. Same trick as L0.
+    const void* YvPtr = hasV ? YvBase : static_cast<const void*>(fused);
+
+    // fp16 KV path routes to the fp16 variant. Yq stays fp32 in both;
+    // only the K/V scatter store differs (vstore_half vs scalar).
+    auto& k = (kvDtype == runtime::KvDtype::FP16)
+                  ? _pimpl->_qkvSplitFp16Kernel
+                  : _pimpl->_qkvSplitKernel;
+
+    // Slot-swap discipline mirror of rmsNormQkvAsync — see that
+    // method for the full rationale (avoids CLR replay races).
+    std::int32_t* offsetSlot;
+    if (useStagingSlot) {
+        offsetSlot = _stagingOffsetSlotUsm;
+    } else {
+        const std::int32_t v = toInt32(writeOffset, "qkvSplit writeOffset");
+        _ctx.allocator().copyH2D(_curLenSlotUsm, &v, sizeof(std::int32_t));
+        offsetSlot = _curLenSlotUsm;
+    }
+
+    k.setPtr  (0, fused);
+    k.setPtr  (1, Yq);
+    k.setPtr  (2, YkBase);
+    k.setPtr  (3, YvPtr);
+    k.setValue(4, toInt32(M,      "qkvSplit M"));
+    k.setValue(5, toInt32(Nq,     "qkvSplit Nq"));
+    k.setValue(6, toInt32(Nkv,    "qkvSplit Nkv"));
+    k.setValue(7, hasV ? std::int32_t{1} : std::int32_t{0});
+    k.setValue(8, toInt32(Nfused, "qkvSplit Nfused"));
+    k.setPtr  (9, offsetSlot);
+
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
 }
 
 void HipGpuOps::attentionAsync(const float*, const void*, const void*,
@@ -684,9 +729,34 @@ void HipGpuOps::attentionAsync(const float*, const void*, const void*,
     throwNotImplemented("attentionAsync");
 }
 
-void HipGpuOps::matmulQ8_0VecReorderAsync(const void*, std::size_t, std::size_t,
-                                          const float*, float*) {
-    throwNotImplemented("matmulQ8_0VecReorderAsync");
+void HipGpuOps::matmulQ8_0VecReorderAsync(const void* wReordered,
+                                          std::size_t N, std::size_t K,
+                                          const float* x, float* y) {
+    if (N == 0 || K == 0) {
+        return;
+    }
+    // Launch geometry matches matmul_q8_0_vec: local=64, subgroup=16,
+    // 4 outputs per workgroup, one workgroup per group of 4 output rows.
+    // Kept in sync with GpuMatmul::kLocalSize / kOutputsPerGroup by the
+    // kernel macros MATMUL_Q8_0_LOCAL / MATMUL_Q8_0_SG.
+    constexpr std::uint32_t kLocalSize       = 64;
+    constexpr std::uint32_t kOutputsPerGroup = 4;
+
+    const std::int32_t Ki = toInt32(K, "matmulQ8_0VecReorder K");
+    const std::int32_t Ni = toInt32(N, "matmulQ8_0VecReorder N");
+
+    auto& k = _pimpl->_matmulQ8_0VecReorderKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, wReordered);
+    k.setPtr  (2, y);
+    k.setValue(3, Ki);
+    k.setValue(4, Ni);
+
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+    k.launch(_ctx.stream(),
+             nGroups, 1, 1,
+             kLocalSize, 1, 1);
 }
 
 } // namespace mimirmind::compute
