@@ -397,6 +397,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/hip_probe_kernel.hip
         kernels_hip/add_bias.hip
         kernels_hip/add_residual.hip
+        kernels_hip/attention_flash_merge.hip
         kernels_hip/attention_flash_partial.hip
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/mul_scalar.hip
@@ -1106,6 +1107,24 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_attention_flash_partial_probe hip_kernels)
 
     target_link_libraries(hip_attention_flash_partial_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_attention_flash_merge_probe — FlashAttention merge ------
+    #
+    # Companion to the partial probe. Feeds a CPU-computed partial
+    # tensor into the merge kernel, compares against a MONOLITHIC
+    # (no-tiling) attention fp64 reference. Validates the online-
+    # softmax identity round-trip. Two-case: A full-attention,
+    # B SWA=32 (tile 0 neutral — merge must handle beta=0 slots).
+
+    add_executable(hip_attention_flash_merge_probe
+        tools/hip-attention-flash-merge-probe.cpp
+    )
+
+    add_dependencies(hip_attention_flash_merge_probe hip_kernels)
+
+    target_link_libraries(hip_attention_flash_merge_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
