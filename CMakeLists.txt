@@ -392,6 +392,14 @@ if(MIMIRMIND_ENABLE_HIP)
         # accessors + Q8_0 reorder counters + module loading are
         # real. Follow-up commits fill launches group-by-group.
         src/compute/hip/GpuOps.cpp
+
+        # Schritt 3b sub-F: HipGpuMatmul skeleton — the ComputeMatmul
+        # peer to HipGpuOps. Loads the 5 Q8_0 matmul kernels
+        # (vec / gemm / gemm_v2 / vec_dp4a / moe_down_fused_k).
+        # supports/dp4aAvailable/moeDownFusedKAvailable/sync/
+        # autotuneReport are real; matmul launches throw pending
+        # follow-up fill-in commits.
+        src/compute/hip/GpuMatmul.cpp
     )
 
     target_link_libraries(mimirmind_core_hip PUBLIC

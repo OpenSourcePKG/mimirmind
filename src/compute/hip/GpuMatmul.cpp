@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
+#include "compute/hip/GpuMatmul.hpp"
+
+#include "compute/hip/GpuOps.hpp"
+#include "core/gpu/hip/HipComputeContext.hpp"
+#include "core/gpu/hip/HipKernel.hpp"
+#include "core/gpu/hip/HipMemoryAllocator.hpp"
+#include "core/gpu/hip/HipModule.hpp"
+#include "core/gpu/hip/HipStream.hpp"
+#include "core/log/Log.hpp"
+
+#include <array>
+#include <cstdlib>
+#include <filesystem>
+#include <stdexcept>
+#include <string>
+
+namespace mimirmind::compute::hip {
+
+namespace {
+
+constexpr const char* kDefaultHsacoDir = "/usr/local/share/mimirmind/hsaco";
+
+// Same resolver as HipGpuOps.cpp — env override, prod install, three
+// build-tree fallbacks. Kept as a local duplicate rather than lifted to
+// a shared helper because these two files are the only consumers and
+// their lookups are independent (a common header would drag HipModule
+// deps into a place that doesn't need them).
+std::filesystem::path resolveHsacoPath(std::string_view name) {
+    const std::string filename = std::string{name} + ".hsaco";
+
+    if (const char* env = std::getenv("MIMIRMIND_HSACO_DIR")) {
+        if (env[0] != '\0') {
+            const std::filesystem::path p =
+                std::filesystem::path{env} / filename;
+            if (std::filesystem::exists(p)) {
+                return p;
+            }
+        }
+    }
+
+    {
+        const std::filesystem::path p =
+            std::filesystem::path{kDefaultHsacoDir} / filename;
+        if (std::filesystem::exists(p)) {
+            return p;
+        }
+    }
+
+    for (auto rel : std::array<const char*, 3>{
+             "build/hsaco", "../build/hsaco", "hsaco"}) {
+        const std::filesystem::path p =
+            std::filesystem::path{rel} / filename;
+        if (std::filesystem::exists(p)) {
+            return p;
+        }
+    }
+
+    throw std::runtime_error(
+        "compute::hip::GpuMatmul: cannot find " + filename +
+        " — set MIMIRMIND_HSACO_DIR or install to " + kDefaultHsacoDir);
+}
+
+::mimirmind::core::hip::HipModule loadHipModule(
+    ::mimirmind::core::hip::HipContext& ctx, std::string_view name) {
+    const auto path = resolveHsacoPath(name);
+    MM_LOG_INFO("hip::GpuMatmul", "loading module '{}' from {}",
+                std::string{name}, path.string());
+    return ::mimirmind::core::hip::HipModule::fromFile(ctx, path.string());
+}
+
+[[noreturn]] void throwNotImplemented(const char* method) {
+    throw std::runtime_error(
+        std::string{"compute::hip::GpuMatmul::"} + method +
+        ": not yet implemented (Schritt 3b sub-F skeleton — kernel-launch "
+        "impl lands in follow-up commits)");
+}
+
+} // namespace
+
+// Pimpl body — 5 Q8_0 matmul-family kernels. Q4_K / Q5_K / Q6_K
+// matmul kernels aren't ported to HIP yet; the dispatcher's
+// `supports()` returns false for those types so callers know to
+// fall back (or the HIP backend refuses to load models with
+// unsupported quant weights).
+struct GpuMatmul::Impl {
+    ::mimirmind::core::hip::HipModule _matmulQ8_0VecModule;
+    ::mimirmind::core::hip::HipKernel _matmulQ8_0VecKernel;
+    ::mimirmind::core::hip::HipModule _matmulQ8_0GemmModule;
+    ::mimirmind::core::hip::HipKernel _matmulQ8_0GemmKernel;
+    ::mimirmind::core::hip::HipModule _matmulQ8_0GemmV2Module;
+    ::mimirmind::core::hip::HipKernel _matmulQ8_0GemmV2Kernel;
+    ::mimirmind::core::hip::HipModule _matmulQ8_0VecDp4aModule;
+    ::mimirmind::core::hip::HipKernel _matmulQ8_0VecDp4aKernel;
+    ::mimirmind::core::hip::HipModule _moeDownFusedKQ8_0Module;
+    ::mimirmind::core::hip::HipKernel _moeDownFusedKQ8_0Kernel;
+
+    explicit Impl(::mimirmind::core::hip::HipContext& ctx)
+        : _matmulQ8_0VecModule    {loadHipModule(ctx, "matmul_q8_0_vec")},
+          _matmulQ8_0VecKernel    {
+              _matmulQ8_0VecModule.getKernel("matmul_q8_0_vec")},
+          _matmulQ8_0GemmModule   {loadHipModule(ctx, "matmul_q8_0_gemm")},
+          _matmulQ8_0GemmKernel   {
+              _matmulQ8_0GemmModule.getKernel("matmul_q8_0_gemm")},
+          _matmulQ8_0GemmV2Module {loadHipModule(ctx, "matmul_q8_0_gemm_v2")},
+          _matmulQ8_0GemmV2Kernel {
+              _matmulQ8_0GemmV2Module.getKernel("matmul_q8_0_gemm_v2")},
+          _matmulQ8_0VecDp4aModule{loadHipModule(ctx, "matmul_q8_0_vec_dp4a")},
+          _matmulQ8_0VecDp4aKernel{
+              _matmulQ8_0VecDp4aModule.getKernel("matmul_q8_0_vec_dp4a")},
+          _moeDownFusedKQ8_0Module{loadHipModule(ctx, "moe_down_fused_k_q8_0")},
+          _moeDownFusedKQ8_0Kernel{
+              _moeDownFusedKQ8_0Module.getKernel("moe_down_fused_k_q8_0")}
+    {}
+};
+
+GpuMatmul::GpuMatmul(::mimirmind::core::hip::HipComputeContext& ctx,
+                     GpuOps& ops)
+    : _ctx{ctx},
+      _ops{ops},
+      _pimpl{std::make_unique<Impl>(ctx.hipContext())}
+{
+    MM_LOG_INFO("hip::GpuMatmul",
+                "compute::hip::GpuMatmul ready — 5 Q8_0 kernels loaded "
+                "(vec / gemm / gemm_v2 / vec_dp4a / moe_down_fused_k)");
+}
+
+GpuMatmul::~GpuMatmul() = default;
+
+// ---- Real (non-stub) implementations --------------------------------
+
+bool GpuMatmul::supports(::mimirmind::core::gguf::GgmlType type)
+    const noexcept {
+    // Only Q8_0 quantised weights are dispatched on the HIP side today.
+    // Q4_K / Q5_K / Q6_K HIP kernels haven't been ported yet — the
+    // dispatcher returns false so callers can fall back to CPU (or
+    // the engine refuses the model at load time).
+    return type == ::mimirmind::core::gguf::GgmlType::Q8_0;
+}
+
+bool GpuMatmul::dp4aAvailable() const noexcept {
+    // The kernel is compiled in whenever this class exists (see the
+    // ctor's Impl init list), so availability is unconditional on the
+    // HIP side. gfx1101 has native `v_dot4_i32_iu8` — the kernel
+    // uses that via the manual dot4 helper in matmul_q8_0_vec_dp4a.hip
+    // (there is no pure signed-signed sdot4 on RDNA3).
+    return true;
+}
+
+bool GpuMatmul::dp4aAvailable(::mimirmind::core::gguf::GgmlType type)
+    const noexcept {
+    return type == ::mimirmind::core::gguf::GgmlType::Q8_0;
+}
+
+bool GpuMatmul::moeDownFusedKAvailable() const noexcept {
+    return true;   // Q8_0 variant is always loaded.
+}
+
+bool GpuMatmul::moeDownFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
+    const noexcept {
+    return type == ::mimirmind::core::gguf::GgmlType::Q8_0;
+}
+
+void GpuMatmul::sync() {
+    _ctx.stream().synchronize();
+}
+
+std::vector<::mimirmind::compute::AutotuneReport>
+GpuMatmul::autotuneReport() const {
+    // Skeleton: return a single Q8_0 entry with the availability flags
+    // set (vec + gemm + dp4a all compiled in) but every timing at 0.
+    // Follow-up commit fills in real bench-time populated timings and
+    // the gemmMinM cross-over pick. Consumers (SystemStatusBuilder)
+    // render 0-ms timings as "not measured" already.
+    ::mimirmind::compute::AutotuneReport r{};
+    r.name             = "Q8_0";
+    r.gemmAvailable    = true;
+    r.gemmPicked       = false;
+    r.vecMs            = 0.0;
+    r.gemmMs           = 0.0;
+    r.mBuckets         = ::mimirmind::compute::kAutotuneMBuckets;
+    r.gemmMinM         = 0;         // rendered as null in JSON — no threshold
+    r.dp4aAvailable    = true;
+    r.dp4aPicked       = false;
+    r.dp4aMs           = 0.0;
+    r.gemmV2Available  = true;
+    r.gemmV2Picked     = false;
+    r.source           = "pending (hip skeleton)";
+    return {r};
+}
+
+// ---- Stubbed matmul-launch overrides --------------------------------
+
+void GpuMatmul::matmul(::mimirmind::core::gguf::GgmlType, const void*,
+                       std::size_t, std::size_t, const float*, std::size_t,
+                       float*, float*) {
+    throwNotImplemented("matmul");
+}
+
+void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType, const void*,
+                            std::size_t, std::size_t, const float*, std::size_t,
+                            float*, float*) {
+    throwNotImplemented("matmulAsync");
+}
+
+void GpuMatmul::matmulDp4aAsync(::mimirmind::core::gguf::GgmlType,
+                                const std::int8_t*, const float*, const void*,
+                                std::size_t, std::size_t, std::size_t, float*) {
+    throwNotImplemented("matmulDp4aAsync");
+}
+
+void GpuMatmul::moeDownFusedKAsync(::mimirmind::core::gguf::GgmlType,
+                                   const float*, const void*,
+                                   const std::int32_t*, const float*,
+                                   float*, std::size_t, std::size_t,
+                                   std::size_t, std::size_t) {
+    throwNotImplemented("moeDownFusedKAsync");
+}
+
+} // namespace mimirmind::compute::hip
