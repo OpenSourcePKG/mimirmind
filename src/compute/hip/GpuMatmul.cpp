@@ -256,10 +256,64 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
     }
 }
 
-void GpuMatmul::matmulDp4aAsync(::mimirmind::core::gguf::GgmlType,
-                                const std::int8_t*, const float*, const void*,
-                                std::size_t, std::size_t, std::size_t, float*) {
-    throwNotImplemented("matmulDp4aAsync");
+void GpuMatmul::matmulDp4aAsync(::mimirmind::core::gguf::GgmlType type,
+                                const std::int8_t* Xq,
+                                const float*       Xscale,
+                                const void*        W,
+                                std::size_t        N,
+                                std::size_t        K,
+                                std::size_t        M,
+                                float*             Y) {
+    if (type != ::mimirmind::core::gguf::GgmlType::Q8_0) {
+        throw std::runtime_error(
+            "compute::hip::GpuMatmul::matmulDp4aAsync: only Q8_0 has a "
+            "DP4A kernel on the HIP side — check dp4aAvailable(type) "
+            "before dispatching");
+    }
+    if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
+
+    // Q8_0 block size = 32 elements. The DP4A kernel processes weights
+    // block-by-block via `v_dot4_i32_iu8` (gfx1101) / manual byte
+    // expansion (any RDNA3 without pure sdot4); K that isn't a
+    // multiple of 32 would leave a partial block at the tail, which
+    // the kernel can't handle. Same guard as L0 GpuMatmul.
+    constexpr std::size_t kBlockElts = 32;
+    if (K % kBlockElts != 0) {
+        throw std::runtime_error(
+            "compute::hip::GpuMatmul::matmulDp4aAsync: K=" +
+            std::to_string(K) + " is not a multiple of Q8_0 blockElements="
+            + std::to_string(kBlockElts));
+    }
+
+    auto& kern = _pimpl->_matmulQ8_0VecDp4aKernel;
+
+    // 4 outputs per workgroup, local=64 — same as matmul_q8_0_vec. WG
+    // count in the N dim only; per-row loop iterates over X in the M
+    // dim (same shape as L0 side).
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (N + kDp4aOutputsPerGroup - 1) / kDp4aOutputsPerGroup);
+
+    // Constant args across all rows — K and N are set once outside
+    // the loop, W stays constant, only Xq/Xscale/Y advance per m.
+    kern.setValue(4, static_cast<std::int32_t>(K));
+    kern.setValue(5, static_cast<std::int32_t>(N));
+
+    for (std::size_t m = 0; m < M; ++m) {
+        const std::int8_t* xqRow = Xq + m * K;
+        const float*       xsRow = Xscale + m;
+        float*             yRow  = Y + m * N;
+
+        kern.setPtr(0, xqRow);
+        kern.setPtr(1, xsRow);
+        kern.setPtr(2, W);
+        kern.setPtr(3, yRow);
+
+        kern.launch(_ctx.stream(),
+                    nGroups, 1, 1,
+                    kDp4aLocalSize, 1, 1);
+    }
 }
 
 void GpuMatmul::moeDownFusedKAsync(::mimirmind::core::gguf::GgmlType,
