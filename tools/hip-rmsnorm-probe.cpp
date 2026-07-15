@@ -12,10 +12,11 @@
 // full compute/ dependency graph in. The reference is 8 lines of
 // arithmetic, easier to audit inline.
 //
-// Tolerance: max abs diff over all M*K outputs. RMSNorm involves a
+// Tolerance: combined-tolerance pattern
+// (|diff| <= abs_tol + rel_tol * |ref|). RMSNorm involves a
 // sum-of-squares reduction + rsqrt, and the parallel reduction order
 // on the GPU differs from the sequential CPU order — expect ULP-level
-// drift, not bit-exact. 1e-4 abs / 1e-5 rel is comfortable for fp32
+// drift, not bit-exact. 1e-4 abs + 1e-4 rel is comfortable for fp32
 // with K in the low thousands.
 
 #include "core/gpu/hip/HipContext.hpp"
@@ -154,25 +155,29 @@ int main(int argc, char** argv) {
 
         const float kernelMs = evEnd.elapsedMs(evStart);
 
-        // ---- readback + compare -----------------------------------------
+        // ---- readback + combined-tolerance compare ----------------------
         alloc.copyD2H(hostYGpu.data(), devY.data(), xBytes);
-
-        float       maxAbs = 0.0f;
-        float       maxRel = 0.0f;
-        std::size_t badIdx = SIZE_MAX;
-        for (std::size_t i = 0; i < xElems; ++i) {
-            const float d = std::fabs(hostYGpu[i] - hostYRef[i]);
-            const float r = d / std::max(std::fabs(hostYRef[i]), 1e-30f);
-            if (d > maxAbs) { maxAbs = d; badIdx = i; }
-            if (r > maxRel) { maxRel = r; }
-        }
 
         constexpr float kAbsTol = 1e-4f;
         constexpr float kRelTol = 1e-4f;
 
-        std::printf("\n  kernel:      %.3f ms\n", static_cast<double>(kernelMs));
-        std::printf("  max abs err: %.3e (tol %.1e)\n", static_cast<double>(maxAbs), static_cast<double>(kAbsTol));
-        std::printf("  max rel err: %.3e (tol %.1e)\n", static_cast<double>(maxRel), static_cast<double>(kRelTol));
+        float       maxAbs   = 0.0f;
+        float       maxRatio = 0.0f;
+        std::size_t badIdx   = SIZE_MAX;
+        for (std::size_t i = 0; i < xElems; ++i) {
+            const float d         = std::fabs(hostYGpu[i] - hostYRef[i]);
+            const float threshold = kAbsTol + kRelTol * std::fabs(hostYRef[i]);
+            const float ratio     = d / threshold;
+            if (ratio > maxRatio) { maxRatio = ratio; badIdx = i; }
+            if (d > maxAbs) maxAbs = d;
+        }
+
+        std::printf("\n  kernel:        %.3f ms\n", static_cast<double>(kernelMs));
+        std::printf("  max abs err:   %.3e\n", static_cast<double>(maxAbs));
+        std::printf("  max err / tol: %.3f (fails if > 1.0)\n",
+                    static_cast<double>(maxRatio));
+        std::printf("  tol formula:   abs %.1e + rel %.1e * |ref|\n",
+                    static_cast<double>(kAbsTol), static_cast<double>(kRelTol));
         if (badIdx != SIZE_MAX) {
             const std::size_t m = badIdx / static_cast<std::size_t>(kK);
             const std::size_t k = badIdx % static_cast<std::size_t>(kK);
@@ -182,7 +187,7 @@ int main(int argc, char** argv) {
                         static_cast<double>(hostYRef[badIdx]));
         }
 
-        const bool ok = (maxAbs <= kAbsTol) && (maxRel <= kRelTol);
+        const bool ok = (maxRatio <= 1.0f);
         std::printf("\nhip_rmsnorm_probe: %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
 

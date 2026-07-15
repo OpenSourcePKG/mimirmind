@@ -17,6 +17,11 @@
 // give both the GPU (packed bytes) and the CPU (dequant to fp32)
 // exactly the same data. That way any diff is a matmul bug, not
 // packing noise.
+//
+// Uses the combined-tolerance pattern
+// (|diff| <= abs_tol + rel_tol * |ref|). Q8_0 dequant + 1024-term
+// parallel FMA adds a bit more noise than pure fp32, so tol is looser
+// (1e-3 abs + 1e-3 rel) than the pure-fp32 element-wise probes.
 
 #include "core/gpu/hip/HipContext.hpp"
 #include "core/gpu/hip/HipEvent.hpp"
@@ -192,25 +197,29 @@ int main(int argc, char** argv) {
 
         const float kernelMs = evEnd.elapsedMs(evStart);
 
-        // ---- readback + compare -----------------------------------------
+        // ---- readback + combined-tolerance compare ----------------------
         alloc.copyD2H(hostYGpu.data(), devY.data(), yBytes);
 
-        float       maxAbs = 0.0f;
-        float       maxRel = 0.0f;
-        std::size_t badIdx = SIZE_MAX;
-        for (std::size_t i = 0; i < static_cast<std::size_t>(kN); ++i) {
-            const float d = std::fabs(hostYGpu[i] - hostYRef[i]);
-            const float r = d / std::max(std::fabs(hostYRef[i]), 1e-30f);
-            if (d > maxAbs) { maxAbs = d; badIdx = i; }
-            if (r > maxRel) { maxRel = r; }
-        }
-
-        constexpr float kAbsTol = 1e-3f;   // Q8_0 dequant + parallel FMA adds a bit more noise than pure fp32.
+        constexpr float kAbsTol = 1e-3f;
         constexpr float kRelTol = 1e-3f;
 
-        std::printf("\n  kernel:      %.3f ms\n", static_cast<double>(kernelMs));
-        std::printf("  max abs err: %.3e (tol %.1e)\n", static_cast<double>(maxAbs), static_cast<double>(kAbsTol));
-        std::printf("  max rel err: %.3e (tol %.1e)\n", static_cast<double>(maxRel), static_cast<double>(kRelTol));
+        float       maxAbs   = 0.0f;
+        float       maxRatio = 0.0f;
+        std::size_t badIdx   = SIZE_MAX;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(kN); ++i) {
+            const float d         = std::fabs(hostYGpu[i] - hostYRef[i]);
+            const float threshold = kAbsTol + kRelTol * std::fabs(hostYRef[i]);
+            const float ratio     = d / threshold;
+            if (ratio > maxRatio) { maxRatio = ratio; badIdx = i; }
+            if (d > maxAbs) maxAbs = d;
+        }
+
+        std::printf("\n  kernel:        %.3f ms\n", static_cast<double>(kernelMs));
+        std::printf("  max abs err:   %.3e\n", static_cast<double>(maxAbs));
+        std::printf("  max err / tol: %.3f (fails if > 1.0)\n",
+                    static_cast<double>(maxRatio));
+        std::printf("  tol formula:   abs %.1e + rel %.1e * |ref|\n",
+                    static_cast<double>(kAbsTol), static_cast<double>(kRelTol));
         if (badIdx != SIZE_MAX) {
             std::printf("  worst @ n=%zu: gpu=%.6g cpu=%.6g\n",
                         badIdx,
@@ -218,7 +227,7 @@ int main(int argc, char** argv) {
                         static_cast<double>(hostYRef[badIdx]));
         }
 
-        const bool ok = (maxAbs <= kAbsTol) && (maxRel <= kRelTol);
+        const bool ok = (maxRatio <= 1.0f);
         std::printf("\nhip_matmul_q8_probe: %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
 
