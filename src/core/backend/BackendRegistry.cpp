@@ -131,6 +131,30 @@ BackendKind BackendRegistry::resolveKind(BackendKind defaultKind) noexcept {
     return defaultKind;
 }
 
+BackendKind BackendRegistry::autoSelect(BackendKind fallback) noexcept {
+    // Explicit env-var override wins over the probe-based pick — same
+    // precedence as `resolveKind`.
+    if (const char* env = std::getenv("MIMIRMIND_BACKEND")) {
+        if (auto parsed = parseKind(env)) {
+            return *parsed;
+        }
+    }
+
+    // Walk the probe table and take the first backend that is both
+    // compiled-in AND runtime-available. `probeAll()` returns entries
+    // in `BackendKind` enum order (LevelZero, Hip, Cuda, Cpu), which
+    // acts as the priority policy without extra machinery. On a box
+    // with only an AMD dGPU LevelZero probes as available=no, so HIP
+    // wins; on a Meteor Lake laptop with no AMD driver, LevelZero wins.
+    const auto probes = probeAll();
+    for (const auto& p : probes) {
+        if (p.compiledIn && p.available) {
+            return p.kind;
+        }
+    }
+    return fallback;
+}
+
 std::unique_ptr<ComputeContext>
 BackendRegistry::createContext(BackendKind kind) {
     switch (kind) {

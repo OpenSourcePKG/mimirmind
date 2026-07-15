@@ -59,12 +59,14 @@ int main() {
                     p.detail.c_str());
     }
 
-    // Step 2 — resolve the requested backend.
+    // Step 2 — resolve the requested backend. Uses autoSelect() so a
+    // build compiled with both L0 and HIP picks whichever is actually
+    // reachable on this box (env override still wins if set).
     const char* envVal = std::getenv("MIMIRMIND_BACKEND");
-    const BackendKind requested = BackendRegistry::resolveKind();
+    const BackendKind requested = BackendRegistry::autoSelect();
     std::printf("\n== Selection ==\n");
     std::printf("  MIMIRMIND_BACKEND env: %s\n",
-                envVal ? envVal : "(unset)");
+                envVal ? envVal : "(unset — autoselect)");
     std::printf("  resolved kind:         %s\n",
                 BackendRegistry::name(requested));
 

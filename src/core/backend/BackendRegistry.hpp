@@ -72,6 +72,21 @@ public:
     [[nodiscard]] static BackendKind
         resolveKind(BackendKind defaultKind = BackendKind::LevelZero) noexcept;
 
+    /// Autotune-style backend picker. Same env-var override as
+    /// `resolveKind`, but when `MIMIRMIND_BACKEND` is unset the
+    /// resolver walks `probeAll()` and returns the FIRST backend
+    /// that is both compiled-in AND runtime-available. Order matches
+    /// the `BackendKind` enum (LevelZero, Hip, Cuda, Cpu). If nothing
+    /// is available, returns `fallback` verbatim — the caller can
+    /// then decide whether to fail loudly or continue with e.g. a
+    /// CPU-only degraded path.
+    ///
+    /// Prefer this over `resolveKind` for main.cpp's default startup
+    /// path so a build compiled with both L0 and HIP does the right
+    /// thing on either box without env-var tinkering.
+    [[nodiscard]] static BackendKind
+        autoSelect(BackendKind fallback = BackendKind::LevelZero) noexcept;
+
     /// Construct a fully-initialised `ComputeContext` for the given
     /// backend. The single entry point where runtime backend-selection
     /// materialises. Throws the backend's concrete error type on driver /
