@@ -399,6 +399,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/add_residual.hip
         kernels_hip/attention_flash_merge.hip
         kernels_hip/attention_flash_partial.hip
+        kernels_hip/attention_flash_partial_fp16.hip
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/mul_scalar.hip
         kernels_hip/qkv_split.hip
@@ -1125,6 +1126,24 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_attention_flash_merge_probe hip_kernels)
 
     target_link_libraries(hip_attention_flash_merge_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_attention_flash_partial_fp16_probe — fp16-KV partial ----
+    #
+    # fp16-KV variant of the flash partial kernel. K/V are __half; the
+    # kernel promotes via __half2float per load. Output partials stay
+    # fp32 so the merge kernel is reused unchanged. Same two-case probe
+    # pattern as the f32 variant (full-attention + SWA-with-neutral-
+    # emission).
+
+    add_executable(hip_attention_flash_partial_fp16_probe
+        tools/hip-attention-flash-partial-fp16-probe.cpp
+    )
+
+    add_dependencies(hip_attention_flash_partial_fp16_probe hip_kernels)
+
+    target_link_libraries(hip_attention_flash_partial_fp16_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
