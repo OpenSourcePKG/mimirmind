@@ -23,7 +23,7 @@
 //   docker compose run --rm mimirmind /usr/local/bin/prefill_bench --tk 24576
 //   docker compose run --rm mimirmind /usr/local/bin/prefill_bench --tk 32768
 
-#include "compute/GpuOps.hpp"
+#include "compute/l0/GpuOps.hpp"
 #include "compute/quant/Q8_0.hpp"
 #include "core/gpu/l0/CommandQueue.hpp"
 #include "core/config/Config.hpp"
@@ -182,7 +182,7 @@ int main(int argc, char** argv) {
     const Args args = parseArgs(argc, argv);
 
     mimirmind::core::l0::L0ComputeContext ctx{};
-    mimirmind::compute::GpuOps            ops{ctx};
+    mimirmind::compute::l0::GpuOps            ops{ctx};
     // Aliases keep the rest of the bench (which reads `usm` / `queue`
     // directly for its own scratch allocations) unchanged.
     mimirmind::core::l0::UsmAllocator&    usm   { ctx.allocator() };

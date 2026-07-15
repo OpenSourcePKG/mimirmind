@@ -6,7 +6,7 @@
 #include "mimirmind/CliArgs.hpp"
 #include "mimirmind/CliParser.hpp"
 
-#include "compute/GpuOps.hpp"
+#include "compute/l0/GpuOps.hpp"
 #include "core/config/Config.hpp"
 #include "core/ipc/MuninClient.hpp"
 #include "core/log/Log.hpp"
@@ -209,21 +209,21 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         // not a stack trace during the first prod-facing request.
         {
             const auto effMaxCtx = e->maxContextTokens();
-            if (effMaxCtx > ::mimirmind::compute::GpuOps::kAttentionMaxTk
+            if (effMaxCtx > ::mimirmind::compute::l0::GpuOps::kAttentionMaxTk
                 && !cfg.features.flashPrefill) {
                 const std::string msg =
                     "serve: model '" + m.id + "' has effective "
                     "runtime.maxContextTokens=" + std::to_string(effMaxCtx) +
                     " > kAttentionMaxTk=" +
                     std::to_string(
-                        ::mimirmind::compute::GpuOps::kAttentionMaxTk) +
+                        ::mimirmind::compute::l0::GpuOps::kAttentionMaxTk) +
                     " while features.prefillFlash=false — the "
                     "plain-attention fallback cannot hold "
                     "scores[ATTN_MAX_TK] in SLM at that context "
                     "length. Set features.prefillFlash=true (default) "
                     "OR reduce runtime.maxContextTokens below " +
                     std::to_string(
-                        ::mimirmind::compute::GpuOps::kAttentionMaxTk) + ".";
+                        ::mimirmind::compute::l0::GpuOps::kAttentionMaxTk) + ".";
                 MM_LOG_ERROR("main", "{}", msg);
                 std::cerr << msg << "\n";
                 return 2;

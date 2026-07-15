@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "compute/GpuMatmul.hpp"
+#include "compute/l0/GpuMatmul.hpp"
 
-#include "compute/GpuOps.hpp"
+#include "compute/l0/GpuOps.hpp"
 #include "compute/Matmul.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
@@ -28,7 +28,7 @@
 #include <utility>
 #include <vector>
 
-namespace mimirmind::compute {
+namespace mimirmind::compute::l0 {
 
 namespace {
 
@@ -1116,4 +1116,4 @@ std::vector<AutotuneReport> GpuMatmul::autotuneReport() const {
     return out;
 }
 
-} // namespace mimirmind::compute
+} // namespace mimirmind::compute::l0

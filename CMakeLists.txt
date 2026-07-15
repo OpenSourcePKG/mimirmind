@@ -391,7 +391,7 @@ if(MIMIRMIND_ENABLE_HIP)
         # All kernel-launch methods currently throw; feature-flag
         # accessors + Q8_0 reorder counters + module loading are
         # real. Follow-up commits fill launches group-by-group.
-        src/compute/HipGpuOps.cpp
+        src/compute/hip/GpuOps.cpp
     )
 
     target_link_libraries(mimirmind_core_hip PUBLIC
@@ -490,8 +490,8 @@ add_executable(mimirmind
     src/compute/Attention.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
-    src/compute/GpuMatmul.cpp
-    src/compute/GpuOps.cpp
+    src/compute/l0/GpuMatmul.cpp
+    src/compute/l0/GpuOps.cpp
     src/compute/Matmul.cpp
     src/compute/MoeRouting.cpp
     src/compute/Norm.cpp
@@ -731,8 +731,8 @@ add_executable(gpu_tests
     src/compute/Attention.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
-    src/compute/GpuMatmul.cpp
-    src/compute/GpuOps.cpp
+    src/compute/l0/GpuMatmul.cpp
+    src/compute/l0/GpuOps.cpp
     src/compute/Matmul.cpp
     src/compute/MoeRouting.cpp
     src/compute/Norm.cpp
@@ -773,8 +773,8 @@ add_executable(prefill_bench
     src/compute/Attention.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
-    src/compute/GpuMatmul.cpp
-    src/compute/GpuOps.cpp
+    src/compute/l0/GpuMatmul.cpp
+    src/compute/l0/GpuOps.cpp
     src/compute/Matmul.cpp
     src/compute/MoeRouting.cpp
     src/compute/Norm.cpp

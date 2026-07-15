@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "compute/HipGpuOps.hpp"
+#include "compute/hip/GpuOps.hpp"
 
 #include "core/gpu/hip/HipComputeContext.hpp"
 #include "core/gpu/hip/HipKernel.hpp"
@@ -17,7 +17,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace mimirmind::compute {
+namespace mimirmind::compute::hip {
 
 namespace {
 
@@ -30,7 +30,7 @@ constexpr const char* kDefaultHsacoDir = "/usr/local/share/mimirmind/hsaco";
 std::int32_t toInt32(std::size_t v, const char* tag) {
     if (v > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::runtime_error(
-            std::string{"HipGpuOps: "} + tag +
+            std::string{"hip::GpuOps: "} + tag +
             " overflows int32 ("  + std::to_string(v) + ")");
     }
     return static_cast<std::int32_t>(v);
@@ -42,7 +42,7 @@ std::int32_t toInt32(std::size_t v, const char* tag) {
 std::uint32_t groupsForN(std::size_t n, std::uint32_t local) {
     const std::size_t g = (n + local - 1) / local;
     if (g > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::runtime_error("HipGpuOps: workgroup count overflows uint32");
+        throw std::runtime_error("hip::GpuOps: workgroup count overflows uint32");
     }
     return static_cast<std::uint32_t>(g);
 }
@@ -84,7 +84,7 @@ std::filesystem::path resolveHsacoPath(std::string_view name) {
     }
 
     throw std::runtime_error(
-        "HipGpuOps: cannot find " + filename +
+        "hip::GpuOps: cannot find " + filename +
         " — set MIMIRMIND_HSACO_DIR or install to " + kDefaultHsacoDir);
 }
 
@@ -105,7 +105,7 @@ core::hip::HipModule loadHipModule(core::hip::HipContext& ctx,
 // implemented dispatch.
 [[noreturn]] void throwNotImplemented(const char* method) {
     throw std::runtime_error(
-        std::string{"HipGpuOps::"} + method +
+        std::string{"compute::hip::GpuOps::"} + method +
         ": not yet implemented (Schritt 3b skeleton — kernel-launch "
         "impl lands in follow-up commits)");
 }
@@ -121,7 +121,7 @@ core::hip::HipModule loadHipModule(core::hip::HipContext& ctx,
 // scaled_add_residual, x_quant_i8, attention_prefill_flash_q8_0_gqa
 // KTILE=64 variant) are deliberately absent — the corresponding
 // ComputeOps overrides throw `not yet implemented` at dispatch time.
-struct HipGpuOps::Impl {
+struct GpuOps::Impl {
     core::hip::HipModule _rmsnormModule;
     core::hip::HipKernel _rmsnormKernel;
     core::hip::HipModule _rmsnormGemmaModule;
@@ -255,7 +255,7 @@ struct HipGpuOps::Impl {
     {}
 };
 
-HipGpuOps::HipGpuOps(core::hip::HipComputeContext& ctx,
+GpuOps::GpuOps(core::hip::HipComputeContext& ctx,
                      bool                          flashPrefillEnabled,
                      bool                          flashPrefillGqaQ8Enabled,
                      std::size_t                   flashPrefillKTileQ8,
@@ -306,13 +306,13 @@ HipGpuOps::HipGpuOps(core::hip::HipComputeContext& ctx,
         _prefillFlashKTileQ8Source = "pinned (config)";
     } else {
         throw std::runtime_error(
-            "HipGpuOps: features.flashPrefillKTileQ8=" +
+            "hip::GpuOps: features.flashPrefillKTileQ8=" +
             std::to_string(flashPrefillKTileQ8) +
             " unexpected — Config.cpp parser should have rejected this");
     }
 
     MM_LOG_INFO("hipgpuops",
-                "HipGpuOps ready — 25 modules loaded (rmsnorm variants, "
+                "hip::GpuOps ready — 25 modules loaded (rmsnorm variants, "
                 "elementwise, rope, attention decode/prefill × f32/fp16/Q8_0, "
                 "qkv_split × f32/fp16, kv_quant_commit_q8_0, "
                 "matmul_q8_0_vec_reorder). "
@@ -326,7 +326,7 @@ HipGpuOps::HipGpuOps(core::hip::HipComputeContext& ctx,
                 q8_0ReorderModeName());
 }
 
-HipGpuOps::~HipGpuOps() {
+GpuOps::~GpuOps() {
     auto& alloc = _ctx.allocator();
     if (_stagingOffsetSlotUsm) {
         alloc.deallocate(_stagingOffsetSlotUsm, sizeof(std::int32_t),
@@ -344,15 +344,15 @@ HipGpuOps::~HipGpuOps() {
 
 // ---- Real (non-stub) implementations --------------------------------
 
-core::hip::HipStream& HipGpuOps::stream() noexcept {
+core::hip::HipStream& GpuOps::stream() noexcept {
     return _ctx.stream();
 }
 
-core::hip::HipMemoryAllocator& HipGpuOps::allocator() noexcept {
+core::hip::HipMemoryAllocator& GpuOps::allocator() noexcept {
     return _ctx.allocator();
 }
 
-std::string_view HipGpuOps::q8_0ReorderModeName() const noexcept {
+std::string_view GpuOps::q8_0ReorderModeName() const noexcept {
     switch (_q8_0ReorderMode) {
         case core::config::TriState::Auto:    return "auto";
         case core::config::TriState::Force:   return "force";
@@ -361,7 +361,7 @@ std::string_view HipGpuOps::q8_0ReorderModeName() const noexcept {
     return "unknown";
 }
 
-void HipGpuOps::noteQ8_0ReorderApplied(std::size_t bytes,
+void GpuOps::noteQ8_0ReorderApplied(std::size_t bytes,
                                        std::string_view label) noexcept {
     _q8_0ReorderTensorCount += 1;
     _q8_0ReorderTotalBytes  += bytes;
@@ -378,7 +378,7 @@ void HipGpuOps::noteQ8_0ReorderApplied(std::size_t bytes,
 // diagnostic. Follow-up commits (Schritt 3b sub-B..sub-E) fill them
 // group-by-group. Order matches the header layout.
 
-void HipGpuOps::rmsNormAsync(const float* x, std::size_t M, std::size_t K,
+void GpuOps::rmsNormAsync(const float* x, std::size_t M, std::size_t K,
                              const float* weight, float eps, float* y) {
     if (M == 0 || K == 0) {
         return;
@@ -396,7 +396,7 @@ void HipGpuOps::rmsNormAsync(const float* x, std::size_t M, std::size_t K,
              kRmsnormLocalSize, 1, 1);
 }
 
-void HipGpuOps::rmsNormGemmaAsync(const float* x, std::size_t M, std::size_t K,
+void GpuOps::rmsNormGemmaAsync(const float* x, std::size_t M, std::size_t K,
                                   const float* weight, float eps, float* y) {
     if (M == 0 || K == 0) {
         return;
@@ -413,7 +413,7 @@ void HipGpuOps::rmsNormGemmaAsync(const float* x, std::size_t M, std::size_t K,
              kRmsnormLocalSize, 1, 1);
 }
 
-void HipGpuOps::rmsNormNoWeightAsync(const float* x, std::size_t M, std::size_t K,
+void GpuOps::rmsNormNoWeightAsync(const float* x, std::size_t M, std::size_t K,
                                      float eps, float* y) {
     if (M == 0 || K == 0) {
         return;
@@ -429,7 +429,7 @@ void HipGpuOps::rmsNormNoWeightAsync(const float* x, std::size_t M, std::size_t 
              kRmsnormLocalSize, 1, 1);
 }
 
-void HipGpuOps::rmsNormQkvAsync(float* qBuf, const float* qWeight,
+void GpuOps::rmsNormQkvAsync(float* qBuf, const float* qWeight,
                                 void* kBase, const float* kWeight,
                                 void* vBase,
                                 std::size_t qRows, std::size_t kvRows,
@@ -486,7 +486,7 @@ void HipGpuOps::rmsNormQkvAsync(float* qBuf, const float* qWeight,
              kRmsnormLocalSize, 1, 1);
 }
 
-void HipGpuOps::addRmsNormAsync(float*, const float*,
+void GpuOps::addRmsNormAsync(float*, const float*,
                                 std::size_t, std::size_t,
                                 const float*, float, float*) {
     // add_rmsnorm kernel not yet ported to HIP — the L0 side has
@@ -495,7 +495,7 @@ void HipGpuOps::addRmsNormAsync(float*, const float*,
     throwNotImplemented("addRmsNormAsync");
 }
 
-void HipGpuOps::addBiasAsync(float* y, std::size_t M, std::size_t K,
+void GpuOps::addBiasAsync(float* y, std::size_t M, std::size_t K,
                              const float* bias) {
     if (M == 0 || K == 0) {
         return;
@@ -512,7 +512,7 @@ void HipGpuOps::addBiasAsync(float* y, std::size_t M, std::size_t K,
              kElementwiseLocalSize, 1, 1);
 }
 
-void HipGpuOps::addResidualAsync(float* y, const float* x, std::size_t n) {
+void GpuOps::addResidualAsync(float* y, const float* x, std::size_t n) {
     if (n == 0) {
         return;
     }
@@ -526,7 +526,7 @@ void HipGpuOps::addResidualAsync(float* y, const float* x, std::size_t n) {
              kElementwiseLocalSize, 1, 1);
 }
 
-void HipGpuOps::siluMulAsync(float* gate, const float* up, std::size_t n) {
+void GpuOps::siluMulAsync(float* gate, const float* up, std::size_t n) {
     if (n == 0) {
         return;
     }
@@ -540,12 +540,12 @@ void HipGpuOps::siluMulAsync(float* gate, const float* up, std::size_t n) {
              kElementwiseLocalSize, 1, 1);
 }
 
-void HipGpuOps::geluMulAsync(float*, const float*, std::size_t) {
+void GpuOps::geluMulAsync(float*, const float*, std::size_t) {
     // gelu_mul.hip not yet ported.
     throwNotImplemented("geluMulAsync");
 }
 
-void HipGpuOps::mulScalarAsync(float* y, float s, std::size_t n) {
+void GpuOps::mulScalarAsync(float* y, float s, std::size_t n) {
     if (n == 0) {
         return;
     }
@@ -559,12 +559,12 @@ void HipGpuOps::mulScalarAsync(float* y, float s, std::size_t n) {
              kElementwiseLocalSize, 1, 1);
 }
 
-void HipGpuOps::scaledAddResidualAsync(float*, const float*, float, std::size_t) {
+void GpuOps::scaledAddResidualAsync(float*, const float*, float, std::size_t) {
     // scaled_add_residual.hip not yet ported.
     throwNotImplemented("scaledAddResidualAsync");
 }
 
-void HipGpuOps::ropeInPlaceAsync(void* xBase, std::size_t seqLen,
+void GpuOps::ropeInPlaceAsync(void* xBase, std::size_t seqLen,
                                  std::size_t numHeads, std::size_t headDim,
                                  std::size_t startPos, float base,
                                  std::size_t writeOffsetStride,
@@ -574,14 +574,14 @@ void HipGpuOps::ropeInPlaceAsync(void* xBase, std::size_t seqLen,
     }
     if (headDim % 2 != 0) {
         throw std::runtime_error(
-            "HipGpuOps::ropeInPlace: headDim must be even");
+            "GpuOps::ropeInPlace: headDim must be even");
     }
     // fp16 in-place variant needs `rope_inplace_fp16.hip` — not
     // ported yet. Refuse loudly rather than silently corrupt an
     // fp16 KV cache with the fp32 kernel.
     if (kvDtype == runtime::KvDtype::FP16) {
         throw std::runtime_error(
-            "HipGpuOps::ropeInPlaceAsync: FP16 KV path requires "
+            "GpuOps::ropeInPlaceAsync: FP16 KV path requires "
             "rope_inplace_fp16.hip — not yet ported on the HIP side");
     }
 
@@ -608,7 +608,7 @@ void HipGpuOps::ropeInPlaceAsync(void* xBase, std::size_t seqLen,
              kRopeLocalSize, 1, 1);
 }
 
-void HipGpuOps::ropeInPlaceWithFactorsAsync(void*, const float*,
+void GpuOps::ropeInPlaceWithFactorsAsync(void*, const float*,
                                             std::size_t, std::size_t,
                                             std::size_t, std::size_t, float,
                                             std::size_t, runtime::KvDtype) {
@@ -616,14 +616,14 @@ void HipGpuOps::ropeInPlaceWithFactorsAsync(void*, const float*,
     throwNotImplemented("ropeInPlaceWithFactorsAsync");
 }
 
-void HipGpuOps::xQuantI8Async(const float*, std::int8_t*, float*,
+void GpuOps::xQuantI8Async(const float*, std::int8_t*, float*,
                               std::size_t, std::size_t) {
     // x_quant_i8.hip not yet ported. Blocks the DP4A matvec path in
     // `HipGpuMatmul` — plain matvec will still work once that lands.
     throwNotImplemented("xQuantI8Async");
 }
 
-void HipGpuOps::kvQuantCommitQ8Async(const float* xSrc, void* kvDst,
+void GpuOps::kvQuantCommitQ8Async(const float* xSrc, void* kvDst,
                                      std::size_t T, std::size_t kvDim,
                                      std::size_t writeOffset) {
     if (T == 0 || kvDim == 0) {
@@ -635,7 +635,7 @@ void HipGpuOps::kvQuantCommitQ8Async(const float* xSrc, void* kvDst,
     constexpr std::size_t kBlockElems = 32;
     if (kvDim % kBlockElems != 0) {
         throw std::runtime_error(
-            "HipGpuOps::kvQuantCommitQ8Async: kvDim=" +
+            "GpuOps::kvQuantCommitQ8Async: kvDim=" +
             std::to_string(kvDim) +
             " must be a multiple of " + std::to_string(kBlockElems));
     }
@@ -662,7 +662,7 @@ void HipGpuOps::kvQuantCommitQ8Async(const float* xSrc, void* kvDst,
              kKvQuantCommitLocalSize, 1, 1);
 }
 
-void HipGpuOps::qkvSplitAsync(const float* fused, float* Yq,
+void GpuOps::qkvSplitAsync(const float* fused, float* Yq,
                               void* YkBase, void* YvBase,
                               std::size_t M, std::size_t Nq, std::size_t Nkv,
                               bool hasV,
@@ -714,7 +714,7 @@ void HipGpuOps::qkvSplitAsync(const float* fused, float* Yq,
              kElementwiseLocalSize, 1, 1);
 }
 
-void HipGpuOps::attentionAsync(const float*, const void*, const void*,
+void GpuOps::attentionAsync(const float*, const void*, const void*,
                                std::size_t, std::size_t,
                                std::size_t, std::size_t, std::size_t,
                                std::size_t,
@@ -729,7 +729,7 @@ void HipGpuOps::attentionAsync(const float*, const void*, const void*,
     throwNotImplemented("attentionAsync");
 }
 
-void HipGpuOps::matmulQ8_0VecReorderAsync(const void* wReordered,
+void GpuOps::matmulQ8_0VecReorderAsync(const void* wReordered,
                                           std::size_t N, std::size_t K,
                                           const float* x, float* y) {
     if (N == 0 || K == 0) {
@@ -759,4 +759,4 @@ void HipGpuOps::matmulQ8_0VecReorderAsync(const void* wReordered,
              kLocalSize, 1, 1);
 }
 
-} // namespace mimirmind::compute
+} // namespace mimirmind::compute::hip

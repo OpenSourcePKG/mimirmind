@@ -3,8 +3,8 @@
 
 #include "runtime/arch/GemmaBaseBackend.hpp"
 
-#include "compute/GpuMatmul.hpp"
-#include "compute/GpuOps.hpp"
+#include "compute/l0/GpuMatmul.hpp"
+#include "compute/l0/GpuOps.hpp"
 #include "core/gpu/l0/CommandQueue.hpp"
 #include "model/FusedQkvWeights.hpp"
 #include "core/gguf/GgufReader.hpp"
@@ -28,8 +28,8 @@ namespace mimirmind::runtime::arch {
 GemmaBaseBackend::GemmaBaseBackend(const model::LlmConfig&        config,
                                    const core::gguf::WeightsMap&       weights,
                                    const model::FusedQkvWeights*  fusedQkv,
-                                   compute::GpuOps&               ops,
-                                   compute::GpuMatmul&            gmm,
+                                   compute::l0::GpuOps&               ops,
+                                   compute::l0::GpuMatmul&            gmm,
                                    runtime::OpProfiler&           opProfiler)
     : _config{config}, _weights{weights}, _fusedQkv{fusedQkv},
       _ops{ops}, _gmm{gmm}, _op{opProfiler} {

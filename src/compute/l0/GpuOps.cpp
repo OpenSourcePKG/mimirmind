@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "compute/GpuOps.hpp"
+#include "compute/l0/GpuOps.hpp"
 
 #include "compute/Attention.hpp"
 #include "core/gpu/l0/L0Context.hpp"
@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-namespace mimirmind::compute {
+namespace mimirmind::compute::l0 {
 
 namespace {
 
@@ -1585,4 +1585,4 @@ void GpuOps::attentionDecodeFlashAsync(const float*     q,
                         1);
 }
 
-} // namespace mimirmind::compute
+} // namespace mimirmind::compute::l0

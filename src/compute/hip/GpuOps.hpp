@@ -19,53 +19,55 @@ class HipStream;
 class HipMemoryAllocator;
 }
 
-namespace mimirmind::compute {
+namespace mimirmind::compute::hip {
 
 /**
  * HIP/ROCm implementation of the backend-neutral `compute::ComputeOps`
- * interface. Parallel to the Level-Zero `compute::GpuOps` — same public
- * surface (all 25 virtuals from `ComputeOps` plus the L0-mirrored
+ * interface. Parallel to the Level-Zero `compute::l0::GpuOps` — same
+ * public surface (all 25 virtuals from `ComputeOps` plus the L0-mirrored
  * feature-flag constructor arguments), but every kernel launch goes
  * through `HipModule` + `HipKernel` + `HipStream` instead of L0
  * modules / command queues.
+ *
+ * Same class name (`GpuOps`) as the L0 side; disambiguation happens
+ * through the `compute::hip::` namespace vs `compute::l0::`. This
+ * mirrors the `src/core/gpu/{l0,hip}/` primitive layout.
  *
  * Skeleton stage (Schritt 3b sub-A): the ctor loads every `.hsaco`
  * from the resolved directory and allocates the persistent
  * FlashAttention partial scratch + the two shared `curLen` USM slots
  * that L0 uses for command-list-replay parity. Feature-flag getters
  * are fully functional; `noteQ8_0ReorderApplied` maintains its
- * counters. Every kernel-launch method currently throws
- * `std::runtime_error("HipGpuOps::<name>: not yet implemented")` —
- * follow-up commits fill them in group-by-group (elementwise,
- * RoPE, Q8_0 KV, attention, matvec).
+ * counters. Kernel-launch methods land group-by-group in the sub-B..E
+ * commits — the remaining stubs throw with an actionable message.
  *
  * The class is deliberately structured so a partial implementation
  * still links and lets the L0 backend keep running unchanged. Once a
  * consumer holds `ComputeOps&` (Schritt 3c) and the runtime picks
- * `HipGpuOps` on HIP_TARGET_HOST, any stubbed method surfaces as a
+ * this backend on HIP_TARGET_HOST, any stubbed method surfaces as a
  * clear runtime error rather than a link-time hole.
  *
  * Not thread-safe. Construct once at startup, share across the engine.
  */
-class HipGpuOps : public ComputeOps {
+class GpuOps : public ::mimirmind::compute::ComputeOps {
 public:
     /// Same 4-arg shape as `GpuOps` — the config knobs propagate 1:1
     /// so a config.json that steered the L0 backend keeps steering
     /// the HIP one. The ctor also allocates persistent scratch and
     /// resolves the K-tile pick up-front so the dispatch hot path
     /// stays branch-cheap.
-    HipGpuOps(core::hip::HipComputeContext& ctx,
+    GpuOps(core::hip::HipComputeContext& ctx,
               bool                          flashPrefillEnabled      = true,
               bool                          flashPrefillGqaQ8Enabled = true,
               std::size_t                   flashPrefillKTileQ8      = 128,
               core::config::TriState        q8_0ReorderMode          =
                   core::config::TriState::Disable);
-    ~HipGpuOps() override;
+    ~GpuOps() override;
 
-    HipGpuOps(const HipGpuOps&)            = delete;
-    HipGpuOps& operator=(const HipGpuOps&) = delete;
-    HipGpuOps(HipGpuOps&&)                 = delete;
-    HipGpuOps& operator=(HipGpuOps&&)      = delete;
+    GpuOps(const GpuOps&)            = delete;
+    GpuOps& operator=(const GpuOps&) = delete;
+    GpuOps(GpuOps&&)                 = delete;
+    GpuOps& operator=(GpuOps&&)      = delete;
 
     // ---- ComputeOps overrides (all stubbed in the skeleton) -----------
 
@@ -188,7 +190,7 @@ public:
     // ---- HIP-native accessors ----------------------------------------
     //
     // Mirror `GpuOps::queue()` / `allocator()` — consumers that need
-    // the raw HIP handle downcast to `HipGpuOps&`, exactly how L0
+    // the raw HIP handle downcast to `GpuOps&`, exactly how L0
     // consumers downcast to `GpuOps&`. Kept out of the `ComputeOps`
     // base for the same reason.
 
@@ -253,4 +255,4 @@ public:
     static constexpr std::size_t kAttentionMaxTk   = 16384;
 };
 
-} // namespace mimirmind::compute
+} // namespace mimirmind::compute::hip

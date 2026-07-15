@@ -21,7 +21,7 @@ namespace mimirmind::core::backend {
  * Concrete subclasses (`L0ComputeContext`, `HipComputeContext`, ...)
  * add backend-specific typed getters (`l0Context()`, `queue()`,
  * `hipStream()` etc.) that consumers with backend-specific kernel
- * launches downcast to. That downcast is intentional: `compute::GpuOps`
+ * launches downcast to. That downcast is intentional: `compute::l0::GpuOps`
  * and friends today take `L0Context&` / `CommandQueue&` /
  * `UsmAllocator&` directly, and porting them to a truly-neutral
  * kernel-launch API is a follow-up refactor (Schicht 4 of the HW-

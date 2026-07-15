@@ -3,8 +3,8 @@
 
 #include "runtime/arch/Qwen2Backend.hpp"
 
-#include "compute/GpuMatmul.hpp"
-#include "compute/GpuOps.hpp"
+#include "compute/l0/GpuMatmul.hpp"
+#include "compute/l0/GpuOps.hpp"
 #include "model/FusedQkvWeights.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "model/LlmConfig.hpp"
@@ -22,8 +22,8 @@ namespace mimirmind::runtime::arch {
 Qwen2Backend::Qwen2Backend(const model::LlmConfig&        config,
                            const core::gguf::WeightsMap&       weights,
                            const model::FusedQkvWeights*  fusedQkv,
-                           compute::GpuOps&               ops,
-                           compute::GpuMatmul&            gmm,
+                           compute::l0::GpuOps&               ops,
+                           compute::l0::GpuMatmul&            gmm,
                            runtime::OpProfiler&           opProfiler)
     : _config{config}, _weights{weights}, _fusedQkv{fusedQkv},
       _ops{ops}, _gmm{gmm}, _op{opProfiler} {

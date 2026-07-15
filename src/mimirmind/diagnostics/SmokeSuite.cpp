@@ -7,7 +7,7 @@
 #include "mimirmind/diagnostics/Formatting.hpp"
 
 #include "compute/Embedding.hpp"
-#include "compute/GpuMatmul.hpp"
+#include "compute/l0/GpuMatmul.hpp"
 #include "compute/Matmul.hpp"
 #include "compute/Norm.hpp"
 #include "core/config/Config.hpp"

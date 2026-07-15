@@ -25,8 +25,8 @@ public:
     Gemma4MoeBackend(const model::LlmConfig&        config,
                      const core::gguf::WeightsMap&       weights,
                      const model::FusedQkvWeights*  fusedQkv,
-                     compute::GpuOps&               ops,
-                     compute::GpuMatmul&            gmm,
+                     compute::l0::GpuOps&               ops,
+                     compute::l0::GpuMatmul&            gmm,
                      runtime::OpProfiler&           opProfiler,
                      bool                           moeGroupEnabled     = true,
                      bool                           moeFusedDownEnabled = false);

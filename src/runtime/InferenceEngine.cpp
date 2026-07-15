@@ -922,9 +922,9 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             const std::size_t maxCurLen =
                 promptIds.size() + params.maxNewTokens;
             const std::size_t replayKTiles = std::min(
-                (maxCurLen + compute::GpuOps::kFlashKTileSize - 1) /
-                    compute::GpuOps::kFlashKTileSize,
-                compute::GpuOps::kFlashMaxKTiles);
+                (maxCurLen + compute::l0::GpuOps::kFlashKTileSize - 1) /
+                    compute::l0::GpuOps::kFlashKTileSize,
+                compute::l0::GpuOps::kFlashMaxKTiles);
             _ops.setReplayMaxKTiles(replayKTiles);
             MM_LOG_INFO("engine",
                         "features.clr right-sized flash launch "

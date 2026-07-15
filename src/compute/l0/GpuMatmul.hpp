@@ -28,7 +28,7 @@ namespace mimirmind::core::config {
 struct FeatureSettings;
 }
 
-namespace mimirmind::compute {
+namespace mimirmind::compute::l0 {
 
 class GpuOps;
 
@@ -52,7 +52,7 @@ class GpuOps;
  * Holds a reference to GpuOps to route the DP4A Q8_0 path (M8.H.3)
  * through the shared x_quant_i8 kernel — no duplicated module load.
  */
-class GpuMatmul : public ComputeMatmul {
+class GpuMatmul : public ::mimirmind::compute::ComputeMatmul {
 public:
     /// Takes `L0ComputeContext&` (Schicht 2 of the backend-neutralisation
     /// story). The concrete L0Context / UsmAllocator / CommandQueue refs
@@ -358,4 +358,4 @@ private:
     static constexpr std::size_t   kDp4aMaxK           = 2816;
 };
 
-} // namespace mimirmind::compute
+} // namespace mimirmind::compute::l0

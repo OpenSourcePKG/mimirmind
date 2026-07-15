@@ -3,8 +3,8 @@
 
 #include "runtime/arch/Gemma4MoeBackend.hpp"
 
-#include "compute/GpuMatmul.hpp"
-#include "compute/GpuOps.hpp"
+#include "compute/l0/GpuMatmul.hpp"
+#include "compute/l0/GpuOps.hpp"
 #include "core/gpu/l0/CommandQueue.hpp"
 #include "compute/MoeRouting.hpp"
 #include "compute/QuantType.hpp"
@@ -33,8 +33,8 @@ namespace mimirmind::runtime::arch {
 Gemma4MoeBackend::Gemma4MoeBackend(const model::LlmConfig&        config,
                                    const core::gguf::WeightsMap&       weights,
                                    const model::FusedQkvWeights*  fusedQkv,
-                                   compute::GpuOps&               ops,
-                                   compute::GpuMatmul&            gmm,
+                                   compute::l0::GpuOps&               ops,
+                                   compute::l0::GpuMatmul&            gmm,
                                    runtime::OpProfiler&           opProfiler,
                                    bool                           moeGroupEnabled,
                                    bool                           moeFusedDownEnabled)

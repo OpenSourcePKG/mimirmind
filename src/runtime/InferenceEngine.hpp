@@ -3,8 +3,8 @@
 
 #pragma once
 
-#include "compute/GpuMatmul.hpp"
-#include "compute/GpuOps.hpp"
+#include "compute/l0/GpuMatmul.hpp"
+#include "compute/l0/GpuOps.hpp"
 #include "compute/Sampling.hpp"
 #include "core/gguf/GgufReader.hpp"
 #include "model/LlmConfig.hpp"
@@ -368,9 +368,9 @@ public:
     [[nodiscard]] const UsmAllocator&      allocator()  const noexcept { return _computeCtx.allocator(); }
     [[nodiscard]] ::mimirmind::core::l0::L0ComputeContext&
         computeContext() noexcept { return _computeCtx; }
-    [[nodiscard]] compute::GpuMatmul&      gpuMatmul()        noexcept { return _gmm; }
-    [[nodiscard]] const compute::GpuMatmul& gpuMatmul()  const noexcept { return _gmm; }
-    [[nodiscard]] const compute::GpuOps&   gpuOps()     const noexcept { return _ops; }
+    [[nodiscard]] compute::l0::GpuMatmul&      gpuMatmul()        noexcept { return _gmm; }
+    [[nodiscard]] const compute::l0::GpuMatmul& gpuMatmul()  const noexcept { return _gmm; }
+    [[nodiscard]] const compute::l0::GpuOps&   gpuOps()     const noexcept { return _ops; }
     [[nodiscard]] const model::FusedQkvWeights* fusedQkv() const noexcept {
         return _fusedQkv.get();
     }
@@ -419,8 +419,8 @@ private:
     // M8.H.3: _ops is constructed BEFORE _gmm so GpuMatmul can hold
     // a reference to it (the DP4A dispatch path calls
     // GpuOps::xQuantI8Async to fill the internal Xq/Xscale scratch).
-    compute::GpuOps                            _ops;
-    compute::GpuMatmul                         _gmm;
+    compute::l0::GpuOps                            _ops;
+    compute::l0::GpuMatmul                         _gmm;
     // M8.K.0: diagnostic per-op timer. Constructed after _queue so it
     // can hold a reference. Off by default; opt in via
     // `diagnostics.traceOpTimes: true` in config.json.

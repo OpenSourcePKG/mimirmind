@@ -14,10 +14,10 @@
 #include <utility>
 #include <vector>
 
-namespace mimirmind::compute {
+namespace mimirmind::compute::l0 {
 class GpuMatmul;
 class GpuOps;
-} // namespace mimirmind::compute
+} // namespace mimirmind::compute::l0
 
 namespace mimirmind::runtime {
 class OpProfiler;
@@ -158,8 +158,8 @@ createArchBackend(const std::string&             architecture,
                   const model::LlmConfig&        config,
                   const core::gguf::WeightsMap&       weights,
                   const model::FusedQkvWeights*  fusedQkv,
-                  compute::GpuOps&               ops,
-                  compute::GpuMatmul&            gmm,
+                  compute::l0::GpuOps&               ops,
+                  compute::l0::GpuMatmul&            gmm,
                   OpProfiler&                    opProfiler,
                   bool                           moeGroupEnabled     = true,
                   bool                           moeFusedDownEnabled = false);

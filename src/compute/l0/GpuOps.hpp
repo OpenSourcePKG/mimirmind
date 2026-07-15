@@ -23,10 +23,11 @@ namespace mimirmind::runtime {
 class CommandQueue;
 }
 
-namespace mimirmind::compute {
+namespace mimirmind::compute::l0 {
 
 /**
- * GPU element-wise + normalisation kernels.
+ * L0-backend element-wise + normalisation kernels (Level Zero
+ * implementation of `compute::ComputeOps`).
  *
  * Shares the engine's CommandQueue with GpuMatmul so the entire block
  * forward can eventually be appended into one command list (M5f.4).
@@ -37,7 +38,7 @@ namespace mimirmind::compute {
  * Not thread-safe (the underlying ze_kernel_handle_t is mutated by
  * setArgumentValue). Construct once at startup, share across the engine.
  */
-class GpuOps : public ComputeOps {
+class GpuOps : public ::mimirmind::compute::ComputeOps {
 public:
     /// `flashPrefillEnabled` maps to `features.flashPrefill` in config.json.
     /// When false, T_q > 1 dispatches fall back to the plain attention.cl
@@ -657,4 +658,4 @@ private:
                                    runtime::KvDtype kvDtype);
 };
 
-} // namespace mimirmind::compute
+} // namespace mimirmind::compute::l0
