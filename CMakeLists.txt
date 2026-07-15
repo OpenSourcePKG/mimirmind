@@ -401,7 +401,10 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/attention_flash_merge.hip
         kernels_hip/attention_flash_partial.hip
         kernels_hip/attention_flash_partial_fp16.hip
+        kernels_hip/attention_flash_partial_q8_0.hip
         kernels_hip/attention_fp16.hip
+        kernels_hip/attention_q8_0.hip
+        kernels_hip/kv_quant_commit_q8_0.hip
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/mul_scalar.hip
         kernels_hip/qkv_split.hip
@@ -1177,6 +1180,54 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_attention_fp16_probe hip_kernels)
 
     target_link_libraries(hip_attention_fp16_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_kv_quant_commit_q8_0_probe — fp32 → Q8_0 KV writer -----
+    #
+    # First write-side quantization kernel. Byte-exact vs a CPU Q8_0
+    # quantiser that follows the same absmax + __float2half + roundf-
+    # to-int8 recipe. Runs at wgSize=32 (full wave on gfx1101) — no
+    # width scoping. Includes cache-stomp check on pre-curLen bytes.
+
+    add_executable(hip_kv_quant_commit_q8_0_probe
+        tools/hip-kv-quant-commit-q8-0-probe.cpp
+    )
+
+    add_dependencies(hip_kv_quant_commit_q8_0_probe hip_kernels)
+
+    target_link_libraries(hip_kv_quant_commit_q8_0_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_attention_q8_0_probe — Q8_0-KV untiled attention -------
+    #
+    # Same as hip_attention_probe but K/V are ggml-style Q8_0 blocks
+    # (2 B fp16 scale + 32 B int8 quants). CPU reference dequantises
+    # the exact same bytes the kernel does.
+
+    add_executable(hip_attention_q8_0_probe
+        tools/hip-attention-q8-0-probe.cpp
+    )
+
+    add_dependencies(hip_attention_q8_0_probe hip_kernels)
+
+    target_link_libraries(hip_attention_q8_0_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_attention_flash_partial_q8_0_probe — Q8_0 flash-partial -
+    #
+    # Q8_0-KV variant of the flash partial kernel. Partials stay fp32
+    # so the merge kernel is reused unchanged for the Q8_0 KV path.
+
+    add_executable(hip_attention_flash_partial_q8_0_probe
+        tools/hip-attention-flash-partial-q8-0-probe.cpp
+    )
+
+    add_dependencies(hip_attention_flash_partial_q8_0_probe hip_kernels)
+
+    target_link_libraries(hip_attention_flash_partial_q8_0_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
