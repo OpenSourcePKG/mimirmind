@@ -399,6 +399,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/add_residual.hip
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/mul_scalar.hip
+        kernels_hip/qkv_split.hip
         kernels_hip/rmsnorm.hip
         kernels_hip/rmsnorm_gemma.hip
         kernels_hip/rmsnorm_no_weight.hip
@@ -1028,6 +1029,25 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_rmsnorm_qkv_probe hip_kernels)
 
     target_link_libraries(hip_rmsnorm_qkv_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_qkv_split_probe — fused-QKV output scatter ---------------
+    #
+    # First scatter/layout-transform kernel (no reduction, no LDS).
+    # Splits a fused matmul output [M, Nq + 2*Nkv] into Q workspace +
+    # K cache + V cache, K/V land at (curLen + m) * Nkv. Uses the
+    # RoPE-style device-int slot for curLen. Scatter is a pure copy —
+    # tolerance is 0 (bit-exact), any diff is a routing/offset bug.
+    # Includes the cache-stomp check inherited from rmsnorm_qkv.
+
+    add_executable(hip_qkv_split_probe
+        tools/hip-qkv-split-probe.cpp
+    )
+
+    add_dependencies(hip_qkv_split_probe hip_kernels)
+
+    target_link_libraries(hip_qkv_split_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
