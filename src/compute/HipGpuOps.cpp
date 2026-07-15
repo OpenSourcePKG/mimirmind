@@ -564,13 +564,48 @@ void HipGpuOps::scaledAddResidualAsync(float*, const float*, float, std::size_t)
     throwNotImplemented("scaledAddResidualAsync");
 }
 
-void HipGpuOps::ropeInPlaceAsync(void*, std::size_t, std::size_t,
-                                 std::size_t, std::size_t, float,
-                                 std::size_t, runtime::KvDtype) {
-    // f32 variant loaded (`rope_inplace.hip`); fp16 variant not ported.
-    // Once the launch code lands, `kvDtype == FP16` will still throw
-    // until `rope_inplace_fp16.hip` gets a port.
-    throwNotImplemented("ropeInPlaceAsync");
+void HipGpuOps::ropeInPlaceAsync(void* xBase, std::size_t seqLen,
+                                 std::size_t numHeads, std::size_t headDim,
+                                 std::size_t startPos, float base,
+                                 std::size_t writeOffsetStride,
+                                 runtime::KvDtype kvDtype) {
+    if (seqLen == 0 || numHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (headDim % 2 != 0) {
+        throw std::runtime_error(
+            "HipGpuOps::ropeInPlace: headDim must be even");
+    }
+    // fp16 in-place variant needs `rope_inplace_fp16.hip` — not
+    // ported yet. Refuse loudly rather than silently corrupt an
+    // fp16 KV cache with the fp32 kernel.
+    if (kvDtype == runtime::KvDtype::FP16) {
+        throw std::runtime_error(
+            "HipGpuOps::ropeInPlaceAsync: FP16 KV path requires "
+            "rope_inplace_fp16.hip — not yet ported on the HIP side");
+    }
+
+    const std::size_t halfDim = headDim / 2;
+    const std::size_t total   = seqLen * numHeads * halfDim;
+
+    // startPos flows through the shared curLen slot — kernel binds it
+    // as a device pointer and dereferences at launch. Sync H2D write
+    // before launch matches L0's `*_curLenSlotUsm = startPos` store
+    // (works there via USM). See rmsNormQkvAsync for the same trick.
+    const std::int32_t startI = toInt32(startPos, "rope startPos");
+    _ctx.allocator().copyH2D(_curLenSlotUsm, &startI, sizeof(std::int32_t));
+
+    auto& k = _pimpl->_ropeKernel;
+    k.setPtr  (0, xBase);
+    k.setValue(1, toInt32(seqLen,   "rope seqLen"));
+    k.setValue(2, toInt32(numHeads, "rope numHeads"));
+    k.setValue(3, toInt32(headDim,  "rope headDim"));
+    k.setPtr  (4, _curLenSlotUsm);
+    k.setValue(5, base);
+    k.setValue(6, toInt32(writeOffsetStride, "rope writeOffsetStride"));
+    k.launch(_ctx.stream(),
+             groupsForN(total, kRopeLocalSize), 1, 1,
+             kRopeLocalSize, 1, 1);
 }
 
 void HipGpuOps::ropeInPlaceWithFactorsAsync(void*, const float*,
@@ -588,9 +623,43 @@ void HipGpuOps::xQuantI8Async(const float*, std::int8_t*, float*,
     throwNotImplemented("xQuantI8Async");
 }
 
-void HipGpuOps::kvQuantCommitQ8Async(const float*, void*,
-                                     std::size_t, std::size_t, std::size_t) {
-    throwNotImplemented("kvQuantCommitQ8Async");
+void HipGpuOps::kvQuantCommitQ8Async(const float* xSrc, void* kvDst,
+                                     std::size_t T, std::size_t kvDim,
+                                     std::size_t writeOffset) {
+    if (T == 0 || kvDim == 0) {
+        return;
+    }
+    // Q8_0 is inherently 32-element block based. A partial block
+    // would leave stale bytes in the fp16 scale slot and mis-index
+    // every following row. Same guard as GpuOps + KvCache ctor.
+    constexpr std::size_t kBlockElems = 32;
+    if (kvDim % kBlockElems != 0) {
+        throw std::runtime_error(
+            "HipGpuOps::kvQuantCommitQ8Async: kvDim=" +
+            std::to_string(kvDim) +
+            " must be a multiple of " + std::to_string(kBlockElems));
+    }
+    const std::size_t nBlocksPerRow = kvDim / kBlockElems;
+
+    // writeOffset goes through the shared curLen slot — kernel adds
+    // `curLen * nBlocksPerRow * 34` to reach the row-aligned start,
+    // so `kvDst` stays a stable layer-base pointer across replays.
+    const std::int32_t offI =
+        toInt32(writeOffset, "kvQuantCommitQ8 writeOffset");
+    _ctx.allocator().copyH2D(_curLenSlotUsm, &offI, sizeof(std::int32_t));
+
+    auto& k = _pimpl->_kvQuantCommitQ8Kernel;
+    k.setPtr  (0, xSrc);
+    k.setPtr  (1, kvDst);
+    k.setValue(2, toInt32(kvDim, "kvQuantCommitQ8 kvDim"));
+    k.setPtr  (3, _curLenSlotUsm);
+    // One workgroup per (t, block). Kernel LOCAL=32 == Q8_0 block
+    // size so each thread owns one element of one block.
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(T),
+             static_cast<std::uint32_t>(nBlocksPerRow),
+             1,
+             kKvQuantCommitLocalSize, 1, 1);
 }
 
 void HipGpuOps::qkvSplitAsync(const float*, float*, void*, void*,
