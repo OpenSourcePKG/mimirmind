@@ -400,6 +400,9 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/mul_scalar.hip
         kernels_hip/rmsnorm.hip
+        kernels_hip/rmsnorm_gemma.hip
+        kernels_hip/rmsnorm_no_weight.hip
+        kernels_hip/rmsnorm_qkv.hip
         kernels_hip/rope_inplace.hip
         kernels_hip/silu_mul.hip
     )
@@ -976,6 +979,55 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_mul_scalar_probe hip_kernels)
 
     target_link_libraries(hip_mul_scalar_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_rmsnorm_gemma_probe — Gemma (1+weight) rmsnorm variant --
+    #
+    # Same tree reduction as vanilla rmsnorm, applies (1 + weight[k])
+    # instead of weight[k]. Used for every proper Gemma 4 norm weight.
+
+    add_executable(hip_rmsnorm_gemma_probe
+        tools/hip-rmsnorm-gemma-probe.cpp
+    )
+
+    add_dependencies(hip_rmsnorm_gemma_probe hip_kernels)
+
+    target_link_libraries(hip_rmsnorm_gemma_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_rmsnorm_no_weight_probe — Gemma V-norm rmsnorm variant --
+    #
+    # Same tree reduction, drops the multiplicative weight — Gemma 4's
+    # V projection passes through a bare ggml_rms_norm before entering
+    # the KV cache.
+
+    add_executable(hip_rmsnorm_no_weight_probe
+        tools/hip-rmsnorm-no-weight-probe.cpp
+    )
+
+    add_dependencies(hip_rmsnorm_no_weight_probe hip_kernels)
+
+    target_link_libraries(hip_rmsnorm_no_weight_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_rmsnorm_qkv_probe — fused Q + K + V rmsnorm --------------
+    #
+    # One dispatch normalizes all three streams. Routes workgroups to
+    # Q / K / V by grid index, writes K/V into their caches at the
+    # curLen offset. Uses the RoPE-style device-int slot for curLen.
+    # Probe additionally checks that pre-curLen cache slots are not
+    # touched.
+
+    add_executable(hip_rmsnorm_qkv_probe
+        tools/hip-rmsnorm-qkv-probe.cpp
+    )
+
+    add_dependencies(hip_rmsnorm_qkv_probe hip_kernels)
+
+    target_link_libraries(hip_rmsnorm_qkv_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
