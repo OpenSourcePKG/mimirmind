@@ -367,7 +367,7 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // cache slot.
         trace("Q+K+V projections (matmulAsync, unordered)");
         {
-            runtime::UnorderedScope u{_ops.queue()};
+            compute::UnorderedScope u{_ops};
             projectAsync(qW, q_dim, qBuf);
             projectAsync(kW, kv_dim,
                          q8Path ? kFp32Scratch
@@ -411,11 +411,11 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // just like the F32 / FP16 paths.
         trace("alt-attn V = raw K (device memcpy)");
         if (q8Path) {
-            _ops.queue().appendMemoryCopy(
+            _ops.appendMemoryCopy(
                 vFp32Scratch, kFp32Scratch,
                 T * kv_dim * sizeof(float));
         } else {
-            _ops.queue().appendMemoryCopy(
+            _ops.appendMemoryCopy(
                 vSlot, kSlot, T * cache.rowBytes(blockIdx));
         }
     }
@@ -466,7 +466,7 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // carries `curLen` for correct positional angles; the write
         // stride is 0 because the staging holds no history.
         trace("RoPE Q+K (unordered)");
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
             _ops.ropeInPlaceWithFactorsAsync(qBuf, _ropeFreqsForFullAttn, T,
                                              li.nHeads, head_dim, curLen,

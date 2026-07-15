@@ -206,7 +206,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
         // cache slot.
         trace("Q+K+V projections (matmulAsync, unordered)");
         {
-            runtime::UnorderedScope u{_ops.queue()};
+            compute::UnorderedScope u{_ops};
             projectAsync(qW, q_dim,  qBuf);
             projectAsync(kW, kv_dim,
                          q8Path ? kFp32Scratch
@@ -229,7 +229,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     // for the same defence-in-depth reason as the projection above.
     trace("QKV bias add (async, unordered)");
     {
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         addBiasIf(qB, q_dim,  qBuf);
         addBiasIf(kB, kv_dim,
                   q8Path ? kFp32Scratch
@@ -252,7 +252,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     // offset stride is 0 because there's no history in front of row 0.
     trace("RoPE Q+K (async, unordered)");
     {
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         _ops.ropeInPlaceAsync(qBuf, T,
                               _config.headCount,   head_dim, curLen,
                               _config.ropeFreqBase);
@@ -310,7 +310,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     // the pop's barrier is what protects it.
     trace("FFN gate+up (matmulAsync, unordered)");
     {
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
                          normBuf, T, gateOutBuf, matmulScratch);
         _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,

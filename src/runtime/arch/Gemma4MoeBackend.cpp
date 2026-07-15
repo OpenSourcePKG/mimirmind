@@ -118,7 +118,7 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     trace("FFN gate+up proj (unordered)");
     {
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
                          normBuf, T, gateOutBuf, matmulScratch);
         _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
@@ -150,7 +150,7 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
     _op.mark(runtime::OpProfiler::Cat::NORM);
     trace("path B: pre_ffw_norm_2 + router rmsNorm (unordered)");
     {
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         _ops.rmsNormAsync(x, T, d_model,
                           static_cast<const float*>(preNorm2->usmPtr),
                           _config.rmsNormEps,
@@ -388,7 +388,7 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
                 // Copy the ffPerExpert activations into the K-strided
                 // slot the fused kernel expects. Kept on the queue for
                 // ordering vs the next iteration's gate_up.
-                _ops.queue().appendMemoryCopy(
+                _ops.appendMemoryCopy(
                     gateActAll + k * ffPerExpert,
                     gateOutBuf,
                     ffPerExpert * sizeof(float));

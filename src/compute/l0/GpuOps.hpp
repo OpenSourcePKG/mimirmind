@@ -330,6 +330,12 @@ public:
     void noteQ8_0ReorderApplied(std::size_t bytes,
                                 std::string_view label) noexcept override;
 
+    // Schritt 3c.1 — stream / recording ops forwarded to `_queue`.
+    void pushUnorderedScope() override;
+    void popUnorderedScope()  override;
+    void appendMemoryCopy(void* dst, const void* src, std::size_t bytes) override;
+    void flush() override;
+
     [[nodiscard]] std::size_t q8_0ReorderTensorCount() const noexcept override {
         return _q8_0ReorderTensorCount;
     }

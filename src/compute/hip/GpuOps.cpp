@@ -402,6 +402,33 @@ void GpuOps::noteQ8_0ReorderApplied(std::size_t bytes,
                 _q8_0ReorderTensorCount, _q8_0ReorderTotalBytes);
 }
 
+// Schritt 3c.1 — neutral stream / recording ops. HIP has no direct
+// analogue of L0's UnorderedScope: streams on RDNA schedule kernel
+// launches concurrently by default (dependency-tracked by the driver
+// via resource use, not by a "strict order" flag). So push/pop are
+// no-ops — the scope reads like documentation of a concurrent
+// section rather than actually toggling behaviour. `flush()` is the
+// stream sync; `appendMemoryCopy` is a stream-ordered async memcpy.
+void GpuOps::pushUnorderedScope() { /* HIP streams reorder freely — no-op */ }
+void GpuOps::popUnorderedScope()  { /* no-op counterpart */ }
+
+void GpuOps::appendMemoryCopy(void* dst, const void* src, std::size_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    const hipError_t rc = hipMemcpyAsync(
+        dst, src, bytes, hipMemcpyDefault, _ctx.stream().handle());
+    if (rc != hipSuccess) {
+        throw std::runtime_error(
+            std::string{"compute::hip::GpuOps::appendMemoryCopy: "
+                        "hipMemcpyAsync failed: "} + hipGetErrorString(rc));
+    }
+}
+
+void GpuOps::flush() {
+    _ctx.stream().synchronize();
+}
+
 // ---- Stubbed kernel-launch overrides --------------------------------
 //
 // Every method below throws `std::runtime_error` with a clear

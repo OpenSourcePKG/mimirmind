@@ -187,6 +187,16 @@ public:
     void noteQ8_0ReorderApplied(std::size_t bytes,
                                 std::string_view label) noexcept override;
 
+    // Schritt 3c.1 — stream / recording ops. push/pop are no-ops
+    // (HIP streams reorder freely at the driver level; the L0
+    // UnorderedScope has no direct equivalent to enable). Memcpy
+    // goes through hipMemcpyAsync on the shared stream; flush
+    // syncs the stream.
+    void pushUnorderedScope() override;
+    void popUnorderedScope()  override;
+    void appendMemoryCopy(void* dst, const void* src, std::size_t bytes) override;
+    void flush() override;
+
     // ---- HIP-native accessors ----------------------------------------
     //
     // Mirror `GpuOps::queue()` / `allocator()` — consumers that need

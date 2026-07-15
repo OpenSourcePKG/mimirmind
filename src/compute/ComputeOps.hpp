@@ -220,8 +220,67 @@ public:
     virtual void noteQ8_0ReorderApplied(std::size_t bytes,
                                         std::string_view label) noexcept = 0;
 
+    // ---- Stream / recording ops (Schritt 3c.1) ------------------------
+    //
+    // Neutral wrappers around the two dominant L0-specific operations
+    // that backends previously reached through `_ops.queue()`:
+    // `UnorderedScope` (concurrent-dispatch window on the command
+    // queue) and `appendMemoryCopy` (device↔device or device↔host
+    // copy queued into the same stream as kernel launches).
+    //
+    // L0 impl forwards to `runtime::CommandQueue::{push,pop}Unordered`
+    // and `appendMemoryCopy`. HIP impl leaves push/pop as no-ops
+    // (streams already reorder freely at driver level) and routes
+    // the copy through `hipMemcpyAsync` on the shared HIP stream.
+
+    /// Enter concurrent-dispatch scope. Launches appended inside the
+    /// scope may reorder / overlap; the runtime restores strict order
+    /// on `popUnorderedScope()`. Use the RAII `compute::UnorderedScope`
+    /// helper below rather than calling these two directly.
+    virtual void pushUnorderedScope() = 0;
+    virtual void popUnorderedScope()  = 0;
+
+    /// Queue a memory copy into the same stream as kernel launches.
+    /// Both pointers must be reachable from the device (backend-
+    /// dependent — for L0 USM they can be host/shared/device; for HIP
+    /// they can be host-pinned or device). Not synchronous — call
+    /// `flush()` before the CPU reads the result.
+    virtual void appendMemoryCopy(void*       dst,
+                                  const void* src,
+                                  std::size_t bytes) = 0;
+
+    /// Flush pending work + wait for it. On L0 this closes the current
+    /// command list, executes it, and syncs; on HIP it calls
+    /// `hipStreamSynchronize`. Same semantic as `ComputeMatmul::sync()`
+    /// but reachable through the ops interface for callers that only
+    /// hold `ComputeOps&`.
+    virtual void flush() = 0;
+
 protected:
     ComputeOps() = default;
+};
+
+/**
+ * RAII helper: enters an unordered-dispatch scope on construction,
+ * exits on destruction. Non-copyable + non-movable to avoid dangling
+ * push/pop pairings. Same shape as the L0-native
+ * `runtime::UnorderedScope` — direct drop-in for callers that migrate
+ * from `_ops.queue()` to `_ops`.
+ */
+class UnorderedScope {
+public:
+    explicit UnorderedScope(ComputeOps& ops) : _ops{ops} {
+        _ops.pushUnorderedScope();
+    }
+    ~UnorderedScope() { _ops.popUnorderedScope(); }
+
+    UnorderedScope(const UnorderedScope&)            = delete;
+    UnorderedScope& operator=(const UnorderedScope&) = delete;
+    UnorderedScope(UnorderedScope&&)                 = delete;
+    UnorderedScope& operator=(UnorderedScope&&)      = delete;
+
+private:
+    ComputeOps& _ops;
 };
 
 } // namespace mimirmind::compute

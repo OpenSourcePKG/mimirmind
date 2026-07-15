@@ -333,6 +333,25 @@ void GpuOps::noteQ8_0ReorderApplied(std::size_t bytes,
                 _q8_0ReorderTotalBytes / (1024 * 1024));
 }
 
+// Schritt 3c.1 — neutral stream / recording ops. L0 forwards to the
+// shared CommandQueue; the runtime::UnorderedScope helper wraps the
+// same push/pop pair we now expose here.
+void GpuOps::pushUnorderedScope() {
+    _queue.pushUnordered();
+}
+
+void GpuOps::popUnorderedScope() {
+    _queue.popUnordered();
+}
+
+void GpuOps::appendMemoryCopy(void* dst, const void* src, std::size_t bytes) {
+    _queue.appendMemoryCopy(dst, src, bytes);
+}
+
+void GpuOps::flush() {
+    _queue.flush();
+}
+
 GpuOps::~GpuOps() {
     if (_flashPartialUsm != nullptr) {
         _alloc.deallocate(_flashPartialUsm, _flashPartialBytes);

@@ -758,7 +758,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             // parity-diff reports a spurious factor-of-sqrt(n_embd)
             // divergence (RMSNorm inside block 0 cancels it so the
             // rest of the pipeline still runs on the scaled value).
-            _ops.queue().flush();
+            _ops.flush();
             const std::string fname =
                 dumpPrefix + "-blk0-inp_scaled.bin";
             std::ofstream f(fname, std::ios::binary);
@@ -1007,7 +1007,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 // and would trip the "immediate work is pending" throw.
                 // Flush the immediate list explicitly so the invariant
                 // holds independently of the backend.
-                _ops.queue().flush();
+                _ops.flush();
                 _ops.queue().beginRecord();
                 for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
                     _backend->runBlock(b, xBuf, 1, cache, buffers, false);

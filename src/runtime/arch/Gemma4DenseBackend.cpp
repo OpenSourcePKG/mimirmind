@@ -81,7 +81,7 @@ void Gemma4DenseBackend::runBlock(std::size_t   blockIdx,
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     trace("FFN gate+up proj (unordered)");
     {
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
                          normBuf, T, gateOutBuf, matmulScratch);
         _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,

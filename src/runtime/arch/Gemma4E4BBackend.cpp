@@ -414,7 +414,7 @@ void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds,
 
     if (haveProj) {
         // Sync the queue so the GPU rmsnorm has landed before CPU reads.
-        _ops.queue().flush();
+        _ops.flush();
 
         const float invSqrt2 = 0.70710678118654752440F;
         const float* proj    = _pleProjBuf.as<float>();
@@ -521,7 +521,7 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     {
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
                          normBuf, T, gateOutBuf, matmulScratch);
         _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
