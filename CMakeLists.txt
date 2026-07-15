@@ -385,6 +385,13 @@ if(MIMIRMIND_ENABLE_HIP)
         src/core/gpu/hip/HipMemoryAllocator.cpp
         src/core/gpu/hip/HipModule.cpp
         src/core/gpu/hip/HipStream.cpp
+
+        # Schritt 3b sub-A: HipGpuOps skeleton — implements the
+        # backend-neutral ComputeOps interface for the HIP path.
+        # All kernel-launch methods currently throw; feature-flag
+        # accessors + Q8_0 reorder counters + module loading are
+        # real. Follow-up commits fill launches group-by-group.
+        src/compute/HipGpuOps.cpp
     )
 
     target_link_libraries(mimirmind_core_hip PUBLIC
