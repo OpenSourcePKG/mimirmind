@@ -117,10 +117,9 @@ core::hip::HipModule loadHipModule(core::hip::HipContext& ctx,
 // entry point. HIP-only kernels used by `HipGpuMatmul` (matmul
 // variants + moe_down) live on that class, not here. Kernels that
 // exist in the L0 `GpuOps::Impl` but haven't been ported to HIP yet
-// (rope_inplace_ff{,_fp16}, rope_inplace_fp16,
-// attention_prefill_flash_q8_0_gqa KTILE=64 variant) are deliberately
-// absent — the corresponding ComputeOps overrides throw
-// `not yet implemented` at dispatch time.
+// (rope_inplace_ff_fp16, attention_prefill_flash_q8_0_gqa KTILE=64
+// variant) are deliberately absent — the corresponding ComputeOps
+// overrides throw a clear diagnostic at dispatch time.
 struct GpuOps::Impl {
     core::hip::HipModule _rmsnormModule;
     core::hip::HipKernel _rmsnormKernel;
@@ -151,6 +150,10 @@ struct GpuOps::Impl {
     core::hip::HipKernel _xQuantI8Kernel;
     core::hip::HipModule _ropeModule;
     core::hip::HipKernel _ropeKernel;
+    core::hip::HipModule _ropeFp16Module;
+    core::hip::HipKernel _ropeFp16Kernel;
+    core::hip::HipModule _ropeFfModule;
+    core::hip::HipKernel _ropeFfKernel;
 
     core::hip::HipModule _attentionModule;
     core::hip::HipKernel _attentionKernel;
@@ -218,6 +221,10 @@ struct GpuOps::Impl {
           _xQuantI8Kernel          {_xQuantI8Module.getKernel("x_quant_i8")},
           _ropeModule              {loadHipModule(ctx, "rope_inplace")},
           _ropeKernel              {_ropeModule.getKernel("rope_inplace")},
+          _ropeFp16Module          {loadHipModule(ctx, "rope_inplace_fp16")},
+          _ropeFp16Kernel          {_ropeFp16Module.getKernel("rope_inplace_fp16")},
+          _ropeFfModule            {loadHipModule(ctx, "rope_inplace_ff")},
+          _ropeFfKernel            {_ropeFfModule.getKernel("rope_inplace_ff")},
 
           _attentionModule         {loadHipModule(ctx, "attention")},
           _attentionKernel         {_attentionModule.getKernel("attention")},
@@ -329,7 +336,7 @@ GpuOps::GpuOps(core::hip::HipComputeContext& ctx,
     }
 
     MM_LOG_INFO("hipgpuops",
-                "hip::GpuOps ready — 29 modules loaded (rmsnorm variants, "
+                "hip::GpuOps ready — 31 modules loaded (rmsnorm variants, "
                 "elementwise, rope, attention decode/prefill × f32/fp16/Q8_0, "
                 "qkv_split × f32/fp16, kv_quant_commit_q8_0, "
                 "matmul_q8_0_vec_reorder). "
@@ -624,17 +631,27 @@ void GpuOps::ropeInPlaceAsync(void* xBase, std::size_t seqLen,
         throw std::runtime_error(
             "GpuOps::ropeInPlace: headDim must be even");
     }
-    // fp16 in-place variant needs `rope_inplace_fp16.hip` — not
-    // ported yet. Refuse loudly rather than silently corrupt an
-    // fp16 KV cache with the fp32 kernel.
-    if (kvDtype == runtime::KvDtype::FP16) {
+    // Q8_0 not supported for RoPE — Q8_0 is a KV-storage-only format;
+    // K-rope always runs against the fp32 workspace before the Q8_0
+    // KV commit. Refuse loudly rather than pick a wrong kernel.
+    if (kvDtype == runtime::KvDtype::Q8_0) {
         throw std::runtime_error(
-            "GpuOps::ropeInPlaceAsync: FP16 KV path requires "
-            "rope_inplace_fp16.hip — not yet ported on the HIP side");
+            "compute::hip::GpuOps::ropeInPlaceAsync: kvDtype=Q8_0 not "
+            "supported — K-rope target buffer is fp32 workspace, not "
+            "the Q8_0 KV cache");
     }
 
     const std::size_t halfDim = headDim / 2;
     const std::size_t total   = seqLen * numHeads * halfDim;
+
+    // Pick f32 vs fp16 kernel by KV dtype. Rotation stays fp32 in
+    // registers on both paths — the fp16 kernel just wraps loads /
+    // stores in __half2float / __float2half so precision matches the
+    // f32 kernel up to the fp16 store round-trip. Same arg layout,
+    // only the `xBase` pointer type differs.
+    auto& k = (kvDtype == runtime::KvDtype::FP16)
+                  ? _pimpl->_ropeFp16Kernel
+                  : _pimpl->_ropeKernel;
 
     // startPos flows through the shared curLen slot — kernel binds it
     // as a device pointer and dereferences at launch. Sync H2D write
@@ -643,7 +660,6 @@ void GpuOps::ropeInPlaceAsync(void* xBase, std::size_t seqLen,
     const std::int32_t startI = toInt32(startPos, "rope startPos");
     _ctx.allocator().copyH2D(_curLenSlotUsm, &startI, sizeof(std::int32_t));
 
-    auto& k = _pimpl->_ropeKernel;
     k.setPtr  (0, xBase);
     k.setValue(1, toInt32(seqLen,   "rope seqLen"));
     k.setValue(2, toInt32(numHeads, "rope numHeads"));
@@ -656,12 +672,52 @@ void GpuOps::ropeInPlaceAsync(void* xBase, std::size_t seqLen,
              kRopeLocalSize, 1, 1);
 }
 
-void GpuOps::ropeInPlaceWithFactorsAsync(void*, const float*,
-                                            std::size_t, std::size_t,
-                                            std::size_t, std::size_t, float,
-                                            std::size_t, runtime::KvDtype) {
-    // rope_inplace_ff.hip not yet ported (nor its _fp16 variant).
-    throwNotImplemented("ropeInPlaceWithFactorsAsync");
+void GpuOps::ropeInPlaceWithFactorsAsync(void* xBase, const float* freqFactors,
+                                         std::size_t seqLen,
+                                         std::size_t numHeads,
+                                         std::size_t headDim,
+                                         std::size_t startPos, float base,
+                                         std::size_t writeOffsetStride,
+                                         runtime::KvDtype kvDtype) {
+    if (seqLen == 0 || numHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (headDim % 2 != 0) {
+        throw std::runtime_error(
+            "compute::hip::GpuOps::ropeInPlaceWithFactors: headDim must be even");
+    }
+    // fp16-KV variant of freq-factors RoPE (`rope_inplace_ff_fp16.hip`)
+    // still needs porting; Q8_0 is not a RoPE target (see
+    // ropeInPlaceAsync). Both refuse loudly.
+    if (kvDtype == runtime::KvDtype::FP16) {
+        throw std::runtime_error(
+            "compute::hip::GpuOps::ropeInPlaceWithFactorsAsync: FP16 KV "
+            "path requires rope_inplace_ff_fp16.hip — not yet ported");
+    }
+    if (kvDtype == runtime::KvDtype::Q8_0) {
+        throw std::runtime_error(
+            "compute::hip::GpuOps::ropeInPlaceWithFactorsAsync: kvDtype=Q8_0 "
+            "not supported — K-rope target buffer is fp32 workspace");
+    }
+
+    const std::size_t halfDim = headDim / 2;
+    const std::size_t total   = seqLen * numHeads * halfDim;
+
+    const std::int32_t startI = toInt32(startPos, "rope_ff startPos");
+    _ctx.allocator().copyH2D(_curLenSlotUsm, &startI, sizeof(std::int32_t));
+
+    auto& k = _pimpl->_ropeFfKernel;
+    k.setPtr  (0, xBase);
+    k.setPtr  (1, freqFactors);
+    k.setValue(2, toInt32(seqLen,   "rope_ff seqLen"));
+    k.setValue(3, toInt32(numHeads, "rope_ff numHeads"));
+    k.setValue(4, toInt32(headDim,  "rope_ff headDim"));
+    k.setPtr  (5, _curLenSlotUsm);
+    k.setValue(6, base);
+    k.setValue(7, toInt32(writeOffsetStride, "rope_ff writeOffsetStride"));
+    k.launch(_ctx.stream(),
+             groupsForN(total, kRopeLocalSize), 1, 1,
+             kRopeLocalSize, 1, 1);
 }
 
 void GpuOps::xQuantI8Async(const float* x, std::int8_t* y, float* scale,

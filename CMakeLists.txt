@@ -437,6 +437,8 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/rmsnorm_qkv.hip
         kernels_hip/rmsnorm_qkv_fp16.hip
         kernels_hip/rope_inplace.hip
+        kernels_hip/rope_inplace_fp16.hip
+        kernels_hip/rope_inplace_ff.hip
         kernels_hip/scaled_add_residual.hip
         kernels_hip/gelu_mul.hip
         kernels_hip/x_quant_i8.hip
@@ -1455,6 +1457,40 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_add_rmsnorm_probe hip_kernels)
 
     target_link_libraries(hip_add_rmsnorm_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_rope_fp16_probe — fp16-KV RoPE parity check --------------
+    #
+    # Kernel body promotes each fp16 pair to fp32 registers, rotates,
+    # demotes back on store. Reference does the same fp16 round-trip
+    # so drift is entirely from sin/cos + multiply-subtract + the two
+    # fp16 stores. Tolerance widened (5e-4 abs / 5e-3 rel) vs the fp32
+    # rope probe to cover ~2^-11 fp16 quantisation.
+
+    add_executable(hip_rope_fp16_probe
+        tools/hip-rope-fp16-probe.cpp
+    )
+
+    add_dependencies(hip_rope_fp16_probe hip_kernels)
+
+    target_link_libraries(hip_rope_fp16_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_rope_ff_probe — freq-factors RoPE parity check -----------
+    #
+    # Adds a [halfDim] `freq_factors` buffer that divides the per-pair
+    # theta. Same numerics envelope as the base rope probe since the
+    # only change is one extra multiply on the frequency computation.
+
+    add_executable(hip_rope_ff_probe
+        tools/hip-rope-ff-probe.cpp
+    )
+
+    add_dependencies(hip_rope_ff_probe hip_kernels)
+
+    target_link_libraries(hip_rope_ff_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
