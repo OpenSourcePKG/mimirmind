@@ -397,6 +397,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/hip_probe_kernel.hip
         kernels_hip/add_bias.hip
         kernels_hip/add_residual.hip
+        kernels_hip/attention_flash_partial.hip
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/mul_scalar.hip
         kernels_hip/qkv_split.hip
@@ -1085,6 +1086,26 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_rmsnorm_qkv_fp16_probe hip_kernels)
 
     target_link_libraries(hip_rmsnorm_qkv_fp16_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_attention_flash_partial_probe — FlashAttention K-tile ---
+    #
+    # First non-trivial reduction+softmax+GEMV composite kernel in the
+    # port. 2D grid (nHeads, nKTiles), wgSize=16 (half-wave on gfx1101).
+    # Warp16 butterfly reduction replaces the L0 sub_group_reduce_max
+    # / _add. Two-case probe: full-attention (both tiles valid) + SWA
+    # (tile 0 hits the -INFINITY neutral-emission path). Bit-exact
+    # match required on the neutral slots; combined-tolerance 1e-4/1e-4
+    # on the numeric slots.
+
+    add_executable(hip_attention_flash_partial_probe
+        tools/hip-attention-flash-partial-probe.cpp
+    )
+
+    add_dependencies(hip_attention_flash_partial_probe hip_kernels)
+
+    target_link_libraries(hip_attention_flash_partial_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
