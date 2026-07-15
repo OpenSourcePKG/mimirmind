@@ -117,10 +117,10 @@ core::hip::HipModule loadHipModule(core::hip::HipContext& ctx,
 // entry point. HIP-only kernels used by `HipGpuMatmul` (matmul
 // variants + moe_down) live on that class, not here. Kernels that
 // exist in the L0 `GpuOps::Impl` but haven't been ported to HIP yet
-// (gelu_mul, add_rmsnorm, rope_inplace_ff{,_fp16}, rope_inplace_fp16,
-// scaled_add_residual, x_quant_i8, attention_prefill_flash_q8_0_gqa
-// KTILE=64 variant) are deliberately absent — the corresponding
-// ComputeOps overrides throw `not yet implemented` at dispatch time.
+// (add_rmsnorm, rope_inplace_ff{,_fp16}, rope_inplace_fp16,
+// attention_prefill_flash_q8_0_gqa KTILE=64 variant) are deliberately
+// absent — the corresponding ComputeOps overrides throw
+// `not yet implemented` at dispatch time.
 struct GpuOps::Impl {
     core::hip::HipModule _rmsnormModule;
     core::hip::HipKernel _rmsnormKernel;
@@ -139,8 +139,14 @@ struct GpuOps::Impl {
     core::hip::HipKernel _addResidualKernel;
     core::hip::HipModule _siluMulModule;
     core::hip::HipKernel _siluMulKernel;
+    core::hip::HipModule _geluMulModule;
+    core::hip::HipKernel _geluMulKernel;
     core::hip::HipModule _mulScalarModule;
     core::hip::HipKernel _mulScalarKernel;
+    core::hip::HipModule _scaledAddResidualModule;
+    core::hip::HipKernel _scaledAddResidualKernel;
+    core::hip::HipModule _xQuantI8Module;
+    core::hip::HipKernel _xQuantI8Kernel;
     core::hip::HipModule _ropeModule;
     core::hip::HipKernel _ropeKernel;
 
@@ -197,8 +203,15 @@ struct GpuOps::Impl {
           _addResidualKernel       {_addResidualModule.getKernel("add_residual")},
           _siluMulModule           {loadHipModule(ctx, "silu_mul")},
           _siluMulKernel           {_siluMulModule.getKernel("silu_mul")},
+          _geluMulModule           {loadHipModule(ctx, "gelu_mul")},
+          _geluMulKernel           {_geluMulModule.getKernel("gelu_mul")},
           _mulScalarModule         {loadHipModule(ctx, "mul_scalar")},
           _mulScalarKernel         {_mulScalarModule.getKernel("mul_scalar")},
+          _scaledAddResidualModule {loadHipModule(ctx, "scaled_add_residual")},
+          _scaledAddResidualKernel {
+              _scaledAddResidualModule.getKernel("scaled_add_residual")},
+          _xQuantI8Module          {loadHipModule(ctx, "x_quant_i8")},
+          _xQuantI8Kernel          {_xQuantI8Module.getKernel("x_quant_i8")},
           _ropeModule              {loadHipModule(ctx, "rope_inplace")},
           _ropeKernel              {_ropeModule.getKernel("rope_inplace")},
 
@@ -312,7 +325,7 @@ GpuOps::GpuOps(core::hip::HipComputeContext& ctx,
     }
 
     MM_LOG_INFO("hipgpuops",
-                "hip::GpuOps ready — 25 modules loaded (rmsnorm variants, "
+                "hip::GpuOps ready — 28 modules loaded (rmsnorm variants, "
                 "elementwise, rope, attention decode/prefill × f32/fp16/Q8_0, "
                 "qkv_split × f32/fp16, kv_quant_commit_q8_0, "
                 "matmul_q8_0_vec_reorder). "
@@ -540,9 +553,18 @@ void GpuOps::siluMulAsync(float* gate, const float* up, std::size_t n) {
              kElementwiseLocalSize, 1, 1);
 }
 
-void GpuOps::geluMulAsync(float*, const float*, std::size_t) {
-    // gelu_mul.hip not yet ported.
-    throwNotImplemented("geluMulAsync");
+void GpuOps::geluMulAsync(float* gate, const float* up, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "geluMul n");
+    auto& k = _pimpl->_geluMulKernel;
+    k.setPtr  (0, gate);
+    k.setPtr  (1, up);
+    k.setValue(2, ni);
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
 }
 
 void GpuOps::mulScalarAsync(float* y, float s, std::size_t n) {
@@ -559,9 +581,20 @@ void GpuOps::mulScalarAsync(float* y, float s, std::size_t n) {
              kElementwiseLocalSize, 1, 1);
 }
 
-void GpuOps::scaledAddResidualAsync(float*, const float*, float, std::size_t) {
-    // scaled_add_residual.hip not yet ported.
-    throwNotImplemented("scaledAddResidualAsync");
+void GpuOps::scaledAddResidualAsync(float* dst, const float* src,
+                                    float scale, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "scaledAddResidual n");
+    auto& k = _pimpl->_scaledAddResidualKernel;
+    k.setPtr  (0, dst);
+    k.setPtr  (1, src);
+    k.setValue(2, scale);
+    k.setValue(3, ni);
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
 }
 
 void GpuOps::ropeInPlaceAsync(void* xBase, std::size_t seqLen,
@@ -616,11 +649,21 @@ void GpuOps::ropeInPlaceWithFactorsAsync(void*, const float*,
     throwNotImplemented("ropeInPlaceWithFactorsAsync");
 }
 
-void GpuOps::xQuantI8Async(const float*, std::int8_t*, float*,
-                              std::size_t, std::size_t) {
-    // x_quant_i8.hip not yet ported. Blocks the DP4A matvec path in
-    // `HipGpuMatmul` — plain matvec will still work once that lands.
-    throwNotImplemented("xQuantI8Async");
+void GpuOps::xQuantI8Async(const float* x, std::int8_t* y, float* scale,
+                           std::size_t M, std::size_t K) {
+    if (M == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t Ki = toInt32(K, "xQuantI8 K");
+    auto& k = _pimpl->_xQuantI8Kernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, y);
+    k.setPtr  (2, scale);
+    k.setValue(3, Ki);
+    // One workgroup per row — kernel LOCAL=128, matches L0.
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(M), 1, 1,
+             kXQuantI8LocalSize, 1, 1);
 }
 
 void GpuOps::kvQuantCommitQ8Async(const float* xSrc, void* kvDst,

@@ -436,6 +436,9 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/rmsnorm_qkv.hip
         kernels_hip/rmsnorm_qkv_fp16.hip
         kernels_hip/rope_inplace.hip
+        kernels_hip/scaled_add_residual.hip
+        kernels_hip/gelu_mul.hip
+        kernels_hip/x_quant_i8.hip
         kernels_hip/silu_mul.hip
     )
 
@@ -1381,6 +1384,58 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_moe_down_fused_k_q8_0_probe hip_kernels)
 
     target_link_libraries(hip_moe_down_fused_k_q8_0_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_gelu_mul_probe — GELU-tanh SwiGLU parity check -----------
+    #
+    # Same shape as silu_mul, GELU-tanh activation instead of SiLU.
+    # Used by Gemma 3 / Gemma 4 FFN paths (LLM_FFN_GELU parallel form).
+    # Combined-tolerance; tanh drift keeps rel-tol at 1e-5 vs 1e-6 for
+    # the plain SiLU probe.
+
+    add_executable(hip_gelu_mul_probe
+        tools/hip-gelu-mul-probe.cpp
+    )
+
+    add_dependencies(hip_gelu_mul_probe hip_kernels)
+
+    target_link_libraries(hip_gelu_mul_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_scaled_add_residual_probe — MoE fused-accumulate check ---
+    #
+    # Trivial 1D fmaf: dst[i] += scale * src[i]. Replaces the L0 kernel
+    # of the same name; used by the Gemma 4 MoE per-expert loop to
+    # collapse mulScalar + addResidual into one launch per expert.
+    # Tight combined-tolerance (scale ~ 0.2, both operands in [-1, 1]).
+
+    add_executable(hip_scaled_add_residual_probe
+        tools/hip-scaled-add-residual-probe.cpp
+    )
+
+    add_dependencies(hip_scaled_add_residual_probe hip_kernels)
+
+    target_link_libraries(hip_scaled_add_residual_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_x_quant_i8_probe — per-row int8 quant parity check --------
+    #
+    # Same shape as rmsnorm: one WG per row, tree reduction over amax,
+    # per-thread strided quantise pass. Feeds the DP4A Q8_0 matvec path.
+    # Byte-exact quant compare (0 slack) — `roundf` matches ggml's
+    # quantize_row_q8_0_ref. Row M-1 is all-zeros to exercise the amax=0
+    # sentinel that stores scale=0 + all-zero quants.
+
+    add_executable(hip_x_quant_i8_probe
+        tools/hip-x-quant-i8-probe.cpp
+    )
+
+    add_dependencies(hip_x_quant_i8_probe hip_kernels)
+
+    target_link_libraries(hip_x_quant_i8_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
