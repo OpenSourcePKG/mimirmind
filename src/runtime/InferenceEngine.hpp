@@ -16,6 +16,7 @@
 #include "core/gpu/l0/CommandQueue.hpp"
 #include "runtime/KvCache.hpp"
 #include "core/gpu/l0/L0Context.hpp"
+#include "core/gpu/l0/L0ComputeContext.hpp"
 #include "runtime/OpProfiler.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
 #include "core/gpu/l0/UsmHandle.hpp"
@@ -361,10 +362,12 @@ public:
 
     // --- Accessors (used by smoke path + diagnostics) -------------------
 
-    [[nodiscard]] L0Context&               ctx()              noexcept { return _ctx; }
-    [[nodiscard]] const L0Context&         ctx()        const noexcept { return _ctx; }
-    [[nodiscard]] UsmAllocator&            allocator()        noexcept { return _allocator; }
-    [[nodiscard]] const UsmAllocator&      allocator()  const noexcept { return _allocator; }
+    [[nodiscard]] L0Context&               ctx()              noexcept { return _computeCtx.l0Context(); }
+    [[nodiscard]] const L0Context&         ctx()        const noexcept { return _computeCtx.l0Context(); }
+    [[nodiscard]] UsmAllocator&            allocator()        noexcept { return _computeCtx.allocator(); }
+    [[nodiscard]] const UsmAllocator&      allocator()  const noexcept { return _computeCtx.allocator(); }
+    [[nodiscard]] ::mimirmind::core::l0::L0ComputeContext&
+        computeContext() noexcept { return _computeCtx; }
     [[nodiscard]] compute::GpuMatmul&      gpuMatmul()        noexcept { return _gmm; }
     [[nodiscard]] const compute::GpuMatmul& gpuMatmul()  const noexcept { return _gmm; }
     [[nodiscard]] const compute::GpuOps&   gpuOps()     const noexcept { return _ops; }
@@ -408,15 +411,16 @@ private:
     void finalizeLoad();
 
     // Held by reference for the whole process lifetime. Provided by main().
-    const Config&                      _cfg;
-    L0Context                          _ctx;
-    UsmAllocator                       _allocator;
-    CommandQueue                       _queue;
+    const Config&                              _cfg;
+    // Backend-neutral RAII owner of the L0 runtime (L0Context + UsmAllocator
+    // + CommandQueue). Constructed first so every downstream member can
+    // reach the concrete handles via `_computeCtx.l0Context()` etc.
+    ::mimirmind::core::l0::L0ComputeContext    _computeCtx;
     // M8.H.3: _ops is constructed BEFORE _gmm so GpuMatmul can hold
     // a reference to it (the DP4A dispatch path calls
     // GpuOps::xQuantI8Async to fill the internal Xq/Xscale scratch).
-    compute::GpuOps                    _ops;
-    compute::GpuMatmul                 _gmm;
+    compute::GpuOps                            _ops;
+    compute::GpuMatmul                         _gmm;
     // M8.K.0: diagnostic per-op timer. Constructed after _queue so it
     // can hold a reference. Off by default; opt in via
     // `diagnostics.traceOpTimes: true` in config.json.

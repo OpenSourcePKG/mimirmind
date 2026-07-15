@@ -9,7 +9,9 @@ namespace mimirmind::core::l0 {
 
 L0ComputeContext::L0ComputeContext(Options opts)
     : _ctx{std::move(opts.spvDirOverride)}
-    , _alloc{_ctx, opts.usmProbeTotalGiB, opts.usmKind}
+    , _alloc{_ctx,
+             opts.usmProbeTotalGiB,
+             opts.usmKindOverride.value_or(selectUsmAllocKind(_ctx))}
     , _queue{_ctx}
 {}
 

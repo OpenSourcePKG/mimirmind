@@ -28,6 +28,7 @@
 #include "core/gpu/l0/CommandQueue.hpp"
 #include "core/config/Config.hpp"
 #include "core/gpu/l0/L0Context.hpp"
+#include "core/gpu/l0/L0ComputeContext.hpp"
 #include "core/log/Log.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
 
@@ -180,10 +181,12 @@ double percentile(std::vector<double>& sorted, double p) {
 int main(int argc, char** argv) {
     const Args args = parseArgs(argc, argv);
 
-    mimirmind::core::l0::L0Context    ctx;
-    mimirmind::core::l0::UsmAllocator usm{ctx};
-    mimirmind::runtime::CommandQueue queue{ctx};
-    mimirmind::compute::GpuOps       ops{ctx, usm, queue};
+    mimirmind::core::l0::L0ComputeContext ctx{};
+    mimirmind::compute::GpuOps            ops{ctx};
+    // Aliases keep the rest of the bench (which reads `usm` / `queue`
+    // directly for its own scratch allocations) unchanged.
+    mimirmind::core::l0::UsmAllocator&    usm   { ctx.allocator() };
+    mimirmind::runtime::CommandQueue&     queue { ctx.queue() };
 
     // KV bytes-per-row depend on the storage dtype. Q8_0 packs
     // (kvDim / 32) blocks per row * 34 B = ~34/128 = 27 % of the

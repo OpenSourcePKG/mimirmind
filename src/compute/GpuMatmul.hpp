@@ -20,6 +20,7 @@
 
 namespace mimirmind::core::l0 {
 class L0Context;
+class L0ComputeContext;
 class UsmAllocator;
 }
 namespace mimirmind::core::config {
@@ -62,10 +63,14 @@ inline constexpr std::size_t kAutotuneBucketCount =
  */
 class GpuMatmul {
 public:
-    GpuMatmul(core::l0::L0Context&    ctx,
-              GpuOps&                ops,
-              core::l0::UsmAllocator& alloc,
-              runtime::CommandQueue& queue);
+    /// Takes `L0ComputeContext&` (Schicht 2 of the backend-neutralisation
+    /// story). The concrete L0Context / UsmAllocator / CommandQueue refs
+    /// are pulled from it at ctor time and stored as members — same
+    /// pattern as `GpuOps`. `ops` is still passed separately because it
+    /// holds compute-side state (kernel handles, self-test status) the
+    /// context doesn't own.
+    GpuMatmul(core::l0::L0ComputeContext& ctx,
+              GpuOps&                     ops);
     ~GpuMatmul();
 
     GpuMatmul(const GpuMatmul&)            = delete;

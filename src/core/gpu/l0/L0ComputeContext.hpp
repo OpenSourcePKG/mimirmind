@@ -44,9 +44,14 @@ public:
     /// new knob is added (config.example.json evolves faster than the
     /// engine's ctor list should).
     struct Options {
-        std::string        spvDirOverride;             // runtime.spvDir
-        std::optional<int> usmProbeTotalGiB;           // runtime.usmProbeTotalGib
-        UsmAllocKind       usmKind = UsmAllocKind::Shared;
+        std::string                 spvDirOverride;      // runtime.spvDir
+        std::optional<int>          usmProbeTotalGiB;    // runtime.usmProbeTotalGib
+        /// When `nullopt`, the ctor calls `selectUsmAllocKind(l0Context)`
+        /// which honours the `MIMIRMIND_USM_KIND` env var and falls back
+        /// to Host on integrated GPUs (Munin-IPC-safe). Explicit values
+        /// bypass the auto-pick and are honoured verbatim — mostly useful
+        /// for bench tools that want deterministic behaviour.
+        std::optional<UsmAllocKind> usmKindOverride;
     };
 
     L0ComputeContext() : L0ComputeContext(Options{}) {}

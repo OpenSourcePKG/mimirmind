@@ -14,6 +14,7 @@
 
 namespace mimirmind::core::l0 {
 class L0Context;
+class L0ComputeContext;
 class UsmAllocator;
 }
 
@@ -40,12 +41,17 @@ public:
     /// `flashPrefillEnabled` maps to `features.flashPrefill` in config.json.
     /// When false, T_q > 1 dispatches fall back to the plain attention.cl
     /// kernel — rollback lever for flash-prefill bugs.
-    GpuOps(core::l0::L0Context&    ctx,
-           core::l0::UsmAllocator& alloc,
-           runtime::CommandQueue& queue,
-           bool                   flashPrefillEnabled      = true,
-           bool                   flashPrefillGqaQ8Enabled = true,
-           std::size_t            flashPrefillKTileQ8      = 128,
+    ///
+    /// Takes `L0ComputeContext&` for the backend-neutralisation layer
+    /// (Schicht 2). The concrete L0Context / UsmAllocator / CommandQueue
+    /// references are pulled from it at ctor time and stored as members
+    /// — the kernel-launch API is still L0-native. When compute:: gets
+    /// its own neutral launch API (Schicht 4) this ctor will change
+    /// again; until then the ComputeContext is the ownership marker.
+    GpuOps(core::l0::L0ComputeContext& ctx,
+           bool                        flashPrefillEnabled      = true,
+           bool                        flashPrefillGqaQ8Enabled = true,
+           std::size_t                 flashPrefillKTileQ8      = 128,
            core::config::TriState      q8_0ReorderMode          =
                core::config::TriState::Disable);
     ~GpuOps();

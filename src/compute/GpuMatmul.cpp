@@ -9,6 +9,7 @@
 #include "compute/QuantTypeRegistry.hpp"
 #include "core/config/Config.hpp"
 #include "core/gpu/l0/L0Context.hpp"
+#include "core/gpu/l0/L0ComputeContext.hpp"
 #include "core/log/Log.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
 
@@ -115,18 +116,17 @@ double medianMs(std::vector<double> xs) {
 
 } // namespace
 
-GpuMatmul::GpuMatmul(core::l0::L0Context&    ctx,
-                     GpuOps&                ops,
-                     core::l0::UsmAllocator& alloc,
-                     runtime::CommandQueue& queue)
-    : _ctx{ctx},
+GpuMatmul::GpuMatmul(core::l0::L0ComputeContext& ctx,
+                     GpuOps&                     ops)
+    : _ctx{ctx.l0Context()},
       _ops{ops},
-      _alloc{alloc},
-      _queue{queue}
+      _alloc{ctx.allocator()},
+      _queue{ctx.queue()}
 {
-    const auto loadSlot = [&ctx](std::string_view moduleName) {
+    core::l0::L0Context& l0ctx = ctx.l0Context();
+    const auto loadSlot = [&l0ctx](std::string_view moduleName) {
         const std::string nameStr{moduleName};
-        auto module = std::make_unique<runtime::GpuModule>(ctx, moduleName);
+        auto module = std::make_unique<runtime::GpuModule>(l0ctx, moduleName);
         runtime::GpuKernel kernel{module->kernel(nameStr.c_str())};
         return KernelSlot{std::move(module), kernel};
     };

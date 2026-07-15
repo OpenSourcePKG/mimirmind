@@ -5,6 +5,7 @@
 
 #include "compute/Attention.hpp"
 #include "core/gpu/l0/L0Context.hpp"
+#include "core/gpu/l0/L0ComputeContext.hpp"
 #include "core/log/Log.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
 #include "core/gpu/l0/CommandQueue.hpp"
@@ -217,17 +218,15 @@ struct GpuOps::Impl {
     {}
 };
 
-GpuOps::GpuOps(core::l0::L0Context&    ctx,
-               core::l0::UsmAllocator& alloc,
-               runtime::CommandQueue& queue,
-               bool                   flashPrefillEnabled,
-               bool                   flashPrefillGqaQ8Enabled,
-               std::size_t            flashPrefillKTileQ8,
+GpuOps::GpuOps(core::l0::L0ComputeContext& ctx,
+               bool                        flashPrefillEnabled,
+               bool                        flashPrefillGqaQ8Enabled,
+               std::size_t                 flashPrefillKTileQ8,
                core::config::TriState      q8_0ReorderMode)
-    : _ctx{ctx},
-      _queue{queue},
-      _alloc{alloc},
-      _pimpl{std::make_unique<Impl>(ctx)}
+    : _ctx{ctx.l0Context()},
+      _queue{ctx.queue()},
+      _alloc{ctx.allocator()},
+      _pimpl{std::make_unique<Impl>(ctx.l0Context())}
 {
     // Persistent FlashAttention partial-tile scratch. Sized for the
     // worst case across our target models; reused across every decode

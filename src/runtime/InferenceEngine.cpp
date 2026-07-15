@@ -103,19 +103,19 @@ void logTensorTaxonomy(const core::gguf::GgufReader& reader) {
 
 InferenceEngine::InferenceEngine(const Config& cfg)
     : _cfg{cfg},
-      _ctx{std::string{cfg.runtime.spvDir.value_or("")}},
-      _allocator{_ctx, cfg.runtime.usmProbeTotalGib,
-                 ::mimirmind::core::l0::selectUsmAllocKind(_ctx)},
-      _queue{_ctx},
-      _ops{_ctx, _allocator, _queue,
+      _computeCtx{::mimirmind::core::l0::L0ComputeContext::Options{
+          .spvDirOverride    = std::string{cfg.runtime.spvDir.value_or("")},
+          .usmProbeTotalGiB  = cfg.runtime.usmProbeTotalGib,
+          .usmKindOverride   = std::nullopt}},
+      _ops{_computeCtx,
            cfg.features.flashPrefill,
            cfg.features.flashPrefillGqaQ8,
            cfg.features.flashPrefillKTileQ8,
            cfg.features.q8_0Reorder},
-      _gmm{_ctx, _ops, _allocator, _queue},
-      _opProfiler{_queue, cfg.diagnostics.traceOpTimes} {
+      _gmm{_computeCtx, _ops},
+      _opProfiler{_computeCtx.queue(), cfg.diagnostics.traceOpTimes} {
     MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");
-    _allocator.probeLimits();
+    allocator().probeLimits();
 
     if (cfg.diagnostics.traceBlock0) {
         _traceBlock0 = true;
@@ -170,7 +170,7 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     _tokenizer.loadFromGguf(_reader);
 
     MM_LOG_INFO("engine", "loadModel: copying tensors into USM");
-    _reader.loadTensors(_allocator);
+    _reader.loadTensors(allocator());
 
     _weights.emplace(_reader);
 
@@ -250,7 +250,7 @@ void InferenceEngine::finalizeLoad() {
     const bool requantToQ8_0 =
         (_config.architecture == "gemma4") && (_config.sharedKvLayers > 0);
     _fusedQkv = std::make_unique<model::FusedQkvWeights>(
-        *_weights, _allocator, _config.blockCount,
+        *_weights, allocator(), _config.blockCount,
         _cfg.features.fusedQkv,
         _config.sharedKvLayers, requantToQ8_0,
         /*q8_0ReorderEnabled=*/
@@ -276,8 +276,8 @@ void InferenceEngine::finalizeLoad() {
     // unfamiliar iGPU µarchs. autotune runs a matvec-vs-GEMM micro-
     // bench (with its own parity gate) and pins the dispatch decision
     // per QuantType. Honours `features.gemm` / `features.dp4a`.
-    _ops.selfTest(_allocator);
-    _gmm.autotune(_allocator, _config.embeddingLength, _cfg.features);
+    _ops.selfTest(allocator());
+    _gmm.autotune(allocator(), _config.embeddingLength, _cfg.features);
 
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
@@ -439,7 +439,7 @@ void InferenceEngine::setKvDtype(KvDtype dtype) {
     const std::size_t autotuneHeadDim = static_cast<std::size_t>(
         _config.keyLengthSwa > 0 ? _config.keyLengthSwa
                                  : _config.keyLength);
-    _ops.autotuneKTileQ8(_allocator,
+    _ops.autotuneKTileQ8(allocator(),
                          static_cast<std::size_t>(_config.headCount),
                          static_cast<std::size_t>(_config.headCountKv),
                          autotuneHeadDim,
@@ -456,7 +456,7 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     // realloc-and-reset path and lose every cached token.
     if (_kvCache == nullptr) {
         _kvCache = std::make_unique<KvCache>(
-            _allocator, _maxContextTokens,
+            allocator(), _maxContextTokens,
             _backend->kvDimPerLayer(),
             _backend->kvSourceLayerPerLayer(),
             _kvDtype);
@@ -502,16 +502,16 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     // workspace: rmsnorm_qkv + RoPE run fp32-in-place there and then
     // `kv_quant_commit_q8_0` folds the rows into the Q8_0 cache slot.
     const bool withKvFp32Scratch = (_kvDtype == KvDtype::Q8_0);
-    _blockBuffers = allocBlockBuffers(_allocator, _config,
+    _blockBuffers = allocBlockBuffers(allocator(), _config,
                                       maxT, _maxContextTokens,
                                       qDimMax, kvDimMax,
                                       withFusedQkv,
                                       withKvFp32Scratch);
 
-    _xBufH      = UsmHandle{_allocator, maxT      * d_model  * sizeof(float)};
-    _normFinalH = UsmHandle{_allocator, d_model   * sizeof(float)};
-    _logitsH    = UsmHandle{_allocator, vocab_lm  * sizeof(float)};
-    _logitsScH  = UsmHandle{_allocator, d_model   * sizeof(float)};
+    _xBufH      = UsmHandle{allocator(), maxT      * d_model  * sizeof(float)};
+    _normFinalH = UsmHandle{allocator(), d_model   * sizeof(float)};
+    _logitsH    = UsmHandle{allocator(), vocab_lm  * sizeof(float)};
+    _logitsScH  = UsmHandle{allocator(), d_model   * sizeof(float)};
 
     _cacheMaxT     = maxT;
     _cacheVocabLm  = vocab_lm;
