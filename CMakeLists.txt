@@ -414,6 +414,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/matmul_q8_0_vec_dp4a.hip
         kernels_hip/matmul_q8_0_vec_reorder.hip
+        kernels_hip/moe_down_fused_k_q8_0.hip
         kernels_hip/mul_scalar.hip
         kernels_hip/qkv_split.hip
         kernels_hip/qkv_split_fp16.hip
@@ -1360,6 +1361,23 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_matmul_q8_vec_dp4a_probe hip_kernels)
 
     target_link_libraries(hip_matmul_q8_vec_dp4a_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_moe_down_fused_k_q8_0_probe — MoE down-projection ------
+    #
+    # Fused over k active experts. First read-modify-write kernel in
+    # the port — accum starts seeded and gets summed into. Probe pre-
+    # seeds accum with random content and verifies GPU output equals
+    # seed + computed_delta.
+
+    add_executable(hip_moe_down_fused_k_q8_0_probe
+        tools/hip-moe-down-fused-k-q8-0-probe.cpp
+    )
+
+    add_dependencies(hip_moe_down_fused_k_q8_0_probe hip_kernels)
+
+    target_link_libraries(hip_moe_down_fused_k_q8_0_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
