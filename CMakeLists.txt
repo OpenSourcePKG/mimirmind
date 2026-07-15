@@ -395,7 +395,10 @@ if(MIMIRMIND_ENABLE_HIP)
     # ships automatically if MIMIRMIND_HIP_ARCHS lists more than one arch.
     set(HIP_KERNEL_SOURCES
         kernels_hip/hip_probe_kernel.hip
+        kernels_hip/add_bias.hip
+        kernels_hip/add_residual.hip
         kernels_hip/matmul_q8_0_vec.hip
+        kernels_hip/mul_scalar.hip
         kernels_hip/rmsnorm.hip
         kernels_hip/rope_inplace.hip
         kernels_hip/silu_mul.hip
@@ -925,6 +928,54 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_silu_mul_probe hip_kernels)
 
     target_link_libraries(hip_silu_mul_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_add_residual_probe — in-place residual add parity check --
+    #
+    # Trivial 1D element-wise (y += x). Every transformer block calls
+    # this twice (post-attn, post-ffn). Combined-tolerance with tight
+    # bounds — a single add should have essentially zero drift.
+
+    add_executable(hip_add_residual_probe
+        tools/hip-add-residual-probe.cpp
+    )
+
+    add_dependencies(hip_add_residual_probe hip_kernels)
+
+    target_link_libraries(hip_add_residual_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_add_bias_probe — broadcast bias add parity check ---------
+    #
+    # Flat-1D thread index across (M, K), inner modulo picks bias slot.
+    # Tight combined-tolerance; the interesting bit is that the index
+    # math is exercised (modulo K per thread).
+
+    add_executable(hip_add_bias_probe
+        tools/hip-add-bias-probe.cpp
+    )
+
+    add_dependencies(hip_add_bias_probe hip_kernels)
+
+    target_link_libraries(hip_add_bias_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_mul_scalar_probe — in-place scalar multiply parity ------
+    #
+    # First HIP probe to bind a plain-float POD via
+    # HipKernel::setValue<float> — Gemma 4 layer_output_scale relies on
+    # this by-value arg path. Otherwise trivially element-wise.
+
+    add_executable(hip_mul_scalar_probe
+        tools/hip-mul-scalar-probe.cpp
+    )
+
+    add_dependencies(hip_mul_scalar_probe hip_kernels)
+
+    target_link_libraries(hip_mul_scalar_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
