@@ -412,6 +412,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/matmul_q8_0_gemm.hip
         kernels_hip/matmul_q8_0_gemm_v2.hip
         kernels_hip/matmul_q8_0_vec.hip
+        kernels_hip/matmul_q8_0_vec_dp4a.hip
         kernels_hip/matmul_q8_0_vec_reorder.hip
         kernels_hip/mul_scalar.hip
         kernels_hip/qkv_split.hip
@@ -1342,6 +1343,23 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_matmul_q8_vec_reorder_probe hip_kernels)
 
     target_link_libraries(hip_matmul_q8_vec_reorder_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_matmul_q8_vec_dp4a_probe — DP4A matvec, first intrinsic -
+    #
+    # FIRST use of a HIP compiler intrinsic in the port:
+    # __builtin_amdgcn_sdot4(a, b, c, false) mapped to gfx1101 v_dot4.
+    # Pre-quantised int8 X + Q8_0 W, one int32 dot per 4-element chunk,
+    # single fp32 multiply per block for d × xScale.
+
+    add_executable(hip_matmul_q8_vec_dp4a_probe
+        tools/hip-matmul-q8-vec-dp4a-probe.cpp
+    )
+
+    add_dependencies(hip_matmul_q8_vec_dp4a_probe hip_kernels)
+
+    target_link_libraries(hip_matmul_q8_vec_dp4a_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
