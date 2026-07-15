@@ -4,6 +4,7 @@
 #include "compute/hip/GpuMatmul.hpp"
 
 #include "compute/hip/GpuOps.hpp"
+#include "core/config/Config.hpp"
 #include "core/gpu/hip/HipComputeContext.hpp"
 #include "core/gpu/hip/HipKernel.hpp"
 #include "core/gpu/hip/HipMemoryAllocator.hpp"
@@ -11,11 +12,17 @@
 #include "core/gpu/hip/HipStream.hpp"
 #include "core/log/Log.hpp"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace mimirmind::compute::hip {
 
@@ -76,6 +83,37 @@ std::filesystem::path resolveHsacoPath(std::string_view name) {
         std::string{"compute::hip::GpuMatmul::"} + method +
         ": not yet implemented (Schritt 3b sub-F skeleton — kernel-launch "
         "impl lands in follow-up commits)");
+}
+
+// Fill a raw Q8_0-encoded weight buffer with reproducible pseudo-random
+// bytes plus a tiny fp16 per-block scale (~0.02). Same shape as the L0
+// autotune's `fillSyntheticWeights` for GgmlType::Q8_0 — random int8
+// quants would land the matmul-output magnitude near zero and starve
+// the autotune of signal, so we pin the scale to a small constant.
+void fillSyntheticQ8_0(std::uint8_t* dst, std::size_t nbytes) {
+    std::mt19937 rng{0xC0FFEEU};
+    std::uniform_int_distribution<int> distByte(0, 255);
+    for (std::size_t i = 0; i < nbytes; ++i) {
+        dst[i] = static_cast<std::uint8_t>(distByte(rng));
+    }
+    // fp16 tiny positive constant used as per-block scale (~0.02).
+    constexpr std::uint16_t kHalfTiny = 0x2400U;
+    constexpr std::size_t   kBlockBytes = 34;
+    for (std::size_t off = 0; off + kBlockBytes <= nbytes; off += kBlockBytes) {
+        std::memcpy(dst + off, &kHalfTiny, 2);
+    }
+}
+
+// Median of a sample. Same shape as the L0 helper; used to squash the
+// occasional outlier iteration (thermal / OS jitter) without giving
+// away the wall-clock signal a mean would.
+double medianMs(std::vector<double> xs) {
+    if (xs.empty()) return 0.0;
+    std::sort(xs.begin(), xs.end());
+    const std::size_t mid = xs.size() / 2;
+    return xs.size() % 2 == 1
+        ? xs[mid]
+        : 0.5 * (xs[mid - 1] + xs[mid]);
 }
 
 } // namespace
@@ -169,26 +207,223 @@ void GpuMatmul::sync() {
 
 std::vector<::mimirmind::compute::AutotuneReport>
 GpuMatmul::autotuneReport() const {
-    // Skeleton: return a single Q8_0 entry with the availability flags
-    // set (vec + gemm + dp4a all compiled in) but every timing at 0.
-    // Follow-up commit fills in real bench-time populated timings and
-    // the gemmMinM cross-over pick. Consumers (SystemStatusBuilder)
-    // render 0-ms timings as "not measured" already.
+    // Populated from the autotune-side state members. `gemmPicked` is
+    // true whenever the crossover threshold is finite (i.e. GEMM won
+    // at some bucket AND wasn't disabled). Timings are 0 pre-autotune
+    // — SystemStatusBuilder renders those as "not measured" already.
     ::mimirmind::compute::AutotuneReport r{};
     r.name             = "Q8_0";
     r.gemmAvailable    = true;
-    r.gemmPicked       = false;
-    r.vecMs            = 0.0;
-    r.gemmMs           = 0.0;
+    r.gemmPicked       = (_gemmMinM != kGemmMinMNever);
+    // Legacy fields — the M=16 bucket, kept so existing consumers don't
+    // break. Autotune fills these too (bucket 0 == M=16).
+    r.vecMs            = _vecMsAtM[0];
+    r.gemmMs           = _gemmMsAtM[0];
     r.mBuckets         = ::mimirmind::compute::kAutotuneMBuckets;
-    r.gemmMinM         = 0;         // rendered as null in JSON — no threshold
+    r.vecMsAtM         = _vecMsAtM;
+    r.gemmMsAtM        = _gemmMsAtM;
+    // 0 in the report is rendered as null; kGemmMinMNever means "never
+    // GEMM" (matvec-loop always wins). Neither is a real threshold.
+    r.gemmMinM         = (_gemmMinM == kGemmMinMNever) ? 0 : _gemmMinM;
     r.dp4aAvailable    = true;
-    r.dp4aPicked       = false;
-    r.dp4aMs           = 0.0;
+    r.dp4aPicked       = _useDp4a;
+    r.dp4aMs           = _dp4aMs;
     r.gemmV2Available  = true;
-    r.gemmV2Picked     = false;
-    r.source           = "pending (hip skeleton)";
+    r.gemmV2Picked     = _useGemmV2 && (_gemmMinM != kGemmMinMNever);
+    r.gemmV2MsAtM      = _gemmV2MsAtM;
+    r.source           = _autotuneSource;
     return {r};
+}
+
+void GpuMatmul::autotune(
+    ::mimirmind::core::hip::HipMemoryAllocator&       alloc,
+    std::size_t                                       hiddenDim,
+    const ::mimirmind::core::config::FeatureSettings& features) {
+
+    using ::mimirmind::core::config::TriState;
+    using ::mimirmind::compute::kAutotuneMBuckets;
+
+    const bool forceDisable    = features.gemm == TriState::Disable;
+    const bool forceEnable     = features.gemm == TriState::Force;
+    const bool forceDisableDp4a = features.dp4a == TriState::Disable;
+    const bool forceEnableDp4a  = features.dp4a == TriState::Force;
+    const std::size_t envMinM  = features.gemmMinM.value_or(std::size_t{0});
+    _useGemmV2                 = features.gemmV2;
+
+    // features.gemmMinM — pin the crossover threshold and skip the bench.
+    // Highest-priority override; features.gemm loses to it.
+    if (envMinM > 0) {
+        _gemmMinM       = envMinM;
+        _autotuneSource = "cfg_gemm_min_m";
+        MM_LOG_INFO("hip::GpuMatmul",
+                    "autotune: features.gemmMinM={} — Q8_0 pinned, bench "
+                    "skipped", envMinM);
+        return;
+    }
+    if (forceDisable) {
+        _gemmMinM       = kGemmMinMNever;
+        _autotuneSource = "cfg_disable_gemm";
+        MM_LOG_INFO("hip::GpuMatmul",
+                    "autotune: features.gemm=disable — Q8_0 pinned to "
+                    "matvec-loop");
+        return;
+    }
+    if (forceEnable) {
+        _gemmMinM       = 2;   // GEMM whenever M > 1
+        _autotuneSource = "cfg_force_gemm";
+        MM_LOG_INFO("hip::GpuMatmul",
+                    "autotune: features.gemm=force — Q8_0 pinned to GEMM "
+                    "(gemmMinM=2)");
+        return;
+    }
+    if (forceEnableDp4a && !forceDisableDp4a) {
+        _useDp4a        = true;
+        _autotuneSource = "cfg_force_dp4a";
+        MM_LOG_INFO("hip::GpuMatmul",
+                    "autotune: features.dp4a=force — Q8_0 pinned to DP4A "
+                    "path (matmulAsync currently requires pre-quantised "
+                    "input; auto-from-float wiring lands in a follow-up)");
+        return;
+    }
+
+    // ---- Bench-driven path -------------------------------------------
+
+    // Round N=K to 256-aligned so any future Q4_K/Q6_K add-in shares the
+    // same synthetic shape. Q8_0 only needs K % 32 == 0 today.
+    const std::size_t K    = ((hiddenDim + 255) / 256) * 256;
+    const std::size_t N    = K;
+    const std::size_t Mmax = kAutotuneMBuckets.back();
+
+    // Shared X / Y / W USM sized for the largest bucket. Q8_0 weight
+    // size: (N * K/32) blocks × 34 bytes.
+    constexpr std::size_t kBlockElts  = 32;
+    constexpr std::size_t kBlockBytes = 34;
+    const std::size_t nBlocksPerRow  = K / kBlockElts;
+    const std::size_t wBytes = N * nBlocksPerRow * kBlockBytes;
+    const std::size_t xBytes = Mmax * K * sizeof(float);
+    const std::size_t yBytes = Mmax * N * sizeof(float);
+    const std::size_t sBytes = K * sizeof(float);   // unused on the HIP path
+
+    void* wDev = alloc.allocate(wBytes);
+    void* xDev = alloc.allocate(xBytes);
+    void* yDev = alloc.allocate(yBytes);
+    void* sDev = alloc.allocate(sBytes);
+
+    // Fill synthetic W (Q8_0 with tiny per-block scale) + X on host,
+    // copy H2D. Deterministic seed matches the L0 bench so timings are
+    // comparable across backends.
+    {
+        std::vector<std::uint8_t> wHost(wBytes);
+        fillSyntheticQ8_0(wHost.data(), wBytes);
+        alloc.copyH2D(wDev, wHost.data(), wBytes);
+    }
+    {
+        std::vector<float> xHost(Mmax * K);
+        std::mt19937 rng{0xB00BB00BU};
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (auto& v : xHost) v = dist(rng);
+        alloc.copyH2D(xDev, xHost.data(), xBytes);
+    }
+
+    constexpr int nWarmup = 2;
+    constexpr int nTimed  = 5;
+    using clk = std::chrono::steady_clock;
+
+    // Warmup at Mmax — primes both kernel dispatch paths + fills any
+    // driver-side JIT / arg-buffer state that would otherwise skew the
+    // first timed iteration.
+    for (int i = 0; i < nWarmup; ++i) {
+        _gemmMinM = kGemmMinMNever;   // force matvec-loop
+        matmulAsync(::mimirmind::core::gguf::GgmlType::Q8_0,
+                    wDev, N, K,
+                    static_cast<const float*>(xDev), Mmax,
+                    static_cast<float*>(yDev),
+                    static_cast<float*>(sDev));
+        sync();
+        _gemmMinM = 2;                // force GEMM
+        matmulAsync(::mimirmind::core::gguf::GgmlType::Q8_0,
+                    wDev, N, K,
+                    static_cast<const float*>(xDev), Mmax,
+                    static_cast<float*>(yDev),
+                    static_cast<float*>(sDev));
+        sync();
+    }
+
+    // Per-M timing loop. Wall-clock median over `nTimed` iterations
+    // per bucket, per kernel — same shape as the L0 bench so numbers
+    // are directly comparable at report time.
+    for (std::size_t bi = 0; bi < kAutotuneMBuckets.size(); ++bi) {
+        const std::size_t Mb = kAutotuneMBuckets[bi];
+
+        _gemmMinM = kGemmMinMNever;
+        std::vector<double> vecMs;
+        vecMs.reserve(nTimed);
+        for (int it = 0; it < nTimed; ++it) {
+            const auto t0 = clk::now();
+            matmulAsync(::mimirmind::core::gguf::GgmlType::Q8_0,
+                        wDev, N, K,
+                        static_cast<const float*>(xDev), Mb,
+                        static_cast<float*>(yDev),
+                        static_cast<float*>(sDev));
+            sync();
+            const auto t1 = clk::now();
+            vecMs.push_back(
+                std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+        _vecMsAtM[bi] = medianMs(std::move(vecMs));
+
+        _gemmMinM = 2;
+        std::vector<double> gemmMs;
+        gemmMs.reserve(nTimed);
+        for (int it = 0; it < nTimed; ++it) {
+            const auto t0 = clk::now();
+            matmulAsync(::mimirmind::core::gguf::GgmlType::Q8_0,
+                        wDev, N, K,
+                        static_cast<const float*>(xDev), Mb,
+                        static_cast<float*>(yDev),
+                        static_cast<float*>(sDev));
+            sync();
+            const auto t1 = clk::now();
+            gemmMs.push_back(
+                std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+        _gemmMsAtM[bi] = medianMs(std::move(gemmMs));
+    }
+
+    // Derive gemmMinM: smallest bucket-M where gemm × 1.05 < vec. 5 %
+    // margin is the noise floor between iGPU runs; below that we stick
+    // with matvec-loop as the conservative default. M=1 (decode) never
+    // triggers GEMM because bucket 0 starts at M=16.
+    _gemmMinM       = kGemmMinMNever;
+    _autotuneSource = "bench";
+    for (std::size_t bi = 0; bi < kAutotuneMBuckets.size(); ++bi) {
+        if (_gemmMsAtM[bi] > 0.0 &&
+            _vecMsAtM[bi] > 0.0 &&
+            _gemmMsAtM[bi] * 1.05 < _vecMsAtM[bi]) {
+            _gemmMinM = kAutotuneMBuckets[bi];
+            break;
+        }
+    }
+
+    // Release bench scratch.
+    alloc.deallocate(sDev, sBytes, ::mimirmind::core::hip::HipAllocKind::Device);
+    alloc.deallocate(yDev, yBytes, ::mimirmind::core::hip::HipAllocKind::Device);
+    alloc.deallocate(xDev, xBytes, ::mimirmind::core::hip::HipAllocKind::Device);
+    alloc.deallocate(wDev, wBytes, ::mimirmind::core::hip::HipAllocKind::Device);
+
+    std::ostringstream summary;
+    summary << "autotune Q8_0: gemmMinM=";
+    if (_gemmMinM == kGemmMinMNever) {
+        summary << "NEVER";
+    } else {
+        summary << _gemmMinM;
+    }
+    for (std::size_t bi = 0; bi < kAutotuneMBuckets.size(); ++bi) {
+        summary << " | M=" << kAutotuneMBuckets[bi]
+                << " vec=" << _vecMsAtM[bi] << "ms"
+                << " gemm=" << _gemmMsAtM[bi] << "ms";
+    }
+    MM_LOG_INFO("hip::GpuMatmul", "{}", summary.str());
 }
 
 // ---- Stubbed matmul-launch overrides --------------------------------
@@ -228,14 +463,62 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
         return;
     }
 
-    // Skeleton scope: always route through the plain vec kernel — one
-    // launch per row of X. GEMM / GEMM_V2 / DP4A picks + the M-based
-    // gemmMinM crossover come with sub-F.2..F.4. This matches how the
-    // L0 side behaves pre-autotune (`gemmMinM = kGemmMinMNever` until
-    // `autotune()` runs, so matvec-loop is the safe default).
+    // Dispatch by autotune state:
+    //   1. useDp4a set (autotune / features.dp4a=Force) → quant + DP4A
+    //   2. else M >= gemmMinM AND GEMM available → batched GEMM (V2 if
+    //      useGemmV2 pinned)
+    //   3. else per-row matvec loop
     //
-    // 4 outputs per workgroup (4 subgroups × 16 threads on Xe / RDNA3
-    // — matches MATMUL_Q8_0_LOCAL / _SG in matmul_q8_0_vec.hip).
+    // Pre-autotune defaults leave `_gemmMinM = kGemmMinMNever` and
+    // `_useDp4a = false`, so an untuned dispatcher takes the safe
+    // matvec-loop path even at Mmax. Same behaviour as L0.
+
+    if (_useDp4a) {
+        // Quantise X → int8 into engine-owned scratch (allocated by the
+        // caller through _ops), then DP4A-matvec. K must be a multiple
+        // of 32 — matmulDp4aAsync enforces the same guard.
+        //
+        // Sub-F.4 scope: DP4A auto-scratch not yet wired (the L0 side
+        // owns `_dp4aXqUsm` / `_dp4aScaleUsm` on GpuMatmul); a full
+        // DP4A-from-float dispatch lands together with the DP4A
+        // auto-pick bench. Until then `_useDp4a=true` requires the
+        // caller to have quantised upfront.
+        throw std::runtime_error(
+            "compute::hip::GpuMatmul::matmulAsync: _useDp4a=true but the "
+            "DP4A-from-float scratch is not owned by this class yet — "
+            "call matmulDp4aAsync with pre-quantised Xq/Xscale (from "
+            "GpuOps::xQuantI8Async) instead. Auto-DP4A-from-float lands "
+            "in a follow-up commit.");
+    }
+
+    if (M >= _gemmMinM) {
+        // Batched GEMM path. V1 and V2 have identical arg layouts —
+        // only the M_TILE differs, so the mGroups division changes.
+        auto& kern = _useGemmV2
+            ? _pimpl->_matmulQ8_0GemmV2Kernel
+            : _pimpl->_matmulQ8_0GemmKernel;
+        const std::size_t mTile = _useGemmV2 ? kGemmV2MTile : kGemmMTile;
+
+        kern.setPtr  (0, X);
+        kern.setPtr  (1, W);
+        kern.setPtr  (2, Y);
+        kern.setValue(3, static_cast<std::int32_t>(K));
+        kern.setValue(4, static_cast<std::int32_t>(N));
+        kern.setValue(5, static_cast<std::int32_t>(M));
+
+        const std::uint32_t nGroups = static_cast<std::uint32_t>(
+            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+        const std::uint32_t mGroups = static_cast<std::uint32_t>(
+            (M + mTile - 1) / mTile);
+        kern.launch(_ctx.stream(),
+                    nGroups, mGroups, 1,
+                    kLocalSize, 1, 1);
+        return;
+    }
+
+    // Matvec-loop fallback: one launch per row of X. 4 outputs per WG
+    // (4 subgroups × 16 threads on RDNA3 — matches MATMUL_Q8_0_LOCAL /
+    // _SG in matmul_q8_0_vec.hip).
     const std::uint32_t nGroups = static_cast<std::uint32_t>(
         (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
 

@@ -6,13 +6,20 @@
 #include "compute/ComputeMatmul.hpp"
 #include "core/gguf/GgufTypes.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <string>
 #include <unordered_map>
 
 namespace mimirmind::core::hip {
 class HipComputeContext;
+class HipMemoryAllocator;
+}
+namespace mimirmind::core::config {
+struct FeatureSettings;
 }
 
 namespace mimirmind::compute::hip {
@@ -117,6 +124,31 @@ public:
     [[nodiscard]] std::vector<::mimirmind::compute::AutotuneReport>
         autotuneReport() const override;
 
+    /// Bench-driven pick between the matvec-loop and the batched GEMM
+    /// kernel per M-bucket. Populates `_gemmMinM` (smallest bucket at
+    /// which GEMM beat matvec-loop with a 5 % margin), plus per-M
+    /// timing arrays surfaced through `autotuneReport()`.
+    ///
+    /// Config overrides short-circuit the bench:
+    ///   features.gemmMinM.has_value() → pin the crossover threshold,
+    ///                                    skip bench
+    ///   features.gemm    == Disable   → gemmMinM = MAX (matvec always)
+    ///   features.gemm    == Force     → gemmMinM = 2   (GEMM whenever M>1)
+    ///   features.dp4a    == Force     → useDp4a = true (skip bench)
+    ///
+    /// `hiddenDim` is the model's d_model; N=K=round_up(hiddenDim, 256)
+    /// so the synthetic bench matches the actual matmul shape. `alloc`
+    /// is used for temporary scratch (X, Y, W, S) that gets freed before
+    /// return.
+    ///
+    /// Idempotent — call once from `InferenceEngine::loadModel` after
+    /// the model dims are known. DP4A/V2 auto-pick + full parity gate
+    /// are follow-up scope (matches the HipGpuOps sub-A → sub-E
+    /// incremental rhythm).
+    void autotune(::mimirmind::core::hip::HipMemoryAllocator& alloc,
+                  std::size_t                                 hiddenDim,
+                  const ::mimirmind::core::config::FeatureSettings& features);
+
 private:
     ::mimirmind::core::hip::HipComputeContext& _ctx;
     GpuOps&                                    _ops;
@@ -135,6 +167,7 @@ private:
     static constexpr std::uint32_t kDp4aOutputsPerGroup =
         kDp4aLocalSize / kDp4aSubgroupSize;
 
+    static constexpr std::size_t   kGemmMTile        = 8;
     static constexpr std::size_t   kGemmV2MTile      = 8;
 
     // MoE fused-K down-projection: same 4-outputs-per-WG geometry as
@@ -143,6 +176,27 @@ private:
     // architecture-specific tuning of one doesn't drag the other.
     static constexpr std::uint32_t kMoeDownLocalSize      = 64;
     static constexpr std::uint32_t kMoeDownOutputsPerGroup = 4;
+
+    // Sentinel for "GEMM never wins — always take matvec-loop". Same
+    // pattern as L0's `kGemmMinMNever`.
+    static constexpr std::size_t   kGemmMinMNever =
+        std::numeric_limits<std::size_t>::max();
+
+    // --- Autotune-populated state --------------------------------------
+    // Set once by `autotune()` and read by `matmulAsync` on every
+    // dispatch. Defaults leave dispatch at the safe matvec-loop path
+    // until autotune runs — same as L0.
+    std::size_t                    _gemmMinM{kGemmMinMNever};
+    bool                           _useGemmV2{false};
+    bool                           _useDp4a{false};
+    std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
+                                   _vecMsAtM{};
+    std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
+                                   _gemmMsAtM{};
+    std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
+                                   _gemmV2MsAtM{};
+    double                         _dp4aMs{0.0};
+    std::string                    _autotuneSource{"pending (hip skeleton)"};
 };
 
 } // namespace mimirmind::compute::hip
