@@ -409,7 +409,10 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/attention_prefill_flash_q8_0_gqa.hip
         kernels_hip/attention_q8_0.hip
         kernels_hip/kv_quant_commit_q8_0.hip
+        kernels_hip/matmul_q8_0_gemm.hip
+        kernels_hip/matmul_q8_0_gemm_v2.hip
         kernels_hip/matmul_q8_0_vec.hip
+        kernels_hip/matmul_q8_0_vec_reorder.hip
         kernels_hip/mul_scalar.hip
         kernels_hip/qkv_split.hip
         kernels_hip/qkv_split_fp16.hip
@@ -1290,6 +1293,55 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_attention_prefill_flash_q8_0_gqa_probe hip_kernels)
 
     target_link_libraries(hip_attention_prefill_flash_q8_0_gqa_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_matmul_q8_gemm_probe — M-way GEMM with Q8_0 weights -----
+    #
+    # M-way generalisation of matmul_q8_0_vec. First multi-sub-group
+    # kernel in the port: WgSize=64 with 4 explicit 16-lane sub-groups
+    # via tid/16 and tid%16, warp16_reduce_sum over `__shfl_xor(v, off,
+    # width=16)`. SLM 32 KiB (X-tile 1024 × M_TILE 8).
+
+    add_executable(hip_matmul_q8_gemm_probe
+        tools/hip-matmul-q8-gemm-probe.cpp
+    )
+
+    add_dependencies(hip_matmul_q8_gemm_probe hip_kernels)
+
+    target_link_libraries(hip_matmul_q8_gemm_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_matmul_q8_gemm_v2_probe — 4× smaller SLM revision ------
+    #
+    # Identical semantics, X-tile shrunk from 1024 → 256 (SLM 32 → 8
+    # KiB). Same parity check with different load-pattern; useful for
+    # bench-comparison.
+
+    add_executable(hip_matmul_q8_gemm_v2_probe
+        tools/hip-matmul-q8-gemm-v2-probe.cpp
+    )
+
+    add_dependencies(hip_matmul_q8_gemm_v2_probe hip_kernels)
+
+    target_link_libraries(hip_matmul_q8_gemm_v2_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_matmul_q8_vec_reorder_probe — layout-transformed matvec -
+    #
+    # Reorder splits each row into scales-first + quants-later. Total
+    # row size unchanged (nBlocks * 34 B). The probe validates that the
+    # reorder is correctness-neutral: same math, different load layout.
+
+    add_executable(hip_matmul_q8_vec_reorder_probe
+        tools/hip-matmul-q8-vec-reorder-probe.cpp
+    )
+
+    add_dependencies(hip_matmul_q8_vec_reorder_probe hip_kernels)
+
+    target_link_libraries(hip_matmul_q8_vec_reorder_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
