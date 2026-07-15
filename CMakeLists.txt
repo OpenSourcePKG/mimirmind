@@ -474,6 +474,44 @@ if(MIMIRMIND_ENABLE_HIP)
         list(APPEND HIP_HSACO_FILES ${hsaco})
     endforeach()
 
+    # Second build of attention_prefill_flash_q8_0_gqa.hip with a
+    # smaller K-tile. Same source, hipcc gets
+    # `-DATTN_FLASH_PREFILL_KTILE=64` so the `#ifndef` in the kernel
+    # picks up the override. Copy the source to a distinct basename
+    # first because hipcc names the code object after the input
+    # filename — that lets both variants coexist in the same hsaco/
+    # dir. Kernel symbol stays `attention_prefill_flash_q8_0_gqa`
+    # (unchanged by the macro) so HipModule::getKernel finds it under
+    # the same name from either .hsaco. Dispatch picks between the two
+    # at runtime via `features.flashPrefillKTileQ8` in config.json.
+    # Mirrors the L0 ocloc `-D ATTN_FLASH_PREFILL_KTILE=64` block above.
+    set(HIP_GQA_KTILE64_HIP
+        ${CMAKE_CURRENT_BINARY_DIR}/attention_prefill_flash_q8_0_gqa_ktile64.hip)
+    set(HIP_GQA_KTILE64_HSACO
+        ${HSACO_OUTPUT_DIR}/attention_prefill_flash_q8_0_gqa_ktile64.hsaco)
+    add_custom_command(
+        OUTPUT ${HIP_GQA_KTILE64_HIP}
+        COMMAND ${CMAKE_COMMAND} -E copy
+                ${CMAKE_CURRENT_SOURCE_DIR}/kernels_hip/attention_prefill_flash_q8_0_gqa.hip
+                ${HIP_GQA_KTILE64_HIP}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels_hip/attention_prefill_flash_q8_0_gqa.hip
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT ${HIP_GQA_KTILE64_HSACO}
+        COMMAND ${HIPCC_EXECUTABLE}
+                --genco
+                ${HIP_OFFLOAD_ARGS}
+                -DATTN_FLASH_PREFILL_KTILE=64
+                ${HIP_GQA_KTILE64_HIP}
+                -o ${HIP_GQA_KTILE64_HSACO}
+        DEPENDS ${HIP_GQA_KTILE64_HIP}
+        WORKING_DIRECTORY ${HSACO_OUTPUT_DIR}
+        COMMENT "hipcc --genco -> attention_prefill_flash_q8_0_gqa_ktile64.hsaco (KTILE=64)"
+        VERBATIM
+    )
+    list(APPEND HIP_HSACO_FILES ${HIP_GQA_KTILE64_HSACO})
+
     add_custom_target(hip_kernels ALL DEPENDS ${HIP_HSACO_FILES})
 endif()
 

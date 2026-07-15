@@ -117,9 +117,8 @@ core::hip::HipModule loadHipModule(core::hip::HipContext& ctx,
 // entry point. HIP-only kernels used by `HipGpuMatmul` (matmul
 // variants + moe_down) live on that class, not here. Kernels that
 // exist in the L0 `GpuOps::Impl` but haven't been ported to HIP yet
-// (rope_inplace_ff_fp16, attention_prefill_flash_q8_0_gqa KTILE=64
-// variant) are deliberately absent — the corresponding ComputeOps
-// overrides throw a clear diagnostic at dispatch time.
+// (rope_inplace_ff_fp16) are deliberately absent — the corresponding
+// ComputeOps overrides throw a clear diagnostic at dispatch time.
 struct GpuOps::Impl {
     core::hip::HipModule _rmsnormModule;
     core::hip::HipKernel _rmsnormKernel;
@@ -178,6 +177,8 @@ struct GpuOps::Impl {
     core::hip::HipKernel _attentionPrefillFlashQ8Kernel;
     core::hip::HipModule _attentionPrefillFlashQ8GqaModule;
     core::hip::HipKernel _attentionPrefillFlashQ8GqaKernel;
+    core::hip::HipModule _attentionPrefillFlashQ8GqaKtile64Module;
+    core::hip::HipKernel _attentionPrefillFlashQ8GqaKtile64Kernel;
 
     core::hip::HipModule _qkvSplitModule;
     core::hip::HipKernel _qkvSplitKernel;
@@ -263,6 +264,11 @@ struct GpuOps::Impl {
           _attentionPrefillFlashQ8GqaKernel{
               _attentionPrefillFlashQ8GqaModule.getKernel(
                   "attention_prefill_flash_q8_0_gqa")},
+          _attentionPrefillFlashQ8GqaKtile64Module{
+              loadHipModule(ctx, "attention_prefill_flash_q8_0_gqa_ktile64")},
+          _attentionPrefillFlashQ8GqaKtile64Kernel{
+              _attentionPrefillFlashQ8GqaKtile64Module.getKernel(
+                  "attention_prefill_flash_q8_0_gqa")},
 
           _qkvSplitModule          {loadHipModule(ctx, "qkv_split")},
           _qkvSplitKernel          {_qkvSplitModule.getKernel("qkv_split")},
@@ -336,7 +342,7 @@ GpuOps::GpuOps(core::hip::HipComputeContext& ctx,
     }
 
     MM_LOG_INFO("hipgpuops",
-                "hip::GpuOps ready — 31 modules loaded (rmsnorm variants, "
+                "hip::GpuOps ready — 32 modules loaded (rmsnorm variants, "
                 "elementwise, rope, attention decode/prefill × f32/fp16/Q8_0, "
                 "qkv_split × f32/fp16, kv_quant_commit_q8_0, "
                 "matmul_q8_0_vec_reorder). "
@@ -937,12 +943,10 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
                                         runtime::KvDtype kvDtype) {
     // Under Q8_0 with GQA shape, route to the head-packed kernel when
     // the config allows and nQPerKv is within the packed kernel's cap.
-    // The HIP port currently ships only the KTILE=128 variant of the
-    // packed kernel (attention_prefill_flash_q8_0_gqa.hip). L0 has a
-    // second SPV compiled from the same source with -DATTN_KTILE=64;
-    // on HIP that's a follow-up kernel-port. Until then, honour
-    // `_prefillFlashKTileQ8` only as configuration bookkeeping — the
-    // dispatch always uses the 128-tile kernel.
+    // K-tile pick: 64 → smaller-SLM variant (higher occupancy on the
+    // heavy per-Q-head register pressure); 128 → default M5i.J
+    // streaming amortisation. Any other value was resolved / rejected
+    // in the ctor.
     const std::size_t nQPerKv = nHeads / nKvHeads;
     const bool useQ8Gqa =
         (kvDtype == runtime::KvDtype::Q8_0) &&
@@ -954,9 +958,13 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
     if (kvDtype == runtime::KvDtype::FP16) {
         kernelPtr = &_pimpl->_attentionPrefillFlashFp16Kernel;
     } else if (kvDtype == runtime::KvDtype::Q8_0) {
-        kernelPtr = useQ8Gqa
-            ? &_pimpl->_attentionPrefillFlashQ8GqaKernel
-            : &_pimpl->_attentionPrefillFlashQ8Kernel;
+        if (useQ8Gqa) {
+            kernelPtr = (_prefillFlashKTileQ8 == 64)
+                ? &_pimpl->_attentionPrefillFlashQ8GqaKtile64Kernel
+                : &_pimpl->_attentionPrefillFlashQ8GqaKernel;
+        } else {
+            kernelPtr = &_pimpl->_attentionPrefillFlashQ8Kernel;
+        }
     }
     auto& kernel = *kernelPtr;
 
