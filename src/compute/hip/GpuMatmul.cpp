@@ -193,16 +193,67 @@ GpuMatmul::autotuneReport() const {
 
 // ---- Stubbed matmul-launch overrides --------------------------------
 
-void GpuMatmul::matmul(::mimirmind::core::gguf::GgmlType, const void*,
-                       std::size_t, std::size_t, const float*, std::size_t,
-                       float*, float*) {
-    throwNotImplemented("matmul");
+void GpuMatmul::matmul(::mimirmind::core::gguf::GgmlType type,
+                       const void*     W,
+                       std::size_t     N,
+                       std::size_t     K,
+                       const float*    X,
+                       std::size_t     M,
+                       float*          Y,
+                       float*          scratch) {
+    matmulAsync(type, W, N, K, X, M, Y, scratch);
+    sync();
 }
 
-void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType, const void*,
-                            std::size_t, std::size_t, const float*, std::size_t,
-                            float*, float*) {
-    throwNotImplemented("matmulAsync");
+void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
+                            const void*     W,
+                            std::size_t     N,
+                            std::size_t     K,
+                            const float*    X,
+                            std::size_t     M,
+                            float*          Y,
+                            float*          scratch) {
+    (void)scratch;   // Only used by the L0 side's CPU fallback path.
+
+    if (type != ::mimirmind::core::gguf::GgmlType::Q8_0) {
+        // Unlike the L0 side, the HIP backend has no CPU fallback wired
+        // in yet — only Q8_0 has a HIP kernel. Callers must have gated
+        // on `supports(type)` before dispatching here.
+        throw std::runtime_error(
+            "compute::hip::GpuMatmul::matmulAsync: only Q8_0 is supported "
+            "on the HIP backend today — Q4_K / Q5_K / Q6_K HIP kernels "
+            "are not ported. Check supports(type) before dispatching.");
+    }
+    if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
+
+    // Skeleton scope: always route through the plain vec kernel — one
+    // launch per row of X. GEMM / GEMM_V2 / DP4A picks + the M-based
+    // gemmMinM crossover come with sub-F.2..F.4. This matches how the
+    // L0 side behaves pre-autotune (`gemmMinM = kGemmMinMNever` until
+    // `autotune()` runs, so matvec-loop is the safe default).
+    //
+    // 4 outputs per workgroup (4 subgroups × 16 threads on Xe / RDNA3
+    // — matches MATMUL_Q8_0_LOCAL / _SG in matmul_q8_0_vec.hip).
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+
+    auto& kern = _pimpl->_matmulQ8_0VecKernel;
+    for (std::size_t m = 0; m < M; ++m) {
+        const float* xRow = X + m * K;
+        float*       yRow = Y + m * N;
+
+        kern.setPtr  (0, xRow);
+        kern.setPtr  (1, W);
+        kern.setPtr  (2, yRow);
+        kern.setValue(3, static_cast<std::int32_t>(K));
+        kern.setValue(4, static_cast<std::int32_t>(N));
+
+        kern.launch(_ctx.stream(),
+                    nGroups, 1, 1,
+                    kLocalSize, 1, 1);
+    }
 }
 
 void GpuMatmul::matmulDp4aAsync(::mimirmind::core::gguf::GgmlType,
