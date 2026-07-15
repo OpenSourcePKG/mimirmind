@@ -397,9 +397,11 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/hip_probe_kernel.hip
         kernels_hip/add_bias.hip
         kernels_hip/add_residual.hip
+        kernels_hip/attention.hip
         kernels_hip/attention_flash_merge.hip
         kernels_hip/attention_flash_partial.hip
         kernels_hip/attention_flash_partial_fp16.hip
+        kernels_hip/attention_fp16.hip
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/mul_scalar.hip
         kernels_hip/qkv_split.hip
@@ -1144,6 +1146,37 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_attention_flash_partial_fp16_probe hip_kernels)
 
     target_link_libraries(hip_attention_flash_partial_fp16_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_attention_probe — untiled M5f.3 variant (a) --------------
+    #
+    # Non-flash attention kernel. 2D grid (nHeads, T_q), 64 KiB static
+    # LDS for scores[MAX_TK=16384]. Two-case probe (full-causal + SWA)
+    # exercises the causal-offset math across multiple query positions.
+
+    add_executable(hip_attention_probe
+        tools/hip-attention-probe.cpp
+    )
+
+    add_dependencies(hip_attention_probe hip_kernels)
+
+    target_link_libraries(hip_attention_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_attention_fp16_probe — fp16-KV untiled attention --------
+    #
+    # Same as hip_attention_probe but with fp16-typed K and V, promoted
+    # via __half2float per load. Q and OUT stay fp32.
+
+    add_executable(hip_attention_fp16_probe
+        tools/hip-attention-fp16-probe.cpp
+    )
+
+    add_dependencies(hip_attention_fp16_probe hip_kernels)
+
+    target_link_libraries(hip_attention_fp16_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
