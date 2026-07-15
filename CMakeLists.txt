@@ -400,10 +400,12 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/mul_scalar.hip
         kernels_hip/qkv_split.hip
+        kernels_hip/qkv_split_fp16.hip
         kernels_hip/rmsnorm.hip
         kernels_hip/rmsnorm_gemma.hip
         kernels_hip/rmsnorm_no_weight.hip
         kernels_hip/rmsnorm_qkv.hip
+        kernels_hip/rmsnorm_qkv_fp16.hip
         kernels_hip/rope_inplace.hip
         kernels_hip/silu_mul.hip
     )
@@ -1048,6 +1050,41 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_qkv_split_probe hip_kernels)
 
     target_link_libraries(hip_qkv_split_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_qkv_split_fp16_probe — fp16-KV variant of qkv_split ------
+    #
+    # Same scatter but K/V destinations are fp16 (__float2half on the
+    # store). Q workspace stays fp32. Bit-exact against a CPU-computed
+    # __float2half of the corresponding fused slice — both sides use
+    # round-to-nearest-even.
+
+    add_executable(hip_qkv_split_fp16_probe
+        tools/hip-qkv-split-fp16-probe.cpp
+    )
+
+    add_dependencies(hip_qkv_split_fp16_probe hip_kernels)
+
+    target_link_libraries(hip_qkv_split_fp16_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_rmsnorm_qkv_fp16_probe — fp16-KV variant of fused qkv ----
+    #
+    # Q branch: fp32 identical to rmsnorm_qkv. K/V branches promote
+    # fp16 cache reads to fp32, compute the reduction and scale in fp32,
+    # then round-trip results back to fp16. Combined-tolerance 1e-4/1e-4
+    # for Q, 1e-3/1e-3 for K/V (fp16 store granularity + fp32 drift).
+    # Cache-stomp check on the fp16 pre-curLen region.
+
+    add_executable(hip_rmsnorm_qkv_fp16_probe
+        tools/hip-rmsnorm-qkv-fp16-probe.cpp
+    )
+
+    add_dependencies(hip_rmsnorm_qkv_fp16_probe hip_kernels)
+
+    target_link_libraries(hip_rmsnorm_qkv_fp16_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
