@@ -406,6 +406,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/attention_prefill_flash.hip
         kernels_hip/attention_prefill_flash_fp16.hip
         kernels_hip/attention_prefill_flash_q8_0.hip
+        kernels_hip/attention_prefill_flash_q8_0_gqa.hip
         kernels_hip/attention_q8_0.hip
         kernels_hip/kv_quant_commit_q8_0.hip
         kernels_hip/matmul_q8_0_vec.hip
@@ -1271,6 +1272,24 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_attention_prefill_flash_q8_0_probe hip_kernels)
 
     target_link_libraries(hip_attention_prefill_flash_q8_0_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_attention_prefill_flash_q8_0_gqa_probe — GQA-packed ----
+    #
+    # Colfax-style query-head packing over KV-groups. Grid changes to
+    # (nKvHeads, T_q, 1); output layout unchanged. Per-Q-head state
+    # arrays with #pragma unroll bounded by N_Q_PER_KV_MAX. K/V blocks
+    # loaded once per tile step, reused across every Q-head in the
+    # group — GQA-ratio KV-bandwidth reduction.
+
+    add_executable(hip_attention_prefill_flash_q8_0_gqa_probe
+        tools/hip-attention-prefill-flash-q8-0-gqa-probe.cpp
+    )
+
+    add_dependencies(hip_attention_prefill_flash_q8_0_gqa_probe hip_kernels)
+
+    target_link_libraries(hip_attention_prefill_flash_q8_0_gqa_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
