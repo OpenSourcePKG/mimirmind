@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "compute/ComputeMatmul.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "core/gpu/l0/CommandQueue.hpp"
 #include "core/gpu/l0/GpuKernel.hpp"
@@ -31,21 +32,11 @@ namespace mimirmind::compute {
 
 class GpuOps;
 
-// M8.J.2 — M-buckets benched by autotune() and reported via
-// /v1/system/info.kernels.matmul.<type>.{vec,gemm}_ms_at_m. Small
-// values (16-64) cover single-request decode + short-prompt prefill;
-// large values (512-1024) cover realistic RAG-prompt prefill on 26B
-// where a batched matmul at M=400-500 is the dominant kernel cost.
-//
-// M8.J original was {16, 64, 256} — too low for RAG-prefill. The
-// M=256 → gemmMinM threshold underfit prefill because Q6_K v2 loses
-// at 256 but might win at 512+; without a bench data point there,
-// the auto-pick logic can't see the crossover.
-inline constexpr std::array<std::size_t, 5> kAutotuneMBuckets{
-    16, 64, 256, 512, 1024,
-};
-inline constexpr std::size_t kAutotuneBucketCount =
-    kAutotuneMBuckets.size();
+// M-bucket ladder + `AutotuneReport` shape live on `ComputeMatmul`
+// so a future `HipGpuMatmul` shares them 1:1. Both are re-exported
+// into the `compute::` namespace as `inline constexpr` / plain
+// struct — every caller that spelled `compute::kAutotuneMBuckets` /
+// `compute::AutotuneReport` keeps working unchanged.
 
 /**
  * Drop-in replacement for compute::matmul that dispatches to GPU kernels
@@ -61,7 +52,7 @@ inline constexpr std::size_t kAutotuneBucketCount =
  * Holds a reference to GpuOps to route the DP4A Q8_0 path (M8.H.3)
  * through the shared x_quant_i8 kernel — no duplicated module load.
  */
-class GpuMatmul {
+class GpuMatmul : public ComputeMatmul {
 public:
     /// Takes `L0ComputeContext&` (Schicht 2 of the backend-neutralisation
     /// story). The concrete L0Context / UsmAllocator / CommandQueue refs
@@ -71,7 +62,7 @@ public:
     /// context doesn't own.
     GpuMatmul(core::l0::L0ComputeContext& ctx,
               GpuOps&                     ops);
-    ~GpuMatmul();
+    ~GpuMatmul() override;
 
     GpuMatmul(const GpuMatmul&)            = delete;
     GpuMatmul& operator=(const GpuMatmul&) = delete;
@@ -79,7 +70,7 @@ public:
     GpuMatmul& operator=(GpuMatmul&&)      = delete;
 
     /// True if this dispatcher will run `type` on the GPU.
-    [[nodiscard]] bool supports(core::gguf::GgmlType type) const noexcept;
+    [[nodiscard]] bool supports(core::gguf::GgmlType type) const noexcept override;
 
     /// Per-QuantType micro-bench: for each type that has both a matvec
     /// and a GEMM kernel, time both paths on a representative prefill
@@ -118,7 +109,7 @@ public:
                 const float*    X,
                 std::size_t     M,
                 float*          Y,
-                float*          scratch);
+                float*          scratch) override;
 
     /**
      * Same as matmul() but doesn't sync. The Y buffer is NOT yet valid
@@ -137,7 +128,7 @@ public:
                      const float*    X,
                      std::size_t     M,
                      float*          Y,
-                     float*          scratch);
+                     float*          scratch) override;
 
     /// M8.H.1 — DP4A matvec with pre-quantised int8 activation. The
     /// generic dispatcher; kernel slot lives on the Entry for `type`.
@@ -155,7 +146,7 @@ public:
                          std::size_t        N,
                          std::size_t        K,
                          std::size_t        M,
-                         float*             Y);
+                         float*             Y) override;
 
 private:
     /// Internal dispatch for the DP4A path — quantises `X` into the
@@ -173,12 +164,12 @@ public:
 
     /// True when at least one DP4A kernel loaded successfully. Query
     /// dp4aAvailable(type) for a per-type check.
-    [[nodiscard]] bool dp4aAvailable() const noexcept;
+    [[nodiscard]] bool dp4aAvailable() const noexcept override;
 
     /// True when the DP4A kernel for `type` loaded successfully. False
     /// when the SPV or the DP4A extension itself was unavailable on the
     /// target iGPU; callers must fall back to the plain matvec path.
-    [[nodiscard]] bool dp4aAvailable(core::gguf::GgmlType type) const noexcept;
+    [[nodiscard]] bool dp4aAvailable(core::gguf::GgmlType type) const noexcept override;
 
     /**
      * M-MoE.Fused-Decode prototype — fused K-experts down projection for
@@ -212,51 +203,27 @@ public:
                             std::size_t          ffPer,
                             std::size_t          dModel,
                             std::size_t          kActive,
-                            std::size_t          expertBytes);
+                            std::size_t          expertBytes) override;
 
     /// True when the fused-K kernel for `type` loaded at ctor.
-    [[nodiscard]] bool moeDownFusedKAvailable(core::gguf::GgmlType type) const noexcept {
+    [[nodiscard]] bool moeDownFusedKAvailable(core::gguf::GgmlType type) const noexcept override {
         return _moeDownFusedK.find(type) != _moeDownFusedK.end();
     }
 
     /// True when at least one fused-K kernel loaded (any quant type).
-    [[nodiscard]] bool moeDownFusedKAvailable() const noexcept {
+    [[nodiscard]] bool moeDownFusedKAvailable() const noexcept override {
         return !_moeDownFusedK.empty();
     }
 
     /// Flush any pending appends (close + execute + sync + reset). Safe
     /// to call when there's no pending work — cheap no-op.
-    void sync();
+    void sync() override;
 
     /// Report the autotune decision + timings per QuantType. Rows are
     /// empty until autotune() has run. Used by ApiServer to expose the
-    /// kernel-dispatch choice via /v1/system/status.
-    struct AutotuneReport {
-        std::string name;                // e.g. "Q6_K"
-        bool        gemmAvailable;       // GEMM kernel loaded for this type
-        bool        gemmPicked;          // GEMM will be dispatched for at least some M (i.e., gemmMinM != MAX)
-        // Legacy fields — the M=16 timing, kept so downstream consumers
-        // don't break during M8.J rollout.
-        double      vecMs;
-        double      gemmMs;
-        // M8.J — per-M-bucket timings + threshold. Buckets match
-        // kAutotuneMBuckets in GpuMatmul.cpp (16, 64, 256).
-        std::array<std::size_t, kAutotuneBucketCount> mBuckets{};
-        std::array<double, kAutotuneBucketCount>      vecMsAtM{};
-        std::array<double, kAutotuneBucketCount>      gemmMsAtM{};
-        std::size_t                gemmMinM{0};  // 0 = "not set" (rendered as null in JSON)
-        // M8.H.3 — only meaningful for Q8_0 on iGPUs where the DP4A
-        // module loaded. Zero elsewhere.
-        bool        dp4aAvailable{false};
-        bool        dp4aPicked{false};
-        double      dp4aMs{0.0};
-        // M8.K.1 — v2 GEMM prototype (M_TILE=16) telemetry. Q8_0 only.
-        bool        gemmV2Available{false};
-        bool        gemmV2Picked{false};
-        std::array<double, kAutotuneBucketCount> gemmV2MsAtM{};
-        std::string source;              // "bench" | "env_force_gemm" | "env_disable_gemm" | "no_gemm" | "parity_fail" | "dp4a_parity_fail" | "env_force_dp4a" | "env_gemm_min_m"
-    };
-    [[nodiscard]] std::vector<AutotuneReport> autotuneReport() const;
+    /// kernel-dispatch choice via /v1/system/status. The struct itself
+    /// lives on `ComputeMatmul` (backend-neutral shape).
+    [[nodiscard]] std::vector<AutotuneReport> autotuneReport() const override;
 
 private:
     struct KernelSlot {

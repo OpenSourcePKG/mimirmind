@@ -32,8 +32,9 @@ namespace mimirmind::compute {
 
 namespace {
 
-// kAutotuneMBuckets + kAutotuneBucketCount moved to the .hpp so
-// Entry / AutotuneReport / GpuMatmul.cpp all see the same size.
+// kAutotuneMBuckets + kAutotuneBucketCount live in ComputeMatmul.hpp
+// so Entry / AutotuneReport / GpuMatmul.cpp all see the same size and
+// a future HipGpuMatmul shares the ladder unchanged.
 constexpr std::size_t kGemmMinMNever =
     std::numeric_limits<std::size_t>::max();
 
@@ -1079,7 +1080,7 @@ void GpuMatmul::sync() {
     _queue.flush();
 }
 
-std::vector<GpuMatmul::AutotuneReport> GpuMatmul::autotuneReport() const {
+std::vector<AutotuneReport> GpuMatmul::autotuneReport() const {
     std::vector<AutotuneReport> out;
     out.reserve(_entries.size());
     for (const auto& [type, entry] : _entries) {
