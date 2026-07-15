@@ -316,12 +316,59 @@ void GpuMatmul::matmulDp4aAsync(::mimirmind::core::gguf::GgmlType type,
     }
 }
 
-void GpuMatmul::moeDownFusedKAsync(::mimirmind::core::gguf::GgmlType,
-                                   const float*, const void*,
-                                   const std::int32_t*, const float*,
-                                   float*, std::size_t, std::size_t,
-                                   std::size_t, std::size_t) {
-    throwNotImplemented("moeDownFusedKAsync");
+void GpuMatmul::moeDownFusedKAsync(::mimirmind::core::gguf::GgmlType type,
+                                   const float*         gateAct,
+                                   const void*          W,
+                                   const std::int32_t*  expIdx,
+                                   const float*         kw,
+                                   float*               accum,
+                                   std::size_t          ffPer,
+                                   std::size_t          dModel,
+                                   std::size_t          kActive,
+                                   std::size_t          expertBytes) {
+    if (type != ::mimirmind::core::gguf::GgmlType::Q8_0) {
+        throw std::runtime_error(
+            "compute::hip::GpuMatmul::moeDownFusedKAsync: only Q8_0 has a "
+            "fused-K kernel on the HIP side — check moeDownFusedKAvailable"
+            "(type) before dispatching");
+    }
+    if (kActive == 0 || dModel == 0 || ffPer == 0) {
+        return;
+    }
+    // Q8_0 block = 32 elements. `ffPer` is the inner dim swept per
+    // expert; a partial block at the tail would corrupt the
+    // dequant accumulator. Same guard as L0 GpuMatmul.
+    constexpr std::size_t kBlockElts = 32;
+    if (ffPer % kBlockElts != 0) {
+        throw std::runtime_error(
+            "compute::hip::GpuMatmul::moeDownFusedKAsync: ffPer=" +
+            std::to_string(ffPer) + " is not a multiple of Q8_0 "
+            "blockElements=" + std::to_string(kBlockElts));
+    }
+
+    auto& kern = _pimpl->_moeDownFusedKQ8_0Kernel;
+    kern.setPtr  (0, gateAct);
+    kern.setPtr  (1, W);
+    kern.setPtr  (2, expIdx);
+    kern.setPtr  (3, kw);
+    kern.setPtr  (4, accum);
+    kern.setValue(5, static_cast<std::int32_t>(ffPer));
+    kern.setValue(6, static_cast<std::int32_t>(dModel));
+    kern.setValue(7, static_cast<std::int32_t>(kActive));
+    kern.setValue(8, static_cast<std::int32_t>(expertBytes));
+
+    // 4 outputs per workgroup — same geometry as the plain Q8_0 vec
+    // kernel by coincidence (MOE_DOWN_LOCAL=64, SG=16 in the .hip).
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (dModel + kMoeDownOutputsPerGroup - 1) / kMoeDownOutputsPerGroup);
+
+    // Read-modify-write on `accum`: the kernel adds the fused
+    // sum-over-K into the caller-supplied accumulator without
+    // pre-zeroing. Caller is responsible for the seed value (matches
+    // Gemma 4 MoE per-expert loop's expectation).
+    kern.launch(_ctx.stream(),
+                nGroups, 1, 1,
+                kMoeDownLocalSize, 1, 1);
 }
 
 } // namespace mimirmind::compute::hip

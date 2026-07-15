@@ -136,6 +136,13 @@ private:
         kDp4aLocalSize / kDp4aSubgroupSize;
 
     static constexpr std::size_t   kGemmV2MTile      = 8;
+
+    // MoE fused-K down-projection: same 4-outputs-per-WG geometry as
+    // the plain vec kernel by coincidence (MOE_DOWN_LOCAL=64, SG=16 in
+    // moe_down_fused_k_q8_0.hip). Declared separately so a future
+    // architecture-specific tuning of one doesn't drag the other.
+    static constexpr std::uint32_t kMoeDownLocalSize      = 64;
+    static constexpr std::uint32_t kMoeDownOutputsPerGroup = 4;
 };
 
 } // namespace mimirmind::compute::hip
