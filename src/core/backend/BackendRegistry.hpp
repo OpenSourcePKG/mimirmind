@@ -4,8 +4,12 @@
 #pragma once
 
 #include "core/backend/ComputeBackend.hpp"
+#include "core/backend/ComputeContext.hpp"
 
+#include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mimirmind::core::backend {
@@ -52,6 +56,32 @@ public:
 
     /// Human-readable name for logging / tools. Never throws.
     [[nodiscard]] static const char* name(BackendKind k) noexcept;
+
+    /// Parse a backend name ("l0" / "levelzero", "hip", "cuda", "cpu")
+    /// to a `BackendKind`. Case-insensitive. Returns `std::nullopt` for
+    /// unrecognised values. Never throws.
+    [[nodiscard]] static std::optional<BackendKind>
+        parseKind(std::string_view s) noexcept;
+
+    /// Resolve the backend the process should use, honouring the
+    /// `MIMIRMIND_BACKEND` env var if set (values as per `parseKind`),
+    /// otherwise falling back to `defaultKind`. The env-var takes
+    /// precedence; a compiled-out backend is not caught here — the
+    /// caller must check `probeAll()` afterwards if they want to know
+    /// whether the resolved backend is actually available. Never throws.
+    [[nodiscard]] static BackendKind
+        resolveKind(BackendKind defaultKind = BackendKind::LevelZero) noexcept;
+
+    /// Construct a fully-initialised `ComputeContext` for the given
+    /// backend. The single entry point where runtime backend-selection
+    /// materialises. Throws the backend's concrete error type on driver /
+    /// device init failure (`L0Error`, `HipError`, ...).
+    ///
+    /// `kind` must correspond to a backend that was compiled in. Passing
+    /// a compiled-out backend throws `std::runtime_error` with a message
+    /// that names the missing CMake flag.
+    [[nodiscard]] static std::unique_ptr<ComputeContext>
+        createContext(BackendKind kind);
 };
 
 } // namespace mimirmind::core::backend

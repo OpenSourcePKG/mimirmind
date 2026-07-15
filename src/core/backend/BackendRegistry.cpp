@@ -3,12 +3,19 @@
 
 #include "core/backend/BackendRegistry.hpp"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <memory>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
-// Forward declarations of the per-backend probe functions live at
-// file scope — declaring `mimirmind::core::l0::probeBackend()` from
-// inside `namespace mimirmind::core::backend` is not permitted.
+// Forward declarations of the per-backend probe + createContext
+// functions live at file scope — declaring
+// `mimirmind::core::l0::probeBackend()` from inside
+// `namespace mimirmind::core::backend` is not permitted.
 //
 // Definitions of these symbols live in the respective backend's
 // translation unit (mimirmind_core_l0 / mimirmind_core_hip) so this
@@ -20,12 +27,16 @@
 #ifdef MIMIRMIND_HAVE_L0
 namespace mimirmind::core::l0 {
     ::mimirmind::core::backend::BackendProbe probeBackend() noexcept;
+    std::unique_ptr<::mimirmind::core::backend::ComputeContext>
+        createComputeContext();
 }
 #endif
 
 #ifdef MIMIRMIND_HAVE_HIP
 namespace mimirmind::core::hip {
     ::mimirmind::core::backend::BackendProbe probeBackend() noexcept;
+    std::unique_ptr<::mimirmind::core::backend::ComputeContext>
+        createComputeContext();
 }
 #endif
 
@@ -84,6 +95,78 @@ const char* BackendRegistry::name(BackendKind k) noexcept {
         case BackendKind::Unknown:   return "Unknown";
     }
     return "Unknown";
+}
+
+std::optional<BackendKind>
+BackendRegistry::parseKind(std::string_view s) noexcept {
+    std::string lower{s};
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    if (lower == "l0" || lower == "levelzero" || lower == "level_zero") {
+        return BackendKind::LevelZero;
+    }
+    if (lower == "hip" || lower == "rocm" || lower == "amd") {
+        return BackendKind::Hip;
+    }
+    if (lower == "cuda" || lower == "nvidia") {
+        return BackendKind::Cuda;
+    }
+    if (lower == "cpu") {
+        return BackendKind::Cpu;
+    }
+    return std::nullopt;
+}
+
+BackendKind BackendRegistry::resolveKind(BackendKind defaultKind) noexcept {
+    if (const char* env = std::getenv("MIMIRMIND_BACKEND")) {
+        if (auto parsed = parseKind(env)) {
+            return *parsed;
+        }
+        // Silently fall through to default on unrecognised value — the
+        // signature is noexcept. Callers can compare the returned kind
+        // against the env value themselves if they want to warn.
+    }
+    return defaultKind;
+}
+
+std::unique_ptr<ComputeContext>
+BackendRegistry::createContext(BackendKind kind) {
+    switch (kind) {
+        case BackendKind::LevelZero:
+#ifdef MIMIRMIND_HAVE_L0
+            return ::mimirmind::core::l0::createComputeContext();
+#else
+            throw std::runtime_error{
+                "BackendKind::LevelZero not compiled in "
+                "(MIMIRMIND_ENABLE_L0=OFF at build time)"};
+#endif
+
+        case BackendKind::Hip:
+#ifdef MIMIRMIND_HAVE_HIP
+            return ::mimirmind::core::hip::createComputeContext();
+#else
+            throw std::runtime_error{
+                "BackendKind::Hip not compiled in "
+                "(MIMIRMIND_ENABLE_HIP=OFF at build time)"};
+#endif
+
+        case BackendKind::Cuda:
+            throw std::runtime_error{
+                "BackendKind::Cuda has no compiled backend "
+                "(no DGX-class target committed)"};
+
+        case BackendKind::Cpu:
+            throw std::runtime_error{
+                "BackendKind::Cpu has no compute backend — "
+                "reference paths live inline in compute/"};
+
+        case BackendKind::Unknown:
+            throw std::runtime_error{
+                "BackendKind::Unknown — cannot construct a ComputeContext"};
+    }
+    throw std::runtime_error{"BackendRegistry::createContext: unreachable"};
 }
 
 } // namespace mimirmind::core::backend

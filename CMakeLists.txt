@@ -337,7 +337,11 @@ endif()
 if(MIMIRMIND_ENABLE_L0)
     add_library(mimirmind_core_l0 STATIC
         src/core/gpu/l0/L0Context.cpp
+        src/core/gpu/l0/L0ComputeContext.cpp
         src/core/gpu/l0/UsmAllocator.cpp
+        src/core/gpu/l0/CommandQueue.cpp
+        src/core/gpu/l0/GpuKernel.cpp
+        src/core/gpu/l0/GpuModule.cpp
         src/core/ipc/IpcExporter.cpp
         src/core/ipc/IpcImporter.cpp
         src/core/ipc/MuninClient.cpp
@@ -375,6 +379,7 @@ endif()
 if(MIMIRMIND_ENABLE_HIP)
     add_library(mimirmind_core_hip STATIC
         src/core/gpu/hip/HipContext.cpp
+        src/core/gpu/hip/HipComputeContext.cpp
         src/core/gpu/hip/HipEvent.cpp
         src/core/gpu/hip/HipKernel.cpp
         src/core/gpu/hip/HipMemoryAllocator.cpp
@@ -501,9 +506,6 @@ add_executable(mimirmind
     src/model/ResponseCleaner.cpp
     src/model/Tokenizer.cpp
     src/runtime/BlockBuffers.cpp
-    src/core/gpu/l0/CommandQueue.cpp
-    src/core/gpu/l0/GpuKernel.cpp
-    src/core/gpu/l0/GpuModule.cpp
     src/runtime/InferenceEngine.cpp
     src/runtime/KvCache.cpp
     src/runtime/SpeculativeDecoder.cpp
@@ -738,9 +740,6 @@ add_executable(gpu_tests
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
-    src/core/gpu/l0/CommandQueue.cpp
-    src/core/gpu/l0/GpuKernel.cpp
-    src/core/gpu/l0/GpuModule.cpp
 )
 
 add_dependencies(gpu_tests spv_kernels)
@@ -783,9 +782,6 @@ add_executable(prefill_bench
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
-    src/core/gpu/l0/CommandQueue.cpp
-    src/core/gpu/l0/GpuKernel.cpp
-    src/core/gpu/l0/GpuModule.cpp
 )
 
 add_dependencies(prefill_bench spv_kernels)
@@ -1405,4 +1401,31 @@ endif()
 
 if(TARGET mimirmind_core_hip)
     target_link_libraries(backend_probe PRIVATE mimirmind_core_hip)
+endif()
+
+# ---- backend_select_probe — runtime backend-selection demo --------------
+#
+# End-to-end: reads MIMIRMIND_BACKEND (falling back to LevelZero),
+# resolves via BackendRegistry::resolveKind(), constructs the concrete
+# ComputeContext via BackendRegistry::createContext(), and prints the
+# device info + feature flags observed through the neutral interface.
+#
+# Same link surface as backend_probe — links both concrete backend libs
+# when they're compiled in so createContext() can reach the free-fn
+# factories via the file-scope forward decls in BackendRegistry.cpp.
+
+add_executable(backend_select_probe
+    tools/backend-select-probe.cpp
+)
+
+target_link_libraries(backend_select_probe PRIVATE
+    mimirmind_core_common
+)
+
+if(TARGET mimirmind_core_l0)
+    target_link_libraries(backend_select_probe PRIVATE mimirmind_core_l0)
+endif()
+
+if(TARGET mimirmind_core_hip)
+    target_link_libraries(backend_select_probe PRIVATE mimirmind_core_hip)
 endif()
