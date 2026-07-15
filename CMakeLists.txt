@@ -409,6 +409,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/hip_probe_kernel.hip
         kernels_hip/add_bias.hip
         kernels_hip/add_residual.hip
+        kernels_hip/add_rmsnorm.hip
         kernels_hip/attention.hip
         kernels_hip/attention_flash_merge.hip
         kernels_hip/attention_flash_partial.hip
@@ -1436,6 +1437,24 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_x_quant_i8_probe hip_kernels)
 
     target_link_libraries(hip_x_quant_i8_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_add_rmsnorm_probe — fused residual + RMSNorm parity check
+    #
+    # Same reduction shape as rmsnorm. Verifies both outputs the fused
+    # kernel writes: the in-place-updated `x` (post-add) and the
+    # normalised `y`. Two separate combined-tolerance envelopes since
+    # the `x` update is a plain sum (tight) while `y` rides the RMS
+    # reduction + rsqrt (looser, like base rmsnorm).
+
+    add_executable(hip_add_rmsnorm_probe
+        tools/hip-add-rmsnorm-probe.cpp
+    )
+
+    add_dependencies(hip_add_rmsnorm_probe hip_kernels)
+
+    target_link_libraries(hip_add_rmsnorm_probe PRIVATE
         mimirmind_core_hip
     )
 endif()

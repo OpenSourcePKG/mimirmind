@@ -117,7 +117,7 @@ core::hip::HipModule loadHipModule(core::hip::HipContext& ctx,
 // entry point. HIP-only kernels used by `HipGpuMatmul` (matmul
 // variants + moe_down) live on that class, not here. Kernels that
 // exist in the L0 `GpuOps::Impl` but haven't been ported to HIP yet
-// (add_rmsnorm, rope_inplace_ff{,_fp16}, rope_inplace_fp16,
+// (rope_inplace_ff{,_fp16}, rope_inplace_fp16,
 // attention_prefill_flash_q8_0_gqa KTILE=64 variant) are deliberately
 // absent — the corresponding ComputeOps overrides throw
 // `not yet implemented` at dispatch time.
@@ -132,6 +132,8 @@ struct GpuOps::Impl {
     core::hip::HipKernel _rmsnormQkvKernel;
     core::hip::HipModule _rmsnormQkvFp16Module;
     core::hip::HipKernel _rmsnormQkvFp16Kernel;
+    core::hip::HipModule _addRmsNormModule;
+    core::hip::HipKernel _addRmsNormKernel;
 
     core::hip::HipModule _addBiasModule;
     core::hip::HipKernel _addBiasKernel;
@@ -196,6 +198,8 @@ struct GpuOps::Impl {
           _rmsnormQkvKernel        {_rmsnormQkvModule.getKernel("rmsnorm_qkv")},
           _rmsnormQkvFp16Module    {loadHipModule(ctx, "rmsnorm_qkv_fp16")},
           _rmsnormQkvFp16Kernel    {_rmsnormQkvFp16Module.getKernel("rmsnorm_qkv_fp16")},
+          _addRmsNormModule        {loadHipModule(ctx, "add_rmsnorm")},
+          _addRmsNormKernel        {_addRmsNormModule.getKernel("add_rmsnorm")},
 
           _addBiasModule           {loadHipModule(ctx, "add_bias")},
           _addBiasKernel           {_addBiasModule.getKernel("add_bias")},
@@ -325,7 +329,7 @@ GpuOps::GpuOps(core::hip::HipComputeContext& ctx,
     }
 
     MM_LOG_INFO("hipgpuops",
-                "hip::GpuOps ready — 28 modules loaded (rmsnorm variants, "
+                "hip::GpuOps ready — 29 modules loaded (rmsnorm variants, "
                 "elementwise, rope, attention decode/prefill × f32/fp16/Q8_0, "
                 "qkv_split × f32/fp16, kv_quant_commit_q8_0, "
                 "matmul_q8_0_vec_reorder). "
@@ -499,13 +503,24 @@ void GpuOps::rmsNormQkvAsync(float* qBuf, const float* qWeight,
              kRmsnormLocalSize, 1, 1);
 }
 
-void GpuOps::addRmsNormAsync(float*, const float*,
-                                std::size_t, std::size_t,
-                                const float*, float, float*) {
-    // add_rmsnorm kernel not yet ported to HIP — the L0 side has
-    // a fused kernel; HIP would either need the port or a two-launch
-    // fallback (addResidualAsync + rmsNormAsync) once those exist.
-    throwNotImplemented("addRmsNormAsync");
+void GpuOps::addRmsNormAsync(float* x, const float* delta,
+                             std::size_t M, std::size_t K,
+                             const float* weight, float eps, float* y) {
+    if (M == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t Ki = toInt32(K, "addRmsNorm K");
+    auto& k = _pimpl->_addRmsNormKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, delta);
+    k.setPtr  (2, weight);
+    k.setPtr  (3, y);
+    k.setValue(4, eps);
+    k.setValue(5, Ki);
+    // One workgroup per row — same as rmsnorm.
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(M), 1, 1,
+             kRmsnormLocalSize, 1, 1);
 }
 
 void GpuOps::addBiasAsync(float* y, std::size_t M, std::size_t K,
