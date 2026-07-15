@@ -13,6 +13,7 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -21,6 +22,30 @@ namespace mimirmind::compute {
 namespace {
 
 constexpr const char* kDefaultHsacoDir = "/usr/local/share/mimirmind/hsaco";
+
+// Range-check + narrow to int32 for kernel scalar args. Kernels bind
+// their shape arguments as `const int` so an oversized `size_t` would
+// silently truncate — this helper throws instead, matching the L0
+// side's `toInt32` in GpuOps.cpp.
+std::int32_t toInt32(std::size_t v, const char* tag) {
+    if (v > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::runtime_error(
+            std::string{"HipGpuOps: "} + tag +
+            " overflows int32 ("  + std::to_string(v) + ")");
+    }
+    return static_cast<std::int32_t>(v);
+}
+
+// Ceiling division for launch grid geometry. Same shape as the L0
+// `groupsForN`. Throws if the resulting group count would overflow a
+// `uint32_t` (kernel launch API takes 32-bit dims).
+std::uint32_t groupsForN(std::size_t n, std::uint32_t local) {
+    const std::size_t g = (n + local - 1) / local;
+    if (g > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error("HipGpuOps: workgroup count overflows uint32");
+    }
+    return static_cast<std::uint32_t>(g);
+}
 
 // Resolve `<name>.hsaco` in one of:
 //   1. $MIMIRMIND_HSACO_DIR (env var — HIP analog of runtime.spvDir)
@@ -353,29 +378,112 @@ void HipGpuOps::noteQ8_0ReorderApplied(std::size_t bytes,
 // diagnostic. Follow-up commits (Schritt 3b sub-B..sub-E) fill them
 // group-by-group. Order matches the header layout.
 
-void HipGpuOps::rmsNormAsync(const float*, std::size_t, std::size_t,
-                             const float*, float, float*) {
-    throwNotImplemented("rmsNormAsync");
+void HipGpuOps::rmsNormAsync(const float* x, std::size_t M, std::size_t K,
+                             const float* weight, float eps, float* y) {
+    if (M == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t Ki = toInt32(K, "rmsNorm K");
+    auto& k = _pimpl->_rmsnormKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, weight);
+    k.setPtr  (2, y);
+    k.setValue(3, eps);
+    k.setValue(4, Ki);
+    // One workgroup per row — mirrors L0 GpuOps.
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(M), 1, 1,
+             kRmsnormLocalSize, 1, 1);
 }
 
-void HipGpuOps::rmsNormGemmaAsync(const float*, std::size_t, std::size_t,
-                                  const float*, float, float*) {
-    throwNotImplemented("rmsNormGemmaAsync");
+void HipGpuOps::rmsNormGemmaAsync(const float* x, std::size_t M, std::size_t K,
+                                  const float* weight, float eps, float* y) {
+    if (M == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t Ki = toInt32(K, "rmsNormGemma K");
+    auto& k = _pimpl->_rmsnormGemmaKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, weight);
+    k.setPtr  (2, y);
+    k.setValue(3, eps);
+    k.setValue(4, Ki);
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(M), 1, 1,
+             kRmsnormLocalSize, 1, 1);
 }
 
-void HipGpuOps::rmsNormNoWeightAsync(const float*, std::size_t, std::size_t,
-                                     float, float*) {
-    throwNotImplemented("rmsNormNoWeightAsync");
+void HipGpuOps::rmsNormNoWeightAsync(const float* x, std::size_t M, std::size_t K,
+                                     float eps, float* y) {
+    if (M == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t Ki = toInt32(K, "rmsNormNoWeight K");
+    auto& k = _pimpl->_rmsnormNoWeightKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, y);
+    k.setValue(2, eps);
+    k.setValue(3, Ki);
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(M), 1, 1,
+             kRmsnormLocalSize, 1, 1);
 }
 
-void HipGpuOps::rmsNormQkvAsync(float*, const float*,
-                                void*, const float*,
-                                void*,
-                                std::size_t, std::size_t, std::size_t,
-                                float,
-                                std::size_t, std::size_t,
-                                runtime::KvDtype, bool) {
-    throwNotImplemented("rmsNormQkvAsync");
+void HipGpuOps::rmsNormQkvAsync(float* qBuf, const float* qWeight,
+                                void* kBase, const float* kWeight,
+                                void* vBase,
+                                std::size_t qRows, std::size_t kvRows,
+                                std::size_t headDim, float eps,
+                                std::size_t writeOffset, std::size_t kvDim,
+                                runtime::KvDtype kvDtype, bool useStagingSlot) {
+    if ((qRows == 0 && kvRows == 0) || headDim == 0) {
+        return;
+    }
+    const std::int32_t Ki      = toInt32(headDim, "rmsNormQkv headDim");
+    const std::int32_t qRowsI  = toInt32(qRows,   "rmsNormQkv qRows");
+    const std::int32_t kvRowsI = toInt32(kvRows,  "rmsNormQkv kvRows");
+    const std::int32_t kvDimI  = toInt32(kvDim,   "rmsNormQkv kvDim");
+
+    // Pick f32 vs fp16 KV variant — arg layout is identical, only the
+    // K/V store lowering differs inside the kernel body.
+    auto& k = (kvDtype == runtime::KvDtype::FP16)
+                  ? _pimpl->_rmsnormQkvFp16Kernel
+                  : _pimpl->_rmsnormQkvKernel;
+
+    // Bind the offset slot. Staging path always reads 0; the non-
+    // staging path writes `writeOffset` into the shared curLen slot
+    // via a synchronous H2D copy before launch. Mirror of the L0
+    // dispatcher's slot-swap logic — see GpuOps::rmsNormQkvAsync.
+    std::int32_t* offsetSlot;
+    if (useStagingSlot) {
+        offsetSlot = _stagingOffsetSlotUsm;
+    } else {
+        const std::int32_t v = toInt32(writeOffset, "rmsNormQkv writeOffset");
+        _ctx.allocator().copyH2D(_curLenSlotUsm, &v, sizeof(std::int32_t));
+        offsetSlot = _curLenSlotUsm;
+    }
+
+    k.setPtr  (0,  qBuf);
+    k.setPtr  (1,  qWeight);
+    k.setPtr  (2,  qBuf);            // in-place
+    k.setPtr  (3,  kBase);
+    k.setPtr  (4,  kWeight);
+    k.setPtr  (5,  kBase);           // in-place
+    k.setPtr  (6,  vBase);
+    k.setPtr  (7,  vBase);           // in-place
+    k.setValue(8,  qRowsI);
+    k.setValue(9,  kvRowsI);
+    k.setValue(10, Ki);
+    k.setValue(11, eps);
+    k.setPtr  (12, offsetSlot);
+    k.setValue(13, kvDimI);
+
+    // Total workgroups = qRows + 2*kvRows. Q rows first, then K, then V.
+    const std::uint32_t totalRows =
+        static_cast<std::uint32_t>(qRows + 2 * kvRows);
+    k.launch(_ctx.stream(),
+             totalRows, 1, 1,
+             kRmsnormLocalSize, 1, 1);
 }
 
 void HipGpuOps::addRmsNormAsync(float*, const float*,
@@ -387,17 +495,49 @@ void HipGpuOps::addRmsNormAsync(float*, const float*,
     throwNotImplemented("addRmsNormAsync");
 }
 
-void HipGpuOps::addBiasAsync(float*, std::size_t, std::size_t,
-                             const float*) {
-    throwNotImplemented("addBiasAsync");
+void HipGpuOps::addBiasAsync(float* y, std::size_t M, std::size_t K,
+                             const float* bias) {
+    if (M == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t Mi = toInt32(M, "addBias M");
+    const std::int32_t Ki = toInt32(K, "addBias K");
+    auto& k = _pimpl->_addBiasKernel;
+    k.setPtr  (0, y);
+    k.setPtr  (1, bias);
+    k.setValue(2, Mi);
+    k.setValue(3, Ki);
+    k.launch(_ctx.stream(),
+             groupsForN(M * K, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
 }
 
-void HipGpuOps::addResidualAsync(float*, const float*, std::size_t) {
-    throwNotImplemented("addResidualAsync");
+void HipGpuOps::addResidualAsync(float* y, const float* x, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "addResidual n");
+    auto& k = _pimpl->_addResidualKernel;
+    k.setPtr  (0, y);
+    k.setPtr  (1, x);
+    k.setValue(2, ni);
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
 }
 
-void HipGpuOps::siluMulAsync(float*, const float*, std::size_t) {
-    throwNotImplemented("siluMulAsync");
+void HipGpuOps::siluMulAsync(float* gate, const float* up, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "siluMul n");
+    auto& k = _pimpl->_siluMulKernel;
+    k.setPtr  (0, gate);
+    k.setPtr  (1, up);
+    k.setValue(2, ni);
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
 }
 
 void HipGpuOps::geluMulAsync(float*, const float*, std::size_t) {
@@ -405,8 +545,18 @@ void HipGpuOps::geluMulAsync(float*, const float*, std::size_t) {
     throwNotImplemented("geluMulAsync");
 }
 
-void HipGpuOps::mulScalarAsync(float*, float, std::size_t) {
-    throwNotImplemented("mulScalarAsync");
+void HipGpuOps::mulScalarAsync(float* y, float s, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "mulScalar n");
+    auto& k = _pimpl->_mulScalarKernel;
+    k.setPtr  (0, y);
+    k.setValue(1, s);
+    k.setValue(2, ni);
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
 }
 
 void HipGpuOps::scaledAddResidualAsync(float*, const float*, float, std::size_t) {
