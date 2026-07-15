@@ -714,19 +714,237 @@ void GpuOps::qkvSplitAsync(const float* fused, float* Yq,
              kElementwiseLocalSize, 1, 1);
 }
 
-void GpuOps::attentionAsync(const float*, const void*, const void*,
-                               std::size_t, std::size_t,
-                               std::size_t, std::size_t, std::size_t,
-                               std::size_t,
-                               float, float*,
-                               std::size_t, runtime::KvDtype) {
-    // Dispatch fan-out (plain / prefill-flash / decode-flash by T_q,
-    // T_k, positionOffset) lands in the follow-up. Both KTILE variants
-    // will need the second .hip compile that L0 gets from ocloc; on
-    // HIP we either compile with -DATTN_KTILE=<n> a second time or
-    // fold both KTILE=64 and KTILE=128 into the same kernel with a
-    // runtime arg.
-    throwNotImplemented("attentionAsync");
+void GpuOps::attentionAsync(const float* q, const void* k, const void* v,
+                            std::size_t T_q, std::size_t T_k,
+                            std::size_t nHeads, std::size_t nKvHeads,
+                            std::size_t headDim,
+                            std::size_t positionOffset,
+                            float scale, float* out,
+                            std::size_t slidingWindow,
+                            runtime::KvDtype kvDtype) {
+    if (T_q == 0 || T_k == 0 || nHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (nKvHeads == 0 || nHeads % nKvHeads != 0) {
+        throw std::runtime_error(
+            "compute::hip::GpuOps::attentionAsync: nHeads (" +
+            std::to_string(nHeads) + ") must be a positive multiple of "
+            "nKvHeads (" + std::to_string(nKvHeads) + ")");
+    }
+
+    // Dispatch mirrors compute::l0::GpuOps::attentionAsync:
+    //   T_q == 1 → decode-flash (two-pass partial + merge)
+    //   T_q >  1 → prefill-flash (single-WG streaming, if enabled)
+    //   fallback → plain attention (T_k <= kAttentionMaxTk)
+    if (T_q == 1) {
+        if (nHeads > kFlashMaxHeads || headDim > kFlashMaxHeadDim) {
+            throw std::runtime_error(
+                "compute::hip::GpuOps::attentionAsync: flash path needs "
+                "nHeads<=" + std::to_string(kFlashMaxHeads) +
+                " and headDim<=" + std::to_string(kFlashMaxHeadDim) +
+                " (got " + std::to_string(nHeads) + " / " +
+                std::to_string(headDim) + ")");
+        }
+        attentionDecodeFlashAsync(q, k, v, T_k, nHeads, nKvHeads, headDim,
+                                  positionOffset, scale, out, slidingWindow,
+                                  kvDtype);
+    } else if (!_prefillFlashDisabled && headDim <= kFlashMaxHeadDim) {
+        attentionPrefillFlashAsync(q, k, v, T_q, nHeads, nKvHeads, headDim,
+                                   positionOffset, scale, out, slidingWindow,
+                                   kvDtype);
+    } else {
+        attentionPlainAsync(q, k, v, T_q, T_k, nHeads, nKvHeads, headDim,
+                            positionOffset, scale, out, slidingWindow,
+                            kvDtype);
+    }
+}
+
+void GpuOps::attentionPlainAsync(const float* q, const void* k, const void* v,
+                                 std::size_t T_q, std::size_t T_k,
+                                 std::size_t nHeads, std::size_t nKvHeads,
+                                 std::size_t headDim,
+                                 std::size_t positionOffset,
+                                 float scale, float* out,
+                                 std::size_t slidingWindow,
+                                 runtime::KvDtype kvDtype) {
+    if (T_k > kAttentionMaxTk) {
+        throw std::runtime_error(
+            "compute::hip::GpuOps::attentionPlainAsync: T_k=" +
+            std::to_string(T_k) + " exceeds compile-time bound "
+            "ATTN_MAX_TK=" + std::to_string(kAttentionMaxTk) +
+            " — the plain-attention kernel holds scores[ATTN_MAX_TK] in "
+            "LDS. Re-enable the flash path (features.prefillFlash: true) "
+            "or reduce runtime.maxContextTokens below " +
+            std::to_string(kAttentionMaxTk));
+    }
+    (void)T_k;
+
+    core::hip::HipKernel* kernelPtr = &_pimpl->_attentionKernel;
+    if (kvDtype == runtime::KvDtype::FP16) {
+        kernelPtr = &_pimpl->_attentionFp16Kernel;
+    } else if (kvDtype == runtime::KvDtype::Q8_0) {
+        kernelPtr = &_pimpl->_attentionQ8Kernel;
+    }
+    auto& kernel = *kernelPtr;
+
+    const std::int32_t posI =
+        toInt32(positionOffset, "attention positionOffset");
+    _ctx.allocator().copyH2D(_curLenSlotUsm, &posI, sizeof(std::int32_t));
+
+    kernel.setPtr  (0, q);
+    kernel.setPtr  (1, k);
+    kernel.setPtr  (2, v);
+    kernel.setPtr  (3, out);
+    kernel.setValue(4, toInt32(T_q,      "attention T_q"));
+    kernel.setValue(5, toInt32(nHeads,   "attention nHeads"));
+    kernel.setValue(6, toInt32(nKvHeads, "attention nKvHeads"));
+    kernel.setValue(7, toInt32(headDim,  "attention headDim"));
+    kernel.setPtr  (8, _curLenSlotUsm);
+    kernel.setValue(9, scale);
+    kernel.setValue(10, toInt32(slidingWindow, "attention slidingWindow"));
+
+    // One workgroup per (head, query-position).
+    kernel.launch(_ctx.stream(),
+                  static_cast<std::uint32_t>(nHeads),
+                  static_cast<std::uint32_t>(T_q),
+                  1,
+                  kAttentionLocalSize, 1, 1);
+}
+
+void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
+                                        const void* v,
+                                        std::size_t T_q,
+                                        std::size_t nHeads,
+                                        std::size_t nKvHeads,
+                                        std::size_t headDim,
+                                        std::size_t positionOffset,
+                                        float scale, float* out,
+                                        std::size_t slidingWindow,
+                                        runtime::KvDtype kvDtype) {
+    // Under Q8_0 with GQA shape, route to the head-packed kernel when
+    // the config allows and nQPerKv is within the packed kernel's cap.
+    // The HIP port currently ships only the KTILE=128 variant of the
+    // packed kernel (attention_prefill_flash_q8_0_gqa.hip). L0 has a
+    // second SPV compiled from the same source with -DATTN_KTILE=64;
+    // on HIP that's a follow-up kernel-port. Until then, honour
+    // `_prefillFlashKTileQ8` only as configuration bookkeeping — the
+    // dispatch always uses the 128-tile kernel.
+    const std::size_t nQPerKv = nHeads / nKvHeads;
+    const bool useQ8Gqa =
+        (kvDtype == runtime::KvDtype::Q8_0) &&
+        !_prefillFlashGqaQ8Disabled &&
+        (nQPerKv > 1) &&
+        (nQPerKv <= kFlashPrefillGqaMaxQPerKv);
+
+    core::hip::HipKernel* kernelPtr = &_pimpl->_attentionPrefillFlashKernel;
+    if (kvDtype == runtime::KvDtype::FP16) {
+        kernelPtr = &_pimpl->_attentionPrefillFlashFp16Kernel;
+    } else if (kvDtype == runtime::KvDtype::Q8_0) {
+        kernelPtr = useQ8Gqa
+            ? &_pimpl->_attentionPrefillFlashQ8GqaKernel
+            : &_pimpl->_attentionPrefillFlashQ8Kernel;
+    }
+    auto& kernel = *kernelPtr;
+
+    const std::int32_t posI =
+        toInt32(positionOffset, "prefill_flash positionOffset");
+    _ctx.allocator().copyH2D(_curLenSlotUsm, &posI, sizeof(std::int32_t));
+
+    kernel.setPtr  (0, q);
+    kernel.setPtr  (1, k);
+    kernel.setPtr  (2, v);
+    kernel.setPtr  (3, out);
+    kernel.setValue(4, toInt32(T_q,      "prefill_flash T_q"));
+    kernel.setValue(5, toInt32(nHeads,   "prefill_flash nHeads"));
+    kernel.setValue(6, toInt32(nKvHeads, "prefill_flash nKvHeads"));
+    kernel.setValue(7, toInt32(headDim,  "prefill_flash headDim"));
+    kernel.setPtr  (8, _curLenSlotUsm);
+    kernel.setValue(9, scale);
+    kernel.setValue(10, toInt32(slidingWindow, "prefill_flash slidingWindow"));
+
+    // Plain kernels: one WG per (query-head, query-position).
+    // GQA-packed kernel: one WG per (kv-head, query-position).
+    const std::uint32_t dim0 = useQ8Gqa
+        ? static_cast<std::uint32_t>(nKvHeads)
+        : static_cast<std::uint32_t>(nHeads);
+    kernel.launch(_ctx.stream(),
+                  dim0,
+                  static_cast<std::uint32_t>(T_q),
+                  1,
+                  kAttentionLocalSize, 1, 1);
+}
+
+void GpuOps::attentionDecodeFlashAsync(const float* q, const void* k,
+                                       const void* v,
+                                       std::size_t T_k,
+                                       std::size_t nHeads,
+                                       std::size_t nKvHeads,
+                                       std::size_t headDim,
+                                       std::size_t positionOffset,
+                                       float scale, float* out,
+                                       std::size_t slidingWindow,
+                                       runtime::KvDtype kvDtype) {
+    const std::size_t kMax =
+        (positionOffset + 1 < T_k) ? (positionOffset + 1) : T_k;
+    const std::size_t nKTiles =
+        (kMax + kFlashKTileSize - 1) / kFlashKTileSize;
+    if (nKTiles == 0 || nKTiles > kFlashMaxKTiles) {
+        throw std::runtime_error(
+            "compute::hip::GpuOps::attentionDecodeFlashAsync: nKTiles=" +
+            std::to_string(nKTiles) + " out of [1, " +
+            std::to_string(kFlashMaxKTiles) + "]");
+    }
+    (void)T_k;
+
+    const std::int32_t posI =
+        toInt32(positionOffset, "flash positionOffset");
+    _ctx.allocator().copyH2D(_curLenSlotUsm, &posI, sizeof(std::int32_t));
+
+    // Pass 1 — per-tile partial (m, l, o_unnorm) into persistent scratch.
+    // Kernel by KV dtype; partial layout stays fp32 regardless so the
+    // merge kernel is dtype-agnostic.
+    core::hip::HipKernel* partialKernelPtr =
+        &_pimpl->_attentionFlashPartialKernel;
+    if (kvDtype == runtime::KvDtype::FP16) {
+        partialKernelPtr = &_pimpl->_attentionFlashPartialFp16Kernel;
+    } else if (kvDtype == runtime::KvDtype::Q8_0) {
+        partialKernelPtr = &_pimpl->_attentionFlashPartialQ8Kernel;
+    }
+    auto& partialKernel = *partialKernelPtr;
+
+    partialKernel.setPtr  (0, q);
+    partialKernel.setPtr  (1, k);
+    partialKernel.setPtr  (2, v);
+    partialKernel.setPtr  (3, _flashPartialUsm);
+    partialKernel.setValue(4, toInt32(nHeads,   "flash nHeads"));
+    partialKernel.setValue(5, toInt32(nKvHeads, "flash nKvHeads"));
+    partialKernel.setValue(6, toInt32(headDim,  "flash headDim"));
+    partialKernel.setPtr  (7, _curLenSlotUsm);
+    partialKernel.setValue(8, scale);
+    partialKernel.setValue(9, toInt32(slidingWindow, "flash slidingWindow"));
+
+    // HIP has no hipGraph recording yet, so launch geometry always uses
+    // the actual nKTiles (immediate-mode optimal). `_replayMaxKTiles` is
+    // kept as bookkeeping for the future hipGraph landing (Schritt 5).
+    partialKernel.launch(_ctx.stream(),
+                         static_cast<std::uint32_t>(nHeads),
+                         static_cast<std::uint32_t>(nKTiles),
+                         1,
+                         kAttentionLocalSize, 1, 1);
+
+    // Pass 2 — merge per-tile partials into the final output. HIP kernel
+    // launches on the same stream serialise implicitly, so the merge
+    // sees committed partials without an explicit barrier.
+    auto& mergeKernel = _pimpl->_attentionFlashMergeKernel;
+    mergeKernel.setPtr  (0, _flashPartialUsm);
+    mergeKernel.setPtr  (1, out);
+    mergeKernel.setValue(2, toInt32(nHeads,  "flash_merge nHeads"));
+    mergeKernel.setValue(3, toInt32(headDim, "flash_merge headDim"));
+    mergeKernel.setPtr  (4, _curLenSlotUsm);
+    mergeKernel.launch(_ctx.stream(),
+                       static_cast<std::uint32_t>(nHeads),
+                       1, 1,
+                       kAttentionLocalSize, 1, 1);
 }
 
 void GpuOps::matmulQ8_0VecReorderAsync(const void* wReordered,

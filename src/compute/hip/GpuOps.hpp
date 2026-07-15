@@ -245,6 +245,55 @@ private:
     static constexpr std::uint32_t kKvQuantCommitLocalSize = 32;
     static constexpr std::uint32_t kAttentionLocalSize    = 16;
 
+    // Cap on how many Q-heads share one KV-head that the head-packed
+    // Q8_0 prefill kernel can serve. Must match the compile-time
+    // register-array + LDS bound inside
+    // `attention_prefill_flash_q8_0_gqa.hip`. Dispatch falls back to
+    // the plain Q8_0 kernel when nQPerKv exceeds this.
+    static constexpr std::size_t kFlashPrefillGqaMaxQPerKv = 8;
+
+    // Attention fan-out. `attentionAsync` dispatches to one of these
+    // three helpers based on T_q, T_k, positionOffset and kvDtype,
+    // matching the L0 GpuOps routing logic. Kept private to make the
+    // public API a single entry point.
+    void attentionPlainAsync(const float*     q,
+                             const void*      k,
+                             const void*      v,
+                             std::size_t      T_q,
+                             std::size_t      T_k,
+                             std::size_t      nHeads,
+                             std::size_t      nKvHeads,
+                             std::size_t      headDim,
+                             std::size_t      positionOffset,
+                             float            scale,
+                             float*           out,
+                             std::size_t      slidingWindow,
+                             runtime::KvDtype kvDtype);
+    void attentionPrefillFlashAsync(const float*     q,
+                                    const void*      k,
+                                    const void*      v,
+                                    std::size_t      T_q,
+                                    std::size_t      nHeads,
+                                    std::size_t      nKvHeads,
+                                    std::size_t      headDim,
+                                    std::size_t      positionOffset,
+                                    float            scale,
+                                    float*           out,
+                                    std::size_t      slidingWindow,
+                                    runtime::KvDtype kvDtype);
+    void attentionDecodeFlashAsync(const float*     q,
+                                   const void*      k,
+                                   const void*      v,
+                                   std::size_t      T_k,
+                                   std::size_t      nHeads,
+                                   std::size_t      nKvHeads,
+                                   std::size_t      headDim,
+                                   std::size_t      positionOffset,
+                                   float            scale,
+                                   float*           out,
+                                   std::size_t      slidingWindow,
+                                   runtime::KvDtype kvDtype);
+
 public:
     // Publicly readable so callers can compute launch upper bounds
     // for `setReplayMaxKTiles`. Parity with `GpuOps`.
