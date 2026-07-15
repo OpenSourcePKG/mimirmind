@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
+#pragma once
+
+#include "core/config/Config.hpp"
+#include "runtime/KvCache.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <string_view>
+
+namespace mimirmind::compute {
+
+/**
+ * Backend-neutral kernel-launch interface. Every element-wise +
+ * normalisation + attention kernel that the transformer block hits
+ * shows up here as a pure virtual — one method per fused-shape.
+ *
+ * Concrete backends (`GpuOps` on Level-Zero, `HipGpuOps` on ROCm/HIP)
+ * implement the launches against their native APIs and own the module
+ * loading / kernel handles / persistent scratch buffers. Backend-
+ * specific escape hatches (raw command queue, USM/HIP allocator,
+ * `curLenSlot()` USM int) stay on the concrete class — consumers that
+ * need them still downcast to the concrete backend, exactly the same
+ * way they downcast `ComputeContext&` to `L0ComputeContext&`.
+ *
+ * Schicht 3 of the HW-abstraction strategy: introducing the abstract
+ * base establishes the interface contract without yet forcing every
+ * caller to migrate to it. `GpuOps` inherits and marks its overrides;
+ * backends can keep holding `GpuOps&` (or `HipGpuOps&` when it lands)
+ * until Schicht 4 unifies the launch API. This split keeps the diff
+ * bounded — the alternative was a mass-rename of every backend at the
+ * same time as the interface split, which was rejected as too risky
+ * for one commit.
+ *
+ * All async methods append a kernel to the backend's queue WITHOUT
+ * syncing — the caller flushes/syncs on the concrete backend before
+ * reading results. Not thread-safe; construct once at startup.
+ */
+class ComputeOps {
+public:
+    virtual ~ComputeOps() = default;
+
+    ComputeOps(const ComputeOps&)            = delete;
+    ComputeOps& operator=(const ComputeOps&) = delete;
+    ComputeOps(ComputeOps&&)                 = delete;
+    ComputeOps& operator=(ComputeOps&&)      = delete;
+
+    // ---- Element-wise + normalisation ----------------------------------
+
+    virtual void rmsNormAsync(const float* x,
+                              std::size_t  M,
+                              std::size_t  K,
+                              const float* weight,
+                              float        eps,
+                              float*       y) = 0;
+
+    virtual void rmsNormGemmaAsync(const float* x,
+                                   std::size_t  M,
+                                   std::size_t  K,
+                                   const float* weight,
+                                   float        eps,
+                                   float*       y) = 0;
+
+    virtual void rmsNormNoWeightAsync(const float* x,
+                                      std::size_t  M,
+                                      std::size_t  K,
+                                      float        eps,
+                                      float*       y) = 0;
+
+    virtual void rmsNormQkvAsync(float*           qBuf,   const float* qWeight,
+                                 void*            kBase,  const float* kWeight,
+                                 void*            vBase,
+                                 std::size_t      qRows,
+                                 std::size_t      kvRows,
+                                 std::size_t      headDim,
+                                 float            eps,
+                                 std::size_t      writeOffset,
+                                 std::size_t      kvDim,
+                                 runtime::KvDtype kvDtype        = runtime::KvDtype::F32,
+                                 bool             useStagingSlot = false) = 0;
+
+    virtual void addRmsNormAsync(float*       x,
+                                 const float* delta,
+                                 std::size_t  M,
+                                 std::size_t  K,
+                                 const float* weight,
+                                 float        eps,
+                                 float*       y) = 0;
+
+    virtual void addBiasAsync(float*       y,
+                              std::size_t  M,
+                              std::size_t  K,
+                              const float* bias) = 0;
+
+    virtual void addResidualAsync(float*       y,
+                                  const float* x,
+                                  std::size_t  n) = 0;
+
+    virtual void siluMulAsync(float*       gate,
+                              const float* up,
+                              std::size_t  n) = 0;
+
+    virtual void geluMulAsync(float*       gate,
+                              const float* up,
+                              std::size_t  n) = 0;
+
+    virtual void mulScalarAsync(float*       y,
+                                float        s,
+                                std::size_t  n) = 0;
+
+    virtual void scaledAddResidualAsync(float*       dst,
+                                        const float* src,
+                                        float        scale,
+                                        std::size_t  n) = 0;
+
+    // ---- RoPE ---------------------------------------------------------
+
+    virtual void ropeInPlaceAsync(void*            xBase,
+                                  std::size_t      seqLen,
+                                  std::size_t      numHeads,
+                                  std::size_t      headDim,
+                                  std::size_t      startPos,
+                                  float            base,
+                                  std::size_t      writeOffsetStride = 0,
+                                  runtime::KvDtype kvDtype           = runtime::KvDtype::F32) = 0;
+
+    virtual void ropeInPlaceWithFactorsAsync(void*            xBase,
+                                             const float*     freqFactors,
+                                             std::size_t      seqLen,
+                                             std::size_t      numHeads,
+                                             std::size_t      headDim,
+                                             std::size_t      startPos,
+                                             float            base,
+                                             std::size_t      writeOffsetStride = 0,
+                                             runtime::KvDtype kvDtype           = runtime::KvDtype::F32) = 0;
+
+    // ---- Quantisation + KV commit -------------------------------------
+
+    virtual void xQuantI8Async(const float* x,
+                               std::int8_t* y,
+                               float*       scale,
+                               std::size_t  M,
+                               std::size_t  K) = 0;
+
+    virtual void kvQuantCommitQ8Async(const float* xSrc,
+                                      void*        kvDst,
+                                      std::size_t  T,
+                                      std::size_t  kvDim,
+                                      std::size_t  writeOffset) = 0;
+
+    virtual void qkvSplitAsync(const float*     fused,
+                               float*           Yq,
+                               void*            YkBase,
+                               void*            YvBase,
+                               std::size_t      M,
+                               std::size_t      Nq,
+                               std::size_t      Nkv,
+                               bool             hasV,
+                               std::size_t      writeOffset    = 0,
+                               runtime::KvDtype kvDtype        = runtime::KvDtype::F32,
+                               bool             useStagingSlot = false) = 0;
+
+    // ---- Attention ----------------------------------------------------
+
+    virtual void attentionAsync(const float*     q,
+                                const void*      k,
+                                const void*      v,
+                                std::size_t      T_q,
+                                std::size_t      T_k,
+                                std::size_t      nHeads,
+                                std::size_t      nKvHeads,
+                                std::size_t      headDim,
+                                std::size_t      positionOffset,
+                                float            scale,
+                                float*           out,
+                                std::size_t      slidingWindow = 0,
+                                runtime::KvDtype kvDtype       = runtime::KvDtype::F32) = 0;
+
+    // ---- Reordered-Q8_0 matvec (test-facing) --------------------------
+
+    virtual void matmulQ8_0VecReorderAsync(const void*  wReordered,
+                                           std::size_t  N,
+                                           std::size_t  K,
+                                           const float* x,
+                                           float*       y) = 0;
+
+    // ---- Recording-side knobs -----------------------------------------
+
+    /// Right-size the FlashAttention partial launch geometry during
+    /// recording. When 0 (default), the launch uses the actual `nKTiles`
+    /// derived from `positionOffset+1`. See `GpuOps::setReplayMaxKTiles`
+    /// for the CLR context; HIP's hipGraph equivalent will consume the
+    /// same knob when it lands.
+    virtual void setReplayMaxKTiles(std::size_t n) noexcept = 0;
+
+    // ---- Feature-flag + status accessors ------------------------------
+    //
+    // These reflect the ctor-time resolution of `features.*` in
+    // config.json plus any post-load autotune result. Numerics-neutral
+    // bookkeeping — every backend surfaces the same values through
+    // `/v1/system/status`, so the interface pins them here.
+
+    [[nodiscard]] virtual std::string_view selfTestStatus() const noexcept = 0;
+
+    [[nodiscard]] virtual bool prefillFlashEnabled() const noexcept = 0;
+    [[nodiscard]] virtual bool prefillFlashGqaQ8Enabled() const noexcept = 0;
+    [[nodiscard]] virtual std::size_t prefillFlashKTileQ8() const noexcept = 0;
+    [[nodiscard]] virtual std::string_view prefillFlashKTileQ8Source() const noexcept = 0;
+
+    [[nodiscard]] virtual core::config::TriState q8_0ReorderMode() const noexcept = 0;
+    [[nodiscard]] virtual std::string_view q8_0ReorderModeName() const noexcept = 0;
+    [[nodiscard]] virtual std::size_t q8_0ReorderTensorCount() const noexcept = 0;
+    [[nodiscard]] virtual std::size_t q8_0ReorderTotalBytes() const noexcept = 0;
+
+    /// Load-time hook: backends invoke this once per Q8_0 tensor they
+    /// actually reordered so the counters + info log stay accurate. See
+    /// `GpuOps::noteQ8_0ReorderApplied` for the full contract.
+    virtual void noteQ8_0ReorderApplied(std::size_t bytes,
+                                        std::string_view label) noexcept = 0;
+
+protected:
+    ComputeOps() = default;
+};
+
+} // namespace mimirmind::compute

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "compute/ComputeOps.hpp"
 #include "core/config/Config.hpp"
 #include "runtime/KvCache.hpp"
 
@@ -36,7 +37,7 @@ namespace mimirmind::compute {
  * Not thread-safe (the underlying ze_kernel_handle_t is mutated by
  * setArgumentValue). Construct once at startup, share across the engine.
  */
-class GpuOps {
+class GpuOps : public ComputeOps {
 public:
     /// `flashPrefillEnabled` maps to `features.flashPrefill` in config.json.
     /// When false, T_q > 1 dispatches fall back to the plain attention.cl
@@ -54,7 +55,7 @@ public:
            std::size_t                 flashPrefillKTileQ8      = 128,
            core::config::TriState      q8_0ReorderMode          =
                core::config::TriState::Disable);
-    ~GpuOps();
+    ~GpuOps() override;
 
     GpuOps(const GpuOps&)            = delete;
     GpuOps& operator=(const GpuOps&) = delete;
@@ -69,7 +70,7 @@ public:
                       std::size_t  K,
                       const float* weight,
                       float        eps,
-                      float*       y);
+                      float*       y) override;
 
     /// Gemma-family variant: y = x * (1 + weight) / sqrt(mean(x^2) + eps).
     /// Used for all proper norm weights in Gemma 2/3/4 (init at 0,
@@ -81,7 +82,7 @@ public:
                            std::size_t  K,
                            const float* weight,
                            float        eps,
-                           float*       y);
+                           float*       y) override;
 
     /// Bare RMS-normalize without a learned scale: y = x / sqrt(mean(x^2) + eps).
     /// Used by Gemma 4 for the V projection (V passes through ggml_rms_norm
@@ -90,7 +91,7 @@ public:
                               std::size_t  M,
                               std::size_t  K,
                               float        eps,
-                              float*       y);
+                              float*       y) override;
 
     /// Fused Q + K + V RMSNorm — one dispatch instead of three. Q and K
     /// normalize with per-`head_dim` weights (plain rmsNorm semantics),
@@ -122,7 +123,7 @@ public:
                          std::size_t      writeOffset,
                          std::size_t      kvDim,
                          runtime::KvDtype kvDtype         = runtime::KvDtype::F32,
-                         bool             useStagingSlot  = false);
+                         bool             useStagingSlot  = false) override;
 
     /// Fused residual-add + RMSNorm. `x[m, k] += delta[m, k]` in place,
     /// then `y[m, k] = x[m, k] * weight[k] / sqrt(mean(x[m, :]^2) + eps)`.
@@ -136,23 +137,23 @@ public:
                          std::size_t  K,
                          const float* weight,
                          float        eps,
-                         float*       y);
+                         float*       y) override;
 
     /// In-place broadcast bias: y[m, k] += bias[k].
     void addBiasAsync(float*       y,
                       std::size_t  M,
                       std::size_t  K,
-                      const float* bias);
+                      const float* bias) override;
 
     /// In-place residual: y[i] += x[i] for i in [0, n).
     void addResidualAsync(float*       y,
                           const float* x,
-                          std::size_t  n);
+                          std::size_t  n) override;
 
     /// Fused SwiGLU step: gate[i] = silu(gate[i]) * up[i] for i in [0, n).
     void siluMulAsync(float*       gate,
                       const float* up,
-                      std::size_t  n);
+                      std::size_t  n) override;
 
     /// In-place RoPE on a [seqLen, numHeads, headDim] f32 buffer. The
     /// per-position angle uses `startPos` as the absolute offset of
@@ -177,7 +178,7 @@ public:
                           std::size_t      startPos,
                           float            base,
                           std::size_t      writeOffsetStride = 0,
-                          runtime::KvDtype kvDtype           = runtime::KvDtype::F32);
+                          runtime::KvDtype kvDtype           = runtime::KvDtype::F32) override;
 
     /// In-place RoPE with per-pair frequency factors (ggml_rope_ext's
     /// `freq_factors` argument). `freqFactors` points at [headDim/2] f32
@@ -196,19 +197,19 @@ public:
                                      std::size_t      startPos,
                                      float            base,
                                      std::size_t      writeOffsetStride = 0,
-                                     runtime::KvDtype kvDtype           = runtime::KvDtype::F32);
+                                     runtime::KvDtype kvDtype           = runtime::KvDtype::F32) override;
 
     /// In-place scalar multiply: y[i] *= s for i in [0, n).
     /// Used by Gemma 4 for layer_output_scale.
     void mulScalarAsync(float*       y,
                         float        s,
-                        std::size_t  n);
+                        std::size_t  n) override;
 
     /// GELU-flavoured SwiGLU: gate[i] = gelu_tanh(gate[i]) * up[i].
     /// Used by Gemma 4's FFN paths (vs Qwen's siluMulAsync).
     void geluMulAsync(float*       gate,
                       const float* up,
-                      std::size_t  n);
+                      std::size_t  n) override;
 
     /// Fused scaled accumulate: dst[i] += scale * src[i]. Replaces a
     /// mulScalarAsync(src, scale) + addResidualAsync(dst, src) pair
@@ -217,7 +218,7 @@ public:
     void scaledAddResidualAsync(float*       dst,
                                 const float* src,
                                 float        scale,
-                                std::size_t  n);
+                                std::size_t  n) override;
 
     /// Per-row symmetric int8 quantisation of an [M, K] f32 matrix.
     /// Writes int8 quants into `y` and per-row scales into `scale`
@@ -229,7 +230,7 @@ public:
                        std::int8_t*   y,
                        float*         scale,
                        std::size_t    M,
-                       std::size_t    K);
+                       std::size_t    K) override;
 
     /// M10.2 Phase 1a Commit 3 — write `T` fp32 rows into a Q8_0-encoded
     /// KV cache slot. `xSrc` is a [T, kvDim] fp32 workspace (typically
@@ -245,7 +246,7 @@ public:
                               void*        kvDst,
                               std::size_t  T,
                               std::size_t  kvDim,
-                              std::size_t  writeOffset);
+                              std::size_t  writeOffset) override;
 
     /// Scatter the output of a fused QKV matmul into the separate Q, K,
     /// V destinations. `fused` has shape [M, Nq + Nkv * (1 + hasV)];
@@ -270,7 +271,7 @@ public:
                        bool             hasV,
                        std::size_t      writeOffset     = 0,
                        runtime::KvDtype kvDtype         = runtime::KvDtype::F32,
-                       bool             useStagingSlot  = false);
+                       bool             useStagingSlot  = false) override;
 
     /// Load-time self-test — run every GPU op with a known input and
     /// compare against a CPU reference within a tight tolerance. Catches
@@ -286,7 +287,7 @@ public:
     /// "pending" | "ok" — populated by selfTest(). Exposed via
     /// /v1/system/status so the deploy can be verified without pulling
     /// docker logs.
-    [[nodiscard]] std::string_view selfTestStatus() const noexcept {
+    [[nodiscard]] std::string_view selfTestStatus() const noexcept override {
         return _selfTestStatus;
     }
 
@@ -294,16 +295,16 @@ public:
     /// features.flashPrefill / features.flashPrefillGqaQ8. Surfaced via
     /// /v1/system/status.kernels.prefill_flash so an operator can
     /// verify the deployed config took effect without reading logs.
-    [[nodiscard]] bool prefillFlashEnabled() const noexcept {
+    [[nodiscard]] bool prefillFlashEnabled() const noexcept override {
         return !_prefillFlashDisabled;
     }
-    [[nodiscard]] bool prefillFlashGqaQ8Enabled() const noexcept {
+    [[nodiscard]] bool prefillFlashGqaQ8Enabled() const noexcept override {
         return !_prefillFlashGqaQ8Disabled;
     }
-    [[nodiscard]] std::size_t prefillFlashKTileQ8() const noexcept {
+    [[nodiscard]] std::size_t prefillFlashKTileQ8() const noexcept override {
         return _prefillFlashKTileQ8;
     }
-    [[nodiscard]] std::string_view prefillFlashKTileQ8Source() const noexcept {
+    [[nodiscard]] std::string_view prefillFlashKTileQ8Source() const noexcept override {
         return _prefillFlashKTileQ8Source;
     }
 
@@ -312,10 +313,10 @@ public:
     /// future GpuMatmul dispatch guard) can distinguish Auto/Force/
     /// Disable without string-matching. String form for status JSON
     /// via `q8_0ReorderModeName()`.
-    [[nodiscard]] core::config::TriState q8_0ReorderMode() const noexcept {
+    [[nodiscard]] core::config::TriState q8_0ReorderMode() const noexcept override {
         return _q8_0ReorderMode;
     }
-    [[nodiscard]] std::string_view q8_0ReorderModeName() const noexcept;
+    [[nodiscard]] std::string_view q8_0ReorderModeName() const noexcept override;
 
     /// Registration hook for backends: called once per tensor that was
     /// successfully reordered at load time. Increments the internal
@@ -326,12 +327,12 @@ public:
     /// Safe to call from any load-time context; no-op is not offered
     /// because the caller already knows they reordered something.
     void noteQ8_0ReorderApplied(std::size_t bytes,
-                                std::string_view label) noexcept;
+                                std::string_view label) noexcept override;
 
-    [[nodiscard]] std::size_t q8_0ReorderTensorCount() const noexcept {
+    [[nodiscard]] std::size_t q8_0ReorderTensorCount() const noexcept override {
         return _q8_0ReorderTensorCount;
     }
-    [[nodiscard]] std::size_t q8_0ReorderTotalBytes() const noexcept {
+    [[nodiscard]] std::size_t q8_0ReorderTotalBytes() const noexcept override {
         return _q8_0ReorderTotalBytes;
     }
 
@@ -408,7 +409,7 @@ public:
                         float             scale,
                         float*            out,
                         std::size_t       slidingWindow = 0,
-                        runtime::KvDtype  kvDtype       = runtime::KvDtype::F32);
+                        runtime::KvDtype  kvDtype       = runtime::KvDtype::F32) override;
 
     /// Compile-time bound on T_k for the **plain-attention fallback**
     /// path (kernels/attention.cl, attention_fp16.cl, attention_q8_0.cl).
@@ -460,7 +461,7 @@ public:
     /// workgroups per attention call for typical short-context chats.
     /// The caller (InferenceEngine) sets this per-generate based on
     /// `prompt_len + params.maxNewTokens`.
-    void setReplayMaxKTiles(std::size_t n) noexcept {
+    void setReplayMaxKTiles(std::size_t n) noexcept override {
         _replayMaxKTiles = n;
     }
 
@@ -482,7 +483,7 @@ public:
                                    std::size_t  N,
                                    std::size_t  K,
                                    const float* x,
-                                   float*       y);
+                                   float*       y) override;
 
     // FlashAttention tuning constants — publicly readable so callers can
     // compute the launch upper bound to hand to setReplayMaxKTiles().
