@@ -403,6 +403,9 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/attention_flash_partial_fp16.hip
         kernels_hip/attention_flash_partial_q8_0.hip
         kernels_hip/attention_fp16.hip
+        kernels_hip/attention_prefill_flash.hip
+        kernels_hip/attention_prefill_flash_fp16.hip
+        kernels_hip/attention_prefill_flash_q8_0.hip
         kernels_hip/attention_q8_0.hip
         kernels_hip/kv_quant_commit_q8_0.hip
         kernels_hip/matmul_q8_0_vec.hip
@@ -1228,6 +1231,46 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_attention_flash_partial_q8_0_probe hip_kernels)
 
     target_link_libraries(hip_attention_flash_partial_q8_0_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_attention_prefill_flash_probe — streaming prefill (f32) --
+    #
+    # Single-workgroup streaming online-softmax for T_q > 1. Small SLM
+    # (~2.5 KiB) so occupancy is unconstrained. 2-case probe (full
+    # causal + SWA) vs monolithic CPU attention.
+
+    add_executable(hip_attention_prefill_flash_probe
+        tools/hip-attention-prefill-flash-probe.cpp
+    )
+
+    add_dependencies(hip_attention_prefill_flash_probe hip_kernels)
+
+    target_link_libraries(hip_attention_prefill_flash_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_attention_prefill_flash_fp16_probe — fp16-KV prefill ----
+
+    add_executable(hip_attention_prefill_flash_fp16_probe
+        tools/hip-attention-prefill-flash-fp16-probe.cpp
+    )
+
+    add_dependencies(hip_attention_prefill_flash_fp16_probe hip_kernels)
+
+    target_link_libraries(hip_attention_prefill_flash_fp16_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_attention_prefill_flash_q8_0_probe — Q8_0-KV prefill ----
+
+    add_executable(hip_attention_prefill_flash_q8_0_probe
+        tools/hip-attention-prefill-flash-q8-0-probe.cpp
+    )
+
+    add_dependencies(hip_attention_prefill_flash_q8_0_probe hip_kernels)
+
+    target_link_libraries(hip_attention_prefill_flash_q8_0_probe PRIVATE
         mimirmind_core_hip
     )
 endif()
