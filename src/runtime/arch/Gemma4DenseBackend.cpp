@@ -3,8 +3,8 @@
 
 #include "runtime/arch/Gemma4DenseBackend.hpp"
 
-#include "compute/l0/GpuMatmul.hpp"
-#include "compute/l0/GpuOps.hpp"
+#include "compute/ComputeMatmul.hpp"
+#include "compute/ComputeOps.hpp"
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "model/LlmConfig.hpp"
@@ -20,8 +20,8 @@ namespace mimirmind::runtime::arch {
 Gemma4DenseBackend::Gemma4DenseBackend(const model::LlmConfig&        config,
                                        const core::gguf::WeightsMap&       weights,
                                        const model::FusedQkvWeights*  fusedQkv,
-                                       compute::l0::GpuOps&               ops,
-                                       compute::l0::GpuMatmul&            gmm,
+                                       compute::ComputeOps&               ops,
+                                       compute::ComputeMatmul&            gmm,
                                        runtime::OpProfiler&           opProfiler)
     : GemmaBaseBackend{config, weights, fusedQkv, ops, gmm, opProfiler} {
     MM_LOG_INFO("gemma4-dense",

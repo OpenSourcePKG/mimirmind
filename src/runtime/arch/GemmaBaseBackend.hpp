@@ -10,10 +10,10 @@
 #include <utility>
 #include <vector>
 
-namespace mimirmind::compute::l0 {
-class GpuMatmul;
-class GpuOps;
-} // namespace mimirmind::compute::l0
+namespace mimirmind::compute {
+class ComputeMatmul;
+class ComputeOps;
+} // namespace mimirmind::compute
 
 namespace mimirmind::core::gguf {
 class WeightsMap;
@@ -90,8 +90,8 @@ protected:
     GemmaBaseBackend(const model::LlmConfig&        config,
                      const core::gguf::WeightsMap&       weights,
                      const model::FusedQkvWeights*  fusedQkv,
-                     compute::l0::GpuOps&               ops,
-                     compute::l0::GpuMatmul&            gmm,
+                     compute::ComputeOps&               ops,
+                     compute::ComputeMatmul&            gmm,
                      runtime::OpProfiler&           opProfiler);
 
     /// Per-layer config snapshot, resolved once at construction. All Gemma-4
@@ -160,8 +160,8 @@ protected:
     const model::LlmConfig&        _config;
     const core::gguf::WeightsMap&       _weights;
     const model::FusedQkvWeights*  _fusedQkv{nullptr};
-    compute::l0::GpuOps&               _ops;
-    compute::l0::GpuMatmul&            _gmm;
+    compute::ComputeOps&               _ops;
+    compute::ComputeMatmul&            _gmm;
     runtime::OpProfiler&           _op;
 
     std::vector<LayerInfo>    _layers;

@@ -10,10 +10,10 @@
 #include <span>
 #include <string>
 
-namespace mimirmind::compute::l0 {
-class GpuMatmul;
-class GpuOps;
-} // namespace mimirmind::compute::l0
+namespace mimirmind::compute {
+class ComputeMatmul;
+class ComputeOps;
+} // namespace mimirmind::compute
 
 namespace mimirmind::core::gguf {
 class WeightsMap;
@@ -47,8 +47,8 @@ public:
     Gemma4Backend(const model::LlmConfig&        config,
                   const core::gguf::WeightsMap&       weights,
                   const model::FusedQkvWeights*  fusedQkv,
-                  compute::l0::GpuOps&               ops,
-                  compute::l0::GpuMatmul&            gmm,
+                  compute::ComputeOps&               ops,
+                  compute::ComputeMatmul&            gmm,
                   runtime::OpProfiler&           opProfiler,
                   bool                           moeGroupEnabled     = true,
                   bool                           moeFusedDownEnabled = false);

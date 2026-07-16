@@ -49,8 +49,8 @@ public:
     Gemma4E4BBackend(const model::LlmConfig&        config,
                      const core::gguf::WeightsMap&       weights,
                      const model::FusedQkvWeights*  fusedQkv,
-                     compute::l0::GpuOps&               ops,
-                     compute::l0::GpuMatmul&            gmm,
+                     compute::ComputeOps&               ops,
+                     compute::ComputeMatmul&            gmm,
                      runtime::OpProfiler&           opProfiler);
 
     void runBlock(std::size_t   blockIdx,

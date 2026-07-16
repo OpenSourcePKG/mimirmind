@@ -439,14 +439,14 @@ void InferenceEngine::finalizeLoad() {
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
     // gracefully with the original architecture string in the error.
-    // Arch backends still take the concrete L0 types (GpuOps / GpuMatmul /
-    // OpProfiler) — the load path is L0-only today (GgufReader.loadTensors
-    // reaches into UsmAllocator), so we're guaranteed to be on L0 here.
-    // If a HIP model-load path lands later, the createArchBackend signature
-    // itself needs to move to the ComputeOps / ComputeMatmul base too.
+    // Schicht 5.1 — arch backends now consume ComputeOps / ComputeMatmul
+    // through the base. `_ops` / `_gmm` are unique_ptr<Base>, deref-passes
+    // the referenced instance. OpProfiler is still L0-only (guarded on
+    // ctor); if a HIP model-load path lands (Schicht 5.2+ around
+    // GgufReader), the profiler needs its own backend-neutral variant.
     _backend = arch::createArchBackend(
         _config.architecture, _config, *_weights, _fusedQkv.get(),
-        l0Ops(), l0Gmm(), _opProfiler.value(), _cfg.features.moeGroup,
+        *_ops, *_gmm, _opProfiler.value(), _cfg.features.moeGroup,
         _cfg.features.moeFusedDown != core::config::TriState::Disable);
 
     _modelLoaded = true;

@@ -4,8 +4,8 @@
 #include "runtime/arch/Gemma4E4BBackend.hpp"
 
 #include "compute/Dequant.hpp"
-#include "compute/l0/GpuMatmul.hpp"
-#include "compute/l0/GpuOps.hpp"
+#include "compute/ComputeMatmul.hpp"
+#include "compute/ComputeOps.hpp"
 #include "core/gpu/l0/CommandQueue.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
@@ -67,8 +67,8 @@ std::uint16_t floatToHalf(float f) noexcept {
 Gemma4E4BBackend::Gemma4E4BBackend(const model::LlmConfig&        config,
                                    const core::gguf::WeightsMap&       weights,
                                    const model::FusedQkvWeights*  fusedQkv,
-                                   compute::l0::GpuOps&               ops,
-                                   compute::l0::GpuMatmul&            gmm,
+                                   compute::ComputeOps&               ops,
+                                   compute::ComputeMatmul&            gmm,
                                    runtime::OpProfiler&           opProfiler)
     : GemmaBaseBackend{config, weights, fusedQkv, ops, gmm, opProfiler} {
     // Per-layer-dim comes from the block-level inp_gate.weight — GGUF
