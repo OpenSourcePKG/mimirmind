@@ -277,6 +277,19 @@ public:
     /// this ops instance's backing allocator.
     [[nodiscard]] virtual ComputeBuffer allocate(std::size_t bytes) = 0;
 
+    /// Synchronous host-to-device copy. Blocks until the transfer is
+    /// visible to subsequent GPU dispatches. Used by loaders that need
+    /// "the mmap bytes must be on the device before we return".
+    ///
+    /// L0 impl is a plain `std::memcpy` — USM is host-visible on the
+    /// target GPU. HIP impl is a blocking `hipMemcpy(hipMemcpyHostToDevice)`.
+    /// Callers should batch multi-tensor loads with a single trailing
+    /// `flush()` if they need cross-tensor ordering; per-tensor this
+    /// call is already ordered against subsequent kernel launches.
+    virtual void uploadHostBytes(void*       deviceDst,
+                                 const void* hostSrc,
+                                 std::size_t bytes) = 0;
+
 protected:
     ComputeOps() = default;
 };

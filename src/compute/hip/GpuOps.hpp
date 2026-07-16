@@ -202,6 +202,8 @@ public:
     // a deleter closure that calls back with the same kind so the
     // deallocate side hits the matching `hipFree` path.
     [[nodiscard]] compute::ComputeBuffer allocate(std::size_t bytes) override;
+    void uploadHostBytes(void* deviceDst, const void* hostSrc,
+                         std::size_t bytes) override;
 
     // ---- HIP-native accessors ----------------------------------------
     //

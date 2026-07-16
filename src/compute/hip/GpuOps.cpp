@@ -450,6 +450,24 @@ compute::ComputeBuffer GpuOps::allocate(std::size_t bytes) {
         &alloc};
 }
 
+// Schicht 5.2 — sync host-to-device copy. Blocking hipMemcpy so the
+// caller can assume the bytes have landed on device by return. The
+// stream-async variant lives on `appendMemoryCopy`; loaders that copy
+// hundreds of tensors in a loop prefer the blocking path for its
+// simpler ordering (no per-tensor flush needed).
+void GpuOps::uploadHostBytes(void*       deviceDst,
+                             const void* hostSrc,
+                             std::size_t bytes) {
+    if (bytes == 0) return;
+    const hipError_t rc = hipMemcpy(
+        deviceDst, hostSrc, bytes, hipMemcpyHostToDevice);
+    if (rc != hipSuccess) {
+        throw std::runtime_error(
+            std::string{"compute::hip::GpuOps::uploadHostBytes: "
+                        "hipMemcpy(H2D) failed: "} + hipGetErrorString(rc));
+    }
+}
+
 // ---- Stubbed kernel-launch overrides --------------------------------
 //
 // Every method below throws `std::runtime_error` with a clear

@@ -327,7 +327,7 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     _tokenizer.loadFromGguf(_reader);
 
     MM_LOG_INFO("engine", "loadModel: copying tensors into USM");
-    _reader.loadTensors(allocator());
+    _reader.loadTensors(*_ops);
 
     _weights.emplace(_reader);
 

@@ -371,6 +371,16 @@ compute::ComputeBuffer GpuOps::allocate(std::size_t bytes) {
         &_alloc};
 }
 
+// Schicht 5.2 — sync host-to-device copy. USM is host-visible on the
+// L0 target GPU, so a plain memcpy already lands in the same memory
+// the GPU reads from. No stream/queue involvement needed.
+void GpuOps::uploadHostBytes(void*       deviceDst,
+                             const void* hostSrc,
+                             std::size_t bytes) {
+    if (bytes == 0) return;
+    std::memcpy(deviceDst, hostSrc, bytes);
+}
+
 GpuOps::~GpuOps() {
     if (_flashPartialUsm != nullptr) {
         _alloc.deallocate(_flashPartialUsm, _flashPartialBytes);

@@ -3,8 +3,8 @@
 
 #include "core/gguf/GgufReader.hpp"
 
+#include "compute/ComputeOps.hpp"
 #include "core/log/Log.hpp"
-#include "core/gpu/l0/UsmAllocator.hpp"
 #include "munin/ChunkAllocator.hpp"
 
 #include <cstring>
@@ -262,7 +262,7 @@ void GgufReader::open(std::string_view path) {
                 _tensorDataOffset, bytesToMiB(_totalTensorBytes));
 }
 
-void GgufReader::loadTensors(core::l0::UsmAllocator& allocator) {
+void GgufReader::loadTensors(compute::ComputeOps& ops) {
     if (!_file.isOpen()) {
         throw std::runtime_error("GgufReader::loadTensors: not open");
     }
@@ -272,24 +272,22 @@ void GgufReader::loadTensors(core::l0::UsmAllocator& allocator) {
             "loadTensorsIntoChunks — mixing ownership regimes is not "
             "supported");
     }
-    if (_allocator != nullptr && _allocator != &allocator) {
+    if (!_tensorBuffers.empty()) {
         throw std::runtime_error(
-            "GgufReader::loadTensors: already loaded with a different allocator");
+            "GgufReader::loadTensors: reader already loaded once — "
+            "second call to loadTensors is not supported");
     }
-    _allocator = &allocator;
 
     MM_LOG_INFO("gguf",
-                "loading {} tensor(s) into USM ({:.2f} MiB total)",
+                "loading {} tensor(s) into device memory ({:.2f} MiB total)",
                 _tensors.size(), bytesToMiB(_totalTensorBytes));
+
+    _tensorBuffers.reserve(_tensors.size());
 
     std::size_t loadedBytes = 0;
     std::size_t loadedCount = 0;
 
     for (auto& t : _tensors) {
-        if (t.usmPtr != nullptr) {
-            continue;
-        }
-
         const std::size_t absOffset = _tensorDataOffset +
                                       static_cast<std::size_t>(t.fileOffset);
         if (absOffset + t.nbytes > _file.size()) {
@@ -301,8 +299,10 @@ void GgufReader::loadTensors(core::l0::UsmAllocator& allocator) {
                 "GgufReader::loadTensors: tensor data out of bounds for " + t.name);
         }
 
-        t.usmPtr = allocator.allocate(t.nbytes);
-        std::memcpy(t.usmPtr, _file.data() + absOffset, t.nbytes);
+        auto buf = ops.allocate(t.nbytes);
+        ops.uploadHostBytes(buf.get(), _file.data() + absOffset, t.nbytes);
+        t.usmPtr = buf.get();
+        _tensorBuffers.push_back(std::move(buf));
 
         loadedBytes += t.nbytes;
         ++loadedCount;
@@ -319,7 +319,7 @@ void GgufReader::loadTensors(core::l0::UsmAllocator& allocator) {
     }
 
     MM_LOG_INFO("gguf",
-                "load complete: {} tensor(s), {:.2f} MiB now in USM",
+                "load complete: {} tensor(s), {:.2f} MiB now on device",
                 loadedCount, bytesToMiB(loadedBytes));
 
     // The mmap'd file is no longer needed — every byte we care about is
@@ -341,7 +341,7 @@ void GgufReader::loadTensorsIntoChunks(::mimirmind::munin::ChunkAllocator& chunk
         throw std::runtime_error(
             "GgufReader::loadTensorsIntoChunks: not open");
     }
-    if (_allocator != nullptr) {
+    if (!_tensorBuffers.empty()) {
         throw std::runtime_error(
             "GgufReader::loadTensorsIntoChunks: reader already loaded via "
             "loadTensors — mixing ownership regimes is not supported");
@@ -416,14 +416,16 @@ void GgufReader::loadTensorsIntoChunks(::mimirmind::munin::ChunkAllocator& chunk
 }
 
 void GgufReader::close() noexcept {
-    if (_allocator != nullptr) {
+    // Schicht 5.2 — per-tensor device allocations are RAII-owned by
+    // `_tensorBuffers`. Clearing the vector drops every ComputeBuffer,
+    // whose deleter closure calls back into the backend allocator that
+    // originally handed it out. `t.usmPtr` aliases die with the buffers
+    // — null them so the reader stops pointing at freed memory.
+    if (!_tensorBuffers.empty()) {
         for (auto& t : _tensors) {
-            if (t.usmPtr != nullptr) {
-                _allocator->deallocate(t.usmPtr, t.nbytes);
-                t.usmPtr = nullptr;
-            }
+            t.usmPtr = nullptr;
         }
-        _allocator = nullptr;
+        _tensorBuffers.clear();
     }
     // Chunk-loaded tensors: the ChunkAllocator owns the memory. Just
     // null the raw pointers so the reader forgets its view — the actual

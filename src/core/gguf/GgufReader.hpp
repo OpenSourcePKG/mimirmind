@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "compute/ComputeBuffer.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "core/os/MappedFile.hpp"
 
@@ -14,8 +15,8 @@
 #include <variant>
 #include <vector>
 
-namespace mimirmind::core::l0 {
-class UsmAllocator;
+namespace mimirmind::compute {
+class ComputeOps;
 }
 
 namespace mimirmind::munin {
@@ -84,10 +85,16 @@ public:
     /// unsupported version / truncated file / unknown tensor type.
     void open(std::string_view path);
 
-    /// Allocate per-tensor USM via `allocator` and memcpy the payload from
-    /// the mmap. Idempotent. Throws if a tensor's offset/size walks off
-    /// the end of the file.
-    void loadTensors(core::l0::UsmAllocator& allocator);
+    /// Allocate per-tensor device memory via `ops.allocate()` and upload
+    /// the payload from the mmap via `ops.uploadHostBytes()`. The reader
+    /// takes ownership of the allocated buffers (RAII via ComputeBuffer);
+    /// `t.usmPtr` remains a raw void* into the device allocation, valid
+    /// for the reader's lifetime or until `close()`.
+    ///
+    /// Single-shot: throws if `loadTensors` or `loadTensorsIntoChunks`
+    /// already ran on this reader. Throws if a tensor's offset/size
+    /// walks off the end of the mmap'd file.
+    void loadTensors(compute::ComputeOps& ops);
 
     /// Munin-side load path. Packs every tensor into `chunks` via
     /// bump-allocation and memcpy'ies the payload from the mmap. Each
@@ -125,10 +132,16 @@ private:
     std::size_t                          _totalTensorBytes{0};
     std::map<std::string, MetadataValue> _metadata{};
     std::vector<GgufTensor>              _tensors{};
-    core::l0::UsmAllocator*               _allocator{nullptr};
+    // Schicht 5.2 — per-tensor RAII owners of the device allocations
+    // that `loadTensors()` populated. Empty until loadTensors runs.
+    // `t.usmPtr` in `_tensors` aliases the corresponding buffer's
+    // raw pointer for downstream (WeightsMap / arch backends) that
+    // still expect a plain void*. `close()` clears the vector to
+    // release everything.
+    std::vector<compute::ComputeBuffer>   _tensorBuffers{};
     // True once loadTensorsIntoChunks() ran successfully. Blocks close()
-    // from calling per-tensor deallocate() — chunk memory is owned by
-    // the ChunkAllocator and freed as a whole when it is destroyed.
+    // from touching `_tensorBuffers` — chunk memory is owned by the
+    // ChunkAllocator and freed as a whole when it is destroyed.
     bool                                  _chunkLoaded{false};
 };
 
