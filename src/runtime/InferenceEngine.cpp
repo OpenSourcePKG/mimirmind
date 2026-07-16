@@ -408,35 +408,47 @@ void InferenceEngine::finalizeLoad() {
     // at load time (quality neutral-to-better, ~70 MiB overhead on E4B).
     const bool requantToQ8_0 =
         (_config.architecture == "gemma4") && (_config.sharedKvLayers > 0);
-    _fusedQkv = std::make_unique<model::FusedQkvWeights>(
-        *_weights, allocator(), _config.blockCount,
-        _cfg.features.fusedQkv,
-        _config.sharedKvLayers, requantToQ8_0,
-        /*q8_0ReorderEnabled=*/
-        _cfg.features.q8_0Reorder != core::config::TriState::Disable);
+    // Schicht 5.4 — FusedQkvWeights + load-time diagnostics are L0-only.
+    // On HIP `_fusedQkv` stays nullptr (downstream code already handles
+    // "fusion off"). selfTest / autotune / autotune-KTile-Q8 stay skipped
+    // — they exercise the L0 SPV kernels via UsmAllocator; the HIP-side
+    // equivalents don't exist yet and aren't blockers for a load attempt.
+    if (_computeCtx->kind() == core::backend::BackendKind::LevelZero) {
+        _fusedQkv = std::make_unique<model::FusedQkvWeights>(
+            *_weights, allocator(), _config.blockCount,
+            _cfg.features.fusedQkv,
+            _config.sharedKvLayers, requantToQ8_0,
+            /*q8_0ReorderEnabled=*/
+            _cfg.features.q8_0Reorder != core::config::TriState::Disable);
 
-    // M8.K.Q8_0-Reorder Phase 5b — register every fused-QKV block that
-    // grew a reorder-layout copy with GpuOps so the /v1/system/status
-    // .kernels.q8_0_reorder counter reflects the real number of
-    // tensors on the reorder path. One note per block keeps the
-    // tensor-count accurate (~24 fused blocks in E4B post-shared-KV
-    // filtering) instead of collapsing them into a single hit.
-    for (std::size_t b = 0; b < _fusedQkv->numBlocks(); ++b) {
-        const auto* blk = _fusedQkv->at(b);
-        if (blk == nullptr || blk->reorderUsmPtr == nullptr) continue;
-        _ops->noteQ8_0ReorderApplied(
-            blk->reorderBytes,
-            "fused_qkv[" + std::to_string(b) + "]");
+        // M8.K.Q8_0-Reorder Phase 5b — register every fused-QKV block that
+        // grew a reorder-layout copy with GpuOps so the /v1/system/status
+        // .kernels.q8_0_reorder counter reflects the real number of
+        // tensors on the reorder path. One note per block keeps the
+        // tensor-count accurate (~24 fused blocks in E4B post-shared-KV
+        // filtering) instead of collapsing them into a single hit.
+        for (std::size_t b = 0; b < _fusedQkv->numBlocks(); ++b) {
+            const auto* blk = _fusedQkv->at(b);
+            if (blk == nullptr || blk->reorderUsmPtr == nullptr) continue;
+            _ops->noteQ8_0ReorderApplied(
+                blk->reorderBytes,
+                "fused_qkv[" + std::to_string(b) + "]");
+        }
+
+        // M5i.D: Load-time self-tests of the GPU compute path. selfTest
+        // verifies every non-matmul GPU op against a CPU reference on a
+        // tiny fixed input — catches broken SPV loads and driver bugs on
+        // unfamiliar iGPU µarchs. autotune runs a matvec-vs-GEMM micro-
+        // bench (with its own parity gate) and pins the dispatch decision
+        // per QuantType. Honours `features.gemm` / `features.dp4a`.
+        l0Ops().selfTest(allocator());
+        l0Gmm().autotune(allocator(), _config.embeddingLength, _cfg.features);
+    } else {
+        MM_LOG_INFO("engine",
+                    "non-L0 backend ({}) — skipping FusedQkvWeights, "
+                    "GPU-op self-test, and matmul autotune (L0-only paths)",
+                    core::backend::BackendRegistry::name(_computeCtx->kind()));
     }
-
-    // M5i.D: Load-time self-tests of the GPU compute path. selfTest
-    // verifies every non-matmul GPU op against a CPU reference on a
-    // tiny fixed input — catches broken SPV loads and driver bugs on
-    // unfamiliar iGPU µarchs. autotune runs a matvec-vs-GEMM micro-
-    // bench (with its own parity gate) and pins the dispatch decision
-    // per QuantType. Honours `features.gemm` / `features.dp4a`.
-    l0Ops().selfTest(allocator());
-    l0Gmm().autotune(allocator(), _config.embeddingLength, _cfg.features);
 
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
@@ -599,15 +611,17 @@ void InferenceEngine::setKvDtype(KvDtype dtype) {
     // storage. Guards inside `autotuneKTileQ8` early-out with an info
     // log for every other case. Uses SWA head_dim when available (most
     // Gemma 4 layers) since that's the geometry the packed kernel spends
-    // most of its time on.
-    const std::size_t autotuneHeadDim = static_cast<std::size_t>(
-        _config.keyLengthSwa > 0 ? _config.keyLengthSwa
-                                 : _config.keyLength);
-    l0Ops().autotuneKTileQ8(allocator(),
-                         static_cast<std::size_t>(_config.headCount),
-                         static_cast<std::size_t>(_config.headCountKv),
-                         autotuneHeadDim,
-                         _kvDtype);
+    // most of its time on. L0-only — driven by the L0 kernel-bench path.
+    if (_computeCtx->kind() == core::backend::BackendKind::LevelZero) {
+        const std::size_t autotuneHeadDim = static_cast<std::size_t>(
+            _config.keyLengthSwa > 0 ? _config.keyLengthSwa
+                                     : _config.keyLength);
+        l0Ops().autotuneKTileQ8(allocator(),
+                             static_cast<std::size_t>(_config.headCount),
+                             static_cast<std::size_t>(_config.headCountKv),
+                             autotuneHeadDim,
+                             _kvDtype);
+    }
 }
 
 void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
