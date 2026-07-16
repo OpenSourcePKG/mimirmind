@@ -158,7 +158,7 @@ belong in the file.
 
 | Section | What it controls |
 |---|---|
-| `models[]` | Loadable model entries (id + path). Multi-model is schema-ready; the loader today accepts one `loadOnStart:true` entry. |
+| `models[]` | Loadable model entries (id + path). A standalone mimirmind worker binds to one model at start; **Munin** (see below) holds every `loadOnStart:true` entry resident in USM at once, and attached workers pick one by id. `speculative` additionally binds a draft alongside the target inside the same worker. |
 | `server` | Port, log level, log file. |
 | `runtime` | KV dtype (`f32`/`q8_0`), max context tokens, USM probe cap, SPV dir, preserve-thinking. Per-model overrides via `models[].runtime`. |
 | `features` | `clr`, `flashPrefill`, `fusedQkv`, `moeGroup`, `gemm` (auto/force/disable), `gemmV2`, `gemmMinM`, `dp4a`. |
@@ -214,6 +214,14 @@ Gemma 4 31B dense variant. On UMA hardware this is mostly a
 page-table-shuffle problem, not the PCIe-bandwidth problem it is on
 discrete GPUs.
 
+**AMD/HIP backend.** The compute layer is being lifted behind a
+`ComputeContext` abstraction on `main`, and a HIP/ROCm implementation
+targeting RDNA3 (`gfx1101`, RX 7800 XT bring-up rig) is in flight on
+`feat/hip-backend-skeleton` — kernel-by-kernel port from the Level-Zero
+side, each verified against the CPU-reference math. Meteor-Lake Xe-LPG
+remains the primary target; HIP opens a second hardware family without
+introducing SYCL or a vendor-neutral graph compiler.
+
 **Pegenaut backend.** MimirMind is the inference half of a TypeScript
 RAG stack we're building in parallel. The two will ship as a unit.
 
@@ -232,11 +240,16 @@ named after Odin's ravens, each aligned with what it carries.
 </p>
 
 **Munin — memory.** The persistent model-memory daemon. Munin loads
-GGUF weights once into shared USM and keeps them resident across
-inference-worker restarts, serving short-lived attached workers over a
-chunk-based IPC. Implemented and prod-shaped; lives in
+**one or more** GGUF models once into shared USM and keeps them resident
+across inference-worker restarts, serving short-lived attached workers
+over a chunk-based IPC. A single Munin process holds every
+`loadOnStart:true` entry from `config.json` simultaneously, in one shared
+USM pool; each attached worker binds to one model by id at attach time.
+Cold-restart the worker to swap models, or run multiple workers in
+parallel — Munin doesn't reload. Implemented and prod-shaped; lives in
 [`src/munin/`](src/munin/) and ships via
-[`docker-compose.munin.yml`](docker-compose.munin.yml).
+[`docker-compose.munin.yml`](docker-compose.munin.yml). Per-request model
+switching *from a single worker* is M-Munin.3, still open.
 See [`doc/attached-rollout.md`](doc/attached-rollout.md) for the
 rollout runbook.
 
