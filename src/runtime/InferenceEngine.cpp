@@ -502,7 +502,7 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     // workspace: rmsnorm_qkv + RoPE run fp32-in-place there and then
     // `kv_quant_commit_q8_0` folds the rows into the Q8_0 cache slot.
     const bool withKvFp32Scratch = (_kvDtype == KvDtype::Q8_0);
-    _blockBuffers = allocBlockBuffers(allocator(), _config,
+    _blockBuffers = allocBlockBuffers(_ops, _config,
                                       maxT, _maxContextTokens,
                                       qDimMax, kvDimMax,
                                       withFusedQkv,

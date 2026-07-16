@@ -352,6 +352,25 @@ void GpuOps::flush() {
     _queue.flush();
 }
 
+// Schritt 3c.2 — neutral buffer factory. Consumers that used to build
+// `core::l0::UsmHandle{allocator(), bytes}` call `_ops.allocate(bytes)`
+// instead; the returned ComputeBuffer carries the deleter that calls
+// back into UsmAllocator::deallocate. Zero-byte request skips the
+// allocator to preserve UsmHandle-default-ctor parity.
+compute::ComputeBuffer GpuOps::allocate(std::size_t bytes) {
+    if (bytes == 0) {
+        return {};
+    }
+    void* ptr = _alloc.allocate(bytes);
+    return compute::ComputeBuffer{
+        ptr,
+        bytes,
+        [](void* p, std::size_t b, void* ctx) noexcept {
+            static_cast<core::l0::UsmAllocator*>(ctx)->deallocate(p, b);
+        },
+        &_alloc};
+}
+
 GpuOps::~GpuOps() {
     if (_flashPartialUsm != nullptr) {
         _alloc.deallocate(_flashPartialUsm, _flashPartialBytes);

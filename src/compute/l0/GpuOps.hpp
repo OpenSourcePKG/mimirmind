@@ -336,6 +336,11 @@ public:
     void appendMemoryCopy(void* dst, const void* src, std::size_t bytes) override;
     void flush() override;
 
+    // Schritt 3c.2 — neutral buffer factory. Wraps `_alloc` (UsmAllocator)
+    // and installs a deleter closure so the returned buffer releases
+    // itself into the same allocator on destruction.
+    [[nodiscard]] compute::ComputeBuffer allocate(std::size_t bytes) override;
+
     [[nodiscard]] std::size_t q8_0ReorderTensorCount() const noexcept override {
         return _q8_0ReorderTensorCount;
     }

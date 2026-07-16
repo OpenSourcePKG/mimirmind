@@ -197,6 +197,12 @@ public:
     void appendMemoryCopy(void* dst, const void* src, std::size_t bytes) override;
     void flush() override;
 
+    // Schritt 3c.2 — neutral buffer factory. Routes through the shared
+    // `HipMemoryAllocator` in `HipAllocKind::Device` mode and installs
+    // a deleter closure that calls back with the same kind so the
+    // deallocate side hits the matching `hipFree` path.
+    [[nodiscard]] compute::ComputeBuffer allocate(std::size_t bytes) override;
+
     // ---- HIP-native accessors ----------------------------------------
     //
     // Mirror `GpuOps::queue()` / `allocator()` — consumers that need

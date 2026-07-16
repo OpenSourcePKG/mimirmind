@@ -429,6 +429,27 @@ void GpuOps::flush() {
     _ctx.stream().synchronize();
 }
 
+// Schritt 3c.2 — neutral buffer factory. Zero-byte request skips the
+// allocator to keep parity with the L0 side and with the empty
+// ComputeBuffer default-ctor semantics. The deleter closure captures
+// `HipAllocKind::Device` implicitly — every buffer this method hands
+// out goes back through the device-free path on destruction.
+compute::ComputeBuffer GpuOps::allocate(std::size_t bytes) {
+    if (bytes == 0) {
+        return {};
+    }
+    auto& alloc = _ctx.allocator();
+    void* ptr = alloc.allocate(bytes, core::hip::HipAllocKind::Device);
+    return compute::ComputeBuffer{
+        ptr,
+        bytes,
+        [](void* p, std::size_t b, void* ctx) noexcept {
+            static_cast<core::hip::HipMemoryAllocator*>(ctx)
+                ->deallocate(p, b, core::hip::HipAllocKind::Device);
+        },
+        &alloc};
+}
+
 // ---- Stubbed kernel-launch overrides --------------------------------
 //
 // Every method below throws `std::runtime_error` with a clear

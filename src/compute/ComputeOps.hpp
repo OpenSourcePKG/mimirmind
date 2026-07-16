@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "compute/ComputeBuffer.hpp"
 #include "core/config/Config.hpp"
 #include "runtime/KvCache.hpp"
 
@@ -255,6 +256,26 @@ public:
     /// but reachable through the ops interface for callers that only
     /// hold `ComputeOps&`.
     virtual void flush() = 0;
+
+    // ---- Allocation (Schritt 3c.2) ------------------------------------
+    //
+    // Neutral buffer factory. Consumers that used to construct
+    // `core::l0::UsmHandle{allocator(), bytes}` now call
+    // `ops.allocate(bytes)` and hold the resulting `ComputeBuffer` as
+    // a value member (see `runtime::BlockBuffers`). The concrete
+    // backend installs a deleter closure at allocate() time; the
+    // buffer releases itself on destruction without depending on any
+    // backend type.
+    //
+    // A zero-byte request returns an empty `ComputeBuffer` (deleter
+    // unset, dtor is a no-op) — mirrors the current UsmHandle default-
+    // ctor semantics.
+
+    /// Allocate `bytes` of device-visible memory. Throws (backend-
+    /// dependent exception type) on driver failure. Returned buffer
+    /// owns the allocation and frees it via the deleter installed by
+    /// this ops instance's backing allocator.
+    [[nodiscard]] virtual ComputeBuffer allocate(std::size_t bytes) = 0;
 
 protected:
     ComputeOps() = default;
