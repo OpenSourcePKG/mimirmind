@@ -634,7 +634,7 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     // realloc-and-reset path and lose every cached token.
     if (_kvCache == nullptr) {
         _kvCache = std::make_unique<KvCache>(
-            allocator(), _maxContextTokens,
+            *_ops, _maxContextTokens,
             _backend->kvDimPerLayer(),
             _backend->kvSourceLayerPerLayer(),
             _kvDtype);
@@ -1075,8 +1075,15 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // are structural to MoE and would need a GPU-side gather +
         // stable-record refactor to fix cleanly; until that lands, MoE
         // decode runs in immediate mode.
+        // Schicht 5.5 — CLR record/replay lives on the L0 CommandQueue.
+        // HIP has no equivalent (hipGraph would be the door, but not
+        // wired). Adding the kind-gate here disables every downstream
+        // `l0Ops().queue()` / `curLenSlot()` call in the decode path
+        // via the existing `if (clrEnabled)` blocks — one flag, all
+        // sites covered.
         const bool clrEnabled =
-            clrEnvOn && (_config.expertCount == 0);
+            clrEnvOn && (_config.expertCount == 0) &&
+            (_computeCtx->kind() == core::backend::BackendKind::LevelZero);
         if (clrEnvOn && _config.expertCount > 0) {
             MM_LOG_WARN("engine",
                         "features.clr=true requested but disabled "

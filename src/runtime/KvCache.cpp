@@ -3,8 +3,8 @@
 
 #include "runtime/KvCache.hpp"
 
+#include "compute/ComputeOps.hpp"
 #include "core/log/Log.hpp"
-#include "core/gpu/l0/UsmAllocator.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -13,30 +13,28 @@
 
 namespace mimirmind::runtime {
 
-KvCache::KvCache(UsmAllocator&            alloc,
+KvCache::KvCache(compute::ComputeOps&     ops,
                  std::size_t              maxSeq,
                  std::vector<std::size_t> kvDimPerLayer,
                  std::vector<std::size_t> kvSourceLayer,
                  KvDtype                  dtype)
-    : _alloc{alloc},
-      _maxSeq{maxSeq},
+    : _maxSeq{maxSeq},
       _kvDim{std::move(kvDimPerLayer)},
       _dtype{dtype},
       _kvSource{std::move(kvSourceLayer)} {
-    allocateLayers();
+    allocateLayers(ops);
 }
 
-KvCache::KvCache(UsmAllocator& alloc,
+KvCache::KvCache(compute::ComputeOps& ops,
                  std::size_t   nLayers,
                  std::size_t   maxSeq,
                  std::size_t   nKvHeads,
                  std::size_t   headDim,
                  KvDtype       dtype)
-    : _alloc{alloc},
-      _maxSeq{maxSeq},
+    : _maxSeq{maxSeq},
       _kvDim(nLayers, nKvHeads * headDim),
       _dtype{dtype} {
-    allocateLayers();
+    allocateLayers(ops);
 }
 
 namespace {
@@ -52,9 +50,13 @@ const char* dtypeName(KvDtype d) noexcept {
 
 } // namespace
 
-void KvCache::allocateLayers() {
+void KvCache::allocateLayers(compute::ComputeOps& ops) {
     const std::size_t nLayers = _kvDim.size();
     _layerBytes.assign(nLayers, 0);
+    _kOwners.clear();
+    _vOwners.clear();
+    _kOwners.resize(nLayers);
+    _vOwners.resize(nLayers);
     _kBuf.assign(nLayers, nullptr);
     _vBuf.assign(nLayers, nullptr);
 
@@ -102,14 +104,18 @@ void KvCache::allocateLayers() {
         maxDim = std::max(maxDim, _kvDim[i]);
         if (src == i) {
             _layerBytes[i] = bytes;
-            _kBuf[i] = _alloc.allocate(bytes);
-            _vBuf[i] = _alloc.allocate(bytes);
+            _kOwners[i] = ops.allocate(bytes);
+            _vOwners[i] = ops.allocate(bytes);
+            _kBuf[i] = _kOwners[i].get();
+            _vBuf[i] = _vOwners[i].get();
             ownedBytes += 2 * bytes;
             ++ownCount;
         } else {
             // Source must have been visited already (src < i) — the
             // backend guarantees this via the shared-KV offset math.
-            _layerBytes[i] = 0;                // marker: don't dealloc
+            // Owner slot stays empty (default-constructed ComputeBuffer);
+            // the raw pointers alias into the source's owning buffer.
+            _layerBytes[i] = 0;
             _kBuf[i] = _kBuf[src];
             _vBuf[i] = _vBuf[src];
             savedBytes += 2 * bytes;
@@ -134,13 +140,13 @@ void KvCache::allocateLayers() {
                 ownCount, aliasCount, totalMiB, savedMiB);
 }
 
-KvCache::~KvCache() {
-    for (std::size_t i = 0; i < _kBuf.size(); ++i) {
-        if (_layerBytes[i] == 0) continue;   // aliased — source owns
-        _alloc.deallocate(_kBuf[i], _layerBytes[i]);
-        _alloc.deallocate(_vBuf[i], _layerBytes[i]);
-    }
-}
+// Schicht 5.5 — ComputeBuffer RAII replaces the manual dealloc loop.
+// Aliased layers hold an empty owner and their raw pointers alias the
+// source layer's ComputeBuffer, so the vector's destructor cleans up
+// exactly the owned allocations and leaves the aliases as dangling
+// void* — which is fine because the source layer that owns the memory
+// is destroyed at the same moment.
+KvCache::~KvCache() = default;
 
 void* KvCache::writeSlotK(std::size_t layer) noexcept {
     // Dtype-aware byte stride per row. For F32/FP16 this is
