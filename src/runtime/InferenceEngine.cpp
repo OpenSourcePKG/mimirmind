@@ -229,16 +229,18 @@ InferenceEngine::InferenceEngine(const Config& cfg)
                 "InferenceEngine: runtime bound to backend '{}'",
                 core::backend::BackendRegistry::name(kind));
 
-    // OpProfiler is L0-native (uses L0 CommandQueue::flush + dispatchCount).
-    // Only wire it up when the runtime picked L0; HIP path leaves the
-    // optional empty and the arch-backend construction deref-throws with
-    // a clear diagnostic if a HIP model-load is ever attempted before
-    // the profiler grows a backend-neutral variant.
+    // OpProfiler wiring — the L0 timing pipeline needs the L0
+    // CommandQueue; on HIP we emplace a no-op instance (Schicht 5.3
+    // default ctor) so arch-backend deref of `_opProfiler.value()`
+    // stays valid regardless of backend. Every `mark/finish/dump`
+    // call is behind an `if (!_enabled) return` early-return anyway.
     if (kind == core::backend::BackendKind::LevelZero) {
         _opProfiler.emplace(l0ComputeContext().queue(),
                             cfg.diagnostics.traceOpTimes);
         MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");
         allocator().probeLimits();
+    } else {
+        _opProfiler.emplace();  // disabled no-op profiler for non-L0
     }
 
     if (cfg.diagnostics.traceBlock0) {

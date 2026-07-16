@@ -42,7 +42,15 @@ public:
         NUM
     };
 
+    /// Default: disabled profiler with no CommandQueue attached. Every
+    /// method is a no-op. Consumed by the HIP path of InferenceEngine
+    /// (Schicht 5.3) so arch backends always get a valid `OpProfiler&`
+    /// reference regardless of the runtime backend. The queue-based
+    /// L0 timing path is unreachable through this ctor.
+    OpProfiler() noexcept = default;
+
     /// `enabled` maps to `diagnostics.traceOpTimes` in config.json.
+    /// L0-only — needs a CommandQueue for the flush-and-time pipeline.
     OpProfiler(CommandQueue& queue, bool enabled);
 
     [[nodiscard]] bool enabled() const noexcept { return _enabled; }
@@ -68,8 +76,10 @@ private:
         static_cast<std::size_t>(Cat::NUM);
     static constexpr std::size_t kDumpEvery = 50;
 
-    bool                                     _enabled;
-    CommandQueue&                            _queue;
+    bool                                     _enabled{false};
+    // Pointer so the default ctor can leave it null; every access site
+    // is behind an `if (!_enabled) return` gate so the null is safe.
+    CommandQueue*                            _queue{nullptr};
     Cat                                      _cur{Cat::NORM};
     bool                                     _active{false};
     std::chrono::steady_clock::time_point    _t0{};
