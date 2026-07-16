@@ -107,12 +107,15 @@ InferenceEngine::InferenceEngine(const Config& cfg)
           .spvDirOverride    = std::string{cfg.runtime.spvDir.value_or("")},
           .usmProbeTotalGiB  = cfg.runtime.usmProbeTotalGib,
           .usmKindOverride   = std::nullopt}},
-      _ops{_computeCtx,
-           cfg.features.flashPrefill,
-           cfg.features.flashPrefillGqaQ8,
-           cfg.features.flashPrefillKTileQ8,
-           cfg.features.q8_0Reorder},
-      _gmm{_computeCtx, _ops},
+      _ops{std::make_unique<compute::l0::GpuOps>(
+          _computeCtx,
+          cfg.features.flashPrefill,
+          cfg.features.flashPrefillGqaQ8,
+          cfg.features.flashPrefillKTileQ8,
+          cfg.features.q8_0Reorder)},
+      _gmm{std::make_unique<compute::l0::GpuMatmul>(
+          _computeCtx,
+          static_cast<compute::l0::GpuOps&>(*_ops))},
       _opProfiler{_computeCtx.queue(), cfg.diagnostics.traceOpTimes} {
     MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");
     allocator().probeLimits();
@@ -265,7 +268,7 @@ void InferenceEngine::finalizeLoad() {
     for (std::size_t b = 0; b < _fusedQkv->numBlocks(); ++b) {
         const auto* blk = _fusedQkv->at(b);
         if (blk == nullptr || blk->reorderUsmPtr == nullptr) continue;
-        _ops.noteQ8_0ReorderApplied(
+        _ops->noteQ8_0ReorderApplied(
             blk->reorderBytes,
             "fused_qkv[" + std::to_string(b) + "]");
     }
@@ -276,8 +279,8 @@ void InferenceEngine::finalizeLoad() {
     // unfamiliar iGPU µarchs. autotune runs a matvec-vs-GEMM micro-
     // bench (with its own parity gate) and pins the dispatch decision
     // per QuantType. Honours `features.gemm` / `features.dp4a`.
-    _ops.selfTest(allocator());
-    _gmm.autotune(allocator(), _config.embeddingLength, _cfg.features);
+    l0Ops().selfTest(allocator());
+    l0Gmm().autotune(allocator(), _config.embeddingLength, _cfg.features);
 
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
@@ -439,7 +442,7 @@ void InferenceEngine::setKvDtype(KvDtype dtype) {
     const std::size_t autotuneHeadDim = static_cast<std::size_t>(
         _config.keyLengthSwa > 0 ? _config.keyLengthSwa
                                  : _config.keyLength);
-    _ops.autotuneKTileQ8(allocator(),
+    l0Ops().autotuneKTileQ8(allocator(),
                          static_cast<std::size_t>(_config.headCount),
                          static_cast<std::size_t>(_config.headCountKv),
                          autotuneHeadDim,
@@ -508,10 +511,10 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
                                       withFusedQkv,
                                       withKvFp32Scratch);
 
-    _xBufH      = _ops.allocate(maxT      * d_model  * sizeof(float));
-    _normFinalH = _ops.allocate(d_model   * sizeof(float));
-    _logitsH    = _ops.allocate(vocab_lm  * sizeof(float));
-    _logitsScH  = _ops.allocate(d_model   * sizeof(float));
+    _xBufH      = _ops->allocate(maxT      * d_model  * sizeof(float));
+    _normFinalH = _ops->allocate(d_model   * sizeof(float));
+    _logitsH    = _ops->allocate(vocab_lm  * sizeof(float));
+    _logitsScH  = _ops->allocate(d_model   * sizeof(float));
 
     _cacheMaxT     = maxT;
     _cacheVocabLm  = vocab_lm;
@@ -528,7 +531,7 @@ InferenceEngine::sampleNext(const float*                   hidden,
                             std::span<const std::int32_t>  recentTokens,
                             const compute::SamplingParams& sampling) {
     // Final-norm runs on the same queue as the residual-add that
-    // produced `hidden`. The subsequent _gmm.matmul flushes and syncs,
+    // produced `hidden`. The subsequent _gmm->matmul flushes and syncs,
     // so CPU argmax sees a fully-resolved logits buffer.
     //
     // Both Qwen and Gemma 4 use plain `w * rms_norm(x)` at runtime:
@@ -537,13 +540,13 @@ InferenceEngine::sampleNext(const float*                   hidden,
     // norm_shift = 0.0 because the HF reference uses standard weight
     // (init at 1.0) — so the GGUF weight is already the multiplicative
     // scale.
-    _ops.rmsNormAsync(
+    _ops->rmsNormAsync(
         hidden, 1, _config.embeddingLength,
         static_cast<const float*>(outNorm.usmPtr),
         _config.rmsNormEps,
         normScratch);
 
-    _gmm.matmul(
+    _gmm->matmul(
         lmHead.type, lmHead.usmPtr,
         vocab_lm, _config.embeddingLength,
         normScratch, 1,
@@ -690,7 +693,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         : 1.0F;
     auto scaleEmbeddingIfNeeded = [&](float* dst, std::size_t T) {
         if (embedScaleEnabled && T > 0) {
-            _ops.mulScalarAsync(dst, embedScale, T * d_model);
+            _ops->mulScalarAsync(dst, embedScale, T * d_model);
         }
     };
 
@@ -758,7 +761,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             // parity-diff reports a spurious factor-of-sqrt(n_embd)
             // divergence (RMSNorm inside block 0 cancels it so the
             // rest of the pipeline still runs on the scaled value).
-            _ops.flush();
+            _ops->flush();
             const std::string fname =
                 dumpPrefix + "-blk0-inp_scaled.bin";
             std::ofstream f(fname, std::ios::binary);
@@ -892,7 +895,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // sampler emits noise tokens. Confirmed on L0_TARGET_HOST with
         // Gemma 4 26B-A4B-it-Q6_K under both KvDtype::F32 and
         // KvDtype::Q8_0. The router matmul is also synchronous
-        // (`_gmm.matmul`, not `matmulAsync`) which flushes the recording
+        // (`_gmm->matmul`, not `matmulAsync`) which flushes the recording
         // list mid-record — a second, subtler CLR breach. Both problems
         // are structural to MoE and would need a GPU-side gather +
         // stable-record refactor to fix cleanly; until that lands, MoE
@@ -912,7 +915,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             MM_LOG_INFO("engine",
                         "features.clr=true — decode uses record/replay "
                         "from step 2 on");
-            _ops.queue().resetRecording();
+            l0Ops().queue().resetRecording();
             // Right-size the FlashAttention partial launch geometry to
             // what THIS generate() call could possibly need. `kFlashMaxKTiles`
             // is a coarse upper bound (32768 / 64 = 512 post-M9.8b) that
@@ -925,13 +928,13 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 (maxCurLen + compute::l0::GpuOps::kFlashKTileSize - 1) /
                     compute::l0::GpuOps::kFlashKTileSize,
                 compute::l0::GpuOps::kFlashMaxKTiles);
-            _ops.setReplayMaxKTiles(replayKTiles);
+            _ops->setReplayMaxKTiles(replayKTiles);
             MM_LOG_INFO("engine",
                         "features.clr right-sized flash launch "
                         "geometry to {} k-tiles (max curLen {})",
                         replayKTiles, maxCurLen);
         } else {
-            _ops.setReplayMaxKTiles(0);
+            _ops->setReplayMaxKTiles(0);
         }
 
         // Inter-token thermal pacing — consult guard every kPaceWindow
@@ -986,13 +989,13 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             //   step == 1                 → immediate (warm)
             //   step == 2 && clrEnabled   → record + replay-once
             //   step >  2 && recording    → update curLen slot + replay
-            if (clrEnabled && _ops.queue().hasRecording()) {
+            if (clrEnabled && l0Ops().queue().hasRecording()) {
                 // Replay-only path. Update the shared USM slot so every
                 // recorded rope / attention / qkv_split / rmsnorm_qkv
                 // kernel sees the current KV-cache length.
-                *_ops.curLenSlot() =
+                *l0Ops().curLenSlot() =
                     static_cast<std::int32_t>(cache.length());
-                _ops.queue().replay();
+                l0Ops().queue().replay();
             } else if (clrEnabled && step == 1) {
                 // Step 1 records into the persistent list AND executes it
                 // via a first replay(). Subsequent steps reuse the
@@ -1007,13 +1010,13 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 // and would trip the "immediate work is pending" throw.
                 // Flush the immediate list explicitly so the invariant
                 // holds independently of the backend.
-                _ops.flush();
-                _ops.queue().beginRecord();
+                _ops->flush();
+                l0Ops().queue().beginRecord();
                 for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
                     _backend->runBlock(b, xBuf, 1, cache, buffers, false);
                 }
-                _ops.queue().endRecord();
-                _ops.queue().replay();
+                l0Ops().queue().endRecord();
+                l0Ops().queue().replay();
             } else {
                 for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
                     _backend->runBlock(b, xBuf, 1, cache, buffers, false);
@@ -1214,7 +1217,7 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
                          d_model, vocab_emb,
                          newTokens, xBuf);
     if (embedScaleEnabled) {
-        _ops.mulScalarAsync(xBuf, embedScale, N * d_model);
+        _ops->mulScalarAsync(xBuf, embedScale, N * d_model);
     }
 
     _backend->prepareForward(newTokens, xBuf, N);
@@ -1232,10 +1235,10 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
     out.reserve(N);
     for (std::size_t i = 0; i < N; ++i) {
         const float* row = xBuf + i * d_model;
-        _ops.rmsNormAsync(row, 1, d_model,
+        _ops->rmsNormAsync(row, 1, d_model,
                           static_cast<const float*>(outNorm->usmPtr),
                           _config.rmsNormEps, normFinal);
-        _gmm.matmul(lmHead->type, lmHead->usmPtr,
+        _gmm->matmul(lmHead->type, lmHead->usmPtr,
                     vocab_lm, d_model, normFinal, 1,
                     logits, logitsSc);
         out.emplace_back(logits, logits + vocab_lm);

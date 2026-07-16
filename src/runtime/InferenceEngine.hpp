@@ -366,9 +366,9 @@ public:
     [[nodiscard]] const UsmAllocator&      allocator()  const noexcept { return _computeCtx.allocator(); }
     [[nodiscard]] ::mimirmind::core::l0::L0ComputeContext&
         computeContext() noexcept { return _computeCtx; }
-    [[nodiscard]] compute::l0::GpuMatmul&      gpuMatmul()        noexcept { return _gmm; }
-    [[nodiscard]] const compute::l0::GpuMatmul& gpuMatmul()  const noexcept { return _gmm; }
-    [[nodiscard]] const compute::l0::GpuOps&   gpuOps()     const noexcept { return _ops; }
+    [[nodiscard]] compute::ComputeMatmul&       gpuMatmul()        noexcept { return *_gmm; }
+    [[nodiscard]] const compute::ComputeMatmul& gpuMatmul()  const noexcept { return *_gmm; }
+    [[nodiscard]] const compute::ComputeOps&    gpuOps()     const noexcept { return *_ops; }
     [[nodiscard]] const model::FusedQkvWeights* fusedQkv() const noexcept {
         return _fusedQkv.get();
     }
@@ -408,6 +408,19 @@ private:
     /// line.
     void finalizeLoad();
 
+    /// L0-only downcast helpers for the paths that still reach L0-native
+    /// APIs (self-test, KTile-Q8 autotune, CommandQueue / curLenSlot for
+    /// CLR record/replay). `_ops` and `_gmm` are always constructed as
+    /// the L0 concrete type in the current ctor — the polymorphic
+    /// factory landing with Schicht 4 will need these paths gated on
+    /// `_computeCtx.kind()`, but until then the static_cast is safe.
+    [[nodiscard]] compute::l0::GpuOps& l0Ops() noexcept {
+        return static_cast<compute::l0::GpuOps&>(*_ops);
+    }
+    [[nodiscard]] compute::l0::GpuMatmul& l0Gmm() noexcept {
+        return static_cast<compute::l0::GpuMatmul&>(*_gmm);
+    }
+
     // Held by reference for the whole process lifetime. Provided by main().
     const Config&                              _cfg;
     // Backend-neutral RAII owner of the L0 runtime (L0Context + UsmAllocator
@@ -417,8 +430,16 @@ private:
     // M8.H.3: _ops is constructed BEFORE _gmm so GpuMatmul can hold
     // a reference to it (the DP4A dispatch path calls
     // GpuOps::xQuantI8Async to fill the internal Xq/Xscale scratch).
-    compute::l0::GpuOps                            _ops;
-    compute::l0::GpuMatmul                         _gmm;
+    //
+    // Schritt 3c.4: both are held as unique_ptr to the backend-neutral
+    // base — the ctor init-list picks the concrete backend (currently
+    // always L0; HIP branch lands with the ComputeContext-polymorphism
+    // refactor in Schicht 4). Consumers hit the interface through the
+    // base accessors below; L0-only paths (self-test, KTile-Q8 autotune,
+    // CLR record/replay via CommandQueue) go through the private
+    // `l0Ops()` / `l0Gmm()` static_cast helpers.
+    std::unique_ptr<compute::ComputeOps>           _ops;
+    std::unique_ptr<compute::ComputeMatmul>        _gmm;
     // M8.K.0: diagnostic per-op timer. Constructed after _queue so it
     // can hold a reference. Off by default; opt in via
     // `diagnostics.traceOpTimes: true` in config.json.
