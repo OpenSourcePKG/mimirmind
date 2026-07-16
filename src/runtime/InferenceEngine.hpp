@@ -377,6 +377,11 @@ public:
     [[nodiscard]] ::mimirmind::core::l0::L0ComputeContext& computeContext() {
         return l0ComputeContext();
     }
+    /// Backend-neutral: which backend the runtime is bound to. Always
+    /// safe to call regardless of L0 / HIP / anything future.
+    [[nodiscard]] core::backend::BackendKind computeContextKind() const noexcept {
+        return _computeCtx->kind();
+    }
     [[nodiscard]] compute::ComputeMatmul&       gpuMatmul()        noexcept { return *_gmm; }
     [[nodiscard]] const compute::ComputeMatmul& gpuMatmul()  const noexcept { return *_gmm; }
     [[nodiscard]] const compute::ComputeOps&    gpuOps()     const noexcept { return *_ops; }
