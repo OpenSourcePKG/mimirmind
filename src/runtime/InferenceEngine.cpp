@@ -508,10 +508,10 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
                                       withFusedQkv,
                                       withKvFp32Scratch);
 
-    _xBufH      = UsmHandle{allocator(), maxT      * d_model  * sizeof(float)};
-    _normFinalH = UsmHandle{allocator(), d_model   * sizeof(float)};
-    _logitsH    = UsmHandle{allocator(), vocab_lm  * sizeof(float)};
-    _logitsScH  = UsmHandle{allocator(), d_model   * sizeof(float)};
+    _xBufH      = _ops.allocate(maxT      * d_model  * sizeof(float));
+    _normFinalH = _ops.allocate(d_model   * sizeof(float));
+    _logitsH    = _ops.allocate(vocab_lm  * sizeof(float));
+    _logitsScH  = _ops.allocate(d_model   * sizeof(float));
 
     _cacheMaxT     = maxT;
     _cacheVocabLm  = vocab_lm;

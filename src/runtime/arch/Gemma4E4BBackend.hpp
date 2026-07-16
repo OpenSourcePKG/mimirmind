@@ -3,8 +3,8 @@
 
 #pragma once
 
+#include "compute/ComputeBuffer.hpp"
 #include "core/gguf/GgufTypes.hpp"
-#include "core/gpu/l0/UsmHandle.hpp"
 #include "runtime/arch/GemmaBaseBackend.hpp"
 
 #include <cstddef>
@@ -12,8 +12,6 @@
 #include <span>
 
 namespace mimirmind::runtime::arch {
-
-using ::mimirmind::core::l0::UsmHandle;
 
 
 /**
@@ -104,7 +102,7 @@ private:
     /// [N=num_layers*per_layer_dim, K=d_model], one row per output
     /// element, K/32 Q8_0 blocks per row. Null when the model doesn't
     /// carry the tensor (defensive; disables PLE).
-    UsmHandle        _projQ8;
+    compute::ComputeBuffer _projQ8;
     std::size_t      _projQ8Bytes{0};
 
     /// M8.K.Q8_0-Reorder — separate USM buffer holding `_projQ8` in
@@ -117,7 +115,7 @@ private:
     /// through GpuMatmul's GEMM dispatch. Dual-copy costs ~size of
     /// `_projQ8` extra USM (~23 MiB for E4B) but avoids un-reordering
     /// on every prefill call.
-    UsmHandle        _projQ8Reorder;
+    compute::ComputeBuffer _projQ8Reorder;
     std::size_t      _projQ8ReorderBytes{0};
 
     /// F32 pointer to per_layer_proj_norm.weight in USM. Owned by the
@@ -129,18 +127,18 @@ private:
     /// Dequantized PLE embedding slices, layout [num_layers, T, per_layer_dim].
     /// Row L is contiguous [T * per_layer_dim] float span — exactly what
     /// siluMulAsync consumes as its `up` operand.
-    UsmHandle        _pleBuf;
+    compute::ComputeBuffer _pleBuf;
     std::size_t      _pleBufCapT{0};
 
     /// Output of per_layer_model_proj matmul + rmsnorm, layout
     /// [T, num_layers, per_layer_dim]. Combined into `_pleBuf` after
     /// scaling by 1/sqrt(2).
-    UsmHandle        _pleProjBuf;
+    compute::ComputeBuffer _pleProjBuf;
     std::size_t      _pleProjBufCapT{0};
 
     /// Post-inp_gate scratch [maxT, per_layer_dim] — siluMulAsync writes
     /// its output here (gate = SiLU(gate) * per_layer_input[layer]).
-    UsmHandle        _pleGateBuf;
+    compute::ComputeBuffer _pleGateBuf;
     std::size_t      _pleGateBufCapT{0};
 
     /// Number of tokens `prepareForward` last wrote — how far runBlock

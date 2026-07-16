@@ -110,7 +110,7 @@ Gemma4E4BBackend::Gemma4E4BBackend(const model::LlmConfig&        config,
                         "per_layer_model_proj Q8_0 requantize failed ({}) — "
                         "PLE-input projection disabled, output degraded",
                         e.what());
-            _projQ8 = UsmHandle{};
+            _projQ8 = {};
             _projQ8Bytes = 0;
         }
     } else {
@@ -173,7 +173,7 @@ void Gemma4E4BBackend::requantizeModelProjToQ8_0(const core::gguf::GgufTensor& s
     // output size = N * K/32 * 34 bytes.
     const std::size_t blocksPerRow = K / 32;
     _projQ8Bytes = N * blocksPerRow * 34;
-    _projQ8 = UsmHandle{_ops.allocator(), _projQ8Bytes};
+    _projQ8 = _ops.allocate(_projQ8Bytes);
     auto* dst = _projQ8.as<std::uint8_t>();
 
     // Bytes per source ROW. For BF16 that's K*2; for F32 K*4; for
@@ -258,8 +258,7 @@ void Gemma4E4BBackend::requantizeModelProjToQ8_0(const core::gguf::GgufTensor& s
     if (_ops.q8_0ReorderMode() != core::config::TriState::Disable) {
         try {
             _projQ8ReorderBytes = _projQ8Bytes;
-            _projQ8Reorder = UsmHandle{_ops.allocator(),
-                                       _projQ8ReorderBytes};
+            _projQ8Reorder = _ops.allocate(_projQ8ReorderBytes);
             std::memcpy(_projQ8Reorder.get(), _projQ8.get(),
                         _projQ8Bytes);
             std::vector<std::uint8_t> scratch(blocksPerRow * 34);
@@ -280,7 +279,7 @@ void Gemma4E4BBackend::requantizeModelProjToQ8_0(const core::gguf::GgufTensor& s
                         "per_layer_model_proj reorder copy failed ({}) "
                         "— decode falls back to native Q8_0 vec kernel",
                         e.what());
-            _projQ8Reorder = UsmHandle{};
+            _projQ8Reorder = {};
             _projQ8ReorderBytes = 0;
         }
     }
@@ -292,19 +291,19 @@ void Gemma4E4BBackend::ensurePleCapacity(std::size_t T) {
     if (_pleTablePtr != nullptr && T > _pleBufCapT) {
         const std::size_t bytes =
             _config.blockCount * T * _perLayerDim * sizeof(float);
-        _pleBuf = UsmHandle{_ops.allocator(), bytes};
+        _pleBuf = _ops.allocate(bytes);
         _pleBufCapT = T;
     }
     if (_projQ8Bytes > 0 && T > _pleProjBufCapT) {
         // Layout [T, num_layers, per_layer_dim] = [T, N] where N = 10752.
         const std::size_t bytes =
             T * _config.blockCount * _perLayerDim * sizeof(float);
-        _pleProjBuf = UsmHandle{_ops.allocator(), bytes};
+        _pleProjBuf = _ops.allocate(bytes);
         _pleProjBufCapT = T;
     }
     if (T > _pleGateBufCapT) {
         const std::size_t bytes = T * _perLayerDim * sizeof(float);
-        _pleGateBuf = UsmHandle{_ops.allocator(), bytes};
+        _pleGateBuf = _ops.allocate(bytes);
         _pleGateBufCapT = T;
     }
 }

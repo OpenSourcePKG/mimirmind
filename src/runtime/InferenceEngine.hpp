@@ -19,7 +19,6 @@
 #include "core/gpu/l0/L0ComputeContext.hpp"
 #include "runtime/OpProfiler.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
-#include "core/gpu/l0/UsmHandle.hpp"
 
 namespace mimirmind::core::config {
 struct Config;
@@ -48,7 +47,6 @@ namespace mimirmind::runtime {
 
 using ::mimirmind::core::l0::L0Context;
 using ::mimirmind::core::l0::UsmAllocator;
-using ::mimirmind::core::l0::UsmHandle;
 using ::mimirmind::core::config::Config;
 
 namespace arch {
@@ -442,10 +440,10 @@ private:
     // sits in the cache so the next generate() can compute the LCP.
     std::unique_ptr<KvCache>           _kvCache;
     std::optional<BlockBuffers>        _blockBuffers;
-    UsmHandle                          _xBufH;
-    UsmHandle                          _normFinalH;
-    UsmHandle                          _logitsH;
-    UsmHandle                          _logitsScH;
+    compute::ComputeBuffer             _xBufH;
+    compute::ComputeBuffer             _normFinalH;
+    compute::ComputeBuffer             _logitsH;
+    compute::ComputeBuffer             _logitsScH;
     std::size_t                        _maxContextTokens{8192}; // see setMaxContextTokens
     KvDtype                            _kvDtype{KvDtype::F32};    // see setKvDtype
     std::size_t                        _cacheMaxT    {0};   // max prompt-chunk scratch was sized for
