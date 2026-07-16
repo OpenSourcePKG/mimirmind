@@ -13,6 +13,7 @@
 #include "core/gguf/WeightsMap.hpp"
 #include "core/ipc/TensorManifest.hpp"
 #include "runtime/BlockBuffers.hpp"
+#include "core/backend/ComputeContext.hpp"
 #include "core/gpu/l0/CommandQueue.hpp"
 #include "runtime/KvCache.hpp"
 #include "core/gpu/l0/L0Context.hpp"
@@ -359,13 +360,23 @@ public:
     }
 
     // --- Accessors (used by smoke path + diagnostics) -------------------
+    //
+    // Schicht 4 — these are L0-only downcasts. Consumers keep the
+    // familiar names but each accessor now throws if the runtime picked
+    // a non-L0 backend, because the returned types (`L0Context&`,
+    // `UsmAllocator&`, `L0ComputeContext&`) are L0-native and have no
+    // meaning under HIP. Downstream diagnostics (SmokeSuite, SmokeMode,
+    // SystemStatusBuilder) still call the L0-native accessors freely —
+    // they self-gate to L0-only runs today, and the throw here would
+    // surface a clean failure if that ever changes.
 
-    [[nodiscard]] L0Context&               ctx()              noexcept { return _computeCtx.l0Context(); }
-    [[nodiscard]] const L0Context&         ctx()        const noexcept { return _computeCtx.l0Context(); }
-    [[nodiscard]] UsmAllocator&            allocator()        noexcept { return _computeCtx.allocator(); }
-    [[nodiscard]] const UsmAllocator&      allocator()  const noexcept { return _computeCtx.allocator(); }
-    [[nodiscard]] ::mimirmind::core::l0::L0ComputeContext&
-        computeContext() noexcept { return _computeCtx; }
+    [[nodiscard]] L0Context&               ctx()             { return l0ComputeContext().l0Context(); }
+    [[nodiscard]] const L0Context&         ctx()       const { return l0ComputeContext().l0Context(); }
+    [[nodiscard]] UsmAllocator&            allocator()       { return l0ComputeContext().allocator(); }
+    [[nodiscard]] const UsmAllocator&      allocator() const { return l0ComputeContext().allocator(); }
+    [[nodiscard]] ::mimirmind::core::l0::L0ComputeContext& computeContext() {
+        return l0ComputeContext();
+    }
     [[nodiscard]] compute::ComputeMatmul&       gpuMatmul()        noexcept { return *_gmm; }
     [[nodiscard]] const compute::ComputeMatmul& gpuMatmul()  const noexcept { return *_gmm; }
     [[nodiscard]] const compute::ComputeOps&    gpuOps()     const noexcept { return *_ops; }
@@ -410,10 +421,10 @@ private:
 
     /// L0-only downcast helpers for the paths that still reach L0-native
     /// APIs (self-test, KTile-Q8 autotune, CommandQueue / curLenSlot for
-    /// CLR record/replay). `_ops` and `_gmm` are always constructed as
-    /// the L0 concrete type in the current ctor — the polymorphic
-    /// factory landing with Schicht 4 will need these paths gated on
-    /// `_computeCtx.kind()`, but until then the static_cast is safe.
+    /// CLR record/replay). The paths that call these must first check
+    /// `_computeCtx->kind() == LevelZero` — Schicht 4 turned the ctor
+    /// factory into a real switch, so `_ops`/`_gmm` are the concrete L0
+    /// subclass only when the runtime picked L0.
     [[nodiscard]] compute::l0::GpuOps& l0Ops() noexcept {
         return static_cast<compute::l0::GpuOps&>(*_ops);
     }
@@ -421,29 +432,42 @@ private:
         return static_cast<compute::l0::GpuMatmul&>(*_gmm);
     }
 
+    /// Guarded downcast of `_computeCtx` to `L0ComputeContext&`. Throws
+    /// if the runtime did not pick L0. Backing store for the public
+    /// `ctx()` / `allocator()` / `computeContext()` accessors — those
+    /// keep the pre-Schicht-4 names but inherit the throw contract.
+    [[nodiscard]] ::mimirmind::core::l0::L0ComputeContext& l0ComputeContext();
+    [[nodiscard]] const ::mimirmind::core::l0::L0ComputeContext& l0ComputeContext() const;
+
     // Held by reference for the whole process lifetime. Provided by main().
     const Config&                              _cfg;
-    // Backend-neutral RAII owner of the L0 runtime (L0Context + UsmAllocator
-    // + CommandQueue). Constructed first so every downstream member can
-    // reach the concrete handles via `_computeCtx.l0Context()` etc.
-    ::mimirmind::core::l0::L0ComputeContext    _computeCtx;
+    // Schicht 4 — backend-polymorphic runtime. The concrete subclass is
+    // picked at ctor time via `BackendRegistry::autoSelect()` (respecting
+    // `MIMIRMIND_BACKEND` env override); today the fallback + primary
+    // path is L0. Downstream L0-only accessors (`ctx()`, `allocator()`,
+    // `computeContext()`) downcast and throw if the runtime picked a
+    // non-L0 backend.
+    std::unique_ptr<core::backend::ComputeContext> _computeCtx;
     // M8.H.3: _ops is constructed BEFORE _gmm so GpuMatmul can hold
     // a reference to it (the DP4A dispatch path calls
     // GpuOps::xQuantI8Async to fill the internal Xq/Xscale scratch).
     //
     // Schritt 3c.4: both are held as unique_ptr to the backend-neutral
-    // base — the ctor init-list picks the concrete backend (currently
-    // always L0; HIP branch lands with the ComputeContext-polymorphism
-    // refactor in Schicht 4). Consumers hit the interface through the
-    // base accessors below; L0-only paths (self-test, KTile-Q8 autotune,
-    // CLR record/replay via CommandQueue) go through the private
-    // `l0Ops()` / `l0Gmm()` static_cast helpers.
+    // base. Schicht 4 wires up the factory switch on `_computeCtx->kind()`
+    // so each pointer holds the matching concrete subclass at runtime.
+    // Consumers hit the interface through the base accessors below;
+    // L0-only paths (self-test, KTile-Q8 autotune, CLR record/replay
+    // via CommandQueue) go through the private `l0Ops()` / `l0Gmm()`
+    // static_cast helpers, gated on `_computeCtx->kind() == LevelZero`.
     std::unique_ptr<compute::ComputeOps>           _ops;
     std::unique_ptr<compute::ComputeMatmul>        _gmm;
-    // M8.K.0: diagnostic per-op timer. Constructed after _queue so it
-    // can hold a reference. Off by default; opt in via
+    // M8.K.0: diagnostic per-op timer. Constructed after `_ops` so it
+    // can hold a reference to the L0 CommandQueue. Only populated when
+    // the runtime picked L0 (HIP path leaves the optional empty — its
+    // per-op timing would need a HIP-stream-event equivalent that
+    // hasn't been wired). Off by default even on L0; opt in via
     // `diagnostics.traceOpTimes: true` in config.json.
-    OpProfiler                         _opProfiler;
+    std::optional<OpProfiler>          _opProfiler;
     compute::Sampler                   _sampler{};
 
     core::gguf::GgufReader                  _reader;

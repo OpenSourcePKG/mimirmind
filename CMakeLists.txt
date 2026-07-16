@@ -407,6 +407,16 @@ if(MIMIRMIND_ENABLE_HIP)
         hip::host
     )
 
+    # Schicht 4 — when both L0 and HIP are compiled in, the L0 lib carries
+    # InferenceEngine.cpp which #ifdefs into compute/hip/GpuOps.hpp and
+    # core/gpu/hip/HipComputeContext.hpp for the factory dispatch. Pull
+    # the HIP lib in as a link dep so the transitive `hip::host` include
+    # paths and libs reach mimirmind_core_l0 and its dependents (the
+    # mimirmind binary, gpu_tests, prefill_bench). No-op when L0=OFF.
+    if(MIMIRMIND_ENABLE_L0)
+        target_link_libraries(mimirmind_core_l0 PUBLIC mimirmind_core_hip)
+    endif()
+
     # ---- HIP kernel code objects (.hip → .hsaco via hipcc --genco) ---
     #
     # Parallel to the ocloc-based L0 spv_kernels custom target. Each .hip

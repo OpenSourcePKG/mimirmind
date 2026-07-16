@@ -4,6 +4,7 @@
 #include "runtime/InferenceEngine.hpp"
 
 #include "compute/Embedding.hpp"
+#include "core/backend/BackendRegistry.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "core/gguf/TensorFingerprint.hpp"
 #include "core/config/Config.hpp"
@@ -16,6 +17,12 @@
 #include "runtime/SystemMonitor.hpp"
 #include "runtime/ThermalGuard.hpp"
 #include "runtime/arch/ArchBackend.hpp"
+
+#ifdef MIMIRMIND_HAVE_HIP
+#include "compute/hip/GpuMatmul.hpp"
+#include "compute/hip/GpuOps.hpp"
+#include "core/gpu/hip/HipComputeContext.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -99,26 +106,140 @@ void logTensorTaxonomy(const core::gguf::GgufReader& reader) {
     }
 }
 
+// Schicht 4 — factory helpers. `_computeCtx` is picked via
+// BackendRegistry::autoSelect (respects MIMIRMIND_BACKEND env var; falls
+// back to LevelZero, which keeps existing setups untouched). `_ops` and
+// `_gmm` factories switch on the resulting kind and forward to the
+// matching concrete ctor. Compile-time guards drop each branch when the
+// corresponding backend isn't built in — a config that asks for HIP on
+// an L0-only build throws with a clear diagnostic.
+
+std::unique_ptr<core::backend::ComputeContext>
+makeComputeContext(const Config& cfg, core::backend::BackendKind kind) {
+    switch (kind) {
+        case core::backend::BackendKind::LevelZero:
+#ifdef MIMIRMIND_HAVE_L0
+            return std::make_unique<core::l0::L0ComputeContext>(
+                core::l0::L0ComputeContext::Options{
+                    .spvDirOverride    = std::string{cfg.runtime.spvDir.value_or("")},
+                    .usmProbeTotalGiB  = cfg.runtime.usmProbeTotalGib,
+                    .usmKindOverride   = std::nullopt});
+#else
+            throw std::runtime_error{
+                "InferenceEngine: LevelZero requested but not compiled in "
+                "(MIMIRMIND_ENABLE_L0=OFF at build time)"};
+#endif
+
+        case core::backend::BackendKind::Hip:
+#ifdef MIMIRMIND_HAVE_HIP
+            (void)cfg;  // HIP path takes no config knobs yet.
+            return std::make_unique<core::hip::HipComputeContext>();
+#else
+            throw std::runtime_error{
+                "InferenceEngine: HIP requested but not compiled in "
+                "(MIMIRMIND_ENABLE_HIP=OFF at build time)"};
+#endif
+
+        default:
+            throw std::runtime_error{
+                "InferenceEngine: no supported compute backend for kind "
+                + std::to_string(static_cast<int>(kind))};
+    }
+}
+
+std::unique_ptr<compute::ComputeOps>
+makeGpuOps(core::backend::ComputeContext&        ctx,
+           const core::config::FeatureSettings&  features) {
+    switch (ctx.kind()) {
+        case core::backend::BackendKind::LevelZero:
+#ifdef MIMIRMIND_HAVE_L0
+            return std::make_unique<compute::l0::GpuOps>(
+                static_cast<core::l0::L0ComputeContext&>(ctx),
+                features.flashPrefill,
+                features.flashPrefillGqaQ8,
+                features.flashPrefillKTileQ8,
+                features.q8_0Reorder);
+#else
+            break;
+#endif
+
+        case core::backend::BackendKind::Hip:
+#ifdef MIMIRMIND_HAVE_HIP
+            return std::make_unique<compute::hip::GpuOps>(
+                static_cast<core::hip::HipComputeContext&>(ctx),
+                features.flashPrefill,
+                features.flashPrefillGqaQ8,
+                features.flashPrefillKTileQ8,
+                features.q8_0Reorder);
+#else
+            break;
+#endif
+
+        default:
+            break;
+    }
+    throw std::runtime_error{
+        "InferenceEngine::makeGpuOps: no compute::*::GpuOps impl for the "
+        "resolved backend kind"};
+}
+
+std::unique_ptr<compute::ComputeMatmul>
+makeGpuMatmul(core::backend::ComputeContext& ctx,
+              compute::ComputeOps&           ops) {
+    switch (ctx.kind()) {
+        case core::backend::BackendKind::LevelZero:
+#ifdef MIMIRMIND_HAVE_L0
+            return std::make_unique<compute::l0::GpuMatmul>(
+                static_cast<core::l0::L0ComputeContext&>(ctx),
+                static_cast<compute::l0::GpuOps&>(ops));
+#else
+            break;
+#endif
+
+        case core::backend::BackendKind::Hip:
+#ifdef MIMIRMIND_HAVE_HIP
+            return std::make_unique<compute::hip::GpuMatmul>(
+                static_cast<core::hip::HipComputeContext&>(ctx),
+                static_cast<compute::hip::GpuOps&>(ops));
+#else
+            break;
+#endif
+
+        default:
+            break;
+    }
+    throw std::runtime_error{
+        "InferenceEngine::makeGpuMatmul: no compute::*::GpuMatmul impl "
+        "for the resolved backend kind"};
+}
+
 } // namespace
 
 InferenceEngine::InferenceEngine(const Config& cfg)
     : _cfg{cfg},
-      _computeCtx{::mimirmind::core::l0::L0ComputeContext::Options{
-          .spvDirOverride    = std::string{cfg.runtime.spvDir.value_or("")},
-          .usmProbeTotalGiB  = cfg.runtime.usmProbeTotalGib,
-          .usmKindOverride   = std::nullopt}},
-      _ops{std::make_unique<compute::l0::GpuOps>(
-          _computeCtx,
-          cfg.features.flashPrefill,
-          cfg.features.flashPrefillGqaQ8,
-          cfg.features.flashPrefillKTileQ8,
-          cfg.features.q8_0Reorder)},
-      _gmm{std::make_unique<compute::l0::GpuMatmul>(
-          _computeCtx,
-          static_cast<compute::l0::GpuOps&>(*_ops))},
-      _opProfiler{_computeCtx.queue(), cfg.diagnostics.traceOpTimes} {
-    MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");
-    allocator().probeLimits();
+      _computeCtx{makeComputeContext(
+          cfg,
+          core::backend::BackendRegistry::autoSelect(
+              core::backend::BackendKind::LevelZero))},
+      _ops{makeGpuOps(*_computeCtx, cfg.features)},
+      _gmm{makeGpuMatmul(*_computeCtx, *_ops)},
+      _opProfiler{} {
+    const auto kind = _computeCtx->kind();
+    MM_LOG_INFO("engine",
+                "InferenceEngine: runtime bound to backend '{}'",
+                core::backend::BackendRegistry::name(kind));
+
+    // OpProfiler is L0-native (uses L0 CommandQueue::flush + dispatchCount).
+    // Only wire it up when the runtime picked L0; HIP path leaves the
+    // optional empty and the arch-backend construction deref-throws with
+    // a clear diagnostic if a HIP model-load is ever attempted before
+    // the profiler grows a backend-neutral variant.
+    if (kind == core::backend::BackendKind::LevelZero) {
+        _opProfiler.emplace(l0ComputeContext().queue(),
+                            cfg.diagnostics.traceOpTimes);
+        MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");
+        allocator().probeLimits();
+    }
 
     if (cfg.diagnostics.traceBlock0) {
         _traceBlock0 = true;
@@ -152,6 +273,39 @@ InferenceEngine::~InferenceEngine() {
         std::fclose(_decodeTrace);
         _decodeTrace = nullptr;
     }
+}
+
+// Schicht 4 — L0-only downcast of the polymorphic `_computeCtx`. The
+// public `ctx()` / `allocator()` / `computeContext()` accessors route
+// through here; each throws with a clear diagnostic on non-L0 runs so
+// the failure surfaces at the call site rather than as UB from a bad
+// static_cast.
+core::l0::L0ComputeContext& InferenceEngine::l0ComputeContext() {
+    if (_computeCtx == nullptr ||
+        _computeCtx->kind() != core::backend::BackendKind::LevelZero) {
+        throw std::runtime_error{
+            "InferenceEngine::l0ComputeContext: runtime is not bound to "
+            "LevelZero — L0-only accessor called on a "
+            + std::string{core::backend::BackendRegistry::name(
+                  _computeCtx ? _computeCtx->kind()
+                              : core::backend::BackendKind::Unknown)}
+            + " backend"};
+    }
+    return static_cast<core::l0::L0ComputeContext&>(*_computeCtx);
+}
+
+const core::l0::L0ComputeContext& InferenceEngine::l0ComputeContext() const {
+    if (_computeCtx == nullptr ||
+        _computeCtx->kind() != core::backend::BackendKind::LevelZero) {
+        throw std::runtime_error{
+            "InferenceEngine::l0ComputeContext: runtime is not bound to "
+            "LevelZero — L0-only accessor called on a "
+            + std::string{core::backend::BackendRegistry::name(
+                  _computeCtx ? _computeCtx->kind()
+                              : core::backend::BackendKind::Unknown)}
+            + " backend"};
+    }
+    return static_cast<const core::l0::L0ComputeContext&>(*_computeCtx);
 }
 
 const core::gguf::WeightsMap& InferenceEngine::weights() const {
@@ -285,9 +439,14 @@ void InferenceEngine::finalizeLoad() {
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
     // gracefully with the original architecture string in the error.
+    // Arch backends still take the concrete L0 types (GpuOps / GpuMatmul /
+    // OpProfiler) — the load path is L0-only today (GgufReader.loadTensors
+    // reaches into UsmAllocator), so we're guaranteed to be on L0 here.
+    // If a HIP model-load path lands later, the createArchBackend signature
+    // itself needs to move to the ComputeOps / ComputeMatmul base too.
     _backend = arch::createArchBackend(
         _config.architecture, _config, *_weights, _fusedQkv.get(),
-        _ops, _gmm, _opProfiler, _cfg.features.moeGroup,
+        l0Ops(), l0Gmm(), _opProfiler.value(), _cfg.features.moeGroup,
         _cfg.features.moeFusedDown != core::config::TriState::Disable);
 
     _modelLoaded = true;
@@ -505,7 +664,7 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     // workspace: rmsnorm_qkv + RoPE run fp32-in-place there and then
     // `kv_quant_commit_q8_0` folds the rows into the Q8_0 cache slot.
     const bool withKvFp32Scratch = (_kvDtype == KvDtype::Q8_0);
-    _blockBuffers = allocBlockBuffers(_ops, _config,
+    _blockBuffers = allocBlockBuffers(*_ops, _config,
                                       maxT, _maxContextTokens,
                                       qDimMax, kvDimMax,
                                       withFusedQkv,
@@ -1064,8 +1223,10 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 }
                 // M8.K.0 diagnostic: emits a per-category share summary
                 // every 50 tokens when diagnostics.traceOpTimes=true.
-                // No-op otherwise.
-                _opProfiler.maybeDumpAndReset(step);
+                // No-op otherwise. Only present on L0 today (see ctor).
+                if (_opProfiler) {
+                    _opProfiler->maybeDumpAndReset(step);
+                }
             }
 
             if (onToken && !onToken(nextId)) {
