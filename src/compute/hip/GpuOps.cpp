@@ -896,8 +896,8 @@ void GpuOps::qkvSplitAsync(const float* fused, float* Yq,
     k.setPtr  (9, offsetSlot);
 
     k.launch(_ctx.stream(),
-             groupsForN(total, kElementwiseLocalSize), 1, 1,
-             kElementwiseLocalSize, 1, 1);
+             groupsForN(total, kQkvSplitLocalSize), 1, 1,
+             kQkvSplitLocalSize, 1, 1);
 }
 
 void GpuOps::attentionAsync(const float* q, const void* k, const void* v,

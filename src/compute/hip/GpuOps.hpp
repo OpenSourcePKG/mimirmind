@@ -262,6 +262,12 @@ private:
     static constexpr std::uint32_t kXQuantI8LocalSize     = 128;
     static constexpr std::uint32_t kKvQuantCommitLocalSize = 32;
     static constexpr std::uint32_t kAttentionLocalSize    = 16;
+    // Matches QKV_SPLIT_LOCAL / QKV_SPLIT_FP16_LOCAL in
+    // kernels_hip/qkv_split{,_fp16}.hip. Numerically equal to
+    // kElementwiseLocalSize today; kept separate so a future retune of
+    // the elementwise WG size doesn't silently un-tune qkv_split.
+    // (2026-07-17 followup from matmul_q8_0_vec launch-geometry audit.)
+    static constexpr std::uint32_t kQkvSplitLocalSize     = 256;
 
     // Cap on how many Q-heads share one KV-head that the head-packed
     // Q8_0 prefill kernel can serve. Must match the compile-time
