@@ -106,24 +106,75 @@ void GpuOps::rmsNormNoWeightAsync(const float* x,
     }
 }
 
-void GpuOps::rmsNormQkvAsync(float*           /*qBuf*/,   const float* /*qWeight*/,
-                             void*            /*kBase*/,  const float* /*kWeight*/,
-                             void*            /*vBase*/,
-                             std::size_t      /*qRows*/,
-                             std::size_t      /*kvRows*/,
-                             std::size_t      /*headDim*/,
-                             float            /*eps*/,
-                             std::size_t      /*writeOffset*/,
-                             std::size_t      /*kvDim*/,
-                             runtime::KvDtype /*kvDtype*/,
-                             bool             /*useStagingSlot*/) {
-    // Fused Q+K+V RMSNorm with KV-cache write-through and kvDtype
-    // conversion. Non-trivial for CPU because we need to (a) rmsNorm
-    // three sub-buffers with different row counts and weight semantics
-    // (Q/K use per-headDim weights; V is no-weight), (b) route K/V
-    // writes into the correct write-slot inside kBase/vBase, (c)
-    // handle FP16 / Q8_0 destination formats. Left for M-CPU.4 fill-in.
-    throwNotImplemented("rmsNormQkvAsync");
+void GpuOps::rmsNormQkvAsync(float*           qBuf,   const float* qWeight,
+                             void*            kBase,  const float* kWeight,
+                             void*            vBase,
+                             std::size_t      qRows,
+                             std::size_t      kvRows,
+                             std::size_t      headDim,
+                             float            eps,
+                             std::size_t      writeOffset,
+                             std::size_t      kvDim,
+                             runtime::KvDtype kvDtype,
+                             bool             useStagingSlot) {
+    if (kvDtype != runtime::KvDtype::F32) {
+        throw std::runtime_error(
+            "compute::cpu::GpuOps::rmsNormQkvAsync: only KvDtype::F32 "
+            "is supported by the M-CPU.4 fills — FP16 / Q8_0 KV cache "
+            "lands with a follow-up commit");
+    }
+    // useStagingSlot is an L0-CLR construct (mutable command list KV
+    // slot indirection). No analogue on CPU.
+    (void)useStagingSlot;
+
+    // Q layout: workspace [qRows, headDim] where qRows = T*nHeads.
+    // Compact, no writeOffset — one rmsNorm per row with per-headDim
+    // qWeight, in place.
+    for (std::size_t r = 0; r < qRows; ++r) {
+        float* row = qBuf + r * headDim;
+        const float inv = rmsScale(row, headDim, eps);
+        for (std::size_t k = 0; k < headDim; ++k) {
+            row[k] = row[k] * qWeight[k] * inv;
+        }
+    }
+
+    // K / V layout: layer cache [maxSeq, kvDim] with kvDim =
+    // nKvHeads * headDim. kvRows = T * nKvHeads rows to process,
+    // distributed across T tokens starting at row writeOffset.
+    // For row r in [0, kvRows): t = r / nKvHeads, h = r % nKvHeads,
+    // physical offset = (writeOffset + t) * kvDim + h * headDim.
+    if (headDim == 0 || kvDim % headDim != 0) {
+        throw std::runtime_error(
+            "compute::cpu::GpuOps::rmsNormQkvAsync: kvDim (" +
+            std::to_string(kvDim) + ") must be a positive multiple "
+            "of headDim (" + std::to_string(headDim) + ")");
+    }
+    const std::size_t nKvHeads = kvDim / headDim;
+
+    // K: rmsNorm with per-headDim kWeight, in-place at cache slot.
+    float* K = static_cast<float*>(kBase);
+    for (std::size_t r = 0; r < kvRows; ++r) {
+        const std::size_t t = r / nKvHeads;
+        const std::size_t h = r % nKvHeads;
+        float* row = K + (writeOffset + t) * kvDim + h * headDim;
+        const float inv = rmsScale(row, headDim, eps);
+        for (std::size_t k = 0; k < headDim; ++k) {
+            row[k] = row[k] * kWeight[k] * inv;
+        }
+    }
+
+    // V: rmsNorm without a learned weight (Gemma-4 semantics), same
+    // physical layout as K in the cache.
+    float* V = static_cast<float*>(vBase);
+    for (std::size_t r = 0; r < kvRows; ++r) {
+        const std::size_t t = r / nKvHeads;
+        const std::size_t h = r % nKvHeads;
+        float* row = V + (writeOffset + t) * kvDim + h * headDim;
+        const float inv = rmsScale(row, headDim, eps);
+        for (std::size_t k = 0; k < headDim; ++k) {
+            row[k] = row[k] * inv;
+        }
+    }
 }
 
 void GpuOps::addRmsNormAsync(float*       x,
