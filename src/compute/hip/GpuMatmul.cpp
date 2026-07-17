@@ -586,9 +586,12 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
         return;
     }
 
-    // Matvec-loop fallback: one launch per row of X. 4 outputs per WG
-    // (4 subgroups × 16 threads on RDNA3 — matches MATMUL_Q8_0_LOCAL /
-    // _SG in matmul_q8_0_vec.hip).
+    // Matvec-loop fallback: one launch per row of X. The vec kernel
+    // (matmul_q8_0_vec.hip) needs 4 warps × 32 lanes = 128 threads on
+    // RDNA3 (one warp per output row, MATMUL_Q8_0_OUTPUTS_PER_GROUP=4).
+    // Launching with the gemm-path's kLocalSize=64 would only give 2
+    // warps — warps 2/3 never execute and their output slots contain
+    // stale memory (2026-07-17 modulo-4 attn_v garbage on Qwen 2.5).
     const std::uint32_t nGroups = static_cast<std::uint32_t>(
         (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
 
@@ -605,7 +608,7 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
 
         kern.launch(_ctx.stream(),
                     nGroups, 1, 1,
-                    kLocalSize, 1, 1);
+                    kVecLocalSize, 1, 1);
     }
 }
 

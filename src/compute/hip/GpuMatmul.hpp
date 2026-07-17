@@ -157,8 +157,14 @@ private:
     std::unique_ptr<Impl>                      _pimpl;
 
     // Kernel-launch geometry constants (must stay in sync with the
-    // MATMUL_Q8_0_* macros in the .hip source files).
-    static constexpr std::uint32_t kLocalSize        = 64;
+    // MATMUL_Q8_0_* macros in the .hip source files). GEMM and vec
+    // kernels historically diverged on threads-per-WG — GEMM keeps the
+    // Intel Xe-style 64 threads (SG=16 → 4 subgroups per WG), vec was
+    // restructured for RDNA3 warpSize=32 with 128 threads (4 warps per
+    // WG, one warp per output row). Both agree on 4 outputs per WG so a
+    // single kOutputsPerGroup is fine.
+    static constexpr std::uint32_t kLocalSize        = 64;   // gemm path
+    static constexpr std::uint32_t kVecLocalSize     = 128;  // vec path (matches MATMUL_Q8_0_LOCAL)
     static constexpr std::uint32_t kSubgroupSize     = 16;
     static constexpr std::uint32_t kOutputsPerGroup  = kLocalSize / kSubgroupSize;
 
