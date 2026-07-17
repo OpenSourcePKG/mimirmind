@@ -3,8 +3,12 @@
 
 #include "compute/hip/GpuMatmul.hpp"
 
+#include "compute/Matmul.hpp"
+#include "compute/QuantType.hpp"
+#include "compute/QuantTypeRegistry.hpp"
 #include "compute/hip/GpuOps.hpp"
 #include "core/config/Config.hpp"
+#include "core/gguf/GgufTypes.hpp"
 #include "core/gpu/hip/HipComputeContext.hpp"
 #include "core/gpu/hip/HipKernel.hpp"
 #include "core/gpu/hip/HipMemoryAllocator.hpp"
@@ -448,18 +452,84 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
                             std::size_t     M,
                             float*          Y,
                             float*          scratch) {
-    (void)scratch;   // Only used by the L0 side's CPU fallback path.
+    // The caller-provided `scratch` is a device pointer for HIP and
+    // therefore not host-writable. The CPU fallback below allocates
+    // its own host scratch; on the Q8_0 GPU path scratch is unused
+    // entirely (Q8_0 kernels don't need dequant workspace).
+    (void)scratch;
+
+    if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
 
     if (type != ::mimirmind::core::gguf::GgmlType::Q8_0) {
-        // Unlike the L0 side, the HIP backend has no CPU fallback wired
-        // in yet — only Q8_0 has a HIP kernel. Callers must have gated
-        // on `supports(type)` before dispatching here.
-        throw std::runtime_error(
-            "compute::hip::GpuMatmul::matmulAsync: only Q8_0 is supported "
-            "on the HIP backend today — Q4_K / Q5_K / Q6_K HIP kernels "
-            "are not ported. Check supports(type) before dispatching.");
-    }
-    if (M == 0 || N == 0 || K == 0) {
+        // CPU fallback for weight types without a HIP matmul kernel
+        // today (Q4_K / Q5_K / Q6_K / F16 / BF16 / F32, or any other
+        // type present in compute::QuantTypeRegistry).
+        //
+        // Shape mirrors the L0 side (l0::GpuMatmul::matmulAsync →
+        // _queue.flush() + compute::matmul), with one extra step:
+        // L0's USM is host-visible so the CPU code reads W/X and
+        // writes Y directly; HIP device pointers aren't, so we stage
+        // through host buffers. This is a correctness path — perf is
+        // O(slow) and expected to be replaced by native HIP kernels
+        // per weight type over time.
+        //
+        // Q5_0 currently still throws inside compute::matmul →
+        // dequantToF32 because QuantTypeRegistry has no Q5_0 entry
+        // (Option D on the shelf). Once Q5_0 lands there, this path
+        // dispatches it too without further changes here.
+
+        const ::mimirmind::compute::QuantType* qt =
+            ::mimirmind::compute::quantType(type);
+        if (qt == nullptr) {
+            throw std::runtime_error(
+                std::string{"compute::hip::GpuMatmul::matmulAsync: no CPU "
+                            "dequant impl for ggml type '"} +
+                std::string{::mimirmind::core::gguf::typeInfo(type).name} +
+                "' — HIP CPU-fallback cannot proceed. Register the type "
+                "in compute::QuantTypeRegistry to unblock.");
+        }
+
+        if (!_cpuFallbackLogged) {
+            _cpuFallbackLogged = true;
+            MM_LOG_INFO("hip::GpuMatmul",
+                        "CPU fallback active — dispatching '{}' (and any "
+                        "other non-Q8_0 type this session) through "
+                        "compute::matmul on the host. W/X are copied D2H, "
+                        "Y is copied H2D. Slow by design; native HIP "
+                        "kernels replace this per type. Further "
+                        "per-dispatch logs suppressed.",
+                        qt->name());
+        }
+
+        // Preceding matmulAsync / GpuOps launches may still be running
+        // and their outputs may be inputs here (X, or W in some
+        // configurations). Sync the stream so the D2H copies observe
+        // the completed state.
+        sync();
+
+        const std::size_t nBlocksPerRow = K / qt->blockElements();
+        const std::size_t wBytes        = N * nBlocksPerRow * qt->blockBytes();
+        const std::size_t xBytes        = M * K * sizeof(float);
+        const std::size_t yBytes        = M * N * sizeof(float);
+
+        std::vector<std::uint8_t> wHost(wBytes);
+        std::vector<float>        xHost(M * K);
+        std::vector<float>        yHost(M * N);
+        std::vector<float>        cpuScratch(K);
+
+        auto& alloc = _ctx.allocator();
+        alloc.copyD2H(wHost.data(), W, wBytes);
+        alloc.copyD2H(xHost.data(), X, xBytes);
+
+        ::mimirmind::compute::matmul(type,
+                                     wHost.data(), N, K,
+                                     xHost.data(), M,
+                                     yHost.data(),
+                                     cpuScratch.data());
+
+        alloc.copyH2D(Y, yHost.data(), yBytes);
         return;
     }
 

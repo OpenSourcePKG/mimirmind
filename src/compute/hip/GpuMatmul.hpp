@@ -197,6 +197,12 @@ private:
                                    _gemmV2MsAtM{};
     double                         _dp4aMs{0.0};
     std::string                    _autotuneSource{"pending (hip skeleton)"};
+
+    // One-shot flag for the CPU-fallback dispatch path (types other than
+    // Q8_0). First dispatch through the fallback logs an INFO line so
+    // the operator knows a slow correctness path is active; subsequent
+    // dispatches stay silent to avoid per-block log spam during prefill.
+    bool                           _cpuFallbackLogged{false};
 };
 
 } // namespace mimirmind::compute::hip
