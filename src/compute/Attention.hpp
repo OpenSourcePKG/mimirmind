@@ -37,7 +37,9 @@ namespace mimirmind::compute {
  * SWA layers (each query sees only the last `slidingWindow` causal keys).
  *
  * Softmax is numerically stable (max-subtract). Scores are scaled by
- * 1/sqrt(headDim) before softmax.
+ * `scale` before softmax; when `scale <= 0` the default 1/sqrt(headDim)
+ * is used. Pass a positive value to override (e.g. Gemma 4 uses 1.0F
+ * because Q was pre-scaled elsewhere).
  */
 void multiHeadAttention(const float* q,
                         const float* k,
@@ -50,6 +52,7 @@ void multiHeadAttention(const float* q,
                         std::size_t  positionOffset,
                         float*       scratch,
                         float*       out,
-                        std::size_t  slidingWindow = 0);
+                        std::size_t  slidingWindow = 0,
+                        float        scale         = 0.0F);
 
 } // namespace mimirmind::compute

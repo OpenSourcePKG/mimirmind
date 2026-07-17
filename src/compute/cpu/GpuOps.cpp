@@ -332,23 +332,13 @@ void GpuOps::attentionAsync(const float*     q,
     if (kvDtype != runtime::KvDtype::F32) {
         throw std::runtime_error(
             "compute::cpu::GpuOps::attentionAsync: only KvDtype::F32 "
-            "is supported by the M-CPU.0 skeleton — FP16 / Q8_0 KV "
-            "cache lands with a follow-up M-CPU.4 commit");
+            "is supported by the M-CPU.4 fills — FP16 / Q8_0 KV cache "
+            "lands with a follow-up commit");
     }
-    // compute::multiHeadAttention bakes in scale = 1/sqrt(headDim).
-    // Callers that pass a different scale (Gemma 4 uses 1.0 because
-    // Q was pre-scaled elsewhere) don't fit today's reference. When
-    // the mismatch is small (< 1e-3 relative) we still delegate;
-    // otherwise throw so bugs surface early.
-    const float expected = 1.0F / std::sqrt(static_cast<float>(headDim));
-    if (std::fabs(scale - expected) > 1e-3F * expected) {
-        throw std::runtime_error(
-            "compute::cpu::GpuOps::attentionAsync: custom scale (" +
-            std::to_string(scale) + " vs baked-in " +
-            std::to_string(expected) + ") not supported by the "
-            "reference multiHeadAttention — M-CPU.4 lifts the "
-            "restriction by threading `scale` through");
-    }
+    // M-CPU.4b: `scale` is threaded through to compute::multiHeadAttention
+    // (which now accepts an optional override; positive value wins,
+    // 0 / negative means "use default 1/sqrt(headDim)"). Gemma 4's 1.0F
+    // and Qwen's baked-default both round-trip cleanly.
     std::vector<float> scratch(T_k);
     ::mimirmind::compute::multiHeadAttention(
         q,
@@ -359,7 +349,8 @@ void GpuOps::attentionAsync(const float*     q,
         positionOffset,
         scratch.data(),
         out,
-        slidingWindow);
+        slidingWindow,
+        scale);
 }
 
 // ---- Reordered Q8_0 matvec ---------------------------------------------
