@@ -296,22 +296,49 @@ void GpuOps::kvQuantCommitQ8Async(const float* /*xSrc*/,
     throwNotImplemented("kvQuantCommitQ8Async");
 }
 
-void GpuOps::qkvSplitAsync(const float*     /*fused*/,
-                           float*           /*Yq*/,
-                           void*            /*YkBase*/,
-                           void*            /*YvBase*/,
-                           std::size_t      /*M*/,
-                           std::size_t      /*Nq*/,
-                           std::size_t      /*Nkv*/,
-                           bool             /*hasV*/,
-                           std::size_t      /*writeOffset*/,
-                           runtime::KvDtype /*kvDtype*/,
-                           bool             /*useStagingSlot*/) {
-    // Scatter of a fused QKV matmul output into three destinations
-    // with kvDtype conversion and rolling-slot arithmetic. Non-trivial
-    // for CPU because of the FP16 / Q8_0 K/V write paths. Left for
-    // M-CPU.4 fill-in.
-    throwNotImplemented("qkvSplitAsync");
+void GpuOps::qkvSplitAsync(const float*     fused,
+                           float*           Yq,
+                           void*            YkBase,
+                           void*            YvBase,
+                           std::size_t      M,
+                           std::size_t      Nq,
+                           std::size_t      Nkv,
+                           bool             hasV,
+                           std::size_t      writeOffset,
+                           runtime::KvDtype kvDtype,
+                           bool             useStagingSlot) {
+    if (kvDtype != runtime::KvDtype::F32) {
+        throw std::runtime_error(
+            "compute::cpu::GpuOps::qkvSplitAsync: only KvDtype::F32 is "
+            "supported by the M-CPU.4 fills — FP16 / Q8_0 KV cache "
+            "lands with a follow-up commit");
+    }
+    // useStagingSlot is an L0-CLR construct (mutable command list KV
+    // slot indirection). No analogue on CPU where nothing is recorded.
+    (void)useStagingSlot;
+
+    // Fused row layout matches the L0 kernel contract in
+    // qkv_split.cl: Q columns come first, then K, then (if hasV) V.
+    // Total row width = Nq + Nkv + (hasV ? Nkv : 0).
+    const std::size_t fusedStride = Nq + Nkv + (hasV ? Nkv : 0);
+
+    // K / V cache bases already point at row 0 of the layer's cache;
+    // the caller's `writeOffset` = current cache length in rows. We
+    // advance to the write slot once here rather than adding
+    // `writeOffset * Nkv` per row inside the loop.
+    float* Yk = static_cast<float*>(YkBase) + writeOffset * Nkv;
+    float* Yv = hasV
+        ? static_cast<float*>(YvBase) + writeOffset * Nkv
+        : nullptr;
+
+    for (std::size_t m = 0; m < M; ++m) {
+        const float* row = fused + m * fusedStride;
+        std::memcpy(Yq + m * Nq,     row,             Nq  * sizeof(float));
+        std::memcpy(Yk + m * Nkv,    row + Nq,        Nkv * sizeof(float));
+        if (hasV) {
+            std::memcpy(Yv + m * Nkv, row + Nq + Nkv, Nkv * sizeof(float));
+        }
+    }
 }
 
 // ---- Attention ----------------------------------------------------------
