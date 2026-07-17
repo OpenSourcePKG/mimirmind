@@ -3,6 +3,8 @@
 
 #include "core/backend/BackendRegistry.hpp"
 
+#include "core/cpu/CpuContext.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -48,13 +50,6 @@ BackendProbe missing(BackendKind kind, const char* why) {
     return BackendProbe{kind, /*compiledIn=*/false, /*available=*/false, why};
 }
 
-BackendProbe cpuPlaceholder() {
-    // No real Cpu backend today — announce it as not-compiled-in so
-    // consumers understand the story is symmetric.
-    return missing(BackendKind::Cpu,
-                   "no CPU compute backend — reference paths live inline in compute/");
-}
-
 BackendProbe cudaPlaceholder() {
     return missing(BackendKind::Cuda,
                    "not compiled in — CUDA backend not committed (no DGX-class target)");
@@ -81,7 +76,7 @@ std::vector<BackendProbe> BackendRegistry::probeAll() noexcept {
 #endif
 
     out.push_back(cudaPlaceholder());
-    out.push_back(cpuPlaceholder());
+    out.push_back(::mimirmind::core::cpu::probeBackend());
 
     return out;
 }
@@ -182,9 +177,7 @@ BackendRegistry::createContext(BackendKind kind) {
                 "(no DGX-class target committed)"};
 
         case BackendKind::Cpu:
-            throw std::runtime_error{
-                "BackendKind::Cpu has no compute backend — "
-                "reference paths live inline in compute/"};
+            return ::mimirmind::core::cpu::createComputeContext();
 
         case BackendKind::Unknown:
             throw std::runtime_error{

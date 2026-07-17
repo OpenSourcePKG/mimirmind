@@ -287,6 +287,7 @@ find_package(Threads REQUIRED)
 add_library(mimirmind_core_common STATIC
     src/core/backend/BackendRegistry.cpp
     src/core/config/Config.cpp
+    src/core/cpu/CpuContext.cpp
     src/core/gguf/GgufTypes.cpp
     src/core/gguf/TensorFingerprint.cpp
     src/core/gguf/WeightsMap.cpp
