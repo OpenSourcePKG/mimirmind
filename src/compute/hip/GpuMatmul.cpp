@@ -122,11 +122,12 @@ double medianMs(std::vector<double> xs) {
 
 } // namespace
 
-// Pimpl body — 5 Q8_0 matmul-family kernels. Q4_K / Q5_K / Q6_K
-// matmul kernels aren't ported to HIP yet; the dispatcher's
-// `supports()` returns false for those types so callers know to
-// fall back (or the HIP backend refuses to load models with
-// unsupported quant weights).
+// Pimpl body — Q8_0 matmul family (5 kernels) + Q5_0 vec. Q4_K /
+// Q5_K / Q6_K matmul kernels aren't ported to HIP yet; matmulAsync
+// falls back to the CPU reference (`compute::matmul`) for those,
+// staging W/X through host memory. The dispatcher's `supports()`
+// stays true for anything with a QuantTypeRegistry entry so the
+// engine keeps loading these weight types.
 struct GpuMatmul::Impl {
     ::mimirmind::core::hip::HipModule _matmulQ8_0VecModule;
     ::mimirmind::core::hip::HipKernel _matmulQ8_0VecKernel;
@@ -138,6 +139,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::hip::HipKernel _matmulQ8_0VecDp4aKernel;
     ::mimirmind::core::hip::HipModule _moeDownFusedKQ8_0Module;
     ::mimirmind::core::hip::HipKernel _moeDownFusedKQ8_0Kernel;
+    ::mimirmind::core::hip::HipModule _matmulQ5_0VecModule;
+    ::mimirmind::core::hip::HipKernel _matmulQ5_0VecKernel;
 
     explicit Impl(::mimirmind::core::hip::HipContext& ctx)
         : _matmulQ8_0VecModule    {loadHipModule(ctx, "matmul_q8_0_vec")},
@@ -154,7 +157,10 @@ struct GpuMatmul::Impl {
               _matmulQ8_0VecDp4aModule.getKernel("matmul_q8_0_vec_dp4a")},
           _moeDownFusedKQ8_0Module{loadHipModule(ctx, "moe_down_fused_k_q8_0")},
           _moeDownFusedKQ8_0Kernel{
-              _moeDownFusedKQ8_0Module.getKernel("moe_down_fused_k_q8_0")}
+              _moeDownFusedKQ8_0Module.getKernel("moe_down_fused_k_q8_0")},
+          _matmulQ5_0VecModule    {loadHipModule(ctx, "matmul_q5_0_vec")},
+          _matmulQ5_0VecKernel    {
+              _matmulQ5_0VecModule.getKernel("matmul_q5_0_vec")}
     {}
 };
 
@@ -165,8 +171,9 @@ GpuMatmul::GpuMatmul(::mimirmind::core::hip::HipComputeContext& ctx,
       _pimpl{std::make_unique<Impl>(ctx.hipContext())}
 {
     MM_LOG_INFO("hip::GpuMatmul",
-                "compute::hip::GpuMatmul ready — 5 Q8_0 kernels loaded "
-                "(vec / gemm / gemm_v2 / vec_dp4a / moe_down_fused_k)");
+                "compute::hip::GpuMatmul ready — 6 kernels loaded "
+                "(Q8_0: vec / gemm / gemm_v2 / vec_dp4a / moe_down_fused_k; "
+                "Q5_0: vec)");
 }
 
 GpuMatmul::~GpuMatmul() = default;
@@ -459,6 +466,41 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
     (void)scratch;
 
     if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
+
+    if (type == ::mimirmind::core::gguf::GgmlType::Q5_0) {
+        // Native Q5_0 vec kernel — same launch geometry as the Q8_0
+        // vec path (128 threads = 4 warps × 32 lanes, one warp per
+        // output row, MATMUL_Q5_0_OUTPUTS_PER_GROUP = 4). Q5_0 blocks
+        // are 32 elements / 22 bytes with fp16 scale + u32 high-bits
+        // + 16 packed nibbles; the kernel handles the bit-extraction
+        // per lane. Per-row matvec loop over M like Q8_0's fallback.
+        constexpr std::size_t kBlockElts = 32;
+        if (K % kBlockElts != 0) {
+            throw std::runtime_error(
+                "compute::hip::GpuMatmul::matmulAsync: K=" +
+                std::to_string(K) + " is not a multiple of Q5_0 "
+                "blockElements=" + std::to_string(kBlockElts));
+        }
+        const std::uint32_t nGroups = static_cast<std::uint32_t>(
+            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+
+        auto& kern = _pimpl->_matmulQ5_0VecKernel;
+        for (std::size_t m = 0; m < M; ++m) {
+            const float* xRow = X + m * K;
+            float*       yRow = Y + m * N;
+
+            kern.setPtr  (0, xRow);
+            kern.setPtr  (1, W);
+            kern.setPtr  (2, yRow);
+            kern.setValue(3, static_cast<std::int32_t>(K));
+            kern.setValue(4, static_cast<std::int32_t>(N));
+
+            kern.launch(_ctx.stream(),
+                        nGroups, 1, 1,
+                        kVecLocalSize, 1, 1);
+        }
         return;
     }
 
