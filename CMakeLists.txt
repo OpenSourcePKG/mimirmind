@@ -553,6 +553,7 @@ add_executable(mimirmind
     src/compute/Attention.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
+    src/compute/cpu/GpuOps.cpp
     src/compute/l0/GpuMatmul.cpp
     src/compute/l0/GpuOps.cpp
     src/compute/Matmul.cpp
@@ -797,6 +798,7 @@ add_executable(gpu_tests
     src/compute/Attention.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
+    src/compute/cpu/GpuOps.cpp
     src/compute/l0/GpuMatmul.cpp
     src/compute/l0/GpuOps.cpp
     src/compute/Matmul.cpp
@@ -840,6 +842,7 @@ add_executable(prefill_bench
     src/compute/Attention.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
+    src/compute/cpu/GpuOps.cpp
     src/compute/l0/GpuMatmul.cpp
     src/compute/l0/GpuOps.cpp
     src/compute/Matmul.cpp
