@@ -4,7 +4,10 @@
 #include "runtime/InferenceEngine.hpp"
 
 #include "compute/Embedding.hpp"
+#include "compute/cpu/GpuMatmul.hpp"
+#include "compute/cpu/GpuOps.hpp"
 #include "core/backend/BackendRegistry.hpp"
+#include "core/cpu/CpuContext.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "core/gguf/TensorFingerprint.hpp"
 #include "core/config/Config.hpp"
@@ -140,6 +143,14 @@ makeComputeContext(const Config& cfg, core::backend::BackendKind kind) {
                 "(MIMIRMIND_ENABLE_HIP=OFF at build time)"};
 #endif
 
+        case core::backend::BackendKind::Cpu:
+            // Cpu is always compiled in — no ifdef. Reference backend
+            // with no config knobs; used as the graceful-degradation
+            // path when no GPU driver is reachable, or explicitly via
+            // MIMIRMIND_BACKEND=Cpu for parity / diagnosis.
+            (void)cfg;
+            return std::make_unique<core::cpu::CpuContext>();
+
         default:
             throw std::runtime_error{
                 "InferenceEngine: no supported compute backend for kind "
@@ -175,6 +186,14 @@ makeGpuOps(core::backend::ComputeContext&        ctx,
             break;
 #endif
 
+        case core::backend::BackendKind::Cpu:
+            // features.* aren't threaded through — CPU GpuOps returns
+            // neutral defaults for every feature-flag accessor (flash
+            // disabled, no reorder, self-test "cpu-noop").
+            (void)features;
+            return std::make_unique<compute::cpu::GpuOps>(
+                static_cast<core::cpu::CpuContext&>(ctx));
+
         default:
             break;
     }
@@ -204,6 +223,13 @@ makeGpuMatmul(core::backend::ComputeContext& ctx,
 #else
             break;
 #endif
+
+        case core::backend::BackendKind::Cpu:
+            // GpuMatmul on CPU doesn't need a GpuOps reference — no
+            // shared kernel state or DP4A workspace to coordinate.
+            (void)ops;
+            return std::make_unique<compute::cpu::GpuMatmul>(
+                static_cast<core::cpu::CpuContext&>(ctx));
 
         default:
             break;
