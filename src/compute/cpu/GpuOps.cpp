@@ -227,20 +227,31 @@ void GpuOps::ropeInPlaceAsync(void*            xBase,
                                            startPos, base);
 }
 
-void GpuOps::ropeInPlaceWithFactorsAsync(void*            /*xBase*/,
-                                         const float*     /*freqFactors*/,
-                                         std::size_t      /*seqLen*/,
-                                         std::size_t      /*numHeads*/,
-                                         std::size_t      /*headDim*/,
-                                         std::size_t      /*startPos*/,
-                                         float            /*base*/,
-                                         std::size_t      /*writeOffsetStride*/,
-                                         runtime::KvDtype /*kvDtype*/) {
-    // Proportional-RoPE variant (Gemma 3/4 global-attention). CPU
-    // reference doesn't have a freqFactors variant of applyRopeInPlace
-    // today — implementing it means duplicating the RoPE inner loop
-    // with per-pair 1/freqFactors[i] scaling. Left for M-CPU.4.
-    throwNotImplemented("ropeInPlaceWithFactorsAsync");
+void GpuOps::ropeInPlaceWithFactorsAsync(void*            xBase,
+                                         const float*     freqFactors,
+                                         std::size_t      seqLen,
+                                         std::size_t      numHeads,
+                                         std::size_t      headDim,
+                                         std::size_t      startPos,
+                                         float            base,
+                                         std::size_t      writeOffsetStride,
+                                         runtime::KvDtype kvDtype) {
+    if (kvDtype != runtime::KvDtype::F32) {
+        throw std::runtime_error(
+            "compute::cpu::GpuOps::ropeInPlaceWithFactorsAsync: only "
+            "KvDtype::F32 is supported by the M-CPU.4a fill — FP16 / "
+            "Q8_0 KV cache lands with a follow-up commit");
+    }
+    // Same writeOffsetStride semantics as ropeInPlaceAsync: measured
+    // in F32 elements. Q-rope callers pass 0; K-rope with a rolling
+    // cache passes the layer's kvDim so `xBase + startPos*writeOffsetStride`
+    // hits the row for the current token.
+    float* effective = static_cast<float*>(xBase)
+                     + startPos * writeOffsetStride;
+    ::mimirmind::compute::applyRopeInPlaceWithFactors(
+        effective, freqFactors,
+        seqLen, numHeads, headDim,
+        startPos, base);
 }
 
 // ---- Quantisation + KV commit ------------------------------------------

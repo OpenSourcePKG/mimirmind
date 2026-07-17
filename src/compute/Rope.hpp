@@ -34,4 +34,23 @@ void applyRopeInPlace(float*        x,
                       std::size_t   startPos,
                       float         base);
 
+/**
+ * Proportional-RoPE variant with per-pair frequency factors. Matches
+ * ggml's `ggml_rope_ext` extension used by Gemma 3 / 4 global-attention
+ * layers: the per-pair angle becomes
+ *
+ *   theta_i = pos * base^(-2i/headDim) / freqFactors[i]
+ *
+ * `freqFactors` points at `headDim / 2` f32 values. Zero entries throw
+ * (division by zero would silently NaN the head). Everything else
+ * matches `applyRopeInPlace`.
+ */
+void applyRopeInPlaceWithFactors(float*        x,
+                                 const float*  freqFactors,
+                                 std::size_t   seqLen,
+                                 std::size_t   numHeads,
+                                 std::size_t   headDim,
+                                 std::size_t   startPos,
+                                 float         base);
+
 } // namespace mimirmind::compute
