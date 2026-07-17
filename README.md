@@ -197,6 +197,32 @@ What remains before Mimir-1.0 is "tagged" rather than just "working":
 - **Pegenaut integration** — the sister TypeScript RAG project that
   this engine was originally built to feed.
 
+## Compute backends
+
+MimirMind builds against a backend-neutral `ComputeContext` +
+`ComputeOps` + `ComputeMatmul` interface. Three concrete backends live
+in the tree; selection is via `MIMIRMIND_BACKEND=l0|hip|cpu` or auto-
+select (walks Level Zero → HIP → Cpu and picks the first that
+compiled + probes available).
+
+| Backend | Hardware target | Status | Kernel path |
+|---|---|---|---|
+| **Level Zero** | Intel Xe-LPG (Meteor Lake iGPU, primary target) | production | F32 / F16 / BF16 + all quant matmuls (Q4_K / Q5_K / Q5_0 / Q6_K / Q8_0), flash prefill, DP4A, Command-List Replay |
+| **HIP / ROCm** | AMD RDNA3 (`gfx1101`, RX 7800 XT bring-up rig) | end-to-end `loadModel` proven on Qwen 2.5 (Schicht 6.0, 2026-07-17). Q8_0 native, non-Q8_0 dispatch through a CPU-fallback (Schicht 6.1) using the reference dequant paths — correctness first, native Q4_K / Q5_0 / Q6_K kernels on the follow-up roadmap | Q8_0 GPU + CPU-fallback for the rest |
+| **CPU** | any x86-64 Linux | reference / fallback / oracle. Full `ComputeOps` interface for F32 KV cache (Qwen 2.5, Gemma 4 baseline); FP16 / Q8_0 KV, DP4A, MoE fused-K throw NotImplemented by design — those are hardware-specific fast paths with no CPU analogue worth writing before there's a perf target | scalar C++ (no SIMD yet), always compiled in |
+
+Level Zero is the production target and where every optimisation
+milestone lands first. HIP opens a second hardware family without
+going through SYCL or a vendor-neutral graph compiler. CPU is the
+in-repo reference oracle used by the parity tests + the graceful-
+degradation path on hosts without a GPU driver.
+
+The abstraction sits behind `src/core/backend/{ComputeBackend,
+ComputeContext,BackendRegistry}.hpp` and the two op interfaces at
+`src/compute/{ComputeOps,ComputeMatmul}.hpp`; concrete backends live
+under `src/core/gpu/<backend>/` (context) and `src/compute/<backend>/`
+(ops + matmul).
+
 ## What's coming
 
 **Project Sleipnir: Speed.** Odin's eight-legged mount. The
@@ -214,13 +240,13 @@ Gemma 4 31B dense variant. On UMA hardware this is mostly a
 page-table-shuffle problem, not the PCIe-bandwidth problem it is on
 discrete GPUs.
 
-**AMD/HIP backend.** The compute layer is being lifted behind a
-`ComputeContext` abstraction on `main`, and a HIP/ROCm implementation
-targeting RDNA3 (`gfx1101`, RX 7800 XT bring-up rig) is in flight on
-`feat/hip-backend-skeleton` — kernel-by-kernel port from the Level-Zero
-side, each verified against the CPU-reference math. Meteor-Lake Xe-LPG
-remains the primary target; HIP opens a second hardware family without
-introducing SYCL or a vendor-neutral graph compiler.
+**HIP kernel coverage.** With the HIP backend's structural bring-up
+done (see [Compute backends](#compute-backends)), the follow-up is
+native `matmul_q4k_*` / `matmul_q5_0_*` / `matmul_q6k_*` HIP kernels
+so Qwen 2.5 and Gemma 4 stop paying the CPU-fallback round-trip on
+non-Q8_0 weights. `hipGraph` as an analogue to Level Zero's
+Command-List Replay is shelved but ready — the kernel side already
+consumes the `curLenSlot` USM indirection that CLR needed.
 
 **Pegenaut backend.** MimirMind is the inference half of a TypeScript
 RAG stack we're building in parallel. The two will ship as a unit.
