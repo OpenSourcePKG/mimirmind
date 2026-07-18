@@ -461,6 +461,16 @@ void GpuOps::appendMemoryCopy(void* dst, const void* src, std::size_t bytes) {
     std::memcpy(dst, src, bytes);
 }
 
+void GpuOps::readbackToHost(void* hostDst, const void* deviceSrc,
+                            std::size_t bytes) {
+    // CPU backend's "device" pointers are host memory already, so the
+    // sampler can read them directly. Provide a plain memcpy for
+    // callers that copy defensively regardless of backend.
+    if (bytes != 0) {
+        std::memcpy(hostDst, deviceSrc, bytes);
+    }
+}
+
 // ---- Allocation --------------------------------------------------------
 
 ::mimirmind::compute::ComputeBuffer

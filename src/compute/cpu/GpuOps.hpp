@@ -219,6 +219,8 @@ public:
     void popUnorderedScope()  override {}
     void appendMemoryCopy(void* dst, const void* src, std::size_t bytes) override;
     void flush() override {}
+    void readbackToHost(void* hostDst, const void* deviceSrc,
+                        std::size_t bytes) override;
 
     // ---- Allocation ----------------------------------------------------
 

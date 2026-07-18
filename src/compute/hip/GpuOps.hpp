@@ -196,6 +196,8 @@ public:
     void popUnorderedScope()  override;
     void appendMemoryCopy(void* dst, const void* src, std::size_t bytes) override;
     void flush() override;
+    void readbackToHost(void* hostDst, const void* deviceSrc,
+                        std::size_t bytes) override;
 
     // Schritt 3c.2 — neutral buffer factory. Routes through the shared
     // `HipMemoryAllocator` in `HipAllocKind::Device` mode and installs

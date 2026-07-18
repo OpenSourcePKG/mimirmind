@@ -753,8 +753,21 @@ InferenceEngine::sampleNext(const float*                   hidden,
         normScratch, 1,
         logits, matmulScratch);
 
+    // Bring logits over to a plain host buffer before the sampler's
+    // argmax / top-p scan touches them. On L0 iGPU / USM this is a
+    // cheap memcpy inside the same address space; on HIP discrete
+    // gfx1101 it is a single bulk `hipMemcpy(D→H)` that replaces the
+    // 152 k byte-by-byte PCIe reads the sampler used to do (~100 ms
+    // per token gone). See ComputeOps::readbackToHost doc-comment.
+    if (_logitsHostScratch.size() < vocab_lm) {
+        _logitsHostScratch.resize(vocab_lm);
+    }
+    _ops->readbackToHost(_logitsHostScratch.data(), logits,
+                         vocab_lm * sizeof(float));
+
     return _sampler.sample(
-        std::span<const float>{logits, vocab_lm}, recentTokens, sampling);
+        std::span<const float>{_logitsHostScratch.data(), vocab_lm},
+        recentTokens, sampling);
 }
 
 std::vector<std::int32_t>

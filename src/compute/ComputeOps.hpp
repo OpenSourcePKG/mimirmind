@@ -257,6 +257,24 @@ public:
     /// hold `ComputeOps&`.
     virtual void flush() = 0;
 
+    /// Copy `bytes` from a device buffer to a plain host buffer
+    /// synchronously — the CPU can dereference `dst` immediately after
+    /// return.
+    ///
+    /// **Why this exists (Session 2026-07-18 finding):** L0 on Meteor
+    /// Lake uses UMA/USM so a device pointer is directly host-readable
+    /// with cache-line-speed access. HIP on discrete gfx1101 does NOT
+    /// share memory: every host-side `logits[i]` on a `hipMalloc`'d
+    /// buffer traverses PCIe, ~700 ns/access × 152 k vocab = ~110 ms
+    /// per token. That was the dominant unaccounted decode cost.
+    /// Callers that need to CPU-scan a device buffer (argmax, top-k,
+    /// etc.) must go through this method — L0 falls back to std::memcpy
+    /// (which the compiler often elides when src == dst), HIP issues a
+    /// single bulk `hipMemcpy(D→H)`.
+    virtual void readbackToHost(void*       hostDst,
+                                const void* deviceSrc,
+                                std::size_t bytes) = 0;
+
     // ---- Allocation (Schritt 3c.2) ------------------------------------
     //
     // Neutral buffer factory. Consumers that used to construct

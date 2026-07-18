@@ -456,6 +456,20 @@ void GpuOps::flush() {
     _ctx.stream().synchronize();
 }
 
+void GpuOps::readbackToHost(void* hostDst, const void* deviceSrc,
+                            std::size_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    // Wait for any pending compute stream work (lm_head matmul in
+    // particular) before pulling bytes back — otherwise we'd read
+    // stale contents. `hipMemcpy` D2H is itself synchronous, so the
+    // stream sync is defensive against unrelated pending work on
+    // other paths.
+    _ctx.stream().synchronize();
+    _ctx.allocator().copyD2H(hostDst, deviceSrc, bytes);
+}
+
 // Schritt 3c.2 — neutral buffer factory. Zero-byte request skips the
 // allocator to keep parity with the L0 side and with the empty
 // ComputeBuffer default-ctor semantics. The deleter closure captures

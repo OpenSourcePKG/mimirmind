@@ -494,6 +494,9 @@ private:
     compute::ComputeBuffer             _normFinalH;
     compute::ComputeBuffer             _logitsH;
     compute::ComputeBuffer             _logitsScH;
+    // Plain host scratch that mirrors _logitsH for the CPU-side
+    // sampler pass. See sampleNext + ComputeOps::readbackToHost.
+    std::vector<float>                 _logitsHostScratch;
     std::size_t                        _maxContextTokens{8192}; // see setMaxContextTokens
     KvDtype                            _kvDtype{KvDtype::F32};    // see setKvDtype
     std::size_t                        _cacheMaxT    {0};   // max prompt-chunk scratch was sized for

@@ -352,6 +352,20 @@ void GpuOps::flush() {
     _queue.flush();
 }
 
+void GpuOps::readbackToHost(void* hostDst, const void* deviceSrc,
+                            std::size_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    // L0 USM is host-readable — the compute stream still needs to
+    // drain first so writes from the last kernel land before the CPU
+    // reads them, then a plain memcpy suffices (typically zero-cost
+    // when hostDst and deviceSrc are the same underlying USM pointer,
+    // which callers may exploit).
+    _queue.flush();
+    std::memcpy(hostDst, deviceSrc, bytes);
+}
+
 // Schritt 3c.2 — neutral buffer factory. Consumers that used to build
 // `core::l0::UsmHandle{allocator(), bytes}` call `_ops.allocate(bytes)`
 // instead; the returned ComputeBuffer carries the deleter that calls
