@@ -69,6 +69,30 @@ int runSmoke(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 
         engine.loadModel(args.modelPath);
 
+        // Apply runtime.kvDtype / runtime.maxContextTokens from
+        // config.json — mirrors ServeMode.cpp:197-200 (setKvDtype +
+        // setMaxContextTokens inspect loaded model state for
+        // fused-QKV / attn_k-v.bias coverage per block, so overrides
+        // must land AFTER loadModel).
+        {
+            const auto& rt = cfg.runtime;
+            if (rt.maxContextTokens.has_value() && *rt.maxContextTokens > 0) {
+                engine.setMaxContextTokens(*rt.maxContextTokens);
+            }
+            if (rt.kvDtype.has_value()) {
+                const std::string_view v{*rt.kvDtype};
+                if      (v == "fp16") engine.setKvDtype(::mimirmind::runtime::KvDtype::FP16);
+                else if (v == "q8_0") engine.setKvDtype(::mimirmind::runtime::KvDtype::Q8_0);
+                else if (v == "f32" || v.empty())
+                                      engine.setKvDtype(::mimirmind::runtime::KvDtype::F32);
+                else {
+                    MM_LOG_WARN("main",
+                                "runtime.kvDtype='{}' unrecognised — falling "
+                                "back to f32", v);
+                }
+            }
+        }
+
         if (isL0) {
             printM3Summary(engine);
             runM5bQ4KParity(engine.ctx(), engine.allocator(), engine.weights());
