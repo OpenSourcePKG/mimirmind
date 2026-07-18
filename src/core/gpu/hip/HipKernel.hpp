@@ -7,10 +7,10 @@
 
 #include <hip/hip_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace mimirmind::core::hip {
 
@@ -87,9 +87,21 @@ public:
     [[nodiscard]] const std::string& name() const noexcept { return _name; }
 
 private:
+    // Fixed-capacity arg storage — no per-launch heap allocation. Every
+    // hot-path launch was building a fresh `std::vector<void*>` argPtrs
+    // and the arg slots were themselves vectors, so ~10k dispatches per
+    // decode meant thousands of tiny mallocs. Cap of 16 slots × 16 B
+    // covers every kernel we launch (largest is `attention_prefill_flash`
+    // with ~12 args, none wider than a pointer).
+    static constexpr std::size_t kMaxArgs      = 16;
+    static constexpr std::size_t kMaxArgBytes  = 16;
+
     hipFunction_t                       _fn{nullptr};
     std::string                         _name;
-    std::vector<std::vector<std::byte>> _argStorage;
+    std::size_t                         _argCount{0};
+    alignas(std::uint64_t) std::array<
+        std::array<std::uint8_t, kMaxArgBytes>, kMaxArgs> _argStorage{};
+    std::array<void*, kMaxArgs>         _argPtrs{};
 };
 
 } // namespace mimirmind::core::hip

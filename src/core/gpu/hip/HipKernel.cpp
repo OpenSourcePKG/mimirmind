@@ -6,6 +6,8 @@
 #include "core/gpu/hip/HipModule.hpp"
 
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace mimirmind::core::hip {
@@ -21,23 +23,41 @@ inline void hipCheck(const char* call, hipError_t code) {
 } // namespace
 
 HipKernel::HipKernel(HipModule& /*parent*/, hipFunction_t fn, std::string name)
-    : _fn(fn), _name(std::move(name)) {}
+    : _fn(fn), _name(std::move(name)) {
+    // Prime the argPtrs table once. Each slot points at a fixed
+    // location in _argStorage — pointers never invalidate, so the
+    // hipModuleLaunchKernel `void**` at launch time is the raw
+    // `_argPtrs.data()` without any per-launch fixup.
+    for (std::size_t i = 0; i < kMaxArgs; ++i) {
+        _argPtrs[i] = _argStorage[i].data();
+    }
+}
 
 void HipKernel::setPtr(std::uint32_t index, const void* devicePtr) {
     setRaw(index, sizeof(devicePtr), &devicePtr);
 }
 
 void HipKernel::setRaw(std::uint32_t index, std::size_t bytes, const void* value) {
-    if (index >= _argStorage.size()) {
-        _argStorage.resize(index + 1);
+    if (index >= kMaxArgs) {
+        throw std::runtime_error(
+            std::string{"HipKernel::setRaw("} + _name +
+            "): arg index " + std::to_string(index) +
+            " exceeds kMaxArgs=" + std::to_string(kMaxArgs));
     }
-    auto& slot = _argStorage[index];
-    slot.assign(bytes, std::byte{0});
-    std::memcpy(slot.data(), value, bytes);
+    if (bytes > kMaxArgBytes) {
+        throw std::runtime_error(
+            std::string{"HipKernel::setRaw("} + _name +
+            "): arg size " + std::to_string(bytes) +
+            " exceeds kMaxArgBytes=" + std::to_string(kMaxArgBytes));
+    }
+    std::memcpy(_argStorage[index].data(), value, bytes);
+    if (index + 1 > _argCount) {
+        _argCount = index + 1;
+    }
 }
 
 void HipKernel::clearArgs() noexcept {
-    _argStorage.clear();
+    _argCount = 0;
 }
 
 void HipKernel::launch(HipStream&    stream,
@@ -48,16 +68,9 @@ void HipKernel::launch(HipStream&    stream,
                        std::uint32_t blockY,
                        std::uint32_t blockZ,
                        std::size_t   sharedMemBytes) {
-    // Build the void** pointer-array HIP expects. Each entry points to
-    // the corresponding slot in _argStorage — HIP reads the value at
-    // launch queue-time, not at return, so the storage must outlive
-    // the launch call (it does — it's owned by the kernel).
-    std::vector<void*> argPtrs;
-    argPtrs.reserve(_argStorage.size());
-    for (auto& slot : _argStorage) {
-        argPtrs.push_back(slot.data());
-    }
-
+    // No allocation. `_argPtrs.data()` was primed at construction and
+    // points at `_argStorage[i].data()` for each slot; HIP reads the
+    // value pointed to at queue-submit time.
     hipCheck("hipModuleLaunchKernel",
              hipModuleLaunchKernel(
                  _fn,
@@ -65,7 +78,7 @@ void HipKernel::launch(HipStream&    stream,
                  blockX, blockY, blockZ,
                  static_cast<unsigned int>(sharedMemBytes),
                  stream.handle(),
-                 argPtrs.empty() ? nullptr : argPtrs.data(),
+                 _argCount == 0 ? nullptr : _argPtrs.data(),
                  /*extra=*/nullptr));
 }
 

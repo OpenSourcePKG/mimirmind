@@ -294,10 +294,10 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                         /*slidingWindow=*/0,
                         kvDtype);
 
-    trace("O projection (matmul)");
-    _gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,
-                attnOutBuf, T,
-                projOutBuf, matmulScratch);
+    trace("O projection (matmulAsync — in-stream ordered, no sync needed)");
+    _gmm.matmulAsync(oW->type, oW->usmPtr, d_model, q_dim,
+                     attnOutBuf, T,
+                     projOutBuf, matmulScratch);
 
     trace("attn residual + ffn rmsNorm (fused)");
     _ops.addRmsNormAsync(x, projOutBuf, T, d_model,
@@ -320,10 +320,10 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     trace("FFN silu+mul (async, fused)");
     _ops.siluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
 
-    trace("FFN down (matmul)");
-    _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
-                gateOutBuf, T,
-                projOutBuf, matmulScratch);
+    trace("FFN down (matmulAsync — in-stream ordered, no sync needed)");
+    _gmm.matmulAsync(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
+                     gateOutBuf, T,
+                     projOutBuf, matmulScratch);
 
     trace("ffn residual (async, exit)");
     _ops.addResidualAsync(x, projOutBuf, T * d_model);
