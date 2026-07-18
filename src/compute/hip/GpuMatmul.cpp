@@ -124,10 +124,10 @@ double medianMs(std::vector<double> xs) {
 
 } // namespace
 
-// Pimpl body — Q8_0 matmul family (5 kernels) + Q5_0 vec + Q6_K vec.
-// Q4_K / Q5_K matmul kernels aren't ported to HIP yet; matmulAsync
-// falls back to the CPU reference (`compute::matmul`) for those,
-// staging W/X through host memory. The dispatcher's `supports()`
+// Pimpl body — Q8_0 matmul family (5 kernels) + Q5_0 vec + Q6_K vec
+// + Q4_K vec. Q5_K matmul kernel isn't ported to HIP yet; matmulAsync
+// falls back to the CPU reference (`compute::matmul`) for anything
+// else, staging W/X through host memory. The dispatcher's `supports()`
 // stays true for anything with a QuantTypeRegistry entry so the
 // engine keeps loading these weight types.
 struct GpuMatmul::Impl {
@@ -145,6 +145,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::hip::HipKernel _matmulQ5_0VecKernel;
     ::mimirmind::core::hip::HipModule _matmulQ6KVecModule;
     ::mimirmind::core::hip::HipKernel _matmulQ6KVecKernel;
+    ::mimirmind::core::hip::HipModule _matmulQ4KVecModule;
+    ::mimirmind::core::hip::HipKernel _matmulQ4KVecKernel;
 
     explicit Impl(::mimirmind::core::hip::HipContext& ctx)
         : _matmulQ8_0VecModule    {loadHipModule(ctx, "matmul_q8_0_vec")},
@@ -167,7 +169,10 @@ struct GpuMatmul::Impl {
               _matmulQ5_0VecModule.getKernel("matmul_q5_0_vec")},
           _matmulQ6KVecModule     {loadHipModule(ctx, "matmul_q6k_vec")},
           _matmulQ6KVecKernel     {
-              _matmulQ6KVecModule.getKernel("matmul_q6k_vec")}
+              _matmulQ6KVecModule.getKernel("matmul_q6k_vec")},
+          _matmulQ4KVecModule     {loadHipModule(ctx, "matmul_q4k_vec")},
+          _matmulQ4KVecKernel     {
+              _matmulQ4KVecModule.getKernel("matmul_q4k_vec")}
     {}
 };
 
@@ -178,9 +183,9 @@ GpuMatmul::GpuMatmul(::mimirmind::core::hip::HipComputeContext& ctx,
       _pimpl{std::make_unique<Impl>(ctx.hipContext())}
 {
     MM_LOG_INFO("hip::GpuMatmul",
-                "compute::hip::GpuMatmul ready — 7 kernels loaded "
+                "compute::hip::GpuMatmul ready — 8 kernels loaded "
                 "(Q8_0: vec / gemm / gemm_v2 / vec_dp4a / moe_down_fused_k; "
-                "Q5_0: vec; Q6_K: vec)");
+                "Q5_0: vec; Q6_K: vec; Q4_K: vec)");
 }
 
 GpuMatmul::~GpuMatmul() = default;
@@ -527,6 +532,39 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
             (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
 
         auto& kern = _pimpl->_matmulQ6KVecKernel;
+        for (std::size_t m = 0; m < M; ++m) {
+            const float* xRow = X + m * K;
+            float*       yRow = Y + m * N;
+
+            kern.setPtr  (0, xRow);
+            kern.setPtr  (1, W);
+            kern.setPtr  (2, yRow);
+            kern.setValue(3, static_cast<std::int32_t>(K));
+            kern.setValue(4, static_cast<std::int32_t>(N));
+
+            kern.launch(_ctx.stream(),
+                        nGroups, 1, 1,
+                        kVecLocalSize, 1, 1);
+        }
+        return;
+    }
+
+    if (type == ::mimirmind::core::gguf::GgmlType::Q4_K) {
+        // Native Q4_K vec kernel — same launch as Q6_K but block is
+        // 256 elements / 144 bytes with d/dmin/scales[12]/qs[128]
+        // layout. Asymmetric quant: value = d*scale*nibble - dmin*min
+        // per sub-block. K must be a multiple of the super-block size.
+        constexpr std::size_t kBlockElts = 256;
+        if (K % kBlockElts != 0) {
+            throw std::runtime_error(
+                "compute::hip::GpuMatmul::matmulAsync: K=" +
+                std::to_string(K) + " is not a multiple of Q4_K "
+                "blockElements=" + std::to_string(kBlockElts));
+        }
+        const std::uint32_t nGroups = static_cast<std::uint32_t>(
+            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+
+        auto& kern = _pimpl->_matmulQ4KVecKernel;
         for (std::size_t m = 0; m < M; ++m) {
             const float* xRow = X + m * K;
             float*       yRow = Y + m * N;

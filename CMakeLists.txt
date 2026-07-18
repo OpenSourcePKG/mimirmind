@@ -443,6 +443,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/kv_quant_commit_q8_0.hip
         kernels_hip/matmul_q8_0_gemm.hip
         kernels_hip/matmul_q8_0_gemm_v2.hip
+        kernels_hip/matmul_q4k_vec.hip
         kernels_hip/matmul_q5_0_vec.hip
         kernels_hip/matmul_q6k_vec.hip
         kernels_hip/matmul_q8_0_vec.hip
