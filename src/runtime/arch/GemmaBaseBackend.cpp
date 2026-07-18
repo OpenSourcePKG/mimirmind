@@ -560,7 +560,7 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     trace("O projection");
-    _gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,
+    _gmm.matmulAsync(oW->type, oW->usmPtr, d_model, q_dim,
                 attnOutBuf, T,
                 projOutBuf, matmulScratch);
 

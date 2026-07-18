@@ -384,7 +384,7 @@ void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds,
                                            projN, d_model,
                                            hiddenStates, projBuf);
         } else {
-            _gmm.matmul(core::gguf::GgmlType::Q8_0, _projQ8.get(),
+            _gmm.matmulAsync(core::gguf::GgmlType::Q8_0, _projQ8.get(),
                         projN, d_model,
                         hiddenStates, T,
                         projBuf, /*scratch=*/nullptr);
@@ -531,7 +531,7 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
     _ops.geluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
-    _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
+    _gmm.matmulAsync(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
                 gateOutBuf, T,
                 projOutBuf, matmulScratch);
 
@@ -560,7 +560,7 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
             + blockIdx * (_pleActiveT * _perLayerDim);
 
         _op.mark(runtime::OpProfiler::Cat::MATMUL);
-        _gmm.matmul(inpGate->type, inpGate->usmPtr,
+        _gmm.matmulAsync(inpGate->type, inpGate->usmPtr,
                     _perLayerDim, d_model,
                     x, T,
                     pleGateBuf, matmulScratch);
@@ -573,7 +573,7 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
         _ops.geluMulAsync(pleGateBuf, pleSliceForLayer, T * _perLayerDim);
 
         _op.mark(runtime::OpProfiler::Cat::MATMUL);
-        _gmm.matmul(proj->type, proj->usmPtr,
+        _gmm.matmulAsync(proj->type, proj->usmPtr,
                     d_model, _perLayerDim,
                     pleGateBuf, T,
                     projOutBuf, matmulScratch);
