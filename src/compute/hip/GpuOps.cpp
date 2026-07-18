@@ -325,6 +325,18 @@ GpuOps::GpuOps(core::hip::HipComputeContext& ctx,
         alloc.copyH2D(_stagingOffsetSlotUsm, &zero, sizeof(std::int32_t));
     }
 
+    // Pinned host ring for scalar H2D staging — the hot decode path
+    // updates `_curLenSlotUsm` once per attention/rope call (~3 per
+    // block × N blocks per token). Sync `hipMemcpy` from stack forced
+    // the host to wait for the compute stream to drain each time —
+    // profiling showed the GPU was 96% idle in decode as a result.
+    // Pinned source lets `hipMemcpyAsync` truly enqueue without
+    // stalling. Ring cycles cleanly (256 slots > any in-flight batch).
+    _scalarRing = static_cast<std::int32_t*>(
+        alloc.allocate(kScalarRingSize * sizeof(std::int32_t),
+                       core::hip::HipAllocKind::HostPinned));
+    _scalarRingIdx = 0;
+
     _prefillFlashDisabled      = !flashPrefillEnabled;
     _prefillFlashGqaQ8Disabled = !flashPrefillGqaQ8Enabled;
     _q8_0ReorderMode           = q8_0ReorderMode;
@@ -360,6 +372,11 @@ GpuOps::GpuOps(core::hip::HipComputeContext& ctx,
 
 GpuOps::~GpuOps() {
     auto& alloc = _ctx.allocator();
+    if (_scalarRing) {
+        alloc.deallocate(_scalarRing,
+                         kScalarRingSize * sizeof(std::int32_t),
+                         core::hip::HipAllocKind::HostPinned);
+    }
     if (_stagingOffsetSlotUsm) {
         alloc.deallocate(_stagingOffsetSlotUsm, sizeof(std::int32_t),
                          core::hip::HipAllocKind::Device);
@@ -372,6 +389,14 @@ GpuOps::~GpuOps() {
         alloc.deallocate(_flashPartialUsm, _flashPartialBytes,
                          core::hip::HipAllocKind::Device);
     }
+}
+
+void GpuOps::stagedInt32ToDevice(std::int32_t* devicePtr,
+                                 std::int32_t  value) {
+    std::int32_t* slot = &_scalarRing[_scalarRingIdx];
+    *slot = value;
+    _scalarRingIdx = (_scalarRingIdx + 1) & (kScalarRingSize - 1);
+    appendMemoryCopy(devicePtr, slot, sizeof(std::int32_t));
 }
 
 // ---- Real (non-stub) implementations --------------------------------
@@ -557,7 +582,7 @@ void GpuOps::rmsNormQkvAsync(float* qBuf, const float* qWeight,
         offsetSlot = _stagingOffsetSlotUsm;
     } else {
         const std::int32_t v = toInt32(writeOffset, "rmsNormQkv writeOffset");
-        _ctx.allocator().copyH2D(_curLenSlotUsm, &v, sizeof(std::int32_t));
+        stagedInt32ToDevice(_curLenSlotUsm, v);
         offsetSlot = _curLenSlotUsm;
     }
 
@@ -732,7 +757,7 @@ void GpuOps::ropeInPlaceAsync(void* xBase, std::size_t seqLen,
     // before launch matches L0's `*_curLenSlotUsm = startPos` store
     // (works there via USM). See rmsNormQkvAsync for the same trick.
     const std::int32_t startI = toInt32(startPos, "rope startPos");
-    _ctx.allocator().copyH2D(_curLenSlotUsm, &startI, sizeof(std::int32_t));
+    stagedInt32ToDevice(_curLenSlotUsm, startI);
 
     k.setPtr  (0, xBase);
     k.setValue(1, toInt32(seqLen,   "rope seqLen"));
@@ -778,7 +803,7 @@ void GpuOps::ropeInPlaceWithFactorsAsync(void* xBase, const float* freqFactors,
     const std::size_t total   = seqLen * numHeads * halfDim;
 
     const std::int32_t startI = toInt32(startPos, "rope_ff startPos");
-    _ctx.allocator().copyH2D(_curLenSlotUsm, &startI, sizeof(std::int32_t));
+    stagedInt32ToDevice(_curLenSlotUsm, startI);
 
     auto& k = _pimpl->_ropeFfKernel;
     k.setPtr  (0, xBase);
@@ -834,7 +859,7 @@ void GpuOps::kvQuantCommitQ8Async(const float* xSrc, void* kvDst,
     // so `kvDst` stays a stable layer-base pointer across replays.
     const std::int32_t offI =
         toInt32(writeOffset, "kvQuantCommitQ8 writeOffset");
-    _ctx.allocator().copyH2D(_curLenSlotUsm, &offI, sizeof(std::int32_t));
+    stagedInt32ToDevice(_curLenSlotUsm, offI);
 
     auto& k = _pimpl->_kvQuantCommitQ8Kernel;
     k.setPtr  (0, xSrc);
@@ -882,7 +907,7 @@ void GpuOps::qkvSplitAsync(const float* fused, float* Yq,
         offsetSlot = _stagingOffsetSlotUsm;
     } else {
         const std::int32_t v = toInt32(writeOffset, "qkvSplit writeOffset");
-        _ctx.allocator().copyH2D(_curLenSlotUsm, &v, sizeof(std::int32_t));
+        stagedInt32ToDevice(_curLenSlotUsm, v);
         offsetSlot = _curLenSlotUsm;
     }
 
@@ -977,7 +1002,7 @@ void GpuOps::attentionPlainAsync(const float* q, const void* k, const void* v,
 
     const std::int32_t posI =
         toInt32(positionOffset, "attention positionOffset");
-    _ctx.allocator().copyH2D(_curLenSlotUsm, &posI, sizeof(std::int32_t));
+    stagedInt32ToDevice(_curLenSlotUsm, posI);
 
     kernel.setPtr  (0, q);
     kernel.setPtr  (1, k);
@@ -1038,7 +1063,7 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
 
     const std::int32_t posI =
         toInt32(positionOffset, "prefill_flash positionOffset");
-    _ctx.allocator().copyH2D(_curLenSlotUsm, &posI, sizeof(std::int32_t));
+    stagedInt32ToDevice(_curLenSlotUsm, posI);
 
     kernel.setPtr  (0, q);
     kernel.setPtr  (1, k);
@@ -1088,7 +1113,7 @@ void GpuOps::attentionDecodeFlashAsync(const float* q, const void* k,
 
     const std::int32_t posI =
         toInt32(positionOffset, "flash positionOffset");
-    _ctx.allocator().copyH2D(_curLenSlotUsm, &posI, sizeof(std::int32_t));
+    stagedInt32ToDevice(_curLenSlotUsm, posI);
 
     // Pass 1 — per-tile partial (m, l, o_unnorm) into persistent scratch.
     // Kernel by KV dtype; partial layout stays fp32 regardless so the

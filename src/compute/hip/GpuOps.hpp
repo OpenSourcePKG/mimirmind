@@ -237,6 +237,23 @@ private:
     std::size_t          _flashPartialBytes{0};
     std::size_t          _replayMaxKTiles{0};
 
+    // Pinned host ring buffer for scalar-int32 H2D updates. Each
+    // `stagedInt32ToDevice` call cycles to the next slot, writes the
+    // value, and issues `hipMemcpyAsync` from that slot — which is
+    // truly async because the source is pinned (pageable-source
+    // hipMemcpyAsync silently falls back to synchronous on ROCm). The
+    // ring size is generous vs. the max in-flight copies in one
+    // decode-step (< 100 per token, cycles cleanly).
+    static constexpr std::size_t kScalarRingSize = 256;
+    std::int32_t*        _scalarRing{nullptr};
+    std::size_t          _scalarRingIdx{0};
+
+    /// Stage `value` into the next pinned slot, issue an async H2D copy
+    /// on the compute stream, and return. The device slot sees the
+    /// value in stream-order — subsequent kernel launches on the same
+    /// stream observe the update without a host sync.
+    void stagedInt32ToDevice(std::int32_t* devicePtr, std::int32_t value);
+
     std::string          _selfTestStatus{"pending"};
 
     // Feature-flag cache — resolved once in the ctor, immutable
