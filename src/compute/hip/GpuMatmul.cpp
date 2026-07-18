@@ -60,8 +60,10 @@ std::filesystem::path resolveHsacoPath(std::string_view name) {
         }
     }
 
-    for (auto rel : std::array<const char*, 3>{
-             "build/hsaco", "../build/hsaco", "hsaco"}) {
+    for (auto rel : std::array<const char*, 5>{
+             "build/hsaco", "build-both/hsaco",
+             "../build/hsaco", "../build-both/hsaco",
+             "hsaco"}) {
         const std::filesystem::path p =
             std::filesystem::path{rel} / filename;
         if (std::filesystem::exists(p)) {

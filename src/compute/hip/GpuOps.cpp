@@ -50,7 +50,7 @@ std::uint32_t groupsForN(std::size_t n, std::uint32_t local) {
 // Resolve `<name>.hsaco` in one of:
 //   1. $MIMIRMIND_HSACO_DIR (env var — HIP analog of runtime.spvDir)
 //   2. /usr/local/share/mimirmind/hsaco (production install)
-//   3. build-tree fallbacks (build/hsaco, ../build/hsaco, hsaco)
+//   3. build-tree fallbacks (build*/hsaco, ../build*/hsaco, hsaco)
 // Mirrors `resolveSpvPath` in `GpuModule.cpp` — same three-tier lookup
 // so the deployment stories stay parallel.
 std::filesystem::path resolveHsacoPath(std::string_view name) {
@@ -74,8 +74,10 @@ std::filesystem::path resolveHsacoPath(std::string_view name) {
         }
     }
 
-    for (auto rel : std::array<const char*, 3>{
-             "build/hsaco", "../build/hsaco", "hsaco"}) {
+    for (auto rel : std::array<const char*, 5>{
+             "build/hsaco", "build-both/hsaco",
+             "../build/hsaco", "../build-both/hsaco",
+             "hsaco"}) {
         const std::filesystem::path p =
             std::filesystem::path{rel} / filename;
         if (std::filesystem::exists(p)) {
