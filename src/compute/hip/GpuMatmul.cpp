@@ -125,11 +125,11 @@ double medianMs(std::vector<double> xs) {
 } // namespace
 
 // Pimpl body — Q8_0 matmul family (5 kernels) + Q5_0 vec + Q6_K vec
-// + Q4_K vec. Q5_K matmul kernel isn't ported to HIP yet; matmulAsync
-// falls back to the CPU reference (`compute::matmul`) for anything
-// else, staging W/X through host memory. The dispatcher's `supports()`
-// stays true for anything with a QuantTypeRegistry entry so the
-// engine keeps loading these weight types.
+// + Q4_K vec + Q5_K vec. Full K-quant coverage (Q4_K / Q5_K / Q6_K)
+// plus the Q5_0 / Q8_0 fixed-block quants used across Qwen 2.5 and
+// Gemma 4. matmulAsync's CPU-fallback branch stays as a safety net
+// for exotic types with a QuantTypeRegistry entry that lack a native
+// kernel (e.g. F16 / BF16 / F32 direct matmul).
 struct GpuMatmul::Impl {
     ::mimirmind::core::hip::HipModule _matmulQ8_0VecModule;
     ::mimirmind::core::hip::HipKernel _matmulQ8_0VecKernel;
@@ -147,6 +147,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::hip::HipKernel _matmulQ6KVecKernel;
     ::mimirmind::core::hip::HipModule _matmulQ4KVecModule;
     ::mimirmind::core::hip::HipKernel _matmulQ4KVecKernel;
+    ::mimirmind::core::hip::HipModule _matmulQ5KVecModule;
+    ::mimirmind::core::hip::HipKernel _matmulQ5KVecKernel;
 
     explicit Impl(::mimirmind::core::hip::HipContext& ctx)
         : _matmulQ8_0VecModule    {loadHipModule(ctx, "matmul_q8_0_vec")},
@@ -172,7 +174,10 @@ struct GpuMatmul::Impl {
               _matmulQ6KVecModule.getKernel("matmul_q6k_vec")},
           _matmulQ4KVecModule     {loadHipModule(ctx, "matmul_q4k_vec")},
           _matmulQ4KVecKernel     {
-              _matmulQ4KVecModule.getKernel("matmul_q4k_vec")}
+              _matmulQ4KVecModule.getKernel("matmul_q4k_vec")},
+          _matmulQ5KVecModule     {loadHipModule(ctx, "matmul_q5k_vec")},
+          _matmulQ5KVecKernel     {
+              _matmulQ5KVecModule.getKernel("matmul_q5k_vec")}
     {}
 };
 
@@ -183,9 +188,9 @@ GpuMatmul::GpuMatmul(::mimirmind::core::hip::HipComputeContext& ctx,
       _pimpl{std::make_unique<Impl>(ctx.hipContext())}
 {
     MM_LOG_INFO("hip::GpuMatmul",
-                "compute::hip::GpuMatmul ready — 8 kernels loaded "
+                "compute::hip::GpuMatmul ready — 9 kernels loaded "
                 "(Q8_0: vec / gemm / gemm_v2 / vec_dp4a / moe_down_fused_k; "
-                "Q5_0: vec; Q6_K: vec; Q4_K: vec)");
+                "Q5_0: vec; Q6_K: vec; Q4_K: vec; Q5_K: vec)");
 }
 
 GpuMatmul::~GpuMatmul() = default;
@@ -565,6 +570,41 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
             (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
 
         auto& kern = _pimpl->_matmulQ4KVecKernel;
+        for (std::size_t m = 0; m < M; ++m) {
+            const float* xRow = X + m * K;
+            float*       yRow = Y + m * N;
+
+            kern.setPtr  (0, xRow);
+            kern.setPtr  (1, W);
+            kern.setPtr  (2, yRow);
+            kern.setValue(3, static_cast<std::int32_t>(K));
+            kern.setValue(4, static_cast<std::int32_t>(N));
+
+            kern.launch(_ctx.stream(),
+                        nGroups, 1, 1,
+                        kVecLocalSize, 1, 1);
+        }
+        return;
+    }
+
+    if (type == ::mimirmind::core::gguf::GgmlType::Q5_K) {
+        // Native Q5_K vec kernel — Q4_K-shape launch, block is 256
+        // elements / 176 bytes: d/dmin/scales[12] identical to Q4_K
+        // plus qh[32] (one high-bit per element, 2-bit shift per pair)
+        // + qs[128] nibbles. Q5_K appears in Gemma 4 Q4_K_M for
+        // attn_k / attn_output — hitting this on every draft step of
+        // M9.11 speculative decoding.
+        constexpr std::size_t kBlockElts = 256;
+        if (K % kBlockElts != 0) {
+            throw std::runtime_error(
+                "compute::hip::GpuMatmul::matmulAsync: K=" +
+                std::to_string(K) + " is not a multiple of Q5_K "
+                "blockElements=" + std::to_string(kBlockElts));
+        }
+        const std::uint32_t nGroups = static_cast<std::uint32_t>(
+            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+
+        auto& kern = _pimpl->_matmulQ5KVecKernel;
         for (std::size_t m = 0; m < M; ++m) {
             const float* xRow = X + m * K;
             float*       yRow = Y + m * N;
