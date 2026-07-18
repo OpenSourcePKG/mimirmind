@@ -149,6 +149,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::hip::HipKernel _matmulQ4KVecKernel;
     ::mimirmind::core::hip::HipModule _matmulQ5KVecModule;
     ::mimirmind::core::hip::HipKernel _matmulQ5KVecKernel;
+    ::mimirmind::core::hip::HipModule _matmulF32VecModule;
+    ::mimirmind::core::hip::HipKernel _matmulF32VecKernel;
 
     explicit Impl(::mimirmind::core::hip::HipContext& ctx)
         : _matmulQ8_0VecModule    {loadHipModule(ctx, "matmul_q8_0_vec")},
@@ -177,7 +179,10 @@ struct GpuMatmul::Impl {
               _matmulQ4KVecModule.getKernel("matmul_q4k_vec")},
           _matmulQ5KVecModule     {loadHipModule(ctx, "matmul_q5k_vec")},
           _matmulQ5KVecKernel     {
-              _matmulQ5KVecModule.getKernel("matmul_q5k_vec")}
+              _matmulQ5KVecModule.getKernel("matmul_q5k_vec")},
+          _matmulF32VecModule     {loadHipModule(ctx, "matmul_f32_vec")},
+          _matmulF32VecKernel     {
+              _matmulF32VecModule.getKernel("matmul_f32_vec")}
     {}
 };
 
@@ -188,9 +193,9 @@ GpuMatmul::GpuMatmul(::mimirmind::core::hip::HipComputeContext& ctx,
       _pimpl{std::make_unique<Impl>(ctx.hipContext())}
 {
     MM_LOG_INFO("hip::GpuMatmul",
-                "compute::hip::GpuMatmul ready — 9 kernels loaded "
+                "compute::hip::GpuMatmul ready — 10 kernels loaded "
                 "(Q8_0: vec / gemm / gemm_v2 / vec_dp4a / moe_down_fused_k; "
-                "Q5_0: vec; Q6_K: vec; Q4_K: vec; Q5_K: vec)");
+                "Q5_0: vec; Q6_K: vec; Q4_K: vec; Q5_K: vec; F32: vec)");
 }
 
 GpuMatmul::~GpuMatmul() = default;
@@ -570,6 +575,33 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
             (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
 
         auto& kern = _pimpl->_matmulQ4KVecKernel;
+        for (std::size_t m = 0; m < M; ++m) {
+            const float* xRow = X + m * K;
+            float*       yRow = Y + m * N;
+
+            kern.setPtr  (0, xRow);
+            kern.setPtr  (1, W);
+            kern.setPtr  (2, yRow);
+            kern.setValue(3, static_cast<std::int32_t>(K));
+            kern.setValue(4, static_cast<std::int32_t>(N));
+
+            kern.launch(_ctx.stream(),
+                        nGroups, 1, 1,
+                        kVecLocalSize, 1, 1);
+        }
+        return;
+    }
+
+    if (type == ::mimirmind::core::gguf::GgmlType::F32) {
+        // Native F32 vec kernel — no dequant, straight fp32 dot. Same
+        // launch shape as the K-quant vec kernels. Motivated by Gemma 4
+        // E4B: inp_gate.weight + proj.weight per layer are F32 (~2.6 MiB
+        // each, 84 dispatches per decode-step). Native F32 closes the
+        // last non-K-quant CPU-fallback for that model.
+        const std::uint32_t nGroups = static_cast<std::uint32_t>(
+            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+
+        auto& kern = _pimpl->_matmulF32VecKernel;
         for (std::size_t m = 0; m < M; ++m) {
             const float* xRow = X + m * K;
             float*       yRow = Y + m * N;
