@@ -316,12 +316,17 @@ SpeculativeDecoder::runSpeculative(
 
         // 3c. Accept loop. At position i we compare argmax(target_logits[i]
         //     with penalties applied over the growing history) against
-        //     the draft's d_i. checkHistory tracks the sequence of tokens
-        //     that would already be committed when target's sampler
-        //     would have chosen the token at position i — starts at
-        //     context+tLast (the state right before d_0).
-        std::vector<std::int32_t> checkHistory = context;
-        checkHistory.push_back(tLast);
+        //     the draft's d_i. checkHistory mirrors what target's own
+        //     sampleNext would pass as `recentTokens` when computing the
+        //     token at position i — which is `generated` (post-prompt
+        //     tokens only, InferenceEngine.cpp:1284-1288). Including
+        //     `context` (= promptIds + committed_generated) would drop
+        //     the prompt tail into the penalty window during the first
+        //     ~64 tokens and diverge from the target-only baseline.
+        //     `tLast` is already the last entry of `generated` (push at
+        //     Phase 1 line 226 and at line 398 in each round tail).
+        std::vector<std::int32_t> checkHistory{
+            generated.begin(), generated.end()};
 
         std::size_t accepted = 0;
         for (std::size_t i = 0; i < M; ++i) {
