@@ -713,6 +713,33 @@ target_include_directories(quant_tests PRIVATE tests)
 
 target_link_libraries(quant_tests PRIVATE mimirmind_core_common)
 
+# ---- backend_tests — pure-CPU tests for BackendPool + BackendRegistry ------
+#
+# Covers the config-facing token grammar (`tokenFor`,
+# `BackendPool::selectByToken`), the pool discovery + select-Auto flow,
+# and `BackendRegistry::parseKind` / `probeAll`. Doesn't touch any GPU;
+# BackendPool + BackendRegistry both live in `mimirmind_core_common`.
+#
+# Run via:   cmake --build build --target backend_tests && build/backend_tests
+
+add_executable(backend_tests
+    tests/backend_tests.cpp
+)
+
+target_include_directories(backend_tests PRIVATE tests)
+
+# BackendRegistry forward-declares `mimirmind::core::{l0,hip}::probeBackend()`
+# behind their MIMIRMIND_HAVE_* defines. When those backends are compiled in
+# their probe/createContext symbols live in the concrete backend libs, so
+# `backend_tests` has to link against them too.
+target_link_libraries(backend_tests PRIVATE mimirmind_core_common)
+if(MIMIRMIND_ENABLE_L0)
+    target_link_libraries(backend_tests PRIVATE mimirmind_core_l0)
+endif()
+if(MIMIRMIND_ENABLE_HIP)
+    target_link_libraries(backend_tests PRIVATE mimirmind_core_hip)
+endif()
+
 # ---- arch_tests — pure-CPU tests for arch-related logic ---------------------
 #
 # Covers the testable surface of the architecture backends without GPU:
