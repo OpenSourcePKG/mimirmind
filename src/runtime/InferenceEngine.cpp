@@ -1490,8 +1490,17 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
     // Per-position logits. rmsNorm + lmHead matmul is cheap next to the
     // block chain, so no need to batch M=N here — a loop keeps the
     // scratch requirement at vocab_lm floats (M=1).
+    //
+    // `logits` is device memory on HIP discrete (HipAllocKind::Device).
+    // A bulk D→H copy is required before the host-side vector copy —
+    // otherwise `emplace_back(logits, logits + vocab_lm)` reads stale
+    // or unmapped device pages and the caller sees garbage. On L0 UMA
+    // the readback is a no-op-cost intra-address-space memcpy.
     std::vector<std::vector<float>> out;
     out.reserve(N);
+    if (_logitsHostScratch.size() < vocab_lm) {
+        _logitsHostScratch.resize(vocab_lm);
+    }
     for (std::size_t i = 0; i < N; ++i) {
         const float* row = xBuf + i * d_model;
         _ops->rmsNormAsync(row, 1, d_model,
@@ -1500,7 +1509,11 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
         _gmm->matmul(lmHead->type, lmHead->usmPtr,
                     vocab_lm, d_model, normFinal, 1,
                     logits, logitsSc);
-        out.emplace_back(logits, logits + vocab_lm);
+        _ops->readbackToHost(_logitsHostScratch.data(), logits,
+                             vocab_lm * sizeof(float));
+        out.emplace_back(_logitsHostScratch.begin(),
+                         _logitsHostScratch.begin() +
+                             static_cast<std::ptrdiff_t>(vocab_lm));
     }
     return out;
 }
