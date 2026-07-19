@@ -71,6 +71,19 @@ struct SamplingParams {
     /// (no penalty applied even if the penalty fields are non-neutral).
     /// llama.cpp default is 64.
     std::uint32_t penaltyWindow{0};
+
+    /// Gemma-4 final-logit softcap. 0 => disabled. When positive the
+    /// sampler applies `cap * tanh(logit / cap)` to the input logits
+    /// BEFORE penalties, temperature scaling, and softmax — matching
+    /// llama.cpp's compute-graph placement in `src/models/gemma4.cpp`.
+    /// Argmax-invariant, so the greedy path is bit-identical only when
+    /// no penalties are active; with penalties the ordering softcap →
+    /// penalty is what target parity requires.
+    ///
+    /// Callers typically leave this at 0 and let `InferenceEngine`
+    /// inject the model-specific value from `LlmConfig::finalLogitSoftcap`
+    /// (respecting the `MIMIRMIND_DISABLE_SOFTCAP` env override).
+    float         finalLogitSoftcap{0.0F};
 };
 
 /**

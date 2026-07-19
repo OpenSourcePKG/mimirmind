@@ -33,6 +33,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <optional>
@@ -424,6 +425,29 @@ void InferenceEngine::loadModelAttached(
 }
 
 void InferenceEngine::finalizeLoad() {
+    // Bake the final-logit softcap from LlmConfig into the engine field
+    // that the sampler + spec-dec verify read. `MIMIRMIND_DISABLE_SOFTCAP=1`
+    // is a correctness rollback — clears the value to zero so we get
+    // the pre-fix behaviour (argmax stays correct, sampling distribution
+    // reverts to the too-sharp shape).
+    _finalLogitSoftcap = _config.finalLogitSoftcap;
+    if (_finalLogitSoftcap > 0.0F) {
+        if (const char* env = std::getenv("MIMIRMIND_DISABLE_SOFTCAP");
+            env != nullptr && env[0] != '\0' && env[0] != '0') {
+            MM_LOG_WARN("engine",
+                        "MIMIRMIND_DISABLE_SOFTCAP set — dropping "
+                        "final_logit_softcap {} (sampling distribution "
+                        "will diverge from llama.cpp reference)",
+                        _config.finalLogitSoftcap);
+            _finalLogitSoftcap = 0.0F;
+        } else {
+            MM_LOG_INFO("engine",
+                        "final_logit_softcap = {} (applied to sampler + "
+                        "spec-dec verify)",
+                        _finalLogitSoftcap);
+        }
+    }
+
     // One-shot architecture diagnostic. For gemma4 also dump the first
     // shared-KV block (block 5 in the standard 26B-A4B layout) — we
     // need to see if its Q tensor has a different output dim than block 0,
@@ -788,9 +812,17 @@ InferenceEngine::sampleNext(const float*                   hidden,
     _ops->readbackToHost(_logitsHostScratch.data(), logits,
                          vocab_lm * sizeof(float));
 
+    // Overlay the model's final-logit softcap onto the caller's params
+    // right before the sampler runs. The Sampler applies the cap before
+    // penalties/temperature/top-k — matching llama.cpp gemma4.cpp's
+    // compute-graph placement. Zero softcap (non-Gemma archs, or the
+    // MIMIRMIND_DISABLE_SOFTCAP rollback) skips the cap pass entirely.
+    compute::SamplingParams effSampling = sampling;
+    effSampling.finalLogitSoftcap = _finalLogitSoftcap;
+
     return _sampler.sample(
         std::span<const float>{_logitsHostScratch.data(), vocab_lm},
-        recentTokens, sampling);
+        recentTokens, effSampling);
 }
 
 std::vector<std::int32_t>

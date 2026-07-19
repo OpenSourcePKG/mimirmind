@@ -212,6 +212,12 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
                     a, sharedKvLayers, sharedKvLayers);
     }
 
+    // Gemma 4 final-logit softcap. llama.cpp reads it as
+    // `<arch>.final_logit_softcapping` and applies `cap * tanh(x / cap)`
+    // to the output logits inside the compute graph (see gemma4.cpp).
+    // Ignored on archs that don't declare the key (Qwen, Llama, ...).
+    finalLogitSoftcap = optionalF32("final_logit_softcapping", 0.0F);
+
     // --- Architecture-specific shape corrections -------------------------
 
     // Gemma 4 26B-A4B's metadata declares two distinct head dimensions

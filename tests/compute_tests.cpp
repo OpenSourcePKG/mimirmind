@@ -293,6 +293,118 @@ TEST(sampler_penalty_neutralParamsAreNoOp) {
     EXPECT_EQ(s.sample(logits, std::span<const std::int32_t>{hist}, p), 0);
 }
 
+// -----------------------------------------------------------------------
+// Gemma-4 final-logit softcap (M-Softcap)
+// -----------------------------------------------------------------------
+
+TEST(sampler_softcap_greedyIsArgmaxInvariant) {
+    // Softcap is monotonic (cap * tanh(x/cap)), so greedy argmax must
+    // not shift regardless of whether the cap is applied. Verifies the
+    // core correctness invariant that lets non-penalty greedy stay
+    // bit-identical for token identity (values differ, choice does not).
+    const std::array<float, 4> logits{45.0F, 50.0F, 12.0F, -30.0F};
+    mimirmind::compute::Sampler s;
+    mimirmind::compute::SamplingParams p{};
+    p.temperature = 0.0F;
+
+    // No softcap.
+    EXPECT_EQ(s.sample(logits, p), 1);
+
+    // Softcap 30 — same argmax.
+    p.finalLogitSoftcap = 30.0F;
+    EXPECT_EQ(s.sample(logits, p), 1);
+}
+
+TEST(sampler_softcap_zeroDisables) {
+    // finalLogitSoftcap == 0 must fall through to the pre-fix behaviour:
+    // no scratch buffer, no tanh calls, no allocation on the fast path.
+    // Sampling result identical to a run without the field.
+    const std::array<float, 3> logits{50.0F, 40.0F, 30.0F};
+    mimirmind::compute::Sampler s;
+    mimirmind::compute::SamplingParams p{};
+    p.temperature       = 0.0F;
+    p.finalLogitSoftcap = 0.0F;
+
+    EXPECT_EQ(s.sample(logits, p), 0);
+}
+
+TEST(sampler_softcap_precedesFreqPenalty) {
+    // Order-dependence: penalty AFTER softcap can produce a different
+    // argmax than penalty on raw logits. This test constructs the flip.
+    //
+    //   raw     = {50, 45}
+    //   raw + penalty(count={5, 1}, freq=1)      = {45,  44}  → argmax 0
+    //   softcap(30) + penalty(count={5, 1}, freq=1):
+    //     softcap gives ~{28.94, 27.15}
+    //     minus {5, 1}                            ≈ {23.94, 26.15} → argmax 1
+    //
+    // The 1 answer is what target parity requires — llama.cpp applies the
+    // cap in the compute graph, penalties in the sampler, in that order.
+    const std::array<float, 2> logits{50.0F, 45.0F};
+    mimirmind::compute::Sampler s;
+    mimirmind::compute::SamplingParams p{};
+    p.temperature       = 0.0F;
+    p.frequencyPenalty  = 1.0F;
+    p.penaltyWindow     = 64U;
+
+    // History: index 0 appears 5×, index 1 appears once.
+    const std::array<std::int32_t, 6> hist{0, 0, 0, 0, 0, 1};
+
+    // Without softcap → penalty on raw → argmax stays 0.
+    EXPECT_EQ(s.sample(logits, std::span<const std::int32_t>{hist}, p), 0);
+
+    // With softcap 30 → softcap-then-penalty flips to 1. This is the
+    // regression gate for the ordering bug that motivated the fix.
+    p.finalLogitSoftcap = 30.0F;
+    EXPECT_EQ(s.sample(logits, std::span<const std::int32_t>{hist}, p), 1);
+}
+
+TEST(sampler_softcap_softensSamplingDistribution) {
+    // Softcap is argmax-invariant so the top-1 rank is preserved, but
+    // it *does* narrow the logit gap. This test picks a regime where
+    // that narrowing shows up in draw counts: logits {60, 40} with
+    // temperature 5.
+    //
+    // No softcap:  scaled logits {12, 8} → softmax(0) ≈ 0.982.
+    // Softcap 30:  softcap gives {29.19, 26.03} (tanh saturates),
+    //              scaled {5.84, 5.21} → softmax(0) ≈ 0.653.
+    //
+    // With 500 draws at seed 42 we expect ~9 hits of token 1 without
+    // softcap and ~170 with. The gap is enormous; even a loose bound
+    // catches a broken softcap wiring.
+    const std::array<float, 2> logits{60.0F, 40.0F};
+    mimirmind::compute::SamplingParams p{};
+    p.temperature = 5.0F;
+    p.topK        = 2U;
+    p.seed        = 42ULL;
+
+    auto countTokenOne = [&](float cap) {
+        p.finalLogitSoftcap = cap;
+        mimirmind::compute::Sampler s(p.seed);
+        int n = 0;
+        for (int i = 0; i < 500; ++i) {
+            if (s.sample(logits, p) == 1) {
+                ++n;
+            }
+        }
+        return n;
+    };
+
+    const int noCap    = countTokenOne(0.0F);
+    const int withCap  = countTokenOne(30.0F);
+
+    // Sanity floor / ceiling on both. Loose bounds to survive minor
+    // RNG-state churn across libstdc++ versions.
+    EXPECT_TRUE(noCap   < 40);          // ~9 expected
+    EXPECT_TRUE(withCap > 80);          // ~170 expected
+
+    // The signal we actually care about: softcap must widen the tail.
+    // At minimum, softcap must produce strictly more token-1 draws than
+    // the no-cap baseline. If this fails, softcap is either not applied
+    // or applied after softmax (which would be a wiring bug).
+    EXPECT_TRUE(withCap > noCap);
+}
+
 // =======================================================================
 // compute::matmul (CPU, double accumulator)
 // =======================================================================

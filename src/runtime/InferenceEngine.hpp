@@ -324,6 +324,15 @@ public:
     void setKvDtype(KvDtype dtype);
     [[nodiscard]] KvDtype kvDtype() const noexcept { return _kvDtype; }
 
+    /// Effective final-logit softcap applied to sampler + spec-dec verify.
+    /// Sourced from `LlmConfig::finalLogitSoftcap` at model-load, then
+    /// zeroed if the `MIMIRMIND_DISABLE_SOFTCAP=1` env override is set.
+    /// 0 means the sampler skips the softcap pass entirely (non-Gemma
+    /// archs, or explicit rollback).
+    [[nodiscard]] float finalLogitSoftcap() const noexcept {
+        return _finalLogitSoftcap;
+    }
+
     /// Install (or remove with nullptr) the thermal guard the decode
     /// loop should consult. The engine does not own the guard. If set,
     /// generate() will call checkAdmission() before prefill (which may
@@ -504,6 +513,11 @@ private:
     // `diagnostics.traceOpTimes: true` in config.json.
     std::optional<OpProfiler>          _opProfiler;
     compute::Sampler                   _sampler{};
+
+    /// Cached softcap injected into every Sampler::sample call from
+    /// sampleNext, and queried by SpeculativeDecoder for its inline
+    /// verify path. Zero until `finalizeLoad()` runs.
+    float                              _finalLogitSoftcap{0.0F};
 
     core::gguf::GgufReader                  _reader;
     model::LlmConfig                   _config;

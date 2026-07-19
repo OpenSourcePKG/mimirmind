@@ -33,6 +33,17 @@ namespace {
             || p.presencePenalty   != 0.0F);
 }
 
+/// Apply Gemma-4 final-logit softcap in place: `cap * tanh(l / cap)`.
+/// Monotonic in `l`, so argmax is preserved; sampling distributions
+/// downstream are strictly softer for `|l| > cap`. Caller must guarantee
+/// `cap > 0`.
+void applyFinalLogitSoftcapInPlace(std::span<float> logits, float cap) {
+    const float invCap = 1.0F / cap;
+    for (float& l : logits) {
+        l = cap * std::tanh(l * invCap);
+    }
+}
+
 } // namespace
 
 Sampler::Sampler() : Sampler{0} {}
@@ -112,13 +123,25 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
         throw std::runtime_error("Sampler::sample: empty logits");
     }
 
-    // If any penalty is active and there is history, copy into the
-    // scratch buffer and mutate that. Otherwise work directly from the
-    // caller's read-only span — no allocation on the fast path.
+    // Route through the scratch buffer whenever softcap or penalties
+    // would mutate the values. Softcap runs FIRST — matches llama.cpp's
+    // gemma4.cpp placement (softcap inside the compute graph, penalties
+    // in the sampler). Order matters: `penalty(softcap(x))` differs from
+    // `softcap(penalty(x))` for repetition and frequency penalties, and
+    // the target parity we care about is `penalty(softcap(x))`.
     std::span<const float> effLogits = logits;
-    if (penaltiesActive(params) && !recentTokens.empty()) {
+    const bool         softcapOn = params.finalLogitSoftcap > 0.0F;
+    const bool         penaltyOn = penaltiesActive(params)
+                                   && !recentTokens.empty();
+    if (softcapOn || penaltyOn) {
         _penaltyLogits.assign(logits.begin(), logits.end());
-        applyPenalties(recentTokens, params);
+        if (softcapOn) {
+            applyFinalLogitSoftcapInPlace(std::span<float>{_penaltyLogits},
+                                          params.finalLogitSoftcap);
+        }
+        if (penaltyOn) {
+            applyPenalties(recentTokens, params);
+        }
         effLogits = std::span<const float>{_penaltyLogits};
     }
 

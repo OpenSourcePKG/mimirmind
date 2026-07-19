@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -95,6 +96,21 @@ void applyPenaltiesInPlace(std::vector<float>&           logits,
         }
     }
     return best;
+}
+
+/// Mirror of Sampling.cpp's softcap. Argmax-invariant on its own, but
+/// composed with penalties the order matters: llama.cpp applies the cap
+/// inside the compute graph, then the sampler applies penalties on the
+/// capped logits. For the accept-check to match target's Sampler the
+/// verify pass must use the same softcap → penalty order. Skip on zero.
+void applySoftcapInPlace(std::vector<float>& logits, float cap) {
+    if (cap <= 0.0F) {
+        return;
+    }
+    const float invCap = 1.0F / cap;
+    for (float& l : logits) {
+        l = cap * std::tanh(l * invCap);
+    }
 }
 
 } // namespace
@@ -328,8 +344,14 @@ SpeculativeDecoder::runSpeculative(
         std::vector<std::int32_t> checkHistory{
             generated.begin(), generated.end()};
 
+        // Softcap value pulled from the target engine so verify matches
+        // what target's own Sampler would apply. Zero on non-Gemma or
+        // MIMIRMIND_DISABLE_SOFTCAP rollback — the softcap pass no-ops.
+        const float softcap = _target.finalLogitSoftcap();
+
         std::size_t accepted = 0;
         for (std::size_t i = 0; i < M; ++i) {
+            applySoftcapInPlace(logits[i], softcap);
             applyPenaltiesInPlace(logits[i],
                                   std::span<const std::int32_t>{checkHistory},
                                   params.sampling);
@@ -346,6 +368,7 @@ SpeculativeDecoder::runSpeculative(
         //     == M this is the "all-accepted bonus"; when accepted < M
         //     it is the target's replacement for the first rejected
         //     draft token. Both cases pull from logits[accepted].
+        applySoftcapInPlace(logits[accepted], softcap);
         applyPenaltiesInPlace(logits[accepted],
                               std::span<const std::int32_t>{checkHistory},
                               params.sampling);

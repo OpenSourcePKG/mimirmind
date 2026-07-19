@@ -78,6 +78,18 @@ struct LlmConfig {
     // `n_kv_from_start - (is_swa(il) ? 2 : 1)`.
     std::uint32_t sharedKvLayers    {0};
 
+    // Gemma 4 final-logit softcap. GGUF key
+    // `<arch>.final_logit_softcapping`. When > 0 the sampler applies
+    // `cap * tanh(logit / cap)` to the output logits before penalties,
+    // temperature scaling, and softmax — matches llama.cpp's placement
+    // inside the compute graph (`src/models/gemma4.cpp`). Argmax-invariant,
+    // so greedy decode is unaffected in bit-identical terms; sampling
+    // (temperature > 0) picks a strictly different distribution shape.
+    // Attention-logit softcap (Gemma 2) was dropped in Gemma 4 — no
+    // corresponding field here. Populated for gemma4 (typically 30.0);
+    // zero for archs that don't declare the key.
+    float         finalLogitSoftcap {0.0F};
+
     [[nodiscard]] std::uint32_t headDim() const noexcept {
         if (keyLength > 0) {
             return keyLength;
