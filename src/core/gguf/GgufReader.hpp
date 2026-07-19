@@ -106,7 +106,14 @@ public:
     /// Idempotent. Cannot be mixed with `loadTensors` for the same
     /// reader — the two ownership regimes (per-tensor deallocate vs
     /// per-chunk drop) are mutually exclusive.
+    ///
+    /// Only compiled in L0-enabled builds — `ChunkAllocator` uses
+    /// `zeMemAllocHost` for L0-IPC export. Munin (the sole caller) is
+    /// itself gated on `MIMIRMIND_ENABLE_L0`, so no HIP-only or
+    /// CPU-only caller ever tries to link against this.
+#ifdef MIMIRMIND_HAVE_L0
     void loadTensorsIntoChunks(::mimirmind::munin::ChunkAllocator& chunks);
+#endif
 
     /// Release USM, drop the mmap, reset state. Idempotent.
     void close() noexcept;
