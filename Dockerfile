@@ -114,6 +114,92 @@ RUN cmake -S src -B build -G Ninja \
 
 
 # ============================================================================
+# Stage 2c — Builder-HIP (ROCm/HIP toolchain, no source)
+# ============================================================================
+#
+# Peer to the Intel L0 `builder` stage above but targets AMD gfx1101
+# (RX 7800 XT and RDNA3 siblings). No source is baked in; docker-compose
+# services can bind-mount from the host the same way. Produces
+# mimirmind + hip_kernels via hipcc --genco.
+#
+# Verified locally:  HIP_TARGET_HOST (RX 7800 XT / gfx1101, ROCm 7.2.53)
+# native builds already work — this stage lifts the setup into a
+# reproducible Docker layer so the same image runs on other AMD hosts.
+#
+# NOT YET verified inside Docker: the stage below installs the ROCm apt
+# repo and hipcc but has not been end-to-end built. Track "Task 1.10"
+# in Synaipse (`todos/hip-tests-inline-migration.md`) for the follow-up
+# once someone with a HIP-capable Docker build host validates it.
+
+FROM ubuntu:24.04 AS builder-hip
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        wget \
+        gnupg \
+        build-essential \
+        cmake \
+        ninja-build \
+        pkg-config \
+        git \
+        libnuma-dev \
+        nlohmann-json3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ROCm apt repo. Version pin matches the tested HIP_TARGET_HOST setup
+# (ROCm 7.2 series). Override at build time with
+#   docker build --build-arg ROCM_VERSION=7.2 --target builder-hip
+ARG ROCM_VERSION=7.2
+
+RUN wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key \
+        | gpg --yes --dearmor --output /usr/share/keyrings/rocm.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] \
+https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" \
+        > /etc/apt/sources.list.d/rocm.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        rocm-hip-runtime \
+        rocm-hip-runtime-dev \
+        hipcc \
+        rocm-cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# hipcc lives at /opt/rocm/bin. Add to PATH so cmake's `find_program`
+# picks it up without an explicit -DHIPCC_EXECUTABLE=... override.
+ENV PATH=/opt/rocm/bin:${PATH}
+
+WORKDIR /src
+
+CMD ["bash", "-lc", \
+     "cmake -S /src -B /src/build-hip -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE:-Release} \
+          -DMIMIRMIND_ENABLE_L0=OFF -DMIMIRMIND_ENABLE_HIP=ON \
+          -DMIMIRMIND_HIP_ARCHS=${MIMIRMIND_HIP_ARCHS:-gfx1101} \
+      && cmake --build /src/build-hip --parallel"]
+
+
+# ============================================================================
+# Stage 2d — Build-HIP (toolchain + baked source, HIP-only mimirmind exec)
+# ============================================================================
+
+FROM builder-hip AS build-hip
+
+COPY CMakeLists.txt ./
+COPY config.example.json ./
+COPY src ./src
+COPY kernels ./kernels
+COPY kernels_hip ./kernels_hip
+COPY tests ./tests
+COPY tools ./tools
+COPY third_party ./third_party
+
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DMIMIRMIND_ENABLE_L0=OFF -DMIMIRMIND_ENABLE_HIP=ON \
+        -DMIMIRMIND_HIP_ARCHS=${MIMIRMIND_HIP_ARCHS:-gfx1101} \
+    && cmake --build build --parallel
+
+
+# ============================================================================
 # Stage 3 — Runtime (no toolchain, no source, just runtime libs + binary)
 # ============================================================================
 #
@@ -202,6 +288,50 @@ RUN chmod +x /usr/local/bin/parity-diff
 # Note: `runtime.spvDir` in config.json can override this at runtime.
 # When left unset in config.json, GpuModule falls back to
 # /usr/local/share/mimirmind/spv (baked in above).
+
+ENTRYPOINT ["/usr/local/bin/mimirmind"]
+
+
+# ============================================================================
+# Stage 3b — Runtime-HIP (AMD RDNA3 runtime, HIP-only mimirmind exec)
+# ============================================================================
+#
+# Peer to the L0 `runtime` stage but ships the HIP build. Installs the
+# ROCm runtime bits (no dev headers, no hipcc) plus the mimirmind binary
+# and the pre-compiled hsaco kernel objects. Host needs an AMD GPU
+# reachable via `/dev/kfd` and `/dev/dri` — `docker compose` runs must
+# pass those through with `--device=/dev/kfd --device=/dev/dri` or the
+# equivalent compose-file entries.
+#
+# Verified locally:  HIP_TARGET_HOST (RX 7800 XT / gfx1101) native runs.
+# NOT YET verified inside Docker end-to-end — same follow-up as the
+# builder-hip stage.
+
+FROM ubuntu:24.04 AS runtime-hip
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG ROCM_VERSION=7.2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        wget \
+        gnupg \
+    && wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key \
+        | gpg --yes --dearmor --output /usr/share/keyrings/rocm.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] \
+https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" \
+        > /etc/apt/sources.list.d/rocm.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        rocm-hip-runtime \
+        libnuma1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy just the mimirmind binary + compiled hsaco kernels. The runtime
+# doesn't need the sources, doesn't need hipcc, doesn't need the L0
+# SPV kernels (those are Intel-only).
+COPY --from=build-hip /src/build/mimirmind /usr/local/bin/mimirmind
+COPY --from=build-hip /src/build/hsaco     /usr/local/share/mimirmind/hsaco
 
 ENTRYPOINT ["/usr/local/bin/mimirmind"]
 

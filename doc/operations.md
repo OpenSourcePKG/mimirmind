@@ -488,3 +488,110 @@ both work. Useful alerts:
   here.
 - **No automatic profile generation.** Profile tuning is a deliberate
   per-host activity — see "Tuning a profile" above.
+## Backend selection
+
+Landed 2026-07-19 with `feat/backend-pool`. Replaces the single-shot
+`MIMIRMIND_BACKEND` env override with a persistent view over every
+compiled-in + runtime-available backend/device, plus a per-model
+config field so operators can pin engines to specific devices.
+
+### Which backend runs by default
+
+Every mimirmind build carries a compile-time set of backends
+(`MIMIRMIND_ENABLE_L0`, `MIMIRMIND_ENABLE_HIP`). At startup
+`BackendRegistry::autoSelect` picks the first backend that is BOTH
+compiled in AND runtime-available:
+
+1. LevelZero (Intel iGPU) — if `MIMIRMIND_ENABLE_L0=ON` and
+   `libze_loader` reaches at least one device via `/dev/dri`.
+2. HIP (AMD dGPU) — if `MIMIRMIND_ENABLE_HIP=ON` and
+   `hipGetDeviceCount` returns > 0.
+3. Cpu — always available as the reference fallback.
+
+The picked backend prints one line on startup:
+
+```
+InferenceEngine: runtime bound to backend 'LevelZero'
+```
+
+Nothing else is required for single-GPU hosts. The dual-GPU
+configuration below is opt-in.
+
+### Overriding for a single process
+
+`MIMIRMIND_BACKEND=<name>` still works and takes precedence over the
+autoSelect walk. Accepted values (case-insensitive): `l0`,
+`levelzero`, `hip`, `rocm`, `amd`, `cpu`. Useful for parity /
+diagnosis runs where you want to force a specific backend even when a
+faster one is available.
+
+### Dual-GPU deployments
+
+On hosts with both an Intel iGPU AND a discrete Radeon, per-model
+selection lets you split workloads without spawning multiple workers.
+Set `models[].backend` in `config.json`:
+
+```json
+"models": [
+  { "id": "primary", "path": "/models/gemma-4-e4b.gguf",       "backend": "hip:0" },
+  { "id": "draft",   "path": "/models/gemma-2-2b-q4km.gguf",   "backend": "l0:0" }
+]
+```
+
+Tokens: `"auto"` / `""` / unset → `autoSelect`, `"cpu"`, `"l0[:N]"`,
+`"hip[:N]"` where `N` is the device index (defaults to 0).
+Multi-device-per-kind (two Radeons in one box) is not modelled yet —
+`deviceIx` is reserved for that follow-up.
+
+`/v1/system/info` shows both the pool and each engine's binding:
+
+```bash
+curl -s http://localhost:8080/v1/system/info | jq '{
+  backend_pool,
+  engine_backend
+}'
+```
+
+Every entry the process saw appears in `backend_pool`. If a token in
+`models[].backend` doesn't resolve against that list, the worker
+refuses to start with a diagnostic that echoes the token back plus
+the list of available entries.
+
+### What is L0-only
+
+Not every runtime feature has a HIP equivalent yet. The following
+paths are L0-only and skipped when the engine is bound to HIP or CPU:
+
+- **Command-List Replay (CLR)** — decode-side record/replay lives on
+  the L0 `CommandQueue`. HIP-side (`M-HipGraph`) is on the roadmap
+  but not committed. HIP decode runs in immediate-mode.
+- **FusedQkvWeights** — the fused Q/K/V weight pack allocates via
+  `UsmAllocator` at load time. HIP engines skip this and go through
+  per-projection dispatches. Correct but slightly slower on the QKV
+  step.
+- **`selfTest` + `autotune` + `autotuneKTileQ8`** — matmul dispatch
+  autotune is L0-native (uses `queue.dispatchCount()` metrics). HIP
+  engines log "skipped (L0-only paths)" once at load time.
+- **`--attach` / Munin attached mode** — Munin's IPC surface uses
+  `zeMemOpenIpcHandle` which has no HIP equivalent. A HIP-only build
+  refuses `--attach` at boot; a dual build lets the L0 engine attach
+  while the HIP engine goes through the standalone `loadModel` path.
+
+None of these are correctness-affecting. They're perf / diagnostic
+paths that a HIP prod deploy simply doesn't get today.
+
+### CI story
+
+The L0 backend has `gpu_tests` (~110 kernel-parity cases). The HIP
+backend has `hip_tests` (13 cases, aggregator over `hip_*_probe`
+binaries) — same shape of pass/fail signal, narrower coverage. Run
+with:
+
+```bash
+docker compose run --rm mimirmind gpu_tests   # L0
+docker compose run --rm mimirmind hip_tests   # HIP (HIP_TARGET_HOST)
+```
+
+A future revision inlines the parity math into `hip_tests` and covers
+the full kernel matrix — see Synaipse
+`todos/hip-tests-inline-migration.md`.
