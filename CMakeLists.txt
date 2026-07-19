@@ -1614,6 +1614,48 @@ if(MIMIRMIND_ENABLE_HIP)
     target_link_libraries(hip_rope_ff_probe PRIVATE
         mimirmind_core_hip
     )
+
+    # ---- hip_tests — CI-visible aggregator over hip_*_probe ------------
+    #
+    # Wraps each parity probe as a TestFramework TEST() case that fork-
+    # execs the probe binary and surfaces exit code + captured stdout on
+    # failure. Turns N independent binaries into ONE ctest-visible target
+    # with N sub-cases — matches the shape of `gpu_tests` on the L0 side.
+    #
+    # Coverage is intentionally narrower than the full probe list (~40
+    # binaries): one representative per kernel family. Adding more is
+    # cheap — one TEST() line per probe.
+    #
+    # A future revision will migrate the parity math into the TEST()
+    # bodies directly and drop the subprocess layer. That's a ~2-3 week
+    # refactor per the plan and out of scope here — see Synaipse
+    # `todos/hip-tests-inline-migration.md`.
+
+    add_executable(hip_tests
+        tests/hip_tests.cpp
+    )
+
+    target_include_directories(hip_tests PRIVATE tests)
+    target_link_libraries(hip_tests PRIVATE mimirmind_core_common)
+
+    # hip_tests spawns the individual probe binaries; ensure they're
+    # built before the test target so a fresh `cmake --build ... --target hip_tests`
+    # gets a complete environment. Each probe already depends on hip_kernels.
+    add_dependencies(hip_tests
+        hip_rmsnorm_probe
+        hip_rmsnorm_gemma_probe
+        hip_add_residual_probe
+        hip_silu_mul_probe
+        hip_gelu_mul_probe
+        hip_rope_probe
+        hip_qkv_split_probe
+        hip_matmul_q8_probe
+        hip_matmul_q8_gemm_probe
+        hip_moe_down_fused_k_q8_0_probe
+        hip_moe_down_fused_k_q6k_probe
+        hip_attention_probe
+        hip_attention_prefill_flash_probe
+    )
 endif()
 
 # ---- backend_probe — neutral backend enumeration diagnostic ---------------
