@@ -141,6 +141,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::hip::HipKernel _matmulQ8_0VecDp4aKernel;
     ::mimirmind::core::hip::HipModule _moeDownFusedKQ8_0Module;
     ::mimirmind::core::hip::HipKernel _moeDownFusedKQ8_0Kernel;
+    ::mimirmind::core::hip::HipModule _moeDownFusedKQ6KModule;
+    ::mimirmind::core::hip::HipKernel _moeDownFusedKQ6KKernel;
     ::mimirmind::core::hip::HipModule _matmulQ5_0VecModule;
     ::mimirmind::core::hip::HipKernel _matmulQ5_0VecKernel;
     ::mimirmind::core::hip::HipModule _matmulQ6KVecModule;
@@ -168,6 +170,9 @@ struct GpuMatmul::Impl {
           _moeDownFusedKQ8_0Module{loadHipModule(ctx, "moe_down_fused_k_q8_0")},
           _moeDownFusedKQ8_0Kernel{
               _moeDownFusedKQ8_0Module.getKernel("moe_down_fused_k_q8_0")},
+          _moeDownFusedKQ6KModule {loadHipModule(ctx, "moe_down_fused_k_q6k")},
+          _moeDownFusedKQ6KKernel {
+              _moeDownFusedKQ6KModule.getKernel("moe_down_fused_k_q6k")},
           _matmulQ5_0VecModule    {loadHipModule(ctx, "matmul_q5_0_vec")},
           _matmulQ5_0VecKernel    {
               _matmulQ5_0VecModule.getKernel("matmul_q5_0_vec")},
@@ -193,9 +198,10 @@ GpuMatmul::GpuMatmul(::mimirmind::core::hip::HipComputeContext& ctx,
       _pimpl{std::make_unique<Impl>(ctx.hipContext())}
 {
     MM_LOG_INFO("hip::GpuMatmul",
-                "compute::hip::GpuMatmul ready — 10 kernels loaded "
+                "compute::hip::GpuMatmul ready — 11 kernels loaded "
                 "(Q8_0: vec / gemm / gemm_v2 / vec_dp4a / moe_down_fused_k; "
-                "Q5_0: vec; Q6_K: vec; Q4_K: vec; Q5_K: vec; F32: vec)");
+                "Q6_K: vec / moe_down_fused_k; Q5_0: vec; Q4_K: vec; "
+                "Q5_K: vec; F32: vec)");
 }
 
 GpuMatmul::~GpuMatmul() = default;
@@ -231,7 +237,8 @@ bool GpuMatmul::moeDownFusedKAvailable() const noexcept {
 
 bool GpuMatmul::moeDownFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
     const noexcept {
-    return type == ::mimirmind::core::gguf::GgmlType::Q8_0;
+    return type == ::mimirmind::core::gguf::GgmlType::Q8_0
+        || type == ::mimirmind::core::gguf::GgmlType::Q6_K;
 }
 
 void GpuMatmul::sync() {
@@ -874,27 +881,41 @@ void GpuMatmul::moeDownFusedKAsync(::mimirmind::core::gguf::GgmlType type,
                                    std::size_t          dModel,
                                    std::size_t          kActive,
                                    std::size_t          expertBytes) {
-    if (type != ::mimirmind::core::gguf::GgmlType::Q8_0) {
-        throw std::runtime_error(
-            "compute::hip::GpuMatmul::moeDownFusedKAsync: only Q8_0 has a "
-            "fused-K kernel on the HIP side — check moeDownFusedKAvailable"
-            "(type) before dispatching");
-    }
     if (kActive == 0 || dModel == 0 || ffPer == 0) {
         return;
     }
-    // Q8_0 block = 32 elements. `ffPer` is the inner dim swept per
-    // expert; a partial block at the tail would corrupt the
-    // dequant accumulator. Same guard as L0 GpuMatmul.
-    constexpr std::size_t kBlockElts = 32;
+
+    // Select kernel + block-element alignment guard per Q-type. Q6_K
+    // super-blocks are 256 elements; Q8_0 blocks are 32. A partial
+    // block at the tail corrupts the dequant accumulator.
+    ::mimirmind::core::hip::HipKernel* kernPtr = nullptr;
+    std::size_t                        kBlockElts = 0;
+    const char*                        kBlockName = "";
+    switch (type) {
+        case ::mimirmind::core::gguf::GgmlType::Q8_0:
+            kernPtr    = &_pimpl->_moeDownFusedKQ8_0Kernel;
+            kBlockElts = 32;
+            kBlockName = "Q8_0";
+            break;
+        case ::mimirmind::core::gguf::GgmlType::Q6_K:
+            kernPtr    = &_pimpl->_moeDownFusedKQ6KKernel;
+            kBlockElts = 256;
+            kBlockName = "Q6_K";
+            break;
+        default:
+            throw std::runtime_error(
+                "compute::hip::GpuMatmul::moeDownFusedKAsync: type not "
+                "supported on the HIP side — check moeDownFusedKAvailable"
+                "(type) before dispatching. Supported: Q8_0, Q6_K.");
+    }
     if (ffPer % kBlockElts != 0) {
         throw std::runtime_error(
-            "compute::hip::GpuMatmul::moeDownFusedKAsync: ffPer=" +
-            std::to_string(ffPer) + " is not a multiple of Q8_0 "
-            "blockElements=" + std::to_string(kBlockElts));
+            std::string("compute::hip::GpuMatmul::moeDownFusedKAsync: ffPer=") +
+            std::to_string(ffPer) + " is not a multiple of " + kBlockName +
+            " blockElements=" + std::to_string(kBlockElts));
     }
 
-    auto& kern = _pimpl->_moeDownFusedKQ8_0Kernel;
+    auto& kern = *kernPtr;
     kern.setPtr  (0, gateAct);
     kern.setPtr  (1, W);
     kern.setPtr  (2, expIdx);
@@ -905,8 +926,8 @@ void GpuMatmul::moeDownFusedKAsync(::mimirmind::core::gguf::GgmlType type,
     kern.setValue(7, static_cast<std::int32_t>(kActive));
     kern.setValue(8, static_cast<std::int32_t>(expertBytes));
 
-    // 4 outputs per workgroup — same geometry as the plain Q8_0 vec
-    // kernel by coincidence (MOE_DOWN_LOCAL=64, SG=16 in the .hip).
+    // 4 outputs per workgroup — geometry shared across Q8_0 and Q6_K
+    // (MOE_DOWN_LOCAL=64, SG=16 in the .hip sources).
     const std::uint32_t nGroups = static_cast<std::uint32_t>(
         (dModel + kMoeDownOutputsPerGroup - 1) / kMoeDownOutputsPerGroup);
 

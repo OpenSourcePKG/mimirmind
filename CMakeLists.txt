@@ -453,6 +453,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/matmul_q8_0_vec_dp4a.hip
         kernels_hip/matmul_q8_0_vec_reorder.hip
+        kernels_hip/moe_down_fused_k_q6k.hip
         kernels_hip/moe_down_fused_k_q8_0.hip
         kernels_hip/mul_scalar.hip
         kernels_hip/qkv_split.hip
@@ -1490,6 +1491,23 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(hip_moe_down_fused_k_q8_0_probe hip_kernels)
 
     target_link_libraries(hip_moe_down_fused_k_q8_0_probe PRIVATE
+        mimirmind_core_hip
+    )
+
+    # ---- hip_moe_down_fused_k_q6k_probe — Q6_K MoE-down parity --------
+    #
+    # Same shape as the Q8_0 sibling but on Q6_K super-blocks (210 B,
+    # 256 elements). Kahan compensation in the kernel keeps FP32 error
+    # inside abs/rel 1e-3 despite the ×40 magnitude of Q6_K terms vs
+    # Q8_0. Unblocks Gemma 4 26B-A4B MoE-down on the HIP path.
+
+    add_executable(hip_moe_down_fused_k_q6k_probe
+        tools/hip-moe-down-fused-k-q6k-probe.cpp
+    )
+
+    add_dependencies(hip_moe_down_fused_k_q6k_probe hip_kernels)
+
+    target_link_libraries(hip_moe_down_fused_k_q6k_probe PRIVATE
         mimirmind_core_hip
     )
 
