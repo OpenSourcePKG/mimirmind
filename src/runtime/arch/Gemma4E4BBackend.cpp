@@ -17,7 +17,7 @@
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
 #include "core/log/Log.hpp"
-#include "runtime/OpProfiler.hpp"
+#include "runtime/perf/OpProfiler.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
 
 #include <algorithm>

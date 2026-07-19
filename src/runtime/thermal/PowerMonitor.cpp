@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "runtime/PowerMonitor.hpp"
+#include "runtime/thermal/PowerMonitor.hpp"
 
 #include <algorithm>
 #include <cstdlib>

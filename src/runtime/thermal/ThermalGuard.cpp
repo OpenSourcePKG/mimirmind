@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "runtime/ThermalGuard.hpp"
+#include "runtime/thermal/ThermalGuard.hpp"
 
 #include <cstdio>
 #include <sstream>

@@ -3,8 +3,8 @@
 
 #pragma once
 
-#include "runtime/SystemMonitor.hpp"
-#include "runtime/ThermalProfile.hpp"
+#include "runtime/thermal/SystemMonitor.hpp"
+#include "runtime/thermal/ThermalProfile.hpp"
 
 #include <chrono>
 #include <stdexcept>

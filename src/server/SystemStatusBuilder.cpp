@@ -9,12 +9,12 @@
 #include "core/backend/BackendPool.hpp"
 #include "core/backend/BackendRegistry.hpp"
 
-#include "runtime/FanController.hpp"
-#include "runtime/GpuClockGovernor.hpp"
+#include "runtime/thermal/FanController.hpp"
+#include "runtime/thermal/GpuClockGovernor.hpp"
 #include "runtime/InferenceEngine.hpp"
-#include "runtime/PerfRegressionDetector.hpp"
-#include "runtime/SpeculativeDecoder.hpp"
-#include "runtime/ThermalGuard.hpp"
+#include "runtime/perf/PerfRegressionDetector.hpp"
+#include "runtime/spec/SpeculativeDecoder.hpp"
+#include "runtime/thermal/ThermalGuard.hpp"
 
 #include <limits>
 #include <vector>

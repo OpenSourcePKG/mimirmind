@@ -16,7 +16,7 @@
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
 #include "core/log/Log.hpp"
-#include "runtime/OpProfiler.hpp"
+#include "runtime/perf/OpProfiler.hpp"
 
 #include <cmath>
 #include <cstdint>

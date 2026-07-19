@@ -15,7 +15,7 @@
 #include "model/Tokenizer.hpp"
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
-#include "runtime/OpProfiler.hpp"
+#include "runtime/perf/OpProfiler.hpp"
 
 // L0-native includes are only pulled in when the L0 backend is
 // compiled in. Downstream L0-only accessors (`ctx()`, `allocator()`,

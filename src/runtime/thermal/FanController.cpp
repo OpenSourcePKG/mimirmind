@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "runtime/FanController.hpp"
+#include "runtime/thermal/FanController.hpp"
 
 #include <algorithm>
 #include <fstream>

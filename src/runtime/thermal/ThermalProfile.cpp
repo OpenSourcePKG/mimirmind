@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "runtime/ThermalProfile.hpp"
+#include "runtime/thermal/ThermalProfile.hpp"
 
 #include <fstream>
 #include <nlohmann/json.hpp>

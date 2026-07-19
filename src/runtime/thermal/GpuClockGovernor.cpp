@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "runtime/GpuClockGovernor.hpp"
+#include "runtime/thermal/GpuClockGovernor.hpp"
 
-#include "runtime/SystemMonitor.hpp"
+#include "runtime/thermal/SystemMonitor.hpp"
 
 #include <algorithm>
 #include <chrono>

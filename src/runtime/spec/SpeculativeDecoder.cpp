@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "runtime/SpeculativeDecoder.hpp"
+#include "runtime/spec/SpeculativeDecoder.hpp"
 
 #include "compute/SpeculativeSampler.hpp"
 #include "core/log/Log.hpp"

@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "runtime/ThermalProfile.hpp"
+#include "runtime/thermal/ThermalProfile.hpp"
 
 #include <cstddef>
 #include <optional>

@@ -593,15 +593,15 @@ add_executable(mimirmind
     src/runtime/BlockBuffers.cpp
     src/runtime/InferenceEngine.cpp
     src/runtime/KvCache.cpp
-    src/runtime/OpProfiler.cpp
-    src/runtime/SpeculativeDecoder.cpp
-    src/runtime/FanController.cpp
-    src/runtime/GpuClockGovernor.cpp
-    src/runtime/PerfRegressionDetector.cpp
-    src/runtime/PowerMonitor.cpp
-    src/runtime/SystemMonitor.cpp
-    src/runtime/ThermalGuard.cpp
-    src/runtime/ThermalProfile.cpp
+    src/runtime/perf/OpProfiler.cpp
+    src/runtime/spec/SpeculativeDecoder.cpp
+    src/runtime/thermal/FanController.cpp
+    src/runtime/thermal/GpuClockGovernor.cpp
+    src/runtime/perf/PerfRegressionDetector.cpp
+    src/runtime/thermal/PowerMonitor.cpp
+    src/runtime/thermal/SystemMonitor.cpp
+    src/runtime/thermal/ThermalGuard.cpp
+    src/runtime/thermal/ThermalProfile.cpp
     src/runtime/arch/ArchBackend.cpp
     src/runtime/arch/GemmaBaseBackend.cpp
     src/runtime/arch/Gemma4Backend.cpp
@@ -731,11 +731,11 @@ add_executable(arch_tests
     src/compute/MoeRouting.cpp
     src/compute/Softmax.cpp
     src/model/ResponseCleaner.cpp
-    src/runtime/GpuClockGovernor.cpp
-    src/runtime/PowerMonitor.cpp
-    src/runtime/SystemMonitor.cpp
-    src/runtime/ThermalGuard.cpp
-    src/runtime/ThermalProfile.cpp
+    src/runtime/thermal/GpuClockGovernor.cpp
+    src/runtime/thermal/PowerMonitor.cpp
+    src/runtime/thermal/SystemMonitor.cpp
+    src/runtime/thermal/ThermalGuard.cpp
+    src/runtime/thermal/ThermalProfile.cpp
 )
 
 target_include_directories(arch_tests PRIVATE tests)
