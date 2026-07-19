@@ -129,10 +129,22 @@ struct FeatureSettings {
 };
 
 struct SpeculativeSettings {
+    /// Source of speculative draft tokens. `Model` uses a second loaded
+    /// `InferenceEngine` (classic naive draft — needs `draft` set and a
+    /// vocab-compatible model). `NGram` uses in-context Prompt-Lookup
+    /// Decoding — no second model, no vocab check, works on any target.
+    enum class Drafter { Model, NGram };
+
     bool        enabled{false};
+    Drafter     drafter{Drafter::Model};
     std::string target{};                // model id in `models[]`
-    std::string draft{};                 // model id in `models[]`
+    std::string draft{};                 // model id in `models[]` (Drafter::Model only)
     int         n{4};
+
+    /// Prompt-Lookup Decoding tuning knobs. Bounded to [1, 32] in the
+    /// parser. Ignored when drafter != NGram.
+    int         ngramMinK{2};
+    int         ngramMaxK{3};
 };
 
 struct FanSettings {

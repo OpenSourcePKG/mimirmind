@@ -13,6 +13,8 @@
 #include "runtime/thermal/GpuClockGovernor.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/perf/PerfRegressionDetector.hpp"
+#include "runtime/spec/ModelDrafter.hpp"
+#include "runtime/spec/NGramDrafter.hpp"
 #include "runtime/spec/SpeculativeDecoder.hpp"
 #include "runtime/thermal/ThermalGuard.hpp"
 
@@ -222,20 +224,29 @@ json SystemStatusBuilder::buildInfo() const {
         fanEnvelope = nullptr;
     }
 
-    // M9.11.1 + M9.11.4 — Speculative-decoding readiness.
+    // M9.11.1 + M9.11.4 — Speculative-decoding readiness. The drafter
+    // kind selects which model-specific fields we report — `model`
+    // exposes the backing engine's arch/block/embedding, `ngram` its
+    // minK/maxK PLD window.
     json speculativeDecoding;
-    auto* draft   = _dispatcher.draftEngine();
+    auto* drafter = _dispatcher.drafter();
     auto* specDec = _dispatcher.speculativeDecoder();
-    if (draft != nullptr && specDec != nullptr) {
-        const auto& draftCfg = draft->config();
+    if (drafter != nullptr && specDec != nullptr) {
         speculativeDecoding = {
-            {"status",                 "ready"},
-            {"mode",                   "greedy"},
-            {"draft_n",                specDec->config().draftN},
-            {"draft_model_arch",       draftCfg.architecture},
-            {"draft_block_count",      draftCfg.blockCount},
-            {"draft_embedding_length", draftCfg.embeddingLength},
+            {"status",  "ready"},
+            {"mode",    "greedy"},
+            {"drafter", std::string{drafter->kind()}},
+            {"draft_n", specDec->config().draftN},
         };
+        if (auto* md = dynamic_cast<runtime::ModelDrafter*>(drafter)) {
+            const auto& draftCfg = md->engine().config();
+            speculativeDecoding["draft_model_arch"]       = draftCfg.architecture;
+            speculativeDecoding["draft_block_count"]      = draftCfg.blockCount;
+            speculativeDecoding["draft_embedding_length"] = draftCfg.embeddingLength;
+        } else if (auto* nd = dynamic_cast<runtime::NGramDrafter*>(drafter)) {
+            speculativeDecoding["ngram_min_k"] = nd->config().minK;
+            speculativeDecoding["ngram_max_k"] = nd->config().maxK;
+        }
     } else {
         speculativeDecoding = {
             {"status", "disabled"},

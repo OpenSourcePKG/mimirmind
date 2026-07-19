@@ -596,10 +596,12 @@ add_executable(mimirmind
     src/runtime/InferenceEngine.cpp
     src/runtime/KvCache.cpp
     src/runtime/perf/OpProfiler.cpp
+    src/runtime/perf/PerfRegressionDetector.cpp
+    src/runtime/spec/ModelDrafter.cpp
+    src/runtime/spec/NGramDrafter.cpp
     src/runtime/spec/SpeculativeDecoder.cpp
     src/runtime/thermal/FanController.cpp
     src/runtime/thermal/GpuClockGovernor.cpp
-    src/runtime/perf/PerfRegressionDetector.cpp
     src/runtime/thermal/PowerMonitor.cpp
     src/runtime/thermal/SystemMonitor.cpp
     src/runtime/thermal/ThermalGuard.cpp
@@ -836,6 +838,7 @@ add_executable(compute_tests
     src/compute/quant/Q5_0.cpp
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
+    src/runtime/spec/NGramDrafter.cpp
 )
 
 target_include_directories(compute_tests PRIVATE tests)

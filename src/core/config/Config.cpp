@@ -289,14 +289,36 @@ FeatureSettings parseFeatures(std::string_view      path,
 
 SpeculativeSettings parseSpeculative(std::string_view      path,
                                      const nlohmann::json& j) {
-    checkKnownKeys(path, "speculative", j, {"enabled", "target", "draft", "n"});
+    checkKnownKeys(path, "speculative", j,
+                   {"enabled", "drafter", "target", "draft", "n",
+                    "ngramMinK", "ngramMaxK"});
     SpeculativeSettings s{};
     if (const auto v = readOpt<bool>(path, "speculative", j, "enabled"); v) s.enabled = *v;
+    if (const auto v = readOpt<std::string>(path, "speculative", j, "drafter"); v) {
+        if (*v == "model") {
+            s.drafter = SpeculativeSettings::Drafter::Model;
+        } else if (*v == "ngram") {
+            s.drafter = SpeculativeSettings::Drafter::NGram;
+        } else {
+            fail(path, "speculative.drafter must be 'model' or 'ngram'");
+        }
+    }
     if (const auto v = readOpt<std::string>(path, "speculative", j, "target"); v) s.target = *v;
     if (const auto v = readOpt<std::string>(path, "speculative", j, "draft");  v) s.draft  = *v;
     if (const auto v = readOpt<int>(path, "speculative", j, "n"); v) {
         if (*v < 1 || *v > 32) fail(path, "speculative.n must be in 1..32");
         s.n = *v;
+    }
+    if (const auto v = readOpt<int>(path, "speculative", j, "ngramMinK"); v) {
+        if (*v < 1 || *v > 32) fail(path, "speculative.ngramMinK must be in 1..32");
+        s.ngramMinK = *v;
+    }
+    if (const auto v = readOpt<int>(path, "speculative", j, "ngramMaxK"); v) {
+        if (*v < 1 || *v > 32) fail(path, "speculative.ngramMaxK must be in 1..32");
+        s.ngramMaxK = *v;
+    }
+    if (s.ngramMaxK < s.ngramMinK) {
+        fail(path, "speculative.ngramMaxK must be >= speculative.ngramMinK");
     }
     return s;
 }
@@ -532,6 +554,9 @@ Config loadConfig(std::string_view path) {
     if (j.contains("diagnostics"))  cfg.diagnostics  = parseDiagnostics(path, j["diagnostics"]);
 
     // Cross-section validation: speculative model ids must resolve.
+    // `target` is required for either drafter; `draft` is only required
+    // for the model-based drafter — the n-gram drafter has no draft
+    // model.
     if (cfg.speculative.enabled) {
         auto exists = [&](const std::string& id) {
             return std::any_of(cfg.models.begin(), cfg.models.end(),
@@ -546,17 +571,20 @@ Config loadConfig(std::string_view path) {
                << "' does not match any models[].id";
             fail(path, os.str());
         }
-        if (cfg.speculative.draft.empty()) {
-            fail(path, "speculative.enabled=true requires speculative.draft (model id)");
-        }
-        if (!exists(cfg.speculative.draft)) {
-            std::ostringstream os;
-            os << "speculative.draft='" << cfg.speculative.draft
-               << "' does not match any models[].id";
-            fail(path, os.str());
-        }
-        if (cfg.speculative.target == cfg.speculative.draft) {
-            fail(path, "speculative.target and speculative.draft must differ");
+        if (cfg.speculative.drafter == SpeculativeSettings::Drafter::Model) {
+            if (cfg.speculative.draft.empty()) {
+                fail(path, "speculative.enabled=true with drafter='model' "
+                           "requires speculative.draft (model id)");
+            }
+            if (!exists(cfg.speculative.draft)) {
+                std::ostringstream os;
+                os << "speculative.draft='" << cfg.speculative.draft
+                   << "' does not match any models[].id";
+                fail(path, os.str());
+            }
+            if (cfg.speculative.target == cfg.speculative.draft) {
+                fail(path, "speculative.target and speculative.draft must differ");
+            }
         }
     }
 

@@ -42,9 +42,12 @@
 
   "speculative": {
     "enabled": false,
+    "drafter": "model",
     "target": "primary",
     "draft": "draft",
-    "n": 4
+    "n": 4,
+    "ngramMinK": 2,
+    "ngramMaxK": 3
   },
 
   "governor": {

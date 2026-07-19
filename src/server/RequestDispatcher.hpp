@@ -16,6 +16,7 @@
 #include <vector>
 
 namespace mimirmind::runtime {
+class Drafter;
 class InferenceEngine;
 }
 
@@ -47,13 +48,14 @@ public:
     };
 
     /// `engines` must be non-empty. `modelId` (if set) picks the
-    /// default engine — must match one of the entries. `draftEngine`
-    /// enables spec-dec on the default engine when
+    /// default engine — must match one of the entries. `drafter`
+    /// (non-owning) enables spec-dec on the default engine when
     /// `speculativeTargetId` is empty or matches the default id;
-    /// otherwise spec-dec stays off with a warning.
+    /// otherwise spec-dec stays off with a warning. Pass nullptr to
+    /// keep spec-dec off.
     RequestDispatcher(std::vector<LoadedEngine>                  engines,
                        const std::string&                          modelId,
-                       runtime::InferenceEngine*                   draftEngine,
+                       runtime::Drafter*                           drafter,
                        const std::string&                          speculativeTargetId,
                        const runtime::SpeculativeDecoder::Config&  speculativeConfig);
 
@@ -67,7 +69,7 @@ public:
     [[nodiscard]] const std::string&           defaultTitle()  const noexcept { return _defaultTitle; }
     [[nodiscard]] std::mutex&                  defaultMutex()  noexcept { return _defaultMutex; }
     [[nodiscard]] runtime::SpeculativeDecoder* speculativeDecoder() noexcept { return _speculativeDecoder.get(); }
-    [[nodiscard]] runtime::InferenceEngine*    draftEngine()   noexcept { return _draftEngine; }
+    [[nodiscard]] runtime::Drafter*            drafter()       noexcept { return _drafter; }
 
     /// All loaded models in order: default first, then extras.
     [[nodiscard]] std::vector<ModelEntry> listModels() const;
@@ -90,7 +92,7 @@ private:
     std::string                                  _defaultId;
     std::string                                  _defaultTitle;
     std::mutex                                   _defaultMutex;
-    runtime::InferenceEngine*                    _draftEngine{nullptr};
+    runtime::Drafter*                            _drafter{nullptr};
     std::unique_ptr<runtime::SpeculativeDecoder> _speculativeDecoder;
     std::vector<ExtraHandle>                     _extraHandles;
 };

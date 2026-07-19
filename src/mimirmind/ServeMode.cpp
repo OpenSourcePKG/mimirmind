@@ -18,10 +18,13 @@
 #include "core/log/Log.hpp"
 #include "core/os/GovernorLock.hpp"
 #include "model/Tokenizer.hpp"
-#include "runtime/thermal/FanController.hpp"
-#include "runtime/thermal/GpuClockGovernor.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/perf/PerfRegressionDetector.hpp"
+#include "runtime/spec/Drafter.hpp"
+#include "runtime/spec/ModelDrafter.hpp"
+#include "runtime/spec/NGramDrafter.hpp"
+#include "runtime/thermal/FanController.hpp"
+#include "runtime/thermal/GpuClockGovernor.hpp"
 #include "runtime/thermal/PowerMonitor.hpp"
 #include "runtime/thermal/SystemMonitor.hpp"
 #include "runtime/thermal/ThermalGuard.hpp"
@@ -350,69 +353,89 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     // to the user later on (preserve_thinking flag).
     const auto effRuntime = cfg.effectiveRuntime(defaultId);
 
-    // M9.11.1 — Optional speculative-decoding draft engine. Opt-in via
-    // `speculative.enabled: true` in config.json plus a `models[]` entry
-    // whose id matches `speculative.draft`. Fully independent
-    // InferenceEngine so the target's L0 context / autotune / KV cache
-    // stay untouched; costs a second autotune pass at startup (~30 s)
-    // plus draft weights in USM. The speculation loop that actually
-    // calls the draft lands in M9.11.2+ — this step only loads and
-    // vocab-checks.
+    // M9.11.1 — Optional speculative decoding. Two drafter variants:
+    //   * `speculative.drafter == "model"` loads a second, smaller
+    //     InferenceEngine and wraps it in `ModelDrafter`. Requires a
+    //     vocab-compatible model resolved via `speculative.draft`.
+    //   * `speculative.drafter == "ngram"` uses in-context Prompt-Lookup
+    //     Decoding — no second model, no vocab check, zero USM cost.
+    // Both variants only kick in when `speculative.enabled` is true.
     std::unique_ptr<::mimirmind::runtime::InferenceEngine> draftEngine;
-    std::string draftPath;
-    if (cfg.speculative.enabled && !cfg.speculative.draft.empty()) {
-        try {
-            draftPath = cfg.model(cfg.speculative.draft).path;
-        } catch (const std::exception& e) {
-            MM_LOG_WARN("main",
-                        "serve: speculative.draft='{}' unresolved ({}) — "
-                        "speculative decoding disabled",
-                        cfg.speculative.draft, e.what());
-        }
-    }
-    if (!draftPath.empty()) {
-        MM_LOG_INFO("main",
-                    "serve: loading draft model '{}'", draftPath);
-        try {
-            draftEngine = std::make_unique<::mimirmind::runtime::InferenceEngine>(cfg);
-            draftEngine->loadModel(draftPath);
-
-            // Vocab compatibility. Modified rejection sampling only
-            // works when draft token-id N and target token-id N mean
-            // the same subword. vocabSize alone doesn't guarantee it,
-            // but a mismatch there is a hard disqualification. bos/eos
-            // must match too because we replay the same prompt-id stream
-            // through both engines.
-            const auto& tTok = engine.tokenizer();
-            const auto& dTok = draftEngine->tokenizer();
-            const bool sizeMatch = tTok.vocabSize() == dTok.vocabSize();
-            const bool bosMatch  = tTok.bosId()     == dTok.bosId();
-            const bool eosMatch  = tTok.eosId()     == dTok.eosId();
-            if (!sizeMatch || !bosMatch || !eosMatch) {
+    std::unique_ptr<::mimirmind::runtime::Drafter>         drafter;
+    if (cfg.speculative.enabled) {
+        using DrafterKind = ::mimirmind::core::config::SpeculativeSettings::Drafter;
+        if (cfg.speculative.drafter == DrafterKind::NGram) {
+            ::mimirmind::runtime::NGramDrafter::Config nc{};
+            nc.minK = static_cast<std::size_t>(cfg.speculative.ngramMinK);
+            nc.maxK = static_cast<std::size_t>(cfg.speculative.ngramMaxK);
+            drafter = std::make_unique<::mimirmind::runtime::NGramDrafter>(nc);
+            MM_LOG_INFO("main",
+                        "serve: speculative decoding ready — "
+                        "drafter=ngram minK={} maxK={}",
+                        nc.minK, nc.maxK);
+        } else if (!cfg.speculative.draft.empty()) {
+            std::string draftPath;
+            try {
+                draftPath = cfg.model(cfg.speculative.draft).path;
+            } catch (const std::exception& e) {
                 MM_LOG_WARN("main",
-                            "serve: draft model vocab incompatible with "
-                            "target — disabling speculative decoding. "
-                            "target(vocab={}, bos={}, eos={}) vs "
-                            "draft(vocab={}, bos={}, eos={})",
-                            tTok.vocabSize(), tTok.bosId(), tTok.eosId(),
-                            dTok.vocabSize(), dTok.bosId(), dTok.eosId());
-                draftEngine.reset();
-            } else {
-                MM_LOG_INFO("main",
-                            "serve: speculative decoding ready — "
-                            "target arch={} d_model={}, draft arch={} d_model={} "
-                            "(shared vocab_size={}, bos={}, eos={})",
-                            engine.config().architecture,
-                            engine.config().embeddingLength,
-                            draftEngine->config().architecture,
-                            draftEngine->config().embeddingLength,
-                            tTok.vocabSize(), tTok.bosId(), tTok.eosId());
+                            "serve: speculative.draft='{}' unresolved ({}) — "
+                            "speculative decoding disabled",
+                            cfg.speculative.draft, e.what());
             }
-        } catch (const std::exception& e) {
+            if (!draftPath.empty()) {
+                MM_LOG_INFO("main",
+                            "serve: loading draft model '{}'", draftPath);
+                try {
+                    draftEngine = std::make_unique<::mimirmind::runtime::InferenceEngine>(cfg);
+                    draftEngine->loadModel(draftPath);
+
+                    // Vocab compatibility. Modified rejection sampling
+                    // only works when draft token-id N and target token-
+                    // id N mean the same subword. vocabSize alone
+                    // doesn't guarantee it, but a mismatch there is a
+                    // hard disqualification. bos/eos must match too
+                    // because we replay the same prompt-id stream
+                    // through both engines.
+                    const auto& tTok = engine.tokenizer();
+                    const auto& dTok = draftEngine->tokenizer();
+                    const bool sizeMatch = tTok.vocabSize() == dTok.vocabSize();
+                    const bool bosMatch  = tTok.bosId()     == dTok.bosId();
+                    const bool eosMatch  = tTok.eosId()     == dTok.eosId();
+                    if (!sizeMatch || !bosMatch || !eosMatch) {
+                        MM_LOG_WARN("main",
+                                    "serve: draft model vocab incompatible with "
+                                    "target — disabling speculative decoding. "
+                                    "target(vocab={}, bos={}, eos={}) vs "
+                                    "draft(vocab={}, bos={}, eos={})",
+                                    tTok.vocabSize(), tTok.bosId(), tTok.eosId(),
+                                    dTok.vocabSize(), dTok.bosId(), dTok.eosId());
+                        draftEngine.reset();
+                    } else {
+                        drafter = std::make_unique<::mimirmind::runtime::ModelDrafter>(*draftEngine);
+                        MM_LOG_INFO("main",
+                                    "serve: speculative decoding ready — "
+                                    "drafter=model target arch={} d_model={}, "
+                                    "draft arch={} d_model={} "
+                                    "(shared vocab_size={}, bos={}, eos={})",
+                                    engine.config().architecture,
+                                    engine.config().embeddingLength,
+                                    draftEngine->config().architecture,
+                                    draftEngine->config().embeddingLength,
+                                    tTok.vocabSize(), tTok.bosId(), tTok.eosId());
+                    }
+                } catch (const std::exception& e) {
+                    MM_LOG_WARN("main",
+                                "serve: draft model load failed ({}) — "
+                                "speculative decoding disabled", e.what());
+                    draftEngine.reset();
+                }
+            }
+        } else {
             MM_LOG_WARN("main",
-                        "serve: draft model load failed ({}) — "
-                        "speculative decoding disabled", e.what());
-            draftEngine.reset();
+                        "serve: speculative.enabled=true with drafter='model' "
+                        "but speculative.draft is empty — speculative "
+                        "decoding disabled");
         }
     }
 
@@ -774,7 +797,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     }
 
     ::mimirmind::server::ApiServer server{std::move(loadedEngines), scfg,
-                                          draftEngine.get()};
+                                          drafter.get()};
 
     g_runningServer.store(&server, std::memory_order_release);
     std::signal(SIGINT,  signalStop);
@@ -824,11 +847,13 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         std::cout << "off (diagnostics.regressionAlert=false)";
     }
     std::cout << "\n  spec decoding:      ";
-    if (draftEngine != nullptr) {
-        std::cout << "ready (draft arch="
-                  << draftEngine->config().architecture
-                  << ", d_model=" << draftEngine->config().embeddingLength
-                  << ")";
+    if (drafter != nullptr) {
+        std::cout << "ready (drafter=" << drafter->kind();
+        if (draftEngine != nullptr) {
+            std::cout << ", draft arch=" << draftEngine->config().architecture
+                      << ", d_model="   << draftEngine->config().embeddingLength;
+        }
+        std::cout << ")";
     } else if (cfg.speculative.enabled) {
         std::cout << "disabled (draft load or vocab check failed — see log)";
     } else {

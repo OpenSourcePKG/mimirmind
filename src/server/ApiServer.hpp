@@ -12,6 +12,7 @@
 #include <vector>
 
 namespace mimirmind::runtime {
+class Drafter;
 class InferenceEngine;
 }
 
@@ -99,14 +100,14 @@ public:
     /// of the engine ids and picks the default engine for requests that
     /// omit `model`.
     ///
-    /// `draftEngine` is optional — when non-null, and `cfg.speculative`
-    /// resolves against one of the loaded engines' id via
-    /// `speculative.target`, the ApiServer wires up the M9.11.4 spec-dec
-    /// orchestrator for that specific target engine only. Other loaded
-    /// engines dispatch through the plain generate() path.
+    /// `drafter` is optional — when non-null, and `cfg.speculative`
+    /// resolves `speculative.target` against the default engine's id,
+    /// the ApiServer wires up the M9.11.4 spec-dec orchestrator for
+    /// that target. Other loaded engines dispatch through the plain
+    /// generate() path.
     ApiServer(std::vector<LoadedEngine>   engines,
               ServerConfig                cfg,
-              runtime::InferenceEngine*   draftEngine = nullptr);
+              runtime::Drafter*           drafter = nullptr);
     ~ApiServer();
 
     ApiServer(const ApiServer&)            = delete;

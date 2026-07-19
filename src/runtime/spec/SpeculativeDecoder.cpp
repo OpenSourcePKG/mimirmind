@@ -5,6 +5,7 @@
 
 #include "compute/SpeculativeSampler.hpp"
 #include "core/log/Log.hpp"
+#include "runtime/spec/Drafter.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -99,9 +100,9 @@ void applyPenaltiesInPlace(std::vector<float>&           logits,
 } // namespace
 
 SpeculativeDecoder::SpeculativeDecoder(InferenceEngine& target,
-                                       InferenceEngine& draft,
+                                       Drafter&         drafter,
                                        Config           cfg)
-    : _target{target}, _draft{draft}, _cfg{cfg} {
+    : _target{target}, _drafter{drafter}, _cfg{cfg} {
     if (_cfg.draftN == 0 || !_cfg.enabled) {
         MM_LOG_INFO("spec-dec",
                     "SpeculativeDecoder: disabled (enabled={}, draftN={}) — "
@@ -109,8 +110,8 @@ SpeculativeDecoder::SpeculativeDecoder(InferenceEngine& target,
                     _cfg.enabled, _cfg.draftN);
     } else {
         MM_LOG_INFO("spec-dec",
-                    "SpeculativeDecoder ready — draftN={}",
-                    _cfg.draftN);
+                    "SpeculativeDecoder ready — drafter={} draftN={}",
+                    _drafter.kind(), _cfg.draftN);
     }
 }
 
@@ -237,25 +238,17 @@ SpeculativeDecoder::runSpeculative(
         return generated;
     }
 
-    // --- Phase 2: catch draft's KV up to [prompt + t_last] ------------
+    // --- Phase 2: warm the drafter's prefix (model-drafter only) -----
     //
-    // A one-token draft.generate primes its prefix cache so subsequent
-    // rounds only prefill the diverging suffix (which, with LCP, is at
-    // most `1 + (accepted_last_round)` tokens). The single-token result
-    // itself is discarded — we only care that the KV is warm.
+    // Model drafters use this to prefill their own KV so the first
+    // `propose()` call only touches the divergent suffix. NGram
+    // drafters implement this as a no-op — the lookup is stateless.
     std::vector<std::int32_t> draftPrimePrompt;
     draftPrimePrompt.reserve(promptIds.size() + 1);
     draftPrimePrompt.insert(draftPrimePrompt.end(),
                             promptIds.begin(), promptIds.end());
     draftPrimePrompt.push_back(tLast);
-    {
-        GenerateParams primeParams  = params;
-        primeParams.maxNewTokens    = 1;
-        (void)_draft.generate(
-            std::span<const std::int32_t>{draftPrimePrompt},
-            primeParams, /*onToken=*/{}, /*outStats=*/nullptr,
-            /*onPrefillDone=*/{}, /*onPrefillProgress=*/{});
-    }
+    _drafter.warmPrefix(std::span<const std::int32_t>{draftPrimePrompt});
 
     // --- Phase 3: draft + verify + accept/reject rounds ---------------
     //
@@ -266,7 +259,6 @@ SpeculativeDecoder::runSpeculative(
     context.reserve(promptIds.size() + maxNew);
     context.insert(context.end(), promptIds.begin(), promptIds.end());
 
-    compute::SpeculativeSampler specSampler;
     std::size_t rounds     = 0;
     std::size_t totalDraft = 0;
     std::size_t totalAcc   = 0;
@@ -295,8 +287,7 @@ SpeculativeDecoder::runSpeculative(
 
         compute::SpeculativeBatch batch;
         if (roundN > 0) {
-            batch = specSampler.speculate(
-                _draft,
+            batch = _drafter.propose(
                 std::span<const std::int32_t>{draftPrompt},
                 roundN,
                 params.sampling);

@@ -45,8 +45,8 @@ struct ApiServer::Impl {
     ChatCompletionHandler                 chatHandler;
 
     Impl(std::vector<LoadedEngine> in, ServerConfig c,
-         runtime::InferenceEngine* draft)
-        : dispatcher{std::move(in), c.modelId, draft,
+         runtime::Drafter*         drafter)
+        : dispatcher{std::move(in), c.modelId, drafter,
                      c.speculativeTargetId, c.speculative},
           engine{dispatcher.defaultEngine()},
           cfg{std::move(c)},
@@ -170,9 +170,9 @@ struct ApiServer::Impl {
 
 ApiServer::ApiServer(std::vector<LoadedEngine>   engines,
                      ServerConfig                cfg,
-                     runtime::InferenceEngine*   draftEngine)
+                     runtime::Drafter*           drafter)
     : _impl{std::make_unique<Impl>(std::move(engines),
-                                   std::move(cfg), draftEngine)} {}
+                                   std::move(cfg), drafter)} {}
 
 ApiServer::~ApiServer() = default;
 

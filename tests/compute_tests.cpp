@@ -2,6 +2,7 @@
 //   - compute::Sampler          — greedy + temperature/top-k/top-p sampling
 //   - compute::matmul           — scalar CPU matmul with double accumulator
 //   - compute::embeddingLookup  — quant-type-aware token row lookup
+//   - runtime::NGramDrafter     — Prompt-Lookup Decoding tail-match core
 //
 // No Level Zero, no SPV kernels, no model file required.
 
@@ -15,6 +16,7 @@
 #include "compute/quant/Q6K.hpp"
 #include "compute/quant/Q8_0.hpp"
 #include "core/gguf/GgufTypes.hpp"
+#include "runtime/spec/NGramDrafter.hpp"
 
 #include <array>
 #include <cmath>
@@ -631,6 +633,155 @@ TEST(embedding_zeroDModelThrows) {
             dst.data());
         EXPECT_TRUE(false && "expected throw");
     } catch (const std::runtime_error&) {
+        // expected
+    }
+}
+
+// =======================================================================
+// runtime::NGramDrafter — pure-function `lookup` covers PLD algorithm
+// =======================================================================
+
+namespace {
+
+// The tiny test framework's EXPECT_EQ streams the compared values into
+// an error message and has no operator<< for std::vector. This helper
+// does an element-wise compare and hits EXPECT_EQ per element so the
+// stock int streaming path handles the failure output.
+void expectTokensEq(const std::vector<std::int32_t>& got,
+                    const std::vector<std::int32_t>& expected) {
+    EXPECT_EQ(got.size(), expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_EQ(got[i], expected[i]);
+    }
+}
+
+}
+
+TEST(ngram_lookup_emptyContext_returnsEmpty) {
+    const std::vector<std::int32_t> ctx;
+    const auto out = mimirmind::runtime::NGramDrafter::lookup(
+        ctx, /*N=*/4, /*maxK=*/3, /*minK=*/2);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST(ngram_lookup_shorterThanMinKPlusOne_returnsEmpty) {
+    // Need at least minK + 1 tokens (minK for needle + 1 for match).
+    const std::vector<std::int32_t> ctx{7, 7};
+    const auto out = mimirmind::runtime::NGramDrafter::lookup(
+        ctx, /*N=*/4, /*maxK=*/3, /*minK=*/2);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST(ngram_lookup_noMatch_returnsEmpty) {
+    // Tail [A, B] appears nowhere earlier in [X, Y, Z, A, B].
+    const std::vector<std::int32_t> ctx{10, 20, 30, 1, 2};
+    const auto out = mimirmind::runtime::NGramDrafter::lookup(
+        ctx, /*N=*/3, /*maxK=*/2, /*minK=*/2);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST(ngram_lookup_exactMatch_returnsFollowUp) {
+    // Tail [A, B, C] matches at position 0 in [A, B, C, X, Y, A, B, C]
+    // → follow-up is [X, Y].
+    const std::vector<std::int32_t> ctx{1, 2, 3, 42, 99, 1, 2, 3};
+    const auto out = mimirmind::runtime::NGramDrafter::lookup(
+        ctx, /*N=*/2, /*maxK=*/3, /*minK=*/2);
+    const std::vector<std::int32_t> expected{42, 99};
+    expectTokensEq(out, expected);
+}
+
+TEST(ngram_lookup_prefersLongerK) {
+    // Tail [B, C]. At k=3 (needle [A, B, C]) match at pos 0 → follow-up
+    // [X]. At k=2 (needle [B, C]) match at pos 1 → follow-up [X]. maxK
+    // sweep starts at k=3, so the k=3 result wins even though both
+    // exist. Here follow-ups happen to be identical, but the assertion
+    // is that the sweep is longest-k-first.
+    const std::vector<std::int32_t> ctx{1, 2, 3, 42, 99, 2, 3};
+    const auto out = mimirmind::runtime::NGramDrafter::lookup(
+        ctx, /*N=*/1, /*maxK=*/3, /*minK=*/2);
+    const std::vector<std::int32_t> expected{42};
+    expectTokensEq(out, expected);
+}
+
+TEST(ngram_lookup_fallsBackToSmallerK) {
+    // Tail [B, C]. At k=3 (needle [A, B, C]) no match. At k=2 (needle
+    // [B, C]) match at pos 2 → follow-up [99].
+    const std::vector<std::int32_t> ctx{7, 8, 2, 3, 99, 5, 2, 3};
+    const auto out = mimirmind::runtime::NGramDrafter::lookup(
+        ctx, /*N=*/1, /*maxK=*/3, /*minK=*/2);
+    const std::vector<std::int32_t> expected{99};
+    expectTokensEq(out, expected);
+}
+
+TEST(ngram_lookup_prefersMostRecentMatch) {
+    // Tail [1, 2] matches at positions 0 and 3. Backward scan picks the
+    // more recent (pos 3), giving follow-up [77].
+    const std::vector<std::int32_t> ctx{1, 2, 55, 1, 2, 77, 1, 2};
+    const auto out = mimirmind::runtime::NGramDrafter::lookup(
+        ctx, /*N=*/1, /*maxK=*/2, /*minK=*/2);
+    const std::vector<std::int32_t> expected{77};
+    expectTokensEq(out, expected);
+}
+
+TEST(ngram_lookup_truncatesFollowUpToN) {
+    // Match has 3 follow-up tokens but caller asks for N=2 → truncate.
+    const std::vector<std::int32_t> ctx{1, 2, 10, 20, 30, 99, 1, 2};
+    const auto out = mimirmind::runtime::NGramDrafter::lookup(
+        ctx, /*N=*/2, /*maxK=*/2, /*minK=*/2);
+    const std::vector<std::int32_t> expected{10, 20};
+    expectTokensEq(out, expected);
+}
+
+TEST(ngram_lookup_truncatesFollowUpToNeedleOverlap) {
+    // Match at position 4 has follow-ups that would overlap the tail
+    // needle at position 6. Only the non-overlapping tokens are
+    // returned — here that's zero, so this match is skipped and the
+    // earlier match at position 0 wins with follow-up [55, 66].
+    const std::vector<std::int32_t> ctx{7, 8, 55, 66, 7, 8, 7, 8};
+    const auto out = mimirmind::runtime::NGramDrafter::lookup(
+        ctx, /*N=*/2, /*maxK=*/2, /*minK=*/2);
+    const std::vector<std::int32_t> expected{55, 66};
+    expectTokensEq(out, expected);
+}
+
+TEST(ngram_lookup_zeroN_returnsEmpty) {
+    // Even with a perfect match, N=0 means no tokens requested.
+    const std::vector<std::int32_t> ctx{1, 2, 3, 42, 1, 2, 3};
+    const auto out = mimirmind::runtime::NGramDrafter::lookup(
+        ctx, /*N=*/0, /*maxK=*/3, /*minK=*/2);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST(ngram_drafter_proposeWrapsLookup) {
+    // Smoke-test the full Drafter interface: config, propose(), that
+    // probs are filled to 1.0F per token.
+    mimirmind::runtime::NGramDrafter drafter{{/*maxK=*/3, /*minK=*/2}};
+    const std::vector<std::int32_t> ctx{1, 2, 3, 42, 99, 1, 2, 3};
+    const mimirmind::compute::SamplingParams sampling{};
+    const auto batch = drafter.propose(
+        std::span<const std::int32_t>{ctx}, /*N=*/2, sampling);
+    const std::vector<std::int32_t> expectedTokens{42, 99};
+    expectTokensEq(batch.tokens, expectedTokens);
+    EXPECT_EQ(batch.probs.size(), std::size_t{2});
+    EXPECT_NEAR(batch.probs[0], 1.0F, 1e-6F);
+    EXPECT_NEAR(batch.probs[1], 1.0F, 1e-6F);
+    EXPECT_TRUE(!batch.hitStop);
+}
+
+TEST(ngram_drafter_ctorRejectsMinKZero) {
+    try {
+        mimirmind::runtime::NGramDrafter drafter{{/*maxK=*/3, /*minK=*/0}};
+        EXPECT_TRUE(false && "expected throw for minK=0");
+    } catch (const std::invalid_argument&) {
+        // expected
+    }
+}
+
+TEST(ngram_drafter_ctorRejectsMaxKBelowMinK) {
+    try {
+        mimirmind::runtime::NGramDrafter drafter{{/*maxK=*/1, /*minK=*/3}};
+        EXPECT_TRUE(false && "expected throw for maxK<minK");
+    } catch (const std::invalid_argument&) {
         // expected
     }
 }

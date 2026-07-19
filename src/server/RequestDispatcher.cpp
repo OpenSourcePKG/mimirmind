@@ -3,6 +3,7 @@
 
 #include "server/RequestDispatcher.hpp"
 
+#include "runtime/spec/Drafter.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "core/log/Log.hpp"
 
@@ -39,11 +40,11 @@ runtime::InferenceEngine& pickDefault(const std::vector<LoadedEngine>& in,
 RequestDispatcher::RequestDispatcher(
     std::vector<LoadedEngine>                  engines,
     const std::string&                          modelId,
-    runtime::InferenceEngine*                   draftEngine,
+    runtime::Drafter*                           drafter,
     const std::string&                          speculativeTargetId,
     const runtime::SpeculativeDecoder::Config&  speculativeConfig)
     : _defaultEngine{&pickDefault(engines, modelId)},
-      _draftEngine{draftEngine} {
+      _drafter{drafter} {
 
     // Identify the default entry so its metadata is available for
     // listModels() without a second lookup.
@@ -68,16 +69,16 @@ RequestDispatcher::RequestDispatcher(
         _extraHandles.push_back(std::move(h));
     }
 
-    // M9.11.4 — stand up the spec-dec orchestrator now that both
-    // engines are ready. Spec-dec is currently wired only for the
+    // M9.11.4 — stand up the spec-dec orchestrator now that the
+    // drafter is ready. Spec-dec is currently wired only for the
     // default engine — if `speculativeTargetId` names an ExtraHandle
     // instead, spec-dec stays off with a warning so the operator can
     // fix the config.
-    if (_draftEngine != nullptr) {
+    if (_drafter != nullptr) {
         if (speculativeTargetId.empty() || speculativeTargetId == _defaultId) {
             _speculativeDecoder =
                 std::make_unique<runtime::SpeculativeDecoder>(
-                    *_defaultEngine, *_draftEngine, speculativeConfig);
+                    *_defaultEngine, *_drafter, speculativeConfig);
         } else {
             MM_LOG_WARN("server",
                         "speculative.target='{}' is not the default "

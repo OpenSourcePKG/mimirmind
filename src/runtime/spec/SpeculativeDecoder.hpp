@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "runtime/spec/Drafter.hpp"
 #include "runtime/InferenceEngine.hpp"
 
 #include <cstddef>
@@ -15,11 +16,13 @@ namespace mimirmind::runtime {
 /**
  * M9.11.4 — speculative-decoding orchestrator.
  *
- * Wraps a `target` (big, slow, authoritative) and a `draft` (small, fast)
- * InferenceEngine pair. Presents the same public shape as
- * `InferenceEngine::generate()` so the ApiServer can route through it
- * with no other change: eligibility check inside decides whether to
- * engage the spec-dec loop or delegate straight to `target.generate()`.
+ * Wraps a `target` (big, slow, authoritative) `InferenceEngine` and a
+ * `drafter` (source of speculative tokens — either a small model
+ * (`ModelDrafter`) or an in-context n-gram lookup (`NGramDrafter`)).
+ * Presents the same public shape as `InferenceEngine::generate()` so
+ * the ApiServer can route through it with no other change:
+ * eligibility check inside decides whether to engage the spec-dec loop
+ * or delegate straight to `target.generate()`.
  *
  * Scope of M9.11.4 — greedy only:
  *
@@ -54,11 +57,12 @@ public:
         std::size_t draftN{4};
     };
 
-    /// `target` and `draft` are non-owning. `draft` must have passed the
-    /// vocab-compat check in main.cpp already — this class does no
-    /// re-verification.
+    /// `target` and `drafter` are non-owning. If `drafter` is a
+    /// `ModelDrafter`, the backing engine must have passed the vocab-
+    /// compat check in main.cpp already — this class does no
+    /// re-verification. `NGramDrafter` has no compat requirements.
     SpeculativeDecoder(InferenceEngine& target,
-                       InferenceEngine& draft,
+                       Drafter&         drafter,
                        Config           cfg);
 
     SpeculativeDecoder(const SpeculativeDecoder&)            = delete;
@@ -97,7 +101,7 @@ private:
         const InferenceEngine::PrefillProgressCallback&  onPrefillProgress);
 
     InferenceEngine& _target;
-    InferenceEngine& _draft;
+    Drafter&         _drafter;
     Config           _cfg;
 };
 
