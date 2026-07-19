@@ -147,6 +147,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::hip::HipKernel _matmulQ5_0VecKernel;
     ::mimirmind::core::hip::HipModule _matmulQ6KVecModule;
     ::mimirmind::core::hip::HipKernel _matmulQ6KVecKernel;
+    ::mimirmind::core::hip::HipModule _matmulQ3KVecModule;
+    ::mimirmind::core::hip::HipKernel _matmulQ3KVecKernel;
     ::mimirmind::core::hip::HipModule _matmulQ4KVecModule;
     ::mimirmind::core::hip::HipKernel _matmulQ4KVecKernel;
     ::mimirmind::core::hip::HipModule _matmulQ5KVecModule;
@@ -179,6 +181,9 @@ struct GpuMatmul::Impl {
           _matmulQ6KVecModule     {loadHipModule(ctx, "matmul_q6k_vec")},
           _matmulQ6KVecKernel     {
               _matmulQ6KVecModule.getKernel("matmul_q6k_vec")},
+          _matmulQ3KVecModule     {loadHipModule(ctx, "matmul_q3k_vec")},
+          _matmulQ3KVecKernel     {
+              _matmulQ3KVecModule.getKernel("matmul_q3k_vec")},
           _matmulQ4KVecModule     {loadHipModule(ctx, "matmul_q4k_vec")},
           _matmulQ4KVecKernel     {
               _matmulQ4KVecModule.getKernel("matmul_q4k_vec")},
@@ -198,10 +203,10 @@ GpuMatmul::GpuMatmul(::mimirmind::core::hip::HipComputeContext& ctx,
       _pimpl{std::make_unique<Impl>(ctx.hipContext())}
 {
     MM_LOG_INFO("hip::GpuMatmul",
-                "compute::hip::GpuMatmul ready — 11 kernels loaded "
+                "compute::hip::GpuMatmul ready — 12 kernels loaded "
                 "(Q8_0: vec / gemm / gemm_v2 / vec_dp4a / moe_down_fused_k; "
                 "Q6_K: vec / moe_down_fused_k; Q5_0: vec; Q4_K: vec; "
-                "Q5_K: vec; F32: vec)");
+                "Q5_K: vec; Q3_K: vec; F32: vec)");
 }
 
 GpuMatmul::~GpuMatmul() = default;
@@ -549,6 +554,40 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
             (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
 
         auto& kern = _pimpl->_matmulQ6KVecKernel;
+        for (std::size_t m = 0; m < M; ++m) {
+            const float* xRow = X + m * K;
+            float*       yRow = Y + m * N;
+
+            kern.setPtr  (0, xRow);
+            kern.setPtr  (1, W);
+            kern.setPtr  (2, yRow);
+            kern.setValue(3, static_cast<std::int32_t>(K));
+            kern.setValue(4, static_cast<std::int32_t>(N));
+
+            kern.launch(_ctx.stream(),
+                        nGroups, 1, 1,
+                        kVecLocalSize, 1, 1);
+        }
+        return;
+    }
+
+    if (type == ::mimirmind::core::gguf::GgmlType::Q3_K) {
+        // Native Q3_K vec kernel — same launch shape as Q6_K but block
+        // is 256 elements / 110 bytes with hmask[32] / qs[64] /
+        // scales[12] (packed 16 x 6-bit) / fp16 d. Signed 3-bit quant:
+        // value = d * (scale - 32) * (low_2 - (high_1 ? 0 : 4)).
+        // K must be a multiple of the super-block size.
+        constexpr std::size_t kBlockElts = 256;
+        if (K % kBlockElts != 0) {
+            throw std::runtime_error(
+                "compute::hip::GpuMatmul::matmulAsync: K=" +
+                std::to_string(K) + " is not a multiple of Q3_K "
+                "blockElements=" + std::to_string(kBlockElts));
+        }
+        const std::uint32_t nGroups = static_cast<std::uint32_t>(
+            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+
+        auto& kern = _pimpl->_matmulQ3KVecKernel;
         for (std::size_t m = 0; m < M; ++m) {
             const float* xRow = X + m * K;
             float*       yRow = Y + m * N;

@@ -142,6 +142,7 @@ TEST(hip_qkv_split)                  { expectProbeOk("hip_qkv_split_probe"); }
 // Matmul families — one representative per quant type
 TEST(hip_matmul_q8_0_vec)            { expectProbeOk("hip_matmul_q8_probe"); }
 TEST(hip_matmul_q8_0_gemm)           { expectProbeOk("hip_matmul_q8_gemm_probe"); }
+TEST(hip_matmul_q3k_vec)             { expectProbeOk("hip_matmul_q3k_probe"); }
 
 // MoE (from Blocker 2)
 TEST(hip_moe_down_fused_k_q8_0)      { expectProbeOk("hip_moe_down_fused_k_q8_0_probe"); }

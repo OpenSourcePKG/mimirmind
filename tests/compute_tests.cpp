@@ -11,6 +11,7 @@
 #include "compute/Embedding.hpp"
 #include "compute/Matmul.hpp"
 #include "compute/Sampling.hpp"
+#include "compute/quant/Q3K.hpp"
 #include "compute/quant/Q6K.hpp"
 #include "compute/quant/Q8_0.hpp"
 #include "core/gguf/GgufTypes.hpp"
@@ -396,6 +397,85 @@ TEST(matmul_q6k_singleSuperBlock) {
                                scratch.data());
 
     EXPECT_NEAR(Y[0], -32.0F * 256.0F, 0.0F);
+}
+
+// Q3_K super-block layout: 32 B hmask + 64 B qs + 12 B packed scales +
+// 2 B fp16 d = 110 B / 256 elements.
+//
+// Signed 3-bit quant: qv = low_2 - (high_1 ? 0 : 4) ∈ [-4, 3].
+// Value: d * (scale[sub_block] - 32) * qv.
+//
+// Scales packing trick: 16 x 6-bit values packed into 12 bytes via
+// kmask1=0x03030303, kmask2=0x0f0f0f0f. To get all 16 scales = 33:
+//   - low 4 bits: nibble = 1 → packed[0..7] = 0x11 (both nibbles 1)
+//   - top 2 bits: value = 2 → tmp bytes = 0b10101010 = 0xAA
+// So packed[0..11] = {0x11 * 8, 0xAA * 4}. (scale − 32) = 1 then, so
+// the multiplier is just d * qv and we can read out the raw 3-bit
+// numeric range cleanly.
+TEST(dequant_q3k_singleSuperBlock_minValue) {
+    // hmask=0, qs=0 → low_2 = 0, high_1 = 0 → qv = 0 - 4 = -4.
+    // scales = 33 (so scale-32 = 1), d = 1 → output = -4 everywhere.
+    std::array<std::uint8_t, 110> W{};
+    // hmask (bytes 0..31)  = 0
+    // qs    (bytes 32..95) = 0
+    for (std::size_t i = 96; i < 104; ++i) W[i] = 0x11U;   // scales packed[0..7]
+    for (std::size_t i = 104; i < 108; ++i) W[i] = 0xAAU;  // scales packed[8..11]
+    writeHalfBits(W.data() + 108, kHalfOne);               // d = 1
+
+    std::array<float, 256> out{};
+    mimirmind::compute::quant::Q3K::instance().dequantToF32(
+        W.data(), out.size(), out.data());
+
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        EXPECT_NEAR(out[i], -4.0F, 0.0F);
+    }
+}
+
+TEST(dequant_q3k_singleSuperBlock_maxValue) {
+    // hmask=0xFF, qs=0xFF → low_2 = 3, high_1 = 1 → qv = 3 - 0 = 3.
+    // scales = 33, d = 1 → output = 3 everywhere.
+    std::array<std::uint8_t, 110> W{};
+    for (std::size_t i = 0;  i < 32;  ++i) W[i] = 0xFFU;   // hmask
+    for (std::size_t i = 32; i < 96;  ++i) W[i] = 0xFFU;   // qs
+    for (std::size_t i = 96; i < 104; ++i) W[i] = 0x11U;   // scales packed[0..7]
+    for (std::size_t i = 104; i < 108; ++i) W[i] = 0xAAU;  // scales packed[8..11]
+    writeHalfBits(W.data() + 108, kHalfOne);               // d = 1
+
+    std::array<float, 256> out{};
+    mimirmind::compute::quant::Q3K::instance().dequantToF32(
+        W.data(), out.size(), out.data());
+
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        EXPECT_NEAR(out[i], 3.0F, 0.0F);
+    }
+}
+
+// End-to-end via compute::matmul dispatch: verify the Q3_K path is
+// reachable through the registry, not just via the direct
+// Q3K::instance().dequantToF32 call.
+TEST(matmul_q3k_singleSuperBlock) {
+    constexpr std::size_t M = 1;
+    constexpr std::size_t N = 1;
+    constexpr std::size_t K = 256;
+
+    // Same block as dequant_q3k_singleSuperBlock_minValue: dequants
+    // to -4 for every element. Y = sum_k (X[k] * (-4)) with X = 1
+    // → Y = -4 * 256 = -1024.
+    std::array<std::uint8_t, 110> W{};
+    for (std::size_t i = 96;  i < 104; ++i) W[i] = 0x11U;
+    for (std::size_t i = 104; i < 108; ++i) W[i] = 0xAAU;
+    writeHalfBits(W.data() + 108, kHalfOne);
+
+    std::vector<float> X(K, 1.0F);
+    std::array<float, M * N> Y{};
+    std::vector<float>       scratch(K);
+
+    mimirmind::compute::matmul(mimirmind::core::gguf::GgmlType::Q3_K,
+                               W.data(), N, K,
+                               X.data(), M, Y.data(),
+                               scratch.data());
+
+    EXPECT_NEAR(Y[0], -4.0F * 256.0F, 0.0F);
 }
 
 TEST(matmul_zeroN_noop) {

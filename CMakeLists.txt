@@ -446,6 +446,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/matmul_q8_0_gemm.hip
         kernels_hip/matmul_q8_0_gemm_v2.hip
         kernels_hip/matmul_f32_vec.hip
+        kernels_hip/matmul_q3k_vec.hip
         kernels_hip/matmul_q4k_vec.hip
         kernels_hip/matmul_q5_0_vec.hip
         kernels_hip/matmul_q5k_vec.hip
@@ -580,6 +581,7 @@ add_executable(mimirmind
     src/compute/quant/Bfloat16.cpp
     src/compute/quant/Float16.cpp
     src/compute/quant/Float32.cpp
+    src/compute/quant/Q3K.cpp
     src/compute/quant/Q4K.cpp
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q5_0.cpp
@@ -702,6 +704,7 @@ add_executable(quant_tests
     src/compute/quant/Bfloat16.cpp
     src/compute/quant/Float16.cpp
     src/compute/quant/Float32.cpp
+    src/compute/quant/Q3K.cpp
     src/compute/quant/Q4K.cpp
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q5_0.cpp
@@ -827,6 +830,7 @@ add_executable(compute_tests
     src/compute/quant/Bfloat16.cpp
     src/compute/quant/Float16.cpp
     src/compute/quant/Float32.cpp
+    src/compute/quant/Q3K.cpp
     src/compute/quant/Q4K.cpp
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q5_0.cpp
@@ -876,6 +880,7 @@ add_executable(gpu_tests
     src/compute/quant/Bfloat16.cpp
     src/compute/quant/Float16.cpp
     src/compute/quant/Float32.cpp
+    src/compute/quant/Q3K.cpp
     src/compute/quant/Q4K.cpp
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q5_0.cpp
@@ -921,6 +926,7 @@ add_executable(prefill_bench
     src/compute/quant/Bfloat16.cpp
     src/compute/quant/Float16.cpp
     src/compute/quant/Float32.cpp
+    src/compute/quant/Q3K.cpp
     src/compute/quant/Q4K.cpp
     src/compute/quant/Q5K.cpp
     src/compute/quant/Q5_0.cpp
@@ -1521,6 +1527,24 @@ if(MIMIRMIND_ENABLE_HIP)
         mimirmind_core_hip
     )
 
+    # ---- hip_matmul_q3k_probe — Q3_K vec parity check -----------------
+    #
+    # Q3_K super-block (110 B / 256 elements) — 32 B hmask + 64 B qs +
+    # 12 B packed scales + fp16 d. Extra bit-parity signal here covers
+    # the kmask1/kmask2 scales-unpack trick in addition to the standard
+    # dequant + FMA path. Unblocks Gemma 4 26B-A4B on the HIP path for
+    # the 16 GB gfx1101 testbed where only Q3_K_* quants fit into VRAM.
+
+    add_executable(hip_matmul_q3k_probe
+        tools/hip-matmul-q3k-probe.cpp
+    )
+
+    add_dependencies(hip_matmul_q3k_probe hip_kernels)
+
+    target_link_libraries(hip_matmul_q3k_probe PRIVATE
+        mimirmind_core_hip
+    )
+
     # ---- hip_moe_down_fused_k_q6k_probe — Q6_K MoE-down parity --------
     #
     # Same shape as the Q8_0 sibling but on Q6_K super-blocks (210 B,
@@ -1678,6 +1702,7 @@ if(MIMIRMIND_ENABLE_HIP)
         hip_qkv_split_probe
         hip_matmul_q8_probe
         hip_matmul_q8_gemm_probe
+        hip_matmul_q3k_probe
         hip_moe_down_fused_k_q8_0_probe
         hip_moe_down_fused_k_q6k_probe
         hip_attention_probe
