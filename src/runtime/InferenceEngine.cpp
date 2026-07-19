@@ -260,6 +260,7 @@ InferenceEngine::InferenceEngine(const Config& cfg)
     // default ctor) so arch-backend deref of `_opProfiler.value()`
     // stays valid regardless of backend. Every `mark/finish/dump`
     // call is behind an `if (!_enabled) return` early-return anyway.
+#ifdef MIMIRMIND_HAVE_L0
     if (kind == core::backend::BackendKind::LevelZero) {
         _opProfiler.emplace(l0ComputeContext().queue(),
                             cfg.diagnostics.traceOpTimes);
@@ -268,6 +269,10 @@ InferenceEngine::InferenceEngine(const Config& cfg)
     } else {
         _opProfiler.emplace();  // disabled no-op profiler for non-L0
     }
+#else
+    (void)kind;
+    _opProfiler.emplace();  // HIP-only or CPU-only build: profiler disabled
+#endif
 
     if (cfg.diagnostics.traceBlock0) {
         _traceBlock0 = true;
@@ -307,7 +312,8 @@ InferenceEngine::~InferenceEngine() {
 // public `ctx()` / `allocator()` / `computeContext()` accessors route
 // through here; each throws with a clear diagnostic on non-L0 runs so
 // the failure surfaces at the call site rather than as UB from a bad
-// static_cast.
+// static_cast. Only compiled when L0 is compiled in.
+#ifdef MIMIRMIND_HAVE_L0
 core::l0::L0ComputeContext& InferenceEngine::l0ComputeContext() {
     if (_computeCtx == nullptr ||
         _computeCtx->kind() != core::backend::BackendKind::LevelZero) {
@@ -335,6 +341,7 @@ const core::l0::L0ComputeContext& InferenceEngine::l0ComputeContext() const {
     }
     return static_cast<const core::l0::L0ComputeContext&>(*_computeCtx);
 }
+#endif // MIMIRMIND_HAVE_L0
 
 const core::gguf::WeightsMap& InferenceEngine::weights() const {
     if (!_weights.has_value()) {
@@ -439,6 +446,7 @@ void InferenceEngine::finalizeLoad() {
     // "fusion off"). selfTest / autotune / autotune-KTile-Q8 stay skipped
     // — they exercise the L0 SPV kernels via UsmAllocator; the HIP-side
     // equivalents don't exist yet and aren't blockers for a load attempt.
+#ifdef MIMIRMIND_HAVE_L0
     if (_computeCtx->kind() == core::backend::BackendKind::LevelZero) {
         _fusedQkv = std::make_unique<model::FusedQkvWeights>(
             *_weights, allocator(), _config.blockCount,
@@ -475,6 +483,14 @@ void InferenceEngine::finalizeLoad() {
                     "GPU-op self-test, and matmul autotune (L0-only paths)",
                     core::backend::BackendRegistry::name(_computeCtx->kind()));
     }
+#else
+    // No L0 compiled in — same "skipped" info line for parity with the
+    // else branch above. FusedQkv, selfTest, autotune are all L0-native.
+    MM_LOG_INFO("engine",
+                "non-L0 backend ({}) — skipping FusedQkvWeights, "
+                "GPU-op self-test, and matmul autotune (L0-only paths)",
+                core::backend::BackendRegistry::name(_computeCtx->kind()));
+#endif
 
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
@@ -638,6 +654,7 @@ void InferenceEngine::setKvDtype(KvDtype dtype) {
     // log for every other case. Uses SWA head_dim when available (most
     // Gemma 4 layers) since that's the geometry the packed kernel spends
     // most of its time on. L0-only — driven by the L0 kernel-bench path.
+#ifdef MIMIRMIND_HAVE_L0
     if (_computeCtx->kind() == core::backend::BackendKind::LevelZero) {
         const std::size_t autotuneHeadDim = static_cast<std::size_t>(
             _config.keyLengthSwa > 0 ? _config.keyLengthSwa
@@ -648,6 +665,7 @@ void InferenceEngine::setKvDtype(KvDtype dtype) {
                              autotuneHeadDim,
                              _kvDtype);
     }
+#endif
 }
 
 void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
@@ -1132,6 +1150,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                         "Immediate-mode decode used instead.",
                         _config.expertCount);
         }
+#ifdef MIMIRMIND_HAVE_L0
         if (clrEnabled) {
             MM_LOG_INFO("engine",
                         "features.clr=true — decode uses record/replay "
@@ -1157,6 +1176,11 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         } else {
             _ops->setReplayMaxKTiles(0);
         }
+#else
+        // No L0 compiled in — CLR is L0-native. Always immediate mode.
+        (void)clrEnabled;
+        _ops->setReplayMaxKTiles(0);
+#endif
 
         // Inter-token thermal pacing — consult guard every kPaceWindow
         // tokens so /sys reads don't dominate the inner loop. Window of
@@ -1210,6 +1234,11 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             //   step == 1                 → immediate (warm)
             //   step == 2 && clrEnabled   → record + replay-once
             //   step >  2 && recording    → update curLen slot + replay
+            //
+            // CLR is L0-native (record/replay live on the L0 CommandQueue).
+            // HIP-only or CPU-only builds compile only the immediate path;
+            // `clrEnabled` is forced to false above under the same guard.
+#ifdef MIMIRMIND_HAVE_L0
             if (clrEnabled && l0Ops().queue().hasRecording()) {
                 // Replay-only path. Update the shared USM slot so every
                 // recorded rope / attention / qkv_split / rmsnorm_qkv
@@ -1238,7 +1267,9 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 }
                 l0Ops().queue().endRecord();
                 l0Ops().queue().replay();
-            } else {
+            } else
+#endif
+            {
                 for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
                     _backend->runBlock(b, xBuf, 1, cache, buffers, false);
                 }

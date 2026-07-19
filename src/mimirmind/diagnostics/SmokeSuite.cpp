@@ -7,24 +7,33 @@
 #include "mimirmind/diagnostics/Formatting.hpp"
 
 #include "compute/Embedding.hpp"
-#include "compute/l0/GpuMatmul.hpp"
 #include "compute/Matmul.hpp"
 #include "compute/Norm.hpp"
 #include "core/config/Config.hpp"
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "core/gguf/WeightsMap.hpp"
-#include "core/gpu/l0/L0Context.hpp"
-#include "core/gpu/l0/UsmAllocator.hpp"
-#include "core/gpu/l0/UsmHandle.hpp"
 #include "core/log/Log.hpp"
 #include "model/ChatTemplate.hpp"
 #include "model/LlmConfig.hpp"
 #include "model/Tokenizer.hpp"
+#include "runtime/InferenceEngine.hpp"
+
+// L0-native single-kernel parity harnesses (M1/M2/M5*) reach into
+// UsmAllocator, L0Context, GpuModule/Kernel, CommandQueue directly.
+// They can only be defined when L0 is compiled in; the neutral
+// harnesses (printM3Summary, runM4aEmbedAndM4bLmHead, runM7cChatTemplate,
+// runM4deGenerate) use only the backend-neutral surface on
+// `InferenceEngine` and stay always-compiled.
+#ifdef MIMIRMIND_HAVE_L0
+#include "compute/l0/GpuMatmul.hpp"
 #include "core/gpu/l0/CommandQueue.hpp"
 #include "core/gpu/l0/GpuKernel.hpp"
 #include "core/gpu/l0/GpuModule.hpp"
-#include "runtime/InferenceEngine.hpp"
+#include "core/gpu/l0/L0Context.hpp"
+#include "core/gpu/l0/UsmAllocator.hpp"
+#include "core/gpu/l0/UsmHandle.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -45,6 +54,15 @@
 #include <vector>
 
 namespace mimirmind::diagnostics {
+
+// ---- L0-native diagnostics (M1/M2/M5/M4a-b) ---------------------------------
+//
+// Every function in this block reaches into UsmAllocator or L0Context
+// directly and can only be compiled + linked when the L0 backend is on.
+// Callers guard their invocations with the same `#ifdef MIMIRMIND_HAVE_L0`
+// so the neutral M7c + M4de generate paths below stay reachable in HIP-
+// only or CPU-only builds.
+#ifdef MIMIRMIND_HAVE_L0
 
 // ---- M1+M2 device + USM probe summary ---------------------------------------
 
@@ -683,6 +701,14 @@ void runM4aEmbedAndM4bLmHead(mimirmind::runtime::InferenceEngine& engine) {
                 normMs, mmMs,
                 idx[0], static_cast<double>(logitsRow[idx[0]]));
 }
+
+#endif // MIMIRMIND_HAVE_L0
+
+// ---- Backend-neutral diagnostics (M7c + M4d/e) ------------------------------
+//
+// Below this line: functions that only touch the neutral
+// `engine.tokenizer()` / `engine.config()` / `engine.generate()` surface
+// and stay compiled regardless of backend.
 
 // ---- M7c chat-template smoke -----------------------------------------------
 

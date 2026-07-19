@@ -8,7 +8,9 @@
 
 #include "compute/l0/GpuOps.hpp"
 #include "core/config/Config.hpp"
+#ifdef MIMIRMIND_HAVE_L0
 #include "core/ipc/MuninClient.hpp"
+#endif
 #include "core/log/Log.hpp"
 #include "core/os/GovernorLock.hpp"
 #include "model/Tokenizer.hpp"
@@ -74,6 +76,16 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     //      failing at boot beats failing on the first request.
     const bool attachedMode = !args.attachSocket.empty();
 
+#ifndef MIMIRMIND_HAVE_L0
+    if (attachedMode) {
+        std::cerr << "serve: --attach requested but this build has no "
+                     "L0 backend compiled in — Munin's IPC surface uses "
+                     "L0 handles, so attached mode is L0-only. Rebuild "
+                     "with -DMIMIRMIND_ENABLE_L0=ON or drop --attach.\n";
+        return 2;
+    }
+#endif
+
     std::optional<::mimirmind::core::os::GovernorLock> governorLock;
     if (!attachedMode) {
         auto lk = ::mimirmind::core::os::GovernorLock::tryAcquire();
@@ -91,7 +103,12 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     }
 
     // Probed once before the per-model attach loop so a dead Munin does
-    // not manifest as N confusing per-model attach errors.
+    // not manifest as N confusing per-model attach errors. The whole
+    // Munin/attach chain is L0-only; a HIP-only build already errored
+    // out above if `--attach` was set, so this block is unreachable
+    // and its `MuninClient` references would fail to compile without
+    // the guard.
+#ifdef MIMIRMIND_HAVE_L0
     if (attachedMode) {
         MM_LOG_INFO("main",
                     "serve: attached mode — probing Munin at '{}'",
@@ -119,6 +136,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                         m.id, m.fingerprint, m.totalBytes);
         }
     }
+#endif
 
     // Load every loadOnStart:true model. Each gets its own InferenceEngine
     // (own L0 context, USM, autotune) — request dispatch picks the target
@@ -147,15 +165,19 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 
     std::vector<std::unique_ptr<::mimirmind::runtime::InferenceEngine>> ownedEngines;
     std::vector<::mimirmind::server::LoadedEngine> loadedEngines;
+#ifdef MIMIRMIND_HAVE_L0
     // In attached mode: one MuninClient per loaded model, kept alive
     // for the whole worker lifetime so Munin's implicit-detach logic
     // sees the peer-close only when the worker actually shuts down.
+    // L0-only — Munin's IPC surface uses `zeMemOpenIpcHandle`.
     std::vector<std::unique_ptr<::mimirmind::core::ipc::MuninClient>> attachedClients;
+#endif
 
     for (const auto& m : cfg.models) {
         if (!m.loadOnStart) continue;
         auto e = std::make_unique<::mimirmind::runtime::InferenceEngine>(cfg);
 
+#ifdef MIMIRMIND_HAVE_L0
         if (attachedMode) {
             MM_LOG_INFO("main",
                         "serve: attaching to Munin for model '{}' "
@@ -178,7 +200,9 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                 return 2;
             }
             attachedClients.push_back(std::move(client));
-        } else {
+        } else
+#endif
+        {
             MM_LOG_INFO("main", "serve: loading model '{}' (id='{}')",
                         m.path, m.id);
             e->loadModel(m.path);

@@ -546,7 +546,14 @@ endif()
 # All of these consume L0Context / GpuOps / GpuMatmul / CommandQueue directly
 # and cannot link without libze_loader. Gated on MIMIRMIND_ENABLE_L0.
 
-if(MIMIRMIND_ENABLE_L0)
+# mimirmind server binary — buildable under any of {L0, HIP, CPU-only}.
+# Consumer sources referenced below are backend-agnostic (talk to
+# `ComputeOps`/`ComputeMatmul`); backend-native compute TUs are gated
+# by `#ifdef MIMIRMIND_HAVE_L0` / `MIMIRMIND_HAVE_HIP` inside their
+# own sources when they exist as separate files, so listing them here
+# unconditionally would drag in a compile dep on the backend SDK. To
+# keep the exec buildable on a host without either SDK we gate the
+# per-backend source additions here.
 
 add_executable(mimirmind
     src/mimirmind/main.cpp
@@ -554,7 +561,6 @@ add_executable(mimirmind
     src/mimirmind/ParityMode.cpp
     src/mimirmind/ServeMode.cpp
     src/mimirmind/SmokeMode.cpp
-    src/mimirmind/diagnostics/Formatting.cpp
     src/mimirmind/diagnostics/SmokeSuite.cpp
     src/compute/Activations.cpp
     src/compute/Attention.cpp
@@ -562,8 +568,6 @@ add_executable(mimirmind
     src/compute/Embedding.cpp
     src/compute/cpu/GpuMatmul.cpp
     src/compute/cpu/GpuOps.cpp
-    src/compute/l0/GpuMatmul.cpp
-    src/compute/l0/GpuOps.cpp
     src/compute/Matmul.cpp
     src/compute/MoeRouting.cpp
     src/compute/Norm.cpp
@@ -588,10 +592,10 @@ add_executable(mimirmind
     src/runtime/BlockBuffers.cpp
     src/runtime/InferenceEngine.cpp
     src/runtime/KvCache.cpp
+    src/runtime/OpProfiler.cpp
     src/runtime/SpeculativeDecoder.cpp
     src/runtime/FanController.cpp
     src/runtime/GpuClockGovernor.cpp
-    src/runtime/OpProfiler.cpp
     src/runtime/PerfRegressionDetector.cpp
     src/runtime/PowerMonitor.cpp
     src/runtime/SystemMonitor.cpp
@@ -615,7 +619,27 @@ add_executable(mimirmind
     src/server/SystemStatusBuilder.cpp
 )
 
-add_dependencies(mimirmind spv_kernels)
+if(MIMIRMIND_ENABLE_L0)
+    target_sources(mimirmind PRIVATE
+        src/compute/l0/GpuMatmul.cpp
+        src/compute/l0/GpuOps.cpp
+        # L0-tied support code — Formatting prints Level-Zero device
+        # type strings. Only reachable from L0-guarded call sites, so
+        # add it only when L0 is on. OpProfiler + FusedQkvWeights are
+        # always compiled with `#ifdef`-split impls: L0 build gets the
+        # real bodies, non-L0 build gets trivial stubs.
+        src/mimirmind/diagnostics/Formatting.cpp
+    )
+    add_dependencies(mimirmind spv_kernels)
+endif()
+
+if(MIMIRMIND_ENABLE_HIP)
+    target_sources(mimirmind PRIVATE
+        src/compute/hip/GpuMatmul.cpp
+        src/compute/hip/GpuOps.cpp
+    )
+    add_dependencies(mimirmind hip_kernels)
+endif()
 
 # cpp-httplib is only used by the server, not by mimirmind_core. SYSTEM so
 # upstream code does not trip our strict warning flags.
@@ -623,33 +647,37 @@ target_include_directories(mimirmind SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib
 )
 
-target_link_libraries(mimirmind PRIVATE
-    mimirmind_core
-)
+# Always link the common lib; add backend-specific libs when they exist.
+target_link_libraries(mimirmind PRIVATE mimirmind_core_common)
+if(MIMIRMIND_ENABLE_L0)
+    target_link_libraries(mimirmind PRIVATE mimirmind_core_l0)
+endif()
+if(MIMIRMIND_ENABLE_HIP)
+    target_link_libraries(mimirmind PRIVATE mimirmind_core_hip)
+endif()
 
 # ---- munin — persistent model-memory daemon (M-Munin Schritt 7) -------------
 #
 # The Munin daemon holds N models in USM(host) and exports them over an
 # AF_UNIX socket to attached mimirmind workers via L0 IPC (SCM_RIGHTS +
-# zeMemOpenIpcHandle). Standalone binary; links against mimirmind_core
-# only. No SPV kernels, no httplib, no compute code — see the M-Munin
-# scope ADR (decisions/2026-07-13-m-munin-scope.md) for the tier-1
-# boundary.
+# zeMemOpenIpcHandle). L0-tied by design (per M-Munin ADR
+# `decisions/2026-07-13-m-munin-scope.md`) — HIP has no equivalent
+# IPC-handle export, so this stays under the L0 gate.
 #
 # Run via:
 #   docker compose run --rm munin --config /etc/mimirmind/config.json
 
-add_executable(munin
-    src/munin/main.cpp
-    src/munin/AttachSession.cpp
-    src/munin/Daemon.cpp
-    src/munin/ModelStore.cpp
-    src/munin/SocketServer.cpp
-)
+if(MIMIRMIND_ENABLE_L0)
+    add_executable(munin
+        src/munin/main.cpp
+        src/munin/AttachSession.cpp
+        src/munin/Daemon.cpp
+        src/munin/ModelStore.cpp
+        src/munin/SocketServer.cpp
+    )
 
-target_link_libraries(munin PRIVATE mimirmind_core)
-
-endif() # MIMIRMIND_ENABLE_L0 (mimirmind + munin executables)
+    target_link_libraries(munin PRIVATE mimirmind_core_l0)
+endif()
 
 # ---- Pure-CPU test binaries — always built ---------------------------------
 #

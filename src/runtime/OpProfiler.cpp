@@ -3,11 +3,21 @@
 
 #include "runtime/OpProfiler.hpp"
 
-#include "core/gpu/l0/CommandQueue.hpp"
 #include "core/log/Log.hpp"
 
 #include <cstdio>
 #include <string>
+
+// The L0 CommandQueue-tied timing pipeline is only reachable through
+// the `OpProfiler(CommandQueue&, bool)` ctor, which lives in a
+// TU-scope that only compiles when L0 is on. Without L0, the class
+// keeps its default-ctor no-op behaviour: `mark/finish/maybeDumpAndReset`
+// bail on `!_enabled`, and `_enabled` can only be set true by the L0
+// ctor. HIP-only and CPU-only builds get a valid `OpProfiler` symbol
+// via cheap stubs so arch backends can call the methods unconditionally.
+#ifdef MIMIRMIND_HAVE_L0
+#include "core/gpu/l0/CommandQueue.hpp"
+#endif
 
 namespace mimirmind::runtime {
 
@@ -18,6 +28,8 @@ constexpr const char* kCatNames[] = {
 };
 
 } // namespace
+
+#ifdef MIMIRMIND_HAVE_L0
 
 OpProfiler::OpProfiler(CommandQueue& queue, bool enabled)
     : _enabled{enabled},
@@ -105,5 +117,16 @@ void OpProfiler::maybeDumpAndReset(std::size_t tokenIdx) {
     _tokensSinceDump  = 0;
     _dispatchBaseline = dispNow;
 }
+
+#else // MIMIRMIND_HAVE_L0
+
+// Non-L0 build — every method a no-op. `_enabled` stays false so the
+// arch backend's `if (!_enabled) return` early-return at the top of
+// mark/finish/maybeDumpAndReset is the only path.
+void OpProfiler::mark(Cat /*c*/) {}
+void OpProfiler::finish() {}
+void OpProfiler::maybeDumpAndReset(std::size_t /*tokenIdx*/) {}
+
+#endif // MIMIRMIND_HAVE_L0
 
 } // namespace mimirmind::runtime

@@ -3,23 +3,32 @@
 
 #pragma once
 
-#include "compute/l0/GpuMatmul.hpp"
-#include "compute/l0/GpuOps.hpp"
+#include "compute/ComputeMatmul.hpp"
+#include "compute/ComputeOps.hpp"
 #include "compute/Sampling.hpp"
+#include "core/backend/ComputeContext.hpp"
 #include "core/gguf/GgufReader.hpp"
-#include "model/LlmConfig.hpp"
-#include "model/Tokenizer.hpp"
-#include "model/FusedQkvWeights.hpp"
 #include "core/gguf/WeightsMap.hpp"
 #include "core/ipc/TensorManifest.hpp"
+#include "model/FusedQkvWeights.hpp"
+#include "model/LlmConfig.hpp"
+#include "model/Tokenizer.hpp"
 #include "runtime/BlockBuffers.hpp"
-#include "core/backend/ComputeContext.hpp"
-#include "core/gpu/l0/CommandQueue.hpp"
 #include "runtime/KvCache.hpp"
+#include "runtime/OpProfiler.hpp"
+
+// L0-native includes are only pulled in when the L0 backend is
+// compiled in. Downstream L0-only accessors (`ctx()`, `allocator()`,
+// `computeContext()`) and the `l0Ops()` / `l0Gmm()` downcast helpers
+// live under the same guard — HIP-only builds cannot see them.
+#ifdef MIMIRMIND_HAVE_L0
+#include "compute/l0/GpuMatmul.hpp"
+#include "compute/l0/GpuOps.hpp"
+#include "core/gpu/l0/CommandQueue.hpp"
 #include "core/gpu/l0/L0Context.hpp"
 #include "core/gpu/l0/L0ComputeContext.hpp"
-#include "runtime/OpProfiler.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
+#endif
 
 namespace mimirmind::core::config {
 struct Config;
@@ -46,8 +55,10 @@ class ThermalGuard;
 
 namespace mimirmind::runtime {
 
+#ifdef MIMIRMIND_HAVE_L0
 using ::mimirmind::core::l0::L0Context;
 using ::mimirmind::core::l0::UsmAllocator;
+#endif
 using ::mimirmind::core::config::Config;
 
 namespace arch {
@@ -362,14 +373,17 @@ public:
     // --- Accessors (used by smoke path + diagnostics) -------------------
     //
     // Schicht 4 — these are L0-only downcasts. Consumers keep the
-    // familiar names but each accessor now throws if the runtime picked
-    // a non-L0 backend, because the returned types (`L0Context&`,
+    // familiar names but each accessor throws if the runtime picked a
+    // non-L0 backend, because the returned types (`L0Context&`,
     // `UsmAllocator&`, `L0ComputeContext&`) are L0-native and have no
     // meaning under HIP. Downstream diagnostics (SmokeSuite, SmokeMode,
     // SystemStatusBuilder) still call the L0-native accessors freely —
-    // they self-gate to L0-only runs today, and the throw here would
-    // surface a clean failure if that ever changes.
+    // they self-gate to L0-only runs today. The accessors are only
+    // compiled at all when the L0 backend is compiled in; HIP-only
+    // builds cannot reach them and neither can the callers that they
+    // themselves guard behind `#ifdef MIMIRMIND_HAVE_L0`.
 
+#ifdef MIMIRMIND_HAVE_L0
     [[nodiscard]] L0Context&               ctx()             { return l0ComputeContext().l0Context(); }
     [[nodiscard]] const L0Context&         ctx()       const { return l0ComputeContext().l0Context(); }
     [[nodiscard]] UsmAllocator&            allocator()       { return l0ComputeContext().allocator(); }
@@ -377,6 +391,8 @@ public:
     [[nodiscard]] ::mimirmind::core::l0::L0ComputeContext& computeContext() {
         return l0ComputeContext();
     }
+#endif
+
     /// Backend-neutral: which backend the runtime is bound to. Always
     /// safe to call regardless of L0 / HIP / anything future.
     [[nodiscard]] core::backend::BackendKind computeContextKind() const noexcept {
@@ -430,6 +446,11 @@ private:
     /// `_computeCtx->kind() == LevelZero` — Schicht 4 turned the ctor
     /// factory into a real switch, so `_ops`/`_gmm` are the concrete L0
     /// subclass only when the runtime picked L0.
+    ///
+    /// Only compiled in L0-enabled builds. HIP-only builds guard their
+    /// callers under the same `#ifdef MIMIRMIND_HAVE_L0` and never
+    /// reach these declarations.
+#ifdef MIMIRMIND_HAVE_L0
     [[nodiscard]] compute::l0::GpuOps& l0Ops() noexcept {
         return static_cast<compute::l0::GpuOps&>(*_ops);
     }
@@ -443,6 +464,7 @@ private:
     /// keep the pre-Schicht-4 names but inherit the throw contract.
     [[nodiscard]] ::mimirmind::core::l0::L0ComputeContext& l0ComputeContext();
     [[nodiscard]] const ::mimirmind::core::l0::L0ComputeContext& l0ComputeContext() const;
+#endif
 
     // Held by reference for the whole process lifetime. Provided by main().
     const Config&                              _cfg;

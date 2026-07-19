@@ -9,7 +9,16 @@
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/WeightsMap.hpp"
 #include "core/log/Log.hpp"
+
+// UsmAllocator is the only L0-tied dep. The class stores a
+// `UsmAllocator&` member (forward-declared in the header) and the
+// ctor/dtor call `allocate()` / `deallocate()` on it. Without L0 we
+// keep the class ABI but stub the ctor/dtor bodies — the InferenceEngine
+// side guards its `_fusedQkv` construction behind `#ifdef MIMIRMIND_HAVE_L0`
+// so a null unique_ptr is the only state that ever reaches the dtor.
+#ifdef MIMIRMIND_HAVE_L0
 #include "core/gpu/l0/UsmAllocator.hpp"
+#endif
 
 #include <cstring>
 #include <string_view>
@@ -35,6 +44,7 @@ std::size_t nCols(const GgufTensor& t) noexcept {
 
 } // namespace
 
+#ifdef MIMIRMIND_HAVE_L0
 FusedQkvWeights::FusedQkvWeights(const WeightsMap&      weights,
                                  core::l0::UsmAllocator& allocator,
                                  std::size_t            numBlocks,
@@ -310,6 +320,25 @@ FusedQkvWeights::~FusedQkvWeights() {
         }
     }
 }
+#else // MIMIRMIND_HAVE_L0
+
+// Non-L0 build — this class is never instantiated (InferenceEngine
+// guards the `_fusedQkv = make_unique<FusedQkvWeights>(...)` call
+// behind `#ifdef MIMIRMIND_HAVE_L0`). We still need the ctor + dtor
+// symbols so `unique_ptr<FusedQkvWeights>` in the runtime member
+// links. Both are declared no-op — invocation implies a bug.
+FusedQkvWeights::FusedQkvWeights(const WeightsMap&,
+                                 core::l0::UsmAllocator& allocator,
+                                 std::size_t,
+                                 bool,
+                                 std::size_t,
+                                 bool,
+                                 bool)
+    : _alloc{allocator} {}
+
+FusedQkvWeights::~FusedQkvWeights() {}
+
+#endif // MIMIRMIND_HAVE_L0
 
 const FusedQkvWeights::Block*
 FusedQkvWeights::find(std::size_t blockIdx) const noexcept {

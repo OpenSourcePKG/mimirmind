@@ -10,14 +10,18 @@
 #include "core/backend/BackendRegistry.hpp"
 #include "core/backend/ComputeContext.hpp"
 #include "core/config/Config.hpp"
-#include "core/gpu/l0/UsmAllocator.hpp"
 #include "core/log/Log.hpp"
 #include "runtime/InferenceEngine.hpp"
+
+#ifdef MIMIRMIND_HAVE_L0
+#include "core/gpu/l0/UsmAllocator.hpp"
+#endif
 
 #include <iostream>
 
 namespace mimirmind::cli {
 
+#ifdef MIMIRMIND_HAVE_L0
 using ::mimirmind::diagnostics::printM1M2;
 using ::mimirmind::diagnostics::printM3Summary;
 using ::mimirmind::diagnostics::runM2bAllocatorSmoke;
@@ -25,6 +29,7 @@ using ::mimirmind::diagnostics::runM5RmsNormParity;
 using ::mimirmind::diagnostics::runM5bQ4KParity;
 using ::mimirmind::diagnostics::runM5cQ6KParity;
 using ::mimirmind::diagnostics::runM4aEmbedAndM4bLmHead;
+#endif
 using ::mimirmind::diagnostics::runM7cChatTemplate;
 using ::mimirmind::diagnostics::runM4deGenerate;
 
@@ -41,6 +46,10 @@ int runSmoke(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     // the accessors throw, so we skip them and drive straight from
     // loadModel to runM4deGenerate (which is backend-agnostic — only
     // touches engine.tokenizer / engine.config / engine.generate).
+    // HIP-only builds skip the entire L0-native chain at compile-time
+    // — the accessors are guarded behind `#ifdef MIMIRMIND_HAVE_L0`
+    // and would fail to compile otherwise.
+#ifdef MIMIRMIND_HAVE_L0
     const bool isL0 = engine.computeContextKind() ==
                       core::backend::BackendKind::LevelZero;
 
@@ -57,6 +66,10 @@ int runSmoke(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         MM_LOG_INFO("main",
                     "non-L0 backend — skipping M1/M2b/M5 L0-native diagnostics");
     }
+#else
+    constexpr bool isL0 = false;
+    std::cout << "\n[M1-M2b/M5] skipped (no L0 compiled in)\n";
+#endif
 
     if (args.modelPath.empty()) {
         std::cout << "\n[M3] GGUF reader — skipped "
@@ -93,6 +106,7 @@ int runSmoke(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             }
         }
 
+#ifdef MIMIRMIND_HAVE_L0
         if (isL0) {
             printM3Summary(engine);
             runM5bQ4KParity(engine.ctx(), engine.allocator(), engine.weights());
@@ -102,10 +116,14 @@ int runSmoke(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         } else {
             std::cout << "\n[M3/M5b-c/M4a-b/M7c] skipped (L0-native)\n";
         }
+#else
+        std::cout << "\n[M3/M5b-c/M4a-b/M7c] skipped (no L0 compiled in)\n";
+#endif
 
         runM4deGenerate(engine, args);
     }
 
+#ifdef MIMIRMIND_HAVE_L0
     if (isL0) {
         const auto lim = engine.allocator().limits();
         const auto st  = engine.allocator().stats();
@@ -117,6 +135,7 @@ int runSmoke(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                     st.freeListHits,
                     st.totalAllocations);
     }
+#endif
     std::cout << "\nProject Well + Envoy smoke test passed.\n";
     return 0;
 }

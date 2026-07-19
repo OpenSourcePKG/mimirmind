@@ -50,8 +50,13 @@ public:
     OpProfiler() noexcept = default;
 
     /// `enabled` maps to `diagnostics.traceOpTimes` in config.json.
-    /// L0-only — needs a CommandQueue for the flush-and-time pipeline.
+    /// L0-only — needs a `CommandQueue` for the flush-and-time
+    /// pipeline. Non-L0 builds don't have `CommandQueue` in scope; the
+    /// default ctor above is the only reachable constructor there and
+    /// `mark`/`finish`/`maybeDumpAndReset` collapse to cheap no-ops.
+#ifdef MIMIRMIND_HAVE_L0
     OpProfiler(CommandQueue& queue, bool enabled);
+#endif
 
     [[nodiscard]] bool enabled() const noexcept { return _enabled; }
 
