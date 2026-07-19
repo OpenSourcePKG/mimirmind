@@ -60,7 +60,15 @@ std::size_t Q3K::blockBytes() const noexcept {
 }
 
 std::string_view Q3K::gpuMatmulModule() const noexcept {
-    return "matmul_q3k_vec";
+    // The abstract module name is only consumed by the L0 loader
+    // (src/compute/l0/GpuMatmul.cpp:139), which iterates all quant
+    // types at ctx-init and eager-loads their SPV. There is no
+    // Q3_K L0 kernel today — return the empty sentinel so L0 skips
+    // us and falls back to the CPU matmul path. The HIP native
+    // kernel (kernels_hip/matmul_q3k_vec.hip) is loaded by name
+    // directly in HipGpuMatmul::Impl's constructor, so this empty
+    // string does not disable it there.
+    return "";
 }
 
 std::string_view Q3K::gpuMatmulGemmModule() const noexcept {
