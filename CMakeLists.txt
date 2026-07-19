@@ -285,6 +285,7 @@ find_package(Threads REQUIRED)
 # link only this library.
 
 add_library(mimirmind_core_common STATIC
+    src/core/backend/BackendPool.cpp
     src/core/backend/BackendRegistry.cpp
     src/core/config/Config.cpp
     src/core/cpu/CpuContext.cpp
