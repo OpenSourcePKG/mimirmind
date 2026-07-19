@@ -6,6 +6,7 @@
 #include "server/RequestDispatcher.hpp"
 #include "server/RequestTracker.hpp"
 
+#include "core/backend/BackendPool.hpp"
 #include "core/backend/BackendRegistry.hpp"
 
 #include "runtime/FanController.hpp"
@@ -241,11 +242,39 @@ json SystemStatusBuilder::buildInfo() const {
         };
     }
 
+    // Backend pool — every compiled-in + available device the process
+    // could bind an engine to. Also reports which entry this engine
+    // actually bound to, so operators can tell "process saw the dGPU
+    // AND the iGPU, this engine picked the dGPU" at a glance.
+    // Discovery is cheap (a few microseconds); running it per
+    // /system/info call keeps the builder stateless.
+    json poolJson = json::array();
+    {
+        core::backend::BackendPool pool;
+        pool.discoverAll();
+        for (const auto& e : pool.entries()) {
+            poolJson.push_back({
+                {"kind",      core::backend::BackendRegistry::name(e.kind)},
+                {"device_ix", e.deviceIx},
+                {"token",     e.token},
+                {"name",      e.name},
+                {"detail",    e.detail},
+            });
+        }
+    }
+    const auto engineKind = _engine.computeContextKind();
+    json engineBackend = {
+        {"kind",  core::backend::BackendRegistry::name(engineKind)},
+        {"token", core::backend::tokenFor(engineKind, /*deviceIx=*/0)},
+    };
+
     return json{
         {"model",                  model},
         {"tokenizer",              tokenizer},
         {"kv_cache",               kvCache},
         {"hardware",               hardware},
+        {"backend_pool",           poolJson},
+        {"engine_backend",         engineBackend},
         {"gpu_clock_envelope",     gpuClockEnvelope},
         {"fan_envelope",           fanEnvelope},
         {"thermal_profile",        thermalProfile},
