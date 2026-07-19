@@ -6,12 +6,15 @@
 #include "server/RequestDispatcher.hpp"
 #include "server/RequestTracker.hpp"
 
-#include "runtime/FanController.hpp"
-#include "runtime/GpuClockGovernor.hpp"
+#include "core/backend/BackendPool.hpp"
+#include "core/backend/BackendRegistry.hpp"
+
+#include "runtime/thermal/FanController.hpp"
+#include "runtime/thermal/GpuClockGovernor.hpp"
 #include "runtime/InferenceEngine.hpp"
-#include "runtime/PerfRegressionDetector.hpp"
-#include "runtime/SpeculativeDecoder.hpp"
-#include "runtime/ThermalGuard.hpp"
+#include "runtime/perf/PerfRegressionDetector.hpp"
+#include "runtime/spec/SpeculativeDecoder.hpp"
+#include "runtime/thermal/ThermalGuard.hpp"
 
 #include <limits>
 #include <vector>
@@ -45,8 +48,6 @@ SystemStatusBuilder::SystemStatusBuilder(runtime::InferenceEngine& engine,
 json SystemStatusBuilder::buildInfo() const {
     const auto& modelCfg = _engine.config();
     const auto& tok      = _engine.tokenizer();
-    const auto& devInfo  = _engine.ctx().info();
-    const auto& usmLim   = _engine.allocator().limits();
 
     // Model architecture + dims
     json model = {
@@ -107,8 +108,16 @@ json SystemStatusBuilder::buildInfo() const {
         {"block_elements",     runtime::kvBlockElements(kvD)},
     };
 
-    // Level-Zero device descriptor
-    json hardware = {
+    // Hardware descriptor — populated from L0 device info + USM limits
+    // when the runtime picked L0. HIP-only / CPU-only builds report a
+    // minimal placeholder here; a HIP-aware version can plumb through
+    // `hipGetDeviceProperties` once the backend-neutral surface lands.
+    json hardware;
+#ifdef MIMIRMIND_HAVE_L0
+    if (_engine.computeContextKind() == core::backend::BackendKind::LevelZero) {
+        const auto& devInfo  = _engine.ctx().info();
+        const auto& usmLim   = _engine.allocator().limits();
+        hardware = {
         {"device_name",             devInfo.name},
         {"device_uuid",             devInfo.uuid},
         {"vendor_id",               devInfo.vendorId},
@@ -117,7 +126,20 @@ json SystemStatusBuilder::buildInfo() const {
         {"core_clock_rate_mhz",     devInfo.coreClockRate},
         {"total_local_mem_bytes",   devInfo.totalLocalMem},
         {"usm_per_alloc_max_bytes", usmLim.perAllocMaxBytes},
-    };
+        };
+    }
+#endif
+    if (hardware.is_null()) {
+        // Fallback for HIP-only, CPU-only, or L0-off runs — expose just
+        // the backend kind so operators can tell the endpoint is alive
+        // and see which backend is bound to this engine.
+        hardware = {
+            {"backend",   core::backend::BackendRegistry::name(
+                              _engine.computeContextKind())},
+            {"note",      "detailed device descriptors are only wired "
+                          "for the L0 backend today"},
+        };
+    }
 
     // GPU clock envelope — the static parts of /system/status.gpu_clock.
     json gpuClockEnvelope;
@@ -220,11 +242,39 @@ json SystemStatusBuilder::buildInfo() const {
         };
     }
 
+    // Backend pool — every compiled-in + available device the process
+    // could bind an engine to. Also reports which entry this engine
+    // actually bound to, so operators can tell "process saw the dGPU
+    // AND the iGPU, this engine picked the dGPU" at a glance.
+    // Discovery is cheap (a few microseconds); running it per
+    // /system/info call keeps the builder stateless.
+    json poolJson = json::array();
+    {
+        core::backend::BackendPool pool;
+        pool.discoverAll();
+        for (const auto& e : pool.entries()) {
+            poolJson.push_back({
+                {"kind",      core::backend::BackendRegistry::name(e.kind)},
+                {"device_ix", e.deviceIx},
+                {"token",     e.token},
+                {"name",      e.name},
+                {"detail",    e.detail},
+            });
+        }
+    }
+    const auto engineKind = _engine.computeContextKind();
+    json engineBackend = {
+        {"kind",  core::backend::BackendRegistry::name(engineKind)},
+        {"token", core::backend::tokenFor(engineKind, /*deviceIx=*/0)},
+    };
+
     return json{
         {"model",                  model},
         {"tokenizer",              tokenizer},
         {"kv_cache",               kvCache},
         {"hardware",               hardware},
+        {"backend_pool",           poolJson},
+        {"engine_backend",         engineBackend},
         {"gpu_clock_envelope",     gpuClockEnvelope},
         {"fan_envelope",           fanEnvelope},
         {"thermal_profile",        thermalProfile},

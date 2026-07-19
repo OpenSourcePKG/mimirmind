@@ -15,8 +15,8 @@
 #include <vector>
 
 namespace mimirmind::compute {
-class GpuMatmul;
-class GpuOps;
+class ComputeMatmul;
+class ComputeOps;
 } // namespace mimirmind::compute
 
 namespace mimirmind::runtime {
@@ -158,8 +158,8 @@ createArchBackend(const std::string&             architecture,
                   const model::LlmConfig&        config,
                   const core::gguf::WeightsMap&       weights,
                   const model::FusedQkvWeights*  fusedQkv,
-                  compute::GpuOps&               ops,
-                  compute::GpuMatmul&            gmm,
+                  compute::ComputeOps&               ops,
+                  compute::ComputeMatmul&            gmm,
                   OpProfiler&                    opProfiler,
                   bool                           moeGroupEnabled     = true,
                   bool                           moeFusedDownEnabled = false);

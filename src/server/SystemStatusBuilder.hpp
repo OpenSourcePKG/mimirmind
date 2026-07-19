@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "runtime/PowerMonitor.hpp"
+#include "runtime/thermal/PowerMonitor.hpp"
 
 #include <nlohmann/json.hpp>
 

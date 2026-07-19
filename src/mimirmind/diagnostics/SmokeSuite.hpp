@@ -30,6 +30,9 @@ namespace mimirmind::diagnostics {
  * refactor. Extracted here so main.cpp stays a thin dispatcher.
  */
 
+// L0-native decls — only usable when L0 is compiled in. Callers guard
+// their invocations under the same `#ifdef MIMIRMIND_HAVE_L0`.
+#ifdef MIMIRMIND_HAVE_L0
 void printM1M2(::mimirmind::runtime::InferenceEngine& engine);
 void printM3Summary(const ::mimirmind::runtime::InferenceEngine& engine);
 
@@ -47,7 +50,9 @@ void runM5cQ6KParity(::mimirmind::core::l0::L0Context&              ctx,
                      const ::mimirmind::core::gguf::WeightsMap&     weights);
 
 void runM4aEmbedAndM4bLmHead(::mimirmind::runtime::InferenceEngine& engine);
+#endif
 
+// Backend-neutral — always available.
 void runM7cChatTemplate(const ::mimirmind::runtime::InferenceEngine& engine);
 
 void runM4deGenerate(::mimirmind::runtime::InferenceEngine& engine,

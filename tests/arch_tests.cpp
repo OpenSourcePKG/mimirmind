@@ -16,12 +16,12 @@
 #include "compute/MoeRouting.hpp"
 #include "compute/Softmax.hpp"
 #include "model/ResponseCleaner.hpp"
-#include "runtime/GpuClockGovernor.hpp"
+#include "runtime/thermal/GpuClockGovernor.hpp"
 #include "runtime/Lcp.hpp"
-#include "runtime/PowerMonitor.hpp"
-#include "runtime/SystemMonitor.hpp"
-#include "runtime/ThermalGuard.hpp"
-#include "runtime/ThermalProfile.hpp"
+#include "runtime/thermal/PowerMonitor.hpp"
+#include "runtime/thermal/SystemMonitor.hpp"
+#include "runtime/thermal/ThermalGuard.hpp"
+#include "runtime/thermal/ThermalProfile.hpp"
 #include "runtime/arch/ArchBackend.hpp"
 
 #include <cstdio>

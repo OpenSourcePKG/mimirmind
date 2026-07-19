@@ -4,8 +4,8 @@
 #include "runtime/arch/Gemma4E4BBackend.hpp"
 
 #include "compute/Dequant.hpp"
-#include "compute/GpuMatmul.hpp"
-#include "compute/GpuOps.hpp"
+#include "compute/ComputeMatmul.hpp"
+#include "compute/ComputeOps.hpp"
 #include "core/gpu/l0/CommandQueue.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
@@ -17,7 +17,7 @@
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
 #include "core/log/Log.hpp"
-#include "runtime/OpProfiler.hpp"
+#include "runtime/perf/OpProfiler.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
 
 #include <algorithm>
@@ -67,8 +67,8 @@ std::uint16_t floatToHalf(float f) noexcept {
 Gemma4E4BBackend::Gemma4E4BBackend(const model::LlmConfig&        config,
                                    const core::gguf::WeightsMap&       weights,
                                    const model::FusedQkvWeights*  fusedQkv,
-                                   compute::GpuOps&               ops,
-                                   compute::GpuMatmul&            gmm,
+                                   compute::ComputeOps&               ops,
+                                   compute::ComputeMatmul&            gmm,
                                    runtime::OpProfiler&           opProfiler)
     : GemmaBaseBackend{config, weights, fusedQkv, ops, gmm, opProfiler} {
     // Per-layer-dim comes from the block-level inp_gate.weight — GGUF
@@ -110,7 +110,7 @@ Gemma4E4BBackend::Gemma4E4BBackend(const model::LlmConfig&        config,
                         "per_layer_model_proj Q8_0 requantize failed ({}) — "
                         "PLE-input projection disabled, output degraded",
                         e.what());
-            _projQ8 = UsmHandle{};
+            _projQ8 = {};
             _projQ8Bytes = 0;
         }
     } else {
@@ -173,7 +173,7 @@ void Gemma4E4BBackend::requantizeModelProjToQ8_0(const core::gguf::GgufTensor& s
     // output size = N * K/32 * 34 bytes.
     const std::size_t blocksPerRow = K / 32;
     _projQ8Bytes = N * blocksPerRow * 34;
-    _projQ8 = UsmHandle{_ops.allocator(), _projQ8Bytes};
+    _projQ8 = _ops.allocate(_projQ8Bytes);
     auto* dst = _projQ8.as<std::uint8_t>();
 
     // Bytes per source ROW. For BF16 that's K*2; for F32 K*4; for
@@ -258,8 +258,7 @@ void Gemma4E4BBackend::requantizeModelProjToQ8_0(const core::gguf::GgufTensor& s
     if (_ops.q8_0ReorderMode() != core::config::TriState::Disable) {
         try {
             _projQ8ReorderBytes = _projQ8Bytes;
-            _projQ8Reorder = UsmHandle{_ops.allocator(),
-                                       _projQ8ReorderBytes};
+            _projQ8Reorder = _ops.allocate(_projQ8ReorderBytes);
             std::memcpy(_projQ8Reorder.get(), _projQ8.get(),
                         _projQ8Bytes);
             std::vector<std::uint8_t> scratch(blocksPerRow * 34);
@@ -280,7 +279,7 @@ void Gemma4E4BBackend::requantizeModelProjToQ8_0(const core::gguf::GgufTensor& s
                         "per_layer_model_proj reorder copy failed ({}) "
                         "— decode falls back to native Q8_0 vec kernel",
                         e.what());
-            _projQ8Reorder = UsmHandle{};
+            _projQ8Reorder = {};
             _projQ8ReorderBytes = 0;
         }
     }
@@ -292,19 +291,19 @@ void Gemma4E4BBackend::ensurePleCapacity(std::size_t T) {
     if (_pleTablePtr != nullptr && T > _pleBufCapT) {
         const std::size_t bytes =
             _config.blockCount * T * _perLayerDim * sizeof(float);
-        _pleBuf = UsmHandle{_ops.allocator(), bytes};
+        _pleBuf = _ops.allocate(bytes);
         _pleBufCapT = T;
     }
     if (_projQ8Bytes > 0 && T > _pleProjBufCapT) {
         // Layout [T, num_layers, per_layer_dim] = [T, N] where N = 10752.
         const std::size_t bytes =
             T * _config.blockCount * _perLayerDim * sizeof(float);
-        _pleProjBuf = UsmHandle{_ops.allocator(), bytes};
+        _pleProjBuf = _ops.allocate(bytes);
         _pleProjBufCapT = T;
     }
     if (T > _pleGateBufCapT) {
         const std::size_t bytes = T * _perLayerDim * sizeof(float);
-        _pleGateBuf = UsmHandle{_ops.allocator(), bytes};
+        _pleGateBuf = _ops.allocate(bytes);
         _pleGateBufCapT = T;
     }
 }
@@ -385,7 +384,7 @@ void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds,
                                            projN, d_model,
                                            hiddenStates, projBuf);
         } else {
-            _gmm.matmul(core::gguf::GgmlType::Q8_0, _projQ8.get(),
+            _gmm.matmulAsync(core::gguf::GgmlType::Q8_0, _projQ8.get(),
                         projN, d_model,
                         hiddenStates, T,
                         projBuf, /*scratch=*/nullptr);
@@ -414,7 +413,7 @@ void Gemma4E4BBackend::prepareForward(std::span<const std::int32_t> tokIds,
 
     if (haveProj) {
         // Sync the queue so the GPU rmsnorm has landed before CPU reads.
-        _ops.queue().flush();
+        _ops.flush();
 
         const float invSqrt2 = 0.70710678118654752440F;
         const float* proj    = _pleProjBuf.as<float>();
@@ -521,7 +520,7 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     {
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
                          normBuf, T, gateOutBuf, matmulScratch);
         _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
@@ -532,7 +531,7 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
     _ops.geluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
-    _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
+    _gmm.matmulAsync(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
                 gateOutBuf, T,
                 projOutBuf, matmulScratch);
 
@@ -561,7 +560,7 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
             + blockIdx * (_pleActiveT * _perLayerDim);
 
         _op.mark(runtime::OpProfiler::Cat::MATMUL);
-        _gmm.matmul(inpGate->type, inpGate->usmPtr,
+        _gmm.matmulAsync(inpGate->type, inpGate->usmPtr,
                     _perLayerDim, d_model,
                     x, T,
                     pleGateBuf, matmulScratch);
@@ -574,7 +573,7 @@ void Gemma4E4BBackend::runBlock(std::size_t   blockIdx,
         _ops.geluMulAsync(pleGateBuf, pleSliceForLayer, T * _perLayerDim);
 
         _op.mark(runtime::OpProfiler::Cat::MATMUL);
-        _gmm.matmul(proj->type, proj->usmPtr,
+        _gmm.matmulAsync(proj->type, proj->usmPtr,
                     d_model, _perLayerDim,
                     pleGateBuf, T,
                     projOutBuf, matmulScratch);

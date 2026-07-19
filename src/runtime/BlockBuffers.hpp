@@ -3,19 +3,21 @@
 
 #pragma once
 
+#include "compute/ComputeBuffer.hpp"
 #include "model/LlmConfig.hpp"
-#include "core/gpu/l0/UsmAllocator.hpp"
-#include "core/gpu/l0/UsmHandle.hpp"
 
 #include <cstddef>
 
+namespace mimirmind::compute {
+class ComputeOps;
+}
+
 namespace mimirmind::runtime {
 
-using ::mimirmind::core::l0::UsmAllocator;
-using ::mimirmind::core::l0::UsmHandle;
+using ::mimirmind::compute::ComputeBuffer;
 
 /**
- * Per-call transformer-block scratch in USM. Shared by every architecture
+ * Per-call transformer-block scratch. Shared by every architecture
  * backend — the dense fields cover Qwen2 / Llama-family inference, the
  * trailing MoE fields are only allocated when the model is MoE
  * (currently Gemma 4 26B-A4B).
@@ -24,6 +26,13 @@ using ::mimirmind::core::l0::UsmHandle;
  * dispatch — Gemma 4's full-attention layers can need double the SWA
  * Q/K stride. Block buffers therefore use the backend-reported
  * `maxQKVDims()` instead of derived `headCount * headDim`.
+ *
+ * Schritt 3c.2 of the HW-abstraction consumer migration: each field is
+ * a `compute::ComputeBuffer` value member (backend-neutral RAII buffer),
+ * allocated via `compute::ComputeOps::allocate()`. Layout and lifetime
+ * stay identical to the previous `core::l0::UsmHandle` version —
+ * only the type changes, so downstream code sees the same
+ * `.get<T>()` / `.bytes()` accessors.
  */
 struct BlockBuffers {
     std::size_t maxT{0};
@@ -33,19 +42,19 @@ struct BlockBuffers {
     std::size_t kv_dim{0};
     std::size_t ff_dim{0};
 
-    UsmHandle qBuf;          // [maxT, q_dim]
-    UsmHandle normBuf;       // [maxT, d_model]
-    UsmHandle attnOut;       // [maxT, q_dim]
-    UsmHandle projOut;       // [maxT, d_model]
-    UsmHandle gateOut;       // [maxT, max(ff_dim, gate_up_per_expert)]
-    UsmHandle upOut;         // [maxT, ff_dim]
-    UsmHandle matmulScratch; // max(d_model, q_dim, ff_dim)
-    UsmHandle scoreScratch;  // [maxSeq]
+    ComputeBuffer qBuf;          // [maxT, q_dim]
+    ComputeBuffer normBuf;       // [maxT, d_model]
+    ComputeBuffer attnOut;       // [maxT, q_dim]
+    ComputeBuffer projOut;       // [maxT, d_model]
+    ComputeBuffer gateOut;       // [maxT, max(ff_dim, gate_up_per_expert)]
+    ComputeBuffer upOut;         // [maxT, ff_dim]
+    ComputeBuffer matmulScratch; // max(d_model, q_dim, ff_dim)
+    ComputeBuffer scoreScratch;  // [maxSeq]
 
     // Fused QKV: staging output for the concatenated matmul, split by a
     // downstream kernel into qBuf / kSlot / vSlot. Sized for the widest
     // layer (Q + K + V heads). Only allocated when fused QKV is enabled.
-    UsmHandle qkvFusedScratch; // [maxT, q_dim + 2*kv_dim]
+    ComputeBuffer qkvFusedScratch; // [maxT, q_dim + 2*kv_dim]
 
     // M10.2 Phase 1a Commit 5 — persistent fp32 K/V staging for the Q8_0
     // KV cache path. rmsnorm_qkv + RoPE stay fp32 in registers/USM; then
@@ -54,22 +63,22 @@ struct BlockBuffers {
     // the engine is configured with KvDtype::Q8_0; zero-sized otherwise.
     // Layout: [maxT, kv_dim] fp32 each. Layer-lokal reused across the
     // forward pass (sequential runBlock), so 2 buffers cover every layer.
-    UsmHandle kvKFp32Scratch;  // [maxT, kv_dim]
-    UsmHandle kvVFp32Scratch;  // [maxT, kv_dim]
+    ComputeBuffer kvKFp32Scratch;  // [maxT, kv_dim]
+    ComputeBuffer kvVFp32Scratch;  // [maxT, kv_dim]
 
     // Gemma 4 Path B (MoE) scratch. Zero-sized for non-MoE blocks.
-    UsmHandle moeAccumBuf;   // [maxT, d_model]   weighted sum of experts
-    UsmHandle expertOutBuf;  // [maxT, d_model]   per-expert down output
+    ComputeBuffer moeAccumBuf;   // [maxT, d_model]   weighted sum of experts
+    ComputeBuffer expertOutBuf;  // [maxT, d_model]   per-expert down output
 
     // Expert-grouping scratch (M5i.F). Compact buffers ordered by
     // expert: row i belongs to expert experts[i]. Sized for the
     // worst-case gather where every (token, top-k slot) fires:
     //   nRowsMax = maxT * expertUsedCount
     // Only allocated when the model has experts AND grouping is on.
-    UsmHandle moeXCompact;    // [nRowsMax, d_model]
-    UsmHandle moeGateCompact; // [nRowsMax, ffPerExpert]
-    UsmHandle moeUpCompact;   // [nRowsMax, ffPerExpert]
-    UsmHandle moeDownCompact; // [nRowsMax, d_model]
+    ComputeBuffer moeXCompact;    // [nRowsMax, d_model]
+    ComputeBuffer moeGateCompact; // [nRowsMax, ffPerExpert]
+    ComputeBuffer moeUpCompact;   // [nRowsMax, ffPerExpert]
+    ComputeBuffer moeDownCompact; // [nRowsMax, d_model]
 
     // M-MoE.Fused-Decode — per-layer routing scratches for the fused-K
     // down kernel. The command queue records dispatches lazily, so the
@@ -77,14 +86,14 @@ struct BlockBuffers {
     // next layer's write would corrupt the earlier layer's captured
     // pointer). Stride is `expertUsedCount` per layer; total size is
     // `blockCount * expertUsedCount`. Only allocated for MoE models.
-    UsmHandle moeExpIdxScratch;   // [blockCount, expertUsedCount] int32
-    UsmHandle moeKwScratch;       // [blockCount, expertUsedCount] fp32
+    ComputeBuffer moeExpIdxScratch;   // [blockCount, expertUsedCount] int32
+    ComputeBuffer moeKwScratch;       // [blockCount, expertUsedCount] fp32
 };
 
 /// Allocate a single BlockBuffers. `qDimMax`/`kvDimMax` come from the
 /// arch backend (`maxQKVDims()`); they must accommodate every layer's
 /// Q/KV stride. MoE scratch is only allocated when the model is MoE.
-BlockBuffers allocBlockBuffers(UsmAllocator&           allocator,
+BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
                                const model::LlmConfig& config,
                                std::size_t             maxT,
                                std::size_t             maxSeq,

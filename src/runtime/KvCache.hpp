@@ -3,17 +3,17 @@
 
 #pragma once
 
+#include "compute/ComputeBuffer.hpp"
+
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
 
-namespace mimirmind::core::l0 { class UsmAllocator; }
+namespace mimirmind::compute { class ComputeOps; }
 
 namespace mimirmind::runtime {
-
-using ::mimirmind::core::l0::UsmAllocator;
 
 /**
  * Element dtype for K/V storage. Baseline F32 today; FP16 lands in
@@ -113,14 +113,14 @@ public:
     /// K/V). Entries must satisfy `kvSourceLayer[L] <= L` (dependency
     /// ordering) and both source and aliased layer must have the same
     /// kvDim (the backend guarantees this via SWA-vs-full offset math).
-    KvCache(UsmAllocator&            alloc,
+    KvCache(compute::ComputeOps&     ops,
             std::size_t              maxSeq,
             std::vector<std::size_t> kvDimPerLayer,
             std::vector<std::size_t> kvSourceLayer = {},
             KvDtype                  dtype = KvDtype::F32);
 
     /// Uniform (Qwen/Llama) convenience: fills every layer with the same dim.
-    KvCache(UsmAllocator& alloc,
+    KvCache(compute::ComputeOps& ops,
             std::size_t   nLayers,
             std::size_t   maxSeq,
             std::size_t   nKvHeads,
@@ -218,20 +218,26 @@ public:
     [[nodiscard]] std::size_t kvDim(std::size_t l) const noexcept { return _kvDim[l]; }
 
 private:
-    void allocateLayers();
+    void allocateLayers(compute::ComputeOps& ops);
 
-    UsmAllocator&            _alloc;
     std::size_t              _maxSeq;
     std::vector<std::size_t> _kvDim;
     KvDtype                  _dtype{KvDtype::F32};
-    /// Bytes actually owned per layer for dealloc. Aliased layers hold
-    /// 0 here so the destructor skips them (their buffer belongs to the
-    /// source layer).
+    /// Bytes owned per layer — populated for own-KV entries, 0 for
+    /// aliased ones. Retained after Schicht 5.5 for the info-log's
+    /// "own vs alias / saved bytes" reporting.
     std::vector<std::size_t> _layerBytes;
     /// kvSourceLayer[L] == L for own-KV, < L for aliased (Gemma 4 E4B).
     /// Empty when the caller passes no override — treated as identity.
     std::vector<std::size_t> _kvSource;
     std::size_t              _length{0};
+    // Schicht 5.5 — RAII ownership of the per-layer device allocations.
+    // Own-KV layers hold their ComputeBuffer here; aliased entries are
+    // empty (default-constructed). `_kBuf` / `_vBuf` alias into the
+    // owning layer's raw pointer for both cases so downstream reads
+    // don't branch on ownership.
+    std::vector<compute::ComputeBuffer> _kOwners;
+    std::vector<compute::ComputeBuffer> _vOwners;
     std::vector<void*>       _kBuf;
     std::vector<void*>       _vBuf;
 };

@@ -6,20 +6,26 @@
 #include "mimirmind/CliArgs.hpp"
 #include "mimirmind/CliParser.hpp"
 
-#include "compute/GpuOps.hpp"
+#ifdef MIMIRMIND_HAVE_L0
+#include "compute/l0/GpuOps.hpp"
+#endif
+#include "core/backend/BackendPool.hpp"
+#include "core/backend/BackendRegistry.hpp"
 #include "core/config/Config.hpp"
+#ifdef MIMIRMIND_HAVE_L0
 #include "core/ipc/MuninClient.hpp"
+#endif
 #include "core/log/Log.hpp"
 #include "core/os/GovernorLock.hpp"
 #include "model/Tokenizer.hpp"
-#include "runtime/FanController.hpp"
-#include "runtime/GpuClockGovernor.hpp"
+#include "runtime/thermal/FanController.hpp"
+#include "runtime/thermal/GpuClockGovernor.hpp"
 #include "runtime/InferenceEngine.hpp"
-#include "runtime/PerfRegressionDetector.hpp"
-#include "runtime/PowerMonitor.hpp"
-#include "runtime/SystemMonitor.hpp"
-#include "runtime/ThermalGuard.hpp"
-#include "runtime/ThermalProfile.hpp"
+#include "runtime/perf/PerfRegressionDetector.hpp"
+#include "runtime/thermal/PowerMonitor.hpp"
+#include "runtime/thermal/SystemMonitor.hpp"
+#include "runtime/thermal/ThermalGuard.hpp"
+#include "runtime/thermal/ThermalProfile.hpp"
 #include "server/ApiServer.hpp"
 
 #include <atomic>
@@ -74,6 +80,16 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     //      failing at boot beats failing on the first request.
     const bool attachedMode = !args.attachSocket.empty();
 
+#ifndef MIMIRMIND_HAVE_L0
+    if (attachedMode) {
+        std::cerr << "serve: --attach requested but this build has no "
+                     "L0 backend compiled in — Munin's IPC surface uses "
+                     "L0 handles, so attached mode is L0-only. Rebuild "
+                     "with -DMIMIRMIND_ENABLE_L0=ON or drop --attach.\n";
+        return 2;
+    }
+#endif
+
     std::optional<::mimirmind::core::os::GovernorLock> governorLock;
     if (!attachedMode) {
         auto lk = ::mimirmind::core::os::GovernorLock::tryAcquire();
@@ -91,7 +107,12 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     }
 
     // Probed once before the per-model attach loop so a dead Munin does
-    // not manifest as N confusing per-model attach errors.
+    // not manifest as N confusing per-model attach errors. The whole
+    // Munin/attach chain is L0-only; a HIP-only build already errored
+    // out above if `--attach` was set, so this block is unreachable
+    // and its `MuninClient` references would fail to compile without
+    // the guard.
+#ifdef MIMIRMIND_HAVE_L0
     if (attachedMode) {
         MM_LOG_INFO("main",
                     "serve: attached mode — probing Munin at '{}'",
@@ -119,6 +140,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                         m.id, m.fingerprint, m.totalBytes);
         }
     }
+#endif
 
     // Load every loadOnStart:true model. Each gets its own InferenceEngine
     // (own L0 context, USM, autotune) — request dispatch picks the target
@@ -147,15 +169,43 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 
     std::vector<std::unique_ptr<::mimirmind::runtime::InferenceEngine>> ownedEngines;
     std::vector<::mimirmind::server::LoadedEngine> loadedEngines;
+#ifdef MIMIRMIND_HAVE_L0
     // In attached mode: one MuninClient per loaded model, kept alive
     // for the whole worker lifetime so Munin's implicit-detach logic
     // sees the peer-close only when the worker actually shuts down.
+    // L0-only — Munin's IPC surface uses `zeMemOpenIpcHandle`.
     std::vector<std::unique_ptr<::mimirmind::core::ipc::MuninClient>> attachedClients;
+#endif
+
+    // Enumerate every compiled-in + runtime-available backend/device
+    // once, up-front. Per-model config gets to pick its entry by token
+    // (`models[].backend`) — enables dual-GPU deployments (target on
+    // dGPU, draft on iGPU) without spawning two worker processes.
+    ::mimirmind::core::backend::BackendPool backendPool;
+    backendPool.discoverAll();
 
     for (const auto& m : cfg.models) {
         if (!m.loadOnStart) continue;
-        auto e = std::make_unique<::mimirmind::runtime::InferenceEngine>(cfg);
+        ::mimirmind::core::backend::BackendKind engineKind{};
+        try {
+            const std::string token = m.backend.empty() ? std::string{"auto"} : m.backend;
+            auto& entry = backendPool.selectByToken(token);
+            engineKind  = entry.kind;
+            MM_LOG_INFO("main",
+                        "serve: model '{}' bound to backend '{}' via token '{}'",
+                        m.id,
+                        ::mimirmind::core::backend::BackendRegistry::name(entry.kind),
+                        entry.token);
+        } catch (const std::exception& x) {
+            std::cerr << "serve: model '" << m.id
+                      << "' backend='" << m.backend << "' cannot be "
+                      << "resolved: " << x.what() << "\n";
+            return 2;
+        }
+        auto e = std::make_unique<::mimirmind::runtime::InferenceEngine>(
+            cfg, engineKind);
 
+#ifdef MIMIRMIND_HAVE_L0
         if (attachedMode) {
             MM_LOG_INFO("main",
                         "serve: attaching to Munin for model '{}' "
@@ -178,7 +228,9 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                 return 2;
             }
             attachedClients.push_back(std::move(client));
-        } else {
+        } else
+#endif
+        {
             MM_LOG_INFO("main", "serve: loading model '{}' (id='{}')",
                         m.path, m.id);
             e->loadModel(m.path);
@@ -209,25 +261,32 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         // not a stack trace during the first prod-facing request.
         {
             const auto effMaxCtx = e->maxContextTokens();
-            if (effMaxCtx > ::mimirmind::compute::GpuOps::kAttentionMaxTk
+            // The plain-attention SLM-cap check is L0-only — the HIP
+            // backend has no plain-attention path (flash is the only
+            // impl there).
+#ifdef MIMIRMIND_HAVE_L0
+            if (effMaxCtx > ::mimirmind::compute::l0::GpuOps::kAttentionMaxTk
                 && !cfg.features.flashPrefill) {
                 const std::string msg =
                     "serve: model '" + m.id + "' has effective "
                     "runtime.maxContextTokens=" + std::to_string(effMaxCtx) +
                     " > kAttentionMaxTk=" +
                     std::to_string(
-                        ::mimirmind::compute::GpuOps::kAttentionMaxTk) +
+                        ::mimirmind::compute::l0::GpuOps::kAttentionMaxTk) +
                     " while features.prefillFlash=false — the "
                     "plain-attention fallback cannot hold "
                     "scores[ATTN_MAX_TK] in SLM at that context "
                     "length. Set features.prefillFlash=true (default) "
                     "OR reduce runtime.maxContextTokens below " +
                     std::to_string(
-                        ::mimirmind::compute::GpuOps::kAttentionMaxTk) + ".";
+                        ::mimirmind::compute::l0::GpuOps::kAttentionMaxTk) + ".";
                 MM_LOG_ERROR("main", "{}", msg);
                 std::cerr << msg << "\n";
                 return 2;
             }
+#else
+            (void)effMaxCtx;
+#endif
             // Informational warn — long context + wide KV storage
             // pressures a 24 GiB DRAM host running Gemma 4 26B-A4B
             // weights (~22 GiB) alongside the KV cache. Rough per-token

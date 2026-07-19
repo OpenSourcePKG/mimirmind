@@ -23,15 +23,21 @@ void multiHeadAttention(const float* q,
                         std::size_t  positionOffset,
                         float*       scratch,
                         float*       out,
-                        std::size_t  slidingWindow) {
+                        std::size_t  slidingWindow,
+                        float        scale) {
     if (nKvHeads == 0 || nHeads == 0 || nHeads % nKvHeads != 0) {
         throw std::runtime_error(
             "attention: nHeads must be a positive multiple of nKvHeads");
     }
     const std::size_t qStride  = nHeads   * headDim;
     const std::size_t kvStride = nKvHeads * headDim;
-    const float       scale    = 1.0F /
-        std::sqrt(static_cast<float>(headDim));
+    // Sentinel: 0 (or negative) means "use default 1/sqrt(headDim)".
+    // Callers pass a positive override (e.g. Gemma 4's 1.0F) when Q
+    // was pre-scaled elsewhere in the block. Never zero legitimately
+    // in production paths.
+    const float effectiveScale = (scale > 0.0F)
+        ? scale
+        : (1.0F / std::sqrt(static_cast<float>(headDim)));
 
     for (std::size_t hq = 0; hq < nHeads; ++hq) {
         const std::size_t hkv = (hq * nKvHeads) / nHeads;
@@ -52,7 +58,7 @@ void multiHeadAttention(const float* q,
                     acc += static_cast<double>(qVec[d]) *
                            static_cast<double>(kVec[d]);
                 }
-                scratch[kk] = static_cast<float>(acc) * scale;
+                scratch[kk] = static_cast<float>(acc) * effectiveScale;
             }
             for (std::size_t kk = kMax; kk < T_k; ++kk) {
                 scratch[kk] = 0.0F;

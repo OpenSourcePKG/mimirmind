@@ -3,15 +3,15 @@
 
 #include "runtime/arch/Gemma4DenseBackend.hpp"
 
-#include "compute/GpuMatmul.hpp"
-#include "compute/GpuOps.hpp"
+#include "compute/ComputeMatmul.hpp"
+#include "compute/ComputeOps.hpp"
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "model/LlmConfig.hpp"
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
 #include "core/log/Log.hpp"
-#include "runtime/OpProfiler.hpp"
+#include "runtime/perf/OpProfiler.hpp"
 
 #include <cstddef>
 
@@ -20,8 +20,8 @@ namespace mimirmind::runtime::arch {
 Gemma4DenseBackend::Gemma4DenseBackend(const model::LlmConfig&        config,
                                        const core::gguf::WeightsMap&       weights,
                                        const model::FusedQkvWeights*  fusedQkv,
-                                       compute::GpuOps&               ops,
-                                       compute::GpuMatmul&            gmm,
+                                       compute::ComputeOps&               ops,
+                                       compute::ComputeMatmul&            gmm,
                                        runtime::OpProfiler&           opProfiler)
     : GemmaBaseBackend{config, weights, fusedQkv, ops, gmm, opProfiler} {
     MM_LOG_INFO("gemma4-dense",
@@ -81,7 +81,7 @@ void Gemma4DenseBackend::runBlock(std::size_t   blockIdx,
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     trace("FFN gate+up proj (unordered)");
     {
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
                          normBuf, T, gateOutBuf, matmulScratch);
         _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,

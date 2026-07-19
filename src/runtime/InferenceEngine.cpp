@@ -4,18 +4,28 @@
 #include "runtime/InferenceEngine.hpp"
 
 #include "compute/Embedding.hpp"
+#include "compute/cpu/GpuMatmul.hpp"
+#include "compute/cpu/GpuOps.hpp"
+#include "core/backend/BackendRegistry.hpp"
+#include "core/cpu/CpuContext.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "core/gguf/TensorFingerprint.hpp"
 #include "core/config/Config.hpp"
-#include "runtime/FanController.hpp"
+#include "runtime/thermal/FanController.hpp"
 #include "runtime/Lcp.hpp"
 #include "core/log/Log.hpp"
-#include "runtime/GpuClockGovernor.hpp"
-#include "runtime/PerfRegressionDetector.hpp"
-#include "runtime/PowerMonitor.hpp"
-#include "runtime/SystemMonitor.hpp"
-#include "runtime/ThermalGuard.hpp"
+#include "runtime/thermal/GpuClockGovernor.hpp"
+#include "runtime/perf/PerfRegressionDetector.hpp"
+#include "runtime/thermal/PowerMonitor.hpp"
+#include "runtime/thermal/SystemMonitor.hpp"
+#include "runtime/thermal/ThermalGuard.hpp"
 #include "runtime/arch/ArchBackend.hpp"
+
+#ifdef MIMIRMIND_HAVE_HIP
+#include "compute/hip/GpuMatmul.hpp"
+#include "compute/hip/GpuOps.hpp"
+#include "core/gpu/hip/HipComputeContext.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -99,23 +109,175 @@ void logTensorTaxonomy(const core::gguf::GgufReader& reader) {
     }
 }
 
+// Schicht 4 — factory helpers. `_computeCtx` is picked via
+// BackendRegistry::autoSelect (respects MIMIRMIND_BACKEND env var; falls
+// back to LevelZero, which keeps existing setups untouched). `_ops` and
+// `_gmm` factories switch on the resulting kind and forward to the
+// matching concrete ctor. Compile-time guards drop each branch when the
+// corresponding backend isn't built in — a config that asks for HIP on
+// an L0-only build throws with a clear diagnostic.
+
+std::unique_ptr<core::backend::ComputeContext>
+makeComputeContext(const Config& cfg, core::backend::BackendKind kind) {
+    switch (kind) {
+        case core::backend::BackendKind::LevelZero:
+#ifdef MIMIRMIND_HAVE_L0
+            return std::make_unique<core::l0::L0ComputeContext>(
+                core::l0::L0ComputeContext::Options{
+                    .spvDirOverride    = std::string{cfg.runtime.spvDir.value_or("")},
+                    .usmProbeTotalGiB  = cfg.runtime.usmProbeTotalGib,
+                    .usmKindOverride   = std::nullopt});
+#else
+            throw std::runtime_error{
+                "InferenceEngine: LevelZero requested but not compiled in "
+                "(MIMIRMIND_ENABLE_L0=OFF at build time)"};
+#endif
+
+        case core::backend::BackendKind::Hip:
+#ifdef MIMIRMIND_HAVE_HIP
+            (void)cfg;  // HIP path takes no config knobs yet.
+            return std::make_unique<core::hip::HipComputeContext>();
+#else
+            throw std::runtime_error{
+                "InferenceEngine: HIP requested but not compiled in "
+                "(MIMIRMIND_ENABLE_HIP=OFF at build time)"};
+#endif
+
+        case core::backend::BackendKind::Cpu:
+            // Cpu is always compiled in — no ifdef. Reference backend
+            // with no config knobs; used as the graceful-degradation
+            // path when no GPU driver is reachable, or explicitly via
+            // MIMIRMIND_BACKEND=Cpu for parity / diagnosis.
+            (void)cfg;
+            return std::make_unique<core::cpu::CpuContext>();
+
+        default:
+            throw std::runtime_error{
+                "InferenceEngine: no supported compute backend for kind "
+                + std::to_string(static_cast<int>(kind))};
+    }
+}
+
+std::unique_ptr<compute::ComputeOps>
+makeGpuOps(core::backend::ComputeContext&        ctx,
+           const core::config::FeatureSettings&  features) {
+    switch (ctx.kind()) {
+        case core::backend::BackendKind::LevelZero:
+#ifdef MIMIRMIND_HAVE_L0
+            return std::make_unique<compute::l0::GpuOps>(
+                static_cast<core::l0::L0ComputeContext&>(ctx),
+                features.flashPrefill,
+                features.flashPrefillGqaQ8,
+                features.flashPrefillKTileQ8,
+                features.q8_0Reorder);
+#else
+            break;
+#endif
+
+        case core::backend::BackendKind::Hip:
+#ifdef MIMIRMIND_HAVE_HIP
+            return std::make_unique<compute::hip::GpuOps>(
+                static_cast<core::hip::HipComputeContext&>(ctx),
+                features.flashPrefill,
+                features.flashPrefillGqaQ8,
+                features.flashPrefillKTileQ8,
+                features.q8_0Reorder);
+#else
+            break;
+#endif
+
+        case core::backend::BackendKind::Cpu:
+            // features.* aren't threaded through — CPU GpuOps returns
+            // neutral defaults for every feature-flag accessor (flash
+            // disabled, no reorder, self-test "cpu-noop").
+            (void)features;
+            return std::make_unique<compute::cpu::GpuOps>(
+                static_cast<core::cpu::CpuContext&>(ctx));
+
+        default:
+            break;
+    }
+    throw std::runtime_error{
+        "InferenceEngine::makeGpuOps: no compute::*::GpuOps impl for the "
+        "resolved backend kind"};
+}
+
+std::unique_ptr<compute::ComputeMatmul>
+makeGpuMatmul(core::backend::ComputeContext& ctx,
+              compute::ComputeOps&           ops) {
+    switch (ctx.kind()) {
+        case core::backend::BackendKind::LevelZero:
+#ifdef MIMIRMIND_HAVE_L0
+            return std::make_unique<compute::l0::GpuMatmul>(
+                static_cast<core::l0::L0ComputeContext&>(ctx),
+                static_cast<compute::l0::GpuOps&>(ops));
+#else
+            break;
+#endif
+
+        case core::backend::BackendKind::Hip:
+#ifdef MIMIRMIND_HAVE_HIP
+            return std::make_unique<compute::hip::GpuMatmul>(
+                static_cast<core::hip::HipComputeContext&>(ctx),
+                static_cast<compute::hip::GpuOps&>(ops));
+#else
+            break;
+#endif
+
+        case core::backend::BackendKind::Cpu:
+            // GpuMatmul on CPU doesn't need a GpuOps reference — no
+            // shared kernel state or DP4A workspace to coordinate.
+            (void)ops;
+            return std::make_unique<compute::cpu::GpuMatmul>(
+                static_cast<core::cpu::CpuContext&>(ctx));
+
+        default:
+            break;
+    }
+    throw std::runtime_error{
+        "InferenceEngine::makeGpuMatmul: no compute::*::GpuMatmul impl "
+        "for the resolved backend kind"};
+}
+
 } // namespace
 
 InferenceEngine::InferenceEngine(const Config& cfg)
+    : InferenceEngine{cfg, core::backend::BackendRegistry::autoSelect(
+                              core::backend::BackendKind::LevelZero)} {}
+
+InferenceEngine::InferenceEngine(const Config&                  cfg,
+                                 core::backend::BackendKind     kind)
     : _cfg{cfg},
-      _ctx{std::string{cfg.runtime.spvDir.value_or("")}},
-      _allocator{_ctx, cfg.runtime.usmProbeTotalGib,
-                 ::mimirmind::core::l0::selectUsmAllocKind(_ctx)},
-      _queue{_ctx},
-      _ops{_ctx, _allocator, _queue,
-           cfg.features.flashPrefill,
-           cfg.features.flashPrefillGqaQ8,
-           cfg.features.flashPrefillKTileQ8,
-           cfg.features.q8_0Reorder},
-      _gmm{_ctx, _ops, _allocator, _queue},
-      _opProfiler{_queue, cfg.diagnostics.traceOpTimes} {
-    MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");
-    _allocator.probeLimits();
+      _computeCtx{makeComputeContext(cfg, kind)},
+      _ops{makeGpuOps(*_computeCtx, cfg.features)},
+      _gmm{makeGpuMatmul(*_computeCtx, *_ops)},
+      _opProfiler{} {
+    // Re-read the kind from `_computeCtx` (the factory may have
+    // resolved a different backend when the requested one was compiled
+    // out — today it just throws, but the accessor is authoritative).
+    kind = _computeCtx->kind();
+    MM_LOG_INFO("engine",
+                "InferenceEngine: runtime bound to backend '{}'",
+                core::backend::BackendRegistry::name(kind));
+
+    // OpProfiler wiring — the L0 timing pipeline needs the L0
+    // CommandQueue; on HIP we emplace a no-op instance (Schicht 5.3
+    // default ctor) so arch-backend deref of `_opProfiler.value()`
+    // stays valid regardless of backend. Every `mark/finish/dump`
+    // call is behind an `if (!_enabled) return` early-return anyway.
+#ifdef MIMIRMIND_HAVE_L0
+    if (kind == core::backend::BackendKind::LevelZero) {
+        _opProfiler.emplace(l0ComputeContext().queue(),
+                            cfg.diagnostics.traceOpTimes);
+        MM_LOG_INFO("engine", "InferenceEngine: probing USM limits");
+        allocator().probeLimits();
+    } else {
+        _opProfiler.emplace();  // disabled no-op profiler for non-L0
+    }
+#else
+    (void)kind;
+    _opProfiler.emplace();  // HIP-only or CPU-only build: profiler disabled
+#endif
 
     if (cfg.diagnostics.traceBlock0) {
         _traceBlock0 = true;
@@ -151,6 +313,41 @@ InferenceEngine::~InferenceEngine() {
     }
 }
 
+// Schicht 4 — L0-only downcast of the polymorphic `_computeCtx`. The
+// public `ctx()` / `allocator()` / `computeContext()` accessors route
+// through here; each throws with a clear diagnostic on non-L0 runs so
+// the failure surfaces at the call site rather than as UB from a bad
+// static_cast. Only compiled when L0 is compiled in.
+#ifdef MIMIRMIND_HAVE_L0
+core::l0::L0ComputeContext& InferenceEngine::l0ComputeContext() {
+    if (_computeCtx == nullptr ||
+        _computeCtx->kind() != core::backend::BackendKind::LevelZero) {
+        throw std::runtime_error{
+            "InferenceEngine::l0ComputeContext: runtime is not bound to "
+            "LevelZero — L0-only accessor called on a "
+            + std::string{core::backend::BackendRegistry::name(
+                  _computeCtx ? _computeCtx->kind()
+                              : core::backend::BackendKind::Unknown)}
+            + " backend"};
+    }
+    return static_cast<core::l0::L0ComputeContext&>(*_computeCtx);
+}
+
+const core::l0::L0ComputeContext& InferenceEngine::l0ComputeContext() const {
+    if (_computeCtx == nullptr ||
+        _computeCtx->kind() != core::backend::BackendKind::LevelZero) {
+        throw std::runtime_error{
+            "InferenceEngine::l0ComputeContext: runtime is not bound to "
+            "LevelZero — L0-only accessor called on a "
+            + std::string{core::backend::BackendRegistry::name(
+                  _computeCtx ? _computeCtx->kind()
+                              : core::backend::BackendKind::Unknown)}
+            + " backend"};
+    }
+    return static_cast<const core::l0::L0ComputeContext&>(*_computeCtx);
+}
+#endif // MIMIRMIND_HAVE_L0
+
 const core::gguf::WeightsMap& InferenceEngine::weights() const {
     if (!_weights.has_value()) {
         throw std::runtime_error("InferenceEngine: no model loaded");
@@ -170,7 +367,7 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     _tokenizer.loadFromGguf(_reader);
 
     MM_LOG_INFO("engine", "loadModel: copying tensors into USM");
-    _reader.loadTensors(_allocator);
+    _reader.loadTensors(*_ops);
 
     _weights.emplace(_reader);
 
@@ -249,42 +446,68 @@ void InferenceEngine::finalizeLoad() {
     // at load time (quality neutral-to-better, ~70 MiB overhead on E4B).
     const bool requantToQ8_0 =
         (_config.architecture == "gemma4") && (_config.sharedKvLayers > 0);
-    _fusedQkv = std::make_unique<model::FusedQkvWeights>(
-        *_weights, _allocator, _config.blockCount,
-        _cfg.features.fusedQkv,
-        _config.sharedKvLayers, requantToQ8_0,
-        /*q8_0ReorderEnabled=*/
-        _cfg.features.q8_0Reorder != core::config::TriState::Disable);
+    // Schicht 5.4 — FusedQkvWeights + load-time diagnostics are L0-only.
+    // On HIP `_fusedQkv` stays nullptr (downstream code already handles
+    // "fusion off"). selfTest / autotune / autotune-KTile-Q8 stay skipped
+    // — they exercise the L0 SPV kernels via UsmAllocator; the HIP-side
+    // equivalents don't exist yet and aren't blockers for a load attempt.
+#ifdef MIMIRMIND_HAVE_L0
+    if (_computeCtx->kind() == core::backend::BackendKind::LevelZero) {
+        _fusedQkv = std::make_unique<model::FusedQkvWeights>(
+            *_weights, allocator(), _config.blockCount,
+            _cfg.features.fusedQkv,
+            _config.sharedKvLayers, requantToQ8_0,
+            /*q8_0ReorderEnabled=*/
+            _cfg.features.q8_0Reorder != core::config::TriState::Disable);
 
-    // M8.K.Q8_0-Reorder Phase 5b — register every fused-QKV block that
-    // grew a reorder-layout copy with GpuOps so the /v1/system/status
-    // .kernels.q8_0_reorder counter reflects the real number of
-    // tensors on the reorder path. One note per block keeps the
-    // tensor-count accurate (~24 fused blocks in E4B post-shared-KV
-    // filtering) instead of collapsing them into a single hit.
-    for (std::size_t b = 0; b < _fusedQkv->numBlocks(); ++b) {
-        const auto* blk = _fusedQkv->at(b);
-        if (blk == nullptr || blk->reorderUsmPtr == nullptr) continue;
-        _ops.noteQ8_0ReorderApplied(
-            blk->reorderBytes,
-            "fused_qkv[" + std::to_string(b) + "]");
+        // M8.K.Q8_0-Reorder Phase 5b — register every fused-QKV block that
+        // grew a reorder-layout copy with GpuOps so the /v1/system/status
+        // .kernels.q8_0_reorder counter reflects the real number of
+        // tensors on the reorder path. One note per block keeps the
+        // tensor-count accurate (~24 fused blocks in E4B post-shared-KV
+        // filtering) instead of collapsing them into a single hit.
+        for (std::size_t b = 0; b < _fusedQkv->numBlocks(); ++b) {
+            const auto* blk = _fusedQkv->at(b);
+            if (blk == nullptr || blk->reorderUsmPtr == nullptr) continue;
+            _ops->noteQ8_0ReorderApplied(
+                blk->reorderBytes,
+                "fused_qkv[" + std::to_string(b) + "]");
+        }
+
+        // M5i.D: Load-time self-tests of the GPU compute path. selfTest
+        // verifies every non-matmul GPU op against a CPU reference on a
+        // tiny fixed input — catches broken SPV loads and driver bugs on
+        // unfamiliar iGPU µarchs. autotune runs a matvec-vs-GEMM micro-
+        // bench (with its own parity gate) and pins the dispatch decision
+        // per QuantType. Honours `features.gemm` / `features.dp4a`.
+        l0Ops().selfTest(allocator());
+        l0Gmm().autotune(allocator(), _config.embeddingLength, _cfg.features);
+    } else {
+        MM_LOG_INFO("engine",
+                    "non-L0 backend ({}) — skipping FusedQkvWeights, "
+                    "GPU-op self-test, and matmul autotune (L0-only paths)",
+                    core::backend::BackendRegistry::name(_computeCtx->kind()));
     }
-
-    // M5i.D: Load-time self-tests of the GPU compute path. selfTest
-    // verifies every non-matmul GPU op against a CPU reference on a
-    // tiny fixed input — catches broken SPV loads and driver bugs on
-    // unfamiliar iGPU µarchs. autotune runs a matvec-vs-GEMM micro-
-    // bench (with its own parity gate) and pins the dispatch decision
-    // per QuantType. Honours `features.gemm` / `features.dp4a`.
-    _ops.selfTest(_allocator);
-    _gmm.autotune(_allocator, _config.embeddingLength, _cfg.features);
+#else
+    // No L0 compiled in — same "skipped" info line for parity with the
+    // else branch above. FusedQkv, selfTest, autotune are all L0-native.
+    MM_LOG_INFO("engine",
+                "non-L0 backend ({}) — skipping FusedQkvWeights, "
+                "GPU-op self-test, and matmul autotune (L0-only paths)",
+                core::backend::BackendRegistry::name(_computeCtx->kind()));
+#endif
 
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
     // gracefully with the original architecture string in the error.
+    // Schicht 5.1 — arch backends now consume ComputeOps / ComputeMatmul
+    // through the base. `_ops` / `_gmm` are unique_ptr<Base>, deref-passes
+    // the referenced instance. OpProfiler is still L0-only (guarded on
+    // ctor); if a HIP model-load path lands (Schicht 5.2+ around
+    // GgufReader), the profiler needs its own backend-neutral variant.
     _backend = arch::createArchBackend(
         _config.architecture, _config, *_weights, _fusedQkv.get(),
-        _ops, _gmm, _opProfiler, _cfg.features.moeGroup,
+        *_ops, *_gmm, _opProfiler.value(), _cfg.features.moeGroup,
         _cfg.features.moeFusedDown != core::config::TriState::Disable);
 
     _modelLoaded = true;
@@ -435,15 +658,19 @@ void InferenceEngine::setKvDtype(KvDtype dtype) {
     // storage. Guards inside `autotuneKTileQ8` early-out with an info
     // log for every other case. Uses SWA head_dim when available (most
     // Gemma 4 layers) since that's the geometry the packed kernel spends
-    // most of its time on.
-    const std::size_t autotuneHeadDim = static_cast<std::size_t>(
-        _config.keyLengthSwa > 0 ? _config.keyLengthSwa
-                                 : _config.keyLength);
-    _ops.autotuneKTileQ8(_allocator,
-                         static_cast<std::size_t>(_config.headCount),
-                         static_cast<std::size_t>(_config.headCountKv),
-                         autotuneHeadDim,
-                         _kvDtype);
+    // most of its time on. L0-only — driven by the L0 kernel-bench path.
+#ifdef MIMIRMIND_HAVE_L0
+    if (_computeCtx->kind() == core::backend::BackendKind::LevelZero) {
+        const std::size_t autotuneHeadDim = static_cast<std::size_t>(
+            _config.keyLengthSwa > 0 ? _config.keyLengthSwa
+                                     : _config.keyLength);
+        l0Ops().autotuneKTileQ8(allocator(),
+                             static_cast<std::size_t>(_config.headCount),
+                             static_cast<std::size_t>(_config.headCountKv),
+                             autotuneHeadDim,
+                             _kvDtype);
+    }
+#endif
 }
 
 void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
@@ -456,7 +683,7 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     // realloc-and-reset path and lose every cached token.
     if (_kvCache == nullptr) {
         _kvCache = std::make_unique<KvCache>(
-            _allocator, _maxContextTokens,
+            *_ops, _maxContextTokens,
             _backend->kvDimPerLayer(),
             _backend->kvSourceLayerPerLayer(),
             _kvDtype);
@@ -502,16 +729,16 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     // workspace: rmsnorm_qkv + RoPE run fp32-in-place there and then
     // `kv_quant_commit_q8_0` folds the rows into the Q8_0 cache slot.
     const bool withKvFp32Scratch = (_kvDtype == KvDtype::Q8_0);
-    _blockBuffers = allocBlockBuffers(_allocator, _config,
+    _blockBuffers = allocBlockBuffers(*_ops, _config,
                                       maxT, _maxContextTokens,
                                       qDimMax, kvDimMax,
                                       withFusedQkv,
                                       withKvFp32Scratch);
 
-    _xBufH      = UsmHandle{_allocator, maxT      * d_model  * sizeof(float)};
-    _normFinalH = UsmHandle{_allocator, d_model   * sizeof(float)};
-    _logitsH    = UsmHandle{_allocator, vocab_lm  * sizeof(float)};
-    _logitsScH  = UsmHandle{_allocator, d_model   * sizeof(float)};
+    _xBufH      = _ops->allocate(maxT      * d_model  * sizeof(float));
+    _normFinalH = _ops->allocate(d_model   * sizeof(float));
+    _logitsH    = _ops->allocate(vocab_lm  * sizeof(float));
+    _logitsScH  = _ops->allocate(d_model   * sizeof(float));
 
     _cacheMaxT     = maxT;
     _cacheVocabLm  = vocab_lm;
@@ -528,7 +755,7 @@ InferenceEngine::sampleNext(const float*                   hidden,
                             std::span<const std::int32_t>  recentTokens,
                             const compute::SamplingParams& sampling) {
     // Final-norm runs on the same queue as the residual-add that
-    // produced `hidden`. The subsequent _gmm.matmul flushes and syncs,
+    // produced `hidden`. The subsequent _gmm->matmul flushes and syncs,
     // so CPU argmax sees a fully-resolved logits buffer.
     //
     // Both Qwen and Gemma 4 use plain `w * rms_norm(x)` at runtime:
@@ -537,20 +764,33 @@ InferenceEngine::sampleNext(const float*                   hidden,
     // norm_shift = 0.0 because the HF reference uses standard weight
     // (init at 1.0) — so the GGUF weight is already the multiplicative
     // scale.
-    _ops.rmsNormAsync(
+    _ops->rmsNormAsync(
         hidden, 1, _config.embeddingLength,
         static_cast<const float*>(outNorm.usmPtr),
         _config.rmsNormEps,
         normScratch);
 
-    _gmm.matmul(
+    _gmm->matmul(
         lmHead.type, lmHead.usmPtr,
         vocab_lm, _config.embeddingLength,
         normScratch, 1,
         logits, matmulScratch);
 
+    // Bring logits over to a plain host buffer before the sampler's
+    // argmax / top-p scan touches them. On L0 iGPU / USM this is a
+    // cheap memcpy inside the same address space; on HIP discrete
+    // gfx1101 it is a single bulk `hipMemcpy(D→H)` that replaces the
+    // 152 k byte-by-byte PCIe reads the sampler used to do (~100 ms
+    // per token gone). See ComputeOps::readbackToHost doc-comment.
+    if (_logitsHostScratch.size() < vocab_lm) {
+        _logitsHostScratch.resize(vocab_lm);
+    }
+    _ops->readbackToHost(_logitsHostScratch.data(), logits,
+                         vocab_lm * sizeof(float));
+
     return _sampler.sample(
-        std::span<const float>{logits, vocab_lm}, recentTokens, sampling);
+        std::span<const float>{_logitsHostScratch.data(), vocab_lm},
+        recentTokens, sampling);
 }
 
 std::vector<std::int32_t>
@@ -690,7 +930,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         : 1.0F;
     auto scaleEmbeddingIfNeeded = [&](float* dst, std::size_t T) {
         if (embedScaleEnabled && T > 0) {
-            _ops.mulScalarAsync(dst, embedScale, T * d_model);
+            _ops->mulScalarAsync(dst, embedScale, T * d_model);
         }
     };
 
@@ -758,7 +998,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             // parity-diff reports a spurious factor-of-sqrt(n_embd)
             // divergence (RMSNorm inside block 0 cancels it so the
             // rest of the pipeline still runs on the scaled value).
-            _ops.queue().flush();
+            _ops->flush();
             const std::string fname =
                 dumpPrefix + "-blk0-inp_scaled.bin";
             std::ofstream f(fname, std::ios::binary);
@@ -892,13 +1132,20 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // sampler emits noise tokens. Confirmed on L0_TARGET_HOST with
         // Gemma 4 26B-A4B-it-Q6_K under both KvDtype::F32 and
         // KvDtype::Q8_0. The router matmul is also synchronous
-        // (`_gmm.matmul`, not `matmulAsync`) which flushes the recording
+        // (`_gmm->matmul`, not `matmulAsync`) which flushes the recording
         // list mid-record — a second, subtler CLR breach. Both problems
         // are structural to MoE and would need a GPU-side gather +
         // stable-record refactor to fix cleanly; until that lands, MoE
         // decode runs in immediate mode.
+        // Schicht 5.5 — CLR record/replay lives on the L0 CommandQueue.
+        // HIP has no equivalent (hipGraph would be the door, but not
+        // wired). Adding the kind-gate here disables every downstream
+        // `l0Ops().queue()` / `curLenSlot()` call in the decode path
+        // via the existing `if (clrEnabled)` blocks — one flag, all
+        // sites covered.
         const bool clrEnabled =
-            clrEnvOn && (_config.expertCount == 0);
+            clrEnvOn && (_config.expertCount == 0) &&
+            (_computeCtx->kind() == core::backend::BackendKind::LevelZero);
         if (clrEnvOn && _config.expertCount > 0) {
             MM_LOG_WARN("engine",
                         "features.clr=true requested but disabled "
@@ -908,11 +1155,12 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                         "Immediate-mode decode used instead.",
                         _config.expertCount);
         }
+#ifdef MIMIRMIND_HAVE_L0
         if (clrEnabled) {
             MM_LOG_INFO("engine",
                         "features.clr=true — decode uses record/replay "
                         "from step 2 on");
-            _ops.queue().resetRecording();
+            l0Ops().queue().resetRecording();
             // Right-size the FlashAttention partial launch geometry to
             // what THIS generate() call could possibly need. `kFlashMaxKTiles`
             // is a coarse upper bound (32768 / 64 = 512 post-M9.8b) that
@@ -922,17 +1170,22 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             const std::size_t maxCurLen =
                 promptIds.size() + params.maxNewTokens;
             const std::size_t replayKTiles = std::min(
-                (maxCurLen + compute::GpuOps::kFlashKTileSize - 1) /
-                    compute::GpuOps::kFlashKTileSize,
-                compute::GpuOps::kFlashMaxKTiles);
-            _ops.setReplayMaxKTiles(replayKTiles);
+                (maxCurLen + compute::l0::GpuOps::kFlashKTileSize - 1) /
+                    compute::l0::GpuOps::kFlashKTileSize,
+                compute::l0::GpuOps::kFlashMaxKTiles);
+            _ops->setReplayMaxKTiles(replayKTiles);
             MM_LOG_INFO("engine",
                         "features.clr right-sized flash launch "
                         "geometry to {} k-tiles (max curLen {})",
                         replayKTiles, maxCurLen);
         } else {
-            _ops.setReplayMaxKTiles(0);
+            _ops->setReplayMaxKTiles(0);
         }
+#else
+        // No L0 compiled in — CLR is L0-native. Always immediate mode.
+        (void)clrEnabled;
+        _ops->setReplayMaxKTiles(0);
+#endif
 
         // Inter-token thermal pacing — consult guard every kPaceWindow
         // tokens so /sys reads don't dominate the inner loop. Window of
@@ -986,13 +1239,18 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             //   step == 1                 → immediate (warm)
             //   step == 2 && clrEnabled   → record + replay-once
             //   step >  2 && recording    → update curLen slot + replay
-            if (clrEnabled && _ops.queue().hasRecording()) {
+            //
+            // CLR is L0-native (record/replay live on the L0 CommandQueue).
+            // HIP-only or CPU-only builds compile only the immediate path;
+            // `clrEnabled` is forced to false above under the same guard.
+#ifdef MIMIRMIND_HAVE_L0
+            if (clrEnabled && l0Ops().queue().hasRecording()) {
                 // Replay-only path. Update the shared USM slot so every
                 // recorded rope / attention / qkv_split / rmsnorm_qkv
                 // kernel sees the current KV-cache length.
-                *_ops.curLenSlot() =
+                *l0Ops().curLenSlot() =
                     static_cast<std::int32_t>(cache.length());
-                _ops.queue().replay();
+                l0Ops().queue().replay();
             } else if (clrEnabled && step == 1) {
                 // Step 1 records into the persistent list AND executes it
                 // via a first replay(). Subsequent steps reuse the
@@ -1007,14 +1265,16 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 // and would trip the "immediate work is pending" throw.
                 // Flush the immediate list explicitly so the invariant
                 // holds independently of the backend.
-                _ops.queue().flush();
-                _ops.queue().beginRecord();
+                _ops->flush();
+                l0Ops().queue().beginRecord();
                 for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
                     _backend->runBlock(b, xBuf, 1, cache, buffers, false);
                 }
-                _ops.queue().endRecord();
-                _ops.queue().replay();
-            } else {
+                l0Ops().queue().endRecord();
+                l0Ops().queue().replay();
+            } else
+#endif
+            {
                 for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
                     _backend->runBlock(b, xBuf, 1, cache, buffers, false);
                 }
@@ -1061,8 +1321,10 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 }
                 // M8.K.0 diagnostic: emits a per-category share summary
                 // every 50 tokens when diagnostics.traceOpTimes=true.
-                // No-op otherwise.
-                _opProfiler.maybeDumpAndReset(step);
+                // No-op otherwise. Only present on L0 today (see ctor).
+                if (_opProfiler) {
+                    _opProfiler->maybeDumpAndReset(step);
+                }
             }
 
             if (onToken && !onToken(nextId)) {
@@ -1214,7 +1476,7 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
                          d_model, vocab_emb,
                          newTokens, xBuf);
     if (embedScaleEnabled) {
-        _ops.mulScalarAsync(xBuf, embedScale, N * d_model);
+        _ops->mulScalarAsync(xBuf, embedScale, N * d_model);
     }
 
     _backend->prepareForward(newTokens, xBuf, N);
@@ -1232,10 +1494,10 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
     out.reserve(N);
     for (std::size_t i = 0; i < N; ++i) {
         const float* row = xBuf + i * d_model;
-        _ops.rmsNormAsync(row, 1, d_model,
+        _ops->rmsNormAsync(row, 1, d_model,
                           static_cast<const float*>(outNorm->usmPtr),
                           _config.rmsNormEps, normFinal);
-        _gmm.matmul(lmHead->type, lmHead->usmPtr,
+        _gmm->matmul(lmHead->type, lmHead->usmPtr,
                     vocab_lm, d_model, normFinal, 1,
                     logits, logitsSc);
         out.emplace_back(logits, logits + vocab_lm);

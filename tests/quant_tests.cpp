@@ -14,6 +14,7 @@
 #include "compute/quant/Float32.hpp"
 #include "compute/quant/Q4K.hpp"
 #include "compute/quant/Q5K.hpp"
+#include "compute/quant/Q5_0.hpp"
 #include "compute/quant/Q6K.hpp"
 #include "compute/quant/Q8_0.hpp"
 #include "core/gguf/GgufTypes.hpp"
@@ -100,6 +101,17 @@ TEST(blockLayout_Q6K) {
     EXPECT_EQ(qt.gpuMatmulModule(), std::string_view{"matmul_q6k_vec"});
 }
 
+TEST(blockLayout_Q5_0) {
+    const auto& qt = mimirmind::compute::quant::Q5_0::instance();
+    EXPECT_EQ(qt.ggmlType(),        mimirmind::core::gguf::GgmlType::Q5_0);
+    EXPECT_EQ(qt.blockElements(),   32U);
+    EXPECT_EQ(qt.blockBytes(),      22U);
+    EXPECT_EQ(qt.name(),            std::string_view{"Q5_0"});
+    // No native L0 / HIP matmul kernel exists for Q5_0 today — CPU
+    // fallback path only, so gpuMatmulModule() stays empty.
+    EXPECT_EQ(qt.gpuMatmulModule(), std::string_view{});
+}
+
 TEST(blockLayout_Q8_0) {
     const auto& qt = mimirmind::compute::quant::Q8_0::instance();
     EXPECT_EQ(qt.ggmlType(),        mimirmind::core::gguf::GgmlType::Q8_0);
@@ -120,6 +132,7 @@ TEST(registry_supportedTypes) {
     EXPECT_TRUE(quantType(GgmlType::BF16) != nullptr);
     EXPECT_TRUE(quantType(GgmlType::Q4_K) != nullptr);
     EXPECT_TRUE(quantType(GgmlType::Q5_K) != nullptr);
+    EXPECT_TRUE(quantType(GgmlType::Q5_0) != nullptr);
     EXPECT_TRUE(quantType(GgmlType::Q6_K) != nullptr);
     EXPECT_TRUE(quantType(GgmlType::Q8_0) != nullptr);
 }
@@ -135,7 +148,7 @@ TEST(registry_unsupportedTypes) {
 
 TEST(registry_allQuantTypes_size) {
     const auto all = mimirmind::compute::allQuantTypes();
-    EXPECT_EQ(all.size(), 7U);
+    EXPECT_EQ(all.size(), 8U);
     for (const auto* qt : all) {
         EXPECT_TRUE(qt != nullptr);
     }
@@ -225,6 +238,114 @@ TEST(bfloat16_array) {
 
     for (std::size_t i = 0; i < bf16s.size(); ++i) {
         EXPECT_NEAR(dst[i], expected[i], 0.0F);
+    }
+}
+
+// =======================================================================
+// Q5_0 — hand-crafted block
+// =======================================================================
+
+// Block layout (22 bytes): fp16 d + uint32_t qh + uint8_t qs[16].
+// qs[j] low nibble = elem j, high nibble = elem j+16.
+// qh bit j        = 5th bit of elem j.
+// qh bit (j+16)   = 5th bit of elem j+16.
+// value[i] = d * (((low4 | (highBit << 4)) - 16))
+TEST(q5_0_zeroBlockIsMinusSixteen) {
+    // d=1.0, qh=0, qs=0 → every 5-bit reconstruction is 0, then -16.
+    std::array<std::uint8_t, 22> block{};
+    writeHalfBits(block.data(), kHalfOne);   // d = 1.0
+
+    std::array<float, 32> dst{};
+    mimirmind::compute::quant::Q5_0::instance()
+        .dequantToF32(block.data(), 32, dst.data());
+
+    for (std::size_t i = 0; i < 32; ++i) {
+        EXPECT_NEAR(dst[i], -16.0F, 0.0F);
+    }
+}
+
+TEST(q5_0_allBitsSetIsFifteen) {
+    // d=1.0, qh=0xFFFFFFFF, qs=0xFF → 5-bit = 0x1F = 31, minus 16 = 15.
+    std::array<std::uint8_t, 22> block{};
+    writeHalfBits(block.data(), kHalfOne);  // d = 1.0
+    const std::uint32_t qh = 0xFFFFFFFFU;
+    std::memcpy(block.data() + 2, &qh, sizeof(qh));
+    std::memset(block.data() + 6, 0xFF, 16);  // qs all 0xFF
+
+    std::array<float, 32> dst{};
+    mimirmind::compute::quant::Q5_0::instance()
+        .dequantToF32(block.data(), 32, dst.data());
+
+    for (std::size_t i = 0; i < 32; ++i) {
+        EXPECT_NEAR(dst[i], 15.0F, 0.0F);
+    }
+}
+
+// Verifies the low-nibble → elem j mapping, high-nibble → elem j+16
+// mapping, and qh bit → 5th-bit-of-quant mapping in isolation. Uses a
+// mix of set/unset bits across both halves to catch any bit-plane
+// misrouting (e.g. reading qh bit j+16 as bit j, or vice versa).
+TEST(q5_0_selectiveBitPlanes) {
+    std::array<std::uint8_t, 22> block{};
+    writeHalfBits(block.data(), kHalfOne);  // d = 1.0
+
+    // qs[0] = 0x51 → elem 0 low4 = 0x1, elem 16 low4 = 0x5
+    block[6] = 0x51U;
+    // qh bit 0 = 1 (elem 0 high bit), bit 17 = 1 (elem 17 high bit);
+    // bit 16 stays 0 (elem 16 unaffected).
+    const std::uint32_t qh = (1U << 0) | (1U << 17);
+    std::memcpy(block.data() + 2, &qh, sizeof(qh));
+
+    std::array<float, 32> dst{};
+    mimirmind::compute::quant::Q5_0::instance()
+        .dequantToF32(block.data(), 32, dst.data());
+
+    // elem 0:  low4=0x1, hi=1 → 0x11 = 17, -16 =  1
+    EXPECT_NEAR(dst[0],    1.0F, 0.0F);
+    // elem 1:  low4=0x0, hi=0 → 0x00 =  0, -16 = -16
+    EXPECT_NEAR(dst[1],  -16.0F, 0.0F);
+    // elem 2: everything zero → -16
+    EXPECT_NEAR(dst[2],  -16.0F, 0.0F);
+    // elem 16: low4=0x5, hi=0 → 0x05 =  5, -16 = -11
+    EXPECT_NEAR(dst[16], -11.0F, 0.0F);
+    // elem 17: low4=0x0, hi=1 → 0x10 = 16, -16 =   0
+    EXPECT_NEAR(dst[17],   0.0F, 0.0F);
+}
+
+// Two-block test — verifies the 22-byte block stride is walked correctly.
+TEST(q5_0_twoBlocks) {
+    std::array<std::uint8_t, 44> blocks{};
+    // Block 0: d=0.5, qh=0, qs[0]=0x10 (elem 0 low4=0, elem 16 low4=1)
+    writeHalfBits(blocks.data(), kHalfHalf);
+    blocks[6] = 0x10U;
+    // Block 1: d=2.0, qh=0, qs[0]=0x0F (elem 0 low4=0xF, elem 16 low4=0)
+    writeHalfBits(blocks.data() + 22, kHalfTwo);
+    blocks[22 + 6] = 0x0FU;
+
+    std::array<float, 64> dst{};
+    mimirmind::compute::quant::Q5_0::instance()
+        .dequantToF32(blocks.data(), 64, dst.data());
+
+    // Block 0, elem 0:  low4=0, hi=0 → -16 * 0.5 = -8
+    EXPECT_NEAR(dst[0],  -8.0F,  0.0F);
+    // Block 0, elem 16: low4=1, hi=0 → -15 * 0.5 = -7.5
+    EXPECT_NEAR(dst[16], -7.5F,  0.0F);
+    // Block 1 starts at dst[32].
+    // Block 1, elem 0:  low4=0xF, hi=0 → -1 * 2.0  = -2.0
+    EXPECT_NEAR(dst[32], -2.0F,  0.0F);
+    // Block 1, elem 16: low4=0,   hi=0 → -16 * 2.0 = -32.0
+    EXPECT_NEAR(dst[48], -32.0F, 0.0F);
+}
+
+TEST(q5_0_misalignedNelementsThrows) {
+    std::array<std::uint8_t, 22> block{};
+    std::array<float, 17>        dst{};
+    try {
+        mimirmind::compute::quant::Q5_0::instance()
+            .dequantToF32(block.data(), 17, dst.data());
+        EXPECT_TRUE(false && "expected throw");
+    } catch (const std::runtime_error&) {
+        // expected
     }
 }
 

@@ -3,9 +3,14 @@
 
 #include "core/gguf/GgufReader.hpp"
 
+#include "compute/ComputeOps.hpp"
 #include "core/log/Log.hpp"
-#include "core/gpu/l0/UsmAllocator.hpp"
-#include "munin/ChunkAllocator.hpp"
+
+// The Munin-side load path (`loadTensorsIntoChunks`) is L0-tied per
+// design and now lives in `GgufReaderChunks.cpp` (compiled into
+// `mimirmind_core_l0`). Keeping the impl out of this TU lets the file
+// live in `mimirmind_core_common` and build cleanly under HIP-only or
+// CPU-only configurations without pulling in Level Zero.
 
 #include <cstring>
 #include <stdexcept>
@@ -262,7 +267,7 @@ void GgufReader::open(std::string_view path) {
                 _tensorDataOffset, bytesToMiB(_totalTensorBytes));
 }
 
-void GgufReader::loadTensors(core::l0::UsmAllocator& allocator) {
+void GgufReader::loadTensors(compute::ComputeOps& ops) {
     if (!_file.isOpen()) {
         throw std::runtime_error("GgufReader::loadTensors: not open");
     }
@@ -272,24 +277,22 @@ void GgufReader::loadTensors(core::l0::UsmAllocator& allocator) {
             "loadTensorsIntoChunks — mixing ownership regimes is not "
             "supported");
     }
-    if (_allocator != nullptr && _allocator != &allocator) {
+    if (!_tensorBuffers.empty()) {
         throw std::runtime_error(
-            "GgufReader::loadTensors: already loaded with a different allocator");
+            "GgufReader::loadTensors: reader already loaded once — "
+            "second call to loadTensors is not supported");
     }
-    _allocator = &allocator;
 
     MM_LOG_INFO("gguf",
-                "loading {} tensor(s) into USM ({:.2f} MiB total)",
+                "loading {} tensor(s) into device memory ({:.2f} MiB total)",
                 _tensors.size(), bytesToMiB(_totalTensorBytes));
+
+    _tensorBuffers.reserve(_tensors.size());
 
     std::size_t loadedBytes = 0;
     std::size_t loadedCount = 0;
 
     for (auto& t : _tensors) {
-        if (t.usmPtr != nullptr) {
-            continue;
-        }
-
         const std::size_t absOffset = _tensorDataOffset +
                                       static_cast<std::size_t>(t.fileOffset);
         if (absOffset + t.nbytes > _file.size()) {
@@ -301,8 +304,10 @@ void GgufReader::loadTensors(core::l0::UsmAllocator& allocator) {
                 "GgufReader::loadTensors: tensor data out of bounds for " + t.name);
         }
 
-        t.usmPtr = allocator.allocate(t.nbytes);
-        std::memcpy(t.usmPtr, _file.data() + absOffset, t.nbytes);
+        auto buf = ops.allocate(t.nbytes);
+        ops.uploadHostBytes(buf.get(), _file.data() + absOffset, t.nbytes);
+        t.usmPtr = buf.get();
+        _tensorBuffers.push_back(std::move(buf));
 
         loadedBytes += t.nbytes;
         ++loadedCount;
@@ -319,7 +324,7 @@ void GgufReader::loadTensors(core::l0::UsmAllocator& allocator) {
     }
 
     MM_LOG_INFO("gguf",
-                "load complete: {} tensor(s), {:.2f} MiB now in USM",
+                "load complete: {} tensor(s), {:.2f} MiB now on device",
                 loadedCount, bytesToMiB(loadedBytes));
 
     // The mmap'd file is no longer needed — every byte we care about is
@@ -336,94 +341,20 @@ void GgufReader::loadTensors(core::l0::UsmAllocator& allocator) {
     }
 }
 
-void GgufReader::loadTensorsIntoChunks(::mimirmind::munin::ChunkAllocator& chunks) {
-    if (!_file.isOpen()) {
-        throw std::runtime_error(
-            "GgufReader::loadTensorsIntoChunks: not open");
-    }
-    if (_allocator != nullptr) {
-        throw std::runtime_error(
-            "GgufReader::loadTensorsIntoChunks: reader already loaded via "
-            "loadTensors — mixing ownership regimes is not supported");
-    }
-    if (_chunkLoaded) {
-        return; // idempotent
-    }
-
-    MM_LOG_INFO("gguf",
-                "loading {} tensor(s) into chunk-USM ({:.2f} MiB total)",
-                _tensors.size(), bytesToMiB(_totalTensorBytes));
-
-    std::size_t loadedBytes = 0;
-    std::size_t loadedCount = 0;
-
-    for (auto& t : _tensors) {
-        if (t.usmPtr != nullptr) {
-            continue;
-        }
-
-        const std::size_t absOffset = _tensorDataOffset +
-                                      static_cast<std::size_t>(t.fileOffset);
-        if (absOffset + t.nbytes > _file.size()) {
-            MM_LOG_ERROR("gguf",
-                         "tensor '{}' walks off EOF: abs_offset={} bytes={} "
-                         "file_size={}",
-                         t.name, absOffset, t.nbytes, _file.size());
-            throw std::runtime_error(
-                "GgufReader::loadTensorsIntoChunks: tensor data out of bounds "
-                "for " + t.name);
-        }
-
-        const auto a  = chunks.allocate(t.nbytes);
-        t.usmPtr      = a.ptr;
-        t.chunkIndex  = a.chunkIndex;
-        t.chunkOffset = a.chunkOffset;
-        std::memcpy(t.usmPtr, _file.data() + absOffset, t.nbytes);
-
-        loadedBytes += t.nbytes;
-        ++loadedCount;
-
-        MM_LOG_TRACE("gguf",
-                     "chunk-loaded tensor[{}] '{}' {} bytes -> "
-                     "chunk={} offset={} ptr={}",
-                     loadedCount, t.name, t.nbytes,
-                     t.chunkIndex, t.chunkOffset, t.usmPtr);
-
-        if (loadedCount % 50 == 0) {
-            MM_LOG_DEBUG("gguf",
-                         "chunk-progress: {}/{} tensors, {:.2f} MiB loaded, "
-                         "chunks={}",
-                         loadedCount, _tensors.size(), bytesToMiB(loadedBytes),
-                         chunks.chunkCount());
-        }
-    }
-
-    _chunkLoaded = true;
-
-    MM_LOG_INFO("gguf",
-                "chunk-load complete: {} tensor(s), {:.2f} MiB packed into "
-                "{} chunk(s) ({:.2f} MiB / chunk max)",
-                loadedCount, bytesToMiB(loadedBytes),
-                chunks.chunkCount(), bytesToMiB(chunks.chunkBytes()));
-
-    if (_file.isOpen()) {
-        const std::size_t freed = _file.size();
-        _file.close();
-        MM_LOG_INFO("gguf",
-                    "dropped mmap of source GGUF, freed ~{:.2f} MiB of page cache",
-                    static_cast<double>(freed) / (1024.0 * 1024.0));
-    }
-}
+// `loadTensorsIntoChunks` moved to `GgufReaderChunks.cpp` in
+// `mimirmind_core_l0`. See the note at the top of this file.
 
 void GgufReader::close() noexcept {
-    if (_allocator != nullptr) {
+    // Schicht 5.2 — per-tensor device allocations are RAII-owned by
+    // `_tensorBuffers`. Clearing the vector drops every ComputeBuffer,
+    // whose deleter closure calls back into the backend allocator that
+    // originally handed it out. `t.usmPtr` aliases die with the buffers
+    // — null them so the reader stops pointing at freed memory.
+    if (!_tensorBuffers.empty()) {
         for (auto& t : _tensors) {
-            if (t.usmPtr != nullptr) {
-                _allocator->deallocate(t.usmPtr, t.nbytes);
-                t.usmPtr = nullptr;
-            }
+            t.usmPtr = nullptr;
         }
-        _allocator = nullptr;
+        _tensorBuffers.clear();
     }
     // Chunk-loaded tensors: the ChunkAllocator owns the memory. Just
     // null the raw pointers so the reader forgets its view — the actual

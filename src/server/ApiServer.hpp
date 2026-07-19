@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "runtime/SpeculativeDecoder.hpp"
+#include "runtime/spec/SpeculativeDecoder.hpp"
 
 #include <cstddef>
 #include <cstdint>

@@ -1,4 +1,4 @@
-// GPU-backed integration tests for compute::GpuOps and compute::GpuMatmul.
+// GPU-backed integration tests for compute::l0::GpuOps and compute::l0::GpuMatmul.
 //
 // We're NOT testing the iGPU hardware here — we're checking that our
 // SPV kernels produce the same numerical result as the CPU reference
@@ -18,8 +18,8 @@
 
 #include "compute/Activations.hpp"
 #include "compute/Attention.hpp"
-#include "compute/GpuMatmul.hpp"
-#include "compute/GpuOps.hpp"
+#include "compute/l0/GpuMatmul.hpp"
+#include "compute/l0/GpuOps.hpp"
 #include "compute/Matmul.hpp"
 #include "compute/Norm.hpp"
 #include "compute/QuantTypeRegistry.hpp"
@@ -29,6 +29,7 @@
 #include "core/gpu/l0/CommandQueue.hpp"
 #include "core/config/Config.hpp"
 #include "core/gpu/l0/L0Context.hpp"
+#include "core/gpu/l0/L0ComputeContext.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
 
 #include <algorithm>
@@ -49,11 +50,14 @@ namespace {
 // -----------------------------------------------------------------------
 
 struct GpuFixture {
-    mimirmind::core::l0::L0Context    ctx;
-    mimirmind::core::l0::UsmAllocator usm{ctx};
-    mimirmind::runtime::CommandQueue queue{ctx};
-    mimirmind::compute::GpuOps       ops{ctx, usm, queue};
-    mimirmind::compute::GpuMatmul    gmm{ctx, ops, usm, queue};
+    mimirmind::core::l0::L0ComputeContext ctx{};
+    mimirmind::compute::l0::GpuOps            ops{ctx};
+    mimirmind::compute::l0::GpuMatmul         gmm{ctx, ops};
+
+    // Backward-compat aliases so the ~1600 lines of test bodies below
+    // that read `fx().usm` / `fx().queue` don't need touching.
+    mimirmind::core::l0::UsmAllocator&    usm   { ctx.allocator() };
+    mimirmind::runtime::CommandQueue&     queue { ctx.queue() };
 
     GpuFixture() {
         // Force the GEMM dispatch decision so the M>1 parity tests

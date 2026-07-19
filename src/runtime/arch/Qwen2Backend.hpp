@@ -6,8 +6,8 @@
 #include "runtime/arch/ArchBackend.hpp"
 
 namespace mimirmind::compute {
-class GpuMatmul;
-class GpuOps;
+class ComputeMatmul;
+class ComputeOps;
 } // namespace mimirmind::compute
 
 namespace mimirmind::core::gguf {
@@ -33,8 +33,8 @@ public:
     Qwen2Backend(const model::LlmConfig&        config,
                  const core::gguf::WeightsMap&       weights,
                  const model::FusedQkvWeights*  fusedQkv,
-                 compute::GpuOps&               ops,
-                 compute::GpuMatmul&            gmm,
+                 compute::ComputeOps&               ops,
+                 compute::ComputeMatmul&            gmm,
                  runtime::OpProfiler&           opProfiler);
 
     void runBlock(std::size_t   blockIdx,
@@ -56,8 +56,8 @@ private:
     const model::LlmConfig&        _config;
     const core::gguf::WeightsMap&       _weights;
     const model::FusedQkvWeights*  _fusedQkv{nullptr};
-    compute::GpuOps&               _ops;
-    compute::GpuMatmul&            _gmm;
+    compute::ComputeOps&               _ops;
+    compute::ComputeMatmul&            _gmm;
     runtime::OpProfiler&           _op;  // held for parity with Gemma4; not instrumented yet
 };
 

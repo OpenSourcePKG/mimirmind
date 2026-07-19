@@ -11,8 +11,8 @@
 #include <string>
 
 namespace mimirmind::compute {
-class GpuMatmul;
-class GpuOps;
+class ComputeMatmul;
+class ComputeOps;
 } // namespace mimirmind::compute
 
 namespace mimirmind::core::gguf {
@@ -47,8 +47,8 @@ public:
     Gemma4Backend(const model::LlmConfig&        config,
                   const core::gguf::WeightsMap&       weights,
                   const model::FusedQkvWeights*  fusedQkv,
-                  compute::GpuOps&               ops,
-                  compute::GpuMatmul&            gmm,
+                  compute::ComputeOps&               ops,
+                  compute::ComputeMatmul&            gmm,
                   runtime::OpProfiler&           opProfiler,
                   bool                           moeGroupEnabled     = true,
                   bool                           moeFusedDownEnabled = false);

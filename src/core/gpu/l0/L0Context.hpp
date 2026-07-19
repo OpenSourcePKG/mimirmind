@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "core/gpu/GpuBackend.hpp"
+#include "core/backend/ComputeBackend.hpp"
 
 #include <level_zero/ze_api.h>
 
@@ -20,7 +20,7 @@ namespace mimirmind::core::l0 {
  * `gpu::BackendDeviceInfo` — carries L0-typed fields
  * (`ze_device_type_t`, sub-device counts, max-hardware-contexts) that
  * only the L0 backend cares about. Consumers that only need the
- * portable subset should use `GpuBackend::deviceInfo()`.
+ * portable subset should use `ComputeBackend::deviceInfo()`.
  */
 struct DeviceInfo {
     std::string  name;
@@ -52,15 +52,15 @@ private:
  * out of scope for M1 — Meteor Lake exposes a single iGPU and that is what
  * MimirMind targets first.
  *
- * Implements `core::gpu::GpuBackend` — the backend-neutral interface.
+ * Implements `core::gpu::ComputeBackend` — the backend-neutral interface.
  * Consumers that only need device-info + feature-flags should take
- * `GpuBackend&`; consumers that touch raw L0 handles (CommandQueue,
+ * `ComputeBackend&`; consumers that touch raw L0 handles (CommandQueue,
  * GpuModule, UsmAllocator, GpuOps, GpuMatmul) stay on `L0Context&`
  * because those classes ARE the L0 backend. See
  * [[MimirMind — HW-Abstraktions-Strategie für Multi-Backend-Support]]
  * for the Schicht-1..6 plan.
  */
-class L0Context : public ::mimirmind::core::gpu::GpuBackend {
+class L0Context : public ::mimirmind::core::backend::ComputeBackend {
 public:
     /// `spvDirOverride`, if non-empty, is where GpuModule looks for `.spv`
     /// files before falling back to the install / build-tree defaults. Comes
@@ -92,18 +92,18 @@ public:
         return _hasMutableCmdLists;
     }
 
-    // ---- GpuBackend interface (backend-agnostic consumers) -------------
+    // ---- ComputeBackend interface (backend-agnostic consumers) -------------
 
-    [[nodiscard]] ::mimirmind::core::gpu::BackendKind
+    [[nodiscard]] ::mimirmind::core::backend::BackendKind
         kind() const noexcept override {
-        return ::mimirmind::core::gpu::BackendKind::LevelZero;
+        return ::mimirmind::core::backend::BackendKind::LevelZero;
     }
 
-    [[nodiscard]] const ::mimirmind::core::gpu::BackendDeviceInfo&
+    [[nodiscard]] const ::mimirmind::core::backend::BackendDeviceInfo&
         deviceInfo() const noexcept override { return _neutralInfo; }
 
     [[nodiscard]] bool hasFeature(
-        ::mimirmind::core::gpu::BackendFeature f) const noexcept override;
+        ::mimirmind::core::backend::BackendFeature f) const noexcept override;
 
     [[nodiscard]] static std::string typeToString(ze_device_type_t t);
     [[nodiscard]] static std::string resultToString(ze_result_t r);
@@ -123,7 +123,7 @@ private:
     // Backend-neutral view populated at ctor time from _info. Kept as a
     // member (rather than derived on-demand) so `deviceInfo()` returning
     // a const reference is safe without lifetime shenanigans.
-    ::mimirmind::core::gpu::BackendDeviceInfo _neutralInfo{};
+    ::mimirmind::core::backend::BackendDeviceInfo _neutralInfo{};
 
     std::string _spvDirOverride{};
     bool        _hasMutableCmdLists{false};

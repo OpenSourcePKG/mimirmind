@@ -5,7 +5,8 @@
       "id": "primary",
       "title": "Gemma 4 E4B (default)",
       "path": "/models/gemma-4-e4b.gguf",
-      "loadOnStart": true
+      "loadOnStart": true,
+      "backend": "auto"
     }
   ],
 

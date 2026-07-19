@@ -3,8 +3,8 @@
 
 #include "runtime/arch/GemmaBaseBackend.hpp"
 
-#include "compute/GpuMatmul.hpp"
-#include "compute/GpuOps.hpp"
+#include "compute/ComputeMatmul.hpp"
+#include "compute/ComputeOps.hpp"
 #include "core/gpu/l0/CommandQueue.hpp"
 #include "model/FusedQkvWeights.hpp"
 #include "core/gguf/GgufReader.hpp"
@@ -14,7 +14,7 @@
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
 #include "core/log/Log.hpp"
-#include "runtime/OpProfiler.hpp"
+#include "runtime/perf/OpProfiler.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -28,8 +28,8 @@ namespace mimirmind::runtime::arch {
 GemmaBaseBackend::GemmaBaseBackend(const model::LlmConfig&        config,
                                    const core::gguf::WeightsMap&       weights,
                                    const model::FusedQkvWeights*  fusedQkv,
-                                   compute::GpuOps&               ops,
-                                   compute::GpuMatmul&            gmm,
+                                   compute::ComputeOps&               ops,
+                                   compute::ComputeMatmul&            gmm,
                                    runtime::OpProfiler&           opProfiler)
     : _config{config}, _weights{weights}, _fusedQkv{fusedQkv},
       _ops{ops}, _gmm{gmm}, _op{opProfiler} {
@@ -367,7 +367,7 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // cache slot.
         trace("Q+K+V projections (matmulAsync, unordered)");
         {
-            runtime::UnorderedScope u{_ops.queue()};
+            compute::UnorderedScope u{_ops};
             projectAsync(qW, q_dim, qBuf);
             projectAsync(kW, kv_dim,
                          q8Path ? kFp32Scratch
@@ -411,11 +411,11 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // just like the F32 / FP16 paths.
         trace("alt-attn V = raw K (device memcpy)");
         if (q8Path) {
-            _ops.queue().appendMemoryCopy(
+            _ops.appendMemoryCopy(
                 vFp32Scratch, kFp32Scratch,
                 T * kv_dim * sizeof(float));
         } else {
-            _ops.queue().appendMemoryCopy(
+            _ops.appendMemoryCopy(
                 vSlot, kSlot, T * cache.rowBytes(blockIdx));
         }
     }
@@ -466,7 +466,7 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // carries `curLen` for correct positional angles; the write
         // stride is 0 because the staging holds no history.
         trace("RoPE Q+K (unordered)");
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
             _ops.ropeInPlaceWithFactorsAsync(qBuf, _ropeFreqsForFullAttn, T,
                                              li.nHeads, head_dim, curLen,
@@ -560,7 +560,7 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     trace("O projection");
-    _gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,
+    _gmm.matmulAsync(oW->type, oW->usmPtr, d_model, q_dim,
                 attnOutBuf, T,
                 projOutBuf, matmulScratch);
 

@@ -3,8 +3,8 @@
 
 #include "runtime/arch/Qwen2Backend.hpp"
 
-#include "compute/GpuMatmul.hpp"
-#include "compute/GpuOps.hpp"
+#include "compute/ComputeMatmul.hpp"
+#include "compute/ComputeOps.hpp"
 #include "model/FusedQkvWeights.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "model/LlmConfig.hpp"
@@ -22,8 +22,8 @@ namespace mimirmind::runtime::arch {
 Qwen2Backend::Qwen2Backend(const model::LlmConfig&        config,
                            const core::gguf::WeightsMap&       weights,
                            const model::FusedQkvWeights*  fusedQkv,
-                           compute::GpuOps&               ops,
-                           compute::GpuMatmul&            gmm,
+                           compute::ComputeOps&               ops,
+                           compute::ComputeMatmul&            gmm,
                            runtime::OpProfiler&           opProfiler)
     : _config{config}, _weights{weights}, _fusedQkv{fusedQkv},
       _ops{ops}, _gmm{gmm}, _op{opProfiler} {
@@ -206,7 +206,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
         // cache slot.
         trace("Q+K+V projections (matmulAsync, unordered)");
         {
-            runtime::UnorderedScope u{_ops.queue()};
+            compute::UnorderedScope u{_ops};
             projectAsync(qW, q_dim,  qBuf);
             projectAsync(kW, kv_dim,
                          q8Path ? kFp32Scratch
@@ -229,7 +229,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     // for the same defence-in-depth reason as the projection above.
     trace("QKV bias add (async, unordered)");
     {
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         addBiasIf(qB, q_dim,  qBuf);
         addBiasIf(kB, kv_dim,
                   q8Path ? kFp32Scratch
@@ -252,7 +252,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     // offset stride is 0 because there's no history in front of row 0.
     trace("RoPE Q+K (async, unordered)");
     {
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         _ops.ropeInPlaceAsync(qBuf, T,
                               _config.headCount,   head_dim, curLen,
                               _config.ropeFreqBase);
@@ -294,10 +294,10 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                         /*slidingWindow=*/0,
                         kvDtype);
 
-    trace("O projection (matmul)");
-    _gmm.matmul(oW->type, oW->usmPtr, d_model, q_dim,
-                attnOutBuf, T,
-                projOutBuf, matmulScratch);
+    trace("O projection (matmulAsync — in-stream ordered, no sync needed)");
+    _gmm.matmulAsync(oW->type, oW->usmPtr, d_model, q_dim,
+                     attnOutBuf, T,
+                     projOutBuf, matmulScratch);
 
     trace("attn residual + ffn rmsNorm (fused)");
     _ops.addRmsNormAsync(x, projOutBuf, T, d_model,
@@ -310,7 +310,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     // the pop's barrier is what protects it.
     trace("FFN gate+up (matmulAsync, unordered)");
     {
-        runtime::UnorderedScope u{_ops.queue()};
+        compute::UnorderedScope u{_ops};
         _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
                          normBuf, T, gateOutBuf, matmulScratch);
         _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
@@ -320,10 +320,10 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     trace("FFN silu+mul (async, fused)");
     _ops.siluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
 
-    trace("FFN down (matmul)");
-    _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
-                gateOutBuf, T,
-                projOutBuf, matmulScratch);
+    trace("FFN down (matmulAsync — in-stream ordered, no sync needed)");
+    _gmm.matmulAsync(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
+                     gateOutBuf, T,
+                     projOutBuf, matmulScratch);
 
     trace("ffn residual (async, exit)");
     _ops.addResidualAsync(x, projOutBuf, T * d_model);

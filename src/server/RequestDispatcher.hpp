@@ -5,7 +5,7 @@
 
 #include "server/ApiServer.hpp"
 
-#include "runtime/SpeculativeDecoder.hpp"
+#include "runtime/spec/SpeculativeDecoder.hpp"
 
 #include <httplib.h>
 

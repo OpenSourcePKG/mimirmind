@@ -13,8 +13,8 @@
 #include "model/ResponseCleaner.hpp"
 #include "model/Tokenizer.hpp"
 #include "core/log/Log.hpp"
-#include "runtime/SpeculativeDecoder.hpp"
-#include "runtime/ThermalGuard.hpp"
+#include "runtime/spec/SpeculativeDecoder.hpp"
+#include "runtime/thermal/ThermalGuard.hpp"
 
 #include <nlohmann/json.hpp>
 

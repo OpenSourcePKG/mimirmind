@@ -16,8 +16,8 @@ namespace mimirmind::runtime::arch {
 Gemma4Backend::Gemma4Backend(const model::LlmConfig&        config,
                              const core::gguf::WeightsMap&       weights,
                              const model::FusedQkvWeights*  fusedQkv,
-                             compute::GpuOps&               ops,
-                             compute::GpuMatmul&            gmm,
+                             compute::ComputeOps&               ops,
+                             compute::ComputeMatmul&            gmm,
                              runtime::OpProfiler&           opProfiler,
                              bool                           moeGroupEnabled,
                              bool                           moeFusedDownEnabled) {

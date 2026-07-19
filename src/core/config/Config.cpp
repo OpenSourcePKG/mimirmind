@@ -183,7 +183,8 @@ ModelEntry parseModel(std::string_view      path,
     if (!j.is_object()) {
         fail(path, section + " must be an object");
     }
-    checkKnownKeys(path, section, j, {"id", "title", "path", "loadOnStart", "runtime"});
+    checkKnownKeys(path, section, j,
+                   {"id", "title", "path", "loadOnStart", "runtime", "backend"});
 
     ModelEntry m{};
     if (!j.contains("id") || !j["id"].is_string() || j["id"].get<std::string>().empty()) {
@@ -202,6 +203,29 @@ ModelEntry parseModel(std::string_view      path,
     }
     if (j.contains("runtime")) {
         m.runtime = parseRuntime(path, section + ".runtime", j["runtime"]);
+    }
+    if (const auto v = readOpt<std::string>(path, section, j, "backend"); v.has_value()) {
+        // Shape check only — the concrete pool lookup happens in
+        // ServeMode after `BackendPool::discoverAll()`. Accept
+        // "auto"/"cpu" as-is, and "l0"|"hip" with an optional ":<n>".
+        const std::string& tok = *v;
+        auto looksValid = [&]() -> bool {
+            if (tok.empty() || tok == "auto" || tok == "cpu") return true;
+            auto colon = tok.find(':');
+            const auto head = tok.substr(0, colon);
+            if (head != "l0" && head != "hip") return false;
+            if (colon == std::string::npos) return true;
+            const auto tail = tok.substr(colon + 1);
+            if (tail.empty()) return false;
+            for (char c : tail) if (c < '0' || c > '9') return false;
+            return true;
+        };
+        if (!looksValid()) {
+            fail(path, section +
+                       ".backend='" + tok +
+                       "' — expected auto | cpu | l0[:N] | hip[:N]");
+        }
+        m.backend = tok;
     }
     return m;
 }
