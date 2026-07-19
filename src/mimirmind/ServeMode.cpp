@@ -6,7 +6,11 @@
 #include "mimirmind/CliArgs.hpp"
 #include "mimirmind/CliParser.hpp"
 
+#ifdef MIMIRMIND_HAVE_L0
 #include "compute/l0/GpuOps.hpp"
+#endif
+#include "core/backend/BackendPool.hpp"
+#include "core/backend/BackendRegistry.hpp"
 #include "core/config/Config.hpp"
 #ifdef MIMIRMIND_HAVE_L0
 #include "core/ipc/MuninClient.hpp"
@@ -173,9 +177,33 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     std::vector<std::unique_ptr<::mimirmind::core::ipc::MuninClient>> attachedClients;
 #endif
 
+    // Enumerate every compiled-in + runtime-available backend/device
+    // once, up-front. Per-model config gets to pick its entry by token
+    // (`models[].backend`) — enables dual-GPU deployments (target on
+    // dGPU, draft on iGPU) without spawning two worker processes.
+    ::mimirmind::core::backend::BackendPool backendPool;
+    backendPool.discoverAll();
+
     for (const auto& m : cfg.models) {
         if (!m.loadOnStart) continue;
-        auto e = std::make_unique<::mimirmind::runtime::InferenceEngine>(cfg);
+        ::mimirmind::core::backend::BackendKind engineKind{};
+        try {
+            const std::string token = m.backend.empty() ? std::string{"auto"} : m.backend;
+            auto& entry = backendPool.selectByToken(token);
+            engineKind  = entry.kind;
+            MM_LOG_INFO("main",
+                        "serve: model '{}' bound to backend '{}' via token '{}'",
+                        m.id,
+                        ::mimirmind::core::backend::BackendRegistry::name(entry.kind),
+                        entry.token);
+        } catch (const std::exception& x) {
+            std::cerr << "serve: model '" << m.id
+                      << "' backend='" << m.backend << "' cannot be "
+                      << "resolved: " << x.what() << "\n";
+            return 2;
+        }
+        auto e = std::make_unique<::mimirmind::runtime::InferenceEngine>(
+            cfg, engineKind);
 
 #ifdef MIMIRMIND_HAVE_L0
         if (attachedMode) {
@@ -233,6 +261,10 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         // not a stack trace during the first prod-facing request.
         {
             const auto effMaxCtx = e->maxContextTokens();
+            // The plain-attention SLM-cap check is L0-only — the HIP
+            // backend has no plain-attention path (flash is the only
+            // impl there).
+#ifdef MIMIRMIND_HAVE_L0
             if (effMaxCtx > ::mimirmind::compute::l0::GpuOps::kAttentionMaxTk
                 && !cfg.features.flashPrefill) {
                 const std::string msg =
@@ -252,6 +284,9 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                 std::cerr << msg << "\n";
                 return 2;
             }
+#else
+            (void)effMaxCtx;
+#endif
             // Informational warn — long context + wide KV storage
             // pressures a 24 GiB DRAM host running Gemma 4 26B-A4B
             // weights (~22 GiB) alongside the KV cache. Rough per-token

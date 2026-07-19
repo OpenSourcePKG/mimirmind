@@ -46,6 +46,19 @@ struct ModelEntry {
     std::string       path{};
     bool              loadOnStart{true};
     RuntimeSettings   runtime{};         // per-model override, merged onto top-level
+
+    /// Backend token — pool selector. Recognised values:
+    ///   `""` / unset / `"auto"` — use `BackendPool::select(Auto)`
+    ///   `"l0"` / `"l0:0"` / ...   — pin to a LevelZero device
+    ///   `"hip"` / `"hip:0"` / ... — pin to a HIP device
+    ///   `"cpu"`                   — force the reference CPU backend
+    ///
+    /// The token must resolve against the pool that
+    /// `BackendPool::discoverAll()` produced at startup; unknown tokens
+    /// fail loud in `ServeMode`. Enables dual-GPU deployments — e.g.
+    /// target model on `"hip:0"` (dGPU) while a small draft sits on
+    /// `"l0:0"` (iGPU) in the same process.
+    std::string       backend{};
 };
 
 struct LogSettings {

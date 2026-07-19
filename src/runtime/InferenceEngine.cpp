@@ -242,15 +242,20 @@ makeGpuMatmul(core::backend::ComputeContext& ctx,
 } // namespace
 
 InferenceEngine::InferenceEngine(const Config& cfg)
+    : InferenceEngine{cfg, core::backend::BackendRegistry::autoSelect(
+                              core::backend::BackendKind::LevelZero)} {}
+
+InferenceEngine::InferenceEngine(const Config&                  cfg,
+                                 core::backend::BackendKind     kind)
     : _cfg{cfg},
-      _computeCtx{makeComputeContext(
-          cfg,
-          core::backend::BackendRegistry::autoSelect(
-              core::backend::BackendKind::LevelZero))},
+      _computeCtx{makeComputeContext(cfg, kind)},
       _ops{makeGpuOps(*_computeCtx, cfg.features)},
       _gmm{makeGpuMatmul(*_computeCtx, *_ops)},
       _opProfiler{} {
-    const auto kind = _computeCtx->kind();
+    // Re-read the kind from `_computeCtx` (the factory may have
+    // resolved a different backend when the requested one was compiled
+    // out — today it just throws, but the accessor is authoritative).
+    kind = _computeCtx->kind();
     MM_LOG_INFO("engine",
                 "InferenceEngine: runtime bound to backend '{}'",
                 core::backend::BackendRegistry::name(kind));

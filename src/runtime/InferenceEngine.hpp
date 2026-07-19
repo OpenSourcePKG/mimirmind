@@ -178,7 +178,15 @@ public:
     /// (traceBlock0, traceDecodeFile). Per-model runtime overrides are
     /// applied by the operator via `setKvDtype`/`setMaxContextTokens`
     /// after resolving `cfg.effectiveRuntime(modelId)`.
+    ///
+    /// Backend selection: the default ctor uses
+    /// `BackendRegistry::autoSelect()` (respects `MIMIRMIND_BACKEND`
+    /// env, else first available). The kind-parameterised overload lets
+    /// callers force a specific backend — used by ServeMode's per-model
+    /// `models[].backend` config so a dual-GPU host can put one engine
+    /// on L0 and another on HIP in the same process.
     explicit InferenceEngine(const Config& cfg);
+    InferenceEngine(const Config& cfg, core::backend::BackendKind kind);
     ~InferenceEngine();
 
     InferenceEngine(const InferenceEngine&)            = delete;
