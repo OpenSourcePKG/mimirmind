@@ -6,7 +6,6 @@
 #include "compute/Dequant.hpp"
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
-#include "core/gpu/l0/CommandQueue.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
 #include "compute/quant/Q8_0.hpp"
@@ -18,7 +17,6 @@
 #include "runtime/KvCache.hpp"
 #include "core/log/Log.hpp"
 #include "runtime/perf/OpProfiler.hpp"
-#include "core/gpu/l0/UsmAllocator.hpp"
 
 #include <algorithm>
 #include <cmath>
