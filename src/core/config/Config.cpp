@@ -115,6 +115,23 @@ std::optional<float> readOpt<float>(std::string_view      path,
 }
 
 template <>
+std::optional<double> readOpt<double>(std::string_view      path,
+                                      std::string_view      section,
+                                      const nlohmann::json& j,
+                                      const char*           key) {
+    // Peer to the float specialisation above. Used by
+    // serving.preemptFreeBlockThreshold which mirrors
+    // PreemptionPolicy's double signature.
+    if (!j.contains(key) || j[key].is_null()) return std::nullopt;
+    if (!j[key].is_number()) {
+        std::ostringstream os;
+        os << section << "." << key << " must be a number";
+        fail(path, os.str());
+    }
+    return j[key].get<double>();
+}
+
+template <>
 std::optional<std::string> readOpt<std::string>(std::string_view      path,
                                                 std::string_view      section,
                                                 const nlohmann::json& j,
@@ -425,7 +442,9 @@ DiagnosticsSettings parseDiagnostics(std::string_view      path,
 ServingSettings parseServing(std::string_view      path,
                              const nlohmann::json& j) {
     checkKnownKeys(path, "serving", j,
-                   {"enableBatching", "minBatchForEnable"});
+                   {"enableBatching", "minBatchForEnable",
+                    "tokenBudget", "maxActiveRequests",
+                    "preemptFreeBlockThreshold", "blockSize"});
     ServingSettings s{};
     s.enableBatching = parseTriState(path, "serving", j, "enableBatching",
                                      TriState::Auto);
@@ -436,6 +455,41 @@ ServingSettings parseServing(std::string_view      path,
                        "(got " + std::to_string(*v) + ")");
         }
         s.minBatchForEnable = *v;
+    }
+    if (const auto v = readOpt<std::size_t>(path, "serving", j,
+                                            "tokenBudget"); v) {
+        if (*v < 1 || *v > 8192) {
+            fail(path, "serving.tokenBudget must be in 1..8192 "
+                       "(got " + std::to_string(*v) + ")");
+        }
+        s.tokenBudget = *v;
+    }
+    if (const auto v = readOpt<std::size_t>(path, "serving", j,
+                                            "maxActiveRequests"); v) {
+        if (*v < 1 || *v > 256) {
+            fail(path, "serving.maxActiveRequests must be in 1..256 "
+                       "(got " + std::to_string(*v) + ")");
+        }
+        s.maxActiveRequests = *v;
+    }
+    if (const auto v = readOpt<double>(path, "serving", j,
+                                       "preemptFreeBlockThreshold"); v) {
+        // Same [0.0, 1.0] contract as PreemptionPolicy's ctor. NaN
+        // caught by the negated in-range check.
+        if (!(*v >= 0.0 && *v <= 1.0)) {
+            fail(path, "serving.preemptFreeBlockThreshold must be in "
+                       "[0.0, 1.0] (got " + std::to_string(*v) + ")");
+        }
+        s.preemptFreeBlockThreshold = *v;
+    }
+    if (const auto v = readOpt<std::size_t>(path, "serving", j,
+                                            "blockSize"); v) {
+        // Must be a power of 2 in {8, 16, 32} per M-Cuda.Batch design.
+        if (*v != 8U && *v != 16U && *v != 32U) {
+            fail(path, "serving.blockSize must be one of {8, 16, 32} "
+                       "(got " + std::to_string(*v) + ")");
+        }
+        s.blockSize = *v;
     }
     return s;
 }

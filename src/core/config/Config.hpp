@@ -211,6 +211,44 @@ struct ServingSettings {
     // instance stays single-session even on capable HW — reflects
     // the "batching-overhead pays off around B=8" empirical threshold.
     std::size_t     minBatchForEnable{8};
+
+    // ---- M-Cuda.Batch Phase C knobs ---------------------------------
+    //
+    // Consumed by RequestScheduler / ChunkedPrefillScheduler /
+    // PreemptionPolicy / PagedKvBlockAllocator at Phase-D construction
+    // time. Defaults match the corresponding class-level defaults so a
+    // config with only `enableBatching: "force"` produces the same
+    // behaviour as constructing the classes with their vanilla defaults.
+
+    // Tokens per iteration (Sarathi-Serve style). Drives
+    // `ChunkedPrefillScheduler::tokenBudget`. Balance-point: too small
+    // → too many scheduler-cycles; too large → decode-first-priority
+    // loses effect because prefill fills the batch before decode ever
+    // gets a look-in. 512 is vLLM V1 default. Range 1..8192.
+    std::size_t     tokenBudget{512};
+
+    // Concurrent (Prefilling + Decoding) request cap. Admissions
+    // beyond this stay in the Waiting queue until an existing request
+    // Completes or Preempts. Drives `RequestScheduler::maxActiveRequests`.
+    // 32 matches the Bragi-v1 target (per M-Cuda.Batch note) —
+    // realistic Spark load at 200-500 tok/s. Range 1..256.
+    std::size_t     maxActiveRequests{32};
+
+    // Paged-KV free-block ratio below which the preemption policy
+    // triggers `RequestScheduler::preemptOne()`. Drives
+    // `PreemptionPolicy::freeBlockThreshold`. 0.05 = 5% headroom
+    // before pressure — matches vLLM's `gpu_memory_utilization=0.95`.
+    // Range [0.0, 1.0]; 0.0 disables preemption, 1.0 is maximally-
+    // eager. Real tuning happens with Spark load-test numbers.
+    double          preemptFreeBlockThreshold{0.05};
+
+    // Tokens per paged KV block. Drives
+    // `PagedKvBlockAllocator::blockSize` and paged-attention kernel
+    // `block_size` argument. vLLM-consistent default 16; also legal:
+    // 8, 32. Larger blocks reduce table-overhead but increase
+    // fragmentation on short sequences. Must be a power of 2 for
+    // future prefix-cache alignment work.
+    std::size_t     blockSize{16};
 };
 
 /**

@@ -520,6 +520,135 @@ TEST(serving_configJson_rejectsOutOfRangeMinBatch) {
     EXPECT_TRUE(threw);
 }
 
+TEST(serving_configJson_cphaseKnobs_defaults) {
+    // No config → all C-phase defaults applied.
+    using ::mimirmind::core::config::ServingSettings;
+    ServingSettings s{};
+    EXPECT_EQ(s.tokenBudget,               std::size_t{512});
+    EXPECT_EQ(s.maxActiveRequests,         std::size_t{32});
+    EXPECT_TRUE(s.preemptFreeBlockThreshold == 0.05);
+    EXPECT_EQ(s.blockSize,                 std::size_t{16});
+}
+
+TEST(serving_configJson_cphaseKnobs_parseExplicitValues) {
+    const auto path = writeTempConfig(R"({
+        "models": [{"id":"primary","path":"/models/x.gguf"}],
+        "serving": {
+            "tokenBudget": 256,
+            "maxActiveRequests": 64,
+            "preemptFreeBlockThreshold": 0.1,
+            "blockSize": 32
+        }
+    })");
+    const auto cfg = ::mimirmind::core::config::loadConfig(path);
+    std::filesystem::remove(path);
+    EXPECT_EQ(cfg.serving.tokenBudget,               std::size_t{256});
+    EXPECT_EQ(cfg.serving.maxActiveRequests,         std::size_t{64});
+    EXPECT_TRUE(cfg.serving.preemptFreeBlockThreshold == 0.1);
+    EXPECT_EQ(cfg.serving.blockSize,                 std::size_t{32});
+}
+
+TEST(serving_configJson_cphaseKnobs_rejectsZeroTokenBudget) {
+    const auto path = writeTempConfig(R"({
+        "models": [{"id":"primary","path":"/models/x.gguf"}],
+        "serving": { "tokenBudget": 0 }
+    })");
+    bool threw = false;
+    try { (void)::mimirmind::core::config::loadConfig(path); }
+    catch (const std::exception&) { threw = true; }
+    std::filesystem::remove(path);
+    EXPECT_TRUE(threw);
+}
+
+TEST(serving_configJson_cphaseKnobs_rejectsHugeTokenBudget) {
+    const auto path = writeTempConfig(R"({
+        "models": [{"id":"primary","path":"/models/x.gguf"}],
+        "serving": { "tokenBudget": 999999 }
+    })");
+    bool threw = false;
+    try { (void)::mimirmind::core::config::loadConfig(path); }
+    catch (const std::exception&) { threw = true; }
+    std::filesystem::remove(path);
+    EXPECT_TRUE(threw);
+}
+
+TEST(serving_configJson_cphaseKnobs_rejectsZeroMaxActive) {
+    const auto path = writeTempConfig(R"({
+        "models": [{"id":"primary","path":"/models/x.gguf"}],
+        "serving": { "maxActiveRequests": 0 }
+    })");
+    bool threw = false;
+    try { (void)::mimirmind::core::config::loadConfig(path); }
+    catch (const std::exception&) { threw = true; }
+    std::filesystem::remove(path);
+    EXPECT_TRUE(threw);
+}
+
+TEST(serving_configJson_cphaseKnobs_rejectsThresholdAboveOne) {
+    const auto path = writeTempConfig(R"({
+        "models": [{"id":"primary","path":"/models/x.gguf"}],
+        "serving": { "preemptFreeBlockThreshold": 1.5 }
+    })");
+    bool threw = false;
+    try { (void)::mimirmind::core::config::loadConfig(path); }
+    catch (const std::exception&) { threw = true; }
+    std::filesystem::remove(path);
+    EXPECT_TRUE(threw);
+}
+
+TEST(serving_configJson_cphaseKnobs_rejectsNegativeThreshold) {
+    const auto path = writeTempConfig(R"({
+        "models": [{"id":"primary","path":"/models/x.gguf"}],
+        "serving": { "preemptFreeBlockThreshold": -0.1 }
+    })");
+    bool threw = false;
+    try { (void)::mimirmind::core::config::loadConfig(path); }
+    catch (const std::exception&) { threw = true; }
+    std::filesystem::remove(path);
+    EXPECT_TRUE(threw);
+}
+
+TEST(serving_configJson_cphaseKnobs_acceptsBoundaryThresholds) {
+    // Both 0.0 (disabled) and 1.0 (maximally-eager) are legal, same
+    // contract as PreemptionPolicy's ctor.
+    for (double t : {0.0, 1.0}) {
+        std::string body = R"({"models":[{"id":"primary","path":"/models/x.gguf"}],)"
+                           R"("serving":{"preemptFreeBlockThreshold": )"
+                           + std::to_string(t) + "}}";
+        const auto path = writeTempConfig(body);
+        const auto cfg = ::mimirmind::core::config::loadConfig(path);
+        std::filesystem::remove(path);
+        EXPECT_TRUE(cfg.serving.preemptFreeBlockThreshold == t);
+    }
+}
+
+TEST(serving_configJson_cphaseKnobs_rejectsNonPowerOfTwoBlockSize) {
+    // Only {8, 16, 32} are legal per M-Cuda.Batch design.
+    for (int bs : {1, 4, 7, 24, 64, 128}) {
+        std::string body = R"({"models":[{"id":"primary","path":"/models/x.gguf"}],)"
+                           R"("serving":{"blockSize": )"
+                           + std::to_string(bs) + "}}";
+        const auto path = writeTempConfig(body);
+        bool threw = false;
+        try { (void)::mimirmind::core::config::loadConfig(path); }
+        catch (const std::exception&) { threw = true; }
+        std::filesystem::remove(path);
+        EXPECT_TRUE(threw);
+    }
+}
+
+TEST(serving_configJson_cphaseKnobs_acceptsAllLegalBlockSizes) {
+    for (int bs : {8, 16, 32}) {
+        std::string body = R"({"models":[{"id":"primary","path":"/models/x.gguf"}],)"
+                           R"("serving":{"blockSize": )"
+                           + std::to_string(bs) + "}}";
+        const auto path = writeTempConfig(body);
+        const auto cfg = ::mimirmind::core::config::loadConfig(path);
+        std::filesystem::remove(path);
+        EXPECT_EQ(cfg.serving.blockSize, static_cast<std::size_t>(bs));
+    }
+}
+
 // -----------------------------------------------------------------------
 // ComputeContext::bandwidthGBps — Cpu backend (only one always compiled)
 // -----------------------------------------------------------------------
