@@ -11,7 +11,9 @@
 #include "core/gguf/WeightsMap.hpp"
 #include "core/ipc/TensorManifest.hpp"
 #include "model/FusedQkvWeights.hpp"
+#include "core/config/Config.hpp"
 #include "model/LlmConfig.hpp"
+#include "runtime/serving/BatchCapacityProbe.hpp"
 #include "model/Tokenizer.hpp"
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
@@ -427,6 +429,30 @@ public:
     [[nodiscard]] const model::Tokenizer&  tokenizer() const noexcept { return _tokenizer; }
     [[nodiscard]] const core::gguf::WeightsMap& weights()   const;
 
+    /// Startup HW-capacity probe snapshot (M-Startup.CapacityProbe).
+    /// Populated in `finalizeLoad()` once weights are on the device.
+    /// Consumed by `SystemStatusBuilder` for the `/v1/system/info.serving`
+    /// block, and (once the M-Cuda.Batch scheduler lands) by the runtime
+    /// batching-gate to decide whether to enable PagedAttention +
+    /// Continuous Batching for this engine instance.
+    [[nodiscard]] const runtime::serving::BatchCapacityEstimate&
+        batchCapacity() const noexcept { return _batchCapacity; }
+
+    /// Effective decision after the probe + the `serving.enableBatching`
+    /// config gate. True means the runtime should route through the
+    /// batching scheduler (once that scheduler exists — M-Cuda.Batch).
+    /// Today no consumer reads this beyond `/v1/system/info` reporting.
+    [[nodiscard]] bool servingClassEnabled() const noexcept {
+        return _servingClassEnabled;
+    }
+
+    /// The serving-config block that drove the gate decision. Read-only
+    /// view for `SystemStatusBuilder`; avoids threading a full `Config`
+    /// reference through the builder ctor just for two knobs.
+    [[nodiscard]] const core::config::ServingSettings& servingConfig() const noexcept {
+        return _cfg.serving;
+    }
+
 private:
     /// Compute logits over the last hidden state row via final-norm +
     /// lm_head, then draw one token id using `_sampler` and `params`.
@@ -534,6 +560,14 @@ private:
     // sits in the cache so the next generate() can compute the LCP.
     std::unique_ptr<KvCache>           _kvCache;
     std::optional<BlockBuffers>        _blockBuffers;
+
+    // --- M-Startup.CapacityProbe ---------------------------------------
+    // Populated in finalizeLoad() once weights are on the device.
+    // Exposed via `batchCapacity()`; drives `_servingClassEnabled` via
+    // the ServingSettings config-gate (Auto/Force/Disable).
+    runtime::serving::BatchCapacityEstimate _batchCapacity{};
+    bool                                    _servingClassEnabled{false};
+
     compute::ComputeBuffer             _xBufH;
     compute::ComputeBuffer             _normFinalH;
     compute::ComputeBuffer             _logitsH;

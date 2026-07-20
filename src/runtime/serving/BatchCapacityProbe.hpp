@@ -64,13 +64,39 @@ public:
     [[nodiscard]] static std::size_t roundToSchedulerStep(std::size_t raw) noexcept;
 
     /**
-     * Conservative fallback estimate. Skeleton returns
+     * Conservative fallback estimate — used when any probe input is 0
+     * (unknown-HW / model-not-loaded / probe-disabled). Returns
      * `sustainableBatch=1, servingClassRecommended=false, reasoning=
      * "probe not yet implemented — assuming single-session"`.
-     * Real HW-driven `estimate(ComputeContext&, LlmConfig&, ...)`
-     * lands in Sub-Step 5 (InferenceEngine wiring).
      */
     [[nodiscard]] static BatchCapacityEstimate estimateConservativeFallback() noexcept;
+
+    /**
+     * Real HW-driven estimate. All inputs are scalars so this stays in
+     * `mimirmind_core_common` without a link-dep on any backend. The
+     * caller (`InferenceEngine::finalizeLoad`) fetches them from:
+     *   bandwidthGBps    — `ComputeContext::bandwidthGBps()` (Sub-Step 2)
+     *   weightBytes      — `GgufReader::totalTensorBytes()`
+     *   kvBytesPerToken  — `LlmConfig::kvBytesPerToken(...)` (Sub-Step 3)
+     *   maxContext       — `LlmConfig::contextLength` or config override
+     *
+     * v1 heuristic: bandwidth-tier proxy for total device memory (a
+     * real per-device VRAM probe is a follow-up milestone). Rough tiers:
+     *   <  80 GB/s → batch 1  (low-end iGPU / CPU)
+     *   <  200     → batch 4  (mid iGPU — HIP Phoenix class)
+     *   <  400     → batch 16 (high-end integrated — DGX Spark class)
+     *   >= 400     → batch 32 (discrete dGPU class)
+     * Bounded to `roundToSchedulerStep`. Any zero input falls back to 1.
+     * `reasoning` field logs all inputs so operators can debug the
+     * decision at `/v1/system/info`.
+     *
+     * Never throws.
+     */
+    [[nodiscard]] static BatchCapacityEstimate estimate(
+        std::size_t bandwidthGBps,
+        std::size_t weightBytes,
+        std::size_t kvBytesPerToken,
+        std::size_t maxContext) noexcept;
 };
 
 } // namespace mimirmind::runtime::serving

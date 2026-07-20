@@ -279,6 +279,29 @@ json SystemStatusBuilder::buildInfo() const {
         {"token", core::backend::tokenFor(engineKind, /*deviceIx=*/0)},
     };
 
+    // M-Startup.CapacityProbe / Bragi — startup probe snapshot + the
+    // resulting serving-class gate decision. Sourced from
+    // `InferenceEngine::batchCapacity()` (populated once in
+    // finalizeLoad(), immutable thereafter for this engine instance).
+    // Operators use this to tell "why is this instance single-session"
+    // at a glance — reasoning field carries the raw probe inputs.
+    const auto& est = _engine.batchCapacity();
+    const auto& cfgServing = _engine.servingConfig();
+    json serving = {
+        {"enable_batching",         cfgServing.enableBatching == core::config::TriState::Auto    ? "auto"
+                                  : cfgServing.enableBatching == core::config::TriState::Force   ? "force"
+                                                                                                 : "disable"},
+        {"min_batch_for_enable",    cfgServing.minBatchForEnable},
+        {"sustainable_batch",       est.sustainableBatch},
+        {"serving_class_enabled",   _engine.servingClassEnabled()},
+        {"probe_recommended",       est.servingClassRecommended},
+        {"bandwidth_gbps",          est.bandwidthGBps},
+        {"weight_bytes",            est.weightBytes},
+        {"kv_bytes_per_token",      est.kvBytesPerToken},
+        {"max_context",             est.maxContext},
+        {"reasoning",               est.reasoning},
+    };
+
     return json{
         {"model",                  model},
         {"tokenizer",              tokenizer},
@@ -286,6 +309,7 @@ json SystemStatusBuilder::buildInfo() const {
         {"hardware",               hardware},
         {"backend_pool",           poolJson},
         {"engine_backend",         engineBackend},
+        {"serving",                serving},
         {"gpu_clock_envelope",     gpuClockEnvelope},
         {"fan_envelope",           fanEnvelope},
         {"thermal_profile",        thermalProfile},

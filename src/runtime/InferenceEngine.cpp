@@ -544,6 +544,60 @@ void InferenceEngine::finalizeLoad() {
                 _config.architecture, _config.blockCount,
                 _config.embeddingLength, _config.feedForwardLength,
                 _config.headCount, _config.headCountKv);
+
+    // M-Startup.CapacityProbe — HW-roofline probe + serving-class gate.
+    // Backend-agnostic: takes scalar inputs, so the probe lib doesn't
+    // link against any backend SDK. Log both the raw estimate and the
+    // gate decision so operators see WHY serving-class did or didn't
+    // light up. `dtypeBytes` for KV: 2 (FP16) is the target of M10.2
+    // Phase 0 and matches what M-Cuda.Batch will use — safe estimator
+    // even while _kvDtype is still F32 today (over-estimates batch, not
+    // under, so the gate stays conservative).
+    {
+        const std::size_t bwGBps      = _computeCtx->bandwidthGBps();
+        const std::size_t weightBytes = _reader.totalTensorBytes();
+        const std::size_t kvPerTok    = _config.kvBytesPerToken(/*dtypeBytes=*/2);
+        const std::size_t ctx         = _maxContextTokens > 0 ? _maxContextTokens
+                                                              : _config.contextLength;
+        _batchCapacity = runtime::serving::BatchCapacityProbe::estimate(
+            bwGBps, weightBytes, kvPerTok, ctx);
+
+        // Config gate — Auto respects the probe, Force overrides on
+        // (with a warning if the probe disagreed), Disable overrides off.
+        // No user-per-request toggle (feedback_no_user_toggles).
+        using core::config::TriState;
+        switch (_cfg.serving.enableBatching) {
+            case TriState::Auto:
+                _servingClassEnabled = _batchCapacity.servingClassRecommended
+                    && _batchCapacity.sustainableBatch >= _cfg.serving.minBatchForEnable;
+                break;
+            case TriState::Force:
+                _servingClassEnabled = true;
+                if (!_batchCapacity.servingClassRecommended) {
+                    MM_LOG_WARN("serving",
+                                "serving.enableBatching=force but probe reports "
+                                "sustainableBatch={} < minBatchForEnable={} — "
+                                "enabling anyway on operator request",
+                                _batchCapacity.sustainableBatch,
+                                _cfg.serving.minBatchForEnable);
+                }
+                break;
+            case TriState::Disable:
+                _servingClassEnabled = false;
+                break;
+        }
+
+        MM_LOG_INFO("serving",
+                    "BatchCapacityProbe: {}", _batchCapacity.reasoning);
+        MM_LOG_INFO("serving",
+                    "serving-class {} (config.enableBatching={}, minBatch={}, probeRecommended={})",
+                    _servingClassEnabled ? "ENABLED" : "disabled",
+                    _cfg.serving.enableBatching == TriState::Auto    ? "auto"
+                  : _cfg.serving.enableBatching == TriState::Force   ? "force"
+                                                                     : "disable",
+                    _cfg.serving.minBatchForEnable,
+                    _batchCapacity.servingClassRecommended);
+    }
 }
 
 void InferenceEngine::resetCache() noexcept {
