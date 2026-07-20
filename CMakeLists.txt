@@ -610,6 +610,7 @@ endif()
 if(MIMIRMIND_ENABLE_CUDA)
     set(CUDA_KERNEL_SOURCES
         kernels_cuda/cuda_probe_kernel.cu
+        kernels_cuda/attention_paged_v1.cu
         kernels_cuda/add_bias.cu
         kernels_cuda/add_residual.cu
         kernels_cuda/add_rmsnorm.cu
@@ -738,6 +739,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         src/core/gpu/cuda/CudaKernel.cpp
         src/core/gpu/cuda/CudaModule.cpp
         src/core/gpu/cuda/CudaComputeContext.cpp
+        src/core/gpu/cuda/PagedAttentionV1.cpp
     )
 
     target_link_libraries(mimirmind_core_cuda PUBLIC
