@@ -1666,6 +1666,131 @@ TEST(reqSchedKv_prefixSharingInvariantHoldsThroughScheduler) {
     EXPECT_TRUE(pool.hashOf(blkA) != std::uint64_t{0});
 }
 
+// -----------------------------------------------------------------------
+// PreemptionPolicy — Sub-Step C5 (M-Cuda.Batch Phase C)
+// -----------------------------------------------------------------------
+
+#include "runtime/serving/PreemptionPolicy.hpp"
+
+TEST(preemptPolicy_ctorDefaultThresholdIsFivePercent) {
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    PreemptionPolicy p{};
+    // Round-trip through ctor without arithmetic — bit-identical to
+    // the literal, safe to compare exactly. (EXPECT_NEAR would trip
+    // TestFramework's float-only signature.)
+    EXPECT_TRUE(p.freeBlockThreshold() == PreemptionPolicy::kDefaultFreeBlockThreshold);
+}
+
+TEST(preemptPolicy_ctorRejectsNegativeThreshold) {
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    bool threw = false;
+    try {
+        PreemptionPolicy p{-0.1};
+        (void)p;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
+}
+
+TEST(preemptPolicy_ctorRejectsAboveOne) {
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    bool threw = false;
+    try {
+        PreemptionPolicy p{1.5};
+        (void)p;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
+}
+
+TEST(preemptPolicy_ctorAcceptsBoundaryValues) {
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    // Both 0.0 and 1.0 are legal — see class docstring for semantics.
+    PreemptionPolicy p0{0.0};
+    PreemptionPolicy p1{1.0};
+    EXPECT_TRUE(p0.freeBlockThreshold() == 0.0);
+    EXPECT_TRUE(p1.freeBlockThreshold() == 1.0);
+}
+
+TEST(preemptPolicy_zeroTotalBlocksIsFalse) {
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    PreemptionPolicy p{0.5};
+    EXPECT_TRUE(!p.shouldPreempt(0, 0, 4));
+}
+
+TEST(preemptPolicy_soleActiveIsFalse) {
+    // Sole-active guard: preempting the only active request thrashes.
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    PreemptionPolicy p{0.5};
+    // Well below threshold (0/100 = 0% free) but numActive=1 → false.
+    EXPECT_TRUE(!p.shouldPreempt(0, 100, 1));
+    EXPECT_TRUE(!p.shouldPreempt(0, 100, 0));
+}
+
+TEST(preemptPolicy_belowThresholdTriggers) {
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    PreemptionPolicy p{0.10};   // 10 %
+    // 4/100 = 4 % free — below threshold, 2 active — trigger.
+    EXPECT_TRUE(p.shouldPreempt(4, 100, 2));
+}
+
+TEST(preemptPolicy_atThresholdDoesNotTrigger) {
+    // Strict-less-than: exactly at threshold is safe.
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    PreemptionPolicy p{0.10};
+    EXPECT_TRUE(!p.shouldPreempt(10, 100, 4));
+}
+
+TEST(preemptPolicy_aboveThresholdDoesNotTrigger) {
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    PreemptionPolicy p{0.10};
+    EXPECT_TRUE(!p.shouldPreempt(50, 100, 4));
+    EXPECT_TRUE(!p.shouldPreempt(100, 100, 4));
+}
+
+TEST(preemptPolicy_zeroThresholdIsDisabled) {
+    // Docstring contract: threshold=0.0 effectively disables the
+    // policy — freeRatio < 0.0 is impossible.
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    PreemptionPolicy p{0.0};
+    EXPECT_TRUE(!p.shouldPreempt(0, 100, 8));    // 0% free but disabled
+    EXPECT_TRUE(!p.shouldPreempt(50, 100, 8));
+    EXPECT_TRUE(!p.shouldPreempt(100, 100, 8));
+}
+
+TEST(preemptPolicy_oneThresholdIsMaximallyEager) {
+    // threshold=1.0 → preempt whenever any block is used
+    // (freeRatio < 1.0 iff at least one block used).
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    PreemptionPolicy p{1.0};
+    EXPECT_TRUE(p.shouldPreempt(99, 100, 2));    // 99% free but not 100 → trigger
+    EXPECT_TRUE(!p.shouldPreempt(100, 100, 2));  // truly empty pool
+}
+
+TEST(preemptPolicy_isPure) {
+    // Sanity: same input → same output, no hidden state.
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    PreemptionPolicy p{0.10};
+    const auto a = p.shouldPreempt(5, 100, 3);
+    const auto b = p.shouldPreempt(5, 100, 3);
+    const auto c = p.shouldPreempt(5, 100, 3);
+    EXPECT_TRUE(a && b && c);
+}
+
+TEST(preemptPolicy_scenarioBragiDefaults) {
+    // Realistic scenario: Bragi-v1 default 5% threshold, 8k-block
+    // pool, 32 active decodes. At 3% free (240 blocks), preempt.
+    // At 8% free (640 blocks), don't preempt.
+    using ::mimirmind::runtime::serving::PreemptionPolicy;
+    PreemptionPolicy p{};   // 5% default
+    EXPECT_TRUE(p.shouldPreempt(240, 8000, 32));      // 3% → trigger
+    EXPECT_TRUE(!p.shouldPreempt(640, 8000, 32));     // 8% → safe
+    EXPECT_TRUE(p.shouldPreempt(240, 8000, 2));       // Same threshold, min active
+    EXPECT_TRUE(!p.shouldPreempt(240, 8000, 1));      // Sole-active guard
+}
+
 TEST(reqSchedKv_preemptedRequestGetsFreshSequenceOnRecompute) {
     // RECOMPUTE flow with KV: preempt → blocks released → next tick
     // re-enqueues → Phase D re-feeds prompt tokens → fresh blocks
