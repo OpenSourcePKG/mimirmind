@@ -8,8 +8,16 @@
 #include "mimirmind/SmokeMode.hpp"
 
 #include "core/config/Config.hpp"
-#include "core/gpu/l0/L0Context.hpp"
 #include "core/log/Log.hpp"
+
+// L0Context.hpp transitively pulls in <level_zero/ze_api.h>, which
+// requires the Intel Level Zero SDK. HIP-only or CUDA-only builds
+// (e.g. radeon-testbed, DGX Spark) don't have that header — same
+// #ifdef pattern used across ServeMode.cpp / SmokeMode.cpp /
+// SmokeSuite.cpp for anything L0-specific.
+#ifdef MIMIRMIND_HAVE_L0
+#include "core/gpu/l0/L0Context.hpp"
+#endif
 
 #include <cstdint>
 #include <exception>
@@ -71,10 +79,12 @@ int main(int argc, char** argv) {
             case Mode::Parity: return mimirmind::cli::runParity(args, cfg);
         }
         return 0;
+#ifdef MIMIRMIND_HAVE_L0
     } catch (const mimirmind::core::l0::L0Error& e) {
         MM_LOG_ERROR("main", "Level Zero error: {}", e.what());
         std::cerr << "Level Zero error: " << e.what() << "\n";
         return 2;
+#endif
     } catch (const std::exception& e) {
         MM_LOG_ERROR("main", "fatal: {}", e.what());
         std::cerr << "Fatal: " << e.what() << "\n";
