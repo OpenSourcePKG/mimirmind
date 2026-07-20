@@ -26,9 +26,13 @@ namespace mimirmind::core::backend {
  *             vs HIP on RDNA3 outweighs the kernel-porting cost.
  *             Impl lives on an isolated branch, not on `main`, until
  *             a first kernel achieves bit-parity vs L0.
- *  - `Cuda` — NVIDIA-native; would need CUDA-C or PTX kernels
- *             alongside our SPIR-V set. No committed target today —
- *             gated on firm/DGX-class deploy decision.
+ *  - `Cuda` — NVIDIA-native; separate `.cu` kernel tree alongside our
+ *             SPIR-V / HIP sets. Target HW: NVIDIA DGX Spark / ASUS
+ *             Ascent GX10 (Grace ARM + Blackwell GB10). Skeleton lands
+ *             on `feat/cuda-backend-skeleton`; per the ds4/DwarfStar
+ *             scan (Synaipse: `research/ds4-dwarfstar-scan-2026-07-16.md`)
+ *             the one Spark-relevant design point is a `cudaMallocManaged`
+ *             fallback for oversized KV caches to avoid UMA lockup.
  *  - `Cpu`  — reference / test fallback.
  *
  * Each concrete backend is implemented in its own translation unit

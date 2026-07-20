@@ -110,6 +110,8 @@ public:
     ///   `"l0:<n>"`     -> LevelZero device index n
     ///   `"hip"`        -> shorthand for `"hip:0"`
     ///   `"hip:<n>"`    -> Hip device index n
+    ///   `"cuda"`       -> shorthand for `"cuda:0"`
+    ///   `"cuda:<n>"`   -> Cuda device index n
     /// Throws `std::runtime_error` when the token names a backend/
     /// device that is not in `entries()`.
     [[nodiscard]] PoolEntry& selectByToken(std::string_view token);

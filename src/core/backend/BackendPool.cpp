@@ -122,7 +122,7 @@ PoolEntry& BackendPool::selectByToken(std::string_view token) {
     if (!parts) {
         std::ostringstream os;
         os << "BackendPool::selectByToken: malformed token '" << token
-           << "' — expected one of auto | cpu | l0[:N] | hip[:N]";
+           << "' — expected one of auto | cpu | l0[:N] | hip[:N] | cuda[:N]";
         throw std::runtime_error(os.str());
     }
     const auto kindOpt = BackendRegistry::parseKind(parts->kindName);

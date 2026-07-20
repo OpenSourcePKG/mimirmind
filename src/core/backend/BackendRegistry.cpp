@@ -42,17 +42,20 @@ namespace mimirmind::core::hip {
 }
 #endif
 
+#ifdef MIMIRMIND_HAVE_CUDA
+namespace mimirmind::core::cuda {
+    ::mimirmind::core::backend::BackendProbe probeBackend() noexcept;
+    std::unique_ptr<::mimirmind::core::backend::ComputeContext>
+        createComputeContext();
+}
+#endif
+
 namespace mimirmind::core::backend {
 
 namespace {
 
 BackendProbe missing(BackendKind kind, const char* why) {
     return BackendProbe{kind, /*compiledIn=*/false, /*available=*/false, why};
-}
-
-BackendProbe cudaPlaceholder() {
-    return missing(BackendKind::Cuda,
-                   "not compiled in — CUDA backend not committed (no DGX-class target)");
 }
 
 } // namespace
@@ -75,7 +78,13 @@ std::vector<BackendProbe> BackendRegistry::probeAll() noexcept {
                           "not compiled in (MIMIRMIND_ENABLE_HIP=OFF at build time)"));
 #endif
 
-    out.push_back(cudaPlaceholder());
+#ifdef MIMIRMIND_HAVE_CUDA
+    out.push_back(::mimirmind::core::cuda::probeBackend());
+#else
+    out.push_back(missing(BackendKind::Cuda,
+                          "not compiled in (MIMIRMIND_ENABLE_CUDA=OFF at build time)"));
+#endif
+
     out.push_back(::mimirmind::core::cpu::probeBackend());
 
     return out;
@@ -172,9 +181,13 @@ BackendRegistry::createContext(BackendKind kind) {
 #endif
 
         case BackendKind::Cuda:
+#ifdef MIMIRMIND_HAVE_CUDA
+            return ::mimirmind::core::cuda::createComputeContext();
+#else
             throw std::runtime_error{
-                "BackendKind::Cuda has no compiled backend "
-                "(no DGX-class target committed)"};
+                "BackendKind::Cuda not compiled in "
+                "(MIMIRMIND_ENABLE_CUDA=OFF at build time)"};
+#endif
 
         case BackendKind::Cpu:
             return ::mimirmind::core::cpu::createComputeContext();

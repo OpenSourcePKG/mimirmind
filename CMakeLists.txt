@@ -23,8 +23,9 @@ project(mimirmind
 #                               plus a status message.
 # With both OFF, only the pure-CPU test binaries build. A configure will
 # succeed but produce nothing that can run a model.
-option(MIMIRMIND_ENABLE_L0  "Build the Level Zero backend and all L0-tied consumers" ON)
-option(MIMIRMIND_ENABLE_HIP "Build the HIP backend (placeholder — no impl on main yet)" OFF)
+option(MIMIRMIND_ENABLE_L0   "Build the Level Zero backend and all L0-tied consumers" ON)
+option(MIMIRMIND_ENABLE_HIP  "Build the HIP backend (placeholder — no impl on main yet)" OFF)
+option(MIMIRMIND_ENABLE_CUDA "Build the CUDA backend skeleton (DGX Spark bringup)" OFF)
 
 # C++23 required — std::expected in src/core/ipc/ for the M-Munin
 # error-return convention (see decisions/2026-07-13-m-munin-scope.md).
@@ -156,6 +157,47 @@ if(MIMIRMIND_ENABLE_HIP)
     # once the kernel port validates on multiple boards.
     set(MIMIRMIND_HIP_ARCHS "gfx1101"
         CACHE STRING "HIP offload archs for hipcc --genco (semicolon list)")
+endif()
+
+if(MIMIRMIND_ENABLE_CUDA)
+    # Pre-check for nvcc so we can emit an actionable error with the
+    # exact override flag before `enable_language(CUDA)` fires cmake's
+    # own stock "Failed to find nvcc" message. Same pattern as the HIP
+    # block's hipcc probe above.
+    find_program(NVCC_EXECUTABLE
+        NAMES nvcc
+        HINTS ${CUDAToolkit_ROOT} $ENV{CUDAToolkit_ROOT}
+              /usr/local/cuda/bin /opt/cuda/bin
+        DOC "nvcc — NVIDIA CUDA compiler driver")
+    if(NOT NVCC_EXECUTABLE)
+        message(FATAL_ERROR
+            "\n  nvcc not found (MIMIRMIND_ENABLE_CUDA=ON requires the CUDA Toolkit).\n"
+            "  On Debian/Ubuntu ARM64 (DGX Spark) via NVIDIA's apt repo:\n"
+            "    sudo apt install cuda-toolkit-12-6\n"
+            "  Or point us at an existing install:\n"
+            "    -DCUDAToolkit_ROOT=/path/to/cuda\n"
+            "  Configure with -DMIMIRMIND_ENABLE_CUDA=OFF to skip the CUDA build entirely.\n")
+    endif()
+    message(STATUS "nvcc: ${NVCC_EXECUTABLE}")
+
+    # CUDAToolkit provides cudart, cuBLAS/cuBLASLt, nvrtc etc. On DGX
+    # Spark (Grace ARM + Blackwell GB10) CUDA 12.6+ ships via NVIDIA's
+    # arm64 apt repo. Kernel files (.cu) arrive with Track 4 — the
+    # skeleton compiles pure C++ against CUDA::cudart only.
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+
+    # Per ds4/DwarfStar scan (Synaipse: research/ds4-dwarfstar-scan-2026-07-16.md)
+    # we keep CMAKE_CUDA_ARCHITECTURES OFF so nvcc emits PTX and the
+    # driver JITs on the target — Blackwell (sm_120) is too new for
+    # stable hard-coding today. Override with e.g.
+    #   -DCMAKE_CUDA_ARCHITECTURES="90-real;120-virtual"
+    # once we have a stable Spark baseline.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES OFF)
+    endif()
+
+    message(STATUS "CUDA Toolkit: ${CUDAToolkit_VERSION} at ${CUDAToolkit_INCLUDE_DIRS}")
 endif()
 
 if(MIMIRMIND_ENABLE_L0)
@@ -325,6 +367,9 @@ if(MIMIRMIND_ENABLE_L0)
 endif()
 if(MIMIRMIND_ENABLE_HIP)
     target_compile_definitions(mimirmind_core_common PUBLIC MIMIRMIND_HAVE_HIP=1)
+endif()
+if(MIMIRMIND_ENABLE_CUDA)
+    target_compile_definitions(mimirmind_core_common PUBLIC MIMIRMIND_HAVE_CUDA=1)
 endif()
 
 # ---- mimirmind_core_l0 — Level Zero-tied foundation ------------------------
@@ -543,6 +588,28 @@ if(MIMIRMIND_ENABLE_HIP)
     add_custom_target(hip_kernels ALL DEPENDS ${HIP_HSACO_FILES})
 endif()
 
+# ---- mimirmind_core_cuda — NVIDIA CUDA-tied foundation --------------------
+#
+# Peer to `mimirmind_core_l0` / `mimirmind_core_hip`. Track 1 lands
+# only the BackendRegistry hook (probeBackend + createComputeContext
+# stub); the actual context/stream/module/allocator wrappers arrive
+# with Track 2 on this same branch.
+#
+# Only built when MIMIRMIND_ENABLE_CUDA=ON. Design + roadmap:
+# Synaipse `research/ds4-dwarfstar-scan-2026-07-16.md` and
+# `research/hw-abstraction-strategy.md`.
+
+if(MIMIRMIND_ENABLE_CUDA)
+    add_library(mimirmind_core_cuda STATIC
+        src/core/gpu/cuda/CudaProbe.cpp
+    )
+
+    target_link_libraries(mimirmind_core_cuda PUBLIC
+        mimirmind_core_common
+        CUDA::cudart
+    )
+endif()
+
 # ---- L0-backed targets: mimirmind binary, munin daemon, GPU tests ---------
 #
 # All of these consume L0Context / GpuOps / GpuMatmul / CommandQueue directly
@@ -660,6 +727,9 @@ endif()
 if(MIMIRMIND_ENABLE_HIP)
     target_link_libraries(mimirmind PRIVATE mimirmind_core_hip)
 endif()
+if(MIMIRMIND_ENABLE_CUDA)
+    target_link_libraries(mimirmind PRIVATE mimirmind_core_cuda)
+endif()
 
 # ---- munin — persistent model-memory daemon (M-Munin Schritt 7) -------------
 #
@@ -743,6 +813,9 @@ if(MIMIRMIND_ENABLE_L0)
 endif()
 if(MIMIRMIND_ENABLE_HIP)
     target_link_libraries(backend_tests PRIVATE mimirmind_core_hip)
+endif()
+if(MIMIRMIND_ENABLE_CUDA)
+    target_link_libraries(backend_tests PRIVATE mimirmind_core_cuda)
 endif()
 
 # ---- arch_tests — pure-CPU tests for arch-related logic ---------------------
