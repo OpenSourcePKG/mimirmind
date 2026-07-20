@@ -713,6 +713,20 @@ if(MIMIRMIND_ENABLE_HIP)
     add_dependencies(mimirmind hip_kernels)
 endif()
 
+if(MIMIRMIND_ENABLE_CUDA)
+    # CUDA compute layer — mirrors the HIP block above. GpuOps +
+    # GpuMatmul dispatch on CUfunction handles held by CudaModule
+    # (Track 2 primitives). Kernel symbols are identical to the HIP
+    # names — Track 4 preserves them so `cuModuleGetFunction("rmsnorm")`
+    # resolves against the same string `hipModuleGetFunction("rmsnorm")`
+    # uses on the HIP side.
+    target_sources(mimirmind PRIVATE
+        src/compute/cuda/GpuMatmul.cpp
+        src/compute/cuda/GpuOps.cpp
+    )
+    add_dependencies(mimirmind cuda_kernels)
+endif()
+
 # cpp-httplib is only used by the server, not by mimirmind_core. SYSTEM so
 # upstream code does not trip our strict warning flags.
 target_include_directories(mimirmind SYSTEM PRIVATE
