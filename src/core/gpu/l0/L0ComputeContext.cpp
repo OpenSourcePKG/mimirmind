@@ -17,6 +17,22 @@ L0ComputeContext::L0ComputeContext(Options opts)
 
 L0ComputeContext::~L0ComputeContext() = default;
 
+std::size_t L0ComputeContext::bandwidthGBps() const noexcept {
+    // Two-branch heuristic — integrated iGPU vs discrete dGPU.
+    // A precise per-device measurement lands in M-Probe.1; for the
+    // BatchCapacityProbe consumer (M-Startup.CapacityProbe) this
+    // coarse estimate is enough to decide serving-class gating.
+    using ::mimirmind::core::backend::DeviceKind;
+    switch (_ctx.deviceInfo().kind) {
+        case DeviceKind::GpuIntegrated:  return 70;    // Meteor/Arrow/Lunar/Panther Lake Xe-LPG
+        case DeviceKind::GpuDiscrete:    return 450;   // Arc B70 / A770 / Battlemage class
+        case DeviceKind::Npu:            return 30;    // VPU 3720 conservative
+        case DeviceKind::Cpu:            return 50;    // unlikely under L0 but safe
+        case DeviceKind::Unknown:        return 0;
+    }
+    return 0;
+}
+
 // Factory hook consumed by BackendRegistry::createContext(). Lives in
 // this translation unit so the common BackendRegistry TU never pulls
 // in level_zero/ze_api.h. Options are the defaults — the entry point

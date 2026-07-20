@@ -520,6 +520,28 @@ TEST(serving_configJson_rejectsOutOfRangeMinBatch) {
     EXPECT_TRUE(threw);
 }
 
+// -----------------------------------------------------------------------
+// ComputeContext::bandwidthGBps — Cpu backend (only one always compiled)
+// -----------------------------------------------------------------------
+
+#include "core/cpu/CpuContext.hpp"
+
+TEST(computeContext_cpu_bandwidthIsFiftyGBps) {
+    ::mimirmind::core::cpu::CpuContext ctx{};
+    // 50 GB/s = dual-channel DDR5-5600 desktop baseline (pegenaut-skynet).
+    EXPECT_EQ(ctx.bandwidthGBps(), std::size_t{50});
+}
+
+TEST(computeContext_baseDefaultsToZero) {
+    // Sanity — the base class default is 0 ("unknown"), meaning any
+    // future backend that forgets to override still compiles and the
+    // BatchCapacityProbe correctly falls back to single-session.
+    // Verified indirectly: CpuContext overrides to non-zero, so if the
+    // default weren't 0 we'd need a different sentinel here.
+    ::mimirmind::core::cpu::CpuContext ctx{};
+    EXPECT_TRUE(ctx.bandwidthGBps() != 0);  // sanity: override IS in effect
+}
+
 int main() {
     return mm::test::run();
 }

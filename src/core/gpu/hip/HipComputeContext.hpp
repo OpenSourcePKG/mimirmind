@@ -58,6 +58,15 @@ public:
     [[nodiscard]] const ::mimirmind::core::backend::ComputeBackend&
         backend() const noexcept override { return _ctx; }
 
+    /// Sustained memory bandwidth heuristic for AMD family:
+    ///   integrated APU (Phoenix / Hawk Point / Strix Halo) —
+    ///     ~100 GB/s (LPDDR5x-8000/8533 class).
+    ///   discrete GPU (RDNA3 RX 7800 XT / 7900 XTX etc.) —
+    ///     ~500 GB/s (real gfx1101 = 624, gfx1030 = 512, average).
+    /// Rough per-family heuristic; a real per-device probe is a
+    /// follow-up. Never throws.
+    [[nodiscard]] std::size_t bandwidthGBps() const noexcept override;
+
     // ---- HIP-native accessors ----------------------------------------
 
     [[nodiscard]] HipContext&              hipContext() noexcept       { return _ctx; }

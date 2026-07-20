@@ -60,6 +60,15 @@ public:
     [[nodiscard]] const ::mimirmind::core::backend::ComputeBackend&
         backend() const noexcept override { return _ctx; }
 
+    /// Sustained memory bandwidth heuristic for NVIDIA family:
+    ///   integrated (Grace ARM + GB10 = DGX Spark, or Jetson) —
+    ///     ~273 GB/s (Spark LPDDR5X-8533, matches Bragi-anchor demo).
+    ///   discrete (Blackwell / Ada / Ampere consumer / RTX 5070 etc.)
+    ///     — ~500 GB/s (RTX 5070 = 672, RTX 5060 = 448, average).
+    /// Rough per-family heuristic; a real per-device probe is a
+    /// follow-up. Never throws.
+    [[nodiscard]] std::size_t bandwidthGBps() const noexcept override;
+
     // ---- CUDA-native accessors ---------------------------------------
 
     [[nodiscard]] CudaContext&              cudaContext() noexcept       { return _ctx; }

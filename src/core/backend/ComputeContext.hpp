@@ -5,6 +5,8 @@
 
 #include "core/backend/ComputeBackend.hpp"
 
+#include <cstddef>
+
 namespace mimirmind::core::backend {
 
 /**
@@ -57,6 +59,22 @@ public:
     /// Convenience — same as `backend().kind()`, just less typing at
     /// the call site.
     [[nodiscard]] BackendKind kind() const noexcept { return backend().kind(); }
+
+    /// Best-effort estimate of sustained memory bandwidth (in GB/s)
+    /// available for compute kernels on this backend's currently-
+    /// selected device. Used by
+    /// `runtime::serving::BatchCapacityProbe` (M-Startup.CapacityProbe)
+    /// to compute the bandwidth-saturating batch size for Bragi
+    /// serving-class gating.
+    ///
+    /// Returns 0 when the backend cannot determine a value — the
+    /// probe interprets 0 as "unknown HW, fall back to single-session
+    /// conservative default". Concrete backends override with a per-
+    /// HW-family heuristic (e.g. integrated-vs-discrete branch); a
+    /// precise per-device HW-probe is a follow-up milestone.
+    ///
+    /// Never throws.
+    [[nodiscard]] virtual std::size_t bandwidthGBps() const noexcept { return 0; }
 
 protected:
     ComputeContext() = default;
