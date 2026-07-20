@@ -1667,6 +1667,145 @@ TEST(reqSchedKv_prefixSharingInvariantHoldsThroughScheduler) {
 }
 
 // -----------------------------------------------------------------------
+// ServingMetrics + snapshotMetrics()
+// -----------------------------------------------------------------------
+
+TEST(reqSchedMetrics_freshSchedulerHasZeroCounters) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    const auto m = s.snapshotMetrics();
+    EXPECT_EQ(m.num_waiting,           std::size_t{0});
+    EXPECT_EQ(m.num_active,            std::size_t{0});
+    EXPECT_EQ(m.num_preempted,         std::size_t{0});
+    EXPECT_EQ(m.num_completed_current, std::size_t{0});
+    EXPECT_EQ(m.total_admitted,        std::uint64_t{0});
+    EXPECT_EQ(m.total_completed,       std::uint64_t{0});
+    EXPECT_EQ(m.total_preempted,       std::uint64_t{0});
+    // State-machine-only mode: pool fields all zero.
+    EXPECT_EQ(m.block_pool_total,      std::size_t{0});
+    EXPECT_EQ(m.block_pool_free,       std::size_t{0});
+    EXPECT_EQ(m.block_pool_used,       std::size_t{0});
+    EXPECT_TRUE(m.block_pool_utilization == 0.0);
+}
+
+TEST(reqSchedMetrics_admitBumpsTotalAdmitted) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    (void)s.admit(10, 5);
+    (void)s.admit(10, 5);
+    (void)s.admit(0, 5);   // rejected, must NOT bump
+    (void)s.admit(10, 0);  // rejected, must NOT bump
+    const auto m = s.snapshotMetrics();
+    EXPECT_EQ(m.total_admitted, std::uint64_t{2});
+    EXPECT_EQ(m.num_waiting,    std::size_t{2});
+}
+
+TEST(reqSchedMetrics_completionBumpsTotalCompleted) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    (void)s.admit(5, 1);
+    s.commitProgress(s.tick(), {});                        // prefill → Decoding
+    s.commitProgress(s.tick(), std::vector<std::uint8_t>{0});  // decode → Completed
+    const auto m = s.snapshotMetrics();
+    EXPECT_EQ(m.total_completed,       std::uint64_t{1});
+    EXPECT_EQ(m.num_completed_current, std::size_t{1});
+    // total_admitted persists across the completion.
+    EXPECT_EQ(m.total_admitted,        std::uint64_t{1});
+}
+
+TEST(reqSchedMetrics_totalCompletedPersistsAcrossDrain) {
+    // Drain removes the Completed entries but the monotonic total
+    // must not decrement. That's the "since-start" contract.
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    (void)s.admit(5, 1);
+    s.commitProgress(s.tick(), {});
+    s.commitProgress(s.tick(), std::vector<std::uint8_t>{0});
+    (void)s.drainCompleted();
+    const auto m = s.snapshotMetrics();
+    EXPECT_EQ(m.total_completed,       std::uint64_t{1});   // persists
+    EXPECT_EQ(m.num_completed_current, std::size_t{0});     // drained
+}
+
+TEST(reqSchedMetrics_preemptBumpsTotalPreempted) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    (void)s.admit(10, 5);
+    (void)s.admit(10, 5);
+    (void)s.tick();
+    (void)s.preemptOne();
+    (void)s.preemptOne();   // second preempt (a different request)
+    const auto m = s.snapshotMetrics();
+    EXPECT_EQ(m.total_preempted, std::uint64_t{2});
+    EXPECT_EQ(m.num_preempted,   std::size_t{2});
+}
+
+TEST(reqSchedMetrics_totalPreemptedCountsEventsNotRequests) {
+    // A single request that gets preempted, re-enqueued, and preempted
+    // again should count as TWO preemption events (not one) — the
+    // counter tracks pressure-relief actions, not unique victims.
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 2};
+    (void)s.admit(10, 5);
+    (void)s.admit(10, 5);
+    (void)s.tick();
+    (void)s.preemptOne();   // victim = req 2
+    (void)s.tick();         // req 2 back to Waiting → Prefilling
+    (void)s.preemptOne();   // victim = req 2 again (still LIFO)
+    const auto m = s.snapshotMetrics();
+    EXPECT_EQ(m.total_preempted, std::uint64_t{2});
+}
+
+TEST(reqSchedMetrics_preemptOnEmptyIsNoop) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    EXPECT_EQ(s.preemptOne(), std::uint64_t{0});   // nothing active
+    const auto m = s.snapshotMetrics();
+    EXPECT_EQ(m.total_preempted, std::uint64_t{0});
+}
+
+TEST(reqSchedMetrics_poolFieldsPopulatedWithAllocator) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    PagedKvBlockAllocator pool{100, 4};
+    RequestScheduler s{512, 4, &pool};
+    const auto id = s.admit(10, 5);
+    const std::int32_t toks[10] = {1,2,3,4,5,6,7,8,9,10};
+    EXPECT_TRUE(s.feedPrefillTokens(id, toks));   // 3 blocks used
+    const auto m = s.snapshotMetrics();
+    EXPECT_EQ(m.block_pool_total, std::size_t{100});
+    EXPECT_EQ(m.block_pool_used,  std::size_t{3});
+    EXPECT_EQ(m.block_pool_free,  std::size_t{97});
+    // 3/100 = 0.03 — round-trip through the division so exact-compare
+    // isn't safe; use range.
+    EXPECT_TRUE(m.block_pool_utilization > 0.029 && m.block_pool_utilization < 0.031);
+}
+
+TEST(reqSchedMetrics_poolUtilisationTracksBlocksLive) {
+    // After preemption releases blocks, utilisation should drop.
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    PagedKvBlockAllocator pool{100, 4};
+    RequestScheduler s{512, 4, &pool};
+    const auto a = s.admit(20, 5);
+    const auto b = s.admit(20, 5);
+    (void)a;
+    const std::int32_t toks[20] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20};
+    EXPECT_TRUE(s.feedPrefillTokens(b, toks));   // 5 blocks used
+    {
+        const auto m = s.snapshotMetrics();
+        EXPECT_EQ(m.block_pool_used, std::size_t{5});
+    }
+    (void)s.tick();
+    (void)s.preemptOne();
+    {
+        const auto m = s.snapshotMetrics();
+        EXPECT_EQ(m.block_pool_used, std::size_t{0});
+        EXPECT_TRUE(m.block_pool_utilization == 0.0);
+    }
+}
+
+// -----------------------------------------------------------------------
 // PreemptionPolicy — Sub-Step C5 (M-Cuda.Batch Phase C)
 // -----------------------------------------------------------------------
 

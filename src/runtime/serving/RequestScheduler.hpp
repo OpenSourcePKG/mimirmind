@@ -68,7 +68,16 @@ struct RequestStateData {
      */
     std::optional<PagedKvSequence> kv_sequence;
 
-    RequestStateData() = default;
+    /**
+     * Set to true the first time preemptOne() moves this request to
+     * Preempted. Used only to decide whether a Completed transition
+     * should bump the monotonic total_preempted_since_start counter
+     * (only requests that WERE preempted at some point count). Not
+     * user-facing.
+     */
+    bool ever_preempted{false};
+
+    RequestStateData()                                       = default;
 
     // Non-copyable because PagedKvSequence is non-copyable. Move-only
     // is fine — the scheduler stores instances in a std::vector that
@@ -78,6 +87,34 @@ struct RequestStateData {
     RequestStateData& operator=(const RequestStateData&) = delete;
     RequestStateData(RequestStateData&&) noexcept        = default;
     RequestStateData& operator=(RequestStateData&&) noexcept = default;
+};
+
+/**
+ * Aggregated snapshot of the serving loop's state for
+ * `/v1/system/info.serving` (Phase E3) and any operator-facing
+ * dashboard. Produced by `RequestScheduler::snapshotMetrics()`.
+ *
+ * Instantaneous counters describe *right now*; totals are monotonic
+ * across the scheduler's lifetime. Pool-side fields are 0 when the
+ * scheduler runs in state-machine-only mode (no allocator).
+ */
+struct ServingMetrics {
+    // ---- Instantaneous (right now) --------------------------------
+    std::size_t   num_waiting{0};
+    std::size_t   num_active{0};             // Prefilling + Decoding
+    std::size_t   num_preempted{0};
+    std::size_t   num_completed_current{0};  // Completed but not yet drained
+
+    // ---- Monotonic totals since scheduler-start -------------------
+    std::uint64_t total_admitted{0};
+    std::uint64_t total_completed{0};
+    std::uint64_t total_preempted{0};        // count of preemption events, not requests
+
+    // ---- Pool utilisation (0 fields when no allocator) ------------
+    std::size_t   block_pool_total{0};
+    std::size_t   block_pool_free{0};
+    std::size_t   block_pool_used{0};
+    double        block_pool_utilization{0.0};   // used / total, [0.0, 1.0]
 };
 
 /**
@@ -266,6 +303,17 @@ public:
         return _allocator;
     }
 
+    /**
+     * One-shot metrics aggregator for the serving-info endpoint /
+     * dashboards. Reads all state without mutating; O(N) in the
+     * current request-count.
+     *
+     * Pool-utilisation fields are populated only when the scheduler
+     * has an allocator. Monotonic totals reflect the scheduler's
+     * lifetime — they are NOT reset by `drainCompleted()`.
+     */
+    [[nodiscard]] ServingMetrics snapshotMetrics() const noexcept;
+
     // ---- Inspection (feeds `/v1/system/info.serving` Phase E3) -----
 
     [[nodiscard]] std::size_t numWaiting()    const noexcept;
@@ -323,6 +371,12 @@ private:
     std::uint64_t                  _nextRequestId{1};
     std::uint64_t                  _nextAdmitSeq{1};
     std::vector<RequestStateData>  _requests;
+
+    // Monotonic counters — never decremented, never reset (persistent
+    // across drainCompleted). Surface via snapshotMetrics().
+    std::uint64_t                  _totalAdmitted{0};
+    std::uint64_t                  _totalCompleted{0};
+    std::uint64_t                  _totalPreempted{0};
 };
 
 } // namespace mimirmind::runtime::serving

@@ -43,6 +43,7 @@ std::uint64_t RequestScheduler::admit(std::int32_t promptLength,
         r.kv_sequence.emplace(*_allocator);
     }
     _requests.push_back(std::move(r));
+    ++_totalAdmitted;
     return _requests.back().request_id;
 }
 
@@ -136,6 +137,7 @@ void RequestScheduler::commitProgress(
         const bool eos = eosSizesMatch ? (reachedEos[i] != 0) : false;
         if (eos || r->tokens_decoded >= r->max_tokens) {
             r->state = RequestState::Completed;
+            ++_totalCompleted;
         }
     }
 }
@@ -152,7 +154,9 @@ std::uint64_t RequestScheduler::preemptOne() noexcept {
         }
     }
     if (victim == nullptr) return 0;
-    victim->state = RequestState::Preempted;
+    victim->state         = RequestState::Preempted;
+    victim->ever_preempted = true;
+    ++_totalPreempted;
     // Release KV blocks eagerly so they're available to whoever gets
     // promoted next iteration. If the request is re-enqueued via
     // reenqueuePreempted → promoteWaitingToActive, the caller's
@@ -256,6 +260,28 @@ RequestStateData* RequestScheduler::findMut(std::uint64_t id) noexcept {
         if (r.request_id == id) return &r;
     }
     return nullptr;
+}
+
+ServingMetrics RequestScheduler::snapshotMetrics() const noexcept {
+    ServingMetrics m{};
+    m.num_waiting           = numWaiting();
+    m.num_active            = numActive();
+    m.num_preempted         = numPreempted();
+    m.num_completed_current = numCompleted();
+    m.total_admitted        = _totalAdmitted;
+    m.total_completed       = _totalCompleted;
+    m.total_preempted       = _totalPreempted;
+    if (_allocator != nullptr) {
+        m.block_pool_total = _allocator->numBlocksTotal();
+        m.block_pool_free  = _allocator->numBlocksFree();
+        m.block_pool_used  = _allocator->numBlocksUsed();
+        if (m.block_pool_total > 0) {
+            m.block_pool_utilization =
+                static_cast<double>(m.block_pool_used) /
+                static_cast<double>(m.block_pool_total);
+        }
+    }
+    return m;
 }
 
 } // namespace mimirmind::runtime::serving
