@@ -117,6 +117,32 @@ struct LlmConfig {
         return headCountKv;
     }
 
+    /// KV-cache bytes required per newly-decoded token, summed across
+    /// all layers. Formula: `sum_{b=0..blockCount-1} 2 * n_kv(b) * head_dim(b) * dtypeBytes`
+    /// where the leading `2` covers K + V. Respects per-layer variations
+    /// (Gemma 4 mixed SWA/full head_dim, per-layer n_kv).
+    ///
+    /// `dtypeBytes` is the size of one element in the runtime KV dtype:
+    ///   4 = F32 (current default)
+    ///   2 = FP16 (M10.2 Phase 0)
+    ///   1 = Q8_0 approximation (per-element cost incl. block scale is
+    ///       closer to 1.0625 for GGUF-Q8_0; caller should round up when
+    ///       using this for capacity planning)
+    ///
+    /// Used by BatchCapacityProbe to estimate memory-limited batch size
+    /// and by KvCache to size preallocations. Never throws.
+    [[nodiscard]] std::size_t kvBytesPerToken(std::size_t dtypeBytes = 2) const noexcept {
+        std::size_t total = 0;
+        for (std::size_t b = 0; b < blockCount; ++b) {
+            const std::size_t nKv = headCountKvFor(b);
+            const std::size_t hd  = headDim(b);
+            // 2 = K + V. Per-block product cannot exceed a few KB even for
+            // the largest models, so plain size_t multiplication is safe.
+            total += 2U * nKv * hd * dtypeBytes;
+        }
+        return total;
+    }
+
     /// Populate from the reader's metadata. Throws on missing required
     /// keys; logs every value found at INFO.
     void parseFromGguf(const GgufReader& reader);

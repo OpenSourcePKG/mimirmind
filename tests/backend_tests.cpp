@@ -370,6 +370,59 @@ TEST(batchProbe_skeletonFallback_isSingleSession) {
     EXPECT_TRUE(!est.reasoning.empty());
 }
 
+// -----------------------------------------------------------------------
+// LlmConfig::kvBytesPerToken — helper used by BatchCapacityProbe
+// -----------------------------------------------------------------------
+
+#include "model/LlmConfig.hpp"
+
+TEST(llmConfig_kvBytesPerToken_uniformFp16) {
+    using ::mimirmind::model::LlmConfig;
+    LlmConfig cfg{};
+    cfg.blockCount      = 32;
+    cfg.embeddingLength = 4096;
+    cfg.headCount       = 32;
+    cfg.headCountKv     = 8;      // GQA 4:1
+    // headDim() = 4096 / 32 = 128 (keyLength unset falls back to embed/head).
+    // Per layer: 2 * 8 * 128 * 2 = 4096 bytes. 32 layers → 131072 bytes.
+    EXPECT_EQ(cfg.kvBytesPerToken(2),
+              std::size_t{32} * 2U * 8U * 128U * 2U);
+}
+
+TEST(llmConfig_kvBytesPerToken_f32ScalesLinearly) {
+    using ::mimirmind::model::LlmConfig;
+    LlmConfig cfg{};
+    cfg.blockCount      = 8;
+    cfg.embeddingLength = 1024;
+    cfg.headCount       = 8;
+    cfg.headCountKv     = 4;
+    // F32 (dtypeBytes=4) is exactly 2x FP16 (dtypeBytes=2).
+    const auto fp16 = cfg.kvBytesPerToken(2);
+    const auto f32  = cfg.kvBytesPerToken(4);
+    EXPECT_EQ(f32, fp16 * 2U);
+}
+
+TEST(llmConfig_kvBytesPerToken_perLayerKvHonoured) {
+    using ::mimirmind::model::LlmConfig;
+    LlmConfig cfg{};
+    cfg.blockCount      = 4;
+    cfg.embeddingLength = 256;
+    cfg.headCount       = 4;
+    cfg.headCountKv     = 4;      // fallback if per-layer empty
+    cfg.headCountKvPerLayer = {1U, 2U, 4U, 8U};
+    // head_dim = 256/4 = 64. Per-layer contribution: 2 * n_kv(b) * 64 * 2.
+    // Sum n_kv = 1+2+4+8 = 15. Total = 15 * 2 * 64 * 2 = 3840 bytes.
+    EXPECT_EQ(cfg.kvBytesPerToken(2),
+              std::size_t{15} * 2U * 64U * 2U);
+}
+
+TEST(llmConfig_kvBytesPerToken_emptyModelReturnsZero) {
+    using ::mimirmind::model::LlmConfig;
+    LlmConfig cfg{};
+    // blockCount=0 → sum-loop doesn't run.
+    EXPECT_EQ(cfg.kvBytesPerToken(2), std::size_t{0});
+}
+
 int main() {
     return mm::test::run();
 }
