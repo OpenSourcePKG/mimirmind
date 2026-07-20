@@ -4,6 +4,7 @@
 #pragma once
 
 #include "runtime/serving/ChunkedPrefillScheduler.hpp"
+#include "runtime/serving/PagedKvSequence.hpp"    // pulls in PagedKvBlockAllocator.hpp
 
 #include <cstddef>
 #include <cstdint>
@@ -56,6 +57,27 @@ struct RequestStateData {
      * request_id.
      */
     std::uint64_t admit_seq{0};
+
+    /**
+     * Optional per-request paged-KV block-table + token-history.
+     * Populated only when the scheduler ctor received a non-null
+     * `PagedKvBlockAllocator*`. Ownership stays with this struct;
+     * `optional`'s destructor releases the sequence's blocks back to
+     * the shared pool via `PagedKvSequence::~PagedKvSequence()` when
+     * the request is drained or the scheduler destructs.
+     */
+    std::optional<PagedKvSequence> kv_sequence;
+
+    RequestStateData() = default;
+
+    // Non-copyable because PagedKvSequence is non-copyable. Move-only
+    // is fine — the scheduler stores instances in a std::vector that
+    // may reallocate on admit(); the move-ctor keeps the allocator
+    // pointer intact because the allocator lives outside the sequence.
+    RequestStateData(const RequestStateData&)            = delete;
+    RequestStateData& operator=(const RequestStateData&) = delete;
+    RequestStateData(RequestStateData&&) noexcept        = default;
+    RequestStateData& operator=(RequestStateData&&) noexcept = default;
 };
 
 /**
@@ -112,9 +134,18 @@ public:
      *
      * Both parameters MUST be > 0; ctor throws `std::invalid_argument`
      * otherwise.
+     *
+     * `allocator` is optional. When null (default), the scheduler
+     * operates in **state-machine-only mode**: admissions create
+     * request entries without paged-KV sequences and `feedPrefillTokens`
+     * / `feedDecodeToken` become no-ops. When non-null, the allocator
+     * MUST outlive the scheduler; every admitted request gets its own
+     * `PagedKvSequence` bound to this allocator, and preemption /
+     * completion release the sequence's blocks back to the pool.
      */
-    RequestScheduler(std::int32_t tokenBudget,
-                     std::size_t  maxActiveRequests);
+    RequestScheduler(std::int32_t            tokenBudget,
+                     std::size_t             maxActiveRequests,
+                     PagedKvBlockAllocator*  allocator = nullptr);
 
     RequestScheduler(const RequestScheduler&)            = delete;
     RequestScheduler& operator=(const RequestScheduler&) = delete;
@@ -191,9 +222,49 @@ public:
     /**
      * Remove all Completed entries and return their ids. Caller uses
      * this to reap the request-registry after the HTTP response has
-     * been sent. Ids are returned in admission order.
+     * been sent. Ids are returned in admission order. Each drained
+     * entry's `kv_sequence` destructor releases its blocks back to
+     * the shared pool.
      */
     std::vector<std::uint64_t> drainCompleted() noexcept;
+
+    // ---- KV wire-up (Phase D calls these) --------------------------
+
+    /**
+     * Append prefilled prompt tokens to a request's KV sequence.
+     * Called by Phase D (`InferenceEngine::generateServing`) after
+     * each prefill chunk to keep the block-table + hash-chain in sync
+     * with the physical KV-cache writes.
+     *
+     * Returns true on success; false if:
+     *   - the id is unknown or already drained, OR
+     *   - the scheduler ctor received no allocator (state-machine
+     *     mode — nothing to feed), OR
+     *   - any per-token append hit pool exhaustion. **Partial appends
+     *     are NOT rolled back** — the caller should preempt the
+     *     affected request via `preemptOne()` (or preempt-by-id in a
+     *     future policy) to recover the partial KV.
+     *
+     * Never throws.
+     */
+    bool feedPrefillTokens(std::uint64_t                  id,
+                           std::span<const std::int32_t>  tokens) noexcept;
+
+    /**
+     * Append one decoded token. Called by Phase D after each decode
+     * forward-pass. Same failure semantics as feedPrefillTokens.
+     */
+    bool feedDecodeToken(std::uint64_t id, std::int32_t token) noexcept;
+
+    /**
+     * Read-only accessor to the allocator this scheduler was
+     * constructed with. Returns nullptr when in state-machine-only
+     * mode. Useful for `/v1/system/info.serving` metrics that want
+     * to surface `block_pool_utilization`.
+     */
+    [[nodiscard]] const PagedKvBlockAllocator* allocator() const noexcept {
+        return _allocator;
+    }
 
     // ---- Inspection (feeds `/v1/system/info.serving` Phase E3) -----
 
@@ -248,6 +319,7 @@ private:
 
     ChunkedPrefillScheduler        _prefillScheduler;
     std::size_t                    _maxActiveRequests;
+    PagedKvBlockAllocator*         _allocator{nullptr};
     std::uint64_t                  _nextRequestId{1};
     std::uint64_t                  _nextAdmitSeq{1};
     std::vector<RequestStateData>  _requests;

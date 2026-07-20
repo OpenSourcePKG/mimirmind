@@ -3,15 +3,20 @@
 
 #include "runtime/serving/RequestScheduler.hpp"
 
+#include "runtime/serving/PagedKvBlockAllocator.hpp"
+
 #include <algorithm>
 #include <stdexcept>
+#include <utility>
 
 namespace mimirmind::runtime::serving {
 
-RequestScheduler::RequestScheduler(std::int32_t tokenBudget,
-                                   std::size_t  maxActiveRequests)
+RequestScheduler::RequestScheduler(std::int32_t           tokenBudget,
+                                   std::size_t            maxActiveRequests,
+                                   PagedKvBlockAllocator* allocator)
     : _prefillScheduler(tokenBudget)
     , _maxActiveRequests(maxActiveRequests)
+    , _allocator(allocator)
 {
     if (maxActiveRequests == 0) {
         throw std::invalid_argument{
@@ -34,8 +39,11 @@ std::uint64_t RequestScheduler::admit(std::int32_t promptLength,
     r.tokens_decoded = 0;
     r.max_tokens     = maxTokens;
     r.admit_seq      = _nextAdmitSeq++;
-    _requests.push_back(r);
-    return r.request_id;
+    if (_allocator != nullptr) {
+        r.kv_sequence.emplace(*_allocator);
+    }
+    _requests.push_back(std::move(r));
+    return _requests.back().request_id;
 }
 
 void RequestScheduler::reenqueuePreempted() noexcept {
@@ -46,6 +54,9 @@ void RequestScheduler::reenqueuePreempted() noexcept {
             r.tokens_decoded = 0;
             // admit_seq stays — preserves LIFO ordering so a
             // just-preempted request doesn't leapfrog fresh admissions.
+            // KV blocks were released when the request went to
+            // Preempted (preemptOne calls seq.reset()); no further
+            // work needed here.
         }
     }
 }
@@ -142,6 +153,14 @@ std::uint64_t RequestScheduler::preemptOne() noexcept {
     }
     if (victim == nullptr) return 0;
     victim->state = RequestState::Preempted;
+    // Release KV blocks eagerly so they're available to whoever gets
+    // promoted next iteration. If the request is re-enqueued via
+    // reenqueuePreempted → promoteWaitingToActive, the caller's
+    // Phase-D pass will re-feed the prompt tokens through
+    // feedPrefillTokens which will allocate fresh blocks.
+    if (victim->kv_sequence.has_value()) {
+        victim->kv_sequence->reset();
+    }
     return victim->request_id;
 }
 
@@ -149,7 +168,8 @@ std::vector<std::uint64_t> RequestScheduler::drainCompleted() noexcept {
     std::vector<std::uint64_t> drained;
     drained.reserve(_requests.size());
     // Two-pass: collect ids first (preserves admission order), then
-    // erase-remove in one shot.
+    // erase-remove in one shot. The erased entries' `kv_sequence`
+    // destructors release their blocks back to the pool.
     for (const auto& r : _requests) {
         if (r.state == RequestState::Completed) {
             drained.push_back(r.request_id);
@@ -162,6 +182,33 @@ std::vector<std::uint64_t> RequestScheduler::drainCompleted() noexcept {
                        }),
         _requests.end());
     return drained;
+}
+
+bool RequestScheduler::feedPrefillTokens(
+    std::uint64_t                  id,
+    std::span<const std::int32_t>  tokens) noexcept
+{
+    auto* r = findMut(id);
+    if (r == nullptr) return false;
+    if (!r->kv_sequence.has_value()) return false;
+    for (const auto tok : tokens) {
+        if (!r->kv_sequence->appendToken(tok)) {
+            // Pool exhausted mid-append. Partial state stays as-is —
+            // caller should preempt to recover (documented on the
+            // header).
+            return false;
+        }
+    }
+    return true;
+}
+
+bool RequestScheduler::feedDecodeToken(std::uint64_t id,
+                                       std::int32_t  token) noexcept
+{
+    auto* r = findMut(id);
+    if (r == nullptr) return false;
+    if (!r->kv_sequence.has_value()) return false;
+    return r->kv_sequence->appendToken(token);
 }
 
 std::size_t RequestScheduler::numWaiting() const noexcept {

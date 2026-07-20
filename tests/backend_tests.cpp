@@ -1491,6 +1491,209 @@ TEST(reqSched_tokenBudgetAccessorReflectsCtor) {
     EXPECT_EQ(s.maxActiveRequests(),  std::size_t{8});
 }
 
+// -----------------------------------------------------------------------
+// RequestScheduler ↔ PagedKvBlockAllocator wire-up (Phase A + C bridge)
+// -----------------------------------------------------------------------
+
+TEST(reqSchedKv_stateMachineOnlyModeHasNoAllocator) {
+    // Backwards-compat: existing 2-arg ctor leaves allocator null.
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    EXPECT_TRUE(s.allocator() == nullptr);
+}
+
+TEST(reqSchedKv_ctorStoresAllocatorPointer) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    PagedKvBlockAllocator pool{16, 4};
+    RequestScheduler s{512, 4, &pool};
+    EXPECT_TRUE(s.allocator() == &pool);
+}
+
+TEST(reqSchedKv_admitCreatesEmptySequenceWhenAllocatorPresent) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    PagedKvBlockAllocator pool{16, 4};
+    RequestScheduler s{512, 4, &pool};
+    const auto id = s.admit(10, 5);
+    const auto* r = s.find(id);
+    EXPECT_TRUE(r != nullptr);
+    EXPECT_TRUE(r->kv_sequence.has_value());
+    EXPECT_EQ(r->kv_sequence->numTokens(), std::size_t{0});
+    EXPECT_EQ(r->kv_sequence->numBlocks(), std::size_t{0});
+    // Allocator untouched — sequence is empty until Phase D feeds
+    // tokens through feedPrefillTokens.
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{0});
+}
+
+TEST(reqSchedKv_admitWithoutAllocatorSkipsSequence) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    const auto id = s.admit(10, 5);
+    const auto* r = s.find(id);
+    EXPECT_TRUE(r != nullptr);
+    EXPECT_TRUE(!r->kv_sequence.has_value());
+}
+
+TEST(reqSchedKv_feedPrefillTokensAllocatesBlocks) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    PagedKvBlockAllocator pool{16, 4};   // 16 blocks × 4 tokens = 64 slots
+    RequestScheduler s{512, 4, &pool};
+    const auto id = s.admit(10, 5);
+    // Feed 10 prompt tokens. Block-size 4 → 3 blocks (10/4 = 2 rem 2 → 3).
+    const std::int32_t tokens[10] = {1,2,3,4,5,6,7,8,9,10};
+    EXPECT_TRUE(s.feedPrefillTokens(id, tokens));
+    const auto* r = s.find(id);
+    EXPECT_EQ(r->kv_sequence->numTokens(), std::size_t{10});
+    EXPECT_EQ(r->kv_sequence->numBlocks(), std::size_t{3});
+    EXPECT_EQ(pool.numBlocksUsed(),        std::size_t{3});
+}
+
+TEST(reqSchedKv_feedDecodeTokenAppendsOne) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    PagedKvBlockAllocator pool{16, 4};
+    RequestScheduler s{512, 4, &pool};
+    const auto id = s.admit(10, 5);
+    EXPECT_TRUE(s.feedDecodeToken(id, 42));
+    EXPECT_EQ(s.find(id)->kv_sequence->numTokens(), std::size_t{1});
+    EXPECT_EQ(pool.numBlocksUsed(),                 std::size_t{1});
+}
+
+TEST(reqSchedKv_feedRejectsUnknownId) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    PagedKvBlockAllocator pool{16, 4};
+    RequestScheduler s{512, 4, &pool};
+    const std::int32_t tokens[1] = {7};
+    EXPECT_TRUE(!s.feedPrefillTokens(9999, tokens));
+    EXPECT_TRUE(!s.feedDecodeToken(9999, 7));
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{0});
+}
+
+TEST(reqSchedKv_feedIsNoopWithoutAllocator) {
+    // State-machine mode: feed silently returns false without
+    // touching anything.
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    const auto id = s.admit(10, 5);
+    const std::int32_t tokens[1] = {7};
+    EXPECT_TRUE(!s.feedPrefillTokens(id, tokens));
+    EXPECT_TRUE(!s.feedDecodeToken(id, 7));
+}
+
+TEST(reqSchedKv_preemptOneReleasesBlocksEagerly) {
+    // The whole point of preemption is to free KV pressure. preemptOne
+    // must actually shrink numBlocksUsed, not just flip a state bit.
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    PagedKvBlockAllocator pool{16, 4};
+    RequestScheduler s{512, 4, &pool};
+    const auto a = s.admit(20, 5);
+    const auto b = s.admit(20, 5);
+    (void)a;
+    // Feed b with 12 tokens → 3 blocks
+    const std::int32_t toks[12] = {1,2,3,4,5,6,7,8,9,10,11,12};
+    EXPECT_TRUE(s.feedPrefillTokens(b, toks));
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{3});
+    (void)s.tick();  // promote both to Prefilling so preemptOne can find them
+    const auto victim = s.preemptOne();
+    EXPECT_EQ(victim, b);   // LIFO — b is newest
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{0});  // b's 3 blocks released
+    EXPECT_EQ(s.find(b)->kv_sequence->numTokens(), std::size_t{0});
+    EXPECT_EQ(s.find(b)->kv_sequence->numBlocks(), std::size_t{0});
+}
+
+TEST(reqSchedKv_drainCompletedReleasesBlocks) {
+    // Completion path: caller drains, blocks return to pool via
+    // sequence destructor.
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    PagedKvBlockAllocator pool{16, 4};
+    RequestScheduler s{512, 4, &pool};
+    const auto id = s.admit(5, 1);
+    const std::int32_t toks[5] = {1,2,3,4,5};
+    EXPECT_TRUE(s.feedPrefillTokens(id, toks));   // 2 blocks
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{2});
+    // Push through the state machine to Completed.
+    s.commitProgress(s.tick(), {});             // prefill → Decoding
+    s.commitProgress(s.tick(), std::vector<std::uint8_t>{0});  // decode → Completed (max_tokens=1)
+    const auto drained = s.drainCompleted();
+    EXPECT_EQ(drained.size(), std::size_t{1});
+    EXPECT_EQ(drained.front(), id);
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{0});
+}
+
+TEST(reqSchedKv_schedulerDestructorReleasesAllBlocks) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    PagedKvBlockAllocator pool{16, 4};
+    {
+        RequestScheduler s{512, 4, &pool};
+        const auto a = s.admit(5, 5);
+        const auto b = s.admit(5, 5);
+        const std::int32_t toks[5] = {1,2,3,4,5};
+        EXPECT_TRUE(s.feedPrefillTokens(a, toks));
+        EXPECT_TRUE(s.feedPrefillTokens(b, toks));
+        EXPECT_EQ(pool.numBlocksUsed(), std::size_t{4});
+    }
+    // Scheduler out of scope — all sequences destroyed → blocks freed.
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{0});
+}
+
+TEST(reqSchedKv_prefixSharingInvariantHoldsThroughScheduler) {
+    // End-to-end test of the M-PrefixCache invariant: two sequences
+    // that receive identical first-block tokens through the scheduler
+    // API produce identical block-0 hashes at the allocator level.
+    // Proves that scheduler wire-up doesn't break the property that
+    // PagedKvSequence guarantees.
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    PagedKvBlockAllocator pool{32, 4};
+    RequestScheduler s{512, 4, &pool};
+    const auto a = s.admit(4, 5);
+    const auto b = s.admit(4, 5);
+    const std::int32_t sharedPrefix[4] = {10, 20, 30, 40};
+    EXPECT_TRUE(s.feedPrefillTokens(a, sharedPrefix));
+    EXPECT_TRUE(s.feedPrefillTokens(b, sharedPrefix));
+    const auto blkA = s.find(a)->kv_sequence->blockTable().front();
+    const auto blkB = s.find(b)->kv_sequence->blockTable().front();
+    // Different physical blocks (no dedup at Allocator level yet —
+    // that's M-PrefixCache) but identical HASHES.
+    EXPECT_TRUE(blkA != blkB);
+    EXPECT_EQ(pool.hashOf(blkA), pool.hashOf(blkB));
+    EXPECT_TRUE(pool.hashOf(blkA) != std::uint64_t{0});
+}
+
+TEST(reqSchedKv_preemptedRequestGetsFreshSequenceOnRecompute) {
+    // RECOMPUTE flow with KV: preempt → blocks released → next tick
+    // re-enqueues → Phase D re-feeds prompt tokens → fresh blocks
+    // allocated from the pool (possibly the same physical ids via
+    // LIFO reuse, but a NEW allocation).
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    using ::mimirmind::runtime::serving::RequestState;
+    PagedKvBlockAllocator pool{16, 4};
+    RequestScheduler s{512, 4, &pool};
+    const auto id = s.admit(8, 5);
+    const std::int32_t toks[8] = {1,2,3,4,5,6,7,8};
+    EXPECT_TRUE(s.feedPrefillTokens(id, toks));
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{2});
+    (void)s.tick();
+    (void)s.preemptOne();
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{0});
+    EXPECT_EQ(s.find(id)->state, RequestState::Preempted);
+    // Next tick re-enqueues + promotes.
+    (void)s.tick();
+    EXPECT_EQ(s.find(id)->state,          RequestState::Prefilling);
+    EXPECT_EQ(s.find(id)->tokens_pending, std::int32_t{8});   // fresh
+    // Sequence is empty — Phase D feeds prompt tokens again.
+    EXPECT_EQ(s.find(id)->kv_sequence->numTokens(), std::size_t{0});
+    EXPECT_TRUE(s.feedPrefillTokens(id, toks));
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{2});
+}
+
 int main() {
     return mm::test::run();
 }
