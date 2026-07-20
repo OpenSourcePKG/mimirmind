@@ -422,6 +422,24 @@ DiagnosticsSettings parseDiagnostics(std::string_view      path,
     return d;
 }
 
+ServingSettings parseServing(std::string_view      path,
+                             const nlohmann::json& j) {
+    checkKnownKeys(path, "serving", j,
+                   {"enableBatching", "minBatchForEnable"});
+    ServingSettings s{};
+    s.enableBatching = parseTriState(path, "serving", j, "enableBatching",
+                                     TriState::Auto);
+    if (const auto v = readOpt<std::size_t>(path, "serving", j,
+                                            "minBatchForEnable"); v) {
+        if (*v < 1 || *v > 1024) {
+            fail(path, "serving.minBatchForEnable must be in 1..1024 "
+                       "(got " + std::to_string(*v) + ")");
+        }
+        s.minBatchForEnable = *v;
+    }
+    return s;
+}
+
 } // namespace
 
 // ---- merge / accessors ------------------------------------------------------
@@ -492,7 +510,7 @@ Config loadConfig(std::string_view path) {
 
     checkKnownKeys(path, "<root>", j,
                    {"defaultModel", "models", "server", "runtime", "features",
-                    "speculative", "governor", "diagnostics"});
+                    "speculative", "governor", "diagnostics", "serving"});
 
     Config cfg{};
 
@@ -552,6 +570,7 @@ Config loadConfig(std::string_view path) {
     if (j.contains("speculative"))  cfg.speculative  = parseSpeculative(path, j["speculative"]);
     if (j.contains("governor"))     cfg.governor     = parseGovernor(path, j["governor"]);
     if (j.contains("diagnostics"))  cfg.diagnostics  = parseDiagnostics(path, j["diagnostics"]);
+    if (j.contains("serving"))      cfg.serving      = parseServing(path, j["serving"]);
 
     // Cross-section validation: speculative model ids must resolve.
     // `target` is required for either drafter; `draft` is only required

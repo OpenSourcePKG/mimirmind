@@ -423,6 +423,103 @@ TEST(llmConfig_kvBytesPerToken_emptyModelReturnsZero) {
     EXPECT_EQ(cfg.kvBytesPerToken(2), std::size_t{0});
 }
 
+// -----------------------------------------------------------------------
+// ServingSettings — config-parser round-trip
+// -----------------------------------------------------------------------
+
+#include "core/config/Config.hpp"
+
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+namespace {
+
+// Write JSON to a fresh temp path, return the path. Caller unlinks.
+std::string writeTempConfig(const std::string& body) {
+    const auto dir  = std::filesystem::temp_directory_path();
+    const auto path = dir / ("mm-cfg-test-"
+                             + std::to_string(std::rand()) + ".json");
+    std::ofstream out{path};
+    out << body;
+    out.close();
+    return path.string();
+}
+
+} // namespace
+
+TEST(serving_defaults_areAutoAndEight) {
+    using ::mimirmind::core::config::ServingSettings;
+    using ::mimirmind::core::config::TriState;
+    ServingSettings s{};
+    EXPECT_EQ(mm::test::streamable(s.enableBatching),
+              mm::test::streamable(TriState::Auto));
+    EXPECT_EQ(s.minBatchForEnable, std::size_t{8});
+}
+
+TEST(serving_configJson_defaultsWhenMissing) {
+    // Config without a `serving` block leaves defaults in place.
+    const auto path = writeTempConfig(R"({
+        "models": [{"id":"primary","path":"/models/x.gguf"}]
+    })");
+    const auto cfg = ::mimirmind::core::config::loadConfig(path);
+    std::filesystem::remove(path);
+    using ::mimirmind::core::config::TriState;
+    EXPECT_EQ(mm::test::streamable(cfg.serving.enableBatching),
+              mm::test::streamable(TriState::Auto));
+    EXPECT_EQ(cfg.serving.minBatchForEnable, std::size_t{8});
+}
+
+TEST(serving_configJson_parsesExplicitValues) {
+    const auto path = writeTempConfig(R"({
+        "models": [{"id":"primary","path":"/models/x.gguf"}],
+        "serving": {
+            "enableBatching": "force",
+            "minBatchForEnable": 16
+        }
+    })");
+    const auto cfg = ::mimirmind::core::config::loadConfig(path);
+    std::filesystem::remove(path);
+    using ::mimirmind::core::config::TriState;
+    EXPECT_EQ(mm::test::streamable(cfg.serving.enableBatching),
+              mm::test::streamable(TriState::Force));
+    EXPECT_EQ(cfg.serving.minBatchForEnable, std::size_t{16});
+}
+
+TEST(serving_configJson_rejectsUnknownKey) {
+    const auto path = writeTempConfig(R"({
+        "models": [{"id":"primary","path":"/models/x.gguf"}],
+        "serving": {
+            "enableBatching": "auto",
+            "banana": 42
+        }
+    })");
+    bool threw = false;
+    try {
+        (void)::mimirmind::core::config::loadConfig(path);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    std::filesystem::remove(path);
+    EXPECT_TRUE(threw);
+}
+
+TEST(serving_configJson_rejectsOutOfRangeMinBatch) {
+    const auto path = writeTempConfig(R"({
+        "models": [{"id":"primary","path":"/models/x.gguf"}],
+        "serving": { "minBatchForEnable": 0 }
+    })");
+    bool threw = false;
+    try {
+        (void)::mimirmind::core::config::loadConfig(path);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    std::filesystem::remove(path);
+    EXPECT_TRUE(threw);
+}
+
 int main() {
     return mm::test::run();
 }

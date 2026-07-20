@@ -187,6 +187,33 @@ struct DiagnosticsSettings {
 };
 
 /**
+ * Serving-class knobs for Bragi (Mimir-2.0). Controls whether
+ * PagedAttention + Continuous Batching (M-Cuda.Batch) is activated at
+ * startup, gated by the HW-capacity probe (M-Startup.CapacityProbe).
+ *
+ * Server-side decision only — no user-per-request toggle
+ * (`feedback_no_user_toggles`). Rate-limits, fairness, adapter-switch
+ * are Bragi follow-ups, not exposed here.
+ */
+struct ServingSettings {
+    // How to decide whether PagedAttention + Continuous Batching runs
+    // at this instance:
+    //   Auto    — HW-capacity probe decides (sustainableBatch >= minBatchForEnable)
+    //   Force   — always enable, warn on-startup if probe below minBatch
+    //   Disable — never enable, keep single-session semantics
+    // Auto is the default; single-session mimirmind consumers see no
+    // behaviour change unless they explicitly opt in.
+    TriState        enableBatching{TriState::Auto};
+
+    // When enableBatching=Auto, the minimum sustainable batch (rounded
+    // to a scheduler step by BatchCapacityProbe::roundToSchedulerStep)
+    // at which serving-class features light up. Below this the
+    // instance stays single-session even on capable HW — reflects
+    // the "batching-overhead pays off around B=8" empirical threshold.
+    std::size_t     minBatchForEnable{8};
+};
+
+/**
  * Root config, loaded once from `config.json` at startup.
  *
  * Precedence: CLI flags > config.json > compiled defaults.
@@ -204,6 +231,7 @@ struct Config {
     SpeculativeSettings        speculative{};
     GovernorSettings           governor{};
     DiagnosticsSettings        diagnostics{};
+    ServingSettings            serving{};
 
     // Resolve the effective runtime for a given model id: top-level defaults,
     // then per-model overrides applied.
