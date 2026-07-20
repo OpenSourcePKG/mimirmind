@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
+#pragma once
+
+#include "runtime/serving/ChunkedPrefillScheduler.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <vector>
+
+namespace mimirmind::runtime::serving {
+
+/**
+ * Per-request lifecycle state — Sub-Step C2 of M-Cuda.Batch.
+ *
+ * Transitions:
+ *   Waiting  → Prefilling  (admitted into active set by tick())
+ *   Prefilling → Decoding  (tokens_pending reaches 0)
+ *   Decoding → Completed   (EOS reached OR tokens_decoded == max_tokens)
+ *   Prefilling → Preempted (memory pressure — preemptOne() called)
+ *   Decoding → Preempted   (memory pressure — preemptOne() called)
+ *   Preempted → Waiting    (re-enqueued for RECOMPUTE — automatic)
+ *
+ * Completed is a terminal state until the caller explicitly removes
+ * the entry via `drainCompleted()`.
+ */
+enum class RequestState : std::uint8_t {
+    Waiting    = 0,
+    Prefilling = 1,
+    Decoding   = 2,
+    Completed  = 3,
+    Preempted  = 4,
+};
+
+/**
+ * Full lifecycle state owned by `RequestScheduler`. RequestSlice
+ * (from ChunkedPrefillScheduler) is a stripped-down snapshot the
+ * scheduling algorithm consumes; this struct carries the full
+ * picture the event loop needs.
+ */
+struct RequestStateData {
+    std::uint64_t request_id{0};
+    RequestState  state{RequestState::Waiting};
+    std::int32_t  prompt_length{0};   // total prompt tokens (frozen at admit)
+    std::int32_t  tokens_pending{0};  // prompt tokens NOT yet prefilled
+    std::int32_t  tokens_decoded{0};  // output tokens generated so far
+    std::int32_t  max_tokens{0};      // decode cap from caller
+
+    /**
+     * Monotonic admission counter — used by preemption to pick LIFO
+     * targets (most-recently admitted has least invested KV, cheapest
+     * to recompute). Assigned by admit() in the same order as
+     * request_id.
+     */
+    std::uint64_t admit_seq{0};
+};
+
+/**
+ * Request lifecycle manager for the M-Cuda.Batch serving loop —
+ * Sub-Steps C1 (event-loop class) + C2 (state machine).
+ *
+ * ---- Loop shape --------------------------------------------------
+ *
+ * Every event-loop iteration is a three-step dance:
+ *
+ *   1. `tick()`             — admit queued requests up to maxActive,
+ *                             build the batch schedule via
+ *                             ChunkedPrefillScheduler.
+ *   2. Caller executes it   — Phase D's InferenceEngine::generateServing
+ *                             launches PagedAttentionV1/V2 + the
+ *                             batched Cat-A kernels, collects new
+ *                             tokens + EOS flags.
+ *   3. `commitProgress()`   — feed results back, advance state
+ *                             (Prefilling → Decoding when pending=0,
+ *                             Decoding → Completed on EOS/max_tokens).
+ *
+ * `preemptOne()` is called between (1) and (2) when memory pressure
+ * requires shrinking the active set — the returned request-id
+ * transitions to Preempted, its KV blocks get released by the caller
+ * (Sub-Step C5 policy, out of scope for the skeleton), then the
+ * scheduler automatically re-enqueues it as Waiting for RECOMPUTE on
+ * the next tick.
+ *
+ * ---- Skeleton scope ---------------------------------------------
+ *
+ * The skeleton owns only the **state machine** — RequestState
+ * transitions + request-registry + integration with C3. It does NOT:
+ *   - own PagedKvSequence instances (follow-up commit — bind to
+ *     Allocator ref, create per-request Sequence on admission,
+ *     release on Completed/Preempted)
+ *   - launch kernels (Phase D)
+ *   - talk to HTTP (Phase D)
+ *   - implement C5 preemption *policy* — only exposes preemptOne()
+ *     as the mechanism the eventual policy will call
+ *
+ * ---- Threading --------------------------------------------------
+ *
+ * NOT thread-safe. Same discipline as PagedKvBlockAllocator /
+ * PagedAttentionV1/V2: the serving-loop thread owns the instance and
+ * serialises all mutations. Cross-thread concurrent calls are UB.
+ */
+class RequestScheduler {
+public:
+    /**
+     * `tokenBudget` forwards to the owned ChunkedPrefillScheduler.
+     * `maxActiveRequests` bounds the concurrent (Prefilling + Decoding)
+     * count — admissions beyond this cap stay in Waiting until an
+     * existing request Completes or Preempts.
+     *
+     * Both parameters MUST be > 0; ctor throws `std::invalid_argument`
+     * otherwise.
+     */
+    RequestScheduler(std::int32_t tokenBudget,
+                     std::size_t  maxActiveRequests);
+
+    RequestScheduler(const RequestScheduler&)            = delete;
+    RequestScheduler& operator=(const RequestScheduler&) = delete;
+    RequestScheduler(RequestScheduler&&) noexcept        = default;
+    RequestScheduler& operator=(RequestScheduler&&) noexcept = default;
+
+    // ---- Admission --------------------------------------------------
+
+    /**
+     * Enqueue a new request. Returns its freshly-assigned id
+     * (monotonic, starts at 1 — 0 is the "no request" sentinel used
+     * by `preemptOne()`). Never throws.
+     *
+     * `promptLength` and `maxTokens` MUST be > 0; the method returns
+     * 0 without side-effects on invalid input (defensive; callers
+     * should validate at the HTTP boundary).
+     */
+    [[nodiscard]] std::uint64_t admit(std::int32_t promptLength,
+                                      std::int32_t maxTokens) noexcept;
+
+    // ---- Event-loop step -------------------------------------------
+
+    /**
+     * Advance any Waiting → Prefilling under the maxActive cap and
+     * build the batch schedule for this iteration. Caller executes
+     * the returned schedule then calls `commitProgress()`.
+     */
+    [[nodiscard]] BatchSchedule tick() noexcept;
+
+    /**
+     * Report execution results to advance state. `executed` is the
+     * schedule handed out by `tick()`; `reachedEos` is a parallel
+     * inline-bitset to `executed.decodes` (same length + same order)
+     * where non-zero means the decode produced an EOS token.
+     *
+     * We deliberately take `std::span<const std::uint8_t>` rather than
+     * `std::span<const bool>` — `std::vector<bool>` is the C++ bitset
+     * specialisation and cannot round-trip through a bool-span. Using
+     * uint8_t lets callers pick whatever container fits.
+     *
+     * State advances per assignment:
+     *   PrefillAssignment{r, chunk} →
+     *       r.tokens_pending -= chunk; if 0 → Prefilling → Decoding
+     *   DecodeAssignment{r} + reachedEos[i]==0 →
+     *       r.tokens_decoded += 1; if == max_tokens → Decoding → Completed
+     *   DecodeAssignment{r} + reachedEos[i]!=0 →
+     *       Decoding → Completed (regardless of max_tokens)
+     *
+     * `reachedEos.size()` MUST equal `executed.decodes.size()` — the
+     * caller is responsible for that invariant. Mismatched sizes are
+     * treated as no-EOS (defensive) so a caller bug degrades to
+     * "no requests complete this iter" rather than corrupting state.
+     */
+    void commitProgress(const BatchSchedule&           executed,
+                        std::span<const std::uint8_t>  reachedEos) noexcept;
+
+    // ---- Preemption (mechanism only — C5 policy is separate) -------
+
+    /**
+     * Pick the newest active request (LIFO — most recent admit_seq
+     * among Prefilling+Decoding) and transition it to Preempted.
+     * Returns the request-id, or 0 if no active requests exist.
+     *
+     * The Preempted entry does NOT auto-re-enqueue synchronously;
+     * that happens at the top of the next `tick()`. This split
+     * keeps the caller in control of KV-block release ordering
+     * (release blocks THEN tick, so freed blocks are available for
+     * the newly-promoted requests in the same iteration).
+     */
+    std::uint64_t preemptOne() noexcept;
+
+    // ---- Cleanup ----------------------------------------------------
+
+    /**
+     * Remove all Completed entries and return their ids. Caller uses
+     * this to reap the request-registry after the HTTP response has
+     * been sent. Ids are returned in admission order.
+     */
+    std::vector<std::uint64_t> drainCompleted() noexcept;
+
+    // ---- Inspection (feeds `/v1/system/info.serving` Phase E3) -----
+
+    [[nodiscard]] std::size_t numWaiting()    const noexcept;
+    [[nodiscard]] std::size_t numActive()     const noexcept;  // Prefilling + Decoding
+    [[nodiscard]] std::size_t numCompleted()  const noexcept;
+    [[nodiscard]] std::size_t numPreempted()  const noexcept;
+
+    [[nodiscard]] std::size_t maxActiveRequests() const noexcept {
+        return _maxActiveRequests;
+    }
+    [[nodiscard]] std::int32_t tokenBudget()      const noexcept {
+        return _prefillScheduler.tokenBudget();
+    }
+
+    /**
+     * Read-only lookup by id. Returns `nullptr` if the id is unknown
+     * (never admitted, or already drained). Useful for the future
+     * Phase D wire-up: after `tick()`, the InferenceEngine needs to
+     * know each active request's tokens_decoded / tokens_pending to
+     * source query tokens from its per-request buffer.
+     */
+    [[nodiscard]] const RequestStateData* find(std::uint64_t id) const noexcept;
+
+private:
+    /**
+     * Build a RequestSlice snapshot of every active (Prefilling +
+     * Decoding) request for the ChunkedPrefillScheduler.
+     */
+    [[nodiscard]] std::vector<RequestSlice> snapshotActiveSlices() const;
+
+    /**
+     * Re-enqueue Preempted entries as Waiting. Called at the top of
+     * every `tick()` so a request preempted in iteration N is
+     * eligible for re-admission (and RECOMPUTE) in iteration N+1.
+     */
+    void reenqueuePreempted() noexcept;
+
+    /**
+     * Promote Waiting requests to Prefilling until either the
+     * Waiting queue is empty or the active count reaches
+     * `maxActiveRequests`.
+     */
+    void promoteWaitingToActive() noexcept;
+
+    /**
+     * Locate a request by id and return a mutable pointer or
+     * nullptr. O(N) linear scan — fine for the maxActive <= 64
+     * bound.
+     */
+    RequestStateData* findMut(std::uint64_t id) noexcept;
+
+    ChunkedPrefillScheduler        _prefillScheduler;
+    std::size_t                    _maxActiveRequests;
+    std::uint64_t                  _nextRequestId{1};
+    std::uint64_t                  _nextAdmitSeq{1};
+    std::vector<RequestStateData>  _requests;
+};
+
+} // namespace mimirmind::runtime::serving

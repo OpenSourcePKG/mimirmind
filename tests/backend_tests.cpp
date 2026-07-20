@@ -1168,6 +1168,329 @@ TEST(chunkedSched_repeatCallsAreIdempotentAndStateless) {
     EXPECT_EQ(a.prefills[0].chunk_size, b.prefills[0].chunk_size);
 }
 
+// -----------------------------------------------------------------------
+// RequestScheduler — Sub-Steps C1+C2 (M-Cuda.Batch Phase C)
+// -----------------------------------------------------------------------
+
+#include "runtime/serving/RequestScheduler.hpp"
+
+TEST(reqSched_ctorRejectsZeroMaxActive) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    bool threw = false;
+    try {
+        RequestScheduler s{512, 0};
+        (void)s;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
+}
+
+TEST(reqSched_ctorPropagatesChunkedBudgetGuard) {
+    // tokenBudget=0 must be rejected — the guard lives in
+    // ChunkedPrefillScheduler and propagates through RequestScheduler.
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    bool threw = false;
+    try {
+        RequestScheduler s{0, 4};
+        (void)s;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
+}
+
+TEST(reqSched_admitAssignsMonotonicIds) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    const auto a = s.admit(100, 32);
+    const auto b = s.admit(200, 64);
+    const auto c = s.admit(50,  16);
+    EXPECT_EQ(a, std::uint64_t{1});
+    EXPECT_EQ(b, std::uint64_t{2});
+    EXPECT_EQ(c, std::uint64_t{3});
+}
+
+TEST(reqSched_admitRejectsInvalidPromptLength) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    EXPECT_EQ(s.admit(0, 32),   std::uint64_t{0});
+    EXPECT_EQ(s.admit(-1, 32),  std::uint64_t{0});
+    // Registry stays clean after rejected admits.
+    EXPECT_EQ(s.numWaiting(), std::size_t{0});
+}
+
+TEST(reqSched_admitRejectsInvalidMaxTokens) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    EXPECT_EQ(s.admit(100, 0),   std::uint64_t{0});
+    EXPECT_EQ(s.admit(100, -5),  std::uint64_t{0});
+    EXPECT_EQ(s.numWaiting(), std::size_t{0});
+}
+
+TEST(reqSched_admittedRequestStartsWaiting) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    using ::mimirmind::runtime::serving::RequestState;
+    RequestScheduler s{512, 4};
+    const auto id = s.admit(100, 32);
+    const auto* r = s.find(id);
+    EXPECT_TRUE(r != nullptr);
+    EXPECT_EQ(r->state,          RequestState::Waiting);
+    EXPECT_EQ(r->prompt_length,  std::int32_t{100});
+    EXPECT_EQ(r->tokens_pending, std::int32_t{100});
+    EXPECT_EQ(r->tokens_decoded, std::int32_t{0});
+    EXPECT_EQ(r->max_tokens,     std::int32_t{32});
+}
+
+TEST(reqSched_tickPromotesWaitingToPrefilling) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    using ::mimirmind::runtime::serving::RequestState;
+    RequestScheduler s{512, 4};
+    const auto id = s.admit(100, 32);
+    (void)s.tick();
+    const auto* r = s.find(id);
+    EXPECT_TRUE(r != nullptr);
+    EXPECT_EQ(r->state, RequestState::Prefilling);
+    EXPECT_EQ(s.numActive(),  std::size_t{1});
+    EXPECT_EQ(s.numWaiting(), std::size_t{0});
+}
+
+TEST(reqSched_tickRespectsMaxActiveCap) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    using ::mimirmind::runtime::serving::RequestState;
+    RequestScheduler s{512, 2};
+    (void)s.admit(100, 32);
+    (void)s.admit(100, 32);
+    (void)s.admit(100, 32);   // this one stays Waiting
+    (void)s.tick();
+    EXPECT_EQ(s.numActive(),  std::size_t{2});
+    EXPECT_EQ(s.numWaiting(), std::size_t{1});
+}
+
+TEST(reqSched_tickProducesScheduleForActiveRequests) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    (void)s.admit(100, 32);
+    const auto sched = s.tick();
+    EXPECT_EQ(sched.prefills.size(),         std::size_t{1});
+    EXPECT_EQ(sched.prefills.front().chunk_size, std::int32_t{100});
+    EXPECT_EQ(sched.decodes.size(),          std::size_t{0});
+    EXPECT_EQ(sched.total_tokens_scheduled,  std::int32_t{100});
+}
+
+TEST(reqSched_commitPrefillAdvancesTokensPending) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    using ::mimirmind::runtime::serving::RequestState;
+    // Long prompt (> budget) — needs multiple prefill iterations.
+    RequestScheduler s{100, 4};
+    const auto id = s.admit(250, 32);
+    // Iter 1: chunk 100, pending 250 → 150, still Prefilling
+    const auto sched1 = s.tick();
+    EXPECT_EQ(sched1.prefills.front().chunk_size, std::int32_t{100});
+    s.commitProgress(sched1, {});
+    {
+        const auto* r = s.find(id);
+        EXPECT_EQ(r->tokens_pending, std::int32_t{150});
+        EXPECT_EQ(r->state,          RequestState::Prefilling);
+    }
+    // Iter 2: chunk 100, pending 150 → 50
+    const auto sched2 = s.tick();
+    EXPECT_EQ(sched2.prefills.front().chunk_size, std::int32_t{100});
+    s.commitProgress(sched2, {});
+    {
+        const auto* r = s.find(id);
+        EXPECT_EQ(r->tokens_pending, std::int32_t{50});
+        EXPECT_EQ(r->state,          RequestState::Prefilling);
+    }
+    // Iter 3: chunk 50, pending 50 → 0, promote to Decoding
+    const auto sched3 = s.tick();
+    EXPECT_EQ(sched3.prefills.front().chunk_size, std::int32_t{50});
+    s.commitProgress(sched3, {});
+    {
+        const auto* r = s.find(id);
+        EXPECT_EQ(r->tokens_pending, std::int32_t{0});
+        EXPECT_EQ(r->state,          RequestState::Decoding);
+    }
+}
+
+TEST(reqSched_commitDecodeAdvancesTokensDecoded) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    using ::mimirmind::runtime::serving::RequestState;
+    RequestScheduler s{512, 4};
+    const auto id = s.admit(10, 5);
+    // Prefill in one shot.
+    const auto sched0 = s.tick();
+    s.commitProgress(sched0, {});
+    // Now Decoding — three decode iterations without EOS.
+    for (int i = 1; i <= 3; ++i) {
+        const auto sched = s.tick();
+        EXPECT_EQ(sched.decodes.size(), std::size_t{1});
+        const std::vector<std::uint8_t> eos(1, 0);
+        s.commitProgress(sched, eos);
+        const auto* r = s.find(id);
+        EXPECT_EQ(r->tokens_decoded, std::int32_t{i});
+        EXPECT_EQ(r->state,          RequestState::Decoding);
+    }
+}
+
+TEST(reqSched_commitDecodePromotesOnEos) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    using ::mimirmind::runtime::serving::RequestState;
+    RequestScheduler s{512, 4};
+    const auto id = s.admit(10, 100);
+    s.commitProgress(s.tick(), {});  // prefill
+    const auto sched = s.tick();
+    const std::vector<std::uint8_t> eos(1, 1);
+    s.commitProgress(sched, eos);
+    EXPECT_EQ(s.find(id)->state, RequestState::Completed);
+}
+
+TEST(reqSched_commitDecodePromotesOnMaxTokens) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    using ::mimirmind::runtime::serving::RequestState;
+    RequestScheduler s{512, 4};
+    const auto id = s.admit(10, 2);
+    s.commitProgress(s.tick(), {});  // prefill → Decoding
+    // Decode 1
+    s.commitProgress(s.tick(), std::vector<std::uint8_t>{0});
+    EXPECT_EQ(s.find(id)->state, RequestState::Decoding);
+    // Decode 2 → hits max_tokens
+    s.commitProgress(s.tick(), std::vector<std::uint8_t>{0});
+    EXPECT_EQ(s.find(id)->state,          RequestState::Completed);
+    EXPECT_EQ(s.find(id)->tokens_decoded, std::int32_t{2});
+}
+
+TEST(reqSched_preemptOneReturnsZeroWhenNoActive) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    EXPECT_EQ(s.preemptOne(), std::uint64_t{0});
+    // Even with Waiting requests, nothing active to preempt.
+    (void)s.admit(100, 32);
+    EXPECT_EQ(s.preemptOne(), std::uint64_t{0});
+}
+
+TEST(reqSched_preemptOnePicksLifo) {
+    // Newest active request has the lowest KV investment → cheapest
+    // to RECOMPUTE. Preemption should pick it, not the oldest.
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    using ::mimirmind::runtime::serving::RequestState;
+    RequestScheduler s{512, 4};
+    const auto a = s.admit(100, 32);
+    const auto b = s.admit(100, 32);
+    const auto c = s.admit(100, 32);
+    (void)s.tick();  // all three become Prefilling
+    const auto victim = s.preemptOne();
+    EXPECT_EQ(victim, c);
+    EXPECT_EQ(s.find(a)->state, RequestState::Prefilling);
+    EXPECT_EQ(s.find(b)->state, RequestState::Prefilling);
+    EXPECT_EQ(s.find(c)->state, RequestState::Preempted);
+    EXPECT_EQ(s.numPreempted(), std::size_t{1});
+    EXPECT_EQ(s.numActive(),    std::size_t{2});
+}
+
+TEST(reqSched_preemptedRequestRestartsFromWaitingOnNextTick) {
+    // RECOMPUTE flow: preempted → next tick moves to Waiting →
+    // (if room) promoted to Prefilling with FRESH tokens_pending =
+    // prompt_length (KV is gone, must recompute).
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    using ::mimirmind::runtime::serving::RequestState;
+    RequestScheduler s{50, 2};
+    const auto a = s.admit(30, 32);
+    const auto b = s.admit(30, 32);
+    // Iter 1: both promoted, budget=50 → a gets 30, b gets 20
+    const auto sched1 = s.tick();
+    EXPECT_EQ(sched1.prefills.size(), std::size_t{2});
+    s.commitProgress(sched1, {});
+    // b has 10 pending, a is now Decoding? no, a's pending was 30 → 0
+    // wait, chunk=30 for a, chunk=20 for b (50 budget, 30 first, 20 remainder)
+    // → a.tokens_pending=0 → Decoding, b.tokens_pending=10, still Prefilling
+    EXPECT_EQ(s.find(a)->state,          RequestState::Decoding);
+    EXPECT_EQ(s.find(b)->state,          RequestState::Prefilling);
+    EXPECT_EQ(s.find(b)->tokens_pending, std::int32_t{10});
+    // Preempt b (only one non-Completed active LIFO candidate).
+    const auto victim = s.preemptOne();
+    EXPECT_EQ(victim, b);
+    EXPECT_EQ(s.find(b)->state, RequestState::Preempted);
+    // Next tick: b re-enqueues to Waiting, then promotes → Prefilling
+    // with FRESH tokens_pending = prompt_length (30, not 10 —
+    // RECOMPUTE means KV is gone).
+    (void)s.tick();
+    EXPECT_EQ(s.find(b)->state,          RequestState::Prefilling);
+    EXPECT_EQ(s.find(b)->tokens_pending, std::int32_t{30});
+    EXPECT_EQ(s.find(b)->tokens_decoded, std::int32_t{0});
+}
+
+TEST(reqSched_drainCompletedRemovesAndReturnsIds) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{512, 4};
+    const auto a = s.admit(5, 1);
+    const auto b = s.admit(5, 1);
+    // Prefill both
+    s.commitProgress(s.tick(), {});
+    // Decode both — both complete on 1st token (max_tokens=1)
+    const auto sched = s.tick();
+    EXPECT_EQ(sched.decodes.size(), std::size_t{2});
+    const std::vector<std::uint8_t> eos{0, 0};
+    s.commitProgress(sched, eos);
+    EXPECT_EQ(s.numCompleted(), std::size_t{2});
+    const auto drained = s.drainCompleted();
+    EXPECT_EQ(drained.size(),   std::size_t{2});
+    EXPECT_EQ(drained[0],       a);
+    EXPECT_EQ(drained[1],       b);
+    EXPECT_EQ(s.numCompleted(), std::size_t{0});
+    EXPECT_TRUE(s.find(a) == nullptr);
+    EXPECT_TRUE(s.find(b) == nullptr);
+}
+
+TEST(reqSched_mismatchedEosSizeIsSafe) {
+    // Defensive: caller passes wrong-size reachedEos. Must not
+    // corrupt state — treat as all-false (no EOS this iteration).
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    using ::mimirmind::runtime::serving::RequestState;
+    RequestScheduler s{512, 4};
+    const auto id = s.admit(5, 100);
+    s.commitProgress(s.tick(), {});  // prefill
+    const auto sched = s.tick();
+    // Wrong-size eos vector (empty when 1 decode assigned).
+    s.commitProgress(sched, {});
+    // State advanced (tokens_decoded++), but no EOS triggered — no
+    // spurious Completed.
+    EXPECT_EQ(s.find(id)->tokens_decoded, std::int32_t{1});
+    EXPECT_EQ(s.find(id)->state,          RequestState::Decoding);
+}
+
+TEST(reqSched_inspectionCountsPartitionsCorrectly) {
+    // Post-state: 1 Waiting + 1 Prefilling + 1 Decoding + 1 Completed.
+    // Counts must sum to storage size.
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{100, 2};
+    (void)s.admit(50, 1);        // will finish
+    (void)s.admit(200, 32);      // needs 2 prefill iters, stays Prefilling
+    (void)s.admit(10, 32);       // waits (maxActive=2)
+    // Iter 1: promote first two, chunk a=50, b=50 → a completes prefill
+    // → Decoding; b tokens_pending = 150 still Prefilling.
+    const auto sched1 = s.tick();
+    s.commitProgress(sched1, {});
+    // Iter 2: a decodes 1 token → Completed (max_tokens=1);
+    // b prefills another chunk of 100 → pending=50, still Prefilling.
+    const auto sched2 = s.tick();
+    const std::vector<std::uint8_t> eos(sched2.decodes.size(), 0);
+    s.commitProgress(sched2, eos);
+    // Now: a Completed, b Prefilling, c Waiting (still can't promote —
+    // b holds one of the two active slots).
+    EXPECT_EQ(s.numCompleted(), std::size_t{1});
+    EXPECT_EQ(s.numActive(),    std::size_t{1});
+    EXPECT_EQ(s.numWaiting(),   std::size_t{1});
+    EXPECT_EQ(s.numPreempted(), std::size_t{0});
+}
+
+TEST(reqSched_tokenBudgetAccessorReflectsCtor) {
+    using ::mimirmind::runtime::serving::RequestScheduler;
+    RequestScheduler s{256, 8};
+    EXPECT_EQ(s.tokenBudget(),        std::int32_t{256});
+    EXPECT_EQ(s.maxActiveRequests(),  std::size_t{8});
+}
+
 int main() {
     return mm::test::run();
 }

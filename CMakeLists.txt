@@ -345,6 +345,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/serving/PagedKvBlockAllocator.cpp
     src/runtime/serving/PagedKvSequence.cpp
     src/runtime/serving/ChunkedPrefillScheduler.cpp
+    src/runtime/serving/RequestScheduler.cpp
 )
 
 target_include_directories(mimirmind_core_common PUBLIC src)
