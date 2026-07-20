@@ -588,6 +588,132 @@ if(MIMIRMIND_ENABLE_HIP)
     add_custom_target(hip_kernels ALL DEPENDS ${HIP_HSACO_FILES})
 endif()
 
+# ---- CUDA kernel code objects (.cu -> .ptx via nvcc --ptx) -----------------
+#
+# Parallel to the ocloc-based L0 spv_kernels custom target and the
+# hipcc-based hip_kernels custom target. Each .cu source lands as one
+# .ptx file in ${CMAKE_BINARY_DIR}/ptx/ which CudaModule loads at
+# runtime via cuModuleLoadData.
+#
+# `-arch=compute_80` is the PTX baseline — Ampere. Chosen over
+# compute_70 (Volta) because DGX Spark SM 12.1 is Ampere-programmer-
+# model-near per Synaipse `reference_dgx_spark_engine_fit.md`;
+# compute_80 unlocks cp.async, ldmatrix, and bf16 tensor cores at
+# native perf. PTX-JIT forward-compat carries it to Blackwell client
+# (sm_120) without a fixed sm hard-code. Override with
+#   -DCMAKE_CUDA_ARCHITECTURES="90-real;120-virtual"
+# for a stable Spark baseline once we have one.
+
+if(MIMIRMIND_ENABLE_CUDA)
+    set(CUDA_KERNEL_SOURCES
+        kernels_cuda/cuda_probe_kernel.cu
+        kernels_cuda/add_bias.cu
+        kernels_cuda/add_residual.cu
+        kernels_cuda/add_rmsnorm.cu
+        kernels_cuda/attention.cu
+        kernels_cuda/attention_flash_merge.cu
+        kernels_cuda/attention_flash_partial.cu
+        kernels_cuda/attention_flash_partial_fp16.cu
+        kernels_cuda/attention_flash_partial_q8_0.cu
+        kernels_cuda/attention_fp16.cu
+        kernels_cuda/attention_prefill_flash.cu
+        kernels_cuda/attention_prefill_flash_fp16.cu
+        kernels_cuda/attention_prefill_flash_q8_0.cu
+        kernels_cuda/attention_prefill_flash_q8_0_gqa.cu
+        kernels_cuda/attention_q8_0.cu
+        kernels_cuda/kv_quant_commit_q8_0.cu
+        kernels_cuda/matmul_q8_0_gemm.cu
+        kernels_cuda/matmul_q8_0_gemm_v2.cu
+        kernels_cuda/matmul_f32_vec.cu
+        kernels_cuda/matmul_q3k_vec.cu
+        kernels_cuda/matmul_q4k_vec.cu
+        kernels_cuda/matmul_q5_0_vec.cu
+        kernels_cuda/matmul_q5k_vec.cu
+        kernels_cuda/matmul_q6k_vec.cu
+        kernels_cuda/matmul_q8_0_vec.cu
+        kernels_cuda/matmul_q8_0_vec_dp4a.cu
+        kernels_cuda/matmul_q8_0_vec_reorder.cu
+        kernels_cuda/moe_down_fused_k_q6k.cu
+        kernels_cuda/moe_down_fused_k_q8_0.cu
+        kernels_cuda/mul_scalar.cu
+        kernels_cuda/qkv_split.cu
+        kernels_cuda/qkv_split_fp16.cu
+        kernels_cuda/rmsnorm.cu
+        kernels_cuda/rmsnorm_gemma.cu
+        kernels_cuda/rmsnorm_no_weight.cu
+        kernels_cuda/rmsnorm_qkv.cu
+        kernels_cuda/rmsnorm_qkv_fp16.cu
+        kernels_cuda/rope_inplace.cu
+        kernels_cuda/rope_inplace_fp16.cu
+        kernels_cuda/rope_inplace_ff.cu
+        kernels_cuda/scaled_add_residual.cu
+        kernels_cuda/gelu_mul.cu
+        kernels_cuda/silu_mul.cu
+        kernels_cuda/x_quant_i8.cu
+    )
+
+    set(PTX_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/ptx)
+    file(MAKE_DIRECTORY ${PTX_OUTPUT_DIR})
+
+    set(CUDA_PTX_FILES "")
+    foreach(src IN LISTS CUDA_KERNEL_SOURCES)
+        get_filename_component(kname ${src} NAME_WE)
+        set(ptx ${PTX_OUTPUT_DIR}/${kname}.ptx)
+        add_custom_command(
+            OUTPUT ${ptx}
+            COMMAND ${NVCC_EXECUTABLE}
+                    --ptx
+                    -arch=compute_80
+                    ${CMAKE_CURRENT_SOURCE_DIR}/${src}
+                    -o ${ptx}
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${src}
+            WORKING_DIRECTORY ${PTX_OUTPUT_DIR}
+            COMMENT "nvcc --ptx -> ${kname}.ptx"
+            VERBATIM
+        )
+        list(APPEND CUDA_PTX_FILES ${ptx})
+    endforeach()
+
+    # Second build of attention_prefill_flash_q8_0_gqa.cu with a smaller
+    # K-tile — same source, nvcc gets -DATTN_FLASH_PREFILL_KTILE=64 so
+    # the #ifndef in the kernel picks up the override. Copy the source
+    # to a distinct basename first because nvcc names the PTX after the
+    # input filename — lets both variants coexist in the same ptx/
+    # directory. Kernel symbol stays `attention_prefill_flash_q8_0_gqa`
+    # (unchanged by the macro) so CudaModule::getFunction finds it under
+    # the same name from either .ptx. Mirrors the HIP hipcc -D block
+    # above and the L0 ocloc -D block above that. Dispatch picks at
+    # runtime via `features.flashPrefillKTileQ8` in config.json.
+    set(CUDA_GQA_KTILE64_CU
+        ${CMAKE_CURRENT_BINARY_DIR}/attention_prefill_flash_q8_0_gqa_ktile64.cu)
+    set(CUDA_GQA_KTILE64_PTX
+        ${PTX_OUTPUT_DIR}/attention_prefill_flash_q8_0_gqa_ktile64.ptx)
+    add_custom_command(
+        OUTPUT ${CUDA_GQA_KTILE64_CU}
+        COMMAND ${CMAKE_COMMAND} -E copy
+                ${CMAKE_CURRENT_SOURCE_DIR}/kernels_cuda/attention_prefill_flash_q8_0_gqa.cu
+                ${CUDA_GQA_KTILE64_CU}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels_cuda/attention_prefill_flash_q8_0_gqa.cu
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT ${CUDA_GQA_KTILE64_PTX}
+        COMMAND ${NVCC_EXECUTABLE}
+                --ptx
+                -arch=compute_80
+                -DATTN_FLASH_PREFILL_KTILE=64
+                ${CUDA_GQA_KTILE64_CU}
+                -o ${CUDA_GQA_KTILE64_PTX}
+        DEPENDS ${CUDA_GQA_KTILE64_CU}
+        WORKING_DIRECTORY ${PTX_OUTPUT_DIR}
+        COMMENT "nvcc --ptx -> attention_prefill_flash_q8_0_gqa_ktile64.ptx (KTILE=64)"
+        VERBATIM
+    )
+    list(APPEND CUDA_PTX_FILES ${CUDA_GQA_KTILE64_PTX})
+
+    add_custom_target(cuda_kernels ALL DEPENDS ${CUDA_PTX_FILES})
+endif()
+
 # ---- mimirmind_core_cuda — NVIDIA CUDA-tied foundation --------------------
 #
 # Peer to `mimirmind_core_l0` / `mimirmind_core_hip`. Track 1 lands
