@@ -386,3 +386,104 @@ COPY --from=build /src/build/munin              /usr/local/bin/munin
 COPY --from=build /src/config.example.json      /usr/local/share/mimirmind/config.example.json
 
 ENTRYPOINT ["/usr/local/bin/munin"]
+
+
+# ============================================================================
+# Stage 5 — Builder-CUDA (NVIDIA toolchain, ARM64 target = DGX Spark)
+# ============================================================================
+#
+# Peer to `builder` (Intel L0) and `builder-hip` (AMD ROCm) but targets
+# the NVIDIA path — specifically DGX Spark / ASUS Ascent GX10 (Grace ARM
+# + Blackwell GB10, sm_120). Pulls NVIDIA's official CUDA-devel image
+# with `--platform=linux/arm64` — the wrong platform pull yields an
+# `exec format error` at `docker run` on Spark (Synaipse:
+# `reference_dgx_spark_engine_fit.md`).
+#
+# NOT YET verified end-to-end. DGX Spark is expected to land in-house
+# 2026-07-21 — this stage is what tomorrow's Spark bringup boots.
+
+FROM --platform=linux/arm64 nvidia/cuda:12.6.0-devel-ubuntu24.04 AS builder-cuda
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        build-essential \
+        cmake \
+        ninja-build \
+        pkg-config \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Default command for the "builder-cuda" docker-compose service: configure
+# + build with the CUDA backend on, all other backends off. Override with
+# `bash` for an interactive shell.
+CMD ["bash", "-lc", \
+     "cmake -S /src -B /src/build-cuda -G Ninja \
+          -DCMAKE_BUILD_TYPE=${BUILD_TYPE:-Release} \
+          -DMIMIRMIND_ENABLE_L0=OFF \
+          -DMIMIRMIND_ENABLE_HIP=OFF \
+          -DMIMIRMIND_ENABLE_CUDA=ON \
+      && cmake --build /src/build-cuda --parallel"]
+
+
+# ============================================================================
+# Stage 5b — Build-CUDA (toolchain + baked source, CUDA-only mimirmind exec)
+# ============================================================================
+
+FROM builder-cuda AS build-cuda
+
+COPY CMakeLists.txt ./
+COPY config.example.json ./
+COPY src ./src
+COPY kernels_cuda ./kernels_cuda
+COPY tests ./tests
+COPY tools ./tools
+COPY third_party ./third_party
+
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DMIMIRMIND_ENABLE_L0=OFF \
+        -DMIMIRMIND_ENABLE_HIP=OFF \
+        -DMIMIRMIND_ENABLE_CUDA=ON \
+    && cmake --build build --parallel
+
+
+# ============================================================================
+# Stage 6 — Runtime-CUDA (NVIDIA runtime, CUDA-only mimirmind exec)
+# ============================================================================
+#
+# Peer to the L0 `runtime` and HIP `runtime-hip` stages. Ships the CUDA
+# build. Host needs an NVIDIA GPU reachable via the NVIDIA Container
+# Runtime — `docker compose` runs must pass a GPU device reservation
+# (see docker-compose.yml `mimirmind-cuda` service) or the equivalent
+# `--gpus all` on plain `docker run`.
+#
+# ARM64-pinned; the runtime image is Grace-ARM-only. Registry pushes
+# from an x86 dev box will publish an x86 manifest that Spark rejects
+# with `exec format error`. Push must use:
+#   docker buildx build --platform linux/arm64 --push \
+#       --target runtime-cuda -t <registry>/mimirmind-cuda:latest .
+# (Registry push is the user's manual step per the project's git/push
+# hygiene rules — not automated here.)
+
+FROM --platform=linux/arm64 nvidia/cuda:12.6.0-runtime-ubuntu24.04 AS runtime-cuda
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy just the mimirmind binary + compiled PTX kernels. Runtime image
+# has no nvcc, no source, no L0 SPV kernels (Intel-only), no hsaco
+# (AMD-only). PTX loads at runtime via CudaModule::loadPtx.
+COPY --from=build-cuda /src/build/mimirmind /usr/local/bin/mimirmind
+COPY --from=build-cuda /src/build/ptx       /usr/local/share/mimirmind/ptx
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/mimirmind"]
+CMD ["serve", "--config", "/etc/mimirmind/config.json"]

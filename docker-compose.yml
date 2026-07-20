@@ -118,3 +118,91 @@ services:
         restart: "no"
         stdin_open: true
         tty: true
+
+    # ------------------------------------------------------------------
+    # builder-cuda — NVIDIA CUDA toolchain, ARM64 target (DGX Spark).
+    #                Peer to `builder` (Intel L0) and `builder-hip`
+    #                (AMD ROCm). Host source bind-mounted; artefacts
+    #                land in ./build-cuda on the host.
+    # ------------------------------------------------------------------
+    builder-cuda:
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: builder-cuda
+            platforms:
+                - linux/arm64
+        image: mimirmind:builder-cuda
+        container_name: mimirmind-builder-cuda
+
+        # NVIDIA Container Runtime — cudart + nvcc need the driver
+        # visible. Modern Docker exposes GPUs via `deploy.resources`;
+        # older Docker versions need `runtime: nvidia` instead.
+        deploy:
+            resources:
+                reservations:
+                    devices:
+                        - driver: nvidia
+                          count: all
+                          capabilities: [gpu]
+
+        environment:
+            BUILD_TYPE: ${BUILD_TYPE:-Release}
+
+        volumes:
+            - ./:/src
+
+        working_dir: /src
+
+        # Default /dev/shm is 64 MB, which silently fails anything
+        # doing shared-memory (parity dumps, perf traces). Bumped to
+        # 8g per the Spark engine-fit note.
+        shm_size: 8g
+
+        restart: "no"
+        stdin_open: true
+        tty: true
+
+    # ------------------------------------------------------------------
+    # mimirmind-cuda — runtime service for DGX Spark deploys. ARM64,
+    #                  NVIDIA GPU passthrough via nvidia-container-runtime.
+    # ------------------------------------------------------------------
+    mimirmind-cuda:
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: runtime-cuda
+            platforms:
+                - linux/arm64
+        image: mimirmind:dev-cuda
+        container_name: mimirmind-cuda
+
+        deploy:
+            resources:
+                reservations:
+                    devices:
+                        - driver: nvidia
+                          count: all
+                          capabilities: [gpu]
+
+        shm_size: 8g
+
+        # Models + config bind-mount identical to the L0 `mimirmind`
+        # service. ApiServer defaults to binding 0.0.0.0 (see
+        # src/server/ApiServer.hpp line 41), so no --host override
+        # needed in the command below.
+        volumes:
+            - ./models:/models:ro
+            - ${MIMIRMIND_CONFIG_HOST:-./config.dev.json}:/etc/mimirmind/config.json:ro
+
+        command:
+            - serve
+            - --config
+            - /etc/mimirmind/config.json
+
+        ports:
+            - "8080:8080"
+
+        restart: "no"
+        stdin_open: true
+        tty: true
