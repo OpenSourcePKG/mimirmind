@@ -1999,3 +1999,74 @@ endif()
 if(TARGET mimirmind_core_hip)
     target_link_libraries(backend_select_probe PRIVATE mimirmind_core_hip)
 endif()
+
+# ---- install rules --------------------------------------------------------
+#
+# Consolidated install layout so `cmake --install build` (or `make install`)
+# produces a self-contained deployment tree:
+#
+#   ${CMAKE_INSTALL_PREFIX}/bin/mimirmind
+#   ${CMAKE_INSTALL_PREFIX}/share/mimirmind/{spv,hsaco,ptx}/*
+#
+# Runtime lookup for kernel code-objects:
+#   - L0 SpvDir default is `runtime.spvDir` in config.json, falling back
+#     to `/usr/local/share/mimirmind/spv` when unset (see GpuModule
+#     fallback path).
+#   - HIP hsaco lookup falls back to
+#     `/usr/local/share/mimirmind/hsaco` when MIMIRMIND_HSACO_DIR
+#     env-var is unset (see the "cannot find rmsnorm.hsaco — set
+#     MIMIRMIND_HSACO_DIR or install to /usr/local/share/mimirmind/hsaco"
+#     error we caught on radeon-testbed).
+#   - CUDA PTX mirrors the pattern under `share/mimirmind/ptx`.
+#
+# Default `CMAKE_INSTALL_PREFIX` on Linux is `/usr/local`, so a plain
+# `cmake --install build` lands everything at the well-known fallback
+# paths and mimirmind runs without any MIMIRMIND_*_DIR env-vars.
+# Override with `cmake --install build --prefix /opt/mimirmind` for a
+# non-standard tree.
+
+include(GNUInstallDirs)
+
+# Binary
+install(TARGETS mimirmind
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    COMPONENT runtime)
+
+# Munin persistent-memory daemon, when compiled in (L0-only today).
+if(TARGET munin)
+    install(TARGETS munin
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        COMPONENT runtime)
+endif()
+
+# L0 SPV kernels — the spv_kernels target owns the compiled .spv files
+# in ${SPV_OUTPUT_DIR}. Install as a directory to preserve any future
+# subdirectory structure without needing to re-list.
+if(MIMIRMIND_ENABLE_L0)
+    install(DIRECTORY ${SPV_OUTPUT_DIR}/
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/mimirmind/spv
+        COMPONENT runtime
+        FILES_MATCHING PATTERN "*.spv")
+endif()
+
+# HIP hsaco kernels — same shape as SPV.
+if(MIMIRMIND_ENABLE_HIP)
+    install(DIRECTORY ${HSACO_OUTPUT_DIR}/
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/mimirmind/hsaco
+        COMPONENT runtime
+        FILES_MATCHING PATTERN "*.hsaco")
+endif()
+
+# CUDA PTX kernels — Bragi-side, loaded by CudaModule::loadPtx.
+if(MIMIRMIND_ENABLE_CUDA)
+    install(DIRECTORY ${PTX_OUTPUT_DIR}/
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/mimirmind/ptx
+        COMPONENT runtime
+        FILES_MATCHING PATTERN "*.ptx")
+endif()
+
+# Config sample — landed alongside the binary so operators have a
+# copy-and-edit starting point.
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/config.example.json
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/mimirmind
+    COMPONENT runtime)
