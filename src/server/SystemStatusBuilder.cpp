@@ -300,6 +300,16 @@ json SystemStatusBuilder::buildInfo() const {
         {"kv_bytes_per_token",      est.kvBytesPerToken},
         {"max_context",             est.maxContext},
         {"reasoning",               est.reasoning},
+        // M-Cuda.Batch Phase C knobs — surfaced so operators can
+        // read the effective serving-loop configuration at a glance.
+        // Populated by ServingSettings defaults + config.json overrides
+        // (see `2715fdd`); consumed at Phase-D construction time by
+        // RequestScheduler / ChunkedPrefillScheduler / PreemptionPolicy /
+        // PagedKvBlockAllocator.
+        {"token_budget",                    cfgServing.tokenBudget},
+        {"max_active_requests",             cfgServing.maxActiveRequests},
+        {"preempt_free_block_threshold",    cfgServing.preemptFreeBlockThreshold},
+        {"block_size",                      cfgServing.blockSize},
     };
 
     return json{
