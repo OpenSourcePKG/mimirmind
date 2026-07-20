@@ -1,12 +1,23 @@
 ## Project
 
-**MimirMind** is a standalone C++ inference engine for GGUF language models,
-targeting the integrated Intel Arc GPU on Meteor Lake via oneAPI Level Zero
-with Unified Shared Memory. Loads pre-trained models; **does not train**.
+**MimirMind** is a standalone C++ inference engine for language models,
+targeting two production platforms:
+
+1. **Intel Meteor Lake iGPU** via oneAPI Level Zero with Unified Shared
+   Memory (Xe-LPG). Single-user / low-concurrency, GGUF weights. Original
+   target platform, ships as `Mimir-1.0`.
+2. **NVIDIA DGX Spark** (Grace ARM + Blackwell GB10, 128 GB unified
+   LPDDR5x, 273 GB/s) via CUDA. Serving-class (multi-user, ≥64
+   concurrent chats), NVFP4 weights, native MTP speculative decoding.
+   Ships as `Mimir-2.0` = phase **Bragi**.
+
+Loads pre-trained models; **does not train**. HIP/ROCm (AMD RDNA3+)
+sits as a home-lab / sandbox tier — not a committed production target.
 
 Sister project: `pegenaut` (TypeScript RAG stack, separate repo). MimirMind
 is intended to eventually serve as a drop-in OpenAI-compatible inference
-backend for Pegenaut, once Phase **Mimir-1.0** lands.
+backend for Pegenaut, once Phase **Mimir-1.0** lands. Serving-class
+Bragi extends the same API to multi-tenant workloads.
 
 ## Codebase Conventions
 
