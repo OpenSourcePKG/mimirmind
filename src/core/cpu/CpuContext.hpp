@@ -63,11 +63,11 @@ public:
         backend() const noexcept override { return _backend; }
 
     /// Sustained CPU memory bandwidth. 50 GB/s covers a typical
-    /// dual-channel DDR5-5600 desktop (pegenaut-skynet class);
-    /// higher-end 4-channel or DDR5-8000+ systems will see more but
-    /// the probe consumer only uses this to gate serving-class
-    /// batching, which is CUDA-only in Bragi-v1 — so the CPU value
-    /// is mostly informational at `/v1/system/info`.
+    /// dual-channel DDR5-5600 desktop; higher-end 4-channel or
+    /// DDR5-8000+ systems will see more but the probe consumer
+    /// only uses this to gate serving-class batching, which is
+    /// CUDA-only in Bragi-v1 — so the CPU value is mostly
+    /// informational at `/v1/system/info`.
     [[nodiscard]] std::size_t bandwidthGBps() const noexcept override {
         return 50;
     }

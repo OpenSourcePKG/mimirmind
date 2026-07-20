@@ -528,7 +528,7 @@ TEST(serving_configJson_rejectsOutOfRangeMinBatch) {
 
 TEST(computeContext_cpu_bandwidthIsFiftyGBps) {
     ::mimirmind::core::cpu::CpuContext ctx{};
-    // 50 GB/s = dual-channel DDR5-5600 desktop baseline (pegenaut-skynet).
+    // 50 GB/s = dual-channel DDR5-5600 desktop baseline.
     EXPECT_EQ(ctx.bandwidthGBps(), std::size_t{50});
 }
 

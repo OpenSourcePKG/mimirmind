@@ -72,7 +72,7 @@ public:
 
     /// Sustained memory bandwidth heuristic for Xe-LPG family:
     ///   integrated iGPU (Meteor Lake / Arrow Lake / Lunar Lake /
-    ///     Panther Lake) — ~70 GB/s sustained per pegenaut-skynet
+    ///     Panther Lake) — ~70 GB/s sustained per internal
     ///     measurements (dual-channel DDR5-5600 IMC, 89.6 theor).
     ///   discrete GPU (Arc B70 / A770 / Battlemage) — ~450 GB/s.
     /// Rough per-family heuristic; a real per-device probe is a
