@@ -76,5 +76,14 @@
     "traceOpTimes": false,
     "gpuBench": false,
     "regressionAlert": true
+  },
+
+  "serving": {
+    "enableBatching": "auto",
+    "minBatchForEnable": 8,
+    "tokenBudget": 512,
+    "maxActiveRequests": 32,
+    "preemptFreeBlockThreshold": 0.05,
+    "blockSize": 16
   }
 }
