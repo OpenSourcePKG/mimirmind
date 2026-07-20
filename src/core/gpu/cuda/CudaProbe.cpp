@@ -1,21 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-// Track 1 skeleton for the CUDA backend. Provides the two symbols
-// `BackendRegistry` forward-declares behind `MIMIRMIND_HAVE_CUDA`:
-//
-//   - `probeBackend()`         — real: counts visible CUDA devices via
-//                                cudaGetDeviceCount, populates the
-//                                one-line detail with the first
-//                                device's name so /v1/system/info shows
-//                                what the process saw.
-//   - `createComputeContext()` — placeholder: throws a distinct message
-//                                so operators can tell "backend not
-//                                compiled in" from "backend compiled
-//                                in, primitives not yet wired". Real
-//                                impl lands with Track 2
-//                                (`CudaContext` + `CudaStream` +
-//                                `CudaMemoryAllocator` + friends).
+// Track 1 shipped this as a skeleton: `probeBackend()` real,
+// `createComputeContext()` throwing "primitives not yet linked" so
+// operators could distinguish "CUDA compiled out" from "CUDA compiled
+// in, no impl yet". Track 2 (this branch) replaces the throw with a
+// real `CudaComputeContext` instantiation now that the seven core
+// primitives (`CudaContext` / `CudaStream` / `CudaMemoryAllocator` /
+// `CudaKernel` / `CudaModule` / `CudaEvent` / `CudaComputeContext`)
+// all exist under `src/core/gpu/cuda/`.
 //
 // Lives in `mimirmind_core_cuda` — the pure-CPU `mimirmind_core_common`
 // library never pulls in <cuda_runtime.h>.
@@ -24,10 +17,11 @@
 #include "core/backend/ComputeBackend.hpp"
 #include "core/backend/ComputeContext.hpp"
 
+#include "core/gpu/cuda/CudaComputeContext.hpp"
+
 #include <cuda_runtime.h>
 
 #include <memory>
-#include <stdexcept>
 #include <string>
 
 namespace mimirmind::core::cuda {
@@ -68,17 +62,14 @@ namespace mimirmind::core::cuda {
     return p;
 }
 
+// Factory hook consumed by BackendRegistry::createContext(). Lives in
+// this TU (rather than being merged into CudaComputeContext.cpp) so
+// the forward-decl in BackendRegistry.cpp resolves against the exact
+// file Track 1 named. Uses default Options: auto-select device,
+// BlockingDefault stream.
 std::unique_ptr<::mimirmind::core::backend::ComputeContext>
 createComputeContext() {
-    // Track 2 fills this in with a real CudaComputeContext that owns
-    // CudaContext + CudaMemoryAllocator + CudaStream. Until then, throw
-    // a message that distinguishes "CUDA not compiled in" (handled in
-    // BackendRegistry.cpp) from "CUDA compiled in but primitives layer
-    // not yet linked" — the two operator experiences are different.
-    throw std::runtime_error{
-        "mimirmind::core::cuda::createComputeContext: skeleton only — "
-        "CUDA primitives (CudaContext / CudaStream / CudaMemoryAllocator) "
-        "land with Track 2 on feat/cuda-backend-skeleton"};
+    return std::make_unique<CudaComputeContext>();
 }
 
 } // namespace mimirmind::core::cuda

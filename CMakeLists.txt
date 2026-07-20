@@ -602,11 +602,23 @@ endif()
 if(MIMIRMIND_ENABLE_CUDA)
     add_library(mimirmind_core_cuda STATIC
         src/core/gpu/cuda/CudaProbe.cpp
+        src/core/gpu/cuda/CudaContext.cpp
+        src/core/gpu/cuda/CudaStream.cpp
+        src/core/gpu/cuda/CudaMemoryAllocator.cpp
+        src/core/gpu/cuda/CudaEvent.cpp
+        src/core/gpu/cuda/CudaKernel.cpp
+        src/core/gpu/cuda/CudaModule.cpp
+        src/core/gpu/cuda/CudaComputeContext.cpp
     )
 
     target_link_libraries(mimirmind_core_cuda PUBLIC
         mimirmind_core_common
+        # CUDA::cudart      = runtime API (streams, memory, events).
+        # CUDA::cuda_driver = driver API (CUmodule, CUfunction,
+        #                     cuLaunchKernel) — needed by CudaModule +
+        #                     CudaKernel for runtime PTX module load.
         CUDA::cudart
+        CUDA::cuda_driver
     )
 endif()
 
