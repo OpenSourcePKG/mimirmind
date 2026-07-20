@@ -901,6 +901,273 @@ TEST(pagedSeq_moveTransfersOwnership) {
     EXPECT_EQ(src.numBlocks(), std::size_t{0});
 }
 
+// -----------------------------------------------------------------------
+// ChunkedPrefillScheduler — Sub-Step C3 (M-Cuda.Batch Phase C)
+// -----------------------------------------------------------------------
+
+#include "runtime/serving/ChunkedPrefillScheduler.hpp"
+
+TEST(chunkedSched_ctorDefaultBudgetIs512) {
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    ChunkedPrefillScheduler s{};
+    EXPECT_EQ(s.tokenBudget(), std::int32_t{512});
+}
+
+TEST(chunkedSched_ctorRejectsZeroBudget) {
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    bool threw = false;
+    try {
+        ChunkedPrefillScheduler s{0};
+        (void)s;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
+}
+
+TEST(chunkedSched_ctorRejectsNegativeBudget) {
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    bool threw = false;
+    try {
+        ChunkedPrefillScheduler s{-1};
+        (void)s;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
+}
+
+TEST(chunkedSched_emptyInputProducesEmptySchedule) {
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{};
+    const std::vector<RequestSlice> empty{};
+    const auto out = s.schedule(empty);
+    EXPECT_EQ(out.decodes.size(),           std::size_t{0});
+    EXPECT_EQ(out.prefills.size(),          std::size_t{0});
+    EXPECT_EQ(out.total_tokens_scheduled,   std::int32_t{0});
+}
+
+TEST(chunkedSched_singleDecodeSchedulesOneToken) {
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{};
+    const std::vector<RequestSlice> reqs{
+        {/*id=*/1, /*pending=*/0, /*decoded=*/5, /*is_decoding=*/true},
+    };
+    const auto out = s.schedule(reqs);
+    EXPECT_EQ(out.decodes.size(),         std::size_t{1});
+    EXPECT_EQ(out.decodes.front().request_id, std::uint64_t{1});
+    EXPECT_EQ(out.prefills.size(),        std::size_t{0});
+    EXPECT_EQ(out.total_tokens_scheduled, std::int32_t{1});
+}
+
+TEST(chunkedSched_manyDecodesUnderBudgetAllScheduled) {
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{16};
+    std::vector<RequestSlice> reqs;
+    for (int i = 0; i < 10; ++i) {
+        reqs.push_back({static_cast<std::uint64_t>(i), 0, 0, true});
+    }
+    const auto out = s.schedule(reqs);
+    EXPECT_EQ(out.decodes.size(),         std::size_t{10});
+    EXPECT_EQ(out.total_tokens_scheduled, std::int32_t{10});
+}
+
+TEST(chunkedSched_decodesExceedBudgetDropsOverflow) {
+    // C3 is pure scheduling math. Overflow is silently dropped — the
+    // C5 preemption policy handles the memory-pressure signal.
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{4};
+    std::vector<RequestSlice> reqs;
+    for (int i = 0; i < 10; ++i) {
+        reqs.push_back({static_cast<std::uint64_t>(i), 0, 0, true});
+    }
+    const auto out = s.schedule(reqs);
+    EXPECT_EQ(out.decodes.size(),         std::size_t{4});
+    EXPECT_EQ(out.total_tokens_scheduled, std::int32_t{4});
+    // Input-order preserved on the survivors.
+    EXPECT_EQ(out.decodes[0].request_id, std::uint64_t{0});
+    EXPECT_EQ(out.decodes[3].request_id, std::uint64_t{3});
+}
+
+TEST(chunkedSched_singlePrefillFitsFullyInBudget) {
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{512};
+    const std::vector<RequestSlice> reqs{
+        {/*id=*/42, /*pending=*/100, /*decoded=*/0, /*is_decoding=*/false},
+    };
+    const auto out = s.schedule(reqs);
+    EXPECT_EQ(out.prefills.size(),           std::size_t{1});
+    EXPECT_EQ(out.prefills.front().request_id, std::uint64_t{42});
+    EXPECT_EQ(out.prefills.front().chunk_size, std::int32_t{100});
+    EXPECT_EQ(out.total_tokens_scheduled,    std::int32_t{100});
+}
+
+TEST(chunkedSched_singlePrefillOverflowSplitsAtBudget) {
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{512};
+    const std::vector<RequestSlice> reqs{
+        {/*id=*/42, /*pending=*/1000, /*decoded=*/0, /*is_decoding=*/false},
+    };
+    const auto out = s.schedule(reqs);
+    EXPECT_EQ(out.prefills.size(),           std::size_t{1});
+    EXPECT_EQ(out.prefills.front().chunk_size, std::int32_t{512});
+    EXPECT_EQ(out.total_tokens_scheduled,    std::int32_t{512});
+    // Caller now reduces tokens_pending by 512 and reschedules next iter.
+}
+
+TEST(chunkedSched_multiplePrefillsFillBudgetInOrder) {
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{512};
+    const std::vector<RequestSlice> reqs{
+        {1, 200, 0, false},
+        {2, 200, 0, false},
+        {3, 200, 0, false},   // only 112 of these get scheduled this iter
+    };
+    const auto out = s.schedule(reqs);
+    EXPECT_EQ(out.prefills.size(),            std::size_t{3});
+    EXPECT_EQ(out.prefills[0].request_id,     std::uint64_t{1});
+    EXPECT_EQ(out.prefills[0].chunk_size,     std::int32_t{200});
+    EXPECT_EQ(out.prefills[1].request_id,     std::uint64_t{2});
+    EXPECT_EQ(out.prefills[1].chunk_size,     std::int32_t{200});
+    EXPECT_EQ(out.prefills[2].request_id,     std::uint64_t{3});
+    EXPECT_EQ(out.prefills[2].chunk_size,     std::int32_t{112});
+    EXPECT_EQ(out.total_tokens_scheduled,     std::int32_t{512});
+}
+
+TEST(chunkedSched_decodeFirstThenPrefillGetsRemainder) {
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{512};
+    std::vector<RequestSlice> reqs;
+    // 5 decodes + 1 long prefill. Decodes eat 5, prefill gets 507.
+    for (int i = 0; i < 5; ++i) {
+        reqs.push_back({static_cast<std::uint64_t>(100 + i), 0, 0, true});
+    }
+    reqs.push_back({999, 1000, 0, false});
+    const auto out = s.schedule(reqs);
+    EXPECT_EQ(out.decodes.size(),             std::size_t{5});
+    EXPECT_EQ(out.prefills.size(),            std::size_t{1});
+    EXPECT_EQ(out.prefills.front().request_id, std::uint64_t{999});
+    EXPECT_EQ(out.prefills.front().chunk_size, std::int32_t{507});
+    EXPECT_EQ(out.total_tokens_scheduled,     std::int32_t{512});
+}
+
+TEST(chunkedSched_decodesFillBudgetPrefillsSkipped) {
+    // When decodes consume the whole budget, prefills wait for the
+    // next iteration. Guarantees decode latency isn't sacrificed to
+    // prefill throughput.
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{8};
+    std::vector<RequestSlice> reqs;
+    for (int i = 0; i < 8; ++i) {
+        reqs.push_back({static_cast<std::uint64_t>(i), 0, 0, true});
+    }
+    reqs.push_back({999, 500, 0, false});     // pending but no room
+    const auto out = s.schedule(reqs);
+    EXPECT_EQ(out.decodes.size(),         std::size_t{8});
+    EXPECT_EQ(out.prefills.size(),        std::size_t{0});
+    EXPECT_EQ(out.total_tokens_scheduled, std::int32_t{8});
+}
+
+TEST(chunkedSched_mixedInputPreservesOrderPerClass) {
+    // Even when decodes and prefills are interleaved in the input,
+    // decodes go first (in their input order) and prefills after
+    // (in their input order).
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{512};
+    const std::vector<RequestSlice> reqs{
+        {10, 100, 0, false},   // prefill
+        {20, 0,   0, true},    // decode
+        {30, 50,  0, false},   // prefill
+        {40, 0,   0, true},    // decode
+    };
+    const auto out = s.schedule(reqs);
+    EXPECT_EQ(out.decodes.size(),          std::size_t{2});
+    EXPECT_EQ(out.decodes[0].request_id,   std::uint64_t{20});
+    EXPECT_EQ(out.decodes[1].request_id,   std::uint64_t{40});
+    EXPECT_EQ(out.prefills.size(),         std::size_t{2});
+    EXPECT_EQ(out.prefills[0].request_id,  std::uint64_t{10});
+    EXPECT_EQ(out.prefills[1].request_id,  std::uint64_t{30});
+    EXPECT_EQ(out.total_tokens_scheduled,  std::int32_t{2 + 100 + 50});
+}
+
+TEST(chunkedSched_zeroPendingPrefillIsSkipped) {
+    // Defensive: a prefill slice with tokens_pending=0 shouldn't
+    // produce a chunk_size=0 assignment (wasted iteration entry).
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{512};
+    const std::vector<RequestSlice> reqs{
+        {1, 0, 0, false},   // "pending but nothing left" — skip
+        {2, 100, 0, false},
+    };
+    const auto out = s.schedule(reqs);
+    EXPECT_EQ(out.prefills.size(),           std::size_t{1});
+    EXPECT_EQ(out.prefills.front().request_id, std::uint64_t{2});
+    EXPECT_EQ(out.prefills.front().chunk_size, std::int32_t{100});
+    EXPECT_EQ(out.total_tokens_scheduled,    std::int32_t{100});
+}
+
+TEST(chunkedSched_customBudgetIsHonoured) {
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{128};
+    const std::vector<RequestSlice> reqs{
+        {1, 500, 0, false},
+    };
+    const auto out = s.schedule(reqs);
+    EXPECT_EQ(out.prefills.size(),           std::size_t{1});
+    EXPECT_EQ(out.prefills.front().chunk_size, std::int32_t{128});
+    EXPECT_EQ(out.total_tokens_scheduled,    std::int32_t{128});
+}
+
+TEST(chunkedSched_totalTokensMatchesSumOfAssignments) {
+    // Meta-invariant: total_tokens_scheduled = decodes.size() +
+    // Σ prefills[i].chunk_size. Never drift.
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{512};
+    const std::vector<RequestSlice> reqs{
+        {1, 0,    5, true},
+        {2, 0,    3, true},
+        {3, 300,  0, false},
+        {4, 500,  0, false},
+    };
+    const auto out = s.schedule(reqs);
+    std::int32_t sum = static_cast<std::int32_t>(out.decodes.size());
+    for (const auto& p : out.prefills) sum += p.chunk_size;
+    EXPECT_EQ(out.total_tokens_scheduled, sum);
+}
+
+TEST(chunkedSched_repeatCallsAreIdempotentAndStateless) {
+    // Sanity: schedule is pure. Two back-to-back calls on the same
+    // input produce identical output. Proves no hidden state.
+    using ::mimirmind::runtime::serving::ChunkedPrefillScheduler;
+    using ::mimirmind::runtime::serving::RequestSlice;
+    ChunkedPrefillScheduler s{512};
+    const std::vector<RequestSlice> reqs{
+        {1, 100, 0, false},
+        {2, 0,   0, true},
+    };
+    const auto a = s.schedule(reqs);
+    const auto b = s.schedule(reqs);
+    EXPECT_EQ(a.total_tokens_scheduled, b.total_tokens_scheduled);
+    EXPECT_EQ(a.decodes.size(),         b.decodes.size());
+    EXPECT_EQ(a.prefills.size(),        b.prefills.size());
+    EXPECT_EQ(a.decodes[0].request_id,  b.decodes[0].request_id);
+    EXPECT_EQ(a.prefills[0].request_id, b.prefills[0].request_id);
+    EXPECT_EQ(a.prefills[0].chunk_size, b.prefills[0].chunk_size);
+}
+
 int main() {
     return mm::test::run();
 }
