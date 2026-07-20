@@ -399,10 +399,16 @@ ENTRYPOINT ["/usr/local/bin/munin"]
 # `exec format error` at `docker run` on Spark (Synaipse:
 # `reference_dgx_spark_engine_fit.md`).
 #
+# Requires CUDA 13.0+ for the NVFP4 `kind::mxf4nvf4` PTX instruction
+# used by the M-Cuda.FP4 milestone. Under CUDA 12.x nvcc lowers that
+# instruction to broken internal opcodes — kernels compile but produce
+# wrong results. Do NOT downgrade to a 12.x image (Synaipse:
+# `research/cutlass-sm120-compatibility-2026-07-20.md`).
+#
 # NOT YET verified end-to-end. DGX Spark is expected to land in-house
 # 2026-07-21 — this stage is what tomorrow's Spark bringup boots.
 
-FROM --platform=linux/arm64 nvidia/cuda:12.6.0-devel-ubuntu24.04 AS builder-cuda
+FROM --platform=linux/arm64 nvidia/cuda:13.0.0-devel-ubuntu24.04 AS builder-cuda
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -468,7 +474,7 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 # (Registry push is the user's manual step per the project's git/push
 # hygiene rules — not automated here.)
 
-FROM --platform=linux/arm64 nvidia/cuda:12.6.0-runtime-ubuntu24.04 AS runtime-cuda
+FROM --platform=linux/arm64 nvidia/cuda:13.0.0-runtime-ubuntu24.04 AS runtime-cuda
 
 ENV DEBIAN_FRONTEND=noninteractive
 
