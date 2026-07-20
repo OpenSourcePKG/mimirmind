@@ -342,6 +342,8 @@ add_library(mimirmind_core_common STATIC
     src/core/log/Log.cpp
     src/core/os/GovernorLock.cpp
     src/runtime/serving/BatchCapacityProbe.cpp
+    src/runtime/serving/PagedKvBlockAllocator.cpp
+    src/runtime/serving/PagedKvSequence.cpp
 )
 
 target_include_directories(mimirmind_core_common PUBLIC src)

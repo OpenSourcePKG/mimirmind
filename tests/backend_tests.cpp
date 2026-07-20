@@ -542,6 +542,365 @@ TEST(computeContext_baseDefaultsToZero) {
     EXPECT_TRUE(ctx.bandwidthGBps() != 0);  // sanity: override IS in effect
 }
 
+// -----------------------------------------------------------------------
+// PagedKvBlockAllocator — logical block-pool for Bragi PagedAttention
+// -----------------------------------------------------------------------
+
+#include "runtime/serving/PagedKvBlockAllocator.hpp"
+
+TEST(pagedAlloc_ctorRejectsZeroBlocks) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    bool threw = false;
+    try {
+        PagedKvBlockAllocator pool{0, 16};
+        (void)pool;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
+}
+
+TEST(pagedAlloc_ctorRejectsZeroBlockSize) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    bool threw = false;
+    try {
+        PagedKvBlockAllocator pool{4, 0};
+        (void)pool;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
+}
+
+TEST(pagedAlloc_freshPoolHasAllFree) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{8, 16};
+    EXPECT_EQ(pool.numBlocksTotal(), std::size_t{8});
+    EXPECT_EQ(pool.numBlocksFree(),  std::size_t{8});
+    EXPECT_EQ(pool.numBlocksUsed(),  std::size_t{0});
+    EXPECT_EQ(pool.blockSize(),      std::size_t{16});
+}
+
+TEST(pagedAlloc_allocateHandsOutIdsInAscendingOrder) {
+    // Free-list is filled reverse in the ctor so LIFO pop returns 0,1,2,...
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{4, 16};
+    EXPECT_EQ(pool.allocate(), std::uint32_t{0});
+    EXPECT_EQ(pool.allocate(), std::uint32_t{1});
+    EXPECT_EQ(pool.allocate(), std::uint32_t{2});
+    EXPECT_EQ(pool.allocate(), std::uint32_t{3});
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{4});
+    EXPECT_EQ(pool.numBlocksFree(), std::size_t{0});
+}
+
+TEST(pagedAlloc_exhaustionReturnsInvalid) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{2, 16};
+    (void)pool.allocate();
+    (void)pool.allocate();
+    EXPECT_EQ(pool.allocate(), PagedKvBlockAllocator::kInvalidBlock);
+}
+
+TEST(pagedAlloc_freshBlockHasRefcountOneAndZeroHash) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{4, 16};
+    const auto id = pool.allocate();
+    EXPECT_EQ(pool.refcountOf(id), std::uint32_t{1});
+    EXPECT_EQ(pool.hashOf(id),     std::uint64_t{0});
+}
+
+TEST(pagedAlloc_addRefBumpsRefcount) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{4, 16};
+    const auto id = pool.allocate();
+    pool.addRef(id);
+    pool.addRef(id);
+    EXPECT_EQ(pool.refcountOf(id), std::uint32_t{3});
+}
+
+TEST(pagedAlloc_releaseReturnsBlockWhenRefcountReachesZero) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{4, 16};
+    const auto id = pool.allocate();
+    EXPECT_EQ(pool.numBlocksFree(), std::size_t{3});
+    pool.release(id);
+    EXPECT_EQ(pool.numBlocksFree(), std::size_t{4});
+    EXPECT_EQ(pool.refcountOf(id),  std::uint32_t{0});
+}
+
+TEST(pagedAlloc_releaseKeepsBlockWhileRefcountAboveZero) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{4, 16};
+    const auto id = pool.allocate();
+    pool.addRef(id);
+    pool.release(id);
+    EXPECT_EQ(pool.refcountOf(id),  std::uint32_t{1});
+    EXPECT_EQ(pool.numBlocksFree(), std::size_t{3});
+    pool.release(id);
+    EXPECT_EQ(pool.refcountOf(id),  std::uint32_t{0});
+    EXPECT_EQ(pool.numBlocksFree(), std::size_t{4});
+}
+
+TEST(pagedAlloc_releasedBlockCanBeReallocated) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{2, 16};
+    const auto a = pool.allocate();
+    (void)pool.allocate();
+    pool.release(a);
+    // LIFO reuse: freshly released `a` sits on top of the free list.
+    EXPECT_EQ(pool.allocate(), a);
+}
+
+TEST(pagedAlloc_hashRoundTrip) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{4, 16};
+    const auto id = pool.allocate();
+    pool.setHash(id, 0xDEADBEEFCAFEBABEULL);
+    EXPECT_EQ(pool.hashOf(id), 0xDEADBEEFCAFEBABEULL);
+}
+
+TEST(pagedAlloc_releaseClearsHash) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{4, 16};
+    const auto id = pool.allocate();
+    pool.setHash(id, 0x42ULL);
+    pool.release(id);
+    // After release the id is back in the free list. Its hash is a
+    // scratch slot the allocator zeroes on release.
+    EXPECT_EQ(pool.hashOf(id), std::uint64_t{0});
+}
+
+TEST(pagedAlloc_setHashOnFreeBlockIsNoOp) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{4, 16};
+    // Never allocated, refcount is 0.
+    pool.setHash(std::uint32_t{2}, 0xAAULL);
+    EXPECT_EQ(pool.hashOf(std::uint32_t{2}), std::uint64_t{0});
+}
+
+TEST(pagedAlloc_addRefOnFreeBlockIsNoOp) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{4, 16};
+    // Refcount stays 0, block stays free — caller-bug guard.
+    pool.addRef(std::uint32_t{2});
+    EXPECT_EQ(pool.refcountOf(std::uint32_t{2}), std::uint32_t{0});
+    EXPECT_EQ(pool.numBlocksFree(), std::size_t{4});
+}
+
+TEST(pagedAlloc_releaseOnFreeBlockIsNoOp) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{4, 16};
+    // Refcount stays 0, free-list stays at capacity — no underflow into
+    // some negative refcount, no duplicate free-list entry.
+    pool.release(std::uint32_t{2});
+    EXPECT_EQ(pool.numBlocksFree(), std::size_t{4});
+}
+
+TEST(pagedAlloc_outOfRangeIdsAreSilentlyIgnored) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    PagedKvBlockAllocator pool{2, 16};
+    // 99 is out of range for a 2-block pool.
+    pool.addRef(99);
+    pool.release(99);
+    pool.setHash(99, 0x1ULL);
+    EXPECT_EQ(pool.refcountOf(99), std::uint32_t{0});
+    EXPECT_EQ(pool.hashOf(99),     std::uint64_t{0});
+    // Pool state must be untouched.
+    EXPECT_EQ(pool.numBlocksFree(), std::size_t{2});
+}
+
+// -----------------------------------------------------------------------
+// PagedKvSequence — per-request block-table + token history + hash chain
+// -----------------------------------------------------------------------
+
+#include "runtime/serving/PagedKvSequence.hpp"
+
+TEST(pagedSeq_emptyOnConstruction) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::PagedKvSequence;
+    PagedKvBlockAllocator pool{8, 4};
+    PagedKvSequence seq{pool};
+    EXPECT_EQ(seq.numTokens(), std::size_t{0});
+    EXPECT_EQ(seq.numBlocks(), std::size_t{0});
+    EXPECT_EQ(seq.blockSize(), std::size_t{4});
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{0});
+}
+
+TEST(pagedSeq_firstAppendAllocatesFirstBlock) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::PagedKvSequence;
+    PagedKvBlockAllocator pool{8, 4};
+    PagedKvSequence seq{pool};
+    EXPECT_TRUE(seq.appendToken(42));
+    EXPECT_EQ(seq.numTokens(),      std::size_t{1});
+    EXPECT_EQ(seq.numBlocks(),      std::size_t{1});
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{1});
+}
+
+TEST(pagedSeq_exactFillUsesOneBlockAndSetsHash) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::PagedKvSequence;
+    PagedKvBlockAllocator pool{8, 4};
+    PagedKvSequence seq{pool};
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_TRUE(seq.appendToken(i));
+    }
+    EXPECT_EQ(seq.numTokens(),      std::size_t{4});
+    EXPECT_EQ(seq.numBlocks(),      std::size_t{1});
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{1});
+    // Block just got filled — hash must be non-zero.
+    const auto id = seq.blockTable().front();
+    EXPECT_TRUE(pool.hashOf(id) != std::uint64_t{0});
+}
+
+TEST(pagedSeq_overfillByOneAllocatesSecondBlock) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::PagedKvSequence;
+    PagedKvBlockAllocator pool{8, 4};
+    PagedKvSequence seq{pool};
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_TRUE(seq.appendToken(i));
+    }
+    EXPECT_EQ(seq.numTokens(), std::size_t{5});
+    EXPECT_EQ(seq.numBlocks(), std::size_t{2});
+    // First block was completed → hashed. Second block is only partial
+    // → hash slot is still zero (allocator clears it on allocate()).
+    EXPECT_TRUE(pool.hashOf(seq.blockTable()[0]) != std::uint64_t{0});
+    EXPECT_EQ(pool.hashOf(seq.blockTable()[1]), std::uint64_t{0});
+}
+
+TEST(pagedSeq_hashChainIsDeterministic) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::PagedKvSequence;
+    // Two independent sequences with the same first block must produce
+    // the same block-hash — that's the property M-PrefixCache relies on.
+    PagedKvBlockAllocator pool{8, 4};
+    PagedKvSequence a{pool};
+    PagedKvSequence b{pool};
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_TRUE(a.appendToken(i));
+        EXPECT_TRUE(b.appendToken(i));
+    }
+    EXPECT_EQ(pool.hashOf(a.blockTable()[0]),
+              pool.hashOf(b.blockTable()[0]));
+}
+
+TEST(pagedSeq_hashChainSeparatesOnDivergence) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::PagedKvSequence;
+    // Same first block, different second block → block-1 hashes differ.
+    PagedKvBlockAllocator pool{8, 4};
+    PagedKvSequence a{pool};
+    PagedKvSequence b{pool};
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_TRUE(a.appendToken(i));
+        EXPECT_TRUE(b.appendToken(i));
+    }
+    // Fill each second block with different tokens.
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_TRUE(a.appendToken(100 + i));
+        EXPECT_TRUE(b.appendToken(200 + i));
+    }
+    // Block 0 still matches (same input).
+    EXPECT_EQ(pool.hashOf(a.blockTable()[0]),
+              pool.hashOf(b.blockTable()[0]));
+    // Block 1 diverges.
+    EXPECT_TRUE(pool.hashOf(a.blockTable()[1]) !=
+                pool.hashOf(b.blockTable()[1]));
+}
+
+TEST(pagedSeq_hashChainDependsOnParent) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::PagedKvSequence;
+    // Same block-2 tokens under different block-1 tokens → different
+    // block-2 hashes. Proves parent-hash actually seeds the chain.
+    PagedKvBlockAllocator pool{8, 4};
+    PagedKvSequence a{pool};
+    PagedKvSequence b{pool};
+    // Divergent first block.
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_TRUE(a.appendToken(i));
+        EXPECT_TRUE(b.appendToken(1000 + i));
+    }
+    // Identical second block.
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_TRUE(a.appendToken(50 + i));
+        EXPECT_TRUE(b.appendToken(50 + i));
+    }
+    EXPECT_TRUE(pool.hashOf(a.blockTable()[1]) !=
+                pool.hashOf(b.blockTable()[1]));
+}
+
+TEST(pagedSeq_resetReleasesEveryBlock) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::PagedKvSequence;
+    PagedKvBlockAllocator pool{8, 4};
+    PagedKvSequence seq{pool};
+    for (int i = 0; i < 10; ++i) {
+        EXPECT_TRUE(seq.appendToken(i));
+    }
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{3});
+    seq.reset();
+    EXPECT_EQ(seq.numTokens(),      std::size_t{0});
+    EXPECT_EQ(seq.numBlocks(),      std::size_t{0});
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{0});
+    EXPECT_EQ(pool.numBlocksFree(), std::size_t{8});
+}
+
+TEST(pagedSeq_destructorReleasesBlocks) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::PagedKvSequence;
+    PagedKvBlockAllocator pool{8, 4};
+    {
+        PagedKvSequence seq{pool};
+        for (int i = 0; i < 6; ++i) {
+            EXPECT_TRUE(seq.appendToken(i));
+        }
+        EXPECT_EQ(pool.numBlocksUsed(), std::size_t{2});
+    }
+    EXPECT_EQ(pool.numBlocksUsed(), std::size_t{0});
+    EXPECT_EQ(pool.numBlocksFree(), std::size_t{8});
+}
+
+TEST(pagedSeq_oomReturnsFalseAndLeavesStateUnchanged) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::PagedKvSequence;
+    // Pool of 1 block × 4 tokens. Fills to exactly 4, then the next
+    // append needs a new block and must fail cleanly.
+    PagedKvBlockAllocator pool{1, 4};
+    PagedKvSequence seq{pool};
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_TRUE(seq.appendToken(i));
+    }
+    EXPECT_EQ(seq.numTokens(), std::size_t{4});
+    EXPECT_EQ(seq.numBlocks(), std::size_t{1});
+    EXPECT_TRUE(!seq.appendToken(99));
+    // Unchanged: still 4 tokens, still 1 block, block-hash from the
+    // earlier fill is still there.
+    EXPECT_EQ(seq.numTokens(), std::size_t{4});
+    EXPECT_EQ(seq.numBlocks(), std::size_t{1});
+    EXPECT_TRUE(pool.hashOf(seq.blockTable().front()) != std::uint64_t{0});
+}
+
+TEST(pagedSeq_moveTransfersOwnership) {
+    using ::mimirmind::runtime::serving::PagedKvBlockAllocator;
+    using ::mimirmind::runtime::serving::PagedKvSequence;
+    PagedKvBlockAllocator pool{8, 4};
+    PagedKvSequence src{pool};
+    for (int i = 0; i < 6; ++i) {
+        EXPECT_TRUE(src.appendToken(i));
+    }
+    const std::size_t blocksBeforeMove = pool.numBlocksUsed();
+    PagedKvSequence dst{std::move(src)};
+    // Pool is untouched by the move — blocks changed owner, not lifecycle.
+    EXPECT_EQ(pool.numBlocksUsed(), blocksBeforeMove);
+    EXPECT_EQ(dst.numTokens(), std::size_t{6});
+    EXPECT_EQ(dst.numBlocks(), std::size_t{2});
+    // Moved-from is empty and its destructor is a no-op.
+    EXPECT_EQ(src.numTokens(), std::size_t{0});
+    EXPECT_EQ(src.numBlocks(), std::size_t{0});
+}
+
 int main() {
     return mm::test::run();
 }
