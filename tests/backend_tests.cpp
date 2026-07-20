@@ -336,6 +336,40 @@ TEST(registry_parseKind_rejectsUnknown) {
     EXPECT_TRUE(!BackendRegistry::parseKind("").has_value());
 }
 
+// -----------------------------------------------------------------------
+// BatchCapacityProbe — roundToSchedulerStep + skeleton fallback
+// -----------------------------------------------------------------------
+
+#include "runtime/serving/BatchCapacityProbe.hpp"
+
+TEST(batchProbe_roundToSchedulerStep_powerOfTwo) {
+    using ::mimirmind::runtime::serving::BatchCapacityProbe;
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(1),  std::size_t{1});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(2),  std::size_t{2});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(4),  std::size_t{4});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(8),  std::size_t{8});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(16), std::size_t{16});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(32), std::size_t{32});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(64), std::size_t{32});
+}
+
+TEST(batchProbe_roundToSchedulerStep_downRounds) {
+    using ::mimirmind::runtime::serving::BatchCapacityProbe;
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(3),  std::size_t{2});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(7),  std::size_t{4});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(15), std::size_t{8});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(27), std::size_t{16});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(0),  std::size_t{1});
+}
+
+TEST(batchProbe_skeletonFallback_isSingleSession) {
+    using ::mimirmind::runtime::serving::BatchCapacityProbe;
+    const auto est = BatchCapacityProbe::estimateConservativeFallback();
+    EXPECT_EQ(est.sustainableBatch, std::size_t{1});
+    EXPECT_TRUE(!est.servingClassRecommended);
+    EXPECT_TRUE(!est.reasoning.empty());
+}
+
 int main() {
     return mm::test::run();
 }
