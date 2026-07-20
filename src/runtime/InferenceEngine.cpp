@@ -587,6 +587,34 @@ void InferenceEngine::finalizeLoad() {
                 break;
         }
 
+        // E2 guard — Bragi-v1 restricts serving-class (continuous
+        // batching + PagedAttention) to the CUDA path. L0/HIP/CPU
+        // backends stay single-session per the M-Cuda.Batch guardrail.
+        // If the decision above landed on true but the backend isn't
+        // CUDA, either hard-error (operator explicitly asked via Force
+        // — silent downgrade would be surprising) or downgrade+warn
+        // (Auto picked it on probe grounds, operator didn't ask
+        // explicitly).
+        if (_servingClassEnabled &&
+            _computeCtx->kind() != core::backend::BackendKind::Cuda) {
+            const auto backendName =
+                core::backend::BackendRegistry::name(_computeCtx->kind());
+            if (_cfg.serving.enableBatching == TriState::Force) {
+                throw std::runtime_error{
+                    std::string{"serving.enableBatching=force but backend '"}
+                    + backendName + "' is not CUDA — Bragi-v1 restricts "
+                    "continuous-batching to the CUDA path (L0/HIP/CPU stay "
+                    "single-session). Set serving.enableBatching to \"auto\" "
+                    "or \"disable\", or select a CUDA backend."};
+            }
+            _servingClassEnabled = false;
+            MM_LOG_WARN("serving",
+                        "batching would engage but backend '{}' is not CUDA — "
+                        "Bragi-v1 restricts serving-class to CUDA "
+                        "(M-Cuda.Batch guardrail). Falling back to "
+                        "single-session.", backendName);
+        }
+
         MM_LOG_INFO("serving",
                     "BatchCapacityProbe: {}", _batchCapacity.reasoning);
         MM_LOG_INFO("serving",
