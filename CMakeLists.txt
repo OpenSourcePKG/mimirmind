@@ -2032,6 +2032,35 @@ install(TARGETS mimirmind
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     COMPONENT runtime)
 
+# INSTALL_RPATH — make the installed binaries self-sufficient without
+# LD_LIBRARY_PATH gymnastics. Backend SDK libs (ROCm libamdhip64,
+# CUDA libcudart, Intel libze_loader) tend to live in non-standard
+# paths that aren't in the system's ldconfig cache on minimal ROCm/
+# CUDA/L0 installs. CMake strips build-tree RPATH on install by
+# default; we re-add the SDK lib dir explicitly so `/usr/local/bin/
+# mimirmind` runs standalone.
+#
+# find_package(...) has already populated the concrete lib dir at
+# ${HIP_PATH}/lib / equivalent by this point. Build a semicolon-
+# separated list of all backend lib dirs so multi-backend builds
+# (e.g. HIP + L0) stack their rpaths without depending on APPEND
+# semantics of set_property (which was observed to no-op on some
+# CMake versions when the property was previously unset).
+set(_MIMIRMIND_INSTALL_RPATH "")
+if(MIMIRMIND_ENABLE_HIP)
+    list(APPEND _MIMIRMIND_INSTALL_RPATH "${HIP_PATH}/lib")
+endif()
+if(MIMIRMIND_ENABLE_CUDA)
+    # CUDA runtime typically lives at /usr/local/cuda/lib64 (or the
+    # active `cuda` symlink) on driver-managed installs.
+    list(APPEND _MIMIRMIND_INSTALL_RPATH "/usr/local/cuda/lib64")
+endif()
+if(_MIMIRMIND_INSTALL_RPATH)
+    set_target_properties(mimirmind PROPERTIES
+        INSTALL_RPATH "${_MIMIRMIND_INSTALL_RPATH}"
+        INSTALL_RPATH_USE_LINK_PATH TRUE)
+endif()
+
 # Munin persistent-memory daemon, when compiled in (L0-only today).
 if(TARGET munin)
     install(TARGETS munin
