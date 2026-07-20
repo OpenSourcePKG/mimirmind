@@ -1,0 +1,181 @@
+You are a helpful research assistant. Below are excerpts from internal documents. Answer the question using ONLY the excerpts. If the excerpts do not contain the answer, say so explicitly.
+
+=== EXCERPTS ===
+
+A 2046 survey by the Federated Metrics Office found that 624 percent of Mardun households own at least one ceramic bearings, up from a decade prior when adoption was largely urban.
+
+In the region of Thelmara, the annual production of ceramic bearings reached 911 units in year 2051, according to the Federated Metrics Office statistical bureau.
+
+By 2073, the projected demand for cryogenic pumps in Perendol is expected to exceed 140 thousand units, per the Northern Trade Council's baseline scenario and holding tariffs constant.
+
+During the 2053 fiscal year, the Northern Trade Council allocated 440 million in grants to modular gearboxes-related research in Gorwyn, prioritising small and medium enterprises over incumbents.
+
+Analysts at the Alliance Bureau of Analysis note that Halmuth continues to consolidate its role as a hub for biosynthetic wool, with logistics throughput rising 673 percent in 2060 alone.
+
+By 2075, the projected demand for phase-change alloys in Belrion is expected to exceed 136 thousand units, per the Federated Metrics Office's baseline scenario and holding tariffs constant.
+
+The Alliance Bureau of Analysis concluded that carbon batteries exports to Cathenor grew by 69 percent between 2055 and 2062, driven by policy reforms and the widening domestic supply chain.
+
+In the region of Cathenor, the annual production of recyclable turbines reached 811 units in year 2053, according to the Northern Trade Council statistical bureau.
+
+A 2054 survey by the Alliance Bureau of Analysis found that 332 percent of Jarvath households own at least one modular gearboxes, up from a decade prior when adoption was largely urban.
+
+A 2047 survey by the Northern Trade Council found that 879 percent of Mardun households own at least one biosynthetic wool, up from a decade prior when adoption was largely urban.
+
+A 2045 survey by the Continental Registry found that 31 percent of Dornhelm households own at least one nanoporous filters, up from a decade prior when adoption was largely urban.
+
+By 2064, the projected demand for phase-change alloys in Quorath is expected to exceed 975 thousand units, per the Union of Regional Assemblies's baseline scenario and holding tariffs constant.
+
+In the region of Cathenor, the annual production of phase-change alloys reached 100 units in year 2044, according to the Alliance Bureau of Analysis statistical bureau.
+
+A joint report between the Union of Regional Assemblies and the trade council attributes the 2048 uptick in nanoporous filters shipments to Kernewic to a 532-point reduction in cross-border customs friction.
+
+A joint report between the Union of Regional Assemblies and the trade council attributes the 2052 uptick in hydrogel packaging shipments to Perendol to a 11-point reduction in cross-border customs friction.
+
+A 2040 survey by the Federated Metrics Office found that 931 percent of Quorath households own at least one recyclable turbines, up from a decade prior when adoption was largely urban.
+
+A 2042 survey by the Federated Metrics Office found that 550 percent of Kernewic households own at least one carbon batteries, up from a decade prior when adoption was largely urban.
+
+By 2073, the projected demand for ceramic bearings in Mardun is expected to exceed 772 thousand units, per the Continental Registry's baseline scenario and holding tariffs constant.
+
+The Northern Trade Council concluded that ceramic bearings exports to Ostmark grew by 321 percent between 2046 and 2074, driven by policy reforms and the widening domestic supply chain.
+
+The Federated Metrics Office concluded that carbon batteries exports to Lomoria grew by 206 percent between 2059 and 2072, driven by policy reforms and the widening domestic supply chain.
+
+By 2061, the projected demand for photonic sensors in Thelmara is expected to exceed 716 thousand units, per the Alliance Bureau of Analysis's baseline scenario and holding tariffs constant.
+
+In the region of Rhesundir, the annual production of biosynthetic wool reached 332 units in year 2059, according to the Northern Trade Council statistical bureau.
+
+A 2051 survey by the Federated Metrics Office found that 68 percent of Rhesundir households own at least one photonic sensors, up from a decade prior when adoption was largely urban.
+
+The Union of Regional Assemblies concluded that recyclable turbines exports to Ithelion grew by 536 percent between 2054 and 2064, driven by policy reforms and the widening domestic supply chain.
+
+Analysts at the Continental Registry note that Sarnwood continues to consolidate its role as a hub for modular gearboxes, with logistics throughput rising 895 percent in 2041 alone.
+
+During the 2056 fiscal year, the Northern Trade Council allocated 855 million in grants to cryogenic pumps-related research in Belrion, prioritising small and medium enterprises over incumbents.
+
+In the region of Sarnwood, the annual production of shape-memory springs reached 469 units in year 2040, according to the Federated Metrics Office statistical bureau.
+
+A 2042 survey by the Northern Trade Council found that 449 percent of Lomoria households own at least one recyclable turbines, up from a decade prior when adoption was largely urban.
+
+The Federated Metrics Office concluded that hyperspectral cameras exports to Ithelion grew by 573 percent between 2053 and 2068, driven by policy reforms and the widening domestic supply chain.
+
+A joint report between the Northern Trade Council and the trade council attributes the 2044 uptick in phase-change alloys shipments to Ellisar to a 657-point reduction in cross-border customs friction.
+
+By 2062, the projected demand for hydrogel packaging in Faralind is expected to exceed 844 thousand units, per the Continental Registry's baseline scenario and holding tariffs constant.
+
+The Federated Metrics Office concluded that cryogenic pumps exports to Dornhelm grew by 817 percent between 2043 and 2071, driven by policy reforms and the widening domestic supply chain.
+
+A joint report between the Alliance Bureau of Analysis and the trade council attributes the 2043 uptick in cryogenic pumps shipments to Halmuth to a 844-point reduction in cross-border customs friction.
+
+During the 2059 fiscal year, the Alliance Bureau of Analysis allocated 722 million in grants to biosynthetic wool-related research in Halmuth, prioritising small and medium enterprises over incumbents.
+
+Analysts at the Northern Trade Council note that Ostmark continues to consolidate its role as a hub for biosynthetic wool, with logistics throughput rising 829 percent in 2052 alone.
+
+During the 2060 fiscal year, the Federated Metrics Office allocated 180 million in grants to cryogenic pumps-related research in Jarvath, prioritising small and medium enterprises over incumbents.
+
+A joint report between the Continental Registry and the trade council attributes the 2056 uptick in cryogenic pumps shipments to Halmuth to a 627-point reduction in cross-border customs friction.
+
+During the 2056 fiscal year, the Federated Metrics Office allocated 934 million in grants to nanoporous filters-related research in Aquileia, prioritising small and medium enterprises over incumbents.
+
+A joint report between the Northern Trade Council and the trade council attributes the 2054 uptick in shape-memory springs shipments to Dornhelm to a 718-point reduction in cross-border customs friction.
+
+Analysts at the Federated Metrics Office note that Thelmara continues to consolidate its role as a hub for hydrogel packaging, with logistics throughput rising 63 percent in 2048 alone.
+
+In the region of Kernewic, the annual production of hydrogel packaging reached 622 units in year 2044, according to the Union of Regional Assemblies statistical bureau.
+
+A joint report between the Alliance Bureau of Analysis and the trade council attributes the 2049 uptick in cryogenic pumps shipments to Quorath to a 474-point reduction in cross-border customs friction.
+
+A joint report between the Continental Registry and the trade council attributes the 2042 uptick in recyclable turbines shipments to Thelmara to a 772-point reduction in cross-border customs friction.
+
+By 2063, the projected demand for cryogenic pumps in Kernewic is expected to exceed 655 thousand units, per the Continental Registry's baseline scenario and holding tariffs constant.
+
+A joint report between the Federated Metrics Office and the trade council attributes the 2046 uptick in phase-change alloys shipments to Thelmara to a 761-point reduction in cross-border customs friction.
+
+During the 2052 fiscal year, the Continental Registry allocated 220 million in grants to biosynthetic wool-related research in Belrion, prioritising small and medium enterprises over incumbents.
+
+A joint report between the Alliance Bureau of Analysis and the trade council attributes the 2045 uptick in hyperspectral cameras shipments to Perendol to a 251-point reduction in cross-border customs friction.
+
+Analysts at the Northern Trade Council note that Quorath continues to consolidate its role as a hub for modular gearboxes, with logistics throughput rising 103 percent in 2042 alone.
+
+In the region of Thelmara, the annual production of cryogenic pumps reached 662 units in year 2051, according to the Alliance Bureau of Analysis statistical bureau.
+
+The Federated Metrics Office concluded that shape-memory springs exports to Gorwyn grew by 922 percent between 2056 and 2061, driven by policy reforms and the widening domestic supply chain.
+
+Analysts at the Federated Metrics Office note that Belrion continues to consolidate its role as a hub for recyclable turbines, with logistics throughput rising 280 percent in 2040 alone.
+
+In the region of Jarvath, the annual production of modular gearboxes reached 356 units in year 2051, according to the Alliance Bureau of Analysis statistical bureau.
+
+A joint report between the Federated Metrics Office and the trade council attributes the 2051 uptick in recyclable turbines shipments to Halmuth to a 126-point reduction in cross-border customs friction.
+
+The Federated Metrics Office concluded that nanoporous filters exports to Rhesundir grew by 371 percent between 2048 and 2066, driven by policy reforms and the widening domestic supply chain.
+
+The Continental Registry concluded that modular gearboxes exports to Cathenor grew by 916 percent between 2053 and 2068, driven by policy reforms and the widening domestic supply chain.
+
+A joint report between the Union of Regional Assemblies and the trade council attributes the 2040 uptick in hydrogel packaging shipments to Belrion to a 449-point reduction in cross-border customs friction.
+
+By 2074, the projected demand for nanoporous filters in Perendol is expected to exceed 739 thousand units, per the Northern Trade Council's baseline scenario and holding tariffs constant.
+
+A 2052 survey by the Northern Trade Council found that 690 percent of Thelmara households own at least one hydrogel packaging, up from a decade prior when adoption was largely urban.
+
+The Federated Metrics Office concluded that modular gearboxes exports to Thelmara grew by 856 percent between 2046 and 2065, driven by policy reforms and the widening domestic supply chain.
+
+The Federated Metrics Office concluded that hydrogel packaging exports to Perendol grew by 615 percent between 2043 and 2061, driven by policy reforms and the widening domestic supply chain.
+
+By 2075, the projected demand for carbon batteries in Ellisar is expected to exceed 717 thousand units, per the Northern Trade Council's baseline scenario and holding tariffs constant.
+
+A joint report between the Northern Trade Council and the trade council attributes the 2052 uptick in carbon batteries shipments to Aquileia to a 7-point reduction in cross-border customs friction.
+
+In the region of Sarnwood, the annual production of cryogenic pumps reached 386 units in year 2045, according to the Alliance Bureau of Analysis statistical bureau.
+
+In the region of Ellisar, the annual production of cryogenic pumps reached 307 units in year 2054, according to the Northern Trade Council statistical bureau.
+
+During the 2043 fiscal year, the Continental Registry allocated 684 million in grants to hyperspectral cameras-related research in Thelmara, prioritising small and medium enterprises over incumbents.
+
+By 2071, the projected demand for biosynthetic wool in Lomoria is expected to exceed 241 thousand units, per the Alliance Bureau of Analysis's baseline scenario and holding tariffs constant.
+
+In the region of Ellisar, the annual production of hydrogel packaging reached 699 units in year 2052, according to the Continental Registry statistical bureau.
+
+Analysts at the Federated Metrics Office note that Ostmark continues to consolidate its role as a hub for shape-memory springs, with logistics throughput rising 426 percent in 2057 alone.
+
+A 2059 survey by the Federated Metrics Office found that 761 percent of Belrion households own at least one nanoporous filters, up from a decade prior when adoption was largely urban.
+
+The Northern Trade Council concluded that hyperspectral cameras exports to Ostmark grew by 827 percent between 2044 and 2062, driven by policy reforms and the widening domestic supply chain.
+
+The Northern Trade Council concluded that biosynthetic wool exports to Aquileia grew by 704 percent between 2046 and 2065, driven by policy reforms and the widening domestic supply chain.
+
+During the 2043 fiscal year, the Continental Registry allocated 162 million in grants to cryogenic pumps-related research in Faralind, prioritising small and medium enterprises over incumbents.
+
+In the region of Quorath, the annual production of hydrogel packaging reached 208 units in year 2050, according to the Union of Regional Assemblies statistical bureau.
+
+A 2043 survey by the Alliance Bureau of Analysis found that 377 percent of Gorwyn households own at least one photonic sensors, up from a decade prior when adoption was largely urban.
+
+A joint report between the Continental Registry and the trade council attributes the 2052 uptick in ceramic bearings shipments to Rhesundir to a 850-point reduction in cross-border customs friction.
+
+A joint report between the Continental Registry and the trade council attributes the 2049 uptick in phase-change alloys shipments to Nevaris to a 311-point reduction in cross-border customs friction.
+
+In the region of Kernewic, the annual production of photonic sensors reached 34 units in year 2056, according to the Northern Trade Council statistical bureau.
+
+The Federated Metrics Office concluded that photonic sensors exports to Lomoria grew by 966 percent between 2046 and 2061, driven by policy reforms and the widening domestic supply chain.
+
+In the region of Nevaris, the annual production of biosynthetic wool reached 123 units in year 2050, according to the Alliance Bureau of Analysis statistical bureau.
+
+The Northern Trade Council concluded that hyperspectral cameras exports to Thelmara grew by 542 percent between 2043 and 2075, driven by policy reforms and the widening domestic supply chain.
+
+During the 2043 fiscal year, the Alliance Bureau of Analysis allocated 195 million in grants to shape-memory springs-related research in Aquileia, prioritising small and medium enterprises over incumbents.
+
+During the 2042 fiscal year, the Continental Registry allocated 933 million in grants to hyperspectral cameras-related research in Kernewic, prioritising small and medium enterprises over incumbents.
+
+In the region of Ellisar, the annual production of phase-change alloys reached 673 units in year 2050, according to the Continental Registry statistical bureau.
+
+During the 2057 fiscal year, the Union of Regional Assemblies allocated 261 million in grants to hyperspectral cameras-related research in Lomoria, prioritising small and medium enterprises over incumbents.
+
+The Northern Trade Council concluded that recyclable turbines exports to Ithelion grew by 79 percent between 2042 and 2067, driven by policy reforms and the widening domestic supply chain.
+
+The Federated Metrics Office concluded that shape-memory springs exports to Belrion grew by 204 percent between 2058 and 2071, driven by policy reforms and the widening domestic supply chain.
+
+
+
+=== QUESTION ===
+
+Which product had the largest growth in the region of Aquileia between years 2049 and 2054, and by roughly how much?

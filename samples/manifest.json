@@ -1,0 +1,930 @@
+{
+  "version": 1,
+  "seed": 20260720,
+  "chars_per_token": {
+    "en": 4.0,
+    "de": 3.0
+  },
+  "shapes": [
+    "chat-multiturn",
+    "code",
+    "instruct",
+    "needle",
+    "rag",
+    "summarize"
+  ],
+  "lengths": [
+    "120",
+    "250",
+    "512",
+    "1k",
+    "2k",
+    "4k",
+    "8k",
+    "16k",
+    "32k"
+  ],
+  "languages": [
+    "en",
+    "de"
+  ],
+  "decode_targets": {
+    "instruct": [
+      32,
+      128
+    ],
+    "rag": [
+      128,
+      512
+    ],
+    "needle": [
+      32
+    ],
+    "code": [
+      512,
+      2048
+    ],
+    "summarize": [
+      128,
+      512
+    ],
+    "chat-multiturn": [
+      128,
+      512
+    ]
+  },
+  "entries": [
+    {
+      "id": "en/instruct-120",
+      "path": "prompts/en/instruct-120.txt",
+      "shape": "instruct",
+      "lang": "en",
+      "length_bucket": "120",
+      "token_target": 120,
+      "char_count": 639,
+      "decode_targets": [
+        32,
+        128
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/instruct-120",
+      "path": "prompts/de/instruct-120.txt",
+      "shape": "instruct",
+      "lang": "de",
+      "length_bucket": "120",
+      "token_target": 120,
+      "char_count": 478,
+      "decode_targets": [
+        32,
+        128
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/instruct-250",
+      "path": "prompts/en/instruct-250.txt",
+      "shape": "instruct",
+      "lang": "en",
+      "length_bucket": "250",
+      "token_target": 250,
+      "char_count": 1007,
+      "decode_targets": [
+        32,
+        128
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/instruct-250",
+      "path": "prompts/de/instruct-250.txt",
+      "shape": "instruct",
+      "lang": "de",
+      "length_bucket": "250",
+      "token_target": 250,
+      "char_count": 926,
+      "decode_targets": [
+        32,
+        128
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/instruct-512",
+      "path": "prompts/en/instruct-512.txt",
+      "shape": "instruct",
+      "lang": "en",
+      "length_bucket": "512",
+      "token_target": 512,
+      "char_count": 2192,
+      "decode_targets": [
+        32,
+        128
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/instruct-512",
+      "path": "prompts/de/instruct-512.txt",
+      "shape": "instruct",
+      "lang": "de",
+      "length_bucket": "512",
+      "token_target": 512,
+      "char_count": 1742,
+      "decode_targets": [
+        32,
+        128
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/rag-512",
+      "path": "prompts/en/rag-512.txt",
+      "shape": "rag",
+      "lang": "en",
+      "length_bucket": "512",
+      "token_target": 512,
+      "char_count": 2234,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/rag-512",
+      "path": "prompts/de/rag-512.txt",
+      "shape": "rag",
+      "lang": "de",
+      "length_bucket": "512",
+      "token_target": 512,
+      "char_count": 1650,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/rag-1k",
+      "path": "prompts/en/rag-1k.txt",
+      "shape": "rag",
+      "lang": "en",
+      "length_bucket": "1k",
+      "token_target": 1024,
+      "char_count": 4268,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/rag-1k",
+      "path": "prompts/de/rag-1k.txt",
+      "shape": "rag",
+      "lang": "de",
+      "length_bucket": "1k",
+      "token_target": 1024,
+      "char_count": 3115,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/rag-2k",
+      "path": "prompts/en/rag-2k.txt",
+      "shape": "rag",
+      "lang": "en",
+      "length_bucket": "2k",
+      "token_target": 2048,
+      "char_count": 8323,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/rag-2k",
+      "path": "prompts/de/rag-2k.txt",
+      "shape": "rag",
+      "lang": "de",
+      "length_bucket": "2k",
+      "token_target": 2048,
+      "char_count": 6155,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/rag-4k",
+      "path": "prompts/en/rag-4k.txt",
+      "shape": "rag",
+      "lang": "en",
+      "length_bucket": "4k",
+      "token_target": 4096,
+      "char_count": 16552,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/rag-4k",
+      "path": "prompts/de/rag-4k.txt",
+      "shape": "rag",
+      "lang": "de",
+      "length_bucket": "4k",
+      "token_target": 4096,
+      "char_count": 12430,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/rag-8k",
+      "path": "prompts/en/rag-8k.txt",
+      "shape": "rag",
+      "lang": "en",
+      "length_bucket": "8k",
+      "token_target": 8192,
+      "char_count": 32884,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/rag-8k",
+      "path": "prompts/de/rag-8k.txt",
+      "shape": "rag",
+      "lang": "de",
+      "length_bucket": "8k",
+      "token_target": 8192,
+      "char_count": 24581,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/rag-16k",
+      "path": "prompts/en/rag-16k.txt",
+      "shape": "rag",
+      "lang": "en",
+      "length_bucket": "16k",
+      "token_target": 16384,
+      "char_count": 65658,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/rag-16k",
+      "path": "prompts/de/rag-16k.txt",
+      "shape": "rag",
+      "lang": "de",
+      "length_bucket": "16k",
+      "token_target": 16384,
+      "char_count": 49164,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/rag-32k",
+      "path": "prompts/en/rag-32k.txt",
+      "shape": "rag",
+      "lang": "en",
+      "length_bucket": "32k",
+      "token_target": 32768,
+      "char_count": 131218,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/rag-32k",
+      "path": "prompts/de/rag-32k.txt",
+      "shape": "rag",
+      "lang": "de",
+      "length_bucket": "32k",
+      "token_target": 32768,
+      "char_count": 98487,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/needle-1k",
+      "path": "prompts/en/needle-1k.json",
+      "shape": "needle",
+      "lang": "en",
+      "length_bucket": "1k",
+      "token_target": 1024,
+      "char_count": 4249,
+      "decode_targets": [
+        32
+      ],
+      "type": "needle",
+      "needle_field": "needle",
+      "prompt_field": "prompt",
+      "position_pct": 0.428
+    },
+    {
+      "id": "de/needle-1k",
+      "path": "prompts/de/needle-1k.json",
+      "shape": "needle",
+      "lang": "de",
+      "length_bucket": "1k",
+      "token_target": 1024,
+      "char_count": 3297,
+      "decode_targets": [
+        32
+      ],
+      "type": "needle",
+      "needle_field": "needle",
+      "prompt_field": "prompt",
+      "position_pct": 0.189
+    },
+    {
+      "id": "en/needle-2k",
+      "path": "prompts/en/needle-2k.json",
+      "shape": "needle",
+      "lang": "en",
+      "length_bucket": "2k",
+      "token_target": 2048,
+      "char_count": 8429,
+      "decode_targets": [
+        32
+      ],
+      "type": "needle",
+      "needle_field": "needle",
+      "prompt_field": "prompt",
+      "position_pct": 0.502
+    },
+    {
+      "id": "de/needle-2k",
+      "path": "prompts/de/needle-2k.json",
+      "shape": "needle",
+      "lang": "de",
+      "length_bucket": "2k",
+      "token_target": 2048,
+      "char_count": 6314,
+      "decode_targets": [
+        32
+      ],
+      "type": "needle",
+      "needle_field": "needle",
+      "prompt_field": "prompt",
+      "position_pct": 0.761
+    },
+    {
+      "id": "en/needle-4k",
+      "path": "prompts/en/needle-4k.json",
+      "shape": "needle",
+      "lang": "en",
+      "length_bucket": "4k",
+      "token_target": 4096,
+      "char_count": 16528,
+      "decode_targets": [
+        32
+      ],
+      "type": "needle",
+      "needle_field": "needle",
+      "prompt_field": "prompt",
+      "position_pct": 0.285
+    },
+    {
+      "id": "de/needle-4k",
+      "path": "prompts/de/needle-4k.json",
+      "shape": "needle",
+      "lang": "de",
+      "length_bucket": "4k",
+      "token_target": 4096,
+      "char_count": 12393,
+      "decode_targets": [
+        32
+      ],
+      "type": "needle",
+      "needle_field": "needle",
+      "prompt_field": "prompt",
+      "position_pct": 0.705
+    },
+    {
+      "id": "en/needle-8k",
+      "path": "prompts/en/needle-8k.json",
+      "shape": "needle",
+      "lang": "en",
+      "length_bucket": "8k",
+      "token_target": 8192,
+      "char_count": 32997,
+      "decode_targets": [
+        32
+      ],
+      "type": "needle",
+      "needle_field": "needle",
+      "prompt_field": "prompt",
+      "position_pct": 0.416
+    },
+    {
+      "id": "de/needle-8k",
+      "path": "prompts/de/needle-8k.json",
+      "shape": "needle",
+      "lang": "de",
+      "length_bucket": "8k",
+      "token_target": 8192,
+      "char_count": 24758,
+      "decode_targets": [
+        32
+      ],
+      "type": "needle",
+      "needle_field": "needle",
+      "prompt_field": "prompt",
+      "position_pct": 0.318
+    },
+    {
+      "id": "en/needle-16k",
+      "path": "prompts/en/needle-16k.json",
+      "shape": "needle",
+      "lang": "en",
+      "length_bucket": "16k",
+      "token_target": 16384,
+      "char_count": 65728,
+      "decode_targets": [
+        32
+      ],
+      "type": "needle",
+      "needle_field": "needle",
+      "prompt_field": "prompt",
+      "position_pct": 0.724
+    },
+    {
+      "id": "de/needle-16k",
+      "path": "prompts/de/needle-16k.json",
+      "shape": "needle",
+      "lang": "de",
+      "length_bucket": "16k",
+      "token_target": 16384,
+      "char_count": 49270,
+      "decode_targets": [
+        32
+      ],
+      "type": "needle",
+      "needle_field": "needle",
+      "prompt_field": "prompt",
+      "position_pct": 0.365
+    },
+    {
+      "id": "en/needle-32k",
+      "path": "prompts/en/needle-32k.json",
+      "shape": "needle",
+      "lang": "en",
+      "length_bucket": "32k",
+      "token_target": 32768,
+      "char_count": 131321,
+      "decode_targets": [
+        32
+      ],
+      "type": "needle",
+      "needle_field": "needle",
+      "prompt_field": "prompt",
+      "position_pct": 0.746
+    },
+    {
+      "id": "de/needle-32k",
+      "path": "prompts/de/needle-32k.json",
+      "shape": "needle",
+      "lang": "de",
+      "length_bucket": "32k",
+      "token_target": 32768,
+      "char_count": 98453,
+      "decode_targets": [
+        32
+      ],
+      "type": "needle",
+      "needle_field": "needle",
+      "prompt_field": "prompt",
+      "position_pct": 0.669
+    },
+    {
+      "id": "en/code-250",
+      "path": "prompts/en/code-250.txt",
+      "shape": "code",
+      "lang": "en",
+      "length_bucket": "250",
+      "token_target": 250,
+      "char_count": 1050,
+      "decode_targets": [
+        512,
+        2048
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/code-250",
+      "path": "prompts/de/code-250.txt",
+      "shape": "code",
+      "lang": "de",
+      "length_bucket": "250",
+      "token_target": 250,
+      "char_count": 1080,
+      "decode_targets": [
+        512,
+        2048
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/code-512",
+      "path": "prompts/en/code-512.txt",
+      "shape": "code",
+      "lang": "en",
+      "length_bucket": "512",
+      "token_target": 512,
+      "char_count": 2686,
+      "decode_targets": [
+        512,
+        2048
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/code-512",
+      "path": "prompts/de/code-512.txt",
+      "shape": "code",
+      "lang": "de",
+      "length_bucket": "512",
+      "token_target": 512,
+      "char_count": 1898,
+      "decode_targets": [
+        512,
+        2048
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/code-1k",
+      "path": "prompts/en/code-1k.txt",
+      "shape": "code",
+      "lang": "en",
+      "length_bucket": "1k",
+      "token_target": 1024,
+      "char_count": 4322,
+      "decode_targets": [
+        512,
+        2048
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/code-1k",
+      "path": "prompts/de/code-1k.txt",
+      "shape": "code",
+      "lang": "de",
+      "length_bucket": "1k",
+      "token_target": 1024,
+      "char_count": 3534,
+      "decode_targets": [
+        512,
+        2048
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/code-2k",
+      "path": "prompts/en/code-2k.txt",
+      "shape": "code",
+      "lang": "en",
+      "length_bucket": "2k",
+      "token_target": 2048,
+      "char_count": 8412,
+      "decode_targets": [
+        512,
+        2048
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/code-2k",
+      "path": "prompts/de/code-2k.txt",
+      "shape": "code",
+      "lang": "de",
+      "length_bucket": "2k",
+      "token_target": 2048,
+      "char_count": 6806,
+      "decode_targets": [
+        512,
+        2048
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/summarize-1k",
+      "path": "prompts/en/summarize-1k.txt",
+      "shape": "summarize",
+      "lang": "en",
+      "length_bucket": "1k",
+      "token_target": 1024,
+      "char_count": 4147,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/summarize-1k",
+      "path": "prompts/de/summarize-1k.txt",
+      "shape": "summarize",
+      "lang": "de",
+      "length_bucket": "1k",
+      "token_target": 1024,
+      "char_count": 3208,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/summarize-2k",
+      "path": "prompts/en/summarize-2k.txt",
+      "shape": "summarize",
+      "lang": "en",
+      "length_bucket": "2k",
+      "token_target": 2048,
+      "char_count": 8214,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/summarize-2k",
+      "path": "prompts/de/summarize-2k.txt",
+      "shape": "summarize",
+      "lang": "de",
+      "length_bucket": "2k",
+      "token_target": 2048,
+      "char_count": 6333,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/summarize-4k",
+      "path": "prompts/en/summarize-4k.txt",
+      "shape": "summarize",
+      "lang": "en",
+      "length_bucket": "4k",
+      "token_target": 4096,
+      "char_count": 16449,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/summarize-4k",
+      "path": "prompts/de/summarize-4k.txt",
+      "shape": "summarize",
+      "lang": "de",
+      "length_bucket": "4k",
+      "token_target": 4096,
+      "char_count": 12408,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/summarize-8k",
+      "path": "prompts/en/summarize-8k.txt",
+      "shape": "summarize",
+      "lang": "en",
+      "length_bucket": "8k",
+      "token_target": 8192,
+      "char_count": 32809,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/summarize-8k",
+      "path": "prompts/de/summarize-8k.txt",
+      "shape": "summarize",
+      "lang": "de",
+      "length_bucket": "8k",
+      "token_target": 8192,
+      "char_count": 24584,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/summarize-16k",
+      "path": "prompts/en/summarize-16k.txt",
+      "shape": "summarize",
+      "lang": "en",
+      "length_bucket": "16k",
+      "token_target": 16384,
+      "char_count": 65709,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/summarize-16k",
+      "path": "prompts/de/summarize-16k.txt",
+      "shape": "summarize",
+      "lang": "de",
+      "length_bucket": "16k",
+      "token_target": 16384,
+      "char_count": 49253,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/summarize-32k",
+      "path": "prompts/en/summarize-32k.txt",
+      "shape": "summarize",
+      "lang": "en",
+      "length_bucket": "32k",
+      "token_target": 32768,
+      "char_count": 131174,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "de/summarize-32k",
+      "path": "prompts/de/summarize-32k.txt",
+      "shape": "summarize",
+      "lang": "de",
+      "length_bucket": "32k",
+      "token_target": 32768,
+      "char_count": 98363,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "prompt"
+    },
+    {
+      "id": "en/chat-multiturn-512",
+      "path": "chats/en/chat-multiturn-512.jsonl",
+      "shape": "chat-multiturn",
+      "lang": "en",
+      "length_bucket": "512",
+      "token_target": 512,
+      "char_count": 2045,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "chat",
+      "n_messages": 10
+    },
+    {
+      "id": "de/chat-multiturn-512",
+      "path": "chats/de/chat-multiturn-512.jsonl",
+      "shape": "chat-multiturn",
+      "lang": "de",
+      "length_bucket": "512",
+      "token_target": 512,
+      "char_count": 1518,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "chat",
+      "n_messages": 8
+    },
+    {
+      "id": "en/chat-multiturn-1k",
+      "path": "chats/en/chat-multiturn-1k.jsonl",
+      "shape": "chat-multiturn",
+      "lang": "en",
+      "length_bucket": "1k",
+      "token_target": 1024,
+      "char_count": 3933,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "chat",
+      "n_messages": 16
+    },
+    {
+      "id": "de/chat-multiturn-1k",
+      "path": "chats/de/chat-multiturn-1k.jsonl",
+      "shape": "chat-multiturn",
+      "lang": "de",
+      "length_bucket": "1k",
+      "token_target": 1024,
+      "char_count": 2949,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "chat",
+      "n_messages": 12
+    },
+    {
+      "id": "en/chat-multiturn-2k",
+      "path": "chats/en/chat-multiturn-2k.jsonl",
+      "shape": "chat-multiturn",
+      "lang": "en",
+      "length_bucket": "2k",
+      "token_target": 2048,
+      "char_count": 8431,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "chat",
+      "n_messages": 30
+    },
+    {
+      "id": "de/chat-multiturn-2k",
+      "path": "chats/de/chat-multiturn-2k.jsonl",
+      "shape": "chat-multiturn",
+      "lang": "de",
+      "length_bucket": "2k",
+      "token_target": 2048,
+      "char_count": 5856,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "chat",
+      "n_messages": 20
+    },
+    {
+      "id": "en/chat-multiturn-4k",
+      "path": "chats/en/chat-multiturn-4k.jsonl",
+      "shape": "chat-multiturn",
+      "lang": "en",
+      "length_bucket": "4k",
+      "token_target": 4096,
+      "char_count": 16091,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "chat",
+      "n_messages": 54
+    },
+    {
+      "id": "de/chat-multiturn-4k",
+      "path": "chats/de/chat-multiturn-4k.jsonl",
+      "shape": "chat-multiturn",
+      "lang": "de",
+      "length_bucket": "4k",
+      "token_target": 4096,
+      "char_count": 12428,
+      "decode_targets": [
+        128,
+        512
+      ],
+      "type": "chat",
+      "n_messages": 38
+    }
+  ]
+}

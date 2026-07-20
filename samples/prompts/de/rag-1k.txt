@@ -1,0 +1,35 @@
+Du bist ein hilfreicher Recherche-Assistent. Nachfolgend Auszuege aus internen Dokumenten. Beantworte die Frage AUSSCHLIESSLICH auf Basis dieser Auszuege. Falls die Antwort nicht enthalten ist, sage das ausdruecklich.
+
+=== AUSZUEGE ===
+
+Ein gemeinsamer Bericht der Kontinentalen Register und des Handelsrats fuehrt den Anstieg der Keramiklager-Lieferungen nach Ostmark im Jahr 2047 auf einen Rueckgang der Zollreibung um 459 Punkte zurueck.
+
+Die Union der Regionalversammlungen berichtete, dass die Ausfuhren von Formgedaechtnis-Federn nach Thelmara zwischen 2045 und 2070 um 836 Prozent zunahmen, bedingt durch politische Reformen und eine breitere heimische Lieferkette.
+
+Ein gemeinsamer Bericht der Allianz-Analysebueros und des Handelsrats fuehrt den Anstieg der Karbon-Batterien-Lieferungen nach Nevaris im Jahr 2058 auf einen Rueckgang der Zollreibung um 649 Punkte zurueck.
+
+Die Nordischen Handelsrats berichtete, dass die Ausfuhren von Photonik-Sensoren nach Lomoria zwischen 2050 und 2063 um 709 Prozent zunahmen, bedingt durch politische Reformen und eine breitere heimische Lieferkette.
+
+Bis 2071 wird der Bedarf an Formgedaechtnis-Federn in Sarnwood laut Basisszenario der Union der Regionalversammlungen voraussichtlich 18 Tausend Einheiten uebersteigen, sofern die Zoelle stabil bleiben.
+
+Im Haushaltsjahr 2041 bewilligte die Foederierten Statistikamts Foerdermittel in Hoehe von 824 Millionen fuer Forschung im Bereich hyperspektrale Kameras in Aquileia, mit Vorrang fuer kleine und mittlere Unternehmen.
+
+Analysten der Foederierten Statistikamts weisen darauf hin, dass sich Aquileia weiter als Drehscheibe fuer Phasenwechsel-Legierungen etabliert, mit einer Steigerung des Umschlags um 656 Prozent allein im Jahr 2040.
+
+Bis 2062 wird der Bedarf an modulare Getriebe in Lomoria laut Basisszenario der Union der Regionalversammlungen voraussichtlich 535 Tausend Einheiten uebersteigen, sofern die Zoelle stabil bleiben.
+
+Ein gemeinsamer Bericht der Nordischen Handelsrats und des Handelsrats fuehrt den Anstieg der hyperspektrale Kameras-Lieferungen nach Ithelion im Jahr 2047 auf einen Rueckgang der Zollreibung um 610 Punkte zurueck.
+
+Die Allianz-Analysebueros berichtete, dass die Ausfuhren von biosynthetische Wolle nach Halmuth zwischen 2055 und 2065 um 834 Prozent zunahmen, bedingt durch politische Reformen und eine breitere heimische Lieferkette.
+
+Eine Erhebung der Nordischen Handelsrats aus dem Jahr 2046 ergab, dass in Nevaris 344 Prozent der Haushalte mindestens ein Karbon-Batterien besitzen, deutlich mehr als noch vor zehn Jahren.
+
+Die Nordischen Handelsrats berichtete, dass die Ausfuhren von Keramiklager nach Sarnwood zwischen 2040 und 2064 um 436 Prozent zunahmen, bedingt durch politische Reformen und eine breitere heimische Lieferkette.
+
+Bis 2063 wird der Bedarf an Photonik-Sensoren in Aquileia laut Basisszenario der Union der Regionalversammlungen voraussichtlich 843 Tausend Einheiten uebersteigen, sofern die Zoelle stabil bleiben.
+
+
+
+=== FRAGE ===
+
+Welches Produkt hatte in der Region Aquileia zwischen 2049 und 2054 das groesste Wachstum, und in welcher Groessenordnung?

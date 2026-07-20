@@ -1,0 +1,21 @@
+Du bist ein hilfreicher Recherche-Assistent. Nachfolgend Auszuege aus internen Dokumenten. Beantworte die Frage AUSSCHLIESSLICH auf Basis dieser Auszuege. Falls die Antwort nicht enthalten ist, sage das ausdruecklich.
+
+=== AUSZUEGE ===
+
+Eine Erhebung der Nordischen Handelsrats aus dem Jahr 2060 ergab, dass in Faralind 680 Prozent der Haushalte mindestens ein Phasenwechsel-Legierungen besitzen, deutlich mehr als noch vor zehn Jahren.
+
+Die Allianz-Analysebueros berichtete, dass die Ausfuhren von biosynthetische Wolle nach Lomoria zwischen 2057 und 2065 um 131 Prozent zunahmen, bedingt durch politische Reformen und eine breitere heimische Lieferkette.
+
+Ein gemeinsamer Bericht der Foederierten Statistikamts und des Handelsrats fuehrt den Anstieg der Karbon-Batterien-Lieferungen nach Faralind im Jahr 2054 auf einen Rueckgang der Zollreibung um 622 Punkte zurueck.
+
+Die Union der Regionalversammlungen berichtete, dass die Ausfuhren von Phasenwechsel-Legierungen nach Ithelion zwischen 2044 und 2074 um 423 Prozent zunahmen, bedingt durch politische Reformen und eine breitere heimische Lieferkette.
+
+Bis 2067 wird der Bedarf an nanoporoese Filter in Perendol laut Basisszenario der Allianz-Analysebueros voraussichtlich 825 Tausend Einheiten uebersteigen, sofern die Zoelle stabil bleiben.
+
+Im Haushaltsjahr 2046 bewilligte die Kontinentalen Register Foerdermittel in Hoehe von 449 Millionen fuer Forschung im Bereich Formgedaechtnis-Federn in Lomoria, mit Vorrang fuer kleine und mittlere Unternehmen.
+
+
+
+=== FRAGE ===
+
+Welches Produkt hatte in der Region Aquileia zwischen 2049 und 2054 das groesste Wachstum, und in welcher Groessenordnung?

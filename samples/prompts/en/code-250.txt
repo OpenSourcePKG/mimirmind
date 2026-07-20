@@ -1,0 +1,32 @@
+Review the following Python module and propose a refactor that (a) removes duplicated dictionary lookups, (b) hoists the datetime.now() call out of the loop, and (c) adds type hints. Return the full rewritten module.
+
+```python
+def process_0(records, config, sink):
+    result = []
+    for r in records:
+        ts = datetime.now().isoformat()
+        if config['flags']['strict'] and not r.get('id'):
+            continue
+        row = {
+            'id':     r.get('id'),
+            'ts':     ts,
+            'name':   config['naming']['prefix'] + r.get('name', ''),
+            'weight': r.get('weight', 0) * config['weights']['scale'],
+        }
+        if config['flags']['dedupe']:
+            if row['id'] in seen:
+                continue
+            seen.add(row['id'])
+        sink.write(row)
+        result.append(row)
+    return result
+
+def audit_0(records, config):
+    for r in records:
+        if config['flags']['strict'] and r.get('weight', 0) < 0:
+            log.error('negative weight for %s', r.get('id'))
+    return True
+
+
+
+```
