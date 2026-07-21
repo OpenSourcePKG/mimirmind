@@ -2131,3 +2131,20 @@ endif()
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/config.example.json
     DESTINATION ${CMAKE_INSTALL_DATADIR}/mimirmind
     COMPONENT runtime)
+
+# ---- cuda_parity_tests — M-Q3N.3 GatedDeltaNet GPU-vs-CPU parity ----------
+#
+# Built only with the CUDA backend. Runs each GatedDeltaNet GPU op against
+# the compute/GatedDeltaNet CPU golden reference on random inputs. Box-only
+# (needs a CUDA device to run):
+#   cmake --build build-cuda --target cuda_parity_tests && ./build-cuda/cuda_parity_tests
+if(MIMIRMIND_ENABLE_CUDA)
+    add_executable(cuda_parity_tests
+        tests/cuda_parity_tests.cpp
+        src/compute/cuda/GpuOps.cpp
+        src/compute/GatedDeltaNet.cpp
+    )
+    add_dependencies(cuda_parity_tests cuda_kernels)
+    target_include_directories(cuda_parity_tests PRIVATE tests)
+    target_link_libraries(cuda_parity_tests PRIVATE mimirmind_core_cuda)
+endif()
