@@ -224,6 +224,7 @@ set(KERNEL_SOURCES
     kernels/gated_deltanet_ar.cl
     kernels/deltanet_gate.cl
     kernels/sigmoid_inplace.cl
+    kernels/gather_heads_from_channels.cl
     kernels/mul_scalar.cl
     kernels/gelu_mul.cl
     kernels/rmsnorm_gemma.cl
@@ -532,6 +533,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/gated_deltanet_ar.hip
         kernels_hip/deltanet_gate.hip
         kernels_hip/sigmoid_inplace.hip
+        kernels_hip/gather_heads_from_channels.hip
         kernels_hip/rope_inplace_fp16.hip
         kernels_hip/rope_inplace_ff.hip
         kernels_hip/scaled_add_residual.hip
@@ -676,6 +678,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/gated_deltanet_ar.cu
         kernels_cuda/deltanet_gate.cu
         kernels_cuda/sigmoid_inplace.cu
+        kernels_cuda/gather_heads_from_channels.cu
         kernels_cuda/rope_inplace_fp16.cu
         kernels_cuda/rope_inplace_ff.cu
         kernels_cuda/scaled_add_residual.cu

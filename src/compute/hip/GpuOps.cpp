@@ -209,6 +209,8 @@ struct GpuOps::Impl {
     core::hip::HipKernel _deltanetGateKernel;
     core::hip::HipModule _sigmoidInplaceModule;
     core::hip::HipKernel _sigmoidInplaceKernel;
+    core::hip::HipModule _gatherHeadsModule;
+    core::hip::HipKernel _gatherHeadsKernel;
 
     explicit Impl(core::hip::HipContext& ctx)
         : _rmsnormModule           {loadHipModule(ctx, "rmsnorm")},
@@ -319,7 +321,10 @@ struct GpuOps::Impl {
           _deltanetGateKernel      {_deltanetGateModule.getKernel("deltanet_gate")},
           _sigmoidInplaceModule    {loadHipModule(ctx, "sigmoid_inplace")},
           _sigmoidInplaceKernel    {
-              _sigmoidInplaceModule.getKernel("sigmoid_inplace")}
+              _sigmoidInplaceModule.getKernel("sigmoid_inplace")},
+          _gatherHeadsModule       {loadHipModule(ctx, "gather_heads_from_channels")},
+          _gatherHeadsKernel       {
+              _gatherHeadsModule.getKernel("gather_heads_from_channels")}
     {}
 };
 
@@ -985,6 +990,29 @@ void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
     k.setValue(1, toInt32(n, "sigmoidInplace n"));
     k.launch(_ctx.stream(),
              groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::gatherHeadsFromChannelsAsync(const float* src, float* dst,
+                                          std::size_t T, std::size_t offset,
+                                          std::size_t srcHeads,
+                                          std::size_t dstHeads, std::size_t S,
+                                          std::size_t convTotalWidth) {
+    const std::size_t total = T * dstHeads * S;
+    if (total == 0) {
+        return;
+    }
+    auto& k = _pimpl->_gatherHeadsKernel;
+    k.setPtr  (0, src);
+    k.setPtr  (1, dst);
+    k.setValue(2, toInt32(T,              "gather T"));
+    k.setValue(3, toInt32(offset,         "gather offset"));
+    k.setValue(4, toInt32(srcHeads,       "gather srcHeads"));
+    k.setValue(5, toInt32(dstHeads,       "gather dstHeads"));
+    k.setValue(6, toInt32(S,              "gather S"));
+    k.setValue(7, toInt32(convTotalWidth, "gather convTotalWidth"));
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize), 1, 1,
              kElementwiseLocalSize, 1, 1);
 }
 

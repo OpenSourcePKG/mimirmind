@@ -379,6 +379,18 @@ void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
     ::mimirmind::compute::sigmoidInPlace(y, n);
 }
 
+void GpuOps::gatherHeadsFromChannelsAsync(const float* src,
+                                          float*       dst,
+                                          std::size_t  T,
+                                          std::size_t  offset,
+                                          std::size_t  srcHeads,
+                                          std::size_t  dstHeads,
+                                          std::size_t  S,
+                                          std::size_t  convTotalWidth) {
+    ::mimirmind::compute::gatherHeadsFromChannels(
+        src, dst, T, offset, srcHeads, dstHeads, S, convTotalWidth);
+}
+
 void GpuOps::ropeInPlaceWithFactorsAsync(void*            xBase,
                                          const float*     freqFactors,
                                          std::size_t      seqLen,

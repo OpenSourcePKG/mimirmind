@@ -139,6 +139,8 @@ struct GpuOps::Impl {
     runtime::GpuKernel     _deltanetGateKernel;
     runtime::GpuModule     _sigmoidInplaceModule;
     runtime::GpuKernel     _sigmoidInplaceKernel;
+    runtime::GpuModule     _gatherHeadsModule;
+    runtime::GpuKernel     _gatherHeadsKernel;
 
     explicit Impl(core::l0::L0Context& ctx)
         : _rmsnormModule    {ctx, "rmsnorm"},
@@ -249,7 +251,10 @@ struct GpuOps::Impl {
           _deltanetGateKernel  {_deltanetGateModule.kernel("deltanet_gate")},
           _sigmoidInplaceModule{ctx, "sigmoid_inplace"},
           _sigmoidInplaceKernel{
-              _sigmoidInplaceModule.kernel("sigmoid_inplace")}
+              _sigmoidInplaceModule.kernel("sigmoid_inplace")},
+          _gatherHeadsModule   {ctx, "gather_heads_from_channels"},
+          _gatherHeadsKernel   {
+              _gatherHeadsModule.kernel("gather_heads_from_channels")}
     {}
 };
 
@@ -903,6 +908,31 @@ void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
     _pimpl->_sigmoidInplaceKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
     _queue.appendLaunch(_pimpl->_sigmoidInplaceKernel,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::gatherHeadsFromChannelsAsync(const float* src,
+                                          float*       dst,
+                                          std::size_t  T,
+                                          std::size_t  offset,
+                                          std::size_t  srcHeads,
+                                          std::size_t  dstHeads,
+                                          std::size_t  S,
+                                          std::size_t  convTotalWidth) {
+    const std::size_t total = T * dstHeads * S;
+    if (total == 0) {
+        return;
+    }
+    auto& k = _pimpl->_gatherHeadsKernel;
+    k.setPtr(0, src);
+    k.setPtr(1, dst);
+    k.setValue<std::int32_t>(2, toInt32(T,              "gather T"));
+    k.setValue<std::int32_t>(3, toInt32(offset,         "gather offset"));
+    k.setValue<std::int32_t>(4, toInt32(srcHeads,       "gather srcHeads"));
+    k.setValue<std::int32_t>(5, toInt32(dstHeads,       "gather dstHeads"));
+    k.setValue<std::int32_t>(6, toInt32(S,              "gather S"));
+    k.setValue<std::int32_t>(7, toInt32(convTotalWidth, "gather convTotalWidth"));
+    k.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(k, groupsForN(total, kElementwiseLocalSize), 1, 1);
 }
 
 void GpuOps::ropeInPlaceWithFactorsAsync(void*            xBase,

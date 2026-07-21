@@ -149,6 +149,11 @@ public:
                            const float* ssmDt, float* gLog,
                            std::size_t T, std::size_t H) override;
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
+    void gatherHeadsFromChannelsAsync(const float* src, float* dst,
+                                      std::size_t T, std::size_t offset,
+                                      std::size_t srcHeads, std::size_t dstHeads,
+                                      std::size_t S,
+                                      std::size_t convTotalWidth) override;
 
     void xQuantI8Async(const float* x, std::int8_t* y, float* scale,
                        std::size_t M, std::size_t K) override;

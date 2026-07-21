@@ -261,6 +261,15 @@ public:
 
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
 
+    void gatherHeadsFromChannelsAsync(const float* src,
+                                      float*       dst,
+                                      std::size_t  T,
+                                      std::size_t  offset,
+                                      std::size_t  srcHeads,
+                                      std::size_t  dstHeads,
+                                      std::size_t  S,
+                                      std::size_t  convTotalWidth) override;
+
     /// In-place scalar multiply: y[i] *= s for i in [0, n).
     /// Used by Gemma 4 for layer_output_scale.
     void mulScalarAsync(float*       y,

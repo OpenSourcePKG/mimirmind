@@ -112,6 +112,28 @@ void sigmoidInPlace(float* y, std::size_t n) {
     }
 }
 
+void gatherHeadsFromChannels(const float* src,
+                             float*       dst,
+                             std::size_t  T,
+                             std::size_t  offset,
+                             std::size_t  srcHeads,
+                             std::size_t  dstHeads,
+                             std::size_t  S,
+                             std::size_t  convTotalWidth) {
+    for (std::size_t t = 0; t < T; ++t) {
+        const float* srcTok = src + t * convTotalWidth + offset;
+        float*       dstTok = dst + t * dstHeads * S;
+        for (std::size_t hd = 0; hd < dstHeads; ++hd) {
+            const std::size_t srcHead = hd % srcHeads;
+            const float* srcHeadPtr = srcTok + srcHead * S;
+            float*       dstHeadPtr = dstTok + hd * S;
+            for (std::size_t s = 0; s < S; ++s) {
+                dstHeadPtr[s] = srcHeadPtr[s];
+            }
+        }
+    }
+}
+
 void causalConv1dSilu(const float* convInput,
                       const float* kernel,
                       float*       out,

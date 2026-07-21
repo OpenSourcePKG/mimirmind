@@ -198,6 +198,34 @@ TEST(cuda_sigmoid_inplace_parity) {
     }
 }
 
+TEST(cuda_gather_heads_from_channels_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    // Wide conv buffer [T, convTotalWidth]; extract a head block at `offset`
+    // and repeat srcHeads=2 -> dstHeads=4 (GQA), S=3.
+    const std::size_t T = 2, convTotalWidth = 20, offset = 5;
+    const std::size_t srcHeads = 2, dstHeads = 4, S = 3;
+    auto src = randVec(T * convTotalWidth, 0x95u);
+
+    std::vector<float> ref(T * dstHeads * S);
+    ::mimirmind::compute::gatherHeadsFromChannels(
+        src.data(), ref.data(), T, offset, srcHeads, dstHeads, S, convTotalWidth);
+
+    auto dsrc = toDevice(ops, src);
+    auto ddst = ops.allocate(T * dstHeads * S * sizeof(float));
+    ops.gatherHeadsFromChannelsAsync(static_cast<const float*>(dsrc.get()),
+                                     static_cast<float*>(ddst.get()),
+                                     T, offset, srcHeads, dstHeads, S,
+                                     convTotalWidth);
+    ops.flush();
+    auto got = fromDevice(ops, ddst.get(), T * dstHeads * S);
+
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], ref[i], 1e-6f);
+    }
+}
+
 int main() {
     return mm::test::run();
 }

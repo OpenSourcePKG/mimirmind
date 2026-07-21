@@ -161,6 +161,15 @@ public:
 
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
 
+    void gatherHeadsFromChannelsAsync(const float* src,
+                                      float*       dst,
+                                      std::size_t  T,
+                                      std::size_t  offset,
+                                      std::size_t  srcHeads,
+                                      std::size_t  dstHeads,
+                                      std::size_t  S,
+                                      std::size_t  convTotalWidth) override;
+
     // ---- RoPE -----------------------------------------------------------
 
     void ropeInPlaceAsync(void*            xBase,

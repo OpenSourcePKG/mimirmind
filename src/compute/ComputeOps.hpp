@@ -194,6 +194,19 @@ public:
     /// `beta` gate. Reference: compute::sigmoidInPlace.
     virtual void sigmoidInPlaceAsync(float* y, std::size_t n) = 0;
 
+    /// Per-head channel slice + optional GQA head repeat: turns the fused
+    /// conv output into contiguous q / k / v. dst[t,hd,s] =
+    /// src[t*convTotalWidth + offset + (hd % srcHeads)*S + s]. dst is
+    /// [T, dstHeads, S]. Reference: compute::gatherHeadsFromChannels.
+    virtual void gatherHeadsFromChannelsAsync(const float* src,
+                                              float*       dst,
+                                              std::size_t  T,
+                                              std::size_t  offset,
+                                              std::size_t  srcHeads,
+                                              std::size_t  dstHeads,
+                                              std::size_t  S,
+                                              std::size_t  convTotalWidth) = 0;
+
     // ---- RoPE ---------------------------------------------------------
 
     virtual void ropeInPlaceAsync(void*            xBase,

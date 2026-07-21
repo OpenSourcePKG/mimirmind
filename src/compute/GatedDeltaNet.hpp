@@ -103,6 +103,30 @@ void deltanetGate(const float* alpha,
 void sigmoidInPlace(float* y, std::size_t n);
 
 /**
+ * Extract a per-head channel slice from a wide per-token buffer, with an
+ * optional GQA-style head repeat — the single data-movement op that turns
+ * the fused conv output into contiguous q / k / v for the delta net.
+ *
+ * The Qwen3-Next conv output is [T, convTotalWidth] token-major, with the
+ * q / k / v blocks concatenated on the channel axis. For each the head
+ * block starts at `offset` and spans `srcHeads * S` channels. This copies
+ *   dst[t, hd, s] = src[t*convTotalWidth + offset + (hd % srcHeads)*S + s]
+ * for hd in [0, dstHeads), s in [0, S). When `dstHeads == srcHeads` it is a
+ * plain slice (v); when `dstHeads` is a multiple of `srcHeads` it also
+ * repeats the source heads (q/k: H_k -> H_v, ggml_repeat modulo semantics).
+ *
+ * dst is [T, dstHeads, S] contiguous.
+ */
+void gatherHeadsFromChannels(const float* src,
+                             float*       dst,
+                             std::size_t  T,
+                             std::size_t  offset,
+                             std::size_t  srcHeads,
+                             std::size_t  dstHeads,
+                             std::size_t  S,
+                             std::size_t  convTotalWidth);
+
+/**
  * In-place L2 normalisation over the innermost `dim` (head_dim), matching
  * ggml `ggml_l2_norm` used on q/k in the linear layer:
  *   x[r, :] /= sqrt( sum_j x[r,j]^2 + eps )
