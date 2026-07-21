@@ -42,15 +42,34 @@ std::uint64_t RequestScheduler::admit(std::int32_t promptLength,
     if (_allocator != nullptr) {
         r.kv_sequence.emplace(*_allocator);
     }
+    const std::uint64_t id = r.request_id;
     _requests.push_back(std::move(r));
+    // Index survives the potential vector reallocation (positions are
+    // stable; only pointers/iterators invalidate).
+    _indexById.emplace(id, _requests.size() - 1);
+    ++_stateCount[static_cast<std::size_t>(RequestState::Waiting)];
     ++_totalAdmitted;
-    return _requests.back().request_id;
+    return id;
+}
+
+void RequestScheduler::setState(RequestStateData& r,
+                                RequestState       next) noexcept {
+    --_stateCount[static_cast<std::size_t>(r.state)];
+    ++_stateCount[static_cast<std::size_t>(next)];
+    r.state = next;
+}
+
+void RequestScheduler::rebuildIndex() noexcept {
+    _indexById.clear();
+    for (std::size_t i = 0; i < _requests.size(); ++i) {
+        _indexById.emplace(_requests[i].request_id, i);
+    }
 }
 
 void RequestScheduler::reenqueuePreempted() noexcept {
     for (auto& r : _requests) {
         if (r.state == RequestState::Preempted) {
-            r.state          = RequestState::Waiting;
+            setState(r, RequestState::Waiting);
             r.tokens_pending = r.prompt_length;
             r.tokens_decoded = 0;
             // admit_seq stays — preserves LIFO ordering so a
@@ -76,9 +95,9 @@ void RequestScheduler::promoteWaitingToActive() noexcept {
         // Decoding (if prompt was 0 — defensive; admit() rejects that
         // but a re-enqueued preempted request could theoretically have
         // been mutated).
-        r.state = (r.tokens_pending > 0)
-                    ? RequestState::Prefilling
-                    : RequestState::Decoding;
+        setState(r, (r.tokens_pending > 0)
+                      ? RequestState::Prefilling
+                      : RequestState::Decoding);
         ++active;
     }
 }
@@ -119,7 +138,7 @@ void RequestScheduler::commitProgress(
         r->tokens_pending -= p.chunk_size;
         if (r->tokens_pending <= 0) {
             r->tokens_pending = 0;
-            r->state = RequestState::Decoding;
+            setState(*r, RequestState::Decoding);
         }
     }
 
@@ -136,7 +155,7 @@ void RequestScheduler::commitProgress(
         r->tokens_decoded += 1;
         const bool eos = eosSizesMatch ? (reachedEos[i] != 0) : false;
         if (eos || r->tokens_decoded >= r->max_tokens) {
-            r->state = RequestState::Completed;
+            setState(*r, RequestState::Completed);
             ++_totalCompleted;
         }
     }
@@ -154,7 +173,7 @@ std::uint64_t RequestScheduler::preemptOne() noexcept {
         }
     }
     if (victim == nullptr) return 0;
-    victim->state         = RequestState::Preempted;
+    setState(*victim, RequestState::Preempted);
     victim->ever_preempted = true;
     ++_totalPreempted;
     // Release KV blocks eagerly so they're available to whoever gets
@@ -185,6 +204,11 @@ std::vector<std::uint64_t> RequestScheduler::drainCompleted() noexcept {
                            return r.state == RequestState::Completed;
                        }),
         _requests.end());
+    // Every Completed entry was just removed, so its population is now
+    // zero; the erase-remove shuffled surviving positions, so the id
+    // index must be rebuilt.
+    _stateCount[static_cast<std::size_t>(RequestState::Completed)] = 0;
+    rebuildIndex();
     return drained;
 }
 
@@ -216,50 +240,30 @@ bool RequestScheduler::feedDecodeToken(std::uint64_t id,
 }
 
 std::size_t RequestScheduler::numWaiting() const noexcept {
-    std::size_t n = 0;
-    for (const auto& r : _requests) {
-        if (r.state == RequestState::Waiting) ++n;
-    }
-    return n;
+    return _stateCount[static_cast<std::size_t>(RequestState::Waiting)];
 }
 
 std::size_t RequestScheduler::numActive() const noexcept {
-    std::size_t n = 0;
-    for (const auto& r : _requests) {
-        if (r.state == RequestState::Prefilling ||
-            r.state == RequestState::Decoding) ++n;
-    }
-    return n;
+    return _stateCount[static_cast<std::size_t>(RequestState::Prefilling)] +
+           _stateCount[static_cast<std::size_t>(RequestState::Decoding)];
 }
 
 std::size_t RequestScheduler::numCompleted() const noexcept {
-    std::size_t n = 0;
-    for (const auto& r : _requests) {
-        if (r.state == RequestState::Completed) ++n;
-    }
-    return n;
+    return _stateCount[static_cast<std::size_t>(RequestState::Completed)];
 }
 
 std::size_t RequestScheduler::numPreempted() const noexcept {
-    std::size_t n = 0;
-    for (const auto& r : _requests) {
-        if (r.state == RequestState::Preempted) ++n;
-    }
-    return n;
+    return _stateCount[static_cast<std::size_t>(RequestState::Preempted)];
 }
 
 const RequestStateData* RequestScheduler::find(std::uint64_t id) const noexcept {
-    for (const auto& r : _requests) {
-        if (r.request_id == id) return &r;
-    }
-    return nullptr;
+    const auto it = _indexById.find(id);
+    return it == _indexById.end() ? nullptr : &_requests[it->second];
 }
 
 RequestStateData* RequestScheduler::findMut(std::uint64_t id) noexcept {
-    for (auto& r : _requests) {
-        if (r.request_id == id) return &r;
-    }
-    return nullptr;
+    const auto it = _indexById.find(id);
+    return it == _indexById.end() ? nullptr : &_requests[it->second];
 }
 
 ServingMetrics RequestScheduler::snapshotMetrics() const noexcept {

@@ -193,20 +193,20 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     const std::string respId = makeRequestId();
     _tracker.begin(respId, promptIds.size(),
                    params.maxNewTokens, /*streaming=*/false);
-    RequestTracker::Guard requestGuard{&_tracker};
+    RequestTracker::Guard requestGuard{&_tracker, respId};
 
     auto onPrefillProgress =
-        [this](const runtime::InferenceEngine::PrefillProgress& p)
+        [this, &respId](const runtime::InferenceEngine::PrefillProgress& p)
             -> bool {
-            _tracker.updatePrefillProgress(p.blocksDone, p.blocksTotal, p.elapsedMs);
+            _tracker.updatePrefillProgress(respId, p.blocksDone, p.blocksTotal, p.elapsedMs);
             return true;
         };
     auto onPrefillDone =
-        [this](const runtime::InferenceEngine::PrefillDone&) {
-            _tracker.markPrefillDone();
+        [this, &respId](const runtime::InferenceEngine::PrefillDone&) {
+            _tracker.markPrefillDone(respId);
         };
-    auto onToken = [this](std::int32_t) -> bool {
-        _tracker.incrementDecodeTokens();
+    auto onToken = [this, &respId](std::int32_t) -> bool {
+        _tracker.incrementDecodeTokens(respId);
         return true;
     };
 
@@ -448,7 +448,7 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                 }
                 // Snapshot the per-token progress even for stripped
                 // tokens so /v1/system/status reflects real decode work.
-                _tracker.incrementDecodeTokens();
+                _tracker.incrementDecodeTokens(state->respId);
                 std::string txt = tok.decode(
                     std::span<const std::int32_t>{&id, 1},
                     /*skipSpecial=*/true);
@@ -489,7 +489,7 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
             // EventSource.addEventListener.
             auto onPrefillDone =
                 [&](const runtime::InferenceEngine::PrefillDone& p) {
-                    _tracker.markPrefillDone();
+                    _tracker.markPrefillDone(state->respId);
                     const json payload = {
                         {"prompt_tokens",    p.promptTokens},
                         {"prefilled_tokens", p.prefilledTokens},
@@ -515,7 +515,7 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                     // Snapshot for /v1/system/status polling — kept
                     // outside the SSE-rate-limit branch so the status
                     // block sees every completed transformer layer.
-                    _tracker.updatePrefillProgress(p.blocksDone, p.blocksTotal, p.elapsedMs);
+                    _tracker.updatePrefillProgress(state->respId, p.blocksDone, p.blocksTotal, p.elapsedMs);
                     // M7g — poll for a client-side disconnect on every
                     // block. If clientGone flipped between blocks (via
                     // the throttle branch below OR via a broken write
@@ -558,7 +558,7 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                            state->promptIds.size(),
                            state->params.maxNewTokens,
                            /*streaming=*/true);
-            RequestTracker::Guard requestGuard{&_tracker};
+            RequestTracker::Guard requestGuard{&_tracker, state->respId};
             {
                 std::lock_guard<std::mutex> lk{*targetMutex};
                 try {

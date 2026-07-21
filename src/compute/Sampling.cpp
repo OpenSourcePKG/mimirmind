@@ -123,6 +123,23 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
         throw std::runtime_error("Sampler::sample: empty logits");
     }
 
+    const bool softcapOn = params.finalLogitSoftcap > 0.0F;
+    const bool penaltyOn = penaltiesActive(params)
+                           && !recentTokens.empty();
+    // Greedy: deterministic argmax, no RNG use.
+    const bool greedy    = (params.temperature <= 0.0F || params.topK == 1);
+
+    // Fast greedy path: softcap is `cap * tanh(l / cap)` — strictly
+    // monotonic, hence argmax-invariant — so when no penalties are active
+    // the copy + full-vocab tanh would not change which index wins.
+    // Argmax the raw logits directly and skip the ~1 MB scratch copy plus
+    // V transcendentals that would otherwise run on every greedy token
+    // (Gemma 4 ships softcap on by default). Penalties genuinely reorder,
+    // so they still force the scratch path below.
+    if (greedy && !penaltyOn) {
+        return argmaxRow(logits);
+    }
+
     // Route through the scratch buffer whenever softcap or penalties
     // would mutate the values. Softcap runs FIRST — matches llama.cpp's
     // gemma4.cpp placement (softcap inside the compute graph, penalties
@@ -130,9 +147,6 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
     // `softcap(penalty(x))` for repetition and frequency penalties, and
     // the target parity we care about is `penalty(softcap(x))`.
     std::span<const float> effLogits = logits;
-    const bool         softcapOn = params.finalLogitSoftcap > 0.0F;
-    const bool         penaltyOn = penaltiesActive(params)
-                                   && !recentTokens.empty();
     if (softcapOn || penaltyOn) {
         _penaltyLogits.assign(logits.begin(), logits.end());
         if (softcapOn) {
@@ -145,31 +159,42 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
         effLogits = std::span<const float>{_penaltyLogits};
     }
 
-    // Greedy: deterministic, no RNG use, bit-identical to argmax.
-    if (params.temperature <= 0.0F || params.topK == 1) {
+    // Greedy with penalties active — argmax over the penalised logits.
+    if (greedy) {
         return argmaxRow(effLogits);
     }
 
     const std::size_t V    = effLogits.size();
     const float       invT = 1.0F / params.temperature;
 
-    // Sort indices by raw logit descending. Ordering by logit equals
-    // ordering by probability since exp is monotonic.
+    // Order indices by logit descending (equals ordering by probability
+    // since exp is monotonic). Only the top `kept` entries are ever read
+    // downstream (softmax, top-P, draw all walk `[0, kept)`), so when
+    // top-K bounds `kept < V` we select just those with partial_sort —
+    // O(V log kept) instead of the full O(V log V) sort over a ~256k
+    // Gemma-4 vocab on every sampled token. Tie order among exactly-equal
+    // logits is unspecified either way (both algorithms are unstable).
     _idx.resize(V);
     for (std::size_t i = 0; i < V; ++i) {
         _idx[i] = static_cast<std::int32_t>(i);
     }
-    std::sort(_idx.begin(), _idx.end(),
-              [&](std::int32_t a, std::int32_t b) {
-                  return effLogits[static_cast<std::size_t>(a)] >
-                         effLogits[static_cast<std::size_t>(b)];
-              });
+    const auto byLogitDesc = [&](std::int32_t a, std::int32_t b) {
+        return effLogits[static_cast<std::size_t>(a)] >
+               effLogits[static_cast<std::size_t>(b)];
+    };
 
-    // Top-K cutoff (after the sort the first kept entries are exactly
-    // the K most probable — no extra work).
+    // Top-K cutoff — compute first so the sort can stop at `kept`.
     std::size_t kept = V;
     if (params.topK > 0 && params.topK < V) {
         kept = params.topK;
+    }
+
+    if (kept < V) {
+        std::partial_sort(_idx.begin(), _idx.begin() + kept, _idx.end(),
+                          byLogitDesc);
+    } else {
+        // Nucleus (top-P) over the full vocab needs every entry ordered.
+        std::sort(_idx.begin(), _idx.end(), byLogitDesc);
     }
 
     // Numerically-stable softmax over the kept (already sorted) entries.

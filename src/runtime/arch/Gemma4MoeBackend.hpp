@@ -5,6 +5,11 @@
 
 #include "runtime/arch/GemmaBaseBackend.hpp"
 
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+#include <vector>
+
 namespace mimirmind::runtime::arch {
 
 /**
@@ -50,6 +55,26 @@ private:
     /// this iGPU AND `ffn_down_exps.weight` is Q6_K; the backend
     /// checks both at first use and falls back silently otherwise.
     bool _moeFusedDownEnabled;
+
+    // ---- Per-block routing scratch (reused across runBlock) ----------
+    //
+    // These held std::vectors that were heap-allocated and freed on every
+    // runBlock() — per block, per token step. The router pick buffers
+    // (_topKIdx/_topKWeight) churned on every call; the expert-grouping
+    // buffers additionally allocated `nExperts` (128) nested vectors each
+    // prefill pass. Hoisted to members so steady-state runBlock() does
+    // zero routing-side allocation: outer containers are sized once, the
+    // hot path clear()/resize()es (capacity is retained). Single-threaded
+    // per engine, same as GemmaBaseBackend's own scratch — the serving
+    // loop serialises all calls on one instance.
+    std::vector<std::int32_t> _topKIdx;      // [T*K] router expert picks
+    std::vector<float>        _topKWeight;   // [T*K] router weights
+
+    // Expert-grouped prefill (T>1) permutation buffers.
+    std::vector<std::vector<std::pair<std::size_t, float>>> _expertTokens;
+    std::vector<std::size_t>  _expertOffset; // [nExperts+1] prefix sum
+    std::vector<std::size_t>  _gatherToken;  // [T*K] compact-row → token
+    std::vector<float>        _rowWeight;    // [T*K] compact-row weight
 };
 
 } // namespace mimirmind::runtime::arch

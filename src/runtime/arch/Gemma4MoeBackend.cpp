@@ -40,6 +40,11 @@ Gemma4MoeBackend::Gemma4MoeBackend(const model::LlmConfig&        config,
     : GemmaBaseBackend{config, weights, fusedQkv, ops, gmm, opProfiler},
       _moeGroupEnabled{moeGroupEnabled},
       _moeFusedDownEnabled{moeFusedDownEnabled} {
+    // Size the per-expert grouping bucket once — the count is fixed for
+    // the model's lifetime, so runBlock() only ever clear()s the inner
+    // vectors (retaining their capacity) instead of reallocating 128 of
+    // them each prefill pass.
+    _expertTokens.resize(_config.expertCount);
     MM_LOG_INFO("gemma4-moe",
                 "Gemma4MoeBackend ready — blocks={} d_model={} ff={} "
                 "experts={} top_k={} swa head_dim={} kv={}, "
@@ -172,10 +177,13 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
                 attnOutBuf, T,
                 upOutBuf, matmulScratch);
 
-    std::vector<std::int32_t> topKIdx(T * K);
-    std::vector<float>        topKWeight(T * K);
+    // Reused scratch — resize() retains capacity, so no allocation in
+    // steady state. moeTopKRoute writes all T*K entries, so the
+    // (uninitialised) grown tail is fully overwritten before any read.
+    _topKIdx.resize(T * K);
+    _topKWeight.resize(T * K);
     cmp::moeTopKRoute(upOutBuf, T, nExperts, K,
-                      topKIdx.data(), topKWeight.data());
+                      _topKIdx.data(), _topKWeight.data());
 
     _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
     trace("path B: zero accumulator");
@@ -235,16 +243,19 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
         // lists, expertOffset prefix-sum, and the flat gather+weight
         // arrays used by the scatter step below.
         const std::size_t nRows = T * K;
-        std::vector<std::vector<std::pair<std::size_t, float>>>
-            expertTokens(nExperts);
+        // Reused buckets — clear() keeps each inner vector's capacity so
+        // the 128 nested allocations only happen on the first prefill.
+        auto& expertTokens = _expertTokens;   // sized to nExperts in ctor
+        for (auto& bucket : expertTokens) bucket.clear();
         for (std::size_t t = 0; t < T; ++t) {
             for (std::size_t k = 0; k < K; ++k) {
                 const std::size_t e =
-                    static_cast<std::size_t>(topKIdx[t * K + k]);
-                expertTokens[e].emplace_back(t, topKWeight[t * K + k]);
+                    static_cast<std::size_t>(_topKIdx[t * K + k]);
+                expertTokens[e].emplace_back(t, _topKWeight[t * K + k]);
             }
         }
-        std::vector<std::size_t> expertOffset(nExperts + 1, 0);
+        auto& expertOffset = _expertOffset;
+        expertOffset.assign(nExperts + 1, 0);
         for (std::size_t e = 0; e < nExperts; ++e) {
             expertOffset[e + 1] =
                 expertOffset[e] + expertTokens[e].size();
@@ -262,8 +273,12 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
                 " (routing produced out-of-range expert index?)");
         }
 
-        std::vector<std::size_t> gatherToken(nRows);
-        std::vector<float>       rowWeight(nRows);
+        // resize() (not assign) — the offset partition covers all of
+        // [0, nRows) so every element is written before it is read.
+        auto& gatherToken = _gatherToken;
+        auto& rowWeight   = _rowWeight;
+        gatherToken.resize(nRows);
+        rowWeight.resize(nRows);
         for (std::size_t e = 0; e < nExperts; ++e) {
             const float scale = expDownScalePtr[e];
             const std::size_t off = expertOffset[e];
@@ -375,7 +390,7 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
             // separate so the fused down kernel sees [K, ffPer].
             for (std::size_t k = 0; k < K; ++k) {
                 const std::size_t e =
-                    static_cast<std::size_t>(topKIdx[k]);
+                    static_cast<std::size_t>(_topKIdx[k]);
                 const void* Wgu = expGateUpBase + e * expertBytesGateUp;
 
                 _gmm.matmulAsync(expGateUp->type, Wgu,
@@ -403,9 +418,9 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
                 blockIdx * K;
             for (std::size_t k = 0; k < K; ++k) {
                 const std::size_t e =
-                    static_cast<std::size_t>(topKIdx[k]);
+                    static_cast<std::size_t>(_topKIdx[k]);
                 expIdxSlot[k] = static_cast<std::int32_t>(e);
-                kwSlot[k]     = topKWeight[k] * expDownScalePtr[e];
+                kwSlot[k]     = _topKWeight[k] * expDownScalePtr[e];
             }
 
             trace("path B: fused-K down dispatch");
@@ -427,8 +442,8 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
                 float* const accumT    = moeAccumBuf  + t * d_model;
                 for (std::size_t k = 0; k < K; ++k) {
                     const std::size_t e =
-                        static_cast<std::size_t>(topKIdx[t * K + k]);
-                    const float       routerWeight = topKWeight[t * K + k];
+                        static_cast<std::size_t>(_topKIdx[t * K + k]);
+                    const float       routerWeight = _topKWeight[t * K + k];
 
                     const void* Wgu = expGateUpBase + e * expertBytesGateUp;
                     const void* Wd  = expDownBase   + e * expertBytesDown;

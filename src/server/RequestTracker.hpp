@@ -8,19 +8,24 @@
 #include <chrono>
 #include <cstddef>
 #include <mutex>
-#include <optional>
 #include <string>
+#include <unordered_map>
 
 namespace mimirmind::server {
 
-/// In-flight chat-request snapshot for /v1/system/status.current_request.
+/// In-flight chat-request snapshots for /v1/system/status.current_request.
 ///
 /// A UI (e.g. Pegenaut) can poll this to render "prefill 24/42, decode
 /// 15/4096" instead of showing a spinner for the ~15 minutes a long
-/// prompt with a large max_tokens can take. Guarded by an internal
-/// mutex; only one chat request runs at a time thanks to the engine
-/// dispatch mutex, so writers never contend — the status poller reads
-/// while a writer may be updating.
+/// prompt with a large max_tokens can take.
+///
+/// Keyed by request id: the RequestDispatcher hands each model its own
+/// mutex, so requests to *different* models run concurrently. A single
+/// slot would let one request clobber another's snapshot (and the first
+/// Guard to destruct would wipe a still-running request). Every mutating
+/// call therefore names the request it touches; `end()` erases only that
+/// id. Guarded by an internal mutex — writers on parallel engine threads
+/// and the status poller may touch the map at the same time.
 class RequestTracker {
 public:
     RequestTracker() = default;
@@ -32,30 +37,37 @@ public:
 
     void begin(std::string id, std::size_t promptTokens,
                std::size_t maxNew, bool streaming);
-    void end() noexcept;
+    void end(const std::string& id) noexcept;
 
-    void updatePrefillProgress(std::size_t blocksDone,
+    void updatePrefillProgress(const std::string& id,
+                                std::size_t blocksDone,
                                 std::size_t blocksTotal,
                                 double      elapsedMs);
-    void markPrefillDone();
-    void incrementDecodeTokens();
+    void markPrefillDone(const std::string& id);
+    void incrementDecodeTokens(const std::string& id);
 
     /// JSON block for /v1/system/status.current_request. Returns
-    /// `{"active": false}` when idle.
+    /// `{"active": false}` when idle. When at least one request is in
+    /// flight it reports `{"active": true, "count": N, "requests": [...]}`;
+    /// for single-tenant back-compat the fields of the oldest active
+    /// request are also mirrored at the top level.
     [[nodiscard]] nlohmann::json buildStatusBlock() const;
 
-    /// RAII helper — clears the snapshot on scope exit even if the
-    /// generate() call throws.
+    /// RAII helper — erases the request's snapshot on scope exit even if
+    /// the generate() call throws. Holds the id so it only clears its own
+    /// entry, never a concurrently-running request's.
     class Guard {
     public:
-        explicit Guard(RequestTracker* t) noexcept : _t{t} {}
-        ~Guard() noexcept { if (_t) _t->end(); }
+        Guard(RequestTracker* t, std::string id) noexcept
+            : _t{t}, _id{std::move(id)} {}
+        ~Guard() noexcept { if (_t) _t->end(_id); }
         Guard(const Guard&)            = delete;
         Guard& operator=(const Guard&) = delete;
         Guard(Guard&&)                 = delete;
         Guard& operator=(Guard&&)      = delete;
     private:
         RequestTracker* _t;
+        std::string     _id;
     };
 
 private:
@@ -72,8 +84,11 @@ private:
         bool        streaming{false};
     };
 
-    mutable std::mutex               _mutex;
-    std::optional<CurrentRequest>    _current;
+    /// Serialise one in-flight request into its status-block shape.
+    static nlohmann::json requestJson(const CurrentRequest& r);
+
+    mutable std::mutex                                _mutex;
+    std::unordered_map<std::string, CurrentRequest>   _requests;
 };
 
 } // namespace mimirmind::server

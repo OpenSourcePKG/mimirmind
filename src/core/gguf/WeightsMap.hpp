@@ -6,6 +6,7 @@
 #include "core/gguf/GgufReader.hpp"
 
 #include <cstddef>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -63,6 +64,12 @@ public:
 
     /// Convenience for per-layer tensors named `blk.<idx>.<suffix>`
     /// (the llama.cpp / GGUF convention). Returns nullptr if missing.
+    ///
+    /// Hot path: called per tensor, per block, per token step in every
+    /// backend's runBlock. Resolves through a per-block index built once
+    /// at construction, so it neither builds the `blk.N.suffix` key nor
+    /// allocates on lookup — a plain vector index plus a heterogeneous
+    /// (string_view) hash probe.
     [[nodiscard]] const GgufTensor* findBlock(std::size_t blockIdx,
                                               std::string_view suffix) const;
 
@@ -73,17 +80,43 @@ public:
     [[nodiscard]] bool isAttached() const noexcept { return !_owned.empty(); }
 
 private:
+    /// Transparent hash so `_byName` / the per-block maps can be probed
+    /// with a `std::string_view` (or `const char*`) without materialising
+    /// a temporary `std::string` on every lookup. Requires pairing with
+    /// `std::equal_to<>` on the map.
+    struct TransparentStringHash {
+        using is_transparent = void;
+        [[nodiscard]] std::size_t operator()(std::string_view sv) const noexcept {
+            return std::hash<std::string_view>{}(sv);
+        }
+    };
+
+    using NameMap =
+        std::unordered_map<std::string, const GgufTensor*,
+                           TransparentStringHash, std::equal_to<>>;
+
     /// Attached-mode ctor used internally by `fromAttachedChunked` to
     /// take ownership of the resolved tensor list. Not part of the
     /// public API — callers must go through the chunked factory so the
     /// manifest → usmPtr mapping stays in one place.
     explicit WeightsMap(std::vector<GgufTensor> attachedTensors);
 
+    /// Populate `_byBlock` from the already-built `_byName`. Called once
+    /// by each constructor after `_byName` is filled. Parses every
+    /// `blk.<idx>.<suffix>` name into `_byBlock[idx][suffix]`.
+    void buildBlockIndex();
+
     // Populated only in attached mode; `_byName` points into this vector
     // when set. In reader mode it stays empty and `_byName` points into
     // the reader's own `tensors()` vector.
-    std::vector<GgufTensor>                            _owned;
-    std::unordered_map<std::string, const GgufTensor*> _byName;
+    std::vector<GgufTensor> _owned;
+    NameMap                 _byName;
+
+    // Per-block suffix → tensor index, indexed by block number. Built
+    // once at construction; empty entries (non-block tensors, gaps) cost
+    // one default-constructed map. Suffix key stays `std::string` but is
+    // probed heterogeneously with the caller's `string_view`.
+    std::vector<NameMap>    _byBlock;
 };
 
 } // namespace mimirmind::core::gguf

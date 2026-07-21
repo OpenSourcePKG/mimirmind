@@ -6,10 +6,12 @@
 #include "runtime/serving/ChunkedPrefillScheduler.hpp"
 #include "runtime/serving/PagedKvSequence.hpp"    // pulls in PagedKvBlockAllocator.hpp
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace mimirmind::runtime::serving {
@@ -305,8 +307,8 @@ public:
 
     /**
      * One-shot metrics aggregator for the serving-info endpoint /
-     * dashboards. Reads all state without mutating; O(N) in the
-     * current request-count.
+     * dashboards. Reads all state without mutating; O(1) — sourced from
+     * the transition-maintained per-state counters.
      *
      * Pool-utilisation fields are populated only when the scheduler
      * has an allocator. Monotonic totals reflect the scheduler's
@@ -359,11 +361,27 @@ private:
     void promoteWaitingToActive() noexcept;
 
     /**
-     * Locate a request by id and return a mutable pointer or
-     * nullptr. O(N) linear scan — fine for the maxActive <= 64
-     * bound.
+     * Locate a request by id and return a mutable pointer or nullptr.
+     * O(1) via `_indexById`. The returned pointer is only valid until
+     * the next mutation of `_requests` (admit / drainCompleted) — same
+     * lifetime contract as before the index existed.
      */
     RequestStateData* findMut(std::uint64_t id) noexcept;
+
+    /**
+     * Transition a request to `next`, keeping the per-state instantaneous
+     * counters (`_stateCount`) in sync. All state changes funnel through
+     * here so the O(1) count accessors never drift. Does NOT touch the
+     * monotonic totals — those stay with their transition sites.
+     */
+    void setState(RequestStateData& r, RequestState next) noexcept;
+
+    /**
+     * Rebuild `_indexById` from `_requests`. Called after drainCompleted
+     * shifts element positions (erase-remove). O(N), off the per-token
+     * path.
+     */
+    void rebuildIndex() noexcept;
 
     ChunkedPrefillScheduler        _prefillScheduler;
     std::size_t                    _maxActiveRequests;
@@ -371,6 +389,19 @@ private:
     std::uint64_t                  _nextRequestId{1};
     std::uint64_t                  _nextAdmitSeq{1};
     std::vector<RequestStateData>  _requests;
+
+    // id → index into `_requests`, kept in sync by admit/rebuildIndex so
+    // find()/findMut() are O(1) rather than a linear scan on the
+    // per-token commitProgress hot path. Indices survive vector
+    // reallocation (only pointers/iterators invalidate); drainCompleted
+    // rebuilds because erase-remove shifts positions.
+    std::unordered_map<std::uint64_t, std::size_t> _indexById;
+
+    // Instantaneous per-state population, indexed by RequestState value.
+    // Maintained at every transition via setState() so numWaiting/
+    // numActive/numCompleted/numPreempted and snapshotMetrics() are O(1)
+    // instead of one full scan each.
+    std::array<std::size_t, 5>     _stateCount{};
 
     // Monotonic counters — never decremented, never reset (persistent
     // across drainCompleted). Surface via snapshotMetrics().

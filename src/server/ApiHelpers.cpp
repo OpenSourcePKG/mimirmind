@@ -11,7 +11,10 @@ namespace mimirmind::server {
 using nlohmann::json;
 
 std::string makeRequestId() {
-    static std::mt19937_64 rng{std::random_device{}()};
+    // thread_local: chat requests to different models run on parallel
+    // dispatcher threads (per-target mutex), so a shared PRNG would be a
+    // data race on its internal state and could hand out duplicate ids.
+    thread_local std::mt19937_64 rng{std::random_device{}()};
     static constexpr char kAlpha[] =
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     std::string out = "chatcmpl-";

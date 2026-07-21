@@ -20,6 +20,7 @@ WeightsMap::WeightsMap(const GgufReader& reader) {
     for (const auto& t : tensors) {
         _byName.emplace(t.name, &t);
     }
+    buildBlockIndex();
     MM_LOG_INFO("weights", "indexed {} tensors for O(1) lookup", _byName.size());
 }
 
@@ -29,10 +30,36 @@ WeightsMap::WeightsMap(std::vector<GgufTensor> attachedTensors)
     for (const auto& t : _owned) {
         _byName.emplace(t.name, &t);
     }
+    buildBlockIndex();
     MM_LOG_INFO("weights",
                 "indexed {} attached tensors for O(1) lookup "
                 "(attached-mode; usmPtrs point at Munin-owned USM)",
                 _byName.size());
+}
+
+void WeightsMap::buildBlockIndex() {
+    constexpr std::string_view kPrefix = "blk.";
+    for (const auto& [name, tptr] : _byName) {
+        std::string_view sv{name};
+        if (!sv.starts_with(kPrefix)) continue;
+        sv.remove_prefix(kPrefix.size());
+
+        // Parse the block index digits up to the next '.'.
+        std::size_t idx = 0;
+        std::size_t pos = 0;
+        for (; pos < sv.size() && sv[pos] >= '0' && sv[pos] <= '9'; ++pos) {
+            idx = idx * 10 + static_cast<std::size_t>(sv[pos] - '0');
+        }
+        if (pos == 0 || pos >= sv.size() || sv[pos] != '.') {
+            continue;  // e.g. "blk.foo" or "blk.3" with no suffix — skip
+        }
+
+        const std::string_view suffix = sv.substr(pos + 1);
+        if (idx >= _byBlock.size()) {
+            _byBlock.resize(idx + 1);
+        }
+        _byBlock[idx].emplace(std::string{suffix}, tptr);
+    }
 }
 
 WeightsMap WeightsMap::fromAttachedChunked(
@@ -87,7 +114,7 @@ WeightsMap WeightsMap::fromAttachedChunked(
 }
 
 const GgufTensor* WeightsMap::find(std::string_view name) const noexcept {
-    const auto it = _byName.find(std::string{name});
+    const auto it = _byName.find(name);  // heterogeneous: no temporary string
     return it == _byName.end() ? nullptr : it->second;
 }
 
@@ -102,11 +129,12 @@ const GgufTensor& WeightsMap::require(std::string_view name) const {
 
 const GgufTensor* WeightsMap::findBlock(std::size_t blockIdx,
                                         std::string_view suffix) const {
-    std::string key = "blk.";
-    key += std::to_string(blockIdx);
-    key += '.';
-    key.append(suffix);
-    return find(key);
+    if (blockIdx >= _byBlock.size()) {
+        return nullptr;
+    }
+    const auto& sub = _byBlock[blockIdx];
+    const auto it = sub.find(suffix);  // heterogeneous probe, no key build
+    return it == sub.end() ? nullptr : it->second;
 }
 
 } // namespace mimirmind::core::gguf
