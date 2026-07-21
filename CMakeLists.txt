@@ -219,6 +219,9 @@ set(KERNEL_SOURCES
     kernels/rope_mrope.cl
     kernels/split_head_pair.cl
     kernels/sigmoid_gate_mul.cl
+    kernels/l2_norm.cl
+    kernels/ssm_conv1d.cl
+    kernels/gated_deltanet_ar.cl
     kernels/mul_scalar.cl
     kernels/gelu_mul.cl
     kernels/rmsnorm_gemma.cl
@@ -522,6 +525,9 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/rope_mrope.hip
         kernels_hip/split_head_pair.hip
         kernels_hip/sigmoid_gate_mul.hip
+        kernels_hip/l2_norm.hip
+        kernels_hip/ssm_conv1d.hip
+        kernels_hip/gated_deltanet_ar.hip
         kernels_hip/rope_inplace_fp16.hip
         kernels_hip/rope_inplace_ff.hip
         kernels_hip/scaled_add_residual.hip
@@ -661,6 +667,9 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/rope_mrope.cu
         kernels_cuda/split_head_pair.cu
         kernels_cuda/sigmoid_gate_mul.cu
+        kernels_cuda/l2_norm.cu
+        kernels_cuda/ssm_conv1d.cu
+        kernels_cuda/gated_deltanet_ar.cu
         kernels_cuda/rope_inplace_fp16.cu
         kernels_cuda/rope_inplace_ff.cu
         kernels_cuda/scaled_add_residual.cu
@@ -798,6 +807,7 @@ add_executable(mimirmind
     src/compute/MoeRouting.cpp
     src/compute/Norm.cpp
     src/compute/QuantTypeRegistry.cpp
+    src/compute/GatedDeltaNet.cpp
     src/compute/Rope.cpp
     src/compute/Sampling.cpp
     src/compute/Softmax.cpp
@@ -1124,6 +1134,7 @@ add_executable(gpu_tests
     src/compute/MoeRouting.cpp
     src/compute/Norm.cpp
     src/compute/QuantTypeRegistry.cpp
+    src/compute/GatedDeltaNet.cpp
     src/compute/Rope.cpp
     src/compute/Sampling.cpp
     src/compute/Softmax.cpp
@@ -1170,6 +1181,7 @@ add_executable(prefill_bench
     src/compute/MoeRouting.cpp
     src/compute/Norm.cpp
     src/compute/QuantTypeRegistry.cpp
+    src/compute/GatedDeltaNet.cpp
     src/compute/Rope.cpp
     src/compute/Sampling.cpp
     src/compute/Softmax.cpp

@@ -6,6 +6,7 @@
 #include "compute/Activations.hpp"
 #include "compute/Attention.hpp"
 #include "compute/ComputeBuffer.hpp"
+#include "compute/GatedDeltaNet.hpp"
 #include "compute/Matmul.hpp"
 #include "compute/Norm.hpp"
 #include "compute/Rope.hpp"
@@ -332,6 +333,37 @@ void GpuOps::sigmoidGateMulAsync(float*       y,
             y[r * dim + c] *= sig;
         }
     }
+}
+
+void GpuOps::l2NormInPlaceAsync(float*      x,
+                                std::size_t rows,
+                                std::size_t dim,
+                                float       eps) {
+    ::mimirmind::compute::l2NormInPlace(x, rows, dim, eps);
+}
+
+void GpuOps::causalConv1dSiluAsync(const float* convInput,
+                                   const float* kernel,
+                                   float*       out,
+                                   std::size_t  T,
+                                   std::size_t  channels,
+                                   std::size_t  kernelSize) {
+    ::mimirmind::compute::causalConv1dSilu(convInput, kernel, out,
+                                           T, channels, kernelSize);
+}
+
+void GpuOps::gatedDeltaNetRecurrentAsync(const float* q,
+                                         const float* k,
+                                         const float* v,
+                                         const float* gLog,
+                                         const float* beta,
+                                         float*       state,
+                                         float*       out,
+                                         std::size_t  T,
+                                         std::size_t  H,
+                                         std::size_t  S) {
+    ::mimirmind::compute::gatedDeltaNetRecurrent(q, k, v, gLog, beta,
+                                                 state, out, T, H, S);
 }
 
 void GpuOps::ropeInPlaceWithFactorsAsync(void*            xBase,

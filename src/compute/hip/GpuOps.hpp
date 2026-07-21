@@ -135,6 +135,17 @@ public:
     void sigmoidGateMulAsync(float* y, const float* g, std::size_t rows,
                              std::size_t dim, std::size_t gateDim) override;
 
+    void l2NormInPlaceAsync(float* x, std::size_t rows, std::size_t dim,
+                            float eps) override;
+    void causalConv1dSiluAsync(const float* convInput, const float* kernel,
+                               float* out, std::size_t T, std::size_t channels,
+                               std::size_t kernelSize) override;
+    void gatedDeltaNetRecurrentAsync(const float* q, const float* k,
+                                     const float* v, const float* gLog,
+                                     const float* beta, float* state,
+                                     float* out, std::size_t T, std::size_t H,
+                                     std::size_t S) override;
+
     void xQuantI8Async(const float* x, std::int8_t* y, float* scale,
                        std::size_t M, std::size_t K) override;
 

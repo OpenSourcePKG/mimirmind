@@ -139,6 +139,47 @@ public:
                                      std::size_t  dim,
                                      std::size_t  gateDim) = 0;
 
+    // ---- GatedDeltaNet (Qwen3-Next linear attention, M-Q3N.3) ---------
+    //
+    // GPU counterparts of the compute/GatedDeltaNet.* CPU reference. The
+    // CPU backend delegates straight to that reference; the GPU backends
+    // dispatch dedicated kernels validated against it. All F32.
+
+    /// In-place L2 normalisation over the innermost `dim` (head_dim):
+    /// `x[r,:] /= max(sqrt(sum_j x[r,j]^2), eps)`. `rows` = number of
+    /// length-`dim` vectors (== T*H). Applied to q/k in the linear layer.
+    virtual void l2NormInPlaceAsync(float*      x,
+                                    std::size_t rows,
+                                    std::size_t dim,
+                                    float       eps) = 0;
+
+    /// Causal depthwise 1-D convolution + SiLU (Qwen3-Next `ssm_conv1d`):
+    /// `out[t,c] = silu( sum_{k} convInput[t+k, c] * kernel[k, c] )`.
+    /// `convInput` is [(kernelSize-1)+T, channels]; `kernel` is
+    /// [kernelSize, channels] (tap-major); `out` is [T, channels].
+    virtual void causalConv1dSiluAsync(const float* convInput,
+                                       const float* kernel,
+                                       float*       out,
+                                       std::size_t  T,
+                                       std::size_t  channels,
+                                       std::size_t  kernelSize) = 0;
+
+    /// Autoregressive gated delta-rule recurrence over `T` tokens, per
+    /// value-head. Updates `state` [H, S, S] in place and writes `out`
+    /// [T, H, S]. q/k/v are [T, H, S]; gLog/beta are [T, H] (gLog is the
+    /// raw log-decay — exp applied internally). Reference:
+    /// compute::gatedDeltaNetRecurrent. Single sequence (n_seqs == 1).
+    virtual void gatedDeltaNetRecurrentAsync(const float* q,
+                                             const float* k,
+                                             const float* v,
+                                             const float* gLog,
+                                             const float* beta,
+                                             float*       state,
+                                             float*       out,
+                                             std::size_t  T,
+                                             std::size_t  H,
+                                             std::size_t  S) = 0;
+
     // ---- RoPE ---------------------------------------------------------
 
     virtual void ropeInPlaceAsync(void*            xBase,

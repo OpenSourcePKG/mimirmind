@@ -199,6 +199,12 @@ struct GpuOps::Impl {
     core::hip::HipKernel _splitHeadPairKernel;
     core::hip::HipModule _sigmoidGateMulModule;
     core::hip::HipKernel _sigmoidGateMulKernel;
+    core::hip::HipModule _l2NormModule;
+    core::hip::HipKernel _l2NormKernel;
+    core::hip::HipModule _ssmConv1dModule;
+    core::hip::HipKernel _ssmConv1dKernel;
+    core::hip::HipModule _gatedDeltaNetArModule;
+    core::hip::HipKernel _gatedDeltaNetArKernel;
 
     explicit Impl(core::hip::HipContext& ctx)
         : _rmsnormModule           {loadHipModule(ctx, "rmsnorm")},
@@ -297,7 +303,14 @@ struct GpuOps::Impl {
           _splitHeadPairKernel     {_splitHeadPairModule.getKernel("split_head_pair")},
           _sigmoidGateMulModule    {loadHipModule(ctx, "sigmoid_gate_mul")},
           _sigmoidGateMulKernel    {
-              _sigmoidGateMulModule.getKernel("sigmoid_gate_mul")}
+              _sigmoidGateMulModule.getKernel("sigmoid_gate_mul")},
+          _l2NormModule            {loadHipModule(ctx, "l2_norm")},
+          _l2NormKernel            {_l2NormModule.getKernel("l2_norm")},
+          _ssmConv1dModule         {loadHipModule(ctx, "ssm_conv1d")},
+          _ssmConv1dKernel         {_ssmConv1dModule.getKernel("ssm_conv1d")},
+          _gatedDeltaNetArModule   {loadHipModule(ctx, "gated_deltanet_ar")},
+          _gatedDeltaNetArKernel   {
+              _gatedDeltaNetArModule.getKernel("gated_deltanet_ar")}
     {}
 };
 
@@ -873,6 +886,66 @@ void GpuOps::sigmoidGateMulAsync(float* y, const float* g, std::size_t rows,
     k.launch(_ctx.stream(),
              groupsForN(total, kElementwiseLocalSize), 1, 1,
              kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::l2NormInPlaceAsync(float* x, std::size_t rows, std::size_t dim,
+                                float eps) {
+    if (rows == 0 || dim == 0) {
+        return;
+    }
+    constexpr std::size_t kL2NormLocal = 64;   // matches l2_norm.hip launch_bounds
+    auto& k = _pimpl->_l2NormKernel;
+    k.setPtr  (0, x);
+    k.setValue(1, toInt32(rows, "l2norm rows"));
+    k.setValue(2, toInt32(dim,  "l2norm dim"));
+    k.setValue(3, eps);
+    k.launch(_ctx.stream(),
+             groupsForN(rows, kL2NormLocal), 1, 1,
+             kL2NormLocal, 1, 1);
+}
+
+void GpuOps::causalConv1dSiluAsync(const float* convInput, const float* kernel,
+                                   float* out, std::size_t T,
+                                   std::size_t channels, std::size_t kernelSize) {
+    const std::size_t total = T * channels;
+    if (total == 0) {
+        return;
+    }
+    auto& k = _pimpl->_ssmConv1dKernel;
+    k.setPtr  (0, convInput);
+    k.setPtr  (1, kernel);
+    k.setPtr  (2, out);
+    k.setValue(3, toInt32(T,          "conv1d T"));
+    k.setValue(4, toInt32(channels,   "conv1d channels"));
+    k.setValue(5, toInt32(kernelSize, "conv1d K"));
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::gatedDeltaNetRecurrentAsync(const float* q, const float* k_,
+                                         const float* v, const float* gLog,
+                                         const float* beta, float* state,
+                                         float* out, std::size_t T,
+                                         std::size_t H, std::size_t S) {
+    if (T == 0 || H == 0 || S == 0) {
+        return;
+    }
+    auto& k = _pimpl->_gatedDeltaNetArKernel;
+    k.setPtr  (0, q);
+    k.setPtr  (1, k_);
+    k.setPtr  (2, v);
+    k.setPtr  (3, gLog);
+    k.setPtr  (4, beta);
+    k.setPtr  (5, state);
+    k.setPtr  (6, out);
+    k.setValue(7, toInt32(T, "gdn T"));
+    k.setValue(8, toInt32(H, "gdn H"));
+    k.setValue(9, toInt32(S, "gdn S"));
+    // grid = H blocks, block = S threads (S <= GATED_DELTANET_AR_MAX_S).
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(H), 1, 1,
+             static_cast<std::uint32_t>(S), 1, 1);
 }
 
 void GpuOps::ropeInPlaceWithFactorsAsync(void* xBase, const float* freqFactors,
