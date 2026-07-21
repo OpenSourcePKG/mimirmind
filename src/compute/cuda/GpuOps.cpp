@@ -94,12 +94,12 @@ std::filesystem::path resolveHsacoPath(std::string_view name) {
 // path through `resolveHsacoPath`. Symbol name inside the module is
 // assumed to be identical to the file basename (mirrors the L0 side
 // where `.spv` filename == kernel `__kernel` symbol).
-core::hip::CudaModule loadCudaModule(core::hip::CudaContext& ctx,
+core::cuda::CudaModule loadCudaModule(core::cuda::CudaContext& ctx,
                                    std::string_view       name) {
     const auto path = resolveHsacoPath(name);
     MM_LOG_INFO("hipgpuops", "loading module '{}' from {}",
                 std::string{name}, path.string());
-    return core::hip::CudaModule::fromFile(ctx, path.string());
+    return core::cuda::CudaModule::fromFile(ctx, path.string());
 }
 
 // Named throw helper — keeps every stub one line and gives an
@@ -122,78 +122,78 @@ core::hip::CudaModule loadCudaModule(core::hip::CudaContext& ctx,
 // (rope_inplace_ff_fp16) are deliberately absent — the corresponding
 // ComputeOps overrides throw a clear diagnostic at dispatch time.
 struct GpuOps::Impl {
-    core::hip::CudaModule _rmsnormModule;
-    core::hip::CudaKernel _rmsnormKernel;
-    core::hip::CudaModule _rmsnormGemmaModule;
-    core::hip::CudaKernel _rmsnormGemmaKernel;
-    core::hip::CudaModule _rmsnormNoWeightModule;
-    core::hip::CudaKernel _rmsnormNoWeightKernel;
-    core::hip::CudaModule _rmsnormQkvModule;
-    core::hip::CudaKernel _rmsnormQkvKernel;
-    core::hip::CudaModule _rmsnormQkvFp16Module;
-    core::hip::CudaKernel _rmsnormQkvFp16Kernel;
-    core::hip::CudaModule _addRmsNormModule;
-    core::hip::CudaKernel _addRmsNormKernel;
+    core::cuda::CudaModule _rmsnormModule;
+    core::cuda::CudaKernel _rmsnormKernel;
+    core::cuda::CudaModule _rmsnormGemmaModule;
+    core::cuda::CudaKernel _rmsnormGemmaKernel;
+    core::cuda::CudaModule _rmsnormNoWeightModule;
+    core::cuda::CudaKernel _rmsnormNoWeightKernel;
+    core::cuda::CudaModule _rmsnormQkvModule;
+    core::cuda::CudaKernel _rmsnormQkvKernel;
+    core::cuda::CudaModule _rmsnormQkvFp16Module;
+    core::cuda::CudaKernel _rmsnormQkvFp16Kernel;
+    core::cuda::CudaModule _addRmsNormModule;
+    core::cuda::CudaKernel _addRmsNormKernel;
 
-    core::hip::CudaModule _addBiasModule;
-    core::hip::CudaKernel _addBiasKernel;
-    core::hip::CudaModule _addResidualModule;
-    core::hip::CudaKernel _addResidualKernel;
-    core::hip::CudaModule _siluMulModule;
-    core::hip::CudaKernel _siluMulKernel;
-    core::hip::CudaModule _geluMulModule;
-    core::hip::CudaKernel _geluMulKernel;
-    core::hip::CudaModule _mulScalarModule;
-    core::hip::CudaKernel _mulScalarKernel;
-    core::hip::CudaModule _scaledAddResidualModule;
-    core::hip::CudaKernel _scaledAddResidualKernel;
-    core::hip::CudaModule _xQuantI8Module;
-    core::hip::CudaKernel _xQuantI8Kernel;
-    core::hip::CudaModule _ropeModule;
-    core::hip::CudaKernel _ropeKernel;
-    core::hip::CudaModule _ropeFp16Module;
-    core::hip::CudaKernel _ropeFp16Kernel;
-    core::hip::CudaModule _ropeFfModule;
-    core::hip::CudaKernel _ropeFfKernel;
+    core::cuda::CudaModule _addBiasModule;
+    core::cuda::CudaKernel _addBiasKernel;
+    core::cuda::CudaModule _addResidualModule;
+    core::cuda::CudaKernel _addResidualKernel;
+    core::cuda::CudaModule _siluMulModule;
+    core::cuda::CudaKernel _siluMulKernel;
+    core::cuda::CudaModule _geluMulModule;
+    core::cuda::CudaKernel _geluMulKernel;
+    core::cuda::CudaModule _mulScalarModule;
+    core::cuda::CudaKernel _mulScalarKernel;
+    core::cuda::CudaModule _scaledAddResidualModule;
+    core::cuda::CudaKernel _scaledAddResidualKernel;
+    core::cuda::CudaModule _xQuantI8Module;
+    core::cuda::CudaKernel _xQuantI8Kernel;
+    core::cuda::CudaModule _ropeModule;
+    core::cuda::CudaKernel _ropeKernel;
+    core::cuda::CudaModule _ropeFp16Module;
+    core::cuda::CudaKernel _ropeFp16Kernel;
+    core::cuda::CudaModule _ropeFfModule;
+    core::cuda::CudaKernel _ropeFfKernel;
 
-    core::hip::CudaModule _attentionModule;
-    core::hip::CudaKernel _attentionKernel;
-    core::hip::CudaModule _attentionFp16Module;
-    core::hip::CudaKernel _attentionFp16Kernel;
-    core::hip::CudaModule _attentionQ8Module;
-    core::hip::CudaKernel _attentionQ8Kernel;
-    core::hip::CudaModule _attentionFlashPartialModule;
-    core::hip::CudaKernel _attentionFlashPartialKernel;
-    core::hip::CudaModule _attentionFlashPartialFp16Module;
-    core::hip::CudaKernel _attentionFlashPartialFp16Kernel;
-    core::hip::CudaModule _attentionFlashPartialQ8Module;
-    core::hip::CudaKernel _attentionFlashPartialQ8Kernel;
-    core::hip::CudaModule _attentionFlashMergeModule;
-    core::hip::CudaKernel _attentionFlashMergeKernel;
+    core::cuda::CudaModule _attentionModule;
+    core::cuda::CudaKernel _attentionKernel;
+    core::cuda::CudaModule _attentionFp16Module;
+    core::cuda::CudaKernel _attentionFp16Kernel;
+    core::cuda::CudaModule _attentionQ8Module;
+    core::cuda::CudaKernel _attentionQ8Kernel;
+    core::cuda::CudaModule _attentionFlashPartialModule;
+    core::cuda::CudaKernel _attentionFlashPartialKernel;
+    core::cuda::CudaModule _attentionFlashPartialFp16Module;
+    core::cuda::CudaKernel _attentionFlashPartialFp16Kernel;
+    core::cuda::CudaModule _attentionFlashPartialQ8Module;
+    core::cuda::CudaKernel _attentionFlashPartialQ8Kernel;
+    core::cuda::CudaModule _attentionFlashMergeModule;
+    core::cuda::CudaKernel _attentionFlashMergeKernel;
 
-    core::hip::CudaModule _attentionPrefillFlashModule;
-    core::hip::CudaKernel _attentionPrefillFlashKernel;
-    core::hip::CudaModule _attentionPrefillFlashFp16Module;
-    core::hip::CudaKernel _attentionPrefillFlashFp16Kernel;
-    core::hip::CudaModule _attentionPrefillFlashQ8Module;
-    core::hip::CudaKernel _attentionPrefillFlashQ8Kernel;
-    core::hip::CudaModule _attentionPrefillFlashQ8GqaModule;
-    core::hip::CudaKernel _attentionPrefillFlashQ8GqaKernel;
-    core::hip::CudaModule _attentionPrefillFlashQ8GqaKtile64Module;
-    core::hip::CudaKernel _attentionPrefillFlashQ8GqaKtile64Kernel;
+    core::cuda::CudaModule _attentionPrefillFlashModule;
+    core::cuda::CudaKernel _attentionPrefillFlashKernel;
+    core::cuda::CudaModule _attentionPrefillFlashFp16Module;
+    core::cuda::CudaKernel _attentionPrefillFlashFp16Kernel;
+    core::cuda::CudaModule _attentionPrefillFlashQ8Module;
+    core::cuda::CudaKernel _attentionPrefillFlashQ8Kernel;
+    core::cuda::CudaModule _attentionPrefillFlashQ8GqaModule;
+    core::cuda::CudaKernel _attentionPrefillFlashQ8GqaKernel;
+    core::cuda::CudaModule _attentionPrefillFlashQ8GqaKtile64Module;
+    core::cuda::CudaKernel _attentionPrefillFlashQ8GqaKtile64Kernel;
 
-    core::hip::CudaModule _qkvSplitModule;
-    core::hip::CudaKernel _qkvSplitKernel;
-    core::hip::CudaModule _qkvSplitFp16Module;
-    core::hip::CudaKernel _qkvSplitFp16Kernel;
+    core::cuda::CudaModule _qkvSplitModule;
+    core::cuda::CudaKernel _qkvSplitKernel;
+    core::cuda::CudaModule _qkvSplitFp16Module;
+    core::cuda::CudaKernel _qkvSplitFp16Kernel;
 
-    core::hip::CudaModule _kvQuantCommitQ8Module;
-    core::hip::CudaKernel _kvQuantCommitQ8Kernel;
+    core::cuda::CudaModule _kvQuantCommitQ8Module;
+    core::cuda::CudaKernel _kvQuantCommitQ8Kernel;
 
-    core::hip::CudaModule _matmulQ8_0VecReorderModule;
-    core::hip::CudaKernel _matmulQ8_0VecReorderKernel;
+    core::cuda::CudaModule _matmulQ8_0VecReorderModule;
+    core::cuda::CudaKernel _matmulQ8_0VecReorderKernel;
 
-    explicit Impl(core::hip::CudaContext& ctx)
+    explicit Impl(core::cuda::CudaContext& ctx)
         : _rmsnormModule           {loadCudaModule(ctx, "rmsnorm")},
           _rmsnormKernel           {_rmsnormModule.getFunction("rmsnorm")},
           _rmsnormGemmaModule      {loadCudaModule(ctx, "rmsnorm_gemma")},
@@ -287,7 +287,7 @@ struct GpuOps::Impl {
     {}
 };
 
-GpuOps::GpuOps(core::hip::CudaComputeContext& ctx,
+GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
                      bool                          flashPrefillEnabled,
                      bool                          flashPrefillGqaQ8Enabled,
                      std::size_t                   flashPrefillKTileQ8,
@@ -334,7 +334,7 @@ GpuOps::GpuOps(core::hip::CudaComputeContext& ctx,
     // stalling. Ring cycles cleanly (256 slots > any in-flight batch).
     _scalarRing = static_cast<std::int32_t*>(
         alloc.allocate(kScalarRingSize * sizeof(std::int32_t),
-                       core::hip::CudaAllocKind::HostPinned));
+                       core::cuda::CudaAllocKind::HostPinned));
     _scalarRingIdx = 0;
 
     _prefillFlashDisabled      = !flashPrefillEnabled;
@@ -375,19 +375,19 @@ GpuOps::~GpuOps() {
     if (_scalarRing) {
         alloc.deallocate(_scalarRing,
                          kScalarRingSize * sizeof(std::int32_t),
-                         core::hip::CudaAllocKind::HostPinned);
+                         core::cuda::CudaAllocKind::HostPinned);
     }
     if (_stagingOffsetSlotUsm) {
         alloc.deallocate(_stagingOffsetSlotUsm, sizeof(std::int32_t),
-                         core::hip::CudaAllocKind::Device);
+                         core::cuda::CudaAllocKind::Device);
     }
     if (_curLenSlotUsm) {
         alloc.deallocate(_curLenSlotUsm, sizeof(std::int32_t),
-                         core::hip::CudaAllocKind::Device);
+                         core::cuda::CudaAllocKind::Device);
     }
     if (_flashPartialUsm) {
         alloc.deallocate(_flashPartialUsm, _flashPartialBytes,
-                         core::hip::CudaAllocKind::Device);
+                         core::cuda::CudaAllocKind::Device);
     }
 }
 
@@ -401,11 +401,11 @@ void GpuOps::stagedInt32ToDevice(std::int32_t* devicePtr,
 
 // ---- Real (non-stub) implementations --------------------------------
 
-core::hip::CudaStream& GpuOps::stream() noexcept {
+core::cuda::CudaStream& GpuOps::stream() noexcept {
     return _ctx.stream();
 }
 
-core::hip::CudaMemoryAllocator& GpuOps::allocator() noexcept {
+core::cuda::CudaMemoryAllocator& GpuOps::allocator() noexcept {
     return _ctx.allocator();
 }
 
@@ -480,13 +480,13 @@ compute::ComputeBuffer GpuOps::allocate(std::size_t bytes) {
         return {};
     }
     auto& alloc = _ctx.allocator();
-    void* ptr = alloc.allocate(bytes, core::hip::CudaAllocKind::Device);
+    void* ptr = alloc.allocate(bytes, core::cuda::CudaAllocKind::Device);
     return compute::ComputeBuffer{
         ptr,
         bytes,
         [](void* p, std::size_t b, void* ctx) noexcept {
-            static_cast<core::hip::CudaMemoryAllocator*>(ctx)
-                ->deallocate(p, b, core::hip::CudaAllocKind::Device);
+            static_cast<core::cuda::CudaMemoryAllocator*>(ctx)
+                ->deallocate(p, b, core::cuda::CudaAllocKind::Device);
         },
         &alloc};
 }
@@ -1006,7 +1006,7 @@ void GpuOps::attentionPlainAsync(const float* q, const void* k, const void* v,
     }
     (void)T_k;
 
-    core::hip::CudaKernel* kernelPtr = &_pimpl->_attentionKernel;
+    core::cuda::CudaKernel* kernelPtr = &_pimpl->_attentionKernel;
     if (kvDtype == runtime::KvDtype::FP16) {
         kernelPtr = &_pimpl->_attentionFp16Kernel;
     } else if (kvDtype == runtime::KvDtype::Q8_0) {
@@ -1061,7 +1061,7 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         (nQPerKv > 1) &&
         (nQPerKv <= kFlashPrefillGqaMaxQPerKv);
 
-    core::hip::CudaKernel* kernelPtr = &_pimpl->_attentionPrefillFlashKernel;
+    core::cuda::CudaKernel* kernelPtr = &_pimpl->_attentionPrefillFlashKernel;
     if (kvDtype == runtime::KvDtype::FP16) {
         kernelPtr = &_pimpl->_attentionPrefillFlashFp16Kernel;
     } else if (kvDtype == runtime::KvDtype::Q8_0) {
@@ -1132,7 +1132,7 @@ void GpuOps::attentionDecodeFlashAsync(const float* q, const void* k,
     // Pass 1 — per-tile partial (m, l, o_unnorm) into persistent scratch.
     // Kernel by KV dtype; partial layout stays fp32 regardless so the
     // merge kernel is dtype-agnostic.
-    core::hip::CudaKernel* partialKernelPtr =
+    core::cuda::CudaKernel* partialKernelPtr =
         &_pimpl->_attentionFlashPartialKernel;
     if (kvDtype == runtime::KvDtype::FP16) {
         partialKernelPtr = &_pimpl->_attentionFlashPartialFp16Kernel;
