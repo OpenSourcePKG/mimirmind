@@ -117,6 +117,21 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     if (addGenerationPrompt) {
         ids.push_back(imStart);
         encodeText(tok, "assistant\n", ids);
+        // Qwen3 "thinking" models (Qwen3 / Qwen3.5 / Qwen3.6 `qwen35moe`)
+        // pre-open a <think> block in the default generation prompt — the
+        // model is trained to continue *inside* it and close with </think>.
+        // Their HF/GGUF chat_template appends '<think>\n' after
+        // 'assistant\n' (default) or '<think>\n\n</think>\n\n' when thinking
+        // is disabled. Qwen2 / Qwen2.5 have no <think> token and use a plain
+        // ChatML generation prompt. Auto-detect by the presence of the
+        // <think> special token so both families work without an arch
+        // switch. Without this, a thinking model emits a spurious </think>
+        // and stops immediately.
+        const std::int32_t think = tok.findToken("<think>");
+        if (think >= 0) {
+            ids.push_back(think);
+            encodeText(tok, "\n", ids);
+        }
     }
 
     return ids;
