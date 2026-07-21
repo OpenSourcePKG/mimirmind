@@ -205,6 +205,10 @@ struct GpuOps::Impl {
     core::hip::HipKernel _ssmConv1dKernel;
     core::hip::HipModule _gatedDeltaNetArModule;
     core::hip::HipKernel _gatedDeltaNetArKernel;
+    core::hip::HipModule _deltanetGateModule;
+    core::hip::HipKernel _deltanetGateKernel;
+    core::hip::HipModule _sigmoidInplaceModule;
+    core::hip::HipKernel _sigmoidInplaceKernel;
 
     explicit Impl(core::hip::HipContext& ctx)
         : _rmsnormModule           {loadHipModule(ctx, "rmsnorm")},
@@ -310,7 +314,12 @@ struct GpuOps::Impl {
           _ssmConv1dKernel         {_ssmConv1dModule.getKernel("ssm_conv1d")},
           _gatedDeltaNetArModule   {loadHipModule(ctx, "gated_deltanet_ar")},
           _gatedDeltaNetArKernel   {
-              _gatedDeltaNetArModule.getKernel("gated_deltanet_ar")}
+              _gatedDeltaNetArModule.getKernel("gated_deltanet_ar")},
+          _deltanetGateModule      {loadHipModule(ctx, "deltanet_gate")},
+          _deltanetGateKernel      {_deltanetGateModule.getKernel("deltanet_gate")},
+          _sigmoidInplaceModule    {loadHipModule(ctx, "sigmoid_inplace")},
+          _sigmoidInplaceKernel    {
+              _sigmoidInplaceModule.getKernel("sigmoid_inplace")}
     {}
 };
 
@@ -946,6 +955,37 @@ void GpuOps::gatedDeltaNetRecurrentAsync(const float* q, const float* k_,
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(H), 1, 1,
              static_cast<std::uint32_t>(S), 1, 1);
+}
+
+void GpuOps::deltanetGateAsync(const float* alpha, const float* ssmA,
+                               const float* ssmDt, float* gLog,
+                               std::size_t T, std::size_t H) {
+    const std::size_t total = T * H;
+    if (total == 0) {
+        return;
+    }
+    auto& k = _pimpl->_deltanetGateKernel;
+    k.setPtr  (0, alpha);
+    k.setPtr  (1, ssmA);
+    k.setPtr  (2, ssmDt);
+    k.setPtr  (3, gLog);
+    k.setValue(4, toInt32(T, "deltanetGate T"));
+    k.setValue(5, toInt32(H, "deltanetGate H"));
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    auto& k = _pimpl->_sigmoidInplaceKernel;
+    k.setPtr  (0, y);
+    k.setValue(1, toInt32(n, "sigmoidInplace n"));
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
 }
 
 void GpuOps::ropeInPlaceWithFactorsAsync(void* xBase, const float* freqFactors,

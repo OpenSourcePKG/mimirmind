@@ -152,6 +152,15 @@ public:
                                      std::size_t  H,
                                      std::size_t  S) override;
 
+    void deltanetGateAsync(const float* alpha,
+                           const float* ssmA,
+                           const float* ssmDt,
+                           float*       gLog,
+                           std::size_t  T,
+                           std::size_t  H) override;
+
+    void sigmoidInPlaceAsync(float* y, std::size_t n) override;
+
     // ---- RoPE -----------------------------------------------------------
 
     void ropeInPlaceAsync(void*            xBase,

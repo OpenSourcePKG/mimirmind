@@ -366,6 +366,19 @@ void GpuOps::gatedDeltaNetRecurrentAsync(const float* q,
                                                  state, out, T, H, S);
 }
 
+void GpuOps::deltanetGateAsync(const float* alpha,
+                               const float* ssmA,
+                               const float* ssmDt,
+                               float*       gLog,
+                               std::size_t  T,
+                               std::size_t  H) {
+    ::mimirmind::compute::deltanetGate(alpha, ssmA, ssmDt, gLog, T, H);
+}
+
+void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
+    ::mimirmind::compute::sigmoidInPlace(y, n);
+}
+
 void GpuOps::ropeInPlaceWithFactorsAsync(void*            xBase,
                                          const float*     freqFactors,
                                          std::size_t      seqLen,

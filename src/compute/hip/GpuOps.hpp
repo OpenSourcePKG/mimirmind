@@ -145,6 +145,10 @@ public:
                                      const float* beta, float* state,
                                      float* out, std::size_t T, std::size_t H,
                                      std::size_t S) override;
+    void deltanetGateAsync(const float* alpha, const float* ssmA,
+                           const float* ssmDt, float* gLog,
+                           std::size_t T, std::size_t H) override;
+    void sigmoidInPlaceAsync(float* y, std::size_t n) override;
 
     void xQuantI8Async(const float* x, std::int8_t* y, float* scale,
                        std::size_t M, std::size_t K) override;

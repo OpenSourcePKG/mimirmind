@@ -135,6 +135,10 @@ struct GpuOps::Impl {
     runtime::GpuKernel     _ssmConv1dKernel;
     runtime::GpuModule     _gatedDeltaNetArModule;
     runtime::GpuKernel     _gatedDeltaNetArKernel;
+    runtime::GpuModule     _deltanetGateModule;
+    runtime::GpuKernel     _deltanetGateKernel;
+    runtime::GpuModule     _sigmoidInplaceModule;
+    runtime::GpuKernel     _sigmoidInplaceKernel;
 
     explicit Impl(core::l0::L0Context& ctx)
         : _rmsnormModule    {ctx, "rmsnorm"},
@@ -240,7 +244,12 @@ struct GpuOps::Impl {
           _ssmConv1dKernel     {_ssmConv1dModule.kernel("ssm_conv1d")},
           _gatedDeltaNetArModule{ctx, "gated_deltanet_ar"},
           _gatedDeltaNetArKernel{
-              _gatedDeltaNetArModule.kernel("gated_deltanet_ar")}
+              _gatedDeltaNetArModule.kernel("gated_deltanet_ar")},
+          _deltanetGateModule  {ctx, "deltanet_gate"},
+          _deltanetGateKernel  {_deltanetGateModule.kernel("deltanet_gate")},
+          _sigmoidInplaceModule{ctx, "sigmoid_inplace"},
+          _sigmoidInplaceKernel{
+              _sigmoidInplaceModule.kernel("sigmoid_inplace")}
     {}
 };
 
@@ -861,6 +870,39 @@ void GpuOps::gatedDeltaNetRecurrentAsync(const float* q,
     // groupsForN(x, 1) == x as a range-checked uint32_t.
     kern.setGroupSize(groupsForN(S, 1), 1, 1);
     _queue.appendLaunch(kern, groupsForN(H, 1), 1, 1);   // H work-groups
+}
+
+void GpuOps::deltanetGateAsync(const float* alpha,
+                               const float* ssmA,
+                               const float* ssmDt,
+                               float*       gLog,
+                               std::size_t  T,
+                               std::size_t  H) {
+    const std::size_t total = T * H;
+    if (total == 0) {
+        return;
+    }
+    auto& k = _pimpl->_deltanetGateKernel;
+    k.setPtr(0, alpha);
+    k.setPtr(1, ssmA);
+    k.setPtr(2, ssmDt);
+    k.setPtr(3, gLog);
+    k.setValue<std::int32_t>(4, toInt32(T, "deltanetGate T"));
+    k.setValue<std::int32_t>(5, toInt32(H, "deltanetGate H"));
+    k.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(k, groupsForN(total, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    _pimpl->_sigmoidInplaceKernel.setPtr(0, y);
+    _pimpl->_sigmoidInplaceKernel.setValue<std::int32_t>(
+        1, toInt32(n, "sigmoidInplace n"));
+    _pimpl->_sigmoidInplaceKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_sigmoidInplaceKernel,
+                        groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 
 void GpuOps::ropeInPlaceWithFactorsAsync(void*            xBase,

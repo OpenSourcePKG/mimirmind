@@ -252,6 +252,15 @@ public:
                                      std::size_t  H,
                                      std::size_t  S) override;
 
+    void deltanetGateAsync(const float* alpha,
+                           const float* ssmA,
+                           const float* ssmDt,
+                           float*       gLog,
+                           std::size_t  T,
+                           std::size_t  H) override;
+
+    void sigmoidInPlaceAsync(float* y, std::size_t n) override;
+
     /// In-place scalar multiply: y[i] *= s for i in [0, n).
     /// Used by Gemma 4 for layer_output_scale.
     void mulScalarAsync(float*       y,

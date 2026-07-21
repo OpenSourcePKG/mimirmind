@@ -150,6 +150,54 @@ TEST(cuda_gated_deltanet_ar_parity) {
     }
 }
 
+TEST(cuda_deltanet_gate_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t T = 5, H = 8;
+    auto alpha = randVec(T * H, 0x51u);
+    auto ssmA  = randVec(H,     0x62u);
+    auto ssmDt = randVec(H,     0x73u);
+
+    std::vector<float> ref(T * H);
+    ::mimirmind::compute::deltanetGate(alpha.data(), ssmA.data(), ssmDt.data(),
+                                       ref.data(), T, H);
+
+    auto da = toDevice(ops, alpha);
+    auto dA = toDevice(ops, ssmA);
+    auto dD = toDevice(ops, ssmDt);
+    auto dg = ops.allocate(T * H * sizeof(float));
+    ops.deltanetGateAsync(static_cast<const float*>(da.get()),
+                          static_cast<const float*>(dA.get()),
+                          static_cast<const float*>(dD.get()),
+                          static_cast<float*>(dg.get()), T, H);
+    ops.flush();
+    auto got = fromDevice(ops, dg.get(), T * H);
+
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], ref[i], 1e-3f);
+    }
+}
+
+TEST(cuda_sigmoid_inplace_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t n = 50;
+    auto host = randVec(n, 0x84u);
+    std::vector<float> ref = host;
+    ::mimirmind::compute::sigmoidInPlace(ref.data(), n);
+
+    auto buf = toDevice(ops, host);
+    ops.sigmoidInPlaceAsync(static_cast<float*>(buf.get()), n);
+    ops.flush();
+    auto got = fromDevice(ops, buf.get(), n);
+
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], ref[i], 1e-4f);
+    }
+}
+
 int main() {
     return mm::test::run();
 }

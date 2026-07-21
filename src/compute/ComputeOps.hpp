@@ -180,6 +180,20 @@ public:
                                              std::size_t  H,
                                              std::size_t  S) = 0;
 
+    /// GatedDeltaNet decay gate: gLog[t,h] = -exp(ssmA[h]) *
+    /// softplus(alpha[t,h] + ssmDt[h]). alpha [T,H]; ssmA/ssmDt [H];
+    /// gLog (out) [T,H]. Reference: compute::deltanetGate.
+    virtual void deltanetGateAsync(const float* alpha,
+                                   const float* ssmA,
+                                   const float* ssmDt,
+                                   float*       gLog,
+                                   std::size_t  T,
+                                   std::size_t  H) = 0;
+
+    /// In-place logistic sigmoid: y[i] = 1/(1+exp(-y[i])). GatedDeltaNet
+    /// `beta` gate. Reference: compute::sigmoidInPlace.
+    virtual void sigmoidInPlaceAsync(float* y, std::size_t n) = 0;
+
     // ---- RoPE ---------------------------------------------------------
 
     virtual void ropeInPlaceAsync(void*            xBase,

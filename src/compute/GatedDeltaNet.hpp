@@ -81,6 +81,28 @@ void causalConv1dSilu(const float* convInput,
                       std::size_t  kernelSize);
 
 /**
+ * GatedDeltaNet decay gate (Qwen3-Next linear layer). Per token t, per
+ * value-head h:
+ *   gLog[t,h] = -exp(ssmA[h]) * softplus(alpha[t,h] + ssmDt[h])
+ * This is the raw log-decay fed to `gatedDeltaNetRecurrent` (which applies
+ * exp internally). softplus uses the numerically-stable form. Reference for
+ * ggml `-A_log.exp() * softplus(alpha + dt)`.
+ *   alpha : [T, H]   ssmA, ssmDt : [H]   gLog (out) : [T, H]
+ */
+void deltanetGate(const float* alpha,
+                  const float* ssmA,
+                  const float* ssmDt,
+                  float*       gLog,
+                  std::size_t  T,
+                  std::size_t  H);
+
+/**
+ * In-place logistic sigmoid: y[i] = 1 / (1 + exp(-y[i])). Used for the
+ * GatedDeltaNet `beta` gate (sigmoid of the ssm_beta projection).
+ */
+void sigmoidInPlace(float* y, std::size_t n);
+
+/**
  * In-place L2 normalisation over the innermost `dim` (head_dim), matching
  * ggml `ggml_l2_norm` used on q/k in the linear layer:
  *   x[r, :] /= sqrt( sum_j x[r,j]^2 + eps )
