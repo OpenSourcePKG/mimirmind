@@ -97,7 +97,11 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
     blockCount        = requireU32("block_count");
     contextLength     = requireU32("context_length");
     embeddingLength   = requireU32("embedding_length");
-    feedForwardLength = requireU32("feed_forward_length");
+    // Optional: pure-MoE models (Qwen3-Next `qwen35moe`) ship no dense
+    // `feed_forward_length` — the per-expert width lives in
+    // `expert_feed_forward_length` instead. Default 0; a sanity check
+    // below flags the pathological "no dense FF *and* not MoE" case.
+    feedForwardLength = optionalU32("feed_forward_length", 0);
     headCount         = requireU32("attention.head_count");
     headCountKv       = optionalU32("attention.head_count_kv", headCount);
 
@@ -237,6 +241,21 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
     ssmGroupCount   = optionalU32("ssm.group_count",    0);
 
     nextnPredictLayers = optionalU32("nextn_predict_layers", 0);
+
+    // Qwen3-Next ships block_count = trunk + NextN/MTP layers (e.g. 41 =
+    // 40 trunk + 1 MTP). The MTP block (`blk.<trunk>.nextn.*`) has a
+    // distinct tensor structure and is NOT part of the main forward pass
+    // (it drives speculative decoding, handled separately). Trim it from
+    // blockCount so the block loop, KV sizing and the recurrent pattern
+    // all cover only the trunk. The MTP tensors stay loaded (unused here).
+    if (nextnPredictLayers > 0 && nextnPredictLayers < blockCount) {
+        const std::uint32_t trunk = blockCount - nextnPredictLayers;
+        MM_LOG_INFO("config",
+                    "block_count {} includes {} NextN/MTP layer(s) — main "
+                    "forward uses {} trunk layers",
+                    blockCount, nextnPredictLayers, trunk);
+        blockCount = trunk;
+    }
 
     // IMRoPE dimension sections — `<arch>.rope.dimension_sections`, an array
     // of (typically 4) int32. Stored verbatim; the attention kernel splits
