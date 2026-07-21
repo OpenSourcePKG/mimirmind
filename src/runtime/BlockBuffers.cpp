@@ -93,7 +93,12 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         b.ssmAlpha     = ops.allocate(maxT * hV * f);
         b.ssmBeta      = ops.allocate(maxT * hV * f);
         b.ssmGate      = ops.allocate(maxT * hV * f);
-        b.ssmState     = ops.allocate(stateElems * f);
+        // Persistent per-layer state, indexed by blockIdx (full-attn slots
+        // stay unused but keep indexing trivial).
+        const std::size_t nBlk       = config.blockCount;
+        const std::size_t convStateE = config.ssmConvStateElemsPerLayer();
+        b.ssmState        = ops.allocate(nBlk * stateElems * f);
+        b.ssmConvStateBuf = ops.allocate(nBlk * convStateE * f);
     }
 
     if (withKvFp32Scratch) {

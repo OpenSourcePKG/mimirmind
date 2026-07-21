@@ -100,7 +100,7 @@ void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
     const bool diag = (blockIdx == 0 && cache.length() == 0 && traceBlock0);
 
     if (_config.isRecurrentLayer(blockIdx)) {
-        runLinearBlock(blockIdx, x, T, s, diag);
+        runLinearBlock(blockIdx, x, T, cache, s, diag);
     } else {
         runFullAttentionBlock(blockIdx, x, T, cache, s, diag);
     }
@@ -239,6 +239,7 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
 void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
                                       float*        x,
                                       std::size_t   T,
+                                      KvCache&      cache,
                                       BlockBuffers& s,
                                       bool          diag) {
     auto trace = [&](const char* tag) {
@@ -267,8 +268,13 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     const std::size_t convDim    = _config.ssmConvDim();
     const std::size_t dConv     = _config.ssmConvKernel;
     const std::size_t keyDim    = S * hK;
-    const std::size_t stateElems = _config.ssmStateElemsPerLayer();
+    const std::size_t stateElems     = _config.ssmStateElemsPerLayer();
+    const std::size_t convStateElems = _config.ssmConvStateElemsPerLayer();
     const float       eps       = _config.rmsNormEps;
+
+    // Persistent per-layer recurrent state (survives across decode steps);
+    // zeroed only at sequence start (curLen == 0).
+    const bool isSeqStart = (cache.length() == 0);
 
     float* const normBuf   = s.normBuf.as<float>();
     float* const qkvMixed  = s.ssmQkvMixed.as<float>();
@@ -281,7 +287,8 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     float* const alphaBuf  = s.ssmAlpha.as<float>();
     float* const betaBuf   = s.ssmBeta.as<float>();
     float* const gateBuf   = s.ssmGate.as<float>();
-    float* const stateBuf  = s.ssmState.as<float>();
+    float* const stateBuf  = s.ssmState.as<float>()        + blockIdx * stateElems;
+    float* const convState = s.ssmConvStateBuf.as<float>() + blockIdx * convStateElems;
     float* const projOut   = s.projOut.as<float>();
     float* const matmulScr = s.matmulScratch.as<float>();
 
@@ -310,15 +317,25 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
 
     // --- causal conv1d + silu ----------------------------------------
     // conv_input = concat(conv_state[d_conv-1], qkv_mixed[T]) along time.
-    // Prefill scope: conv_state is zero. conv output reuses qkvMixed.
-    trace("conv1d (state-concat + silu)");
+    // conv_state persists across decode steps (rolling tail); it is zeroed
+    // only at sequence start. After the conv, the last (d_conv-1) rows of
+    // conv_input become the new conv_state. conv output reuses qkvMixed.
+    trace("conv1d (rolling state-concat + silu)");
     const std::size_t stateRows = (dConv > 0 ? dConv - 1 : 0);
-    _ops.mulScalarAsync(convInput, 0.0F, stateRows * convDim);   // zero conv state
+    if (isSeqStart) {
+        _ops.mulScalarAsync(convState, 0.0F, convStateElems);
+    }
+    // conv_input = [conv_state | qkv_mixed]
+    _ops.appendMemoryCopy(convInput, convState,
+                          convStateElems * sizeof(float));
     _ops.appendMemoryCopy(convInput + stateRows * convDim, qkvMixed,
                           T * convDim * sizeof(float));
     _ops.causalConv1dSiluAsync(convInput,
                                static_cast<const float*>(convW.usmPtr),
                                qkvMixed, T, convDim, dConv);      // conv out -> qkvMixed
+    // Save the trailing (d_conv-1) rows as the next conv_state.
+    _ops.appendMemoryCopy(convState, convInput + T * convDim,
+                          convStateElems * sizeof(float));
 
     // --- split conv into q / k / v (+ GQA repeat H_k -> H_v) ---------
     trace("gather q/k/v");
@@ -331,9 +348,12 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     _ops.l2NormInPlaceAsync(qBuf, T * hV, S, eps);
     _ops.l2NormInPlaceAsync(kBuf, T * hV, S, eps);
 
-    // --- gated delta-rule recurrence (state zero-init: prefill) ------
+    // --- gated delta-rule recurrence (persistent state) -------------
+    // state zeroed only at sequence start; decode steps evolve it in place.
     trace("delta-rule recurrence");
-    _ops.mulScalarAsync(stateBuf, 0.0F, stateElems);
+    if (isSeqStart) {
+        _ops.mulScalarAsync(stateBuf, 0.0F, stateElems);
+    }
     _ops.gatedDeltaNetRecurrentAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
                                      stateBuf, deltaOut, T, hV, S);
 

@@ -96,6 +96,7 @@ private:
     void runLinearBlock(std::size_t   blockIdx,
                         float*        x,
                         std::size_t   T,
+                        KvCache&      cache,
                         BlockBuffers& s,
                         bool          diag);
 

@@ -106,7 +106,15 @@ struct BlockBuffers {
     ComputeBuffer ssmAlpha;      // [maxT, H_v]
     ComputeBuffer ssmBeta;       // [maxT, H_v]
     ComputeBuffer ssmGate;       // [maxT, H_v]        (gLog)
-    ComputeBuffer ssmState;      // [H_v * S * S]      (recurrent state)
+    // Persistent per-linear-layer recurrent state, indexed by blockIdx:
+    // ssmState  = [blockCount, H_v*S*S]  (delta-net [S,S] state per v-head)
+    // ssmConvStateBuf = [blockCount, (d_conv-1)*conv_dim]  (rolling conv tail)
+    // Both survive across forward calls (the engine reuses one BlockBuffers
+    // for a sequence) and are zero-initialised only at sequence start
+    // (curLen == 0), so decode steps carry the state forward. Single-sequence
+    // scope; multi-tenant serving needs per-sequence instances (like KvCache).
+    ComputeBuffer ssmState;         // [blockCount, H_v*S*S]
+    ComputeBuffer ssmConvStateBuf;  // [blockCount, (d_conv-1)*conv_dim]
 
     // M-MoE.Fused-Decode — per-layer routing scratches for the fused-K
     // down kernel. The command queue records dispatches lazily, so the
