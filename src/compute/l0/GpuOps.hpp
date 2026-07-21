@@ -200,6 +200,34 @@ public:
                                      std::size_t      writeOffsetStride = 0,
                                      runtime::KvDtype kvDtype           = runtime::KvDtype::F32) override;
 
+    /// Interleaved multi-axis RoPE (IMRoPE) — Qwen3-Next full-attention.
+    void mropeInPlaceAsync(void*               xBase,
+                           std::size_t         seqLen,
+                           std::size_t         numHeads,
+                           std::size_t         headDim,
+                           std::size_t         startPos,
+                           float               base,
+                           const std::int32_t* sections,
+                           std::size_t         writeOffsetStride = 0,
+                           runtime::KvDtype    kvDtype           = runtime::KvDtype::F32) override;
+
+    /// De-interleave a fused per-head [Q|gate] projection into two
+    /// contiguous halves. Qwen3-Next full-attention query + output gate.
+    void splitHeadPairAsync(const float* src,
+                            float*       a,
+                            float*       b,
+                            std::size_t  seqLen,
+                            std::size_t  numHeads,
+                            std::size_t  headDim) override;
+
+    /// In-place sigmoid gate: y[r,c] *= sigmoid(g[r, gateDim==1?0:c]).
+    /// Qwen3-Next attention output gate + shared-expert gate.
+    void sigmoidGateMulAsync(float*       y,
+                             const float* g,
+                             std::size_t  rows,
+                             std::size_t  dim,
+                             std::size_t  gateDim) override;
+
     /// In-place scalar multiply: y[i] *= s for i in [0, n).
     /// Used by Gemma 4 for layer_output_scale.
     void mulScalarAsync(float*       y,

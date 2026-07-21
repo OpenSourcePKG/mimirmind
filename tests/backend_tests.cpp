@@ -424,6 +424,76 @@ TEST(llmConfig_kvBytesPerToken_emptyModelReturnsZero) {
 }
 
 // -----------------------------------------------------------------------
+// LlmConfig — Qwen3-Next / GatedDeltaNet hybrid (qwen35moe) helpers
+// -----------------------------------------------------------------------
+
+TEST(llmConfig_ssm_dimsFor35bA3b) {
+    using ::mimirmind::model::LlmConfig;
+    LlmConfig cfg{};
+    // Qwen3.6-35B-A3B SSM hyperparameters (recon 2026-07-21).
+    cfg.ssmConvKernel   = 4;
+    cfg.ssmInnerSize    = 4096;   // value_dim = H_v * S_v = 32 * 128
+    cfg.ssmStateSize    = 128;    // head_dim
+    cfg.ssmTimeStepRank = 32;     // H_v (num v-heads)
+    cfg.ssmGroupCount   = 16;     // H_k (num k-heads)
+
+    EXPECT_EQ(cfg.ssmHeadDim(),   std::uint32_t{128});
+    EXPECT_EQ(cfg.ssmNumKHeads(), std::uint32_t{16});
+    EXPECT_EQ(cfg.ssmNumVHeads(), std::uint32_t{32});
+    // conv_dim = d_inner + 2*n_group*d_state = 4096 + 2*16*128 = 8192.
+    EXPECT_EQ(cfg.ssmConvDim(),   std::uint32_t{8192});
+    // state elems/layer = S^2 * H_v = 128*128*32 = 524288 (= 2 MiB F32).
+    EXPECT_EQ(cfg.ssmStateElemsPerLayer(), std::size_t{524288});
+    // conv state elems/layer = (d_conv-1) * conv_dim = 3 * 8192 = 24576.
+    EXPECT_EQ(cfg.ssmConvStateElemsPerLayer(), std::size_t{24576});
+}
+
+TEST(llmConfig_ssm_nonHybridReturnsZero) {
+    using ::mimirmind::model::LlmConfig;
+    LlmConfig cfg{};
+    // No SSM params set → all derived SSM quantities are zero, no recurrence.
+    EXPECT_EQ(cfg.ssmConvDim(),                std::uint32_t{0});
+    EXPECT_EQ(cfg.ssmStateElemsPerLayer(),     std::size_t{0});
+    EXPECT_EQ(cfg.ssmConvStateElemsPerLayer(), std::size_t{0});
+    EXPECT_TRUE(!cfg.isHybridRecurrent());
+    EXPECT_TRUE(!cfg.isRecurrentLayer(0));
+}
+
+TEST(llmConfig_attentionScaleFor) {
+    using ::mimirmind::model::LlmConfig;
+    LlmConfig cfg{};
+    // Unset (0) → default 1/sqrt(head_dim).
+    EXPECT_NEAR(cfg.attentionScaleFor(256),
+                1.0F / std::sqrt(256.0F), 1e-7F);
+    // Explicit scale wins.
+    cfg.attentionScale = 0.125F;
+    EXPECT_NEAR(cfg.attentionScaleFor(256), 0.125F, 1e-7F);
+    // head_dim 0 with no explicit scale is a safe 0 (no div-by-zero).
+    LlmConfig z{};
+    EXPECT_NEAR(z.attentionScaleFor(0), 0.0F, 1e-7F);
+}
+
+TEST(llmConfig_recurrentPattern_intervalConvention) {
+    using ::mimirmind::model::LlmConfig;
+    LlmConfig cfg{};
+    // Mirror the llama.cpp qwen35moe synthesis `(b+1) % 4 != 0` over 8 layers:
+    // full at index 3 and 7, recurrent elsewhere.
+    cfg.blockCount = 8;
+    cfg.recurrentLayerPattern =
+        {true, true, true, false, true, true, true, false};
+    EXPECT_TRUE(cfg.isHybridRecurrent());
+    EXPECT_TRUE(cfg.isRecurrentLayer(0));
+    EXPECT_TRUE(cfg.isRecurrentLayer(1));
+    EXPECT_TRUE(cfg.isRecurrentLayer(2));
+    EXPECT_TRUE(!cfg.isRecurrentLayer(3));   // full attention
+    EXPECT_TRUE(cfg.isRecurrentLayer(6));
+    EXPECT_TRUE(!cfg.isRecurrentLayer(7));   // full attention
+    // Out-of-range index is a safe false, never UB.
+    EXPECT_TRUE(!cfg.isRecurrentLayer(8));
+    EXPECT_TRUE(!cfg.isRecurrentLayer(9999));
+}
+
+// -----------------------------------------------------------------------
 // ServingSettings — config-parser round-trip
 // -----------------------------------------------------------------------
 

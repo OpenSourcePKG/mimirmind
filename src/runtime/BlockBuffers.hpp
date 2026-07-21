@@ -56,6 +56,15 @@ struct BlockBuffers {
     // layer (Q + K + V heads). Only allocated when fused QKV is enabled.
     ComputeBuffer qkvFusedScratch; // [maxT, q_dim + 2*kv_dim]
 
+    // Qwen3-Next full-attention: the `attn_q` weight fuses the query and a
+    // per-head output gate, so its matmul output is [maxT, 2*q_dim]
+    // ([Q_h|gate_h] per head). `qGateFused` receives that matmul;
+    // `splitHeadPairAsync` de-interleaves it into `qBuf` (Q) and
+    // `gateScratch` (the gate, applied post-attention). Both zero-sized
+    // unless the arch reports `needsQGateScratch()`.
+    ComputeBuffer qGateFused;   // [maxT, 2*q_dim]
+    ComputeBuffer gateScratch;  // [maxT, q_dim]
+
     // M10.2 Phase 1a Commit 5 — persistent fp32 K/V staging for the Q8_0
     // KV cache path. rmsnorm_qkv + RoPE stay fp32 in registers/USM; then
     // `kv_quant_commit_q8_0` folds each row into a 32-elem Q8_0 block
@@ -99,7 +108,8 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
                                std::size_t             maxSeq,
                                std::size_t             qDimMax,
                                std::size_t             kvDimMax,
-                               bool                    withFusedQkv     = false,
-                               bool                    withKvFp32Scratch = false);
+                               bool                    withFusedQkv      = false,
+                               bool                    withKvFp32Scratch = false,
+                               bool                    withQGate         = false);
 
 } // namespace mimirmind::runtime

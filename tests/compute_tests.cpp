@@ -898,6 +898,196 @@ TEST(ngram_drafter_ctorRejectsMaxKBelowMinK) {
     }
 }
 
+// -----------------------------------------------------------------------
+// IMRoPE (Qwen3-Next full-attention) — applyMropeInPlace
+// -----------------------------------------------------------------------
+
+#include "compute/Rope.hpp"
+
+namespace {
+
+// Fill a [seqLen, numHeads, headDim] buffer with a deterministic ramp so
+// the rotation is observable.
+std::vector<float> ropeRamp(std::size_t seqLen, std::size_t numHeads,
+                            std::size_t headDim) {
+    std::vector<float> v(seqLen * numHeads * headDim);
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        v[i] = 0.1F + 0.01F * static_cast<float>(i % 37);
+    }
+    return v;
+}
+
+} // namespace
+
+TEST(mrope_textPositions_equalsPlainRope) {
+    using namespace mimirmind::compute;
+    // For text-only positions every mRoPE axis carries the same position,
+    // so IMRoPE must be bit-identical to plain NeoX RoPE regardless of the
+    // section widths.
+    const std::size_t seqLen = 5, numHeads = 3, headDim = 8;
+    const std::size_t startPos = 2;
+    const float base = 10000.0F;
+    // headDim/2 = 4 pairs; sections sum 4 covers them (Qwen3-Next uses a
+    // 4-way split, here [1,1,1,1] for the small head).
+    const std::int32_t sections[4] = {1, 1, 1, 1};
+
+    auto a = ropeRamp(seqLen, numHeads, headDim);
+    auto b = a;   // identical start
+
+    applyRopeInPlace(a.data(), seqLen, numHeads, headDim, startPos, base);
+    applyMropeInPlace(b.data(), seqLen, numHeads, headDim, startPos, base,
+                      sections);
+
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        EXPECT_NEAR(a[i], b[i], 1e-6F);
+    }
+}
+
+TEST(mrope_nullSections_equalsPlainRope) {
+    using namespace mimirmind::compute;
+    // A null sections pointer (or zero-sum) degenerates to plain RoPE.
+    const std::size_t seqLen = 4, numHeads = 2, headDim = 6;
+    const float base = 10000.0F;
+
+    auto a = ropeRamp(seqLen, numHeads, headDim);
+    auto b = a;
+
+    applyRopeInPlace(a.data(), seqLen, numHeads, headDim, /*startPos=*/0, base);
+    applyMropeInPlace(b.data(), seqLen, numHeads, headDim, /*startPos=*/0, base,
+                      /*sections=*/nullptr);
+
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        EXPECT_NEAR(a[i], b[i], 1e-6F);
+    }
+}
+
+TEST(mrope_position0_isIdentityRotation) {
+    using namespace mimirmind::compute;
+    // At position 0 every theta is 0 → rotation is the identity, so the
+    // buffer is unchanged (sanity that the section path doesn't corrupt).
+    const std::size_t seqLen = 1, numHeads = 2, headDim = 8;
+    const std::int32_t sections[4] = {2, 1, 1, 0};
+    auto v = ropeRamp(seqLen, numHeads, headDim);
+    const auto orig = v;
+    applyMropeInPlace(v.data(), seqLen, numHeads, headDim, /*startPos=*/0,
+                      10000.0F, sections);
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        EXPECT_NEAR(v[i], orig[i], 1e-6F);
+    }
+}
+
+// -----------------------------------------------------------------------
+// GatedDeltaNet (Qwen3-Next linear attention) — CPU reference (M-Q3N.3)
+// -----------------------------------------------------------------------
+
+#include "compute/GatedDeltaNet.hpp"
+
+TEST(gdn_zeroState_singleToken_analytic) {
+    using namespace mimirmind::compute;
+    // From a zero state, one token: the decay does nothing (s=0), the
+    // prediction sk=0, so d = v*beta and s = k ⊗ (v*beta). The readout is
+    //   out[j] = sum_i s[i,j] * qs[i] = beta * (sum_i k[i]*qs[i]) * v[j]
+    // with qs = q / sqrt(S). H=1.
+    const std::size_t T = 1, H = 1, S = 4;
+    const float q[4] = {1.0F, 2.0F, -1.0F, 0.5F};
+    const float k[4] = {0.5F, -1.0F, 2.0F, 1.0F};
+    const float v[4] = {3.0F, -2.0F, 1.0F, 0.0F};
+    const float gLog[1] = {-0.3F};   // decay irrelevant from zero state
+    const float beta[1] = {0.7F};
+    float state[16] = {0};
+    float out[4]    = {0};
+
+    gatedDeltaNetRecurrent(q, k, v, gLog, beta, state, out, T, H, S);
+
+    const float qScale = 1.0F / std::sqrt(static_cast<float>(S));
+    float kq = 0.0F;
+    for (std::size_t i = 0; i < S; ++i) kq += k[i] * q[i] * qScale;
+    for (std::size_t j = 0; j < S; ++j) {
+        EXPECT_NEAR(out[j], beta[0] * kq * v[j], 1e-5F);
+        // state[i,j] = k[i] * v[j] * beta.
+        for (std::size_t i = 0; i < S; ++i) {
+            EXPECT_NEAR(state[i * S + j], k[i] * v[j] * beta[0], 1e-5F);
+        }
+    }
+}
+
+TEST(gdn_betaZero_onlyDecaysAndReads) {
+    using namespace mimirmind::compute;
+    // beta=0 → d=0 → no rank-1 update. State only decays by exp(gLog);
+    // readout is o[j] = sum_i (g*s0[i,j]) * qs[i].
+    const std::size_t T = 1, H = 1, S = 3;
+    const float q[3] = {1.0F, -2.0F, 0.5F};
+    const float k[3] = {9.0F, 9.0F, 9.0F};   // irrelevant (beta=0)
+    const float v[3] = {9.0F, 9.0F, 9.0F};   // irrelevant (beta=0)
+    const float gLog[1] = {-0.5F};
+    const float beta[1] = {0.0F};
+    float s0[9] = {1, 2, 3,  4, 5, 6,  7, 8, 9};
+    float state[9];
+    for (int i = 0; i < 9; ++i) state[i] = s0[i];
+    float out[3] = {0};
+
+    gatedDeltaNetRecurrent(q, k, v, gLog, beta, state, out, T, H, S);
+
+    const float g = std::exp(-0.5F);
+    const float qScale = 1.0F / std::sqrt(static_cast<float>(S));
+    for (std::size_t j = 0; j < S; ++j) {
+        float expect = 0.0F;
+        for (std::size_t i = 0; i < S; ++i)
+            expect += g * s0[i * S + j] * q[i] * qScale;
+        EXPECT_NEAR(out[j], expect, 1e-5F);
+        // State decayed but not updated.
+        for (std::size_t i = 0; i < S; ++i)
+            EXPECT_NEAR(state[i * S + j], g * s0[i * S + j], 1e-5F);
+    }
+}
+
+TEST(gdn_twoHeads_independent) {
+    using namespace mimirmind::compute;
+    // Two heads with identical inputs must produce identical outputs and
+    // states — proves head-parallel indexing is correct.
+    const std::size_t T = 1, H = 2, S = 2;
+    const float q[4]   = {1.0F, 2.0F,  1.0F, 2.0F};
+    const float k[4]   = {0.5F, 1.0F,  0.5F, 1.0F};
+    const float v[4]   = {2.0F, 3.0F,  2.0F, 3.0F};
+    const float gLog[2] = {-0.2F, -0.2F};
+    const float beta[2] = {0.9F, 0.9F};
+    float state[8] = {0};
+    float out[4]   = {0};
+    gatedDeltaNetRecurrent(q, k, v, gLog, beta, state, out, T, H, S);
+    EXPECT_NEAR(out[0], out[2], 1e-6F);
+    EXPECT_NEAR(out[1], out[3], 1e-6F);
+    for (int i = 0; i < 4; ++i) EXPECT_NEAR(state[i], state[4 + i], 1e-6F);
+}
+
+TEST(gdn_causalConv1dSilu_handComputed) {
+    using namespace mimirmind::compute;
+    // channels=1, K=3, T=2. convInput has (K-1)+T = 4 rows: [s0, s1, x0, x1].
+    // y[0] = silu( s0*w0 + s1*w1 + x0*w2 )
+    // y[1] = silu( s1*w0 + x0*w1 + x1*w2 )
+    const std::size_t T = 2, C = 1, K = 3;
+    const float convInput[4] = {0.0F, 1.0F, 2.0F, 3.0F};  // s0,s1,x0,x1
+    const float kernel[3]    = {0.5F, -1.0F, 2.0F};        // w0,w1,w2
+    float out[2] = {0};
+    causalConv1dSilu(convInput, kernel, out, T, C, K);
+
+    auto silu = [](float a) { return a / (1.0F + std::exp(-a)); };
+    const float a0 = 0.0F * 0.5F + 1.0F * (-1.0F) + 2.0F * 2.0F;   // = 3
+    const float a1 = 1.0F * 0.5F + 2.0F * (-1.0F) + 3.0F * 2.0F;   // = 4.5
+    EXPECT_NEAR(out[0], silu(a0), 1e-5F);
+    EXPECT_NEAR(out[1], silu(a1), 1e-5F);
+}
+
+TEST(gdn_l2Norm_unitAndEpsFloor) {
+    using namespace mimirmind::compute;
+    // Row 0: [3,4] → norm 5 → [0.6, 0.8]. Row 1: zeros → eps floor keeps 0.
+    float x[4] = {3.0F, 4.0F, 0.0F, 0.0F};
+    l2NormInPlace(x, /*rows=*/2, /*dim=*/2, /*eps=*/1e-6F);
+    EXPECT_NEAR(x[0], 0.6F, 1e-5F);
+    EXPECT_NEAR(x[1], 0.8F, 1e-5F);
+    EXPECT_NEAR(x[2], 0.0F, 1e-6F);
+    EXPECT_NEAR(x[3], 0.0F, 1e-6F);
+}
+
 int main() {
     return mm::test::run();
 }

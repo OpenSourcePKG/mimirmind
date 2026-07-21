@@ -121,6 +121,20 @@ public:
                                      std::size_t writeOffsetStride = 0,
                                      runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
 
+    void mropeInPlaceAsync(void* xBase, std::size_t seqLen,
+                           std::size_t numHeads, std::size_t headDim,
+                           std::size_t startPos, float base,
+                           const std::int32_t* sections,
+                           std::size_t writeOffsetStride = 0,
+                           runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
+
+    void splitHeadPairAsync(const float* src, float* a, float* b,
+                            std::size_t seqLen, std::size_t numHeads,
+                            std::size_t headDim) override;
+
+    void sigmoidGateMulAsync(float* y, const float* g, std::size_t rows,
+                             std::size_t dim, std::size_t gateDim) override;
+
     void xQuantI8Async(const float* x, std::int8_t* y, float* scale,
                        std::size_t M, std::size_t K) override;
 

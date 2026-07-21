@@ -190,8 +190,9 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
     }
 
     if (kept < V) {
-        std::partial_sort(_idx.begin(), _idx.begin() + kept, _idx.end(),
-                          byLogitDesc);
+        const auto mid =
+            _idx.begin() + static_cast<std::ptrdiff_t>(kept);
+        std::partial_sort(_idx.begin(), mid, _idx.end(), byLogitDesc);
     } else {
         // Nucleus (top-P) over the full vocab needs every entry ordered.
         std::sort(_idx.begin(), _idx.end(), byLogitDesc);

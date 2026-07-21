@@ -17,7 +17,8 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
                                std::size_t             qDimMax,
                                std::size_t             kvDimMax,
                                bool                    withFusedQkv,
-                               bool                    withKvFp32Scratch) {
+                               bool                    withKvFp32Scratch,
+                               bool                    withQGate) {
     BlockBuffers b{};
     b.maxT    = maxT;
     b.maxSeq  = maxSeq;
@@ -26,15 +27,26 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
     b.kv_dim  = kvDimMax;
     b.ff_dim  = config.feedForwardLength;
 
+    // FFN scratch width. For dense models this is `feedForwardLength`. For
+    // MoE models the per-routed-expert (`expertFeedForwardLength`) and the
+    // shared-expert (`expertSharedFeedForwardLength`) intermediate widths
+    // can exceed the dense `ff_dim` (Qwen3-Next `qwen35moe` is pure MoE, so
+    // its dense `ff_dim` need not bound either). Size the gate/up + MoE
+    // compact buffers on the max so no per-expert matmul overruns them.
+    const std::size_t ffScratch = std::max({
+        static_cast<std::size_t>(config.feedForwardLength),
+        static_cast<std::size_t>(config.expertFeedForwardLength),
+        static_cast<std::size_t>(config.expertSharedFeedForwardLength)});
+
     const std::size_t qBytes            = maxT * b.q_dim   * sizeof(float);
     const std::size_t normBytes         = maxT * b.d_model * sizeof(float);
     const std::size_t attnOutBytes      = maxT * b.q_dim   * sizeof(float);
     const std::size_t projOutBytes      = maxT * b.d_model * sizeof(float);
-    const std::size_t gateOutBytes      = maxT * b.ff_dim  * sizeof(float);
-    const std::size_t upOutBytes        = maxT * b.ff_dim  * sizeof(float);
+    const std::size_t gateOutBytes      = maxT * ffScratch * sizeof(float);
+    const std::size_t upOutBytes        = maxT * ffScratch * sizeof(float);
     const std::size_t scoreScratchBytes = maxSeq           * sizeof(float);
     const std::size_t matmulScratchBytes =
-        std::max({b.d_model, b.q_dim, b.ff_dim}) * sizeof(float);
+        std::max({b.d_model, b.q_dim, ffScratch}) * sizeof(float);
 
     b.qBuf          = ops.allocate(qBytes);
     b.normBuf       = ops.allocate(normBytes);
@@ -50,6 +62,15 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         const std::size_t fusedBytes =
             maxT * (b.q_dim + 2 * b.kv_dim) * sizeof(float);
         b.qkvFusedScratch = ops.allocate(fusedBytes);
+    }
+
+    if (withQGate) {
+        // Qwen3-Next full-attention fused [Q|gate] projection + the split
+        // gate. qGateFused holds the 2*q_dim matmul output; gateScratch
+        // holds the de-interleaved gate that survives until the
+        // post-attention sigmoid multiply.
+        b.qGateFused  = ops.allocate(maxT * 2 * b.q_dim * sizeof(float));
+        b.gateScratch = ops.allocate(maxT *     b.q_dim * sizeof(float));
     }
 
     if (withKvFp32Scratch) {
@@ -75,7 +96,7 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         // safe upper bound: for Gemma 4 26B-A4B ff_dim == ffPerExpert.
         const std::size_t nRowsMax  = maxT * config.expertUsedCount;
         const std::size_t xBytes    = nRowsMax * b.d_model   * sizeof(float);
-        const std::size_t gateBytes = nRowsMax * b.ff_dim    * sizeof(float);
+        const std::size_t gateBytes = nRowsMax * ffScratch   * sizeof(float);
         b.moeXCompact    = ops.allocate(xBytes);
         b.moeGateCompact = ops.allocate(gateBytes);
         b.moeUpCompact   = ops.allocate(gateBytes);
