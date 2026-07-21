@@ -480,7 +480,17 @@ compute::ComputeBuffer GpuOps::allocate(std::size_t bytes) {
         return {};
     }
     auto& alloc = _ctx.allocator();
-    void* ptr = alloc.allocate(bytes, core::cuda::CudaAllocKind::Device);
+    // Integrated (unified, coherent) devices — GB10 / Jetson — need weight
+    // and buffer memory host-reachable: InferenceEngine::generate()
+    // dereferences token_embd.usmPtr on the CPU (embeddingLookup). A
+    // device-only cudaMalloc segfaults that host read; Managed is the same
+    // physical LPDDR5x on unified silicon, so it is free here. Discrete GPUs
+    // keep Device. Device and Managed share the cudaFree deallocate path,
+    // so the captureless deleter below stays correct for both.
+    const auto kind = _ctx.cudaContext().cudaDeviceInfo().isIntegrated
+                          ? core::cuda::CudaAllocKind::Managed
+                          : core::cuda::CudaAllocKind::Device;
+    void* ptr = alloc.allocate(bytes, kind);
     return compute::ComputeBuffer{
         ptr,
         bytes,
