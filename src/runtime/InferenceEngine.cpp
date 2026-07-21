@@ -27,6 +27,12 @@
 #include "core/gpu/hip/HipComputeContext.hpp"
 #endif
 
+#ifdef MIMIRMIND_HAVE_CUDA
+#include "compute/cuda/GpuMatmul.hpp"
+#include "compute/cuda/GpuOps.hpp"
+#include "core/gpu/cuda/CudaComputeContext.hpp"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -144,6 +150,16 @@ makeComputeContext(const Config& cfg, core::backend::BackendKind kind) {
                 "(MIMIRMIND_ENABLE_HIP=OFF at build time)"};
 #endif
 
+        case core::backend::BackendKind::Cuda:
+#ifdef MIMIRMIND_HAVE_CUDA
+            (void)cfg;  // CUDA path takes no config knobs yet.
+            return std::make_unique<core::cuda::CudaComputeContext>();
+#else
+            throw std::runtime_error{
+                "InferenceEngine: CUDA requested but not compiled in "
+                "(MIMIRMIND_ENABLE_CUDA=OFF at build time)"};
+#endif
+
         case core::backend::BackendKind::Cpu:
             // Cpu is always compiled in — no ifdef. Reference backend
             // with no config knobs; used as the graceful-degradation
@@ -187,6 +203,18 @@ makeGpuOps(core::backend::ComputeContext&        ctx,
             break;
 #endif
 
+        case core::backend::BackendKind::Cuda:
+#ifdef MIMIRMIND_HAVE_CUDA
+            return std::make_unique<compute::cuda::GpuOps>(
+                static_cast<core::cuda::CudaComputeContext&>(ctx),
+                features.flashPrefill,
+                features.flashPrefillGqaQ8,
+                features.flashPrefillKTileQ8,
+                features.q8_0Reorder);
+#else
+            break;
+#endif
+
         case core::backend::BackendKind::Cpu:
             // features.* aren't threaded through — CPU GpuOps returns
             // neutral defaults for every feature-flag accessor (flash
@@ -221,6 +249,15 @@ makeGpuMatmul(core::backend::ComputeContext& ctx,
             return std::make_unique<compute::hip::GpuMatmul>(
                 static_cast<core::hip::HipComputeContext&>(ctx),
                 static_cast<compute::hip::GpuOps&>(ops));
+#else
+            break;
+#endif
+
+        case core::backend::BackendKind::Cuda:
+#ifdef MIMIRMIND_HAVE_CUDA
+            return std::make_unique<compute::cuda::GpuMatmul>(
+                static_cast<core::cuda::CudaComputeContext&>(ctx),
+                static_cast<compute::cuda::GpuOps&>(ops));
 #else
             break;
 #endif

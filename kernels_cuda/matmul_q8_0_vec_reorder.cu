@@ -50,10 +50,10 @@
 #define X_TILE_ELEMENTS 1024
 
 static __device__ __forceinline__ float warp16_reduce_sum(float v) {
-    v += __shfl_xor(v, 8, 16);
-    v += __shfl_xor(v, 4, 16);
-    v += __shfl_xor(v, 2, 16);
-    v += __shfl_xor(v, 1, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 8, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 4, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 2, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 1, 16);
     return v;
 }
 

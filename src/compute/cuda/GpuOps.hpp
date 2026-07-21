@@ -56,7 +56,7 @@ public:
     /// the HIP one. The ctor also allocates persistent scratch and
     /// resolves the K-tile pick up-front so the dispatch hot path
     /// stays branch-cheap.
-    GpuOps(core::hip::CudaComputeContext& ctx,
+    GpuOps(core::cuda::CudaComputeContext& ctx,
               bool                          flashPrefillEnabled      = true,
               bool                          flashPrefillGqaQ8Enabled = true,
               std::size_t                   flashPrefillKTileQ8      = 128,
@@ -214,8 +214,8 @@ public:
     // consumers downcast to `GpuOps&`. Kept out of the `ComputeOps`
     // base for the same reason.
 
-    [[nodiscard]] core::hip::CudaStream&           stream() noexcept;
-    [[nodiscard]] core::hip::CudaMemoryAllocator&  allocator() noexcept;
+    [[nodiscard]] core::cuda::CudaStream&           stream() noexcept;
+    [[nodiscard]] core::cuda::CudaMemoryAllocator&  allocator() noexcept;
 
     /// Persistent USM-equivalent slot for the current KV-cache length /
     /// decode position. Mirrors `GpuOps::curLenSlot()`; kernels bind
@@ -226,7 +226,7 @@ public:
     [[nodiscard]] std::int32_t* curLenSlot() noexcept { return _curLenSlotUsm; }
 
 private:
-    core::hip::CudaComputeContext& _ctx;
+    core::cuda::CudaComputeContext& _ctx;
 
     struct Impl;
     std::unique_ptr<Impl>         _pimpl;

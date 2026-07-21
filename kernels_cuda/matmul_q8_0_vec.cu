@@ -57,11 +57,11 @@ namespace {
 // of halving cover the whole warp with no LDS traffic. Returns the
 // full sum in lane 0; other lanes hold partial state.
 __device__ __forceinline__ float warpReduceSum(float v) {
-    v += __shfl_down(v, 16);
-    v += __shfl_down(v,  8);
-    v += __shfl_down(v,  4);
-    v += __shfl_down(v,  2);
-    v += __shfl_down(v,  1);
+    v += __shfl_down_sync(0xffffffffu, v, 16);
+    v += __shfl_down_sync(0xffffffffu, v,  8);
+    v += __shfl_down_sync(0xffffffffu, v,  4);
+    v += __shfl_down_sync(0xffffffffu, v,  2);
+    v += __shfl_down_sync(0xffffffffu, v,  1);
     return v;
 }
 

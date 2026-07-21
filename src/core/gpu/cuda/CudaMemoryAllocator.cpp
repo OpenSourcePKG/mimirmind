@@ -190,15 +190,18 @@ void CudaMemoryAllocator::adviseReadMostly(void* ptr, std::size_t bytes) noexcep
     }
 
     const int dev = _ctx.cudaDeviceIndex();
+    cudaMemLocation loc{};
+    loc.type = cudaMemLocationTypeDevice;
+    loc.id   = dev;
 
-    cudaError_t rc = cudaMemAdvise(ptr, bytes, cudaMemAdviseSetReadMostly, dev);
+    cudaError_t rc = cudaMemAdvise(ptr, bytes, cudaMemAdviseSetReadMostly, loc);
     if (rc != cudaSuccess) {
         MM_LOG_WARN("CudaMem", "cudaMemAdvise(SetReadMostly) failed: {}",
                     cudaGetErrorString(rc));
         (void)cudaGetLastError();
         return;
     }
-    rc = cudaMemAdvise(ptr, bytes, cudaMemAdviseSetPreferredLocation, dev);
+    rc = cudaMemAdvise(ptr, bytes, cudaMemAdviseSetPreferredLocation, loc);
     if (rc != cudaSuccess) {
         MM_LOG_WARN("CudaMem", "cudaMemAdvise(SetPreferredLocation) failed: {}",
                     cudaGetErrorString(rc));
