@@ -18,7 +18,8 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
                                std::size_t             kvDimMax,
                                bool                    withFusedQkv,
                                bool                    withKvFp32Scratch,
-                               bool                    withQGate) {
+                               bool                    withQGate,
+                               bool                    withSsm) {
     BlockBuffers b{};
     b.maxT    = maxT;
     b.maxSeq  = maxSeq;
@@ -71,6 +72,28 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         // post-attention sigmoid multiply.
         b.qGateFused  = ops.allocate(maxT * 2 * b.q_dim * sizeof(float));
         b.gateScratch = ops.allocate(maxT *     b.q_dim * sizeof(float));
+    }
+
+    if (withSsm) {
+        // Qwen3-Next GatedDeltaNet linear-layer scratch (M-Q3N.3.2).
+        const std::size_t convDim   = config.ssmConvDim();
+        const std::size_t valueDim  = config.ssmInnerSize;   // = H_v * S
+        const std::size_t hV        = config.ssmNumVHeads();
+        const std::size_t dConv     = config.ssmConvKernel;
+        const std::size_t stateElems = config.ssmStateElemsPerLayer();
+        const std::size_t f = sizeof(float);
+
+        b.ssmQkvMixed  = ops.allocate(maxT * convDim * f);
+        b.ssmConvInput = ops.allocate(((dConv > 0 ? dConv - 1 : 0) + maxT) * convDim * f);
+        b.ssmZ         = ops.allocate(maxT * valueDim * f);
+        b.ssmQ         = ops.allocate(maxT * valueDim * f);
+        b.ssmK         = ops.allocate(maxT * valueDim * f);
+        b.ssmV         = ops.allocate(maxT * valueDim * f);
+        b.ssmDeltaOut  = ops.allocate(maxT * valueDim * f);
+        b.ssmAlpha     = ops.allocate(maxT * hV * f);
+        b.ssmBeta      = ops.allocate(maxT * hV * f);
+        b.ssmGate      = ops.allocate(maxT * hV * f);
+        b.ssmState     = ops.allocate(stateElems * f);
     }
 
     if (withKvFp32Scratch) {

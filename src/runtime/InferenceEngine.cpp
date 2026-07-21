@@ -873,12 +873,14 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     // `kv_quant_commit_q8_0` folds the rows into the Q8_0 cache slot.
     const bool withKvFp32Scratch = (_kvDtype == KvDtype::Q8_0);
     const bool withQGate = _backend->needsQGateScratch();
+    const bool withSsm   = _backend->needsSsmScratch();
     _blockBuffers = allocBlockBuffers(*_ops, _config,
                                       maxT, _maxContextTokens,
                                       qDimMax, kvDimMax,
                                       withFusedQkv,
                                       withKvFp32Scratch,
-                                      withQGate);
+                                      withQGate,
+                                      withSsm);
 
     _xBufH      = _ops->allocate(maxT      * d_model  * sizeof(float));
     _normFinalH = _ops->allocate(d_model   * sizeof(float));

@@ -89,6 +89,25 @@ struct BlockBuffers {
     ComputeBuffer moeUpCompact;   // [nRowsMax, ffPerExpert]
     ComputeBuffer moeDownCompact; // [nRowsMax, d_model]
 
+    // Qwen3-Next GatedDeltaNet linear-layer scratch (M-Q3N.3.2). Only
+    // allocated for hybrid-recurrent models. Sizes derive from the SSM
+    // hyperparameters: conv_dim = ssmConvDim(), value_dim = ssmInnerSize
+    // (= H_v*S), H_v = ssmNumVHeads(), S = ssmStateSize, d_conv =
+    // ssmConvKernel. `ssmState` holds the [H_v, S, S] recurrent state; for
+    // M-Q3N.3.2b it is zero-initialised per forward (prefill scope) — a
+    // persistent across-decode-step pool lands with the decode path.
+    ComputeBuffer ssmQkvMixed;   // [maxT, conv_dim]  (also reused as conv out)
+    ComputeBuffer ssmConvInput;  // [(d_conv-1)+maxT, conv_dim]
+    ComputeBuffer ssmZ;          // [maxT, value_dim]  (output gate z)
+    ComputeBuffer ssmQ;          // [maxT, value_dim]  (also reused as norm buf)
+    ComputeBuffer ssmK;          // [maxT, value_dim]
+    ComputeBuffer ssmV;          // [maxT, value_dim]
+    ComputeBuffer ssmDeltaOut;   // [maxT, value_dim]  (delta-net output)
+    ComputeBuffer ssmAlpha;      // [maxT, H_v]
+    ComputeBuffer ssmBeta;       // [maxT, H_v]
+    ComputeBuffer ssmGate;       // [maxT, H_v]        (gLog)
+    ComputeBuffer ssmState;      // [H_v * S * S]      (recurrent state)
+
     // M-MoE.Fused-Decode — per-layer routing scratches for the fused-K
     // down kernel. The command queue records dispatches lazily, so the
     // caller cannot reuse a single K-sized scratch across layers (the
@@ -110,6 +129,7 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
                                std::size_t             kvDimMax,
                                bool                    withFusedQkv      = false,
                                bool                    withKvFp32Scratch = false,
-                               bool                    withQGate         = false);
+                               bool                    withQGate         = false,
+                               bool                    withSsm           = false);
 
 } // namespace mimirmind::runtime

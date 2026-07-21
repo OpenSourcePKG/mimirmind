@@ -113,6 +113,14 @@ public:
         return false;
     }
 
+    /// True if the arch needs the GatedDeltaNet linear-layer scratch
+    /// (`BlockBuffers::ssm*`). Qwen3-Next hybrid-recurrent models set this;
+    /// every other arch leaves it false. Read by InferenceEngine when
+    /// sizing block scratch.
+    [[nodiscard]] virtual bool needsSsmScratch() const noexcept {
+        return false;
+    }
+
     /// Enable per-stage parity dumps. PREFIX is the same string carried by
     /// `diagnostics.parityDump` in config.json: each stage writes a file at
     ///   <prefix>-blk{N}-<stage>.bin

@@ -87,6 +87,10 @@ std::pair<std::size_t, std::size_t> Qwen35MoeBackend::maxQKVDims() const {
     return {qDim, kvDim};
 }
 
+bool Qwen35MoeBackend::needsSsmScratch() const noexcept {
+    return _config.isHybridRecurrent();
+}
+
 void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
                                 float*        x,
                                 std::size_t   T,
@@ -96,16 +100,10 @@ void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
     const bool diag = (blockIdx == 0 && cache.length() == 0 && traceBlock0);
 
     if (_config.isRecurrentLayer(blockIdx)) {
-        // GatedDeltaNet linear-attention layer — conv1d + delta-rule state
-        // recurrence lands in M-Q3N.3. Until then this backend can only run
-        // the full-attention layers; reaching a full-attention block
-        // end-to-end needs parity-harness input injection.
-        throw std::runtime_error(
-            "Qwen35MoeBackend: block " + std::to_string(blockIdx) +
-            " is a GatedDeltaNet linear-attention layer — not implemented "
-            "until M-Q3N.3");
+        runLinearBlock(blockIdx, x, T, s, diag);
+    } else {
+        runFullAttentionBlock(blockIdx, x, T, cache, s, diag);
     }
-    runFullAttentionBlock(blockIdx, x, T, cache, s, diag);
 }
 
 void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
@@ -230,6 +228,135 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     _ops.rmsNormAsync(x, T, d_model,
                       static_cast<const float*>(attnPost.usmPtr),
                       _config.rmsNormEps, normBuf);
+
+    trace("MoE FFN");
+    runMoeFfn(blockIdx, normBuf, T, s);
+
+    trace("ffn residual");
+    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), T * d_model);
+}
+
+void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
+                                      float*        x,
+                                      std::size_t   T,
+                                      BlockBuffers& s,
+                                      bool          diag) {
+    auto trace = [&](const char* tag) {
+        if (diag) MM_LOG_INFO("blkdiag-q35", "blk {} lin {}", blockIdx, tag);
+    };
+    trace("enter (linear/GatedDeltaNet)");
+
+    const auto& w = _weights;
+    const auto& attnNorm  = requireBlock(w, blockIdx, "attn_norm.weight");
+    const auto& qkvW      = requireBlock(w, blockIdx, "attn_qkv.weight");
+    const auto& gateW     = requireBlock(w, blockIdx, "attn_gate.weight");
+    const auto& betaW     = requireBlock(w, blockIdx, "ssm_beta.weight");
+    const auto& alphaW    = requireBlock(w, blockIdx, "ssm_alpha.weight");
+    const auto& ssmA      = requireBlock(w, blockIdx, "ssm_a");
+    const auto& ssmDt     = requireBlock(w, blockIdx, "ssm_dt.bias");
+    const auto& convW     = requireBlock(w, blockIdx, "ssm_conv1d.weight");
+    const auto& ssmNormW  = requireBlock(w, blockIdx, "ssm_norm.weight");
+    const auto& ssmOutW   = requireBlock(w, blockIdx, "ssm_out.weight");
+    const auto& attnPost  = requireBlock(w, blockIdx, "post_attention_norm.weight");
+
+    const std::size_t d_model   = s.d_model;
+    const std::size_t S         = _config.ssmStateSize;      // head_dim
+    const std::size_t hK        = _config.ssmNumKHeads();
+    const std::size_t hV        = _config.ssmNumVHeads();
+    const std::size_t valueDim  = _config.ssmInnerSize;      // = hV * S
+    const std::size_t convDim    = _config.ssmConvDim();
+    const std::size_t dConv     = _config.ssmConvKernel;
+    const std::size_t keyDim    = S * hK;
+    const std::size_t stateElems = _config.ssmStateElemsPerLayer();
+    const float       eps       = _config.rmsNormEps;
+
+    float* const normBuf   = s.normBuf.as<float>();
+    float* const qkvMixed  = s.ssmQkvMixed.as<float>();
+    float* const convInput = s.ssmConvInput.as<float>();
+    float* const zBuf      = s.ssmZ.as<float>();
+    float* const qBuf      = s.ssmQ.as<float>();
+    float* const kBuf      = s.ssmK.as<float>();
+    float* const vBuf      = s.ssmV.as<float>();
+    float* const deltaOut  = s.ssmDeltaOut.as<float>();
+    float* const alphaBuf  = s.ssmAlpha.as<float>();
+    float* const betaBuf   = s.ssmBeta.as<float>();
+    float* const gateBuf   = s.ssmGate.as<float>();
+    float* const stateBuf  = s.ssmState.as<float>();
+    float* const projOut   = s.projOut.as<float>();
+    float* const matmulScr = s.matmulScratch.as<float>();
+
+    // --- pre-attention RMSNorm ---------------------------------------
+    trace("attn rmsNorm");
+    _ops.rmsNormAsync(x, T, d_model,
+                      static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
+
+    // --- projections (all read normBuf, disjoint outputs) ------------
+    trace("qkv / gate / beta / alpha projections");
+    {
+        compute::UnorderedScope u{_ops};
+        _gmm.matmulAsync(qkvW.type,   qkvW.usmPtr,   convDim,  d_model, normBuf, T, qkvMixed, matmulScr);
+        _gmm.matmulAsync(gateW.type,  gateW.usmPtr,  valueDim, d_model, normBuf, T, zBuf,     matmulScr);
+        _gmm.matmulAsync(betaW.type,  betaW.usmPtr,  hV,       d_model, normBuf, T, betaBuf,  matmulScr);
+        _gmm.matmulAsync(alphaW.type, alphaW.usmPtr, hV,       d_model, normBuf, T, alphaBuf, matmulScr);
+    }
+
+    // beta = sigmoid(beta); gLog = -exp(ssm_a) * softplus(alpha + ssm_dt).
+    trace("beta sigmoid + decay gate");
+    _ops.sigmoidInPlaceAsync(betaBuf, T * hV);
+    _ops.deltanetGateAsync(alphaBuf,
+                           static_cast<const float*>(ssmA.usmPtr),
+                           static_cast<const float*>(ssmDt.usmPtr),
+                           gateBuf, T, hV);
+
+    // --- causal conv1d + silu ----------------------------------------
+    // conv_input = concat(conv_state[d_conv-1], qkv_mixed[T]) along time.
+    // Prefill scope: conv_state is zero. conv output reuses qkvMixed.
+    trace("conv1d (state-concat + silu)");
+    const std::size_t stateRows = (dConv > 0 ? dConv - 1 : 0);
+    _ops.mulScalarAsync(convInput, 0.0F, stateRows * convDim);   // zero conv state
+    _ops.appendMemoryCopy(convInput + stateRows * convDim, qkvMixed,
+                          T * convDim * sizeof(float));
+    _ops.causalConv1dSiluAsync(convInput,
+                               static_cast<const float*>(convW.usmPtr),
+                               qkvMixed, T, convDim, dConv);      // conv out -> qkvMixed
+
+    // --- split conv into q / k / v (+ GQA repeat H_k -> H_v) ---------
+    trace("gather q/k/v");
+    _ops.gatherHeadsFromChannelsAsync(qkvMixed, qBuf, T, 0,          hK, hV, S, convDim);
+    _ops.gatherHeadsFromChannelsAsync(qkvMixed, kBuf, T, keyDim,     hK, hV, S, convDim);
+    _ops.gatherHeadsFromChannelsAsync(qkvMixed, vBuf, T, 2 * keyDim, hV, hV, S, convDim);
+
+    // --- L2-norm q, k over head_dim ----------------------------------
+    trace("L2-norm q,k");
+    _ops.l2NormInPlaceAsync(qBuf, T * hV, S, eps);
+    _ops.l2NormInPlaceAsync(kBuf, T * hV, S, eps);
+
+    // --- gated delta-rule recurrence (state zero-init: prefill) ------
+    trace("delta-rule recurrence");
+    _ops.mulScalarAsync(stateBuf, 0.0F, stateElems);
+    _ops.gatedDeltaNetRecurrentAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
+                                     stateBuf, deltaOut, T, hV, S);
+
+    // --- gated output norm: ssm_norm(out) * silu(z) ------------------
+    // rmsNorm(out) over head_dim -> qBuf (reused as norm buffer), then
+    // siluMul(z, n) = silu(z) * n, in place into zBuf.
+    trace("gated ssm_norm x silu(z)");
+    _ops.rmsNormAsync(deltaOut, T * hV, S,
+                      static_cast<const float*>(ssmNormW.usmPtr), eps, qBuf);
+    _ops.siluMulAsync(zBuf, qBuf, T * valueDim);
+
+    // --- output projection ssm_out -----------------------------------
+    trace("ssm_out projection");
+    _gmm.matmulAsync(ssmOutW.type, ssmOutW.usmPtr, d_model, valueDim,
+                     zBuf, T, projOut, matmulScr);
+
+    // --- attn residual + post-attn-norm -> MoE FFN -> FFN residual ---
+    trace("attn residual");
+    _ops.addResidualAsync(x, projOut, T * d_model);
+
+    trace("post_attention_norm");
+    _ops.rmsNormAsync(x, T, d_model,
+                      static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
 
     trace("MoE FFN");
     runMoeFfn(blockIdx, normBuf, T, s);

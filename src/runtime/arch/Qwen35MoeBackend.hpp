@@ -73,6 +73,7 @@ public:
     [[nodiscard]] bool        scalesEmbedding()   const noexcept override { return false; }
     [[nodiscard]] const char* name()              const noexcept override { return "qwen35moe"; }
     [[nodiscard]] bool        needsQGateScratch() const noexcept override { return true; }
+    [[nodiscard]] bool        needsSsmScratch()   const noexcept override;
 
     [[nodiscard]] std::vector<std::size_t>
         kvDimPerLayer() const override;
@@ -87,6 +88,16 @@ private:
                                KvCache&      cache,
                                BlockBuffers& s,
                                bool          diag);
+
+    /// GatedDeltaNet linear-attention layer forward (M-Q3N.3.2). Runs the
+    /// conv1d → delta-rule recurrence → gated norm → out projection, then
+    /// the shared MoE FFN. `s.ssmState` is zero-initialised per call
+    /// (prefill scope); cross-decode-step persistence lands later.
+    void runLinearBlock(std::size_t   blockIdx,
+                        float*        x,
+                        std::size_t   T,
+                        BlockBuffers& s,
+                        bool          diag);
 
     /// MoE FFN shared by full-attention (and, later, linear) layers:
     /// routed top-K softmax experts + gated shared expert. Reads its input
