@@ -33,7 +33,7 @@ void ssm_conv1d(
     float acc = 0.0f;
     for (int kk = 0; kk < K; ++kk) {
         acc += convInput[(size_t)(t + kk) * channels + c] *
-               kern[(size_t)kk * channels + c];
+               kern[(size_t)c * K + kk];
     }
     out[gid] = acc / (1.0f + expf(-acc));   // SiLU
 }

@@ -144,9 +144,12 @@ void causalConv1dSilu(const float* convInput,
         for (std::size_t c = 0; c < channels; ++c) {
             float acc = 0.0F;
             for (std::size_t kk = 0; kk < kernelSize; ++kk) {
-                // convInput row (t + kk) — the state-prepended input.
+                // convInput row (t + kk) — the state-prepended input
+                // (time-major, channel contiguous). kernel is channel-major
+                // (GGUF ssm_conv1d.weight [d_conv, conv_dim], ne0=d_conv
+                // contiguous → weight[c*K + kk], matching ggml_ssm_conv).
                 acc += convInput[(t + kk) * channels + c] *
-                       kernel[kk * channels + c];
+                       kernel[c * kernelSize + kk];
             }
             // SiLU: acc * sigmoid(acc).
             out[t * channels + c] = acc / (1.0F + std::exp(-acc));
