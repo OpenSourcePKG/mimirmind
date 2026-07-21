@@ -35,7 +35,7 @@
 // contexts (T_k > MAX_TK) callers must use the flash path.
 //
 // WAVE32 note: sub_group_reduce_max / _add on 16 Lanes become
-// __shfl_xor(v, off, 16) butterfly steps, identical to the reduction
+// __shfl_xor_sync(0xffffffffu, v, off, 16) butterfly steps, identical to the reduction
 // helpers used by attention_flash_partial.hip.
 
 #include <cuda_runtime.h>
@@ -57,18 +57,18 @@
 #endif
 
 static __device__ __forceinline__ float warp16_reduce_max(float v) {
-    v = fmaxf(v, __shfl_xor(v, 8, 16));
-    v = fmaxf(v, __shfl_xor(v, 4, 16));
-    v = fmaxf(v, __shfl_xor(v, 2, 16));
-    v = fmaxf(v, __shfl_xor(v, 1, 16));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 8, 16));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 4, 16));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 2, 16));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1, 16));
     return v;
 }
 
 static __device__ __forceinline__ float warp16_reduce_sum(float v) {
-    v += __shfl_xor(v, 8, 16);
-    v += __shfl_xor(v, 4, 16);
-    v += __shfl_xor(v, 2, 16);
-    v += __shfl_xor(v, 1, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 8, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 4, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 2, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 1, 16);
     return v;
 }
 

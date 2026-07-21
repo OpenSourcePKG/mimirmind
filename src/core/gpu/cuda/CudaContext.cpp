@@ -45,7 +45,9 @@ void populate(const cudaDeviceProp& p,
     info.totalVram        = static_cast<std::size_t>(p.totalGlobalMem);
     info.maxAllocSize     = static_cast<std::size_t>(p.totalGlobalMem);
     info.warpSize         = p.warpSize;
-    info.coreClockRateKhz = p.clockRate;
+    int clockKhz = 0;
+    cudaDeviceGetAttribute(&clockKhz, cudaDevAttrClockRate, index);
+    info.coreClockRateKhz = clockKhz;
     info.isIntegrated     = p.integrated != 0;
 
     backendInfo.name             = info.name;

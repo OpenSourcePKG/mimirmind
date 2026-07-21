@@ -1973,6 +1973,10 @@ if(TARGET mimirmind_core_hip)
     target_link_libraries(backend_probe PRIVATE mimirmind_core_hip)
 endif()
 
+if(TARGET mimirmind_core_cuda)
+    target_link_libraries(backend_probe PRIVATE mimirmind_core_cuda)
+endif()
+
 # ---- backend_select_probe — runtime backend-selection demo --------------
 #
 # End-to-end: reads MIMIRMIND_BACKEND (falling back to LevelZero),
@@ -1998,6 +2002,10 @@ endif()
 
 if(TARGET mimirmind_core_hip)
     target_link_libraries(backend_select_probe PRIVATE mimirmind_core_hip)
+endif()
+
+if(TARGET mimirmind_core_cuda)
+    target_link_libraries(backend_select_probe PRIVATE mimirmind_core_cuda)
 endif()
 
 # ---- install rules --------------------------------------------------------

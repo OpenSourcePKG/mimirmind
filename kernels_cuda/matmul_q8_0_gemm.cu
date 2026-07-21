@@ -26,7 +26,7 @@
 // of 16 lanes via `intel_reqd_sub_group_size(16)`. On RDNA3 warpSize=32
 // so the same 64-thread WG is 2 waves. We model the "4 sub-groups of
 // 16 lanes" pattern explicitly: sgInWg = tid / 16, sgLocal = tid % 16,
-// and sub_group_reduce_add becomes a butterfly `__shfl_xor(v, off, 16)`
+// and sub_group_reduce_add becomes a butterfly `__shfl_xor_sync(0xffffffffu, v, off, 16)`
 // — the width=16 parameter scopes each reduction to its own 16-lane
 // slice of the wave, so all four sub-groups reduce in parallel.
 
@@ -58,10 +58,10 @@
 // Butterfly reduction over a 16-lane sub-group. width=16 makes each
 // 16-lane group inside the wave reduce independently.
 static __device__ __forceinline__ float warp16_reduce_sum(float v) {
-    v += __shfl_xor(v, 8, 16);
-    v += __shfl_xor(v, 4, 16);
-    v += __shfl_xor(v, 2, 16);
-    v += __shfl_xor(v, 1, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 8, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 4, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 2, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 1, 16);
     return v;
 }
 

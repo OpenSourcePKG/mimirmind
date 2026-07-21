@@ -33,7 +33,7 @@
 //
 // Launch geometry matches matmul_q8_0_vec: WG=64, sg16 mapped
 // explicitly (tid/16, tid%16), warp16_reduce_sum via
-// `__shfl_xor(v, off, 16)`.
+// `__shfl_xor_sync(0xffffffffu, v, off, 16)`.
 //
 // With 16 lanes but only 8 char4 chunks per 32-element block, each
 // outer iteration processes TWO consecutive Q8_0 blocks: lanes 0..7
@@ -62,10 +62,10 @@
 #define X_TILE_ELEMENTS 1024
 
 static __device__ __forceinline__ float warp16_reduce_sum(float v) {
-    v += __shfl_xor(v, 8, 16);
-    v += __shfl_xor(v, 4, 16);
-    v += __shfl_xor(v, 2, 16);
-    v += __shfl_xor(v, 1, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 8, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 4, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 2, 16);
+    v += __shfl_xor_sync(0xffffffffu, v, 1, 16);
     return v;
 }
 
