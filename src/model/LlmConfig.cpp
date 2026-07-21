@@ -153,6 +153,7 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
         }
     }
     rmsNormEps      = optionalF32("attention.layer_norm_rms_epsilon", 1e-6F);
+    attentionScale  = optionalF32("attention.scale", 0.0F);
     ropeFreqBase    = optionalF32("rope.freq_base", 10000.0F);
     ropeFreqBaseSwa = optionalF32("rope.freq_base_swa", ropeFreqBase);
     slidingWindow   = optionalU32("attention.sliding_window", 0);
@@ -217,6 +218,123 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
     // to the output logits inside the compute graph (see gemma4.cpp).
     // Ignored on archs that don't declare the key (Qwen, Llama, ...).
     finalLogitSoftcap = optionalF32("final_logit_softcapping", 0.0F);
+
+    // MoE expert feed-forward lengths + gating scale (Qwen3-Next qwen35moe;
+    // also some Gemma 4 MoE builds). Absent ⇒ 0, consumers derive from
+    // feedForwardLength.
+    expertFeedForwardLength       = optionalU32("expert_feed_forward_length", 0);
+    expertSharedFeedForwardLength = optionalU32("expert_shared_feed_forward_length", 0);
+    expertWeightsScale            = optionalF32("expert_weights_scale", 0.0F);
+
+    // --- Qwen3-Next / GatedDeltaNet hybrid (qwen35moe) -------------------
+    // Linear-attention SSM hyperparameters. All optional/zero — a model that
+    // ships none of these is not a hybrid arch and the recurrent path stays
+    // off. See research/qwen3next-gated-deltanet-recon-2026-07-21.
+    ssmConvKernel   = optionalU32("ssm.conv_kernel",    0);
+    ssmInnerSize    = optionalU32("ssm.inner_size",     0);
+    ssmStateSize    = optionalU32("ssm.state_size",     0);
+    ssmTimeStepRank = optionalU32("ssm.time_step_rank", 0);
+    ssmGroupCount   = optionalU32("ssm.group_count",    0);
+
+    nextnPredictLayers = optionalU32("nextn_predict_layers", 0);
+
+    // IMRoPE dimension sections — `<arch>.rope.dimension_sections`, an array
+    // of (typically 4) int32. Stored verbatim; the attention kernel splits
+    // the head-dim rotation across these section widths.
+    if (const auto* rs = reader.findMetadata(a + ".rope.dimension_sections");
+        rs != nullptr && std::holds_alternative<GgufArray>(*rs)) {
+        const auto& arr = std::get<GgufArray>(*rs);
+        const std::size_t elemBytes = valueElementWidth(arr.elementType);
+        if ((arr.elementType == GgufValueType::Int32 ||
+             arr.elementType == GgufValueType::UInt32) &&
+            elemBytes == sizeof(std::int32_t) &&
+            arr.raw.size() == arr.count * elemBytes) {
+            ropeSections.resize(arr.count);
+            for (std::uint64_t i = 0; i < arr.count; ++i) {
+                std::int32_t value = 0;
+                std::memcpy(&value, arr.raw.data() + i * elemBytes,
+                            sizeof(std::int32_t));
+                ropeSections[i] = value;
+            }
+            MM_LOG_INFO("config",
+                        "{}.rope.dimension_sections = [{} entries] (IMRoPE)",
+                        a, ropeSections.size());
+        } else {
+            MM_LOG_WARN("config",
+                        "{}.rope.dimension_sections present but unexpected "
+                        "(elementType={}, count={}, bytes={}) — ignored",
+                        a, static_cast<int>(arr.elementType),
+                        arr.count, arr.raw.size());
+        }
+    }
+
+    // Per-layer recurrent (linear-attention) mask. Two sources, in priority
+    // order:
+    //   1. `<arch>.attention.recurrent_layers` — explicit bool array, one
+    //      entry per layer. Authoritative when present.
+    //   2. `<arch>.full_attention_interval` (default 4) — synthesised as
+    //      `(b+1) % interval != 0`, matching llama.cpp qwen35moe
+    //      (`is_recr(i) = (i+1) % full_attn_interval != 0`). Only applied
+    //      when the model actually declares SSM params (ssmConvKernel > 0),
+    //      so pure-attention archs never get a recurrent pattern.
+    if (const auto* rl = reader.findMetadata(a + ".attention.recurrent_layers");
+        rl != nullptr && std::holds_alternative<GgufArray>(*rl)) {
+        const auto& arr = std::get<GgufArray>(*rl);
+        if (arr.elementType == GgufValueType::Bool &&
+            arr.raw.size() == arr.count) {
+            recurrentLayerPattern.resize(arr.count);
+            for (std::uint64_t i = 0; i < arr.count; ++i) {
+                recurrentLayerPattern[i] = (arr.raw[i] != 0);
+            }
+            std::size_t recCount = 0;
+            for (bool r : recurrentLayerPattern) if (r) ++recCount;
+            MM_LOG_INFO("config",
+                        "{}.attention.recurrent_layers = [{} entries, {} "
+                        "recurrent / {} full]",
+                        a, recurrentLayerPattern.size(), recCount,
+                        recurrentLayerPattern.size() - recCount);
+        } else {
+            MM_LOG_WARN("config",
+                        "{}.attention.recurrent_layers present but unexpected "
+                        "(elementType={}, count={}, bytes={}) — ignored",
+                        a, static_cast<int>(arr.elementType),
+                        arr.count, arr.raw.size());
+        }
+    }
+    if (recurrentLayerPattern.empty() && ssmConvKernel > 0 && blockCount > 0) {
+        const std::uint32_t interval =
+            optionalU32("full_attention_interval", 4);
+        if (interval == 0) {
+            MM_LOG_WARN("config",
+                        "{}.full_attention_interval = 0 — cannot synthesise "
+                        "recurrent pattern; treating all layers as full attn",
+                        a);
+        } else {
+            recurrentLayerPattern.resize(blockCount);
+            std::size_t recCount = 0;
+            for (std::uint32_t b = 0; b < blockCount; ++b) {
+                const bool recurrent = ((b + 1U) % interval != 0U);
+                recurrentLayerPattern[b] = recurrent;
+                if (recurrent) ++recCount;
+            }
+            MM_LOG_INFO("config",
+                        "recurrent pattern synthesised from "
+                        "{}.full_attention_interval={} — {} recurrent / {} "
+                        "full over {} layers",
+                        a, interval, recCount, blockCount - recCount,
+                        blockCount);
+        }
+    }
+
+    if (ssmConvKernel > 0) {
+        MM_LOG_INFO("config",
+                    "hybrid SSM (GatedDeltaNet) — d_conv={} d_inner={} "
+                    "d_state={} dt_rank={} n_group={} conv_dim={} "
+                    "state_elems/layer={} nextn={}",
+                    ssmConvKernel, ssmInnerSize, ssmStateSize,
+                    ssmTimeStepRank, ssmGroupCount, ssmConvDim(),
+                    ssmStateElemsPerLayer(), nextnPredictLayers);
+    }
 
     // --- Architecture-specific shape corrections -------------------------
 

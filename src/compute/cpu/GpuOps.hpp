@@ -116,6 +116,19 @@ public:
                                 float        scale,
                                 std::size_t  n) override;
 
+    void splitHeadPairAsync(const float* src,
+                            float*       a,
+                            float*       b,
+                            std::size_t  seqLen,
+                            std::size_t  numHeads,
+                            std::size_t  headDim) override;
+
+    void sigmoidGateMulAsync(float*       y,
+                             const float* g,
+                             std::size_t  rows,
+                             std::size_t  dim,
+                             std::size_t  gateDim) override;
+
     // ---- RoPE -----------------------------------------------------------
 
     void ropeInPlaceAsync(void*            xBase,
@@ -136,6 +149,16 @@ public:
                                      float            base,
                                      std::size_t      writeOffsetStride = 0,
                                      runtime::KvDtype kvDtype           = runtime::KvDtype::F32) override;
+
+    void mropeInPlaceAsync(void*               xBase,
+                           std::size_t         seqLen,
+                           std::size_t         numHeads,
+                           std::size_t         headDim,
+                           std::size_t         startPos,
+                           float               base,
+                           const std::int32_t* sections,
+                           std::size_t         writeOffsetStride = 0,
+                           runtime::KvDtype    kvDtype           = runtime::KvDtype::F32) override;
 
     // ---- Quantisation + KV commit --------------------------------------
 

@@ -5,6 +5,8 @@
 
 #include "core/gguf/GgufReader.hpp"
 
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -49,6 +51,11 @@ struct LlmConfig {
     std::uint32_t keyLengthSwa      {0};        // SWA-layer key length (Gemma 4)
     std::uint32_t valueLengthSwa    {0};        // SWA-layer value length (Gemma 4)
     float         rmsNormEps        {1e-6F};
+    // Explicit attention softmax scale (GGUF `<arch>.attention.scale`).
+    // 0 = unset → attention uses the default 1/sqrt(head_dim). Qwen3-Next
+    // (`qwen35moe`) ships this key; llama.cpp:
+    // `kq_scale = f_attention_scale ? f_attention_scale : 1/sqrt(head_dim)`.
+    float         attentionScale    {0.0F};
     float         ropeFreqBase      {10000.0F}; // global / full-attention layers
     float         ropeFreqBaseSwa   {10000.0F}; // sliding-window layers (Gemma 3/4)
     std::uint32_t slidingWindow     {0};        // 0 = disabled (Gemma 3+ uses 4096)
@@ -66,6 +73,51 @@ struct LlmConfig {
     // MoE (Gemma 4). 0 = dense model (no expert routing).
     std::uint32_t expertCount       {0};        // total experts per block
     std::uint32_t expertUsedCount   {0};        // top-K experts activated per token
+
+    // MoE expert feed-forward lengths + gating scale. Populated when the
+    // model ships them (Qwen3-Next `qwen35moe`; also some Gemma 4 MoE).
+    // `expertFeedForwardLength` (GGUF `<arch>.expert_feed_forward_length`)
+    // is the per-routed-expert intermediate width; `expertSharedFeedForwardLength`
+    // (`<arch>.expert_shared_feed_forward_length`) sizes the always-on shared
+    // expert. Zero ⇒ derive from `feedForwardLength` at use-site.
+    // `expertWeightsScale` (`<arch>.expert_weights_scale`) multiplies the
+    // (renormalised top-K softmax) router weights. Zero ⇒ no extra scale.
+    std::uint32_t expertFeedForwardLength       {0};
+    std::uint32_t expertSharedFeedForwardLength {0};
+    float         expertWeightsScale            {0.0F};
+
+    // --- Qwen3-Next / GatedDeltaNet hybrid (qwen35moe) -------------------
+    // Linear-attention ("gated delta net") SSM hyperparameters. All zero on
+    // non-hybrid archs. GGUF keys `<arch>.ssm.{conv_kernel,inner_size,
+    // state_size,time_step_rank,group_count}`. For Qwen3.6-35B-A3B:
+    //   conv_kernel=4, inner_size=4096, state_size=128, time_step_rank=32,
+    //   group_count=16. See research/qwen3next-gated-deltanet-recon-2026-07-21.
+    std::uint32_t ssmConvKernel   {0};  // ssm_d_conv  — causal conv1d width
+    std::uint32_t ssmInnerSize    {0};  // ssm_d_inner — = value_dim (H_v*S_v)
+    std::uint32_t ssmStateSize    {0};  // ssm_d_state — GatedDeltaNet head_dim
+    std::uint32_t ssmTimeStepRank {0};  // ssm_dt_rank — num v-heads (H_v)
+    std::uint32_t ssmGroupCount   {0};  // ssm_n_group — num k-heads  (H_k)
+
+    // NextN / MTP speculative-decode head. >0 ⇒ the model appends
+    // `nextnPredictLayers` dense-attention MTP block(s) past the main stack
+    // (`blk.<blockCount>.nextn.*`). Not executed in the main forward pass;
+    // stored here so the spec-decode path (M-Q3N.5+) can find them.
+    std::uint32_t nextnPredictLayers {0};
+
+    // Interleaved-MRoPE (IMRoPE) dimension sections. Empty on archs without
+    // mRoPE. Length 4 when present (Qwen3-Next / Qwen2.5-VL). GGUF key
+    // `<arch>.rope.dimension_sections`.
+    std::vector<std::int32_t> ropeSections{};
+
+    // Per-layer "is this a recurrent (GatedDeltaNet linear-attention)
+    // layer?" mask. Empty = every layer is standard attention (all non-hybrid
+    // archs). When present, size == blockCount; entry b is true if block b is
+    // a linear-attention layer, false if it's a full (softmax) attention
+    // layer. Derived from `<arch>.attention.recurrent_layers` (bool array)
+    // when present, else synthesised from `<arch>.full_attention_interval`
+    // (default 4) via `(b+1) % interval != 0` — the llama.cpp qwen35moe
+    // convention (every `interval`-th layer is full attention).
+    std::vector<bool> recurrentLayerPattern{};
 
     // Gemma 4 "shared KV layers": last N layers reuse an earlier layer's
     // K/V cache instead of computing their own. GGUF key
@@ -97,6 +149,18 @@ struct LlmConfig {
         return headCount > 0 ? embeddingLength / headCount : 0;
     }
 
+    /// Effective attention softmax scale for a given head_dim. Returns the
+    /// explicit `attentionScale` when the model ships it (>0), else the
+    /// conventional `1/sqrt(head_dim)`. Matches llama.cpp's kq_scale pick.
+    [[nodiscard]] float attentionScaleFor(std::size_t headDim_) const noexcept {
+        if (attentionScale > 0.0F) {
+            return attentionScale;
+        }
+        return headDim_ > 0
+                   ? 1.0F / std::sqrt(static_cast<float>(headDim_))
+                   : 0.0F;
+    }
+
     /// Per-layer head_dim. For Gemma 4 returns `keyLengthSwa` on SWA
     /// layers and `keyLength` (full) on global-attention layers. For
     /// every other arch (uniform attention) it just returns `headDim()`.
@@ -115,6 +179,47 @@ struct LlmConfig {
             return headCountKvPerLayer[blockIdx];
         }
         return headCountKv;
+    }
+
+    /// True iff block `blockIdx` is a GatedDeltaNet linear-attention layer.
+    /// False for every layer on non-hybrid archs (empty pattern).
+    [[nodiscard]] bool isRecurrentLayer(std::size_t blockIdx) const noexcept {
+        return blockIdx < recurrentLayerPattern.size() &&
+               recurrentLayerPattern[blockIdx];
+    }
+
+    /// True iff this is a hybrid arch with at least one recurrent
+    /// (linear-attention) layer — i.e. the SSM path is active.
+    [[nodiscard]] bool isHybridRecurrent() const noexcept {
+        return !recurrentLayerPattern.empty();
+    }
+
+    /// GatedDeltaNet dims, derived from the SSM hyperparameters. All return
+    /// 0 on non-hybrid archs. `ssmConvDim` is the depthwise-conv channel
+    /// count `key_dim*2 + value_dim = d_inner + 2*n_group*d_state` (the
+    /// `ssm_conv1d.weight` dim[1]).
+    [[nodiscard]] std::uint32_t ssmHeadDim()   const noexcept { return ssmStateSize; }
+    [[nodiscard]] std::uint32_t ssmNumKHeads() const noexcept { return ssmGroupCount; }
+    [[nodiscard]] std::uint32_t ssmNumVHeads() const noexcept { return ssmTimeStepRank; }
+    [[nodiscard]] std::uint32_t ssmConvDim()   const noexcept {
+        return ssmInnerSize + 2U * ssmGroupCount * ssmStateSize;
+    }
+
+    /// Recurrent SSM state elements per linear-attention layer per sequence:
+    /// the `[head_dim, head_dim]` memory matrix per v-head, i.e.
+    /// `S_v * S_v * H_v = ssm_d_state^2 * ssm_dt_rank`. For 35B-A3B this is
+    /// 128*128*32 = 512Ki floats = 2 MiB (F32) per linear layer per sequence.
+    /// Used to size the SSM state pool (M-Q3N.3). Zero on non-hybrid archs.
+    [[nodiscard]] std::size_t ssmStateElemsPerLayer() const noexcept {
+        return std::size_t{ssmStateSize} * ssmStateSize * ssmTimeStepRank;
+    }
+
+    /// Causal-conv rolling state elements per linear-attention layer per
+    /// sequence: `(conv_kernel - 1) * conv_dim`. Zero on non-hybrid archs.
+    [[nodiscard]] std::size_t ssmConvStateElemsPerLayer() const noexcept {
+        return ssmConvKernel == 0
+                   ? 0
+                   : std::size_t{ssmConvKernel - 1U} * ssmConvDim();
     }
 
     /// KV-cache bytes required per newly-decoded token, summed across

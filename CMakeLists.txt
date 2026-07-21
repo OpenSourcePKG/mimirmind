@@ -216,6 +216,9 @@ set(KERNEL_SOURCES
     kernels/add_residual.cl
     kernels/silu_mul.cl
     kernels/rope_inplace.cl
+    kernels/rope_mrope.cl
+    kernels/split_head_pair.cl
+    kernels/sigmoid_gate_mul.cl
     kernels/mul_scalar.cl
     kernels/gelu_mul.cl
     kernels/rmsnorm_gemma.cl
@@ -516,6 +519,9 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/rmsnorm_qkv.hip
         kernels_hip/rmsnorm_qkv_fp16.hip
         kernels_hip/rope_inplace.hip
+        kernels_hip/rope_mrope.hip
+        kernels_hip/split_head_pair.hip
+        kernels_hip/sigmoid_gate_mul.hip
         kernels_hip/rope_inplace_fp16.hip
         kernels_hip/rope_inplace_ff.hip
         kernels_hip/scaled_add_residual.hip
@@ -652,6 +658,9 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/rmsnorm_qkv.cu
         kernels_cuda/rmsnorm_qkv_fp16.cu
         kernels_cuda/rope_inplace.cu
+        kernels_cuda/rope_mrope.cu
+        kernels_cuda/split_head_pair.cu
+        kernels_cuda/sigmoid_gate_mul.cu
         kernels_cuda/rope_inplace_fp16.cu
         kernels_cuda/rope_inplace_ff.cu
         kernels_cuda/scaled_add_residual.cu
@@ -828,6 +837,7 @@ add_executable(mimirmind
     src/runtime/arch/Gemma4E4BBackend.cpp
     src/runtime/arch/Gemma4MoeBackend.cpp
     src/runtime/arch/Qwen2Backend.cpp
+    src/runtime/arch/Qwen35MoeBackend.cpp
     src/server/ApiHelpers.cpp
     src/server/ApiServer.cpp
     src/server/ChatCompletionHandler.cpp
@@ -1061,8 +1071,10 @@ add_executable(compute_tests
     tests/compute_tests.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
+    src/compute/GatedDeltaNet.cpp
     src/compute/Matmul.cpp
     src/compute/QuantTypeRegistry.cpp
+    src/compute/Rope.cpp
     src/compute/Sampling.cpp
     src/compute/quant/Bfloat16.cpp
     src/compute/quant/Float16.cpp

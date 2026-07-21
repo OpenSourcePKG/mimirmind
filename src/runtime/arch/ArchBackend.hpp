@@ -104,6 +104,15 @@ public:
     /// Short identifier for logs ("qwen2", "gemma4").
     [[nodiscard]] virtual const char* name() const noexcept = 0;
 
+    /// True if the arch needs the per-head fused [Q|gate] scratch buffers
+    /// (`BlockBuffers::qGateFused` / `gateScratch`). Qwen3-Next full-
+    /// attention fuses the query projection with a per-head output gate;
+    /// every other arch leaves this false. InferenceEngine reads it when
+    /// sizing block scratch.
+    [[nodiscard]] virtual bool needsQGateScratch() const noexcept {
+        return false;
+    }
+
     /// Enable per-stage parity dumps. PREFIX is the same string carried by
     /// `diagnostics.parityDump` in config.json: each stage writes a file at
     ///   <prefix>-blk{N}-<stage>.bin
@@ -145,7 +154,8 @@ protected:
 /// in Qwen2Backend / Gemma4Backend implementations.
 [[nodiscard]] inline bool
 isSupportedArchitecture(std::string_view architecture) noexcept {
-    return architecture == "qwen2" || architecture == "gemma4";
+    return architecture == "qwen2" || architecture == "gemma4" ||
+           architecture == "qwen35moe";
 }
 
 /// Build the backend matching `architecture` ("qwen2" / "gemma4"). Returns

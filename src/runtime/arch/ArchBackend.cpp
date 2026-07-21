@@ -5,6 +5,7 @@
 
 #include "runtime/arch/Gemma4Backend.hpp"
 #include "runtime/arch/Qwen2Backend.hpp"
+#include "runtime/arch/Qwen35MoeBackend.hpp"
 
 namespace mimirmind::runtime::arch {
 
@@ -27,6 +28,12 @@ createArchBackend(const std::string&             architecture,
                                                ops, gmm, opProfiler,
                                                moeGroupEnabled,
                                                moeFusedDownEnabled);
+    }
+    if (architecture == "qwen35moe") {
+        return std::make_unique<Qwen35MoeBackend>(config, weights, fusedQkv,
+                                                  ops, gmm, opProfiler,
+                                                  moeGroupEnabled,
+                                                  moeFusedDownEnabled);
     }
     return nullptr;
 }

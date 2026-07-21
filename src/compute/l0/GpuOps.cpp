@@ -123,6 +123,12 @@ struct GpuOps::Impl {
     runtime::GpuKernel     _xQuantI8Kernel;
     runtime::GpuModule     _matmulQ8_0VecReorderModule;
     runtime::GpuKernel     _matmulQ8_0VecReorderKernel;
+    runtime::GpuModule     _mropeModule;
+    runtime::GpuKernel     _mropeKernel;
+    runtime::GpuModule     _splitHeadPairModule;
+    runtime::GpuKernel     _splitHeadPairKernel;
+    runtime::GpuModule     _sigmoidGateMulModule;
+    runtime::GpuKernel     _sigmoidGateMulKernel;
 
     explicit Impl(core::l0::L0Context& ctx)
         : _rmsnormModule    {ctx, "rmsnorm"},
@@ -214,7 +220,14 @@ struct GpuOps::Impl {
           _xQuantI8Kernel             {_xQuantI8Module.kernel("x_quant_i8")},
           _matmulQ8_0VecReorderModule {ctx, "matmul_q8_0_vec_reorder"},
           _matmulQ8_0VecReorderKernel {
-              _matmulQ8_0VecReorderModule.kernel("matmul_q8_0_vec_reorder")}
+              _matmulQ8_0VecReorderModule.kernel("matmul_q8_0_vec_reorder")},
+          _mropeModule         {ctx, "rope_mrope"},
+          _mropeKernel         {_mropeModule.kernel("rope_mrope")},
+          _splitHeadPairModule {ctx, "split_head_pair"},
+          _splitHeadPairKernel {_splitHeadPairModule.kernel("split_head_pair")},
+          _sigmoidGateMulModule{ctx, "sigmoid_gate_mul"},
+          _sigmoidGateMulKernel{
+              _sigmoidGateMulModule.kernel("sigmoid_gate_mul")}
     {}
 };
 
@@ -676,6 +689,96 @@ void GpuOps::ropeInPlaceAsync(void*            xBase,
     kernel.setGroupSize(kRopeLocalSize, 1, 1);
     _queue.appendLaunch(kernel,
                         groupsForN(total, kRopeLocalSize), 1, 1);
+}
+
+void GpuOps::mropeInPlaceAsync(void*               xBase,
+                               std::size_t         seqLen,
+                               std::size_t         numHeads,
+                               std::size_t         headDim,
+                               std::size_t         startPos,
+                               float               base,
+                               const std::int32_t* sections,
+                               std::size_t         writeOffsetStride,
+                               runtime::KvDtype    kvDtype) {
+    if (seqLen == 0 || numHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (headDim % 2 != 0) {
+        throw std::runtime_error("GpuOps::mropeInPlace: headDim must be even");
+    }
+    if (kvDtype != runtime::KvDtype::F32) {
+        throw std::runtime_error(
+            "GpuOps::mropeInPlace: only KvDtype::F32 is supported "
+            "(M-Q3N.2 F32-only IMRoPE path)");
+    }
+    const std::size_t halfDim = headDim / 2;
+    const std::size_t total   = seqLen * numHeads * halfDim;
+
+    // See ropeInPlaceAsync for the startPos-via-USM-slot + writeOffsetStride
+    // contract. sections[0..3] drive the IMRoPE sector rule; a null pointer
+    // or zero sum degenerates to plain RoPE inside the kernel.
+    runtime::GpuKernel& kernel = _pimpl->_mropeKernel;
+    *_curLenSlotUsm = toInt32(startPos, "mrope startPos");
+    kernel.setPtr(0, xBase);
+    kernel.setValue<std::int32_t>(1, toInt32(seqLen,   "mrope seqLen"));
+    kernel.setValue<std::int32_t>(2, toInt32(numHeads, "mrope numHeads"));
+    kernel.setValue<std::int32_t>(3, toInt32(headDim,  "mrope headDim"));
+    kernel.setPtr(4, _curLenSlotUsm);
+    kernel.setValue<float>(5, base);
+    kernel.setValue<std::int32_t>(
+        6, toInt32(writeOffsetStride, "mrope writeOffsetStride"));
+    kernel.setValue<std::int32_t>(7, sections ? sections[0] : 0);
+    kernel.setValue<std::int32_t>(8, sections ? sections[1] : 0);
+    kernel.setValue<std::int32_t>(9, sections ? sections[2] : 0);
+    kernel.setValue<std::int32_t>(10, sections ? sections[3] : 0);
+    kernel.setGroupSize(kRopeLocalSize, 1, 1);
+    _queue.appendLaunch(kernel, groupsForN(total, kRopeLocalSize), 1, 1);
+}
+
+void GpuOps::splitHeadPairAsync(const float* src,
+                                float*       a,
+                                float*       b,
+                                std::size_t  seqLen,
+                                std::size_t  numHeads,
+                                std::size_t  headDim) {
+    const std::size_t total = seqLen * numHeads * headDim;
+    if (total == 0) {
+        return;
+    }
+    _pimpl->_splitHeadPairKernel.setPtr(0, src);
+    _pimpl->_splitHeadPairKernel.setPtr(1, a);
+    _pimpl->_splitHeadPairKernel.setPtr(2, b);
+    _pimpl->_splitHeadPairKernel.setValue<std::int32_t>(
+        3, toInt32(seqLen, "splitHeadPair seqLen"));
+    _pimpl->_splitHeadPairKernel.setValue<std::int32_t>(
+        4, toInt32(numHeads, "splitHeadPair numHeads"));
+    _pimpl->_splitHeadPairKernel.setValue<std::int32_t>(
+        5, toInt32(headDim, "splitHeadPair headDim"));
+    _pimpl->_splitHeadPairKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_splitHeadPairKernel,
+                        groupsForN(total, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::sigmoidGateMulAsync(float*       y,
+                                 const float* g,
+                                 std::size_t  rows,
+                                 std::size_t  dim,
+                                 std::size_t  gateDim) {
+    const std::size_t total = rows * dim;
+    if (total == 0) {
+        return;
+    }
+    _pimpl->_sigmoidGateMulKernel.setPtr(0, y);
+    _pimpl->_sigmoidGateMulKernel.setPtr(1, g);
+    _pimpl->_sigmoidGateMulKernel.setValue<std::int32_t>(
+        2, toInt32(rows, "sigmoidGateMul rows"));
+    _pimpl->_sigmoidGateMulKernel.setValue<std::int32_t>(
+        3, toInt32(dim, "sigmoidGateMul dim"));
+    _pimpl->_sigmoidGateMulKernel.setValue<std::int32_t>(
+        4, toInt32(gateDim, "sigmoidGateMul gateDim"));
+    _pimpl->_sigmoidGateMulKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(_pimpl->_sigmoidGateMulKernel,
+                        groupsForN(total, kElementwiseLocalSize), 1, 1);
 }
 
 void GpuOps::ropeInPlaceWithFactorsAsync(void*            xBase,

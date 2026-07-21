@@ -116,6 +116,29 @@ public:
                                         float        scale,
                                         std::size_t  n) = 0;
 
+    // De-interleave a fused per-head [block_a | block_b] projection into
+    // two contiguous [seqLen, numHeads, headDim] buffers. Qwen3-Next fuses
+    // the query and a per-head output gate into one `attn_q` weight whose
+    // output is `[Q_h | gate_h]` per head (head stride 2*headDim); this
+    // splits it so RoPE/attention see a contiguous Q and the gate is
+    // applied post-attention. `a` = first block per head, `b` = second.
+    virtual void splitHeadPairAsync(const float* src,
+                                    float*       a,
+                                    float*       b,
+                                    std::size_t  seqLen,
+                                    std::size_t  numHeads,
+                                    std::size_t  headDim) = 0;
+
+    // In-place sigmoid gating: y[r,c] *= sigmoid(g[r, gateDim==1?0:c]).
+    // `gateDim == dim` = per-element gate (Qwen3-Next attention output
+    // gate); `gateDim == 1` = per-row scalar broadcast (shared-expert
+    // gate). y is [rows, dim] f32 row-major; g is [rows, gateDim].
+    virtual void sigmoidGateMulAsync(float*       y,
+                                     const float* g,
+                                     std::size_t  rows,
+                                     std::size_t  dim,
+                                     std::size_t  gateDim) = 0;
+
     // ---- RoPE ---------------------------------------------------------
 
     virtual void ropeInPlaceAsync(void*            xBase,
@@ -136,6 +159,24 @@ public:
                                              float            base,
                                              std::size_t      writeOffsetStride = 0,
                                              runtime::KvDtype kvDtype           = runtime::KvDtype::F32) = 0;
+
+    // Interleaved multi-axis RoPE (IMRoPE) — Qwen3-Next / Qwen3.5-VL
+    // full-attention layers (`LLM_ROPE_TYPE_IMROPE`). Same split-pair
+    // rotation as ropeInPlaceAsync but the per-pair angle base is chosen
+    // across four position axes via the IMRoPE sector rule. `sections`
+    // points at 4 int32 dimension-section widths (GGUF
+    // `<arch>.rope.dimension_sections`). For text-only positions (all
+    // axes equal) this is bit-identical to ropeInPlaceAsync. Only the
+    // F32 storage path is implemented in M-Q3N.2; FP16/Q8_0 KV throws.
+    virtual void mropeInPlaceAsync(void*              xBase,
+                                   std::size_t        seqLen,
+                                   std::size_t        numHeads,
+                                   std::size_t        headDim,
+                                   std::size_t        startPos,
+                                   float              base,
+                                   const std::int32_t* sections,
+                                   std::size_t        writeOffsetStride = 0,
+                                   runtime::KvDtype   kvDtype           = runtime::KvDtype::F32) = 0;
 
     // ---- Quantisation + KV commit -------------------------------------
 

@@ -278,6 +278,62 @@ void GpuOps::ropeInPlaceAsync(void*            xBase,
                                            startPos, base);
 }
 
+void GpuOps::mropeInPlaceAsync(void*               xBase,
+                               std::size_t         seqLen,
+                               std::size_t         numHeads,
+                               std::size_t         headDim,
+                               std::size_t         startPos,
+                               float               base,
+                               const std::int32_t* sections,
+                               std::size_t         writeOffsetStride,
+                               runtime::KvDtype    kvDtype) {
+    if (kvDtype != runtime::KvDtype::F32) {
+        throw std::runtime_error(
+            "compute::cpu::GpuOps::mropeInPlaceAsync: only KvDtype::F32 "
+            "is supported (M-Q3N.2 F32-only IMRoPE path)");
+    }
+    float* effective = static_cast<float*>(xBase)
+                     + startPos * writeOffsetStride;
+    ::mimirmind::compute::applyMropeInPlace(effective,
+                                            seqLen, numHeads, headDim,
+                                            startPos, base, sections);
+}
+
+void GpuOps::splitHeadPairAsync(const float* src,
+                                float*       a,
+                                float*       b,
+                                std::size_t  seqLen,
+                                std::size_t  numHeads,
+                                std::size_t  headDim) {
+    for (std::size_t p = 0; p < seqLen; ++p) {
+        for (std::size_t h = 0; h < numHeads; ++h) {
+            const float* srcHead =
+                src + (p * numHeads + h) * (2 * headDim);
+            float* aHead = a + (p * numHeads + h) * headDim;
+            float* bHead = b + (p * numHeads + h) * headDim;
+            for (std::size_t d = 0; d < headDim; ++d) {
+                aHead[d] = srcHead[d];
+                bHead[d] = srcHead[headDim + d];
+            }
+        }
+    }
+}
+
+void GpuOps::sigmoidGateMulAsync(float*       y,
+                                 const float* g,
+                                 std::size_t  rows,
+                                 std::size_t  dim,
+                                 std::size_t  gateDim) {
+    for (std::size_t r = 0; r < rows; ++r) {
+        for (std::size_t c = 0; c < dim; ++c) {
+            const std::size_t gcol = (gateDim == 1) ? 0 : c;
+            const float gv  = g[r * gateDim + gcol];
+            const float sig = 1.0F / (1.0F + std::exp(-gv));
+            y[r * dim + c] *= sig;
+        }
+    }
+}
+
 void GpuOps::ropeInPlaceWithFactorsAsync(void*            xBase,
                                          const float*     freqFactors,
                                          std::size_t      seqLen,

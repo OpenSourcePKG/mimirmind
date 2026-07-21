@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace mimirmind::compute {
 
@@ -52,5 +53,33 @@ void applyRopeInPlaceWithFactors(float*        x,
                                  std::size_t   headDim,
                                  std::size_t   startPos,
                                  float         base);
+
+/**
+ * Interleaved multi-axis RoPE (IMRoPE) — the rotary variant used by
+ * Qwen3-Next / Qwen3.5-VL full-attention layers (`LLM_ROPE_TYPE_IMROPE`
+ * in llama.cpp). Same split-pair rotation as `applyRopeInPlace`, but the
+ * per-pair angle base is selected across four position axes (time /
+ * height / width / extra) via the IMRoPE sector rule (ggml
+ * `ggml_mrope_cache_init`, `is_imrope` branch):
+ *
+ *   sect_dims = sections[0..3] summed
+ *   sector    = i % sect_dims             (i = pair index in [0, headDim/2))
+ *   theta     = pos_axis(sector) * base^(-2i/headDim)
+ *
+ * `sections` points at 4 int32 dimension-section widths (GGUF
+ * `<arch>.rope.dimension_sections`). This engine is text-only, so all
+ * four axis positions equal the sequence position `startPos + p` and the
+ * result is bit-identical to `applyRopeInPlace` — the sector machinery is
+ * the faithful IMRoPE algorithm and the extension point for true
+ * multimodal position ids. `sections == nullptr` or a zero sum
+ * degenerates to plain RoPE.
+ */
+void applyMropeInPlace(float*              x,
+                       std::size_t         seqLen,
+                       std::size_t         numHeads,
+                       std::size_t         headDim,
+                       std::size_t         startPos,
+                       float               base,
+                       const std::int32_t* sections);
 
 } // namespace mimirmind::compute
