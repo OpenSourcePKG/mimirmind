@@ -1129,6 +1129,23 @@ GdnCase makeGdnCase(std::size_t T, std::size_t H, std::size_t S,
     return c;
 }
 
+// L2-normalise q and k per (token,head) over head_dim — the real linear layer
+// applies ggml_l2_norm to q/k before the delta net, which bounds k.k to 1.
+void l2normQK(GdnCase& c) {
+    auto norm = [&](std::vector<float>& x) {
+        for (std::size_t r = 0; r < c.T * c.H; ++r) {
+            float* row = x.data() + r * c.S;
+            double ss = 0.0;
+            for (std::size_t j = 0; j < c.S; ++j) ss += double(row[j]) * row[j];
+            const float s = 1.0F / std::fmax(std::sqrt(static_cast<float>(ss)),
+                                             1e-6F);
+            for (std::size_t j = 0; j < c.S; ++j) row[j] *= s;
+        }
+    };
+    norm(c.q);
+    norm(c.k);
+}
+
 // Max abs deviation of chunk vs recurrent for a given chunk size.
 void expectChunkMatchesRecurrent(const GdnCase& c, std::size_t chunkSize,
                                  float tol) {
@@ -1240,6 +1257,23 @@ TEST(gdn_chunk_stagedPipeline_partialTrailingChunk) {
     expectStagedMatchesRecurrent(c, /*C=*/7,   /*tol=*/2e-3F);
     expectStagedMatchesRecurrent(c, /*C=*/64,  /*tol=*/2e-3F);
     expectStagedMatchesRecurrent(c, /*C=*/128, /*tol=*/2e-3F);
+}
+
+TEST(gdn_chunk_realisticQwen3NextShapes) {
+    // The production Qwen3-Next GatedDeltaNet dimensions: head_dim S=128,
+    // value heads H=32. T=160 → chunks 64/64/32 (partial trailing). Both the
+    // raw case and the L2-normalised-q/k case (what the real linear layer
+    // feeds) stay far below tolerance — no accumulation blow-up at d=128.
+    // expectStagedMatchesRecurrent already cross-checks staged vs BOTH the
+    // recurrent golden and the monolith, so one call covers all three paths.
+    auto raw = makeGdnCase(/*T=*/160, /*H=*/32, /*S=*/128, /*seed=*/4242,
+                           /*nonzeroState=*/true);
+    expectStagedMatchesRecurrent(raw, /*C=*/64, /*tol=*/1e-3F);
+
+    auto normed = makeGdnCase(/*T=*/160, /*H=*/32, /*S=*/128, /*seed=*/4242,
+                              /*nonzeroState=*/true);
+    l2normQK(normed);
+    expectStagedMatchesRecurrent(normed, /*C=*/64, /*tol=*/1e-3F);
 }
 
 int main() {
