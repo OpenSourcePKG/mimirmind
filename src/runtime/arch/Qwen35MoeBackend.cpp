@@ -528,8 +528,18 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
         _moeDeviceTopKEnabled && useMoeFusedDownPre && useGateUpFusedPre;
 
     // --- router: logits = ffn_gate_inp @ x, then top-K softmax -------
-    _gmm.matmul(routerW.type, routerW.usmPtr, nExperts, d_model,
-                moeInput, T, upOutBuf, matmulScratch);   // upOutBuf [T, nExperts]
+    // On the device-top-K path nothing reads upOutBuf on the host, so the
+    // router runs async — this removes the last per-layer host sync on the
+    // fused decode block (matmul() = matmulAsync + stream sync), letting the
+    // whole trunk pipeline and unblocking graph capture. The host path keeps
+    // the sync because cmp::moeTopKRoute reads upOutBuf on the CPU below.
+    if (deviceTopK) {
+        _gmm.matmulAsync(routerW.type, routerW.usmPtr, nExperts, d_model,
+                         moeInput, T, upOutBuf, matmulScratch);
+    } else {
+        _gmm.matmul(routerW.type, routerW.usmPtr, nExperts, d_model,
+                    moeInput, T, upOutBuf, matmulScratch);  // upOutBuf [T, nExperts]
+    }
 
     _topKIdx.resize(T * K);
     _topKWeight.resize(T * K);
