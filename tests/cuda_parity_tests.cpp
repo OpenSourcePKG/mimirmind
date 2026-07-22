@@ -384,8 +384,6 @@ TEST(cuda_deltanet_chunk_forward_parity) {
     }
 }
 
-#if defined(MIMIRMIND_GDN_CHUNK_GPU_READY)
-
 // End-to-end: run all three GPU kernels chained (G, A0 stay on device) and
 // close the loop against the autoregressive golden — the same output the
 // prefill path must produce before it can replace the AR loop.
@@ -445,8 +443,6 @@ TEST(cuda_deltanet_chunk_pipeline_vs_recurrent) {
         EXPECT_NEAR(gotState[i], refState[i], 2e-3f);
     }
 }
-
-#endif // MIMIRMIND_GDN_CHUNK_GPU_READY
 
 int main() {
     return mm::test::run();
