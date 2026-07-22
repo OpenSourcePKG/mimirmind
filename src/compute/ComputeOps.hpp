@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string_view>
 
 namespace mimirmind::compute {
@@ -189,6 +190,20 @@ public:
                                    float*       gLog,
                                    std::size_t  T,
                                    std::size_t  H) = 0;
+
+    /// Chunked-prefill stage K0: inclusive prefix-sum of gLog within each
+    /// chunk, per head. gLog/gCum [T,H]; chunkSize C (0 -> 64). Reference:
+    /// compute::deltanetChunkCumGate. Default: unsupported — the chunked-
+    /// prefill GPU path is CUDA-first; CUDA overrides.
+    virtual void deltanetChunkCumGateAsync(const float* gLog,
+                                           float*       gCum,
+                                           std::size_t  T,
+                                           std::size_t  H,
+                                           std::size_t  chunkSize) {
+        (void)gLog; (void)gCum; (void)T; (void)H; (void)chunkSize;
+        throw std::runtime_error(
+            "deltanetChunkCumGateAsync: not supported on this backend");
+    }
 
     /// In-place logistic sigmoid: y[i] = 1/(1+exp(-y[i])). GatedDeltaNet
     /// `beta` gate. Reference: compute::sigmoidInPlace.

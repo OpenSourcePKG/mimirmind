@@ -207,6 +207,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _gatedDeltaNetArKernel;
     core::cuda::CudaModule _deltanetGateModule;
     core::cuda::CudaKernel _deltanetGateKernel;
+    core::cuda::CudaModule _deltanetChunkCumGateModule;
+    core::cuda::CudaKernel _deltanetChunkCumGateKernel;
     core::cuda::CudaModule _sigmoidInplaceModule;
     core::cuda::CudaKernel _sigmoidInplaceKernel;
     core::cuda::CudaModule _gatherHeadsModule;
@@ -319,6 +321,9 @@ struct GpuOps::Impl {
               _gatedDeltaNetArModule.getFunction("gated_deltanet_ar")},
           _deltanetGateModule      {loadCudaModule(ctx, "deltanet_gate")},
           _deltanetGateKernel      {_deltanetGateModule.getFunction("deltanet_gate")},
+          _deltanetChunkCumGateModule{loadCudaModule(ctx, "deltanet_chunk_cumgate")},
+          _deltanetChunkCumGateKernel{
+              _deltanetChunkCumGateModule.getFunction("deltanet_chunk_cumgate")},
           _sigmoidInplaceModule    {loadCudaModule(ctx, "sigmoid_inplace")},
           _sigmoidInplaceKernel    {
               _sigmoidInplaceModule.getFunction("sigmoid_inplace")},
@@ -987,6 +992,26 @@ void GpuOps::deltanetGateAsync(const float* alpha, const float* ssmA,
     k.setPtr  (3, gLog);
     k.setValue(4, toInt32(T, "deltanetGate T"));
     k.setValue(5, toInt32(H, "deltanetGate H"));
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::deltanetChunkCumGateAsync(const float* gLog, float* gCum,
+                                       std::size_t T, std::size_t H,
+                                       std::size_t chunkSize) {
+    if (T == 0 || H == 0) {
+        return;
+    }
+    const std::size_t C       = chunkSize ? chunkSize : 64;
+    const std::size_t nChunks = (T + C - 1) / C;
+    const std::size_t total   = H * nChunks;   // one thread per (head, chunk)
+    auto& k = _pimpl->_deltanetChunkCumGateKernel;
+    k.setPtr  (0, gLog);
+    k.setPtr  (1, gCum);
+    k.setValue(2, toInt32(T, "cumgate T"));
+    k.setValue(3, toInt32(H, "cumgate H"));
+    k.setValue(4, toInt32(C, "cumgate C"));
     k.launch(_ctx.stream(),
              groupsForN(total, kElementwiseLocalSize), 1, 1,
              kElementwiseLocalSize, 1, 1);

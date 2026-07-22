@@ -257,15 +257,9 @@ TEST(cuda_gather_heads_from_channels_parity) {
 // C = chunkSize (see GatedDeltaNet.hpp deltanetKktSolveInverse).
 // ===========================================================================
 
-#if defined(MIMIRMIND_GDN_CHUNK_GPU_READY)
-
-namespace {
-inline std::size_t nChunksOf(std::size_t T, std::size_t C) {
-    return (T + C - 1) / C;
-}
-} // namespace
-
 // K0 — cumulative decay gate G. The prefix-sum hand-off tensor to K1/K2.
+// K0's GPU kernel has landed (deltanetChunkCumGateAsync); K1/K2/pipeline
+// stay gated behind MIMIRMIND_GDN_CHUNK_GPU_READY below until their kernels land.
 TEST(cuda_deltanet_chunk_cumgate_parity) {
     CudaComputeContext ctx{};
     GpuOps ops{ctx};
@@ -287,6 +281,14 @@ TEST(cuda_deltanet_chunk_cumgate_parity) {
         EXPECT_NEAR(got[i], ref[i], 1e-3f);
     }
 }
+
+#if defined(MIMIRMIND_GDN_CHUNK_GPU_READY)
+
+namespace {
+inline std::size_t nChunksOf(std::size_t T, std::size_t C) {
+    return (T + C - 1) / C;
+}
+} // namespace
 
 // K1 — per-chunk ungated inverse A0 = (I + strictLower(diag(beta) K K^T))^-1.
 // The most error-prone kernel (triangular solve); checked directly on A0.
