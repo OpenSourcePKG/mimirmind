@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -131,11 +132,26 @@ private:
     // for the perf measurement; default off.
     bool _q8Dp4a{false};
 
-    // MIMIRMIND_GDN_CHUNK: use the chunked GatedDeltaNet prefill (K0->K1->K2)
-    // for T>1 instead of the sequential AR loop (M-Q3N.4). Parity-equivalent
-    // (cuda_parity 10/10); env-gated for A/B until it is the default. Decode
-    // (T==1) always uses the AR recurrence.
-    bool _gdnChunk{false};
+    // Chunked GatedDeltaNet prefill (K0->K1->K2, M-Q3N.4) auto-gate.
+    //
+    // For a prefill of length T the delta-rule step runs either the
+    // T-sequential AR recurrence or the parallel chunked pipeline
+    // (parity-equivalent, cuda_parity 10/10). The chunked path only wins once
+    // T is large enough that the sequential dependency dominates -- at short
+    // prefills it is correct but no faster (M-Q3N.4l). `_gdnChunkMinT` is the
+    // smallest prefill T that switches to the chunked path; decode (T==1)
+    // always uses AR.
+    //
+    // Resolution (see ctor), highest precedence first:
+    //   MIMIRMIND_GDN_CHUNK_MIN_T=<N>  -> chunk when T >= N  (A/B sweep knob)
+    //   MIMIRMIND_GDN_CHUNK[=1]        -> chunk for every prefill (T >= 2)
+    //   (neither set)                  -> kGdnChunkMinTDefault
+    //
+    // The default is "disabled" (SIZE_MAX) until the GB10 crossover A/B fixes
+    // the break-even T; prod stays on the AR path meanwhile.
+    static constexpr std::size_t kGdnChunkMinTDefault =
+        std::numeric_limits<std::size_t>::max();
+    std::size_t _gdnChunkMinT{kGdnChunkMinTDefault};
 
     /// Host-side L2 norm + max|.| of a compute buffer, after a sync. Only
     /// called on the diagnostic trace path.

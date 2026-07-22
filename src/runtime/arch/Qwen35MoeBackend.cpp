@@ -53,7 +53,21 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
       _moeFusedDownEnabled{moeFusedDownEnabled} {
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     _q8Dp4a   = (std::getenv("MIMIRMIND_Q8_DP4A") != nullptr);
-    _gdnChunk = (std::getenv("MIMIRMIND_GDN_CHUNK") != nullptr);
+    // Chunked GatedDeltaNet prefill auto-gate (M-Q3N.4). See the header for the
+    // precedence rules; MIN_T (the A/B sweep knob) overrides the coarse flag.
+    _gdnChunkMinT = kGdnChunkMinTDefault;
+    if (std::getenv("MIMIRMIND_GDN_CHUNK") != nullptr) {
+        _gdnChunkMinT = 2;  // force chunk for every prefill (T > 1)
+    }
+    if (const char* mt = std::getenv("MIMIRMIND_GDN_CHUNK_MIN_T")) {
+        const long v = std::strtol(mt, nullptr, 10);
+        if (v >= 2) {
+            _gdnChunkMinT = static_cast<std::size_t>(v);
+        } else {
+            MM_LOG_WARN("qwen35moe",
+                        "MIMIRMIND_GDN_CHUNK_MIN_T='{}' ignored (need >= 2)", mt);
+        }
+    }
     for (std::size_t i = 0; i < 4; ++i) {
         _ropeSections[i] = i < _config.ropeSections.size()
                                ? _config.ropeSections[i]
@@ -74,6 +88,12 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
                 _config.expertSharedFeedForwardLength,
                 _ropeSections[0], _ropeSections[1],
                 _ropeSections[2], _ropeSections[3]);
+    if (_gdnChunkMinT == kGdnChunkMinTDefault) {
+        MM_LOG_INFO("qwen35moe", "GatedDeltaNet prefill: AR (chunk disabled)");
+    } else {
+        MM_LOG_INFO("qwen35moe",
+                    "GatedDeltaNet prefill: chunked (C=64) for T>={}", _gdnChunkMinT);
+    }
 }
 
 std::vector<std::size_t> Qwen35MoeBackend::kvDimPerLayer() const {
@@ -383,11 +403,12 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     if (isSeqStart) {
         _ops.mulScalarAsync(stateBuf, 0.0F, stateElems);
     }
-    if (_gdnChunk && T > 1) {
+    if (T > 1 && T >= _gdnChunkMinT) {
         // Chunked prefill: K0 (cumgate) -> K1 (kkt inverse) -> K2 (forward).
         // Parity-equivalent to the AR recurrence (cuda_parity 10/10) but
         // parallel across the chunk instead of T sequential steps. gateBuf is
-        // gLog; K0 turns it into gCum. Chunk size C = 64.
+        // gLog; K0 turns it into gCum. Chunk size C = 64. Gated on T so short
+        // prefills (where chunking is correct but not faster) keep the AR path.
         const std::size_t cChunk = 64;
         float* const gCum = s.ssmGCum.as<float>();
         float* const a0   = s.ssmA0.as<float>();
