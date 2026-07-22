@@ -139,6 +139,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _matmulQ8_0GemmV2Kernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ8_0MmqModule;
     ::mimirmind::core::cuda::CudaKernel _matmulQ8_0MmqKernel;
+    ::mimirmind::core::cuda::CudaModule _matmulQ4KMmqModule;
+    ::mimirmind::core::cuda::CudaKernel _matmulQ4KMmqKernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ8_0VecDp4aModule;
     ::mimirmind::core::cuda::CudaKernel _matmulQ8_0VecDp4aKernel;
     ::mimirmind::core::cuda::CudaModule _moeDownFusedKQ8_0Module;
@@ -177,6 +179,9 @@ struct GpuMatmul::Impl {
           _matmulQ8_0MmqModule    {loadCudaModule(ctx, "matmul_q8_0_mmq")},
           _matmulQ8_0MmqKernel    {
               _matmulQ8_0MmqModule.getFunction("matmul_q8_0_mmq")},
+          _matmulQ4KMmqModule     {loadCudaModule(ctx, "matmul_q4k_mmq")},
+          _matmulQ4KMmqKernel     {
+              _matmulQ4KMmqModule.getFunction("matmul_q4k_mmq")},
           _matmulQ8_0VecDp4aModule{loadCudaModule(ctx, "matmul_q8_0_vec_dp4a")},
           _matmulQ8_0VecDp4aKernel{
               _matmulQ8_0VecDp4aModule.getFunction("matmul_q8_0_vec_dp4a")},
@@ -222,6 +227,15 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
       _ops{ops},
       _pimpl{std::make_unique<Impl>(ctx.cudaContext())}
 {
+    // Value-aware so `env MIMIRMIND_MMQ=` (empty) reads as OFF — a bare
+    // presence check turns an empty A/B-baseline var into an accidental ON.
+    if (const char* mmq = std::getenv("MIMIRMIND_MMQ")) {
+        _mmqEnabled = (mmq[0] != '\0' && !(mmq[0] == '0' && mmq[1] == '\0'));
+    }
+    if (_mmqEnabled) {
+        MM_LOG_INFO("hip::GpuMatmul",
+                    "M-Cuda.MMQ enabled — Q8_0 prefill (M>1) uses int8 dp4a MMQ");
+    }
     MM_LOG_INFO("hip::GpuMatmul",
                 "compute::cuda::GpuMatmul ready — 12 kernels loaded "
                 "(Q8_0: vec / gemm / gemm_v2 / vec_dp4a / moe_down_fused_k; "
@@ -811,6 +825,14 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
     // `_useDp4a = false`, so an untuned dispatcher takes the safe
     // matvec-loop path even at Mmax. Same behaviour as L0.
 
+    if (_mmqEnabled && type == ::mimirmind::core::gguf::GgmlType::Q8_0
+        && M > 1) {
+        // M-Cuda.MMQ C1 — int8 dp4a MMQ GEMM for Q8_0 prefill (env-gated).
+        // Decode (M==1) falls through to the launch-bound-friendly GEMV path.
+        matmulQ8_0MmqAsync(W, N, K, X, M, Y);
+        return;
+    }
+
     if (_useDp4a) {
         // Quantise X → int8 into engine-owned scratch (allocated by the
         // caller through _ops), then DP4A-matvec. K must be a multiple
@@ -952,6 +974,33 @@ void GpuMatmul::matmulQ8_0MmqAsync(const void*  W,
     // Same launch geometry as the Q8_0 GEMM path (4 output cols/WG, M_TILE
     // rows/WG, 64 threads). Kernel arg order: X, W, Y, K, N, M.
     auto& kern = _pimpl->_matmulQ8_0MmqKernel;
+    kern.setPtr  (0, X);
+    kern.setPtr  (1, W);
+    kern.setPtr  (2, Y);
+    kern.setValue(3, static_cast<std::int32_t>(K));
+    kern.setValue(4, static_cast<std::int32_t>(N));
+    kern.setValue(5, static_cast<std::int32_t>(M));
+
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+    const std::uint32_t mGroups = static_cast<std::uint32_t>(
+        (M + kGemmV2MTile - 1) / kGemmV2MTile);
+    kern.launch(_ctx.stream(),
+                nGroups, mGroups, 1,
+                kLocalSize, 1, 1);
+}
+
+void GpuMatmul::matmulQ4KMmqAsync(const void*  W,
+                                  std::size_t  N,
+                                  std::size_t  K,
+                                  const float* X,
+                                  std::size_t  M,
+                                  float*       Y) {
+    if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
+    // Same launch geometry as the Q8_0 MMQ / GEMM path. Kernel args: X,W,Y,K,N,M.
+    auto& kern = _pimpl->_matmulQ4KMmqKernel;
     kern.setPtr  (0, X);
     kern.setPtr  (1, W);
     kern.setPtr  (2, Y);

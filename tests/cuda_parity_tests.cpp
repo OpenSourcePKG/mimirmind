@@ -669,6 +669,46 @@ TEST(cuda_matmul_q8_0_mmq_vs_fp32) {
     EXPECT_NEAR(relL2, 0.0, 0.05);     // int8-activation quant is lossy
 }
 
+// M-Cuda.MMQ B2: matmul_q4k_mmq (int8 dp4a GEMM) vs fp32 q4k_vec reference.
+// Q4_K affine dequant (a_j*nibble - b_j) folded into the int8 decomposition;
+// lossy (int8 activations) -> relative-L2 bound, not bit-exact.
+TEST(cuda_matmul_q4k_mmq_vs_fp32) {
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+
+    const std::size_t M = 10, N = 14, K = 512;      // K multiple of 256 (Q4_K)
+    const std::size_t blkBytes = 144, nSuper = K / 256;
+    auto W = buildQuantBank(ops, blkBytes, N * nSuper, 0x4B4Bu);
+    auto X = toDevice(ops, randVec(M * K, 0x5151u));
+
+    auto Yref    = ops.allocate(M * N * sizeof(float));
+    auto Ymmq    = ops.allocate(M * N * sizeof(float));
+    auto scratch = ops.allocate(std::max(N, K) * sizeof(float));
+
+    gmm.matmulAsync(GgmlType::Q4_K, W.get(), N, K,
+                    static_cast<const float*>(X.get()), M,
+                    static_cast<float*>(Yref.get()),
+                    static_cast<float*>(scratch.get()));
+    gmm.matmulQ4KMmqAsync(W.get(), N, K,
+                          static_cast<const float*>(X.get()), M,
+                          static_cast<float*>(Ymmq.get()));
+    ops.flush();
+
+    auto ref = fromDevice(ops, Yref.get(), M * N);
+    auto got = fromDevice(ops, Ymmq.get(), M * N);
+
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        const double d = static_cast<double>(got[i]) - static_cast<double>(ref[i]);
+        num += d * d;
+        den += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+    }
+    const double relL2 = (den > 0.0) ? std::sqrt(num / den) : std::sqrt(num);
+    EXPECT_TRUE(den > 0.0);
+    EXPECT_NEAR(relL2, 0.0, 0.05);
+}
+
 int main() {
     return mm::test::run();
 }

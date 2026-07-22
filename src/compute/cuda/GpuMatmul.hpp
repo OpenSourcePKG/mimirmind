@@ -155,6 +155,16 @@ public:
                             std::size_t  M,
                             float*       Y);
 
+    /// M-Cuda.MMQ B2 — Q4_K int8 quantized-matmul GEMM for prefill (M>1).
+    /// Q4_K has no CUDA GEMM otherwise (vec-only); this both tiles it and runs
+    /// the dot in int8. Affine per-sub-block dequant folded into the scale.
+    void matmulQ4KMmqAsync(const void*  W,
+                           std::size_t  N,
+                           std::size_t  K,
+                           const float* X,
+                           std::size_t  M,
+                           float*       Y);
+
     void sync() override;
 
     [[nodiscard]] std::vector<::mimirmind::compute::AutotuneReport>
@@ -237,6 +247,10 @@ private:
     std::size_t                    _gemmMinM{kGemmMinMNever};
     bool                           _useGemmV2{false};
     bool                           _useDp4a{false};
+    // M-Cuda.MMQ C1: MIMIRMIND_MMQ routes the Q8_0 prefill (M>1) matmul
+    // through the int8 dp4a MMQ GEMM instead of the fp32 gemm/matvec path.
+    // Decode (M==1) is unaffected. Default off until the prefill A/B lands.
+    bool                           _mmqEnabled{false};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
                                    _vecMsAtM{};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
