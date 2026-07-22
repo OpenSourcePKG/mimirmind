@@ -322,12 +322,12 @@ void deltanetChunkForward(const float* q,
     const std::size_t C = chunkSize ? chunkSize : 64;
 
     std::vector<float> s0(S * S);      // chunk-start state snapshot
-    std::vector<float> egc(C);         // exp(gCum_a)
-    std::vector<float> ieg(C);         // exp(-gCum_a)
+    std::vector<float> gc(C);          // raw gCum_a (chunk-local cumulative gate)
+    std::vector<float> egc(C);         // exp(gCum_a)  (<=1, gCum<=0 — stable)
     std::vector<float> u(C * S);       // (S0^T k_a)[j]
     std::vector<float> uq(C * S);      // (S0^T qs_a)[j]
     std::vector<float> qs(C * S);      // scaled query
-    std::vector<float> rp(C * S);      // exp(-gCum_m) r_m
+    std::vector<float> rp(C * S);      // r_m = beta_m (v_m - exp(gCum_m) u_m)
     std::vector<float> d(C * S);       // solved delta vectors
 
     for (std::size_t h = 0; h < H; ++h) {
@@ -340,10 +340,16 @@ void deltanetChunkForward(const float* q,
 
             std::copy(st, st + S * S, s0.begin());
 
+            // Keep the raw chunk-local cumulative gate gc[a] (<=0, monotone
+            // non-increasing) instead of its reciprocal exp(-gc[a]): the
+            // latter overflows to +inf when a single gate log is large
+            // (gLog reaches -91 in Qwen3-Next), and egc[a]*ieg[m] then
+            // evaluates 0*inf = nan even though the physical exp(gc[a]-gc[m])
+            // (a>=m, argument <=0) is finite. All decay factors below are
+            // therefore formed as exp(gc[a]-gc[m]) directly.
             for (std::size_t a = 0; a < cs; ++a) {
-                const float g = gCum[(c0 + a) * H + h];
-                egc[a] = std::exp(g);
-                ieg[a] = std::exp(-g);
+                gc[a]  = gCum[(c0 + a) * H + h];
+                egc[a] = std::exp(gc[a]);
             }
 
             // qs, u = S0^T k_a, uq = S0^T qs_a.
@@ -369,32 +375,32 @@ void deltanetChunkForward(const float* q,
                 }
             }
 
-            // r'_m = exp(-gCum_m) r_m,  r_m = beta_m (v_m - exp(gCum_m) u_m).
+            // r_m = beta_m (v_m - exp(gCum_m) u_m)  (no exp(-gCum_m) factor).
             for (std::size_t m = 0; m < cs; ++m) {
                 const float* vm = v + ((c0 + m) * H + h) * S;
                 const float  bm = beta[(c0 + m) * H + h];
                 const float* um = u.data() + m * S;
                 float* rpm = rp.data() + m * S;
                 for (std::size_t j = 0; j < S; ++j) {
-                    rpm[j] = ieg[m] * bm * (vm[j] - egc[m] * um[j]);
+                    rpm[j] = bm * (vm[j] - egc[m] * um[j]);
                 }
             }
 
-            // d_a = exp(gCum_a) * sum_{m<=a} a0[a,m] r'_m   (a0 lower-tri).
+            // d_a = sum_{m<=a} a0[a,m] exp(gCum_a-gCum_m) r_m   (a0 lower-tri).
+            // This equals the old exp(gCum_a)*sum a0[a,m] exp(-gCum_m) r_m but
+            // folds both exponentials into one non-positive exponent, so no
+            // isolated exp(-gCum) can overflow.
             for (std::size_t a = 0; a < cs; ++a) {
                 float* da = d.data() + a * S;
                 for (std::size_t j = 0; j < S; ++j) {
                     da[j] = 0.0F;
                 }
                 for (std::size_t m = 0; m <= a; ++m) {
-                    const float w = a0c[a * C + m];
+                    const float w = a0c[a * C + m] * std::exp(gc[a] - gc[m]);
                     const float* rpm = rp.data() + m * S;
                     for (std::size_t j = 0; j < S; ++j) {
                         da[j] += w * rpm[j];
                     }
-                }
-                for (std::size_t j = 0; j < S; ++j) {
-                    da[j] *= egc[a];
                 }
             }
 
@@ -413,7 +419,7 @@ void deltanetChunkForward(const float* q,
                     for (std::size_t i = 0; i < S; ++i) {
                         kq += km[i] * qsa[i];
                     }
-                    const float w   = egc[a] * ieg[m] * kq;
+                    const float w   = std::exp(gc[a] - gc[m]) * kq;
                     const float* dm = d.data() + m * S;
                     for (std::size_t j = 0; j < S; ++j) {
                         oa[j] += w * dm[j];
@@ -433,7 +439,7 @@ void deltanetChunkForward(const float* q,
             for (std::size_t m = 0; m < cs; ++m) {
                 const float* km = k + ((c0 + m) * H + h) * S;
                 const float* dm = d.data() + m * S;
-                const float  wm = eLast * ieg[m];
+                const float  wm = std::exp(gc[cs - 1] - gc[m]);
                 for (std::size_t i = 0; i < S; ++i) {
                     const float ki = km[i] * wm;
                     float* strow = st + i * S;

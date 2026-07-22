@@ -58,8 +58,8 @@ void deltanet_chunk_forward(
     float* rph = scratch + hss + 3 * hcs + static_cast<size_t>(h) * C * S;
     float* dh  = scratch + hss + 4 * hcs + static_cast<size_t>(h) * C * S;
 
-    __shared__ float egc[DELTANET_CHUNK_FWD_MAX_C];
-    __shared__ float ieg[DELTANET_CHUNK_FWD_MAX_C];
+    __shared__ float egc[DELTANET_CHUNK_FWD_MAX_C];  // exp(gCum) (<=1, stable)
+    __shared__ float gc[DELTANET_CHUNK_FWD_MAX_C];   // raw gCum (<=0)
     __shared__ float kqs[DELTANET_CHUNK_FWD_MAX_C * DELTANET_CHUNK_FWD_MAX_C];
     __shared__ float red[DELTANET_CHUNK_FWD_MAX_S];
 
@@ -71,9 +71,12 @@ void deltanet_chunk_forward(
         // Snapshot chunk-start state (column j across all rows).
         for (int i = 0; i < S; ++i) s0[i * S + j] = st[i * S + j];
         if (j < cs) {
+            // Keep raw gCum (<=0); exp(-gCum) alone overflows to +inf for
+            // large gate logs and egc*ieg then gives 0*inf=nan. All decays
+            // below are formed as exp(gc[a]-gc[m]) (a>=m -> exponent <=0).
             const float g = gCum[(c0 + j) * H + h];
+            gc[j]  = g;
             egc[j] = __expf(g);
-            ieg[j] = __expf(-g);
         }
         __syncthreads();
 
@@ -97,15 +100,16 @@ void deltanet_chunk_forward(
         for (int m = 0; m < cs; ++m) {
             const float* vm = v + (static_cast<size_t>(c0 + m) * H + h) * S;
             const float  bm = beta[(c0 + m) * H + h];
-            rph[m * S + j] = ieg[m] * bm * (vm[j] - egc[m] * uh[m * S + j]);
+            rph[m * S + j] = bm * (vm[j] - egc[m] * uh[m * S + j]);
         }
         __syncthreads();
 
         // Step 4: d_a = exp(G_a) * sum_{m<=a} a0[a,m] r'_m.
         for (int a = 0; a < cs; ++a) {
             float dj = 0.0f;
-            for (int m = 0; m <= a; ++m) dj += a0c[a * C + m] * rph[m * S + j];
-            dh[a * S + j] = dj * egc[a];
+            for (int m = 0; m <= a; ++m)
+                dj += a0c[a * C + m] * __expf(gc[a] - gc[m]) * rph[m * S + j];
+            dh[a * S + j] = dj;
         }
         __syncthreads();
 
@@ -129,7 +133,7 @@ void deltanet_chunk_forward(
             float* oa = out + (static_cast<size_t>(c0 + a) * H + h) * S;
             float oj = egc[a] * uqh[a * S + j];
             for (int m = 0; m <= a; ++m) {
-                const float w = egc[a] * ieg[m] * kqs[a * C + m];
+                const float w = __expf(gc[a] - gc[m]) * kqs[a * C + m];
                 oj += w * dh[m * S + j];
             }
             oa[j] = oj;
@@ -143,7 +147,7 @@ void deltanet_chunk_forward(
             float sij = eLast * s0[i * S + j];
             for (int m = 0; m < cs; ++m) {
                 const float* km = k + (static_cast<size_t>(c0 + m) * H + h) * S;
-                sij += (eLast * ieg[m] * km[i]) * dh[m * S + j];
+                sij += (__expf(gc[cs - 1] - gc[m]) * km[i]) * dh[m * S + j];
             }
             st[i * S + j] = sij;
         }
