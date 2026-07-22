@@ -647,14 +647,30 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
             _gmm.matmulDp4aAsync(downShexp.type, xq, xs, downShexp.usmPtr,
                                  d_model, n_ff_shexp, 1, expertOutBuf);
         } else {
-            {
-                compute::UnorderedScope u{_ops};
-                _gmm.matmulAsync(gateShexp.type, gateShexp.usmPtr, n_ff_shexp, d_model,
-                                 moeInput, T, gateOutBuf, matmulScratch);
-                _gmm.matmulAsync(upShexp->type, upShexp->usmPtr, n_ff_shexp, d_model,
-                                 moeInput, T, upOutBuf, matmulScratch);
+            // gate/up -> silu(gate)*up into gateOutBuf. At T=1 decode a
+            // single fused Q8_0 kernel does gate+up+silu (launch reduction);
+            // otherwise the two-matmul + siluMul path.
+            const bool shexpFusedGu =
+                T == 1 &&
+                gateShexp.type == core::gguf::GgmlType::Q8_0 &&
+                upShexp->type  == core::gguf::GgmlType::Q8_0 &&
+                _gmm.ffnGateUpFusedQ8Available() &&
+                (d_model % 32 == 0);
+
+            if (shexpFusedGu) {
+                _gmm.ffnGateUpFusedQ8Async(moeInput, gateShexp.usmPtr,
+                                           upShexp->usmPtr, gateOutBuf,
+                                           d_model, n_ff_shexp);
+            } else {
+                {
+                    compute::UnorderedScope u{_ops};
+                    _gmm.matmulAsync(gateShexp.type, gateShexp.usmPtr, n_ff_shexp, d_model,
+                                     moeInput, T, gateOutBuf, matmulScratch);
+                    _gmm.matmulAsync(upShexp->type, upShexp->usmPtr, n_ff_shexp, d_model,
+                                     moeInput, T, upOutBuf, matmulScratch);
+                }
+                _ops.siluMulAsync(gateOutBuf, upOutBuf, T * n_ff_shexp);
             }
-            _ops.siluMulAsync(gateOutBuf, upOutBuf, T * n_ff_shexp);
             _gmm.matmulAsync(downShexp.type, downShexp.usmPtr, d_model, n_ff_shexp,
                              gateOutBuf, T, expertOutBuf, matmulScratch);
         }

@@ -147,6 +147,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _moeDownFusedKQ5KKernel;
     ::mimirmind::core::cuda::CudaModule _moeGateUpFusedKQ4KModule;
     ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKQ4KKernel;
+    ::mimirmind::core::cuda::CudaModule _ffnGateUpFusedQ8Module;
+    ::mimirmind::core::cuda::CudaKernel _ffnGateUpFusedQ8Kernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ5_0VecModule;
     ::mimirmind::core::cuda::CudaKernel _matmulQ5_0VecKernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ6KVecModule;
@@ -185,6 +187,9 @@ struct GpuMatmul::Impl {
           _moeGateUpFusedKQ4KModule{loadCudaModule(ctx, "moe_gate_up_fused_k_q4k")},
           _moeGateUpFusedKQ4KKernel{
               _moeGateUpFusedKQ4KModule.getFunction("moe_gate_up_fused_k_q4k")},
+          _ffnGateUpFusedQ8Module{loadCudaModule(ctx, "ffn_gate_up_fused_q8_0")},
+          _ffnGateUpFusedQ8Kernel{
+              _ffnGateUpFusedQ8Module.getFunction("ffn_gate_up_fused_q8_0")},
           _matmulQ5_0VecModule    {loadCudaModule(ctx, "matmul_q5_0_vec")},
           _matmulQ5_0VecKernel    {
               _matmulQ5_0VecModule.getFunction("matmul_q5_0_vec")},
@@ -260,6 +265,10 @@ bool GpuMatmul::moeDownFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
 bool GpuMatmul::moeGateUpFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
     const noexcept {
     return type == ::mimirmind::core::gguf::GgmlType::Q4_K;
+}
+
+bool GpuMatmul::ffnGateUpFusedQ8Available() const noexcept {
+    return true;
 }
 
 void GpuMatmul::sync() {
@@ -1048,6 +1057,38 @@ void GpuMatmul::moeGateUpFusedKAsync(::mimirmind::core::gguf::GgmlType type,
     kern.launch(_ctx.stream(),
                 nGroups, 1, 1,
                 kMoeGateUpLocalSize, 1, 1);
+}
+
+void GpuMatmul::ffnGateUpFusedQ8Async(const float* x,
+                                      const void*  Wg,
+                                      const void*  Wu,
+                                      float*       Y,
+                                      std::size_t  dModel,
+                                      std::size_t  nFf) {
+    if (dModel == 0 || nFf == 0) {
+        return;
+    }
+    if (dModel % 32 != 0) {
+        throw std::runtime_error(
+            "compute::cuda::GpuMatmul::ffnGateUpFusedQ8Async: dModel=" +
+            std::to_string(dModel) +
+            " is not a multiple of Q8_0 blockElements=32");
+    }
+
+    auto& kern = _pimpl->_ffnGateUpFusedQ8Kernel;
+    kern.setPtr  (0, x);
+    kern.setPtr  (1, Wg);
+    kern.setPtr  (2, Wu);
+    kern.setPtr  (3, Y);
+    kern.setValue(4, static_cast<std::int32_t>(dModel));   // K
+    kern.setValue(5, static_cast<std::int32_t>(nFf));      // N
+
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (nFf + kFfnGuQ8OutputsPerGroup - 1) / kFfnGuQ8OutputsPerGroup);
+
+    kern.launch(_ctx.stream(),
+                nGroups, 1, 1,
+                kFfnGuQ8LocalSize, 1, 1);
 }
 
 } // namespace mimirmind::compute::cuda

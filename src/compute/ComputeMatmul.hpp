@@ -183,6 +183,25 @@ public:
     [[nodiscard]] virtual bool moeGateUpFusedKAvailable(
         core::gguf::GgmlType /*type*/) const noexcept { return false; }
 
+    /// Fused dense FFN gate+up projection (Q8_0) for T=1 decode:
+    ///   Y[n] = silu(sum_k Wg[n,k]*x[k]) * (sum_k Wu[n,k]*x[k])
+    /// One launch replacing 2 GEMVs + silu_mul (Qwen3-Next shared expert).
+    /// Default: unsupported. CUDA overrides.
+    virtual void ffnGateUpFusedQ8Async(const float* x,
+                                       const void*  Wg,
+                                       const void*  Wu,
+                                       float*       Y,
+                                       std::size_t  dModel,
+                                       std::size_t  nFf) {
+        (void)x; (void)Wg; (void)Wu; (void)Y; (void)dModel; (void)nFf;
+        throw std::runtime_error(
+            "ffnGateUpFusedQ8Async: not supported on this backend");
+    }
+
+    [[nodiscard]] virtual bool ffnGateUpFusedQ8Available() const noexcept {
+        return false;
+    }
+
     /// Flush any pending appends. Safe to call when there's no
     /// pending work — cheap no-op.
     virtual void sync() = 0;
