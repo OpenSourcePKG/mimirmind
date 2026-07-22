@@ -17,6 +17,7 @@
 #include "model/Tokenizer.hpp"
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
+#include "runtime/SsmState.hpp"
 #include "runtime/perf/OpProfiler.hpp"
 
 // L0-native includes are only pulled in when the L0 backend is
@@ -560,6 +561,11 @@ private:
     // sits in the cache so the next generate() can compute the LCP.
     std::unique_ptr<KvCache>           _kvCache;
     std::optional<BlockBuffers>        _blockBuffers;
+    // Per-sequence GatedDeltaNet recurrent state (hybrid-recurrent models
+    // only). Allocated once beside _kvCache; persists across forward calls
+    // and BlockBuffers reallocations. Its pointers are bound into
+    // _blockBuffers after each scratch (re)allocation.
+    std::unique_ptr<SsmState>          _ssmState;
 
     // --- M-Startup.CapacityProbe ---------------------------------------
     // Populated in finalizeLoad() once weights are on the device.

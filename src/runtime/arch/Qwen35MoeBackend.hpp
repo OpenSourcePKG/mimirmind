@@ -91,8 +91,9 @@ private:
 
     /// GatedDeltaNet linear-attention layer forward (M-Q3N.3.2). Runs the
     /// conv1d → delta-rule recurrence → gated norm → out projection, then
-    /// the shared MoE FFN. `s.ssmState` is zero-initialised per call
-    /// (prefill scope); cross-decode-step persistence lands later.
+    /// the shared MoE FFN. The recurrent state (s.ssmStatePtr /
+    /// ssmConvStatePtr) is per-sequence (owned by SsmState) and persists
+    /// across decode steps; it is zeroed at sequence start (cache.length()==0).
     void runLinearBlock(std::size_t   blockIdx,
                         float*        x,
                         std::size_t   T,

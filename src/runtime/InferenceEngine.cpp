@@ -839,6 +839,24 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
                     _maxContextTokens, dtypeLabel);
     }
 
+    // Per-sequence GatedDeltaNet recurrent state (hybrid-recurrent models
+    // only). Like the KvCache, allocated once — its size is
+    // context-length-independent — and it lives here rather than inside the
+    // transient BlockBuffers so it survives scratch reallocation and can
+    // become one-per-sequence for multi-tenant serving.
+    if (_ssmState == nullptr && _backend->needsSsmScratch()) {
+        _ssmState = std::make_unique<SsmState>(
+            *_ops, _config.blockCount,
+            _config.ssmStateElemsPerLayer(),
+            _config.ssmConvStateElemsPerLayer());
+        MM_LOG_INFO("ssmstate",
+                    "pre-allocated per-sequence GatedDeltaNet state "
+                    "({} layers, {}+{} elems/layer)",
+                    _config.blockCount,
+                    _config.ssmStateElemsPerLayer(),
+                    _config.ssmConvStateElemsPerLayer());
+    }
+
     // Hard cap: a request that doesn't fit gets a clear error rather
     // than silently overflowing the cache. Operator can raise
     // `runtime.maxContextTokens` in config.json if the workload needs it.
@@ -881,6 +899,14 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
                                       withKvFp32Scratch,
                                       withQGate,
                                       withSsm);
+
+    // Bind the per-sequence SSM state into the freshly (re)allocated
+    // scratch. The SsmState itself is stable across BlockBuffers reallocs;
+    // only the BlockBuffers pointers need re-pointing here.
+    if (_ssmState != nullptr) {
+        _blockBuffers->ssmStatePtr     = _ssmState->statePtr();
+        _blockBuffers->ssmConvStatePtr = _ssmState->convStatePtr();
+    }
 
     _xBufH      = _ops->allocate(maxT      * d_model  * sizeof(float));
     _normFinalH = _ops->allocate(d_model   * sizeof(float));

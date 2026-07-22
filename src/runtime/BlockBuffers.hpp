@@ -93,9 +93,9 @@ struct BlockBuffers {
     // allocated for hybrid-recurrent models. Sizes derive from the SSM
     // hyperparameters: conv_dim = ssmConvDim(), value_dim = ssmInnerSize
     // (= H_v*S), H_v = ssmNumVHeads(), S = ssmStateSize, d_conv =
-    // ssmConvKernel. `ssmState` holds the [H_v, S, S] recurrent state; for
-    // M-Q3N.3.2b it is zero-initialised per forward (prefill scope) — a
-    // persistent across-decode-step pool lands with the decode path.
+    // ssmConvKernel. These are all transient per-forward scratch; the
+    // persistent recurrent state lives in a per-sequence SsmState and is
+    // reached via the ssmStatePtr / ssmConvStatePtr pointers below.
     ComputeBuffer ssmQkvMixed;   // [maxT, conv_dim]  (also reused as conv out)
     ComputeBuffer ssmConvInput;  // [(d_conv-1)+maxT, conv_dim]
     ComputeBuffer ssmZ;          // [maxT, value_dim]  (output gate z)
@@ -106,15 +106,17 @@ struct BlockBuffers {
     ComputeBuffer ssmAlpha;      // [maxT, H_v]
     ComputeBuffer ssmBeta;       // [maxT, H_v]
     ComputeBuffer ssmGate;       // [maxT, H_v]        (gLog)
-    // Persistent per-linear-layer recurrent state, indexed by blockIdx:
-    // ssmState  = [blockCount, H_v*S*S]  (delta-net [S,S] state per v-head)
-    // ssmConvStateBuf = [blockCount, (d_conv-1)*conv_dim]  (rolling conv tail)
-    // Both survive across forward calls (the engine reuses one BlockBuffers
-    // for a sequence) and are zero-initialised only at sequence start
-    // (curLen == 0), so decode steps carry the state forward. Single-sequence
-    // scope; multi-tenant serving needs per-sequence instances (like KvCache).
-    ComputeBuffer ssmState;         // [blockCount, H_v*S*S]
-    ComputeBuffer ssmConvStateBuf;  // [blockCount, (d_conv-1)*conv_dim]
+    // Persistent per-linear-layer recurrent state. This is NOT owned here
+    // anymore — it lives in a per-sequence SsmState object (owned by
+    // InferenceEngine, lifecycle like KvCache) so it survives BlockBuffers
+    // reallocations and can become one-per-sequence for multi-tenant
+    // serving. The engine binds these raw pointers after each BlockBuffers
+    // (re)allocation. Indexed by blockIdx:
+    //   ssmStatePtr[blockIdx * stateElemsPerLayer]      = delta-net [S,S] state
+    //   ssmConvStatePtr[blockIdx * convStateElemsPerLayer] = rolling conv tail
+    // nullptr for non-recurrent models (never dereferenced there).
+    float* ssmStatePtr     = nullptr;  // -> SsmState::statePtr()
+    float* ssmConvStatePtr = nullptr;  // -> SsmState::convStatePtr()
 
     // M-MoE.Fused-Decode — per-layer routing scratches for the fused-K
     // down kernel. The command queue records dispatches lazily, so the

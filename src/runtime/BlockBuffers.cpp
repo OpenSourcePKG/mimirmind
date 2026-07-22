@@ -80,7 +80,6 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         const std::size_t valueDim  = config.ssmInnerSize;   // = H_v * S
         const std::size_t hV        = config.ssmNumVHeads();
         const std::size_t dConv     = config.ssmConvKernel;
-        const std::size_t stateElems = config.ssmStateElemsPerLayer();
         const std::size_t f = sizeof(float);
 
         b.ssmQkvMixed  = ops.allocate(maxT * convDim * f);
@@ -93,12 +92,10 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         b.ssmAlpha     = ops.allocate(maxT * hV * f);
         b.ssmBeta      = ops.allocate(maxT * hV * f);
         b.ssmGate      = ops.allocate(maxT * hV * f);
-        // Persistent per-layer state, indexed by blockIdx (full-attn slots
-        // stay unused but keep indexing trivial).
-        const std::size_t nBlk       = config.blockCount;
-        const std::size_t convStateE = config.ssmConvStateElemsPerLayer();
-        b.ssmState        = ops.allocate(nBlk * stateElems * f);
-        b.ssmConvStateBuf = ops.allocate(nBlk * convStateE * f);
+        // The persistent recurrent state (ssmStatePtr / ssmConvStatePtr) is
+        // NOT allocated here — it lives in a per-sequence SsmState object
+        // that the engine binds after this allocation. Only the transient
+        // per-forward scratch above is owned by BlockBuffers.
     }
 
     if (withKvFp32Scratch) {

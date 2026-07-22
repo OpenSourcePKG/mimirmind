@@ -311,8 +311,11 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     float* const alphaBuf  = s.ssmAlpha.as<float>();
     float* const betaBuf   = s.ssmBeta.as<float>();
     float* const gateBuf   = s.ssmGate.as<float>();
-    float* const stateBuf  = s.ssmState.as<float>()        + blockIdx * stateElems;
-    float* const convState = s.ssmConvStateBuf.as<float>() + blockIdx * convStateElems;
+    // Persistent per-sequence recurrent state, bound by the engine into
+    // BlockBuffers from the per-sequence SsmState (survives BlockBuffers
+    // reallocation); indexed by blockIdx.
+    float* const stateBuf  = s.ssmStatePtr     + blockIdx * stateElems;
+    float* const convState = s.ssmConvStatePtr + blockIdx * convStateElems;
     float* const projOut   = s.projOut.as<float>();
     float* const matmulScr = s.matmulScratch.as<float>();
 

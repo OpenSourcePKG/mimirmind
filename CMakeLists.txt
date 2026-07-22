@@ -838,6 +838,7 @@ add_executable(mimirmind
     src/runtime/BlockBuffers.cpp
     src/runtime/InferenceEngine.cpp
     src/runtime/KvCache.cpp
+    src/runtime/SsmState.cpp
     src/runtime/perf/OpProfiler.cpp
     src/runtime/perf/PerfRegressionDetector.cpp
     src/runtime/spec/ModelDrafter.cpp
