@@ -119,6 +119,17 @@ private:
     bool _moeGroupEnabled;
     bool _moeFusedDownEnabled;
 
+    // Diagnostic: when MIMIRMIND_SSM_TRACE is set, log per-linear-layer
+    // recurrent-state / output norms and per-block residual-stream norms
+    // each forward. Localises the M-Q3N.3 length-degeneration bug (state
+    // saturation) without an external reference. No-op / zero cost when off.
+    bool _ssmTrace{false};
+
+    /// Host-side L2 norm + max|.| of a compute buffer, after a sync. Only
+    /// called on the diagnostic trace path.
+    void traceNorm(const char* tag, std::size_t blockIdx,
+                   std::size_t pos, const float* p, std::size_t n) const;
+
     // IMRoPE dimension sections (config.ropeSections), padded to 4 int32
     // so the op always receives a valid 4-element pointer. Zeroed when the
     // model ships no sections (degenerates to plain RoPE).

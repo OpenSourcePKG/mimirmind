@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -50,6 +51,7 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
       _ops{ops}, _gmm{gmm}, _op{opProfiler},
       _moeGroupEnabled{moeGroupEnabled},
       _moeFusedDownEnabled{moeFusedDownEnabled} {
+    _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     for (std::size_t i = 0; i < 4; ++i) {
         _ropeSections[i] = i < _config.ropeSections.size()
                                ? _config.ropeSections[i]
@@ -91,6 +93,21 @@ bool Qwen35MoeBackend::needsSsmScratch() const noexcept {
     return _config.isHybridRecurrent();
 }
 
+void Qwen35MoeBackend::traceNorm(const char* tag, std::size_t blockIdx,
+                                 std::size_t pos, const float* p,
+                                 std::size_t n) const {
+    _gmm.sync();  // p is a unified-memory pointer; readable after sync.
+    double sumSq = 0.0;
+    float  maxAbs = 0.0F;
+    for (std::size_t i = 0; i < n; ++i) {
+        const float v = p[i];
+        sumSq += static_cast<double>(v) * static_cast<double>(v);
+        maxAbs = std::fmax(maxAbs, std::fabs(v));
+    }
+    MM_LOG_INFO("ssm-trace", "pos={} blk={} {} l2={:.5g} max={:.5g}",
+                pos, blockIdx, tag, std::sqrt(sumSq), maxAbs);
+}
+
 void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
                                 float*        x,
                                 std::size_t   T,
@@ -103,6 +120,13 @@ void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
         runLinearBlock(blockIdx, x, T, cache, s, diag);
     } else {
         runFullAttentionBlock(blockIdx, x, T, cache, s, diag);
+    }
+
+    if (_ssmTrace) {
+        const std::size_t pos = cache.length() + (T > 0 ? T - 1 : 0);
+        const char* kind = _config.isRecurrentLayer(blockIdx) ? "xout(lin)"
+                                                              : "xout(full)";
+        traceNorm(kind, blockIdx, pos, x, T * s.d_model);
     }
 }
 
@@ -356,6 +380,15 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     }
     _ops.gatedDeltaNetRecurrentAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
                                      stateBuf, deltaOut, T, hV, S);
+
+    if (_ssmTrace) {
+        // For T>1 (prefill) the state reflects the last token; for decode
+        // (T==1) cache.length() is the position of the token just added.
+        const std::size_t pos = cache.length() + (T > 0 ? T - 1 : 0);
+        traceNorm("gate",  blockIdx, pos, gateBuf, T * hV);
+        traceNorm("state", blockIdx, pos, stateBuf, stateElems);
+        traceNorm("dnet",  blockIdx, pos, deltaOut, T * valueDim);
+    }
 
     // --- gated output norm: ssm_norm(out) * silu(z) ------------------
     // rmsNorm(out) over head_dim -> qBuf (reused as norm buffer), then
