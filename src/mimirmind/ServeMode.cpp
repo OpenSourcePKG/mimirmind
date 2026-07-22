@@ -240,7 +240,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         }
 
         const auto& arch = e->config().architecture;
-        if (arch != "qwen2" && arch != "gemma4") {
+        if (arch != "qwen2" && arch != "gemma4" && arch != "qwen35moe") {
             const std::string msg =
                 "serve: architecture '" + arch + "' (model id '" + m.id +
                 "') is not implemented yet. See "
