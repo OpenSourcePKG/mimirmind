@@ -1088,6 +1088,98 @@ TEST(gdn_l2Norm_unitAndEpsFloor) {
     EXPECT_NEAR(x[3], 0.0F, 1e-6F);
 }
 
+ // ---------------------------------------------------------------------------
+// gatedDeltaNetChunk — the chunked prefill algebra must reproduce the
+// autoregressive golden reference (out + carried state) for any chunk size.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Deterministic reproducible inputs. A tiny LCG keeps the test dependency-free
+// and identical across runs; values are scaled small so the recurrent state
+// stays bounded over long sequences.
+struct GdnCase {
+    std::size_t T, H, S;
+    std::vector<float> q, k, v, gLog, beta, state0;
+};
+
+GdnCase makeGdnCase(std::size_t T, std::size_t H, std::size_t S,
+                    std::uint32_t seed, bool nonzeroState) {
+    std::uint32_t rng = seed ? seed : 1U;
+    auto next = [&rng]() {
+        rng = rng * 1664525U + 1013904223U;
+        return static_cast<float>((rng >> 8) & 0xFFFFFFU) / 16777216.0F; // [0,1)
+    };
+    auto sym = [&next]() { return next() * 2.0F - 1.0F; };               // [-1,1)
+
+    GdnCase c{T, H, S, {}, {}, {}, {}, {}, {}};
+    c.q.resize(T * H * S);
+    c.k.resize(T * H * S);
+    c.v.resize(T * H * S);
+    c.gLog.resize(T * H);
+    c.beta.resize(T * H);
+    c.state0.resize(H * S * S);
+
+    for (auto& x : c.q) x = sym() * 0.5F;
+    for (auto& x : c.k) x = sym() * 0.5F;
+    for (auto& x : c.v) x = sym() * 0.5F;
+    // gLog < 0 (genuine decay, exp in (0,1)); beta in (0,1) like sigmoid.
+    for (auto& x : c.gLog) x = -(0.02F + next() * 0.6F);
+    for (auto& x : c.beta) x = 0.1F + next() * 0.8F;
+    for (auto& x : c.state0) x = nonzeroState ? sym() * 0.2F : 0.0F;
+    return c;
+}
+
+// Max abs deviation of chunk vs recurrent for a given chunk size.
+void expectChunkMatchesRecurrent(const GdnCase& c, std::size_t chunkSize,
+                                 float tol) {
+    using namespace mimirmind::compute;
+    std::vector<float> outRef(c.T * c.H * c.S), stRef = c.state0;
+    std::vector<float> outChk(c.T * c.H * c.S), stChk = c.state0;
+
+    gatedDeltaNetRecurrent(c.q.data(), c.k.data(), c.v.data(), c.gLog.data(),
+                           c.beta.data(), stRef.data(), outRef.data(),
+                           c.T, c.H, c.S);
+    gatedDeltaNetChunk(c.q.data(), c.k.data(), c.v.data(), c.gLog.data(),
+                       c.beta.data(), stChk.data(), outChk.data(),
+                       c.T, c.H, c.S, chunkSize);
+
+    for (std::size_t i = 0; i < outRef.size(); ++i) {
+        EXPECT_NEAR(outChk[i], outRef[i], tol);
+    }
+    for (std::size_t i = 0; i < stRef.size(); ++i) {
+        EXPECT_NEAR(stChk[i], stRef[i], tol);
+    }
+}
+
+} // namespace
+
+TEST(gdn_chunk_matchesRecurrent_multiChunk_zeroState) {
+    // T=200, C=64 → 3 full chunks + a 8-token tail; exercises the inter-chunk
+    // state recurrence from a zero start.
+    const auto c = makeGdnCase(/*T=*/200, /*H=*/2, /*S=*/8, /*seed=*/12345,
+                               /*nonzeroState=*/false);
+    expectChunkMatchesRecurrent(c, /*chunkSize=*/64, /*tol=*/2e-3F);
+}
+
+TEST(gdn_chunk_matchesRecurrent_nonzeroInitialState) {
+    // A non-zero incoming state must be carried through S0 correctly — the
+    // inter-chunk term exp(G) * S0 in both output and update.
+    const auto c = makeGdnCase(/*T=*/150, /*H=*/2, /*S=*/8, /*seed=*/777,
+                               /*nonzeroState=*/true);
+    expectChunkMatchesRecurrent(c, /*chunkSize=*/64, /*tol=*/2e-3F);
+}
+
+TEST(gdn_chunk_chunkSizeInvariant) {
+    // The result is independent of chunk size: C=1 (degenerates to the
+    // recurrence), C=7 (non-divisor of T), C=64, C>=T (single chunk).
+    const auto c = makeGdnCase(/*T=*/97, /*H=*/3, /*S=*/6, /*seed=*/2024,
+                               /*nonzeroState=*/true);
+    expectChunkMatchesRecurrent(c, /*chunkSize=*/1,   /*tol=*/2e-3F);
+    expectChunkMatchesRecurrent(c, /*chunkSize=*/7,   /*tol=*/2e-3F);
+    expectChunkMatchesRecurrent(c, /*chunkSize=*/64,  /*tol=*/2e-3F);
+    expectChunkMatchesRecurrent(c, /*chunkSize=*/128, /*tol=*/2e-3F);
+}
+
 int main() {
     return mm::test::run();
 }

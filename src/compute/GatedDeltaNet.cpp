@@ -3,6 +3,7 @@
 
 #include "compute/GatedDeltaNet.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -78,6 +79,157 @@ void gatedDeltaNetRecurrent(const float* q,
                 const float* srow = s + i * S;
                 for (std::size_t j = 0; j < S; ++j) {
                     ot[j] += srow[j] * qi;
+                }
+            }
+        }
+    }
+}
+
+void gatedDeltaNetChunk(const float* q,
+                        const float* k,
+                        const float* v,
+                        const float* gLog,
+                        const float* beta,
+                        float*       state,
+                        float*       out,
+                        std::size_t  T,
+                        std::size_t  H,
+                        std::size_t  S,
+                        std::size_t  chunkSize) {
+    const float qScale = 1.0F / std::sqrt(static_cast<float>(S));
+    if (chunkSize == 0) {
+        chunkSize = 64;
+    }
+    const std::size_t C = chunkSize;
+
+    // Per-chunk / per-head scratch, all sized for the maximum chunk width.
+    std::vector<float> s0(S * S);      // chunk-start state snapshot [i*S + j]
+    std::vector<float> gcum(C);        // cumulative log-decay within chunk
+    std::vector<float> egc(C);         // exp(gcum)
+    std::vector<float> u(C * S);       // (S0^T k_a)[j]        row a
+    std::vector<float> uq(C * S);      // (S0^T qs_a)[j]       row a
+    std::vector<float> qs(C * S);      // scaled query         row a
+    std::vector<float> amat(C * C);    // strict-lower gated Gram A[a,m]
+    std::vector<float> kq(C * C);      // (k_m . qs_a)         [a*C + m]
+    std::vector<float> d(C * S);       // solved delta vectors row a
+
+    for (std::size_t h = 0; h < H; ++h) {
+        float* st = state + h * S * S;
+
+        for (std::size_t c0 = 0; c0 < T; c0 += C) {
+            const std::size_t cs = std::min(C, T - c0);   // this chunk's width
+
+            // Snapshot the chunk-start state: both the RHS and the readout
+            // reference S0 while the update below overwrites `st`.
+            std::copy(st, st + S * S, s0.begin());
+
+            // Cumulative (inclusive) log-decay and its exp within the chunk.
+            float run = 0.0F;
+            for (std::size_t a = 0; a < cs; ++a) {
+                run += gLog[(c0 + a) * H + h];
+                gcum[a] = run;
+                egc[a]  = std::exp(run);
+            }
+
+            // Per-token: scaled query, u = S0^T k_a, uq = S0^T qs_a.
+            for (std::size_t a = 0; a < cs; ++a) {
+                const float* qa = q + ((c0 + a) * H + h) * S;
+                const float* ka = k + ((c0 + a) * H + h) * S;
+                float* qsa = qs.data() + a * S;
+                float* ua  = u.data() + a * S;
+                float* uqa = uq.data() + a * S;
+                for (std::size_t j = 0; j < S; ++j) {
+                    qsa[j] = qa[j] * qScale;
+                    ua[j]  = 0.0F;
+                    uqa[j] = 0.0F;
+                }
+                for (std::size_t i = 0; i < S; ++i) {
+                    const float ki   = ka[i];
+                    const float qsi  = qsa[i];
+                    const float* row = s0.data() + i * S;
+                    for (std::size_t j = 0; j < S; ++j) {
+                        ua[j]  += row[j] * ki;
+                        uqa[j] += row[j] * qsi;
+                    }
+                }
+            }
+
+            // Gram-derived matrices: A[a,m] = beta_a (k_a.k_m) exp(G_a-G_m)
+            // strictly below the diagonal; kq[a,m] = (k_m . qs_a).
+            for (std::size_t a = 0; a < cs; ++a) {
+                const float* ka = k + ((c0 + a) * H + h) * S;
+                const float* qsa = qs.data() + a * S;
+                const float  ba = beta[(c0 + a) * H + h];
+                for (std::size_t m = 0; m < cs; ++m) {
+                    const float* km = k + ((c0 + m) * H + h) * S;
+                    float kk = 0.0F;
+                    float kqv = 0.0F;
+                    for (std::size_t i = 0; i < S; ++i) {
+                        kk  += ka[i] * km[i];
+                        kqv += km[i] * qsa[i];
+                    }
+                    kq[a * C + m] = kqv;
+                    amat[a * C + m] =
+                        (m < a) ? ba * kk * std::exp(gcum[a] - gcum[m]) : 0.0F;
+                }
+            }
+
+            // Forward-substitution solve of (I + A) d = r, r_a = beta_a
+            // (v_a - exp(G_a) u_a). (I + A) is unit lower-triangular.
+            for (std::size_t a = 0; a < cs; ++a) {
+                const float* va = v + ((c0 + a) * H + h) * S;
+                const float  ba = beta[(c0 + a) * H + h];
+                const float* ua = u.data() + a * S;
+                float* da = d.data() + a * S;
+                for (std::size_t j = 0; j < S; ++j) {
+                    da[j] = ba * (va[j] - egc[a] * ua[j]);
+                }
+                for (std::size_t m = 0; m < a; ++m) {
+                    const float amm = amat[a * C + m];
+                    const float* dm = d.data() + m * S;
+                    for (std::size_t j = 0; j < S; ++j) {
+                        da[j] -= amm * dm[j];
+                    }
+                }
+            }
+
+            // Output: o_a = exp(G_a) uq_a + sum_{m<=a} exp(G_a-G_m)(k_m.qs_a) d_m.
+            for (std::size_t a = 0; a < cs; ++a) {
+                float* oa = out + ((c0 + a) * H + h) * S;
+                const float* uqa = uq.data() + a * S;
+                for (std::size_t j = 0; j < S; ++j) {
+                    oa[j] = egc[a] * uqa[j];
+                }
+                for (std::size_t m = 0; m <= a; ++m) {
+                    const float w  = std::exp(gcum[a] - gcum[m]) * kq[a * C + m];
+                    const float* dm = d.data() + m * S;
+                    for (std::size_t j = 0; j < S; ++j) {
+                        oa[j] += w * dm[j];
+                    }
+                }
+            }
+
+            // Carry the state: S' = exp(G_{cs-1}) S0
+            //                       + sum_m exp(G_{cs-1}-G_m) k_m d_m^T.
+            const float gLast = gcum[cs - 1];
+            const float eLast = std::exp(gLast);
+            for (std::size_t i = 0; i < S; ++i) {
+                const float* s0row = s0.data() + i * S;
+                float* strow = st + i * S;
+                for (std::size_t j = 0; j < S; ++j) {
+                    strow[j] = eLast * s0row[j];
+                }
+            }
+            for (std::size_t m = 0; m < cs; ++m) {
+                const float* km = k + ((c0 + m) * H + h) * S;
+                const float* dm = d.data() + m * S;
+                const float  wm = std::exp(gLast - gcum[m]);
+                for (std::size_t i = 0; i < S; ++i) {
+                    const float ki = km[i] * wm;
+                    float* strow = st + i * S;
+                    for (std::size_t j = 0; j < S; ++j) {
+                        strow[j] += ki * dm[j];
+                    }
                 }
             }
         }

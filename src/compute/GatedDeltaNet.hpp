@@ -59,6 +59,46 @@ void gatedDeltaNetRecurrent(const float* q,
                             std::size_t  H,
                             std::size_t  S);
 
+ /**
+ * Chunked ("WY / UT-transform") gated delta-rule forward — the parallel
+ * prefill algebra that reproduces `gatedDeltaNetRecurrent` output and final
+ * state exactly, but processes the sequence in chunks of `chunkSize` tokens
+ * so the per-chunk work is matmul-shaped (the GPU M-Q3N.4 prefill kernel is
+ * a direct port of this). Same tensor contract as the recurrent reference.
+ *
+ * Derivation (from the recurrent recurrence, per head, state S [S_k,S_v]):
+ * unrolling one chunk of C tokens with cumulative log-decay
+ * G_a = sum_{r<=a} gLog_r (within the chunk) yields the intra-chunk delta
+ * vectors d_a as the solution of a unit lower-triangular system
+ *   (I + A) d = r,   A[a,m] = beta_a (k_a . k_m) exp(G_a - G_m)   (m < a)
+ *   r_a         = beta_a ( v_a - exp(G_a) (S0^T k_a) )
+ * solved by forward substitution. The gate exp(G_a - G_m) is an EXACT
+ * diagonal similarity of the ungated system (I + A) = D (I + A~) D^-1 with
+ * D = diag(exp G), so it may equivalently be applied entrywise to the
+ * ungated inverse (this is the FlashQLA factorisation — verified exact, not
+ * an approximation). Output and the carried state are then
+ *   o_a  = exp(G_a) (S0^T qs_a) + sum_{m<=a} exp(G_a - G_m)(k_m . qs_a) d_m
+ *   S'   = exp(G_{C-1}) S0 + sum_m exp(G_{C-1} - G_m) k_m d_m^T
+ * with qs = q / sqrt(S). exp arguments are <= 0 within a chunk (decay), so
+ * no overflow. `state` is read at chunk start and overwritten with S' after
+ * each chunk, chaining chunks and leaving the post-sequence state ready for
+ * decode — identical to the recurrent path.
+ *
+ * Shapes identical to gatedDeltaNetRecurrent. `chunkSize` is a free tuning
+ * knob (the result is chunk-size invariant); 64 is the default.
+ */
+void gatedDeltaNetChunk(const float* q,
+                        const float* k,
+                        const float* v,
+                        const float* gLog,
+                        const float* beta,
+                        float*       state,
+                        float*       out,
+                        std::size_t  T,
+                        std::size_t  H,
+                        std::size_t  S,
+                        std::size_t  chunkSize = 64);
+
 /**
  * Causal depthwise 1-D convolution followed by SiLU, the Qwen3-Next
  * `ssm_conv1d` step. Per channel `c` the output at time `t` is a
