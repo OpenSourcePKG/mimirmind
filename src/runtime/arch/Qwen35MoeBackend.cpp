@@ -535,28 +535,42 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
         float* const gateActAll = s.moeGateCompact.as<float>();
         const float* const xt   = moeInput;   // T == 1
 
-        // Per-expert gate/up + silu into K-strided activation slots the
-        // fused-K down kernel reads as [K, n_ff_exp].
-        for (std::size_t k = 0; k < K; ++k) {
-            const std::size_t e = static_cast<std::size_t>(_topKIdx[k]);
-            const void* Wg = gateBase + e * bytesGate;
-            const void* Wu = fused
-                ? static_cast<const void*>(gateBase + e * bytesGate + gateBytesHalf)
-                : static_cast<const void*>(upBase + e * bytesUp);
-            _gmm.matmulAsync(gateType, Wg, n_ff_exp, d_model, xt, 1, gateOutBuf, matmulScratch);
-            _gmm.matmulAsync(upType,   Wu, n_ff_exp, d_model, xt, 1, upOutBuf,   matmulScratch);
-            _ops.siluMulAsync(gateOutBuf, upOutBuf, n_ff_exp);  // silu(gate)*up
-            _ops.appendMemoryCopy(gateActAll + k * n_ff_exp, gateOutBuf,
-                                  n_ff_exp * sizeof(float));
-        }
-
-        // Per-layer routing scratch (host-visible USM on UMA); the fused
-        // kernel reads it on the stream after these writes.
+        // Per-layer routing scratch (host-visible USM on UMA); both fused
+        // kernels read it on the stream after these writes.
         auto* const expIdxSlot = s.moeExpIdxScratch.as<std::int32_t>() + blockIdx * K;
         auto* const kwSlot     = s.moeKwScratch.as<float>()            + blockIdx * K;
         for (std::size_t k = 0; k < K; ++k) {
             expIdxSlot[k] = _topKIdx[k];
             kwSlot[k]     = _topKWeight[k] * wScale;
+        }
+
+        // gate/up -> silu(gate)*up into the K-strided [K, n_ff_exp] slots.
+        // Fused-K when the experts are separate Q4_K banks and the kernel
+        // is loaded (one launch for all K×2 GEMVs + silu); otherwise the
+        // per-expert matmul + siluMul path.
+        const bool useGateUpFused =
+            !fused &&
+            gateType == upType &&
+            _gmm.moeGateUpFusedKAvailable(gateType) &&
+            (d_model % 256 == 0);
+
+        if (useGateUpFused) {
+            _gmm.moeGateUpFusedKAsync(gateType, xt, gateBase, upBase,
+                                      expIdxSlot, gateActAll,
+                                      d_model, n_ff_exp, K, bytesGate, bytesUp);
+        } else {
+            for (std::size_t k = 0; k < K; ++k) {
+                const std::size_t e = static_cast<std::size_t>(_topKIdx[k]);
+                const void* Wg = gateBase + e * bytesGate;
+                const void* Wu = fused
+                    ? static_cast<const void*>(gateBase + e * bytesGate + gateBytesHalf)
+                    : static_cast<const void*>(upBase + e * bytesUp);
+                _gmm.matmulAsync(gateType, Wg, n_ff_exp, d_model, xt, 1, gateOutBuf, matmulScratch);
+                _gmm.matmulAsync(upType,   Wu, n_ff_exp, d_model, xt, 1, upOutBuf,   matmulScratch);
+                _ops.siluMulAsync(gateOutBuf, upOutBuf, n_ff_exp);  // silu(gate)*up
+                _ops.appendMemoryCopy(gateActAll + k * n_ff_exp, gateOutBuf,
+                                      n_ff_exp * sizeof(float));
+            }
         }
 
         // Fused-K down projection: accum += sum_k kw[k] * (W[e_k] @ gateAct[k]).

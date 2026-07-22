@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -156,6 +157,31 @@ public:
 
     [[nodiscard]] virtual bool moeDownFusedKAvailable() const noexcept = 0;
     [[nodiscard]] virtual bool moeDownFusedKAvailable(core::gguf::GgmlType type) const noexcept = 0;
+
+    /// Fused K-experts gate+up projection for MoE T=1 decode with SEPARATE
+    /// gate/up expert banks. Produces the K-strided activation buffer the
+    /// fused-K down kernel consumes:
+    ///   gateActOut[k, f] = silu( Wg[expIdx[k]][f] · x ) * ( Wu[expIdx[k]][f] · x )
+    /// Default: unsupported. Only backends with the kernel override it.
+    virtual void moeGateUpFusedKAsync(core::gguf::GgmlType type,
+                                      const float*         x,
+                                      const void*          Wg,
+                                      const void*          Wu,
+                                      const std::int32_t*  expIdx,
+                                      float*               gateActOut,
+                                      std::size_t          dModel,
+                                      std::size_t          nFf,
+                                      std::size_t          kActive,
+                                      std::size_t          expertBytesGate,
+                                      std::size_t          expertBytesUp) {
+        (void)type; (void)x; (void)Wg; (void)Wu; (void)expIdx; (void)gateActOut;
+        (void)dModel; (void)nFf; (void)kActive; (void)expertBytesGate; (void)expertBytesUp;
+        throw std::runtime_error(
+            "moeGateUpFusedKAsync: not supported on this backend");
+    }
+
+    [[nodiscard]] virtual bool moeGateUpFusedKAvailable(
+        core::gguf::GgmlType /*type*/) const noexcept { return false; }
 
     /// Flush any pending appends. Safe to call when there's no
     /// pending work — cheap no-op.

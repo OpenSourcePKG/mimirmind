@@ -662,6 +662,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/moe_down_fused_k_q5k.cu
         kernels_cuda/moe_down_fused_k_q6k.cu
         kernels_cuda/moe_down_fused_k_q8_0.cu
+        kernels_cuda/moe_gate_up_fused_k_q4k.cu
         kernels_cuda/mul_scalar.cu
         kernels_cuda/qkv_split.cu
         kernels_cuda/qkv_split_fp16.cu
