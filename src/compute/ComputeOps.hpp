@@ -221,6 +221,18 @@ public:
             "deltanetChunkForwardAsync: not supported on this backend");
     }
 
+    /// Chunked-prefill stage K1: per-chunk ungated triangular inverse A0
+    /// (a0 [nChunks,H,C,C]). Reference: compute::deltanetKktSolveInverse.
+    /// Default: unsupported; CUDA overrides.
+    virtual void deltanetKktSolveInverseAsync(const float* k, const float* beta,
+                                              float* a0, std::size_t T,
+                                              std::size_t H, std::size_t S,
+                                              std::size_t chunkSize) {
+        (void)k; (void)beta; (void)a0; (void)T; (void)H; (void)S; (void)chunkSize;
+        throw std::runtime_error(
+            "deltanetKktSolveInverseAsync: not supported on this backend");
+    }
+
     /// In-place logistic sigmoid: y[i] = 1/(1+exp(-y[i])). GatedDeltaNet
     /// `beta` gate. Reference: compute::sigmoidInPlace.
     virtual void sigmoidInPlaceAsync(float* y, std::size_t n) = 0;

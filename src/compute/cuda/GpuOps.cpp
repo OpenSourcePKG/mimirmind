@@ -211,6 +211,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _deltanetChunkCumGateKernel;
     core::cuda::CudaModule _deltanetChunkForwardModule;
     core::cuda::CudaKernel _deltanetChunkForwardKernel;
+    core::cuda::CudaModule _deltanetKktSolveModule;
+    core::cuda::CudaKernel _deltanetKktSolveKernel;
     core::cuda::CudaModule _sigmoidInplaceModule;
     core::cuda::CudaKernel _sigmoidInplaceKernel;
     core::cuda::CudaModule _gatherHeadsModule;
@@ -329,6 +331,9 @@ struct GpuOps::Impl {
           _deltanetChunkForwardModule{loadCudaModule(ctx, "deltanet_chunk_forward")},
           _deltanetChunkForwardKernel{
               _deltanetChunkForwardModule.getFunction("deltanet_chunk_forward")},
+          _deltanetKktSolveModule{loadCudaModule(ctx, "deltanet_kkt_solve")},
+          _deltanetKktSolveKernel{
+              _deltanetKktSolveModule.getFunction("deltanet_kkt_solve")},
           _sigmoidInplaceModule    {loadCudaModule(ctx, "sigmoid_inplace")},
           _sigmoidInplaceKernel    {
               _sigmoidInplaceModule.getFunction("sigmoid_inplace")},
@@ -1063,6 +1068,29 @@ void GpuOps::deltanetChunkForwardAsync(const float* q, const float* k_,
     // Sync so the scratch ComputeBuffers stay alive until the kernel is done
     // (prefill-only path; not the decode hot loop).
     _ctx.stream().synchronize();
+}
+
+void GpuOps::deltanetKktSolveInverseAsync(const float* k_, const float* beta,
+                                          float* a0, std::size_t T,
+                                          std::size_t H, std::size_t S,
+                                          std::size_t chunkSize) {
+    if (T == 0 || H == 0 || S == 0) {
+        return;
+    }
+    const std::size_t C       = chunkSize ? chunkSize : 64;
+    const std::size_t nChunks = (T + C - 1) / C;
+    const std::size_t nBlocks = nChunks * H;   // one block per (chunk, head)
+    auto& kern = _pimpl->_deltanetKktSolveKernel;
+    kern.setPtr  (0, k_);
+    kern.setPtr  (1, beta);
+    kern.setPtr  (2, a0);
+    kern.setValue(3, toInt32(T, "kkt T"));
+    kern.setValue(4, toInt32(H, "kkt H"));
+    kern.setValue(5, toInt32(S, "kkt S"));
+    kern.setValue(6, toInt32(C, "kkt C"));
+    kern.launch(_ctx.stream(),
+                static_cast<std::uint32_t>(nBlocks), 1, 1,
+                static_cast<std::uint32_t>(C), 1, 1);
 }
 
 void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {

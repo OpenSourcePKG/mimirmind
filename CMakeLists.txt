@@ -682,6 +682,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/deltanet_gate.cu
         kernels_cuda/deltanet_chunk_cumgate.cu
         kernels_cuda/deltanet_chunk_forward.cu
+        kernels_cuda/deltanet_kkt_solve.cu
         kernels_cuda/sigmoid_inplace.cu
         kernels_cuda/gather_heads_from_channels.cu
         kernels_cuda/rope_inplace_fp16.cu

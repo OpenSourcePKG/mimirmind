@@ -288,8 +288,6 @@ inline std::size_t nChunksOf(std::size_t T, std::size_t C) {
 }
 } // namespace
 
-#if defined(MIMIRMIND_GDN_CHUNK_GPU_READY)
-
 // K1 — per-chunk ungated inverse A0 = (I + strictLower(diag(beta) K K^T))^-1.
 // The most error-prone kernel (triangular solve); checked directly on A0.
 // Realistic head_dim S=128, chunk C=64 to exercise the real inverse width.
@@ -316,12 +314,17 @@ TEST(cuda_deltanet_kkt_solve_parity) {
     ops.flush();
     auto got = fromDevice(ops, da0.get(), nc * H * C * C);
 
+    // A0 is a triangular inverse: with random k the strict-lower Gram is
+    // ill-conditioned, so the inverse entries grow to ~1e4 where an absolute
+    // 2e-3 tolerance sits below the fp32 accumulation floor (a few ULP at that
+    // magnitude already exceed it). The GPU matches the CPU reference to
+    // ~5e-7 relative, so use an absolute floor plus a relative term.
     for (std::size_t i = 0; i < got.size(); ++i) {
-        EXPECT_NEAR(got[i], ref[i], 2e-3f);
+        const float ar  = ref[i] < 0.0f ? -ref[i] : ref[i];
+        const float tol = 2e-3f + 1e-4f * ar;
+        EXPECT_NEAR(got[i], ref[i], tol);
     }
 }
-
-#endif  // MIMIRMIND_GDN_CHUNK_GPU_READY — K1 stays gated (kernel pending)
 
 // K2 — chunk forward: consumes G (K0) and A0 (K1), carries state, writes out.
 // Fed the CPU-reference G/A0 so a failure here is isolated to K2's own math.
