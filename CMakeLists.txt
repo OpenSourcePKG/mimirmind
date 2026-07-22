@@ -2148,17 +2148,34 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/config.example.json
     DESTINATION ${CMAKE_INSTALL_DATADIR}/mimirmind
     COMPONENT runtime)
 
-# ---- cuda_parity_tests — M-Q3N.3 GatedDeltaNet GPU-vs-CPU parity ----------
+# ---- cuda_parity_tests — M-Q3N.3/.4 CUDA GPU parity ----------------------
 #
-# Built only with the CUDA backend. Runs each GatedDeltaNet GPU op against
-# the compute/GatedDeltaNet CPU golden reference on random inputs. Box-only
-# (needs a CUDA device to run):
+# Built only with the CUDA backend. Two families:
+#   * GatedDeltaNet GPU ops vs the compute/GatedDeltaNet CPU golden (M-Q3N.3).
+#   * Fused-K MoE decode kernels (M-Q3N.4c/.4d) vs the sequential per-expert
+#     ComputeMatmul path -- GPU-vs-GPU, so GpuMatmul + the compute matmul /
+#     dequant / quant-type closure it needs are compiled in here.
+# Box-only (needs a CUDA device to run):
 #   cmake --build build-cuda --target cuda_parity_tests && ./build-cuda/cuda_parity_tests
 if(MIMIRMIND_ENABLE_CUDA)
     add_executable(cuda_parity_tests
         tests/cuda_parity_tests.cpp
         src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/GpuMatmul.cpp
         src/compute/GatedDeltaNet.cpp
+        # GpuMatmul closure: CPU-fallback matmul + dequant + quant-type registry.
+        src/compute/Matmul.cpp
+        src/compute/Dequant.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
     )
     add_dependencies(cuda_parity_tests cuda_kernels)
     target_include_directories(cuda_parity_tests PRIVATE tests)

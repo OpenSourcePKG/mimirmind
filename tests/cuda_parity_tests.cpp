@@ -11,9 +11,13 @@
 #include "TestFramework.hpp"
 
 #include "compute/GatedDeltaNet.hpp"
+#include "compute/cuda/GpuMatmul.hpp"
 #include "compute/cuda/GpuOps.hpp"
 #include "core/gpu/cuda/CudaComputeContext.hpp"
+#include "core/gguf/GgufTypes.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -50,6 +54,42 @@ std::vector<float> fromDevice(GpuOps& ops, const void* dev, std::size_t n) {
     std::vector<float> h(n);
     ops.readbackToHost(h.data(), dev, n * sizeof(float));
     return h;
+}
+
+// Build a device-resident K-quant weight bank of `blockCount` blocks. Bytes
+// are pseudo-random EXCEPT each super-block's leading fp16 d/dmin scales,
+// which are forced to a finite value (0.03125). Both the fused kernel's
+// inline dequant and the sequential matmul path read these identical bytes,
+// so the parity check only needs the weights to be finite and identical --
+// not "correctly quantized" floats (there is no K-quant quantizer; K-quants
+// are load-only from GGUF). Forcing the scales finite avoids inf/nan from a
+// random fp16 that would poison both paths.
+::mimirmind::compute::ComputeBuffer
+buildQuantBank(GpuOps& ops, std::size_t blockBytes, std::size_t blockCount,
+               std::uint32_t seed) {
+    Lcg g{seed};
+    std::vector<std::uint8_t> bytes(blockBytes * blockCount);
+    for (auto& b : bytes) {
+        g.s = g.s * 1664525u + 1013904223u;
+        b = static_cast<std::uint8_t>(g.s >> 24);
+    }
+    for (std::size_t blk = 0; blk < blockCount; ++blk) {
+        std::uint8_t* p = bytes.data() + blk * blockBytes;
+        p[0] = 0x00; p[1] = 0x28;   // d    = fp16 0.03125
+        p[2] = 0x00; p[3] = 0x28;   // dmin = fp16 0.03125
+    }
+    auto buf = ops.allocate(bytes.size());
+    ops.uploadHostBytes(buf.get(), bytes.data(), bytes.size());
+    return buf;
+}
+
+// Upload a small host array of trivially-copyable Ts into a fresh buffer.
+template <typename T>
+::mimirmind::compute::ComputeBuffer
+uploadRaw(GpuOps& ops, const std::vector<T>& h) {
+    auto buf = ops.allocate(h.size() * sizeof(T));
+    ops.uploadHostBytes(buf.get(), h.data(), h.size() * sizeof(T));
+    return buf;
 }
 
 } // namespace
@@ -441,6 +481,149 @@ TEST(cuda_deltanet_chunk_pipeline_vs_recurrent) {
     }
     for (std::size_t i = 0; i < gotState.size(); ++i) {
         EXPECT_NEAR(gotState[i], refState[i], 2e-3f);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused-K MoE decode kernels (M-Q3N.4c/.4d). The end-to-end run verified these
+// byte-identical to the sequential per-expert path; these tests isolate that
+// same claim as a unit. The reference IS the sequential ComputeMatmul path
+// (matmulAsync per expert + silu/scaledAdd) that runMoeFfn falls back to, run
+// on the SAME device against the SAME quantised banks -- a GPU-vs-GPU parity
+// that sidesteps the fp16-scale CPU-reference round-trip trap.
+// ---------------------------------------------------------------------------
+
+using ::mimirmind::compute::cuda::GpuMatmul;
+using ::mimirmind::core::gguf::GgmlType;
+
+// .4d: moeGateUpFusedKAsync == per-expert (matmul Wg, matmul Wu, silu*up).
+TEST(cuda_moe_gate_up_fused_k_q4k_parity) {
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+
+    const GgmlType Q4K = GgmlType::Q4_K;
+    if (!gmm.moeGateUpFusedKAvailable(Q4K)) {
+        EXPECT_TRUE(false && "moe_gate_up_fused_k_q4k kernel not loaded");
+        return;
+    }
+
+    const std::size_t dModel = 256, nFf = 256, K = 2, nExp = 4;
+    // Separate Q4_K gate/up banks: per expert [nFf, dModel] = nFf blocks of 144B
+    // (dModel/256 == 1 block per row). Matches runMoeFfn's `bytesGate`.
+    const std::size_t blkBytes  = 144;
+    const std::size_t bytesGate = nFf * (dModel / 256) * blkBytes;
+    const std::size_t blkCount  = nExp * nFf * (dModel / 256);
+
+    auto gateBank = buildQuantBank(ops, blkBytes, blkCount, 0xA1A1u);
+    auto upBank   = buildQuantBank(ops, blkBytes, blkCount, 0xB2B2u);
+    auto x        = toDevice(ops, randVec(dModel, 0x1111u));
+
+    const std::vector<std::int32_t> expIdx{1, 3};   // K routed experts
+    auto dExpIdx = uploadRaw(ops, expIdx);
+
+    // Reference: sequential silu(Wg·x)*(Wu·x) into K-strided [K, nFf].
+    auto refBuf  = ops.allocate(K * nFf * sizeof(float));
+    auto gateTmp = ops.allocate(nFf * sizeof(float));
+    auto upTmp   = ops.allocate(nFf * sizeof(float));
+    auto scratch = ops.allocate(std::max(dModel, nFf) * sizeof(float));
+    const auto* gateBase = static_cast<const std::uint8_t*>(gateBank.get());
+    const auto* upBase   = static_cast<const std::uint8_t*>(upBank.get());
+    for (std::size_t k = 0; k < K; ++k) {
+        const std::size_t e = static_cast<std::size_t>(expIdx[k]);
+        gmm.matmulAsync(Q4K, gateBase + e * bytesGate, nFf, dModel,
+                        static_cast<const float*>(x.get()), 1,
+                        static_cast<float*>(gateTmp.get()),
+                        static_cast<float*>(scratch.get()));
+        gmm.matmulAsync(Q4K, upBase + e * bytesGate, nFf, dModel,
+                        static_cast<const float*>(x.get()), 1,
+                        static_cast<float*>(upTmp.get()),
+                        static_cast<float*>(scratch.get()));
+        ops.siluMulAsync(static_cast<float*>(gateTmp.get()),
+                         static_cast<const float*>(upTmp.get()), nFf);
+        ops.appendMemoryCopy(static_cast<float*>(refBuf.get()) + k * nFf,
+                             gateTmp.get(), nFf * sizeof(float));
+    }
+    ops.flush();
+    auto ref = fromDevice(ops, refBuf.get(), K * nFf);
+
+    // Fused: one launch for all K×2 GEMVs + silu.
+    auto gotBuf = ops.allocate(K * nFf * sizeof(float));
+    gmm.moeGateUpFusedKAsync(Q4K, static_cast<const float*>(x.get()),
+                             gateBank.get(), upBank.get(),
+                             static_cast<const std::int32_t*>(dExpIdx.get()),
+                             static_cast<float*>(gotBuf.get()),
+                             dModel, nFf, K, bytesGate, bytesGate);
+    ops.flush();
+    auto got = fromDevice(ops, gotBuf.get(), K * nFf);
+
+    // Magnitude-relative: identical dequant + fp32 sum agree to ~eps*|v|;
+    // a real kernel divergence is order-1 relative and still trips this.
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], ref[i], 2e-3f * (1.0f + std::fabs(ref[i])));
+    }
+}
+
+// .4c: moeDownFusedKAsync == per-expert (matmul Wd, scaledAdd kw*·).
+TEST(cuda_moe_down_fused_k_q5k_parity) {
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+
+    const GgmlType Q5K = GgmlType::Q5_K;
+    if (!gmm.moeDownFusedKAvailable(Q5K)) {
+        EXPECT_TRUE(false && "moe_down_fused_k_q5k kernel not loaded");
+        return;
+    }
+
+    const std::size_t dModel = 256, nFf = 256, K = 2, nExp = 4;
+    // down bank: per expert [dModel, nFf] = dModel blocks of 176B (nFf/256 == 1
+    // block per row). Matches runMoeFfn's `bytesDown`.
+    const std::size_t blkBytes  = 176;
+    const std::size_t bytesDown = dModel * (nFf / 256) * blkBytes;
+    const std::size_t blkCount  = nExp * dModel * (nFf / 256);
+
+    auto downBank = buildQuantBank(ops, blkBytes, blkCount, 0xD0D0u);
+    auto gateAct  = toDevice(ops, randVec(K * nFf, 0x2222u));
+
+    const std::vector<std::int32_t> expIdx{0, 2};
+    const std::vector<float>        kw{0.6f, 0.4f};   // router weights (× wScale)
+    auto dExpIdx = uploadRaw(ops, expIdx);
+    auto dKw     = uploadRaw(ops, kw);
+
+    // Reference: accum += kw[k] * (Wd[e_k] @ gateAct[k]).
+    auto refAcc  = ops.allocate(dModel * sizeof(float));
+    auto expOut  = ops.allocate(dModel * sizeof(float));
+    auto scratch = ops.allocate(std::max(dModel, nFf) * sizeof(float));
+    ops.mulScalarAsync(static_cast<float*>(refAcc.get()), 0.0f, dModel);
+    const auto* downBase = static_cast<const std::uint8_t*>(downBank.get());
+    for (std::size_t k = 0; k < K; ++k) {
+        const std::size_t e = static_cast<std::size_t>(expIdx[k]);
+        gmm.matmulAsync(Q5K, downBase + e * bytesDown, dModel, nFf,
+                        static_cast<const float*>(gateAct.get()) + k * nFf, 1,
+                        static_cast<float*>(expOut.get()),
+                        static_cast<float*>(scratch.get()));
+        ops.scaledAddResidualAsync(static_cast<float*>(refAcc.get()),
+                                   static_cast<const float*>(expOut.get()),
+                                   kw[k], dModel);
+    }
+    ops.flush();
+    auto ref = fromDevice(ops, refAcc.get(), dModel);
+
+    // Fused: one launch for all K down-GEMVs + router-weighted residual add.
+    auto gotAcc = ops.allocate(dModel * sizeof(float));
+    ops.mulScalarAsync(static_cast<float*>(gotAcc.get()), 0.0f, dModel);
+    gmm.moeDownFusedKAsync(Q5K, static_cast<const float*>(gateAct.get()),
+                           downBank.get(),
+                           static_cast<const std::int32_t*>(dExpIdx.get()),
+                           static_cast<const float*>(dKw.get()),
+                           static_cast<float*>(gotAcc.get()),
+                           nFf, dModel, K, bytesDown);
+    ops.flush();
+    auto got = fromDevice(ops, gotAcc.get(), dModel);
+
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], ref[i], 2e-3f * (1.0f + std::fabs(ref[i])));
     }
 }
 
