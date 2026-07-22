@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <vector>
 
@@ -783,6 +784,68 @@ TEST(cuda_matmul_q5k_mmq_vs_fp32) {
     const double relL2 = (den > 0.0) ? std::sqrt(num / den) : std::sqrt(num);
     EXPECT_TRUE(den > 0.0);
     EXPECT_NEAR(relL2, 0.0, 0.05);
+}
+
+// ---------------------------------------------------------------------------
+// M-Cuda.MMQ large-SHAPE parity — distinguishes (a) int8-lossiness from
+// (b) a large-M kernel bug behind the long-prefill quality collapse.
+// The earlier MMQ parity used M=10 (< the TC M_TILE=16, so the mGroups>1 path
+// was NEVER exercised); prod prefill is M~2000. These run M=2048 (many M-tiles)
+// and PRINT the relative-L2. A gross M-tiling bug blows relative-L2 up (>>0.1);
+// mere int8-lossiness stays modest. Loose EXPECT so a bug fails loudly.
+// ---------------------------------------------------------------------------
+
+namespace {
+double relL2LargeM(GpuOps& ops, GpuMatmul& gmm, bool tc,
+                   std::size_t M, std::size_t N, std::size_t K) {
+    const std::size_t nBlocks = K / 32;
+    auto W   = buildQuantBank(ops, 34, N * nBlocks, 0xABCDu);
+    auto X   = toDevice(ops, randVec(M * K, 0x1234u));
+    auto Yr  = ops.allocate(M * N * sizeof(float));
+    auto Ym  = ops.allocate(M * N * sizeof(float));
+    auto scr = ops.allocate(std::max(N, K) * sizeof(float));
+
+    gmm.matmulAsync(GgmlType::Q8_0, W.get(), N, K,
+                    static_cast<const float*>(X.get()), M,
+                    static_cast<float*>(Yr.get()),
+                    static_cast<float*>(scr.get()));
+    if (tc) {
+        gmm.matmulQ8_0MmqTcAsync(W.get(), N, K,
+                                 static_cast<const float*>(X.get()), M,
+                                 static_cast<float*>(Ym.get()));
+    } else {
+        gmm.matmulQ8_0MmqAsync(W.get(), N, K,
+                               static_cast<const float*>(X.get()), M,
+                               static_cast<float*>(Ym.get()));
+    }
+    ops.flush();
+
+    auto r = fromDevice(ops, Yr.get(), M * N);
+    auto m = fromDevice(ops, Ym.get(), M * N);
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < r.size(); ++i) {
+        const double d = static_cast<double>(m[i]) - static_cast<double>(r[i]);
+        num += d * d;
+        den += static_cast<double>(r[i]) * static_cast<double>(r[i]);
+    }
+    return (den > 0.0) ? std::sqrt(num / den) : std::sqrt(num);
+}
+} // namespace
+
+TEST(cuda_matmul_q8_0_mmq_largeM_dp4a) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx}; GpuMatmul gmm{ctx, ops};
+    const double rl = relL2LargeM(ops, gmm, /*tc=*/false, 2048, 256, 2048);
+    std::printf("[largeM dp4a M=2048 K=2048] relative-L2 = %.6f\n", rl);
+    EXPECT_TRUE(rl < 0.15);   // gross kernel bug >> 0.1; pure int8-loss stays low
+}
+
+TEST(cuda_matmul_q8_0_mmq_largeM_tc) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx}; GpuMatmul gmm{ctx, ops};
+    const double rl = relL2LargeM(ops, gmm, /*tc=*/true, 2048, 256, 2048);
+    std::printf("[largeM tc   M=2048 K=2048] relative-L2 = %.6f\n", rl);
+    EXPECT_TRUE(rl < 0.15);
 }
 
 int main() {
