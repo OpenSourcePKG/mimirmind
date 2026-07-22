@@ -797,10 +797,25 @@ TEST(cuda_matmul_q5k_mmq_vs_fp32) {
 
 namespace {
 double relL2LargeM(GpuOps& ops, GpuMatmul& gmm, bool tc,
-                   std::size_t M, std::size_t N, std::size_t K) {
+                   std::size_t M, std::size_t N, std::size_t K,
+                   float outlierMag = 0.0f) {
     const std::size_t nBlocks = K / 32;
     auto W   = buildQuantBank(ops, 34, N * nBlocks, 0xABCDu);
-    auto X   = toDevice(ops, randVec(M * K, 0x1234u));
+    auto xh  = randVec(M * K, 0x1234u);
+    if (outlierMag > 0.0f) {
+        // Inject a couple of large outliers per row (real LLM activations have
+        // per-channel outliers; per-32-block-absmax quant then rounds the other
+        // 31 block values toward 0). 2 outliers / row at fixed-ish channels.
+        Lcg g{0xF00Du};
+        for (std::size_t r = 0; r < M; ++r) {
+            for (int o = 0; o < 2; ++o) {
+                g.s = g.s * 1664525u + 1013904223u;
+                const std::size_t c = (g.s >> 8) % K;
+                xh[r * K + c] = (o & 1 ? -outlierMag : outlierMag);
+            }
+        }
+    }
+    auto X   = toDevice(ops, xh);
     auto Yr  = ops.allocate(M * N * sizeof(float));
     auto Ym  = ops.allocate(M * N * sizeof(float));
     auto scr = ops.allocate(std::max(N, K) * sizeof(float));
@@ -822,12 +837,19 @@ double relL2LargeM(GpuOps& ops, GpuMatmul& gmm, bool tc,
 
     auto r = fromDevice(ops, Yr.get(), M * N);
     auto m = fromDevice(ops, Ym.get(), M * N);
-    double num = 0.0, den = 0.0;
+    double num = 0.0, den = 0.0, maxAbs = 0.0, maxRel = 0.0;
     for (std::size_t i = 0; i < r.size(); ++i) {
         const double d = static_cast<double>(m[i]) - static_cast<double>(r[i]);
         num += d * d;
         den += static_cast<double>(r[i]) * static_cast<double>(r[i]);
+        const double ad = std::fabs(d);
+        if (ad > maxAbs) maxAbs = ad;
+        const double rel = ad / (1e-6 + std::fabs(static_cast<double>(r[i])));
+        if (rel > maxRel) maxRel = rel;
     }
+    // Print max-element error too: a low aggregate L2 can hide a few
+    // catastrophically-wrong outputs that flip the critical argmax logit.
+    std::printf("    (maxAbsErr=%.4f  maxRelErr=%.4f)\n", maxAbs, maxRel);
     return (den > 0.0) ? std::sqrt(num / den) : std::sqrt(num);
 }
 } // namespace
@@ -838,6 +860,26 @@ TEST(cuda_matmul_q8_0_mmq_largeM_dp4a) {
     const double rl = relL2LargeM(ops, gmm, /*tc=*/false, 2048, 256, 2048);
     std::printf("[largeM dp4a M=2048 K=2048] relative-L2 = %.6f\n", rl);
     EXPECT_TRUE(rl < 0.15);   // gross kernel bug >> 0.1; pure int8-loss stays low
+}
+
+// Outlier-injected: confirms whether real-activation outliers (absent in the
+// uniform-random test above) are what drives the long-prefill quality collapse.
+// If relative-L2 blows up here vs the clean 0.0038, the per-32-block-absmax
+// activation quant is the culprit (fix at the quant scheme).
+TEST(cuda_matmul_q8_0_mmq_largeM_dp4a_outlier) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx}; GpuMatmul gmm{ctx, ops};
+    const double rl = relL2LargeM(ops, gmm, /*tc=*/false, 2048, 256, 2048, 300.0f);
+    std::printf("[largeM dp4a OUTLIER=300] relative-L2 = %.6f\n", rl);
+    EXPECT_TRUE(rl >= 0.0);   // diagnostic: read the printed value
+}
+
+TEST(cuda_matmul_q8_0_mmq_largeM_tc_outlier) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx}; GpuMatmul gmm{ctx, ops};
+    const double rl = relL2LargeM(ops, gmm, /*tc=*/true, 2048, 256, 2048, 300.0f);
+    std::printf("[largeM tc   OUTLIER=300] relative-L2 = %.6f\n", rl);
+    EXPECT_TRUE(rl >= 0.0);   // diagnostic
 }
 
 TEST(cuda_matmul_q8_0_mmq_largeM_tc) {
