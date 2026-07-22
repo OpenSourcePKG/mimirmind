@@ -26,5 +26,6 @@ void deltanet_gate(
     const int h = gid % H;
     const float x  = alpha[gid] + ssmDt[h];
     const float sp = x > 0.0f ? x + log1pf(expf(-x)) : log1pf(expf(x));
-    gLog[gid] = -expf(ssmA[h]) * sp;
+    // ssm_a is pre-computed A = -exp(A_log); multiply directly (no extra exp).
+    gLog[gid] = ssmA[h] * sp;
 }

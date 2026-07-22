@@ -101,7 +101,12 @@ void deltanetGate(const float* alpha,
     for (std::size_t t = 0; t < T; ++t) {
         for (std::size_t h = 0; h < H; ++h) {
             const float sp = softplus(alpha[t * H + h] + ssmDt[h]);
-            gLog[t * H + h] = -std::exp(ssmA[h]) * sp;
+            // ssm_a (GGUF SSM_A_NOSCAN) is the pre-computed decay coefficient
+            // A = -exp(A_log), stored negative. llama.cpp multiplies softplus
+            // by it directly (qwen35moe.cpp: gate = softplus * ssm_a). Do NOT
+            // apply -exp() again here — that double-exponentiates the decay,
+            // making the recurrent state forget far too slowly.
+            gLog[t * H + h] = ssmA[h] * sp;
         }
     }
 }
