@@ -1180,6 +1180,68 @@ TEST(gdn_chunk_chunkSizeInvariant) {
     expectChunkMatchesRecurrent(c, /*chunkSize=*/128, /*tol=*/2e-3F);
 }
 
+namespace {
+
+// Run the K0 -> K1 -> K2 staged pipeline and compare against BOTH the
+// recurrent golden and the monolithic gatedDeltaNetChunk. Agreement with the
+// monolith cross-checks the ungated-inverse + diagonal-similarity
+// factorisation the GPU kernels rely on.
+void expectStagedMatchesRecurrent(const GdnCase& c, std::size_t C, float tol) {
+    using namespace mimirmind::compute;
+    const std::size_t nChunks = (c.T + C - 1) / C;
+    std::vector<float> gCum(c.T * c.H), a0(nChunks * c.H * C * C);
+    std::vector<float> outRef(c.T * c.H * c.S), stRef = c.state0;
+    std::vector<float> outMon(c.T * c.H * c.S), stMon = c.state0;
+    std::vector<float> outStg(c.T * c.H * c.S), stStg = c.state0;
+
+    gatedDeltaNetRecurrent(c.q.data(), c.k.data(), c.v.data(), c.gLog.data(),
+                           c.beta.data(), stRef.data(), outRef.data(),
+                           c.T, c.H, c.S);
+    gatedDeltaNetChunk(c.q.data(), c.k.data(), c.v.data(), c.gLog.data(),
+                       c.beta.data(), stMon.data(), outMon.data(),
+                       c.T, c.H, c.S, C);
+
+    deltanetChunkCumGate(c.gLog.data(), gCum.data(), c.T, c.H, C);
+    deltanetKktSolveInverse(c.k.data(), c.beta.data(), a0.data(),
+                            c.T, c.H, c.S, C);
+    deltanetChunkForward(c.q.data(), c.k.data(), c.v.data(), gCum.data(),
+                         c.beta.data(), a0.data(), stStg.data(), outStg.data(),
+                         c.T, c.H, c.S, C);
+
+    for (std::size_t i = 0; i < outRef.size(); ++i) {
+        EXPECT_NEAR(outStg[i], outRef[i], tol);
+        EXPECT_NEAR(outStg[i], outMon[i], tol);
+    }
+    for (std::size_t i = 0; i < stRef.size(); ++i) {
+        EXPECT_NEAR(stStg[i], stRef[i], tol);
+        EXPECT_NEAR(stStg[i], stMon[i], tol);
+    }
+}
+
+} // namespace
+
+TEST(gdn_chunk_stagedPipelineMatchesRecurrent) {
+    // K0/K1/K2 hand-off through the intermediate G / A0 tensors reproduces
+    // both the recurrent golden and the monolith, for zero and non-zero
+    // initial state.
+    const auto a = makeGdnCase(/*T=*/200, /*H=*/2, /*S=*/8, /*seed=*/12345,
+                               /*nonzeroState=*/false);
+    const auto b = makeGdnCase(/*T=*/150, /*H=*/2, /*S=*/8, /*seed=*/777,
+                               /*nonzeroState=*/true);
+    expectStagedMatchesRecurrent(a, /*C=*/64, /*tol=*/2e-3F);
+    expectStagedMatchesRecurrent(b, /*C=*/64, /*tol=*/2e-3F);
+}
+
+TEST(gdn_chunk_stagedPipeline_partialTrailingChunk) {
+    // T not a multiple of C exercises the partial trailing chunk in K1's
+    // zero-fill and K2's cs<C loops.
+    const auto c = makeGdnCase(/*T=*/97, /*H=*/3, /*S=*/6, /*seed=*/2024,
+                               /*nonzeroState=*/true);
+    expectStagedMatchesRecurrent(c, /*C=*/7,   /*tol=*/2e-3F);
+    expectStagedMatchesRecurrent(c, /*C=*/64,  /*tol=*/2e-3F);
+    expectStagedMatchesRecurrent(c, /*C=*/128, /*tol=*/2e-3F);
+}
+
 int main() {
     return mm::test::run();
 }

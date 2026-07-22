@@ -236,6 +236,216 @@ void gatedDeltaNetChunk(const float* q,
     }
 }
 
+void deltanetChunkCumGate(const float* gLog,
+                          float*       gCum,
+                          std::size_t  T,
+                          std::size_t  H,
+                          std::size_t  chunkSize) {
+    const std::size_t C = chunkSize ? chunkSize : 64;
+    for (std::size_t h = 0; h < H; ++h) {
+        for (std::size_t c0 = 0; c0 < T; c0 += C) {
+            const std::size_t cs = std::min(C, T - c0);
+            float run = 0.0F;
+            for (std::size_t a = 0; a < cs; ++a) {
+                run += gLog[(c0 + a) * H + h];
+                gCum[(c0 + a) * H + h] = run;
+            }
+        }
+    }
+}
+
+void deltanetKktSolveInverse(const float* k,
+                             const float* beta,
+                             float*       a0,
+                             std::size_t  T,
+                             std::size_t  H,
+                             std::size_t  S,
+                             std::size_t  chunkSize) {
+    const std::size_t C = chunkSize ? chunkSize : 64;
+    const std::size_t nChunks = (T + C - 1) / C;
+
+    // Strict-lower ungated Gram of one chunk: lt[a*C + m] = beta_a (k_a.k_m).
+    std::vector<float> lt(C * C);
+
+    for (std::size_t c = 0; c < nChunks; ++c) {
+        const std::size_t c0 = c * C;
+        const std::size_t cs = std::min(C, T - c0);
+        for (std::size_t h = 0; h < H; ++h) {
+            float* a0c = a0 + ((c * H) + h) * C * C;
+            std::fill(a0c, a0c + C * C, 0.0F);
+
+            // Build strict-lower ungated Gram.
+            for (std::size_t a = 0; a < cs; ++a) {
+                const float* ka = k + ((c0 + a) * H + h) * S;
+                const float  ba = beta[(c0 + a) * H + h];
+                for (std::size_t m = 0; m < a; ++m) {
+                    const float* km = k + ((c0 + m) * H + h) * S;
+                    float kk = 0.0F;
+                    for (std::size_t i = 0; i < S; ++i) {
+                        kk += ka[i] * km[i];
+                    }
+                    lt[a * C + m] = ba * kk;
+                }
+            }
+
+            // Invert the unit lower-triangular L = I + strictLower(lt).
+            // X = L^-1 is unit lower-triangular:
+            //   X[a,a] = 1;  X[a,m>a] = 0;
+            //   X[a,m] = -sum_{p=m..a-1} lt[a,p] X[p,m]   (a > m)
+            for (std::size_t a = 0; a < cs; ++a) {
+                a0c[a * C + a] = 1.0F;
+                for (std::size_t m = 0; m < a; ++m) {
+                    float acc = 0.0F;
+                    for (std::size_t p = m; p < a; ++p) {
+                        acc += lt[a * C + p] * a0c[p * C + m];
+                    }
+                    a0c[a * C + m] = -acc;
+                }
+            }
+        }
+    }
+}
+
+void deltanetChunkForward(const float* q,
+                          const float* k,
+                          const float* v,
+                          const float* gCum,
+                          const float* beta,
+                          const float* a0,
+                          float*       state,
+                          float*       out,
+                          std::size_t  T,
+                          std::size_t  H,
+                          std::size_t  S,
+                          std::size_t  chunkSize) {
+    const float qScale = 1.0F / std::sqrt(static_cast<float>(S));
+    const std::size_t C = chunkSize ? chunkSize : 64;
+
+    std::vector<float> s0(S * S);      // chunk-start state snapshot
+    std::vector<float> egc(C);         // exp(gCum_a)
+    std::vector<float> ieg(C);         // exp(-gCum_a)
+    std::vector<float> u(C * S);       // (S0^T k_a)[j]
+    std::vector<float> uq(C * S);      // (S0^T qs_a)[j]
+    std::vector<float> qs(C * S);      // scaled query
+    std::vector<float> rp(C * S);      // exp(-gCum_m) r_m
+    std::vector<float> d(C * S);       // solved delta vectors
+
+    for (std::size_t h = 0; h < H; ++h) {
+        float* st = state + h * S * S;
+
+        for (std::size_t c0 = 0; c0 < T; c0 += C) {
+            const std::size_t c  = c0 / C;
+            const std::size_t cs = std::min(C, T - c0);
+            const float* a0c = a0 + ((c * H) + h) * C * C;
+
+            std::copy(st, st + S * S, s0.begin());
+
+            for (std::size_t a = 0; a < cs; ++a) {
+                const float g = gCum[(c0 + a) * H + h];
+                egc[a] = std::exp(g);
+                ieg[a] = std::exp(-g);
+            }
+
+            // qs, u = S0^T k_a, uq = S0^T qs_a.
+            for (std::size_t a = 0; a < cs; ++a) {
+                const float* qa = q + ((c0 + a) * H + h) * S;
+                const float* ka = k + ((c0 + a) * H + h) * S;
+                float* qsa = qs.data() + a * S;
+                float* ua  = u.data() + a * S;
+                float* uqa = uq.data() + a * S;
+                for (std::size_t j = 0; j < S; ++j) {
+                    qsa[j] = qa[j] * qScale;
+                    ua[j]  = 0.0F;
+                    uqa[j] = 0.0F;
+                }
+                for (std::size_t i = 0; i < S; ++i) {
+                    const float ki  = ka[i];
+                    const float qsi = qsa[i];
+                    const float* row = s0.data() + i * S;
+                    for (std::size_t j = 0; j < S; ++j) {
+                        ua[j]  += row[j] * ki;
+                        uqa[j] += row[j] * qsi;
+                    }
+                }
+            }
+
+            // r'_m = exp(-gCum_m) r_m,  r_m = beta_m (v_m - exp(gCum_m) u_m).
+            for (std::size_t m = 0; m < cs; ++m) {
+                const float* vm = v + ((c0 + m) * H + h) * S;
+                const float  bm = beta[(c0 + m) * H + h];
+                const float* um = u.data() + m * S;
+                float* rpm = rp.data() + m * S;
+                for (std::size_t j = 0; j < S; ++j) {
+                    rpm[j] = ieg[m] * bm * (vm[j] - egc[m] * um[j]);
+                }
+            }
+
+            // d_a = exp(gCum_a) * sum_{m<=a} a0[a,m] r'_m   (a0 lower-tri).
+            for (std::size_t a = 0; a < cs; ++a) {
+                float* da = d.data() + a * S;
+                for (std::size_t j = 0; j < S; ++j) {
+                    da[j] = 0.0F;
+                }
+                for (std::size_t m = 0; m <= a; ++m) {
+                    const float w = a0c[a * C + m];
+                    const float* rpm = rp.data() + m * S;
+                    for (std::size_t j = 0; j < S; ++j) {
+                        da[j] += w * rpm[j];
+                    }
+                }
+                for (std::size_t j = 0; j < S; ++j) {
+                    da[j] *= egc[a];
+                }
+            }
+
+            // Output: o_a = exp(G_a) uq_a
+            //             + sum_{m<=a} exp(G_a-G_m)(k_m.qs_a) d_m.
+            for (std::size_t a = 0; a < cs; ++a) {
+                float* oa = out + ((c0 + a) * H + h) * S;
+                const float* uqa = uq.data() + a * S;
+                const float* qsa = qs.data() + a * S;
+                for (std::size_t j = 0; j < S; ++j) {
+                    oa[j] = egc[a] * uqa[j];
+                }
+                for (std::size_t m = 0; m <= a; ++m) {
+                    const float* km = k + ((c0 + m) * H + h) * S;
+                    float kq = 0.0F;
+                    for (std::size_t i = 0; i < S; ++i) {
+                        kq += km[i] * qsa[i];
+                    }
+                    const float w   = egc[a] * ieg[m] * kq;
+                    const float* dm = d.data() + m * S;
+                    for (std::size_t j = 0; j < S; ++j) {
+                        oa[j] += w * dm[j];
+                    }
+                }
+            }
+
+            // Carry: S' = exp(G_{cs-1}) S0 + sum_m exp(G_{cs-1}-G_m) k_m d_m^T.
+            const float eLast = egc[cs - 1];
+            for (std::size_t i = 0; i < S; ++i) {
+                const float* s0row = s0.data() + i * S;
+                float* strow = st + i * S;
+                for (std::size_t j = 0; j < S; ++j) {
+                    strow[j] = eLast * s0row[j];
+                }
+            }
+            for (std::size_t m = 0; m < cs; ++m) {
+                const float* km = k + ((c0 + m) * H + h) * S;
+                const float* dm = d.data() + m * S;
+                const float  wm = eLast * ieg[m];
+                for (std::size_t i = 0; i < S; ++i) {
+                    const float ki = km[i] * wm;
+                    float* strow = st + i * S;
+                    for (std::size_t j = 0; j < S; ++j) {
+                        strow[j] += ki * dm[j];
+                    }
+                }
+            }
+        }
+    }
+}
+
 namespace {
 // Numerically-stable softplus: log(1 + exp(x)).
 inline float softplus(float x) {

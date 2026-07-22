@@ -99,6 +99,67 @@ void gatedDeltaNetChunk(const float* q,
                         std::size_t  S,
                         std::size_t  chunkSize = 64);
 
+// ---------------------------------------------------------------------------
+// gatedDeltaNetChunk, decomposed into the three GPU-kernel-shaped stages
+// (M-Q3N.4b ports each one-to-one). Running K0 -> K1 -> K2 reproduces the
+// monolithic gatedDeltaNetChunk (and thus the recurrent reference) exactly;
+// the intermediate tensors G and A0 are the kernel hand-off buffers.
+// ---------------------------------------------------------------------------
+
+/**
+ * K0 — cumulative decay gate. Prefix-sum of `gLog` within each `chunkSize`
+ * window (reset at every chunk boundary), per head:
+ *   gCum[c*C + a, h] = sum_{r=0..a} gLog[c*C + r, h]
+ * gLog, gCum are [T, H] row-major; the exp is applied by K2, not here.
+ */
+void deltanetChunkCumGate(const float* gLog,
+                          float*       gCum,
+                          std::size_t  T,
+                          std::size_t  H,
+                          std::size_t  chunkSize);
+
+/**
+ * K1 — per-chunk, per-head inverse of the UNGATED unit lower-triangular
+ * system. With the strict-lower Gram A~[a,m] = beta_a (k_a . k_m) (m < a),
+ * this writes A0 = (I + A~)^-1 (itself unit lower-triangular). The decay
+ * gate is deliberately absent — K2 reintroduces it as the exact diagonal
+ * similarity D A0 D^-1, D = diag(exp gCum) (see gatedDeltaNetChunk).
+ *
+ * a0 is [nChunks, H, C, C] row-major, nChunks = ceil(T/chunkSize),
+ * C = chunkSize; element (c,h,a,m) at ((c*H + h)*C + a)*C + m. For a partial
+ * trailing chunk only the leading cs x cs block (cs = tokens in chunk) is
+ * meaningful; the remainder is zero-filled. k is [T,H,S], beta is [T,H].
+ */
+void deltanetKktSolveInverse(const float* k,
+                             const float* beta,
+                             float*       a0,
+                             std::size_t  T,
+                             std::size_t  H,
+                             std::size_t  S,
+                             std::size_t  chunkSize);
+
+/**
+ * K2 — chunk forward. Consumes gCum (K0) and a0 (K1) and, chunk by chunk,
+ * carries the recurrent state while writing the output. Per chunk the intra-
+ * chunk deltas are recovered without a solve:
+ *   r_m   = beta_m ( v_m - exp(gCum_m) (S0^T k_m) )
+ *   d_a   = exp(gCum_a) * sum_{m<=a} a0[a,m] exp(-gCum_m) r_m
+ * then output and state carry exactly as in gatedDeltaNetChunk. Same tensor
+ * contract; `state` is read at chunk start and overwritten with the carry.
+ */
+void deltanetChunkForward(const float* q,
+                          const float* k,
+                          const float* v,
+                          const float* gCum,
+                          const float* beta,
+                          const float* a0,
+                          float*       state,
+                          float*       out,
+                          std::size_t  T,
+                          std::size_t  H,
+                          std::size_t  S,
+                          std::size_t  chunkSize);
+
 /**
  * Causal depthwise 1-D convolution followed by SiLU, the Qwen3-Next
  * `ssm_conv1d` step. Per channel `c` the output at time `t` is a
