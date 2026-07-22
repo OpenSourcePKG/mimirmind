@@ -515,32 +515,80 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
     // --- zero the accumulator ----------------------------------------
     _ops.mulScalarAsync(moeAccumBuf, 0.0F, T * d_model);
 
-    // --- routed experts: per-token top-K dispatch --------------------
-    // Correctness-first (matches decode). Prefill expert-grouping is a
-    // perf follow-up (M-Q3N.4).
-    for (std::size_t t = 0; t < T; ++t) {
-        const float* const xt     = moeInput    + t * d_model;
-        float* const       accumT = moeAccumBuf + t * d_model;
-        for (std::size_t k = 0; k < K; ++k) {
-            const std::size_t e = static_cast<std::size_t>(_topKIdx[t * K + k]);
-            const float routerWeight = _topKWeight[t * K + k];
+    // --- routed experts ----------------------------------------------
+    // M-Q3N.4 MoE-Expert-Grouping (decode). At T==1 the down-projections
+    // of all K experts fold into ONE fused-K launch (+ the router-weighted
+    // residual add), replacing K separate down-matmuls + K scaledAdds. The
+    // gate/up half stays per-expert (separate Q4_K experts + SILU). Prefill
+    // (T>1) and any model whose down quant lacks a fused kernel keep the
+    // sequential per-token/per-expert path.
+    const bool useMoeFusedDown =
+        _moeFusedDownEnabled &&
+        T == 1 &&
+        _gmm.moeDownFusedKAvailable(downExps.type) &&
+        (n_ff_exp % 256 == 0) &&
+        s.moeExpIdxScratch.get() != nullptr &&
+        s.moeKwScratch.get()     != nullptr &&
+        s.moeGateCompact.get()   != nullptr;
 
+    if (useMoeFusedDown) {
+        float* const gateActAll = s.moeGateCompact.as<float>();
+        const float* const xt   = moeInput;   // T == 1
+
+        // Per-expert gate/up + silu into K-strided activation slots the
+        // fused-K down kernel reads as [K, n_ff_exp].
+        for (std::size_t k = 0; k < K; ++k) {
+            const std::size_t e = static_cast<std::size_t>(_topKIdx[k]);
             const void* Wg = gateBase + e * bytesGate;
             const void* Wu = fused
                 ? static_cast<const void*>(gateBase + e * bytesGate + gateBytesHalf)
                 : static_cast<const void*>(upBase + e * bytesUp);
-            const void* Wd = downBase + e * bytesDown;
-
-            _gmm.matmulAsync(gateType, Wg, n_ff_exp, d_model,
-                             xt, 1, gateOutBuf, matmulScratch);
-            _gmm.matmulAsync(upType, Wu, n_ff_exp, d_model,
-                             xt, 1, upOutBuf, matmulScratch);
+            _gmm.matmulAsync(gateType, Wg, n_ff_exp, d_model, xt, 1, gateOutBuf, matmulScratch);
+            _gmm.matmulAsync(upType,   Wu, n_ff_exp, d_model, xt, 1, upOutBuf,   matmulScratch);
             _ops.siluMulAsync(gateOutBuf, upOutBuf, n_ff_exp);  // silu(gate)*up
-            _gmm.matmulAsync(downExps.type, Wd, d_model, n_ff_exp,
-                             gateOutBuf, 1, expertOutBuf, matmulScratch);
+            _ops.appendMemoryCopy(gateActAll + k * n_ff_exp, gateOutBuf,
+                                  n_ff_exp * sizeof(float));
+        }
 
-            _ops.scaledAddResidualAsync(accumT, expertOutBuf,
-                                        routerWeight * wScale, d_model);
+        // Per-layer routing scratch (host-visible USM on UMA); the fused
+        // kernel reads it on the stream after these writes.
+        auto* const expIdxSlot = s.moeExpIdxScratch.as<std::int32_t>() + blockIdx * K;
+        auto* const kwSlot     = s.moeKwScratch.as<float>()            + blockIdx * K;
+        for (std::size_t k = 0; k < K; ++k) {
+            expIdxSlot[k] = _topKIdx[k];
+            kwSlot[k]     = _topKWeight[k] * wScale;
+        }
+
+        // Fused-K down projection: accum += sum_k kw[k] * (W[e_k] @ gateAct[k]).
+        _gmm.moeDownFusedKAsync(downExps.type, gateActAll, downBase,
+                                expIdxSlot, kwSlot, moeAccumBuf,
+                                n_ff_exp, d_model, K, bytesDown);
+    } else {
+        // Sequential per-token top-K dispatch (prefill / no fused kernel).
+        for (std::size_t t = 0; t < T; ++t) {
+            const float* const xt     = moeInput    + t * d_model;
+            float* const       accumT = moeAccumBuf + t * d_model;
+            for (std::size_t k = 0; k < K; ++k) {
+                const std::size_t e = static_cast<std::size_t>(_topKIdx[t * K + k]);
+                const float routerWeight = _topKWeight[t * K + k];
+
+                const void* Wg = gateBase + e * bytesGate;
+                const void* Wu = fused
+                    ? static_cast<const void*>(gateBase + e * bytesGate + gateBytesHalf)
+                    : static_cast<const void*>(upBase + e * bytesUp);
+                const void* Wd = downBase + e * bytesDown;
+
+                _gmm.matmulAsync(gateType, Wg, n_ff_exp, d_model,
+                                 xt, 1, gateOutBuf, matmulScratch);
+                _gmm.matmulAsync(upType, Wu, n_ff_exp, d_model,
+                                 xt, 1, upOutBuf, matmulScratch);
+                _ops.siluMulAsync(gateOutBuf, upOutBuf, n_ff_exp);  // silu(gate)*up
+                _gmm.matmulAsync(downExps.type, Wd, d_model, n_ff_exp,
+                                 gateOutBuf, 1, expertOutBuf, matmulScratch);
+
+                _ops.scaledAddResidualAsync(accumT, expertOutBuf,
+                                            routerWeight * wScale, d_model);
+            }
         }
     }
 

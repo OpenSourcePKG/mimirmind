@@ -143,6 +143,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _moeDownFusedKQ8_0Kernel;
     ::mimirmind::core::cuda::CudaModule _moeDownFusedKQ6KModule;
     ::mimirmind::core::cuda::CudaKernel _moeDownFusedKQ6KKernel;
+    ::mimirmind::core::cuda::CudaModule _moeDownFusedKQ5KModule;
+    ::mimirmind::core::cuda::CudaKernel _moeDownFusedKQ5KKernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ5_0VecModule;
     ::mimirmind::core::cuda::CudaKernel _matmulQ5_0VecKernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ6KVecModule;
@@ -175,6 +177,9 @@ struct GpuMatmul::Impl {
           _moeDownFusedKQ6KModule {loadCudaModule(ctx, "moe_down_fused_k_q6k")},
           _moeDownFusedKQ6KKernel {
               _moeDownFusedKQ6KModule.getFunction("moe_down_fused_k_q6k")},
+          _moeDownFusedKQ5KModule {loadCudaModule(ctx, "moe_down_fused_k_q5k")},
+          _moeDownFusedKQ5KKernel {
+              _moeDownFusedKQ5KModule.getFunction("moe_down_fused_k_q5k")},
           _matmulQ5_0VecModule    {loadCudaModule(ctx, "matmul_q5_0_vec")},
           _matmulQ5_0VecKernel    {
               _matmulQ5_0VecModule.getFunction("matmul_q5_0_vec")},
@@ -243,7 +248,8 @@ bool GpuMatmul::moeDownFusedKAvailable() const noexcept {
 bool GpuMatmul::moeDownFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
     const noexcept {
     return type == ::mimirmind::core::gguf::GgmlType::Q8_0
-        || type == ::mimirmind::core::gguf::GgmlType::Q6_K;
+        || type == ::mimirmind::core::gguf::GgmlType::Q6_K
+        || type == ::mimirmind::core::gguf::GgmlType::Q5_K;
 }
 
 void GpuMatmul::sync() {
@@ -941,11 +947,16 @@ void GpuMatmul::moeDownFusedKAsync(::mimirmind::core::gguf::GgmlType type,
             kBlockElts = 256;
             kBlockName = "Q6_K";
             break;
+        case ::mimirmind::core::gguf::GgmlType::Q5_K:
+            kernPtr    = &_pimpl->_moeDownFusedKQ5KKernel;
+            kBlockElts = 256;
+            kBlockName = "Q5_K";
+            break;
         default:
             throw std::runtime_error(
                 "compute::cuda::GpuMatmul::moeDownFusedKAsync: type not "
-                "supported on the HIP side — check moeDownFusedKAvailable"
-                "(type) before dispatching. Supported: Q8_0, Q6_K.");
+                "supported — check moeDownFusedKAvailable"
+                "(type) before dispatching. Supported: Q8_0, Q6_K, Q5_K.");
     }
     if (ffPer % kBlockElts != 0) {
         throw std::runtime_error(
