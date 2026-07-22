@@ -151,6 +151,11 @@ public:
     void deltanetChunkCumGateAsync(const float* gLog, float* gCum,
                                    std::size_t T, std::size_t H,
                                    std::size_t chunkSize) override;
+    void deltanetChunkForwardAsync(const float* q, const float* k, const float* v,
+                                   const float* gCum, const float* beta,
+                                   const float* a0, float* state, float* out,
+                                   std::size_t T, std::size_t H, std::size_t S,
+                                   std::size_t chunkSize) override;
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
     void gatherHeadsFromChannelsAsync(const float* src, float* dst,
                                       std::size_t T, std::size_t offset,

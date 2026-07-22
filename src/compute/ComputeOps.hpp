@@ -205,6 +205,22 @@ public:
             "deltanetChunkCumGateAsync: not supported on this backend");
     }
 
+    /// Chunked-prefill stage K2: chunk forward (readout + state carry).
+    /// Consumes gCum (K0) and a0 (K1); writes out [T,H,S] and carries state
+    /// [H,S,S] in place. Reference: compute::deltanetChunkForward. Default:
+    /// unsupported; CUDA overrides.
+    virtual void deltanetChunkForwardAsync(const float* q, const float* k,
+                                           const float* v, const float* gCum,
+                                           const float* beta, const float* a0,
+                                           float* state, float* out,
+                                           std::size_t T, std::size_t H,
+                                           std::size_t S, std::size_t chunkSize) {
+        (void)q; (void)k; (void)v; (void)gCum; (void)beta; (void)a0;
+        (void)state; (void)out; (void)T; (void)H; (void)S; (void)chunkSize;
+        throw std::runtime_error(
+            "deltanetChunkForwardAsync: not supported on this backend");
+    }
+
     /// In-place logistic sigmoid: y[i] = 1/(1+exp(-y[i])). GatedDeltaNet
     /// `beta` gate. Reference: compute::sigmoidInPlace.
     virtual void sigmoidInPlaceAsync(float* y, std::size_t n) = 0;

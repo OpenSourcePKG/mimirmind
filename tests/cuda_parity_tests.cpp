@@ -282,13 +282,13 @@ TEST(cuda_deltanet_chunk_cumgate_parity) {
     }
 }
 
-#if defined(MIMIRMIND_GDN_CHUNK_GPU_READY)
-
 namespace {
 inline std::size_t nChunksOf(std::size_t T, std::size_t C) {
     return (T + C - 1) / C;
 }
 } // namespace
+
+#if defined(MIMIRMIND_GDN_CHUNK_GPU_READY)
 
 // K1 — per-chunk ungated inverse A0 = (I + strictLower(diag(beta) K K^T))^-1.
 // The most error-prone kernel (triangular solve); checked directly on A0.
@@ -321,8 +321,11 @@ TEST(cuda_deltanet_kkt_solve_parity) {
     }
 }
 
+#endif  // MIMIRMIND_GDN_CHUNK_GPU_READY — K1 stays gated (kernel pending)
+
 // K2 — chunk forward: consumes G (K0) and A0 (K1), carries state, writes out.
 // Fed the CPU-reference G/A0 so a failure here is isolated to K2's own math.
+// K2's GPU kernel has landed (deltanetChunkForwardAsync) — un-gated.
 TEST(cuda_deltanet_chunk_forward_parity) {
     CudaComputeContext ctx{};
     GpuOps ops{ctx};
@@ -377,6 +380,8 @@ TEST(cuda_deltanet_chunk_forward_parity) {
         EXPECT_NEAR(gotState[i], refState[i], 2e-3f);
     }
 }
+
+#if defined(MIMIRMIND_GDN_CHUNK_GPU_READY)
 
 // End-to-end: run all three GPU kernels chained (G, A0 stay on device) and
 // close the loop against the autoregressive golden — the same output the

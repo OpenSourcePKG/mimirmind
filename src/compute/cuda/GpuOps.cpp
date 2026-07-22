@@ -209,6 +209,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _deltanetGateKernel;
     core::cuda::CudaModule _deltanetChunkCumGateModule;
     core::cuda::CudaKernel _deltanetChunkCumGateKernel;
+    core::cuda::CudaModule _deltanetChunkForwardModule;
+    core::cuda::CudaKernel _deltanetChunkForwardKernel;
     core::cuda::CudaModule _sigmoidInplaceModule;
     core::cuda::CudaKernel _sigmoidInplaceKernel;
     core::cuda::CudaModule _gatherHeadsModule;
@@ -324,6 +326,9 @@ struct GpuOps::Impl {
           _deltanetChunkCumGateModule{loadCudaModule(ctx, "deltanet_chunk_cumgate")},
           _deltanetChunkCumGateKernel{
               _deltanetChunkCumGateModule.getFunction("deltanet_chunk_cumgate")},
+          _deltanetChunkForwardModule{loadCudaModule(ctx, "deltanet_chunk_forward")},
+          _deltanetChunkForwardKernel{
+              _deltanetChunkForwardModule.getFunction("deltanet_chunk_forward")},
           _sigmoidInplaceModule    {loadCudaModule(ctx, "sigmoid_inplace")},
           _sigmoidInplaceKernel    {
               _sigmoidInplaceModule.getFunction("sigmoid_inplace")},
@@ -1015,6 +1020,49 @@ void GpuOps::deltanetChunkCumGateAsync(const float* gLog, float* gCum,
     k.launch(_ctx.stream(),
              groupsForN(total, kElementwiseLocalSize), 1, 1,
              kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::deltanetChunkForwardAsync(const float* q, const float* k_,
+                                       const float* v, const float* gCum,
+                                       const float* beta, const float* a0,
+                                       float* state, float* out,
+                                       std::size_t T, std::size_t H,
+                                       std::size_t S, std::size_t chunkSize) {
+    if (T == 0 || H == 0 || S == 0) {
+        return;
+    }
+    const std::size_t C = chunkSize ? chunkSize : 64;
+    const std::size_t f = sizeof(float);
+    // Per-head global scratch: the [S,S] state snapshot plus the [C,S] chunk
+    // working tensors exceed the shared budget at prod width. Freed after the
+    // sync below (the kernel needs it live). Correctness-first; a persistent
+    // scratch is a perf follow-up.
+    // One combined scratch buffer (kMaxArgs=16 limit): s0[H,S,S] followed by
+    // u|uq|qs|rp|d ([H,C,S] each). The kernel slices it by offset.
+    const std::size_t scratchElems = H * S * S + 5 * H * C * S;
+    auto scratch = allocate(scratchElems * f);
+
+    auto& kern = _pimpl->_deltanetChunkForwardKernel;
+    kern.setPtr  (0,  q);
+    kern.setPtr  (1,  k_);
+    kern.setPtr  (2,  v);
+    kern.setPtr  (3,  gCum);
+    kern.setPtr  (4,  beta);
+    kern.setPtr  (5,  a0);
+    kern.setPtr  (6,  state);
+    kern.setPtr  (7,  out);
+    kern.setPtr  (8,  scratch.get());
+    kern.setValue(9,  toInt32(T, "chunkfwd T"));
+    kern.setValue(10, toInt32(H, "chunkfwd H"));
+    kern.setValue(11, toInt32(S, "chunkfwd S"));
+    kern.setValue(12, toInt32(C, "chunkfwd C"));
+    // grid = H blocks (one per head), block = S threads (one per state column).
+    kern.launch(_ctx.stream(),
+                static_cast<std::uint32_t>(H), 1, 1,
+                static_cast<std::uint32_t>(S), 1, 1);
+    // Sync so the scratch ComputeBuffers stay alive until the kernel is done
+    // (prefill-only path; not the decode hot loop).
+    _ctx.stream().synchronize();
 }
 
 void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
