@@ -139,8 +139,12 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _matmulQ8_0GemmV2Kernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ8_0MmqModule;
     ::mimirmind::core::cuda::CudaKernel _matmulQ8_0MmqKernel;
+    ::mimirmind::core::cuda::CudaModule _matmulQ8_0MmqTcModule;
+    ::mimirmind::core::cuda::CudaKernel _matmulQ8_0MmqTcKernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ4KMmqModule;
     ::mimirmind::core::cuda::CudaKernel _matmulQ4KMmqKernel;
+    ::mimirmind::core::cuda::CudaModule _matmulQ5KMmqModule;
+    ::mimirmind::core::cuda::CudaKernel _matmulQ5KMmqKernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ8_0VecDp4aModule;
     ::mimirmind::core::cuda::CudaKernel _matmulQ8_0VecDp4aKernel;
     ::mimirmind::core::cuda::CudaModule _moeDownFusedKQ8_0Module;
@@ -179,9 +183,15 @@ struct GpuMatmul::Impl {
           _matmulQ8_0MmqModule    {loadCudaModule(ctx, "matmul_q8_0_mmq")},
           _matmulQ8_0MmqKernel    {
               _matmulQ8_0MmqModule.getFunction("matmul_q8_0_mmq")},
+          _matmulQ8_0MmqTcModule  {loadCudaModule(ctx, "matmul_q8_0_mmq_tc")},
+          _matmulQ8_0MmqTcKernel  {
+              _matmulQ8_0MmqTcModule.getFunction("matmul_q8_0_mmq_tc")},
           _matmulQ4KMmqModule     {loadCudaModule(ctx, "matmul_q4k_mmq")},
           _matmulQ4KMmqKernel     {
               _matmulQ4KMmqModule.getFunction("matmul_q4k_mmq")},
+          _matmulQ5KMmqModule     {loadCudaModule(ctx, "matmul_q5k_mmq")},
+          _matmulQ5KMmqKernel     {
+              _matmulQ5KMmqModule.getFunction("matmul_q5k_mmq")},
           _matmulQ8_0VecDp4aModule{loadCudaModule(ctx, "matmul_q8_0_vec_dp4a")},
           _matmulQ8_0VecDp4aKernel{
               _matmulQ8_0VecDp4aModule.getFunction("matmul_q8_0_vec_dp4a")},
@@ -990,6 +1000,31 @@ void GpuMatmul::matmulQ8_0MmqAsync(const void*  W,
                 kLocalSize, 1, 1);
 }
 
+void GpuMatmul::matmulQ8_0MmqTcAsync(const void*  W,
+                                     std::size_t  N,
+                                     std::size_t  K,
+                                     const float* X,
+                                     std::size_t  M,
+                                     float*       Y) {
+    if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
+    // One warp (32 threads) per 16x16 output tile. Kernel args: X, W, Y, K, N, M.
+    auto& kern = _pimpl->_matmulQ8_0MmqTcKernel;
+    kern.setPtr  (0, X);
+    kern.setPtr  (1, W);
+    kern.setPtr  (2, Y);
+    kern.setValue(3, static_cast<std::int32_t>(K));
+    kern.setValue(4, static_cast<std::int32_t>(N));
+    kern.setValue(5, static_cast<std::int32_t>(M));
+
+    const std::uint32_t nGroups = static_cast<std::uint32_t>((N + 15) / 16);
+    const std::uint32_t mGroups = static_cast<std::uint32_t>((M + 15) / 16);
+    kern.launch(_ctx.stream(),
+                nGroups, mGroups, 1,
+                32, 1, 1);
+}
+
 void GpuMatmul::matmulQ4KMmqAsync(const void*  W,
                                   std::size_t  N,
                                   std::size_t  K,
@@ -1001,6 +1036,32 @@ void GpuMatmul::matmulQ4KMmqAsync(const void*  W,
     }
     // Same launch geometry as the Q8_0 MMQ / GEMM path. Kernel args: X,W,Y,K,N,M.
     auto& kern = _pimpl->_matmulQ4KMmqKernel;
+    kern.setPtr  (0, X);
+    kern.setPtr  (1, W);
+    kern.setPtr  (2, Y);
+    kern.setValue(3, static_cast<std::int32_t>(K));
+    kern.setValue(4, static_cast<std::int32_t>(N));
+    kern.setValue(5, static_cast<std::int32_t>(M));
+
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+    const std::uint32_t mGroups = static_cast<std::uint32_t>(
+        (M + kGemmV2MTile - 1) / kGemmV2MTile);
+    kern.launch(_ctx.stream(),
+                nGroups, mGroups, 1,
+                kLocalSize, 1, 1);
+}
+
+void GpuMatmul::matmulQ5KMmqAsync(const void*  W,
+                                  std::size_t  N,
+                                  std::size_t  K,
+                                  const float* X,
+                                  std::size_t  M,
+                                  float*       Y) {
+    if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
+    auto& kern = _pimpl->_matmulQ5KMmqKernel;
     kern.setPtr  (0, X);
     kern.setPtr  (1, W);
     kern.setPtr  (2, Y);

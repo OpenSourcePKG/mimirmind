@@ -630,6 +630,7 @@ endif()
 
 if(MIMIRMIND_ENABLE_CUDA)
     set(CUDA_KERNEL_SOURCES
+        kernels_cuda/moe_topk.cu
         kernels_cuda/cuda_probe_kernel.cu
         kernels_cuda/attention_paged_v1.cu
         kernels_cuda/attention_paged_v2.cu
@@ -651,7 +652,9 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/matmul_q8_0_gemm.cu
         kernels_cuda/matmul_q8_0_gemm_v2.cu
         kernels_cuda/matmul_q8_0_mmq.cu
+        kernels_cuda/matmul_q8_0_mmq_tc.cu
         kernels_cuda/matmul_q4k_mmq.cu
+        kernels_cuda/matmul_q5k_mmq.cu
         kernels_cuda/matmul_f32_vec.cu
         kernels_cuda/matmul_q3k_vec.cu
         kernels_cuda/matmul_q4k_vec.cu
@@ -909,6 +912,7 @@ if(MIMIRMIND_ENABLE_CUDA)
     target_sources(mimirmind PRIVATE
         src/compute/cuda/GpuMatmul.cpp
         src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/MoeTopKRouteDevice.cpp
     )
     add_dependencies(mimirmind cuda_kernels)
 endif()
@@ -2163,6 +2167,7 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_executable(cuda_parity_tests
         tests/cuda_parity_tests.cpp
         src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/MoeTopKRouteDevice.cpp
         src/compute/cuda/GpuMatmul.cpp
         src/compute/GatedDeltaNet.cpp
         # GpuMatmul closure: CPU-fallback matmul + dequant + quant-type registry.

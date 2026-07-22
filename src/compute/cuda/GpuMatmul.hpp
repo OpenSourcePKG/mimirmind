@@ -155,10 +155,29 @@ public:
                             std::size_t  M,
                             float*       Y);
 
+    /// M-Cuda.MMQ B1b — Q8_0 int8 TENSOR-CORE (wmma) matmul GEMM for prefill.
+    /// Same contract as matmulQ8_0MmqAsync but runs the int8 dot on the
+    /// Blackwell int8 tensor cores (16x16x16 s8->s32), scaled per Q8_0 block.
+    void matmulQ8_0MmqTcAsync(const void*  W,
+                              std::size_t  N,
+                              std::size_t  K,
+                              const float* X,
+                              std::size_t  M,
+                              float*       Y);
+
     /// M-Cuda.MMQ B2 — Q4_K int8 quantized-matmul GEMM for prefill (M>1).
     /// Q4_K has no CUDA GEMM otherwise (vec-only); this both tiles it and runs
     /// the dot in int8. Affine per-sub-block dequant folded into the scale.
     void matmulQ4KMmqAsync(const void*  W,
+                           std::size_t  N,
+                           std::size_t  K,
+                           const float* X,
+                           std::size_t  M,
+                           float*       Y);
+
+    /// M-Cuda.MMQ B2 — Q5_K int8 quantized-matmul GEMM for prefill (M>1).
+    /// Q5_K = Q4_K + one high bit per quant; same affine int8 decomposition.
+    void matmulQ5KMmqAsync(const void*  W,
                            std::size_t  N,
                            std::size_t  K,
                            const float* X,

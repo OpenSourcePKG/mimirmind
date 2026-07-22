@@ -709,6 +709,82 @@ TEST(cuda_matmul_q4k_mmq_vs_fp32) {
     EXPECT_NEAR(relL2, 0.0, 0.05);
 }
 
+// M-Cuda.MMQ B1b: matmul_q8_0_mmq_tc (int8 tensor-core wmma) vs fp32 reference.
+TEST(cuda_matmul_q8_0_mmq_tc_vs_fp32) {
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+
+    const std::size_t M = 10, N = 14, K = 512;
+    const std::size_t blkBytes = 34, nBlocks = K / 32;
+    auto W = buildQuantBank(ops, blkBytes, N * nBlocks, 0x7C7Cu);
+    auto X = toDevice(ops, randVec(M * K, 0x6262u));
+
+    auto Yref = ops.allocate(M * N * sizeof(float));
+    auto Ytc  = ops.allocate(M * N * sizeof(float));
+    auto scr  = ops.allocate(std::max(N, K) * sizeof(float));
+
+    gmm.matmulAsync(GgmlType::Q8_0, W.get(), N, K,
+                    static_cast<const float*>(X.get()), M,
+                    static_cast<float*>(Yref.get()),
+                    static_cast<float*>(scr.get()));
+    gmm.matmulQ8_0MmqTcAsync(W.get(), N, K,
+                             static_cast<const float*>(X.get()), M,
+                             static_cast<float*>(Ytc.get()));
+    ops.flush();
+
+    auto ref = fromDevice(ops, Yref.get(), M * N);
+    auto got = fromDevice(ops, Ytc.get(), M * N);
+
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        const double d = static_cast<double>(got[i]) - static_cast<double>(ref[i]);
+        num += d * d;
+        den += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+    }
+    const double relL2 = (den > 0.0) ? std::sqrt(num / den) : std::sqrt(num);
+    EXPECT_TRUE(den > 0.0);
+    EXPECT_NEAR(relL2, 0.0, 0.05);
+}
+
+// M-Cuda.MMQ B2: matmul_q5k_mmq (int8 dp4a GEMM) vs fp32 q5k_vec reference.
+TEST(cuda_matmul_q5k_mmq_vs_fp32) {
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+
+    const std::size_t M = 10, N = 14, K = 512;      // K multiple of 256 (Q5_K)
+    const std::size_t blkBytes = 176, nSuper = K / 256;
+    auto W = buildQuantBank(ops, blkBytes, N * nSuper, 0x5A5Au);
+    auto X = toDevice(ops, randVec(M * K, 0x7373u));
+
+    auto Yref = ops.allocate(M * N * sizeof(float));
+    auto Ymmq = ops.allocate(M * N * sizeof(float));
+    auto scr  = ops.allocate(std::max(N, K) * sizeof(float));
+
+    gmm.matmulAsync(GgmlType::Q5_K, W.get(), N, K,
+                    static_cast<const float*>(X.get()), M,
+                    static_cast<float*>(Yref.get()),
+                    static_cast<float*>(scr.get()));
+    gmm.matmulQ5KMmqAsync(W.get(), N, K,
+                          static_cast<const float*>(X.get()), M,
+                          static_cast<float*>(Ymmq.get()));
+    ops.flush();
+
+    auto ref = fromDevice(ops, Yref.get(), M * N);
+    auto got = fromDevice(ops, Ymmq.get(), M * N);
+
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        const double d = static_cast<double>(got[i]) - static_cast<double>(ref[i]);
+        num += d * d;
+        den += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+    }
+    const double relL2 = (den > 0.0) ? std::sqrt(num / den) : std::sqrt(num);
+    EXPECT_TRUE(den > 0.0);
+    EXPECT_NEAR(relL2, 0.0, 0.05);
+}
+
 int main() {
     return mm::test::run();
 }
