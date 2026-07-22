@@ -69,9 +69,16 @@ static __device__ __forceinline__ float warp16_reduce_sum(float v) {
     return v;
 }
 
-// Load 4 aligned int8 bytes as one packed int32.
+// Pack 4 int8 bytes into one int32 (little-endian) for __dp4a. Byte-wise
+// on purpose: the Q8_0 qs payload starts at block offset 2 (after the fp16
+// scale), so weight pointers are NOT 4-byte aligned and a plain int load
+// faults on CUDA ("misaligned address"). HIP/gfx1101 tolerated the aligned
+// cast; CUDA does not.
 static __device__ __forceinline__ int load_char4_as_int(const signed char* p) {
-    return *reinterpret_cast<const int*>(p);
+    return  static_cast<int>(static_cast<unsigned char>(p[0]))
+         | (static_cast<int>(static_cast<unsigned char>(p[1])) << 8)
+         | (static_cast<int>(static_cast<unsigned char>(p[2])) << 16)
+         | (static_cast<int>(static_cast<unsigned char>(p[3])) << 24);
 }
 
 // Signed int8×4 dot product. gfx1101 lacks the pure sdot4 instruction
@@ -79,12 +86,10 @@ static __device__ __forceinline__ int load_char4_as_int(const signed char* p) {
 // free to reshape it into v_dot4_i32_iu8 with implicit bias
 // compensation if that turns out faster on Navi 32.
 static __device__ __forceinline__ int dot4_i8(int a, int b) {
-    const signed char* pa = reinterpret_cast<const signed char*>(&a);
-    const signed char* pb = reinterpret_cast<const signed char*>(&b);
-    return static_cast<int>(pa[0]) * static_cast<int>(pb[0])
-         + static_cast<int>(pa[1]) * static_cast<int>(pb[1])
-         + static_cast<int>(pa[2]) * static_cast<int>(pb[2])
-         + static_cast<int>(pa[3]) * static_cast<int>(pb[3]);
+    // Blackwell (and every sm_61+) has a native signed int8×4 dot-product;
+    // __dp4a(a, b, 0) == the manual expansion below, one instruction. The
+    // HIP sibling keeps the manual form because gfx1101 lacks signed sdot4.
+    return __dp4a(a, b, 0);
 }
 
 extern "C" __global__ __launch_bounds__(MATMUL_Q8_0_DP4A_LOCAL)

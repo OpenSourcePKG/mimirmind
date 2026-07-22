@@ -126,6 +126,11 @@ private:
     // saturation) without an external reference. No-op / zero cost when off.
     bool _ssmTrace{false};
 
+    // MIMIRMIND_Q8_DP4A: route the Q8_0 shared-expert GEMVs through the
+    // dp4a (int8) path at T=1 decode (M-Q3N.4e). Experimental A/B toggle
+    // for the perf measurement; default off.
+    bool _q8Dp4a{false};
+
     /// Host-side L2 norm + max|.| of a compute buffer, after a sync. Only
     /// called on the diagnostic trace path.
     void traceNorm(const char* tag, std::size_t blockIdx,

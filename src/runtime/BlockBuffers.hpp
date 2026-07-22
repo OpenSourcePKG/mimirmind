@@ -89,6 +89,11 @@ struct BlockBuffers {
     ComputeBuffer moeUpCompact;   // [nRowsMax, ffPerExpert]
     ComputeBuffer moeDownCompact; // [nRowsMax, d_model]
 
+    // Q8_0 dp4a decode path (M-Q3N.4e): int8-quantized activation row +
+    // per-row scale for xQuantI8Async -> matmulDp4aAsync.
+    ComputeBuffer xqI8;      // [max(d_model, ffScratch)] int8
+    ComputeBuffer xScaleI8;  // [maxSeq] f32
+
     // Qwen3-Next GatedDeltaNet linear-layer scratch (M-Q3N.3.2). Only
     // allocated for hybrid-recurrent models. Sizes derive from the SSM
     // hyperparameters: conv_dim = ssmConvDim(), value_dim = ssmInnerSize

@@ -57,6 +57,11 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
     b.upOut         = ops.allocate(upOutBytes);
     b.matmulScratch = ops.allocate(matmulScratchBytes);
     b.scoreScratch  = ops.allocate(scoreScratchBytes);
+    // Q8_0 dp4a decode path: int8-quantized activation row + its per-row
+    // scale (xQuantI8Async -> matmulDp4aAsync). Sized for the widest GEMV
+    // input this backend feeds through it (d_model or the FFN width).
+    b.xqI8     = ops.allocate(std::max(b.d_model, ffScratch) * sizeof(std::int8_t));
+    b.xScaleI8 = ops.allocate(maxSeq * sizeof(float));
 
     if (withFusedQkv) {
         // Q + K + V fused output. Widest layer: Q width + two KV widths.

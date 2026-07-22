@@ -52,6 +52,7 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
       _moeGroupEnabled{moeGroupEnabled},
       _moeFusedDownEnabled{moeFusedDownEnabled} {
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
+    _q8Dp4a   = (std::getenv("MIMIRMIND_Q8_DP4A") != nullptr);
     for (std::size_t i = 0; i < 4; ++i) {
         _ropeSections[i] = i < _config.ropeSections.size()
                                ? _config.ropeSections[i]
@@ -621,17 +622,42 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
                 "Qwen35MoeBackend: ffn_gate_shexp has unexpected shape");
         }
 
-        // gate/up over the full batch, silu-mul, down.
-        {
-            compute::UnorderedScope u{_ops};
-            _gmm.matmulAsync(gateShexp.type, gateShexp.usmPtr, n_ff_shexp, d_model,
-                             moeInput, T, gateOutBuf, matmulScratch);
-            _gmm.matmulAsync(upShexp->type, upShexp->usmPtr, n_ff_shexp, d_model,
-                             moeInput, T, upOutBuf, matmulScratch);
+        // gate/up over the batch, silu-mul, down. At T=1 decode the Q8_0
+        // GEMVs can go through the dp4a (int8) path (M-Q3N.4e): quantize the
+        // activation once per matmul input, then int8 dot products. gate/up
+        // share moeInput's quantization; down quantizes the silu-mul result.
+        const bool shexpDp4a =
+            _q8Dp4a && T == 1 &&
+            gateShexp.type == core::gguf::GgmlType::Q8_0 &&
+            upShexp->type  == core::gguf::GgmlType::Q8_0 &&
+            downShexp.type == core::gguf::GgmlType::Q8_0 &&
+            _gmm.dp4aAvailable(gateShexp.type) &&
+            (d_model % 32 == 0) && (n_ff_shexp % 32 == 0);
+
+        if (shexpDp4a) {
+            std::int8_t* const xq = s.xqI8.as<std::int8_t>();
+            float* const       xs = s.xScaleI8.as<float>();
+            _ops.xQuantI8Async(moeInput, xq, xs, 1, d_model);
+            _gmm.matmulDp4aAsync(gateShexp.type, xq, xs, gateShexp.usmPtr,
+                                 n_ff_shexp, d_model, 1, gateOutBuf);
+            _gmm.matmulDp4aAsync(upShexp->type, xq, xs, upShexp->usmPtr,
+                                 n_ff_shexp, d_model, 1, upOutBuf);
+            _ops.siluMulAsync(gateOutBuf, upOutBuf, n_ff_shexp);
+            _ops.xQuantI8Async(gateOutBuf, xq, xs, 1, n_ff_shexp);
+            _gmm.matmulDp4aAsync(downShexp.type, xq, xs, downShexp.usmPtr,
+                                 d_model, n_ff_shexp, 1, expertOutBuf);
+        } else {
+            {
+                compute::UnorderedScope u{_ops};
+                _gmm.matmulAsync(gateShexp.type, gateShexp.usmPtr, n_ff_shexp, d_model,
+                                 moeInput, T, gateOutBuf, matmulScratch);
+                _gmm.matmulAsync(upShexp->type, upShexp->usmPtr, n_ff_shexp, d_model,
+                                 moeInput, T, upOutBuf, matmulScratch);
+            }
+            _ops.siluMulAsync(gateOutBuf, upOutBuf, T * n_ff_shexp);
+            _gmm.matmulAsync(downShexp.type, downShexp.usmPtr, d_model, n_ff_shexp,
+                             gateOutBuf, T, expertOutBuf, matmulScratch);
         }
-        _ops.siluMulAsync(gateOutBuf, upOutBuf, T * n_ff_shexp);
-        _gmm.matmulAsync(downShexp.type, downShexp.usmPtr, d_model, n_ff_shexp,
-                         gateOutBuf, T, expertOutBuf, matmulScratch);
 
         // scalar gate per token -> sigmoid -> broadcast multiply.
         // scoreScratch is [maxSeq] fp32; T <= maxSeq, so it holds [T, 1].
