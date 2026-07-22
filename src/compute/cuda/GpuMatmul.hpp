@@ -143,6 +143,18 @@ public:
 
     [[nodiscard]] bool ffnGateUpFusedQ8Available() const noexcept override;
 
+    /// M-Cuda.MMQ B1 — Q8_0 int8 quantized-matmul GEMM for prefill (M>1).
+    /// Y[M,N] = X[M,K] (fp32, int8-quantised per 32-elem block) · W[N,K]
+    /// (Q8_0), int8 dp4a dots scaled per k-block. Lossy vs fp32 (int8
+    /// activations) — the compute-bound-prefill accelerator. CUDA-only, not on
+    /// the ComputeMatmul interface yet (production dispatch wiring is step C1).
+    void matmulQ8_0MmqAsync(const void*  W,
+                            std::size_t  N,
+                            std::size_t  K,
+                            const float* X,
+                            std::size_t  M,
+                            float*       Y);
+
     void sync() override;
 
     [[nodiscard]] std::vector<::mimirmind::compute::AutotuneReport>

@@ -137,6 +137,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _matmulQ8_0GemmKernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ8_0GemmV2Module;
     ::mimirmind::core::cuda::CudaKernel _matmulQ8_0GemmV2Kernel;
+    ::mimirmind::core::cuda::CudaModule _matmulQ8_0MmqModule;
+    ::mimirmind::core::cuda::CudaKernel _matmulQ8_0MmqKernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ8_0VecDp4aModule;
     ::mimirmind::core::cuda::CudaKernel _matmulQ8_0VecDp4aKernel;
     ::mimirmind::core::cuda::CudaModule _moeDownFusedKQ8_0Module;
@@ -172,6 +174,9 @@ struct GpuMatmul::Impl {
           _matmulQ8_0GemmV2Module {loadCudaModule(ctx, "matmul_q8_0_gemm_v2")},
           _matmulQ8_0GemmV2Kernel {
               _matmulQ8_0GemmV2Module.getFunction("matmul_q8_0_gemm_v2")},
+          _matmulQ8_0MmqModule    {loadCudaModule(ctx, "matmul_q8_0_mmq")},
+          _matmulQ8_0MmqKernel    {
+              _matmulQ8_0MmqModule.getFunction("matmul_q8_0_mmq")},
           _matmulQ8_0VecDp4aModule{loadCudaModule(ctx, "matmul_q8_0_vec_dp4a")},
           _matmulQ8_0VecDp4aKernel{
               _matmulQ8_0VecDp4aModule.getFunction("matmul_q8_0_vec_dp4a")},
@@ -933,6 +938,34 @@ void GpuMatmul::matmulDp4aAsync(::mimirmind::core::gguf::GgmlType type,
                     nGroups, 1, 1,
                     kDp4aLocalSize, 1, 1);
     }
+}
+
+void GpuMatmul::matmulQ8_0MmqAsync(const void*  W,
+                                   std::size_t  N,
+                                   std::size_t  K,
+                                   const float* X,
+                                   std::size_t  M,
+                                   float*       Y) {
+    if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
+    // Same launch geometry as the Q8_0 GEMM path (4 output cols/WG, M_TILE
+    // rows/WG, 64 threads). Kernel arg order: X, W, Y, K, N, M.
+    auto& kern = _pimpl->_matmulQ8_0MmqKernel;
+    kern.setPtr  (0, X);
+    kern.setPtr  (1, W);
+    kern.setPtr  (2, Y);
+    kern.setValue(3, static_cast<std::int32_t>(K));
+    kern.setValue(4, static_cast<std::int32_t>(N));
+    kern.setValue(5, static_cast<std::int32_t>(M));
+
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+    const std::uint32_t mGroups = static_cast<std::uint32_t>(
+        (M + kGemmV2MTile - 1) / kGemmV2MTile);
+    kern.launch(_ctx.stream(),
+                nGroups, mGroups, 1,
+                kLocalSize, 1, 1);
 }
 
 void GpuMatmul::moeDownFusedKAsync(::mimirmind::core::gguf::GgmlType type,

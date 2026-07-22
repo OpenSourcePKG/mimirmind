@@ -627,6 +627,48 @@ TEST(cuda_moe_down_fused_k_q5k_parity) {
     }
 }
 
+// M-Cuda.MMQ B1: matmul_q8_0_mmq (int8 dp4a GEMM) vs the fp32 reference.
+// Unlike the exact fused-MoE parity above, MMQ int8-quantises the activations
+// -> lossy vs fp32. Assert a relative-L2 bound (structural bugs blow it up;
+// int8 quant noise stays well under it), not bit-exactness. Reference is the
+// untuned matmulAsync (matvec-loop, exact fp32 dequant).
+TEST(cuda_matmul_q8_0_mmq_vs_fp32) {
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+
+    const std::size_t M = 10, N = 14, K = 512;   // partial M-tile + partial N
+    const std::size_t blkBytes = 34, nBlocks = K / 32;
+    auto W = buildQuantBank(ops, blkBytes, N * nBlocks, 0x8080u);
+    auto X = toDevice(ops, randVec(M * K, 0x3131u));
+
+    auto Yref    = ops.allocate(M * N * sizeof(float));
+    auto Ymmq    = ops.allocate(M * N * sizeof(float));
+    auto scratch = ops.allocate(std::max(N, K) * sizeof(float));
+
+    gmm.matmulAsync(GgmlType::Q8_0, W.get(), N, K,
+                    static_cast<const float*>(X.get()), M,
+                    static_cast<float*>(Yref.get()),
+                    static_cast<float*>(scratch.get()));
+    gmm.matmulQ8_0MmqAsync(W.get(), N, K,
+                           static_cast<const float*>(X.get()), M,
+                           static_cast<float*>(Ymmq.get()));
+    ops.flush();
+
+    auto ref = fromDevice(ops, Yref.get(), M * N);
+    auto got = fromDevice(ops, Ymmq.get(), M * N);
+
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        const double d = static_cast<double>(got[i]) - static_cast<double>(ref[i]);
+        num += d * d;
+        den += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+    }
+    const double relL2 = (den > 0.0) ? std::sqrt(num / den) : std::sqrt(num);
+    EXPECT_TRUE(den > 0.0);            // reference is non-trivial
+    EXPECT_NEAR(relL2, 0.0, 0.05);     // int8-activation quant is lossy
+}
+
 int main() {
     return mm::test::run();
 }
