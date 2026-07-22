@@ -349,7 +349,8 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
                      std::size_t                   flashPrefillKTileQ8,
                      core::config::TriState        q8_0ReorderMode)
     : _ctx{ctx},
-      _pimpl{std::make_unique<Impl>(ctx.cudaContext())}
+      _pimpl{std::make_unique<Impl>(ctx.cudaContext())},
+      _moeTopKRoute{ctx}
 {
     auto& alloc = ctx.allocator();
 
@@ -1091,6 +1092,13 @@ void GpuOps::deltanetKktSolveInverseAsync(const float* k_, const float* beta,
     kern.launch(_ctx.stream(),
                 static_cast<std::uint32_t>(nBlocks), 1, 1,
                 static_cast<std::uint32_t>(C), 1, 1);
+}
+
+void GpuOps::moeTopKRouteDeviceAsync(const float* logits, std::int32_t* outIdx,
+                                     float* outWeight, std::size_t T,
+                                     std::size_t nExperts, std::size_t K,
+                                     float wScale) {
+    _moeTopKRoute.launch(logits, outIdx, outWeight, T, nExperts, K, wScale);
 }
 
 void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {

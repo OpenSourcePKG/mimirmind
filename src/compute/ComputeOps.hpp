@@ -233,6 +233,24 @@ public:
             "deltanetKktSolveInverseAsync: not supported on this backend");
     }
 
+    /// M-Q3N.5: device-side MoE top-K router. Replaces the host
+    /// compute::moeTopKRoute + host->USM copy so the MoE block has no host
+    /// sync (precondition for decode graph capture). logits [T,nExperts] F32;
+    /// outIdx [T,K] int32; outWeight [T,K] F32 (renormalised, *wScale).
+    /// Reference: compute::moeTopKRoute. Default: unsupported; CUDA overrides.
+    virtual void moeTopKRouteDeviceAsync(const float*  logits,
+                                         std::int32_t* outIdx,
+                                         float*        outWeight,
+                                         std::size_t   T,
+                                         std::size_t   nExperts,
+                                         std::size_t   K,
+                                         float         wScale) {
+        (void)logits; (void)outIdx; (void)outWeight;
+        (void)T; (void)nExperts; (void)K; (void)wScale;
+        throw std::runtime_error(
+            "moeTopKRouteDeviceAsync: not supported on this backend");
+    }
+
     /// In-place logistic sigmoid: y[i] = 1/(1+exp(-y[i])). GatedDeltaNet
     /// `beta` gate. Reference: compute::sigmoidInPlace.
     virtual void sigmoidInPlaceAsync(float* y, std::size_t n) = 0;

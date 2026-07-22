@@ -4,6 +4,7 @@
 #pragma once
 
 #include "compute/ComputeOps.hpp"
+#include "compute/cuda/MoeTopKRouteDevice.hpp"
 #include "core/config/Config.hpp"
 #include "runtime/KvCache.hpp"
 
@@ -159,6 +160,10 @@ public:
     void deltanetKktSolveInverseAsync(const float* k, const float* beta,
                                       float* a0, std::size_t T, std::size_t H,
                                       std::size_t S, std::size_t chunkSize) override;
+    void moeTopKRouteDeviceAsync(const float* logits, std::int32_t* outIdx,
+                                 float* outWeight, std::size_t T,
+                                 std::size_t nExperts, std::size_t K,
+                                 float wScale) override;
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
     void gatherHeadsFromChannelsAsync(const float* src, float* dst,
                                       std::size_t T, std::size_t offset,
@@ -275,6 +280,10 @@ private:
 
     struct Impl;
     std::unique_ptr<Impl>         _pimpl;
+
+    // M-Q3N.5 device-side MoE top-K router launcher (holds the moe_topk
+    // module + kernel; loaded once). Delegated to by moeTopKRouteDeviceAsync.
+    MoeTopKRouteDevice            _moeTopKRoute;
 
     // Persistent scratch — layout identical to the L0 side for pattern
     // parity. Sizes are constants below.

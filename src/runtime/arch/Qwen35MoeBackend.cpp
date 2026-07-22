@@ -53,6 +53,7 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
       _moeFusedDownEnabled{moeFusedDownEnabled} {
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     _q8Dp4a   = (std::getenv("MIMIRMIND_Q8_DP4A") != nullptr);
+    _moeDeviceTopKEnabled = (std::getenv("MIMIRMIND_MOE_DEVICE_TOPK") != nullptr);
     // Chunked GatedDeltaNet prefill auto-gate (M-Q3N.4). See the header for the
     // precedence rules; MIN_T (the A/B sweep knob) overrides the coarse flag.
     _gdnChunkMinT = kGdnChunkMinTDefault;
@@ -507,14 +508,35 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
     float* const expertOutBuf  = s.expertOutBuf.as<float>();
     (void)normBuf;
 
+    // --- M-Q3N.5: decide device-side top-K up front. These predicates are
+    // identical to useMoeFusedDown / useGateUpFused below (recomputed here
+    // only because they are needed before the router to gate the host
+    // moeTopKRoute). deviceTopK is true only on the fully-fused decode path,
+    // where _topKIdx/_topKWeight go unused (the fused-K kernels read
+    // expIdxSlot/kwSlot filled on-device instead) — so skipping the host
+    // top-K there removes the per-layer host round trip.
+    const core::gguf::GgufTensor& upSrcPre = fused ? *gateUpFused : *upExpsP;
+    const bool useMoeFusedDownPre =
+        _moeFusedDownEnabled && T == 1 &&
+        _gmm.moeDownFusedKAvailable(downExps.type) && (n_ff_exp % 256 == 0) &&
+        s.moeExpIdxScratch.get() != nullptr && s.moeKwScratch.get() != nullptr &&
+        s.moeGateCompact.get() != nullptr;
+    const bool useGateUpFusedPre =
+        !fused && gateSrc.type == upSrcPre.type &&
+        _gmm.moeGateUpFusedKAvailable(gateSrc.type) && (d_model % 256 == 0);
+    const bool deviceTopK =
+        _moeDeviceTopKEnabled && useMoeFusedDownPre && useGateUpFusedPre;
+
     // --- router: logits = ffn_gate_inp @ x, then top-K softmax -------
     _gmm.matmul(routerW.type, routerW.usmPtr, nExperts, d_model,
                 moeInput, T, upOutBuf, matmulScratch);   // upOutBuf [T, nExperts]
 
     _topKIdx.resize(T * K);
     _topKWeight.resize(T * K);
-    cmp::moeTopKRoute(upOutBuf, T, nExperts, K,
-                      _topKIdx.data(), _topKWeight.data());
+    if (!deviceTopK) {
+        cmp::moeTopKRoute(upOutBuf, T, nExperts, K,
+                          _topKIdx.data(), _topKWeight.data());
+    }
 
     // Optional router-weight scale (llama.cpp w_scale); 0 = unset = 1.0.
     const float wScale = (_config.expertWeightsScale != 0.0F)
@@ -576,9 +598,17 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
         // kernels read it on the stream after these writes.
         auto* const expIdxSlot = s.moeExpIdxScratch.as<std::int32_t>() + blockIdx * K;
         auto* const kwSlot     = s.moeKwScratch.as<float>()            + blockIdx * K;
-        for (std::size_t k = 0; k < K; ++k) {
-            expIdxSlot[k] = _topKIdx[k];
-            kwSlot[k]     = _topKWeight[k] * wScale;
+        if (deviceTopK) {
+            // top-K straight into the USM slots on the stream — no host round
+            // trip. deviceTopK guarantees the fused gate/up path below reads
+            // expIdxSlot (never the host _topKIdx fallback).
+            _ops.moeTopKRouteDeviceAsync(upOutBuf, expIdxSlot, kwSlot,
+                                         T, nExperts, K, wScale);
+        } else {
+            for (std::size_t k = 0; k < K; ++k) {
+                expIdxSlot[k] = _topKIdx[k];
+                kwSlot[k]     = _topKWeight[k] * wScale;
+            }
         }
 
         // gate/up -> silu(gate)*up into the K-strided [K, n_ff_exp] slots.

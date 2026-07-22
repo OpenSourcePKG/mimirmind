@@ -120,6 +120,11 @@ private:
 
     bool _moeGroupEnabled;
     bool _moeFusedDownEnabled;
+    // M-Q3N.5: device-side MoE top-K (env MIMIRMIND_MOE_DEVICE_TOPK). When on
+    // AND the fully-fused decode path applies, top-K runs on the device and
+    // the host moeTopKRoute + host->USM copy are skipped (no per-layer host
+    // sync). Default off until parity-gated in prod.
+    bool _moeDeviceTopKEnabled{false};
 
     // Diagnostic: when MIMIRMIND_SSM_TRACE is set, log per-linear-layer
     // recurrent-state / output norms and per-block residual-stream norms
