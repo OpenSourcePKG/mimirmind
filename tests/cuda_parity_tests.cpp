@@ -890,6 +890,49 @@ TEST(cuda_matmul_q8_0_mmq_largeM_tc) {
     EXPECT_TRUE(rl < 0.15);
 }
 
+// Localise the per-element defect: dump the worst (m,n) outputs + histograms
+// over m%16 / n%16 (TC tile = 16x16) to reveal a tile-boundary structure.
+// Clean inputs (no outliers) since the defect is present there too.
+TEST(cuda_matmul_q8_0_mmq_tc_localize) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx}; GpuMatmul gmm{ctx, ops};
+    const std::size_t M = 2048, N = 256, K = 2048, nBlocks = K / 32;
+    auto W  = buildQuantBank(ops, 34, N * nBlocks, 0xABCDu);
+    auto X  = toDevice(ops, randVec(M * K, 0x1234u));
+    auto Yr = ops.allocate(M * N * sizeof(float));
+    auto Ym = ops.allocate(M * N * sizeof(float));
+    auto sc = ops.allocate(std::max(N, K) * sizeof(float));
+    gmm.matmulAsync(GgmlType::Q8_0, W.get(), N, K,
+                    static_cast<const float*>(X.get()), M,
+                    static_cast<float*>(Yr.get()), static_cast<float*>(sc.get()));
+    gmm.matmulQ8_0MmqTcAsync(W.get(), N, K,
+                             static_cast<const float*>(X.get()), M,
+                             static_cast<float*>(Ym.get()));
+    ops.flush();
+    auto r = fromDevice(ops, Yr.get(), M * N);
+    auto m = fromDevice(ops, Ym.get(), M * N);
+
+    struct E { float err; int mi; int ni; float ref; float got; };
+    std::vector<E> bad;
+    for (std::size_t i = 0; i < r.size(); ++i) {
+        const float e = std::fabs(m[i] - r[i]);
+        if (e > 0.3f) bad.push_back({e, int(i / N), int(i % N), r[i], m[i]});
+    }
+    std::sort(bad.begin(), bad.end(),
+              [](const E& a, const E& b) { return a.err > b.err; });
+    int hm[16] = {0}, hn[16] = {0};
+    for (const auto& e : bad) { hm[e.mi % 16]++; hn[e.ni % 16]++; }
+    std::printf("=== LOCALIZE clean M=2048 N=256 K=2048: %zu elems err>0.3 ===\n",
+                bad.size());
+    std::printf("m%%16: "); for (int i = 0; i < 16; ++i) std::printf("%d ", hm[i]);
+    std::printf("\nn%%16: "); for (int i = 0; i < 16; ++i) std::printf("%d ", hn[i]);
+    std::printf("\n");
+    for (std::size_t i = 0; i < bad.size() && i < 15; ++i)
+        std::printf("  [m=%d n=%d] ref=%.4f got=%.4f err=%.4f\n",
+                    bad[i].mi, bad[i].ni, bad[i].ref, bad[i].got, bad[i].err);
+    EXPECT_TRUE(true);
+}
+
 int main() {
     return mm::test::run();
 }
