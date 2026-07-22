@@ -270,6 +270,10 @@ private:
     // through the int8 dp4a MMQ GEMM instead of the fp32 gemm/matvec path.
     // Decode (M==1) is unaffected. Default off until the prefill A/B lands.
     bool                           _mmqEnabled{false};
+    // MIMIRMIND_MMQ_TC (only meaningful with MIMIRMIND_MMQ): use the int8
+    // TENSOR-CORE (wmma) Q8_0 MMQ kernel instead of the dp4a one. A/B knob to
+    // measure tensor-core vs dp4a for the Q8_0 prefill.
+    bool                           _mmqTc{false};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
                                    _vecMsAtM{};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
