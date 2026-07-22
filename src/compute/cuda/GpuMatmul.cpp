@@ -245,10 +245,15 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
     if (const char* tc = std::getenv("MIMIRMIND_MMQ_TC")) {
         _mmqTc = (tc[0] != '\0' && !(tc[0] == '0' && tc[1] == '\0'));
     }
+    if (const char* mx = std::getenv("MIMIRMIND_MMQ_MAX_N")) {
+        const long v = std::strtol(mx, nullptr, 10);
+        if (v > 0) _mmqMaxN = static_cast<std::size_t>(v);
+    }
     if (_mmqEnabled) {
         MM_LOG_INFO("hip::GpuMatmul",
-                    "M-Cuda.MMQ enabled — Q8_0 prefill (M>1) uses int8 {} MMQ",
-                    _mmqTc ? "tensor-core" : "dp4a");
+                    "M-Cuda.MMQ enabled — Q8_0 prefill (M>1) uses int8 {} MMQ "
+                    "for N<={} (lm_head/vocab stays fp32)",
+                    _mmqTc ? "tensor-core" : "dp4a", _mmqMaxN);
     }
     MM_LOG_INFO("hip::GpuMatmul",
                 "compute::cuda::GpuMatmul ready — 12 kernels loaded "
@@ -840,10 +845,12 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
     // matvec-loop path even at Mmax. Same behaviour as L0.
 
     if (_mmqEnabled && type == ::mimirmind::core::gguf::GgmlType::Q8_0
-        && M > 1) {
+        && M > 1 && N <= _mmqMaxN) {
         // M-Cuda.MMQ C1 — int8 MMQ GEMM for Q8_0 prefill (env-gated). Decode
         // (M==1) falls through to the launch-bound-friendly GEMV path.
         // MIMIRMIND_MMQ_TC picks the tensor-core (wmma) kernel over dp4a.
+        // Alternative F: N>_mmqMaxN (the vocab-sized lm_head) stays fp32 so the
+        // greedy argmax is decided by exact final logits.
         if (_mmqTc) {
             matmulQ8_0MmqTcAsync(W, N, K, X, M, Y);
         } else {

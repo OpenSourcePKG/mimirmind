@@ -274,6 +274,14 @@ private:
     // TENSOR-CORE (wmma) Q8_0 MMQ kernel instead of the dp4a one. A/B knob to
     // measure tensor-core vs dp4a for the Q8_0 prefill.
     bool                           _mmqTc{false};
+    // M-Cuda.MMQ Alternative F: skip MMQ for output dims larger than this, i.e.
+    // keep the vocab-sized final logit projection (lm_head, N=vocab~248320) in
+    // fp32. The greedy argmax is decided by the final logits, so int8 loss there
+    // tips the top token; the intermediate projections (N<=d_model-ish) run
+    // through error-tolerant norms/attention. Default 32768 excludes lm_head,
+    // includes every other Q8_0 matmul. MIMIRMIND_MMQ_MAX_N overrides (0/large
+    // = no exclusion, i.e. MMQ everything, for the A/B).
+    std::size_t                    _mmqMaxN{32768};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
                                    _vecMsAtM{};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
