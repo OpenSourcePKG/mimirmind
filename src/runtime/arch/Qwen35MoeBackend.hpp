@@ -131,6 +131,12 @@ private:
     // for the perf measurement; default off.
     bool _q8Dp4a{false};
 
+    // MIMIRMIND_GDN_CHUNK: use the chunked GatedDeltaNet prefill (K0->K1->K2)
+    // for T>1 instead of the sequential AR loop (M-Q3N.4). Parity-equivalent
+    // (cuda_parity 10/10); env-gated for A/B until it is the default. Decode
+    // (T==1) always uses the AR recurrence.
+    bool _gdnChunk{false};
+
     /// Host-side L2 norm + max|.| of a compute buffer, after a sync. Only
     /// called on the diagnostic trace path.
     void traceNorm(const char* tag, std::size_t blockIdx,

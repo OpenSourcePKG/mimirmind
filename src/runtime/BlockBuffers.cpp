@@ -97,6 +97,11 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         b.ssmAlpha     = ops.allocate(maxT * hV * f);
         b.ssmBeta      = ops.allocate(maxT * hV * f);
         b.ssmGate      = ops.allocate(maxT * hV * f);
+        // Chunked-prefill (T>1) scratch: K0 cumgate output + K1 inverse a0.
+        const std::size_t cChunk     = 64;
+        const std::size_t nChunksMax = (maxT + cChunk - 1) / cChunk;
+        b.ssmGCum = ops.allocate(maxT * hV * f);
+        b.ssmA0   = ops.allocate(nChunksMax * hV * cChunk * cChunk * f);
         // The persistent recurrent state (ssmStatePtr / ssmConvStatePtr) is
         // NOT allocated here — it lives in a per-sequence SsmState object
         // that the engine binds after this allocation. Only the transient

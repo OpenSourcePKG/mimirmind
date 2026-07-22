@@ -123,6 +123,12 @@ struct BlockBuffers {
     float* ssmStatePtr     = nullptr;  // -> SsmState::statePtr()
     float* ssmConvStatePtr = nullptr;  // -> SsmState::convStatePtr()
 
+    // Chunked-prefill (T>1) scratch (M-Q3N.4 integration): K0 cumgate output
+    // gCum [maxT, H_v] and K1 triangular-inverse a0 [nChunks, H_v, C, C]
+    // (C=64). Only used on the T>1 chunked path; the AR decode path ignores them.
+    ComputeBuffer ssmGCum;
+    ComputeBuffer ssmA0;
+
     // M-MoE.Fused-Decode — per-layer routing scratches for the fused-K
     // down kernel. The command queue records dispatches lazily, so the
     // caller cannot reuse a single K-sized scratch across layers (the

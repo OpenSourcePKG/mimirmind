@@ -53,6 +53,7 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
       _moeFusedDownEnabled{moeFusedDownEnabled} {
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     _q8Dp4a   = (std::getenv("MIMIRMIND_Q8_DP4A") != nullptr);
+    _gdnChunk = (std::getenv("MIMIRMIND_GDN_CHUNK") != nullptr);
     for (std::size_t i = 0; i < 4; ++i) {
         _ropeSections[i] = i < _config.ropeSections.size()
                                ? _config.ropeSections[i]
@@ -382,8 +383,22 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     if (isSeqStart) {
         _ops.mulScalarAsync(stateBuf, 0.0F, stateElems);
     }
-    _ops.gatedDeltaNetRecurrentAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
-                                     stateBuf, deltaOut, T, hV, S);
+    if (_gdnChunk && T > 1) {
+        // Chunked prefill: K0 (cumgate) -> K1 (kkt inverse) -> K2 (forward).
+        // Parity-equivalent to the AR recurrence (cuda_parity 10/10) but
+        // parallel across the chunk instead of T sequential steps. gateBuf is
+        // gLog; K0 turns it into gCum. Chunk size C = 64.
+        const std::size_t cChunk = 64;
+        float* const gCum = s.ssmGCum.as<float>();
+        float* const a0   = s.ssmA0.as<float>();
+        _ops.deltanetChunkCumGateAsync(gateBuf, gCum, T, hV, cChunk);
+        _ops.deltanetKktSolveInverseAsync(kBuf, betaBuf, a0, T, hV, S, cChunk);
+        _ops.deltanetChunkForwardAsync(qBuf, kBuf, vBuf, gCum, betaBuf, a0,
+                                       stateBuf, deltaOut, T, hV, S, cChunk);
+    } else {
+        _ops.gatedDeltaNetRecurrentAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
+                                         stateBuf, deltaOut, T, hV, S);
+    }
 
     if (_ssmTrace) {
         // For T>1 (prefill) the state reflects the last token; for decode
