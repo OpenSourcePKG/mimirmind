@@ -783,6 +783,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         src/core/gpu/cuda/CudaComputeContext.cpp
         src/core/gpu/cuda/PagedAttentionV1.cpp
         src/core/gpu/cuda/PagedAttentionV2.cpp
+        src/core/gpu/cuda/CudaGraph.cpp
     )
 
     target_link_libraries(mimirmind_core_cuda PUBLIC

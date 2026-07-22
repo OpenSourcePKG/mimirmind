@@ -1368,6 +1368,37 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         _ops->setReplayMaxKTiles(0);
 #endif
 
+#ifdef MIMIRMIND_HAVE_CUDA
+        // M-Q3N.5 K4: CUDA-graph decode capture. Reset any graph from a prior
+        // generate() (a different length => a different capture), then arm on
+        // the CUDA backend when features.clr is on. MoE needs device-top-K
+        // (MIMIRMIND_MOE_DEVICE_TOPK) so the decode block is host-sync-free;
+        // if a residual sync remains, cudaStreamEndCapture throws and we fall
+        // back to immediate mode for the rest of the run.
+        _cudaDecodeGraph    = core::cuda::CudaGraph{};
+        _cudaGraphDisabled  = false;
+        // Opt-in via MIMIRMIND_CUDA_GRAPH (NOT features.clr) — experimental,
+        // off by default until the decode-replay path is bit-identical to
+        // immediate mode (a divergence remains under investigation).
+        const bool cudaGraphEnabled =
+            std::getenv("MIMIRMIND_CUDA_GRAPH") != nullptr &&
+            _computeCtx->kind() == core::backend::BackendKind::Cuda;
+        if (cudaGraphEnabled) {
+            const std::size_t maxCurLen =
+                promptIds.size() + params.maxNewTokens;
+            const std::size_t replayKTiles = std::min(
+                (maxCurLen + compute::cuda::GpuOps::kFlashKTileSize - 1) /
+                    compute::cuda::GpuOps::kFlashKTileSize,
+                compute::cuda::GpuOps::kFlashMaxKTiles);
+            cudaOps().setReplayMaxKTiles(replayKTiles);
+            MM_LOG_INFO("engine",
+                        "features.clr on CUDA — decode-graph capture armed, "
+                        "flash geometry right-sized to {} k-tiles "
+                        "(max curLen {})",
+                        replayKTiles, maxCurLen);
+        }
+#endif
+
         // Inter-token thermal pacing — consult guard every kPaceWindow
         // tokens so /sys reads don't dominate the inner loop. Window of
         // 4 keeps overhead under a millisecond per token at ~145 ms/tok
@@ -1453,6 +1484,56 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 }
                 l0Ops().queue().endRecord();
                 l0Ops().queue().replay();
+            } else
+#endif
+#ifdef MIMIRMIND_HAVE_CUDA
+            if (cudaGraphEnabled && _cudaDecodeGraph.valid()) {
+                // Replay: update the curLen slot outside the graph (stream-
+                // ordered before the launch), replay the captured prefix, then
+                // run the final (non-capturable) block immediately.
+                cudaOps().updateDecodeCurLen(
+                    static_cast<std::int32_t>(cache.length()));
+                _cudaDecodeGraph.launch(cudaOps().stream());
+                _backend->runBlock(_config.blockCount - 1, xBuf, 1, cache,
+                                   buffers, false);
+            } else if (cudaGraphEnabled && step == 1) {
+                // Capture the trunk once. The engine now owns the curLen slot
+                // (per-kernel staging off) and pre-sets it; the embedding /
+                // scale enqueued above run before capture (drained by the
+                // sync), so only the block loop is captured.
+                cudaOps().setPerKernelCurLenStaging(false);
+                cudaOps().updateDecodeCurLen(
+                    static_cast<std::int32_t>(cache.length()));
+                cudaOps().stream().synchronize();
+                try {
+                    // Capture all but the final block. Qwen3-Next-style models
+                    // have a heterogeneous last trunk layer (gate/up quant with
+                    // no fused-K kernel => host top-K => a mid-record sync that
+                    // cannot be captured); it runs immediately after the graph.
+                    // If an EARLIER block is also non-capturable the capture
+                    // throws and we fall back to full immediate mode below.
+                    const std::uint32_t nCap =
+                        _config.blockCount > 0 ? _config.blockCount - 1 : 0;
+                    _cudaDecodeGraph.capture(cudaOps().stream(), [&] {
+                        for (std::uint32_t b = 0; b < nCap; ++b) {
+                            _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+                        }
+                    });
+                    _cudaDecodeGraph.launch(cudaOps().stream());
+                    _backend->runBlock(_config.blockCount - 1, xBuf, 1, cache,
+                                       buffers, false);
+                } catch (const std::exception& e) {
+                    // Residual host sync mid-record (e.g. device-top-K off) —
+                    // fall back to immediate mode for the rest of the run.
+                    MM_LOG_WARN("engine",
+                                "CUDA-graph decode capture failed ({}); "
+                                "falling back to immediate mode", e.what());
+                    _cudaGraphDisabled = true;
+                    cudaOps().setPerKernelCurLenStaging(true);
+                    for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
+                        _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+                    }
+                }
             } else
 #endif
             {

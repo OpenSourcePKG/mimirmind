@@ -450,10 +450,25 @@ GpuOps::~GpuOps() {
 
 void GpuOps::stagedInt32ToDevice(std::int32_t* devicePtr,
                                  std::int32_t  value) {
+    // During graph capture/replay the engine owns _curLenSlotUsm and updates
+    // it once per token outside the graph; skip the per-kernel copy so no
+    // record-time value is baked into the captured DAG.
+    if (!_perKernelCurLenStaging && devicePtr == _curLenSlotUsm) {
+        return;
+    }
     std::int32_t* slot = &_scalarRing[_scalarRingIdx];
     *slot = value;
     _scalarRingIdx = (_scalarRingIdx + 1) & (kScalarRingSize - 1);
     appendMemoryCopy(devicePtr, slot, sizeof(std::int32_t));
+}
+
+void GpuOps::updateDecodeCurLen(std::int32_t v) {
+    // Raw staging bypassing the gate — the single per-token curLen update the
+    // engine issues outside the captured region.
+    std::int32_t* slot = &_scalarRing[_scalarRingIdx];
+    *slot = v;
+    _scalarRingIdx = (_scalarRingIdx + 1) & (kScalarRingSize - 1);
+    appendMemoryCopy(_curLenSlotUsm, slot, sizeof(std::int32_t));
 }
 
 // ---- Real (non-stub) implementations --------------------------------
@@ -1503,12 +1518,17 @@ void GpuOps::attentionDecodeFlashAsync(const float* q, const void* k,
     partialKernel.setValue(8, scale);
     partialKernel.setValue(9, toInt32(slidingWindow, "flash slidingWindow"));
 
-    // HIP has no hipGraph recording yet, so launch geometry always uses
-    // the actual nKTiles (immediate-mode optimal). `_replayMaxKTiles` is
-    // kept as bookkeeping for the future hipGraph landing (Schritt 5).
+    // In graph capture/replay mode (staging off) the launch geometry must
+    // cover the MAX KV length (_replayMaxKTiles) — the captured grid is
+    // frozen, and the kernel early-exits K-tiles past curLen (read from the
+    // slot). In immediate mode use the actual nKTiles (optimal). M-Q3N.5 K4.
+    const std::uint32_t gridKTiles =
+        (!_perKernelCurLenStaging && _replayMaxKTiles > 0)
+            ? static_cast<std::uint32_t>(_replayMaxKTiles)
+            : static_cast<std::uint32_t>(nKTiles);
     partialKernel.launch(_ctx.stream(),
                          static_cast<std::uint32_t>(nHeads),
-                         static_cast<std::uint32_t>(nKTiles),
+                         gridKTiles,
                          1,
                          kAttentionLocalSize, 1, 1);
 

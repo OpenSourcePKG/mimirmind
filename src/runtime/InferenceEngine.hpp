@@ -33,6 +33,13 @@
 #include "core/gpu/l0/UsmAllocator.hpp"
 #endif
 
+// CUDA-native includes for the CUDA-graph decode capture (M-Q3N.5 K4),
+// only pulled in when the CUDA backend is compiled in.
+#ifdef MIMIRMIND_HAVE_CUDA
+#include "compute/cuda/GpuOps.hpp"
+#include "core/gpu/cuda/CudaGraph.hpp"
+#endif
+
 namespace mimirmind::core::config {
 struct Config;
 }
@@ -510,6 +517,15 @@ private:
     [[nodiscard]] const ::mimirmind::core::l0::L0ComputeContext& l0ComputeContext() const;
 #endif
 
+#ifdef MIMIRMIND_HAVE_CUDA
+    /// Guarded downcast of `_ops` to the concrete CUDA GpuOps — only valid
+    /// when the runtime picked the CUDA backend. Used by the CUDA-graph
+    /// decode capture path (M-Q3N.5 K4).
+    [[nodiscard]] compute::cuda::GpuOps& cudaOps() noexcept {
+        return static_cast<compute::cuda::GpuOps&>(*_ops);
+    }
+#endif
+
     // Held by reference for the whole process lifetime. Provided by main().
     const Config&                              _cfg;
     // Schicht 4 — backend-polymorphic runtime. The concrete subclass is
@@ -532,6 +548,16 @@ private:
     // static_cast helpers, gated on `_computeCtx->kind() == LevelZero`.
     std::unique_ptr<compute::ComputeOps>           _ops;
     std::unique_ptr<compute::ComputeMatmul>        _gmm;
+
+#ifdef MIMIRMIND_HAVE_CUDA
+    // M-Q3N.5 K4: CUDA-graph decode capture. Captured once (step 2), then
+    // replayed per token; curLen flows through the device slot updated
+    // outside the graph. Declared after _ops/_gmm so it destructs first,
+    // while the CUDA context/stream it references is still alive. Sticky
+    // disable flag once a capture attempt fails (fall back to immediate).
+    core::cuda::CudaGraph _cudaDecodeGraph;
+    bool                  _cudaGraphDisabled{false};
+#endif
     // M8.K.0: diagnostic per-op timer. Constructed after `_ops` so it
     // can hold a reference to the L0 CommandQueue. Only populated when
     // the runtime picked L0 (HIP path leaves the optional empty — its

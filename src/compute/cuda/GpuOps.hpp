@@ -275,6 +275,24 @@ public:
     /// on discrete gfx1101).
     [[nodiscard]] std::int32_t* curLenSlot() noexcept { return _curLenSlotUsm; }
 
+    // ---- M-Q3N.5 Kernaufgabe 4: CUDA-graph decode capture support -------
+    //
+    // Decode kernels read the KV length from `_curLenSlotUsm` (a device
+    // slot). In immediate mode each op stages the value in via a per-kernel
+    // async H2D copy — which would bake a record-time value into a captured
+    // graph. For capture the engine disables per-kernel staging and updates
+    // the slot ONCE per token, outside the graph.
+
+    /// Enable/disable per-kernel curLen staging copies. Disable during graph
+    /// capture + replay; the engine then owns the slot via updateDecodeCurLen().
+    void setPerKernelCurLenStaging(bool on) noexcept { _perKernelCurLenStaging = on; }
+
+    /// Push `v` (current KV length) into the shared curLen slot once,
+    /// bypassing the staging gate. Call OUTSIDE the captured region, before
+    /// each graph launch; enqueued on the compute stream (ordered before the
+    /// subsequent launch).
+    void updateDecodeCurLen(std::int32_t v);
+
 private:
     core::cuda::CudaComputeContext& _ctx;
 
@@ -290,6 +308,9 @@ private:
     void*                _flashPartialUsm{nullptr};
     std::int32_t*        _curLenSlotUsm{nullptr};
     std::int32_t*        _stagingOffsetSlotUsm{nullptr};
+    // M-Q3N.5 K4: when false, per-kernel curLen staging is skipped and the
+    // engine owns _curLenSlotUsm (graph capture/replay). Default true.
+    bool                 _perKernelCurLenStaging{true};
     std::size_t          _flashPartialBytes{0};
     std::size_t          _replayMaxKTiles{0};
 
