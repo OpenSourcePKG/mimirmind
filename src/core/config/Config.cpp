@@ -217,7 +217,8 @@ ModelEntry parseModel(std::string_view      path,
         fail(path, section + " must be an object");
     }
     checkKnownKeys(path, section, j,
-                   {"id", "title", "path", "format", "loadOnStart", "runtime", "backend"});
+                   {"id", "title", "path", "format", "tokenizerGguf",
+                    "loadOnStart", "runtime", "backend"});
 
     ModelEntry m{};
     if (!j.contains("id") || !j["id"].is_string() || j["id"].get<std::string>().empty()) {
@@ -237,6 +238,9 @@ ModelEntry parseModel(std::string_view      path,
             fail(path, section + ".format must be one of \"auto\", \"gguf\", \"nvfp4\"");
         }
         m.format = *fmt;
+    }
+    if (const auto v = readOpt<std::string>(path, section, j, "tokenizerGguf"); v.has_value()) {
+        m.tokenizerGguf = *v;
     }
     if (const auto v = readOpt<bool>(path, section, j, "loadOnStart"); v.has_value()) {
         m.loadOnStart = *v;

@@ -38,6 +38,8 @@
 #ifdef MIMIRMIND_HAVE_CUDA
 #include "compute/cuda/GpuOps.hpp"
 #include "core/gpu/cuda/CudaGraph.hpp"
+#include "runtime/nvfp4/NvFp4Materializer.hpp"
+#include "runtime/nvfp4/NvFp4Model.hpp"
 #endif
 
 namespace mimirmind::core::config {
@@ -207,6 +209,19 @@ public:
     /// Parse + load a GGUF model into USM. Throws if a model is already
     /// loaded (no hot-swap in M7a) or the file is malformed.
     void loadModel(std::string_view ggufPath);
+
+    /**
+     * Load a ModelOpt NVFP4 checkpoint directory (CUDA/Bragi only). Uploads
+     * the NVFP4/FP8 weights, dequantises them to BF16 on device (weight-only
+     * W4A16), and exposes them as a GGUF-convention BF16 WeightsMap the
+     * qwen35moe backend consumes unchanged. `config.json` supplies LlmConfig;
+     * `tokenizerGguf` supplies the tokenizer (the checkpoint's HF
+     * tokenizer.json is not parsed yet). Throws on a non-CUDA backend or a
+     * malformed checkpoint. See runtime/nvfp4/ + Synaipse
+     * `development/nvfp4-phase-c-kernels-2026-07-23`.
+     */
+    void loadModelNvfp4(std::string_view checkpointDir,
+                        std::string_view tokenizerGguf);
 
     /**
      * Attached-mode load for the M-Munin flow. Opens `ggufPath` only for
@@ -575,6 +590,14 @@ private:
     core::gguf::GgufReader                  _reader;
     model::LlmConfig                   _config;
     model::Tokenizer                   _tokenizer;
+#ifdef MIMIRMIND_HAVE_CUDA
+    // NVFP4 load path (loadModelNvfp4). `_materializedBf16` owns the BF16
+    // device buffers that `_weights` points into, so it is declared BEFORE
+    // `_weights` — it must destruct AFTER it. `_nvfp4Model` (the packed NVFP4
+    // uploads) is freed inside loadModelNvfp4 once materialization is done.
+    std::unique_ptr<runtime::nvfp4::NvFp4Model>          _nvfp4Model;
+    std::vector<runtime::nvfp4::MaterializedTensor>      _materializedBf16;
+#endif
     std::optional<core::gguf::WeightsMap>       _weights;
     std::unique_ptr<model::FusedQkvWeights> _fusedQkv;
     std::unique_ptr<arch::ArchBackend>      _backend;

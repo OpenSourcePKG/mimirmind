@@ -30,7 +30,16 @@
 #ifdef MIMIRMIND_HAVE_CUDA
 #include "compute/cuda/GpuMatmul.hpp"
 #include "compute/cuda/GpuOps.hpp"
+#include "compute/cuda/CudaMaterializerOps.hpp"
 #include "core/gpu/cuda/CudaComputeContext.hpp"
+#include "core/modelopt/HfQuantConfig.hpp"
+#include "core/modelopt/Qwen35MoeMaterializer.hpp"
+#include "core/safetensors/SafetensorsModel.hpp"
+#include "runtime/nvfp4/ComputeOpsUploader.hpp"
+#include "runtime/nvfp4/NvFp4WeightsMap.hpp"
+#include "runtime/nvfp4/Qwen35MoeConfig.hpp"
+#include <filesystem>
+#include <sstream>
 #endif
 
 #include <algorithm>
@@ -410,6 +419,84 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     _weights.emplace(_reader);
 
     finalizeLoad();
+}
+
+void InferenceEngine::loadModelNvfp4(std::string_view checkpointDir,
+                                     std::string_view tokenizerGguf) {
+#ifndef MIMIRMIND_HAVE_CUDA
+    (void)checkpointDir;
+    (void)tokenizerGguf;
+    throw std::runtime_error("InferenceEngine::loadModelNvfp4: NVFP4 requires "
+                             "the CUDA backend (built without MIMIRMIND_ENABLE_CUDA)");
+#else
+    if (_modelLoaded) {
+        throw std::runtime_error("InferenceEngine: model already loaded");
+    }
+    if (_computeCtx->kind() != core::backend::BackendKind::Cuda) {
+        throw std::runtime_error("InferenceEngine::loadModelNvfp4: NVFP4 needs the "
+                                 "CUDA backend, but this engine picked another");
+    }
+    if (tokenizerGguf.empty()) {
+        throw std::runtime_error("InferenceEngine::loadModelNvfp4: models[].tokenizerGguf "
+                                 "is required (the NVFP4 checkpoint ships no GGUF tokenizer)");
+    }
+
+    const std::string dir{checkpointDir};
+    auto readText = [](const std::filesystem::path& p) -> std::string {
+        std::ifstream f(p);
+        if (!f) throw std::runtime_error("loadModelNvfp4: cannot read " + p.string());
+        std::stringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    };
+
+    MM_LOG_INFO("engine", "loadModelNvfp4: '{}' (tokenizer from '{}')",
+                checkpointDir, tokenizerGguf);
+
+    // 1. Arch params from config.json (GGUF-metadata parse is GGUF-only).
+    _config = runtime::nvfp4::parseQwen35MoeSafetensorsConfig(
+        readText(std::filesystem::path{dir} / "config.json"));
+
+    // 2. Tokenizer via the GGUF shortcut (HF tokenizer.json not parsed yet).
+    _reader.open(tokenizerGguf);
+    _tokenizer.loadFromGguf(_reader);
+
+    // 3. Upload the NVFP4/FP8 weights (+ BF16 passthroughs) to the device.
+    runtime::nvfp4::ComputeOpsUploader uploader(*_ops);
+    _nvfp4Model = std::make_unique<runtime::nvfp4::NvFp4Model>(
+        runtime::nvfp4::loadNvfp4Model(dir, uploader));
+
+    // 4. Build the materialization plan (tensor shapes + per-module schemes).
+    core::safetensors::SafetensorsModel sm;
+    sm.open(dir);
+    const core::modelopt::HfQuantConfig hfCfg =
+        core::modelopt::HfQuantConfig::parse(
+            readText(std::filesystem::path{dir} / "hf_quant_config.json"));
+    const core::modelopt::Qwen35MoeArch arch{
+        static_cast<int>(_config.blockCount),
+        static_cast<int>(_config.expertCount),
+        4 /* full_attention_interval; layer_types agrees for this model */};
+    const std::vector<core::modelopt::MaterializationStep> steps =
+        core::modelopt::planQwen35MoeMaterialization(sm, hfCfg, arch);
+
+    // 5. Dequantise every weight to BF16 on device (weight-only W4A16).
+    auto& cudaCtx = static_cast<core::cuda::CudaComputeContext&>(*_computeCtx);
+    compute::cuda::CudaMaterializerOps devOps(cudaCtx, *_ops);
+    _materializedBf16 =
+        runtime::nvfp4::executeMaterialization(steps, *_nvfp4Model, devOps);
+    cudaCtx.stream().synchronize(); // all dequant kernels + D2D copies complete
+
+    // 6. Expose the BF16 tensors as a GGUF-convention WeightsMap.
+    _weights.emplace(runtime::nvfp4::buildBf16WeightsMap(_materializedBf16));
+
+    // 7. Release the packed NVFP4 uploads — only the BF16 result is needed.
+    _nvfp4Model.reset();
+
+    MM_LOG_INFO("engine", "loadModelNvfp4: materialised {} BF16 tensors",
+                _materializedBf16.size());
+
+    finalizeLoad();
+#endif
 }
 
 void InferenceEngine::loadModelAttached(

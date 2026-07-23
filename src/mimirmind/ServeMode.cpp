@@ -19,6 +19,7 @@
 #include "core/os/GovernorLock.hpp"
 #include "model/Tokenizer.hpp"
 #include "runtime/InferenceEngine.hpp"
+#include "runtime/nvfp4/ModelFormatResolver.hpp"
 #include "runtime/perf/PerfRegressionDetector.hpp"
 #include "runtime/spec/Drafter.hpp"
 #include "runtime/spec/ModelDrafter.hpp"
@@ -234,9 +235,16 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         } else
 #endif
         {
-            MM_LOG_INFO("main", "serve: loading model '{}' (id='{}')",
-                        m.path, m.id);
-            e->loadModel(m.path);
+            if (runtime::nvfp4::resolveModelFormat(m.format, m.path)
+                == core::config::ModelFormat::Nvfp4) {
+                MM_LOG_INFO("main", "serve: loading NVFP4 model '{}' (id='{}')",
+                            m.path, m.id);
+                e->loadModelNvfp4(m.path, m.tokenizerGguf);
+            } else {
+                MM_LOG_INFO("main", "serve: loading model '{}' (id='{}')",
+                            m.path, m.id);
+                e->loadModel(m.path);
+            }
         }
 
         const auto& arch = e->config().architecture;

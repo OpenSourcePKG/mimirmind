@@ -63,6 +63,10 @@ struct ModelEntry {
                                          // Falls back to `id` in /v1/models when empty.
     std::string       path{};            // GGUF file, or NVFP4 checkpoint directory
     ModelFormat       format{ModelFormat::Auto};
+    // For `format: nvfp4`: path to a GGUF whose tokenizer to reuse (the NVFP4
+    // checkpoint ships only an HF tokenizer.json, which we don't parse yet).
+    // Ignored for GGUF models (their tokenizer comes from the file itself).
+    std::string       tokenizerGguf{};
     bool              loadOnStart{true};
     RuntimeSettings   runtime{};         // per-model override, merged onto top-level
 
