@@ -532,6 +532,9 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/matmul_q8_0_vec_dp4a.hip
         kernels_hip/matmul_q8_0_vec_reorder.hip
+        kernels_hip/deltanet_chunk_cumgate.hip
+        kernels_hip/deltanet_chunk_forward.hip
+        kernels_hip/deltanet_kkt_solve.hip
         kernels_hip/ffn_gate_up_fused_q8_0.hip
         kernels_hip/moe_gate_up_fused_k_q4k.hip
         kernels_hip/moe_down_fused_k_q6k.hip
