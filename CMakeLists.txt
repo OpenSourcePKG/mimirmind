@@ -370,6 +370,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/serving/RequestScheduler.cpp
     src/runtime/serving/PreemptionPolicy.cpp
     src/runtime/nvfp4/NvFp4Model.cpp
+    src/runtime/nvfp4/NvFp4Materializer.cpp
     src/runtime/nvfp4/ModelFormatResolver.cpp
 )
 
