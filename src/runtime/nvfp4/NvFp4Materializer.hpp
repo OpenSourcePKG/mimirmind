@@ -39,6 +39,14 @@ struct MaterializerDeviceOps {
     /// Device-to-device copy of already-BF16 bytes (passthrough tensors).
     virtual void copyBytes(void* dst, const void* src, std::size_t bytes) = 0;
 
+    /// Widen a half-width source (`srcDtype` BF16 or F16) to F32 [n] at dst,
+    /// or D2D-copy an F32 source verbatim. Used for unquantised passthrough
+    /// tensors the runtime reads as `const float*` (norms, ssm scalars,
+    /// conv1d, biases, router, embed).
+    virtual void widenToF32(void* dstF32, const void* src,
+                            safetensors::SafetensorsDtype srcDtype,
+                            std::uint64_t n) = 0;
+
     /// Read a 4-byte F32 scalar from device memory to the host.
     [[nodiscard]] virtual float readF32(const void* devPtr) = 0;
 };
@@ -47,9 +55,10 @@ struct MaterializerDeviceOps {
 /// convention, ready to wrap in a WeightsMap. Owns its device buffer.
 struct MaterializedTensor {
     std::string                ggufName;
-    compute::ComputeBuffer     buffer;   ///< BF16 device memory
+    compute::ComputeBuffer     buffer;   ///< device memory: F32 if isF32 else BF16
     std::vector<std::uint64_t> ggufDims; ///< ne-order
     std::uint64_t              elems{0};
+    bool                       isF32{false}; ///< true for widened passthrough tensors
 };
 
 /**

@@ -18,10 +18,11 @@ core::gguf::WeightsMap buildBf16WeightsMap(std::vector<MaterializedTensor>& mats
     for (MaterializedTensor& m : mats) {
         core::gguf::GgufTensor t{};
         t.name       = m.ggufName;
-        t.type       = core::gguf::GgmlType::BF16;
+        t.type       = m.isF32 ? core::gguf::GgmlType::F32
+                               : core::gguf::GgmlType::BF16;
         t.dimensions = m.ggufDims;
         t.nelements  = m.elems;
-        t.nbytes     = static_cast<std::size_t>(m.elems) * 2; // BF16
+        t.nbytes     = static_cast<std::size_t>(m.elems) * (m.isF32 ? 4 : 2);
         t.usmPtr     = m.buffer.get();
         tensors.push_back(std::move(t));
     }

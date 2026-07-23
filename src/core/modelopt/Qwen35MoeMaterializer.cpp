@@ -91,6 +91,10 @@ void addDirect(std::vector<MaterializationStep>& steps,
                           ? ggufDimsFromHf(w.shape)
                           : std::vector<std::uint64_t>{src.in, src.rows};
     step.totalElems = src.rows * src.in;
+    // Unquantised passthrough tensors (norms, ssm scalars, conv1d, biases,
+    // router, embed) are read as F32 device pointers by the runtime; widen
+    // them here. Dequantised NVFP4/FP8 weights stay BF16.
+    step.outF32     = (src.kind == SourceKind::Bf16Passthrough);
     step.sources.push_back(std::move(src));
     steps.push_back(std::move(step));
 }

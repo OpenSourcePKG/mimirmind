@@ -58,8 +58,11 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _ops{ops},
       _nvfp4Module{loadModule(ctx.cudaContext(), "dequant_nvfp4")},
       _fp8Module{loadModule(ctx.cudaContext(), "dequant_fp8")},
+      _castModule{loadModule(ctx.cudaContext(), "cast_to_f32")},
       _dqNvfp4{_nvfp4Module.getFunction("dequant_nvfp4")},
-      _dqFp8{_fp8Module.getFunction("dequant_fp8")} {}
+      _dqFp8{_fp8Module.getFunction("dequant_fp8")},
+      _castBf16{_castModule.getFunction("cast_bf16_to_f32")},
+      _castF16{_castModule.getFunction("cast_f16_to_f32")} {}
 
 ComputeBuffer CudaMaterializerOps::allocate(std::size_t bytes) {
     return _ops.allocate(bytes);
@@ -92,6 +95,39 @@ void CudaMaterializerOps::dequantFp8(const void* weight, float scale,
 
 void CudaMaterializerOps::copyBytes(void* dst, const void* src, std::size_t bytes) {
     _ops.appendMemoryCopy(dst, src, bytes); // async D2D on the context stream
+}
+
+void CudaMaterializerOps::widenToF32(void* dstF32, const void* src,
+                                     core::safetensors::SafetensorsDtype srcDtype,
+                                     std::uint64_t n) {
+    using Dt = core::safetensors::SafetensorsDtype;
+    switch (srcDtype) {
+        case Dt::F32:
+            // Already F32; straight D2D copy on the context stream.
+            _ops.appendMemoryCopy(dstF32, src, static_cast<std::size_t>(n) * 4);
+            return;
+        case Dt::BF16: {
+            _castBf16.clearArgs();
+            _castBf16.setPtr  (0, src);
+            _castBf16.setPtr  (1, dstF32);
+            _castBf16.setValue(2, static_cast<std::int64_t>(n));
+            _castBf16.launch(_ctx.stream(), gridFor(n), 1, 1, kBlock, 1, 1);
+            return;
+        }
+        case Dt::F16: {
+            _castF16.clearArgs();
+            _castF16.setPtr  (0, src);
+            _castF16.setPtr  (1, dstF32);
+            _castF16.setValue(2, static_cast<std::int64_t>(n));
+            _castF16.launch(_ctx.stream(), gridFor(n), 1, 1, kBlock, 1, 1);
+            return;
+        }
+        default:
+            throw std::runtime_error(
+                "CudaMaterializerOps::widenToF32: unsupported passthrough source "
+                "dtype '" + std::string{core::safetensors::dtypeName(srcDtype)} +
+                "' — expected F32, F16 or BF16");
+    }
 }
 
 float CudaMaterializerOps::readF32(const void* devPtr) {

@@ -37,7 +37,12 @@ struct MaterializationSource {
 struct MaterializationStep {
     std::string                ggufName;    ///< e.g. "blk.3.attn_q.weight", "output.weight"
     std::vector<std::uint64_t> ggufDims;    ///< GGUF ne-order (reverse+squeeze of HF shape)
-    std::uint64_t              totalElems;  ///< BF16 elements in the output tensor
+    std::uint64_t              totalElems;  ///< output elements in the tensor
+    /// Output dtype: passthrough (unquantised) tensors materialise to F32 so
+    /// the runtime's norm / SSM / bias kernels can `static_cast<const float*>`
+    /// them; dequantised NVFP4/FP8 matmul weights stay BF16. Set per step
+    /// because a plan mixes both.
+    bool                       outF32{false};
     std::vector<MaterializationSource> sources;
 };
 

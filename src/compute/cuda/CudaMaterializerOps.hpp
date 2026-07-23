@@ -42,6 +42,10 @@ public:
 
     void copyBytes(void* dst, const void* src, std::size_t bytes) override;
 
+    void widenToF32(void* dstF32, const void* src,
+                    core::safetensors::SafetensorsDtype srcDtype,
+                    std::uint64_t n) override;
+
     [[nodiscard]] float readF32(const void* devPtr) override;
 
 private:
@@ -49,8 +53,11 @@ private:
     ComputeOps&                     _ops;
     core::cuda::CudaModule          _nvfp4Module;
     core::cuda::CudaModule          _fp8Module;
+    core::cuda::CudaModule          _castModule;
     core::cuda::CudaKernel          _dqNvfp4;
     core::cuda::CudaKernel          _dqFp8;
+    core::cuda::CudaKernel          _castBf16;
+    core::cuda::CudaKernel          _castF16;
 };
 
 } // namespace mimirmind::compute::cuda

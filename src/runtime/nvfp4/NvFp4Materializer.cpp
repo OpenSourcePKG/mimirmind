@@ -46,12 +46,15 @@ executeMaterialization(const std::vector<mo::MaterializationStep>& steps,
     out.reserve(steps.size());
 
     for (const mo::MaterializationStep& step : steps) {
-        const std::size_t bf16Bytes = static_cast<std::size_t>(step.totalElems) * 2;
-        compute::ComputeBuffer buf = ops.allocate(bf16Bytes);
+        // Passthrough tensors materialise to F32 (4 bytes), dequantised
+        // NVFP4/FP8 matmul weights to BF16 (2 bytes).
+        const std::size_t elemBytes = step.outF32 ? 4 : 2;
+        const std::size_t outBytes  = static_cast<std::size_t>(step.totalElems) * elemBytes;
+        compute::ComputeBuffer buf = ops.allocate(outBytes);
         auto* dstBase = static_cast<std::uint8_t*>(buf.get());
 
         for (const mo::MaterializationSource& s : step.sources) {
-            void* dst = dstBase + s.dstElemOffset * 2; // BF16 = 2 bytes/element
+            void* dst = dstBase + s.dstElemOffset * elemBytes;
             const NvFp4DeviceTensor& w = require(src, s.hfWeightName);
             const std::string base = moduleBase(s.hfWeightName);
 
@@ -71,14 +74,16 @@ executeMaterialization(const std::vector<mo::MaterializationStep>& steps,
                 }
                 case mo::SourceKind::Bf16Passthrough:
                 default:
-                    // Already BF16 on device; copy its bytes verbatim.
-                    ops.copyBytes(dst, w.devPtr, w.nbytes);
+                    // Unquantised: widen BF16/F16 -> F32 (or copy F32) so the
+                    // runtime can read it as a `const float*`.
+                    ops.widenToF32(dst, w.devPtr, w.dtype, s.rows * s.in);
                     break;
             }
         }
 
         out.push_back(MaterializedTensor{step.ggufName, std::move(buf),
-                                         step.ggufDims, step.totalElems});
+                                         step.ggufDims, step.totalElems,
+                                         step.outF32});
     }
 
     return out;
