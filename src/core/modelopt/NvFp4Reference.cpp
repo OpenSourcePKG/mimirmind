@@ -57,4 +57,13 @@ void dequantNvfp4(const std::uint8_t* packed,
     }
 }
 
+void dequantFp8(const std::uint8_t* weight,
+                float               weightScale,
+                std::uint64_t       n,
+                float*              out) noexcept {
+    for (std::uint64_t i = 0; i < n; ++i) {
+        out[i] = weightScale * e4m3ToFloat(weight[i]);
+    }
+}
+
 } // namespace mimirmind::core::modelopt

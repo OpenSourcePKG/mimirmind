@@ -441,6 +441,17 @@ TEST(dequant_nvfp4_block) {
     EXPECT_EQ(out[15], 0.0f);
 }
 
+TEST(dequant_fp8_weight) {
+    // Unpacked E4M3 weights x per-tensor scale.
+    const std::uint8_t w[4] = {0x38, 0x40, 0xB8, 0x00}; // 1.0, 2.0, -1.0, 0
+    float out[4];
+    mo::dequantFp8(w, 0.5f, 4, out);
+    EXPECT_EQ(out[0], 0.5f);   // 0.5 * 1.0
+    EXPECT_EQ(out[1], 1.0f);   // 0.5 * 2.0
+    EXPECT_EQ(out[2], -0.5f);  // 0.5 * -1.0
+    EXPECT_EQ(out[3], 0.0f);
+}
+
 int main() {
     return mm::test::run();
 }

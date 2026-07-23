@@ -48,4 +48,18 @@ void dequantNvfp4(const std::uint8_t* packed,
                   std::uint64_t       in,
                   float*              out) noexcept;
 
+/**
+ * Dequantise an FP8 (E4M3) weight to f32. This is the attention-projection
+ * format on the W4A16 checkpoint: an unpacked F8_E4M3 weight plus one F32
+ * per-tensor `weight_scale` (the `input_scale` is for activation quant and
+ * is unused on the weight-only path).
+ *   weight : F8_E4M3 [n]   (row-major, one byte per element)
+ *   out    : f32      [n]
+ *   out[i] = weightScale * e4m3(weight[i])
+ */
+void dequantFp8(const std::uint8_t* weight,
+                float               weightScale,
+                std::uint64_t       n,
+                float*              out) noexcept;
+
 } // namespace mimirmind::core::modelopt
