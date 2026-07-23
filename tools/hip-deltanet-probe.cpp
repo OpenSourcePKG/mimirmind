@@ -9,6 +9,7 @@
 // compute::GatedDeltaNet golden reference on identical random inputs and
 // returns 0 iff both agree within tolerance.
 
+#include "compute/ComputeOps.hpp"
 #include "compute/GatedDeltaNet.hpp"
 #include "compute/hip/GpuOps.hpp"
 #include "core/gpu/hip/HipComputeContext.hpp"
@@ -133,6 +134,71 @@ bool testGatedDeltaNetAr(GpuOps& ops) {
     return fails == 0;
 }
 
+bool testL2Norm(GpuOps& ops) {
+    const std::size_t rows = 7, dim = 40;
+    const float eps = 1e-6f;
+    auto host = randVec(rows * dim, 0x1234u);
+    std::vector<float> ref = host;
+    ::mimirmind::compute::l2NormInPlace(ref.data(), rows, dim, eps);
+
+    auto buf = toDevice(ops, host);
+    ops.l2NormInPlaceAsync(static_cast<float*>(buf.get()), rows, dim, eps);
+    ops.flush();
+    auto got = fromDevice(ops, buf.get(), rows * dim);
+    return countMismatch(got, ref, 1e-3f, "l2_norm") == 0;
+}
+
+bool testSsmConv1d(GpuOps& ops) {
+    const std::size_t T = 5, channels = 12, K = 4;
+    auto convInput = randVec((K - 1 + T) * channels, 0x2222u);
+    auto kernel    = randVec(K * channels,           0x3333u);
+    std::vector<float> ref(T * channels);
+    ::mimirmind::compute::causalConv1dSilu(convInput.data(), kernel.data(),
+                                           ref.data(), T, channels, K);
+
+    auto dIn  = toDevice(ops, convInput);
+    auto dKer = toDevice(ops, kernel);
+    auto dOut = ops.allocate(T * channels * sizeof(float));
+    ops.causalConv1dSiluAsync(static_cast<const float*>(dIn.get()),
+                              static_cast<const float*>(dKer.get()),
+                              static_cast<float*>(dOut.get()), T, channels, K);
+    ops.flush();
+    auto got = fromDevice(ops, dOut.get(), T * channels);
+    return countMismatch(got, ref, 1e-3f, "ssm_conv1d") == 0;
+}
+
+bool testSigmoidInplace(GpuOps& ops) {
+    const std::size_t n = 50;
+    auto host = randVec(n, 0x84u);
+    std::vector<float> ref = host;
+    ::mimirmind::compute::sigmoidInPlace(ref.data(), n);
+
+    auto buf = toDevice(ops, host);
+    ops.sigmoidInPlaceAsync(static_cast<float*>(buf.get()), n);
+    ops.flush();
+    auto got = fromDevice(ops, buf.get(), n);
+    return countMismatch(got, ref, 1e-4f, "sigmoid_inplace") == 0;
+}
+
+bool testGatherHeads(GpuOps& ops) {
+    const std::size_t T = 2, convTotalWidth = 20, offset = 5;
+    const std::size_t srcHeads = 2, dstHeads = 4, S = 3;
+    auto src = randVec(T * convTotalWidth, 0x95u);
+    std::vector<float> ref(T * dstHeads * S);
+    ::mimirmind::compute::gatherHeadsFromChannels(
+        src.data(), ref.data(), T, offset, srcHeads, dstHeads, S, convTotalWidth);
+
+    auto dsrc = toDevice(ops, src);
+    auto ddst = ops.allocate(T * dstHeads * S * sizeof(float));
+    ops.gatherHeadsFromChannelsAsync(static_cast<const float*>(dsrc.get()),
+                                     static_cast<float*>(ddst.get()),
+                                     T, offset, srcHeads, dstHeads, S,
+                                     convTotalWidth);
+    ops.flush();
+    auto got = fromDevice(ops, ddst.get(), T * dstHeads * S);
+    return countMismatch(got, ref, 1e-6f, "gather_heads") == 0;
+}
+
 } // namespace
 
 int main() {
@@ -143,6 +209,10 @@ int main() {
         bool ok = true;
         ok = testDeltanetGate(ops) && ok;
         ok = testGatedDeltaNetAr(ops) && ok;
+        ok = testL2Norm(ops) && ok;
+        ok = testSsmConv1d(ops) && ok;
+        ok = testSigmoidInplace(ops) && ok;
+        ok = testGatherHeads(ops) && ok;
 
         if (ok) {
             std::fprintf(stderr, "hip_deltanet_probe: PASS\n");
