@@ -1581,6 +1581,24 @@ if(MIMIRMIND_ENABLE_HIP)
         mimirmind_core_hip
     )
 
+    # ---- hip_deltanet_probe — GatedDeltaNet gate + AR recurrence parity --
+    #
+    # GPU-vs-CPU parity for the Qwen3-Next linear-attention HIP kernels
+    # (deltanet_gate, gated_deltanet_ar) via compute::hip::GpuOps against the
+    # compute::GatedDeltaNet reference — verifies the recurrence on gfx1101
+    # (wave32), which the CUDA cuda_parity suite covered but HIP did not.
+
+    add_executable(hip_deltanet_probe
+        tools/hip-deltanet-probe.cpp
+        src/compute/GatedDeltaNet.cpp
+    )
+
+    add_dependencies(hip_deltanet_probe hip_kernels)
+
+    target_link_libraries(hip_deltanet_probe PRIVATE
+        mimirmind_core_hip
+    )
+
     # ---- hip_qkv_split_probe — fused-QKV output scatter ---------------
     #
     # First scatter/layout-transform kernel (no reduction, no LDS).
@@ -2089,6 +2107,7 @@ if(MIMIRMIND_ENABLE_HIP)
         hip_matmul_q3k_probe
         hip_moe_down_fused_k_q8_0_probe
         hip_moe_down_fused_k_q6k_probe
+        hip_deltanet_probe
         hip_attention_probe
         hip_attention_prefill_flash_probe
     )

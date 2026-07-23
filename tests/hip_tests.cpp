@@ -148,6 +148,9 @@ TEST(hip_matmul_q3k_vec)             { expectProbeOk("hip_matmul_q3k_probe"); }
 TEST(hip_moe_down_fused_k_q8_0)      { expectProbeOk("hip_moe_down_fused_k_q8_0_probe"); }
 TEST(hip_moe_down_fused_k_q6k)       { expectProbeOk("hip_moe_down_fused_k_q6k_probe"); }
 
+// Qwen3-Next GatedDeltaNet linear-attention (gate + AR recurrence, wave32)
+TEST(hip_deltanet)                   { expectProbeOk("hip_deltanet_probe"); }
+
 // Attention families — flash prefill covers the largest compute share
 TEST(hip_attention)                  { expectProbeOk("hip_attention_probe"); }
 TEST(hip_attention_prefill_flash)    { expectProbeOk("hip_attention_prefill_flash_probe"); }
