@@ -934,6 +934,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         src/compute/cuda/GpuMatmul.cpp
         src/compute/cuda/GpuOps.cpp
         src/compute/cuda/MoeTopKRouteDevice.cpp
+        src/compute/cuda/CudaMaterializerOps.cpp
     )
     add_dependencies(mimirmind cuda_kernels)
 endif()
