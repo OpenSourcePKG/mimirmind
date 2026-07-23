@@ -24,9 +24,11 @@ constexpr std::array<GgufTensorSource, 8> kFullAttn = {{
 // ---- DeltaNet (linear_attn) layer (e.g. GGUF blk.0) ----------------------
 // unsloth reuses attn_qkv/attn_gate for in_proj_qkv/in_proj_z. conv1d
 // [8192,1,4] is byte-identical to GGUF [4,8192].
-// NOTE: ssm_alpha<-in_proj_a / ssm_beta<-in_proj_b is the natural a->alpha,
-// b->beta pairing; both are [32,2048] so it is NOT shape-checkable and must
-// be confirmed against the DeltaNet math at end-to-end parity time.
+// ssm_alpha<-in_proj_a / ssm_beta<-in_proj_b: both are [32,2048] so this is
+// not shape-checkable, but CONFIRMED by value correlation between the GGUF's
+// F32 ssm_alpha/ssm_beta and the HF bf16 in_proj_a/in_proj_b (blk.0):
+// alpha matches in_proj_a (mse 1.95e-4, wrong pairing 5.3e-4), beta matches
+// in_proj_b (mse 3.7e-5, wrong pairing 5.1e-4) — the natural a->alpha pairing.
 constexpr std::array<GgufTensorSource, 11> kDeltaNet = {{
     {"attn_norm.weight",           "input_layernorm.weight",          WeightXform::Direct},
     {"attn_qkv.weight",            "linear_attn.in_proj_qkv.weight",  WeightXform::Direct},
