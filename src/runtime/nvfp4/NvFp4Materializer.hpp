@@ -49,6 +49,11 @@ struct MaterializerDeviceOps {
 
     /// Read a 4-byte F32 scalar from device memory to the host.
     [[nodiscard]] virtual float readF32(const void* devPtr) = 0;
+
+    /// In-place element-wise y = -exp(y) over F32 [n] device memory. Turns the
+    /// HF `A_log` into the GGUF `ssm_a` (= -exp(A_log)) the DeltaNet decay gate
+    /// consumes directly. Only invoked on F32 passthrough outputs.
+    virtual void negExpInPlaceF32(void* f32, std::uint64_t n) = 0;
 };
 
 /// One materialised GGUF tensor: BF16 on device, named + dimensioned in GGUF

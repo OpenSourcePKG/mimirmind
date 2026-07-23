@@ -717,6 +717,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/dequant_nvfp4.cu
         kernels_cuda/dequant_fp8.cu
         kernels_cuda/cast_to_f32.cu
+        kernels_cuda/neg_exp.cu
     )
 
     set(PTX_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/ptx)

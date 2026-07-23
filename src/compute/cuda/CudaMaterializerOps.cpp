@@ -59,10 +59,12 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _nvfp4Module{loadModule(ctx.cudaContext(), "dequant_nvfp4")},
       _fp8Module{loadModule(ctx.cudaContext(), "dequant_fp8")},
       _castModule{loadModule(ctx.cudaContext(), "cast_to_f32")},
+      _negExpModule{loadModule(ctx.cudaContext(), "neg_exp")},
       _dqNvfp4{_nvfp4Module.getFunction("dequant_nvfp4")},
       _dqFp8{_fp8Module.getFunction("dequant_fp8")},
       _castBf16{_castModule.getFunction("cast_bf16_to_f32")},
-      _castF16{_castModule.getFunction("cast_f16_to_f32")} {}
+      _castF16{_castModule.getFunction("cast_f16_to_f32")},
+      _negExp{_negExpModule.getFunction("neg_exp_f32")} {}
 
 ComputeBuffer CudaMaterializerOps::allocate(std::size_t bytes) {
     return _ops.allocate(bytes);
@@ -128,6 +130,14 @@ void CudaMaterializerOps::widenToF32(void* dstF32, const void* src,
                 "dtype '" + std::string{core::safetensors::dtypeName(srcDtype)} +
                 "' — expected F32, F16 or BF16");
     }
+}
+
+void CudaMaterializerOps::negExpInPlaceF32(void* f32, std::uint64_t n) {
+    // Kernel: (float* x, long n) -> x = -exp(x), in place.
+    _negExp.clearArgs();
+    _negExp.setPtr  (0, f32);
+    _negExp.setValue(1, static_cast<std::int64_t>(n));
+    _negExp.launch(_ctx.stream(), gridFor(n), 1, 1, kBlock, 1, 1);
 }
 
 float CudaMaterializerOps::readF32(const void* devPtr) {

@@ -81,6 +81,28 @@ executeMaterialization(const std::vector<mo::MaterializationStep>& steps,
             }
         }
 
+        // Element-wise fix-up on the finished buffer. NegExp turns HF `A_log`
+        // into GGUF `ssm_a` (= -exp(A_log)); it only runs on F32 passthrough
+        // outputs (the ssm_a step is unquantised -> outF32).
+        if (step.postTransform == mo::PostTransform::NegExp) {
+            if (!step.outF32) {
+                fail("NegExp post-transform requires an F32 output ('"
+                     + step.ggufName + "')");
+            }
+            ops.negExpInPlaceF32(dstBase, step.totalElems);
+        }
+
+        // Element-wise fix-up on the finished buffer. NegExp turns HF `A_log`
+        // into GGUF `ssm_a` (= -exp(A_log)); it only runs on F32 passthrough
+        // outputs (the ssm_a step is unquantised -> outF32).
+        if (step.postTransform == mo::PostTransform::NegExp) {
+            if (!step.outF32) {
+                fail("NegExp post-transform requires an F32 output ('"
+                     + step.ggufName + "')");
+            }
+            ops.negExpInPlaceF32(dstBase, step.totalElems);
+        }
+
         out.push_back(MaterializedTensor{step.ggufName, std::move(buf),
                                          step.ggufDims, step.totalElems,
                                          step.outF32});

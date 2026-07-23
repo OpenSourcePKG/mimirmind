@@ -23,6 +23,14 @@ enum class SourceKind : std::uint8_t {
     Bf16Passthrough ///< already BF16 (norms, router, embed, conv1d, ssm gates) -> copy
 };
 
+/// Element-wise transform applied to a step's finished output buffer, after
+/// all sources have been dequantised/widened.
+enum class PostTransform : std::uint8_t {
+    None,   ///< emit the materialised values as-is
+    NegExp  ///< y = -exp(y) over the F32 output; turns HF `A_log` into the
+            ///< GGUF `ssm_a` (= -exp(A_log)) the DeltaNet decay gate expects
+};
+
 /// One HF tensor feeding a GGUF tensor. For a stacked expert tensor there are
 /// N of these, each writing at its own `dstElemOffset`.
 struct MaterializationSource {
@@ -43,6 +51,9 @@ struct MaterializationStep {
     /// them; dequantised NVFP4/FP8 matmul weights stay BF16. Set per step
     /// because a plan mixes both.
     bool                       outF32{false};
+    /// Element-wise fix-up applied once after the sources are materialised.
+    /// Only NegExp is used (ssm_a = -exp(A_log)); it requires an F32 output.
+    PostTransform              postTransform{PostTransform::None};
     std::vector<MaterializationSource> sources;
 };
 

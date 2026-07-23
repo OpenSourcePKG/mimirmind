@@ -95,6 +95,16 @@ void addDirect(std::vector<MaterializationStep>& steps,
     // router, embed) are read as F32 device pointers by the runtime; widen
     // them here. Dequantised NVFP4/FP8 weights stay BF16.
     step.outF32     = (src.kind == SourceKind::Bf16Passthrough);
+    // The GGUF `ssm_a` (SSM_A_NOSCAN) is the pre-computed decay coefficient
+    // A = -exp(A_log); llama.cpp bakes the -exp() into the checkpoint at
+    // conversion time. The NVFP4 checkpoint stores the raw HF `A_log`, so we
+    // apply it here. The DeltaNet gate then multiplies softplus by ssm_a
+    // directly (GatedDeltaNet.cpp / deltanet_gate.cu) — without this the gate
+    // sees +A_log, the decay blows up and the state diverges to garbage.
+    if (ggufName.size() >= 6
+        && ggufName.compare(ggufName.size() - 6, 6, ".ssm_a") == 0) {
+        step.postTransform = PostTransform::NegExp;
+    }
     step.sources.push_back(std::move(src));
     steps.push_back(std::move(step));
 }

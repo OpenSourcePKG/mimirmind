@@ -48,16 +48,20 @@ public:
 
     [[nodiscard]] float readF32(const void* devPtr) override;
 
+    void negExpInPlaceF32(void* f32, std::uint64_t n) override;
+
 private:
     core::cuda::CudaComputeContext& _ctx;
     ComputeOps&                     _ops;
     core::cuda::CudaModule          _nvfp4Module;
     core::cuda::CudaModule          _fp8Module;
     core::cuda::CudaModule          _castModule;
+    core::cuda::CudaModule          _negExpModule;
     core::cuda::CudaKernel          _dqNvfp4;
     core::cuda::CudaKernel          _dqFp8;
     core::cuda::CudaKernel          _castBf16;
     core::cuda::CudaKernel          _castF16;
+    core::cuda::CudaKernel          _negExp;
 };
 
 } // namespace mimirmind::compute::cuda
