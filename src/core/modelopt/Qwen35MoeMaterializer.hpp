@@ -26,9 +26,14 @@ enum class SourceKind : std::uint8_t {
 /// Element-wise transform applied to a step's finished output buffer, after
 /// all sources have been dequantised/widened.
 enum class PostTransform : std::uint8_t {
-    None,   ///< emit the materialised values as-is
-    NegExp  ///< y = -exp(y) over the F32 output; turns HF `A_log` into the
-            ///< GGUF `ssm_a` (= -exp(A_log)) the DeltaNet decay gate expects
+    None,    ///< emit the materialised values as-is
+    NegExp,  ///< y = -exp(y) over the F32 output; turns HF `A_log` into the
+             ///< GGUF `ssm_a` (= -exp(A_log)) the DeltaNet decay gate expects
+    AddOne   ///< y = y + 1 over the F32 output; the transformer RMSNorm
+             ///< weights use the centred (1 + w) convention that llama.cpp
+             ///< bakes into the GGUF norm tensors, so the runtime multiplies
+             ///< by the stored weight directly. The GatedDeltaNet ssm_norm is
+             ///< excluded — it uses the plain (uncentred) convention.
 };
 
 /// One HF tensor feeding a GGUF tensor. For a stacked expert tensor there are

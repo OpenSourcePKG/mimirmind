@@ -81,26 +81,17 @@ executeMaterialization(const std::vector<mo::MaterializationStep>& steps,
             }
         }
 
-        // Element-wise fix-up on the finished buffer. NegExp turns HF `A_log`
-        // into GGUF `ssm_a` (= -exp(A_log)); it only runs on F32 passthrough
-        // outputs (the ssm_a step is unquantised -> outF32).
-        if (step.postTransform == mo::PostTransform::NegExp) {
-            if (!step.outF32) {
-                fail("NegExp post-transform requires an F32 output ('"
-                     + step.ggufName + "')");
-            }
-            ops.negExpInPlaceF32(dstBase, step.totalElems);
+        // Element-wise fix-up on the finished buffer, only on F32 passthrough
+        // outputs. NegExp: HF `A_log` -> GGUF `ssm_a` (= -exp(A_log)) for the
+        // DeltaNet decay gate. AddOne: HF centred RMSNorm weight -> GGUF
+        // (1 + w) for the transformer norms.
+        if (step.postTransform != mo::PostTransform::None && !step.outF32) {
+            fail("post-transform requires an F32 output ('" + step.ggufName + "')");
         }
-
-        // Element-wise fix-up on the finished buffer. NegExp turns HF `A_log`
-        // into GGUF `ssm_a` (= -exp(A_log)); it only runs on F32 passthrough
-        // outputs (the ssm_a step is unquantised -> outF32).
         if (step.postTransform == mo::PostTransform::NegExp) {
-            if (!step.outF32) {
-                fail("NegExp post-transform requires an F32 output ('"
-                     + step.ggufName + "')");
-            }
             ops.negExpInPlaceF32(dstBase, step.totalElems);
+        } else if (step.postTransform == mo::PostTransform::AddOne) {
+            ops.addOneInPlaceF32(dstBase, step.totalElems);
         }
 
         out.push_back(MaterializedTensor{step.ggufName, std::move(buf),

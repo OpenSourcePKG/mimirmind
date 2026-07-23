@@ -718,6 +718,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/dequant_fp8.cu
         kernels_cuda/cast_to_f32.cu
         kernels_cuda/neg_exp.cu
+        kernels_cuda/add_one.cu
     )
 
     set(PTX_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/ptx)
@@ -1015,6 +1016,32 @@ add_executable(quant_tests
 target_include_directories(quant_tests PRIVATE tests)
 
 target_link_libraries(quant_tests PRIVATE mimirmind_core_common)
+
+# ---- nvfp4_weight_parity — host weight-stats probe (diagnostic) -------------
+#
+# Dequantises NVFP4/FP8/passthrough weights on the host and compares stats +
+# leading elements against the GGUF checkpoint of the same model, to localise
+# a wrong weight class. No CUDA; needs the two model files at runtime.
+#
+# Run via:  cmake --build build --target nvfp4_weight_parity && \
+#           build/nvfp4_weight_parity <nvfp4_dir> <gguf_file>
+
+add_executable(nvfp4_weight_parity
+    tools/nvfp4_weight_parity.cpp
+    src/compute/Dequant.cpp
+    src/compute/QuantTypeRegistry.cpp
+    src/compute/quant/Bfloat16.cpp
+    src/compute/quant/Float16.cpp
+    src/compute/quant/Float32.cpp
+    src/compute/quant/Q3K.cpp
+    src/compute/quant/Q4K.cpp
+    src/compute/quant/Q5K.cpp
+    src/compute/quant/Q5_0.cpp
+    src/compute/quant/Q6K.cpp
+    src/compute/quant/Q8_0.cpp
+)
+
+target_link_libraries(nvfp4_weight_parity PRIVATE mimirmind_core_common)
 
 # ---- modelopt_tests — pure-CPU unit tests for ModelOpt/NVFP4/FP8 schemes ----
 #

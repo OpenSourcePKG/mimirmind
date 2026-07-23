@@ -8,6 +8,7 @@
 #include "core/safetensors/SafetensorsModel.hpp"
 
 #include <stdexcept>
+#include <string_view>
 
 namespace mimirmind::core::modelopt {
 
@@ -17,6 +18,11 @@ namespace st = safetensors;
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error("qwen35moe materialize: " + msg);
+}
+
+bool endsWith(const std::string& s, std::string_view suf) {
+    return s.size() >= suf.size()
+        && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
 }
 
 const st::SafetensorsTensor& require(const st::SafetensorsModel& m, const std::string& name) {
@@ -101,9 +107,16 @@ void addDirect(std::vector<MaterializationStep>& steps,
     // apply it here. The DeltaNet gate then multiplies softplus by ssm_a
     // directly (GatedDeltaNet.cpp / deltanet_gate.cu) — without this the gate
     // sees +A_log, the decay blows up and the state diverges to garbage.
-    if (ggufName.size() >= 6
-        && ggufName.compare(ggufName.size() - 6, 6, ".ssm_a") == 0) {
+    if (endsWith(ggufName, ".ssm_a")) {
         step.postTransform = PostTransform::NegExp;
+    } else if (endsWith(ggufName, "norm.weight") && !endsWith(ggufName, "ssm_norm.weight")) {
+        // Transformer RMSNorm weights (attn/q/k/post/output norms) are stored
+        // centred at 0; llama.cpp bakes the (1 + w) into the GGUF tensor, and
+        // the runtime multiplies by it directly. The NVFP4 checkpoint keeps
+        // the raw HF weight, so add 1 here. The GatedDeltaNet ssm_norm uses
+        // the plain convention (weights ~1) and is excluded — verified by
+        // per-tensor NVFP4-vs-GGUF weight parity on GB10.
+        step.postTransform = PostTransform::AddOne;
     }
     step.sources.push_back(std::move(src));
     steps.push_back(std::move(step));

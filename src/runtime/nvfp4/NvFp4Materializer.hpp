@@ -54,6 +54,11 @@ struct MaterializerDeviceOps {
     /// HF `A_log` into the GGUF `ssm_a` (= -exp(A_log)) the DeltaNet decay gate
     /// consumes directly. Only invoked on F32 passthrough outputs.
     virtual void negExpInPlaceF32(void* f32, std::uint64_t n) = 0;
+
+    /// In-place element-wise y = y + 1 over F32 [n] device memory. Turns the
+    /// centred HF RMSNorm weight into the GGUF (1 + w) the norm kernel expects.
+    /// Only invoked on F32 passthrough outputs.
+    virtual void addOneInPlaceF32(void* f32, std::uint64_t n) = 0;
 };
 
 /// One materialised GGUF tensor: BF16 on device, named + dimensioned in GGUF

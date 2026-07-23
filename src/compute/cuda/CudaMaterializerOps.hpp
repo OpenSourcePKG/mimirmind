@@ -50,6 +50,8 @@ public:
 
     void negExpInPlaceF32(void* f32, std::uint64_t n) override;
 
+    void addOneInPlaceF32(void* f32, std::uint64_t n) override;
+
 private:
     core::cuda::CudaComputeContext& _ctx;
     ComputeOps&                     _ops;
@@ -57,11 +59,13 @@ private:
     core::cuda::CudaModule          _fp8Module;
     core::cuda::CudaModule          _castModule;
     core::cuda::CudaModule          _negExpModule;
+    core::cuda::CudaModule          _addOneModule;
     core::cuda::CudaKernel          _dqNvfp4;
     core::cuda::CudaKernel          _dqFp8;
     core::cuda::CudaKernel          _castBf16;
     core::cuda::CudaKernel          _castF16;
     core::cuda::CudaKernel          _negExp;
+    core::cuda::CudaKernel          _addOne;
 };
 
 } // namespace mimirmind::compute::cuda
