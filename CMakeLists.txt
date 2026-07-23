@@ -534,6 +534,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/matmul_q8_0_vec_reorder.hip
         kernels_hip/moe_down_fused_k_q6k.hip
         kernels_hip/moe_down_fused_k_q8_0.hip
+        kernels_hip/moe_topk.hip
         kernels_hip/mul_scalar.hip
         kernels_hip/qkv_split.hip
         kernels_hip/qkv_split_fp16.hip
@@ -1599,6 +1600,24 @@ if(MIMIRMIND_ENABLE_HIP)
         mimirmind_core_hip
     )
 
+    # ---- hip_moe_topk_probe — device-side MoE top-K router parity ------
+    #
+    # Wires the (already-committed, low-level) moe_topk parity probe into the
+    # build: drives moe_topk.hsaco via the raw HIP module API against the CPU
+    # golden compute::moeTopKRoute across three shapes (top-8, scaled, T=1
+    # decode). Verifies the Qwen3-Next MoE routing on gfx1101 (wave32).
+
+    add_executable(hip_moe_topk_probe
+        tools/hip-moe-topk-probe.cpp
+        src/compute/MoeRouting.cpp
+    )
+
+    add_dependencies(hip_moe_topk_probe hip_kernels)
+
+    target_link_libraries(hip_moe_topk_probe PRIVATE
+        mimirmind_core_hip
+    )
+
     # ---- hip_qkv_split_probe — fused-QKV output scatter ---------------
     #
     # First scatter/layout-transform kernel (no reduction, no LDS).
@@ -2107,6 +2126,7 @@ if(MIMIRMIND_ENABLE_HIP)
         hip_matmul_q3k_probe
         hip_moe_down_fused_k_q8_0_probe
         hip_moe_down_fused_k_q6k_probe
+        hip_moe_topk_probe
         hip_deltanet_probe
         hip_attention_probe
         hip_attention_prefill_flash_probe
