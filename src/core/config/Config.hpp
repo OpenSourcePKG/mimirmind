@@ -35,6 +35,24 @@ struct RuntimeSettings {
 };
 
 /**
+ * On-disk weight format for a model entry.
+ *   Auto  — infer from `path`: a directory with a
+ *           `model.safetensors.index.json` (or a single `model.safetensors`)
+ *           is Nvfp4/ModelOpt; anything else is Gguf.
+ *   Gguf  — a `*.gguf` file (the L0 / HIP / CPU path).
+ *   Nvfp4 — a ModelOpt NVFP4 safetensors checkpoint directory (CUDA/Bragi).
+ * The concrete filesystem probe for `Auto` lives in the load path, not the
+ * config parser — Config stays filesystem-free.
+ */
+enum class ModelFormat { Auto, Gguf, Nvfp4 };
+
+/// Parse a `format` string ("auto"|"gguf"|"nvfp4") or return nullopt.
+[[nodiscard]] std::optional<ModelFormat> modelFormatFromString(std::string_view s) noexcept;
+
+/// Canonical lower-case name for a format ("auto"|"gguf"|"nvfp4").
+[[nodiscard]] std::string_view modelFormatName(ModelFormat f) noexcept;
+
+/**
  * One loadable model entry. Multiple entries with `loadOnStart:true` are
  * allowed — main() constructs one InferenceEngine per entry, and the
  * chat/completions dispatch routes on the request's `model` field.
@@ -43,7 +61,8 @@ struct ModelEntry {
     std::string       id{};              // OpenAI-facing name (matched against request.model)
     std::string       title{};           // Optional human-readable name for UI dropdowns.
                                          // Falls back to `id` in /v1/models when empty.
-    std::string       path{};
+    std::string       path{};            // GGUF file, or NVFP4 checkpoint directory
+    ModelFormat       format{ModelFormat::Auto};
     bool              loadOnStart{true};
     RuntimeSettings   runtime{};         // per-model override, merged onto top-level
 

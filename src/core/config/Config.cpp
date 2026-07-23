@@ -191,6 +191,22 @@ RuntimeSettings parseRuntime(std::string_view      path,
     return r;
 }
 
+std::optional<ModelFormat> modelFormatFromString(std::string_view s) noexcept {
+    if (s == "auto")  return ModelFormat::Auto;
+    if (s == "gguf")  return ModelFormat::Gguf;
+    if (s == "nvfp4") return ModelFormat::Nvfp4;
+    return std::nullopt;
+}
+
+std::string_view modelFormatName(ModelFormat f) noexcept {
+    switch (f) {
+        case ModelFormat::Gguf:  return "gguf";
+        case ModelFormat::Nvfp4: return "nvfp4";
+        case ModelFormat::Auto:
+        default:                 return "auto";
+    }
+}
+
 ModelEntry parseModel(std::string_view      path,
                       const nlohmann::json& j,
                       std::size_t           index) {
@@ -201,7 +217,7 @@ ModelEntry parseModel(std::string_view      path,
         fail(path, section + " must be an object");
     }
     checkKnownKeys(path, section, j,
-                   {"id", "title", "path", "loadOnStart", "runtime", "backend"});
+                   {"id", "title", "path", "format", "loadOnStart", "runtime", "backend"});
 
     ModelEntry m{};
     if (!j.contains("id") || !j["id"].is_string() || j["id"].get<std::string>().empty()) {
@@ -215,6 +231,13 @@ ModelEntry parseModel(std::string_view      path,
         fail(path, section + ".path is required (non-empty string)");
     }
     m.path = j["path"].get<std::string>();
+    if (const auto v = readOpt<std::string>(path, section, j, "format"); v.has_value()) {
+        const auto fmt = modelFormatFromString(*v);
+        if (!fmt.has_value()) {
+            fail(path, section + ".format must be one of \"auto\", \"gguf\", \"nvfp4\"");
+        }
+        m.format = *fmt;
+    }
     if (const auto v = readOpt<bool>(path, section, j, "loadOnStart"); v.has_value()) {
         m.loadOnStart = *v;
     }

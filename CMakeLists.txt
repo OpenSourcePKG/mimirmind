@@ -365,6 +365,8 @@ add_library(mimirmind_core_common STATIC
     src/runtime/serving/ChunkedPrefillScheduler.cpp
     src/runtime/serving/RequestScheduler.cpp
     src/runtime/serving/PreemptionPolicy.cpp
+    src/runtime/nvfp4/NvFp4Model.cpp
+    src/runtime/nvfp4/ModelFormatResolver.cpp
 )
 
 target_include_directories(mimirmind_core_common PUBLIC src)
@@ -1034,6 +1036,22 @@ add_executable(safetensors_tests
 target_include_directories(safetensors_tests PRIVATE tests)
 
 target_link_libraries(safetensors_tests PRIVATE mimirmind_core_common)
+
+# ---- nvfp4_tests — NVFP4 runtime integration (format resolve + loader) ------
+#
+# Standalone test binary. No CUDA — the loader is exercised against a
+# hand-built miniature ModelOpt checkpoint in a temp dir, uploaded through a
+# malloc/memcpy FakeUploader (DeviceUploader test double).
+#
+# Run via:   cmake --build build --target nvfp4_tests && build/nvfp4_tests
+
+add_executable(nvfp4_tests
+    tests/nvfp4_tests.cpp
+)
+
+target_include_directories(nvfp4_tests PRIVATE tests)
+
+target_link_libraries(nvfp4_tests PRIVATE mimirmind_core_common)
 
 # ---- backend_tests — pure-CPU tests for BackendPool + BackendRegistry ------
 #
