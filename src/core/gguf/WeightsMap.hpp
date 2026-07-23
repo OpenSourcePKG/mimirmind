@@ -56,6 +56,15 @@ public:
         const ::mimirmind::core::ipc::TensorManifest& manifest,
         std::span<void* const>                        chunkBases);
 
+    /**
+     * Build a WeightsMap that owns a caller-supplied tensor list. Each
+     * tensor's `usmPtr` must already point at live device memory (owned by
+     * the caller, e.g. the NVFP4 materializer's BF16 buffers) that outlives
+     * the map. Used by the non-GGUF (NVFP4 -> BF16) load path, which
+     * synthesises GGUF-convention BF16 tensors instead of reading a file.
+     */
+    [[nodiscard]] static WeightsMap fromOwnedTensors(std::vector<GgufTensor> tensors);
+
     /// Returns nullptr if no tensor has that name.
     [[nodiscard]] const GgufTensor* find(std::string_view name) const noexcept;
 

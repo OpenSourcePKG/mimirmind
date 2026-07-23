@@ -113,6 +113,12 @@ WeightsMap WeightsMap::fromAttachedChunked(
     return WeightsMap{std::move(owned)};
 }
 
+WeightsMap WeightsMap::fromOwnedTensors(std::vector<GgufTensor> tensors) {
+    MM_LOG_INFO("weights", "indexing {} synthesised tensor(s) (owned mode)",
+                tensors.size());
+    return WeightsMap{std::move(tensors)};
+}
+
 const GgufTensor* WeightsMap::find(std::string_view name) const noexcept {
     const auto it = _byName.find(name);  // heterogeneous: no temporary string
     return it == _byName.end() ? nullptr : it->second;
