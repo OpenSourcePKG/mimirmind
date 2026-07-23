@@ -143,6 +143,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::hip::HipKernel _moeDownFusedKQ8_0Kernel;
     ::mimirmind::core::hip::HipModule _moeDownFusedKQ6KModule;
     ::mimirmind::core::hip::HipKernel _moeDownFusedKQ6KKernel;
+    ::mimirmind::core::hip::HipModule _moeGateUpFusedKQ4KModule;
+    ::mimirmind::core::hip::HipKernel _moeGateUpFusedKQ4KKernel;
     ::mimirmind::core::hip::HipModule _matmulQ5_0VecModule;
     ::mimirmind::core::hip::HipKernel _matmulQ5_0VecKernel;
     ::mimirmind::core::hip::HipModule _matmulQ6KVecModule;
@@ -175,6 +177,9 @@ struct GpuMatmul::Impl {
           _moeDownFusedKQ6KModule {loadHipModule(ctx, "moe_down_fused_k_q6k")},
           _moeDownFusedKQ6KKernel {
               _moeDownFusedKQ6KModule.getKernel("moe_down_fused_k_q6k")},
+          _moeGateUpFusedKQ4KModule{loadHipModule(ctx, "moe_gate_up_fused_k_q4k")},
+          _moeGateUpFusedKQ4KKernel{
+              _moeGateUpFusedKQ4KModule.getKernel("moe_gate_up_fused_k_q4k")},
           _matmulQ5_0VecModule    {loadHipModule(ctx, "matmul_q5_0_vec")},
           _matmulQ5_0VecKernel    {
               _matmulQ5_0VecModule.getKernel("matmul_q5_0_vec")},
@@ -244,6 +249,11 @@ bool GpuMatmul::moeDownFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
     const noexcept {
     return type == ::mimirmind::core::gguf::GgmlType::Q8_0
         || type == ::mimirmind::core::gguf::GgmlType::Q6_K;
+}
+
+bool GpuMatmul::moeGateUpFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
+    const noexcept {
+    return type == ::mimirmind::core::gguf::GgmlType::Q4_K;
 }
 
 void GpuMatmul::sync() {
@@ -977,6 +987,57 @@ void GpuMatmul::moeDownFusedKAsync(::mimirmind::core::gguf::GgmlType type,
     kern.launch(_ctx.stream(),
                 nGroups, 1, 1,
                 kMoeDownLocalSize, 1, 1);
+}
+
+void GpuMatmul::moeGateUpFusedKAsync(::mimirmind::core::gguf::GgmlType type,
+                                     const float*         x,
+                                     const void*          Wg,
+                                     const void*          Wu,
+                                     const std::int32_t*  expIdx,
+                                     float*               gateActOut,
+                                     std::size_t          dModel,
+                                     std::size_t          nFf,
+                                     std::size_t          kActive,
+                                     std::size_t          expertBytesGate,
+                                     std::size_t          expertBytesUp) {
+    if (kActive == 0 || dModel == 0 || nFf == 0) {
+        return;
+    }
+    if (type != ::mimirmind::core::gguf::GgmlType::Q4_K) {
+        throw std::runtime_error(
+            "compute::hip::GpuMatmul::moeGateUpFusedKAsync: only Q4_K "
+            "supported on the HIP side — check moeGateUpFusedKAvailable(type) "
+            "before dispatching.");
+    }
+    // Both GEMVs reduce over dModel in Q4_K super-blocks of 256; require an
+    // exact multiple so no partial block corrupts the dequant.
+    if (dModel % 256 != 0) {
+        throw std::runtime_error(
+            "compute::hip::GpuMatmul::moeGateUpFusedKAsync: dModel=" +
+            std::to_string(dModel) +
+            " is not a multiple of Q4_K blockElements=256");
+    }
+
+    auto& kern = _pimpl->_moeGateUpFusedKQ4KKernel;
+    kern.setPtr  (0, x);
+    kern.setPtr  (1, Wg);
+    kern.setPtr  (2, Wu);
+    kern.setPtr  (3, expIdx);
+    kern.setPtr  (4, gateActOut);
+    kern.setValue(5, static_cast<std::int32_t>(dModel));
+    kern.setValue(6, static_cast<std::int32_t>(nFf));
+    kern.setValue(7, static_cast<std::int32_t>(kActive));
+    kern.setValue(8, static_cast<std::int32_t>(expertBytesGate));
+    kern.setValue(9, static_cast<std::int32_t>(expertBytesUp));
+
+    // One warp per (k, f) output; kMoeGateUpOutputsPerGroup warps per WG.
+    const std::uint32_t nOutputs = static_cast<std::uint32_t>(kActive * nFf);
+    const std::uint32_t nGroups  =
+        (nOutputs + kMoeGateUpOutputsPerGroup - 1) / kMoeGateUpOutputsPerGroup;
+
+    kern.launch(_ctx.stream(),
+                nGroups, 1, 1,
+                kMoeGateUpLocalSize, 1, 1);
 }
 
 } // namespace mimirmind::compute::hip

@@ -119,6 +119,21 @@ public:
     [[nodiscard]] bool moeDownFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
         const noexcept override;
 
+    void moeGateUpFusedKAsync(::mimirmind::core::gguf::GgmlType type,
+                              const float*         x,
+                              const void*          Wg,
+                              const void*          Wu,
+                              const std::int32_t*  expIdx,
+                              float*               gateActOut,
+                              std::size_t          dModel,
+                              std::size_t          nFf,
+                              std::size_t          kActive,
+                              std::size_t          expertBytesGate,
+                              std::size_t          expertBytesUp) override;
+
+    [[nodiscard]] bool moeGateUpFusedKAvailable(
+        ::mimirmind::core::gguf::GgmlType type) const noexcept override;
+
     void sync() override;
 
     [[nodiscard]] std::vector<::mimirmind::compute::AutotuneReport>
@@ -182,6 +197,12 @@ private:
     // architecture-specific tuning of one doesn't drag the other.
     static constexpr std::uint32_t kMoeDownLocalSize      = 64;
     static constexpr std::uint32_t kMoeDownOutputsPerGroup = 4;
+
+    // MoE fused-K gate+up projection (Q4_K). One warp per (k,f) output,
+    // 4 warps per WG (MOE_GU_LOCAL=128 in moe_gate_up_fused_k_q4k.hip) —
+    // restructured for RDNA3 warpSize=32 (unlike the down kernel's SG=16).
+    static constexpr std::uint32_t kMoeGateUpLocalSize      = 128;
+    static constexpr std::uint32_t kMoeGateUpOutputsPerGroup = 4;
 
     // Sentinel for "GEMM never wins — always take matvec-loop". Same
     // pattern as L0's `kGemmMinMNever`.

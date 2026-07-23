@@ -533,6 +533,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/matmul_q8_0_vec_dp4a.hip
         kernels_hip/matmul_q8_0_vec_reorder.hip
         kernels_hip/ffn_gate_up_fused_q8_0.hip
+        kernels_hip/moe_gate_up_fused_k_q4k.hip
         kernels_hip/moe_down_fused_k_q6k.hip
         kernels_hip/moe_down_fused_k_q8_0.hip
         kernels_hip/moe_topk.hip
@@ -1636,6 +1637,37 @@ if(MIMIRMIND_ENABLE_HIP)
         mimirmind_core_hip
     )
 
+    # ---- hip_moe_gate_up_fused_k_q4k_probe — routed-expert gate+up -----
+    #
+    # Exercises the new HIP GpuMatmul::moeGateUpFusedKAsync wiring (Q4_K)
+    # AND the ported kernel against a self-contained CPU reference that
+    # dequantises the same random Q4_K banks. Verifies the 32-lane warp
+    # reduce + super-block unpack on gfx1101 (wave32).
+
+    add_executable(hip_moe_gate_up_fused_k_q4k_probe
+        tools/hip-moe-gate-up-fused-k-q4k-probe.cpp
+        # GpuMatmul.cpp references compute::matmul + compute::quantType
+        # (CPU fallback / quant registry) — not part of mimirmind_core_hip.
+        src/compute/Matmul.cpp
+        src/compute/Dequant.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
+    )
+
+    add_dependencies(hip_moe_gate_up_fused_k_q4k_probe hip_kernels)
+
+    target_link_libraries(hip_moe_gate_up_fused_k_q4k_probe PRIVATE
+        mimirmind_core_hip
+    )
+
     # ---- hip_qkv_split_probe — fused-QKV output scatter ---------------
     #
     # First scatter/layout-transform kernel (no reduction, no LDS).
@@ -2146,6 +2178,7 @@ if(MIMIRMIND_ENABLE_HIP)
         hip_moe_down_fused_k_q6k_probe
         hip_moe_topk_probe
         hip_ffn_gate_up_q8_probe
+        hip_moe_gate_up_fused_k_q4k_probe
         hip_deltanet_probe
         hip_attention_probe
         hip_attention_prefill_flash_probe
