@@ -15,6 +15,11 @@
 // differs — Q6_K packs 256 6-bit signed quants per super-block with
 // 16 per-sub-block int8 scales and a single fp16 super-scale.
 //
+// X is read directly from global memory (was: staged into an LDS tile
+// with per-tile __syncthreads barriers). On gfx1101 the staging cost
+// throughput on this decode matvec — X is tiny + L2-hot, the barriers
+// only stalled the warps. Same change + measurement as matmul_q4k_vec.
+//
 // Launch:
 //   dim3 grid ( ceil(N / OUTPUTS_PER_GROUP), 1, 1 )
 //   dim3 block( MATMUL_Q6K_LOCAL, 1, 1 )
@@ -55,7 +60,6 @@
 
 #define Q6K_BLOCK_ELEMENTS 256
 #define Q6K_BLOCK_BYTES    210
-#define X_TILE_ELEMENTS    1024
 
 namespace {
 
@@ -81,125 +85,94 @@ void matmul_q6k_vec(
     const int                          K,
     const int                          N)
 {
-    __shared__ float xTile[X_TILE_ELEMENTS];
+    const int wg     = blockIdx.x;
+    const int tid    = threadIdx.x;
+    const int warpId = tid / 32;
+    const int laneId = tid % 32;
+    const int n      = wg * MATMUL_Q6K_OUTPUTS_PER_GROUP + warpId;
+    if (n >= N) return;
 
-    const int wg      = blockIdx.x;
-    const int tid     = threadIdx.x;
-    const int lsize   = blockDim.x;
-    const int warpId  = tid / 32;
-    const int laneId  = tid % 32;
-    const int n       = wg * MATMUL_Q6K_OUTPUTS_PER_GROUP + warpId;
-    const bool active = (n < N);
     const int nBlocks = K / Q6K_BLOCK_ELEMENTS;
 
     // Precompute this lane's per-half scale-group index. l in [0..32),
-    // is = l/16 ∈ {0,1} selects between the two sc[] runs within a
-    // half. The four scale slots per lane are then at is + {0,2,4,6}
-    // (first half) or 8 + is + {0,2,4,6} (second half).
+    // is = l/16 ∈ {0,1} selects between the two sc[] runs within a half.
+    const int l  = laneId;
     const int is = laneId >> 4;
+
+    const unsigned char* row =
+        W + static_cast<size_t>(n) * static_cast<size_t>(nBlocks) * Q6K_BLOCK_BYTES;
 
     float sum = 0.0f;
 
-    for (int tile = 0; tile < K; tile += X_TILE_ELEMENTS) {
-        const int tileK = min(X_TILE_ELEMENTS, K - tile);
+    for (int b = 0; b < nBlocks; ++b) {
+        const unsigned char* block = row + b * Q6K_BLOCK_BYTES;
 
-        for (int i = tid; i < tileK; i += lsize) {
-            xTile[i] = X[tile + i];
-        }
-        __syncthreads();
+        const unsigned char* ql = block;
+        const unsigned char* qh = block + 128;
+        const signed char*   sc =
+            reinterpret_cast<const signed char*>(block + 192);
+        const __half*        d_ptr =
+            reinterpret_cast<const __half*>(block + 208);
+        const float d = __half2float(d_ptr[0]);
 
-        if (active) {
-            const unsigned char* row =
-                W + static_cast<size_t>(n)
-                  * static_cast<size_t>(nBlocks)
-                  * Q6K_BLOCK_BYTES;
+        const int xBase = b * Q6K_BLOCK_ELEMENTS;   // global X offset of block
 
-            const int blockStart   = tile / Q6K_BLOCK_ELEMENTS;
-            const int blocksInTile = X_TILE_ELEMENTS / Q6K_BLOCK_ELEMENTS;
-            const int blockEnd     = min(blockStart + blocksInTile, nBlocks);
+        // ---- First 128-element half (elements 0..127) --------
+        {
+            const unsigned int ql0  = ql[l + 0];
+            const unsigned int ql32 = ql[l + 32];
+            const unsigned int qhv  = qh[l];
 
-            for (int b = blockStart; b < blockEnd; ++b) {
-                const unsigned char* block = row + b * Q6K_BLOCK_BYTES;
+            const int q1 = static_cast<int>(
+                (ql0  & 0x0Fu) | (((qhv >> 0) & 0x03u) << 4)) - 32;
+            const int q2 = static_cast<int>(
+                (ql32 & 0x0Fu) | (((qhv >> 2) & 0x03u) << 4)) - 32;
+            const int q3 = static_cast<int>(
+                (ql0  >> 4)    | (((qhv >> 4) & 0x03u) << 4)) - 32;
+            const int q4 = static_cast<int>(
+                (ql32 >> 4)    | (((qhv >> 6) & 0x03u) << 4)) - 32;
 
-                const unsigned char* ql = block;
-                const unsigned char* qh = block + 128;
-                const signed char*   sc =
-                    reinterpret_cast<const signed char*>(block + 192);
-                const __half*        d_ptr =
-                    reinterpret_cast<const __half*>(block + 208);
-                const float d = __half2float(d_ptr[0]);
+            const float s1 = static_cast<float>(sc[is + 0]);
+            const float s2 = static_cast<float>(sc[is + 2]);
+            const float s3 = static_cast<float>(sc[is + 4]);
+            const float s4 = static_cast<float>(sc[is + 6]);
 
-                const int xLocalBase = (b - blockStart) * Q6K_BLOCK_ELEMENTS;
-                const int l          = laneId;
-
-                // ---- First 128-element half (elements 0..127) --------
-                {
-                    const unsigned int ql0  = ql[l + 0];
-                    const unsigned int ql32 = ql[l + 32];
-                    const unsigned int qhv  = qh[l];
-
-                    const int q1 = static_cast<int>(
-                        (ql0  & 0x0Fu) | (((qhv >> 0) & 0x03u) << 4)) - 32;
-                    const int q2 = static_cast<int>(
-                        (ql32 & 0x0Fu) | (((qhv >> 2) & 0x03u) << 4)) - 32;
-                    const int q3 = static_cast<int>(
-                        (ql0  >> 4)    | (((qhv >> 4) & 0x03u) << 4)) - 32;
-                    const int q4 = static_cast<int>(
-                        (ql32 >> 4)    | (((qhv >> 6) & 0x03u) << 4)) - 32;
-
-                    const float s1 = static_cast<float>(sc[is + 0]);
-                    const float s2 = static_cast<float>(sc[is + 2]);
-                    const float s3 = static_cast<float>(sc[is + 4]);
-                    const float s4 = static_cast<float>(sc[is + 6]);
-
-                    sum = __fmaf_rn(xTile[xLocalBase + l +  0],
-                                    d * s1 * static_cast<float>(q1), sum);
-                    sum = __fmaf_rn(xTile[xLocalBase + l + 32],
-                                    d * s2 * static_cast<float>(q2), sum);
-                    sum = __fmaf_rn(xTile[xLocalBase + l + 64],
-                                    d * s3 * static_cast<float>(q3), sum);
-                    sum = __fmaf_rn(xTile[xLocalBase + l + 96],
-                                    d * s4 * static_cast<float>(q4), sum);
-                }
-
-                // ---- Second 128-element half (elements 128..255) -----
-                {
-                    const unsigned int ql0  = ql[64 + l + 0];
-                    const unsigned int ql32 = ql[64 + l + 32];
-                    const unsigned int qhv  = qh[32 + l];
-
-                    const int q1 = static_cast<int>(
-                        (ql0  & 0x0Fu) | (((qhv >> 0) & 0x03u) << 4)) - 32;
-                    const int q2 = static_cast<int>(
-                        (ql32 & 0x0Fu) | (((qhv >> 2) & 0x03u) << 4)) - 32;
-                    const int q3 = static_cast<int>(
-                        (ql0  >> 4)    | (((qhv >> 4) & 0x03u) << 4)) - 32;
-                    const int q4 = static_cast<int>(
-                        (ql32 >> 4)    | (((qhv >> 6) & 0x03u) << 4)) - 32;
-
-                    const float s1 = static_cast<float>(sc[8 + is + 0]);
-                    const float s2 = static_cast<float>(sc[8 + is + 2]);
-                    const float s3 = static_cast<float>(sc[8 + is + 4]);
-                    const float s4 = static_cast<float>(sc[8 + is + 6]);
-
-                    sum = __fmaf_rn(xTile[xLocalBase + 128 + l +  0],
-                                    d * s1 * static_cast<float>(q1), sum);
-                    sum = __fmaf_rn(xTile[xLocalBase + 128 + l + 32],
-                                    d * s2 * static_cast<float>(q2), sum);
-                    sum = __fmaf_rn(xTile[xLocalBase + 128 + l + 64],
-                                    d * s3 * static_cast<float>(q3), sum);
-                    sum = __fmaf_rn(xTile[xLocalBase + 128 + l + 96],
-                                    d * s4 * static_cast<float>(q4), sum);
-                }
-            }
+            sum = __fmaf_rn(X[xBase + l +  0], d * s1 * static_cast<float>(q1), sum);
+            sum = __fmaf_rn(X[xBase + l + 32], d * s2 * static_cast<float>(q2), sum);
+            sum = __fmaf_rn(X[xBase + l + 64], d * s3 * static_cast<float>(q3), sum);
+            sum = __fmaf_rn(X[xBase + l + 96], d * s4 * static_cast<float>(q4), sum);
         }
 
-        __syncthreads();
+        // ---- Second 128-element half (elements 128..255) -----
+        {
+            const unsigned int ql0  = ql[64 + l + 0];
+            const unsigned int ql32 = ql[64 + l + 32];
+            const unsigned int qhv  = qh[32 + l];
+
+            const int q1 = static_cast<int>(
+                (ql0  & 0x0Fu) | (((qhv >> 0) & 0x03u) << 4)) - 32;
+            const int q2 = static_cast<int>(
+                (ql32 & 0x0Fu) | (((qhv >> 2) & 0x03u) << 4)) - 32;
+            const int q3 = static_cast<int>(
+                (ql0  >> 4)    | (((qhv >> 4) & 0x03u) << 4)) - 32;
+            const int q4 = static_cast<int>(
+                (ql32 >> 4)    | (((qhv >> 6) & 0x03u) << 4)) - 32;
+
+            const float s1 = static_cast<float>(sc[8 + is + 0]);
+            const float s2 = static_cast<float>(sc[8 + is + 2]);
+            const float s3 = static_cast<float>(sc[8 + is + 4]);
+            const float s4 = static_cast<float>(sc[8 + is + 6]);
+
+            sum = __fmaf_rn(X[xBase + 128 + l +  0], d * s1 * static_cast<float>(q1), sum);
+            sum = __fmaf_rn(X[xBase + 128 + l + 32], d * s2 * static_cast<float>(q2), sum);
+            sum = __fmaf_rn(X[xBase + 128 + l + 64], d * s3 * static_cast<float>(q3), sum);
+            sum = __fmaf_rn(X[xBase + 128 + l + 96], d * s4 * static_cast<float>(q4), sum);
+        }
     }
 
     sum = warpReduceSum(sum);
 
-    if (active && laneId == 0) {
+    if (laneId == 0) {
         Y[n] = sum;
     }
 }

@@ -15,6 +15,14 @@
 // K-quant — every sub-block has its own scale AND min, so per
 // element:  value = d * scale * nibble - dmin * min.
 //
+// X is read directly from global memory. An earlier version staged X
+// into an LDS tile with per-tile __syncthreads barriers; on gfx1101
+// that cost throughput (this decode matvec is ~75 % of decode GPU
+// time, memory/latency-bound, and X is tiny + stays hot in L2 so the
+// staging bought nothing while the barriers stalled the warps). A/B
+// bench on gfx1101: dropping the LDS tiling was 1.08-1.20x faster
+// bit-for-bit across FFN/attn shapes.
+//
 // Launch:
 //   dim3 grid ( ceil(N / OUTPUTS_PER_GROUP), 1, 1 )
 //   dim3 block( MATMUL_Q4K_LOCAL, 1, 1 )
@@ -52,7 +60,6 @@
 
 #define Q4K_BLOCK_ELEMENTS 256
 #define Q4K_BLOCK_BYTES    144
-#define X_TILE_ELEMENTS    1024
 
 namespace {
 
@@ -69,9 +76,6 @@ __device__ __forceinline__ float warpReduceSum(float v) {
 
 // Unpack one of the 8 (scale, min) pairs from the 12-byte packed
 // scales field. Matches ggml's get_scale_min_k4 and Q4K.cpp:48-61.
-//   j in [0..4): scale = q[j]     & 0x3F, min = q[j+4] & 0x3F
-//   j in [4..8): scale = (q[j+4] & 0x0F) | ((q[j-4] >> 6) << 4)
-//                min   = (q[j+4] >> 4)   | ((q[j]   >> 6) << 4)
 __device__ __forceinline__ void getScaleMinK4(
     int j, const unsigned char* q, unsigned int& scale, unsigned int& min) {
     if (j < 4) {
@@ -95,91 +99,65 @@ void matmul_q4k_vec(
     const int                          K,
     const int                          N)
 {
-    __shared__ float xTile[X_TILE_ELEMENTS];
+    const int wg     = blockIdx.x;
+    const int tid    = threadIdx.x;
+    const int warpId = tid / 32;
+    const int laneId = tid % 32;
+    const int n      = wg * MATMUL_Q4K_OUTPUTS_PER_GROUP + warpId;
+    if (n >= N) return;
 
-    const int wg      = blockIdx.x;
-    const int tid     = threadIdx.x;
-    const int lsize   = blockDim.x;
-    const int warpId  = tid / 32;
-    const int laneId  = tid % 32;
-    const int n       = wg * MATMUL_Q4K_OUTPUTS_PER_GROUP + warpId;
-    const bool active = (n < N);
     const int nBlocks = K / Q4K_BLOCK_ELEMENTS;
+    const int l       = laneId;
+
+    const unsigned char* row =
+        W + static_cast<size_t>(n) * static_cast<size_t>(nBlocks) * Q4K_BLOCK_BYTES;
 
     float sum = 0.0f;
 
-    for (int tile = 0; tile < K; tile += X_TILE_ELEMENTS) {
-        const int tileK = min(X_TILE_ELEMENTS, K - tile);
+    for (int b = 0; b < nBlocks; ++b) {
+        const unsigned char* block = row + b * Q4K_BLOCK_BYTES;
 
-        for (int i = tid; i < tileK; i += lsize) {
-            xTile[i] = X[tile + i];
+        const __half* d_ptr    = reinterpret_cast<const __half*>(block);
+        const __half* dmin_ptr = reinterpret_cast<const __half*>(block + 2);
+        const float d    = __half2float(d_ptr[0]);
+        const float dmin = __half2float(dmin_ptr[0]);
+
+        const unsigned char* scales = block + 4;
+        const unsigned char* qs     = block + 16;
+        const int xBase = b * Q4K_BLOCK_ELEMENTS;   // global X offset of block
+
+        #pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const int jLo = 2 * pair;
+            const int jHi = jLo + 1;
+
+            unsigned int sLo, mLo, sHi, mHi;
+            getScaleMinK4(jLo, scales, sLo, mLo);
+            getScaleMinK4(jHi, scales, sHi, mHi);
+
+            const float dLo  = d    * static_cast<float>(sLo);
+            const float mmLo = dmin * static_cast<float>(mLo);
+            const float dHi  = d    * static_cast<float>(sHi);
+            const float mmHi = dmin * static_cast<float>(mHi);
+
+            const unsigned char qb = qs[pair * 32 + l];
+            const float nibLo = static_cast<float>(qb & 0x0Fu);
+            const float nibHi = static_cast<float>(qb >> 4);
+
+            const float wLo = dLo * nibLo - mmLo;
+            const float wHi = dHi * nibHi - mmHi;
+
+            const float xLo = X[xBase + jLo * 32 + l];
+            const float xHi = X[xBase + jHi * 32 + l];
+
+            sum = __fmaf_rn(xLo, wLo, sum);
+            sum = __fmaf_rn(xHi, wHi, sum);
         }
-        __syncthreads();
-
-        if (active) {
-            const unsigned char* row =
-                W + static_cast<size_t>(n)
-                  * static_cast<size_t>(nBlocks)
-                  * Q4K_BLOCK_BYTES;
-
-            const int blockStart   = tile / Q4K_BLOCK_ELEMENTS;
-            const int blocksInTile = X_TILE_ELEMENTS / Q4K_BLOCK_ELEMENTS;
-            const int blockEnd     = min(blockStart + blocksInTile, nBlocks);
-
-            for (int b = blockStart; b < blockEnd; ++b) {
-                const unsigned char* block = row + b * Q4K_BLOCK_BYTES;
-
-                const __half* d_ptr    = reinterpret_cast<const __half*>(block);
-                const __half* dmin_ptr = reinterpret_cast<const __half*>(block + 2);
-                const float d    = __half2float(d_ptr[0]);
-                const float dmin = __half2float(dmin_ptr[0]);
-
-                const unsigned char* scales = block + 4;
-                const unsigned char* qs     = block + 16;
-
-                const int xLocalBase = (b - blockStart) * Q4K_BLOCK_ELEMENTS;
-                const int l          = laneId;
-
-                // Iterate over 8 sub-blocks. Two adjacent sub-blocks
-                // share the same 32-byte qs chunk (low+high nibbles).
-                for (int pair = 0; pair < 4; ++pair) {
-                    const int jLo = 2 * pair;
-                    const int jHi = jLo + 1;
-
-                    unsigned int sLo, mLo, sHi, mHi;
-                    getScaleMinK4(jLo, scales, sLo, mLo);
-                    getScaleMinK4(jHi, scales, sHi, mHi);
-
-                    const float dLo  = d    * static_cast<float>(sLo);
-                    const float mmLo = dmin * static_cast<float>(mLo);
-                    const float dHi  = d    * static_cast<float>(sHi);
-                    const float mmHi = dmin * static_cast<float>(mHi);
-
-                    const unsigned char qb = qs[pair * 32 + l];
-                    const float nibLo = static_cast<float>(qb & 0x0Fu);
-                    const float nibHi = static_cast<float>(qb >> 4);
-
-                    // Sub-block jLo covers elements [jLo*32 .. jLo*32+31]
-                    // (low nibbles); jHi covers [jHi*32 .. jHi*32+31]
-                    // (high nibbles). Same qs byte, different nibble.
-                    const float wLo = dLo * nibLo - mmLo;
-                    const float wHi = dHi * nibHi - mmHi;
-
-                    const float xLo = xTile[xLocalBase + jLo * 32 + l];
-                    const float xHi = xTile[xLocalBase + jHi * 32 + l];
-
-                    sum = __fmaf_rn(xLo, wLo, sum);
-                    sum = __fmaf_rn(xHi, wHi, sum);
-                }
-            }
-        }
-
-        __syncthreads();
     }
 
     sum = warpReduceSum(sum);
 
-    if (active && laneId == 0) {
+    if (laneId == 0) {
         Y[n] = sum;
     }
 }
