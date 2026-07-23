@@ -12,6 +12,7 @@
 #include "core/modelopt/HfQuantConfig.hpp"
 #include "core/modelopt/ModelOptQuant.hpp"
 #include "core/modelopt/ModelOptWeightLayout.hpp"
+#include "core/modelopt/Qwen35MoeGgufMap.hpp"
 #include "core/safetensors/SafetensorsHeader.hpp"
 
 #include <cmath>
@@ -450,6 +451,69 @@ TEST(dequant_fp8_weight) {
     EXPECT_EQ(out[1], 1.0f);   // 0.5 * 2.0
     EXPECT_EQ(out[2], -0.5f);  // 0.5 * -1.0
     EXPECT_EQ(out[3], 0.0f);
+}
+
+// =======================================================================
+// Qwen35MoeGgufMap — HF<->GGUF name mapping (verified vs the running GGUF)
+// =======================================================================
+
+namespace {
+const mo::GgufTensorSource* findGguf(std::span<const mo::GgufTensorSource> t,
+                                     std::string_view ggufSuffix) {
+    for (const auto& e : t) if (e.ggufSuffix == ggufSuffix) return &e;
+    return nullptr;
+}
+} // namespace
+
+TEST(ggufmap_full_attn_layers) {
+    // full_attention_interval = 4 -> layers 3,7,...,39.
+    EXPECT_TRUE(mo::qwen35moeIsFullAttnLayer(3));
+    EXPECT_TRUE(mo::qwen35moeIsFullAttnLayer(7));
+    EXPECT_TRUE(mo::qwen35moeIsFullAttnLayer(39));
+    EXPECT_TRUE(!mo::qwen35moeIsFullAttnLayer(0));
+    EXPECT_TRUE(!mo::qwen35moeIsFullAttnLayer(1));
+    EXPECT_TRUE(!mo::qwen35moeIsFullAttnLayer(2));
+}
+
+TEST(ggufmap_name_substitution) {
+    EXPECT_EQ(mo::qwen35moeHfName("self_attn.q_proj.weight", 3),
+              std::string{"model.language_model.layers.3.self_attn.q_proj.weight"});
+    EXPECT_EQ(mo::qwen35moeHfName("mlp.experts.{E}.gate_proj.weight", 0, 5),
+              std::string{"model.language_model.layers.0.mlp.experts.5.gate_proj.weight"});
+    // no expert -> {E} left as-is (caller iterates experts)
+    EXPECT_EQ(mo::qwen35moeHfName("mlp.experts.{E}.up_proj.weight", 12),
+              std::string{"model.language_model.layers.12.mlp.experts.{E}.up_proj.weight"});
+}
+
+TEST(ggufmap_tables) {
+    // full-attn: attn_q comes from the FULL gated q_proj (Direct, no split)
+    const auto* q = findGguf(mo::qwen35moeFullAttnTensors(), "attn_q.weight");
+    EXPECT_TRUE(q != nullptr);
+    EXPECT_EQ(q->hfSuffix, std::string_view{"self_attn.q_proj.weight"});
+    EXPECT_EQ(q->xform,    mo::WeightXform::Direct);
+
+    // DeltaNet: attn_qkv reuses the name for in_proj_qkv; attn_gate for in_proj_z
+    const auto* qkv = findGguf(mo::qwen35moeDeltaNetTensors(), "attn_qkv.weight");
+    EXPECT_TRUE(qkv != nullptr);
+    EXPECT_EQ(qkv->hfSuffix, std::string_view{"linear_attn.in_proj_qkv.weight"});
+    const auto* gate = findGguf(mo::qwen35moeDeltaNetTensors(), "attn_gate.weight");
+    EXPECT_TRUE(gate != nullptr);
+    EXPECT_EQ(gate->hfSuffix, std::string_view{"linear_attn.in_proj_z.weight"});
+    EXPECT_TRUE(findGguf(mo::qwen35moeDeltaNetTensors(), "ssm_a") != nullptr);
+
+    // MoE: routed experts are StackExperts, shared is Direct
+    const auto* exps = findGguf(mo::qwen35moeMoeTensors(), "ffn_gate_exps.weight");
+    EXPECT_TRUE(exps != nullptr);
+    EXPECT_EQ(exps->xform, mo::WeightXform::StackExperts);
+    EXPECT_TRUE(exps->hfSuffix.find("{E}") != std::string_view::npos);
+    const auto* sh = findGguf(mo::qwen35moeMoeTensors(), "ffn_down_shexp.weight");
+    EXPECT_TRUE(sh != nullptr);
+    EXPECT_EQ(sh->xform, mo::WeightXform::Direct);
+
+    // top-level: lm_head -> output.weight
+    const auto* out = findGguf(mo::qwen35moeTopLevelTensors(), "output.weight");
+    EXPECT_TRUE(out != nullptr);
+    EXPECT_EQ(out->hfSuffix, std::string_view{"lm_head.weight"});
 }
 
 int main() {
