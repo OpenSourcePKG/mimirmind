@@ -349,6 +349,8 @@ add_library(mimirmind_core_common STATIC
     src/core/ipc/WireOps.cpp
     src/core/modelopt/HfQuantConfig.cpp
     src/core/modelopt/ModelOptQuant.cpp
+    src/core/modelopt/ModelOptWeightLayout.cpp
+    src/core/modelopt/ModelOptWeightAssembler.cpp
     src/core/safetensors/SafetensorsDtype.cpp
     src/core/safetensors/SafetensorsHeader.cpp
     src/core/safetensors/SafetensorsIndex.cpp

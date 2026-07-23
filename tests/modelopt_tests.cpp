@@ -9,12 +9,17 @@
 
 #include "core/modelopt/HfQuantConfig.hpp"
 #include "core/modelopt/ModelOptQuant.hpp"
+#include "core/modelopt/ModelOptWeightLayout.hpp"
+#include "core/safetensors/SafetensorsHeader.hpp"
 
+#include <cstdint>
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace mo = mimirmind::core::modelopt;
+namespace st = mimirmind::core::safetensors;
 
 namespace {
 
@@ -28,6 +33,22 @@ bool threw(const std::function<void()>& fn) {
         return false;
     }
     return false;
+}
+
+// Hand-build a SafetensorsTensor with a self-consistent byte size.
+st::SafetensorsTensor mkTensor(const std::string&                name,
+                               st::SafetensorsDtype              dtype,
+                               const std::vector<std::uint64_t>& shape) {
+    st::SafetensorsTensor t;
+    t.name      = name;
+    t.dtype     = dtype;
+    t.shape     = shape;
+    t.nelements = 1;
+    for (const auto d : shape) t.nelements *= d;
+    t.nbytes    = static_cast<std::size_t>(t.nelements) * st::dtypeWidth(dtype);
+    t.dataBegin = 0;
+    t.dataEnd   = t.nbytes;
+    return t;
 }
 
 } // namespace
@@ -229,6 +250,78 @@ TEST(hfquant_rejects_malformed) {
         (void)mo::HfQuantConfig::parse(
             R"({"quantization":{"quantized_layers":{"m":{"group_size":16}}}})");
     }));
+}
+
+// =======================================================================
+// validateWeightLayout — pure ModelOpt weight assembly / validation
+// =======================================================================
+
+TEST(assemble_nvfp4_layout) {
+    // Real gate_proj sidecars: weight U8 [512,1024] (in=2048), block scale
+    // F8_E4M3 [512,128], global scale F32 scalar.
+    const auto w  = mkTensor("w.weight",         st::SafetensorsDtype::U8,      {512, 1024});
+    const auto bs = mkTensor("w.weight_scale",   st::SafetensorsDtype::F8_E4M3, {512, 128});
+    const auto gs = mkTensor("w.weight_scale_2", st::SafetensorsDtype::F32,     {});
+
+    const auto layout = mo::validateWeightLayout(
+        mo::ModelOptQuantScheme::NVFP4_E2M1_BLK16, 16, w, &bs, &gs, nullptr, nullptr);
+
+    EXPECT_EQ(layout.scheme,      mo::ModelOptQuantScheme::NVFP4_E2M1_BLK16);
+    EXPECT_EQ(layout.outFeatures, std::uint64_t{512});
+    EXPECT_EQ(layout.inFeatures,  std::uint64_t{2048}); // 1024 packed * 2
+    EXPECT_EQ(layout.groupSize,   static_cast<std::uint16_t>(16));
+}
+
+TEST(assemble_fp8_layout) {
+    // q_proj: weight F8_E4M3 [8192,2048] unpacked, F32 weight + input scales.
+    const auto w  = mkTensor("q.weight",       st::SafetensorsDtype::F8_E4M3, {8192, 2048});
+    const auto ws = mkTensor("q.weight_scale", st::SafetensorsDtype::F32,     {});
+    const auto is = mkTensor("q.input_scale",  st::SafetensorsDtype::F32,     {});
+
+    const auto layout = mo::validateWeightLayout(
+        mo::ModelOptQuantScheme::FP8_E4M3, 0, w, nullptr, nullptr, &ws, &is);
+
+    EXPECT_EQ(layout.outFeatures, std::uint64_t{8192});
+    EXPECT_EQ(layout.inFeatures,  std::uint64_t{2048}); // packFactor 1
+    EXPECT_EQ(layout.groupSize,   static_cast<std::uint16_t>(0));
+}
+
+TEST(assemble_rejects_inconsistencies) {
+    const auto wU8  = mkTensor("w.weight",         st::SafetensorsDtype::U8,      {512, 1024});
+    const auto bs   = mkTensor("w.weight_scale",   st::SafetensorsDtype::F8_E4M3, {512, 128});
+    const auto gs   = mkTensor("w.weight_scale_2", st::SafetensorsDtype::F32,     {});
+    constexpr auto NVFP4 = mo::ModelOptQuantScheme::NVFP4_E2M1_BLK16;
+    constexpr auto FP8   = mo::ModelOptQuantScheme::FP8_E4M3;
+
+    // weight dtype mismatch (F32 where U8 expected)
+    const auto wF32 = mkTensor("w.weight", st::SafetensorsDtype::F32, {512, 1024});
+    EXPECT_TRUE(threw([&] { (void)mo::validateWeightLayout(NVFP4, 16, wF32, &bs, &gs, nullptr, nullptr); }));
+
+    // weight not 2-D
+    const auto w1d = mkTensor("w.weight", st::SafetensorsDtype::U8, {512});
+    EXPECT_TRUE(threw([&] { (void)mo::validateWeightLayout(NVFP4, 16, w1d, &bs, &gs, nullptr, nullptr); }));
+
+    // missing block scale
+    EXPECT_TRUE(threw([&] { (void)mo::validateWeightLayout(NVFP4, 16, wU8, nullptr, &gs, nullptr, nullptr); }));
+
+    // block scale wrong column count (should be 128)
+    const auto bsBad = mkTensor("w.weight_scale", st::SafetensorsDtype::F8_E4M3, {512, 64});
+    EXPECT_TRUE(threw([&] { (void)mo::validateWeightLayout(NVFP4, 16, wU8, &bsBad, &gs, nullptr, nullptr); }));
+
+    // missing global scale
+    EXPECT_TRUE(threw([&] { (void)mo::validateWeightLayout(NVFP4, 16, wU8, &bs, nullptr, nullptr, nullptr); }));
+
+    // global scale not scalar
+    const auto gsVec = mkTensor("w.weight_scale_2", st::SafetensorsDtype::F32, {2});
+    EXPECT_TRUE(threw([&] { (void)mo::validateWeightLayout(NVFP4, 16, wU8, &bs, &gsVec, nullptr, nullptr); }));
+
+    // config group_size disagrees with the scheme (16)
+    EXPECT_TRUE(threw([&] { (void)mo::validateWeightLayout(NVFP4, 32, wU8, &bs, &gs, nullptr, nullptr); }));
+
+    // FP8: missing input scale
+    const auto wf  = mkTensor("q.weight",       st::SafetensorsDtype::F8_E4M3, {8192, 2048});
+    const auto ws  = mkTensor("q.weight_scale", st::SafetensorsDtype::F32,     {});
+    EXPECT_TRUE(threw([&] { (void)mo::validateWeightLayout(FP8, 0, wf, nullptr, nullptr, &ws, nullptr); }));
 }
 
 int main() {
