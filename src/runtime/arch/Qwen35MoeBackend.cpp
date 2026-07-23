@@ -448,6 +448,11 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     trace("attn residual");
     _ops.addResidualAsync(x, projOut, T * d_model);
 
+    if (diag) {
+        const std::size_t posPA = cache.length() + (T > 0 ? T - 1 : 0);
+        traceNorm("postattn", blockIdx, posPA, x, T * d_model);
+    }
+
     trace("post_attention_norm");
     _ops.rmsNormAsync(x, T, d_model,
                       static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
