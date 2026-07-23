@@ -8,11 +8,13 @@
 #include "TestFramework.hpp"
 
 #include "core/modelopt/BlockScaleSwizzle.hpp"
+#include "core/modelopt/NvFp4Reference.hpp"
 #include "core/modelopt/HfQuantConfig.hpp"
 #include "core/modelopt/ModelOptQuant.hpp"
 #include "core/modelopt/ModelOptWeightLayout.hpp"
 #include "core/safetensors/SafetensorsHeader.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
@@ -391,6 +393,52 @@ TEST(swizzle_pads_with_zero) {
             written[mo::swizzledScaleOffset(m, s, mT, kT)] = true;
     for (std::size_t i = 0; i < dst.size(); ++i)
         if (!written[i]) EXPECT_EQ(dst[i], std::uint8_t{0});
+}
+
+// =======================================================================
+// NvFp4Reference — CPU dequant oracle (scalars verified vs CUTLASS on GB10)
+// =======================================================================
+
+TEST(e2m1_full_table) {
+    // All 16 codes: magnitudes {0,.5,1,1.5,2,3,4,6}, bit 3 = sign.
+    const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    for (std::uint8_t n = 0; n < 16; ++n) {
+        const float expect = (n & 0x8u) ? -mag[n & 0x7u] : mag[n & 0x7u];
+        EXPECT_EQ(mo::e2m1ToFloat(n), expect);
+    }
+}
+
+TEST(e4m3_known_values) {
+    EXPECT_EQ(mo::e4m3ToFloat(0x00), 0.0f);
+    EXPECT_EQ(mo::e4m3ToFloat(0x38), 1.0f);   // e=7,m=0 -> 2^0
+    EXPECT_EQ(mo::e4m3ToFloat(0x40), 2.0f);   // e=8,m=0 -> 2^1
+    EXPECT_EQ(mo::e4m3ToFloat(0x3C), 1.5f);   // e=7,m=4 -> 1.5
+    EXPECT_EQ(mo::e4m3ToFloat(0x7E), 448.0f); // e=15,m=6 -> 2^8*1.75 (max normal)
+    EXPECT_EQ(mo::e4m3ToFloat(0xB8), -1.0f);  // sign + 1.0
+    EXPECT_EQ(mo::e4m3ToFloat(0x04), 0.0078125f); // subnormal m=4: 2^-6 * 4/8
+    EXPECT_TRUE(std::isnan(mo::e4m3ToFloat(0x7F))); // NaN code
+}
+
+TEST(dequant_nvfp4_block) {
+    // One row, 16 elements (one block). global=0.125, block_scale=2.0 (0x40),
+    // nibbles: [+1.0(0x2), -1.5(0xB), +0.5(0x1), +6.0(0x7), rest 0].
+    // packed: element 2j low nibble, 2j+1 high nibble.
+    std::uint8_t packed[8] = {
+        static_cast<std::uint8_t>(0x2 | (0xB << 4)),  // e0=+1.0, e1=-1.5
+        static_cast<std::uint8_t>(0x1 | (0x7 << 4)),  // e2=+0.5, e3=+6.0
+        0, 0, 0, 0, 0, 0,
+    };
+    std::uint8_t blockScale[1] = {0x40}; // 2.0
+    float out[16];
+    mo::dequantNvfp4(packed, blockScale, 0.125f, 1, 16, out);
+
+    // value = 0.125 * 2.0 * e2m1
+    EXPECT_EQ(out[0], 0.125f * 2.0f * 1.0f);
+    EXPECT_EQ(out[1], 0.125f * 2.0f * -1.5f);
+    EXPECT_EQ(out[2], 0.125f * 2.0f * 0.5f);
+    EXPECT_EQ(out[3], 0.125f * 2.0f * 6.0f);
+    EXPECT_EQ(out[4], 0.0f);
+    EXPECT_EQ(out[15], 0.0f);
 }
 
 int main() {
