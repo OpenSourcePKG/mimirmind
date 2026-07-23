@@ -7,6 +7,7 @@
 
 #include "TestFramework.hpp"
 
+#include "core/modelopt/BlockScaleSwizzle.hpp"
 #include "core/modelopt/HfQuantConfig.hpp"
 #include "core/modelopt/ModelOptQuant.hpp"
 #include "core/modelopt/ModelOptWeightLayout.hpp"
@@ -322,6 +323,74 @@ TEST(assemble_rejects_inconsistencies) {
     const auto wf  = mkTensor("q.weight",       st::SafetensorsDtype::F8_E4M3, {8192, 2048});
     const auto ws  = mkTensor("q.weight_scale", st::SafetensorsDtype::F32,     {});
     EXPECT_TRUE(threw([&] { (void)mo::validateWeightLayout(FP8, 0, wf, nullptr, nullptr, &ws, nullptr); }));
+}
+
+// =======================================================================
+// BlockScaleSwizzle — CUTLASS SF layout (verified bit-exact vs cute on GB10)
+// =======================================================================
+
+TEST(swizzle_sizes) {
+    EXPECT_EQ(mo::swizzledBlockScaleBytes(128, 4),      std::size_t{512});
+    EXPECT_EQ(mo::swizzledBlockScaleBytes(256, 8),      std::size_t{2048});
+    EXPECT_EQ(mo::swizzledBlockScaleBytes(512, 16),     std::size_t{8192});
+    // real lm_head SF: rows=248320, ksf=2048/16=128
+    EXPECT_EQ(mo::swizzledBlockScaleBytes(248320, 128), std::size_t{31784960});
+    // padding: 100 rows -> 1 tile, 4 ksf -> 1 tile
+    EXPECT_EQ(mo::swizzledBlockScaleBytes(100, 4),      std::size_t{512});
+}
+
+TEST(swizzle_known_offsets) {
+    // Values below are the exact offsets cute's tile_atom_to_shape_SFA
+    // returned on GB10 (rows=256, ksf=8 -> mTiles=2, ksfTiles=2).
+    const std::uint64_t mT = mo::sfRowTiles(256), kT = mo::sfKTiles(8);
+    EXPECT_EQ(mo::swizzledScaleOffset(0,   0, mT, kT), std::size_t{0});
+    EXPECT_EQ(mo::swizzledScaleOffset(0,   4, mT, kT), std::size_t{512});  // 2nd K-tile
+    EXPECT_EQ(mo::swizzledScaleOffset(1,   1, mT, kT), std::size_t{17});   // m0=1 -> 16, a_s=1
+    EXPECT_EQ(mo::swizzledScaleOffset(32,  0, mT, kT), std::size_t{4});    // m1=1 -> stride 4
+    EXPECT_EQ(mo::swizzledScaleOffset(128, 0, mT, kT), std::size_t{1024}); // 2nd M-tile
+}
+
+TEST(swizzle_roundtrip_and_injective) {
+    const std::uint64_t rows = 8, ksf = 8; // 64 unique byte values (< 256)
+    std::vector<std::uint8_t> src(rows * ksf);
+    for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<std::uint8_t>(i + 1);
+
+    std::vector<std::uint8_t> dst(mo::swizzledBlockScaleBytes(rows, ksf), 0xEE);
+    mo::swizzleBlockScale(src.data(), rows, ksf, dst.data());
+
+    const std::uint64_t mT = mo::sfRowTiles(rows), kT = mo::sfKTiles(ksf);
+    // every source scale lands at its offset, in bounds, no collisions
+    std::vector<int> hitCount(dst.size(), 0);
+    for (std::uint64_t m = 0; m < rows; ++m) {
+        for (std::uint64_t s = 0; s < ksf; ++s) {
+            const std::size_t off = mo::swizzledScaleOffset(m, s, mT, kT);
+            EXPECT_TRUE(off < dst.size());
+            EXPECT_EQ(dst[off], src[m * ksf + s]);
+            ++hitCount[off];
+        }
+    }
+    // injectivity: no offset written twice
+    int maxHits = 0;
+    for (int h : hitCount) if (h > maxHits) maxHits = h;
+    EXPECT_EQ(maxHits, 1);
+}
+
+TEST(swizzle_pads_with_zero) {
+    // rows=100 padded to 128: the 28 padding rows write nothing, and no
+    // source scale collides into their storage, so every un-hit byte is 0.
+    const std::uint64_t rows = 100, ksf = 4;
+    std::vector<std::uint8_t> src(rows * ksf);
+    for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<std::uint8_t>((i % 255) + 1);
+    std::vector<std::uint8_t> dst(mo::swizzledBlockScaleBytes(rows, ksf), 0x7);
+    mo::swizzleBlockScale(src.data(), rows, ksf, dst.data());
+
+    const std::uint64_t mT = mo::sfRowTiles(rows), kT = mo::sfKTiles(ksf);
+    std::vector<bool> written(dst.size(), false);
+    for (std::uint64_t m = 0; m < rows; ++m)
+        for (std::uint64_t s = 0; s < ksf; ++s)
+            written[mo::swizzledScaleOffset(m, s, mT, kT)] = true;
+    for (std::size_t i = 0; i < dst.size(); ++i)
+        if (!written[i]) EXPECT_EQ(dst[i], std::uint8_t{0});
 }
 
 int main() {

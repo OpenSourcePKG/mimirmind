@@ -347,6 +347,7 @@ add_library(mimirmind_core_common STATIC
     src/core/ipc/TensorManifest.cpp
     src/core/ipc/UnixSocketFrame.cpp
     src/core/ipc/WireOps.cpp
+    src/core/modelopt/BlockScaleSwizzle.cpp
     src/core/modelopt/HfQuantConfig.cpp
     src/core/modelopt/ModelOptQuant.cpp
     src/core/modelopt/ModelOptWeightLayout.cpp
