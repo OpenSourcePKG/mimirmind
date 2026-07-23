@@ -347,6 +347,13 @@ add_library(mimirmind_core_common STATIC
     src/core/ipc/TensorManifest.cpp
     src/core/ipc/UnixSocketFrame.cpp
     src/core/ipc/WireOps.cpp
+    src/core/modelopt/HfQuantConfig.cpp
+    src/core/modelopt/ModelOptQuant.cpp
+    src/core/safetensors/SafetensorsDtype.cpp
+    src/core/safetensors/SafetensorsHeader.cpp
+    src/core/safetensors/SafetensorsIndex.cpp
+    src/core/safetensors/SafetensorsModel.cpp
+    src/core/safetensors/SafetensorsReader.cpp
     src/core/os/MappedFile.cpp
     src/core/log/Log.cpp
     src/core/os/GovernorLock.cpp
@@ -992,6 +999,39 @@ add_executable(quant_tests
 target_include_directories(quant_tests PRIVATE tests)
 
 target_link_libraries(quant_tests PRIVATE mimirmind_core_common)
+
+# ---- modelopt_tests — pure-CPU unit tests for ModelOpt/NVFP4/FP8 schemes ----
+#
+# Standalone test binary. No CUDA, no model file — locks the ModelOpt
+# scheme descriptors (NVFP4_E2M1_BLK16, FP8_E4M3), the hf_quant_config
+# quant_algo string mapping, and the packed-weight byte-size math against
+# the shapes verified on nvidia/Qwen3.6-35B-A3B-NVFP4's safetensors index.
+#
+# Run via:   cmake --build build --target modelopt_tests && build/modelopt_tests
+
+add_executable(modelopt_tests
+    tests/modelopt_tests.cpp
+)
+
+target_include_directories(modelopt_tests PRIVATE tests)
+
+target_link_libraries(modelopt_tests PRIVATE mimirmind_core_common)
+
+# ---- safetensors_tests — pure-CPU unit tests for the safetensors reader -----
+#
+# Standalone test binary. No CUDA, no model file — exercises the dtype
+# parsing and the mmap-free header parser (parseSafetensorsHeader) against
+# hand-crafted safetensors buffers, including every malformation branch.
+#
+# Run via:   cmake --build build --target safetensors_tests && build/safetensors_tests
+
+add_executable(safetensors_tests
+    tests/safetensors_tests.cpp
+)
+
+target_include_directories(safetensors_tests PRIVATE tests)
+
+target_link_libraries(safetensors_tests PRIVATE mimirmind_core_common)
 
 # ---- backend_tests — pure-CPU tests for BackendPool + BackendRegistry ------
 #
