@@ -354,6 +354,7 @@ add_library(mimirmind_core_common STATIC
     src/core/modelopt/ModelOptWeightAssembler.cpp
     src/core/modelopt/NvFp4Reference.cpp
     src/core/modelopt/Qwen35MoeGgufMap.cpp
+    src/core/modelopt/Qwen35MoeMaterializer.cpp
     src/core/safetensors/SafetensorsDtype.cpp
     src/core/safetensors/SafetensorsHeader.cpp
     src/core/safetensors/SafetensorsIndex.cpp
