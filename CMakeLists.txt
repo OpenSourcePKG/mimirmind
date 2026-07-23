@@ -372,6 +372,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/nvfp4/NvFp4Model.cpp
     src/runtime/nvfp4/NvFp4Materializer.cpp
     src/runtime/nvfp4/NvFp4WeightsMap.cpp
+    src/runtime/nvfp4/Qwen35MoeConfig.cpp
     src/runtime/nvfp4/ModelFormatResolver.cpp
 )
 
