@@ -532,6 +532,7 @@ if(MIMIRMIND_ENABLE_HIP)
         kernels_hip/matmul_q8_0_vec.hip
         kernels_hip/matmul_q8_0_vec_dp4a.hip
         kernels_hip/matmul_q8_0_vec_reorder.hip
+        kernels_hip/ffn_gate_up_fused_q8_0.hip
         kernels_hip/moe_down_fused_k_q6k.hip
         kernels_hip/moe_down_fused_k_q8_0.hip
         kernels_hip/moe_topk.hip
@@ -1618,6 +1619,23 @@ if(MIMIRMIND_ENABLE_HIP)
         mimirmind_core_hip
     )
 
+    # ---- hip_ffn_gate_up_q8_probe — fused shared-expert gate+up parity -
+    #
+    # Drives ffn_gate_up_fused_q8_0.hsaco (the always-on Qwen3-Next shared
+    # expert, Q8_0) against a self-contained CPU reference that dequantises
+    # the same Q8_0 bytes. Verifies the 32-lane warp reduce on gfx1101
+    # (wave32) — the one place a CDNA-derived shuffle width would break.
+
+    add_executable(hip_ffn_gate_up_q8_probe
+        tools/hip-ffn-gate-up-q8-probe.cpp
+    )
+
+    add_dependencies(hip_ffn_gate_up_q8_probe hip_kernels)
+
+    target_link_libraries(hip_ffn_gate_up_q8_probe PRIVATE
+        mimirmind_core_hip
+    )
+
     # ---- hip_qkv_split_probe — fused-QKV output scatter ---------------
     #
     # First scatter/layout-transform kernel (no reduction, no LDS).
@@ -2127,6 +2145,7 @@ if(MIMIRMIND_ENABLE_HIP)
         hip_moe_down_fused_k_q8_0_probe
         hip_moe_down_fused_k_q6k_probe
         hip_moe_topk_probe
+        hip_ffn_gate_up_q8_probe
         hip_deltanet_probe
         hip_attention_probe
         hip_attention_prefill_flash_probe

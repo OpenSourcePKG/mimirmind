@@ -148,6 +148,7 @@ TEST(hip_matmul_q3k_vec)             { expectProbeOk("hip_matmul_q3k_probe"); }
 TEST(hip_moe_down_fused_k_q8_0)      { expectProbeOk("hip_moe_down_fused_k_q8_0_probe"); }
 TEST(hip_moe_down_fused_k_q6k)       { expectProbeOk("hip_moe_down_fused_k_q6k_probe"); }
 TEST(hip_moe_topk)                   { expectProbeOk("hip_moe_topk_probe"); }
+TEST(hip_ffn_gate_up_q8)             { expectProbeOk("hip_ffn_gate_up_q8_probe"); }
 
 // Qwen3-Next GatedDeltaNet linear-attention (gate + AR recurrence, wave32)
 TEST(hip_deltanet)                   { expectProbeOk("hip_deltanet_probe"); }
