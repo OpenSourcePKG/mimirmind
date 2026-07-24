@@ -111,6 +111,28 @@ private:
                    std::size_t         T,
                    BlockBuffers&       s);
 
+    /// M-Cuda.Batch D2c — batched (nSeq) MoE FFN for serving-class decode.
+    /// Every sequence contributes exactly one token (T==1 per seq); the nSeq
+    /// rows of `moeInput` [nSeq, d_model] take the place of the single-session
+    /// `T` batch dimension for the row-parallel ops (router matmul, shared
+    /// expert), while the routed experts go through the fused-K *_Batched
+    /// kernels (grid.y = nSeq). Per-sequence top-K is computed on the host and
+    /// scattered into caller-owned USM slots `expIdxSlot` / `kwSlot`, each
+    /// [nSeq * expertUsedCount]. Result is summed into `s.moeAccumBuf`
+    /// [nSeq, d_model], byte-identical to nSeq separate runMoeFfn(T==1) calls.
+    ///
+    /// Preconditions (serving path only — throws otherwise): routed experts
+    /// use SEPARATE Q4_K gate/up banks + a Q5_K down bank, the fused-K kernels
+    /// are available, d_model % 256 == 0 and n_ff_exp % 256 == 0. Scratch
+    /// `s.moeGateCompact` must hold [nSeq * K, n_ff_exp]; `s.scoreScratch`
+    /// must hold >= nSeq scalars for the shared-expert gate.
+    void runMoeFfnBatched(std::size_t    blockIdx,
+                          const float*   moeInput,
+                          std::size_t    nSeq,
+                          std::int32_t*  expIdxSlot,
+                          float*         kwSlot,
+                          BlockBuffers&  s);
+
     const model::LlmConfig&       _config;
     const core::gguf::WeightsMap& _weights;
     const model::FusedQkvWeights* _fusedQkv{nullptr};

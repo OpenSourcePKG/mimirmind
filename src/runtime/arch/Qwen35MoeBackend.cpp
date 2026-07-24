@@ -768,4 +768,155 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
     }
 }
 
+void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
+                                        const float*   moeInput,
+                                        std::size_t    nSeq,
+                                        std::int32_t*  expIdxSlot,
+                                        float*         kwSlot,
+                                        BlockBuffers&  s) {
+    namespace cmp = mimirmind::compute;
+    const auto& w = _weights;
+
+    const auto& routerW  = requireBlock(w, blockIdx, "ffn_gate_inp.weight");
+    const auto& downExps = requireBlock(w, blockIdx, "ffn_down_exps.weight");
+
+    // Serving decode requires the SEPARATE-bank fused-K layout: Q4_K gate/up
+    // banks + a Q5_K down bank (the only layout the *_Batched kernels port
+    // today). The single-session runMoeFfn falls back to per-expert matmuls
+    // for other layouts; there is no such fallback here — a batched decode on
+    // an unsupported model is a configuration error, not a slow path.
+    const auto* gateUpFused = w.findBlock(blockIdx, "ffn_gate_up_exps.weight");
+    if (gateUpFused != nullptr) {
+        throw std::runtime_error(
+            "Qwen35MoeBackend::runMoeFfnBatched: fused ffn_gate_up_exps layout "
+            "is not supported on the batched decode path (need separate Q4_K "
+            "gate/up + Q5_K down banks)");
+    }
+    const auto& gateExps = requireBlock(w, blockIdx, "ffn_gate_exps.weight");
+    const auto& upExps   = requireBlock(w, blockIdx, "ffn_up_exps.weight");
+
+    const std::size_t d_model  = s.d_model;
+    const std::size_t nExperts = _config.expertCount;
+    const std::size_t K        = _config.expertUsedCount;
+
+    if (gateExps.dimensions.size() < 3) {
+        throw std::runtime_error(
+            "Qwen35MoeBackend::runMoeFfnBatched: expert gate tensor must be 3-D "
+            "[n_embd, n_ff, n_expert]");
+    }
+    const std::size_t n_ff_exp = gateExps.dimensions[1];
+
+    if (!_gmm.moeGateUpFusedKAvailable(gateExps.type) ||
+        !_gmm.moeDownFusedKAvailable(downExps.type) ||
+        gateExps.type != upExps.type ||
+        (d_model % 256 != 0) || (n_ff_exp % 256 != 0)) {
+        throw std::runtime_error(
+            "Qwen35MoeBackend::runMoeFfnBatched: batched fused-K MoE kernels "
+            "unavailable for this model (need Q4_K gate/up + Q5_K down, "
+            "d_model % 256 == 0, n_ff_exp % 256 == 0)");
+    }
+
+    float* const gateOutBuf    = s.gateOut.as<float>();
+    float* const upOutBuf      = s.upOut.as<float>();
+    float* const matmulScratch = s.matmulScratch.as<float>();
+    float* const moeAccumBuf   = s.moeAccumBuf.as<float>();
+    float* const expertOutBuf  = s.expertOutBuf.as<float>();
+    float* const gateActAll    = s.moeGateCompact.as<float>();  // [nSeq*K, n_ff_exp]
+
+    // --- router: logits[nSeq, nExperts] = ffn_gate_inp @ moeInput ----------
+    // Synchronous: the host top-K below reads upOutBuf on the CPU. (The
+    // device-top-K fast path of runMoeFfn is deferred for the batched path
+    // until a batched moeTopKRouteDeviceAsync exists.)
+    _gmm.matmul(routerW.type, routerW.usmPtr, nExperts, d_model,
+                moeInput, nSeq, upOutBuf, matmulScratch);
+
+    // Per-sequence top-K over the nSeq router rows (moeTopKRoute treats its
+    // batch dim generically, so nSeq rows == nSeq independent routings).
+    _topKIdx.resize(nSeq * K);
+    _topKWeight.resize(nSeq * K);
+    cmp::moeTopKRoute(upOutBuf, nSeq, nExperts, K,
+                      _topKIdx.data(), _topKWeight.data());
+
+    const float wScale = (_config.expertWeightsScale != 0.0F)
+                             ? _config.expertWeightsScale : 1.0F;
+    for (std::size_t r = 0; r < nSeq * K; ++r) {
+        expIdxSlot[r] = _topKIdx[r];
+        kwSlot[r]     = _topKWeight[r] * wScale;
+    }
+
+    // Per-expert byte strides (separate banks: one block per expert).
+    const compute::QuantType* const qtGate = compute::quantType(gateExps.type);
+    const compute::QuantType* const qtUp   = compute::quantType(upExps.type);
+    const compute::QuantType* const qtDown = compute::quantType(downExps.type);
+    if (qtGate == nullptr || qtUp == nullptr || qtDown == nullptr) {
+        throw std::runtime_error(
+            "Qwen35MoeBackend::runMoeFfnBatched: expert weight type(s) not in "
+            "QuantType registry");
+    }
+    const std::size_t rowBytesGate =
+        (d_model / qtGate->blockElements()) * qtGate->blockBytes();
+    const std::size_t rowBytesUp =
+        (d_model / qtUp->blockElements()) * qtUp->blockBytes();
+    const std::size_t bytesGate = n_ff_exp * rowBytesGate;
+    const std::size_t bytesUp   = n_ff_exp * rowBytesUp;
+    const std::size_t bytesDown =
+        d_model * (n_ff_exp / qtDown->blockElements()) * qtDown->blockBytes();
+
+    const auto* const gateBase = static_cast<const std::uint8_t*>(gateExps.usmPtr);
+    const auto* const upBase   = static_cast<const std::uint8_t*>(upExps.usmPtr);
+    const auto* const downBase = static_cast<const std::uint8_t*>(downExps.usmPtr);
+
+    // --- routed experts: fused gate/up -> silu*up -> fused down ------------
+    // gateActAll[seq, k, f] laid out as [nSeq, K*n_ff_exp] (seq stride
+    // K*n_ff_exp), exactly the batched kernels' contract.
+    _gmm.moeGateUpFusedKBatchedAsync(gateExps.type, moeInput, gateBase, upBase,
+                                     expIdxSlot, gateActAll, nSeq,
+                                     d_model, n_ff_exp, K, bytesGate, bytesUp);
+
+    _ops.mulScalarAsync(moeAccumBuf, 0.0F, nSeq * d_model);
+
+    _gmm.moeDownFusedKBatchedAsync(downExps.type, gateActAll, downBase,
+                                   expIdxSlot, kwSlot, moeAccumBuf, nSeq,
+                                   n_ff_exp, d_model, K, bytesDown);
+
+    // --- shared expert (always-on) + sigmoid gate -------------------------
+    // Row-parallel over the nSeq tokens: identical to runMoeFfn's shared
+    // expert with T := nSeq (the two-matmul + siluMul + down path; the T==1
+    // fused-Q8 / dp4a shortcuts are single-token-only and intentionally
+    // skipped here).
+    const auto* upShexp = w.findBlock(blockIdx, "ffn_up_shexp.weight");
+    if (upShexp != nullptr) {
+        const auto& gateShexp = requireBlock(w, blockIdx, "ffn_gate_shexp.weight");
+        const auto& downShexp = requireBlock(w, blockIdx, "ffn_down_shexp.weight");
+        const auto& routerSh  = requireBlock(w, blockIdx, "ffn_gate_inp_shexp.weight");
+        const std::size_t n_ff_shexp = gateShexp.dimensions.size() >= 2
+                                           ? gateShexp.dimensions[1] : 0;
+        if (n_ff_shexp == 0) {
+            throw std::runtime_error(
+                "Qwen35MoeBackend::runMoeFfnBatched: ffn_gate_shexp has "
+                "unexpected shape");
+        }
+
+        {
+            compute::UnorderedScope u{_ops};
+            _gmm.matmulAsync(gateShexp.type, gateShexp.usmPtr, n_ff_shexp, d_model,
+                             moeInput, nSeq, gateOutBuf, matmulScratch);
+            _gmm.matmulAsync(upShexp->type, upShexp->usmPtr, n_ff_shexp, d_model,
+                             moeInput, nSeq, upOutBuf, matmulScratch);
+        }
+        _ops.siluMulAsync(gateOutBuf, upOutBuf, nSeq * n_ff_shexp);
+        _gmm.matmulAsync(downShexp.type, downShexp.usmPtr, d_model, n_ff_shexp,
+                         gateOutBuf, nSeq, expertOutBuf, matmulScratch);
+
+        // Scalar gate per token: [nSeq, 1] -> sigmoid -> broadcast multiply.
+        float* const gateScalar = s.scoreScratch.as<float>();
+        _gmm.matmulAsync(routerSh.type, routerSh.usmPtr, 1, d_model,
+                         moeInput, nSeq, gateScalar, matmulScratch);
+        _ops.sigmoidGateMulAsync(expertOutBuf, gateScalar, nSeq, d_model,
+                                 /*gateDim=*/1);
+
+        _ops.addResidualAsync(moeAccumBuf, expertOutBuf, nSeq * d_model);
+    }
+}
+
 } // namespace mimirmind::runtime::arch
