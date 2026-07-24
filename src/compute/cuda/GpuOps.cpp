@@ -170,6 +170,10 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _attentionFlashPartialQ8Kernel;
     core::cuda::CudaModule _attentionFlashMergeModule;
     core::cuda::CudaKernel _attentionFlashMergeKernel;
+    core::cuda::CudaModule _attentionFlashPartialBatchedModule;
+    core::cuda::CudaKernel _attentionFlashPartialBatchedKernel;
+    core::cuda::CudaModule _attentionFlashMergeBatchedModule;
+    core::cuda::CudaKernel _attentionFlashMergeBatchedKernel;
 
     core::cuda::CudaModule _attentionPrefillFlashModule;
     core::cuda::CudaKernel _attentionPrefillFlashKernel;
@@ -280,6 +284,12 @@ struct GpuOps::Impl {
           _attentionFlashMergeModule{loadCudaModule(ctx, "attention_flash_merge")},
           _attentionFlashMergeKernel{
               _attentionFlashMergeModule.getFunction("attention_flash_merge")},
+          _attentionFlashPartialBatchedModule{loadCudaModule(ctx, "attention_flash_partial_batched")},
+          _attentionFlashPartialBatchedKernel{
+              _attentionFlashPartialBatchedModule.getFunction("attention_flash_partial_batched")},
+          _attentionFlashMergeBatchedModule{loadCudaModule(ctx, "attention_flash_merge_batched")},
+          _attentionFlashMergeBatchedKernel{
+              _attentionFlashMergeBatchedModule.getFunction("attention_flash_merge_batched")},
 
           _attentionPrefillFlashModule{loadCudaModule(ctx, "attention_prefill_flash")},
           _attentionPrefillFlashKernel{
@@ -1652,6 +1662,65 @@ void GpuOps::attentionDecodeFlashAsync(const float* q, const void* k,
     mergeKernel.launch(_ctx.stream(),
                        static_cast<std::uint32_t>(nHeads),
                        1, 1,
+                       kAttentionLocalSize, 1, 1);
+}
+
+void GpuOps::attentionDecodeFlashBatchedAsync(
+        const float* q, const float* k, const float* v, float* partialScratch,
+        float* out, std::size_t nSeq, std::size_t maxKTiles,
+        std::size_t qSeqStride, std::size_t kvSeqStride,
+        std::size_t partialSeqStride, std::size_t outSeqStride,
+        std::size_t nHeads, std::size_t nKvHeads, std::size_t headDim,
+        const std::int32_t* curLenDev, float scale, std::size_t slidingWindow,
+        runtime::KvDtype kvDtype) {
+    if (nSeq == 0 || nHeads == 0 || headDim == 0 || maxKTiles == 0) {
+        return;
+    }
+    if (kvDtype != runtime::KvDtype::F32) {
+        throw std::runtime_error(
+            "compute::cuda::GpuOps::attentionDecodeFlashBatchedAsync: only "
+            "KvDtype::F32 batched today (M-Cuda.Batch Cat attention).");
+    }
+    // Pass 1 — per-tile partials. grid (nHeads, maxKTiles, nSeq); each
+    // sequence uses its own q/kv/curLen, a uniform maxKTiles per-head
+    // stride, and early-exits tiles past its own length. Provisional
+    // per-seq strides — KV layout settled in Phase D. Byte-identical to
+    // nSeq single attentionDecodeFlashAsync.
+    auto& partialKernel = _pimpl->_attentionFlashPartialBatchedKernel;
+    partialKernel.setPtr  (0, q);
+    partialKernel.setPtr  (1, k);
+    partialKernel.setPtr  (2, v);
+    partialKernel.setPtr  (3, partialScratch);
+    partialKernel.setValue(4, toInt32(nHeads,   "flashB nHeads"));
+    partialKernel.setValue(5, toInt32(nKvHeads, "flashB nKvHeads"));
+    partialKernel.setValue(6, toInt32(headDim,  "flashB headDim"));
+    partialKernel.setPtr  (7, curLenDev);
+    partialKernel.setValue(8, scale);
+    partialKernel.setValue(9, toInt32(slidingWindow, "flashB slidingWindow"));
+    partialKernel.setValue(10, toInt32(maxKTiles, "flashB kTilesStride"));
+    partialKernel.setValue(11, toInt32(qSeqStride, "flashB qSeqStride"));
+    partialKernel.setValue(12, toInt32(kvSeqStride, "flashB kvSeqStride"));
+    partialKernel.setValue(13, toInt32(partialSeqStride, "flashB partialSeqStride"));
+    partialKernel.launch(_ctx.stream(),
+                         static_cast<std::uint32_t>(nHeads),
+                         static_cast<std::uint32_t>(maxKTiles),
+                         static_cast<std::uint32_t>(nSeq),
+                         kAttentionLocalSize, 1, 1);
+
+    // Pass 2 — merge. grid (nHeads, nSeq).
+    auto& mergeKernel = _pimpl->_attentionFlashMergeBatchedKernel;
+    mergeKernel.setPtr  (0, partialScratch);
+    mergeKernel.setPtr  (1, out);
+    mergeKernel.setValue(2, toInt32(nHeads,  "flashB_merge nHeads"));
+    mergeKernel.setValue(3, toInt32(headDim, "flashB_merge headDim"));
+    mergeKernel.setPtr  (4, curLenDev);
+    mergeKernel.setValue(5, toInt32(maxKTiles, "flashB_merge kTilesStride"));
+    mergeKernel.setValue(6, toInt32(partialSeqStride, "flashB_merge partialSeqStride"));
+    mergeKernel.setValue(7, toInt32(outSeqStride, "flashB_merge outSeqStride"));
+    mergeKernel.launch(_ctx.stream(),
+                       static_cast<std::uint32_t>(nHeads),
+                       static_cast<std::uint32_t>(nSeq),
+                       1,
                        kAttentionLocalSize, 1, 1);
 }
 

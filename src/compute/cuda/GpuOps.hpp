@@ -440,6 +440,26 @@ private:
                                    runtime::KvDtype kvDtype);
 
 public:
+    // M-Cuda.Batch (attention): batched decode flash-attention over nSeq
+    // sequences, each with its own query, contiguous KV cache and length.
+    // CUDA-only, F32, parity-gated. Caller owns partialScratch
+    // [nSeq, nHeads, maxKTiles, 2+headDim] and curLenDev [nSeq]; per-seq
+    // KV/partial strides are provisional (settled in Phase D).
+    void attentionDecodeFlashBatchedAsync(const float* q, const float* k,
+                                          const float* v, float* partialScratch,
+                                          float* out, std::size_t nSeq,
+                                          std::size_t maxKTiles,
+                                          std::size_t qSeqStride,
+                                          std::size_t kvSeqStride,
+                                          std::size_t partialSeqStride,
+                                          std::size_t outSeqStride,
+                                          std::size_t nHeads,
+                                          std::size_t nKvHeads,
+                                          std::size_t headDim,
+                                          const std::int32_t* curLenDev,
+                                          float scale, std::size_t slidingWindow,
+                                          runtime::KvDtype kvDtype
+                                              = runtime::KvDtype::F32);
     // Publicly readable so callers can compute launch upper bounds
     // for `setReplayMaxKTiles`. Parity with `GpuOps`.
     static constexpr std::size_t kFlashKTileSize   = 64;

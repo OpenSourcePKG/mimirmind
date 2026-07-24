@@ -659,6 +659,8 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/attention.cu
         kernels_cuda/attention_flash_merge.cu
         kernels_cuda/attention_flash_partial.cu
+        kernels_cuda/attention_flash_partial_batched.cu
+        kernels_cuda/attention_flash_merge_batched.cu
         kernels_cuda/attention_flash_partial_fp16.cu
         kernels_cuda/attention_flash_partial_q8_0.cu
         kernels_cuda/attention_fp16.cu

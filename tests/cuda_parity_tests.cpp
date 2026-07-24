@@ -1357,6 +1357,82 @@ TEST(cuda_rope_mrope_batched_parity) {
                 nSeq, numHeads, headDim, maxErr);
 }
 
+// M-Cuda.Batch (attention) — batched decode flash-attention vs N single
+// runs. Each sequence has its own query, KV cache and length; batched
+// output must be byte-identical to running each sequence alone. Reference
+// is the public attentionAsync (T_q==1 routes to the decode-flash path).
+TEST(cuda_attention_flash_decode_batched_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t nSeq = 3, nHeads = 4, nKvHeads = 2, headDim = 16;
+    const std::size_t T_k = 128;                    // KV cache capacity per seq
+    const std::int32_t curLen[3] = {30, 70, 10};    // positionOffset per seq
+    const std::size_t maxKTiles = 2;                // ceil((70+1)/64)
+    const std::size_t qSeqStride      = nHeads * headDim;
+    const std::size_t kvSeqStride     = T_k * nKvHeads * headDim;
+    const std::size_t outSeqStride    = nHeads * headDim;
+    const std::size_t partialSeqStride = nHeads * maxKTiles * (2 + headDim);
+    const float scale = 1.0f / std::sqrt((float)headDim);
+
+    std::vector<float> Q(nSeq * qSeqStride), Kc(nSeq * kvSeqStride), Vc(nSeq * kvSeqStride);
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        const std::uint32_t o = static_cast<std::uint32_t>(s) * 31u;
+        auto qs = randVec(qSeqStride,  0x9000u + o);
+        auto ks = randVec(kvSeqStride, 0xA000u + o);
+        auto vs = randVec(kvSeqStride, 0xB000u + o);
+        std::copy(qs.begin(), qs.end(), Q.begin()  + s * qSeqStride);
+        std::copy(ks.begin(), ks.end(), Kc.begin() + s * kvSeqStride);
+        std::copy(vs.begin(), vs.end(), Vc.begin() + s * kvSeqStride);
+    }
+
+    // Batched: one launch pair (partial + merge) over all nSeq.
+    auto dQ = toDevice(ops, Q);
+    auto dK = toDevice(ops, Kc);
+    auto dV = toDevice(ops, Vc);
+    std::vector<std::int32_t> cl(curLen, curLen + nSeq);
+    auto dCl = uploadRaw(ops, cl);
+    auto dPartial = ops.allocate(nSeq * partialSeqStride * sizeof(float));
+    auto dOut = ops.allocate(nSeq * outSeqStride * sizeof(float));
+    ops.attentionDecodeFlashBatchedAsync(
+        static_cast<const float*>(dQ.get()), static_cast<const float*>(dK.get()),
+        static_cast<const float*>(dV.get()), static_cast<float*>(dPartial.get()),
+        static_cast<float*>(dOut.get()), nSeq, maxKTiles, qSeqStride, kvSeqStride,
+        partialSeqStride, outSeqStride, nHeads, nKvHeads, headDim,
+        static_cast<const std::int32_t*>(dCl.get()), scale, 0,
+        ::mimirmind::runtime::KvDtype::F32);
+    ops.flush();
+    auto gotAll = fromDevice(ops, dOut.get(), nSeq * outSeqStride);
+
+    // Reference: each sequence via the single-seq decode-flash path.
+    double maxErr = 0.0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        std::vector<float> qs(Q.begin() + s * qSeqStride,  Q.begin() + (s + 1) * qSeqStride);
+        std::vector<float> ks(Kc.begin() + s * kvSeqStride, Kc.begin() + (s + 1) * kvSeqStride);
+        std::vector<float> vs(Vc.begin() + s * kvSeqStride, Vc.begin() + (s + 1) * kvSeqStride);
+        auto dqs = toDevice(ops, qs);
+        auto dks = toDevice(ops, ks);
+        auto dvs = toDevice(ops, vs);
+        auto dos = ops.allocate(outSeqStride * sizeof(float));
+        ops.attentionAsync(static_cast<const float*>(dqs.get()),
+                           static_cast<const float*>(dks.get()),
+                           static_cast<const float*>(dvs.get()),
+                           1, T_k, nHeads, nKvHeads, headDim,
+                           static_cast<std::size_t>(curLen[s]), scale,
+                           static_cast<float*>(dos.get()), 0,
+                           ::mimirmind::runtime::KvDtype::F32);
+        ops.flush();
+        auto ref = fromDevice(ops, dos.get(), outSeqStride);
+        for (std::size_t i = 0; i < outSeqStride; ++i) {
+            maxErr = std::max(maxErr,
+                std::fabs((double)gotAll[s * outSeqStride + i] - (double)ref[i]));
+            EXPECT_NEAR(gotAll[s * outSeqStride + i], ref[i], 1e-5f);
+        }
+    }
+    std::printf("[attn-flash-decode-batched-parity] nSeq=%zu nHeads=%zu headDim=%zu maxErr=%.2e\n",
+                nSeq, nHeads, headDim, maxErr);
+}
+
 int main() {
     return mm::test::run();
 }
