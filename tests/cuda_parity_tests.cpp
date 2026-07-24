@@ -1433,6 +1433,97 @@ TEST(cuda_attention_flash_decode_batched_parity) {
                 nSeq, nHeads, headDim, maxErr);
 }
 
+// M-Cuda.Batch Cat C-P1 — batched chunked-prefill (cumgate + forward) vs N
+// single-sequence pipelines. kkt-solve (K1) is run per sequence to build the
+// shared a0; the batched cumgate (K0) and forward (K2) must be byte-identical
+// to running each sequence alone.
+TEST(cuda_deltanet_chunk_batched_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t nSeq = 3, T = 10, H = 3, S = 16, C = 4;
+    const std::size_t nc   = nChunksOf(T, C);
+    const std::size_t actP = T * H * S, gateP = T * H, stP = H * S * S, a0P = nc * H * C * C;
+
+    std::vector<float> Q(nSeq*actP), K(nSeq*actP), V(nSeq*actP);
+    std::vector<float> G(nSeq*gateP), B(nSeq*gateP), ST(nSeq*stP);
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        const std::uint32_t o = static_cast<std::uint32_t>(s) * 37u;
+        auto q = randVec(actP, 0x4c1u + o); auto k = randVec(actP, 0x4c2u + o);
+        auto v = randVec(actP, 0x4c3u + o); auto g = randVec(gateP, 0x4c4u + o);
+        auto b = randVec(gateP, 0x4c5u + o); auto st = randVec(stP, 0x4c6u + o);
+        std::copy(q.begin(),q.end(),Q.begin()+s*actP);
+        std::copy(k.begin(),k.end(),K.begin()+s*actP);
+        std::copy(v.begin(),v.end(),V.begin()+s*actP);
+        std::copy(g.begin(),g.end(),G.begin()+s*gateP);
+        std::copy(b.begin(),b.end(),B.begin()+s*gateP);
+        std::copy(st.begin(),st.end(),ST.begin()+s*stP);
+    }
+
+    // Batched pipeline.
+    auto dQ=toDevice(ops,Q); auto dK=toDevice(ops,K); auto dV=toDevice(ops,V);
+    auto dG=toDevice(ops,G); auto dB=toDevice(ops,B); auto dS=toDevice(ops,ST);
+    auto dGc=ops.allocate(nSeq*gateP*sizeof(float));
+    auto dA0=ops.allocate(nSeq*a0P*sizeof(float));
+    auto dOut=ops.allocate(nSeq*actP*sizeof(float));
+    ops.deltanetChunkCumGateBatchedAsync(static_cast<const float*>(dG.get()),
+        static_cast<float*>(dGc.get()), nSeq, T, H, C);
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        ops.deltanetKktSolveInverseAsync(
+            static_cast<const float*>(dK.get()) + s*actP,
+            static_cast<const float*>(dB.get()) + s*gateP,
+            static_cast<float*>(dA0.get()) + s*a0P, T, H, S, C);
+    }
+    ops.deltanetChunkForwardBatchedAsync(
+        static_cast<const float*>(dQ.get()), static_cast<const float*>(dK.get()),
+        static_cast<const float*>(dV.get()), static_cast<const float*>(dGc.get()),
+        static_cast<const float*>(dB.get()), static_cast<const float*>(dA0.get()),
+        static_cast<float*>(dS.get()), static_cast<float*>(dOut.get()),
+        nSeq, T, H, S, C);
+    ops.flush();
+    auto outB = fromDevice(ops, dOut.get(), nSeq*actP);
+    auto stateB = fromDevice(ops, dS.get(), nSeq*stP);
+
+    // Reference: each sequence through the single-seq pipeline.
+    double maxErr = 0.0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        std::vector<float> q(Q.begin()+s*actP,Q.begin()+(s+1)*actP);
+        std::vector<float> k(K.begin()+s*actP,K.begin()+(s+1)*actP);
+        std::vector<float> v(V.begin()+s*actP,V.begin()+(s+1)*actP);
+        std::vector<float> g(G.begin()+s*gateP,G.begin()+(s+1)*gateP);
+        std::vector<float> b(B.begin()+s*gateP,B.begin()+(s+1)*gateP);
+        std::vector<float> st(ST.begin()+s*stP,ST.begin()+(s+1)*stP);
+        auto dq=toDevice(ops,q); auto dk=toDevice(ops,k); auto dv=toDevice(ops,v);
+        auto dg=toDevice(ops,g); auto db=toDevice(ops,b); auto ds=toDevice(ops,st);
+        auto dgc=ops.allocate(gateP*sizeof(float));
+        auto da0=ops.allocate(a0P*sizeof(float));
+        auto dout=ops.allocate(actP*sizeof(float));
+        ops.deltanetChunkCumGateAsync(static_cast<const float*>(dg.get()),
+            static_cast<float*>(dgc.get()), T, H, C);
+        ops.deltanetKktSolveInverseAsync(static_cast<const float*>(dk.get()),
+            static_cast<const float*>(db.get()),
+            static_cast<float*>(da0.get()), T, H, S, C);
+        ops.deltanetChunkForwardAsync(static_cast<const float*>(dq.get()),
+            static_cast<const float*>(dk.get()), static_cast<const float*>(dv.get()),
+            static_cast<const float*>(dgc.get()), static_cast<const float*>(db.get()),
+            static_cast<const float*>(da0.get()), static_cast<float*>(ds.get()),
+            static_cast<float*>(dout.get()), T, H, S, C);
+        ops.flush();
+        auto outS = fromDevice(ops, dout.get(), actP);
+        auto stateS = fromDevice(ops, ds.get(), stP);
+        for (std::size_t i = 0; i < actP; ++i) {
+            maxErr = std::max(maxErr, std::fabs((double)outB[s*actP+i]-(double)outS[i]));
+            EXPECT_NEAR(outB[s*actP+i], outS[i], 1e-5f);
+        }
+        for (std::size_t i = 0; i < stP; ++i) {
+            maxErr = std::max(maxErr, std::fabs((double)stateB[s*stP+i]-(double)stateS[i]));
+            EXPECT_NEAR(stateB[s*stP+i], stateS[i], 1e-5f);
+        }
+    }
+    std::printf("[chunk-batched-parity] nSeq=%zu T=%zu H=%zu S=%zu C=%zu maxErr=%.2e\n",
+                nSeq, T, H, S, C, maxErr);
+}
+
 int main() {
     return mm::test::run();
 }

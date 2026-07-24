@@ -221,6 +221,10 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _deltanetChunkCumGateKernel;
     core::cuda::CudaModule _deltanetChunkForwardModule;
     core::cuda::CudaKernel _deltanetChunkForwardKernel;
+    core::cuda::CudaModule _deltanetChunkCumGateBatchedModule;
+    core::cuda::CudaKernel _deltanetChunkCumGateBatchedKernel;
+    core::cuda::CudaModule _deltanetChunkForwardBatchedModule;
+    core::cuda::CudaKernel _deltanetChunkForwardBatchedKernel;
     core::cuda::CudaModule _deltanetKktSolveModule;
     core::cuda::CudaKernel _deltanetKktSolveKernel;
     core::cuda::CudaModule _sigmoidInplaceModule;
@@ -354,6 +358,12 @@ struct GpuOps::Impl {
           _deltanetChunkForwardModule{loadCudaModule(ctx, "deltanet_chunk_forward")},
           _deltanetChunkForwardKernel{
               _deltanetChunkForwardModule.getFunction("deltanet_chunk_forward")},
+          _deltanetChunkCumGateBatchedModule{loadCudaModule(ctx, "deltanet_chunk_cumgate_batched")},
+          _deltanetChunkCumGateBatchedKernel{
+              _deltanetChunkCumGateBatchedModule.getFunction("deltanet_chunk_cumgate_batched")},
+          _deltanetChunkForwardBatchedModule{loadCudaModule(ctx, "deltanet_chunk_forward_batched")},
+          _deltanetChunkForwardBatchedKernel{
+              _deltanetChunkForwardBatchedModule.getFunction("deltanet_chunk_forward_batched")},
           _deltanetKktSolveModule{loadCudaModule(ctx, "deltanet_kkt_solve")},
           _deltanetKktSolveKernel{
               _deltanetKktSolveModule.getFunction("deltanet_kkt_solve")},
@@ -1161,6 +1171,30 @@ void GpuOps::deltanetChunkCumGateAsync(const float* gLog, float* gCum,
              kElementwiseLocalSize, 1, 1);
 }
 
+void GpuOps::deltanetChunkCumGateBatchedAsync(const float* gLog, float* gCum,
+                                              std::size_t nSeq, std::size_t T,
+                                              std::size_t H,
+                                              std::size_t chunkSize) {
+    if (nSeq == 0 || T == 0 || H == 0) {
+        return;
+    }
+    const std::size_t C       = chunkSize ? chunkSize : 64;
+    const std::size_t nChunks = (T + C - 1) / C;
+    const std::size_t total   = H * nChunks;   // one thread per (head, chunk)
+    // grid.y = nSeq; each sequence prefix-sums its own gLog slab (M-Cuda.Batch
+    // Cat C-P1). Byte-identical to nSeq single deltanetChunkCumGateAsync.
+    auto& k = _pimpl->_deltanetChunkCumGateBatchedKernel;
+    k.setPtr  (0, gLog);
+    k.setPtr  (1, gCum);
+    k.setValue(2, toInt32(T, "cumgateB T"));
+    k.setValue(3, toInt32(H, "cumgateB H"));
+    k.setValue(4, toInt32(C, "cumgateB C"));
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize),
+             static_cast<std::uint32_t>(nSeq), 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
 void GpuOps::deltanetChunkForwardAsync(const float* q, const float* k_,
                                        const float* v, const float* gCum,
                                        const float* beta, const float* a0,
@@ -1201,6 +1235,43 @@ void GpuOps::deltanetChunkForwardAsync(const float* q, const float* k_,
                 static_cast<std::uint32_t>(S), 1, 1);
     // Sync so the scratch ComputeBuffers stay alive until the kernel is done
     // (prefill-only path; not the decode hot loop).
+    _ctx.stream().synchronize();
+}
+
+void GpuOps::deltanetChunkForwardBatchedAsync(
+        const float* q, const float* k_, const float* v, const float* gCum,
+        const float* beta, const float* a0, float* state, float* out,
+        std::size_t nSeq, std::size_t T, std::size_t H, std::size_t S,
+        std::size_t chunkSize) {
+    if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
+        return;
+    }
+    const std::size_t C = chunkSize ? chunkSize : 64;
+    const std::size_t f = sizeof(float);
+    // nSeq copies of the single-seq global scratch ([s0 [H,S,S] + 5 chunk
+    // tensors [H,C,S]]); the kernel offsets by seq*scratchPerSeq. grid.y =
+    // nSeq. Byte-identical to nSeq single deltanetChunkForwardAsync.
+    const std::size_t scratchPerSeq = H * S * S + 5 * H * C * S;
+    auto scratch = allocate(nSeq * scratchPerSeq * f);
+
+    auto& kern = _pimpl->_deltanetChunkForwardBatchedKernel;
+    kern.setPtr  (0,  q);
+    kern.setPtr  (1,  k_);
+    kern.setPtr  (2,  v);
+    kern.setPtr  (3,  gCum);
+    kern.setPtr  (4,  beta);
+    kern.setPtr  (5,  a0);
+    kern.setPtr  (6,  state);
+    kern.setPtr  (7,  out);
+    kern.setPtr  (8,  scratch.get());
+    kern.setValue(9,  toInt32(T, "chunkfwdB T"));
+    kern.setValue(10, toInt32(H, "chunkfwdB H"));
+    kern.setValue(11, toInt32(S, "chunkfwdB S"));
+    kern.setValue(12, toInt32(C, "chunkfwdB C"));
+    kern.launch(_ctx.stream(),
+                static_cast<std::uint32_t>(H),
+                static_cast<std::uint32_t>(nSeq), 1,
+                static_cast<std::uint32_t>(S), 1, 1);
     _ctx.stream().synchronize();
 }
 

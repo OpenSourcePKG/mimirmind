@@ -184,6 +184,19 @@ public:
                                    const float* a0, float* state, float* out,
                                    std::size_t T, std::size_t H, std::size_t S,
                                    std::size_t chunkSize) override;
+    // M-Cuda.Batch Cat C-P1: batched chunked-prefill variants — nSeq
+    // sequences in one launch (grid.y = nSeq), each with its own slabs and
+    // per-sequence state/scratch. CUDA-only, parity-gated.
+    void deltanetChunkCumGateBatchedAsync(const float* gLog, float* gCum,
+                                          std::size_t nSeq, std::size_t T,
+                                          std::size_t H, std::size_t chunkSize);
+    void deltanetChunkForwardBatchedAsync(const float* q, const float* k,
+                                          const float* v, const float* gCum,
+                                          const float* beta, const float* a0,
+                                          float* state, float* out,
+                                          std::size_t nSeq, std::size_t T,
+                                          std::size_t H, std::size_t S,
+                                          std::size_t chunkSize);
     void deltanetKktSolveInverseAsync(const float* k, const float* beta,
                                       float* a0, std::size_t T, std::size_t H,
                                       std::size_t S, std::size_t chunkSize) override;
