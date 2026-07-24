@@ -221,6 +221,80 @@ public:
             "deltanetChunkForwardAsync: not supported on this backend");
     }
 
+    // ---- M-Cuda.Batch batched (nSeq) variants -----------------------------
+    // Serving-class batched decode/prefill ops. CUDA-first; every default
+    // throws so non-CUDA backends (single-session) stay unaffected.
+
+    virtual void gatedDeltaNetRecurrentBatchedAsync(
+            const float* q, const float* k, const float* v, const float* gLog,
+            const float* beta, float* state, float* out, std::size_t nSeq,
+            std::size_t T, std::size_t H, std::size_t S) {
+        (void)q; (void)k; (void)v; (void)gLog; (void)beta; (void)state;
+        (void)out; (void)nSeq; (void)T; (void)H; (void)S;
+        throw std::runtime_error(
+            "gatedDeltaNetRecurrentBatchedAsync: not supported on this backend");
+    }
+
+    virtual void causalConv1dSiluBatchedAsync(
+            const float* convInput, const float* kernel, float* out,
+            std::size_t nSeq, std::size_t T, std::size_t channels,
+            std::size_t kernelSize) {
+        (void)convInput; (void)kernel; (void)out; (void)nSeq; (void)T;
+        (void)channels; (void)kernelSize;
+        throw std::runtime_error(
+            "causalConv1dSiluBatchedAsync: not supported on this backend");
+    }
+
+    virtual void mropeInPlaceBatchedAsync(
+            void* xBase, std::size_t nSeq, std::size_t xSeqStride,
+            std::size_t seqLen, std::size_t numHeads, std::size_t headDim,
+            const std::int32_t* startPosDev, float base,
+            const std::int32_t* sections, std::size_t writeOffsetStride,
+            runtime::KvDtype kvDtype) {
+        (void)xBase; (void)nSeq; (void)xSeqStride; (void)seqLen; (void)numHeads;
+        (void)headDim; (void)startPosDev; (void)base; (void)sections;
+        (void)writeOffsetStride; (void)kvDtype;
+        throw std::runtime_error(
+            "mropeInPlaceBatchedAsync: not supported on this backend");
+    }
+
+    virtual void attentionDecodeFlashBatchedAsync(
+            const float* q, const float* k, const float* v,
+            float* partialScratch, float* out, std::size_t nSeq,
+            std::size_t maxKTiles, std::size_t qSeqStride,
+            std::size_t kvSeqStride, std::size_t partialSeqStride,
+            std::size_t outSeqStride, std::size_t nHeads, std::size_t nKvHeads,
+            std::size_t headDim, const std::int32_t* curLenDev, float scale,
+            std::size_t slidingWindow, runtime::KvDtype kvDtype) {
+        (void)q; (void)k; (void)v; (void)partialScratch; (void)out; (void)nSeq;
+        (void)maxKTiles; (void)qSeqStride; (void)kvSeqStride;
+        (void)partialSeqStride; (void)outSeqStride; (void)nHeads;
+        (void)nKvHeads; (void)headDim; (void)curLenDev; (void)scale;
+        (void)slidingWindow; (void)kvDtype;
+        throw std::runtime_error(
+            "attentionDecodeFlashBatchedAsync: not supported on this backend");
+    }
+
+    virtual void deltanetChunkCumGateBatchedAsync(
+            const float* gLog, float* gCum, std::size_t nSeq, std::size_t T,
+            std::size_t H, std::size_t chunkSize) {
+        (void)gLog; (void)gCum; (void)nSeq; (void)T; (void)H; (void)chunkSize;
+        throw std::runtime_error(
+            "deltanetChunkCumGateBatchedAsync: not supported on this backend");
+    }
+
+    virtual void deltanetChunkForwardBatchedAsync(
+            const float* q, const float* k, const float* v, const float* gCum,
+            const float* beta, const float* a0, float* state, float* out,
+            std::size_t nSeq, std::size_t T, std::size_t H, std::size_t S,
+            std::size_t chunkSize) {
+        (void)q; (void)k; (void)v; (void)gCum; (void)beta; (void)a0;
+        (void)state; (void)out; (void)nSeq; (void)T; (void)H; (void)S;
+        (void)chunkSize;
+        throw std::runtime_error(
+            "deltanetChunkForwardBatchedAsync: not supported on this backend");
+    }
+
     /// Chunked-prefill stage K1: per-chunk ungated triangular inverse A0
     /// (a0 [nChunks,H,C,C]). Reference: compute::deltanetKktSolveInverse.
     /// Default: unsupported; CUDA overrides.

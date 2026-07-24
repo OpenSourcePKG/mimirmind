@@ -158,6 +158,32 @@ public:
     [[nodiscard]] virtual bool moeDownFusedKAvailable() const noexcept = 0;
     [[nodiscard]] virtual bool moeDownFusedKAvailable(core::gguf::GgmlType type) const noexcept = 0;
 
+    // ---- M-Cuda.Batch batched (nSeq) MoE variants -------------------------
+    // Serving-class batched decode. CUDA-first; default throws so non-CUDA
+    // matmul backends (single-session) stay unaffected.
+    virtual void moeGateUpFusedKBatchedAsync(
+            core::gguf::GgmlType type, const float* x, const void* Wg,
+            const void* Wu, const std::int32_t* expIdx, float* gateActOut,
+            std::size_t nSeq, std::size_t dModel, std::size_t nFf,
+            std::size_t kActive, std::size_t expertBytesGate,
+            std::size_t expertBytesUp) {
+        (void)type; (void)x; (void)Wg; (void)Wu; (void)expIdx; (void)gateActOut;
+        (void)nSeq; (void)dModel; (void)nFf; (void)kActive;
+        (void)expertBytesGate; (void)expertBytesUp;
+        throw std::runtime_error(
+            "moeGateUpFusedKBatchedAsync: not supported on this backend");
+    }
+    virtual void moeDownFusedKBatchedAsync(
+            core::gguf::GgmlType type, const float* gateAct, const void* W,
+            const std::int32_t* expIdx, const float* kw, float* accum,
+            std::size_t nSeq, std::size_t ffPer, std::size_t dModel,
+            std::size_t kActive, std::size_t expertBytes) {
+        (void)type; (void)gateAct; (void)W; (void)expIdx; (void)kw; (void)accum;
+        (void)nSeq; (void)ffPer; (void)dModel; (void)kActive; (void)expertBytes;
+        throw std::runtime_error(
+            "moeDownFusedKBatchedAsync: not supported on this backend");
+    }
+
     /// Fused K-experts gate+up projection for MoE T=1 decode with SEPARATE
     /// gate/up expert banks. Produces the K-strided activation buffer the
     /// fused-K down kernel consumes:

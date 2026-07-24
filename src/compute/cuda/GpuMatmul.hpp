@@ -128,7 +128,7 @@ public:
                                    std::size_t          ffPer,
                                    std::size_t          dModel,
                                    std::size_t          kActive,
-                                   std::size_t          expertBytes);
+                                   std::size_t          expertBytes) override;
 
     [[nodiscard]] bool moeDownFusedKAvailable() const noexcept override;
     [[nodiscard]] bool moeDownFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
@@ -160,7 +160,7 @@ public:
                                      std::size_t          nFf,
                                      std::size_t          kActive,
                                      std::size_t          expertBytesGate,
-                                     std::size_t          expertBytesUp);
+                                     std::size_t          expertBytesUp) override;
 
     [[nodiscard]] bool moeGateUpFusedKAvailable(
         ::mimirmind::core::gguf::GgmlType type) const noexcept override;

@@ -137,7 +137,7 @@ public:
                                   const std::int32_t* startPosDev, float base,
                                   const std::int32_t* sections,
                                   std::size_t writeOffsetStride = 0,
-                                  runtime::KvDtype kvDtype = runtime::KvDtype::F32);
+                                  runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
 
     void splitHeadPairAsync(const float* src, float* a, float* b,
                             std::size_t seqLen, std::size_t numHeads,
@@ -158,7 +158,7 @@ public:
                                       const float* kernel, float* out,
                                       std::size_t nSeq, std::size_t T,
                                       std::size_t channels,
-                                      std::size_t kernelSize);
+                                      std::size_t kernelSize) override;
     void gatedDeltaNetRecurrentAsync(const float* q, const float* k,
                                      const float* v, const float* gLog,
                                      const float* beta, float* state,
@@ -172,7 +172,7 @@ public:
                                             const float* beta, float* state,
                                             float* out, std::size_t nSeq,
                                             std::size_t T, std::size_t H,
-                                            std::size_t S);
+                                            std::size_t S) override;
     void deltanetGateAsync(const float* alpha, const float* ssmA,
                            const float* ssmDt, float* gLog,
                            std::size_t T, std::size_t H) override;
@@ -189,14 +189,14 @@ public:
     // per-sequence state/scratch. CUDA-only, parity-gated.
     void deltanetChunkCumGateBatchedAsync(const float* gLog, float* gCum,
                                           std::size_t nSeq, std::size_t T,
-                                          std::size_t H, std::size_t chunkSize);
+                                          std::size_t H, std::size_t chunkSize) override;
     void deltanetChunkForwardBatchedAsync(const float* q, const float* k,
                                           const float* v, const float* gCum,
                                           const float* beta, const float* a0,
                                           float* state, float* out,
                                           std::size_t nSeq, std::size_t T,
                                           std::size_t H, std::size_t S,
-                                          std::size_t chunkSize);
+                                          std::size_t chunkSize) override;
     void deltanetKktSolveInverseAsync(const float* k, const float* beta,
                                       float* a0, std::size_t T, std::size_t H,
                                       std::size_t S, std::size_t chunkSize) override;
@@ -472,7 +472,7 @@ public:
                                           const std::int32_t* curLenDev,
                                           float scale, std::size_t slidingWindow,
                                           runtime::KvDtype kvDtype
-                                              = runtime::KvDtype::F32);
+                                              = runtime::KvDtype::F32) override;
     // Publicly readable so callers can compute launch upper bounds
     // for `setReplayMaxKTiles`. Parity with `GpuOps`.
     static constexpr std::size_t kFlashKTileSize   = 64;
