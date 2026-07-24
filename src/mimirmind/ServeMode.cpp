@@ -95,7 +95,13 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 #endif
 
     std::optional<::mimirmind::core::os::GovernorLock> governorLock;
-    if (!attachedMode) {
+    // The MIMIRMIND_SERVING_PARITY dev hook exits before the HTTP server
+    // starts, so it needs neither the thermal governor nor exclusive
+    // ownership — skip the flock so a parity check can run alongside a
+    // live serve worker (subject to host memory).
+    const bool servingParity =
+        std::getenv("MIMIRMIND_SERVING_PARITY") != nullptr;
+    if (!attachedMode && !servingParity) {
         auto lk = ::mimirmind::core::os::GovernorLock::tryAcquire();
         if (!lk) {
             std::cerr << "serve: " << lk.error()
@@ -261,6 +267,68 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         // (fused-QKV coverage, attn_k/v.bias presence per block), so
         // apply the per-model runtime overrides AFTER loadModel.
         applyRuntimeOverrides(*e, cfg.effectiveRuntime(m.id));
+
+        // M-Cuda.Batch D2d — batched serving parity gate (dev/CI hook).
+        // With MIMIRMIND_SERVING_PARITY set, run the batched decode path
+        // (generateServingParity) against single-seq greedy generate() on
+        // this freshly-loaded model, print the comparison, and exit before
+        // the HTTP server starts. qwen35moe only.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_SERVING_PARITY") != nullptr) {
+            const auto& tok = e->tokenizer();
+            std::vector<std::int32_t> promptIds =
+                tok.encode("The capital of France is", /*addBos=*/false);
+            if (promptIds.empty()) {
+                promptIds.push_back(1);
+            }
+            // MIMIRMIND_BATCH_NP=N truncates the prompt to N tokens. With a
+            // 1-token prompt the single-session reference does a T=1 prefill,
+            // i.e. the same per-token forward the batched path feeds — an
+            // apples-to-apples parity gate. Larger N makes the single side do
+            // a T=N prefill (a numerically distinct kernel path from N* T=1
+            // decode), so the comparison then also reflects prefill-vs-feed.
+            if (const char* np = std::getenv("MIMIRMIND_BATCH_NP")) {
+                const long n = std::strtol(np, nullptr, 10);
+                if (n > 0 && static_cast<std::size_t>(n) < promptIds.size()) {
+                    promptIds.resize(static_cast<std::size_t>(n));
+                }
+            }
+            const std::size_t maxNew = 8;
+            const std::size_t nSeq   = 2;
+
+            ::mimirmind::runtime::GenerateParams gp{};
+            gp.maxNewTokens         = maxNew;
+            gp.sampling.temperature = 0.0F;   // greedy argmax
+            std::vector<std::int32_t> ref =
+                e->generate(promptIds, gp, {}, nullptr, {}, {});
+
+            auto batched = e->generateServingParity(promptIds, nSeq, maxNew);
+
+            bool allSeqEqual = true;
+            for (std::size_t s = 1; s < nSeq; ++s) {
+                if (batched[s] != batched[0]) allSeqEqual = false;
+            }
+            std::size_t matchLen = 0;
+            const std::size_t cmpN = std::min(batched[0].size(), ref.size());
+            for (; matchLen < cmpN; ++matchLen) {
+                if (batched[0][matchLen] != ref[matchLen]) break;
+            }
+            std::cout << "\n[M-Cuda.Batch D2d serving-parity] nSeq=" << nSeq
+                      << " maxNew=" << maxNew
+                      << " promptTokens=" << promptIds.size() << "\n"
+                      << "  batched[0] :";
+            for (auto t : batched[0]) std::cout << ' ' << t;
+            std::cout << "\n  single-seq :";
+            for (auto t : ref) std::cout << ' ' << t;
+            std::cout << "\n  all-seq-identical=" << (allSeqEqual ? "YES" : "NO")
+                      << "  ref-match-prefix=" << matchLen << "/" << ref.size()
+                      << ((matchLen == ref.size() && allSeqEqual)
+                              ? "  => PASS"
+                              : "  => CHECK")
+                      << "\n";
+            std::cout.flush();
+            return 0;
+        }
 
         // M9.8b — cross-block sanity check on the effective runtime.
         // The plain-attention fallback in kernels/attention.cl holds
