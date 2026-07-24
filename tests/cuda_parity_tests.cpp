@@ -1536,8 +1536,8 @@ TEST(cuda_paged_attention_v1_decode_parity) {
     CudaComputeContext ctx{};
     GpuOps ops{ctx};
 
-    const int   nSeq = 3, nHeads = 4, nKvHeads = 2, headSize = 16, blockSize = 4;
-    const int   seqLens[nSeq] = {5, 3, 7};
+    const int   nSeq = 3, nHeads = 8, nKvHeads = 2, headSize = 256, blockSize = 16;
+    const int   seqLens[nSeq] = {1, 2, 7};
     const float scale   = 1.0f / std::sqrt(static_cast<float>(headSize));
     const float softcap = 0.0f;
 

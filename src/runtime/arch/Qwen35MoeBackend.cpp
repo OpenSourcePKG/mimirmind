@@ -783,6 +783,36 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
                                         float*         kwSlot,
                                         BlockBuffers&  s) {
     namespace cmp = mimirmind::compute;
+
+    // The batched fused-K fast path only exists for the separate Q4_K
+    // gate/up + Q5_K down decode layout. Any other layout/quant (notably
+    // the NVFP4->BF16 materialised experts of the Bragi target checkpoint)
+    // has no batched fused-K kernel — delegate to the generic runMoeFfn,
+    // whose sequential per-token dispatch already routes each of the nSeq
+    // rows independently when it is handed nSeq as its T. (expIdxSlot /
+    // kwSlot are used only by the fused-K path below, so they are unused
+    // here — the generic path routes through _topKIdx / _topKWeight.)
+    {
+        const auto* gu = _weights.findBlock(blockIdx, "ffn_gate_up_exps.weight");
+        const auto* g  = _weights.findBlock(blockIdx, "ffn_gate_exps.weight");
+        const auto* u  = _weights.findBlock(blockIdx, "ffn_up_exps.weight");
+        const auto* d  = _weights.findBlock(blockIdx, "ffn_down_exps.weight");
+        bool fusedKOk = (gu == nullptr) && g != nullptr && u != nullptr &&
+                        d != nullptr && g->dimensions.size() >= 3;
+        if (fusedKOk) {
+            const std::size_t nff = g->dimensions[1];
+            fusedKOk = _gmm.moeGateUpFusedKAvailable(g->type) &&
+                       _gmm.moeDownFusedKAvailable(d->type) &&
+                       g->type == u->type &&
+                       (s.d_model % 256 == 0) && (nff % 256 == 0);
+        }
+        if (!fusedKOk) {
+            (void)expIdxSlot; (void)kwSlot;
+            runMoeFfn(blockIdx, moeInput, nSeq, s);
+            return;
+        }
+    }
+
     const auto& w = _weights;
 
     const auto& routerW  = requireBlock(w, blockIdx, "ffn_gate_inp.weight");
@@ -1005,19 +1035,32 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
                       static_cast<const float*>(qNorm.usmPtr), eps, qBuf);
     _ops.rmsNormAsync(kProj, nSeq * nKvHeads, head_dim,
                       static_cast<const float*>(kNorm.usmPtr), eps, kProj);
+    // The single-session rmsNormQkv also RMS-normalises V per head (over
+    // head_dim, with NO learned weight — kernels_cuda/rmsnorm_qkv.cu V
+    // branch). The batched path builds q/k/v separately, so replicate the
+    // V normalisation here; without it V enters attention un-normalised and
+    // the whole full-attention output is off by V's per-head 1/rms factor.
+    _ops.rmsNormNoWeightAsync(vProj, nSeq * nKvHeads, head_dim, eps, vProj);
 
     // --- IMRoPE on Q and K (per-seq startPos, one token per seq) ------
+    // writeOffsetStride MUST be 0 here: the batched mrope writes at
+    // x_base + seq*xSeqStride + startPos*writeOffsetStride, which is the
+    // KV-cache-absolute-position pattern. Our q/k live in COMPACT per-seq
+    // buffers (one row per sequence), so the token position must not shift
+    // the write — only the rotation angle depends on startPos (pos =
+    // startPos + p inside the kernel). A non-zero stride here walks off the
+    // compact buffer as startPos grows (the pos=2 OOB).
     {
         compute::UnorderedScope u{_ops};
         _ops.mropeInPlaceBatchedAsync(qBuf, nSeq, q_dim, /*seqLen=*/1,
                                       nHeads, head_dim, ctx.startPosDev,
                                       _config.ropeFreqBase, _ropeSections,
-                                      /*writeOffsetStride=*/q_dim,
+                                      /*writeOffsetStride=*/0,
                                       runtime::KvDtype::F32);
         _ops.mropeInPlaceBatchedAsync(kProj, nSeq, kv_dim, /*seqLen=*/1,
                                       nKvHeads, head_dim, ctx.startPosDev,
                                       _config.ropeFreqBase, _ropeSections,
-                                      /*writeOffsetStride=*/kv_dim,
+                                      /*writeOffsetStride=*/0,
                                       runtime::KvDtype::F32);
     }
 
