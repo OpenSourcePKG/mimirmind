@@ -1054,9 +1054,137 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
 void Qwen35MoeBackend::runLinearBlockBatched(
         std::size_t blockIdx, float* x, const BatchedDecodeCtx& ctx,
         BlockBuffers& s) {
-    (void)blockIdx; (void)x; (void)ctx; (void)s;
-    throw std::runtime_error(
-        "runLinearBlockBatched: not yet implemented (M-Cuda.Batch D2b)");
+    const std::size_t nSeq = ctx.nSeq;
+    if (nSeq == 0) {
+        return;
+    }
+
+    const auto& w        = _weights;
+    const auto& attnNorm = requireBlock(w, blockIdx, "attn_norm.weight");
+    const auto& qkvW     = requireBlock(w, blockIdx, "attn_qkv.weight");
+    const auto& gateW    = requireBlock(w, blockIdx, "attn_gate.weight");
+    const auto& betaW    = requireBlock(w, blockIdx, "ssm_beta.weight");
+    const auto& alphaW   = requireBlock(w, blockIdx, "ssm_alpha.weight");
+    const auto& ssmA     = requireBlock(w, blockIdx, "ssm_a");
+    const auto& ssmDt    = requireBlock(w, blockIdx, "ssm_dt.bias");
+    const auto& convW    = requireBlock(w, blockIdx, "ssm_conv1d.weight");
+    const auto& ssmNormW = requireBlock(w, blockIdx, "ssm_norm.weight");
+    const auto& ssmOutW  = requireBlock(w, blockIdx, "ssm_out.weight");
+    const auto& attnPost = requireBlock(w, blockIdx, "post_attention_norm.weight");
+
+    const std::size_t d_model        = s.d_model;
+    const std::size_t S              = _config.ssmStateSize;
+    const std::size_t hK             = _config.ssmNumKHeads();
+    const std::size_t hV             = _config.ssmNumVHeads();
+    const std::size_t valueDim       = _config.ssmInnerSize;      // hV * S
+    const std::size_t convDim        = _config.ssmConvDim();
+    const std::size_t dConv          = _config.ssmConvKernel;
+    const std::size_t keyDim         = S * hK;
+    const std::size_t stateElems     = _config.ssmStateElemsPerLayer();
+    const std::size_t convStateElems = _config.ssmConvStateElemsPerLayer();
+    const std::size_t stateRows      = (dConv > 0 ? dConv - 1 : 0);
+    const float       eps            = _config.rmsNormEps;
+
+    float* const normBuf   = s.normBuf.as<float>();
+    float* const qkvMixed  = s.ssmQkvMixed.as<float>();   // [nSeq, convDim] (also conv out)
+    float* const convInput = s.ssmConvInput.as<float>();  // [nSeq, dConv, convDim] (serving-sized)
+    float* const zBuf      = s.ssmZ.as<float>();
+    float* const qBuf      = s.ssmQ.as<float>();
+    float* const kBuf      = s.ssmK.as<float>();
+    float* const vBuf      = s.ssmV.as<float>();
+    float* const deltaOut  = s.ssmDeltaOut.as<float>();
+    float* const alphaBuf  = s.ssmAlpha.as<float>();
+    float* const betaBuf   = s.ssmBeta.as<float>();
+    float* const gateBuf   = s.ssmGate.as<float>();
+    float* const projOut   = s.projOut.as<float>();
+    float* const mmScratch = s.matmulScratch.as<float>();
+
+    // Per-sequence recurrent + conv state (SsmState[nSeq]): the per-layer
+    // slab is [nSeq, stateElems] / [nSeq, convStateElems], so the layer
+    // base steps by nSeq*elems (SsmState::stateLayerStride) and sequence s
+    // sits at + s*elems.
+    float* const stateBase = s.ssmStatePtr     + blockIdx * (nSeq * stateElems);
+    float* const convBase  = s.ssmConvStatePtr + blockIdx * (nSeq * convStateElems);
+
+    // --- pre-attention RMSNorm (nSeq rows) ---------------------------
+    _ops.rmsNormAsync(x, nSeq, d_model,
+                      static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
+
+    // --- projections (M = nSeq) --------------------------------------
+    {
+        compute::UnorderedScope u{_ops};
+        _gmm.matmulAsync(qkvW.type,  qkvW.usmPtr,  convDim,  d_model, normBuf, nSeq, qkvMixed, mmScratch);
+        _gmm.matmulAsync(gateW.type, gateW.usmPtr, valueDim, d_model, normBuf, nSeq, zBuf,     mmScratch);
+        _gmm.matmulAsync(betaW.type, betaW.usmPtr, hV,       d_model, normBuf, nSeq, betaBuf,  mmScratch);
+        _gmm.matmulAsync(alphaW.type,alphaW.usmPtr,hV,       d_model, normBuf, nSeq, alphaBuf, mmScratch);
+    }
+
+    // beta = sigmoid(beta); gLog = ssm_a * softplus(alpha + ssm_dt).
+    _ops.sigmoidInPlaceAsync(betaBuf, nSeq * hV);
+    _ops.deltanetGateAsync(alphaBuf,
+                           static_cast<const float*>(ssmA.usmPtr),
+                           static_cast<const float*>(ssmDt.usmPtr),
+                           gateBuf, nSeq, hV);
+
+    // --- causal conv1d + silu (per-seq rolling state) ----------------
+    // convInput[seq] = [convState[seq] (stateRows) | qkvMixed[seq] (1 row)].
+    // Serving BlockBuffers must size ssmConvInput to nSeq*dConv*convDim.
+    const std::size_t convInBytes  = convStateElems * sizeof(float);
+    const std::size_t qkvRowBytes  = convDim * sizeof(float);
+    for (std::size_t seq = 0; seq < nSeq; ++seq) {
+        float* const cvState = convBase + seq * convStateElems;
+        float* const cvIn    = convInput + seq * dConv * convDim;
+        if (ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
+            _ops.mulScalarAsync(cvState, 0.0F, convStateElems);
+        }
+        _ops.appendMemoryCopy(cvIn, cvState, convInBytes);
+        _ops.appendMemoryCopy(cvIn + stateRows * convDim,
+                              qkvMixed + seq * convDim, qkvRowBytes);
+    }
+    _ops.causalConv1dSiluBatchedAsync(convInput,
+                                      static_cast<const float*>(convW.usmPtr),
+                                      qkvMixed, nSeq, /*T=*/1, convDim, dConv);
+    // Save each sequence's trailing stateRows rows as the next conv state.
+    for (std::size_t seq = 0; seq < nSeq; ++seq) {
+        float* const cvState = convBase + seq * convStateElems;
+        float* const cvIn    = convInput + seq * dConv * convDim;
+        _ops.appendMemoryCopy(cvState, cvIn + /*T=*/1 * convDim, convInBytes);
+    }
+
+    // --- split conv into q/k/v (+ GQA repeat H_k -> H_v) -------------
+    _ops.gatherHeadsFromChannelsAsync(qkvMixed, qBuf, nSeq, 0,          hK, hV, S, convDim);
+    _ops.gatherHeadsFromChannelsAsync(qkvMixed, kBuf, nSeq, keyDim,     hK, hV, S, convDim);
+    _ops.gatherHeadsFromChannelsAsync(qkvMixed, vBuf, nSeq, 2 * keyDim, hV, hV, S, convDim);
+
+    // --- L2-norm q,k over head_dim -----------------------------------
+    _ops.l2NormInPlaceAsync(qBuf, nSeq * hV, S, eps);
+    _ops.l2NormInPlaceAsync(kBuf, nSeq * hV, S, eps);
+
+    // --- gated delta-rule recurrence (persistent per-seq state) ------
+    for (std::size_t seq = 0; seq < nSeq; ++seq) {
+        if (ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
+            _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
+        }
+    }
+    _ops.gatedDeltaNetRecurrentBatchedAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
+                                            stateBase, deltaOut, nSeq,
+                                            /*T=*/1, hV, S);
+
+    // --- gated output norm: ssm_norm(out) * silu(z) ------------------
+    _ops.rmsNormAsync(deltaOut, nSeq * hV, S,
+                      static_cast<const float*>(ssmNormW.usmPtr), eps, qBuf);
+    _ops.siluMulAsync(zBuf, qBuf, nSeq * valueDim);
+
+    // --- output projection ssm_out -----------------------------------
+    _gmm.matmulAsync(ssmOutW.type, ssmOutW.usmPtr, d_model, valueDim,
+                     zBuf, nSeq, projOut, mmScratch);
+    _ops.addResidualAsync(x, projOut, nSeq * d_model);
+
+    // --- post-attn norm -> batched MoE -> FFN residual ---------------
+    _ops.rmsNormAsync(x, nSeq, d_model,
+                      static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
+    runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
+    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nSeq * d_model);
 }
 
 } // namespace mimirmind::runtime::arch
