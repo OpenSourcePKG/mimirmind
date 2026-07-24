@@ -26,7 +26,35 @@ class FusedQkvWeights;
 struct LlmConfig;
 } // namespace mimirmind::model
 
+namespace mimirmind::runtime::serving { class PagedKvPool; }
+
 namespace mimirmind::runtime::arch {
+
+/**
+ * M-Cuda.Batch D2 — per-decode-step batched context (nSeq active
+ * sequences, exactly one query token each). Assembled once per decode
+ * step by the serving engine and passed to every batched block. All
+ * pointers are caller-owned and outlive the block call.
+ */
+struct BatchedDecodeCtx {
+    std::size_t nSeq{0};
+
+    // ---- Paged KV (full-attention layers) ----
+    serving::PagedKvPool* pool{nullptr};
+    const std::uint32_t*  writeBlockId{nullptr};   // [nSeq] host: block for current pos
+    const std::int32_t*   writeSlot{nullptr};      // [nSeq] host: slot for current pos
+    const std::int32_t*   blockTablesDev{nullptr}; // [nSeq, maxBlocksPerSeq] device
+    const std::int32_t*   seqLensDev{nullptr};     // [nSeq] device: length incl. current token
+    std::size_t           maxBlocksPerSeq{0};
+    const std::int32_t*   startPosDev{nullptr};    // [nSeq] device: per-seq current position
+
+    // ---- MoE routing scratch (USM) ----
+    std::int32_t*         expIdxSlot{nullptr};     // [nSeq * expertUsedCount]
+    float*                kwSlot{nullptr};         // [nSeq * expertUsedCount]
+
+    // ---- GatedDeltaNet (linear layers) ----
+    const std::uint8_t*   isSeqStart{nullptr};     // [nSeq]: 1 => zero SsmState this step
+};
 
 /**
  * Qwen3-Next / Qwen3.5-MoE (`qwen35moe`) decoder block — the hybrid
@@ -70,6 +98,16 @@ public:
                   KvCache&      cache,
                   BlockBuffers& buffers,
                   bool          traceBlock0) override;
+
+    /// M-Cuda.Batch D2 — batched serving decode of one layer over nSeq
+    /// sequences (one query token each). CUDA-only concrete entry point
+    /// (not on the ArchBackend interface); the serving engine calls it
+    /// directly. Dispatches full-attention vs GatedDeltaNet by blockIdx.
+    /// `x` is [nSeq, d_model]; `s` scratch must be sized for maxT >= nSeq.
+    void runBlockBatched(std::size_t              blockIdx,
+                         float*                   x,
+                         const BatchedDecodeCtx&  ctx,
+                         BlockBuffers&            s);
 
     [[nodiscard]] bool        scalesEmbedding()   const noexcept override { return false; }
     [[nodiscard]] const char* name()              const noexcept override { return "qwen35moe"; }
@@ -133,6 +171,22 @@ private:
                           float*         kwSlot,
                           BlockBuffers&  s);
 
+    /// M-Cuda.Batch D2a — batched full-attention layer (paged KV). Mirrors
+    /// runFullAttentionBlock with the T dimension replaced by nSeq and the
+    /// KV write/read going through the PagedKvPool + paged_attention_v1.
+    void runFullAttentionBlockBatched(std::size_t             blockIdx,
+                                      float*                  x,
+                                      const BatchedDecodeCtx& ctx,
+                                      BlockBuffers&           s);
+
+    /// M-Cuda.Batch D2b — batched GatedDeltaNet layer. Mirrors
+    /// runLinearBlock with per-sequence SsmState[nSeq] recurrent + conv
+    /// state and the *_Batched conv/recurrence kernels.
+    void runLinearBlockBatched(std::size_t             blockIdx,
+                               float*                  x,
+                               const BatchedDecodeCtx& ctx,
+                               BlockBuffers&           s);
+
     const model::LlmConfig&       _config;
     const core::gguf::WeightsMap& _weights;
     const model::FusedQkvWeights* _fusedQkv{nullptr};
@@ -189,6 +243,12 @@ private:
     // so the op always receives a valid 4-element pointer. Zeroed when the
     // model ships no sections (degenerates to plain RoPE).
     std::int32_t _ropeSections[4]{0, 0, 0, 0};
+
+    // M-Cuda.Batch D2a — maps a global blockIdx to its dense index among
+    // full-attention layers (the PagedKvPool layer index). SIZE_MAX for
+    // recurrent (GatedDeltaNet) layers, which hold an SsmState instead of
+    // paged KV. Built once in the ctor.
+    std::vector<std::size_t> _fullAttnDense;
 
     // Router scratch, hoisted so steady-state runBlock does no allocation.
     std::vector<std::int32_t> _topKIdx;      // [T*K]
