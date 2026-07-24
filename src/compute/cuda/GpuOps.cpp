@@ -174,6 +174,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _attentionFlashPartialBatchedKernel;
     core::cuda::CudaModule _attentionFlashMergeBatchedModule;
     core::cuda::CudaKernel _attentionFlashMergeBatchedKernel;
+    core::cuda::CudaModule _pagedAttentionV1Module;
+    core::cuda::CudaKernel _pagedAttentionV1Kernel;
 
     core::cuda::CudaModule _attentionPrefillFlashModule;
     core::cuda::CudaKernel _attentionPrefillFlashKernel;
@@ -294,6 +296,9 @@ struct GpuOps::Impl {
           _attentionFlashMergeBatchedModule{loadCudaModule(ctx, "attention_flash_merge_batched")},
           _attentionFlashMergeBatchedKernel{
               _attentionFlashMergeBatchedModule.getFunction("attention_flash_merge_batched")},
+          _pagedAttentionV1Module{loadCudaModule(ctx, "attention_paged_v1")},
+          _pagedAttentionV1Kernel{
+              _pagedAttentionV1Module.getFunction("paged_attention_v1")},
 
           _attentionPrefillFlashModule{loadCudaModule(ctx, "attention_prefill_flash")},
           _attentionPrefillFlashKernel{
@@ -1793,6 +1798,46 @@ void GpuOps::attentionDecodeFlashBatchedAsync(
                        static_cast<std::uint32_t>(nSeq),
                        1,
                        kAttentionLocalSize, 1, 1);
+}
+
+void GpuOps::pagedAttentionDecodeV1Async(
+        float* out, const float* query, const float* keyCache,
+        const float* valueCache, const std::int32_t* blockTables,
+        const std::int32_t* seqLens, std::size_t numSeqs, std::size_t numHeads,
+        std::size_t numKvHeads, std::size_t headSize, std::size_t blockSize,
+        std::size_t maxNumBlocksPerSeq, float scale, float softcap) {
+    if (numSeqs == 0 || numHeads == 0 || headSize == 0) {
+        return;
+    }
+    // Baseline paged decode attention (fp32). Grid (numHeads, numSeqs); one
+    // workgroup owns one (head, sequence). Dynamic SMEM holds the query row,
+    // the per-dim accumulator and the reduction scratch:
+    // (2*headSize + PAGED_ATTN_V1_LOCAL) floats. kLocal MUST match the
+    // kernel's __launch_bounds__ (PagedAttentionV1::kBlockThreads).
+    constexpr std::uint32_t kLocal = 128;   // == PAGED_ATTN_V1_LOCAL
+    auto& kern = _pimpl->_pagedAttentionV1Kernel;
+    kern.setPtr  (0, out);
+    kern.setPtr  (1, query);
+    kern.setPtr  (2, keyCache);
+    kern.setPtr  (3, valueCache);
+    kern.setPtr  (4, blockTables);
+    kern.setPtr  (5, seqLens);
+    kern.setValue(6,  toInt32(numSeqs,            "pagedV1 numSeqs"));
+    kern.setValue(7,  toInt32(numHeads,           "pagedV1 numHeads"));
+    kern.setValue(8,  toInt32(numKvHeads,         "pagedV1 numKvHeads"));
+    kern.setValue(9,  toInt32(headSize,           "pagedV1 headSize"));
+    kern.setValue(10, toInt32(blockSize,          "pagedV1 blockSize"));
+    kern.setValue(11, toInt32(maxNumBlocksPerSeq, "pagedV1 maxBlocks"));
+    kern.setValue(12, scale);
+    kern.setValue(13, softcap);
+    kern.setValue(14, static_cast<std::int32_t>(0));   // PAGED_ATTN_KV_DTYPE_FP32
+    const std::size_t smemBytes = (2 * headSize + kLocal) * sizeof(float);
+    kern.launch(_ctx.stream(),
+                static_cast<std::uint32_t>(numHeads),
+                static_cast<std::uint32_t>(numSeqs),
+                1,
+                kLocal, 1, 1,
+                smemBytes);
 }
 
 void GpuOps::matmulQ8_0VecReorderAsync(const void* wReordered,

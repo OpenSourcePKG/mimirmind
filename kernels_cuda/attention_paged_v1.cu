@@ -93,27 +93,129 @@ void paged_attention_v1(
     const float               softcap,             // 0.0f = disabled; > 0 = Gemma-4 final-logit-softcap
     const int                 kv_cache_dtype)      // PAGED_ATTN_KV_DTYPE_*
 {
-    // Compile-time sanity: keep the signature stable. Any change here
-    // must be mirrored in src/core/gpu/cuda/PagedAttentionV1.hpp.
-    (void)out;
-    (void)query;
-    (void)key_cache;
-    (void)value_cache;
-    (void)block_tables;
-    (void)seq_lens;
-    (void)num_seqs;
-    (void)num_heads;
-    (void)num_kv_heads;
-    (void)head_size;
-    (void)block_size;
-    (void)max_num_blocks_per_seq;
-    (void)scale;
-    (void)softcap;
-    (void)kv_cache_dtype;
+    // ---- Baseline correctness body (M-Cuda.Batch B2) --------------------
+    // fp32 paged-KV decode attention: one query token per sequence, online
+    // (streaming) softmax over the sequence's KV via block-table
+    // indirection, GQA head mapping, optional Gemma-4 logit soft-cap.
+    //
+    // This is the CORRECT-but-not-fast body. The FA2-Ampere speed-of-light
+    // variant (BLOCK_KV tiling, warp-specialisation, mbarrier producer/
+    // consumer, inline PTX) is a deferred perf task — see the file header.
+    // One workgroup owns one (head, sequence); threadIdx.x strides the
+    // head_size dimension. Physical KV layout is the simple vLLM-alt form
+    //   key/value_cache[num_blocks, block_size, num_kv_heads, head_size]
+    // chosen here (see header — the coalesced [.., head_size/X, .., X] form
+    // is left to the FA2 body). Both caches share this layout.
+    if (kv_cache_dtype != PAGED_ATTN_KV_DTYPE_FP32) {
+        __trap();   // fp16 / Q8_0 paged KV land with the FA2 body
+    }
 
-    // TODO(M-Cuda.Batch B2 body): FA2-Ampere compute with paged-KV
-    // indirection. See file header for blueprint references. Until the
-    // body lands, invocation is a hard runtime error so the scheduler
-    // never operates against garbage output.
-    __trap();
+    const int hq  = static_cast<int>(blockIdx.x);   // query head
+    const int seq = static_cast<int>(blockIdx.y);   // sequence
+    if (hq >= num_heads || seq >= num_seqs) {
+        return;
+    }
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int nthr = static_cast<int>(blockDim.x);  // == PAGED_ATTN_V1_LOCAL
+
+    // GQA: many query heads share one KV head (same rule as the contiguous
+    // attention kernels). num_kv_heads == num_heads collapses to identity.
+    const int hkv     = (hq * num_kv_heads) / num_heads;
+    const int seq_len = seq_lens[seq];
+
+    const float* __restrict__ q_row =
+        query + (static_cast<long>(seq) * num_heads + hq) * head_size;
+    float* __restrict__ o_row =
+        out + (static_cast<long>(seq) * num_heads + hq) * head_size;
+
+    // Dynamic shared memory laid out as
+    //   [ head_size (query) | head_size (accumulator) | nthr (reduction) ].
+    // The launch must reserve (2*head_size + nthr) * sizeof(float) bytes;
+    // the C++ wrapper computes this. head_size <= 256 for qwen35moe, so the
+    // budget stays a few KiB — far under the sm_120 SMEM cap.
+    extern __shared__ float smem[];
+    float* __restrict__ sq  = smem;                     // [head_size]
+    float* __restrict__ acc = smem + head_size;         // [head_size]
+    float* __restrict__ red = smem + 2 * head_size;     // [nthr]
+
+    for (int d = tid; d < head_size; d += nthr) {
+        sq[d]  = q_row[d];
+        acc[d] = 0.0f;
+    }
+    __syncthreads();
+
+    if (seq_len <= 0) {   // defensive: scheduler should never admit len 0
+        for (int d = tid; d < head_size; d += nthr) {
+            o_row[d] = 0.0f;
+        }
+        return;
+    }
+
+    __shared__ float s_m;      // running row-max of the logits
+    __shared__ float s_l;      // running softmax denominator
+    __shared__ float s_score;  // broadcast of the current position's logit
+    if (tid == 0) {
+        s_m = -1.0e30f;        // effectively -inf; first logit always wins
+        s_l = 0.0f;
+    }
+    __syncthreads();
+
+    const float* __restrict__ kbase = static_cast<const float*>(key_cache);
+    const float* __restrict__ vbase = static_cast<const float*>(value_cache);
+    const int*   __restrict__ bt =
+        block_tables + static_cast<long>(seq) * max_num_blocks_per_seq;
+
+    for (int p = 0; p < seq_len; ++p) {
+        const int  blk    = bt[p / block_size];
+        const int  slot   = p % block_size;
+        const long kv_off =
+            ((static_cast<long>(blk) * block_size + slot) * num_kv_heads + hkv)
+            * head_size;
+        const float* __restrict__ k_p = kbase + kv_off;
+
+        // logit = scale * (q . k_p), reduced across the block.
+        float partial = 0.0f;
+        for (int d = tid; d < head_size; d += nthr) {
+            partial += sq[d] * k_p[d];
+        }
+        red[tid] = partial;
+        __syncthreads();
+        for (int stride = nthr >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                red[tid] += red[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            float logit = red[0] * scale;
+            if (softcap > 0.0f) {
+                logit = softcap * tanhf(logit / softcap);
+            }
+            s_score = logit;
+        }
+        __syncthreads();
+
+        // Streaming-softmax update: rescale the running accumulator by the
+        // shift in the row-max, then fold in this position's contribution.
+        const float score   = s_score;
+        const float m_new   = fmaxf(s_m, score);
+        const float rescale = __expf(s_m - m_new);   // 0 on the first step
+        const float p_exp   = __expf(score - m_new);
+        const float* __restrict__ v_p = vbase + kv_off;
+        for (int d = tid; d < head_size; d += nthr) {
+            acc[d] = acc[d] * rescale + p_exp * v_p[d];
+        }
+        __syncthreads();
+        if (tid == 0) {
+            s_l = s_l * rescale + p_exp;
+            s_m = m_new;
+        }
+        __syncthreads();
+    }
+
+    const float inv_l = 1.0f / s_l;
+    for (int d = tid; d < head_size; d += nthr) {
+        o_row[d] = acc[d] * inv_l;
+    }
 }

@@ -295,6 +295,29 @@ public:
             "deltanetChunkForwardBatchedAsync: not supported on this backend");
     }
 
+    /// M-Cuda.Batch B2/D2a — paged-KV decode attention. One query token per
+    /// sequence; each sequence reads its KV from the shared physical pool
+    /// (PagedKvPool) via its block table. `keyCache`/`valueCache` are the
+    /// per-layer pool bases [numBlocks, blockSize, numKvHeads, headSize];
+    /// `blockTables` [numSeqs, maxNumBlocksPerSeq] int32 (-1 sentinel);
+    /// `seqLens` [numSeqs] int32. `query`/`out` [numSeqs, numHeads, headSize].
+    /// fp32 baseline (kernel `paged_attention_v1`). Default: unsupported;
+    /// CUDA overrides.
+    virtual void pagedAttentionDecodeV1Async(
+            float* out, const float* query, const float* keyCache,
+            const float* valueCache, const std::int32_t* blockTables,
+            const std::int32_t* seqLens, std::size_t numSeqs,
+            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
+            std::size_t blockSize, std::size_t maxNumBlocksPerSeq, float scale,
+            float softcap) {
+        (void)out; (void)query; (void)keyCache; (void)valueCache;
+        (void)blockTables; (void)seqLens; (void)numSeqs; (void)numHeads;
+        (void)numKvHeads; (void)headSize; (void)blockSize;
+        (void)maxNumBlocksPerSeq; (void)scale; (void)softcap;
+        throw std::runtime_error(
+            "pagedAttentionDecodeV1Async: not supported on this backend");
+    }
+
     /// Chunked-prefill stage K1: per-chunk ungated triangular inverse A0
     /// (a0 [nChunks,H,C,C]). Reference: compute::deltanetKktSolveInverse.
     /// Default: unsupported; CUDA overrides.
