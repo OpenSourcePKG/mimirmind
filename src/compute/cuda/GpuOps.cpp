@@ -195,6 +195,8 @@ struct GpuOps::Impl {
 
     core::cuda::CudaModule _mropeModule;
     core::cuda::CudaKernel _mropeKernel;
+    core::cuda::CudaModule _mropeBatchedModule;
+    core::cuda::CudaKernel _mropeBatchedKernel;
     core::cuda::CudaModule _splitHeadPairModule;
     core::cuda::CudaKernel _splitHeadPairKernel;
     core::cuda::CudaModule _sigmoidGateMulModule;
@@ -203,8 +205,12 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _l2NormKernel;
     core::cuda::CudaModule _ssmConv1dModule;
     core::cuda::CudaKernel _ssmConv1dKernel;
+    core::cuda::CudaModule _ssmConv1dBatchedModule;
+    core::cuda::CudaKernel _ssmConv1dBatchedKernel;
     core::cuda::CudaModule _gatedDeltaNetArModule;
     core::cuda::CudaKernel _gatedDeltaNetArKernel;
+    core::cuda::CudaModule _gatedDeltaNetArBatchedModule;
+    core::cuda::CudaKernel _gatedDeltaNetArBatchedKernel;
     core::cuda::CudaModule _deltanetGateModule;
     core::cuda::CudaKernel _deltanetGateKernel;
     core::cuda::CudaModule _deltanetChunkCumGateModule;
@@ -311,6 +317,8 @@ struct GpuOps::Impl {
               _matmulQ8_0VecReorderModule.getFunction("matmul_q8_0_vec_reorder")},
           _mropeModule             {loadCudaModule(ctx, "rope_mrope")},
           _mropeKernel             {_mropeModule.getFunction("rope_mrope")},
+          _mropeBatchedModule      {loadCudaModule(ctx, "rope_mrope_batched")},
+          _mropeBatchedKernel      {_mropeBatchedModule.getFunction("rope_mrope_batched")},
           _splitHeadPairModule     {loadCudaModule(ctx, "split_head_pair")},
           _splitHeadPairKernel     {_splitHeadPairModule.getFunction("split_head_pair")},
           _sigmoidGateMulModule    {loadCudaModule(ctx, "sigmoid_gate_mul")},
@@ -320,9 +328,14 @@ struct GpuOps::Impl {
           _l2NormKernel            {_l2NormModule.getFunction("l2_norm")},
           _ssmConv1dModule         {loadCudaModule(ctx, "ssm_conv1d")},
           _ssmConv1dKernel         {_ssmConv1dModule.getFunction("ssm_conv1d")},
+          _ssmConv1dBatchedModule  {loadCudaModule(ctx, "ssm_conv1d_batched")},
+          _ssmConv1dBatchedKernel  {_ssmConv1dBatchedModule.getFunction("ssm_conv1d_batched")},
           _gatedDeltaNetArModule   {loadCudaModule(ctx, "gated_deltanet_ar")},
           _gatedDeltaNetArKernel   {
               _gatedDeltaNetArModule.getFunction("gated_deltanet_ar")},
+          _gatedDeltaNetArBatchedModule{loadCudaModule(ctx, "gated_deltanet_ar_batched")},
+          _gatedDeltaNetArBatchedKernel{
+              _gatedDeltaNetArBatchedModule.getFunction("gated_deltanet_ar_batched")},
           _deltanetGateModule      {loadCudaModule(ctx, "deltanet_gate")},
           _deltanetGateKernel      {_deltanetGateModule.getFunction("deltanet_gate")},
           _deltanetChunkCumGateModule{loadCudaModule(ctx, "deltanet_chunk_cumgate")},
@@ -907,6 +920,49 @@ void GpuOps::mropeInPlaceAsync(void* xBase, std::size_t seqLen,
              kRopeLocalSize, 1, 1);
 }
 
+void GpuOps::mropeInPlaceBatchedAsync(void* xBase, std::size_t nSeq,
+                                      std::size_t xSeqStride,
+                                      std::size_t seqLen, std::size_t numHeads,
+                                      std::size_t headDim,
+                                      const std::int32_t* startPosDev,
+                                      float base, const std::int32_t* sections,
+                                      std::size_t writeOffsetStride,
+                                      runtime::KvDtype kvDtype) {
+    if (nSeq == 0 || seqLen == 0 || numHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (headDim % 2 != 0) {
+        throw std::runtime_error(
+            "compute::cuda::GpuOps::mropeInPlaceBatchedAsync: headDim must be even");
+    }
+    if (kvDtype != runtime::KvDtype::F32) {
+        throw std::runtime_error(
+            "compute::cuda::GpuOps::mropeInPlaceBatchedAsync: only KvDtype::F32");
+    }
+    const std::size_t halfDim = headDim / 2;
+    const std::size_t total   = seqLen * numHeads * halfDim;
+    // Per-seq start positions come from a caller-owned device int32[nSeq]
+    // (unlike the single path's staged single slot). Provisional x layout:
+    // seq s at xBase + s*xSeqStride (M-Cuda.Batch Cat B, parity-gated).
+    auto& k = _pimpl->_mropeBatchedKernel;
+    k.setPtr  (0, xBase);
+    k.setValue(1, toInt32(seqLen,   "mropeB seqLen"));
+    k.setValue(2, toInt32(numHeads, "mropeB numHeads"));
+    k.setValue(3, toInt32(headDim,  "mropeB headDim"));
+    k.setPtr  (4, startPosDev);
+    k.setValue(5, base);
+    k.setValue(6, toInt32(writeOffsetStride, "mropeB writeOffsetStride"));
+    k.setValue(7, toInt32(xSeqStride, "mropeB xSeqStride"));
+    k.setValue(8,  sections ? sections[0] : 0);
+    k.setValue(9,  sections ? sections[1] : 0);
+    k.setValue(10, sections ? sections[2] : 0);
+    k.setValue(11, sections ? sections[3] : 0);
+    k.launch(_ctx.stream(),
+             groupsForN(total, kRopeLocalSize),
+             static_cast<std::uint32_t>(nSeq), 1,
+             kRopeLocalSize, 1, 1);
+}
+
 void GpuOps::splitHeadPairAsync(const float* src, float* a, float* b,
                                 std::size_t seqLen, std::size_t numHeads,
                                 std::size_t headDim) {
@@ -978,6 +1034,31 @@ void GpuOps::causalConv1dSiluAsync(const float* convInput, const float* kernel,
              kElementwiseLocalSize, 1, 1);
 }
 
+void GpuOps::causalConv1dSiluBatchedAsync(const float* convInput,
+                                          const float* kernel, float* out,
+                                          std::size_t nSeq, std::size_t T,
+                                          std::size_t channels,
+                                          std::size_t kernelSize) {
+    const std::size_t total = T * channels;
+    if (nSeq == 0 || total == 0) {
+        return;
+    }
+    // grid = (ceil(T*channels/LOCAL), nSeq); each seq owns its own conv
+    // input (caller prepends its rolling conv-tail). Math byte-identical
+    // to the single-sequence causalConv1dSiluAsync (M-Cuda.Batch Cat C-P0).
+    auto& k = _pimpl->_ssmConv1dBatchedKernel;
+    k.setPtr  (0, convInput);
+    k.setPtr  (1, kernel);
+    k.setPtr  (2, out);
+    k.setValue(3, toInt32(T,          "conv1dB T"));
+    k.setValue(4, toInt32(channels,   "conv1dB channels"));
+    k.setValue(5, toInt32(kernelSize, "conv1dB K"));
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize),
+             static_cast<std::uint32_t>(nSeq), 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
 void GpuOps::gatedDeltaNetRecurrentAsync(const float* q, const float* k_,
                                          const float* v, const float* gLog,
                                          const float* beta, float* state,
@@ -1001,6 +1082,33 @@ void GpuOps::gatedDeltaNetRecurrentAsync(const float* q, const float* k_,
     // grid = H blocks, block = S threads (S <= GATED_DELTANET_AR_MAX_S).
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(H), 1, 1,
+             static_cast<std::uint32_t>(S), 1, 1);
+}
+
+void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
+        const float* q, const float* k_, const float* v, const float* gLog,
+        const float* beta, float* state, float* out, std::size_t nSeq,
+        std::size_t T, std::size_t H, std::size_t S) {
+    if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
+        return;
+    }
+    // grid = (H, nSeq) blocks, block = S threads. Each (head, seq) block
+    // owns one sequence [S,S] state; math is byte-identical to the
+    // single-sequence gatedDeltaNetRecurrentAsync (M-Cuda.Batch Cat C-P0).
+    auto& k = _pimpl->_gatedDeltaNetArBatchedKernel;
+    k.setPtr  (0, q);
+    k.setPtr  (1, k_);
+    k.setPtr  (2, v);
+    k.setPtr  (3, gLog);
+    k.setPtr  (4, beta);
+    k.setPtr  (5, state);
+    k.setPtr  (6, out);
+    k.setValue(7, toInt32(T, "gdnB T"));
+    k.setValue(8, toInt32(H, "gdnB H"));
+    k.setValue(9, toInt32(S, "gdnB S"));
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(H),
+             static_cast<std::uint32_t>(nSeq), 1,
              static_cast<std::uint32_t>(S), 1, 1);
 }
 

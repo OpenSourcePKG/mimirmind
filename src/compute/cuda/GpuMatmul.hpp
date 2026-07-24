@@ -115,6 +115,21 @@ public:
                             std::size_t          kActive,
                             std::size_t          expertBytes) override;
 
+    // M-Cuda.Batch Cat B: batched variant (Q5_K only for now) — nSeq
+    // decode tokens, each with its own gateAct / routed experts / router
+    // weights / RMW accumulator, in one launch. CUDA-only, parity-gated.
+    void moeDownFusedKBatchedAsync(::mimirmind::core::gguf::GgmlType type,
+                                   const float*         gateAct,
+                                   const void*          W,
+                                   const std::int32_t*  expIdx,
+                                   const float*         kw,
+                                   float*               accum,
+                                   std::size_t          nSeq,
+                                   std::size_t          ffPer,
+                                   std::size_t          dModel,
+                                   std::size_t          kActive,
+                                   std::size_t          expertBytes);
+
     [[nodiscard]] bool moeDownFusedKAvailable() const noexcept override;
     [[nodiscard]] bool moeDownFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
         const noexcept override;
@@ -130,6 +145,22 @@ public:
                               std::size_t          kActive,
                               std::size_t          expertBytesGate,
                               std::size_t          expertBytesUp) override;
+
+    // M-Cuda.Batch Cat B: batched variant — nSeq decode tokens, each with
+    // its own x + routed-expert list, in one launch. Expert banks shared.
+    // CUDA-only (parity-gated before wiring).
+    void moeGateUpFusedKBatchedAsync(::mimirmind::core::gguf::GgmlType type,
+                                     const float*         x,
+                                     const void*          Wg,
+                                     const void*          Wu,
+                                     const std::int32_t*  expIdx,
+                                     float*               gateActOut,
+                                     std::size_t          nSeq,
+                                     std::size_t          dModel,
+                                     std::size_t          nFf,
+                                     std::size_t          kActive,
+                                     std::size_t          expertBytesGate,
+                                     std::size_t          expertBytesUp);
 
     [[nodiscard]] bool moeGateUpFusedKAvailable(
         ::mimirmind::core::gguf::GgmlType type) const noexcept override;

@@ -153,8 +153,12 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _moeDownFusedKQ6KKernel;
     ::mimirmind::core::cuda::CudaModule _moeDownFusedKQ5KModule;
     ::mimirmind::core::cuda::CudaKernel _moeDownFusedKQ5KKernel;
+    ::mimirmind::core::cuda::CudaModule _moeDownFusedKQ5KBatchedModule;
+    ::mimirmind::core::cuda::CudaKernel _moeDownFusedKQ5KBatchedKernel;
     ::mimirmind::core::cuda::CudaModule _moeGateUpFusedKQ4KModule;
     ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKQ4KKernel;
+    ::mimirmind::core::cuda::CudaModule _moeGateUpFusedKQ4KBatchedModule;
+    ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKQ4KBatchedKernel;
     ::mimirmind::core::cuda::CudaModule _ffnGateUpFusedQ8Module;
     ::mimirmind::core::cuda::CudaKernel _ffnGateUpFusedQ8Kernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ5_0VecModule;
@@ -204,9 +208,15 @@ struct GpuMatmul::Impl {
           _moeDownFusedKQ5KModule {loadCudaModule(ctx, "moe_down_fused_k_q5k")},
           _moeDownFusedKQ5KKernel {
               _moeDownFusedKQ5KModule.getFunction("moe_down_fused_k_q5k")},
+          _moeDownFusedKQ5KBatchedModule{loadCudaModule(ctx, "moe_down_fused_k_q5k_batched")},
+          _moeDownFusedKQ5KBatchedKernel{
+              _moeDownFusedKQ5KBatchedModule.getFunction("moe_down_fused_k_q5k_batched")},
           _moeGateUpFusedKQ4KModule{loadCudaModule(ctx, "moe_gate_up_fused_k_q4k")},
           _moeGateUpFusedKQ4KKernel{
               _moeGateUpFusedKQ4KModule.getFunction("moe_gate_up_fused_k_q4k")},
+          _moeGateUpFusedKQ4KBatchedModule{loadCudaModule(ctx, "moe_gate_up_fused_k_q4k_batched")},
+          _moeGateUpFusedKQ4KBatchedKernel{
+              _moeGateUpFusedKQ4KBatchedModule.getFunction("moe_gate_up_fused_k_q4k_batched")},
           _ffnGateUpFusedQ8Module{loadCudaModule(ctx, "ffn_gate_up_fused_q8_0")},
           _ffnGateUpFusedQ8Kernel{
               _ffnGateUpFusedQ8Module.getFunction("ffn_gate_up_fused_q8_0")},
@@ -1168,6 +1178,46 @@ void GpuMatmul::moeDownFusedKAsync(::mimirmind::core::gguf::GgmlType type,
                 kMoeDownLocalSize, 1, 1);
 }
 
+void GpuMatmul::moeDownFusedKBatchedAsync(
+        ::mimirmind::core::gguf::GgmlType type, const float* gateAct,
+        const void* W, const std::int32_t* expIdx, const float* kw,
+        float* accum, std::size_t nSeq, std::size_t ffPer, std::size_t dModel,
+        std::size_t kActive, std::size_t expertBytes) {
+    if (nSeq == 0 || kActive == 0 || dModel == 0 || ffPer == 0) {
+        return;
+    }
+    if (type != ::mimirmind::core::gguf::GgmlType::Q5_K) {
+        throw std::runtime_error(
+            "compute::cuda::GpuMatmul::moeDownFusedKBatchedAsync: only Q5_K "
+            "batched today — Q6_K/Q8_0 batched variants not yet ported.");
+    }
+    if (ffPer % 256 != 0) {
+        throw std::runtime_error(
+            "compute::cuda::GpuMatmul::moeDownFusedKBatchedAsync: ffPer=" +
+            std::to_string(ffPer) +
+            " is not a multiple of Q5_K blockElements=256");
+    }
+    // grid = (nGroups, nSeq); each seq has its own gateAct/expIdx/kw/accum
+    // (per-token routing + RMW accumulator). Expert bank shared. Math
+    // byte-identical to nSeq single moeDownFusedKAsync (Cat B).
+    auto& kern = _pimpl->_moeDownFusedKQ5KBatchedKernel;
+    kern.setPtr  (0, gateAct);
+    kern.setPtr  (1, W);
+    kern.setPtr  (2, expIdx);
+    kern.setPtr  (3, kw);
+    kern.setPtr  (4, accum);
+    kern.setValue(5, static_cast<std::int32_t>(ffPer));
+    kern.setValue(6, static_cast<std::int32_t>(dModel));
+    kern.setValue(7, static_cast<std::int32_t>(kActive));
+    kern.setValue(8, static_cast<std::int32_t>(expertBytes));
+
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (dModel + kMoeDownOutputsPerGroup - 1) / kMoeDownOutputsPerGroup);
+    kern.launch(_ctx.stream(),
+                nGroups, static_cast<std::uint32_t>(nSeq), 1,
+                kMoeDownLocalSize, 1, 1);
+}
+
 void GpuMatmul::moeGateUpFusedKAsync(::mimirmind::core::gguf::GgmlType type,
                                      const float*         x,
                                      const void*          Wg,
@@ -1215,6 +1265,50 @@ void GpuMatmul::moeGateUpFusedKAsync(::mimirmind::core::gguf::GgmlType type,
 
     kern.launch(_ctx.stream(),
                 nGroups, 1, 1,
+                kMoeGateUpLocalSize, 1, 1);
+}
+
+void GpuMatmul::moeGateUpFusedKBatchedAsync(
+        ::mimirmind::core::gguf::GgmlType type, const float* x, const void* Wg,
+        const void* Wu, const std::int32_t* expIdx, float* gateActOut,
+        std::size_t nSeq, std::size_t dModel, std::size_t nFf,
+        std::size_t kActive, std::size_t expertBytesGate,
+        std::size_t expertBytesUp) {
+    if (nSeq == 0 || kActive == 0 || dModel == 0 || nFf == 0) {
+        return;
+    }
+    if (type != ::mimirmind::core::gguf::GgmlType::Q4_K) {
+        throw std::runtime_error(
+            "compute::cuda::GpuMatmul::moeGateUpFusedKBatchedAsync: only "
+            "Q4_K supported — check moeGateUpFusedKAvailable(type) first.");
+    }
+    if (dModel % 256 != 0) {
+        throw std::runtime_error(
+            "compute::cuda::GpuMatmul::moeGateUpFusedKBatchedAsync: dModel=" +
+            std::to_string(dModel) +
+            " is not a multiple of Q4_K blockElements=256");
+    }
+    // grid = (nGroups, nSeq); each seq has its own x + expIdx (per-token
+    // routing) writing its own gateActOut slice. Expert banks shared.
+    // Math byte-identical to nSeq single moeGateUpFusedKAsync (Cat B).
+    auto& kern = _pimpl->_moeGateUpFusedKQ4KBatchedKernel;
+    kern.setPtr  (0, x);
+    kern.setPtr  (1, Wg);
+    kern.setPtr  (2, Wu);
+    kern.setPtr  (3, expIdx);
+    kern.setPtr  (4, gateActOut);
+    kern.setValue(5, static_cast<std::int32_t>(dModel));
+    kern.setValue(6, static_cast<std::int32_t>(nFf));
+    kern.setValue(7, static_cast<std::int32_t>(kActive));
+    kern.setValue(8, static_cast<std::int32_t>(expertBytesGate));
+    kern.setValue(9, static_cast<std::int32_t>(expertBytesUp));
+
+    const std::uint32_t nOutputs = static_cast<std::uint32_t>(kActive * nFf);
+    const std::uint32_t nGroups  =
+        (nOutputs + kMoeGateUpOutputsPerGroup - 1) / kMoeGateUpOutputsPerGroup;
+
+    kern.launch(_ctx.stream(),
+                nGroups, static_cast<std::uint32_t>(nSeq), 1,
                 kMoeGateUpLocalSize, 1, 1);
 }
 

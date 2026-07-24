@@ -38,26 +38,40 @@ namespace mimirmind::runtime {
  */
 class SsmState {
 public:
+    // nSeq > 1 allocates one recurrent state per concurrent sequence
+    // (M-Cuda.Batch): the per-layer slab becomes [nSeq, stateElemsPerLayer],
+    // exactly the layout the *_batched GatedDeltaNet kernels index (seq
+    // stride = stateElemsPerLayer). nSeq == 1 is byte-identical to the
+    // original single-sequence layout.
     SsmState(compute::ComputeOps& ops,
              std::size_t          blockCount,
              std::size_t          stateElemsPerLayer,
-             std::size_t          convStateElemsPerLayer);
+             std::size_t          convStateElemsPerLayer,
+             std::size_t          nSeq = 1);
 
     SsmState(const SsmState&)            = delete;
     SsmState& operator=(const SsmState&) = delete;
     SsmState(SsmState&&)                 = delete;
     SsmState& operator=(SsmState&&)      = delete;
 
-    /// Base of the recurrent delta-net state, [blockCount, H_v*S*S].
-    /// Index layer L at `statePtr() + L * stateElemsPerLayer()`.
+    /// Base of the recurrent delta-net state, [blockCount, nSeq, H_v*S*S].
+    /// Index layer L at `statePtr() + L * stateLayerStride()`, then
+    /// sequence s at `+ s * stateElemsPerLayer()`. For nSeq == 1 the layer
+    /// stride equals stateElemsPerLayer() (original single-seq indexing).
     [[nodiscard]] float* statePtr() noexcept { return _state.as<float>(); }
-    /// Base of the rolling causal-conv tail, [blockCount, (d_conv-1)*conv_dim].
-    /// Index layer L at `convStatePtr() + L * convStateElemsPerLayer()`.
+    /// Base of the rolling causal-conv tail, [blockCount, nSeq, (d_conv-1)*conv_dim].
+    /// Index layer L at `convStatePtr() + L * convStateLayerStride()`,
+    /// then sequence s at `+ s * convStateElemsPerLayer()`.
     [[nodiscard]] float* convStatePtr() noexcept { return _convState.as<float>(); }
 
     [[nodiscard]] std::size_t stateElemsPerLayer()     const noexcept { return _stateElems; }
     [[nodiscard]] std::size_t convStateElemsPerLayer() const noexcept { return _convStateElems; }
     [[nodiscard]] std::size_t blockCount()             const noexcept { return _blockCount; }
+    [[nodiscard]] std::size_t nSeq()                   const noexcept { return _nSeq; }
+    /// Per-layer stride = nSeq * stateElemsPerLayer (== stateElemsPerLayer
+    /// when nSeq == 1). Use this to step between layers in the batched slab.
+    [[nodiscard]] std::size_t stateLayerStride()     const noexcept { return _nSeq * _stateElems; }
+    [[nodiscard]] std::size_t convStateLayerStride() const noexcept { return _nSeq * _convStateElems; }
 
     /// Zero the entire state (queued on the compute stream). Mirrors
     /// KvCache::reset(); used at true sequence start / eviction.
@@ -67,8 +81,9 @@ private:
     std::size_t            _blockCount;
     std::size_t            _stateElems;
     std::size_t            _convStateElems;
-    compute::ComputeBuffer _state;      // [blockCount, stateElemsPerLayer]
-    compute::ComputeBuffer _convState;  // [blockCount, convStateElemsPerLayer]
+    std::size_t            _nSeq;
+    compute::ComputeBuffer _state;      // [blockCount, nSeq, stateElemsPerLayer]
+    compute::ComputeBuffer _convState;  // [blockCount, nSeq, convStateElemsPerLayer]
 };
 
 } // namespace mimirmind::runtime

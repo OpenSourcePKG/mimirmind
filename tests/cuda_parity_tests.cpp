@@ -15,11 +15,13 @@
 #include "compute/cuda/GpuOps.hpp"
 #include "core/gpu/cuda/CudaComputeContext.hpp"
 #include "core/gguf/GgufTypes.hpp"
+#include "compute/quant/Q8_0.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <chrono>
 #include <vector>
 
 namespace {
@@ -931,6 +933,428 @@ TEST(cuda_matmul_q8_0_mmq_tc_localize) {
         std::printf("  [m=%d n=%d] ref=%.4f got=%.4f err=%.4f\n",
                     bad[i].mi, bad[i].ni, bad[i].ref, bad[i].got, bad[i].err);
     EXPECT_TRUE(true);
+}
+
+// M-Q3N.4 microbench (2026-07-24, GB10) — Q8_0 decode GEMV: native
+// interleaved 34-byte layout vs reordered [scales|quants] layout.
+// Answers whether the reorder layout lifts the ~16-27% DRAM throughput
+// that ncu measured on matmul_q8_0_vec. Parity-checks reorderRow + the
+// reorder kernel addressing, then times both on the big decode shape.
+TEST(cuda_matmul_q8_0_vec_reorder_bench) {
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+    const GgmlType Q8 = GgmlType::Q8_0;
+
+    const std::size_t N = 8192, K = 4096;
+    const std::size_t blockBytes   = 34;
+    const std::size_t blocksPerRow = K / 32;
+    const std::size_t bytesPerRow  = blocksPerRow * blockBytes;
+    const std::size_t totalBytes   = N * bytesPerRow;
+
+    // Deterministic native Q8_0 weights: pseudo-random quants, every
+    // block scale pinned to a benign finite fp16 (0x2C00 = 0.0625).
+    std::vector<std::uint8_t> wNative(totalBytes);
+    for (std::size_t i = 0; i < totalBytes; ++i) {
+        wNative[i] = static_cast<std::uint8_t>((i * 2654435761u) >> 24);
+    }
+    for (std::size_t n = 0; n < N; ++n) {
+        for (std::size_t b = 0; b < blocksPerRow; ++b) {
+            std::uint8_t* s = wNative.data() + n * bytesPerRow + b * blockBytes;
+            s[0] = 0x00; s[1] = 0x2C;
+        }
+    }
+
+    std::vector<std::uint8_t> wReorder(totalBytes);
+    for (std::size_t n = 0; n < N; ++n) {
+        mimirmind::compute::quant::Q8_0::reorderRow(
+            wNative.data()  + n * bytesPerRow, K,
+            wReorder.data() + n * bytesPerRow);
+    }
+
+    auto x         = toDevice(ops, randVec(K, 0x2222u));
+    auto dWNative  = uploadRaw(ops, wNative);
+    auto dWReorder = uploadRaw(ops, wReorder);
+    auto yNative   = ops.allocate(N * sizeof(float));
+    auto yReorder  = ops.allocate(N * sizeof(float));
+    auto scratch   = ops.allocate(K * sizeof(float));
+    const float* xp = static_cast<const float*>(x.get());
+
+    // Parity — same math, different memory layout.
+    gmm.matmulAsync(Q8, dWNative.get(), N, K, xp, 1,
+                    static_cast<float*>(yNative.get()),
+                    static_cast<float*>(scratch.get()));
+    ops.matmulQ8_0VecReorderAsync(dWReorder.get(), N, K, xp,
+                                  static_cast<float*>(yReorder.get()));
+    ops.flush();
+
+    auto hN = fromDevice(ops, yNative.get(), N);
+    auto hR = fromDevice(ops, yReorder.get(), N);
+    double maxErr = 0.0, num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < N; ++i) {
+        const double d = static_cast<double>(hN[i]) - static_cast<double>(hR[i]);
+        maxErr = std::max(maxErr, std::fabs(d));
+        num += d * d;
+        den += static_cast<double>(hN[i]) * static_cast<double>(hN[i]);
+    }
+    const double relL2 = den > 0.0 ? std::sqrt(num / den) : 0.0;
+    std::printf("[reorder-bench] parity maxErr=%.5f relL2=%.6f\n", maxErr, relL2);
+    EXPECT_NEAR(relL2, 0.0, 0.02);
+
+    const int iters = 300;
+    for (int w = 0; w < 20; ++w) {
+        gmm.matmulAsync(Q8, dWNative.get(), N, K, xp, 1,
+                        static_cast<float*>(yNative.get()),
+                        static_cast<float*>(scratch.get()));
+    }
+    ops.flush();
+
+    auto t0 = std::chrono::steady_clock::now();
+    for (int it = 0; it < iters; ++it) {
+        gmm.matmulAsync(Q8, dWNative.get(), N, K, xp, 1,
+                        static_cast<float*>(yNative.get()),
+                        static_cast<float*>(scratch.get()));
+    }
+    ops.flush();
+    auto t1 = std::chrono::steady_clock::now();
+    for (int it = 0; it < iters; ++it) {
+        ops.matmulQ8_0VecReorderAsync(dWReorder.get(), N, K, xp,
+                                      static_cast<float*>(yReorder.get()));
+    }
+    ops.flush();
+    auto t2 = std::chrono::steady_clock::now();
+
+    const double nativeUs  =
+        std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
+    const double reorderUs =
+        std::chrono::duration<double, std::micro>(t2 - t1).count() / iters;
+    std::printf("[reorder-bench] N=%zu K=%zu native=%.2f us reorder=%.2f us speedup=%.2fx\n",
+                N, K, nativeUs, reorderUs,
+                reorderUs > 0.0 ? nativeUs / reorderUs : 0.0);
+    EXPECT_TRUE(true);
+}
+
+// M-Cuda.Batch Cat C-P0 — batched gated_deltanet_ar vs N single-sequence
+// runs. Same kernel math with a per-sequence offset, so batched output and
+// state must be byte-identical to running each sequence on its own.
+TEST(cuda_gated_deltanet_ar_batched_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t nSeq = 3, T = 5, H = 4, S = 16;
+    const std::size_t act = T * H * S;   // per-seq q/k/v/out
+    const std::size_t gat = T * H;       // per-seq gLog/beta
+    const std::size_t stt = H * S * S;   // per-seq state
+
+    std::vector<float> Q(nSeq*act), K(nSeq*act), V(nSeq*act);
+    std::vector<float> G(nSeq*gat), B(nSeq*gat), ST(nSeq*stt);
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        const std::uint32_t o = static_cast<std::uint32_t>(s) * 7u;
+        auto q  = randVec(act, 0x0a1u + o);
+        auto k  = randVec(act, 0x0b2u + o);
+        auto v  = randVec(act, 0x0c3u + o);
+        auto g  = randVec(gat, 0x0d4u + o);
+        auto b  = randVec(gat, 0x0e5u + o);
+        auto st = randVec(stt, 0x0f6u + o);
+        std::copy(q.begin(),  q.end(),  Q.begin()  + s*act);
+        std::copy(k.begin(),  k.end(),  K.begin()  + s*act);
+        std::copy(v.begin(),  v.end(),  V.begin()  + s*act);
+        std::copy(g.begin(),  g.end(),  G.begin()  + s*gat);
+        std::copy(b.begin(),  b.end(),  B.begin()  + s*gat);
+        std::copy(st.begin(), st.end(), ST.begin() + s*stt);
+    }
+
+    // Batched: one launch over all nSeq.
+    auto dQ = toDevice(ops, Q); auto dK = toDevice(ops, K); auto dV = toDevice(ops, V);
+    auto dG = toDevice(ops, G); auto dB = toDevice(ops, B); auto dS = toDevice(ops, ST);
+    auto dOut = ops.allocate(nSeq*act*sizeof(float));
+    ops.gatedDeltaNetRecurrentBatchedAsync(
+        static_cast<const float*>(dQ.get()), static_cast<const float*>(dK.get()),
+        static_cast<const float*>(dV.get()), static_cast<const float*>(dG.get()),
+        static_cast<const float*>(dB.get()), static_cast<float*>(dS.get()),
+        static_cast<float*>(dOut.get()), nSeq, T, H, S);
+    ops.flush();
+    auto outB   = fromDevice(ops, dOut.get(), nSeq*act);
+    auto stateB = fromDevice(ops, dS.get(),   nSeq*stt);
+
+    // Reference: each sequence through the single-seq kernel.
+    double maxErr = 0.0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        std::vector<float> q(Q.begin()+s*act, Q.begin()+(s+1)*act);
+        std::vector<float> k(K.begin()+s*act, K.begin()+(s+1)*act);
+        std::vector<float> v(V.begin()+s*act, V.begin()+(s+1)*act);
+        std::vector<float> g(G.begin()+s*gat, G.begin()+(s+1)*gat);
+        std::vector<float> b(B.begin()+s*gat, B.begin()+(s+1)*gat);
+        std::vector<float> st(ST.begin()+s*stt, ST.begin()+(s+1)*stt);
+        auto dq=toDevice(ops,q); auto dk=toDevice(ops,k); auto dv=toDevice(ops,v);
+        auto dg=toDevice(ops,g); auto db=toDevice(ops,b); auto dst=toDevice(ops,st);
+        auto dSingle = ops.allocate(act*sizeof(float));
+        ops.gatedDeltaNetRecurrentAsync(
+            static_cast<const float*>(dq.get()), static_cast<const float*>(dk.get()),
+            static_cast<const float*>(dv.get()), static_cast<const float*>(dg.get()),
+            static_cast<const float*>(db.get()), static_cast<float*>(dst.get()),
+            static_cast<float*>(dSingle.get()), T, H, S);
+        ops.flush();
+        auto outS   = fromDevice(ops, dSingle.get(), act);
+        auto stateS = fromDevice(ops, dst.get(),     stt);
+        for (std::size_t i = 0; i < act; ++i) {
+            maxErr = std::max(maxErr, std::fabs((double)outB[s*act+i] - (double)outS[i]));
+            EXPECT_NEAR(outB[s*act+i], outS[i], 1e-5f);
+        }
+        for (std::size_t i = 0; i < stt; ++i) {
+            maxErr = std::max(maxErr, std::fabs((double)stateB[s*stt+i] - (double)stateS[i]));
+            EXPECT_NEAR(stateB[s*stt+i], stateS[i], 1e-5f);
+        }
+    }
+    std::printf("[gdn-batched-parity] nSeq=%zu T=%zu H=%zu S=%zu maxErr=%.2e\n",
+                nSeq, T, H, S, maxErr);
+}
+
+// M-Cuda.Batch Cat C-P0 — batched ssm_conv1d vs N single-sequence runs.
+// Each sequence has its own conv input (its rolling conv-tail prepended);
+// batched output must be byte-identical to running each sequence alone.
+TEST(cuda_ssm_conv1d_batched_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t nSeq = 3, T = 5, channels = 12, K = 4;
+    const std::size_t inPer  = (K - 1 + T) * channels;   // per-seq conv input
+    const std::size_t outPer = T * channels;             // per-seq output
+
+    auto kernel = randVec(K * channels, 0x3333u);        // shared across seqs
+    std::vector<float> IN(nSeq * inPer);
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        auto in = randVec(inPer, 0x2200u + static_cast<std::uint32_t>(s) * 13u);
+        std::copy(in.begin(), in.end(), IN.begin() + s * inPer);
+    }
+
+    // Batched: one launch over all nSeq.
+    auto dIn  = toDevice(ops, IN);
+    auto dKer = toDevice(ops, kernel);
+    auto dOut = ops.allocate(nSeq * outPer * sizeof(float));
+    ops.causalConv1dSiluBatchedAsync(
+        static_cast<const float*>(dIn.get()),
+        static_cast<const float*>(dKer.get()),
+        static_cast<float*>(dOut.get()), nSeq, T, channels, K);
+    ops.flush();
+    auto outB = fromDevice(ops, dOut.get(), nSeq * outPer);
+
+    // Reference: each sequence through the single-seq kernel.
+    double maxErr = 0.0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        std::vector<float> in(IN.begin() + s * inPer, IN.begin() + (s + 1) * inPer);
+        auto di  = toDevice(ops, in);
+        auto dk  = toDevice(ops, kernel);
+        auto doS = ops.allocate(outPer * sizeof(float));
+        ops.causalConv1dSiluAsync(static_cast<const float*>(di.get()),
+                                  static_cast<const float*>(dk.get()),
+                                  static_cast<float*>(doS.get()), T, channels, K);
+        ops.flush();
+        auto outS = fromDevice(ops, doS.get(), outPer);
+        for (std::size_t i = 0; i < outPer; ++i) {
+            maxErr = std::max(maxErr,
+                std::fabs((double)outB[s*outPer+i] - (double)outS[i]));
+            EXPECT_NEAR(outB[s*outPer+i], outS[i], 1e-5f);
+        }
+    }
+    std::printf("[conv1d-batched-parity] nSeq=%zu T=%zu channels=%zu K=%zu maxErr=%.2e\n",
+                nSeq, T, channels, K, maxErr);
+}
+
+// M-Cuda.Batch Cat B — batched moe_gate_up_fused_k_q4k vs N single-token
+// runs. Each token has its own x and routed experts; batched output must
+// be byte-identical to running each token alone.
+TEST(cuda_moe_gate_up_fused_k_q4k_batched_parity) {
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+    const GgmlType Q4K = GgmlType::Q4_K;
+    if (!gmm.moeGateUpFusedKAvailable(Q4K)) {
+        EXPECT_TRUE(false && "moe_gate_up_fused_k_q4k kernel not loaded");
+        return;
+    }
+
+    const std::size_t nSeq = 3, dModel = 256, nFf = 256, K = 2, nExp = 4;
+    const std::size_t blkBytes  = 144;
+    const std::size_t bytesGate = nFf * (dModel / 256) * blkBytes;
+    const std::size_t blkCount  = nExp * nFf * (dModel / 256);
+
+    auto gateBank = buildQuantBank(ops, blkBytes, blkCount, 0xA1A1u);
+    auto upBank   = buildQuantBank(ops, blkBytes, blkCount, 0xB2B2u);
+
+    // Per-token x and routed experts (distinct experts per token).
+    std::vector<float> Xh(nSeq * dModel);
+    std::vector<std::int32_t> Eh(nSeq * K);
+    const std::int32_t experts[3][2] = {{1, 3}, {0, 2}, {3, 1}};
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        auto xs = randVec(dModel, 0x1100u + static_cast<std::uint32_t>(s) * 17u);
+        std::copy(xs.begin(), xs.end(), Xh.begin() + s * dModel);
+        Eh[s * K + 0] = experts[s][0];
+        Eh[s * K + 1] = experts[s][1];
+    }
+    auto dX = toDevice(ops, Xh);
+    auto dE = uploadRaw(ops, Eh);
+
+    // Batched: one launch over all nSeq tokens.
+    auto gotBuf = ops.allocate(nSeq * K * nFf * sizeof(float));
+    gmm.moeGateUpFusedKBatchedAsync(Q4K, static_cast<const float*>(dX.get()),
+        gateBank.get(), upBank.get(),
+        static_cast<const std::int32_t*>(dE.get()),
+        static_cast<float*>(gotBuf.get()),
+        nSeq, dModel, nFf, K, bytesGate, bytesGate);
+    ops.flush();
+    auto got = fromDevice(ops, gotBuf.get(), nSeq * K * nFf);
+
+    // Reference: each token through the single-token fused kernel.
+    double maxErr = 0.0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        std::vector<float> xs(Xh.begin() + s * dModel, Xh.begin() + (s + 1) * dModel);
+        std::vector<std::int32_t> es(Eh.begin() + s * K, Eh.begin() + (s + 1) * K);
+        auto dxs = toDevice(ops, xs);
+        auto des = uploadRaw(ops, es);
+        auto refBuf = ops.allocate(K * nFf * sizeof(float));
+        gmm.moeGateUpFusedKAsync(Q4K, static_cast<const float*>(dxs.get()),
+            gateBank.get(), upBank.get(),
+            static_cast<const std::int32_t*>(des.get()),
+            static_cast<float*>(refBuf.get()),
+            dModel, nFf, K, bytesGate, bytesGate);
+        ops.flush();
+        auto ref = fromDevice(ops, refBuf.get(), K * nFf);
+        for (std::size_t i = 0; i < K * nFf; ++i) {
+            maxErr = std::max(maxErr,
+                std::fabs((double)got[s * K * nFf + i] - (double)ref[i]));
+            EXPECT_NEAR(got[s * K * nFf + i], ref[i], 1e-5f);
+        }
+    }
+    std::printf("[moe-gu-batched-parity] nSeq=%zu dModel=%zu nFf=%zu K=%zu maxErr=%.2e\n",
+                nSeq, dModel, nFf, K, maxErr);
+}
+
+// M-Cuda.Batch Cat B — batched moe_down_fused_k_q5k vs N single-token runs.
+// Each token has its own gate activations, routed experts, router weights
+// and RMW accumulator; batched output must be byte-identical to per-token.
+TEST(cuda_moe_down_fused_k_q5k_batched_parity) {
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+    const GgmlType Q5K = GgmlType::Q5_K;
+    if (!gmm.moeDownFusedKAvailable(Q5K)) {
+        EXPECT_TRUE(false && "moe_down_fused_k_q5k kernel not loaded");
+        return;
+    }
+
+    const std::size_t nSeq = 3, dModel = 256, nFf = 256, K = 2, nExp = 4;
+    const std::size_t blkBytes  = 176;
+    const std::size_t bytesDown = dModel * (nFf / 256) * blkBytes;
+    const std::size_t blkCount  = nExp * dModel * (nFf / 256);
+    auto downBank = buildQuantBank(ops, blkBytes, blkCount, 0xD0D0u);
+
+    std::vector<float>        GA(nSeq * K * nFf);
+    std::vector<std::int32_t> EI(nSeq * K);
+    std::vector<float>        KW(nSeq * K);
+    const std::int32_t experts[3][2] = {{0, 2}, {1, 3}, {2, 0}};
+    const float        kws[3][2]     = {{0.6f, 0.4f}, {0.7f, 0.3f}, {0.5f, 0.5f}};
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        auto ga = randVec(K * nFf, 0x2200u + static_cast<std::uint32_t>(s) * 19u);
+        std::copy(ga.begin(), ga.end(), GA.begin() + s * K * nFf);
+        for (std::size_t k = 0; k < K; ++k) {
+            EI[s * K + k] = experts[s][k];
+            KW[s * K + k] = kws[s][k];
+        }
+    }
+    auto dGA = toDevice(ops, GA);
+    auto dEI = uploadRaw(ops, EI);
+    auto dKW = uploadRaw(ops, KW);
+
+    // Batched: accum[nSeq, dModel] seeded to 0, one launch.
+    auto gotAcc = ops.allocate(nSeq * dModel * sizeof(float));
+    ops.mulScalarAsync(static_cast<float*>(gotAcc.get()), 0.0f, nSeq * dModel);
+    gmm.moeDownFusedKBatchedAsync(Q5K, static_cast<const float*>(dGA.get()),
+        downBank.get(), static_cast<const std::int32_t*>(dEI.get()),
+        static_cast<const float*>(dKW.get()),
+        static_cast<float*>(gotAcc.get()),
+        nSeq, nFf, dModel, K, bytesDown);
+    ops.flush();
+    auto got = fromDevice(ops, gotAcc.get(), nSeq * dModel);
+
+    // Reference: each token through the single-token fused kernel.
+    double maxErr = 0.0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        std::vector<float> ga(GA.begin() + s * K * nFf, GA.begin() + (s + 1) * K * nFf);
+        std::vector<std::int32_t> ei(EI.begin() + s * K, EI.begin() + (s + 1) * K);
+        std::vector<float> kw(KW.begin() + s * K, KW.begin() + (s + 1) * K);
+        auto dga = toDevice(ops, ga);
+        auto dei = uploadRaw(ops, ei);
+        auto dkw = uploadRaw(ops, kw);
+        auto refAcc = ops.allocate(dModel * sizeof(float));
+        ops.mulScalarAsync(static_cast<float*>(refAcc.get()), 0.0f, dModel);
+        gmm.moeDownFusedKAsync(Q5K, static_cast<const float*>(dga.get()),
+            downBank.get(), static_cast<const std::int32_t*>(dei.get()),
+            static_cast<const float*>(dkw.get()),
+            static_cast<float*>(refAcc.get()),
+            nFf, dModel, K, bytesDown);
+        ops.flush();
+        auto ref = fromDevice(ops, refAcc.get(), dModel);
+        for (std::size_t i = 0; i < dModel; ++i) {
+            maxErr = std::max(maxErr,
+                std::fabs((double)got[s * dModel + i] - (double)ref[i]));
+            EXPECT_NEAR(got[s * dModel + i], ref[i], 1e-5f);
+        }
+    }
+    std::printf("[moe-down-batched-parity] nSeq=%zu dModel=%zu nFf=%zu K=%zu maxErr=%.2e\n",
+                nSeq, dModel, nFf, K, maxErr);
+}
+
+// M-Cuda.Batch Cat B — batched rope_mrope vs N single-sequence runs. Each
+// sequence has its own x region and start position; batched result must be
+// byte-identical to running each sequence alone. (Provisional Cat-B x
+// layout: seq s at xBase + s*xSeqStride, settled in Phase D.)
+TEST(cuda_rope_mrope_batched_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t nSeq = 3, seqLen = 1, numHeads = 4, headDim = 16;
+    const std::size_t writeStride = numHeads * headDim;   // one token slot
+    const std::size_t xSeqStride  = 8 * writeStride;      // holds startPos < 8
+    const float base = 1000000.0f;
+    const std::int32_t sections[4] = {2, 2, 2, 2};
+    const std::int32_t startPos[3] = {2, 5, 0};
+
+    std::vector<float> X(nSeq * xSeqStride);
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        auto xs = randVec(xSeqStride, 0x7700u + static_cast<std::uint32_t>(s) * 23u);
+        std::copy(xs.begin(), xs.end(), X.begin() + s * xSeqStride);
+    }
+
+    // Batched: one launch over all nSeq (per-seq startPos device array).
+    auto dX = toDevice(ops, X);
+    std::vector<std::int32_t> sp(startPos, startPos + nSeq);
+    auto dSp = uploadRaw(ops, sp);
+    ops.mropeInPlaceBatchedAsync(dX.get(), nSeq, xSeqStride, seqLen, numHeads,
+                                 headDim,
+                                 static_cast<const std::int32_t*>(dSp.get()),
+                                 base, sections, writeStride);
+    ops.flush();
+    auto gotAll = fromDevice(ops, dX.get(), nSeq * xSeqStride);
+
+    // Reference: each sequence through the single-seq kernel on its own copy.
+    double maxErr = 0.0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        std::vector<float> xs(X.begin() + s * xSeqStride, X.begin() + (s + 1) * xSeqStride);
+        auto dxs = toDevice(ops, xs);
+        ops.mropeInPlaceAsync(dxs.get(), seqLen, numHeads, headDim,
+                              static_cast<std::size_t>(startPos[s]), base,
+                              sections, writeStride);
+        ops.flush();
+        auto refSeg = fromDevice(ops, dxs.get(), xSeqStride);
+        for (std::size_t i = 0; i < xSeqStride; ++i) {
+            maxErr = std::max(maxErr,
+                std::fabs((double)gotAll[s * xSeqStride + i] - (double)refSeg[i]));
+            EXPECT_NEAR(gotAll[s * xSeqStride + i], refSeg[i], 1e-5f);
+        }
+    }
+    std::printf("[rope-mrope-batched-parity] nSeq=%zu numHeads=%zu headDim=%zu maxErr=%.2e\n",
+                nSeq, numHeads, headDim, maxErr);
 }
 
 int main() {

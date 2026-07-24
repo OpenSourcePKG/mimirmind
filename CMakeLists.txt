@@ -684,9 +684,11 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/matmul_q8_0_vec_dp4a.cu
         kernels_cuda/matmul_q8_0_vec_reorder.cu
         kernels_cuda/moe_down_fused_k_q5k.cu
+        kernels_cuda/moe_down_fused_k_q5k_batched.cu
         kernels_cuda/moe_down_fused_k_q6k.cu
         kernels_cuda/moe_down_fused_k_q8_0.cu
         kernels_cuda/moe_gate_up_fused_k_q4k.cu
+        kernels_cuda/moe_gate_up_fused_k_q4k_batched.cu
         kernels_cuda/ffn_gate_up_fused_q8_0.cu
         kernels_cuda/mul_scalar.cu
         kernels_cuda/qkv_split.cu
@@ -698,11 +700,14 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/rmsnorm_qkv_fp16.cu
         kernels_cuda/rope_inplace.cu
         kernels_cuda/rope_mrope.cu
+        kernels_cuda/rope_mrope_batched.cu
         kernels_cuda/split_head_pair.cu
         kernels_cuda/sigmoid_gate_mul.cu
         kernels_cuda/l2_norm.cu
         kernels_cuda/ssm_conv1d.cu
+        kernels_cuda/ssm_conv1d_batched.cu
         kernels_cuda/gated_deltanet_ar.cu
+        kernels_cuda/gated_deltanet_ar_batched.cu
         kernels_cuda/deltanet_gate.cu
         kernels_cuda/deltanet_chunk_cumgate.cu
         kernels_cuda/deltanet_chunk_forward.cu

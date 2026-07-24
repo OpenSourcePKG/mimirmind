@@ -128,6 +128,16 @@ public:
                            const std::int32_t* sections,
                            std::size_t writeOffsetStride = 0,
                            runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
+    // M-Cuda.Batch Cat B: batched IMRoPE — nSeq sequences, each with its
+    // own x region (xSeqStride) and start position (startPosDev[nSeq]), in
+    // one launch. CUDA-only, parity-gated. x layout provisional (Phase D).
+    void mropeInPlaceBatchedAsync(void* xBase, std::size_t nSeq,
+                                  std::size_t xSeqStride, std::size_t seqLen,
+                                  std::size_t numHeads, std::size_t headDim,
+                                  const std::int32_t* startPosDev, float base,
+                                  const std::int32_t* sections,
+                                  std::size_t writeOffsetStride = 0,
+                                  runtime::KvDtype kvDtype = runtime::KvDtype::F32);
 
     void splitHeadPairAsync(const float* src, float* a, float* b,
                             std::size_t seqLen, std::size_t numHeads,
@@ -141,11 +151,28 @@ public:
     void causalConv1dSiluAsync(const float* convInput, const float* kernel,
                                float* out, std::size_t T, std::size_t channels,
                                std::size_t kernelSize) override;
+    // M-Cuda.Batch Cat C-P0: batched variant — nSeq independent sequences,
+    // each with its own conv input (caller prepends the per-sequence conv
+    // tail), in one launch. CUDA-only (parity-gated before wiring).
+    void causalConv1dSiluBatchedAsync(const float* convInput,
+                                      const float* kernel, float* out,
+                                      std::size_t nSeq, std::size_t T,
+                                      std::size_t channels,
+                                      std::size_t kernelSize);
     void gatedDeltaNetRecurrentAsync(const float* q, const float* k,
                                      const float* v, const float* gLog,
                                      const float* beta, float* state,
                                      float* out, std::size_t T, std::size_t H,
                                      std::size_t S) override;
+    // M-Cuda.Batch Cat C-P0: batched-state variant. nSeq independent
+    // sequences, each with its own [H,S,S] state, in one launch. CUDA-only
+    // (not in the ComputeOps interface yet; parity-gated before wiring).
+    void gatedDeltaNetRecurrentBatchedAsync(const float* q, const float* k,
+                                            const float* v, const float* gLog,
+                                            const float* beta, float* state,
+                                            float* out, std::size_t nSeq,
+                                            std::size_t T, std::size_t H,
+                                            std::size_t S);
     void deltanetGateAsync(const float* alpha, const float* ssmA,
                            const float* ssmDt, float* gLog,
                            std::size_t T, std::size_t H) override;
