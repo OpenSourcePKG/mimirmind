@@ -19,7 +19,8 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
                                bool                    withFusedQkv,
                                bool                    withKvFp32Scratch,
                                bool                    withQGate,
-                               bool                    withSsm) {
+                               bool                    withSsm,
+                               bool                    perSeqConvInput) {
     BlockBuffers b{};
     b.maxT    = maxT;
     b.maxSeq  = maxSeq;
@@ -88,7 +89,16 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         const std::size_t f = sizeof(float);
 
         b.ssmQkvMixed  = ops.allocate(maxT * convDim * f);
-        b.ssmConvInput = ops.allocate(((dConv > 0 ? dConv - 1 : 0) + maxT) * convDim * f);
+        // Single-session prefill concatenates conv_state (d_conv-1 rows) with
+        // the T prompt rows of ONE sequence: [(d_conv-1)+maxT, conv_dim]. The
+        // batched serving path instead needs a private [d_conv, conv_dim]
+        // concat per sequence (nSeq == maxT), i.e. maxT*d_conv rows — see
+        // runLinearBlockBatched. maxT*d_conv >= (d_conv-1)+maxT always, so the
+        // serving sizing is a strict superset.
+        const std::size_t convRows =
+            perSeqConvInput ? maxT * (dConv > 0 ? dConv : 1)
+                            : (dConv > 0 ? dConv - 1 : 0) + maxT;
+        b.ssmConvInput = ops.allocate(convRows * convDim * f);
         b.ssmZ         = ops.allocate(maxT * valueDim * f);
         b.ssmQ         = ops.allocate(maxT * valueDim * f);
         b.ssmK         = ops.allocate(maxT * valueDim * f);

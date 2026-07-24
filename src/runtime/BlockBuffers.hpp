@@ -151,6 +151,7 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
                                bool                    withFusedQkv      = false,
                                bool                    withKvFp32Scratch = false,
                                bool                    withQGate         = false,
-                               bool                    withSsm           = false);
+                               bool                    withSsm           = false,
+                               bool                    perSeqConvInput   = false);
 
 } // namespace mimirmind::runtime
