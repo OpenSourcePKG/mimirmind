@@ -310,6 +310,23 @@ public:
      */
     void commitVerified(std::span<const std::int32_t> acceptedTokens);
 
+    /**
+     * M-Cuda.Batch D2d — batched serving-path validation harness. Runs the
+     * qwen35moe batched decode blocks (runBlockBatched) over `nSeq`
+     * sequences that are all fed the SAME prompt, greedily generating
+     * `maxNew` tokens each. Uses a self-contained contiguous-block PagedKvPool
+     * (no scheduler — that is D2e) and feeds every token one at a time
+     * through the T=1 batched path (so no separate prefill / state handoff).
+     *
+     * Returns one token stream per sequence. For identical prompts every
+     * stream must be identical, and stream 0 must match single-session
+     * greedy generate() — the end-to-end parity gate for the batched blocks.
+     * CUDA + qwen35moe only; throws otherwise.
+     */
+    [[nodiscard]] std::vector<std::vector<std::int32_t>>
+    generateServingParity(std::span<const std::int32_t> promptIds,
+                          std::size_t nSeq, std::size_t maxNew);
+
     /// Number of token ids currently cached (i.e. how long an exact
     /// prefix the next request could potentially skip-prefill).
     [[nodiscard]] std::size_t cachedTokenCount() const noexcept {

@@ -20,6 +20,8 @@
 #include "runtime/thermal/SystemMonitor.hpp"
 #include "runtime/thermal/ThermalGuard.hpp"
 #include "runtime/arch/ArchBackend.hpp"
+#include "runtime/arch/Qwen35MoeBackend.hpp"
+#include "runtime/serving/PagedKvPool.hpp"
 
 #ifdef MIMIRMIND_HAVE_HIP
 #include "compute/hip/GpuMatmul.hpp"
@@ -1879,6 +1881,175 @@ void InferenceEngine::commitVerified(
     _kvCache->commit(acceptedTokens.size());
     _cachedTokens.insert(_cachedTokens.end(),
                          acceptedTokens.begin(), acceptedTokens.end());
+}
+
+std::vector<std::vector<std::int32_t>>
+InferenceEngine::generateServingParity(std::span<const std::int32_t> promptIds,
+                                       std::size_t nSeq, std::size_t maxNew) {
+    namespace cmp = mimirmind::compute;
+
+    if (_backend == nullptr) {
+        throw std::runtime_error("generateServingParity: no model loaded");
+    }
+    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_backend.get());
+    if (qb == nullptr) {
+        throw std::runtime_error(
+            "generateServingParity: batched serving only supports qwen35moe");
+    }
+    if (nSeq == 0 || promptIds.empty() || maxNew == 0) {
+        throw std::runtime_error("generateServingParity: empty request");
+    }
+
+    const auto* tokEmb  = _weights->find("token_embd.weight");
+    const auto* outNorm = _weights->find("output_norm.weight");
+    const auto* lmHead  = _weights->find("output.weight");
+    if (lmHead == nullptr) {
+        lmHead = tokEmb;
+    }
+    if (tokEmb == nullptr || outNorm == nullptr || lmHead == nullptr) {
+        throw std::runtime_error("generateServingParity: embed/norm/lm_head missing");
+    }
+
+    const std::size_t d_model   = _config.embeddingLength;
+    const std::size_t vocab_lm  = lmHead->dimensions.size() >= 2
+                                      ? lmHead->dimensions[1] : _tokenizer.vocabSize();
+    const std::size_t vocab_emb = tokEmb->dimensions.size() >= 2
+                                      ? tokEmb->dimensions[1] : _tokenizer.vocabSize();
+    const std::size_t Tp        = promptIds.size();
+    const std::size_t total     = Tp + maxNew;
+
+    const std::size_t nKvHeads   = _config.headCountKv;
+    const std::size_t headDim    = _config.headDim();
+    const std::size_t K          = _config.expertUsedCount;
+    const std::size_t blockCount = _config.blockCount;
+    std::size_t nFullAttn = 0;
+    for (std::size_t b = 0; b < blockCount; ++b) {
+        if (!_config.isRecurrentLayer(b)) ++nFullAttn;
+    }
+
+    // Paged pool with contiguous blocks per sequence (validation harness —
+    // the production scheduler + PagedKvSequence is D2e).
+    const std::size_t blockSize    = 16;
+    const std::size_t blocksPerSeq = (total + blockSize - 1) / blockSize;
+    const std::size_t numBlocks    = nSeq * blocksPerSeq;
+    serving::PagedKvPool pool(*_ops, nFullAttn, numBlocks, blockSize,
+                              nKvHeads, headDim);
+
+    SsmState ssm(*_ops, blockCount, _config.ssmStateElemsPerLayer(),
+                 _config.ssmConvStateElemsPerLayer(), nSeq);
+
+    const auto qkv = qb->maxQKVDims();
+    BlockBuffers sb = allocBlockBuffers(*_ops, _config, /*maxT=*/nSeq,
+                                        /*maxSeq=*/nSeq, qkv.first, qkv.second,
+                                        /*withFusedQkv=*/false,
+                                        /*withKvFp32Scratch=*/true,
+                                        /*withQGate=*/true, /*withSsm=*/true,
+                                        /*perSeqConvInput=*/true);
+    sb.ssmStatePtr     = ssm.statePtr();
+    sb.ssmConvStatePtr = ssm.convStatePtr();
+
+    auto expIdxBuf = _ops->allocate(nSeq * K * sizeof(std::int32_t));
+    auto kwBuf     = _ops->allocate(nSeq * K * sizeof(float));
+
+    std::vector<std::int32_t> blockTablesH(nSeq * blocksPerSeq);
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        for (std::size_t i = 0; i < blocksPerSeq; ++i) {
+            blockTablesH[s * blocksPerSeq + i] =
+                static_cast<std::int32_t>(s * blocksPerSeq + i);
+        }
+    }
+    auto blockTablesDev = _ops->allocate(blockTablesH.size() * sizeof(std::int32_t));
+    _ops->uploadHostBytes(blockTablesDev.get(), blockTablesH.data(),
+                          blockTablesH.size() * sizeof(std::int32_t));
+    auto seqLensDev  = _ops->allocate(nSeq * sizeof(std::int32_t));
+    auto startPosDev = _ops->allocate(nSeq * sizeof(std::int32_t));
+
+    auto xBufB   = _ops->allocate(nSeq * d_model  * sizeof(float));
+    auto normB   = _ops->allocate(nSeq * d_model  * sizeof(float));
+    auto logitsB = _ops->allocate(nSeq * vocab_lm * sizeof(float));
+    auto lmScr   = _ops->allocate(std::max(d_model, vocab_lm) * sizeof(float));
+    float* const xBuf   = xBufB.as<float>();
+    float* const normBuf= normB.as<float>();
+    float* const logits = logitsB.as<float>();
+
+    std::vector<std::uint32_t> writeBlockId(nSeq);
+    std::vector<std::int32_t>  writeSlot(nSeq);
+    std::vector<std::int32_t>  seqLensH(nSeq);
+    std::vector<std::int32_t>  startPosH(nSeq);
+    std::vector<std::uint8_t>  isSeqStart(nSeq);
+    std::vector<std::int32_t>  inputTok(nSeq);
+    std::vector<std::vector<std::int32_t>> out(nSeq);
+
+    auto stepForward = [&](std::size_t p) {
+        cmp::embeddingLookup(tokEmb->type, tokEmb->usmPtr, d_model, vocab_emb,
+                             std::span<const std::int32_t>{inputTok.data(), nSeq},
+                             xBuf);
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            writeBlockId[s] = static_cast<std::uint32_t>(s * blocksPerSeq + p / blockSize);
+            writeSlot[s]    = static_cast<std::int32_t>(p % blockSize);
+            seqLensH[s]     = static_cast<std::int32_t>(p + 1);
+            startPosH[s]    = static_cast<std::int32_t>(p);
+            isSeqStart[s]   = (p == 0) ? 1U : 0U;
+        }
+        _ops->uploadHostBytes(seqLensDev.get(),  seqLensH.data(),  nSeq * sizeof(std::int32_t));
+        _ops->uploadHostBytes(startPosDev.get(), startPosH.data(), nSeq * sizeof(std::int32_t));
+
+        arch::BatchedDecodeCtx ctx{};
+        ctx.nSeq            = nSeq;
+        ctx.pool            = &pool;
+        ctx.writeBlockId    = writeBlockId.data();
+        ctx.writeSlot       = writeSlot.data();
+        ctx.blockTablesDev  = static_cast<const std::int32_t*>(blockTablesDev.get());
+        ctx.seqLensDev      = static_cast<const std::int32_t*>(seqLensDev.get());
+        ctx.maxBlocksPerSeq = blocksPerSeq;
+        ctx.startPosDev     = static_cast<const std::int32_t*>(startPosDev.get());
+        ctx.expIdxSlot      = expIdxBuf.as<std::int32_t>();
+        ctx.kwSlot          = kwBuf.as<float>();
+        ctx.isSeqStart      = isSeqStart.data();
+
+        for (std::size_t b = 0; b < blockCount; ++b) {
+            qb->runBlockBatched(b, xBuf, ctx, sb);
+        }
+    };
+
+    auto lmHeadSample = [&]() {
+        _ops->rmsNormAsync(xBuf, nSeq, d_model,
+                           static_cast<const float*>(outNorm->usmPtr),
+                           _config.rmsNormEps, normBuf);
+        _gmm->matmul(lmHead->type, lmHead->usmPtr, vocab_lm, d_model,
+                     normBuf, nSeq, logits, lmScr.as<float>());
+        _ops->flush();
+        std::vector<float> host(nSeq * vocab_lm);
+        _ops->readbackToHost(host.data(), logits, nSeq * vocab_lm * sizeof(float));
+        std::vector<std::int32_t> toks(nSeq);
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            const float* row = host.data() + s * vocab_lm;
+            std::size_t best = 0;
+            float bv = row[0];
+            for (std::size_t v = 1; v < vocab_lm; ++v) {
+                if (row[v] > bv) { bv = row[v]; best = v; }
+            }
+            toks[s] = static_cast<std::int32_t>(best);
+        }
+        return toks;
+    };
+
+    // Feed the prompt one token at a time (positions 0..Tp-1).
+    for (std::size_t p = 0; p < Tp; ++p) {
+        for (std::size_t s = 0; s < nSeq; ++s) inputTok[s] = promptIds[p];
+        stepForward(p);
+    }
+    std::vector<std::int32_t> nextToks = lmHeadSample();
+    for (std::size_t s = 0; s < nSeq; ++s) out[s].push_back(nextToks[s]);
+
+    // Greedy decode the remaining tokens (positions Tp, Tp+1, ...).
+    for (std::size_t g = 1; g < maxNew; ++g) {
+        for (std::size_t s = 0; s < nSeq; ++s) inputTok[s] = nextToks[s];
+        stepForward(Tp - 1 + g);
+        nextToks = lmHeadSample();
+        for (std::size_t s = 0; s < nSeq; ++s) out[s].push_back(nextToks[s]);
+    }
+    return out;
 }
 
 } // namespace mimirmind::runtime
