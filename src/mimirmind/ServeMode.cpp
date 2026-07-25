@@ -19,6 +19,7 @@
 #include "core/os/GovernorLock.hpp"
 #include "model/Tokenizer.hpp"
 #include "runtime/InferenceEngine.hpp"
+#include "runtime/serving/ContinuousBatcher.hpp"
 #include "runtime/nvfp4/ModelFormatResolver.hpp"
 #include "runtime/perf/PerfRegressionDetector.hpp"
 #include "runtime/spec/Drafter.hpp"
@@ -549,6 +550,78 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                 std::cout << "\n";
             }
             std::cout << "  => serving-loop " << (allOk ? "PASS" : "CHECK")
+                      << "\n";
+            std::cout.flush();
+            return 0;
+        }
+
+        // M-Cuda.Batch D2e.2 — threaded ContinuousBatcher end-to-end test.
+        // With MIMIRMIND_BATCHER_TEST set, submit MORE requests than there
+        // are slots so later ones must reuse freed slots, then verify each
+        // stream == its single-seq greedy generate(). Exercises the worker
+        // thread + admit/complete/slot-reuse path the HTTP server uses.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_BATCHER_TEST") != nullptr) {
+            const auto& tok = e->tokenizer();
+            const char* prompts[] = {
+                "The capital of France is",
+                "Once upon a time",
+                "2 plus 2 equals",
+                "The sky is",
+                "In the beginning",
+            };
+            const std::size_t nReq  = 5;
+            const std::size_t maxNew = 8;
+            std::vector<std::vector<std::int32_t>> pids(nReq);
+            std::size_t maxLen = 0;
+            for (std::size_t r = 0; r < nReq; ++r) {
+                pids[r] = tok.encode(prompts[r], /*addBos=*/false);
+                if (pids[r].empty()) pids[r].push_back(1);
+                maxLen = std::max(maxLen, pids[r].size());
+            }
+            // References first (before the batcher builds serving state), so
+            // the single-session KV/SSM path is untouched by the batcher.
+            std::vector<std::vector<std::int32_t>> refs(nReq);
+            for (std::size_t r = 0; r < nReq; ++r) {
+                ::mimirmind::runtime::GenerateParams gpr{};
+                gpr.maxNewTokens         = maxNew;
+                gpr.sampling.temperature = 0.0F;
+                e->resetCache();
+                refs[r] = e->generate(pids[r], gpr, {}, nullptr, {}, {});
+            }
+
+            const std::size_t maxBatch   = 3;   // < nReq => forces slot reuse
+            const std::size_t maxContext = maxLen + maxNew + 8;
+            ::mimirmind::runtime::serving::ContinuousBatcher batcher(
+                *e, maxBatch, maxContext, /*eosId=*/-1);
+
+            std::vector<std::shared_ptr<
+                ::mimirmind::runtime::serving::ServingRequest>> handles(nReq);
+            for (std::size_t r = 0; r < nReq; ++r) {
+                handles[r] = batcher.submit(pids[r], maxNew, {});
+            }
+            std::cout << "\n[M-Cuda.Batch D2e.2 batcher-test] " << nReq
+                      << " requests, maxBatch=" << maxBatch
+                      << " (slot reuse), maxNew=" << maxNew << "\n";
+            bool allOk = true;
+            for (std::size_t r = 0; r < nReq; ++r) {
+                std::vector<std::int32_t> out = handles[r]->waitAll();
+                std::size_t ml = 0;
+                const std::size_t cn = std::min(out.size(), refs[r].size());
+                for (; ml < cn; ++ml) if (out[ml] != refs[r][ml]) break;
+                const bool ok = (ml == refs[r].size() &&
+                                 out.size() == refs[r].size() &&
+                                 handles[r]->error.empty());
+                allOk = allOk && ok;
+                std::cout << "  req[" << r << "] match=" << ml << "/"
+                          << refs[r].size() << (ok ? " OK" : " MISMATCH");
+                if (!handles[r]->error.empty())
+                    std::cout << " err=" << handles[r]->error;
+                std::cout << "  out:";
+                for (auto t : out) std::cout << ' ' << t;
+                std::cout << "\n";
+            }
+            std::cout << "  => batcher-test " << (allOk ? "PASS" : "CHECK")
                       << "\n";
             std::cout.flush();
             return 0;
