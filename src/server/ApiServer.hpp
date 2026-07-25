@@ -15,6 +15,9 @@ namespace mimirmind::runtime {
 class Drafter;
 class InferenceEngine;
 }
+namespace mimirmind::runtime::serving {
+class ContinuousBatcher;
+}
 
 namespace mimirmind::server {
 
@@ -75,6 +78,14 @@ struct ServerConfig {
     /// engine, spec-dec stays off with a warning (target-on-extra is
     /// not wired yet).
     std::string speculativeTargetId{};
+
+    /// M-Cuda.Batch D2e.2 — continuous-batching worker for the DEFAULT
+    /// engine (serving-class). Non-owning; the caller keeps it alive for
+    /// the server's lifetime. When set, chat requests that resolve to the
+    /// default engine are serviced through the batcher (multi-tenant
+    /// continuous batching) instead of the serialised single-session
+    /// generate() path. nullptr => classic per-engine-mutex generate().
+    runtime::serving::ContinuousBatcher* batcher{nullptr};
 };
 
 /**

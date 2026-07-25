@@ -563,15 +563,23 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         if (arch == "qwen35moe" &&
             std::getenv("MIMIRMIND_BATCHER_TEST") != nullptr) {
             const auto& tok = e->tokenizer();
+            // Include LONG prompts (>16 tokens => cross paged-KV block
+            // boundaries, blockSize=16) so the block-table walk in the
+            // batched paged path is exercised, plus short ones for slot
+            // reuse. Each stream must still equal single-seq generate().
             const char* prompts[] = {
                 "The capital of France is",
-                "Once upon a time",
+                "Once upon a time in a small village nestled deep between two "
+                "great mountains, there lived an old clockmaker who believed "
+                "that every second carried a secret worth keeping, and so he",
                 "2 plus 2 equals",
-                "The sky is",
+                "Write a detailed explanation of how photosynthesis converts "
+                "sunlight, water and carbon dioxide into glucose and oxygen "
+                "inside the chloroplasts of a green plant leaf, step by step:",
                 "In the beginning",
             };
             const std::size_t nReq  = 5;
-            const std::size_t maxNew = 8;
+            const std::size_t maxNew = 12;
             std::vector<std::vector<std::int32_t>> pids(nReq);
             std::size_t maxLen = 0;
             for (std::size_t r = 0; r < nReq; ++r) {
@@ -613,7 +621,8 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                                  out.size() == refs[r].size() &&
                                  handles[r]->error.empty());
                 allOk = allOk && ok;
-                std::cout << "  req[" << r << "] match=" << ml << "/"
+                std::cout << "  req[" << r << "] promptLen=" << pids[r].size()
+                          << " match=" << ml << "/"
                           << refs[r].size() << (ok ? " OK" : " MISMATCH");
                 if (!handles[r]->error.empty())
                     std::cout << " err=" << handles[r]->error;
@@ -1167,6 +1176,37 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         if (auto* p = engine.powerMonitor())            e->setPowerMonitor(p);
         if (auto* d = engine.perfRegressionDetector()) e->setPerfRegressionDetector(d);
         if (auto* fc = engine.fanController())          e->setFanController(fc);
+    }
+
+    // M-Cuda.Batch D2e.2 — continuous-batching worker for the default
+    // (serving-class) engine. Built only for qwen35moe once the startup
+    // BatchCapacityProbe has recommended serving-class (sustainableBatch
+    // >= min). Requests to the default engine are then serviced through the
+    // batcher's worker thread (multi-tenant continuous batching) rather than
+    // the serialised single-session generate() path. Kept alive for the
+    // whole server.run() below; its dtor joins the worker on shutdown.
+    std::unique_ptr<::mimirmind::runtime::serving::ContinuousBatcher> batcher;
+    if (engine.config().architecture == "qwen35moe" &&
+        engine.servingClassEnabled()) {
+        const std::size_t maxBatch =
+            std::max<std::size_t>(1, engine.batchCapacity().sustainableBatch);
+        const std::size_t maxContext = engine.maxContextTokens();
+        try {
+            batcher = std::make_unique<
+                ::mimirmind::runtime::serving::ContinuousBatcher>(
+                engine, maxBatch, maxContext, engine.tokenizer().eosId());
+            scfg.batcher = batcher.get();
+            MM_LOG_INFO("main",
+                        "serve: continuous batcher ENABLED for default engine "
+                        "'{}' (maxBatch={} maxContext={})",
+                        defaultId, maxBatch, maxContext);
+        } catch (const std::exception& e) {
+            MM_LOG_WARN("main",
+                        "serve: continuous batcher init failed ({}); falling "
+                        "back to single-session generate()", e.what());
+            batcher.reset();
+            scfg.batcher = nullptr;
+        }
     }
 
     ::mimirmind::server::ApiServer server{std::move(loadedEngines), scfg,

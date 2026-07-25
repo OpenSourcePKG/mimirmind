@@ -86,6 +86,11 @@ public:
                                            std::size_t               maxNew,
                                            std::vector<std::int32_t> stopIds);
 
+    /// Request early termination (e.g. the streaming client disconnected).
+    /// The worker retires the request at the next iteration and frees its
+    /// slot; already-produced tokens stay in the handle. Idempotent.
+    void cancel(const std::shared_ptr<ServingRequest>& req);
+
     [[nodiscard]] std::size_t maxBatch()   const noexcept { return _maxBatch; }
     [[nodiscard]] std::size_t maxContext() const noexcept { return _maxContext; }
 

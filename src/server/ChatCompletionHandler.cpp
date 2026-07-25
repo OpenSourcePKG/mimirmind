@@ -13,6 +13,7 @@
 #include "model/ResponseCleaner.hpp"
 #include "model/Tokenizer.hpp"
 #include "core/log/Log.hpp"
+#include "runtime/serving/ContinuousBatcher.hpp"
 #include "runtime/spec/SpeculativeDecoder.hpp"
 #include "runtime/thermal/ThermalGuard.hpp"
 
@@ -20,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -28,6 +30,43 @@
 namespace mimirmind::server {
 
 using nlohmann::json;
+
+namespace {
+
+/// Drive one request through the ContinuousBatcher, mirroring the callback
+/// contract of InferenceEngine::generate() so the existing response
+/// formatting can be reused verbatim. Submits the prompt, then delivers
+/// each generated token to `onToken` in order; if `onToken` returns false
+/// (client gone) the request is cancelled. Returns the full generated
+/// stream (including any trailing stop token — the caller strips it, as it
+/// does for generate()). M-Cuda.Batch D2e.2.
+std::vector<std::int32_t> runViaBatcher(
+        runtime::serving::ContinuousBatcher&      batcher,
+        std::vector<std::int32_t>                 promptIds,
+        const runtime::GenerateParams&            params,
+        std::vector<std::int32_t>                 stopIds,
+        const std::function<bool(std::int32_t)>&  onToken) {
+    auto req = batcher.submit(std::move(promptIds), params.maxNewTokens,
+                              std::move(stopIds));
+    std::vector<std::int32_t> out;
+    std::size_t  next = 0;
+    std::int32_t t    = 0;
+    bool aborted = false;
+    while (req->waitToken(next, t)) {
+        out.push_back(t);
+        ++next;
+        if (onToken && !onToken(t)) { aborted = true; break; }
+    }
+    if (aborted) {
+        batcher.cancel(req);
+    }
+    if (!req->error.empty()) {
+        throw std::runtime_error(req->error);
+    }
+    return out;
+}
+
+} // namespace
 
 ChatCompletionHandler::ChatCompletionHandler(RequestDispatcher&        dispatcher,
                                               RequestTracker&           tracker,
@@ -210,7 +249,26 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         return true;
     };
 
-    {
+    // M-Cuda.Batch D2e.2 — when a continuous batcher is wired for the
+    // default (serving-class) engine, requests to it are serviced by the
+    // batcher's worker thread (multi-tenant continuous batching) instead of
+    // the per-engine-mutex single-session generate(). The batcher owns the
+    // engine's serving state + GPU stream, so this path must NOT also take
+    // the engine mutex or call generate() concurrently.
+    const bool useBatcher =
+        (_cfg.batcher != nullptr &&
+         target->engine == &_dispatcher.defaultEngine());
+    if (useBatcher) {
+        try {
+            generated = runViaBatcher(*_cfg.batcher, promptIds, params,
+                                      stopIds, onToken);
+        } catch (const std::exception& e) {
+            MM_LOG_ERROR("server", "batcher generate failed: {}", e.what());
+            sendError(res, 500, "server_error",
+                      std::string{"generate: "} + e.what());
+            return;
+        }
+    } else {
         // Per-target mutex — requests to different models run in
         // parallel; requests to the same model serialise on its own
         // engine's mutable scratch + sampler state.
@@ -559,7 +617,24 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                            state->params.maxNewTokens,
                            /*streaming=*/true);
             RequestTracker::Guard requestGuard{&_tracker, state->respId};
-            {
+            // M-Cuda.Batch D2e.2 — batcher-serviced streaming for the
+            // default (serving-class) engine. The batcher drives onToken per
+            // decoded token exactly like generate(); it has no prefill-phase
+            // callbacks, so a streaming client just sees decode deltas (no
+            // prefill_done / prefill_progress events on this path). onToken
+            // returning false (client gone) cancels the batcher request.
+            const bool useBatcher =
+                (this->_cfg.batcher != nullptr &&
+                 targetEngine == &this->_dispatcher.defaultEngine());
+            if (useBatcher) {
+                try {
+                    generated = runViaBatcher(*this->_cfg.batcher,
+                                              state->promptIds, state->params,
+                                              state->stopIds, onToken);
+                } catch (const std::exception& e) {
+                    errorMessage = e.what();
+                }
+            } else {
                 std::lock_guard<std::mutex> lk{*targetMutex};
                 try {
                     if (targetSpec != nullptr) {

@@ -97,6 +97,15 @@ std::shared_ptr<ServingRequest> ContinuousBatcher::submit(
     return req;
 }
 
+void ContinuousBatcher::cancel(const std::shared_ptr<ServingRequest>& req) {
+    if (!req) return;
+    std::lock_guard<std::mutex> rl(req->mtx);
+    req->cancelled = true;
+    // The worker checks `cancelled` each iteration; wake it in case it is
+    // idle-waiting (no active slots) so a still-queued request is retired.
+    _cv.notify_all();
+}
+
 void ContinuousBatcher::workerLoop() {
     using Step = InferenceEngine::ServingSlotStep;
 
@@ -207,6 +216,22 @@ void ContinuousBatcher::workerLoop() {
             for (std::size_t i = 0; i < nActive; ++i) {
                 if (!_slots[i].occupied) continue;
                 Slot& s = _slots[i];
+
+                // Client-requested cancellation: retire + free immediately.
+                bool cancelled = false;
+                {
+                    std::lock_guard<std::mutex> rl(s.req->mtx);
+                    cancelled = s.req->cancelled;
+                }
+                if (cancelled) {
+                    finish(s.req, "");
+                    s.occupied = false;
+                    s.req.reset();
+                    s.prompt.clear();
+                    freedSlot = true;
+                    continue;
+                }
+
                 const bool isGen = (s.pos + 1 >= s.promptLen);
                 if (isGen) {
                     const std::int32_t t = toks[i];
