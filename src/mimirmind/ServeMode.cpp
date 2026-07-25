@@ -101,7 +101,8 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     // ownership — skip the flock so a parity check can run alongside a
     // live serve worker (subject to host memory).
     const bool servingParity =
-        std::getenv("MIMIRMIND_SERVING_PARITY") != nullptr;
+        std::getenv("MIMIRMIND_SERVING_PARITY") != nullptr ||
+        std::getenv("MIMIRMIND_BATCH_BENCH") != nullptr;
     if (!attachedMode && !servingParity) {
         auto lk = ::mimirmind::core::os::GovernorLock::tryAcquire();
         if (!lk) {
@@ -280,12 +281,32 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             const auto& tok = e->tokenizer();
             auto base = tok.encode("The capital of France is", /*addBos=*/false);
             if (base.empty()) base.push_back(1);
-            const std::size_t maxNew    = 32;
+            const bool quick = std::getenv("MIMIRMIND_BENCH_QUICK") != nullptr;
+            const std::size_t maxNew    = quick ? 4 : 32;
             const std::size_t promptLen = base.size();
+            const std::vector<std::size_t> batchSizes =
+                quick ? std::vector<std::size_t>{1}
+                      : std::vector<std::size_t>{1, 4, 8, 16};
             std::cout << "\n[M-Cuda.Batch D2e bench] promptLen=" << promptLen
                       << " maxNew=" << maxNew << "\n";
-            for (std::size_t nSeq : {std::size_t{1}, std::size_t{4},
-                                     std::size_t{8}, std::size_t{16}}) {
+            // Single-session baseline on THIS box+model (apples-to-apples).
+            {
+                ::mimirmind::runtime::GenerateParams gpb{};
+                gpb.maxNewTokens         = maxNew;
+                gpb.sampling.temperature = 0.0F;
+                e->resetCache();
+                const auto s0 = std::chrono::steady_clock::now();
+                auto sref = e->generate(base, gpb, {}, nullptr, {}, {});
+                const auto s1 = std::chrono::steady_clock::now();
+                const double sms =
+                    std::chrono::duration<double, std::milli>(s1 - s0).count();
+                std::cout << "  single-seq generate(): " << sms << " ms  "
+                          << (sms / static_cast<double>(sref.size()))
+                          << " ms/tok  " << (1000.0 * static_cast<double>(sref.size()) / sms)
+                          << " tok/s\n";
+                std::cout.flush();
+            }
+            for (std::size_t nSeq : batchSizes) {
                 std::vector<std::vector<std::int32_t>> prompts(nSeq, base);
                 if (nSeq == 1) {
                     (void)e->generateBatch(prompts, 2, -1);   // warm up

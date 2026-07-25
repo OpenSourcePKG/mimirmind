@@ -1990,7 +1990,12 @@ InferenceEngine::generateBatch(
     std::vector<std::int32_t>  inputTok(nSeq);
     std::vector<std::vector<std::int32_t>> out(nSeq);
 
+    const bool timing = std::getenv("MIMIRMIND_BATCH_TIMING") != nullptr;
+    double tFull = 0.0, tLin = 0.0, tLm = 0.0, tPre = 0.0;
+    using clk = std::chrono::steady_clock;
+
     auto stepForward = [&](std::size_t p) {
+        const auto tp0 = clk::now();
         cmp::embeddingLookup(tokEmb->type, tokEmb->usmPtr, d_model, vocab_emb,
                              std::span<const std::int32_t>{inputTok.data(), nSeq},
                              xBuf);
@@ -2017,8 +2022,19 @@ InferenceEngine::generateBatch(
         ctx.kwSlot          = kwBuf.as<float>();
         ctx.isSeqStart      = isSeqStart.data();
 
+        if (timing) {
+            _ops->flush();
+            tPre += std::chrono::duration<double, std::milli>(clk::now() - tp0).count();
+        }
         for (std::size_t b = 0; b < blockCount; ++b) {
+            const auto tb0 = timing ? clk::now() : clk::time_point{};
             qb->runBlockBatched(b, xBuf, ctx, sb);
+            if (timing) {
+                _ops->flush();
+                const double dt =
+                    std::chrono::duration<double, std::milli>(clk::now() - tb0).count();
+                if (_config.isRecurrentLayer(b)) tLin += dt; else tFull += dt;
+            }
         }
     };
 
@@ -2058,7 +2074,11 @@ InferenceEngine::generateBatch(
             inputTok[s] = (g < Tps[s]) ? prompts[s][g] : lastTok[s];
         }
         stepForward(g);
+        const auto tl0 = timing ? clk::now() : clk::time_point{};
         const std::vector<std::int32_t> toks = lmHeadSample();
+        if (timing) {
+            tLm += std::chrono::duration<double, std::milli>(clk::now() - tl0).count();
+        }
         bool allDone = true;
         for (std::size_t s = 0; s < nSeq; ++s) {
             if (finished[s] != 0) {
@@ -2078,6 +2098,13 @@ InferenceEngine::generateBatch(
         if (allDone) {
             break;
         }
+    }
+    if (timing) {
+        std::fprintf(stderr,
+            "[batch-timing] nSeq=%zu full-attn=%.1f ms  linear=%.1f ms  "
+            "lm-head=%.1f ms  prep=%.1f ms  (total blocks-only=%.1f ms)\n",
+            nSeq, tFull, tLin, tLm, tPre, tFull + tLin);
+        std::fflush(stderr);
     }
     return out;
 }
