@@ -51,6 +51,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <optional>
@@ -538,6 +539,103 @@ void InferenceEngine::loadModelNvfp4(std::string_view checkpointDir,
     _materializedBf16 =
         runtime::nvfp4::executeMaterialization(steps, *_nvfp4Model, devOps);
     cudaCtx.stream().synchronize(); // all dequant kernels + D2D copies complete
+
+    // 5b. GatedDeltaNet value-head regroup (HF -> GGUF layout).
+    //
+    // llama.cpp's GGUF conversion stores the linear-attention value stream
+    // as (gqa, num_k_heads, head_dim), while the HF checkpoint stores it as
+    // (num_k_heads, gqa, head_dim). The NVFP4 materializer emits raw HF
+    // layout, but the backend that consumes these BF16 tensors was written
+    // for the GGUF convention — so without this regroup the 32 value heads
+    // are scrambled, the delta-rule recurrence reads the wrong channels, and
+    // the whole model degenerates into incoherent tokens (block-0 residual
+    // over-amplification). Full-attention layers are unaffected (their
+    // attn_q/k/v/output already match GGUF element-wise). Verified against
+    // the coherent GGUF Q4_K weights for every affected tensor.
+    //
+    // The regroup is a pure element permutation of the vDim value channels:
+    //   dst(j,k,d) <- src(k,j,d)   (k: k-head, j: gqa slot, d: head dim)
+    // applied to the value ROWS of attn_qkv / ssm_conv1d, ALL rows of
+    // attn_gate, and the value COLUMNS of ssm_out.
+    {
+        const std::size_t KH  = _config.ssmNumKHeads();   // num k heads (16)
+        const std::size_t VH  = _config.ssmNumVHeads();   // num v heads (32)
+        const std::size_t HD  = _config.ssmHeadDim();     // head dim (128)
+        const std::size_t GQA = (KH > 0) ? VH / KH : 1;   // v-per-k (2)
+        const std::size_t vDim = VH * HD;                 // value dim (4096)
+        if (GQA >= 2 && KH * GQA * HD == vDim) {
+            std::vector<std::size_t> perm(vDim);
+            for (std::size_t k = 0; k < KH; ++k) {
+                for (std::size_t j = 0; j < GQA; ++j) {
+                    for (std::size_t d = 0; d < HD; ++d) {
+                        const std::size_t src = k * GQA * HD + j * HD + d;
+                        const std::size_t dst = j * KH * HD + k * HD + d;
+                        perm[dst] = src;
+                    }
+                }
+            }
+            auto regroupRows = [&](runtime::nvfp4::MaterializedTensor& t,
+                                   std::size_t rowStart) {
+                const std::size_t inCols    = t.ggufDims[0];
+                const std::size_t elemBytes = t.isF32 ? 4 : 2;
+                const std::size_t rowBytes  = inCols * elemBytes;
+                const std::size_t nbytes    = vDim * rowBytes;
+                auto* base = static_cast<std::uint8_t*>(t.buffer.get())
+                             + rowStart * rowBytes;
+                std::vector<std::uint8_t> in(nbytes), out(nbytes);
+                _ops->readbackToHost(in.data(), base, nbytes);
+                for (std::size_t r = 0; r < vDim; ++r) {
+                    std::memcpy(out.data() + r * rowBytes,
+                                in.data() + perm[r] * rowBytes, rowBytes);
+                }
+                _ops->uploadHostBytes(base, out.data(), nbytes);
+            };
+            auto regroupCols = [&](runtime::nvfp4::MaterializedTensor& t) {
+                const std::size_t cols      = t.ggufDims[0];  // == vDim
+                const std::size_t rows      = t.ggufDims[1];
+                const std::size_t elemBytes = t.isF32 ? 4 : 2;
+                const std::size_t nbytes    = rows * cols * elemBytes;
+                auto* base = static_cast<std::uint8_t*>(t.buffer.get());
+                std::vector<std::uint8_t> in(nbytes), out(nbytes);
+                _ops->readbackToHost(in.data(), base, nbytes);
+                for (std::size_t r = 0; r < rows; ++r) {
+                    const std::size_t ro = r * cols;
+                    for (std::size_t c = 0; c < cols; ++c) {
+                        std::memcpy(out.data() + (ro + c) * elemBytes,
+                                    in.data() + (ro + perm[c]) * elemBytes,
+                                    elemBytes);
+                    }
+                }
+                _ops->uploadHostBytes(base, out.data(), nbytes);
+            };
+            std::size_t regrouped = 0;
+            for (auto& t : _materializedBf16) {
+                const std::string& n = t.ggufName;
+                if (n.ends_with(".attn_qkv.weight")) {
+                    // q(KH*HD) | k(KH*HD) | v(vDim): only the v rows move.
+                    regroupRows(t, /*rowStart=*/2 * KH * HD);
+                    ++regrouped;
+                } else if (n.ends_with(".ssm_conv1d.weight")) {
+                    // q | k | v channels: only the v channels move.
+                    regroupRows(t, /*rowStart=*/2 * KH * HD);
+                    ++regrouped;
+                } else if (n.ends_with(".attn_gate.weight")) {
+                    // z gate — one per value channel, all rows move.
+                    regroupRows(t, /*rowStart=*/0);
+                    ++regrouped;
+                } else if (n.ends_with(".ssm_out.weight")) {
+                    // out projection reads the value dim on its input cols.
+                    regroupCols(t);
+                    ++regrouped;
+                }
+            }
+            cudaCtx.stream().synchronize();
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: GatedDeltaNet value-head regroup "
+                        "applied to {} tensors (KH={} GQA={} HD={})",
+                        regrouped, KH, GQA, HD);
+        }
+    }
 
     // 6. Expose the BF16 tensors as a GGUF-convention WeightsMap.
     _weights.emplace(runtime::nvfp4::buildBf16WeightsMap(_materializedBf16));
