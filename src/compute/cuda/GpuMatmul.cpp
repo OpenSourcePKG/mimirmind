@@ -173,6 +173,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _matmulQ5KVecKernel;
     ::mimirmind::core::cuda::CudaModule _matmulF32VecModule;
     ::mimirmind::core::cuda::CudaKernel _matmulF32VecKernel;
+    ::mimirmind::core::cuda::CudaModule _matmulBf16VecModule;
+    ::mimirmind::core::cuda::CudaKernel _matmulBf16VecKernel;
 
     explicit Impl(::mimirmind::core::cuda::CudaContext& ctx)
         : _matmulQ8_0VecModule    {loadCudaModule(ctx, "matmul_q8_0_vec")},
@@ -237,7 +239,10 @@ struct GpuMatmul::Impl {
               _matmulQ5KVecModule.getFunction("matmul_q5k_vec")},
           _matmulF32VecModule     {loadCudaModule(ctx, "matmul_f32_vec")},
           _matmulF32VecKernel     {
-              _matmulF32VecModule.getFunction("matmul_f32_vec")}
+              _matmulF32VecModule.getFunction("matmul_f32_vec")},
+          _matmulBf16VecModule    {loadCudaModule(ctx, "matmul_bf16_vec")},
+          _matmulBf16VecKernel    {
+              _matmulBf16VecModule.getFunction("matmul_bf16_vec")}
     {}
 };
 
@@ -721,6 +726,34 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
             (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
 
         auto& kern = _pimpl->_matmulF32VecKernel;
+        for (std::size_t m = 0; m < M; ++m) {
+            const float* xRow = X + m * K;
+            float*       yRow = Y + m * N;
+
+            kern.setPtr  (0, xRow);
+            kern.setPtr  (1, W);
+            kern.setPtr  (2, yRow);
+            kern.setValue(3, static_cast<std::int32_t>(K));
+            kern.setValue(4, static_cast<std::int32_t>(N));
+
+            kern.launch(_ctx.stream(),
+                        nGroups, 1, 1,
+                        kVecLocalSize, 1, 1);
+        }
+        return;
+    }
+
+    if (type == ::mimirmind::core::gguf::GgmlType::BF16) {
+        // Native BF16 vec kernel — reads 2-byte BF16 weights and widens
+        // each to fp32 in the FMA. The NVFP4 checkpoints materialise their
+        // (dequantised) weights to BF16, notably every MoE expert bank;
+        // without this the whole qwen35moe decode fell through to the
+        // host CPU-fallback below (~seconds per token). Same launch shape
+        // as the F32 / K-quant vec kernels.
+        const std::uint32_t nGroups = static_cast<std::uint32_t>(
+            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+
+        auto& kern = _pimpl->_matmulBf16VecKernel;
         for (std::size_t m = 0; m < M; ++m) {
             const float* xRow = X + m * K;
             float*       yRow = Y + m * N;

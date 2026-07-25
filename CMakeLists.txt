@@ -678,6 +678,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/matmul_q4k_mmq.cu
         kernels_cuda/matmul_q5k_mmq.cu
         kernels_cuda/matmul_f32_vec.cu
+        kernels_cuda/matmul_bf16_vec.cu
         kernels_cuda/matmul_q3k_vec.cu
         kernels_cuda/matmul_q4k_vec.cu
         kernels_cuda/matmul_q5_0_vec.cu
