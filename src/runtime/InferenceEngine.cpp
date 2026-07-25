@@ -1884,20 +1884,31 @@ void InferenceEngine::commitVerified(
 }
 
 std::vector<std::vector<std::int32_t>>
-InferenceEngine::generateServingParity(std::span<const std::int32_t> promptIds,
-                                       std::size_t nSeq, std::size_t maxNew) {
+InferenceEngine::generateBatch(
+        const std::vector<std::vector<std::int32_t>>& prompts,
+        std::size_t maxNew, std::int32_t eosId) {
     namespace cmp = mimirmind::compute;
 
     if (_backend == nullptr) {
-        throw std::runtime_error("generateServingParity: no model loaded");
+        throw std::runtime_error("generateBatch: no model loaded");
     }
     auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_backend.get());
     if (qb == nullptr) {
         throw std::runtime_error(
-            "generateServingParity: batched serving only supports qwen35moe");
+            "generateBatch: batched serving only supports qwen35moe");
     }
-    if (nSeq == 0 || promptIds.empty() || maxNew == 0) {
-        throw std::runtime_error("generateServingParity: empty request");
+    const std::size_t nSeq = prompts.size();
+    if (nSeq == 0 || maxNew == 0) {
+        throw std::runtime_error("generateBatch: empty request");
+    }
+    std::vector<std::size_t> Tps(nSeq);
+    std::size_t maxTp = 0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        if (prompts[s].empty()) {
+            throw std::runtime_error("generateBatch: empty prompt in batch");
+        }
+        Tps[s] = prompts[s].size();
+        maxTp  = std::max(maxTp, Tps[s]);
     }
 
     const auto* tokEmb  = _weights->find("token_embd.weight");
@@ -1907,7 +1918,7 @@ InferenceEngine::generateServingParity(std::span<const std::int32_t> promptIds,
         lmHead = tokEmb;
     }
     if (tokEmb == nullptr || outNorm == nullptr || lmHead == nullptr) {
-        throw std::runtime_error("generateServingParity: embed/norm/lm_head missing");
+        throw std::runtime_error("generateBatch: embed/norm/lm_head missing");
     }
 
     const std::size_t d_model   = _config.embeddingLength;
@@ -1915,8 +1926,7 @@ InferenceEngine::generateServingParity(std::span<const std::int32_t> promptIds,
                                       ? lmHead->dimensions[1] : _tokenizer.vocabSize();
     const std::size_t vocab_emb = tokEmb->dimensions.size() >= 2
                                       ? tokEmb->dimensions[1] : _tokenizer.vocabSize();
-    const std::size_t Tp        = promptIds.size();
-    const std::size_t total     = Tp + maxNew;
+    const std::size_t total     = maxTp + maxNew;
 
     const std::size_t nKvHeads   = _config.headCountKv;
     const std::size_t headDim    = _config.headDim();
@@ -2034,22 +2044,56 @@ InferenceEngine::generateServingParity(std::span<const std::int32_t> promptIds,
         return toks;
     };
 
-    // Feed the prompt one token at a time (positions 0..Tp-1).
-    for (std::size_t p = 0; p < Tp; ++p) {
-        for (std::size_t s = 0; s < nSeq; ++s) inputTok[s] = promptIds[p];
-        stepForward(p);
-    }
-    std::vector<std::int32_t> nextToks = lmHeadSample();
-    for (std::size_t s = 0; s < nSeq; ++s) out[s].push_back(nextToks[s]);
-
-    // Greedy decode the remaining tokens (positions Tp, Tp+1, ...).
-    for (std::size_t g = 1; g < maxNew; ++g) {
-        for (std::size_t s = 0; s < nSeq; ++s) inputTok[s] = nextToks[s];
-        stepForward(Tp - 1 + g);
-        nextToks = lmHeadSample();
-        for (std::size_t s = 0; s < nSeq; ++s) out[s].push_back(nextToks[s]);
+    // Lockstep decode: at global step g every sequence is at position g,
+    // feeding its prompt token while g < its prompt length, then its own
+    // last sampled token. A sequence's first generated token is the one
+    // sampled at g == promptLen-1 (the prediction for position promptLen);
+    // it is collected until eosId or maxNew, after which the sequence is
+    // finished (still stepped, output ignored) until all sequences are done.
+    std::vector<std::int32_t> lastTok(nSeq, 0);
+    std::vector<char>         finished(nSeq, 0);
+    const std::size_t totalSteps = maxTp + maxNew;
+    for (std::size_t g = 0; g < totalSteps; ++g) {
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            inputTok[s] = (g < Tps[s]) ? prompts[s][g] : lastTok[s];
+        }
+        stepForward(g);
+        const std::vector<std::int32_t> toks = lmHeadSample();
+        bool allDone = true;
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            if (finished[s] != 0) {
+                continue;
+            }
+            if (g + 1 >= Tps[s]) {              // toks[s] is a generated token
+                out[s].push_back(toks[s]);
+                lastTok[s] = toks[s];
+                if (toks[s] == eosId || out[s].size() >= maxNew) {
+                    finished[s] = 1;
+                }
+            }
+            if (finished[s] == 0) {
+                allDone = false;
+            }
+        }
+        if (allDone) {
+            break;
+        }
     }
     return out;
+}
+
+std::vector<std::vector<std::int32_t>>
+InferenceEngine::generateServingParity(std::span<const std::int32_t> promptIds,
+                                       std::size_t nSeq, std::size_t maxNew) {
+    if (promptIds.empty()) {
+        throw std::runtime_error("generateServingParity: empty prompt");
+    }
+    // nSeq copies of the SAME prompt, no EOS stop (eosId=-1 never matches a
+    // valid token id) => exactly maxNew tokens per sequence, so the streams
+    // are directly comparable to single-session greedy generate().
+    const std::vector<std::int32_t>        p(promptIds.begin(), promptIds.end());
+    std::vector<std::vector<std::int32_t>> prompts(nSeq, p);
+    return generateBatch(prompts, maxNew, /*eosId=*/-1);
 }
 
 } // namespace mimirmind::runtime

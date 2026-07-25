@@ -33,6 +33,7 @@
 #include "server/ApiServer.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -268,6 +269,44 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         // apply the per-model runtime overrides AFTER loadModel.
         applyRuntimeOverrides(*e, cfg.effectiveRuntime(m.id));
 
+        // M-Cuda.Batch D2e — batched decode throughput benchmark. With
+        // MIMIRMIND_BATCH_BENCH set, time generateBatch across batch sizes
+        // and report ms/step + generated-tokens/s, then exit. The batched
+        // forward processes all nSeq sequences in one pass, so gen-tok/s
+        // should scale with the batch while ms/step stays roughly flat —
+        // that is the serving-class throughput win. qwen35moe only.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_BATCH_BENCH") != nullptr) {
+            const auto& tok = e->tokenizer();
+            auto base = tok.encode("The capital of France is", /*addBos=*/false);
+            if (base.empty()) base.push_back(1);
+            const std::size_t maxNew    = 32;
+            const std::size_t promptLen = base.size();
+            std::cout << "\n[M-Cuda.Batch D2e bench] promptLen=" << promptLen
+                      << " maxNew=" << maxNew << "\n";
+            for (std::size_t nSeq : {std::size_t{1}, std::size_t{4},
+                                     std::size_t{8}, std::size_t{16}}) {
+                std::vector<std::vector<std::int32_t>> prompts(nSeq, base);
+                if (nSeq == 1) {
+                    (void)e->generateBatch(prompts, 2, -1);   // warm up
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                (void)e->generateBatch(prompts, maxNew, /*eosId=*/-1);
+                const auto t1 = std::chrono::steady_clock::now();
+                const double ms =
+                    std::chrono::duration<double, std::milli>(t1 - t0).count();
+                const std::size_t steps   = promptLen + maxNew;
+                const std::size_t genToks = nSeq * maxNew;
+                std::cout << "  nSeq=" << nSeq
+                          << "  total=" << ms << " ms  "
+                          << (ms / static_cast<double>(steps)) << " ms/step  "
+                          << (1000.0 * static_cast<double>(genToks) / ms)
+                          << " gen-tok/s\n";
+                std::cout.flush();
+            }
+            return 0;
+        }
+
         // M-Cuda.Batch D2d — batched serving parity gate (dev/CI hook).
         // With MIMIRMIND_SERVING_PARITY set, run the batched decode path
         // (generateServingParity) against single-seq greedy generate() on
@@ -299,6 +338,11 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             ::mimirmind::runtime::GenerateParams gp{};
             gp.maxNewTokens         = maxNew;
             gp.sampling.temperature = 0.0F;   // greedy argmax
+            // Reset the KV+SSM state so the reference is a clean single-session
+            // run — the prefix cache reuses KV across generate() calls but does
+            // NOT restore the GatedDeltaNet recurrent state, which would
+            // contaminate a later reference (lcp>0 keeps a stale SsmState).
+            e->resetCache();
             std::vector<std::int32_t> ref =
                 e->generate(promptIds, gp, {}, nullptr, {}, {});
 
@@ -326,6 +370,47 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                               ? "  => PASS"
                               : "  => CHECK")
                       << "\n";
+
+            // D2e.1 — generateBatch with DISTINCT prompts. Each batched
+            // stream must equal its own single-session greedy generate().
+            const char* multiPrompts[] = {
+                "The capital of France is",
+                "Once upon a time",
+                "2 plus 2 equals",
+            };
+            std::vector<std::vector<std::int32_t>> bprompts;
+            for (const char* mp : multiPrompts) {
+                auto ids = tok.encode(mp, /*addBos=*/false);
+                if (ids.empty()) ids.push_back(1);
+                bprompts.push_back(std::move(ids));
+            }
+            auto bout = e->generateBatch(bprompts, maxNew, /*eosId=*/-1);
+            std::cout << "[M-Cuda.Batch D2e generateBatch] "
+                      << bprompts.size() << " distinct prompts, maxNew="
+                      << maxNew << "\n";
+            bool allBatchOk = true;
+            for (std::size_t i = 0; i < bprompts.size(); ++i) {
+                ::mimirmind::runtime::GenerateParams gpi{};
+                gpi.maxNewTokens         = maxNew;
+                gpi.sampling.temperature = 0.0F;
+                e->resetCache();   // clean single-session reference (see above)
+                std::vector<std::int32_t> refi =
+                    e->generate(bprompts[i], gpi, {}, nullptr, {}, {});
+                std::size_t ml = 0;
+                const std::size_t cn = std::min(bout[i].size(), refi.size());
+                for (; ml < cn; ++ml) {
+                    if (bout[i][ml] != refi[ml]) break;
+                }
+                const bool ok = (ml == refi.size() && bout[i].size() == refi.size());
+                allBatchOk = allBatchOk && ok;
+                std::cout << "  prompt[" << i << "] match=" << ml << "/"
+                          << refi.size() << (ok ? " OK" : " MISMATCH")
+                          << "  batched:";
+                for (auto t : bout[i]) std::cout << ' ' << t;
+                std::cout << "\n";
+            }
+            std::cout << "  => generateBatch "
+                      << (allBatchOk ? "PASS" : "CHECK") << "\n";
             std::cout.flush();
             return 0;
         }

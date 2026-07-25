@@ -327,6 +327,21 @@ public:
     generateServingParity(std::span<const std::int32_t> promptIds,
                           std::size_t nSeq, std::size_t maxNew);
 
+    /**
+     * M-Cuda.Batch D2e — batched multi-prompt greedy generation. Runs the
+     * `prompts.size()` DIFFERENT prompts concurrently through the batched
+     * decode path (paged full-attn + GatedDeltaNet + MoE), each generating
+     * up to `maxNew` tokens and stopping early at `eosId` (pass a negative id
+     * to disable the EOS stop). Lockstep by global position; a finished
+     * sequence keeps stepping (output ignored) until all are done. Returns
+     * one token stream per prompt. CUDA + qwen35moe only. This is the
+     * serving-class throughput primitive — per-stream output equals each
+     * prompt's single-session greedy generate().
+     */
+    [[nodiscard]] std::vector<std::vector<std::int32_t>>
+    generateBatch(const std::vector<std::vector<std::int32_t>>& prompts,
+                  std::size_t maxNew, std::int32_t eosId);
+
     /// Number of token ids currently cached (i.e. how long an exact
     /// prefix the next request could potentially skip-prefill).
     [[nodiscard]] std::size_t cachedTokenCount() const noexcept {
