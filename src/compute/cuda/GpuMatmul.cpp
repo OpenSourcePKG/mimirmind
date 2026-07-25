@@ -159,6 +159,10 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKQ4KKernel;
     ::mimirmind::core::cuda::CudaModule _moeGateUpFusedKQ4KBatchedModule;
     ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKQ4KBatchedKernel;
+    ::mimirmind::core::cuda::CudaModule _moeGateUpFusedKBf16BatchedModule;
+    ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKBf16BatchedKernel;
+    ::mimirmind::core::cuda::CudaModule _moeDownFusedKBf16BatchedModule;
+    ::mimirmind::core::cuda::CudaKernel _moeDownFusedKBf16BatchedKernel;
     ::mimirmind::core::cuda::CudaModule _ffnGateUpFusedQ8Module;
     ::mimirmind::core::cuda::CudaKernel _ffnGateUpFusedQ8Kernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ5_0VecModule;
@@ -221,6 +225,12 @@ struct GpuMatmul::Impl {
           _moeGateUpFusedKQ4KBatchedModule{loadCudaModule(ctx, "moe_gate_up_fused_k_q4k_batched")},
           _moeGateUpFusedKQ4KBatchedKernel{
               _moeGateUpFusedKQ4KBatchedModule.getFunction("moe_gate_up_fused_k_q4k_batched")},
+          _moeGateUpFusedKBf16BatchedModule{loadCudaModule(ctx, "moe_gate_up_fused_k_bf16_batched")},
+          _moeGateUpFusedKBf16BatchedKernel{
+              _moeGateUpFusedKBf16BatchedModule.getFunction("moe_gate_up_fused_k_bf16_batched")},
+          _moeDownFusedKBf16BatchedModule{loadCudaModule(ctx, "moe_down_fused_k_bf16_batched")},
+          _moeDownFusedKBf16BatchedKernel{
+              _moeDownFusedKBf16BatchedModule.getFunction("moe_down_fused_k_bf16_batched")},
           _ffnGateUpFusedQ8Module{loadCudaModule(ctx, "ffn_gate_up_fused_q8_0")},
           _ffnGateUpFusedQ8Kernel{
               _ffnGateUpFusedQ8Module.getFunction("ffn_gate_up_fused_q8_0")},
@@ -317,12 +327,14 @@ bool GpuMatmul::moeDownFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
     const noexcept {
     return type == ::mimirmind::core::gguf::GgmlType::Q8_0
         || type == ::mimirmind::core::gguf::GgmlType::Q6_K
-        || type == ::mimirmind::core::gguf::GgmlType::Q5_K;
+        || type == ::mimirmind::core::gguf::GgmlType::Q5_K
+        || type == ::mimirmind::core::gguf::GgmlType::BF16;
 }
 
 bool GpuMatmul::moeGateUpFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
     const noexcept {
-    return type == ::mimirmind::core::gguf::GgmlType::Q4_K;
+    return type == ::mimirmind::core::gguf::GgmlType::Q4_K
+        || type == ::mimirmind::core::gguf::GgmlType::BF16;
 }
 
 bool GpuMatmul::ffnGateUpFusedQ8Available() const noexcept {
@@ -1242,6 +1254,26 @@ void GpuMatmul::moeDownFusedKBatchedAsync(
     if (nSeq == 0 || kActive == 0 || dModel == 0 || ffPer == 0) {
         return;
     }
+    if (type == ::mimirmind::core::gguf::GgmlType::BF16) {
+        // Dense BF16 experts. Element strides derive from dims; expertBytes
+        // is unused. Kernel block = 128 (4 warps -> 4 outputs/group).
+        (void)expertBytes;
+        auto& kern = _pimpl->_moeDownFusedKBf16BatchedKernel;
+        kern.setPtr  (0, gateAct);
+        kern.setPtr  (1, W);
+        kern.setPtr  (2, expIdx);
+        kern.setPtr  (3, kw);
+        kern.setPtr  (4, accum);
+        kern.setValue(5, static_cast<std::int32_t>(ffPer));
+        kern.setValue(6, static_cast<std::int32_t>(dModel));
+        kern.setValue(7, static_cast<std::int32_t>(kActive));
+        const std::uint32_t nGroups = static_cast<std::uint32_t>(
+            (dModel + kMoeDownOutputsPerGroup - 1) / kMoeDownOutputsPerGroup);
+        kern.launch(_ctx.stream(),
+                    nGroups, static_cast<std::uint32_t>(nSeq), 1,
+                    kMoeGateUpLocalSize, 1, 1);
+        return;
+    }
     if (type != ::mimirmind::core::gguf::GgmlType::Q5_K) {
         throw std::runtime_error(
             "compute::cuda::GpuMatmul::moeDownFusedKBatchedAsync: only Q5_K "
@@ -1331,6 +1363,27 @@ void GpuMatmul::moeGateUpFusedKBatchedAsync(
         std::size_t kActive, std::size_t expertBytesGate,
         std::size_t expertBytesUp) {
     if (nSeq == 0 || kActive == 0 || dModel == 0 || nFf == 0) {
+        return;
+    }
+    if (type == ::mimirmind::core::gguf::GgmlType::BF16) {
+        // Dense BF16 experts (NVFP4->BF16). Element strides derive from
+        // dims; the byte-stride args are unused.
+        (void)expertBytesGate; (void)expertBytesUp;
+        auto& kern = _pimpl->_moeGateUpFusedKBf16BatchedKernel;
+        kern.setPtr  (0, x);
+        kern.setPtr  (1, Wg);
+        kern.setPtr  (2, Wu);
+        kern.setPtr  (3, expIdx);
+        kern.setPtr  (4, gateActOut);
+        kern.setValue(5, static_cast<std::int32_t>(dModel));
+        kern.setValue(6, static_cast<std::int32_t>(nFf));
+        kern.setValue(7, static_cast<std::int32_t>(kActive));
+        const std::uint32_t nOutputs = static_cast<std::uint32_t>(kActive * nFf);
+        const std::uint32_t nGroups  =
+            (nOutputs + kMoeGateUpOutputsPerGroup - 1) / kMoeGateUpOutputsPerGroup;
+        kern.launch(_ctx.stream(),
+                    nGroups, static_cast<std::uint32_t>(nSeq), 1,
+                    kMoeGateUpLocalSize, 1, 1);
         return;
     }
     if (type != ::mimirmind::core::gguf::GgmlType::Q4_K) {

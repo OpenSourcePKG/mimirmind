@@ -882,23 +882,33 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
         kwSlot[r]     = _topKWeight[r] * wScale;
     }
 
-    // Per-expert byte strides (separate banks: one block per expert).
-    const compute::QuantType* const qtGate = compute::quantType(gateExps.type);
-    const compute::QuantType* const qtUp   = compute::quantType(upExps.type);
-    const compute::QuantType* const qtDown = compute::quantType(downExps.type);
-    if (qtGate == nullptr || qtUp == nullptr || qtDown == nullptr) {
-        throw std::runtime_error(
-            "Qwen35MoeBackend::runMoeFfnBatched: expert weight type(s) not in "
-            "QuantType registry");
+    // Per-expert byte strides (separate banks: one block per expert). For
+    // BF16 experts (NVFP4->BF16 checkpoints) the *_bf16_batched kernels index
+    // by dims, so a dense 2-byte stride is used; the K-quant banks take the
+    // QuantType block byte layout.
+    std::size_t bytesGate = 0, bytesUp = 0, bytesDown = 0;
+    if (gateExps.type == core::gguf::GgmlType::BF16) {
+        bytesGate = n_ff_exp * d_model * sizeof(std::uint16_t);
+        bytesUp   = n_ff_exp * d_model * sizeof(std::uint16_t);
+        bytesDown = d_model * n_ff_exp * sizeof(std::uint16_t);
+    } else {
+        const compute::QuantType* const qtGate = compute::quantType(gateExps.type);
+        const compute::QuantType* const qtUp   = compute::quantType(upExps.type);
+        const compute::QuantType* const qtDown = compute::quantType(downExps.type);
+        if (qtGate == nullptr || qtUp == nullptr || qtDown == nullptr) {
+            throw std::runtime_error(
+                "Qwen35MoeBackend::runMoeFfnBatched: expert weight type(s) not "
+                "in QuantType registry");
+        }
+        const std::size_t rowBytesGate =
+            (d_model / qtGate->blockElements()) * qtGate->blockBytes();
+        const std::size_t rowBytesUp =
+            (d_model / qtUp->blockElements()) * qtUp->blockBytes();
+        bytesGate = n_ff_exp * rowBytesGate;
+        bytesUp   = n_ff_exp * rowBytesUp;
+        bytesDown =
+            d_model * (n_ff_exp / qtDown->blockElements()) * qtDown->blockBytes();
     }
-    const std::size_t rowBytesGate =
-        (d_model / qtGate->blockElements()) * qtGate->blockBytes();
-    const std::size_t rowBytesUp =
-        (d_model / qtUp->blockElements()) * qtUp->blockBytes();
-    const std::size_t bytesGate = n_ff_exp * rowBytesGate;
-    const std::size_t bytesUp   = n_ff_exp * rowBytesUp;
-    const std::size_t bytesDown =
-        d_model * (n_ff_exp / qtDown->blockElements()) * qtDown->blockBytes();
 
     const auto* const gateBase = static_cast<const std::uint8_t*>(gateExps.usmPtr);
     const auto* const upBase   = static_cast<const std::uint8_t*>(upExps.usmPtr);
