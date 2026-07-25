@@ -1152,12 +1152,18 @@ void Qwen35MoeBackend::runLinearBlockBatched(
     float* const projOut   = s.projOut.as<float>();
     float* const mmScratch = s.matmulScratch.as<float>();
 
-    // Per-sequence recurrent + conv state (SsmState[nSeq]): the per-layer
-    // slab is [nSeq, stateElems] / [nSeq, convStateElems], so the layer
-    // base steps by nSeq*elems (SsmState::stateLayerStride) and sequence s
-    // sits at + s*elems.
-    float* const stateBase = s.ssmStatePtr     + blockIdx * (nSeq * stateElems);
-    float* const convBase  = s.ssmConvStatePtr + blockIdx * (nSeq * convStateElems);
+    // Per-sequence recurrent + conv state (SsmState[slabNSeq]): the per-layer
+    // slab is [slabNSeq, stateElems] / [slabNSeq, convStateElems], so the
+    // layer base steps by slabNSeq*elems (== SsmState::stateLayerStride) and
+    // sequence s sits at + s*elems. The layer stride MUST use the slab's
+    // ALLOCATED nSeq, not the runtime batch `nSeq` — under continuous
+    // batching the active count varies below the allocation, and using the
+    // runtime nSeq would offset every layer into the wrong slice
+    // (M-Cuda.Batch D2e.2). Falls back to nSeq when unset (== generateBatch,
+    // where slab nSeq == runtime nSeq, so the two agree).
+    const std::size_t slabNSeq = (s.ssmSlabNSeq != 0) ? s.ssmSlabNSeq : nSeq;
+    float* const stateBase = s.ssmStatePtr     + blockIdx * (slabNSeq * stateElems);
+    float* const convBase  = s.ssmConvStatePtr + blockIdx * (slabNSeq * convStateElems);
 
     // --- pre-attention RMSNorm (nSeq rows) ---------------------------
     _ops.rmsNormAsync(x, nSeq, d_model,

@@ -290,6 +290,57 @@ makeGpuMatmul(core::backend::ComputeContext& ctx,
 
 } // namespace
 
+// =======================================================================
+// M-Cuda.Batch D2e.2 — continuous-batching serving state.
+//
+// Persistent per-slot substrate that lets an external event loop
+// (ContinuousBatcher) admit/decode/complete requests asynchronously. Each
+// of the `maxBatch` physical slots owns a contiguous run of paged-KV blocks
+// and one SsmState sequence-slice, pinned for a request's lifetime.
+// stepServing() runs one batched forward over a contiguous slot prefix,
+// each slot at its OWN position — generateBatch's stepForward/lmHeadSample
+// lifted onto persistent state with per-slot positions instead of a global
+// step. Defined here (ahead of ~InferenceEngine) so the unique_ptr member
+// destructs against a complete type.
+// =======================================================================
+struct ServingState {
+    std::size_t maxBatch{0};
+    std::size_t maxContext{0};
+    std::size_t blockSize{16};
+    std::size_t blocksPerSeq{0};
+    std::size_t numBlocks{0};
+
+    // Cached model dims + weights (valid while the model stays loaded).
+    std::size_t d_model{0};
+    std::size_t vocab_lm{0};
+    std::size_t vocab_emb{0};
+    std::size_t blockCount{0};
+    const core::gguf::GgufTensor* tokEmb{nullptr};
+    const core::gguf::GgufTensor* outNorm{nullptr};
+    const core::gguf::GgufTensor* lmHead{nullptr};
+    arch::Qwen35MoeBackend*       qb{nullptr};
+
+    // Persistent device state.
+    std::unique_ptr<serving::PagedKvPool> pool;
+    std::unique_ptr<SsmState>             ssm;
+    std::optional<BlockBuffers>           sb;
+
+    // Scratch (device).
+    compute::ComputeBuffer expIdxBuf, kwBuf;
+    compute::ComputeBuffer blockTablesDev, seqLensDev, startPosDev;
+    compute::ComputeBuffer xBufB, normB, logitsB, lmScr;
+
+    // Per-iteration host staging.
+    std::vector<std::int32_t>  blockTablesH;  // [maxBatch * blocksPerSeq] static
+    std::vector<std::uint32_t> writeBlockId;  // [maxBatch]
+    std::vector<std::int32_t>  writeSlot;      // [maxBatch]
+    std::vector<std::int32_t>  seqLensH;       // [maxBatch]
+    std::vector<std::int32_t>  startPosH;      // [maxBatch]
+    std::vector<std::uint8_t>  isSeqStart;     // [maxBatch]
+    std::vector<std::int32_t>  inputTok;       // [maxBatch]
+    std::vector<float>         hostLogits;     // [maxBatch * vocab_lm]
+};
+
 InferenceEngine::InferenceEngine(const Config& cfg)
     : InferenceEngine{cfg, core::backend::BackendRegistry::autoSelect(
                               core::backend::BackendKind::LevelZero)} {}
@@ -995,6 +1046,7 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     if (_ssmState != nullptr) {
         _blockBuffers->ssmStatePtr     = _ssmState->statePtr();
         _blockBuffers->ssmConvStatePtr = _ssmState->convStatePtr();
+        _blockBuffers->ssmSlabNSeq     = _ssmState->nSeq();
     }
 
     _xBufH      = _ops->allocate(maxT      * d_model  * sizeof(float));
@@ -1957,6 +2009,7 @@ InferenceEngine::generateBatch(
                                         /*perSeqConvInput=*/true);
     sb.ssmStatePtr     = ssm.statePtr();
     sb.ssmConvStatePtr = ssm.convStatePtr();
+    sb.ssmSlabNSeq     = ssm.nSeq();
 
     auto expIdxBuf = _ops->allocate(nSeq * K * sizeof(std::int32_t));
     auto kwBuf     = _ops->allocate(nSeq * K * sizeof(float));
@@ -2121,6 +2174,213 @@ InferenceEngine::generateServingParity(std::span<const std::int32_t> promptIds,
     const std::vector<std::int32_t>        p(promptIds.begin(), promptIds.end());
     std::vector<std::vector<std::int32_t>> prompts(nSeq, p);
     return generateBatch(prompts, maxNew, /*eosId=*/-1);
+}
+
+void InferenceEngine::ensureServingState(std::size_t maxBatch,
+                                         std::size_t maxContext) {
+    if (_backend == nullptr) {
+        throw std::runtime_error("ensureServingState: no model loaded");
+    }
+    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_backend.get());
+    if (qb == nullptr) {
+        throw std::runtime_error(
+            "ensureServingState: continuous batching only supports qwen35moe");
+    }
+    if (maxBatch == 0 || maxContext == 0) {
+        throw std::runtime_error("ensureServingState: maxBatch/maxContext must be > 0");
+    }
+    // Idempotent unless capacity must grow.
+    if (_serving != nullptr && _serving->maxBatch >= maxBatch &&
+        _serving->maxContext >= maxContext) {
+        return;
+    }
+
+    const auto* tokEmb  = _weights->find("token_embd.weight");
+    const auto* outNorm = _weights->find("output_norm.weight");
+    const auto* lmHead  = _weights->find("output.weight");
+    if (lmHead == nullptr) {
+        lmHead = tokEmb;
+    }
+    if (tokEmb == nullptr || outNorm == nullptr || lmHead == nullptr) {
+        throw std::runtime_error("ensureServingState: embed/norm/lm_head missing");
+    }
+
+    auto st = std::make_unique<ServingState>();
+    st->maxBatch   = maxBatch;
+    st->maxContext = maxContext;
+    st->blockSize  = 16;
+    st->blocksPerSeq =
+        (maxContext + st->blockSize - 1) / st->blockSize;
+    st->numBlocks  = maxBatch * st->blocksPerSeq;
+
+    st->d_model   = _config.embeddingLength;
+    st->vocab_lm  = lmHead->dimensions.size() >= 2 ? lmHead->dimensions[1]
+                                                   : _tokenizer.vocabSize();
+    st->vocab_emb = tokEmb->dimensions.size() >= 2 ? tokEmb->dimensions[1]
+                                                   : _tokenizer.vocabSize();
+    st->blockCount = _config.blockCount;
+    st->tokEmb  = tokEmb;
+    st->outNorm = outNorm;
+    st->lmHead  = lmHead;
+    st->qb      = qb;
+
+    const std::size_t nKvHeads = _config.headCountKv;
+    const std::size_t headDim  = _config.headDim();
+    const std::size_t K        = _config.expertUsedCount;
+    std::size_t nFullAttn = 0;
+    for (std::size_t b = 0; b < st->blockCount; ++b) {
+        if (!_config.isRecurrentLayer(b)) ++nFullAttn;
+    }
+
+    st->pool = std::make_unique<serving::PagedKvPool>(
+        *_ops, nFullAttn, st->numBlocks, st->blockSize, nKvHeads, headDim);
+    st->ssm = std::make_unique<SsmState>(
+        *_ops, st->blockCount, _config.ssmStateElemsPerLayer(),
+        _config.ssmConvStateElemsPerLayer(), maxBatch);
+
+    const auto qkv = qb->maxQKVDims();
+    st->sb = allocBlockBuffers(*_ops, _config, /*maxT=*/maxBatch,
+                               /*maxSeq=*/maxBatch, qkv.first, qkv.second,
+                               /*withFusedQkv=*/false, /*withKvFp32Scratch=*/true,
+                               /*withQGate=*/true, /*withSsm=*/true,
+                               /*perSeqConvInput=*/true);
+    st->sb->ssmStatePtr     = st->ssm->statePtr();
+    st->sb->ssmConvStatePtr = st->ssm->convStatePtr();
+    st->sb->ssmSlabNSeq     = st->ssm->nSeq();
+
+    st->expIdxBuf = _ops->allocate(maxBatch * K * sizeof(std::int32_t));
+    st->kwBuf     = _ops->allocate(maxBatch * K * sizeof(float));
+
+    // Static per-slot block table: slot s owns physical blocks
+    // [s*blocksPerSeq, (s+1)*blocksPerSeq). Uploaded once.
+    st->blockTablesH.resize(maxBatch * st->blocksPerSeq);
+    for (std::size_t s = 0; s < maxBatch; ++s) {
+        for (std::size_t i = 0; i < st->blocksPerSeq; ++i) {
+            st->blockTablesH[s * st->blocksPerSeq + i] =
+                static_cast<std::int32_t>(s * st->blocksPerSeq + i);
+        }
+    }
+    st->blockTablesDev =
+        _ops->allocate(st->blockTablesH.size() * sizeof(std::int32_t));
+    _ops->uploadHostBytes(st->blockTablesDev.get(), st->blockTablesH.data(),
+                          st->blockTablesH.size() * sizeof(std::int32_t));
+    st->seqLensDev  = _ops->allocate(maxBatch * sizeof(std::int32_t));
+    st->startPosDev = _ops->allocate(maxBatch * sizeof(std::int32_t));
+
+    st->xBufB   = _ops->allocate(maxBatch * st->d_model  * sizeof(float));
+    st->normB   = _ops->allocate(maxBatch * st->d_model  * sizeof(float));
+    st->logitsB = _ops->allocate(maxBatch * st->vocab_lm * sizeof(float));
+    st->lmScr   = _ops->allocate(std::max(st->d_model, st->vocab_lm) * sizeof(float));
+
+    st->writeBlockId.resize(maxBatch);
+    st->writeSlot.resize(maxBatch);
+    st->seqLensH.resize(maxBatch);
+    st->startPosH.resize(maxBatch);
+    st->isSeqStart.resize(maxBatch);
+    st->inputTok.resize(maxBatch);
+    st->hostLogits.resize(maxBatch * st->vocab_lm);
+
+    _serving = std::move(st);
+    MM_LOG_INFO("serving",
+                "ensureServingState: maxBatch={} maxContext={} blocksPerSeq={} "
+                "numBlocks={} vocab_lm={}",
+                maxBatch, maxContext, _serving->blocksPerSeq, _serving->numBlocks,
+                _serving->vocab_lm);
+}
+
+void InferenceEngine::stepServing(std::span<const ServingSlotStep> steps,
+                                  std::span<std::int32_t>          outTokens) {
+    namespace cmp = mimirmind::compute;
+    if (_serving == nullptr) {
+        throw std::runtime_error("stepServing: ensureServingState not called");
+    }
+    auto& st = *_serving;
+    const std::size_t nSeq = steps.size();
+    if (nSeq == 0) {
+        return;
+    }
+    if (nSeq > st.maxBatch) {
+        throw std::runtime_error("stepServing: nSeq exceeds serving maxBatch");
+    }
+    if (outTokens.size() != nSeq) {
+        throw std::runtime_error("stepServing: outTokens size != steps size");
+    }
+
+    for (std::size_t i = 0; i < nSeq; ++i) {
+        const ServingSlotStep& s = steps[i];
+        if (s.slot != i) {
+            throw std::runtime_error(
+                "stepServing: steps must be ordered by slot over a contiguous "
+                "prefix (steps[i].slot == i)");
+        }
+        const std::size_t pos = static_cast<std::size_t>(s.pos);
+        if (pos >= st.maxContext) {
+            throw std::runtime_error("stepServing: position exceeds maxContext");
+        }
+        st.inputTok[i]     = s.token;
+        st.writeBlockId[i] = static_cast<std::uint32_t>(
+            i * st.blocksPerSeq + pos / st.blockSize);
+        st.writeSlot[i]    = static_cast<std::int32_t>(pos % st.blockSize);
+        st.seqLensH[i]     = static_cast<std::int32_t>(pos + 1);
+        st.startPosH[i]    = static_cast<std::int32_t>(pos);
+        st.isSeqStart[i]   = s.seqStart ? 1U : 0U;
+    }
+    _ops->uploadHostBytes(st.seqLensDev.get(),  st.seqLensH.data(),
+                          nSeq * sizeof(std::int32_t));
+    _ops->uploadHostBytes(st.startPosDev.get(), st.startPosH.data(),
+                          nSeq * sizeof(std::int32_t));
+
+    float* const xBuf   = st.xBufB.as<float>();
+    float* const normBuf= st.normB.as<float>();
+    float* const logits = st.logitsB.as<float>();
+
+    cmp::embeddingLookup(st.tokEmb->type, st.tokEmb->usmPtr, st.d_model,
+                         st.vocab_emb,
+                         std::span<const std::int32_t>{st.inputTok.data(), nSeq},
+                         xBuf);
+
+    arch::BatchedDecodeCtx ctx{};
+    ctx.nSeq            = nSeq;
+    ctx.pool            = st.pool.get();
+    ctx.writeBlockId    = st.writeBlockId.data();
+    ctx.writeSlot       = st.writeSlot.data();
+    ctx.blockTablesDev  = static_cast<const std::int32_t*>(st.blockTablesDev.get());
+    ctx.seqLensDev      = static_cast<const std::int32_t*>(st.seqLensDev.get());
+    ctx.maxBlocksPerSeq = st.blocksPerSeq;
+    ctx.startPosDev     = static_cast<const std::int32_t*>(st.startPosDev.get());
+    ctx.expIdxSlot      = st.expIdxBuf.as<std::int32_t>();
+    ctx.kwSlot          = st.kwBuf.as<float>();
+    ctx.isSeqStart      = st.isSeqStart.data();
+
+    for (std::size_t b = 0; b < st.blockCount; ++b) {
+        st.qb->runBlockBatched(b, xBuf, ctx, *st.sb);
+    }
+
+    _ops->rmsNormAsync(xBuf, nSeq, st.d_model,
+                       static_cast<const float*>(st.outNorm->usmPtr),
+                       _config.rmsNormEps, normBuf);
+    _gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, st.d_model,
+                 normBuf, nSeq, logits, st.lmScr.as<float>());
+    _ops->flush();
+    _ops->readbackToHost(st.hostLogits.data(), logits,
+                         nSeq * st.vocab_lm * sizeof(float));
+    for (std::size_t i = 0; i < nSeq; ++i) {
+        const float* row = st.hostLogits.data() + i * st.vocab_lm;
+        std::size_t best = 0;
+        float bv = row[0];
+        for (std::size_t v = 1; v < st.vocab_lm; ++v) {
+            if (row[v] > bv) { bv = row[v]; best = v; }
+        }
+        outTokens[i] = static_cast<std::int32_t>(best);
+    }
+}
+
+std::size_t InferenceEngine::servingMaxBatch() const noexcept {
+    return _serving != nullptr ? _serving->maxBatch : 0;
+}
+
+std::size_t InferenceEngine::servingMaxContext() const noexcept {
+    return _serving != nullptr ? _serving->maxContext : 0;
 }
 
 } // namespace mimirmind::runtime

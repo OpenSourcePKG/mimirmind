@@ -436,6 +436,124 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             return 0;
         }
 
+        // M-Cuda.Batch D2e.2 — continuous-batching STEP-loop validation.
+        // With MIMIRMIND_SERVING_LOOP set, drive the persistent per-slot
+        // stepServing() interface as a hand-rolled continuous batcher:
+        // admit 3 distinct prompts at STAGGERED iterations (each pinned to
+        // its own slot, stepping at its OWN position), collect each stream,
+        // and compare to single-seq greedy generate(). This is the engine
+        // primitive the ContinuousBatcher wraps with a worker thread + HTTP.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_SERVING_LOOP") != nullptr) {
+            const auto& tok = e->tokenizer();
+            const char* prompts[] = {
+                "The capital of France is",
+                "Once upon a time",
+                "2 plus 2 equals",
+            };
+            const std::size_t nReq   = 3;
+            const std::size_t maxNew  = 8;
+            const std::size_t admitAt[nReq] = {0, 2, 4};   // staggered arrival
+
+            std::vector<std::vector<std::int32_t>> pids(nReq);
+            std::size_t maxLen = 0;
+            for (std::size_t r = 0; r < nReq; ++r) {
+                pids[r] = tok.encode(prompts[r], /*addBos=*/false);
+                if (pids[r].empty()) pids[r].push_back(1);
+                maxLen = std::max(maxLen, pids[r].size());
+            }
+            const std::size_t maxContext = maxLen + maxNew + 8;
+            e->ensureServingState(/*maxBatch=*/nReq, maxContext);
+
+            struct Req {
+                std::size_t promptLen{0};
+                std::size_t pos{0};
+                std::int32_t lastTok{0};
+                bool admitted{false};
+                bool done{false};
+                std::vector<std::int32_t> out;
+            };
+            std::vector<Req> req(nReq);
+            for (std::size_t r = 0; r < nReq; ++r) req[r].promptLen = pids[r].size();
+
+            // Slot r == request r (pinned): admit in request order so the
+            // active set is always the contiguous prefix [0, nAdmitted).
+            std::size_t nAdmitted = 0;
+            using Step = ::mimirmind::runtime::InferenceEngine::ServingSlotStep;
+            for (std::size_t g = 0; g < maxLen + maxNew + nReq * 4; ++g) {
+                for (std::size_t r = 0; r < nReq; ++r) {
+                    if (!req[r].admitted && admitAt[r] <= g) {
+                        req[r].admitted = true;
+                        nAdmitted = std::max(nAdmitted, r + 1);
+                    }
+                }
+                if (nAdmitted == 0) continue;
+
+                std::vector<Step> steps(nAdmitted);
+                for (std::size_t i = 0; i < nAdmitted; ++i) {
+                    Step s{};
+                    s.slot = static_cast<std::uint32_t>(i);
+                    if (!req[i].admitted || req[i].done) {
+                        // Idle slot: fresh 1-token dummy (output discarded).
+                        s.token = 0; s.pos = 0; s.seqStart = true;
+                    } else {
+                        const std::size_t p = req[i].pos;
+                        s.token = (p < req[i].promptLen) ? pids[i][p]
+                                                         : req[i].lastTok;
+                        s.pos      = static_cast<std::int32_t>(p);
+                        s.seqStart = (p == 0);
+                    }
+                    steps[i] = s;
+                }
+                std::vector<std::int32_t> toks(nAdmitted, 0);
+                e->stepServing(steps, toks);
+
+                bool allDone = true;
+                for (std::size_t i = 0; i < nAdmitted; ++i) {
+                    if (!req[i].admitted || req[i].done) continue;
+                    if (req[i].pos + 1 >= req[i].promptLen) {
+                        req[i].out.push_back(toks[i]);
+                        req[i].lastTok = toks[i];
+                        if (req[i].out.size() >= maxNew) req[i].done = true;
+                    }
+                    req[i].pos++;
+                    if (!req[i].done) allDone = false;
+                }
+                bool allAdmitted = true;
+                for (std::size_t r = 0; r < nReq; ++r)
+                    if (!req[r].admitted) allAdmitted = false;
+                if (allAdmitted && allDone) break;
+            }
+
+            std::cout << "\n[M-Cuda.Batch D2e.2 serving-loop] " << nReq
+                      << " staggered requests (admitAt 0/2/4), maxNew="
+                      << maxNew << "\n";
+            bool allOk = true;
+            for (std::size_t r = 0; r < nReq; ++r) {
+                ::mimirmind::runtime::GenerateParams gpr{};
+                gpr.maxNewTokens         = maxNew;
+                gpr.sampling.temperature = 0.0F;
+                e->resetCache();
+                std::vector<std::int32_t> ref =
+                    e->generate(pids[r], gpr, {}, nullptr, {}, {});
+                std::size_t ml = 0;
+                const std::size_t cn = std::min(req[r].out.size(), ref.size());
+                for (; ml < cn; ++ml) if (req[r].out[ml] != ref[ml]) break;
+                const bool ok = (ml == ref.size() &&
+                                 req[r].out.size() == ref.size());
+                allOk = allOk && ok;
+                std::cout << "  req[" << r << "] admitAt=" << admitAt[r]
+                          << " match=" << ml << "/" << ref.size()
+                          << (ok ? " OK" : " MISMATCH") << "  loop:";
+                for (auto t : req[r].out) std::cout << ' ' << t;
+                std::cout << "\n";
+            }
+            std::cout << "  => serving-loop " << (allOk ? "PASS" : "CHECK")
+                      << "\n";
+            std::cout.flush();
+            return 0;
+        }
+
         // M9.8b — cross-block sanity check on the effective runtime.
         // The plain-attention fallback in kernels/attention.cl holds
         // scores[ATTN_MAX_TK] in 64 KiB SLM, so if a caller forces the

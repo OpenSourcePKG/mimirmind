@@ -53,6 +53,7 @@ class PerfRegressionDetector;
 class PowerMonitor;
 class SystemMonitor;
 class ThermalGuard;
+struct ServingState;   // M-Cuda.Batch D2e.2 — persistent continuous-batch state
 } // namespace mimirmind::runtime
 
 #include <cstddef>
@@ -341,6 +342,55 @@ public:
     [[nodiscard]] std::vector<std::vector<std::int32_t>>
     generateBatch(const std::vector<std::vector<std::int32_t>>& prompts,
                   std::size_t maxNew, std::int32_t eosId);
+
+    // ================================================================
+    // M-Cuda.Batch D2e.2 — continuous-batching serving primitives.
+    //
+    // These expose the batched decode substrate (runBlockBatched) as a
+    // persistent, per-slot stepping interface so an external event loop
+    // (ContinuousBatcher) can admit / decode / complete requests
+    // asynchronously — each request pinned to a physical slot for its
+    // lifetime (SsmState continuity), stepping at its OWN position.
+    // CUDA + qwen35moe only. Not thread-safe: the batcher serialises all
+    // calls onto its single worker thread.
+    // ================================================================
+
+    /// One per-slot step for `stepServing`. `slot` is the persistent
+    /// physical slot index (0..maxBatch-1). `token` is the input token
+    /// for this iteration (prompt token during prefill, last sampled
+    /// token during decode). `pos` is the slot's current absolute
+    /// position (0-based). `seqStart` MUST be true exactly on the slot's
+    /// pos==0 iteration — it zeroes that slot's GatedDeltaNet recurrent +
+    /// conv state (admit / reuse).
+    struct ServingSlotStep {
+        std::uint32_t slot{0};
+        std::int32_t  token{0};
+        std::int32_t  pos{0};
+        bool          seqStart{false};
+    };
+
+    /// Lazily build the persistent serving state for `maxBatch` slots,
+    /// each able to hold up to `maxContext` tokens of paged KV. Idempotent
+    /// for the same (maxBatch, maxContext); rebuilds if they grow. Must be
+    /// called once before the first `stepServing`. CUDA + qwen35moe only.
+    void ensureServingState(std::size_t maxBatch, std::size_t maxContext);
+
+    /// Run ONE batched decode iteration over the slots described by
+    /// `steps` (which must be ordered by slot and cover a contiguous
+    /// prefix 0..steps.size()-1 — idle slots inside the prefix are passed
+    /// as fresh 1-token dummies). Writes the greedy argmax token for each
+    /// slot into `outTokens` (same order/length as `steps`). Per-slot KV
+    /// and recurrent state persist across calls. Requires a prior
+    /// `ensureServingState`.
+    void stepServing(std::span<const ServingSlotStep> steps,
+                     std::span<std::int32_t>          outTokens);
+
+    /// Physical slot capacity of the current serving state (0 if not yet
+    /// built). The max concurrent sequences the batcher may pin.
+    [[nodiscard]] std::size_t servingMaxBatch() const noexcept;
+
+    /// Max context tokens per slot the serving state was sized for.
+    [[nodiscard]] std::size_t servingMaxContext() const noexcept;
 
     /// Number of token ids currently cached (i.e. how long an exact
     /// prefix the next request could potentially skip-prefill).
@@ -647,6 +697,12 @@ private:
     // and BlockBuffers reallocations. Its pointers are bound into
     // _blockBuffers after each scratch (re)allocation.
     std::unique_ptr<SsmState>          _ssmState;
+
+    // --- M-Cuda.Batch D2e.2 continuous-batching serving state ----------
+    // Persistent per-slot paged KV pool + batched SsmState + scratch,
+    // built by ensureServingState() and stepped by stepServing(). Defined
+    // in the .cpp so the header stays free of the serving-internal types.
+    std::unique_ptr<ServingState>      _serving;
 
     // --- M-Startup.CapacityProbe ---------------------------------------
     // Populated in finalizeLoad() once weights are on the device.
