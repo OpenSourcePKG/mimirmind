@@ -63,6 +63,7 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _addOneModule{loadModule(ctx.cudaContext(), "add_one")},
       _quantQ8Module{loadModule(ctx.cudaContext(), "quantize_bf16_to_q8_0")},
       _quantQ4KModule{loadModule(ctx.cudaContext(), "quantize_bf16_to_q4k")},
+      _quantQ6KModule{loadModule(ctx.cudaContext(), "quantize_bf16_to_q6k")},
       _dqNvfp4{_nvfp4Module.getFunction("dequant_nvfp4")},
       _dqFp8{_fp8Module.getFunction("dequant_fp8")},
       _castBf16{_castModule.getFunction("cast_bf16_to_f32")},
@@ -70,7 +71,8 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _negExp{_negExpModule.getFunction("neg_exp_f32")},
       _addOne{_addOneModule.getFunction("add_one_f32")},
       _quantQ8{_quantQ8Module.getFunction("quantize_bf16_to_q8_0")},
-      _quantQ4K{_quantQ4KModule.getFunction("quantize_bf16_to_q4k")} {}
+      _quantQ4K{_quantQ4KModule.getFunction("quantize_bf16_to_q4k")},
+      _quantQ6K{_quantQ6KModule.getFunction("quantize_bf16_to_q6k")} {}
 
 ComputeBuffer CudaMaterializerOps::allocate(std::size_t bytes) {
     return _ops.allocate(bytes);
@@ -174,6 +176,17 @@ void CudaMaterializerOps::quantizeBf16ToQ4K(void* dstQ4K, const void* srcBf16,
     _quantQ4K.setPtr(0, srcBf16);
     _quantQ4K.setPtr(1, dstQ4K);
     _quantQ4K.launch(_ctx.stream(),
+                     static_cast<std::uint32_t>(totalElems / 256), 1, 1,
+                     256, 1, 1);
+}
+
+void CudaMaterializerOps::quantizeBf16ToQ6K(void* dstQ6K, const void* srcBf16,
+                                            std::uint64_t totalElems) {
+    // Kernel: (bf16* src, u8* dst); grid (totalElems/256), block 256.
+    _quantQ6K.clearArgs();
+    _quantQ6K.setPtr(0, srcBf16);
+    _quantQ6K.setPtr(1, dstQ6K);
+    _quantQ6K.launch(_ctx.stream(),
                      static_cast<std::uint32_t>(totalElems / 256), 1, 1,
                      256, 1, 1);
 }

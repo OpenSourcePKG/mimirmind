@@ -735,22 +735,29 @@ void InferenceEngine::loadModelNvfp4(std::string_view checkpointDir,
                 const std::string& n = t.ggufName;
                 const bool isGateUp = n.ends_with(".ffn_gate_exps.weight")
                                    || n.ends_with(".ffn_up_exps.weight");
-                if (!isGateUp) continue;
+                const bool isDown   = n.ends_with(".ffn_down_exps.weight");
+                if (!isGateUp && !isDown) continue;
                 if ((t.elems % 256) != 0) continue;
-                const std::size_t q4kBytes =
-                    (static_cast<std::size_t>(t.elems) / 256) * 144;
-                compute::ComputeBuffer q4k = devOps.allocate(q4kBytes);
-                devOps.quantizeBf16ToQ4K(q4k.get(), t.buffer.get(), t.elems);
+                // gate/up -> Q4_K (144 B/256); down -> Q6_K (210 B/256, higher
+                // precision for the output projection). Both feed the existing
+                // fused-K MoE kernels for their type.
+                const std::size_t qBytes = isGateUp
+                    ? (static_cast<std::size_t>(t.elems) / 256) * 144
+                    : (static_cast<std::size_t>(t.elems) / 256) * 210;
+                compute::ComputeBuffer q = devOps.allocate(qBytes);
+                if (isGateUp) devOps.quantizeBf16ToQ4K(q.get(), t.buffer.get(), t.elems);
+                else          devOps.quantizeBf16ToQ6K(q.get(), t.buffer.get(), t.elems);
                 cudaCtx.stream().synchronize();
                 bytesBefore += static_cast<std::uint64_t>(t.elems) * 2;
-                bytesAfter  += q4kBytes;
-                t.buffer = std::move(q4k); // frees the BF16 bank (RAII)
-                t.isQ4K  = true;
+                bytesAfter  += qBytes;
+                t.buffer = std::move(q); // frees the BF16 bank (RAII)
+                if (isGateUp) t.isQ4K = true;
+                else          t.isQ6K = true;
                 ++nQuant;
             }
             MM_LOG_INFO("engine",
-                        "loadModelNvfp4: re-quantised {} MoE gate/up expert banks "
-                        "BF16 -> Q4_K ({} MiB -> {} MiB)",
+                        "loadModelNvfp4: re-quantised {} MoE expert banks "
+                        "(gate/up->Q4_K, down->Q6_K) BF16 -> Kquant ({} MiB -> {} MiB)",
                         nQuant, bytesBefore >> 20, bytesAfter >> 20);
         }
     }

@@ -73,6 +73,10 @@ public:
     void quantizeBf16ToQ4K(void* dstQ4K, const void* srcBf16,
                            std::uint64_t totalElems);
 
+    /** BF16 -> Q6_K (210 B / 256 elems), for the MoE down-expert banks. */
+    void quantizeBf16ToQ6K(void* dstQ6K, const void* srcBf16,
+                           std::uint64_t totalElems);
+
 private:
     core::cuda::CudaComputeContext& _ctx;
     ComputeOps&                     _ops;
@@ -83,6 +87,7 @@ private:
     core::cuda::CudaModule          _addOneModule;
     core::cuda::CudaModule          _quantQ8Module;
     core::cuda::CudaModule          _quantQ4KModule;
+    core::cuda::CudaModule          _quantQ6KModule;
     core::cuda::CudaKernel          _dqNvfp4;
     core::cuda::CudaKernel          _dqFp8;
     core::cuda::CudaKernel          _castBf16;
@@ -91,6 +96,7 @@ private:
     core::cuda::CudaKernel          _addOne;
     core::cuda::CudaKernel          _quantQ8;
     core::cuda::CudaKernel          _quantQ4K;
+    core::cuda::CudaKernel          _quantQ6K;
 };
 
 } // namespace mimirmind::compute::cuda
