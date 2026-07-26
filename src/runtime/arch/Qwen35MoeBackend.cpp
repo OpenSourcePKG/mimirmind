@@ -862,25 +862,18 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
     float* const gateActAll    = s.moeGateCompact.as<float>();  // [nSeq*K, n_ff_exp]
 
     // --- router: logits[nSeq, nExperts] = ffn_gate_inp @ moeInput ----------
-    // Synchronous: the host top-K below reads upOutBuf on the CPU. (The
-    // device-top-K fast path of runMoeFfn is deferred for the batched path
-    // until a batched moeTopKRouteDeviceAsync exists.)
-    _gmm.matmul(routerW.type, routerW.usmPtr, nExperts, d_model,
-                moeInput, nSeq, upOutBuf, matmulScratch);
-
-    // Per-sequence top-K over the nSeq router rows (moeTopKRoute treats its
-    // batch dim generically, so nSeq rows == nSeq independent routings).
-    _topKIdx.resize(nSeq * K);
-    _topKWeight.resize(nSeq * K);
-    cmp::moeTopKRoute(upOutBuf, nSeq, nExperts, K,
-                      _topKIdx.data(), _topKWeight.data());
-
+    // Device top-K straight into the USM routing slots — the batched fused-K
+    // kernels below consume expIdxSlot/kwSlot on the same stream, so there is
+    // NO host round trip and NO per-MoE-block GPU sync. moe_topk grids one
+    // block per token (grid.x = nSeq), so a single async launch routes the
+    // whole batch. (Removes ~1 sync per MoE block × 40 blocks per decode
+    // step — the dominant host-stall in the serving decode loop.)
     const float wScale = (_config.expertWeightsScale != 0.0F)
                              ? _config.expertWeightsScale : 1.0F;
-    for (std::size_t r = 0; r < nSeq * K; ++r) {
-        expIdxSlot[r] = _topKIdx[r];
-        kwSlot[r]     = _topKWeight[r] * wScale;
-    }
+    _gmm.matmulAsync(routerW.type, routerW.usmPtr, nExperts, d_model,
+                     moeInput, nSeq, upOutBuf, matmulScratch);
+    _ops.moeTopKRouteDeviceAsync(upOutBuf, expIdxSlot, kwSlot,
+                                 nSeq, nExperts, K, wScale);
 
     // Per-expert byte strides (separate banks: one block per expert). For
     // BF16 experts (NVFP4->BF16 checkpoints) the *_bf16_batched kernels index
