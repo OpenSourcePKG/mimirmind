@@ -80,6 +80,7 @@ class ArchBackend;
 
 namespace engine {
 class Nvfp4Loader;   // friend collaborator — runs loadModelNvfp4's pipeline
+class MtpDecoder;    // friend collaborator — native MTP greedy decode
 } // namespace engine
 
 /**
@@ -588,6 +589,7 @@ private:
     // Collaborators that run a cohesive slice of the engine's work on its
     // internals (extracted to keep this translation unit focused).
     friend class engine::Nvfp4Loader;
+    friend class engine::MtpDecoder;
 
     /// Compute logits over the last hidden state row via final-norm +
     /// lm_head, then draw one token id using `_sampler` and `params`.
@@ -728,21 +730,13 @@ private:
     // _blockBuffers after each scratch (re)allocation.
     std::unique_ptr<SsmState>          _ssmState;
 
-    // --- M-Cuda.MTP — native multi-token-prediction draft state --------
-    // Private 1-layer KvCache for the nextn module's self-attn (kept in sync
-    // with the trunk sequence; truncated on reject) + per-step scratch.
-    std::unique_ptr<KvCache>           _mtpKvCache;
-    compute::ComputeBuffer             _mtpEmb;      // [d_model] embed(prevTok)
-    compute::ComputeBuffer             _mtpCat;      // [2*d_model] concat(norms)
-    compute::ComputeBuffer             _mtpEh;       // [d_model] eh_proj / block out
-    compute::ComputeBuffer             _mtpLogits;   // [vocab] draft logits
-    compute::ComputeBuffer             _mtpHidden;   // [d_model] stable trunk-hidden copy
-    // GatedDeltaNet recurrent-state snapshot for verify rollback. The trunk
-    // SSM state advances monolithically over the K+1 verify tokens and cannot
-    // be truncated like a KV cache — so it is checkpointed before verify and
-    // restored (+ the accepted prefix re-forwarded) on a partial accept.
-    compute::ComputeBuffer             _mtpSsmBak;
-    compute::ComputeBuffer             _mtpConvBak;
+    // --- M-Cuda.MTP — native multi-token-prediction draft decoder ------
+    // The MTP scratch (private nextn KV cache, per-step buffers, GatedDeltaNet
+    // rollback snapshot) + the draft/verify/accept loop live in
+    // engine::MtpDecoder. Constructed lazily by generateMtp on first use;
+    // reaches back into this engine (forwardVerify / commitVerified / weights /
+    // backend / KV+SSM state) as a friend.
+    std::unique_ptr<engine::MtpDecoder> _mtpDecoder;
 
     // --- M-Cuda.Batch D2e.2 continuous-batching serving state ----------
     // Persistent per-slot paged KV pool + batched SsmState + scratch,
