@@ -5,6 +5,7 @@
 
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
+#include "compute/Embedding.hpp"
 #include "compute/MoeRouting.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
@@ -166,7 +167,14 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
                                              std::size_t   T,
                                              KvCache&      cache,
                                              BlockBuffers& s,
-                                             bool          diag) {
+                                             bool          diag,
+                                             std::size_t   kvLayerIdx) {
+    // Weight-block index (blockIdx) vs KV-cache layer index (kvL) are
+    // decoupled so the MTP module can read blk.<mtp> weights while writing
+    // into a private 1-layer KvCache at layer 0.
+    const std::size_t kvL =
+        (kvLayerIdx == std::numeric_limits<std::size_t>::max()) ? blockIdx
+                                                                : kvLayerIdx;
     auto trace = [&](const char* tag) {
         if (diag) MM_LOG_INFO("blkdiag-q35", "blk {} {}", blockIdx, tag);
     };
@@ -206,10 +214,10 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     float* const projOutBuf    = s.projOut.as<float>();
     float* const matmulScratch = s.matmulScratch.as<float>();
 
-    void* const kSlot = cache.writeSlotK(blockIdx);
-    void* const vSlot = cache.writeSlotV(blockIdx);
-    void* const kBase = const_cast<void*>(cache.baseK(blockIdx));
-    void* const vBase = const_cast<void*>(cache.baseV(blockIdx));
+    void* const kSlot = cache.writeSlotK(kvL);
+    void* const vSlot = cache.writeSlotV(kvL);
+    void* const kBase = const_cast<void*>(cache.baseK(kvL));
+    void* const vBase = const_cast<void*>(cache.baseV(kvL));
 
     // --- pre-attention RMSNorm ---------------------------------------
     trace("attn rmsNorm");
@@ -261,7 +269,7 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     // --- GQA attention -----------------------------------------------
     trace("attention");
     const float attnScale = _config.attentionScaleFor(head_dim);
-    _ops.attentionAsync(qBuf, cache.baseK(blockIdx), cache.baseV(blockIdx),
+    _ops.attentionAsync(qBuf, cache.baseK(kvL), cache.baseV(kvL),
                         T, totalLen, nHeads, nKvHeads, head_dim,
                         curLen, attnScale, attnOutBuf,
                         /*slidingWindow=*/0, kvDtype);
@@ -289,6 +297,69 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
 
     trace("ffn residual");
     _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), T * d_model);
+}
+
+void Qwen35MoeBackend::runMtpDraftStep(const float*  hidden,
+                                       std::int32_t  prevTok,
+                                       KvCache&      mtpCache,
+                                       BlockBuffers& s,
+                                       float*        embScratch,
+                                       float*        catScratch,
+                                       float*        ehScratch,
+                                       float*        logitsOut,
+                                       float*        logitsScratch) {
+    const auto& w = _weights;
+    const std::size_t mtpBlk = _config.blockCount;   // nextn module = blk.<blockCount>
+    const std::size_t d      = s.d_model;
+    const float       eps    = _config.rmsNormEps;
+
+    const auto& enorm      = requireBlock(w, mtpBlk, "nextn.enorm.weight");
+    const auto& hnorm      = requireBlock(w, mtpBlk, "nextn.hnorm.weight");
+    const auto& ehProj     = requireBlock(w, mtpBlk, "nextn.eh_proj.weight");
+    const auto& sharedNorm = requireBlock(w, mtpBlk, "nextn.shared_head_norm.weight");
+
+    const auto* tokEmb = w.find("token_embd.weight");
+    const auto* lmHead = w.find("output.weight");
+    if (lmHead == nullptr) lmHead = tokEmb;
+    if (tokEmb == nullptr || lmHead == nullptr) {
+        throw std::runtime_error("runMtpDraftStep: shared embed/lm_head missing");
+    }
+    const std::size_t vocabEmb = tokEmb->dimensions.size() >= 2
+                                     ? tokEmb->dimensions[1] : d;
+    const std::size_t vocabLm  = lmHead->dimensions.size() >= 2
+                                     ? lmHead->dimensions[1] : d;
+
+    // 1. token embedding of the just-produced token (shared trunk embedding).
+    //    qwen35moe does not scale embeddings (scalesEmbedding()==false).
+    const std::int32_t tokArr[1] = {prevTok};
+    compute::embeddingLookup(tokEmb->type, tokEmb->usmPtr, d, vocabEmb,
+                             std::span<const std::int32_t>{tokArr, 1}, embScratch);
+
+    // 2. h = eh_proj( concat( RMSNorm(embed, enorm), RMSNorm(hidden, hnorm) ) )
+    //    llama.cpp's GGUF eh_proj expects the embedding-norm FIRST, then the
+    //    hidden-norm (the reverse of the HF/vLLM fc(cat(hnorm, enorm)) order —
+    //    the convert step swaps the concat halves). catScratch = [ enorm-of-
+    //    embed (d) | hnorm-of-hidden (d) ]  (2*d).
+    _ops.rmsNormAsync(embScratch, 1, d, static_cast<const float*>(enorm.usmPtr),
+                      eps, catScratch);
+    _ops.rmsNormAsync(hidden,     1, d, static_cast<const float*>(hnorm.usmPtr),
+                      eps, catScratch + d);
+    _gmm.matmul(ehProj.type, ehProj.usmPtr, d, 2 * d, catScratch, 1,
+                ehScratch, s.matmulScratch.as<float>());
+
+    // 3. the nextn transformer block (attn + MoE), in place on ehScratch,
+    //    using the private MTP KV cache (layer 0). No commit here — the caller
+    //    advances / rolls back mtpCache around the verify/accept loop.
+    runFullAttentionBlock(mtpBlk, ehScratch, /*T=*/1, mtpCache, s,
+                          /*diag=*/false, /*kvLayerIdx=*/0);
+
+    // 4. shared head: RMSNorm(shared_head_norm) -> shared lm_head -> logits.
+    _ops.rmsNormAsync(ehScratch, 1, d,
+                      static_cast<const float*>(sharedNorm.usmPtr), eps,
+                      s.normBuf.as<float>());
+    _gmm.matmul(lmHead->type, lmHead->usmPtr, vocabLm, d,
+                s.normBuf.as<float>(), 1, logitsOut, logitsScratch);
+    // ehScratch now holds the block-<mtp> output = the next-step MTP hidden.
 }
 
 void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,

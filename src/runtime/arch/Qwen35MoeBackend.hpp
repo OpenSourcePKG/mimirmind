@@ -109,6 +109,24 @@ public:
                          const BatchedDecodeCtx&  ctx,
                          BlockBuffers&            s);
 
+    /// M-Cuda.MTP — one Multi-Token-Prediction draft step. Runs the model's
+    /// native nextn module (blk.<blockCount>): eh_proj(concat(RMSNorm(hidden,
+    /// hnorm), RMSNorm(embed(prevTok), enorm))) -> block-<mtp> attn+MoE (own
+    /// KV via `mtpCache` layer 0) -> RMSNorm(shared_head_norm) -> shared
+    /// lm_head. Writes vocab logits into `logitsOut` and leaves the block
+    /// output (the next-step hidden) in `ehScratch`. Does NOT commit mtpCache.
+    /// Scratch (caller-owned): embScratch[d], catScratch[2*d], ehScratch[d],
+    /// logitsScratch (lm-head). CUDA-only concrete entry point for the engine.
+    void runMtpDraftStep(const float*   hidden,
+                         std::int32_t   prevTok,
+                         KvCache&       mtpCache,
+                         BlockBuffers&  s,
+                         float*         embScratch,
+                         float*         catScratch,
+                         float*         ehScratch,
+                         float*         logitsOut,
+                         float*         logitsScratch);
+
     [[nodiscard]] bool        scalesEmbedding()   const noexcept override { return false; }
     [[nodiscard]] const char* name()              const noexcept override { return "qwen35moe"; }
     [[nodiscard]] bool        needsQGateScratch() const noexcept override { return true; }
@@ -121,12 +139,18 @@ public:
 
 private:
     /// Full-attention layer forward (the "easy" 1-in-interval layers).
+    /// `kvLayerIdx` selects the KvCache layer for the self-attn K/V (defaults
+    /// to `blockIdx`). The MTP module reuses this block with its OWN 1-layer
+    /// KvCache addressed at layer 0 while reading blk.<mtp> weights — hence
+    /// the decoupling of weight-block-index from KV-layer-index.
     void runFullAttentionBlock(std::size_t   blockIdx,
                                float*        x,
                                std::size_t   T,
                                KvCache&      cache,
                                BlockBuffers& s,
-                               bool          diag);
+                               bool          diag,
+                               std::size_t   kvLayerIdx =
+                                   std::numeric_limits<std::size_t>::max());
 
     /// GatedDeltaNet linear-attention layer forward (M-Q3N.3.2). Runs the
     /// conv1d → delta-rule recurrence → gated norm → out projection, then

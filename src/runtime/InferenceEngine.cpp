@@ -2481,4 +2481,194 @@ std::size_t InferenceEngine::servingMaxContext() const noexcept {
     return _serving != nullptr ? _serving->maxContext : 0;
 }
 
+bool InferenceEngine::mtpAvailable() const noexcept {
+    if (_config.nextnPredictLayers == 0 || !_weights.has_value()) {
+        return false;
+    }
+    if (dynamic_cast<arch::Qwen35MoeBackend*>(_backend.get()) == nullptr) {
+        return false;
+    }
+    return _weights->findBlock(_config.blockCount, "nextn.eh_proj.weight") != nullptr;
+}
+
+std::vector<std::int32_t>
+InferenceEngine::generateMtp(std::span<const std::int32_t> promptIds,
+                             std::size_t maxNew, std::size_t mtpDepth,
+                             std::int32_t eosId,
+                             std::size_t* draftedOut, std::size_t* acceptedOut) {
+    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_backend.get());
+    if (qb == nullptr || !mtpAvailable()) {
+        throw std::runtime_error("generateMtp: requires CUDA qwen35moe + MTP head");
+    }
+    if (promptIds.empty() || maxNew == 0) {
+        return {};
+    }
+    if (mtpDepth == 0) mtpDepth = 1;
+
+    const std::size_t d      = _config.embeddingLength;
+    const auto*       tokEmb = _weights->find("token_embd.weight");
+    const auto*       lmHead = _weights->find("output.weight");
+    if (lmHead == nullptr) lmHead = tokEmb;
+    const std::size_t vocab  = (lmHead != nullptr && lmHead->dimensions.size() >= 2)
+                                   ? lmHead->dimensions[1] : _tokenizer.vocabSize();
+
+    // Clean trunk state, then size trunk scratch (forwardVerify's ensureCapacity
+    // handles _kvCache / _blockBuffers alloc on the first call below).
+    resetCache();
+
+    // Lazy MTP KV + per-step scratch (own 1-layer cache for blk.<blockCount>).
+    if (_mtpKvCache == nullptr) {
+        _mtpKvCache = std::make_unique<KvCache>(
+            *_ops, /*nLayers=*/1, _maxContextTokens,
+            _config.headCountKv, _config.headDim(), _kvDtype);
+        _mtpEmb    = _ops->allocate(d * sizeof(float));
+        _mtpCat    = _ops->allocate(2 * d * sizeof(float));
+        _mtpEh     = _ops->allocate(d * sizeof(float));
+        _mtpHidden = _ops->allocate(d * sizeof(float));
+        _mtpLogits = _ops->allocate(vocab * sizeof(float));
+    }
+    _mtpKvCache->reset();
+
+    float* const embS   = _mtpEmb.as<float>();
+    float* const catS   = _mtpCat.as<float>();
+    float* const ehS    = _mtpEh.as<float>();
+    float* const hidS   = _mtpHidden.as<float>();
+    float* const mtpLog = _mtpLogits.as<float>();
+    float* const logSc  = _logitsScH.as<float>();
+
+    auto argmaxDev = [&](float* devLogits) -> std::int32_t {
+        if (_logitsHostScratch.size() < vocab) _logitsHostScratch.resize(vocab);
+        _ops->flush();
+        _ops->readbackToHost(_logitsHostScratch.data(), devLogits,
+                             vocab * sizeof(float));
+        std::size_t best = 0; float bv = _logitsHostScratch[0];
+        for (std::size_t v = 1; v < vocab; ++v)
+            if (_logitsHostScratch[v] > bv) { bv = _logitsHostScratch[v]; best = v; }
+        return static_cast<std::int32_t>(best);
+    };
+    auto argmaxHost = [&](const std::vector<float>& row) -> std::int32_t {
+        std::size_t best = 0; float bv = row[0];
+        for (std::size_t v = 1; v < row.size(); ++v)
+            if (row[v] > bv) { bv = row[v]; best = v; }
+        return static_cast<std::int32_t>(best);
+    };
+
+    // ---- Prefill: trunk forward (provisional KV) + seed the MTP KV -------
+    std::vector<std::int32_t> prompt(promptIds.begin(), promptIds.end());
+    auto pfLogits = forwardVerify(prompt);  // _xBufH now holds the P trunk hiddens
+    const std::size_t P    = prompt.size();
+    BlockBuffers&     buf  = *_blockBuffers;
+    float*            xBuf = _xBufH.as<float>();
+    for (std::size_t p = 0; p + 1 < P; ++p) {
+        qb->runMtpDraftStep(xBuf + p * d, prompt[p + 1], *_mtpKvCache, buf,
+                            embS, catS, ehS, mtpLog, logSc);
+        _mtpKvCache->commit(1);
+    }
+    commitVerified(prompt);
+    _ops->appendMemoryCopy(hidS, xBuf + (P - 1) * d, d * sizeof(float));
+    _ops->flush();
+    std::int32_t token0 = argmaxHost(pfLogits.back());
+
+    std::vector<std::int32_t> out;
+    std::size_t drafted = 0, accepted = 0;
+    bool stop = false;
+    auto emit = [&](std::int32_t t) -> bool {
+        out.push_back(t);
+        if (eosId >= 0 && t == eosId) { stop = true; return false; }
+        return out.size() < maxNew;
+    };
+
+    while (out.size() < maxNew && !stop) {
+        const std::size_t K = std::min(mtpDepth, maxNew - out.size());
+
+        // ---- Draft K tokens with the nextn module -----------------------
+        std::vector<std::int32_t> drafts;
+        drafts.reserve(K);
+        std::int32_t       prev = token0;
+        const float*       hcur = hidS;
+        const std::size_t  mtpPre = _mtpKvCache->length();
+        for (std::size_t k = 0; k < K; ++k) {
+            qb->runMtpDraftStep(hcur, prev, *_mtpKvCache, buf,
+                                embS, catS, ehS, mtpLog, logSc);
+            _mtpKvCache->commit(1);
+            const std::int32_t dk = argmaxDev(mtpLog);
+            drafts.push_back(dk);
+            hcur = ehS;   // block-<mtp> output = next-step hidden
+            prev = dk;
+            ++drafted;
+        }
+
+        // ---- Verify: one trunk forward on [token0, drafts...] -----------
+        std::vector<std::int32_t> vtoks;
+        vtoks.reserve(K + 1);
+        vtoks.push_back(token0);
+        vtoks.insert(vtoks.end(), drafts.begin(), drafts.end());
+
+        // Snapshot the trunk GatedDeltaNet recurrent state + rolling conv tail
+        // before verify — it advances monolithically over all K+1 tokens and
+        // (unlike the KV cache) cannot be truncated. On a partial accept we
+        // restore it and re-forward just the accepted prefix.
+        SsmState* const ssm = _ssmState.get();
+        std::size_t stBytes = 0, cvBytes = 0;
+        if (ssm != nullptr) {
+            stBytes = ssm->blockCount() * ssm->stateLayerStride()     * sizeof(float);
+            cvBytes = ssm->blockCount() * ssm->convStateLayerStride() * sizeof(float);
+            if (_mtpSsmBak.get() == nullptr) {
+                _mtpSsmBak  = _ops->allocate(stBytes);
+                _mtpConvBak = _ops->allocate(cvBytes);
+            }
+            _ops->appendMemoryCopy(_mtpSsmBak.get(),  ssm->statePtr(),     stBytes);
+            _ops->appendMemoryCopy(_mtpConvBak.get(), ssm->convStatePtr(), cvBytes);
+        }
+
+        const std::size_t preKvLen = _kvCache->length();
+        auto vlogits = forwardVerify(vtoks);   // advances trunk KV(prov) + SSM by K+1
+        xBuf = _xBufH.as<float>();
+
+        // ---- Accept the longest matching prefix (greedy) ----------------
+        std::size_t a = 0;
+        for (std::size_t i = 0; i < K; ++i) {
+            if (argmaxHost(vlogits[i]) == drafts[i]) ++a; else break;
+        }
+        const std::int32_t corrected = argmaxHost(vlogits[a]);
+        accepted += a;
+
+        std::vector<std::int32_t> committed(vtoks.begin(),
+                                            vtoks.begin() + static_cast<std::ptrdiff_t>(a + 1));
+
+        if (a == K) {
+            // All K drafts accepted (committed == all K+1 verify tokens): the
+            // SSM state already reflects exactly the committed prefix.
+            commitVerified(committed);
+            _ops->appendMemoryCopy(hidS, xBuf + a * d, d * sizeof(float));
+        } else {
+            // Partial accept: the SSM state over-advanced. Restore it, undo the
+            // provisional KV, and re-forward the accepted prefix so both the
+            // KV and the recurrent state land exactly on the committed suffix.
+            if (ssm != nullptr) {
+                _ops->appendMemoryCopy(ssm->statePtr(),     _mtpSsmBak.get(),  stBytes);
+                _ops->appendMemoryCopy(ssm->convStatePtr(), _mtpConvBak.get(), cvBytes);
+            }
+            _kvCache->truncate(preKvLen);
+            auto vl2 = forwardVerify(committed);   // KV(prov) + SSM by a+1
+            xBuf = _xBufH.as<float>();
+            commitVerified(committed);
+            _ops->appendMemoryCopy(hidS, xBuf + a * d, d * sizeof(float));
+        }
+        _mtpKvCache->truncate(mtpPre + a + 1);  // MTP-attn KV: token0 + accepted
+
+        // ---- Emit token0 + accepted drafts (corrected -> next token0) ---
+        bool cont = emit(token0);
+        for (std::size_t i = 0; i < a && cont; ++i) cont = emit(drafts[i]);
+
+        _ops->flush();
+        token0 = corrected;
+        if (!cont) break;
+    }
+
+    if (draftedOut)  *draftedOut  = drafted;
+    if (acceptedOut) *acceptedOut = accepted;
+    return out;
+}
+
 } // namespace mimirmind::runtime

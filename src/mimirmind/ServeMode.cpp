@@ -636,6 +636,74 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             return 0;
         }
 
+        // M-Cuda.MTP — native multi-token-prediction validation + speedup.
+        // MIMIRMIND_MTP_TEST: run generateMtp (depth from MIMIRMIND_MTP_DEPTH,
+        // default 2) vs plain greedy generate() on the same prompt. Output MUST
+        // be bit-identical (verify guarantees correctness); report accept-rate
+        // and decode speedup.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_MTP_TEST") != nullptr) {
+            if (!e->mtpAvailable()) {
+                std::cout << "\n[M-Cuda.MTP] model has no nextn head — skipped\n";
+                std::cout.flush();
+                return 0;
+            }
+            const auto& tok = e->tokenizer();
+            std::vector<std::int32_t> pids =
+                tok.encode("The history of artificial intelligence began when",
+                           /*addBos=*/false);
+            if (pids.empty()) pids.push_back(1);
+            std::size_t depth = 2;
+            if (const char* dv = std::getenv("MIMIRMIND_MTP_DEPTH")) {
+                const long v = std::strtol(dv, nullptr, 10);
+                if (v >= 1) depth = static_cast<std::size_t>(v);
+            }
+            const std::size_t maxNew = 64;
+            using clk = std::chrono::steady_clock;
+
+            // Baseline greedy generate().
+            ::mimirmind::runtime::GenerateParams gp{};
+            gp.maxNewTokens         = maxNew;
+            gp.sampling.temperature = 0.0F;
+            e->resetCache();
+            const auto tb0 = clk::now();
+            std::vector<std::int32_t> ref =
+                e->generate(pids, gp, {}, nullptr, {}, {});
+            const double baseMs =
+                std::chrono::duration<double, std::milli>(clk::now() - tb0).count();
+
+            // MTP greedy generate.
+            std::size_t drafted = 0, accepted = 0;
+            const auto tm0 = clk::now();
+            std::vector<std::int32_t> mtp =
+                e->generateMtp(pids, maxNew, depth, tok.eosId(),
+                               &drafted, &accepted);
+            const double mtpMs =
+                std::chrono::duration<double, std::milli>(clk::now() - tm0).count();
+
+            std::size_t matchLen = 0;
+            const std::size_t cn = std::min(ref.size(), mtp.size());
+            for (; matchLen < cn; ++matchLen)
+                if (ref[matchLen] != mtp[matchLen]) break;
+            const bool identical =
+                (ref.size() == mtp.size()) && (matchLen == ref.size());
+            const double acceptRate =
+                drafted > 0 ? static_cast<double>(accepted) / drafted : 0.0;
+
+            std::cout << "\n[M-Cuda.MTP] depth=" << depth << " maxNew=" << maxNew
+                      << "\n  output-identical=" << (identical ? "YES" : "NO")
+                      << " (match " << matchLen << "/" << ref.size() << ", mtp "
+                      << mtp.size() << ")\n"
+                      << "  accept-rate=" << acceptRate << " (" << accepted << "/"
+                      << drafted << ")\n"
+                      << "  baseline=" << baseMs << " ms  mtp=" << mtpMs
+                      << " ms  speedup=" << (mtpMs > 0 ? baseMs / mtpMs : 0.0)
+                      << "x\n"
+                      << "  => MTP " << (identical ? "PASS" : "MISMATCH") << "\n";
+            std::cout.flush();
+            return 0;
+        }
+
         // M9.8b — cross-block sanity check on the effective runtime.
         // The plain-attention fallback in kernels/attention.cl holds
         // scores[ATTN_MAX_TK] in 64 KiB SLM, so if a caller forces the

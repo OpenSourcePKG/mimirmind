@@ -261,6 +261,28 @@ public:
              const PrefillCallback&          onPrefillDone      = {},
              const PrefillProgressCallback&  onPrefillProgress  = {});
 
+    /**
+     * M-Cuda.MTP — greedy multi-token-prediction (model-native speculative
+     * decoding). Drafts `mtpDepth` tokens per round with the model's nextn
+     * module (blk.<blockCount>), verifies them in a single trunk forward
+     * (forwardVerify), accepts the longest matching prefix. For temperature 0
+     * the output is BIT-IDENTICAL to greedy generate() — verify guarantees
+     * correctness; the draft only affects speed (accept rate). CUDA +
+     * qwen35moe with a loaded MTP head only (nextnPredictLayers > 0).
+     * `acceptedOut`/`draftedOut` (optional) report the accept-rate counters.
+     */
+    [[nodiscard]] std::vector<std::int32_t>
+    generateMtp(std::span<const std::int32_t> promptIds,
+                std::size_t                    maxNew,
+                std::size_t                    mtpDepth,
+                std::int32_t                   eosId,
+                std::size_t*                   draftedOut  = nullptr,
+                std::size_t*                   acceptedOut = nullptr);
+
+    /// True iff the loaded model carries a native MTP (nextn) head and the
+    /// backend supports the MTP draft path (CUDA qwen35moe).
+    [[nodiscard]] bool mtpAvailable() const noexcept;
+
     /// Drop the persistent KV-cache so the next generate() starts from
     /// scratch. Cache *buffers* stay allocated — only the logical length
     /// and the cached-token bookkeeping are cleared. Used by tests, by
@@ -697,6 +719,22 @@ private:
     // and BlockBuffers reallocations. Its pointers are bound into
     // _blockBuffers after each scratch (re)allocation.
     std::unique_ptr<SsmState>          _ssmState;
+
+    // --- M-Cuda.MTP — native multi-token-prediction draft state --------
+    // Private 1-layer KvCache for the nextn module's self-attn (kept in sync
+    // with the trunk sequence; truncated on reject) + per-step scratch.
+    std::unique_ptr<KvCache>           _mtpKvCache;
+    compute::ComputeBuffer             _mtpEmb;      // [d_model] embed(prevTok)
+    compute::ComputeBuffer             _mtpCat;      // [2*d_model] concat(norms)
+    compute::ComputeBuffer             _mtpEh;       // [d_model] eh_proj / block out
+    compute::ComputeBuffer             _mtpLogits;   // [vocab] draft logits
+    compute::ComputeBuffer             _mtpHidden;   // [d_model] stable trunk-hidden copy
+    // GatedDeltaNet recurrent-state snapshot for verify rollback. The trunk
+    // SSM state advances monolithically over the K+1 verify tokens and cannot
+    // be truncated like a KV cache — so it is checkpointed before verify and
+    // restored (+ the accepted prefix re-forwarded) on a partial accept.
+    compute::ComputeBuffer             _mtpSsmBak;
+    compute::ComputeBuffer             _mtpConvBak;
 
     // --- M-Cuda.Batch D2e.2 continuous-batching serving state ----------
     // Persistent per-slot paged KV pool + batched SsmState + scratch,
