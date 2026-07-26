@@ -77,6 +77,15 @@ public:
     void quantizeBf16ToQ6K(void* dstQ6K, const void* srcBf16,
                            std::uint64_t totalElems);
 
+    /**
+     * BF16 -> blocked-FP8 E4M3 (34 B / 32 elems) for the attention projections.
+     * `rows` rows of `K` BF16 elements (K % 32 == 0); dst gets the blocked-FP8
+     * in the layout matmul_fp8_vec/_gemm expect. Log-format (E4M3) preserves the
+     * small weights a linear Q8_0 would crush. Enqueued on the stream.
+     */
+    void quantizeBf16ToFp8(void* dstFp8, const void* srcBf16,
+                           std::uint64_t rows, std::uint64_t K);
+
 private:
     core::cuda::CudaComputeContext& _ctx;
     ComputeOps&                     _ops;
@@ -88,6 +97,7 @@ private:
     core::cuda::CudaModule          _quantQ8Module;
     core::cuda::CudaModule          _quantQ4KModule;
     core::cuda::CudaModule          _quantQ6KModule;
+    core::cuda::CudaModule          _quantFp8Module;
     core::cuda::CudaKernel          _dqNvfp4;
     core::cuda::CudaKernel          _dqFp8;
     core::cuda::CudaKernel          _castBf16;
@@ -97,6 +107,7 @@ private:
     core::cuda::CudaKernel          _quantQ8;
     core::cuda::CudaKernel          _quantQ4K;
     core::cuda::CudaKernel          _quantQ6K;
+    core::cuda::CudaKernel          _quantFp8;
 };
 
 } // namespace mimirmind::compute::cuda

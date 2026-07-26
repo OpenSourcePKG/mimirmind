@@ -683,6 +683,9 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/quantize_bf16_to_q8_0.cu
         kernels_cuda/quantize_bf16_to_q4k.cu
         kernels_cuda/quantize_bf16_to_q6k.cu
+        kernels_cuda/quantize_bf16_to_fp8.cu
+        kernels_cuda/matmul_fp8_vec.cu
+        kernels_cuda/matmul_fp8_gemm.cu
         kernels_cuda/moe_gate_up_fused_k_bf16_batched.cu
         kernels_cuda/moe_down_fused_k_bf16_batched.cu
         kernels_cuda/matmul_q3k_vec.cu

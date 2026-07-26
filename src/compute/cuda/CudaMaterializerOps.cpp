@@ -9,11 +9,15 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace mimirmind::compute::cuda {
 
@@ -64,6 +68,7 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _quantQ8Module{loadModule(ctx.cudaContext(), "quantize_bf16_to_q8_0")},
       _quantQ4KModule{loadModule(ctx.cudaContext(), "quantize_bf16_to_q4k")},
       _quantQ6KModule{loadModule(ctx.cudaContext(), "quantize_bf16_to_q6k")},
+      _quantFp8Module{loadModule(ctx.cudaContext(), "quantize_bf16_to_fp8")},
       _dqNvfp4{_nvfp4Module.getFunction("dequant_nvfp4")},
       _dqFp8{_fp8Module.getFunction("dequant_fp8")},
       _castBf16{_castModule.getFunction("cast_bf16_to_f32")},
@@ -72,7 +77,8 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _addOne{_addOneModule.getFunction("add_one_f32")},
       _quantQ8{_quantQ8Module.getFunction("quantize_bf16_to_q8_0")},
       _quantQ4K{_quantQ4KModule.getFunction("quantize_bf16_to_q4k")},
-      _quantQ6K{_quantQ6KModule.getFunction("quantize_bf16_to_q6k")} {}
+      _quantQ6K{_quantQ6KModule.getFunction("quantize_bf16_to_q6k")},
+      _quantFp8{_quantFp8Module.getFunction("quantize_bf16_to_fp8")} {}
 
 ComputeBuffer CudaMaterializerOps::allocate(std::size_t bytes) {
     return _ops.allocate(bytes);
@@ -189,6 +195,39 @@ void CudaMaterializerOps::quantizeBf16ToQ6K(void* dstQ6K, const void* srcBf16,
     _quantQ6K.launch(_ctx.stream(),
                      static_cast<std::uint32_t>(totalElems / 256), 1, 1,
                      256, 1, 1);
+}
+
+void CudaMaterializerOps::quantizeBf16ToFp8(void* dstFp8, const void* srcBf16,
+                                            std::uint64_t rows, std::uint64_t K) {
+    // Per-tensor E4M3 scale: readback the BF16 weights, take absmax on host,
+    // scale = absmax / 448 (E4M3 max). This equals the checkpoint's original
+    // FP8 weight_scale, so e4m3(BF16/scale) recovers the original e4m3 grid
+    // near-losslessly (no double-quant). One-time at load.
+    const std::uint64_t n = rows * K;
+    std::vector<std::uint16_t> hostBf16(n);
+    _ops.readbackToHost(hostBf16.data(), srcBf16, n * sizeof(std::uint16_t));
+    _ops.flush();
+    float absMax = 0.0f;
+    for (std::uint64_t i = 0; i < n; ++i) {
+        const std::uint32_t bits = static_cast<std::uint32_t>(hostBf16[i]) << 16;
+        float f;
+        std::memcpy(&f, &bits, sizeof(f));
+        absMax = std::fmax(absMax, std::fabs(f));
+    }
+    const float scale    = (absMax > 0.0f) ? absMax * (1.0f / 448.0f) : 1.0f;
+    const float invScale = (absMax > 0.0f) ? (448.0f / absMax) : 0.0f;
+
+    // Kernel: (bf16* src, u8* dst, int K, float scale, float invScale).
+    _quantFp8.clearArgs();
+    _quantFp8.setPtr  (0, srcBf16);
+    _quantFp8.setPtr  (1, dstFp8);
+    _quantFp8.setValue(2, static_cast<std::int32_t>(K));
+    _quantFp8.setValue(3, scale);
+    _quantFp8.setValue(4, invScale);
+    _quantFp8.launch(_ctx.stream(),
+                     static_cast<std::uint32_t>(rows),
+                     static_cast<std::uint32_t>(K / 32), 1,
+                     32, 1, 1);
 }
 
 float CudaMaterializerOps::readF32(const void* devPtr) {

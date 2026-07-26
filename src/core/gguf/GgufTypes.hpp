@@ -50,6 +50,11 @@ enum class GgmlType : std::uint32_t {
     I64     = 27,
     F64     = 28,
     BF16    = 30,
+    // Custom (not a GGUF on-disk type): blocked-FP8 E4M3, 34 B per 32-element
+    // block (fp16 scale + 32 E4M3). Produced at load time by the NVFP4 loader
+    // to keep the attention projections 1-byte in a log-preserving format;
+    // consumed by matmul_fp8_vec / _gemm. Never read from a GGUF file.
+    FP8_E4M3 = 40,
     Unknown = 0xFFFFFFFFu,
 };
 

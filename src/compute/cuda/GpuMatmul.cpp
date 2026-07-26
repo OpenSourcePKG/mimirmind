@@ -183,6 +183,10 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _matmulBf16VecKernel;
     ::mimirmind::core::cuda::CudaModule _matmulBf16GemmModule;
     ::mimirmind::core::cuda::CudaKernel _matmulBf16GemmKernel;
+    ::mimirmind::core::cuda::CudaModule _matmulFp8VecModule;
+    ::mimirmind::core::cuda::CudaKernel _matmulFp8VecKernel;
+    ::mimirmind::core::cuda::CudaModule _matmulFp8GemmModule;
+    ::mimirmind::core::cuda::CudaKernel _matmulFp8GemmKernel;
 
     explicit Impl(::mimirmind::core::cuda::CudaContext& ctx)
         : _matmulQ8_0VecModule    {loadCudaModule(ctx, "matmul_q8_0_vec")},
@@ -262,7 +266,13 @@ struct GpuMatmul::Impl {
               _matmulBf16VecModule.getFunction("matmul_bf16_vec")},
           _matmulBf16GemmModule   {loadCudaModule(ctx, "matmul_bf16_gemm")},
           _matmulBf16GemmKernel   {
-              _matmulBf16GemmModule.getFunction("matmul_bf16_gemm")}
+              _matmulBf16GemmModule.getFunction("matmul_bf16_gemm")},
+          _matmulFp8VecModule     {loadCudaModule(ctx, "matmul_fp8_vec")},
+          _matmulFp8VecKernel     {
+              _matmulFp8VecModule.getFunction("matmul_fp8_vec")},
+          _matmulFp8GemmModule    {loadCudaModule(ctx, "matmul_fp8_gemm")},
+          _matmulFp8GemmKernel    {
+              _matmulFp8GemmModule.getFunction("matmul_fp8_gemm")}
     {}
 };
 
@@ -807,6 +817,40 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
             kern.launch(_ctx.stream(),
                         nGroups, 1, 1,
                         kVecLocalSize, 1, 1);
+        }
+        return;
+    }
+
+    if (type == ::mimirmind::core::gguf::GgmlType::FP8_E4M3) {
+        // Blocked-FP8 (E4M3) matmul — 1-byte log-format weights (34 B / 32).
+        // Same warp layout as BF16 (LOCAL=128, 4 outputs/group); the scale is
+        // embedded per block so no scale plumbing is needed. Used for the
+        // attention projections the NVFP4 loader keeps blocked-FP8.
+        const std::uint32_t nGroups = static_cast<std::uint32_t>(
+            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+
+        if (M == 1) {
+            auto& kern = _pimpl->_matmulFp8VecKernel;
+            kern.setPtr  (0, X);
+            kern.setPtr  (1, W);
+            kern.setPtr  (2, Y);
+            kern.setValue(3, static_cast<std::int32_t>(K));
+            kern.setValue(4, static_cast<std::int32_t>(N));
+            kern.launch(_ctx.stream(), nGroups, 1, 1, kVecLocalSize, 1, 1);
+            return;
+        }
+
+        constexpr std::size_t kGemmMaxM = 16;   // == GEMM_MAX_M in the .cu
+        auto& kern = _pimpl->_matmulFp8GemmKernel;
+        for (std::size_t m0 = 0; m0 < M; m0 += kGemmMaxM) {
+            const std::size_t mChunk = std::min(kGemmMaxM, M - m0);
+            kern.setPtr  (0, X + m0 * K);
+            kern.setPtr  (1, W);
+            kern.setPtr  (2, Y + m0 * N);
+            kern.setValue(3, static_cast<std::int32_t>(K));
+            kern.setValue(4, static_cast<std::int32_t>(N));
+            kern.setValue(5, static_cast<std::int32_t>(mChunk));
+            kern.launch(_ctx.stream(), nGroups, 1, 1, kVecLocalSize, 1, 1);
         }
         return;
     }

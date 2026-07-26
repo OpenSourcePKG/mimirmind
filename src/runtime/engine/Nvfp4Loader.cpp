@@ -284,6 +284,65 @@ void Nvfp4Loader::load(InferenceEngine& e,
         }
     }
 
+    // 5e. Re-quantise the dense attention projections BF16 -> blocked-FP8 (E4M3).
+    //
+    // These log-distributed FP8/NVFP4-origin projections are exactly what a
+    // linear Q8_0 crushes (q8_0-linear-requant lesson). Blocked-FP8 keeps the
+    // E4M3 log format per 32-block (34 B / 32 ≈ 1.06 B/elem vs 2 B BF16) so the
+    // small weights survive; the matmul_fp8_vec/_gemm kernels consume it (scale
+    // embedded per block, so no scale plumbing / matmulAsync signature change).
+    // Halves the always-read attention traffic (all layers, every token).
+    // MIMIRMIND_NVFP4_ATTN_FP8=0 keeps BF16 (A/B).
+    {
+        // MIMIRMIND_NVFP4_ATTN_FP8 selects which projections to keep FP8:
+        //   unset / "gdn" — only the GatedDeltaNet linear projections
+        //                   (attn_qkv/attn_gate/ssm_out), which ARE natively FP8
+        //                   in the checkpoint → E4M3 is lossless-ish + coherent
+        //   "fa"          — full-attention q/k/v/output only (NVFP4/BF16 origin;
+        //                   E4M3 is a downgrade there — degrades)
+        //   "all"         — both     "0" — disabled (keep BF16)
+        const char* fp8env = std::getenv("MIMIRMIND_NVFP4_ATTN_FP8");
+        const std::string_view mode = (fp8env == nullptr) ? "gdn" : fp8env;
+        if (mode != "0") {
+            const bool wantFa  = (mode == "all" || mode == "fa");
+            const bool wantGdn = (mode == "all" || mode == "gdn");
+            auto isFa = [](std::string_view n) {
+                return n.ends_with(".attn_q.weight") || n.ends_with(".attn_k.weight")
+                    || n.ends_with(".attn_v.weight") || n.ends_with(".attn_output.weight");
+            };
+            auto isGdn = [](std::string_view n) {
+                return n.ends_with(".attn_qkv.weight") || n.ends_with(".attn_gate.weight")
+                    || n.ends_with(".ssm_out.weight");
+            };
+            auto isAttnProj = [&](std::string_view n) {
+                return (wantFa && isFa(n)) || (wantGdn && isGdn(n));
+            };
+            std::size_t nQuant = 0;
+            std::uint64_t bytesBefore = 0, bytesAfter = 0;
+            for (auto& t : e._materializedBf16) {
+                if (t.isF32 || t.isQ8_0 || t.isQ4K || t.isQ6K) continue;
+                if (t.ggufDims.size() < 2 || !isAttnProj(t.ggufName)) continue;
+                const std::uint64_t K    = t.ggufDims[0];  // input dim (contiguous)
+                const std::uint64_t rows = t.ggufDims[1];  // output dim
+                if (K == 0 || rows == 0 || (K % 32) != 0 || K * rows != t.elems) continue;
+                const std::size_t fp8Bytes =
+                    (static_cast<std::size_t>(t.elems) / 32) * 34;
+                compute::ComputeBuffer fp8 = devOps.allocate(fp8Bytes);
+                devOps.quantizeBf16ToFp8(fp8.get(), t.buffer.get(), rows, K);
+                cudaCtx.stream().synchronize();
+                bytesBefore += static_cast<std::uint64_t>(t.elems) * 2;
+                bytesAfter  += fp8Bytes;
+                t.buffer = std::move(fp8); // frees the BF16 buffer (RAII)
+                t.isFp8  = true;
+                ++nQuant;
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: re-quantised {} attention projections "
+                        "BF16 -> blocked-FP8 E4M3 (mode='{}', {} MiB -> {} MiB)",
+                        nQuant, mode, bytesBefore >> 20, bytesAfter >> 20);
+        }
+    }
+
     // 6. Expose the BF16 tensors as a GGUF-convention WeightsMap.
     e._weights.emplace(runtime::nvfp4::buildBf16WeightsMap(e._materializedBf16));
 
