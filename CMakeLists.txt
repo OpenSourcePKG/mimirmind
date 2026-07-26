@@ -1260,6 +1260,22 @@ target_include_directories(compute_tests PRIVATE tests)
 
 target_link_libraries(compute_tests PRIVATE mimirmind_core_common)
 
+# ---- thermal_tests — pure-CPU tests for the GPU clock governor -------------
+#
+# Covers the M9.6.6.2 adaptive up-gain: the pure ramp function plus
+# adjustForTemp + overshoot watchdog + kill-switch driven against a
+# synthetic /sys/class/drm tree (plain files). No GPU, no model, no L0.
+#
+# Run via:   cmake --build build --target thermal_tests && build/thermal_tests
+
+add_executable(thermal_tests
+    tests/thermal_tests.cpp
+    src/runtime/thermal/GpuClockGovernor.cpp
+    src/runtime/thermal/SystemMonitor.cpp
+)
+target_include_directories(thermal_tests PRIVATE tests)
+target_link_libraries(thermal_tests PRIVATE mimirmind_core_common)
+
 # ---- L0-backed integration binaries ----------------------------------------
 #
 # gpu_tests / prefill_bench / l0_ipc_testrig all need libze_loader plus the

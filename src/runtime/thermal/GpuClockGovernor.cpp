@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <string>
+#include <string_view>
 
 namespace mimirmind::runtime {
 
@@ -38,6 +40,16 @@ bool writeFreq(const std::string& path, std::uint32_t mhz) {
 } // namespace
 
 GpuClockGovernor::GpuClockGovernor(std::string_view sysfsRoot) {
+    // M9.6.6.2 kill-switch: MIMIRMIND_GOVERNOR_ADAPTIVE_UP=off|0|false|no
+    // reverts to the flat paranoid up-gain without a rebuild — the
+    // post-deploy rollback path for the one milestone with real
+    // hardware-shutdown risk.
+    if (const char* e = std::getenv("MIMIRMIND_GOVERNOR_ADAPTIVE_UP")) {
+        const std::string_view v{e};
+        if (v == "off" || v == "0" || v == "false" || v == "no") {
+            _adaptiveUp = false;
+        }
+    }
     probe(sysfsRoot);
 }
 
@@ -126,19 +138,48 @@ std::uint32_t GpuClockGovernor::pin(std::uint32_t mhz,
     return _pinnedMhz;
 }
 
+float GpuClockGovernor::adaptiveUpGainMhzPerC(float headroomC) noexcept {
+    if (headroomC < 0.0F) {
+        headroomC = 0.0F;
+    }
+    return std::clamp(headroomC * kAdaptiveUpSlope,
+                      kGainUpMhzPerC, kAdaptiveUpMaxMhzPerC);
+}
+
 std::uint32_t GpuClockGovernor::adjustForTemp(float current_temp_c) {
     if (!_available) {
         return 0;
     }
-    const float error = current_temp_c - _targetTempC;
+    const float error = current_temp_c - _targetTempC;  // >0 = over target
+
+    // Overshoot watchdog (hysteresis) — evaluated every tick, even inside
+    // the deadband. A real overshoot past the deadband latches the adaptive
+    // up-gain OFF (back to the flat baseline creep); it releases only once
+    // the chip has cooled kOvershootReleaseC below target. This bounds how
+    // fast the cap can climb right after a heat spike — the exact
+    // 2026-07-01 shutdown condition. The DOWN path is never gated by this.
+    if (error > kOvershootLatchC) {
+        _overshootLatched = true;
+    } else if (error < -kOvershootReleaseC) {
+        _overshootLatched = false;
+    }
 
     // Deadband — within ±kDeadbandC of target the cap is left alone.
     if (error >= -kDeadbandC && error <= kDeadbandC) {
         return _currentCap;
     }
 
-    // Asymmetric gain: drop fast on overshoot, creep up on undershoot.
-    const float gain   = (error > 0.0F) ? kGainDownMhzPerC : kGainUpMhzPerC;
+    // Asymmetric gain. DOWN is always the hard paranoid rate. UP scales
+    // with headroom (adaptive) unless the kill-switch is off or the
+    // watchdog has latched — then it falls back to the flat baseline creep.
+    float gain;
+    if (error > 0.0F) {
+        gain = kGainDownMhzPerC;                  // over target — drop hard
+    } else if (_adaptiveUp && !_overshootLatched) {
+        gain = adaptiveUpGainMhzPerC(-error);     // headroom = -error (>0)
+    } else {
+        gain = kGainUpMhzPerC;                     // baseline creep
+    }
     const float deltaF = -error * gain;
     // Round toward zero so a sub-1-MHz target doesn't churn the cap.
     const std::int32_t delta = static_cast<std::int32_t>(deltaF);
@@ -181,6 +222,12 @@ std::uint32_t GpuClockGovernor::tick(SystemMonitor& monitor) {
             << ",\"gain_up_mhz_per_c\":"      << kGainUpMhzPerC
             << ",\"gain_down_mhz_per_c\":"    << kGainDownMhzPerC
             << ",\"deadband_c\":"             << kDeadbandC
+            << ",\"adaptive_up\":"            << (_adaptiveUp ? "true" : "false")
+            << ",\"overshoot_latched\":"      << (_overshootLatched ? "true" : "false")
+            << ",\"eff_up_gain_mhz_per_c\":"
+            << ((error < 0.0F && _adaptiveUp && !_overshootLatched)
+                    ? adaptiveUpGainMhzPerC(-error)
+                    : kGainUpMhzPerC)
             << ",\"pinned\":"                 << (_pinned ? "true" : "false")
             << "}\n";
         _tickLog.flush();
