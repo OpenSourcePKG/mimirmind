@@ -53,7 +53,6 @@ class PerfRegressionDetector;
 class PowerMonitor;
 class SystemMonitor;
 class ThermalGuard;
-struct ServingState;   // M-Cuda.Batch D2e.2 — persistent continuous-batch state
 } // namespace mimirmind::runtime
 
 #include <cstddef>
@@ -79,8 +78,9 @@ class ArchBackend;
 } // namespace arch
 
 namespace engine {
-class Nvfp4Loader;   // friend collaborator — runs loadModelNvfp4's pipeline
-class MtpDecoder;    // friend collaborator — native MTP greedy decode
+class Nvfp4Loader;    // friend collaborator — runs loadModelNvfp4's pipeline
+class MtpDecoder;     // friend collaborator — native MTP greedy decode
+class ServingSession; // friend collaborator — batched / continuous-batch decode
 } // namespace engine
 
 /**
@@ -590,6 +590,7 @@ private:
     // internals (extracted to keep this translation unit focused).
     friend class engine::Nvfp4Loader;
     friend class engine::MtpDecoder;
+    friend class engine::ServingSession;
 
     /// Compute logits over the last hidden state row via final-norm +
     /// lm_head, then draw one token id using `_sampler` and `params`.
@@ -738,11 +739,12 @@ private:
     // backend / KV+SSM state) as a friend.
     std::unique_ptr<engine::MtpDecoder> _mtpDecoder;
 
-    // --- M-Cuda.Batch D2e.2 continuous-batching serving state ----------
-    // Persistent per-slot paged KV pool + batched SsmState + scratch,
-    // built by ensureServingState() and stepped by stepServing(). Defined
-    // in the .cpp so the header stays free of the serving-internal types.
-    std::unique_ptr<ServingState>      _serving;
+    // --- M-Cuda.Batch — batched / continuous-batch decode substrate ----
+    // The batched-generation harnesses (generateBatch / generateServingParity)
+    // and the persistent per-slot continuous-batch state (ensureServingState /
+    // stepServing) live in engine::ServingSession, which owns the ServingState.
+    // Constructed lazily on the first serving call.
+    std::unique_ptr<engine::ServingSession> _servingSession;
 
     // --- M-Startup.CapacityProbe ---------------------------------------
     // Populated in finalizeLoad() once weights are on the device.

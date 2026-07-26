@@ -893,6 +893,7 @@ add_executable(mimirmind
     src/runtime/InferenceEngine.cpp
     src/runtime/engine/Nvfp4Loader.cpp
     src/runtime/engine/MtpDecoder.cpp
+    src/runtime/engine/ServingSession.cpp
     src/runtime/serving/ContinuousBatcher.cpp
     src/runtime/KvCache.cpp
     src/runtime/SsmState.cpp
