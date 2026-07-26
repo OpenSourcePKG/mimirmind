@@ -801,8 +801,18 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
                         d != nullptr && g->dimensions.size() >= 3;
         if (fusedKOk) {
             const std::size_t nff = g->dimensions[1];
+            // BATCHED-specific support: the *_Batched kernels handle Q4_K/BF16
+            // gate-up + Q5_K/BF16 down only. Other quant types (e.g. the
+            // Q6_K down / Q5_K gate-up of a few Q4_K_XL dynamic-quant layers)
+            // have single-seq fused-K kernels but NO batched variant — for
+            // those layers, delegate to the generic per-token runMoeFfn, which
+            // routes each of the nSeq rows independently. (moeDownFusedKAvailable
+            // is single-seq scope and would wrongly admit Q6_K here.)
+            const bool downBatchedOk =
+                d->type == core::gguf::GgmlType::Q5_K ||
+                d->type == core::gguf::GgmlType::BF16;
             fusedKOk = _gmm.moeGateUpFusedKAvailable(g->type) &&
-                       _gmm.moeDownFusedKAvailable(d->type) &&
+                       downBatchedOk &&
                        g->type == u->type &&
                        (s.d_model % 256 == 0) && (nff % 256 == 0);
         }
@@ -844,14 +854,17 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
     }
     const std::size_t n_ff_exp = gateExps.dimensions[1];
 
+    const bool downBatchedOk =
+        downExps.type == core::gguf::GgmlType::Q5_K ||
+        downExps.type == core::gguf::GgmlType::BF16;
     if (!_gmm.moeGateUpFusedKAvailable(gateExps.type) ||
-        !_gmm.moeDownFusedKAvailable(downExps.type) ||
+        !downBatchedOk ||
         gateExps.type != upExps.type ||
         (d_model % 256 != 0) || (n_ff_exp % 256 != 0)) {
         throw std::runtime_error(
             "Qwen35MoeBackend::runMoeFfnBatched: batched fused-K MoE kernels "
-            "unavailable for this model (need Q4_K gate/up + Q5_K down, "
-            "d_model % 256 == 0, n_ff_exp % 256 == 0)");
+            "unavailable for this model (need Q4_K/BF16 gate/up + Q5_K/BF16 "
+            "down, d_model % 256 == 0, n_ff_exp % 256 == 0)");
     }
 
     float* const gateOutBuf    = s.gateOut.as<float>();
