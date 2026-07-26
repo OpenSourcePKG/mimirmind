@@ -243,17 +243,72 @@ void Nvfp4Loader::load(InferenceEngine& e,
         }
     }
 
-    // 5d. Re-quantise the MoE expert banks BF16 -> K-quant (gate/up->Q4_K,
-    // down->Q6_K). The experts dominate the decode-time weight traffic and the
-    // qwen35moe decode is memory-bound. K-quants keep per-sub-block scale+min,
-    // preserving the log-distributed weights (unlike a flat linear Q8_0), and
-    // are the format llama.cpp uses for these experts (proven coherent). They
-    // feed the existing fused-K MoE kernels unchanged (the backend dispatches
-    // on tensor .type). MIMIRMIND_NVFP4_MOE_Q4K=0 keeps BF16 (A/B).
+    // 5d. MoE routed-expert banks. The experts dominate the decode-time weight
+    // traffic and the qwen35moe decode is memory-bound. MIMIRMIND_NVFP4_MOE:
+    //   "nvfp4" (default) — keep the checkpoint's native NVFP4 by repackaging
+    //       each expert into the blocked format (32-elem supers, exact E2M1).
+    //       LOSSLESS (fused-K NVFP4 kernels), ~0.625 B/elem.
+    //   "kquant"          — gate/up -> Q4_K, down -> Q6_K (a lossy but coherent
+    //       re-quant, make_qkx2/make_qx_quants). Slightly smaller (~0.56 B).
+    //   "0"               — keep BF16.
     {
-        const char* mq = std::getenv("MIMIRMIND_NVFP4_MOE_Q4K");
-        const bool moeQ4K = (mq == nullptr) || (std::string_view{mq} != "0");
-        if (moeQ4K) {
+        const char* mq = std::getenv("MIMIRMIND_NVFP4_MOE");
+        const std::string_view moeMode = (mq == nullptr) ? "nvfp4" : mq;
+        auto isExpert = [](std::string_view n) {
+            return n.ends_with(".ffn_gate_exps.weight")
+                || n.ends_with(".ffn_up_exps.weight")
+                || n.ends_with(".ffn_down_exps.weight");
+        };
+        if (moeMode == "nvfp4" && e._nvfp4Model) {
+            // Native: stack each expert's NVFP4 into one blocked-NVFP4 bank
+            // (per-source repackage at the expert's byte offset in the bank).
+            std::size_t nBanks = 0;
+            std::uint64_t bytesBefore = 0, bytesAfter = 0;
+            for (const auto& step : steps) {
+                if (!isExpert(step.ggufName)) continue;
+                auto it = std::find_if(
+                    e._materializedBf16.begin(), e._materializedBf16.end(),
+                    [&](const runtime::nvfp4::MaterializedTensor& t) {
+                        return t.ggufName == step.ggufName;
+                    });
+                if (it == e._materializedBf16.end() || it->isF32) continue;
+                if ((it->elems % 32) != 0) continue;
+                const std::size_t blkBytes =
+                    (static_cast<std::size_t>(it->elems) / 32) * 20;
+                compute::ComputeBuffer bank = devOps.allocate(blkBytes);
+                auto* bankBytes = static_cast<std::uint8_t*>(bank.get());
+                bool ok = true;
+                for (const auto& src : step.sources) {
+                    if (src.kind != core::modelopt::SourceKind::Nvfp4
+                        || (src.in % 32) != 0) { ok = false; break; }
+                    const auto* pk = e._nvfp4Model->find(src.hfWeightName);
+                    const std::string base{src.hfWeightName};
+                    const std::string baseNoW =
+                        base.size() > 7 ? base.substr(0, base.size() - 7) : base;
+                    const auto* bs = e._nvfp4Model->find(baseNoW + ".weight_scale");
+                    const auto* gs = e._nvfp4Model->find(baseNoW + ".weight_scale_2");
+                    if (pk == nullptr || bs == nullptr || gs == nullptr) {
+                        ok = false; break;
+                    }
+                    const float global = devOps.readF32(gs->devPtr);
+                    const std::size_t byteOff =
+                        (static_cast<std::size_t>(src.dstElemOffset) / 32) * 20;
+                    devOps.repackageNvfp4ToBlk(bankBytes + byteOff, pk->devPtr,
+                                               bs->devPtr, global, src.rows, src.in);
+                }
+                if (!ok) continue;   // leave this bank BF16
+                cudaCtx.stream().synchronize();
+                bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
+                bytesAfter  += blkBytes;
+                it->buffer     = std::move(bank); // frees the BF16 bank (RAII)
+                it->isNvfp4Blk = true;
+                ++nBanks;
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: kept {} MoE routed-expert banks native "
+                        "blocked-NVFP4 ({} MiB -> {} MiB)",
+                        nBanks, bytesBefore >> 20, bytesAfter >> 20);
+        } else if (moeMode == "kquant") {
             std::size_t nQuant = 0;
             std::uint64_t bytesBefore = 0, bytesAfter = 0;
             for (auto& t : e._materializedBf16) {
@@ -360,8 +415,13 @@ void Nvfp4Loader::load(InferenceEngine& e,
     // design, so there is no native NVFP4 form to keep for them.
     // MIMIRMIND_NVFP4_SHEXP=0 keeps BF16 (A/B).
     if (e._nvfp4Model) {
+        // DEFAULT OFF: the shared-expert blocked-NVFP4 path degenerates when the
+        // routed experts are ALSO blocked-NVFP4 (an unresolved interaction —
+        // each alone is coherent). With routed experts NVFP4 by default, keep the
+        // shared experts BF16. MIMIRMIND_NVFP4_SHEXP=1 opts in (only coherent if
+        // the routed experts are NOT NVFP4, e.g. MIMIRMIND_NVFP4_MOE=kquant).
         const char* faenv = std::getenv("MIMIRMIND_NVFP4_SHEXP");
-        const bool faNvblk = (faenv == nullptr) || (std::string_view{faenv} != "0");
+        const bool faNvblk = (faenv != nullptr) && (std::string_view{faenv} != "0");
         if (faNvblk) {
             auto isFullAttn = [](std::string_view n) {
                 return n.ends_with(".ffn_gate_shexp.weight")

@@ -161,6 +161,10 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKQ4KKernel;
     ::mimirmind::core::cuda::CudaModule _moeGateUpFusedKQ4KBatchedModule;
     ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKQ4KBatchedKernel;
+    ::mimirmind::core::cuda::CudaModule _moeGateUpFusedKNvblkBatchedModule;
+    ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKNvblkBatchedKernel;
+    ::mimirmind::core::cuda::CudaModule _moeDownFusedKNvblkBatchedModule;
+    ::mimirmind::core::cuda::CudaKernel _moeDownFusedKNvblkBatchedKernel;
     ::mimirmind::core::cuda::CudaModule _moeGateUpFusedKBf16BatchedModule;
     ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKBf16BatchedKernel;
     ::mimirmind::core::cuda::CudaModule _moeDownFusedKBf16BatchedModule;
@@ -238,6 +242,12 @@ struct GpuMatmul::Impl {
           _moeGateUpFusedKQ4KBatchedModule{loadCudaModule(ctx, "moe_gate_up_fused_k_q4k_batched")},
           _moeGateUpFusedKQ4KBatchedKernel{
               _moeGateUpFusedKQ4KBatchedModule.getFunction("moe_gate_up_fused_k_q4k_batched")},
+          _moeGateUpFusedKNvblkBatchedModule{loadCudaModule(ctx, "moe_gate_up_fused_k_nvfp4blk_batched")},
+          _moeGateUpFusedKNvblkBatchedKernel{
+              _moeGateUpFusedKNvblkBatchedModule.getFunction("moe_gate_up_fused_k_nvfp4blk_batched")},
+          _moeDownFusedKNvblkBatchedModule{loadCudaModule(ctx, "moe_down_fused_k_nvfp4blk_batched")},
+          _moeDownFusedKNvblkBatchedKernel{
+              _moeDownFusedKNvblkBatchedModule.getFunction("moe_down_fused_k_nvfp4blk_batched")},
           _moeGateUpFusedKBf16BatchedModule{loadCudaModule(ctx, "moe_gate_up_fused_k_bf16_batched")},
           _moeGateUpFusedKBf16BatchedKernel{
               _moeGateUpFusedKBf16BatchedModule.getFunction("moe_gate_up_fused_k_bf16_batched")},
@@ -353,12 +363,14 @@ bool GpuMatmul::moeDownFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
     return type == ::mimirmind::core::gguf::GgmlType::Q8_0
         || type == ::mimirmind::core::gguf::GgmlType::Q6_K
         || type == ::mimirmind::core::gguf::GgmlType::Q5_K
+        || type == ::mimirmind::core::gguf::GgmlType::NVFP4_BLK
         || type == ::mimirmind::core::gguf::GgmlType::BF16;
 }
 
 bool GpuMatmul::moeGateUpFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
     const noexcept {
     return type == ::mimirmind::core::gguf::GgmlType::Q4_K
+        || type == ::mimirmind::core::gguf::GgmlType::NVFP4_BLK
         || type == ::mimirmind::core::gguf::GgmlType::BF16;
 }
 
@@ -1278,6 +1290,28 @@ void GpuMatmul::moeDownFusedKAsync(::mimirmind::core::gguf::GgmlType type,
         return;
     }
 
+    if (type == ::mimirmind::core::gguf::GgmlType::NVFP4_BLK) {
+        // Single-token = the batched NVFP4 down kernel with nSeq=1 (grid.y=1).
+        if (ffPer % 32 != 0) {
+            throw std::runtime_error(
+                "moeDownFusedKAsync: ffPer not a multiple of 32 (NVFP4_BLK)");
+        }
+        auto& kern = _pimpl->_moeDownFusedKNvblkBatchedKernel;
+        kern.setPtr  (0, gateAct);
+        kern.setPtr  (1, W);
+        kern.setPtr  (2, expIdx);
+        kern.setPtr  (3, kw);
+        kern.setPtr  (4, accum);
+        kern.setValue(5, static_cast<std::int32_t>(ffPer));
+        kern.setValue(6, static_cast<std::int32_t>(dModel));
+        kern.setValue(7, static_cast<std::int32_t>(kActive));
+        kern.setValue(8, static_cast<std::int32_t>(expertBytes));
+        const std::uint32_t nGroups = static_cast<std::uint32_t>(
+            (dModel + kMoeDownOutputsPerGroup - 1) / kMoeDownOutputsPerGroup);
+        kern.launch(_ctx.stream(), nGroups, 1, 1, kMoeDownLocalSize, 1, 1);
+        return;
+    }
+
     // Select kernel + block-element alignment guard per Q-type. Q6_K
     // super-blocks are 256 elements; Q8_0 blocks are 32. A partial
     // block at the tail corrupts the dequant accumulator.
@@ -1366,6 +1400,30 @@ void GpuMatmul::moeDownFusedKBatchedAsync(
                     kMoeGateUpLocalSize, 1, 1);
         return;
     }
+    if (type == ::mimirmind::core::gguf::GgmlType::NVFP4_BLK) {
+        // Native blocked-NVFP4 down experts (32-element supers). Same launch
+        // geometry as the K-quant path; ffPer must be a multiple of 32.
+        if (ffPer % 32 != 0) {
+            throw std::runtime_error(
+                "moeDownFusedKBatchedAsync: ffPer not a multiple of 32 (NVFP4_BLK)");
+        }
+        auto& kern = _pimpl->_moeDownFusedKNvblkBatchedKernel;
+        kern.setPtr  (0, gateAct);
+        kern.setPtr  (1, W);
+        kern.setPtr  (2, expIdx);
+        kern.setPtr  (3, kw);
+        kern.setPtr  (4, accum);
+        kern.setValue(5, static_cast<std::int32_t>(ffPer));
+        kern.setValue(6, static_cast<std::int32_t>(dModel));
+        kern.setValue(7, static_cast<std::int32_t>(kActive));
+        kern.setValue(8, static_cast<std::int32_t>(expertBytes));
+        const std::uint32_t nGroups = static_cast<std::uint32_t>(
+            (dModel + kMoeDownOutputsPerGroup - 1) / kMoeDownOutputsPerGroup);
+        kern.launch(_ctx.stream(),
+                    nGroups, static_cast<std::uint32_t>(nSeq), 1,
+                    kMoeDownLocalSize, 1, 1);
+        return;
+    }
     const bool isQ5K = (type == ::mimirmind::core::gguf::GgmlType::Q5_K);
     const bool isQ6K = (type == ::mimirmind::core::gguf::GgmlType::Q6_K);
     if (!isQ5K && !isQ6K) {
@@ -1414,6 +1472,29 @@ void GpuMatmul::moeGateUpFusedKAsync(::mimirmind::core::gguf::GgmlType type,
                                      std::size_t          expertBytesGate,
                                      std::size_t          expertBytesUp) {
     if (kActive == 0 || dModel == 0 || nFf == 0) {
+        return;
+    }
+    if (type == ::mimirmind::core::gguf::GgmlType::NVFP4_BLK) {
+        // Single-token = the batched NVFP4 kernel with nSeq=1 (grid.y=1).
+        if (dModel % 32 != 0) {
+            throw std::runtime_error(
+                "moeGateUpFusedKAsync: dModel not a multiple of 32 (NVFP4_BLK)");
+        }
+        auto& kern = _pimpl->_moeGateUpFusedKNvblkBatchedKernel;
+        kern.setPtr  (0, x);
+        kern.setPtr  (1, Wg);
+        kern.setPtr  (2, Wu);
+        kern.setPtr  (3, expIdx);
+        kern.setPtr  (4, gateActOut);
+        kern.setValue(5, static_cast<std::int32_t>(dModel));
+        kern.setValue(6, static_cast<std::int32_t>(nFf));
+        kern.setValue(7, static_cast<std::int32_t>(kActive));
+        kern.setValue(8, static_cast<std::int32_t>(expertBytesGate));
+        kern.setValue(9, static_cast<std::int32_t>(expertBytesUp));
+        const std::uint32_t nOutputs = static_cast<std::uint32_t>(kActive * nFf);
+        const std::uint32_t nGroups  =
+            (nOutputs + kMoeGateUpOutputsPerGroup - 1) / kMoeGateUpOutputsPerGroup;
+        kern.launch(_ctx.stream(), nGroups, 1, 1, kMoeGateUpLocalSize, 1, 1);
         return;
     }
     if (type != ::mimirmind::core::gguf::GgmlType::Q4_K) {
@@ -1474,6 +1555,31 @@ void GpuMatmul::moeGateUpFusedKBatchedAsync(
         kern.setValue(5, static_cast<std::int32_t>(dModel));
         kern.setValue(6, static_cast<std::int32_t>(nFf));
         kern.setValue(7, static_cast<std::int32_t>(kActive));
+        const std::uint32_t nOutputs = static_cast<std::uint32_t>(kActive * nFf);
+        const std::uint32_t nGroups  =
+            (nOutputs + kMoeGateUpOutputsPerGroup - 1) / kMoeGateUpOutputsPerGroup;
+        kern.launch(_ctx.stream(),
+                    nGroups, static_cast<std::uint32_t>(nSeq), 1,
+                    kMoeGateUpLocalSize, 1, 1);
+        return;
+    }
+    if (type == ::mimirmind::core::gguf::GgmlType::NVFP4_BLK) {
+        // Native blocked-NVFP4 gate/up experts (32-element supers).
+        if (dModel % 32 != 0) {
+            throw std::runtime_error(
+                "moeGateUpFusedKBatchedAsync: dModel not a multiple of 32 (NVFP4_BLK)");
+        }
+        auto& kern = _pimpl->_moeGateUpFusedKNvblkBatchedKernel;
+        kern.setPtr  (0, x);
+        kern.setPtr  (1, Wg);
+        kern.setPtr  (2, Wu);
+        kern.setPtr  (3, expIdx);
+        kern.setPtr  (4, gateActOut);
+        kern.setValue(5, static_cast<std::int32_t>(dModel));
+        kern.setValue(6, static_cast<std::int32_t>(nFf));
+        kern.setValue(7, static_cast<std::int32_t>(kActive));
+        kern.setValue(8, static_cast<std::int32_t>(expertBytesGate));
+        kern.setValue(9, static_cast<std::int32_t>(expertBytesUp));
         const std::uint32_t nOutputs = static_cast<std::uint32_t>(kActive * nFf);
         const std::uint32_t nGroups  =
             (nOutputs + kMoeGateUpOutputsPerGroup - 1) / kMoeGateUpOutputsPerGroup;

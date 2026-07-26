@@ -689,6 +689,8 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/repackage_nvfp4_to_blk.cu
         kernels_cuda/matmul_nvfp4blk_vec.cu
         kernels_cuda/matmul_nvfp4blk_gemm.cu
+        kernels_cuda/moe_gate_up_fused_k_nvfp4blk_batched.cu
+        kernels_cuda/moe_down_fused_k_nvfp4blk_batched.cu
         kernels_cuda/moe_gate_up_fused_k_bf16_batched.cu
         kernels_cuda/moe_down_fused_k_bf16_batched.cu
         kernels_cuda/matmul_q3k_vec.cu

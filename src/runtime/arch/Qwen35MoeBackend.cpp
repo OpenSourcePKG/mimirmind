@@ -27,6 +27,21 @@ namespace mimirmind::runtime::arch {
 
 namespace {
 
+// Block geometry (elements, bytes) for an expert weight type. NVFP4_BLK is a
+// runtime-only blocked format (32-element super-blocks of 20 bytes) not in the
+// QuantType registry, so handle it explicitly; everything else goes through the
+// registry. Returns {0,0} for an unregistered non-NVFP4 type (caller checks).
+inline std::pair<std::size_t, std::size_t>
+moeBlockGeom(core::gguf::GgmlType type) {
+    if (type == core::gguf::GgmlType::NVFP4_BLK) {
+        return {32, 20};
+    }
+    const compute::QuantType* qt = compute::quantType(type);
+    return qt != nullptr ? std::pair<std::size_t, std::size_t>{qt->blockElements(),
+                                                               qt->blockBytes()}
+                         : std::pair<std::size_t, std::size_t>{0, 0};
+}
+
 const core::gguf::GgufTensor&
 requireBlock(const core::gguf::WeightsMap& w, std::size_t blockIdx,
              std::string_view suffix) {
@@ -641,23 +656,21 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
     // first n_ff_exp, the up rows follow at `gateBytesHalf`. In the
     // separate layout each has its own per-expert block.
     const core::gguf::GgufTensor& upSrc = fused ? *gateUpFused : *upExpsP;
-    const compute::QuantType* const qtGate = compute::quantType(gateSrc.type);
-    const compute::QuantType* const qtUp   = compute::quantType(upSrc.type);
-    const compute::QuantType* const qtDown = compute::quantType(downExps.type);
-    if (qtGate == nullptr || qtUp == nullptr || qtDown == nullptr) {
+    const auto [geGate, gbGate] = moeBlockGeom(gateSrc.type);
+    const auto [geUp,   gbUp]   = moeBlockGeom(upSrc.type);
+    const auto [geDown, gbDown] = moeBlockGeom(downExps.type);
+    if (geGate == 0 || geUp == 0 || geDown == 0) {
         throw std::runtime_error(
             "Qwen35MoeBackend: expert weight type(s) not in QuantType registry");
     }
-    const std::size_t rowBytesGate =
-        (d_model / qtGate->blockElements()) * qtGate->blockBytes();
-    const std::size_t rowBytesUp =
-        (d_model / qtUp->blockElements()) * qtUp->blockBytes();
+    const std::size_t rowBytesGate = (d_model / geGate) * gbGate;
+    const std::size_t rowBytesUp   = (d_model / geUp)   * gbUp;
     const std::size_t gateBytesHalf = n_ff_exp * rowBytesGate;   // fused split
     // Per-expert block stride: fused holds 2*n_ff rows, separate holds n_ff.
     const std::size_t bytesGate = (fused ? 2 : 1) * n_ff_exp * rowBytesGate;
     const std::size_t bytesUp   = (fused ? 2 : 1) * n_ff_exp * rowBytesUp;
     const std::size_t bytesDown =
-        d_model * (n_ff_exp / qtDown->blockElements()) * qtDown->blockBytes();
+        d_model * (n_ff_exp / geDown) * gbDown;
 
     const auto* const gateBase = static_cast<const std::uint8_t*>(gateSrc.usmPtr);
     const auto* const upBase   = static_cast<const std::uint8_t*>(upSrc.usmPtr);
@@ -881,11 +894,16 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
             const bool downBatchedOk =
                 d->type == core::gguf::GgmlType::Q5_K ||
                 d->type == core::gguf::GgmlType::Q6_K ||
+                d->type == core::gguf::GgmlType::NVFP4_BLK ||
                 d->type == core::gguf::GgmlType::BF16;
+            // NVFP4_BLK is 32-element super-blocks (not 256); the other batched
+            // types are 256-block. Require the matching alignment per type.
+            const std::size_t blkAlign =
+                (g->type == core::gguf::GgmlType::NVFP4_BLK) ? 32 : 256;
             fusedKOk = _gmm.moeGateUpFusedKAvailable(g->type) &&
                        downBatchedOk &&
                        g->type == u->type &&
-                       (s.d_model % 256 == 0) && (nff % 256 == 0);
+                       (s.d_model % blkAlign == 0) && (nff % blkAlign == 0);
         }
         if (!fusedKOk) {
             (void)expIdxSlot; (void)kwSlot;
@@ -928,15 +946,18 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
     const bool downBatchedOk =
         downExps.type == core::gguf::GgmlType::Q5_K ||
         downExps.type == core::gguf::GgmlType::Q6_K ||
+        downExps.type == core::gguf::GgmlType::NVFP4_BLK ||
         downExps.type == core::gguf::GgmlType::BF16;
+    const std::size_t blkAlign =
+        (gateExps.type == core::gguf::GgmlType::NVFP4_BLK) ? 32 : 256;
     if (!_gmm.moeGateUpFusedKAvailable(gateExps.type) ||
         !downBatchedOk ||
         gateExps.type != upExps.type ||
-        (d_model % 256 != 0) || (n_ff_exp % 256 != 0)) {
+        (d_model % blkAlign != 0) || (n_ff_exp % blkAlign != 0)) {
         throw std::runtime_error(
             "Qwen35MoeBackend::runMoeFfnBatched: batched fused-K MoE kernels "
-            "unavailable for this model (need Q4_K/BF16 gate/up + Q5_K/BF16 "
-            "down, d_model % 256 == 0, n_ff_exp % 256 == 0)");
+            "unavailable for this model (need Q4_K/NVFP4_BLK/BF16 gate/up + "
+            "Q5_K/Q6_K/NVFP4_BLK/BF16 down, d_model/n_ff_exp block-aligned)");
     }
 
     float* const gateOutBuf    = s.gateOut.as<float>();
@@ -970,22 +991,17 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
         bytesUp   = n_ff_exp * d_model * sizeof(std::uint16_t);
         bytesDown = d_model * n_ff_exp * sizeof(std::uint16_t);
     } else {
-        const compute::QuantType* const qtGate = compute::quantType(gateExps.type);
-        const compute::QuantType* const qtUp   = compute::quantType(upExps.type);
-        const compute::QuantType* const qtDown = compute::quantType(downExps.type);
-        if (qtGate == nullptr || qtUp == nullptr || qtDown == nullptr) {
+        const auto [geGate, gbGate] = moeBlockGeom(gateExps.type);
+        const auto [geUp,   gbUp]   = moeBlockGeom(upExps.type);
+        const auto [geDown, gbDown] = moeBlockGeom(downExps.type);
+        if (geGate == 0 || geUp == 0 || geDown == 0) {
             throw std::runtime_error(
                 "Qwen35MoeBackend::runMoeFfnBatched: expert weight type(s) not "
                 "in QuantType registry");
         }
-        const std::size_t rowBytesGate =
-            (d_model / qtGate->blockElements()) * qtGate->blockBytes();
-        const std::size_t rowBytesUp =
-            (d_model / qtUp->blockElements()) * qtUp->blockBytes();
-        bytesGate = n_ff_exp * rowBytesGate;
-        bytesUp   = n_ff_exp * rowBytesUp;
-        bytesDown =
-            d_model * (n_ff_exp / qtDown->blockElements()) * qtDown->blockBytes();
+        bytesGate = n_ff_exp * ((d_model / geGate) * gbGate);
+        bytesUp   = n_ff_exp * ((d_model / geUp)   * gbUp);
+        bytesDown = d_model * ((n_ff_exp / geDown) * gbDown);
     }
 
     const auto* const gateBase = static_cast<const std::uint8_t*>(gateExps.usmPtr);
