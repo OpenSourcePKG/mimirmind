@@ -170,6 +170,12 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _attentionFlashPartialQ8Kernel;
     core::cuda::CudaModule _attentionFlashMergeModule;
     core::cuda::CudaKernel _attentionFlashMergeKernel;
+    core::cuda::CudaModule _attentionFlashPartialBatchedModule;
+    core::cuda::CudaKernel _attentionFlashPartialBatchedKernel;
+    core::cuda::CudaModule _attentionFlashMergeBatchedModule;
+    core::cuda::CudaKernel _attentionFlashMergeBatchedKernel;
+    core::cuda::CudaModule _pagedAttentionV1Module;
+    core::cuda::CudaKernel _pagedAttentionV1Kernel;
 
     core::cuda::CudaModule _attentionPrefillFlashModule;
     core::cuda::CudaKernel _attentionPrefillFlashKernel;
@@ -195,6 +201,8 @@ struct GpuOps::Impl {
 
     core::cuda::CudaModule _mropeModule;
     core::cuda::CudaKernel _mropeKernel;
+    core::cuda::CudaModule _mropeBatchedModule;
+    core::cuda::CudaKernel _mropeBatchedKernel;
     core::cuda::CudaModule _splitHeadPairModule;
     core::cuda::CudaKernel _splitHeadPairKernel;
     core::cuda::CudaModule _sigmoidGateMulModule;
@@ -203,14 +211,22 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _l2NormKernel;
     core::cuda::CudaModule _ssmConv1dModule;
     core::cuda::CudaKernel _ssmConv1dKernel;
+    core::cuda::CudaModule _ssmConv1dBatchedModule;
+    core::cuda::CudaKernel _ssmConv1dBatchedKernel;
     core::cuda::CudaModule _gatedDeltaNetArModule;
     core::cuda::CudaKernel _gatedDeltaNetArKernel;
+    core::cuda::CudaModule _gatedDeltaNetArBatchedModule;
+    core::cuda::CudaKernel _gatedDeltaNetArBatchedKernel;
     core::cuda::CudaModule _deltanetGateModule;
     core::cuda::CudaKernel _deltanetGateKernel;
     core::cuda::CudaModule _deltanetChunkCumGateModule;
     core::cuda::CudaKernel _deltanetChunkCumGateKernel;
     core::cuda::CudaModule _deltanetChunkForwardModule;
     core::cuda::CudaKernel _deltanetChunkForwardKernel;
+    core::cuda::CudaModule _deltanetChunkCumGateBatchedModule;
+    core::cuda::CudaKernel _deltanetChunkCumGateBatchedKernel;
+    core::cuda::CudaModule _deltanetChunkForwardBatchedModule;
+    core::cuda::CudaKernel _deltanetChunkForwardBatchedKernel;
     core::cuda::CudaModule _deltanetKktSolveModule;
     core::cuda::CudaKernel _deltanetKktSolveKernel;
     core::cuda::CudaModule _sigmoidInplaceModule;
@@ -274,6 +290,15 @@ struct GpuOps::Impl {
           _attentionFlashMergeModule{loadCudaModule(ctx, "attention_flash_merge")},
           _attentionFlashMergeKernel{
               _attentionFlashMergeModule.getFunction("attention_flash_merge")},
+          _attentionFlashPartialBatchedModule{loadCudaModule(ctx, "attention_flash_partial_batched")},
+          _attentionFlashPartialBatchedKernel{
+              _attentionFlashPartialBatchedModule.getFunction("attention_flash_partial_batched")},
+          _attentionFlashMergeBatchedModule{loadCudaModule(ctx, "attention_flash_merge_batched")},
+          _attentionFlashMergeBatchedKernel{
+              _attentionFlashMergeBatchedModule.getFunction("attention_flash_merge_batched")},
+          _pagedAttentionV1Module{loadCudaModule(ctx, "attention_paged_v1")},
+          _pagedAttentionV1Kernel{
+              _pagedAttentionV1Module.getFunction("paged_attention_v1")},
 
           _attentionPrefillFlashModule{loadCudaModule(ctx, "attention_prefill_flash")},
           _attentionPrefillFlashKernel{
@@ -311,6 +336,8 @@ struct GpuOps::Impl {
               _matmulQ8_0VecReorderModule.getFunction("matmul_q8_0_vec_reorder")},
           _mropeModule             {loadCudaModule(ctx, "rope_mrope")},
           _mropeKernel             {_mropeModule.getFunction("rope_mrope")},
+          _mropeBatchedModule      {loadCudaModule(ctx, "rope_mrope_batched")},
+          _mropeBatchedKernel      {_mropeBatchedModule.getFunction("rope_mrope_batched")},
           _splitHeadPairModule     {loadCudaModule(ctx, "split_head_pair")},
           _splitHeadPairKernel     {_splitHeadPairModule.getFunction("split_head_pair")},
           _sigmoidGateMulModule    {loadCudaModule(ctx, "sigmoid_gate_mul")},
@@ -320,9 +347,14 @@ struct GpuOps::Impl {
           _l2NormKernel            {_l2NormModule.getFunction("l2_norm")},
           _ssmConv1dModule         {loadCudaModule(ctx, "ssm_conv1d")},
           _ssmConv1dKernel         {_ssmConv1dModule.getFunction("ssm_conv1d")},
+          _ssmConv1dBatchedModule  {loadCudaModule(ctx, "ssm_conv1d_batched")},
+          _ssmConv1dBatchedKernel  {_ssmConv1dBatchedModule.getFunction("ssm_conv1d_batched")},
           _gatedDeltaNetArModule   {loadCudaModule(ctx, "gated_deltanet_ar")},
           _gatedDeltaNetArKernel   {
               _gatedDeltaNetArModule.getFunction("gated_deltanet_ar")},
+          _gatedDeltaNetArBatchedModule{loadCudaModule(ctx, "gated_deltanet_ar_batched")},
+          _gatedDeltaNetArBatchedKernel{
+              _gatedDeltaNetArBatchedModule.getFunction("gated_deltanet_ar_batched")},
           _deltanetGateModule      {loadCudaModule(ctx, "deltanet_gate")},
           _deltanetGateKernel      {_deltanetGateModule.getFunction("deltanet_gate")},
           _deltanetChunkCumGateModule{loadCudaModule(ctx, "deltanet_chunk_cumgate")},
@@ -331,6 +363,12 @@ struct GpuOps::Impl {
           _deltanetChunkForwardModule{loadCudaModule(ctx, "deltanet_chunk_forward")},
           _deltanetChunkForwardKernel{
               _deltanetChunkForwardModule.getFunction("deltanet_chunk_forward")},
+          _deltanetChunkCumGateBatchedModule{loadCudaModule(ctx, "deltanet_chunk_cumgate_batched")},
+          _deltanetChunkCumGateBatchedKernel{
+              _deltanetChunkCumGateBatchedModule.getFunction("deltanet_chunk_cumgate_batched")},
+          _deltanetChunkForwardBatchedModule{loadCudaModule(ctx, "deltanet_chunk_forward_batched")},
+          _deltanetChunkForwardBatchedKernel{
+              _deltanetChunkForwardBatchedModule.getFunction("deltanet_chunk_forward_batched")},
           _deltanetKktSolveModule{loadCudaModule(ctx, "deltanet_kkt_solve")},
           _deltanetKktSolveKernel{
               _deltanetKktSolveModule.getFunction("deltanet_kkt_solve")},
@@ -907,6 +945,49 @@ void GpuOps::mropeInPlaceAsync(void* xBase, std::size_t seqLen,
              kRopeLocalSize, 1, 1);
 }
 
+void GpuOps::mropeInPlaceBatchedAsync(void* xBase, std::size_t nSeq,
+                                      std::size_t xSeqStride,
+                                      std::size_t seqLen, std::size_t numHeads,
+                                      std::size_t headDim,
+                                      const std::int32_t* startPosDev,
+                                      float base, const std::int32_t* sections,
+                                      std::size_t writeOffsetStride,
+                                      runtime::KvDtype kvDtype) {
+    if (nSeq == 0 || seqLen == 0 || numHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (headDim % 2 != 0) {
+        throw std::runtime_error(
+            "compute::cuda::GpuOps::mropeInPlaceBatchedAsync: headDim must be even");
+    }
+    if (kvDtype != runtime::KvDtype::F32) {
+        throw std::runtime_error(
+            "compute::cuda::GpuOps::mropeInPlaceBatchedAsync: only KvDtype::F32");
+    }
+    const std::size_t halfDim = headDim / 2;
+    const std::size_t total   = seqLen * numHeads * halfDim;
+    // Per-seq start positions come from a caller-owned device int32[nSeq]
+    // (unlike the single path's staged single slot). Provisional x layout:
+    // seq s at xBase + s*xSeqStride (M-Cuda.Batch Cat B, parity-gated).
+    auto& k = _pimpl->_mropeBatchedKernel;
+    k.setPtr  (0, xBase);
+    k.setValue(1, toInt32(seqLen,   "mropeB seqLen"));
+    k.setValue(2, toInt32(numHeads, "mropeB numHeads"));
+    k.setValue(3, toInt32(headDim,  "mropeB headDim"));
+    k.setPtr  (4, startPosDev);
+    k.setValue(5, base);
+    k.setValue(6, toInt32(writeOffsetStride, "mropeB writeOffsetStride"));
+    k.setValue(7, toInt32(xSeqStride, "mropeB xSeqStride"));
+    k.setValue(8,  sections ? sections[0] : 0);
+    k.setValue(9,  sections ? sections[1] : 0);
+    k.setValue(10, sections ? sections[2] : 0);
+    k.setValue(11, sections ? sections[3] : 0);
+    k.launch(_ctx.stream(),
+             groupsForN(total, kRopeLocalSize),
+             static_cast<std::uint32_t>(nSeq), 1,
+             kRopeLocalSize, 1, 1);
+}
+
 void GpuOps::splitHeadPairAsync(const float* src, float* a, float* b,
                                 std::size_t seqLen, std::size_t numHeads,
                                 std::size_t headDim) {
@@ -978,6 +1059,31 @@ void GpuOps::causalConv1dSiluAsync(const float* convInput, const float* kernel,
              kElementwiseLocalSize, 1, 1);
 }
 
+void GpuOps::causalConv1dSiluBatchedAsync(const float* convInput,
+                                          const float* kernel, float* out,
+                                          std::size_t nSeq, std::size_t T,
+                                          std::size_t channels,
+                                          std::size_t kernelSize) {
+    const std::size_t total = T * channels;
+    if (nSeq == 0 || total == 0) {
+        return;
+    }
+    // grid = (ceil(T*channels/LOCAL), nSeq); each seq owns its own conv
+    // input (caller prepends its rolling conv-tail). Math byte-identical
+    // to the single-sequence causalConv1dSiluAsync (M-Cuda.Batch Cat C-P0).
+    auto& k = _pimpl->_ssmConv1dBatchedKernel;
+    k.setPtr  (0, convInput);
+    k.setPtr  (1, kernel);
+    k.setPtr  (2, out);
+    k.setValue(3, toInt32(T,          "conv1dB T"));
+    k.setValue(4, toInt32(channels,   "conv1dB channels"));
+    k.setValue(5, toInt32(kernelSize, "conv1dB K"));
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize),
+             static_cast<std::uint32_t>(nSeq), 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
 void GpuOps::gatedDeltaNetRecurrentAsync(const float* q, const float* k_,
                                          const float* v, const float* gLog,
                                          const float* beta, float* state,
@@ -1001,6 +1107,33 @@ void GpuOps::gatedDeltaNetRecurrentAsync(const float* q, const float* k_,
     // grid = H blocks, block = S threads (S <= GATED_DELTANET_AR_MAX_S).
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(H), 1, 1,
+             static_cast<std::uint32_t>(S), 1, 1);
+}
+
+void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
+        const float* q, const float* k_, const float* v, const float* gLog,
+        const float* beta, float* state, float* out, std::size_t nSeq,
+        std::size_t T, std::size_t H, std::size_t S) {
+    if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
+        return;
+    }
+    // grid = (H, nSeq) blocks, block = S threads. Each (head, seq) block
+    // owns one sequence [S,S] state; math is byte-identical to the
+    // single-sequence gatedDeltaNetRecurrentAsync (M-Cuda.Batch Cat C-P0).
+    auto& k = _pimpl->_gatedDeltaNetArBatchedKernel;
+    k.setPtr  (0, q);
+    k.setPtr  (1, k_);
+    k.setPtr  (2, v);
+    k.setPtr  (3, gLog);
+    k.setPtr  (4, beta);
+    k.setPtr  (5, state);
+    k.setPtr  (6, out);
+    k.setValue(7, toInt32(T, "gdnB T"));
+    k.setValue(8, toInt32(H, "gdnB H"));
+    k.setValue(9, toInt32(S, "gdnB S"));
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(H),
+             static_cast<std::uint32_t>(nSeq), 1,
              static_cast<std::uint32_t>(S), 1, 1);
 }
 
@@ -1040,6 +1173,30 @@ void GpuOps::deltanetChunkCumGateAsync(const float* gLog, float* gCum,
     k.setValue(4, toInt32(C, "cumgate C"));
     k.launch(_ctx.stream(),
              groupsForN(total, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::deltanetChunkCumGateBatchedAsync(const float* gLog, float* gCum,
+                                              std::size_t nSeq, std::size_t T,
+                                              std::size_t H,
+                                              std::size_t chunkSize) {
+    if (nSeq == 0 || T == 0 || H == 0) {
+        return;
+    }
+    const std::size_t C       = chunkSize ? chunkSize : 64;
+    const std::size_t nChunks = (T + C - 1) / C;
+    const std::size_t total   = H * nChunks;   // one thread per (head, chunk)
+    // grid.y = nSeq; each sequence prefix-sums its own gLog slab (M-Cuda.Batch
+    // Cat C-P1). Byte-identical to nSeq single deltanetChunkCumGateAsync.
+    auto& k = _pimpl->_deltanetChunkCumGateBatchedKernel;
+    k.setPtr  (0, gLog);
+    k.setPtr  (1, gCum);
+    k.setValue(2, toInt32(T, "cumgateB T"));
+    k.setValue(3, toInt32(H, "cumgateB H"));
+    k.setValue(4, toInt32(C, "cumgateB C"));
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize),
+             static_cast<std::uint32_t>(nSeq), 1,
              kElementwiseLocalSize, 1, 1);
 }
 
@@ -1083,6 +1240,43 @@ void GpuOps::deltanetChunkForwardAsync(const float* q, const float* k_,
                 static_cast<std::uint32_t>(S), 1, 1);
     // Sync so the scratch ComputeBuffers stay alive until the kernel is done
     // (prefill-only path; not the decode hot loop).
+    _ctx.stream().synchronize();
+}
+
+void GpuOps::deltanetChunkForwardBatchedAsync(
+        const float* q, const float* k_, const float* v, const float* gCum,
+        const float* beta, const float* a0, float* state, float* out,
+        std::size_t nSeq, std::size_t T, std::size_t H, std::size_t S,
+        std::size_t chunkSize) {
+    if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
+        return;
+    }
+    const std::size_t C = chunkSize ? chunkSize : 64;
+    const std::size_t f = sizeof(float);
+    // nSeq copies of the single-seq global scratch ([s0 [H,S,S] + 5 chunk
+    // tensors [H,C,S]]); the kernel offsets by seq*scratchPerSeq. grid.y =
+    // nSeq. Byte-identical to nSeq single deltanetChunkForwardAsync.
+    const std::size_t scratchPerSeq = H * S * S + 5 * H * C * S;
+    auto scratch = allocate(nSeq * scratchPerSeq * f);
+
+    auto& kern = _pimpl->_deltanetChunkForwardBatchedKernel;
+    kern.setPtr  (0,  q);
+    kern.setPtr  (1,  k_);
+    kern.setPtr  (2,  v);
+    kern.setPtr  (3,  gCum);
+    kern.setPtr  (4,  beta);
+    kern.setPtr  (5,  a0);
+    kern.setPtr  (6,  state);
+    kern.setPtr  (7,  out);
+    kern.setPtr  (8,  scratch.get());
+    kern.setValue(9,  toInt32(T, "chunkfwdB T"));
+    kern.setValue(10, toInt32(H, "chunkfwdB H"));
+    kern.setValue(11, toInt32(S, "chunkfwdB S"));
+    kern.setValue(12, toInt32(C, "chunkfwdB C"));
+    kern.launch(_ctx.stream(),
+                static_cast<std::uint32_t>(H),
+                static_cast<std::uint32_t>(nSeq), 1,
+                static_cast<std::uint32_t>(S), 1, 1);
     _ctx.stream().synchronize();
 }
 
@@ -1545,6 +1739,105 @@ void GpuOps::attentionDecodeFlashAsync(const float* q, const void* k,
                        static_cast<std::uint32_t>(nHeads),
                        1, 1,
                        kAttentionLocalSize, 1, 1);
+}
+
+void GpuOps::attentionDecodeFlashBatchedAsync(
+        const float* q, const float* k, const float* v, float* partialScratch,
+        float* out, std::size_t nSeq, std::size_t maxKTiles,
+        std::size_t qSeqStride, std::size_t kvSeqStride,
+        std::size_t partialSeqStride, std::size_t outSeqStride,
+        std::size_t nHeads, std::size_t nKvHeads, std::size_t headDim,
+        const std::int32_t* curLenDev, float scale, std::size_t slidingWindow,
+        runtime::KvDtype kvDtype) {
+    if (nSeq == 0 || nHeads == 0 || headDim == 0 || maxKTiles == 0) {
+        return;
+    }
+    if (kvDtype != runtime::KvDtype::F32) {
+        throw std::runtime_error(
+            "compute::cuda::GpuOps::attentionDecodeFlashBatchedAsync: only "
+            "KvDtype::F32 batched today (M-Cuda.Batch Cat attention).");
+    }
+    // Pass 1 — per-tile partials. grid (nHeads, maxKTiles, nSeq); each
+    // sequence uses its own q/kv/curLen, a uniform maxKTiles per-head
+    // stride, and early-exits tiles past its own length. Provisional
+    // per-seq strides — KV layout settled in Phase D. Byte-identical to
+    // nSeq single attentionDecodeFlashAsync.
+    auto& partialKernel = _pimpl->_attentionFlashPartialBatchedKernel;
+    partialKernel.setPtr  (0, q);
+    partialKernel.setPtr  (1, k);
+    partialKernel.setPtr  (2, v);
+    partialKernel.setPtr  (3, partialScratch);
+    partialKernel.setValue(4, toInt32(nHeads,   "flashB nHeads"));
+    partialKernel.setValue(5, toInt32(nKvHeads, "flashB nKvHeads"));
+    partialKernel.setValue(6, toInt32(headDim,  "flashB headDim"));
+    partialKernel.setPtr  (7, curLenDev);
+    partialKernel.setValue(8, scale);
+    partialKernel.setValue(9, toInt32(slidingWindow, "flashB slidingWindow"));
+    partialKernel.setValue(10, toInt32(maxKTiles, "flashB kTilesStride"));
+    partialKernel.setValue(11, toInt32(qSeqStride, "flashB qSeqStride"));
+    partialKernel.setValue(12, toInt32(kvSeqStride, "flashB kvSeqStride"));
+    partialKernel.setValue(13, toInt32(partialSeqStride, "flashB partialSeqStride"));
+    partialKernel.launch(_ctx.stream(),
+                         static_cast<std::uint32_t>(nHeads),
+                         static_cast<std::uint32_t>(maxKTiles),
+                         static_cast<std::uint32_t>(nSeq),
+                         kAttentionLocalSize, 1, 1);
+
+    // Pass 2 — merge. grid (nHeads, nSeq).
+    auto& mergeKernel = _pimpl->_attentionFlashMergeBatchedKernel;
+    mergeKernel.setPtr  (0, partialScratch);
+    mergeKernel.setPtr  (1, out);
+    mergeKernel.setValue(2, toInt32(nHeads,  "flashB_merge nHeads"));
+    mergeKernel.setValue(3, toInt32(headDim, "flashB_merge headDim"));
+    mergeKernel.setPtr  (4, curLenDev);
+    mergeKernel.setValue(5, toInt32(maxKTiles, "flashB_merge kTilesStride"));
+    mergeKernel.setValue(6, toInt32(partialSeqStride, "flashB_merge partialSeqStride"));
+    mergeKernel.setValue(7, toInt32(outSeqStride, "flashB_merge outSeqStride"));
+    mergeKernel.launch(_ctx.stream(),
+                       static_cast<std::uint32_t>(nHeads),
+                       static_cast<std::uint32_t>(nSeq),
+                       1,
+                       kAttentionLocalSize, 1, 1);
+}
+
+void GpuOps::pagedAttentionDecodeV1Async(
+        float* out, const float* query, const float* keyCache,
+        const float* valueCache, const std::int32_t* blockTables,
+        const std::int32_t* seqLens, std::size_t numSeqs, std::size_t numHeads,
+        std::size_t numKvHeads, std::size_t headSize, std::size_t blockSize,
+        std::size_t maxNumBlocksPerSeq, float scale, float softcap) {
+    if (numSeqs == 0 || numHeads == 0 || headSize == 0) {
+        return;
+    }
+    // Baseline paged decode attention (fp32). Grid (numHeads, numSeqs); one
+    // workgroup owns one (head, sequence). Dynamic SMEM holds the query row,
+    // the per-dim accumulator and the reduction scratch:
+    // (2*headSize + PAGED_ATTN_V1_LOCAL) floats. kLocal MUST match the
+    // kernel's __launch_bounds__ (PagedAttentionV1::kBlockThreads).
+    constexpr std::uint32_t kLocal = 128;   // == PAGED_ATTN_V1_LOCAL
+    auto& kern = _pimpl->_pagedAttentionV1Kernel;
+    kern.setPtr  (0, out);
+    kern.setPtr  (1, query);
+    kern.setPtr  (2, keyCache);
+    kern.setPtr  (3, valueCache);
+    kern.setPtr  (4, blockTables);
+    kern.setPtr  (5, seqLens);
+    kern.setValue(6,  toInt32(numSeqs,            "pagedV1 numSeqs"));
+    kern.setValue(7,  toInt32(numHeads,           "pagedV1 numHeads"));
+    kern.setValue(8,  toInt32(numKvHeads,         "pagedV1 numKvHeads"));
+    kern.setValue(9,  toInt32(headSize,           "pagedV1 headSize"));
+    kern.setValue(10, toInt32(blockSize,          "pagedV1 blockSize"));
+    kern.setValue(11, toInt32(maxNumBlocksPerSeq, "pagedV1 maxBlocks"));
+    kern.setValue(12, scale);
+    kern.setValue(13, softcap);
+    kern.setValue(14, static_cast<std::int32_t>(0));   // PAGED_ATTN_KV_DTYPE_FP32
+    const std::size_t smemBytes = (2 * headSize + kLocal) * sizeof(float);
+    kern.launch(_ctx.stream(),
+                static_cast<std::uint32_t>(numHeads),
+                static_cast<std::uint32_t>(numSeqs),
+                1,
+                kLocal, 1, 1,
+                smemBytes);
 }
 
 void GpuOps::matmulQ8_0VecReorderAsync(const void* wReordered,

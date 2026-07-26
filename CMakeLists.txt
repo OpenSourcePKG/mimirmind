@@ -366,6 +366,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/serving/BatchCapacityProbe.cpp
     src/runtime/serving/PagedKvBlockAllocator.cpp
     src/runtime/serving/PagedKvSequence.cpp
+    src/runtime/serving/PagedKvPool.cpp
     src/runtime/serving/ChunkedPrefillScheduler.cpp
     src/runtime/serving/RequestScheduler.cpp
     src/runtime/serving/PreemptionPolicy.cpp
@@ -664,6 +665,8 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/attention.cu
         kernels_cuda/attention_flash_merge.cu
         kernels_cuda/attention_flash_partial.cu
+        kernels_cuda/attention_flash_partial_batched.cu
+        kernels_cuda/attention_flash_merge_batched.cu
         kernels_cuda/attention_flash_partial_fp16.cu
         kernels_cuda/attention_flash_partial_q8_0.cu
         kernels_cuda/attention_fp16.cu
@@ -680,6 +683,21 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/matmul_q4k_mmq.cu
         kernels_cuda/matmul_q5k_mmq.cu
         kernels_cuda/matmul_f32_vec.cu
+        kernels_cuda/matmul_bf16_vec.cu
+        kernels_cuda/matmul_bf16_gemm.cu
+        kernels_cuda/quantize_bf16_to_q8_0.cu
+        kernels_cuda/quantize_bf16_to_q4k.cu
+        kernels_cuda/quantize_bf16_to_q6k.cu
+        kernels_cuda/quantize_bf16_to_fp8.cu
+        kernels_cuda/matmul_fp8_vec.cu
+        kernels_cuda/matmul_fp8_gemm.cu
+        kernels_cuda/repackage_nvfp4_to_blk.cu
+        kernels_cuda/matmul_nvfp4blk_vec.cu
+        kernels_cuda/matmul_nvfp4blk_gemm.cu
+        kernels_cuda/moe_gate_up_fused_k_nvfp4blk_batched.cu
+        kernels_cuda/moe_down_fused_k_nvfp4blk_batched.cu
+        kernels_cuda/moe_gate_up_fused_k_bf16_batched.cu
+        kernels_cuda/moe_down_fused_k_bf16_batched.cu
         kernels_cuda/matmul_q3k_vec.cu
         kernels_cuda/matmul_q4k_vec.cu
         kernels_cuda/matmul_q5_0_vec.cu
@@ -689,9 +707,12 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/matmul_q8_0_vec_dp4a.cu
         kernels_cuda/matmul_q8_0_vec_reorder.cu
         kernels_cuda/moe_down_fused_k_q5k.cu
+        kernels_cuda/moe_down_fused_k_q5k_batched.cu
+        kernels_cuda/moe_down_fused_k_q6k_batched.cu
         kernels_cuda/moe_down_fused_k_q6k.cu
         kernels_cuda/moe_down_fused_k_q8_0.cu
         kernels_cuda/moe_gate_up_fused_k_q4k.cu
+        kernels_cuda/moe_gate_up_fused_k_q4k_batched.cu
         kernels_cuda/ffn_gate_up_fused_q8_0.cu
         kernels_cuda/mul_scalar.cu
         kernels_cuda/qkv_split.cu
@@ -703,14 +724,19 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/rmsnorm_qkv_fp16.cu
         kernels_cuda/rope_inplace.cu
         kernels_cuda/rope_mrope.cu
+        kernels_cuda/rope_mrope_batched.cu
         kernels_cuda/split_head_pair.cu
         kernels_cuda/sigmoid_gate_mul.cu
         kernels_cuda/l2_norm.cu
         kernels_cuda/ssm_conv1d.cu
+        kernels_cuda/ssm_conv1d_batched.cu
         kernels_cuda/gated_deltanet_ar.cu
+        kernels_cuda/gated_deltanet_ar_batched.cu
         kernels_cuda/deltanet_gate.cu
         kernels_cuda/deltanet_chunk_cumgate.cu
         kernels_cuda/deltanet_chunk_forward.cu
+        kernels_cuda/deltanet_chunk_cumgate_batched.cu
+        kernels_cuda/deltanet_chunk_forward_batched.cu
         kernels_cuda/deltanet_kkt_solve.cu
         kernels_cuda/sigmoid_inplace.cu
         kernels_cuda/gather_heads_from_channels.cu
@@ -878,6 +904,10 @@ add_executable(mimirmind
     src/model/Tokenizer.cpp
     src/runtime/BlockBuffers.cpp
     src/runtime/InferenceEngine.cpp
+    src/runtime/engine/Nvfp4Loader.cpp
+    src/runtime/engine/MtpDecoder.cpp
+    src/runtime/engine/ServingSession.cpp
+    src/runtime/serving/ContinuousBatcher.cpp
     src/runtime/KvCache.cpp
     src/runtime/SsmState.cpp
     src/runtime/perf/OpProfiler.cpp

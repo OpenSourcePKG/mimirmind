@@ -19,6 +19,7 @@
 #include "core/os/GovernorLock.hpp"
 #include "model/Tokenizer.hpp"
 #include "runtime/InferenceEngine.hpp"
+#include "runtime/serving/ContinuousBatcher.hpp"
 #include "runtime/nvfp4/ModelFormatResolver.hpp"
 #include "runtime/perf/PerfRegressionDetector.hpp"
 #include "runtime/spec/Drafter.hpp"
@@ -33,6 +34,7 @@
 #include "server/ApiServer.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -95,7 +97,14 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 #endif
 
     std::optional<::mimirmind::core::os::GovernorLock> governorLock;
-    if (!attachedMode) {
+    // The MIMIRMIND_SERVING_PARITY dev hook exits before the HTTP server
+    // starts, so it needs neither the thermal governor nor exclusive
+    // ownership — skip the flock so a parity check can run alongside a
+    // live serve worker (subject to host memory).
+    const bool servingParity =
+        std::getenv("MIMIRMIND_SERVING_PARITY") != nullptr ||
+        std::getenv("MIMIRMIND_BATCH_BENCH") != nullptr;
+    if (!attachedMode && !servingParity) {
         auto lk = ::mimirmind::core::os::GovernorLock::tryAcquire();
         if (!lk) {
             std::cerr << "serve: " << lk.error()
@@ -261,6 +270,447 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         // (fused-QKV coverage, attn_k/v.bias presence per block), so
         // apply the per-model runtime overrides AFTER loadModel.
         applyRuntimeOverrides(*e, cfg.effectiveRuntime(m.id));
+
+        // M-Cuda.Batch D2e — batched decode throughput benchmark. With
+        // MIMIRMIND_BATCH_BENCH set, time generateBatch across batch sizes
+        // and report ms/step + generated-tokens/s, then exit. The batched
+        // forward processes all nSeq sequences in one pass, so gen-tok/s
+        // should scale with the batch while ms/step stays roughly flat —
+        // that is the serving-class throughput win. qwen35moe only.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_BATCH_BENCH") != nullptr) {
+            const auto& tok = e->tokenizer();
+            auto base = tok.encode("The capital of France is", /*addBos=*/false);
+            if (base.empty()) base.push_back(1);
+            const bool quick = std::getenv("MIMIRMIND_BENCH_QUICK") != nullptr;
+            const std::size_t maxNew    = quick ? 4 : 32;
+            const std::size_t promptLen = base.size();
+            const std::vector<std::size_t> batchSizes =
+                quick ? std::vector<std::size_t>{1}
+                      : std::vector<std::size_t>{1, 4, 8, 16};
+            std::cout << "\n[M-Cuda.Batch D2e bench] promptLen=" << promptLen
+                      << " maxNew=" << maxNew << "\n";
+            // Single-session baseline on THIS box+model (apples-to-apples).
+            {
+                ::mimirmind::runtime::GenerateParams gpb{};
+                gpb.maxNewTokens         = maxNew;
+                gpb.sampling.temperature = 0.0F;
+                e->resetCache();
+                const auto s0 = std::chrono::steady_clock::now();
+                auto sref = e->generate(base, gpb, {}, nullptr, {}, {});
+                const auto s1 = std::chrono::steady_clock::now();
+                const double sms =
+                    std::chrono::duration<double, std::milli>(s1 - s0).count();
+                std::cout << "  single-seq generate(): " << sms << " ms  "
+                          << (sms / static_cast<double>(sref.size()))
+                          << " ms/tok  " << (1000.0 * static_cast<double>(sref.size()) / sms)
+                          << " tok/s\n";
+                std::cout.flush();
+            }
+            for (std::size_t nSeq : batchSizes) {
+                std::vector<std::vector<std::int32_t>> prompts(nSeq, base);
+                if (nSeq == 1) {
+                    (void)e->generateBatch(prompts, 2, -1);   // warm up
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                (void)e->generateBatch(prompts, maxNew, /*eosId=*/-1);
+                const auto t1 = std::chrono::steady_clock::now();
+                const double ms =
+                    std::chrono::duration<double, std::milli>(t1 - t0).count();
+                const std::size_t steps   = promptLen + maxNew;
+                const std::size_t genToks = nSeq * maxNew;
+                std::cout << "  nSeq=" << nSeq
+                          << "  total=" << ms << " ms  "
+                          << (ms / static_cast<double>(steps)) << " ms/step  "
+                          << (1000.0 * static_cast<double>(genToks) / ms)
+                          << " gen-tok/s\n";
+                std::cout.flush();
+            }
+            return 0;
+        }
+
+        // M-Cuda.Batch D2d — batched serving parity gate (dev/CI hook).
+        // With MIMIRMIND_SERVING_PARITY set, run the batched decode path
+        // (generateServingParity) against single-seq greedy generate() on
+        // this freshly-loaded model, print the comparison, and exit before
+        // the HTTP server starts. qwen35moe only.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_SERVING_PARITY") != nullptr) {
+            const auto& tok = e->tokenizer();
+            std::vector<std::int32_t> promptIds =
+                tok.encode("The capital of France is", /*addBos=*/false);
+            if (promptIds.empty()) {
+                promptIds.push_back(1);
+            }
+            // MIMIRMIND_BATCH_NP=N truncates the prompt to N tokens. With a
+            // 1-token prompt the single-session reference does a T=1 prefill,
+            // i.e. the same per-token forward the batched path feeds — an
+            // apples-to-apples parity gate. Larger N makes the single side do
+            // a T=N prefill (a numerically distinct kernel path from N* T=1
+            // decode), so the comparison then also reflects prefill-vs-feed.
+            if (const char* np = std::getenv("MIMIRMIND_BATCH_NP")) {
+                const long n = std::strtol(np, nullptr, 10);
+                if (n > 0 && static_cast<std::size_t>(n) < promptIds.size()) {
+                    promptIds.resize(static_cast<std::size_t>(n));
+                }
+            }
+            const std::size_t maxNew = 8;
+            const std::size_t nSeq   = 2;
+
+            ::mimirmind::runtime::GenerateParams gp{};
+            gp.maxNewTokens         = maxNew;
+            gp.sampling.temperature = 0.0F;   // greedy argmax
+            // Reset the KV+SSM state so the reference is a clean single-session
+            // run — the prefix cache reuses KV across generate() calls but does
+            // NOT restore the GatedDeltaNet recurrent state, which would
+            // contaminate a later reference (lcp>0 keeps a stale SsmState).
+            e->resetCache();
+            std::vector<std::int32_t> ref =
+                e->generate(promptIds, gp, {}, nullptr, {}, {});
+
+            auto batched = e->generateServingParity(promptIds, nSeq, maxNew);
+
+            bool allSeqEqual = true;
+            for (std::size_t s = 1; s < nSeq; ++s) {
+                if (batched[s] != batched[0]) allSeqEqual = false;
+            }
+            std::size_t matchLen = 0;
+            const std::size_t cmpN = std::min(batched[0].size(), ref.size());
+            for (; matchLen < cmpN; ++matchLen) {
+                if (batched[0][matchLen] != ref[matchLen]) break;
+            }
+            std::cout << "\n[M-Cuda.Batch D2d serving-parity] nSeq=" << nSeq
+                      << " maxNew=" << maxNew
+                      << " promptTokens=" << promptIds.size() << "\n"
+                      << "  batched[0] :";
+            for (auto t : batched[0]) std::cout << ' ' << t;
+            std::cout << "\n  single-seq :";
+            for (auto t : ref) std::cout << ' ' << t;
+            std::cout << "\n  all-seq-identical=" << (allSeqEqual ? "YES" : "NO")
+                      << "  ref-match-prefix=" << matchLen << "/" << ref.size()
+                      << ((matchLen == ref.size() && allSeqEqual)
+                              ? "  => PASS"
+                              : "  => CHECK")
+                      << "\n";
+
+            // D2e.1 — generateBatch with DISTINCT prompts. Each batched
+            // stream must equal its own single-session greedy generate().
+            const char* multiPrompts[] = {
+                "The capital of France is",
+                "Once upon a time",
+                "2 plus 2 equals",
+            };
+            std::vector<std::vector<std::int32_t>> bprompts;
+            for (const char* mp : multiPrompts) {
+                auto ids = tok.encode(mp, /*addBos=*/false);
+                if (ids.empty()) ids.push_back(1);
+                bprompts.push_back(std::move(ids));
+            }
+            auto bout = e->generateBatch(bprompts, maxNew, /*eosId=*/-1);
+            std::cout << "[M-Cuda.Batch D2e generateBatch] "
+                      << bprompts.size() << " distinct prompts, maxNew="
+                      << maxNew << "\n";
+            bool allBatchOk = true;
+            for (std::size_t i = 0; i < bprompts.size(); ++i) {
+                ::mimirmind::runtime::GenerateParams gpi{};
+                gpi.maxNewTokens         = maxNew;
+                gpi.sampling.temperature = 0.0F;
+                e->resetCache();   // clean single-session reference (see above)
+                std::vector<std::int32_t> refi =
+                    e->generate(bprompts[i], gpi, {}, nullptr, {}, {});
+                std::size_t ml = 0;
+                const std::size_t cn = std::min(bout[i].size(), refi.size());
+                for (; ml < cn; ++ml) {
+                    if (bout[i][ml] != refi[ml]) break;
+                }
+                const bool ok = (ml == refi.size() && bout[i].size() == refi.size());
+                allBatchOk = allBatchOk && ok;
+                std::cout << "  prompt[" << i << "] match=" << ml << "/"
+                          << refi.size() << (ok ? " OK" : " MISMATCH")
+                          << "  batched:";
+                for (auto t : bout[i]) std::cout << ' ' << t;
+                std::cout << "\n";
+            }
+            std::cout << "  => generateBatch "
+                      << (allBatchOk ? "PASS" : "CHECK") << "\n";
+            std::cout.flush();
+            return 0;
+        }
+
+        // M-Cuda.Batch D2e.2 — continuous-batching STEP-loop validation.
+        // With MIMIRMIND_SERVING_LOOP set, drive the persistent per-slot
+        // stepServing() interface as a hand-rolled continuous batcher:
+        // admit 3 distinct prompts at STAGGERED iterations (each pinned to
+        // its own slot, stepping at its OWN position), collect each stream,
+        // and compare to single-seq greedy generate(). This is the engine
+        // primitive the ContinuousBatcher wraps with a worker thread + HTTP.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_SERVING_LOOP") != nullptr) {
+            const auto& tok = e->tokenizer();
+            const char* prompts[] = {
+                "The capital of France is",
+                "Once upon a time",
+                "2 plus 2 equals",
+            };
+            const std::size_t nReq   = 3;
+            const std::size_t maxNew  = 8;
+            const std::size_t admitAt[nReq] = {0, 2, 4};   // staggered arrival
+
+            std::vector<std::vector<std::int32_t>> pids(nReq);
+            std::size_t maxLen = 0;
+            for (std::size_t r = 0; r < nReq; ++r) {
+                pids[r] = tok.encode(prompts[r], /*addBos=*/false);
+                if (pids[r].empty()) pids[r].push_back(1);
+                maxLen = std::max(maxLen, pids[r].size());
+            }
+            const std::size_t maxContext = maxLen + maxNew + 8;
+            e->ensureServingState(/*maxBatch=*/nReq, maxContext);
+
+            struct Req {
+                std::size_t promptLen{0};
+                std::size_t pos{0};
+                std::int32_t lastTok{0};
+                bool admitted{false};
+                bool done{false};
+                std::vector<std::int32_t> out;
+            };
+            std::vector<Req> req(nReq);
+            for (std::size_t r = 0; r < nReq; ++r) req[r].promptLen = pids[r].size();
+
+            // Slot r == request r (pinned): admit in request order so the
+            // active set is always the contiguous prefix [0, nAdmitted).
+            std::size_t nAdmitted = 0;
+            using Step = ::mimirmind::runtime::InferenceEngine::ServingSlotStep;
+            for (std::size_t g = 0; g < maxLen + maxNew + nReq * 4; ++g) {
+                for (std::size_t r = 0; r < nReq; ++r) {
+                    if (!req[r].admitted && admitAt[r] <= g) {
+                        req[r].admitted = true;
+                        nAdmitted = std::max(nAdmitted, r + 1);
+                    }
+                }
+                if (nAdmitted == 0) continue;
+
+                std::vector<Step> steps(nAdmitted);
+                for (std::size_t i = 0; i < nAdmitted; ++i) {
+                    Step s{};
+                    s.slot = static_cast<std::uint32_t>(i);
+                    if (!req[i].admitted || req[i].done) {
+                        // Idle slot: fresh 1-token dummy (output discarded).
+                        s.token = 0; s.pos = 0; s.seqStart = true;
+                    } else {
+                        const std::size_t p = req[i].pos;
+                        s.token = (p < req[i].promptLen) ? pids[i][p]
+                                                         : req[i].lastTok;
+                        s.pos      = static_cast<std::int32_t>(p);
+                        s.seqStart = (p == 0);
+                    }
+                    steps[i] = s;
+                }
+                std::vector<std::int32_t> toks(nAdmitted, 0);
+                e->stepServing(steps, toks);
+
+                bool allDone = true;
+                for (std::size_t i = 0; i < nAdmitted; ++i) {
+                    if (!req[i].admitted || req[i].done) continue;
+                    if (req[i].pos + 1 >= req[i].promptLen) {
+                        req[i].out.push_back(toks[i]);
+                        req[i].lastTok = toks[i];
+                        if (req[i].out.size() >= maxNew) req[i].done = true;
+                    }
+                    req[i].pos++;
+                    if (!req[i].done) allDone = false;
+                }
+                bool allAdmitted = true;
+                for (std::size_t r = 0; r < nReq; ++r)
+                    if (!req[r].admitted) allAdmitted = false;
+                if (allAdmitted && allDone) break;
+            }
+
+            std::cout << "\n[M-Cuda.Batch D2e.2 serving-loop] " << nReq
+                      << " staggered requests (admitAt 0/2/4), maxNew="
+                      << maxNew << "\n";
+            bool allOk = true;
+            for (std::size_t r = 0; r < nReq; ++r) {
+                ::mimirmind::runtime::GenerateParams gpr{};
+                gpr.maxNewTokens         = maxNew;
+                gpr.sampling.temperature = 0.0F;
+                e->resetCache();
+                std::vector<std::int32_t> ref =
+                    e->generate(pids[r], gpr, {}, nullptr, {}, {});
+                std::size_t ml = 0;
+                const std::size_t cn = std::min(req[r].out.size(), ref.size());
+                for (; ml < cn; ++ml) if (req[r].out[ml] != ref[ml]) break;
+                const bool ok = (ml == ref.size() &&
+                                 req[r].out.size() == ref.size());
+                allOk = allOk && ok;
+                std::cout << "  req[" << r << "] admitAt=" << admitAt[r]
+                          << " match=" << ml << "/" << ref.size()
+                          << (ok ? " OK" : " MISMATCH") << "  loop:";
+                for (auto t : req[r].out) std::cout << ' ' << t;
+                std::cout << "\n";
+            }
+            std::cout << "  => serving-loop " << (allOk ? "PASS" : "CHECK")
+                      << "\n";
+            std::cout.flush();
+            return 0;
+        }
+
+        // M-Cuda.Batch D2e.2 — threaded ContinuousBatcher end-to-end test.
+        // With MIMIRMIND_BATCHER_TEST set, submit MORE requests than there
+        // are slots so later ones must reuse freed slots, then verify each
+        // stream == its single-seq greedy generate(). Exercises the worker
+        // thread + admit/complete/slot-reuse path the HTTP server uses.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_BATCHER_TEST") != nullptr) {
+            const auto& tok = e->tokenizer();
+            // Include LONG prompts (>16 tokens => cross paged-KV block
+            // boundaries, blockSize=16) so the block-table walk in the
+            // batched paged path is exercised, plus short ones for slot
+            // reuse. Each stream must still equal single-seq generate().
+            const char* prompts[] = {
+                "The capital of France is",
+                "Once upon a time in a small village nestled deep between two "
+                "great mountains, there lived an old clockmaker who believed "
+                "that every second carried a secret worth keeping, and so he",
+                "2 plus 2 equals",
+                "Write a detailed explanation of how photosynthesis converts "
+                "sunlight, water and carbon dioxide into glucose and oxygen "
+                "inside the chloroplasts of a green plant leaf, step by step:",
+                "In the beginning",
+            };
+            const std::size_t nReq  = 5;
+            const std::size_t maxNew = 12;
+            std::vector<std::vector<std::int32_t>> pids(nReq);
+            std::size_t maxLen = 0;
+            for (std::size_t r = 0; r < nReq; ++r) {
+                pids[r] = tok.encode(prompts[r], /*addBos=*/false);
+                if (pids[r].empty()) pids[r].push_back(1);
+                maxLen = std::max(maxLen, pids[r].size());
+            }
+            // References first (before the batcher builds serving state), so
+            // the single-session KV/SSM path is untouched by the batcher.
+            std::vector<std::vector<std::int32_t>> refs(nReq);
+            for (std::size_t r = 0; r < nReq; ++r) {
+                ::mimirmind::runtime::GenerateParams gpr{};
+                gpr.maxNewTokens         = maxNew;
+                gpr.sampling.temperature = 0.0F;
+                e->resetCache();
+                refs[r] = e->generate(pids[r], gpr, {}, nullptr, {}, {});
+            }
+
+            const std::size_t maxBatch   = 3;   // < nReq => forces slot reuse
+            const std::size_t maxContext = maxLen + maxNew + 8;
+            ::mimirmind::runtime::serving::ContinuousBatcher batcher(
+                *e, maxBatch, maxContext, /*eosId=*/-1);
+
+            std::vector<std::shared_ptr<
+                ::mimirmind::runtime::serving::ServingRequest>> handles(nReq);
+            for (std::size_t r = 0; r < nReq; ++r) {
+                handles[r] = batcher.submit(pids[r], maxNew, {});
+            }
+            std::cout << "\n[M-Cuda.Batch D2e.2 batcher-test] " << nReq
+                      << " requests, maxBatch=" << maxBatch
+                      << " (slot reuse), maxNew=" << maxNew << "\n";
+            bool allOk = true;
+            for (std::size_t r = 0; r < nReq; ++r) {
+                std::vector<std::int32_t> out = handles[r]->waitAll();
+                std::size_t ml = 0;
+                const std::size_t cn = std::min(out.size(), refs[r].size());
+                for (; ml < cn; ++ml) if (out[ml] != refs[r][ml]) break;
+                const bool ok = (ml == refs[r].size() &&
+                                 out.size() == refs[r].size() &&
+                                 handles[r]->error.empty());
+                allOk = allOk && ok;
+                std::cout << "  req[" << r << "] promptLen=" << pids[r].size()
+                          << " match=" << ml << "/"
+                          << refs[r].size() << (ok ? " OK" : " MISMATCH");
+                if (!handles[r]->error.empty())
+                    std::cout << " err=" << handles[r]->error;
+                std::cout << "  out:";
+                for (auto t : out) std::cout << ' ' << t;
+                std::cout << "\n";
+            }
+            std::cout << "  => batcher-test " << (allOk ? "PASS" : "CHECK")
+                      << "\n";
+            std::cout.flush();
+            return 0;
+        }
+
+        // M-Cuda.MTP — native multi-token-prediction validation + speedup.
+        // MIMIRMIND_MTP_TEST: run generateMtp (depth from MIMIRMIND_MTP_DEPTH,
+        // default 2) vs plain greedy generate() on the same prompt. Output MUST
+        // be bit-identical (verify guarantees correctness); report accept-rate
+        // and decode speedup.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_MTP_TEST") != nullptr) {
+            if (!e->mtpAvailable()) {
+                std::cout << "\n[M-Cuda.MTP] model has no nextn head — skipped\n";
+                std::cout.flush();
+                return 0;
+            }
+            const auto& tok = e->tokenizer();
+            const char* promptEnv = std::getenv("MIMIRMIND_MTP_PROMPT");
+            std::vector<std::int32_t> pids = tok.encode(
+                promptEnv != nullptr
+                    ? promptEnv
+                    : "The history of artificial intelligence began when",
+                /*addBos=*/false);
+            if (pids.empty()) pids.push_back(1);
+            std::size_t depth = 2;
+            if (const char* dv = std::getenv("MIMIRMIND_MTP_DEPTH")) {
+                const long v = std::strtol(dv, nullptr, 10);
+                if (v >= 1) depth = static_cast<std::size_t>(v);
+            }
+            std::size_t maxNew = 64;
+            if (const char* mv = std::getenv("MIMIRMIND_MTP_MAXNEW")) {
+                const long v = std::strtol(mv, nullptr, 10);
+                if (v >= 1) maxNew = static_cast<std::size_t>(v);
+            }
+            std::cout << "\n[M-Cuda.MTP] promptTokens=" << pids.size();
+            using clk = std::chrono::steady_clock;
+
+            // Baseline greedy generate().
+            ::mimirmind::runtime::GenerateParams gp{};
+            gp.maxNewTokens         = maxNew;
+            gp.sampling.temperature = 0.0F;
+            e->resetCache();
+            const auto tb0 = clk::now();
+            std::vector<std::int32_t> ref =
+                e->generate(pids, gp, {}, nullptr, {}, {});
+            const double baseMs =
+                std::chrono::duration<double, std::milli>(clk::now() - tb0).count();
+
+            // MTP greedy generate.
+            std::size_t drafted = 0, accepted = 0;
+            const auto tm0 = clk::now();
+            std::vector<std::int32_t> mtp =
+                e->generateMtp(pids, maxNew, depth, tok.eosId(),
+                               &drafted, &accepted);
+            const double mtpMs =
+                std::chrono::duration<double, std::milli>(clk::now() - tm0).count();
+
+            std::size_t matchLen = 0;
+            const std::size_t cn = std::min(ref.size(), mtp.size());
+            for (; matchLen < cn; ++matchLen)
+                if (ref[matchLen] != mtp[matchLen]) break;
+            const bool identical =
+                (ref.size() == mtp.size()) && (matchLen == ref.size());
+            const double acceptRate =
+                drafted > 0 ? static_cast<double>(accepted) / drafted : 0.0;
+
+            std::cout << "\n[M-Cuda.MTP] depth=" << depth << " maxNew=" << maxNew
+                      << "\n  output-identical=" << (identical ? "YES" : "NO")
+                      << " (match " << matchLen << "/" << ref.size() << ", mtp "
+                      << mtp.size() << ")\n"
+                      << "  accept-rate=" << acceptRate << " (" << accepted << "/"
+                      << drafted << ")\n"
+                      << "  baseline=" << baseMs << " ms  mtp=" << mtpMs
+                      << " ms  speedup=" << (mtpMs > 0 ? baseMs / mtpMs : 0.0)
+                      << "x\n"
+                      << "  => MTP " << (identical ? "PASS" : "MISMATCH") << "\n";
+            std::cout.flush();
+            return 0;
+        }
 
         // M9.8b — cross-block sanity check on the effective runtime.
         // The plain-attention fallback in kernels/attention.cl holds
@@ -802,6 +1252,37 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         if (auto* p = engine.powerMonitor())            e->setPowerMonitor(p);
         if (auto* d = engine.perfRegressionDetector()) e->setPerfRegressionDetector(d);
         if (auto* fc = engine.fanController())          e->setFanController(fc);
+    }
+
+    // M-Cuda.Batch D2e.2 — continuous-batching worker for the default
+    // (serving-class) engine. Built only for qwen35moe once the startup
+    // BatchCapacityProbe has recommended serving-class (sustainableBatch
+    // >= min). Requests to the default engine are then serviced through the
+    // batcher's worker thread (multi-tenant continuous batching) rather than
+    // the serialised single-session generate() path. Kept alive for the
+    // whole server.run() below; its dtor joins the worker on shutdown.
+    std::unique_ptr<::mimirmind::runtime::serving::ContinuousBatcher> batcher;
+    if (engine.config().architecture == "qwen35moe" &&
+        engine.servingClassEnabled()) {
+        const std::size_t maxBatch =
+            std::max<std::size_t>(1, engine.batchCapacity().sustainableBatch);
+        const std::size_t maxContext = engine.maxContextTokens();
+        try {
+            batcher = std::make_unique<
+                ::mimirmind::runtime::serving::ContinuousBatcher>(
+                engine, maxBatch, maxContext, engine.tokenizer().eosId());
+            scfg.batcher = batcher.get();
+            MM_LOG_INFO("main",
+                        "serve: continuous batcher ENABLED for default engine "
+                        "'{}' (maxBatch={} maxContext={})",
+                        defaultId, maxBatch, maxContext);
+        } catch (const std::exception& e) {
+            MM_LOG_WARN("main",
+                        "serve: continuous batcher init failed ({}); falling "
+                        "back to single-session generate()", e.what());
+            batcher.reset();
+            scfg.batcher = nullptr;
+        }
     }
 
     ::mimirmind::server::ApiServer server{std::move(loadedEngines), scfg,

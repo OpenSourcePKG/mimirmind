@@ -128,6 +128,16 @@ public:
                            const std::int32_t* sections,
                            std::size_t writeOffsetStride = 0,
                            runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
+    // M-Cuda.Batch Cat B: batched IMRoPE — nSeq sequences, each with its
+    // own x region (xSeqStride) and start position (startPosDev[nSeq]), in
+    // one launch. CUDA-only, parity-gated. x layout provisional (Phase D).
+    void mropeInPlaceBatchedAsync(void* xBase, std::size_t nSeq,
+                                  std::size_t xSeqStride, std::size_t seqLen,
+                                  std::size_t numHeads, std::size_t headDim,
+                                  const std::int32_t* startPosDev, float base,
+                                  const std::int32_t* sections,
+                                  std::size_t writeOffsetStride = 0,
+                                  runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
 
     void splitHeadPairAsync(const float* src, float* a, float* b,
                             std::size_t seqLen, std::size_t numHeads,
@@ -141,11 +151,28 @@ public:
     void causalConv1dSiluAsync(const float* convInput, const float* kernel,
                                float* out, std::size_t T, std::size_t channels,
                                std::size_t kernelSize) override;
+    // M-Cuda.Batch Cat C-P0: batched variant — nSeq independent sequences,
+    // each with its own conv input (caller prepends the per-sequence conv
+    // tail), in one launch. CUDA-only (parity-gated before wiring).
+    void causalConv1dSiluBatchedAsync(const float* convInput,
+                                      const float* kernel, float* out,
+                                      std::size_t nSeq, std::size_t T,
+                                      std::size_t channels,
+                                      std::size_t kernelSize) override;
     void gatedDeltaNetRecurrentAsync(const float* q, const float* k,
                                      const float* v, const float* gLog,
                                      const float* beta, float* state,
                                      float* out, std::size_t T, std::size_t H,
                                      std::size_t S) override;
+    // M-Cuda.Batch Cat C-P0: batched-state variant. nSeq independent
+    // sequences, each with its own [H,S,S] state, in one launch. CUDA-only
+    // (not in the ComputeOps interface yet; parity-gated before wiring).
+    void gatedDeltaNetRecurrentBatchedAsync(const float* q, const float* k,
+                                            const float* v, const float* gLog,
+                                            const float* beta, float* state,
+                                            float* out, std::size_t nSeq,
+                                            std::size_t T, std::size_t H,
+                                            std::size_t S) override;
     void deltanetGateAsync(const float* alpha, const float* ssmA,
                            const float* ssmDt, float* gLog,
                            std::size_t T, std::size_t H) override;
@@ -157,6 +184,19 @@ public:
                                    const float* a0, float* state, float* out,
                                    std::size_t T, std::size_t H, std::size_t S,
                                    std::size_t chunkSize) override;
+    // M-Cuda.Batch Cat C-P1: batched chunked-prefill variants — nSeq
+    // sequences in one launch (grid.y = nSeq), each with its own slabs and
+    // per-sequence state/scratch. CUDA-only, parity-gated.
+    void deltanetChunkCumGateBatchedAsync(const float* gLog, float* gCum,
+                                          std::size_t nSeq, std::size_t T,
+                                          std::size_t H, std::size_t chunkSize) override;
+    void deltanetChunkForwardBatchedAsync(const float* q, const float* k,
+                                          const float* v, const float* gCum,
+                                          const float* beta, const float* a0,
+                                          float* state, float* out,
+                                          std::size_t nSeq, std::size_t T,
+                                          std::size_t H, std::size_t S,
+                                          std::size_t chunkSize) override;
     void deltanetKktSolveInverseAsync(const float* k, const float* beta,
                                       float* a0, std::size_t T, std::size_t H,
                                       std::size_t S, std::size_t chunkSize) override;
@@ -413,6 +453,33 @@ private:
                                    runtime::KvDtype kvDtype);
 
 public:
+    // M-Cuda.Batch (attention): batched decode flash-attention over nSeq
+    // sequences, each with its own query, contiguous KV cache and length.
+    // CUDA-only, F32, parity-gated. Caller owns partialScratch
+    // [nSeq, nHeads, maxKTiles, 2+headDim] and curLenDev [nSeq]; per-seq
+    // KV/partial strides are provisional (settled in Phase D).
+    void attentionDecodeFlashBatchedAsync(const float* q, const float* k,
+                                          const float* v, float* partialScratch,
+                                          float* out, std::size_t nSeq,
+                                          std::size_t maxKTiles,
+                                          std::size_t qSeqStride,
+                                          std::size_t kvSeqStride,
+                                          std::size_t partialSeqStride,
+                                          std::size_t outSeqStride,
+                                          std::size_t nHeads,
+                                          std::size_t nKvHeads,
+                                          std::size_t headDim,
+                                          const std::int32_t* curLenDev,
+                                          float scale, std::size_t slidingWindow,
+                                          runtime::KvDtype kvDtype
+                                              = runtime::KvDtype::F32) override;
+    void pagedAttentionDecodeV1Async(
+            float* out, const float* query, const float* keyCache,
+            const float* valueCache, const std::int32_t* blockTables,
+            const std::int32_t* seqLens, std::size_t numSeqs,
+            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
+            std::size_t blockSize, std::size_t maxNumBlocksPerSeq, float scale,
+            float softcap) override;
     // Publicly readable so callers can compute launch upper bounds
     // for `setReplayMaxKTiles`. Parity with `GpuOps`.
     static constexpr std::size_t kFlashKTileSize   = 64;

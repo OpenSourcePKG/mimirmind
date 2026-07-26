@@ -122,6 +122,13 @@ struct BlockBuffers {
     // nullptr for non-recurrent models (never dereferenced there).
     float* ssmStatePtr     = nullptr;  // -> SsmState::statePtr()
     float* ssmConvStatePtr = nullptr;  // -> SsmState::convStatePtr()
+    // Allocated sequence-width of the SsmState slab bound above. The
+    // per-layer stride is `blockIdx * (ssmSlabNSeq * elemsPerLayer)` — it
+    // MUST use the slab's allocated nSeq, NOT the runtime batch nSeq, or a
+    // continuous batch whose active count is smaller than the allocation
+    // reads the wrong layer's state (M-Cuda.Batch D2e.2). Bound alongside
+    // ssmStatePtr; defaults to 1 for the single-sequence path.
+    std::size_t ssmSlabNSeq = 1;  // -> SsmState::nSeq()
 
     // Chunked-prefill (T>1) scratch (M-Q3N.4 integration): K0 cumgate output
     // gCum [maxT, H_v] and K1 triangular-inverse a0 [nChunks, H_v, C, C]
@@ -151,6 +158,7 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
                                bool                    withFusedQkv      = false,
                                bool                    withKvFp32Scratch = false,
                                bool                    withQGate         = false,
-                               bool                    withSsm           = false);
+                               bool                    withSsm           = false,
+                               bool                    perSeqConvInput   = false);
 
 } // namespace mimirmind::runtime

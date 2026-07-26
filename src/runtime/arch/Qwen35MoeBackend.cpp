@@ -5,6 +5,7 @@
 
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
+#include "compute/Embedding.hpp"
 #include "compute/MoeRouting.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
@@ -14,6 +15,7 @@
 #include "model/LlmConfig.hpp"
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
+#include "runtime/serving/PagedKvPool.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -24,6 +26,21 @@
 namespace mimirmind::runtime::arch {
 
 namespace {
+
+// Block geometry (elements, bytes) for an expert weight type. NVFP4_BLK is a
+// runtime-only blocked format (32-element super-blocks of 20 bytes) not in the
+// QuantType registry, so handle it explicitly; everything else goes through the
+// registry. Returns {0,0} for an unregistered non-NVFP4 type (caller checks).
+inline std::pair<std::size_t, std::size_t>
+moeBlockGeom(core::gguf::GgmlType type) {
+    if (type == core::gguf::GgmlType::NVFP4_BLK) {
+        return {32, 20};
+    }
+    const compute::QuantType* qt = compute::quantType(type);
+    return qt != nullptr ? std::pair<std::size_t, std::size_t>{qt->blockElements(),
+                                                               qt->blockBytes()}
+                         : std::pair<std::size_t, std::size_t>{0, 0};
+}
 
 const core::gguf::GgufTensor&
 requireBlock(const core::gguf::WeightsMap& w, std::size_t blockIdx,
@@ -75,8 +92,15 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
                                : 0;
     }
     std::size_t recurrent = 0;
+    _fullAttnDense.assign(_config.blockCount,
+                          std::numeric_limits<std::size_t>::max());
+    std::size_t denseFull = 0;
     for (std::size_t b = 0; b < _config.blockCount; ++b) {
-        if (_config.isRecurrentLayer(b)) ++recurrent;
+        if (_config.isRecurrentLayer(b)) {
+            ++recurrent;
+        } else {
+            _fullAttnDense[b] = denseFull++;   // dense PagedKvPool layer index
+        }
     }
     MM_LOG_INFO("qwen35moe",
                 "Qwen35MoeBackend ready — blocks={} ({} full / {} linear) "
@@ -158,7 +182,14 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
                                              std::size_t   T,
                                              KvCache&      cache,
                                              BlockBuffers& s,
-                                             bool          diag) {
+                                             bool          diag,
+                                             std::size_t   kvLayerIdx) {
+    // Weight-block index (blockIdx) vs KV-cache layer index (kvL) are
+    // decoupled so the MTP module can read blk.<mtp> weights while writing
+    // into a private 1-layer KvCache at layer 0.
+    const std::size_t kvL =
+        (kvLayerIdx == std::numeric_limits<std::size_t>::max()) ? blockIdx
+                                                                : kvLayerIdx;
     auto trace = [&](const char* tag) {
         if (diag) MM_LOG_INFO("blkdiag-q35", "blk {} {}", blockIdx, tag);
     };
@@ -198,10 +229,10 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     float* const projOutBuf    = s.projOut.as<float>();
     float* const matmulScratch = s.matmulScratch.as<float>();
 
-    void* const kSlot = cache.writeSlotK(blockIdx);
-    void* const vSlot = cache.writeSlotV(blockIdx);
-    void* const kBase = const_cast<void*>(cache.baseK(blockIdx));
-    void* const vBase = const_cast<void*>(cache.baseV(blockIdx));
+    void* const kSlot = cache.writeSlotK(kvL);
+    void* const vSlot = cache.writeSlotV(kvL);
+    void* const kBase = const_cast<void*>(cache.baseK(kvL));
+    void* const vBase = const_cast<void*>(cache.baseV(kvL));
 
     // --- pre-attention RMSNorm ---------------------------------------
     trace("attn rmsNorm");
@@ -253,7 +284,7 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     // --- GQA attention -----------------------------------------------
     trace("attention");
     const float attnScale = _config.attentionScaleFor(head_dim);
-    _ops.attentionAsync(qBuf, cache.baseK(blockIdx), cache.baseV(blockIdx),
+    _ops.attentionAsync(qBuf, cache.baseK(kvL), cache.baseV(kvL),
                         T, totalLen, nHeads, nKvHeads, head_dim,
                         curLen, attnScale, attnOutBuf,
                         /*slidingWindow=*/0, kvDtype);
@@ -281,6 +312,69 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
 
     trace("ffn residual");
     _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), T * d_model);
+}
+
+void Qwen35MoeBackend::runMtpDraftStep(const float*  hidden,
+                                       std::int32_t  prevTok,
+                                       KvCache&      mtpCache,
+                                       BlockBuffers& s,
+                                       float*        embScratch,
+                                       float*        catScratch,
+                                       float*        ehScratch,
+                                       float*        logitsOut,
+                                       float*        logitsScratch) {
+    const auto& w = _weights;
+    const std::size_t mtpBlk = _config.blockCount;   // nextn module = blk.<blockCount>
+    const std::size_t d      = s.d_model;
+    const float       eps    = _config.rmsNormEps;
+
+    const auto& enorm      = requireBlock(w, mtpBlk, "nextn.enorm.weight");
+    const auto& hnorm      = requireBlock(w, mtpBlk, "nextn.hnorm.weight");
+    const auto& ehProj     = requireBlock(w, mtpBlk, "nextn.eh_proj.weight");
+    const auto& sharedNorm = requireBlock(w, mtpBlk, "nextn.shared_head_norm.weight");
+
+    const auto* tokEmb = w.find("token_embd.weight");
+    const auto* lmHead = w.find("output.weight");
+    if (lmHead == nullptr) lmHead = tokEmb;
+    if (tokEmb == nullptr || lmHead == nullptr) {
+        throw std::runtime_error("runMtpDraftStep: shared embed/lm_head missing");
+    }
+    const std::size_t vocabEmb = tokEmb->dimensions.size() >= 2
+                                     ? tokEmb->dimensions[1] : d;
+    const std::size_t vocabLm  = lmHead->dimensions.size() >= 2
+                                     ? lmHead->dimensions[1] : d;
+
+    // 1. token embedding of the just-produced token (shared trunk embedding).
+    //    qwen35moe does not scale embeddings (scalesEmbedding()==false).
+    const std::int32_t tokArr[1] = {prevTok};
+    compute::embeddingLookup(tokEmb->type, tokEmb->usmPtr, d, vocabEmb,
+                             std::span<const std::int32_t>{tokArr, 1}, embScratch);
+
+    // 2. h = eh_proj( concat( RMSNorm(embed, enorm), RMSNorm(hidden, hnorm) ) )
+    //    llama.cpp's GGUF eh_proj expects the embedding-norm FIRST, then the
+    //    hidden-norm (the reverse of the HF/vLLM fc(cat(hnorm, enorm)) order —
+    //    the convert step swaps the concat halves). catScratch = [ enorm-of-
+    //    embed (d) | hnorm-of-hidden (d) ]  (2*d).
+    _ops.rmsNormAsync(embScratch, 1, d, static_cast<const float*>(enorm.usmPtr),
+                      eps, catScratch);
+    _ops.rmsNormAsync(hidden,     1, d, static_cast<const float*>(hnorm.usmPtr),
+                      eps, catScratch + d);
+    _gmm.matmul(ehProj.type, ehProj.usmPtr, d, 2 * d, catScratch, 1,
+                ehScratch, s.matmulScratch.as<float>());
+
+    // 3. the nextn transformer block (attn + MoE), in place on ehScratch,
+    //    using the private MTP KV cache (layer 0). No commit here — the caller
+    //    advances / rolls back mtpCache around the verify/accept loop.
+    runFullAttentionBlock(mtpBlk, ehScratch, /*T=*/1, mtpCache, s,
+                          /*diag=*/false, /*kvLayerIdx=*/0);
+
+    // 4. shared head: RMSNorm(shared_head_norm) -> shared lm_head -> logits.
+    _ops.rmsNormAsync(ehScratch, 1, d,
+                      static_cast<const float*>(sharedNorm.usmPtr), eps,
+                      s.normBuf.as<float>());
+    _gmm.matmul(lmHead->type, lmHead->usmPtr, vocabLm, d,
+                s.normBuf.as<float>(), 1, logitsOut, logitsScratch);
+    // ehScratch now holds the block-<mtp> output = the next-step MTP hidden.
 }
 
 void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
@@ -562,23 +656,21 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
     // first n_ff_exp, the up rows follow at `gateBytesHalf`. In the
     // separate layout each has its own per-expert block.
     const core::gguf::GgufTensor& upSrc = fused ? *gateUpFused : *upExpsP;
-    const compute::QuantType* const qtGate = compute::quantType(gateSrc.type);
-    const compute::QuantType* const qtUp   = compute::quantType(upSrc.type);
-    const compute::QuantType* const qtDown = compute::quantType(downExps.type);
-    if (qtGate == nullptr || qtUp == nullptr || qtDown == nullptr) {
+    const auto [geGate, gbGate] = moeBlockGeom(gateSrc.type);
+    const auto [geUp,   gbUp]   = moeBlockGeom(upSrc.type);
+    const auto [geDown, gbDown] = moeBlockGeom(downExps.type);
+    if (geGate == 0 || geUp == 0 || geDown == 0) {
         throw std::runtime_error(
             "Qwen35MoeBackend: expert weight type(s) not in QuantType registry");
     }
-    const std::size_t rowBytesGate =
-        (d_model / qtGate->blockElements()) * qtGate->blockBytes();
-    const std::size_t rowBytesUp =
-        (d_model / qtUp->blockElements()) * qtUp->blockBytes();
+    const std::size_t rowBytesGate = (d_model / geGate) * gbGate;
+    const std::size_t rowBytesUp   = (d_model / geUp)   * gbUp;
     const std::size_t gateBytesHalf = n_ff_exp * rowBytesGate;   // fused split
     // Per-expert block stride: fused holds 2*n_ff rows, separate holds n_ff.
     const std::size_t bytesGate = (fused ? 2 : 1) * n_ff_exp * rowBytesGate;
     const std::size_t bytesUp   = (fused ? 2 : 1) * n_ff_exp * rowBytesUp;
     const std::size_t bytesDown =
-        d_model * (n_ff_exp / qtDown->blockElements()) * qtDown->blockBytes();
+        d_model * (n_ff_exp / geDown) * gbDown;
 
     const auto* const gateBase = static_cast<const std::uint8_t*>(gateSrc.usmPtr);
     const auto* const upBase   = static_cast<const std::uint8_t*>(upSrc.usmPtr);
@@ -766,6 +858,486 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
 
         _ops.addResidualAsync(moeAccumBuf, expertOutBuf, T * d_model);
     }
+}
+
+void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
+                                        const float*   moeInput,
+                                        std::size_t    nSeq,
+                                        std::int32_t*  expIdxSlot,
+                                        float*         kwSlot,
+                                        BlockBuffers&  s) {
+    namespace cmp = mimirmind::compute;
+
+    // The batched fused-K fast path only exists for the separate Q4_K
+    // gate/up + Q5_K down decode layout. Any other layout/quant (notably
+    // the NVFP4->BF16 materialised experts of the Bragi target checkpoint)
+    // has no batched fused-K kernel — delegate to the generic runMoeFfn,
+    // whose sequential per-token dispatch already routes each of the nSeq
+    // rows independently when it is handed nSeq as its T. (expIdxSlot /
+    // kwSlot are used only by the fused-K path below, so they are unused
+    // here — the generic path routes through _topKIdx / _topKWeight.)
+    {
+        const auto* gu = _weights.findBlock(blockIdx, "ffn_gate_up_exps.weight");
+        const auto* g  = _weights.findBlock(blockIdx, "ffn_gate_exps.weight");
+        const auto* u  = _weights.findBlock(blockIdx, "ffn_up_exps.weight");
+        const auto* d  = _weights.findBlock(blockIdx, "ffn_down_exps.weight");
+        bool fusedKOk = (gu == nullptr) && g != nullptr && u != nullptr &&
+                        d != nullptr && g->dimensions.size() >= 3;
+        if (fusedKOk) {
+            const std::size_t nff = g->dimensions[1];
+            // BATCHED-specific support: the *_Batched kernels handle Q4_K/BF16
+            // gate-up + Q5_K/Q6_K/BF16 down. Types without a batched variant
+            // (e.g. the Q5_K gate-up of one Q4_K_XL dynamic-quant layer, blk 39)
+            // delegate to the generic per-token runMoeFfn, which routes each of
+            // the nSeq rows independently. (moeDownFusedKAvailable is single-seq
+            // scope and admits Q8_0 which has no batched down kernel.)
+            const bool downBatchedOk =
+                d->type == core::gguf::GgmlType::Q5_K ||
+                d->type == core::gguf::GgmlType::Q6_K ||
+                d->type == core::gguf::GgmlType::NVFP4_BLK ||
+                d->type == core::gguf::GgmlType::BF16;
+            // NVFP4_BLK is 32-element super-blocks (not 256); the other batched
+            // types are 256-block. Require the matching alignment per type.
+            const std::size_t blkAlign =
+                (g->type == core::gguf::GgmlType::NVFP4_BLK) ? 32 : 256;
+            fusedKOk = _gmm.moeGateUpFusedKAvailable(g->type) &&
+                       downBatchedOk &&
+                       g->type == u->type &&
+                       (s.d_model % blkAlign == 0) && (nff % blkAlign == 0);
+        }
+        if (!fusedKOk) {
+            (void)expIdxSlot; (void)kwSlot;
+            runMoeFfn(blockIdx, moeInput, nSeq, s);
+            return;
+        }
+    }
+
+    const auto& w = _weights;
+
+    const auto& routerW  = requireBlock(w, blockIdx, "ffn_gate_inp.weight");
+    const auto& downExps = requireBlock(w, blockIdx, "ffn_down_exps.weight");
+
+    // Serving decode requires the SEPARATE-bank fused-K layout: Q4_K gate/up
+    // banks + a Q5_K down bank (the only layout the *_Batched kernels port
+    // today). The single-session runMoeFfn falls back to per-expert matmuls
+    // for other layouts; there is no such fallback here — a batched decode on
+    // an unsupported model is a configuration error, not a slow path.
+    const auto* gateUpFused = w.findBlock(blockIdx, "ffn_gate_up_exps.weight");
+    if (gateUpFused != nullptr) {
+        throw std::runtime_error(
+            "Qwen35MoeBackend::runMoeFfnBatched: fused ffn_gate_up_exps layout "
+            "is not supported on the batched decode path (need separate Q4_K "
+            "gate/up + Q5_K down banks)");
+    }
+    const auto& gateExps = requireBlock(w, blockIdx, "ffn_gate_exps.weight");
+    const auto& upExps   = requireBlock(w, blockIdx, "ffn_up_exps.weight");
+
+    const std::size_t d_model  = s.d_model;
+    const std::size_t nExperts = _config.expertCount;
+    const std::size_t K        = _config.expertUsedCount;
+
+    if (gateExps.dimensions.size() < 3) {
+        throw std::runtime_error(
+            "Qwen35MoeBackend::runMoeFfnBatched: expert gate tensor must be 3-D "
+            "[n_embd, n_ff, n_expert]");
+    }
+    const std::size_t n_ff_exp = gateExps.dimensions[1];
+
+    const bool downBatchedOk =
+        downExps.type == core::gguf::GgmlType::Q5_K ||
+        downExps.type == core::gguf::GgmlType::Q6_K ||
+        downExps.type == core::gguf::GgmlType::NVFP4_BLK ||
+        downExps.type == core::gguf::GgmlType::BF16;
+    const std::size_t blkAlign =
+        (gateExps.type == core::gguf::GgmlType::NVFP4_BLK) ? 32 : 256;
+    if (!_gmm.moeGateUpFusedKAvailable(gateExps.type) ||
+        !downBatchedOk ||
+        gateExps.type != upExps.type ||
+        (d_model % blkAlign != 0) || (n_ff_exp % blkAlign != 0)) {
+        throw std::runtime_error(
+            "Qwen35MoeBackend::runMoeFfnBatched: batched fused-K MoE kernels "
+            "unavailable for this model (need Q4_K/NVFP4_BLK/BF16 gate/up + "
+            "Q5_K/Q6_K/NVFP4_BLK/BF16 down, d_model/n_ff_exp block-aligned)");
+    }
+
+    float* const gateOutBuf    = s.gateOut.as<float>();
+    float* const upOutBuf      = s.upOut.as<float>();
+    float* const matmulScratch = s.matmulScratch.as<float>();
+    float* const moeAccumBuf   = s.moeAccumBuf.as<float>();
+    float* const expertOutBuf  = s.expertOutBuf.as<float>();
+    float* const gateActAll    = s.moeGateCompact.as<float>();  // [nSeq*K, n_ff_exp]
+
+    // --- router: logits[nSeq, nExperts] = ffn_gate_inp @ moeInput ----------
+    // Device top-K straight into the USM routing slots — the batched fused-K
+    // kernels below consume expIdxSlot/kwSlot on the same stream, so there is
+    // NO host round trip and NO per-MoE-block GPU sync. moe_topk grids one
+    // block per token (grid.x = nSeq), so a single async launch routes the
+    // whole batch. (Removes ~1 sync per MoE block × 40 blocks per decode
+    // step — the dominant host-stall in the serving decode loop.)
+    const float wScale = (_config.expertWeightsScale != 0.0F)
+                             ? _config.expertWeightsScale : 1.0F;
+    _gmm.matmulAsync(routerW.type, routerW.usmPtr, nExperts, d_model,
+                     moeInput, nSeq, upOutBuf, matmulScratch);
+    _ops.moeTopKRouteDeviceAsync(upOutBuf, expIdxSlot, kwSlot,
+                                 nSeq, nExperts, K, wScale);
+
+    // Per-expert byte strides (separate banks: one block per expert). For
+    // BF16 experts (NVFP4->BF16 checkpoints) the *_bf16_batched kernels index
+    // by dims, so a dense 2-byte stride is used; the K-quant banks take the
+    // QuantType block byte layout.
+    std::size_t bytesGate = 0, bytesUp = 0, bytesDown = 0;
+    if (gateExps.type == core::gguf::GgmlType::BF16) {
+        bytesGate = n_ff_exp * d_model * sizeof(std::uint16_t);
+        bytesUp   = n_ff_exp * d_model * sizeof(std::uint16_t);
+        bytesDown = d_model * n_ff_exp * sizeof(std::uint16_t);
+    } else {
+        const auto [geGate, gbGate] = moeBlockGeom(gateExps.type);
+        const auto [geUp,   gbUp]   = moeBlockGeom(upExps.type);
+        const auto [geDown, gbDown] = moeBlockGeom(downExps.type);
+        if (geGate == 0 || geUp == 0 || geDown == 0) {
+            throw std::runtime_error(
+                "Qwen35MoeBackend::runMoeFfnBatched: expert weight type(s) not "
+                "in QuantType registry");
+        }
+        bytesGate = n_ff_exp * ((d_model / geGate) * gbGate);
+        bytesUp   = n_ff_exp * ((d_model / geUp)   * gbUp);
+        bytesDown = d_model * ((n_ff_exp / geDown) * gbDown);
+    }
+
+    const auto* const gateBase = static_cast<const std::uint8_t*>(gateExps.usmPtr);
+    const auto* const upBase   = static_cast<const std::uint8_t*>(upExps.usmPtr);
+    const auto* const downBase = static_cast<const std::uint8_t*>(downExps.usmPtr);
+
+    // --- routed experts: fused gate/up -> silu*up -> fused down ------------
+    // gateActAll[seq, k, f] laid out as [nSeq, K*n_ff_exp] (seq stride
+    // K*n_ff_exp), exactly the batched kernels' contract.
+    _gmm.moeGateUpFusedKBatchedAsync(gateExps.type, moeInput, gateBase, upBase,
+                                     expIdxSlot, gateActAll, nSeq,
+                                     d_model, n_ff_exp, K, bytesGate, bytesUp);
+
+    _ops.mulScalarAsync(moeAccumBuf, 0.0F, nSeq * d_model);
+
+    _gmm.moeDownFusedKBatchedAsync(downExps.type, gateActAll, downBase,
+                                   expIdxSlot, kwSlot, moeAccumBuf, nSeq,
+                                   n_ff_exp, d_model, K, bytesDown);
+
+    // --- shared expert (always-on) + sigmoid gate -------------------------
+    // Row-parallel over the nSeq tokens: identical to runMoeFfn's shared
+    // expert with T := nSeq (the two-matmul + siluMul + down path; the T==1
+    // fused-Q8 / dp4a shortcuts are single-token-only and intentionally
+    // skipped here).
+    const auto* upShexp = w.findBlock(blockIdx, "ffn_up_shexp.weight");
+    if (upShexp != nullptr) {
+        const auto& gateShexp = requireBlock(w, blockIdx, "ffn_gate_shexp.weight");
+        const auto& downShexp = requireBlock(w, blockIdx, "ffn_down_shexp.weight");
+        const auto& routerSh  = requireBlock(w, blockIdx, "ffn_gate_inp_shexp.weight");
+        const std::size_t n_ff_shexp = gateShexp.dimensions.size() >= 2
+                                           ? gateShexp.dimensions[1] : 0;
+        if (n_ff_shexp == 0) {
+            throw std::runtime_error(
+                "Qwen35MoeBackend::runMoeFfnBatched: ffn_gate_shexp has "
+                "unexpected shape");
+        }
+
+        {
+            compute::UnorderedScope u{_ops};
+            _gmm.matmulAsync(gateShexp.type, gateShexp.usmPtr, n_ff_shexp, d_model,
+                             moeInput, nSeq, gateOutBuf, matmulScratch);
+            _gmm.matmulAsync(upShexp->type, upShexp->usmPtr, n_ff_shexp, d_model,
+                             moeInput, nSeq, upOutBuf, matmulScratch);
+        }
+        _ops.siluMulAsync(gateOutBuf, upOutBuf, nSeq * n_ff_shexp);
+        _gmm.matmulAsync(downShexp.type, downShexp.usmPtr, d_model, n_ff_shexp,
+                         gateOutBuf, nSeq, expertOutBuf, matmulScratch);
+
+        // Scalar gate per token: [nSeq, 1] -> sigmoid -> broadcast multiply.
+        float* const gateScalar = s.scoreScratch.as<float>();
+        _gmm.matmulAsync(routerSh.type, routerSh.usmPtr, 1, d_model,
+                         moeInput, nSeq, gateScalar, matmulScratch);
+        _ops.sigmoidGateMulAsync(expertOutBuf, gateScalar, nSeq, d_model,
+                                 /*gateDim=*/1);
+
+        _ops.addResidualAsync(moeAccumBuf, expertOutBuf, nSeq * d_model);
+    }
+}
+
+void Qwen35MoeBackend::runBlockBatched(std::size_t             blockIdx,
+                                       float*                  x,
+                                       const BatchedDecodeCtx& ctx,
+                                       BlockBuffers&           s) {
+    if (_config.isRecurrentLayer(blockIdx)) {
+        runLinearBlockBatched(blockIdx, x, ctx, s);
+    } else {
+        runFullAttentionBlockBatched(blockIdx, x, ctx, s);
+    }
+}
+
+void Qwen35MoeBackend::runFullAttentionBlockBatched(
+        std::size_t blockIdx, float* x, const BatchedDecodeCtx& ctx,
+        BlockBuffers& s) {
+    const std::size_t nSeq = ctx.nSeq;
+    if (nSeq == 0) {
+        return;
+    }
+    if (ctx.pool == nullptr) {
+        throw std::runtime_error(
+            "runFullAttentionBlockBatched: null PagedKvPool in context");
+    }
+    const std::size_t denseLayer = _fullAttnDense[blockIdx];
+
+    const auto& w        = _weights;
+    const auto& attnNorm = requireBlock(w, blockIdx, "attn_norm.weight");
+    const auto& qW       = requireBlock(w, blockIdx, "attn_q.weight");
+    const auto& kW       = requireBlock(w, blockIdx, "attn_k.weight");
+    const auto& vW       = requireBlock(w, blockIdx, "attn_v.weight");
+    const auto& qNorm    = requireBlock(w, blockIdx, "attn_q_norm.weight");
+    const auto& kNorm    = requireBlock(w, blockIdx, "attn_k_norm.weight");
+    const auto& oW       = requireBlock(w, blockIdx, "attn_output.weight");
+    const auto& attnPost = requireBlock(w, blockIdx, "post_attention_norm.weight");
+
+    const std::size_t d_model  = s.d_model;
+    const std::size_t head_dim = _config.headDim();
+    const std::size_t nHeads   = _config.headCount;
+    const std::size_t nKvHeads = _config.headCountKv;
+    const std::size_t q_dim    = nHeads   * head_dim;
+    const std::size_t kv_dim   = nKvHeads * head_dim;
+    const float       eps      = _config.rmsNormEps;
+
+    float* const normBuf    = s.normBuf.as<float>();
+    float* const qGateFused = s.qGateFused.as<float>();
+    float* const qBuf       = s.qBuf.as<float>();
+    float* const gateBuf    = s.gateScratch.as<float>();
+    float* const kProj      = s.kvKFp32Scratch.as<float>();   // [nSeq, kv_dim]
+    float* const vProj      = s.kvVFp32Scratch.as<float>();   // [nSeq, kv_dim]
+    float* const attnOut    = s.attnOut.as<float>();
+    float* const projOut    = s.projOut.as<float>();
+    float* const mmScratch  = s.matmulScratch.as<float>();
+
+    // --- pre-attention RMSNorm (nSeq rows) ---------------------------
+    _ops.rmsNormAsync(x, nSeq, d_model,
+                      static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
+
+    // --- Q(+gate) / K / V projections (M = nSeq) ---------------------
+    {
+        compute::UnorderedScope u{_ops};
+        _gmm.matmulAsync(qW.type, qW.usmPtr, 2 * q_dim, d_model,
+                         normBuf, nSeq, qGateFused, mmScratch);
+        _gmm.matmulAsync(kW.type, kW.usmPtr, kv_dim, d_model,
+                         normBuf, nSeq, kProj, mmScratch);
+        _gmm.matmulAsync(vW.type, vW.usmPtr, kv_dim, d_model,
+                         normBuf, nSeq, vProj, mmScratch);
+    }
+
+    _ops.splitHeadPairAsync(qGateFused, qBuf, gateBuf, nSeq, nHeads, head_dim);
+
+    // --- QK-norm (per-head RMS over head_dim) ------------------------
+    // In place on the compact q/k buffers — the paged path writes K into
+    // the pool below (not a contiguous cache), so unlike the single-seq
+    // rmsNormQkvAsync there is no fused cache write here. Per-row rmsnorm
+    // is in-place safe (each row is independent).
+    _ops.rmsNormAsync(qBuf,  nSeq * nHeads,   head_dim,
+                      static_cast<const float*>(qNorm.usmPtr), eps, qBuf);
+    _ops.rmsNormAsync(kProj, nSeq * nKvHeads, head_dim,
+                      static_cast<const float*>(kNorm.usmPtr), eps, kProj);
+    // The single-session rmsNormQkv also RMS-normalises V per head (over
+    // head_dim, with NO learned weight — kernels_cuda/rmsnorm_qkv.cu V
+    // branch). The batched path builds q/k/v separately, so replicate the
+    // V normalisation here; without it V enters attention un-normalised and
+    // the whole full-attention output is off by V's per-head 1/rms factor.
+    _ops.rmsNormNoWeightAsync(vProj, nSeq * nKvHeads, head_dim, eps, vProj);
+
+    // --- IMRoPE on Q and K (per-seq startPos, one token per seq) ------
+    // writeOffsetStride MUST be 0 here: the batched mrope writes at
+    // x_base + seq*xSeqStride + startPos*writeOffsetStride, which is the
+    // KV-cache-absolute-position pattern. Our q/k live in COMPACT per-seq
+    // buffers (one row per sequence), so the token position must not shift
+    // the write — only the rotation angle depends on startPos (pos =
+    // startPos + p inside the kernel). A non-zero stride here walks off the
+    // compact buffer as startPos grows (the pos=2 OOB).
+    {
+        compute::UnorderedScope u{_ops};
+        _ops.mropeInPlaceBatchedAsync(qBuf, nSeq, q_dim, /*seqLen=*/1,
+                                      nHeads, head_dim, ctx.startPosDev,
+                                      _config.ropeFreqBase, _ropeSections,
+                                      /*writeOffsetStride=*/0,
+                                      runtime::KvDtype::F32);
+        _ops.mropeInPlaceBatchedAsync(kProj, nSeq, kv_dim, /*seqLen=*/1,
+                                      nKvHeads, head_dim, ctx.startPosDev,
+                                      _config.ropeFreqBase, _ropeSections,
+                                      /*writeOffsetStride=*/0,
+                                      runtime::KvDtype::F32);
+    }
+
+    // --- scatter this step's K/V into the paged pool -----------------
+    for (std::size_t seq = 0; seq < nSeq; ++seq) {
+        ctx.pool->writeToken(_ops, denseLayer,
+                             ctx.writeBlockId[seq],
+                             static_cast<std::size_t>(ctx.writeSlot[seq]),
+                             kProj + seq * kv_dim,
+                             vProj + seq * kv_dim);
+    }
+
+    // --- paged GQA attention (block-table indirection) ---------------
+    const float attnScale = _config.attentionScaleFor(head_dim);
+    _ops.pagedAttentionDecodeV1Async(
+        attnOut, qBuf, ctx.pool->keyPool(denseLayer),
+        ctx.pool->valuePool(denseLayer), ctx.blockTablesDev, ctx.seqLensDev,
+        nSeq, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
+        ctx.maxBlocksPerSeq, attnScale, /*softcap=*/0.0f);
+
+    // --- output gate + O projection + attn residual ------------------
+    _ops.sigmoidGateMulAsync(attnOut, gateBuf, nSeq, q_dim, /*gateDim=*/q_dim);
+    _gmm.matmulAsync(oW.type, oW.usmPtr, d_model, q_dim,
+                     attnOut, nSeq, projOut, mmScratch);
+    _ops.addResidualAsync(x, projOut, nSeq * d_model);
+
+    // --- post-attention norm -> batched MoE -> FFN residual ----------
+    _ops.rmsNormAsync(x, nSeq, d_model,
+                      static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
+    runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
+    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nSeq * d_model);
+}
+
+void Qwen35MoeBackend::runLinearBlockBatched(
+        std::size_t blockIdx, float* x, const BatchedDecodeCtx& ctx,
+        BlockBuffers& s) {
+    const std::size_t nSeq = ctx.nSeq;
+    if (nSeq == 0) {
+        return;
+    }
+
+    const auto& w        = _weights;
+    const auto& attnNorm = requireBlock(w, blockIdx, "attn_norm.weight");
+    const auto& qkvW     = requireBlock(w, blockIdx, "attn_qkv.weight");
+    const auto& gateW    = requireBlock(w, blockIdx, "attn_gate.weight");
+    const auto& betaW    = requireBlock(w, blockIdx, "ssm_beta.weight");
+    const auto& alphaW   = requireBlock(w, blockIdx, "ssm_alpha.weight");
+    const auto& ssmA     = requireBlock(w, blockIdx, "ssm_a");
+    const auto& ssmDt    = requireBlock(w, blockIdx, "ssm_dt.bias");
+    const auto& convW    = requireBlock(w, blockIdx, "ssm_conv1d.weight");
+    const auto& ssmNormW = requireBlock(w, blockIdx, "ssm_norm.weight");
+    const auto& ssmOutW  = requireBlock(w, blockIdx, "ssm_out.weight");
+    const auto& attnPost = requireBlock(w, blockIdx, "post_attention_norm.weight");
+
+    const std::size_t d_model        = s.d_model;
+    const std::size_t S              = _config.ssmStateSize;
+    const std::size_t hK             = _config.ssmNumKHeads();
+    const std::size_t hV             = _config.ssmNumVHeads();
+    const std::size_t valueDim       = _config.ssmInnerSize;      // hV * S
+    const std::size_t convDim        = _config.ssmConvDim();
+    const std::size_t dConv          = _config.ssmConvKernel;
+    const std::size_t keyDim         = S * hK;
+    const std::size_t stateElems     = _config.ssmStateElemsPerLayer();
+    const std::size_t convStateElems = _config.ssmConvStateElemsPerLayer();
+    const std::size_t stateRows      = (dConv > 0 ? dConv - 1 : 0);
+    const float       eps            = _config.rmsNormEps;
+
+    float* const normBuf   = s.normBuf.as<float>();
+    float* const qkvMixed  = s.ssmQkvMixed.as<float>();   // [nSeq, convDim] (also conv out)
+    float* const convInput = s.ssmConvInput.as<float>();  // [nSeq, dConv, convDim] (serving-sized)
+    float* const zBuf      = s.ssmZ.as<float>();
+    float* const qBuf      = s.ssmQ.as<float>();
+    float* const kBuf      = s.ssmK.as<float>();
+    float* const vBuf      = s.ssmV.as<float>();
+    float* const deltaOut  = s.ssmDeltaOut.as<float>();
+    float* const alphaBuf  = s.ssmAlpha.as<float>();
+    float* const betaBuf   = s.ssmBeta.as<float>();
+    float* const gateBuf   = s.ssmGate.as<float>();
+    float* const projOut   = s.projOut.as<float>();
+    float* const mmScratch = s.matmulScratch.as<float>();
+
+    // Per-sequence recurrent + conv state (SsmState[slabNSeq]): the per-layer
+    // slab is [slabNSeq, stateElems] / [slabNSeq, convStateElems], so the
+    // layer base steps by slabNSeq*elems (== SsmState::stateLayerStride) and
+    // sequence s sits at + s*elems. The layer stride MUST use the slab's
+    // ALLOCATED nSeq, not the runtime batch `nSeq` — under continuous
+    // batching the active count varies below the allocation, and using the
+    // runtime nSeq would offset every layer into the wrong slice
+    // (M-Cuda.Batch D2e.2). Falls back to nSeq when unset (== generateBatch,
+    // where slab nSeq == runtime nSeq, so the two agree).
+    const std::size_t slabNSeq = (s.ssmSlabNSeq != 0) ? s.ssmSlabNSeq : nSeq;
+    float* const stateBase = s.ssmStatePtr     + blockIdx * (slabNSeq * stateElems);
+    float* const convBase  = s.ssmConvStatePtr + blockIdx * (slabNSeq * convStateElems);
+
+    // --- pre-attention RMSNorm (nSeq rows) ---------------------------
+    _ops.rmsNormAsync(x, nSeq, d_model,
+                      static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
+
+    // --- projections (M = nSeq) --------------------------------------
+    {
+        compute::UnorderedScope u{_ops};
+        _gmm.matmulAsync(qkvW.type,  qkvW.usmPtr,  convDim,  d_model, normBuf, nSeq, qkvMixed, mmScratch);
+        _gmm.matmulAsync(gateW.type, gateW.usmPtr, valueDim, d_model, normBuf, nSeq, zBuf,     mmScratch);
+        _gmm.matmulAsync(betaW.type, betaW.usmPtr, hV,       d_model, normBuf, nSeq, betaBuf,  mmScratch);
+        _gmm.matmulAsync(alphaW.type,alphaW.usmPtr,hV,       d_model, normBuf, nSeq, alphaBuf, mmScratch);
+    }
+
+    // beta = sigmoid(beta); gLog = ssm_a * softplus(alpha + ssm_dt).
+    _ops.sigmoidInPlaceAsync(betaBuf, nSeq * hV);
+    _ops.deltanetGateAsync(alphaBuf,
+                           static_cast<const float*>(ssmA.usmPtr),
+                           static_cast<const float*>(ssmDt.usmPtr),
+                           gateBuf, nSeq, hV);
+
+    // --- causal conv1d + silu (per-seq rolling state) ----------------
+    // convInput[seq] = [convState[seq] (stateRows) | qkvMixed[seq] (1 row)].
+    // Serving BlockBuffers must size ssmConvInput to nSeq*dConv*convDim.
+    const std::size_t convInBytes  = convStateElems * sizeof(float);
+    const std::size_t qkvRowBytes  = convDim * sizeof(float);
+    for (std::size_t seq = 0; seq < nSeq; ++seq) {
+        float* const cvState = convBase + seq * convStateElems;
+        float* const cvIn    = convInput + seq * dConv * convDim;
+        if (ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
+            _ops.mulScalarAsync(cvState, 0.0F, convStateElems);
+        }
+        _ops.appendMemoryCopy(cvIn, cvState, convInBytes);
+        _ops.appendMemoryCopy(cvIn + stateRows * convDim,
+                              qkvMixed + seq * convDim, qkvRowBytes);
+    }
+    _ops.causalConv1dSiluBatchedAsync(convInput,
+                                      static_cast<const float*>(convW.usmPtr),
+                                      qkvMixed, nSeq, /*T=*/1, convDim, dConv);
+    // Save each sequence's trailing stateRows rows as the next conv state.
+    for (std::size_t seq = 0; seq < nSeq; ++seq) {
+        float* const cvState = convBase + seq * convStateElems;
+        float* const cvIn    = convInput + seq * dConv * convDim;
+        _ops.appendMemoryCopy(cvState, cvIn + /*T=*/1 * convDim, convInBytes);
+    }
+
+    // --- split conv into q/k/v (+ GQA repeat H_k -> H_v) -------------
+    _ops.gatherHeadsFromChannelsAsync(qkvMixed, qBuf, nSeq, 0,          hK, hV, S, convDim);
+    _ops.gatherHeadsFromChannelsAsync(qkvMixed, kBuf, nSeq, keyDim,     hK, hV, S, convDim);
+    _ops.gatherHeadsFromChannelsAsync(qkvMixed, vBuf, nSeq, 2 * keyDim, hV, hV, S, convDim);
+
+    // --- L2-norm q,k over head_dim -----------------------------------
+    _ops.l2NormInPlaceAsync(qBuf, nSeq * hV, S, eps);
+    _ops.l2NormInPlaceAsync(kBuf, nSeq * hV, S, eps);
+
+    // --- gated delta-rule recurrence (persistent per-seq state) ------
+    for (std::size_t seq = 0; seq < nSeq; ++seq) {
+        if (ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
+            _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
+        }
+    }
+    _ops.gatedDeltaNetRecurrentBatchedAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
+                                            stateBase, deltaOut, nSeq,
+                                            /*T=*/1, hV, S);
+
+    // --- gated output norm: ssm_norm(out) * silu(z) ------------------
+    _ops.rmsNormAsync(deltaOut, nSeq * hV, S,
+                      static_cast<const float*>(ssmNormW.usmPtr), eps, qBuf);
+    _ops.siluMulAsync(zBuf, qBuf, nSeq * valueDim);
+
+    // --- output projection ssm_out -----------------------------------
+    _gmm.matmulAsync(ssmOutW.type, ssmOutW.usmPtr, d_model, valueDim,
+                     zBuf, nSeq, projOut, mmScratch);
+    _ops.addResidualAsync(x, projOut, nSeq * d_model);
+
+    // --- post-attn norm -> batched MoE -> FFN residual ---------------
+    _ops.rmsNormAsync(x, nSeq, d_model,
+                      static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
+    runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
+    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nSeq * d_model);
 }
 
 } // namespace mimirmind::runtime::arch

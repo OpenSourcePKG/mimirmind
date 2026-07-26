@@ -221,6 +221,103 @@ public:
             "deltanetChunkForwardAsync: not supported on this backend");
     }
 
+    // ---- M-Cuda.Batch batched (nSeq) variants -----------------------------
+    // Serving-class batched decode/prefill ops. CUDA-first; every default
+    // throws so non-CUDA backends (single-session) stay unaffected.
+
+    virtual void gatedDeltaNetRecurrentBatchedAsync(
+            const float* q, const float* k, const float* v, const float* gLog,
+            const float* beta, float* state, float* out, std::size_t nSeq,
+            std::size_t T, std::size_t H, std::size_t S) {
+        (void)q; (void)k; (void)v; (void)gLog; (void)beta; (void)state;
+        (void)out; (void)nSeq; (void)T; (void)H; (void)S;
+        throw std::runtime_error(
+            "gatedDeltaNetRecurrentBatchedAsync: not supported on this backend");
+    }
+
+    virtual void causalConv1dSiluBatchedAsync(
+            const float* convInput, const float* kernel, float* out,
+            std::size_t nSeq, std::size_t T, std::size_t channels,
+            std::size_t kernelSize) {
+        (void)convInput; (void)kernel; (void)out; (void)nSeq; (void)T;
+        (void)channels; (void)kernelSize;
+        throw std::runtime_error(
+            "causalConv1dSiluBatchedAsync: not supported on this backend");
+    }
+
+    virtual void mropeInPlaceBatchedAsync(
+            void* xBase, std::size_t nSeq, std::size_t xSeqStride,
+            std::size_t seqLen, std::size_t numHeads, std::size_t headDim,
+            const std::int32_t* startPosDev, float base,
+            const std::int32_t* sections, std::size_t writeOffsetStride,
+            runtime::KvDtype kvDtype) {
+        (void)xBase; (void)nSeq; (void)xSeqStride; (void)seqLen; (void)numHeads;
+        (void)headDim; (void)startPosDev; (void)base; (void)sections;
+        (void)writeOffsetStride; (void)kvDtype;
+        throw std::runtime_error(
+            "mropeInPlaceBatchedAsync: not supported on this backend");
+    }
+
+    virtual void attentionDecodeFlashBatchedAsync(
+            const float* q, const float* k, const float* v,
+            float* partialScratch, float* out, std::size_t nSeq,
+            std::size_t maxKTiles, std::size_t qSeqStride,
+            std::size_t kvSeqStride, std::size_t partialSeqStride,
+            std::size_t outSeqStride, std::size_t nHeads, std::size_t nKvHeads,
+            std::size_t headDim, const std::int32_t* curLenDev, float scale,
+            std::size_t slidingWindow, runtime::KvDtype kvDtype) {
+        (void)q; (void)k; (void)v; (void)partialScratch; (void)out; (void)nSeq;
+        (void)maxKTiles; (void)qSeqStride; (void)kvSeqStride;
+        (void)partialSeqStride; (void)outSeqStride; (void)nHeads;
+        (void)nKvHeads; (void)headDim; (void)curLenDev; (void)scale;
+        (void)slidingWindow; (void)kvDtype;
+        throw std::runtime_error(
+            "attentionDecodeFlashBatchedAsync: not supported on this backend");
+    }
+
+    virtual void deltanetChunkCumGateBatchedAsync(
+            const float* gLog, float* gCum, std::size_t nSeq, std::size_t T,
+            std::size_t H, std::size_t chunkSize) {
+        (void)gLog; (void)gCum; (void)nSeq; (void)T; (void)H; (void)chunkSize;
+        throw std::runtime_error(
+            "deltanetChunkCumGateBatchedAsync: not supported on this backend");
+    }
+
+    virtual void deltanetChunkForwardBatchedAsync(
+            const float* q, const float* k, const float* v, const float* gCum,
+            const float* beta, const float* a0, float* state, float* out,
+            std::size_t nSeq, std::size_t T, std::size_t H, std::size_t S,
+            std::size_t chunkSize) {
+        (void)q; (void)k; (void)v; (void)gCum; (void)beta; (void)a0;
+        (void)state; (void)out; (void)nSeq; (void)T; (void)H; (void)S;
+        (void)chunkSize;
+        throw std::runtime_error(
+            "deltanetChunkForwardBatchedAsync: not supported on this backend");
+    }
+
+    /// M-Cuda.Batch B2/D2a — paged-KV decode attention. One query token per
+    /// sequence; each sequence reads its KV from the shared physical pool
+    /// (PagedKvPool) via its block table. `keyCache`/`valueCache` are the
+    /// per-layer pool bases [numBlocks, blockSize, numKvHeads, headSize];
+    /// `blockTables` [numSeqs, maxNumBlocksPerSeq] int32 (-1 sentinel);
+    /// `seqLens` [numSeqs] int32. `query`/`out` [numSeqs, numHeads, headSize].
+    /// fp32 baseline (kernel `paged_attention_v1`). Default: unsupported;
+    /// CUDA overrides.
+    virtual void pagedAttentionDecodeV1Async(
+            float* out, const float* query, const float* keyCache,
+            const float* valueCache, const std::int32_t* blockTables,
+            const std::int32_t* seqLens, std::size_t numSeqs,
+            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
+            std::size_t blockSize, std::size_t maxNumBlocksPerSeq, float scale,
+            float softcap) {
+        (void)out; (void)query; (void)keyCache; (void)valueCache;
+        (void)blockTables; (void)seqLens; (void)numSeqs; (void)numHeads;
+        (void)numKvHeads; (void)headSize; (void)blockSize;
+        (void)maxNumBlocksPerSeq; (void)scale; (void)softcap;
+        throw std::runtime_error(
+            "pagedAttentionDecodeV1Async: not supported on this backend");
+    }
+
     /// Chunked-prefill stage K1: per-chunk ungated triangular inverse A0
     /// (a0 [nChunks,H,C,C]). Reference: compute::deltanetKktSolveInverse.
     /// Default: unsupported; CUDA overrides.

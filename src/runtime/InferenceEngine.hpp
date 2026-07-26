@@ -77,6 +77,12 @@ namespace arch {
 class ArchBackend;
 } // namespace arch
 
+namespace engine {
+class Nvfp4Loader;    // friend collaborator — runs loadModelNvfp4's pipeline
+class MtpDecoder;     // friend collaborator — native MTP greedy decode
+class ServingSession; // friend collaborator — batched / continuous-batch decode
+} // namespace engine
+
 /**
  * Sampling + generation knobs. Default is greedy/argmax — sampling.temperature
  * <= 0 keeps the decode loop bit-identical to plain argmax.
@@ -260,6 +266,28 @@ public:
              const PrefillCallback&          onPrefillDone      = {},
              const PrefillProgressCallback&  onPrefillProgress  = {});
 
+    /**
+     * M-Cuda.MTP — greedy multi-token-prediction (model-native speculative
+     * decoding). Drafts `mtpDepth` tokens per round with the model's nextn
+     * module (blk.<blockCount>), verifies them in a single trunk forward
+     * (forwardVerify), accepts the longest matching prefix. For temperature 0
+     * the output is BIT-IDENTICAL to greedy generate() — verify guarantees
+     * correctness; the draft only affects speed (accept rate). CUDA +
+     * qwen35moe with a loaded MTP head only (nextnPredictLayers > 0).
+     * `acceptedOut`/`draftedOut` (optional) report the accept-rate counters.
+     */
+    [[nodiscard]] std::vector<std::int32_t>
+    generateMtp(std::span<const std::int32_t> promptIds,
+                std::size_t                    maxNew,
+                std::size_t                    mtpDepth,
+                std::int32_t                   eosId,
+                std::size_t*                   draftedOut  = nullptr,
+                std::size_t*                   acceptedOut = nullptr);
+
+    /// True iff the loaded model carries a native MTP (nextn) head and the
+    /// backend supports the MTP draft path (CUDA qwen35moe).
+    [[nodiscard]] bool mtpAvailable() const noexcept;
+
     /// Drop the persistent KV-cache so the next generate() starts from
     /// scratch. Cache *buffers* stay allocated — only the logical length
     /// and the cached-token bookkeeping are cleared. Used by tests, by
@@ -309,6 +337,87 @@ public:
      * inspect the returned logits before deciding how far to commit.
      */
     void commitVerified(std::span<const std::int32_t> acceptedTokens);
+
+    /**
+     * M-Cuda.Batch D2d — batched serving-path validation harness. Runs the
+     * qwen35moe batched decode blocks (runBlockBatched) over `nSeq`
+     * sequences that are all fed the SAME prompt, greedily generating
+     * `maxNew` tokens each. Uses a self-contained contiguous-block PagedKvPool
+     * (no scheduler — that is D2e) and feeds every token one at a time
+     * through the T=1 batched path (so no separate prefill / state handoff).
+     *
+     * Returns one token stream per sequence. For identical prompts every
+     * stream must be identical, and stream 0 must match single-session
+     * greedy generate() — the end-to-end parity gate for the batched blocks.
+     * CUDA + qwen35moe only; throws otherwise.
+     */
+    [[nodiscard]] std::vector<std::vector<std::int32_t>>
+    generateServingParity(std::span<const std::int32_t> promptIds,
+                          std::size_t nSeq, std::size_t maxNew);
+
+    /**
+     * M-Cuda.Batch D2e — batched multi-prompt greedy generation. Runs the
+     * `prompts.size()` DIFFERENT prompts concurrently through the batched
+     * decode path (paged full-attn + GatedDeltaNet + MoE), each generating
+     * up to `maxNew` tokens and stopping early at `eosId` (pass a negative id
+     * to disable the EOS stop). Lockstep by global position; a finished
+     * sequence keeps stepping (output ignored) until all are done. Returns
+     * one token stream per prompt. CUDA + qwen35moe only. This is the
+     * serving-class throughput primitive — per-stream output equals each
+     * prompt's single-session greedy generate().
+     */
+    [[nodiscard]] std::vector<std::vector<std::int32_t>>
+    generateBatch(const std::vector<std::vector<std::int32_t>>& prompts,
+                  std::size_t maxNew, std::int32_t eosId);
+
+    // ================================================================
+    // M-Cuda.Batch D2e.2 — continuous-batching serving primitives.
+    //
+    // These expose the batched decode substrate (runBlockBatched) as a
+    // persistent, per-slot stepping interface so an external event loop
+    // (ContinuousBatcher) can admit / decode / complete requests
+    // asynchronously — each request pinned to a physical slot for its
+    // lifetime (SsmState continuity), stepping at its OWN position.
+    // CUDA + qwen35moe only. Not thread-safe: the batcher serialises all
+    // calls onto its single worker thread.
+    // ================================================================
+
+    /// One per-slot step for `stepServing`. `slot` is the persistent
+    /// physical slot index (0..maxBatch-1). `token` is the input token
+    /// for this iteration (prompt token during prefill, last sampled
+    /// token during decode). `pos` is the slot's current absolute
+    /// position (0-based). `seqStart` MUST be true exactly on the slot's
+    /// pos==0 iteration — it zeroes that slot's GatedDeltaNet recurrent +
+    /// conv state (admit / reuse).
+    struct ServingSlotStep {
+        std::uint32_t slot{0};
+        std::int32_t  token{0};
+        std::int32_t  pos{0};
+        bool          seqStart{false};
+    };
+
+    /// Lazily build the persistent serving state for `maxBatch` slots,
+    /// each able to hold up to `maxContext` tokens of paged KV. Idempotent
+    /// for the same (maxBatch, maxContext); rebuilds if they grow. Must be
+    /// called once before the first `stepServing`. CUDA + qwen35moe only.
+    void ensureServingState(std::size_t maxBatch, std::size_t maxContext);
+
+    /// Run ONE batched decode iteration over the slots described by
+    /// `steps` (which must be ordered by slot and cover a contiguous
+    /// prefix 0..steps.size()-1 — idle slots inside the prefix are passed
+    /// as fresh 1-token dummies). Writes the greedy argmax token for each
+    /// slot into `outTokens` (same order/length as `steps`). Per-slot KV
+    /// and recurrent state persist across calls. Requires a prior
+    /// `ensureServingState`.
+    void stepServing(std::span<const ServingSlotStep> steps,
+                     std::span<std::int32_t>          outTokens);
+
+    /// Physical slot capacity of the current serving state (0 if not yet
+    /// built). The max concurrent sequences the batcher may pin.
+    [[nodiscard]] std::size_t servingMaxBatch() const noexcept;
+
+    /// Max context tokens per slot the serving state was sized for.
+    [[nodiscard]] std::size_t servingMaxContext() const noexcept;
 
     /// Number of token ids currently cached (i.e. how long an exact
     /// prefix the next request could potentially skip-prefill).
@@ -477,6 +586,12 @@ public:
     }
 
 private:
+    // Collaborators that run a cohesive slice of the engine's work on its
+    // internals (extracted to keep this translation unit focused).
+    friend class engine::Nvfp4Loader;
+    friend class engine::MtpDecoder;
+    friend class engine::ServingSession;
+
     /// Compute logits over the last hidden state row via final-norm +
     /// lm_head, then draw one token id using `_sampler` and `params`.
     /// `recentTokens` — ordered oldest-to-newest history that the
@@ -615,6 +730,21 @@ private:
     // and BlockBuffers reallocations. Its pointers are bound into
     // _blockBuffers after each scratch (re)allocation.
     std::unique_ptr<SsmState>          _ssmState;
+
+    // --- M-Cuda.MTP — native multi-token-prediction draft decoder ------
+    // The MTP scratch (private nextn KV cache, per-step buffers, GatedDeltaNet
+    // rollback snapshot) + the draft/verify/accept loop live in
+    // engine::MtpDecoder. Constructed lazily by generateMtp on first use;
+    // reaches back into this engine (forwardVerify / commitVerified / weights /
+    // backend / KV+SSM state) as a friend.
+    std::unique_ptr<engine::MtpDecoder> _mtpDecoder;
+
+    // --- M-Cuda.Batch — batched / continuous-batch decode substrate ----
+    // The batched-generation harnesses (generateBatch / generateServingParity)
+    // and the persistent per-slot continuous-batch state (ensureServingState /
+    // stepServing) live in engine::ServingSession, which owns the ServingState.
+    // Constructed lazily on the first serving call.
+    std::unique_ptr<engine::ServingSession> _servingSession;
 
     // --- M-Startup.CapacityProbe ---------------------------------------
     // Populated in finalizeLoad() once weights are on the device.
