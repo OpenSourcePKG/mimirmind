@@ -69,6 +69,7 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _quantQ4KModule{loadModule(ctx.cudaContext(), "quantize_bf16_to_q4k")},
       _quantQ6KModule{loadModule(ctx.cudaContext(), "quantize_bf16_to_q6k")},
       _quantFp8Module{loadModule(ctx.cudaContext(), "quantize_bf16_to_fp8")},
+      _repackNvblkModule{loadModule(ctx.cudaContext(), "repackage_nvfp4_to_blk")},
       _dqNvfp4{_nvfp4Module.getFunction("dequant_nvfp4")},
       _dqFp8{_fp8Module.getFunction("dequant_fp8")},
       _castBf16{_castModule.getFunction("cast_bf16_to_f32")},
@@ -78,7 +79,8 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _quantQ8{_quantQ8Module.getFunction("quantize_bf16_to_q8_0")},
       _quantQ4K{_quantQ4KModule.getFunction("quantize_bf16_to_q4k")},
       _quantQ6K{_quantQ6KModule.getFunction("quantize_bf16_to_q6k")},
-      _quantFp8{_quantFp8Module.getFunction("quantize_bf16_to_fp8")} {}
+      _quantFp8{_quantFp8Module.getFunction("quantize_bf16_to_fp8")},
+      _repackNvblk{_repackNvblkModule.getFunction("repackage_nvfp4_to_blk")} {}
 
 ComputeBuffer CudaMaterializerOps::allocate(std::size_t bytes) {
     return _ops.allocate(bytes);
@@ -228,6 +230,23 @@ void CudaMaterializerOps::quantizeBf16ToFp8(void* dstFp8, const void* srcBf16,
                      static_cast<std::uint32_t>(rows),
                      static_cast<std::uint32_t>(K / 32), 1,
                      32, 1, 1);
+}
+
+void CudaMaterializerOps::repackageNvfp4ToBlk(void* dst, const void* packed,
+                                              const void* blockScale, float global,
+                                              std::uint64_t rows, std::uint64_t in) {
+    // Kernel: (u8* packed, u8* blockScale, float global, u8* dst, int in);
+    // grid (rows, in/32), block 16.
+    _repackNvblk.clearArgs();
+    _repackNvblk.setPtr  (0, packed);
+    _repackNvblk.setPtr  (1, blockScale);
+    _repackNvblk.setValue(2, global);
+    _repackNvblk.setPtr  (3, dst);
+    _repackNvblk.setValue(4, static_cast<std::int32_t>(in));
+    _repackNvblk.launch(_ctx.stream(),
+                        static_cast<std::uint32_t>(rows),
+                        static_cast<std::uint32_t>(in / 32), 1,
+                        16, 1, 1);
 }
 
 float CudaMaterializerOps::readF32(const void* devPtr) {

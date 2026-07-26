@@ -86,6 +86,16 @@ public:
     void quantizeBf16ToFp8(void* dstFp8, const void* srcBf16,
                            std::uint64_t rows, std::uint64_t K);
 
+    /**
+     * NVFP4 -> blocked-NVFP4 repackage (LOSSLESS — keeps the E2M1 nibbles).
+     * `packed` [rows, in/2] E2M1, `blockScale` [rows, in/16] E4M3, `global`
+     * scalar; `dst` receives 20-byte / 32-element super-blocks matmul_nvfp4blk
+     * expects. `in` % 32 == 0. Enqueued on the stream.
+     */
+    void repackageNvfp4ToBlk(void* dst, const void* packed,
+                             const void* blockScale, float global,
+                             std::uint64_t rows, std::uint64_t in);
+
 private:
     core::cuda::CudaComputeContext& _ctx;
     ComputeOps&                     _ops;
@@ -98,6 +108,7 @@ private:
     core::cuda::CudaModule          _quantQ4KModule;
     core::cuda::CudaModule          _quantQ6KModule;
     core::cuda::CudaModule          _quantFp8Module;
+    core::cuda::CudaModule          _repackNvblkModule;
     core::cuda::CudaKernel          _dqNvfp4;
     core::cuda::CudaKernel          _dqFp8;
     core::cuda::CudaKernel          _castBf16;
@@ -108,6 +119,7 @@ private:
     core::cuda::CudaKernel          _quantQ4K;
     core::cuda::CudaKernel          _quantQ6K;
     core::cuda::CudaKernel          _quantFp8;
+    core::cuda::CudaKernel          _repackNvblk;
 };
 
 } // namespace mimirmind::compute::cuda

@@ -17,6 +17,7 @@
 #include "runtime/nvfp4/NvFp4WeightsMap.hpp"
 #include "runtime/nvfp4/Qwen35MoeConfig.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -340,6 +341,70 @@ void Nvfp4Loader::load(InferenceEngine& e,
                         "loadModelNvfp4: re-quantised {} attention projections "
                         "BF16 -> blocked-FP8 E4M3 (mode='{}', {} MiB -> {} MiB)",
                         nQuant, mode, bytesBefore >> 20, bytesAfter >> 20);
+        }
+    }
+
+    // 5f. Keep the dense NVFP4 projections native 4-bit (blocked-NVFP4).
+    //
+    // The MoE shared-expert projections (ffn_*_shexp) are W4A16_NVFP4 in the
+    // checkpoint and go through the dense matmulAsync (always active, read every
+    // token). Their BF16 materialisation holds exactly the NVFP4 values widened,
+    // so keeping them 4-bit is LOSSLESS (no re-quant; re-quantising BF16 back to
+    // the very coarse E2M1 would double-quant and degrade). Repackage the
+    // original NVFP4 (packed E2M1 + per-16 E4M3 block-scale + global, still
+    // resident in _nvfp4Model) into a single-pointer blocked format the
+    // matmul_nvfp4blk kernels consume (embedded folded scale, no plumbing).
+    //
+    // NB: the full-attention self_attn.{q,k,v,o} are NOT quantised in this
+    // checkpoint (no quantized_layers entry) — they stay full-precision BF16 by
+    // design, so there is no native NVFP4 form to keep for them.
+    // MIMIRMIND_NVFP4_SHEXP=0 keeps BF16 (A/B).
+    if (e._nvfp4Model) {
+        const char* faenv = std::getenv("MIMIRMIND_NVFP4_SHEXP");
+        const bool faNvblk = (faenv == nullptr) || (std::string_view{faenv} != "0");
+        if (faNvblk) {
+            auto isFullAttn = [](std::string_view n) {
+                return n.ends_with(".ffn_gate_shexp.weight")
+                    || n.ends_with(".ffn_up_shexp.weight")
+                    || n.ends_with(".ffn_down_shexp.weight");
+            };
+            std::size_t nRepack = 0;
+            std::uint64_t bytesBefore = 0, bytesAfter = 0;
+            for (const auto& step : steps) {
+                if (!isFullAttn(step.ggufName) || step.sources.size() != 1) continue;
+                const auto& src = step.sources[0];
+                if (src.kind != core::modelopt::SourceKind::Nvfp4) continue;
+                if ((src.in % 32) != 0) continue;
+                auto it = std::find_if(
+                    e._materializedBf16.begin(), e._materializedBf16.end(),
+                    [&](const runtime::nvfp4::MaterializedTensor& t) {
+                        return t.ggufName == step.ggufName;
+                    });
+                if (it == e._materializedBf16.end() || it->isF32) continue;
+                const auto* pk = e._nvfp4Model->find(src.hfWeightName);
+                const std::string base{src.hfWeightName};
+                const std::string baseNoW =
+                    base.size() > 7 ? base.substr(0, base.size() - 7) : base;
+                const auto* bs = e._nvfp4Model->find(baseNoW + ".weight_scale");
+                const auto* gs = e._nvfp4Model->find(baseNoW + ".weight_scale_2");
+                if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
+                const float global = devOps.readF32(gs->devPtr);
+                const std::size_t blkBytes =
+                    (static_cast<std::size_t>(it->elems) / 32) * 20;
+                compute::ComputeBuffer nb = devOps.allocate(blkBytes);
+                devOps.repackageNvfp4ToBlk(nb.get(), pk->devPtr, bs->devPtr, global,
+                                           src.rows, src.in);
+                cudaCtx.stream().synchronize();
+                bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
+                bytesAfter  += blkBytes;
+                it->buffer     = std::move(nb); // frees the BF16 buffer (RAII)
+                it->isNvfp4Blk = true;
+                ++nRepack;
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: kept {} dense NVFP4 (shared-expert) "
+                        "projections native blocked-NVFP4 ({} MiB -> {} MiB)",
+                        nRepack, bytesBefore >> 20, bytesAfter >> 20);
         }
     }
 

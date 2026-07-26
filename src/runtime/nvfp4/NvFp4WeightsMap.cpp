@@ -18,19 +18,22 @@ core::gguf::WeightsMap buildBf16WeightsMap(std::vector<MaterializedTensor>& mats
     for (MaterializedTensor& m : mats) {
         core::gguf::GgufTensor t{};
         t.name       = m.ggufName;
-        t.type       = m.isQ4K  ? core::gguf::GgmlType::Q4_K
-                     : m.isQ6K  ? core::gguf::GgmlType::Q6_K
-                     : m.isFp8  ? core::gguf::GgmlType::FP8_E4M3
-                     : m.isQ8_0 ? core::gguf::GgmlType::Q8_0
-                     : m.isF32  ? core::gguf::GgmlType::F32
-                                : core::gguf::GgmlType::BF16;
+        t.type       = m.isQ4K       ? core::gguf::GgmlType::Q4_K
+                     : m.isQ6K       ? core::gguf::GgmlType::Q6_K
+                     : m.isFp8       ? core::gguf::GgmlType::FP8_E4M3
+                     : m.isNvfp4Blk  ? core::gguf::GgmlType::NVFP4_BLK
+                     : m.isQ8_0      ? core::gguf::GgmlType::Q8_0
+                     : m.isF32       ? core::gguf::GgmlType::F32
+                                     : core::gguf::GgmlType::BF16;
         t.dimensions = m.ggufDims;
         t.nelements  = m.elems;
-        // Block byte sizes: Q8_0/FP8 34 B/32, Q4_K 144 B/256, Q6_K 210 B/256.
-        t.nbytes     = m.isQ4K  ? (static_cast<std::size_t>(m.elems) / 256) * 144
-                     : m.isQ6K  ? (static_cast<std::size_t>(m.elems) / 256) * 210
+        // Block byte sizes: Q8_0/FP8 34 B/32, NVFP4_BLK 20 B/32, Q4_K 144 B/256,
+        // Q6_K 210 B/256.
+        t.nbytes     = m.isQ4K       ? (static_cast<std::size_t>(m.elems) / 256) * 144
+                     : m.isQ6K       ? (static_cast<std::size_t>(m.elems) / 256) * 210
+                     : m.isNvfp4Blk  ? (static_cast<std::size_t>(m.elems) / 32)  * 20
                      : (m.isQ8_0 || m.isFp8)
-                                ? (static_cast<std::size_t>(m.elems) / 32)  * 34
+                                     ? (static_cast<std::size_t>(m.elems) / 32)  * 34
                      : static_cast<std::size_t>(m.elems) * (m.isF32 ? 4 : 2);
         t.usmPtr     = m.buffer.get();
         tensors.push_back(std::move(t));

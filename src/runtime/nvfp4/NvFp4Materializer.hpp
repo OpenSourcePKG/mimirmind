@@ -73,6 +73,7 @@ struct MaterializedTensor {
     bool                       isQ4K{false};  ///< true if buffer holds Q4_K super-blocks (MoE experts)
     bool                       isQ6K{false};  ///< true if buffer holds Q6_K super-blocks (MoE experts)
     bool                       isFp8{false};  ///< true if buffer holds blocked-FP8 E4M3 (attn projections)
+    bool                       isNvfp4Blk{false}; ///< true if buffer holds blocked-NVFP4 (full-attn projections)
 };
 
 /**

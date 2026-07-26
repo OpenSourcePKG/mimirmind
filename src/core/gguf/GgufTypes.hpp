@@ -55,6 +55,11 @@ enum class GgmlType : std::uint32_t {
     // to keep the attention projections 1-byte in a log-preserving format;
     // consumed by matmul_fp8_vec / _gemm. Never read from a GGUF file.
     FP8_E4M3 = 40,
+    // Custom: blocked-NVFP4, 20 B per 32-element super-block (2 fp16 scales +
+    // 16 packed E2M1 bytes). Produced at load time by repackaging the native
+    // NVFP4 (packed E2M1 + per-16 E4M3 block-scale + global) losslessly, to
+    // keep the full-attention projections 4-bit. Consumed by matmul_nvfp4blk.
+    NVFP4_BLK = 41,
     Unknown = 0xFFFFFFFFu,
 };
 

@@ -187,6 +187,10 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _matmulFp8VecKernel;
     ::mimirmind::core::cuda::CudaModule _matmulFp8GemmModule;
     ::mimirmind::core::cuda::CudaKernel _matmulFp8GemmKernel;
+    ::mimirmind::core::cuda::CudaModule _matmulNvblkVecModule;
+    ::mimirmind::core::cuda::CudaKernel _matmulNvblkVecKernel;
+    ::mimirmind::core::cuda::CudaModule _matmulNvblkGemmModule;
+    ::mimirmind::core::cuda::CudaKernel _matmulNvblkGemmKernel;
 
     explicit Impl(::mimirmind::core::cuda::CudaContext& ctx)
         : _matmulQ8_0VecModule    {loadCudaModule(ctx, "matmul_q8_0_vec")},
@@ -272,7 +276,13 @@ struct GpuMatmul::Impl {
               _matmulFp8VecModule.getFunction("matmul_fp8_vec")},
           _matmulFp8GemmModule    {loadCudaModule(ctx, "matmul_fp8_gemm")},
           _matmulFp8GemmKernel    {
-              _matmulFp8GemmModule.getFunction("matmul_fp8_gemm")}
+              _matmulFp8GemmModule.getFunction("matmul_fp8_gemm")},
+          _matmulNvblkVecModule   {loadCudaModule(ctx, "matmul_nvfp4blk_vec")},
+          _matmulNvblkVecKernel   {
+              _matmulNvblkVecModule.getFunction("matmul_nvfp4blk_vec")},
+          _matmulNvblkGemmModule  {loadCudaModule(ctx, "matmul_nvfp4blk_gemm")},
+          _matmulNvblkGemmKernel  {
+              _matmulNvblkGemmModule.getFunction("matmul_nvfp4blk_gemm")}
     {}
 };
 
@@ -842,6 +852,39 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
 
         constexpr std::size_t kGemmMaxM = 16;   // == GEMM_MAX_M in the .cu
         auto& kern = _pimpl->_matmulFp8GemmKernel;
+        for (std::size_t m0 = 0; m0 < M; m0 += kGemmMaxM) {
+            const std::size_t mChunk = std::min(kGemmMaxM, M - m0);
+            kern.setPtr  (0, X + m0 * K);
+            kern.setPtr  (1, W);
+            kern.setPtr  (2, Y + m0 * N);
+            kern.setValue(3, static_cast<std::int32_t>(K));
+            kern.setValue(4, static_cast<std::int32_t>(N));
+            kern.setValue(5, static_cast<std::int32_t>(mChunk));
+            kern.launch(_ctx.stream(), nGroups, 1, 1, kVecLocalSize, 1, 1);
+        }
+        return;
+    }
+
+    if (type == ::mimirmind::core::gguf::GgmlType::NVFP4_BLK) {
+        // Blocked-NVFP4 (E2M1) matmul — native 4-bit weights kept resident
+        // (20 B / 32 elems). Same warp layout as BF16; scales embedded per
+        // super-block, so no plumbing. Full-attention projections.
+        const std::uint32_t nGroups = static_cast<std::uint32_t>(
+            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+
+        if (M == 1) {
+            auto& kern = _pimpl->_matmulNvblkVecKernel;
+            kern.setPtr  (0, X);
+            kern.setPtr  (1, W);
+            kern.setPtr  (2, Y);
+            kern.setValue(3, static_cast<std::int32_t>(K));
+            kern.setValue(4, static_cast<std::int32_t>(N));
+            kern.launch(_ctx.stream(), nGroups, 1, 1, kVecLocalSize, 1, 1);
+            return;
+        }
+
+        constexpr std::size_t kGemmMaxM = 16;
+        auto& kern = _pimpl->_matmulNvblkGemmKernel;
         for (std::size_t m0 = 0; m0 < M; m0 += kGemmMaxM) {
             const std::size_t mChunk = std::min(kGemmMaxM, M - m0);
             kern.setPtr  (0, X + m0 * K);
