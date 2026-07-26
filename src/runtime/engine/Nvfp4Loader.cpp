@@ -415,13 +415,16 @@ void Nvfp4Loader::load(InferenceEngine& e,
     // design, so there is no native NVFP4 form to keep for them.
     // MIMIRMIND_NVFP4_SHEXP=0 keeps BF16 (A/B).
     if (e._nvfp4Model) {
-        // DEFAULT OFF: the shared-expert blocked-NVFP4 path degenerates when the
-        // routed experts are ALSO blocked-NVFP4 (an unresolved interaction —
-        // each alone is coherent). With routed experts NVFP4 by default, keep the
-        // shared experts BF16. MIMIRMIND_NVFP4_SHEXP=1 opts in (only coherent if
-        // the routed experts are NOT NVFP4, e.g. MIMIRMIND_NVFP4_MOE=kquant).
+        // DEFAULT ON: the shared experts stay native blocked-NVFP4 alongside the
+        // routed experts. An earlier "routed-NVFP4 + shared-NVFP4 degenerates"
+        // report was a MISDIAGNOSIS (it compared different prompts): a 40-block
+        // probe shows shared-NVFP4 matches shared-BF16 to <=0.18% with no NaN,
+        // and an A/B with repetition_penalty has the both-NVFP4 output as the
+        // MOST coherent of the set. The residual short-prompt greedy repetition
+        // collapse is identical with shared BF16, so it is a decode/chat-template
+        // artefact, not a quant bug. MIMIRMIND_NVFP4_SHEXP=0 keeps BF16 for A/B.
         const char* faenv = std::getenv("MIMIRMIND_NVFP4_SHEXP");
-        const bool faNvblk = (faenv != nullptr) && (std::string_view{faenv} != "0");
+        const bool faNvblk = (faenv == nullptr) || (std::string_view{faenv} != "0");
         if (faNvblk) {
             auto isFullAttn = [](std::string_view n) {
                 return n.ends_with(".ffn_gate_shexp.weight")
