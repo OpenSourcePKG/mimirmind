@@ -118,6 +118,19 @@ public:
     /// monitor has no package temp reading.
     std::uint32_t tick(SystemMonitor& monitor);
 
+    /// M9.6.6.2 — headroom-scaled up-gain (MHz per °C of error). Pure
+    /// function of the distance below target (headroomC = targetTempC -
+    /// current_temp_c; negatives treated as 0) so the ramp is unit-testable
+    /// without sysfs. Returns clamp(headroom * kAdaptiveUpSlope,
+    /// kGainUpMhzPerC, kAdaptiveUpMaxMhzPerC).
+    [[nodiscard]] static float adaptiveUpGainMhzPerC(float headroomC) noexcept;
+
+    /// True when the adaptive up-gain is active: the kill-switch
+    /// (MIMIRMIND_GOVERNOR_ADAPTIVE_UP) is on AND the overshoot watchdog
+    /// has not latched it off. Reported via /system/info; used by tests.
+    [[nodiscard]] bool adaptiveUp()       const noexcept { return _adaptiveUp; }
+    [[nodiscard]] bool overshootLatched() const noexcept { return _overshootLatched; }
+
 private:
     void probe(std::string_view sysfsRoot);
     [[nodiscard]] static std::uint32_t readFreqFile(const std::string& path);
@@ -146,6 +159,28 @@ private:
     static constexpr float kDeadbandC           = 0.5F;
     static constexpr float kDefaultTargetTempC   = 72.0F;
 
+    // M9.6.6.2 — Adaptive up-gain. The flat kGainUpMhzPerC creep left the
+    // cap stuck near RPn under sustained load even 20+ °C below target
+    // (headroom the chip could safely spend). The up-gain now scales with
+    // headroom distance so a cold chip ramps fast while a near-target chip
+    // still creeps gently:
+    //   gain_up(headroom) = clamp(headroom * kAdaptiveUpSlope,
+    //                             kGainUpMhzPerC, kAdaptiveUpMaxMhzPerC)
+    // headroom = targetTempC - current_temp_c. At headroom 0 it is the
+    // paranoid baseline (10); it saturates at 100 (== |down-gain|) by
+    // ~18 °C. The DOWN path stays hard at kGainDownMhzPerC — the
+    // 2026-07-01 thermal shutdown proved the drop must never soften.
+    static constexpr float kAdaptiveUpSlope      = 5.0F;   // MHz/°C per °C headroom
+    static constexpr float kAdaptiveUpMaxMhzPerC = 100.0F;
+
+    // Overshoot watchdog (hysteresis). A real overshoot past the deadband
+    // latches the adaptive up-gain OFF (flat baseline creep) until the chip
+    // has cooled kOvershootReleaseC below target again. Bounds how fast the
+    // cap climbs right after a heat spike — the 2026-07-01 shutdown
+    // condition. The down-gain is never gated by this.
+    static constexpr float kOvershootLatchC      = 1.0F;   // error above target that latches
+    static constexpr float kOvershootReleaseC    = 3.0F;   // headroom below target that releases
+
     std::string   _cardPath{};
     std::string   _unavailableReason{};
     std::uint32_t _rp0Mhz{0};
@@ -153,6 +188,10 @@ private:
     std::uint32_t _currentCap{0};
     float         _targetTempC{kDefaultTargetTempC};
     bool          _available{false};
+
+    // M9.6.6.2 adaptive up-gain state.
+    bool          _adaptiveUp{true};        // MIMIRMIND_GOVERNOR_ADAPTIVE_UP kill-switch
+    bool          _overshootLatched{false}; // watchdog: adaptive suppressed until cooled
 
     // M9.11.a session-level pin. Set once via pin(); read by the engine's
     // decode loop (skip P-controller tick) and by ApiServer (report to
