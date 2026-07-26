@@ -692,6 +692,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels_cuda/matmul_q8_0_vec_reorder.cu
         kernels_cuda/moe_down_fused_k_q5k.cu
         kernels_cuda/moe_down_fused_k_q5k_batched.cu
+        kernels_cuda/moe_down_fused_k_q6k_batched.cu
         kernels_cuda/moe_down_fused_k_q6k.cu
         kernels_cuda/moe_down_fused_k_q8_0.cu
         kernels_cuda/moe_gate_up_fused_k_q4k.cu

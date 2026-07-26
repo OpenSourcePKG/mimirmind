@@ -155,6 +155,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _moeDownFusedKQ5KKernel;
     ::mimirmind::core::cuda::CudaModule _moeDownFusedKQ5KBatchedModule;
     ::mimirmind::core::cuda::CudaKernel _moeDownFusedKQ5KBatchedKernel;
+    ::mimirmind::core::cuda::CudaModule _moeDownFusedKQ6KBatchedModule;
+    ::mimirmind::core::cuda::CudaKernel _moeDownFusedKQ6KBatchedKernel;
     ::mimirmind::core::cuda::CudaModule _moeGateUpFusedKQ4KModule;
     ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKQ4KKernel;
     ::mimirmind::core::cuda::CudaModule _moeGateUpFusedKQ4KBatchedModule;
@@ -219,6 +221,9 @@ struct GpuMatmul::Impl {
           _moeDownFusedKQ5KBatchedModule{loadCudaModule(ctx, "moe_down_fused_k_q5k_batched")},
           _moeDownFusedKQ5KBatchedKernel{
               _moeDownFusedKQ5KBatchedModule.getFunction("moe_down_fused_k_q5k_batched")},
+          _moeDownFusedKQ6KBatchedModule{loadCudaModule(ctx, "moe_down_fused_k_q6k_batched")},
+          _moeDownFusedKQ6KBatchedKernel{
+              _moeDownFusedKQ6KBatchedModule.getFunction("moe_down_fused_k_q6k_batched")},
           _moeGateUpFusedKQ4KModule{loadCudaModule(ctx, "moe_gate_up_fused_k_q4k")},
           _moeGateUpFusedKQ4KKernel{
               _moeGateUpFusedKQ4KModule.getFunction("moe_gate_up_fused_k_q4k")},
@@ -1274,21 +1279,25 @@ void GpuMatmul::moeDownFusedKBatchedAsync(
                     kMoeGateUpLocalSize, 1, 1);
         return;
     }
-    if (type != ::mimirmind::core::gguf::GgmlType::Q5_K) {
+    const bool isQ5K = (type == ::mimirmind::core::gguf::GgmlType::Q5_K);
+    const bool isQ6K = (type == ::mimirmind::core::gguf::GgmlType::Q6_K);
+    if (!isQ5K && !isQ6K) {
         throw std::runtime_error(
-            "compute::cuda::GpuMatmul::moeDownFusedKBatchedAsync: only Q5_K "
-            "batched today — Q6_K/Q8_0 batched variants not yet ported.");
+            "compute::cuda::GpuMatmul::moeDownFusedKBatchedAsync: only Q5_K/Q6_K/"
+            "BF16 batched today — Q8_0 batched variant not yet ported.");
     }
     if (ffPer % 256 != 0) {
         throw std::runtime_error(
             "compute::cuda::GpuMatmul::moeDownFusedKBatchedAsync: ffPer=" +
             std::to_string(ffPer) +
-            " is not a multiple of Q5_K blockElements=256");
+            " is not a multiple of K-quant blockElements=256");
     }
     // grid = (nGroups, nSeq); each seq has its own gateAct/expIdx/kw/accum
     // (per-token routing + RMW accumulator). Expert bank shared. Math
-    // byte-identical to nSeq single moeDownFusedKAsync (Cat B).
-    auto& kern = _pimpl->_moeDownFusedKQ5KBatchedKernel;
+    // byte-identical to nSeq single moeDownFusedKAsync (Cat B). Q5_K and Q6_K
+    // share the launch geometry (MOE_DOWN_LOCAL=64, 4 outputs/group).
+    auto& kern = isQ6K ? _pimpl->_moeDownFusedKQ6KBatchedKernel
+                       : _pimpl->_moeDownFusedKQ5KBatchedKernel;
     kern.setPtr  (0, gateAct);
     kern.setPtr  (1, W);
     kern.setPtr  (2, expIdx);
