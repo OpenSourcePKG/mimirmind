@@ -52,6 +52,27 @@ public:
 
     void addOneInPlaceF32(void* f32, std::uint64_t n) override;
 
+    /**
+     * BF16 -> Q8_0 weight re-quantisation (not part of the materializer
+     * interface — the NVFP4 loader calls it directly on the concrete ops to
+     * shrink the materialised attention projections). `srcBf16` holds `rows`
+     * rows of `K` BF16 elements (K % 32 == 0); `dstQ8_0` receives the Q8_0
+     * blocks in the ggml layout the matmul_q8_0 kernels expect. Enqueued on
+     * the context stream; caller syncs.
+     */
+    void quantizeBf16ToQ8_0(void* dstQ8_0, const void* srcBf16,
+                            std::uint64_t rows, std::uint64_t K);
+
+    /**
+     * BF16 -> Q4_K weight re-quantisation for the MoE experts. `srcBf16` holds
+     * `totalElems` BF16 values (totalElems % 256 == 0); `dstQ4K` receives the
+     * Q4_K super-blocks (144 B / 256 elems) in the ggml layout matmul_q4k
+     * expects. One thread block per 256-element super-block. Enqueued on the
+     * context stream; caller syncs.
+     */
+    void quantizeBf16ToQ4K(void* dstQ4K, const void* srcBf16,
+                           std::uint64_t totalElems);
+
 private:
     core::cuda::CudaComputeContext& _ctx;
     ComputeOps&                     _ops;
@@ -60,12 +81,16 @@ private:
     core::cuda::CudaModule          _castModule;
     core::cuda::CudaModule          _negExpModule;
     core::cuda::CudaModule          _addOneModule;
+    core::cuda::CudaModule          _quantQ8Module;
+    core::cuda::CudaModule          _quantQ4KModule;
     core::cuda::CudaKernel          _dqNvfp4;
     core::cuda::CudaKernel          _dqFp8;
     core::cuda::CudaKernel          _castBf16;
     core::cuda::CudaKernel          _castF16;
     core::cuda::CudaKernel          _negExp;
     core::cuda::CudaKernel          _addOne;
+    core::cuda::CudaKernel          _quantQ8;
+    core::cuda::CudaKernel          _quantQ4K;
 };
 
 } // namespace mimirmind::compute::cuda

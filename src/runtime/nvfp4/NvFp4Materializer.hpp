@@ -69,6 +69,9 @@ struct MaterializedTensor {
     std::vector<std::uint64_t> ggufDims; ///< ne-order
     std::uint64_t              elems{0};
     bool                       isF32{false}; ///< true for widened passthrough tensors
+    bool                       isQ8_0{false}; ///< true if buffer holds Q8_0 blocks (load-time re-quant)
+    bool                       isQ4K{false};  ///< true if buffer holds Q4_K super-blocks (MoE experts)
+    bool                       isQ6K{false};  ///< true if buffer holds Q6_K super-blocks (MoE experts)
 };
 
 /**

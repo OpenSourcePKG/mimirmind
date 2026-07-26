@@ -61,12 +61,16 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _castModule{loadModule(ctx.cudaContext(), "cast_to_f32")},
       _negExpModule{loadModule(ctx.cudaContext(), "neg_exp")},
       _addOneModule{loadModule(ctx.cudaContext(), "add_one")},
+      _quantQ8Module{loadModule(ctx.cudaContext(), "quantize_bf16_to_q8_0")},
+      _quantQ4KModule{loadModule(ctx.cudaContext(), "quantize_bf16_to_q4k")},
       _dqNvfp4{_nvfp4Module.getFunction("dequant_nvfp4")},
       _dqFp8{_fp8Module.getFunction("dequant_fp8")},
       _castBf16{_castModule.getFunction("cast_bf16_to_f32")},
       _castF16{_castModule.getFunction("cast_f16_to_f32")},
       _negExp{_negExpModule.getFunction("neg_exp_f32")},
-      _addOne{_addOneModule.getFunction("add_one_f32")} {}
+      _addOne{_addOneModule.getFunction("add_one_f32")},
+      _quantQ8{_quantQ8Module.getFunction("quantize_bf16_to_q8_0")},
+      _quantQ4K{_quantQ4KModule.getFunction("quantize_bf16_to_q4k")} {}
 
 ComputeBuffer CudaMaterializerOps::allocate(std::size_t bytes) {
     return _ops.allocate(bytes);
@@ -148,6 +152,30 @@ void CudaMaterializerOps::addOneInPlaceF32(void* f32, std::uint64_t n) {
     _addOne.setPtr  (0, f32);
     _addOne.setValue(1, static_cast<std::int64_t>(n));
     _addOne.launch(_ctx.stream(), gridFor(n), 1, 1, kBlock, 1, 1);
+}
+
+void CudaMaterializerOps::quantizeBf16ToQ8_0(void* dstQ8_0, const void* srcBf16,
+                                             std::uint64_t rows, std::uint64_t K) {
+    // Kernel: (bf16* src, u8* dst, int K); grid (rows, K/32), block 32.
+    _quantQ8.clearArgs();
+    _quantQ8.setPtr  (0, srcBf16);
+    _quantQ8.setPtr  (1, dstQ8_0);
+    _quantQ8.setValue(2, static_cast<std::int32_t>(K));
+    _quantQ8.launch(_ctx.stream(),
+                    static_cast<std::uint32_t>(rows),
+                    static_cast<std::uint32_t>(K / 32), 1,
+                    32, 1, 1);
+}
+
+void CudaMaterializerOps::quantizeBf16ToQ4K(void* dstQ4K, const void* srcBf16,
+                                            std::uint64_t totalElems) {
+    // Kernel: (bf16* src, u8* dst); grid (totalElems/256), block 256.
+    _quantQ4K.clearArgs();
+    _quantQ4K.setPtr(0, srcBf16);
+    _quantQ4K.setPtr(1, dstQ4K);
+    _quantQ4K.launch(_ctx.stream(),
+                     static_cast<std::uint32_t>(totalElems / 256), 1, 1,
+                     256, 1, 1);
 }
 
 float CudaMaterializerOps::readF32(const void* devPtr) {

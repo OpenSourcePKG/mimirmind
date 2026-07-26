@@ -637,6 +637,124 @@ void InferenceEngine::loadModelNvfp4(std::string_view checkpointDir,
         }
     }
 
+    // 5c. Re-quantise the dense attention projections BF16 -> Q8_0.
+    //
+    // The materialised BF16 weights double the checkpoint's on-device size
+    // (FP8/NVFP4 -> 2 B/elem), and the qwen35moe decode is memory-bound —
+    // it is dominated by streaming the projection + expert weights per token.
+    // Q8_0 (34 B / 32 elems = ~1.06 B/elem) halves the traffic of these
+    // dense projections with negligible quality loss: Q8_0's per-block 8-bit
+    // mantissa captures the FP8-origin values with more precision than they
+    // were stored at. The Q8_0 result feeds the existing matmul_q8_0 kernels
+    // unchanged (the backend dispatches on tensor .type), so no new matmul or
+    // scale plumbing is needed. The value-head regroup above has already run
+    // on the BF16 layout, so we quantise the final regrouped bytes.
+    //
+    // Experts (3-D banks) are left BF16 here — they use the fused-K MoE
+    // kernels, a separate lever. Norms / conv1d / router stay BF16.
+    // Load-time server decision; MIMIRMIND_NVFP4_Q8_PROJ=0 keeps BF16 (A/B).
+    {
+        // MIMIRMIND_NVFP4_Q8_PROJ re-quantises the dense attention projections
+        // BF16 -> Q8_0 to halve their decode-time read.
+        //
+        // DEFAULT OFF: empirically this BREAKS coherence on qwen35moe. Q8_0 is
+        // a per-32-block *linear* quant, but these projections are FP8(e4m3)/
+        // NVFP4 origin — *logarithmic*, wide-dynamic-range. In a block with one
+        // large + many small weights, Q8_0's absmax scale crushes the small
+        // weights to ~0; e4m3/NVFP4 preserve them via log/grouped scales, and
+        // the model is calibrated for that. Degradation scales with the count
+        // of quantised tensors and is worst on the recurrent GatedDeltaNet
+        // path. The correct memory lever keeps the NATIVE format (FP8 1-byte /
+        // NVFP4 4-bit), not a linear re-quant. Kept behind this flag (off) for
+        // A/B reference. See lesson q8_0-linear-requant-crushes-fp8-weights.
+        //   "all"/"1"/"fa"/"gdn" — quantise that group   "0"/unset — keep BF16
+        const char* q8env = std::getenv("MIMIRMIND_NVFP4_Q8_PROJ");
+        const std::string_view q8mode = (q8env == nullptr) ? "0" : q8env;
+        const bool q8proj = (q8mode != "0");
+        if (q8proj) {
+            const bool wantFa  = (q8mode == "all" || q8mode == "1" || q8mode == "fa");
+            const bool wantGdn = (q8mode == "all" || q8mode == "1" || q8mode == "gdn");
+            auto isFa = [](std::string_view n) {
+                return n.ends_with(".attn_q.weight") || n.ends_with(".attn_k.weight")
+                    || n.ends_with(".attn_v.weight") || n.ends_with(".attn_output.weight");
+            };
+            auto isGdn = [](std::string_view n) {
+                return n.ends_with(".attn_qkv.weight") || n.ends_with(".attn_gate.weight")
+                    || n.ends_with(".ssm_out.weight");
+            };
+            auto isProj = [&](std::string_view n) {
+                return (wantFa && isFa(n)) || (wantGdn && isGdn(n));
+            };
+            std::size_t nQuant = 0;
+            std::uint64_t bytesBefore = 0, bytesAfter = 0;
+            for (auto& t : _materializedBf16) {
+                if (t.isF32 || t.ggufDims.size() < 2 || !isProj(t.ggufName)) continue;
+                const std::uint64_t K    = t.ggufDims[0];  // input dim (contiguous)
+                const std::uint64_t rows = t.ggufDims[1];  // output dim
+                if (K == 0 || rows == 0 || (K % 32) != 0 || K * rows != t.elems) continue;
+                const std::size_t q8Bytes =
+                    (static_cast<std::size_t>(t.elems) / 32) * 34;
+                compute::ComputeBuffer q8 = devOps.allocate(q8Bytes);
+                devOps.quantizeBf16ToQ8_0(q8.get(), t.buffer.get(), rows, K);
+                cudaCtx.stream().synchronize(); // finish before the BF16 buffer frees
+                bytesBefore += static_cast<std::uint64_t>(t.elems) * 2;
+                bytesAfter  += q8Bytes;
+                t.buffer = std::move(q8); // frees the BF16 buffer (RAII)
+                t.isQ8_0 = true;
+                ++nQuant;
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: re-quantised {} attention projections "
+                        "BF16 -> Q8_0 (mode='{}', {} MiB -> {} MiB)",
+                        nQuant, q8mode, bytesBefore >> 20, bytesAfter >> 20);
+        }
+    }
+
+    // 5d. Re-quantise the MoE expert gate/up banks BF16 -> Q4_K.
+    //
+    // The experts dominate the decode-time weight traffic (256 experts, the
+    // largest tensors), and the qwen35moe decode is memory-bound. Q4_K is
+    // 4-bit (144 B / 256 elems ≈ 0.56 B/elem vs 2 B BF16) — a ~3.5x cut on the
+    // expert reads. Unlike a flat linear Q8_0 (which crushes the small
+    // log-distributed weights and breaks coherence — see the q8_0-linear-requant
+    // lesson), Q4_K keeps per-32 sub-block scale+min and is the exact format
+    // llama.cpp uses for these experts (proven coherent), and the MoE is
+    // quant-robust (8/256 experts active per token, router-weighted). The Q4_K
+    // banks feed the existing moe_gate_up_fused_k_q4k kernels unchanged (the
+    // backend dispatches on tensor .type and computes K-quant strides via the
+    // quant registry). Down banks stay BF16 here (Q6_K down is a follow-up).
+    // Load-time server decision; MIMIRMIND_NVFP4_MOE_Q4K=0 keeps BF16 (A/B).
+    {
+        const char* mq = std::getenv("MIMIRMIND_NVFP4_MOE_Q4K");
+        const bool moeQ4K = (mq == nullptr) || (std::string_view{mq} != "0");
+        if (moeQ4K) {
+            std::size_t nQuant = 0;
+            std::uint64_t bytesBefore = 0, bytesAfter = 0;
+            for (auto& t : _materializedBf16) {
+                if (t.isF32 || t.isQ8_0) continue;
+                const std::string& n = t.ggufName;
+                const bool isGateUp = n.ends_with(".ffn_gate_exps.weight")
+                                   || n.ends_with(".ffn_up_exps.weight");
+                if (!isGateUp) continue;
+                if ((t.elems % 256) != 0) continue;
+                const std::size_t q4kBytes =
+                    (static_cast<std::size_t>(t.elems) / 256) * 144;
+                compute::ComputeBuffer q4k = devOps.allocate(q4kBytes);
+                devOps.quantizeBf16ToQ4K(q4k.get(), t.buffer.get(), t.elems);
+                cudaCtx.stream().synchronize();
+                bytesBefore += static_cast<std::uint64_t>(t.elems) * 2;
+                bytesAfter  += q4kBytes;
+                t.buffer = std::move(q4k); // frees the BF16 bank (RAII)
+                t.isQ4K  = true;
+                ++nQuant;
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: re-quantised {} MoE gate/up expert banks "
+                        "BF16 -> Q4_K ({} MiB -> {} MiB)",
+                        nQuant, bytesBefore >> 20, bytesAfter >> 20);
+        }
+    }
+
     // 6. Expose the BF16 tensors as a GGUF-convention WeightsMap.
     _weights.emplace(runtime::nvfp4::buildBf16WeightsMap(_materializedBf16));
 
