@@ -891,6 +891,7 @@ add_executable(mimirmind
     src/model/Tokenizer.cpp
     src/runtime/BlockBuffers.cpp
     src/runtime/InferenceEngine.cpp
+    src/runtime/engine/Nvfp4Loader.cpp
     src/runtime/serving/ContinuousBatcher.cpp
     src/runtime/KvCache.cpp
     src/runtime/SsmState.cpp

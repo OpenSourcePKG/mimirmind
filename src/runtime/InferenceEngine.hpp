@@ -78,6 +78,10 @@ namespace arch {
 class ArchBackend;
 } // namespace arch
 
+namespace engine {
+class Nvfp4Loader;   // friend collaborator — runs loadModelNvfp4's pipeline
+} // namespace engine
+
 /**
  * Sampling + generation knobs. Default is greedy/argmax — sampling.temperature
  * <= 0 keeps the decode loop bit-identical to plain argmax.
@@ -581,6 +585,10 @@ public:
     }
 
 private:
+    // Collaborators that run a cohesive slice of the engine's work on its
+    // internals (extracted to keep this translation unit focused).
+    friend class engine::Nvfp4Loader;
+
     /// Compute logits over the last hidden state row via final-norm +
     /// lm_head, then draw one token id using `_sampler` and `params`.
     /// `recentTokens` — ordered oldest-to-newest history that the
