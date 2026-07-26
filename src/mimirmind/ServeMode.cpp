@@ -649,16 +649,24 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                 return 0;
             }
             const auto& tok = e->tokenizer();
-            std::vector<std::int32_t> pids =
-                tok.encode("The history of artificial intelligence began when",
-                           /*addBos=*/false);
+            const char* promptEnv = std::getenv("MIMIRMIND_MTP_PROMPT");
+            std::vector<std::int32_t> pids = tok.encode(
+                promptEnv != nullptr
+                    ? promptEnv
+                    : "The history of artificial intelligence began when",
+                /*addBos=*/false);
             if (pids.empty()) pids.push_back(1);
             std::size_t depth = 2;
             if (const char* dv = std::getenv("MIMIRMIND_MTP_DEPTH")) {
                 const long v = std::strtol(dv, nullptr, 10);
                 if (v >= 1) depth = static_cast<std::size_t>(v);
             }
-            const std::size_t maxNew = 64;
+            std::size_t maxNew = 64;
+            if (const char* mv = std::getenv("MIMIRMIND_MTP_MAXNEW")) {
+                const long v = std::strtol(mv, nullptr, 10);
+                if (v >= 1) maxNew = static_cast<std::size_t>(v);
+            }
+            std::cout << "\n[M-Cuda.MTP] promptTokens=" << pids.size();
             using clk = std::chrono::steady_clock;
 
             // Baseline greedy generate().
