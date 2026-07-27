@@ -78,6 +78,15 @@ public:
                                 const float*                  /*hiddenStates*/,
                                 std::size_t                   /*T*/) {}
 
+    /// M-CLR.MoE Increment 3 — mirrors ArchBackend::moeDecodeClrSafe().
+    /// True when this variant's decode block runs fully device-side expert
+    /// dispatch (no host routing read), making it CLR-capturable. The
+    /// facade Gemma4Backend forwards its ArchBackend override here. Dense
+    /// variants keep the default false.
+    [[nodiscard]] virtual bool moeDecodeClrSafe() const noexcept {
+        return false;
+    }
+
     [[nodiscard]] std::vector<std::size_t> kvDimPerLayer() const;
     [[nodiscard]] std::vector<std::size_t> kvSourceLayerPerLayer() const;
     [[nodiscard]] std::pair<std::size_t, std::size_t> maxQKVDims() const;

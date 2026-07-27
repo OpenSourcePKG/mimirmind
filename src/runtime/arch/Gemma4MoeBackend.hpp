@@ -4,6 +4,7 @@
 #pragma once
 
 #include "runtime/arch/GemmaBaseBackend.hpp"
+#include "compute/ComputeBuffer.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +44,13 @@ public:
                   BlockBuffers& s,
                   bool          traceBlock0) override;
 
+    /// M-CLR.MoE Increment 3 — true when every decode block will take the
+    /// device-side expert dispatch path (Increment 2), which removes all
+    /// host routing reads and makes the block Command-List-Replay-capturable.
+    /// Mirrors the per-block `wantDeviceDispatch` gate in runBlock(), using
+    /// block 0's expert weight types (uniform across Gemma 4 MoE blocks).
+    [[nodiscard]] bool moeDecodeClrSafe() const noexcept override;
+
 private:
     /// `features.moeGroup` at construction — routes T>1 through the
     /// expert-grouped batched dispatch path in runBlock(). Off falls back
@@ -69,6 +77,15 @@ private:
     // loop serialises all calls on one instance.
     std::vector<std::int32_t> _topKIdx;      // [T*K] router expert picks
     std::vector<float>        _topKWeight;   // [T*K] router weights
+
+    // Device-side top-K routing (opt-in, MIMIRMIND_MOE_DEVICE_TOPK).
+    // M-CLR.MoE Increment 1: parity foundation for un-gating L0-CLR on
+    // MoE. The kernel writes idx/weight into USM; the result is copied
+    // back into _topKIdx/_topKWeight so the existing host expert-dispatch
+    // path is byte-for-byte unchanged. Default off = zero prod risk.
+    // Grown lazily to hold T*K entries; capacity retained across calls.
+    compute::ComputeBuffer    _devTopKIdx;    // USM [>=T*K] int32
+    compute::ComputeBuffer    _devTopKWeight; // USM [>=T*K] float
 
     // Expert-grouped prefill (T>1) permutation buffers.
     std::vector<std::vector<std::pair<std::size_t, float>>> _expertTokens;

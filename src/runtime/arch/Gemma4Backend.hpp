@@ -78,6 +78,8 @@ public:
                         const float*                  hiddenStates,
                         std::size_t                   T) override;
 
+    [[nodiscard]] bool moeDecodeClrSafe() const noexcept override;
+
 private:
     std::unique_ptr<GemmaBaseBackend> _impl;
 };

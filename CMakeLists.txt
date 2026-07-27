@@ -204,6 +204,7 @@ if(MIMIRMIND_ENABLE_L0)
 
 set(KERNEL_SOURCES
     kernels/rmsnorm.cl
+    kernels/matmul_f32_vec.cl
     kernels/matmul_q4k_vec.cl
     kernels/matmul_q5k_vec.cl
     kernels/matmul_q6k_vec.cl
@@ -258,6 +259,8 @@ set(KERNEL_SOURCES
     kernels/matmul_q8_0_vec_reorder.cl
     kernels/moe_down_fused_k_q6k.cl
     kernels/moe_down_fused_k_q8_0.cl
+    kernels/moe_gateup_fused_k_q6k.cl
+    kernels/moe_topk.cl
 )
 
 set(KERNEL_SPV_FILES "")
@@ -944,6 +947,8 @@ if(MIMIRMIND_ENABLE_L0)
     target_sources(mimirmind PRIVATE
         src/compute/l0/GpuMatmul.cpp
         src/compute/l0/GpuOps.cpp
+        src/compute/l0/MoeTopKRouteDevice.cpp
+        src/compute/l0/MoeGateUpFusedKDevice.cpp
         # L0-tied support code — Formatting prints Level-Zero device
         # type strings. Only reachable from L0-guarded call sites, so
         # add it only when L0 is on. OpProfiler + FusedQkvWeights are
@@ -1304,6 +1309,8 @@ add_executable(gpu_tests
     src/compute/cpu/GpuOps.cpp
     src/compute/l0/GpuMatmul.cpp
     src/compute/l0/GpuOps.cpp
+    src/compute/l0/MoeTopKRouteDevice.cpp
+    src/compute/l0/MoeGateUpFusedKDevice.cpp
     src/compute/Matmul.cpp
     src/compute/MoeRouting.cpp
     src/compute/Norm.cpp
@@ -1351,6 +1358,8 @@ add_executable(prefill_bench
     src/compute/cpu/GpuOps.cpp
     src/compute/l0/GpuMatmul.cpp
     src/compute/l0/GpuOps.cpp
+    src/compute/l0/MoeTopKRouteDevice.cpp
+    src/compute/l0/MoeGateUpFusedKDevice.cpp
     src/compute/Matmul.cpp
     src/compute/MoeRouting.cpp
     src/compute/Norm.cpp

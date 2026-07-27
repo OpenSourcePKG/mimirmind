@@ -182,8 +182,86 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
     // (uninitialised) grown tail is fully overwritten before any read.
     _topKIdx.resize(T * K);
     _topKWeight.resize(T * K);
-    cmp::moeTopKRoute(upOutBuf, T, nExperts, K,
-                      _topKIdx.data(), _topKWeight.data());
+
+    // M-CLR.MoE Increment 1 — opt-in device-side top-K routing. The
+    // kernel is algebraically identical to cmp::moeTopKRoute (wScale=1;
+    // the global softmax denominator cancels against the kept-mass
+    // renormaliser). We copy the result back into the host pick buffers,
+    // so the downstream expert-dispatch path is byte-for-byte unchanged —
+    // this increment only establishes routing parity ahead of the
+    // device-side dispatch that will let MoE run under L0-CLR. Default
+    // off; any launch failure falls back to the host path silently.
+    static const bool kDeviceTopK =
+        std::getenv("MIMIRMIND_MOE_DEVICE_TOPK") != nullptr;
+
+    // M-CLR.MoE Increment 2 — can the entire expert dispatch run
+    // device-side this block? When yes, the routing never round-trips to
+    // the host: the device top-K result feeds the device gate_up (Q6_K) +
+    // fused-K down kernels directly, so no host op reads _topKIdx (and the
+    // memcpy-back below is skipped). That is the precondition for
+    // Command-List-Replay capture of the MoE decode block. Requires the
+    // fused-decode preconditions plus both device kernels for these
+    // weight types; otherwise fall back to the host dispatch path.
+    // MIMIRMIND_MOE_DEVICE_TOPK is the master switch for the whole
+    // device-MoE decode feature, so the device dispatch rides on kernel
+    // availability alone — it does not require the separate host-side
+    // features.moeFusedDown config toggle (that governs the host fused-K
+    // path). The fused-K down kernels are loaded unconditionally by
+    // GpuMatmul, so moeDownFusedKAvailable() reflects driver support.
+    const bool wantDeviceDispatch =
+        kDeviceTopK &&
+        T == 1 &&
+        _gmm.moeDownFusedKAvailable(expDown->type) &&
+        expGateUp->type == core::gguf::GgmlType::Q6_K &&
+        _ops.moeGateUpFusedKGeluAvailable(d_model) &&
+        s.moeGateCompact.get() != nullptr;
+
+    bool deviceTopKDone = false;
+    if (kDeviceTopK) {
+        try {
+            const std::size_t need = T * K;
+            if (_devTopKIdx.bytes() < need * sizeof(std::int32_t)) {
+                _devTopKIdx = _ops.allocate(need * sizeof(std::int32_t));
+            }
+            if (_devTopKWeight.bytes() < need * sizeof(float)) {
+                _devTopKWeight = _ops.allocate(need * sizeof(float));
+            }
+            _ops.moeTopKRouteDeviceAsync(upOutBuf,
+                                         _devTopKIdx.as<std::int32_t>(),
+                                         _devTopKWeight.as<float>(),
+                                         T, nExperts, K, 1.0F);
+            // The host pick buffers are only read when the dispatch stays
+            // on the host (prefill grouping, or a missing device kernel).
+            // Under full device dispatch we skip the flush + copy so that
+            // no host op touches the routing — the CLR-capture win. The
+            // device kernels read _devTopKIdx/_devTopKWeight directly and
+            // are ordered after the top-K launch on the same queue.
+            if (!wantDeviceDispatch) {
+                _ops.flush();
+                std::memcpy(_topKIdx.data(), _devTopKIdx.as<std::int32_t>(),
+                            need * sizeof(std::int32_t));
+                std::memcpy(_topKWeight.data(), _devTopKWeight.as<float>(),
+                            need * sizeof(float));
+            }
+            deviceTopKDone = true;
+            static bool announced = false;
+            if (!announced) {
+                announced = true;
+                MM_LOG_INFO("gemma4moe",
+                            "MoE device top-K routing active "
+                            "(MIMIRMIND_MOE_DEVICE_TOPK)");
+            }
+        } catch (const std::exception&) {
+            trace("path B: device top-K unavailable, host fallback");
+        }
+    }
+    if (!deviceTopKDone) {
+        cmp::moeTopKRoute(upOutBuf, T, nExperts, K,
+                          _topKIdx.data(), _topKWeight.data());
+    }
+    // Only take the device dispatch path if the device top-K actually ran
+    // (a launch failure above leaves the host _topKIdx authoritative).
+    const bool useDeviceDispatch = wantDeviceDispatch && deviceTopKDone;
 
     _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
     trace("path B: zero accumulator");
@@ -364,6 +442,36 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
                 rowWeight[i],
                 d_model);
         }
+    } else if (useDeviceDispatch) {
+        // M-CLR.MoE Increment 2 — fully device-side expert dispatch for
+        // T=1 decode. The device gate_up kernel reads the router pick
+        // expIdx[k] from _devTopKIdx (no host read) and folds downScale[e]
+        // into the gate activation; the fused-K down kernel then takes the
+        // raw router weight (_devTopKWeight) as kw. No host op touches the
+        // routing between top-K and the accumulator, so the whole block is
+        // Command-List-Replay-capturable (Increment 3).
+        trace("path B: device expert dispatch (gate_up + fused-K down)");
+        static bool dispatchAnnounced = false;
+        if (!dispatchAnnounced) {
+            dispatchAnnounced = true;
+            MM_LOG_INFO("gemma4moe",
+                        "MoE device expert dispatch active — gate_up "
+                        "(Q6_K) + fused-K down, no host routing read");
+        }
+        float* const gateActAll = s.moeGateCompact.as<float>();
+        const auto* const devIdx = _devTopKIdx.as<std::int32_t>();
+
+        // gate_up: gateActAll[k, f] = gelu(gate_f · x) * (up_f · x) * scale[e]
+        _ops.moeGateUpFusedKGeluAsync(normBuf, expGateUpBase, devIdx,
+                                      expDownScalePtr, gateActAll,
+                                      d_model, ffPerExpert, K,
+                                      expertBytesGateUp);
+
+        // down: moeAccumBuf[n] += sum_k weight[k] * (W_down[e_k] · gateAct_k)
+        _gmm.moeDownFusedKAsync(expDown->type, gateActAll, expDownBase,
+                                devIdx, _devTopKWeight.as<float>(),
+                                moeAccumBuf, ffPerExpert, d_model, K,
+                                expertBytesDown);
     } else {
         // M-MoE.Fused-Decode — enable the fused-K down path when all
         // preconditions line up: toggle on, kernel loaded for this
@@ -514,6 +622,41 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
     // Close the last phase before returning so its time lands in the
     // accumulator. Cheap no-op when profiling is disabled.
     _op.finish();
+}
+
+bool Gemma4MoeBackend::moeDecodeClrSafe() const noexcept {
+    // M-CLR.MoE Increment 3 — CLR-safe when the whole decode block runs
+    // device-side expert dispatch (Increment 2), so no host op reads the
+    // routing between the router matmul and the accumulator. Verified on
+    // NUC / Xe-LPG (26B-A4B-it-Q6_K): with device dispatch + the two CLR
+    // record fixes this depends on (the F32 GPU router matmul so the router
+    // is recorded instead of a stale host fallback — see
+    // kernels/matmul_f32_vec.cl — and the replay-path embedding-scale flush
+    // in InferenceEngine), record/replay output is bit-identical to
+    // immediate mode. Gated behind MIMIRMIND_MOE_DEVICE_TOPK (the device
+    // dispatch master switch) + kernel availability, evaluated per block so
+    // no layer can silently fall back to the host routing path mid-replay.
+    static const bool kDeviceTopK =
+        std::getenv("MIMIRMIND_MOE_DEVICE_TOPK") != nullptr;
+    if (!kDeviceTopK ||
+        !_ops.moeGateUpFusedKGeluAvailable(_config.embeddingLength)) {
+        return false;
+    }
+    try {
+        for (std::size_t b = 0; b < _config.blockCount; ++b) {
+            const auto* eg =
+                requireTensor(b, "ffn_gate_up_exps.weight", "Gemma4MoeBackend");
+            const auto* ed =
+                requireTensor(b, "ffn_down_exps.weight", "Gemma4MoeBackend");
+            if (eg->type != core::gguf::GgmlType::Q6_K ||
+                !_gmm.moeDownFusedKAvailable(ed->type)) {
+                return false;
+            }
+        }
+    } catch (...) {
+        return false;
+    }
+    return true;
 }
 
 } // namespace mimirmind::runtime::arch

@@ -71,4 +71,8 @@ void Gemma4Backend::prepareForward(std::span<const std::int32_t> tokIds,
     _impl->prepareForward(tokIds, hiddenStates, T);
 }
 
+bool Gemma4Backend::moeDecodeClrSafe() const noexcept {
+    return _impl->moeDecodeClrSafe();
+}
+
 } // namespace mimirmind::runtime::arch

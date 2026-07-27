@@ -121,6 +121,18 @@ public:
         return false;
     }
 
+    /// True when this MoE backend runs its decode block with fully
+    /// device-side expert dispatch — no host read of the routing between
+    /// the router matmul and the accumulator (M-CLR.MoE Increment 2). Such
+    /// a block is Command-List-Replay-capturable: InferenceEngine may then
+    /// enable CLR for the decode loop even though expertCount > 0. Dense
+    /// (expertCount == 0) backends never need this; the MoE default is
+    /// false (host routing bakes stale expert picks into the recording).
+    /// Gemma4MoeBackend overrides it to reflect the device-dispatch gate.
+    [[nodiscard]] virtual bool moeDecodeClrSafe() const noexcept {
+        return false;
+    }
+
     /// Enable per-stage parity dumps. PREFIX is the same string carried by
     /// `diagnostics.parityDump` in config.json: each stage writes a file at
     ///   <prefix>-blk{N}-<stage>.bin

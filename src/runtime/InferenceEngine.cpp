@@ -1362,38 +1362,55 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // recorded list — no per-token appendLaunch, no per-token
         // barrier setup, no per-kernel arg binding.
         const bool clrEnvOn = _cfg.features.clr;
-        // MoE models are NOT CLR-safe: `Gemma4MoeBackend::runBlock` picks
-        // top-K experts on the host per record via `cmp::moeTopKRoute`
-        // (reading the router matmul output on the CPU), and every
-        // per-expert matmul dispatch captures a fixed expert weight
-        // pointer + weight scale via setPtr/setValue at record time. At
-        // replay for steps 3+ the routing decision is frozen to step-2's
-        // hidden state — the recorded expert selection is stale, per-
-        // token attention degrades into a repetition loop, and the
-        // sampler emits noise tokens. Confirmed on L0_TARGET_HOST with
-        // Gemma 4 26B-A4B-it-Q6_K under both KvDtype::F32 and
-        // KvDtype::Q8_0. The router matmul is also synchronous
-        // (`_gmm->matmul`, not `matmulAsync`) which flushes the recording
-        // list mid-record — a second, subtler CLR breach. Both problems
-        // are structural to MoE and would need a GPU-side gather +
-        // stable-record refactor to fix cleanly; until that lands, MoE
-        // decode runs in immediate mode.
+        // MoE models were historically NOT CLR-safe: the host top-K path
+        // in `Gemma4MoeBackend::runBlock` (`cmp::moeTopKRoute` reading the
+        // router matmul output on the CPU) plus per-expert matmul dispatches
+        // that captured a fixed expert weight pointer via setPtr at record
+        // time meant steps 3+ replayed step-2's stale expert selection —
+        // repetition loop, noise tokens. Confirmed on L0_TARGET_HOST with
+        // Gemma 4 26B-A4B-it-Q6_K under both KvDtype::F32 and KvDtype::Q8_0.
+        //
+        // M-CLR.MoE Increment 2 removed that breach: with device expert
+        // dispatch (MIMIRMIND_MOE_DEVICE_TOPK) the router pick is read on
+        // the GPU (device top-K → device gate_up → fused-K down) and no host
+        // op touches the routing, so the block records cleanly and each
+        // replay re-derives the routing from the current hidden state. The
+        // router matmul being synchronous is NOT a breach: flush() is a
+        // no-op while recording (it early-returns on !_hasPending, which
+        // appendLaunch never sets during a record). The lift is gated per
+        // backend by `moeDecodeClrSafe()` below; a MoE model without device
+        // dispatch still runs immediate-mode decode.
         // Schicht 5.5 — CLR record/replay lives on the L0 CommandQueue.
         // HIP has no equivalent (hipGraph would be the door, but not
         // wired). Adding the kind-gate here disables every downstream
         // `l0Ops().queue()` / `curLenSlot()` call in the decode path
         // via the existing `if (clrEnabled)` blocks — one flag, all
         // sites covered.
+        // M-CLR.MoE Increment 3: an MoE backend running fully device-side
+        // expert dispatch (Increment 2) has no host routing read in the
+        // decode block, so the stale-expert breach above no longer applies
+        // and CLR may capture the block. Gated behind the backend's own
+        // moeDecodeClrSafe() so a host-routing fallback path can never be
+        // recorded.
+        const bool moeClrSafe =
+            _config.expertCount > 0 && _backend->moeDecodeClrSafe();
         const bool clrEnabled =
-            clrEnvOn && (_config.expertCount == 0) &&
+            clrEnvOn &&
+            (_config.expertCount == 0 || moeClrSafe) &&
             (_computeCtx->kind() == core::backend::BackendKind::LevelZero);
-        if (clrEnvOn && _config.expertCount > 0) {
+        if (clrEnvOn && _config.expertCount > 0 && !moeClrSafe) {
             MM_LOG_WARN("engine",
                         "features.clr=true requested but disabled "
-                        "for this MoE model (expertCount={}) — MoE "
-                        "routing bakes host-computed expert selections "
-                        "into the recording, which stales at replay. "
+                        "for this MoE model (expertCount={}) — CLR replay "
+                        "of the MoE decode block is not yet verified "
+                        "(see Gemma4MoeBackend::moeDecodeClrSafe). "
                         "Immediate-mode decode used instead.",
+                        _config.expertCount);
+        } else if (clrEnvOn && moeClrSafe) {
+            MM_LOG_INFO("engine",
+                        "features.clr=true — MoE decode is CLR-safe via "
+                        "device expert dispatch (expertCount={}); "
+                        "record/replay enabled",
                         _config.expertCount);
         }
 #ifdef MIMIRMIND_HAVE_L0
@@ -1517,9 +1534,20 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             // `clrEnabled` is forced to false above under the same guard.
 #ifdef MIMIRMIND_HAVE_L0
             if (clrEnabled && l0Ops().queue().hasRecording()) {
-                // Replay-only path. Update the shared USM slot so every
-                // recorded rope / attention / qkv_split / rmsnorm_qkv
-                // kernel sees the current KV-cache length.
+                // Replay-only path. `scaleEmbeddingIfNeeded` above queued a
+                // `mulScalarAsync` (embedding scale) into the IMMEDIATE list;
+                // the recorded block loop reads xBuf, so that scale must
+                // execute before replay() or block 0 reads the unscaled
+                // embedding and the whole step diverges. The step-1 record
+                // path below flushes for the same reason — E4B masks it via
+                // a flush inside prepareForward, but MoE / Dense have a
+                // no-op prepareForward and need this explicit drain. (Bug:
+                // MoE decode replay produced token noise from step 2 without
+                // this — M-CLR.MoE Increment 3 root cause.)
+                _ops->flush();
+                // Update the shared USM slot so every recorded rope /
+                // attention / qkv_split / rmsnorm_qkv kernel sees the
+                // current KV-cache length.
                 *l0Ops().curLenSlot() =
                     static_cast<std::int32_t>(cache.length());
                 l0Ops().queue().replay();

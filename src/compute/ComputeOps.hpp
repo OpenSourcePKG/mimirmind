@@ -348,6 +348,39 @@ public:
             "moeTopKRouteDeviceAsync: not supported on this backend");
     }
 
+    /// M-CLR.MoE Increment 2: device-indexed fused gate+up projection for
+    /// Gemma 4 MoE T=1 decode. Reads the router pick `expIdx[k]` on the
+    /// device (no host round-trip on the routing) and folds the per-expert
+    /// down-scale into the activation, so the companion fused-K down kernel
+    /// can take the raw router weight as `kw`. Together they remove every
+    /// host read of the routing from the decode MoE block — the
+    /// precondition for Command-List-Replay capture (Xe-LPG / NUC).
+    ///   gateActOut[k, f] = gelu_tanh(gate_f . x) * (up_f . x) * downScale[e]
+    /// with gate_f = row f, up_f = row (nFf + f) of expert e's fused
+    /// gate_up bank. Reference: the sequential (gate GEMV, up GEMV,
+    /// geluMul, downScale) host path. Default: unsupported; L0 overrides
+    /// for Q6_K expert banks.
+    virtual void moeGateUpFusedKGeluAsync(const float*        x,
+                                          const void*         W,
+                                          const std::int32_t* expIdx,
+                                          const float*        downScale,
+                                          float*              gateActOut,
+                                          std::size_t         dModel,
+                                          std::size_t         nFf,
+                                          std::size_t         kActive,
+                                          std::size_t         expertBytes) {
+        (void)x; (void)W; (void)expIdx; (void)downScale; (void)gateActOut;
+        (void)dModel; (void)nFf; (void)kActive; (void)expertBytes;
+        throw std::runtime_error(
+            "moeGateUpFusedKGeluAsync: not supported on this backend");
+    }
+
+    /// True when the fused device gate+up kernel is loaded and this dModel
+    /// fits its SLM-resident input ceiling. The caller must additionally
+    /// confirm the expert gate_up bank is Q6_K (the only type wired today).
+    [[nodiscard]] virtual bool moeGateUpFusedKGeluAvailable(
+        std::size_t /*dModel*/) const noexcept { return false; }
+
     /// In-place logistic sigmoid: y[i] = 1/(1+exp(-y[i])). GatedDeltaNet
     /// `beta` gate. Reference: compute::sigmoidInPlace.
     virtual void sigmoidInPlaceAsync(float* y, std::size_t n) = 0;

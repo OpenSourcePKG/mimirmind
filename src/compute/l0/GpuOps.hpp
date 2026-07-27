@@ -261,6 +261,27 @@ public:
 
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
 
+    void moeTopKRouteDeviceAsync(const float* logits,
+                                 std::int32_t* outIdx,
+                                 float*        outWeight,
+                                 std::size_t   T,
+                                 std::size_t   nExperts,
+                                 std::size_t   K,
+                                 float         wScale) override;
+
+    void moeGateUpFusedKGeluAsync(const float*        x,
+                                  const void*         W,
+                                  const std::int32_t* expIdx,
+                                  const float*        downScale,
+                                  float*              gateActOut,
+                                  std::size_t         dModel,
+                                  std::size_t         nFf,
+                                  std::size_t         kActive,
+                                  std::size_t         expertBytes) override;
+
+    [[nodiscard]] bool moeGateUpFusedKGeluAvailable(
+        std::size_t dModel) const noexcept override;
+
     void gatherHeadsFromChannelsAsync(const float* src,
                                       float*       dst,
                                       std::size_t  T,

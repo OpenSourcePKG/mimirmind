@@ -4,6 +4,8 @@
 #include "compute/l0/GpuOps.hpp"
 
 #include "compute/Attention.hpp"
+#include "compute/l0/MoeGateUpFusedKDevice.hpp"
+#include "compute/l0/MoeTopKRouteDevice.hpp"
 #include "core/gpu/l0/L0Context.hpp"
 #include "core/gpu/l0/L0ComputeContext.hpp"
 #include "core/log/Log.hpp"
@@ -142,7 +144,10 @@ struct GpuOps::Impl {
     runtime::GpuModule     _gatherHeadsModule;
     runtime::GpuKernel     _gatherHeadsKernel;
 
-    explicit Impl(core::l0::L0Context& ctx)
+    MoeTopKRouteDevice     _moeTopKRoute;
+    MoeGateUpFusedKDevice  _moeGateUpFused;
+
+    explicit Impl(core::l0::L0Context& ctx, core::l0::L0ComputeContext& cctx)
         : _rmsnormModule    {ctx, "rmsnorm"},
           _rmsnormKernel    {_rmsnormModule.kernel("rmsnorm")},
           _addBiasModule    {ctx, "add_bias"},
@@ -254,7 +259,9 @@ struct GpuOps::Impl {
               _sigmoidInplaceModule.kernel("sigmoid_inplace")},
           _gatherHeadsModule   {ctx, "gather_heads_from_channels"},
           _gatherHeadsKernel   {
-              _gatherHeadsModule.kernel("gather_heads_from_channels")}
+              _gatherHeadsModule.kernel("gather_heads_from_channels")},
+          _moeTopKRoute        {cctx},
+          _moeGateUpFused      {cctx}
     {}
 };
 
@@ -266,7 +273,7 @@ GpuOps::GpuOps(core::l0::L0ComputeContext& ctx,
     : _ctx{ctx.l0Context()},
       _queue{ctx.queue()},
       _alloc{ctx.allocator()},
-      _pimpl{std::make_unique<Impl>(ctx.l0Context())}
+      _pimpl{std::make_unique<Impl>(ctx.l0Context(), ctx)}
 {
     // Persistent FlashAttention partial-tile scratch. Sized for the
     // worst case across our target models; reused across every decode
@@ -908,6 +915,34 @@ void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
     _pimpl->_sigmoidInplaceKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
     _queue.appendLaunch(_pimpl->_sigmoidInplaceKernel,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::moeTopKRouteDeviceAsync(const float* logits,
+                                     std::int32_t* outIdx,
+                                     float*        outWeight,
+                                     std::size_t   T,
+                                     std::size_t   nExperts,
+                                     std::size_t   K,
+                                     float         wScale) {
+    _pimpl->_moeTopKRoute.launch(logits, outIdx, outWeight,
+                                 T, nExperts, K, wScale);
+}
+
+void GpuOps::moeGateUpFusedKGeluAsync(const float*        x,
+                                      const void*         W,
+                                      const std::int32_t* expIdx,
+                                      const float*        downScale,
+                                      float*              gateActOut,
+                                      std::size_t         dModel,
+                                      std::size_t         nFf,
+                                      std::size_t         kActive,
+                                      std::size_t         expertBytes) {
+    _pimpl->_moeGateUpFused.launch(x, W, expIdx, downScale, gateActOut,
+                                   dModel, nFf, kActive, expertBytes);
+}
+
+bool GpuOps::moeGateUpFusedKGeluAvailable(std::size_t dModel) const noexcept {
+    return _pimpl->_moeGateUpFused.supports(dModel);
 }
 
 void GpuOps::gatherHeadsFromChannelsAsync(const float* src,
