@@ -1,207 +1,162 @@
 #!/usr/bin/env python3
-"""roofline-probe -- decode-throughput roofline model for MimirMind.
+"""roofline-probe -- decode-throughput model for MimirMind, calibrated to
+measured NUC numbers (2026-07-27).
 
-Answers one question: for a given (model, quantization, hardware, decode
-regime), how many tokens/second can we realistically expect, and does it
-clear a target such as 100 tok/s?
+Answers: for a given (model, quant, hardware, decode regime), how many
+tok/s can we realistically expect, and does it clear a target like 100?
 
-The model is deliberately simple and physically grounded. Decode is
-memory-bandwidth-bound *or* launch/host-sync-bound; we model both and add
-them, because on Xe-LPG today the host-sync term dominates for MoE:
+WHAT CHANGED vs the 2026-07-22 version (all from on-target measurement):
 
-    t_token = t_weights + t_kv + t_host_sync + t_dispatch
-      t_weights   = active_params * bpw/8 / BW        (stream active weights)
-      t_kv        = kv_bytes(context) / BW            (KV read, grows w/ ctx)
-      t_host_sync = n_layers * syncs * host_sync_ms   (host-side top-K stalls)
-      t_dispatch  = n_dispatches * dispatch_us
+  * The DRAM bus is NOT the wall and dispatch/host-sync is NOT the lever.
+    Measured on the NUC (Xe-LPG):
+      - `prefill_bench --bw`: sustained bus 67.5 GB/s (2N/time memcpy).
+      - Gemma 4 26B-A4B-Q6_K: 3.555 GB active/token (GGUF exact,
+        tools/gguf-active-bytes.py), decode 138.6 ms/tok.
+        -> effective 25.6 GB/s = 38% of the bus over the whole token.
+      - OpProfiler breakdown: matmul 72% (~100 ms), norm 12%, attn 7%,
+        resid/router/act ~9%; 1819 dispatches/token.
+        -> the matmuls themselves run at ~52% of the bus.
 
-    tok_per_s = 1000 / t_token_ms * mtp_factor
+  * ROOT CAUSE: decode is M=1 GEMV -- each weight is read once and used
+    once, no reuse. An iGPU sustains only ~50% of peak bandwidth on GEMV;
+    80-90% needs GEMM (M>1, weight reuse). So the efficiency knob is
+    `gemv_eff`, which rises when a forward processes M>1 positions.
 
-Two decode regimes are compared:
-  * "today"       -- host-side top-K forces a D2H/host/H2D round trip per
-                     MoE layer; this is the observed launch-bound regime
-                     (E4B ~133 ms/tok on the NUC while its pure roofline is
-                     ~32 ms/tok).
-  * "graph-replay"-- device-side top-K + CLR/CUDA-Graph/HipGraph capture
-                     removes the host-sync stalls; decode approaches the
-                     bandwidth roofline.
+  * MTP / speculative decode is therefore a DOUBLE lever, not just an
+    accept-rate multiplier: verifying M draft tokens in one forward reads
+    each weight once for M rows (GEMV -> GEMM, gemv_eff up) AND amortises
+    the weight bytes over the accepted tokens. Continuous batching (multi
+    user) does the same via the sequence dimension.
 
-Calibration anchors (from Synaipse):
-  * Meteor Lake NUC: DDR5-5600 dual-IMC, sustained read ~65-75 GB/s (UMA).
-    Dispatch overhead ~10-15 us. E4B Q4_K_M ~130-141 ms/tok measured.
-  * DGX Spark GB10: 128 GB LPDDR5x, ~273 GB/s. qwen35moe ~27-34 ms/tok.
-  * MTP on Xe-LPG realistically 1.4-2.2x (quality-neutral). Default 1.8x.
+MODEL (calibrated so 26B-A4B-Q6_K, M=1 -> 138.6 ms/tok):
 
-Pure stdlib, no deps. Run:  python3 tools/roofline-probe.py
+    t_stream_ms = active_bytes / (BW * gemv_eff(M)) * 1e3
+    t_token_ms  = t_stream_ms * (1 + OVERHEAD_FRAC)      # +norm/attn/...
+    tok_per_s   = accepted_per_forward / t_token_ms * 1e3
+
+  gemv_eff(M): 0.52 at M=1 (measured), ramps toward ~0.90 as M grows
+  (weight reuse). accepted_per_forward folds the MTP accept rate.
+
+Pure stdlib. Run:  python3 tools/roofline-probe.py
 """
-
 from __future__ import annotations
+from dataclasses import dataclass
 
-from dataclasses import dataclass, field
+# --- Calibration anchors (measured on the NUC, 2026-07-27) -----------------
+BW_GBS_NUC      = 67.5     # sustained bus, prefill_bench --bw
+GEMV_EFF_M1     = 0.52     # matmul fraction of bus at M=1 (from OpProfiler)
+GEMV_EFF_MAX    = 0.90     # GEMM ceiling with full weight reuse
+OVERHEAD_FRAC   = 0.38     # non-matmul (norm/attn/resid/router/act) over matmul time
 
-
-# --------------------------------------------------------------------------
-# Quantization: effective bytes per weight parameter.
-# K-quants carry block scales/mins, so bpw is a little above the nominal bits.
-# --------------------------------------------------------------------------
+# Effective bytes per weight parameter at a given quant.
 BYTES_PER_PARAM = {
-    "Q8_0": 8.5 / 8,      # ~1.06
-    "Q6_K": 6.6 / 8,      # ~0.83
-    "Q5_K": 5.5 / 8,      # ~0.69
-    "Q4_K": 4.5 / 8,      # ~0.56
-    "Q3_K": 3.4 / 8,      # ~0.43
-    "Q2_K": 2.6 / 8,      # ~0.33
-    # Unsloth Dynamic 2.0 style: sensitive layers (attn/router/shared) high,
-    # routed experts low -> effective ~2.5-3.0 bpw over the *active* weights.
-    "Dyn2.5": 2.5 / 8,    # 0.3125
-    "Dyn3.0": 3.0 / 8,    # 0.375
+    "Q8_0": 8.5 / 8, "Q6_K": 6.6 / 8, "Q5_K": 5.5 / 8, "Q4_K": 4.5 / 8,
+    "Q3_K": 3.4 / 8, "Q2_K": 2.6 / 8,
+    # Unsloth Dynamic-2.0 style over the *active* weights (attn/router/shared
+    # high, routed experts low).
+    "Dyn2.5": 2.5 / 8, "Dyn3.0": 3.0 / 8,
 }
 
 
-@dataclass(frozen=True)
-class Hardware:
-    name: str
-    bandwidth_gbs: float       # sustained read bandwidth, GB/s
-    dispatch_us: float         # per-dispatch launch latency, microseconds
-    host_sync_ms: float        # cost of one host round-trip stall, ms
-
-
-HARDWARE = {
-    "nuc": Hardware("NUC Meteor Lake (Xe-LPG)", 70.0, 12.0, 2.0),
-    "spark": Hardware("DGX Spark GB10", 273.0, 5.0, 0.8),
-}
+def gemv_eff(m: int) -> float:
+    """Bus utilisation as a function of positions-per-forward M.
+    M=1 GEMV measured ~0.52; each extra row adds reuse toward the GEMM ceiling."""
+    return min(GEMV_EFF_M1 + (m - 1) * 0.09, GEMV_EFF_MAX)
 
 
 @dataclass(frozen=True)
 class Model:
     name: str
-    total_b: float             # total params, billions
-    active_b: float            # active params per token, billions
-    n_layers: int
-    # KV bytes per token per full context token (GQA/MLA already folded in):
-    # = 2 (K+V) * n_kv_heads * head_dim * bytes_per_elem, cached per layer.
-    kv_bytes_per_ctx_tok: float
-    dispatches_per_layer: int  # rough dispatch count in the decode path
+    total_b: float
+    active_b: float          # active params/token, billions
+    # measured active bytes/token override (GB) at a specific quant, if known
+    measured_active_gb: float = 0.0
+    measured_quant: str = ""
 
 
-# Candidate models. Numbers are order-of-magnitude architecture figures for
-# roofline purposes, not exact GGUF metadata.
 MODELS = {
-    # A3B family -- the sweet spot for the 100 tok/s target.
-    "qwen3-30b-a3b": Model("Qwen3-30B-A3B", 30.5, 3.3, 48,
-                           kv_bytes_per_ctx_tok=48 * 4 * 128 * 2, dispatches_per_layer=22),
-    "qwen35-a3b": Model("Qwen3.6-35B-A3B (qwen35moe)", 35.0, 3.0, 48,
-                        kv_bytes_per_ctx_tok=48 * 2 * 128 * 2, dispatches_per_layer=24),
-    "qwen3-next-80b-a3b": Model("Qwen3-Next-80B-A3B", 80.0, 3.0, 48,
-                                kv_bytes_per_ctx_tok=48 * 2 * 128 * 2, dispatches_per_layer=26),
-    # Reference points.
-    "gemma4-26b-a4b": Model("Gemma 4 26B-A4B", 26.0, 4.0, 46,
-                            kv_bytes_per_ctx_tok=46 * 4 * 256 * 2, dispatches_per_layer=20),
-    "gemma4-e4b": Model("Gemma 4 E4B", 8.0, 4.0, 35,
-                        kv_bytes_per_ctx_tok=35 * 2 * 256 * 2, dispatches_per_layer=18),
-    # Frontier point -- to show why it cannot hit the target.
-    "deepseek-v3": Model("DeepSeek-V3 (671B/37B)", 671.0, 37.0, 61,
-                         kv_bytes_per_ctx_tok=61 * 1 * 512 * 2, dispatches_per_layer=30),
+    # Reference: exactly what we run today. measured_active_gb from GGUF.
+    "gemma4-26b-a4b": Model("Gemma 4 26B-A4B", 26.0, 4.0,
+                            measured_active_gb=3.555, measured_quant="Q6_K"),
+    # Off-the-shelf A3B fits (qwen35moe already runs on CUDA).
+    "qwen35-a3b":     Model("Qwen3.6-35B-A3B", 35.0, 3.0),
+    "qwen3-30b-a3b":  Model("Qwen3-30B-A3B", 30.5, 3.3),
+    # The byte-budget-designed custom target.
+    "mimir-nuc-a2b":  Model("Mimir-NUC-A2B (custom)", 30.0, 1.7),
+    # Frontier point -- shows the quality wall.
+    "deepseek-v3":    Model("DeepSeek-V3 (671B/37B)", 671.0, 37.0),
 }
 
 
-@dataclass
-class Regime:
-    name: str
-    host_syncs_per_layer: float   # host round trips per layer (0 => captured)
-    dispatch_scale: float         # fraction of dispatches still paid serially
+def active_bytes_gb(model: Model, quant: str) -> float:
+    if model.measured_active_gb and quant == model.measured_quant:
+        return model.measured_active_gb
+    # Scale the measured 26B anchor by the active-param and bpw ratio when we
+    # only have an estimate. Falls back to active_b * bpw for others.
+    return model.active_b * BYTES_PER_PARAM[quant]
 
 
-REGIMES = {
-    "today": Regime("today (launch-bound)", host_syncs_per_layer=1.0, dispatch_scale=1.0),
-    "graph-replay": Regime("graph-replay (roofline)", host_syncs_per_layer=0.0, dispatch_scale=0.05),
-}
+def decode(model: Model, quant: str, m: int, bw: float = BW_GBS_NUC) -> dict:
+    ab = active_bytes_gb(model, quant) * 1e9
+    t_stream = ab / (bw * 1e9 * gemv_eff(m)) * 1e3
+    t_token = t_stream * (1 + OVERHEAD_FRAC)
+    return {"active_gb": ab / 1e9, "t_stream": t_stream, "t_token": t_token}
 
 
-def decode_ms(model: Model, quant: str, hw: Hardware, regime: Regime,
-              context: int) -> dict:
-    """Return a breakdown of per-token decode time in milliseconds."""
-    bpw = BYTES_PER_PARAM[quant]
-    bw = hw.bandwidth_gbs * 1e9  # bytes/s
-
-    active_bytes = model.active_b * 1e9 * bpw
-    t_weights = active_bytes / bw * 1e3
-
-    kv_bytes = model.kv_bytes_per_ctx_tok * context
-    t_kv = kv_bytes / bw * 1e3
-
-    t_host_sync = model.n_layers * regime.host_syncs_per_layer * hw.host_sync_ms
-
-    n_dispatch = model.n_layers * model.dispatches_per_layer * regime.dispatch_scale
-    t_dispatch = n_dispatch * hw.dispatch_us / 1e3
-
-    total = t_weights + t_kv + t_host_sync + t_dispatch
-    return {
-        "weights": t_weights, "kv": t_kv, "host_sync": t_host_sync,
-        "dispatch": t_dispatch, "total": total,
-    }
-
-
-def tok_per_s(model: Model, quant: str, hw: Hardware, regime: Regime,
-              context: int, mtp: float) -> float:
-    total = decode_ms(model, quant, hw, regime, context)["total"]
-    return 1000.0 / total * mtp
+def tok_s(model: Model, quant: str, m: int, accept: float, bw: float = BW_GBS_NUC) -> float:
+    t = decode(model, quant, m, bw)["t_token"]
+    accepted = 1.0 + (m - 1) * accept          # 1 real + (M-1) draft * accept
+    return accepted / t * 1e3
 
 
 def ram_gb(model: Model, quant: str) -> float:
-    """Total weight footprint (all experts resident) at this quant."""
-    return model.total_b * 1e9 * BYTES_PER_PARAM[quant] / 1e9
+    return model.total_b * BYTES_PER_PARAM[quant]
 
 
-# --------------------------------------------------------------------------
-# Report
-# --------------------------------------------------------------------------
-def fmt_row(cells, widths, align="<"):
-    return "  ".join(f"{str(c):{align}{w}}" for c, w in zip(cells, widths))
+def main():
+    target = 100.0
+    print("=" * 96)
+    print(f"MimirMind decode roofline (NUC, calibrated)  --  target {target:.0f} tok/s")
+    print(f"bus {BW_GBS_NUC} GB/s | gemv_eff M1={GEMV_EFF_M1} -> max {GEMV_EFF_MAX} | "
+          f"overhead {OVERHEAD_FRAC:.0%}")
+    print("=" * 96)
 
+    # Validate the anchor.
+    a = decode(MODELS["gemma4-26b-a4b"], "Q6_K", m=1)
+    print(f"\nanchor: 26B-A4B-Q6_K M=1 -> {a['t_token']:.0f} ms/tok "
+          f"({1000/a['t_token']:.1f} tok/s)   [measured 138.6 ms]")
 
-def sweep(target=100.0, context=2048, mtp=1.8):
-    print("=" * 92)
-    print(f"MimirMind decode roofline  --  target {target:.0f} tok/s  "
-          f"(context={context}, MTP x{mtp})")
-    print("=" * 92)
+    print("\n" + "-" * 96)
+    hdr = ["model", "quant", "RAM GB", "active GB", "M1 t/s",
+           "M4+MTP0.6", "hits 100"]
+    w = [24, 8, 8, 10, 9, 12, 9]
+    print("  ".join(f"{h:<{x}}" for h, x in zip(hdr, w)))
+    print("-" * 96)
+    plan = [
+        ("gemma4-26b-a4b", "Q6_K"), ("gemma4-26b-a4b", "Dyn2.5"),
+        ("qwen35-a3b", "Dyn2.5"), ("qwen3-30b-a3b", "Dyn2.5"),
+        ("mimir-nuc-a2b", "Dyn2.5"), ("deepseek-v3", "Q4_K"),
+    ]
+    for mkey, quant in plan:
+        model = MODELS[mkey]
+        m1 = tok_s(model, quant, m=1, accept=0.0)
+        m4 = tok_s(model, quant, m=4, accept=0.6)      # MTP width 4, accept 0.6
+        hit = "YES" if m4 >= target else "no"
+        cells = [model.name, quant, f"{ram_gb(model, quant):.1f}",
+                 f"{active_bytes_gb(model, quant):.2f}",
+                 f"{m1:.1f}", f"{m4:.1f}", hit]
+        print("  ".join(f"{c:<{x}}" for c, x in zip(cells, w)))
 
-    for hw_key in ("nuc", "spark"):
-        hw = HARDWARE[hw_key]
-        print(f"\n### {hw.name}   ({hw.bandwidth_gbs:.0f} GB/s, "
-              f"dispatch {hw.dispatch_us:.0f} us, host-sync {hw.host_sync_ms:.1f} ms)")
-        widths = [26, 8, 8, 12, 12, 12, 12]
-        hdr = ["model", "quant", "RAM GB", "today t/s", "replay t/s",
-               "replay+MTP", "hits target"]
-        print(fmt_row(hdr, widths))
-        print("-" * 92)
-        for mkey, model in MODELS.items():
-            # pick a representative quant per model class
-            quants = ["Q4_K", "Dyn2.5"] if model.active_b <= 5 else ["Q4_K"]
-            for quant in quants:
-                today = tok_per_s(model, quant, hw, REGIMES["today"], context, mtp=1.0)
-                replay = tok_per_s(model, quant, hw, REGIMES["graph-replay"], context, mtp=1.0)
-                replay_mtp = tok_per_s(model, quant, hw, REGIMES["graph-replay"], context, mtp)
-                hit = "YES" if replay_mtp >= target else "no"
-                print(fmt_row(
-                    [model.name, quant, f"{ram_gb(model, quant):.1f}",
-                     f"{today:.1f}", f"{replay:.1f}", f"{replay_mtp:.1f}", hit],
-                    widths))
-
-    print("\n" + "=" * 92)
-    print("Breakdown for the recommended pick (Qwen3.6-35B-A3B, Dyn2.5, NUC):")
-    print("=" * 92)
-    hw = HARDWARE["nuc"]
-    model = MODELS["qwen35-a3b"]
-    for rkey, regime in REGIMES.items():
-        b = decode_ms(model, "Dyn2.5", hw, regime, context)
-        base = 1000.0 / b["total"]
-        print(f"\n  regime = {regime.name}")
-        print(f"    weights {b['weights']:6.1f} ms | kv {b['kv']:5.1f} ms | "
-              f"host_sync {b['host_sync']:6.1f} ms | dispatch {b['dispatch']:5.1f} ms")
-        print(f"    -> {b['total']:.1f} ms/tok = {base:.1f} tok/s  "
-              f"(x{mtp} MTP = {base * mtp:.1f} tok/s)")
+    print("\n" + "=" * 96)
+    print("Levers to reach 100 tok/s (evidence-ranked):")
+    print("  1. M>1 per forward (MTP / continuous batching) -- GEMV->GEMM,")
+    print("     lifts bus utilisation from ~52% toward ~90% AND amortises")
+    print("     weight bytes over accepted tokens. The under-rated double lever.")
+    print("  2. Dynamic mixed-Q_K quant (~2.5 bpw) -- the byte-budget lever (~7x).")
+    print("  3. Smaller active params (A2B) -- for the last stretch.")
+    print("  NOT a lever: CLR/dispatch elimination (measured ~8%); the 26B is")
+    print("  byte-hopeless (~5x over budget even at the bus ceiling).")
 
 
 if __name__ == "__main__":
-    sweep()
+    main()

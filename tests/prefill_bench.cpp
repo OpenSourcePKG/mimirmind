@@ -76,6 +76,12 @@ struct Args {
     // (bucket_target, derived_tk) stay close.
     std::string promptFile;
     double      charsPerToken = 4.0;
+
+    // Bandwidth-probe mode (--bw): stream a large USM buffer via device
+    // memcpy to measure sustained UMA DRAM bandwidth, the roofline ceiling
+    // for decode weight streaming. Ignores the attention args above.
+    bool        bwProbe = false;
+    std::size_t bwMiB   = 1024;
 };
 
 void printHelp() {
@@ -124,6 +130,8 @@ Args parseArgs(int argc, char** argv) {
         else if (k == "--label"    ) a.label    = next();
         else if (k == "--prompt-file") a.promptFile = next();
         else if (k == "--cpt"      ) a.charsPerToken = std::stod(next());
+        else if (k == "--bw"       ) a.bwProbe  = true;
+        else if (k == "--bw-mib"   ) a.bwMiB    = std::stoull(next());
         else if (k == "-h" || k == "--help") {
             printHelp();
             std::exit(0);
@@ -256,6 +264,46 @@ int main(int argc, char** argv) {
     // directly for its own scratch allocations) unchanged.
     mimirmind::core::l0::UsmAllocator&    usm   { ctx.allocator() };
     mimirmind::runtime::CommandQueue&     queue { ctx.queue() };
+
+    // --- Bandwidth probe (--bw) --------------------------------------------
+    // Sustained UMA DRAM bandwidth via a large device memcpy. This is the
+    // roofline ceiling for decode: weight streaming is read-bound, so the
+    // read+write bus traffic (2N/time) bounds how fast active weights can be
+    // pulled per token. Compare against the effective decode bandwidth
+    // derived from a real ms/tok measurement (active_bytes / decode_time).
+    if (args.bwProbe) {
+        const std::size_t N = args.bwMiB * static_cast<std::size_t>(1024) * 1024;
+        void* src = usm.allocate(N);
+        void* dst = usm.allocate(N);
+        std::memset(src, 0x3c, N);
+        std::memset(dst, 0x00, N);
+
+        for (std::size_t w = 0; w < 3; ++w) {          // warmups
+            queue.appendMemoryCopy(dst, src, N);
+            queue.flush();
+        }
+        double best = 1e30;
+        const std::size_t reps = std::max<std::size_t>(args.iters, 10);
+        for (std::size_t r = 0; r < reps; ++r) {
+            const auto t0 = Clock::now();
+            queue.appendMemoryCopy(dst, src, N);
+            queue.flush();
+            const double ms =
+                std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            best = std::min(best, ms);
+        }
+        const double sec     = best / 1e3;
+        const double copyGbs  = (static_cast<double>(N) / 1e9) / sec;   // N moved
+        const double trafficGbs = (2.0 * static_cast<double>(N) / 1e9) / sec; // R+W
+        std::cout << "bw-probe: memcpy " << args.bwMiB << " MiB, best "
+                  << best << " ms\n"
+                  << "  copy-throughput  = " << copyGbs   << " GB/s (N/time)\n"
+                  << "  DRAM traffic     = " << trafficGbs << " GB/s (2N/time, read+write bus)\n"
+                  << "  -> decode read ceiling ~ " << trafficGbs << " GB/s (weights are read-only)\n";
+        usm.deallocate(src, N);
+        usm.deallocate(dst, N);
+        return 0;
+    }
 
     // KV bytes-per-row depend on the storage dtype. Q8_0 packs
     // (kvDim / 32) blocks per row * 34 B = ~34/128 = 27 % of the
