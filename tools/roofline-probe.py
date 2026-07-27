@@ -42,11 +42,20 @@ Pure stdlib. Run:  python3 tools/roofline-probe.py
 from __future__ import annotations
 from dataclasses import dataclass
 
-# --- Calibration anchors (measured on the NUC, 2026-07-27) -----------------
+# --- Calibration anchors (measured on the NUC, 2026-07-27..28) -------------
 BW_GBS_NUC      = 67.5     # sustained bus, prefill_bench --bw
 GEMV_EFF_M1     = 0.52     # matmul fraction of bus at M=1 (from OpProfiler)
 GEMV_EFF_MAX    = 0.90     # GEMM ceiling with full weight reuse
 OVERHEAD_FRAC   = 0.38     # non-matmul (norm/attn/resid/router/act) over matmul time
+
+# Speculative decode measured on 2026-07-28 (26B-A4B-Q6_K, ngram, 94-99%
+# accept, byte-identical): single-user MTP tops out at ~1.2x, NOT the 1.8x a
+# pure roofline predicts. The verify round costs ~2x an equal prefill forward
+# (MoE host-permutation + mid-generation KV attention per forward), so the
+# small-batch GEMV->GEMM win is eaten. The full gemv_eff(M) win below is
+# therefore the CONTINUOUS-BATCHING model (M concurrent streams sharing the
+# weight read), which is where the ~3x actually lands -- the serving lever.
+MTP_SINGLE_USER = 1.2     # measured cap, single-user speculative decode
 
 # Effective bytes per weight parameter at a given quant.
 BYTES_PER_PARAM = {
@@ -126,10 +135,13 @@ def main():
     print(f"\nanchor: 26B-A4B-Q6_K M=1 -> {a['t_token']:.0f} ms/tok "
           f"({1000/a['t_token']:.1f} tok/s)   [measured 138.6 ms]")
 
-    print("\n" + "-" * 96)
-    hdr = ["model", "quant", "RAM GB", "active GB", "M1 t/s",
-           "M4+MTP0.6", "hits 100"]
-    w = [24, 8, 8, 10, 9, 12, 9]
+    print("\n  single-user t/s (M1/+MTP measured-calibrated) | continuous-batching (MODELLED)")
+    print("  NOTE: the B8 columns are a projection (gemv_eff weight-reuse model, no")
+    print("  compute-floor); the real batching ceiling is NOT yet measured on L0.")
+    print("-" * 96)
+    hdr = ["model", "quant", "RAM GB", "act GB", "M1", "+MTP1.2",
+           "B8/strm", "B8 agg", "100?"]
+    w = [22, 8, 7, 7, 6, 8, 8, 8, 5]
     print("  ".join(f"{h:<{x}}" for h, x in zip(hdr, w)))
     print("-" * 96)
     plan = [
@@ -137,24 +149,31 @@ def main():
         ("qwen35-a3b", "Dyn2.5"), ("qwen3-30b-a3b", "Dyn2.5"),
         ("mimir-nuc-a2b", "Dyn2.5"), ("deepseek-v3", "Q4_K"),
     ]
+    B = 8
     for mkey, quant in plan:
         model = MODELS[mkey]
-        m1 = tok_s(model, quant, m=1, accept=0.0)
-        m4 = tok_s(model, quant, m=4, accept=0.6)      # MTP width 4, accept 0.6
-        hit = "YES" if m4 >= target else "no"
+        m1 = tok_s(model, quant, m=1, accept=0.0)      # single-user decode
+        mtp = m1 * MTP_SINGLE_USER                     # single-user + spec-dec (measured cap)
+        strm = tok_s(model, quant, m=B, accept=0.0)    # per-stream in a B-way batch
+        agg = strm * B                                 # server aggregate throughput
+        # "hits 100" = single-user MTP OR per-stream in an 8-way batch clears it
+        hit = "YES" if (mtp >= target or strm >= target) else "no"
         cells = [model.name, quant, f"{ram_gb(model, quant):.1f}",
                  f"{active_bytes_gb(model, quant):.2f}",
-                 f"{m1:.1f}", f"{m4:.1f}", hit]
+                 f"{m1:.0f}", f"{mtp:.0f}", f"{strm:.0f}", f"{agg:.0f}", hit]
         print("  ".join(f"{c:<{x}}" for c, x in zip(cells, w)))
 
     print("\n" + "=" * 96)
-    print("Levers to reach 100 tok/s (evidence-ranked):")
-    print("  1. M>1 per forward (MTP / continuous batching) -- GEMV->GEMM,")
-    print("     lifts bus utilisation from ~52% toward ~90% AND amortises")
-    print("     weight bytes over accepted tokens. The under-rated double lever.")
+    print("Levers to reach 100 tok/s (evidence-ranked, 2026-07-28):")
+    print("  1. CONTINUOUS BATCHING (multi-user) -- B streams share each weight")
+    print("     read AND turn GEMV into GEMM (~52% -> ~90% bus). The real serving")
+    print("     lever; where the ~3x actually lands. (per-stream 't/s' in the B8")
+    print("     column; aggregate = B8 agg.)")
     print("  2. Dynamic mixed-Q_K quant (~2.5 bpw) -- the byte-budget lever (~7x).")
     print("  3. Smaller active params (A2B) -- for the last stretch.")
-    print("  NOT a lever: CLR/dispatch elimination (measured ~8%); the 26B is")
+    print("  MODEST: single-user speculative decode -- measured ~1.2x on 26B MoE")
+    print("     (not the 1.8x a pure roofline predicts; verify-round overhead).")
+    print("  NOT a lever: CLR/dispatch elimination (measured ~8%). The 26B is")
     print("  byte-hopeless (~5x over budget even at the bus ceiling).")
 
 
