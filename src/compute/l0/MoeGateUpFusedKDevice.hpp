@@ -41,7 +41,7 @@ public:
     // Mirror MOE_GU_XMAX in the kernel — the SLM-resident X ceiling. A
     // dModel above this must fall back to the host path (the launcher
     // returns false from available()/throws so the caller can catch).
-    static constexpr std::size_t kMaxDModel = 4096;
+    static constexpr std::size_t kMaxDModel = 2560;
 
     explicit MoeGateUpFusedKDevice(core::l0::L0ComputeContext& ctx);
 

@@ -66,11 +66,13 @@
 
 #define MOE_GU_OUTPUTS_PER_GROUP (MOE_GU_LOCAL / MOE_GU_SG)
 
-// Max reduction width held in SLM. Gemma 4 26B-A4B has dModel = 2560; leave
-// headroom for larger siblings. The launcher guards this ceiling and falls
-// back to the host path above it.
+// Max reduction width held in SLM. Sized to Gemma 4 26B-A4B's dModel =
+// 2560 (10 KiB): a tighter SLM footprint than the earlier 4096 lifts
+// occupancy (more concurrent work-groups per sub-slice) on the
+// bandwidth/latency-bound decode. The launcher guards this ceiling and
+// falls back to the host path for any dModel above it.
 #ifndef MOE_GU_XMAX
-#define MOE_GU_XMAX 4096
+#define MOE_GU_XMAX 2560
 #endif
 
 #define Q6K_BLOCK_ELEMENTS 256
