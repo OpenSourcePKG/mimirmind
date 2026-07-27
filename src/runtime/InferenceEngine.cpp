@@ -1232,9 +1232,39 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // the block loop starts.
         _backend->prepareForward(prefillIds, xBuf, prefillCount);
 
+        // L0 long-prefill wedge guard. runBlock() only submits async ops
+        // and never flushes, so a whole multi-block prefill otherwise
+        // piles into one immediate command list whose final
+        // zeCommandQueueSynchronize never returns above ~370-520 prompt
+        // tokens on Xe-LPG (100% CPU busy-poll — the L0-long-prefill-hang;
+        // reproduced at 519 tokens, hung >5 min). Draining the queue once
+        // per block bounds the in-flight command list and makes it
+        // complete — the same side effect that the per-op-category flush
+        // in OpProfiler (diagnostics.traceOpTimes=true) had, which is why
+        // tracing masked the hang.
+        //
+        // The drain is NOT free: it breaks the cross-block submission
+        // pipelining that keeps the Xe-LPG queue busy without host
+        // round-trips, so an always-on per-block flush drags a 149-token
+        // prefill from ~0.12 s to ~10 s (measured). We therefore gate it
+        // on prompt length: short prompts (the common interactive-chat
+        // case) keep the fast single-flush path with zero regression;
+        // only long prompts — which are exactly the ones that wedge, and
+        // were already multi-second on the pre-Bragi build — pay for
+        // safety. Prompts up to ~260 tokens completed unflushed in every
+        // test; the threshold sits below that. Reducing the large-prompt
+        // cost (chunked prefill / double-buffered command lists) is a
+        // follow-up. Decode is a single small block replayed via CLR
+        // (self-syncs), so it never reaches this loop.
+        constexpr std::size_t kPrefillDrainThreshold = 256;
+        const bool drainPerBlock = prefillCount > kPrefillDrainThreshold;
+
         for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
             _backend->runBlock(b, xBuf, prefillCount, cache, buffers,
                                _traceBlock0);
+            if (drainPerBlock) {
+                _ops->flush();
+            }
             if (onPrefillProgress) {
                 const auto now = clock::now();
                 const double elapsedMs =
