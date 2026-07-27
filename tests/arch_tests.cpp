@@ -508,6 +508,51 @@ TEST(responseCleaner_qwen_dropsEmptyText) {
     EXPECT_TRUE(!c.feed(kFakeTextId, empty));
 }
 
+TEST(responseCleaner_qwen_stripsThinkingBlock) {
+    // Qwen3 thinking models (qwen35moe) pre-open <think> in the prompt, so the
+    // response begins inside the block and closes it with the first </think>,
+    // emitted as literal text. A non-negative channelStartId marks the model as
+    // thinking-capable. The cleaner swallows content + </think> and surfaces
+    // only the post-</think> answer, stripping the trailing newlines.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::QwenChatML, /*thinkId=*/1, -1};
+
+    std::string out;
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId, "Let me reason", out));
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId, "</think>",      out));
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId, "\n\n",          out));
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId,  "The answer",    out));
+    EXPECT_EQ(out, std::string{"The answer"});
+}
+
+TEST(responseCleaner_qwen_thinkTagsSplitAcrossTokens) {
+    // The </think> closer can arrive split across tokens ("</thin" + "k>").
+    // The state machine must still recognise it.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::QwenChatML, /*thinkId=*/1, -1};
+
+    std::string out;
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId, "reasoning</", out));
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId, "thin",        out));
+    EXPECT_TRUE(feedAndCapture(c,  kFakeTextId, "k>Paris",     out));
+    EXPECT_EQ(out, std::string{"Paris"});
+}
+
+TEST(responseCleaner_qwen_noThinkPassesThrough) {
+    // A response that does NOT open with <think> (Qwen2/2.5 or thinking off)
+    // must pass through verbatim, including leading whitespace.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::QwenChatML, -1, -1};
+
+    std::string out;
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId, "The capital ", out));
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId, "is Paris.",    out));
+    EXPECT_EQ(out, std::string{"The capital is Paris."});
+}
+
 TEST(responseCleaner_gemma3_passThrough) {
     // Gemma 3 has no thinking-channel wrapper, so the cleaner is a no-op
     // even though the IDs were supplied.

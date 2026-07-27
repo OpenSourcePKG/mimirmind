@@ -355,10 +355,24 @@ std::string
 ChatTemplate::cleanResponse(Style style, std::string_view text) {
     std::string out{text};
     switch (style) {
-        case Style::QwenChatML:
-            // Decoder already drops <|im_end|> via stopIds; nothing else
-            // structural sits in the visible content.
+        case Style::QwenChatML: {
+            // Qwen3 "thinking" models (qwen35moe) have <think> pre-opened in
+            // the generation prompt, so the response starts INSIDE the thinking
+            // block and closes it with a lone </think>. Drop everything up to
+            // and including that closer, then any leading whitespace. Qwen2/2.5
+            // never emit </think>, so this is a no-op there. <|im_end|> is
+            // already removed upstream via stopIds.
+            constexpr std::string_view kThinkEnd{"</think>"};
+            const auto end = out.find(kThinkEnd);
+            if (end != std::string::npos) {
+                out.erase(0, end + kThinkEnd.size());
+                while (!out.empty() && (out.front() == '\n' || out.front() == ' ' ||
+                                        out.front() == '\t' || out.front() == '\r')) {
+                    out.erase(0, 1);
+                }
+            }
             return out;
+        }
         case Style::Gemma3:
             stripTrailing(out, kGemma3EndOfTurn);
             return out;
