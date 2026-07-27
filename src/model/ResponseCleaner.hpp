@@ -53,16 +53,24 @@ public:
     /// without dragging in Tokenizer.cpp.
     [[nodiscard]] static inline ResponseCleaner
     forStyle(ChatTemplate::Style style, const Tokenizer& tok) {
-        if (style != ChatTemplate::Style::Gemma4) {
-            return ResponseCleaner{style, -1, -1};
+        if (style == ChatTemplate::Style::Gemma4) {
+            constexpr std::string_view kChannelStart{"<|channel>"};
+            constexpr std::string_view kChannelEnd  {"<channel|>"};
+            return ResponseCleaner{
+                style,
+                tok.findToken(kChannelStart),
+                tok.findToken(kChannelEnd),
+            };
         }
-        constexpr std::string_view kChannelStart{"<|channel>"};
-        constexpr std::string_view kChannelEnd  {"<channel|>"};
-        return ResponseCleaner{
-            style,
-            tok.findToken(kChannelStart),
-            tok.findToken(kChannelEnd),
-        };
+        // QwenChatML: qwen35moe pre-opens <think> in the generation prompt
+        // (ChatTemplate::encodeQwen), so the response begins INSIDE the thinking
+        // block and its content up to the first </think> is reasoning to drop.
+        // The strip is string-based (see feed) — the tags arrive as literal
+        // text, sometimes split across tokens, so token-id matching is
+        // unreliable. Gate it on the model actually having a <think> token:
+        // findToken>=0 means thinking is pre-opened; Qwen2/2.5 (no such token,
+        // -1) get pure pass-through so a normal answer is never swallowed.
+        return ResponseCleaner{style, tok.findToken("<think>"), -1};
     }
 
     /// Decide whether the decoded text for `tokenId` reaches the client.
@@ -74,11 +82,21 @@ public:
     [[nodiscard]] bool feed(std::int32_t tokenId, std::string& text);
 
 private:
+    // Streaming strip of the pre-opened Qwen thinking block. InThink: swallow
+    // until the first </think> closer; Done: pass-through (also the initial
+    // state for non-thinking Qwen2/2.5).
+    enum class ThinkPhase { InThink, Done };
+
+    bool feedGemma4(std::int32_t tokenId, std::string& text);
+    bool feedQwenThink(std::string& text);
+
     ChatTemplate::Style _style;
     std::int32_t        _channelStartId;
     std::int32_t        _channelEndId;
     bool                _inChannel    {false};
     bool                _stripLeading {false};
+    ThinkPhase          _thinkPhase   {ThinkPhase::Done};
+    std::string         _pending;
 };
 
 } // namespace mimirmind::model
