@@ -41,6 +41,13 @@
 // only the fused activation + downScale multiply are new. Parity target is
 // the sequential (gate GEMV, up GEMV, gelu_mul) path in Gemma4MoeBackend.
 //
+// v2 (perf): the gate-row dot and the up-row dot share ONE super-block
+// traversal — the two rows multiply the same x, so each x super-block is
+// read from SLM once and used for both dequant-mads. Separate Kahan
+// accumulators keep each dot's add-order identical to the two-pass v1, so
+// the result stays bit-for-bit the same; it just halves the loop control
+// and SLM traffic.
+//
 // The whole X vector lives in SLM (it is identical across all K experts,
 // unlike the down kernel where each k has its own gate-activation slice).
 // Capped by MOE_GU_XMAX; the launcher falls back to the host path when
@@ -59,9 +66,9 @@
 
 #define MOE_GU_OUTPUTS_PER_GROUP (MOE_GU_LOCAL / MOE_GU_SG)
 
-// Max reduction width held in SLM (4 KiB * 4 = 16 KiB). Gemma 4 26B-A4B
-// has dModel = 2560; leave headroom for larger d_model siblings. The
-// launcher guards this ceiling and falls back to the host path above it.
+// Max reduction width held in SLM. Gemma 4 26B-A4B has dModel = 2560; leave
+// headroom for larger siblings. The launcher guards this ceiling and falls
+// back to the host path above it.
 #ifndef MOE_GU_XMAX
 #define MOE_GU_XMAX 4096
 #endif
@@ -69,76 +76,118 @@
 #define Q6K_BLOCK_ELEMENTS 256
 #define Q6K_BLOCK_BYTES    210
 
-// Kahan-compensated Q6_K row dot for one sub-group lane. Returns this
-// lane's partial (a sub_group_reduce_add across the 16 lanes gives the
-// full dot). Reads nothing when !active so out-of-range rows are never
-// touched. Byte layout + arithmetic copied verbatim from matmul_q6k_vec.cl.
-static inline float q6k_row_lane_dot(__local const float* xTile,
-                                     __global const uchar* row,
-                                     int nSuper,
-                                     int sgLocal,
-                                     bool active)
+// Fused Kahan-compensated Q6_K dot of BOTH the gate row and the up row for
+// one sub-group lane, sharing the super-block traversal + x-SLM reads. Each
+// accumulator keeps the exact add order of the single-row matmul_q6k_vec so
+// `outG`/`outU` are bit-identical to two separate q6k row dots. Reads
+// nothing when !active. A sub_group_reduce_add over the 16 lanes gives each
+// full dot.
+static inline void q6k_two_row_lane_dot(__local const float* xTile,
+                                        __global const uchar* gRow,
+                                        __global const uchar* uRow,
+                                        int nSuper,
+                                        int sgLocal,
+                                        bool active,
+                                        float* outG,
+                                        float* outU)
 {
     if (!active) {
-        return 0.0f;
+        *outG = 0.0f;
+        *outU = 0.0f;
+        return;
     }
 
-    float          sum = 0.0f;
-    volatile float kc  = 0.0f;
+    float          sumG = 0.0f, sumU = 0.0f;
+    volatile float kcG  = 0.0f, kcU  = 0.0f;
 
     for (int sb = 0; sb < nSuper; ++sb) {
-        __global const uchar* block = row + sb * Q6K_BLOCK_BYTES;
+        __global const uchar* gblock = gRow + sb * Q6K_BLOCK_BYTES;
+        __global const uchar* ublock = uRow + sb * Q6K_BLOCK_BYTES;
 
-        __global const uchar* ql = block;                 // 128 bytes
-        __global const uchar* qh = block + 128;           // 64 bytes
-        __global const char*  sc = (__global const char*)(block + 192);
-        const float d = vload_half(0, (__global const half*)(block + 208));
+        __global const uchar* gql = gblock;                 // 128 bytes
+        __global const uchar* gqh = gblock + 128;           // 64 bytes
+        __global const char*  gsc = (__global const char*)(gblock + 192);
+        const float gd = vload_half(0, (__global const half*)(gblock + 208));
+
+        __global const uchar* uql = ublock;
+        __global const uchar* uqh = ublock + 128;
+        __global const char*  usc = (__global const char*)(ublock + 192);
+        const float ud = vload_half(0, (__global const half*)(ublock + 208));
 
         const int xBase = sb * Q6K_BLOCK_ELEMENTS;
 
         for (int hIdx = 0; hIdx < 2; ++hIdx) {
             const int xHalfBase = xBase + hIdx * 128;
-            __global const uchar* qlp = ql + hIdx * 64;
-            __global const uchar* qhp = qh + hIdx * 32;
-            __global const char*  scp = sc + hIdx * 8;
+            __global const uchar* gqlp = gql + hIdx * 64;
+            __global const uchar* gqhp = gqh + hIdx * 32;
+            __global const char*  gscp = gsc + hIdx * 8;
+            __global const uchar* uqlp = uql + hIdx * 64;
+            __global const uchar* uqhp = uqh + hIdx * 32;
+            __global const char*  uscp = usc + hIdx * 8;
 
             for (int l = sgLocal; l < 32; l += MOE_GU_SG) {
                 const int is = l / 16;
 
-                const char q1 = (char)((qlp[l +  0] & 0x0F) |
-                                       (((qhp[l] >> 0) & 0x03) << 4)) - 32;
-                const char q2 = (char)((qlp[l + 32] & 0x0F) |
-                                       (((qhp[l] >> 2) & 0x03) << 4)) - 32;
-                const char q3 = (char)((qlp[l +  0] >> 4) |
-                                       (((qhp[l] >> 4) & 0x03) << 4)) - 32;
-                const char q4 = (char)((qlp[l + 32] >> 4) |
-                                       (((qhp[l] >> 6) & 0x03) << 4)) - 32;
+                // Shared x reads (same for gate + up).
+                const float x0  = xTile[xHalfBase + l +  0];
+                const float x32 = xTile[xHalfBase + l + 32];
+                const float x64 = xTile[xHalfBase + l + 64];
+                const float x96 = xTile[xHalfBase + l + 96];
 
-                const float s0 = d * (float)scp[is + 0];
-                const float s2 = d * (float)scp[is + 2];
-                const float s4 = d * (float)scp[is + 4];
-                const float s6 = d * (float)scp[is + 6];
-
-                #define KAHAN_ADD(term)                                       \
+                #define KAHAN(dst, comp, term)                                \
                     do {                                                      \
-                        const float _y = (term) - kc;                         \
-                        const float _t = sum + _y;                            \
-                        kc  = (_t - sum) - _y;                                \
-                        sum = _t;                                             \
+                        const float _y = (term) - (comp);                     \
+                        const float _t = (dst) + _y;                          \
+                        (comp) = (_t - (dst)) - _y;                           \
+                        (dst)  = _t;                                          \
                     } while (0)
 
-                KAHAN_ADD(xTile[xHalfBase + l +  0] * (s0 * (float)q1));
-                KAHAN_ADD(xTile[xHalfBase + l + 32] * (s2 * (float)q2));
-                KAHAN_ADD(xTile[xHalfBase + l + 64] * (s4 * (float)q3));
-                KAHAN_ADD(xTile[xHalfBase + l + 96] * (s6 * (float)q4));
+                // --- gate row (same add order as v1's first pass) ---
+                {
+                    const char q1 = (char)((gqlp[l +  0] & 0x0F) |
+                                           (((gqhp[l] >> 0) & 0x03) << 4)) - 32;
+                    const char q2 = (char)((gqlp[l + 32] & 0x0F) |
+                                           (((gqhp[l] >> 2) & 0x03) << 4)) - 32;
+                    const char q3 = (char)((gqlp[l +  0] >> 4) |
+                                           (((gqhp[l] >> 4) & 0x03) << 4)) - 32;
+                    const char q4 = (char)((gqlp[l + 32] >> 4) |
+                                           (((gqhp[l] >> 6) & 0x03) << 4)) - 32;
+                    const float s0 = gd * (float)gscp[is + 0];
+                    const float s2 = gd * (float)gscp[is + 2];
+                    const float s4 = gd * (float)gscp[is + 4];
+                    const float s6 = gd * (float)gscp[is + 6];
+                    KAHAN(sumG, kcG, x0  * (s0 * (float)q1));
+                    KAHAN(sumG, kcG, x32 * (s2 * (float)q2));
+                    KAHAN(sumG, kcG, x64 * (s4 * (float)q3));
+                    KAHAN(sumG, kcG, x96 * (s6 * (float)q4));
+                }
+                // --- up row (same add order as v1's second pass) ---
+                {
+                    const char q1 = (char)((uqlp[l +  0] & 0x0F) |
+                                           (((uqhp[l] >> 0) & 0x03) << 4)) - 32;
+                    const char q2 = (char)((uqlp[l + 32] & 0x0F) |
+                                           (((uqhp[l] >> 2) & 0x03) << 4)) - 32;
+                    const char q3 = (char)((uqlp[l +  0] >> 4) |
+                                           (((uqhp[l] >> 4) & 0x03) << 4)) - 32;
+                    const char q4 = (char)((uqlp[l + 32] >> 4) |
+                                           (((uqhp[l] >> 6) & 0x03) << 4)) - 32;
+                    const float s0 = ud * (float)uscp[is + 0];
+                    const float s2 = ud * (float)uscp[is + 2];
+                    const float s4 = ud * (float)uscp[is + 4];
+                    const float s6 = ud * (float)uscp[is + 6];
+                    KAHAN(sumU, kcU, x0  * (s0 * (float)q1));
+                    KAHAN(sumU, kcU, x32 * (s2 * (float)q2));
+                    KAHAN(sumU, kcU, x64 * (s4 * (float)q3));
+                    KAHAN(sumU, kcU, x96 * (s6 * (float)q4));
+                }
 
-                #undef KAHAN_ADD
+                #undef KAHAN
             }
         }
     }
 
-    sum += kc;
-    return sum;
+    *outG = sumG + kcG;
+    *outU = sumU + kcU;
 }
 
 __attribute__((reqd_work_group_size(MOE_GU_LOCAL, 1, 1)))
@@ -186,10 +235,9 @@ __kernel void moe_gateup_fused_k_q6k(
         __global const uchar* upRow =
             Wexpert + (size_t)(nFf + f) * (size_t)rowBytes;
 
-        const float laneG = q6k_row_lane_dot(xTile, gateRow, nSuper,
-                                             sgLocal, active);
-        const float laneU = q6k_row_lane_dot(xTile, upRow, nSuper,
-                                             sgLocal, active);
+        float laneG, laneU;
+        q6k_two_row_lane_dot(xTile, gateRow, upRow, nSuper,
+                             sgLocal, active, &laneG, &laneU);
 
         const float g = sub_group_reduce_add(laneG);
         const float u = sub_group_reduce_add(laneU);
