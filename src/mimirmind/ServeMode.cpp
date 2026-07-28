@@ -97,13 +97,17 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 #endif
 
     std::optional<::mimirmind::core::os::GovernorLock> governorLock;
-    // The MIMIRMIND_SERVING_PARITY dev hook exits before the HTTP server
-    // starts, so it needs neither the thermal governor nor exclusive
-    // ownership — skip the flock so a parity check can run alongside a
-    // live serve worker (subject to host memory).
+    // These dev/bench hooks exit before the HTTP server starts, so they
+    // need neither the thermal governor nor exclusive ownership — skip the
+    // flock so they can run alongside a live serve/Munin worker (subject to
+    // host memory). MIMIRMIND_L0_BATCH (the L0 synchronized batched-decode
+    // parity+perf hook) is one of them: without this it would fail the
+    // GovernorLock::tryAcquire while Munin holds the lock and never reach
+    // the bench block below.
     const bool servingParity =
         std::getenv("MIMIRMIND_SERVING_PARITY") != nullptr ||
-        std::getenv("MIMIRMIND_BATCH_BENCH") != nullptr;
+        std::getenv("MIMIRMIND_BATCH_BENCH")    != nullptr ||
+        std::getenv("MIMIRMIND_L0_BATCH")       != nullptr;
     if (!attachedMode && !servingParity) {
         auto lk = ::mimirmind::core::os::GovernorLock::tryAcquire();
         if (!lk) {
