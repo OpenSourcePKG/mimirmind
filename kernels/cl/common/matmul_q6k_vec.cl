@@ -10,7 +10,20 @@
 // also recovers most of Kahan's precision without the volatile traffic.
 // Measured +11.9% end-to-end decode on Qwen2.5-1.5B-Q4_K_M (its
 // down_proj/output are Q6_K) on Xe-LPG (RP0); startup vec-parity maxDiff
-// 1.9e-4, well inside the gate. Also speeds the 26B expert-down decode.
+// ~2e-4, well inside the gate. Also speeds the 26B expert-down decode.
+//
+// Subgroup size 8 (NOT the 16 the other vec kernels use). Q6_K's 6-bit
+// dequant is register-heavy; SG=8 gives each lane 4 inner positions
+// instead of 2 (K/8 reduction), so more independent loads are in flight
+// per thread to hide latency, and the heavy dequant amortises over more
+// work per thread. Measured +5.6% over the SG=16 variant on Qwen2.5-1.5B
+// (parity unchanged). Widening the loads instead (uchar2/float2) regressed
+// −9.5% — for register-heavy formats the geometry is the lever, not load
+// width. NOTE: the host (GpuMatmul kOutputsPerGroup = kLocalSize/16 = 4)
+// still launches ceil(N/4) workgroups; with 8 outputs/WG here that is a 2x
+// workgroup over-launch whose extra groups all take the `n >= N` early
+// return — free on Xe-LPG (empty-workgroup execution costs nothing). No
+// host change needed; results are byte-correct (parity-gated at startup).
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
@@ -20,7 +33,7 @@
 #endif
 
 #ifndef MATMUL_Q6K_SG
-#define MATMUL_Q6K_SG 16
+#define MATMUL_Q6K_SG 8
 #endif
 
 #define MATMUL_Q6K_OUTPUTS_PER_GROUP (MATMUL_Q6K_LOCAL / MATMUL_Q6K_SG)
