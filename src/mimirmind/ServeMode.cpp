@@ -462,6 +462,31 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             const std::size_t promptLen = base.size();
 
             try {
+                // --- Q6_K prefill probe: a long prompt drives the block
+                // matmuls at M=promptLen (>=16) so the Q6_K GEMM engages
+                // (gemmMinM=16). Run under gemm-on vs gemm-disable configs
+                // to A/B the prefill time; the greedy output must be
+                // identical across configs (GEMM numerically correct in
+                // situ). onPrefillDone isolates the prefill wall-time.
+                {
+                    std::vector<std::int32_t> longP;
+                    while (longP.size() < 96) {
+                        longP.insert(longP.end(), base.begin(), base.end());
+                    }
+                    ::mimirmind::runtime::GenerateParams gpp{};
+                    gpp.maxNewTokens         = 8;
+                    gpp.sampling.temperature = 0.0F;
+                    double prefillMs = 0.0;
+                    auto onPre = [&](const auto& d) { prefillMs = d.prefillMs; };
+                    e->resetCache();
+                    auto pout = e->generate(longP, gpp, {}, nullptr, onPre, {});
+                    std::cout << "\n[M-L0.Batch prefill] promptLen=" << longP.size()
+                              << " prefill_ms=" << prefillMs << " gen8=";
+                    for (auto t : pout) std::cout << ' ' << t;
+                    std::cout << "\n";
+                    std::cout.flush();
+                }
+
                 // --- (1c) greedy parity: batched nSeq in {1,2,4} vs single ---
                 // nSeq=1 isolates the batched-attention MATH (M=1 -> same
                 // vec kernels as single-seq) from the M>1 GEMM-vs-GEMV
