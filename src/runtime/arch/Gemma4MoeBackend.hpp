@@ -44,6 +44,17 @@ public:
                   BlockBuffers& s,
                   bool          traceBlock0) override;
 
+    /// M-L0.Batch Phase 1 — synchronized batched decode of `nSeq`
+    /// lock-step sequences. Runs the batched attention section
+    /// (GemmaBaseBackend) then the shared FFN/MoE tail at T=nSeq. See the
+    /// base-class declaration for the batch contract.
+    void runBlockBatched(std::size_t                blockIdx,
+                         float*                     x,
+                         std::size_t                nSeq,
+                         std::span<KvCache* const>  caches,
+                         BlockBuffers&              s,
+                         bool                       diag) override;
+
     /// M-CLR.MoE Increment 3 — true when every decode block will take the
     /// device-side expert dispatch path (Increment 2), which removes all
     /// host routing reads and makes the block Command-List-Replay-capturable.
@@ -52,6 +63,21 @@ public:
     [[nodiscard]] bool moeDecodeClrSafe() const noexcept override;
 
 private:
+    /// FFN/MoE tail of a block, shared by the single-sequence runBlock()
+    /// and the batched-decode path. Runs from `ffn_norm` through the
+    /// final `layer_output_scale`: dense Path A, MoE Path B, combine,
+    /// `post_ffw_norm`, residual, output scale. Every op depends only on
+    /// the row count `T` (== nSeq for batched decode), never on sequence
+    /// position — the position-dependent work lives entirely in
+    /// runAttentionSection. The T==1 fast decode paths (device dispatch,
+    /// fused-K down) engage only for a single row, so batched calls fall
+    /// cleanly to the expert-grouping / per-token paths.
+    void runFfnMoeSection(std::size_t   blockIdx,
+                          float*        x,
+                          std::size_t   T,
+                          BlockBuffers& s,
+                          bool          diag);
+
     /// `features.moeGroup` at construction — routes T>1 through the
     /// expert-grouped batched dispatch path in runBlock(). Off falls back
     /// to per-token dispatch even during prefill.

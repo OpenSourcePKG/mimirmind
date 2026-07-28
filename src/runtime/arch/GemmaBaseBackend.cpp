@@ -579,4 +579,182 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // updated in-place with the residual.
 }
 
+// ===========================================================================
+// M-L0.Batch Phase 1 — batched (synchronized-decode) attention section.
+//
+// Additive: the single-sequence runAttentionSection above is untouched.
+// This variant runs the position-independent matmuls at M=nSeq (Q proj,
+// O proj) and the position-independent norms batched, then loops per
+// sequence only for K/V projection, K-norm, RoPE and attention — the
+// three ops that read a per-sequence position (`curLen`) or a per-
+// sequence KvCache. See runAttentionSection for the per-stage rationale;
+// only the batching structure is commented here.
+// ===========================================================================
+void GemmaBaseBackend::runAttentionSectionBatched(
+        std::size_t                blockIdx,
+        float*                     x,
+        std::size_t                nSeq,
+        std::span<KvCache* const>  caches,
+        BlockBuffers&              s,
+        bool                       diag) {
+    auto trace = [&](const char* tag) {
+        if (diag) MM_LOG_INFO("blkdiag-gb", "batch blk {}", tag);
+    };
+
+    if (caches.size() != nSeq) {
+        throw std::runtime_error(
+            "runAttentionSectionBatched: caches.size() != nSeq");
+    }
+    // Phase 1 supports F32 KV only. Batched decode (nSeq > 1) already
+    // disables the device-MoE / Command-List-Replay fast path (those gate
+    // on T == 1), and FP16/Q8_0 batched K/V staging is a later increment.
+    for (std::size_t i = 0; i < nSeq; ++i) {
+        if (caches[i] == nullptr) {
+            throw std::runtime_error(
+                "runAttentionSectionBatched: null cache pointer");
+        }
+        if (caches[i]->dtype() != KvDtype::F32) {
+            throw std::runtime_error(
+                "runAttentionSectionBatched: Phase 1 supports F32 KV only");
+        }
+    }
+
+    const auto& li = _layers[blockIdx];
+
+    const auto* attnNorm = requireTensor(blockIdx, "attn_norm.weight",           "GemmaBase");
+    const auto* qW       = requireTensor(blockIdx, "attn_q.weight",              "GemmaBase");
+    const auto* qNorm    = requireTensor(blockIdx, "attn_q_norm.weight",         "GemmaBase");
+    const auto* oW       = requireTensor(blockIdx, "attn_output.weight",         "GemmaBase");
+    const auto* attnPost = requireTensor(blockIdx, "post_attention_norm.weight", "GemmaBase");
+
+    const core::gguf::GgufTensor* kW    = nullptr;
+    const core::gguf::GgufTensor* kNorm = nullptr;
+    const core::gguf::GgufTensor* vW    = nullptr;
+    if (li.ownsKv) {
+        kW    = requireTensor(blockIdx, "attn_k.weight",      "GemmaBase");
+        kNorm = requireTensor(blockIdx, "attn_k_norm.weight", "GemmaBase");
+        if (!li.altAttention) {
+            vW = requireTensor(blockIdx, "attn_v.weight", "GemmaBase");
+        }
+    }
+
+    const std::size_t d_model  = s.d_model;
+    const std::size_t q_dim    = li.qDim;
+    const std::size_t kv_dim   = li.kvDim;
+    const std::size_t head_dim = li.headDim;
+
+    float* const normBuf       = s.normBuf.as<float>();
+    float* const qBuf          = s.qBuf.as<float>();
+    float* const attnOutBuf    = s.attnOut.as<float>();
+    float* const projOutBuf    = s.projOut.as<float>();
+    float* const matmulScratch = s.matmulScratch.as<float>();
+
+    // --- (1) batched pre-attention RMSNorm over the nSeq rows -----------
+    _op.mark(runtime::OpProfiler::Cat::NORM);
+    trace("attn rmsNorm");
+    _ops.rmsNormAsync(x, nSeq, d_model,
+                      static_cast<const float*>(attnNorm->usmPtr),
+                      _config.rmsNormEps, normBuf);
+
+    // --- (2) batched Q projection (M=nSeq) — the amortized-weight win ----
+    _op.mark(runtime::OpProfiler::Cat::MATMUL);
+    trace("Q projection (batched M=nSeq)");
+    _gmm.matmulAsync(qW->type, qW->usmPtr, q_dim, d_model,
+                     normBuf, nSeq, qBuf, matmulScratch);
+
+    // --- (3) batched Q-norm over nSeq*nHeads rows (position-independent) -
+    _op.mark(runtime::OpProfiler::Cat::NORM);
+    trace("Q-norm (batched)");
+    _ops.rmsNormAsync(qBuf, nSeq * li.nHeads, head_dim,
+                      static_cast<const float*>(qNorm->usmPtr),
+                      _config.rmsNormEps, qBuf);
+
+    // --- (4) per-sequence K/V proj + K-norm + RoPE + attention ----------
+    // Each sequence sits at its own position and owns its own cache, so
+    // these ops cannot be batched. K/V projection is M=1 here (a small
+    // share of attention-section matmul time); batching it needs a K/V
+    // staging + per-cache scatter, deferred to a later increment.
+    const std::size_t slidingWindow =
+        li.isSwa ? static_cast<std::size_t>(_config.slidingWindow) : 0;
+
+    for (std::size_t i = 0; i < nSeq; ++i) {
+        KvCache&          cache    = *caches[i];
+        const std::size_t curLen   = cache.length();
+        const std::size_t totalLen = curLen + 1;
+        float* const      xRow     = normBuf    + i * d_model;
+        float* const      qRow     = qBuf       + i * q_dim;
+        float* const      aRow     = attnOutBuf + i * q_dim;
+
+        float* const kSlot = li.ownsKv ? cache.writeSlotKf32(blockIdx) : nullptr;
+        float* const vSlot = li.ownsKv ? cache.writeSlotVf32(blockIdx) : nullptr;
+
+        if (li.ownsKv) {
+            _op.mark(runtime::OpProfiler::Cat::MATMUL);
+            _gmm.matmulAsync(kW->type, kW->usmPtr, kv_dim, d_model,
+                             xRow, 1, kSlot, matmulScratch);
+            if (!li.altAttention) {
+                _gmm.matmulAsync(vW->type, vW->usmPtr, kv_dim, d_model,
+                                 xRow, 1, vSlot, matmulScratch);
+            } else {
+                // V = raw K projection — device-side copy (recordable),
+                // taken before K-norm so V keeps the raw layout.
+                _ops.appendMemoryCopy(vSlot, kSlot,
+                                      cache.rowBytes(blockIdx));
+            }
+            _op.mark(runtime::OpProfiler::Cat::NORM);
+            _ops.rmsNormAsync(kSlot, li.nKvHeads, head_dim,
+                              static_cast<const float*>(kNorm->usmPtr),
+                              _config.rmsNormEps, kSlot);
+        }
+
+        // RoPE Q (always) + K (own-KV only), per-sequence startPos=curLen.
+        _op.mark(runtime::OpProfiler::Cat::ATTENTION);
+        if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
+            _ops.ropeInPlaceWithFactorsAsync(qRow, _ropeFreqsForFullAttn, 1,
+                                             li.nHeads, head_dim, curLen,
+                                             li.ropeBase);
+            if (li.ownsKv) {
+                _ops.ropeInPlaceWithFactorsAsync(kSlot, _ropeFreqsForFullAttn,
+                                                 1, li.nKvHeads, head_dim,
+                                                 curLen, li.ropeBase);
+            }
+        } else {
+            _ops.ropeInPlaceAsync(qRow, 1, li.nHeads, head_dim, curLen,
+                                  li.ropeBase);
+            if (li.ownsKv) {
+                _ops.ropeInPlaceAsync(kSlot, 1, li.nKvHeads, head_dim, curLen,
+                                      li.ropeBase);
+            }
+        }
+
+        // Attention for this sequence. Shared-KV layers read the source
+        // layer's cache (written earlier this pass for this sequence).
+        _op.mark(runtime::OpProfiler::Cat::ATTENTION);
+        _ops.attentionAsync(qRow,
+                            cache.baseK(li.kvSourceLayer),
+                            cache.baseV(li.kvSourceLayer),
+                            1, totalLen,
+                            li.nHeads, li.nKvHeads, head_dim,
+                            curLen, /*scale=*/1.0F,
+                            aRow,
+                            slidingWindow,
+                            KvDtype::F32);
+    }
+
+    // --- (5) batched O projection (M=nSeq) ------------------------------
+    _op.mark(runtime::OpProfiler::Cat::MATMUL);
+    trace("O projection (batched M=nSeq)");
+    _gmm.matmulAsync(oW->type, oW->usmPtr, d_model, q_dim,
+                     attnOutBuf, nSeq, projOutBuf, matmulScratch);
+
+    // --- (6) batched post-attention norm --------------------------------
+    // Leaves projOutBuf = attn_post_norm(attn_out) per row for the
+    // caller's fused residual + ffn_norm, exactly as the single-seq path.
+    _op.mark(runtime::OpProfiler::Cat::NORM);
+    trace("attn_post_norm (batched)");
+    _ops.rmsNormAsync(projOutBuf, nSeq, d_model,
+                      static_cast<const float*>(attnPost->usmPtr),
+                      _config.rmsNormEps, projOutBuf);
+}
+
 } // namespace mimirmind::runtime::arch

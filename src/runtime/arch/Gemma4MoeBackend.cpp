@@ -65,8 +65,6 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
                                 KvCache&      cache,
                                 BlockBuffers& s,
                                 bool          traceBlock0) {
-    namespace cmp = mimirmind::compute;
-
     const bool diag = (blockIdx == 0 && cache.length() == 0 && traceBlock0);
     auto trace = [&](const char* tag) {
         if (diag) MM_LOG_INFO("blkdiag-g4m", "blk0 {}", tag);
@@ -76,6 +74,24 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
     // Shared attention section. On return `x` holds
     // sa_out = inpL + post_attention_norm(W_o @ attn(...)).
     runAttentionSection(blockIdx, x, T, cache, s, diag);
+
+    // FFN/MoE tail — position-independent, shared verbatim with the
+    // batched decode path (runBlockBatched calls this with T = nSeq).
+    // Everything from ffn_norm onward depends only on the row count T,
+    // never on sequence position.
+    runFfnMoeSection(blockIdx, x, T, s, diag);
+}
+
+void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
+                                        float*        x,
+                                        std::size_t   T,
+                                        BlockBuffers& s,
+                                        bool          diag) {
+    namespace cmp = mimirmind::compute;
+
+    auto trace = [&](const char* tag) {
+        if (diag) MM_LOG_INFO("blkdiag-g4m", "blk0 {}", tag);
+    };
 
     // FFN tensors (Path A dense weights + MoE router + expert bank +
     // per-side / combined norms + layer output scale).
@@ -622,6 +638,20 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
     // Close the last phase before returning so its time lands in the
     // accumulator. Cheap no-op when profiling is disabled.
     _op.finish();
+}
+
+void Gemma4MoeBackend::runBlockBatched(std::size_t                blockIdx,
+                                       float*                     x,
+                                       std::size_t                nSeq,
+                                       std::span<KvCache* const>  caches,
+                                       BlockBuffers&              s,
+                                       bool                       diag) {
+    // Batched attention section (per-seq caches), then the shared FFN/MoE
+    // tail at T=nSeq. The tail's T==1 fast paths (device dispatch, fused-K
+    // down) stay off for nSeq>1 — it falls to the expert-grouping /
+    // per-token dispatch, which is correct for a batch of rows.
+    runAttentionSectionBatched(blockIdx, x, nSeq, caches, s, diag);
+    runFfnMoeSection(blockIdx, x, nSeq, s, diag);
 }
 
 bool Gemma4MoeBackend::moeDecodeClrSafe() const noexcept {

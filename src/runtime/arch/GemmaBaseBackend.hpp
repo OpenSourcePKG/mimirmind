@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,6 +70,27 @@ public:
                           KvCache&      cache,
                           BlockBuffers& s,
                           bool          traceBlock0) = 0;
+
+    /// M-L0.Batch Phase 1 — synchronized batched decode of `nSeq`
+    /// lock-step sequences (each contributes exactly one row of `x`,
+    /// T=1 per sequence). `caches[i]` is sequence i's own single-sequence
+    /// KvCache; all must sit at their pre-forward length (the batch
+    /// harness commits each once after the whole block chain). The
+    /// dominant matmuls (Q/O projection, dense FFN, MoE) run at M=nSeq so
+    /// each weight read amortizes across the batch (the GEMV→GEMM lever
+    /// the decode roofline identified); attention + RoPE stay per-sequence
+    /// because each sits at a different position. Default throws —
+    /// only the MoE variant implements it in Phase 1.
+    virtual void runBlockBatched(std::size_t                blockIdx,
+                                 float*                     x,
+                                 std::size_t                nSeq,
+                                 std::span<KvCache* const>  caches,
+                                 BlockBuffers&              s,
+                                 bool                       diag) {
+        (void)blockIdx; (void)x; (void)nSeq; (void)caches; (void)s; (void)diag;
+        throw std::runtime_error(
+            "runBlockBatched: batched decode not implemented for this backend");
+    }
 
     /// Forwarded from the ArchBackend facade so `Gemma4E4BBackend` can
     /// prefetch its per-layer-embedding (PLE) slices and run the
@@ -163,6 +185,32 @@ protected:
                              KvCache&      cache,
                              BlockBuffers& s,
                              bool          diag);
+
+    /// Batched (synchronized-decode) counterpart of runAttentionSection.
+    /// `x` is [nSeq, d_model] (row i = sequence i's hidden state, T=1
+    /// each); `caches[i]` is sequence i's KvCache, all at the same
+    /// pre-forward length within this pass. Batches the position-
+    /// independent work — pre-norm, Q projection, Q-norm, O projection,
+    /// post-attention norm — at M=nSeq, and loops per sequence only for
+    /// the position-dependent K/V projection, K-norm, RoPE (per-seq
+    /// startPos) and attention. On return `x` is untouched and
+    /// `s.projOut` holds `attn_post_norm(W_o @ attn(...))` per row for the
+    /// caller's fused residual+ffn_norm — identical contract to the
+    /// single-sequence path.
+    ///
+    /// Phase 1 supports F32 KV only (throws otherwise) and mirrors every
+    /// Gemma-4 attention variant the single-seq path handles: own-KV vs
+    /// shared-KV (`kvSourceLayer`), altAttention (V = raw K), SWA vs full
+    /// (sliding-window clamp + proportional RoPE factors). K/V projection
+    /// runs at M=1 per sequence — batching it needs a K/V staging +
+    /// scatter, deferred to a later increment (K/V proj is a small share
+    /// of the attention-section matmul time).
+    void runAttentionSectionBatched(std::size_t                blockIdx,
+                                    float*                     x,
+                                    std::size_t                nSeq,
+                                    std::span<KvCache* const>  caches,
+                                    BlockBuffers&              s,
+                                    bool                       diag);
 
     // Shared runtime state -----------------------------------------------
 
