@@ -462,40 +462,50 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             const std::size_t promptLen = base.size();
 
             try {
-                // --- (1c) greedy parity: nSeq=2 identical vs single-seq ----
+                // --- (1c) greedy parity: batched nSeq in {1,2,4} vs single ---
+                // nSeq=1 isolates the batched-attention MATH (M=1 -> same
+                // vec kernels as single-seq) from the M>1 GEMM-vs-GEMV
+                // numeric path. If nSeq=1 matches single-seq but nSeq>1
+                // diverges, the divergence is kernel numerics breaking a
+                // near-tie greedy pick, not a batched-attention bug.
                 ::mimirmind::runtime::GenerateParams gp{};
                 gp.maxNewTokens         = maxNew;
                 gp.sampling.temperature = 0.0F;   // greedy argmax
                 e->resetCache();
                 const std::vector<std::int32_t> ref =
                     e->generate(base, gp, {}, nullptr, {}, {});
-
-                const std::size_t nParity = 2;
-                std::vector<std::vector<std::int32_t>> pprompts(nParity, base);
-                auto batched = e->generateBatchL0(pprompts, maxNew, /*eosId=*/-1);
-
-                bool allSeqEqual = true;
-                for (std::size_t s = 1; s < nParity; ++s) {
-                    if (batched[s] != batched[0]) allSeqEqual = false;
-                }
-                std::size_t matchLen = 0;
-                const std::size_t cmpN = std::min(batched[0].size(), ref.size());
-                for (; matchLen < cmpN; ++matchLen) {
-                    if (batched[0][matchLen] != ref[matchLen]) break;
-                }
-                std::cout << "\n[M-L0.Batch parity] nSeq=" << nParity
-                          << " maxNew=" << maxNew
-                          << " promptTokens=" << promptLen << "\n"
-                          << "  batched[0] :";
-                for (auto t : batched[0]) std::cout << ' ' << t;
-                std::cout << "\n  single-seq :";
+                std::cout << "\n[M-L0.Batch parity] maxNew=" << maxNew
+                          << " promptTokens=" << promptLen << "\n  single-seq :";
                 for (auto t : ref) std::cout << ' ' << t;
-                std::cout << "\n  all-seq-identical=" << (allSeqEqual ? "YES" : "NO")
-                          << "  ref-match-prefix=" << matchLen << "/" << ref.size()
-                          << ((matchLen == ref.size() && allSeqEqual)
-                                  ? "  => PASS"
-                                  : "  => CHECK")
-                          << "\n";
+                std::cout << "\n";
+
+                const std::vector<std::size_t> parityN =
+                    quick ? std::vector<std::size_t>{1, 2}
+                          : std::vector<std::size_t>{1, 2, 4};
+                for (std::size_t nSeq : parityN) {
+                    std::vector<std::vector<std::int32_t>> pprompts(nSeq, base);
+                    auto batched =
+                        e->generateBatchL0(pprompts, maxNew, /*eosId=*/-1);
+                    bool allSeqEqual = true;
+                    for (std::size_t s = 1; s < nSeq; ++s) {
+                        if (batched[s] != batched[0]) allSeqEqual = false;
+                    }
+                    std::size_t matchLen = 0;
+                    const std::size_t cmpN =
+                        std::min(batched[0].size(), ref.size());
+                    for (; matchLen < cmpN; ++matchLen) {
+                        if (batched[0][matchLen] != ref[matchLen]) break;
+                    }
+                    std::cout << "  nSeq=" << nSeq
+                              << "  all-seq-identical="
+                              << (allSeqEqual ? "YES" : "NO")
+                              << "  ref-match=" << matchLen << "/" << ref.size()
+                              << ((matchLen == ref.size() && allSeqEqual)
+                                      ? "  PASS" : "  CHECK")
+                              << "  batched[0]:";
+                    for (auto t : batched[0]) std::cout << ' ' << t;
+                    std::cout << "\n";
+                }
 
                 // --- (1d) throughput sweep over nSeq ------------------------
                 std::cout << "[M-L0.Batch bench] promptLen=" << promptLen
@@ -516,7 +526,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                 }
                 const std::vector<std::size_t> batchSizes =
                     quick ? std::vector<std::size_t>{1}
-                          : std::vector<std::size_t>{1, 2, 4, 8};
+                          : std::vector<std::size_t>{1, 2, 4, 8, 16, 32};
                 for (std::size_t nSeq : batchSizes) {
                     std::vector<std::vector<std::int32_t>> prompts(nSeq, base);
                     (void)e->generateBatchL0(prompts, quick ? 2 : 4, -1); // warm
