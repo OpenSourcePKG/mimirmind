@@ -10,9 +10,21 @@
 // SLM: 256 * 8 * 4 = 8 KiB / WG. v1 was 32 KiB / WG (X_TILE=1024).
 // 4× more resident WGs on the Xe Vector Engine scheduler.
 //
-// Everything else (WG=64, SG=16, 4 outputs/WG, Kahan compensation,
-// per-half dequant loop) is deliberately identical to v1 so any perf
-// delta is attributable to the SLM axis alone.
+// 2026-07-28 — plain-fma accumulation. The M_TILE accumulator was a
+// `volatile float kc[8]` Kahan array (inherited from the M=1 vec kernel,
+// where one compensated accumulator is cheap). In the 8-wide GEMM that
+// forced all 8 accumulators + 8 compensation terms out of registers into
+// memory: every one of the 8 MACs per dequant became a volatile
+// load/store instead of an `mad`, making the inner loop memory-latency-
+// bound and collapsing occupancy. The dequant-reuse win was real but
+// swamped by it, so autotune measured this v2 SLOWER than vec at every M
+// (gemmMinM=never) — while the byte-for-byte-identical Q8_0 v2, which
+// uses plain `float sum[8]` + `mad`, wins (gemmMinM=16). This kernel now
+// mirrors that: register `sum[8]` + `mad`, no Kahan. The M=1 vec decode
+// path keeps Kahan (parity / CLR unaffected). Precision over ~K/16 terms
+// per lane is ~17-18 bits, within the inference/parity tolerance (same as
+// Q8_0 v2). Everything else (WG=64, SG=16, 4 outputs/WG, per-half dequant
+// loop) is unchanged.
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
@@ -61,13 +73,11 @@ __kernel void matmul_q6k_gemm_v2(
     const bool nActive = (n < N);
     const int  nSuper  = K / Q6K_BLOCK_ELEMENTS;
 
-    float          sum[MATMUL_Q6K_GEMM_V2_M_TILE];
-    volatile float kc [MATMUL_Q6K_GEMM_V2_M_TILE];
+    float sum[MATMUL_Q6K_GEMM_V2_M_TILE];
 
     #pragma unroll
     for (int mm = 0; mm < MATMUL_Q6K_GEMM_V2_M_TILE; ++mm) {
         sum[mm] = 0.0f;
-        kc [mm] = 0.0f;
     }
 
     for (int tile = 0; tile < K; tile += X_TILE_ELEMENTS) {
@@ -127,23 +137,17 @@ __kernel void matmul_q6k_gemm_v2(
                         const float w2 = d * (float)scp[is + 4] * (float)q3;
                         const float w3 = d * (float)scp[is + 6] * (float)q4;
 
-                        #define KAHAN_ADD(mm, term)                              \
-                            do {                                                  \
-                                const float _y = (term) - kc[mm];                 \
-                                const float _t = sum[mm] + _y;                    \
-                                kc[mm]  = (_t - sum[mm]) - _y;                    \
-                                sum[mm] = _t;                                     \
-                            } while (0)
-
+                        // Plain-fma register accumulation (see header). Each
+                        // dequant (w0..w3) is reused across all M_TILE rows.
                         #pragma unroll
                         for (int mm = 0; mm < MATMUL_Q6K_GEMM_V2_M_TILE; ++mm) {
-                            KAHAN_ADD(mm, xTile[xHalfBase + l +  0][mm] * w0);
-                            KAHAN_ADD(mm, xTile[xHalfBase + l + 32][mm] * w1);
-                            KAHAN_ADD(mm, xTile[xHalfBase + l + 64][mm] * w2);
-                            KAHAN_ADD(mm, xTile[xHalfBase + l + 96][mm] * w3);
+                            float acc = sum[mm];
+                            acc = mad(xTile[xHalfBase + l +  0][mm], w0, acc);
+                            acc = mad(xTile[xHalfBase + l + 32][mm], w1, acc);
+                            acc = mad(xTile[xHalfBase + l + 64][mm], w2, acc);
+                            acc = mad(xTile[xHalfBase + l + 96][mm], w3, acc);
+                            sum[mm] = acc;
                         }
-
-                        #undef KAHAN_ADD
                     }
                 }
             }
@@ -154,8 +158,7 @@ __kernel void matmul_q6k_gemm_v2(
 
     #pragma unroll
     for (int mm = 0; mm < MATMUL_Q6K_GEMM_V2_M_TILE; ++mm) {
-        float s = sum[mm] + kc[mm];
-        s = sub_group_reduce_add(s);
+        float s = sub_group_reduce_add(sum[mm]);
         if (nActive && sgLocal == 0) {
             const int mAct = mBase + mm;
             if (mAct < M) {
