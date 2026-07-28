@@ -43,7 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Intel GPU repo for current Level Zero (Ubuntu 24.04 = "noble").
 # intel-ocloc compiles OpenCL C to SPIR-V at build time; required from M5
-# onward where the GPU kernels live in kernels/*.cl.
+# onward where the GPU kernels live in kernels/cl/*.cl.
 RUN wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
         | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
@@ -188,7 +188,7 @@ COPY CMakeLists.txt ./
 COPY config.example.json ./
 COPY src ./src
 COPY kernels ./kernels
-COPY kernels_hip ./kernels_hip
+COPY kernels/hip ./kernels/hip
 COPY tests ./tests
 COPY tools ./tools
 COPY third_party ./third_party
@@ -444,7 +444,7 @@ FROM builder-cuda AS build-cuda
 COPY CMakeLists.txt ./
 COPY config.example.json ./
 COPY src ./src
-COPY kernels_cuda ./kernels_cuda
+COPY kernels/cuda ./kernels/cuda
 COPY tests ./tests
 COPY tools ./tools
 COPY third_party ./third_party

@@ -17,7 +17,7 @@ namespace mimirmind::compute::hip {
 
 /**
  * Standalone launcher for the M-Q3N.5 device-side MoE top-K router
- * (`kernels_hip/moe_topk.hip`). HIP peer of
+ * (`kernels/hip/llm/moe_topk.hip`). HIP peer of
  * `compute::cuda::MoeTopKRouteDevice`. Loads the `moe_topk` module +
  * kernel once and drives one async launch per call.
  *

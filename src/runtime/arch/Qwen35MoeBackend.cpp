@@ -1140,7 +1140,7 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
     _ops.rmsNormAsync(kProj, nSeq * nKvHeads, head_dim,
                       static_cast<const float*>(kNorm.usmPtr), eps, kProj);
     // The single-session rmsNormQkv also RMS-normalises V per head (over
-    // head_dim, with NO learned weight — kernels_cuda/rmsnorm_qkv.cu V
+    // head_dim, with NO learned weight — kernels/cuda/llm/rmsnorm_qkv.cu V
     // branch). The batched path builds q/k/v separately, so replicate the
     // V normalisation here; without it V enters attention un-normalised and
     // the whole full-attention output is off by V's per-head 1/rms factor.

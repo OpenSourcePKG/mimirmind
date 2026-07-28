@@ -17,7 +17,7 @@ namespace mimirmind::compute::cuda {
 
 /**
  * Standalone launcher for the M-Q3N.5 device-side MoE top-K router
- * (`kernels_cuda/moe_topk.cu`). Loads the `moe_topk` module + function once
+ * (`kernels/cuda/llm/moe_topk.cu`). Loads the `moe_topk` module + function once
  * and drives one async launch per call.
  *
  * `GpuOps` owns an instance and forwards its `moeTopKRouteDeviceAsync`

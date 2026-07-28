@@ -65,7 +65,7 @@ std::string_view Q3K::gpuMatmulModule() const noexcept {
     // types at ctx-init and eager-loads their SPV. There is no
     // Q3_K L0 kernel today — return the empty sentinel so L0 skips
     // us and falls back to the CPU matmul path. The HIP native
-    // kernel (kernels_hip/matmul_q3k_vec.hip) is loaded by name
+    // kernel (kernels/hip/common/matmul_q3k_vec.hip) is loaded by name
     // directly in HipGpuMatmul::Impl's constructor, so this empty
     // string does not disable it there.
     return "";

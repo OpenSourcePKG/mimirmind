@@ -35,7 +35,7 @@ void PagedAttentionV2::launch(CudaStream&  stream,
 {
     // ---- Kernel 1: per-partition partial attention ---------------
     //
-    // Argument order MUST match kernels_cuda/attention_paged_v2.cu
+    // Argument order MUST match kernels/cuda/llm/attention_paged_v2.cu
     // paged_attention_v2 slot-for-slot. 19 args total.
     _partial.clearArgs();
     _partial.setPtr(0,  tmpOut);

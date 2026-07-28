@@ -16,7 +16,7 @@ namespace mimirmind::core::cuda {
 /**
  * KV-cache element format understood by the `paged_attention_v1` kernel.
  * Values MUST stay in sync with the `PAGED_ATTN_KV_DTYPE_*` macros in
- * `kernels_cuda/attention_paged_v1.cu` — the kernel switches on this
+ * `kernels/cuda/llm/attention_paged_v1.cu` — the kernel switches on this
  * int argument, so 0/1/2 is part of the ABI.
  */
 enum class PagedKvDtype : int {

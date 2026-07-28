@@ -115,7 +115,7 @@ core::cuda::CudaModule loadCudaModule(core::cuda::CudaContext& ctx,
 } // namespace
 
 // Pimpl body — one CudaModule + CudaKernel pair per compiled `.hip`
-// source under `kernels_hip/` that corresponds to a `ComputeOps`
+// source under `kernels/hip/llm/` that corresponds to a `ComputeOps`
 // entry point. HIP-only kernels used by `HipGpuMatmul` (matmul
 // variants + moe_down) live on that class, not here. Kernels that
 // exist in the L0 `GpuOps::Impl` but haven't been ported to HIP yet

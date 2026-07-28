@@ -25,7 +25,7 @@ namespace mimirmind::compute::quant {
  * `kmask1=0x03030303 / kmask2=0x0f0f0f0f` trick.
  *
  * HIP path: native `matmul_q3k_vec` kernel in
- * `kernels_hip/matmul_q3k_vec.hip` (WAVE32 gfx1101, one warp per output
+ * `kernels/hip/common/matmul_q3k_vec.hip` (WAVE32 gfx1101, one warp per output
  * row, 32 lanes × 8 elements = full 256-element super-block, no
  * cross-lane work per block). Bit-parity verified by
  * `tools/hip-matmul-q3k-probe.cpp`.

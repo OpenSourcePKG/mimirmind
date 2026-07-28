@@ -6,10 +6,14 @@
 #include "core/gguf/GgufReader.hpp"
 #include "core/log/Log.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <array>
 #include <climits>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <queue>
 #include <stdexcept>
@@ -249,6 +253,147 @@ void Tokenizer::loadFromGguf(const GgufReader& reader) {
                 "pad={} add_space_prefix={}",
                 _tokens.size(), _mergesRank.size(),
                 _bosId, _eosId, _unknownId, _padId, _addSpacePrefix);
+}
+
+void Tokenizer::loadFromHfJson(const std::string& checkpointDir) {
+    namespace fs = std::filesystem;
+    const fs::path dir{checkpointDir};
+
+    auto readJson = [](const fs::path& p) -> nlohmann::json {
+        std::ifstream f(p);
+        if (!f) {
+            throw std::runtime_error(
+                "Tokenizer::loadFromHfJson: cannot open " + p.string());
+        }
+        nlohmann::json j;
+        f >> j;
+        return j;
+    };
+
+    const nlohmann::json tj = readJson(dir / "tokenizer.json");
+    const auto modelIt = tj.find("model");
+    if (modelIt == tj.end() || !modelIt->is_object()) {
+        throw std::runtime_error(
+            "Tokenizer::loadFromHfJson: tokenizer.json has no 'model' object");
+    }
+    const nlohmann::json& model = *modelIt;
+
+    // Byte-level BPE only (Qwen / GPT-2 family) — the one encode path this
+    // populates. SentencePiece / Unigram / WordPiece checkpoints must keep
+    // using a GGUF tokenizer (models[].tokenizerGguf).
+    const std::string bpeType = model.value("type", std::string{});
+    if (bpeType != "BPE") {
+        throw std::runtime_error(
+            "Tokenizer::loadFromHfJson: only byte-level BPE tokenizer.json is "
+            "supported (model.type='" + bpeType + "')");
+    }
+    _modelType = "gpt2";
+
+    // ---- 1. vocab {token: id} (+ added_tokens) -> _tokens (indexed by id)
+    //         and _byText. Same layout the gpt2 GGUF path builds.
+    const auto vocabIt = model.find("vocab");
+    if (vocabIt == model.end() || !vocabIt->is_object()) {
+        throw std::runtime_error(
+            "Tokenizer::loadFromHfJson: tokenizer.json model.vocab missing");
+    }
+
+    std::vector<std::pair<std::int32_t, std::string>> entries;
+    entries.reserve(vocabIt->size() + 64);
+    std::int32_t maxId = -1;
+    for (auto it = vocabIt->begin(); it != vocabIt->end(); ++it) {
+        const auto id = it.value().get<std::int32_t>();
+        entries.emplace_back(id, it.key());
+        maxId = std::max(maxId, id);
+    }
+    if (const auto addedIt = tj.find("added_tokens");
+        addedIt != tj.end() && addedIt->is_array()) {
+        for (const auto& a : *addedIt) {
+            if (!a.contains("id") || !a.contains("content")) {
+                continue;
+            }
+            const auto id = a["id"].get<std::int32_t>();
+            entries.emplace_back(id, a["content"].get<std::string>());
+            maxId = std::max(maxId, id);
+        }
+    }
+    if (maxId < 0) {
+        throw std::runtime_error(
+            "Tokenizer::loadFromHfJson: empty vocab");
+    }
+
+    _tokens.assign(static_cast<std::size_t>(maxId) + 1, TokenInfo{});
+    _byText.clear();
+    _byText.reserve(entries.size() * 2);
+    for (auto& [id, text] : entries) {
+        _tokens[static_cast<std::size_t>(id)].text = text;  // score=0, type=1
+        _byText[text] = id;  // last-write-wins, mirrors the GGUF path
+    }
+
+    // ---- 2. merges -> rank (index). tokenizer.json stores them either as
+    //         space-joined strings ("Ġ Ġ", identical to the GGUF format) or
+    //         as ["Ġ","Ġ"] pairs; accept both.
+    _mergesRank.clear();
+    if (const auto mergesIt = model.find("merges");
+        mergesIt != model.end() && mergesIt->is_array()) {
+        _mergesRank.reserve(mergesIt->size());
+        std::int32_t rank = 0;
+        for (const auto& m : *mergesIt) {
+            std::string key;
+            if (m.is_string()) {
+                key = m.get<std::string>();
+            } else if (m.is_array() && m.size() == 2) {
+                key = m[0].get<std::string>() + ' ' + m[1].get<std::string>();
+            } else {
+                continue;
+            }
+            _mergesRank.emplace(std::move(key), rank++);
+        }
+    }
+
+    // ---- 3. special-token ids. tokenizer_config.json is authoritative:
+    //         Qwen sets bos_token=null (no BOS prepend) -> _bosId = -1, which
+    //         the gpt2 encode path honours. generation_config.json is a
+    //         numeric fallback for eos only (it may be a list -> take first).
+    auto idOf = [&](const std::string& text) -> std::int32_t {
+        const auto it = _byText.find(text);
+        return it != _byText.end() ? it->second : -1;
+    };
+    _bosId = _eosId = _unknownId = _padId = -1;
+
+    if (const fs::path tcPath = dir / "tokenizer_config.json"; fs::exists(tcPath)) {
+        const nlohmann::json tc = readJson(tcPath);
+        auto strTok = [&](const char* key) -> std::string {
+            if (const auto it = tc.find(key); it != tc.end() && it->is_string()) {
+                return it->get<std::string>();
+            }
+            return {};
+        };
+        if (const std::string s = strTok("bos_token"); !s.empty()) _bosId     = idOf(s);
+        if (const std::string s = strTok("eos_token"); !s.empty()) _eosId     = idOf(s);
+        if (const std::string s = strTok("pad_token"); !s.empty()) _padId     = idOf(s);
+        if (const std::string s = strTok("unk_token"); !s.empty()) _unknownId = idOf(s);
+    }
+
+    if (const fs::path gcPath = dir / "generation_config.json";
+        _eosId < 0 && fs::exists(gcPath)) {
+        const nlohmann::json gc = readJson(gcPath);
+        if (const auto it = gc.find("eos_token_id"); it != gc.end()) {
+            if (it->is_number_integer()) {
+                _eosId = it->get<std::int32_t>();
+            } else if (it->is_array() && !it->empty()
+                       && it->front().is_number_integer()) {
+                _eosId = it->front().get<std::int32_t>();
+            }
+        }
+    }
+
+    _addSpacePrefix = false;  // gpt2 byte-level BPE never prepends a ▁.
+
+    MM_LOG_INFO("tok",
+                "HF tokenizer.json loaded: {} tokens, {} merges, bos={} eos={} "
+                "unk={} pad={}",
+                _tokens.size(), _mergesRank.size(),
+                _bosId, _eosId, _unknownId, _padId);
 }
 
 // ---------------------------------------------------------------------------

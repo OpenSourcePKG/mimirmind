@@ -203,64 +203,64 @@ endif()
 if(MIMIRMIND_ENABLE_L0)
 
 set(KERNEL_SOURCES
-    kernels/rmsnorm.cl
-    kernels/matmul_f32_vec.cl
-    kernels/matmul_q4k_vec.cl
-    kernels/matmul_q5k_vec.cl
-    kernels/matmul_q6k_vec.cl
-    kernels/matmul_q8_0_vec.cl
-    kernels/matmul_q6k_gemm.cl
-    kernels/matmul_q4k_gemm.cl
-    kernels/matmul_q8_0_gemm.cl
-    kernels/qkv_split.cl
-    kernels/add_bias.cl
-    kernels/add_residual.cl
-    kernels/silu_mul.cl
-    kernels/rope_inplace.cl
-    kernels/rope_mrope.cl
-    kernels/split_head_pair.cl
-    kernels/sigmoid_gate_mul.cl
-    kernels/l2_norm.cl
-    kernels/ssm_conv1d.cl
-    kernels/gated_deltanet_ar.cl
-    kernels/deltanet_gate.cl
-    kernels/sigmoid_inplace.cl
-    kernels/gather_heads_from_channels.cl
-    kernels/mul_scalar.cl
-    kernels/gelu_mul.cl
-    kernels/rmsnorm_gemma.cl
-    kernels/rmsnorm_no_weight.cl
-    kernels/rmsnorm_qkv.cl
-    kernels/add_rmsnorm.cl
-    kernels/rope_inplace_ff.cl
-    kernels/attention.cl
-    kernels/attention_flash_partial.cl
-    kernels/attention_flash_merge.cl
-    kernels/attention_prefill_flash.cl
-    kernels/attention_fp16.cl
-    kernels/attention_flash_partial_fp16.cl
-    kernels/attention_prefill_flash_fp16.cl
-    kernels/rmsnorm_qkv_fp16.cl
-    kernels/qkv_split_fp16.cl
-    kernels/rope_inplace_fp16.cl
-    kernels/rope_inplace_ff_fp16.cl
-    kernels/kv_quant_commit_q8_0.cl
-    kernels/attention_q8_0.cl
-    kernels/attention_flash_partial_q8_0.cl
-    kernels/attention_prefill_flash_q8_0.cl
-    kernels/attention_prefill_flash_q8_0_gqa.cl
-    kernels/scaled_add_residual.cl
-    kernels/x_quant_i8.cl
-    kernels/matmul_q8_0_vec_dp4a.cl
-    kernels/matmul_q4k_vec_dp4a.cl
-    kernels/matmul_q8_0_gemm_v2.cl
-    kernels/matmul_q6k_gemm_v2.cl
-    kernels/matmul_q4k_gemm_v2.cl
-    kernels/matmul_q8_0_vec_reorder.cl
-    kernels/moe_down_fused_k_q6k.cl
-    kernels/moe_down_fused_k_q8_0.cl
-    kernels/moe_gateup_fused_k_q6k.cl
-    kernels/moe_topk.cl
+    kernels/cl/common/rmsnorm.cl
+    kernels/cl/common/matmul_f32_vec.cl
+    kernels/cl/common/matmul_q4k_vec.cl
+    kernels/cl/common/matmul_q5k_vec.cl
+    kernels/cl/common/matmul_q6k_vec.cl
+    kernels/cl/common/matmul_q8_0_vec.cl
+    kernels/cl/common/matmul_q6k_gemm.cl
+    kernels/cl/common/matmul_q4k_gemm.cl
+    kernels/cl/common/matmul_q8_0_gemm.cl
+    kernels/cl/llm/qkv_split.cl
+    kernels/cl/common/add_bias.cl
+    kernels/cl/common/add_residual.cl
+    kernels/cl/common/silu_mul.cl
+    kernels/cl/llm/rope_inplace.cl
+    kernels/cl/llm/rope_mrope.cl
+    kernels/cl/llm/split_head_pair.cl
+    kernels/cl/common/sigmoid_gate_mul.cl
+    kernels/cl/common/l2_norm.cl
+    kernels/cl/llm/ssm_conv1d.cl
+    kernels/cl/llm/gated_deltanet_ar.cl
+    kernels/cl/llm/deltanet_gate.cl
+    kernels/cl/common/sigmoid_inplace.cl
+    kernels/cl/llm/gather_heads_from_channels.cl
+    kernels/cl/common/mul_scalar.cl
+    kernels/cl/common/gelu_mul.cl
+    kernels/cl/common/rmsnorm_gemma.cl
+    kernels/cl/common/rmsnorm_no_weight.cl
+    kernels/cl/llm/rmsnorm_qkv.cl
+    kernels/cl/common/add_rmsnorm.cl
+    kernels/cl/llm/rope_inplace_ff.cl
+    kernels/cl/llm/attention.cl
+    kernels/cl/llm/attention_flash_partial.cl
+    kernels/cl/llm/attention_flash_merge.cl
+    kernels/cl/llm/attention_prefill_flash.cl
+    kernels/cl/llm/attention_fp16.cl
+    kernels/cl/llm/attention_flash_partial_fp16.cl
+    kernels/cl/llm/attention_prefill_flash_fp16.cl
+    kernels/cl/llm/rmsnorm_qkv_fp16.cl
+    kernels/cl/llm/qkv_split_fp16.cl
+    kernels/cl/llm/rope_inplace_fp16.cl
+    kernels/cl/llm/rope_inplace_ff_fp16.cl
+    kernels/cl/llm/kv_quant_commit_q8_0.cl
+    kernels/cl/llm/attention_q8_0.cl
+    kernels/cl/llm/attention_flash_partial_q8_0.cl
+    kernels/cl/llm/attention_prefill_flash_q8_0.cl
+    kernels/cl/llm/attention_prefill_flash_q8_0_gqa.cl
+    kernels/cl/common/scaled_add_residual.cl
+    kernels/cl/common/x_quant_i8.cl
+    kernels/cl/common/matmul_q8_0_vec_dp4a.cl
+    kernels/cl/common/matmul_q4k_vec_dp4a.cl
+    kernels/cl/common/matmul_q8_0_gemm_v2.cl
+    kernels/cl/common/matmul_q6k_gemm_v2.cl
+    kernels/cl/common/matmul_q4k_gemm_v2.cl
+    kernels/cl/common/matmul_q8_0_vec_reorder.cl
+    kernels/cl/llm/moe_down_fused_k_q6k.cl
+    kernels/cl/llm/moe_down_fused_k_q8_0.cl
+    kernels/cl/llm/moe_gateup_fused_k_q6k.cl
+    kernels/cl/llm/moe_topk.cl
 )
 
 set(KERNEL_SPV_FILES "")
@@ -302,9 +302,9 @@ set(GQA_KTILE64_SPV ${SPV_OUTPUT_DIR}/attention_prefill_flash_q8_0_gqa_ktile64.s
 add_custom_command(
     OUTPUT ${GQA_KTILE64_CL}
     COMMAND ${CMAKE_COMMAND} -E copy
-            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/attention_prefill_flash_q8_0_gqa.cl
+            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cl/llm/attention_prefill_flash_q8_0_gqa.cl
             ${GQA_KTILE64_CL}
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/attention_prefill_flash_q8_0_gqa.cl
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cl/llm/attention_prefill_flash_q8_0_gqa.cl
     VERBATIM
 )
 add_custom_command(
@@ -509,65 +509,65 @@ if(MIMIRMIND_ENABLE_HIP)
     # which HipModule loads at runtime. Multi-arch fat-binary support
     # ships automatically if MIMIRMIND_HIP_ARCHS lists more than one arch.
     set(HIP_KERNEL_SOURCES
-        kernels_hip/hip_probe_kernel.hip
-        kernels_hip/add_bias.hip
-        kernels_hip/add_residual.hip
-        kernels_hip/add_rmsnorm.hip
-        kernels_hip/attention.hip
-        kernels_hip/attention_flash_merge.hip
-        kernels_hip/attention_flash_partial.hip
-        kernels_hip/attention_flash_partial_fp16.hip
-        kernels_hip/attention_flash_partial_q8_0.hip
-        kernels_hip/attention_fp16.hip
-        kernels_hip/attention_prefill_flash.hip
-        kernels_hip/attention_prefill_flash_fp16.hip
-        kernels_hip/attention_prefill_flash_q8_0.hip
-        kernels_hip/attention_prefill_flash_q8_0_gqa.hip
-        kernels_hip/attention_q8_0.hip
-        kernels_hip/kv_quant_commit_q8_0.hip
-        kernels_hip/matmul_q8_0_gemm.hip
-        kernels_hip/matmul_q8_0_gemm_v2.hip
-        kernels_hip/matmul_f32_vec.hip
-        kernels_hip/matmul_q3k_vec.hip
-        kernels_hip/matmul_q4k_vec.hip
-        kernels_hip/matmul_q5_0_vec.hip
-        kernels_hip/matmul_q5k_vec.hip
-        kernels_hip/matmul_q6k_vec.hip
-        kernels_hip/matmul_q8_0_vec.hip
-        kernels_hip/matmul_q8_0_vec_dp4a.hip
-        kernels_hip/matmul_q8_0_vec_reorder.hip
-        kernels_hip/deltanet_chunk_cumgate.hip
-        kernels_hip/deltanet_chunk_forward.hip
-        kernels_hip/deltanet_kkt_solve.hip
-        kernels_hip/ffn_gate_up_fused_q8_0.hip
-        kernels_hip/moe_gate_up_fused_k_q4k.hip
-        kernels_hip/moe_down_fused_k_q6k.hip
-        kernels_hip/moe_down_fused_k_q8_0.hip
-        kernels_hip/moe_topk.hip
-        kernels_hip/mul_scalar.hip
-        kernels_hip/qkv_split.hip
-        kernels_hip/qkv_split_fp16.hip
-        kernels_hip/rmsnorm.hip
-        kernels_hip/rmsnorm_gemma.hip
-        kernels_hip/rmsnorm_no_weight.hip
-        kernels_hip/rmsnorm_qkv.hip
-        kernels_hip/rmsnorm_qkv_fp16.hip
-        kernels_hip/rope_inplace.hip
-        kernels_hip/rope_mrope.hip
-        kernels_hip/split_head_pair.hip
-        kernels_hip/sigmoid_gate_mul.hip
-        kernels_hip/l2_norm.hip
-        kernels_hip/ssm_conv1d.hip
-        kernels_hip/gated_deltanet_ar.hip
-        kernels_hip/deltanet_gate.hip
-        kernels_hip/sigmoid_inplace.hip
-        kernels_hip/gather_heads_from_channels.hip
-        kernels_hip/rope_inplace_fp16.hip
-        kernels_hip/rope_inplace_ff.hip
-        kernels_hip/scaled_add_residual.hip
-        kernels_hip/gelu_mul.hip
-        kernels_hip/x_quant_i8.hip
-        kernels_hip/silu_mul.hip
+        kernels/hip/llm/hip_probe_kernel.hip
+        kernels/hip/common/add_bias.hip
+        kernels/hip/common/add_residual.hip
+        kernels/hip/common/add_rmsnorm.hip
+        kernels/hip/llm/attention.hip
+        kernels/hip/llm/attention_flash_merge.hip
+        kernels/hip/llm/attention_flash_partial.hip
+        kernels/hip/llm/attention_flash_partial_fp16.hip
+        kernels/hip/llm/attention_flash_partial_q8_0.hip
+        kernels/hip/llm/attention_fp16.hip
+        kernels/hip/llm/attention_prefill_flash.hip
+        kernels/hip/llm/attention_prefill_flash_fp16.hip
+        kernels/hip/llm/attention_prefill_flash_q8_0.hip
+        kernels/hip/llm/attention_prefill_flash_q8_0_gqa.hip
+        kernels/hip/llm/attention_q8_0.hip
+        kernels/hip/llm/kv_quant_commit_q8_0.hip
+        kernels/hip/common/matmul_q8_0_gemm.hip
+        kernels/hip/common/matmul_q8_0_gemm_v2.hip
+        kernels/hip/common/matmul_f32_vec.hip
+        kernels/hip/common/matmul_q3k_vec.hip
+        kernels/hip/common/matmul_q4k_vec.hip
+        kernels/hip/common/matmul_q5_0_vec.hip
+        kernels/hip/common/matmul_q5k_vec.hip
+        kernels/hip/common/matmul_q6k_vec.hip
+        kernels/hip/common/matmul_q8_0_vec.hip
+        kernels/hip/common/matmul_q8_0_vec_dp4a.hip
+        kernels/hip/common/matmul_q8_0_vec_reorder.hip
+        kernels/hip/llm/deltanet_chunk_cumgate.hip
+        kernels/hip/llm/deltanet_chunk_forward.hip
+        kernels/hip/llm/deltanet_kkt_solve.hip
+        kernels/hip/llm/ffn_gate_up_fused_q8_0.hip
+        kernels/hip/llm/moe_gate_up_fused_k_q4k.hip
+        kernels/hip/llm/moe_down_fused_k_q6k.hip
+        kernels/hip/llm/moe_down_fused_k_q8_0.hip
+        kernels/hip/llm/moe_topk.hip
+        kernels/hip/common/mul_scalar.hip
+        kernels/hip/llm/qkv_split.hip
+        kernels/hip/llm/qkv_split_fp16.hip
+        kernels/hip/common/rmsnorm.hip
+        kernels/hip/common/rmsnorm_gemma.hip
+        kernels/hip/common/rmsnorm_no_weight.hip
+        kernels/hip/llm/rmsnorm_qkv.hip
+        kernels/hip/llm/rmsnorm_qkv_fp16.hip
+        kernels/hip/llm/rope_inplace.hip
+        kernels/hip/llm/rope_mrope.hip
+        kernels/hip/llm/split_head_pair.hip
+        kernels/hip/common/sigmoid_gate_mul.hip
+        kernels/hip/common/l2_norm.hip
+        kernels/hip/llm/ssm_conv1d.hip
+        kernels/hip/llm/gated_deltanet_ar.hip
+        kernels/hip/llm/deltanet_gate.hip
+        kernels/hip/common/sigmoid_inplace.hip
+        kernels/hip/llm/gather_heads_from_channels.hip
+        kernels/hip/llm/rope_inplace_fp16.hip
+        kernels/hip/llm/rope_inplace_ff.hip
+        kernels/hip/common/scaled_add_residual.hip
+        kernels/hip/common/gelu_mul.hip
+        kernels/hip/common/x_quant_i8.hip
+        kernels/hip/common/silu_mul.hip
     )
 
     set(HSACO_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/hsaco)
@@ -617,9 +617,9 @@ if(MIMIRMIND_ENABLE_HIP)
     add_custom_command(
         OUTPUT ${HIP_GQA_KTILE64_HIP}
         COMMAND ${CMAKE_COMMAND} -E copy
-                ${CMAKE_CURRENT_SOURCE_DIR}/kernels_hip/attention_prefill_flash_q8_0_gqa.hip
+                ${CMAKE_CURRENT_SOURCE_DIR}/kernels/hip/llm/attention_prefill_flash_q8_0_gqa.hip
                 ${HIP_GQA_KTILE64_HIP}
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels_hip/attention_prefill_flash_q8_0_gqa.hip
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/hip/llm/attention_prefill_flash_q8_0_gqa.hip
         VERBATIM
     )
     add_custom_command(
@@ -658,102 +658,102 @@ endif()
 
 if(MIMIRMIND_ENABLE_CUDA)
     set(CUDA_KERNEL_SOURCES
-        kernels_cuda/moe_topk.cu
-        kernels_cuda/cuda_probe_kernel.cu
-        kernels_cuda/attention_paged_v1.cu
-        kernels_cuda/attention_paged_v2.cu
-        kernels_cuda/add_bias.cu
-        kernels_cuda/add_residual.cu
-        kernels_cuda/add_rmsnorm.cu
-        kernels_cuda/attention.cu
-        kernels_cuda/attention_flash_merge.cu
-        kernels_cuda/attention_flash_partial.cu
-        kernels_cuda/attention_flash_partial_batched.cu
-        kernels_cuda/attention_flash_merge_batched.cu
-        kernels_cuda/attention_flash_partial_fp16.cu
-        kernels_cuda/attention_flash_partial_q8_0.cu
-        kernels_cuda/attention_fp16.cu
-        kernels_cuda/attention_prefill_flash.cu
-        kernels_cuda/attention_prefill_flash_fp16.cu
-        kernels_cuda/attention_prefill_flash_q8_0.cu
-        kernels_cuda/attention_prefill_flash_q8_0_gqa.cu
-        kernels_cuda/attention_q8_0.cu
-        kernels_cuda/kv_quant_commit_q8_0.cu
-        kernels_cuda/matmul_q8_0_gemm.cu
-        kernels_cuda/matmul_q8_0_gemm_v2.cu
-        kernels_cuda/matmul_q8_0_mmq.cu
-        kernels_cuda/matmul_q8_0_mmq_tc.cu
-        kernels_cuda/matmul_q4k_mmq.cu
-        kernels_cuda/matmul_q5k_mmq.cu
-        kernels_cuda/matmul_f32_vec.cu
-        kernels_cuda/matmul_bf16_vec.cu
-        kernels_cuda/matmul_bf16_gemm.cu
-        kernels_cuda/quantize_bf16_to_q8_0.cu
-        kernels_cuda/quantize_bf16_to_q4k.cu
-        kernels_cuda/quantize_bf16_to_q6k.cu
-        kernels_cuda/quantize_bf16_to_fp8.cu
-        kernels_cuda/matmul_fp8_vec.cu
-        kernels_cuda/matmul_fp8_gemm.cu
-        kernels_cuda/repackage_nvfp4_to_blk.cu
-        kernels_cuda/matmul_nvfp4blk_vec.cu
-        kernels_cuda/matmul_nvfp4blk_gemm.cu
-        kernels_cuda/moe_gate_up_fused_k_nvfp4blk_batched.cu
-        kernels_cuda/moe_down_fused_k_nvfp4blk_batched.cu
-        kernels_cuda/moe_gate_up_fused_k_bf16_batched.cu
-        kernels_cuda/moe_down_fused_k_bf16_batched.cu
-        kernels_cuda/matmul_q3k_vec.cu
-        kernels_cuda/matmul_q4k_vec.cu
-        kernels_cuda/matmul_q5_0_vec.cu
-        kernels_cuda/matmul_q5k_vec.cu
-        kernels_cuda/matmul_q6k_vec.cu
-        kernels_cuda/matmul_q8_0_vec.cu
-        kernels_cuda/matmul_q8_0_vec_dp4a.cu
-        kernels_cuda/matmul_q8_0_vec_reorder.cu
-        kernels_cuda/moe_down_fused_k_q5k.cu
-        kernels_cuda/moe_down_fused_k_q5k_batched.cu
-        kernels_cuda/moe_down_fused_k_q6k_batched.cu
-        kernels_cuda/moe_down_fused_k_q6k.cu
-        kernels_cuda/moe_down_fused_k_q8_0.cu
-        kernels_cuda/moe_gate_up_fused_k_q4k.cu
-        kernels_cuda/moe_gate_up_fused_k_q4k_batched.cu
-        kernels_cuda/ffn_gate_up_fused_q8_0.cu
-        kernels_cuda/mul_scalar.cu
-        kernels_cuda/qkv_split.cu
-        kernels_cuda/qkv_split_fp16.cu
-        kernels_cuda/rmsnorm.cu
-        kernels_cuda/rmsnorm_gemma.cu
-        kernels_cuda/rmsnorm_no_weight.cu
-        kernels_cuda/rmsnorm_qkv.cu
-        kernels_cuda/rmsnorm_qkv_fp16.cu
-        kernels_cuda/rope_inplace.cu
-        kernels_cuda/rope_mrope.cu
-        kernels_cuda/rope_mrope_batched.cu
-        kernels_cuda/split_head_pair.cu
-        kernels_cuda/sigmoid_gate_mul.cu
-        kernels_cuda/l2_norm.cu
-        kernels_cuda/ssm_conv1d.cu
-        kernels_cuda/ssm_conv1d_batched.cu
-        kernels_cuda/gated_deltanet_ar.cu
-        kernels_cuda/gated_deltanet_ar_batched.cu
-        kernels_cuda/deltanet_gate.cu
-        kernels_cuda/deltanet_chunk_cumgate.cu
-        kernels_cuda/deltanet_chunk_forward.cu
-        kernels_cuda/deltanet_chunk_cumgate_batched.cu
-        kernels_cuda/deltanet_chunk_forward_batched.cu
-        kernels_cuda/deltanet_kkt_solve.cu
-        kernels_cuda/sigmoid_inplace.cu
-        kernels_cuda/gather_heads_from_channels.cu
-        kernels_cuda/rope_inplace_fp16.cu
-        kernels_cuda/rope_inplace_ff.cu
-        kernels_cuda/scaled_add_residual.cu
-        kernels_cuda/gelu_mul.cu
-        kernels_cuda/silu_mul.cu
-        kernels_cuda/x_quant_i8.cu
-        kernels_cuda/dequant_nvfp4.cu
-        kernels_cuda/dequant_fp8.cu
-        kernels_cuda/cast_to_f32.cu
-        kernels_cuda/neg_exp.cu
-        kernels_cuda/add_one.cu
+        kernels/cuda/llm/moe_topk.cu
+        kernels/cuda/llm/cuda_probe_kernel.cu
+        kernels/cuda/llm/attention_paged_v1.cu
+        kernels/cuda/llm/attention_paged_v2.cu
+        kernels/cuda/common/add_bias.cu
+        kernels/cuda/common/add_residual.cu
+        kernels/cuda/common/add_rmsnorm.cu
+        kernels/cuda/llm/attention.cu
+        kernels/cuda/llm/attention_flash_merge.cu
+        kernels/cuda/llm/attention_flash_partial.cu
+        kernels/cuda/llm/attention_flash_partial_batched.cu
+        kernels/cuda/llm/attention_flash_merge_batched.cu
+        kernels/cuda/llm/attention_flash_partial_fp16.cu
+        kernels/cuda/llm/attention_flash_partial_q8_0.cu
+        kernels/cuda/llm/attention_fp16.cu
+        kernels/cuda/llm/attention_prefill_flash.cu
+        kernels/cuda/llm/attention_prefill_flash_fp16.cu
+        kernels/cuda/llm/attention_prefill_flash_q8_0.cu
+        kernels/cuda/llm/attention_prefill_flash_q8_0_gqa.cu
+        kernels/cuda/llm/attention_q8_0.cu
+        kernels/cuda/llm/kv_quant_commit_q8_0.cu
+        kernels/cuda/common/matmul_q8_0_gemm.cu
+        kernels/cuda/common/matmul_q8_0_gemm_v2.cu
+        kernels/cuda/common/matmul_q8_0_mmq.cu
+        kernels/cuda/common/matmul_q8_0_mmq_tc.cu
+        kernels/cuda/common/matmul_q4k_mmq.cu
+        kernels/cuda/common/matmul_q5k_mmq.cu
+        kernels/cuda/common/matmul_f32_vec.cu
+        kernels/cuda/common/matmul_bf16_vec.cu
+        kernels/cuda/common/matmul_bf16_gemm.cu
+        kernels/cuda/common/quantize_bf16_to_q8_0.cu
+        kernels/cuda/common/quantize_bf16_to_q4k.cu
+        kernels/cuda/common/quantize_bf16_to_q6k.cu
+        kernels/cuda/common/quantize_bf16_to_fp8.cu
+        kernels/cuda/common/matmul_fp8_vec.cu
+        kernels/cuda/common/matmul_fp8_gemm.cu
+        kernels/cuda/common/repackage_nvfp4_to_blk.cu
+        kernels/cuda/common/matmul_nvfp4blk_vec.cu
+        kernels/cuda/common/matmul_nvfp4blk_gemm.cu
+        kernels/cuda/llm/moe_gate_up_fused_k_nvfp4blk_batched.cu
+        kernels/cuda/llm/moe_down_fused_k_nvfp4blk_batched.cu
+        kernels/cuda/llm/moe_gate_up_fused_k_bf16_batched.cu
+        kernels/cuda/llm/moe_down_fused_k_bf16_batched.cu
+        kernels/cuda/common/matmul_q3k_vec.cu
+        kernels/cuda/common/matmul_q4k_vec.cu
+        kernels/cuda/common/matmul_q5_0_vec.cu
+        kernels/cuda/common/matmul_q5k_vec.cu
+        kernels/cuda/common/matmul_q6k_vec.cu
+        kernels/cuda/common/matmul_q8_0_vec.cu
+        kernels/cuda/common/matmul_q8_0_vec_dp4a.cu
+        kernels/cuda/common/matmul_q8_0_vec_reorder.cu
+        kernels/cuda/llm/moe_down_fused_k_q5k.cu
+        kernels/cuda/llm/moe_down_fused_k_q5k_batched.cu
+        kernels/cuda/llm/moe_down_fused_k_q6k_batched.cu
+        kernels/cuda/llm/moe_down_fused_k_q6k.cu
+        kernels/cuda/llm/moe_down_fused_k_q8_0.cu
+        kernels/cuda/llm/moe_gate_up_fused_k_q4k.cu
+        kernels/cuda/llm/moe_gate_up_fused_k_q4k_batched.cu
+        kernels/cuda/llm/ffn_gate_up_fused_q8_0.cu
+        kernels/cuda/common/mul_scalar.cu
+        kernels/cuda/llm/qkv_split.cu
+        kernels/cuda/llm/qkv_split_fp16.cu
+        kernels/cuda/common/rmsnorm.cu
+        kernels/cuda/common/rmsnorm_gemma.cu
+        kernels/cuda/common/rmsnorm_no_weight.cu
+        kernels/cuda/llm/rmsnorm_qkv.cu
+        kernels/cuda/llm/rmsnorm_qkv_fp16.cu
+        kernels/cuda/llm/rope_inplace.cu
+        kernels/cuda/llm/rope_mrope.cu
+        kernels/cuda/llm/rope_mrope_batched.cu
+        kernels/cuda/llm/split_head_pair.cu
+        kernels/cuda/common/sigmoid_gate_mul.cu
+        kernels/cuda/common/l2_norm.cu
+        kernels/cuda/llm/ssm_conv1d.cu
+        kernels/cuda/llm/ssm_conv1d_batched.cu
+        kernels/cuda/llm/gated_deltanet_ar.cu
+        kernels/cuda/llm/gated_deltanet_ar_batched.cu
+        kernels/cuda/llm/deltanet_gate.cu
+        kernels/cuda/llm/deltanet_chunk_cumgate.cu
+        kernels/cuda/llm/deltanet_chunk_forward.cu
+        kernels/cuda/llm/deltanet_chunk_cumgate_batched.cu
+        kernels/cuda/llm/deltanet_chunk_forward_batched.cu
+        kernels/cuda/llm/deltanet_kkt_solve.cu
+        kernels/cuda/common/sigmoid_inplace.cu
+        kernels/cuda/llm/gather_heads_from_channels.cu
+        kernels/cuda/llm/rope_inplace_fp16.cu
+        kernels/cuda/llm/rope_inplace_ff.cu
+        kernels/cuda/common/scaled_add_residual.cu
+        kernels/cuda/common/gelu_mul.cu
+        kernels/cuda/common/silu_mul.cu
+        kernels/cuda/common/x_quant_i8.cu
+        kernels/cuda/common/dequant_nvfp4.cu
+        kernels/cuda/common/dequant_fp8.cu
+        kernels/cuda/common/cast_to_f32.cu
+        kernels/cuda/llm/neg_exp.cu
+        kernels/cuda/llm/add_one.cu
     )
 
     set(PTX_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/ptx)
@@ -795,9 +795,9 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_custom_command(
         OUTPUT ${CUDA_GQA_KTILE64_CU}
         COMMAND ${CMAKE_COMMAND} -E copy
-                ${CMAKE_CURRENT_SOURCE_DIR}/kernels_cuda/attention_prefill_flash_q8_0_gqa.cu
+                ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/llm/attention_prefill_flash_q8_0_gqa.cu
                 ${CUDA_GQA_KTILE64_CU}
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels_cuda/attention_prefill_flash_q8_0_gqa.cu
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/llm/attention_prefill_flash_q8_0_gqa.cu
         VERBATIM
     )
     add_custom_command(
@@ -1473,7 +1473,7 @@ if(MIMIRMIND_ENABLE_HIP)
 
     # ---- hip_rmsnorm_probe — first real HIP kernel bit-parity test ----
     #
-    # Loads rmsnorm.hsaco (compiled from kernels_hip/rmsnorm.hip via
+    # Loads rmsnorm.hsaco (compiled from kernels/hip/common/rmsnorm.hip via
     # hipcc --genco), runs RMSNorm on synthetic M×K input, compares
     # against an inline double-precision CPU reference within abs/rel
     # 1e-4. First concrete "GPU output matches expected" signal from

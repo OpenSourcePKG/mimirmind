@@ -39,7 +39,7 @@ class GpuOps;
  *
  * Skeleton stage (sub-F): ctor loads the 5 Q8_0 matmul kernel modules
  * (`matmul_q8_0_vec`, `_gemm`, `_gemm_v2`, `_vec_dp4a`,
- * `moe_down_fused_k_q8_0`) that already exist under `kernels_hip/`.
+ * `moe_down_fused_k_q8_0`) that already exist under `kernels/hip/llm/`.
  * `supports()`, `dp4aAvailable()`, `moeDownFusedKAvailable()`, `sync()`
  * and `autotuneReport()` are all real. Every matmul-launch method
  * currently throws `std::runtime_error("compute::hip::GpuMatmul::<name>:

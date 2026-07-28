@@ -49,11 +49,6 @@ void Nvfp4Loader::load(InferenceEngine& e,
         throw std::runtime_error("Nvfp4Loader::load: NVFP4 needs the CUDA "
                                  "backend, but this engine picked another");
     }
-    if (tokenizerGguf.empty()) {
-        throw std::runtime_error("Nvfp4Loader::load: models[].tokenizerGguf is "
-                                 "required (the NVFP4 checkpoint ships no GGUF tokenizer)");
-    }
-
     const std::string dir{checkpointDir};
     auto readText = [](const std::filesystem::path& p) -> std::string {
         std::ifstream f(p);
@@ -63,16 +58,26 @@ void Nvfp4Loader::load(InferenceEngine& e,
         return ss.str();
     };
 
-    MM_LOG_INFO("engine", "loadModelNvfp4: '{}' (tokenizer from '{}')",
-                checkpointDir, tokenizerGguf);
-
     // 1. Arch params from config.json (GGUF-metadata parse is GGUF-only).
     e._config = runtime::nvfp4::parseQwen35MoeSafetensorsConfig(
         readText(std::filesystem::path{dir} / "config.json"));
 
-    // 2. Tokenizer via the GGUF shortcut (HF tokenizer.json not parsed yet).
-    e._reader.open(tokenizerGguf);
-    e._tokenizer.loadFromGguf(e._reader);
+    // 2. Tokenizer. NVFP4 checkpoints ship no GGUF tokenizer, so by default
+    //    parse the checkpoint's HF tokenizer.json directly (byte-level BPE,
+    //    Qwen family). An explicit models[].tokenizerGguf still wins — e.g.
+    //    to reuse a llama.cpp GGUF tokenizer for parity testing.
+    if (tokenizerGguf.empty()) {
+        MM_LOG_INFO("engine",
+                    "loadModelNvfp4: '{}' (tokenizer from tokenizer.json)",
+                    checkpointDir);
+        e._tokenizer.loadFromHfJson(dir);
+    } else {
+        MM_LOG_INFO("engine",
+                    "loadModelNvfp4: '{}' (tokenizer from GGUF '{}')",
+                    checkpointDir, tokenizerGguf);
+        e._reader.open(tokenizerGguf);
+        e._tokenizer.loadFromGguf(e._reader);
+    }
 
     // 3. Upload the NVFP4/FP8 weights (+ BF16 passthroughs) to the device.
     runtime::nvfp4::ComputeOpsUploader uploader(*e._ops);

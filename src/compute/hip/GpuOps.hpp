@@ -329,7 +329,7 @@ private:
     static constexpr std::uint32_t kKvQuantCommitLocalSize = 32;
     static constexpr std::uint32_t kAttentionLocalSize    = 16;
     // Matches QKV_SPLIT_LOCAL / QKV_SPLIT_FP16_LOCAL in
-    // kernels_hip/qkv_split{,_fp16}.hip. Numerically equal to
+    // kernels/hip/llm/qkv_split{,_fp16}.hip. Numerically equal to
     // kElementwiseLocalSize today; kept separate so a future retune of
     // the elementwise WG size doesn't silently un-tune qkv_split.
     // (2026-07-17 followup from matmul_q8_0_vec launch-geometry audit.)

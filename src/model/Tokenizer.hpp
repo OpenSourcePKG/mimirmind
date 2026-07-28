@@ -51,6 +51,15 @@ public:
     /// `tokenizer.ggml.tokens` is missing.
     void loadFromGguf(const GgufReader& reader);
 
+    /// Populate vocab, merges and special-token IDs from a HuggingFace
+    /// `tokenizer.json` (+ `tokenizer_config.json` / `generation_config.json`)
+    /// found in `checkpointDir`. Byte-level BPE only (Qwen / GPT-2 family) —
+    /// it fills exactly the same internal state as the gpt2 GGUF path, so
+    /// encode/decode behave identically. Lets NVFP4 checkpoints (which ship
+    /// no GGUF tokenizer) tokenise without a separate GGUF. Throws if the
+    /// tokenizer is not byte-level BPE or the files are missing/malformed.
+    void loadFromHfJson(const std::string& checkpointDir);
+
     [[nodiscard]] std::vector<std::int32_t> encode(std::string_view text,
                                                    bool addBos = true) const;
     [[nodiscard]] std::string                decode(std::span<const std::int32_t> ids,

@@ -27,7 +27,7 @@ void PagedAttentionV1::launch(CudaStream&  stream,
                               PagedKvDtype kvDtype,
                               std::size_t  sharedMemBytes)
 {
-    // Argument order MUST match kernels_cuda/attention_paged_v1.cu
+    // Argument order MUST match kernels/cuda/llm/attention_paged_v1.cu
     // signature slot-for-slot — the kernel reads a raw void** so any
     // divergence here is a silent memory corruption.
     _kernel.clearArgs();
