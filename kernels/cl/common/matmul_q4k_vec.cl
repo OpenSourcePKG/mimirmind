@@ -1,36 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
-
-// Matrix-vector multiply with Q4_K weights, on-the-fly dequant.
 //
-//   Y[n] = sum_{k=0..K-1} X[k] * dequant_q4k(W, n, k)
+// SLM-free Q4_K matvec with split accumulators and widened loads. Each
+// of the 16 subgroup lanes owns a contiguous 2-element span of every
+// 32-element half (lane l -> elements 2l, 2l+1), so it issues one uchar2
+// weight load plus two float2 X loads per half instead of two scalar
+// passes of single-byte / single-float loads. The wider memory
+// transactions keep more loads in flight, which is the lever on this
+// memory-latency-bound path; two independent FMA chains (sumLo/sumHi)
+// break the otherwise-serial accumulation. Measured +16.7% end-to-end
+// decode over the earlier SLM-staged single-accumulator kernel on
+// Qwen2.5-1.5B-Q4_K (Xe-LPG, RP0), parity unchanged.
 //
-//   X:  [K]     F32 dense vector (single token / M=1)
-//   W:  [N, K]  Q4_K — each row is (K/256) super-blocks of 144 bytes
-//   Y:  [N]     F32 dense vector
-//
-// Launch geometry (M5h subgroup-reduce, SLM-free):
-//   local_size_x          = MATMUL_Q4K_LOCAL   (64)
-//   sub_group_size        = MATMUL_Q4K_SG      (16) via intel_reqd_sub_group_size
-//   outputs per workgroup = MATMUL_Q4K_LOCAL / MATMUL_Q4K_SG  (= 4)
-//   global_size_x         = ceil(N / 4) * 64
-//
-// Each subgroup of 16 threads cooperatively computes ONE output by
-// splitting the K-reduction across its members and collapsing with
-// sub_group_reduce_add. Compared to M5e (1 thread per output), per-
-// thread compute drops ~16×, and small-N matmuls (Q/K/V projections)
-// saturate the iGPU much better.
-//
-// X is read straight from global — NO local-memory X-tile. For a matvec
-// every workgroup consumes the SAME X vector, so X stays L2/L3-resident
-// and cache-hot; the earlier SLM staging bought nothing while its two
-// per-tile workgroup barriers throttled occupancy. Dropping it measured
-// +7.7% end-to-end decode on Qwen2.5-1.5B-Q4_K (Xe-LPG, RP0), parity
-// unchanged. `n` is subgroup-uniform, so the early return is
-// subgroup-safe for sub_group_reduce_add.
-//
-// Reference: ggml-quants.c dequantize_row_q4_K. Sub-block iteration
-// matches compute/Dequant.cpp dequantQ4K.
+// Alignment: qs = block+16, block = row + sb*144 (144 % 16 == 0), so qs
+// is 16-byte aligned; qsOffset in {0,32,64,96} is even -> the uchar2 /
+// float2 loads are well-formed.
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
@@ -79,7 +63,10 @@ __kernel void matmul_q4k_vec(
     __global const uchar* row =
         W + (size_t)n * (size_t)nSuper * Q4K_BLOCK_BYTES;
 
-    float sum = 0.0f;
+    const int e2 = 2 * sgLocal;                             // 0,2,..,30
+
+    float sumLo = 0.0f;
+    float sumHi = 0.0f;
 
     for (int sb = 0; sb < nSuper; ++sb) {
         __global const uchar* block = row + sb * Q4K_BLOCK_BYTES;
@@ -104,19 +91,25 @@ __kernel void matmul_q4k_vec(
             const int xLoBase  = xbase + j * 32;
             const int xHiBase  = xbase + (j + 1) * 32;
 
-            // 16 threads share the 32-element half — each does 2.
-            for (int l = sgLocal; l < 32; l += MATMUL_Q4K_SG) {
-                const uchar q   = qs[qsOffset + l];
-                const float qLo = (float)(q & 0x0F);
-                const float qHi = (float)(q >> 4);
-                sum = mad(X[xLoBase + l], d1 * qLo - m1, sum);
-                sum = mad(X[xHiBase + l], d2 * qHi - m2, sum);
-            }
+            // Lane owns the contiguous pair {e2, e2+1} of this 32-half.
+            const uchar2 qq  = vload2(0, qs + qsOffset + e2);
+            const float2 xlo = vload2(0, X + xLoBase + e2);
+            const float2 xhi = vload2(0, X + xHiBase + e2);
+
+            const float q0lo = (float)(qq.s0 & 0x0F);
+            const float q1lo = (float)(qq.s1 & 0x0F);
+            const float q0hi = (float)(qq.s0 >> 4);
+            const float q1hi = (float)(qq.s1 >> 4);
+
+            sumLo = mad(xlo.s0, d1 * q0lo - m1, sumLo);
+            sumLo = mad(xlo.s1, d1 * q1lo - m1, sumLo);
+            sumHi = mad(xhi.s0, d2 * q0hi - m2, sumHi);
+            sumHi = mad(xhi.s1, d2 * q1hi - m2, sumHi);
         }
     }
 
-    // Collapse the 16 partial sums in this subgroup into one.
-    sum = sub_group_reduce_add(sum);
+    // Combine the two independent chains, then collapse across the subgroup.
+    float sum = sub_group_reduce_add(sumLo + sumHi);
 
     if (sgLocal == 0) {
         Y[n] = sum;
