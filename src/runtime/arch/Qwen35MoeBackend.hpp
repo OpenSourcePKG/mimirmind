@@ -99,6 +99,13 @@ public:
                   BlockBuffers& buffers,
                   bool          traceBlock0) override;
 
+    /// This concrete CUDA serving overload shares a name with the new
+    /// ArchBackend::runBlockBatched (the L0 synchronized-decode interface,
+    /// which this backend does not implement — supportsBatchedDecode()
+    /// stays false). Pull the base overload into scope so the concrete one
+    /// below overloads rather than name-hides it (-Woverloaded-virtual).
+    using ArchBackend::runBlockBatched;
+
     /// M-Cuda.Batch D2 — batched serving decode of one layer over nSeq
     /// sequences (one query token each). CUDA-only concrete entry point
     /// (not on the ArchBackend interface); the serving engine calls it

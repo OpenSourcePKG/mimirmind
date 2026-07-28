@@ -55,6 +55,10 @@ public:
                          BlockBuffers&              s,
                          bool                       diag) override;
 
+    [[nodiscard]] bool supportsBatchedDecode() const noexcept override {
+        return true;
+    }
+
     /// M-CLR.MoE Increment 3 — true when every decode block will take the
     /// device-side expert dispatch path (Increment 2), which removes all
     /// host routing reads and makes the block Command-List-Replay-capturable.

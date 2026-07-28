@@ -62,6 +62,15 @@ public:
                   BlockBuffers& buffers,
                   bool          traceBlock0) override;
 
+    void runBlockBatched(std::size_t                blockIdx,
+                         float*                     x,
+                         std::size_t                nSeq,
+                         std::span<KvCache* const>  caches,
+                         BlockBuffers&              buffers,
+                         bool                       diag) override;
+
+    [[nodiscard]] bool supportsBatchedDecode() const noexcept override;
+
     [[nodiscard]] bool        scalesEmbedding() const noexcept override { return true; }
     [[nodiscard]] const char* name()            const noexcept override { return "gemma4"; }
 

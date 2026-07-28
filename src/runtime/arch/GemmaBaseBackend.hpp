@@ -92,6 +92,12 @@ public:
             "runBlockBatched: batched decode not implemented for this backend");
     }
 
+    /// True when this variant implements runBlockBatched (Gemma 4 MoE in
+    /// Phase 1). The Gemma4Backend facade forwards this to ArchBackend.
+    [[nodiscard]] virtual bool supportsBatchedDecode() const noexcept {
+        return false;
+    }
+
     /// Forwarded from the ArchBackend facade so `Gemma4E4BBackend` can
     /// prefetch its per-layer-embedding (PLE) slices and run the
     /// per_layer_model_proj chain before the block chain runs. Default

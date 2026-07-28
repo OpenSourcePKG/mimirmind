@@ -370,6 +370,31 @@ public:
     generateBatch(const std::vector<std::vector<std::int32_t>>& prompts,
                   std::size_t maxNew, std::int32_t eosId);
 
+    /**
+     * M-L0.Batch Phase 1 — synchronized batched greedy decode for the L0
+     * Gemma 4 MoE backend. Runs `prompts.size()` sequences lock-step
+     * through the batched decode block (`runBlockBatched`), each with its
+     * OWN single-sequence KvCache so they may sit at different positions.
+     * Each sequence is prefilled individually (single-seq runBlock), then
+     * all sequences decode together at M=nSeq — the block matmuls amortize
+     * their weight reads across the batch (the GEMV→GEMM lever).
+     *
+     * Greedy/argmax only (the parity gate): with identical prompts every
+     * stream is identical AND matches single-session greedy generate();
+     * with different prompts each stream matches that prompt's own greedy
+     * generate(). A finished sequence (hit `eosId`, or a negative `eosId`
+     * disables the stop) keeps stepping with output ignored until all are
+     * done or `maxNew` tokens are produced. Returns one token stream per
+     * prompt (excluding the prompt).
+     *
+     * Requires `_backend->supportsBatchedDecode()` (L0 Gemma 4 MoE) and
+     * F32 KV; throws otherwise. Not thread-safe — one call at a time, like
+     * generate().
+     */
+    [[nodiscard]] std::vector<std::vector<std::int32_t>>
+    generateBatchL0(const std::vector<std::vector<std::int32_t>>& prompts,
+                    std::size_t maxNew, std::int32_t eosId);
+
     // ================================================================
     // M-Cuda.Batch D2e.2 — continuous-batching serving primitives.
     //

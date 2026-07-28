@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -73,6 +74,34 @@ public:
                           KvCache&      cache,
                           BlockBuffers& buffers,
                           bool          traceBlock0) = 0;
+
+    /// M-L0.Batch Phase 1 — run one transformer block for `nSeq`
+    /// lock-step decode sequences at once (each contributes one row of
+    /// `x`, T=1). `caches[i]` is sequence i's own KvCache; all sit at
+    /// their pre-forward length (the caller commits each once after the
+    /// whole block chain). Batches the position-independent matmuls at
+    /// M=nSeq and loops per sequence only for attention/RoPE. Default
+    /// throws — only backends that implement synchronized batched decode
+    /// override it. `supportsBatchedDecode()` reports availability.
+    virtual void runBlockBatched(std::size_t                blockIdx,
+                                 float*                     x,
+                                 std::size_t                nSeq,
+                                 std::span<KvCache* const>  caches,
+                                 BlockBuffers&              buffers,
+                                 bool                       diag) {
+        (void)blockIdx; (void)x; (void)nSeq; (void)caches;
+        (void)buffers; (void)diag;
+        throw std::runtime_error(
+            "runBlockBatched: synchronized batched decode not supported by "
+            "this architecture backend");
+    }
+
+    /// True when `runBlockBatched` is implemented for this backend (L0
+    /// Gemma 4 MoE in Phase 1). InferenceEngine's batched harness checks
+    /// this before allocating per-sequence state. Default false.
+    [[nodiscard]] virtual bool supportsBatchedDecode() const noexcept {
+        return false;
+    }
 
     /// True if the arch needs the token embedding to be scaled by
     /// sqrt(d_model) before the first block (Gemma family). InferenceEngine

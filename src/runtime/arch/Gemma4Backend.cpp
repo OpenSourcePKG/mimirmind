@@ -49,6 +49,19 @@ void Gemma4Backend::runBlock(std::size_t   blockIdx,
     _impl->runBlock(blockIdx, x, T, cache, buffers, traceBlock0);
 }
 
+void Gemma4Backend::runBlockBatched(std::size_t                blockIdx,
+                                    float*                     x,
+                                    std::size_t                nSeq,
+                                    std::span<KvCache* const>  caches,
+                                    BlockBuffers&              buffers,
+                                    bool                       diag) {
+    _impl->runBlockBatched(blockIdx, x, nSeq, caches, buffers, diag);
+}
+
+bool Gemma4Backend::supportsBatchedDecode() const noexcept {
+    return _impl->supportsBatchedDecode();
+}
+
 std::vector<std::size_t> Gemma4Backend::kvDimPerLayer() const {
     return _impl->kvDimPerLayer();
 }

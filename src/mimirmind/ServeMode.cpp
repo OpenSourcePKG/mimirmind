@@ -437,6 +437,106 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             return 0;
         }
 
+        // M-L0.Batch Phase 1 — L0 synchronized batched decode parity + perf.
+        // With MIMIRMIND_L0_BATCH set, run the Gemma 4 MoE batched decode
+        // path (generateBatchL0): first a greedy parity gate (nSeq identical
+        // prompts must produce identical streams AND match single-seq greedy
+        // generate()), then a throughput sweep over nSeq. Prints and exits
+        // before the HTTP server starts. Xe-LPG / Gemma 4 MoE only.
+        if (std::getenv("MIMIRMIND_L0_BATCH") != nullptr) {
+            const auto& tok = e->tokenizer();
+            auto base = tok.encode("The capital of France is", /*addBos=*/false);
+            if (base.empty()) base.push_back(1);
+            if (const char* np = std::getenv("MIMIRMIND_BATCH_NP")) {
+                const long n = std::strtol(np, nullptr, 10);
+                if (n > 0 && static_cast<std::size_t>(n) < base.size()) {
+                    base.resize(static_cast<std::size_t>(n));
+                }
+            }
+            const bool quick = std::getenv("MIMIRMIND_BENCH_QUICK") != nullptr;
+            const std::size_t maxNew    = quick ? 4 : 24;
+            const std::size_t promptLen = base.size();
+
+            try {
+                // --- (1c) greedy parity: nSeq=2 identical vs single-seq ----
+                ::mimirmind::runtime::GenerateParams gp{};
+                gp.maxNewTokens         = maxNew;
+                gp.sampling.temperature = 0.0F;   // greedy argmax
+                e->resetCache();
+                const std::vector<std::int32_t> ref =
+                    e->generate(base, gp, {}, nullptr, {}, {});
+
+                const std::size_t nParity = 2;
+                std::vector<std::vector<std::int32_t>> pprompts(nParity, base);
+                auto batched = e->generateBatchL0(pprompts, maxNew, /*eosId=*/-1);
+
+                bool allSeqEqual = true;
+                for (std::size_t s = 1; s < nParity; ++s) {
+                    if (batched[s] != batched[0]) allSeqEqual = false;
+                }
+                std::size_t matchLen = 0;
+                const std::size_t cmpN = std::min(batched[0].size(), ref.size());
+                for (; matchLen < cmpN; ++matchLen) {
+                    if (batched[0][matchLen] != ref[matchLen]) break;
+                }
+                std::cout << "\n[M-L0.Batch parity] nSeq=" << nParity
+                          << " maxNew=" << maxNew
+                          << " promptTokens=" << promptLen << "\n"
+                          << "  batched[0] :";
+                for (auto t : batched[0]) std::cout << ' ' << t;
+                std::cout << "\n  single-seq :";
+                for (auto t : ref) std::cout << ' ' << t;
+                std::cout << "\n  all-seq-identical=" << (allSeqEqual ? "YES" : "NO")
+                          << "  ref-match-prefix=" << matchLen << "/" << ref.size()
+                          << ((matchLen == ref.size() && allSeqEqual)
+                                  ? "  => PASS"
+                                  : "  => CHECK")
+                          << "\n";
+
+                // --- (1d) throughput sweep over nSeq ------------------------
+                std::cout << "[M-L0.Batch bench] promptLen=" << promptLen
+                          << " maxNew=" << maxNew << "\n";
+                {
+                    e->resetCache();
+                    const auto s0 = std::chrono::steady_clock::now();
+                    auto sref = e->generate(base, gp, {}, nullptr, {}, {});
+                    const auto s1 = std::chrono::steady_clock::now();
+                    const double sms =
+                        std::chrono::duration<double, std::milli>(s1 - s0).count();
+                    std::cout << "  single-seq generate(): " << sms << " ms  "
+                              << (sms / static_cast<double>(sref.size()))
+                              << " ms/tok  "
+                              << (1000.0 * static_cast<double>(sref.size()) / sms)
+                              << " tok/s\n";
+                    std::cout.flush();
+                }
+                const std::vector<std::size_t> batchSizes =
+                    quick ? std::vector<std::size_t>{1}
+                          : std::vector<std::size_t>{1, 2, 4, 8};
+                for (std::size_t nSeq : batchSizes) {
+                    std::vector<std::vector<std::int32_t>> prompts(nSeq, base);
+                    (void)e->generateBatchL0(prompts, quick ? 2 : 4, -1); // warm
+                    const auto t0 = std::chrono::steady_clock::now();
+                    (void)e->generateBatchL0(prompts, maxNew, /*eosId=*/-1);
+                    const auto t1 = std::chrono::steady_clock::now();
+                    const double ms =
+                        std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    const std::size_t steps   = promptLen + maxNew;
+                    const std::size_t genToks = nSeq * maxNew;
+                    std::cout << "  nSeq=" << nSeq
+                              << "  total=" << ms << " ms  "
+                              << (ms / static_cast<double>(steps)) << " ms/step  "
+                              << (1000.0 * static_cast<double>(genToks) / ms)
+                              << " gen-tok/s\n";
+                    std::cout.flush();
+                }
+            } catch (const std::exception& ex) {
+                std::cout << "\n[M-L0.Batch] unavailable for this model: "
+                          << ex.what() << "\n";
+            }
+            return 0;
+        }
+
         // M-Cuda.Batch D2e.2 — continuous-batching STEP-loop validation.
         // With MIMIRMIND_SERVING_LOOP set, drive the persistent per-slot
         // stepServing() interface as a hand-rolled continuous batcher:

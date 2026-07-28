@@ -1757,6 +1757,205 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     return generated;
 }
 
+std::vector<std::vector<std::int32_t>>
+InferenceEngine::generateBatchL0(
+        const std::vector<std::vector<std::int32_t>>& prompts,
+        std::size_t maxNew, std::int32_t eosId) {
+    namespace cmp = mimirmind::compute;
+
+    if (!_modelLoaded) {
+        throw std::runtime_error("generateBatchL0: no model loaded");
+    }
+    if (prompts.empty()) {
+        throw std::runtime_error("generateBatchL0: no prompts");
+    }
+    if (!_backend->supportsBatchedDecode()) {
+        throw std::runtime_error(
+            "generateBatchL0: the active backend does not implement "
+            "synchronized batched decode (L0 Gemma 4 MoE only in Phase 1)");
+    }
+    if (_kvDtype != KvDtype::F32) {
+        throw std::runtime_error(
+            "generateBatchL0: Phase 1 supports F32 KV only");
+    }
+    const std::size_t nSeq = prompts.size();
+    for (const auto& p : prompts) {
+        if (p.empty()) {
+            throw std::runtime_error("generateBatchL0: empty prompt");
+        }
+    }
+    if (maxNew == 0) {
+        return std::vector<std::vector<std::int32_t>>(nSeq);
+    }
+
+    // --- weight tensors (mirror generate()) -----------------------------
+    const auto* tokEmb = _weights->find("token_embd.weight");
+    if (tokEmb == nullptr) {
+        tokEmb = _weights->find("tok_embeddings.weight");
+    }
+    const auto* outNorm = _weights->find("output_norm.weight");
+    const auto* lmHead  = _weights->find("output.weight");
+    if (lmHead == nullptr) {
+        lmHead = _weights->find("token_embd.weight");
+    }
+    if (tokEmb == nullptr) {
+        throw std::runtime_error("generateBatchL0: token embedding missing");
+    }
+    if (outNorm == nullptr || outNorm->type != core::gguf::GgmlType::F32) {
+        throw std::runtime_error(
+            "generateBatchL0: output_norm.weight missing or not F32");
+    }
+    if (lmHead == nullptr) {
+        throw std::runtime_error("generateBatchL0: lm_head tensor missing");
+    }
+
+    const std::size_t d_model  = _config.embeddingLength;
+    const std::size_t vocab_lm = lmHead->dimensions.size() >= 2
+                                    ? lmHead->dimensions[1]
+                                    : _tokenizer.vocabSize();
+    const std::size_t vocab_emb = tokEmb->dimensions.size() >= 2
+                                    ? tokEmb->dimensions[1]
+                                    : _tokenizer.vocabSize();
+
+    std::size_t maxPrefill = 0;
+    for (const auto& p : prompts) {
+        maxPrefill = std::max(maxPrefill, p.size());
+    }
+    // BlockBuffers / xBuf must hold the wider of a prefill chunk (T=Tp)
+    // and a batched decode row-set (T=nSeq).
+    const std::size_t maxT = std::max(maxPrefill, nSeq);
+    ensureCapacity(maxT, maxPrefill, maxNew, vocab_lm, d_model);
+
+    BlockBuffers& buffers  = *_blockBuffers;
+    float* const  xBuf     = _xBufH     .as<float>();
+    float* const  normFinal= _normFinalH.as<float>();
+    float* const  logits   = _logitsH   .as<float>();
+    float* const  logitsSc = _logitsScH .as<float>();
+
+    // One independent single-sequence KvCache per stream. These are local
+    // to the call (the persistent _kvCache is the single-session path).
+    std::vector<std::unique_ptr<KvCache>> caches;
+    std::vector<KvCache*>                 cachePtrs;
+    caches.reserve(nSeq);
+    cachePtrs.reserve(nSeq);
+    for (std::size_t i = 0; i < nSeq; ++i) {
+        caches.push_back(std::make_unique<KvCache>(
+            *_ops, _maxContextTokens,
+            _backend->kvDimPerLayer(),
+            _backend->kvSourceLayerPerLayer(),
+            _kvDtype));
+        cachePtrs.push_back(caches.back().get());
+    }
+    const std::span<KvCache* const> cacheSpan{cachePtrs};
+
+    const bool  embedScaleEnabled = _backend->scalesEmbedding();
+    const float embedScale = embedScaleEnabled
+        ? std::sqrt(static_cast<float>(d_model))
+        : 1.0F;
+    auto scaleEmbeddingIfNeeded = [&](float* dst, std::size_t T) {
+        if (embedScaleEnabled && T > 0) {
+            _ops->mulScalarAsync(dst, embedScale, T * d_model);
+        }
+    };
+
+    // Greedy sampling — the parity gate. temperature <= 0 is argmax; the
+    // final-logit softcap is applied inside sampleNext.
+    compute::SamplingParams greedy{};
+    greedy.temperature = 0.0F;
+
+    std::vector<std::vector<std::int32_t>> streams(nSeq);
+    std::vector<std::int32_t>              current(nSeq, 0);
+    std::vector<bool>                      finished(nSeq, false);
+
+    // --- per-sequence prefill (single-seq runBlock into each cache) -----
+    constexpr std::size_t kPrefillDrainThreshold = 256;
+    for (std::size_t i = 0; i < nSeq; ++i) {
+        const std::span<const std::int32_t> ids{prompts[i]};
+        const std::size_t Tp = ids.size();
+
+        cmp::embeddingLookup(tokEmb->type, tokEmb->usmPtr,
+                             d_model, vocab_emb, ids, xBuf);
+        scaleEmbeddingIfNeeded(xBuf, Tp);
+        _backend->prepareForward(ids, xBuf, Tp);
+
+        const bool drainPerBlock = Tp > kPrefillDrainThreshold;
+        for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
+            _backend->runBlock(b, xBuf, Tp, *caches[i], buffers, false);
+            if (drainPerBlock) {
+                _ops->flush();
+            }
+        }
+        caches[i]->commit(Tp);
+
+        // First token from the last prefill row.
+        const float* lastRow = xBuf + (Tp - 1) * d_model;
+        const std::int32_t first = sampleNext(
+            lastRow, vocab_lm, *outNorm, *lmHead,
+            normFinal, logits, logitsSc, ids, greedy);
+        streams[i].push_back(first);
+        current[i] = first;
+        if (eosId >= 0 && first == eosId) {
+            finished[i] = true;
+        }
+    }
+
+    // --- lock-step batched decode ---------------------------------------
+    // Each iteration embeds every stream's current token into a contiguous
+    // [nSeq, d_model] batch, runs the batched block chain, commits one row
+    // to every cache, then greedily samples per stream.
+    for (std::size_t produced = 1; produced < maxNew; ++produced) {
+        bool allDone = true;
+        for (std::size_t i = 0; i < nSeq; ++i) {
+            if (!finished[i]) { allDone = false; break; }
+        }
+        if (allDone) {
+            break;
+        }
+        // Position guard — every cache advances one row this step; stop if
+        // the batch would overflow the configured context.
+        std::size_t maxLen = 0;
+        for (std::size_t i = 0; i < nSeq; ++i) {
+            maxLen = std::max(maxLen, caches[i]->length());
+        }
+        if (maxLen + 1 > _maxContextTokens) {
+            break;
+        }
+
+        cmp::embeddingLookup(tokEmb->type, tokEmb->usmPtr,
+                             d_model, vocab_emb,
+                             std::span<const std::int32_t>{current}, xBuf);
+        scaleEmbeddingIfNeeded(xBuf, nSeq);
+        _backend->prepareForward(
+            std::span<const std::int32_t>{current}, xBuf, nSeq);
+
+        for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
+            _backend->runBlockBatched(b, xBuf, nSeq, cacheSpan, buffers, false);
+        }
+        for (std::size_t i = 0; i < nSeq; ++i) {
+            caches[i]->commit(1);
+        }
+
+        for (std::size_t i = 0; i < nSeq; ++i) {
+            // Finished streams keep stepping (their row was computed and
+            // committed to keep the batch lock-step) but produce no output.
+            if (finished[i]) {
+                continue;
+            }
+            const std::int32_t next = sampleNext(
+                xBuf + i * d_model, vocab_lm, *outNorm, *lmHead,
+                normFinal, logits, logitsSc,
+                std::span<const std::int32_t>{streams[i]}, greedy);
+            streams[i].push_back(next);
+            current[i] = next;
+            if (eosId >= 0 && next == eosId) {
+                finished[i] = true;
+            }
+        }
+    }
+
+    return streams;
+}
+
 std::vector<std::vector<float>>
 InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
     namespace cmp = mimirmind::compute;
