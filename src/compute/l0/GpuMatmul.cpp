@@ -637,12 +637,68 @@ void GpuMatmul::autotune(core::l0::UsmAllocator&          allocator,
             const std::size_t savedMinM = entry.gemmMinM;
             entry.gemmMinM = 2;
 
-            // Warmup — one shot at Mmax to prime the JIT.
+            // Warmup — one shot at Mmax to prime the JIT. Leaves the v2
+            // result for Mmax in yUsm, which the parity gate below reads.
             matmulAsync(type, wUsm, N, K,
                         static_cast<const float*>(xUsm), Mmax,
                         static_cast<float*>(yUsm),
                         static_cast<float*>(sUsm));
             _queue.flush();
+
+            // v2 parity gate — the v1 gate above validates the v1 kernel,
+            // but v2 may differ numerically (e.g. plain-fma accumulation
+            // vs v1's Kahan), so the actual v2 kernel MUST be validated
+            // against the matvec reference before it is allowed to
+            // dispatch. Reads the warmup's v2 output (yUsm) and recomputes
+            // the matvec reference at Mmax.
+            bool v2ParityOk = true;
+            {
+                const std::size_t elts = Mmax * N;
+                std::vector<float> yV2(elts);
+                std::vector<float> yRef(elts);
+                std::memcpy(yV2.data(), yUsm, elts * sizeof(float));
+
+                entry.useGemmV2 = false;
+                entry.gemmMinM  = kGemmMinMNever;   // force matvec-loop
+                for (std::size_t m = 0; m < Mmax; ++m) {
+                    matmulAsync(type, wUsm, N, K,
+                                static_cast<const float*>(xUsm) + m * K,
+                                /*M=*/1,
+                                static_cast<float*>(yUsm) + m * N,
+                                static_cast<float*>(sUsm));
+                }
+                _queue.flush();
+                std::memcpy(yRef.data(), yUsm, elts * sizeof(float));
+                entry.useGemmV2 = true;             // restore for timing
+                entry.gemmMinM  = 2;
+
+                float maxDiff = 0.0F;
+                float maxRel  = 0.0F;
+                for (std::size_t i = 0; i < elts; ++i) {
+                    const float d = std::fabs(yRef[i] - yV2[i]);
+                    if (d > maxDiff) maxDiff = d;
+                    const float ref = std::fabs(yRef[i]);
+                    if (ref > 1e-6F) {
+                        const float r = d / ref;
+                        if (r > maxRel) maxRel = r;
+                    }
+                }
+                constexpr float kAbsTol = 5e-2F;
+                constexpr float kRelTol = 5e-2F;
+                v2ParityOk = (maxDiff <= kAbsTol) || (maxRel <= kRelTol);
+                if (v2ParityOk) {
+                    MM_LOG_INFO("gpummm",
+                                "autotune v2 parity OK for {} — v2 vs "
+                                "matvec maxDiff={:.6g} maxRel={:.6g}",
+                                qt->name(), maxDiff, maxRel);
+                } else {
+                    MM_LOG_WARN("gpummm",
+                                "autotune v2 parity FAIL for {} — v2 vs "
+                                "matvec maxDiff={:.6g} maxRel={:.6g}. v2 "
+                                "dispatch disabled (matvec fallback).",
+                                qt->name(), maxDiff, maxRel);
+                }
+            }
 
             for (std::size_t bi = 0; bi < kAutotuneMBuckets.size(); ++bi) {
                 const std::size_t Mb = kAutotuneMBuckets[bi];
@@ -685,7 +741,7 @@ void GpuMatmul::autotune(core::l0::UsmAllocator&          allocator,
             // manually. Winning is defined against matvec (vecMsAtM),
             // not against v1, because that's the actual dispatch
             // fallback when GEMM isn't picked.
-            if (features.gemmV2) {
+            if (features.gemmV2 && v2ParityOk) {
                 entry.useGemmV2 = true;
                 for (std::size_t bi = 0;
                      bi < kAutotuneMBuckets.size(); ++bi)
