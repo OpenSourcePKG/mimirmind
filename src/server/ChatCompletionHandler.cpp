@@ -70,11 +70,9 @@ std::vector<std::int32_t> runViaBatcher(
 
 ChatCompletionHandler::ChatCompletionHandler(RequestDispatcher&        dispatcher,
                                               RequestTracker&           tracker,
-                                              model::ChatTemplate::Style chatStyle,
                                               const ServerConfig&        cfg)
     : _dispatcher{dispatcher},
       _tracker{tracker},
-      _chatStyle{chatStyle},
       _cfg{cfg} {}
 
 bool ChatCompletionHandler::prepareChatRequest(
@@ -92,14 +90,21 @@ bool ChatCompletionHandler::prepareChatRequest(
     }
 
     const auto& tok = targetEngine.tokenizer();
+    // The chat-template style is per-model: a multi-model server may serve
+    // a gemma4 default alongside a qwen2 "fast" model, and each needs its
+    // own template. Resolve it from the REQUESTED model's architecture,
+    // not the process-wide default set at construction.
+    const model::ChatTemplate::Style style =
+        model::ChatTemplate::detectFromArch(
+            targetEngine.config().architecture);
     // M-PT: work on a mutable copy so the trim loop can drop entries
     // without touching the parsed request. Also lets us report the
     // original prompt-token count in the response.
     std::vector<model::ChatMessage> msgs = cr.messages;
     promptIds = model::ChatTemplate::encode(
-        _chatStyle, tok, msgs, /*addGenerationPrompt=*/true);
+        style, tok, msgs, /*addGenerationPrompt=*/true);
 
-    stopIds = model::ChatTemplate::stopIds(_chatStyle, tok);
+    stopIds = model::ChatTemplate::stopIds(style, tok);
     PromptTrimmer::extendStopIds(tok, cr.stopStrings, stopIds);
 
     params.maxNewTokens = cr.maxTokens > 0 ? cr.maxTokens : _cfg.defaultMaxNew;
@@ -111,7 +116,7 @@ bool ChatCompletionHandler::prepareChatRequest(
         if (!PromptTrimmer::applyPromptTrim(msgs, promptIds, params.maxNewTokens,
                              targetEngine.maxContextTokens(),
                              targetEngine.config().contextLength,
-                             tok, _chatStyle, report, trimErr)) {
+                             tok, style, report, trimErr)) {
             sendError(res, 400, "invalid_request_error", trimErr);
             return false;
         }
@@ -320,7 +325,10 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     const std::string rawText  = tok.decode(visible, /*skipSpecial=*/true);
     const std::string text     = _cfg.preserveThinking
         ? rawText
-        : model::ChatTemplate::cleanResponse(_chatStyle, rawText);
+        : model::ChatTemplate::cleanResponse(
+              model::ChatTemplate::detectFromArch(
+                  engine.config().architecture),
+              rawText);
 
     const std::int64_t now   = unixNow();
     const std::string finish = hitStop ? "stop" : "length";
@@ -447,8 +455,9 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                       model::ChatTemplate::Style::QwenChatML, -1, -1}
                 : model::ResponseCleaner::forStyle(style, tok)} {}
     };
-    auto state = std::make_shared<StreamState>(_chatStyle, engine.tokenizer(),
-                                               _cfg.preserveThinking);
+    auto state = std::make_shared<StreamState>(
+        model::ChatTemplate::detectFromArch(engine.config().architecture),
+        engine.tokenizer(), _cfg.preserveThinking);
     state->promptIds = std::move(promptIds);
     state->stopIds   = std::move(stopIds);
     state->params    = std::move(params);

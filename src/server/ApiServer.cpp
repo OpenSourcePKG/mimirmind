@@ -30,7 +30,6 @@ struct ApiServer::Impl {
     RequestDispatcher                     dispatcher;
     runtime::InferenceEngine&             engine;    // == dispatcher.defaultEngine()
     ServerConfig                          cfg;
-    model::ChatTemplate::Style            chatStyle;
     httplib::Server                       server;
     std::atomic_bool                      started{false};
 
@@ -50,10 +49,8 @@ struct ApiServer::Impl {
                      c.speculativeTargetId, c.speculative},
           engine{dispatcher.defaultEngine()},
           cfg{std::move(c)},
-          chatStyle{model::ChatTemplate::detectFromArch(
-              engine.config().architecture)},
           statusBuilder{engine, dispatcher, requestTracker, cfg.modelId},
-          chatHandler{dispatcher, requestTracker, chatStyle, cfg} {
+          chatHandler{dispatcher, requestTracker, cfg} {
         installRoutes();
     }
 

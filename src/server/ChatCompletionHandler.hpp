@@ -29,7 +29,6 @@ class ChatCompletionHandler {
 public:
     ChatCompletionHandler(RequestDispatcher&        dispatcher,
                            RequestTracker&           tracker,
-                           model::ChatTemplate::Style chatStyle,
                            const ServerConfig&        cfg);
 
     ChatCompletionHandler(const ChatCompletionHandler&)            = delete;
@@ -54,7 +53,6 @@ private:
 
     RequestDispatcher&         _dispatcher;
     RequestTracker&            _tracker;
-    model::ChatTemplate::Style _chatStyle;
     const ServerConfig&        _cfg;
 };
 
