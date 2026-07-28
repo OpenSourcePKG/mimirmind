@@ -1,27 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
-
-// Matrix-vector multiply with Q6_K weights, on-the-fly dequant.
 //
-//   Y[n] = sum_{k=0..K-1} X[k] * dequant_q6k(W, n, k)
-//
-//   X:  [K]     F32 dense vector (single token / M=1)
-//   W:  [N, K]  Q6_K — each row is (K/256) super-blocks of 210 bytes.
-//   Y:  [N]     F32 dense vector
-//
-// Launch geometry (M5h subgroup-reduce):
-//   local_size_x          = MATMUL_Q6K_LOCAL   (64)
-//   sub_group_size        = MATMUL_Q6K_SG      (16) via intel_reqd_sub_group_size
-//   outputs per workgroup = MATMUL_Q6K_LOCAL / MATMUL_Q6K_SG  (= 4)
-//   global_size_x         = ceil(N / 4) * 64
-//
-// Q6_K super-block layout (matches ggml block_q6_K):
-//   uint8  ql[128]    : lower 4 bits of 256 6-bit quants
-//   uint8  qh[64]     : upper 2 bits of 256 6-bit quants
-//   int8   scales[16] : 16 signed scales, one per 16-element sub-block
-//   fp16   d          : super-block scale
-//
-// Per element: q in [-32, 31], value = d * scales[is] * q
+// SLM-free Q6_K matvec with plain-fma split accumulators. Drops (1) the
+// local-memory X-tile and its two per-tile barriers — for a matvec X is
+// shared by every workgroup and stays cache-hot — and (2) the
+// volatile-Kahan accumulation, which forced every term through memory (the
+// same latency killer the Q6_K GEMM fix c82a349 removed). Four independent
+// accumulators (one per q1..q4 stream) break the dependency chain, which
+// also recovers most of Kahan's precision without the volatile traffic.
+// Measured +11.9% end-to-end decode on Qwen2.5-1.5B-Q4_K_M (its
+// down_proj/output are Q6_K) on Xe-LPG (RP0); startup vec-parity maxDiff
+// 1.9e-4, well inside the gate. Also speeds the 26B expert-down decode.
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
@@ -39,9 +28,6 @@
 #define Q6K_BLOCK_ELEMENTS 256
 #define Q6K_BLOCK_BYTES    210
 
-// 1024 elements = 4 super-blocks = 4 KiB SLM per workgroup.
-#define X_TILE_ELEMENTS 1024
-
 __attribute__((reqd_work_group_size(MATMUL_Q6K_LOCAL, 1, 1)))
 __attribute__((intel_reqd_sub_group_size(MATMUL_Q6K_SG)))
 __kernel void matmul_q6k_vec(
@@ -51,106 +37,64 @@ __kernel void matmul_q6k_vec(
     const int             K,
     const int             N)
 {
-    __local float xTile[X_TILE_ELEMENTS];
-
     const int  wg      = (int)get_group_id(0);
-    const int  sgInWg  = (int)get_sub_group_id();           // 0..3
-    const int  sgLocal = (int)get_sub_group_local_id();     // 0..15
-    const int  tid     = (int)get_local_id(0);
-    const int  lsize   = (int)get_local_size(0);
+    const int  sgInWg  = (int)get_sub_group_id();
+    const int  sgLocal = (int)get_sub_group_local_id();
     const int  n       = wg * MATMUL_Q6K_OUTPUTS_PER_GROUP + sgInWg;
-    const bool active  = (n < N);
+    if (n >= N) return;
+
     const int  nSuper  = K / Q6K_BLOCK_ELEMENTS;
+    __global const uchar* row =
+        W + (size_t)n * (size_t)nSuper * Q6K_BLOCK_BYTES;
 
-    // Kahan compensated summation in FP32 (Xe-LPG has no native FP64).
-    // Keeps ~24 bits of precision through the ~K/16 terms each sub-group
-    // lane accumulates, vs ~17 bits with naive FP32 mad-chain.
-    // `kc` is the running compensation term; `volatile` forces the compiler
-    // to preserve the (t - sum) - y cancellation that Kahan depends on.
-    float          sum = 0.0f;
-    volatile float kc  = 0.0f;
+    float acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f, acc4 = 0.0f;
 
-    for (int tile = 0; tile < K; tile += X_TILE_ELEMENTS) {
-        const int tileK = min(X_TILE_ELEMENTS, K - tile);
-        for (int i = tid; i < tileK; i += lsize) {
-            xTile[i] = X[tile + i];
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
+    for (int sb = 0; sb < nSuper; ++sb) {
+        __global const uchar* block = row + sb * Q6K_BLOCK_BYTES;
 
-        if (active) {
-            __global const uchar* row =
-                W + (size_t)n * (size_t)nSuper * Q6K_BLOCK_BYTES;
+        __global const uchar* ql = block;              // 128 bytes
+        __global const uchar* qh = block + 128;        // 64 bytes
+        __global const char*  sc = (__global const char*)(block + 192);
+        const float d = vload_half(0, (__global const half*)(block + 208));
 
-            const int sbStart  = tile / Q6K_BLOCK_ELEMENTS;
-            const int sbInTile = X_TILE_ELEMENTS / Q6K_BLOCK_ELEMENTS;
-            const int sbEnd    = min(sbStart + sbInTile, nSuper);
+        const int xBlockBase = sb * Q6K_BLOCK_ELEMENTS;
 
-            for (int sb = sbStart; sb < sbEnd; ++sb) {
-                __global const uchar* block = row + sb * Q6K_BLOCK_BYTES;
+        // Two 128-element halves per super-block.
+        for (int hIdx = 0; hIdx < 2; ++hIdx) {
+            const int xHalfBase = xBlockBase + hIdx * 128;
+            __global const uchar* qlp = ql + hIdx * 64;
+            __global const uchar* qhp = qh + hIdx * 32;
+            __global const char*  scp = sc + hIdx * 8;
 
-                __global const uchar* ql = block;              // 128 bytes
-                __global const uchar* qh = block + 128;        // 64 bytes
-                __global const char*  sc =
-                    (__global const char*)(block + 192);       // 16 signed
-                const float d =
-                    vload_half(0, (__global const half*)(block + 208));
+            // 16 threads share the 32-element inner span (4 mads each).
+            for (int l = sgLocal; l < 32; l += MATMUL_Q6K_SG) {
+                const int is = l / 16;
 
-                const int xLocalBase = (sb - sbStart) * Q6K_BLOCK_ELEMENTS;
+                const char q1 = (char)((qlp[l +  0] & 0x0F) |
+                                       (((qhp[l] >> 0) & 0x03) << 4)) - 32;
+                const char q2 = (char)((qlp[l + 32] & 0x0F) |
+                                       (((qhp[l] >> 2) & 0x03) << 4)) - 32;
+                const char q3 = (char)((qlp[l +  0] >> 4) |
+                                       (((qhp[l] >> 4) & 0x03) << 4)) - 32;
+                const char q4 = (char)((qlp[l + 32] >> 4) |
+                                       (((qhp[l] >> 6) & 0x03) << 4)) - 32;
 
-                // Two 128-element halves per super-block.
-                for (int hIdx = 0; hIdx < 2; ++hIdx) {
-                    const int xHalfBase = xLocalBase + hIdx * 128;
-                    __global const uchar* qlp = ql + hIdx * 64;
-                    __global const uchar* qhp = qh + hIdx * 32;
-                    __global const char*  scp = sc + hIdx * 8;
+                const float s0 = d * (float)scp[is + 0];
+                const float s2 = d * (float)scp[is + 2];
+                const float s4 = d * (float)scp[is + 4];
+                const float s6 = d * (float)scp[is + 6];
 
-                    // 16 threads share the 32-element inner span (4 mads each).
-                    for (int l = sgLocal; l < 32; l += MATMUL_Q6K_SG) {
-                        const int is = l / 16;
-
-                        const char q1 = (char)((qlp[l +  0] & 0x0F) |
-                                               (((qhp[l] >> 0) & 0x03) << 4)) - 32;
-                        const char q2 = (char)((qlp[l + 32] & 0x0F) |
-                                               (((qhp[l] >> 2) & 0x03) << 4)) - 32;
-                        const char q3 = (char)((qlp[l +  0] >> 4) |
-                                               (((qhp[l] >> 4) & 0x03) << 4)) - 32;
-                        const char q4 = (char)((qlp[l + 32] >> 4) |
-                                               (((qhp[l] >> 6) & 0x03) << 4)) - 32;
-
-                        const float s0 = d * (float)scp[is + 0];
-                        const float s2 = d * (float)scp[is + 2];
-                        const float s4 = d * (float)scp[is + 4];
-                        const float s6 = d * (float)scp[is + 6];
-
-                        // Kahan-compensated accumulation, 4 terms per iter.
-                        // y = term - kc; t = sum + y; kc = (t - sum) - y; sum = t.
-                        #define KAHAN_ADD(term)                              \
-                            do {                                              \
-                                const float _y = (term) - kc;                 \
-                                const float _t = sum + _y;                    \
-                                kc  = (_t - sum) - _y;                        \
-                                sum = _t;                                     \
-                            } while (0)
-
-                        KAHAN_ADD(xTile[xHalfBase + l +  0] * (s0 * (float)q1));
-                        KAHAN_ADD(xTile[xHalfBase + l + 32] * (s2 * (float)q2));
-                        KAHAN_ADD(xTile[xHalfBase + l + 64] * (s4 * (float)q3));
-                        KAHAN_ADD(xTile[xHalfBase + l + 96] * (s6 * (float)q4));
-
-                        #undef KAHAN_ADD
-                    }
-                }
+                acc1 = mad(X[xHalfBase + l +  0], s0 * (float)q1, acc1);
+                acc2 = mad(X[xHalfBase + l + 32], s2 * (float)q2, acc2);
+                acc3 = mad(X[xHalfBase + l + 64], s4 * (float)q3, acc3);
+                acc4 = mad(X[xHalfBase + l + 96], s6 * (float)q4, acc4);
             }
         }
-
-        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // Fold the residual compensation into sum before the final reduce.
-    sum += kc;
-    sum = sub_group_reduce_add(sum);
+    float sum = sub_group_reduce_add((acc1 + acc2) + (acc3 + acc4));
 
-    if (active && sgLocal == 0) {
+    if (sgLocal == 0) {
         Y[n] = sum;
     }
 }
