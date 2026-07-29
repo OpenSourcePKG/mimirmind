@@ -675,6 +675,21 @@ ChatTemplate::toolCallOpenerText(Style style) noexcept {
     return {};
 }
 
+std::vector<std::int32_t>
+ChatTemplate::toolCallStopIds(Style style, const Tokenizer& tok) {
+    std::vector<std::int32_t> ids;
+    if (style == Style::Gemma4) {
+        // `<tool_call|>` closes a Gemma 4 tool call and is a single special
+        // token — halt right after the first complete call to stop the loop.
+        const std::int32_t close = tok.findToken("<tool_call|>");
+        if (close >= 0) {
+            ids.push_back(close);
+        }
+    }
+    // QwenChatML / Gemma3: none — see the header.
+    return ids;
+}
+
 namespace {
 
 /// Drop one occurrence of `needle` from the start of `s`, then drop any

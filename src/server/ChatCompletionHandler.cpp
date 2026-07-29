@@ -145,6 +145,17 @@ bool ChatCompletionHandler::prepareChatRequest(
     stopIds = model::ChatTemplate::stopIds(style, tok);
     PromptTrimmer::extendStopIds(tok, cr.stopStrings, stopIds);
 
+    // M-FunctionCalling: when tools are offered, also stop as soon as the model
+    // emits one complete native tool call. Gemma 4 otherwise loops the same
+    // <|tool_call>…<tool_call|> block until max_tokens (it never emits <turn|>
+    // after a call), turning a single tool round into a multi-minute runaway
+    // with dozens of duplicate calls. The closing marker stays in the model
+    // output — the tool parse below reads the pre-trim `generated` ids.
+    if (!cr.tools.empty()) {
+        const auto toolStops = model::ChatTemplate::toolCallStopIds(style, tok);
+        stopIds.insert(stopIds.end(), toolStops.begin(), toolStops.end());
+    }
+
     params.maxNewTokens = cr.maxTokens > 0 ? cr.maxTokens : _cfg.defaultMaxNew;
     params.stopIds      = stopIds;
 
@@ -415,8 +426,12 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         // With tool_choice:"required" the native opener was prefilled into the
         // prompt, so it is absent from the generated span — prepend it back so
         // the parser sees a whole tool-call block. Empty in the "auto" case.
+        // Decode the pre-trim `generated` (not `visible`): when we stopped on
+        // the tool-call closing marker (see toolCallStopIds) that marker is the
+        // last token and `visible` has stripped it — the parser needs it to
+        // delimit the block.
         const std::string toolText =
-            forcedToolOpener + tok.decode(visible, /*skipSpecial=*/false);
+            forcedToolOpener + tok.decode(generated, /*skipSpecial=*/false);
         if (model::ToolCallParser::looksLikeGemmaToolCall(toolText)) {
             toolCalls = model::ToolCallParser::parseGemma(toolText);
         } else if (model::ToolCallParser::looksLikeQwenToolCall(toolText)) {

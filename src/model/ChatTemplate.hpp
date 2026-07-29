@@ -124,6 +124,25 @@ public:
     toolCallOpenerText(Style style) noexcept;
 
     /**
+     * Token ids that CLOSE a native tool-call block, to add to the decode
+     * stop set when a request carries tools. They make the decoder halt as
+     * soon as the model has emitted one complete tool call.
+     *
+     *   Gemma4: the `<tool_call|>` marker (a single special token). Without
+     *           this Gemma 4 loops the same `<|tool_call>…<tool_call|>` block
+     *           until max_tokens — it never emits `<turn|>` after a call — so
+     *           one tool round becomes a multi-minute, many-duplicate runaway.
+     *   QwenChatML / Gemma3: empty. Qwen closes a call with the plain-text
+     *           `</tool_call>` (not a single token) and reliably emits
+     *           `<|im_end|>` right after, so it stops on its own.
+     *
+     * The closing marker is left in the model output for the parser — callers
+     * should parse the pre-trim generated ids, not the stop-stripped view.
+     */
+    [[nodiscard]] static std::vector<std::int32_t>
+    toolCallStopIds(Style style, const Tokenizer& tok);
+
+    /**
      * Strip style-specific control markup from a freshly-decoded model
      * response so that what reaches an OpenAI-compatible client is just
      * the visible content.
