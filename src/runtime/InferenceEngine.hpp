@@ -500,6 +500,23 @@ public:
     mtpDraftParity(std::span<const std::int32_t> prompt,
                    std::size_t nSeq, std::size_t depth);
 
+    /// M-Cuda.MTP Increment E3 — batched native MTP (speculative) decode.
+    /// Runs `nSeq` copies of `prompt` concurrently through the serving
+    /// substrate, drafting `depth` tokens per round with the nextn head and
+    /// verifying them in ONE batched trunk forward (stepServingVerify). On a
+    /// partial accept each slot's GatedDeltaNet state is restored from the
+    /// matching per-step snapshot — NO re-forward — so the batched verify
+    /// amortizes the trunk weight reads across N slots. Greedy (temperature
+    /// 0). Returns one token stream per slot (excluding the prompt), each up
+    /// to `maxNew` tokens, stopping early at `eosId` (negative disables).
+    /// With identical prompts every stream is identical AND equals single-
+    /// session generateMtp — the Increment E3 parity gate. CUDA + qwen35moe
+    /// with a loaded nextn head only.
+    [[nodiscard]] std::vector<std::vector<std::int32_t>>
+    generateBatchMtp(std::span<const std::int32_t> prompt,
+                     std::size_t nSeq, std::size_t maxNew,
+                     std::size_t depth, std::int32_t eosId);
+
     /// Physical slot capacity of the current serving state (0 if not yet
     /// built). The max concurrent sequences the batcher may pin.
     [[nodiscard]] std::size_t servingMaxBatch() const noexcept;

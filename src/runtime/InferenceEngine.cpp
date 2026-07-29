@@ -2169,6 +2169,16 @@ InferenceEngine::mtpDraftParity(std::span<const std::int32_t> prompt,
     return _servingSession->mtpDraftParity(prompt, nSeq, depth);
 }
 
+std::vector<std::vector<std::int32_t>>
+InferenceEngine::generateBatchMtp(std::span<const std::int32_t> prompt,
+                                  std::size_t nSeq, std::size_t maxNew,
+                                  std::size_t depth, std::int32_t eosId) {
+    if (_servingSession == nullptr) {
+        _servingSession = std::make_unique<engine::ServingSession>(*this);
+    }
+    return _servingSession->generateBatchMtp(prompt, nSeq, maxNew, depth, eosId);
+}
+
 std::size_t InferenceEngine::servingMaxBatch() const noexcept {
     return _servingSession != nullptr ? _servingSession->maxBatch() : 0;
 }

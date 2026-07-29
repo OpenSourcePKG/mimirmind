@@ -64,6 +64,12 @@ public:
     mtpDraftParity(std::span<const std::int32_t> prompt,
                    std::size_t nSeq, std::size_t depth);
 
+    /// See InferenceEngine::generateBatchMtp.
+    [[nodiscard]] std::vector<std::vector<std::int32_t>>
+    generateBatchMtp(std::span<const std::int32_t> prompt,
+                     std::size_t nSeq, std::size_t maxNew,
+                     std::size_t depth, std::int32_t eosId);
+
     [[nodiscard]] std::size_t maxBatch() const noexcept;
     [[nodiscard]] std::size_t maxContext() const noexcept;
 
@@ -82,6 +88,12 @@ private:
     /// `runMtpDraftStep` per step (the draft is cheap — blk.<blockCount>).
     void draftKInto(KvCache& kv, const float* hidden0, std::int32_t prevTok,
                     std::size_t K, std::vector<std::int32_t>& out);
+
+    /// Increment E3 — restore slot `slot`'s GatedDeltaNet recurrent + conv
+    /// state from verify snapshot `snapIdx` (== accepted-token count), a
+    /// per-layer per-slot slice copy. Avoids the single-session re-forward
+    /// on a partial accept.
+    void restoreSlotSsm(std::size_t slot, std::size_t snapIdx);
 
     InferenceEngine&              _e;
     std::unique_ptr<ServingState> _state;

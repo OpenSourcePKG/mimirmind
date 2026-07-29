@@ -101,6 +101,7 @@ struct ServingState {
     compute::ComputeBuffer mtpEh;                    // [d_model]   eh_proj / next hidden
     compute::ComputeBuffer mtpDraftLogits;           // [vocab_lm]  draft logits
     compute::ComputeBuffer mtpLmScr;                 // [max(d,vocab)] lm-head scratch
+    compute::ComputeBuffer mtpHid;                   // [maxBatch, d] per-slot round hidden
     std::vector<float>     mtpHostLogits;            // [vocab_lm]  argmax readback
 };
 
@@ -801,6 +802,7 @@ void ServingSession::ensureMtpServingState() {
     st.mtpEh          = _e._ops->allocate(d * sizeof(float));
     st.mtpDraftLogits = _e._ops->allocate(vocab * sizeof(float));
     st.mtpLmScr       = _e._ops->allocate(std::max(d, vocab) * sizeof(float));
+    st.mtpHid         = _e._ops->allocate(st.maxBatch * d * sizeof(float));
     st.mtpHostLogits.assign(vocab, 0.0F);
     st.mtpReady = true;
 
@@ -914,6 +916,178 @@ ServingSession::mtpDraftParity(std::span<const std::int32_t> prompt,
         if (res.slotDrafts[s] != res.refDrafts)     res.matchesReference = false;
     }
     return res;
+}
+
+void ServingSession::restoreSlotSsm(std::size_t slot, std::size_t snapIdx) {
+    auto& st = *_state;
+    float* const       stDst = st.ssm->statePtr();
+    float* const       cvDst = st.ssm->convStatePtr();
+    const float* const stSrc = st.ssmSnap[snapIdx].as<float>();
+    const float* const cvSrc = st.convSnap[snapIdx].as<float>();
+    const std::size_t stStride = st.ssm->stateLayerStride();
+    const std::size_t cvStride = st.ssm->convStateLayerStride();
+    const std::size_t stElems  = st.ssm->stateElemsPerLayer();
+    const std::size_t cvElems  = st.ssm->convStateElemsPerLayer();
+    for (std::size_t L = 0; L < st.blockCount; ++L) {
+        if (!_e._config.isRecurrentLayer(L)) {
+            continue;   // full-attention layers keep no recurrent state
+        }
+        _e._ops->appendMemoryCopy(stDst + L * stStride + slot * stElems,
+                                  stSrc + L * stStride + slot * stElems,
+                                  stElems * sizeof(float));
+        _e._ops->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
+                                  cvSrc + L * cvStride + slot * cvElems,
+                                  cvElems * sizeof(float));
+    }
+}
+
+std::vector<std::vector<std::int32_t>>
+ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
+                                 std::size_t nSeq, std::size_t maxNew,
+                                 std::size_t depth, std::int32_t eosId) {
+    if (_e._backend == nullptr) {
+        throw std::runtime_error("generateBatchMtp: no model loaded");
+    }
+    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    if (qb == nullptr || !_e.mtpAvailable()) {
+        throw std::runtime_error(
+            "generateBatchMtp: requires CUDA qwen35moe with a nextn head");
+    }
+    if (nSeq == 0)  nSeq = 1;
+    if (depth == 0) depth = 1;
+    if (prompt.empty() || maxNew == 0) {
+        return std::vector<std::vector<std::int32_t>>(nSeq);
+    }
+    const std::size_t P = prompt.size();
+    const std::size_t d = _e._config.embeddingLength;
+
+    ensureServingState(nSeq, P + maxNew + 8);
+    ensureMtpServingState();
+    ensureVerifyCapacity(depth);
+    auto& st = *_state;
+
+    auto argmax = [](const std::vector<float>& row) -> std::int32_t {
+        std::size_t best = 0;
+        float       bv   = row[0];
+        for (std::size_t v = 1; v < row.size(); ++v) {
+            if (row[v] > bv) { bv = row[v]; best = v; }
+        }
+        return static_cast<std::int32_t>(best);
+    };
+
+    // --- trunk prefill: single-session forwardVerify(prompt) -------------
+    // Provides token0 + the trunk hiddens used to seed the nextn KV and the
+    // first-round draft hidden (matches single-session generateMtp exactly).
+    _e.resetCache();
+    const std::vector<std::int32_t> pvec(prompt.begin(), prompt.end());
+    const auto pf = _e.forwardVerify(pvec);
+    float* const xBufH = _e._xBufH.as<float>();
+    const std::int32_t token0v = argmax(pf.back());
+
+    // Seed each slot's nextn KV by replaying the prompt (P-1 steps) and
+    // broadcast the last trunk hidden into the per-slot round hidden.
+    float* const mtpHid = st.mtpHid.as<float>();
+    auto seedMtp = [&](KvCache& kv) {
+        kv.reset();
+        float* const emb  = st.mtpEmb.as<float>();
+        float* const cat  = st.mtpCat.as<float>();
+        float* const eh   = st.mtpEh.as<float>();
+        float* const dlog = st.mtpDraftLogits.as<float>();
+        float* const lmSc = st.mtpLmScr.as<float>();
+        for (std::size_t p = 0; p + 1 < P; ++p) {
+            st.qb->runMtpDraftStep(xBufH + p * d, prompt[p + 1], kv, *st.sb,
+                                   emb, cat, eh, dlog, lmSc);
+            kv.commit(1);
+        }
+    };
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        seedMtp(*st.mtpKv[s]);
+        _e._ops->appendMemoryCopy(mtpHid + s * d, xBufH + (P - 1) * d,
+                                  d * sizeof(float));
+    }
+
+    // --- seed the paged trunk KV + SSM via a lockstep stepServing prefill.
+    for (std::size_t g = 0; g < P; ++g) {
+        std::vector<InferenceEngine::ServingSlotStep> steps(nSeq);
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            steps[s].slot     = static_cast<std::uint32_t>(s);
+            steps[s].token    = prompt[g];
+            steps[s].pos      = static_cast<std::int32_t>(g);
+            steps[s].seqStart = (g == 0);
+        }
+        std::vector<std::int32_t> toks(nSeq, 0);
+        stepServing(steps, toks);
+    }
+
+    // --- per-slot decode state -------------------------------------------
+    std::vector<std::size_t>               basePos(nSeq, P);
+    std::vector<std::int32_t>              token0(nSeq, token0v);
+    std::vector<std::vector<std::int32_t>> out(nSeq);
+    std::vector<char>                      finished(nSeq, 0);
+
+    while (true) {
+        std::size_t nDone = 0;
+        for (std::size_t s = 0; s < nSeq; ++s) nDone += (finished[s] != 0);
+        if (nDone == nSeq) break;
+        const std::size_t produced = out[0].size();
+        if (produced >= maxNew) break;
+        const std::size_t K = std::min(depth, maxNew - produced);
+
+        // --- draft K tokens per slot on its own nextn KV -----------------
+        std::vector<std::size_t>               mtpPre(nSeq);
+        std::vector<std::vector<std::int32_t>> drafts(nSeq);
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            mtpPre[s] = st.mtpKv[s]->length();
+            draftKInto(*st.mtpKv[s], mtpHid + s * d, token0[s], K, drafts[s]);
+        }
+
+        // --- one batched verify over [token0, drafts...] per slot --------
+        std::vector<InferenceEngine::VerifySlot> slots(nSeq);
+        std::vector<std::int32_t> vtokTM((K + 1) * nSeq);
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            slots[s].slot    = static_cast<std::uint32_t>(s);
+            slots[s].basePos = static_cast<std::int32_t>(basePos[s]);
+            vtokTM[0 * nSeq + s] = token0[s];
+            for (std::size_t j = 1; j <= K; ++j) {
+                vtokTM[j * nSeq + s] = drafts[s][j - 1];
+            }
+        }
+        const auto vlog = stepServingVerify(slots, vtokTM, K);
+        float* const vX = st.vXBuf.as<float>();   // M trunk hiddens (time-major)
+
+        // --- per-slot accept-longest-prefix + snapshot restore -----------
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            if (finished[s] != 0) continue;
+            std::size_t a = 0;
+            for (std::size_t i = 0; i < K; ++i) {
+                if (argmax(vlog[i * nSeq + s]) == drafts[s][i]) ++a; else break;
+            }
+            const std::int32_t corrected = argmax(vlog[a * nSeq + s]);
+
+            auto emit = [&](std::int32_t t) -> bool {
+                out[s].push_back(t);
+                if (eosId >= 0 && t == eosId) { finished[s] = 1; return false; }
+                if (out[s].size() >= maxNew)  { finished[s] = 1; return false; }
+                return true;
+            };
+            bool cont = emit(token0[s]);
+            for (std::size_t i = 0; i < a && cont; ++i) cont = emit(drafts[s][i]);
+
+            // Commit: KV for the accepted a+1 tokens is already correct (the
+            // verify wrote it), so committing is just advancing the slot's
+            // length. Restore the GatedDeltaNet state to the accepted step
+            // (no re-forward), truncate the nextn KV, and carry the trunk
+            // hidden at the accepted position into the next round's draft.
+            basePos[s] += a + 1;
+            if (a < K) restoreSlotSsm(s, a);
+            st.mtpKv[s]->truncate(mtpPre[s] + a + 1);
+            _e._ops->appendMemoryCopy(mtpHid + s * d, vX + (a * nSeq + s) * d,
+                                      d * sizeof(float));
+            token0[s] = corrected;
+        }
+        _e._ops->flush();
+    }
+    return out;
 }
 
 std::size_t ServingSession::maxBatch() const noexcept {

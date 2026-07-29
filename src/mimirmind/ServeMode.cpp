@@ -989,6 +989,77 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             return 0;
         }
 
+        // M-Cuda.MTP Increment E3 — batched native MTP decode parity gate.
+        // generateBatchMtp (per-slot draft -> batched verify -> per-slot
+        // accept + snapshot restore, no re-forward) over nSeq identical
+        // prompts MUST (a) produce identical streams and (b) match single-
+        // session generateMtp bit-for-bit — the end-to-end Increment E gate.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_MTP_BATCH_TEST") != nullptr) {
+            if (!e->mtpAvailable()) {
+                std::cout << "\n[M-Cuda.MTP.E3] model has no nextn head — skipped\n";
+                std::cout.flush();
+                return 0;
+            }
+            const auto& tok = e->tokenizer();
+            const char* promptEnv = std::getenv("MIMIRMIND_MTP_PROMPT");
+            std::vector<std::int32_t> pids = tok.encode(
+                promptEnv != nullptr
+                    ? promptEnv
+                    : "The history of artificial intelligence began when",
+                /*addBos=*/false);
+            if (pids.empty()) pids.push_back(1);
+            std::size_t K = 2;
+            if (const char* dv = std::getenv("MIMIRMIND_MTP_DEPTH")) {
+                const long v = std::strtol(dv, nullptr, 10);
+                if (v >= 1) K = static_cast<std::size_t>(v);
+            }
+            std::size_t N = 4;
+            if (const char* nv = std::getenv("MIMIRMIND_MTP_NSEQ")) {
+                const long v = std::strtol(nv, nullptr, 10);
+                if (v >= 1) N = static_cast<std::size_t>(v);
+            }
+            std::size_t maxNew = 32;
+            if (const char* mv = std::getenv("MIMIRMIND_MTP_MAXNEW")) {
+                const long v = std::strtol(mv, nullptr, 10);
+                if (v >= 1) maxNew = static_cast<std::size_t>(v);
+            }
+
+            const auto batched = e->generateBatchMtp(pids, N, maxNew, K, tok.eosId());
+            std::size_t drafted = 0, accepted = 0;
+            const auto ref = e->generateMtp(pids, maxNew, K, tok.eosId(),
+                                            &drafted, &accepted);
+
+            bool allEq = true;
+            for (std::size_t s = 1; s < batched.size(); ++s) {
+                if (batched[s] != batched[0]) allEq = false;
+            }
+            const std::vector<std::int32_t>& b0 =
+                batched.empty() ? ref : batched[0];
+            std::size_t matchLen = 0;
+            const std::size_t cn = std::min(ref.size(), b0.size());
+            for (; matchLen < cn; ++matchLen) {
+                if (ref[matchLen] != b0[matchLen]) break;
+            }
+            const bool slot0Exact =
+                (ref.size() == b0.size()) && (matchLen == ref.size());
+            const bool pass = allEq && slot0Exact;
+
+            std::cout << "\n[M-Cuda.MTP.E3] nSeq=" << N << " depth=" << K
+                      << " maxNew=" << maxNew << " promptTokens=" << pids.size()
+                      << "\n  ref    (" << ref.size() << "):";
+            for (const std::int32_t t : ref) std::cout << " " << t;
+            std::cout << "\n  slot 0 (" << b0.size() << "):";
+            for (const std::int32_t t : b0) std::cout << " " << t;
+            std::cout << "\n  allSlotsAgree=" << (allEq ? "YES" : "NO")
+                      << " slot0==single-session=" << (slot0Exact ? "YES" : "NO")
+                      << " (match " << matchLen << "/" << ref.size() << ")"
+                      << "\n  => E3 batch-MTP " << (pass ? "PASS" : "MISMATCH")
+                      << "\n";
+            std::cout.flush();
+            return 0;
+        }
+
         // M9.8b — cross-block sanity check on the effective runtime.
         // The plain-attention fallback in kernels/attention.cl holds
         // scores[ATTN_MAX_TK] in 64 KiB SLM, so if a caller forces the
