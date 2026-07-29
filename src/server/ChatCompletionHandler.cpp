@@ -85,7 +85,9 @@ bool ChatCompletionHandler::prepareChatRequest(
     std::vector<std::int32_t>&     promptIds,
     std::vector<std::int32_t>&     stopIds,
     runtime::GenerateParams&       params,
-    TrimReport&                    report) {
+    TrimReport&                    report,
+    std::string&                   forcedToolOpener) {
+    forcedToolOpener.clear();
     if (cr.messages.empty()) {
         sendError(res, 400, "invalid_request_error",
                   "messages must not be empty");
@@ -175,6 +177,29 @@ bool ChatCompletionHandler::prepareChatRequest(
         }
         PromptTrimmer::attachTrimHeaders(res, report);
     }
+
+    // M-FunctionCalling Phase 3 — tool_choice:"required". Force a tool call by
+    // prefilling the model's native tool-call opener onto the prompt, so the
+    // decoder must continue *inside* a call instead of choosing prose (the
+    // failure mode small models like Qwen2.5-1.5B hit on some prompts). Done
+    // AFTER prompt-trim: a trim re-encodes promptIds from the messages and
+    // would otherwise wipe a pre-trim suffix. The opener is a handful of tokens
+    // — well within the post-trim maxNew slack. Its text is echoed back through
+    // `forcedToolOpener` so handleBlocking can prepend it before parsing (the
+    // opener lives in the prompt, not the generated span).
+    if (cr.toolChoice == "required" && !cr.tools.empty()) {
+        const auto openerIds = model::ChatTemplate::toolCallOpenerIds(style, tok);
+        if (!openerIds.empty()) {
+            promptIds.insert(promptIds.end(), openerIds.begin(), openerIds.end());
+            forcedToolOpener =
+                std::string(model::ChatTemplate::toolCallOpenerText(style));
+            MM_LOG_INFO("server",
+                        "tool_choice=required: prefilled {} tool-call opener "
+                        "token(s) (prompt now {})",
+                        openerIds.size(), promptIds.size());
+        }
+    }
+
     if (cr.hasTemperature) {
         params.sampling.temperature = cr.temperature;
     }
@@ -258,8 +283,9 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     std::vector<std::int32_t> stopIds;
     runtime::GenerateParams   params;
     TrimReport                trimReport;
+    std::string               forcedToolOpener;
     if (!prepareChatRequest(engine, cr, res, promptIds, stopIds, params,
-                            trimReport)) {
+                            trimReport, forcedToolOpener)) {
         return;
     }
 
@@ -385,8 +411,12 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     // Dispatch by marker: Gemma's `<|tool_call>` and Qwen's `<tool_call>` are
     // distinct (the leading pipe).
     std::vector<model::ToolCall> toolCalls;
-    if (!cr.tools.empty()) {
-        const std::string toolText = tok.decode(visible, /*skipSpecial=*/false);
+    if (!cr.tools.empty() && cr.toolChoice != "none") {
+        // With tool_choice:"required" the native opener was prefilled into the
+        // prompt, so it is absent from the generated span — prepend it back so
+        // the parser sees a whole tool-call block. Empty in the "auto" case.
+        const std::string toolText =
+            forcedToolOpener + tok.decode(visible, /*skipSpecial=*/false);
         if (model::ToolCallParser::looksLikeGemmaToolCall(toolText)) {
             toolCalls = model::ToolCallParser::parseGemma(toolText);
         } else if (model::ToolCallParser::looksLikeQwenToolCall(toolText)) {
@@ -490,8 +520,13 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
     // doesn't emit a terminal usage chunk (see prefill_done named
     // event for the token-count signal instead).
     TrimReport                trimReport;
+    // The SSE path streams content deltas and does not yet re-assemble
+    // structured tool_calls (a separate Phase-3 item). tool_choice:"required"
+    // still prefills the opener so the model emits a call, but its text is not
+    // needed here — the block is discarded.
+    std::string               forcedToolOpener;
     if (!prepareChatRequest(engine, cr, res, promptIds, stopIds, params,
-                            trimReport)) {
+                            trimReport, forcedToolOpener)) {
         return;
     }
 

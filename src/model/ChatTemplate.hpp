@@ -99,6 +99,31 @@ public:
     stopIds(Style style, const Tokenizer& tok);
 
     /**
+     * M-FunctionCalling Phase 3 — the token ids that OPEN a native tool-call
+     * block for `style`. Appended to the generation prompt when a request
+     * carries `tool_choice: "required"`, forcing the model to continue
+     * decoding *inside* a tool call rather than choosing to answer in prose.
+     *
+     *   QwenChatML: the Hermes plain-text opener `<tool_call>\n`.
+     *   Gemma4:     empty — Gemma 4 auto-emits a thinking-channel wrapper
+     *               before its content, which orphans a prefilled opener; it
+     *               calls tools reliably unforced, so no prefill is used.
+     *   Gemma3:     empty — no tool-calling support.
+     *
+     * The opener lives in the prompt, so it is NOT part of the model's
+     * generated span. Prepend {@link toolCallOpenerText} to the decoded output
+     * before handing it to ToolCallParser so the block parses as a whole.
+     */
+    [[nodiscard]] static std::vector<std::int32_t>
+    toolCallOpenerIds(Style style, const Tokenizer& tok);
+
+    /// The literal text that {@link toolCallOpenerIds} encodes to — prepend
+    /// this to the model's decoded output before parsing a forced tool call.
+    /// Empty for styles without tool support.
+    [[nodiscard]] static std::string_view
+    toolCallOpenerText(Style style) noexcept;
+
+    /**
      * Strip style-specific control markup from a freshly-decoded model
      * response so that what reaches an OpenAI-compatible client is just
      * the visible content.

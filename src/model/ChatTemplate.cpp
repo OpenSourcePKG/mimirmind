@@ -640,6 +640,41 @@ ChatTemplate::stopIds(Style style, const Tokenizer& tok) {
     return ids;
 }
 
+std::vector<std::int32_t>
+ChatTemplate::toolCallOpenerIds(Style style, const Tokenizer& tok) {
+    std::vector<std::int32_t> ids;
+    switch (style) {
+        case Style::QwenChatML:
+            // Hermes opener is plain text — same as the template renders it.
+            // Prefilling it forces weak Qwen models (e.g. 1.5B) that would
+            // otherwise narrate a refusal into an actual <tool_call> block.
+            encodeText(tok, "<tool_call>\n", ids);
+            break;
+        case Style::Gemma4:
+            // No opener: Gemma 4 opens every response with an auto-emitted
+            // thinking-channel wrapper (`<|channel>thought\n<channel|>`, present
+            // even when thinking is off), so a prefilled `<|tool_call>` opener
+            // would be orphaned ahead of the wrapper and the model then emits
+            // its own complete call — corrupting the parse. Gemma 4 (26B) calls
+            // tools reliably unforced, so "required" relies on natural emission
+            // + the existing parse. Left empty deliberately.
+            break;
+        case Style::Gemma3:
+            break;  // no tool-calling support
+    }
+    return ids;
+}
+
+std::string_view
+ChatTemplate::toolCallOpenerText(Style style) noexcept {
+    switch (style) {
+        case Style::QwenChatML: return "<tool_call>\n";
+        case Style::Gemma4:     return {};  // see toolCallOpenerIds — no prefill
+        case Style::Gemma3:     return {};
+    }
+    return {};
+}
+
 namespace {
 
 /// Drop one occurrence of `needle` from the start of `s`, then drop any

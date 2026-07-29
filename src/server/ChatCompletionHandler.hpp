@@ -11,6 +11,7 @@
 #include <httplib.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace mimirmind::server {
@@ -46,7 +47,8 @@ private:
         std::vector<std::int32_t>&     promptIds,
         std::vector<std::int32_t>&     stopIds,
         runtime::GenerateParams&       params,
-        TrimReport&                    report);
+        TrimReport&                    report,
+        std::string&                   forcedToolOpener);
 
     void handleBlocking(const ChatRequest& cr, httplib::Response& res);
     void handleStream  (const ChatRequest& cr, httplib::Response& res);
