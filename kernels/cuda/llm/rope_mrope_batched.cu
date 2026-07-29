@@ -57,10 +57,19 @@ void rope_mrope_batched(
     const float pos      = (float)(startPos + p);
     const float posAxis[4] = { pos, pos, pos, pos };
 
+    // PARTIAL ROTARY — see rope_mrope.cu for the full derivation. sectDims =
+    // rotary_dim/2; only the first sectDims pairs rotate, partner at +sectDims,
+    // freq denom = rotary_dim = 2*sectDims. No-op for full-rotary (sectDims ==
+    // halfDim). Matches HF Qwen3-Next/Qwen3.5-MoE partial_rotary_factor.
     const int sectDims = sec0 + sec1 + sec2 + sec3;
+    const int rotPairs = (sectDims > 0) ? sectDims : halfDim;
+    if (i >= rotPairs) {
+        return;  // outside the rotary block -> pass through untouched
+    }
+
     float posSel = posAxis[0];
     if (sectDims > 0) {
-        const int sector = i % sectDims;
+        const int sector = i;
         if (sector % 3 == 1 && sector < 3 * sec1) {
             posSel = posAxis[1];
         } else if (sector % 3 == 2 && sector < 3 * sec2) {
@@ -74,7 +83,8 @@ void rope_mrope_batched(
 
     float* x = x_base + (size_t)seq * (size_t)xSeqStride
                       + (size_t)startPos * (size_t)writeOffsetStride;
-    const float invDim = 1.0f / (float)headDim;
+    const int   rotaryDim = 2 * rotPairs;
+    const float invDim = 1.0f / (float)rotaryDim;
     const float freq   = powf(base, -(float)(2 * i) * invDim);
     const float theta  = posSel * freq;
     const float c      = cosf(theta);
@@ -82,7 +92,7 @@ void rope_mrope_batched(
 
     const int headBase = (p * numHeads + h) * headDim;
     const float a = x[headBase + i];
-    const float b = x[headBase + i + halfDim];
-    x[headBase + i]           = a * c - b * s;
-    x[headBase + i + halfDim] = a * s + b * c;
+    const float b = x[headBase + i + rotPairs];
+    x[headBase + i]            = a * c - b * s;
+    x[headBase + i + rotPairs] = a * s + b * c;
 }

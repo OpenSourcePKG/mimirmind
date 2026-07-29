@@ -11,6 +11,7 @@
 #include "TestFramework.hpp"
 
 #include "compute/GatedDeltaNet.hpp"
+#include "compute/Rope.hpp"
 #include "compute/cuda/GpuMatmul.hpp"
 #include "compute/cuda/GpuOps.hpp"
 #include "core/gpu/cuda/CudaComputeContext.hpp"
@@ -1357,6 +1358,71 @@ TEST(cuda_rope_mrope_batched_parity) {
     }
     std::printf("[rope-mrope-batched-parity] nSeq=%zu numHeads=%zu headDim=%zu maxErr=%.2e\n",
                 nSeq, numHeads, headDim, maxErr);
+}
+
+// IMRoPE partial rotary (Qwen3-Next / Qwen3.5-MoE, partial_rotary_factor =
+// 0.25). head_dim = 256, so only rotary_dim = 64 head dims (= 32 pairs) rotate
+// and the remaining 192 pass through untouched; the freq denominator is
+// rotary_dim (64), NOT head_dim (256). Guards the norm-blind directional bug
+// that shipped incoherent long-gen on Qwen3.6-NVFP4 (the kernel used to rotate
+// all 128 pairs with denom 512). Mirrors the L0 gpu_tests case: the CUDA kernel
+// is held to the compute:: partial-rotary reference, plus a reference-
+// independent pass-through invariant so BOTH paths regressing to full-head
+// rotation together is still caught.
+TEST(cuda_mrope_partial_rotary_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t seqLen = 3, numHeads = 2, headDim = 256;
+    const std::size_t startPos = 7;                   // non-zero base position
+    const float base = 10000.0f;
+    // GGUF <arch>.rope.dimension_sections; sum is rotary_dim/2 -> 32 pairs.
+    const std::int32_t sections[4] = {16, 8, 8, 0};
+    const std::size_t rotaryDim = 64;                 // 2 * sum(sections)
+
+    const std::size_t n = seqLen * numHeads * headDim;
+    auto x = randVec(n, 0x63u);
+
+    auto dX = toDevice(ops, x);
+    ops.mropeInPlaceAsync(dX.get(), seqLen, numHeads, headDim, startPos, base,
+                          sections);
+    ops.flush();
+    auto got = fromDevice(ops, dX.get(), n);
+
+    std::vector<float> ref = x;
+    ::mimirmind::compute::applyMropeInPlace(ref.data(), seqLen, numHeads,
+                                            headDim, startPos, base, sections);
+
+    // (1) CUDA kernel matches the compute:: partial-rotary reference.
+    double maxErr = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        maxErr = std::max(maxErr, std::fabs((double)got[i] - (double)ref[i]));
+        EXPECT_NEAR(got[i], ref[i], 1e-4f);
+    }
+
+    // (2) Reference-independent invariants: head dims [rotaryDim, headDim) are
+    // byte-identical to the input (pass-through), and the rotary block
+    // [0, rotaryDim) actually changed.
+    float passMaxDiff = 0.0f;
+    bool  rotaryMoved = false;
+    for (std::size_t p = 0; p < seqLen; ++p) {
+        for (std::size_t h = 0; h < numHeads; ++h) {
+            const std::size_t off = (p * numHeads + h) * headDim;
+            for (std::size_t d = rotaryDim; d < headDim; ++d) {
+                passMaxDiff = std::max(passMaxDiff,
+                                       std::fabs(got[off + d] - x[off + d]));
+            }
+            for (std::size_t d = 0; d < rotaryDim; ++d) {
+                if (std::fabs(got[off + d] - x[off + d]) > 1e-4f) {
+                    rotaryMoved = true;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(passMaxDiff, 0.0f);   // pass-through dims untouched
+    EXPECT_TRUE(rotaryMoved);       // rotary block was actually rotated
+    std::printf("[mrope-partial-rotary-parity] headDim=%zu rotaryDim=%zu maxErr=%.2e\n",
+                headDim, rotaryDim, maxErr);
 }
 
 // M-Cuda.Batch (attention) — batched decode flash-attention vs N single

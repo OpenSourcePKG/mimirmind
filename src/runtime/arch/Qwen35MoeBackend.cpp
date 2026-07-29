@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -69,6 +70,28 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
       _moeGroupEnabled{moeGroupEnabled},
       _moeFusedDownEnabled{moeFusedDownEnabled} {
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
+    if (const char* d = std::getenv("MIMIRMIND_SSM_DUMP")) {
+        _ssmDump    = true;
+        _ssmDumpDir = d;
+        if (const char* pp = std::getenv("MIMIRMIND_SSM_DUMP_POS")) {
+            _ssmDumpPos = std::strtol(pp, nullptr, 10);
+        }
+        MM_LOG_INFO("qwen35moe",
+                    "MIMIRMIND_SSM_DUMP active — dir='{}' pos={} (directional "
+                    "per-block residual dump)",
+                    _ssmDumpDir, _ssmDumpPos);
+    }
+    if (const char* d = std::getenv("MIMIRMIND_GDN_DUMP")) {
+        _gdnDump    = true;
+        _gdnDumpDir = d;
+        if (const char* b = std::getenv("MIMIRMIND_GDN_DUMP_BLK")) {
+            _gdnDumpBlk = static_cast<std::size_t>(std::strtol(b, nullptr, 10));
+        }
+        MM_LOG_INFO("qwen35moe",
+                    "MIMIRMIND_GDN_DUMP active — dir='{}' blk={} (recurrence "
+                    "in/out isolation dump)",
+                    _gdnDumpDir, _gdnDumpBlk);
+    }
     _q8Dp4a   = (std::getenv("MIMIRMIND_Q8_DP4A") != nullptr);
     _moeDeviceTopKEnabled = (std::getenv("MIMIRMIND_MOE_DEVICE_TOPK") != nullptr);
     // Chunked GatedDeltaNet prefill auto-gate (M-Q3N.4). See the header for the
@@ -155,6 +178,25 @@ void Qwen35MoeBackend::traceNorm(const char* tag, std::size_t blockIdx,
                 pos, blockIdx, tag, std::sqrt(sumSq), maxAbs);
 }
 
+void Qwen35MoeBackend::traceDump(const char* tag, std::size_t blockIdx,
+                                 std::size_t pos, const float* p,
+                                 std::size_t n) const {
+    if (_ssmDumpPos >= 0 && pos != static_cast<std::size_t>(_ssmDumpPos)) {
+        return;
+    }
+    _gmm.sync();  // p is a unified-memory pointer; readable after sync.
+    const std::string path = _ssmDumpDir + "/pos" + std::to_string(pos) +
+                             "-blk" + std::to_string(blockIdx) + "-" + tag +
+                             ".bin";
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        MM_LOG_WARN("ssm-dump", "cannot open '{}' for write", path);
+        return;
+    }
+    f.write(reinterpret_cast<const char*>(p),
+            static_cast<std::streamsize>(n * sizeof(float)));
+}
+
 void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
                                 float*        x,
                                 std::size_t   T,
@@ -169,11 +211,38 @@ void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
         runFullAttentionBlock(blockIdx, x, T, cache, s, diag);
     }
 
-    if (_ssmTrace) {
-        const std::size_t pos = cache.length() + (T > 0 ? T - 1 : 0);
+    if (_ssmTrace || _ssmDump) {
+        const std::size_t base    = cache.length();
+        const std::size_t last    = (T > 0 ? T - 1 : 0);
+        const std::size_t lastPos = base + last;
         const char* kind = _config.isRecurrentLayer(blockIdx) ? "xout(lin)"
                                                               : "xout(full)";
-        traceNorm(kind, blockIdx, pos, x, T * s.d_model);
+        if (_ssmTrace) {
+            traceNorm(kind, blockIdx, lastPos, x, T * s.d_model);
+        }
+        if (_ssmDump) {
+            // Directional dump of the residual stream after this block — the
+            // vector to diff for prefill-vs-decode localisation. With a target
+            // position set (MIMIRMIND_SSM_DUMP_POS), dump that absolute
+            // position's row whenever it falls inside this call's T-window (so
+            // a T=N prefill dumps the same position a T=1 decode step does);
+            // otherwise dump the last row every call (decode-trajectory mode).
+            if (_ssmDumpPos >= 0) {
+                const std::size_t tgt = static_cast<std::size_t>(_ssmDumpPos);
+                if (tgt >= base && tgt < base + T) {
+                    traceDump("xout", blockIdx, tgt,
+                              x + (tgt - base) * s.d_model, s.d_model);
+                }
+            } else {
+                // Dump every row at its absolute position, so a single T=N
+                // prefill pass captures the same positions a T=1 decode
+                // trajectory does — the basis for the prefill-vs-decode diff.
+                for (std::size_t r = 0; r < T; ++r) {
+                    traceDump("xout", blockIdx, base + r,
+                              x + r * s.d_model, s.d_model);
+                }
+            }
+        }
     }
 }
 
@@ -523,6 +592,30 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
         traceNorm("gate",  blockIdx, pos, gateBuf, T * hV);
         traceNorm("state", blockIdx, pos, stateBuf, stateElems);
         traceNorm("dnet",  blockIdx, pos, deltaOut, T * valueDim);
+    }
+
+    if (_gdnDump && blockIdx == _gdnDumpBlk) {
+        // Isolate the recurrence: dump its exact in/out tensors so the fp64 HF
+        // reference can be run on identical inputs. q,k are L2-normed here (as
+        // the kernel consumes them); glog=gateBuf, beta=betaBuf. One prefill.
+        _gmm.sync();
+        auto dumpT = [&](const char* tag, const float* p, std::size_t n) {
+            std::ofstream f(_gdnDumpDir + "/blk" + std::to_string(blockIdx) +
+                            "-" + tag + ".bin",
+                            std::ios::binary | std::ios::trunc);
+            if (f) {
+                f.write(reinterpret_cast<const char*>(p),
+                        static_cast<std::streamsize>(n * sizeof(float)));
+            }
+        };
+        dumpT("q",    qBuf,     T * hV * S);
+        dumpT("k",    kBuf,     T * hV * S);
+        dumpT("v",    vBuf,     T * hV * S);
+        dumpT("glog", gateBuf,  T * hV);
+        dumpT("beta", betaBuf,  T * hV);
+        dumpT("dnet", deltaOut, T * valueDim);
+        MM_LOG_INFO("gdn-dump", "blk{} dumped q/k/v/glog/beta/dnet T={} hV={} S={}",
+                    blockIdx, T, hV, S);
     }
 
     // --- gated output norm: ssm_norm(out) * silu(z) ------------------

@@ -118,7 +118,14 @@ void Nvfp4Loader::load(InferenceEngine& e,
     // The regroup is a pure element permutation of the vDim value channels:
     //   dst(j,k,d) <- src(k,j,d)   (k: k-head, j: gqa slot, d: head dim)
     // applied to the value ROWS of attn_qkv / ssm_conv1d, ALL rows of
-    // attn_gate, and the value COLUMNS of ssm_out.
+    // attn_gate, and the value COLUMNS of ssm_out. The SAME regroup at head
+    // granularity (dst(j,k) <- src(k,j)) applies to the per-value-head decay /
+    // beta tensors — ssm_alpha.weight / ssm_beta.weight (VH output rows) and
+    // ssm_a / ssm_dt.bias (VH scalars) — so each head's decay and beta stay
+    // paired with the regrouped value head. Missing these was the Qwen3.6
+    // long-generation degeneration bug (vLLM-oracle-localised): the recurrence
+    // applied every value head's decay/beta to the wrong head, invisible per
+    // token but compounding over the sequence.
     {
         const std::size_t KH  = e._config.ssmNumKHeads();   // num k heads (16)
         const std::size_t VH  = e._config.ssmNumVHeads();   // num v heads (32)
@@ -134,6 +141,20 @@ void Nvfp4Loader::load(InferenceEngine& e,
                         const std::size_t dst = j * KH * HD + k * HD + d;
                         perm[dst] = src;
                     }
+                }
+            }
+            // Per-HEAD permutation (same (k,j)->(j,k) regroup, but at head
+            // granularity) for the per-value-head decay/beta tensors. These
+            // (ssm_alpha/ssm_beta projections + ssm_a/ssm_dt biases) select one
+            // scalar per value head, so they must be regrouped to [rep,k] to
+            // stay paired with the [rep,k] value stream — otherwise the
+            // delta-rule recurrence applies each head's decay/beta to the wrong
+            // value head, which is norm-invisible per token but compounds over
+            // the sequence into long-generation degeneration.
+            std::vector<std::size_t> permHead(VH);
+            for (std::size_t k = 0; k < KH; ++k) {
+                for (std::size_t j = 0; j < GQA; ++j) {
+                    permHead[j * KH + k] = k * GQA + j;
                 }
             }
             auto regroupRows = [&](runtime::nvfp4::MaterializedTensor& t,
@@ -170,6 +191,40 @@ void Nvfp4Loader::load(InferenceEngine& e,
                 }
                 e._ops->uploadHostBytes(base, out.data(), nbytes);
             };
+            // Permute the VH output rows (one per value head) of a per-head
+            // projection weight ([VH, inCols] row-major), or the VH elements of
+            // a 1-D per-head bias, by permHead.
+            auto regroupHeadRows = [&](runtime::nvfp4::MaterializedTensor& t) {
+                const std::size_t inCols    = t.ggufDims[0];
+                const std::size_t elemBytes = t.isF32 ? 4 : 2;
+                const std::size_t rowBytes  = inCols * elemBytes;
+                const std::size_t nbytes    = VH * rowBytes;
+                auto* base = static_cast<std::uint8_t*>(t.buffer.get());
+                std::vector<std::uint8_t> in(nbytes), out(nbytes);
+                e._ops->readbackToHost(in.data(), base, nbytes);
+                for (std::size_t r = 0; r < VH; ++r) {
+                    std::memcpy(out.data() + r * rowBytes,
+                                in.data() + permHead[r] * rowBytes, rowBytes);
+                }
+                e._ops->uploadHostBytes(base, out.data(), nbytes);
+            };
+            auto regroupHeadVec = [&](runtime::nvfp4::MaterializedTensor& t) {
+                const std::size_t elemBytes = t.isF32 ? 4 : 2;
+                const std::size_t nbytes    = VH * elemBytes;
+                auto* base = static_cast<std::uint8_t*>(t.buffer.get());
+                std::vector<std::uint8_t> in(nbytes), out(nbytes);
+                e._ops->readbackToHost(in.data(), base, nbytes);
+                for (std::size_t r = 0; r < VH; ++r) {
+                    std::memcpy(out.data() + r * elemBytes,
+                                in.data() + permHead[r] * elemBytes, elemBytes);
+                }
+                e._ops->uploadHostBytes(base, out.data(), nbytes);
+            };
+            auto numElems = [](const runtime::nvfp4::MaterializedTensor& t) {
+                std::size_t n = 1;
+                for (std::size_t dd : t.ggufDims) n *= dd;
+                return n;
+            };
             std::size_t regrouped = 0;
             for (auto& t : e._materializedBf16) {
                 const std::string& n = t.ggufName;
@@ -185,6 +240,22 @@ void Nvfp4Loader::load(InferenceEngine& e,
                 } else if (n.ends_with(".ssm_out.weight")) {
                     regroupCols(t);
                     ++regrouped;
+                } else if (n.ends_with(".ssm_alpha.weight") ||
+                           n.ends_with(".ssm_beta.weight")) {
+                    // Per-head decay/beta projections: VH output rows.
+                    regroupHeadRows(t);
+                    ++regrouped;
+                } else if (n.ends_with(".ssm_a") || n.ends_with(".ssm_dt.bias")) {
+                    // Per-head scalar biases ([VH]); regroup the VH elements.
+                    if (numElems(t) == VH) {
+                        regroupHeadVec(t);
+                        ++regrouped;
+                    } else {
+                        MM_LOG_WARN("engine",
+                                    "GDN regroup: {} has {} elems (expected VH={}) "
+                                    "— skipped",
+                                    n, numElems(t), VH);
+                    }
                 }
             }
             cudaCtx.stream().synchronize();

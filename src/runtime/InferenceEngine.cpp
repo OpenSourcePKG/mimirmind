@@ -1122,8 +1122,19 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     // re-run prefill for the final prompt token, because sampleNext()
     // reads its hidden state directly from xBuf (the cache only stores
     // K/V, not the hidden state that feeds the lm-head).
-    std::size_t lcp = longestCommonPrefix(promptIds,
-                                          std::span<const std::int32_t>{_cachedTokens});
+    // Backends with a recurrent SSM/GatedDeltaNet state cannot prefix-reuse:
+    // the linear layers hold a running recurrence whose value at position `lcp`
+    // depends on every token in [0, lcp), and that state lives outside the KV
+    // cache. Worse, the per-block seq-start zero fires on `cache.length() == 0`
+    // (see Qwen35MoeBackend::runLinearBlock) — a non-zero prefix leaves the KV
+    // length at `lcp`, so the SSM state is never zeroed and carries over from
+    // the previous request, degrading generation on every call after the first.
+    // Force a full prefill (lcp = 0) so the recurrence replays from a zeroed
+    // state each request. Pure-attention models keep the M9.1 prefix cache.
+    std::size_t lcp = _backend->needsSsmScratch()
+        ? 0
+        : longestCommonPrefix(promptIds,
+                              std::span<const std::int32_t>{_cachedTokens});
     if (lcp >= Tp) {
         lcp = Tp - 1;
     }

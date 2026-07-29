@@ -109,7 +109,6 @@ void applyMropeInPlace(float*              x,
         throw std::runtime_error("IMRoPE: headDim must be even");
     }
     const std::size_t halfDim = headDim / 2;
-    const float       invDim  = 1.0F / static_cast<float>(headDim);
 
     const std::int32_t s0 = sections ? sections[0] : 0;
     const std::int32_t s1 = sections ? sections[1] : 0;
@@ -117,13 +116,26 @@ void applyMropeInPlace(float*              x,
     const std::int32_t s3 = sections ? sections[3] : 0;
     const std::int32_t sectDims = s0 + s1 + s2 + s3;
 
+    // PARTIAL ROTARY: when sections are present, sectDims == rotary_dim/2, so
+    // only the first `sectDims` pairs (rotary_dim = 2*sectDims head dims) are
+    // rotated and the remaining head dims pass through unchanged; the rotation
+    // partner sits at +sectDims and the frequency denominator is rotary_dim.
+    // sectDims==0 (no sections) degenerates to plain full-head NeoX RoPE
+    // (rotPairs == halfDim, rotaryDim == headDim). Matches HF Qwen3-Next /
+    // Qwen3.5-MoE: dim = int(head_dim*partial_rotary_factor); inv_freq =
+    // base^(-2j/dim); q_rot = q[..., :dim]; q_pass = q[..., dim:].
+    const std::size_t rotPairs  = (sectDims > 0)
+        ? static_cast<std::size_t>(sectDims) : halfDim;
+    const std::size_t rotaryDim = 2 * rotPairs;
+    const float       invDim    = 1.0F / static_cast<float>(rotaryDim);
+
     for (std::size_t p = 0; p < seqLen; ++p) {
         // Text-only: all four axis positions are the sequence position.
         const float pos       = static_cast<float>(startPos + p);
         const float posAxis[4] = {pos, pos, pos, pos};
         for (std::size_t h = 0; h < numHeads; ++h) {
             float* head = x + (p * numHeads + h) * headDim;
-            for (std::size_t i = 0; i < halfDim; ++i) {
+            for (std::size_t i = 0; i < rotPairs; ++i) {
                 // IMRoPE sector rule (ggml is_imrope branch). sectDims==0
                 // degenerates to plain RoPE (posSel = time axis).
                 float posSel = posAxis[0];
@@ -147,9 +159,9 @@ void applyMropeInPlace(float*              x,
                 const float s     = std::sin(theta);
 
                 const float a = head[i];
-                const float b = head[i + halfDim];
+                const float b = head[i + rotPairs];
                 head[i]           = a * c - b * s;
-                head[i + halfDim] = a * s + b * c;
+                head[i + rotPairs] = a * s + b * c;
             }
         }
     }

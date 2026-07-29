@@ -47,7 +47,17 @@ void rope_mrope(
     const float pos      = (float)(startPos + p);
     const float posAxis[4] = { pos, pos, pos, pos };
 
+    // PARTIAL ROTARY: with sections present sectDims == rotary_dim/2, so only
+    // the first `sectDims` pairs are rotated (partner at +sectDims, freq denom
+    // = rotary_dim = 2*sectDims); the rest pass through. sectDims == 0 (no
+    // sections) degenerates to plain full-head RoPE (rotPairs == halfDim).
+    // Matches HF Qwen3-Next/Qwen3.5-MoE partial_rotary_factor.
     const int sectDims = sec0 + sec1 + sec2 + sec3;
+    const int rotPairs = (sectDims > 0) ? sectDims : halfDim;
+    if (i >= rotPairs) {
+        return;  // outside the rotary block -> pass through untouched
+    }
+
     float posSel = posAxis[0];
     if (sectDims > 0) {
         const int sector = i % sectDims;
@@ -63,7 +73,8 @@ void rope_mrope(
     }
 
     float* x = x_base + (size_t)startPos * (size_t)writeOffsetStride;
-    const float invDim = 1.0f / (float)headDim;
+    const int   rotaryDim = 2 * rotPairs;
+    const float invDim = 1.0f / (float)rotaryDim;
     const float freq   = powf(base, -(float)(2 * i) * invDim);
     const float theta  = posSel * freq;
     const float c      = cosf(theta);
@@ -71,7 +82,7 @@ void rope_mrope(
 
     const int headBase = (p * numHeads + h) * headDim;
     const float a = x[headBase + i];
-    const float b = x[headBase + i + halfDim];
+    const float b = x[headBase + i + rotPairs];
     x[headBase + i]           = a * c - b * s;
-    x[headBase + i + halfDim] = a * s + b * c;
+    x[headBase + i + rotPairs] = a * s + b * c;
 }

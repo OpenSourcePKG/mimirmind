@@ -1527,6 +1527,25 @@ if(MIMIRMIND_ENABLE_HIP)
         mimirmind_core_hip
     )
 
+    # ---- hip_mrope_probe — IMRoPE partial-rotary parity check ---------
+    #
+    # Same launch-arg pattern as hip_rope_probe (startPosPtr device slot),
+    # but exercises rope_mrope with dimension sections summing to
+    # rotary_dim/2 — the Qwen3-Next / Qwen3.5-MoE partial_rotary_factor
+    # = 0.25 path. Guards the norm-blind directional bug that shipped
+    # incoherent long-gen on Qwen3.6-NVFP4. Mirrors the L0 (gpu_tests)
+    # and CUDA (cuda_parity_tests) partial-rotary cases.
+
+    add_executable(hip_mrope_probe
+        tools/hip-mrope-probe.cpp
+    )
+
+    add_dependencies(hip_mrope_probe hip_kernels)
+
+    target_link_libraries(hip_mrope_probe PRIVATE
+        mimirmind_core_hip
+    )
+
     # ---- hip_silu_mul_probe — SwiGLU fused step parity check ----------
     #
     # Trivial element-wise kernel (one thread per element, no LDS, no
@@ -2228,6 +2247,7 @@ if(MIMIRMIND_ENABLE_HIP)
         hip_silu_mul_probe
         hip_gelu_mul_probe
         hip_rope_probe
+        hip_mrope_probe
         hip_qkv_split_probe
         hip_matmul_q8_probe
         hip_matmul_q8_gemm_probe
@@ -2419,6 +2439,8 @@ if(MIMIRMIND_ENABLE_CUDA)
         src/compute/cuda/MoeTopKRouteDevice.cpp
         src/compute/cuda/GpuMatmul.cpp
         src/compute/GatedDeltaNet.cpp
+        # CPU golden reference for the IMRoPE partial-rotary parity test.
+        src/compute/Rope.cpp
         # GpuMatmul closure: CPU-fallback matmul + dequant + quant-type registry.
         src/compute/Matmul.cpp
         src/compute/Dequant.cpp

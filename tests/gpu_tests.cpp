@@ -18,6 +18,7 @@
 
 #include "compute/Activations.hpp"
 #include "compute/Attention.hpp"
+#include "compute/GatedDeltaNet.hpp"
 #include "compute/l0/GpuMatmul.hpp"
 #include "compute/l0/GpuOps.hpp"
 #include "compute/Matmul.hpp"
@@ -811,6 +812,72 @@ TEST(rope_inplace_decodeOffset) {
 
     EXPECT_ARRAY_NEAR("rope_decode_offset", bufX.as<float>(), cpu.data(),
                       n, 1e-4F);
+}
+
+// -----------------------------------------------------------------------
+// IMRoPE partial rotary (Qwen3-Next / Qwen3.5-MoE, partial_rotary_factor
+// = 0.25). head_dim = 256, so only rotary_dim = 64 head dims (= 32 pairs)
+// rotate and the remaining 192 head dims pass through untouched; the freq
+// denominator is rotary_dim (64), NOT head_dim (256). This guards the
+// exact norm-blind directional bug that shipped incoherent long-gen on
+// Qwen3.6-NVFP4: the kernel used to rotate all 128 pairs with denom 512.
+// Beyond GPU-vs-compute:: parity we assert the pass-through invariant
+// directly, so BOTH paths silently regressing to full-head rotation
+// together is still caught.
+// -----------------------------------------------------------------------
+
+TEST(mrope_partial_rotary_parity) {
+    constexpr std::size_t seqLen   = 3;
+    constexpr std::size_t numHeads = 2;
+    constexpr std::size_t headDim  = 256;    // Qwen3-Next attention head_dim
+    constexpr std::size_t startPos = 7;      // exercise a non-zero base pos
+    constexpr float       base     = 10000.0F;
+    // GGUF <arch>.rope.dimension_sections (time/height/width/extra); the sum
+    // is rotary_dim/2, so 16+8+8+0 = 32 pairs -> rotary_dim = 64 head dims.
+    const std::int32_t sections[4] = {16, 8, 8, 0};
+    constexpr std::size_t rotaryDim = 64;    // 2 * sum(sections)
+
+    const std::size_t n = seqLen * numHeads * headDim;
+    const auto x = generateFloats(n, 0x63);
+
+    UsmBuf bufX(n * sizeof(float));
+    std::memcpy(bufX.raw(), x.data(), n * sizeof(float));
+
+    fx().ops.mropeInPlaceAsync(bufX.as<float>(), seqLen, numHeads, headDim,
+                               startPos, base, sections);
+    fx().queue.flush();
+
+    std::vector<float> cpu = x;
+    mimirmind::compute::applyMropeInPlace(cpu.data(), seqLen, numHeads,
+                                          headDim, startPos, base, sections);
+
+    // (1) L0 kernel matches the compute:: partial-rotary reference.
+    EXPECT_ARRAY_NEAR("mrope_partial/parity", bufX.as<float>(), cpu.data(),
+                      n, 1e-4F);
+
+    // (2) Reference-independent invariants: head dims [rotaryDim, headDim)
+    // are byte-identical to the input (pass-through), and the rotary block
+    // [0, rotaryDim) actually changed. Catches both paths regressing to
+    // full-head rotation together.
+    const float* g = bufX.as<float>();
+    float passMaxDiff  = 0.0F;
+    bool  rotaryMoved  = false;
+    for (std::size_t p = 0; p < seqLen; ++p) {
+        for (std::size_t h = 0; h < numHeads; ++h) {
+            const std::size_t off = (p * numHeads + h) * headDim;
+            for (std::size_t d = rotaryDim; d < headDim; ++d) {
+                passMaxDiff = std::max(passMaxDiff,
+                                       std::fabs(g[off + d] - x[off + d]));
+            }
+            for (std::size_t d = 0; d < rotaryDim; ++d) {
+                if (std::fabs(g[off + d] - x[off + d]) > 1e-4F) {
+                    rotaryMoved = true;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(passMaxDiff, 0.0F);   // pass-through dims untouched
+    EXPECT_TRUE(rotaryMoved);       // rotary block was actually rotated
 }
 
 // =======================================================================
@@ -3096,6 +3163,168 @@ TEST(moe_down_fused_k_q8_0_parity) {
 
     EXPECT_ARRAY_NEAR("moe_down_fused_k_q8_0_parity",
                       bufAccum.as<float>(), cpuAccum.data(), dModel, 1e-2F);
+}
+
+// =======================================================================
+// GatedDeltaNet (Qwen3-Next linear attention) recurrent primitives.
+//
+// These mirror the CUDA fixtures in cuda_parity_tests.cpp so the L0 SPV
+// kernels are held to the SAME compute:: reference math. Historically
+// only CUDA had numeric parity for this family (the recurrent decay path
+// where the `deltanet_gate` double-exp bug hid — see Synaipse
+// `lessons/gated-deltanet-decay-gate-double-exp-2026-07-22.md`). A
+// re-break of the L0 kernels now fails here instead of shipping silently.
+//
+// Only the six primitives that exist as L0 kernels are covered; the
+// chunked-prefill / batched / paged CUDA-only kernels have no L0 port.
+// =======================================================================
+
+TEST(gdn_l2norm_parity) {
+    constexpr std::size_t rows = 7, dim = 40;
+    constexpr float eps = 1e-6F;
+    const auto host = generateFloats(rows * dim, 0x1234);
+
+    std::vector<float> cpu = host;
+    mimirmind::compute::l2NormInPlace(cpu.data(), rows, dim, eps);
+
+    UsmBuf buf(rows * dim * sizeof(float));
+    std::memcpy(buf.raw(), host.data(), host.size() * sizeof(float));
+    fx().ops.l2NormInPlaceAsync(buf.as<float>(), rows, dim, eps);
+    fx().queue.flush();
+
+    EXPECT_ARRAY_NEAR("gdn_l2norm_parity", buf.as<float>(), cpu.data(),
+                      rows * dim, 1e-3F);
+}
+
+TEST(gdn_ssm_conv1d_parity) {
+    constexpr std::size_t T = 5, channels = 12, K = 4;
+    const auto convInput = generateFloats((K - 1 + T) * channels, 0x2222);
+    const auto kernel    = generateFloats(K * channels,           0x3333);
+
+    std::vector<float> cpu(T * channels);
+    mimirmind::compute::causalConv1dSilu(convInput.data(), kernel.data(),
+                                         cpu.data(), T, channels, K);
+
+    UsmBuf dIn((K - 1 + T) * channels * sizeof(float));
+    UsmBuf dKer(K * channels * sizeof(float));
+    UsmBuf dOut(T * channels * sizeof(float));
+    std::memcpy(dIn.raw(),  convInput.data(), convInput.size() * sizeof(float));
+    std::memcpy(dKer.raw(), kernel.data(),    kernel.size() * sizeof(float));
+
+    fx().ops.causalConv1dSiluAsync(dIn.as<float>(), dKer.as<float>(),
+                                   dOut.as<float>(), T, channels, K);
+    fx().queue.flush();
+
+    EXPECT_ARRAY_NEAR("gdn_ssm_conv1d_parity", dOut.as<float>(), cpu.data(),
+                      T * channels, 1e-3F);
+}
+
+TEST(gdn_gated_deltanet_ar_parity) {
+    constexpr std::size_t T = 4, H = 3, S = 16;
+    const auto q     = generateFloats(T * H * S, 0x0A1);
+    const auto k     = generateFloats(T * H * S, 0x0B2);
+    const auto v     = generateFloats(T * H * S, 0x0C3);
+    const auto gLog  = generateFloats(T * H,     0x0D4);
+    const auto beta  = generateFloats(T * H,     0x0E5);
+    const auto state = generateFloats(H * S * S, 0x0F6);
+
+    std::vector<float> cpuState = state;
+    std::vector<float> cpuOut(T * H * S);
+    mimirmind::compute::gatedDeltaNetRecurrent(
+        q.data(), k.data(), v.data(), gLog.data(), beta.data(),
+        cpuState.data(), cpuOut.data(), T, H, S);
+
+    UsmBuf dq(T * H * S * sizeof(float));
+    UsmBuf dk(T * H * S * sizeof(float));
+    UsmBuf dv(T * H * S * sizeof(float));
+    UsmBuf dg(T * H * sizeof(float));
+    UsmBuf db(T * H * sizeof(float));
+    UsmBuf ds(H * S * S * sizeof(float));
+    UsmBuf dout(T * H * S * sizeof(float));
+    std::memcpy(dq.raw(), q.data(),     q.size() * sizeof(float));
+    std::memcpy(dk.raw(), k.data(),     k.size() * sizeof(float));
+    std::memcpy(dv.raw(), v.data(),     v.size() * sizeof(float));
+    std::memcpy(dg.raw(), gLog.data(),  gLog.size() * sizeof(float));
+    std::memcpy(db.raw(), beta.data(),  beta.size() * sizeof(float));
+    std::memcpy(ds.raw(), state.data(), state.size() * sizeof(float));
+
+    fx().ops.gatedDeltaNetRecurrentAsync(
+        dq.as<float>(), dk.as<float>(), dv.as<float>(),
+        dg.as<float>(), db.as<float>(), ds.as<float>(),
+        dout.as<float>(), T, H, S);
+    fx().queue.flush();
+
+    EXPECT_ARRAY_NEAR("gdn_gated_deltanet_ar_parity/out",
+                      dout.as<float>(), cpuOut.data(), T * H * S, 2e-3F);
+    EXPECT_ARRAY_NEAR("gdn_gated_deltanet_ar_parity/state",
+                      ds.as<float>(), cpuState.data(), H * S * S, 2e-3F);
+}
+
+TEST(gdn_deltanet_gate_parity) {
+    constexpr std::size_t T = 5, H = 8;
+    const auto alpha = generateFloats(T * H, 0x51);
+    const auto ssmA  = generateFloats(H,     0x62);
+    const auto ssmDt = generateFloats(H,     0x73);
+
+    std::vector<float> cpu(T * H);
+    mimirmind::compute::deltanetGate(alpha.data(), ssmA.data(), ssmDt.data(),
+                                     cpu.data(), T, H);
+
+    UsmBuf da(T * H * sizeof(float));
+    UsmBuf dA(H * sizeof(float));
+    UsmBuf dD(H * sizeof(float));
+    UsmBuf dg(T * H * sizeof(float));
+    std::memcpy(da.raw(), alpha.data(), alpha.size() * sizeof(float));
+    std::memcpy(dA.raw(), ssmA.data(),  ssmA.size() * sizeof(float));
+    std::memcpy(dD.raw(), ssmDt.data(), ssmDt.size() * sizeof(float));
+
+    fx().ops.deltanetGateAsync(da.as<float>(), dA.as<float>(), dD.as<float>(),
+                               dg.as<float>(), T, H);
+    fx().queue.flush();
+
+    EXPECT_ARRAY_NEAR("gdn_deltanet_gate_parity", dg.as<float>(), cpu.data(),
+                      T * H, 1e-3F);
+}
+
+TEST(gdn_sigmoid_inplace_parity) {
+    constexpr std::size_t n = 50;
+    const auto host = generateFloats(n, 0x84);
+
+    std::vector<float> cpu = host;
+    mimirmind::compute::sigmoidInPlace(cpu.data(), n);
+
+    UsmBuf buf(n * sizeof(float));
+    std::memcpy(buf.raw(), host.data(), host.size() * sizeof(float));
+    fx().ops.sigmoidInPlaceAsync(buf.as<float>(), n);
+    fx().queue.flush();
+
+    EXPECT_ARRAY_NEAR("gdn_sigmoid_inplace_parity", buf.as<float>(),
+                      cpu.data(), n, 1e-4F);
+}
+
+TEST(gdn_gather_heads_from_channels_parity) {
+    // Wide conv buffer [T, convTotalWidth]; extract a head block at `offset`
+    // and repeat srcHeads=2 -> dstHeads=4 (GQA), S=3.
+    constexpr std::size_t T = 2, convTotalWidth = 20, offset = 5;
+    constexpr std::size_t srcHeads = 2, dstHeads = 4, S = 3;
+    const auto src = generateFloats(T * convTotalWidth, 0x95);
+
+    std::vector<float> cpu(T * dstHeads * S);
+    mimirmind::compute::gatherHeadsFromChannels(
+        src.data(), cpu.data(), T, offset, srcHeads, dstHeads, S,
+        convTotalWidth);
+
+    UsmBuf dsrc(T * convTotalWidth * sizeof(float));
+    UsmBuf ddst(T * dstHeads * S * sizeof(float));
+    std::memcpy(dsrc.raw(), src.data(), src.size() * sizeof(float));
+
+    fx().ops.gatherHeadsFromChannelsAsync(dsrc.as<float>(), ddst.as<float>(),
+                                          T, offset, srcHeads, dstHeads, S,
+                                          convTotalWidth);
+    fx().queue.flush();
+
+    EXPECT_ARRAY_NEAR("gdn_gather_heads_from_channels_parity",
+                      ddst.as<float>(), cpu.data(), T * dstHeads * S, 1e-6F);
 }
 
 int main() {

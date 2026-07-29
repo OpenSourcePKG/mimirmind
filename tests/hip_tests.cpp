@@ -137,6 +137,7 @@ TEST(hip_gelu_mul)                   { expectProbeOk("hip_gelu_mul_probe"); }
 
 // Positional encoding + shape ops
 TEST(hip_rope)                       { expectProbeOk("hip_rope_probe"); }
+TEST(hip_mrope_partial_rotary)       { expectProbeOk("hip_mrope_probe"); }
 TEST(hip_qkv_split)                  { expectProbeOk("hip_qkv_split_probe"); }
 
 // Matmul families — one representative per quant type

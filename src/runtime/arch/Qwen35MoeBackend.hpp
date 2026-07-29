@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -239,6 +240,27 @@ private:
     // saturation) without an external reference. No-op / zero cost when off.
     bool _ssmTrace{false};
 
+    // MIMIRMIND_SSM_DUMP=<dir>: directional per-block residual-stream dump.
+    // Unlike _ssmTrace (l2+max, norm-blind), this writes the RAW last-token
+    // hidden-state vector after every block to
+    //   <dir>/pos<pos>-blk<blockIdx>-xout.bin   (d_model f32, little-endian)
+    // so it can be diffed against an external oracle (vLLM/HF hidden_states)
+    // to localise the Qwen3.6 long-gen directional drift, which the norm
+    // trace is blind to. MIMIRMIND_SSM_DUMP_POS=<N> restricts dumping to the
+    // single decode position N (-1 / unset = every position). No-op when off.
+    bool        _ssmDump{false};
+    std::string _ssmDumpDir{};
+    long        _ssmDumpPos{-1};
+
+    // MIMIRMIND_GDN_DUMP=<dir>: dump the GatedDeltaNet recurrence in/out tensors
+    // for block MIMIRMIND_GDN_DUMP_BLK (default 0) as one file per tensor:
+    //   <dir>/blk<b>-{q,k,v,glog,beta,dnet}.bin  ([T,...] f32, one prefill call)
+    // to isolate the recurrence math (feed q/k/v/glog/beta to the fp64 HF
+    // reference, compare dnet) from upstream conv/projections. No-op when off.
+    bool        _gdnDump{false};
+    std::string _gdnDumpDir{};
+    std::size_t _gdnDumpBlk{0};
+
     // MIMIRMIND_Q8_DP4A: route the Q8_0 shared-expert GEMVs through the
     // dp4a (int8) path at T=1 decode (M-Q3N.4e). Experimental A/B toggle
     // for the perf measurement; default off.
@@ -268,6 +290,13 @@ private:
     /// Host-side L2 norm + max|.| of a compute buffer, after a sync. Only
     /// called on the diagnostic trace path.
     void traceNorm(const char* tag, std::size_t blockIdx,
+                   std::size_t pos, const float* p, std::size_t n) const;
+
+    /// Directional dump: writes `n` raw f32 from unified-memory `p` (after a
+    /// sync) to `<_ssmDumpDir>/pos<pos>-blk<blockIdx>-<tag>.bin`. Gated by
+    /// MIMIRMIND_SSM_DUMP / MIMIRMIND_SSM_DUMP_POS (see `_ssmDump`). Only
+    /// called on the diagnostic path.
+    void traceDump(const char* tag, std::size_t blockIdx,
                    std::size_t pos, const float* p, std::size_t n) const;
 
     // IMRoPE dimension sections (config.ropeSections), padded to 4 int32

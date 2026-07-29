@@ -47,10 +47,29 @@ void rope_mrope(
     const float pos      = (float)(startPos + p);
     const float posAxis[4] = { pos, pos, pos, pos };
 
+    // PARTIAL ROTARY: sectDims = sum of the mRoPE sections = rotary_dim/2.
+    // Only the first `sectDims` pairs (rotary_dim = 2*sectDims head dims) are
+    // rotated; the remaining head dims pass through unchanged. For full-rotary
+    // IMRoPE models sectDims == headDim/2 and this reduces to rotating every
+    // pair, so the change is a no-op there. Matches HF Qwen3-Next/Qwen3.5-MoE:
+    //   dim = int(head_dim * partial_rotary_factor);  inv_freq = base^(-2j/dim)
+    //   q_rot = q[..., :dim]; q_pass = q[..., dim:]  (rotate_half over q_rot,
+    //   i.e. the rotation partner sits at +dim/2 = +sectDims, NOT +halfDim).
+    // sectDims (sum of the mRoPE sections) = rotary_dim/2 when sections are
+    // provided; sectDims==0 means "no sections" -> plain full-head RoPE. So the
+    // number of rotated pairs is sectDims, or halfDim in the no-sections case.
     const int sectDims = sec0 + sec1 + sec2 + sec3;
+    const int rotPairs = (sectDims > 0) ? sectDims : halfDim;
+    if (i >= rotPairs) {
+        return;  // outside the rotary block -> pass through untouched
+    }
+
+    // Interleaved-mRoPE axis selection (collapses to a single axis for text,
+    // where all four posAxis entries are equal). Only meaningful when sections
+    // are present; i < rotPairs == sectDims there so sector == i.
     float posSel = posAxis[0];
     if (sectDims > 0) {
-        const int sector = i % sectDims;
+        const int sector = i;
         if (sector % 3 == 1 && sector < 3 * sec1) {
             posSel = posAxis[1];
         } else if (sector % 3 == 2 && sector < 3 * sec2) {
@@ -63,7 +82,8 @@ void rope_mrope(
     }
 
     float* x = x_base + (size_t)startPos * (size_t)writeOffsetStride;
-    const float invDim = 1.0f / (float)headDim;
+    const int   rotaryDim = 2 * rotPairs;            // head_dim*partial_rotary
+    const float invDim = 1.0f / (float)rotaryDim;    // freq denom is rotary_dim
     const float freq   = powf(base, -(float)(2 * i) * invDim);
     const float theta  = posSel * freq;
     const float c      = cosf(theta);
@@ -71,7 +91,7 @@ void rope_mrope(
 
     const int headBase = (p * numHeads + h) * headDim;
     const float a = x[headBase + i];
-    const float b = x[headBase + i + halfDim];
-    x[headBase + i]           = a * c - b * s;
-    x[headBase + i + halfDim] = a * s + b * c;
+    const float b = x[headBase + i + rotPairs];      // partner at +rotary_dim/2
+    x[headBase + i]            = a * c - b * s;
+    x[headBase + i + rotPairs] = a * s + b * c;
 }
