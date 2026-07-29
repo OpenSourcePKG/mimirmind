@@ -1122,6 +1122,87 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             return 0;
         }
 
+        // M-Cuda.MTP Increment E5 — throughput bench: batched native MTP
+        // (generateBatchMtp, depth 2/3) vs the non-speculative batched
+        // baseline (generateBatch) across nSeq, reporting gen-tok/s and the
+        // MTP speedup. All streams run eosId=-1 so every slot produces
+        // exactly maxNew tokens (clean token counting).
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_MTP_PERF_TEST") != nullptr) {
+            if (!e->mtpAvailable()) {
+                std::cout << "\n[M-Cuda.MTP.E5] model has no nextn head — skipped\n";
+                std::cout.flush();
+                return 0;
+            }
+            const auto& tok = e->tokenizer();
+            const char* promptEnv = std::getenv("MIMIRMIND_MTP_PROMPT");
+            std::vector<std::int32_t> pids = tok.encode(
+                promptEnv != nullptr
+                    ? promptEnv
+                    : "The history of artificial intelligence began when",
+                /*addBos=*/false);
+            if (pids.empty()) pids.push_back(1);
+            std::size_t maxNew = 128;
+            if (const char* mv = std::getenv("MIMIRMIND_MTP_MAXNEW")) {
+                const long v = std::strtol(mv, nullptr, 10);
+                if (v >= 1) maxNew = static_cast<std::size_t>(v);
+            }
+            std::vector<std::size_t> nSeqs = {1, 4, 8, 16};
+            if (const char* nv = std::getenv("MIMIRMIND_MTP_NSEQ")) {
+                const long v = std::strtol(nv, nullptr, 10);
+                if (v >= 1) nSeqs = {static_cast<std::size_t>(v)};
+            }
+            const std::vector<std::size_t> depths = {2, 3};
+            using clk = std::chrono::steady_clock;
+
+            // Representative accept-rate (prompt-dependent, batch-invariant).
+            std::cout << "\n[M-Cuda.MTP.E5] maxNew=" << maxNew
+                      << " promptTokens=" << pids.size() << "\n";
+            for (const std::size_t D : depths) {
+                std::size_t drafted = 0, accepted = 0;
+                (void)e->generateMtp(pids, 32, D, /*eos=*/-1, &drafted, &accepted);
+                std::cout << "  accept-rate depth=" << D << ": "
+                          << (drafted ? double(accepted) / double(drafted) : 0.0)
+                          << " (" << accepted << "/" << drafted << ")\n";
+            }
+
+            auto timeCall = [&](auto&& fn) -> double {
+                const auto t0 = clk::now();
+                fn();
+                return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+            };
+            // Global warmup at the largest shape (lazy-allocs all serving +
+            // verify buffers; ramps GPU clocks) so timed runs are steady.
+            {
+                const std::size_t wn = nSeqs.back();
+                std::vector<std::vector<std::int32_t>> wp(wn, pids);
+                (void)e->generateBatch(wp, 8, -1);
+                (void)e->generateBatchMtp(pids, wn, 8, depths.back(), -1);
+            }
+
+            std::cout << "  nSeq | baseline tok/s | depth2 tok/s (x) | depth3 tok/s (x)\n";
+            for (const std::size_t nSeq : nSeqs) {
+                const double toks = double(nSeq) * double(maxNew);
+                std::vector<std::vector<std::int32_t>> bp(nSeq, pids);
+                const double baseMs =
+                    timeCall([&]{ (void)e->generateBatch(bp, maxNew, /*eos=*/-1); });
+                const double baseTps = toks / (baseMs / 1000.0);
+
+                std::cout << "  " << nSeq << "    | " << baseTps;
+                for (const std::size_t D : depths) {
+                    const double mtpMs = timeCall(
+                        [&]{ (void)e->generateBatchMtp(pids, nSeq, maxNew, D, -1); });
+                    const double mtpTps = toks / (mtpMs / 1000.0);
+                    std::cout << " | " << mtpTps << " (" << (mtpTps / baseTps) << ")";
+                }
+                std::cout << "\n";
+                std::cout.flush();
+            }
+            std::cout << "  => E5 perf done\n";
+            std::cout.flush();
+            return 0;
+        }
+
         // M9.8b — cross-block sanity check on the effective runtime.
         // The plain-attention fallback in kernels/attention.cl holds
         // scores[ATTN_MAX_TK] in 64 KiB SLM, so if a caller forces the
