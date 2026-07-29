@@ -47,6 +47,14 @@ public:
     [[nodiscard]] bool        scalesEmbedding() const noexcept override { return false; }
     [[nodiscard]] const char* name()            const noexcept override { return "qwen2"; }
 
+    /// CLR-safe only when every block's QKV is fused (the split writes K/V
+    /// via a stable base + device curLen). Mixed-quant QKV (e.g. Qwen2.5
+    /// Q4_K_M: attn_v=Q6_K != attn_q/k=Q4_K) makes FusedQkvWeights skip the
+    /// block, so runBlock falls to the unfused path that bakes a per-token
+    /// K/V slot pointer into the recording — replay-unsafe. See
+    /// ArchBackend::decodeQkvClrSafe.
+    [[nodiscard]] bool decodeQkvClrSafe() const noexcept override;
+
     [[nodiscard]] std::vector<std::size_t>
         kvDimPerLayer() const override;
     [[nodiscard]] std::pair<std::size_t, std::size_t>

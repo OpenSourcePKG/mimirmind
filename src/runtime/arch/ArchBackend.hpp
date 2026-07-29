@@ -162,6 +162,23 @@ public:
         return false;
     }
 
+    /// True when this backend's dense (non-MoE) decode block writes K/V
+    /// through a Command-List-Replay-safe destination — a stable cache
+    /// base plus the device-side curLen slot, as the fused-QKV split does.
+    /// The UNFUSED QKV path instead projects K/V straight into
+    /// `cache.writeSlotK/V()`, a host-computed per-token pointer baked into
+    /// the recording at capture time; a replayed decode step then re-writes
+    /// that same stale slot instead of the current one, so the KV cache
+    /// never advances and generation degenerates after the first (recorded)
+    /// step. A backend that can fall onto the unfused path for the loaded
+    /// weights (e.g. mixed-quant QKV that FusedQkvWeights refuses to fuse)
+    /// must override this to report false so InferenceEngine keeps decode in
+    /// immediate mode. Default true: backends whose QKV is always fused (or
+    /// which never use per-token slot writes) are replay-safe.
+    [[nodiscard]] virtual bool decodeQkvClrSafe() const noexcept {
+        return true;
+    }
+
     /// Enable per-stage parity dumps. PREFIX is the same string carried by
     /// `diagnostics.parityDump` in config.json: each stage writes a file at
     ///   <prefix>-blk{N}-<stage>.bin

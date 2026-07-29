@@ -1394,10 +1394,30 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // recorded.
         const bool moeClrSafe =
             _config.expertCount > 0 && _backend->moeDecodeClrSafe();
+        // Dense decode is CLR-safe only when the backend writes K/V through
+        // a replay-stable destination. A backend that falls onto the
+        // unfused-QKV path (mixed-quant QKV that FusedQkvWeights refuses to
+        // fuse — e.g. Qwen2.5 Q4_K_M with attn_v=Q6_K != attn_q/k=Q4_K)
+        // bakes a per-token K/V slot pointer into the recording; replayed
+        // steps clobber that stale slot, stalling the KV cache and
+        // degenerating output after the first (recorded) step. Gate on the
+        // backend's own report so such models drop to immediate-mode decode.
+        const bool qkvClrSafe = _backend->decodeQkvClrSafe();
         const bool clrEnabled =
             clrEnvOn &&
             (_config.expertCount == 0 || moeClrSafe) &&
+            qkvClrSafe &&
             (_computeCtx->kind() == core::backend::BackendKind::LevelZero);
+        if (clrEnvOn && _config.expertCount == 0 && !qkvClrSafe) {
+            MM_LOG_WARN("engine",
+                        "features.clr=true requested but disabled — this "
+                        "model's QKV is not fully fused, so decode uses the "
+                        "unfused K/V path that bakes a per-token cache slot "
+                        "into the CLR recording; replaying it would clobber "
+                        "the stale slot and corrupt generation. Immediate-"
+                        "mode decode used instead (see "
+                        "ArchBackend::decodeQkvClrSafe).");
+        }
         if (clrEnvOn && _config.expertCount > 0 && !moeClrSafe) {
             MM_LOG_WARN("engine",
                         "features.clr=true requested but disabled "
