@@ -6,6 +6,7 @@
 #include "compute/Embedding.hpp"
 #include "core/log/Log.hpp"
 #include "runtime/BlockBuffers.hpp"
+#include "runtime/KvCache.hpp"
 #include "runtime/SsmState.hpp"
 #include "runtime/arch/Qwen35MoeBackend.hpp"
 #include "runtime/serving/PagedKvPool.hpp"
@@ -65,6 +66,42 @@ struct ServingState {
     std::vector<std::uint8_t>  isSeqStart;     // [maxBatch]
     std::vector<std::int32_t>  inputTok;       // [maxBatch]
     std::vector<float>         hostLogits;     // [maxBatch * vocab_lm]
+
+    // ---- Increment E1: MTP batched-verify scratch (lazily sized) --------
+    // Sized for up to `maxBatch` slots × (verifyDepth + 1) verify tokens =
+    // Mcap virtual rows. Full-attention runs over all Mcap rows at once;
+    // the GatedDeltaNet layers run (verifyDepth + 1) sequential steps of
+    // nSeq = maxBatch, snapshotting the recurrent state after each step.
+    std::size_t verifyDepth{0};   // K (0 => verify scratch not yet built)
+    std::size_t verifyMcap{0};    // maxBatch * (verifyDepth + 1)
+    std::optional<BlockBuffers> vsb;                 // maxT = verifyMcap
+    compute::ComputeBuffer vExpIdx, vKw;             // [Mcap * expertUsedCount]
+    compute::ComputeBuffer vBlockTablesDev;          // [Mcap * blocksPerSeq]
+    compute::ComputeBuffer vSeqLensDev, vStartPosDev;// [Mcap]
+    compute::ComputeBuffer vXBuf, vNormB, vLogitsB, vLmScr;
+    std::vector<compute::ComputeBuffer> ssmSnap;     // [K+1] full SsmState state images
+    std::vector<compute::ComputeBuffer> convSnap;    // [K+1] full SsmState conv images
+    std::vector<std::int32_t>  vBlockTablesH;        // [Mcap * blocksPerSeq]
+    std::vector<std::int32_t>  vSeqLensH, vStartPosH;
+    std::vector<std::uint32_t> vWriteBlockId;
+    std::vector<std::int32_t>  vWriteSlot;
+    std::vector<std::uint8_t>  vIsSeqStart;          // full-attn virt-slot start flags
+    std::vector<std::uint8_t>  vGdnSeqStart;         // [(K+1) * maxBatch] per-step GDN start flags
+    std::vector<std::int32_t>  vInputTok;
+    std::vector<float>         vHostLogits;          // [Mcap * vocab_lm]
+
+    // ---- Increment E2: per-slot nextn (MTP) KV + draft scratch ----------
+    // One 1-layer nextn self-attention KV cache per physical slot (the MTP
+    // draft chain is independent per slot). Draft scratch is shared — the
+    // draft loop runs one slot at a time (blk.<blockCount> is cheap).
+    bool mtpReady{false};
+    std::vector<std::unique_ptr<KvCache>> mtpKv;     // [maxBatch] 1-layer nextn cache
+    compute::ComputeBuffer mtpEmb;                   // [d_model]   embed(prevTok)
+    compute::ComputeBuffer mtpCat;                   // [2*d_model] concat(norms)
+    compute::ComputeBuffer mtpEh;                    // [d_model]   eh_proj / next hidden
+    compute::ComputeBuffer mtpDraftLogits;           // [vocab_lm]  draft logits
+    compute::ComputeBuffer mtpLmScr;                 // [max(d,vocab)] lm-head scratch
+    std::vector<float>     mtpHostLogits;            // [vocab_lm]  argmax readback
 };
 
 ServingSession::ServingSession(InferenceEngine& engine) : _e{engine} {}
@@ -505,6 +542,378 @@ void ServingSession::stepServing(
         }
         outTokens[i] = static_cast<std::int32_t>(best);
     }
+}
+
+void ServingSession::ensureVerifyCapacity(std::size_t depth) {
+    if (_state == nullptr) {
+        throw std::runtime_error("stepServingVerify: ensureServingState not called");
+    }
+    auto& st = *_state;
+    if (depth == 0) {
+        depth = 1;   // K >= 1 (token0 + at least one draft)
+    }
+    if (st.verifyDepth >= depth && st.vsb.has_value()) {
+        return;      // already sized for at least this depth
+    }
+
+    const std::size_t K       = std::max(st.verifyDepth, depth);
+    const std::size_t Mcap    = st.maxBatch * (K + 1);
+    const std::size_t d_model = st.d_model;
+    const std::size_t vocab   = st.vocab_lm;
+    const std::size_t nExp    = _e._config.expertUsedCount;
+
+    st.verifyDepth = K;
+    st.verifyMcap  = Mcap;
+
+    const auto qkv = st.qb->maxQKVDims();
+    st.vsb = allocBlockBuffers(*_e._ops, _e._config, /*maxT=*/Mcap,
+                               /*maxSeq=*/Mcap, qkv.first, qkv.second,
+                               /*withFusedQkv=*/false, /*withKvFp32Scratch=*/true,
+                               /*withQGate=*/true, /*withSsm=*/true,
+                               /*perSeqConvInput=*/true);
+    // Bind the recurrent slab to the PERSISTENT per-slot SsmState (slab
+    // width = maxBatch). Verify advances it in place; the snapshots let a
+    // partial accept (Increment E3) restore it without a re-forward.
+    st.vsb->ssmStatePtr     = st.ssm->statePtr();
+    st.vsb->ssmConvStatePtr = st.ssm->convStatePtr();
+    st.vsb->ssmSlabNSeq     = st.ssm->nSeq();
+
+    st.vExpIdx = _e._ops->allocate(Mcap * nExp * sizeof(std::int32_t));
+    st.vKw     = _e._ops->allocate(Mcap * nExp * sizeof(float));
+    st.vBlockTablesDev =
+        _e._ops->allocate(Mcap * st.blocksPerSeq * sizeof(std::int32_t));
+    st.vSeqLensDev  = _e._ops->allocate(Mcap * sizeof(std::int32_t));
+    st.vStartPosDev = _e._ops->allocate(Mcap * sizeof(std::int32_t));
+    st.vXBuf    = _e._ops->allocate(Mcap * d_model * sizeof(float));
+    st.vNormB   = _e._ops->allocate(Mcap * d_model * sizeof(float));
+    st.vLogitsB = _e._ops->allocate(Mcap * vocab   * sizeof(float));
+    st.vLmScr   = _e._ops->allocate(std::max(d_model, vocab) * sizeof(float));
+
+    // Full recurrent-state images (one per verify step): [blockCount, slab,
+    // stateElems] / conv. On a partial accept, slot s's slice is restored
+    // from ssmSnap[a_s]; E1 only produces them (the logits are the gate).
+    const std::size_t stImgElems = st.ssm->blockCount() * st.ssm->stateLayerStride();
+    const std::size_t cvImgElems = st.ssm->blockCount() * st.ssm->convStateLayerStride();
+    st.ssmSnap.clear();
+    st.convSnap.clear();
+    st.ssmSnap.reserve(K + 1);
+    st.convSnap.reserve(K + 1);
+    for (std::size_t j = 0; j <= K; ++j) {
+        st.ssmSnap.push_back(_e._ops->allocate(stImgElems * sizeof(float)));
+        st.convSnap.push_back(_e._ops->allocate(cvImgElems * sizeof(float)));
+    }
+
+    st.vBlockTablesH.assign(Mcap * st.blocksPerSeq, 0);
+    st.vSeqLensH.assign(Mcap, 0);
+    st.vStartPosH.assign(Mcap, 0);
+    st.vWriteBlockId.assign(Mcap, 0);
+    st.vWriteSlot.assign(Mcap, 0);
+    st.vIsSeqStart.assign(Mcap, 0);
+    st.vGdnSeqStart.assign((K + 1) * st.maxBatch, 0);
+    st.vInputTok.assign(Mcap, 0);
+    st.vHostLogits.assign(Mcap * vocab, 0.0F);
+
+    MM_LOG_INFO("serving",
+                "ensureVerifyCapacity: depth={} Mcap={} snapStateBytes={} x{}",
+                K, Mcap, stImgElems * sizeof(float), K + 1);
+}
+
+std::vector<std::vector<float>>
+ServingSession::stepServingVerify(
+        std::span<const InferenceEngine::VerifySlot> slots,
+        std::span<const std::int32_t>                tokensTimeMajor,
+        std::size_t                                  depth) {
+    namespace cmp = mimirmind::compute;
+    if (_state == nullptr) {
+        throw std::runtime_error("stepServingVerify: ensureServingState not called");
+    }
+    auto& st = *_state;
+    const std::size_t N = slots.size();
+    if (N == 0) {
+        return {};
+    }
+    if (depth == 0) {
+        depth = 1;
+    }
+    const std::size_t K   = depth;
+    const std::size_t Kp1 = K + 1;
+    const std::size_t M   = N * Kp1;
+    if (N > st.maxBatch) {
+        throw std::runtime_error("stepServingVerify: N exceeds serving maxBatch");
+    }
+    if (tokensTimeMajor.size() != M) {
+        throw std::runtime_error(
+            "stepServingVerify: tokensTimeMajor size != N*(depth+1)");
+    }
+    for (std::size_t s = 0; s < N; ++s) {
+        if (slots[s].slot != s) {
+            throw std::runtime_error(
+                "stepServingVerify: slots must be a contiguous prefix "
+                "(slots[s].slot == s)");
+        }
+        const std::size_t endPos =
+            static_cast<std::size_t>(slots[s].basePos) + K;
+        if (endPos >= st.maxContext) {
+            throw std::runtime_error(
+                "stepServingVerify: basePos+depth exceeds maxContext");
+        }
+    }
+    ensureVerifyCapacity(K);
+
+    const std::size_t d_model = st.d_model;
+    const std::size_t vocab   = st.vocab_lm;
+    const std::size_t bps     = st.blocksPerSeq;
+    const std::size_t bsz     = st.blockSize;
+
+    // --- host metadata for the N*(K+1) full-attention virtual slots ------
+    // Row r = j*N + s is slot s's j-th verify token, at absolute position
+    // basePos_s + j. It writes its K/V into slot s's paged blocks and, via
+    // seqLens = pos+1, attends causally over [0, pos] — i.e. slot s's
+    // committed prefix plus this round's earlier drafts, never the later ones.
+    for (std::size_t j = 0; j < Kp1; ++j) {
+        for (std::size_t s = 0; s < N; ++s) {
+            const std::size_t r   = j * N + s;
+            const std::size_t pos =
+                static_cast<std::size_t>(slots[s].basePos) + j;
+            st.vInputTok[r]     = tokensTimeMajor[r];
+            st.vWriteBlockId[r] = static_cast<std::uint32_t>(s * bps + pos / bsz);
+            st.vWriteSlot[r]    = static_cast<std::int32_t>(pos % bsz);
+            st.vSeqLensH[r]     = static_cast<std::int32_t>(pos + 1);
+            st.vStartPosH[r]    = static_cast<std::int32_t>(pos);
+            st.vIsSeqStart[r]   = (pos == 0) ? 1U : 0U;
+            for (std::size_t i = 0; i < bps; ++i) {
+                st.vBlockTablesH[r * bps + i] =
+                    static_cast<std::int32_t>(s * bps + i);
+            }
+        }
+    }
+    // per-step GatedDeltaNet sequence-start flags (nSeq = N per step): a
+    // slot only starts fresh if its verify token j sits at absolute pos 0.
+    for (std::size_t j = 0; j < Kp1; ++j) {
+        for (std::size_t s = 0; s < N; ++s) {
+            st.vGdnSeqStart[j * st.maxBatch + s] =
+                (static_cast<std::size_t>(slots[s].basePos) + j == 0) ? 1U : 0U;
+        }
+    }
+
+    _e._ops->uploadHostBytes(st.vBlockTablesDev.get(), st.vBlockTablesH.data(),
+                             M * bps * sizeof(std::int32_t));
+    _e._ops->uploadHostBytes(st.vSeqLensDev.get(),  st.vSeqLensH.data(),
+                             M * sizeof(std::int32_t));
+    _e._ops->uploadHostBytes(st.vStartPosDev.get(), st.vStartPosH.data(),
+                             M * sizeof(std::int32_t));
+
+    float* const xBuf = st.vXBuf.as<float>();
+    cmp::embeddingLookup(st.tokEmb->type, st.tokEmb->usmPtr, d_model,
+                         st.vocab_emb,
+                         std::span<const std::int32_t>{st.vInputTok.data(), M},
+                         xBuf);
+
+    // --- full-attention context (all M virtual slots at once) ------------
+    arch::BatchedDecodeCtx ctxFull{};
+    ctxFull.nSeq            = M;
+    ctxFull.pool            = st.pool.get();
+    ctxFull.writeBlockId    = st.vWriteBlockId.data();
+    ctxFull.writeSlot       = st.vWriteSlot.data();
+    ctxFull.blockTablesDev  = static_cast<const std::int32_t*>(st.vBlockTablesDev.get());
+    ctxFull.seqLensDev      = static_cast<const std::int32_t*>(st.vSeqLensDev.get());
+    ctxFull.maxBlocksPerSeq = bps;
+    ctxFull.startPosDev     = static_cast<const std::int32_t*>(st.vStartPosDev.get());
+    ctxFull.expIdxSlot      = st.vExpIdx.as<std::int32_t>();
+    ctxFull.kwSlot          = st.vKw.as<float>();
+    ctxFull.isSeqStart      = st.vIsSeqStart.data();
+
+    const std::size_t stStride = st.ssm->stateLayerStride();
+    const std::size_t cvStride = st.ssm->convStateLayerStride();
+
+    for (std::size_t b = 0; b < st.blockCount; ++b) {
+        if (_e._config.isRecurrentLayer(b)) {
+            // GatedDeltaNet: K+1 sequential batched steps (nSeq = N). Step j
+            // advances the per-slot recurrent state by verify token j; a
+            // full state image is snapshotted after each step so a partial
+            // accept can restore it (Increment E3) without a re-forward.
+            for (std::size_t j = 0; j < Kp1; ++j) {
+                arch::BatchedDecodeCtx ctxGdn{};
+                ctxGdn.nSeq       = N;
+                ctxGdn.expIdxSlot = st.vExpIdx.as<std::int32_t>();
+                ctxGdn.kwSlot     = st.vKw.as<float>();
+                ctxGdn.isSeqStart = st.vGdnSeqStart.data() + j * st.maxBatch;
+                st.qb->runBlockBatched(b, xBuf + j * N * d_model, ctxGdn, *st.vsb);
+                _e._ops->appendMemoryCopy(
+                    st.ssmSnap[j].as<float>() + b * stStride,
+                    st.ssm->statePtr()        + b * stStride,
+                    stStride * sizeof(float));
+                _e._ops->appendMemoryCopy(
+                    st.convSnap[j].as<float>() + b * cvStride,
+                    st.ssm->convStatePtr()     + b * cvStride,
+                    cvStride * sizeof(float));
+            }
+        } else {
+            st.qb->runBlockBatched(b, xBuf, ctxFull, *st.vsb);
+        }
+    }
+
+    // --- per-position logits over all M rows -----------------------------
+    float* const normBuf = st.vNormB.as<float>();
+    float* const logits  = st.vLogitsB.as<float>();
+    _e._ops->rmsNormAsync(xBuf, M, d_model,
+                          static_cast<const float*>(st.outNorm->usmPtr),
+                          _e._config.rmsNormEps, normBuf);
+    _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, vocab, d_model,
+                    normBuf, M, logits, st.vLmScr.as<float>());
+    _e._ops->flush();
+    _e._ops->readbackToHost(st.vHostLogits.data(), logits,
+                            M * vocab * sizeof(float));
+
+    std::vector<std::vector<float>> out;
+    out.reserve(M);
+    for (std::size_t r = 0; r < M; ++r) {
+        const float* row = st.vHostLogits.data() + r * vocab;
+        out.emplace_back(row, row + vocab);
+    }
+    return out;
+}
+
+void ServingSession::ensureMtpServingState() {
+    if (_state == nullptr) {
+        throw std::runtime_error("mtp serving: ensureServingState not called");
+    }
+    auto& st = *_state;
+    if (st.mtpReady) {
+        return;
+    }
+    if (!_e.mtpAvailable()) {
+        throw std::runtime_error("mtp serving: model has no nextn (MTP) head");
+    }
+    const std::size_t d        = st.d_model;
+    const std::size_t vocab    = st.vocab_lm;
+    const std::size_t nKvHeads = _e._config.headCountKv;
+    const std::size_t headDim  = _e._config.headDim();
+
+    st.mtpKv.clear();
+    st.mtpKv.reserve(st.maxBatch);
+    for (std::size_t s = 0; s < st.maxBatch; ++s) {
+        st.mtpKv.push_back(std::make_unique<KvCache>(
+            *_e._ops, /*nLayers=*/1, st.maxContext, nKvHeads, headDim, _e._kvDtype));
+    }
+    st.mtpEmb         = _e._ops->allocate(d * sizeof(float));
+    st.mtpCat         = _e._ops->allocate(2 * d * sizeof(float));
+    st.mtpEh          = _e._ops->allocate(d * sizeof(float));
+    st.mtpDraftLogits = _e._ops->allocate(vocab * sizeof(float));
+    st.mtpLmScr       = _e._ops->allocate(std::max(d, vocab) * sizeof(float));
+    st.mtpHostLogits.assign(vocab, 0.0F);
+    st.mtpReady = true;
+
+    MM_LOG_INFO("serving",
+                "ensureMtpServingState: {} per-slot nextn KV caches (maxContext={})",
+                st.maxBatch, st.maxContext);
+}
+
+void ServingSession::draftKInto(KvCache& kv, const float* hidden0,
+                                std::int32_t prevTok, std::size_t K,
+                                std::vector<std::int32_t>& out) {
+    auto& st = *_state;
+    float* const emb  = st.mtpEmb.as<float>();
+    float* const cat  = st.mtpCat.as<float>();
+    float* const eh   = st.mtpEh.as<float>();
+    float* const dlog = st.mtpDraftLogits.as<float>();
+    float* const lmSc = st.mtpLmScr.as<float>();
+    const std::size_t vocab = st.vocab_lm;
+
+    const float*  hcur = hidden0;
+    std::int32_t  prev = prevTok;
+    for (std::size_t k = 0; k < K; ++k) {
+        // one nextn draft step: writes logits into dlog, next hidden into eh.
+        st.qb->runMtpDraftStep(hcur, prev, kv, *st.sb, emb, cat, eh, dlog, lmSc);
+        kv.commit(1);
+        _e._ops->flush();
+        _e._ops->readbackToHost(st.mtpHostLogits.data(), dlog, vocab * sizeof(float));
+        std::size_t best = 0;
+        float       bv   = st.mtpHostLogits[0];
+        for (std::size_t v = 1; v < vocab; ++v) {
+            if (st.mtpHostLogits[v] > bv) { bv = st.mtpHostLogits[v]; best = v; }
+        }
+        out.push_back(static_cast<std::int32_t>(best));
+        hcur = eh;                                   // block-<mtp> out = next hidden
+        prev = static_cast<std::int32_t>(best);
+    }
+}
+
+InferenceEngine::MtpDraftParityResult
+ServingSession::mtpDraftParity(std::span<const std::int32_t> prompt,
+                               std::size_t nSeq, std::size_t depth) {
+    InferenceEngine::MtpDraftParityResult res{};
+    if (_e._backend == nullptr) {
+        throw std::runtime_error("mtpDraftParity: no model loaded");
+    }
+    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    if (qb == nullptr || !_e.mtpAvailable()) {
+        throw std::runtime_error(
+            "mtpDraftParity: requires CUDA qwen35moe with a nextn head");
+    }
+    if (prompt.empty()) {
+        throw std::runtime_error("mtpDraftParity: empty prompt");
+    }
+    if (nSeq == 0)  nSeq = 1;
+    if (depth == 0) depth = 1;
+    const std::size_t P = prompt.size();
+    const std::size_t d = _e._config.embeddingLength;
+
+    ensureServingState(nSeq, P + depth + 8);
+    ensureMtpServingState();
+    auto& st = *_state;
+
+    // --- trunk prefill: single-session forwardVerify(prompt) -------------
+    // Leaves the P trunk hiddens in _xBufH (untouched by draft steps, which
+    // write only into MTP scratch); last row = the draft seed hidden.
+    _e.resetCache();
+    const std::vector<std::int32_t> pvec(prompt.begin(), prompt.end());
+    const auto pf = _e.forwardVerify(pvec);
+    float* const xBuf = _e._xBufH.as<float>();
+    const float* const hidS = xBuf + (P - 1) * d;
+    std::size_t t0 = 0;
+    {
+        const auto& last = pf.back();
+        float bv = last[0];
+        for (std::size_t v = 1; v < last.size(); ++v) {
+            if (last[v] > bv) { bv = last[v]; t0 = v; }
+        }
+    }
+    const std::int32_t token0 = static_cast<std::int32_t>(t0);
+
+    // Seed a nextn KV cache by replaying the prompt (P-1 steps), exactly
+    // like MtpDecoder's prefill (runMtpDraftStep over prompt[1..P-1]).
+    auto seed = [&](KvCache& kv) {
+        kv.reset();
+        float* const emb  = st.mtpEmb.as<float>();
+        float* const cat  = st.mtpCat.as<float>();
+        float* const eh   = st.mtpEh.as<float>();
+        float* const dlog = st.mtpDraftLogits.as<float>();
+        float* const lmSc = st.mtpLmScr.as<float>();
+        for (std::size_t p = 0; p + 1 < P; ++p) {
+            st.qb->runMtpDraftStep(xBuf + p * d, prompt[p + 1], kv, *st.sb,
+                                   emb, cat, eh, dlog, lmSc);
+            kv.commit(1);
+        }
+    };
+
+    // --- reference: independent single-sequence nextn KV cache -----------
+    KvCache refKv(*_e._ops, /*nLayers=*/1, st.maxContext,
+                  _e._config.headCountKv, _e._config.headDim(), _e._kvDtype);
+    seed(refKv);
+    draftKInto(refKv, hidS, token0, depth, res.refDrafts);
+
+    // --- serving path: one per-slot MTP-KV per sequence ------------------
+    res.slotDrafts.assign(nSeq, {});
+    res.allSlotsAgree    = true;
+    res.matchesReference = true;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        seed(*st.mtpKv[s]);
+        draftKInto(*st.mtpKv[s], hidS, token0, depth, res.slotDrafts[s]);
+        if (res.slotDrafts[s] != res.slotDrafts[0]) res.allSlotsAgree = false;
+        if (res.slotDrafts[s] != res.refDrafts)     res.matchesReference = false;
+    }
+    return res;
 }
 
 std::size_t ServingSession::maxBatch() const noexcept {

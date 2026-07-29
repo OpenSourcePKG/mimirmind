@@ -11,6 +11,8 @@
 #include <span>
 #include <vector>
 
+namespace mimirmind::runtime { class KvCache; }   // nextn (MTP) KV cache
+
 namespace mimirmind::runtime::engine {
 
 struct ServingState;   // persistent continuous-batch substrate (defined in .cpp)
@@ -51,10 +53,36 @@ public:
     void stepServing(std::span<const InferenceEngine::ServingSlotStep> steps,
                      std::span<std::int32_t>                           outTokens);
 
+    /// See InferenceEngine::stepServingVerify.
+    [[nodiscard]] std::vector<std::vector<float>>
+    stepServingVerify(std::span<const InferenceEngine::VerifySlot> slots,
+                      std::span<const std::int32_t>                tokensTimeMajor,
+                      std::size_t                                  depth);
+
+    /// See InferenceEngine::mtpDraftParity.
+    [[nodiscard]] InferenceEngine::MtpDraftParityResult
+    mtpDraftParity(std::span<const std::int32_t> prompt,
+                   std::size_t nSeq, std::size_t depth);
+
     [[nodiscard]] std::size_t maxBatch() const noexcept;
     [[nodiscard]] std::size_t maxContext() const noexcept;
 
 private:
+    /// Lazily (re)allocate the Increment-E1 verify scratch for up to
+    /// `maxBatch` slots × `depth + 1` verify tokens. Grows monotonically.
+    void ensureVerifyCapacity(std::size_t depth);
+
+    /// Increment E2 — lazily allocate the per-slot nextn (MTP) KV caches +
+    /// shared draft scratch. Requires a loaded nextn head. Idempotent.
+    void ensureMtpServingState();
+
+    /// Increment E2 — draft `K` tokens through `kv` (a 1-layer nextn KV
+    /// cache) starting from trunk hidden `hidden0` (device [d]) and token
+    /// `prevTok`, committing each step. Appends the drafted ids to `out`.
+    /// `runMtpDraftStep` per step (the draft is cheap — blk.<blockCount>).
+    void draftKInto(KvCache& kv, const float* hidden0, std::int32_t prevTok,
+                    std::size_t K, std::vector<std::int32_t>& out);
+
     InferenceEngine&              _e;
     std::unique_ptr<ServingState> _state;
 };

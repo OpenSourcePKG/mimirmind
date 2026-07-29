@@ -851,6 +851,144 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             return 0;
         }
 
+        // M-Cuda.MTP Increment E1 — batched-verify parity gate. With a
+        // single slot (N=1), stepServingVerify (full-attention over virtual
+        // paged slots + K+1 sequential GatedDeltaNet steps + per-step SSM
+        // snapshot) MUST reproduce single-session forwardVerify on the SAME
+        // committed prefix and the SAME K+1 verify tokens, position for
+        // position. This isolates the new verify orchestration from the
+        // paged-vs-contiguous substrate parity already proven by
+        // generateServingParity.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_MTP_VERIFY_TEST") != nullptr) {
+            const auto& tok = e->tokenizer();
+            const char* promptEnv = std::getenv("MIMIRMIND_MTP_PROMPT");
+            std::vector<std::int32_t> pids = tok.encode(
+                promptEnv != nullptr
+                    ? promptEnv
+                    : "The history of artificial intelligence began when",
+                /*addBos=*/false);
+            if (pids.empty()) pids.push_back(1);
+            std::size_t K = 2;
+            if (const char* dv = std::getenv("MIMIRMIND_MTP_DEPTH")) {
+                const long v = std::strtol(dv, nullptr, 10);
+                if (v >= 1) K = static_cast<std::size_t>(v);
+            }
+            const std::size_t P = pids.size();
+
+            // K+1 in-distribution verify tokens (token0 + K greedy drafts).
+            // Their VALUES only need to agree across the two forward paths —
+            // the gate compares logits, not correctness — so a short greedy
+            // generate() is a convenient, realistic source.
+            ::mimirmind::runtime::GenerateParams gp{};
+            gp.maxNewTokens         = K + 1;
+            gp.sampling.temperature = 0.0F;
+            e->resetCache();
+            std::vector<std::int32_t> vtoks =
+                e->generate(pids, gp, {}, nullptr, {}, {});
+            if (vtoks.empty()) vtoks.push_back(1);
+            vtoks.resize(K + 1, vtoks.back());
+
+            // Reference: single-session forwardVerify over the committed
+            // prompt, then the K+1 verify tokens (provisional, not committed).
+            e->resetCache();
+            (void)e->forwardVerify(pids);
+            e->commitVerified(pids);
+            const std::vector<std::vector<float>> ref = e->forwardVerify(vtoks);
+
+            // Test: serving path. Prefill the prompt through stepServing to
+            // build the paged KV + recurrent state to position P, then verify.
+            using Step = ::mimirmind::runtime::InferenceEngine::ServingSlotStep;
+            using VSlot = ::mimirmind::runtime::InferenceEngine::VerifySlot;
+            e->ensureServingState(/*maxBatch=*/1, /*maxContext=*/P + K + 8);
+            for (std::size_t g = 0; g < P; ++g) {
+                std::vector<Step> steps(1);
+                steps[0].slot     = 0;
+                steps[0].token    = pids[g];
+                steps[0].pos      = static_cast<std::int32_t>(g);
+                steps[0].seqStart = (g == 0);
+                std::vector<std::int32_t> outTok(1, 0);
+                e->stepServing(steps, outTok);
+            }
+            std::vector<VSlot> vs(1);
+            vs[0].slot    = 0;
+            vs[0].basePos = static_cast<std::int32_t>(P);
+            const std::vector<std::vector<float>> test =
+                e->stepServingVerify(vs, vtoks, K);
+
+            bool   allMatch = (ref.size() == test.size());
+            double maxDelta = 0.0;
+            const std::size_t rows = std::min(ref.size(), test.size());
+            std::cout << "\n[M-Cuda.MTP.E1] depth=" << K << " promptTokens=" << P;
+            for (std::size_t j = 0; j < rows; ++j) {
+                std::size_t aRef = 0, aTst = 0;
+                float bRef = ref[j][0], bTst = test[j][0];
+                const std::size_t V = std::min(ref[j].size(), test[j].size());
+                for (std::size_t v = 1; v < V; ++v) {
+                    if (ref[j][v]  > bRef) { bRef = ref[j][v];  aRef = v; }
+                    if (test[j][v] > bTst) { bTst = test[j][v]; aTst = v; }
+                    double d = static_cast<double>(ref[j][v]) - test[j][v];
+                    if (d < 0.0) d = -d;
+                    if (d > maxDelta) maxDelta = d;
+                }
+                if (aRef != aTst) allMatch = false;
+                std::cout << "\n  pos " << j << " argmax ref=" << aRef
+                          << " test=" << aTst
+                          << (aRef == aTst ? "  match" : "  MISMATCH");
+            }
+            std::cout << "\n  maxLogitDelta=" << maxDelta
+                      << "\n  => E1 verify " << (allMatch ? "PASS" : "MISMATCH")
+                      << "\n";
+            std::cout.flush();
+            return 0;
+        }
+
+        // M-Cuda.MTP Increment E2 — per-slot MTP draft parity gate. Drafts
+        // `depth` tokens for `nSeq` slots, each on its own nextn KV cache,
+        // and checks (a) all slots agree (per-slot KV isolation) and (b)
+        // they match an independent single-sequence reference draft chain
+        // (the serving per-slot KV path == single-session draft).
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_MTP_DRAFT_TEST") != nullptr) {
+            if (!e->mtpAvailable()) {
+                std::cout << "\n[M-Cuda.MTP.E2] model has no nextn head — skipped\n";
+                std::cout.flush();
+                return 0;
+            }
+            const auto& tok = e->tokenizer();
+            const char* promptEnv = std::getenv("MIMIRMIND_MTP_PROMPT");
+            std::vector<std::int32_t> pids = tok.encode(
+                promptEnv != nullptr
+                    ? promptEnv
+                    : "The history of artificial intelligence began when",
+                /*addBos=*/false);
+            if (pids.empty()) pids.push_back(1);
+            std::size_t K = 4;
+            if (const char* dv = std::getenv("MIMIRMIND_MTP_DEPTH")) {
+                const long v = std::strtol(dv, nullptr, 10);
+                if (v >= 1) K = static_cast<std::size_t>(v);
+            }
+            std::size_t N = 4;
+            if (const char* nv = std::getenv("MIMIRMIND_MTP_NSEQ")) {
+                const long v = std::strtol(nv, nullptr, 10);
+                if (v >= 1) N = static_cast<std::size_t>(v);
+            }
+            const auto r = e->mtpDraftParity(pids, N, K);
+            std::cout << "\n[M-Cuda.MTP.E2] nSeq=" << N << " depth=" << K
+                      << " promptTokens=" << pids.size() << "\n  ref  drafts:";
+            for (const std::int32_t t : r.refDrafts) std::cout << " " << t;
+            for (std::size_t s = 0; s < r.slotDrafts.size(); ++s) {
+                std::cout << "\n  slot " << s << " drafts:";
+                for (const std::int32_t t : r.slotDrafts[s]) std::cout << " " << t;
+            }
+            const bool pass = r.allSlotsAgree && r.matchesReference;
+            std::cout << "\n  allSlotsAgree=" << (r.allSlotsAgree ? "YES" : "NO")
+                      << " matchesReference=" << (r.matchesReference ? "YES" : "NO")
+                      << "\n  => E2 draft " << (pass ? "PASS" : "MISMATCH") << "\n";
+            std::cout.flush();
+            return 0;
+        }
+
         // M9.8b — cross-block sanity check on the effective runtime.
         // The plain-attention fallback in kernels/attention.cl holds
         // scores[ATTN_MAX_TK] in 64 KiB SLM, so if a caller forces the

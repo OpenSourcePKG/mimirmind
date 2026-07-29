@@ -2150,6 +2150,25 @@ void InferenceEngine::stepServing(std::span<const ServingSlotStep> steps,
     _servingSession->stepServing(steps, outTokens);
 }
 
+std::vector<std::vector<float>>
+InferenceEngine::stepServingVerify(std::span<const VerifySlot>   slots,
+                                   std::span<const std::int32_t> tokensTimeMajor,
+                                   std::size_t                   depth) {
+    if (_servingSession == nullptr) {
+        throw std::runtime_error("stepServingVerify: ensureServingState not called");
+    }
+    return _servingSession->stepServingVerify(slots, tokensTimeMajor, depth);
+}
+
+InferenceEngine::MtpDraftParityResult
+InferenceEngine::mtpDraftParity(std::span<const std::int32_t> prompt,
+                                std::size_t nSeq, std::size_t depth) {
+    if (_servingSession == nullptr) {
+        _servingSession = std::make_unique<engine::ServingSession>(*this);
+    }
+    return _servingSession->mtpDraftParity(prompt, nSeq, depth);
+}
+
 std::size_t InferenceEngine::servingMaxBatch() const noexcept {
     return _servingSession != nullptr ? _servingSession->maxBatch() : 0;
 }

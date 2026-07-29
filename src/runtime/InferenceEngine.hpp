@@ -421,6 +421,30 @@ public:
         bool          seqStart{false};
     };
 
+    /// M-Cuda.MTP Increment E1 — one per-slot descriptor for
+    /// `stepServingVerify`. `slot` MUST equal the slot's index in the batch
+    /// (verify slots are a contiguous prefix 0..N-1, mirroring stepServing).
+    /// `basePos` is the slot's committed length — the absolute position of
+    /// this slot's first verify token (token0). The committed per-slot KV +
+    /// GatedDeltaNet state must already sit at exactly `basePos`.
+    struct VerifySlot {
+        std::uint32_t slot{0};
+        std::int32_t  basePos{0};
+    };
+
+    /// M-Cuda.MTP Increment E2 — result of the per-slot MTP draft parity
+    /// gate. `slotDrafts[s]` is slot s's `depth` drafted tokens; `refDrafts`
+    /// is the same draft chain computed through an independent single-
+    /// sequence KV cache. `allSlotsAgree` iff every slot produced the SAME
+    /// chain (per-slot MTP-KV isolation); `matchesReference` iff they equal
+    /// `refDrafts` (the serving per-slot KV path == single-session draft).
+    struct MtpDraftParityResult {
+        bool                                    allSlotsAgree{false};
+        bool                                    matchesReference{false};
+        std::vector<std::int32_t>               refDrafts;
+        std::vector<std::vector<std::int32_t>>  slotDrafts;
+    };
+
     /// Lazily build the persistent serving state for `maxBatch` slots,
     /// each able to hold up to `maxContext` tokens of paged KV. Idempotent
     /// for the same (maxBatch, maxContext); rebuilds if they grow. Must be
@@ -436,6 +460,45 @@ public:
     /// `ensureServingState`.
     void stepServing(std::span<const ServingSlotStep> steps,
                      std::span<std::int32_t>          outTokens);
+
+    /// M-Cuda.MTP Increment E1 — one batched MTP *verify* forward. `slots`
+    /// is a contiguous prefix (slots[s].slot == s, N = slots.size()), each
+    /// carrying `depth + 1` verify tokens (token0 + `depth` drafts).
+    /// `tokensTimeMajor` is `[(depth + 1) * N]`, laid out time-major: row
+    /// `j * N + s` is slot s's j-th verify token.
+    ///
+    /// The full-attention layers run ONCE over all `N * (depth + 1)` tokens
+    /// as virtual paged slots — virtual slot (s, j) sits at absolute
+    /// position `basePos_s + j`, writes its K/V into slot s's paged blocks
+    /// and attends causally over `[0, basePos_s + j]` (masked by per-slot
+    /// seqLens). The GatedDeltaNet layers run as `depth + 1` sequential
+    /// batched steps (nSeq = N), each advancing the per-slot recurrent
+    /// state by one token; the state is snapshotted after every step so a
+    /// later partial accept can be restored WITHOUT a re-forward (the
+    /// Increment-E win-or-loss point).
+    ///
+    /// Returns `N * (depth + 1)` logit rows (host, time-major, same order
+    /// as `tokensTimeMajor`). Requires a prior `ensureServingState` with the
+    /// committed per-slot KV + SSM already advanced to `slots[s].basePos`.
+    /// Does NOT commit; the caller accepts a prefix and (Increment E3)
+    /// restores the recurrent state from the matching snapshot. CUDA +
+    /// qwen35moe only.
+    [[nodiscard]] std::vector<std::vector<float>>
+    stepServingVerify(std::span<const VerifySlot>   slots,
+                      std::span<const std::int32_t> tokensTimeMajor,
+                      std::size_t                   depth);
+
+    /// M-Cuda.MTP Increment E2 — per-slot MTP draft parity gate. Prefills
+    /// the trunk on `prompt` (single-session forwardVerify) to obtain the
+    /// last hidden + first token, seeds `nSeq` per-slot nextn KV caches by
+    /// replaying the prompt, then drafts `depth` tokens per slot. Compares
+    /// all slots against each other and against an independent single-
+    /// sequence reference draft chain. Exercises the per-slot MTP-KV
+    /// substrate that Increment E3 (generateBatchMtp) will drive. CUDA +
+    /// qwen35moe with a loaded nextn head only.
+    [[nodiscard]] MtpDraftParityResult
+    mtpDraftParity(std::span<const std::int32_t> prompt,
+                   std::size_t nSeq, std::size_t depth);
 
     /// Physical slot capacity of the current serving state (0 if not yet
     /// built). The max concurrent sequences the batcher may pin.
