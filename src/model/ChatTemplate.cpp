@@ -5,7 +5,10 @@
 
 #include "model/Tokenizer.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <stdexcept>
 #include <string>
@@ -83,7 +86,8 @@ void encodeText(const Tokenizer&         tok,
 
 std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
                                      std::span<const ChatMessage> messages,
-                                     bool                         addGenerationPrompt) {
+                                     bool                         addGenerationPrompt,
+                                     std::span<const ToolSpec>    tools) {
     const std::int32_t imStart = requireToken(tok, kQwenImStart);
     const std::int32_t imEnd   = requireToken(tok, kQwenImEnd);
 
@@ -93,13 +97,36 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     const bool hasExplicitSystem =
         !messages.empty() && messages.front().role == ChatRole::System;
 
-    // Qwen2 / Qwen2.5 inject a default system turn when the caller gives
-    // none — their HF Jinja template does. Qwen3 / Qwen3.5 / Qwen3.6 (the
-    // "thinking" models, qwen35moe) do NOT: prepending the 2.5 default to
-    // a 3.x model is out-of-distribution and yields off-topic / early-EOS
-    // garbage. Discriminate on the <think> special token, exactly as the
-    // generation-prompt branch below already does.
+    // Qwen2 / Qwen2.5 inject a default system turn ("You are Qwen, created
+    // by Alibaba Cloud. …") when the caller provides none — their HF Jinja
+    // template does exactly this. Qwen3 / Qwen3.5 / Qwen3.6 (the "thinking"
+    // models, `qwen35moe`) do NOT: their template renders no system turn at
+    // all unless one is supplied. Prepending the 2.5 default to a 3.x model
+    // is an out-of-distribution context it was never trained on and yields
+    // off-topic / early-EOS garbage. Discriminate on the <think> special
+    // token, exactly as the generation-prompt branch below already does.
     const bool isThinkingFamily = tok.findToken("<think>") >= 0;
+
+    // M-FunctionCalling: Hermes-style tool-spec block Qwen2.5 is trained on.
+    // Rendered into the system turn when the request carries tools; the model
+    // then answers with <tool_call>{...}</tool_call>, which the handler parses
+    // back into structured tool_calls.
+    std::string toolsBlock;
+    if (!tools.empty()) {
+        toolsBlock =
+            "\n\n# Tools\n\nYou may call one or more functions to assist with "
+            "the user query.\n\nYou are provided with function signatures "
+            "within <tools></tools> XML tags:\n<tools>";
+        for (const auto& t : tools) {
+            toolsBlock += "\n";
+            toolsBlock += t.toolJson;
+        }
+        toolsBlock +=
+            "\n</tools>\n\nFor each function call, return a json object with "
+            "function name and arguments within <tool_call></tool_call> XML "
+            "tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": "
+            "<args-json-object>}\n</tool_call>";
+    }
 
     auto emitTurn = [&](std::string_view role, std::string_view content) {
         ids.push_back(imStart);
@@ -111,11 +138,52 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
         encodeText(tok, "\n", ids);
     };
 
-    if (!hasExplicitSystem && !isThinkingFamily) {
-        emitTurn("system", kQwenDefaultSystem);
+    // System turn. Without an explicit system: Qwen2.5 gets its default, a
+    // thinking model gets none — but if tools are present they still need a
+    // home, so emit a (possibly bare) system turn carrying the tools block.
+    if (!hasExplicitSystem) {
+        std::string sys =
+            isThinkingFamily ? std::string{} : std::string{kQwenDefaultSystem};
+        sys += toolsBlock;
+        if (!sys.empty()) {
+            emitTurn("system", sys);
+        }
     }
 
+    // When the caller DID supply a system turn, the tools block is appended
+    // to it on its first occurrence.
+    bool explicitSystemToolsPending = hasExplicitSystem && !toolsBlock.empty();
+
     for (const auto& m : messages) {
+        if (explicitSystemToolsPending && m.role == ChatRole::System) {
+            emitTurn("system", m.content + toolsBlock);
+            explicitSystemToolsPending = false;
+            continue;
+        }
+        // Assistant turn that invoked tools: render each call as a
+        // <tool_call>{...}</tool_call> block after any visible content.
+        if (m.role == ChatRole::Assistant && !m.toolCalls.empty()) {
+            std::string body = m.content;
+            for (const auto& call : m.toolCalls) {
+                if (!body.empty()) {
+                    body += "\n";
+                }
+                body += "<tool_call>\n{\"name\": \"";
+                body += call.name;
+                body += "\", \"arguments\": ";
+                body += call.argumentsJson;
+                body += "}\n</tool_call>";
+            }
+            emitTurn("assistant", body);
+            continue;
+        }
+        // Tool result: Qwen2.5 carries it in a user turn wrapped in
+        // <tool_response></tool_response>.
+        if (m.role == ChatRole::Tool) {
+            emitTurn("user",
+                     "<tool_response>\n" + m.content + "\n</tool_response>");
+            continue;
+        }
         emitTurn(chatRoleName(m.role), m.content);
     }
 
@@ -225,9 +293,258 @@ std::vector<std::int32_t> encodeGemma3(const Tokenizer&             tok,
                            kGemma3StartOfTurn, kGemma3EndOfTurn);
 }
 
+// ---- M-FunctionCalling Phase 2: Gemma 4 tool rendering ----------------------
+//
+// Gemma 4 declares tools and emits/consumes tool calls in a custom DSL (NOT
+// JSON), with its own special-token markers. The markers are single special
+// tokens in the vocab, so they are emitted as token ids (not BPE-encoded
+// text); free text between them goes through encodeText. This is an
+// approximate renderer (name/description/property-description+type/required);
+// enum/nullable/nested-schema nuances are omitted, which the model tolerates.
+
+using json = nlohmann::json;
+
+// Gemma tool markers, longest-first so a prefix ("<|tool>") never shadows a
+// longer marker ("<|tool_call>") during the scan.
+constexpr std::array<std::string_view, 7> kGemmaToolMarkers = {
+    "<|tool_call>", "<tool_call|>", "<|tool_response>", "<tool_response|>",
+    "<|tool>", "<tool|>", "<|\"|>",
+};
+
+// Emit a DSL string that interleaves gemma special-token markers with free
+// text: each marker becomes its token id (falling back to encodeText if the
+// vocab lacks it); text spans between markers go through encodeText.
+void emitGemmaDsl(const Tokenizer& tok, std::string_view dsl,
+                  std::vector<std::int32_t>& ids) {
+    std::string pending;
+    auto flush = [&] {
+        if (!pending.empty()) {
+            encodeText(tok, pending, ids);
+            pending.clear();
+        }
+    };
+    for (std::size_t i = 0; i < dsl.size();) {
+        std::string_view marker;
+        for (const auto& m : kGemmaToolMarkers) {
+            if (dsl.substr(i, m.size()) == m) {
+                marker = m;
+                break;
+            }
+        }
+        if (!marker.empty()) {
+            flush();
+            const std::int32_t id = tok.findToken(marker);
+            if (id >= 0) {
+                ids.push_back(id);
+            } else {
+                encodeText(tok, marker, ids);
+            }
+            i += marker.size();
+        } else {
+            pending.push_back(dsl[i]);
+            ++i;
+        }
+    }
+    flush();
+}
+
+// A JSON value -> gemma DSL argument value.
+std::string gemmaDslValue(const json& v) {
+    if (v.is_string()) {
+        return "<|\"|>" + v.get<std::string>() + "<|\"|>";
+    }
+    if (v.is_boolean()) {
+        return v.get<bool>() ? "true" : "false";
+    }
+    if (v.is_number_integer()) {
+        return std::to_string(v.get<std::int64_t>());
+    }
+    if (v.is_number()) {
+        return std::to_string(v.get<double>());
+    }
+    if (v.is_array()) {
+        std::string s = "[";
+        bool first = true;
+        for (const auto& e : v) {
+            if (!first) { s += ","; }
+            first = false;
+            s += gemmaDslValue(e);
+        }
+        return s + "]";
+    }
+    if (v.is_object()) {
+        std::string s = "{";
+        bool first = true;
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            if (!first) { s += ","; }
+            first = false;
+            s += it.key();
+            s += ":";
+            s += gemmaDslValue(it.value());
+        }
+        return s + "}";
+    }
+    return "<|\"|><|\"|>";
+}
+
+// Render one tool's declaration DSL from its OpenAI tool JSON.
+std::string gemmaRenderToolDecl(const ToolSpec& t) {
+    const json tool = json::parse(t.toolJson, nullptr, /*allow_exceptions=*/false);
+    if (tool.is_discarded() || !tool.contains("function") ||
+        !tool["function"].is_object()) {
+        return "<|tool>declaration:" + t.name + "{}<tool|>";
+    }
+    const json& fn = tool["function"];
+    const std::string name = fn.value("name", t.name);
+    std::string s = "<|tool>declaration:" + name + "{";
+    bool comma = false;
+    if (fn.contains("description") && fn["description"].is_string()) {
+        s += "description:<|\"|>" + fn["description"].get<std::string>() + "<|\"|>";
+        comma = true;
+    }
+    if (fn.contains("parameters") && fn["parameters"].is_object()) {
+        const json& params = fn["parameters"];
+        if (comma) { s += ","; }
+        s += "parameters:{properties:{";
+        if (params.contains("properties") && params["properties"].is_object()) {
+            bool pfirst = true;
+            for (auto it = params["properties"].begin();
+                 it != params["properties"].end(); ++it) {
+                if (!pfirst) { s += ","; }
+                pfirst = false;
+                s += it.key() + ":{";
+                bool pc = false;
+                if (it.value().contains("description") &&
+                    it.value()["description"].is_string()) {
+                    s += "description:<|\"|>" +
+                         it.value()["description"].get<std::string>() + "<|\"|>";
+                    pc = true;
+                }
+                if (it.value().contains("type") && it.value()["type"].is_string()) {
+                    std::string ty = it.value()["type"].get<std::string>();
+                    std::transform(ty.begin(), ty.end(), ty.begin(),
+                                   [](unsigned char c) { return std::toupper(c); });
+                    if (pc) { s += ","; }
+                    s += "type:<|\"|>" + ty + "<|\"|>";
+                }
+                s += "}";
+            }
+        }
+        s += "}";
+        if (params.contains("required") && params["required"].is_array()) {
+            s += ",required:[";
+            bool rfirst = true;
+            for (const auto& r : params["required"]) {
+                if (!r.is_string()) { continue; }
+                if (!rfirst) { s += ","; }
+                rfirst = false;
+                s += "<|\"|>" + r.get<std::string>() + "<|\"|>";
+            }
+            s += "]";
+        }
+        s += "}";
+    }
+    s += "}<tool|>";
+    return s;
+}
+
+// Render an assistant tool call's arguments (JSON string) as a gemma DSL body.
+std::string gemmaRenderCallArgs(const std::string& argsJson) {
+    const json args = json::parse(argsJson, nullptr, /*allow_exceptions=*/false);
+    if (args.is_discarded() || !args.is_object()) {
+        return "{}";
+    }
+    return gemmaDslValue(args);
+}
+
+// Dedicated Gemma 4 encoder for the tool path: tools live in their own
+// <|turn>system turn (the shared gemma encoder folds system into the user
+// turn, which the tool format does not want).
+std::vector<std::int32_t> encodeGemma4Tools(const Tokenizer&             tok,
+                                            std::span<const ChatMessage> messages,
+                                            bool                         addGenerationPrompt,
+                                            std::span<const ToolSpec>    tools) {
+    const std::int32_t startOfTurn = requireToken(tok, kGemma4StartOfTurn);
+    const std::int32_t endOfTurn   = requireToken(tok, kGemma4EndOfTurn);
+    const std::int32_t bosId       = tok.bosId();
+
+    std::vector<std::int32_t> ids;
+    ids.reserve(128);
+    if (bosId >= 0) {
+        ids.push_back(bosId);
+    }
+
+    std::string systemContent;
+    for (const auto& m : messages) {
+        if (m.role == ChatRole::System) {
+            if (!systemContent.empty()) {
+                systemContent.append("\n\n");
+            }
+            systemContent.append(m.content);
+        }
+    }
+
+    // System turn carrying the tool declarations.
+    ids.push_back(startOfTurn);
+    encodeText(tok, "system\n", ids);
+    if (!systemContent.empty()) {
+        encodeText(tok, systemContent, ids);
+    }
+    for (const auto& t : tools) {
+        emitGemmaDsl(tok, gemmaRenderToolDecl(t), ids);
+    }
+    ids.push_back(endOfTurn);
+    encodeText(tok, "\n", ids);
+
+    for (const auto& m : messages) {
+        if (m.role == ChatRole::System) {
+            continue;
+        }
+        if (m.role == ChatRole::Tool) {
+            ids.push_back(startOfTurn);
+            encodeText(tok, "user\n", ids);
+            emitGemmaDsl(tok,
+                         "<|tool_response>response:tool{value:<|\"|>" + m.content +
+                             "<|\"|>}<tool_response|>",
+                         ids);
+            ids.push_back(endOfTurn);
+            encodeText(tok, "\n", ids);
+            continue;
+        }
+        ids.push_back(startOfTurn);
+        std::string head{gemmaRoleName(m.role)};
+        head.push_back('\n');
+        encodeText(tok, head, ids);
+        if (!m.content.empty()) {
+            encodeText(tok, m.content, ids);
+        }
+        if (m.role == ChatRole::Assistant && !m.toolCalls.empty()) {
+            for (const auto& call : m.toolCalls) {
+                emitGemmaDsl(tok,
+                             "<|tool_call>call:" + call.name +
+                                 gemmaRenderCallArgs(call.argumentsJson) +
+                                 "<tool_call|>",
+                             ids);
+            }
+        }
+        ids.push_back(endOfTurn);
+        encodeText(tok, "\n", ids);
+    }
+
+    if (addGenerationPrompt) {
+        ids.push_back(startOfTurn);
+        encodeText(tok, "model\n", ids);
+    }
+    return ids;
+}
+
 std::vector<std::int32_t> encodeGemma4(const Tokenizer&             tok,
                                        std::span<const ChatMessage> messages,
-                                       bool                         addGenerationPrompt) {
+                                       bool                         addGenerationPrompt,
+                                       std::span<const ToolSpec>    tools) {
+    if (!tools.empty()) {
+        return encodeGemma4Tools(tok, messages, addGenerationPrompt, tools);
+    }
     return encodeGemmaImpl(tok, messages, addGenerationPrompt,
                            kGemma4StartOfTurn, kGemma4EndOfTurn);
 }
@@ -239,6 +556,7 @@ std::string_view chatRoleName(ChatRole r) noexcept {
         case ChatRole::System:    return "system";
         case ChatRole::User:      return "user";
         case ChatRole::Assistant: return "assistant";
+        case ChatRole::Tool:      return "tool";
     }
     return "user";
 }
@@ -248,6 +566,7 @@ bool parseChatRole(std::string_view s, ChatRole& out) noexcept {
     if (low == "system")    { out = ChatRole::System;    return true; }
     if (low == "user")      { out = ChatRole::User;      return true; }
     if (low == "assistant") { out = ChatRole::Assistant; return true; }
+    if (low == "tool")      { out = ChatRole::Tool;      return true; }
     return false;
 }
 
@@ -278,14 +597,16 @@ std::vector<std::int32_t>
 ChatTemplate::encode(Style                        style,
                      const Tokenizer&             tok,
                      std::span<const ChatMessage> messages,
-                     bool                         addGenerationPrompt) {
+                     bool                         addGenerationPrompt,
+                     std::span<const ToolSpec>    tools) {
     switch (style) {
         case Style::QwenChatML:
-            return encodeQwen(tok, messages, addGenerationPrompt);
+            return encodeQwen(tok, messages, addGenerationPrompt, tools);
         case Style::Gemma3:
+            // Gemma 3 tool rendering not implemented (Gemma 4 is the target).
             return encodeGemma3(tok, messages, addGenerationPrompt);
         case Style::Gemma4:
-            return encodeGemma4(tok, messages, addGenerationPrompt);
+            return encodeGemma4(tok, messages, addGenerationPrompt, tools);
     }
     throw std::runtime_error("ChatTemplate::encode: unhandled style");
 }

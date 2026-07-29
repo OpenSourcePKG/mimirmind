@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "model/ToolCall.hpp"
+
 #include <cstdint>
 #include <span>
 #include <string>
@@ -13,12 +15,13 @@ namespace mimirmind::model {
 
 class Tokenizer;
 
-/// Author of a chat message. Mirrors the OpenAI Chat Completions roles
-/// — anything else (tool, function) is not yet supported by M7c.
+/// Author of a chat message. Mirrors the OpenAI Chat Completions roles.
+/// `Tool` carries a tool-execution result back to the model (M-FunctionCalling).
 enum class ChatRole {
     System,
     User,
     Assistant,
+    Tool,
 };
 
 [[nodiscard]] std::string_view chatRoleName(ChatRole r) noexcept;
@@ -30,6 +33,14 @@ enum class ChatRole {
 struct ChatMessage {
     ChatRole    role{ChatRole::User};
     std::string content;
+
+    // M-FunctionCalling. For an assistant message that invoked tools, the
+    // calls it made (content is then usually empty). For a role:"tool"
+    // message, `toolCallId` correlates the result with the assistant call
+    // that produced it (content holds the tool's result text). Both empty on
+    // ordinary system/user/assistant turns.
+    std::vector<ToolCall> toolCalls{};
+    std::string           toolCallId{};
 };
 
 /**
@@ -75,7 +86,8 @@ public:
     encode(Style                          style,
            const Tokenizer&               tok,
            std::span<const ChatMessage>   messages,
-           bool                           addGenerationPrompt = true);
+           bool                           addGenerationPrompt = true,
+           std::span<const ToolSpec>      tools               = {});
 
     /**
      * Token ids that should terminate decoding for `style`, in addition

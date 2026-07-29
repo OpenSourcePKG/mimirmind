@@ -31,6 +31,30 @@ struct ChatRequest {
     bool                            stream{false};
     std::string                     model;
 
+    // M-FunctionCalling. `tools` are the function definitions the client
+    // offered (OpenAI `tools` array); when non-empty the chat template
+    // renders them into the model's tool-spec block and the handler parses
+    // the model's tool-call markup back into structured tool_calls.
+    // `toolChoice` mirrors OpenAI: "auto" (default), "none", "required", or
+    // a named function. Empty => "auto".
+    std::vector<model::ToolSpec>    tools;
+    std::string                     toolChoice;
+
+    // Debug / parity teacher-forcing: raw text appended to the prompt AFTER
+    // the chat template's generation prompt (no special tokens, no BOS), so
+    // the engine prefills [template prompt + this text] in one T=N pass.
+    // Lets the prefill path replay an exact previously-decoded token
+    // sequence for prefill-vs-decode divergence localisation. Empty (the
+    // default) => no-op, standard behaviour. Not part of the OpenAI schema.
+    std::string                     assistantPrefill{};
+
+    // Debug / parity teacher-forcing by raw token IDs (bypasses the
+    // tokenizer entirely). Appended to the prompt after assistantPrefill, so
+    // an exact previously-generated token sequence — including special tokens
+    // like </think> that text cannot round-trip — can be replayed through the
+    // prefill path. Empty (default) => no-op. Not part of the OpenAI schema.
+    std::vector<std::int32_t>       assistantPrefillIds{};
+
     // M7f — repetition-control penalties.
     float                           frequencyPenalty{0.0F};
     bool                            hasFrequencyPenalty{false};

@@ -11,6 +11,7 @@
 #include "server/SseEncoder.hpp"
 
 #include "model/ResponseCleaner.hpp"
+#include "model/ToolCallParser.hpp"
 #include "model/Tokenizer.hpp"
 #include "core/log/Log.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
@@ -21,6 +22,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -102,7 +105,40 @@ bool ChatCompletionHandler::prepareChatRequest(
     // original prompt-token count in the response.
     std::vector<model::ChatMessage> msgs = cr.messages;
     promptIds = model::ChatTemplate::encode(
-        style, tok, msgs, /*addGenerationPrompt=*/true);
+        style, tok, msgs, /*addGenerationPrompt=*/true, cr.tools);
+
+    // Debug teacher-forcing: append the raw prefill suffix (no BOS, no
+    // special tokens) so the engine prefills the whole sequence in one pass.
+    // Empty by default => no-op. See ChatRequest::assistantPrefill.
+    if (!cr.assistantPrefill.empty()) {
+        const auto suffix = tok.encode(cr.assistantPrefill, /*addBos=*/false);
+        promptIds.insert(promptIds.end(), suffix.begin(), suffix.end());
+        MM_LOG_INFO("server",
+                    "assistant_prefill teacher-forcing: +{} tokens "
+                    "(prompt now {})",
+                    suffix.size(), promptIds.size());
+    }
+    // Raw-ID teacher-forcing (exact replay incl. special tokens).
+    if (!cr.assistantPrefillIds.empty()) {
+        promptIds.insert(promptIds.end(),
+                         cr.assistantPrefillIds.begin(),
+                         cr.assistantPrefillIds.end());
+        MM_LOG_INFO("server",
+                    "assistant_prefill_ids teacher-forcing: +{} ids "
+                    "(prompt now {})",
+                    cr.assistantPrefillIds.size(), promptIds.size());
+    }
+    // Debug: dump the exact prompt token IDs the engine will prefill, so the
+    // same sequence can be replayed through an external oracle (vLLM/HF).
+    // Env-gated, no-op in normal serving.
+    if (const char* pd = std::getenv("MIMIRMIND_PROMPT_DUMP")) {
+        std::ofstream pf(pd, std::ios::trunc);
+        for (std::int32_t id : promptIds) {
+            pf << id << "\n";
+        }
+        MM_LOG_INFO("server", "MIMIRMIND_PROMPT_DUMP wrote {} ids to {}",
+                    promptIds.size(), pd);
+    }
 
     stopIds = model::ChatTemplate::stopIds(style, tok);
     PromptTrimmer::extendStopIds(tok, cr.stopStrings, stopIds);
@@ -307,6 +343,18 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         }
     }
 
+    // Debug: dump the raw generated token IDs (pre-cleaning, incl. special
+    // tokens) so a follow-up request can teacher-force the exact sequence via
+    // assistant_prefill_ids. Env-gated, no-op in normal serving.
+    if (const char* td = std::getenv("MIMIRMIND_TOKEN_DUMP")) {
+        std::ofstream tf(td, std::ios::trunc);
+        for (std::int32_t id : generated) {
+            tf << id << "\n";
+        }
+        MM_LOG_INFO("server", "MIMIRMIND_TOKEN_DUMP wrote {} ids to {}",
+                    generated.size(), td);
+    }
+
     // Strip trailing stop tokens from the rendered text so clients don't
     // see "<|im_end|>" tacked onto the answer. Loop because at low
     // temperatures the model could in theory sample several stop tokens
@@ -330,8 +378,25 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                   engine.config().architecture),
               rawText);
 
+    // M-FunctionCalling: when tools were offered and the model emitted a tool
+    // call, surface it as structured tool_calls instead of content. Decode
+    // WITHOUT skipping specials — Gemma's tool markers are special tokens that
+    // skipSpecial=true would strip; Qwen's are plain text (present either way).
+    // Dispatch by marker: Gemma's `<|tool_call>` and Qwen's `<tool_call>` are
+    // distinct (the leading pipe).
+    std::vector<model::ToolCall> toolCalls;
+    if (!cr.tools.empty()) {
+        const std::string toolText = tok.decode(visible, /*skipSpecial=*/false);
+        if (model::ToolCallParser::looksLikeGemmaToolCall(toolText)) {
+            toolCalls = model::ToolCallParser::parseGemma(toolText);
+        } else if (model::ToolCallParser::looksLikeQwenToolCall(toolText)) {
+            toolCalls = model::ToolCallParser::parseQwen(toolText);
+        }
+    }
+
     const std::int64_t now   = unixNow();
-    const std::string finish = hitStop ? "stop" : "length";
+    const std::string finish = !toolCalls.empty() ? "tool_calls"
+                             : (hitStop ? "stop" : "length");
 
     const std::string echoModel = target->id;
 
@@ -350,6 +415,27 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     // / extrapolation-warn actually fired.
     PromptTrimmer::attachTrimUsage(usage, trimReport);
 
+    json message = {{"role", "assistant"}};
+    if (toolCalls.empty()) {
+        message["content"] = text;
+    } else {
+        // OpenAI shape: content null, calls under tool_calls[]. arguments is a
+        // JSON *string* (already normalised by the parser).
+        message["content"] = nullptr;
+        json tcArr = json::array();
+        for (const auto& call : toolCalls) {
+            tcArr.push_back({
+                {"id",   call.id},
+                {"type", "function"},
+                {"function", {
+                    {"name",      call.name},
+                    {"arguments", call.argumentsJson},
+                }},
+            });
+        }
+        message["tool_calls"] = std::move(tcArr);
+    }
+
     json response = {
         {"id",      respId},
         {"object",  "chat.completion"},
@@ -358,10 +444,7 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         {"choices", json::array({
             json{
                 {"index", 0},
-                {"message", {
-                    {"role",    "assistant"},
-                    {"content", text},
-                }},
+                {"message", std::move(message)},
                 {"finish_reason", finish},
             },
         })},

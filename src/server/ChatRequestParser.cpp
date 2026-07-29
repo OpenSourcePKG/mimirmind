@@ -24,13 +24,27 @@ ChatRequest parseChatRequest(const json& body) {
         req.model = body["model"].get<std::string>();
     }
 
+    // Debug teacher-forcing (non-OpenAI): raw prefill suffix appended after
+    // the generation prompt. See ChatRequest::assistantPrefill.
+    if (body.contains("assistant_prefill") &&
+        body["assistant_prefill"].is_string()) {
+        req.assistantPrefill = body["assistant_prefill"].get<std::string>();
+    }
+    if (body.contains("assistant_prefill_ids") &&
+        body["assistant_prefill_ids"].is_array()) {
+        for (const auto& v : body["assistant_prefill_ids"]) {
+            if (v.is_number_integer()) {
+                req.assistantPrefillIds.push_back(v.get<std::int32_t>());
+            }
+        }
+    }
+
     if (!body.contains("messages") || !body["messages"].is_array()) {
         throw std::runtime_error("messages: missing or not an array");
     }
     for (const auto& m : body["messages"]) {
-        if (!m.is_object() || !m.contains("role") || !m.contains("content")) {
-            throw std::runtime_error(
-                "messages[]: each entry needs role + content");
+        if (!m.is_object() || !m.contains("role")) {
+            throw std::runtime_error("messages[]: each entry needs a role");
         }
         const auto roleStr = m["role"].get<std::string>();
         model::ChatRole role;
@@ -38,17 +52,82 @@ ChatRequest parseChatRequest(const json& body) {
             throw std::runtime_error(
                 "messages[].role: unsupported value '" + roleStr + "'");
         }
-        std::string content;
-        if (m["content"].is_string()) {
-            content = m["content"].get<std::string>();
-        } else if (m["content"].is_null()) {
-            content = "";
-        } else {
-            // OpenAI also accepts content arrays (multimodal). Not supported.
-            throw std::runtime_error(
-                "messages[].content: only plain strings are supported");
+        model::ChatMessage msg;
+        msg.role = role;
+
+        // Content is optional for an assistant turn that only carries
+        // tool_calls (OpenAI sends content:null there); tolerated as empty
+        // rather than a 400 for every other role too.
+        if (m.contains("content")) {
+            const auto& c = m["content"];
+            if (c.is_string()) {
+                msg.content = c.get<std::string>();
+            } else if (!c.is_null()) {
+                // OpenAI also accepts content arrays (multimodal). Not supported.
+                throw std::runtime_error(
+                    "messages[].content: only plain strings are supported");
+            }
         }
-        req.messages.push_back({role, std::move(content)});
+
+        // M-FunctionCalling: prior assistant tool calls (multi-round replay).
+        if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+            for (const auto& tc : m["tool_calls"]) {
+                if (!tc.is_object() || !tc.contains("function") ||
+                    !tc["function"].is_object()) {
+                    continue;
+                }
+                const auto& fn = tc["function"];
+                model::ToolCall call;
+                if (tc.contains("id") && tc["id"].is_string()) {
+                    call.id = tc["id"].get<std::string>();
+                }
+                if (fn.contains("name") && fn["name"].is_string()) {
+                    call.name = fn["name"].get<std::string>();
+                }
+                if (fn.contains("arguments")) {
+                    // OpenAI stringifies arguments; tolerate an object too.
+                    const auto& a = fn["arguments"];
+                    call.argumentsJson =
+                        a.is_string() ? a.get<std::string>() : a.dump();
+                }
+                msg.toolCalls.push_back(std::move(call));
+            }
+        }
+
+        // M-FunctionCalling: role:"tool" result correlation id.
+        if (m.contains("tool_call_id") && m["tool_call_id"].is_string()) {
+            msg.toolCallId = m["tool_call_id"].get<std::string>();
+        }
+
+        req.messages.push_back(std::move(msg));
+    }
+
+    // M-FunctionCalling: function tool definitions + tool_choice.
+    if (body.contains("tools") && body["tools"].is_array()) {
+        for (const auto& t : body["tools"]) {
+            if (!t.is_object()) {
+                continue;
+            }
+            const bool isFunction =
+                !t.contains("type") ||
+                (t["type"].is_string() &&
+                 t["type"].get<std::string>() == "function");
+            if (!isFunction || !t.contains("function") ||
+                !t["function"].is_object()) {
+                continue;
+            }
+            const auto& fn = t["function"];
+            if (!fn.contains("name") || !fn["name"].is_string()) {
+                continue;
+            }
+            model::ToolSpec spec;
+            spec.name     = fn["name"].get<std::string>();
+            spec.toolJson = t.dump();   // spliced verbatim into <tools>
+            req.tools.push_back(std::move(spec));
+        }
+    }
+    if (body.contains("tool_choice") && body["tool_choice"].is_string()) {
+        req.toolChoice = body["tool_choice"].get<std::string>();
     }
 
     auto readSize = [&](const char* key, std::size_t& dst) {
