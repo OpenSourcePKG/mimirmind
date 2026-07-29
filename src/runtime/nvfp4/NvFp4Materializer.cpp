@@ -72,6 +72,16 @@ executeMaterialization(const std::vector<mo::MaterializationStep>& steps,
                     ops.dequantFp8(w.devPtr, scale, s.rows * s.in, dst);
                     break;
                 }
+                case mo::SourceKind::Bf16Copy: {
+                    // Already-BF16 matmul weight, kept BF16 (no widen). Reads a
+                    // slice at `srcElemOffset` — used to split the MTP fused
+                    // gate_up_proj and de-stack the expert-major MTP MoE tensors
+                    // into per-expert GGUF ffn_*_exps. 2 bytes/element.
+                    const auto* srcBytes =
+                        static_cast<const std::uint8_t*>(w.devPtr) + s.srcElemOffset * 2;
+                    ops.copyBytes(dst, srcBytes, s.rows * s.in * 2);
+                    break;
+                }
                 case mo::SourceKind::Bf16Passthrough:
                 default:
                     // Unquantised: widen BF16/F16 -> F32 (or copy F32) so the

@@ -55,6 +55,19 @@ constexpr std::array<GgufTensorSource, 8> kMoe = {{
     {"ffn_gate_inp_shexp.weight", "mlp.shared_expert_gate.weight",       WeightXform::Direct},
 }};
 
+// ---- MTP (nextn) head projections ---------------------------------------
+// hfSuffix relative to the top-level `mtp.` prefix. The HF checkpoint stores
+// the fused concat as fc(cat(hnorm, enorm)); the GGUF/backend eh_proj expects
+// cat(enorm, hnorm) — the loader swaps the two input halves after materialise
+// (see Nvfp4Loader). The transformer block (mtp.layers.0.*) reuses kFullAttn
+// + kMoe via qwen35moeMtpHfName.
+constexpr std::array<GgufTensorSource, 4> kNextn = {{
+    {"nextn.eh_proj.weight",          "fc.weight",                    WeightXform::Direct},
+    {"nextn.enorm.weight",            "pre_fc_norm_embedding.weight", WeightXform::Direct},
+    {"nextn.hnorm.weight",            "pre_fc_norm_hidden.weight",    WeightXform::Direct},
+    {"nextn.shared_head_norm.weight", "norm.weight",                  WeightXform::Direct},
+}};
+
 // ---- Model-level (full names) -------------------------------------------
 constexpr std::array<GgufTensorSource, 3> kTopLevel = {{
     {"token_embd.weight", "model.language_model.embed_tokens.weight", WeightXform::Direct},
@@ -68,6 +81,7 @@ std::span<const GgufTensorSource> qwen35moeFullAttnTensors() noexcept { return k
 std::span<const GgufTensorSource> qwen35moeDeltaNetTensors() noexcept { return kDeltaNet; }
 std::span<const GgufTensorSource> qwen35moeMoeTensors() noexcept { return kMoe; }
 std::span<const GgufTensorSource> qwen35moeTopLevelTensors() noexcept { return kTopLevel; }
+std::span<const GgufTensorSource> qwen35moeNextnTensors() noexcept { return kNextn; }
 
 bool qwen35moeIsFullAttnLayer(int layer, int interval) noexcept {
     return interval > 0 && ((layer + 1) % interval == 0);
@@ -75,6 +89,19 @@ bool qwen35moeIsFullAttnLayer(int layer, int interval) noexcept {
 
 std::string qwen35moeHfName(std::string_view hfSuffix, int layer, int expert) {
     std::string s = "model.language_model.layers." + std::to_string(layer) + ".";
+    s.append(hfSuffix);
+    if (expert >= 0) {
+        const std::string ph = "{E}";
+        const auto pos = s.find(ph);
+        if (pos != std::string::npos) {
+            s.replace(pos, ph.size(), std::to_string(expert));
+        }
+    }
+    return s;
+}
+
+std::string qwen35moeMtpHfName(std::string_view hfSuffix, int expert) {
+    std::string s = "mtp.layers.0.";
     s.append(hfSuffix);
     if (expert >= 0) {
         const std::string ph = "{E}";

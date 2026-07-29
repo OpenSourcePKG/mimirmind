@@ -18,9 +18,11 @@ namespace mimirmind::core::modelopt {
 
 /// How one HF source tensor is turned into (part of) a GGUF BF16 tensor.
 enum class SourceKind : std::uint8_t {
-    Nvfp4,          ///< dequant packed U8 + F8 block scale + F32 global -> BF16
-    Fp8,            ///< dequant F8_E4M3 + F32 per-tensor scale -> BF16
-    Bf16Passthrough ///< already BF16 (norms, router, embed, conv1d, ssm gates) -> copy
+    Nvfp4,           ///< dequant packed U8 + F8 block scale + F32 global -> BF16
+    Fp8,             ///< dequant F8_E4M3 + F32 per-tensor scale -> BF16
+    Bf16Passthrough, ///< already BF16 (norms, router, embed, conv1d, ssm gates) -> WIDEN to F32
+    Bf16Copy         ///< already BF16 matmul weight -> BF16 verbatim (no widen); reads a
+                     ///< `srcElemOffset`-based slice of the source (MTP fused/stacked experts)
 };
 
 /// Element-wise transform applied to a step's finished output buffer, after
@@ -44,6 +46,8 @@ struct MaterializationSource {
     std::uint64_t rows;          ///< out-features (or product for passthrough vectors)
     std::uint64_t in;            ///< in-features (1 for a 1-D passthrough)
     std::uint64_t dstElemOffset; ///< element offset into the GGUF tensor (0 unless stacking)
+    std::uint64_t srcElemOffset = 0; ///< element offset INTO the source tensor; only used by
+                                     ///< Bf16Copy to slice a fused/stacked HF tensor (0 otherwise)
 };
 
 /// One GGUF tensor to build from one or more HF sources.
@@ -67,6 +71,11 @@ struct Qwen35MoeArch {
     int numLayers          = 40;
     int numExperts         = 256;
     int fullAttnInterval   = 4;
+    /// Number of native MTP (nextn) prediction blocks past the main stack
+    /// (`mtp_num_hidden_layers`). When > 0 the plan emits the MTP head as GGUF
+    /// block index `numLayers` (a full-attention + MoE block plus the four
+    /// nextn.* projections). 0 = no MTP head loaded.
+    int mtpLayers          = 0;
 };
 
 /**

@@ -93,7 +93,8 @@ void Nvfp4Loader::load(InferenceEngine& e,
     const core::modelopt::Qwen35MoeArch arch{
         static_cast<int>(e._config.blockCount),
         static_cast<int>(e._config.expertCount),
-        4 /* full_attention_interval; layer_types agrees for this model */};
+        4 /* full_attention_interval; layer_types agrees for this model */,
+        static_cast<int>(e._config.nextnPredictLayers) /* MTP head blocks */};
     const std::vector<core::modelopt::MaterializationStep> steps =
         core::modelopt::planQwen35MoeMaterialization(sm, hfCfg, arch);
 
@@ -263,6 +264,53 @@ void Nvfp4Loader::load(InferenceEngine& e,
                         "loadModelNvfp4: GatedDeltaNet value-head regroup "
                         "applied to {} tensors (KH={} GQA={} HD={})",
                         regrouped, KH, GQA, HD);
+        }
+    }
+
+    // 5b'. MTP eh_proj concat-half swap. The HF checkpoint stores the fused
+    // pre-fc projection as fc(cat(hnorm, enorm)) — hidden-norm half first. The
+    // backend's runMtpBlock feeds cat(enorm, hnorm) (embed-norm first, matching
+    // the llama.cpp GGUF convert which swaps the halves). So swap the two
+    // input-halves of blk.<blockCount>.nextn.eh_proj.weight. Layout is
+    // [out(ne1) rows][in(ne0) cols] with in = 2*d_model contiguous per row.
+    // eh_proj concat-half swap is OPT-IN: MTP accept-rate testing showed this
+    // Qwen3.6-VL checkpoint's mtp.fc is already cat(enorm, hnorm) (no swap:
+    // accept 0.30 vs 0.04 with swap). The llama.cpp swap-on-convert note
+    // applies to Qwen3-Next, not this VL head. Kept behind MIMIRMIND_MTP_EHSWAP
+    // for other checkpoints.
+    if (std::getenv("MIMIRMIND_MTP_EHSWAP") != nullptr) {
+        for (auto& t : e._materializedBf16) {
+            if (!t.ggufName.ends_with(".nextn.eh_proj.weight")) {
+                continue;
+            }
+            if (t.ggufDims.size() < 2 || (t.ggufDims[0] % 2) != 0) {
+                MM_LOG_WARN("engine", "MTP eh_proj: unexpected dims for {}",
+                            t.ggufName);
+                break;
+            }
+            const std::size_t inCols    = t.ggufDims[0];       // 2 * d_model
+            const std::size_t rows      = t.ggufDims[1];       // d_model (out)
+            const std::size_t half      = inCols / 2;
+            const std::size_t elemBytes = t.isF32 ? 4 : 2;
+            const std::size_t rowBytes  = inCols * elemBytes;
+            const std::size_t nbytes    = rows * rowBytes;
+            auto* base = static_cast<std::uint8_t*>(t.buffer.get());
+            std::vector<std::uint8_t> in(nbytes), out(nbytes);
+            e._ops->readbackToHost(in.data(), base, nbytes);
+            for (std::size_t r = 0; r < rows; ++r) {
+                const std::uint8_t* ri = in.data() + r * rowBytes;
+                std::uint8_t*       ro = out.data() + r * rowBytes;
+                std::memcpy(ro,                       ri + half * elemBytes,
+                            half * elemBytes);          // enorm half -> front
+                std::memcpy(ro + half * elemBytes,    ri,
+                            half * elemBytes);          // hnorm half -> back
+            }
+            e._ops->uploadHostBytes(base, out.data(), nbytes);
+            cudaCtx.stream().synchronize();
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: MTP eh_proj concat-half swap applied "
+                        "({} rows x {} in)", rows, inCols);
+            break;
         }
     }
 

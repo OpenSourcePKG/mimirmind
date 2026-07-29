@@ -127,12 +127,13 @@ void addDirect(std::vector<MaterializationStep>& steps,
 void addStacked(std::vector<MaterializationStep>& steps,
                 const st::SafetensorsModel& model, const HfQuantConfig& cfg,
                 const std::string& ggufName, std::string_view hfTemplate,
-                int layer, int numExperts) {
+                int layer, int numExperts, bool mtp = false) {
     MaterializationStep step;
     step.ggufName = ggufName;
     std::uint64_t perExpert = 0;
     for (int e = 0; e < numExperts; ++e) {
-        const std::string hf = qwen35moeHfName(hfTemplate, layer, e);
+        const std::string hf = mtp ? qwen35moeMtpHfName(hfTemplate, e)
+                                   : qwen35moeHfName(hfTemplate, layer, e);
         MaterializationSource src = sourceFor(model, cfg, hf, 0);
         if (e == 0) {
             perExpert = src.rows * src.in;
@@ -143,6 +144,38 @@ void addStacked(std::vector<MaterializationStep>& steps,
         step.sources.push_back(std::move(src));
     }
     step.totalElems = perExpert * static_cast<std::uint64_t>(numExperts);
+    steps.push_back(std::move(step));
+}
+
+/// Append a de-stacked BF16 expert step sliced out of ONE fused HF source
+/// tensor (the MTP MoE format: `experts.gate_up_proj [n_exp, 2*ff, d]` and
+/// `experts.down_proj [n_exp, d, ff]`, expert-major, unquantised BF16). Per
+/// expert e, copy `outRows*inCols` BF16 elements from
+/// `src[e*srcStride + srcOffsetInExpert]` into the stacked GGUF tensor at
+/// `e*outRows*inCols`. Byte layout is compatible (HF per-expert [out,in]
+/// row-major == GGUF [in,out] ne-order), so this is a pure sliced copy.
+void addFusedStack(std::vector<MaterializationStep>& steps,
+                   const st::SafetensorsModel& model,
+                   const std::string& ggufName, const std::string& hfName,
+                   std::uint64_t nExp, std::uint64_t outRows, std::uint64_t inCols,
+                   std::uint64_t srcStride, std::uint64_t srcOffsetInExpert) {
+    (void)require(model, hfName);  // validate presence up front
+    MaterializationStep step;
+    step.ggufName   = ggufName;
+    const std::uint64_t perExpert = outRows * inCols;
+    step.ggufDims   = {inCols, outRows, nExp};  // GGUF ne-order [in, out, n_expert]
+    step.totalElems = perExpert * nExp;
+    step.outF32     = false;                    // BF16 matmul weight, kept BF16
+    for (std::uint64_t e = 0; e < nExp; ++e) {
+        MaterializationSource src;
+        src.hfWeightName  = hfName;
+        src.kind          = SourceKind::Bf16Copy;
+        src.rows          = outRows;
+        src.in            = inCols;
+        src.dstElemOffset = e * perExpert;
+        src.srcElemOffset = e * srcStride + srcOffsetInExpert;
+        step.sources.push_back(std::move(src));
+    }
     steps.push_back(std::move(step));
 }
 
@@ -178,6 +211,58 @@ planQwen35MoeMaterialization(const st::SafetensorsModel& model,
                           qwen35moeHfName(t.hfSuffix, L));
             }
         }
+    }
+
+    // --- MTP (nextn) head, as GGUF block index numLayers ------------------
+    // A full-attention + MoE transformer block (mtp.layers.0.*) plus the four
+    // nextn.* projections (mtp.fc / mtp.pre_fc_norm_* / mtp.norm). The backend
+    // (Qwen35MoeBackend::runMtpBlock) addresses it at block index blockCount.
+    if (arch.mtpLayers > 0) {
+        const std::string blk = "blk." + std::to_string(arch.numLayers) + ".";
+        for (const auto& t : qwen35moeNextnTensors()) {
+            addDirect(steps, model, cfg, blk + std::string(t.ggufSuffix),
+                      "mtp." + std::string(t.hfSuffix));
+        }
+        for (const auto& t : qwen35moeFullAttnTensors()) {
+            addDirect(steps, model, cfg, blk + std::string(t.ggufSuffix),
+                      qwen35moeMtpHfName(t.hfSuffix));
+        }
+        for (const auto& t : qwen35moeMoeTensors()) {
+            // Routed experts use the fused, expert-stacked BF16 MTP layout
+            // (below), NOT the main stack's per-expert `experts.{E}.*`; skip
+            // them here and emit via addFusedStack. Router + shared-expert
+            // (Direct) map normally.
+            if (t.xform == WeightXform::StackExperts) {
+                continue;
+            }
+            addDirect(steps, model, cfg, blk + std::string(t.ggufSuffix),
+                      qwen35moeMtpHfName(t.hfSuffix));
+        }
+
+        // Routed experts, de-stacked from the two fused BF16 tensors:
+        //   gate_up_proj [n_exp, 2*ff, d]  ->  ffn_gate_exps (rows 0:ff)
+        //                                       ffn_up_exps   (rows ff:2*ff)
+        //   down_proj    [n_exp, d, ff]    ->  ffn_down_exps
+        const std::string guName = qwen35moeMtpHfName("mlp.experts.gate_up_proj");
+        const std::string dnName = qwen35moeMtpHfName("mlp.experts.down_proj");
+        const st::SafetensorsTensor& gu = require(model, guName);
+        const st::SafetensorsTensor& dn = require(model, dnName);
+        if (gu.shape.size() != 3 || dn.shape.size() != 3) {
+            fail("MTP fused expert tensors are not 3-D");
+        }
+        const std::uint64_t nExp  = gu.shape[0];
+        const std::uint64_t twoFf = gu.shape[1];
+        const std::uint64_t d     = gu.shape[2];
+        const std::uint64_t ff    = twoFf / 2;
+        // gate_up_proj is gate-first: ffn_gate_exps <- rows [0:ff], ffn_up_exps
+        // <- rows [ff:2*ff]. Pinned by MTP accept-rate on GB10: gate-first gives
+        // 0.89 vs up-first 0.30 (with the eh_proj swap off — see Nvfp4Loader).
+        addFusedStack(steps, model, blk + "ffn_gate_exps.weight", guName,
+                      nExp, /*out=*/ff, /*in=*/d, /*stride=*/twoFf * d, /*off=*/0);
+        addFusedStack(steps, model, blk + "ffn_up_exps.weight", guName,
+                      nExp, /*out=*/ff, /*in=*/d, /*stride=*/twoFf * d, /*off=*/ff * d);
+        addFusedStack(steps, model, blk + "ffn_down_exps.weight", dnName,
+                      nExp, /*out=*/d, /*in=*/ff, /*stride=*/d * ff, /*off=*/0);
     }
 
     return steps;

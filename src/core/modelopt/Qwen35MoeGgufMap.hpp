@@ -71,4 +71,17 @@ struct GgufTensorSource {
 [[nodiscard]] std::string qwen35moeHfName(std::string_view hfSuffix, int layer,
                                           int expert = -1);
 
+/// The four MTP (nextn) head projections. `ggufSuffix` is relative to the MTP
+/// block prefix `blk.<numLayers>.` (e.g. "nextn.eh_proj.weight"); `hfSuffix`
+/// is relative to the top-level MTP prefix `mtp.` (e.g. "fc.weight"). The MTP
+/// transformer block itself reuses the full-attention + MoE tables.
+[[nodiscard]] std::span<const GgufTensorSource> qwen35moeNextnTensors() noexcept;
+
+/// Build the full HF name for a tensor inside the MTP transformer block:
+/// prefix `mtp.layers.0.` + `hfSuffix`, with `{E}` replaced by `expert` when
+/// `expert >= 0`. (The HF checkpoint numbers the single MTP block as
+/// `mtp.layers.0`, independent of the main stack depth.)
+[[nodiscard]] std::string qwen35moeMtpHfName(std::string_view hfSuffix,
+                                             int expert = -1);
+
 } // namespace mimirmind::core::modelopt
