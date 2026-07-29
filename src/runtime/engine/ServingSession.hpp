@@ -70,6 +70,12 @@ public:
                      std::size_t nSeq, std::size_t maxNew,
                      std::size_t depth, std::int32_t eosId);
 
+    /// See InferenceEngine::generateBatchMtpMulti.
+    [[nodiscard]] std::vector<std::vector<std::int32_t>>
+    generateBatchMtpMulti(const std::vector<std::vector<std::int32_t>>& prompts,
+                          std::size_t maxNew, std::size_t depth,
+                          std::int32_t eosId);
+
     [[nodiscard]] std::size_t maxBatch() const noexcept;
     [[nodiscard]] std::size_t maxContext() const noexcept;
 

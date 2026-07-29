@@ -1090,6 +1090,175 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
     return out;
 }
 
+std::vector<std::vector<std::int32_t>>
+ServingSession::generateBatchMtpMulti(
+        const std::vector<std::vector<std::int32_t>>& prompts,
+        std::size_t maxNew, std::size_t depth, std::int32_t eosId) {
+    if (_e._backend == nullptr) {
+        throw std::runtime_error("generateBatchMtpMulti: no model loaded");
+    }
+    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    if (qb == nullptr || !_e.mtpAvailable()) {
+        throw std::runtime_error(
+            "generateBatchMtpMulti: requires CUDA qwen35moe with a nextn head");
+    }
+    const std::size_t N = prompts.size();
+    if (N == 0 || maxNew == 0) {
+        return std::vector<std::vector<std::int32_t>>(N);
+    }
+    if (depth == 0) depth = 1;
+    for (const auto& p : prompts) {
+        if (p.empty()) {
+            throw std::runtime_error("generateBatchMtpMulti: empty prompt");
+        }
+    }
+    const std::size_t d = _e._config.embeddingLength;
+
+    // Physical slot p handles prompt order[p], sorted by DESCENDING length so
+    // the token-by-token prefill always steps a contiguous slot prefix
+    // (slots drop out of the prefill prefix once their prompt is exhausted).
+    std::vector<std::size_t> order(N);
+    for (std::size_t i = 0; i < N; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](std::size_t a, std::size_t b) {
+                         return prompts[a].size() > prompts[b].size();
+                     });
+    const std::size_t maxLen = prompts[order[0]].size();
+
+    // maxContext must hold the longest prompt plus the worst-case commit
+    // growth: a slot rides along (padded) until the slowest slot finishes —
+    // at most maxNew rounds, each committing at most depth+1 tokens.
+    ensureServingState(N, maxLen + maxNew * (depth + 1) + 8);
+    ensureMtpServingState();
+    ensureVerifyCapacity(depth);
+    auto& st = *_state;
+
+    auto argmax = [](const std::vector<float>& row) -> std::int32_t {
+        std::size_t best = 0;
+        float       bv   = row[0];
+        for (std::size_t v = 1; v < row.size(); ++v) {
+            if (row[v] > bv) { bv = row[v]; best = v; }
+        }
+        return static_cast<std::int32_t>(best);
+    };
+
+    float* const mtpHid = st.mtpHid.as<float>();
+
+    // --- per-slot prefill: single-session forwardVerify(prompt) for the
+    //     first token + trunk hidden + nextn-KV seed. (The MTP head only
+    //     proposes drafts, so seed/hidden fidelity affects accept-rate, not
+    //     the greedy output — the trunk verify guarantees correctness.) -----
+    std::vector<std::int32_t> token0(N);
+    std::vector<std::size_t>  basePos(N);
+    for (std::size_t p = 0; p < N; ++p) {
+        const auto& pr = prompts[order[p]];
+        const std::size_t P = pr.size();
+        basePos[p] = P;
+        _e.resetCache();
+        const auto pf = _e.forwardVerify(pr);
+        float* const xBufH = _e._xBufH.as<float>();
+        token0[p] = argmax(pf.back());
+        st.mtpKv[p]->reset();
+        {
+            float* const emb  = st.mtpEmb.as<float>();
+            float* const cat  = st.mtpCat.as<float>();
+            float* const eh   = st.mtpEh.as<float>();
+            float* const dlog = st.mtpDraftLogits.as<float>();
+            float* const lmSc = st.mtpLmScr.as<float>();
+            for (std::size_t q = 0; q + 1 < P; ++q) {
+                st.qb->runMtpDraftStep(xBufH + q * d, pr[q + 1], *st.mtpKv[p],
+                                       *st.sb, emb, cat, eh, dlog, lmSc);
+                st.mtpKv[p]->commit(1);
+            }
+        }
+        _e._ops->appendMemoryCopy(mtpHid + p * d, xBufH + (P - 1) * d,
+                                  d * sizeof(float));
+        _e._ops->flush();   // land the hidden copy before the next slot's forward
+    }
+
+    // --- seed the paged trunk KV + SSM via a sorted-descending lockstep
+    //     stepServing prefill (each step advances a contiguous prefix). -----
+    for (std::size_t g = 0; g < maxLen; ++g) {
+        std::size_t k = 0;
+        for (std::size_t p = 0; p < N; ++p) {
+            if (prompts[order[p]].size() > g) ++k; else break;
+        }
+        std::vector<InferenceEngine::ServingSlotStep> steps(k);
+        for (std::size_t p = 0; p < k; ++p) {
+            steps[p].slot     = static_cast<std::uint32_t>(p);
+            steps[p].token    = prompts[order[p]][g];
+            steps[p].pos      = static_cast<std::int32_t>(g);
+            steps[p].seqStart = (g == 0);
+        }
+        std::vector<std::int32_t> toks(k, 0);
+        stepServing(steps, toks);
+    }
+
+    // --- per-slot divergent decode: all slots draft+verify+accept each
+    //     round at their OWN positions; a finished slot stops emitting but
+    //     keeps riding along (padding) so the batch stays a contiguous
+    //     prefix. Every active slot emits >= 1 token/round, so <= maxNew
+    //     rounds suffice for the slowest slot. --------------------------------
+    std::vector<std::vector<std::int32_t>> out(N);
+    std::vector<char>                      finished(N, 0);
+    for (std::size_t round = 0; round < maxNew; ++round) {
+        std::size_t nDone = 0;
+        for (const char f : finished) nDone += (f != 0);
+        if (nDone == N) break;
+        const std::size_t K = depth;
+
+        std::vector<std::size_t>               mtpPre(N);
+        std::vector<std::vector<std::int32_t>> drafts(N);
+        for (std::size_t p = 0; p < N; ++p) {
+            mtpPre[p] = st.mtpKv[p]->length();
+            draftKInto(*st.mtpKv[p], mtpHid + p * d, token0[p], K, drafts[p]);
+        }
+
+        std::vector<InferenceEngine::VerifySlot> slots(N);
+        std::vector<std::int32_t> vtokTM((K + 1) * N);
+        for (std::size_t p = 0; p < N; ++p) {
+            slots[p].slot    = static_cast<std::uint32_t>(p);
+            slots[p].basePos = static_cast<std::int32_t>(basePos[p]);
+            vtokTM[0 * N + p] = token0[p];
+            for (std::size_t j = 1; j <= K; ++j) {
+                vtokTM[j * N + p] = drafts[p][j - 1];
+            }
+        }
+        const auto vlog = stepServingVerify(slots, vtokTM, K);
+        float* const vX = st.vXBuf.as<float>();
+
+        for (std::size_t p = 0; p < N; ++p) {
+            std::size_t a = 0;
+            for (std::size_t i = 0; i < K; ++i) {
+                if (argmax(vlog[i * N + p]) == drafts[p][i]) ++a; else break;
+            }
+            const std::int32_t corrected = argmax(vlog[a * N + p]);
+            if (finished[p] == 0) {
+                auto emit = [&](std::int32_t t) -> bool {
+                    out[p].push_back(t);
+                    if (eosId >= 0 && t == eosId) { finished[p] = 1; return false; }
+                    if (out[p].size() >= maxNew)  { finished[p] = 1; return false; }
+                    return true;
+                };
+                bool cont = emit(token0[p]);
+                for (std::size_t i = 0; i < a && cont; ++i) cont = emit(drafts[p][i]);
+            }
+            basePos[p] += a + 1;
+            if (a < K) restoreSlotSsm(p, a);
+            st.mtpKv[p]->truncate(mtpPre[p] + a + 1);
+            _e._ops->appendMemoryCopy(mtpHid + p * d, vX + (a * N + p) * d,
+                                      d * sizeof(float));
+            token0[p] = corrected;
+        }
+        _e._ops->flush();
+    }
+
+    // --- restore input order ---------------------------------------------
+    std::vector<std::vector<std::int32_t>> result(N);
+    for (std::size_t p = 0; p < N; ++p) result[order[p]] = std::move(out[p]);
+    return result;
+}
+
 std::size_t ServingSession::maxBatch() const noexcept {
     return _state != nullptr ? _state->maxBatch : 0;
 }

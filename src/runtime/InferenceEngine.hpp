@@ -517,6 +517,21 @@ public:
                      std::size_t nSeq, std::size_t maxNew,
                      std::size_t depth, std::int32_t eosId);
 
+    /// M-Cuda.MTP Increment E4 — batched native MTP decode over `prompts`
+    /// DIFFERENT prompts (different content AND length) concurrently, the
+    /// heterogeneous generalization of generateBatchMtp that a continuous
+    /// batcher drives. Each slot prefills its own prompt, then all slots
+    /// draft+verify+accept per round at their OWN (diverging) positions,
+    /// finishing independently at `maxNew`/`eosId`. Greedy (temperature 0):
+    /// each slot's stream equals that prompt's single-session generateMtp
+    /// bit-for-bit — the Increment E4 parity gate. Returns one stream per
+    /// prompt (excluding the prompt), input order preserved. CUDA +
+    /// qwen35moe with a loaded nextn head only.
+    [[nodiscard]] std::vector<std::vector<std::int32_t>>
+    generateBatchMtpMulti(const std::vector<std::vector<std::int32_t>>& prompts,
+                          std::size_t maxNew, std::size_t depth,
+                          std::int32_t eosId);
+
     /// Physical slot capacity of the current serving state (0 if not yet
     /// built). The max concurrent sequences the batcher may pin.
     [[nodiscard]] std::size_t servingMaxBatch() const noexcept;

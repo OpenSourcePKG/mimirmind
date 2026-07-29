@@ -2179,6 +2179,16 @@ InferenceEngine::generateBatchMtp(std::span<const std::int32_t> prompt,
     return _servingSession->generateBatchMtp(prompt, nSeq, maxNew, depth, eosId);
 }
 
+std::vector<std::vector<std::int32_t>>
+InferenceEngine::generateBatchMtpMulti(
+        const std::vector<std::vector<std::int32_t>>& prompts,
+        std::size_t maxNew, std::size_t depth, std::int32_t eosId) {
+    if (_servingSession == nullptr) {
+        _servingSession = std::make_unique<engine::ServingSession>(*this);
+    }
+    return _servingSession->generateBatchMtpMulti(prompts, maxNew, depth, eosId);
+}
+
 std::size_t InferenceEngine::servingMaxBatch() const noexcept {
     return _servingSession != nullptr ? _servingSession->maxBatch() : 0;
 }
