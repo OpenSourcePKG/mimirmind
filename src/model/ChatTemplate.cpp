@@ -90,11 +90,16 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     std::vector<std::int32_t> ids;
     ids.reserve(64);  // chat headers + a short message fit comfortably
 
-    // If the caller did not provide an explicit system message as the
-    // first turn, insert Qwen's default — exactly what the HF Jinja
-    // template does.
     const bool hasExplicitSystem =
         !messages.empty() && messages.front().role == ChatRole::System;
+
+    // Qwen2 / Qwen2.5 inject a default system turn when the caller gives
+    // none — their HF Jinja template does. Qwen3 / Qwen3.5 / Qwen3.6 (the
+    // "thinking" models, qwen35moe) do NOT: prepending the 2.5 default to
+    // a 3.x model is out-of-distribution and yields off-topic / early-EOS
+    // garbage. Discriminate on the <think> special token, exactly as the
+    // generation-prompt branch below already does.
+    const bool isThinkingFamily = tok.findToken("<think>") >= 0;
 
     auto emitTurn = [&](std::string_view role, std::string_view content) {
         ids.push_back(imStart);
@@ -106,7 +111,7 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
         encodeText(tok, "\n", ids);
     };
 
-    if (!hasExplicitSystem) {
+    if (!hasExplicitSystem && !isThinkingFamily) {
         emitTurn("system", kQwenDefaultSystem);
     }
 
