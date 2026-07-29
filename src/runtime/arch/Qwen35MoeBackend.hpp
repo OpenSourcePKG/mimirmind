@@ -135,6 +135,32 @@ public:
                          float*         logitsOut,
                          float*         logitsScratch);
 
+    /// M-Cuda.MTP Increment E5b — BATCHED MTP draft step over `nSeq` slots.
+    /// The throughput fix: one nextn forward (eh_proj → blk.<blockCount>
+    /// attn+MoE via the paged pool → shared head) over all slots instead of
+    /// N sequential runMtpDraftStep calls with a flush per step. `hidden`
+    /// [nSeq,d] and `prevTok` (host [nSeq]) are per-slot; `ctx` carries the
+    /// nextn pool + per-slot positions (via `kvPoolLayer`). Writes
+    /// `logitsOut` [nSeq,vocab] and leaves the next-step hiddens in
+    /// `ehScratch` [nSeq,d]. When `skipHead` (prefill seed) the shared head
+    /// is skipped (no logits). Scratch is caller-owned, sized for nSeq rows:
+    /// embScratch[nSeq,d], catScratch[nSeq,2d], ehScratch[nSeq,d],
+    /// tmpE/tmpH[nSeq,d]. Does NOT advance the pool position (caller commits).
+    void runMtpDraftStepBatched(const float*            hidden,
+                                const std::int32_t*     prevTok,
+                                std::size_t             nSeq,
+                                const BatchedDecodeCtx& ctx,
+                                std::size_t             kvPoolLayer,
+                                BlockBuffers&           s,
+                                float*                  embScratch,
+                                float*                  catScratch,
+                                float*                  ehScratch,
+                                float*                  tmpE,
+                                float*                  tmpH,
+                                float*                  logitsOut,
+                                float*                  logitsScratch,
+                                bool                    skipHead);
+
     [[nodiscard]] bool        scalesEmbedding()   const noexcept override { return false; }
     [[nodiscard]] const char* name()              const noexcept override { return "qwen35moe"; }
     [[nodiscard]] bool        needsQGateScratch() const noexcept override { return true; }
@@ -206,10 +232,16 @@ private:
     /// M-Cuda.Batch D2a — batched full-attention layer (paged KV). Mirrors
     /// runFullAttentionBlock with the T dimension replaced by nSeq and the
     /// KV write/read going through the PagedKvPool + paged_attention_v1.
-    void runFullAttentionBlockBatched(std::size_t             blockIdx,
-                                      float*                  x,
-                                      const BatchedDecodeCtx& ctx,
-                                      BlockBuffers&           s);
+    /// `kvPoolLayer` decouples the pool layer from the weight-block index
+    /// (default = `_fullAttnDense[blockIdx]`); the batched MTP draft passes
+    /// the dedicated nextn pool layer while reading blk.<blockCount> weights.
+    void runFullAttentionBlockBatched(
+        std::size_t             blockIdx,
+        float*                  x,
+        const BatchedDecodeCtx& ctx,
+        BlockBuffers&           s,
+        std::size_t             kvPoolLayer =
+            std::numeric_limits<std::size_t>::max());
 
     /// M-Cuda.Batch D2b — batched GatedDeltaNet layer. Mirrors
     /// runLinearBlock with per-sequence SsmState[nSeq] recurrent + conv

@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -103,6 +104,24 @@ struct ServingState {
     compute::ComputeBuffer mtpLmScr;                 // [max(d,vocab)] lm-head scratch
     compute::ComputeBuffer mtpHid;                   // [maxBatch, d] per-slot round hidden
     std::vector<float>     mtpHostLogits;            // [vocab_lm]  argmax readback
+
+    // ---- Increment E5b: BATCHED nextn draft (perf) ----------------------
+    // The nextn KV lives in `pool` at a dedicated extra layer (mtpPoolLayer =
+    // nFullAttn), reusing the per-slot block tables; per-slot nextn length is
+    // tracked in nextnLen. One batched runMtpDraftStepBatched over N slots
+    // replaces the N sequential runMtpDraftStep + per-step flush.
+    std::size_t mtpPoolLayer{std::numeric_limits<std::size_t>::max()};
+    std::vector<std::size_t>   nextnLen;             // [maxBatch] per-slot nextn KV length
+    compute::ComputeBuffer mtpEmbB, mtpCatB, mtpEhB; // [maxBatch,d]/[maxBatch,2d]/[maxBatch,d]
+    compute::ComputeBuffer mtpTmpE, mtpTmpH;         // [maxBatch,d] rmsnorm temps
+    compute::ComputeBuffer mtpDraftLogitsB, mtpLmScrB;
+    compute::ComputeBuffer mtpSeqLensDev, mtpStartPosDev; // [maxBatch] nextn positions
+    compute::ComputeBuffer mtpSeedHid;               // [maxBatch,d] broadcast seed hidden
+    std::vector<std::int32_t>  mtpSeqLensH, mtpStartPosH;
+    std::vector<std::uint32_t> mtpWriteBlockId;
+    std::vector<std::int32_t>  mtpWriteSlot;
+    std::vector<std::int32_t>  mtpPrevTok;           // [maxBatch] host prevTok
+    std::vector<float>         mtpHostLogitsB;       // [maxBatch*vocab_lm] batched readback
 };
 
 ServingSession::ServingSession(InferenceEngine& engine) : _e{engine} {}
@@ -401,8 +420,14 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         if (!_e._config.isRecurrentLayer(b)) ++nFullAttn;
     }
 
+    // Increment E5b: one extra paged layer holds the nextn (MTP) KV so the
+    // batched draft can attend it through the same per-slot block tables.
+    const bool        hasMtp      = _e.mtpAvailable();
+    const std::size_t nPoolLayers = nFullAttn + (hasMtp ? 1 : 0);
+    st->mtpPoolLayer = hasMtp ? nFullAttn
+                              : std::numeric_limits<std::size_t>::max();
     st->pool = std::make_unique<serving::PagedKvPool>(
-        *_e._ops, nFullAttn, st->numBlocks, st->blockSize, nKvHeads, headDim);
+        *_e._ops, nPoolLayers, st->numBlocks, st->blockSize, nKvHeads, headDim);
     st->ssm = std::make_unique<SsmState>(
         *_e._ops, st->blockCount, _e._config.ssmStateElemsPerLayer(),
         _e._config.ssmConvStateElemsPerLayer(), maxBatch);
@@ -804,6 +829,27 @@ void ServingSession::ensureMtpServingState() {
     st.mtpLmScr       = _e._ops->allocate(std::max(d, vocab) * sizeof(float));
     st.mtpHid         = _e._ops->allocate(st.maxBatch * d * sizeof(float));
     st.mtpHostLogits.assign(vocab, 0.0F);
+
+    // Increment E5b — batched nextn draft scratch (nSeq rows at a time).
+    const std::size_t B = st.maxBatch;
+    st.nextnLen.assign(B, 0);
+    st.mtpEmbB         = _e._ops->allocate(B * d * sizeof(float));
+    st.mtpCatB         = _e._ops->allocate(B * 2 * d * sizeof(float));
+    st.mtpEhB          = _e._ops->allocate(B * d * sizeof(float));
+    st.mtpTmpE         = _e._ops->allocate(B * d * sizeof(float));
+    st.mtpTmpH         = _e._ops->allocate(B * d * sizeof(float));
+    st.mtpSeedHid      = _e._ops->allocate(B * d * sizeof(float));
+    st.mtpDraftLogitsB = _e._ops->allocate(B * vocab * sizeof(float));
+    st.mtpLmScrB       = _e._ops->allocate(std::max(d, vocab) * sizeof(float));
+    st.mtpSeqLensDev   = _e._ops->allocate(B * sizeof(std::int32_t));
+    st.mtpStartPosDev  = _e._ops->allocate(B * sizeof(std::int32_t));
+    st.mtpSeqLensH.assign(B, 0);
+    st.mtpStartPosH.assign(B, 0);
+    st.mtpWriteBlockId.assign(B, 0);
+    st.mtpWriteSlot.assign(B, 0);
+    st.mtpPrevTok.assign(B, 0);
+    st.mtpHostLogitsB.assign(B * vocab, 0.0F);
+
     st.mtpReady = true;
 
     MM_LOG_INFO("serving",
@@ -838,6 +884,113 @@ void ServingSession::draftKInto(KvCache& kv, const float* hidden0,
         out.push_back(static_cast<std::int32_t>(best));
         hcur = eh;                                   // block-<mtp> out = next hidden
         prev = static_cast<std::int32_t>(best);
+    }
+}
+
+void ServingSession::mtpSeedBatched(std::size_t nSeq, const float* promptHiddens,
+                                    std::span<const std::int32_t> prompt) {
+    auto& st = *_state;
+    const std::size_t d   = st.d_model;
+    const std::size_t bps = st.blocksPerSeq;
+    const std::size_t bsz = st.blockSize;
+    const std::size_t P   = prompt.size();
+    float* const seedHid = st.mtpSeedHid.as<float>();
+    for (std::size_t s = 0; s < nSeq; ++s) st.nextnLen[s] = 0;
+    for (std::size_t g = 0; g + 1 < P; ++g) {
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            _e._ops->appendMemoryCopy(seedHid + s * d, promptHiddens + g * d,
+                                      d * sizeof(float));
+            st.mtpPrevTok[s]      = prompt[g + 1];
+            st.mtpWriteBlockId[s] = static_cast<std::uint32_t>(s * bps + g / bsz);
+            st.mtpWriteSlot[s]    = static_cast<std::int32_t>(g % bsz);
+            st.mtpSeqLensH[s]     = static_cast<std::int32_t>(g + 1);
+            st.mtpStartPosH[s]    = static_cast<std::int32_t>(g);
+        }
+        _e._ops->uploadHostBytes(st.mtpSeqLensDev.get(),  st.mtpSeqLensH.data(),
+                                 nSeq * sizeof(std::int32_t));
+        _e._ops->uploadHostBytes(st.mtpStartPosDev.get(), st.mtpStartPosH.data(),
+                                 nSeq * sizeof(std::int32_t));
+        arch::BatchedDecodeCtx ctx{};
+        ctx.nSeq            = nSeq;
+        ctx.pool            = st.pool.get();
+        ctx.writeBlockId    = st.mtpWriteBlockId.data();
+        ctx.writeSlot       = st.mtpWriteSlot.data();
+        ctx.blockTablesDev  = static_cast<const std::int32_t*>(st.blockTablesDev.get());
+        ctx.seqLensDev      = static_cast<const std::int32_t*>(st.mtpSeqLensDev.get());
+        ctx.maxBlocksPerSeq = bps;
+        ctx.startPosDev     = static_cast<const std::int32_t*>(st.mtpStartPosDev.get());
+        ctx.expIdxSlot      = st.expIdxBuf.as<std::int32_t>();
+        ctx.kwSlot          = st.kwBuf.as<float>();
+        st.qb->runMtpDraftStepBatched(
+            seedHid, st.mtpPrevTok.data(), nSeq, ctx, st.mtpPoolLayer, *st.sb,
+            st.mtpEmbB.as<float>(), st.mtpCatB.as<float>(), st.mtpEhB.as<float>(),
+            st.mtpTmpE.as<float>(), st.mtpTmpH.as<float>(),
+            st.mtpDraftLogitsB.as<float>(), st.mtpLmScrB.as<float>(),
+            /*skipHead=*/true);
+        for (std::size_t s = 0; s < nSeq; ++s) ++st.nextnLen[s];
+    }
+}
+
+void ServingSession::draftBatchRound(
+        std::size_t nSeq, std::size_t K,
+        const std::vector<std::int32_t>&        token0,
+        std::vector<std::vector<std::int32_t>>& drafts) {
+    auto& st = *_state;
+    const std::size_t d     = st.d_model;
+    const std::size_t vocab = st.vocab_lm;
+    const std::size_t bps   = st.blocksPerSeq;
+    const std::size_t bsz   = st.blockSize;
+    float* const hidB = st.mtpHid.as<float>();
+    float* const ehB  = st.mtpEhB.as<float>();
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        drafts[s].clear();
+        st.mtpPrevTok[s] = token0[s];
+    }
+    const float* hcur = hidB;
+    for (std::size_t k = 0; k < K; ++k) {
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            const std::size_t pos = st.nextnLen[s];
+            st.mtpWriteBlockId[s] = static_cast<std::uint32_t>(s * bps + pos / bsz);
+            st.mtpWriteSlot[s]    = static_cast<std::int32_t>(pos % bsz);
+            st.mtpSeqLensH[s]     = static_cast<std::int32_t>(pos + 1);
+            st.mtpStartPosH[s]    = static_cast<std::int32_t>(pos);
+        }
+        _e._ops->uploadHostBytes(st.mtpSeqLensDev.get(),  st.mtpSeqLensH.data(),
+                                 nSeq * sizeof(std::int32_t));
+        _e._ops->uploadHostBytes(st.mtpStartPosDev.get(), st.mtpStartPosH.data(),
+                                 nSeq * sizeof(std::int32_t));
+        arch::BatchedDecodeCtx ctx{};
+        ctx.nSeq            = nSeq;
+        ctx.pool            = st.pool.get();
+        ctx.writeBlockId    = st.mtpWriteBlockId.data();
+        ctx.writeSlot       = st.mtpWriteSlot.data();
+        ctx.blockTablesDev  = static_cast<const std::int32_t*>(st.blockTablesDev.get());
+        ctx.seqLensDev      = static_cast<const std::int32_t*>(st.mtpSeqLensDev.get());
+        ctx.maxBlocksPerSeq = bps;
+        ctx.startPosDev     = static_cast<const std::int32_t*>(st.mtpStartPosDev.get());
+        ctx.expIdxSlot      = st.expIdxBuf.as<std::int32_t>();
+        ctx.kwSlot          = st.kwBuf.as<float>();
+        st.qb->runMtpDraftStepBatched(
+            hcur, st.mtpPrevTok.data(), nSeq, ctx, st.mtpPoolLayer, *st.sb,
+            st.mtpEmbB.as<float>(), st.mtpCatB.as<float>(), ehB,
+            st.mtpTmpE.as<float>(), st.mtpTmpH.as<float>(),
+            st.mtpDraftLogitsB.as<float>(), st.mtpLmScrB.as<float>(),
+            /*skipHead=*/false);
+        _e._ops->flush();
+        _e._ops->readbackToHost(st.mtpHostLogitsB.data(), st.mtpDraftLogitsB.get(),
+                                nSeq * vocab * sizeof(float));
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            const float* row = st.mtpHostLogitsB.data() + s * vocab;
+            std::size_t best = 0;
+            float       bv   = row[0];
+            for (std::size_t v = 1; v < vocab; ++v) {
+                if (row[v] > bv) { bv = row[v]; best = v; }
+            }
+            drafts[s].push_back(static_cast<std::int32_t>(best));
+            st.mtpPrevTok[s] = static_cast<std::int32_t>(best);
+            ++st.nextnLen[s];
+        }
+        hcur = ehB;
     }
 }
 
@@ -984,24 +1137,12 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
     float* const xBufH = _e._xBufH.as<float>();
     const std::int32_t token0v = argmax(pf.back());
 
-    // Seed each slot's nextn KV by replaying the prompt (P-1 steps) and
-    // broadcast the last trunk hidden into the per-slot round hidden.
+    // Increment E5b: seed the BATCHED nextn KV (paged pool layer, all slots
+    // at once) by replaying the identical prompt, and broadcast the last
+    // trunk hidden into each slot's round hidden.
     float* const mtpHid = st.mtpHid.as<float>();
-    auto seedMtp = [&](KvCache& kv) {
-        kv.reset();
-        float* const emb  = st.mtpEmb.as<float>();
-        float* const cat  = st.mtpCat.as<float>();
-        float* const eh   = st.mtpEh.as<float>();
-        float* const dlog = st.mtpDraftLogits.as<float>();
-        float* const lmSc = st.mtpLmScr.as<float>();
-        for (std::size_t p = 0; p + 1 < P; ++p) {
-            st.qb->runMtpDraftStep(xBufH + p * d, prompt[p + 1], kv, *st.sb,
-                                   emb, cat, eh, dlog, lmSc);
-            kv.commit(1);
-        }
-    };
+    mtpSeedBatched(nSeq, xBufH, prompt);
     for (std::size_t s = 0; s < nSeq; ++s) {
-        seedMtp(*st.mtpKv[s]);
         _e._ops->appendMemoryCopy(mtpHid + s * d, xBufH + (P - 1) * d,
                                   d * sizeof(float));
     }
@@ -1033,13 +1174,11 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
         if (produced >= maxNew) break;
         const std::size_t K = std::min(depth, maxNew - produced);
 
-        // --- draft K tokens per slot on its own nextn KV -----------------
-        std::vector<std::size_t>               mtpPre(nSeq);
+        // --- draft K tokens for ALL slots in one batched nextn pass (E5b) -
+        std::vector<std::size_t>               nextnPre(nSeq);
         std::vector<std::vector<std::int32_t>> drafts(nSeq);
-        for (std::size_t s = 0; s < nSeq; ++s) {
-            mtpPre[s] = st.mtpKv[s]->length();
-            draftKInto(*st.mtpKv[s], mtpHid + s * d, token0[s], K, drafts[s]);
-        }
+        for (std::size_t s = 0; s < nSeq; ++s) nextnPre[s] = st.nextnLen[s];
+        draftBatchRound(nSeq, K, token0, drafts);
 
         // --- one batched verify over [token0, drafts...] per slot --------
         std::vector<InferenceEngine::VerifySlot> slots(nSeq);
@@ -1080,7 +1219,7 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
             // hidden at the accepted position into the next round's draft.
             basePos[s] += a + 1;
             if (a < K) restoreSlotSsm(s, a);
-            st.mtpKv[s]->truncate(mtpPre[s] + a + 1);
+            st.nextnLen[s] = nextnPre[s] + a + 1;
             _e._ops->appendMemoryCopy(mtpHid + s * d, vX + (a * nSeq + s) * d,
                                       d * sizeof(float));
             token0[s] = corrected;

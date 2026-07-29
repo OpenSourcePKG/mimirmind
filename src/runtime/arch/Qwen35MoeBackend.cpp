@@ -446,6 +446,65 @@ void Qwen35MoeBackend::runMtpDraftStep(const float*  hidden,
     // ehScratch now holds the block-<mtp> output = the next-step MTP hidden.
 }
 
+void Qwen35MoeBackend::runMtpDraftStepBatched(
+        const float* hidden, const std::int32_t* prevTok, std::size_t nSeq,
+        const BatchedDecodeCtx& ctx, std::size_t kvPoolLayer, BlockBuffers& s,
+        float* embScratch, float* catScratch, float* ehScratch,
+        float* tmpE, float* tmpH, float* logitsOut, float* logitsScratch,
+        bool skipHead) {
+    if (nSeq == 0) {
+        return;
+    }
+    const auto&       w      = _weights;
+    const std::size_t mtpBlk = _config.blockCount;   // nextn = blk.<blockCount>
+    const std::size_t d      = s.d_model;
+    const float       eps    = _config.rmsNormEps;
+
+    const auto& enorm      = requireBlock(w, mtpBlk, "nextn.enorm.weight");
+    const auto& hnorm      = requireBlock(w, mtpBlk, "nextn.hnorm.weight");
+    const auto& ehProj     = requireBlock(w, mtpBlk, "nextn.eh_proj.weight");
+    const auto& sharedNorm = requireBlock(w, mtpBlk, "nextn.shared_head_norm.weight");
+
+    const auto* tokEmb = w.find("token_embd.weight");
+    const auto* lmHead = w.find("output.weight");
+    if (lmHead == nullptr) lmHead = tokEmb;
+    if (tokEmb == nullptr || lmHead == nullptr) {
+        throw std::runtime_error("runMtpDraftStepBatched: shared embed/lm_head missing");
+    }
+    const std::size_t vocabEmb = tokEmb->dimensions.size() >= 2 ? tokEmb->dimensions[1] : d;
+    const std::size_t vocabLm  = lmHead->dimensions.size() >= 2 ? lmHead->dimensions[1] : d;
+
+    // 1. batched token embedding of prevTok[nSeq] (shared trunk embedding).
+    compute::embeddingLookup(tokEmb->type, tokEmb->usmPtr, d, vocabEmb,
+                             std::span<const std::int32_t>{prevTok, nSeq}, embScratch);
+
+    // 2. eh = eh_proj( concat( RMSNorm(embed, enorm), RMSNorm(hidden, hnorm) ) ).
+    //    Normalise into temps, then interleave into the [nSeq, 2d] concat
+    //    ([enorm-embed | hnorm-hidden] per row) since rmsnorm has no strided out.
+    _ops.rmsNormAsync(embScratch, nSeq, d, static_cast<const float*>(enorm.usmPtr), eps, tmpE);
+    _ops.rmsNormAsync(hidden,     nSeq, d, static_cast<const float*>(hnorm.usmPtr), eps, tmpH);
+    for (std::size_t r = 0; r < nSeq; ++r) {
+        _ops.appendMemoryCopy(catScratch + r * 2 * d,     tmpE + r * d, d * sizeof(float));
+        _ops.appendMemoryCopy(catScratch + r * 2 * d + d, tmpH + r * d, d * sizeof(float));
+    }
+    _gmm.matmulAsync(ehProj.type, ehProj.usmPtr, d, 2 * d, catScratch, nSeq,
+                     ehScratch, s.matmulScratch.as<float>());
+
+    // 3. the nextn transformer block (attn + MoE), batched over nSeq slots,
+    //    in place on ehScratch, using the paged nextn pool layer `kvPoolLayer`.
+    runFullAttentionBlockBatched(mtpBlk, ehScratch, ctx, s, kvPoolLayer);
+
+    // 4. shared head (skipped while seeding): RMSNorm(shared_head_norm) -> lm_head.
+    if (!skipHead) {
+        _ops.rmsNormAsync(ehScratch, nSeq, d,
+                          static_cast<const float*>(sharedNorm.usmPtr), eps,
+                          s.normBuf.as<float>());
+        _gmm.matmulAsync(lmHead->type, lmHead->usmPtr, vocabLm, d,
+                         s.normBuf.as<float>(), nSeq, logitsOut, logitsScratch);
+    }
+    // ehScratch now holds the per-slot block-<mtp> output = next MTP hidden.
+}
+
 void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
                                       float*        x,
                                       std::size_t   T,
@@ -1167,7 +1226,7 @@ void Qwen35MoeBackend::runBlockBatched(std::size_t             blockIdx,
 
 void Qwen35MoeBackend::runFullAttentionBlockBatched(
         std::size_t blockIdx, float* x, const BatchedDecodeCtx& ctx,
-        BlockBuffers& s) {
+        BlockBuffers& s, std::size_t kvPoolLayer) {
     const std::size_t nSeq = ctx.nSeq;
     if (nSeq == 0) {
         return;
@@ -1176,7 +1235,10 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
         throw std::runtime_error(
             "runFullAttentionBlockBatched: null PagedKvPool in context");
     }
-    const std::size_t denseLayer = _fullAttnDense[blockIdx];
+    const std::size_t denseLayer =
+        (kvPoolLayer == std::numeric_limits<std::size_t>::max())
+            ? _fullAttnDense[blockIdx]
+            : kvPoolLayer;
 
     const auto& w        = _weights;
     const auto& attnNorm = requireBlock(w, blockIdx, "attn_norm.weight");

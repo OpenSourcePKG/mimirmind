@@ -101,6 +101,21 @@ private:
     /// on a partial accept.
     void restoreSlotSsm(std::size_t slot, std::size_t snapIdx);
 
+    /// Increment E5b — seed the paged nextn KV (pool layer mtpPoolLayer) for
+    /// `nSeq` slots by replaying an IDENTICAL prompt: broadcast the trunk
+    /// hiddens `promptHiddens` ([P,d], device) and step the batched nextn
+    /// block P-1 times (no head). Sets nextnLen[s] = P-1.
+    void mtpSeedBatched(std::size_t nSeq, const float* promptHiddens,
+                        std::span<const std::int32_t> prompt);
+
+    /// Increment E5b — draft `K` tokens for ALL `nSeq` slots in one batched
+    /// nextn forward per step (round-start hidden in `mtpHid`, per-slot
+    /// `token0`), advancing each slot's nextnLen. One flush+argmax readback
+    /// per step (K total) instead of the N×K of the per-slot draftKInto.
+    void draftBatchRound(std::size_t nSeq, std::size_t K,
+                         const std::vector<std::int32_t>&        token0,
+                         std::vector<std::vector<std::int32_t>>& drafts);
+
     InferenceEngine&              _e;
     std::unique_ptr<ServingState> _state;
 };
