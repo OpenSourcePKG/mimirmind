@@ -64,6 +64,9 @@ std::vector<std::int32_t> runViaBatcher(
         batcher.cancel(req);
     }
     if (!req->error.empty()) {
+        if (req->overloaded) {
+            throw runtime::serving::ServingOverloadedError(req->error);
+        }
         throw std::runtime_error(req->error);
     }
     return out;
@@ -277,6 +280,22 @@ void ChatCompletionHandler::handle(const httplib::Request& req,
         }
     }
 
+    // Serving-class load shedding BEFORE we commit to a stream: like the
+    // thermal check above, the continuous batcher stands in as a process-wide
+    // capacity proxy (the default serving-class engine is the batcher's).
+    // Rejecting here ships a clean 503 as plain JSON rather than a truncated
+    // SSE body; submit() still enforces the same bound authoritatively for the
+    // narrow check-then-submit race.
+    if (_cfg.batcher != nullptr && _cfg.batcher->atCapacity()) {
+        MM_LOG_WARN("server",
+                    "serving overloaded ({}/{} in flight) — shedding with 503",
+                    _cfg.batcher->inflight(), _cfg.batcher->maxInflight());
+        res.set_header("Retry-After", "1");
+        sendError(res, 503, "service_unavailable",
+                  "server overloaded: too many concurrent requests");
+        return;
+    }
+
     if (cr.stream) {
         handleStream(cr, res);
     } else {
@@ -340,6 +359,11 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         try {
             generated = runViaBatcher(*_cfg.batcher, promptIds, params,
                                       stopIds, onToken);
+        } catch (const runtime::serving::ServingOverloadedError& e) {
+            // Load shedding, not a bug: retryable 503.
+            res.set_header("Retry-After", "1");
+            sendError(res, 503, "service_unavailable", e.what());
+            return;
         } catch (const std::exception& e) {
             MM_LOG_ERROR("server", "batcher generate failed: {}", e.what());
             sendError(res, 500, "server_error",

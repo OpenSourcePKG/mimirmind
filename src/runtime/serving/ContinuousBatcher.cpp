@@ -30,11 +30,16 @@ bool ServingRequest::waitToken(std::size_t next, std::int32_t& out) {
 ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
                                      std::size_t maxBatch,
                                      std::size_t maxContext,
-                                     std::int32_t eosId)
+                                     std::int32_t eosId,
+                                     std::size_t maxInflight)
     : _engine(engine),
       _maxBatch(maxBatch),
       _maxContext(maxContext),
-      _eosId(eosId) {
+      _eosId(eosId),
+      // Never let the admission bound sit below the running capacity — that
+      // would reject requests that could start immediately. A zero config
+      // value means "no extra queue", i.e. exactly maxBatch in flight.
+      _maxInflight(std::max(maxInflight, maxBatch)) {
     if (maxBatch == 0 || maxContext == 0) {
         throw std::runtime_error("ContinuousBatcher: maxBatch/maxContext > 0");
     }
@@ -45,8 +50,9 @@ ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
     _running = true;
     _worker  = std::thread(&ContinuousBatcher::workerLoop, this);
     MM_LOG_INFO("serving",
-                "ContinuousBatcher: started (maxBatch={} maxContext={} eosId={})",
-                maxBatch, maxContext, eosId);
+                "ContinuousBatcher: started (maxBatch={} maxContext={} "
+                "maxInflight={} eosId={})",
+                maxBatch, maxContext, _maxInflight, eosId);
 }
 
 ContinuousBatcher::~ContinuousBatcher() {
@@ -86,6 +92,25 @@ std::shared_ptr<ServingRequest> ContinuousBatcher::submit(
             req->cancelled = true;
             return req;
         }
+        // Bounded admission — the authoritative hard cap. Count running slots
+        // plus the waiting queue; beyond `_maxInflight` shed load instead of
+        // growing an unbounded queue (which would balloon memory and push tail
+        // latency to minutes under a spike). The HTTP layer turns `overloaded`
+        // into a 503 + Retry-After.
+        std::size_t inFlight = _waiting.size();
+        for (const auto& s : _slots) {
+            if (s.occupied) ++inFlight;
+        }
+        if (inFlight >= _maxInflight) {
+            req->error      = "server overloaded: request queue full";
+            req->overloaded = true;
+            req->done       = true;
+            MM_LOG_WARN("serving",
+                        "ContinuousBatcher: rejecting submit — {} in flight >= "
+                        "maxInflight {} (load shedding)",
+                        inFlight, _maxInflight);
+            return req;
+        }
         Pending p;
         p.req     = req;
         p.prompt  = std::move(prompt);
@@ -95,6 +120,15 @@ std::shared_ptr<ServingRequest> ContinuousBatcher::submit(
     }
     _cv.notify_all();
     return req;
+}
+
+std::size_t ContinuousBatcher::inflight() const {
+    std::lock_guard<std::mutex> lk(_mtx);
+    std::size_t n = _waiting.size();
+    for (const auto& s : _slots) {
+        if (s.occupied) ++n;
+    }
+    return n;
 }
 
 void ContinuousBatcher::cancel(const std::shared_ptr<ServingRequest>& req) {

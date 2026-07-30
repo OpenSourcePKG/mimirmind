@@ -759,7 +759,8 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             const std::size_t maxBatch   = 3;   // < nReq => forces slot reuse
             const std::size_t maxContext = maxLen + maxNew + 8;
             ::mimirmind::runtime::serving::ContinuousBatcher batcher(
-                *e, maxBatch, maxContext, /*eosId=*/-1);
+                *e, maxBatch, maxContext, /*eosId=*/-1,
+                /*maxInflight=*/nReq);   // accept all; validate queueing/reuse
 
             std::vector<std::shared_ptr<
                 ::mimirmind::runtime::serving::ServingRequest>> handles(nReq);
@@ -1777,15 +1778,20 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         const std::size_t maxBatch =
             std::max<std::size_t>(1, engine.batchCapacity().sustainableBatch);
         const std::size_t maxContext = engine.maxContextTokens();
+        // Total accepted-but-unfinished cap (running + queued). Beyond it the
+        // batcher sheds load with a 503 instead of an unbounded queue.
+        const std::size_t maxInflight = cfg.serving.maxActiveRequests;
         try {
             batcher = std::make_unique<
                 ::mimirmind::runtime::serving::ContinuousBatcher>(
-                engine, maxBatch, maxContext, engine.tokenizer().eosId());
+                engine, maxBatch, maxContext, engine.tokenizer().eosId(),
+                maxInflight);
             scfg.batcher = batcher.get();
             MM_LOG_INFO("main",
                         "serve: continuous batcher ENABLED for default engine "
-                        "'{}' (maxBatch={} maxContext={})",
-                        defaultId, maxBatch, maxContext);
+                        "'{}' (maxBatch={} maxContext={} maxInflight={})",
+                        defaultId, maxBatch, maxContext,
+                        batcher->maxInflight());
         } catch (const std::exception& e) {
             MM_LOG_WARN("main",
                         "serve: continuous batcher init failed ({}); falling "

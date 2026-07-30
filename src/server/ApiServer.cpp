@@ -11,6 +11,7 @@
 
 #include "model/ChatTemplate.hpp"
 #include "runtime/InferenceEngine.hpp"
+#include "runtime/serving/ContinuousBatcher.hpp"
 #include "core/log/Log.hpp"
 
 #include <httplib.h>
@@ -148,6 +149,32 @@ struct ApiServer::Impl {
     }
 
     void run() {
+        // Serving-class load management: size the HTTP worker pool to the
+        // batcher's admission bound (+ headroom for health/monitoring routes)
+        // so the batcher — which knows the GPU's real serving capacity — is the
+        // authoritative admission controller and its clean 503 actually fires.
+        // With the default pool (~hw_concurrency) smaller than maxInflight, the
+        // undersized pool becomes the silent bottleneck: excess requests queue
+        // in httplib's unbounded task queue for tens of seconds instead of
+        // getting a fast 503. Pool threads waiting on the batcher are just
+        // blocked on a condvar (no CPU), so a larger pool is cheap. The accept
+        // queue is bounded too, so an extreme flood sheds (connection close)
+        // rather than growing httplib's queue without limit. Non-serving
+        // (single-session) keeps httplib's default pool.
+        if (cfg.batcher != nullptr) {
+            constexpr std::size_t kHeadroom = 8;   // health/models/system routes
+            const std::size_t poolSize =
+                cfg.batcher->maxInflight() + kHeadroom;
+            const std::size_t queueMax = cfg.batcher->maxInflight() * 4;
+            server.new_task_queue = [poolSize, queueMax] {
+                return new httplib::ThreadPool(poolSize, queueMax);
+            };
+            MM_LOG_INFO("server",
+                        "serving-class HTTP pool = {} workers (maxInflight {} + "
+                        "headroom {}), accept-queue bound {} — batcher governs "
+                        "admission with clean 503s",
+                        poolSize, cfg.batcher->maxInflight(), kHeadroom, queueMax);
+        }
         MM_LOG_INFO("server", "binding {}:{} (model={})",
                     cfg.host, cfg.port, cfg.modelId);
         started.store(true);

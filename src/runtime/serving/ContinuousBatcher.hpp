@@ -9,6 +9,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -18,6 +19,15 @@ class InferenceEngine;
 }
 
 namespace mimirmind::runtime::serving {
+
+/**
+ * Thrown (via `ServingRequest::overloaded`) when the batcher rejects a submit
+ * because the in-flight bound is reached. The HTTP layer maps this to a 503
+ * (retryable overload) rather than a 500 (server bug).
+ */
+struct ServingOverloadedError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 /**
  * A single in-flight serving request. Shared between the submitting HTTP
@@ -33,6 +43,7 @@ struct ServingRequest {
     std::vector<std::int32_t> tokens;    // generated ids, appended by worker
     bool                     done{false};
     bool                     cancelled{false};
+    bool                     overloaded{false};  // rejected: in-flight bound hit
     std::string              error;      // non-empty => request failed
 
     /// Block until the request completes; returns the full token stream.
@@ -69,8 +80,14 @@ public:
     /// `maxContext` tokens (prompt + generated) per slot. `eosId` ends a
     /// request when generated (pass negative to disable the implicit EOS
     /// stop). The serving state is built eagerly here.
+    /// `maxInflight` bounds the total accepted-but-unfinished requests
+    /// (running slots + waiting queue). Beyond it, `submit()` rejects with
+    /// `ServingRequest::overloaded` so the HTTP layer sheds load with a 503
+    /// instead of growing an unbounded queue. Clamped up to `maxBatch` so the
+    /// bound can never sit below the running capacity.
     ContinuousBatcher(InferenceEngine& engine, std::size_t maxBatch,
-                      std::size_t maxContext, std::int32_t eosId);
+                      std::size_t maxContext, std::int32_t eosId,
+                      std::size_t maxInflight);
     ~ContinuousBatcher();
 
     ContinuousBatcher(const ContinuousBatcher&)            = delete;
@@ -93,6 +110,14 @@ public:
 
     [[nodiscard]] std::size_t maxBatch()   const noexcept { return _maxBatch; }
     [[nodiscard]] std::size_t maxContext() const noexcept { return _maxContext; }
+    [[nodiscard]] std::size_t maxInflight() const noexcept { return _maxInflight; }
+
+    /// Current accepted-but-unfinished requests (running slots + waiting).
+    /// Thread-safe. A cheap pre-admission proxy for the HTTP layer to shed a
+    /// streaming request with a clean 503 before it commits to an SSE body;
+    /// `submit()` remains the authoritative hard cap.
+    [[nodiscard]] std::size_t inflight() const;
+    [[nodiscard]] bool        atCapacity() const { return inflight() >= _maxInflight; }
 
 private:
     struct Pending {
@@ -121,10 +146,11 @@ private:
     std::size_t      _maxBatch;
     std::size_t      _maxContext;
     std::int32_t     _eosId;
+    std::size_t      _maxInflight;
 
     std::vector<Slot>                     _slots;
     std::deque<Pending>                   _waiting;
-    std::mutex                            _mtx;
+    mutable std::mutex                    _mtx;
     std::condition_variable               _cv;      // wakes worker on submit/stop
     std::thread                           _worker;
     bool                                  _running{false};
