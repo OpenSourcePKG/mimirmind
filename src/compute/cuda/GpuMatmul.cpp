@@ -187,6 +187,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _matmulBf16VecKernel;
     ::mimirmind::core::cuda::CudaModule _matmulBf16GemmModule;
     ::mimirmind::core::cuda::CudaKernel _matmulBf16GemmKernel;
+    ::mimirmind::core::cuda::CudaModule _matmulBf16GemmTcModule;
+    ::mimirmind::core::cuda::CudaKernel _matmulBf16GemmTcKernel;
     ::mimirmind::core::cuda::CudaModule _matmulFp8VecModule;
     ::mimirmind::core::cuda::CudaKernel _matmulFp8VecKernel;
     ::mimirmind::core::cuda::CudaModule _matmulFp8GemmModule;
@@ -281,6 +283,9 @@ struct GpuMatmul::Impl {
           _matmulBf16GemmModule   {loadCudaModule(ctx, "matmul_bf16_gemm")},
           _matmulBf16GemmKernel   {
               _matmulBf16GemmModule.getFunction("matmul_bf16_gemm")},
+          _matmulBf16GemmTcModule {loadCudaModule(ctx, "matmul_bf16_gemm_tc")},
+          _matmulBf16GemmTcKernel {
+              _matmulBf16GemmTcModule.getFunction("matmul_bf16_gemm_tc")},
           _matmulFp8VecModule     {loadCudaModule(ctx, "matmul_fp8_vec")},
           _matmulFp8VecKernel     {
               _matmulFp8VecModule.getFunction("matmul_fp8_vec")},
@@ -313,6 +318,9 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
     if (const char* mx = std::getenv("MIMIRMIND_MMQ_MAX_N")) {
         const long v = std::strtol(mx, nullptr, 10);
         if (v > 0) _mmqMaxN = static_cast<std::size_t>(v);
+    }
+    if (const char* bt = std::getenv("MIMIRMIND_BF16_TC")) {
+        _bf16Tc = (bt[0] != '\0' && !(bt[0] == '0' && bt[1] == '\0'));
     }
     if (_mmqEnabled) {
         MM_LOG_INFO("hip::GpuMatmul",
@@ -822,6 +830,23 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
         // it across all M activation rows — the serving-throughput path.
         // M is chunked to the kernel's fixed accumulator bound (GEMM_MAX_M);
         // weights are re-read once per chunk, not once per row.
+        // E-FP4.3: BF16 tensor-core GEMM (wmma). One launch tiles M and N by
+        // 16; activations are rounded F32->BF16 on stage (not bit-exact vs the
+        // scalar path). Gated behind MIMIRMIND_BF16_TC until the A/B lands.
+        if (_bf16Tc) {
+            auto& tk = _pimpl->_matmulBf16GemmTcKernel;
+            tk.setPtr  (0, X);
+            tk.setPtr  (1, W);
+            tk.setPtr  (2, Y);
+            tk.setValue(3, static_cast<std::int32_t>(K));
+            tk.setValue(4, static_cast<std::int32_t>(N));
+            tk.setValue(5, static_cast<std::int32_t>(M));
+            const std::uint32_t gx = static_cast<std::uint32_t>((N + 15) / 16);
+            const std::uint32_t gy = static_cast<std::uint32_t>((M + 15) / 16);
+            tk.launch(_ctx.stream(), gx, gy, 1, 32, 1, 1);
+            return;
+        }
+
         constexpr std::size_t kGemmMaxM = 16;   // == GEMM_MAX_M in the .cu
         auto& kern = _pimpl->_matmulBf16GemmKernel;
         for (std::size_t m0 = 0; m0 < M; m0 += kGemmMaxM) {

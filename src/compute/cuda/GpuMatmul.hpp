@@ -313,6 +313,11 @@ private:
     // includes every other Q8_0 matmul. MIMIRMIND_MMQ_MAX_N overrides (0/large
     // = no exclusion, i.e. MMQ everything, for the A/B).
     std::size_t                    _mmqMaxN{32768};
+    // E-FP4.3: MIMIRMIND_BF16_TC routes the batched (M>1) BF16 dense GEMM
+    // (shared expert / attn projections / lm-head) through the wmma
+    // tensor-core kernel instead of the scalar warp-per-column one. Activations
+    // are rounded F32->BF16 (not bit-exact, ~0.2% relL2). Default off until A/B.
+    bool                           _bf16Tc{false};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
                                    _vecMsAtM{};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
