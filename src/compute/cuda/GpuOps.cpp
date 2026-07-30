@@ -217,6 +217,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _gatedDeltaNetArKernel;
     core::cuda::CudaModule _gatedDeltaNetArBatchedModule;
     core::cuda::CudaKernel _gatedDeltaNetArBatchedKernel;
+    core::cuda::CudaModule _gatedDeltaNetArBatchedV2Module;
+    core::cuda::CudaKernel _gatedDeltaNetArBatchedV2Kernel;
     core::cuda::CudaModule _deltanetGateModule;
     core::cuda::CudaKernel _deltanetGateKernel;
     core::cuda::CudaModule _deltanetChunkCumGateModule;
@@ -355,6 +357,9 @@ struct GpuOps::Impl {
           _gatedDeltaNetArBatchedModule{loadCudaModule(ctx, "gated_deltanet_ar_batched")},
           _gatedDeltaNetArBatchedKernel{
               _gatedDeltaNetArBatchedModule.getFunction("gated_deltanet_ar_batched")},
+          _gatedDeltaNetArBatchedV2Module{loadCudaModule(ctx, "gated_deltanet_ar_batched_v2")},
+          _gatedDeltaNetArBatchedV2Kernel{
+              _gatedDeltaNetArBatchedV2Module.getFunction("gated_deltanet_ar_batched_v2")},
           _deltanetGateModule      {loadCudaModule(ctx, "deltanet_gate")},
           _deltanetGateKernel      {_deltanetGateModule.getFunction("deltanet_gate")},
           _deltanetChunkCumGateModule{loadCudaModule(ctx, "deltanet_chunk_cumgate")},
@@ -1120,7 +1125,16 @@ void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
     // grid = (H, nSeq) blocks, block = S threads. Each (head, seq) block
     // owns one sequence [S,S] state; math is byte-identical to the
     // single-sequence gatedDeltaNetRecurrentAsync (M-Cuda.Batch Cat C-P0).
-    auto& k = _pimpl->_gatedDeltaNetArBatchedKernel;
+    // E-GDN.1: the latency-optimised v2 kernel (bit-identical math, fewer
+    // global state passes + pipelined loads, +2.8% serving decode @nSeq16).
+    // Default ON — it is bit-identical to v1, so there is no quality tradeoff;
+    // MIMIRMIND_GDN_V2=0 rolls back to v1.
+    static const bool gdnV2 = [] {
+        const char* e = std::getenv("MIMIRMIND_GDN_V2");
+        return e == nullptr || !(e[0] == '0' && e[1] == '\0');
+    }();
+    auto& k = gdnV2 ? _pimpl->_gatedDeltaNetArBatchedV2Kernel
+                    : _pimpl->_gatedDeltaNetArBatchedKernel;
     k.setPtr  (0, q);
     k.setPtr  (1, k_);
     k.setPtr  (2, v);
