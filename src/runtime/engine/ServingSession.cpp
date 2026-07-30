@@ -235,7 +235,14 @@ ServingSession::generateBatch(
     std::vector<std::vector<std::int32_t>> out(nSeq);
 
     const bool timing = std::getenv("MIMIRMIND_BATCH_TIMING") != nullptr;
+    // Overhead probe: per decode step, measure host-enqueue (dispatch, no
+    // flush) vs GPU-drain (a single flush after). dispatch/(dispatch+drain)
+    // ~= the launch/host-sync fraction a CUDA graph would remove. Distinct
+    // from `timing` (which flushes per block and thus serialises).
+    const bool ohMode = std::getenv("MIMIRMIND_BATCH_OVERHEAD") != nullptr;
     double tFull = 0.0, tLin = 0.0, tLm = 0.0, tPre = 0.0;
+    double tDisp = 0.0, tDrain = 0.0;
+    std::size_t ohSteps = 0;
     using clk = std::chrono::steady_clock;
 
     auto stepForward = [&](std::size_t p) {
@@ -270,14 +277,34 @@ ServingSession::generateBatch(
             _e._ops->flush();
             tPre += std::chrono::duration<double, std::milli>(clk::now() - tp0).count();
         }
-        for (std::size_t b = 0; b < blockCount; ++b) {
-            const auto tb0 = timing ? clk::now() : clk::time_point{};
-            qb->runBlockBatched(b, xBuf, ctx, sb);
-            if (timing) {
-                _e._ops->flush();
-                const double dt =
-                    std::chrono::duration<double, std::milli>(clk::now() - tb0).count();
-                if (_e._config.isRecurrentLayer(b)) tLin += dt; else tFull += dt;
+        if (ohMode) {
+            // Pure host enqueue of all blocks (no per-block flush), then one
+            // drain. Skip the first steps (first-touch PTX JIT / warm-up).
+            const auto td0 = clk::now();
+            for (std::size_t b = 0; b < blockCount; ++b) {
+                qb->runBlockBatched(b, xBuf, ctx, sb);
+            }
+            const double tdisp =
+                std::chrono::duration<double, std::milli>(clk::now() - td0).count();
+            const auto tf0 = clk::now();
+            _e._ops->flush();
+            const double tdrain =
+                std::chrono::duration<double, std::milli>(clk::now() - tf0).count();
+            if (p >= 4) {
+                tDisp  += tdisp;
+                tDrain += tdrain;
+                ++ohSteps;
+            }
+        } else {
+            for (std::size_t b = 0; b < blockCount; ++b) {
+                const auto tb0 = timing ? clk::now() : clk::time_point{};
+                qb->runBlockBatched(b, xBuf, ctx, sb);
+                if (timing) {
+                    _e._ops->flush();
+                    const double dt =
+                        std::chrono::duration<double, std::milli>(clk::now() - tb0).count();
+                    if (_e._config.isRecurrentLayer(b)) tLin += dt; else tFull += dt;
+                }
             }
         }
     };
@@ -345,6 +372,17 @@ ServingSession::generateBatch(
             "[batch-timing] nSeq=%zu full-attn=%.1f ms  linear=%.1f ms  "
             "lm-head=%.1f ms  prep=%.1f ms  (total blocks-only=%.1f ms)\n",
             nSeq, tFull, tLin, tLm, tPre, tFull + tLin);
+        std::fflush(stderr);
+    }
+    if (ohMode && ohSteps > 0) {
+        const double disp  = tDisp / static_cast<double>(ohSteps);
+        const double drain = tDrain / static_cast<double>(ohSteps);
+        const double frac  = 100.0 * tDisp / (tDisp + tDrain);
+        std::fprintf(stderr,
+            "[batch-overhead] nSeq=%zu steps=%zu blocks=%zu  "
+            "dispatch(host-enqueue)=%.3f ms/step  drain(gpu)=%.3f ms/step  "
+            "=> dispatch-bound=%.1f%% (CUDA-graph-removable)\n",
+            nSeq, ohSteps, blockCount, disp, drain, frac);
         std::fflush(stderr);
     }
     return out;
