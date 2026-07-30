@@ -38,9 +38,16 @@ static __device__ __forceinline__ float warp16_reduce_sum(float v) {
     return v;
 }
 
+// E2M1 magnitude decode without a runtime-indexed local LUT (which spills to
+// local memory — a latency load per dequant). Build the fp32 bit pattern
+// arithmetically; bit-exact to the table {0,0.5,1,1.5,2,3,4,6}. mm = [E1 E0 M];
+// normal (E>0) = 2^(E-1)*(1+0.5*M) => exp = (mm>>1)+126, mantissa top bit = M;
+// subnormals mm<2 are 0.0 / 0.5.
 static __device__ __forceinline__ float dq_e2m1(unsigned nib) {
-    const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-    const float v = mag[nib & 0x7u];
+    const unsigned mm   = nib & 0x7u;
+    const unsigned bits = (((mm >> 1) + 126u) << 23) | ((mm & 1u) << 22);
+    float v = __uint_as_float(bits);
+    v = (mm < 2u) ? (0.5f * static_cast<float>(mm)) : v;
     return (nib & 0x8u) ? -v : v;
 }
 

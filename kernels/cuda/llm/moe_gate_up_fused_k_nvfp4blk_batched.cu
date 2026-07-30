@@ -39,21 +39,34 @@ __device__ __forceinline__ float warpReduceSum(float v) {
     return v;
 }
 
+// E2M1 magnitude decode without a runtime-indexed local LUT. A `float mag[8]`
+// indexed by a per-lane (divergent) value cannot be kept in registers, so it
+// spills to local memory — a latency load on every dequant. Instead build the
+// fp32 bit pattern arithmetically. Bit-exact to the table
+// {0,0.5,1,1.5,2,3,4,6}: mm = [E1 E0 M]; the normal path (E>0) is
+// 2^(E-1)*(1+0.5*M) => exponent (E-1)+127 = (mm>>1)+126, mantissa top bit = M.
+// The two subnormals (mm<2) are 0.0 and 0.5.
 __device__ __forceinline__ float dq_e2m1(unsigned nib) {
-    const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-    const float v = mag[nib & 0x7u];
+    const unsigned mm   = nib & 0x7u;
+    const unsigned bits = (((mm >> 1) + 126u) << 23) | ((mm & 1u) << 22);
+    float v = __uint_as_float(bits);
+    v = (mm < 2u) ? (0.5f * static_cast<float>(mm)) : v;
     return (nib & 0x8u) ? -v : v;
 }
 
 // Contribution of element `l` (lane) of one 32-element super to the dot product.
 __device__ __forceinline__ float nvblkSuperDot(
     const unsigned char* super, const float* xBase, int l) {
-    const float s0 = __half2float(*reinterpret_cast<const __half*>(super));
-    const float s1 = __half2float(*reinterpret_cast<const __half*>(super + 2));
+    // Each lane owns exactly one element of the super, so it needs only its own
+    // scale (s0 for lanes 0-15, s1 for 16-31). Read and convert just that one
+    // half instead of converting both per lane (32 lanes previously did 64
+    // half->float conversions per super for 2 distinct values).
+    const __half hs =
+        *reinterpret_cast<const __half*>(super + ((l < 16) ? 0 : 2));
+    const float scale = __half2float(hs);
     const unsigned char byte = super[4 + (l >> 1)];
     const unsigned nib = (l & 1) ? (byte >> 4) : (byte & 0x0F);
-    const float w = ((l < 16) ? s0 : s1) * dq_e2m1(nib);
-    return xBase[l] * w;
+    return xBase[l] * (scale * dq_e2m1(nib));
 }
 
 } // namespace
