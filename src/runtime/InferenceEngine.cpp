@@ -621,7 +621,15 @@ void InferenceEngine::finalizeLoad() {
     // under, so the gate stays conservative).
     {
         const std::size_t bwGBps      = _computeCtx->bandwidthGBps();
-        const std::size_t weightBytes = _reader.totalTensorBytes();
+        // Reader-borrowed (GGUF) path fills totalTensorBytes(); the non-GGUF
+        // (NVFP4 -> synthesised tensors) path leaves the reader empty, so fall
+        // back to the resident weight footprint from the WeightsMap. Without
+        // this the probe sees weight=0, reports "insufficient probe data", and
+        // pins serving-class off on the Spark NVFP4 path.
+        std::size_t weightBytes = _reader.totalTensorBytes();
+        if (weightBytes == 0 && _weights.has_value()) {
+            weightBytes = _weights->totalTensorBytes();
+        }
         const std::size_t kvPerTok    = _config.kvBytesPerToken(/*dtypeBytes=*/2);
         const std::size_t ctx         = _maxContextTokens > 0 ? _maxContextTokens
                                                               : _config.contextLength;

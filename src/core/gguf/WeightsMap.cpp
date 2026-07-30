@@ -37,6 +37,14 @@ WeightsMap::WeightsMap(std::vector<GgufTensor> attachedTensors)
                 _byName.size());
 }
 
+std::size_t WeightsMap::totalTensorBytes() const noexcept {
+    std::size_t total = 0;
+    for (const auto& [name, t] : _byName) {
+        total += t->nbytes;
+    }
+    return total;
+}
+
 void WeightsMap::buildBlockIndex() {
     constexpr std::string_view kPrefix = "blk.";
     for (const auto& [name, tptr] : _byName) {

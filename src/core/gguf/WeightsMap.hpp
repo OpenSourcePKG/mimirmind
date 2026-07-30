@@ -84,6 +84,13 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return _byName.size(); }
 
+    /// Sum of `nbytes` over every indexed tensor — the resident weight
+    /// footprint. Works in both construction modes (reader-borrowed and
+    /// owned/attached). Used by the startup capacity probe, which on the
+    /// non-GGUF (NVFP4) path has no populated `GgufReader::totalTensorBytes()`
+    /// to read. O(#tensors); called once at load, not on the hot path.
+    [[nodiscard]] std::size_t totalTensorBytes() const noexcept;
+
     /// True when this map owns its tensor entries (attached mode).
     /// Diagnostic only — the forward-pass code doesn't care.
     [[nodiscard]] bool isAttached() const noexcept { return !_owned.empty(); }
