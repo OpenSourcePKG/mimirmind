@@ -74,6 +74,14 @@ void CudaKernel::clearArgs() noexcept {
     _argCount = 0;
 }
 
+void CudaKernel::setMaxDynamicSharedBytes(std::size_t bytes) {
+    cudaDriverCheck(
+        "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)",
+        cuFuncSetAttribute(_fn,
+                           CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                           static_cast<int>(bytes)));
+}
+
 void CudaKernel::launch(CudaStream&   stream,
                         std::uint32_t gridX,
                         std::uint32_t gridY,

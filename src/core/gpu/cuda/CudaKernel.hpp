@@ -82,6 +82,15 @@ public:
     /// Clear all staged args.
     void clearArgs() noexcept;
 
+    // ---- Attributes -----------------------------------------------------
+
+    /// Opt in to more than the 48 KiB static shared-memory cap for this
+    /// function. `cuLaunchKernel` will otherwise reject a `sharedMemBytes`
+    /// above 48 KiB with CUDA_ERROR_INVALID_VALUE. Call once (idempotent)
+    /// before launching with a large dynamic shared request. Throws
+    /// `CudaDriverError` if the device cannot grant `bytes`.
+    void setMaxDynamicSharedBytes(std::size_t bytes);
+
     // ---- Launch ---------------------------------------------------------
 
     /// Launch on `stream` with the given grid/block dimensions.

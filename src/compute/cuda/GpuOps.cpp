@@ -219,6 +219,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _gatedDeltaNetArBatchedKernel;
     core::cuda::CudaModule _gatedDeltaNetArBatchedV2Module;
     core::cuda::CudaKernel _gatedDeltaNetArBatchedV2Kernel;
+    core::cuda::CudaModule _gatedDeltaNetArBatchedV3Module;
+    core::cuda::CudaKernel _gatedDeltaNetArBatchedV3Kernel;
     core::cuda::CudaModule _deltanetGateModule;
     core::cuda::CudaKernel _deltanetGateKernel;
     core::cuda::CudaModule _deltanetChunkCumGateModule;
@@ -360,6 +362,9 @@ struct GpuOps::Impl {
           _gatedDeltaNetArBatchedV2Module{loadCudaModule(ctx, "gated_deltanet_ar_batched_v2")},
           _gatedDeltaNetArBatchedV2Kernel{
               _gatedDeltaNetArBatchedV2Module.getFunction("gated_deltanet_ar_batched_v2")},
+          _gatedDeltaNetArBatchedV3Module{loadCudaModule(ctx, "gated_deltanet_ar_batched_v3")},
+          _gatedDeltaNetArBatchedV3Kernel{
+              _gatedDeltaNetArBatchedV3Module.getFunction("gated_deltanet_ar_batched_v3")},
           _deltanetGateModule      {loadCudaModule(ctx, "deltanet_gate")},
           _deltanetGateKernel      {_deltanetGateModule.getFunction("deltanet_gate")},
           _deltanetChunkCumGateModule{loadCudaModule(ctx, "deltanet_chunk_cumgate")},
@@ -1133,8 +1138,43 @@ void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
         const char* e = std::getenv("MIMIRMIND_GDN_V2");
         return e == nullptr || !(e[0] == '0' && e[1] == '\0');
     }();
-    auto& k = gdnV2 ? _pimpl->_gatedDeltaNetArBatchedV2Kernel
-                    : _pimpl->_gatedDeltaNetArBatchedKernel;
+    // E-GDN.2: the smem-staged v3 kernel (bit-identical math). Stages the whole
+    // [S,S] state block into dynamic shared memory once so the latency-critical
+    // recurrence reads hit smem, not the ~937-cycle global state loads. Needs a
+    // >48 KiB dynamic-smem opt-in (S*S*4 = 64 KiB for S=128). Default ON — it is
+    // bit-identical to v2 (verified byte-for-byte across 8 diverse prompts x 64
+    // tokens) and +8.3% serving decode @nSeq16; MIMIRMIND_GDN_V3=0 rolls back to
+    // v2. It silently falls back to v2/v1 if the device rejects the smem request
+    // (e.g. a model whose S*S*4 exceeds the device opt-in cap).
+    static const bool gdnV3Req = [] {
+        const char* e = std::getenv("MIMIRMIND_GDN_V3");
+        return e == nullptr || !(e[0] == '0' && e[1] == '\0');
+    }();
+    const std::size_t gdnSmemBytes =
+        static_cast<std::size_t>(S) * S * sizeof(float);
+    bool useV3 = false;
+    if (gdnV3Req) {
+        static const bool v3Ready = [&] {
+            try {
+                _pimpl->_gatedDeltaNetArBatchedV3Kernel
+                    .setMaxDynamicSharedBytes(gdnSmemBytes);
+                MM_LOG_INFO("cudagpuops",
+                            "GDN v3 (smem-staged) enabled: {} bytes dynamic smem",
+                            gdnSmemBytes);
+                return true;
+            } catch (const core::cuda::CudaDriverError& err) {
+                MM_LOG_WARN("cudagpuops",
+                            "GDN v3 opt-in for {} bytes smem rejected ({}); "
+                            "falling back to v2",
+                            gdnSmemBytes, err.what());
+                return false;
+            }
+        }();
+        useV3 = v3Ready;
+    }
+    auto& k = useV3 ? _pimpl->_gatedDeltaNetArBatchedV3Kernel
+                    : (gdnV2 ? _pimpl->_gatedDeltaNetArBatchedV2Kernel
+                             : _pimpl->_gatedDeltaNetArBatchedKernel);
     k.setPtr  (0, q);
     k.setPtr  (1, k_);
     k.setPtr  (2, v);
@@ -1148,7 +1188,8 @@ void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(H),
              static_cast<std::uint32_t>(nSeq), 1,
-             static_cast<std::uint32_t>(S), 1, 1);
+             static_cast<std::uint32_t>(S), 1, 1,
+             useV3 ? gdnSmemBytes : 0);
 }
 
 void GpuOps::deltanetGateAsync(const float* alpha, const float* ssmA,

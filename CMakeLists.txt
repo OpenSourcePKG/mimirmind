@@ -737,6 +737,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/gated_deltanet_ar.cu
         kernels/cuda/llm/gated_deltanet_ar_batched.cu
         kernels/cuda/llm/gated_deltanet_ar_batched_v2.cu
+        kernels/cuda/llm/gated_deltanet_ar_batched_v3.cu
         kernels/cuda/llm/deltanet_gate.cu
         kernels/cuda/llm/deltanet_chunk_cumgate.cu
         kernels/cuda/llm/deltanet_chunk_forward.cu
