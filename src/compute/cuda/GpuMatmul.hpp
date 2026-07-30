@@ -323,6 +323,16 @@ private:
     // activation noise — and costs ~80% of the win, so the whole path uses TC.)
     // MIMIRMIND_BF16_TC=0 forces it off (A/B / rollback).
     bool                           _bf16Tc{true};
+    // E-FP4.5 fidelity path: run the dense-GEMM tensor-core kernel in TF32
+    // (10-bit mantissa) instead of BF16 (7-bit), so the F32 activations round
+    // closer to the scalar reference. This removes the benign BF16-TC near-tie
+    // flip (serving-parity 8/8 bit-identical to the scalar single-session path
+    // vs BF16-TC's 7/8) at NO measurable perf cost: the M<=16 tile is staging-
+    // /overhead-bound, not TC-throughput-bound, so TF32's lower mma throughput
+    // does not bite (measured within +/-2% of BF16-TC @nSeq16, bracketed).
+    // Default ON; MIMIRMIND_TF32_TC=0 rolls back to BF16-TC. Takes precedence
+    // over BF16-TC when both are on.
+    bool                           _tf32Tc{true};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
                                    _vecMsAtM{};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>

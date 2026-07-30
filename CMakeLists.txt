@@ -689,6 +689,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/matmul_bf16_vec.cu
         kernels/cuda/common/matmul_bf16_gemm.cu
         kernels/cuda/common/matmul_bf16_gemm_tc.cu
+        kernels/cuda/common/matmul_bf16_gemm_tf32_tc.cu
         kernels/cuda/common/quantize_bf16_to_q8_0.cu
         kernels/cuda/common/quantize_bf16_to_q4k.cu
         kernels/cuda/common/quantize_bf16_to_q6k.cu

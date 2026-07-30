@@ -189,6 +189,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _matmulBf16GemmKernel;
     ::mimirmind::core::cuda::CudaModule _matmulBf16GemmTcModule;
     ::mimirmind::core::cuda::CudaKernel _matmulBf16GemmTcKernel;
+    ::mimirmind::core::cuda::CudaModule _matmulBf16GemmTf32TcModule;
+    ::mimirmind::core::cuda::CudaKernel _matmulBf16GemmTf32TcKernel;
     ::mimirmind::core::cuda::CudaModule _matmulFp8VecModule;
     ::mimirmind::core::cuda::CudaKernel _matmulFp8VecKernel;
     ::mimirmind::core::cuda::CudaModule _matmulFp8GemmModule;
@@ -286,6 +288,10 @@ struct GpuMatmul::Impl {
           _matmulBf16GemmTcModule {loadCudaModule(ctx, "matmul_bf16_gemm_tc")},
           _matmulBf16GemmTcKernel {
               _matmulBf16GemmTcModule.getFunction("matmul_bf16_gemm_tc")},
+          _matmulBf16GemmTf32TcModule {
+              loadCudaModule(ctx, "matmul_bf16_gemm_tf32_tc")},
+          _matmulBf16GemmTf32TcKernel {
+              _matmulBf16GemmTf32TcModule.getFunction("matmul_bf16_gemm_tf32_tc")},
           _matmulFp8VecModule     {loadCudaModule(ctx, "matmul_fp8_vec")},
           _matmulFp8VecKernel     {
               _matmulFp8VecModule.getFunction("matmul_fp8_vec")},
@@ -322,7 +328,15 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
     if (const char* bt = std::getenv("MIMIRMIND_BF16_TC")) {
         _bf16Tc = (bt[0] != '\0' && !(bt[0] == '0' && bt[1] == '\0'));
     }
-    if (_bf16Tc) {
+    if (const char* tt = std::getenv("MIMIRMIND_TF32_TC")) {
+        _tf32Tc = (tt[0] != '\0' && !(tt[0] == '0' && tt[1] == '\0'));
+    }
+    if (_tf32Tc) {
+        MM_LOG_INFO("hip::GpuMatmul",
+                    "E-FP4.5 TF32 tensor-core GEMM enabled for batched (M>1) "
+                    "dense matmuls — fidelity variant (MIMIRMIND_TF32_TC=0 to "
+                    "disable, falls back to BF16-TC)");
+    } else if (_bf16Tc) {
         MM_LOG_INFO("hip::GpuMatmul",
                     "E-FP4.3 BF16 tensor-core GEMM enabled for batched (M>1) "
                     "dense matmuls (MIMIRMIND_BF16_TC=0 to disable)");
@@ -838,8 +852,12 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
         // E-FP4.3: BF16 tensor-core GEMM (wmma). One launch tiles M and N by
         // 16; activations are rounded F32->BF16 on stage (not bit-exact vs the
         // scalar path). Default on (MIMIRMIND_BF16_TC=0 disables).
-        if (_bf16Tc) {
-            auto& tk = _pimpl->_matmulBf16GemmTcKernel;
+        // E-FP4.5: TF32 fidelity variant — same tile/launch, activations round
+        // to 10-bit (TF32) instead of 7-bit (BF16). Takes precedence over the
+        // BF16-TC kernel when MIMIRMIND_TF32_TC=1.
+        if (_tf32Tc || _bf16Tc) {
+            auto& tk = _tf32Tc ? _pimpl->_matmulBf16GemmTf32TcKernel
+                               : _pimpl->_matmulBf16GemmTcKernel;
             tk.setPtr  (0, X);
             tk.setPtr  (1, W);
             tk.setPtr  (2, Y);
