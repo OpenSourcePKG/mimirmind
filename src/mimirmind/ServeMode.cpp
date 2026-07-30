@@ -365,7 +365,14 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                     promptIds.resize(static_cast<std::size_t>(n));
                 }
             }
-            const std::size_t maxNew = 8;
+            // MIMIRMIND_PARITY_MAXNEW=N lengthens the greedy comparison — used
+            // as the BF16-TC default-on coherence gate (long generations across
+            // diverse prompts must track the trusted scalar single-session path).
+            std::size_t maxNew = 8;
+            if (const char* mn = std::getenv("MIMIRMIND_PARITY_MAXNEW")) {
+                const long v = std::strtol(mn, nullptr, 10);
+                if (v > 0) maxNew = static_cast<std::size_t>(v);
+            }
             const std::size_t nSeq   = 2;
 
             ::mimirmind::runtime::GenerateParams gp{};
@@ -410,6 +417,11 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                 "The capital of France is",
                 "Once upon a time",
                 "2 plus 2 equals",
+                "Explain how a transformer neural network works:",
+                "def quicksort(arr):",
+                "The three laws of thermodynamics are",
+                "Translate to German: The weather is nice today.",
+                "List the planets of the solar system in order:",
             };
             std::vector<std::vector<std::int32_t>> bprompts;
             for (const char* mp : multiPrompts) {

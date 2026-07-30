@@ -313,11 +313,16 @@ private:
     // includes every other Q8_0 matmul. MIMIRMIND_MMQ_MAX_N overrides (0/large
     // = no exclusion, i.e. MMQ everything, for the A/B).
     std::size_t                    _mmqMaxN{32768};
-    // E-FP4.3: MIMIRMIND_BF16_TC routes the batched (M>1) BF16 dense GEMM
-    // (shared expert / attn projections / lm-head) through the wmma
-    // tensor-core kernel instead of the scalar warp-per-column one. Activations
-    // are rounded F32->BF16 (not bit-exact, ~0.2% relL2). Default off until A/B.
-    bool                           _bf16Tc{false};
+    // E-FP4.3: BF16 tensor-core (wmma) for ALL batched (M>1) BF16 dense GEMMs
+    // (shared expert / attn projections / lm-head). Activations are rounded
+    // F32->BF16 (not bit-exact, ~0.2% relL2). Default ON (+11.7% serving
+    // decode). Coherence gate (64 greedy tokens, 8 diverse prompts): 7/8
+    // bit-identical to the scalar path, the one divergence a benign near-tie
+    // flip whose continuation stays coherent — standard BF16-serving behaviour.
+    // (Excluding the lm-head does NOT remove the flip — it is upstream
+    // activation noise — and costs ~80% of the win, so the whole path uses TC.)
+    // MIMIRMIND_BF16_TC=0 forces it off (A/B / rollback).
+    bool                           _bf16Tc{true};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
                                    _vecMsAtM{};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>

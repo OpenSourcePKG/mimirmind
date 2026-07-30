@@ -322,6 +322,11 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
     if (const char* bt = std::getenv("MIMIRMIND_BF16_TC")) {
         _bf16Tc = (bt[0] != '\0' && !(bt[0] == '0' && bt[1] == '\0'));
     }
+    if (_bf16Tc) {
+        MM_LOG_INFO("hip::GpuMatmul",
+                    "E-FP4.3 BF16 tensor-core GEMM enabled for batched (M>1) "
+                    "dense matmuls (MIMIRMIND_BF16_TC=0 to disable)");
+    }
     if (_mmqEnabled) {
         MM_LOG_INFO("hip::GpuMatmul",
                     "M-Cuda.MMQ enabled — Q8_0 prefill (M>1) uses int8 {} MMQ "
@@ -832,7 +837,7 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
         // weights are re-read once per chunk, not once per row.
         // E-FP4.3: BF16 tensor-core GEMM (wmma). One launch tiles M and N by
         // 16; activations are rounded F32->BF16 on stage (not bit-exact vs the
-        // scalar path). Gated behind MIMIRMIND_BF16_TC until the A/B lands.
+        // scalar path). Default on (MIMIRMIND_BF16_TC=0 disables).
         if (_bf16Tc) {
             auto& tk = _pimpl->_matmulBf16GemmTcKernel;
             tk.setPtr  (0, X);
