@@ -287,15 +287,22 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             auto base = tok.encode("The capital of France is", /*addBos=*/false);
             if (base.empty()) base.push_back(1);
             const bool quick = std::getenv("MIMIRMIND_BENCH_QUICK") != nullptr;
-            const std::size_t maxNew    = quick ? 4 : 32;
+            // MIMIRMIND_BENCH_NSEQ=N: profile-friendly mode — run ONLY nSeq=N
+            // (skip the single-seq baseline and the sweep) with a small maxNew,
+            // so an ncu run reaches the target regime with few prior kernels.
+            const char* nseqEnv = std::getenv("MIMIRMIND_BENCH_NSEQ");
+            const std::size_t maxNew    = quick ? 4 : (nseqEnv != nullptr ? 8 : 32);
             const std::size_t promptLen = base.size();
             const std::vector<std::size_t> batchSizes =
-                quick ? std::vector<std::size_t>{1}
-                      : std::vector<std::size_t>{1, 4, 8, 16};
+                nseqEnv != nullptr
+                    ? std::vector<std::size_t>{static_cast<std::size_t>(
+                          std::max<long>(1, std::strtol(nseqEnv, nullptr, 10)))}
+                    : quick ? std::vector<std::size_t>{1}
+                            : std::vector<std::size_t>{1, 4, 8, 16};
             std::cout << "\n[M-Cuda.Batch D2e bench] promptLen=" << promptLen
                       << " maxNew=" << maxNew << "\n";
             // Single-session baseline on THIS box+model (apples-to-apples).
-            {
+            if (nseqEnv == nullptr) {
                 ::mimirmind::runtime::GenerateParams gpb{};
                 gpb.maxNewTokens         = maxNew;
                 gpb.sampling.temperature = 0.0F;
