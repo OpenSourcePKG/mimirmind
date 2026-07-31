@@ -383,6 +383,46 @@ public:
             "moeScatterExpertOutAsync: not supported on this backend");
     }
 
+    /// M-Cuda.MoeGroup Sub-Step E-a: turn the per-expert row ranges
+    /// (expOffset, exclusive prefix sum) into a compact per-tile schedule a
+    /// single device-driven grouped GEMM consumes in ONE launch — no expOffset
+    /// D2H, no per-expert host loop. `maxTiles` is the host-computed static
+    /// upper bound ceil(R/tileM)+nExperts; unused tail tiles carry the -1
+    /// sentinel. Default: unsupported; CUDA overrides. See
+    /// kernels/cuda/llm/moe_group_tiles.cu.
+    virtual void moeGroupTilesAsync(const std::int32_t* expOffset,
+                                    std::int32_t* tileExpert,
+                                    std::int32_t* tileRow0,
+                                    std::int32_t* tileRows,
+                                    std::int32_t* nTiles,
+                                    std::size_t nExperts, std::size_t maxTiles,
+                                    std::size_t tileM) {
+        (void)expOffset; (void)tileExpert; (void)tileRow0; (void)tileRows;
+        (void)nTiles; (void)nExperts; (void)maxTiles; (void)tileM;
+        throw std::runtime_error(
+            "moeGroupTilesAsync: not supported on this backend");
+    }
+
+    /// M-Cuda.MoeGroup Sub-Step E-b: device-driven grouped GEMM over the
+    /// contiguous [nExperts][N][K] blocked-NVFP4 expert bank. Each grid.y block
+    /// reads its (expert, row-range) from the tile schedule ON THE DEVICE and
+    /// GEMMs its <= tileM rows into Y[row0.., :]. `maxTiles` sizes grid.y
+    /// (over-provisioned to the static bound; -1 sentinel tiles early-exit).
+    /// Default: unsupported; CUDA overrides. See
+    /// kernels/cuda/llm/moe_grouped_gemm_nvfp4blk.cu.
+    virtual void moeGroupedGemmNvfp4Async(const float* x,
+                                          const unsigned char* w, float* y,
+                                          const std::int32_t* tileExpert,
+                                          const std::int32_t* tileRow0,
+                                          const std::int32_t* tileRows,
+                                          std::size_t K, std::size_t N,
+                                          std::size_t maxTiles) {
+        (void)x; (void)w; (void)y; (void)tileExpert; (void)tileRow0;
+        (void)tileRows; (void)K; (void)N; (void)maxTiles;
+        throw std::runtime_error(
+            "moeGroupedGemmNvfp4Async: not supported on this backend");
+    }
+
     /// M-CLR.MoE Increment 2: device-indexed fused gate+up projection for
     /// Gemma 4 MoE T=1 decode. Reads the router pick `expIdx[k]` on the
     /// device (no host round-trip on the routing) and folds the per-expert

@@ -95,6 +95,15 @@ struct BlockBuffers {
     ComputeBuffer moeGroupRowKw;  // [nRowsMax]   f32   row -> router weight
     ComputeBuffer moeGroupAsnRow; // [nRowsMax]   int32 assignment -> row (inverse)
 
+    // M-Cuda.MoeGroup Sub-Step E — device-driven grouped GEMM tile schedule
+    // (moe_group_tiles). Sized to the static upper bound maxTiles =
+    // ceil(nRowsMax/16) + nExperts so the grouped-GEMM grid.y never reads a
+    // device value. Only allocated on the device-driven grouped path.
+    ComputeBuffer moeGroupTileExpert; // [maxTiles] int32 expert id / -1
+    ComputeBuffer moeGroupTileRow0;   // [maxTiles] int32 tile start row
+    ComputeBuffer moeGroupTileRows;   // [maxTiles] int32 tile row count
+    ComputeBuffer moeGroupTileCount;  // [1]        int32 real tile count
+
     // Q8_0 dp4a decode path (M-Q3N.4e): int8-quantized activation row +
     // per-row scale for xQuantI8Async -> matmulDp4aAsync.
     ComputeBuffer xqI8;      // [max(d_model, ffScratch)] int8

@@ -323,8 +323,18 @@ private:
     // DEVICE-DRIVEN grouped GEMM (single kernel reading expOffset on device,
     // no D2H, collapsed launches, FP4-TC) — the M-Cuda.MoeGroup follow-up.
     bool _moeGroupedPrefill{false};
+    // M-Cuda.MoeGroup Sub-Step E (Option 2): when set (env
+    // MIMIRMIND_GROUPED_MOE=2), runMoeFfnGrouped drives the grouped GEMM
+    // entirely on the device — moe_group_tiles builds a compact tile schedule
+    // and a single moe_grouped_gemm_nvfp4blk launch per projection consumes it,
+    // reading the per-tile (expert, row-range) on the device. No expOffset D2H,
+    // no per-expert host loop — the shape that can beat fused-K. NVFP4_BLK
+    // expert weights only (the serving format); other types fall back to the
+    // host-driven loop. Opt-in, off by default.
+    bool _moeGroupedDeviceDriven{false};
     // Host mirror of the device expert-offset table (moe_group_build output),
-    // read back once per grouped MoE layer to drive the per-expert launches.
+    // read back once per grouped MoE layer to drive the per-expert launches
+    // (host-driven Option 1 only; the device-driven path never reads it back).
     std::vector<std::int32_t> _groupOffsetHost;
 
     // Diagnostic: when MIMIRMIND_SSM_TRACE is set, log per-linear-layer

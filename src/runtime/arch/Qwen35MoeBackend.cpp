@@ -70,9 +70,16 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
       _moeGroupEnabled{moeGroupEnabled},
       _moeFusedDownEnabled{moeFusedDownEnabled} {
     if (const char* g = std::getenv("MIMIRMIND_GROUPED_MOE")) {
-        // Opt-in only (default off — grouped Option 1 is slower than fused-K
-        // batched on GB10, see _moeGroupedPrefill). "1" enables it.
-        _moeGroupedPrefill = (g[0] == '1' && g[1] == '\0');
+        // Opt-in only (default off). "1" = host-driven grouped (Option 1,
+        // slower than fused-K batched on GB10 — per-layer expOffset D2H + host
+        // per-expert loop). "2" = device-driven grouped (Option 2, Sub-Step
+        // E): moe_group_tiles + a single moe_grouped_gemm_nvfp4blk launch per
+        // projection, NO D2H — the shape that can actually beat fused-K.
+        _moeGroupedPrefill      = (g[0] == '1' && g[1] == '\0');
+        _moeGroupedDeviceDriven = (g[0] == '2' && g[1] == '\0');
+        if (_moeGroupedDeviceDriven) {
+            _moeGroupedPrefill = true;   // route prefill through runMoeFfnGrouped
+        }
     }
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     if (const char* d = std::getenv("MIMIRMIND_SSM_DUMP")) {
@@ -1334,63 +1341,109 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     _ops.moeGroupBuildAsync(expIdxSlot, kwSlot, expOffset, rowSrcTok, rowKw,
                             asnToRow, R, nExperts, K);
 
-    // The per-expert launch bounds are the only thing that must cross to the
-    // host — one small D2H (nExperts+1 ints) per MoE layer. Routing, gather
-    // and scatter all stay on the device.
-    _groupOffsetHost.resize(nExperts + 1);
-    _ops.flush();
-    _ops.readbackToHost(_groupOffsetHost.data(), expOffset,
-                        (nExperts + 1) * sizeof(std::int32_t));
-
-    // --- gather activations into per-expert-contiguous rows ----------------
+    // --- gather activations into per-expert-contiguous rows (both paths) ---
     _ops.moeGatherRowsAsync(moeInput, rowSrcTok, xComp, d_model, R);
 
-    // Per-expert byte strides (separate banks, one block per expert).
-    std::size_t bytesGate = 0, bytesUp = 0, bytesDown = 0;
-    if (gateExps.type == core::gguf::GgmlType::BF16) {
-        bytesGate = n_ff_exp * d_model * sizeof(std::uint16_t);
-        bytesUp   = n_ff_exp * d_model * sizeof(std::uint16_t);
-        bytesDown = d_model * n_ff_exp * sizeof(std::uint16_t);
+    const bool deviceDrivenGrouped =
+        _moeGroupedDeviceDriven &&
+        gateExps.type == core::gguf::GgmlType::NVFP4_BLK &&
+        upExps.type   == core::gguf::GgmlType::NVFP4_BLK &&
+        downExps.type == core::gguf::GgmlType::NVFP4_BLK;
+
+    if (deviceDrivenGrouped) {
+        // --- Option 2: fully device-driven grouped GEMM (Sub-Step E) -------
+        // moe_group_tiles builds a compact per-tile (expert, row-range)
+        // schedule on the device; ONE moe_grouped_gemm_nvfp4blk launch per
+        // projection consumes it, reading the tile assignment on the device.
+        // No expOffset D2H, no per-expert host loop — nothing crosses to the
+        // host, so the stream is never drained mid-layer (the killer that
+        // made the host-driven path lose to fused-K on GB10).
+        const std::size_t tileM    = 16;                 // == GEMM_MAX_M
+        const std::size_t maxTiles = (R + tileM - 1) / tileM + nExperts;
+        auto* const tileExpert = s.moeGroupTileExpert.as<std::int32_t>();
+        auto* const tileRow0   = s.moeGroupTileRow0.as<std::int32_t>();
+        auto* const tileRows   = s.moeGroupTileRows.as<std::int32_t>();
+        auto* const tileCount  = s.moeGroupTileCount.as<std::int32_t>();
+
+        _ops.moeGroupTilesAsync(expOffset, tileExpert, tileRow0, tileRows,
+                                tileCount, nExperts, maxTiles, tileM);
+
+        const auto* const gateBase =
+            static_cast<const unsigned char*>(gateExps.usmPtr);
+        const auto* const upBase =
+            static_cast<const unsigned char*>(upExps.usmPtr);
+        const auto* const downBase =
+            static_cast<const unsigned char*>(downExps.usmPtr);
+
+        // gate/up: weight [nExperts][n_ff_exp][d_model] (N=n_ff_exp, K=d_model)
+        _ops.moeGroupedGemmNvfp4Async(xComp, gateBase, gateComp,
+                                      tileExpert, tileRow0, tileRows,
+                                      d_model, n_ff_exp, maxTiles);
+        _ops.moeGroupedGemmNvfp4Async(xComp, upBase, upComp,
+                                      tileExpert, tileRow0, tileRows,
+                                      d_model, n_ff_exp, maxTiles);
+        _ops.siluMulAsync(gateComp, upComp, R * n_ff_exp);      // silu(gate)*up
+        // down: weight [nExperts][d_model][n_ff_exp] (N=d_model, K=n_ff_exp)
+        _ops.moeGroupedGemmNvfp4Async(gateComp, downBase, downComp,
+                                      tileExpert, tileRow0, tileRows,
+                                      n_ff_exp, d_model, maxTiles);
     } else {
-        const auto [geGate, gbGate] = moeBlockGeom(gateExps.type);
-        const auto [geUp,   gbUp]   = moeBlockGeom(upExps.type);
-        const auto [geDown, gbDown] = moeBlockGeom(downExps.type);
-        if (geGate == 0 || geUp == 0 || geDown == 0) {
-            throw std::runtime_error(
-                "Qwen35MoeBackend::runMoeFfnGrouped: expert weight type(s) not "
-                "in QuantType registry");
-        }
-        bytesGate = n_ff_exp * ((d_model / geGate) * gbGate);
-        bytesUp   = n_ff_exp * ((d_model / geUp)   * gbUp);
-        bytesDown = d_model * ((n_ff_exp / geDown) * gbDown);
-    }
-    const auto* const gateBase = static_cast<const std::uint8_t*>(gateExps.usmPtr);
-    const auto* const upBase   = static_cast<const std::uint8_t*>(upExps.usmPtr);
-    const auto* const downBase = static_cast<const std::uint8_t*>(downExps.usmPtr);
+        // --- Option 1: host-driven grouped (correct but slower on GB10) ----
+        // The per-expert launch bounds are the only thing that must cross to
+        // the host — one small D2H (nExperts+1 ints) per MoE layer. This
+        // stream drain is exactly why Option 1 loses; the device-driven
+        // branch above avoids it.
+        _groupOffsetHost.resize(nExperts + 1);
+        _ops.flush();
+        _ops.readbackToHost(_groupOffsetHost.data(), expOffset,
+                            (nExperts + 1) * sizeof(std::int32_t));
 
-    // --- one dense GEMM per expert over its M=count[e] grouped rows --------
-    // Each expert weight is read once per 16-row GEMM chunk (matmulAsync M>1),
-    // vs the fused-K path's once per (token, expert). Experts with no routed
-    // tokens are skipped (an M=0 launch is pure overhead).
-    for (std::size_t e = 0; e < nExperts; ++e) {
-        const std::int32_t off = _groupOffsetHost[e];
-        const std::int32_t end = _groupOffsetHost[e + 1];
-        const std::size_t  Me  = static_cast<std::size_t>(end - off);
-        if (Me == 0) {
-            continue;
+        // Per-expert byte strides (separate banks, one block per expert).
+        std::size_t bytesGate = 0, bytesUp = 0, bytesDown = 0;
+        if (gateExps.type == core::gguf::GgmlType::BF16) {
+            bytesGate = n_ff_exp * d_model * sizeof(std::uint16_t);
+            bytesUp   = n_ff_exp * d_model * sizeof(std::uint16_t);
+            bytesDown = d_model * n_ff_exp * sizeof(std::uint16_t);
+        } else {
+            const auto [geGate, gbGate] = moeBlockGeom(gateExps.type);
+            const auto [geUp,   gbUp]   = moeBlockGeom(upExps.type);
+            const auto [geDown, gbDown] = moeBlockGeom(downExps.type);
+            if (geGate == 0 || geUp == 0 || geDown == 0) {
+                throw std::runtime_error(
+                    "Qwen35MoeBackend::runMoeFfnGrouped: expert weight type(s) "
+                    "not in QuantType registry");
+            }
+            bytesGate = n_ff_exp * ((d_model / geGate) * gbGate);
+            bytesUp   = n_ff_exp * ((d_model / geUp)   * gbUp);
+            bytesDown = d_model * ((n_ff_exp / geDown) * gbDown);
         }
-        const float* xE    = xComp    + static_cast<std::size_t>(off) * d_model;
-        float*       gateE = gateComp + static_cast<std::size_t>(off) * n_ff_exp;
-        float*       upE   = upComp   + static_cast<std::size_t>(off) * n_ff_exp;
-        float*       downE = downComp + static_cast<std::size_t>(off) * d_model;
+        const auto* const gateBase = static_cast<const std::uint8_t*>(gateExps.usmPtr);
+        const auto* const upBase   = static_cast<const std::uint8_t*>(upExps.usmPtr);
+        const auto* const downBase = static_cast<const std::uint8_t*>(downExps.usmPtr);
 
-        _gmm.matmulAsync(gateExps.type, gateBase + e * bytesGate,
-                         n_ff_exp, d_model, xE, Me, gateE, matmulScratch);
-        _gmm.matmulAsync(upExps.type, upBase + e * bytesUp,
-                         n_ff_exp, d_model, xE, Me, upE, matmulScratch);
-        _ops.siluMulAsync(gateE, upE, Me * n_ff_exp);          // silu(gate)*up
-        _gmm.matmulAsync(downExps.type, downBase + e * bytesDown,
-                         d_model, n_ff_exp, gateE, Me, downE, matmulScratch);
+        // --- one dense GEMM per expert over its M=count[e] grouped rows ----
+        // Each expert weight is read once per 16-row GEMM chunk. Experts with
+        // no routed tokens are skipped (an M=0 launch is pure overhead).
+        for (std::size_t e = 0; e < nExperts; ++e) {
+            const std::int32_t off = _groupOffsetHost[e];
+            const std::int32_t end = _groupOffsetHost[e + 1];
+            const std::size_t  Me  = static_cast<std::size_t>(end - off);
+            if (Me == 0) {
+                continue;
+            }
+            const float* xE    = xComp    + static_cast<std::size_t>(off) * d_model;
+            float*       gateE = gateComp + static_cast<std::size_t>(off) * n_ff_exp;
+            float*       upE   = upComp   + static_cast<std::size_t>(off) * n_ff_exp;
+            float*       downE = downComp + static_cast<std::size_t>(off) * d_model;
+
+            _gmm.matmulAsync(gateExps.type, gateBase + e * bytesGate,
+                             n_ff_exp, d_model, xE, Me, gateE, matmulScratch);
+            _gmm.matmulAsync(upExps.type, upBase + e * bytesUp,
+                             n_ff_exp, d_model, xE, Me, upE, matmulScratch);
+            _ops.siluMulAsync(gateE, upE, Me * n_ff_exp);      // silu(gate)*up
+            _gmm.matmulAsync(downExps.type, downBase + e * bytesDown,
+                             d_model, n_ff_exp, gateE, Me, downE, matmulScratch);
+        }
     }
 
     // --- scatter the grouped output back to token order (routed sum) -------

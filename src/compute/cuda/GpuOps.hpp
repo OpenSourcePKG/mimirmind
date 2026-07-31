@@ -216,6 +216,17 @@ public:
                                   const float* kw, float* accum,
                                   std::size_t dModel, std::size_t T,
                                   std::size_t K) override;
+    void moeGroupTilesAsync(const std::int32_t* expOffset,
+                            std::int32_t* tileExpert, std::int32_t* tileRow0,
+                            std::int32_t* tileRows, std::int32_t* nTiles,
+                            std::size_t nExperts, std::size_t maxTiles,
+                            std::size_t tileM) override;
+    void moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
+                                  float* y, const std::int32_t* tileExpert,
+                                  const std::int32_t* tileRow0,
+                                  const std::int32_t* tileRows,
+                                  std::size_t K, std::size_t N,
+                                  std::size_t maxTiles) override;
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
     void gatherHeadsFromChannelsAsync(const float* src, float* dst,
                                       std::size_t T, std::size_t offset,

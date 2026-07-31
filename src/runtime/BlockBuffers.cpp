@@ -156,6 +156,17 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         b.moeGroupRowKw  = ops.allocate(nRowsMax * sizeof(float));
         b.moeGroupAsnRow = ops.allocate(nRowsMax * sizeof(std::int32_t));
 
+        // M-Cuda.MoeGroup Sub-Step E — tile-schedule scratch. Static upper
+        // bound maxTiles = ceil(nRowsMax/16) + nExperts (16 == the grouped
+        // GEMM's per-block M cap), so the grouped-GEMM grid.y is host-sized.
+        constexpr std::size_t kMoeTileM = 16;
+        const std::size_t maxTiles =
+            (nRowsMax + kMoeTileM - 1) / kMoeTileM + config.expertCount;
+        b.moeGroupTileExpert = ops.allocate(maxTiles * sizeof(std::int32_t));
+        b.moeGroupTileRow0   = ops.allocate(maxTiles * sizeof(std::int32_t));
+        b.moeGroupTileRows   = ops.allocate(maxTiles * sizeof(std::int32_t));
+        b.moeGroupTileCount  = ops.allocate(sizeof(std::int32_t));
+
         // M-MoE.Fused-Decode — routing scratches. `blockCount *
         // expertUsedCount` slots so each layer owns its own K-tuple
         // across the recorded command stream.

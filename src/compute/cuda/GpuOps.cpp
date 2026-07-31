@@ -246,6 +246,12 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _moeGatherRowsKernel;
     core::cuda::CudaModule _moeScatterExpertOutModule;
     core::cuda::CudaKernel _moeScatterExpertOutKernel;
+    // M-Cuda.MoeGroup Sub-Step E — device-driven grouped GEMM (tile schedule
+    // build + single grouped NVFP4 launch; no expOffset D2H).
+    core::cuda::CudaModule _moeGroupTilesModule;
+    core::cuda::CudaKernel _moeGroupTilesKernel;
+    core::cuda::CudaModule _moeGroupedGemmNvfp4Module;
+    core::cuda::CudaKernel _moeGroupedGemmNvfp4Kernel;
 
     explicit Impl(core::cuda::CudaContext& ctx)
         : _rmsnormModule           {loadCudaModule(ctx, "rmsnorm")},
@@ -405,7 +411,14 @@ struct GpuOps::Impl {
               _moeGatherRowsModule.getFunction("moe_gather_rows")},
           _moeScatterExpertOutModule{loadCudaModule(ctx, "moe_scatter_expert_out")},
           _moeScatterExpertOutKernel{
-              _moeScatterExpertOutModule.getFunction("moe_scatter_expert_out")}
+              _moeScatterExpertOutModule.getFunction("moe_scatter_expert_out")},
+          _moeGroupTilesModule     {loadCudaModule(ctx, "moe_group_tiles")},
+          _moeGroupTilesKernel     {
+              _moeGroupTilesModule.getFunction("moe_group_tiles")},
+          _moeGroupedGemmNvfp4Module{
+              loadCudaModule(ctx, "moe_grouped_gemm_nvfp4blk")},
+          _moeGroupedGemmNvfp4Kernel{
+              _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk")}
     {}
 };
 
@@ -1436,6 +1449,55 @@ void GpuOps::moeScatterExpertOutAsync(const float* y, const std::int32_t* asnToR
     k.setValue(5, toInt32(T, "moeScatter T"));
     k.setValue(6, toInt32(K, "moeScatter K"));
     k.launch(_ctx.stream(), static_cast<std::uint32_t>(T), 1, 1, 256, 1, 1);
+}
+
+void GpuOps::moeGroupTilesAsync(const std::int32_t* expOffset,
+                                std::int32_t* tileExpert, std::int32_t* tileRow0,
+                                std::int32_t* tileRows, std::int32_t* nTiles,
+                                std::size_t nExperts, std::size_t maxTiles,
+                                std::size_t tileM) {
+    if (nExperts == 0 || maxTiles == 0) {
+        return;
+    }
+    auto& k = _pimpl->_moeGroupTilesKernel;
+    k.setPtr  (0, expOffset);
+    k.setPtr  (1, tileExpert);
+    k.setPtr  (2, tileRow0);
+    k.setPtr  (3, tileRows);
+    k.setPtr  (4, nTiles);
+    k.setValue(5, toInt32(nExperts, "moeGroupTiles nExperts"));
+    k.setValue(6, toInt32(maxTiles, "moeGroupTiles maxTiles"));
+    k.setValue(7, toInt32(tileM, "moeGroupTiles tileM"));
+    // v1: single thread walks the experts and emits the schedule (see kernel).
+    k.launch(_ctx.stream(), 1, 1, 1, 1, 1, 1);
+}
+
+void GpuOps::moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
+                                      float* y, const std::int32_t* tileExpert,
+                                      const std::int32_t* tileRow0,
+                                      const std::int32_t* tileRows,
+                                      std::size_t K, std::size_t N,
+                                      std::size_t maxTiles) {
+    if (N == 0 || K == 0 || maxTiles == 0) {
+        return;
+    }
+    // Matches matmul_nvfp4blk_gemm's warp layout: 4 output columns per group,
+    // 128 threads/block. grid.x tiles N, grid.y indexes the tile schedule.
+    constexpr std::uint32_t kOutputsPerGroup = 4;
+    constexpr std::uint32_t kLocal           = 128;
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+    auto& k = _pimpl->_moeGroupedGemmNvfp4Kernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, w);
+    k.setPtr  (2, y);
+    k.setPtr  (3, tileExpert);
+    k.setPtr  (4, tileRow0);
+    k.setPtr  (5, tileRows);
+    k.setValue(6, toInt32(K, "moeGroupedGemm K"));
+    k.setValue(7, toInt32(N, "moeGroupedGemm N"));
+    k.launch(_ctx.stream(), nGroups, static_cast<std::uint32_t>(maxTiles), 1,
+             kLocal, 1, 1);
 }
 
 void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
