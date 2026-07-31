@@ -127,6 +127,19 @@ public:
         return _fullAttnDense[blockIdx];
     }
 
+    /// Prefill-only routing hook: when set, the routed-MoE of subsequent
+    /// single-session runBlock(T>1) calls goes through the amortised batched
+    /// fused-K path (runMoeFfnBatched) instead of the per-token runMoeFfn,
+    /// using the caller-provided device routing scratch (expIdx/kw, each sized
+    /// >= T*expertUsedCount). This turns a T-token prefill's MoE from
+    /// O(T) weight re-reads into one batched pass (the TTFT lever). Set before
+    /// a prefillSlot block loop, cleared (nullptr) after — nullptr keeps the
+    /// historical per-token path (single-session generate is unaffected).
+    void setPrefillMoeScratch(std::int32_t* expIdx, float* kw) noexcept {
+        _prefillMoeExpIdx = expIdx;
+        _prefillMoeKw     = kw;
+    }
+
     /// M-Cuda.MTP — one Multi-Token-Prediction draft step. Runs the model's
     /// native nextn module (blk.<blockCount>): eh_proj(concat(RMSNorm(hidden,
     /// hnorm), RMSNorm(embed(prevTok), enorm))) -> block-<mtp> attn+MoE (own
@@ -355,6 +368,11 @@ private:
     // Router scratch, hoisted so steady-state runBlock does no allocation.
     std::vector<std::int32_t> _topKIdx;      // [T*K]
     std::vector<float>        _topKWeight;   // [T*K]
+
+    // Prefill-only MoE routing scratch (device), set via setPrefillMoeScratch.
+    // nullptr => per-token runMoeFfn (the historical single-session path).
+    std::int32_t* _prefillMoeExpIdx{nullptr};
+    float*        _prefillMoeKw{nullptr};
 };
 
 } // namespace mimirmind::runtime::arch

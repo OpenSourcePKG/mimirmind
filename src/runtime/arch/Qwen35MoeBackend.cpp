@@ -377,7 +377,17 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
                       _config.rmsNormEps, normBuf);
 
     trace("MoE FFN");
-    runMoeFfn(blockIdx, normBuf, T, s);
+    // Prefill (T>1) routes the routed-MoE through the amortised batched
+    // fused-K path when prefill routing scratch is set (setPrefillMoeScratch),
+    // turning O(T) per-token expert-weight re-reads into one batched pass.
+    // runMoeFfnBatched falls back internally to runMoeFfn for unsupported
+    // expert layouts. nullptr scratch => the historical per-token path
+    // (single-session generate is unaffected).
+    if (_prefillMoeExpIdx != nullptr && T > 1) {
+        runMoeFfnBatched(blockIdx, normBuf, T, _prefillMoeExpIdx, _prefillMoeKw, s);
+    } else {
+        runMoeFfn(blockIdx, normBuf, T, s);
+    }
 
     trace("ffn residual");
     _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), T * d_model);
@@ -711,7 +721,17 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
                       static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
 
     trace("MoE FFN");
-    runMoeFfn(blockIdx, normBuf, T, s);
+    // Prefill (T>1) routes the routed-MoE through the amortised batched
+    // fused-K path when prefill routing scratch is set (setPrefillMoeScratch),
+    // turning O(T) per-token expert-weight re-reads into one batched pass.
+    // runMoeFfnBatched falls back internally to runMoeFfn for unsupported
+    // expert layouts. nullptr scratch => the historical per-token path
+    // (single-session generate is unaffected).
+    if (_prefillMoeExpIdx != nullptr && T > 1) {
+        runMoeFfnBatched(blockIdx, normBuf, T, _prefillMoeExpIdx, _prefillMoeKw, s);
+    } else {
+        runMoeFfn(blockIdx, normBuf, T, s);
+    }
 
     trace("ffn residual");
     _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), T * d_model);

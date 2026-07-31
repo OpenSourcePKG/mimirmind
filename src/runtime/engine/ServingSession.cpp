@@ -80,6 +80,10 @@ struct ServingState {
     std::optional<BlockBuffers> sbPrefill;     // maxT = prefillChunk
     compute::ComputeBuffer      xBufP;         // [prefillChunk, d_model]
     std::vector<std::int32_t>   prefillTokH;   // [prefillChunk] host token staging
+    // Device MoE routing scratch for the amortised batched-fused-K MoE the
+    // prefill forwards use (runMoeFfnBatched via setPrefillMoeScratch).
+    compute::ComputeBuffer      prefillExpIdx; // [prefillChunk * expertUsedCount]
+    compute::ComputeBuffer      prefillKw;     // [prefillChunk * expertUsedCount]
 
     // ---- Increment E1: MTP batched-verify scratch (lazily sized) --------
     // Sized for up to `maxBatch` slots × (verifyDepth + 1) verify tokens =
@@ -576,6 +580,8 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
             // the per-layer stride matches stepServing's slab layout.
             st->sbPrefill->ssmSlabNSeq = st->ssm->nSeq();
             st->xBufP = _e._ops->allocate(chunk * st->d_model * sizeof(float));
+            st->prefillExpIdx = _e._ops->allocate(chunk * K * sizeof(std::int32_t));
+            st->prefillKw     = _e._ops->allocate(chunk * K * sizeof(float));
             st->prefillTokH.resize(chunk);
             MM_LOG_INFO("serving",
                         "chunked prefill ENABLED (chunk={}) — prompts prefill "
@@ -762,9 +768,16 @@ std::int32_t ServingSession::prefillSlot(
     // targets this slot's SSM slab slice. runLinearBlock zeroes the recurrent
     // + conv state only when cache.length() == 0 (startPos == 0 == the
     // request's first chunk), so multi-chunk prefill carries state forward.
+    // Route this prefill forward's routed-MoE through the amortised batched
+    // fused-K path (one pass over the T tokens) instead of the per-token
+    // runMoeFfn — the prefill TTFT lever. Cleared after the loop so
+    // single-session paths keep the per-token MoE.
+    st.qb->setPrefillMoeScratch(st.prefillExpIdx.as<std::int32_t>(),
+                                st.prefillKw.as<float>());
     for (std::size_t b = 0; b < st.blockCount; ++b) {
         st.qb->runBlock(b, xBuf, T, view, sb, /*traceBlock0=*/false);
     }
+    st.qb->setPrefillMoeScratch(nullptr, nullptr);
 
     std::int32_t firstTok = -1;
     if (produceToken) {
