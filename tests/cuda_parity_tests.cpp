@@ -1789,6 +1789,7 @@ void checkMoeGroupParity(std::size_t T, std::size_t nExperts, std::size_t K,
     }
     std::vector<std::int32_t> refRowTok(R, 0);
     std::vector<float>        refRowKw(R, 0.0f);
+    std::vector<std::int32_t> refAsnToRow(R, -1);
     {
         std::vector<std::int32_t> cursor(refOffset.begin(),
                                          refOffset.begin() + nExperts);
@@ -1797,6 +1798,7 @@ void checkMoeGroupParity(std::size_t T, std::size_t nExperts, std::size_t K,
             const std::int32_t pos = cursor[e]++;
             refRowTok[pos] = static_cast<std::int32_t>(i / K);
             refRowKw[pos]  = kw[i];
+            refAsnToRow[i] = pos;
         }
     }
 
@@ -1806,21 +1808,24 @@ void checkMoeGroupParity(std::size_t T, std::size_t nExperts, std::size_t K,
     auto dOffset = ops.allocate((nExperts + 1) * sizeof(std::int32_t));
     auto dRowTok = ops.allocate(R * sizeof(std::int32_t));
     auto dRowKw  = ops.allocate(R * sizeof(float));
+    auto dAsnRow = ops.allocate(R * sizeof(std::int32_t));
 
     kern.setPtr  (0, dExpIdx.get());
     kern.setPtr  (1, dKw.get());
     kern.setPtr  (2, dOffset.get());
     kern.setPtr  (3, dRowTok.get());
     kern.setPtr  (4, dRowKw.get());
-    kern.setValue(5, static_cast<std::int32_t>(R));
-    kern.setValue(6, static_cast<std::int32_t>(nExperts));
-    kern.setValue(7, static_cast<std::int32_t>(K));
+    kern.setPtr  (5, dAsnRow.get());
+    kern.setValue(6, static_cast<std::int32_t>(R));
+    kern.setValue(7, static_cast<std::int32_t>(nExperts));
+    kern.setValue(8, static_cast<std::int32_t>(K));
     kern.launch(ctx.stream(), 1, 1, 1, 1, 1, 1);
     ops.flush();
 
     auto gotOffset = fromDeviceI32(ops, dOffset.get(), nExperts + 1);
     auto gotRowTok = fromDeviceI32(ops, dRowTok.get(), R);
     auto gotRowKw  = fromDevice   (ops, dRowKw.get(),  R);
+    auto gotAsnRow = fromDeviceI32(ops, dAsnRow.get(), R);
 
     for (std::size_t e = 0; e <= nExperts; ++e) {
         EXPECT_EQ(gotOffset[e], refOffset[e]);
@@ -1829,6 +1834,12 @@ void checkMoeGroupParity(std::size_t T, std::size_t nExperts, std::size_t K,
     for (std::size_t r = 0; r < R; ++r) {
         EXPECT_EQ(gotRowTok[r], refRowTok[r]);
         EXPECT_NEAR(gotRowKw[r], refRowKw[r], 0.0f);
+    }
+    // Inverse-permutation consistency: asnToRow is a bijection [0,R) and
+    // rowSrcTok[asnToRow[i]] == i/K (the assignment's source token).
+    for (std::size_t i = 0; i < R; ++i) {
+        EXPECT_EQ(gotAsnRow[i], refAsnToRow[i]);
+        EXPECT_EQ(gotRowTok[gotAsnRow[i]], static_cast<std::int32_t>(i / K));
     }
     std::printf("[moe-group-build] T=%zu nExp=%zu K=%zu R=%zu OK\n",
                 T, nExperts, K, R);
@@ -1847,6 +1858,112 @@ TEST(cuda_moe_group_build_parity_small) {
 
 TEST(cuda_moe_group_build_parity_single_token) {
     checkMoeGroupParity(/*T=*/1, /*nExperts=*/128, /*K=*/8, 0x5EEDu);
+}
+
+// M-Cuda.MoeGroup Sub-Step B — moe_gather_rows: xCompact[r]=x[rowSrcTok[r]].
+TEST(cuda_moe_gather_rows_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    ::mimirmind::core::cuda::CudaModule mod =
+        ::mimirmind::core::cuda::CudaModule::fromFile(ctx.cudaContext(),
+                                                      resolvePtx("moe_gather_rows"));
+    ::mimirmind::core::cuda::CudaKernel kern = mod.getFunction("moe_gather_rows");
+
+    const std::size_t T = 40, dModel = 384, R = 300;
+    auto Xh = randVec(T * dModel, 0x0A11u);
+    Lcg g{0xBADu};
+    std::vector<std::int32_t> rowSrcTok(R);
+    for (auto& v : rowSrcTok) {
+        v = static_cast<std::int32_t>(((g.s = g.s * 1664525u + 1013904223u) >> 9) % T);
+    }
+
+    auto dX   = toDevice(ops, Xh);
+    auto dTok = uploadRaw(ops, rowSrcTok);
+    auto dOut = ops.allocate(R * dModel * sizeof(float));
+    kern.setPtr  (0, dX.get());
+    kern.setPtr  (1, dTok.get());
+    kern.setPtr  (2, dOut.get());
+    kern.setValue(3, static_cast<std::int32_t>(dModel));
+    kern.setValue(4, static_cast<std::int32_t>(R));
+    kern.launch(ctx.stream(), static_cast<std::uint32_t>(R), 1, 1, 256, 1, 1);
+    ops.flush();
+    auto got = fromDevice(ops, dOut.get(), R * dModel);
+
+    for (std::size_t r = 0; r < R; ++r) {
+        const std::size_t t = static_cast<std::size_t>(rowSrcTok[r]);
+        for (std::size_t j = 0; j < dModel; ++j) {
+            EXPECT_EQ(got[r * dModel + j], Xh[t * dModel + j]);
+        }
+    }
+    std::printf("[moe-gather] T=%zu d=%zu R=%zu OK\n", T, dModel, R);
+}
+
+// M-Cuda.MoeGroup Sub-Step C — moe_scatter_expert_out deterministic fold.
+//   accum[t] = sum_k kw[t*K+k] * y[asnToRow[t*K+k]]
+// asnToRow is a bijection [0,R); the CPU golden folds in the same fixed k
+// order, so the match is exact (not just within fp tolerance).
+TEST(cuda_moe_scatter_expert_out_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    ::mimirmind::core::cuda::CudaModule mod =
+        ::mimirmind::core::cuda::CudaModule::fromFile(ctx.cudaContext(),
+                                                      resolvePtx("moe_scatter_expert_out"));
+    ::mimirmind::core::cuda::CudaKernel kern =
+        mod.getFunction("moe_scatter_expert_out");
+
+    const std::size_t T = 32, K = 8, dModel = 256, R = T * K;
+    auto Yh  = randVec(R * dModel, 0x5CA7u);
+    auto kwh = randVec(R, 0x42u);
+    // Deterministic Fisher-Yates permutation of [0,R): asnToRow[i] = perm[i].
+    std::vector<std::int32_t> asnToRow(R);
+    for (std::size_t i = 0; i < R; ++i) {
+        asnToRow[i] = static_cast<std::int32_t>(i);
+    }
+    Lcg g{0xF15Eu};
+    for (std::size_t i = R; i > 1; --i) {
+        g.s = g.s * 1664525u + 1013904223u;
+        const std::size_t j = (g.s >> 8) % i;
+        std::swap(asnToRow[i - 1], asnToRow[j]);
+    }
+
+    // CPU golden (same fixed k order as the kernel).
+    std::vector<float> ref(T * dModel, 0.0f);
+    for (std::size_t t = 0; t < T; ++t) {
+        for (std::size_t d = 0; d < dModel; ++d) {
+            float acc = 0.0f;
+            for (std::size_t k = 0; k < K; ++k) {
+                const std::int32_t row = asnToRow[t * K + k];
+                acc += kwh[t * K + k] * Yh[static_cast<std::size_t>(row) * dModel + d];
+            }
+            ref[t * dModel + d] = acc;
+        }
+    }
+
+    auto dY   = toDevice(ops, Yh);
+    auto dRow = uploadRaw(ops, asnToRow);
+    auto dKw  = toDevice(ops, kwh);
+    auto dAcc = ops.allocate(T * dModel * sizeof(float));
+    kern.setPtr  (0, dY.get());
+    kern.setPtr  (1, dRow.get());
+    kern.setPtr  (2, dKw.get());
+    kern.setPtr  (3, dAcc.get());
+    kern.setValue(4, static_cast<std::int32_t>(dModel));
+    kern.setValue(5, static_cast<std::int32_t>(T));
+    kern.setValue(6, static_cast<std::int32_t>(K));
+    kern.launch(ctx.stream(), static_cast<std::uint32_t>(T), 1, 1, 256, 1, 1);
+    ops.flush();
+    auto got = fromDevice(ops, dAcc.get(), T * dModel);
+
+    double maxErr = 0.0;
+    for (std::size_t i = 0; i < T * dModel; ++i) {
+        maxErr = std::max(maxErr,
+            std::fabs(static_cast<double>(got[i]) - static_cast<double>(ref[i])));
+        // Tolerance, not exact: nvcc contracts kw*y+acc into FMA; the host
+        // reference may not, so the two can differ by ~1 ULP per fold step.
+        EXPECT_NEAR(got[i], ref[i], 1e-4f);
+    }
+    std::printf("[moe-scatter] T=%zu K=%zu d=%zu R=%zu maxErr=%.2e OK\n",
+                T, K, dModel, R, maxErr);
 }
 
 int main() {

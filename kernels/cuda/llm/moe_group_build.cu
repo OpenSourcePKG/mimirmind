@@ -19,7 +19,12 @@
 //   rowSrcTok[r]   = source token t of compacted row r  (= assignment/K)
 //                    -> gather x[rowSrcTok[r]] into the compact activation buf
 //   rowKw[r]       = router weight of compacted row r    (post-wScale, from kw)
-//                    -> applied on the scatter-add back into the accumulator
+//                    -> applied on the scatter back into the accumulator
+//   asnToRow[i]    = compacted row of assignment i (= t*K+k); the INVERSE
+//                    permutation. -1 for a dropped (malformed) assignment.
+//                    -> lets the scatter run token-major (for k: asnToRow[t*K+k])
+//                       so the K contributions of a token accumulate in a
+//                       fixed order — deterministic, no atomics.
 // Expert e owns rows [expOffset[e], expOffset[e+1]); the weight to use for
 // that range is expert e itself (groups are dense and index-ordered).
 //
@@ -47,6 +52,7 @@ extern "C" __global__ void moe_group_build(
           int*   __restrict__ expOffset,  // [nExperts+1]  out: exclusive prefix sum
           int*   __restrict__ rowSrcTok,  // [R]           out: source token per compacted row
           float* __restrict__ rowKw,      // [R]           out: router weight per compacted row
+          int*   __restrict__ asnToRow,   // [R]           out: inverse perm (assignment -> row)
     const int                 R,          //               total assignments = T*K
     const int                 nExperts,
     const int                 K)
@@ -88,6 +94,9 @@ extern "C" __global__ void moe_group_build(
         cursor[e] = expOffset[e];
     }
     for (int i = 0; i < R; ++i) {
+        asnToRow[i] = -1;                            // default: dropped
+    }
+    for (int i = 0; i < R; ++i) {
         int e = expIdx[i];
         if (e < 0 || e >= nE) {
             continue;
@@ -95,5 +104,6 @@ extern "C" __global__ void moe_group_build(
         const int pos     = cursor[e]++;
         rowSrcTok[pos]    = (K > 0) ? (i / K) : 0;   // assignment i -> token t
         rowKw[pos]        = kw[i];
+        asnToRow[i]       = pos;                      // inverse permutation
     }
 }

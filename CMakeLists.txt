@@ -660,6 +660,8 @@ if(MIMIRMIND_ENABLE_CUDA)
     set(CUDA_KERNEL_SOURCES
         kernels/cuda/llm/moe_topk.cu
         kernels/cuda/llm/moe_group_build.cu
+        kernels/cuda/llm/moe_gather_rows.cu
+        kernels/cuda/llm/moe_scatter_expert_out.cu
         kernels/cuda/llm/cuda_probe_kernel.cu
         kernels/cuda/llm/attention_paged_v1.cu
         kernels/cuda/llm/attention_paged_v2.cu
