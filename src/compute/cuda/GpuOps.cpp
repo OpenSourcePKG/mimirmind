@@ -238,6 +238,15 @@ struct GpuOps::Impl {
     core::cuda::CudaModule _gatherHeadsModule;
     core::cuda::CudaKernel _gatherHeadsKernel;
 
+    // M-Cuda.MoeGroup — grouped-by-expert MoE prefill (token grouping build,
+    // row gather, deterministic expert-output scatter).
+    core::cuda::CudaModule _moeGroupBuildModule;
+    core::cuda::CudaKernel _moeGroupBuildKernel;
+    core::cuda::CudaModule _moeGatherRowsModule;
+    core::cuda::CudaKernel _moeGatherRowsKernel;
+    core::cuda::CudaModule _moeScatterExpertOutModule;
+    core::cuda::CudaKernel _moeScatterExpertOutKernel;
+
     explicit Impl(core::cuda::CudaContext& ctx)
         : _rmsnormModule           {loadCudaModule(ctx, "rmsnorm")},
           _rmsnormKernel           {_rmsnormModule.getFunction("rmsnorm")},
@@ -387,7 +396,16 @@ struct GpuOps::Impl {
               _sigmoidInplaceModule.getFunction("sigmoid_inplace")},
           _gatherHeadsModule       {loadCudaModule(ctx, "gather_heads_from_channels")},
           _gatherHeadsKernel       {
-              _gatherHeadsModule.getFunction("gather_heads_from_channels")}
+              _gatherHeadsModule.getFunction("gather_heads_from_channels")},
+          _moeGroupBuildModule     {loadCudaModule(ctx, "moe_group_build")},
+          _moeGroupBuildKernel     {
+              _moeGroupBuildModule.getFunction("moe_group_build")},
+          _moeGatherRowsModule     {loadCudaModule(ctx, "moe_gather_rows")},
+          _moeGatherRowsKernel     {
+              _moeGatherRowsModule.getFunction("moe_gather_rows")},
+          _moeScatterExpertOutModule{loadCudaModule(ctx, "moe_scatter_expert_out")},
+          _moeScatterExpertOutKernel{
+              _moeScatterExpertOutModule.getFunction("moe_scatter_expert_out")}
     {}
 };
 
@@ -1363,6 +1381,61 @@ void GpuOps::moeTopKRouteDeviceAsync(const float* logits, std::int32_t* outIdx,
                                      std::size_t nExperts, std::size_t K,
                                      float wScale) {
     _moeTopKRoute.launch(logits, outIdx, outWeight, T, nExperts, K, wScale);
+}
+
+void GpuOps::moeGroupBuildAsync(const std::int32_t* expIdx, const float* kw,
+                                std::int32_t* expOffset, std::int32_t* rowSrcTok,
+                                float* rowKw, std::int32_t* asnToRow,
+                                std::size_t R, std::size_t nExperts,
+                                std::size_t K) {
+    if (R == 0 || nExperts == 0) {
+        return;
+    }
+    auto& k = _pimpl->_moeGroupBuildKernel;
+    k.setPtr  (0, expIdx);
+    k.setPtr  (1, kw);
+    k.setPtr  (2, expOffset);
+    k.setPtr  (3, rowSrcTok);
+    k.setPtr  (4, rowKw);
+    k.setPtr  (5, asnToRow);
+    k.setValue(6, toInt32(R, "moeGroupBuild R"));
+    k.setValue(7, toInt32(nExperts, "moeGroupBuild nExperts"));
+    k.setValue(8, toInt32(K, "moeGroupBuild K"));
+    // v1: single thread does the whole counting-sort build (see kernel).
+    k.launch(_ctx.stream(), 1, 1, 1, 1, 1, 1);
+}
+
+void GpuOps::moeGatherRowsAsync(const float* x, const std::int32_t* rowSrcTok,
+                                float* xCompact, std::size_t dModel,
+                                std::size_t R) {
+    if (R == 0 || dModel == 0) {
+        return;
+    }
+    auto& k = _pimpl->_moeGatherRowsKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, rowSrcTok);
+    k.setPtr  (2, xCompact);
+    k.setValue(3, toInt32(dModel, "moeGatherRows dModel"));
+    k.setValue(4, toInt32(R, "moeGatherRows R"));
+    k.launch(_ctx.stream(), static_cast<std::uint32_t>(R), 1, 1, 256, 1, 1);
+}
+
+void GpuOps::moeScatterExpertOutAsync(const float* y, const std::int32_t* asnToRow,
+                                      const float* kw, float* accum,
+                                      std::size_t dModel, std::size_t T,
+                                      std::size_t K) {
+    if (T == 0 || dModel == 0) {
+        return;
+    }
+    auto& k = _pimpl->_moeScatterExpertOutKernel;
+    k.setPtr  (0, y);
+    k.setPtr  (1, asnToRow);
+    k.setPtr  (2, kw);
+    k.setPtr  (3, accum);
+    k.setValue(4, toInt32(dModel, "moeScatter dModel"));
+    k.setValue(5, toInt32(T, "moeScatter T"));
+    k.setValue(6, toInt32(K, "moeScatter K"));
+    k.launch(_ctx.stream(), static_cast<std::uint32_t>(T), 1, 1, 256, 1, 1);
 }
 
 void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {

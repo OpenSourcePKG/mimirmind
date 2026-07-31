@@ -69,6 +69,11 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
       _ops{ops}, _gmm{gmm}, _op{opProfiler},
       _moeGroupEnabled{moeGroupEnabled},
       _moeFusedDownEnabled{moeFusedDownEnabled} {
+    if (const char* g = std::getenv("MIMIRMIND_GROUPED_MOE")) {
+        // Opt-in only (default off — grouped Option 1 is slower than fused-K
+        // batched on GB10, see _moeGroupedPrefill). "1" enables it.
+        _moeGroupedPrefill = (g[0] == '1' && g[1] == '\0');
+    }
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     if (const char* d = std::getenv("MIMIRMIND_SSM_DUMP")) {
         _ssmDump    = true;
@@ -384,7 +389,13 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     // expert layouts. nullptr scratch => the historical per-token path
     // (single-session generate is unaffected).
     if (_prefillMoeExpIdx != nullptr && T > 1) {
-        runMoeFfnBatched(blockIdx, normBuf, T, _prefillMoeExpIdx, _prefillMoeKw, s);
+        if (_moeGroupedPrefill) {
+            runMoeFfnGrouped(blockIdx, normBuf, T, _prefillMoeExpIdx,
+                             _prefillMoeKw, s);
+        } else {
+            runMoeFfnBatched(blockIdx, normBuf, T, _prefillMoeExpIdx,
+                             _prefillMoeKw, s);
+        }
     } else {
         runMoeFfn(blockIdx, normBuf, T, s);
     }
@@ -728,7 +739,13 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     // expert layouts. nullptr scratch => the historical per-token path
     // (single-session generate is unaffected).
     if (_prefillMoeExpIdx != nullptr && T > 1) {
-        runMoeFfnBatched(blockIdx, normBuf, T, _prefillMoeExpIdx, _prefillMoeKw, s);
+        if (_moeGroupedPrefill) {
+            runMoeFfnGrouped(blockIdx, normBuf, T, _prefillMoeExpIdx,
+                             _prefillMoeKw, s);
+        } else {
+            runMoeFfnBatched(blockIdx, normBuf, T, _prefillMoeExpIdx,
+                             _prefillMoeKw, s);
+        }
     } else {
         runMoeFfn(blockIdx, normBuf, T, s);
     }
@@ -1230,6 +1247,183 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
                          gateOutBuf, nSeq, expertOutBuf, matmulScratch);
 
         // Scalar gate per token: [nSeq, 1] -> sigmoid -> broadcast multiply.
+        float* const gateScalar = s.scoreScratch.as<float>();
+        _gmm.matmulAsync(routerSh.type, routerSh.usmPtr, 1, d_model,
+                         moeInput, nSeq, gateScalar, matmulScratch);
+        _ops.sigmoidGateMulAsync(expertOutBuf, gateScalar, nSeq, d_model,
+                                 /*gateDim=*/1);
+
+        _ops.addResidualAsync(moeAccumBuf, expertOutBuf, nSeq * d_model);
+    }
+}
+
+void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
+                                        const float*   moeInput,
+                                        std::size_t    nSeq,
+                                        std::int32_t*  expIdxSlot,
+                                        float*         kwSlot,
+                                        BlockBuffers&  s) {
+    const auto& w = _weights;
+
+    // Same layout gate as runMoeFfnBatched: SEPARATE gate/up + down banks the
+    // fused-K kernels support. Anything else -> fall back to the generic
+    // per-token runMoeFfn (which routes via _topKIdx, so expIdxSlot/kwSlot are
+    // unused there).
+    const auto* gateUpFused = w.findBlock(blockIdx, "ffn_gate_up_exps.weight");
+    const auto* gExps = w.findBlock(blockIdx, "ffn_gate_exps.weight");
+    const auto* uExps = w.findBlock(blockIdx, "ffn_up_exps.weight");
+    const auto* dExps = w.findBlock(blockIdx, "ffn_down_exps.weight");
+    if (gateUpFused != nullptr || gExps == nullptr || uExps == nullptr ||
+        dExps == nullptr || gExps->dimensions.size() < 3) {
+        (void)expIdxSlot; (void)kwSlot;
+        runMoeFfn(blockIdx, moeInput, nSeq, s);
+        return;
+    }
+
+    const auto& routerW  = requireBlock(w, blockIdx, "ffn_gate_inp.weight");
+    const auto& gateExps = *gExps;
+    const auto& upExps   = *uExps;
+    const auto& downExps = *dExps;
+
+    const std::size_t d_model  = s.d_model;
+    const std::size_t nExperts = _config.expertCount;
+    const std::size_t K        = _config.expertUsedCount;
+    const std::size_t n_ff_exp = gateExps.dimensions[1];
+    const std::size_t R        = nSeq * K;
+
+    // Block alignment / type support identical to the batched path; on a
+    // mismatch fall back to the generic per-token path rather than throw.
+    const bool downOk =
+        downExps.type == core::gguf::GgmlType::Q5_K ||
+        downExps.type == core::gguf::GgmlType::Q6_K ||
+        downExps.type == core::gguf::GgmlType::NVFP4_BLK ||
+        downExps.type == core::gguf::GgmlType::BF16;
+    const std::size_t blkAlign =
+        (gateExps.type == core::gguf::GgmlType::NVFP4_BLK) ? 32 : 256;
+    if (!_gmm.moeGateUpFusedKAvailable(gateExps.type) || !downOk ||
+        gateExps.type != upExps.type ||
+        (d_model % blkAlign != 0) || (n_ff_exp % blkAlign != 0)) {
+        runMoeFfn(blockIdx, moeInput, nSeq, s);
+        return;
+    }
+
+    float* const upOutBuf      = s.upOut.as<float>();
+    float* const matmulScratch = s.matmulScratch.as<float>();
+    float* const moeAccumBuf   = s.moeAccumBuf.as<float>();
+    float* const gateOutBuf    = s.gateOut.as<float>();
+
+    float* const xComp    = s.moeXCompact.as<float>();
+    float* const gateComp = s.moeGateCompact.as<float>();
+    float* const upComp   = s.moeUpCompact.as<float>();
+    float* const downComp = s.moeDownCompact.as<float>();
+
+    auto* const expOffset = s.moeGroupOffset.as<std::int32_t>();
+    auto* const rowSrcTok = s.moeGroupRowTok.as<std::int32_t>();
+    float* const rowKw    = s.moeGroupRowKw.as<float>();
+    auto* const asnToRow  = s.moeGroupAsnRow.as<std::int32_t>();
+
+    // --- router + device top-K straight into the caller's USM slots --------
+    const float wScale = (_config.expertWeightsScale != 0.0F)
+                             ? _config.expertWeightsScale : 1.0F;
+    _gmm.matmulAsync(routerW.type, routerW.usmPtr, nExperts, d_model,
+                     moeInput, nSeq, upOutBuf, matmulScratch);
+    _ops.moeTopKRouteDeviceAsync(upOutBuf, expIdxSlot, kwSlot,
+                                 nSeq, nExperts, K, wScale);
+
+    // --- group the T*K assignments by expert (device counting sort) --------
+    _ops.moeGroupBuildAsync(expIdxSlot, kwSlot, expOffset, rowSrcTok, rowKw,
+                            asnToRow, R, nExperts, K);
+
+    // The per-expert launch bounds are the only thing that must cross to the
+    // host — one small D2H (nExperts+1 ints) per MoE layer. Routing, gather
+    // and scatter all stay on the device.
+    _groupOffsetHost.resize(nExperts + 1);
+    _ops.flush();
+    _ops.readbackToHost(_groupOffsetHost.data(), expOffset,
+                        (nExperts + 1) * sizeof(std::int32_t));
+
+    // --- gather activations into per-expert-contiguous rows ----------------
+    _ops.moeGatherRowsAsync(moeInput, rowSrcTok, xComp, d_model, R);
+
+    // Per-expert byte strides (separate banks, one block per expert).
+    std::size_t bytesGate = 0, bytesUp = 0, bytesDown = 0;
+    if (gateExps.type == core::gguf::GgmlType::BF16) {
+        bytesGate = n_ff_exp * d_model * sizeof(std::uint16_t);
+        bytesUp   = n_ff_exp * d_model * sizeof(std::uint16_t);
+        bytesDown = d_model * n_ff_exp * sizeof(std::uint16_t);
+    } else {
+        const auto [geGate, gbGate] = moeBlockGeom(gateExps.type);
+        const auto [geUp,   gbUp]   = moeBlockGeom(upExps.type);
+        const auto [geDown, gbDown] = moeBlockGeom(downExps.type);
+        if (geGate == 0 || geUp == 0 || geDown == 0) {
+            throw std::runtime_error(
+                "Qwen35MoeBackend::runMoeFfnGrouped: expert weight type(s) not "
+                "in QuantType registry");
+        }
+        bytesGate = n_ff_exp * ((d_model / geGate) * gbGate);
+        bytesUp   = n_ff_exp * ((d_model / geUp)   * gbUp);
+        bytesDown = d_model * ((n_ff_exp / geDown) * gbDown);
+    }
+    const auto* const gateBase = static_cast<const std::uint8_t*>(gateExps.usmPtr);
+    const auto* const upBase   = static_cast<const std::uint8_t*>(upExps.usmPtr);
+    const auto* const downBase = static_cast<const std::uint8_t*>(downExps.usmPtr);
+
+    // --- one dense GEMM per expert over its M=count[e] grouped rows --------
+    // Each expert weight is read once per 16-row GEMM chunk (matmulAsync M>1),
+    // vs the fused-K path's once per (token, expert). Experts with no routed
+    // tokens are skipped (an M=0 launch is pure overhead).
+    for (std::size_t e = 0; e < nExperts; ++e) {
+        const std::int32_t off = _groupOffsetHost[e];
+        const std::int32_t end = _groupOffsetHost[e + 1];
+        const std::size_t  Me  = static_cast<std::size_t>(end - off);
+        if (Me == 0) {
+            continue;
+        }
+        const float* xE    = xComp    + static_cast<std::size_t>(off) * d_model;
+        float*       gateE = gateComp + static_cast<std::size_t>(off) * n_ff_exp;
+        float*       upE   = upComp   + static_cast<std::size_t>(off) * n_ff_exp;
+        float*       downE = downComp + static_cast<std::size_t>(off) * d_model;
+
+        _gmm.matmulAsync(gateExps.type, gateBase + e * bytesGate,
+                         n_ff_exp, d_model, xE, Me, gateE, matmulScratch);
+        _gmm.matmulAsync(upExps.type, upBase + e * bytesUp,
+                         n_ff_exp, d_model, xE, Me, upE, matmulScratch);
+        _ops.siluMulAsync(gateE, upE, Me * n_ff_exp);          // silu(gate)*up
+        _gmm.matmulAsync(downExps.type, downBase + e * bytesDown,
+                         d_model, n_ff_exp, gateE, Me, downE, matmulScratch);
+    }
+
+    // --- scatter the grouped output back to token order (routed sum) -------
+    // Overwrites moeAccumBuf (no pre-zero needed); the shared expert is added
+    // after, exactly as runMoeFfnBatched does.
+    _ops.moeScatterExpertOutAsync(downComp, asnToRow, kwSlot, moeAccumBuf,
+                                  d_model, nSeq, K);
+
+    // --- shared expert (always-on) + sigmoid gate — identical to batched ---
+    const auto* upShexp = w.findBlock(blockIdx, "ffn_up_shexp.weight");
+    if (upShexp != nullptr) {
+        const auto& gateShexp = requireBlock(w, blockIdx, "ffn_gate_shexp.weight");
+        const auto& downShexp = requireBlock(w, blockIdx, "ffn_down_shexp.weight");
+        const auto& routerSh  = requireBlock(w, blockIdx, "ffn_gate_inp_shexp.weight");
+        const std::size_t n_ff_shexp = gateShexp.dimensions.size() >= 2
+                                           ? gateShexp.dimensions[1] : 0;
+        if (n_ff_shexp == 0) {
+            throw std::runtime_error(
+                "Qwen35MoeBackend::runMoeFfnGrouped: ffn_gate_shexp has "
+                "unexpected shape");
+        }
+        float* const expertOutBuf = s.expertOutBuf.as<float>();
+        {
+            compute::UnorderedScope u{_ops};
+            _gmm.matmulAsync(gateShexp.type, gateShexp.usmPtr, n_ff_shexp, d_model,
+                             moeInput, nSeq, gateOutBuf, matmulScratch);
+            _gmm.matmulAsync(upShexp->type, upShexp->usmPtr, n_ff_shexp, d_model,
+                             moeInput, nSeq, upOutBuf, matmulScratch);
+        }
+        _ops.siluMulAsync(gateOutBuf, upOutBuf, nSeq * n_ff_shexp);
+        _gmm.matmulAsync(downShexp.type, downShexp.usmPtr, d_model, n_ff_shexp,
+                         gateOutBuf, nSeq, expertOutBuf, matmulScratch);
+
         float* const gateScalar = s.scoreScratch.as<float>();
         _gmm.matmulAsync(routerSh.type, routerSh.usmPtr, 1, d_model,
                          moeInput, nSeq, gateScalar, matmulScratch);

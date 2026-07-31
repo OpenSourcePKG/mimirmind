@@ -348,6 +348,41 @@ public:
             "moeTopKRouteDeviceAsync: not supported on this backend");
     }
 
+    /// M-Cuda.MoeGroup: grouped-by-expert MoE prefill building blocks. Turns
+    /// flat per-assignment routing (expIdx/kw, R=T*K) into an offset table +
+    /// permutation so each expert weight is read once (moeGroupBuildAsync),
+    /// gathers the per-expert-grouped activations (moeGatherRowsAsync), and
+    /// folds the grouped GEMM output back to token order with router weights
+    /// (moeScatterExpertOutAsync). Default: unsupported; CUDA overrides.
+    /// See kernels/cuda/llm/moe_group_build.cu et al. for the exact contracts.
+    virtual void moeGroupBuildAsync(const std::int32_t* expIdx, const float* kw,
+                                    std::int32_t* expOffset,
+                                    std::int32_t* rowSrcTok, float* rowKw,
+                                    std::int32_t* asnToRow, std::size_t R,
+                                    std::size_t nExperts, std::size_t K) {
+        (void)expIdx; (void)kw; (void)expOffset; (void)rowSrcTok; (void)rowKw;
+        (void)asnToRow; (void)R; (void)nExperts; (void)K;
+        throw std::runtime_error(
+            "moeGroupBuildAsync: not supported on this backend");
+    }
+    virtual void moeGatherRowsAsync(const float* x, const std::int32_t* rowSrcTok,
+                                    float* xCompact, std::size_t dModel,
+                                    std::size_t R) {
+        (void)x; (void)rowSrcTok; (void)xCompact; (void)dModel; (void)R;
+        throw std::runtime_error(
+            "moeGatherRowsAsync: not supported on this backend");
+    }
+    virtual void moeScatterExpertOutAsync(const float* y,
+                                          const std::int32_t* asnToRow,
+                                          const float* kw, float* accum,
+                                          std::size_t dModel, std::size_t T,
+                                          std::size_t K) {
+        (void)y; (void)asnToRow; (void)kw; (void)accum;
+        (void)dModel; (void)T; (void)K;
+        throw std::runtime_error(
+            "moeScatterExpertOutAsync: not supported on this backend");
+    }
+
     /// M-CLR.MoE Increment 2: device-indexed fused gate+up projection for
     /// Gemma 4 MoE T=1 decode. Reads the router pick `expIdx[k]` on the
     /// device (no host round-trip on the routing) and folds the per-expert

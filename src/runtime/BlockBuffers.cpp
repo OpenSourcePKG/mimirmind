@@ -147,6 +147,15 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         b.moeUpCompact   = ops.allocate(gateBytes);
         b.moeDownCompact = ops.allocate(xBytes);
 
+        // M-Cuda.MoeGroup — device token-grouping outputs (moe_group_build):
+        // per-expert row-range offsets + the row->token / assignment->row
+        // permutation the grouped GEMM gather/scatter consume. Sized on the
+        // same worst-case nRowsMax as the compact activation scratch.
+        b.moeGroupOffset = ops.allocate((config.expertCount + 1) * sizeof(std::int32_t));
+        b.moeGroupRowTok = ops.allocate(nRowsMax * sizeof(std::int32_t));
+        b.moeGroupRowKw  = ops.allocate(nRowsMax * sizeof(float));
+        b.moeGroupAsnRow = ops.allocate(nRowsMax * sizeof(std::int32_t));
+
         // M-MoE.Fused-Decode — routing scratches. `blockCount *
         // expertUsedCount` slots so each layer owns its own K-tuple
         // across the recorded command stream.

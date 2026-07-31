@@ -204,6 +204,18 @@ public:
                                  float* outWeight, std::size_t T,
                                  std::size_t nExperts, std::size_t K,
                                  float wScale) override;
+    void moeGroupBuildAsync(const std::int32_t* expIdx, const float* kw,
+                            std::int32_t* expOffset, std::int32_t* rowSrcTok,
+                            float* rowKw, std::int32_t* asnToRow,
+                            std::size_t R, std::size_t nExperts,
+                            std::size_t K) override;
+    void moeGatherRowsAsync(const float* x, const std::int32_t* rowSrcTok,
+                            float* xCompact, std::size_t dModel,
+                            std::size_t R) override;
+    void moeScatterExpertOutAsync(const float* y, const std::int32_t* asnToRow,
+                                  const float* kw, float* accum,
+                                  std::size_t dModel, std::size_t T,
+                                  std::size_t K) override;
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
     void gatherHeadsFromChannelsAsync(const float* src, float* dst,
                                       std::size_t T, std::size_t offset,

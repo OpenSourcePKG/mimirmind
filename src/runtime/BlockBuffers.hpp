@@ -89,6 +89,12 @@ struct BlockBuffers {
     ComputeBuffer moeUpCompact;   // [nRowsMax, ffPerExpert]
     ComputeBuffer moeDownCompact; // [nRowsMax, d_model]
 
+    // M-Cuda.MoeGroup — device token-grouping build outputs (moe_group_build).
+    ComputeBuffer moeGroupOffset; // [nExperts+1] int32 exclusive prefix sum
+    ComputeBuffer moeGroupRowTok; // [nRowsMax]   int32 row -> source token
+    ComputeBuffer moeGroupRowKw;  // [nRowsMax]   f32   row -> router weight
+    ComputeBuffer moeGroupAsnRow; // [nRowsMax]   int32 assignment -> row (inverse)
+
     // Q8_0 dp4a decode path (M-Q3N.4e): int8-quantized activation row +
     // per-row scale for xQuantI8Async -> matmulDp4aAsync.
     ComputeBuffer xqI8;      // [max(d_model, ffScratch)] int8

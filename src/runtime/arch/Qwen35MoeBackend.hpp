@@ -252,6 +252,26 @@ private:
                           float*         kwSlot,
                           BlockBuffers&  s);
 
+    /// M-Cuda.MoeGroup — true grouped-by-expert MoE for the T>1 prefill.
+    /// Same preconditions and result as runMoeFfnBatched (separate
+    /// NVFP4_BLK/Q4_K gate/up + NVFP4_BLK/Q5_K/Q6_K down banks), but instead
+    /// of the fused-K kernels (which re-read each expert weight once per token
+    /// routing to it) it groups the T*K assignments by expert on the device
+    /// (moe_group_build), gathers the per-expert-grouped activations
+    /// (moe_gather_rows), runs ONE dense GEMM per expert over its M=count[e]
+    /// rows (each weight read once per 16-row chunk), and folds the result
+    /// back to token order with the router weights (moe_scatter_expert_out).
+    /// Only expOffset crosses to the host (one small D2H per layer) to drive
+    /// the per-expert launch bounds; routing/gather/scatter stay device-side.
+    /// Numerically a different fold order than the fused-K path — validated by
+    /// relative logits parity + coherence, not bit-exactness.
+    void runMoeFfnGrouped(std::size_t    blockIdx,
+                          const float*   moeInput,
+                          std::size_t    nSeq,
+                          std::int32_t*  expIdxSlot,
+                          float*         kwSlot,
+                          BlockBuffers&  s);
+
     /// M-Cuda.Batch D2a — batched full-attention layer (paged KV). Mirrors
     /// runFullAttentionBlock with the T dimension replaced by nSeq and the
     /// KV write/read going through the PagedKvPool + paged_attention_v1.
@@ -288,6 +308,24 @@ private:
     // the host moeTopKRoute + host->USM copy are skipped (no per-layer host
     // sync). Default off until parity-gated in prod.
     bool _moeDeviceTopKEnabled{false};
+
+    // M-Cuda.MoeGroup: route the T>1 prefill routed-MoE through the true
+    // grouped-by-expert path (runMoeFfnGrouped) instead of the fused-K
+    // batched path. Env MIMIRMIND_GROUPED_MOE (opt-in `=1`).
+    //
+    // DEFAULT OFF — the host-driven grouped path (Option 1) is correct but
+    // MEASURED ~25-35% SLOWER than the fused-K batched path on GB10 (A/B on
+    // xd-ki-pkg1, qwen3.6-35B-NVFP4: batched 11.3-13.8 vs grouped 15.3-17.1
+    // ms/prompt-tok across 185..4337 tokens). Reading each expert weight once
+    // is outweighed by the per-MoE-layer host sync (one expOffset D2H drains
+    // the stream ~48x/chunk) + the ~nExperts*3 per-expert launches. The
+    // fused-K path is already host-sync-free. The real win needs a
+    // DEVICE-DRIVEN grouped GEMM (single kernel reading expOffset on device,
+    // no D2H, collapsed launches, FP4-TC) — the M-Cuda.MoeGroup follow-up.
+    bool _moeGroupedPrefill{false};
+    // Host mirror of the device expert-offset table (moe_group_build output),
+    // read back once per grouped MoE layer to drive the per-expert launches.
+    std::vector<std::int32_t> _groupOffsetHost;
 
     // Diagnostic: when MIMIRMIND_SSM_TRACE is set, log per-linear-layer
     // recurrent-state / output norms and per-block residual-stream norms
