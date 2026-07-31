@@ -15,16 +15,21 @@
 #include "compute/cuda/GpuMatmul.hpp"
 #include "compute/cuda/GpuOps.hpp"
 #include "core/gpu/cuda/CudaComputeContext.hpp"
+#include "core/gpu/cuda/CudaKernel.hpp"
+#include "core/gpu/cuda/CudaModule.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "compute/quant/Q8_0.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <chrono>
+#include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -96,6 +101,37 @@ uploadRaw(GpuOps& ops, const std::vector<T>& h) {
     auto buf = ops.allocate(h.size() * sizeof(T));
     ops.uploadHostBytes(buf.get(), h.data(), h.size() * sizeof(T));
     return buf;
+}
+
+// Read a device int32 array back to host.
+std::vector<std::int32_t>
+fromDeviceI32(GpuOps& ops, const void* dev, std::size_t n) {
+    std::vector<std::int32_t> h(n);
+    ops.readbackToHost(h.data(), dev, n * sizeof(std::int32_t));
+    return h;
+}
+
+// Locate a "<name>.ptx" the same way GpuMatmul/MoeTopKRouteDevice do, so a
+// raw kernel with no GpuOps/GpuMatmul entry point yet can be launched through
+// the driver API (CudaModule / CudaKernel) directly in a parity test.
+std::string resolvePtx(std::string_view name) {
+    const std::string filename = std::string{name} + ".ptx";
+    const char* env = std::getenv("MIMIRMIND_HSACO_DIR");
+    for (const auto& d : std::array<std::string, 6>{
+             env ? std::string{env} : std::string{},
+             "build/ptx", "build-cuda/ptx", "../build/ptx",
+             "../build-cuda/ptx", "ptx"}) {
+        if (d.empty()) {
+            continue;
+        }
+        std::filesystem::path p = std::filesystem::path{d} / filename;
+        if (std::filesystem::exists(p)) {
+            return p.string();
+        }
+    }
+    throw std::runtime_error(
+        "cuda_parity_tests: cannot find " + filename +
+        " — build the CUDA kernels or set MIMIRMIND_HSACO_DIR");
 }
 
 } // namespace
@@ -1704,6 +1740,113 @@ TEST(cuda_paged_attention_v1_decode_parity) {
     }
     std::printf("[paged-attn-v1-parity] nSeq=%d nHeads=%d nKv=%d hd=%d blk=%d maxErr=%.2e\n",
                 nSeq, nHeads, nKvHeads, headSize, blockSize, maxErr);
+}
+
+// M-Cuda.MoeGroup Sub-Step A — device token-grouping build vs CPU golden.
+//
+// moe_group_build turns flat per-assignment routing (expIdx[R], kw[R],
+// R = T*K) into the offset table + stable permutation a grouped-by-expert
+// GEMM consumes: expOffset[nE+1] (exclusive prefix sum), rowSrcTok[R]
+// (source token per compacted row), rowKw[R] (router weight per compacted
+// row). The CPU reference is a plain stable counting sort — the kernel's v1
+// visits assignments in ascending index order, so the two match exactly
+// (offsets, permutation and gathered weights, not just within fp tolerance).
+namespace {
+
+void checkMoeGroupParity(std::size_t T, std::size_t nExperts, std::size_t K,
+                         std::uint32_t seed) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    ::mimirmind::core::cuda::CudaModule mod =
+        ::mimirmind::core::cuda::CudaModule::fromFile(ctx.cudaContext(),
+                                                      resolvePtx("moe_group_build"));
+    ::mimirmind::core::cuda::CudaKernel kern = mod.getFunction("moe_group_build");
+
+    const std::size_t R = T * K;
+
+    // Random routing: each of the R assignments picks an expert in [0,nE).
+    Lcg g{seed};
+    std::vector<std::int32_t> expIdx(R);
+    std::vector<float>        kw(R);
+    for (std::size_t i = 0; i < R; ++i) {
+        // Map the LCG output into [0, nExperts); +1 keeps it in-range at 1.0.
+        float u = (g.next() + 1.0f) * 0.5f;                 // [0,1)
+        std::int32_t e = static_cast<std::int32_t>(u * static_cast<float>(nExperts));
+        if (e >= static_cast<std::int32_t>(nExperts)) {
+            e = static_cast<std::int32_t>(nExperts) - 1;
+        }
+        expIdx[i] = e;
+        kw[i]     = g.next();                                // any finite weight
+    }
+
+    // CPU golden: stable counting sort.
+    std::vector<std::int32_t> refOffset(nExperts + 1, 0);
+    for (std::size_t i = 0; i < R; ++i) {
+        refOffset[expIdx[i] + 1] += 1;
+    }
+    for (std::size_t e = 1; e <= nExperts; ++e) {
+        refOffset[e] += refOffset[e - 1];
+    }
+    std::vector<std::int32_t> refRowTok(R, 0);
+    std::vector<float>        refRowKw(R, 0.0f);
+    {
+        std::vector<std::int32_t> cursor(refOffset.begin(),
+                                         refOffset.begin() + nExperts);
+        for (std::size_t i = 0; i < R; ++i) {
+            const std::int32_t e = expIdx[i];
+            const std::int32_t pos = cursor[e]++;
+            refRowTok[pos] = static_cast<std::int32_t>(i / K);
+            refRowKw[pos]  = kw[i];
+        }
+    }
+
+    // Device run.
+    auto dExpIdx = uploadRaw(ops, expIdx);
+    auto dKw     = uploadRaw(ops, kw);
+    auto dOffset = ops.allocate((nExperts + 1) * sizeof(std::int32_t));
+    auto dRowTok = ops.allocate(R * sizeof(std::int32_t));
+    auto dRowKw  = ops.allocate(R * sizeof(float));
+
+    kern.setPtr  (0, dExpIdx.get());
+    kern.setPtr  (1, dKw.get());
+    kern.setPtr  (2, dOffset.get());
+    kern.setPtr  (3, dRowTok.get());
+    kern.setPtr  (4, dRowKw.get());
+    kern.setValue(5, static_cast<std::int32_t>(R));
+    kern.setValue(6, static_cast<std::int32_t>(nExperts));
+    kern.setValue(7, static_cast<std::int32_t>(K));
+    kern.launch(ctx.stream(), 1, 1, 1, 1, 1, 1);
+    ops.flush();
+
+    auto gotOffset = fromDeviceI32(ops, dOffset.get(), nExperts + 1);
+    auto gotRowTok = fromDeviceI32(ops, dRowTok.get(), R);
+    auto gotRowKw  = fromDevice   (ops, dRowKw.get(),  R);
+
+    for (std::size_t e = 0; e <= nExperts; ++e) {
+        EXPECT_EQ(gotOffset[e], refOffset[e]);
+    }
+    EXPECT_EQ(gotOffset[nExperts], static_cast<std::int32_t>(R));
+    for (std::size_t r = 0; r < R; ++r) {
+        EXPECT_EQ(gotRowTok[r], refRowTok[r]);
+        EXPECT_NEAR(gotRowKw[r], refRowKw[r], 0.0f);
+    }
+    std::printf("[moe-group-build] T=%zu nExp=%zu K=%zu R=%zu OK\n",
+                T, nExperts, K, R);
+}
+
+} // namespace
+
+TEST(cuda_moe_group_build_parity_k8) {
+    // Serving prefill shape: 128 experts, top-8, a full chunk of tokens.
+    checkMoeGroupParity(/*T=*/512, /*nExperts=*/128, /*K=*/8, 0x6A08u);
+}
+
+TEST(cuda_moe_group_build_parity_small) {
+    checkMoeGroupParity(/*T=*/6, /*nExperts=*/8, /*K=*/2, 0xC0FFEEu);
+}
+
+TEST(cuda_moe_group_build_parity_single_token) {
+    checkMoeGroupParity(/*T=*/1, /*nExperts=*/128, /*K=*/8, 0x5EEDu);
 }
 
 int main() {

@@ -12,10 +12,12 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -85,7 +87,18 @@ inline void expectTrueImpl(const char* file, int line,
 inline int run() {
     int passed = 0;
     int failed = 0;
+    int skipped = 0;
+    // Optional substring filter: MIMIRMIND_TEST_FILTER=foo runs only tests
+    // whose name contains "foo". Empty/unset runs everything. Handy on a GPU
+    // box where a full parity suite contends with a running inference
+    // container — target the one kernel under test instead.
+    const char* filterEnv = std::getenv("MIMIRMIND_TEST_FILTER");
+    const char* filter = (filterEnv && filterEnv[0] != '\0') ? filterEnv : nullptr;
     for (auto& t : registry()) {
+        if (filter && std::string_view{t.name}.find(filter) == std::string_view::npos) {
+            ++skipped;
+            continue;
+        }
         std::printf("[RUN ] %s\n", t.name);
         try {
             t.fn();
@@ -96,8 +109,8 @@ inline int run() {
             ++failed;
         }
     }
-    std::printf("\n=== %d passed, %d failed (of %zu) ===\n",
-                passed, failed, registry().size());
+    std::printf("\n=== %d passed, %d failed, %d skipped (of %zu) ===\n",
+                passed, failed, skipped, registry().size());
     return failed == 0 ? 0 : 1;
 }
 
