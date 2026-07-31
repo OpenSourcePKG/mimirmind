@@ -663,6 +663,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/moe_gather_rows.cu
         kernels/cuda/llm/moe_scatter_expert_out.cu
         kernels/cuda/llm/moe_group_tiles.cu
+        kernels/cuda/llm/moe_grouped_gemm_nvfp4blk.cu
         kernels/cuda/llm/cuda_probe_kernel.cu
         kernels/cuda/llm/attention_paged_v1.cu
         kernels/cuda/llm/attention_paged_v2.cu

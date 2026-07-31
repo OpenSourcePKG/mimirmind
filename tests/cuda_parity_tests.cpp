@@ -1985,6 +1985,166 @@ TEST(cuda_moe_group_tiles_parity_single_expert) {
     checkMoeGroupTilesParity({100, 0, 0, 0}, /*tileM=*/16);
 }
 
+// M-Cuda.MoeGroup Sub-Step E-b — moe_grouped_gemm_nvfp4blk: ONE device-driven
+// launch reproduces the per-expert sequential NVFP4 GEMM by reading each tile's
+// (expert, row-range) from the moe_group_tiles schedule on the device — no
+// expOffset D2H, no per-expert host loop. Random blocked-NVFP4 weight bytes
+// (finite fp16 scales, any nibbles) are shared byte-for-byte between the
+// reference (one matmul_nvfp4blk_gemm launch per tile) and the grouped kernel;
+// both iterate K in identical order, so the outputs are BIT-identical.
+namespace {
+
+constexpr int kNvSuperElems = 32;
+constexpr int kNvSuperBytes = 20;
+
+void checkMoeGroupedGemmParity(const std::vector<std::int32_t>& counts,
+                               int N, int K, std::uint32_t seed) {
+    namespace cc = ::mimirmind::core::cuda;
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    cc::CudaModule tilesMod = cc::CudaModule::fromFile(ctx.cudaContext(),
+                                                       resolvePtx("moe_group_tiles"));
+    cc::CudaKernel tilesKern = tilesMod.getFunction("moe_group_tiles");
+    cc::CudaModule refMod = cc::CudaModule::fromFile(ctx.cudaContext(),
+                                                     resolvePtx("matmul_nvfp4blk_gemm"));
+    cc::CudaKernel refKern = refMod.getFunction("matmul_nvfp4blk_gemm");
+    cc::CudaModule grpMod = cc::CudaModule::fromFile(ctx.cudaContext(),
+                                                     resolvePtx("moe_grouped_gemm_nvfp4blk"));
+    cc::CudaKernel grpKern = grpMod.getFunction("moe_grouped_gemm_nvfp4blk");
+
+    const int nExperts = static_cast<int>(counts.size());
+    const int tileM    = 16;                          // == GEMM_MAX_M
+
+    std::vector<std::int32_t> expOffset(nExperts + 1, 0);
+    for (int e = 0; e < nExperts; ++e) {
+        expOffset[e + 1] = expOffset[e] + counts[e];
+    }
+    const int R        = expOffset[nExperts];
+    const int maxTiles = (R + tileM - 1) / tileM + nExperts;
+    const int nSuper   = K / kNvSuperElems;
+    const std::size_t expertBytes =
+        static_cast<std::size_t>(N) * nSuper * kNvSuperBytes;
+
+    Lcg g{seed};
+    auto nextU32 = [&g]() -> std::uint32_t {
+        g.s = g.s * 1664525u + 1013904223u;
+        return g.s;
+    };
+
+    // Random activations in [-1, 1].
+    std::vector<float> X(static_cast<std::size_t>(R) * K);
+    for (auto& v : X) v = g.next();
+
+    // Random blocked-NVFP4 weight bank [nExperts][N][K]. Each 20-byte super =
+    // two fp16 scales (bytes 0..3) + 16 nibble-bytes (4..19). We force the fp16
+    // scale exponent off 0x1F so no scale decodes to NaN/Inf; any other bits
+    // (incl. nibbles) are fair game — the kernels interpret them identically.
+    std::vector<unsigned char> W(static_cast<std::size_t>(nExperts) * expertBytes);
+    for (std::size_t off = 0; off + kNvSuperBytes <= W.size(); off += kNvSuperBytes) {
+        for (int h = 0; h < 2; ++h) {                 // two fp16 scales
+            std::uint32_t bits = nextU32() & 0xFFFFu;
+            if (((bits >> 10) & 0x1Fu) == 0x1Fu) {
+                bits &= ~(1u << 14);                  // clear exp MSB -> not Inf/NaN
+            }
+            W[off + h * 2 + 0] = static_cast<unsigned char>(bits & 0xFFu);
+            W[off + h * 2 + 1] = static_cast<unsigned char>((bits >> 8) & 0xFFu);
+        }
+        for (int b = 4; b < kNvSuperBytes; ++b) {
+            W[off + b] = static_cast<unsigned char>(nextU32() & 0xFFu);
+        }
+    }
+
+    auto dX   = uploadRaw(ops, X);
+    auto dW   = uploadRaw(ops, W);
+    std::vector<float> zeros(static_cast<std::size_t>(R) * N, 0.0f);
+    auto dYref = uploadRaw(ops, zeros);
+    auto dYgrp = uploadRaw(ops, zeros);
+
+    const auto*  Wbase = static_cast<const unsigned char*>(dW.get());
+    const float* Xbase = static_cast<const float*>(dX.get());
+    const std::uint32_t gx = static_cast<std::uint32_t>((N + 3) / 4);   // ceil(N/4)
+
+    // --- reference: one dense per-expert GEMM per tile (CPU-walked schedule) ---
+    float* Yref = static_cast<float*>(dYref.get());
+    for (int e = 0; e < nExperts; ++e) {
+        int row = expOffset[e];
+        const int end = expOffset[e + 1];
+        while (row < end) {
+            int rows = end - row;
+            if (rows > tileM) rows = tileM;
+            refKern.setPtr  (0, Xbase + static_cast<std::size_t>(row) * K);
+            refKern.setPtr  (1, Wbase + static_cast<std::size_t>(e) * expertBytes);
+            refKern.setPtr  (2, Yref  + static_cast<std::size_t>(row) * N);
+            refKern.setValue(3, K);
+            refKern.setValue(4, N);
+            refKern.setValue(5, rows);
+            refKern.launch(ctx.stream(), gx, 1, 1, 128, 1, 1);
+            row += rows;
+        }
+    }
+
+    // --- grouped: device schedule build + ONE grouped launch ------------------
+    auto dExpert = ops.allocate(maxTiles * sizeof(std::int32_t));
+    auto dRow0   = ops.allocate(maxTiles * sizeof(std::int32_t));
+    auto dRows   = ops.allocate(maxTiles * sizeof(std::int32_t));
+    auto dN      = ops.allocate(sizeof(std::int32_t));
+    auto dOffset = uploadRaw(ops, expOffset);
+
+    tilesKern.setPtr  (0, dOffset.get());
+    tilesKern.setPtr  (1, dExpert.get());
+    tilesKern.setPtr  (2, dRow0.get());
+    tilesKern.setPtr  (3, dRows.get());
+    tilesKern.setPtr  (4, dN.get());
+    tilesKern.setValue(5, nExperts);
+    tilesKern.setValue(6, maxTiles);
+    tilesKern.setValue(7, tileM);
+    tilesKern.launch(ctx.stream(), 1, 1, 1, 1, 1, 1);
+
+    grpKern.setPtr  (0, dX.get());
+    grpKern.setPtr  (1, dW.get());
+    grpKern.setPtr  (2, dYgrp.get());
+    grpKern.setPtr  (3, dExpert.get());
+    grpKern.setPtr  (4, dRow0.get());
+    grpKern.setPtr  (5, dRows.get());
+    grpKern.setValue(6, K);
+    grpKern.setValue(7, N);
+    grpKern.launch(ctx.stream(), gx, static_cast<std::uint32_t>(maxTiles), 1,
+                   128, 1, 1);
+    ops.flush();
+
+    auto gotRef = fromDevice(ops, dYref.get(), static_cast<std::size_t>(R) * N);
+    auto gotGrp = fromDevice(ops, dYgrp.get(), static_cast<std::size_t>(R) * N);
+    for (std::size_t i = 0; i < gotRef.size(); ++i) {
+        EXPECT_NEAR(gotGrp[i], gotRef[i], 0.0f);      // bit-identical FMA order
+    }
+    std::printf("[moe-grouped-gemm] nExp=%d R=%d N=%d K=%d OK\n",
+                nExperts, R, N, K);
+}
+
+} // namespace
+
+TEST(cuda_moe_grouped_gemm_parity_k8) {
+    // Serving-ish shape: many experts, skewed counts, multi-tile experts.
+    Lcg g{0x9A11u};
+    std::vector<std::int32_t> counts(16);
+    for (auto& c : counts) {
+        const float u = (g.next() + 1.0f) * 0.5f;
+        c = static_cast<std::int32_t>(u * 40.0f);     // 0..39, some > tileM
+    }
+    checkMoeGroupedGemmParity(counts, /*N=*/64, /*K=*/64, 0x3131u);
+}
+
+TEST(cuda_moe_grouped_gemm_parity_nonmult_n) {
+    // N not a multiple of the 4-output group -> exercises the active-column
+    // guard; down-projection-ish (K > N).
+    checkMoeGroupedGemmParity({20, 0, 33, 5, 16, 17}, /*N=*/70, /*K=*/128, 0x77u);
+}
+
+TEST(cuda_moe_grouped_gemm_parity_single_expert) {
+    // One expert takes every row -> ceil(R/tileM) tiles, single weight base.
+    checkMoeGroupedGemmParity({50, 0, 0}, /*N=*/32, /*K=*/96, 0xB0Bu);
+}
+
 // M-Cuda.MoeGroup Sub-Step B — moe_gather_rows: xCompact[r]=x[rowSrcTok[r]].
 TEST(cuda_moe_gather_rows_parity) {
     CudaComputeContext ctx{};

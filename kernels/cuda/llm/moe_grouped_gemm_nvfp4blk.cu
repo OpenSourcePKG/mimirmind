@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+//
+// Device-driven grouped GEMM over blocked-NVFP4 expert weights
+// (M-Cuda.MoeGroup, Sub-Step E-b) — the kernel that turns the host-driven
+// Option 1 (per-expert host launch loop + one expOffset D2H per MoE layer)
+// into a SINGLE device-driven launch, the only shape that can beat the
+// fused-K batched path on GB10.
+//
+//   Y[row, n] = sum_k xCompact[row, k] * (scale_block * e2m1(W[e][n, k]))
+//
+// where the compacted rows are grouped by expert (moe_gather_rows), and a
+// compact per-tile schedule (moe_group_tiles) assigns each grid.y block one
+// tile = (expert e, absolute row range [row0, row0+rows), rows <= tileM). The
+// block reads its expert + row range from the schedule ON THE DEVICE, so
+// nothing crosses to the host: no expOffset D2H, no per-expert launch loop.
+// The whole per-expert loop collapses into one launch per projection.
+//
+// This is the exact math of matmul_nvfp4blk_gemm (see it + matmul_nvfp4blk_vec
+// for the 20-byte / 32-element super-block layout), generalised two ways:
+//   * grid.y indexes the tile schedule instead of a fixed single problem, so
+//     one launch covers every expert's rows;
+//   * the weight base is offset by the tile's expert e into the contiguous
+//     [nExperts][N][K] blocked bank, and X/Y are offset by the tile's row0.
+// Each weight row is still read once and reused across the tile's <= tileM
+// activation rows (tileM == GEMM_MAX_M == 16, the schedule guarantees it).
+//
+// Empty schedule slots carry tileExpert == -1 (the host over-provisions
+// grid.y to the static upper bound maxTiles); those blocks early-exit. A tile
+// always has rows >= 1 (moe_group_tiles never emits an empty tile), so no
+// active block does zero work.
+//
+// Launch: grid.x = ceil(N / OUTPUTS_PER_GROUP), grid.y = maxTiles;
+//         block  = MATMUL_NVBLK_GEMM_LOCAL (128).
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+#ifndef MATMUL_NVBLK_GEMM_LOCAL
+#define MATMUL_NVBLK_GEMM_LOCAL 128
+#endif
+
+#define MATMUL_NVBLK_GEMM_WARPS             (MATMUL_NVBLK_GEMM_LOCAL / 32)
+#define MATMUL_NVBLK_GEMM_OUTPUTS_PER_GROUP MATMUL_NVBLK_GEMM_WARPS
+
+#define NVBLK_SUPER_ELEMENTS 32
+#define NVBLK_SUPER_BYTES    20
+#define GEMM_MAX_M   16
+#define GEMM_X_TILE  256   // 8 supers
+
+namespace {
+
+__device__ __forceinline__ float dq_e2m1(unsigned nib) {
+    const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float v = mag[nib & 0x7u];
+    return (nib & 0x8u) ? -v : v;
+}
+
+__device__ __forceinline__ float warpReduceSum(float v) {
+    v += __shfl_down_sync(0xffffffffu, v, 16);
+    v += __shfl_down_sync(0xffffffffu, v,  8);
+    v += __shfl_down_sync(0xffffffffu, v,  4);
+    v += __shfl_down_sync(0xffffffffu, v,  2);
+    v += __shfl_down_sync(0xffffffffu, v,  1);
+    return v;
+}
+
+} // namespace
+
+extern "C" __global__ __launch_bounds__(MATMUL_NVBLK_GEMM_LOCAL)
+void moe_grouped_gemm_nvfp4blk(
+    const float*         __restrict__ X,           // [R, K]  compacted activations
+    const unsigned char* __restrict__ W,           // [nExperts, N, K] blocked NVFP4
+          float*         __restrict__ Y,           // [R, N]  grouped output
+    const int*           __restrict__ tileExpert,  // [maxTiles] expert id / -1
+    const int*           __restrict__ tileRow0,    // [maxTiles] start row
+    const int*           __restrict__ tileRows,    // [maxTiles] row count (1..GEMM_MAX_M)
+    const int                          K,
+    const int                          N)
+{
+    __shared__ float xTile[GEMM_MAX_M * GEMM_X_TILE];
+
+    const int tt = blockIdx.y;                     // tile index into the schedule
+    const int e  = tileExpert[tt];
+    if (e < 0) {
+        return;                                    // unused (over-provisioned) tile
+    }
+    const int row0 = tileRow0[tt];
+    int M          = tileRows[tt];
+    if (M > GEMM_MAX_M) {
+        M = GEMM_MAX_M;                            // defensive; schedule caps at tileM
+    }
+
+    const int tid    = threadIdx.x;
+    const int lsize  = blockDim.x;
+    const int warpId = tid / 32;
+    const int laneId = tid % 32;
+    const int n      = blockIdx.x * MATMUL_NVBLK_GEMM_OUTPUTS_PER_GROUP + warpId;
+    const bool active = (n < N);
+    const int nSuper = K / NVBLK_SUPER_ELEMENTS;
+
+    // Expert weight base into the contiguous [nExperts][N][K] blocked bank,
+    // and the tile's activation / output row bases.
+    const unsigned char* __restrict__ Wexp =
+        W + static_cast<size_t>(e) * static_cast<size_t>(N)
+          * static_cast<size_t>(nSuper) * NVBLK_SUPER_BYTES;
+    const float* __restrict__ Xt = X + static_cast<size_t>(row0) * K;
+    float*       __restrict__ Yt = Y + static_cast<size_t>(row0) * N;
+
+    float acc[GEMM_MAX_M];
+#pragma unroll
+    for (int m = 0; m < GEMM_MAX_M; ++m) acc[m] = 0.0f;
+
+    for (int tile = 0; tile < K; tile += GEMM_X_TILE) {
+        const int tileK = min(GEMM_X_TILE, K - tile);
+        for (int i = tid; i < M * tileK; i += lsize) {
+            const int m  = i / tileK;
+            const int kk = i % tileK;
+            xTile[m * GEMM_X_TILE + kk] = Xt[static_cast<size_t>(m) * K + tile + kk];
+        }
+        __syncthreads();
+
+        if (active) {
+            const unsigned char* row =
+                Wexp + static_cast<size_t>(n) * static_cast<size_t>(nSuper)
+                     * NVBLK_SUPER_BYTES;
+            const int superStart   = tile / NVBLK_SUPER_ELEMENTS;
+            const int supersInTile = GEMM_X_TILE / NVBLK_SUPER_ELEMENTS;
+            const int superEnd     = min(superStart + supersInTile, nSuper);
+            for (int sp = superStart; sp < superEnd; ++sp) {
+                const unsigned char* blk = row + sp * NVBLK_SUPER_BYTES;
+                const float s0 = __half2float(*reinterpret_cast<const __half*>(blk));
+                const float s1 = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+                const unsigned char* qs = blk + 4;
+                const unsigned char byte = qs[laneId >> 1];
+                const unsigned nib = (laneId & 1) ? (byte >> 4) : (byte & 0x0F);
+                const float w = ((laneId < 16) ? s0 : s1) * dq_e2m1(nib);
+                const int kk = (sp - superStart) * NVBLK_SUPER_ELEMENTS + laneId;
+                for (int m = 0; m < M; ++m) {
+                    acc[m] = __fmaf_rn(w, xTile[m * GEMM_X_TILE + kk], acc[m]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int m = 0; m < M; ++m) {
+        const float s = warpReduceSum(acc[m]);
+        if (active && laneId == 0) {
+            Yt[static_cast<size_t>(m) * N + n] = s;
+        }
+    }
+}
