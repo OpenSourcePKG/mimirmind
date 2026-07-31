@@ -1860,6 +1860,131 @@ TEST(cuda_moe_group_build_parity_single_token) {
     checkMoeGroupParity(/*T=*/1, /*nExperts=*/128, /*K=*/8, 0x5EEDu);
 }
 
+// M-Cuda.MoeGroup Sub-Step E-a — moe_group_tiles turns the per-expert row
+// ranges (expOffset, exclusive prefix sum) into a compact per-tile schedule a
+// single device-driven grouped GEMM consumes in one launch (no expOffset D2H,
+// no per-expert host loop). Expert e's count is split into ceil(count/tileM)
+// tiles of <= tileM rows; unused tail tiles carry the -1 sentinel. The CPU
+// golden walks experts in the same order, so offsets/rows/sentinels match
+// exactly. Also asserts the static host-side upper bound is never exceeded.
+namespace {
+
+void checkMoeGroupTilesParity(const std::vector<std::int32_t>& counts,
+                              int tileM) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    ::mimirmind::core::cuda::CudaModule mod =
+        ::mimirmind::core::cuda::CudaModule::fromFile(ctx.cudaContext(),
+                                                      resolvePtx("moe_group_tiles"));
+    ::mimirmind::core::cuda::CudaKernel kern = mod.getFunction("moe_group_tiles");
+
+    const int nExperts = static_cast<int>(counts.size());
+
+    // expOffset = exclusive prefix sum of the per-expert counts.
+    std::vector<std::int32_t> expOffset(nExperts + 1, 0);
+    for (int e = 0; e < nExperts; ++e) {
+        expOffset[e + 1] = expOffset[e] + counts[e];
+    }
+    const int R = expOffset[nExperts];
+
+    // Static upper bound (host-computable, no D2H): ceil(R/tileM) + nExperts.
+    const int maxTiles = (R + tileM - 1) / tileM + nExperts;
+
+    // CPU golden: sequential per-expert tile walk (matches the kernel order).
+    std::vector<std::int32_t> refExpert(maxTiles, -1);
+    std::vector<std::int32_t> refRow0(maxTiles, 0);
+    std::vector<std::int32_t> refRows(maxTiles, 0);
+    int refN = 0;
+    for (int e = 0; e < nExperts; ++e) {
+        int row = expOffset[e];
+        const int end = expOffset[e + 1];
+        while (row < end) {
+            int rows = end - row;
+            if (rows > tileM) {
+                rows = tileM;
+            }
+            refExpert[refN] = e;
+            refRow0[refN]   = row;
+            refRows[refN]   = rows;
+            row += rows;
+            ++refN;
+        }
+    }
+    // The upper bound must never be exceeded (the whole no-D2H design relies
+    // on this being tight enough to size the grid on the host).
+    EXPECT_EQ(static_cast<int>(refN <= maxTiles), 1);
+
+    // Device run.
+    auto dOffset = uploadRaw(ops, expOffset);
+    auto dExpert = ops.allocate(maxTiles * sizeof(std::int32_t));
+    auto dRow0   = ops.allocate(maxTiles * sizeof(std::int32_t));
+    auto dRows   = ops.allocate(maxTiles * sizeof(std::int32_t));
+    auto dN      = ops.allocate(sizeof(std::int32_t));
+
+    kern.setPtr  (0, dOffset.get());
+    kern.setPtr  (1, dExpert.get());
+    kern.setPtr  (2, dRow0.get());
+    kern.setPtr  (3, dRows.get());
+    kern.setPtr  (4, dN.get());
+    kern.setValue(5, nExperts);
+    kern.setValue(6, maxTiles);
+    kern.setValue(7, tileM);
+    kern.launch(ctx.stream(), 1, 1, 1, 1, 1, 1);
+    ops.flush();
+
+    auto gotExpert = fromDeviceI32(ops, dExpert.get(), maxTiles);
+    auto gotRow0   = fromDeviceI32(ops, dRow0.get(),   maxTiles);
+    auto gotRows   = fromDeviceI32(ops, dRows.get(),   maxTiles);
+    auto gotN      = fromDeviceI32(ops, dN.get(),      1);
+
+    EXPECT_EQ(gotN[0], refN);
+    for (int t = 0; t < maxTiles; ++t) {
+        EXPECT_EQ(gotExpert[t], refExpert[t]);
+        EXPECT_EQ(gotRow0[t],   refRow0[t]);
+        EXPECT_EQ(gotRows[t],   refRows[t]);
+    }
+    // Coverage invariant: the emitted tiles partition every expert's row range
+    // exactly (contiguous, no gaps/overlap), so the grouped GEMM touches each
+    // compacted row once.
+    for (int e = 0; e < nExperts; ++e) {
+        int expect = expOffset[e];
+        for (int t = 0; t < gotN[0]; ++t) {
+            if (gotExpert[t] != e) {
+                continue;
+            }
+            EXPECT_EQ(gotRow0[t], expect);
+            expect += gotRows[t];
+        }
+        EXPECT_EQ(expect, expOffset[e + 1]);
+    }
+    std::printf("[moe-group-tiles] nExp=%d R=%d tileM=%d nTiles=%d/%d OK\n",
+                nExperts, R, tileM, gotN[0], maxTiles);
+}
+
+} // namespace
+
+TEST(cuda_moe_group_tiles_parity_k8) {
+    // Serving prefill shape: 128 experts, ~full chunk of top-8 assignments.
+    // Random-ish skewed counts around the R=512*8/128 = 32 average.
+    Lcg g{0x71235u};
+    std::vector<std::int32_t> counts(128);
+    for (auto& c : counts) {
+        const float u = (g.next() + 1.0f) * 0.5f;            // [0,1)
+        c = static_cast<std::int32_t>(u * 64.0f);            // 0..63, avg ~32
+    }
+    checkMoeGroupTilesParity(counts, /*tileM=*/16);
+}
+
+TEST(cuda_moe_group_tiles_parity_edges) {
+    // Empty experts, exact-multiple, and one-over-multiple counts all present.
+    checkMoeGroupTilesParity({0, 16, 1, 17, 32, 0, 15, 48}, /*tileM=*/16);
+}
+
+TEST(cuda_moe_group_tiles_parity_single_expert) {
+    // One expert takes every row (degenerate routing) -> ceil(R/tileM) tiles.
+    checkMoeGroupTilesParity({100, 0, 0, 0}, /*tileM=*/16);
+}
+
 // M-Cuda.MoeGroup Sub-Step B — moe_gather_rows: xCompact[r]=x[rowSrcTok[r]].
 TEST(cuda_moe_gather_rows_parity) {
     CudaComputeContext ctx{};
