@@ -127,6 +127,29 @@ public:
             std::size_t   headDim,
             KvDtype       dtype = KvDtype::F32);
 
+    /// Tag disambiguating the non-owning "view" ctor below.
+    struct ExternalView {};
+
+    /// Non-owning view over caller-provided per-layer device K/V base
+    /// pointers — performs NO allocation. Wraps external contiguous storage
+    /// (e.g. a serving slot's per-slot contiguous PagedKvPool region) so the
+    /// single-session prefill path (`runFullAttentionBlock` /
+    /// `runLinearBlock`, T>1) can operate on it verbatim. Each layer's
+    /// storage must be `[maxSeq, kvDim]` row-major in `dtype`, contiguous
+    /// (row stride == kvDim elements), and outlive this view. `initialLength`
+    /// seeds `length()` (the slot's already-cached prefix, so `writeSlotK/V`
+    /// point at the first free row and attention reads `[0, length()+T)`).
+    /// `kBases`/`vBases` size must equal `kvDimPerLayer` size. F32/FP16 only
+    /// (Q8_0's block storage is not a plain external view). No ComputeOps —
+    /// the view owns nothing to allocate.
+    KvCache(ExternalView,
+            std::size_t              maxSeq,
+            std::vector<std::size_t> kvDimPerLayer,
+            std::vector<void*>       kBases,
+            std::vector<void*>       vBases,
+            std::size_t              initialLength = 0,
+            KvDtype                  dtype = KvDtype::F32);
+
     ~KvCache();
 
     KvCache(const KvCache&)            = delete;

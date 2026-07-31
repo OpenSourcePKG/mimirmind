@@ -142,11 +142,21 @@ private:
     void workerLoop();
     [[nodiscard]] bool isStop(std::int32_t tok, const Slot& s) const;
 
+    /// Increment A — prefill a just-admitted slot's whole prompt as chunked
+    /// T>1 forwards (see InferenceEngine::prefillSlot), then move it into
+    /// decode state at pos == promptLen with its first generated token
+    /// pushed. Runs the GPU work without holding `_mtx`. A prefill failure
+    /// fails only that request. Only called when `_prefillChunk > 0`.
+    void prefillSlotAdmitted(std::size_t slot);
+
     InferenceEngine& _engine;
     std::size_t      _maxBatch;
     std::size_t      _maxContext;
     std::int32_t     _eosId;
     std::size_t      _maxInflight;
+    // Chunked-prefill chunk size C (InferenceEngine::servingPrefillChunk());
+    // 0 => disabled, prompts ingest token-by-token via the decode loop.
+    std::size_t      _prefillChunk{0};
 
     std::vector<Slot>                     _slots;
     std::deque<Pending>                   _waiting;

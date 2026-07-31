@@ -68,6 +68,19 @@ struct ServingState {
     std::vector<std::int32_t>  inputTok;       // [maxBatch]
     std::vector<float>         hostLogits;     // [maxBatch * vocab_lm]
 
+    // ---- Increment A: chunked multi-token prefill scratch ---------------
+    // A newly-admitted request's prompt is prefilled as a T>1 forward per
+    // physical slot (reusing the single-session runBlock path over the slot's
+    // contiguous paged-KV region + its SsmState slice) instead of token-by-
+    // token. sbPrefill is sized for maxT = prefillChunk rows; xBufP holds the
+    // chunk's hidden states. Built only when chunked prefill is enabled
+    // (MIMIRMIND_CHUNKED_PREFILL != 0; chunk size MIMIRMIND_PREFILL_CHUNK).
+    bool        chunkedPrefill{false};
+    std::size_t prefillChunk{0};               // C (tokens per prefill forward)
+    std::optional<BlockBuffers> sbPrefill;     // maxT = prefillChunk
+    compute::ComputeBuffer      xBufP;         // [prefillChunk, d_model]
+    std::vector<std::int32_t>   prefillTokH;   // [prefillChunk] host token staging
+
     // ---- Increment E1: MTP batched-verify scratch (lazily sized) --------
     // Sized for up to `maxBatch` slots × (verifyDepth + 1) verify tokens =
     // Mcap virtual rows. Full-attention runs over all Mcap rows at once;
@@ -528,6 +541,51 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     st->inputTok.resize(maxBatch);
     st->hostLogits.resize(maxBatch * st->vocab_lm);
 
+    // ---- Increment A: chunked multi-token prefill scratch ---------------
+    // Default ON with an env rollback (MIMIRMIND_CHUNKED_PREFILL=0 -> the
+    // token-by-token prefill path in ContinuousBatcher stays). The prefill
+    // forward reuses the single-session runBlock(T>1) path, so its scratch is
+    // sized exactly like the single-session BlockBuffers (perSeqConvInput
+    // false, no Q8_0 kv scratch), maxT = prefillChunk.
+    {
+        const char* cpEnv = std::getenv("MIMIRMIND_CHUNKED_PREFILL");
+        st->chunkedPrefill = (cpEnv == nullptr) || !(cpEnv[0] == '0' && cpEnv[1] == '\0');
+        // Tokens per prefill forward. A prompt longer than this ingests as
+        // several chunked T>1 forwards, each carrying the KV + recurrent state
+        // forward (the between-chunk flush in prefillSlot commits each chunk
+        // before the next reads its state). Bounds the prefill scratch
+        // (BlockBuffers + xBufP are sized for maxT = chunk) and the per-chunk
+        // step latency. Overridable via MIMIRMIND_PREFILL_CHUNK.
+        std::size_t chunk = 512;
+        if (const char* c = std::getenv("MIMIRMIND_PREFILL_CHUNK")) {
+            const long v = std::strtol(c, nullptr, 10);
+            if (v >= 1) chunk = static_cast<std::size_t>(v);
+        }
+        // Never exceed the slot capacity; a chunk spanning more than the
+        // context would overrun the slot's block run.
+        chunk = std::min(chunk, maxContext);
+        st->prefillChunk = chunk;
+        if (st->chunkedPrefill) {
+            st->sbPrefill = allocBlockBuffers(
+                *_e._ops, _e._config, /*maxT=*/chunk, /*maxSeq=*/maxContext,
+                qkv.first, qkv.second, /*withFusedQkv=*/false,
+                /*withKvFp32Scratch=*/false, /*withQGate=*/true,
+                /*withSsm=*/true, /*perSeqConvInput=*/false);
+            // SSM state pointers are (re)bound per prefillSlot call to the
+            // target slot's slab slice; ssmSlabNSeq is the full slab width so
+            // the per-layer stride matches stepServing's slab layout.
+            st->sbPrefill->ssmSlabNSeq = st->ssm->nSeq();
+            st->xBufP = _e._ops->allocate(chunk * st->d_model * sizeof(float));
+            st->prefillTokH.resize(chunk);
+            MM_LOG_INFO("serving",
+                        "chunked prefill ENABLED (chunk={}) — prompts prefill "
+                        "as T>1 forwards per slot", chunk);
+        } else {
+            MM_LOG_INFO("serving", "chunked prefill DISABLED "
+                        "(MIMIRMIND_CHUNKED_PREFILL=0) — token-by-token prefill");
+        }
+    }
+
     _state = std::move(st);
     MM_LOG_INFO("serving",
                 "ensureServingState: maxBatch={} maxContext={} blocksPerSeq={} "
@@ -622,6 +680,132 @@ void ServingSession::stepServing(
         }
         outTokens[i] = static_cast<std::int32_t>(best);
     }
+}
+
+std::int32_t ServingSession::prefillSlot(
+        std::size_t                   slot,
+        std::span<const std::int32_t> tokens,
+        std::size_t                   startPos,
+        bool                          produceToken) {
+    namespace cmp = mimirmind::compute;
+    if (_state == nullptr) {
+        throw std::runtime_error("prefillSlot: ensureServingState not called");
+    }
+    auto& st = *_state;
+    if (!st.chunkedPrefill || !st.sbPrefill.has_value()) {
+        throw std::runtime_error("prefillSlot: chunked prefill not enabled");
+    }
+    const std::size_t T = tokens.size();
+    if (T == 0) {
+        return -1;
+    }
+    if (T > st.prefillChunk) {
+        throw std::runtime_error("prefillSlot: chunk larger than prefillChunk");
+    }
+    if (slot >= st.maxBatch) {
+        throw std::runtime_error("prefillSlot: slot out of range");
+    }
+    if (startPos + T > st.maxContext) {
+        throw std::runtime_error("prefillSlot: startPos+T exceeds maxContext");
+    }
+
+    const std::size_t d_model  = st.d_model;
+    const std::size_t nKvHeads = _e._config.headCountKv;
+    const std::size_t headDim  = _e._config.headDim();
+    const std::size_t kvDim    = nKvHeads * headDim;
+    const std::size_t slotCap  = st.blocksPerSeq * st.blockSize;   // tokens
+    const std::size_t slotElemBase = slot * slotCap * kvDim;       // elements
+
+    // Non-owning per-block KvCache view over this slot's contiguous paged-KV
+    // region. runBlock indexes the cache by blockIdx, so the view carries
+    // blockCount layers: a full-attention block points at its dense pool
+    // layer's slot region; a recurrent (GatedDeltaNet) block gets a valid
+    // placeholder pointer (runLinearBlock never reads/writes cache K/V).
+    std::vector<std::size_t> kvDimPerLayer(st.blockCount, kvDim);
+    std::vector<void*>       kBases(st.blockCount, nullptr);
+    std::vector<void*>       vBases(st.blockCount, nullptr);
+    for (std::size_t b = 0; b < st.blockCount; ++b) {
+        const std::size_t dense = st.qb->fullAttnDenseLayer(b);
+        const std::size_t layer =
+            (dense == std::numeric_limits<std::size_t>::max()) ? 0 : dense;
+        kBases[b] = st.pool->keyPool(layer)   + slotElemBase;
+        vBases[b] = st.pool->valuePool(layer) + slotElemBase;
+    }
+    KvCache view(KvCache::ExternalView{}, /*maxSeq=*/slotCap,
+                 std::move(kvDimPerLayer), std::move(kBases), std::move(vBases),
+                 /*initialLength=*/startPos, KvDtype::F32);
+
+    // Bind the prefill BlockBuffers' SSM state base to this slot's slab slice.
+    // runLinearBlock indexes `ssmStatePtr + blockIdx*(ssmSlabNSeq*elems)`, so a
+    // base pre-offset by slot*elems (with ssmSlabNSeq == full slab width)
+    // lands on exactly this slot's per-layer state — the same memory
+    // stepServing evolves during decode. Kernels bake the pointer at enqueue,
+    // so restoring the base afterwards is safe without a sync.
+    const std::size_t stateElems     = _e._config.ssmStateElemsPerLayer();
+    const std::size_t convStateElems = _e._config.ssmConvStateElemsPerLayer();
+    BlockBuffers& sb = *st.sbPrefill;
+    sb.ssmStatePtr     = st.ssm->statePtr()     + slot * stateElems;
+    sb.ssmConvStatePtr = st.ssm->convStatePtr() + slot * convStateElems;
+
+    // Embed the chunk tokens into the prefill hidden buffer.
+    for (std::size_t i = 0; i < T; ++i) {
+        st.prefillTokH[i] = tokens[i];
+    }
+    float* const xBuf = st.xBufP.as<float>();
+    cmp::embeddingLookup(st.tokEmb->type, st.tokEmb->usmPtr, d_model,
+                         st.vocab_emb,
+                         std::span<const std::int32_t>{st.prefillTokH.data(), T},
+                         xBuf);
+
+    // One T>1 forward reusing the single-session block path. runBlock reads
+    // cache.length() == startPos for the causal boundary / KV write offset and
+    // targets this slot's SSM slab slice. runLinearBlock zeroes the recurrent
+    // + conv state only when cache.length() == 0 (startPos == 0 == the
+    // request's first chunk), so multi-chunk prefill carries state forward.
+    for (std::size_t b = 0; b < st.blockCount; ++b) {
+        st.qb->runBlock(b, xBuf, T, view, sb, /*traceBlock0=*/false);
+    }
+
+    std::int32_t firstTok = -1;
+    if (produceToken) {
+        // lm-head over the final prompt row -> the first generated token,
+        // identical to the token-by-token step that samples at pos ==
+        // promptLen-1 (isGen). Intermediate chunks skip this.
+        float* const normBuf = st.normB.as<float>();
+        float* const logits  = st.logitsB.as<float>();
+        _e._ops->rmsNormAsync(xBuf + (T - 1) * d_model, 1, d_model,
+                              static_cast<const float*>(st.outNorm->usmPtr),
+                              _e._config.rmsNormEps, normBuf);
+        _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, d_model,
+                        normBuf, 1, logits, st.lmScr.as<float>());
+        _e._ops->flush();
+        _e._ops->readbackToHost(st.hostLogits.data(), logits,
+                                st.vocab_lm * sizeof(float));
+        std::size_t best = 0;
+        float bv = st.hostLogits[0];
+        for (std::size_t v = 1; v < st.vocab_lm; ++v) {
+            if (st.hostLogits[v] > bv) { bv = st.hostLogits[v]; best = v; }
+        }
+        firstTok = static_cast<std::int32_t>(best);
+    } else {
+        // Intermediate chunk: no lm-head. Flush so this chunk's KV/state
+        // writes are fully committed before the next (carry) chunk reads
+        // them — matches the single-chunk path's implicit flush.
+        _e._ops->flush();
+    }
+
+    // Restore the prefill SSM base to the slab origin so the next prefillSlot
+    // (a different slot) re-offsets from a clean base.
+    sb.ssmStatePtr     = st.ssm->statePtr();
+    sb.ssmConvStatePtr = st.ssm->convStatePtr();
+    return firstTok;
+}
+
+std::size_t ServingSession::prefillChunkSize() const noexcept {
+    if (_state == nullptr || !_state->chunkedPrefill) {
+        return 0;
+    }
+    return _state->prefillChunk;
 }
 
 void ServingSession::ensureVerifyCapacity(std::size_t depth) {

@@ -117,6 +117,16 @@ public:
                          const BatchedDecodeCtx&  ctx,
                          BlockBuffers&            s);
 
+    /// Dense PagedKvPool layer index for full-attention block `blockIdx`, or
+    /// `SIZE_MAX` for recurrent (GatedDeltaNet) blocks (they hold no KV).
+    /// Exposes the private `_fullAttnDense` map so the serving prefill path
+    /// (ServingSession::prefillSlot) can build a per-block KvCache view over a
+    /// slot's contiguous pool region and reuse the single-session
+    /// `runBlock`(T>1) forward on it.
+    [[nodiscard]] std::size_t fullAttnDenseLayer(std::size_t blockIdx) const {
+        return _fullAttnDense[blockIdx];
+    }
+
     /// M-Cuda.MTP — one Multi-Token-Prediction draft step. Runs the model's
     /// native nextn module (blk.<blockCount>): eh_proj(concat(RMSNorm(hidden,
     /// hnorm), RMSNorm(embed(prevTok), enorm))) -> block-<mtp> attn+MoE (own

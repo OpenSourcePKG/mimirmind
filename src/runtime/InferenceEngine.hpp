@@ -461,6 +461,26 @@ public:
     void stepServing(std::span<const ServingSlotStep> steps,
                      std::span<std::int32_t>          outTokens);
 
+    /// M-Cuda.Batch Perf (Increment A) — prefill one physical serving `slot`'s
+    /// prompt chunk `tokens` at absolute positions `[startPos, startPos+T)` as
+    /// a single T>1 forward (reuses the single-session block path over the
+    /// slot's contiguous paged-KV region + its SsmState slab slice), instead
+    /// of token-by-token. Evolves the slot's KV + recurrent state in place.
+    /// When `produceToken` (the chunk ending at the last prompt token),
+    /// returns the greedy argmax of the final position's logits — the first
+    /// generated token (identical to the token-by-token step at pos ==
+    /// promptLen-1); otherwise returns -1. Requires chunked prefill enabled
+    /// (see `servingPrefillChunk`) and a prior `ensureServingState`.
+    [[nodiscard]] std::int32_t
+    prefillSlot(std::size_t slot, std::span<const std::int32_t> tokens,
+                std::size_t startPos, bool produceToken);
+
+    /// Prefill chunk size C (max tokens per `prefillSlot` forward), or 0 when
+    /// chunked prefill is disabled (MIMIRMIND_CHUNKED_PREFILL=0) — callers
+    /// fall back to the token-by-token prefill path. Valid after
+    /// `ensureServingState`.
+    [[nodiscard]] std::size_t servingPrefillChunk() const;
+
     /// M-Cuda.MTP Increment E1 — one batched MTP *verify* forward. `slots`
     /// is a contiguous prefix (slots[s].slot == s, N = slots.size()), each
     /// carrying `depth + 1` verify tokens (token0 + `depth` drafts).

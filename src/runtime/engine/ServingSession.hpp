@@ -53,6 +53,14 @@ public:
     void stepServing(std::span<const InferenceEngine::ServingSlotStep> steps,
                      std::span<std::int32_t>                           outTokens);
 
+    /// See InferenceEngine::prefillSlot.
+    [[nodiscard]] std::int32_t
+    prefillSlot(std::size_t slot, std::span<const std::int32_t> tokens,
+                std::size_t startPos, bool produceToken);
+
+    /// See InferenceEngine::servingPrefillChunk.
+    [[nodiscard]] std::size_t prefillChunkSize() const noexcept;
+
     /// See InferenceEngine::stepServingVerify.
     [[nodiscard]] std::vector<std::vector<float>>
     stepServingVerify(std::span<const InferenceEngine::VerifySlot> slots,

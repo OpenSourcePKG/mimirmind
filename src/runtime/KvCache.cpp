@@ -37,6 +37,49 @@ KvCache::KvCache(compute::ComputeOps& ops,
     allocateLayers(ops);
 }
 
+KvCache::KvCache(ExternalView,
+                 std::size_t              maxSeq,
+                 std::vector<std::size_t> kvDimPerLayer,
+                 std::vector<void*>       kBases,
+                 std::vector<void*>       vBases,
+                 std::size_t              initialLength,
+                 KvDtype                  dtype)
+    : _maxSeq{maxSeq},
+      _kvDim{std::move(kvDimPerLayer)},
+      _dtype{dtype},
+      _length{initialLength} {
+    const std::size_t nLayers = _kvDim.size();
+    if (kBases.size() != nLayers || vBases.size() != nLayers) {
+        throw std::invalid_argument(
+            "KvCache(ExternalView): kBases/vBases size must equal "
+            "kvDimPerLayer size");
+    }
+    if (_dtype == KvDtype::Q8_0) {
+        throw std::invalid_argument(
+            "KvCache(ExternalView): Q8_0 block storage is not a plain "
+            "external view — use F32/FP16");
+    }
+    if (initialLength > maxSeq) {
+        throw std::invalid_argument(
+            "KvCache(ExternalView): initialLength exceeds maxSeq");
+    }
+    // No allocation: owners stay empty (default-constructed), the raw
+    // pointers alias the caller-provided external storage. _kvSource is
+    // identity — every layer is its own "owner" for read purposes even
+    // though nothing is owned here.
+    _layerBytes.assign(nLayers, 0);
+    _kOwners.resize(nLayers);
+    _vOwners.resize(nLayers);
+    _kvSource.resize(nLayers);
+    _kBuf.assign(nLayers, nullptr);
+    _vBuf.assign(nLayers, nullptr);
+    for (std::size_t i = 0; i < nLayers; ++i) {
+        _kvSource[i] = i;
+        _kBuf[i]     = kBases[i];
+        _vBuf[i]     = vBases[i];
+    }
+}
+
 namespace {
 
 const char* dtypeName(KvDtype d) noexcept {

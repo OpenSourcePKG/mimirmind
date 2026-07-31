@@ -2158,6 +2158,21 @@ void InferenceEngine::stepServing(std::span<const ServingSlotStep> steps,
     _servingSession->stepServing(steps, outTokens);
 }
 
+std::int32_t InferenceEngine::prefillSlot(std::size_t slot,
+                                          std::span<const std::int32_t> tokens,
+                                          std::size_t startPos,
+                                          bool produceToken) {
+    if (_servingSession == nullptr) {
+        throw std::runtime_error("prefillSlot: ensureServingState not called");
+    }
+    return _servingSession->prefillSlot(slot, tokens, startPos, produceToken);
+}
+
+std::size_t InferenceEngine::servingPrefillChunk() const {
+    return _servingSession == nullptr ? 0
+                                      : _servingSession->prefillChunkSize();
+}
+
 std::vector<std::vector<float>>
 InferenceEngine::stepServingVerify(std::span<const VerifySlot>   slots,
                                    std::span<const std::int32_t> tokensTimeMajor,

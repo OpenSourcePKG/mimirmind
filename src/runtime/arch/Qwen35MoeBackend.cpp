@@ -558,9 +558,16 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     float* const gateBuf   = s.ssmGate.as<float>();
     // Persistent per-sequence recurrent state, bound by the engine into
     // BlockBuffers from the per-sequence SsmState (survives BlockBuffers
-    // reallocation); indexed by blockIdx.
-    float* const stateBuf  = s.ssmStatePtr     + blockIdx * stateElems;
-    float* const convState = s.ssmConvStatePtr + blockIdx * convStateElems;
+    // reallocation). Slab-aware per-layer stride (BlockBuffers convention,
+    // see BlockBuffers.hpp): the layer base steps by ssmSlabNSeq*elems so a
+    // multi-sequence slab (serving) and the single-sequence path share one
+    // indexing rule. ssmSlabNSeq defaults to 1, where this reduces to
+    // blockIdx*elems (bit-identical to the historical single-session path).
+    // ServingSession::prefillSlot pre-offsets ssmStatePtr/ssmConvStatePtr by
+    // slot*elems so this T>1 path targets that slot's slab slice.
+    const std::size_t slabNSeq = (s.ssmSlabNSeq != 0) ? s.ssmSlabNSeq : 1;
+    float* const stateBuf  = s.ssmStatePtr     + blockIdx * (slabNSeq * stateElems);
+    float* const convState = s.ssmConvStatePtr + blockIdx * (slabNSeq * convStateElems);
     float* const projOut   = s.projOut.as<float>();
     float* const matmulScr = s.matmulScratch.as<float>();
 

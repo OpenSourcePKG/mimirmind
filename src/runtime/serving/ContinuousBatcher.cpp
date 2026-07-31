@@ -7,7 +7,10 @@
 #include "core/log/Log.hpp"
 
 #include <algorithm>
+#include <exception>
+#include <span>
 #include <utility>
+#include <vector>
 
 namespace mimirmind::runtime::serving {
 
@@ -46,13 +49,14 @@ ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
     // Build the persistent per-slot serving state up front (throws for a
     // non-qwen35moe engine, before any request is accepted).
     _engine.ensureServingState(maxBatch, maxContext);
+    _prefillChunk = _engine.servingPrefillChunk();
     _slots.resize(maxBatch);
     _running = true;
     _worker  = std::thread(&ContinuousBatcher::workerLoop, this);
     MM_LOG_INFO("serving",
                 "ContinuousBatcher: started (maxBatch={} maxContext={} "
-                "maxInflight={} eosId={})",
-                maxBatch, maxContext, _maxInflight, eosId);
+                "maxInflight={} eosId={} prefillChunk={})",
+                maxBatch, maxContext, _maxInflight, eosId, _prefillChunk);
 }
 
 ContinuousBatcher::~ContinuousBatcher() {
@@ -140,6 +144,93 @@ void ContinuousBatcher::cancel(const std::shared_ptr<ServingRequest>& req) {
     _cv.notify_all();
 }
 
+void ContinuousBatcher::prefillSlotAdmitted(std::size_t slot) {
+    // Snapshot the prompt + request handle under a short lock; the GPU prefill
+    // runs without holding _mtx so submitters/streamers never block on it.
+    std::vector<std::int32_t>       prompt;
+    std::shared_ptr<ServingRequest> req;
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        if (!_slots[slot].occupied) {
+            return;   // cancelled/retired before we got here
+        }
+        prompt = _slots[slot].prompt;   // copy: read outside the lock
+        req    = _slots[slot].req;
+    }
+    const std::size_t L = prompt.size();
+    if (L == 0) {
+        return;
+    }
+
+    // Ingest the prompt as chunked T>1 forwards; the final chunk yields the
+    // first generated token (identical to the token-by-token step at pos ==
+    // promptLen-1).
+    std::int32_t firstTok = -1;
+    try {
+        const std::size_t C = _prefillChunk;
+        for (std::size_t p = 0; p < L; p += C) {
+            const std::size_t t    = std::min(C, L - p);
+            const bool        last = (p + t == L);
+            const std::span<const std::int32_t> chunk{prompt.data() + p, t};
+            const std::int32_t tk = _engine.prefillSlot(slot, chunk, p, last);
+            if (last) {
+                firstTok = tk;
+            }
+        }
+    } catch (const std::exception& ex) {
+        std::lock_guard<std::mutex> lk(_mtx);
+        Slot& s = _slots[slot];
+        if (s.occupied && s.req == req) {
+            {
+                std::lock_guard<std::mutex> rl(s.req->mtx);
+                s.req->error = std::string("prefill failed: ") + ex.what();
+                s.req->done  = true;
+                s.req->cv.notify_all();
+            }
+            s.occupied = false;
+            s.req.reset();
+            s.prompt.clear();
+        }
+        return;
+    }
+
+    // Commit: the slot enters decode at pos == promptLen with firstTok already
+    // produced. (Only the worker thread admits/frees slots, so the slot cannot
+    // have been re-used mid-prefill; the guards are defensive.)
+    std::lock_guard<std::mutex> lk(_mtx);
+    Slot& s = _slots[slot];
+    if (!s.occupied || s.req != req) {
+        return;
+    }
+    s.pos      = s.promptLen;
+    s.lastTok  = firstTok;
+    s.produced = 1;
+
+    bool cancelled = false;
+    {
+        std::lock_guard<std::mutex> rl(s.req->mtx);
+        cancelled = s.req->cancelled;
+        if (!cancelled) {
+            s.req->tokens.push_back(firstTok);
+            s.req->cv.notify_all();
+        }
+    }
+    const bool ctxFull = (s.pos + 1 >= _maxContext);
+    const bool stop =
+        cancelled || (_eosId >= 0 && firstTok == _eosId) || isStop(firstTok, s) ||
+        s.produced >= s.maxNew || ctxFull;
+    if (stop) {
+        {
+            std::lock_guard<std::mutex> rl(s.req->mtx);
+            s.req->done = true;
+            s.req->cv.notify_all();
+        }
+        s.occupied = false;
+        s.req.reset();
+        s.prompt.clear();
+    }
+}
+
 void ContinuousBatcher::workerLoop() {
     using Step = InferenceEngine::ServingSlotStep;
 
@@ -157,6 +248,7 @@ void ContinuousBatcher::workerLoop() {
 
     while (true) {
         std::size_t nActive = 0;
+        std::vector<std::size_t> toPrefill;   // slots admitted this iter (chunked)
         {
             std::unique_lock<std::mutex> lk(_mtx);
 
@@ -194,6 +286,13 @@ void ContinuousBatcher::workerLoop() {
                 s.maxNew    = p.maxNew;
                 s.produced  = 0;
                 s.stopIds   = std::move(p.stopIds);
+                // Chunked prefill: the whole prompt ingests as one or more
+                // T>1 forwards (prefillSlotAdmitted splits it into
+                // _prefillChunk-sized chunks, each carrying KV + recurrent
+                // state forward), replacing token-by-token prompt ingestion.
+                if (_prefillChunk > 0 && s.promptLen > 0) {
+                    toPrefill.push_back(i);
+                }
             }
 
             for (std::size_t i = 0; i < _maxBatch; ++i) {
@@ -205,9 +304,31 @@ void ContinuousBatcher::workerLoop() {
                 _cv.wait(lk, [this] { return !_running || !_waiting.empty(); });
                 continue;
             }
+        }
 
-            // Snapshot per-slot step inputs under the lock; run the forward
-            // outside it so submitters never block on a decode iteration.
+        // --- Chunked prefill of newly-admitted slots (Increment A) --------
+        // Each slot's whole prompt ingests as T>1 forwards over its own slot
+        // (GPU work, no lock), then the slot enters decode at pos==promptLen
+        // with its first generated token already pushed. When disabled
+        // (_prefillChunk==0) toPrefill is empty and prompts ingest
+        // token-by-token through the decode step below (legacy path).
+        for (std::size_t si : toPrefill) {
+            prefillSlotAdmitted(si);
+        }
+
+        // Snapshot per-slot step inputs under the lock; run the forward
+        // outside it so submitters never block on a decode iteration.
+        // Re-taken after prefill: a slot may have retired (eos on the first
+        // token / cancel) and prefilled slots now sit at pos==promptLen.
+        {
+            std::unique_lock<std::mutex> lk(_mtx);
+            nActive = 0;
+            for (std::size_t i = 0; i < _maxBatch; ++i) {
+                if (_slots[i].occupied) nActive = i + 1;
+            }
+            if (nActive == 0) {
+                continue;   // everything retired during prefill — loop back
+            }
             steps.resize(nActive);
             for (std::size_t i = 0; i < nActive; ++i) {
                 Step st{};
