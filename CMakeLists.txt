@@ -2531,3 +2531,60 @@ if(MIMIRMIND_ENABLE_CUDA)
     target_include_directories(cuda_parity_tests PRIVATE tests)
     target_link_libraries(cuda_parity_tests PRIVATE mimirmind_core_cuda)
 endif()
+
+# ============================================================================
+# CTest registration — thin wrapper over the standalone test executables.
+#
+# Each test above is a self-contained binary that returns non-zero on
+# failure. This block makes them visible to `ctest` so CI (and humans) can
+# get a single green/red summary instead of invoking every binary by hand:
+#
+#   cmake --build build          # build the test targets as usual
+#   ctest --test-dir build --output-on-failure
+#
+# Registration is guarded by `if(TARGET ...)` inside mm_register_test(), so
+# the backend gating above (L0 / HIP / CUDA) is respected automatically — a
+# target that was never defined is simply skipped, never a hard error.
+#
+# Labels let a runner execute only the subset its hardware supports:
+#   ctest --test-dir build -L cpu     # pure-CPU, runs on any machine
+#   ctest --test-dir build -L l0      # needs an Intel Level-Zero device
+#   ctest --test-dir build -L hip     # needs an AMD GPU
+#   ctest --test-dir build -L cuda    # needs an NVIDIA GPU
+#
+# Deliberately NOT registered: prefill_bench (wall-clock benchmark),
+# nvfp4_weight_parity and l0_ipc_testrig (diagnostic rigs taking required
+# argv). Those are not pass/fail gates and would only produce false reds.
+# ============================================================================
+enable_testing()
+
+# Register `target` with ctest under the labels passed as extra args, but
+# only when the target actually exists in this configuration.
+function(mm_register_test target)
+    if(TARGET ${target})
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES
+            LABELS "${ARGN}"
+            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    endif()
+endfunction()
+
+# Pure-CPU unit / parity tests — safe to run on any runner.
+foreach(mm_cpu_test
+        quant_tests
+        modelopt_tests
+        safetensors_tests
+        nvfp4_tests
+        backend_tests
+        arch_tests
+        ipc_tests
+        compute_tests
+        thermal_tests)
+    mm_register_test(${mm_cpu_test} cpu)
+endforeach()
+
+# Accelerator-gated tests — need the matching device present at run time.
+mm_register_test(gpu_tests         l0)
+mm_register_test(munin_tests       l0)
+mm_register_test(hip_tests         hip)
+mm_register_test(cuda_parity_tests cuda)
