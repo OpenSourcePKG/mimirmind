@@ -55,6 +55,16 @@ struct GgufTensor {
     std::uint64_t               fileOffset{0};   // within the tensor-data region
     void*                       usmPtr{nullptr}; // set by loadTensors[IntoChunks]()
 
+    // M-Cuda.MoeGroup Sub-Step E-d.2b: optional NVFP4 tensor-core grouped-MoE
+    // side banks, built additively at load only when MIMIRMIND_GROUPED_MOE=3
+    // for the routed-expert weights. `usmPtr`/`type` stay the blocked-NVFP4
+    // bank the decode path reads; these carry the FP4-TC prefill operands:
+    // plain E2M1 nibbles [nExperts,N,K/2], swizzled UE4M3 SFB, and per-expert
+    // F32 weight globals. All nullptr for every other tensor.
+    void*                       tcNibblePtr{nullptr};
+    void*                       tcSfbPtr{nullptr};
+    void*                       tcGlobalsPtr{nullptr};
+
     // Chunk placement, populated by loadTensorsIntoChunks(). Meaningless
     // (both zero) when the tensor was loaded via the per-tensor
     // UsmAllocator path — those callers do not need chunk coordinates

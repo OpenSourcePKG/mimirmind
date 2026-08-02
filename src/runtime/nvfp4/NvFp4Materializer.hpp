@@ -74,6 +74,14 @@ struct MaterializedTensor {
     bool                       isQ6K{false};  ///< true if buffer holds Q6_K super-blocks (MoE experts)
     bool                       isFp8{false};  ///< true if buffer holds blocked-FP8 E4M3 (attn projections)
     bool                       isNvfp4Blk{false}; ///< true if buffer holds blocked-NVFP4 (full-attn projections)
+
+    // E-d.2b: additive FP4-tensor-core grouped-MoE side banks (routed experts,
+    // MIMIRMIND_GROUPED_MOE=3 only). `buffer` stays the blocked-NVFP4 bank for
+    // decode; these own the TC prefill operands. Empty otherwise.
+    bool                       isNvfp4Tc{false};
+    compute::ComputeBuffer     tcNibbleBank;   ///< [nExperts, N, K/2] plain E2M1
+    compute::ComputeBuffer     tcSfbBank;      ///< swizzled UE4M3 SFB bank
+    compute::ComputeBuffer     tcGlobalsBank;  ///< [nExperts] F32 weight globals
 };
 
 /**

@@ -36,6 +36,13 @@ core::gguf::WeightsMap buildBf16WeightsMap(std::vector<MaterializedTensor>& mats
                                      ? (static_cast<std::size_t>(m.elems) / 32)  * 34
                      : static_cast<std::size_t>(m.elems) * (m.isF32 ? 4 : 2);
         t.usmPtr     = m.buffer.get();
+        // E-d.2b: carry the additive FP4-TC grouped-MoE side banks (nullptr
+        // unless the loader built them for this routed-expert tensor).
+        if (m.isNvfp4Tc) {
+            t.tcNibblePtr  = m.tcNibbleBank.get();
+            t.tcSfbPtr     = m.tcSfbBank.get();
+            t.tcGlobalsPtr = m.tcGlobalsBank.get();
+        }
         tensors.push_back(std::move(t));
     }
 

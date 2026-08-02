@@ -96,6 +96,16 @@ public:
                              const void* blockScale, float global,
                              std::uint64_t rows, std::uint64_t in);
 
+    /**
+     * E-d.2b: swizzle one expert's NVFP4 weight block scales into the CUTLASS
+     * SFB slot the tensor-core grouped GEMM reads. `srcScales` [rows, in/16]
+     * F8_E4M3 (row-major) -> `dstSlot` in the swizzled 128x4 layout. The slot
+     * (moeSwizzledScaleBytes(rows, in/16) bytes) is zeroed here first (padding),
+     * then filled. Enqueued on the stream.
+     */
+    void swizzleWeightSf(void* dstSlot, const void* srcScales,
+                         std::uint64_t rows, std::uint64_t in);
+
 private:
     core::cuda::CudaComputeContext& _ctx;
     ComputeOps&                     _ops;
@@ -109,6 +119,7 @@ private:
     core::cuda::CudaModule          _quantQ6KModule;
     core::cuda::CudaModule          _quantFp8Module;
     core::cuda::CudaModule          _repackNvblkModule;
+    core::cuda::CudaModule          _sfSwizzleModule;
     core::cuda::CudaKernel          _dqNvfp4;
     core::cuda::CudaKernel          _dqFp8;
     core::cuda::CudaKernel          _castBf16;
@@ -120,6 +131,7 @@ private:
     core::cuda::CudaKernel          _quantQ6K;
     core::cuda::CudaKernel          _quantFp8;
     core::cuda::CudaKernel          _repackNvblk;
+    core::cuda::CudaKernel          _sfSwizzle;
 };
 
 } // namespace mimirmind::compute::cuda

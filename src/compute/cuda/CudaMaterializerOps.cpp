@@ -70,6 +70,7 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _quantQ6KModule{loadModule(ctx.cudaContext(), "quantize_bf16_to_q6k")},
       _quantFp8Module{loadModule(ctx.cudaContext(), "quantize_bf16_to_fp8")},
       _repackNvblkModule{loadModule(ctx.cudaContext(), "repackage_nvfp4_to_blk")},
+      _sfSwizzleModule{loadModule(ctx.cudaContext(), "moe_weight_sf_swizzle")},
       _dqNvfp4{_nvfp4Module.getFunction("dequant_nvfp4")},
       _dqFp8{_fp8Module.getFunction("dequant_fp8")},
       _castBf16{_castModule.getFunction("cast_bf16_to_f32")},
@@ -80,7 +81,8 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _quantQ4K{_quantQ4KModule.getFunction("quantize_bf16_to_q4k")},
       _quantQ6K{_quantQ6KModule.getFunction("quantize_bf16_to_q6k")},
       _quantFp8{_quantFp8Module.getFunction("quantize_bf16_to_fp8")},
-      _repackNvblk{_repackNvblkModule.getFunction("repackage_nvfp4_to_blk")} {}
+      _repackNvblk{_repackNvblkModule.getFunction("repackage_nvfp4_to_blk")},
+      _sfSwizzle{_sfSwizzleModule.getFunction("moe_weight_sf_swizzle")} {}
 
 ComputeBuffer CudaMaterializerOps::allocate(std::size_t bytes) {
     return _ops.allocate(bytes);
@@ -247,6 +249,34 @@ void CudaMaterializerOps::repackageNvfp4ToBlk(void* dst, const void* packed,
                         static_cast<std::uint32_t>(rows),
                         static_cast<std::uint32_t>(in / 32), 1,
                         16, 1, 1);
+}
+
+void CudaMaterializerOps::swizzleWeightSf(void* dstSlot, const void* srcScales,
+                                          std::uint64_t rows, std::uint64_t in) {
+    const std::uint64_t ksf       = in / 16;
+    const std::uint64_t numKTiles = (ksf + 3) / 4;
+    const std::uint64_t numMTiles = (rows + 127) / 128;
+    const std::size_t   slotBytes = static_cast<std::size_t>(512) * numMTiles * numKTiles;
+
+    // Zero the padded slot first (rows->128, ksf->4 padding is never written).
+    const cudaError_t rc = cudaMemsetAsync(dstSlot, 0, slotBytes, _ctx.stream().handle());
+    if (rc != cudaSuccess) {
+        throw std::runtime_error(std::string("CudaMaterializerOps::swizzleWeightSf: "
+                                             "cudaMemsetAsync failed: ")
+                                 + cudaGetErrorString(rc));
+    }
+
+    // Kernel: (u8* src, u8* dst, int rows, int ksf); grid (rows, ceil(ksf/128)).
+    constexpr std::uint32_t kLocal = 128;
+    _sfSwizzle.clearArgs();
+    _sfSwizzle.setPtr  (0, srcScales);
+    _sfSwizzle.setPtr  (1, dstSlot);
+    _sfSwizzle.setValue(2, static_cast<std::int32_t>(rows));
+    _sfSwizzle.setValue(3, static_cast<std::int32_t>(ksf));
+    _sfSwizzle.launch(_ctx.stream(),
+                      static_cast<std::uint32_t>(rows),
+                      static_cast<std::uint32_t>((ksf + kLocal - 1) / kLocal), 1,
+                      kLocal, 1, 1);
 }
 
 float CudaMaterializerOps::readF32(const void* devPtr) {

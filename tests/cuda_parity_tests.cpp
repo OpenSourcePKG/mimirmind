@@ -20,9 +20,9 @@
 #include "core/gguf/GgufTypes.hpp"
 #include "compute/quant/Q8_0.hpp"
 
+#include "core/modelopt/BlockScaleSwizzle.hpp" // swizzledBlockScaleBytes / swizzleBlockScale
 #ifdef MIMIRMIND_HAVE_CUTLASS_MOE
 #include "MoeGroupedGemmNvfp4Tc.hpp"          // E-d.3 CUTLASS grouped NVFP4-TC GEMM
-#include "core/modelopt/BlockScaleSwizzle.hpp" // swizzledBlockScaleBytes
 #endif
 
 #include <algorithm>
@@ -2388,6 +2388,50 @@ TEST(cuda_moe_act_quant_nvfp4_parity_kpad) {
 TEST(cuda_moe_act_quant_nvfp4_parity_gscale) {
     // Non-unit global scale (K=512 = down-proj intermediate).
     checkActQuantNvfp4Parity(/*M=*/96, /*K=*/512, /*gscale=*/0.5f, 0x1DE7u);
+}
+
+// M-Cuda.MoeGroup Sub-Step E-d.2b — the device weight-SF swizzle kernel
+// (moe_weight_sf_swizzle) must be byte-identical to the host swizzleBlockScale
+// (verified vs cute's tile_atom_to_shape_SFA on GB10), so the loader can build
+// the SFB bank on-device without a D2H/H2D round-trip.
+TEST(cuda_moe_weight_sf_swizzle_parity) {
+    namespace cc = ::mimirmind::core::cuda;
+    namespace mo = ::mimirmind::core::modelopt;
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    cc::CudaModule mod = cc::CudaModule::fromFile(
+        ctx.cudaContext(), resolvePtx("moe_weight_sf_swizzle"));
+    cc::CudaKernel kern = mod.getFunction("moe_weight_sf_swizzle");
+
+    const std::array<std::array<int, 2>, 3> shapes{{{40, 128}, {130, 2048}, {17, 48}}};
+    for (const auto& sh : shapes) {
+        const int rows = sh[0], in = sh[1], ksf = in / 16;
+        const std::size_t bytes = mo::swizzledBlockScaleBytes(
+            static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(ksf));
+
+        Lcg g{static_cast<std::uint32_t>(0x1234u + rows)};
+        std::vector<unsigned char> src(static_cast<std::size_t>(rows) * ksf);
+        for (auto& b : src) { g.s = g.s * 1664525u + 1013904223u; b = static_cast<unsigned char>(g.s >> 24); }
+
+        std::vector<unsigned char> ref(bytes);
+        mo::swizzleBlockScale(src.data(), rows, ksf, ref.data());
+
+        auto dSrc = uploadRaw(ops, src);
+        std::vector<unsigned char> zero(bytes, 0u);
+        auto dDst = uploadRaw(ops, zero);
+        kern.setPtr  (0, dSrc.get());
+        kern.setPtr  (1, dDst.get());
+        kern.setValue(2, rows);
+        kern.setValue(3, ksf);
+        kern.launch(ctx.stream(), static_cast<std::uint32_t>(rows),
+                    static_cast<std::uint32_t>((ksf + 127) / 128), 1, 128, 1, 1);
+        ops.flush();
+
+        std::vector<unsigned char> got(bytes);
+        ops.readbackToHost(got.data(), dDst.get(), bytes);
+        for (std::size_t i = 0; i < bytes; ++i) EXPECT_EQ(got[i], ref[i]);
+        std::printf("[weight-sf-swizzle] rows=%d in=%d bytes=%zu OK\n", rows, in, bytes);
+    }
 }
 
 #ifdef MIMIRMIND_HAVE_CUTLASS_MOE
