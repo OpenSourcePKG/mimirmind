@@ -265,12 +265,18 @@ private:
     /// the per-expert launch bounds; routing/gather/scatter stay device-side.
     /// Numerically a different fold order than the fused-K path — validated by
     /// relative logits parity + coherence, not bit-exactness.
+    /// `preferBlocked` (GD-a, decode): force the device-driven blocked grouped
+    /// GEMM and never the FP4-TC branch, even when the experts carry TC sidecar
+    /// pointers (additive-default decode). Decode M is ~1 row/expert, where TC's
+    /// 128-row padding is pure waste; the win is weight-read amortisation on the
+    /// blocked kernel.
     void runMoeFfnGrouped(std::size_t    blockIdx,
                           const float*   moeInput,
                           std::size_t    nSeq,
                           std::int32_t*  expIdxSlot,
                           float*         kwSlot,
-                          BlockBuffers&  s);
+                          BlockBuffers&  s,
+                          bool           preferBlocked = false);
 
     /// M-Cuda.Batch D2a — batched full-attention layer (paged KV). Mirrors
     /// runFullAttentionBlock with the T dimension replaced by nSeq and the
@@ -334,6 +340,14 @@ private:
     bool _moeGroupedDeviceDriven{false};
     // E-d.4b: FP4-tensor-core grouped prefill (MIMIRMIND_GROUPED_MOE=3).
     bool _moeGroupedTc{false};
+    // M-Cuda.MoeGroup-Decode GD-a: route the batched *decode* MoE through the
+    // device-driven blocked grouped GEMM instead of the per-token fused-K path
+    // (env MIMIRMIND_GROUPED_MOE_DECODE=1). The decode ceiling is expert-weight
+    // bandwidth — fused-K re-reads each expert per token; grouped reads it once
+    // per tile. Forces the blocked branch (never TC — decode M is tiny, TC's
+    // 128-row pad is pure waste). Opt-in, off by default; needs NVFP4_BLK banks
+    // (the additive-default decode format).
+    bool _moeGroupedDecode{false};
     // Host mirror of the device expert-offset table (moe_group_build output),
     // read back once per grouped MoE layer to drive the per-expert launches
     // (host-driven Option 1 only; the device-driven path never reads it back).

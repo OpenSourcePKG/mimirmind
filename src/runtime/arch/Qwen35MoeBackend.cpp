@@ -91,6 +91,12 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
             _moeGroupedPrefill = true;   // route prefill through runMoeFfnGrouped
         }
     }
+    // M-Cuda.MoeGroup-Decode GD-a: independent opt-in for the *decode* path.
+    // Routes batched-decode routed-MoE through the blocked grouped GEMM to
+    // amortise expert-weight reads across the batch (the ~70 gen-tok/s ceiling).
+    if (const char* d = std::getenv("MIMIRMIND_GROUPED_MOE_DECODE")) {
+        _moeGroupedDecode = (d[0] == '1' && d[1] == '\0');
+    }
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     if (const char* d = std::getenv("MIMIRMIND_SSM_DUMP")) {
         _ssmDump    = true;
@@ -1328,7 +1334,8 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
                                         std::size_t    nSeq,
                                         std::int32_t*  expIdxSlot,
                                         float*         kwSlot,
-                                        BlockBuffers&  s) {
+                                        BlockBuffers&  s,
+                                        bool           preferBlocked) {
     const auto& w = _weights;
 
     // Same layout gate as runMoeFfnBatched: SEPARATE gate/up + down banks the
@@ -1374,6 +1381,19 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         return;
     }
 
+    // GD-a: the decode grouped path only supports the blocked NVFP4 bank (the
+    // scalar device-driven grouped GEMM reads gateExps.usmPtr as a blocked
+    // super-block bank). For any other layout (e.g. tc-only NVFP4_TC, where
+    // usmPtr is the plain-nibble bank, or Q4_K/BF16) stay on the fused-K batched
+    // path rather than dropping into the slow host-driven per-expert loop.
+    if (preferBlocked &&
+        (gateExps.type != core::gguf::GgmlType::NVFP4_BLK ||
+         upExps.type   != core::gguf::GgmlType::NVFP4_BLK ||
+         downExps.type != core::gguf::GgmlType::NVFP4_BLK)) {
+        runMoeFfnBatched(blockIdx, moeInput, nSeq, expIdxSlot, kwSlot, s);
+        return;
+    }
+
     float* const upOutBuf      = s.upOut.as<float>();
     float* const matmulScratch = s.matmulScratch.as<float>();
     float* const moeAccumBuf   = s.moeAccumBuf.as<float>();
@@ -1407,14 +1427,17 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     // FP4-tensor-core grouped path: the routed experts are the NVFP4_TC format
     // (loader built the nibble + swizzled-SFB + globals banks) and CUTLASS is
     // linked. Type-driven, so it is the default whenever those banks exist.
+    // GD-a: preferBlocked (decode) forces the blocked branch — never TC, even
+    // though additive-default NVFP4_BLK experts carry TC sidecar pointers.
     const bool tcGrouped =
+        !preferBlocked &&
         _ops.moeGroupedGemmNvfp4TcAvailable() &&
         gateExps.tcNibblePtr != nullptr &&
         upExps.tcNibblePtr   != nullptr &&
         downExps.tcNibblePtr != nullptr;
 
     const bool deviceDrivenGrouped =
-        !tcGrouped && _moeGroupedDeviceDriven &&
+        !tcGrouped && (_moeGroupedDeviceDriven || preferBlocked) &&
         gateExps.type == core::gguf::GgmlType::NVFP4_BLK &&
         upExps.type   == core::gguf::GgmlType::NVFP4_BLK &&
         downExps.type == core::gguf::GgmlType::NVFP4_BLK;
@@ -1773,7 +1796,14 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
     // --- post-attention norm -> batched MoE -> FFN residual ----------
     _ops.rmsNormAsync(x, nSeq, d_model,
                       static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
-    runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
+    if (_moeGroupedDecode) {
+        // GD-a: expert-grouped decode — amortise routed expert-weight reads
+        // across the batch (blocked bank; preferBlocked forces the non-TC path).
+        runMoeFfnGrouped(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s,
+                         /*preferBlocked=*/true);
+    } else {
+        runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
+    }
     _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nSeq * d_model);
 }
 
@@ -1915,7 +1945,14 @@ void Qwen35MoeBackend::runLinearBlockBatched(
     // --- post-attn norm -> batched MoE -> FFN residual ---------------
     _ops.rmsNormAsync(x, nSeq, d_model,
                       static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
-    runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
+    if (_moeGroupedDecode) {
+        // GD-a: expert-grouped decode — amortise routed expert-weight reads
+        // across the batch (blocked bank; preferBlocked forces the non-TC path).
+        runMoeFfnGrouped(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s,
+                         /*preferBlocked=*/true);
+    } else {
+        runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
+    }
     _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nSeq * d_model);
 }
 
