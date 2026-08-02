@@ -20,12 +20,18 @@
 #include "core/gguf/GgufTypes.hpp"
 #include "compute/quant/Q8_0.hpp"
 
+#ifdef MIMIRMIND_HAVE_CUTLASS_MOE
+#include "MoeGroupedGemmNvfp4Tc.hpp"          // E-d.3 CUTLASS grouped NVFP4-TC GEMM
+#include "core/modelopt/BlockScaleSwizzle.hpp" // swizzledBlockScaleBytes
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <chrono>
 #include <filesystem>
 #include <string>
@@ -2383,6 +2389,178 @@ TEST(cuda_moe_act_quant_nvfp4_parity_gscale) {
     // Non-unit global scale (K=512 = down-proj intermediate).
     checkActQuantNvfp4Parity(/*M=*/96, /*K=*/512, /*gscale=*/0.5f, 0x1DE7u);
 }
+
+#ifdef MIMIRMIND_HAVE_CUTLASS_MOE
+// M-Cuda.MoeGroup Sub-Step E-d.3 — end-to-end numeric parity of the CUTLASS
+// block-scaled NVFP4 tensor-core grouped GEMM (runGroupedNvfp4TcBf16) against a
+// CPU dequant-and-matmul reference. Both A and B are quantised on the device by
+// the E-d.1 act-quant kernel (F32 -> NVFP4 E2M1 + swizzled UE4M3 SF): A=[M,K]
+// gives SFA (rows=M), the same kernel on the weight [N,K] gives B nibbles +
+// SFB (rows=N). gscale=1 for both, so per-group alpha=1 and each quantised
+// value reconstructs to e2m1(nibble)*e4m3(SF). The reference dequantises the
+// SAME device-side nibbles/scales the GEMM reads, so the only slack is bf16
+// output rounding + FP accumulation order — a tight tolerance.
+namespace {
+
+// Decode a CUTLASS bfloat16_t (stored as the high 16 bits of an F32).
+float aq_dec_bf16(std::uint16_t b) {
+    std::uint32_t bits = static_cast<std::uint32_t>(b) << 16;
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+// Quantise a host [rows, K] F32 matrix to NVFP4 via moe_act_quant_nvfp4.
+// Returns the device nibble bank [rows*K/2], the device swizzled SF bank, and
+// keeps host copies of both for the CPU reference. gscale=1.
+struct QuantOperand {
+    ::mimirmind::compute::ComputeBuffer nib;   // [rows*K/2] E2M1
+    ::mimirmind::compute::ComputeBuffer sf;    // swizzled UE4M3 (pre-zeroed)
+    std::vector<unsigned char>          nibHost;
+    std::vector<unsigned char>          sfHost;
+    int rows{0};
+    int K{0};
+    int numKTiles{0};
+};
+
+QuantOperand quantizeNvfp4(GpuOps& ops, ::mimirmind::core::cuda::CudaKernel& kern,
+                           CudaComputeContext& ctx,
+                           const std::vector<float>& X, int rows, int K) {
+    namespace mo = ::mimirmind::core::modelopt;
+    const int nBlocks   = K / 16;
+    const int numKTiles = (nBlocks + 3) / 4;
+    const std::size_t sfBytes = mo::swizzledBlockScaleBytes(
+        static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(nBlocks));
+
+    QuantOperand q;
+    q.rows = rows; q.K = K; q.numKTiles = numKTiles;
+    q.nib = ops.allocate(static_cast<std::size_t>(rows) * K / 2);
+    std::vector<unsigned char> sfZero(sfBytes, 0u);
+    q.sf = uploadRaw(ops, sfZero);
+    auto dX = uploadRaw(ops, X);
+
+    kern.setPtr  (0, dX.get());
+    kern.setPtr  (1, q.nib.get());
+    kern.setPtr  (2, q.sf.get());
+    kern.setValue(3, 1.0f);      // gscale = 1
+    kern.setValue(4, rows);
+    kern.setValue(5, K);
+    const std::uint32_t gy = static_cast<std::uint32_t>((nBlocks + 255) / 256);
+    kern.launch(ctx.stream(), static_cast<std::uint32_t>(rows), gy, 1, 256, 1, 1);
+    ops.flush();
+
+    q.nibHost.resize(static_cast<std::size_t>(rows) * K / 2);
+    q.sfHost.resize(sfBytes);
+    ops.readbackToHost(q.nibHost.data(), q.nib.get(), q.nibHost.size());
+    ops.readbackToHost(q.sfHost.data(),  q.sf.get(),  q.sfHost.size());
+    return q;
+}
+
+// Dequantised value of element (r, k) of a quantised operand.
+double dequantElem(const QuantOperand& q, int r, int k) {
+    const int blk = k / 16;
+    const std::size_t byte = (static_cast<std::size_t>(r) * q.K + k) / 2;
+    const unsigned nib = (k & 1) ? (q.nibHost[byte] >> 4) & 0xF
+                                 :  q.nibHost[byte]       & 0xF;
+    const double sf = aq_dec_e4m3(q.sfHost[aq_test_sf_offset(r, blk, q.numKTiles)]);
+    return aq_dec_e2m1(nib) * sf;
+}
+
+void checkGroupedNvfp4TcParity(const std::vector<std::array<int, 3>>& groups,
+                               std::uint32_t seed) {
+    namespace cc = ::mimirmind::core::cuda;
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    cc::CudaModule mod = cc::CudaModule::fromFile(ctx.cudaContext(),
+                                                  resolvePtx("moe_act_quant_nvfp4"));
+    cc::CudaKernel kern = mod.getFunction("moe_act_quant_nvfp4");
+
+    const int G = static_cast<int>(groups.size());
+    std::vector<int> mH(G), nH(G), kH(G);
+    std::vector<QuantOperand> A, B;
+    A.reserve(G); B.reserve(G);
+    std::vector<::mimirmind::compute::ComputeBuffer> dOut, dAlphaVal;
+    std::vector<const void*>  pA(G), pSFA(G), pB(G), pSFB(G);
+    std::vector<void*>        pD(G);
+    std::vector<const float*> pAlpha(G);
+
+    Lcg g{seed};
+    for (int e = 0; e < G; ++e) {
+        const int M = groups[e][0], N = groups[e][1], K = groups[e][2];
+        mH[e] = M; nH[e] = N; kH[e] = K;
+        std::vector<float> Xa(static_cast<std::size_t>(M) * K);
+        std::vector<float> Xb(static_cast<std::size_t>(N) * K);
+        for (auto& v : Xa) v = g.next();          // ~[-1,1]
+        for (auto& v : Xb) v = g.next();
+        A.push_back(quantizeNvfp4(ops, kern, ctx, Xa, M, K));
+        B.push_back(quantizeNvfp4(ops, kern, ctx, Xb, N, K));
+
+        auto d = ops.allocate(static_cast<std::size_t>(M) * N * 2); // bf16
+        dOut.push_back(std::move(d));
+        std::vector<float> one{1.0f};
+        dAlphaVal.push_back(uploadRaw(ops, one));
+
+        pA[e]    = A[e].nib.get(); pSFA[e] = A[e].sf.get();
+        pB[e]    = B[e].nib.get(); pSFB[e] = B[e].sf.get();
+        pD[e]    = dOut[e].get();
+        pAlpha[e]= static_cast<const float*>(dAlphaVal[e].get());
+    }
+
+    // Device arrays of device pointers (the grouped operand arrays).
+    auto dpA = uploadRaw(ops, pA);
+    auto dpSFA = uploadRaw(ops, pSFA);
+    auto dpB = uploadRaw(ops, pB);
+    auto dpSFB = uploadRaw(ops, pSFB);
+    auto dpD = uploadRaw(ops, pD);
+    auto dpAlpha = uploadRaw(ops, pAlpha);
+    ops.flush();
+
+    const int rc = ::mimirmind::kernels::cutlassmoe::runGroupedNvfp4TcBf16(
+        G, mH.data(), nH.data(), kH.data(),
+        static_cast<const void* const*>(dpA.get()),
+        static_cast<const void* const*>(dpSFA.get()),
+        static_cast<const void* const*>(dpB.get()),
+        static_cast<const void* const*>(dpSFB.get()),
+        reinterpret_cast<const float* const*>(dpAlpha.get()),
+        static_cast<void* const*>(dpD.get()),
+        ctx.stream().handle());
+    EXPECT_EQ(rc, 0);
+
+    double maxRel = 0.0, maxAbs = 0.0;
+    for (int e = 0; e < G; ++e) {
+        const int M = mH[e], N = nH[e], K = kH[e];
+        std::vector<std::uint16_t> D(static_cast<std::size_t>(M) * N);
+        ops.readbackToHost(D.data(), dOut[e].get(), D.size() * sizeof(std::uint16_t));
+        for (int m = 0; m < M; ++m) {
+            for (int n = 0; n < N; ++n) {
+                double ref = 0.0;
+                for (int k = 0; k < K; ++k)
+                    ref += dequantElem(A[e], m, k) * dequantElem(B[e], n, k);
+                const double got = aq_dec_bf16(D[static_cast<std::size_t>(m) * N + n]);
+                const double aerr = std::fabs(got - ref);
+                const double rerr = aerr / (std::fabs(ref) + 1e-3);
+                maxAbs = std::max(maxAbs, aerr);
+                maxRel = std::max(maxRel, rerr);
+                // bf16 out (8-bit mantissa) + FP accumulation order: ~1% rel.
+                EXPECT_TRUE(aerr <= 0.02 * std::fabs(ref) + 0.05);
+            }
+        }
+    }
+    std::printf("[grouped-nvfp4-tc] G=%d maxAbs=%.3e maxRel=%.3e OK\n",
+                G, maxAbs, maxRel);
+}
+
+} // namespace
+
+TEST(cuda_moe_grouped_nvfp4_tc_parity_single) {
+    checkGroupedNvfp4TcParity({{48, 64, 64}}, 0x3311u);
+}
+
+TEST(cuda_moe_grouped_nvfp4_tc_parity_multi) {
+    // Variable M per group (the MoE case: tokens/expert differ), shared-ish N/K.
+    checkGroupedNvfp4TcParity({{32, 64, 64}, {16, 128, 128}, {80, 64, 128}}, 0x77A2u);
+}
+#endif // MIMIRMIND_HAVE_CUTLASS_MOE
 
 int main() {
     return mm::test::run();
