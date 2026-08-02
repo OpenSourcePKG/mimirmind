@@ -411,7 +411,7 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
         // the batched fused-K path.
         const auto* gExpsRoute = _weights.findBlock(blockIdx, "ffn_gate_exps.weight");
         const bool tcRoute = gExpsRoute != nullptr
-            && gExpsRoute->type == core::gguf::GgmlType::NVFP4_TC;
+            && gExpsRoute->tcNibblePtr != nullptr;   // additive or tc-only
         if (tcRoute || _moeGroupedPrefill) {
             runMoeFfnGrouped(blockIdx, normBuf, T, _prefillMoeExpIdx,
                              _prefillMoeKw, s);
@@ -767,7 +767,7 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
         // the batched fused-K path.
         const auto* gExpsRoute = _weights.findBlock(blockIdx, "ffn_gate_exps.weight");
         const bool tcRoute = gExpsRoute != nullptr
-            && gExpsRoute->type == core::gguf::GgmlType::NVFP4_TC;
+            && gExpsRoute->tcNibblePtr != nullptr;   // additive or tc-only
         if (tcRoute || _moeGroupedPrefill) {
             runMoeFfnGrouped(blockIdx, normBuf, T, _prefillMoeExpIdx,
                              _prefillMoeKw, s);
@@ -1409,9 +1409,9 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     // linked. Type-driven, so it is the default whenever those banks exist.
     const bool tcGrouped =
         _ops.moeGroupedGemmNvfp4TcAvailable() &&
-        gateExps.type == core::gguf::GgmlType::NVFP4_TC &&
-        upExps.type   == core::gguf::GgmlType::NVFP4_TC &&
-        downExps.type == core::gguf::GgmlType::NVFP4_TC;
+        gateExps.tcNibblePtr != nullptr &&
+        upExps.tcNibblePtr   != nullptr &&
+        downExps.tcNibblePtr != nullptr;
 
     const bool deviceDrivenGrouped =
         !tcGrouped && _moeGroupedDeviceDriven &&

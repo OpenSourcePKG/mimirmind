@@ -385,17 +385,20 @@ void Nvfp4Loader::load(InferenceEngine& e,
                 || n.ends_with(".ffn_down_exps.weight");
         };
         if (moeMode == "nvfp4" && e._nvfp4Model) {
-            // Routed experts: FP4-tensor-core format (E-d) when CUTLASS is
-            // linked — one plain-nibble bank + swizzled UE4M3 SFB + per-expert
-            // F32 globals, used by BOTH prefill (CUTLASS grouped GEMM) and decode
-            // (moe_*_fused_k_nvfp4tc). This is the sole routed-expert format, so
-            // no blocked-NVFP4 bank is built (halves routed-expert memory).
-            // MIMIRMIND_GROUPED_MOE=0 forces the legacy blocked bank instead.
-            const bool tcMode = [&] {
-                const char* g = std::getenv("MIMIRMIND_GROUPED_MOE");
-                if (g != nullptr && std::string_view(g) == "0") return false;
-                return e._ops->moeGroupedGemmNvfp4TcAvailable();
-            }();
+            // Routed experts, three modes (MIMIRMIND_GROUPED_MOE):
+            //   default = "additive": blocked-NVFP4 bank (decode) + FP4-TC side
+            //             banks (prefill grouped GEMM). Both wins, ~2x routed
+            //             memory. The default when CUTLASS is linked.
+            //   "3" = "tc-only": one plain-nibble bank (NVFP4_TC) used by BOTH
+            //             prefill AND decode; no blocked bank (saves memory, but
+            //             the TC decode kernel is ~18% slower than blocked).
+            //   "0" = "blocked": legacy blocked-NVFP4 only (no prefill win).
+            const bool tcAvail = e._ops->moeGroupedGemmNvfp4TcAvailable();
+            const char* gEnv = std::getenv("MIMIRMIND_GROUPED_MOE");
+            const std::string_view gv = gEnv ? std::string_view(gEnv) : std::string_view();
+            const bool forceBlocked = (gv == "0") || !tcAvail;
+            const bool tcOnly   = !forceBlocked && (gv == "3");
+            const bool additive = !forceBlocked && !tcOnly;   // default
             std::size_t nBanks = 0, tcBanks = 0;
             std::uint64_t bytesBefore = 0, bytesAfter = 0;
 
@@ -425,8 +428,8 @@ void Nvfp4Loader::load(InferenceEngine& e,
                 const std::uint64_t tcN = step.sources.empty() ? 0 : step.sources.front().rows;
                 const std::uint64_t tcK = step.sources.empty() ? 0 : step.sources.front().in;
 
-                if (tcMode && nExp > 0 && tcK % 32 == 0) {
-                    // --- FP4-TC banks (nibbles = the tensor buffer) ------------
+                if (tcOnly && nExp > 0 && tcK % 32 == 0) {
+                    // --- FP4-TC-only banks (nibbles = the tensor buffer) -------
                     const std::size_t nibBytes = static_cast<std::size_t>(it->elems) / 2;
                     const std::size_t sfbBytes =
                         core::modelopt::moeSwizzledScaleBankBytes(
@@ -472,11 +475,27 @@ void Nvfp4Loader::load(InferenceEngine& e,
                     it->isNvfp4Tc     = true;
                     ++tcBanks;
                 } else {
-                    // --- legacy blocked-NVFP4 bank (20-byte supers) -----------
+                    // --- blocked-NVFP4 bank (decode) [+ additive TC sidecars
+                    //     for the prefill grouped GEMM] --------------------------
                     const std::size_t blkBytes =
                         (static_cast<std::size_t>(it->elems) / 32) * 20;
                     compute::ComputeBuffer bank = devOps.allocate(blkBytes);
                     auto* bankBytes = static_cast<std::uint8_t*>(bank.get());
+                    const bool tcAdd = additive && nExp > 0 && tcK % 32 == 0;
+                    compute::ComputeBuffer tcNib, tcSfb, tcGlob;
+                    std::uint8_t *tcNibB = nullptr, *tcSfbB = nullptr;
+                    std::size_t sfbBytes = 0;
+                    std::vector<float> tcGlobHost;
+                    if (tcAdd) {
+                        sfbBytes = core::modelopt::moeSwizzledScaleBankBytes(
+                            static_cast<std::uint64_t>(nExp), tcN, tcK / 16);
+                        tcNib  = devOps.allocate(static_cast<std::size_t>(it->elems) / 2);
+                        tcSfb  = devOps.allocate(sfbBytes);
+                        tcGlob = devOps.allocate(static_cast<std::size_t>(nExp) * sizeof(float));
+                        tcNibB = static_cast<std::uint8_t*>(tcNib.get());
+                        tcSfbB = static_cast<std::uint8_t*>(tcSfb.get());
+                        tcGlobHost.assign(static_cast<std::size_t>(nExp), 0.0f);
+                    }
                     bool ok = true;
                     for (const auto& src : step.sources) {
                         const runtime::nvfp4::NvFp4DeviceTensor *pk, *bs, *gs;
@@ -489,14 +508,41 @@ void Nvfp4Loader::load(InferenceEngine& e,
                             (static_cast<std::size_t>(src.dstElemOffset) / 32) * 20;
                         devOps.repackageNvfp4ToBlk(bankBytes + byteOff, pk->devPtr,
                                                    bs->devPtr, global, src.rows, src.in);
+                        if (tcAdd) {
+                            const int eIdx = static_cast<int>(
+                                src.dstElemOffset
+                                / (static_cast<std::uint64_t>(src.rows) * src.in));
+                            devOps.copyBytes(
+                                tcNibB + static_cast<std::size_t>(eIdx) * src.rows * (src.in / 2),
+                                pk->devPtr,
+                                static_cast<std::size_t>(src.rows) * (src.in / 2));
+                            devOps.swizzleWeightSf(
+                                tcSfbB + static_cast<std::size_t>(eIdx)
+                                    * core::modelopt::moeSwizzledScaleStride(src.rows, src.in / 16),
+                                bs->devPtr, src.rows, src.in);
+                            if (eIdx >= 0 && eIdx < nExp) {
+                                tcGlobHost[static_cast<std::size_t>(eIdx)] = global;
+                            }
+                        }
                     }
                     if (!ok) continue;
+                    if (tcAdd) {
+                        e._ops->uploadHostBytes(tcGlob.get(), tcGlobHost.data(),
+                                                tcGlobHost.size() * sizeof(float));
+                    }
                     cudaCtx.stream().synchronize();
                     bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
                     bytesAfter  += blkBytes;
                     it->buffer     = std::move(bank);
                     it->isNvfp4Blk = true;
                     ++nBanks;
+                    if (tcAdd) {
+                        bytesAfter += static_cast<std::uint64_t>(it->elems) / 2 + sfbBytes;
+                        it->tcNibbleBank  = std::move(tcNib);
+                        it->tcSfbBank     = std::move(tcSfb);
+                        it->tcGlobalsBank = std::move(tcGlob);
+                        ++tcBanks;
+                    }
                 }
             }
             MM_LOG_INFO("engine",

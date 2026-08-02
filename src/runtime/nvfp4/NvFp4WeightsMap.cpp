@@ -42,7 +42,15 @@ core::gguf::WeightsMap buildBf16WeightsMap(std::vector<MaterializedTensor>& mats
         // swizzled SFB + per-expert globals ride as side pointers, and
         // tcNibblePtr aliases usmPtr so the prefill grouped path reads the same.
         if (m.isNvfp4Tc) {
+            // tc-only: the main buffer IS the nibble bank; type is NVFP4_TC so
+            // decode uses the TC kernels.
             t.tcNibblePtr  = m.buffer.get();
+            t.tcSfbPtr     = m.tcSfbBank.get();
+            t.tcGlobalsPtr = m.tcGlobalsBank.get();
+        } else if (m.tcSfbBank.bytes() > 0) {
+            // additive: the buffer is the blocked bank (decode uses NVFP4_BLK
+            // kernels); the TC side banks feed the prefill grouped GEMM.
+            t.tcNibblePtr  = m.tcNibbleBank.get();
             t.tcSfbPtr     = m.tcSfbBank.get();
             t.tcGlobalsPtr = m.tcGlobalsBank.get();
         }
