@@ -2251,6 +2251,139 @@ TEST(cuda_moe_scatter_expert_out_parity) {
                 T, K, dModel, R, maxErr);
 }
 
+// M-Cuda.MoeGroup Sub-Step E-d — moe_act_quant_nvfp4: F32 activations ->
+// NVFP4 (E2M1 nibbles) + per-16 UE4M3 block scales in the CUTLASS swizzled SF
+// layout [numMTiles, numKTiles, 32, 4, 4]. There is no host-side dependency on
+// the exact E4M3/E2M1 rounding: we read the device output back and reconstruct
+// value = e2m1(nibble) * e4m3(SF) / gscale, then check it lands within NVFP4
+// quant error of the original activation. Crucially the SF is fetched through
+// the SAME swizzle-offset formula the kernel writes with — a wrong swizzle
+// pulls a different block's scale (or a zeroed pad slot) and blows the bound.
+namespace {
+
+// E4M3 decode matching CUDA __nv_fp8_e4m3 / repackage_nvfp4_to_blk.cu (bias 7).
+double aq_dec_e4m3(unsigned b) {
+    const unsigned s = (b >> 7) & 0x1u;
+    const unsigned e = (b >> 3) & 0xFu;
+    const unsigned m = b & 0x7u;
+    const double sign = s ? -1.0 : 1.0;
+    if (e == 0u) return sign * std::ldexp(static_cast<double>(m) / 8.0, -6);
+    return sign * std::ldexp(1.0 + static_cast<double>(m) / 8.0,
+                             static_cast<int>(e) - 7);
+}
+
+// E2M1 decode: 3-bit magnitude LUT + sign bit.
+double aq_dec_e2m1(unsigned nib) {
+    static const double mag[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+    const double v = mag[nib & 0x7u];
+    return (nib & 0x8u) ? -v : v;
+}
+
+long aq_test_sf_offset(int mIdx, int kIdx, int numKTiles) {
+    const int mTileIdx  = mIdx >> 7;
+    const int outerMIdx = mIdx & 31;
+    const int innerMIdx = (mIdx >> 5) & 3;
+    const int kTileIdx  = kIdx >> 2;
+    const int innerKIdx = kIdx & 3;
+    return ((static_cast<long>(mTileIdx) * numKTiles + kTileIdx) << 9)
+         | (static_cast<long>(outerMIdx) << 4)
+         | (static_cast<long>(innerMIdx) << 2)
+         | static_cast<long>(innerKIdx);
+}
+
+void checkActQuantNvfp4Parity(int M, int K, float gscale, std::uint32_t seed) {
+    namespace cc = ::mimirmind::core::cuda;
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    cc::CudaModule mod = cc::CudaModule::fromFile(ctx.cudaContext(),
+                                                  resolvePtx("moe_act_quant_nvfp4"));
+    cc::CudaKernel kern = mod.getFunction("moe_act_quant_nvfp4");
+
+    const int nBlocks   = K / 16;
+    const int numKTiles = (nBlocks + 3) / 4;
+    const int numMTiles = (M + 127) / 128;
+    const std::size_t sfBytes =
+        static_cast<std::size_t>(numMTiles) * numKTiles * 512;   // 32*4*4
+
+    Lcg g{seed};
+    std::vector<float> X(static_cast<std::size_t>(M) * K);
+    for (auto& v : X) v = g.next() * 3.0f;                        // ~[-3, 3]
+
+    auto dX  = uploadRaw(ops, X);
+    auto dOut = ops.allocate(static_cast<std::size_t>(M) * K / 2);
+    std::vector<unsigned char> sfZero(sfBytes, 0u);
+    auto dSF  = uploadRaw(ops, sfZero);                           // pre-zeroed pad
+
+    kern.setPtr  (0, dX.get());
+    kern.setPtr  (1, dOut.get());
+    kern.setPtr  (2, dSF.get());
+    kern.setValue(3, gscale);
+    kern.setValue(4, M);
+    kern.setValue(5, K);
+    const std::uint32_t gy = static_cast<std::uint32_t>((nBlocks + 255) / 256);
+    kern.launch(ctx.stream(), static_cast<std::uint32_t>(M), gy, 1, 256, 1, 1);
+    ops.flush();
+
+    std::vector<unsigned char> out(static_cast<std::size_t>(M) * K / 2);
+    std::vector<unsigned char> sf(sfBytes);
+    ops.readbackToHost(out.data(), dOut.get(), out.size());
+    ops.readbackToHost(sf.data(),  dSF.get(),  sf.size());
+
+    double maxErr = 0.0;
+    for (int m = 0; m < M; ++m) {
+        for (int b = 0; b < nBlocks; ++b) {
+            const int k0 = b * 16;
+            double absmax = 0.0;
+            for (int i = 0; i < 16; ++i) {
+                absmax = std::max(absmax,
+                    std::fabs(static_cast<double>(X[static_cast<std::size_t>(m) * K + k0 + i])));
+            }
+            const double sfVal = aq_dec_e4m3(sf[aq_test_sf_offset(m, b, numKTiles)]);
+            // Bound: worst NVFP4 gap is 2*step (between codes 6 and 7), so half
+            // is 1*step == sfVal; ×2 margin covers the E4M3 scale rounding too.
+            const double bound = 0.34 * absmax + 1e-4;
+            const std::size_t pbase = (static_cast<std::size_t>(m) * K + k0) / 2;
+            for (int j = 0; j < 8; ++j) {
+                const unsigned byte = out[pbase + j];
+                const unsigned lo = byte & 0x0Fu;
+                const unsigned hi = (byte >> 4) & 0x0Fu;
+                const double recLo = aq_dec_e2m1(lo) * sfVal / gscale;
+                const double recHi = aq_dec_e2m1(hi) * sfVal / gscale;
+                const double xLo = X[static_cast<std::size_t>(m) * K + k0 + 2 * j];
+                const double xHi = X[static_cast<std::size_t>(m) * K + k0 + 2 * j + 1];
+                const double eLo = std::fabs(recLo - xLo);
+                const double eHi = std::fabs(recHi - xHi);
+                maxErr = std::max(maxErr, std::max(eLo, eHi));
+                EXPECT_TRUE(eLo <= bound);
+                EXPECT_TRUE(eHi <= bound);
+            }
+        }
+    }
+    std::printf("[act-quant-nvfp4] M=%d K=%d gscale=%.3f maxErr=%.3e OK\n",
+                M, K, gscale, maxErr);
+}
+
+} // namespace
+
+TEST(cuda_moe_act_quant_nvfp4_parity_basic) {
+    checkActQuantNvfp4Parity(/*M=*/20, /*K=*/64, /*gscale=*/1.0f, 0x51A1u);
+}
+
+TEST(cuda_moe_act_quant_nvfp4_parity_hidden) {
+    // Realistic Qwen3.6 hidden K=2048, a full 128-row tile plus change.
+    checkActQuantNvfp4Parity(/*M=*/130, /*K=*/2048, /*gscale=*/1.0f, 0x7C3Du);
+}
+
+TEST(cuda_moe_act_quant_nvfp4_parity_kpad) {
+    // nBlocks=3 (K/16) is not a multiple of 4 -> exercises kTile padding.
+    checkActQuantNvfp4Parity(/*M=*/17, /*K=*/48, /*gscale=*/1.0f, 0x2B9Fu);
+}
+
+TEST(cuda_moe_act_quant_nvfp4_parity_gscale) {
+    // Non-unit global scale (K=512 = down-proj intermediate).
+    checkActQuantNvfp4Parity(/*M=*/96, /*K=*/512, /*gscale=*/0.5f, 0x1DE7u);
+}
+
 int main() {
     return mm::test::run();
 }
