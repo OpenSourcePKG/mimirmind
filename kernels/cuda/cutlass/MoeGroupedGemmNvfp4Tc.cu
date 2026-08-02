@@ -148,6 +148,49 @@ __global__ void buildGroupArraysKernel(
     layoutSFB[e] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
 }
 
+// Banks builder (E-d.4): additionally computes every per-group operand pointer
+// from the contiguous banks + the padded row offsets — nothing on the host.
+//   A/SFA/D:  padded row offset padOffset[e] (each expert padded to 128 rows so
+//             its SFA sub-tensor is tile-aligned in the one big act-quant SFA).
+//   B/SFB:    per-expert index e (weight shape shared, so stride is constant).
+//   alpha:    &globalsBank[e] (one F32 weight global per expert).
+__global__ void buildGroupArraysBanksKernel(
+    const int* __restrict__ expOffset, const int* __restrict__ padOffset,
+    int G, int N, int K,
+    const unsigned char* __restrict__ aBank, const unsigned char* __restrict__ sfaBank,
+    const unsigned char* __restrict__ bBank, const unsigned char* __restrict__ sfbBank,
+    const float* __restrict__ globalsBank, unsigned char* __restrict__ dBank,
+    UnderlyingProblem* __restrict__ problems,
+    const GemmElementA** __restrict__ ptrA, const GemmElementB** __restrict__ ptrB,
+    const ElementSF** __restrict__ ptrSFA, const ElementSF** __restrict__ ptrSFB,
+    ElementDOut** __restrict__ ptrD, const float** __restrict__ ptrAlpha,
+    StrideA* __restrict__ strideA, StrideB* __restrict__ strideB,
+    StrideC* __restrict__ strideC, StrideD* __restrict__ strideD,
+    LayoutSFA* __restrict__ layoutSFA, LayoutSFB* __restrict__ layoutSFB) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= G) return;
+    const int  M       = expOffset[e + 1] - expOffset[e];
+    const long padRow  = padOffset[e];
+    const long ksfTiles = ((static_cast<long>(K) / 16) + 3) / 4;
+    const long nMTiles  = (N + 127) / 128;
+    const long sfbStride = 512L * nMTiles * ksfTiles;          // moeSwizzledScaleStride(N,K/16)
+    const long sfaTileOff = 512L * ksfTiles * (padRow / 128);  // big-SFA tile of expert e
+
+    problems[e]  = UnderlyingProblem{M, N, K};
+    ptrA[e]      = reinterpret_cast<const GemmElementA*>(aBank + padRow * (static_cast<long>(K) / 2));
+    ptrSFA[e]    = reinterpret_cast<const ElementSF*>(sfaBank + sfaTileOff);
+    ptrB[e]      = reinterpret_cast<const GemmElementB*>(bBank + static_cast<long>(e) * N * (static_cast<long>(K) / 2));
+    ptrSFB[e]    = reinterpret_cast<const ElementSF*>(sfbBank + static_cast<long>(e) * sfbStride);
+    ptrD[e]      = reinterpret_cast<ElementDOut*>(dBank + padRow * N * static_cast<long>(sizeof(ElementDOut)));
+    ptrAlpha[e]  = globalsBank + e;
+    strideA[e]   = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    strideB[e]   = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    strideC[e]   = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+    strideD[e]   = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
+    layoutSFA[e] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, N, K, 1));
+    layoutSFB[e] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
+}
+
 } // namespace
 
 bool nvfp4TcAvailable() noexcept { return true; }
@@ -367,6 +410,98 @@ int runGroupedNvfp4TcBf16DeviceDriven(
     return 0;
 }
 
+int runGroupedNvfp4TcBf16Banks(
+    int                  groups,
+    int                  N,
+    int                  K,
+    const int*           dExpOffset,
+    const int*           dPadOffset,
+    const void*          aBank,
+    const void*          sfaBank,
+    const void*          bBank,
+    const void*          sfbBank,
+    const float*         globalsBank,
+    void*                dBank,
+    CUstream_st*         streamRaw) {
+
+    if (groups <= 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(streamRaw);
+
+    DevBuf<UnderlyingProblem>   dProblems(groups);
+    DevBuf<const GemmElementA*> dA(groups);
+    DevBuf<const GemmElementB*> dB(groups);
+    DevBuf<const ElementSF*>    dSFA(groups);
+    DevBuf<const ElementSF*>    dSFB(groups);
+    DevBuf<ElementDOut*>        dD(groups);
+    DevBuf<const float*>        dAlpha(groups);
+    DevBuf<StrideA>   dsA(groups);
+    DevBuf<StrideB>   dsB(groups);
+    DevBuf<StrideC>   dsC(groups);
+    DevBuf<StrideD>   dsD(groups);
+    DevBuf<LayoutSFA> dlSFA(groups);
+    DevBuf<LayoutSFB> dlSFB(groups);
+
+    const int threads = 64;
+    const int blocks  = (groups + threads - 1) / threads;
+    buildGroupArraysBanksKernel<<<blocks, threads, 0, stream>>>(
+        dExpOffset, dPadOffset, groups, N, K,
+        static_cast<const unsigned char*>(aBank), static_cast<const unsigned char*>(sfaBank),
+        static_cast<const unsigned char*>(bBank), static_cast<const unsigned char*>(sfbBank),
+        globalsBank, static_cast<unsigned char*>(dBank),
+        dProblems.get(), dA.get(), dB.get(), dSFA.get(), dSFB.get(), dD.get(), dAlpha.get(),
+        dsA.get(), dsB.get(), dsC.get(), dsD.get(), dlSFA.get(), dlSFB.get());
+
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = 0;
+    hw_info.sm_count  = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+
+    typename Gemm::Arguments arguments;
+    decltype(arguments.epilogue.thread) fusion_args;
+    fusion_args.alpha = 0;
+    fusion_args.beta  = 0;
+    fusion_args.alpha_ptr = nullptr;
+    fusion_args.beta_ptr  = nullptr;
+    fusion_args.alpha_ptr_array = dAlpha.get();
+    fusion_args.beta_ptr_array  = nullptr;
+    fusion_args.dAlpha = {_0{}, _0{}, 1};
+    fusion_args.dBeta  = {_0{}, _0{}, 0};
+
+    typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
+
+    arguments = typename Gemm::Arguments{
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {groups, dProblems.get(), nullptr},
+        {dA.get(), dsA.get(), dB.get(), dsB.get(),
+         dSFA.get(), dlSFA.get(), dSFB.get(), dlSFB.get()},
+        {fusion_args, nullptr, dsC.get(), dD.get(), dsD.get()},
+        hw_info, scheduler};
+
+    Gemm gemm;
+    const std::size_t wsBytes = Gemm::get_workspace_size(arguments);
+    DevBuf<std::uint8_t> workspace(wsBytes ? wsBytes : 1);
+
+    cutlass::Status st = gemm.can_implement(arguments);
+    if (st != cutlass::Status::kSuccess) {
+        std::fprintf(stderr, "[nvfp4-tc-banks] can_implement: %s\n", cutlassGetStatusString(st));
+        cudaStreamSynchronize(stream);
+        return 1;
+    }
+    st = gemm.initialize(arguments, workspace.get(), stream);
+    if (st != cutlass::Status::kSuccess) {
+        std::fprintf(stderr, "[nvfp4-tc-banks] initialize: %s\n", cutlassGetStatusString(st));
+        cudaStreamSynchronize(stream);
+        return 2;
+    }
+    st = gemm.run(stream);
+    if (st != cutlass::Status::kSuccess) {
+        std::fprintf(stderr, "[nvfp4-tc-banks] run: %s\n", cutlassGetStatusString(st));
+        cudaStreamSynchronize(stream);
+        return 3;
+    }
+    cudaStreamSynchronize(stream);
+    return 0;
+}
+
 #else // no SM120/SM121 support in this build
 
 bool nvfp4TcAvailable() noexcept { return false; }
@@ -384,6 +519,13 @@ int runGroupedNvfp4TcBf16DeviceDriven(int, int, int, const int*,
                                       const void* const*, const void* const*,
                                       const float* const*, void* const*,
                                       CUstream_st*) {
+    return -1;
+}
+
+int runGroupedNvfp4TcBf16Banks(int, int, int, const int*, const int*,
+                               const void*, const void*, const void*,
+                               const void*, const float*, void*,
+                               CUstream_st*) {
     return -1;
 }
 

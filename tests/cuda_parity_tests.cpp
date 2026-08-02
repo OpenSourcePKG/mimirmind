@@ -2638,6 +2638,107 @@ TEST(cuda_moe_grouped_nvfp4_tc_device_multi) {
     checkGroupedNvfp4TcParity({{32, 128, 128}, {16, 128, 128}, {80, 128, 128}},
                               0x9E4Cu, /*deviceDriven=*/true);
 }
+
+// E-d.4 — the banks runtime op (runGroupedNvfp4TcBf16Banks): contiguous device
+// banks + device expOffset/padOffset, all per-group pointers built on device.
+// Mirrors the runtime: ONE act-quant over the padded [totalPad,K] activation
+// buffer (each expert padded to 128 rows so its SFA sub-tensor is tile-aligned),
+// contiguous weight nibble+SFB banks, per-expert F32 globals. Compares the real
+// (non-padding) output rows vs the CPU dequant-and-matmul reference.
+TEST(cuda_moe_grouped_nvfp4_tc_banks_multi) {
+    namespace cc = ::mimirmind::core::cuda;
+    namespace mo = ::mimirmind::core::modelopt;
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    cc::CudaModule mod = cc::CudaModule::fromFile(ctx.cudaContext(),
+                                                  resolvePtx("moe_act_quant_nvfp4"));
+    cc::CudaKernel kern = mod.getFunction("moe_act_quant_nvfp4");
+
+    const std::vector<int> M{32, 16, 80};
+    const int G = static_cast<int>(M.size());
+    const int N = 128, K = 128, ksf = K / 16;
+    const std::size_t sfbStride = mo::moeSwizzledScaleStride(N, ksf);
+
+    std::vector<std::int32_t> expOff(G + 1, 0), padOff(G + 1, 0);
+    for (int e = 0; e < G; ++e) {
+        expOff[e + 1] = expOff[e] + M[e];
+        padOff[e + 1] = padOff[e] + ((M[e] + 127) / 128) * 128;
+    }
+    const int totalPad = padOff[G];
+
+    Lcg g{0x4B7Fu};
+    auto launchQuant = [&](const void* dX, void* dNib, void* dSf, int rows) {
+        kern.setPtr(0, dX); kern.setPtr(1, dNib); kern.setPtr(2, dSf);
+        kern.setValue(3, 1.0f); kern.setValue(4, rows); kern.setValue(5, K);
+        const std::uint32_t gy = static_cast<std::uint32_t>(((K / 16) + 255) / 256);
+        kern.launch(ctx.stream(), static_cast<std::uint32_t>(rows), gy, 1, 256, 1, 1);
+    };
+
+    // Padded activation buffer: real rows random, padding rows zero.
+    std::vector<float> Xa(static_cast<std::size_t>(totalPad) * K, 0.0f);
+    for (int e = 0; e < G; ++e)
+        for (int m = 0; m < M[e]; ++m)
+            for (int k = 0; k < K; ++k)
+                Xa[static_cast<std::size_t>(padOff[e] + m) * K + k] = g.next();
+    QuantOperand A = quantizeNvfp4(ops, kern, ctx, Xa, totalPad, K);  // aBank + big SFA
+
+    // Weight banks: quantise each expert's [N,K] into the contiguous nib/SFB banks.
+    auto bBank = ops.allocate(static_cast<std::size_t>(G) * N * (K / 2));
+    std::vector<unsigned char> sfbZero(static_cast<std::size_t>(G) * sfbStride, 0u);
+    auto sfbBank = uploadRaw(ops, sfbZero);
+    auto globals = uploadRaw(ops, std::vector<float>(static_cast<std::size_t>(G), 1.0f));
+    std::vector<QuantOperand> B(G);
+    for (int e = 0; e < G; ++e) {
+        std::vector<float> Xb(static_cast<std::size_t>(N) * K);
+        for (auto& v : Xb) v = g.next();
+        auto dXb = uploadRaw(ops, Xb);
+        auto* nibDst = static_cast<unsigned char*>(bBank.get()) + static_cast<std::size_t>(e) * N * (K / 2);
+        auto* sfDst  = static_cast<unsigned char*>(sfbBank.get()) + static_cast<std::size_t>(e) * sfbStride;
+        launchQuant(dXb.get(), nibDst, sfDst, N);
+        ops.flush();
+        B[e].rows = N; B[e].K = K; B[e].numKTiles = (ksf + 3) / 4;
+        B[e].nibHost.resize(static_cast<std::size_t>(N) * (K / 2));
+        B[e].sfHost.resize(sfbStride);
+        ops.readbackToHost(B[e].nibHost.data(), nibDst, B[e].nibHost.size());
+        ops.readbackToHost(B[e].sfHost.data(),  sfDst,  sfbStride);
+    }
+
+    auto dOut  = ops.allocate(static_cast<std::size_t>(totalPad) * N * 2);  // bf16
+    auto dExp  = uploadRaw(ops, expOff);
+    auto dPad  = uploadRaw(ops, padOff);
+    ops.flush();
+
+    const int rc = ::mimirmind::kernels::cutlassmoe::runGroupedNvfp4TcBf16Banks(
+        G, N, K,
+        static_cast<const std::int32_t*>(dExp.get()),
+        static_cast<const std::int32_t*>(dPad.get()),
+        A.nib.get(), A.sf.get(), bBank.get(), sfbBank.get(),
+        static_cast<const float*>(globals.get()), dOut.get(),
+        ctx.stream().handle());
+    EXPECT_EQ(rc, 0);
+
+    std::vector<std::uint16_t> D(static_cast<std::size_t>(totalPad) * N);
+    ops.readbackToHost(D.data(), dOut.get(), D.size() * sizeof(std::uint16_t));
+
+    double maxRel = 0.0, maxAbs = 0.0;
+    for (int e = 0; e < G; ++e) {
+        for (int m = 0; m < M[e]; ++m) {
+            const int row = padOff[e] + m;
+            for (int n = 0; n < N; ++n) {
+                double ref = 0.0;
+                for (int k = 0; k < K; ++k)
+                    ref += dequantElem(A, row, k) * dequantElem(B[e], n, k);
+                const double got = aq_dec_bf16(D[static_cast<std::size_t>(row) * N + n]);
+                const double aerr = std::fabs(got - ref);
+                maxAbs = std::max(maxAbs, aerr);
+                maxRel = std::max(maxRel, aerr / (std::fabs(ref) + 1e-3));
+                EXPECT_TRUE(aerr <= 0.02 * std::fabs(ref) + 0.05);
+            }
+        }
+    }
+    std::printf("[grouped-nvfp4-tc-banks] G=%d totalPad=%d maxAbs=%.3e maxRel=%.3e OK\n",
+                G, totalPad, maxAbs, maxRel);
+}
 #endif // MIMIRMIND_HAVE_CUTLASS_MOE
 
 int main() {

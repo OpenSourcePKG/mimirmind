@@ -93,4 +93,33 @@ namespace mimirmind::kernels::cutlassmoe {
     void* const*         dPtrD,
     CUstream_st*         stream);
 
+/**
+ * Banks variant (E-d.4) — the runtime entry the MoE backend calls. All operands
+ * are contiguous device banks; the per-group pointers are computed ON DEVICE
+ * from two device offset arrays, so nothing crosses to the host:
+ *   - `dExpOffset[groups+1]`  real cumulative token counts -> problem M_e.
+ *   - `dPadOffset[groups+1]`  padded cumulative row starts (each expert padded
+ *                             to a multiple of 128 rows so its SFA sub-tensor is
+ *                             tile-aligned). Row offset for A / SFA / D.
+ * The activation banks come from ONE act-quant over the padded gathered buffer
+ * (`aBank` [totalPad, K/2] nibbles, `sfaBank` its swizzled SFA for M=totalPad).
+ * The weight banks are the E-d.2b load-time side banks (`bBank` [groups,N,K/2]
+ * nibbles, `sfbBank` swizzled SFB, `globalsBank` [groups] F32 -> per-group
+ * alpha). `dBank` is [totalPad, N] bf16 output. N,K shared across groups.
+ * Runs on `stream`. Returns 0 on success.
+ */
+[[nodiscard]] int runGroupedNvfp4TcBf16Banks(
+    int                  groups,
+    int                  N,
+    int                  K,
+    const int*           dExpOffset,
+    const int*           dPadOffset,
+    const void*          aBank,
+    const void*          sfaBank,
+    const void*          bBank,
+    const void*          sfbBank,
+    const float*         globalsBank,
+    void*                dBank,
+    CUstream_st*         stream);
+
 } // namespace mimirmind::kernels::cutlassmoe
