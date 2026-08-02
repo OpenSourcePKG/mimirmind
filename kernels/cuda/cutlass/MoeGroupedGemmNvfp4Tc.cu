@@ -2,9 +2,9 @@
 // Copyright 2026 Stefan Werfling
 //
 // M-Cuda.MoeGroup Sub-Step E-d.3 — CUTLASS block-scaled NVFP4 grouped GEMM
-// (bf16 output) for Blackwell sm_120/sm_121 (GB10). See the header for the
+// (f32 output) for Blackwell sm_120/sm_121 (GB10). See the header for the
 // operand contract. The type stack is CUTLASS example 79d's Sm120 NVFP4
-// grouped mainloop with example 75's plain BF16 LinearCombination epilogue
+// grouped mainloop with example 75's plain F32 LinearCombination epilogue
 // (no scale-factor output) — i.e. vLLM's run_fp4_blockwise_scaled_group_mm_sm120
 // shape. Compiled as real sm_121a SASS in its own static library.
 
@@ -45,9 +45,11 @@ using ElementB   = cutlass::nv_float4_t<ElementInput>;
 using LayoutBTag = cutlass::layout::ColumnMajor;
 constexpr int AlignmentB = 32;
 
-// C / D: BF16, plain LinearCombination epilogue (D = alpha * acc). No SFD.
-using ElementC    = cutlass::bfloat16_t;
-using ElementD    = cutlass::bfloat16_t;
+// C / D: F32, plain LinearCombination epilogue (D = alpha * acc). No SFD.
+// F32 output keeps the MoE pipeline (siluMul / act-quant / scatter) single-dtype
+// on the device — no bf16<->f32 casts around the grouped GEMM.
+using ElementC    = float;
+using ElementD    = float;
 using LayoutCTag  = cutlass::layout::RowMajor;
 using LayoutDTag  = cutlass::layout::RowMajor;
 constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
@@ -195,7 +197,7 @@ __global__ void buildGroupArraysBanksKernel(
 
 bool nvfp4TcAvailable() noexcept { return true; }
 
-int runGroupedNvfp4TcBf16(
+int runGroupedNvfp4TcF32(
     int                  groups,
     const int*           mHost,
     const int*           nHost,
@@ -314,7 +316,7 @@ int runGroupedNvfp4TcBf16(
     return 0;
 }
 
-int runGroupedNvfp4TcBf16DeviceDriven(
+int runGroupedNvfp4TcF32DeviceDriven(
     int                  groups,
     int                  N,
     int                  K,
@@ -410,7 +412,7 @@ int runGroupedNvfp4TcBf16DeviceDriven(
     return 0;
 }
 
-int runGroupedNvfp4TcBf16Banks(
+int runGroupedNvfp4TcF32Banks(
     int                  groups,
     int                  N,
     int                  K,
@@ -506,7 +508,7 @@ int runGroupedNvfp4TcBf16Banks(
 
 bool nvfp4TcAvailable() noexcept { return false; }
 
-int runGroupedNvfp4TcBf16(int, const int*, const int*, const int*,
+int runGroupedNvfp4TcF32(int, const int*, const int*, const int*,
                           const void* const*, const void* const*,
                           const void* const*, const void* const*,
                           const float* const*, void* const*,
@@ -514,7 +516,7 @@ int runGroupedNvfp4TcBf16(int, const int*, const int*, const int*,
     return -1;
 }
 
-int runGroupedNvfp4TcBf16DeviceDriven(int, int, int, const int*,
+int runGroupedNvfp4TcF32DeviceDriven(int, int, int, const int*,
                                       const void* const*, const void* const*,
                                       const void* const*, const void* const*,
                                       const float* const*, void* const*,
@@ -522,7 +524,7 @@ int runGroupedNvfp4TcBf16DeviceDriven(int, int, int, const int*,
     return -1;
 }
 
-int runGroupedNvfp4TcBf16Banks(int, int, int, const int*, const int*,
+int runGroupedNvfp4TcF32Banks(int, int, int, const int*, const int*,
                                const void*, const void*, const void*,
                                const void*, const float*, void*,
                                CUstream_st*) {

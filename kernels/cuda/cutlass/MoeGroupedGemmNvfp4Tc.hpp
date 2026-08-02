@@ -8,7 +8,7 @@
 // One expert == one CUTLASS group. Per group: A = [M_e, K] NVFP4 (E2M1 nibbles,
 // row-major, produced by moe_act_quant_nvfp4), B = [N, K] NVFP4 weight (E2M1,
 // column-major), both with swizzled UE4M3 block scales (SFA from the act-quant
-// kernel, SFB from swizzleMoeBlockScales). Output D = [M_e, N] BF16, with a
+// kernel, SFB from swizzleMoeBlockScales). Output D = [M_e, N] F32, with a
 // per-group scalar alpha = 1/(act_gscale * weight_gscale) folding both global
 // scales back in. Mirrors vLLM's run_fp4_blockwise_scaled_group_mm_sm120
 // (CUTLASS v4.4.2), adapted to raw device pointers and mimirmind's idiom.
@@ -34,7 +34,7 @@ namespace mimirmind::kernels::cutlassmoe {
 
 /**
  * Host-known-shapes grouped NVFP4 tensor-core GEMM (one expert per group),
- * BF16 output. The per-group problem sizes are supplied on the host (mHost[e],
+ * F32 output. The per-group problem sizes are supplied on the host (mHost[e],
  * with a shared N and K), so this entry is used by the parity test and the
  * host-driven runtime path; the fully device-driven builder (no D2H) is a
  * later sub-step.
@@ -45,7 +45,7 @@ namespace mimirmind::kernels::cutlassmoe {
  *   dPtrB[e]     -> N*K NVFP4 nibbles (E2M1), column-major   (const uint8)
  *   dPtrSFB[e]   -> swizzled UE4M3 block scales for B        (const uint8)
  *   dPtrAlpha[e] -> one F32 alpha for the group              (const float*)
- *   dPtrD[e]     -> M_e*N BF16 output                        (uint16 / bf16)
+ *   dPtrD[e]     -> M_e*N F32 output                        (float)
  *
  * `mHost`/`nHost`/`kHost` are host arrays of length `groups` (N,K equal across
  * experts in practice, but kept per-group for generality). K and N must be
@@ -54,7 +54,7 @@ namespace mimirmind::kernels::cutlassmoe {
  * Returns 0 on success, non-zero on a CUTLASS error (can_implement / run).
  * Blocks: runs on `stream` and does not synchronize; the caller syncs.
  */
-[[nodiscard]] int runGroupedNvfp4TcBf16(
+[[nodiscard]] int runGroupedNvfp4TcF32(
     int                  groups,
     const int*           mHost,
     const int*           nHost,
@@ -76,11 +76,11 @@ namespace mimirmind::kernels::cutlassmoe {
  * batched on GB10). N and K are shared across all groups.
  *
  * The operand pointer arrays are device arrays of device pointers, exactly as
- * in runGroupedNvfp4TcBf16 (in the runtime they are produced by the gather +
+ * in runGroupedNvfp4TcF32 (in the runtime they are produced by the gather +
  * grouped act-quant kernels; SFA is one tensor per expert). `dExpOffset` has
  * `groups+1` entries. Runs on `stream`. Returns 0 on success.
  */
-[[nodiscard]] int runGroupedNvfp4TcBf16DeviceDriven(
+[[nodiscard]] int runGroupedNvfp4TcF32DeviceDriven(
     int                  groups,
     int                  N,
     int                  K,
@@ -105,10 +105,10 @@ namespace mimirmind::kernels::cutlassmoe {
  * (`aBank` [totalPad, K/2] nibbles, `sfaBank` its swizzled SFA for M=totalPad).
  * The weight banks are the E-d.2b load-time side banks (`bBank` [groups,N,K/2]
  * nibbles, `sfbBank` swizzled SFB, `globalsBank` [groups] F32 -> per-group
- * alpha). `dBank` is [totalPad, N] bf16 output. N,K shared across groups.
+ * alpha). `dBank` is [totalPad, N] f32 output. N,K shared across groups.
  * Runs on `stream`. Returns 0 on success.
  */
-[[nodiscard]] int runGroupedNvfp4TcBf16Banks(
+[[nodiscard]] int runGroupedNvfp4TcF32Banks(
     int                  groups,
     int                  N,
     int                  K,

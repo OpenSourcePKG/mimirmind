@@ -2516,7 +2516,7 @@ TEST(cuda_moe_pad_infra) {
 
 #ifdef MIMIRMIND_HAVE_CUTLASS_MOE
 // M-Cuda.MoeGroup Sub-Step E-d.3 — end-to-end numeric parity of the CUTLASS
-// block-scaled NVFP4 tensor-core grouped GEMM (runGroupedNvfp4TcBf16) against a
+// block-scaled NVFP4 tensor-core grouped GEMM (runGroupedNvfp4TcF32) against a
 // CPU dequant-and-matmul reference. Both A and B are quantised on the device by
 // the E-d.1 act-quant kernel (F32 -> NVFP4 E2M1 + swizzled UE4M3 SF): A=[M,K]
 // gives SFA (rows=M), the same kernel on the weight [N,K] gives B nibbles +
@@ -2525,14 +2525,6 @@ TEST(cuda_moe_pad_infra) {
 // SAME device-side nibbles/scales the GEMM reads, so the only slack is bf16
 // output rounding + FP accumulation order — a tight tolerance.
 namespace {
-
-// Decode a CUTLASS bfloat16_t (stored as the high 16 bits of an F32).
-float aq_dec_bf16(std::uint16_t b) {
-    std::uint32_t bits = static_cast<std::uint32_t>(b) << 16;
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
-}
 
 // Quantise a host [rows, K] F32 matrix to NVFP4 via moe_act_quant_nvfp4.
 // Returns the device nibble bank [rows*K/2], the device swizzled SF bank, and
@@ -2619,7 +2611,7 @@ void checkGroupedNvfp4TcParity(const std::vector<std::array<int, 3>>& groups,
         A.push_back(quantizeNvfp4(ops, kern, ctx, Xa, M, K));
         B.push_back(quantizeNvfp4(ops, kern, ctx, Xb, N, K));
 
-        auto d = ops.allocate(static_cast<std::size_t>(M) * N * 2); // bf16
+        auto d = ops.allocate(static_cast<std::size_t>(M) * N * sizeof(float)); // f32 out
         dOut.push_back(std::move(d));
         std::vector<float> one{1.0f};
         dAlphaVal.push_back(uploadRaw(ops, one));
@@ -2650,7 +2642,7 @@ void checkGroupedNvfp4TcParity(const std::vector<std::array<int, 3>>& groups,
         for (int e = 0; e < G; ++e) expOff[e + 1] = expOff[e] + mH[e];
         dExp = uploadRaw(ops, expOff);
         ops.flush();
-        rc = cm::runGroupedNvfp4TcBf16DeviceDriven(
+        rc = cm::runGroupedNvfp4TcF32DeviceDriven(
             G, nH[0], kH[0], static_cast<const std::int32_t*>(dExp.get()),
             static_cast<const void* const*>(dpA.get()),
             static_cast<const void* const*>(dpSFA.get()),
@@ -2660,7 +2652,7 @@ void checkGroupedNvfp4TcParity(const std::vector<std::array<int, 3>>& groups,
             static_cast<void* const*>(dpD.get()),
             ctx.stream().handle());
     } else {
-        rc = cm::runGroupedNvfp4TcBf16(
+        rc = cm::runGroupedNvfp4TcF32(
             G, mH.data(), nH.data(), kH.data(),
             static_cast<const void* const*>(dpA.get()),
             static_cast<const void* const*>(dpSFA.get()),
@@ -2675,14 +2667,14 @@ void checkGroupedNvfp4TcParity(const std::vector<std::array<int, 3>>& groups,
     double maxRel = 0.0, maxAbs = 0.0;
     for (int e = 0; e < G; ++e) {
         const int M = mH[e], N = nH[e], K = kH[e];
-        std::vector<std::uint16_t> D(static_cast<std::size_t>(M) * N);
-        ops.readbackToHost(D.data(), dOut[e].get(), D.size() * sizeof(std::uint16_t));
+        std::vector<float> D(static_cast<std::size_t>(M) * N);
+        ops.readbackToHost(D.data(), dOut[e].get(), D.size() * sizeof(float));
         for (int m = 0; m < M; ++m) {
             for (int n = 0; n < N; ++n) {
                 double ref = 0.0;
                 for (int k = 0; k < K; ++k)
                     ref += dequantElem(A[e], m, k) * dequantElem(B[e], n, k);
-                const double got = aq_dec_bf16(D[static_cast<std::size_t>(m) * N + n]);
+                const double got = D[static_cast<std::size_t>(m) * N + n];
                 const double aerr = std::fabs(got - ref);
                 const double rerr = aerr / (std::fabs(ref) + 1e-3);
                 maxAbs = std::max(maxAbs, aerr);
@@ -2719,7 +2711,7 @@ TEST(cuda_moe_grouped_nvfp4_tc_device_multi) {
                               0x9E4Cu, /*deviceDriven=*/true);
 }
 
-// E-d.4 — the banks runtime op (runGroupedNvfp4TcBf16Banks): contiguous device
+// E-d.4 — the banks runtime op (runGroupedNvfp4TcF32Banks): contiguous device
 // banks + device expOffset/padOffset, all per-group pointers built on device.
 // Mirrors the runtime: ONE act-quant over the padded [totalPad,K] activation
 // buffer (each expert padded to 128 rows so its SFA sub-tensor is tile-aligned),
@@ -2783,12 +2775,12 @@ TEST(cuda_moe_grouped_nvfp4_tc_banks_multi) {
         ops.readbackToHost(B[e].sfHost.data(),  sfDst,  sfbStride);
     }
 
-    auto dOut  = ops.allocate(static_cast<std::size_t>(totalPad) * N * 2);  // bf16
+    auto dOut  = ops.allocate(static_cast<std::size_t>(totalPad) * N * sizeof(float));  // f32 out
     auto dExp  = uploadRaw(ops, expOff);
     auto dPad  = uploadRaw(ops, padOff);
     ops.flush();
 
-    const int rc = ::mimirmind::kernels::cutlassmoe::runGroupedNvfp4TcBf16Banks(
+    const int rc = ::mimirmind::kernels::cutlassmoe::runGroupedNvfp4TcF32Banks(
         G, N, K,
         static_cast<const std::int32_t*>(dExp.get()),
         static_cast<const std::int32_t*>(dPad.get()),
@@ -2797,8 +2789,8 @@ TEST(cuda_moe_grouped_nvfp4_tc_banks_multi) {
         ctx.stream().handle());
     EXPECT_EQ(rc, 0);
 
-    std::vector<std::uint16_t> D(static_cast<std::size_t>(totalPad) * N);
-    ops.readbackToHost(D.data(), dOut.get(), D.size() * sizeof(std::uint16_t));
+    std::vector<float> D(static_cast<std::size_t>(totalPad) * N);
+    ops.readbackToHost(D.data(), dOut.get(), D.size() * sizeof(float));
 
     double maxRel = 0.0, maxAbs = 0.0;
     for (int e = 0; e < G; ++e) {
@@ -2808,7 +2800,7 @@ TEST(cuda_moe_grouped_nvfp4_tc_banks_multi) {
                 double ref = 0.0;
                 for (int k = 0; k < K; ++k)
                     ref += dequantElem(A, row, k) * dequantElem(B[e], n, k);
-                const double got = aq_dec_bf16(D[static_cast<std::size_t>(row) * N + n]);
+                const double got = D[static_cast<std::size_t>(row) * N + n];
                 const double aerr = std::fabs(got - ref);
                 maxAbs = std::max(maxAbs, aerr);
                 maxRel = std::max(maxRel, aerr / (std::fabs(ref) + 1e-3));
