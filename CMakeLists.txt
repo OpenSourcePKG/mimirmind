@@ -865,6 +865,63 @@ if(MIMIRMIND_ENABLE_CUDA)
     )
 endif()
 
+# ---- mimirmind_cutlass_moe — CUTLASS block-scaled NVFP4 grouped GEMM -------
+#
+# M-Cuda.MoeGroup Sub-Step E-d.3 (Bragi). The FP4-tensor-core grouped MoE
+# GEMM that beats batched fused-K on GB10. Compiled as REAL sm_121a SASS (not
+# the --ptx compute_80 path the other kernels use), because the CUTLASS host
+# API needs a concrete SASS instantiation linked into the binary. Header-only
+# CUTLASS is fetched to third_party/cutlass on the build box (v4.4.2, ~200 MiB,
+# NOT committed); the whole target is skipped when it is absent, and callers
+# fall back to the scalar grouped / batched path.
+#
+# Arch is pinned explicitly (compute_121a/sm_121a) rather than via
+# CMAKE_CUDA_ARCHITECTURES so the block-scaled fp4 mma lowers; keep the target
+# ARCHITECTURES OFF to stop CMake from adding a second -arch.
+
+set(MIMIRMIND_CUTLASS_DIR "${CMAKE_SOURCE_DIR}/third_party/cutlass"
+    CACHE PATH "CUTLASS checkout for the NVFP4 tensor-core grouped MoE GEMM")
+
+if(MIMIRMIND_ENABLE_CUDA AND EXISTS "${MIMIRMIND_CUTLASS_DIR}/include/cutlass/cutlass.h")
+    message(STATUS "CUTLASS found at ${MIMIRMIND_CUTLASS_DIR} — building mimirmind_cutlass_moe (sm_121a)")
+
+    add_library(mimirmind_cutlass_moe STATIC
+        kernels/cuda/cutlass/MoeGroupedGemmNvfp4Tc.cu
+    )
+
+    set_target_properties(mimirmind_cutlass_moe PROPERTIES
+        CUDA_ARCHITECTURES OFF
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+        POSITION_INDEPENDENT_CODE ON
+    )
+
+    target_include_directories(mimirmind_cutlass_moe PRIVATE
+        "${MIMIRMIND_CUTLASS_DIR}/include"
+        "${MIMIRMIND_CUTLASS_DIR}/tools/util/include"
+        "${CMAKE_SOURCE_DIR}/kernels/cuda/cutlass"
+    )
+
+    target_compile_options(mimirmind_cutlass_moe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_121a,code=sm_121a>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    )
+
+    target_link_libraries(mimirmind_cutlass_moe PUBLIC CUDA::cudart)
+
+    # Expose the header + a feature macro to the rest of the CUDA foundation.
+    target_include_directories(mimirmind_core_cuda PUBLIC
+        "${CMAKE_SOURCE_DIR}/kernels/cuda/cutlass")
+    target_link_libraries(mimirmind_core_cuda PUBLIC mimirmind_cutlass_moe)
+    target_compile_definitions(mimirmind_core_cuda PUBLIC MIMIRMIND_HAVE_CUTLASS_MOE=1)
+else()
+    if(MIMIRMIND_ENABLE_CUDA)
+        message(STATUS "CUTLASS not found at ${MIMIRMIND_CUTLASS_DIR} — "
+                       "mimirmind_cutlass_moe skipped (grouped NVFP4-TC MoE off)")
+    endif()
+endif()
+
 # ---- L0-backed targets: mimirmind binary, munin daemon, GPU tests ---------
 #
 # All of these consume L0Context / GpuOps / GpuMatmul / CommandQueue directly

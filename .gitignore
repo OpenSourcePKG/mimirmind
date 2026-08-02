@@ -15,3 +15,6 @@ run-state/
 config.json
 config.dev.json
 usbboot/
+# CUTLASS checkout for the NVFP4 tensor-core grouped MoE GEMM (E-d.3);
+# ~200 MiB, fetched to the build box, never committed.
+/third_party/cutlass/
