@@ -2514,6 +2514,150 @@ TEST(cuda_moe_pad_infra) {
     std::printf("[moe-pad-infra] nE=%d R=%d totalPad=%d OK\n", nE, R, totalPad);
 }
 
+// M-Cuda.MoeGroup Sub-Step E-d.5 — the FP4-TC DECODE kernels
+// (moe_gate_up_fused_k_nvfp4tc_batched + moe_down_fused_k_nvfp4tc_batched) read
+// the SAME plain-nibbles + swizzled-SFB + F32-global banks the prefill grouped
+// GEMM uses, so the blocked-NVFP4 bank can be dropped. Validate both against a
+// CPU dequant-and-matmul reference that reads the identical device banks
+// (nib * ue4m3(SFB[swizzle]) * global), through the same swizzle-offset formula.
+namespace {
+
+// Quantise a host [rows, K] F32 matrix (gscale=1) into a device nibble-bank
+// slot + swizzled-SFB slot via moe_act_quant_nvfp4; keep host copies for the
+// reference. Reuses the E-d.1 decoders aq_dec_e2m1 / aq_dec_e4m3 (== dq_ue4m3).
+struct TcWeightSlot {
+    std::vector<unsigned char> nibHost;   // [rows * K/2]
+    std::vector<unsigned char> sfHost;    // swizzled slot
+    int rows{0}, K{0}, numKTiles{0};
+};
+
+TcWeightSlot tcQuantSlot(GpuOps& ops, ::mimirmind::core::cuda::CudaKernel& kern,
+                         CudaComputeContext& ctx,
+                         const std::vector<float>& W, int rows, int K,
+                         void* dNibSlot, void* dSfSlot) {
+    namespace mo = ::mimirmind::core::modelopt;
+    const int ksf = K / 16;
+    TcWeightSlot s; s.rows = rows; s.K = K; s.numKTiles = (ksf + 3) / 4;
+    const std::size_t sfBytes = mo::swizzledBlockScaleBytes(rows, ksf);
+    // pre-zero the swizzled slot (padding), then quantise into it.
+    std::vector<unsigned char> zero(sfBytes, 0u);
+    ops.uploadHostBytes(dSfSlot, zero.data(), sfBytes);
+    auto dW = uploadRaw(ops, W);
+    kern.setPtr(0, dW.get()); kern.setPtr(1, dNibSlot); kern.setPtr(2, dSfSlot);
+    kern.setValue(3, 1.0f); kern.setValue(4, rows); kern.setValue(5, K);
+    const std::uint32_t gy = static_cast<std::uint32_t>((ksf + 255) / 256);
+    kern.launch(ctx.stream(), static_cast<std::uint32_t>(rows), gy, 1, 256, 1, 1);
+    ops.flush();
+    s.nibHost.resize(static_cast<std::size_t>(rows) * (K / 2));
+    s.sfHost.resize(sfBytes);
+    ops.readbackToHost(s.nibHost.data(), dNibSlot, s.nibHost.size());
+    ops.readbackToHost(s.sfHost.data(),  dSfSlot,  sfBytes);
+    return s;
+}
+
+double tcDequant(const TcWeightSlot& s, int row, int k) {
+    const std::size_t byte = (static_cast<std::size_t>(row) * s.K + k) / 2;
+    const unsigned nib = (k & 1) ? (s.nibHost[byte] >> 4) & 0xF : s.nibHost[byte] & 0xF;
+    const double sf = aq_dec_e4m3(s.sfHost[aq_test_sf_offset(row, k / 16, s.numKTiles)]);
+    return aq_dec_e2m1(nib) * sf;   // global == 1
+}
+
+} // namespace
+
+TEST(cuda_moe_nvfp4tc_decode_parity) {
+    namespace cc = ::mimirmind::core::cuda;
+    namespace mo = ::mimirmind::core::modelopt;
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    auto ptx = [&](const char* n) { return cc::CudaModule::fromFile(ctx.cudaContext(), resolvePtx(n)); };
+    cc::CudaModule mAq = ptx("moe_act_quant_nvfp4");
+    cc::CudaKernel kAq = mAq.getFunction("moe_act_quant_nvfp4");
+    cc::CudaModule mGu = ptx("moe_gate_up_fused_k_nvfp4tc_batched");
+    cc::CudaKernel kGu = mGu.getFunction("moe_gate_up_fused_k_nvfp4tc_batched");
+    cc::CudaModule mDn = ptx("moe_down_fused_k_nvfp4tc_batched");
+    cc::CudaKernel kDn = mDn.getFunction("moe_down_fused_k_nvfp4tc_batched");
+
+    const int dModel = 128, nFf = 256, nExperts = 2, expUsed = 1, nSeq = 1;
+    const int E = 1;  // routed expert index (exercises the per-expert stride)
+    const std::size_t guNibStride = static_cast<std::size_t>(nFf) * (dModel / 2);
+    const std::size_t guSfStride  = mo::swizzledBlockScaleBytes(nFf, dModel / 16);
+    const std::size_t dnNibStride = static_cast<std::size_t>(dModel) * (nFf / 2);
+    const std::size_t dnSfStride  = mo::swizzledBlockScaleBytes(dModel, nFf / 16);
+
+    auto gNibBank = ops.allocate(nExperts * guNibStride);
+    auto uNibBank = ops.allocate(nExperts * guNibStride);
+    auto gSfBank  = ops.allocate(nExperts * guSfStride);
+    auto uSfBank  = ops.allocate(nExperts * guSfStride);
+    auto dNibBank = ops.allocate(nExperts * dnNibStride);
+    auto dSfBank  = ops.allocate(nExperts * dnSfStride);
+    auto ones     = uploadRaw(ops, std::vector<float>(nExperts, 1.0f)); // globals
+
+    Lcg g{0x2C7Bu};
+    auto rnd = [&](std::size_t n) { std::vector<float> v(n); for (auto& x : v) x = g.next(); return v; };
+    std::vector<float> Wg = rnd(static_cast<std::size_t>(nFf) * dModel);
+    std::vector<float> Wu = rnd(static_cast<std::size_t>(nFf) * dModel);
+    std::vector<float> Wd = rnd(static_cast<std::size_t>(dModel) * nFf);
+    auto slotN = [](::mimirmind::compute::ComputeBuffer& b, std::size_t stride, int e) {
+        return static_cast<unsigned char*>(b.get()) + static_cast<std::size_t>(e) * stride;
+    };
+    TcWeightSlot gS = tcQuantSlot(ops, kAq, ctx, Wg, nFf, dModel, slotN(gNibBank, guNibStride, E), slotN(gSfBank, guSfStride, E));
+    TcWeightSlot uS = tcQuantSlot(ops, kAq, ctx, Wu, nFf, dModel, slotN(uNibBank, guNibStride, E), slotN(uSfBank, guSfStride, E));
+    TcWeightSlot dS = tcQuantSlot(ops, kAq, ctx, Wd, dModel, nFf, slotN(dNibBank, dnNibStride, E), slotN(dSfBank, dnSfStride, E));
+
+    std::vector<float> X = rnd(dModel);
+    auto dX = uploadRaw(ops, X);
+    std::vector<std::int32_t> expIdx{E};
+    auto dExpIdx = uploadRaw(ops, expIdx);
+    auto dKw     = uploadRaw(ops, std::vector<float>{1.0f});
+    auto dGate   = ops.allocate(static_cast<std::size_t>(nFf) * sizeof(float));
+    auto dAccum  = ops.allocate(static_cast<std::size_t>(dModel) * sizeof(float));
+    ops.uploadHostBytes(dAccum.get(), std::vector<float>(dModel, 0.0f).data(), dModel * sizeof(float));
+
+    // gate+up: grid (ceil(expUsed*nFf/4), nSeq), block 128.
+    kGu.setPtr(0, dX.get()); kGu.setPtr(1, gNibBank.get()); kGu.setPtr(2, uNibBank.get());
+    kGu.setPtr(3, gSfBank.get()); kGu.setPtr(4, uSfBank.get());
+    kGu.setPtr(5, ones.get()); kGu.setPtr(6, ones.get());
+    kGu.setPtr(7, dExpIdx.get()); kGu.setPtr(8, dGate.get());
+    kGu.setValue(9, dModel); kGu.setValue(10, nFf); kGu.setValue(11, expUsed);
+    kGu.setValue(12, static_cast<std::int32_t>(guSfStride));
+    kGu.launch(ctx.stream(), static_cast<std::uint32_t>((expUsed * nFf + 3) / 4),
+               static_cast<std::uint32_t>(nSeq), 1, 128, 1, 1);
+    ops.flush();
+    std::vector<float> gateAct(nFf);
+    ops.readbackToHost(gateAct.data(), dGate.get(), nFf * sizeof(float));
+
+    // reference gate/up
+    double maxGuErr = 0.0;
+    for (int f = 0; f < nFf; ++f) {
+        double gd = 0.0, ud = 0.0;
+        for (int k = 0; k < dModel; ++k) { gd += X[k] * tcDequant(gS, f, k); ud += X[k] * tcDequant(uS, f, k); }
+        const double silu = gd / (1.0 + std::exp(-gd));
+        maxGuErr = std::max(maxGuErr, std::fabs(gateAct[f] - silu * ud));
+    }
+
+    // down: grid (ceil(dModel/4), nSeq), block 64. input = gateAct [expUsed, nFf].
+    kDn.setPtr(0, dGate.get()); kDn.setPtr(1, dNibBank.get()); kDn.setPtr(2, dSfBank.get());
+    kDn.setPtr(3, ones.get()); kDn.setPtr(4, dExpIdx.get()); kDn.setPtr(5, dKw.get());
+    kDn.setPtr(6, dAccum.get());
+    kDn.setValue(7, nFf); kDn.setValue(8, dModel); kDn.setValue(9, expUsed);
+    kDn.setValue(10, static_cast<std::int32_t>(dnSfStride));
+    kDn.launch(ctx.stream(), static_cast<std::uint32_t>((dModel + 3) / 4),
+               static_cast<std::uint32_t>(nSeq), 1, 64, 1, 1);
+    ops.flush();
+    std::vector<float> accum(dModel);
+    ops.readbackToHost(accum.data(), dAccum.get(), dModel * sizeof(float));
+
+    double maxDnErr = 0.0;
+    for (int n = 0; n < dModel; ++n) {
+        double d = 0.0;
+        for (int k = 0; k < nFf; ++k) d += gateAct[k] * tcDequant(dS, n, k);
+        maxDnErr = std::max(maxDnErr, std::fabs(accum[n] - d));
+    }
+    EXPECT_TRUE(maxGuErr <= 1e-2);
+    EXPECT_TRUE(maxDnErr <= 1e-2);
+    std::printf("[nvfp4tc-decode] maxGuErr=%.3e maxDnErr=%.3e OK\n", maxGuErr, maxDnErr);
+}
+
 #ifdef MIMIRMIND_HAVE_CUTLASS_MOE
 // M-Cuda.MoeGroup Sub-Step E-d.3 — end-to-end numeric parity of the CUTLASS
 // block-scaled NVFP4 tensor-core grouped GEMM (runGroupedNvfp4TcF32) against a
