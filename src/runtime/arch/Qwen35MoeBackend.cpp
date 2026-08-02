@@ -5,6 +5,9 @@
 
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
+#include "core/modelopt/BlockScaleSwizzle.hpp" // E-d.4b swizzledBlockScaleBytes
+
+#include <algorithm>
 #include "compute/Embedding.hpp"
 #include "compute/MoeRouting.hpp"
 #include "compute/QuantType.hpp"
@@ -77,7 +80,11 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
         // projection, NO D2H — the shape that can actually beat fused-K.
         _moeGroupedPrefill      = (g[0] == '1' && g[1] == '\0');
         _moeGroupedDeviceDriven = (g[0] == '2' && g[1] == '\0');
-        if (_moeGroupedDeviceDriven) {
+        // "3" = FP4-tensor-core grouped (Sub-Step E-d): padded per-expert
+        // act-quant + the CUTLASS block-scaled NVFP4 grouped GEMM. The only
+        // path whose FP4-TC compute density can beat batched fused-K on GB10.
+        _moeGroupedTc           = (g[0] == '3' && g[1] == '\0');
+        if (_moeGroupedDeviceDriven || _moeGroupedTc) {
             _moeGroupedPrefill = true;   // route prefill through runMoeFfnGrouped
         }
     }
@@ -1344,13 +1351,92 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     // --- gather activations into per-expert-contiguous rows (both paths) ---
     _ops.moeGatherRowsAsync(moeInput, rowSrcTok, xComp, d_model, R);
 
+    // FP4-tensor-core grouped path needs the E-d.2b load-time side banks.
+    const bool tcGrouped =
+        _moeGroupedTc && _ops.moeGroupedGemmNvfp4TcAvailable() &&
+        gateExps.tcNibblePtr != nullptr && upExps.tcNibblePtr != nullptr &&
+        downExps.tcNibblePtr != nullptr;
+
     const bool deviceDrivenGrouped =
-        _moeGroupedDeviceDriven &&
+        !tcGrouped && _moeGroupedDeviceDriven &&
         gateExps.type == core::gguf::GgmlType::NVFP4_BLK &&
         upExps.type   == core::gguf::GgmlType::NVFP4_BLK &&
         downExps.type == core::gguf::GgmlType::NVFP4_BLK;
 
-    if (deviceDrivenGrouped) {
+    if (tcGrouped) {
+        // --- Sub-Step E-d: FP4-tensor-core grouped GEMM (F32 out) ----------
+        // Each expert padded to 128 rows so its SFA sub-tensor is tile-aligned
+        // in one big act-quant; every per-group pointer built on device from
+        // expOffset/padOffset — nothing crosses to the host.
+        namespace mo = core::modelopt;
+        const std::size_t maxPad = R + nExperts * 128;
+        const std::size_t nAsn   = R;                    // nSeq * K assignments
+        TcMoeScratch& t = _tcMoe;
+        if (t.maxPad < maxPad || t.dModel != d_model || t.nFfExp != n_ff_exp ||
+            t.R < R || t.nAsn < nAsn) {
+            t.maxPad  = std::max(t.maxPad, maxPad);
+            t.dModel  = d_model; t.nFfExp = n_ff_exp; t.nExperts = nExperts;
+            t.R       = std::max(t.R, R);
+            t.nAsn    = std::max(t.nAsn, nAsn);
+            t.padOffset   = _ops.allocate((nExperts + 1) * sizeof(std::int32_t));
+            t.contigToPad = _ops.allocate(t.R * sizeof(std::int32_t));
+            t.padAsn      = _ops.allocate(t.nAsn * sizeof(std::int32_t));
+            t.xPad        = _ops.allocate(t.maxPad * d_model * sizeof(float));
+            t.gatePad     = _ops.allocate(t.maxPad * n_ff_exp * sizeof(float));
+            t.upPad       = _ops.allocate(t.maxPad * n_ff_exp * sizeof(float));
+            t.downPad     = _ops.allocate(t.maxPad * d_model * sizeof(float));
+            t.aBank       = _ops.allocate(t.maxPad * (d_model / 2));
+            t.sfaBank     = _ops.allocate(mo::swizzledBlockScaleBytes(t.maxPad, d_model / 16));
+            t.aBank2      = _ops.allocate(t.maxPad * (n_ff_exp / 2));
+            t.sfaBank2    = _ops.allocate(mo::swizzledBlockScaleBytes(t.maxPad, n_ff_exp / 16));
+        }
+        auto* const padOffset   = t.padOffset.as<std::int32_t>();
+        auto* const contigToPad = t.contigToPad.as<std::int32_t>();
+        auto* const padAsn      = t.padAsn.as<std::int32_t>();
+        float* const xPad    = t.xPad.as<float>();
+        float* const gatePad = t.gatePad.as<float>();
+        float* const upPad   = t.upPad.as<float>();
+        float* const downPad = t.downPad.as<float>();
+        auto* const aBank    = t.aBank.as<unsigned char>();
+        auto* const sfaBank  = t.sfaBank.as<unsigned char>();
+        auto* const aBank2   = t.aBank2.as<unsigned char>();
+        auto* const sfaBank2 = t.sfaBank2.as<unsigned char>();
+
+        // padded row maps (device only)
+        _ops.moePadOffsetsAsync(expOffset, padOffset, nExperts);
+        _ops.moeContigToPadAsync(expOffset, padOffset, contigToPad, nExperts, R);
+        _ops.moeIndexGatherI32Async(asnToRow, contigToPad, padAsn, nAsn);
+
+        // spread gathered rows -> padded slots; act-quant (SF pre-zeroed).
+        _ops.moeRowsScatterF32Async(xComp, contigToPad, xPad, R, d_model);
+        _ops.moeZeroBytesAsync(sfaBank, mo::swizzledBlockScaleBytes(maxPad, d_model / 16));
+        _ops.moeActQuantNvfp4Async(xPad, aBank, sfaBank, 1.0F, maxPad, d_model);
+
+        // gate + up: N=n_ff_exp, K=d_model. alpha[e] = weight global (folds the
+        // per-expert global back in; act gscale=1).
+        _ops.moeGroupedGemmNvfp4TcBanksAsync(
+            nExperts, n_ff_exp, d_model, expOffset, padOffset, aBank, sfaBank,
+            gateExps.tcNibblePtr, gateExps.tcSfbPtr,
+            static_cast<const float*>(gateExps.tcGlobalsPtr), gatePad);
+        _ops.moeGroupedGemmNvfp4TcBanksAsync(
+            nExperts, n_ff_exp, d_model, expOffset, padOffset, aBank, sfaBank,
+            upExps.tcNibblePtr, upExps.tcSfbPtr,
+            static_cast<const float*>(upExps.tcGlobalsPtr), upPad);
+
+        _ops.siluMulAsync(gatePad, upPad, maxPad * n_ff_exp);  // silu(gate)*up
+
+        // act-quant the intermediate -> down GEMM: N=d_model, K=n_ff_exp.
+        _ops.moeZeroBytesAsync(sfaBank2, mo::swizzledBlockScaleBytes(maxPad, n_ff_exp / 16));
+        _ops.moeActQuantNvfp4Async(gatePad, aBank2, sfaBank2, 1.0F, maxPad, n_ff_exp);
+        _ops.moeGroupedGemmNvfp4TcBanksAsync(
+            nExperts, d_model, n_ff_exp, expOffset, padOffset, aBank2, sfaBank2,
+            downExps.tcNibblePtr, downExps.tcSfbPtr,
+            static_cast<const float*>(downExps.tcGlobalsPtr), downPad);
+
+        // scatter padded expert output back to token order (routed sum).
+        _ops.moeScatterExpertOutAsync(downPad, padAsn, kwSlot, moeAccumBuf,
+                                      d_model, nSeq, K);
+    } else if (deviceDrivenGrouped) {
         // --- Option 2: fully device-driven grouped GEMM (Sub-Step E) -------
         // moe_group_tiles builds a compact per-tile (expert, row-range)
         // schedule on the device; ONE moe_grouped_gemm_nvfp4blk launch per
@@ -1448,9 +1534,12 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
 
     // --- scatter the grouped output back to token order (routed sum) -------
     // Overwrites moeAccumBuf (no pre-zero needed); the shared expert is added
-    // after, exactly as runMoeFfnBatched does.
-    _ops.moeScatterExpertOutAsync(downComp, asnToRow, kwSlot, moeAccumBuf,
-                                  d_model, nSeq, K);
+    // after, exactly as runMoeFfnBatched does. The FP4-TC path already
+    // scattered its padded output above.
+    if (!tcGrouped) {
+        _ops.moeScatterExpertOutAsync(downComp, asnToRow, kwSlot, moeAccumBuf,
+                                      d_model, nSeq, K);
+    }
 
     // --- shared expert (always-on) + sigmoid gate — identical to batched ---
     const auto* upShexp = w.findBlock(blockIdx, "ffn_up_shexp.weight");

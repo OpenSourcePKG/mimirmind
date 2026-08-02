@@ -10,6 +10,12 @@
 #include "core/gpu/cuda/CudaStream.hpp"
 #include "core/log/Log.hpp"
 
+#ifdef MIMIRMIND_HAVE_CUTLASS_MOE
+#include "MoeGroupedGemmNvfp4Tc.hpp" // E-d.4b: FP4-TC grouped GEMM (banks entry)
+#endif
+
+#include <cuda_runtime.h>
+
 #include <array>
 #include <cstdlib>
 #include <filesystem>
@@ -252,6 +258,14 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _moeGroupTilesKernel;
     core::cuda::CudaModule _moeGroupedGemmNvfp4Module;
     core::cuda::CudaKernel _moeGroupedGemmNvfp4Kernel;
+    // E-d.4b: padding infra (one module, four kernels) + act-quant.
+    core::cuda::CudaModule _moePadModule;
+    core::cuda::CudaKernel _moePadOffsetsKernel;
+    core::cuda::CudaKernel _moeContigToPadKernel;
+    core::cuda::CudaKernel _moeRowsScatterKernel;
+    core::cuda::CudaKernel _moeIndexGatherKernel;
+    core::cuda::CudaModule _moeActQuantModule;
+    core::cuda::CudaKernel _moeActQuantKernel;
 
     explicit Impl(core::cuda::CudaContext& ctx)
         : _rmsnormModule           {loadCudaModule(ctx, "rmsnorm")},
@@ -418,7 +432,14 @@ struct GpuOps::Impl {
           _moeGroupedGemmNvfp4Module{
               loadCudaModule(ctx, "moe_grouped_gemm_nvfp4blk")},
           _moeGroupedGemmNvfp4Kernel{
-              _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk")}
+              _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk")},
+          _moePadModule            {loadCudaModule(ctx, "moe_pad")},
+          _moePadOffsetsKernel     {_moePadModule.getFunction("moe_pad_offsets")},
+          _moeContigToPadKernel    {_moePadModule.getFunction("moe_contig_to_pad")},
+          _moeRowsScatterKernel    {_moePadModule.getFunction("moe_rows_scatter_f32")},
+          _moeIndexGatherKernel    {_moePadModule.getFunction("moe_index_gather_i32")},
+          _moeActQuantModule       {loadCudaModule(ctx, "moe_act_quant_nvfp4")},
+          _moeActQuantKernel       {_moeActQuantModule.getFunction("moe_act_quant_nvfp4")}
     {}
 };
 
@@ -1498,6 +1519,113 @@ void GpuOps::moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
     k.setValue(7, toInt32(N, "moeGroupedGemm N"));
     k.launch(_ctx.stream(), nGroups, static_cast<std::uint32_t>(maxTiles), 1,
              kLocal, 1, 1);
+}
+
+// === E-d.4b FP4-tensor-core grouped MoE ===================================
+
+bool GpuOps::moeGroupedGemmNvfp4TcAvailable() const noexcept {
+#ifdef MIMIRMIND_HAVE_CUTLASS_MOE
+    return kernels::cutlassmoe::nvfp4TcAvailable();
+#else
+    return false;
+#endif
+}
+
+void GpuOps::moeZeroBytesAsync(void* dst, std::size_t bytes) {
+    if (bytes == 0) return;
+    const cudaError_t rc = cudaMemsetAsync(dst, 0, bytes, _ctx.stream().handle());
+    if (rc != cudaSuccess) {
+        throw std::runtime_error(std::string("moeZeroBytesAsync: cudaMemsetAsync failed: ")
+                                 + cudaGetErrorString(rc));
+    }
+}
+
+void GpuOps::moePadOffsetsAsync(const std::int32_t* expOffset,
+                                std::int32_t* padOffset, std::size_t nExperts) {
+    if (nExperts == 0) return;
+    auto& k = _pimpl->_moePadOffsetsKernel;
+    k.setPtr  (0, expOffset);
+    k.setPtr  (1, padOffset);
+    k.setValue(2, toInt32(nExperts, "moePadOffsets nExperts"));
+    k.launch(_ctx.stream(), 1, 1, 1, 1, 1, 1);
+}
+
+void GpuOps::moeContigToPadAsync(const std::int32_t* expOffset,
+                                 const std::int32_t* padOffset,
+                                 std::int32_t* contigToPad,
+                                 std::size_t nExperts, std::size_t R) {
+    if (R == 0) return;
+    auto& k = _pimpl->_moeContigToPadKernel;
+    k.setPtr  (0, expOffset);
+    k.setPtr  (1, padOffset);
+    k.setPtr  (2, contigToPad);
+    k.setValue(3, toInt32(nExperts, "moeContigToPad nExperts"));
+    k.setValue(4, toInt32(R, "moeContigToPad R"));
+    k.launch(_ctx.stream(), static_cast<std::uint32_t>((R + 127) / 128), 1, 1, 128, 1, 1);
+}
+
+void GpuOps::moeRowsScatterF32Async(const float* src, const std::int32_t* idxMap,
+                                    float* dst, std::size_t nRows, std::size_t dim) {
+    if (nRows == 0 || dim == 0) return;
+    auto& k = _pimpl->_moeRowsScatterKernel;
+    k.setPtr  (0, src);
+    k.setPtr  (1, idxMap);
+    k.setPtr  (2, dst);
+    k.setValue(3, toInt32(nRows, "moeRowsScatter nRows"));
+    k.setValue(4, toInt32(dim, "moeRowsScatter dim"));
+    const std::uint32_t gy = static_cast<std::uint32_t>((dim + 255) / 256);
+    k.launch(_ctx.stream(), static_cast<std::uint32_t>(nRows), gy, 1, 256, 1, 1);
+}
+
+void GpuOps::moeIndexGatherI32Async(const std::int32_t* src,
+                                    const std::int32_t* idxMap,
+                                    std::int32_t* dst, std::size_t n) {
+    if (n == 0) return;
+    auto& k = _pimpl->_moeIndexGatherKernel;
+    k.setPtr  (0, src);
+    k.setPtr  (1, idxMap);
+    k.setPtr  (2, dst);
+    k.setValue(3, toInt32(n, "moeIndexGather n"));
+    k.launch(_ctx.stream(), static_cast<std::uint32_t>((n + 127) / 128), 1, 1, 128, 1, 1);
+}
+
+void GpuOps::moeActQuantNvfp4Async(const float* in, unsigned char* outNib,
+                                   unsigned char* outSf, float gscale,
+                                   std::size_t M, std::size_t K) {
+    if (M == 0 || K == 0) return;
+    auto& k = _pimpl->_moeActQuantKernel;
+    k.setPtr  (0, in);
+    k.setPtr  (1, outNib);
+    k.setPtr  (2, outSf);
+    k.setValue(3, gscale);
+    k.setValue(4, toInt32(M, "moeActQuant M"));
+    k.setValue(5, toInt32(K, "moeActQuant K"));
+    const std::uint32_t gy = static_cast<std::uint32_t>(((K / 16) + 255) / 256);
+    k.launch(_ctx.stream(), static_cast<std::uint32_t>(M), gy, 1, 256, 1, 1);
+}
+
+void GpuOps::moeGroupedGemmNvfp4TcBanksAsync(
+    std::size_t nExperts, std::size_t N, std::size_t K,
+    const std::int32_t* expOffset, const std::int32_t* padOffset,
+    const void* aBank, const void* sfaBank,
+    const void* bBank, const void* sfbBank,
+    const float* globalsBank, void* dBank) {
+#ifdef MIMIRMIND_HAVE_CUTLASS_MOE
+    const int rc = kernels::cutlassmoe::runGroupedNvfp4TcF32Banks(
+        static_cast<int>(nExperts), static_cast<int>(N), static_cast<int>(K),
+        expOffset, padOffset, aBank, sfaBank, bBank, sfbBank, globalsBank, dBank,
+        _ctx.stream().handle());
+    if (rc != 0) {
+        throw std::runtime_error(
+            "moeGroupedGemmNvfp4TcBanksAsync: CUTLASS grouped GEMM failed rc="
+            + std::to_string(rc));
+    }
+#else
+    (void)nExperts; (void)N; (void)K; (void)expOffset; (void)padOffset;
+    (void)aBank; (void)sfaBank; (void)bBank; (void)sfbBank; (void)globalsBank; (void)dBank;
+    throw std::runtime_error(
+        "moeGroupedGemmNvfp4TcBanksAsync: CUTLASS not linked in this build");
+#endif
 }
 
 void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {

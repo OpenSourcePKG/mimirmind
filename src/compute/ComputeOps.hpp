@@ -423,6 +423,77 @@ public:
             "moeGroupedGemmNvfp4Async: not supported on this backend");
     }
 
+    // === M-Cuda.MoeGroup Sub-Step E-d.4b: FP4-tensor-core grouped MoE ========
+    // The padded-per-expert building blocks + the CUTLASS block-scaled NVFP4
+    // grouped GEMM. CUDA-only; every default is unsupported / unavailable.
+
+    /// True if this build can run the FP4-TC grouped GEMM (CUTLASS linked).
+    [[nodiscard]] virtual bool moeGroupedGemmNvfp4TcAvailable() const noexcept {
+        return false;
+    }
+
+    /// Async device memset to zero (pre-zero the swizzled SF banks' padding).
+    virtual void moeZeroBytesAsync(void* dst, std::size_t bytes) {
+        (void)dst; (void)bytes;
+        throw std::runtime_error("moeZeroBytesAsync: not supported on this backend");
+    }
+
+    /// padOffset = prefix of round_up(count_e, 128); padOffset[nExperts]=totalPad.
+    virtual void moePadOffsetsAsync(const std::int32_t* expOffset,
+                                    std::int32_t* padOffset, std::size_t nExperts) {
+        (void)expOffset; (void)padOffset; (void)nExperts;
+        throw std::runtime_error("moePadOffsetsAsync: not supported on this backend");
+    }
+
+    /// contigToPad[r] = padded row of contiguous gathered row r.
+    virtual void moeContigToPadAsync(const std::int32_t* expOffset,
+                                     const std::int32_t* padOffset,
+                                     std::int32_t* contigToPad,
+                                     std::size_t nExperts, std::size_t R) {
+        (void)expOffset; (void)padOffset; (void)contigToPad; (void)nExperts; (void)R;
+        throw std::runtime_error("moeContigToPadAsync: not supported on this backend");
+    }
+
+    /// dst[idxMap[r]] = src[r] over `dim`-wide rows (spread to padded slots).
+    virtual void moeRowsScatterF32Async(const float* src, const std::int32_t* idxMap,
+                                        float* dst, std::size_t nRows, std::size_t dim) {
+        (void)src; (void)idxMap; (void)dst; (void)nRows; (void)dim;
+        throw std::runtime_error("moeRowsScatterF32Async: not supported on this backend");
+    }
+
+    /// dst[i] = (src[i] < 0) ? -1 : idxMap[src[i]]  (remap an index array).
+    virtual void moeIndexGatherI32Async(const std::int32_t* src,
+                                        const std::int32_t* idxMap,
+                                        std::int32_t* dst, std::size_t n) {
+        (void)src; (void)idxMap; (void)dst; (void)n;
+        throw std::runtime_error("moeIndexGatherI32Async: not supported on this backend");
+    }
+
+    /// F32 [M,K] activations -> NVFP4 nibbles [M,K/2] + swizzled UE4M3 SFA. The
+    /// caller pre-zeroes `outNib`/`outSf` (padding). K % 16 == 0.
+    virtual void moeActQuantNvfp4Async(const float* in, unsigned char* outNib,
+                                       unsigned char* outSf, float gscale,
+                                       std::size_t M, std::size_t K) {
+        (void)in; (void)outNib; (void)outSf; (void)gscale; (void)M; (void)K;
+        throw std::runtime_error("moeActQuantNvfp4Async: not supported on this backend");
+    }
+
+    /// CUTLASS block-scaled NVFP4 grouped GEMM, one expert per group, F32 out.
+    /// Banks + device expOffset/padOffset; all per-group pointers built on
+    /// device (no D2H). N,K shared. See runGroupedNvfp4TcF32Banks.
+    virtual void moeGroupedGemmNvfp4TcBanksAsync(
+        std::size_t nExperts, std::size_t N, std::size_t K,
+        const std::int32_t* expOffset, const std::int32_t* padOffset,
+        const void* aBank, const void* sfaBank,
+        const void* bBank, const void* sfbBank,
+        const float* globalsBank, void* dBank) {
+        (void)nExperts; (void)N; (void)K; (void)expOffset; (void)padOffset;
+        (void)aBank; (void)sfaBank; (void)bBank; (void)sfbBank;
+        (void)globalsBank; (void)dBank;
+        throw std::runtime_error(
+            "moeGroupedGemmNvfp4TcBanksAsync: not supported on this backend");
+    }
+
     /// M-CLR.MoE Increment 2: device-indexed fused gate+up projection for
     /// Gemma 4 MoE T=1 decode. Reads the router pick `expIdx[k]` on the
     /// device (no host round-trip on the routing) and folds the per-expert

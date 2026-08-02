@@ -227,6 +227,28 @@ public:
                                   const std::int32_t* tileRows,
                                   std::size_t K, std::size_t N,
                                   std::size_t maxTiles) override;
+    // E-d.4b FP4-tensor-core grouped MoE.
+    [[nodiscard]] bool moeGroupedGemmNvfp4TcAvailable() const noexcept override;
+    void moeZeroBytesAsync(void* dst, std::size_t bytes) override;
+    void moePadOffsetsAsync(const std::int32_t* expOffset,
+                            std::int32_t* padOffset, std::size_t nExperts) override;
+    void moeContigToPadAsync(const std::int32_t* expOffset,
+                             const std::int32_t* padOffset,
+                             std::int32_t* contigToPad,
+                             std::size_t nExperts, std::size_t R) override;
+    void moeRowsScatterF32Async(const float* src, const std::int32_t* idxMap,
+                                float* dst, std::size_t nRows, std::size_t dim) override;
+    void moeIndexGatherI32Async(const std::int32_t* src, const std::int32_t* idxMap,
+                                std::int32_t* dst, std::size_t n) override;
+    void moeActQuantNvfp4Async(const float* in, unsigned char* outNib,
+                               unsigned char* outSf, float gscale,
+                               std::size_t M, std::size_t K) override;
+    void moeGroupedGemmNvfp4TcBanksAsync(
+        std::size_t nExperts, std::size_t N, std::size_t K,
+        const std::int32_t* expOffset, const std::int32_t* padOffset,
+        const void* aBank, const void* sfaBank,
+        const void* bBank, const void* sfbBank,
+        const float* globalsBank, void* dBank) override;
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
     void gatherHeadsFromChannelsAsync(const float* src, float* dst,
                                       std::size_t T, std::size_t offset,
