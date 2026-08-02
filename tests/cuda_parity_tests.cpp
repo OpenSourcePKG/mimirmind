@@ -2467,7 +2467,7 @@ double dequantElem(const QuantOperand& q, int r, int k) {
 }
 
 void checkGroupedNvfp4TcParity(const std::vector<std::array<int, 3>>& groups,
-                               std::uint32_t seed) {
+                               std::uint32_t seed, bool deviceDriven = false) {
     namespace cc = ::mimirmind::core::cuda;
     CudaComputeContext ctx{};
     GpuOps ops{ctx};
@@ -2515,15 +2515,37 @@ void checkGroupedNvfp4TcParity(const std::vector<std::array<int, 3>>& groups,
     auto dpAlpha = uploadRaw(ops, pAlpha);
     ops.flush();
 
-    const int rc = ::mimirmind::kernels::cutlassmoe::runGroupedNvfp4TcBf16(
-        G, mH.data(), nH.data(), kH.data(),
-        static_cast<const void* const*>(dpA.get()),
-        static_cast<const void* const*>(dpSFA.get()),
-        static_cast<const void* const*>(dpB.get()),
-        static_cast<const void* const*>(dpSFB.get()),
-        reinterpret_cast<const float* const*>(dpAlpha.get()),
-        static_cast<void* const*>(dpD.get()),
-        ctx.stream().handle());
+    namespace cm = ::mimirmind::kernels::cutlassmoe;
+    int rc;
+    // Keep expOffset alive across the device-driven call (it reads M on device).
+    ::mimirmind::compute::ComputeBuffer dExp;
+    if (deviceDriven) {
+        // Device path: M per group comes from a device expOffset (cumulative
+        // row starts); N,K shared across groups. Nothing crosses to the host.
+        std::vector<std::int32_t> expOff(G + 1, 0);
+        for (int e = 0; e < G; ++e) expOff[e + 1] = expOff[e] + mH[e];
+        dExp = uploadRaw(ops, expOff);
+        ops.flush();
+        rc = cm::runGroupedNvfp4TcBf16DeviceDriven(
+            G, nH[0], kH[0], static_cast<const std::int32_t*>(dExp.get()),
+            static_cast<const void* const*>(dpA.get()),
+            static_cast<const void* const*>(dpSFA.get()),
+            static_cast<const void* const*>(dpB.get()),
+            static_cast<const void* const*>(dpSFB.get()),
+            reinterpret_cast<const float* const*>(dpAlpha.get()),
+            static_cast<void* const*>(dpD.get()),
+            ctx.stream().handle());
+    } else {
+        rc = cm::runGroupedNvfp4TcBf16(
+            G, mH.data(), nH.data(), kH.data(),
+            static_cast<const void* const*>(dpA.get()),
+            static_cast<const void* const*>(dpSFA.get()),
+            static_cast<const void* const*>(dpB.get()),
+            static_cast<const void* const*>(dpSFB.get()),
+            reinterpret_cast<const float* const*>(dpAlpha.get()),
+            static_cast<void* const*>(dpD.get()),
+            ctx.stream().handle());
+    }
     EXPECT_EQ(rc, 0);
 
     double maxRel = 0.0, maxAbs = 0.0;
@@ -2559,6 +2581,18 @@ TEST(cuda_moe_grouped_nvfp4_tc_parity_single) {
 TEST(cuda_moe_grouped_nvfp4_tc_parity_multi) {
     // Variable M per group (the MoE case: tokens/expert differ), shared-ish N/K.
     checkGroupedNvfp4TcParity({{32, 64, 64}, {16, 128, 128}, {80, 64, 128}}, 0x77A2u);
+}
+
+// E-d.3b — fully device-driven: per-group M / problem_sizes / strides / SF
+// layouts built ON DEVICE from a device expOffset (no host M, no D2H). N,K are
+// shared across groups (the real MoE shape: only tokens-per-expert vary).
+TEST(cuda_moe_grouped_nvfp4_tc_device_single) {
+    checkGroupedNvfp4TcParity({{64, 128, 128}}, 0x51B3u, /*deviceDriven=*/true);
+}
+
+TEST(cuda_moe_grouped_nvfp4_tc_device_multi) {
+    checkGroupedNvfp4TcParity({{32, 128, 128}, {16, 128, 128}, {80, 128, 128}},
+                              0x9E4Cu, /*deviceDriven=*/true);
 }
 #endif // MIMIRMIND_HAVE_CUTLASS_MOE
 

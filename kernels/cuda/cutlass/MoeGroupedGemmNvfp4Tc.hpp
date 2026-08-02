@@ -67,4 +67,30 @@ namespace mimirmind::kernels::cutlassmoe {
     void* const*         dPtrD,
     CUstream_st*         stream);
 
+/**
+ * Fully device-driven variant (E-d.3b) — the runtime path. The per-group
+ * problem sizes come from a device expOffset (M_e = expOffset[e+1] -
+ * expOffset[e]); the per-group problem_sizes, strides, and SF layouts are BUILT
+ * ON DEVICE by a small builder kernel, so nothing crosses to the host (no M
+ * D2H, the Option-1 host-sync killer that made the scalar grouped path lose to
+ * batched on GB10). N and K are shared across all groups.
+ *
+ * The operand pointer arrays are device arrays of device pointers, exactly as
+ * in runGroupedNvfp4TcBf16 (in the runtime they are produced by the gather +
+ * grouped act-quant kernels; SFA is one tensor per expert). `dExpOffset` has
+ * `groups+1` entries. Runs on `stream`. Returns 0 on success.
+ */
+[[nodiscard]] int runGroupedNvfp4TcBf16DeviceDriven(
+    int                  groups,
+    int                  N,
+    int                  K,
+    const int*           dExpOffset,
+    const void* const*   dPtrA,
+    const void* const*   dPtrSFA,
+    const void* const*   dPtrB,
+    const void* const*   dPtrSFB,
+    const float* const*  dPtrAlpha,
+    void* const*         dPtrD,
+    CUstream_st*         stream);
+
 } // namespace mimirmind::kernels::cutlassmoe

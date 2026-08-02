@@ -99,6 +99,11 @@ using ElementSF = typename Gemm::GemmKernel::CollectiveMainloop::ElementSF;
 using ElementDOut = typename Gemm::EpilogueOutputOp::ElementOutput;
 using UnderlyingProblem = typename ProblemShape::UnderlyingProblemShape;
 
+// The collective's operand element is the raw FP4 element (float_e2m1_t)
+// exposed as Gemm::ElementA/B, NOT the nv_float4_t<> block-scaled alias.
+using GemmElementA = typename Gemm::ElementA;
+using GemmElementB = typename Gemm::ElementB;
+
 // RAII device scratch — one cudaFree per allocation, freed after the stream
 // sync at the end of the run.
 template <typename T>
@@ -116,6 +121,31 @@ struct DevBuf {
 template <typename T>
 void uploadAsync(T* dst, const T* src, std::size_t n, cudaStream_t s) {
     cudaMemcpyAsync(dst, src, n * sizeof(T), cudaMemcpyHostToDevice, s);
+}
+
+// Device builder (E-d.3b): one thread per group builds the per-group
+// problem_sizes, strides, and SF layouts from the device expOffset — the only
+// M-dependent arrays (M_e = expOffset[e+1]-expOffset[e]). Strides are actually
+// M-independent (RowMajor A/D row stride is K/N) and the SFB layout depends
+// only on N,K, but building all of them here keeps the host free of M and needs
+// no D2H. make_cute_packed_stride and tile_atom_to_shape_SFA/B are
+// CUTLASS_HOST_DEVICE, so they lower into the kernel.
+__global__ void buildGroupArraysKernel(
+    const int* __restrict__ expOffset, int G, int N, int K,
+    UnderlyingProblem* __restrict__ problems,
+    StrideA* __restrict__ strideA, StrideB* __restrict__ strideB,
+    StrideC* __restrict__ strideC, StrideD* __restrict__ strideD,
+    LayoutSFA* __restrict__ layoutSFA, LayoutSFB* __restrict__ layoutSFB) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= G) return;
+    const int M = expOffset[e + 1] - expOffset[e];
+    problems[e]  = UnderlyingProblem{M, N, K};
+    strideA[e]   = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    strideB[e]   = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    strideC[e]   = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+    strideD[e]   = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
+    layoutSFA[e] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, N, K, 1));
+    layoutSFB[e] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
 }
 
 } // namespace
@@ -158,11 +188,7 @@ int runGroupedNvfp4TcBf16(
         lSFB[e] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
     }
 
-    // Device arrays consumed by the grouped kernel. The collective's operand
-    // element is the raw FP4 element (float_e2m1_t) exposed as Gemm::ElementA/B,
-    // NOT the nv_float4_t<> block-scaled alias — the pointer arrays use it.
-    using GemmElementA = typename Gemm::ElementA;
-    using GemmElementB = typename Gemm::ElementB;
+    // Device arrays consumed by the grouped kernel.
     DevBuf<UnderlyingProblem>   dProblems(groups);
     DevBuf<const GemmElementA*> dA(groups);
     DevBuf<const GemmElementB*> dB(groups);
@@ -245,6 +271,102 @@ int runGroupedNvfp4TcBf16(
     return 0;
 }
 
+int runGroupedNvfp4TcBf16DeviceDriven(
+    int                  groups,
+    int                  N,
+    int                  K,
+    const int*           dExpOffset,
+    const void* const*   dPtrA,
+    const void* const*   dPtrSFA,
+    const void* const*   dPtrB,
+    const void* const*   dPtrSFB,
+    const float* const*  dPtrAlpha,
+    void* const*         dPtrD,
+    CUstream_st*         streamRaw) {
+
+    if (groups <= 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(streamRaw);
+
+    // Per-group problem_sizes / strides / SF layouts, built on the device from
+    // dExpOffset — nothing crosses to the host.
+    DevBuf<UnderlyingProblem> dProblems(groups);
+    DevBuf<StrideA>   dsA(groups);
+    DevBuf<StrideB>   dsB(groups);
+    DevBuf<StrideC>   dsC(groups);
+    DevBuf<StrideD>   dsD(groups);
+    DevBuf<LayoutSFA> dlSFA(groups);
+    DevBuf<LayoutSFB> dlSFB(groups);
+
+    const int threads = 64;
+    const int blocks  = (groups + threads - 1) / threads;
+    buildGroupArraysKernel<<<blocks, threads, 0, stream>>>(
+        dExpOffset, groups, N, K,
+        dProblems.get(), dsA.get(), dsB.get(), dsC.get(), dsD.get(),
+        dlSFA.get(), dlSFB.get());
+
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = 0;
+    hw_info.sm_count  = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+
+    typename Gemm::Arguments arguments;
+    decltype(arguments.epilogue.thread) fusion_args;
+    fusion_args.alpha = 0;
+    fusion_args.beta  = 0;
+    fusion_args.alpha_ptr = nullptr;
+    fusion_args.beta_ptr  = nullptr;
+    fusion_args.alpha_ptr_array = dPtrAlpha;
+    fusion_args.beta_ptr_array  = nullptr;
+    fusion_args.dAlpha = {_0{}, _0{}, 1};
+    fusion_args.dBeta  = {_0{}, _0{}, 0};
+
+    typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
+
+    // C-style casts: the operand arrays are device arrays of device pointers,
+    // bit-identical to the CUTLASS pointer-of-pointer operands; combine the
+    // const strip + reinterpret in one (reinterpret_cast alone can't strip).
+    auto ptrA   = (const GemmElementA**)(dPtrA);
+    auto ptrB   = (const GemmElementB**)(dPtrB);
+    auto ptrSFA = (const ElementSF**)(dPtrSFA);
+    auto ptrSFB = (const ElementSF**)(dPtrSFB);
+    auto ptrD   = (ElementDOut**)(dPtrD);
+
+    arguments = typename Gemm::Arguments{
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {groups, dProblems.get(), nullptr},   // host shapes unavailable -> device
+        {ptrA, dsA.get(), ptrB, dsB.get(),
+         ptrSFA, dlSFA.get(), ptrSFB, dlSFB.get()},
+        {fusion_args, nullptr, dsC.get(), ptrD, dsD.get()},
+        hw_info, scheduler};
+
+    Gemm gemm;
+    const std::size_t wsBytes = Gemm::get_workspace_size(arguments);
+    DevBuf<std::uint8_t> workspace(wsBytes ? wsBytes : 1);
+
+    cutlass::Status st = gemm.can_implement(arguments);
+    if (st != cutlass::Status::kSuccess) {
+        std::fprintf(stderr, "[nvfp4-tc-dev] can_implement: %s\n",
+                     cutlassGetStatusString(st));
+        cudaStreamSynchronize(stream);
+        return 1;
+    }
+    st = gemm.initialize(arguments, workspace.get(), stream);
+    if (st != cutlass::Status::kSuccess) {
+        std::fprintf(stderr, "[nvfp4-tc-dev] initialize: %s\n", cutlassGetStatusString(st));
+        cudaStreamSynchronize(stream);
+        return 2;
+    }
+    st = gemm.run(stream);
+    if (st != cutlass::Status::kSuccess) {
+        std::fprintf(stderr, "[nvfp4-tc-dev] run: %s\n", cutlassGetStatusString(st));
+        cudaStreamSynchronize(stream);
+        return 3;
+    }
+    // Sync so the device scratch DevBufs are safe to free. E-d.4 will use a
+    // pre-allocated scratch + no sync (the true host-sync-free runtime path).
+    cudaStreamSynchronize(stream);
+    return 0;
+}
+
 #else // no SM120/SM121 support in this build
 
 bool nvfp4TcAvailable() noexcept { return false; }
@@ -254,6 +376,14 @@ int runGroupedNvfp4TcBf16(int, const int*, const int*, const int*,
                           const void* const*, const void* const*,
                           const float* const*, void* const*,
                           CUstream_st*) {
+    return -1;
+}
+
+int runGroupedNvfp4TcBf16DeviceDriven(int, int, int, const int*,
+                                      const void* const*, const void* const*,
+                                      const void* const*, const void* const*,
+                                      const float* const*, void* const*,
+                                      CUstream_st*) {
     return -1;
 }
 
