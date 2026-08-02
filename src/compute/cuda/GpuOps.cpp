@@ -1611,10 +1611,17 @@ void GpuOps::moeGroupedGemmNvfp4TcBanksAsync(
     const void* bBank, const void* sfbBank,
     const float* globalsBank, void* dBank) {
 #ifdef MIMIRMIND_HAVE_CUTLASS_MOE
+    // Ensure the persistent scratch (per-group arrays + CUTLASS workspace).
+    const std::size_t need =
+        kernels::cutlassmoe::groupedNvfp4TcBanksScratchBytes(static_cast<int>(nExperts));
+    if (_tcBanksScratchBytes < need) {
+        _tcBanksScratch      = allocate(need);
+        _tcBanksScratchBytes = need;
+    }
     const int rc = kernels::cutlassmoe::runGroupedNvfp4TcF32Banks(
         static_cast<int>(nExperts), static_cast<int>(N), static_cast<int>(K),
         expOffset, padOffset, aBank, sfaBank, bBank, sfbBank, globalsBank, dBank,
-        _ctx.stream().handle());
+        _tcBanksScratch.get(), _tcBanksScratchBytes, _ctx.stream().handle());
     if (rc != 0) {
         throw std::runtime_error(
             "moeGroupedGemmNvfp4TcBanksAsync: CUTLASS grouped GEMM failed rc="

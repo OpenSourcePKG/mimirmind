@@ -384,6 +384,12 @@ private:
     struct Impl;
     std::unique_ptr<Impl>         _pimpl;
 
+    // E-d.4c: persistent device scratch for the FP4-TC banks GEMM (CUTLASS
+    // per-group arrays + workspace), grown lazily so the GEMM does no per-call
+    // malloc and never syncs.
+    compute::ComputeBuffer        _tcBanksScratch;
+    std::size_t                   _tcBanksScratchBytes{0};
+
     // M-Q3N.5 device-side MoE top-K router launcher (holds the moe_topk
     // module + kernel; loaded once). Delegated to by moeTopKRouteDeviceAsync.
     MoeTopKRouteDevice            _moeTopKRoute;

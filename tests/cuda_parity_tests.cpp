@@ -2780,13 +2780,17 @@ TEST(cuda_moe_grouped_nvfp4_tc_banks_multi) {
     auto dPad  = uploadRaw(ops, padOff);
     ops.flush();
 
+    const std::size_t scratchBytes =
+        ::mimirmind::kernels::cutlassmoe::groupedNvfp4TcBanksScratchBytes(G);
+    auto dScratch = ops.allocate(scratchBytes);
     const int rc = ::mimirmind::kernels::cutlassmoe::runGroupedNvfp4TcF32Banks(
         G, N, K,
         static_cast<const std::int32_t*>(dExp.get()),
         static_cast<const std::int32_t*>(dPad.get()),
         A.nib.get(), A.sf.get(), bBank.get(), sfbBank.get(),
         static_cast<const float*>(globals.get()), dOut.get(),
-        ctx.stream().handle());
+        dScratch.get(), scratchBytes, ctx.stream().handle());
+    ops.flush();  // banks op no longer syncs internally
     EXPECT_EQ(rc, 0);
 
     std::vector<float> D(static_cast<std::size_t>(totalPad) * N);

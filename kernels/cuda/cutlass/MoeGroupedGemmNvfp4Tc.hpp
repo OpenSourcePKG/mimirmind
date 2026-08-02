@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 // Forward-declared so callers need no CUDA runtime include beyond the stream.
@@ -120,6 +121,13 @@ namespace mimirmind::kernels::cutlassmoe {
     const void*          sfbBank,
     const float*         globalsBank,
     void*                dBank,
+    void*                scratch,
+    std::size_t          scratchBytes,
     CUstream_st*         stream);
+
+/// Bytes of caller-owned device scratch runGroupedNvfp4TcF32Banks needs for
+/// `groups` (the per-group CUTLASS arrays + the CUTLASS workspace). Allocate
+/// once and reuse across calls so the GEMM does no per-call malloc and no sync.
+[[nodiscard]] std::size_t groupedNvfp4TcBanksScratchBytes(int groups);
 
 } // namespace mimirmind::kernels::cutlassmoe

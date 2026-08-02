@@ -193,6 +193,84 @@ __global__ void buildGroupArraysBanksKernel(
     layoutSFB[e] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
 }
 
+// --- E-d.4c: pre-allocated scratch layout for the banks GEMM ---------------
+// The per-group CUTLASS arrays + the CUTLASS workspace live in one caller-owned
+// buffer so the banks GEMM does no per-call cudaMalloc and never syncs (the
+// caller's stream ordering + persistent scratch keep it host-sync-free — the
+// whole point of the FP4-TC path).
+inline std::size_t alignUp(std::size_t x, std::size_t a) { return (x + a - 1) / a * a; }
+
+struct BanksScratch {
+    UnderlyingProblem*  problems{nullptr};
+    const GemmElementA** pA{nullptr};
+    const GemmElementB** pB{nullptr};
+    const ElementSF**   pSFA{nullptr};
+    const ElementSF**   pSFB{nullptr};
+    ElementDOut**       pD{nullptr};
+    const float**       pAlpha{nullptr};
+    StrideA*   sA{nullptr};
+    StrideB*   sB{nullptr};
+    StrideC*   sC{nullptr};
+    StrideD*   sD{nullptr};
+    LayoutSFA* lSFA{nullptr};
+    LayoutSFB* lSFB{nullptr};
+    std::uint8_t* workspace{nullptr};
+    std::size_t total{0};
+};
+
+// Assigns sub-pointers into `base` (or, with base==nullptr, only measures
+// `total`). `groups` and `wsBytes` fully determine the layout.
+inline BanksScratch layoutBanksScratch(void* base, int groups, std::size_t wsBytes) {
+    BanksScratch s{};
+    std::size_t off = 0;
+    auto* const b = static_cast<std::uint8_t*>(base);
+    auto take = [&](std::size_t bytes) -> void* {
+        off = alignUp(off, 256);
+        void* p = b ? (b + off) : nullptr;
+        off += bytes;
+        return p;
+    };
+    const std::size_t g = static_cast<std::size_t>(groups);
+    s.problems = static_cast<UnderlyingProblem*>(take(g * sizeof(UnderlyingProblem)));
+    s.pA       = static_cast<const GemmElementA**>(take(g * sizeof(void*)));
+    s.pB       = static_cast<const GemmElementB**>(take(g * sizeof(void*)));
+    s.pSFA     = static_cast<const ElementSF**>(take(g * sizeof(void*)));
+    s.pSFB     = static_cast<const ElementSF**>(take(g * sizeof(void*)));
+    s.pD       = static_cast<ElementDOut**>(take(g * sizeof(void*)));
+    s.pAlpha   = static_cast<const float**>(take(g * sizeof(void*)));
+    s.sA       = static_cast<StrideA*>(take(g * sizeof(StrideA)));
+    s.sB       = static_cast<StrideB*>(take(g * sizeof(StrideB)));
+    s.sC       = static_cast<StrideC*>(take(g * sizeof(StrideC)));
+    s.sD       = static_cast<StrideD*>(take(g * sizeof(StrideD)));
+    s.lSFA     = static_cast<LayoutSFA*>(take(g * sizeof(LayoutSFA)));
+    s.lSFB     = static_cast<LayoutSFB*>(take(g * sizeof(LayoutSFB)));
+    s.workspace = static_cast<std::uint8_t*>(take(wsBytes ? wsBytes : 1));
+    s.total    = alignUp(off, 256);
+    return s;
+}
+
+// CUTLASS grouped workspace bytes for `groups` (host-only; group count +
+// sm_count, does not read device data — safe with null/stub pointers).
+inline std::size_t banksWorkspaceBytes(int groups) {
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = 0;
+    hw_info.sm_count  = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+    typename Gemm::Arguments args;
+    decltype(args.epilogue.thread) fusion_args;
+    fusion_args.alpha = 0; fusion_args.beta = 0;
+    fusion_args.alpha_ptr = nullptr; fusion_args.beta_ptr = nullptr;
+    fusion_args.alpha_ptr_array = nullptr; fusion_args.beta_ptr_array = nullptr;
+    fusion_args.dAlpha = {_0{}, _0{}, 1}; fusion_args.dBeta = {_0{}, _0{}, 0};
+    typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
+    args = typename Gemm::Arguments{
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {groups, nullptr, nullptr},
+        {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr},
+        {fusion_args, nullptr, nullptr, nullptr, nullptr},
+        hw_info, scheduler};
+    return Gemm::get_workspace_size(args);
+}
+
 } // namespace
 
 bool nvfp4TcAvailable() noexcept { return true; }
@@ -424,24 +502,20 @@ int runGroupedNvfp4TcF32Banks(
     const void*          sfbBank,
     const float*         globalsBank,
     void*                dBank,
+    void*                scratch,
+    std::size_t          scratchBytes,
     CUstream_st*         streamRaw) {
 
     if (groups <= 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(streamRaw);
 
-    DevBuf<UnderlyingProblem>   dProblems(groups);
-    DevBuf<const GemmElementA*> dA(groups);
-    DevBuf<const GemmElementB*> dB(groups);
-    DevBuf<const ElementSF*>    dSFA(groups);
-    DevBuf<const ElementSF*>    dSFB(groups);
-    DevBuf<ElementDOut*>        dD(groups);
-    DevBuf<const float*>        dAlpha(groups);
-    DevBuf<StrideA>   dsA(groups);
-    DevBuf<StrideB>   dsB(groups);
-    DevBuf<StrideC>   dsC(groups);
-    DevBuf<StrideD>   dsD(groups);
-    DevBuf<LayoutSFA> dlSFA(groups);
-    DevBuf<LayoutSFB> dlSFB(groups);
+    const std::size_t wsBytes = banksWorkspaceBytes(groups);
+    BanksScratch sc = layoutBanksScratch(scratch, groups, wsBytes);
+    if (scratch == nullptr || scratchBytes < sc.total) {
+        std::fprintf(stderr, "[nvfp4-tc-banks] scratch too small: have %zu need %zu\n",
+                     scratchBytes, sc.total);
+        return 4;
+    }
 
     const int threads = 64;
     const int blocks  = (groups + threads - 1) / threads;
@@ -450,8 +524,8 @@ int runGroupedNvfp4TcF32Banks(
         static_cast<const unsigned char*>(aBank), static_cast<const unsigned char*>(sfaBank),
         static_cast<const unsigned char*>(bBank), static_cast<const unsigned char*>(sfbBank),
         globalsBank, static_cast<unsigned char*>(dBank),
-        dProblems.get(), dA.get(), dB.get(), dSFA.get(), dSFB.get(), dD.get(), dAlpha.get(),
-        dsA.get(), dsB.get(), dsC.get(), dsD.get(), dlSFA.get(), dlSFB.get());
+        sc.problems, sc.pA, sc.pB, sc.pSFA, sc.pSFB, sc.pD, sc.pAlpha,
+        sc.sA, sc.sB, sc.sC, sc.sD, sc.lSFA, sc.lSFB);
 
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
@@ -463,7 +537,7 @@ int runGroupedNvfp4TcF32Banks(
     fusion_args.beta  = 0;
     fusion_args.alpha_ptr = nullptr;
     fusion_args.beta_ptr  = nullptr;
-    fusion_args.alpha_ptr_array = dAlpha.get();
+    fusion_args.alpha_ptr_array = sc.pAlpha;
     fusion_args.beta_ptr_array  = nullptr;
     fusion_args.dAlpha = {_0{}, _0{}, 1};
     fusion_args.dBeta  = {_0{}, _0{}, 0};
@@ -472,36 +546,37 @@ int runGroupedNvfp4TcF32Banks(
 
     arguments = typename Gemm::Arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        {groups, dProblems.get(), nullptr},
-        {dA.get(), dsA.get(), dB.get(), dsB.get(),
-         dSFA.get(), dlSFA.get(), dSFB.get(), dlSFB.get()},
-        {fusion_args, nullptr, dsC.get(), dD.get(), dsD.get()},
+        {groups, sc.problems, nullptr},
+        {sc.pA, sc.sA, sc.pB, sc.sB,
+         sc.pSFA, sc.lSFA, sc.pSFB, sc.lSFB},
+        {fusion_args, nullptr, sc.sC, sc.pD, sc.sD},
         hw_info, scheduler};
 
     Gemm gemm;
-    const std::size_t wsBytes = Gemm::get_workspace_size(arguments);
-    DevBuf<std::uint8_t> workspace(wsBytes ? wsBytes : 1);
-
+    // No per-call cudaMalloc, no sync: the scratch + workspace persist across
+    // calls (caller-owned) and the stream ordering serialises the builder ->
+    // GEMM chain against the surrounding MoE ops.
     cutlass::Status st = gemm.can_implement(arguments);
     if (st != cutlass::Status::kSuccess) {
         std::fprintf(stderr, "[nvfp4-tc-banks] can_implement: %s\n", cutlassGetStatusString(st));
-        cudaStreamSynchronize(stream);
         return 1;
     }
-    st = gemm.initialize(arguments, workspace.get(), stream);
+    st = gemm.initialize(arguments, sc.workspace, stream);
     if (st != cutlass::Status::kSuccess) {
         std::fprintf(stderr, "[nvfp4-tc-banks] initialize: %s\n", cutlassGetStatusString(st));
-        cudaStreamSynchronize(stream);
         return 2;
     }
     st = gemm.run(stream);
     if (st != cutlass::Status::kSuccess) {
         std::fprintf(stderr, "[nvfp4-tc-banks] run: %s\n", cutlassGetStatusString(st));
-        cudaStreamSynchronize(stream);
         return 3;
     }
-    cudaStreamSynchronize(stream);
     return 0;
+}
+
+std::size_t groupedNvfp4TcBanksScratchBytes(int groups) {
+    if (groups <= 0) return 0;
+    return layoutBanksScratch(nullptr, groups, banksWorkspaceBytes(groups)).total;
 }
 
 #else // no SM120/SM121 support in this build
@@ -527,9 +602,11 @@ int runGroupedNvfp4TcF32DeviceDriven(int, int, int, const int*,
 int runGroupedNvfp4TcF32Banks(int, int, int, const int*, const int*,
                                const void*, const void*, const void*,
                                const void*, const float*, void*,
-                               CUstream_st*) {
+                               void*, std::size_t, CUstream_st*) {
     return -1;
 }
+
+std::size_t groupedNvfp4TcBanksScratchBytes(int) { return 0; }
 
 #endif
 
