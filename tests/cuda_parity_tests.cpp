@@ -2434,6 +2434,86 @@ TEST(cuda_moe_weight_sf_swizzle_parity) {
     }
 }
 
+// M-Cuda.MoeGroup Sub-Step E-d.4b — padding infrastructure kernels. Validate
+// padOffset (prefix of round_up(count,128)), contigToPad (contiguous row ->
+// padded row, binary search over expOffset), the row spread, and the index
+// remap. Edge cases: an empty expert (count 0) and a small tail expert.
+TEST(cuda_moe_pad_infra) {
+    namespace cc = ::mimirmind::core::cuda;
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    auto load = [&](const char* n) {
+        return cc::CudaModule::fromFile(ctx.cudaContext(), resolvePtx(n));
+    };
+    cc::CudaModule mOff = load("moe_pad");
+    cc::CudaKernel kOff  = mOff.getFunction("moe_pad_offsets");
+    cc::CudaKernel kC2P  = mOff.getFunction("moe_contig_to_pad");
+    cc::CudaKernel kSpr  = mOff.getFunction("moe_rows_scatter_f32");
+    cc::CudaKernel kGat  = mOff.getFunction("moe_index_gather_i32");
+
+    const std::vector<int> counts{32, 16, 80, 0, 5};
+    const int nE = static_cast<int>(counts.size());
+    std::vector<std::int32_t> expOff(nE + 1, 0);
+    for (int e = 0; e < nE; ++e) expOff[e + 1] = expOff[e] + counts[e];
+    const int R = expOff[nE];
+
+    std::vector<std::int32_t> padRef(nE + 1, 0);
+    for (int e = 0; e < nE; ++e) padRef[e + 1] = padRef[e] + ((counts[e] + 127) / 128) * 128;
+    const int totalPad = padRef[nE];
+
+    auto dExp = uploadRaw(ops, expOff);
+    auto dPad = ops.allocate((nE + 1) * sizeof(std::int32_t));
+    kOff.setPtr(0, dExp.get()); kOff.setPtr(1, dPad.get()); kOff.setValue(2, nE);
+    kOff.launch(ctx.stream(), 1, 1, 1, 1, 1, 1);
+    ops.flush();
+    std::vector<std::int32_t> padGot(nE + 1);
+    ops.readbackToHost(padGot.data(), dPad.get(), padGot.size() * sizeof(std::int32_t));
+    for (int e = 0; e <= nE; ++e) EXPECT_EQ(padGot[e], padRef[e]);
+
+    // contigToPad
+    auto dC2P = ops.allocate(static_cast<std::size_t>(R) * sizeof(std::int32_t));
+    kC2P.setPtr(0, dExp.get()); kC2P.setPtr(1, dPad.get()); kC2P.setPtr(2, dC2P.get());
+    kC2P.setValue(3, nE); kC2P.setValue(4, R);
+    kC2P.launch(ctx.stream(), static_cast<std::uint32_t>((R + 127) / 128), 1, 1, 128, 1, 1);
+    ops.flush();
+    std::vector<std::int32_t> c2p(R), c2pRef(R);
+    for (int e = 0; e < nE; ++e)
+        for (int i = 0; i < counts[e]; ++i) c2pRef[expOff[e] + i] = padRef[e] + i;
+    ops.readbackToHost(c2p.data(), dC2P.get(), static_cast<std::size_t>(R) * sizeof(std::int32_t));
+    for (int r = 0; r < R; ++r) EXPECT_EQ(c2p[r], c2pRef[r]);
+
+    // rows spread
+    const int dim = 4;
+    std::vector<float> src(static_cast<std::size_t>(R) * dim);
+    for (int r = 0; r < R; ++r) for (int c = 0; c < dim; ++c) src[r * dim + c] = r * 10.0f + c;
+    auto dSrc = uploadRaw(ops, src);
+    std::vector<float> zero(static_cast<std::size_t>(totalPad) * dim, -1.0f);
+    auto dDst = uploadRaw(ops, zero);
+    kSpr.setPtr(0, dSrc.get()); kSpr.setPtr(1, dC2P.get()); kSpr.setPtr(2, dDst.get());
+    kSpr.setValue(3, R); kSpr.setValue(4, dim);
+    kSpr.launch(ctx.stream(), static_cast<std::uint32_t>(R), 1, 1, 32, 1, 1);
+    ops.flush();
+    std::vector<float> dst(static_cast<std::size_t>(totalPad) * dim);
+    ops.readbackToHost(dst.data(), dDst.get(), dst.size() * sizeof(float));
+    for (int r = 0; r < R; ++r)
+        for (int c = 0; c < dim; ++c)
+            EXPECT_TRUE(dst[static_cast<std::size_t>(c2pRef[r]) * dim + c] == src[r * dim + c]);
+
+    // index remap
+    std::vector<std::int32_t> asn(R);
+    for (int i = 0; i < R; ++i) asn[i] = R - 1 - i;
+    auto dAsn = uploadRaw(ops, asn);
+    auto dOut = ops.allocate(static_cast<std::size_t>(R) * sizeof(std::int32_t));
+    kGat.setPtr(0, dAsn.get()); kGat.setPtr(1, dC2P.get()); kGat.setPtr(2, dOut.get());
+    kGat.setValue(3, R);
+    kGat.launch(ctx.stream(), static_cast<std::uint32_t>((R + 127) / 128), 1, 1, 128, 1, 1);
+    ops.flush();
+    std::vector<std::int32_t> out(R);
+    ops.readbackToHost(out.data(), dOut.get(), static_cast<std::size_t>(R) * sizeof(std::int32_t));
+    for (int a = 0; a < R; ++a) EXPECT_EQ(out[a], c2pRef[asn[a]]);
+    std::printf("[moe-pad-infra] nE=%d R=%d totalPad=%d OK\n", nE, R, totalPad);
+}
+
 #ifdef MIMIRMIND_HAVE_CUTLASS_MOE
 // M-Cuda.MoeGroup Sub-Step E-d.3 — end-to-end numeric parity of the CUTLASS
 // block-scaled NVFP4 tensor-core grouped GEMM (runGroupedNvfp4TcBf16) against a
