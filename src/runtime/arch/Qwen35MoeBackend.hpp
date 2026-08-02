@@ -4,7 +4,6 @@
 #pragma once
 
 #include "runtime/arch/ArchBackend.hpp"
-#include "compute/ComputeBuffer.hpp" // E-d.4b TcMoeScratch buffers
 
 #include <cstddef>
 #include <cstdint>
@@ -339,18 +338,6 @@ private:
     // read back once per grouped MoE layer to drive the per-expert launches
     // (host-driven Option 1 only; the device-driven path never reads it back).
     std::vector<std::int32_t> _groupOffsetHost;
-
-    // E-d.4b FP4-TC grouped prefill scratch — lazily allocated, grows with
-    // maxPad = R + nExperts*128. Prefill is single-stream, so one set on the
-    // backend suffices; productionising for concurrent prefill would move these
-    // into per-slot BlockBuffers.
-    struct TcMoeScratch {
-        std::size_t maxPad{0}, dModel{0}, nFfExp{0}, nExperts{0}, R{0}, nAsn{0};
-        compute::ComputeBuffer padOffset, contigToPad, padAsn;   // int32
-        compute::ComputeBuffer xPad, gatePad, upPad, downPad;    // f32
-        compute::ComputeBuffer aBank, sfaBank, aBank2, sfaBank2; // u8 (nibbles+SFA)
-    };
-    TcMoeScratch _tcMoe;
 
     // Diagnostic: when MIMIRMIND_SSM_TRACE is set, log per-linear-layer
     // recurrent-state / output norms and per-block residual-stream norms

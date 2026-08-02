@@ -1371,36 +1371,38 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         namespace mo = core::modelopt;
         const std::size_t maxPad = R + nExperts * 128;
         const std::size_t nAsn   = R;                    // nSeq * K assignments
-        TcMoeScratch& t = _tcMoe;
-        if (t.maxPad < maxPad || t.dModel != d_model || t.nFfExp != n_ff_exp ||
-            t.R < R || t.nAsn < nAsn) {
-            t.maxPad  = std::max(t.maxPad, maxPad);
-            t.dModel  = d_model; t.nFfExp = n_ff_exp; t.nExperts = nExperts;
-            t.R       = std::max(t.R, R);
-            t.nAsn    = std::max(t.nAsn, nAsn);
-            t.padOffset   = _ops.allocate((nExperts + 1) * sizeof(std::int32_t));
-            t.contigToPad = _ops.allocate(t.R * sizeof(std::int32_t));
-            t.padAsn      = _ops.allocate(t.nAsn * sizeof(std::int32_t));
-            t.xPad        = _ops.allocate(t.maxPad * d_model * sizeof(float));
-            t.gatePad     = _ops.allocate(t.maxPad * n_ff_exp * sizeof(float));
-            t.upPad       = _ops.allocate(t.maxPad * n_ff_exp * sizeof(float));
-            t.downPad     = _ops.allocate(t.maxPad * d_model * sizeof(float));
-            t.aBank       = _ops.allocate(t.maxPad * (d_model / 2));
-            t.sfaBank     = _ops.allocate(mo::swizzledBlockScaleBytes(t.maxPad, d_model / 16));
-            t.aBank2      = _ops.allocate(t.maxPad * (n_ff_exp / 2));
-            t.sfaBank2    = _ops.allocate(mo::swizzledBlockScaleBytes(t.maxPad, n_ff_exp / 16));
-        }
-        auto* const padOffset   = t.padOffset.as<std::int32_t>();
-        auto* const contigToPad = t.contigToPad.as<std::int32_t>();
-        auto* const padAsn      = t.padAsn.as<std::int32_t>();
-        float* const xPad    = t.xPad.as<float>();
-        float* const gatePad = t.gatePad.as<float>();
-        float* const upPad   = t.upPad.as<float>();
-        float* const downPad = t.downPad.as<float>();
-        auto* const aBank    = t.aBank.as<unsigned char>();
-        auto* const sfaBank  = t.sfaBank.as<unsigned char>();
-        auto* const aBank2   = t.aBank2.as<unsigned char>();
-        auto* const sfaBank2 = t.sfaBank2.as<unsigned char>();
+        // Per-slot scratch lives in BlockBuffers (concurrent-prefill safe);
+        // lazily grown to the current maxPad on first / larger use.
+        auto grow = [&](compute::ComputeBuffer& buf, std::size_t bytes) {
+            if (buf.bytes() < bytes) buf = _ops.allocate(bytes);
+        };
+        grow(s.moeTcPadOffset,   (nExperts + 1) * sizeof(std::int32_t));
+        grow(s.moeTcContigToPad, R * sizeof(std::int32_t));
+        grow(s.moeTcPadAsn,      nAsn * sizeof(std::int32_t));
+        grow(s.moeTcXPad,        maxPad * d_model * sizeof(float));
+        grow(s.moeTcGatePad,     maxPad * n_ff_exp * sizeof(float));
+        grow(s.moeTcUpPad,       maxPad * n_ff_exp * sizeof(float));
+        grow(s.moeTcDownPad,     maxPad * d_model * sizeof(float));
+        grow(s.moeTcABank,       maxPad * (d_model / 2));
+        grow(s.moeTcSfaBank,     mo::swizzledBlockScaleBytes(maxPad, d_model / 16));
+        grow(s.moeTcABank2,      maxPad * (n_ff_exp / 2));
+        grow(s.moeTcSfaBank2,    mo::swizzledBlockScaleBytes(maxPad, n_ff_exp / 16));
+        grow(s.moeTcBanksScratch,
+             _ops.moeGroupedGemmNvfp4TcBanksScratchBytes(nExperts));
+
+        auto* const padOffset   = s.moeTcPadOffset.as<std::int32_t>();
+        auto* const contigToPad = s.moeTcContigToPad.as<std::int32_t>();
+        auto* const padAsn      = s.moeTcPadAsn.as<std::int32_t>();
+        float* const xPad    = s.moeTcXPad.as<float>();
+        float* const gatePad = s.moeTcGatePad.as<float>();
+        float* const upPad   = s.moeTcUpPad.as<float>();
+        float* const downPad = s.moeTcDownPad.as<float>();
+        auto* const aBank    = s.moeTcABank.as<unsigned char>();
+        auto* const sfaBank  = s.moeTcSfaBank.as<unsigned char>();
+        auto* const aBank2   = s.moeTcABank2.as<unsigned char>();
+        auto* const sfaBank2 = s.moeTcSfaBank2.as<unsigned char>();
+        void* const banksScratch     = s.moeTcBanksScratch.get();
+        const std::size_t banksBytes = s.moeTcBanksScratch.bytes();
 
         // padded row maps (device only)
         _ops.moePadOffsetsAsync(expOffset, padOffset, nExperts);
@@ -1417,11 +1419,13 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         _ops.moeGroupedGemmNvfp4TcBanksAsync(
             nExperts, n_ff_exp, d_model, expOffset, padOffset, aBank, sfaBank,
             gateExps.tcNibblePtr, gateExps.tcSfbPtr,
-            static_cast<const float*>(gateExps.tcGlobalsPtr), gatePad);
+            static_cast<const float*>(gateExps.tcGlobalsPtr), gatePad,
+            banksScratch, banksBytes);
         _ops.moeGroupedGemmNvfp4TcBanksAsync(
             nExperts, n_ff_exp, d_model, expOffset, padOffset, aBank, sfaBank,
             upExps.tcNibblePtr, upExps.tcSfbPtr,
-            static_cast<const float*>(upExps.tcGlobalsPtr), upPad);
+            static_cast<const float*>(upExps.tcGlobalsPtr), upPad,
+            banksScratch, banksBytes);
 
         _ops.siluMulAsync(gatePad, upPad, maxPad * n_ff_exp);  // silu(gate)*up
 
@@ -1431,7 +1435,8 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         _ops.moeGroupedGemmNvfp4TcBanksAsync(
             nExperts, d_model, n_ff_exp, expOffset, padOffset, aBank2, sfaBank2,
             downExps.tcNibblePtr, downExps.tcSfbPtr,
-            static_cast<const float*>(downExps.tcGlobalsPtr), downPad);
+            static_cast<const float*>(downExps.tcGlobalsPtr), downPad,
+            banksScratch, banksBytes);
 
         // scatter padded expert output back to token order (routed sum).
         _ops.moeScatterExpertOutAsync(downPad, padAsn, kwSlot, moeAccumBuf,

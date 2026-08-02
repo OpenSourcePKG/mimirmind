@@ -478,18 +478,30 @@ public:
         throw std::runtime_error("moeActQuantNvfp4Async: not supported on this backend");
     }
 
+    /// Device scratch bytes moeGroupedGemmNvfp4TcBanksAsync needs for
+    /// `nExperts` groups (per-group CUTLASS arrays + workspace). Zero if the
+    /// FP4-TC path is unavailable. The caller owns the buffer (per-slot).
+    [[nodiscard]] virtual std::size_t
+    moeGroupedGemmNvfp4TcBanksScratchBytes(std::size_t nExperts) const noexcept {
+        (void)nExperts;
+        return 0;
+    }
+
     /// CUTLASS block-scaled NVFP4 grouped GEMM, one expert per group, F32 out.
     /// Banks + device expOffset/padOffset; all per-group pointers built on
-    /// device (no D2H). N,K shared. See runGroupedNvfp4TcF32Banks.
+    /// device (no D2H). N,K shared. `scratch` is caller-owned (per-slot), sized
+    /// >= moeGroupedGemmNvfp4TcBanksScratchBytes(nExperts). See
+    /// runGroupedNvfp4TcF32Banks.
     virtual void moeGroupedGemmNvfp4TcBanksAsync(
         std::size_t nExperts, std::size_t N, std::size_t K,
         const std::int32_t* expOffset, const std::int32_t* padOffset,
         const void* aBank, const void* sfaBank,
         const void* bBank, const void* sfbBank,
-        const float* globalsBank, void* dBank) {
+        const float* globalsBank, void* dBank,
+        void* scratch, std::size_t scratchBytes) {
         (void)nExperts; (void)N; (void)K; (void)expOffset; (void)padOffset;
         (void)aBank; (void)sfaBank; (void)bBank; (void)sfbBank;
-        (void)globalsBank; (void)dBank;
+        (void)globalsBank; (void)dBank; (void)scratch; (void)scratchBytes;
         throw std::runtime_error(
             "moeGroupedGemmNvfp4TcBanksAsync: not supported on this backend");
     }

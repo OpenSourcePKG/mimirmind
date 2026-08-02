@@ -243,12 +243,15 @@ public:
     void moeActQuantNvfp4Async(const float* in, unsigned char* outNib,
                                unsigned char* outSf, float gscale,
                                std::size_t M, std::size_t K) override;
+    [[nodiscard]] std::size_t
+    moeGroupedGemmNvfp4TcBanksScratchBytes(std::size_t nExperts) const noexcept override;
     void moeGroupedGemmNvfp4TcBanksAsync(
         std::size_t nExperts, std::size_t N, std::size_t K,
         const std::int32_t* expOffset, const std::int32_t* padOffset,
         const void* aBank, const void* sfaBank,
         const void* bBank, const void* sfbBank,
-        const float* globalsBank, void* dBank) override;
+        const float* globalsBank, void* dBank,
+        void* scratch, std::size_t scratchBytes) override;
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
     void gatherHeadsFromChannelsAsync(const float* src, float* dst,
                                       std::size_t T, std::size_t offset,
@@ -383,12 +386,6 @@ private:
 
     struct Impl;
     std::unique_ptr<Impl>         _pimpl;
-
-    // E-d.4c: persistent device scratch for the FP4-TC banks GEMM (CUTLASS
-    // per-group arrays + workspace), grown lazily so the GEMM does no per-call
-    // malloc and never syncs.
-    compute::ComputeBuffer        _tcBanksScratch;
-    std::size_t                   _tcBanksScratchBytes{0};
 
     // M-Q3N.5 device-side MoE top-K router launcher (holds the moe_topk
     // module + kernel; loaded once). Delegated to by moeTopKRouteDeviceAsync.

@@ -1604,24 +1604,31 @@ void GpuOps::moeActQuantNvfp4Async(const float* in, unsigned char* outNib,
     k.launch(_ctx.stream(), static_cast<std::uint32_t>(M), gy, 1, 256, 1, 1);
 }
 
+std::size_t GpuOps::moeGroupedGemmNvfp4TcBanksScratchBytes(
+    std::size_t nExperts) const noexcept {
+#ifdef MIMIRMIND_HAVE_CUTLASS_MOE
+    return kernels::cutlassmoe::groupedNvfp4TcBanksScratchBytes(
+        static_cast<int>(nExperts));
+#else
+    (void)nExperts;
+    return 0;
+#endif
+}
+
 void GpuOps::moeGroupedGemmNvfp4TcBanksAsync(
     std::size_t nExperts, std::size_t N, std::size_t K,
     const std::int32_t* expOffset, const std::int32_t* padOffset,
     const void* aBank, const void* sfaBank,
     const void* bBank, const void* sfbBank,
-    const float* globalsBank, void* dBank) {
+    const float* globalsBank, void* dBank,
+    void* scratch, std::size_t scratchBytes) {
 #ifdef MIMIRMIND_HAVE_CUTLASS_MOE
-    // Ensure the persistent scratch (per-group arrays + CUTLASS workspace).
-    const std::size_t need =
-        kernels::cutlassmoe::groupedNvfp4TcBanksScratchBytes(static_cast<int>(nExperts));
-    if (_tcBanksScratchBytes < need) {
-        _tcBanksScratch      = allocate(need);
-        _tcBanksScratchBytes = need;
-    }
+    // Scratch is caller-owned (per-slot BlockBuffers) — no shared GpuOps state,
+    // so concurrent prefills never collide on it.
     const int rc = kernels::cutlassmoe::runGroupedNvfp4TcF32Banks(
         static_cast<int>(nExperts), static_cast<int>(N), static_cast<int>(K),
         expOffset, padOffset, aBank, sfaBank, bBank, sfbBank, globalsBank, dBank,
-        _tcBanksScratch.get(), _tcBanksScratchBytes, _ctx.stream().handle());
+        scratch, scratchBytes, _ctx.stream().handle());
     if (rc != 0) {
         throw std::runtime_error(
             "moeGroupedGemmNvfp4TcBanksAsync: CUTLASS grouped GEMM failed rc="
@@ -1629,7 +1636,8 @@ void GpuOps::moeGroupedGemmNvfp4TcBanksAsync(
     }
 #else
     (void)nExperts; (void)N; (void)K; (void)expOffset; (void)padOffset;
-    (void)aBank; (void)sfaBank; (void)bBank; (void)sfbBank; (void)globalsBank; (void)dBank;
+    (void)aBank; (void)sfaBank; (void)bBank; (void)sfbBank; (void)globalsBank;
+    (void)dBank; (void)scratch; (void)scratchBytes;
     throw std::runtime_error(
         "moeGroupedGemmNvfp4TcBanksAsync: CUTLASS not linked in this build");
 #endif

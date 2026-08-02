@@ -104,6 +104,24 @@ struct BlockBuffers {
     ComputeBuffer moeGroupTileRows;   // [maxTiles] int32 tile row count
     ComputeBuffer moeGroupTileCount;  // [1]        int32 real tile count
 
+    // M-Cuda.MoeGroup Sub-Step E-d — FP4-tensor-core grouped prefill scratch.
+    // Per-BlockBuffers (i.e. per-slot / per-forward), so concurrent prefills
+    // never share it — the precondition for MIMIRMIND_GROUPED_MOE=3 default-on.
+    // Lazily grown on first TC use to maxPad = nRowsMax + nExperts*128 (padding
+    // each expert to a 128-row tile); zero-sized on every non-TC path.
+    ComputeBuffer moeTcPadOffset;    // [nExperts+1]        int32
+    ComputeBuffer moeTcContigToPad;  // [nRowsMax]          int32
+    ComputeBuffer moeTcPadAsn;       // [nRowsMax]          int32
+    ComputeBuffer moeTcXPad;         // [maxPad, d_model]   f32
+    ComputeBuffer moeTcGatePad;      // [maxPad, ffPerExpert] f32
+    ComputeBuffer moeTcUpPad;        // [maxPad, ffPerExpert] f32
+    ComputeBuffer moeTcDownPad;      // [maxPad, d_model]   f32
+    ComputeBuffer moeTcABank;        // [maxPad, d_model/2] u8 (E2M1 nibbles)
+    ComputeBuffer moeTcSfaBank;      // swizzled SFA over d_model
+    ComputeBuffer moeTcABank2;       // [maxPad, ffPerExpert/2] u8
+    ComputeBuffer moeTcSfaBank2;     // swizzled SFA over ffPerExpert
+    ComputeBuffer moeTcBanksScratch; // CUTLASS per-group arrays + workspace
+
     // Q8_0 dp4a decode path (M-Q3N.4e): int8-quantized activation row +
     // per-row scale for xQuantI8Async -> matmulDp4aAsync.
     ComputeBuffer xqI8;      // [max(d_model, ffScratch)] int8
