@@ -60,6 +60,13 @@ enum class GgmlType : std::uint32_t {
     // NVFP4 (packed E2M1 + per-16 E4M3 block-scale + global) losslessly, to
     // keep the full-attention projections 4-bit. Consumed by matmul_nvfp4blk.
     NVFP4_BLK = 41,
+    // Custom: FP4-tensor-core NVFP4 (M-Cuda.MoeGroup E-d). The main buffer is
+    // plain E2M1 nibbles [rows, in/2]; the swizzled UE4M3 block-scale bank + the
+    // per-expert F32 globals ride as GgufTensor side pointers (tcSfbPtr/
+    // tcGlobalsPtr). One format for both prefill (CUTLASS grouped GEMM) and
+    // decode (moe_*_fused_k_nvfp4tc), so the blocked bank is not built. 0.5 B
+    // nibble/elem.
+    NVFP4_TC = 42,
     Unknown = 0xFFFFFFFFu,
 };
 

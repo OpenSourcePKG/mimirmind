@@ -165,6 +165,11 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKNvblkBatchedKernel;
     ::mimirmind::core::cuda::CudaModule _moeDownFusedKNvblkBatchedModule;
     ::mimirmind::core::cuda::CudaKernel _moeDownFusedKNvblkBatchedKernel;
+    // E-d.5 FP4-TC decode kernels.
+    ::mimirmind::core::cuda::CudaModule _moeGateUpFusedKTcModule;
+    ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKTcKernel;
+    ::mimirmind::core::cuda::CudaModule _moeDownFusedKTcModule;
+    ::mimirmind::core::cuda::CudaKernel _moeDownFusedKTcKernel;
     ::mimirmind::core::cuda::CudaModule _moeGateUpFusedKBf16BatchedModule;
     ::mimirmind::core::cuda::CudaKernel _moeGateUpFusedKBf16BatchedKernel;
     ::mimirmind::core::cuda::CudaModule _moeDownFusedKBf16BatchedModule;
@@ -252,6 +257,12 @@ struct GpuMatmul::Impl {
           _moeDownFusedKNvblkBatchedModule{loadCudaModule(ctx, "moe_down_fused_k_nvfp4blk_batched")},
           _moeDownFusedKNvblkBatchedKernel{
               _moeDownFusedKNvblkBatchedModule.getFunction("moe_down_fused_k_nvfp4blk_batched")},
+          _moeGateUpFusedKTcModule{loadCudaModule(ctx, "moe_gate_up_fused_k_nvfp4tc_batched")},
+          _moeGateUpFusedKTcKernel{
+              _moeGateUpFusedKTcModule.getFunction("moe_gate_up_fused_k_nvfp4tc_batched")},
+          _moeDownFusedKTcModule{loadCudaModule(ctx, "moe_down_fused_k_nvfp4tc_batched")},
+          _moeDownFusedKTcKernel{
+              _moeDownFusedKTcModule.getFunction("moe_down_fused_k_nvfp4tc_batched")},
           _moeGateUpFusedKBf16BatchedModule{loadCudaModule(ctx, "moe_gate_up_fused_k_bf16_batched")},
           _moeGateUpFusedKBf16BatchedKernel{
               _moeGateUpFusedKBf16BatchedModule.getFunction("moe_gate_up_fused_k_bf16_batched")},
@@ -391,6 +402,7 @@ bool GpuMatmul::moeDownFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
         || type == ::mimirmind::core::gguf::GgmlType::Q6_K
         || type == ::mimirmind::core::gguf::GgmlType::Q5_K
         || type == ::mimirmind::core::gguf::GgmlType::NVFP4_BLK
+        || type == ::mimirmind::core::gguf::GgmlType::NVFP4_TC
         || type == ::mimirmind::core::gguf::GgmlType::BF16;
 }
 
@@ -398,6 +410,7 @@ bool GpuMatmul::moeGateUpFusedKAvailable(::mimirmind::core::gguf::GgmlType type)
     const noexcept {
     return type == ::mimirmind::core::gguf::GgmlType::Q4_K
         || type == ::mimirmind::core::gguf::GgmlType::NVFP4_BLK
+        || type == ::mimirmind::core::gguf::GgmlType::NVFP4_TC
         || type == ::mimirmind::core::gguf::GgmlType::BF16;
 }
 
@@ -1669,6 +1682,57 @@ void GpuMatmul::moeGateUpFusedKBatchedAsync(
     kern.launch(_ctx.stream(),
                 nGroups, static_cast<std::uint32_t>(nSeq), 1,
                 kMoeGateUpLocalSize, 1, 1);
+}
+
+void GpuMatmul::moeGateUpFusedKTcBatchedAsync(
+        const float* x, const void* WgNib, const void* WuNib,
+        const void* WgSfb, const void* WuSfb,
+        const float* WgGlobal, const float* WuGlobal,
+        const std::int32_t* expIdx, float* gateActOut,
+        std::size_t nSeq, std::size_t dModel, std::size_t nFf,
+        std::size_t kActive, std::size_t sfbStride) {
+    auto& kern = _pimpl->_moeGateUpFusedKTcKernel;
+    kern.setPtr  (0, x);
+    kern.setPtr  (1, WgNib);
+    kern.setPtr  (2, WuNib);
+    kern.setPtr  (3, WgSfb);
+    kern.setPtr  (4, WuSfb);
+    kern.setPtr  (5, WgGlobal);
+    kern.setPtr  (6, WuGlobal);
+    kern.setPtr  (7, expIdx);
+    kern.setPtr  (8, gateActOut);
+    kern.setValue(9,  static_cast<std::int32_t>(dModel));
+    kern.setValue(10, static_cast<std::int32_t>(nFf));
+    kern.setValue(11, static_cast<std::int32_t>(kActive));
+    kern.setValue(12, static_cast<std::int32_t>(sfbStride));
+    const std::uint32_t nOutputs = static_cast<std::uint32_t>(kActive * nFf);
+    const std::uint32_t nGroups  =
+        (nOutputs + kMoeGateUpOutputsPerGroup - 1) / kMoeGateUpOutputsPerGroup;
+    kern.launch(_ctx.stream(), nGroups, static_cast<std::uint32_t>(nSeq), 1,
+                kMoeGateUpLocalSize, 1, 1);
+}
+
+void GpuMatmul::moeDownFusedKTcBatchedAsync(
+        const float* gateAct, const void* WNib, const void* WSfb,
+        const float* WGlobal, const std::int32_t* expIdx, const float* kw,
+        float* accum, std::size_t nSeq, std::size_t ffPer, std::size_t dModel,
+        std::size_t kActive, std::size_t sfbStride) {
+    auto& kern = _pimpl->_moeDownFusedKTcKernel;
+    kern.setPtr  (0, gateAct);
+    kern.setPtr  (1, WNib);
+    kern.setPtr  (2, WSfb);
+    kern.setPtr  (3, WGlobal);
+    kern.setPtr  (4, expIdx);
+    kern.setPtr  (5, kw);
+    kern.setPtr  (6, accum);
+    kern.setValue(7,  static_cast<std::int32_t>(ffPer));
+    kern.setValue(8,  static_cast<std::int32_t>(dModel));
+    kern.setValue(9,  static_cast<std::int32_t>(kActive));
+    kern.setValue(10, static_cast<std::int32_t>(sfbStride));
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (dModel + kMoeDownOutputsPerGroup - 1) / kMoeDownOutputsPerGroup);
+    kern.launch(_ctx.stream(), nGroups, static_cast<std::uint32_t>(nSeq), 1,
+                kMoeDownLocalSize, 1, 1);
 }
 
 void GpuMatmul::ffnGateUpFusedQ8Async(const float* x,

@@ -32,6 +32,10 @@ GgmlTypeInfo typeInfo(GgmlType t) noexcept {
         case GgmlType::Q6_K: return {"Q6_K", 256, 210};
         case GgmlType::Q8_K: return {"Q8_K", 256, 292};
 
+        // Custom (nbytes also set explicitly by the NVFP4 weights-map bridge):
+        // NVFP4_TC's main buffer is plain E2M1 nibbles = 0.5 B/elem (2 elem/B).
+        case GgmlType::NVFP4_TC: return {"NVFP4_TC", 2, 1};
+
         case GgmlType::Unknown:
         default:
             return {"UNKNOWN", 0, 0};

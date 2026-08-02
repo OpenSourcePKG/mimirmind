@@ -184,6 +184,35 @@ public:
             "moeDownFusedKBatchedAsync: not supported on this backend");
     }
 
+    // === M-Cuda.MoeGroup Sub-Step E-d.5: FP4-TC decode (drop the blocked bank).
+    // Fused gate+up / down over the plain-nibble + swizzled-SFB + per-expert
+    // F32-global banks (NVFP4_TC). Single-token decode passes nSeq=1. `sfbStride`
+    // is the swizzled SFB bytes per expert (moeSwizzledScaleStride(N, K/16)).
+    virtual void moeGateUpFusedKTcBatchedAsync(
+            const float* x, const void* WgNib, const void* WuNib,
+            const void* WgSfb, const void* WuSfb,
+            const float* WgGlobal, const float* WuGlobal,
+            const std::int32_t* expIdx, float* gateActOut,
+            std::size_t nSeq, std::size_t dModel, std::size_t nFf,
+            std::size_t kActive, std::size_t sfbStride) {
+        (void)x; (void)WgNib; (void)WuNib; (void)WgSfb; (void)WuSfb;
+        (void)WgGlobal; (void)WuGlobal; (void)expIdx; (void)gateActOut;
+        (void)nSeq; (void)dModel; (void)nFf; (void)kActive; (void)sfbStride;
+        throw std::runtime_error(
+            "moeGateUpFusedKTcBatchedAsync: not supported on this backend");
+    }
+    virtual void moeDownFusedKTcBatchedAsync(
+            const float* gateAct, const void* WNib, const void* WSfb,
+            const float* WGlobal, const std::int32_t* expIdx, const float* kw,
+            float* accum, std::size_t nSeq, std::size_t ffPer, std::size_t dModel,
+            std::size_t kActive, std::size_t sfbStride) {
+        (void)gateAct; (void)WNib; (void)WSfb; (void)WGlobal; (void)expIdx;
+        (void)kw; (void)accum; (void)nSeq; (void)ffPer; (void)dModel;
+        (void)kActive; (void)sfbStride;
+        throw std::runtime_error(
+            "moeDownFusedKTcBatchedAsync: not supported on this backend");
+    }
+
     /// Fused K-experts gate+up projection for MoE T=1 decode with SEPARATE
     /// gate/up expert banks. Produces the K-strided activation buffer the
     /// fused-K down kernel consumes:

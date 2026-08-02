@@ -40,6 +40,9 @@ moeBlockGeom(core::gguf::GgmlType type) {
     if (type == core::gguf::GgmlType::NVFP4_BLK) {
         return {32, 20};
     }
+    if (type == core::gguf::GgmlType::NVFP4_TC) {
+        return {32, 16};   // plain E2M1 nibbles: 16 B / 32 elems (decode uses TC banks)
+    }
     const compute::QuantType* qt = compute::quantType(type);
     return qt != nullptr ? std::pair<std::size_t, std::size_t>{qt->blockElements(),
                                                                qt->blockBytes()}
@@ -403,7 +406,13 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     // expert layouts. nullptr scratch => the historical per-token path
     // (single-session generate is unaffected).
     if (_prefillMoeExpIdx != nullptr && T > 1) {
-        if (_moeGroupedPrefill) {
+        // FP4-TC experts route through the grouped GEMM (the prefill win); the
+        // legacy =1/=2 opt-in also uses runMoeFfnGrouped. Everything else uses
+        // the batched fused-K path.
+        const auto* gExpsRoute = _weights.findBlock(blockIdx, "ffn_gate_exps.weight");
+        const bool tcRoute = gExpsRoute != nullptr
+            && gExpsRoute->type == core::gguf::GgmlType::NVFP4_TC;
+        if (tcRoute || _moeGroupedPrefill) {
             runMoeFfnGrouped(blockIdx, normBuf, T, _prefillMoeExpIdx,
                              _prefillMoeKw, s);
         } else {
@@ -753,7 +762,13 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     // expert layouts. nullptr scratch => the historical per-token path
     // (single-session generate is unaffected).
     if (_prefillMoeExpIdx != nullptr && T > 1) {
-        if (_moeGroupedPrefill) {
+        // FP4-TC experts route through the grouped GEMM (the prefill win); the
+        // legacy =1/=2 opt-in also uses runMoeFfnGrouped. Everything else uses
+        // the batched fused-K path.
+        const auto* gExpsRoute = _weights.findBlock(blockIdx, "ffn_gate_exps.weight");
+        const bool tcRoute = gExpsRoute != nullptr
+            && gExpsRoute->type == core::gguf::GgmlType::NVFP4_TC;
+        if (tcRoute || _moeGroupedPrefill) {
             runMoeFfnGrouped(blockIdx, normBuf, T, _prefillMoeExpIdx,
                              _prefillMoeKw, s);
         } else {
@@ -932,6 +947,23 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
         // Fused-K when the experts are separate Q4_K banks and the kernel
         // is loaded (one launch for all K×2 GEMVs + silu); otherwise the
         // per-expert matmul + siluMul path.
+        if (gateType == core::gguf::GgmlType::NVFP4_TC) {
+            // E-d.5 FP4-TC single-token decode = the batched TC kernels, nSeq=1.
+            namespace mo = core::modelopt;
+            const std::size_t sfbGu = mo::moeSwizzledScaleStride(n_ff_exp, d_model / 16);
+            const std::size_t sfbDn = mo::moeSwizzledScaleStride(d_model, n_ff_exp / 16);
+            _gmm.moeGateUpFusedKTcBatchedAsync(
+                xt, gateSrc.tcNibblePtr, upSrc.tcNibblePtr,
+                gateSrc.tcSfbPtr, upSrc.tcSfbPtr,
+                static_cast<const float*>(gateSrc.tcGlobalsPtr),
+                static_cast<const float*>(upSrc.tcGlobalsPtr),
+                expIdxSlot, gateActAll, 1, d_model, n_ff_exp, K, sfbGu);
+            _ops.mulScalarAsync(moeAccumBuf, 0.0F, d_model);
+            _gmm.moeDownFusedKTcBatchedAsync(
+                gateActAll, downExps.tcNibblePtr, downExps.tcSfbPtr,
+                static_cast<const float*>(downExps.tcGlobalsPtr),
+                expIdxSlot, kwSlot, moeAccumBuf, 1, n_ff_exp, d_model, K, sfbDn);
+        } else {
         const bool useGateUpFused =
             !fused &&
             gateType == upType &&
@@ -961,6 +993,7 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
         _gmm.moeDownFusedKAsync(downExps.type, gateActAll, downBase,
                                 expIdxSlot, kwSlot, moeAccumBuf,
                                 n_ff_exp, d_model, K, bytesDown);
+        }
     } else {
         // Sequential per-token top-K dispatch (prefill / no fused kernel).
         for (std::size_t t = 0; t < T; ++t) {
@@ -1105,11 +1138,12 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
                 d->type == core::gguf::GgmlType::Q5_K ||
                 d->type == core::gguf::GgmlType::Q6_K ||
                 d->type == core::gguf::GgmlType::NVFP4_BLK ||
+                d->type == core::gguf::GgmlType::NVFP4_TC ||
                 d->type == core::gguf::GgmlType::BF16;
             // NVFP4_BLK is 32-element super-blocks (not 256); the other batched
             // types are 256-block. Require the matching alignment per type.
             const std::size_t blkAlign =
-                (g->type == core::gguf::GgmlType::NVFP4_BLK) ? 32 : 256;
+                (g->type == core::gguf::GgmlType::NVFP4_BLK || g->type == core::gguf::GgmlType::NVFP4_TC) ? 32 : 256;
             fusedKOk = _gmm.moeGateUpFusedKAvailable(g->type) &&
                        downBatchedOk &&
                        g->type == u->type &&
@@ -1157,9 +1191,10 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
         downExps.type == core::gguf::GgmlType::Q5_K ||
         downExps.type == core::gguf::GgmlType::Q6_K ||
         downExps.type == core::gguf::GgmlType::NVFP4_BLK ||
+        downExps.type == core::gguf::GgmlType::NVFP4_TC ||
         downExps.type == core::gguf::GgmlType::BF16;
     const std::size_t blkAlign =
-        (gateExps.type == core::gguf::GgmlType::NVFP4_BLK) ? 32 : 256;
+        (gateExps.type == core::gguf::GgmlType::NVFP4_BLK || gateExps.type == core::gguf::GgmlType::NVFP4_TC) ? 32 : 256;
     if (!_gmm.moeGateUpFusedKAvailable(gateExps.type) ||
         !downBatchedOk ||
         gateExps.type != upExps.type ||
@@ -1221,15 +1256,32 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
     // --- routed experts: fused gate/up -> silu*up -> fused down ------------
     // gateActAll[seq, k, f] laid out as [nSeq, K*n_ff_exp] (seq stride
     // K*n_ff_exp), exactly the batched kernels' contract.
-    _gmm.moeGateUpFusedKBatchedAsync(gateExps.type, moeInput, gateBase, upBase,
-                                     expIdxSlot, gateActAll, nSeq,
-                                     d_model, n_ff_exp, K, bytesGate, bytesUp);
-
-    _ops.mulScalarAsync(moeAccumBuf, 0.0F, nSeq * d_model);
-
-    _gmm.moeDownFusedKBatchedAsync(downExps.type, gateActAll, downBase,
-                                   expIdxSlot, kwSlot, moeAccumBuf, nSeq,
-                                   n_ff_exp, d_model, K, bytesDown);
+    if (gateExps.type == core::gguf::GgmlType::NVFP4_TC) {
+        // E-d.5 FP4-TC decode: read the plain nibbles (usmPtr) + swizzled SFB +
+        // per-expert globals, no blocked bank.
+        namespace mo = core::modelopt;
+        const std::size_t sfbGu = mo::moeSwizzledScaleStride(n_ff_exp, d_model / 16);
+        const std::size_t sfbDn = mo::moeSwizzledScaleStride(d_model, n_ff_exp / 16);
+        _gmm.moeGateUpFusedKTcBatchedAsync(
+            moeInput, gateExps.tcNibblePtr, upExps.tcNibblePtr,
+            gateExps.tcSfbPtr, upExps.tcSfbPtr,
+            static_cast<const float*>(gateExps.tcGlobalsPtr),
+            static_cast<const float*>(upExps.tcGlobalsPtr),
+            expIdxSlot, gateActAll, nSeq, d_model, n_ff_exp, K, sfbGu);
+        _ops.mulScalarAsync(moeAccumBuf, 0.0F, nSeq * d_model);
+        _gmm.moeDownFusedKTcBatchedAsync(
+            gateActAll, downExps.tcNibblePtr, downExps.tcSfbPtr,
+            static_cast<const float*>(downExps.tcGlobalsPtr),
+            expIdxSlot, kwSlot, moeAccumBuf, nSeq, n_ff_exp, d_model, K, sfbDn);
+    } else {
+        _gmm.moeGateUpFusedKBatchedAsync(gateExps.type, moeInput, gateBase, upBase,
+                                         expIdxSlot, gateActAll, nSeq,
+                                         d_model, n_ff_exp, K, bytesGate, bytesUp);
+        _ops.mulScalarAsync(moeAccumBuf, 0.0F, nSeq * d_model);
+        _gmm.moeDownFusedKBatchedAsync(downExps.type, gateActAll, downBase,
+                                       expIdxSlot, kwSlot, moeAccumBuf, nSeq,
+                                       n_ff_exp, d_model, K, bytesDown);
+    }
 
     // --- shared expert (always-on) + sigmoid gate -------------------------
     // Row-parallel over the nSeq tokens: identical to runMoeFfn's shared
@@ -1311,9 +1363,10 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         downExps.type == core::gguf::GgmlType::Q5_K ||
         downExps.type == core::gguf::GgmlType::Q6_K ||
         downExps.type == core::gguf::GgmlType::NVFP4_BLK ||
+        downExps.type == core::gguf::GgmlType::NVFP4_TC ||
         downExps.type == core::gguf::GgmlType::BF16;
     const std::size_t blkAlign =
-        (gateExps.type == core::gguf::GgmlType::NVFP4_BLK) ? 32 : 256;
+        (gateExps.type == core::gguf::GgmlType::NVFP4_BLK || gateExps.type == core::gguf::GgmlType::NVFP4_TC) ? 32 : 256;
     if (!_gmm.moeGateUpFusedKAvailable(gateExps.type) || !downOk ||
         gateExps.type != upExps.type ||
         (d_model % blkAlign != 0) || (n_ff_exp % blkAlign != 0)) {
@@ -1351,11 +1404,14 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     // --- gather activations into per-expert-contiguous rows (both paths) ---
     _ops.moeGatherRowsAsync(moeInput, rowSrcTok, xComp, d_model, R);
 
-    // FP4-tensor-core grouped path needs the E-d.2b load-time side banks.
+    // FP4-tensor-core grouped path: the routed experts are the NVFP4_TC format
+    // (loader built the nibble + swizzled-SFB + globals banks) and CUTLASS is
+    // linked. Type-driven, so it is the default whenever those banks exist.
     const bool tcGrouped =
-        _moeGroupedTc && _ops.moeGroupedGemmNvfp4TcAvailable() &&
-        gateExps.tcNibblePtr != nullptr && upExps.tcNibblePtr != nullptr &&
-        downExps.tcNibblePtr != nullptr;
+        _ops.moeGroupedGemmNvfp4TcAvailable() &&
+        gateExps.type == core::gguf::GgmlType::NVFP4_TC &&
+        upExps.type   == core::gguf::GgmlType::NVFP4_TC &&
+        downExps.type == core::gguf::GgmlType::NVFP4_TC;
 
     const bool deviceDrivenGrouped =
         !tcGrouped && _moeGroupedDeviceDriven &&

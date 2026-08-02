@@ -165,6 +165,20 @@ public:
     [[nodiscard]] bool moeGateUpFusedKAvailable(
         ::mimirmind::core::gguf::GgmlType type) const noexcept override;
 
+    // E-d.5 FP4-TC decode (plain nibbles + swizzled SFB + per-expert global).
+    void moeGateUpFusedKTcBatchedAsync(
+            const float* x, const void* WgNib, const void* WuNib,
+            const void* WgSfb, const void* WuSfb,
+            const float* WgGlobal, const float* WuGlobal,
+            const std::int32_t* expIdx, float* gateActOut,
+            std::size_t nSeq, std::size_t dModel, std::size_t nFf,
+            std::size_t kActive, std::size_t sfbStride) override;
+    void moeDownFusedKTcBatchedAsync(
+            const float* gateAct, const void* WNib, const void* WSfb,
+            const float* WGlobal, const std::int32_t* expIdx, const float* kw,
+            float* accum, std::size_t nSeq, std::size_t ffPer, std::size_t dModel,
+            std::size_t kActive, std::size_t sfbStride) override;
+
     void ffnGateUpFusedQ8Async(const float* x,
                                const void*  Wg,
                                const void*  Wu,
