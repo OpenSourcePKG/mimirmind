@@ -73,4 +73,44 @@ swizzledScaleOffset(std::uint64_t m, std::uint64_t s,
 void swizzleBlockScale(const std::uint8_t* src, std::uint64_t rows,
                        std::uint64_t ksf, std::uint8_t* dst) noexcept;
 
+// ---------------------------------------------------------------------------
+// Grouped-MoE weight scale bank (M-Cuda.MoeGroup Sub-Step E-d).
+//
+// The CUTLASS block-scaled *grouped* NVFP4 GEMM takes one expert per group,
+// with a per-group `ptr_SFB[e]` that must point at that expert's scales in the
+// same 128x4 swizzled layout `swizzleBlockScale` produces. All experts of a
+// routed-MoE bank share the weight shape (rows = N = output features, ksf =
+// K/16), so each expert's swizzled SFB tensor is `swizzledBlockScaleBytes(N,
+// ksf)` bytes and the per-expert slots are independent (each zero-padded to a
+// full 128x4 atom). Packing them back-to-back with a uniform stride gives the
+// contiguous bank the loader uploads and the group-array builder indexes with
+// `bank + e * stride`.
+// ---------------------------------------------------------------------------
+
+/// Per-expert byte stride of a swizzled weight-SF bank (one CUTLASS SFB tensor
+/// per expert; all experts share `rows`/`ksf`).
+[[nodiscard]] constexpr std::size_t
+moeSwizzledScaleStride(std::uint64_t rows, std::uint64_t ksf) noexcept {
+    return swizzledBlockScaleBytes(rows, ksf);
+}
+
+/// Byte size of the whole `nExperts`-expert swizzled weight-SF bank.
+[[nodiscard]] constexpr std::size_t
+moeSwizzledScaleBankBytes(std::uint64_t nExperts, std::uint64_t rows,
+                          std::uint64_t ksf) noexcept {
+    return static_cast<std::size_t>(nExperts) * swizzledBlockScaleBytes(rows, ksf);
+}
+
+/**
+ * Swizzle `nExperts` stacked row-major `[rows, ksf]` F8_E4M3 block-scale
+ * tensors (expert `e` at `src + e*rows*ksf`) into a contiguous bank (expert
+ * `e` at `dst + e*moeSwizzledScaleStride(rows, ksf)`). `dst` must be sized
+ * `moeSwizzledScaleBankBytes(nExperts, rows, ksf)` and is fully written: each
+ * expert slot is an independent, zero-padded CUTLASS SFB tensor. `src` and
+ * `dst` must not alias.
+ */
+void swizzleMoeBlockScales(const std::uint8_t* src, std::uint64_t nExperts,
+                           std::uint64_t rows, std::uint64_t ksf,
+                           std::uint8_t* dst) noexcept;
+
 } // namespace mimirmind::core::modelopt

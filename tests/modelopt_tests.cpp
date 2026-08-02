@@ -396,6 +396,43 @@ TEST(swizzle_pads_with_zero) {
         if (!written[i]) EXPECT_EQ(dst[i], std::uint8_t{0});
 }
 
+// M-Cuda.MoeGroup Sub-Step E-d — grouped-MoE weight scale bank: nExperts
+// stacked [rows, ksf] E4M3 scale tensors swizzled into one contiguous bank
+// with a uniform per-expert stride. Each expert slot must be byte-identical to
+// an independent swizzleBlockScale of that expert (so CUTLASS's per-group
+// ptr_SFB[e] = bank + e*stride reads a self-contained, zero-padded SFB tensor).
+
+TEST(moe_swizzle_bank_sizes) {
+    // Stride == single-tensor swizzle size; bank == nExperts * stride.
+    EXPECT_EQ(mo::moeSwizzledScaleStride(128, 4),          std::size_t{512});
+    EXPECT_EQ(mo::moeSwizzledScaleBankBytes(8, 128, 4),    std::size_t{8 * 512});
+    // rows=40 -> 1 M-tile, ksf=8 -> 2 K-tiles => 1024 B/expert.
+    EXPECT_EQ(mo::moeSwizzledScaleStride(40, 8),           std::size_t{1024});
+    EXPECT_EQ(mo::moeSwizzledScaleBankBytes(3, 40, 8),     std::size_t{3 * 1024});
+}
+
+TEST(moe_swizzle_bank_matches_per_expert) {
+    const std::uint64_t nExperts = 3, rows = 40, ksf = 8;
+    const std::size_t srcStride = static_cast<std::size_t>(rows) * ksf;
+    const std::size_t dstStride = mo::moeSwizzledScaleStride(rows, ksf);
+
+    // Distinct per-expert scale bytes (avoid 0 so padding is distinguishable).
+    std::vector<std::uint8_t> src(nExperts * srcStride);
+    for (std::size_t i = 0; i < src.size(); ++i)
+        src[i] = static_cast<std::uint8_t>((i % 250) + 1);
+
+    std::vector<std::uint8_t> bank(mo::moeSwizzledScaleBankBytes(nExperts, rows, ksf), 0xAB);
+    mo::swizzleMoeBlockScales(src.data(), nExperts, rows, ksf, bank.data());
+
+    // Each expert slot equals an independent swizzle of that expert's scales.
+    std::vector<std::uint8_t> ref(dstStride);
+    for (std::uint64_t e = 0; e < nExperts; ++e) {
+        mo::swizzleBlockScale(src.data() + e * srcStride, rows, ksf, ref.data());
+        for (std::size_t b = 0; b < dstStride; ++b)
+            EXPECT_EQ(bank[e * dstStride + b], ref[b]);
+    }
+}
+
 // =======================================================================
 // NvFp4Reference — CPU dequant oracle (scalars verified vs CUTLASS on GB10)
 // =======================================================================

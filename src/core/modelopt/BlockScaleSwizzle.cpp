@@ -21,4 +21,14 @@ void swizzleBlockScale(const std::uint8_t* src, std::uint64_t rows,
     }
 }
 
+void swizzleMoeBlockScales(const std::uint8_t* src, std::uint64_t nExperts,
+                           std::uint64_t rows, std::uint64_t ksf,
+                           std::uint8_t* dst) noexcept {
+    const std::size_t srcStride = static_cast<std::size_t>(rows) * ksf;
+    const std::size_t dstStride = moeSwizzledScaleStride(rows, ksf);
+    for (std::uint64_t e = 0; e < nExperts; ++e) {
+        swizzleBlockScale(src + e * srcStride, rows, ksf, dst + e * dstStride);
+    }
+}
+
 } // namespace mimirmind::core::modelopt
