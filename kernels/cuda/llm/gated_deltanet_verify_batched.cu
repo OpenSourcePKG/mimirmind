@@ -16,10 +16,15 @@
 //   * write the post-step state of timestep t to `stateOut[t]` (per position),
 //     instead of only the final state.
 //
-// Activation layout matches the AR-batched path: q,k,v,out are [nSeq, T, H, S]
-// (seq-major, then time), gLog/beta [nSeq, T, H]. The per-position state export
-// is [T, nSeq, H, S, S] (time-major on T so the accept-commit gathers position
-// a for each slot with a single contiguous per-(slot,head) block).
+// Activation layout is TIME-major to match the batched verify trunk, which
+// packs verify position j's N slots as the contiguous row block [j*N, j*N+N):
+// q,k,v,out are [T, nSeq, H, S], gLog/beta [T, nSeq, H]. This lets
+// runLinearBlockVerify feed its position-major projection/conv outputs (and
+// receive `out` straight into the position-major deltaOut) with no transpose.
+// stateIn is [nSeq, H, S, S] (the committed pre-window state S_0). The
+// per-position state export stays [T, nSeq, H, S, S] (time-major on T so the
+// accept-commit gathers position a for each slot as one contiguous
+// per-(slot,head) block).
 //
 // Launch: grid = dim3(H, nSeq, 1), block = S threads,
 //         sharedMemBytes = S*S*sizeof(float) (>48 KiB for S=128 -> host opts in
@@ -54,8 +59,8 @@ void gated_deltanet_verify_batched(
     __shared__ float ksh[GATED_DELTANET_AR_MAX_S];
     __shared__ float qsh[GATED_DELTANET_AR_MAX_S];
 
-    const size_t actSeqStride   = (size_t)T * H * S;   // q,k,v,out per seq
-    const size_t gateSeqStride  = (size_t)T * H;       // gLog,beta per seq
+    // Time-major activations: element (t,seq,h) lives at row (t*nSeq + seq),
+    // head-block h. State is seq-major (one [H,S,S] image per slot).
     const size_t stateSeqStride = (size_t)H * S * S;   // state per seq (one image)
 
     const float* s0 = stateIn + (size_t)seq * stateSeqStride + (size_t)h * S * S;
@@ -68,10 +73,8 @@ void gated_deltanet_verify_batched(
     __syncthreads();
 
     for (int t = 0; t < T; ++t) {
-        const size_t base    = (size_t)seq * actSeqStride
-                             + (size_t)(t * H + h) * S;
-        const size_t gateIdx = (size_t)seq * gateSeqStride
-                             + (size_t)(t * H + h);
+        const size_t base    = (((size_t)t * nSeq + seq) * H + h) * S;
+        const size_t gateIdx = ((size_t)t * nSeq + seq) * H + h;
 
         ksh[j] = k[base + j];
         qsh[j] = q[base + j] * qScale;

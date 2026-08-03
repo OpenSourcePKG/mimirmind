@@ -99,7 +99,12 @@ struct ServingState {
     compute::ComputeBuffer vXBuf, vNormB, vLogitsB, vLmScr;
     compute::ComputeBuffer vArgmaxDev;               // [Mcap] device per-row argmax ids
     std::vector<std::int32_t>  vArgmaxHost;          // [Mcap] argmax readback (draft+verify)
-    std::vector<compute::ComputeBuffer> ssmSnap;     // [K+1] full SsmState state images
+    // MV-d: compact per-position recurrent-state export written by the fused
+    // verify kernel — [blockCount, Kp1, maxBatch, stateElems], time-major on
+    // the verify position, packed with the runtime slot stride N. Replaces the
+    // K+1 full-slab recurrent snapshots. conv state still snapshotted per
+    // position (cheap) into convSnap.
+    compute::ComputeBuffer ssmExport;
     std::vector<compute::ComputeBuffer> convSnap;    // [K+1] full SsmState conv images
     std::vector<std::int32_t>  vBlockTablesH;        // [Mcap * blocksPerSeq]
     std::vector<std::int32_t>  vSeqLensH, vStartPosH;
@@ -869,17 +874,19 @@ void ServingSession::ensureVerifyCapacity(std::size_t depth) {
     st.vArgmaxDev = _e._ops->allocate(Mcap * sizeof(std::int32_t));
     st.vLmScr   = _e._ops->allocate(std::max(d_model, vocab) * sizeof(float));
 
-    // Full recurrent-state images (one per verify step): [blockCount, slab,
-    // stateElems] / conv. On a partial accept, slot s's slice is restored
-    // from ssmSnap[a_s]; E1 only produces them (the logits are the gate).
-    const std::size_t stImgElems = st.ssm->blockCount() * st.ssm->stateLayerStride();
+    // MV-d: one compact recurrent-state export [blockCount, Kp1, maxBatch,
+    // stateElems] (the fused verify kernel writes each layer's slab, packed
+    // with slot stride N ≤ maxBatch). Replaces the K+1 full-slab recurrent
+    // snapshots. conv state still snapshotted per position into convSnap.
+    const std::size_t stateElems = st.ssm->stateElemsPerLayer();
+    const std::size_t exportElems =
+        st.ssm->blockCount() * (K + 1) * st.maxBatch * stateElems;
+    st.ssmExport = _e._ops->allocate(exportElems * sizeof(float));
+
     const std::size_t cvImgElems = st.ssm->blockCount() * st.ssm->convStateLayerStride();
-    st.ssmSnap.clear();
     st.convSnap.clear();
-    st.ssmSnap.reserve(K + 1);
     st.convSnap.reserve(K + 1);
     for (std::size_t j = 0; j <= K; ++j) {
-        st.ssmSnap.push_back(_e._ops->allocate(stImgElems * sizeof(float)));
         st.convSnap.push_back(_e._ops->allocate(cvImgElems * sizeof(float)));
     }
 
@@ -895,8 +902,8 @@ void ServingSession::ensureVerifyCapacity(std::size_t depth) {
     st.vArgmaxHost.assign(Mcap, 0);
 
     MM_LOG_INFO("serving",
-                "ensureVerifyCapacity: depth={} Mcap={} snapStateBytes={} x{}",
-                K, Mcap, stImgElems * sizeof(float), K + 1);
+                "ensureVerifyCapacity: depth={} Mcap={} exportStateBytes={} convSnaps={}",
+                K, Mcap, exportElems * sizeof(float), K + 1);
 }
 
 std::size_t
@@ -1004,25 +1011,23 @@ ServingSession::verifyForward(
     ctxFull.kwSlot          = st.vKw.as<float>();
     ctxFull.isSeqStart      = st.vIsSeqStart.data();
 
-    // MV-c: per-position ssmSnap/convSnap slab-image bases (Kp1), so the
-    // GatedDeltaNet verify layer can snapshot each verify position inline.
-    std::vector<float*> ssmSnapBases(Kp1);
+    // MV-d: per-position convSnap slab-image bases (Kp1); the recurrent state
+    // is exported by the fused verify kernel into the single st.ssmExport.
     std::vector<float*> convSnapBases(Kp1);
     for (std::size_t j = 0; j < Kp1; ++j) {
-        ssmSnapBases[j]  = st.ssmSnap[j].as<float>();
         convSnapBases[j] = st.convSnap[j].as<float>();
     }
 
     for (std::size_t b = 0; b < st.blockCount; ++b) {
         if (_e._config.isRecurrentLayer(b)) {
-            // MV-c: GatedDeltaNet verify — ONE batched layer over M=N*(K+1)
-            // rows (proj/out-proj/MoE read each weight once vs K+1x for the old
-            // per-position loop), conv+recurrence per position (byte-identical),
-            // snapshotting each position into ssmSnap[j]/convSnap[j].
+            // MV-c/d: GatedDeltaNet verify — ONE batched layer over M=N*(K+1)
+            // rows (proj/out-proj/MoE read each weight once vs K+1x), conv per
+            // position, and ONE fused verify kernel for the recurrence that
+            // exports every position's state into st.ssmExport.
             st.qb->runLinearBlockVerify(
                 b, xBuf, N, Kp1, st.vExpIdx.as<std::int32_t>(),
                 st.vKw.as<float>(), st.vGdnSeqStart.data(), st.maxBatch,
-                ssmSnapBases.data(), convSnapBases.data(), *st.vsb);
+                st.ssmExport.as<float>(), convSnapBases.data(), *st.vsb);
         } else {
             st.qb->runBlockBatched(b, xBuf, ctxFull, *st.vsb);
         }
@@ -1358,22 +1363,25 @@ ServingSession::mtpDraftParity(std::span<const std::int32_t> prompt,
     return res;
 }
 
-void ServingSession::restoreSlotSsm(std::size_t slot, std::size_t snapIdx) {
+void ServingSession::restoreSlotSsm(std::size_t slot, std::size_t a,
+                                    std::size_t N) {
     auto& st = *_state;
     float* const       stDst = st.ssm->statePtr();
     float* const       cvDst = st.ssm->convStatePtr();
-    const float* const stSrc = st.ssmSnap[snapIdx].as<float>();
-    const float* const cvSrc = st.convSnap[snapIdx].as<float>();
-    const std::size_t stStride = st.ssm->stateLayerStride();
+    const float* const exp   = st.ssmExport.as<float>();
+    const float* const cvSrc = st.convSnap[a].as<float>();
+    const std::size_t stStride = st.ssm->stateLayerStride();       // live slab
     const std::size_t cvStride = st.ssm->convStateLayerStride();
     const std::size_t stElems  = st.ssm->stateElemsPerLayer();
     const std::size_t cvElems  = st.ssm->convStateElemsPerLayer();
+    const std::size_t Kp1        = st.verifyDepth + 1;
+    const std::size_t expLStride = Kp1 * st.maxBatch * stElems;    // export slab
     for (std::size_t L = 0; L < st.blockCount; ++L) {
         if (!_e._config.isRecurrentLayer(L)) {
             continue;   // full-attention layers keep no recurrent state
         }
         _e._ops->appendMemoryCopy(stDst + L * stStride + slot * stElems,
-                                  stSrc + L * stStride + slot * stElems,
+                                  exp + L * expLStride + (a * N + slot) * stElems,
                                   stElems * sizeof(float));
         _e._ops->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
                                   cvSrc + L * cvStride + slot * cvElems,
@@ -1505,7 +1513,9 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
             // (no re-forward), truncate the nextn KV, and carry the trunk
             // hidden at the accepted position into the next round's draft.
             basePos[s] += a + 1;
-            if (a < K) restoreSlotSsm(s, a);
+            // The fused verify kernel does not advance the live recurrent
+            // state, so commit from the export for EVERY accept a (0..K).
+            restoreSlotSsm(s, a, nSeq);
             st.nextnLen[s] = nextnPre[s] + a + 1;
             _e._ops->appendMemoryCopy(mtpHid + s * d, vX + (a * nSeq + s) * d,
                                       d * sizeof(float));
@@ -1670,7 +1680,8 @@ ServingSession::generateBatchMtpMulti(
                 for (std::size_t i = 0; i < a && cont; ++i) cont = emit(drafts[p][i]);
             }
             basePos[p] += a + 1;
-            if (a < K) restoreSlotSsm(p, a);
+            // Fused verify kernel leaves live state at S_0 → commit every a.
+            restoreSlotSsm(p, a, N);
             st.mtpKv[p]->truncate(mtpPre[p] + a + 1);
             _e._ops->appendMemoryCopy(mtpHid + p * d, vX + (a * N + p) * d,
                                       d * sizeof(float));

@@ -117,14 +117,22 @@ public:
                          const BatchedDecodeCtx&  ctx,
                          BlockBuffers&            s);
 
-    /// M-Cuda.MTP-VerifyChunked MV-c — batched GatedDeltaNet VERIFY layer.
+    /// M-Cuda.MTP-VerifyChunked MV-c/d — batched GatedDeltaNet VERIFY layer.
     /// N slots' K+1-token verify window laid time-major in `x` (row j*N+s;
     /// position j's N slots contiguous). Batches proj/out-proj/MoE over
     /// M=N*(K+1) (each weight read once vs K+1x for the sequential path — the
-    /// spec-decode weight-read amortisation), conv1d + gated-delta recurrence
-    /// stay per-position (byte-identical to runLinearBlockBatched). Snapshots
-    /// the full recurrent + conv slab after each position j into ssmSnap[j]/
-    /// convSnap[j] for partial-accept restore. gdnSeqStart is [(K+1)*maxBatch].
+    /// spec-decode weight-read amortisation). The gated-delta recurrence runs
+    /// as ONE fused verify kernel (`gatedDeltaNetVerifyBatchedAsync`): the
+    /// [S,S] state stays resident across the K+1 positions (no per-token global
+    /// state round-trip) and the post-step state of every position is exported
+    /// to `ssmExport` (per-layer slab, time-major [Kp1, maxBatch, stateElems],
+    /// packed with stride N) so a partial accept picks the accepted-prefix
+    /// state without re-forwarding and without the K+1 full-slab snapshots the
+    /// old path used. The kernel does NOT advance the live `stateBase`, so the
+    /// caller commits from `ssmExport[a]` for EVERY accept a (0..K). conv1d
+    /// stays per-position (cheap) and is snapshotted into convSnap[j].
+    /// gdnSeqStart is [(K+1)*maxBatch]. `ssmExport` is the whole buffer base;
+    /// this call writes the [blockIdx] slab.
     void runLinearBlockVerify(std::size_t         blockIdx,
                               float*              x,
                               std::size_t         N,
@@ -133,7 +141,7 @@ public:
                               float*              kwSlot,
                               const std::uint8_t* gdnSeqStart,
                               std::size_t         maxBatch,
-                              float* const*       ssmSnap,
+                              float*              ssmExport,
                               float* const*       convSnap,
                               BlockBuffers&       s);
 

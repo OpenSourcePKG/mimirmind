@@ -1963,7 +1963,7 @@ void Qwen35MoeBackend::runLinearBlockBatched(
 void Qwen35MoeBackend::runLinearBlockVerify(
         std::size_t blockIdx, float* x, std::size_t N, std::size_t Kp1,
         std::int32_t* expIdxSlot, float* kwSlot, const std::uint8_t* gdnSeqStart,
-        std::size_t maxBatch, float* const* ssmSnap, float* const* convSnap,
+        std::size_t maxBatch, float* ssmExport, float* const* convSnap,
         BlockBuffers& s) {
     if (N == 0 || Kp1 == 0) {
         return;
@@ -2013,8 +2013,14 @@ void Qwen35MoeBackend::runLinearBlockVerify(
     const std::size_t slabNSeq = (s.ssmSlabNSeq != 0) ? s.ssmSlabNSeq : N;
     float* const stateBase = s.ssmStatePtr     + blockIdx * (slabNSeq * stateElems);
     float* const convBase  = s.ssmConvStatePtr + blockIdx * (slabNSeq * convStateElems);
-    const std::size_t stStride = slabNSeq * stateElems;   // per-layer slab (== SsmState::stateLayerStride)
     const std::size_t cvStride = slabNSeq * convStateElems;
+
+    // MV-d: this layer's compact per-position state-export slab. Layout
+    // [Kp1, maxBatch, stateElems] (time-major on the verify position), written
+    // by the fused verify kernel with the runtime slot stride N (positions
+    // packed contiguously in the first Kp1*N*stateElems). The per-layer stride
+    // uses maxBatch so the buffer size is constant across runs.
+    float* const ssmExportBase = ssmExport + blockIdx * (Kp1 * maxBatch * stateElems);
 
     // === Phase 1: weight-heavy projections, BATCHED over M (read once) =====
     _ops.rmsNormAsync(x, M, d_model,
@@ -2032,17 +2038,20 @@ void Qwen35MoeBackend::runLinearBlockVerify(
                            static_cast<const float*>(ssmDt.usmPtr),
                            gateBuf, M, hV);
 
-    // === Phase 2: conv1d + gated-delta recurrence, PER VERIFY POSITION =====
-    // Position j's N slots are the contiguous row block [j*N, j*N+N). Byte-
-    // identical to runLinearBlockBatched's conv/GDN, advancing the per-slot
-    // state token-by-token; the full slab is snapshotted after each position.
+    // === Phase 2: conv1d (per position) + ONE fused gated-delta verify =====
+    // Position j's N slots are the contiguous row block [j*N, j*N+N). conv1d
+    // stays per-position (cheap rolling causal state) and its full slab is
+    // snapshotted into convSnap[j] for partial-accept restore. The gated-delta
+    // recurrence, by contrast, runs as ONE fused kernel over the whole K+1
+    // window: the [S,S] state stays resident across the positions (no per-token
+    // global round-trip, no K+1 separate launches) and every position's
+    // post-step state is exported to ssmExportBase — replacing the K+1
+    // full-slab recurrent snapshots. The kernel reads stateBase (S_0) but does
+    // NOT advance it; the caller commits from ssmExport[a].
     const std::size_t convInBytes = convStateElems * sizeof(float);
     const std::size_t qkvRowBytes = convDim * sizeof(float);
     for (std::size_t j = 0; j < Kp1; ++j) {
         float* const qkvMixedJ = qkvMixed + j * N * convDim;
-        float* const gateJ     = gateBuf  + j * N * hV;
-        float* const betaJ     = betaBuf  + j * N * hV;
-        float* const deltaJ    = deltaOut + j * N * valueDim;
         const std::uint8_t* const seqStartJ = gdnSeqStart + j * maxBatch;
 
         // causal conv1d + silu (per-seq rolling state) over the N slots.
@@ -2065,27 +2074,38 @@ void Qwen35MoeBackend::runLinearBlockVerify(
             _ops.appendMemoryCopy(cvState, cvIn + /*T=*/1 * convDim, convInBytes);
         }
 
-        _ops.gatherHeadsFromChannelsAsync(qkvMixedJ, qBuf, N, 0,          hK, hV, S, convDim);
-        _ops.gatherHeadsFromChannelsAsync(qkvMixedJ, kBuf, N, keyDim,     hK, hV, S, convDim);
-        _ops.gatherHeadsFromChannelsAsync(qkvMixedJ, vBuf, N, 2 * keyDim, hV, hV, S, convDim);
-        _ops.l2NormInPlaceAsync(qBuf, N * hV, S, eps);
-        _ops.l2NormInPlaceAsync(kBuf, N * hV, S, eps);
+        // Gather q/k/v for this position into its time-major slice so the fused
+        // kernel sees all Kp1 positions at once ([Kp1, N, hV, S]).
+        float* const qJ = qBuf + j * N * valueDim;
+        float* const kJ = kBuf + j * N * valueDim;
+        float* const vJ = vBuf + j * N * valueDim;
+        _ops.gatherHeadsFromChannelsAsync(qkvMixedJ, qJ, N, 0,          hK, hV, S, convDim);
+        _ops.gatherHeadsFromChannelsAsync(qkvMixedJ, kJ, N, keyDim,     hK, hV, S, convDim);
+        _ops.gatherHeadsFromChannelsAsync(qkvMixedJ, vJ, N, 2 * keyDim, hV, hV, S, convDim);
+        _ops.l2NormInPlaceAsync(qJ, N * hV, S, eps);
+        _ops.l2NormInPlaceAsync(kJ, N * hV, S, eps);
 
-        for (std::size_t seq = 0; seq < N; ++seq) {
-            if (seqStartJ[seq] != 0) {
-                _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
-            }
-        }
-        _ops.gatedDeltaNetRecurrentBatchedAsync(qBuf, kBuf, vBuf, gateJ, betaJ,
-                                                stateBase, deltaJ, N,
-                                                /*T=*/1, hV, S);
-
-        // Snapshot the full recurrent + conv slab after verify position j.
-        _ops.appendMemoryCopy(ssmSnap[j] + blockIdx * stStride,
-                              stateBase, stStride * sizeof(float));
+        // Conv-state snapshot after verify position j (recurrent state is
+        // exported by the fused kernel below, not snapshotted here).
         _ops.appendMemoryCopy(convSnap[j] + blockIdx * cvStride,
                               convBase, cvStride * sizeof(float));
     }
+
+    // Verify never re-starts a sequence mid-window (all slots are ongoing
+    // committed sequences); a fresh start can only appear at position 0, which
+    // maps to the fused kernel's stateIn. Reset S_0 for any such slot.
+    for (std::size_t seq = 0; seq < N; ++seq) {
+        if (gdnSeqStart[seq] != 0) {
+            _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
+        }
+    }
+
+    // ONE fused verify kernel: q/k/v/out time-major [Kp1, N, hV, S], gate/beta
+    // [Kp1, N, hV], stateIn [N, stateElems], stateOut [Kp1, N, stateElems]
+    // packed with stride N into this layer's export slab.
+    _ops.gatedDeltaNetVerifyBatchedAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
+                                         stateBase, ssmExportBase, deltaOut,
+                                         N, Kp1, hV, S);
 
     // === Phase 3: gated output norm + out-proj + MoE, BATCHED over M =======
     _ops.rmsNormAsync(deltaOut, M * hV, S,

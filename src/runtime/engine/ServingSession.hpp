@@ -126,7 +126,11 @@ private:
     /// state from verify snapshot `snapIdx` (== accepted-token count), a
     /// per-layer per-slot slice copy. Avoids the single-session re-forward
     /// on a partial accept.
-    void restoreSlotSsm(std::size_t slot, std::size_t snapIdx);
+    // MV-d: commit slot's recurrent state to accept position `a` from the
+    // fused-kernel export (packed with slot stride `N`), and its conv state
+    // from convSnap[a]. Called for EVERY accept (the fused kernel does not
+    // advance the live state), unlike the old snapshot path.
+    void restoreSlotSsm(std::size_t slot, std::size_t a, std::size_t N);
 
     /// Increment E5b — seed the paged nextn KV (pool layer mtpPoolLayer) for
     /// `nSeq` slots by replaying an IDENTICAL prompt: broadcast the trunk
