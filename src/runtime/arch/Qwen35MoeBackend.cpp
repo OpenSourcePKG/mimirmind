@@ -97,6 +97,11 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
     if (const char* d = std::getenv("MIMIRMIND_GROUPED_MOE_DECODE")) {
         _moeGroupedDecode = !(d[0] == '0' && d[1] == '\0');
     }
+    // GD-c (experimental): route decode routed-MoE through the FP4-TC grouped
+    // GEMM (needs TC sidecar banks). Off by default (W4A4 numerics gate).
+    if (const char* t = std::getenv("MIMIRMIND_GROUPED_MOE_DECODE_TC")) {
+        _moeGroupedDecodeTc = (t[0] == '1' && t[1] == '\0');
+    }
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     if (const char* d = std::getenv("MIMIRMIND_SSM_DUMP")) {
         _ssmDump    = true;
@@ -1489,9 +1494,13 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         _ops.moeIndexGatherI32Async(asnToRow, contigToPad, padAsn, nAsn);
 
         // spread gathered rows -> padded slots; act-quant (SF pre-zeroed).
+        // Only the R real rows are quantised (each at its padded slot via
+        // contigToPad); the padding rows keep the zeroed SF (scale 0 -> act 0)
+        // and their GEMM output is discarded, so quantising them is pure waste
+        // (~64x the real rows at decode M). Bit-identical for the real rows.
         _ops.moeRowsScatterF32Async(xComp, contigToPad, xPad, R, d_model);
         _ops.moeZeroBytesAsync(sfaBank, mo::swizzledBlockScaleBytes(maxPad, d_model / 16));
-        _ops.moeActQuantNvfp4Async(xPad, aBank, sfaBank, 1.0F, maxPad, d_model);
+        _ops.moeActQuantNvfp4RowsAsync(xPad, aBank, sfaBank, 1.0F, contigToPad, R, d_model);
 
         // gate + up: N=n_ff_exp, K=d_model. alpha[e] = weight global (folds the
         // per-expert global back in; act gscale=1).
@@ -1509,8 +1518,10 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         _ops.siluMulAsync(gatePad, upPad, maxPad * n_ff_exp);  // silu(gate)*up
 
         // act-quant the intermediate -> down GEMM: N=d_model, K=n_ff_exp.
+        // Row-mapped: the GEMM wrote gate/up outputs at the same padded slots
+        // (contigToPad), so the intermediate's real rows live there too.
         _ops.moeZeroBytesAsync(sfaBank2, mo::swizzledBlockScaleBytes(maxPad, n_ff_exp / 16));
-        _ops.moeActQuantNvfp4Async(gatePad, aBank2, sfaBank2, 1.0F, maxPad, n_ff_exp);
+        _ops.moeActQuantNvfp4RowsAsync(gatePad, aBank2, sfaBank2, 1.0F, contigToPad, R, n_ff_exp);
         _ops.moeGroupedGemmNvfp4TcBanksAsync(
             nExperts, d_model, n_ff_exp, expOffset, padOffset, aBank2, sfaBank2,
             downExps.tcNibblePtr, downExps.tcSfbPtr,
@@ -1804,7 +1815,7 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
         // GD-a: expert-grouped decode — amortise routed expert-weight reads
         // across the batch (blocked bank; preferBlocked forces the non-TC path).
         runMoeFfnGrouped(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s,
-                         /*preferBlocked=*/true);
+                         /*preferBlocked=*/!_moeGroupedDecodeTc);
     } else {
         runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
     }
@@ -1953,7 +1964,7 @@ void Qwen35MoeBackend::runLinearBlockBatched(
         // GD-a: expert-grouped decode — amortise routed expert-weight reads
         // across the batch (blocked bank; preferBlocked forces the non-TC path).
         runMoeFfnGrouped(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s,
-                         /*preferBlocked=*/true);
+                         /*preferBlocked=*/!_moeGroupedDecodeTc);
     } else {
         runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
     }
@@ -2119,7 +2130,7 @@ void Qwen35MoeBackend::runLinearBlockVerify(
                       static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
     if (_moeGroupedDecode) {
         runMoeFfnGrouped(blockIdx, normBuf, M, expIdxSlot, kwSlot, s,
-                         /*preferBlocked=*/true);
+                         /*preferBlocked=*/!_moeGroupedDecodeTc);
     } else {
         runMoeFfnBatched(blockIdx, normBuf, M, expIdxSlot, kwSlot, s);
     }

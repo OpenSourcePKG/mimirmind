@@ -34,6 +34,7 @@
 #include <cstring>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -2963,6 +2964,184 @@ TEST(cuda_moe_grouped_nvfp4_tc_banks_multi) {
     }
     std::printf("[grouped-nvfp4-tc-banks] G=%d totalPad=%d maxAbs=%.3e maxRel=%.3e OK\n",
                 G, totalPad, maxAbs, maxRel);
+}
+
+// Fp4TcDec-b PoC (env-gated, NOT part of the correctness gate): time the two
+// grouped-MoE decode GEMM paths — blocked GD-b (`moe_grouped_gemm_nvfp4blk_m4`,
+// the current default-on decode kernel) vs the CUTLASS NVFP4 tensor-core banks
+// path (`runGroupedNvfp4TcF32Banks`) — across a per-expert decode-M sweep at the
+// real gate_up shape (dModel=2048, gate+up width=1024, 256 experts). Answers
+// the scoping question: at what per-expert M does TC overtake the scalar-dequant
+// blocked kernel, and what is TC's ceiling once its 128-row M-tile is filled.
+// Run with MIMIRMIND_MOE_DECODE_BENCH=1; otherwise this returns immediately so
+// ctest is unaffected. See research note vllm-anchor-decode-lever-scoping.
+TEST(fp4_tc_decode_m_sweep_bench) {
+    if (std::getenv("MIMIRMIND_MOE_DECODE_BENCH") == nullptr) return;
+
+    namespace cc = ::mimirmind::core::cuda;
+    namespace mo = ::mimirmind::core::modelopt;
+    namespace cm = ::mimirmind::kernels::cutlassmoe;
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const int G = 256;          // routed experts
+    const int K = 2048;         // dModel
+    const int N = 1024;         // gate+up output width (2 * moe_ff, moe_ff=512)
+    const int ksf = K / 16;
+    const int nSuper = K / kNvSuperElems;
+    const std::size_t expertBytesBlk =
+        static_cast<std::size_t>(N) * nSuper * kNvSuperBytes;
+
+    cc::CudaModule tilesMod = cc::CudaModule::fromFile(
+        ctx.cudaContext(), resolvePtx("moe_group_tiles"));
+    cc::CudaKernel tilesKern = tilesMod.getFunction("moe_group_tiles");
+    cc::CudaModule aqMod = cc::CudaModule::fromFile(
+        ctx.cudaContext(), resolvePtx("moe_act_quant_nvfp4"));
+    cc::CudaKernel aqKern = aqMod.getFunction("moe_act_quant_nvfp4");
+
+    const bool tcOk = ops.moeGroupedGemmNvfp4TcAvailable();
+
+    // ---- blocked-NVFP4 weight bank [G][N][K] (shared across M sweep) ----------
+    Lcg wg{0xD00Du};
+    auto nextU32 = [&wg]() -> std::uint32_t {
+        wg.s = wg.s * 1664525u + 1013904223u; return wg.s;
+    };
+    std::vector<unsigned char> Wblk(static_cast<std::size_t>(G) * expertBytesBlk);
+    for (std::size_t off = 0; off + kNvSuperBytes <= Wblk.size(); off += kNvSuperBytes) {
+        for (int h = 0; h < 2; ++h) {
+            std::uint32_t bits = nextU32() & 0xFFFFu;
+            if (((bits >> 10) & 0x1Fu) == 0x1Fu) bits &= ~(1u << 14);
+            Wblk[off + h * 2 + 0] = static_cast<unsigned char>(bits & 0xFFu);
+            Wblk[off + h * 2 + 1] = static_cast<unsigned char>((bits >> 8) & 0xFFu);
+        }
+        for (int b = 4; b < kNvSuperBytes; ++b)
+            Wblk[off + b] = static_cast<unsigned char>(nextU32() & 0xFFu);
+    }
+    auto dWblk = uploadRaw(ops, Wblk);
+
+    // ---- CUTLASS TC weight banks [G] of [N,K] (nibbles + swizzled SF) ---------
+    const std::size_t sfbStride = mo::moeSwizzledScaleStride(N, ksf);
+    ::mimirmind::compute::ComputeBuffer bBank, sfbBank, globals;
+    if (tcOk) {
+        bBank   = ops.allocate(static_cast<std::size_t>(G) * N * (K / 2));
+        std::vector<unsigned char> sfbZero(static_cast<std::size_t>(G) * sfbStride, 0u);
+        sfbBank = uploadRaw(ops, sfbZero);
+        globals = uploadRaw(ops, std::vector<float>(static_cast<std::size_t>(G), 1.0f));
+        Lcg bg{0xBEEFu};
+        for (int e = 0; e < G; ++e) {
+            std::vector<float> Xb(static_cast<std::size_t>(N) * K);
+            for (auto& v : Xb) v = bg.next();
+            auto dXb = uploadRaw(ops, Xb);
+            auto* nibDst = static_cast<unsigned char*>(bBank.get())
+                         + static_cast<std::size_t>(e) * N * (K / 2);
+            auto* sfDst  = static_cast<unsigned char*>(sfbBank.get())
+                         + static_cast<std::size_t>(e) * sfbStride;
+            aqKern.setPtr(0, dXb.get()); aqKern.setPtr(1, nibDst); aqKern.setPtr(2, sfDst);
+            aqKern.setValue(3, 1.0f); aqKern.setValue(4, N); aqKern.setValue(5, K);
+            const std::uint32_t gy = static_cast<std::uint32_t>(((K / 16) + 255) / 256);
+            aqKern.launch(ctx.stream(), static_cast<std::uint32_t>(N), gy, 1, 256, 1, 1);
+        }
+        ops.flush();
+    }
+
+    auto timeIt = [&](const std::function<void()>& enqueue) -> double {
+        constexpr int kWarm = 5, kIter = 30;
+        for (int i = 0; i < kWarm; ++i) enqueue();
+        ctx.stream().synchronize();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kIter; ++i) enqueue();
+        ctx.stream().synchronize();
+        const auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() / kIter;
+    };
+
+    std::printf("[fp4-tc-decode-sweep] G=%d K=%d N=%d  (gate_up shape)  tc=%s\n",
+                G, K, N, tcOk ? "yes" : "no(CUTLASS not linked)");
+    std::printf("  %6s | %10s | %10s | %9s | %7s | %8s\n",
+                "M/exp", "blocked_ms", "tc_net_ms", "tc_gemm", "aq_ms", "net_spdup");
+    for (int M : {1, 2, 4, 8, 16, 32, 64, 128}) {
+        const int R = G * M;
+        // Blocked inputs: X[R,K] f32, device tile schedule (tileM=4 -> m4 kernel).
+        std::vector<float> X(static_cast<std::size_t>(R) * K);
+        { Lcg xg{0x1234u + static_cast<std::uint32_t>(M)}; for (auto& v : X) v = xg.next(); }
+        auto dX = uploadRaw(ops, X);
+        auto dY = ops.allocate(static_cast<std::size_t>(R) * N * sizeof(float));
+
+        std::vector<std::int32_t> expOff(G + 1, 0);
+        for (int e = 0; e < G; ++e) expOff[e + 1] = expOff[e] + M;
+        const int tileM = 4;
+        const int maxTiles = (R + tileM - 1) / tileM + G;
+        auto dTileE = ops.allocate(maxTiles * sizeof(std::int32_t));
+        auto dTileR0 = ops.allocate(maxTiles * sizeof(std::int32_t));
+        auto dTileRows = ops.allocate(maxTiles * sizeof(std::int32_t));
+        auto dNslot = ops.allocate(sizeof(std::int32_t));
+        auto dOff = uploadRaw(ops, expOff);
+        tilesKern.setPtr(0, dOff.get()); tilesKern.setPtr(1, dTileE.get());
+        tilesKern.setPtr(2, dTileR0.get()); tilesKern.setPtr(3, dTileRows.get());
+        tilesKern.setPtr(4, dNslot.get());
+        tilesKern.setValue(5, G); tilesKern.setValue(6, maxTiles); tilesKern.setValue(7, tileM);
+        tilesKern.launch(ctx.stream(), 1, 1, 1, 1, 1, 1);
+        ops.flush();
+
+        const double blkMs = timeIt([&] {
+            ops.moeGroupedGemmNvfp4Async(
+                static_cast<const float*>(dX.get()),
+                static_cast<const unsigned char*>(dWblk.get()),
+                static_cast<float*>(dY.get()),
+                static_cast<const std::int32_t*>(dTileE.get()),
+                static_cast<const std::int32_t*>(dTileR0.get()),
+                static_cast<const std::int32_t*>(dTileRows.get()),
+                K, N, maxTiles, /*decodeSmallM=*/true);
+        });
+
+        double tcNetMs = 0.0, tcGemmMs = 0.0, aqMs = 0.0;
+        if (tcOk) {
+            std::vector<std::int32_t> padOff(G + 1, 0);
+            for (int e = 0; e < G; ++e)
+                padOff[e + 1] = padOff[e] + ((M + 127) / 128) * 128;
+            const int totalPad = padOff[G];
+            std::vector<float> Xa(static_cast<std::size_t>(totalPad) * K, 0.0f);
+            { Lcg ag{0x9999u + static_cast<std::uint32_t>(M)};
+              for (int e = 0; e < G; ++e)
+                for (int m = 0; m < M; ++m)
+                  for (int k = 0; k < K; ++k)
+                    Xa[static_cast<std::size_t>(padOff[e] + m) * K + k] = ag.next(); }
+            auto dXa = uploadRaw(ops, Xa);
+            QuantOperand A = quantizeNvfp4(ops, aqKern, ctx, Xa, totalPad, K);
+            auto dOut = ops.allocate(static_cast<std::size_t>(totalPad) * N * sizeof(float));
+            auto dExpO = uploadRaw(ops, expOff);
+            auto dPadO = uploadRaw(ops, padOff);
+            const std::size_t scratchBytes = cm::groupedNvfp4TcBanksScratchBytes(G);
+            auto dScratch = ops.allocate(scratchBytes);
+            ops.flush();
+            // Real W4A4 decode cost = activation-quantise A each step + TC GEMM.
+            const std::uint32_t aqGy = static_cast<std::uint32_t>(((K / 16) + 255) / 256);
+            auto actQuant = [&] {
+                aqKern.setPtr(0, dXa.get()); aqKern.setPtr(1, A.nib.get());
+                aqKern.setPtr(2, A.sf.get()); aqKern.setValue(3, 1.0f);
+                aqKern.setValue(4, totalPad); aqKern.setValue(5, K);
+                aqKern.launch(ctx.stream(), static_cast<std::uint32_t>(totalPad),
+                              aqGy, 1, 256, 1, 1);
+            };
+            auto gemm = [&] {
+                cm::runGroupedNvfp4TcF32Banks(
+                    G, N, K,
+                    static_cast<const std::int32_t*>(dExpO.get()),
+                    static_cast<const std::int32_t*>(dPadO.get()),
+                    A.nib.get(), A.sf.get(), bBank.get(), sfbBank.get(),
+                    static_cast<const float*>(globals.get()), dOut.get(),
+                    dScratch.get(), scratchBytes, ctx.stream().handle());
+            };
+            aqMs     = timeIt(actQuant);
+            tcGemmMs = timeIt(gemm);
+            tcNetMs  = timeIt([&] { actQuant(); gemm(); });
+        }
+        std::printf("  %6d | %10.4f | %10.4f | %9.4f | %7.4f | %8.2f\n",
+                    M, blkMs, tcNetMs, tcGemmMs, aqMs,
+                    (tcNetMs > 0.0 ? blkMs / tcNetMs : 0.0));
+    }
+    std::printf("[fp4-tc-decode-sweep] done  (blocked=GD-b m4 scalar; "
+                "tc_net=actquant+CUTLASS-TC; W4A4)\n");
 }
 #endif // MIMIRMIND_HAVE_CUTLASS_MOE
 

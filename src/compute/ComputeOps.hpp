@@ -502,6 +502,19 @@ public:
         throw std::runtime_error("moeActQuantNvfp4Async: not supported on this backend");
     }
 
+    /// Row-mapped activation quantiser: quantise only `nRows` rows, each read
+    /// from / written to padded row `rowMap[i]`. The FP4-TC MoE path uses this to
+    /// skip the 128-row padding slots (their SF stays pre-zeroed) — at decode M
+    /// this avoids ~64x wasted act-quant work vs the dense variant over maxPad.
+    virtual void moeActQuantNvfp4RowsAsync(const float* in, unsigned char* outNib,
+                                           unsigned char* outSf, float gscale,
+                                           const std::int32_t* rowMap,
+                                           std::size_t nRows, std::size_t K) {
+        (void)in; (void)outNib; (void)outSf; (void)gscale;
+        (void)rowMap; (void)nRows; (void)K;
+        throw std::runtime_error("moeActQuantNvfp4RowsAsync: not supported on this backend");
+    }
+
     /// Device scratch bytes moeGroupedGemmNvfp4TcBanksAsync needs for
     /// `nExperts` groups (per-group CUTLASS arrays + workspace). Zero if the
     /// FP4-TC path is unavailable. The caller owns the buffer (per-slot).
