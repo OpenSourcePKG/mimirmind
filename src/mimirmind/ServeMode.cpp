@@ -35,6 +35,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -1077,6 +1078,55 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                       << "\n  => E3 batch-MTP " << (pass ? "PASS" : "MISMATCH")
                       << "\n";
             std::cout.flush();
+            return 0;
+        }
+
+        // M-Cuda.MTP accept-rate sweep — measures single-session MTP accept over
+        // depths 1..4 on a few prompts (no throughput sweep, one load). SpecLA
+        // shows spec-decode on linear-attention loses below ~0.7 accept; this
+        // checks whether lower depth reaches that on qwen3.6.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_MTP_ACCEPT") != nullptr) {
+            if (!e->mtpAvailable()) {
+                std::cout << "\n[MTP-ACCEPT] model has no nextn head — skipped\n";
+                std::cout.flush();
+                return 0;
+            }
+            const auto& tok = e->tokenizer();
+            const char* prompts[] = {
+                "The history of artificial intelligence began when",
+                "Write a Python function that returns the nth Fibonacci number.",
+                "Explain the theory of relativity in simple terms."
+            };
+            std::size_t maxNew = 128;
+            if (const char* mv = std::getenv("MIMIRMIND_MTP_MAXNEW")) {
+                const long v = std::strtol(mv, nullptr, 10);
+                if (v >= 1) maxNew = static_cast<std::size_t>(v);
+            }
+            std::cout << "\n[MTP-ACCEPT] maxNew=" << maxNew
+                      << " prompts=3 (per-token accept = accepted/drafted)\n";
+            for (std::size_t K = 1; K <= 4; ++K) {
+                std::size_t totD = 0, totA = 0;
+                for (const char* p : prompts) {
+                    std::vector<std::int32_t> pids = tok.encode(p, /*addBos=*/false);
+                    if (pids.empty()) pids.push_back(1);
+                    std::size_t d = 0, a = 0;
+                    (void)e->generateMtp(pids, maxNew, K, tok.eosId(), &d, &a);
+                    totD += d;
+                    totA += a;
+                }
+                const double acc =
+                    totD > 0 ? static_cast<double>(totA) / totD : 0.0;
+                // Expected accepted tokens per draft round (geometric, per-token p):
+                const double eAcc =
+                    (acc < 1.0) ? (acc * (1.0 - std::pow(acc, static_cast<double>(K))) /
+                                   (1.0 - acc))
+                                : static_cast<double>(K);
+                std::cout << "  depth=" << K << "  accept=" << acc << "  (" << totA
+                          << "/" << totD << ")  E[accepted/round]=" << eAcc
+                          << "  tokens/step=" << (1.0 + eAcc) << "\n";
+                std::cout.flush();
+            }
             return 0;
         }
 
