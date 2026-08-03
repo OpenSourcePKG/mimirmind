@@ -235,6 +235,19 @@ public:
             "gatedDeltaNetRecurrentBatchedAsync: not supported on this backend");
     }
 
+    // MV-a (MTP verify): batched GDN over the T=K+1 window with per-position
+    // state export (stateOut [T,nSeq,H,S,S]) instead of a per-step snapshot.
+    virtual void gatedDeltaNetVerifyBatchedAsync(
+            const float* q, const float* k, const float* v, const float* gLog,
+            const float* beta, const float* stateIn, float* stateOut,
+            float* out, std::size_t nSeq, std::size_t T, std::size_t H,
+            std::size_t S) {
+        (void)q; (void)k; (void)v; (void)gLog; (void)beta; (void)stateIn;
+        (void)stateOut; (void)out; (void)nSeq; (void)T; (void)H; (void)S;
+        throw std::runtime_error(
+            "gatedDeltaNetVerifyBatchedAsync: not supported on this backend");
+    }
+
     virtual void causalConv1dSiluBatchedAsync(
             const float* convInput, const float* kernel, float* out,
             std::size_t nSeq, std::size_t T, std::size_t channels,

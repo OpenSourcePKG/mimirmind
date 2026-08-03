@@ -227,6 +227,9 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _gatedDeltaNetArBatchedV2Kernel;
     core::cuda::CudaModule _gatedDeltaNetArBatchedV3Module;
     core::cuda::CudaKernel _gatedDeltaNetArBatchedV3Kernel;
+    // MV-a: batched GDN verify (T-loop over K+1, per-position state export).
+    core::cuda::CudaModule _gatedDeltaNetVerifyBatchedModule;
+    core::cuda::CudaKernel _gatedDeltaNetVerifyBatchedKernel;
     core::cuda::CudaModule _deltanetGateModule;
     core::cuda::CudaKernel _deltanetGateKernel;
     core::cuda::CudaModule _deltanetChunkCumGateModule;
@@ -396,6 +399,9 @@ struct GpuOps::Impl {
           _gatedDeltaNetArBatchedV3Module{loadCudaModule(ctx, "gated_deltanet_ar_batched_v3")},
           _gatedDeltaNetArBatchedV3Kernel{
               _gatedDeltaNetArBatchedV3Module.getFunction("gated_deltanet_ar_batched_v3")},
+          _gatedDeltaNetVerifyBatchedModule{loadCudaModule(ctx, "gated_deltanet_verify_batched")},
+          _gatedDeltaNetVerifyBatchedKernel{
+              _gatedDeltaNetVerifyBatchedModule.getFunction("gated_deltanet_verify_batched")},
           _deltanetGateModule      {loadCudaModule(ctx, "deltanet_gate")},
           _deltanetGateKernel      {_deltanetGateModule.getFunction("deltanet_gate")},
           _deltanetChunkCumGateModule{loadCudaModule(ctx, "deltanet_chunk_cumgate")},
@@ -1246,6 +1252,42 @@ void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
              static_cast<std::uint32_t>(nSeq), 1,
              static_cast<std::uint32_t>(S), 1, 1,
              useV3 ? gdnSmemBytes : 0);
+}
+
+void GpuOps::gatedDeltaNetVerifyBatchedAsync(
+        const float* q, const float* k_, const float* v, const float* gLog,
+        const float* beta, const float* stateIn, float* stateOut, float* out,
+        std::size_t nSeq, std::size_t T, std::size_t H, std::size_t S) {
+    // MV-a: verify the T=K+1 window for nSeq slots in one launch, state resident
+    // in smem across all T, exporting the per-position state to stateOut so a
+    // partial accept can pick the accepted-prefix state (no per-step snapshot).
+    // Byte-identical per-step math to gated_deltanet_ar_batched_v3. q/k/v/out
+    // are time-major [T, nSeq, H, S] (verify layout); stateIn [nSeq,H,S,S];
+    // stateOut [T, nSeq, H, S, S]. Always smem-staged (needs the >48 KiB opt-in).
+    if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
+        return;
+    }
+    const std::size_t gdnSmemBytes =
+        static_cast<std::size_t>(S) * S * sizeof(float);
+    _pimpl->_gatedDeltaNetVerifyBatchedKernel.setMaxDynamicSharedBytes(gdnSmemBytes);
+    auto& k = _pimpl->_gatedDeltaNetVerifyBatchedKernel;
+    k.setPtr  (0, q);
+    k.setPtr  (1, k_);
+    k.setPtr  (2, v);
+    k.setPtr  (3, gLog);
+    k.setPtr  (4, beta);
+    k.setPtr  (5, stateIn);
+    k.setPtr  (6, stateOut);
+    k.setPtr  (7, out);
+    k.setValue(8,  toInt32(T, "gdnV T"));
+    k.setValue(9,  toInt32(nSeq, "gdnV nSeq"));
+    k.setValue(10, toInt32(H, "gdnV H"));
+    k.setValue(11, toInt32(S, "gdnV S"));
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(H),
+             static_cast<std::uint32_t>(nSeq), 1,
+             static_cast<std::uint32_t>(S), 1, 1,
+             gdnSmemBytes);
 }
 
 void GpuOps::deltanetGateAsync(const float* alpha, const float* ssmA,

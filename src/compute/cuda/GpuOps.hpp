@@ -173,6 +173,13 @@ public:
                                             float* out, std::size_t nSeq,
                                             std::size_t T, std::size_t H,
                                             std::size_t S) override;
+
+    void gatedDeltaNetVerifyBatchedAsync(const float* q, const float* k,
+                                         const float* v, const float* gLog,
+                                         const float* beta, const float* stateIn,
+                                         float* stateOut, float* out,
+                                         std::size_t nSeq, std::size_t T,
+                                         std::size_t H, std::size_t S) override;
     void deltanetGateAsync(const float* alpha, const float* ssmA,
                            const float* ssmDt, float* gLog,
                            std::size_t T, std::size_t H) override;
