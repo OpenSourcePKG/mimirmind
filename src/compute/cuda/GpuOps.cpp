@@ -230,6 +230,9 @@ struct GpuOps::Impl {
     // MV-a: batched GDN verify (T-loop over K+1, per-position state export).
     core::cuda::CudaModule _gatedDeltaNetVerifyBatchedModule;
     core::cuda::CudaKernel _gatedDeltaNetVerifyBatchedKernel;
+    // MTP draft-side: per-row device argmax over vocab.
+    core::cuda::CudaModule _argmaxRowsModule;
+    core::cuda::CudaKernel _argmaxRowsKernel;
     core::cuda::CudaModule _deltanetGateModule;
     core::cuda::CudaKernel _deltanetGateKernel;
     core::cuda::CudaModule _deltanetChunkCumGateModule;
@@ -402,6 +405,8 @@ struct GpuOps::Impl {
           _gatedDeltaNetVerifyBatchedModule{loadCudaModule(ctx, "gated_deltanet_verify_batched")},
           _gatedDeltaNetVerifyBatchedKernel{
               _gatedDeltaNetVerifyBatchedModule.getFunction("gated_deltanet_verify_batched")},
+          _argmaxRowsModule{loadCudaModule(ctx, "argmax_rows")},
+          _argmaxRowsKernel{_argmaxRowsModule.getFunction("argmax_rows")},
           _deltanetGateModule      {loadCudaModule(ctx, "deltanet_gate")},
           _deltanetGateKernel      {_deltanetGateModule.getFunction("deltanet_gate")},
           _deltanetChunkCumGateModule{loadCudaModule(ctx, "deltanet_chunk_cumgate")},
@@ -1288,6 +1293,19 @@ void GpuOps::gatedDeltaNetVerifyBatchedAsync(
              static_cast<std::uint32_t>(nSeq), 1,
              static_cast<std::uint32_t>(S), 1, 1,
              gdnSmemBytes);
+}
+
+void GpuOps::argmaxRowsAsync(const float* logits, std::int32_t* out,
+                             std::size_t nRows, std::size_t vocab) {
+    if (nRows == 0 || vocab == 0) {
+        return;
+    }
+    auto& k = _pimpl->_argmaxRowsKernel;
+    k.setPtr  (0, logits);
+    k.setPtr  (1, out);
+    k.setValue(2, toInt32(nRows, "argmax nRows"));
+    k.setValue(3, toInt32(vocab, "argmax vocab"));
+    k.launch(_ctx.stream(), static_cast<std::uint32_t>(nRows), 1, 1, 256, 1, 1);
 }
 
 void GpuOps::deltanetGateAsync(const float* alpha, const float* ssmA,

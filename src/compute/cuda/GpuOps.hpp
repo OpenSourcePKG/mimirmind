@@ -180,6 +180,9 @@ public:
                                          float* stateOut, float* out,
                                          std::size_t nSeq, std::size_t T,
                                          std::size_t H, std::size_t S) override;
+
+    void argmaxRowsAsync(const float* logits, std::int32_t* out,
+                         std::size_t nRows, std::size_t vocab) override;
     void deltanetGateAsync(const float* alpha, const float* ssmA,
                            const float* ssmDt, float* gLog,
                            std::size_t T, std::size_t H) override;

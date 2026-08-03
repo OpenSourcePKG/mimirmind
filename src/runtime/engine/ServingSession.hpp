@@ -92,6 +92,25 @@ private:
     /// `maxBatch` slots × `depth + 1` verify tokens. Grows monotonically.
     void ensureVerifyCapacity(std::size_t depth);
 
+    /// Shared verify trunk forward: validates `slots`/`tokensTimeMajor`, runs
+    /// the N*(depth+1) full-attention + GatedDeltaNet-verify trunk, and leaves
+    /// per-position logits in `st.vLogitsB` on the device (NOT flushed / read
+    /// back). Returns M = N*(depth+1) (0 if N==0). The two entry points below
+    /// differ only in how they harvest those logits.
+    [[nodiscard]] std::size_t
+    verifyForward(std::span<const InferenceEngine::VerifySlot> slots,
+                  std::span<const std::int32_t>                tokensTimeMajor,
+                  std::size_t                                  depth);
+
+    /// MTP verify harvest for the perf path: device argmax over each of the M
+    /// rows, reading back only the M token ids (a few bytes) instead of the
+    /// full M*vocab logits (tens of MB). Row r = j*N+s is slot s's j-th verify
+    /// position. Byte-identical argmax to `stepServingVerify` + host `argmax`.
+    [[nodiscard]] std::vector<std::int32_t>
+    stepServingVerifyIds(std::span<const InferenceEngine::VerifySlot> slots,
+                         std::span<const std::int32_t>                tokensTimeMajor,
+                         std::size_t                                  depth);
+
     /// Increment E2 — lazily allocate the per-slot nextn (MTP) KV caches +
     /// shared draft scratch. Requires a loaded nextn head. Idempotent.
     void ensureMtpServingState();

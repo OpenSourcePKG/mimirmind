@@ -248,6 +248,16 @@ public:
             "gatedDeltaNetVerifyBatchedAsync: not supported on this backend");
     }
 
+    // MTP draft/verify: per-row device argmax over vocab (out[row] = argmax).
+    // Keeps the argmax on-device so only the token ids are read back, not the
+    // full nRows*vocab logits. Lowest-index tie-break (== the host scan).
+    virtual void argmaxRowsAsync(const float* logits, std::int32_t* out,
+                                 std::size_t nRows, std::size_t vocab) {
+        (void)logits; (void)out; (void)nRows; (void)vocab;
+        throw std::runtime_error(
+            "argmaxRowsAsync: not supported on this backend");
+    }
+
     virtual void causalConv1dSiluBatchedAsync(
             const float* convInput, const float* kernel, float* out,
             std::size_t nSeq, std::size_t T, std::size_t channels,

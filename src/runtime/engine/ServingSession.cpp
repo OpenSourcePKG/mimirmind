@@ -97,6 +97,8 @@ struct ServingState {
     compute::ComputeBuffer vBlockTablesDev;          // [Mcap * blocksPerSeq]
     compute::ComputeBuffer vSeqLensDev, vStartPosDev;// [Mcap]
     compute::ComputeBuffer vXBuf, vNormB, vLogitsB, vLmScr;
+    compute::ComputeBuffer vArgmaxDev;               // [Mcap] device per-row argmax ids
+    std::vector<std::int32_t>  vArgmaxHost;          // [Mcap] argmax readback (draft+verify)
     std::vector<compute::ComputeBuffer> ssmSnap;     // [K+1] full SsmState state images
     std::vector<compute::ComputeBuffer> convSnap;    // [K+1] full SsmState conv images
     std::vector<std::int32_t>  vBlockTablesH;        // [Mcap * blocksPerSeq]
@@ -864,6 +866,7 @@ void ServingSession::ensureVerifyCapacity(std::size_t depth) {
     st.vXBuf    = _e._ops->allocate(Mcap * d_model * sizeof(float));
     st.vNormB   = _e._ops->allocate(Mcap * d_model * sizeof(float));
     st.vLogitsB = _e._ops->allocate(Mcap * vocab   * sizeof(float));
+    st.vArgmaxDev = _e._ops->allocate(Mcap * sizeof(std::int32_t));
     st.vLmScr   = _e._ops->allocate(std::max(d_model, vocab) * sizeof(float));
 
     // Full recurrent-state images (one per verify step): [blockCount, slab,
@@ -889,14 +892,15 @@ void ServingSession::ensureVerifyCapacity(std::size_t depth) {
     st.vGdnSeqStart.assign((K + 1) * st.maxBatch, 0);
     st.vInputTok.assign(Mcap, 0);
     st.vHostLogits.assign(Mcap * vocab, 0.0F);
+    st.vArgmaxHost.assign(Mcap, 0);
 
     MM_LOG_INFO("serving",
                 "ensureVerifyCapacity: depth={} Mcap={} snapStateBytes={} x{}",
                 K, Mcap, stImgElems * sizeof(float), K + 1);
 }
 
-std::vector<std::vector<float>>
-ServingSession::stepServingVerify(
+std::size_t
+ServingSession::verifyForward(
         std::span<const InferenceEngine::VerifySlot> slots,
         std::span<const std::int32_t>                tokensTimeMajor,
         std::size_t                                  depth) {
@@ -907,7 +911,7 @@ ServingSession::stepServingVerify(
     auto& st = *_state;
     const std::size_t N = slots.size();
     if (N == 0) {
-        return {};
+        return 0;
     }
     if (depth == 0) {
         depth = 1;
@@ -1032,6 +1036,21 @@ ServingSession::stepServingVerify(
                           _e._config.rmsNormEps, normBuf);
     _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, vocab, d_model,
                     normBuf, M, logits, st.vLmScr.as<float>());
+    return M;
+}
+
+std::vector<std::vector<float>>
+ServingSession::stepServingVerify(
+        std::span<const InferenceEngine::VerifySlot> slots,
+        std::span<const std::int32_t>                tokensTimeMajor,
+        std::size_t                                  depth) {
+    const std::size_t M = verifyForward(slots, tokensTimeMajor, depth);
+    if (M == 0) {
+        return {};
+    }
+    auto& st = *_state;
+    const std::size_t vocab  = st.vocab_lm;
+    float* const      logits = st.vLogitsB.as<float>();
     _e._ops->flush();
     _e._ops->readbackToHost(st.vHostLogits.data(), logits,
                             M * vocab * sizeof(float));
@@ -1043,6 +1062,29 @@ ServingSession::stepServingVerify(
         out.emplace_back(row, row + vocab);
     }
     return out;
+}
+
+std::vector<std::int32_t>
+ServingSession::stepServingVerifyIds(
+        std::span<const InferenceEngine::VerifySlot> slots,
+        std::span<const std::int32_t>                tokensTimeMajor,
+        std::size_t                                  depth) {
+    const std::size_t M = verifyForward(slots, tokensTimeMajor, depth);
+    if (M == 0) {
+        return {};
+    }
+    auto& st = *_state;
+    const std::size_t vocab  = st.vocab_lm;
+    float* const      logits = st.vLogitsB.as<float>();
+    // Device argmax over each of the M rows, then read back only the M ids
+    // instead of the full M*vocab logits (tens of MB → a few bytes).
+    _e._ops->argmaxRowsAsync(logits, st.vArgmaxDev.as<std::int32_t>(),
+                             static_cast<int>(M), static_cast<int>(vocab));
+    _e._ops->flush();
+    _e._ops->readbackToHost(st.vArgmaxHost.data(), st.vArgmaxDev.get(),
+                            M * sizeof(std::int32_t));
+    return {st.vArgmaxHost.begin(),
+            st.vArgmaxHost.begin() + static_cast<std::ptrdiff_t>(M)};
 }
 
 void ServingSession::ensureMtpServingState() {
@@ -1221,18 +1263,18 @@ void ServingSession::draftBatchRound(
             st.mtpTmpE.as<float>(), st.mtpTmpH.as<float>(),
             st.mtpDraftLogitsB.as<float>(), st.mtpLmScrB.as<float>(),
             /*skipHead=*/false);
+        // Device argmax over vocab -> read back only nSeq token ids (was the
+        // full nSeq*vocab logits, ~19 MB/step). Lowest-index tie-break matches
+        // the previous host scan, so the drafted ids are identical.
+        _e._ops->argmaxRowsAsync(st.mtpDraftLogitsB.as<float>(),
+                                 st.vArgmaxDev.as<std::int32_t>(), nSeq, vocab);
         _e._ops->flush();
-        _e._ops->readbackToHost(st.mtpHostLogitsB.data(), st.mtpDraftLogitsB.get(),
-                                nSeq * vocab * sizeof(float));
+        _e._ops->readbackToHost(st.vArgmaxHost.data(), st.vArgmaxDev.get(),
+                                nSeq * sizeof(std::int32_t));
         for (std::size_t s = 0; s < nSeq; ++s) {
-            const float* row = st.mtpHostLogitsB.data() + s * vocab;
-            std::size_t best = 0;
-            float       bv   = row[0];
-            for (std::size_t v = 1; v < vocab; ++v) {
-                if (row[v] > bv) { bv = row[v]; best = v; }
-            }
-            drafts[s].push_back(static_cast<std::int32_t>(best));
-            st.mtpPrevTok[s] = static_cast<std::int32_t>(best);
+            const std::int32_t best = st.vArgmaxHost[s];
+            drafts[s].push_back(best);
+            st.mtpPrevTok[s] = best;
             ++st.nextnLen[s];
         }
         hcur = ehB;
@@ -1436,7 +1478,7 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
                 vtokTM[j * nSeq + s] = drafts[s][j - 1];
             }
         }
-        const auto vlog = stepServingVerify(slots, vtokTM, K);
+        const auto vids = stepServingVerifyIds(slots, vtokTM, K);
         float* const vX = st.vXBuf.as<float>();   // M trunk hiddens (time-major)
 
         // --- per-slot accept-longest-prefix + snapshot restore -----------
@@ -1444,9 +1486,9 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
             if (finished[s] != 0) continue;
             std::size_t a = 0;
             for (std::size_t i = 0; i < K; ++i) {
-                if (argmax(vlog[i * nSeq + s]) == drafts[s][i]) ++a; else break;
+                if (vids[i * nSeq + s] == drafts[s][i]) ++a; else break;
             }
-            const std::int32_t corrected = argmax(vlog[a * nSeq + s]);
+            const std::int32_t corrected = vids[a * nSeq + s];
 
             auto emit = [&](std::int32_t t) -> bool {
                 out[s].push_back(t);
@@ -1608,15 +1650,15 @@ ServingSession::generateBatchMtpMulti(
                 vtokTM[j * N + p] = drafts[p][j - 1];
             }
         }
-        const auto vlog = stepServingVerify(slots, vtokTM, K);
+        const auto vids = stepServingVerifyIds(slots, vtokTM, K);
         float* const vX = st.vXBuf.as<float>();
 
         for (std::size_t p = 0; p < N; ++p) {
             std::size_t a = 0;
             for (std::size_t i = 0; i < K; ++i) {
-                if (argmax(vlog[i * N + p]) == drafts[p][i]) ++a; else break;
+                if (vids[i * N + p] == drafts[p][i]) ++a; else break;
             }
-            const std::int32_t corrected = argmax(vlog[a * N + p]);
+            const std::int32_t corrected = vids[a * N + p];
             if (finished[p] == 0) {
                 auto emit = [&](std::int32_t t) -> bool {
                     out[p].push_back(t);
