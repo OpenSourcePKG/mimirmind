@@ -1000,31 +1000,25 @@ ServingSession::stepServingVerify(
     ctxFull.kwSlot          = st.vKw.as<float>();
     ctxFull.isSeqStart      = st.vIsSeqStart.data();
 
-    const std::size_t stStride = st.ssm->stateLayerStride();
-    const std::size_t cvStride = st.ssm->convStateLayerStride();
+    // MV-c: per-position ssmSnap/convSnap slab-image bases (Kp1), so the
+    // GatedDeltaNet verify layer can snapshot each verify position inline.
+    std::vector<float*> ssmSnapBases(Kp1);
+    std::vector<float*> convSnapBases(Kp1);
+    for (std::size_t j = 0; j < Kp1; ++j) {
+        ssmSnapBases[j]  = st.ssmSnap[j].as<float>();
+        convSnapBases[j] = st.convSnap[j].as<float>();
+    }
 
     for (std::size_t b = 0; b < st.blockCount; ++b) {
         if (_e._config.isRecurrentLayer(b)) {
-            // GatedDeltaNet: K+1 sequential batched steps (nSeq = N). Step j
-            // advances the per-slot recurrent state by verify token j; a
-            // full state image is snapshotted after each step so a partial
-            // accept can restore it (Increment E3) without a re-forward.
-            for (std::size_t j = 0; j < Kp1; ++j) {
-                arch::BatchedDecodeCtx ctxGdn{};
-                ctxGdn.nSeq       = N;
-                ctxGdn.expIdxSlot = st.vExpIdx.as<std::int32_t>();
-                ctxGdn.kwSlot     = st.vKw.as<float>();
-                ctxGdn.isSeqStart = st.vGdnSeqStart.data() + j * st.maxBatch;
-                st.qb->runBlockBatched(b, xBuf + j * N * d_model, ctxGdn, *st.vsb);
-                _e._ops->appendMemoryCopy(
-                    st.ssmSnap[j].as<float>() + b * stStride,
-                    st.ssm->statePtr()        + b * stStride,
-                    stStride * sizeof(float));
-                _e._ops->appendMemoryCopy(
-                    st.convSnap[j].as<float>() + b * cvStride,
-                    st.ssm->convStatePtr()     + b * cvStride,
-                    cvStride * sizeof(float));
-            }
+            // MV-c: GatedDeltaNet verify — ONE batched layer over M=N*(K+1)
+            // rows (proj/out-proj/MoE read each weight once vs K+1x for the old
+            // per-position loop), conv+recurrence per position (byte-identical),
+            // snapshotting each position into ssmSnap[j]/convSnap[j].
+            st.qb->runLinearBlockVerify(
+                b, xBuf, N, Kp1, st.vExpIdx.as<std::int32_t>(),
+                st.vKw.as<float>(), st.vGdnSeqStart.data(), st.maxBatch,
+                ssmSnapBases.data(), convSnapBases.data(), *st.vsb);
         } else {
             st.qb->runBlockBatched(b, xBuf, ctxFull, *st.vsb);
         }

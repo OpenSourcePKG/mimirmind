@@ -1960,4 +1960,150 @@ void Qwen35MoeBackend::runLinearBlockBatched(
     _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nSeq * d_model);
 }
 
+void Qwen35MoeBackend::runLinearBlockVerify(
+        std::size_t blockIdx, float* x, std::size_t N, std::size_t Kp1,
+        std::int32_t* expIdxSlot, float* kwSlot, const std::uint8_t* gdnSeqStart,
+        std::size_t maxBatch, float* const* ssmSnap, float* const* convSnap,
+        BlockBuffers& s) {
+    if (N == 0 || Kp1 == 0) {
+        return;
+    }
+    const std::size_t M = N * Kp1;
+
+    const auto& w        = _weights;
+    const auto& attnNorm = requireBlock(w, blockIdx, "attn_norm.weight");
+    const auto& qkvW     = requireBlock(w, blockIdx, "attn_qkv.weight");
+    const auto& gateW    = requireBlock(w, blockIdx, "attn_gate.weight");
+    const auto& betaW    = requireBlock(w, blockIdx, "ssm_beta.weight");
+    const auto& alphaW   = requireBlock(w, blockIdx, "ssm_alpha.weight");
+    const auto& ssmA     = requireBlock(w, blockIdx, "ssm_a");
+    const auto& ssmDt    = requireBlock(w, blockIdx, "ssm_dt.bias");
+    const auto& convW    = requireBlock(w, blockIdx, "ssm_conv1d.weight");
+    const auto& ssmNormW = requireBlock(w, blockIdx, "ssm_norm.weight");
+    const auto& ssmOutW  = requireBlock(w, blockIdx, "ssm_out.weight");
+    const auto& attnPost = requireBlock(w, blockIdx, "post_attention_norm.weight");
+
+    const std::size_t d_model        = s.d_model;
+    const std::size_t S              = _config.ssmStateSize;
+    const std::size_t hK             = _config.ssmNumKHeads();
+    const std::size_t hV             = _config.ssmNumVHeads();
+    const std::size_t valueDim       = _config.ssmInnerSize;
+    const std::size_t convDim        = _config.ssmConvDim();
+    const std::size_t dConv          = _config.ssmConvKernel;
+    const std::size_t keyDim         = S * hK;
+    const std::size_t stateElems     = _config.ssmStateElemsPerLayer();
+    const std::size_t convStateElems = _config.ssmConvStateElemsPerLayer();
+    const std::size_t stateRows      = (dConv > 0 ? dConv - 1 : 0);
+    const float       eps            = _config.rmsNormEps;
+
+    float* const normBuf   = s.normBuf.as<float>();
+    float* const qkvMixed  = s.ssmQkvMixed.as<float>();
+    float* const convInput = s.ssmConvInput.as<float>();
+    float* const zBuf      = s.ssmZ.as<float>();
+    float* const qBuf      = s.ssmQ.as<float>();
+    float* const kBuf      = s.ssmK.as<float>();
+    float* const vBuf      = s.ssmV.as<float>();
+    float* const deltaOut  = s.ssmDeltaOut.as<float>();
+    float* const alphaBuf  = s.ssmAlpha.as<float>();
+    float* const betaBuf   = s.ssmBeta.as<float>();
+    float* const gateBuf   = s.ssmGate.as<float>();
+    float* const projOut   = s.projOut.as<float>();
+    float* const mmScratch = s.matmulScratch.as<float>();
+
+    const std::size_t slabNSeq = (s.ssmSlabNSeq != 0) ? s.ssmSlabNSeq : N;
+    float* const stateBase = s.ssmStatePtr     + blockIdx * (slabNSeq * stateElems);
+    float* const convBase  = s.ssmConvStatePtr + blockIdx * (slabNSeq * convStateElems);
+    const std::size_t stStride = slabNSeq * stateElems;   // per-layer slab (== SsmState::stateLayerStride)
+    const std::size_t cvStride = slabNSeq * convStateElems;
+
+    // === Phase 1: weight-heavy projections, BATCHED over M (read once) =====
+    _ops.rmsNormAsync(x, M, d_model,
+                      static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
+    {
+        compute::UnorderedScope u{_ops};
+        _gmm.matmulAsync(qkvW.type,  qkvW.usmPtr,  convDim,  d_model, normBuf, M, qkvMixed, mmScratch);
+        _gmm.matmulAsync(gateW.type, gateW.usmPtr, valueDim, d_model, normBuf, M, zBuf,     mmScratch);
+        _gmm.matmulAsync(betaW.type, betaW.usmPtr, hV,       d_model, normBuf, M, betaBuf,  mmScratch);
+        _gmm.matmulAsync(alphaW.type,alphaW.usmPtr,hV,       d_model, normBuf, M, alphaBuf, mmScratch);
+    }
+    _ops.sigmoidInPlaceAsync(betaBuf, M * hV);
+    _ops.deltanetGateAsync(alphaBuf,
+                           static_cast<const float*>(ssmA.usmPtr),
+                           static_cast<const float*>(ssmDt.usmPtr),
+                           gateBuf, M, hV);
+
+    // === Phase 2: conv1d + gated-delta recurrence, PER VERIFY POSITION =====
+    // Position j's N slots are the contiguous row block [j*N, j*N+N). Byte-
+    // identical to runLinearBlockBatched's conv/GDN, advancing the per-slot
+    // state token-by-token; the full slab is snapshotted after each position.
+    const std::size_t convInBytes = convStateElems * sizeof(float);
+    const std::size_t qkvRowBytes = convDim * sizeof(float);
+    for (std::size_t j = 0; j < Kp1; ++j) {
+        float* const qkvMixedJ = qkvMixed + j * N * convDim;
+        float* const gateJ     = gateBuf  + j * N * hV;
+        float* const betaJ     = betaBuf  + j * N * hV;
+        float* const deltaJ    = deltaOut + j * N * valueDim;
+        const std::uint8_t* const seqStartJ = gdnSeqStart + j * maxBatch;
+
+        // causal conv1d + silu (per-seq rolling state) over the N slots.
+        for (std::size_t seq = 0; seq < N; ++seq) {
+            float* const cvState = convBase + seq * convStateElems;
+            float* const cvIn    = convInput + seq * dConv * convDim;
+            if (seqStartJ[seq] != 0) {
+                _ops.mulScalarAsync(cvState, 0.0F, convStateElems);
+            }
+            _ops.appendMemoryCopy(cvIn, cvState, convInBytes);
+            _ops.appendMemoryCopy(cvIn + stateRows * convDim,
+                                  qkvMixedJ + seq * convDim, qkvRowBytes);
+        }
+        _ops.causalConv1dSiluBatchedAsync(convInput,
+                                          static_cast<const float*>(convW.usmPtr),
+                                          qkvMixedJ, N, /*T=*/1, convDim, dConv);
+        for (std::size_t seq = 0; seq < N; ++seq) {
+            float* const cvState = convBase + seq * convStateElems;
+            float* const cvIn    = convInput + seq * dConv * convDim;
+            _ops.appendMemoryCopy(cvState, cvIn + /*T=*/1 * convDim, convInBytes);
+        }
+
+        _ops.gatherHeadsFromChannelsAsync(qkvMixedJ, qBuf, N, 0,          hK, hV, S, convDim);
+        _ops.gatherHeadsFromChannelsAsync(qkvMixedJ, kBuf, N, keyDim,     hK, hV, S, convDim);
+        _ops.gatherHeadsFromChannelsAsync(qkvMixedJ, vBuf, N, 2 * keyDim, hV, hV, S, convDim);
+        _ops.l2NormInPlaceAsync(qBuf, N * hV, S, eps);
+        _ops.l2NormInPlaceAsync(kBuf, N * hV, S, eps);
+
+        for (std::size_t seq = 0; seq < N; ++seq) {
+            if (seqStartJ[seq] != 0) {
+                _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
+            }
+        }
+        _ops.gatedDeltaNetRecurrentBatchedAsync(qBuf, kBuf, vBuf, gateJ, betaJ,
+                                                stateBase, deltaJ, N,
+                                                /*T=*/1, hV, S);
+
+        // Snapshot the full recurrent + conv slab after verify position j.
+        _ops.appendMemoryCopy(ssmSnap[j] + blockIdx * stStride,
+                              stateBase, stStride * sizeof(float));
+        _ops.appendMemoryCopy(convSnap[j] + blockIdx * cvStride,
+                              convBase, cvStride * sizeof(float));
+    }
+
+    // === Phase 3: gated output norm + out-proj + MoE, BATCHED over M =======
+    _ops.rmsNormAsync(deltaOut, M * hV, S,
+                      static_cast<const float*>(ssmNormW.usmPtr), eps, qBuf);
+    _ops.siluMulAsync(zBuf, qBuf, M * valueDim);
+    _gmm.matmulAsync(ssmOutW.type, ssmOutW.usmPtr, d_model, valueDim,
+                     zBuf, M, projOut, mmScratch);
+    _ops.addResidualAsync(x, projOut, M * d_model);
+
+    _ops.rmsNormAsync(x, M, d_model,
+                      static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
+    if (_moeGroupedDecode) {
+        runMoeFfnGrouped(blockIdx, normBuf, M, expIdxSlot, kwSlot, s,
+                         /*preferBlocked=*/true);
+    } else {
+        runMoeFfnBatched(blockIdx, normBuf, M, expIdxSlot, kwSlot, s);
+    }
+    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), M * d_model);
+}
+
 } // namespace mimirmind::runtime::arch

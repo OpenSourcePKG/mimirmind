@@ -117,6 +117,26 @@ public:
                          const BatchedDecodeCtx&  ctx,
                          BlockBuffers&            s);
 
+    /// M-Cuda.MTP-VerifyChunked MV-c — batched GatedDeltaNet VERIFY layer.
+    /// N slots' K+1-token verify window laid time-major in `x` (row j*N+s;
+    /// position j's N slots contiguous). Batches proj/out-proj/MoE over
+    /// M=N*(K+1) (each weight read once vs K+1x for the sequential path — the
+    /// spec-decode weight-read amortisation), conv1d + gated-delta recurrence
+    /// stay per-position (byte-identical to runLinearBlockBatched). Snapshots
+    /// the full recurrent + conv slab after each position j into ssmSnap[j]/
+    /// convSnap[j] for partial-accept restore. gdnSeqStart is [(K+1)*maxBatch].
+    void runLinearBlockVerify(std::size_t         blockIdx,
+                              float*              x,
+                              std::size_t         N,
+                              std::size_t         Kp1,
+                              std::int32_t*       expIdxSlot,
+                              float*              kwSlot,
+                              const std::uint8_t* gdnSeqStart,
+                              std::size_t         maxBatch,
+                              float* const*       ssmSnap,
+                              float* const*       convSnap,
+                              BlockBuffers&       s);
+
     /// Dense PagedKvPool layer index for full-attention block `blockIdx`, or
     /// `SIZE_MAX` for recurrent (GatedDeltaNet) blocks (they hold no KV).
     /// Exposes the private `_fullAttnDense` map so the serving prefill path
