@@ -598,8 +598,16 @@ void Nvfp4Loader::load(InferenceEngine& e,
         //   "fa"          — full-attention q/k/v/output only (NVFP4/BF16 origin;
         //                   E4M3 is a downgrade there — degrades)
         //   "all"         — both     "0" — disabled (keep BF16)
+        // Default flipped to "0" (keep BF16) 2026-08-03: the FP8 requant halves
+        // the attention weight bytes but matmul_fp8_gemm is slower than the
+        // BF16 tf32-TC path at decode-M, and it dominates the decode step (it is
+        // on all 30 GDN layers × 3 proj). Back-to-back HTTP A/B on GB10
+        // (qwen3.6-35B-NVFP4): BF16 84.6 vs FP8 70.5 gen-tok/s @conc32 (+20%),
+        // for +900 MiB (trivial on 128 GB). Precision-neutral (these projections
+        // are natively FP8 in the checkpoint, so BF16 holds them exactly).
+        // `MIMIRMIND_NVFP4_ATTN_FP8=gdn` restores the memory-saving FP8 path.
         const char* fp8env = std::getenv("MIMIRMIND_NVFP4_ATTN_FP8");
-        const std::string_view mode = (fp8env == nullptr) ? "gdn" : fp8env;
+        const std::string_view mode = (fp8env == nullptr) ? "0" : fp8env;
         if (mode != "0") {
             const bool wantFa  = (mode == "all" || mode == "fa");
             const bool wantGdn = (mode == "all" || mode == "gdn");
