@@ -1142,13 +1142,18 @@ TEST(cuda_gated_deltanet_ar_batched_parity) {
         ops.flush();
         auto outS   = fromDevice(ops, dSingle.get(), act);
         auto stateS = fromDevice(ops, dst.get(),     stt);
+        // Batched vs single-seq differ only in FMA/reduction ordering, so hold
+        // each element to a magnitude-relative bound (atol + rtol*|ref|). A flat
+        // 1e-5 atol demands ~4e-7 relative on large-magnitude state entries
+        // (|state| ~= 25), which f32 cannot guarantee across reassociation and
+        // which the CUDA 13.3 toolchain's FMA contraction exceeds by ~14%.
         for (std::size_t i = 0; i < act; ++i) {
             maxErr = std::max(maxErr, std::fabs((double)outB[s*act+i] - (double)outS[i]));
-            EXPECT_NEAR(outB[s*act+i], outS[i], 1e-5f);
+            EXPECT_NEAR(outB[s*act+i], outS[i], 1e-5f + 1e-6f * std::fabs(outS[i]));
         }
         for (std::size_t i = 0; i < stt; ++i) {
             maxErr = std::max(maxErr, std::fabs((double)stateB[s*stt+i] - (double)stateS[i]));
-            EXPECT_NEAR(stateB[s*stt+i], stateS[i], 1e-5f);
+            EXPECT_NEAR(stateB[s*stt+i], stateS[i], 1e-5f + 1e-6f * std::fabs(stateS[i]));
         }
     }
     std::printf("[gdn-batched-parity] nSeq=%zu T=%zu H=%zu S=%zu maxErr=%.2e\n",
