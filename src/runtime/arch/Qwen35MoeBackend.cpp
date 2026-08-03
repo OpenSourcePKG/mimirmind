@@ -91,11 +91,11 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
             _moeGroupedPrefill = true;   // route prefill through runMoeFfnGrouped
         }
     }
-    // M-Cuda.MoeGroup-Decode GD-a: independent opt-in for the *decode* path.
-    // Routes batched-decode routed-MoE through the blocked grouped GEMM to
-    // amortise expert-weight reads across the batch (the ~70 gen-tok/s ceiling).
+    // M-Cuda.MoeGroup-Decode GD-a/b: the *decode* routed-MoE goes through the
+    // blocked grouped GEMM (GD-b small-M kernel) by default — greedy-bit-
+    // identical to fused-K, +5% decode, 0 memory cost. Set =0 to disable.
     if (const char* d = std::getenv("MIMIRMIND_GROUPED_MOE_DECODE")) {
-        _moeGroupedDecode = (d[0] == '1' && d[1] == '\0');
+        _moeGroupedDecode = !(d[0] == '0' && d[1] == '\0');
     }
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     if (const char* d = std::getenv("MIMIRMIND_SSM_DUMP")) {

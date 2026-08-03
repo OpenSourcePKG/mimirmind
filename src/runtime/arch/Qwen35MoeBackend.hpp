@@ -345,9 +345,11 @@ private:
     // (env MIMIRMIND_GROUPED_MOE_DECODE=1). The decode ceiling is expert-weight
     // bandwidth — fused-K re-reads each expert per token; grouped reads it once
     // per tile. Forces the blocked branch (never TC — decode M is tiny, TC's
-    // 128-row pad is pure waste). Opt-in, off by default; needs NVFP4_BLK banks
-    // (the additive-default decode format).
-    bool _moeGroupedDecode{false};
+    // 128-row pad is pure waste); needs NVFP4_BLK banks (the additive-default
+    // decode format; tc-only/other layouts fall back to fused-K via the guard).
+    // DEFAULT-ON 2026-08-03: +5% decode, greedy-bit-identical to fused-K (3/3
+    // prompts), 0 memory cost. MIMIRMIND_GROUPED_MOE_DECODE=0 disables.
+    bool _moeGroupedDecode{true};
     // Host mirror of the device expert-offset table (moe_group_build output),
     // read back once per grouped MoE layer to drive the per-expert launches
     // (host-driven Option 1 only; the device-driven path never reads it back).
