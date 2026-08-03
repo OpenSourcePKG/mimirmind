@@ -416,9 +416,10 @@ public:
                                           const std::int32_t* tileRow0,
                                           const std::int32_t* tileRows,
                                           std::size_t K, std::size_t N,
-                                          std::size_t maxTiles) {
+                                          std::size_t maxTiles,
+                                          bool decodeSmallM = false) {
         (void)x; (void)w; (void)y; (void)tileExpert; (void)tileRow0;
-        (void)tileRows; (void)K; (void)N; (void)maxTiles;
+        (void)tileRows; (void)K; (void)N; (void)maxTiles; (void)decodeSmallM;
         throw std::runtime_error(
             "moeGroupedGemmNvfp4Async: not supported on this backend");
     }

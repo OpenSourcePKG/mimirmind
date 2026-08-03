@@ -32,6 +32,19 @@
 //
 // Launch: grid.x = ceil(N / OUTPUTS_PER_GROUP), grid.y = maxTiles;
 //         block  = MATMUL_NVBLK_GEMM_LOCAL (128).
+//
+// GD-b (M-Cuda.MoeGroup-Decode): the kernel body is templated on MAX_M and
+// emitted twice via extern-C wrappers:
+//   * moe_grouped_gemm_nvfp4blk     (MAX_M = 16) — prefill / large-M grouped.
+//   * moe_grouped_gemm_nvfp4blk_m4  (MAX_M = 4)  — decode small-M.
+// At decode the schedule (moe_group_tiles, tileM=4) emits <=4-row tiles, so the
+// M4 variant needs only xTile[4*256]=4 KB shared + acc[4] regs instead of 16 KB
+// + acc[16]. ncu on the M16 kernel at decode-M showed occupancy capped at
+// ~41.7% by shared memory (Block Limit Shared Mem = 5), with ~72% of cycles
+// stalled on scoreboard (L1TEX/shared) — i.e. latency-bound at low occupancy.
+// The M4 variant lifts both the shared- and register-occupancy limits so the
+// hardware has enough warps to hide that memory latency at small batch. This
+// is the reference (DeepGEMM/SGLang) "adaptive occupancy at small batch" fix.
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -45,7 +58,6 @@
 
 #define NVBLK_SUPER_ELEMENTS 32
 #define NVBLK_SUPER_BYTES    20
-#define GEMM_MAX_M   16
 #define GEMM_X_TILE  256   // 8 supers
 
 namespace {
@@ -65,20 +77,18 @@ __device__ __forceinline__ float warpReduceSum(float v) {
     return v;
 }
 
-} // namespace
-
-extern "C" __global__ __launch_bounds__(MATMUL_NVBLK_GEMM_LOCAL)
-void moe_grouped_gemm_nvfp4blk(
+template <int MAX_M>
+__device__ __forceinline__ void grouped_gemm_nvfp4blk_core(
     const float*         __restrict__ X,           // [R, K]  compacted activations
     const unsigned char* __restrict__ W,           // [nExperts, N, K] blocked NVFP4
           float*         __restrict__ Y,           // [R, N]  grouped output
     const int*           __restrict__ tileExpert,  // [maxTiles] expert id / -1
     const int*           __restrict__ tileRow0,    // [maxTiles] start row
-    const int*           __restrict__ tileRows,    // [maxTiles] row count (1..GEMM_MAX_M)
+    const int*           __restrict__ tileRows,    // [maxTiles] row count (1..MAX_M)
     const int                          K,
     const int                          N)
 {
-    __shared__ float xTile[GEMM_MAX_M * GEMM_X_TILE];
+    __shared__ float xTile[MAX_M * GEMM_X_TILE];
 
     const int tt = blockIdx.y;                     // tile index into the schedule
     const int e  = tileExpert[tt];
@@ -87,8 +97,8 @@ void moe_grouped_gemm_nvfp4blk(
     }
     const int row0 = tileRow0[tt];
     int M          = tileRows[tt];
-    if (M > GEMM_MAX_M) {
-        M = GEMM_MAX_M;                            // defensive; schedule caps at tileM
+    if (M > MAX_M) {
+        M = MAX_M;                                 // defensive; schedule caps at tileM
     }
 
     const int tid    = threadIdx.x;
@@ -107,9 +117,9 @@ void moe_grouped_gemm_nvfp4blk(
     const float* __restrict__ Xt = X + static_cast<size_t>(row0) * K;
     float*       __restrict__ Yt = Y + static_cast<size_t>(row0) * N;
 
-    float acc[GEMM_MAX_M];
+    float acc[MAX_M];
 #pragma unroll
-    for (int m = 0; m < GEMM_MAX_M; ++m) acc[m] = 0.0f;
+    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
 
     for (int tile = 0; tile < K; tile += GEMM_X_TILE) {
         const int tileK = min(GEMM_X_TILE, K - tile);
@@ -150,4 +160,29 @@ void moe_grouped_gemm_nvfp4blk(
             Yt[static_cast<size_t>(m) * N + n] = s;
         }
     }
+}
+
+} // namespace
+
+// M16 — prefill / large-M grouped GEMM (16 KB shared, acc[16]).
+extern "C" __global__ __launch_bounds__(MATMUL_NVBLK_GEMM_LOCAL)
+void moe_grouped_gemm_nvfp4blk(
+    const float* __restrict__ X, const unsigned char* __restrict__ W,
+    float* __restrict__ Y, const int* __restrict__ tileExpert,
+    const int* __restrict__ tileRow0, const int* __restrict__ tileRows,
+    const int K, const int N)
+{
+    grouped_gemm_nvfp4blk_core<16>(X, W, Y, tileExpert, tileRow0, tileRows, K, N);
+}
+
+// M4 — decode small-M grouped GEMM (4 KB shared, acc[4]); lifts the shared- and
+// register-occupancy limits ncu flagged on the M16 kernel at decode-M.
+extern "C" __global__ __launch_bounds__(MATMUL_NVBLK_GEMM_LOCAL)
+void moe_grouped_gemm_nvfp4blk_m4(
+    const float* __restrict__ X, const unsigned char* __restrict__ W,
+    float* __restrict__ Y, const int* __restrict__ tileExpert,
+    const int* __restrict__ tileRow0, const int* __restrict__ tileRows,
+    const int K, const int N)
+{
+    grouped_gemm_nvfp4blk_core<4>(X, W, Y, tileExpert, tileRow0, tileRows, K, N);
 }

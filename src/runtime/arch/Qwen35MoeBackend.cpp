@@ -1528,7 +1528,11 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         // No expOffset D2H, no per-expert host loop — nothing crosses to the
         // host, so the stream is never drained mid-layer (the killer that
         // made the host-driven path lose to fused-K on GB10).
-        const std::size_t tileM    = 16;                 // == GEMM_MAX_M
+        // GD-b: decode (preferBlocked) uses tileM=4 + the small-M kernel so the
+        // GEMM's shared/register footprint drops and SM occupancy rises (decode
+        // M is ~1-2 rows/expert). Prefill keeps tileM=16.
+        const std::size_t tileM    = preferBlocked ? 4 : 16;
+        const bool        smallM   = preferBlocked;
         const std::size_t maxTiles = (R + tileM - 1) / tileM + nExperts;
         auto* const tileExpert = s.moeGroupTileExpert.as<std::int32_t>();
         auto* const tileRow0   = s.moeGroupTileRow0.as<std::int32_t>();
@@ -1548,15 +1552,15 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         // gate/up: weight [nExperts][n_ff_exp][d_model] (N=n_ff_exp, K=d_model)
         _ops.moeGroupedGemmNvfp4Async(xComp, gateBase, gateComp,
                                       tileExpert, tileRow0, tileRows,
-                                      d_model, n_ff_exp, maxTiles);
+                                      d_model, n_ff_exp, maxTiles, smallM);
         _ops.moeGroupedGemmNvfp4Async(xComp, upBase, upComp,
                                       tileExpert, tileRow0, tileRows,
-                                      d_model, n_ff_exp, maxTiles);
+                                      d_model, n_ff_exp, maxTiles, smallM);
         _ops.siluMulAsync(gateComp, upComp, R * n_ff_exp);      // silu(gate)*up
         // down: weight [nExperts][d_model][n_ff_exp] (N=d_model, K=n_ff_exp)
         _ops.moeGroupedGemmNvfp4Async(gateComp, downBase, downComp,
                                       tileExpert, tileRow0, tileRows,
-                                      n_ff_exp, d_model, maxTiles);
+                                      n_ff_exp, d_model, maxTiles, smallM);
     } else {
         // --- Option 1: host-driven grouped (correct but slower on GB10) ----
         // The per-expert launch bounds are the only thing that must cross to

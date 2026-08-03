@@ -157,9 +157,11 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         b.moeGroupAsnRow = ops.allocate(nRowsMax * sizeof(std::int32_t));
 
         // M-Cuda.MoeGroup Sub-Step E — tile-schedule scratch. Static upper
-        // bound maxTiles = ceil(nRowsMax/16) + nExperts (16 == the grouped
-        // GEMM's per-block M cap), so the grouped-GEMM grid.y is host-sized.
-        constexpr std::size_t kMoeTileM = 16;
+        // bound maxTiles = ceil(nRowsMax/kMoeTileM) + nExperts, so the grouped-
+        // GEMM grid.y is host-sized. GD-b: decode uses tileM=4 (small-M kernel),
+        // which produces more tiles than prefill's tileM=16 — size the arrays
+        // for the smallest tileM so both fit.
+        constexpr std::size_t kMoeTileM = 4;
         const std::size_t maxTiles =
             (nRowsMax + kMoeTileM - 1) / kMoeTileM + config.expertCount;
         b.moeGroupTileExpert = ops.allocate(maxTiles * sizeof(std::int32_t));

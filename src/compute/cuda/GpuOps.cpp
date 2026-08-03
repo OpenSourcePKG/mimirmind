@@ -258,6 +258,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _moeGroupTilesKernel;
     core::cuda::CudaModule _moeGroupedGemmNvfp4Module;
     core::cuda::CudaKernel _moeGroupedGemmNvfp4Kernel;
+    // GD-b: decode small-M variant (acc[4] + 4 KB shared) from the same module.
+    core::cuda::CudaKernel _moeGroupedGemmNvfp4M4Kernel;
     // E-d.4b: padding infra (one module, four kernels) + act-quant.
     core::cuda::CudaModule _moePadModule;
     core::cuda::CudaKernel _moePadOffsetsKernel;
@@ -433,6 +435,8 @@ struct GpuOps::Impl {
               loadCudaModule(ctx, "moe_grouped_gemm_nvfp4blk")},
           _moeGroupedGemmNvfp4Kernel{
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk")},
+          _moeGroupedGemmNvfp4M4Kernel{
+              _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m4")},
           _moePadModule            {loadCudaModule(ctx, "moe_pad")},
           _moePadOffsetsKernel     {_moePadModule.getFunction("moe_pad_offsets")},
           _moeContigToPadKernel    {_moePadModule.getFunction("moe_contig_to_pad")},
@@ -1498,7 +1502,7 @@ void GpuOps::moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
                                       const std::int32_t* tileRow0,
                                       const std::int32_t* tileRows,
                                       std::size_t K, std::size_t N,
-                                      std::size_t maxTiles) {
+                                      std::size_t maxTiles, bool decodeSmallM) {
     if (N == 0 || K == 0 || maxTiles == 0) {
         return;
     }
@@ -1508,7 +1512,11 @@ void GpuOps::moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
     constexpr std::uint32_t kLocal           = 128;
     const std::uint32_t nGroups = static_cast<std::uint32_t>(
         (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
-    auto& k = _pimpl->_moeGroupedGemmNvfp4Kernel;
+    // GD-b: decode uses the small-M (MAX_M=4) kernel — the schedule caps decode
+    // tiles at tileM=4, and the smaller shared/register footprint lets the SM
+    // run enough warps to hide the memory latency that bottlenecks decode-M.
+    auto& k = decodeSmallM ? _pimpl->_moeGroupedGemmNvfp4M4Kernel
+                           : _pimpl->_moeGroupedGemmNvfp4Kernel;
     k.setPtr  (0, x);
     k.setPtr  (1, w);
     k.setPtr  (2, y);
