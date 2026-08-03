@@ -1080,6 +1080,74 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             return 0;
         }
 
+        // M-Cuda.MTP re-test — MTP-at-serving-scale THROUGHPUT. Times batched
+        // native MTP (generateBatchMtp) vs plain batched decode (generateBatch)
+        // at nSeq {16,32,64}, depth K. The Increment-E "net-loss" verdict was
+        // measured at nSeq16; this checks whether a larger batch amortises the
+        // MTP verify (esp. the GDN K+1 sequential passes) and flips it to a win.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_MTP_PERF") != nullptr) {
+            if (!e->mtpAvailable()) {
+                std::cout << "\n[MTP-PERF] model has no nextn head — skipped\n";
+                std::cout.flush();
+                return 0;
+            }
+            using clk = std::chrono::steady_clock;
+            const auto& tok = e->tokenizer();
+            const char* promptEnv = std::getenv("MIMIRMIND_MTP_PROMPT");
+            std::vector<std::int32_t> pids = tok.encode(
+                promptEnv != nullptr
+                    ? promptEnv
+                    : "The history of artificial intelligence began when",
+                /*addBos=*/false);
+            if (pids.empty()) pids.push_back(1);
+            std::size_t K = 3;
+            if (const char* dv = std::getenv("MIMIRMIND_MTP_DEPTH")) {
+                const long v = std::strtol(dv, nullptr, 10);
+                if (v >= 1) K = static_cast<std::size_t>(v);
+            }
+            std::size_t maxNew = 128;
+            if (const char* mv = std::getenv("MIMIRMIND_MTP_MAXNEW")) {
+                const long v = std::strtol(mv, nullptr, 10);
+                if (v >= 1) maxNew = static_cast<std::size_t>(v);
+            }
+            // Single-session accept-rate for context (drafted/accepted).
+            std::size_t drafted = 0, accepted = 0;
+            (void)e->generateMtp(pids, maxNew, K, tok.eosId(), &drafted, &accepted);
+            const double acc =
+                drafted > 0 ? static_cast<double>(accepted) / drafted : 0.0;
+            std::cout << "\n[MTP-PERF] depth=" << K << " maxNew=" << maxNew
+                      << " promptTokens=" << pids.size()
+                      << " single-session accept=" << acc << " (" << accepted
+                      << "/" << drafted << ")\n";
+            auto genCount = [](const std::vector<std::vector<std::int32_t>>& o) {
+                std::size_t n = 0;
+                for (const auto& s : o) n += s.size();
+                return n;
+            };
+            for (std::size_t N : {std::size_t{16}, std::size_t{32}, std::size_t{64}}) {
+                std::vector<std::vector<std::int32_t>> prompts(N, pids);
+                (void)e->generateBatchMtp(pids, N, 4, K, tok.eosId());   // warm
+                (void)e->generateBatch(prompts, 4, /*eosId=*/-1);        // warm
+                const auto m0 = clk::now();
+                const auto mout = e->generateBatchMtp(pids, N, maxNew, K, tok.eosId());
+                const auto m1 = clk::now();
+                const auto p0 = clk::now();
+                const auto pout = e->generateBatch(prompts, maxNew, /*eosId=*/-1);
+                const auto p1 = clk::now();
+                const double mtpS = std::chrono::duration<double>(m1 - m0).count();
+                const double plnS = std::chrono::duration<double>(p1 - p0).count();
+                const double mtpTps = static_cast<double>(genCount(mout)) / mtpS;
+                const double plnTps = static_cast<double>(genCount(pout)) / plnS;
+                std::cout << "  nSeq=" << N << "  plain=" << plnTps << " tok/s ("
+                          << plnS << "s)  MTP=" << mtpTps << " tok/s (" << mtpS
+                          << "s)  ratio=" << (plnTps > 0 ? mtpTps / plnTps : 0.0)
+                          << "x\n";
+                std::cout.flush();
+            }
+            return 0;
+        }
+
         // M-Cuda.MTP Increment E4 — heterogeneous batched MTP parity gate.
         // generateBatchMtpMulti over DIFFERENT prompts (different content and
         // length, slots diverging in position + finishing independently) MUST
