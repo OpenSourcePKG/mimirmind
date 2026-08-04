@@ -507,6 +507,7 @@ ServingSettings parseServing(std::string_view      path,
     checkKnownKeys(path, "serving", j,
                    {"enableBatching", "minBatchForEnable",
                     "tokenBudget", "maxActiveRequests",
+                    "maxActiveRequestsPerTenant",
                     "preemptFreeBlockThreshold", "blockSize"});
     ServingSettings s{};
     s.enableBatching = parseTriState(path, "serving", j, "enableBatching",
@@ -534,6 +535,17 @@ ServingSettings parseServing(std::string_view      path,
                        "(got " + std::to_string(*v) + ")");
         }
         s.maxActiveRequests = *v;
+    }
+    if (const auto v = readOpt<std::size_t>(path, "serving", j,
+                                            "maxActiveRequestsPerTenant"); v) {
+        // 0 = off; otherwise cap one tenant's concurrent share. Upper bound
+        // matches maxActiveRequests' 256 ceiling (a per-tenant cap above the
+        // global pool is harmless but pointless).
+        if (*v > 256) {
+            fail(path, "serving.maxActiveRequestsPerTenant must be in 0..256 "
+                       "(got " + std::to_string(*v) + ")");
+        }
+        s.maxActiveRequestsPerTenant = *v;
     }
     if (const auto v = readOpt<double>(path, "serving", j,
                                        "preemptFreeBlockThreshold"); v) {

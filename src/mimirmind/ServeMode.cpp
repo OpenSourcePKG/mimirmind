@@ -2150,17 +2150,23 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         // Total accepted-but-unfinished cap (running + queued). Beyond it the
         // batcher sheds load with a 503 instead of an unbounded queue.
         const std::size_t maxInflight = cfg.serving.maxActiveRequests;
+        // Per-tenant fairness cap (0 = off). Keeps one API-key tenant from
+        // eating the whole maxInflight budget and starving co-tenants.
+        const std::size_t maxInflightPerTenant =
+            cfg.serving.maxActiveRequestsPerTenant;
         try {
             batcher = std::make_unique<
                 ::mimirmind::runtime::serving::ContinuousBatcher>(
                 engine, maxBatch, maxContext, engine.tokenizer().eosId(),
-                maxInflight);
+                maxInflight, maxInflightPerTenant);
             scfg.batcher = batcher.get();
             MM_LOG_INFO("main",
                         "serve: continuous batcher ENABLED for default engine "
-                        "'{}' (maxBatch={} maxContext={} maxInflight={})",
+                        "'{}' (maxBatch={} maxContext={} maxInflight={} "
+                        "maxInflightPerTenant={})",
                         defaultId, maxBatch, maxContext,
-                        batcher->maxInflight());
+                        batcher->maxInflight(),
+                        batcher->maxInflightPerTenant());
         } catch (const std::exception& e) {
             MM_LOG_WARN("main",
                         "serve: continuous batcher init failed ({}); falling "

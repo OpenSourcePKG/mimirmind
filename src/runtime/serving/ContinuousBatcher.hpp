@@ -11,6 +11,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -30,6 +31,17 @@ struct ServingOverloadedError : std::runtime_error {
 };
 
 /**
+ * Thrown (via `ServingRequest::tenantQuotaExceeded`) when the batcher rejects a
+ * submit because the requesting tenant already holds its per-tenant in-flight
+ * quota — while the server as a whole may still have spare capacity. Distinct
+ * from `ServingOverloadedError` so the HTTP layer can map it to 429 (rate limit
+ * scoped to the caller) rather than 503 (whole-server overload).
+ */
+struct ServingTenantQuotaError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+/**
  * A single in-flight serving request. Shared between the submitting HTTP
  * thread and the batcher worker: the worker appends generated token ids
  * under `mtx` and signals `cv`; the HTTP thread waits on `cv` to block for
@@ -44,7 +56,12 @@ struct ServingRequest {
     bool                     done{false};
     bool                     cancelled{false};
     bool                     overloaded{false};  // rejected: in-flight bound hit
+    bool                     tenantQuotaExceeded{false}; // rejected: per-tenant cap
     std::string              error;      // non-empty => request failed
+    // Owning tenant label (API-key tenantId; empty when auth is off). Set at
+    // submit() and immutable thereafter, so the worker and the per-tenant
+    // admission scan can read it without extra synchronisation beyond `_mtx`.
+    std::string              tenantId;
 
     /// Block until the request completes; returns the full token stream.
     /// On failure the stream may be partial and `error` is set.
@@ -85,9 +102,18 @@ public:
     /// `ServingRequest::overloaded` so the HTTP layer sheds load with a 503
     /// instead of growing an unbounded queue. Clamped up to `maxBatch` so the
     /// bound can never sit below the running capacity.
+    /// `maxInflightPerTenant` optionally caps the accepted-but-unfinished
+    /// requests a SINGLE tenant (API-key `tenantId`) may hold at once, so no
+    /// one caller can monopolise the whole `maxInflight` budget and starve
+    /// co-tenants. 0 disables per-tenant limiting (any tenant may use the whole
+    /// global budget). Requests with an empty tenant label (auth off) are never
+    /// per-tenant limited. A submit over the per-tenant cap is rejected via
+    /// `ServingRequest::tenantQuotaExceeded` (HTTP 429), distinct from the
+    /// whole-server overload (HTTP 503).
     ContinuousBatcher(InferenceEngine& engine, std::size_t maxBatch,
                       std::size_t maxContext, std::int32_t eosId,
-                      std::size_t maxInflight);
+                      std::size_t maxInflight,
+                      std::size_t maxInflightPerTenant = 0);
     ~ContinuousBatcher();
 
     ContinuousBatcher(const ContinuousBatcher&)            = delete;
@@ -99,9 +125,14 @@ public:
     /// generated tokens; `stopIds` are extra single-token stops (checked in
     /// addition to the ctor eosId). Returns immediately with a handle the
     /// caller waits/streams on. Thread-safe.
+    /// `tenantId` is the owning API-key tenant (empty when auth is off); it
+    /// feeds the optional per-tenant admission cap and is stored on the returned
+    /// handle. A per-tenant-quota rejection sets `tenantQuotaExceeded` on the
+    /// handle (mapped to 429) rather than `overloaded` (503).
     std::shared_ptr<ServingRequest> submit(std::vector<std::int32_t> prompt,
                                            std::size_t               maxNew,
-                                           std::vector<std::int32_t> stopIds);
+                                           std::vector<std::int32_t> stopIds,
+                                           std::string               tenantId = {});
 
     /// Request early termination (e.g. the streaming client disconnected).
     /// The worker retires the request at the next iteration and frees its
@@ -111,6 +142,9 @@ public:
     [[nodiscard]] std::size_t maxBatch()   const noexcept { return _maxBatch; }
     [[nodiscard]] std::size_t maxContext() const noexcept { return _maxContext; }
     [[nodiscard]] std::size_t maxInflight() const noexcept { return _maxInflight; }
+    [[nodiscard]] std::size_t maxInflightPerTenant() const noexcept {
+        return _maxInflightPerTenant;
+    }
 
     /// Current accepted-but-unfinished requests (running slots + waiting).
     /// Thread-safe. A cheap pre-admission proxy for the HTTP layer to shed a
@@ -118,6 +152,17 @@ public:
     /// `submit()` remains the authoritative hard cap.
     [[nodiscard]] std::size_t inflight() const;
     [[nodiscard]] bool        atCapacity() const { return inflight() >= _maxInflight; }
+
+    /// Accepted-but-unfinished requests currently owned by `tenantId` (running
+    /// slots + waiting queue). Thread-safe. Returns 0 for an empty tenant label.
+    [[nodiscard]] std::size_t inflightForTenant(std::string_view tenantId) const;
+
+    /// Cheap pre-admission proxy mirroring `atCapacity()` but scoped to one
+    /// tenant, so the HTTP layer can shed a per-tenant-quota request with a
+    /// clean 429 before committing to an SSE body. Always false when per-tenant
+    /// limiting is disabled (`_maxInflightPerTenant == 0`) or the tenant label
+    /// is empty; `submit()` remains the authoritative hard cap for the race.
+    [[nodiscard]] bool atCapacityForTenant(std::string_view tenantId) const;
 
 private:
     struct Pending {
@@ -142,6 +187,10 @@ private:
     void workerLoop();
     [[nodiscard]] bool isStop(std::int32_t tok, const Slot& s) const;
 
+    /// Count `tenantId`'s accepted-but-unfinished requests (waiting queue +
+    /// occupied slots). Caller MUST hold `_mtx`. Returns 0 for an empty label.
+    [[nodiscard]] std::size_t countTenantLocked(std::string_view tenantId) const;
+
     /// Increment A — prefill a just-admitted slot's whole prompt as chunked
     /// T>1 forwards (see InferenceEngine::prefillSlot), then move it into
     /// decode state at pos == promptLen with its first generated token
@@ -154,6 +203,8 @@ private:
     std::size_t      _maxContext;
     std::int32_t     _eosId;
     std::size_t      _maxInflight;
+    // Per-tenant accepted-but-unfinished cap; 0 => per-tenant limiting off.
+    std::size_t      _maxInflightPerTenant;
     // Chunked-prefill chunk size C (InferenceEngine::servingPrefillChunk());
     // 0 => disabled, prompts ingest token-by-token via the decode loop.
     std::size_t      _prefillChunk{0};

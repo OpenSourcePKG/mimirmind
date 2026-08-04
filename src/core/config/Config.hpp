@@ -283,6 +283,18 @@ struct ServingSettings {
     // realistic Spark load at 200-500 tok/s. Range 1..256.
     std::size_t     maxActiveRequests{32};
 
+    // Per-tenant slice of the accepted-but-unfinished budget: the most
+    // concurrent (running + queued) requests a SINGLE API-key tenant may
+    // hold at once in the ContinuousBatcher. Stops one caller from
+    // monopolising the whole `maxActiveRequests` pool and starving
+    // co-tenants under load; a submit past it is shed with a 429 (tenant
+    // quota) rather than a 503 (whole-server overload). Only meaningful
+    // when auth is enabled (tenant = key `tenantId`); requests with an
+    // empty tenant label (auth off) are never per-tenant limited and share
+    // one bucket. 0 = off (default) so single-tenant / Pegenaut deployments
+    // keep the full budget and see no behaviour change. Range 0..256.
+    std::size_t     maxActiveRequestsPerTenant{0};
+
     // Paged-KV free-block ratio below which the preemption policy
     // triggers `RequestScheduler::preemptOne()`. Drives
     // `PreemptionPolicy::freeBlockThreshold`. 0.05 = 5% headroom

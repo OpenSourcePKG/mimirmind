@@ -14,6 +14,7 @@
 #include "model/ToolCallParser.hpp"
 #include "model/Tokenizer.hpp"
 #include "core/log/Log.hpp"
+#include "core/security/ScopedTenant.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
 #include "runtime/spec/SpeculativeDecoder.hpp"
 #include "runtime/thermal/ThermalGuard.hpp"
@@ -48,9 +49,10 @@ std::vector<std::int32_t> runViaBatcher(
         std::vector<std::int32_t>                 promptIds,
         const runtime::GenerateParams&            params,
         std::vector<std::int32_t>                 stopIds,
+        std::string                               tenantId,
         const std::function<bool(std::int32_t)>&  onToken) {
     auto req = batcher.submit(std::move(promptIds), params.maxNewTokens,
-                              std::move(stopIds));
+                              std::move(stopIds), std::move(tenantId));
     std::vector<std::int32_t> out;
     std::size_t  next = 0;
     std::int32_t t    = 0;
@@ -64,6 +66,12 @@ std::vector<std::int32_t> runViaBatcher(
         batcher.cancel(req);
     }
     if (!req->error.empty()) {
+        // Per-tenant quota is checked before the whole-server overload: both
+        // set `error`, but a quota rejection is the caller's own fault (429),
+        // not server saturation (503).
+        if (req->tenantQuotaExceeded) {
+            throw runtime::serving::ServingTenantQuotaError(req->error);
+        }
         if (req->overloaded) {
             throw runtime::serving::ServingOverloadedError(req->error);
         }
@@ -296,6 +304,27 @@ void ChatCompletionHandler::handle(const httplib::Request& req,
         return;
     }
 
+    // Per-tenant fairness pre-check — like the global shed above, ship a clean
+    // 429 as plain JSON before committing to an SSE body when the authenticated
+    // tenant is already at its concurrent quota (submit() re-checks
+    // authoritatively for the narrow check-then-submit race). No-op when
+    // per-tenant limiting is off or auth is disabled (empty tenant label).
+    if (_cfg.batcher != nullptr) {
+        const std::string& tenant = core::security::ScopedTenant::active();
+        if (_cfg.batcher->atCapacityForTenant(tenant)) {
+            MM_LOG_WARN("server",
+                        "tenant '{}' at quota ({}/{} in flight) — shedding "
+                        "with 429",
+                        tenant, _cfg.batcher->inflightForTenant(tenant),
+                        _cfg.batcher->maxInflightPerTenant());
+            res.set_header("Retry-After", "1");
+            sendError(res, 429, "rate_limit_exceeded",
+                      "tenant quota exceeded: too many concurrent requests "
+                      "for this API key");
+            return;
+        }
+    }
+
     if (cr.stream) {
         handleStream(cr, res);
     } else {
@@ -358,7 +387,14 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     if (useBatcher) {
         try {
             generated = runViaBatcher(*_cfg.batcher, promptIds, params,
-                                      stopIds, onToken);
+                                      stopIds,
+                                      core::security::ScopedTenant::active(),
+                                      onToken);
+        } catch (const runtime::serving::ServingTenantQuotaError& e) {
+            // Per-tenant fairness shed, not a bug: retryable 429.
+            res.set_header("Retry-After", "1");
+            sendError(res, 429, "rate_limit_exceeded", e.what());
+            return;
         } catch (const runtime::serving::ServingOverloadedError& e) {
             // Load shedding, not a bug: retryable 503.
             res.set_header("Retry-After", "1");
@@ -594,6 +630,11 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
         std::string                   respId;
         std::int64_t                  created{};
         std::string                   echoModel;
+        // Owning tenant, snapshotted on the request thread: the chunked
+        // content-provider that submits to the batcher may be invoked on a
+        // different pool thread where the thread_local ScopedTenant no longer
+        // holds this request's label.
+        std::string                   tenantId;
         // Buffers a trailing incomplete UTF-8 codepoint between tokens
         // so SSE deltas always carry valid UTF-8.
         std::string                   utf8Pending;
@@ -621,6 +662,7 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
     state->respId    = respId;
     state->created   = created;
     state->echoModel = echoModel;
+    state->tenantId  = core::security::ScopedTenant::active();
 
     res.set_chunked_content_provider(
         "text/event-stream",
@@ -796,7 +838,8 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                 try {
                     generated = runViaBatcher(*this->_cfg.batcher,
                                               state->promptIds, state->params,
-                                              state->stopIds, onToken);
+                                              state->stopIds, state->tenantId,
+                                              onToken);
                 } catch (const std::exception& e) {
                     errorMessage = e.what();
                 }
