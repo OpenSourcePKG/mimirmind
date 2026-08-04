@@ -1,24 +1,23 @@
-# docker-compose.server.yml — Dev-Test gegen ein vorab gebautes Image.
+# docker-compose.server.yml — run a prebuilt image (no local build).
 #
-# Im Gegensatz zu docker-compose.yml wird hier nichts lokal gebaut; das
-# Image kommt aus ${MIMIRMIND_IMAGE:-mimirmind:latest}. Setze
-# MIMIRMIND_IMAGE, wenn Du aus einer eigenen Registry ziehen willst
-# (z.B. `your-registry.example/mimirmind:sha-abcd123`). Logs landen
-# sowohl auf stdout (via tty) als auch in ./run-logs/run.log auf dem
-# Host (der Log-Path steht in der config.json unter server.log.file).
+# Unlike docker-compose.yml, nothing is built here; the image comes from
+# ${MIMIRMIND_IMAGE:-mimirmind:latest}. Set MIMIRMIND_IMAGE to pull from
+# your own registry (e.g. `your-registry.example/mimirmind:sha-abcd123`).
+# Logs go both to stdout (via tty) and to ./run-logs/run.log on the host
+# (the log path is set in config.json under server.log.file).
 #
-# Voraussetzungen:
-#   - GGUFs liegen unter ${MIMIRMIND_MODELS_DIR} (default: ./models)
-#   - Intel iGPU/dGPU unter /dev/dri verfügbar
-#   - Host-config unter ${MIMIRMIND_CONFIG_HOST} (default ./config.json)
-#     — Copy-Vorlage: `cp config.example.json config.json` und für den
-#     Host tunen. Enthält alle Runtime-, Feature-, Governor-, Thermal-
-#     und Diagnostics-Knöpfe (was früher MIMIRMIND_*-env-Vars waren).
-#   - LXC-Layer reicht /sys/devices/virtual/powercap durch (für RAPL),
-#     wenn dieser Container in einem Proxmox-CT läuft:
+# Prerequisites:
+#   - GGUFs live under ${MIMIRMIND_MODELS_DIR} (default: ./models)
+#   - Intel iGPU/dGPU available at /dev/dri
+#   - Host config at ${MIMIRMIND_CONFIG_HOST} (default ./config.json)
+#     — copy template: `cp config.example.json config.json` and tune it for
+#     the host. Holds all runtime, feature, governor, thermal, diagnostics,
+#     and now server.tls / server.auth / server.metrics knobs.
+#   - The LXC layer passes /sys/devices/virtual/powercap through (for RAPL)
+#     when this container runs inside a Proxmox CT:
 #       lxc.mount.entry: /sys/devices/virtual/powercap sys/devices/virtual/powercap none bind,ro,create=dir 0 0
 #
-# Gemeinsame Env-Variablen (Compose-Steuerung, NICHT Runtime-Knöpfe):
+# Compose-control env vars (NOT runtime knobs):
 #
 #   export MIMIRMIND_MODELS_DIR=/srv/llm-models
 #   export MIMIRMIND_CONFIG_HOST=/etc/mimirmind/config.json
@@ -26,46 +25,61 @@
 #   export MIMIRMIND_VIDEO_GID=$(getent group video  | cut -d: -f3)
 #   export MIMIRMIND_PORT=8080
 #
-# Standard-Command in diesem File ist `serve` (Production-Pfad). Smoke
-# muss man explizit anstoßen — siehe unten.
+# The default command in this file is `serve` (the production path). Smoke
+# has to be triggered explicitly — see below.
 #
-# ── Serve-Workflow (M7d/M7e OpenAI HTTP-API) ──────────────────────────────
+# ── Security defaults (secure-by-default) ─────────────────────────────────
+#
+# The server is HTTPS + auth ON out of the box (config server.tls.enabled
+# and server.auth.enabled default to true; set them false to opt out):
+#   - TLS terminates in-process. With no cert/key configured the server
+#     mints a self-signed cert on first boot — clients use `curl -k` or
+#     trust it explicitly. Provide server.tls.certFile+keyFile for a real one.
+#   - Every route requires `Authorization: Bearer <key>`. With no key
+#     configured the server generates one on first boot and logs it once,
+#     in full; it is also saved to <config-dir>/mimir-apikeys.txt. The
+#     auto-generated key is an admin key.
+#
+# ── Serve workflow (M7d/M7e OpenAI HTTP API) ──────────────────────────────
 #
 #   docker compose -f docker-compose.server.yml up                  # foreground
 #   docker compose -f docker-compose.server.yml up -d               # daemon
 #
-# Endpoints am Host auf Port ${MIMIRMIND_PORT:-8080}:
+# Endpoints on the host at port ${MIMIRMIND_PORT:-8080} (HTTPS):
 #   GET  /health
 #   GET  /v1/models
-#   POST /v1/chat/completions   (auch mit stream:true)
+#   POST /v1/chat/completions   (also with stream:true)
+#   GET  /v1/admin/tenants      (admin key only — per-tenant usage JSON)
+#   GET  /metrics               (admin key only — OpenMetrics/Prometheus)
 #
-#   curl -N http://localhost:8080/v1/chat/completions \
+#   curl -k -N https://localhost:8080/v1/chat/completions \
+#     -H 'Authorization: Bearer <your-key>' \
 #     -H 'Content-Type: application/json' \
 #     -d '{"messages":[{"role":"user","content":"Hi!"}],"stream":true}'
 #
-# ── Smoke-Workflow (M1-M5 Diagnostics + ein 20-Token-Generate) ────────────
+# ── Smoke workflow (M1-M5 diagnostics + a 20-token generate) ──────────────
 #
-# Smoke überschreibt das default-`command` durch Argv hinter dem Service-Namen:
+# Smoke overrides the default `command` via argv after the service name:
 #
 #   docker compose -f docker-compose.server.yml pull
-#   rm -f ./run-logs/run.log                                    # frischer Log
+#   rm -f ./run-logs/run.log                                    # fresh log
 #   docker compose -f docker-compose.server.yml run --rm mimirmind smoke 2>&1 \
 #       | tee ./run-logs/stdout.log
 #
-# Mit Chat-Template (M7c) und/oder Sampling (M7b):
+# With a chat template (M7c) and/or sampling (M7b):
 #
 #   docker compose -f docker-compose.server.yml run --rm mimirmind \
-#       smoke --chat --prompt "Wer hat den Mond entdeckt?"
+#       smoke --chat --prompt "Who discovered the moon?"
 #   docker compose -f docker-compose.server.yml run --rm mimirmind \
 #       smoke --temperature 0.8 --top-p 0.95 --seed 42
 #
-# Logs in ./run-logs/run.log (strukturierter MM_LOG, Pfad aus config.json).
+# Logs in ./run-logs/run.log (structured MM_LOG, path from config.json).
 #
-# ── Migration hinweis (vor 2026-07-10) ────────────────────────────────────
+# ── Migration note (pre 2026-07-10) ───────────────────────────────────────
 #
-# Bis Commit 99924d3 lebten die Runtime-Knöpfe als MIMIRMIND_*-env-Vars
-# hier im environment: Block. Diese sind ersatzlos gestrichen — der
-# Ersatz ist config.json. Mapping-Tabelle:
+# Up to commit 99924d3 the runtime knobs lived as MIMIRMIND_* env vars in
+# the environment: block here. They were removed outright — the replacement
+# is config.json. Mapping table:
 #
 #   MIMIRMIND_MODEL_PATH             → models[<defaultModel>].path
 #   MIMIRMIND_LOG_LEVEL / _FILE      → server.log.level / server.log.file
@@ -85,7 +99,7 @@
 #   MIMIRMIND_DISABLE_DP4A           → features.dp4a: "disable"
 #   MIMIRMIND_FORCE_DP4A             → features.dp4a: "force"
 #   MIMIRMIND_SPEC_DEC / _N          → speculative.enabled / speculative.n
-#   MIMIRMIND_DRAFT_MODEL_PATH       → models[].path mit id "draft"
+#   MIMIRMIND_DRAFT_MODEL_PATH       → models[].path with id "draft"
 #                                       + speculative.draft="draft"
 #   MIMIRMIND_THERMAL_PROFILE        → governor.thermal (inline)
 #   MIMIRMIND_GPU_CLOCK_PIN          → governor.gpuClockPin
@@ -103,77 +117,78 @@ services:
 
     mimirmind:
         image: ${MIMIRMIND_IMAGE:-mimirmind:latest}
-        container_name: mimirmind-devtest
+        container_name: mimirmind
         pull_policy: always
 
-        # Default treibt den Serve-Modus, weil das der Production-Pfad ist.
-        # Smoke startet man explizit per `compose run --rm mimirmind smoke ...`
-        # — die Argv-Override hinter dem Service-Namen ersetzt dieses
-        # `command`. Der Pfad `/etc/mimirmind/config.json` kommt aus dem
-        # Bind-Mount weiter unten.
+        # Default is the serve mode, because that is the production path.
+        # Run smoke explicitly via `compose run --rm mimirmind smoke ...` —
+        # the argv override after the service name replaces this `command`.
+        # The path /etc/mimirmind/config.json comes from the bind mount below.
         command:
             - serve
             - --config
             - /etc/mimirmind/config.json
 
+        # Keep the server (and its restart) alive across host reboots on a
+        # long-running deploy. `run --rm ... smoke` ignores this.
+        restart: unless-stopped
+
         devices:
             - /dev/dri:/dev/dri
 
-        # GIDs müssen denen des Hosts entsprechen — sonst kein /dev/dri-
-        # Zugriff. Default 104/44 sind Ubuntu/Debian; per env überschreiben.
+        # GIDs must match the host's — otherwise no /dev/dri access. The
+        # defaults 104/44 are Ubuntu/Debian; override via env.
         group_add:
             - "${MIMIRMIND_RENDER_GID:-104}"
             - "${MIMIRMIND_VIDEO_GID:-44}"
 
-        # Hebt die Docker-Default-Maskierung von /sys/devices/virtual/powercap
-        # auf, damit der Engine die Intel-RAPL-Energy-Counters lesen kann.
-        # Ohne das melden /v1/system/status und die per-request usage einfach
-        # "power unavailable". Platypus-Side-Channel ist für eine LLM-
-        # Inferenz-Workload nicht relevant.
+        # Lift Docker's default masking of /sys/devices/virtual/powercap so
+        # the engine can read the Intel RAPL energy counters. Without it
+        # /v1/system/status, per-request usage, and /metrics energy_joules
+        # just report "power unavailable". A power side channel is not a
+        # concern for an LLM inference workload.
         security_opt:
             - systempaths=unconfined
 
-        # M7d/M7e — OpenAI-compatible HTTP API. Host-Port via
-        # MIMIRMIND_PORT env, Container-Port sollte config.json.server.port
-        # entsprechen (default 8080).
+        # M7d/M7e — OpenAI-compatible HTTPS API. Host port via MIMIRMIND_PORT;
+        # the container port must match config.json server.port (default 8080).
         ports:
             - "${MIMIRMIND_PORT:-8080}:8080"
 
         environment:
-            # Level Zero: 4-GiB-Cap aufheben (sonst sieht der Probe bei
-            # 4 GiB einen ze_RESULT_ERROR_OUT_OF_DEVICE_MEMORY). Das sind
-            # LZ-Loader-env-Vars, keine mimirmind-Runtime-Knöpfe.
+            # Level Zero: lift the 4-GiB cap (otherwise the probe hits a
+            # ze_RESULT_ERROR_OUT_OF_DEVICE_MEMORY at 4 GiB). These are
+            # LZ-loader env vars, not mimirmind runtime knobs.
             UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS: "1"
             UR_L0_USE_RELAXED_ALLOCATION_LIMITS:    "1"
 
         volumes:
             - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
             - ./run-logs:/logs:rw
-            # Perf-regression detector's rolling baseline. Persists
-            # across container restarts so the trailing-7d p50 does not
-            # rebuild from scratch every deploy. Without this mount the
-            # detector logs a "cannot open" warning on the first run and
-            # keeps running (in-memory only) — inference is unaffected,
-            # but a regression won't be catchable until enough runs have
-            # accumulated in the fresh container.
+            # Persists across restarts:
+            #   - the perf-regression detector's rolling baseline (trailing
+            #     p50), so it is not rebuilt from scratch on every deploy;
+            #   - the per-tenant usage metrics store
+            #     (mimir-tenant-metrics.json) that backs /v1/admin/tenants
+            #     and /metrics, so counters survive a restart.
+            # Without this mount both fall back to in-memory only — inference
+            # is unaffected, but the baseline and metric totals reset.
             - ${MIMIRMIND_STATE_DIR:-./run-state}:/root/.cache/mimirmind:rw
-            # config.json — Single Source of Truth für alle Runtime-,
-            # Feature-, Governor- und Diagnostics-Knöpfe. Bind-Mount aus
-            # ${MIMIRMIND_CONFIG_HOST}. Falls die Host-Datei nicht
-            # existiert, weigert sich compose mit klarem "no such file".
+            # config.json — single source of truth for all runtime, feature,
+            # governor, diagnostics, TLS, auth, and metrics knobs. Bind mount
+            # from ${MIMIRMIND_CONFIG_HOST}. If the host file does not exist,
+            # compose refuses with a clear "no such file".
             - ${MIMIRMIND_CONFIG_HOST:-./config.json}:/etc/mimirmind/config.json:ro
-            # iGPU sysfs view (Symlinks für /sys/class/drm/cardN, rw für
-            # den dynamischen GPU-Clock-Governor).
+            # iGPU sysfs view (symlinks for /sys/class/drm/cardN; rw for the
+            # dynamic GPU clock governor).
             - /sys/class/drm:/sys/class/drm:rw
-            # Echtes Device-Verzeichnis hinter den Symlinks. Wir mounten
-            # den /sys/devices-Tree ganz, weil der spezifische PCI-Pfad
-            # (/sys/devices/pci0000:00/0000:00:02.0/drm) Doppelpunkte
-            # enthält und ältere `docker compose`-Versionen das selbst in
-            # der long-form als Short-Form-String an den Daemon
-            # serialisieren — der dann an den Colons stolpert. /sys/devices
-            # selbst ist colon-frei und parsed sauber.
+            # Real device directory behind the symlinks. We mount the whole
+            # /sys/devices tree because the specific PCI path
+            # (/sys/devices/pci0000:00/0000:00:02.0/drm) contains colons, and
+            # older `docker compose` versions serialize even the long form as
+            # a short-form string to the daemon — which then trips over the
+            # colons. /sys/devices itself is colon-free and parses cleanly.
             - /sys/devices:/sys/devices:rw
 
-        restart: "no"
         stdin_open: true
         tty: true
