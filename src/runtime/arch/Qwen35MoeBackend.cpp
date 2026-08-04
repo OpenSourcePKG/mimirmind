@@ -1432,10 +1432,14 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     // FP4-tensor-core grouped path: the routed experts are the NVFP4_TC format
     // (loader built the nibble + swizzled-SFB + globals banks) and CUTLASS is
     // linked. Type-driven, so it is the default whenever those banks exist.
-    // GD-a: preferBlocked (decode) forces the blocked branch — never TC, even
-    // though additive-default NVFP4_BLK experts carry TC sidecar pointers.
+    // Prefill (preferBlocked=false) always takes TC when the banks exist.
+    // GD-c: decode (preferBlocked=true) takes TC only when _moeGroupedDecodeTc
+    // is set — real-row act-quant makes it a net decode win (+28% @nSeq64,
+    // 2026-08-04 A/B), default-on. When the TC sidecar banks are absent
+    // (blocked-only =0 load) tcNibblePtr is null and decode falls through to
+    // the device-driven blocked branch below — never the host-driven loop.
     const bool tcGrouped =
-        !preferBlocked &&
+        (!preferBlocked || _moeGroupedDecodeTc) &&
         _ops.moeGroupedGemmNvfp4TcAvailable() &&
         gateExps.tcNibblePtr != nullptr &&
         upExps.tcNibblePtr   != nullptr &&
@@ -1813,9 +1817,10 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
                       static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
     if (_moeGroupedDecode) {
         // GD-a: expert-grouped decode — amortise routed expert-weight reads
-        // across the batch (blocked bank; preferBlocked forces the non-TC path).
+        // across the batch. preferBlocked=true marks this as decode; TC vs the
+        // device-driven blocked branch is chosen inside via _moeGroupedDecodeTc.
         runMoeFfnGrouped(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s,
-                         /*preferBlocked=*/!_moeGroupedDecodeTc);
+                         /*preferBlocked=*/true);
     } else {
         runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
     }
@@ -1962,9 +1967,10 @@ void Qwen35MoeBackend::runLinearBlockBatched(
                       static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
     if (_moeGroupedDecode) {
         // GD-a: expert-grouped decode — amortise routed expert-weight reads
-        // across the batch (blocked bank; preferBlocked forces the non-TC path).
+        // across the batch. preferBlocked=true marks this as decode; TC vs the
+        // device-driven blocked branch is chosen inside via _moeGroupedDecodeTc.
         runMoeFfnGrouped(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s,
-                         /*preferBlocked=*/!_moeGroupedDecodeTc);
+                         /*preferBlocked=*/true);
     } else {
         runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
     }
@@ -2130,7 +2136,7 @@ void Qwen35MoeBackend::runLinearBlockVerify(
                       static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
     if (_moeGroupedDecode) {
         runMoeFfnGrouped(blockIdx, normBuf, M, expIdxSlot, kwSlot, s,
-                         /*preferBlocked=*/!_moeGroupedDecodeTc);
+                         /*preferBlocked=*/true);
     } else {
         runMoeFfnBatched(blockIdx, normBuf, M, expIdxSlot, kwSlot, s);
     }

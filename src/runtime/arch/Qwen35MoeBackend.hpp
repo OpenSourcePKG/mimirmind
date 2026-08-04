@@ -378,10 +378,16 @@ private:
     // DEFAULT-ON 2026-08-03: +5% decode, greedy-bit-identical to fused-K (3/3
     // prompts), 0 memory cost. MIMIRMIND_GROUPED_MOE_DECODE=0 disables.
     bool _moeGroupedDecode{true};
-    // Opt-in (MIMIRMIND_GROUPED_MOE_DECODE_TC=1): route the *decode* routed-MoE
-    // through the FP4-tensor-core grouped GEMM instead of the blocked GD-b
-    // kernel. Requires the experts to carry TC sidecar banks (additive / =3
-    // load). W4A4 numerics — coherence-gated, off by default.
+    // GD-c: route the *decode* routed-MoE through the FP4-tensor-core grouped
+    // GEMM instead of the blocked GD-b kernel. Requires the experts to carry TC
+    // sidecar banks (additive-default / =3 load); with blocked-only (=0) banks
+    // absent, decode falls through to the device-driven blocked branch. W4A4
+    // numerics — coherence-gated. OPT-IN, DEFAULT-OFF: the isolated D2e batched
+    // -decode bench shows +28% @nSeq64 (short context), BUT the real HTTP
+    // serving aggregate (conc32/64, growing KV context, continuous batching) is
+    // ~3.5% SLOWER than device-driven blocked GD-b (99.3 vs 103; measured
+    // 2026-08-04) — the isolated win inverts under real serving, so blocked
+    // stays the serving default. Enable with MIMIRMIND_GROUPED_MOE_DECODE_TC=1.
     bool _moeGroupedDecodeTc{false};
     // Host mirror of the device expert-offset table (moe_group_build output),
     // read back once per grouped MoE layer to drive the per-expert launches
