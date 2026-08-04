@@ -292,14 +292,43 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             // (skip the single-seq baseline and the sweep) with a small maxNew,
             // so an ncu run reaches the target regime with few prior kernels.
             const char* nseqEnv = std::getenv("MIMIRMIND_BENCH_NSEQ");
-            const std::size_t maxNew    = quick ? 4 : (nseqEnv != nullptr ? 8 : 32);
+            // MIMIRMIND_BENCH_MAXNEW overrides the decode window (default 64
+            // in nseq mode so decode dominates over prefill for a clean
+            // gen-tok/s A/B); MIMIRMIND_BENCH_REPS repeats the sweep in-process
+            // for a same-load median. nseqEnv accepts a comma-separated list.
+            const char* maxNewEnv = std::getenv("MIMIRMIND_BENCH_MAXNEW");
+            const std::size_t maxNew =
+                quick ? 4
+                      : (maxNewEnv != nullptr
+                             ? static_cast<std::size_t>(std::max<long>(
+                                   1, std::strtol(maxNewEnv, nullptr, 10)))
+                             : (nseqEnv != nullptr ? 64 : 32));
+            const char* repsEnv = std::getenv("MIMIRMIND_BENCH_REPS");
+            const std::size_t reps = repsEnv != nullptr
+                ? static_cast<std::size_t>(std::max<long>(1, std::strtol(repsEnv, nullptr, 10)))
+                : 1;
             const std::size_t promptLen = base.size();
-            const std::vector<std::size_t> batchSizes =
-                nseqEnv != nullptr
-                    ? std::vector<std::size_t>{static_cast<std::size_t>(
-                          std::max<long>(1, std::strtol(nseqEnv, nullptr, 10)))}
-                    : quick ? std::vector<std::size_t>{1}
-                            : std::vector<std::size_t>{1, 4, 8, 16};
+            std::vector<std::size_t> batchSizes;
+            if (nseqEnv != nullptr) {
+                const std::string spec(nseqEnv);
+                std::size_t pos = 0;
+                while (pos < spec.size()) {
+                    std::size_t comma = spec.find(',', pos);
+                    const std::string tok2 =
+                        spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                    if (!tok2.empty()) {
+                        batchSizes.push_back(static_cast<std::size_t>(
+                            std::max<long>(1, std::strtol(tok2.c_str(), nullptr, 10))));
+                    }
+                    if (comma == std::string::npos) break;
+                    pos = comma + 1;
+                }
+                if (batchSizes.empty()) batchSizes.push_back(1);
+            } else if (quick) {
+                batchSizes = {1};
+            } else {
+                batchSizes = {1, 4, 8, 16};
+            }
             std::cout << "\n[M-Cuda.Batch D2e bench] promptLen=" << promptLen
                       << " maxNew=" << maxNew << "\n";
             // Single-session baseline on THIS box+model (apples-to-apples).
@@ -321,22 +350,22 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             }
             for (std::size_t nSeq : batchSizes) {
                 std::vector<std::vector<std::int32_t>> prompts(nSeq, base);
-                if (nSeq == 1) {
-                    (void)e->generateBatch(prompts, 2, -1);   // warm up
+                (void)e->generateBatch(prompts, 4, -1);   // warm up (all nSeq)
+                for (std::size_t rep = 0; rep < reps; ++rep) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    (void)e->generateBatch(prompts, maxNew, /*eosId=*/-1);
+                    const auto t1 = std::chrono::steady_clock::now();
+                    const double ms =
+                        std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    const std::size_t steps   = promptLen + maxNew;
+                    const std::size_t genToks = nSeq * maxNew;
+                    std::cout << "  nSeq=" << nSeq << "  rep=" << rep
+                              << "  total=" << ms << " ms  "
+                              << (ms / static_cast<double>(steps)) << " ms/step  "
+                              << (1000.0 * static_cast<double>(genToks) / ms)
+                              << " gen-tok/s\n";
+                    std::cout.flush();
                 }
-                const auto t0 = std::chrono::steady_clock::now();
-                (void)e->generateBatch(prompts, maxNew, /*eosId=*/-1);
-                const auto t1 = std::chrono::steady_clock::now();
-                const double ms =
-                    std::chrono::duration<double, std::milli>(t1 - t0).count();
-                const std::size_t steps   = promptLen + maxNew;
-                const std::size_t genToks = nSeq * maxNew;
-                std::cout << "  nSeq=" << nSeq
-                          << "  total=" << ms << " ms  "
-                          << (ms / static_cast<double>(steps)) << " ms/step  "
-                          << (1000.0 * static_cast<double>(genToks) / ms)
-                          << " gen-tok/s\n";
-                std::cout.flush();
             }
             return 0;
         }
