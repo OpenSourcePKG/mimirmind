@@ -418,6 +418,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
         ninja-build \
         pkg-config \
+        libssl-dev \
         git \
     && rm -rf /var/lib/apt/lists/*
 
@@ -481,6 +482,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libstdc++6 \
+        libssl3t64 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy just the mimirmind binary + compiled PTX kernels. Runtime image

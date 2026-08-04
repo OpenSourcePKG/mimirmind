@@ -276,7 +276,7 @@ ModelEntry parseModel(std::string_view      path,
 
 ServerSettings parseServer(std::string_view      path,
                            const nlohmann::json& j) {
-    checkKnownKeys(path, "server", j, {"port", "log"});
+    checkKnownKeys(path, "server", j, {"port", "log", "tls", "auth"});
     ServerSettings s{};
     if (const auto v = readOpt<int>(path, "server", j, "port"); v.has_value()) {
         if (*v <= 0 || *v > 65535) {
@@ -293,6 +293,42 @@ ServerSettings parseServer(std::string_view      path,
         }
         if (const auto v = readOpt<std::string>(path, "server.log", lj, "level"); v.has_value()) {
             s.log.level = *v;
+        }
+    }
+    if (j.contains("tls")) {
+        const auto& tj = j["tls"];
+        if (!tj.is_object()) fail(path, "server.tls must be an object");
+        checkKnownKeys(path, "server.tls", tj, {"enabled", "certFile", "keyFile"});
+        s.tls.enabled = readOpt<bool>(path, "server.tls", tj, "enabled");
+        if (const auto v = readOpt<std::string>(path, "server.tls", tj, "certFile"); v.has_value()) {
+            s.tls.certFile = *v;
+        }
+        if (const auto v = readOpt<std::string>(path, "server.tls", tj, "keyFile"); v.has_value()) {
+            s.tls.keyFile = *v;
+        }
+    }
+    if (j.contains("auth")) {
+        const auto& aj = j["auth"];
+        if (!aj.is_object()) fail(path, "server.auth must be an object");
+        checkKnownKeys(path, "server.auth", aj,
+                       {"enabled", "autoGenerateKey", "keys", "keyFile"});
+        s.auth.enabled = readOpt<bool>(path, "server.auth", aj, "enabled");
+        if (const auto v = readOpt<bool>(path, "server.auth", aj, "autoGenerateKey"); v.has_value()) {
+            s.auth.autoGenerateKey = *v;
+        }
+        if (aj.contains("keys") && !aj["keys"].is_null()) {
+            if (!aj["keys"].is_array()) {
+                fail(path, "server.auth.keys must be an array of strings");
+            }
+            for (const auto& item : aj["keys"]) {
+                if (!item.is_string()) {
+                    fail(path, "server.auth.keys[] entries must be strings");
+                }
+                s.auth.keys.push_back(item.get<std::string>());
+            }
+        }
+        if (const auto v = readOpt<std::string>(path, "server.auth", aj, "keyFile"); v.has_value()) {
+            s.auth.keyFile = *v;
         }
     }
     return s;

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "core/security/ApiKeyStore.hpp"
 #include "runtime/spec/SpeculativeDecoder.hpp"
 
 #include <cstddef>
@@ -39,9 +40,43 @@ struct LoadedEngine {
     runtime::InferenceEngine*   engine{nullptr};
 };
 
+/// In-process TLS termination settings. When `enabled`, the listener is a
+/// cpp-httplib `SSLServer` built from an in-memory PEM cert/key pair; the
+/// certificate is provisioned by ServeMode (real files, or an auto self-
+/// signed pair) so the server itself never touches disk here. OpenSSL types
+/// are deliberately kept out of this header — the PEM strings cross the
+/// boundary instead.
+struct TlsConfig {
+    /// Secure-by-default: TLS on unless explicitly disabled in config.
+    bool        enabled{true};
+    /// PEM-encoded certificate (leaf, optionally chain). Empty when
+    /// `enabled` is false.
+    std::string certPem{};
+    /// PEM-encoded private key matching `certPem`.
+    std::string keyPem{};
+    /// True when the loaded cert was auto-generated (self-signed) rather
+    /// than operator-provided — drives the startup WARN banner.
+    bool        selfSigned{false};
+};
+
+/// Bearer-token API-key auth settings. When `enabled`, a pre-routing hook
+/// requires `Authorization: Bearer <key>` on protected routes and answers
+/// 401 otherwise. Keys are provisioned by ServeMode (explicit config, a
+/// keyfile, or a single auto-generated key).
+struct AuthConfig {
+    bool                        enabled{false};
+    core::security::ApiKeyStore store{};
+};
+
 struct ServerConfig {
     /// Bind address. "0.0.0.0" for all interfaces; "127.0.0.1" for loopback.
     std::string   host{"0.0.0.0"};
+
+    /// In-process TLS (OpenSSL via httplib SSLServer).
+    TlsConfig     tls{};
+
+    /// Bearer-token API-key auth.
+    AuthConfig    auth{};
 
     /// TCP port for the listener.
     std::uint16_t port{8080};

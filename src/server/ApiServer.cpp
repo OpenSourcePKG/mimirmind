@@ -13,25 +13,92 @@
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
 #include "core/log/Log.hpp"
+#include "core/security/ScopedTenant.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#endif
+
 #include <atomic>
 #include <exception>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace mimirmind::server {
 
 using nlohmann::json;
 
+namespace {
+
+/// Extract the raw token from an `Authorization: Bearer <token>` header.
+/// Returns an empty view when the scheme is absent or malformed.
+std::string_view bearerToken(std::string_view header) noexcept {
+    constexpr std::string_view kPrefix = "Bearer ";
+    if (header.size() <= kPrefix.size()) return {};
+    if (header.substr(0, kPrefix.size()) != kPrefix) return {};
+    std::string_view tok = header.substr(kPrefix.size());
+    // Tolerate leading spaces after the scheme (some clients emit two).
+    while (!tok.empty() && tok.front() == ' ') tok.remove_prefix(1);
+    return tok;
+}
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+
+// Owns the OpenSSL cert/key objects for the SSLServer's lifetime. httplib's
+// in-memory SSLServer ctor installs these into its SSL_CTX; keeping our own
+// references alive here is robust regardless of upstream ref-count
+// semantics, and frees them deterministically on server teardown.
+struct TlsMaterial {
+    X509*     cert{nullptr};
+    EVP_PKEY* key{nullptr};
+
+    ~TlsMaterial() {
+        if (cert) X509_free(cert);
+        if (key)  EVP_PKEY_free(key);
+    }
+    TlsMaterial() = default;
+    TlsMaterial(const TlsMaterial&)            = delete;
+    TlsMaterial& operator=(const TlsMaterial&) = delete;
+};
+
+// Parse in-memory PEM strings into an X509 + EVP_PKEY. Returns false and
+// leaves `out` empty on any parse failure.
+bool parsePemMaterial(const std::string& certPem, const std::string& keyPem,
+                      TlsMaterial& out) {
+    BIO* cbio = BIO_new_mem_buf(certPem.data(),
+                                static_cast<int>(certPem.size()));
+    BIO* kbio = BIO_new_mem_buf(keyPem.data(),
+                                static_cast<int>(keyPem.size()));
+    bool ok = false;
+    if (cbio && kbio) {
+        out.cert = PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr);
+        out.key  = PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, nullptr);
+        ok = out.cert != nullptr && out.key != nullptr;
+    }
+    if (cbio) BIO_free(cbio);
+    if (kbio) BIO_free(kbio);
+    return ok;
+}
+
+#endif // CPPHTTPLIB_OPENSSL_SUPPORT
+
+} // namespace
+
 struct ApiServer::Impl {
     RequestDispatcher                     dispatcher;
     runtime::InferenceEngine&             engine;    // == dispatcher.defaultEngine()
     ServerConfig                          cfg;
-    httplib::Server                       server;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+    TlsMaterial                           tls;       // kept alive for `server`
+#endif
+    std::unique_ptr<httplib::Server>      server;
     std::atomic_bool                      started{false};
 
     // In-flight request snapshot for /v1/system/status.current_request.
@@ -52,27 +119,101 @@ struct ApiServer::Impl {
           cfg{std::move(c)},
           statusBuilder{engine, dispatcher, requestTracker, cfg.modelId},
           chatHandler{dispatcher, requestTracker, cfg} {
+        makeServer();
         installRoutes();
     }
 
+    // Build the concrete listener: an OpenSSL SSLServer when TLS is enabled
+    // (from the in-memory PEM material ServeMode provisioned), otherwise the
+    // plain HTTP Server. SSLServer derives from Server, so every route /
+    // pool / listen call below is identical through the base pointer.
+    void makeServer() {
+        if (cfg.tls.enabled) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+            if (cfg.tls.certPem.empty() || cfg.tls.keyPem.empty()) {
+                throw std::runtime_error(
+                    "ApiServer: TLS enabled but no certificate material "
+                    "provided");
+            }
+            if (!parsePemMaterial(cfg.tls.certPem, cfg.tls.keyPem, tls)) {
+                throw std::runtime_error(
+                    "ApiServer: failed to parse TLS certificate/key PEM");
+            }
+            auto ssl = std::make_unique<httplib::SSLServer>(tls.cert, tls.key);
+            if (!ssl->is_valid()) {
+                throw std::runtime_error(
+                    "ApiServer: SSLServer rejected the certificate/key "
+                    "(mismatched pair or unsupported key?)");
+            }
+            server = std::move(ssl);
+            MM_LOG_INFO("server", "TLS: in-process HTTPS enabled ({}cert)",
+                        cfg.tls.selfSigned ? "self-signed " : "");
+#else
+            throw std::runtime_error(
+                "ApiServer: TLS requested but binary built without OpenSSL "
+                "(CPPHTTPLIB_OPENSSL_SUPPORT)");
+#endif
+        } else {
+            server = std::make_unique<httplib::Server>();
+            MM_LOG_WARN("server",
+                        "TLS: DISABLED — HTTP is served in cleartext");
+        }
+    }
+
+    // Bearer-token gate. Installed as httplib's pre-routing handler so it
+    // runs before any route match and can short-circuit with a 401. When
+    // auth is enabled EVERY path is gated with no exceptions — including
+    // `/health` — so an internet scanner cannot read or POST to anything
+    // without a valid key. Health checks must therefore send the key too
+    // (see the Docker note) or probe TLS reachability instead.
+    void installAuthHook() {
+        server->set_pre_routing_handler(
+            [this](const httplib::Request& req, httplib::Response& res) {
+                using HR = httplib::Server::HandlerResponse;
+                if (!cfg.auth.enabled) return HR::Unhandled;
+
+                // get_header_value returns by value — keep it alive so the
+                // string_view carved out of it does not dangle.
+                const std::string authHeader =
+                    req.get_header_value("Authorization");
+                const std::string_view tok = bearerToken(authHeader);
+                const core::security::ApiKey* hit = cfg.auth.store.match(tok);
+                if (hit == nullptr) {
+                    core::security::ScopedTenant::set({});
+                    res.set_header("WWW-Authenticate",
+                                   "Bearer realm=\"mimirmind\"");
+                    res.set_header("Cache-Control", "no-store");
+                    sendError(res, 401, "unauthorized",
+                              "invalid or missing API key");
+                    return HR::Handled;
+                }
+                // Carry the tenant label for the rest of this request on
+                // this pool thread. Per-tenant serving admission reads it
+                // later (TODO Bragi: wire into ContinuousBatcher admission).
+                core::security::ScopedTenant::set(hit->tenantId);
+                return HR::Unhandled;
+            });
+    }
+
     void installRoutes() {
-        server.Get("/health", [this](const httplib::Request& req,
+        installAuthHook();   // pre-routing: runs before every route match
+        server->Get("/health", [this](const httplib::Request& req,
                                      httplib::Response&       res) {
             handleHealth(req, res);
         });
-        server.Get("/v1/models", [this](const httplib::Request& req,
+        server->Get("/v1/models", [this](const httplib::Request& req,
                                         httplib::Response&       res) {
             handleModels(req, res);
         });
-        server.Get("/v1/system/status",
+        server->Get("/v1/system/status",
                    [this](const httplib::Request&, httplib::Response& res) {
                        sendJson(res, 200, statusBuilder.buildStatus());
                    });
-        server.Get("/v1/system/info",
+        server->Get("/v1/system/info",
                    [this](const httplib::Request&, httplib::Response& res) {
                        sendJson(res, 200, statusBuilder.buildInfo());
                    });
-        server.Post("/v1/chat/completions",
+        server->Post("/v1/chat/completions",
                     [this](const httplib::Request& req,
                            httplib::Response&       res) {
                         // M9.8b observability follow-up: log request
@@ -94,7 +235,7 @@ struct ApiServer::Impl {
                         chatHandler.handle(req, res);
                     });
 
-        server.set_exception_handler(
+        server->set_exception_handler(
             [](const httplib::Request& req,
                httplib::Response& res,
                const std::exception_ptr& ep) {
@@ -112,7 +253,7 @@ struct ApiServer::Impl {
                 sendError(res, 500, "server_error", msg);
             });
 
-        server.set_logger([](const httplib::Request& req,
+        server->set_logger([](const httplib::Request& req,
                              const httplib::Response& res) {
             // Access-log with remote IP so operators can correlate
             // request-start (chat-completions POST accept-log above)
@@ -166,7 +307,7 @@ struct ApiServer::Impl {
             const std::size_t poolSize =
                 cfg.batcher->maxInflight() + kHeadroom;
             const std::size_t queueMax = cfg.batcher->maxInflight() * 4;
-            server.new_task_queue = [poolSize, queueMax] {
+            server->new_task_queue = [poolSize, queueMax] {
                 return new httplib::ThreadPool(poolSize, queueMax);
             };
             MM_LOG_INFO("server",
@@ -178,7 +319,7 @@ struct ApiServer::Impl {
         MM_LOG_INFO("server", "binding {}:{} (model={})",
                     cfg.host, cfg.port, cfg.modelId);
         started.store(true);
-        if (!server.listen(cfg.host, cfg.port)) {
+        if (!server->listen(cfg.host, cfg.port)) {
             started.store(false);
             throw std::runtime_error("ApiServer: failed to bind " +
                                      cfg.host + ":" + std::to_string(cfg.port));
@@ -187,7 +328,7 @@ struct ApiServer::Impl {
 
     void stop() {
         if (started.exchange(false)) {
-            server.stop();
+            server->stop();
         }
     }
 };

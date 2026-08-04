@@ -17,6 +17,8 @@
 #endif
 #include "core/log/Log.hpp"
 #include "core/os/GovernorLock.hpp"
+#include "core/security/ApiKeyStore.hpp"
+#include "core/security/SelfSignedCert.hpp"
 #include "model/Tokenizer.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
@@ -41,10 +43,12 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -55,6 +59,213 @@ namespace {
 
 // Held in the SIGINT handler so a Ctrl-C asks the listener to drain.
 std::atomic<::mimirmind::server::ApiServer*> g_runningServer{nullptr};
+
+// Directory that auto-provisioned security files (cert, key, keyfile) live
+// in: the directory of the loaded config file. Falls back to "." when the
+// config path has no parent component (e.g. a bare "config.json").
+std::filesystem::path securityDir(const std::string& configPath) {
+    std::filesystem::path p{configPath};
+    std::filesystem::path parent = p.parent_path();
+    return parent.empty() ? std::filesystem::path{"."} : parent;
+}
+
+std::string readTextFile(const std::filesystem::path& path) {
+    std::ifstream in{path, std::ios::binary};
+    if (!in) return {};
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+bool writeTextFile(const std::filesystem::path& path, const std::string& body) {
+    std::ofstream out{path, std::ios::binary | std::ios::trunc};
+    if (!out) return false;
+    out << body;
+    return static_cast<bool>(out);
+}
+
+// Provision in-process TLS material into `scfg.tls`. Reuses operator-supplied
+// cert/key files, else reuses a persisted self-signed pair next to the
+// config, else mints a fresh self-signed pair (persisted when the dir is
+// writable, otherwise kept in memory for this run only). Returns false only
+// when TLS is enabled but no usable material could be produced.
+bool provisionTls(const ::mimirmind::core::config::TlsSettings& in,
+                  const std::string&                            host,
+                  const std::filesystem::path&                  dir,
+                  ::mimirmind::server::TlsConfig&               out) {
+    namespace sec = ::mimirmind::core::security;
+
+    out.enabled = in.enabled.value_or(true);   // secure-by-default
+    if (!out.enabled) {
+        MM_LOG_WARN("main",
+                    "server.tls.enabled=false — HTTP will be served in "
+                    "cleartext on {}", host);
+        return true;
+    }
+
+    // (1) Operator-provided cert/key files win outright.
+    if (!in.certFile.empty() || !in.keyFile.empty()) {
+        const std::string cert = readTextFile(in.certFile);
+        const std::string key  = readTextFile(in.keyFile);
+        if (cert.empty() || key.empty()) {
+            MM_LOG_ERROR("main",
+                         "server.tls: certFile '{}' / keyFile '{}' set but "
+                         "not both readable — cannot enable TLS",
+                         in.certFile, in.keyFile);
+            return false;
+        }
+        out.certPem    = cert;
+        out.keyPem     = key;
+        out.selfSigned = false;
+        MM_LOG_INFO("main", "TLS: using operator cert '{}' + key '{}'",
+                    in.certFile, in.keyFile);
+        return true;
+    }
+
+    // (2) Reuse a persisted self-signed pair if present (idempotent).
+    const std::filesystem::path certPath = dir / "mimir-cert.pem";
+    const std::filesystem::path keyPath  = dir / "mimir-key.pem";
+    {
+        const std::string cert = readTextFile(certPath);
+        const std::string key  = readTextFile(keyPath);
+        if (!cert.empty() && !key.empty()) {
+            out.certPem    = cert;
+            out.keyPem     = key;
+            out.selfSigned = true;
+            MM_LOG_WARN("main",
+                        "TLS: reusing SELF-SIGNED certificate {} — clients "
+                        "must trust it explicitly (curl --insecure / import "
+                        "the cert). Provide server.tls.certFile+keyFile for a "
+                        "real cert.", certPath.string());
+            return true;
+        }
+    }
+
+    // (3) Mint a fresh self-signed pair.
+    sec::SelfSignedCertParams params;
+    params.commonName = sec::resolveHostname();
+    const sec::SelfSignedCert gen = sec::generateSelfSignedCert(params);
+    if (!gen.ok) {
+        MM_LOG_ERROR("main", "TLS: self-signed generation failed: {}",
+                     gen.error);
+        return false;
+    }
+    out.certPem    = gen.certPem;
+    out.keyPem     = gen.keyPem;
+    out.selfSigned = true;
+
+    const bool wroteCert = writeTextFile(certPath, gen.certPem);
+    const bool wroteKey  = writeTextFile(keyPath, gen.keyPem);
+    if (wroteCert && wroteKey) {
+        std::error_code ec;
+        std::filesystem::permissions(
+            keyPath,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace, ec);
+        MM_LOG_WARN("main",
+                    "TLS: generated SELF-SIGNED certificate (CN={}) and saved "
+                    "it to {} / {} — clients must trust it explicitly (curl "
+                    "--insecure / import the cert). Provide "
+                    "server.tls.certFile+keyFile for a real cert.",
+                    params.commonName, certPath.string(), keyPath.string());
+    } else {
+        MM_LOG_WARN("main",
+                    "TLS: generated SELF-SIGNED certificate (CN={}) but could "
+                    "not persist to {} — using an EPHEMERAL in-memory cert "
+                    "(regenerated every restart). Clients must trust it "
+                    "explicitly.", params.commonName, dir.string());
+    }
+    return true;
+}
+
+// Provision bearer-token API keys into `scfg.auth`. Resolves the bind-aware
+// enabled default, loads explicit keys[] + keyFile, and — when auth is on and
+// no key is configured — auto-generates + persists one and logs it once.
+void provisionAuth(const ::mimirmind::core::config::AuthSettings& in,
+                   const std::string&                             host,
+                   const std::filesystem::path&                   dir,
+                   ::mimirmind::server::AuthConfig&               out) {
+    namespace sec = ::mimirmind::core::security;
+
+    // Policy: auth is ON by default regardless of bind address. An
+    // internet-exposed listener must never answer (or accept) anything
+    // without a valid key — no bind-aware exception. Only an explicit
+    // server.auth.enabled=false opts out, and that is loudly warned.
+    out.enabled = in.enabled.value_or(true);
+
+    if (!out.enabled) {
+        MM_LOG_WARN("main",
+                    "server.auth.enabled=false — the API is UNAUTHENTICATED "
+                    "on {} (every route is open, including /health)", host);
+        return;
+    }
+
+    // Parse an entry shaped as `key` or `name:key[:tenantId]`.
+    auto parseEntry = [](const std::string& raw) -> sec::ApiKey {
+        sec::ApiKey k;
+        const auto c1 = raw.find(':');
+        if (c1 == std::string::npos) {
+            k.name = "config"; k.key = raw; k.tenantId = "default";
+            return k;
+        }
+        k.name        = raw.substr(0, c1);
+        const auto c2 = raw.find(':', c1 + 1);
+        if (c2 == std::string::npos) {
+            k.key = raw.substr(c1 + 1); k.tenantId = k.name;
+        } else {
+            k.key = raw.substr(c1 + 1, c2 - c1 - 1); k.tenantId = raw.substr(c2 + 1);
+        }
+        if (k.tenantId.empty()) k.tenantId = k.name;
+        return k;
+    };
+
+    for (const std::string& raw : in.keys) {
+        sec::ApiKey k = parseEntry(raw);
+        if (!k.key.empty()) out.store.add(std::move(k));
+    }
+
+    const std::filesystem::path keyfile =
+        in.keyFile.empty() ? (dir / "mimir-apikeys.txt")
+                           : std::filesystem::path{in.keyFile};
+    for (sec::ApiKey& k : sec::ApiKeyStore::loadKeyFile(keyfile.string())) {
+        out.store.add(std::move(k));
+    }
+
+    if (!out.store.empty()) {
+        MM_LOG_INFO("main", "AUTH: enabled with {} API key(s)",
+                    out.store.size());
+        return;
+    }
+
+    if (!in.autoGenerateKey) {
+        MM_LOG_WARN("main",
+                    "AUTH: enabled but no key configured and "
+                    "autoGenerateKey=false — every request will 401. Set "
+                    "server.auth.keys or a keyFile.");
+        return;
+    }
+
+    // Auto-generate + persist a single key, and log it once, in full.
+    sec::ApiKey k;
+    k.name     = "auto";
+    k.key      = sec::ApiKeyStore::generateKey();
+    k.tenantId = "default";
+    if (k.key.empty()) {
+        MM_LOG_ERROR("main", "AUTH: key auto-generation failed (CSPRNG) — "
+                             "auth is enabled but has no usable key");
+        return;
+    }
+    const bool persisted =
+        sec::ApiKeyStore::saveKeyFile(keyfile.string(), {k});
+    MM_LOG_WARN("main",
+                "AUTH: no API key configured — generated one and saved it to "
+                "{}.\n  ==> API key: {}\n  Send it as: Authorization: Bearer "
+                "{}\n  Set server.auth.keys to manage keys explicitly.",
+                persisted ? keyfile.string() : "(memory only — keyfile not "
+                                               "writable)",
+                k.key, k.key);
+    out.store.add(std::move(k));
+}
 
 } // namespace
 
@@ -1567,6 +1778,17 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     scfg.speculative.draftN   = static_cast<std::size_t>(cfg.speculative.n);
     scfg.speculativeTargetId  = cfg.speculative.target;
 
+    // Zero-config security provisioning: in-process TLS + bearer auth, both
+    // auto-provisioned (self-signed cert / auto-generated key) so a bare
+    // `serve` still comes up secure. Files land next to the loaded config.
+    const std::filesystem::path secDir = securityDir(args.configPath);
+    if (!provisionTls(cfg.server.tls, scfg.host, secDir, scfg.tls)) {
+        std::cerr << "serve: TLS is enabled but no usable certificate could "
+                     "be provisioned — aborting.\n";
+        return 1;
+    }
+    provisionAuth(cfg.server.auth, scfg.host, secDir, scfg.auth);
+
     // Thermal profile lives inline in config.json under governor.thermal.
     // Empty `name` means "no profile" and the guard runs unprotected.
     const bool hasThermalProfile = !cfg.governor.thermal.name.empty() ||
@@ -1955,7 +2177,10 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     std::signal(SIGINT,  signalStop);
     std::signal(SIGTERM, signalStop);
 
-    std::cout << "\n[M7d/M7e] OpenAI-compatible HTTP API listening on "
+    std::cout << "\n[M7d/M7e] OpenAI-compatible "
+              << (scfg.tls.enabled ? "HTTPS" : "HTTP")
+              << " API listening on "
+              << (scfg.tls.enabled ? "https://" : "http://")
               << scfg.host << ":" << scfg.port
               << "\n  GET  /health\n"
                  "  GET  /v1/models\n"
@@ -1963,7 +2188,16 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                  "  GET  /v1/system/status\n"
                  "  POST /v1/chat/completions  (stream=true supported)\n"
                  "  model id:           " << scfg.modelId << "\n"
-                 "  preserve-thinking:  "
+                 "  tls:                "
+              << (scfg.tls.enabled
+                      ? (scfg.tls.selfSigned ? "on (self-signed, use curl -k)"
+                                             : "on (operator cert)")
+                      : "off (cleartext)")
+              << "\n  auth:               "
+              << (scfg.auth.enabled
+                      ? "on (Authorization: Bearer <key>)"
+                      : "off (open)")
+              << "\n  preserve-thinking:  "
               << (scfg.preserveThinking ? "on (raw deltas, KV-cache friendly)"
                                         : "off (cleaned text, channel-wrapper stripped)")
               << "\n  thermal profile:    ";

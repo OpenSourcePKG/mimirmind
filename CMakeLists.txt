@@ -330,6 +330,10 @@ endif() # MIMIRMIND_ENABLE_L0 (SPV kernel block)
 # used by mimirmind_core_common::Log for its background file sink.
 find_package(Threads REQUIRED)
 
+# OpenSSL — in-process TLS (httplib SSLServer) + CSPRNG for API-key
+# generation and X509/EC self-signed cert minting (src/core/security/).
+find_package(OpenSSL REQUIRED)
+
 # ---- mimirmind_core_common — pure-CPU foundation library --------------------
 #
 # The pieces that never touch Level Zero: config parsing, GGUF loading,
@@ -366,6 +370,8 @@ add_library(mimirmind_core_common STATIC
     src/core/os/MappedFile.cpp
     src/core/log/Log.cpp
     src/core/os/GovernorLock.cpp
+    src/core/security/ApiKeyStore.cpp
+    src/core/security/SelfSignedCert.cpp
     src/runtime/serving/BatchCapacityProbe.cpp
     src/runtime/serving/PagedKvBlockAllocator.cpp
     src/runtime/serving/PagedKvSequence.cpp
@@ -390,6 +396,8 @@ target_include_directories(mimirmind_core_common SYSTEM PUBLIC
 
 target_link_libraries(mimirmind_core_common PUBLIC
     Threads::Threads
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 # BackendRegistry::probeAll() forward-declares
@@ -1062,6 +1070,13 @@ endif()
 target_include_directories(mimirmind SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib
 )
+
+# In-process TLS: compile httplib's SSLServer path and link OpenSSL. The
+# security helpers already come in transitively via mimirmind_core_common's
+# PUBLIC OpenSSL link, but the exec also compiles ApiServer.cpp against
+# httplib, which needs the macro defined at that TU.
+target_compile_definitions(mimirmind PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+target_link_libraries(mimirmind PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
 # Always link the common lib; add backend-specific libs when they exist.
 target_link_libraries(mimirmind PRIVATE mimirmind_core_common)

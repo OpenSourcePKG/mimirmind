@@ -89,9 +89,35 @@ struct LogSettings {
     std::string level{"info"};           // debug | info | warn | error
 };
 
+/// In-process TLS termination (OpenSSL via httplib SSLServer).
+struct TlsSettings {
+    /// `std::nullopt` → apply the secure-by-default (true). Explicit value
+    /// wins.
+    std::optional<bool> enabled{};
+    /// PEM certificate path. Empty → auto self-signed next to the config.
+    std::string         certFile{};
+    /// PEM private-key path. Empty → auto self-signed next to the config.
+    std::string         keyFile{};
+};
+
+/// Bearer-token API-key auth.
+struct AuthSettings {
+    /// `std::nullopt` → bind-address-aware default (off on loopback, on when
+    /// bound to a non-loopback interface). Explicit value wins.
+    std::optional<bool>      enabled{};
+    /// Auto-generate + persist a key when auth is on and none is configured.
+    bool                     autoGenerateKey{true};
+    /// Explicit keys. Each entry is `key` or `name:key[:tenantId]`.
+    std::vector<std::string> keys{};
+    /// Keyfile path. Empty → default `<config-dir>/mimir-apikeys.txt`.
+    std::string              keyFile{};
+};
+
 struct ServerSettings {
-    int         port{8080};
-    LogSettings log{};
+    int          port{8080};
+    LogSettings  log{};
+    TlsSettings  tls{};
+    AuthSettings auth{};
 };
 
 struct FeatureSettings {
