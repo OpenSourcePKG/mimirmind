@@ -378,11 +378,14 @@ private:
     // DEFAULT-ON 2026-08-03: +5% decode, greedy-bit-identical to fused-K (3/3
     // prompts), 0 memory cost. MIMIRMIND_GROUPED_MOE_DECODE=0 disables.
     bool _moeGroupedDecode{true};
-    // Opt-in (MIMIRMIND_GROUPED_MOE_DECODE_TC=1): route the *decode* routed-MoE
-    // through the FP4-tensor-core grouped GEMM instead of the blocked GD-b
-    // kernel. Requires the experts to carry TC sidecar banks (additive / =3
-    // load). W4A4 numerics — coherence-gated, off by default.
-    bool _moeGroupedDecodeTc{false};
+    // GD-c: route the *decode* routed-MoE through the FP4-tensor-core grouped
+    // GEMM instead of the blocked GD-b kernel. Requires the experts to carry TC
+    // sidecar banks (additive-default / =3 load); with blocked-only (=0) banks
+    // absent, decode falls through to the device-driven blocked branch. W4A4
+    // numerics — coherence-gated. DEFAULT-ON 2026-08-04: real-row act-quant
+    // turns TC decode into a net win (+28% @nSeq64, +12% @nSeq32 same-session
+    // A/B, within-arm spread <2%). MIMIRMIND_GROUPED_MOE_DECODE_TC=0 disables.
+    bool _moeGroupedDecodeTc{true};
     // Host mirror of the device expert-offset table (moe_group_build output),
     // read back once per grouped MoE layer to drive the per-expert launches
     // (host-driven Option 1 only; the device-driven path never reads it back).
