@@ -25,13 +25,15 @@ namespace mimirmind::core::security {
  */
 class ScopedTenant {
 public:
-    explicit ScopedTenant(std::string tenantId)
-        : _previous{std::move(current())} {
-        current() = std::move(tenantId);
+    explicit ScopedTenant(std::string tenantId, bool isAdmin = false)
+        : _previous{std::move(current())}, _previousAdmin{currentAdmin()} {
+        current()      = std::move(tenantId);
+        currentAdmin() = isAdmin;
     }
 
     ~ScopedTenant() {
-        current() = std::move(_previous);
+        current()      = std::move(_previous);
+        currentAdmin() = _previousAdmin;
     }
 
     ScopedTenant(const ScopedTenant&)            = delete;
@@ -43,21 +45,35 @@ public:
     /// empty string when auth is off / no guard is active.
     [[nodiscard]] static const std::string& active() { return current(); }
 
-    /// Directly set the current thread's tenant label. Used by the auth
-    /// pre-routing hook, whose lambda returns before the route handler
-    /// runs, so an RAII guard would be destroyed too early — the label has
-    /// to outlive the hook and be picked up by the subsequent handler on
-    /// the same pool thread. Cleared to empty for open / unauthenticated
-    /// paths so a reused thread never inherits a previous tenant.
-    static void set(std::string tenantId) { current() = std::move(tenantId); }
+    /// Whether the current thread's request was authenticated with an
+    /// admin-scoped key. False when auth is off or the key is a normal
+    /// tenant key — the operator-only routes gate on this.
+    [[nodiscard]] static bool activeIsAdmin() { return currentAdmin(); }
+
+    /// Directly set the current thread's tenant label + admin flag. Used by
+    /// the auth pre-routing hook, whose lambda returns before the route
+    /// handler runs, so an RAII guard would be destroyed too early — the
+    /// label has to outlive the hook and be picked up by the subsequent
+    /// handler on the same pool thread. Cleared (empty tenant, non-admin)
+    /// for open / unauthenticated paths so a reused thread never inherits a
+    /// previous tenant's identity or privilege.
+    static void set(std::string tenantId, bool isAdmin = false) {
+        current()      = std::move(tenantId);
+        currentAdmin() = isAdmin;
+    }
 
 private:
     static std::string& current() {
         static thread_local std::string tenant{};
         return tenant;
     }
+    static bool& currentAdmin() {
+        static thread_local bool admin{false};
+        return admin;
+    }
 
     std::string _previous;
+    bool        _previousAdmin;
 };
 
 } // namespace mimirmind::core::security

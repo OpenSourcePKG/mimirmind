@@ -113,11 +113,23 @@ struct AuthSettings {
     std::string              keyFile{};
 };
 
+/// Per-tenant (per-API-key) usage metrics for the admin routes.
+struct MetricsSettings {
+    /// Aggregate per-tenant request/token counters and expose them on the
+    /// operator-only routes (`/v1/admin/tenants`, `/metrics`). On by default;
+    /// the recording is a cheap map update off the request path.
+    bool        enabled{true};
+    /// Persistence file so totals survive a restart. Empty → default
+    /// `<config-dir>/mimir-tenant-metrics.json`. Set to override the location.
+    std::string path{};
+};
+
 struct ServerSettings {
-    int          port{8080};
-    LogSettings  log{};
-    TlsSettings  tls{};
-    AuthSettings auth{};
+    int             port{8080};
+    LogSettings     log{};
+    TlsSettings     tls{};
+    AuthSettings    auth{};
+    MetricsSettings metrics{};
 };
 
 struct FeatureSettings {

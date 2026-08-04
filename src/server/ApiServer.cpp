@@ -8,6 +8,7 @@
 #include "server/RequestDispatcher.hpp"
 #include "server/RequestTracker.hpp"
 #include "server/SystemStatusBuilder.hpp"
+#include "server/TenantMetrics.hpp"
 
 #include "model/ChatTemplate.hpp"
 #include "runtime/InferenceEngine.hpp"
@@ -104,6 +105,11 @@ struct ApiServer::Impl {
     // In-flight request snapshot for /v1/system/status.current_request.
     RequestTracker                        requestTracker;
 
+    // Per-tenant (per-API-key) usage accounting for /v1/admin/tenants +
+    // /metrics. Loads persisted totals + starts its flush thread on ctor;
+    // declared before chatHandler because the handler binds it by reference.
+    TenantMetrics                         tenantMetrics;
+
     // Populates /v1/system/info (static) and /v1/system/status (dynamic).
     // Owns the RAPL power baseline snapshot captured at construction.
     SystemStatusBuilder                   statusBuilder;
@@ -117,8 +123,9 @@ struct ApiServer::Impl {
                      c.speculativeTargetId, c.speculative},
           engine{dispatcher.defaultEngine()},
           cfg{std::move(c)},
+          tenantMetrics{cfg.tenantMetricsPath},
           statusBuilder{engine, dispatcher, requestTracker, cfg.modelId},
-          chatHandler{dispatcher, requestTracker, cfg} {
+          chatHandler{dispatcher, requestTracker, tenantMetrics, cfg} {
         makeServer();
         installRoutes();
     }
@@ -179,7 +186,7 @@ struct ApiServer::Impl {
                 const std::string_view tok = bearerToken(authHeader);
                 const core::security::ApiKey* hit = cfg.auth.store.match(tok);
                 if (hit == nullptr) {
-                    core::security::ScopedTenant::set({});
+                    core::security::ScopedTenant::set({}, /*isAdmin=*/false);
                     res.set_header("WWW-Authenticate",
                                    "Bearer realm=\"mimirmind\"");
                     res.set_header("Cache-Control", "no-store");
@@ -187,10 +194,10 @@ struct ApiServer::Impl {
                               "invalid or missing API key");
                     return HR::Handled;
                 }
-                // Carry the tenant label for the rest of this request on
-                // this pool thread. Per-tenant serving admission reads it
-                // later (TODO Bragi: wire into ContinuousBatcher admission).
-                core::security::ScopedTenant::set(hit->tenantId);
+                // Carry the tenant label + admin flag for the rest of this
+                // request on this pool thread. Per-tenant serving admission
+                // reads the label; the operator-only routes read isAdmin.
+                core::security::ScopedTenant::set(hit->tenantId, hit->isAdmin);
                 return HR::Unhandled;
             });
     }
@@ -212,6 +219,27 @@ struct ApiServer::Impl {
         server->Get("/v1/system/info",
                    [this](const httplib::Request&, httplib::Response& res) {
                        sendJson(res, 200, statusBuilder.buildInfo());
+                   });
+
+        // Operator-only per-tenant usage accounting. Auth already gated the
+        // request to a valid key (pre-routing hook); these two additionally
+        // require an ADMIN key so a normal tenant cannot read every tenant's
+        // usage. When auth is off (dev), there is no admin distinction — the
+        // routes are open like everything else.
+        server->Get("/v1/admin/tenants",
+                   [this](const httplib::Request&, httplib::Response& res) {
+                       if (!requireAdmin(res)) return;
+                       sendJson(res, 200,
+                                tenantMetrics.snapshotJson(cfg.batcher));
+                   });
+        server->Get("/metrics",
+                   [this](const httplib::Request&, httplib::Response& res) {
+                       if (!requireAdmin(res)) return;
+                       // OpenMetrics/Prometheus text exposition format.
+                       res.set_content(
+                           tenantMetrics.snapshotOpenMetrics(cfg.batcher),
+                           "text/plain; version=0.0.4; charset=utf-8");
+                       res.status = 200;
                    });
         server->Post("/v1/chat/completions",
                     [this](const httplib::Request& req,
@@ -263,6 +291,19 @@ struct ApiServer::Impl {
             MM_LOG_INFO("server", "{} {} -> {} (from {})",
                         req.method, req.path, res.status, req.remote_addr);
         });
+    }
+
+    // Gate the operator-only routes on an admin-scoped key. Returns true to
+    // proceed. When auth is disabled there is no privilege distinction, so
+    // the routes are as open as the rest of the API. A valid-but-non-admin
+    // key gets a 403 (distinct from the 401 an invalid key already got).
+    bool requireAdmin(httplib::Response& res) {
+        if (cfg.auth.enabled && !core::security::ScopedTenant::activeIsAdmin()) {
+            sendError(res, 403, "forbidden",
+                      "admin API key required for this route");
+            return false;
+        }
+        return true;
     }
 
     void handleHealth(const httplib::Request&, httplib::Response& res) {
@@ -329,6 +370,9 @@ struct ApiServer::Impl {
     void stop() {
         if (started.exchange(false)) {
             server->stop();
+            // Persist the final metrics window promptly on shutdown (the
+            // dtor also flushes, but stop() may run well before teardown).
+            tenantMetrics.flush();
         }
     }
 };

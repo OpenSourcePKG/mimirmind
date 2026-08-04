@@ -9,6 +9,7 @@
 #include "server/RequestDispatcher.hpp"
 #include "server/RequestTracker.hpp"
 #include "server/SseEncoder.hpp"
+#include "server/TenantMetrics.hpp"
 
 #include "model/ResponseCleaner.hpp"
 #include "model/ToolCallParser.hpp"
@@ -84,9 +85,11 @@ std::vector<std::int32_t> runViaBatcher(
 
 ChatCompletionHandler::ChatCompletionHandler(RequestDispatcher&        dispatcher,
                                               RequestTracker&           tracker,
+                                              TenantMetrics&            metrics,
                                               const ServerConfig&        cfg)
     : _dispatcher{dispatcher},
       _tracker{tracker},
+      _metrics{metrics},
       _cfg{cfg} {}
 
 bool ChatCompletionHandler::prepareChatRequest(
@@ -282,6 +285,8 @@ void ChatCompletionHandler::handle(const httplib::Request& req,
         } catch (const runtime::ThermalLimitExceeded& e) {
             MM_LOG_INFO("server",
                         "thermal refusal: {}", e.what());
+            _metrics.recordOverloadRejected(
+                core::security::ScopedTenant::active());
             res.set_header("Retry-After", "10");
             sendError(res, 503, "service_unavailable", e.what());
             return;
@@ -298,6 +303,7 @@ void ChatCompletionHandler::handle(const httplib::Request& req,
         MM_LOG_WARN("server",
                     "serving overloaded ({}/{} in flight) — shedding with 503",
                     _cfg.batcher->inflight(), _cfg.batcher->maxInflight());
+        _metrics.recordOverloadRejected(core::security::ScopedTenant::active());
         res.set_header("Retry-After", "1");
         sendError(res, 503, "service_unavailable",
                   "server overloaded: too many concurrent requests");
@@ -317,6 +323,7 @@ void ChatCompletionHandler::handle(const httplib::Request& req,
                         "with 429",
                         tenant, _cfg.batcher->inflightForTenant(tenant),
                         _cfg.batcher->maxInflightPerTenant());
+            _metrics.recordQuotaRejected(tenant);
             res.set_header("Retry-After", "1");
             sendError(res, 429, "rate_limit_exceeded",
                       "tenant quota exceeded: too many concurrent requests "
@@ -349,6 +356,11 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     }
 
     const auto& tok = engine.tokenizer();
+
+    // Owning tenant for this request (empty when auth is off) — feeds the
+    // per-tenant usage metrics recorded at each outcome below. Same thread
+    // start-to-finish on the blocking path, so the thread_local is stable.
+    const std::string tenant = core::security::ScopedTenant::active();
 
     runtime::GenerateStats stats;
     std::vector<std::int32_t> generated;
@@ -387,21 +399,22 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     if (useBatcher) {
         try {
             generated = runViaBatcher(*_cfg.batcher, promptIds, params,
-                                      stopIds,
-                                      core::security::ScopedTenant::active(),
-                                      onToken);
+                                      stopIds, tenant, onToken);
         } catch (const runtime::serving::ServingTenantQuotaError& e) {
             // Per-tenant fairness shed, not a bug: retryable 429.
+            _metrics.recordQuotaRejected(tenant);
             res.set_header("Retry-After", "1");
             sendError(res, 429, "rate_limit_exceeded", e.what());
             return;
         } catch (const runtime::serving::ServingOverloadedError& e) {
             // Load shedding, not a bug: retryable 503.
+            _metrics.recordOverloadRejected(tenant);
             res.set_header("Retry-After", "1");
             sendError(res, 503, "service_unavailable", e.what());
             return;
         } catch (const std::exception& e) {
             MM_LOG_ERROR("server", "batcher generate failed: {}", e.what());
+            _metrics.recordError(tenant);
             sendError(res, 500, "server_error",
                       std::string{"generate: "} + e.what());
             return;
@@ -429,11 +442,13 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         } catch (const runtime::ThermalLimitExceeded& e) {
             MM_LOG_INFO("server",
                         "thermal refusal at engine entry: {}", e.what());
+            _metrics.recordOverloadRejected(tenant);
             res.set_header("Retry-After", "10");
             sendError(res, 503, "service_unavailable", e.what());
             return;
         } catch (const std::exception& e) {
             MM_LOG_ERROR("server", "generate failed: {}", e.what());
+            _metrics.recordError(tenant);
             sendError(res, 500, "server_error",
                       std::string{"generate: "} + e.what());
             return;
@@ -576,6 +591,8 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                 stats.prefillMs, stats.decodeMs, stats.packageJoules,
                 finish, specSuffix);
 
+    _metrics.recordSuccess(tenant, promptIds.size(), visible.size(),
+                           stats.packageJoules, stats.prefillMs, stats.decodeMs);
     sendJson(res, 200, response);
 }
 
@@ -840,7 +857,15 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                                               state->promptIds, state->params,
                                               state->stopIds, state->tenantId,
                                               onToken);
+                } catch (const runtime::serving::ServingTenantQuotaError& e) {
+                    // Race-path 429 (pre-check in handle() sheds the rest).
+                    this->_metrics.recordQuotaRejected(state->tenantId);
+                    errorMessage = e.what();
+                } catch (const runtime::serving::ServingOverloadedError& e) {
+                    this->_metrics.recordOverloadRejected(state->tenantId);
+                    errorMessage = e.what();
                 } catch (const std::exception& e) {
+                    this->_metrics.recordError(state->tenantId);
                     errorMessage = e.what();
                 }
             } else {
@@ -860,6 +885,7 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                                                     onPrefillProgress);
                     }
                 } catch (const std::exception& e) {
+                    this->_metrics.recordError(state->tenantId);
                     errorMessage = e.what();
                 }
             }
@@ -944,6 +970,10 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                         emittedTokens,
                         stats.prefillMs, stats.decodeMs,
                         stats.packageJoules, finish, streamSpecSuffix);
+
+            this->_metrics.recordSuccess(
+                state->tenantId, state->promptIds.size(), emittedTokens,
+                stats.packageJoules, stats.prefillMs, stats.decodeMs);
 
             sink.done();
             return false;

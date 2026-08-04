@@ -1023,6 +1023,7 @@ add_executable(mimirmind
     src/server/RequestTracker.cpp
     src/server/SseEncoder.cpp
     src/server/SystemStatusBuilder.cpp
+    src/server/TenantMetrics.cpp
 )
 
 if(MIMIRMIND_ENABLE_L0)

@@ -39,6 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ninja-build \
         pkg-config \
         git \
+        libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Intel GPU repo for current Level Zero (Ubuntu 24.04 = "noble").
@@ -234,6 +235,7 @@ https://repositories.intel.com/gpu/ubuntu noble client" \
         level-zero \
         intel-level-zero-gpu \
         intel-opencl-icd \
+        libssl3t64 \
         python3 \
         python3-numpy \
     && apt-get purge -y wget gnupg \

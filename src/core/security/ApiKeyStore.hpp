@@ -14,13 +14,16 @@ namespace mimirmind::core::security {
  *
  * `key` is the raw secret sent as `Authorization: Bearer <key>`. `name`
  * is an operator-facing label (keyfile column / log line). `tenantId`
- * feeds later per-tenant serving admission — defaults to the key's `name`,
- * or `"default"` for the auto-generated key.
+ * feeds per-tenant serving admission + metrics — defaults to the key's
+ * `name`, or `"default"` for the auto-generated key. `isAdmin` gates the
+ * operator-only routes (`/v1/admin/tenants`, `/metrics`); the
+ * auto-generated bootstrap key is admin so a bare `serve` can read them.
  */
 struct ApiKey {
     std::string name{};
     std::string key{};
     std::string tenantId{};
+    bool        isAdmin{false};
 };
 
 /**
@@ -55,12 +58,13 @@ public:
     [[nodiscard]] static std::string generateKey();
 
     /// Parse a keyfile. One key per non-empty, non-`#` line in the form
-    /// `name:key[:tenantId]`. Missing tenantId defaults to `name`. Missing
-    /// or unreadable file yields an empty vector (not an error).
+    /// `name:key[:tenantId[:role]]`. Missing tenantId defaults to `name`;
+    /// `role` == "admin" sets `isAdmin` (any other value / absent = user).
+    /// Missing or unreadable file yields an empty vector (not an error).
     [[nodiscard]] static std::vector<ApiKey> loadKeyFile(const std::string& path);
 
-    /// Persist keys to `path`, one `name:key:tenantId` line each, and set
-    /// mode 0600. Returns false if the file could not be written (caller
+    /// Persist keys to `path`, one `name:key:tenantId[:admin]` line each, and
+    /// set mode 0600. Returns false if the file could not be written (caller
     /// then falls back to keeping the key in memory only).
     [[nodiscard]] static bool saveKeyFile(const std::string&         path,
                                           const std::vector<ApiKey>& keys);

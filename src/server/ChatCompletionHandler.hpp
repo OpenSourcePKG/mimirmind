@@ -18,6 +18,7 @@ namespace mimirmind::server {
 
 class RequestDispatcher;
 class RequestTracker;
+class TenantMetrics;
 struct ChatRequest;
 struct TrimReport;
 
@@ -30,6 +31,7 @@ class ChatCompletionHandler {
 public:
     ChatCompletionHandler(RequestDispatcher&        dispatcher,
                            RequestTracker&           tracker,
+                           TenantMetrics&            metrics,
                            const ServerConfig&        cfg);
 
     ChatCompletionHandler(const ChatCompletionHandler&)            = delete;
@@ -55,6 +57,7 @@ private:
 
     RequestDispatcher&         _dispatcher;
     RequestTracker&            _tracker;
+    TenantMetrics&             _metrics;
     const ServerConfig&        _cfg;
 };
 

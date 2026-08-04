@@ -78,6 +78,12 @@ struct ServerConfig {
     /// Bearer-token API-key auth.
     AuthConfig    auth{};
 
+    /// Persistence file for per-tenant usage metrics (per-API-key request /
+    /// token accounting shown on the admin routes). Empty => metrics kept
+    /// in-memory only (or disabled — ServeMode leaves it empty when
+    /// `server.metrics.enabled` is false).
+    std::string   tenantMetricsPath{};
+
     /// TCP port for the listener.
     std::uint16_t port{8080};
 

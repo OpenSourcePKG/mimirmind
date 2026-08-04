@@ -276,7 +276,7 @@ ModelEntry parseModel(std::string_view      path,
 
 ServerSettings parseServer(std::string_view      path,
                            const nlohmann::json& j) {
-    checkKnownKeys(path, "server", j, {"port", "log", "tls", "auth"});
+    checkKnownKeys(path, "server", j, {"port", "log", "tls", "auth", "metrics"});
     ServerSettings s{};
     if (const auto v = readOpt<int>(path, "server", j, "port"); v.has_value()) {
         if (*v <= 0 || *v > 65535) {
@@ -329,6 +329,16 @@ ServerSettings parseServer(std::string_view      path,
         }
         if (const auto v = readOpt<std::string>(path, "server.auth", aj, "keyFile"); v.has_value()) {
             s.auth.keyFile = *v;
+        }
+    }
+    if (j.contains("metrics")) {
+        const auto& mj = j["metrics"];
+        checkKnownKeys(path, "server.metrics", mj, {"enabled", "path"});
+        if (const auto v = readOpt<bool>(path, "server.metrics", mj, "enabled"); v.has_value()) {
+            s.metrics.enabled = *v;
+        }
+        if (const auto v = readOpt<std::string>(path, "server.metrics", mj, "path"); v.has_value()) {
+            s.metrics.path = *v;
         }
     }
     return s;

@@ -200,7 +200,8 @@ void provisionAuth(const ::mimirmind::core::config::AuthSettings& in,
         return;
     }
 
-    // Parse an entry shaped as `key` or `name:key[:tenantId]`.
+    // Parse an entry shaped as `key` or `name:key[:tenantId[:role]]`.
+    // `role` == "admin" grants access to the operator-only routes.
     auto parseEntry = [](const std::string& raw) -> sec::ApiKey {
         sec::ApiKey k;
         const auto c1 = raw.find(':');
@@ -213,7 +214,14 @@ void provisionAuth(const ::mimirmind::core::config::AuthSettings& in,
         if (c2 == std::string::npos) {
             k.key = raw.substr(c1 + 1); k.tenantId = k.name;
         } else {
-            k.key = raw.substr(c1 + 1, c2 - c1 - 1); k.tenantId = raw.substr(c2 + 1);
+            k.key         = raw.substr(c1 + 1, c2 - c1 - 1);
+            const auto c3 = raw.find(':', c2 + 1);
+            if (c3 == std::string::npos) {
+                k.tenantId = raw.substr(c2 + 1);
+            } else {
+                k.tenantId = raw.substr(c2 + 1, c3 - c2 - 1);
+                k.isAdmin  = (raw.substr(c3 + 1) == "admin");
+            }
         }
         if (k.tenantId.empty()) k.tenantId = k.name;
         return k;
@@ -245,11 +253,14 @@ void provisionAuth(const ::mimirmind::core::config::AuthSettings& in,
         return;
     }
 
-    // Auto-generate + persist a single key, and log it once, in full.
+    // Auto-generate + persist a single key, and log it once, in full. The
+    // bootstrap key is admin so a bare `serve` can reach the operator-only
+    // routes (/v1/admin/tenants, /metrics) with the key it just printed.
     sec::ApiKey k;
     k.name     = "auto";
     k.key      = sec::ApiKeyStore::generateKey();
     k.tenantId = "default";
+    k.isAdmin  = true;
     if (k.key.empty()) {
         MM_LOG_ERROR("main", "AUTH: key auto-generation failed (CSPRNG) — "
                              "auth is enabled but has no usable key");
@@ -1788,6 +1799,16 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         return 1;
     }
     provisionAuth(cfg.server.auth, scfg.host, secDir, scfg.auth);
+
+    // Per-tenant usage metrics (per-API-key token/request accounting for the
+    // admin routes). Persisted next to the config so totals survive a restart;
+    // an explicit path overrides. Empty path => in-memory only.
+    if (cfg.server.metrics.enabled) {
+        scfg.tenantMetricsPath =
+            cfg.server.metrics.path.empty()
+                ? (secDir / "mimir-tenant-metrics.json").string()
+                : cfg.server.metrics.path;
+    }
 
     // Thermal profile lives inline in config.json under governor.thermal.
     // Empty `name` means "no profile" and the guard runs unprotected.

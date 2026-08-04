@@ -97,8 +97,15 @@ std::vector<ApiKey> ApiKeyStore::loadKeyFile(const std::string& path) {
             k.key      = line.substr(c1 + 1);
             k.tenantId = k.name;
         } else {
-            k.key      = line.substr(c1 + 1, c2 - c1 - 1);
-            k.tenantId = line.substr(c2 + 1);
+            k.key         = line.substr(c1 + 1, c2 - c1 - 1);
+            // Optional 4th `:role` field after tenantId. `admin` => isAdmin.
+            const auto c3 = line.find(':', c2 + 1);
+            if (c3 == std::string::npos) {
+                k.tenantId = line.substr(c2 + 1);
+            } else {
+                k.tenantId = line.substr(c2 + 1, c3 - c2 - 1);
+                k.isAdmin  = (line.substr(c3 + 1) == "admin");
+            }
         }
         if (k.tenantId.empty()) k.tenantId = k.name;
         if (!k.key.empty()) keys.push_back(std::move(k));
@@ -109,11 +116,13 @@ std::vector<ApiKey> ApiKeyStore::loadKeyFile(const std::string& path) {
 bool ApiKeyStore::saveKeyFile(const std::string&         path,
                               const std::vector<ApiKey>& keys) {
     std::ostringstream body;
-    body << "# mimirmind API keys — format: name:key:tenantId\n";
+    body << "# mimirmind API keys — format: name:key:tenantId[:admin]\n";
     body << "# Auto-generated when server.auth is enabled and no key was "
             "configured.\n";
     for (const ApiKey& k : keys) {
-        body << k.name << ':' << k.key << ':' << k.tenantId << '\n';
+        body << k.name << ':' << k.key << ':' << k.tenantId;
+        if (k.isAdmin) body << ":admin";
+        body << '\n';
     }
     {
         std::ofstream out{path, std::ios::binary | std::ios::trunc};
