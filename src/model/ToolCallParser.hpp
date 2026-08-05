@@ -45,6 +45,24 @@ public:
     /// True when `text` contains at least one `<|tool_call>` opener (the
     /// Gemma marker — note the leading pipe, distinct from Qwen's).
     [[nodiscard]] static bool looksLikeGemmaToolCall(std::string_view text) noexcept;
+
+    /// Fallback for reasoning models (e.g. Qwen3.6) that sometimes emit the
+    /// call as a bare JSON object with NO `<tool_call>` wrapper —
+    ///   {"name": "fn", "arguments": { ... }}
+    /// possibly several concatenated, embedded in surrounding text. Every
+    /// balanced `{…}` is tried; an object is accepted only when its string
+    /// `name` is one of `knownNames` (the tools the request offered), so a
+    /// legitimate JSON *answer* is never mistaken for a call. `arguments` is
+    /// normalised to a compact JSON string; ids are "call_0", "call_1", ….
+    [[nodiscard]] static std::vector<ToolCall>
+    parseBareJson(std::string_view text, const std::vector<std::string>& knownNames);
+
+    /// Cheap pre-check for `parseBareJson`: `text` mentions a `"name"` key and
+    /// at least one of the offered tool names. Gate the (JSON-scanning) parse
+    /// behind this so the common no-call answer stays fast.
+    [[nodiscard]] static bool
+    looksLikeBareJsonToolCall(std::string_view text,
+                              const std::vector<std::string>& knownNames) noexcept;
 };
 
 } // namespace mimirmind::model

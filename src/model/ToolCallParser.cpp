@@ -270,4 +270,84 @@ std::vector<ToolCall> ToolCallParser::parseGemma(std::string_view text) {
     return calls;
 }
 
+bool ToolCallParser::looksLikeBareJsonToolCall(
+        std::string_view text,
+        const std::vector<std::string>& knownNames) noexcept {
+    if (text.find("\"name\"") == std::string_view::npos) {
+        return false;
+    }
+    for (const std::string& n : knownNames) {
+        if (!n.empty() && text.find(n) != std::string_view::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<ToolCall> ToolCallParser::parseBareJson(
+        std::string_view text, const std::vector<std::string>& knownNames) {
+    std::vector<ToolCall> calls;
+
+    const auto isKnown = [&knownNames](const std::string& name) {
+        for (const std::string& n : knownNames) {
+            if (n == name) return true;
+        }
+        return false;
+    };
+
+    // Walk every `{`, find its string-aware matching `}`, and try that span as
+    // a tool-call object. Accept only objects whose `name` is an offered tool —
+    // that guard is what keeps a genuine JSON answer from being parsed as a
+    // call. Continue after each object so several concatenated calls all parse.
+    std::size_t i = 0;
+    while (i < text.size()) {
+        const std::size_t open = text.find('{', i);
+        if (open == std::string_view::npos) {
+            break;
+        }
+
+        std::size_t depth = 0;
+        bool        inStr = false;
+        bool        esc   = false;
+        std::size_t closeIdx = std::string_view::npos;
+        for (std::size_t j = open; j < text.size(); ++j) {
+            const char c = text[j];
+            if (inStr) {
+                if (esc)            esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"')  inStr = false;
+            } else if (c == '"') {
+                inStr = true;
+            } else if (c == '{') {
+                ++depth;
+            } else if (c == '}') {
+                if (--depth == 0) { closeIdx = j; break; }
+            }
+        }
+        if (closeIdx == std::string_view::npos) {
+            break;   // unbalanced from here on — stop
+        }
+
+        const std::string_view obj = text.substr(open, closeIdx - open + 1);
+        json parsed = json::parse(obj, /*cb=*/nullptr, /*allow_exceptions=*/false);
+        if (!parsed.is_discarded() && parsed.is_object()) {
+            const auto nameIt = parsed.find("name");
+            if (nameIt != parsed.end() && nameIt->is_string() &&
+                isKnown(nameIt->get<std::string>())) {
+                ToolCall call;
+                call.id   = "call_" + std::to_string(calls.size());
+                call.name = nameIt->get<std::string>();
+                const auto argsIt = parsed.find("arguments");
+                call.argumentsJson =
+                    (argsIt != parsed.end()) ? argumentsToString(*argsIt) : "{}";
+                calls.push_back(std::move(call));
+            }
+        }
+
+        i = closeIdx + 1;
+    }
+
+    return calls;
+}
+
 } // namespace mimirmind::model

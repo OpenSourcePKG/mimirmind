@@ -516,6 +516,21 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             toolCalls = model::ToolCallParser::parseGemma(toolText);
         } else if (model::ToolCallParser::looksLikeQwenToolCall(toolText)) {
             toolCalls = model::ToolCallParser::parseQwen(toolText);
+        } else {
+            // Bare-JSON fallback: a reasoning model (Qwen3.6) sometimes emits the
+            // call as plain {"name":…,"arguments":…} with no <tool_call> wrapper,
+            // which would otherwise leak into content. Run it over the cleaned
+            // answer (`text`, already stripped of the <think> reasoning) and gate
+            // on the offered tool names so a legit JSON answer is never parsed as
+            // a call.
+            std::vector<std::string> toolNames;
+            toolNames.reserve(cr.tools.size());
+            for (const auto& spec : cr.tools) {
+                toolNames.push_back(spec.name);
+            }
+            if (model::ToolCallParser::looksLikeBareJsonToolCall(text, toolNames)) {
+                toolCalls = model::ToolCallParser::parseBareJson(text, toolNames);
+            }
         }
     }
 
