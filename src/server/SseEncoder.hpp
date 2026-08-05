@@ -40,6 +40,16 @@ struct SseEncoder {
         const std::string& model,
         std::string_view   text);
 
+    /// Delta chunk carrying a piece of the model's reasoning (thinking).
+    /// Emitted as `delta.reasoning_content`, the shape vLLM / llama.cpp use
+    /// for reasoning models so clients can show a "thinking…" indicator
+    /// separately from the answer content.
+    [[nodiscard]] static nlohmann::json buildReasoningChunk(
+        const std::string& id,
+        std::int64_t       created,
+        const std::string& model,
+        std::string_view   reasoning);
+
     /// Terminal chunk with `finish_reason`.
     [[nodiscard]] static nlohmann::json buildFinishChunk(
         const std::string& id,

@@ -46,6 +46,20 @@ json SseEncoder::buildContentChunk(const std::string& id, std::int64_t created,
     return out;
 }
 
+json SseEncoder::buildReasoningChunk(const std::string& id, std::int64_t created,
+                                     const std::string& model,
+                                     std::string_view reasoning) {
+    json out = streamChunkSkeleton(id, created, model);
+    out["choices"] = json::array({
+        json{
+            {"index",         0},
+            {"delta",         json{{"reasoning_content", std::string{reasoning}}}},
+            {"finish_reason", nullptr},
+        },
+    });
+    return out;
+}
+
 json SseEncoder::buildFinishChunk(const std::string& id, std::int64_t created,
                                    const std::string& model, std::string_view finishReason) {
     json out = streamChunkSkeleton(id, created, model);

@@ -33,28 +33,32 @@ ResponseCleaner::ResponseCleaner(ChatTemplate::Style style,
     }
 }
 
-bool ResponseCleaner::feed(std::int32_t tokenId, std::string& text) {
+bool ResponseCleaner::feed(std::int32_t tokenId, std::string& text,
+                           std::string& reasoning) {
+    reasoning.clear();
     switch (_style) {
         case ChatTemplate::Style::Gemma4:
-            return feedGemma4(tokenId, text);
+            return feedGemma4(tokenId, text, reasoning);
         case ChatTemplate::Style::QwenChatML:
-            return feedQwenThink(text);
+            return feedQwenThink(text, reasoning);
         default:
             return !text.empty();
     }
 }
 
-// Gemma 4: swallow the <|channel>thought<channel|> wrapper at the token level.
-bool ResponseCleaner::feedGemma4(std::int32_t tokenId, std::string& text) {
-    // Channel-open marker — enter swallow mode. The token id is the
+// Gemma 4: split the <|channel>thought<channel|> wrapper at the token level —
+// the channel body is the model's thinking and is surfaced as reasoning.
+bool ResponseCleaner::feedGemma4(std::int32_t tokenId, std::string& text,
+                                 std::string& reasoning) {
+    // Channel-open marker — enter thinking mode. The token id is the
     // single special token <|channel>; the channel body that follows
-    // is regular text plus eventually the <channel|> closer.
+    // is the reasoning text plus eventually the <channel|> closer.
     if (_channelStartId >= 0 && tokenId == _channelStartId) {
         _inChannel = true;
         return false;
     }
 
-    // Channel-close marker — leave swallow mode and arm a
+    // Channel-close marker — leave thinking mode and arm a
     // leading-whitespace strip so the first visible content does not
     // start with the "\n" that immediately follows the close.
     if (_inChannel && _channelEndId >= 0 && tokenId == _channelEndId) {
@@ -64,6 +68,9 @@ bool ResponseCleaner::feedGemma4(std::int32_t tokenId, std::string& text) {
     }
 
     if (_inChannel) {
+        // Channel body = thinking. Surface it as reasoning rather than dropping.
+        reasoning = std::move(text);
+        text.clear();
         return false;
     }
 
@@ -88,31 +95,38 @@ bool ResponseCleaner::feedGemma4(std::int32_t tokenId, std::string& text) {
 // string match is used rather than the (unreliable) </think> token id. Swallow
 // everything up to and including that closer; then pass through. For a
 // non-thinking model the phase starts at Done, so this is a plain pass-through.
-bool ResponseCleaner::feedQwenThink(std::string& text) {
+bool ResponseCleaner::feedQwenThink(std::string& text, std::string& reasoning) {
     constexpr std::string_view kOpen{"<think>"};
     constexpr std::string_view kClose{"</think>"};
 
     _pending.append(text);
-    std::string emit;
+    std::string emit;    // answer content
+    std::string think;   // reasoning content
 
-    // Alternate between swallowing a thinking block (InThink, until </think>)
-    // and passing answer text through (Done, until a spurious re-opened
-    // <think>). qwen35moe usually emits one pre-opened block, but some prompts
-    // make it re-open a second <think>…</think> mid-answer — the loop strips
-    // every such block. <think>/</think> are single tokens, so they arrive
-    // whole; the </think> tail-hold below only guards a defensive split.
+    // Alternate between a thinking block (InThink, until </think>, streamed out
+    // as reasoning) and answer text (Done, passed through, until a spurious
+    // re-opened <think>). qwen35moe usually emits one pre-opened block, but some
+    // prompts make it re-open a second <think>…</think> mid-answer — the loop
+    // handles every such block. <think>/</think> are single tokens, so they
+    // arrive whole; the </think> tail-hold below only guards a defensive split.
     for (bool progress = true; progress;) {
         progress = false;
 
         if (_thinkPhase == ThinkPhase::InThink) {
             const std::size_t close = _pending.find(kClose);
             if (close == std::string::npos) {
-                // Keep only a tail that could be a split </think> prefix.
+                // Stream out the reasoning so far, holding back only a tail that
+                // could be a split </think> prefix (so we never emit a partial
+                // closer as reasoning).
                 if (_pending.size() > kClose.size() - 1) {
-                    _pending.erase(0, _pending.size() - (kClose.size() - 1));
+                    const std::size_t take =
+                        _pending.size() - (kClose.size() - 1);
+                    think.append(_pending, 0, take);
+                    _pending.erase(0, take);
                 }
                 break;
             }
+            think.append(_pending, 0, close);   // reasoning up to the closer
             _pending.erase(0, close + kClose.size());
             _thinkPhase   = ThinkPhase::Done;
             _stripLeading = true;   // drop the newline(s) right after </think>
@@ -146,7 +160,8 @@ bool ResponseCleaner::feedQwenThink(std::string& text) {
         progress    = true;
     }
 
-    text = std::move(emit);
+    text      = std::move(emit);
+    reasoning = std::move(think);
     return !text.empty();
 }
 

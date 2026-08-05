@@ -155,9 +155,16 @@ public:
      *
      * Safe to call on partial / streaming chunks: leading wrapper is only
      * removed when fully present in the input.
+     *
+     * When `reasoningOut` is non-null, the stripped thinking (the Qwen3
+     * `<think>…</think>` body or the Gemma 4 channel-thought body) is written
+     * there instead of being discarded, so the blocking chat handler can put
+     * it in `message.reasoning_content` (vLLM / llama.cpp reasoning-model
+     * shape). Empty when the model produced no thinking.
      */
     [[nodiscard]] static std::string
-    cleanResponse(Style style, std::string_view text);
+    cleanResponse(Style style, std::string_view text,
+                  std::string* reasoningOut = nullptr);
 };
 
 } // namespace mimirmind::model

@@ -483,12 +483,17 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     }
 
     const std::string rawText  = tok.decode(visible, /*skipSpecial=*/true);
+    // Split thinking out into `reasoning` so it can ride in
+    // message.reasoning_content (vLLM / llama.cpp reasoning-model shape)
+    // instead of being discarded. preserveThinking keeps the raw thinking
+    // inline in content (debug / KV-cache-parity mode).
+    std::string reasoning;
     const std::string text     = _cfg.preserveThinking
         ? rawText
         : model::ChatTemplate::cleanResponse(
               model::ChatTemplate::detectFromArch(
                   engine.config().architecture),
-              rawText);
+              rawText, &reasoning);
 
     // M-FunctionCalling: when tools were offered and the model emitted a tool
     // call, surface it as structured tool_calls instead of content. Decode
@@ -536,6 +541,12 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     PromptTrimmer::attachTrimUsage(usage, trimReport);
 
     json message = {{"role", "assistant"}};
+    // Surface the model's thinking separately (vLLM / llama.cpp shape). Present
+    // on both the content answer and a tool-call turn — a reasoning model
+    // thinks before it decides to call a tool, and clients show that.
+    if (!reasoning.empty()) {
+        message["reasoning_content"] = reasoning;
+    }
     if (toolCalls.empty()) {
         message["content"] = text;
     } else {
@@ -655,6 +666,8 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
         // Buffers a trailing incomplete UTF-8 codepoint between tokens
         // so SSE deltas always carry valid UTF-8.
         std::string                   utf8Pending;
+        // Same UTF-8 hold buffer, for the reasoning_content stream.
+        std::string                   reasoningPending;
         // Per-stream filter that swallows the Gemma 4
         // <|channel>thought<channel|> wrapper at the token level,
         // matching the behaviour ChatTemplate::cleanResponse applies in
@@ -739,8 +752,34 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                     return true;
                 }
 
-                // Drop structural markup (Gemma 4 channel wrapper).
-                if (!state->cleaner.feed(id, txt)) {
+                // Split thinking from answer: `txt` becomes the answer content
+                // (may be emptied), `reasoning` the thinking fragment. Structural
+                // markup (Gemma 4 channel / Qwen3 <think>…</think>) is consumed.
+                std::string reasoning;
+                const bool hasContent = state->cleaner.feed(id, txt, reasoning);
+
+                // Reasoning delta → delta.reasoning_content (own UTF-8 hold
+                // buffer so a multibyte codepoint split across tokens never
+                // ships broken). vLLM / llama.cpp reasoning-model shape.
+                if (!reasoning.empty()) {
+                    state->reasoningPending.append(reasoning);
+                    const std::size_t rcut = SseEncoder::utf8IncompleteTailStart(
+                        state->reasoningPending);
+                    if (rcut > 0) {
+                        std::string remit = state->reasoningPending.substr(0, rcut);
+                        state->reasoningPending.erase(0, rcut);
+                        if (!SseEncoder::writeSseEvent(
+                                sink,
+                                SseEncoder::buildReasoningChunk(
+                                    state->respId, state->created,
+                                    state->echoModel, remit))) {
+                            clientGone = true;
+                            return false;   // abort generate()
+                        }
+                    }
+                }
+
+                if (!hasContent) {
                     return true;
                 }
 
@@ -923,6 +962,17 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                              state->respId, errorMessage);
                 sink.done();
                 return false;
+            }
+
+            // Flush any leftover reasoning buffer first (a model that stops
+            // while still "thinking" — e.g. length cutoff mid-<think> — should
+            // still surface what it reasoned).
+            if (!state->reasoningPending.empty()) {
+                (void)SseEncoder::writeSseEvent(
+                    sink,
+                    SseEncoder::buildReasoningChunk(state->respId, state->created,
+                                      state->echoModel, state->reasoningPending));
+                state->reasoningPending.clear();
             }
 
             // Flush any UTF-8 buffer leftover (partial codepoint at the

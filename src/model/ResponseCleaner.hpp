@@ -77,9 +77,26 @@ public:
     /// May mutate `text` in place — specifically, after the closing
     /// `<channel|>` we strip leading whitespace so the visible content
     /// starts cleanly. Returns true if the (possibly modified) `text`
-    /// should be emitted, false if the token is structural and should
-    /// be dropped.
-    [[nodiscard]] bool feed(std::int32_t tokenId, std::string& text);
+    /// should be emitted as answer content, false if it should be
+    /// dropped or was entirely thinking.
+    ///
+    /// The model's thinking/reasoning (the Gemma 4 channel-thought body or
+    /// the Qwen3 `<think>…</think>` block) used to be discarded. It is now
+    /// routed out through `reasoning`: on return `reasoning` holds the
+    /// reasoning fragment produced by this token (possibly empty), so the
+    /// SSE path can surface it as `delta.reasoning_content` like vLLM /
+    /// llama.cpp do for reasoning models. Answer text goes to `text`,
+    /// reasoning to `reasoning`; the two never overlap for one token.
+    [[nodiscard]] bool feed(std::int32_t tokenId, std::string& text,
+                            std::string& reasoning);
+
+    /// Backward-compatible overload for callers that only want the answer
+    /// content and discard the reasoning (e.g. unit tests). Content behaviour
+    /// is identical to the three-argument form.
+    [[nodiscard]] bool feed(std::int32_t tokenId, std::string& text) {
+        std::string discard;
+        return feed(tokenId, text, discard);
+    }
 
 private:
     // Streaming strip of the pre-opened Qwen thinking block. InThink: swallow
@@ -87,8 +104,8 @@ private:
     // state for non-thinking Qwen2/2.5).
     enum class ThinkPhase { InThink, Done };
 
-    bool feedGemma4(std::int32_t tokenId, std::string& text);
-    bool feedQwenThink(std::string& text);
+    bool feedGemma4(std::int32_t tokenId, std::string& text, std::string& reasoning);
+    bool feedQwenThink(std::string& text, std::string& reasoning);
 
     ChatTemplate::Style _style;
     std::int32_t        _channelStartId;

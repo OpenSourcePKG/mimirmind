@@ -728,19 +728,24 @@ bool stripTrailing(std::string& s, std::string_view needle) {
 } // namespace
 
 std::string
-ChatTemplate::cleanResponse(Style style, std::string_view text) {
+ChatTemplate::cleanResponse(Style style, std::string_view text,
+                            std::string* reasoningOut) {
     std::string out{text};
     switch (style) {
         case Style::QwenChatML: {
             // Qwen3 "thinking" models (qwen35moe) have <think> pre-opened in
             // the generation prompt, so the response starts INSIDE the thinking
-            // block and closes it with a lone </think>. Drop everything up to
-            // and including that closer, then any leading whitespace. Qwen2/2.5
-            // never emit </think>, so this is a no-op there. <|im_end|> is
-            // already removed upstream via stopIds.
+            // block and closes it with a lone </think>. The text up to that
+            // closer is reasoning; drop it (or hand it back via reasoningOut),
+            // then any leading whitespace. Qwen2/2.5 never emit </think>, so
+            // this is a no-op there. <|im_end|> is already removed upstream via
+            // stopIds.
             constexpr std::string_view kThinkEnd{"</think>"};
             const auto end = out.find(kThinkEnd);
             if (end != std::string::npos) {
+                if (reasoningOut != nullptr) {
+                    *reasoningOut = out.substr(0, end);
+                }
                 out.erase(0, end + kThinkEnd.size());
                 while (!out.empty() && (out.front() == '\n' || out.front() == ' ' ||
                                         out.front() == '\t' || out.front() == '\r')) {
@@ -758,8 +763,12 @@ ChatTemplate::cleanResponse(Style style, std::string_view text) {
             // (then the channel is empty). Drop the whole wrapper.
             if (stripLeading(out, kGemma4ChannelStart)) {
                 // Now skip the channel-tag name + newline up to <channel|>.
+                // The body between the tag name and the closer is the thinking.
                 const auto end = out.find(kGemma4ChannelEnd);
                 if (end != std::string::npos) {
+                    if (reasoningOut != nullptr) {
+                        *reasoningOut = out.substr(0, end);
+                    }
                     out.erase(0, end + kGemma4ChannelEnd.size());
                 }
                 while (!out.empty() && (out.front() == '\n' ||
