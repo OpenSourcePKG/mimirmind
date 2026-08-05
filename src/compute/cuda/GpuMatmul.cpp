@@ -16,7 +16,11 @@
 #include "core/gpu/cuda/CudaStream.hpp"
 #include "core/log/Log.hpp"
 
+#include <cublasLt.h>
+#include <cuda_runtime.h>
+
 #include <algorithm>
+#include <unordered_map>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -204,6 +208,45 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _matmulNvblkVecKernel;
     ::mimirmind::core::cuda::CudaModule _matmulNvblkGemmModule;
     ::mimirmind::core::cuda::CudaKernel _matmulNvblkGemmKernel;
+    // cuBLASLt dense BF16 matmul (opt-in). The cast_f32_to_bf16 kernel stages
+    // the F32 activation into `_xBf16` before the tensor-core GEMM; the handle
+    // + workspace are created lazily on first use in cublasBf16Matmul().
+    ::mimirmind::core::cuda::CudaModule _castToF32Module;
+    ::mimirmind::core::cuda::CudaKernel _castF32ToBf16Kernel;
+    cublasLtHandle_t _ltHandle{nullptr};
+    void*            _ltWorkspace{nullptr};
+    std::size_t      _ltWorkspaceBytes{0};
+    void*            _xBf16{nullptr};   // staged BF16 activations (grows on demand)
+    std::size_t      _xBf16Bytes{0};
+
+    // cuBLASLt per-tensor FP8 path (opt-in). Quant kernels + a by-pointer cache
+    // of E4M3 weights (each with a device [scale,invScale] pair), plus per-call
+    // E4M3-activation staging and amax/scale scratch.
+    ::mimirmind::core::cuda::CudaModule _cublasFp8Module;
+    ::mimirmind::core::cuda::CudaKernel _amaxF32Kernel;
+    ::mimirmind::core::cuda::CudaKernel _amaxBf16Kernel;
+    ::mimirmind::core::cuda::CudaKernel _scaleFromAmaxKernel;
+    ::mimirmind::core::cuda::CudaKernel _castF32E4m3Kernel;
+    ::mimirmind::core::cuda::CudaKernel _castBf16E4m3Kernel;
+    struct Fp8W { void* data{nullptr}; void* scale{nullptr}; }; // E4M3 + [scale,inv]
+    std::unordered_map<const void*, Fp8W> _fp8WeightCache;
+    void*  _xFp8{nullptr};        // staged E4M3 activations (grows on demand)
+    std::size_t _xFp8Bytes{0};
+    void*  _xScaleDev{nullptr};   // 2 floats [scale, invScale] for X
+    void*  _amaxDev{nullptr};     // 1 float amax scratch
+
+    ~Impl() {
+        for (auto& kv : _fp8WeightCache) {
+            if (kv.second.data  != nullptr) { cudaFree(kv.second.data); }
+            if (kv.second.scale != nullptr) { cudaFree(kv.second.scale); }
+        }
+        if (_amaxDev != nullptr)     { cudaFree(_amaxDev); }
+        if (_xScaleDev != nullptr)   { cudaFree(_xScaleDev); }
+        if (_xFp8 != nullptr)        { cudaFree(_xFp8); }
+        if (_xBf16 != nullptr)       { cudaFree(_xBf16); }
+        if (_ltWorkspace != nullptr) { cudaFree(_ltWorkspace); }
+        if (_ltHandle != nullptr)    { cublasLtDestroy(_ltHandle); }
+    }
 
     explicit Impl(::mimirmind::core::cuda::CudaContext& ctx)
         : _matmulQ8_0VecModule    {loadCudaModule(ctx, "matmul_q8_0_vec")},
@@ -314,7 +357,19 @@ struct GpuMatmul::Impl {
               _matmulNvblkVecModule.getFunction("matmul_nvfp4blk_vec")},
           _matmulNvblkGemmModule  {loadCudaModule(ctx, "matmul_nvfp4blk_gemm")},
           _matmulNvblkGemmKernel  {
-              _matmulNvblkGemmModule.getFunction("matmul_nvfp4blk_gemm")}
+              _matmulNvblkGemmModule.getFunction("matmul_nvfp4blk_gemm")},
+          _castToF32Module        {loadCudaModule(ctx, "cast_to_f32")},
+          _castF32ToBf16Kernel    {
+              _castToF32Module.getFunction("cast_f32_to_bf16")},
+          _cublasFp8Module        {loadCudaModule(ctx, "cublas_fp8_quant")},
+          _amaxF32Kernel          {_cublasFp8Module.getFunction("amax_f32")},
+          _amaxBf16Kernel         {_cublasFp8Module.getFunction("amax_bf16")},
+          _scaleFromAmaxKernel    {
+              _cublasFp8Module.getFunction("scale_from_amax")},
+          _castF32E4m3Kernel      {
+              _cublasFp8Module.getFunction("cast_f32_to_e4m3")},
+          _castBf16E4m3Kernel     {
+              _cublasFp8Module.getFunction("cast_bf16_to_e4m3")}
     {}
 };
 
@@ -341,6 +396,24 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
     }
     if (const char* tt = std::getenv("MIMIRMIND_TF32_TC")) {
         _tf32Tc = (tt[0] != '\0' && !(tt[0] == '0' && tt[1] == '\0'));
+    }
+    if (const char* cb = std::getenv("MIMIRMIND_CUBLAS")) {
+        _useCublas = (cb[0] != '\0' && !(cb[0] == '0' && cb[1] == '\0'));
+    }
+    if (_useCublas) {
+        MM_LOG_INFO("hip::GpuMatmul",
+                    "cuBLASLt dense BF16 matmul enabled (MIMIRMIND_CUBLAS=1) — "
+                    "decode GEMV (M==1) and batched GEMM (M>1) route through "
+                    "cublasLtMatmul; hand kernels remain the fallback");
+    }
+    if (const char* cf = std::getenv("MIMIRMIND_CUBLAS_FP8")) {
+        _useCublasFp8 = (cf[0] != '\0' && !(cf[0] == '0' && cf[1] == '\0'));
+    }
+    if (_useCublasFp8) {
+        MM_LOG_INFO("hip::GpuMatmul",
+                    "cuBLASLt per-tensor FP8 (E4M3) dense matmul enabled "
+                    "(MIMIRMIND_CUBLAS_FP8=1) — BF16 weights quantised to E4M3 "
+                    "(cached) + per-call X quant; hand kernel is the fallback");
     }
     if (_tf32Tc) {
         MM_LOG_INFO("hip::GpuMatmul",
@@ -657,6 +730,271 @@ void GpuMatmul::matmul(::mimirmind::core::gguf::GgmlType type,
     sync();
 }
 
+bool GpuMatmul::cublasBf16Matmul(const void*  W,
+                                 std::size_t  N,
+                                 std::size_t  K,
+                                 const float* X,
+                                 std::size_t  M,
+                                 float*       Y) {
+    // Lazily create the cuBLASLt handle + a fixed workspace on first use.
+    if (_pimpl->_ltHandle == nullptr) {
+        if (cublasLtCreate(&_pimpl->_ltHandle) != CUBLAS_STATUS_SUCCESS) {
+            _pimpl->_ltHandle = nullptr;
+            return false;
+        }
+        _pimpl->_ltWorkspaceBytes = std::size_t{32} * 1024 * 1024;   // 32 MiB
+        if (cudaMalloc(&_pimpl->_ltWorkspace, _pimpl->_ltWorkspaceBytes)
+                != cudaSuccess) {
+            _pimpl->_ltWorkspace      = nullptr;
+            _pimpl->_ltWorkspaceBytes = 0;   // matmul still runs, no scratch
+        }
+    }
+
+    // Stage the F32 activation X[M*K] -> BF16 (grow the buffer on demand).
+    const std::size_t elems    = M * K;
+    const std::size_t needBytes = elems * sizeof(std::uint16_t);   // BF16 = 2B
+    if (needBytes > _pimpl->_xBf16Bytes) {
+        if (_pimpl->_xBf16 != nullptr) {
+            cudaFree(_pimpl->_xBf16);
+            _pimpl->_xBf16 = nullptr;
+        }
+        if (cudaMalloc(&_pimpl->_xBf16, needBytes) != cudaSuccess) {
+            _pimpl->_xBf16      = nullptr;
+            _pimpl->_xBf16Bytes = 0;
+            return false;
+        }
+        _pimpl->_xBf16Bytes = needBytes;
+    }
+    {
+        auto& kern = _pimpl->_castF32ToBf16Kernel;
+        constexpr std::uint32_t kCastLocal = 256;
+        const std::uint32_t grid = static_cast<std::uint32_t>(
+            (elems + kCastLocal - 1) / kCastLocal);
+        kern.setPtr  (0, X);
+        kern.setPtr  (1, _pimpl->_xBf16);
+        kern.setValue(2, static_cast<std::int64_t>(elems));
+        kern.launch(_ctx.stream(), grid, 1, 1, kCastLocal, 1, 1);
+    }
+
+    // Column-major cuBLASLt. The logical (row-major) op is
+    //   Y[m,n] = sum_k X[m,k] * W[n,k]   (Y = X @ W^T).
+    // Row-major W[N,K] read as column-major is a [K,N] matrix (Aw[k,n]=W[n,k]),
+    // ld=K; row-major X[M,K] read column-major is [K,M] (ld=K); Y as row-major
+    // [M,N] is column-major [N,M], ld=N. So D[N,M] = op_T(Aw[K,N]) @ Bx[K,M].
+    const int nI = static_cast<int>(N);
+    const int mI = static_cast<int>(M);
+    const int kI = static_cast<int>(K);
+
+    cublasLtMatmulDesc_t   op = nullptr;
+    cublasLtMatrixLayout_t aL = nullptr, bL = nullptr, cL = nullptr;
+    const cublasOperation_t opT = CUBLAS_OP_T;
+    const cublasOperation_t opN = CUBLAS_OP_N;
+
+    bool ok =
+        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F)
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulDescSetAttribute(
+               op, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulDescSetAttribute(
+               op, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatrixLayoutCreate(&aL, CUDA_R_16BF, kI, nI, kI)
+            == CUBLAS_STATUS_SUCCESS   // A = W  [K,N] col-major, op=T
+        && cublasLtMatrixLayoutCreate(&bL, CUDA_R_16BF, kI, mI, kI)
+            == CUBLAS_STATUS_SUCCESS   // B = Xbf16 [K,M] col-major, op=N
+        && cublasLtMatrixLayoutCreate(&cL, CUDA_R_32F, nI, mI, nI)
+            == CUBLAS_STATUS_SUCCESS;  // D = Y  [N,M] col-major
+
+    if (ok) {
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+        const cublasStatus_t st = cublasLtMatmul(
+            _pimpl->_ltHandle, op,
+            &alpha,
+            W,              aL,
+            _pimpl->_xBf16, bL,
+            &beta,
+            Y,              cL,
+            Y,              cL,
+            nullptr,        // let cuBLASLt heuristically pick the algo
+            _pimpl->_ltWorkspace, _pimpl->_ltWorkspaceBytes,
+            _ctx.stream().handle());
+        ok = (st == CUBLAS_STATUS_SUCCESS);
+    }
+
+    if (cL != nullptr) { cublasLtMatrixLayoutDestroy(cL); }
+    if (bL != nullptr) { cublasLtMatrixLayoutDestroy(bL); }
+    if (aL != nullptr) { cublasLtMatrixLayoutDestroy(aL); }
+    if (op != nullptr) { cublasLtMatmulDescDestroy(op); }
+    return ok;
+}
+
+bool GpuMatmul::cublasFp8Matmul(const void*  W,
+                                std::size_t  N,
+                                std::size_t  K,
+                                const float* X,
+                                std::size_t  M,
+                                float*       Y) {
+    if (_pimpl->_ltHandle == nullptr) {
+        if (cublasLtCreate(&_pimpl->_ltHandle) != CUBLAS_STATUS_SUCCESS) {
+            _pimpl->_ltHandle = nullptr;
+            return false;
+        }
+        _pimpl->_ltWorkspaceBytes = std::size_t{32} * 1024 * 1024;
+        if (cudaMalloc(&_pimpl->_ltWorkspace, _pimpl->_ltWorkspaceBytes)
+                != cudaSuccess) {
+            _pimpl->_ltWorkspace      = nullptr;
+            _pimpl->_ltWorkspaceBytes = 0;
+        }
+    }
+    if (_pimpl->_xScaleDev == nullptr
+            && cudaMalloc(&_pimpl->_xScaleDev, 2 * sizeof(float)) != cudaSuccess) {
+        _pimpl->_xScaleDev = nullptr;
+        return false;
+    }
+    if (_pimpl->_amaxDev == nullptr
+            && cudaMalloc(&_pimpl->_amaxDev, sizeof(float)) != cudaSuccess) {
+        _pimpl->_amaxDev = nullptr;
+        return false;
+    }
+
+    cudaStream_t stream = _ctx.stream().handle();
+    constexpr std::uint32_t kLocal = 256;
+    auto gridOf = [](std::size_t n) {
+        return static_cast<std::uint32_t>((n + kLocal - 1) / kLocal);
+    };
+
+    // ---- W: quantise BF16 -> per-tensor E4M3 once, cache by pointer ----------
+    auto wit = _pimpl->_fp8WeightCache.find(W);
+    if (wit == _pimpl->_fp8WeightCache.end()) {
+        const std::size_t wElems = N * K;
+        void* wData  = nullptr;
+        void* wScale = nullptr;
+        if (cudaMalloc(&wData, wElems) != cudaSuccess) {
+            return false;
+        }
+        if (cudaMalloc(&wScale, 2 * sizeof(float)) != cudaSuccess) {
+            cudaFree(wData);
+            return false;
+        }
+        void* wInv = static_cast<char*>(wScale) + sizeof(float);
+        cudaMemsetAsync(_pimpl->_amaxDev, 0, sizeof(float), stream);
+        _pimpl->_amaxBf16Kernel.setPtr  (0, W);
+        _pimpl->_amaxBf16Kernel.setPtr  (1, _pimpl->_amaxDev);
+        _pimpl->_amaxBf16Kernel.setValue(2, static_cast<std::int64_t>(wElems));
+        _pimpl->_amaxBf16Kernel.launch(_ctx.stream(), gridOf(wElems), 1, 1,
+                                       kLocal, 1, 1);
+        _pimpl->_scaleFromAmaxKernel.setPtr(0, _pimpl->_amaxDev);
+        _pimpl->_scaleFromAmaxKernel.setPtr(1, wScale);
+        _pimpl->_scaleFromAmaxKernel.setPtr(2, wInv);
+        _pimpl->_scaleFromAmaxKernel.launch(_ctx.stream(), 1, 1, 1, 1, 1, 1);
+        _pimpl->_castBf16E4m3Kernel.setPtr  (0, W);
+        _pimpl->_castBf16E4m3Kernel.setPtr  (1, wData);
+        _pimpl->_castBf16E4m3Kernel.setPtr  (2, wInv);
+        _pimpl->_castBf16E4m3Kernel.setValue(3, static_cast<std::int64_t>(wElems));
+        _pimpl->_castBf16E4m3Kernel.launch(_ctx.stream(), gridOf(wElems), 1, 1,
+                                           kLocal, 1, 1);
+        wit = _pimpl->_fp8WeightCache.emplace(
+            W, Impl::Fp8W{wData, wScale}).first;
+    }
+    void* wData  = wit->second.data;
+    void* wScale = wit->second.scale;
+
+    // ---- X: quantise F32 -> per-tensor E4M3 per call -------------------------
+    const std::size_t xElems = M * K;
+    if (xElems > _pimpl->_xFp8Bytes) {
+        if (_pimpl->_xFp8 != nullptr) {
+            cudaFree(_pimpl->_xFp8);
+            _pimpl->_xFp8 = nullptr;
+        }
+        if (cudaMalloc(&_pimpl->_xFp8, xElems) != cudaSuccess) {
+            _pimpl->_xFp8Bytes = 0;
+            return false;
+        }
+        _pimpl->_xFp8Bytes = xElems;
+    }
+    void* xInv = static_cast<char*>(_pimpl->_xScaleDev) + sizeof(float);
+    cudaMemsetAsync(_pimpl->_amaxDev, 0, sizeof(float), stream);
+    _pimpl->_amaxF32Kernel.setPtr  (0, X);
+    _pimpl->_amaxF32Kernel.setPtr  (1, _pimpl->_amaxDev);
+    _pimpl->_amaxF32Kernel.setValue(2, static_cast<std::int64_t>(xElems));
+    _pimpl->_amaxF32Kernel.launch(_ctx.stream(), gridOf(xElems), 1, 1,
+                                  kLocal, 1, 1);
+    _pimpl->_scaleFromAmaxKernel.setPtr(0, _pimpl->_amaxDev);
+    _pimpl->_scaleFromAmaxKernel.setPtr(1, _pimpl->_xScaleDev);
+    _pimpl->_scaleFromAmaxKernel.setPtr(2, xInv);
+    _pimpl->_scaleFromAmaxKernel.launch(_ctx.stream(), 1, 1, 1, 1, 1, 1);
+    _pimpl->_castF32E4m3Kernel.setPtr  (0, X);
+    _pimpl->_castF32E4m3Kernel.setPtr  (1, _pimpl->_xFp8);
+    _pimpl->_castF32E4m3Kernel.setPtr  (2, xInv);
+    _pimpl->_castF32E4m3Kernel.setValue(3, static_cast<std::int64_t>(xElems));
+    _pimpl->_castF32E4m3Kernel.launch(_ctx.stream(), gridOf(xElems), 1, 1,
+                                      kLocal, 1, 1);
+
+    // ---- cuBLASLt per-tensor FP8 matmul (same col-major layout as BF16) ------
+    const int nI = static_cast<int>(N);
+    const int mI = static_cast<int>(M);
+    const int kI = static_cast<int>(K);
+    cublasLtMatmulDesc_t   op = nullptr;
+    cublasLtMatrixLayout_t aL = nullptr, bL = nullptr, cL = nullptr;
+    const cublasOperation_t opT = CUBLAS_OP_T;
+    const cublasOperation_t opN = CUBLAS_OP_N;
+    const std::int32_t scaleMode = CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+
+    bool ok =
+        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F)
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulDescSetAttribute(
+               op, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulDescSetAttribute(
+               op, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulDescSetAttribute(
+               op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &scaleMode, sizeof(scaleMode))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulDescSetAttribute(
+               op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &scaleMode, sizeof(scaleMode))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulDescSetAttribute(
+               op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &wScale, sizeof(wScale))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulDescSetAttribute(
+               op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+               &_pimpl->_xScaleDev, sizeof(void*))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatrixLayoutCreate(&aL, CUDA_R_8F_E4M3, kI, nI, kI)
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatrixLayoutCreate(&bL, CUDA_R_8F_E4M3, kI, mI, kI)
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatrixLayoutCreate(&cL, CUDA_R_32F, nI, mI, nI)
+            == CUBLAS_STATUS_SUCCESS;
+
+    if (ok) {
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+        const cublasStatus_t st = cublasLtMatmul(
+            _pimpl->_ltHandle, op,
+            &alpha,
+            wData,         aL,
+            _pimpl->_xFp8, bL,
+            &beta,
+            Y,             cL,
+            Y,             cL,
+            nullptr,
+            _pimpl->_ltWorkspace, _pimpl->_ltWorkspaceBytes,
+            stream);
+        ok = (st == CUBLAS_STATUS_SUCCESS);
+    }
+
+    if (cL != nullptr) { cublasLtMatrixLayoutDestroy(cL); }
+    if (bL != nullptr) { cublasLtMatrixLayoutDestroy(bL); }
+    if (aL != nullptr) { cublasLtMatrixLayoutDestroy(aL); }
+    if (op != nullptr) { cublasLtMatmulDescDestroy(op); }
+    return ok;
+}
+
 void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
                             const void*     W,
                             std::size_t     N,
@@ -845,6 +1183,20 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
         // CPU-fallback below (~seconds per token).
         const std::uint32_t nGroups = static_cast<std::uint32_t>(
             (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+
+        // Opt-in cuBLASLt paths (decode GEMV + batched GEMM). FP8 first (half
+        // the weight bytes), then BF16. Both fall through to the hand kernels
+        // below if disabled or the shape is unsupported.
+        // FP8 is gated to M==1 (decode): the per-tensor E4M3 activation quant is
+        // validated for the single-token GEMV, but a large prefill activation
+        // (M>1) can hold outliers that make the amax/448 scale crush precision,
+        // so prefill stays on the higher-fidelity BF16 path below.
+        if (_useCublasFp8 && M == 1 && cublasFp8Matmul(W, N, K, X, M, Y)) {
+            return;
+        }
+        if (_useCublas && cublasBf16Matmul(W, N, K, X, M, Y)) {
+            return;
+        }
 
         if (M == 1) {
             // Single-token decode: GEMV, one weight read per output.

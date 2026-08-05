@@ -776,6 +776,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/dequant_nvfp4.cu
         kernels/cuda/common/dequant_fp8.cu
         kernels/cuda/common/cast_to_f32.cu
+        kernels/cuda/common/cublas_fp8_quant.cu
         kernels/cuda/llm/neg_exp.cu
         kernels/cuda/llm/add_one.cu
     )
@@ -876,6 +877,10 @@ if(MIMIRMIND_ENABLE_CUDA)
         #                     CudaKernel for runtime PTX module load.
         CUDA::cudart
         CUDA::cuda_driver
+        # CUDA::cublasLt = cuBLASLt (part of the CUDA Toolkit). Drives the
+        # dense BF16 matmul path in GpuMatmul (tensor-core GEMM/GEMV) as an
+        # opt-in alternative to the hand-written matmul_bf16_* kernels.
+        CUDA::cublasLt
     )
 endif()
 

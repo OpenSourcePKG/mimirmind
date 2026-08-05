@@ -347,6 +347,17 @@ private:
     // Default ON; MIMIRMIND_TF32_TC=0 rolls back to BF16-TC. Takes precedence
     // over BF16-TC when both are on.
     bool                           _tf32Tc{true};
+    // Route the dense BF16 matmul (decode GEMV M==1 and batched GEMM M>1)
+    // through cuBLASLt instead of the hand-written matmul_bf16_* kernels.
+    // Opt-in for A/B (MIMIRMIND_CUBLAS=1); the hand kernels stay the default
+    // and the safe fallback when cuBLASLt is unavailable or errors.
+    bool                           _useCublas{false};
+    // As _useCublas but routes the dense BF16 branch through cuBLASLt *FP8*
+    // (per-tensor E4M3): W is quantised BF16->E4M3 once (cached) and X per call,
+    // both with an amax/448 device scale. Opt-in MIMIRMIND_CUBLAS_FP8=1. Reads
+    // half the weight bytes of the BF16 cuBLAS path; falls back to the hand
+    // kernel if cuBLASLt does not support the shape (e.g. M=1 non-TC).
+    bool                           _useCublasFp8{false};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
                                    _vecMsAtM{};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
@@ -361,6 +372,28 @@ private:
     // the operator knows a slow correctness path is active; subsequent
     // dispatches stay silent to avoid per-block log spam during prefill.
     bool                           _cpuFallbackLogged{false};
+
+    // cuBLASLt dense BF16 matmul (opt-in via _useCublas). Computes
+    // Y[M,N] (F32) = X[M,K] (F32->BF16) @ W[N,K] (BF16)^T on tensor cores.
+    // Returns false if cuBLASLt is unavailable / errors, so the caller falls
+    // back to the hand-written matmul_bf16_* kernels. State (handle, work-
+    // space, X-staging buffer) lives in Impl.
+    [[nodiscard]] bool cublasBf16Matmul(const void*  W,
+                                        std::size_t  N,
+                                        std::size_t  K,
+                                        const float* X,
+                                        std::size_t  M,
+                                        float*       Y);
+
+    // cuBLASLt per-tensor FP8 (E4M3) dense matmul. W is BF16 on entry; it is
+    // quantised to E4M3 once and cached by pointer. Returns false (-> hand
+    // kernel) if cuBLASLt cannot service the shape.
+    [[nodiscard]] bool cublasFp8Matmul(const void*  W,
+                                       std::size_t  N,
+                                       std::size_t  K,
+                                       const float* X,
+                                       std::size_t  M,
+                                       float*       Y);
 };
 
 } // namespace mimirmind::compute::cuda

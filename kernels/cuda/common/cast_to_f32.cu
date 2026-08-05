@@ -48,3 +48,21 @@ void cast_f16_to_f32(
     }
     out[gid] = __half2float(src[gid]);
 }
+
+// Narrow an F32 tensor to BF16. Used by the cuBLASLt dense-matmul path
+// (GpuMatmul): cublasLtMatmul needs both operands in the same tensor-core
+// type, so the F32 activation `X` is staged to BF16 here before the GEMM
+// against the (already BF16) weight. Same rounding the in-kernel BF16-TC
+// GEMM already applies to activations, so no extra fidelity loss.
+extern "C" __global__ __launch_bounds__(CAST_TO_F32_LOCAL)
+void cast_f32_to_bf16(
+    const float*    __restrict__ src, // (n,) F32
+    __nv_bfloat16*  __restrict__ out, // (n,) BF16
+    const long                   n)
+{
+    const long gid = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= n) {
+        return;
+    }
+    out[gid] = __float2bfloat16(src[gid]);
+}
