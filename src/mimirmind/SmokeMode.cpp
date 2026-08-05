@@ -12,6 +12,7 @@
 #include "core/config/Config.hpp"
 #include "core/log/Log.hpp"
 #include "runtime/InferenceEngine.hpp"
+#include "runtime/nvfp4/ModelFormatResolver.hpp"
 
 #ifdef MIMIRMIND_HAVE_L0
 #include "core/gpu/l0/UsmAllocator.hpp"
@@ -80,7 +81,28 @@ int runSmoke(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         std::cout.flush();
         MM_LOG_INFO("main", "[M3] opening model '{}'", args.modelPath);
 
-        engine.loadModel(args.modelPath);
+        // Dispatch NVFP4 checkpoints (a directory / .safetensors) to the
+        // dedicated loader, mirroring ServeMode. The declared format from
+        // the config's default model entry wins — a bare directory path has
+        // no extension for the resolver to auto-detect NVFP4 from.
+        core::config::ModelFormat smokeFormat =
+            core::config::ModelFormat::Gguf;
+        std::string smokeTokenizerGguf;
+        if (!cfg.models.empty()) {
+            const auto& dm = cfg.defaultModelEntry();
+            if (dm.path == args.modelPath) {
+                smokeFormat        = dm.format;
+                smokeTokenizerGguf = dm.tokenizerGguf;
+            }
+        }
+        if (runtime::nvfp4::resolveModelFormat(smokeFormat, args.modelPath)
+            == core::config::ModelFormat::Nvfp4) {
+            MM_LOG_INFO("main", "[M3] loading NVFP4 model '{}'",
+                        args.modelPath);
+            engine.loadModelNvfp4(args.modelPath, smokeTokenizerGguf);
+        } else {
+            engine.loadModel(args.modelPath);
+        }
 
         // Apply runtime.kvDtype / runtime.maxContextTokens from
         // config.json — mirrors ServeMode.cpp:197-200 (setKvDtype +

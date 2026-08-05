@@ -337,6 +337,11 @@ private:
 
     bool _moeGroupEnabled;
     bool _moeFusedDownEnabled;
+    // M-dependent dense FP8 (env MIMIRMIND_DENSE_FP8_LOWM). Max batch (nSeq/T)
+    // at which the FP8 ".fp8" dense variants are preferred over BF16; 0 = off.
+    // The loader adds the variants only when this is set, so pickDense() falls
+    // back to BF16 whenever they are absent.
+    std::size_t _denseFp8MaxT{0};
     // M-Q3N.5: device-side MoE top-K (env MIMIRMIND_MOE_DEVICE_TOPK). When on
     // AND the fully-fused decode path applies, top-K runs on the device and
     // the host moeTopKRoute + host->USM copy are skipped (no per-layer host

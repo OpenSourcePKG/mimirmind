@@ -720,6 +720,69 @@ void Nvfp4Loader::load(InferenceEngine& e,
         }
     }
 
+    // 5g. M-dependent dense FP8 (dual-copy). KEEP the BF16 dense projections
+    // AND add a blocked-FP8 E4M3 ".fp8" variant of each, exposed as a separate
+    // WeightsMap tensor. The backend then reads FP8 at low batch (decode is
+    // memory-bound there: FP8 halves the always-read dense traffic, +~15%
+    // single-request, bit-coherent since these projections are natively FP8 in
+    // the checkpoint) and the BF16 copy at high batch (compute-bound, where the
+    // TF32 tensor-core path wins). Opt-in via MIMIRMIND_DENSE_FP8_LOWM=<maxSeq>
+    // (the FP8 copy costs ~1.3 GiB — trivial on 128 GB unified). Independent of
+    // the static 5e MIMIRMIND_NVFP4_ATTN_FP8 replace-in-place path.
+    {
+        const char* lowmEnv = std::getenv("MIMIRMIND_DENSE_FP8_LOWM");
+        if (lowmEnv != nullptr && std::atoi(lowmEnv) > 0) {
+            auto isDense = [](std::string_view n) {
+                return n.ends_with(".attn_qkv.weight")
+                    || n.ends_with(".attn_gate.weight")
+                    || n.ends_with(".ssm_out.weight")
+                    || n.ends_with(".attn_q.weight")
+                    || n.ends_with(".attn_k.weight")
+                    || n.ends_with(".attn_v.weight")
+                    || n.ends_with(".attn_output.weight");
+            };
+            std::vector<runtime::nvfp4::MaterializedTensor> variants;
+            std::size_t   nDual = 0;
+            std::uint64_t addBytes = 0;
+            for (auto& t : e._materializedBf16) {
+                if (t.isF32 || t.isQ8_0 || t.isQ4K || t.isQ6K || t.isFp8 ||
+                    t.isNvfp4Blk) {
+                    continue;
+                }
+                if (t.ggufDims.size() < 2 || !isDense(t.ggufName)) {
+                    continue;
+                }
+                const std::uint64_t K    = t.ggufDims[0];
+                const std::uint64_t rows = t.ggufDims[1];
+                if (K == 0 || rows == 0 || (K % 32) != 0 || K * rows != t.elems) {
+                    continue;
+                }
+                const std::size_t fp8Bytes =
+                    (static_cast<std::size_t>(t.elems) / 32) * 34;
+                compute::ComputeBuffer fp8 = devOps.allocate(fp8Bytes);
+                devOps.quantizeBf16ToFp8(fp8.get(), t.buffer.get(), rows, K);
+                cudaCtx.stream().synchronize();
+                runtime::nvfp4::MaterializedTensor v;
+                v.ggufName = t.ggufName + ".fp8";
+                v.buffer   = std::move(fp8);
+                v.ggufDims = t.ggufDims;
+                v.elems    = t.elems;
+                v.isFp8    = true;
+                variants.push_back(std::move(v));
+                addBytes += fp8Bytes;
+                ++nDual;
+            }
+            for (auto& v : variants) {
+                e._materializedBf16.push_back(std::move(v));
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: M-dependent dense FP8 — added {} FP8 "
+                        "'.fp8' variants (+{} MiB), BF16 kept (FP8 used for "
+                        "nSeq<={})",
+                        nDual, addBytes >> 20, std::atoi(lowmEnv));
+        }
+    }
+
     // 6. Expose the BF16 tensors as a GGUF-convention WeightsMap.
     e._weights.emplace(runtime::nvfp4::buildBf16WeightsMap(e._materializedBf16));
 

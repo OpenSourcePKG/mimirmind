@@ -61,6 +61,25 @@ requireBlock(const core::gguf::WeightsMap& w, std::size_t blockIdx,
     return *t;
 }
 
+// M-dependent dense-weight pick (M-Cuda dense-FP8-lowM). At low batch
+// (seqCount <= maxT) prefer the blocked-FP8 E4M3 ".fp8" variant — decode is
+// memory-bound there and FP8 halves the always-read dense traffic (+~15%
+// single-request, bit-coherent). At high batch use the BF16 copy — compute-
+// bound, where the TF32 tensor-core GEMM wins. Falls back to BF16 when maxT==0
+// or the model carries no ".fp8" variant (dual-copy not loaded).
+const core::gguf::GgufTensor&
+pickDense(const core::gguf::WeightsMap& w, std::size_t blockIdx,
+          std::string_view suffix, std::size_t seqCount, std::size_t maxT) {
+    if (maxT > 0 && seqCount <= maxT) {
+        std::string fp8Suffix(suffix);
+        fp8Suffix += ".fp8";
+        if (const auto* v = w.findBlock(blockIdx, fp8Suffix)) {
+            return *v;
+        }
+    }
+    return requireBlock(w, blockIdx, suffix);
+}
+
 } // namespace
 
 Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
@@ -75,6 +94,13 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
       _ops{ops}, _gmm{gmm}, _op{opProfiler},
       _moeGroupEnabled{moeGroupEnabled},
       _moeFusedDownEnabled{moeFusedDownEnabled} {
+    // M-dependent dense FP8: read the max batch at which the FP8 ".fp8" dense
+    // variants are preferred (0 = off / no dual-copy). Must match the loader's
+    // MIMIRMIND_DENSE_FP8_LOWM (which decides whether the variants exist).
+    if (const char* m = std::getenv("MIMIRMIND_DENSE_FP8_LOWM")) {
+        const long v = std::strtol(m, nullptr, 10);
+        _denseFp8MaxT = v > 0 ? static_cast<std::size_t>(v) : 0;
+    }
     if (const char* g = std::getenv("MIMIRMIND_GROUPED_MOE")) {
         // Opt-in only (default off). "1" = host-driven grouped (Option 1,
         // slower than fused-K batched on GB10 — per-layer expOffset D2H + host
@@ -306,12 +332,12 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
 
     const auto& w    = _weights;
     const auto& attnNorm = requireBlock(w, blockIdx, "attn_norm.weight");
-    const auto& qW       = requireBlock(w, blockIdx, "attn_q.weight");
-    const auto& kW       = requireBlock(w, blockIdx, "attn_k.weight");
-    const auto& vW       = requireBlock(w, blockIdx, "attn_v.weight");
+    const auto& qW       = pickDense(w, blockIdx, "attn_q.weight", T, _denseFp8MaxT);
+    const auto& kW       = pickDense(w, blockIdx, "attn_k.weight", T, _denseFp8MaxT);
+    const auto& vW       = pickDense(w, blockIdx, "attn_v.weight", T, _denseFp8MaxT);
     const auto& qNorm    = requireBlock(w, blockIdx, "attn_q_norm.weight");
     const auto& kNorm    = requireBlock(w, blockIdx, "attn_k_norm.weight");
-    const auto& oW       = requireBlock(w, blockIdx, "attn_output.weight");
+    const auto& oW       = pickDense(w, blockIdx, "attn_output.weight", T, _denseFp8MaxT);
     const auto& attnPost = requireBlock(w, blockIdx, "post_attention_norm.weight");
 
     const std::size_t d_model  = s.d_model;
@@ -573,15 +599,15 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
 
     const auto& w = _weights;
     const auto& attnNorm  = requireBlock(w, blockIdx, "attn_norm.weight");
-    const auto& qkvW      = requireBlock(w, blockIdx, "attn_qkv.weight");
-    const auto& gateW     = requireBlock(w, blockIdx, "attn_gate.weight");
+    const auto& qkvW      = pickDense(w, blockIdx, "attn_qkv.weight", T, _denseFp8MaxT);
+    const auto& gateW     = pickDense(w, blockIdx, "attn_gate.weight", T, _denseFp8MaxT);
     const auto& betaW     = requireBlock(w, blockIdx, "ssm_beta.weight");
     const auto& alphaW    = requireBlock(w, blockIdx, "ssm_alpha.weight");
     const auto& ssmA      = requireBlock(w, blockIdx, "ssm_a");
     const auto& ssmDt     = requireBlock(w, blockIdx, "ssm_dt.bias");
     const auto& convW     = requireBlock(w, blockIdx, "ssm_conv1d.weight");
     const auto& ssmNormW  = requireBlock(w, blockIdx, "ssm_norm.weight");
-    const auto& ssmOutW   = requireBlock(w, blockIdx, "ssm_out.weight");
+    const auto& ssmOutW   = pickDense(w, blockIdx, "ssm_out.weight", T, _denseFp8MaxT);
     const auto& attnPost  = requireBlock(w, blockIdx, "post_attention_norm.weight");
 
     const std::size_t d_model   = s.d_model;
@@ -1708,12 +1734,12 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
 
     const auto& w        = _weights;
     const auto& attnNorm = requireBlock(w, blockIdx, "attn_norm.weight");
-    const auto& qW       = requireBlock(w, blockIdx, "attn_q.weight");
-    const auto& kW       = requireBlock(w, blockIdx, "attn_k.weight");
-    const auto& vW       = requireBlock(w, blockIdx, "attn_v.weight");
+    const auto& qW       = pickDense(w, blockIdx, "attn_q.weight", nSeq, _denseFp8MaxT);
+    const auto& kW       = pickDense(w, blockIdx, "attn_k.weight", nSeq, _denseFp8MaxT);
+    const auto& vW       = pickDense(w, blockIdx, "attn_v.weight", nSeq, _denseFp8MaxT);
     const auto& qNorm    = requireBlock(w, blockIdx, "attn_q_norm.weight");
     const auto& kNorm    = requireBlock(w, blockIdx, "attn_k_norm.weight");
-    const auto& oW       = requireBlock(w, blockIdx, "attn_output.weight");
+    const auto& oW       = pickDense(w, blockIdx, "attn_output.weight", nSeq, _denseFp8MaxT);
     const auto& attnPost = requireBlock(w, blockIdx, "post_attention_norm.weight");
 
     const std::size_t d_model  = s.d_model;
@@ -1837,15 +1863,15 @@ void Qwen35MoeBackend::runLinearBlockBatched(
 
     const auto& w        = _weights;
     const auto& attnNorm = requireBlock(w, blockIdx, "attn_norm.weight");
-    const auto& qkvW     = requireBlock(w, blockIdx, "attn_qkv.weight");
-    const auto& gateW    = requireBlock(w, blockIdx, "attn_gate.weight");
+    const auto& qkvW     = pickDense(w, blockIdx, "attn_qkv.weight", nSeq, _denseFp8MaxT);
+    const auto& gateW    = pickDense(w, blockIdx, "attn_gate.weight", nSeq, _denseFp8MaxT);
     const auto& betaW    = requireBlock(w, blockIdx, "ssm_beta.weight");
     const auto& alphaW   = requireBlock(w, blockIdx, "ssm_alpha.weight");
     const auto& ssmA     = requireBlock(w, blockIdx, "ssm_a");
     const auto& ssmDt    = requireBlock(w, blockIdx, "ssm_dt.bias");
     const auto& convW    = requireBlock(w, blockIdx, "ssm_conv1d.weight");
     const auto& ssmNormW = requireBlock(w, blockIdx, "ssm_norm.weight");
-    const auto& ssmOutW  = requireBlock(w, blockIdx, "ssm_out.weight");
+    const auto& ssmOutW  = pickDense(w, blockIdx, "ssm_out.weight", nSeq, _denseFp8MaxT);
     const auto& attnPost = requireBlock(w, blockIdx, "post_attention_norm.weight");
 
     const std::size_t d_model        = s.d_model;
