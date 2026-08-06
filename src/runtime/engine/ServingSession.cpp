@@ -424,26 +424,26 @@ ServingSession::generateBatch(
         }
     };
 
-    auto lmHeadSample = [&]() {
+    // Greedy sampling on-device: compute the per-row argmax with a device kernel
+    // and read back only nSeq token ids (4 B each), instead of the full logits
+    // (nSeq * vocab_lm floats = ~600 KB/seq) plus a host argmax over the whole
+    // vocabulary. That host round-trip is a big per-step cost that CUDA graphs
+    // do not remove (it is not launch overhead) and that vLLM avoids by sampling
+    // on the GPU.
+    auto argmaxDev = _e._ops->allocate(nSeq * sizeof(std::int32_t));
+    std::vector<std::int32_t> toksHost(nSeq);
+    auto lmHeadSample = [&]() -> std::vector<std::int32_t> {
         _e._ops->rmsNormAsync(xBuf, nSeq, d_model,
                               static_cast<const float*>(outNorm->usmPtr),
                               _e._config.rmsNormEps, normBuf);
         _e._gmm->matmul(lmHead->type, lmHead->usmPtr, vocab_lm, d_model,
                         normBuf, nSeq, logits, lmScr.as<float>());
+        _e._ops->argmaxRowsAsync(logits, argmaxDev.as<std::int32_t>(),
+                                 nSeq, vocab_lm);
         _e._ops->flush();
-        std::vector<float> host(nSeq * vocab_lm);
-        _e._ops->readbackToHost(host.data(), logits, nSeq * vocab_lm * sizeof(float));
-        std::vector<std::int32_t> toks(nSeq);
-        for (std::size_t s = 0; s < nSeq; ++s) {
-            const float* row = host.data() + s * vocab_lm;
-            std::size_t best = 0;
-            float bv = row[0];
-            for (std::size_t v = 1; v < vocab_lm; ++v) {
-                if (row[v] > bv) { bv = row[v]; best = v; }
-            }
-            toks[s] = static_cast<std::int32_t>(best);
-        }
-        return toks;
+        _e._ops->readbackToHost(toksHost.data(), argmaxDev.get(),
+                                nSeq * sizeof(std::int32_t));
+        return toksHost;
     };
 
     // Lockstep decode: at global step g every sequence is at position g,
