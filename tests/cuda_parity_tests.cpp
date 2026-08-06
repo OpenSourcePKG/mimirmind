@@ -2271,6 +2271,104 @@ TEST(cuda_moe_grouped_gemm_parity_single_expert) {
     checkMoeGroupedGemmParity({50, 0, 0}, /*N=*/32, /*K=*/96, 0xB0Bu);
 }
 
+// NVFP4 de-interleaved vectorised matvec (M=1) — parity vs the 20-byte blocked
+// matmul_nvfp4blk_gemm(rows=1) baseline + a bandwidth A/B. Proves whether the
+// uint4 coalesced load on a de-interleaved layout lifts the ~42%-of-peak DRAM
+// throughput of the interleaved byte/half path toward vLLM's ~80%.
+TEST(cuda_nvfp4blk_deint_vec_bw) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    constexpr int N = 8192, K = 2048;
+    constexpr int kNvSuperBytes = 20;
+    const int nSuper = K / 32;
+
+    Lcg g{0xDEEEu};
+    auto nextU32 = [&]() -> std::uint32_t {
+        const float f = g.next();
+        return static_cast<std::uint32_t>((f + 1.0f) * 2.1e9f);
+    };
+
+    std::vector<float> X(K);
+    for (auto& v : X) v = g.next();
+
+    // 20-byte blocked weight [N][nSuper][20] (fp16 s0|s1 | 16 nibble-bytes).
+    std::vector<unsigned char> W(static_cast<std::size_t>(N) * nSuper * kNvSuperBytes);
+    for (std::size_t off = 0; off + kNvSuperBytes <= W.size(); off += kNvSuperBytes) {
+        for (int h = 0; h < 2; ++h) {
+            std::uint32_t bits = nextU32() & 0xFFFFu;
+            if (((bits >> 10) & 0x1Fu) == 0x1Fu) bits &= ~(1u << 14);
+            W[off + h * 2 + 0] = static_cast<unsigned char>(bits & 0xFFu);
+            W[off + h * 2 + 1] = static_cast<unsigned char>((bits >> 8) & 0xFFu);
+        }
+        for (int b = 4; b < kNvSuperBytes; ++b)
+            W[off + b] = static_cast<unsigned char>(nextU32() & 0xFFu);
+    }
+
+    // De-interleave: nib[N][nSuper][16], scale-bytes[N][nSuper][4] (=2 fp16).
+    std::vector<unsigned char> nibD(static_cast<std::size_t>(N) * nSuper * 16);
+    std::vector<unsigned char> scD (static_cast<std::size_t>(N) * nSuper * 4);
+    for (std::size_t s = 0; s < static_cast<std::size_t>(N) * nSuper; ++s) {
+        const unsigned char* src = &W[s * kNvSuperBytes];
+        for (int b = 0; b < 4;  ++b) scD [s * 4  + b] = src[b];
+        for (int b = 0; b < 16; ++b) nibD[s * 16 + b] = src[4 + b];
+    }
+
+    namespace cc = ::mimirmind::core::cuda;
+    cc::CudaModule oldMod = cc::CudaModule::fromFile(
+        ctx.cudaContext(), resolvePtx("matmul_nvfp4blk_gemm"));
+    cc::CudaKernel oldK = oldMod.getFunction("matmul_nvfp4blk_gemm");
+    cc::CudaModule newMod = cc::CudaModule::fromFile(
+        ctx.cudaContext(), resolvePtx("matmul_nvfp4blk_deint_vec"));
+    cc::CudaKernel newK = newMod.getFunction("matmul_nvfp4blk_deint_vec");
+
+    auto dX   = toDevice(ops, X);
+    auto dW   = uploadRaw(ops, W);
+    auto dNib = uploadRaw(ops, nibD);
+    auto dSc  = uploadRaw(ops, scD);
+    std::vector<float> zeros(N, 0.0f);
+    auto dYo = uploadRaw(ops, zeros);
+    auto dYn = uploadRaw(ops, zeros);
+    const std::uint32_t gx = static_cast<std::uint32_t>((N + 3) / 4);
+
+    auto launchOld = [&]() {
+        oldK.setPtr(0, dX.get()); oldK.setPtr(1, dW.get()); oldK.setPtr(2, dYo.get());
+        oldK.setValue(3, K); oldK.setValue(4, N); oldK.setValue(5, 1);
+        oldK.launch(ctx.stream(), gx, 1, 1, 128, 1, 1);
+    };
+    auto launchNew = [&]() {
+        newK.setPtr(0, dX.get()); newK.setPtr(1, dNib.get()); newK.setPtr(2, dSc.get());
+        newK.setPtr(3, dYn.get()); newK.setValue(4, N); newK.setValue(5, K);
+        newK.launch(ctx.stream(), gx, 1, 1, 128, 1, 1, K * sizeof(float));
+    };
+
+    launchOld(); launchNew(); ops.flush();
+    auto yo = fromDevice(ops, dYo.get(), N);
+    auto yn = fromDevice(ops, dYn.get(), N);
+    double maxRel = 0.0;
+    for (int i = 0; i < N; ++i) {
+        const double denom = std::max(1e-3, std::fabs(static_cast<double>(yo[i])));
+        maxRel = std::max(maxRel, std::fabs(static_cast<double>(yn[i] - yo[i])) / denom);
+        EXPECT_NEAR(yn[i], yo[i], 1e-2f * (1.0f + std::fabs(yo[i])));
+    }
+
+    constexpr int ITERS = 2000;
+    const double bytes = static_cast<double>(N) * K * 0.625;   // NVFP4 weight bytes
+    auto bench = [&](auto fn) {
+        fn(); ops.flush();
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < ITERS; ++i) fn();
+        ops.flush();
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const double sec = std::chrono::duration<double>(t1 - t0).count();
+        return (bytes * ITERS) / sec / 1e9;                   // GB/s
+    };
+    const double gbOld = bench(launchOld);
+    const double gbNew = bench(launchNew);
+    std::printf("[nvfp4-deint-vec] N=%d K=%d maxRel=%.2e | OLD %.1f GB/s | NEW %.1f GB/s "
+                "(%.2fx, peak 273)\n", N, K, maxRel, gbOld, gbNew, gbNew / gbOld);
+}
+
 // M-Cuda.MoeGroup Sub-Step B — moe_gather_rows: xCompact[r]=x[rowSrcTok[r]].
 TEST(cuda_moe_gather_rows_parity) {
     CudaComputeContext ctx{};
