@@ -684,11 +684,13 @@ void ServingSession::stepServing(
         st.qb->runBlockBatched(b, xBuf, ctx, *st.sb);
     }
 
+    _e._ops->profileSection("lmhead");
     _e._ops->rmsNormAsync(xBuf, nSeq, st.d_model,
                           static_cast<const float*>(st.outNorm->usmPtr),
                           _e._config.rmsNormEps, normBuf);
     _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, st.d_model,
                     normBuf, nSeq, logits, st.lmScr.as<float>());
+    _e._ops->profileStepEnd();
     _e._ops->flush();
     _e._ops->readbackToHost(st.hostLogits.data(), logits,
                             nSeq * st.vocab_lm * sizeof(float));

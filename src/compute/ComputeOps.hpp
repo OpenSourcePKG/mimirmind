@@ -793,6 +793,16 @@ public:
     /// hold `ComputeOps&`.
     virtual void flush() = 0;
 
+    /// Lightweight decode-step self-profiler (MIMIRMIND_DECODE_PROFILE).
+    /// `profileSection(name)` closes the previous timed section and opens a new
+    /// one named `name` on the compute stream; `profileStepEnd()` closes the
+    /// last section and periodically logs the per-name accumulated ms. Default:
+    /// no-op (disabled / non-CUDA backends). Purely diagnostic — the CUDA
+    /// override syncs per section, so timings are for attribution, not the
+    /// pipelined wall-clock.
+    virtual void profileSection(const char* name) { (void)name; }
+    virtual void profileStepEnd() {}
+
     /// Copy `bytes` from a device buffer to a plain host buffer
     /// synchronously — the CPU can dereference `dst` immediately after
     /// return.

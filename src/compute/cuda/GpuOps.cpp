@@ -284,6 +284,14 @@ struct GpuOps::Impl {
         compute::ComputeBuffer scale;
     };
     std::unordered_map<const void*, DeintBank> _deintCache;
+
+    // MIMIRMIND_DECODE_PROFILE self-profiler.
+    bool        _profOn{false};
+    cudaEvent_t _profA{nullptr};
+    cudaEvent_t _profB{nullptr};
+    std::string _profPrev;
+    int         _profSteps{0};
+    std::vector<std::pair<std::string, double>> _profAcc;   // insertion order
     // GD-b: decode small-M variant (acc[4] + 4 KB shared) from the same module.
     core::cuda::CudaKernel _moeGroupedGemmNvfp4M4Kernel;
     // E-d.4b: padding infra (one module, four kernels) + act-quant.
@@ -518,6 +526,13 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
         const std::int32_t zero = 0;
         alloc.copyH2D(_curLenSlotUsm, &zero, sizeof(std::int32_t));
     }
+    if (const char* pp = std::getenv("MIMIRMIND_DECODE_PROFILE")) {
+        _pimpl->_profOn = (pp[0] == '1' && pp[1] == '\0');
+    }
+    if (_pimpl->_profOn) {
+        cudaEventCreate(&_pimpl->_profA);
+        cudaEventCreate(&_pimpl->_profB);
+    }
 
     // Second slot: always-0 sentinel for the Q8_0 fp32-staging pipeline.
     // Same design point as the L0 side — one slot advances with curLen,
@@ -673,6 +688,67 @@ void GpuOps::appendMemoryCopy(void* dst, const void* src, std::size_t bytes) {
 
 void GpuOps::flush() {
     _ctx.stream().synchronize();
+}
+
+void GpuOps::profileSection(const char* name) {
+    if (!_pimpl->_profOn) {
+        return;
+    }
+    cudaStream_t s = _ctx.stream().handle();
+    if (!_pimpl->_profPrev.empty()) {
+        cudaEventRecord(_pimpl->_profB, s);
+        cudaEventSynchronize(_pimpl->_profB);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, _pimpl->_profA, _pimpl->_profB);
+        bool found = false;
+        for (auto& p : _pimpl->_profAcc) {
+            if (p.first == _pimpl->_profPrev) { p.second += ms; found = true; break; }
+        }
+        if (!found) {
+            _pimpl->_profAcc.emplace_back(_pimpl->_profPrev,
+                                          static_cast<double>(ms));
+        }
+    }
+    cudaEventRecord(_pimpl->_profA, s);
+    _pimpl->_profPrev = name;
+}
+
+void GpuOps::profileStepEnd() {
+    if (!_pimpl->_profOn) {
+        return;
+    }
+    if (!_pimpl->_profPrev.empty()) {
+        cudaStream_t s = _ctx.stream().handle();
+        cudaEventRecord(_pimpl->_profB, s);
+        cudaEventSynchronize(_pimpl->_profB);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, _pimpl->_profA, _pimpl->_profB);
+        bool found = false;
+        for (auto& p : _pimpl->_profAcc) {
+            if (p.first == _pimpl->_profPrev) { p.second += ms; found = true; break; }
+        }
+        if (!found) {
+            _pimpl->_profAcc.emplace_back(_pimpl->_profPrev,
+                                          static_cast<double>(ms));
+        }
+        _pimpl->_profPrev.clear();
+    }
+    if (++_pimpl->_profSteps >= 32) {
+        double total = 0.0;
+        for (auto& p : _pimpl->_profAcc) total += p.second;
+        std::string line;
+        for (auto& p : _pimpl->_profAcc) {
+            const double perStep = p.second / 32.0;
+            const double pct = (total > 0.0) ? (100.0 * p.second / total) : 0.0;
+            line += " " + p.first + "="
+                  + std::to_string(perStep).substr(0, 6) + "ms("
+                  + std::to_string(static_cast<int>(pct + 0.5)) + "%)";
+        }
+        MM_LOG_INFO("decode-prof", "32-step avg, ms/step:{} | total={}",
+                    line, std::to_string(total / 32.0).substr(0, 6));
+        _pimpl->_profAcc.clear();
+        _pimpl->_profSteps = 0;
+    }
 }
 
 void GpuOps::readbackToHost(void* hostDst, const void* deviceSrc,

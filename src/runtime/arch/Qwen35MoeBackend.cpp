@@ -1153,6 +1153,7 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
                                         float*         kwSlot,
                                         BlockBuffers&  s) {
     namespace cmp = mimirmind::compute;
+    _ops.profileSection("moe");
 
     // The batched fused-K fast path only exists for the separate Q4_K
     // gate/up + Q5_K down decode layout. Any other layout/quant (notably
@@ -1374,6 +1375,7 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
                                         BlockBuffers&  s,
                                         bool           preferBlocked) {
     const auto& w = _weights;
+    _ops.profileSection("moe");
 
     // Same layout gate as runMoeFfnBatched: SEPARATE gate/up + down banks the
     // fused-K kernels support. Anything else -> fall back to the generic
@@ -1596,6 +1598,7 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         const auto* const downBase =
             static_cast<const unsigned char*>(downExps.usmPtr);
 
+        _ops.profileSection("moe.gemm");
         // gate/up: weight [nExperts][n_ff_exp][d_model] (N=n_ff_exp, K=d_model)
         // Single-user decode (nSeq==1 => <=1 row/tile) can take the de-inter-
         // leaved uint4-coalesced kernel (~2x DRAM bandwidth); everything else
@@ -1745,6 +1748,7 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
     if (nSeq == 0) {
         return;
     }
+    _ops.profileSection("attn");
     if (ctx.pool == nullptr) {
         throw std::runtime_error(
             "runFullAttentionBlockBatched: null PagedKvPool in context");
@@ -1892,6 +1896,7 @@ void Qwen35MoeBackend::runLinearBlockBatched(
         std::size_t blockIdx, float* x, const BatchedDecodeCtx& ctx,
         BlockBuffers& s) {
     const std::size_t nSeq = ctx.nSeq;
+    _ops.profileSection("gdn");
     if (nSeq == 0) {
         return;
     }
