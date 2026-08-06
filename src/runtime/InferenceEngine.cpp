@@ -1623,8 +1623,15 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                 _cudaDecodeGraph.launch(cudaOps().stream());
                 _backend->runBlock(_config.blockCount - 1, xBuf, 1, cache,
                                    buffers, false);
-            } else if (cudaGraphEnabled && step == 1) {
-                // Capture the trunk once. The engine now owns the curLen slot
+            } else if (cudaGraphEnabled && step == 2) {
+                // Warmup-before-capture (vLLM's dummy-run pattern): step 1 runs
+                // the first decode-shaped forward in IMMEDIATE mode (the else
+                // branch below), so all lazy decode-shape work — cuBLAS(Lt)
+                // workspace + algo selection, dynamic-smem opt-in
+                // (cudaFuncSetAttribute), first-touch scratch allocs — happens
+                // BEFORE capture. Capturing at step 1 recorded those illegal ops
+                // and always failed at block 0 (GDN). Capture the warmed trunk at
+                // step 2. The engine now owns the curLen slot
                 // (per-kernel staging off) and pre-sets it; the embedding /
                 // scale enqueued above run before capture (drained by the
                 // sync), so only the block loop is captured.

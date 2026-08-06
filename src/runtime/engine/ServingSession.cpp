@@ -10,6 +10,10 @@
 #include "runtime/SsmState.hpp"
 #include "runtime/arch/Qwen35MoeBackend.hpp"
 #include "runtime/serving/PagedKvPool.hpp"
+#ifdef MIMIRMIND_HAVE_CUDA
+#include "core/gpu/cuda/CudaGraph.hpp"
+#include "compute/cuda/GpuOps.hpp"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -274,6 +278,20 @@ ServingSession::generateBatch(
     std::size_t ohSteps = 0;
     using clk = std::chrono::steady_clock;
 
+    // Serving-decode CUDA-graph probe (Milestone 0): capture the device-driven
+    // block loop once (after a warmup step so lazy decode-shape work is done) and
+    // replay it. NOTE: correctness needs the per-step ctx values
+    // (writeBlockId/writeSlot/maxSeqLen) to become device slots updated OUTSIDE
+    // the graph; until then replay reuses the capture step's KV write location,
+    // so this probe measures capturability + replay speed, not correct tokens.
+    // Env-gated, CUDA-only.
+#ifdef MIMIRMIND_HAVE_CUDA
+    const bool servingGraphOn = std::getenv("MIMIRMIND_SERVING_GRAPH") != nullptr;
+    core::cuda::CudaGraph servingGraph;
+    bool        servingGraphFailed = false;
+    std::size_t decStep            = 0;
+#endif
+
     auto stepForward = [&](std::size_t p) {
         const auto tp0 = clk::now();
         cmp::embeddingLookup(tokEmb->type, tokEmb->usmPtr, d_model, vocab_emb,
@@ -332,14 +350,47 @@ ServingSession::generateBatch(
                 ++ohSteps;
             }
         } else {
-            for (std::size_t b = 0; b < blockCount; ++b) {
-                const auto tb0 = timing ? clk::now() : clk::time_point{};
-                qb->runBlockBatched(b, xBuf, ctx, sb);
-                if (timing) {
-                    _e._ops->flush();
-                    const double dt =
-                        std::chrono::duration<double, std::milli>(clk::now() - tb0).count();
-                    if (_e._config.isRecurrentLayer(b)) tLin += dt; else tFull += dt;
+#ifdef MIMIRMIND_HAVE_CUDA
+            if (servingGraphOn && !servingGraphFailed && !timing) {
+                auto blockLoop = [&] {
+                    for (std::size_t b = 0; b < blockCount; ++b) {
+                        qb->runBlockBatched(b, xBuf, ctx, sb);
+                    }
+                };
+                if (servingGraph.valid()) {
+                    servingGraph.launch(_e.cudaOps().stream());
+                } else if (decStep >= 1) {
+                    // Warmup-before-capture: decStep 0 ran immediate (below) so
+                    // lazy decode-shape work is done; capture the warmed loop now.
+                    try {
+                        servingGraph.capture(_e.cudaOps().stream(), blockLoop);
+                        servingGraph.launch(_e.cudaOps().stream());
+                        MM_LOG_INFO("serving-graph",
+                            "capture SUCCEEDED ({} blocks) — device-driven serving "
+                            "decode loop is graph-capturable; replaying from now",
+                            blockCount);
+                    } catch (const std::exception& ex) {
+                        MM_LOG_WARN("serving-graph",
+                            "capture FAILED: {} — immediate fallback", ex.what());
+                        servingGraphFailed = true;
+                        blockLoop();
+                    }
+                } else {
+                    blockLoop();   // decStep 0: warmup, immediate
+                }
+                ++decStep;
+            } else
+#endif
+            {
+                for (std::size_t b = 0; b < blockCount; ++b) {
+                    const auto tb0 = timing ? clk::now() : clk::time_point{};
+                    qb->runBlockBatched(b, xBuf, ctx, sb);
+                    if (timing) {
+                        _e._ops->flush();
+                        const double dt =
+                            std::chrono::duration<double, std::milli>(clk::now() - tb0).count();
+                        if (_e._config.isRecurrentLayer(b)) tLin += dt; else tFull += dt;
+                    }
                 }
             }
         }
