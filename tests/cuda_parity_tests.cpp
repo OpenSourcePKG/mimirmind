@@ -1754,6 +1754,120 @@ TEST(cuda_paged_attention_v1_decode_parity) {
                 nSeq, nHeads, nKvHeads, headSize, blockSize, maxErr);
 }
 
+// M-Cuda.Batch B3 — paged_attention_v2 (split-K FlashDecoding) vs the SAME CPU
+// softmax reference. seq_lens > PARTITION_SIZE (512) so V2 actually splits the
+// KV into partitions + runs the reduce merge. Ragged lengths cover full,
+// partial and single-partition sequences. Must match V1 / the CPU ref.
+TEST(cuda_paged_attention_v2_decode_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const int   nSeq = 3, nHeads = 8, nKvHeads = 2, headSize = 256, blockSize = 16;
+    const int   seqLens[nSeq] = {600, 1300, 100};   // 2 / 3 / 1 partitions
+    const float scale   = 1.0f / std::sqrt(static_cast<float>(headSize));
+    const float softcap = 0.0f;
+    int maxSeqLen = 0;
+    for (int s = 0; s < nSeq; ++s) maxSeqLen = std::max(maxSeqLen, seqLens[s]);
+
+    int maxBlocks = 0;
+    for (int s = 0; s < nSeq; ++s) {
+        maxBlocks = std::max(maxBlocks, (seqLens[s] + blockSize - 1) / blockSize);
+    }
+    std::vector<int> blockTables(static_cast<std::size_t>(nSeq) * maxBlocks, -1);
+    int nextBlock = 0;
+    for (int s = 0; s < nSeq; ++s) {
+        const int nb = (seqLens[s] + blockSize - 1) / blockSize;
+        for (int b = 0; b < nb; ++b) {
+            blockTables[static_cast<std::size_t>(s) * maxBlocks + b] = nextBlock++;
+        }
+    }
+    const int numBlocks = nextBlock;
+    const int kvDim     = nKvHeads * headSize;
+
+    std::vector<float> keyPool(static_cast<std::size_t>(numBlocks) * blockSize * kvDim, 0.0f);
+    std::vector<float> valPool(static_cast<std::size_t>(numBlocks) * blockSize * kvDim, 0.0f);
+    Lcg gk{0x51u}, gv{0x62u}, gq{0x73u};
+    std::vector<float> query(static_cast<std::size_t>(nSeq) * nHeads * headSize);
+    for (auto& x : query) x = gq.next();
+    for (int s = 0; s < nSeq; ++s) {
+        for (int p = 0; p < seqLens[s]; ++p) {
+            const int blk  = blockTables[static_cast<std::size_t>(s) * maxBlocks + p / blockSize];
+            const int slot = p % blockSize;
+            for (int h = 0; h < nKvHeads; ++h) {
+                for (int d = 0; d < headSize; ++d) {
+                    const long off =
+                        ((static_cast<long>(blk) * blockSize + slot) * nKvHeads + h) * headSize + d;
+                    keyPool[off] = gk.next();
+                    valPool[off] = gv.next();
+                }
+            }
+        }
+    }
+
+    auto dOut = ops.allocate(static_cast<std::size_t>(nSeq) * nHeads * headSize * sizeof(float));
+    auto dQ   = toDevice(ops, query);
+    auto dK   = toDevice(ops, keyPool);
+    auto dV   = toDevice(ops, valPool);
+    auto dBT  = uploadRaw(ops, blockTables);
+    std::vector<int> seqLensV(seqLens, seqLens + nSeq);
+    auto dSL  = uploadRaw(ops, seqLensV);
+
+    ops.pagedAttentionDecodeV2Async(
+        static_cast<float*>(dOut.get()),
+        static_cast<const float*>(dQ.get()),
+        static_cast<const float*>(dK.get()),
+        static_cast<const float*>(dV.get()),
+        static_cast<const std::int32_t*>(dBT.get()),
+        static_cast<const std::int32_t*>(dSL.get()),
+        nSeq, nHeads, nKvHeads, headSize, blockSize, maxBlocks,
+        static_cast<std::size_t>(maxSeqLen), scale, softcap);
+    ops.flush();
+    auto got = fromDevice(ops, dOut.get(),
+                          static_cast<std::size_t>(nSeq) * nHeads * headSize);
+
+    double maxErr = 0.0;
+    for (int s = 0; s < nSeq; ++s) {
+        for (int hq = 0; hq < nHeads; ++hq) {
+            const int hkv = (hq * nKvHeads) / nHeads;
+            std::vector<float> logits(seqLens[s]);
+            float mx = -1.0e30f;
+            for (int p = 0; p < seqLens[s]; ++p) {
+                const int  blk  = blockTables[static_cast<std::size_t>(s) * maxBlocks + p / blockSize];
+                const int  slot = p % blockSize;
+                const long koff = (static_cast<long>(blk) * blockSize + slot) * nKvHeads * headSize
+                                  + static_cast<long>(hkv) * headSize;
+                float dot = 0.0f;
+                for (int d = 0; d < headSize; ++d) {
+                    dot += query[(static_cast<std::size_t>(s) * nHeads + hq) * headSize + d]
+                           * keyPool[koff + d];
+                }
+                float lg = dot * scale;
+                if (softcap > 0.0f) lg = softcap * std::tanh(lg / softcap);
+                logits[p] = lg;
+                mx = std::max(mx, lg);
+            }
+            float sum = 0.0f;
+            for (float& lg : logits) { lg = std::exp(lg - mx); sum += lg; }
+            std::vector<float> o(headSize, 0.0f);
+            for (int p = 0; p < seqLens[s]; ++p) {
+                const int  blk  = blockTables[static_cast<std::size_t>(s) * maxBlocks + p / blockSize];
+                const int  slot = p % blockSize;
+                const long voff = (static_cast<long>(blk) * blockSize + slot) * nKvHeads * headSize
+                                  + static_cast<long>(hkv) * headSize;
+                const float wgt = logits[p] / sum;
+                for (int d = 0; d < headSize; ++d) o[d] += wgt * valPool[voff + d];
+            }
+            for (int d = 0; d < headSize; ++d) {
+                const float g = got[(static_cast<std::size_t>(s) * nHeads + hq) * headSize + d];
+                maxErr = std::max(maxErr, std::fabs(static_cast<double>(g) - static_cast<double>(o[d])));
+                EXPECT_NEAR(g, o[d], 1e-3f);
+            }
+        }
+    }
+    std::printf("[paged-attn-v2-parity] nSeq=%d maxSeqLen=%d parts=%d maxErr=%.2e\n",
+                nSeq, maxSeqLen, (maxSeqLen + 511) / 512, maxErr);
+}
+
 // M-Cuda.MoeGroup Sub-Step A — device token-grouping build vs CPU golden.
 //
 // moe_group_build turns flat per-assignment routing (expIdx[R], kw[R],

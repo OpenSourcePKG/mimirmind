@@ -341,6 +341,27 @@ public:
             "pagedAttentionDecodeV1Async: not supported on this backend");
     }
 
+    /// Split-K (partition-parallel) paged decode attention — kernels
+    /// `paged_attention_v2` + `paged_attention_v2_reduce`. Same result as V1
+    /// but parallelises the KV traversal across `ceil(maxSeqLen/512)` partitions
+    /// so long-context decode fills the GPU (FlashDecoding / vLLM v2 pattern).
+    /// Workspace is managed internally by the implementation. Default: fall back
+    /// to the single-pass V1 (correct, just not partition-parallel); CUDA
+    /// overrides with the real split-K path.
+    virtual void pagedAttentionDecodeV2Async(
+            float* out, const float* query, const float* keyCache,
+            const float* valueCache, const std::int32_t* blockTables,
+            const std::int32_t* seqLens, std::size_t numSeqs,
+            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
+            std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
+            std::size_t maxSeqLen, float scale, float softcap) {
+        (void)maxSeqLen;
+        pagedAttentionDecodeV1Async(out, query, keyCache, valueCache,
+                                    blockTables, seqLens, numSeqs, numHeads,
+                                    numKvHeads, headSize, blockSize,
+                                    maxNumBlocksPerSeq, scale, softcap);
+    }
+
     /// Chunked-prefill stage K1: per-chunk ungated triangular inverse A0
     /// (a0 [nChunks,H,C,C]). Reference: compute::deltanetKktSolveInverse.
     /// Default: unsupported; CUDA overrides.

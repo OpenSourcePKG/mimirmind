@@ -128,6 +128,9 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
     if (const char* t = std::getenv("MIMIRMIND_GROUPED_MOE_DECODE_TC")) {
         _moeGroupedDecodeTc = (t[0] == '1' && t[1] == '\0');
     }
+    if (const char* p = std::getenv("MIMIRMIND_PAGED_V1")) {
+        _forcePagedV1 = (p[0] == '1' && p[1] == '\0');
+    }
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     if (const char* d = std::getenv("MIMIRMIND_SSM_DUMP")) {
         _ssmDump    = true;
@@ -1826,11 +1829,24 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
 
     // --- paged GQA attention (block-table indirection) ---------------
     const float attnScale = _config.attentionScaleFor(head_dim);
-    _ops.pagedAttentionDecodeV1Async(
-        attnOut, qBuf, ctx.pool->keyPool(denseLayer),
-        ctx.pool->valuePool(denseLayer), ctx.blockTablesDev, ctx.seqLensDev,
-        nSeq, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
-        ctx.maxBlocksPerSeq, attnScale, /*softcap=*/0.0f);
+    // Split-K paged decode (V2) when the context is long enough to split;
+    // V2 internally falls back to the single-pass V1 for short/unknown
+    // (maxSeqLen<=partition) contexts so short-prompt decode keeps V1's speed.
+    // MIMIRMIND_PAGED_V1=1 forces the old single-pass path (A/B + rollback).
+    if (_forcePagedV1) {
+        _ops.pagedAttentionDecodeV1Async(
+            attnOut, qBuf, ctx.pool->keyPool(denseLayer),
+            ctx.pool->valuePool(denseLayer), ctx.blockTablesDev, ctx.seqLensDev,
+            nSeq, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
+            ctx.maxBlocksPerSeq, attnScale, /*softcap=*/0.0f);
+    } else {
+        _ops.pagedAttentionDecodeV2Async(
+            attnOut, qBuf, ctx.pool->keyPool(denseLayer),
+            ctx.pool->valuePool(denseLayer), ctx.blockTablesDev, ctx.seqLensDev,
+            nSeq, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
+            ctx.maxBlocksPerSeq, static_cast<std::size_t>(ctx.maxSeqLen),
+            attnScale, /*softcap=*/0.0f);
+    }
 
     // --- output gate + O projection + attn residual ------------------
     _ops.sigmoidGateMulAsync(attnOut, gateBuf, nSeq, q_dim, /*gateDim=*/q_dim);

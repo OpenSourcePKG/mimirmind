@@ -104,39 +104,132 @@ void paged_attention_v2(
     const int                 block_size,
     const int                 max_num_blocks_per_seq,
     const int                 max_num_partitions,       // for tmp_out stride
-    const int                 partition_size,           // = PAGED_ATTN_V2_PARTITION_SIZE, passed for consistency
-    const float               scale,
-    const float               softcap,                  // 0.0f = disabled; > 0 = Gemma-4
-    const int                 kv_cache_dtype)
+    const float               scale)
 {
-    // Compile-time sanity: keep the signature stable. Any change here
-    // must be mirrored in src/core/gpu/cuda/PagedAttentionV2.hpp.
-    (void)tmp_out;
-    (void)exp_sums;
-    (void)max_logits;
-    (void)query;
-    (void)key_cache;
-    (void)value_cache;
-    (void)block_tables;
-    (void)seq_lens;
-    (void)num_seqs;
-    (void)num_heads;
-    (void)num_kv_heads;
-    (void)head_size;
-    (void)block_size;
-    (void)max_num_blocks_per_seq;
-    (void)max_num_partitions;
-    (void)partition_size;
-    (void)scale;
-    (void)softcap;
-    (void)kv_cache_dtype;
+    // ---- Partition-parallel paged-KV decode (M-Cuda.Batch B3 body) ------
+    // Same streaming-softmax compute as paged_attention_v1, but each
+    // workgroup walks only its [p_start, p_end) K-range (one partition) and
+    // emits the UNNORMALISED partial (acc, m, l) for the reduce kernel to
+    // merge — the FlashDecoding / vLLM-v2 split-K pattern. fp32 KV only + no
+    // soft-cap (qwen35moe full-attn); the CudaKernel 16-arg cap forced
+    // partition_size to the compile-time constant and dropped the softcap /
+    // dtype args — the C++ wrapper routes softcap>0 to V1.
+    constexpr int partition_size = PAGED_ATTN_V2_PARTITION_SIZE;
 
-    // TODO(M-Cuda.Batch B3 body): partition-parallel FA2-Ampere with
-    // paged-KV indirection. Same compute pattern as v1's eventual
-    // body, but only walks a [partition_start, partition_end) K-range
-    // instead of the full KV. Writes partial (o, m, l) instead of the
-    // final output. Blueprint refs in the file header.
-    __trap();
+    const int hq   = static_cast<int>(blockIdx.x);   // query head
+    const int seq  = static_cast<int>(blockIdx.y);   // sequence
+    const int part = static_cast<int>(blockIdx.z);   // partition index
+    if (hq >= num_heads || seq >= num_seqs || part >= max_num_partitions) {
+        return;
+    }
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int nthr = static_cast<int>(blockDim.x);
+
+    const int hkv     = (hq * num_kv_heads) / num_heads;
+    const int seq_len = seq_lens[seq];
+    const int p_start = part * partition_size;
+    int       p_end   = p_start + partition_size;
+    if (p_end > seq_len) {
+        p_end = seq_len;
+    }
+
+    // Partial-output slot for this (seq, head, partition).
+    const long part_idx =
+        (static_cast<long>(seq) * num_heads + hq) * max_num_partitions + part;
+    float* __restrict__ o_row = tmp_out + part_idx * head_size;
+
+    const float* __restrict__ q_row =
+        query + (static_cast<long>(seq) * num_heads + hq) * head_size;
+
+    extern __shared__ float smem[];
+    float* __restrict__ sq  = smem;                     // [head_size]
+    float* __restrict__ acc = smem + head_size;         // [head_size]
+    float* __restrict__ red = smem + 2 * head_size;     // [nthr]
+
+    for (int d = tid; d < head_size; d += nthr) {
+        sq[d]  = q_row[d];
+        acc[d] = 0.0f;
+    }
+    __syncthreads();
+
+    // Empty partition (past this sequence's length): emit a neutral partial
+    // (m = -inf, l = 0, acc = 0) so the reduce kernel skips it cleanly.
+    if (p_start >= p_end) {
+        if (tid == 0) {
+            max_logits[part_idx] = -1.0e30f;
+            exp_sums[part_idx]   = 0.0f;
+        }
+        for (int d = tid; d < head_size; d += nthr) {
+            o_row[d] = 0.0f;
+        }
+        return;
+    }
+
+    __shared__ float s_m;      // running row-max
+    __shared__ float s_l;      // running softmax denominator
+    __shared__ float s_score;  // broadcast of current logit
+    if (tid == 0) {
+        s_m = -1.0e30f;
+        s_l = 0.0f;
+    }
+    __syncthreads();
+
+    const float* __restrict__ kbase = static_cast<const float*>(key_cache);
+    const float* __restrict__ vbase = static_cast<const float*>(value_cache);
+    const int*   __restrict__ bt =
+        block_tables + static_cast<long>(seq) * max_num_blocks_per_seq;
+
+    for (int p = p_start; p < p_end; ++p) {
+        const int  blk    = bt[p / block_size];
+        const int  slot   = p % block_size;
+        const long kv_off =
+            ((static_cast<long>(blk) * block_size + slot) * num_kv_heads + hkv)
+            * head_size;
+        const float* __restrict__ k_p = kbase + kv_off;
+
+        float partial = 0.0f;
+        for (int d = tid; d < head_size; d += nthr) {
+            partial += sq[d] * k_p[d];
+        }
+        red[tid] = partial;
+        __syncthreads();
+        for (int stride = nthr >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                red[tid] += red[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            s_score = red[0] * scale;
+        }
+        __syncthreads();
+
+        const float score   = s_score;
+        const float m_new    = fmaxf(s_m, score);
+        const float rescale  = __expf(s_m - m_new);
+        const float p_exp    = __expf(score - m_new);
+        const float* __restrict__ v_p = vbase + kv_off;
+        for (int d = tid; d < head_size; d += nthr) {
+            acc[d] = acc[d] * rescale + p_exp * v_p[d];
+        }
+        __syncthreads();
+        if (tid == 0) {
+            s_l = s_l * rescale + p_exp;
+            s_m = m_new;
+        }
+        __syncthreads();
+    }
+
+    // Emit UNNORMALISED partials: acc (sum of p_exp*v), plus m and l. The
+    // reduce kernel rescales across partitions and divides by the global l.
+    if (tid == 0) {
+        max_logits[part_idx] = s_m;
+        exp_sums[part_idx]   = s_l;
+    }
+    for (int d = tid; d < head_size; d += nthr) {
+        o_row[d] = acc[d];
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -156,28 +249,88 @@ void paged_attention_v2_reduce(
     const int                 num_seqs,
     const int                 num_heads,
     const int                 head_size,
-    const int                 max_num_partitions,
-    const int                 partition_size)
+    const int                 max_num_partitions)
 {
-    // Compile-time sanity — mirror in PagedAttentionV2.hpp.
-    (void)out;
-    (void)exp_sums;
-    (void)max_logits;
-    (void)tmp_out;
-    (void)seq_lens;
-    (void)num_seqs;
-    (void)num_heads;
-    (void)head_size;
-    (void)max_num_partitions;
-    (void)partition_size;
+    // ---- Online-softmax merge across partitions (M-Cuda.Batch B3) -------
+    constexpr int partition_size = PAGED_ATTN_V2_PARTITION_SIZE;
+    const int hq  = static_cast<int>(blockIdx.x);   // query head
+    const int seq = static_cast<int>(blockIdx.y);   // sequence
+    if (hq >= num_heads || seq >= num_seqs) {
+        return;
+    }
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int nthr = static_cast<int>(blockDim.x);
 
-    // TODO(M-Cuda.Batch B3 body): online-softmax merge across
-    // partitions. Same math as our existing L0 kernel
-    // attention_flash_merge.cl adapted to paged-partition layout:
-    //   m_global = max_i(max_logits[i])
-    //   l_global = sum_i(exp_sums[i] * exp(max_logits[i] - m_global))
-    //   o_global = sum_i(tmp_out[i] * exp(max_logits[i] - m_global))
-    //              / l_global
-    // Only partitions with i < ceil(seq_len / partition_size) contribute.
-    __trap();
+    const int seq_len   = seq_lens[seq];
+    int       num_parts = (seq_len + partition_size - 1) / partition_size;
+    if (num_parts > max_num_partitions) {
+        num_parts = max_num_partitions;
+    }
+
+    const long base = static_cast<long>(seq) * num_heads + hq;
+    float* __restrict__ o_row = out + base * head_size;
+
+    if (num_parts <= 0) {
+        for (int d = tid; d < head_size; d += nthr) {
+            o_row[d] = 0.0f;
+        }
+        return;
+    }
+
+    const float* __restrict__ ml = max_logits + base * max_num_partitions;
+    const float* __restrict__ es = exp_sums   + base * max_num_partitions;
+    const float* __restrict__ to =
+        tmp_out + base * max_num_partitions * head_size;   // [max_num_partitions, head_size]
+
+    extern __shared__ float rsmem[];   // [nthr]
+
+    // Phase 1: global max of the per-partition max-logits.
+    float lm = -1.0e30f;
+    for (int i = tid; i < num_parts; i += nthr) {
+        lm = fmaxf(lm, ml[i]);
+    }
+    rsmem[tid] = lm;
+    __syncthreads();
+    for (int stride = nthr >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            rsmem[tid] = fmaxf(rsmem[tid], rsmem[tid + stride]);
+        }
+        __syncthreads();
+    }
+    __shared__ float s_mg;
+    if (tid == 0) {
+        s_mg = rsmem[0];
+    }
+    __syncthreads();
+    const float mg = s_mg;
+
+    // Phase 2: global softmax denominator l = sum_i es[i] * exp(ml[i] - mg).
+    float ll = 0.0f;
+    for (int i = tid; i < num_parts; i += nthr) {
+        ll += es[i] * __expf(ml[i] - mg);
+    }
+    rsmem[tid] = ll;
+    __syncthreads();
+    for (int stride = nthr >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            rsmem[tid] += rsmem[tid + stride];
+        }
+        __syncthreads();
+    }
+    __shared__ float s_lg;
+    if (tid == 0) {
+        s_lg = rsmem[0];
+    }
+    __syncthreads();
+    const float inv_l = (s_lg > 0.0f) ? (1.0f / s_lg) : 0.0f;
+
+    // Phase 3: o[d] = (sum_i to[i][d] * exp(ml[i] - mg)) / l. Each thread owns
+    // a subset of the head_size dims and loops over the (few) partitions.
+    for (int d = tid; d < head_size; d += nthr) {
+        float o = 0.0f;
+        for (int i = 0; i < num_parts; ++i) {
+            o += to[static_cast<long>(i) * head_size + d] * __expf(ml[i] - mg);
+        }
+        o_row[d] = o * inv_l;
+    }
 }

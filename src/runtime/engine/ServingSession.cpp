@@ -297,6 +297,7 @@ ServingSession::generateBatch(
         ctx.blockTablesDev  = static_cast<const std::int32_t*>(blockTablesDev.get());
         ctx.seqLensDev      = static_cast<const std::int32_t*>(seqLensDev.get());
         ctx.maxBlocksPerSeq = blocksPerSeq;
+        ctx.maxSeqLen       = static_cast<std::int32_t>(p + 1); // uniform bench pos
         ctx.startPosDev     = static_cast<const std::int32_t*>(startPosDev.get());
         ctx.expIdxSlot      = expIdxBuf.as<std::int32_t>();
         ctx.kwSlot          = kwBuf.as<float>();
@@ -667,6 +668,13 @@ void ServingSession::stepServing(
     ctx.blockTablesDev  = static_cast<const std::int32_t*>(st.blockTablesDev.get());
     ctx.seqLensDev      = static_cast<const std::int32_t*>(st.seqLensDev.get());
     ctx.maxBlocksPerSeq = st.blocksPerSeq;
+    {
+        std::int32_t mx = 0;
+        for (std::size_t i = 0; i < nSeq; ++i) {
+            mx = std::max(mx, st.seqLensH[i]);
+        }
+        ctx.maxSeqLen = mx;
+    }
     ctx.startPosDev     = static_cast<const std::int32_t*>(st.startPosDev.get());
     ctx.expIdxSlot      = st.expIdxBuf.as<std::int32_t>();
     ctx.kwSlot          = st.kwBuf.as<float>();

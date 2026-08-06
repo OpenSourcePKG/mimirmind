@@ -182,6 +182,15 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _attentionFlashMergeBatchedKernel;
     core::cuda::CudaModule _pagedAttentionV1Module;
     core::cuda::CudaKernel _pagedAttentionV1Kernel;
+    core::cuda::CudaModule _pagedAttentionV2Module;
+    core::cuda::CudaKernel _pagedAttentionV2Kernel;
+    core::cuda::CudaKernel _pagedAttentionV2ReduceKernel;
+    // Split-K V2 per-partition workspace (grown on demand; RAII-freed).
+    compute::ComputeBuffer _pagedV2TmpOut;      // [slots, headSize] fp32
+    compute::ComputeBuffer _pagedV2ExpSums;     // [slots] fp32
+    compute::ComputeBuffer _pagedV2MaxLogits;   // [slots] fp32
+    std::size_t            _pagedV2SlotCap{0};   // slots = nSeq*nHeads*maxNumPartitions
+    std::size_t            _pagedV2HeadDimCap{0};
 
     core::cuda::CudaModule _attentionPrefillFlashModule;
     core::cuda::CudaKernel _attentionPrefillFlashKernel;
@@ -341,6 +350,11 @@ struct GpuOps::Impl {
           _pagedAttentionV1Module{loadCudaModule(ctx, "attention_paged_v1")},
           _pagedAttentionV1Kernel{
               _pagedAttentionV1Module.getFunction("paged_attention_v1")},
+          _pagedAttentionV2Module{loadCudaModule(ctx, "attention_paged_v2")},
+          _pagedAttentionV2Kernel{
+              _pagedAttentionV2Module.getFunction("paged_attention_v2")},
+          _pagedAttentionV2ReduceKernel{
+              _pagedAttentionV2Module.getFunction("paged_attention_v2_reduce")},
 
           _attentionPrefillFlashModule{loadCudaModule(ctx, "attention_prefill_flash")},
           _attentionPrefillFlashKernel{
@@ -2258,6 +2272,97 @@ void GpuOps::pagedAttentionDecodeV1Async(
                 1,
                 kLocal, 1, 1,
                 smemBytes);
+}
+
+void GpuOps::pagedAttentionDecodeV2Async(
+        float* out, const float* query, const float* keyCache,
+        const float* valueCache, const std::int32_t* blockTables,
+        const std::int32_t* seqLens, std::size_t numSeqs, std::size_t numHeads,
+        std::size_t numKvHeads, std::size_t headSize, std::size_t blockSize,
+        std::size_t maxNumBlocksPerSeq, std::size_t maxSeqLen, float scale,
+        float softcap) {
+    if (numSeqs == 0 || numHeads == 0 || headSize == 0) {
+        return;
+    }
+    // Split-K paged decode: partition the KV into kPartitionSize chunks so many
+    // workgroups cover one (head, seq) in parallel (FlashDecoding / vLLM v2).
+    // Pass 1 emits per-partition (acc, m, l); pass 2 merges via online-softmax.
+    constexpr std::int32_t  kPartitionSize = 512;  // == PAGED_ATTN_V2_PARTITION_SIZE
+    constexpr std::uint32_t kLocal         = 128;  // == PAGED_ATTN_V2_LOCAL
+    const std::size_t maxNumPartitions =
+        (maxSeqLen + kPartitionSize - 1) / static_cast<std::size_t>(kPartitionSize);
+    // The split-K kernels are fp32, no-softcap (16-arg CudaKernel cap). Route
+    // short/unsplittable contexts and any soft-capped call to the single-pass
+    // V1 which handles both.
+    if (maxNumPartitions <= 1 || softcap > 0.0f) {
+        pagedAttentionDecodeV1Async(out, query, keyCache, valueCache,
+                                    blockTables, seqLens, numSeqs, numHeads,
+                                    numKvHeads, headSize, blockSize,
+                                    maxNumBlocksPerSeq, scale, softcap);
+        return;
+    }
+
+    // Grow the per-partition workspace on demand (RAII buffers in Impl).
+    const std::size_t slots = numSeqs * numHeads * maxNumPartitions;
+    if (slots > _pimpl->_pagedV2SlotCap
+            || headSize > _pimpl->_pagedV2HeadDimCap) {
+        _pimpl->_pagedV2TmpOut    = allocate(slots * headSize * sizeof(float));
+        _pimpl->_pagedV2ExpSums   = allocate(slots * sizeof(float));
+        _pimpl->_pagedV2MaxLogits = allocate(slots * sizeof(float));
+        _pimpl->_pagedV2SlotCap    = slots;
+        _pimpl->_pagedV2HeadDimCap = headSize;
+    }
+    float* tmpOut  = _pimpl->_pagedV2TmpOut.as<float>();
+    float* expSums = _pimpl->_pagedV2ExpSums.as<float>();
+    float* maxLog  = _pimpl->_pagedV2MaxLogits.as<float>();
+
+    // --- Pass 1: per-partition partial attention -------------------------
+    {
+        auto& k = _pimpl->_pagedAttentionV2Kernel;
+        k.setPtr  (0, tmpOut);
+        k.setPtr  (1, expSums);
+        k.setPtr  (2, maxLog);
+        k.setPtr  (3, query);
+        k.setPtr  (4, keyCache);
+        k.setPtr  (5, valueCache);
+        k.setPtr  (6, blockTables);
+        k.setPtr  (7, seqLens);
+        k.setValue(8,  toInt32(numSeqs,            "pagedV2 numSeqs"));
+        k.setValue(9,  toInt32(numHeads,           "pagedV2 numHeads"));
+        k.setValue(10, toInt32(numKvHeads,         "pagedV2 numKvHeads"));
+        k.setValue(11, toInt32(headSize,           "pagedV2 headSize"));
+        k.setValue(12, toInt32(blockSize,          "pagedV2 blockSize"));
+        k.setValue(13, toInt32(maxNumBlocksPerSeq, "pagedV2 maxBlocks"));
+        k.setValue(14, toInt32(maxNumPartitions,   "pagedV2 maxParts"));
+        k.setValue(15, scale);   // partition_size / softcap / dtype are compile-time
+        const std::size_t smemBytes = (2 * headSize + kLocal) * sizeof(float);
+        k.launch(_ctx.stream(),
+                 static_cast<std::uint32_t>(numHeads),
+                 static_cast<std::uint32_t>(numSeqs),
+                 static_cast<std::uint32_t>(maxNumPartitions),
+                 kLocal, 1, 1,
+                 smemBytes);
+    }
+    // --- Pass 2: online-softmax reduce across partitions -----------------
+    {
+        auto& k = _pimpl->_pagedAttentionV2ReduceKernel;
+        k.setPtr  (0, out);
+        k.setPtr  (1, expSums);
+        k.setPtr  (2, maxLog);
+        k.setPtr  (3, tmpOut);
+        k.setPtr  (4, seqLens);
+        k.setValue(5, toInt32(numSeqs,          "pagedV2r numSeqs"));
+        k.setValue(6, toInt32(numHeads,         "pagedV2r numHeads"));
+        k.setValue(7, toInt32(headSize,         "pagedV2r headSize"));
+        k.setValue(8, toInt32(maxNumPartitions, "pagedV2r maxParts"));
+        const std::size_t smemBytes = kLocal * sizeof(float);
+        k.launch(_ctx.stream(),
+                 static_cast<std::uint32_t>(numHeads),
+                 static_cast<std::uint32_t>(numSeqs),
+                 1,
+                 kLocal, 1, 1,
+                 smemBytes);
+    }
 }
 
 void GpuOps::matmulQ8_0VecReorderAsync(const void* wReordered,

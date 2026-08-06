@@ -47,6 +47,10 @@ struct BatchedDecodeCtx {
     const std::int32_t*   blockTablesDev{nullptr}; // [nSeq, maxBlocksPerSeq] device
     const std::int32_t*   seqLensDev{nullptr};     // [nSeq] device: length incl. current token
     std::size_t           maxBlocksPerSeq{0};
+    std::int32_t          maxSeqLen{0};            // host: max seq_lens over the batch
+                                                   // (0 => unknown; full-attn decode
+                                                   //  falls back to paged V1). Drives the
+                                                   //  split-K partition count for V2.
     const std::int32_t*   startPosDev{nullptr};    // [nSeq] device: per-seq current position
 
     // ---- MoE routing scratch (USM) ----
@@ -394,6 +398,9 @@ private:
     // 2026-08-04) — the isolated win inverts under real serving, so blocked
     // stays the serving default. Enable with MIMIRMIND_GROUPED_MOE_DECODE_TC=1.
     bool _moeGroupedDecodeTc{false};
+    // Force the single-pass paged decode (V1) instead of the split-K V2 for
+    // full-attention layers. A/B + rollback lever (MIMIRMIND_PAGED_V1=1).
+    bool _forcePagedV1{false};
     // Host mirror of the device expert-offset table (moe_group_build output),
     // read back once per grouped MoE layer to drive the per-expert launches
     // (host-driven Option 1 only; the device-driven path never reads it back).

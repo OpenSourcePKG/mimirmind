@@ -543,6 +543,13 @@ public:
             std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
             std::size_t blockSize, std::size_t maxNumBlocksPerSeq, float scale,
             float softcap) override;
+    void pagedAttentionDecodeV2Async(
+            float* out, const float* query, const float* keyCache,
+            const float* valueCache, const std::int32_t* blockTables,
+            const std::int32_t* seqLens, std::size_t numSeqs,
+            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
+            std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
+            std::size_t maxSeqLen, float scale, float softcap) override;
     // Publicly readable so callers can compute launch upper bounds
     // for `setReplayMaxKTiles`. Parity with `GpuOps`.
     static constexpr std::size_t kFlashKTileSize   = 64;
