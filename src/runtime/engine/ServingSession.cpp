@@ -286,23 +286,18 @@ ServingSession::generateBatch(
     // so this probe measures capturability + replay speed, not correct tokens.
     // Env-gated, CUDA-only.
 #ifdef MIMIRMIND_HAVE_CUDA
+    // Piecewise serving-decode CUDA graph (vLLM-style): capture the RECURRENT
+    // (GDN) blocks — fixed-shape at T=1, no paged attention, no paged-KV write —
+    // one graph per block, and run the full-attention blocks EAGER (their varlen
+    // paged attention reads the true seqLensDev, so no context-length is baked
+    // into a graph). The GDN blocks are ~9.4ms of the ~12.9ms host launch
+    // overhead, so this captures the bulk while sidestepping varlen entirely.
     const bool servingGraphOn = std::getenv("MIMIRMIND_SERVING_GRAPH") != nullptr;
-    core::cuda::CudaGraph servingGraph;
+    std::vector<core::cuda::CudaGraph> blockGraphs;
     bool        servingGraphFailed = false;
     std::size_t decStep            = 0;
-    // Device copies of the per-step KV write indices so the paged write is
-    // captured correctly, plus the worst-case attention length: the captured
-    // paged-attention grid is fixed, so size it for the pool capacity and let
-    // the kernel read the true per-seq length from seqLensDev on replay.
-    compute::ComputeBuffer writeBlockIdDev, writeSlotDev;
-    // Size the captured attention grid for the longest context this run reaches
-    // (not the full pool capacity — the paged-V2 kernel does not early-exit
-    // partitions past the real length, so an oversized grid wastes work every
-    // replay). Correct for every step since the kernel reads seqLensDev.
-    const std::int32_t     graphMaxSeqLen = static_cast<std::int32_t>(maxTp + maxNew);
     if (servingGraphOn) {
-        writeBlockIdDev = _e._ops->allocate(nSeq * sizeof(std::uint32_t));
-        writeSlotDev    = _e._ops->allocate(nSeq * sizeof(std::int32_t));
+        blockGraphs.resize(blockCount);
     }
 #endif
 
@@ -320,17 +315,6 @@ ServingSession::generateBatch(
         }
         _e._ops->uploadHostBytes(seqLensDev.get(),  seqLensH.data(),  nSeq * sizeof(std::int32_t));
         _e._ops->uploadHostBytes(startPosDev.get(), startPosH.data(), nSeq * sizeof(std::int32_t));
-#ifdef MIMIRMIND_HAVE_CUDA
-        // Push this step's KV write indices to device OUTSIDE any capture so the
-        // captured scatter reads the current slot, not the capture step's.
-        if (servingGraphOn) {
-            _e._ops->uploadHostBytes(writeBlockIdDev.get(), writeBlockId.data(),
-                                     nSeq * sizeof(std::uint32_t));
-            _e._ops->uploadHostBytes(writeSlotDev.get(), writeSlot.data(),
-                                     nSeq * sizeof(std::int32_t));
-        }
-#endif
-
         arch::BatchedDecodeCtx ctx{};
         ctx.nSeq            = nSeq;
         ctx.pool            = &pool;
@@ -344,17 +328,6 @@ ServingSession::generateBatch(
         ctx.expIdxSlot      = expIdxBuf.as<std::int32_t>();
         ctx.kwSlot          = kwBuf.as<float>();
         ctx.isSeqStart      = isSeqStart.data();
-#ifdef MIMIRMIND_HAVE_CUDA
-        if (servingGraphOn) {
-            ctx.writeBlockIdDev =
-                static_cast<const std::uint32_t*>(writeBlockIdDev.get());
-            ctx.writeSlotDev =
-                static_cast<const std::int32_t*>(writeSlotDev.get());
-            // Worst-case attention grid so a single captured graph serves every
-            // context length; the kernel reads the true length from seqLensDev.
-            ctx.maxSeqLen = graphMaxSeqLen;
-        }
-#endif
 
         if (timing) {
             _e._ops->flush();
@@ -387,31 +360,51 @@ ServingSession::generateBatch(
         } else {
 #ifdef MIMIRMIND_HAVE_CUDA
             if (servingGraphOn && !servingGraphFailed && !timing) {
-                auto blockLoop = [&] {
-                    for (std::size_t b = 0; b < blockCount; ++b) {
-                        qb->runBlockBatched(b, xBuf, ctx, sb);
+                auto& gstream = _e.cudaOps().stream();
+                // Piecewise by SEGMENT: capture each contiguous run of recurrent
+                // (GDN) blocks as ONE graph (collapsing its many kernel launches
+                // into a single replay — this is where the launch-overhead win
+                // is), and run the full-attention blocks eager (varlen). The
+                // segment's graph is stored at its start-block index.
+                for (std::size_t b = 0; b < blockCount; ) {
+                    if (!_e._config.isRecurrentLayer(b)) {
+                        qb->runBlockBatched(b, xBuf, ctx, sb);      // full-attn eager
+                        ++b;
+                        continue;
                     }
-                };
-                if (servingGraph.valid()) {
-                    servingGraph.launch(_e.cudaOps().stream());
-                } else if (decStep >= 1) {
-                    // Warmup-before-capture: decStep 0 ran immediate (below) so
-                    // lazy decode-shape work is done; capture the warmed loop now.
-                    try {
-                        servingGraph.capture(_e.cudaOps().stream(), blockLoop);
-                        servingGraph.launch(_e.cudaOps().stream());
-                        MM_LOG_INFO("serving-graph",
-                            "capture SUCCEEDED ({} blocks) — device-driven serving "
-                            "decode loop is graph-capturable; replaying from now",
-                            blockCount);
-                    } catch (const std::exception& ex) {
-                        MM_LOG_WARN("serving-graph",
-                            "capture FAILED: {} — immediate fallback", ex.what());
-                        servingGraphFailed = true;
-                        blockLoop();
+                    std::size_t segEnd = b;
+                    while (segEnd < blockCount &&
+                           _e._config.isRecurrentLayer(segEnd)) {
+                        ++segEnd;
                     }
-                } else {
-                    blockLoop();   // decStep 0: warmup, immediate
+                    auto runSeg = [&] {
+                        for (std::size_t bb = b; bb < segEnd; ++bb) {
+                            qb->runBlockBatched(bb, xBuf, ctx, sb);
+                        }
+                    };
+                    core::cuda::CudaGraph& g = blockGraphs[b];
+                    if (g.valid()) {
+                        g.launch(gstream);
+                    } else if (decStep >= 1) {                      // warmup at 0
+                        try {
+                            g.capture(gstream, runSeg);
+                            g.launch(gstream);
+                        } catch (const std::exception& ex) {
+                            MM_LOG_WARN("serving-graph",
+                                "segment [{}, {}) capture FAILED: {} — eager",
+                                b, segEnd, ex.what());
+                            servingGraphFailed = true;
+                            runSeg();
+                        }
+                    } else {
+                        runSeg();                                   // warmup
+                    }
+                    b = segEnd;
+                }
+                if (decStep == 1 && !servingGraphFailed) {
+                    MM_LOG_INFO("serving-graph",
+                        "piecewise capture done (recurrent blocks graphed, "
+                        "full-attn eager)");
                 }
                 ++decStep;
             } else
