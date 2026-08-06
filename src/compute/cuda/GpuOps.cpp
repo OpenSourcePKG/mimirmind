@@ -294,6 +294,9 @@ struct GpuOps::Impl {
     std::vector<std::pair<std::string, double>> _profAcc;   // insertion order
     // GD-b: decode small-M variant (acc[4] + 4 KB shared) from the same module.
     core::cuda::CudaKernel _moeGroupedGemmNvfp4M4Kernel;
+    // Decode single-user (M==1) register-staged variant: activation in registers
+    // instead of shared memory, removing the MIO/short-scoreboard stall.
+    core::cuda::CudaKernel _moeGroupedGemmNvfp4M1RegKernel;
     // E-d.4b: padding infra (one module, four kernels) + act-quant.
     core::cuda::CudaModule _moePadModule;
     core::cuda::CudaKernel _moePadOffsetsKernel;
@@ -482,6 +485,8 @@ struct GpuOps::Impl {
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk")},
           _moeGroupedGemmNvfp4M4Kernel{
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m4")},
+          _moeGroupedGemmNvfp4M1RegKernel{
+              _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m1reg")},
           _nvfp4DeintModule{loadCudaModule(ctx, "matmul_nvfp4blk_deint_vec")},
           _nvfp4DeinterleaveKernel{
               _nvfp4DeintModule.getFunction("nvfp4blk_deinterleave")},
@@ -1693,6 +1698,32 @@ void GpuOps::moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
     k.setPtr  (5, tileRows);
     k.setValue(6, toInt32(K, "moeGroupedGemm K"));
     k.setValue(7, toInt32(N, "moeGroupedGemm N"));
+    k.launch(_ctx.stream(), nGroups, static_cast<std::uint32_t>(maxTiles), 1,
+             kLocal, 1, 1);
+}
+
+void GpuOps::moeGroupedGemmNvfp4M1NBAsync(const float* x, const unsigned char* w,
+                                          float* y, const std::int32_t* tileExpert,
+                                          const std::int32_t* tileRow0,
+                                          const std::int32_t* tileRows,
+                                          std::size_t K, std::size_t N,
+                                          std::size_t maxTiles) {
+    if (N == 0 || K == 0 || maxTiles == 0) {
+        return;
+    }
+    // One output column per warp (4 warps/block), activation staged in registers.
+    constexpr std::uint32_t kWarps = 4;
+    constexpr std::uint32_t kLocal = 128;
+    const std::uint32_t nGroups = static_cast<std::uint32_t>((N + kWarps - 1) / kWarps);
+    auto& k = _pimpl->_moeGroupedGemmNvfp4M1RegKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, w);
+    k.setPtr  (2, y);
+    k.setPtr  (3, tileExpert);
+    k.setPtr  (4, tileRow0);
+    k.setPtr  (5, tileRows);
+    k.setValue(6, toInt32(K, "moeGroupedGemmM1NB K"));
+    k.setValue(7, toInt32(N, "moeGroupedGemmM1NB N"));
     k.launch(_ctx.stream(), nGroups, static_cast<std::uint32_t>(maxTiles), 1,
              kLocal, 1, 1);
 }

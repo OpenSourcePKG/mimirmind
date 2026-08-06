@@ -404,6 +404,9 @@ private:
     // Route the routed-MoE decode grouped GEMM through the de-interleaved
     // uint4-coalesced kernel (nSeq==1 only). A/B (MIMIRMIND_NVFP4_DEINT=1).
     bool _useDeintMoe{false};
+    // Default-on: single-user (nSeq==1) decode uses the register-staged MoE GEMV
+    // (m1reg, +2-4% vs m4). MIMIRMIND_MOE_M1NB=0 disables it.
+    bool _useM1nb{true};
     // Host mirror of the device expert-offset table (moe_group_build output),
     // read back once per grouped MoE layer to drive the per-expert launches
     // (host-driven Option 1 only; the device-driven path never reads it back).

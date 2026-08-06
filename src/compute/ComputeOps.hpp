@@ -468,6 +468,23 @@ public:
             "moeGroupedGemmNvfp4Async: not supported on this backend");
     }
 
+    /// As moeGroupedGemmNvfp4Async but for single-row decode (M==1, nSeq==1):
+    /// stages the activation in registers instead of shared memory, removing the
+    /// MIO/short-scoreboard stall that bottlenecks decode without spending
+    /// occupancy (the ncu-guided m1reg kernel, +2-4% vs the m4 path).
+    virtual void moeGroupedGemmNvfp4M1NBAsync(const float* x,
+                                              const unsigned char* w, float* y,
+                                              const std::int32_t* tileExpert,
+                                              const std::int32_t* tileRow0,
+                                              const std::int32_t* tileRows,
+                                              std::size_t K, std::size_t N,
+                                              std::size_t maxTiles) {
+        (void)x; (void)w; (void)y; (void)tileExpert; (void)tileRow0;
+        (void)tileRows; (void)K; (void)N; (void)maxTiles;
+        throw std::runtime_error(
+            "moeGroupedGemmNvfp4M1NBAsync: not supported on this backend");
+    }
+
     /// As moeGroupedGemmNvfp4Async but consumes a de-interleaved blocked-NVFP4
     /// bank (16-byte-aligned nibbles + separate fp16 scales) via coalesced
     /// uint4 loads — ~2x the DRAM bandwidth of the interleaved 20-byte path at

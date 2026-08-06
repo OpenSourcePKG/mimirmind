@@ -134,6 +134,9 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
     if (const char* dm = std::getenv("MIMIRMIND_NVFP4_DEINT")) {
         _useDeintMoe = (dm[0] == '1' && dm[1] == '\0');
     }
+    if (const char* nb = std::getenv("MIMIRMIND_MOE_M1NB")) {
+        _useM1nb = (nb[0] == '1' && nb[1] == '\0');
+    }
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     if (const char* d = std::getenv("MIMIRMIND_SSM_DUMP")) {
         _ssmDump    = true;
@@ -1604,6 +1607,12 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         // leaved uint4-coalesced kernel (~2x DRAM bandwidth); everything else
         // stays on the interleaved GD-b path.
         const bool deint = _useDeintMoe && nSeq == 1;
+        // M1-REG: single-user (nSeq==1) register-staged decode kernel — the
+        // activation lives in registers instead of shared memory, removing the
+        // ncu-measured MIO/short-scoreboard stall without spending occupancy
+        // (+2-4% vs m4). Interleaved layout like GD-b (no de-interleave cache);
+        // default-on, mutually exclusive with deint.
+        const bool m1nb = _useM1nb && nSeq == 1 && !deint;
         if (deint) {
             _ops.moeGroupedGemmNvfp4DeintAsync(xComp, gateBase, gateComp,
                 tileExpert, tileRow0, tileRows, d_model, n_ff_exp, nExperts,
@@ -1611,6 +1620,11 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
             _ops.moeGroupedGemmNvfp4DeintAsync(xComp, upBase, upComp,
                 tileExpert, tileRow0, tileRows, d_model, n_ff_exp, nExperts,
                 maxTiles, smallM);
+        } else if (m1nb) {
+            _ops.moeGroupedGemmNvfp4M1NBAsync(xComp, gateBase, gateComp,
+                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles);
+            _ops.moeGroupedGemmNvfp4M1NBAsync(xComp, upBase, upComp,
+                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles);
         } else {
             _ops.moeGroupedGemmNvfp4Async(xComp, gateBase, gateComp,
                 tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles, smallM);
@@ -1623,6 +1637,9 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
             _ops.moeGroupedGemmNvfp4DeintAsync(gateComp, downBase, downComp,
                 tileExpert, tileRow0, tileRows, n_ff_exp, d_model, nExperts,
                 maxTiles, smallM);
+        } else if (m1nb) {
+            _ops.moeGroupedGemmNvfp4M1NBAsync(gateComp, downBase, downComp,
+                tileExpert, tileRow0, tileRows, n_ff_exp, d_model, maxTiles);
         } else {
             _ops.moeGroupedGemmNvfp4Async(gateComp, downBase, downComp,
                 tileExpert, tileRow0, tileRows, n_ff_exp, d_model, maxTiles, smallM);

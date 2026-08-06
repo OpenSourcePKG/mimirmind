@@ -238,6 +238,12 @@ public:
                                   std::size_t K, std::size_t N,
                                   std::size_t maxTiles,
                                   bool decodeSmallM = false) override;
+    void moeGroupedGemmNvfp4M1NBAsync(const float* x, const unsigned char* w,
+                                      float* y, const std::int32_t* tileExpert,
+                                      const std::int32_t* tileRow0,
+                                      const std::int32_t* tileRows,
+                                      std::size_t K, std::size_t N,
+                                      std::size_t maxTiles) override;
     void moeGroupedGemmNvfp4DeintAsync(const float* x, const unsigned char* w,
                                        float* y, const std::int32_t* tileExpert,
                                        const std::int32_t* tileRow0,

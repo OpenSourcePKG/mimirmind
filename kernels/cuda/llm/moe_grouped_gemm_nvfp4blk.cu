@@ -162,6 +162,82 @@ __device__ __forceinline__ void grouped_gemm_nvfp4blk_core(
     }
 }
 
+// Decode single-row (M==1) core with the activation staged in REGISTERS, not
+// shared memory. ncu on the m4 kernel showed decode stalls ~56-61% on "short
+// scoreboard / waiting on data TO SHARED MEMORY" at full occupancy and only
+// ~24% DRAM: the 1-smem-load-per-FMA activation read is the bottleneck, and it
+// is a latency (not throughput) stall already at the occupancy ceiling — so
+// N-blocking (fewer smem loads at the cost of more registers/less occupancy)
+// regressed. This variant removes shared memory entirely: per K-tile each lane
+// loads its GEMM_X_TILE/32 activation elements (one per super, at element
+// position laneId) into registers with a coalesced global (L2-resident) load,
+// then the inner loop reads x from registers. No smem, no __syncthreads, no MIO
+// stall; only ~8 extra registers so occupancy is preserved. One output column
+// per warp (like m4). Assumes one activation row per tile (nSeq==1 decode).
+#define M1REG_SUPERS_PER_TILE (GEMM_X_TILE / NVBLK_SUPER_ELEMENTS)   // 8
+__device__ __forceinline__ void grouped_gemm_nvfp4blk_core_m1reg(
+    const float*         __restrict__ X,           // [R, K]  (row0 is the row)
+    const unsigned char* __restrict__ W,           // [nExperts, N, K] blocked NVFP4
+          float*         __restrict__ Y,           // [R, N]
+    const int*           __restrict__ tileExpert,
+    const int*           __restrict__ tileRow0,
+    const int*           __restrict__ /*tileRows*/,
+    const int                          K,
+    const int                          N)
+{
+    const int tt = blockIdx.y;
+    const int e  = tileExpert[tt];
+    if (e < 0) {
+        return;
+    }
+    const int laneId = threadIdx.x % 32;
+    const int warpId = threadIdx.x / 32;
+    const int n      = blockIdx.x * MATMUL_NVBLK_GEMM_WARPS + warpId;
+    if (n >= N) {
+        return;                                    // no smem/sync: safe early exit
+    }
+    const int row0   = tileRow0[tt];
+    const int nSuper = K / NVBLK_SUPER_ELEMENTS;
+
+    const float*         __restrict__ Xt = X + static_cast<size_t>(row0) * K;
+    float*               __restrict__ Yt = Y + static_cast<size_t>(row0) * N;
+    const unsigned char* __restrict__ Wrow =
+        W + ((static_cast<size_t>(e) * N + n) * nSuper) * NVBLK_SUPER_BYTES;
+
+    float acc = 0.0f;
+    for (int tile = 0; tile < K; tile += GEMM_X_TILE) {
+        // Stage this lane's activation elements (one per super in the tile) into
+        // registers; lanes 0..31 read 32 consecutive floats per super => coalesced.
+        float xr[M1REG_SUPERS_PER_TILE];
+#pragma unroll
+        for (int j = 0; j < M1REG_SUPERS_PER_TILE; ++j) {
+            const int k = tile + j * NVBLK_SUPER_ELEMENTS + laneId;
+            xr[j] = (k < K) ? Xt[k] : 0.0f;
+        }
+        const int superStart = tile / NVBLK_SUPER_ELEMENTS;
+#pragma unroll
+        for (int j = 0; j < M1REG_SUPERS_PER_TILE; ++j) {
+            const int sp = superStart + j;
+            if (sp >= nSuper) {
+                break;
+            }
+            const unsigned char* blk =
+                Wrow + static_cast<size_t>(sp) * NVBLK_SUPER_BYTES;
+            const float s0 = __half2float(*reinterpret_cast<const __half*>(blk));
+            const float s1 = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+            const unsigned char byte = blk[4 + (laneId >> 1)];
+            const unsigned nib = (laneId & 1) ? (byte >> 4) : (byte & 0x0F);
+            const float w = ((laneId < 16) ? s0 : s1) * dq_e2m1(nib);
+            acc = __fmaf_rn(w, xr[j], acc);
+        }
+    }
+
+    const float s = warpReduceSum(acc);
+    if (laneId == 0) {
+        Yt[n] = s;
+    }
+}
+
 } // namespace
 
 // M16 — prefill / large-M grouped GEMM (16 KB shared, acc[16]).
@@ -185,4 +261,17 @@ void moe_grouped_gemm_nvfp4blk_m4(
     const int K, const int N)
 {
     grouped_gemm_nvfp4blk_core<4>(X, W, Y, tileExpert, tileRow0, tileRows, K, N);
+}
+
+// M1-REG — decode single-user (M==1) grouped GEMM with the activation staged in
+// registers instead of shared memory, removing the ncu-measured MIO/short-
+// scoreboard stall without spending occupancy. Dispatched only at nSeq==1.
+extern "C" __global__ __launch_bounds__(MATMUL_NVBLK_GEMM_LOCAL)
+void moe_grouped_gemm_nvfp4blk_m1reg(
+    const float* __restrict__ X, const unsigned char* __restrict__ W,
+    float* __restrict__ Y, const int* __restrict__ tileExpert,
+    const int* __restrict__ tileRow0, const int* __restrict__ tileRows,
+    const int K, const int N)
+{
+    grouped_gemm_nvfp4blk_core_m1reg(X, W, Y, tileExpert, tileRow0, tileRows, K, N);
 }
