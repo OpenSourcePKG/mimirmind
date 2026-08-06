@@ -253,6 +253,37 @@ bool ChatCompletionHandler::prepareChatRequest(
     params.sampling.repetitionPenalty =
         cr.hasRepetitionPenalty ? cr.repetitionPenalty : kDefaultRepetitionPenalty;
     params.sampling.penaltyWindow = kDefaultPenaltyWindow;
+
+    // Anti-repeat safety floor. A client that explicitly disables BOTH the
+    // frequency and repetition penalties (e.g. frequency_penalty=0 +
+    // repetition_penalty=1.0) leaves greedy decoding with no history-based way
+    // to escape a degeneration loop — observed via the Pegenaut tool path as a
+    // 1500+-token single-phrase repeat ("- Query: ..." / "0649 0649 ..."). Keep
+    // a minimal repetition penalty in that fully-unprotected case so the backend
+    // never streams garbage, while still honouring any client that sets a real
+    // (>1.0 / >0) penalty value.
+    // Floor covers two degeneration modes seen via the Pegenaut agentic path:
+    //   1. exact-token loop ("0649 0649 ...")     -> repetition penalty breaks it
+    //   2. incrementing-template loop             -> the varying number defeats the
+    //      ("The text from page 104 ... page 105")   repetition penalty, but the
+    //      constant words (text/page/about/...) recur, so a FREQUENCY penalty over
+    //      a WIDE window breaks it.
+    // Apply both, over a wide window, only when the client left it fully open.
+    constexpr float        kAntiLoopFloorRepetition = 1.10F;
+    constexpr float        kAntiLoopFloorFrequency  = 0.50F;
+    constexpr std::uint32_t kAntiLoopFloorWindow    = 256U;
+    if (params.sampling.frequencyPenalty  <= 0.0F &&
+        params.sampling.presencePenalty   <= 0.0F &&
+        params.sampling.repetitionPenalty <= 1.0F) {
+        params.sampling.repetitionPenalty = kAntiLoopFloorRepetition;
+        params.sampling.frequencyPenalty  = kAntiLoopFloorFrequency;
+        params.sampling.penaltyWindow     = kAntiLoopFloorWindow;
+        MM_LOG_INFO("server",
+                    "anti-repeat floor: client disabled all penalties; applying "
+                    "repetitionPenalty={} frequencyPenalty={} window={} safeguard",
+                    kAntiLoopFloorRepetition, kAntiLoopFloorFrequency,
+                    kAntiLoopFloorWindow);
+    }
     return true;
 }
 
