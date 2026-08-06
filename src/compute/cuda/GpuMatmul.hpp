@@ -358,6 +358,9 @@ private:
     // half the weight bytes of the BF16 cuBLAS path; falls back to the hand
     // kernel if cuBLASLt does not support the shape (e.g. M=1 non-TC).
     bool                           _useCublasFp8{false};
+    // Route the M==1 blocked-NVFP4 vec (shexp / full-attn decode) through the
+    // de-interleaved uint4-coalesced kernel. Opt-in MIMIRMIND_NVFP4_DEINT=1.
+    bool                           _useDeintVec{false};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
                                    _vecMsAtM{};
     std::array<double, ::mimirmind::compute::kAutotuneBucketCount>
@@ -394,6 +397,11 @@ private:
                                        const float* X,
                                        std::size_t  M,
                                        float*       Y);
+
+    // M==1 blocked-NVFP4 vec via the de-interleaved uint4-coalesced kernel.
+    // De-interleaves W once (cached by pointer) then launches the vec kernel.
+    void nvblkDeintVec(const void* W, std::size_t N, std::size_t K,
+                       const float* X, float* Y);
 };
 
 } // namespace mimirmind::compute::cuda

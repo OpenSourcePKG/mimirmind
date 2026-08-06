@@ -208,6 +208,13 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _matmulNvblkVecKernel;
     ::mimirmind::core::cuda::CudaModule _matmulNvblkGemmModule;
     ::mimirmind::core::cuda::CudaKernel _matmulNvblkGemmKernel;
+    // De-interleaved uint4 NVFP4 vec (shexp / full-attn decode) + its helper,
+    // plus a by-pointer cache of the de-interleaved (nib, scale) buffers.
+    ::mimirmind::core::cuda::CudaModule _nvblkDeintModule;
+    ::mimirmind::core::cuda::CudaKernel _nvblkDeinterleaveKernel;
+    ::mimirmind::core::cuda::CudaKernel _nvblkDeintVecKernel;
+    struct NvblkDeint { void* nib{nullptr}; void* scale{nullptr}; };
+    std::unordered_map<const void*, NvblkDeint> _nvblkDeintCache;
     // cuBLASLt dense BF16 matmul (opt-in). The cast_f32_to_bf16 kernel stages
     // the F32 activation into `_xBf16` before the tensor-core GEMM; the handle
     // + workspace are created lazily on first use in cublasBf16Matmul().
@@ -238,6 +245,10 @@ struct GpuMatmul::Impl {
     ~Impl() {
         for (auto& kv : _fp8WeightCache) {
             if (kv.second.data  != nullptr) { cudaFree(kv.second.data); }
+            if (kv.second.scale != nullptr) { cudaFree(kv.second.scale); }
+        }
+        for (auto& kv : _nvblkDeintCache) {
+            if (kv.second.nib   != nullptr) { cudaFree(kv.second.nib); }
             if (kv.second.scale != nullptr) { cudaFree(kv.second.scale); }
         }
         if (_amaxDev != nullptr)     { cudaFree(_amaxDev); }
@@ -358,6 +369,11 @@ struct GpuMatmul::Impl {
           _matmulNvblkGemmModule  {loadCudaModule(ctx, "matmul_nvfp4blk_gemm")},
           _matmulNvblkGemmKernel  {
               _matmulNvblkGemmModule.getFunction("matmul_nvfp4blk_gemm")},
+          _nvblkDeintModule       {loadCudaModule(ctx, "matmul_nvfp4blk_deint_vec")},
+          _nvblkDeinterleaveKernel{
+              _nvblkDeintModule.getFunction("nvfp4blk_deinterleave")},
+          _nvblkDeintVecKernel    {
+              _nvblkDeintModule.getFunction("matmul_nvfp4blk_deint_vec")},
           _castToF32Module        {loadCudaModule(ctx, "cast_to_f32")},
           _castF32ToBf16Kernel    {
               _castToF32Module.getFunction("cast_f32_to_bf16")},
@@ -408,6 +424,9 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
     }
     if (const char* cf = std::getenv("MIMIRMIND_CUBLAS_FP8")) {
         _useCublasFp8 = (cf[0] != '\0' && !(cf[0] == '0' && cf[1] == '\0'));
+    }
+    if (const char* dv = std::getenv("MIMIRMIND_NVFP4_DEINT")) {
+        _useDeintVec = (dv[0] == '1' && dv[1] == '\0');
     }
     if (_useCublasFp8) {
         MM_LOG_INFO("hip::GpuMatmul",
@@ -828,6 +847,40 @@ bool GpuMatmul::cublasBf16Matmul(const void*  W,
     if (aL != nullptr) { cublasLtMatrixLayoutDestroy(aL); }
     if (op != nullptr) { cublasLtMatmulDescDestroy(op); }
     return ok;
+}
+
+void GpuMatmul::nvblkDeintVec(const void* W, std::size_t N, std::size_t K,
+                             const float* X, float* Y) {
+    const std::size_t totalSupers = N * (K / 32);
+    auto it = _pimpl->_nvblkDeintCache.find(W);
+    if (it == _pimpl->_nvblkDeintCache.end()) {
+        Impl::NvblkDeint c;
+        if (cudaMalloc(&c.nib, totalSupers * 16) != cudaSuccess) {
+            return;
+        }
+        if (cudaMalloc(&c.scale, totalSupers * 4) != cudaSuccess) {
+            cudaFree(c.nib);
+            return;
+        }
+        auto& dk = _pimpl->_nvblkDeinterleaveKernel;
+        dk.setPtr  (0, W);
+        dk.setPtr  (1, c.nib);
+        dk.setPtr  (2, c.scale);
+        dk.setValue(3, static_cast<std::int64_t>(totalSupers));
+        const std::uint32_t g =
+            static_cast<std::uint32_t>((totalSupers + 255) / 256);
+        dk.launch(_ctx.stream(), g, 1, 1, 256, 1, 1);
+        it = _pimpl->_nvblkDeintCache.emplace(W, c).first;
+    }
+    auto& k = _pimpl->_nvblkDeintVecKernel;
+    k.setPtr  (0, X);
+    k.setPtr  (1, it->second.nib);
+    k.setPtr  (2, it->second.scale);
+    k.setPtr  (3, Y);
+    k.setValue(4, static_cast<std::int32_t>(N));
+    k.setValue(5, static_cast<std::int32_t>(K));
+    const std::uint32_t nGroups = static_cast<std::uint32_t>((N + 3) / 4);
+    k.launch(_ctx.stream(), nGroups, 1, 1, 128, 1, 1, K * sizeof(float));
 }
 
 bool GpuMatmul::cublasFp8Matmul(const void*  W,
@@ -1298,6 +1351,10 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
             (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
 
         if (M == 1) {
+            if (_useDeintVec) {
+                nvblkDeintVec(W, N, K, X, Y);
+                return;
+            }
             auto& kern = _pimpl->_matmulNvblkVecKernel;
             kern.setPtr  (0, X);
             kern.setPtr  (1, W);
