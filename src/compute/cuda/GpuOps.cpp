@@ -268,6 +268,9 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _moeGatherRowsKernel;
     core::cuda::CudaModule _moeScatterExpertOutModule;
     core::cuda::CudaKernel _moeScatterExpertOutKernel;
+    // Device KV scatter (graph-capturable paged-KV write by device index).
+    core::cuda::CudaModule _kvWriteTokensModule;
+    core::cuda::CudaKernel _kvWriteTokensKernel;
     // M-Cuda.MoeGroup Sub-Step E — device-driven grouped GEMM (tile schedule
     // build + single grouped NVFP4 launch; no expOffset D2H).
     core::cuda::CudaModule _moeGroupTilesModule;
@@ -476,6 +479,9 @@ struct GpuOps::Impl {
           _moeScatterExpertOutModule{loadCudaModule(ctx, "moe_scatter_expert_out")},
           _moeScatterExpertOutKernel{
               _moeScatterExpertOutModule.getFunction("moe_scatter_expert_out")},
+          _kvWriteTokensModule{loadCudaModule(ctx, "kv_write_tokens_batched")},
+          _kvWriteTokensKernel{
+              _kvWriteTokensModule.getFunction("kv_write_tokens_batched")},
           _moeGroupTilesModule     {loadCudaModule(ctx, "moe_group_tiles")},
           _moeGroupTilesKernel     {
               _moeGroupTilesModule.getFunction("moe_group_tiles")},
@@ -1647,6 +1653,29 @@ void GpuOps::moeScatterExpertOutAsync(const float* y, const std::int32_t* asnToR
     k.setValue(5, toInt32(T, "moeScatter T"));
     k.setValue(6, toInt32(K, "moeScatter K"));
     k.launch(_ctx.stream(), static_cast<std::uint32_t>(T), 1, 1, 256, 1, 1);
+}
+
+void GpuOps::writeKvTokensBatchedAsync(const float* kProj, const float* vProj,
+                                       const std::uint32_t* writeBlockIdDev,
+                                       const std::int32_t* writeSlotDev,
+                                       float* kPool, float* vPool,
+                                       std::size_t nSeq, std::size_t blockSize,
+                                       std::size_t width) {
+    if (nSeq == 0 || width == 0) {
+        return;
+    }
+    auto& k = _pimpl->_kvWriteTokensKernel;
+    k.setPtr  (0, kProj);
+    k.setPtr  (1, vProj);
+    k.setPtr  (2, writeBlockIdDev);
+    k.setPtr  (3, writeSlotDev);
+    k.setPtr  (4, kPool);
+    k.setPtr  (5, vPool);
+    k.setValue(6, toInt32(nSeq, "writeKv nSeq"));
+    k.setValue(7, toInt32(blockSize, "writeKv blockSize"));
+    k.setValue(8, toInt32(width, "writeKv width"));
+    const std::uint32_t blk = width < 256 ? static_cast<std::uint32_t>(width) : 256;
+    k.launch(_ctx.stream(), static_cast<std::uint32_t>(nSeq), 1, 1, blk, 1, 1);
 }
 
 void GpuOps::moeGroupTilesAsync(const std::int32_t* expOffset,

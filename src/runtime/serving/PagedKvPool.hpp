@@ -87,6 +87,18 @@ public:
                     const float*         kRow,
                     const float*         vRow);
 
+    /// Graph-capturable batched variant: scatter all nSeq rows at once using
+    /// DEVICE block/slot index arrays (offset computed on-device), so the paged
+    /// write can live inside a captured decode graph. kProj/vProj are [nSeq,
+    /// slotElems()] compact per-seq rows.
+    void writeTokensBatched(compute::ComputeOps& ops,
+                            std::size_t          layer,
+                            const float*         kProj,
+                            const float*         vProj,
+                            const std::uint32_t* writeBlockIdDev,
+                            const std::int32_t*  writeSlotDev,
+                            std::size_t          nSeq);
+
     [[nodiscard]] std::size_t numLayers()  const noexcept { return _numLayers; }
     [[nodiscard]] std::size_t numBlocks()  const noexcept { return _numBlocks; }
     [[nodiscard]] std::size_t blockSize()  const noexcept { return _blockSize; }

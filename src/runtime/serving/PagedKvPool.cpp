@@ -81,4 +81,16 @@ void PagedKvPool::writeToken(compute::ComputeOps& ops,
     ops.appendMemoryCopy(_vPool[layer] + off, vRow, bytes);
 }
 
+void PagedKvPool::writeTokensBatched(compute::ComputeOps& ops,
+                                     std::size_t          layer,
+                                     const float*         kProj,
+                                     const float*         vProj,
+                                     const std::uint32_t* writeBlockIdDev,
+                                     const std::int32_t*  writeSlotDev,
+                                     std::size_t          nSeq) {
+    ops.writeKvTokensBatchedAsync(kProj, vProj, writeBlockIdDev, writeSlotDev,
+                                  _kPool[layer], _vPool[layer], nSeq, _blockSize,
+                                  slotElems());
+}
+
 } // namespace mimirmind::runtime::serving

@@ -575,7 +575,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                 (void)e->generateBatch(prompts, 4, -1);   // warm up (all nSeq)
                 for (std::size_t rep = 0; rep < reps; ++rep) {
                     const auto t0 = std::chrono::steady_clock::now();
-                    (void)e->generateBatch(prompts, maxNew, /*eosId=*/-1);
+                    const auto benchOut = e->generateBatch(prompts, maxNew, /*eosId=*/-1);
                     const auto t1 = std::chrono::steady_clock::now();
                     const double ms =
                         std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -586,6 +586,15 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                               << (ms / static_cast<double>(steps)) << " ms/step  "
                               << (1000.0 * static_cast<double>(genToks) / ms)
                               << " gen-tok/s\n";
+                    // Parity probe: first output token ids (compare graph vs not).
+                    if (!benchOut.empty()) {
+                        std::cout << "  out[0] ids:";
+                        for (std::size_t ti = 0;
+                             ti < benchOut[0].size() && ti < 12; ++ti) {
+                            std::cout << " " << benchOut[0][ti];
+                        }
+                        std::cout << "\n";
+                    }
                     std::cout.flush();
                 }
             }

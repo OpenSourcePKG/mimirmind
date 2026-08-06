@@ -427,6 +427,21 @@ public:
             "moeScatterExpertOutAsync: not supported on this backend");
     }
 
+    /// Graph-capturable paged-KV write: scatter this decode step's K/V rows into
+    /// their pool slots using DEVICE block/slot index arrays (offset computed
+    /// on-device, so nothing bakes the capture step's destination address).
+    virtual void writeKvTokensBatchedAsync(const float* kProj, const float* vProj,
+                                           const std::uint32_t* writeBlockIdDev,
+                                           const std::int32_t* writeSlotDev,
+                                           float* kPool, float* vPool,
+                                           std::size_t nSeq, std::size_t blockSize,
+                                           std::size_t width) {
+        (void)kProj; (void)vProj; (void)writeBlockIdDev; (void)writeSlotDev;
+        (void)kPool; (void)vPool; (void)nSeq; (void)blockSize; (void)width;
+        throw std::runtime_error(
+            "writeKvTokensBatchedAsync: not supported on this backend");
+    }
+
     /// M-Cuda.MoeGroup Sub-Step E-a: turn the per-expert row ranges
     /// (expOffset, exclusive prefix sum) into a compact per-tile schedule a
     /// single device-driven grouped GEMM consumes in ONE launch — no expOffset

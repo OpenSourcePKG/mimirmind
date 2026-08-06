@@ -44,6 +44,10 @@ struct BatchedDecodeCtx {
     serving::PagedKvPool* pool{nullptr};
     const std::uint32_t*  writeBlockId{nullptr};   // [nSeq] host: block for current pos
     const std::int32_t*   writeSlot{nullptr};      // [nSeq] host: slot for current pos
+    // Device copies of writeBlockId/writeSlot (updated outside a decode graph);
+    // when set, the KV write scatters on-device so it is graph-capturable.
+    const std::uint32_t*  writeBlockIdDev{nullptr}; // [nSeq] device
+    const std::int32_t*   writeSlotDev{nullptr};    // [nSeq] device
     const std::int32_t*   blockTablesDev{nullptr}; // [nSeq, maxBlocksPerSeq] device
     const std::int32_t*   seqLensDev{nullptr};     // [nSeq] device: length incl. current token
     std::size_t           maxBlocksPerSeq{0};

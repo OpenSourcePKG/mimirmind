@@ -226,6 +226,12 @@ public:
                                   const float* kw, float* accum,
                                   std::size_t dModel, std::size_t T,
                                   std::size_t K) override;
+    void writeKvTokensBatchedAsync(const float* kProj, const float* vProj,
+                                   const std::uint32_t* writeBlockIdDev,
+                                   const std::int32_t* writeSlotDev,
+                                   float* kPool, float* vPool,
+                                   std::size_t nSeq, std::size_t blockSize,
+                                   std::size_t width) override;
     void moeGroupTilesAsync(const std::int32_t* expOffset,
                             std::int32_t* tileExpert, std::int32_t* tileRow0,
                             std::int32_t* tileRows, std::int32_t* nTiles,

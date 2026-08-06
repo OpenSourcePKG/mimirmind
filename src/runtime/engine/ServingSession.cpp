@@ -290,6 +290,20 @@ ServingSession::generateBatch(
     core::cuda::CudaGraph servingGraph;
     bool        servingGraphFailed = false;
     std::size_t decStep            = 0;
+    // Device copies of the per-step KV write indices so the paged write is
+    // captured correctly, plus the worst-case attention length: the captured
+    // paged-attention grid is fixed, so size it for the pool capacity and let
+    // the kernel read the true per-seq length from seqLensDev on replay.
+    compute::ComputeBuffer writeBlockIdDev, writeSlotDev;
+    // Size the captured attention grid for the longest context this run reaches
+    // (not the full pool capacity — the paged-V2 kernel does not early-exit
+    // partitions past the real length, so an oversized grid wastes work every
+    // replay). Correct for every step since the kernel reads seqLensDev.
+    const std::int32_t     graphMaxSeqLen = static_cast<std::int32_t>(maxTp + maxNew);
+    if (servingGraphOn) {
+        writeBlockIdDev = _e._ops->allocate(nSeq * sizeof(std::uint32_t));
+        writeSlotDev    = _e._ops->allocate(nSeq * sizeof(std::int32_t));
+    }
 #endif
 
     auto stepForward = [&](std::size_t p) {
@@ -306,6 +320,16 @@ ServingSession::generateBatch(
         }
         _e._ops->uploadHostBytes(seqLensDev.get(),  seqLensH.data(),  nSeq * sizeof(std::int32_t));
         _e._ops->uploadHostBytes(startPosDev.get(), startPosH.data(), nSeq * sizeof(std::int32_t));
+#ifdef MIMIRMIND_HAVE_CUDA
+        // Push this step's KV write indices to device OUTSIDE any capture so the
+        // captured scatter reads the current slot, not the capture step's.
+        if (servingGraphOn) {
+            _e._ops->uploadHostBytes(writeBlockIdDev.get(), writeBlockId.data(),
+                                     nSeq * sizeof(std::uint32_t));
+            _e._ops->uploadHostBytes(writeSlotDev.get(), writeSlot.data(),
+                                     nSeq * sizeof(std::int32_t));
+        }
+#endif
 
         arch::BatchedDecodeCtx ctx{};
         ctx.nSeq            = nSeq;
@@ -320,6 +344,17 @@ ServingSession::generateBatch(
         ctx.expIdxSlot      = expIdxBuf.as<std::int32_t>();
         ctx.kwSlot          = kwBuf.as<float>();
         ctx.isSeqStart      = isSeqStart.data();
+#ifdef MIMIRMIND_HAVE_CUDA
+        if (servingGraphOn) {
+            ctx.writeBlockIdDev =
+                static_cast<const std::uint32_t*>(writeBlockIdDev.get());
+            ctx.writeSlotDev =
+                static_cast<const std::int32_t*>(writeSlotDev.get());
+            // Worst-case attention grid so a single captured graph serves every
+            // context length; the kernel reads the true length from seqLensDev.
+            ctx.maxSeqLen = graphMaxSeqLen;
+        }
+#endif
 
         if (timing) {
             _e._ops->flush();

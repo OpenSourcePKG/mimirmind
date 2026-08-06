@@ -670,6 +670,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/moe_group_build.cu
         kernels/cuda/llm/moe_gather_rows.cu
         kernels/cuda/llm/moe_scatter_expert_out.cu
+        kernels/cuda/llm/kv_write_tokens_batched.cu
         kernels/cuda/llm/moe_group_tiles.cu
         kernels/cuda/llm/moe_grouped_gemm_nvfp4blk.cu
         kernels/cuda/llm/matmul_nvfp4blk_deint_vec.cu

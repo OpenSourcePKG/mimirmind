@@ -1859,12 +1859,19 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
     }
 
     // --- scatter this step's K/V into the paged pool -----------------
-    for (std::size_t seq = 0; seq < nSeq; ++seq) {
-        ctx.pool->writeToken(_ops, denseLayer,
-                             ctx.writeBlockId[seq],
-                             static_cast<std::size_t>(ctx.writeSlot[seq]),
-                             kProj + seq * kv_dim,
-                             vProj + seq * kv_dim);
+    // Device path (graph-capturable) when the device index arrays are provided;
+    // otherwise the per-seq host loop (host-computed slot address).
+    if (ctx.writeBlockIdDev != nullptr && ctx.writeSlotDev != nullptr) {
+        ctx.pool->writeTokensBatched(_ops, denseLayer, kProj, vProj,
+                                     ctx.writeBlockIdDev, ctx.writeSlotDev, nSeq);
+    } else {
+        for (std::size_t seq = 0; seq < nSeq; ++seq) {
+            ctx.pool->writeToken(_ops, denseLayer,
+                                 ctx.writeBlockId[seq],
+                                 static_cast<std::size_t>(ctx.writeSlot[seq]),
+                                 kProj + seq * kv_dim,
+                                 vProj + seq * kv_dim);
+        }
     }
 
     // --- paged GQA attention (block-table indirection) ---------------
