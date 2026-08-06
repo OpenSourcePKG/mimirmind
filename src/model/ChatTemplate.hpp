@@ -6,6 +6,7 @@
 #include "model/ToolCall.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -87,7 +88,11 @@ public:
            const Tokenizer&               tok,
            std::span<const ChatMessage>   messages,
            bool                           addGenerationPrompt = true,
-           std::span<const ToolSpec>      tools               = {});
+           std::span<const ToolSpec>      tools               = {},
+           // Explicit reasoning toggle (OpenAI chat_template_kwargs.enable_thinking,
+           // like vLLM). nullopt = architecture default (Qwen: on unless a tool
+           // round). Only the Qwen "thinking" family honours it.
+           std::optional<bool>            enableThinking      = std::nullopt);
 
     /**
      * Token ids that should terminate decoding for `style`, in addition

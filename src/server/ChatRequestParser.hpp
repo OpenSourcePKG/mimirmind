@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -62,6 +63,13 @@ struct ChatRequest {
     bool                            hasPresencePenalty{false};
     float                           repetitionPenalty{1.0F};
     bool                            hasRepetitionPenalty{false};
+
+    // Reasoning toggle for "thinking" models (Qwen3.6). Mirrors vLLM's
+    // `chat_template_kwargs: {enable_thinking: <bool>}`; also accepted as a
+    // top-level `enable_thinking`. nullopt => architecture default (Qwen: think
+    // on unless a tool round). false => force a direct answer (no reasoning),
+    // which is what agentic RAG wants for its final answer turn.
+    std::optional<bool>             enableThinking{std::nullopt};
 };
 
 /// Parse an OpenAI chat-completions request body. Throws std::runtime_error

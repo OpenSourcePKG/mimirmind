@@ -121,7 +121,8 @@ bool ChatCompletionHandler::prepareChatRequest(
     // original prompt-token count in the response.
     std::vector<model::ChatMessage> msgs = cr.messages;
     promptIds = model::ChatTemplate::encode(
-        style, tok, msgs, /*addGenerationPrompt=*/true, cr.tools);
+        style, tok, msgs, /*addGenerationPrompt=*/true, cr.tools,
+        cr.enableThinking);
 
     // Debug teacher-forcing: append the raw prefill suffix (no BOS, no
     // special tokens) so the engine prefills the whole sequence in one pass.

@@ -159,6 +159,19 @@ ChatRequest parseChatRequest(const json& body) {
     readFloat("presence_penalty",   req.presencePenalty,   req.hasPresencePenalty);
     readFloat("repetition_penalty", req.repetitionPenalty, req.hasRepetitionPenalty);
 
+    // Reasoning toggle (vLLM-compatible). Accept a top-level `enable_thinking`
+    // and the nested `chat_template_kwargs: {enable_thinking: <bool>}`.
+    if (body.contains("enable_thinking") && body["enable_thinking"].is_boolean()) {
+        req.enableThinking = body["enable_thinking"].get<bool>();
+    } else if (body.contains("chat_template_kwargs") &&
+               body["chat_template_kwargs"].is_object()) {
+        const auto& kwargs = body["chat_template_kwargs"];
+        if (kwargs.contains("enable_thinking") &&
+            kwargs["enable_thinking"].is_boolean()) {
+            req.enableThinking = kwargs["enable_thinking"].get<bool>();
+        }
+    }
+
     if (body.contains("seed") && body["seed"].is_number_integer()) {
         req.seed = body["seed"].get<std::uint64_t>();
     }

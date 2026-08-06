@@ -87,7 +87,8 @@ void encodeText(const Tokenizer&         tok,
 std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
                                      std::span<const ChatMessage> messages,
                                      bool                         addGenerationPrompt,
-                                     std::span<const ToolSpec>    tools) {
+                                     std::span<const ToolSpec>    tools,
+                                     std::optional<bool>          enableThinking) {
     const std::int32_t imStart = requireToken(tok, kQwenImStart);
     const std::int32_t imEnd   = requireToken(tok, kQwenImEnd);
 
@@ -203,7 +204,35 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
         const std::int32_t think = tok.findToken("<think>");
         if (think >= 0) {
             ids.push_back(think);
-            encodeText(tok, "\n", ids);
+            // Explicit enable_thinking (OpenAI chat_template_kwargs, like vLLM)
+            // overrides the tools heuristic: enable_thinking=false forces the
+            // empty pre-closed block even WITHOUT tools (direct answer, no
+            // reasoning). This is the fix for agentic RAG whose final answer
+            // call carries no tools but must not leak an unclosed <think>.
+            // Unset (nullopt) keeps the tools-based default.
+            const bool thinkOn = enableThinking.value_or(tools.empty());
+            if (thinkOn) {
+                // pre-OPEN <think>: the model reasons, then closes
+                // with </think>. This is the answer path; the reasoning is
+                // surfaced as reasoning_content.
+                encodeText(tok, "\n", ids);
+            } else {
+                // Tool round → pre-CLOSE an empty think block (Qwen3's
+                // "thinking disabled" prompt shape: <think>\n\n</think>\n\n)
+                // so the model emits the tool call directly instead of a
+                // multi-thousand-token chain-of-thought. Tool selection does
+                // not need deep reasoning, and those think blocks made agentic
+                // RAG unusably slow (~4096 tokens / round). The final answer
+                // (sent without tools) still reasons.
+                encodeText(tok, "\n\n", ids);
+                const std::int32_t thinkEnd = tok.findToken("</think>");
+                if (thinkEnd >= 0) {
+                    ids.push_back(thinkEnd);
+                } else {
+                    encodeText(tok, "</think>", ids);
+                }
+                encodeText(tok, "\n\n", ids);
+            }
         }
     }
 
@@ -598,10 +627,12 @@ ChatTemplate::encode(Style                        style,
                      const Tokenizer&             tok,
                      std::span<const ChatMessage> messages,
                      bool                         addGenerationPrompt,
-                     std::span<const ToolSpec>    tools) {
+                     std::span<const ToolSpec>    tools,
+                     std::optional<bool>          enableThinking) {
     switch (style) {
         case Style::QwenChatML:
-            return encodeQwen(tok, messages, addGenerationPrompt, tools);
+            return encodeQwen(tok, messages, addGenerationPrompt, tools,
+                              enableThinking);
         case Style::Gemma3:
             // Gemma 3 tool rendering not implemented (Gemma 4 is the target).
             return encodeGemma3(tok, messages, addGenerationPrompt);
