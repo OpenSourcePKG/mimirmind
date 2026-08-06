@@ -17,9 +17,25 @@
 #include "runtime/spec/NGramDrafter.hpp"
 #include "runtime/spec/SpeculativeDecoder.hpp"
 #include "runtime/thermal/ThermalGuard.hpp"
+#ifdef MIMIRMIND_HAVE_CUDA
+#include "runtime/thermal/NvmlTelemetry.hpp"
+#endif
 
 #include <limits>
 #include <vector>
+
+namespace {
+#ifdef MIMIRMIND_HAVE_CUDA
+// Process-lifetime NVML telemetry reader (observability only; never enforces).
+// Lazily constructed on first status request so a CPU/L0 build without a driver
+// pays nothing. Used as a fallback on the CUDA (GB10) backend where the sysfs
+// PowerMonitor / GpuClockGovernor do not apply.
+const ::mimirmind::runtime::thermal::NvmlTelemetry& nvmlTelemetry() {
+    static ::mimirmind::runtime::thermal::NvmlTelemetry inst;
+    return inst;
+}
+#endif
+} // namespace
 
 namespace mimirmind::server {
 
@@ -335,53 +351,80 @@ json SystemStatusBuilder::buildStatus() {
     json body{
         {"profile_active", guard != nullptr},
     };
-    if (guard == nullptr) {
+
+    // Enforcement (guard-gated): thermal profile + throttle decision + the
+    // guard's own readings. No guard = no throttling (engine runs unthrottled,
+    // full load) — but telemetry below is still reported (observability is
+    // independent of enforcement).
+    if (guard != nullptr) {
+        const auto& p        = guard->profile();
+        const auto  decision = guard->decide();
+        const auto  reading  = guard->lastReading();
+
+        json profileJson{
+            {"name",        p.name},
+            {"description", p.description},
+        };
+        if (p.hasPackageLimits()) {
+            profileJson["package_temp_soft_c"]    = *p.package_temp_soft_c;
+            profileJson["package_temp_hard_c"]    = *p.package_temp_hard_c;
+            profileJson["package_throttle_max_ms"] = p.package_throttle_max_ms;
+        }
+
+        json readingsJson = json::object();
+        if (reading.package_temp_c.has_value()) {
+            readingsJson["package_temp_c"] = *reading.package_temp_c;
+        }
+        if (reading.ram_total_mib.has_value()) {
+            readingsJson["ram_total_mib"] = *reading.ram_total_mib;
+        }
+        if (reading.ram_available_mib.has_value()) {
+            readingsJson["ram_available_mib"] = *reading.ram_available_mib;
+        }
+
+        const char* stateStr =
+            decision.state == runtime::ThermalDecision::State::Critical   ? "critical"
+            : decision.state == runtime::ThermalDecision::State::Throttling ? "throttling"
+                                                                            : "ok";
+
+        body["profile"]   = std::move(profileJson);
+        body["readings"]  = std::move(readingsJson);
+        body["throttle"]  = json{
+            {"state",                stateStr},
+            {"current_pause_ms",     static_cast<int>(decision.pause.count())},
+            {"next_request_allowed", decision.admit_new_request},
+            {"reason",               decision.reason.empty()
+                                       ? json{}
+                                       : json{decision.reason}},
+        };
+    } else {
         body["warning"] =
-            "no thermal profile configured — engine is unprotected. "
-            "Fill the governor.thermal section in config.json.";
-        return body;
+            "no thermal profile configured — engine runs unthrottled (full "
+            "load). Fill the governor.thermal section in config.json to enable "
+            "thermal enforcement.";
+#ifdef MIMIRMIND_HAVE_CUDA
+        // Temperature + memory telemetry via NVML (the guard's usual source is
+        // absent). Same field names as the guard readings so clients need no
+        // special-casing.
+        const auto s = nvmlTelemetry().sample();
+        json readingsJson = json::object();
+        if (s.temp_c.has_value()) {
+            readingsJson["package_temp_c"] = *s.temp_c;
+        }
+        if (s.mem_total_mib.has_value()) {
+            readingsJson["ram_total_mib"] = *s.mem_total_mib;
+        }
+        if (s.mem_used_mib.has_value() && s.mem_total_mib.has_value()) {
+            readingsJson["ram_available_mib"] =
+                *s.mem_total_mib - *s.mem_used_mib;
+        }
+        if (!readingsJson.empty()) {
+            body["readings"] = std::move(readingsJson);
+        }
+#endif
     }
 
-    const auto& p        = guard->profile();
-    const auto  decision = guard->decide();
-    const auto  reading  = guard->lastReading();
-
-    json profileJson{
-        {"name",        p.name},
-        {"description", p.description},
-    };
-    if (p.hasPackageLimits()) {
-        profileJson["package_temp_soft_c"]    = *p.package_temp_soft_c;
-        profileJson["package_temp_hard_c"]    = *p.package_temp_hard_c;
-        profileJson["package_throttle_max_ms"] = p.package_throttle_max_ms;
-    }
-
-    json readingsJson = json::object();
-    if (reading.package_temp_c.has_value()) {
-        readingsJson["package_temp_c"] = *reading.package_temp_c;
-    }
-    if (reading.ram_total_mib.has_value()) {
-        readingsJson["ram_total_mib"] = *reading.ram_total_mib;
-    }
-    if (reading.ram_available_mib.has_value()) {
-        readingsJson["ram_available_mib"] = *reading.ram_available_mib;
-    }
-
-    const char* stateStr =
-        decision.state == runtime::ThermalDecision::State::Critical   ? "critical"
-        : decision.state == runtime::ThermalDecision::State::Throttling ? "throttling"
-                                                                        : "ok";
-
-    body["profile"]   = std::move(profileJson);
-    body["readings"]  = std::move(readingsJson);
-    body["throttle"]  = json{
-        {"state",                stateStr},
-        {"current_pause_ms",     static_cast<int>(decision.pause.count())},
-        {"next_request_allowed", decision.admit_new_request},
-        {"reason",               decision.reason.empty()
-                                   ? json{}
-                                   : json{decision.reason}},
-    };
+    // Observability (always reported, independent of the thermal guard).
     body["power"]           = buildPowerBlock();
     body["gpu_clock"]       = buildGpuClockBlock();
     body["fan"]             = buildFanBlock();
@@ -435,17 +478,29 @@ json SystemStatusBuilder::buildPerfRegressionBlock() const {
 
 json SystemStatusBuilder::buildGpuClockBlock() const {
     auto* gov = _engine.gpuClockGovernor();
-    if (gov == nullptr) {
+    if (gov == nullptr || !gov->available()) {
+#ifdef MIMIRMIND_HAVE_CUDA
+        // No sysfs governor (CUDA/GB10) — report the live SM clock via NVML.
+        const auto s = nvmlTelemetry().sample();
+        if (s.sm_clock_mhz.has_value()) {
+            json b{
+                {"available",       true},
+                {"source",          "nvml"},
+                {"device",          nvmlTelemetry().deviceName()},
+                {"current_cap_mhz", *s.sm_clock_mhz},
+                {"current_mhz",     *s.sm_clock_mhz},
+            };
+            if (s.mem_clock_mhz.has_value()) {
+                b["mem_clock_mhz"] = *s.mem_clock_mhz;
+            }
+            return b;
+        }
+#endif
         return json{
             {"available", false},
-            {"reason",    "no GPU clock governor installed (profile "
-                          "has no gpu_target_temp_c)"},
-        };
-    }
-    if (!gov->available()) {
-        return json{
-            {"available", false},
-            {"reason",    std::string{gov->unavailableReason()}},
+            {"reason",    gov == nullptr
+                            ? std::string{"no GPU clock governor installed"}
+                            : std::string{gov->unavailableReason()}},
         };
     }
     json body{
@@ -580,16 +635,30 @@ json SystemStatusBuilder::buildKernelsBlock() const {
 
 json SystemStatusBuilder::buildPowerBlock() {
     auto* mon = _engine.powerMonitor();
-    if (mon == nullptr) {
+    if (mon == nullptr || !mon->available()) {
+#ifdef MIMIRMIND_HAVE_CUDA
+        // No RAPL power monitor (CUDA/GB10) — report the live GPU power draw via
+        // NVML as a single "gpu" domain, matching the sysfs domains schema.
+        const auto s = nvmlTelemetry().sample();
+        if (s.power_w.has_value()) {
+            // Name the domain "package-0" to match the RAPL-domain schema that
+            // status clients (Pegenaut) read as the headline "power" figure; the
+            // GB10 GPU power is effectively the whole-package draw here.
+            return json{
+                {"available", true},
+                {"source",    "nvml"},
+                {"domains",   json::array({ json{
+                    {"name",      "package-0"},
+                    {"watts_now", *s.power_w},
+                }})},
+            };
+        }
+#endif
         return json{
             {"available", false},
-            {"reason",    "no power monitor installed"},
-        };
-    }
-    if (!mon->available()) {
-        return json{
-            {"available", false},
-            {"reason",    std::string{mon->unavailableReason()}},
+            {"reason",    mon == nullptr
+                            ? std::string{"no power monitor installed"}
+                            : std::string{mon->unavailableReason()}},
         };
     }
 

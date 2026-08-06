@@ -869,10 +869,16 @@ if(MIMIRMIND_ENABLE_CUDA)
         src/core/gpu/cuda/PagedAttentionV1.cpp
         src/core/gpu/cuda/PagedAttentionV2.cpp
         src/core/gpu/cuda/CudaGraph.cpp
+        # NVML-based GPU telemetry (power/temp/clock/mem observability).
+        src/runtime/thermal/NvmlTelemetry.cpp
     )
 
     target_link_libraries(mimirmind_core_cuda PUBLIC
         mimirmind_core_common
+        # CUDA::nvml = NVIDIA Management Library (read-only telemetry). Links the
+        # toolkit stub; the real libnvidia-ml.so.1 is injected at runtime by the
+        # NVIDIA container runtime (--gpus all).
+        CUDA::nvml
         # CUDA::cudart      = runtime API (streams, memory, events).
         # CUDA::cuda_driver = driver API (CUmodule, CUfunction,
         #                     cuLaunchKernel) — needed by CudaModule +
