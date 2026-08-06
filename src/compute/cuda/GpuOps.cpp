@@ -18,6 +18,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <unordered_map>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -273,6 +274,16 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _moeGroupTilesKernel;
     core::cuda::CudaModule _moeGroupedGemmNvfp4Module;
     core::cuda::CudaKernel _moeGroupedGemmNvfp4Kernel;
+    // De-interleaved (uint4-coalesced) NVFP4 grouped decode + its de-interleave
+    // helper, plus a by-pointer cache of the de-interleaved (nib, scale) banks.
+    core::cuda::CudaModule _nvfp4DeintModule;
+    core::cuda::CudaKernel _nvfp4DeinterleaveKernel;
+    core::cuda::CudaKernel _moeGroupedGemmNvfp4DeintKernel;
+    struct DeintBank {
+        compute::ComputeBuffer nib;
+        compute::ComputeBuffer scale;
+    };
+    std::unordered_map<const void*, DeintBank> _deintCache;
     // GD-b: decode small-M variant (acc[4] + 4 KB shared) from the same module.
     core::cuda::CudaKernel _moeGroupedGemmNvfp4M4Kernel;
     // E-d.4b: padding infra (one module, four kernels) + act-quant.
@@ -463,6 +474,11 @@ struct GpuOps::Impl {
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk")},
           _moeGroupedGemmNvfp4M4Kernel{
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m4")},
+          _nvfp4DeintModule{loadCudaModule(ctx, "matmul_nvfp4blk_deint_vec")},
+          _nvfp4DeinterleaveKernel{
+              _nvfp4DeintModule.getFunction("nvfp4blk_deinterleave")},
+          _moeGroupedGemmNvfp4DeintKernel{
+              _nvfp4DeintModule.getFunction("moe_grouped_gemm_nvfp4blk_deint")},
           _moePadModule            {loadCudaModule(ctx, "moe_pad")},
           _moePadOffsetsKernel     {_moePadModule.getFunction("moe_pad_offsets")},
           _moeContigToPadKernel    {_moePadModule.getFunction("moe_contig_to_pad")},
@@ -1603,6 +1619,52 @@ void GpuOps::moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
     k.setValue(7, toInt32(N, "moeGroupedGemm N"));
     k.launch(_ctx.stream(), nGroups, static_cast<std::uint32_t>(maxTiles), 1,
              kLocal, 1, 1);
+}
+
+void GpuOps::moeGroupedGemmNvfp4DeintAsync(
+        const float* x, const unsigned char* w, float* y,
+        const std::int32_t* tileExpert, const std::int32_t* tileRow0,
+        const std::int32_t* tileRows, std::size_t K, std::size_t N,
+        std::size_t nExperts, std::size_t maxTiles, bool /*decodeSmallM*/) {
+    if (N == 0 || K == 0 || maxTiles == 0) {
+        return;
+    }
+    constexpr std::uint32_t kLocal = 128;
+    const std::size_t nSuper      = K / 32;
+    const std::size_t totalSupers = nExperts * N * nSuper;
+
+    // De-interleave the interleaved 20-byte blocked bank into a 16-byte-aligned
+    // nibble bank + fp16 scale bank once; cache by the weight pointer.
+    auto it = _pimpl->_deintCache.find(w);
+    if (it == _pimpl->_deintCache.end()) {
+        Impl::DeintBank bank;
+        bank.nib   = allocate(totalSupers * 16);
+        bank.scale = allocate(totalSupers * 4);
+        auto& dk = _pimpl->_nvfp4DeinterleaveKernel;
+        dk.setPtr  (0, w);
+        dk.setPtr  (1, bank.nib.get());
+        dk.setPtr  (2, bank.scale.get());
+        dk.setValue(3, static_cast<std::int64_t>(totalSupers));
+        const std::uint32_t g =
+            static_cast<std::uint32_t>((totalSupers + 255) / 256);
+        dk.launch(_ctx.stream(), g, 1, 1, 256, 1, 1);
+        it = _pimpl->_deintCache.emplace(w, std::move(bank)).first;
+    }
+
+    auto& k = _pimpl->_moeGroupedGemmNvfp4DeintKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, it->second.nib.get());
+    k.setPtr  (2, it->second.scale.get());
+    k.setPtr  (3, y);
+    k.setPtr  (4, tileExpert);
+    k.setPtr  (5, tileRow0);
+    k.setPtr  (6, tileRows);
+    k.setValue(7, toInt32(K, "deint K"));
+    k.setValue(8, toInt32(N, "deint N"));
+    const std::uint32_t nGroups = static_cast<std::uint32_t>((N + 3) / 4);
+    const std::size_t smemBytes = K * sizeof(float);   // MAX_M(1) * K
+    k.launch(_ctx.stream(), nGroups, static_cast<std::uint32_t>(maxTiles), 1,
+             kLocal, 1, 1, smemBytes);
 }
 
 // === E-d.4b FP4-tensor-core grouped MoE ===================================

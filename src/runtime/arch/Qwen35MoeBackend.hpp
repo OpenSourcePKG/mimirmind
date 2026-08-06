@@ -401,6 +401,9 @@ private:
     // Force the single-pass paged decode (V1) instead of the split-K V2 for
     // full-attention layers. A/B + rollback lever (MIMIRMIND_PAGED_V1=1).
     bool _forcePagedV1{false};
+    // Route the routed-MoE decode grouped GEMM through the de-interleaved
+    // uint4-coalesced kernel (nSeq==1 only). A/B (MIMIRMIND_NVFP4_DEINT=1).
+    bool _useDeintMoe{false};
     // Host mirror of the device expert-offset table (moe_group_build output),
     // read back once per grouped MoE layer to drive the per-expert launches
     // (host-driven Option 1 only; the device-driven path never reads it back).

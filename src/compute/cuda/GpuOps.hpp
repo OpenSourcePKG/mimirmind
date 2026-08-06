@@ -238,6 +238,14 @@ public:
                                   std::size_t K, std::size_t N,
                                   std::size_t maxTiles,
                                   bool decodeSmallM = false) override;
+    void moeGroupedGemmNvfp4DeintAsync(const float* x, const unsigned char* w,
+                                       float* y, const std::int32_t* tileExpert,
+                                       const std::int32_t* tileRow0,
+                                       const std::int32_t* tileRows,
+                                       std::size_t K, std::size_t N,
+                                       std::size_t nExperts,
+                                       std::size_t maxTiles,
+                                       bool decodeSmallM = false) override;
     // E-d.4b FP4-tensor-core grouped MoE.
     [[nodiscard]] bool moeGroupedGemmNvfp4TcAvailable() const noexcept override;
     void moeZeroBytesAsync(void* dst, std::size_t bytes) override;

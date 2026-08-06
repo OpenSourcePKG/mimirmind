@@ -468,6 +468,26 @@ public:
             "moeGroupedGemmNvfp4Async: not supported on this backend");
     }
 
+    /// As moeGroupedGemmNvfp4Async but consumes a de-interleaved blocked-NVFP4
+    /// bank (16-byte-aligned nibbles + separate fp16 scales) via coalesced
+    /// uint4 loads — ~2x the DRAM bandwidth of the interleaved 20-byte path at
+    /// decode. The de-interleave of `w` (nExperts*N*K/32 supers) is done once
+    /// and cached by the implementation. Default: fall back to the interleaved
+    /// path (correct, just slower); CUDA overrides.
+    virtual void moeGroupedGemmNvfp4DeintAsync(const float* x,
+                                               const unsigned char* w, float* y,
+                                               const std::int32_t* tileExpert,
+                                               const std::int32_t* tileRow0,
+                                               const std::int32_t* tileRows,
+                                               std::size_t K, std::size_t N,
+                                               std::size_t nExperts,
+                                               std::size_t maxTiles,
+                                               bool decodeSmallM = false) {
+        (void)nExperts;
+        moeGroupedGemmNvfp4Async(x, w, y, tileExpert, tileRow0, tileRows,
+                                 K, N, maxTiles, decodeSmallM);
+    }
+
     // === M-Cuda.MoeGroup Sub-Step E-d.4b: FP4-tensor-core grouped MoE ========
     // The padded-per-expert building blocks + the CUTLASS block-scaled NVFP4
     // grouped GEMM. CUDA-only; every default is unsupported / unavailable.

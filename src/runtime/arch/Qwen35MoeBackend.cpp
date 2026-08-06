@@ -131,6 +131,9 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
     if (const char* p = std::getenv("MIMIRMIND_PAGED_V1")) {
         _forcePagedV1 = (p[0] == '1' && p[1] == '\0');
     }
+    if (const char* dm = std::getenv("MIMIRMIND_NVFP4_DEINT")) {
+        _useDeintMoe = (dm[0] == '1' && dm[1] == '\0');
+    }
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     if (const char* d = std::getenv("MIMIRMIND_SSM_DUMP")) {
         _ssmDump    = true;
@@ -1594,17 +1597,33 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
             static_cast<const unsigned char*>(downExps.usmPtr);
 
         // gate/up: weight [nExperts][n_ff_exp][d_model] (N=n_ff_exp, K=d_model)
-        _ops.moeGroupedGemmNvfp4Async(xComp, gateBase, gateComp,
-                                      tileExpert, tileRow0, tileRows,
-                                      d_model, n_ff_exp, maxTiles, smallM);
-        _ops.moeGroupedGemmNvfp4Async(xComp, upBase, upComp,
-                                      tileExpert, tileRow0, tileRows,
-                                      d_model, n_ff_exp, maxTiles, smallM);
+        // Single-user decode (nSeq==1 => <=1 row/tile) can take the de-inter-
+        // leaved uint4-coalesced kernel (~2x DRAM bandwidth); everything else
+        // stays on the interleaved GD-b path.
+        const bool deint = _useDeintMoe && nSeq == 1;
+        if (deint) {
+            _ops.moeGroupedGemmNvfp4DeintAsync(xComp, gateBase, gateComp,
+                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, nExperts,
+                maxTiles, smallM);
+            _ops.moeGroupedGemmNvfp4DeintAsync(xComp, upBase, upComp,
+                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, nExperts,
+                maxTiles, smallM);
+        } else {
+            _ops.moeGroupedGemmNvfp4Async(xComp, gateBase, gateComp,
+                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles, smallM);
+            _ops.moeGroupedGemmNvfp4Async(xComp, upBase, upComp,
+                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles, smallM);
+        }
         _ops.siluMulAsync(gateComp, upComp, R * n_ff_exp);      // silu(gate)*up
         // down: weight [nExperts][d_model][n_ff_exp] (N=d_model, K=n_ff_exp)
-        _ops.moeGroupedGemmNvfp4Async(gateComp, downBase, downComp,
-                                      tileExpert, tileRow0, tileRows,
-                                      n_ff_exp, d_model, maxTiles, smallM);
+        if (deint) {
+            _ops.moeGroupedGemmNvfp4DeintAsync(gateComp, downBase, downComp,
+                tileExpert, tileRow0, tileRows, n_ff_exp, d_model, nExperts,
+                maxTiles, smallM);
+        } else {
+            _ops.moeGroupedGemmNvfp4Async(gateComp, downBase, downComp,
+                tileExpert, tileRow0, tileRows, n_ff_exp, d_model, maxTiles, smallM);
+        }
     } else {
         // --- Option 1: host-driven grouped (correct but slower on GB10) ----
         // The per-expert launch bounds are the only thing that must cross to
