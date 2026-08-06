@@ -2335,7 +2335,10 @@ void GpuOps::pagedAttentionDecodeV2Async(
         k.setValue(13, toInt32(maxNumBlocksPerSeq, "pagedV2 maxBlocks"));
         k.setValue(14, toInt32(maxNumPartitions,   "pagedV2 maxParts"));
         k.setValue(15, scale);   // partition_size / softcap / dtype are compile-time
-        const std::size_t smemBytes = (2 * headSize + kLocal) * sizeof(float);
+        // smem = [nWarps*headSize (acc) | nWarps (m) | nWarps (l)].
+        const std::size_t nWarps = kLocal / 32;
+        const std::size_t smemBytes =
+            (nWarps * headSize + 2 * nWarps) * sizeof(float);
         k.launch(_ctx.stream(),
                  static_cast<std::uint32_t>(numHeads),
                  static_cast<std::uint32_t>(numSeqs),

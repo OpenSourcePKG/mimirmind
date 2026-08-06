@@ -142,19 +142,24 @@ void paged_attention_v2(
     const float* __restrict__ q_row =
         query + (static_cast<long>(seq) * num_heads + hq) * head_size;
 
-    extern __shared__ float smem[];
-    float* __restrict__ sq  = smem;                     // [head_size]
-    float* __restrict__ acc = smem + head_size;         // [head_size]
-    float* __restrict__ red = smem + 2 * head_size;     // [nthr]
-
-    for (int d = tid; d < head_size; d += nthr) {
-        sq[d]  = q_row[d];
-        acc[d] = 0.0f;
+    // Warp-cooperative decode attention: block = nWarps warps of 32 lanes.
+    // Each warp streams a strided subset of the partition's KV positions and
+    // keeps its OWN online-softmax (m, l, acc) with acc distributed across the
+    // 32 lanes (lane owns dims { lane + i*32 }). The per-position q.k reduction
+    // is a sync-free warp shuffle; the warps are merged once at the end. This
+    // removes V1's per-position __syncthreads tree-reduction (the bottleneck).
+    // Requires head_size % 32 == 0 and <= 256 (128 for qwen35moe); fp32 KV.
+    constexpr int WARP = 32;
+    if ((head_size % WARP) != 0 || head_size > 256) {
+        __trap();
     }
-    __syncthreads();
+    const int lane     = tid % WARP;
+    const int warpId   = tid / WARP;
+    const int nWarps   = nthr / WARP;
+    const int dPerLane = head_size / WARP;   // <= 8 for head_size <= 256
 
-    // Empty partition (past this sequence's length): emit a neutral partial
-    // (m = -inf, l = 0, acc = 0) so the reduce kernel skips it cleanly.
+    // Empty partition (past this sequence's length): neutral partial so the
+    // reduce kernel skips it cleanly.
     if (p_start >= p_end) {
         if (tid == 0) {
             max_logits[part_idx] = -1.0e30f;
@@ -166,21 +171,23 @@ void paged_attention_v2(
         return;
     }
 
-    __shared__ float s_m;      // running row-max
-    __shared__ float s_l;      // running softmax denominator
-    __shared__ float s_score;  // broadcast of current logit
-    if (tid == 0) {
-        s_m = -1.0e30f;
-        s_l = 0.0f;
+    // Per-lane registers: this lane owns dims { lane + i*WARP : i < dPerLane }.
+    float qreg[8];
+    float acc[8];
+    #pragma unroll
+    for (int i = 0; i < dPerLane; ++i) {
+        qreg[i] = q_row[lane + i * WARP];
+        acc[i]  = 0.0f;
     }
-    __syncthreads();
+    float m = -1.0e30f;
+    float l = 0.0f;
 
     const float* __restrict__ kbase = static_cast<const float*>(key_cache);
     const float* __restrict__ vbase = static_cast<const float*>(value_cache);
     const int*   __restrict__ bt =
         block_tables + static_cast<long>(seq) * max_num_blocks_per_seq;
 
-    for (int p = p_start; p < p_end; ++p) {
+    for (int p = p_start + warpId; p < p_end; p += nWarps) {
         const int  blk    = bt[p / block_size];
         const int  slot   = p % block_size;
         const long kv_off =
@@ -188,47 +195,65 @@ void paged_attention_v2(
             * head_size;
         const float* __restrict__ k_p = kbase + kv_off;
 
-        float partial = 0.0f;
-        for (int d = tid; d < head_size; d += nthr) {
-            partial += sq[d] * k_p[d];
+        float dot = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < dPerLane; ++i) {
+            dot += qreg[i] * k_p[lane + i * WARP];
         }
-        red[tid] = partial;
-        __syncthreads();
-        for (int stride = nthr >> 1; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                red[tid] += red[tid + stride];
-            }
-            __syncthreads();
+        #pragma unroll
+        for (int off = WARP / 2; off > 0; off >>= 1) {
+            dot += __shfl_xor_sync(0xffffffffu, dot, off);
         }
-        if (tid == 0) {
-            s_score = red[0] * scale;
-        }
-        __syncthreads();
-
-        const float score   = s_score;
-        const float m_new    = fmaxf(s_m, score);
-        const float rescale  = __expf(s_m - m_new);
-        const float p_exp    = __expf(score - m_new);
+        const float logit   = dot * scale;   // identical across the warp's lanes
+        const float m_new    = fmaxf(m, logit);
+        const float rescale  = __expf(m - m_new);
+        const float p_exp    = __expf(logit - m_new);
         const float* __restrict__ v_p = vbase + kv_off;
-        for (int d = tid; d < head_size; d += nthr) {
-            acc[d] = acc[d] * rescale + p_exp * v_p[d];
+        #pragma unroll
+        for (int i = 0; i < dPerLane; ++i) {
+            acc[i] = acc[i] * rescale + p_exp * v_p[lane + i * WARP];
         }
-        __syncthreads();
-        if (tid == 0) {
-            s_l = s_l * rescale + p_exp;
-            s_m = m_new;
-        }
-        __syncthreads();
+        l = l * rescale + p_exp;
+        m = m_new;
     }
 
-    // Emit UNNORMALISED partials: acc (sum of p_exp*v), plus m and l. The
-    // reduce kernel rescales across partitions and divides by the global l.
-    if (tid == 0) {
-        max_logits[part_idx] = s_m;
-        exp_sums[part_idx]   = s_l;
+    // Cross-warp merge in shared memory (once). Layout:
+    //   [ nWarps * head_size (acc) | nWarps (m) | nWarps (l) ].
+    extern __shared__ float smem[];
+    float* __restrict__ sAcc = smem;                       // [nWarps][head_size]
+    float* __restrict__ sM   = smem + nWarps * head_size;  // [nWarps]
+    float* __restrict__ sL   = sM + nWarps;                // [nWarps]
+    #pragma unroll
+    for (int i = 0; i < dPerLane; ++i) {
+        sAcc[warpId * head_size + lane + i * WARP] = acc[i];
+    }
+    if (lane == 0) {
+        sM[warpId] = m;
+        sL[warpId] = l;
+    }
+    __syncthreads();
+
+    // Global max + denominator (nWarps <= 8, so every thread recomputes them
+    // cheaply), then each thread merges the head dims it owns. Emit the
+    // UNNORMALISED acc + (m, l) for the reduce kernel.
+    float mg = -1.0e30f;
+    for (int w = 0; w < nWarps; ++w) {
+        mg = fmaxf(mg, sM[w]);
+    }
+    float lg = 0.0f;
+    for (int w = 0; w < nWarps; ++w) {
+        lg += sL[w] * __expf(sM[w] - mg);
     }
     for (int d = tid; d < head_size; d += nthr) {
-        o_row[d] = acc[d];
+        float a = 0.0f;
+        for (int w = 0; w < nWarps; ++w) {
+            a += sAcc[w * head_size + d] * __expf(sM[w] - mg);
+        }
+        o_row[d] = a;
+    }
+    if (tid == 0) {
+        max_logits[part_idx] = mg;
+        exp_sums[part_idx]   = lg;
     }
 }
 
