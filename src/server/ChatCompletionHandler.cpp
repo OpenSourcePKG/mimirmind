@@ -724,15 +724,23 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
 
         StreamState(model::ChatTemplate::Style style,
                     const model::Tokenizer&    tok,
-                    bool                       preserveThinking)
-            : cleaner{preserveThinking
-                ? model::ResponseCleaner{
-                      model::ChatTemplate::Style::QwenChatML, -1, -1}
+                    bool                       preserveThinking,
+                    bool                       thinkPreClosed)
+            // A `<think>` token makes forStyle() start the cleaner INSIDE the
+            // think block (Qwen pre-opens <think> in the default prompt). But
+            // when the request disabled thinking, the chat template pre-CLOSES
+            // the block (`<think>\n\n</think>\n\n`) so generation is answer
+            // content from the first token — start the cleaner in content mode
+            // (channelStartId = -1), else the whole answer is mislabelled as
+            // reasoning_content and delta.content streams empty.
+            : cleaner{(preserveThinking || thinkPreClosed)
+                ? model::ResponseCleaner{style, -1, -1}
                 : model::ResponseCleaner::forStyle(style, tok)} {}
     };
     auto state = std::make_shared<StreamState>(
         model::ChatTemplate::detectFromArch(engine.config().architecture),
-        engine.tokenizer(), _cfg.preserveThinking);
+        engine.tokenizer(), _cfg.preserveThinking,
+        /*thinkPreClosed=*/cr.enableThinking.has_value() && !cr.enableThinking.value());
     state->promptIds = std::move(promptIds);
     state->stopIds   = std::move(stopIds);
     state->params    = std::move(params);
