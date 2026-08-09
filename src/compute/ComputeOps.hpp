@@ -235,6 +235,23 @@ public:
             "gatedDeltaNetRecurrentBatchedAsync: not supported on this backend");
     }
 
+    /// GDN-Inc 2: as gatedDeltaNetRecurrentBatchedAsync but with the decay gate
+    /// (deltanet_gate) and beta sigmoid folded into the recurrence — consumes the
+    /// RAW alpha/beta projections + per-head ssm_a/ssm_dt, removing two
+    /// elementwise launches per layer. Bit-identical result.
+    virtual void gatedDeltaNetRecurrentGateFusedBatchedAsync(
+            const float* q, const float* k, const float* v, const float* alpha,
+            const float* beta, const float* ssmA, const float* ssmDt,
+            float* state, float* out, std::size_t nSeq, std::size_t T,
+            std::size_t H, std::size_t S) {
+        (void)q; (void)k; (void)v; (void)alpha; (void)beta; (void)ssmA;
+        (void)ssmDt; (void)state; (void)out; (void)nSeq; (void)T; (void)H;
+        (void)S;
+        throw std::runtime_error(
+            "gatedDeltaNetRecurrentGateFusedBatchedAsync: not supported on this "
+            "backend");
+    }
+
     // MV-a (MTP verify): batched GDN over the T=K+1 window with per-position
     // state export (stateOut [T,nSeq,H,S,S]) instead of a per-step snapshot.
     virtual void gatedDeltaNetVerifyBatchedAsync(
@@ -665,6 +682,22 @@ public:
                                               std::size_t  dstHeads,
                                               std::size_t  S,
                                               std::size_t  convTotalWidth) = 0;
+
+    /// GDN-Inc 2b: fused post-conv prep — q/k/v head gather (with GQA repeat) +
+    /// q/k L2-norm in ONE launch, replacing 3 gather + 2 l2norm launches.
+    /// Bit-identical. Default throws; only the CUDA backend implements it.
+    virtual void fusedPostConvPrepAsync(const float* qkvMixed, float* qOut,
+                                        float* kOut, float* vOut, std::size_t T,
+                                        std::size_t srcHeadsKV,
+                                        std::size_t dstHeads, std::size_t S,
+                                        std::size_t convTotalWidth,
+                                        std::size_t keyDim, float eps) {
+        (void)qkvMixed; (void)qOut; (void)kOut; (void)vOut; (void)T;
+        (void)srcHeadsKV; (void)dstHeads; (void)S; (void)convTotalWidth;
+        (void)keyDim; (void)eps;
+        throw std::runtime_error(
+            "fusedPostConvPrepAsync: not supported on this backend");
+    }
 
     // ---- RoPE ---------------------------------------------------------
 

@@ -137,6 +137,20 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
     if (const char* nb = std::getenv("MIMIRMIND_MOE_M1NB")) {
         _useM1nb = (nb[0] == '1' && nb[1] == '\0');
     }
+    // GDN-Inc 1: vLLM-style fused GDN input projections (qkvz + ba), nSeq==1.
+    if (const char* pf = std::getenv("MIMIRMIND_GDN_PROJ_FUSE")) {
+        _gdnProjFuse = (pf[0] == '1' && pf[1] == '\0');
+    }
+    // GDN-Inc 2 / 2b are bit-identical and cost no memory, so they default ON;
+    // MIMIRMIND_GDN_GATE_FUSE=0 / MIMIRMIND_GDN_PREP_FUSE=0 roll back.
+    if (const char* gf = std::getenv("MIMIRMIND_GDN_GATE_FUSE")) {
+        _gdnGateFuse = !(gf[0] == '0' && gf[1] == '\0');
+    }
+    if (const char* pcf = std::getenv("MIMIRMIND_GDN_PREP_FUSE")) {
+        _gdnPrepFuse = !(pcf[0] == '0' && pcf[1] == '\0');
+    }
+    _gdnQkvzW.resize(_config.blockCount);
+    _gdnBaW.resize(_config.blockCount);
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     if (const char* d = std::getenv("MIMIRMIND_SSM_DUMP")) {
         _ssmDump    = true;
@@ -1920,7 +1934,9 @@ void Qwen35MoeBackend::runLinearBlockBatched(
         std::size_t blockIdx, float* x, const BatchedDecodeCtx& ctx,
         BlockBuffers& s) {
     const std::size_t nSeq = ctx.nSeq;
-    _ops.profileSection("gdn");
+    // GDN sub-instrumentation (MIMIRMIND_DECODE_PROFILE only): split the single
+    // "gdn" bucket into proj / conv / recur / tail to locate the residual cost.
+    _ops.profileSection("gdn.proj");
     if (nSeq == 0) {
         return;
     }
@@ -1952,15 +1968,15 @@ void Qwen35MoeBackend::runLinearBlockBatched(
     const float       eps            = _config.rmsNormEps;
 
     float* const normBuf   = s.normBuf.as<float>();
-    float* const qkvMixed  = s.ssmQkvMixed.as<float>();   // [nSeq, convDim] (also conv out)
+    float*       qkvMixed  = s.ssmQkvMixed.as<float>();   // [nSeq, convDim] (also conv out; fused proj -> _gdnQkvzOut)
     float* const convInput = s.ssmConvInput.as<float>();  // [nSeq, dConv, convDim] (serving-sized)
-    float* const zBuf      = s.ssmZ.as<float>();
+    float*       zBuf      = s.ssmZ.as<float>();
     float* const qBuf      = s.ssmQ.as<float>();
     float* const kBuf      = s.ssmK.as<float>();
     float* const vBuf      = s.ssmV.as<float>();
     float* const deltaOut  = s.ssmDeltaOut.as<float>();
-    float* const alphaBuf  = s.ssmAlpha.as<float>();
-    float* const betaBuf   = s.ssmBeta.as<float>();
+    float*       alphaBuf  = s.ssmAlpha.as<float>();
+    float*       betaBuf   = s.ssmBeta.as<float>();
     float* const gateBuf   = s.ssmGate.as<float>();
     float* const projOut   = s.projOut.as<float>();
     float* const mmScratch = s.matmulScratch.as<float>();
@@ -1983,7 +1999,46 @@ void Qwen35MoeBackend::runLinearBlockBatched(
                       static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
 
     // --- projections (M = nSeq) --------------------------------------
-    {
+    // GDN-Inc 1: at nSeq==1 decode, fuse qkv+gate -> qkvz and beta+alpha -> ba
+    // into ONE fp8 GEMV each (vLLM in_proj_qkvz / in_proj_ba). The fused BF16
+    // weight is concatenated once per block and cached; matmulAsync quantises it
+    // to E4M3 with a SINGLE per-tensor scale, matching vLLM's fused-tensor
+    // granularity. The output is contiguous [qkv | gate] / [beta | alpha], so
+    // the split is pure pointer arithmetic at nSeq==1. Falls back to 4 matmuls.
+    if (_gdnProjFuse && nSeq == 1) {
+        auto buildFused = [&](compute::ComputeBuffer& dst,
+                              const core::gguf::GgufTensor& wa,
+                              const core::gguf::GgufTensor& wb) {
+            if (dst.bytes() == 0) {
+                dst = _ops.allocate(wa.nbytes + wb.nbytes);
+                char* const base =
+                    static_cast<char*>(static_cast<void*>(dst.as<float>()));
+                _ops.appendMemoryCopy(base,             wa.usmPtr, wa.nbytes);
+                _ops.appendMemoryCopy(base + wa.nbytes, wb.usmPtr, wb.nbytes);
+            }
+        };
+        auto grow = [&](compute::ComputeBuffer& b, std::size_t bytes) {
+            if (b.bytes() < bytes) { b = _ops.allocate(bytes); }
+        };
+        buildFused(_gdnQkvzW[blockIdx], qkvW,  gateW);
+        buildFused(_gdnBaW[blockIdx],   betaW, alphaW);
+        grow(_gdnQkvzOut, (convDim + valueDim) * nSeq * sizeof(float));
+        grow(_gdnBaOut,   (std::size_t{2} * hV) * nSeq * sizeof(float));
+        float* const qkvzOut = _gdnQkvzOut.as<float>();
+        float* const baOut   = _gdnBaOut.as<float>();
+        {
+            compute::UnorderedScope u{_ops};
+            _gmm.matmulAsync(qkvW.type, _gdnQkvzW[blockIdx].as<float>(),
+                             convDim + valueDim, d_model, normBuf, nSeq,
+                             qkvzOut, mmScratch);
+            _gmm.matmulAsync(betaW.type, _gdnBaW[blockIdx].as<float>(),
+                             2 * hV, d_model, normBuf, nSeq, baOut, mmScratch);
+        }
+        qkvMixed = qkvzOut;               // [0, convDim)
+        zBuf     = qkvzOut + convDim;     // [convDim, convDim+valueDim)
+        betaBuf  = baOut;                 // [0, hV)
+        alphaBuf = baOut + hV;            // [hV, 2*hV)
+    } else {
         compute::UnorderedScope u{_ops};
         _gmm.matmulAsync(qkvW.type,  qkvW.usmPtr,  convDim,  d_model, normBuf, nSeq, qkvMixed, mmScratch);
         _gmm.matmulAsync(gateW.type, gateW.usmPtr, valueDim, d_model, normBuf, nSeq, zBuf,     mmScratch);
@@ -1992,15 +2047,21 @@ void Qwen35MoeBackend::runLinearBlockBatched(
     }
 
     // beta = sigmoid(beta); gLog = ssm_a * softplus(alpha + ssm_dt).
-    _ops.sigmoidInPlaceAsync(betaBuf, nSeq * hV);
-    _ops.deltanetGateAsync(alphaBuf,
-                           static_cast<const float*>(ssmA.usmPtr),
-                           static_cast<const float*>(ssmDt.usmPtr),
-                           gateBuf, nSeq, hV);
+    // GDN-Inc 2: when the gate is folded into the recurrence kernel these two
+    // launches are skipped and beta/alpha stay RAW (consumed by the fused
+    // recurrence below). MIMIRMIND_GDN_GATE_FUSE=1.
+    if (!_gdnGateFuse) {
+        _ops.sigmoidInPlaceAsync(betaBuf, nSeq * hV);
+        _ops.deltanetGateAsync(alphaBuf,
+                               static_cast<const float*>(ssmA.usmPtr),
+                               static_cast<const float*>(ssmDt.usmPtr),
+                               gateBuf, nSeq, hV);
+    }
 
     // --- causal conv1d + silu (per-seq rolling state) ----------------
     // convInput[seq] = [convState[seq] (stateRows) | qkvMixed[seq] (1 row)].
     // Serving BlockBuffers must size ssmConvInput to nSeq*dConv*convDim.
+    _ops.profileSection("gdn.conv");
     const std::size_t convInBytes  = convStateElems * sizeof(float);
     const std::size_t qkvRowBytes  = convDim * sizeof(float);
     for (std::size_t seq = 0; seq < nSeq; ++seq) {
@@ -2023,26 +2084,41 @@ void Qwen35MoeBackend::runLinearBlockBatched(
         _ops.appendMemoryCopy(cvState, cvIn + /*T=*/1 * convDim, convInBytes);
     }
 
-    // --- split conv into q/k/v (+ GQA repeat H_k -> H_v) -------------
-    _ops.gatherHeadsFromChannelsAsync(qkvMixed, qBuf, nSeq, 0,          hK, hV, S, convDim);
-    _ops.gatherHeadsFromChannelsAsync(qkvMixed, kBuf, nSeq, keyDim,     hK, hV, S, convDim);
-    _ops.gatherHeadsFromChannelsAsync(qkvMixed, vBuf, nSeq, 2 * keyDim, hV, hV, S, convDim);
-
-    // --- L2-norm q,k over head_dim -----------------------------------
-    _ops.l2NormInPlaceAsync(qBuf, nSeq * hV, S, eps);
-    _ops.l2NormInPlaceAsync(kBuf, nSeq * hV, S, eps);
+    // --- split conv into q/k/v (+ GQA repeat H_k -> H_v) + q/k L2-norm ---
+    // GDN-Inc 2b: one fused launch (gather q/k/v + norm q/k) vs 3 gathers + 2 norms.
+    if (_gdnPrepFuse) {
+        _ops.fusedPostConvPrepAsync(qkvMixed, qBuf, kBuf, vBuf, nSeq, hK, hV, S,
+                                    convDim, keyDim, eps);
+    } else {
+        _ops.gatherHeadsFromChannelsAsync(qkvMixed, qBuf, nSeq, 0,          hK, hV, S, convDim);
+        _ops.gatherHeadsFromChannelsAsync(qkvMixed, kBuf, nSeq, keyDim,     hK, hV, S, convDim);
+        _ops.gatherHeadsFromChannelsAsync(qkvMixed, vBuf, nSeq, 2 * keyDim, hV, hV, S, convDim);
+        _ops.l2NormInPlaceAsync(qBuf, nSeq * hV, S, eps);
+        _ops.l2NormInPlaceAsync(kBuf, nSeq * hV, S, eps);
+    }
 
     // --- gated delta-rule recurrence (persistent per-seq state) ------
+    _ops.profileSection("gdn.recur");
     for (std::size_t seq = 0; seq < nSeq; ++seq) {
         if (ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
             _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
         }
     }
-    _ops.gatedDeltaNetRecurrentBatchedAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
-                                            stateBase, deltaOut, nSeq,
-                                            /*T=*/1, hV, S);
+    if (_gdnGateFuse) {
+        // GDN-Inc 2: gate folded in — pass RAW alpha/beta + per-head ssm_a/ssm_dt.
+        _ops.gatedDeltaNetRecurrentGateFusedBatchedAsync(
+            qBuf, kBuf, vBuf, alphaBuf, betaBuf,
+            static_cast<const float*>(ssmA.usmPtr),
+            static_cast<const float*>(ssmDt.usmPtr),
+            stateBase, deltaOut, nSeq, /*T=*/1, hV, S);
+    } else {
+        _ops.gatedDeltaNetRecurrentBatchedAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
+                                                stateBase, deltaOut, nSeq,
+                                                /*T=*/1, hV, S);
+    }
 
     // --- gated output norm: ssm_norm(out) * silu(z) ------------------
+    _ops.profileSection("gdn.tail");
     _ops.rmsNormAsync(deltaOut, nSeq * hV, S,
                       static_cast<const float*>(ssmNormW.usmPtr), eps, qBuf);
     _ops.siluMulAsync(zBuf, qBuf, nSeq * valueDim);

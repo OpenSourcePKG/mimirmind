@@ -174,6 +174,12 @@ public:
                                             std::size_t T, std::size_t H,
                                             std::size_t S) override;
 
+    void gatedDeltaNetRecurrentGateFusedBatchedAsync(
+            const float* q, const float* k, const float* v, const float* alpha,
+            const float* beta, const float* ssmA, const float* ssmDt,
+            float* state, float* out, std::size_t nSeq, std::size_t T,
+            std::size_t H, std::size_t S) override;
+
     void gatedDeltaNetVerifyBatchedAsync(const float* q, const float* k,
                                          const float* v, const float* gLog,
                                          const float* beta, const float* stateIn,
@@ -293,6 +299,12 @@ public:
                                       std::size_t srcHeads, std::size_t dstHeads,
                                       std::size_t S,
                                       std::size_t convTotalWidth) override;
+
+    void fusedPostConvPrepAsync(const float* qkvMixed, float* qOut, float* kOut,
+                                float* vOut, std::size_t T,
+                                std::size_t srcHeadsKV, std::size_t dstHeads,
+                                std::size_t S, std::size_t convTotalWidth,
+                                std::size_t keyDim, float eps) override;
 
     void xQuantI8Async(const float* x, std::int8_t* y, float* scale,
                        std::size_t M, std::size_t K) override;

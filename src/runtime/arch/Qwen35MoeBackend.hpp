@@ -4,6 +4,7 @@
 #pragma once
 
 #include "runtime/arch/ArchBackend.hpp"
+#include "compute/ComputeBuffer.hpp"  // GDN-Inc 1 fused-proj weight/scratch buffers
 
 #include <cstddef>
 #include <cstdint>
@@ -350,6 +351,26 @@ private:
     // The loader adds the variants only when this is set, so pickDense() falls
     // back to BF16 whenever they are absent.
     std::size_t _denseFp8MaxT{0};
+    // GDN-Inc 1 (2026-08-09): vLLM-style fused GDN input projections. Concats
+    // attn_qkv+attn_gate -> qkvz and ssm_beta+ssm_alpha -> ba into one BF16
+    // weight each (runtime-cached, per block), so each dispatches as ONE fp8
+    // GEMV (quantised with a single per-tensor scale, matching vLLM's
+    // in_proj_qkvz / in_proj_ba) instead of 2+2 matmuls. nSeq==1 decode only
+    // (pointer-split output). MIMIRMIND_GDN_PROJ_FUSE=1; off by default.
+    bool                                _gdnProjFuse{false};
+    std::vector<compute::ComputeBuffer> _gdnQkvzW;    // [convDim+valueDim, d_model] BF16
+    std::vector<compute::ComputeBuffer> _gdnBaW;      // [2*hV, d_model] BF16
+    compute::ComputeBuffer              _gdnQkvzOut;  // scratch [(convDim+valueDim)]
+    compute::ComputeBuffer              _gdnBaOut;    // scratch [2*hV]
+    // GDN-Inc 2 (2026-08-09): fold deltanet_gate + sigmoid(beta) into the v3
+    // recurrence kernel (vLLM fused_sigmoid_gating_delta_rule_update), removing
+    // two elementwise launches per linear layer. Bit-identical, no memory cost →
+    // DEFAULT ON; MIMIRMIND_GDN_GATE_FUSE=0 disables.
+    bool                                _gdnGateFuse{true};
+    // GDN-Inc 2b (2026-08-09): fuse the 3 head-gathers + 2 q/k L2-norms after
+    // conv into one launch (vLLM fused_post_conv_prep). Bit-identical, no memory
+    // cost → DEFAULT ON; MIMIRMIND_GDN_PREP_FUSE=0 disables.
+    bool                                _gdnPrepFuse{true};
     // M-Q3N.5: device-side MoE top-K (env MIMIRMIND_MOE_DEVICE_TOPK). When on
     // AND the fully-fused decode path applies, top-K runs on the device and
     // the host moeTopKRoute + host->USM copy are skipped (no per-layer host

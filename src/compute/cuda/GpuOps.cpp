@@ -237,6 +237,9 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _gatedDeltaNetArBatchedV2Kernel;
     core::cuda::CudaModule _gatedDeltaNetArBatchedV3Module;
     core::cuda::CudaKernel _gatedDeltaNetArBatchedV3Kernel;
+    // GDN-Inc 2: v3 with the decay gate + beta-sigmoid folded in (from the same
+    // module). Removes the deltanet_gate + sigmoid_inplace launches per layer.
+    core::cuda::CudaKernel _gatedDeltaNetArBatchedV3GateFusedKernel;
     // MV-a: batched GDN verify (T-loop over K+1, per-position state export).
     core::cuda::CudaModule _gatedDeltaNetVerifyBatchedModule;
     core::cuda::CudaKernel _gatedDeltaNetVerifyBatchedKernel;
@@ -259,6 +262,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _sigmoidInplaceKernel;
     core::cuda::CudaModule _gatherHeadsModule;
     core::cuda::CudaKernel _gatherHeadsKernel;
+    // GDN-Inc 2b: fused post-conv prep (q/k/v gather + q/k L2-norm) in one launch.
+    core::cuda::CudaKernel _fusedPostConvPrepKernel;
 
     // M-Cuda.MoeGroup — grouped-by-expert MoE prefill (token grouping build,
     // row gather, deterministic expert-output scatter).
@@ -442,6 +447,9 @@ struct GpuOps::Impl {
           _gatedDeltaNetArBatchedV3Module{loadCudaModule(ctx, "gated_deltanet_ar_batched_v3")},
           _gatedDeltaNetArBatchedV3Kernel{
               _gatedDeltaNetArBatchedV3Module.getFunction("gated_deltanet_ar_batched_v3")},
+          _gatedDeltaNetArBatchedV3GateFusedKernel{
+              _gatedDeltaNetArBatchedV3Module.getFunction(
+                  "gated_deltanet_ar_batched_v3_gatefused")},
           _gatedDeltaNetVerifyBatchedModule{loadCudaModule(ctx, "gated_deltanet_verify_batched")},
           _gatedDeltaNetVerifyBatchedKernel{
               _gatedDeltaNetVerifyBatchedModule.getFunction("gated_deltanet_verify_batched")},
@@ -470,6 +478,8 @@ struct GpuOps::Impl {
           _gatherHeadsModule       {loadCudaModule(ctx, "gather_heads_from_channels")},
           _gatherHeadsKernel       {
               _gatherHeadsModule.getFunction("gather_heads_from_channels")},
+          _fusedPostConvPrepKernel {
+              _gatherHeadsModule.getFunction("fused_post_conv_prep")},
           _moeGroupBuildModule     {loadCudaModule(ctx, "moe_group_build")},
           _moeGroupBuildKernel     {
               _moeGroupBuildModule.getFunction("moe_group_build")},
@@ -1236,6 +1246,32 @@ void GpuOps::l2NormInPlaceAsync(float* x, std::size_t rows, std::size_t dim,
              kL2NormLocal, 1, 1);
 }
 
+void GpuOps::fusedPostConvPrepAsync(const float* qkvMixed, float* qOut,
+                                    float* kOut, float* vOut, std::size_t T,
+                                    std::size_t srcHeadsKV, std::size_t dstHeads,
+                                    std::size_t S, std::size_t convTotalWidth,
+                                    std::size_t keyDim, float eps) {
+    const std::size_t rows = T * dstHeads;
+    if (rows == 0 || S == 0) {
+        return;
+    }
+    auto& k = _pimpl->_fusedPostConvPrepKernel;
+    k.setPtr  (0, qkvMixed);
+    k.setPtr  (1, qOut);
+    k.setPtr  (2, kOut);
+    k.setPtr  (3, vOut);
+    k.setValue(4,  toInt32(T,              "fpcp T"));
+    k.setValue(5,  toInt32(srcHeadsKV,     "fpcp srcHeadsKV"));
+    k.setValue(6,  toInt32(dstHeads,       "fpcp dstHeads"));
+    k.setValue(7,  toInt32(S,              "fpcp S"));
+    k.setValue(8,  toInt32(convTotalWidth, "fpcp convW"));
+    k.setValue(9,  toInt32(keyDim,         "fpcp keyDim"));
+    k.setValue(10, eps);
+    k.launch(_ctx.stream(),
+             groupsForN(rows, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
 void GpuOps::causalConv1dSiluAsync(const float* convInput, const float* kernel,
                                    float* out, std::size_t T,
                                    std::size_t channels, std::size_t kernelSize) {
@@ -1376,6 +1412,57 @@ void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
              static_cast<std::uint32_t>(nSeq), 1,
              static_cast<std::uint32_t>(S), 1, 1,
              useV3 ? gdnSmemBytes : 0);
+}
+
+void GpuOps::gatedDeltaNetRecurrentGateFusedBatchedAsync(
+        const float* q, const float* k_, const float* v, const float* alpha,
+        const float* beta, const float* ssmA, const float* ssmDt, float* state,
+        float* out, std::size_t nSeq, std::size_t T, std::size_t H,
+        std::size_t S) {
+    if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
+        return;
+    }
+    // GDN-Inc 2: v3 with the decay gate (deltanet_gate) + beta sigmoid folded in
+    // (vLLM fused_sigmoid_gating_delta_rule_update). Always smem-staged (same
+    // >48 KiB opt-in as v3); requires the device to accept the S*S*4 request
+    // (true wherever v3 runs). Bit-identical to v3 + the separate gate passes.
+    const std::size_t gdnSmemBytes =
+        static_cast<std::size_t>(S) * S * sizeof(float);
+    static const bool ready = [&] {
+        try {
+            _pimpl->_gatedDeltaNetArBatchedV3GateFusedKernel
+                .setMaxDynamicSharedBytes(gdnSmemBytes);
+            return true;
+        } catch (const core::cuda::CudaDriverError& err) {
+            MM_LOG_WARN("cudagpuops",
+                        "GDN gate-fused smem opt-in ({} bytes) rejected ({})",
+                        gdnSmemBytes, err.what());
+            return false;
+        }
+    }();
+    if (!ready) {
+        throw std::runtime_error(
+            "gatedDeltaNetRecurrentGateFusedBatchedAsync: device rejected the "
+            "dynamic-smem opt-in required by the fused GDN kernel");
+    }
+    auto& k = _pimpl->_gatedDeltaNetArBatchedV3GateFusedKernel;
+    k.setPtr  (0, q);
+    k.setPtr  (1, k_);
+    k.setPtr  (2, v);
+    k.setPtr  (3, alpha);
+    k.setPtr  (4, beta);
+    k.setPtr  (5, ssmA);
+    k.setPtr  (6, ssmDt);
+    k.setPtr  (7, state);
+    k.setPtr  (8, out);
+    k.setValue(9,  toInt32(T, "gdnGF T"));
+    k.setValue(10, toInt32(H, "gdnGF H"));
+    k.setValue(11, toInt32(S, "gdnGF S"));
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(H),
+             static_cast<std::uint32_t>(nSeq), 1,
+             static_cast<std::uint32_t>(S), 1, 1,
+             gdnSmemBytes);
 }
 
 void GpuOps::gatedDeltaNetVerifyBatchedAsync(
