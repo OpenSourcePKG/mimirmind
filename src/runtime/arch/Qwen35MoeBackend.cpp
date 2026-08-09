@@ -31,6 +31,13 @@ namespace mimirmind::runtime::arch {
 
 namespace {
 
+// Track B: token threshold at/above which a shared-expert projection is routed
+// through the FP4-TC grouped GEMM (nExp=1) instead of the dense blocked kernel.
+// Below it (decode, small chunks) the blocked kGemmMaxM=16 kernel wins on
+// launch overhead; the TC path only pays off once the M/16 weight re-reads it
+// avoids dominate. Matches the routed-MoE "prefill takes TC" M>=64 crossover.
+constexpr std::size_t kShexpTcMinM = 64;
+
 // Block geometry (elements, bytes) for an expert weight type. NVFP4_BLK is a
 // runtime-only blocked format (32-element super-blocks of 20 bytes) not in the
 // QuantType registry, so handle it explicitly; everything else goes through the
@@ -127,6 +134,12 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
     // GEMM (needs TC sidecar banks). Off by default (W4A4 numerics gate).
     if (const char* t = std::getenv("MIMIRMIND_GROUPED_MOE_DECODE_TC")) {
         _moeGroupedDecodeTc = (t[0] == '1' && t[1] == '\0');
+    }
+    // Track B: shared-expert prefill via the FP4-TC grouped GEMM (nExp=1),
+    // default-on when the loader built the shexp TC sidecars. MIMIRMIND_SHEXP_TC=0
+    // forces the dense blocked kernel back (A/B and rollback).
+    if (const char* st = std::getenv("MIMIRMIND_SHEXP_TC")) {
+        _shexpTc = !(st[0] == '0' && st[1] == '\0');
     }
     if (const char* p = std::getenv("MIMIRMIND_PAGED_V1")) {
         _forcePagedV1 = (p[0] == '1' && p[1] == '\0');
@@ -843,6 +856,55 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), T * d_model);
 }
 
+void Qwen35MoeBackend::sharedExpertTcGemm(std::size_t N, std::size_t K,
+                                          const float* X, std::size_t M,
+                                          const void* wNib, const void* wSfb,
+                                          const float* wGlob, float* Y,
+                                          BlockBuffers& s) {
+    namespace mo = core::modelopt;
+    // One group padded to a 128-row tile so its SFA sub-tensor is tile-aligned.
+    const std::size_t padM = ((M + 127) / 128) * 128;
+    auto grow = [&](compute::ComputeBuffer& buf, std::size_t bytes) {
+        if (buf.bytes() < bytes) buf = _ops.allocate(bytes);
+    };
+    grow(s.shexpTcOffsets,      4 * sizeof(std::int32_t));
+    grow(s.shexpTcABank,        padM * (K / 2));
+    grow(s.shexpTcSfaBank,      mo::swizzledBlockScaleBytes(padM, K / 16));
+    grow(s.shexpTcOutPad,       padM * N * sizeof(float));
+    grow(s.shexpTcBanksScratch, _ops.moeGroupedGemmNvfp4TcBanksScratchBytes(1));
+
+    auto* const offsets = s.shexpTcOffsets.as<std::int32_t>();
+    auto* const aBank   = s.shexpTcABank.as<unsigned char>();
+    auto* const sfaBank = s.shexpTcSfaBank.as<unsigned char>();
+    float* const outPad = s.shexpTcOutPad.as<float>();
+
+    // offsets = {expOffset[0..1]=0,M ; padOffset[0..1]=0,padM}. Pure function of
+    // M, which is constant across a forward's blocks -> upload only when M
+    // changes (once per forward), keeping the sync H2D off the per-block path.
+    if (s.shexpTcOffM != static_cast<std::int32_t>(M)) {
+        const std::int32_t off[4] = {0, static_cast<std::int32_t>(M),
+                                     0, static_cast<std::int32_t>(padM)};
+        _ops.uploadHostBytes(offsets, off, sizeof(off));
+        s.shexpTcOffM = static_cast<std::int32_t>(M);
+    }
+    const std::int32_t* const expOffset = offsets;
+    const std::int32_t* const padOffset = offsets + 2;
+
+    // Quantise the M real rows into the swizzled aBank/sfaBank. The pad tail
+    // [M,padM) keeps its zeroed SFA (scale 0 -> act 0), so those GEMM rows are 0
+    // and discarded; gscale=1 since the weight global folds in via globalsBank.
+    _ops.moeZeroBytesAsync(sfaBank, mo::swizzledBlockScaleBytes(padM, K / 16));
+    _ops.moeActQuantNvfp4Async(X, aBank, sfaBank, 1.0F, M, K);
+
+    _ops.moeGroupedGemmNvfp4TcBanksAsync(
+        1, N, K, expOffset, padOffset, aBank, sfaBank, wNib, wSfb, wGlob,
+        outPad, s.shexpTcBanksScratch.get(), s.shexpTcBanksScratch.bytes());
+
+    // The single group's real rows are the first M rows of outPad ([padM, N],
+    // row-major) -> the contiguous leading [M*N] block. Copy them to Y[M,N].
+    _ops.appendMemoryCopy(Y, outPad, M * N * sizeof(float));
+}
+
 void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
                                  const float*  moeInput,
                                  std::size_t   T,
@@ -1122,6 +1184,29 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
             _ops.xQuantI8Async(gateOutBuf, xq, xs, 1, n_ff_shexp);
             _gmm.matmulDp4aAsync(downShexp.type, xq, xs, downShexp.usmPtr,
                                  d_model, n_ff_shexp, 1, expertOutBuf);
+        } else if (_shexpTc && T >= kShexpTcMinM &&
+                   _ops.moeGroupedGemmNvfp4TcAvailable() &&
+                   gateShexp.tcNibblePtr != nullptr &&
+                   upShexp->tcNibblePtr  != nullptr &&
+                   downShexp.tcNibblePtr != nullptr) {
+            // Track B: prefill shared expert via the FP4-TC grouped GEMM
+            // (nExp=1) -> no kGemmMaxM=16 weight re-read. gate/up: N=n_ff_shexp,
+            // K=d_model; down: N=d_model, K=n_ff_shexp. Sequential (shared
+            // shexpTc* scratch); the T==1 dp4a/fused shortcuts above are
+            // decode-only and never reached at this M.
+            sharedExpertTcGemm(n_ff_shexp, d_model, moeInput, T,
+                               gateShexp.tcNibblePtr, gateShexp.tcSfbPtr,
+                               static_cast<const float*>(gateShexp.tcGlobalsPtr),
+                               gateOutBuf, s);
+            sharedExpertTcGemm(n_ff_shexp, d_model, moeInput, T,
+                               upShexp->tcNibblePtr, upShexp->tcSfbPtr,
+                               static_cast<const float*>(upShexp->tcGlobalsPtr),
+                               upOutBuf, s);
+            _ops.siluMulAsync(gateOutBuf, upOutBuf, T * n_ff_shexp);
+            sharedExpertTcGemm(d_model, n_ff_shexp, gateOutBuf, T,
+                               downShexp.tcNibblePtr, downShexp.tcSfbPtr,
+                               static_cast<const float*>(downShexp.tcGlobalsPtr),
+                               expertOutBuf, s);
         } else {
             // gate/up -> silu(gate)*up into gateOutBuf. At T=1 decode a
             // single fused Q8_0 kernel does gate+up+silu (launch reduction);
@@ -1362,16 +1447,39 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
                 "unexpected shape");
         }
 
-        {
-            compute::UnorderedScope u{_ops};
-            _gmm.matmulAsync(gateShexp.type, gateShexp.usmPtr, n_ff_shexp, d_model,
-                             moeInput, nSeq, gateOutBuf, matmulScratch);
-            _gmm.matmulAsync(upShexp->type, upShexp->usmPtr, n_ff_shexp, d_model,
-                             moeInput, nSeq, upOutBuf, matmulScratch);
+        if (_shexpTc && nSeq >= kShexpTcMinM &&
+            _ops.moeGroupedGemmNvfp4TcAvailable() &&
+            gateShexp.tcNibblePtr != nullptr &&
+            upShexp->tcNibblePtr  != nullptr &&
+            downShexp.tcNibblePtr != nullptr) {
+            // Track B: prefill shared expert via the FP4-TC grouped GEMM
+            // (nExp=1) -> no kGemmMaxM=16 weight re-read. Sequential across the
+            // three projections (they share the shexpTc* scratch).
+            sharedExpertTcGemm(n_ff_shexp, d_model, moeInput, nSeq,
+                               gateShexp.tcNibblePtr, gateShexp.tcSfbPtr,
+                               static_cast<const float*>(gateShexp.tcGlobalsPtr),
+                               gateOutBuf, s);
+            sharedExpertTcGemm(n_ff_shexp, d_model, moeInput, nSeq,
+                               upShexp->tcNibblePtr, upShexp->tcSfbPtr,
+                               static_cast<const float*>(upShexp->tcGlobalsPtr),
+                               upOutBuf, s);
+            _ops.siluMulAsync(gateOutBuf, upOutBuf, nSeq * n_ff_shexp);
+            sharedExpertTcGemm(d_model, n_ff_shexp, gateOutBuf, nSeq,
+                               downShexp.tcNibblePtr, downShexp.tcSfbPtr,
+                               static_cast<const float*>(downShexp.tcGlobalsPtr),
+                               expertOutBuf, s);
+        } else {
+            {
+                compute::UnorderedScope u{_ops};
+                _gmm.matmulAsync(gateShexp.type, gateShexp.usmPtr, n_ff_shexp, d_model,
+                                 moeInput, nSeq, gateOutBuf, matmulScratch);
+                _gmm.matmulAsync(upShexp->type, upShexp->usmPtr, n_ff_shexp, d_model,
+                                 moeInput, nSeq, upOutBuf, matmulScratch);
+            }
+            _ops.siluMulAsync(gateOutBuf, upOutBuf, nSeq * n_ff_shexp);
+            _gmm.matmulAsync(downShexp.type, downShexp.usmPtr, d_model, n_ff_shexp,
+                             gateOutBuf, nSeq, expertOutBuf, matmulScratch);
         }
-        _ops.siluMulAsync(gateOutBuf, upOutBuf, nSeq * n_ff_shexp);
-        _gmm.matmulAsync(downShexp.type, downShexp.usmPtr, d_model, n_ff_shexp,
-                         gateOutBuf, nSeq, expertOutBuf, matmulScratch);
 
         // Scalar gate per token: [nSeq, 1] -> sigmoid -> broadcast multiply.
         float* const gateScalar = s.scoreScratch.as<float>();
@@ -1740,16 +1848,39 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
                 "unexpected shape");
         }
         float* const expertOutBuf = s.expertOutBuf.as<float>();
-        {
-            compute::UnorderedScope u{_ops};
-            _gmm.matmulAsync(gateShexp.type, gateShexp.usmPtr, n_ff_shexp, d_model,
-                             moeInput, nSeq, gateOutBuf, matmulScratch);
-            _gmm.matmulAsync(upShexp->type, upShexp->usmPtr, n_ff_shexp, d_model,
-                             moeInput, nSeq, upOutBuf, matmulScratch);
+        if (_shexpTc && nSeq >= kShexpTcMinM &&
+            _ops.moeGroupedGemmNvfp4TcAvailable() &&
+            gateShexp.tcNibblePtr != nullptr &&
+            upShexp->tcNibblePtr  != nullptr &&
+            downShexp.tcNibblePtr != nullptr) {
+            // Track B: prefill shared expert via the FP4-TC grouped GEMM
+            // (nExp=1) -> no kGemmMaxM=16 weight re-read. Sequential across the
+            // three projections (they share the shexpTc* scratch).
+            sharedExpertTcGemm(n_ff_shexp, d_model, moeInput, nSeq,
+                               gateShexp.tcNibblePtr, gateShexp.tcSfbPtr,
+                               static_cast<const float*>(gateShexp.tcGlobalsPtr),
+                               gateOutBuf, s);
+            sharedExpertTcGemm(n_ff_shexp, d_model, moeInput, nSeq,
+                               upShexp->tcNibblePtr, upShexp->tcSfbPtr,
+                               static_cast<const float*>(upShexp->tcGlobalsPtr),
+                               upOutBuf, s);
+            _ops.siluMulAsync(gateOutBuf, upOutBuf, nSeq * n_ff_shexp);
+            sharedExpertTcGemm(d_model, n_ff_shexp, gateOutBuf, nSeq,
+                               downShexp.tcNibblePtr, downShexp.tcSfbPtr,
+                               static_cast<const float*>(downShexp.tcGlobalsPtr),
+                               expertOutBuf, s);
+        } else {
+            {
+                compute::UnorderedScope u{_ops};
+                _gmm.matmulAsync(gateShexp.type, gateShexp.usmPtr, n_ff_shexp, d_model,
+                                 moeInput, nSeq, gateOutBuf, matmulScratch);
+                _gmm.matmulAsync(upShexp->type, upShexp->usmPtr, n_ff_shexp, d_model,
+                                 moeInput, nSeq, upOutBuf, matmulScratch);
+            }
+            _ops.siluMulAsync(gateOutBuf, upOutBuf, nSeq * n_ff_shexp);
+            _gmm.matmulAsync(downShexp.type, downShexp.usmPtr, d_model, n_ff_shexp,
+                             gateOutBuf, nSeq, expertOutBuf, matmulScratch);
         }
-        _ops.siluMulAsync(gateOutBuf, upOutBuf, nSeq * n_ff_shexp);
-        _gmm.matmulAsync(downShexp.type, downShexp.usmPtr, d_model, n_ff_shexp,
-                         gateOutBuf, nSeq, expertOutBuf, matmulScratch);
 
         float* const gateScalar = s.scoreScratch.as<float>();
         _gmm.matmulAsync(routerSh.type, routerSh.usmPtr, 1, d_model,

@@ -680,7 +680,24 @@ void Nvfp4Loader::load(InferenceEngine& e,
                     || n.ends_with(".ffn_up_shexp.weight")
                     || n.ends_with(".ffn_down_shexp.weight");
             };
-            std::size_t nRepack = 0;
+            // Track B (stage R prefill fix): in addition to the blocked-NVFP4
+            // bank (kept for decode), build FP4-tensor-core sidecars (plain
+            // E2M1 nibbles + swizzled UE4M3 SFB + F32 global) for each shared
+            // expert so the prefill path can run it through the CUTLASS grouped
+            // GEMM as a single group (nExp=1). The dense blocked kernel's
+            // kGemmMaxM=16 loop re-streams the whole weight ~M/16 times at large
+            // M — the measured 48 s@7.6k prefill bottleneck. A shared expert is
+            // a single matrix, so its sidecar is the nExp=1, eIdx=0 degenerate
+            // case of the routed tcAdd path above. Additive in every TC mode;
+            // skipped only when CUTLASS is absent or GROUPED_MOE=0 forces
+            // blocked-only. The generic NvFp4WeightsMap bridge exposes these as
+            // tcNibblePtr/tcSfbPtr/tcGlobalsPtr once tcSfbBank is set.
+            const bool tcAvail = e._ops->moeGroupedGemmNvfp4TcAvailable();
+            const char* gEnv = std::getenv("MIMIRMIND_GROUPED_MOE");
+            const std::string_view gv =
+                gEnv ? std::string_view(gEnv) : std::string_view();
+            const bool shexpTcAdd = tcAvail && (gv != "0");
+            std::size_t nRepack = 0, tcSidecars = 0;
             std::uint64_t bytesBefore = 0, bytesAfter = 0;
             for (const auto& step : steps) {
                 if (!isFullAttn(step.ggufName) || step.sources.size() != 1) continue;
@@ -712,11 +729,34 @@ void Nvfp4Loader::load(InferenceEngine& e,
                 it->buffer     = std::move(nb); // frees the BF16 buffer (RAII)
                 it->isNvfp4Blk = true;
                 ++nRepack;
+
+                // Additive FP4-TC sidecar (single matrix -> nExp=1, eIdx=0).
+                if (shexpTcAdd) {
+                    const std::size_t nibBytes =
+                        static_cast<std::size_t>(it->elems) / 2;
+                    const std::size_t sfbBytes =
+                        core::modelopt::moeSwizzledScaleBankBytes(
+                            1, src.rows, src.in / 16);
+                    compute::ComputeBuffer tcNib  = devOps.allocate(nibBytes);
+                    compute::ComputeBuffer tcSfb  = devOps.allocate(sfbBytes);
+                    compute::ComputeBuffer tcGlob = devOps.allocate(sizeof(float));
+                    devOps.copyBytes(tcNib.get(), pk->devPtr, nibBytes);
+                    devOps.swizzleWeightSf(tcSfb.get(), bs->devPtr,
+                                           src.rows, src.in);
+                    e._ops->uploadHostBytes(tcGlob.get(), &global, sizeof(float));
+                    cudaCtx.stream().synchronize();
+                    bytesAfter        += nibBytes + sfbBytes;
+                    it->tcNibbleBank   = std::move(tcNib);
+                    it->tcSfbBank      = std::move(tcSfb);
+                    it->tcGlobalsBank  = std::move(tcGlob);
+                    ++tcSidecars;
+                }
             }
             MM_LOG_INFO("engine",
                         "loadModelNvfp4: kept {} dense NVFP4 (shared-expert) "
-                        "projections native blocked-NVFP4 ({} MiB -> {} MiB)",
-                        nRepack, bytesBefore >> 20, bytesAfter >> 20);
+                        "projections native blocked-NVFP4 (+{} FP4-TC sidecars) "
+                        "({} MiB -> {} MiB)",
+                        nRepack, tcSidecars, bytesBefore >> 20, bytesAfter >> 20);
         }
     }
 

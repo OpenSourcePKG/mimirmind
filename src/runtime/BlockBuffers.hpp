@@ -7,6 +7,7 @@
 #include "model/LlmConfig.hpp"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace mimirmind::compute {
 class ComputeOps;
@@ -121,6 +122,22 @@ struct BlockBuffers {
     ComputeBuffer moeTcABank2;       // [maxPad, ffPerExpert/2] u8
     ComputeBuffer moeTcSfaBank2;     // swizzled SFA over ffPerExpert
     ComputeBuffer moeTcBanksScratch; // CUTLASS per-group arrays + workspace
+
+    // Track B: shared-expert FP4-TC dense GEMM scratch (single group, nExp=1).
+    // At prefill (M>=64) each shexp projection runs through the CUTLASS grouped
+    // GEMM as one padded group instead of the dense blocked kernel, whose
+    // kGemmMaxM=16 loop re-streams the whole shexp weight ~M/16 times (the
+    // measured stage-R prefill bottleneck). Lazily grown to padM=round_up(M,128)
+    // and Kmax/Nmax over the gate/up (K=d_model,N=ffShexp) and down
+    // (K=ffShexp,N=d_model) shapes. Zero-sized on the decode/blocked path.
+    ComputeBuffer shexpTcOffsets;    // [4] int32 = {0, M, 0, padM}
+    ComputeBuffer shexpTcABank;      // [padM, Kmax/2]  u8 (E2M1 nibbles)
+    ComputeBuffer shexpTcSfaBank;    // swizzled SFA over Kmax
+    ComputeBuffer shexpTcOutPad;     // [padM, Nmax]    f32
+    ComputeBuffer shexpTcBanksScratch;
+    std::int32_t  shexpTcOffM{-1};   // cached M in shexpTcOffsets (offsets are a
+                                     // pure fn of M, constant across a forward's
+                                     // blocks -> upload once per forward)
 
     // Q8_0 dp4a decode path (M-Q3N.4e): int8-quantized activation row +
     // per-row scale for xQuantI8Async -> matmulDp4aAsync.

@@ -315,6 +315,24 @@ private:
                           BlockBuffers&  s,
                           bool           preferBlocked = false);
 
+    /// Track B — one shared-expert projection through the CUTLASS block-scaled
+    /// NVFP4 tensor-core GEMM as a single group (nExp=1), instead of the dense
+    /// blocked kernel whose kGemmMaxM=16 loop re-streams the weight ~M/16 times.
+    /// Computes Y[M,N] = dequant(wNib,wSfb,wGlob) . X[M,K] for the shared expert
+    /// (all M tokens in one group, no routing). Requires the block's FP4-TC
+    /// sidecars (built by the loader); the caller gates on M>=64 and non-null
+    /// sidecars and otherwise keeps the blocked matmulAsync path. `s` supplies
+    /// the per-forward scratch (shexpTc*). X and Y are F32 device buffers.
+    void sharedExpertTcGemm(std::size_t   N,
+                            std::size_t   K,
+                            const float*  X,
+                            std::size_t   M,
+                            const void*   wNib,
+                            const void*   wSfb,
+                            const float*  wGlob,
+                            float*        Y,
+                            BlockBuffers& s);
+
     /// M-Cuda.Batch D2a — batched full-attention layer (paged KV). Mirrors
     /// runFullAttentionBlock with the T dimension replaced by nSeq and the
     /// KV write/read going through the PagedKvPool + paged_attention_v1.
@@ -423,6 +441,12 @@ private:
     // 2026-08-04) — the isolated win inverts under real serving, so blocked
     // stays the serving default. Enable with MIMIRMIND_GROUPED_MOE_DECODE_TC=1.
     bool _moeGroupedDecodeTc{false};
+    // Track B: run the dense shared-expert projections through the FP4-TC
+    // grouped GEMM (nExp=1) at prefill (M>=kShexpTcMinM) instead of the blocked
+    // kernel whose kGemmMaxM=16 loop re-streams the weight ~M/16 times (the
+    // measured stage-R prefill bottleneck). Default-on; only fires when the
+    // loader built the shexp TC sidecars. MIMIRMIND_SHEXP_TC=0 rolls back.
+    bool _shexpTc{true};
     // Force the single-pass paged decode (V1) instead of the split-K V2 for
     // full-attention layers. A/B + rollback lever (MIMIRMIND_PAGED_V1=1).
     bool _forcePagedV1{false};
