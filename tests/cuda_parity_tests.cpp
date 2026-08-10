@@ -23,6 +23,8 @@
 #include "core/gpu/cuda/CudaModule.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "compute/quant/Q8_0.hpp"
+#include "runtime/encoder/EncoderModel.hpp"
+#include "runtime/encoder/EncoderRunner.hpp"
 
 #include "core/modelopt/BlockScaleSwizzle.hpp" // swizzledBlockScaleBytes / swizzleBlockScale
 #ifdef MIMIRMIND_HAVE_CUTLASS_MOE
@@ -1214,6 +1216,45 @@ TEST(cuda_encoder_layer0_parity) {
 
     cmp("layer0_out", fromDevice(ops, l0.get(), T * H),
         O.at("layer0_out").f, 5e-3f);
+}
+
+// Full 24-layer forward through the production EncoderModel + EncoderRunner
+// against the real bge-reranker-v2-m3 safetensors on disk: loads the dense
+// F32 checkpoint natively (no GGUF), feeds the oracle's tokenized input_ids,
+// and checks the classifier logit against the HF reference score. Validates
+// the loader + the whole runner end-to-end (tokenizer excluded — ids come
+// from the fixture). Self-skips if the fixture or the model dir is absent.
+TEST(cuda_encoder_full_forward_parity) {
+    const char* envp = std::getenv("MIMIRMIND_ENCODER_ORACLE");
+    const std::string fx = envp ? envp : "scratchpad/encoder_oracle.bin";
+    OracleMap O;
+    if (!readOracle(fx, O)) {
+        std::printf("[SKIP] encoder oracle fixture not found at %s\n", fx.c_str());
+        return;
+    }
+    const char* mdl = std::getenv("MIMIRMIND_BGE_DIR");
+    const std::string dir = mdl ? mdl : "models/bge-reranker-v2-m3";
+    if (!std::filesystem::exists(std::filesystem::path(dir) / "config.json")) {
+        std::printf("[SKIP] bge model dir not found at %s\n", dir.c_str());
+        return;
+    }
+
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+
+    ::mimirmind::runtime::encoder::EncoderModel model;
+    model.load(dir, ops);
+    ::mimirmind::runtime::encoder::EncoderRunner runner{model, ops, gmm};
+
+    const std::vector<std::int32_t>& ids = O.at("input_ids").i;
+    const std::vector<float> logits = runner.forwardLogits(ids);
+    const float ref = O.at("final_score").f.at(0);
+
+    std::printf("    [full_forward] score=%.6f ref=%.6f (T=%zu layers=%zu labels=%zu)\n",
+                logits.at(0), ref, ids.size(), model.config().numLayers,
+                model.config().numLabels);
+    EXPECT_NEAR(logits.at(0), ref, 5e-2f);
 }
 
 TEST(cuda_matmul_q8_0_mmq_largeM_dp4a) {

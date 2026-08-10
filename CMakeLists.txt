@@ -384,6 +384,8 @@ add_library(mimirmind_core_common STATIC
     src/runtime/nvfp4/NvFp4WeightsMap.cpp
     src/runtime/nvfp4/Qwen35MoeConfig.cpp
     src/runtime/nvfp4/ModelFormatResolver.cpp
+    src/runtime/encoder/EncoderModel.cpp
+    src/runtime/encoder/EncoderRunner.cpp
 )
 
 target_include_directories(mimirmind_core_common PUBLIC src)
