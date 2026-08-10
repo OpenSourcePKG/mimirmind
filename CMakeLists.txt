@@ -1011,6 +1011,7 @@ add_executable(mimirmind
     src/model/Tokenizer.cpp
     src/runtime/BlockBuffers.cpp
     src/runtime/InferenceEngine.cpp
+    src/runtime/ComputeStack.cpp
     src/runtime/engine/Nvfp4Loader.cpp
     src/runtime/engine/MtpDecoder.cpp
     src/runtime/engine/ServingSession.cpp
@@ -1039,6 +1040,7 @@ add_executable(mimirmind
     src/server/ApiHelpers.cpp
     src/server/ApiServer.cpp
     src/server/ChatCompletionHandler.cpp
+    src/server/RerankHandler.cpp
     src/server/ChatRequestParser.cpp
     src/server/PromptTrimmer.cpp
     src/server/RequestDispatcher.cpp

@@ -20,7 +20,9 @@
 #include "core/security/ApiKeyStore.hpp"
 #include "core/security/SelfSignedCert.hpp"
 #include "model/Tokenizer.hpp"
+#include "runtime/ComputeStack.hpp"
 #include "runtime/InferenceEngine.hpp"
+#include "runtime/encoder/RerankEngine.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
 #include "runtime/nvfp4/ModelFormatResolver.hpp"
 #include "runtime/perf/PerfRegressionDetector.hpp"
@@ -409,6 +411,13 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 
     std::vector<std::unique_ptr<::mimirmind::runtime::InferenceEngine>> ownedEngines;
     std::vector<::mimirmind::server::LoadedEngine> loadedEngines;
+    // Rerank (cross-encoder) models: each owns its own compute stack. Declared
+    // BEFORE the rerankers so the stacks (ctx + ops) outlive the RerankEngines
+    // whose USM buffers free through those ops at teardown.
+    std::vector<::mimirmind::runtime::ComputeStack> ownedRerankStacks;
+    std::vector<std::unique_ptr<::mimirmind::runtime::encoder::RerankEngine>>
+        ownedRerankers;
+    std::vector<::mimirmind::server::LoadedReranker> loadedRerankers;
 #ifdef MIMIRMIND_HAVE_L0
     // In attached mode: one MuninClient per loaded model, kept alive
     // for the whole worker lifetime so Munin's implicit-detach logic
@@ -442,6 +451,34 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                       << "resolved: " << x.what() << "\n";
             return 2;
         }
+        // Rerank models take a separate path: a dense F32 cross-encoder
+        // (EncoderModel + XLM-R tokenizer) behind /v1/rerank, with its own
+        // isolated compute stack — not an autoregressive InferenceEngine.
+        if (m.task == ::mimirmind::core::config::ModelTask::Rerank) {
+            try {
+                ownedRerankStacks.push_back(
+                    ::mimirmind::runtime::makeComputeStack(cfg, engineKind));
+                auto& stk = ownedRerankStacks.back();
+                auto re = std::make_unique<
+                    ::mimirmind::runtime::encoder::RerankEngine>(
+                    m.path, *stk.ops, *stk.matmul);
+                ::mimirmind::server::LoadedReranker lr{};
+                lr.id     = m.id;
+                lr.title  = m.title;
+                lr.engine = re.get();
+                loadedRerankers.push_back(std::move(lr));
+                ownedRerankers.push_back(std::move(re));
+                MM_LOG_INFO("main",
+                            "serve: loaded rerank model '{}' (id='{}')",
+                            m.path, m.id);
+            } catch (const std::exception& x) {
+                std::cerr << "serve: rerank model '" << m.id
+                          << "' load failed: " << x.what() << "\n";
+                return 2;
+            }
+            continue;
+        }
+
         auto e = std::make_unique<::mimirmind::runtime::InferenceEngine>(
             cfg, engineKind);
 
@@ -2207,7 +2244,8 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     }
 
     ::mimirmind::server::ApiServer server{std::move(loadedEngines), scfg,
-                                          drafter.get()};
+                                          drafter.get(),
+                                          std::move(loadedRerankers)};
 
     g_runningServer.store(&server, std::memory_order_release);
     std::signal(SIGINT,  signalStop);

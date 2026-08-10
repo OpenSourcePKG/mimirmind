@@ -26,6 +26,7 @@
 #include "runtime/encoder/EncoderModel.hpp"
 #include "runtime/encoder/EncoderRunner.hpp"
 #include "model/XlmRobertaTokenizer.hpp"
+#include "runtime/encoder/RerankEngine.hpp"
 
 #include "core/modelopt/BlockScaleSwizzle.hpp" // swizzledBlockScaleBytes / swizzleBlockScale
 #ifdef MIMIRMIND_HAVE_CUTLASS_MOE
@@ -1308,6 +1309,38 @@ TEST(cuda_xlmr_tokenizer_parity) {
         }
     }
     EXPECT_EQ(mism, std::size_t{0});
+}
+
+// End-to-end RerankEngine smoke: real bge-reranker-v2-m3 weights + tokenizer,
+// rank a relevant vs an irrelevant document against a query. Validates the
+// full serving wrapper (tokenize pair -> forward -> score -> sort). No fixture
+// needed for the assertion; skips if the model dir is absent.
+TEST(cuda_rerank_engine_smoke) {
+    const char* mdl = std::getenv("MIMIRMIND_BGE_DIR");
+    const std::string dir = mdl ? mdl : "models/bge-reranker-v2-m3";
+    if (!std::filesystem::exists(std::filesystem::path(dir) / "config.json")) {
+        std::printf("[SKIP] bge model dir not found at %s\n", dir.c_str());
+        return;
+    }
+
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+    ::mimirmind::runtime::encoder::RerankEngine re{dir, ops, gmm};
+
+    const std::string query = "Welche Anschlüsse hat der NUC10?";
+    const std::vector<std::string> docs = {
+        "Der Intel NUC10 hat an der Rückseite HDMI, USB-C/Thunderbolt und "
+        "Gigabit-Ethernet.",                                  // relevant
+        "Die Hauptstadt von Frankreich ist Paris, durchflossen von der Seine.",
+    };
+    const auto results = re.rerank(query, std::span<const std::string>{docs});
+
+    EXPECT_EQ(results.size(), docs.size());
+    std::printf("    [rerank] top index=%zu score=%.4f  (other score=%.4f)\n",
+                results[0].index, results[0].score, results[1].score);
+    EXPECT_EQ(results[0].index, std::size_t{0});         // relevant ranks first
+    EXPECT_TRUE(results[0].score > results[1].score);
 }
 
 TEST(cuda_matmul_q8_0_mmq_largeM_dp4a) {

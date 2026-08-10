@@ -5,6 +5,7 @@
 
 #include "server/ApiHelpers.hpp"
 #include "server/ChatCompletionHandler.hpp"
+#include "server/RerankHandler.hpp"
 #include "server/RequestDispatcher.hpp"
 #include "server/RequestTracker.hpp"
 #include "server/SystemStatusBuilder.hpp"
@@ -117,15 +118,21 @@ struct ApiServer::Impl {
     // POST /v1/chat/completions dispatcher + streaming/blocking handlers.
     ChatCompletionHandler                 chatHandler;
 
+    // POST /v1/rerank — cross-encoder reranker(s). Empty when no model
+    // with task=rerank is configured.
+    RerankHandler                         rerankHandler;
+
     Impl(std::vector<LoadedEngine> in, ServerConfig c,
-         runtime::Drafter*         drafter)
+         runtime::Drafter*         drafter,
+         std::vector<LoadedReranker> rerankers)
         : dispatcher{std::move(in), c.modelId, drafter,
                      c.speculativeTargetId, c.speculative},
           engine{dispatcher.defaultEngine()},
           cfg{std::move(c)},
           tenantMetrics{cfg.tenantMetricsPath},
           statusBuilder{engine, dispatcher, requestTracker, cfg.modelId},
-          chatHandler{dispatcher, requestTracker, tenantMetrics, cfg} {
+          chatHandler{dispatcher, requestTracker, tenantMetrics, cfg},
+          rerankHandler{std::move(rerankers), cfg} {
         makeServer();
         installRoutes();
     }
@@ -263,6 +270,17 @@ struct ApiServer::Impl {
                         chatHandler.handle(req, res);
                     });
 
+        server->Post("/v1/rerank",
+                    [this](const httplib::Request& req,
+                           httplib::Response&       res) {
+                        MM_LOG_INFO(
+                            "server",
+                            "POST /v1/rerank accepted from {} "
+                            "(content-length={} B)",
+                            req.remote_addr, req.body.size());
+                        rerankHandler.handle(req, res);
+                    });
+
         server->set_exception_handler(
             [](const httplib::Request& req,
                httplib::Response& res,
@@ -324,6 +342,16 @@ struct ApiServer::Impl {
                 {"owned_by", "mimirmind"},
             });
         }
+        for (const auto& m : rerankHandler.listModels()) {
+            data.push_back(json{
+                {"id",       m.id},
+                {"title",    m.title},
+                {"object",   "model"},
+                {"created",  0},
+                {"owned_by", "mimirmind"},
+                {"task",     "rerank"},
+            });
+        }
         sendJson(res, 200, {
             {"object", "list"},
             {"data",   std::move(data)},
@@ -377,11 +405,13 @@ struct ApiServer::Impl {
     }
 };
 
-ApiServer::ApiServer(std::vector<LoadedEngine>   engines,
-                     ServerConfig                cfg,
-                     runtime::Drafter*           drafter)
+ApiServer::ApiServer(std::vector<LoadedEngine>     engines,
+                     ServerConfig                  cfg,
+                     runtime::Drafter*             drafter,
+                     std::vector<LoadedReranker>   rerankers)
     : _impl{std::make_unique<Impl>(std::move(engines),
-                                   std::move(cfg), drafter)} {}
+                                   std::move(cfg), drafter,
+                                   std::move(rerankers))} {}
 
 ApiServer::~ApiServer() = default;
 

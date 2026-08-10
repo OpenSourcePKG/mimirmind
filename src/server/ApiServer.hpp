@@ -19,6 +19,9 @@ class InferenceEngine;
 namespace mimirmind::runtime::serving {
 class ContinuousBatcher;
 }
+namespace mimirmind::runtime::encoder {
+class RerankEngine;
+}
 
 namespace mimirmind::server {
 
@@ -38,6 +41,18 @@ struct LoadedEngine {
     /// /v1/models when empty.
     std::string                 title;
     runtime::InferenceEngine*   engine{nullptr};
+};
+
+/**
+ * One loaded cross-encoder reranker exposed under /v1/rerank. `engine` is
+ * non-owning — ServeMode keeps the RerankEngine (and its compute stack)
+ * alive for the process lifetime. Each entry gets its own serialisation
+ * mutex inside RerankHandler.
+ */
+struct LoadedReranker {
+    std::string                     id;
+    std::string                     title;
+    runtime::encoder::RerankEngine* engine{nullptr};
 };
 
 /// In-process TLS termination settings. When `enabled`, the listener is a
@@ -157,9 +172,10 @@ public:
     /// the ApiServer wires up the M9.11.4 spec-dec orchestrator for
     /// that target. Other loaded engines dispatch through the plain
     /// generate() path.
-    ApiServer(std::vector<LoadedEngine>   engines,
-              ServerConfig                cfg,
-              runtime::Drafter*           drafter = nullptr);
+    ApiServer(std::vector<LoadedEngine>     engines,
+              ServerConfig                  cfg,
+              runtime::Drafter*             drafter = nullptr,
+              std::vector<LoadedReranker>   rerankers = {});
     ~ApiServer();
 
     ApiServer(const ApiServer&)            = delete;
