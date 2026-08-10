@@ -11,6 +11,7 @@
 #include "TestFramework.hpp"
 
 #include "compute/Activations.hpp"
+#include "compute/Attention.hpp"
 #include "compute/GatedDeltaNet.hpp"
 #include "compute/Norm.hpp"
 #include "compute/Rope.hpp"
@@ -215,6 +216,42 @@ TEST(cuda_gelu_erf_parity) {
 
     for (std::size_t i = 0; i < got.size(); ++i) {
         EXPECT_NEAR(got[i], ref[i], 1e-4f);
+    }
+}
+
+TEST(cuda_attention_encoder_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    // Non-causal (bidirectional) encoder MHA. nHeads == nKvHeads (no GQA).
+    const std::size_t T = 12, H = 4, S = 16;
+    const float scale = 0.25f;   // 1/sqrt(16)
+    auto q = randVec(T * H * S, 0x51a1u);
+    auto k = randVec(T * H * S, 0x52b2u);
+    auto v = randVec(T * H * S, 0x53c3u);
+
+    // positionOffset == T makes multiHeadAttention's min(posOff+p+1, T) clamp
+    // let every query attend to ALL keys [0, T) — the full/bidirectional ref.
+    std::vector<float> ref(T * H * S);
+    std::vector<float> scratch(T);
+    ::mimirmind::compute::multiHeadAttention(
+        q.data(), k.data(), v.data(), T, T, H, H, S, /*positionOffset=*/T,
+        scratch.data(), ref.data(), /*slidingWindow=*/0, scale);
+
+    auto dq = toDevice(ops, q);
+    auto dk = toDevice(ops, k);
+    auto dv = toDevice(ops, v);
+    auto dOut = ops.allocate(T * H * S * sizeof(float));
+    ops.attentionEncoderAsync(static_cast<const float*>(dq.get()),
+                              static_cast<const float*>(dk.get()),
+                              static_cast<const float*>(dv.get()),
+                              T, H, H, S, scale,
+                              static_cast<float*>(dOut.get()));
+    ops.flush();
+    auto got = fromDevice(ops, dOut.get(), T * H * S);
+
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], ref[i], 1e-3f);
     }
 }
 

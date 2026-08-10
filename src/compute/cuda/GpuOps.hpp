@@ -336,6 +336,11 @@ public:
                         std::size_t slidingWindow = 0,
                         runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
 
+    void attentionEncoderAsync(const float* q, const float* k, const float* v,
+                               std::size_t T, std::size_t nHeads,
+                               std::size_t nKvHeads, std::size_t headDim,
+                               float scale, float* out) override;
+
     void matmulQ8_0VecReorderAsync(const void* wReordered,
                                    std::size_t N, std::size_t K,
                                    const float* x, float* y) override;

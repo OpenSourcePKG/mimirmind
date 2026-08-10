@@ -802,6 +802,21 @@ public:
                                 std::size_t      slidingWindow = 0,
                                 runtime::KvDtype kvDtype       = runtime::KvDtype::F32) = 0;
 
+    // Non-causal (bidirectional) self-attention for the BERT/RoBERTa/XLM-R
+    // encoder (EncoderRunner / cross-encoder reranker): every query attends to
+    // all keys [0, T]; no KV cache, no causal mask, no SWA. Default-throws so
+    // only encoder-capable backends implement it. q/k/v/out: [T, nHeads*headDim]
+    // (GQA-aware via nKvHeads; encoders use nHeads == nKvHeads).
+    virtual void attentionEncoderAsync(const float* /*q*/, const float* /*k*/,
+                                       const float* /*v*/, std::size_t /*T*/,
+                                       std::size_t /*nHeads*/,
+                                       std::size_t /*nKvHeads*/,
+                                       std::size_t /*headDim*/, float /*scale*/,
+                                       float* /*out*/) {
+        throw std::runtime_error(
+            "attentionEncoderAsync: not supported on this backend");
+    }
+
     // ---- Reordered-Q8_0 matvec (test-facing) --------------------------
 
     virtual void matmulQ8_0VecReorderAsync(const void*  wReordered,

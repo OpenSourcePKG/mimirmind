@@ -686,6 +686,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/add_residual.cu
         kernels/cuda/common/add_rmsnorm.cu
         kernels/cuda/llm/attention.cu
+        kernels/cuda/llm/attention_encoder.cu
         kernels/cuda/llm/attention_flash_merge.cu
         kernels/cuda/llm/attention_flash_partial.cu
         kernels/cuda/llm/attention_flash_partial_batched.cu
@@ -2550,6 +2551,8 @@ if(MIMIRMIND_ENABLE_CUDA)
         src/compute/Norm.cpp
         # CPU golden reference for the erf-GELU (EncoderRunner) parity test.
         src/compute/Activations.cpp
+        # CPU golden reference for the non-causal encoder MHA parity test.
+        src/compute/Attention.cpp
         # GpuMatmul closure: CPU-fallback matmul + dequant + quant-type registry.
         src/compute/Matmul.cpp
         src/compute/Dequant.cpp
