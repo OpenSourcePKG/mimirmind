@@ -131,6 +131,8 @@ core::cuda::CudaModule loadCudaModule(core::cuda::CudaContext& ctx,
 struct GpuOps::Impl {
     core::cuda::CudaModule _rmsnormModule;
     core::cuda::CudaKernel _rmsnormKernel;
+    core::cuda::CudaModule _layernormModule;
+    core::cuda::CudaKernel _layernormKernel;
     core::cuda::CudaModule _rmsnormGemmaModule;
     core::cuda::CudaKernel _rmsnormGemmaKernel;
     core::cuda::CudaModule _rmsnormNoWeightModule;
@@ -318,6 +320,8 @@ struct GpuOps::Impl {
     explicit Impl(core::cuda::CudaContext& ctx)
         : _rmsnormModule           {loadCudaModule(ctx, "rmsnorm")},
           _rmsnormKernel           {_rmsnormModule.getFunction("rmsnorm")},
+          _layernormModule         {loadCudaModule(ctx, "layernorm")},
+          _layernormKernel         {_layernormModule.getFunction("layernorm")},
           _rmsnormGemmaModule      {loadCudaModule(ctx, "rmsnorm_gemma")},
           _rmsnormGemmaKernel      {_rmsnormGemmaModule.getFunction("rmsnorm_gemma")},
           _rmsnormNoWeightModule   {loadCudaModule(ctx, "rmsnorm_no_weight")},
@@ -857,6 +861,26 @@ void GpuOps::rmsNormAsync(const float* x, std::size_t M, std::size_t K,
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(M), 1, 1,
              kRmsnormLocalSize, 1, 1);
+}
+
+void GpuOps::layerNormAsync(const float* x, std::size_t M, std::size_t K,
+                            const float* weight, const float* bias, float eps,
+                            float* y) {
+    if (M == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t Ki = toInt32(K, "layerNorm K");
+    auto& k = _pimpl->_layernormKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, weight);
+    k.setPtr  (2, bias);
+    k.setPtr  (3, y);
+    k.setValue(4, eps);
+    k.setValue(5, Ki);
+    // One workgroup per row (BERT/XLM-R encoder LayerNorm).
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(M), 1, 1,
+             kLayernormLocalSize, 1, 1);
 }
 
 void GpuOps::rmsNormGemmaAsync(const float* x, std::size_t M, std::size_t K,

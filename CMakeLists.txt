@@ -743,6 +743,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/qkv_split.cu
         kernels/cuda/llm/qkv_split_fp16.cu
         kernels/cuda/common/rmsnorm.cu
+        kernels/cuda/common/layernorm.cu
         kernels/cuda/common/rmsnorm_gemma.cu
         kernels/cuda/common/rmsnorm_no_weight.cu
         kernels/cuda/llm/rmsnorm_qkv.cu
@@ -2544,6 +2545,8 @@ if(MIMIRMIND_ENABLE_CUDA)
         src/compute/GatedDeltaNet.cpp
         # CPU golden reference for the IMRoPE partial-rotary parity test.
         src/compute/Rope.cpp
+        # CPU golden reference for the LayerNorm (EncoderRunner) parity test.
+        src/compute/Norm.cpp
         # GpuMatmul closure: CPU-fallback matmul + dequant + quant-type registry.
         src/compute/Matmul.cpp
         src/compute/Dequant.cpp

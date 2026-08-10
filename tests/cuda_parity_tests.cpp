@@ -11,6 +11,7 @@
 #include "TestFramework.hpp"
 
 #include "compute/GatedDeltaNet.hpp"
+#include "compute/Norm.hpp"
 #include "compute/Rope.hpp"
 #include "compute/cuda/GpuMatmul.hpp"
 #include "compute/cuda/GpuOps.hpp"
@@ -158,6 +159,37 @@ TEST(cuda_l2norm_parity) {
     ops.l2NormInPlaceAsync(static_cast<float*>(buf.get()), rows, dim, eps);
     ops.flush();
     auto got = fromDevice(ops, buf.get(), rows * dim);
+
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], ref[i], 1e-3f);
+    }
+}
+
+TEST(cuda_layernorm_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    // XLM-R hidden = 1024; the EncoderRunner / cross-encoder reranker path.
+    const std::size_t rows = 5, dim = 1024;
+    const float eps = 1e-5f;
+    auto host   = randVec(rows * dim, 0x1a1u);
+    auto weight = randVec(dim, 0x2b2u);   // gamma
+    auto bias   = randVec(dim, 0x3c3u);   // beta
+
+    std::vector<float> ref(rows * dim);
+    ::mimirmind::compute::layerNorm(host.data(), rows, dim,
+                                    weight.data(), bias.data(), eps, ref.data());
+
+    auto dx = toDevice(ops, host);
+    auto dw = toDevice(ops, weight);
+    auto db = toDevice(ops, bias);
+    auto dy = ops.allocate(rows * dim * sizeof(float));
+    ops.layerNormAsync(static_cast<const float*>(dx.get()), rows, dim,
+                       static_cast<const float*>(dw.get()),
+                       static_cast<const float*>(db.get()), eps,
+                       static_cast<float*>(dy.get()));
+    ops.flush();
+    auto got = fromDevice(ops, dy.get(), rows * dim);
 
     for (std::size_t i = 0; i < got.size(); ++i) {
         EXPECT_NEAR(got[i], ref[i], 1e-3f);

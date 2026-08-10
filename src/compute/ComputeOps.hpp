@@ -58,6 +58,20 @@ public:
                               float        eps,
                               float*       y) = 0;
 
+    // LayerNorm (mean+var+gamma+beta) for the BERT/RoBERTa/XLM-R encoder path
+    // (EncoderRunner / cross-encoder reranker). Default-throws so only backends
+    // that implement the encoder forward need to provide it.
+    virtual void layerNormAsync(const float* /*x*/,
+                                std::size_t  /*M*/,
+                                std::size_t  /*K*/,
+                                const float* /*weight*/,
+                                const float* /*bias*/,
+                                float        /*eps*/,
+                                float*       /*y*/) {
+        throw std::runtime_error(
+            "layerNormAsync: not supported on this backend");
+    }
+
     virtual void rmsNormGemmaAsync(const float* x,
                                    std::size_t  M,
                                    std::size_t  K,

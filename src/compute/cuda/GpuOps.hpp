@@ -75,6 +75,10 @@ public:
     void rmsNormAsync(const float* x, std::size_t M, std::size_t K,
                       const float* weight, float eps, float* y) override;
 
+    void layerNormAsync(const float* x, std::size_t M, std::size_t K,
+                        const float* weight, const float* bias, float eps,
+                        float* y) override;
+
     void rmsNormGemmaAsync(const float* x, std::size_t M, std::size_t K,
                            const float* weight, float eps, float* y) override;
 
@@ -488,6 +492,7 @@ private:
     // consume their own local macros; parity is maintained by
     // convention (mirrored from `GpuOps` kernel constants).
     static constexpr std::uint32_t kRmsnormLocalSize      = 128;
+    static constexpr std::uint32_t kLayernormLocalSize    = 128;
     static constexpr std::uint32_t kElementwiseLocalSize  = 256;
     static constexpr std::uint32_t kRopeLocalSize         = 256;
     static constexpr std::uint32_t kXQuantI8LocalSize     = 128;

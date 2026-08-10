@@ -40,4 +40,46 @@ void rmsNorm(const float* x,
                  static_cast<double>(eps));
 }
 
+void layerNorm(const float* x,
+               std::size_t  M,
+               std::size_t  K,
+               const float* weight,
+               const float* bias,
+               float        eps,
+               float*       y) {
+    if (K == 0) {
+        return;
+    }
+    const double invK = 1.0 / static_cast<double>(K);
+
+    for (std::size_t m = 0; m < M; ++m) {
+        const float* xr = x + m * K;
+        float*       yr = y + m * K;
+
+        // Pass 1: mean.
+        double sum = 0.0;
+        for (std::size_t k = 0; k < K; ++k) {
+            sum += static_cast<double>(xr[k]);
+        }
+        const double mean = sum * invK;
+
+        // Pass 2: variance from (x - mean)^2 (biased — matches PyTorch/HF).
+        double sumSq = 0.0;
+        for (std::size_t k = 0; k < K; ++k) {
+            const double d = static_cast<double>(xr[k]) - mean;
+            sumSq += d * d;
+        }
+        const float invStd = 1.0F /
+            std::sqrt(static_cast<float>(sumSq * invK) + eps);
+
+        for (std::size_t k = 0; k < K; ++k) {
+            yr[k] = static_cast<float>(static_cast<double>(xr[k]) - mean) *
+                        invStd * weight[k] +
+                    bias[k];
+        }
+    }
+    MM_LOG_DEBUG("norm", "layerNorm done — M={} K={} eps={}", M, K,
+                 static_cast<double>(eps));
+}
+
 } // namespace mimirmind::compute
