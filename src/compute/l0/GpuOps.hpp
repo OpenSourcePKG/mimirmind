@@ -335,6 +335,18 @@ public:
                                float        scale,
                                float*       out) override;
 
+    void attentionEncoderBatchedAsync(const float*        q,
+                                      const float*        k,
+                                      const float*        v,
+                                      float*              out,
+                                      const std::int32_t* seqLens,
+                                      std::size_t         B,
+                                      std::size_t         Tmax,
+                                      std::size_t         nHeads,
+                                      std::size_t         nKvHeads,
+                                      std::size_t         headDim,
+                                      float               scale) override;
+
     /// Fused scaled accumulate: dst[i] += scale * src[i]. Replaces a
     /// mulScalarAsync(src, scale) + addResidualAsync(dst, src) pair
     /// where the intermediate scaled src is not read elsewhere. Used by

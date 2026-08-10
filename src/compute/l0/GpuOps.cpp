@@ -84,6 +84,8 @@ struct GpuOps::Impl {
     runtime::GpuKernel     _encoderEmbedAddKernel;
     runtime::GpuModule     _attentionEncoderModule;
     runtime::GpuKernel     _attentionEncoderKernel;
+    runtime::GpuModule     _attentionEncoderBatchedModule;
+    runtime::GpuKernel     _attentionEncoderBatchedKernel;
     runtime::GpuModule     _rmsnormGemmaModule;
     runtime::GpuKernel     _rmsnormGemmaKernel;
     runtime::GpuModule     _rmsnormNoWeightModule;
@@ -183,6 +185,8 @@ struct GpuOps::Impl {
           _encoderEmbedAddKernel{_encoderEmbedAddModule.kernel("encoder_embed_add")},
           _attentionEncoderModule{ctx, "attention_encoder"},
           _attentionEncoderKernel{_attentionEncoderModule.kernel("attention_encoder")},
+          _attentionEncoderBatchedModule{ctx, "attention_encoder_batched"},
+          _attentionEncoderBatchedKernel{_attentionEncoderBatchedModule.kernel("attention_encoder_batched")},
           _rmsnormGemmaModule{ctx, "rmsnorm_gemma"},
           _rmsnormGemmaKernel{_rmsnormGemmaModule.kernel("rmsnorm_gemma")},
           _rmsnormNoWeightModule{ctx, "rmsnorm_no_weight"},
@@ -802,6 +806,41 @@ void GpuOps::attentionEncoderAsync(const float* q,
     _queue.appendLaunch(kern,
                         static_cast<std::uint32_t>(nHeads),
                         static_cast<std::uint32_t>(T), 1);
+}
+
+void GpuOps::attentionEncoderBatchedAsync(const float* q, const float* k,
+                                          const float* v, float* out,
+                                          const std::int32_t* seqLens,
+                                          std::size_t B, std::size_t Tmax,
+                                          std::size_t nHeads,
+                                          std::size_t nKvHeads,
+                                          std::size_t headDim, float scale) {
+    if (B == 0 || Tmax == 0 || nHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (Tmax > kAttentionMaxTk) {
+        throw std::runtime_error(
+            "GpuOps::attentionEncoderBatchedAsync: Tmax=" + std::to_string(Tmax) +
+            " exceeds ATTN_ENC_MAX_TK=" + std::to_string(kAttentionMaxTk));
+    }
+    auto& kern = _pimpl->_attentionEncoderBatchedKernel;
+    kern.setPtr(0, q);
+    kern.setPtr(1, k);
+    kern.setPtr(2, v);
+    kern.setPtr(3, out);
+    kern.setPtr(4, seqLens);
+    kern.setValue<std::int32_t>(5, toInt32(B,        "attnEncB B"));
+    kern.setValue<std::int32_t>(6, toInt32(Tmax,     "attnEncB Tmax"));
+    kern.setValue<std::int32_t>(7, toInt32(nHeads,   "attnEncB nHeads"));
+    kern.setValue<std::int32_t>(8, toInt32(nKvHeads, "attnEncB nKvHeads"));
+    kern.setValue<std::int32_t>(9, toInt32(headDim,  "attnEncB headDim"));
+    kern.setValue<float>(10, scale);
+    kern.setGroupSize(kAttentionLocalSize, 1, 1);
+    // One workgroup per (head, query-position, batch).
+    _queue.appendLaunch(kern,
+                        static_cast<std::uint32_t>(nHeads),
+                        static_cast<std::uint32_t>(Tmax),
+                        static_cast<std::uint32_t>(B));
 }
 
 void GpuOps::ropeInPlaceAsync(void*            xBase,

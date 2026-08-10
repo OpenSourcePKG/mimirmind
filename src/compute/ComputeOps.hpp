@@ -835,6 +835,20 @@ public:
             "attentionEncoderAsync: not supported on this backend");
     }
 
+    // Batched non-causal encoder attention: B sequences packed as rows
+    // r = b*Tmax + t in q/k/v/out ([B*Tmax, nHeads*headDim]). Query (b,pq)
+    // attends to keys [0, seqLens[b]) of the same batch; padding rows
+    // (pq >= seqLens[b]) get a zeroed output. seqLens is a device int32[B].
+    // One GPU forward for a whole rerank pool. (EncoderRunner batched path.)
+    virtual void attentionEncoderBatchedAsync(
+        const float* /*q*/, const float* /*k*/, const float* /*v*/,
+        float* /*out*/, const std::int32_t* /*seqLens*/, std::size_t /*B*/,
+        std::size_t /*Tmax*/, std::size_t /*nHeads*/, std::size_t /*nKvHeads*/,
+        std::size_t /*headDim*/, float /*scale*/) {
+        throw std::runtime_error(
+            "attentionEncoderBatchedAsync: not supported on this backend");
+    }
+
     // ---- Reordered-Q8_0 matvec (test-facing) --------------------------
 
     virtual void matmulQ8_0VecReorderAsync(const void*  wReordered,

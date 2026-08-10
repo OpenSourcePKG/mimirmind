@@ -175,6 +175,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _attentionKernel;
     core::cuda::CudaModule _attentionEncoderModule;
     core::cuda::CudaKernel _attentionEncoderKernel;
+    core::cuda::CudaModule _attentionEncoderBatchedModule;
+    core::cuda::CudaKernel _attentionEncoderBatchedKernel;
     core::cuda::CudaModule _attentionFp16Module;
     core::cuda::CudaKernel _attentionFp16Kernel;
     core::cuda::CudaModule _attentionQ8Module;
@@ -373,6 +375,8 @@ struct GpuOps::Impl {
           _attentionKernel         {_attentionModule.getFunction("attention")},
           _attentionEncoderModule  {loadCudaModule(ctx, "attention_encoder")},
           _attentionEncoderKernel  {_attentionEncoderModule.getFunction("attention_encoder")},
+          _attentionEncoderBatchedModule {loadCudaModule(ctx, "attention_encoder_batched")},
+          _attentionEncoderBatchedKernel {_attentionEncoderBatchedModule.getFunction("attention_encoder_batched")},
           _attentionFp16Module     {loadCudaModule(ctx, "attention_fp16")},
           _attentionFp16Kernel     {_attentionFp16Module.getFunction("attention_fp16")},
           _attentionQ8Module       {loadCudaModule(ctx, "attention_q8_0")},
@@ -2425,6 +2429,36 @@ void GpuOps::attentionEncoderAsync(const float* q, const float* k,
                   static_cast<std::uint32_t>(nHeads),
                   static_cast<std::uint32_t>(T),
                   1,
+                  kAttentionLocalSize, 1, 1);
+}
+
+void GpuOps::attentionEncoderBatchedAsync(const float* q, const float* k,
+                                          const float* v, float* out,
+                                          const std::int32_t* seqLens,
+                                          std::size_t B, std::size_t Tmax,
+                                          std::size_t nHeads,
+                                          std::size_t nKvHeads,
+                                          std::size_t headDim, float scale) {
+    if (B == 0 || Tmax == 0 || nHeads == 0) {
+        return;
+    }
+    auto& kernel = _pimpl->_attentionEncoderBatchedKernel;
+    kernel.setPtr  (0, q);
+    kernel.setPtr  (1, k);
+    kernel.setPtr  (2, v);
+    kernel.setPtr  (3, out);
+    kernel.setPtr  (4, seqLens);
+    kernel.setValue(5, toInt32(B,        "attnEncB B"));
+    kernel.setValue(6, toInt32(Tmax,     "attnEncB Tmax"));
+    kernel.setValue(7, toInt32(nHeads,   "attnEncB nHeads"));
+    kernel.setValue(8, toInt32(nKvHeads, "attnEncB nKvHeads"));
+    kernel.setValue(9, toInt32(headDim,  "attnEncB headDim"));
+    kernel.setValue(10, scale);
+    // grid (head, query-pos, batch).
+    kernel.launch(_ctx.stream(),
+                  static_cast<std::uint32_t>(nHeads),
+                  static_cast<std::uint32_t>(Tmax),
+                  static_cast<std::uint32_t>(B),
                   kAttentionLocalSize, 1, 1);
 }
 

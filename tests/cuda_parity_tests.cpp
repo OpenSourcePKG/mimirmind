@@ -262,6 +262,62 @@ TEST(cuda_attention_encoder_parity) {
     }
 }
 
+TEST(cuda_attention_encoder_batched_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    // Three packed sequences of different lengths; each row r = b*Tmax + t.
+    const std::size_t H = 4, S = 16, Tmax = 16;
+    const std::array<std::size_t, 3> lens{12, 7, 16};
+    const std::size_t B = lens.size();
+    const float scale = 1.0f / std::sqrt(static_cast<float>(S));
+    const std::size_t rowElems = H * S;
+
+    std::vector<float> q(B * Tmax * rowElems, 0.0f);
+    std::vector<float> k(B * Tmax * rowElems, 0.0f);
+    std::vector<float> vv(B * Tmax * rowElems, 0.0f);
+    for (std::size_t b = 0; b < B; ++b) {
+        auto qb = randVec(lens[b] * rowElems, 0x9100u + static_cast<std::uint32_t>(b));
+        auto kb = randVec(lens[b] * rowElems, 0x9200u + static_cast<std::uint32_t>(b));
+        auto vb = randVec(lens[b] * rowElems, 0x9300u + static_cast<std::uint32_t>(b));
+        const std::size_t off = b * Tmax * rowElems;
+        std::copy(qb.begin(), qb.end(), q.begin() + static_cast<std::ptrdiff_t>(off));
+        std::copy(kb.begin(), kb.end(), k.begin() + static_cast<std::ptrdiff_t>(off));
+        std::copy(vb.begin(), vb.end(), vv.begin() + static_cast<std::ptrdiff_t>(off));
+    }
+
+    std::vector<std::int32_t> seqLens(B);
+    for (std::size_t b = 0; b < B; ++b) seqLens[b] = static_cast<std::int32_t>(lens[b]);
+
+    auto dq = toDevice(ops, q);
+    auto dk = toDevice(ops, k);
+    auto dv = toDevice(ops, vv);
+    auto dOut = ops.allocate(B * Tmax * rowElems * sizeof(float));
+    auto dLens = ops.allocate(B * sizeof(std::int32_t));
+    ops.uploadHostBytes(dLens.get(), seqLens.data(), B * sizeof(std::int32_t));
+
+    ops.attentionEncoderBatchedAsync(
+        static_cast<const float*>(dq.get()), static_cast<const float*>(dk.get()),
+        static_cast<const float*>(dv.get()), static_cast<float*>(dOut.get()),
+        static_cast<const std::int32_t*>(dLens.get()), B, Tmax, H, H, S, scale);
+    ops.flush();
+    auto got = fromDevice(ops, dOut.get(), B * Tmax * rowElems);
+
+    // Each sequence must match the single-sequence reference over its length.
+    for (std::size_t b = 0; b < B; ++b) {
+        const std::size_t off = b * Tmax * rowElems;
+        std::vector<float> ref(lens[b] * rowElems);
+        std::vector<float> scratch(lens[b]);
+        ::mimirmind::compute::multiHeadAttention(
+            q.data() + off, k.data() + off, vv.data() + off,
+            lens[b], lens[b], H, H, S, /*positionOffset=*/lens[b],
+            scratch.data(), ref.data(), /*slidingWindow=*/0, scale);
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            EXPECT_NEAR(got[off + i], ref[i], 1e-3f);
+        }
+    }
+}
+
 TEST(cuda_encoder_embed_add_parity) {
     CudaComputeContext ctx{};
     GpuOps ops{ctx};
@@ -1257,6 +1313,53 @@ TEST(cuda_encoder_full_forward_parity) {
                 logits.at(0), ref, ids.size(), model.config().numLayers,
                 model.config().numLabels);
     EXPECT_NEAR(logits.at(0), ref, 5e-2f);
+}
+
+// Batched forward parity: running B sequences of DIFFERENT lengths through
+// forwardLogitsBatch (padded + per-sequence attention masking) must match
+// scoring each one individually with forwardLogits. Validates the batched
+// EncoderRunner path (padding never leaks across sequences).
+TEST(cuda_encoder_batched_forward_parity) {
+    const char* envp = std::getenv("MIMIRMIND_ENCODER_ORACLE");
+    const std::string fx = envp ? envp : "scratchpad/encoder_oracle.bin";
+    OracleMap O;
+    if (!readOracle(fx, O)) {
+        std::printf("[SKIP] encoder oracle fixture not found at %s\n", fx.c_str());
+        return;
+    }
+    const char* mdl = std::getenv("MIMIRMIND_BGE_DIR");
+    const std::string dir = mdl ? mdl : "models/bge-reranker-v2-m3";
+    if (!std::filesystem::exists(std::filesystem::path(dir) / "config.json")) {
+        std::printf("[SKIP] bge model dir not found at %s\n", dir.c_str());
+        return;
+    }
+
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+    ::mimirmind::runtime::encoder::EncoderModel model;
+    model.load(dir, ops);
+    ::mimirmind::runtime::encoder::EncoderRunner runner{model, ops, gmm};
+
+    const std::vector<std::int32_t>& ids = O.at("input_ids").i;
+    // Three sequences of differing lengths (full, and two truncations that
+    // keep the leading <s> so the [CLS] head still has a valid row 0).
+    std::vector<std::vector<std::int32_t>> seqs = {
+        ids,
+        std::vector<std::int32_t>(ids.begin(), ids.begin() + 40),
+        std::vector<std::int32_t>(ids.begin(), ids.begin() + 60),
+    };
+
+    const auto batched = runner.forwardLogitsBatch(
+        std::span<const std::vector<std::int32_t>>{seqs});
+    EXPECT_EQ(batched.size(), seqs.size());
+
+    for (std::size_t b = 0; b < seqs.size(); ++b) {
+        const auto single = runner.forwardLogits(seqs[b]);
+        std::printf("    [batch b=%zu len=%zu] batched=%.6f single=%.6f\n",
+                    b, seqs[b].size(), batched[b].at(0), single.at(0));
+        EXPECT_NEAR(batched[b].at(0), single.at(0), 2e-3f);
+    }
 }
 
 // XLM-R Unigram tokenizer parity: the oracle's input_ids came from the HF

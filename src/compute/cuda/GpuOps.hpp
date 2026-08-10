@@ -347,6 +347,13 @@ public:
                                std::size_t nKvHeads, std::size_t headDim,
                                float scale, float* out) override;
 
+    void attentionEncoderBatchedAsync(const float* q, const float* k,
+                                      const float* v, float* out,
+                                      const std::int32_t* seqLens,
+                                      std::size_t B, std::size_t Tmax,
+                                      std::size_t nHeads, std::size_t nKvHeads,
+                                      std::size_t headDim, float scale) override;
+
     void matmulQ8_0VecReorderAsync(const void* wReordered,
                                    std::size_t N, std::size_t K,
                                    const float* x, float* y) override;

@@ -43,6 +43,12 @@ public:
     [[nodiscard]] std::vector<float>
     forwardLogits(std::span<const std::int32_t> inputIds);
 
+    /// Batched full forward: B sequences in ONE GPU pass (padded to the max
+    /// length, per-sequence attention masking). Returns B × numLabels logits.
+    /// Far faster than B separate forwardLogits() for a rerank pool.
+    [[nodiscard]] std::vector<std::vector<float>>
+    forwardLogitsBatch(std::span<const std::vector<std::int32_t>> sequences);
+
     /// The single rerank relevance logit (numLabels == 1).
     [[nodiscard]] float score(std::span<const std::int32_t> inputIds);
 

@@ -4,7 +4,10 @@
 #include "runtime/encoder/RerankEngine.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
+#include <span>
+#include <vector>
 
 namespace mimirmind::runtime::encoder {
 
@@ -30,10 +33,24 @@ RerankEngine::rerank(std::string_view query,
                      std::span<const std::string> documents,
                      bool sortDescending,
                      std::optional<std::size_t> topN) const {
+    // Tokenize every (query, document) pair, then score the whole pool in ONE
+    // batched forward (padded, per-sequence attention masking) — far faster
+    // than one forward per document.
+    std::vector<std::vector<std::int32_t>> pairs;
+    pairs.reserve(documents.size());
+    for (const auto& doc : documents) {
+        pairs.push_back(_tokenizer.encodePair(query, doc));
+    }
+
+    const std::vector<std::vector<float>> logits =
+        _runner.forwardLogitsBatch(std::span<const std::vector<std::int32_t>>{pairs});
+
     std::vector<Result> results;
     results.reserve(documents.size());
     for (std::size_t i = 0; i < documents.size(); ++i) {
-        results.push_back({i, scorePair(query, documents[i])});
+        const float score = (i < logits.size() && !logits[i].empty())
+                                ? logits[i].front() : 0.0F;
+        results.push_back({i, score});
     }
 
     if (sortDescending) {

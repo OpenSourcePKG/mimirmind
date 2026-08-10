@@ -332,6 +332,52 @@ TEST(attention_encoder_basic) {
                       elems, 5e-4F);
 }
 
+TEST(attention_encoder_batched_basic) {
+    constexpr std::size_t H = 4, headDim = 16, Tmax = 16;
+    const std::array<std::size_t, 3> lens{12, 7, 16};
+    constexpr std::size_t B = 3;
+    const float scale = 1.0F / std::sqrt(static_cast<float>(headDim));
+    const std::size_t rowElems = H * headDim;
+    const std::size_t total = B * Tmax * rowElems;
+
+    std::vector<float> q(total, 0.0F), k(total, 0.0F), vv(total, 0.0F);
+    for (std::size_t b = 0; b < B; ++b) {
+        const auto qb = generateFloats(lens[b] * rowElems, 0x9100u + static_cast<std::uint32_t>(b));
+        const auto kb = generateFloats(lens[b] * rowElems, 0x9200u + static_cast<std::uint32_t>(b));
+        const auto vb = generateFloats(lens[b] * rowElems, 0x9300u + static_cast<std::uint32_t>(b));
+        const std::size_t off = b * Tmax * rowElems;
+        std::copy(qb.begin(), qb.end(), q.begin() + static_cast<std::ptrdiff_t>(off));
+        std::copy(kb.begin(), kb.end(), k.begin() + static_cast<std::ptrdiff_t>(off));
+        std::copy(vb.begin(), vb.end(), vv.begin() + static_cast<std::ptrdiff_t>(off));
+    }
+    std::array<std::int32_t, B> seqLens{};
+    for (std::size_t b = 0; b < B; ++b) seqLens[b] = static_cast<std::int32_t>(lens[b]);
+
+    UsmBuf bq(total * sizeof(float)), bk(total * sizeof(float)), bv(total * sizeof(float));
+    UsmBuf bo(total * sizeof(float)), blen(B * sizeof(std::int32_t));
+    std::memcpy(bq.raw(), q.data(), q.size() * sizeof(float));
+    std::memcpy(bk.raw(), k.data(), k.size() * sizeof(float));
+    std::memcpy(bv.raw(), vv.data(), vv.size() * sizeof(float));
+    std::memcpy(blen.raw(), seqLens.data(), B * sizeof(std::int32_t));
+
+    fx().ops.attentionEncoderBatchedAsync(
+        bq.as<float>(), bk.as<float>(), bv.as<float>(), bo.as<float>(),
+        blen.as<std::int32_t>(), B, Tmax, H, H, headDim, scale);
+    fx().queue.flush();
+
+    for (std::size_t b = 0; b < B; ++b) {
+        const std::size_t off = b * Tmax * rowElems;
+        std::vector<float> ref(lens[b] * rowElems);
+        std::vector<float> scratch(lens[b]);
+        mimirmind::compute::multiHeadAttention(
+            q.data() + off, k.data() + off, vv.data() + off,
+            lens[b], lens[b], H, H, headDim, /*positionOffset=*/lens[b],
+            scratch.data(), ref.data(), /*slidingWindow=*/0, scale);
+        EXPECT_ARRAY_NEAR("attn_enc_batched", bo.as<float>() + off, ref.data(),
+                          ref.size(), 5e-4F);
+    }
+}
+
 // (1+w)·norm Gemma variant: rewrite weight as (1+w), call standard rmsNorm
 // reference, then compare. The GPU kernel does the addition internally.
 TEST(rmsnorm_gemma_oneplus) {

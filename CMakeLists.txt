@@ -233,6 +233,7 @@ set(KERNEL_SOURCES
     kernels/cl/common/tanh_inplace.cl
     kernels/cl/common/encoder_embed_add.cl
     kernels/cl/llm/attention_encoder.cl
+    kernels/cl/llm/attention_encoder_batched.cl
     kernels/cl/common/rmsnorm_gemma.cl
     kernels/cl/common/rmsnorm_no_weight.cl
     kernels/cl/llm/rmsnorm_qkv.cl
@@ -696,6 +697,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/add_rmsnorm.cu
         kernels/cuda/llm/attention.cu
         kernels/cuda/llm/attention_encoder.cu
+        kernels/cuda/llm/attention_encoder_batched.cu
         kernels/cuda/llm/attention_flash_merge.cu
         kernels/cuda/llm/attention_flash_partial.cu
         kernels/cuda/llm/attention_flash_partial_batched.cu

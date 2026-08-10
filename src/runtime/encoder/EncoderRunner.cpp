@@ -10,7 +10,9 @@
 #include "core/gguf/GgufTypes.hpp"
 #include "runtime/encoder/EncoderModel.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 
 namespace mimirmind::runtime::encoder {
@@ -115,6 +117,141 @@ EncoderRunner::forwardLogits(std::span<const std::int32_t> inputIds) {
     _ops.flush();
     std::vector<float> logits(nL);
     _ops.readbackToHost(logits.data(), out, nL * sizeof(float));
+    return logits;
+}
+
+std::vector<std::vector<float>>
+EncoderRunner::forwardLogitsBatch(
+    std::span<const std::vector<std::int32_t>> sequences) {
+    const EncoderConfig& c = _m.config();
+    const std::size_t B = sequences.size();
+    if (B == 0) {
+        return {};
+    }
+
+    std::size_t Tmax = 0;
+    for (const auto& s : sequences) {
+        Tmax = std::max(Tmax, s.size());
+    }
+    if (Tmax == 0) {
+        return std::vector<std::vector<float>>(B, std::vector<float>(c.numLabels, 0.0F));
+    }
+
+    const std::size_t H   = c.hidden;
+    const std::size_t ffn = c.ffn;
+    const std::size_t nL  = c.numLabels;
+    const std::size_t R   = B * Tmax;                 // padded row count
+    const float eps       = c.lnEps;
+    const float scale     = 1.0F / std::sqrt(static_cast<float>(c.headDim));
+    const auto  F32       = core::gguf::GgmlType::F32;
+
+    // Padded token ids (pad rows filled with pad_token_id) + per-seq lengths.
+    std::vector<std::int32_t> ids(R, c.padTokenId);
+    std::vector<std::int32_t> seqLens(B, 0);
+    for (std::size_t b = 0; b < B; ++b) {
+        const auto& s = sequences[b];
+        seqLens[b] = static_cast<std::int32_t>(s.size());
+        std::copy(s.begin(), s.end(), ids.begin() + static_cast<std::ptrdiff_t>(b * Tmax));
+    }
+
+    auto alloc = [&](std::size_t n) { return _ops.allocate(n * sizeof(float)); };
+    auto fp = [](compute::ComputeBuffer& b) { return static_cast<float*>(b.get()); };
+
+    compute::ComputeBuffer xb   = alloc(R * H);
+    compute::ComputeBuffer hb   = alloc(R * H);
+    compute::ComputeBuffer qb   = alloc(R * H);
+    compute::ComputeBuffer kb   = alloc(R * H);
+    compute::ComputeBuffer vb   = alloc(R * H);
+    compute::ComputeBuffer attnb = alloc(R * H);
+    compute::ComputeBuffer aob  = alloc(R * H);
+    compute::ComputeBuffer ln1b = alloc(R * H);
+    compute::ComputeBuffer interb = alloc(R * ffn);
+    compute::ComputeBuffer ffnb = alloc(R * H);
+    compute::ComputeBuffer scr  = alloc(R * ffn);
+    compute::ComputeBuffer clsInb = alloc(B * H);
+    compute::ComputeBuffer clsb = alloc(B * H);
+    compute::ComputeBuffer outb = alloc(B * nL);
+    compute::ComputeBuffer lensb = _ops.allocate(B * sizeof(std::int32_t));
+    _ops.uploadHostBytes(lensb.get(), seqLens.data(), B * sizeof(std::int32_t));
+
+    float* x    = fp(xb);
+    float* h    = fp(hb);
+    float* q    = fp(qb);
+    float* k    = fp(kb);
+    float* v    = fp(vb);
+    float* attn = fp(attnb);
+    float* ao   = fp(aob);
+    float* ln1  = fp(ln1b);
+    float* inter = fp(interb);
+    float* ffnO = fp(ffnb);
+    float* scratch = fp(scr);
+    float* clsIn = fp(clsInb);
+    float* cls  = fp(clsb);
+    float* out  = fp(outb);
+    const auto* lens = static_cast<const std::int32_t*>(lensb.get());
+
+    // Embeddings: word gather over all padded rows, then per-sequence
+    // pos+type add on the real rows (padding rows keep the raw pad embedding
+    // — they never affect a real row: masked out of attention, ignored at
+    // the head). LayerNorm is per-row over the whole batch.
+    compute::embeddingLookup(F32, _m.wordEmb(), H, c.vocab,
+                             std::span<const std::int32_t>{ids}, x);
+    for (std::size_t b = 0; b < B; ++b) {
+        const std::size_t len = static_cast<std::size_t>(seqLens[b]);
+        if (len > 0) {
+            _ops.encoderEmbedAddAsync(x + b * Tmax * H, _m.posTable(),
+                                      _m.typeVec(), len, H, c.posOffset);
+        }
+    }
+    _ops.layerNormAsync(x, R, H, _m.embLnW(), _m.embLnB(), eps, h);
+
+    for (std::size_t i = 0; i < c.numLayers; ++i) {
+        const EncoderLayerWeights& L = _m.layer(i);
+
+        _mm.matmulAsync(F32, L.qW, H, H, h, R, q, scratch);
+        _ops.addBiasAsync(q, R, H, L.qB);
+        _mm.matmulAsync(F32, L.kW, H, H, h, R, k, scratch);
+        _ops.addBiasAsync(k, R, H, L.kB);
+        _mm.matmulAsync(F32, L.vW, H, H, h, R, v, scratch);
+        _ops.addBiasAsync(v, R, H, L.vB);
+
+        _ops.attentionEncoderBatchedAsync(q, k, v, attn, lens, B, Tmax,
+                                          c.heads, c.heads, c.headDim, scale);
+
+        _mm.matmulAsync(F32, L.aoW, H, H, attn, R, ao, scratch);
+        _ops.addBiasAsync(ao, R, H, L.aoB);
+        _ops.addResidualAsync(ao, h, R * H);
+        _ops.layerNormAsync(ao, R, H, L.aoLnW, L.aoLnB, eps, ln1);
+
+        _mm.matmulAsync(F32, L.fiW, ffn, H, ln1, R, inter, scratch);
+        _ops.addBiasAsync(inter, R, ffn, L.fiB);
+        _ops.geluErfAsync(inter, R * ffn);
+        _mm.matmulAsync(F32, L.foW, H, ffn, inter, R, ffnO, scratch);
+        _ops.addBiasAsync(ffnO, R, H, L.foB);
+        _ops.addResidualAsync(ffnO, ln1, R * H);
+        _ops.layerNormAsync(ffnO, R, H, L.outLnW, L.outLnB, eps, h);
+    }
+
+    // Classifier head on the <s>/CLS token (row 0) of each sequence: gather
+    // those B rows contiguous, then dense -> tanh -> out_proj (batched, M=B).
+    for (std::size_t b = 0; b < B; ++b) {
+        _ops.appendMemoryCopy(clsIn + b * H, h + b * Tmax * H, H * sizeof(float));
+    }
+    _mm.matmulAsync(F32, _m.clsDenseW(), H, H, clsIn, B, cls, scratch);
+    _ops.addBiasAsync(cls, B, H, _m.clsDenseB());
+    _ops.tanhInPlaceAsync(cls, B * H);
+    _mm.matmulAsync(F32, _m.clsOutW(), nL, H, cls, B, out, scratch);
+    _ops.addBiasAsync(out, B, nL, _m.clsOutB());
+
+    _ops.flush();
+    std::vector<float> flat(B * nL);
+    _ops.readbackToHost(flat.data(), out, B * nL * sizeof(float));
+
+    std::vector<std::vector<float>> logits(B);
+    for (std::size_t b = 0; b < B; ++b) {
+        logits[b].assign(flat.begin() + static_cast<std::ptrdiff_t>(b * nL),
+                         flat.begin() + static_cast<std::ptrdiff_t>((b + 1) * nL));
+    }
     return logits;
 }
 
