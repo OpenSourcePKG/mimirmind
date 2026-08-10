@@ -33,4 +33,26 @@ void embeddingLookup(core::gguf::GgmlType                weightType,
                      std::span<const std::int32_t>  tokenIds,
                      float*                         dst);
 
+/**
+ * Additive position + token-type embeddings for the BERT/RoBERTa/XLM-R
+ * embeddings block (EncoderRunner / cross-encoder reranker). Adds, in place:
+ *
+ *   x[t, d] += posTable[(t + posOffset) * hidden + d] + typeVec[d]
+ *
+ * for the no-padding case (position_ids = t + posOffset). XLM-R uses
+ * posOffset = pad_token_id + 1 (= 2). `typeVec` is the single token-type
+ * embedding row (type_vocab_size == 1 for XLM-R) broadcast to all positions.
+ * Word embeddings (embeddingLookup) go into `x` first; LayerNorm follows.
+ *
+ *   x:        [T, hidden]      F32 row-major, in/out
+ *   posTable: [maxPos, hidden] F32 learned absolute position embeddings
+ *   typeVec:  [hidden]         F32 token-type[0]
+ */
+void encoderEmbedAdd(float*       x,
+                     const float* posTable,
+                     const float* typeVec,
+                     std::size_t  T,
+                     std::size_t  hidden,
+                     std::size_t  posOffset);
+
 } // namespace mimirmind::compute

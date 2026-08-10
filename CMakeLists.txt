@@ -776,6 +776,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/scaled_add_residual.cu
         kernels/cuda/common/gelu_mul.cu
         kernels/cuda/common/gelu_erf.cu
+        kernels/cuda/common/encoder_embed_add.cu
         kernels/cuda/common/silu_mul.cu
         kernels/cuda/common/x_quant_i8.cu
         kernels/cuda/common/dequant_nvfp4.cu
@@ -2553,6 +2554,8 @@ if(MIMIRMIND_ENABLE_CUDA)
         src/compute/Activations.cpp
         # CPU golden reference for the non-causal encoder MHA parity test.
         src/compute/Attention.cpp
+        # CPU golden reference for the encoder embeddings (pos+type) parity test.
+        src/compute/Embedding.cpp
         # GpuMatmul closure: CPU-fallback matmul + dequant + quant-type registry.
         src/compute/Matmul.cpp
         src/compute/Dequant.cpp

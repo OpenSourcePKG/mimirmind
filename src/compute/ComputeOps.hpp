@@ -130,6 +130,17 @@ public:
             "geluErfAsync: not supported on this backend");
     }
 
+    // Additive position + token-type embeddings for the encoder embeddings
+    // block (EncoderRunner): x[t,d] += posTable[(t+posOffset)*hidden+d] +
+    // typeVec[d]. Default-throws so only encoder-capable backends implement it.
+    virtual void encoderEmbedAddAsync(float* /*x*/, const float* /*posTable*/,
+                                      const float* /*typeVec*/,
+                                      std::size_t /*T*/, std::size_t /*hidden*/,
+                                      std::size_t /*posOffset*/) {
+        throw std::runtime_error(
+            "encoderEmbedAddAsync: not supported on this backend");
+    }
+
     virtual void mulScalarAsync(float*       y,
                                 float        s,
                                 std::size_t  n) = 0;

@@ -12,6 +12,7 @@
 
 #include "compute/Activations.hpp"
 #include "compute/Attention.hpp"
+#include "compute/Embedding.hpp"
 #include "compute/GatedDeltaNet.hpp"
 #include "compute/Norm.hpp"
 #include "compute/Rope.hpp"
@@ -252,6 +253,35 @@ TEST(cuda_attention_encoder_parity) {
 
     for (std::size_t i = 0; i < got.size(); ++i) {
         EXPECT_NEAR(got[i], ref[i], 1e-3f);
+    }
+}
+
+TEST(cuda_encoder_embed_add_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    // XLM-R hidden = 1024; posOffset 2 (pad_token_id 1). Additive pos+type.
+    const std::size_t T = 12, hidden = 1024, posOffset = 2, maxPos = 64;
+    auto x   = randVec(T * hidden, 0x71a1u);
+    auto pos = randVec(maxPos * hidden, 0x72b2u);
+    auto typ = randVec(hidden, 0x73c3u);
+
+    std::vector<float> ref = x;
+    ::mimirmind::compute::encoderEmbedAdd(ref.data(), pos.data(), typ.data(),
+                                          T, hidden, posOffset);
+
+    auto dx  = toDevice(ops, x);
+    auto dp  = toDevice(ops, pos);
+    auto dt  = toDevice(ops, typ);
+    ops.encoderEmbedAddAsync(static_cast<float*>(dx.get()),
+                             static_cast<const float*>(dp.get()),
+                             static_cast<const float*>(dt.get()),
+                             T, hidden, posOffset);
+    ops.flush();
+    auto got = fromDevice(ops, dx.get(), T * hidden);
+
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], ref[i], 1e-4f);
     }
 }
 

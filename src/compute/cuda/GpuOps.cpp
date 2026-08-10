@@ -154,6 +154,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _geluMulKernel;
     core::cuda::CudaModule _geluErfModule;
     core::cuda::CudaKernel _geluErfKernel;
+    core::cuda::CudaModule _encoderEmbedAddModule;
+    core::cuda::CudaKernel _encoderEmbedAddKernel;
     core::cuda::CudaModule _mulScalarModule;
     core::cuda::CudaKernel _mulScalarKernel;
     core::cuda::CudaModule _scaledAddResidualModule;
@@ -347,6 +349,8 @@ struct GpuOps::Impl {
           _geluMulKernel           {_geluMulModule.getFunction("gelu_mul")},
           _geluErfModule           {loadCudaModule(ctx, "gelu_erf")},
           _geluErfKernel           {_geluErfModule.getFunction("gelu_erf")},
+          _encoderEmbedAddModule   {loadCudaModule(ctx, "encoder_embed_add")},
+          _encoderEmbedAddKernel   {_encoderEmbedAddModule.getFunction("encoder_embed_add")},
           _mulScalarModule         {loadCudaModule(ctx, "mul_scalar")},
           _mulScalarKernel         {_mulScalarModule.getFunction("mul_scalar")},
           _scaledAddResidualModule {loadCudaModule(ctx, "scaled_add_residual")},
@@ -1070,6 +1074,25 @@ void GpuOps::geluErfAsync(float* x, std::size_t n) {
     k.setValue(1, ni);
     k.launch(_ctx.stream(),
              groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::encoderEmbedAddAsync(float* x, const float* posTable,
+                                  const float* typeVec, std::size_t T,
+                                  std::size_t hidden, std::size_t posOffset) {
+    const std::size_t total = T * hidden;
+    if (total == 0) {
+        return;
+    }
+    auto& k = _pimpl->_encoderEmbedAddKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, posTable);
+    k.setPtr  (2, typeVec);
+    k.setValue(3, toInt32(T,         "encEmbed T"));
+    k.setValue(4, toInt32(hidden,    "encEmbed hidden"));
+    k.setValue(5, toInt32(posOffset, "encEmbed posOffset"));
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize), 1, 1,
              kElementwiseLocalSize, 1, 1);
 }
 

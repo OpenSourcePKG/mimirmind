@@ -72,4 +72,19 @@ void embeddingLookup(core::gguf::GgmlType                weightType,
                  core::gguf::typeInfo(weightType).name, rowBytes);
 }
 
+void encoderEmbedAdd(float*       x,
+                     const float* posTable,
+                     const float* typeVec,
+                     std::size_t  T,
+                     std::size_t  hidden,
+                     std::size_t  posOffset) {
+    for (std::size_t t = 0; t < T; ++t) {
+        const float* posRow = posTable + (t + posOffset) * hidden;
+        float*       xr     = x + t * hidden;
+        for (std::size_t d = 0; d < hidden; ++d) {
+            xr[d] += posRow[d] + typeVec[d];
+        }
+    }
+}
+
 } // namespace mimirmind::compute
