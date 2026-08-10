@@ -152,6 +152,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _siluMulKernel;
     core::cuda::CudaModule _geluMulModule;
     core::cuda::CudaKernel _geluMulKernel;
+    core::cuda::CudaModule _geluErfModule;
+    core::cuda::CudaKernel _geluErfKernel;
     core::cuda::CudaModule _mulScalarModule;
     core::cuda::CudaKernel _mulScalarKernel;
     core::cuda::CudaModule _scaledAddResidualModule;
@@ -341,6 +343,8 @@ struct GpuOps::Impl {
           _siluMulKernel           {_siluMulModule.getFunction("silu_mul")},
           _geluMulModule           {loadCudaModule(ctx, "gelu_mul")},
           _geluMulKernel           {_geluMulModule.getFunction("gelu_mul")},
+          _geluErfModule           {loadCudaModule(ctx, "gelu_erf")},
+          _geluErfKernel           {_geluErfModule.getFunction("gelu_erf")},
           _mulScalarModule         {loadCudaModule(ctx, "mul_scalar")},
           _mulScalarKernel         {_mulScalarModule.getFunction("mul_scalar")},
           _scaledAddResidualModule {loadCudaModule(ctx, "scaled_add_residual")},
@@ -1047,6 +1051,19 @@ void GpuOps::geluMulAsync(float* gate, const float* up, std::size_t n) {
     k.setPtr  (0, gate);
     k.setPtr  (1, up);
     k.setValue(2, ni);
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::geluErfAsync(float* x, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "geluErf n");
+    auto& k = _pimpl->_geluErfKernel;
+    k.setPtr  (0, x);
+    k.setValue(1, ni);
     k.launch(_ctx.stream(),
              groupsForN(n, kElementwiseLocalSize), 1, 1,
              kElementwiseLocalSize, 1, 1);

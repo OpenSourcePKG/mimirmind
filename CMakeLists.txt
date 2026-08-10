@@ -774,6 +774,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/rope_inplace_ff.cu
         kernels/cuda/common/scaled_add_residual.cu
         kernels/cuda/common/gelu_mul.cu
+        kernels/cuda/common/gelu_erf.cu
         kernels/cuda/common/silu_mul.cu
         kernels/cuda/common/x_quant_i8.cu
         kernels/cuda/common/dequant_nvfp4.cu
@@ -2547,6 +2548,8 @@ if(MIMIRMIND_ENABLE_CUDA)
         src/compute/Rope.cpp
         # CPU golden reference for the LayerNorm (EncoderRunner) parity test.
         src/compute/Norm.cpp
+        # CPU golden reference for the erf-GELU (EncoderRunner) parity test.
+        src/compute/Activations.cpp
         # GpuMatmul closure: CPU-fallback matmul + dequant + quant-type registry.
         src/compute/Matmul.cpp
         src/compute/Dequant.cpp

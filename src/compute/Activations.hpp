@@ -16,4 +16,11 @@ void siluInPlace(float* x, std::size_t n) noexcept;
 /// Used as the "* up" half of SwiGLU after silu(gate).
 void mulInPlace(float* a, const float* b, std::size_t n) noexcept;
 
+/// In-place exact (erf) GELU — PyTorch/HF nn.GELU default, as BERT /
+/// RoBERTa / XLM-R use it in the encoder FFN (the EncoderRunner /
+/// cross-encoder reranker path):
+///   x[i] = 0.5 * x[i] * (1 + erf(x[i] / sqrt(2)))
+/// Distinct from the tanh-approximation GELU in gelu_mul (Gemma FFN).
+void geluErfInPlace(float* x, std::size_t n) noexcept;
+
 } // namespace mimirmind::compute

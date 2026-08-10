@@ -122,6 +122,14 @@ public:
                               const float* up,
                               std::size_t  n) = 0;
 
+    // In-place exact (erf) GELU for the BERT/RoBERTa/XLM-R encoder FFN
+    // (EncoderRunner / cross-encoder reranker). Default-throws so only
+    // encoder-capable backends implement it.
+    virtual void geluErfAsync(float* /*x*/, std::size_t /*n*/) {
+        throw std::runtime_error(
+            "geluErfAsync: not supported on this backend");
+    }
+
     virtual void mulScalarAsync(float*       y,
                                 float        s,
                                 std::size_t  n) = 0;

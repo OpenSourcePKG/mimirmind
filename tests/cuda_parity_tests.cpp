@@ -10,6 +10,7 @@
 
 #include "TestFramework.hpp"
 
+#include "compute/Activations.hpp"
 #include "compute/GatedDeltaNet.hpp"
 #include "compute/Norm.hpp"
 #include "compute/Rope.hpp"
@@ -193,6 +194,27 @@ TEST(cuda_layernorm_parity) {
 
     for (std::size_t i = 0; i < got.size(); ++i) {
         EXPECT_NEAR(got[i], ref[i], 1e-3f);
+    }
+}
+
+TEST(cuda_gelu_erf_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    // XLM-R FFN width = 4096; a few rows. erf-GELU (EncoderRunner FFN).
+    const std::size_t n = 4096 * 3;
+    auto host = randVec(n, 0x9e3u);
+
+    std::vector<float> ref = host;
+    ::mimirmind::compute::geluErfInPlace(ref.data(), n);
+
+    auto buf = toDevice(ops, host);
+    ops.geluErfAsync(static_cast<float*>(buf.get()), n);
+    ops.flush();
+    auto got = fromDevice(ops, buf.get(), n);
+
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], ref[i], 1e-4f);
     }
 }
 
