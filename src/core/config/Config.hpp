@@ -53,6 +53,20 @@ enum class ModelFormat { Auto, Gguf, Nvfp4 };
 [[nodiscard]] std::string_view modelFormatName(ModelFormat f) noexcept;
 
 /**
+ * What a model entry serves. `Chat` = the autoregressive decoder behind
+ * /v1/chat/completions (the default). `Rerank` = a bidirectional cross-encoder
+ * (EncoderRunner) behind /v1/rerank — no KV cache, no sampler, one score per
+ * (query, document) pair.
+ */
+enum class ModelTask { Chat, Rerank };
+
+/// Parse a `task` string ("chat"|"rerank") or return nullopt.
+[[nodiscard]] std::optional<ModelTask> modelTaskFromString(std::string_view s) noexcept;
+
+/// Canonical lower-case name for a task ("chat"|"rerank").
+[[nodiscard]] std::string_view modelTaskName(ModelTask t) noexcept;
+
+/**
  * One loadable model entry. Multiple entries with `loadOnStart:true` are
  * allowed — main() constructs one InferenceEngine per entry, and the
  * chat/completions dispatch routes on the request's `model` field.
@@ -63,6 +77,10 @@ struct ModelEntry {
                                          // Falls back to `id` in /v1/models when empty.
     std::string       path{};            // GGUF file, or NVFP4 checkpoint directory
     ModelFormat       format{ModelFormat::Auto};
+    // What this entry serves: chat (default, decoder) or rerank (cross-encoder).
+    // A rerank entry loads a dense F32 XLM-R safetensors dir (EncoderModel) and
+    // is exposed under /v1/rerank instead of /v1/chat/completions.
+    ModelTask         task{ModelTask::Chat};
     // For `format: nvfp4`: path to a GGUF whose tokenizer to reuse (the NVFP4
     // checkpoint ships only an HF tokenizer.json, which we don't parse yet).
     // Ignored for GGUF models (their tokenizer comes from the file itself).

@@ -207,6 +207,20 @@ std::string_view modelFormatName(ModelFormat f) noexcept {
     }
 }
 
+std::optional<ModelTask> modelTaskFromString(std::string_view s) noexcept {
+    if (s == "chat")   return ModelTask::Chat;
+    if (s == "rerank") return ModelTask::Rerank;
+    return std::nullopt;
+}
+
+std::string_view modelTaskName(ModelTask t) noexcept {
+    switch (t) {
+        case ModelTask::Rerank: return "rerank";
+        case ModelTask::Chat:
+        default:                return "chat";
+    }
+}
+
 ModelEntry parseModel(std::string_view      path,
                       const nlohmann::json& j,
                       std::size_t           index) {
@@ -218,7 +232,7 @@ ModelEntry parseModel(std::string_view      path,
     }
     checkKnownKeys(path, section, j,
                    {"id", "title", "path", "format", "tokenizerGguf",
-                    "loadOnStart", "runtime", "backend"});
+                    "loadOnStart", "runtime", "backend", "task"});
 
     ModelEntry m{};
     if (!j.contains("id") || !j["id"].is_string() || j["id"].get<std::string>().empty()) {
@@ -241,6 +255,13 @@ ModelEntry parseModel(std::string_view      path,
     }
     if (const auto v = readOpt<std::string>(path, section, j, "tokenizerGguf"); v.has_value()) {
         m.tokenizerGguf = *v;
+    }
+    if (const auto v = readOpt<std::string>(path, section, j, "task"); v.has_value()) {
+        const auto t = modelTaskFromString(*v);
+        if (!t.has_value()) {
+            fail(path, section + ".task must be one of \"chat\", \"rerank\"");
+        }
+        m.task = *t;
     }
     if (const auto v = readOpt<bool>(path, section, j, "loadOnStart"); v.has_value()) {
         m.loadOnStart = *v;
