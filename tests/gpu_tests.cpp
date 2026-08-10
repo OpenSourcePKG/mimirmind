@@ -18,6 +18,7 @@
 
 #include "compute/Activations.hpp"
 #include "compute/Attention.hpp"
+#include "compute/Embedding.hpp"
 #include "compute/GatedDeltaNet.hpp"
 #include "compute/l0/GpuMatmul.hpp"
 #include "compute/l0/GpuOps.hpp"
@@ -198,6 +199,137 @@ TEST(rmsnorm_multiRow) {
 
     EXPECT_ARRAY_NEAR("rmsnorm_multiRow", bufY.as<float>(), cpu.data(),
                       M * K, 5e-5F);
+}
+
+// =======================================================================
+// Encoder ops (cross-encoder reranker / EncoderRunner) — parity vs the
+// CPU references, mirroring the CUDA encoder parity tests.
+// =======================================================================
+
+TEST(layernorm_basic) {
+    constexpr std::size_t M = 4;
+    constexpr std::size_t K = 1024;
+    constexpr float eps     = 1e-5F;
+
+    const auto x = generateFloats(M * K, 0xE1);
+    const auto w = generateFloats(K, 0xE2);
+    const auto b = generateFloats(K, 0xE3);
+
+    UsmBuf bufX(M * K * sizeof(float));
+    UsmBuf bufW(K * sizeof(float));
+    UsmBuf bufB(K * sizeof(float));
+    UsmBuf bufY(M * K * sizeof(float));
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+    std::memcpy(bufW.raw(), w.data(), w.size() * sizeof(float));
+    std::memcpy(bufB.raw(), b.data(), b.size() * sizeof(float));
+
+    fx().ops.layerNormAsync(bufX.as<float>(), M, K, bufW.as<float>(),
+                            bufB.as<float>(), eps, bufY.as<float>());
+    fx().queue.flush();
+
+    std::vector<float> cpu(M * K);
+    mimirmind::compute::layerNorm(x.data(), M, K, w.data(), b.data(), eps,
+                                  cpu.data());
+
+    EXPECT_ARRAY_NEAR("layernorm_basic", bufY.as<float>(), cpu.data(),
+                      M * K, 5e-5F);
+}
+
+TEST(gelu_erf_basic) {
+    constexpr std::size_t n = 4096;
+    const auto x = generateFloats(n, 0xE4);
+
+    UsmBuf bufX(n * sizeof(float));
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+
+    fx().ops.geluErfAsync(bufX.as<float>(), n);
+    fx().queue.flush();
+
+    std::vector<float> cpu = x;
+    mimirmind::compute::geluErfInPlace(cpu.data(), n);
+
+    EXPECT_ARRAY_NEAR("gelu_erf_basic", bufX.as<float>(), cpu.data(), n, 1e-5F);
+}
+
+TEST(tanh_inplace_basic) {
+    constexpr std::size_t n = 3072;
+    const auto x = generateFloats(n, 0xE5);
+
+    UsmBuf bufX(n * sizeof(float));
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+
+    fx().ops.tanhInPlaceAsync(bufX.as<float>(), n);
+    fx().queue.flush();
+
+    std::vector<float> cpu = x;
+    mimirmind::compute::tanhInPlace(cpu.data(), n);
+
+    EXPECT_ARRAY_NEAR("tanh_inplace_basic", bufX.as<float>(), cpu.data(), n, 1e-5F);
+}
+
+TEST(encoder_embed_add_basic) {
+    constexpr std::size_t T = 12;
+    constexpr std::size_t H = 256;
+    constexpr std::size_t posOffset = 2;
+    constexpr std::size_t maxPos    = 64;
+
+    const auto x   = generateFloats(T * H, 0xE7);
+    const auto pos = generateFloats(maxPos * H, 0xE8);
+    const auto tv  = generateFloats(H, 0xE9);
+
+    UsmBuf bufX(T * H * sizeof(float));
+    UsmBuf bufP(maxPos * H * sizeof(float));
+    UsmBuf bufT(H * sizeof(float));
+    std::memcpy(bufX.raw(), x.data(), x.size() * sizeof(float));
+    std::memcpy(bufP.raw(), pos.data(), pos.size() * sizeof(float));
+    std::memcpy(bufT.raw(), tv.data(), tv.size() * sizeof(float));
+
+    fx().ops.encoderEmbedAddAsync(bufX.as<float>(), bufP.as<float>(),
+                                  bufT.as<float>(), T, H, posOffset);
+    fx().queue.flush();
+
+    std::vector<float> cpu = x;
+    mimirmind::compute::encoderEmbedAdd(cpu.data(), pos.data(), tv.data(),
+                                        T, H, posOffset);
+
+    EXPECT_ARRAY_NEAR("encoder_embed_add_basic", bufX.as<float>(), cpu.data(),
+                      T * H, 1e-5F);
+}
+
+TEST(attention_encoder_basic) {
+    constexpr std::size_t T = 12;
+    constexpr std::size_t nHeads = 4;
+    constexpr std::size_t headDim = 16;
+    const float scale = 1.0F / std::sqrt(static_cast<float>(headDim));
+    const std::size_t elems = T * nHeads * headDim;
+
+    const auto q = generateFloats(elems, 0xEA);
+    const auto k = generateFloats(elems, 0xEB);
+    const auto v = generateFloats(elems, 0xEC);
+
+    UsmBuf bufQ(elems * sizeof(float));
+    UsmBuf bufK(elems * sizeof(float));
+    UsmBuf bufV(elems * sizeof(float));
+    UsmBuf bufO(elems * sizeof(float));
+    std::memcpy(bufQ.raw(), q.data(), q.size() * sizeof(float));
+    std::memcpy(bufK.raw(), k.data(), k.size() * sizeof(float));
+    std::memcpy(bufV.raw(), v.data(), v.size() * sizeof(float));
+
+    fx().ops.attentionEncoderAsync(bufQ.as<float>(), bufK.as<float>(),
+                                   bufV.as<float>(), T, nHeads, nHeads,
+                                   headDim, scale, bufO.as<float>());
+    fx().queue.flush();
+
+    // positionOffset == T lets the causal ref clamp to the full range.
+    std::vector<float> cpu(elems);
+    std::vector<float> scratch(T);
+    mimirmind::compute::multiHeadAttention(
+        q.data(), k.data(), v.data(), T, T, nHeads, nHeads, headDim,
+        /*positionOffset=*/T, scratch.data(), cpu.data(),
+        /*slidingWindow=*/0, scale);
+
+    EXPECT_ARRAY_NEAR("attention_encoder_basic", bufO.as<float>(), cpu.data(),
+                      elems, 5e-4F);
 }
 
 // (1+w)·norm Gemma variant: rewrite weight as (1+w), call standard rmsNorm

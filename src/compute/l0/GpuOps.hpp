@@ -303,6 +303,38 @@ public:
                       const float* up,
                       std::size_t  n) override;
 
+    // ---- Encoder ops (cross-encoder reranker / EncoderRunner) ----------
+    // BERT/RoBERTa/XLM-R primitives, mirroring the CUDA overrides. Shared
+    // by the runner across CUDA and L0 through the abstract ComputeOps.
+    void layerNormAsync(const float* x,
+                        std::size_t  M,
+                        std::size_t  K,
+                        const float* weight,
+                        const float* bias,
+                        float        eps,
+                        float*       y) override;
+
+    void geluErfAsync(float* x, std::size_t n) override;
+
+    void tanhInPlaceAsync(float* x, std::size_t n) override;
+
+    void encoderEmbedAddAsync(float*       x,
+                              const float* posTable,
+                              const float* typeVec,
+                              std::size_t  T,
+                              std::size_t  hidden,
+                              std::size_t  posOffset) override;
+
+    void attentionEncoderAsync(const float* q,
+                               const float* k,
+                               const float* v,
+                               std::size_t  T,
+                               std::size_t  nHeads,
+                               std::size_t  nKvHeads,
+                               std::size_t  headDim,
+                               float        scale,
+                               float*       out) override;
+
     /// Fused scaled accumulate: dst[i] += scale * src[i]. Replaces a
     /// mulScalarAsync(src, scale) + addResidualAsync(dst, src) pair
     /// where the intermediate scaled src is not read elsewhere. Used by

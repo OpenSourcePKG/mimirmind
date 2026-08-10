@@ -228,6 +228,11 @@ set(KERNEL_SOURCES
     kernels/cl/llm/gather_heads_from_channels.cl
     kernels/cl/common/mul_scalar.cl
     kernels/cl/common/gelu_mul.cl
+    kernels/cl/common/layernorm.cl
+    kernels/cl/common/gelu_erf.cl
+    kernels/cl/common/tanh_inplace.cl
+    kernels/cl/common/encoder_embed_add.cl
+    kernels/cl/llm/attention_encoder.cl
     kernels/cl/common/rmsnorm_gemma.cl
     kernels/cl/common/rmsnorm_no_weight.cl
     kernels/cl/llm/rmsnorm_qkv.cl

@@ -1,6 +1,9 @@
 build/
 build-*/
 out/
+.claude/
+scratchpad/
+node_modules/
 .cache/
 .vscode/
 .idea/

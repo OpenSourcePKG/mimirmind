@@ -73,6 +73,17 @@ struct GpuOps::Impl {
     runtime::GpuKernel     _mulScalarKernel;
     runtime::GpuModule     _geluMulModule;
     runtime::GpuKernel     _geluMulKernel;
+    // Encoder ops (cross-encoder reranker / EncoderRunner).
+    runtime::GpuModule     _layernormModule;
+    runtime::GpuKernel     _layernormKernel;
+    runtime::GpuModule     _geluErfModule;
+    runtime::GpuKernel     _geluErfKernel;
+    runtime::GpuModule     _tanhInplaceModule;
+    runtime::GpuKernel     _tanhInplaceKernel;
+    runtime::GpuModule     _encoderEmbedAddModule;
+    runtime::GpuKernel     _encoderEmbedAddKernel;
+    runtime::GpuModule     _attentionEncoderModule;
+    runtime::GpuKernel     _attentionEncoderKernel;
     runtime::GpuModule     _rmsnormGemmaModule;
     runtime::GpuKernel     _rmsnormGemmaKernel;
     runtime::GpuModule     _rmsnormNoWeightModule;
@@ -162,6 +173,16 @@ struct GpuOps::Impl {
           _mulScalarKernel  {_mulScalarModule.kernel("mul_scalar")},
           _geluMulModule    {ctx, "gelu_mul"},
           _geluMulKernel    {_geluMulModule.kernel("gelu_mul")},
+          _layernormModule  {ctx, "layernorm"},
+          _layernormKernel  {_layernormModule.kernel("layernorm")},
+          _geluErfModule    {ctx, "gelu_erf"},
+          _geluErfKernel    {_geluErfModule.kernel("gelu_erf")},
+          _tanhInplaceModule{ctx, "tanh_inplace"},
+          _tanhInplaceKernel{_tanhInplaceModule.kernel("tanh_inplace")},
+          _encoderEmbedAddModule{ctx, "encoder_embed_add"},
+          _encoderEmbedAddKernel{_encoderEmbedAddModule.kernel("encoder_embed_add")},
+          _attentionEncoderModule{ctx, "attention_encoder"},
+          _attentionEncoderKernel{_attentionEncoderModule.kernel("attention_encoder")},
           _rmsnormGemmaModule{ctx, "rmsnorm_gemma"},
           _rmsnormGemmaKernel{_rmsnormGemmaModule.kernel("rmsnorm_gemma")},
           _rmsnormNoWeightModule{ctx, "rmsnorm_no_weight"},
@@ -677,6 +698,110 @@ void GpuOps::geluMulAsync(float*       gate,
     _pimpl->_geluMulKernel.setGroupSize(kElementwiseLocalSize, 1, 1);
     _queue.appendLaunch(_pimpl->_geluMulKernel,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
+}
+
+// ---- Encoder ops (cross-encoder reranker / EncoderRunner) --------------
+
+void GpuOps::layerNormAsync(const float* x,
+                            std::size_t  M,
+                            std::size_t  K,
+                            const float* weight,
+                            const float* bias,
+                            float        eps,
+                            float*       y) {
+    if (M == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t Ki = toInt32(K, "layerNorm K");
+    auto& kern = _pimpl->_layernormKernel;
+    kern.setPtr(0, x);
+    kern.setPtr(1, weight);
+    kern.setPtr(2, bias);
+    kern.setPtr(3, y);
+    kern.setValue<float>(4, eps);
+    kern.setValue<std::int32_t>(5, Ki);
+    kern.setGroupSize(kRmsnormLocalSize, 1, 1);
+    // One workgroup per row.
+    _queue.appendLaunch(kern, static_cast<std::uint32_t>(M), 1, 1);
+}
+
+void GpuOps::geluErfAsync(float* x, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "geluErf n");
+    auto& kern = _pimpl->_geluErfKernel;
+    kern.setPtr(0, x);
+    kern.setValue<std::int32_t>(1, ni);
+    kern.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(kern, groupsForN(n, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::tanhInPlaceAsync(float* x, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "tanhInPlace n");
+    auto& kern = _pimpl->_tanhInplaceKernel;
+    kern.setPtr(0, x);
+    kern.setValue<std::int32_t>(1, ni);
+    kern.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(kern, groupsForN(n, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::encoderEmbedAddAsync(float*       x,
+                                  const float* posTable,
+                                  const float* typeVec,
+                                  std::size_t  T,
+                                  std::size_t  hidden,
+                                  std::size_t  posOffset) {
+    if (T == 0 || hidden == 0) {
+        return;
+    }
+    auto& kern = _pimpl->_encoderEmbedAddKernel;
+    kern.setPtr(0, x);
+    kern.setPtr(1, posTable);
+    kern.setPtr(2, typeVec);
+    kern.setValue<std::int32_t>(3, toInt32(T,         "encoderEmbedAdd T"));
+    kern.setValue<std::int32_t>(4, toInt32(hidden,    "encoderEmbedAdd hidden"));
+    kern.setValue<std::int32_t>(5, toInt32(posOffset, "encoderEmbedAdd posOffset"));
+    kern.setGroupSize(kElementwiseLocalSize, 1, 1);
+    _queue.appendLaunch(kern, groupsForN(T * hidden, kElementwiseLocalSize), 1, 1);
+}
+
+void GpuOps::attentionEncoderAsync(const float* q,
+                                   const float* k,
+                                   const float* v,
+                                   std::size_t  T,
+                                   std::size_t  nHeads,
+                                   std::size_t  nKvHeads,
+                                   std::size_t  headDim,
+                                   float        scale,
+                                   float*       out) {
+    if (T == 0 || nHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (T > kAttentionMaxTk) {
+        throw std::runtime_error(
+            "GpuOps::attentionEncoderAsync: T=" + std::to_string(T) +
+            " exceeds ATTN_ENC_MAX_TK=" + std::to_string(kAttentionMaxTk) +
+            " (scores[] SLM bound in kernels/cl/llm/attention_encoder.cl)");
+    }
+    auto& kern = _pimpl->_attentionEncoderKernel;
+    kern.setPtr(0, q);
+    kern.setPtr(1, k);
+    kern.setPtr(2, v);
+    kern.setPtr(3, out);
+    kern.setValue<std::int32_t>(4, toInt32(T,        "attnEnc T"));
+    kern.setValue<std::int32_t>(5, toInt32(nHeads,   "attnEnc nHeads"));
+    kern.setValue<std::int32_t>(6, toInt32(nKvHeads, "attnEnc nKvHeads"));
+    kern.setValue<std::int32_t>(7, toInt32(headDim,  "attnEnc headDim"));
+    kern.setValue<float>(8, scale);
+    kern.setGroupSize(kAttentionLocalSize, 1, 1);
+    // One workgroup per (head, query-position).
+    _queue.appendLaunch(kern,
+                        static_cast<std::uint32_t>(nHeads),
+                        static_cast<std::uint32_t>(T), 1);
 }
 
 void GpuOps::ropeInPlaceAsync(void*            xBase,
