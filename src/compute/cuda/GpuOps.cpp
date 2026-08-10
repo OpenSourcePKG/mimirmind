@@ -156,6 +156,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _geluErfKernel;
     core::cuda::CudaModule _encoderEmbedAddModule;
     core::cuda::CudaKernel _encoderEmbedAddKernel;
+    core::cuda::CudaModule _tanhModule;
+    core::cuda::CudaKernel _tanhKernel;
     core::cuda::CudaModule _mulScalarModule;
     core::cuda::CudaKernel _mulScalarKernel;
     core::cuda::CudaModule _scaledAddResidualModule;
@@ -351,6 +353,8 @@ struct GpuOps::Impl {
           _geluErfKernel           {_geluErfModule.getFunction("gelu_erf")},
           _encoderEmbedAddModule   {loadCudaModule(ctx, "encoder_embed_add")},
           _encoderEmbedAddKernel   {_encoderEmbedAddModule.getFunction("encoder_embed_add")},
+          _tanhModule              {loadCudaModule(ctx, "tanh_inplace")},
+          _tanhKernel              {_tanhModule.getFunction("tanh_inplace")},
           _mulScalarModule         {loadCudaModule(ctx, "mul_scalar")},
           _mulScalarKernel         {_mulScalarModule.getFunction("mul_scalar")},
           _scaledAddResidualModule {loadCudaModule(ctx, "scaled_add_residual")},
@@ -1070,6 +1074,19 @@ void GpuOps::geluErfAsync(float* x, std::size_t n) {
     }
     const std::int32_t ni = toInt32(n, "geluErf n");
     auto& k = _pimpl->_geluErfKernel;
+    k.setPtr  (0, x);
+    k.setValue(1, ni);
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::tanhInPlaceAsync(float* x, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "tanh n");
+    auto& k = _pimpl->_tanhKernel;
     k.setPtr  (0, x);
     k.setValue(1, ni);
     k.launch(_ctx.stream(),

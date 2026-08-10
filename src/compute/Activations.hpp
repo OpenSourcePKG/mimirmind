@@ -23,4 +23,9 @@ void mulInPlace(float* a, const float* b, std::size_t n) noexcept;
 /// Distinct from the tanh-approximation GELU in gelu_mul (Gemma FFN).
 void geluErfInPlace(float* x, std::size_t n) noexcept;
 
+/// In-place tanh: x[i] = tanh(x[i]). The activation in the RoBERTa/XLM-R
+/// sequence-classification head (dense -> tanh -> out_proj) used by the
+/// cross-encoder reranker (EncoderRunner).
+void tanhInPlace(float* x, std::size_t n) noexcept;
+
 } // namespace mimirmind::compute

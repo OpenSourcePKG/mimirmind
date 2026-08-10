@@ -130,6 +130,13 @@ public:
             "geluErfAsync: not supported on this backend");
     }
 
+    // In-place tanh — RoBERTa/XLM-R classifier head activation (EncoderRunner
+    // reranker: dense -> tanh -> out_proj). Default-throws (encoder-only).
+    virtual void tanhInPlaceAsync(float* /*x*/, std::size_t /*n*/) {
+        throw std::runtime_error(
+            "tanhInPlaceAsync: not supported on this backend");
+    }
+
     // Additive position + token-type embeddings for the encoder embeddings
     // block (EncoderRunner): x[t,d] += posTable[(t+posOffset)*hidden+d] +
     // typeVec[d]. Default-throws so only encoder-capable backends implement it.

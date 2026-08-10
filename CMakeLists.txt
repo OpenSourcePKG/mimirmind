@@ -777,6 +777,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/gelu_mul.cu
         kernels/cuda/common/gelu_erf.cu
         kernels/cuda/common/encoder_embed_add.cu
+        kernels/cuda/common/tanh_inplace.cu
         kernels/cuda/common/silu_mul.cu
         kernels/cuda/common/x_quant_i8.cu
         kernels/cuda/common/dequant_nvfp4.cu

@@ -285,6 +285,27 @@ TEST(cuda_encoder_embed_add_parity) {
     }
 }
 
+TEST(cuda_tanh_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    // RoBERTa/XLM-R classifier-head activation (dense -> tanh -> out_proj).
+    const std::size_t n = 1024 * 3;
+    auto host = randVec(n, 0x7a11u);
+
+    std::vector<float> ref = host;
+    ::mimirmind::compute::tanhInPlace(ref.data(), n);
+
+    auto buf = toDevice(ops, host);
+    ops.tanhInPlaceAsync(static_cast<float*>(buf.get()), n);
+    ops.flush();
+    auto got = fromDevice(ops, buf.get(), n);
+
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], ref[i], 1e-5f);
+    }
+}
+
 TEST(cuda_ssm_conv1d_parity) {
     CudaComputeContext ctx{};
     GpuOps ops{ctx};

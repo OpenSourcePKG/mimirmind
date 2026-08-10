@@ -109,6 +109,8 @@ public:
 
     void geluErfAsync(float* x, std::size_t n) override;
 
+    void tanhInPlaceAsync(float* x, std::size_t n) override;
+
     void encoderEmbedAddAsync(float* x, const float* posTable,
                               const float* typeVec, std::size_t T,
                               std::size_t hidden, std::size_t posOffset) override;

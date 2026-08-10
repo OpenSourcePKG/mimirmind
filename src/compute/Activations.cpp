@@ -16,6 +16,12 @@ void geluErfInPlace(float* x, std::size_t n) noexcept {
     }
 }
 
+void tanhInPlace(float* x, std::size_t n) noexcept {
+    for (std::size_t i = 0; i < n; ++i) {
+        x[i] = std::tanh(x[i]);
+    }
+}
+
 void siluInPlace(float* x, std::size_t n) noexcept {
     for (std::size_t i = 0; i < n; ++i) {
         const float v = x[i];
