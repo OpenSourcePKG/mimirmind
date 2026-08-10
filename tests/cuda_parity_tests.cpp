@@ -38,7 +38,9 @@
 #include <cstring>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1042,7 +1044,177 @@ double relL2LargeM(GpuOps& ops, GpuMatmul& gmm, bool tc,
     std::printf("    (maxAbsErr=%.4f  maxRelErr=%.4f)\n", maxAbs, maxRel);
     return (den > 0.0) ? std::sqrt(num / den) : std::sqrt(num);
 }
+
+// ---- Encoder layer-0 parity (Phase 0b integration) ----------------------
+// Composes the five encoder primitives (encoderEmbedAdd, layerNorm,
+// non-causal attention, erf-GELU) plus the trusted matmul/addBias/residual
+// path into the real XLM-R (bge-reranker-v2-m3) embeddings block + first
+// transformer layer, and checks it bit-close against a HF reference dumped
+// to a flat fixture (scratchpad/encoder_oracle.bin). This validates the
+// KERNEL COMPOSITION with real weights — the last de-risk before wiring the
+// full 24-layer EncoderRunner (which the GGUF loader + tokenizer feed).
+struct OracleRec {
+    std::vector<int>            dims;
+    std::vector<float>          f;   // dtype 0
+    std::vector<std::int32_t>   i;   // dtype 1
+    std::size_t count() const {
+        std::size_t n = 1;
+        for (int d : dims) n *= static_cast<std::size_t>(d);
+        return n;
+    }
+};
+using OracleMap = std::map<std::string, OracleRec>;
+
+bool readOracle(const std::string& path, OracleMap& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    auto rd = [&](std::int32_t& v) {
+        in.read(reinterpret_cast<char*>(&v), sizeof(v));
+    };
+    std::int32_t count = 0;
+    rd(count);
+    for (std::int32_t r = 0; r < count; ++r) {
+        std::int32_t nameLen = 0;
+        rd(nameLen);
+        std::string name(static_cast<std::size_t>(nameLen), '\0');
+        in.read(name.data(), nameLen);
+        std::int32_t dtype = 0, ndim = 0;
+        rd(dtype);
+        rd(ndim);
+        OracleRec rec;
+        std::size_t n = 1;
+        for (int d = 0; d < ndim; ++d) {
+            std::int32_t s = 0;
+            rd(s);
+            rec.dims.push_back(s);
+            n *= static_cast<std::size_t>(s);
+        }
+        if (dtype == 1) {
+            rec.i.resize(n);
+            in.read(reinterpret_cast<char*>(rec.i.data()),
+                    static_cast<std::streamsize>(n * sizeof(std::int32_t)));
+        } else {
+            rec.f.resize(n);
+            in.read(reinterpret_cast<char*>(rec.f.data()),
+                    static_cast<std::streamsize>(n * sizeof(float)));
+        }
+        out.emplace(std::move(name), std::move(rec));
+    }
+    return static_cast<bool>(in);
+}
 } // namespace
+
+TEST(cuda_encoder_layer0_parity) {
+    const char* envp = std::getenv("MIMIRMIND_ENCODER_ORACLE");
+    const std::string path = envp ? envp : "scratchpad/encoder_oracle.bin";
+    OracleMap O;
+    if (!readOracle(path, O)) {
+        std::printf("[SKIP] encoder oracle fixture not found at %s\n",
+                    path.c_str());
+        return;
+    }
+
+    CudaComputeContext ctx{};
+    GpuOps    ops{ctx};
+    GpuMatmul gmm{ctx, ops};
+    const auto F32 = GgmlType::F32;
+
+    // XLM-R-large (bge-reranker-v2-m3) shape.
+    const std::size_t T   = static_cast<std::size_t>(O.at("word_emb").dims[0]);
+    const std::size_t H   = 1024;
+    const std::size_t hds = 16;    // heads
+    const std::size_t hd  = 64;    // head dim
+    const std::size_t ffn = 4096;
+    const float eps       = 1e-5f;
+    const float scale     = 1.0f / std::sqrt(static_cast<float>(hd));
+    const std::size_t posOffset = 2;   // pad_token_id(1) + 1
+
+    auto W = [&](const char* k) { return toDevice(ops, O.at(k).f); };
+    auto dPos    = W("pos_table");
+    auto dType   = W("type_vec");
+    auto dEmbLnW = W("emb_ln_w");
+    auto dEmbLnB = W("emb_ln_b");
+    auto dQw = W("q_w"),  dQb = W("q_b");
+    auto dKw = W("k_w"),  dKb = W("k_b");
+    auto dVw = W("v_w"),  dVb = W("v_b");
+    auto dAoW = W("ao_w"), dAoB = W("ao_b");
+    auto dAoLnW = W("ao_ln_w"), dAoLnB = W("ao_ln_b");
+    auto dFiW = W("fi_w"), dFiB = W("fi_b");
+    auto dFoW = W("fo_w"), dFoB = W("fo_b");
+    auto dOutLnW = W("out_ln_w"), dOutLnB = W("out_ln_b");
+
+    auto ptr = [](auto& b) { return static_cast<float*>(b.get()); };
+    auto cptr = [](auto& b) { return static_cast<const float*>(b.get()); };
+
+    auto scratch = ops.allocate(T * ffn * sizeof(float));
+
+    // ---- embeddings block: word + pos + type, then LayerNorm ----
+    auto x = toDevice(ops, O.at("word_emb").f);   // [T,H] starts at word emb
+    ops.encoderEmbedAddAsync(ptr(x), cptr(dPos), cptr(dType), T, H, posOffset);
+    auto embOut = ops.allocate(T * H * sizeof(float));
+    ops.layerNormAsync(ptr(x), T, H, cptr(dEmbLnW), cptr(dEmbLnB), eps,
+                       ptr(embOut));
+    ops.flush();
+
+    auto cmp = [&](const char* tag, const std::vector<float>& got,
+                   const std::vector<float>& ref, float tol) {
+        double mx = 0.0;
+        std::size_t at = 0;
+        for (std::size_t k = 0; k < got.size(); ++k) {
+            const double e = std::fabs(static_cast<double>(got[k]) -
+                                       static_cast<double>(ref[k]));
+            if (e > mx) { mx = e; at = k; }
+        }
+        std::printf("    [%s] max_abs_err=%.6g at %zu (got %.6g ref %.6g)\n",
+                    tag, mx, at, got[at], ref[at]);
+        EXPECT_NEAR(static_cast<float>(mx), 0.0f, tol);
+    };
+
+    cmp("emb_out", fromDevice(ops, embOut.get(), T * H),
+        O.at("emb_out").f, 2e-3f);
+
+    // ---- encoder layer 0 ----
+    auto qBuf   = ops.allocate(T * H * sizeof(float));
+    auto kBuf   = ops.allocate(T * H * sizeof(float));
+    auto vBuf   = ops.allocate(T * H * sizeof(float));
+    auto attn   = ops.allocate(T * H * sizeof(float));
+    auto aoBuf  = ops.allocate(T * H * sizeof(float));
+    auto ln1    = ops.allocate(T * H * sizeof(float));
+    auto inter  = ops.allocate(T * ffn * sizeof(float));
+    auto ffnBuf = ops.allocate(T * H * sizeof(float));
+    auto l0     = ops.allocate(T * H * sizeof(float));
+
+    // Q/K/V = h * Wqkv^T + b   (h = embOut)
+    gmm.matmulAsync(F32, cptr(dQw), H, H, cptr(embOut), T, ptr(qBuf), ptr(scratch));
+    ops.addBiasAsync(ptr(qBuf), T, H, cptr(dQb));
+    gmm.matmulAsync(F32, cptr(dKw), H, H, cptr(embOut), T, ptr(kBuf), ptr(scratch));
+    ops.addBiasAsync(ptr(kBuf), T, H, cptr(dKb));
+    gmm.matmulAsync(F32, cptr(dVw), H, H, cptr(embOut), T, ptr(vBuf), ptr(scratch));
+    ops.addBiasAsync(ptr(vBuf), T, H, cptr(dVb));
+
+    // non-causal (bidirectional) MHA
+    ops.attentionEncoderAsync(cptr(qBuf), cptr(kBuf), cptr(vBuf), T, hds, hds,
+                              hd, scale, ptr(attn));
+
+    // attention output dense + residual(h) + LayerNorm
+    gmm.matmulAsync(F32, cptr(dAoW), H, H, cptr(attn), T, ptr(aoBuf), ptr(scratch));
+    ops.addBiasAsync(ptr(aoBuf), T, H, cptr(dAoB));
+    ops.addResidualAsync(ptr(aoBuf), cptr(embOut), T * H);
+    ops.layerNormAsync(ptr(aoBuf), T, H, cptr(dAoLnW), cptr(dAoLnB), eps, ptr(ln1));
+
+    // FFN: intermediate (erf-GELU) -> output dense + residual(ln1) + LayerNorm
+    gmm.matmulAsync(F32, cptr(dFiW), ffn, H, cptr(ln1), T, ptr(inter), ptr(scratch));
+    ops.addBiasAsync(ptr(inter), T, ffn, cptr(dFiB));
+    ops.geluErfAsync(ptr(inter), T * ffn);
+    gmm.matmulAsync(F32, cptr(dFoW), H, ffn, cptr(inter), T, ptr(ffnBuf), ptr(scratch));
+    ops.addBiasAsync(ptr(ffnBuf), T, H, cptr(dFoB));
+    ops.addResidualAsync(ptr(ffnBuf), cptr(ln1), T * H);
+    ops.layerNormAsync(ptr(ffnBuf), T, H, cptr(dOutLnW), cptr(dOutLnB), eps, ptr(l0));
+    ops.flush();
+
+    cmp("layer0_out", fromDevice(ops, l0.get(), T * H),
+        O.at("layer0_out").f, 5e-3f);
+}
 
 TEST(cuda_matmul_q8_0_mmq_largeM_dp4a) {
     CudaComputeContext ctx{};
