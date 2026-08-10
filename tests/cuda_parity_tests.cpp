@@ -25,6 +25,7 @@
 #include "compute/quant/Q8_0.hpp"
 #include "runtime/encoder/EncoderModel.hpp"
 #include "runtime/encoder/EncoderRunner.hpp"
+#include "model/XlmRobertaTokenizer.hpp"
 
 #include "core/modelopt/BlockScaleSwizzle.hpp" // swizzledBlockScaleBytes / swizzleBlockScale
 #ifdef MIMIRMIND_HAVE_CUTLASS_MOE
@@ -1255,6 +1256,58 @@ TEST(cuda_encoder_full_forward_parity) {
                 logits.at(0), ref, ids.size(), model.config().numLayers,
                 model.config().numLabels);
     EXPECT_NEAR(logits.at(0), ref, 5e-2f);
+}
+
+// XLM-R Unigram tokenizer parity: the oracle's input_ids came from the HF
+// tokenizer on this exact (query, passage) pair, so reproducing them bit-for-
+// bit validates normalize + Viterbi + fairseq id remap + sentence-pair framing.
+// The strings are reference test data (the oracle pair), not prose. No GPU.
+TEST(cuda_xlmr_tokenizer_parity) {
+    const char* envp = std::getenv("MIMIRMIND_ENCODER_ORACLE");
+    const std::string fx = envp ? envp : "scratchpad/encoder_oracle.bin";
+    OracleMap O;
+    if (!readOracle(fx, O)) {
+        std::printf("[SKIP] encoder oracle fixture not found at %s\n", fx.c_str());
+        return;
+    }
+    const char* mdl = std::getenv("MIMIRMIND_BGE_DIR");
+    const std::string dir = mdl ? mdl : "models/bge-reranker-v2-m3";
+    const std::string spm = dir + "/sentencepiece.bpe.model";
+    if (!std::filesystem::exists(spm)) {
+        std::printf("[SKIP] sentencepiece model not found at %s\n", spm.c_str());
+        return;
+    }
+
+    // The oracle reference pair (gen_oracle.py) — real DE text with umlauts.
+    // UTF-8 literals directly (this file is UTF-8); \x escapes would swallow a
+    // following hex-digit char (e.g. "\xBC" + 'c' in "Rück").
+    const std::string query =
+        "Welche Anschlüsse hat der NUC10 an der Vorder- und Rückseite?";
+    const std::string passage =
+        "Der Intel NUC10 verfügt an der Vorderseite über zwei "
+        "USB-3.1-Ports und einen Kopfhörer-Ausgang; an der Rückseite "
+        "HDMI 2.0, USB-C/Thunderbolt, zwei USB-3.1, Gigabit-Ethernet (RJ-45) und "
+        "den Stromanschluss.";
+
+    ::mimirmind::model::XlmRobertaTokenizer tok;
+    tok.load(spm);
+    const std::vector<std::int32_t> got = tok.encodePair(query, passage);
+    const std::vector<std::int32_t>& ref = O.at("input_ids").i;
+
+    std::printf("    [xlmr_tok] vocab=%zu got %zu ids, ref %zu ids\n",
+                tok.vocabSize(), got.size(), ref.size());
+    EXPECT_EQ(got.size(), ref.size());
+    const std::size_t nmin = std::min(got.size(), ref.size());
+    std::size_t mism = 0;
+    for (std::size_t i = 0; i < nmin; ++i) {
+        if (got[i] != ref[i]) {
+            if (mism < 5) {
+                std::printf("    diff [%zu] got=%d ref=%d\n", i, got[i], ref[i]);
+            }
+            ++mism;
+        }
+    }
+    EXPECT_EQ(mism, std::size_t{0});
 }
 
 TEST(cuda_matmul_q8_0_mmq_largeM_dp4a) {

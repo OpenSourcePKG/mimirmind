@@ -386,6 +386,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/nvfp4/ModelFormatResolver.cpp
     src/runtime/encoder/EncoderModel.cpp
     src/runtime/encoder/EncoderRunner.cpp
+    src/model/XlmRobertaTokenizer.cpp
 )
 
 target_include_directories(mimirmind_core_common PUBLIC src)
