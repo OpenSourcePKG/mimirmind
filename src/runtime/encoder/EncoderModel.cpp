@@ -9,10 +9,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace mimirmind::runtime::encoder {
 
@@ -26,6 +29,15 @@ std::string readTextFile(const std::filesystem::path& p) {
     std::ostringstream ss;
     ss << in.rdbuf();
     return ss.str();
+}
+
+// Round a binary32 to bfloat16 (round-to-nearest-even), returned as the raw
+// 16-bit pattern. Weight-only; NaN/Inf are not special-cased (weights finite).
+std::uint16_t f32ToBf16(float f) {
+    std::uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    const std::uint32_t rounding = 0x7FFFu + ((x >> 16) & 1u);
+    return static_cast<std::uint16_t>((x + rounding) >> 16);
 }
 
 } // namespace
@@ -57,15 +69,17 @@ EncoderConfig parseEncoderConfig(std::string_view configJson) {
     return c;
 }
 
-void EncoderModel::load(std::string_view dir, compute::ComputeOps& ops) {
+void EncoderModel::load(std::string_view dir, compute::ComputeOps& ops,
+                        core::gguf::GgmlType matmulType) {
+    _matmulType = matmulType;
     const std::filesystem::path root{dir};
     _config = parseEncoderConfig(readTextFile(root / "config.json"));
 
     core::safetensors::SafetensorsModel sm;
     sm.open(dir);
 
-    // Upload one F32 tensor to USM, keep the buffer alive, return its device ptr.
-    auto upload = [&](const std::string& name) -> const float* {
+    auto findF32 = [&](const std::string& name)
+        -> std::pair<const float*, std::size_t> {
         const auto* t = sm.find(name);
         if (t == nullptr) {
             throw std::runtime_error("EncoderModel: missing tensor '" + name + "'");
@@ -76,8 +90,38 @@ void EncoderModel::load(std::string_view dir, compute::ComputeOps& ops) {
                 "' is not F32 (only dense float32 checkpoints are supported)");
         }
         const std::span<const std::uint8_t> bytes = sm.tensorBytes(name);
-        compute::ComputeBuffer buf = ops.allocate(bytes.size());
-        ops.uploadHostBytes(buf.get(), bytes.data(), bytes.size());
+        return {reinterpret_cast<const float*>(bytes.data()), bytes.size() / sizeof(float)};
+    };
+
+    // Upload one F32 tensor verbatim to USM (biases, LayerNorm, embeddings).
+    auto upload = [&](const std::string& name) -> const float* {
+        const auto [src, n] = findF32(name);
+        compute::ComputeBuffer buf = ops.allocate(n * sizeof(float));
+        ops.uploadHostBytes(buf.get(), src, n * sizeof(float));
+        const float* p = static_cast<const float*>(buf.get());
+        _owned.push_back(std::move(buf));
+        return p;
+    };
+
+    // Upload a dense LINEAR weight as _matmulType: BF16 (round F32->bf16, half
+    // the bytes, tensor-core GEMM at M>1) or F32 verbatim. Returned as an
+    // opaque device pointer (ComputeMatmul reads it per GgmlType). Ranking is
+    // robust to the bf16 rounding; activations stay F32.
+    auto uploadW = [&](const std::string& name) -> const float* {
+        const auto [src, n] = findF32(name);
+        if (_matmulType == core::gguf::GgmlType::BF16) {
+            std::vector<std::uint16_t> bf(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                bf[i] = f32ToBf16(src[i]);
+            }
+            compute::ComputeBuffer buf = ops.allocate(n * sizeof(std::uint16_t));
+            ops.uploadHostBytes(buf.get(), bf.data(), n * sizeof(std::uint16_t));
+            const auto* p = reinterpret_cast<const float*>(buf.get());
+            _owned.push_back(std::move(buf));
+            return p;
+        }
+        compute::ComputeBuffer buf = ops.allocate(n * sizeof(float));
+        ops.uploadHostBytes(buf.get(), src, n * sizeof(float));
         const float* p = static_cast<const float*>(buf.get());
         _owned.push_back(std::move(buf));
         return p;
@@ -96,28 +140,28 @@ void EncoderModel::load(std::string_view dir, compute::ComputeOps& ops) {
         const std::string pre =
             "roberta.encoder.layer." + std::to_string(i) + ".";
         EncoderLayerWeights& L = _layers[i];
-        L.qW   = upload(pre + "attention.self.query.weight");
+        L.qW   = uploadW(pre + "attention.self.query.weight");
         L.qB   = upload(pre + "attention.self.query.bias");
-        L.kW   = upload(pre + "attention.self.key.weight");
+        L.kW   = uploadW(pre + "attention.self.key.weight");
         L.kB   = upload(pre + "attention.self.key.bias");
-        L.vW   = upload(pre + "attention.self.value.weight");
+        L.vW   = uploadW(pre + "attention.self.value.weight");
         L.vB   = upload(pre + "attention.self.value.bias");
-        L.aoW  = upload(pre + "attention.output.dense.weight");
+        L.aoW  = uploadW(pre + "attention.output.dense.weight");
         L.aoB  = upload(pre + "attention.output.dense.bias");
         L.aoLnW = upload(pre + "attention.output.LayerNorm.weight");
         L.aoLnB = upload(pre + "attention.output.LayerNorm.bias");
-        L.fiW  = upload(pre + "intermediate.dense.weight");
+        L.fiW  = uploadW(pre + "intermediate.dense.weight");
         L.fiB  = upload(pre + "intermediate.dense.bias");
-        L.foW  = upload(pre + "output.dense.weight");
+        L.foW  = uploadW(pre + "output.dense.weight");
         L.foB  = upload(pre + "output.dense.bias");
         L.outLnW = upload(pre + "output.LayerNorm.weight");
         L.outLnB = upload(pre + "output.LayerNorm.bias");
     }
 
     // Classifier head (dense -> tanh -> out_proj on the <s>/CLS token).
-    _clsDenseW = upload("classifier.dense.weight");
+    _clsDenseW = uploadW("classifier.dense.weight");
     _clsDenseB = upload("classifier.dense.bias");
-    _clsOutW   = upload("classifier.out_proj.weight");
+    _clsOutW   = uploadW("classifier.out_proj.weight");
     _clsOutB   = upload("classifier.out_proj.bias");
 
     // num_labels from the head if config didn't pin it.

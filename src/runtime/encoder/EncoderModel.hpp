@@ -4,6 +4,7 @@
 #pragma once
 
 #include "compute/ComputeBuffer.hpp"
+#include "core/gguf/GgufTypes.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -73,10 +74,19 @@ public:
 
     /// `dir` is a folder with config.json + model.safetensors (or a sharded
     /// index) or a direct .safetensors path (config.json must sit next to it).
-    /// Throws std::runtime_error on a missing/wrong-dtype tensor.
-    void load(std::string_view dir, compute::ComputeOps& ops);
+    /// `matmulType` is the dtype the dense LINEAR weights are stored/matmul'd
+    /// as: F32 (exact, slow — parity) or BF16 (tensor-core GEMM at M>1, the
+    /// fast serving path — activations stay F32, ranking-grade precision).
+    /// Biases, LayerNorm and embeddings always stay F32. Throws on a missing/
+    /// wrong-dtype tensor.
+    void load(std::string_view dir, compute::ComputeOps& ops,
+              core::gguf::GgmlType matmulType = core::gguf::GgmlType::F32);
 
     [[nodiscard]] const EncoderConfig& config() const noexcept { return _config; }
+
+    /// The GgmlType the linear weights are stored as (F32 or BF16) — the type
+    /// EncoderRunner must pass to ComputeMatmul::matmulAsync for them.
+    [[nodiscard]] core::gguf::GgmlType matmulType() const noexcept { return _matmulType; }
 
     // Embeddings block.
     [[nodiscard]] const float* wordEmb() const noexcept { return _wordEmb; }
@@ -96,7 +106,8 @@ public:
     [[nodiscard]] const float* clsOutB() const noexcept { return _clsOutB; }
 
 private:
-    EncoderConfig _config{};
+    EncoderConfig       _config{};
+    core::gguf::GgmlType _matmulType{core::gguf::GgmlType::F32};
 
     std::vector<compute::ComputeBuffer> _owned;   // lifetime of every USM buffer
     std::vector<EncoderLayerWeights>    _layers;

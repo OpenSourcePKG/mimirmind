@@ -15,7 +15,9 @@ RerankEngine::RerankEngine(std::string_view modelDir,
                            compute::ComputeOps& ops,
                            compute::ComputeMatmul& matmul)
     : _runner{_model, ops, matmul} {
-    _model.load(modelDir, ops);
+    // BF16 linear weights -> tensor-core GEMM at M>1 (fast batched rerank);
+    // ranking is robust to the bf16 rounding, activations stay F32.
+    _model.load(modelDir, ops, core::gguf::GgmlType::BF16);
     const std::filesystem::path spm =
         std::filesystem::path{modelDir} / "sentencepiece.bpe.model";
     _tokenizer.load(spm.string());

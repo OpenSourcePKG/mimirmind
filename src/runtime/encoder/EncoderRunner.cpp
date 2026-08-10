@@ -35,6 +35,7 @@ EncoderRunner::forwardLogits(std::span<const std::int32_t> inputIds) {
     const float eps       = c.lnEps;
     const float scale     = 1.0F / std::sqrt(static_cast<float>(c.headDim));
     const auto  F32       = core::gguf::GgmlType::F32;
+    const auto  WT        = _m.matmulType();
 
     auto alloc = [&](std::size_t n) { return _ops.allocate(n * sizeof(float)); };
     auto fp = [](compute::ComputeBuffer& b) {
@@ -79,11 +80,11 @@ EncoderRunner::forwardLogits(std::span<const std::int32_t> inputIds) {
         const EncoderLayerWeights& L = _m.layer(i);
 
         // Q/K/V = h * W^T + b
-        _mm.matmulAsync(F32, L.qW, H, H, h, T, q, scratch);
+        _mm.matmulAsync(WT, L.qW, H, H, h, T, q, scratch);
         _ops.addBiasAsync(q, T, H, L.qB);
-        _mm.matmulAsync(F32, L.kW, H, H, h, T, k, scratch);
+        _mm.matmulAsync(WT, L.kW, H, H, h, T, k, scratch);
         _ops.addBiasAsync(k, T, H, L.kB);
-        _mm.matmulAsync(F32, L.vW, H, H, h, T, v, scratch);
+        _mm.matmulAsync(WT, L.vW, H, H, h, T, v, scratch);
         _ops.addBiasAsync(v, T, H, L.vB);
 
         // bidirectional self-attention
@@ -91,16 +92,16 @@ EncoderRunner::forwardLogits(std::span<const std::int32_t> inputIds) {
                                    scale, attn);
 
         // attention.output.dense + residual(h) + LayerNorm
-        _mm.matmulAsync(F32, L.aoW, H, H, attn, T, ao, scratch);
+        _mm.matmulAsync(WT, L.aoW, H, H, attn, T, ao, scratch);
         _ops.addBiasAsync(ao, T, H, L.aoB);
         _ops.addResidualAsync(ao, h, T * H);
         _ops.layerNormAsync(ao, T, H, L.aoLnW, L.aoLnB, eps, ln1);
 
         // FFN: intermediate (erf-GELU) + output.dense + residual(ln1) + LN
-        _mm.matmulAsync(F32, L.fiW, ffn, H, ln1, T, inter, scratch);
+        _mm.matmulAsync(WT, L.fiW, ffn, H, ln1, T, inter, scratch);
         _ops.addBiasAsync(inter, T, ffn, L.fiB);
         _ops.geluErfAsync(inter, T * ffn);
-        _mm.matmulAsync(F32, L.foW, H, ffn, inter, T, ffnO, scratch);
+        _mm.matmulAsync(WT, L.foW, H, ffn, inter, T, ffnO, scratch);
         _ops.addBiasAsync(ffnO, T, H, L.foB);
         _ops.addResidualAsync(ffnO, ln1, T * H);
         // next layer's input goes back into h
@@ -108,10 +109,10 @@ EncoderRunner::forwardLogits(std::span<const std::int32_t> inputIds) {
     }
 
     // ---- classifier head on the <s>/CLS token (row 0 of h) ----
-    _mm.matmulAsync(F32, _m.clsDenseW(), H, H, h, 1, cls, scratch);
+    _mm.matmulAsync(WT, _m.clsDenseW(), H, H, h, 1, cls, scratch);
     _ops.addBiasAsync(cls, 1, H, _m.clsDenseB());
     _ops.tanhInPlaceAsync(cls, H);
-    _mm.matmulAsync(F32, _m.clsOutW(), nL, H, cls, 1, out, scratch);
+    _mm.matmulAsync(WT, _m.clsOutW(), nL, H, cls, 1, out, scratch);
     _ops.addBiasAsync(out, 1, nL, _m.clsOutB());
 
     _ops.flush();
@@ -144,6 +145,7 @@ EncoderRunner::forwardLogitsBatch(
     const float eps       = c.lnEps;
     const float scale     = 1.0F / std::sqrt(static_cast<float>(c.headDim));
     const auto  F32       = core::gguf::GgmlType::F32;
+    const auto  WT        = _m.matmulType();
 
     // Padded token ids (pad rows filled with pad_token_id) + per-seq lengths.
     std::vector<std::int32_t> ids(R, c.padTokenId);
@@ -208,25 +210,25 @@ EncoderRunner::forwardLogitsBatch(
     for (std::size_t i = 0; i < c.numLayers; ++i) {
         const EncoderLayerWeights& L = _m.layer(i);
 
-        _mm.matmulAsync(F32, L.qW, H, H, h, R, q, scratch);
+        _mm.matmulAsync(WT, L.qW, H, H, h, R, q, scratch);
         _ops.addBiasAsync(q, R, H, L.qB);
-        _mm.matmulAsync(F32, L.kW, H, H, h, R, k, scratch);
+        _mm.matmulAsync(WT, L.kW, H, H, h, R, k, scratch);
         _ops.addBiasAsync(k, R, H, L.kB);
-        _mm.matmulAsync(F32, L.vW, H, H, h, R, v, scratch);
+        _mm.matmulAsync(WT, L.vW, H, H, h, R, v, scratch);
         _ops.addBiasAsync(v, R, H, L.vB);
 
         _ops.attentionEncoderBatchedAsync(q, k, v, attn, lens, B, Tmax,
                                           c.heads, c.heads, c.headDim, scale);
 
-        _mm.matmulAsync(F32, L.aoW, H, H, attn, R, ao, scratch);
+        _mm.matmulAsync(WT, L.aoW, H, H, attn, R, ao, scratch);
         _ops.addBiasAsync(ao, R, H, L.aoB);
         _ops.addResidualAsync(ao, h, R * H);
         _ops.layerNormAsync(ao, R, H, L.aoLnW, L.aoLnB, eps, ln1);
 
-        _mm.matmulAsync(F32, L.fiW, ffn, H, ln1, R, inter, scratch);
+        _mm.matmulAsync(WT, L.fiW, ffn, H, ln1, R, inter, scratch);
         _ops.addBiasAsync(inter, R, ffn, L.fiB);
         _ops.geluErfAsync(inter, R * ffn);
-        _mm.matmulAsync(F32, L.foW, H, ffn, inter, R, ffnO, scratch);
+        _mm.matmulAsync(WT, L.foW, H, ffn, inter, R, ffnO, scratch);
         _ops.addBiasAsync(ffnO, R, H, L.foB);
         _ops.addResidualAsync(ffnO, ln1, R * H);
         _ops.layerNormAsync(ffnO, R, H, L.outLnW, L.outLnB, eps, h);
@@ -237,10 +239,10 @@ EncoderRunner::forwardLogitsBatch(
     for (std::size_t b = 0; b < B; ++b) {
         _ops.appendMemoryCopy(clsIn + b * H, h + b * Tmax * H, H * sizeof(float));
     }
-    _mm.matmulAsync(F32, _m.clsDenseW(), H, H, clsIn, B, cls, scratch);
+    _mm.matmulAsync(WT, _m.clsDenseW(), H, H, clsIn, B, cls, scratch);
     _ops.addBiasAsync(cls, B, H, _m.clsDenseB());
     _ops.tanhInPlaceAsync(cls, B * H);
-    _mm.matmulAsync(F32, _m.clsOutW(), nL, H, cls, B, out, scratch);
+    _mm.matmulAsync(WT, _m.clsOutW(), nL, H, cls, B, out, scratch);
     _ops.addBiasAsync(out, B, nL, _m.clsOutB());
 
     _ops.flush();
