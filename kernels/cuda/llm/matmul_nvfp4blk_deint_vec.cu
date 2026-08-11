@@ -159,28 +159,27 @@ void moe_grouped_gemm_nvfp4blk_deint(
     const int                          K,
     const int                          N)
 {
-    extern __shared__ float sxg[];              // [MAX_M * K]
+    // No smem staging: reading the activation from smem here means one smem
+    // load per FMA, and with lane==super the access xTile[super*32+e] is
+    // stride-32 (128 B) => 32-way bank conflict. ncu on the sibling m4 kernel
+    // showed the grouped decode GEMM is MIO/shared-pipe bound (56-61% short-
+    // scoreboard stall) at 24% DRAM / 103% occupancy -- NOT DRAM- or occupancy-
+    // limited. So read x straight from global: it is tiny (one row, K floats),
+    // L2-resident (re-read by every grid.x block of this tile), and lands on the
+    // L1TEX pipe instead of the saturated MIO pipe.
     const int tt = blockIdx.y;
     const int e  = tileExpert[tt];
     if (e < 0) {
         return;
     }
     const int row0 = tileRow0[tt];
-    int M = tileRows[tt];
-    if (M > NVBLK_DEINT_MAX_M) {
-        M = NVBLK_DEINT_MAX_M;
-    }
 
     const int tid    = threadIdx.x;
-    const int lsize  = blockDim.x;
     const int warpId = tid / 32;
     const int laneId = tid % 32;
     const int nSuper = K / NVBLK_SUPER_ELEMS;
 
-    for (int i = tid; i < M * K; i += lsize) {
-        sxg[i] = X[static_cast<size_t>(row0) * K + i];
-    }
-    __syncthreads();
+    const float* __restrict__ xRow = X + static_cast<size_t>(row0) * K;
 
     const int n = blockIdx.x * NVBLK_DEINT_WARPS + warpId;
     if (n >= N) {
@@ -193,10 +192,9 @@ void moe_grouped_gemm_nvfp4blk_deint(
     const __half* __restrict__ scRow =
         scale + ((static_cast<size_t>(e) * N + n) * rowSupers) * 2;
 
-    float acc[NVBLK_DEINT_MAX_M];
-    #pragma unroll
-    for (int m = 0; m < NVBLK_DEINT_MAX_M; ++m) acc[m] = 0.0f;
-
+    // MAX_M == 1 for the decode dispatch: a single activation row, so no
+    // per-row loop and the x reads go straight to global (L2).
+    float acc = 0.0f;
     for (int sp = laneId; sp < nSuper; sp += 32) {
         const uint4 q = nibRow[sp];
         const float s0 = __half2float(scRow[sp * 2 + 0]);
@@ -209,16 +207,139 @@ void moe_grouped_gemm_nvfp4blk_deint(
             const int   e0  = b * 2;
             const float w0  = ((e0     < 16) ? s0 : s1) * dq_e2m1(byte & 0x0F);
             const float w1  = ((e0 + 1 < 16) ? s0 : s1) * dq_e2m1(byte >> 4);
-            for (int m = 0; m < M; ++m) {
-                acc[m] = __fmaf_rn(w0, sxg[m * K + k0 + e0],     acc[m]);
-                acc[m] = __fmaf_rn(w1, sxg[m * K + k0 + e0 + 1], acc[m]);
-            }
+            acc = __fmaf_rn(w0, xRow[k0 + e0],     acc);
+            acc = __fmaf_rn(w1, xRow[k0 + e0 + 1], acc);
         }
     }
-    for (int m = 0; m < M; ++m) {
-        const float s = warpReduceSum(acc[m]);
-        if (laneId == 0) {
-            Y[static_cast<size_t>(row0 + m) * N + n] = s;
-        }
+    const float s = warpReduceSum(acc);
+    if (laneId == 0) {
+        Y[static_cast<size_t>(row0) * N + n] = s;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Increment 1 — "untried quadrant": de-interleaved uint4 weight read + the
+// activation in REGISTERS (no shared memory at all).
+//
+// The committed grouped deint kernel above stages x to shared (sxg) and reads
+// sxg[laneId*32 + e] in the inner loop — a stride-32 access => 32-way bank
+// conflict, which is why deint regressed vs m1reg despite the wider weight load.
+// The m1reg kernel (moe_grouped_gemm_nvfp4blk_m1reg) removed shared memory but
+// reads weights from the INTERLEAVED 20-byte super, whose base (sp*20) is not
+// 16-byte aligned, so a warp's nibble read can split across two sectors.
+//
+// This kernel takes both wins at once, decode single-user (nSeq==1, one row):
+//   * lane == element position within a super (like m1reg) => the activation
+//     read Xt[sp*32 + laneId] is coalesced and lives in a register, never smem;
+//   * the 16 nibble-bytes of each super are 16-byte aligned in the de-inter-
+//     leaved bank, so the whole super loads as ONE uint4 broadcast to the warp
+//     (a single clean sector). Each lane extracts its own nibble from the uint4
+//     in registers.
+// It isolates the sector/alignment effect from the smem-conflict penalty that
+// dominated the earlier deint measurement. One output column per warp.
+extern "C" __global__ __launch_bounds__(NVBLK_DEINT_LOCAL)
+void moe_grouped_gemm_nvfp4blk_deint_m1reg(
+    const float*         __restrict__ X,        // [R, K] compacted activations
+    const unsigned char* __restrict__ nib,      // [nExperts, N, nSuper, 16]
+    const __half*        __restrict__ scale,    // [nExperts, N, nSuper, 2]
+          float*         __restrict__ Y,        // [R, N]
+    const int*           __restrict__ tileExpert,
+    const int*           __restrict__ tileRow0,
+    const int*           __restrict__ /*tileRows*/,
+    const int                          K,
+    const int                          N)
+{
+    const int tt = blockIdx.y;
+    const int e  = tileExpert[tt];
+    if (e < 0) {
+        return;
+    }
+    const int laneId = threadIdx.x % 32;
+    const int warpId = threadIdx.x / 32;
+    const int n      = blockIdx.x * NVBLK_DEINT_WARPS + warpId;
+    if (n >= N) {
+        return;                                    // no smem/sync: safe early exit
+    }
+    const int row0   = tileRow0[tt];
+    const int nSuper = K / NVBLK_SUPER_ELEMS;
+
+    const float*  __restrict__ Xt = X + static_cast<size_t>(row0) * K;
+    float*        __restrict__ Yt = Y + static_cast<size_t>(row0) * N;
+    const uint4*  __restrict__ nibRow = reinterpret_cast<const uint4*>(
+        nib + ((static_cast<size_t>(e) * N + n) * nSuper) * 16);
+    const __half* __restrict__ scRow =
+        scale + ((static_cast<size_t>(e) * N + n) * nSuper) * 2;
+
+    float acc = 0.0f;
+    for (int sp = 0; sp < nSuper; ++sp) {
+        // Activation element `laneId` of super sp — coalesced across the warp,
+        // straight into a register (no shared memory).
+        const float xe = Xt[static_cast<size_t>(sp) * NVBLK_SUPER_ELEMS + laneId];
+        // Whole super's 16 nibble-bytes as one aligned uint4 (same address for
+        // all lanes => a single broadcast sector); extract this lane's nibble.
+        const uint4 q = nibRow[sp];
+        const unsigned word = (laneId < 16) ? ((laneId < 8) ? q.x : q.y)
+                                            : ((laneId < 24) ? q.z : q.w);
+        const unsigned byte = (word >> (((laneId >> 1) & 3) * 8)) & 0xFFu;
+        const unsigned nibv = (laneId & 1) ? (byte >> 4) : (byte & 0x0Fu);
+        const float s = (laneId < 16) ? __half2float(scRow[sp * 2 + 0])
+                                      : __half2float(scRow[sp * 2 + 1]);
+        acc = __fmaf_rn(s * dq_e2m1(nibv), xe, acc);
+    }
+
+    const float s = warpReduceSum(acc);
+    if (laneId == 0) {
+        Yt[n] = s;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Increment 5 — DENSE lmhead/dense NVFP4 matvec, register-x + uint4 deint.
+//
+// nvblkDeintVec (GpuMatmul) drives the lmhead GEMV (248 k vocab) when
+// MIMIRMIND_NVFP4_DEINT=1. Its v1 kernel (matmul_nvfp4blk_deint_vec above)
+// stages x to shared and reads xTile[super*32+e] per FMA (lane==super) — the
+// same MIO/shared-pipe stall Inc 1 removed for the grouped MoE GEMM, which is
+// why deint gave the lmhead nothing. This variant is the dense analogue of the
+// grouped Inc-1 kernel: lane == element position (like matmul_nvfp4blk_vec), x
+// coalesced into a register (no shared memory), the super's 16 nibble-bytes read
+// as one aligned uint4 broadcast to the warp. Accumulation order (per-super,
+// then warp-reduce over the 32 element-lanes) is IDENTICAL to matmul_nvfp4blk_vec
+// -> bit-identical logits -> identical argmax/tokens.
+extern "C" __global__ __launch_bounds__(NVBLK_DEINT_LOCAL)
+void matmul_nvfp4blk_deint_reg_vec(
+    const float*         __restrict__ X,        // [K] activation
+    const unsigned char* __restrict__ nib,      // [N, nSuper, 16]
+    const __half*        __restrict__ scale,    // [N, nSuper, 2]
+          float*         __restrict__ Y,        // [N]
+    const int                          N,
+    const int                          K)
+{
+    const int laneId = threadIdx.x % 32;
+    const int warpId = threadIdx.x / 32;
+    const int n      = blockIdx.x * NVBLK_DEINT_WARPS + warpId;
+    if (n >= N) {
+        return;
+    }
+    const int nSuper = K / NVBLK_SUPER_ELEMS;
+    const uint4*  __restrict__ nibRow =
+        reinterpret_cast<const uint4*>(nib + static_cast<size_t>(n) * nSuper * 16);
+    const __half* __restrict__ scRow = scale + static_cast<size_t>(n) * nSuper * 2;
+
+    float acc = 0.0f;
+    for (int sp = 0; sp < nSuper; ++sp) {
+        const float xe = X[static_cast<size_t>(sp) * NVBLK_SUPER_ELEMS + laneId];
+        const uint4 q = nibRow[sp];
+        const unsigned word = (laneId < 16) ? ((laneId < 8) ? q.x : q.y)
+                                            : ((laneId < 24) ? q.z : q.w);
+        const unsigned byte = (word >> (((laneId >> 1) & 3) * 8)) & 0xFFu;
+        const unsigned nibv = (laneId & 1) ? (byte >> 4) : (byte & 0x0Fu);
+        const float s = (laneId < 16) ? __half2float(scRow[sp * 2 + 0])
+                                      : __half2float(scRow[sp * 2 + 1]);
+        acc = __fmaf_rn(s * dq_e2m1(nibv), xe, acc);
+    }
+    const float sred = warpReduceSum(acc);
+    if (laneId == 0) {
+        Y[n] = sred;
     }
 }

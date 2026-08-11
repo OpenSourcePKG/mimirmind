@@ -57,53 +57,68 @@ extern "C" __global__ void moe_group_build(
     const int                 nExperts,
     const int                 K)
 {
-    if (threadIdx.x != 0 || blockIdx.x != 0) {
-        return;
-    }
-
     // Defensive clamp: the host wrapper validates nExperts against this
     // ceiling before dispatch; a kernel cannot throw, so an out-of-range
-    // nExperts would otherwise overrun the `cursor` scratch below.
+    // nExperts would otherwise overrun the shared scratch below.
     const int nE = (nExperts < MOE_GROUP_MAX_EXPERTS) ? nExperts
                                                       : MOE_GROUP_MAX_EXPERTS;
+    const int tid      = static_cast<int>(threadIdx.x);
+    const int nthreads = static_cast<int>(blockDim.x);
 
-    // 1. Histogram into expOffset[e+1] (shifted by one so the in-place scan
-    //    in step 2 leaves expOffset[e] = start-of-expert-e directly).
-    for (int e = 0; e <= nE; ++e) {
-        expOffset[e] = 0;
+    // v2 (2026-08-11): v1 was single-thread — the O(nExperts) zero + in-place
+    // global prefix-sum + a cursor[nExperts] LOCAL array (register spill) cost
+    // ~13 us/layer. v2 keeps the histogram / scan / stable-scatter on thread 0
+    // (so outputs are bit-identical to the CPU counting-sort golden), but runs
+    // them over SHARED counts (no global RMW, no local-mem cursor) and does the
+    // O(nExperts) zero + expOffset write across all threads of one block.
+    __shared__ int cnt[MOE_GROUP_MAX_EXPERTS + 1];
+    __shared__ int cursor[MOE_GROUP_MAX_EXPERTS];
+
+    for (int e = tid; e <= nE; e += nthreads) {
+        cnt[e] = 0;
     }
-    for (int i = 0; i < R; ++i) {
-        int e = expIdx[i];
-        if (e < 0 || e >= nE) {
-            continue;                       // drop malformed routing defensively
+    __syncthreads();
+
+    // 1+2. Histogram (into cnt[e+1]) then exclusive prefix sum — thread 0, in
+    //       shared memory. cnt[e] ends as expert e's row-range start; cnt[nE]=R'.
+    if (tid == 0) {
+        for (int i = 0; i < R; ++i) {
+            const int e = expIdx[i];
+            if (e >= 0 && e < nE) {
+                cnt[e + 1] += 1;            // drop malformed routing defensively
+            }
         }
-        expOffset[e + 1] += 1;
+        for (int e = 1; e <= nE; ++e) {
+            cnt[e] += cnt[e - 1];
+        }
     }
+    __syncthreads();
 
-    // 2. Exclusive prefix sum: expOffset[e] = sum of counts of experts < e.
-    //    expOffset[0] stays 0; expOffset[nE] becomes R (minus any dropped).
-    for (int e = 1; e <= nE; ++e) {
-        expOffset[e] += expOffset[e - 1];
+    // Publish the offsets, seed the scatter cursors, default the inverse perm —
+    // all parallel across the block.
+    for (int e = tid; e <= nE; e += nthreads) {
+        expOffset[e] = cnt[e];
     }
-
-    // 3. Stable scatter. `cursor[e]` starts at expert e's row range start and
-    //    advances as assignments land. Visiting assignments in ascending `i`
-    //    keeps the within-expert order stable == the CPU counting-sort golden.
-    int cursor[MOE_GROUP_MAX_EXPERTS];
-    for (int e = 0; e < nE; ++e) {
-        cursor[e] = expOffset[e];
+    for (int e = tid; e < nE; e += nthreads) {
+        cursor[e] = cnt[e];
     }
-    for (int i = 0; i < R; ++i) {
+    for (int i = tid; i < R; i += nthreads) {
         asnToRow[i] = -1;                            // default: dropped
     }
-    for (int i = 0; i < R; ++i) {
-        int e = expIdx[i];
-        if (e < 0 || e >= nE) {
-            continue;
+    __syncthreads();
+
+    // 3. Stable scatter — thread 0, ascending `i`, so the within-expert order
+    //    matches the CPU counting-sort golden bit-for-bit.
+    if (tid == 0) {
+        for (int i = 0; i < R; ++i) {
+            const int e = expIdx[i];
+            if (e < 0 || e >= nE) {
+                continue;
+            }
+            const int pos  = cursor[e]++;
+            rowSrcTok[pos] = (K > 0) ? (i / K) : 0;  // assignment i -> token t
+            rowKw[pos]     = kw[i];
+            asnToRow[i]    = pos;                     // inverse permutation
         }
-        const int pos     = cursor[e]++;
-        rowSrcTok[pos]    = (K > 0) ? (i / K) : 0;   // assignment i -> token t
-        rowKw[pos]        = kw[i];
-        asnToRow[i]       = pos;                      // inverse permutation
     }
 }

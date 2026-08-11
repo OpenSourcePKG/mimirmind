@@ -1576,16 +1576,20 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     // --- router + device top-K straight into the caller's USM slots --------
     const float wScale = (_config.expertWeightsScale != 0.0F)
                              ? _config.expertWeightsScale : 1.0F;
+    _ops.profileSection("rt.gemm");   // route sub-breakdown (DECODE_PROFILE only)
     _gmm.matmulAsync(routerW.type, routerW.usmPtr, nExperts, d_model,
                      moeInput, nSeq, upOutBuf, matmulScratch);
+    _ops.profileSection("rt.topk");
     _ops.moeTopKRouteDeviceAsync(upOutBuf, expIdxSlot, kwSlot,
                                  nSeq, nExperts, K, wScale);
 
     // --- group the T*K assignments by expert (device counting sort) --------
+    _ops.profileSection("rt.build");
     _ops.moeGroupBuildAsync(expIdxSlot, kwSlot, expOffset, rowSrcTok, rowKw,
                             asnToRow, R, nExperts, K);
 
     // --- gather activations into per-expert-contiguous rows (both paths) ---
+    _ops.profileSection("rt.gather");
     _ops.moeGatherRowsAsync(moeInput, rowSrcTok, xComp, d_model, R);
 
     // FP4-tensor-core grouped path: the routed experts are the NVFP4_TC format
@@ -1713,6 +1717,7 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         auto* const tileRows   = s.moeGroupTileRows.as<std::int32_t>();
         auto* const tileCount  = s.moeGroupTileCount.as<std::int32_t>();
 
+        _ops.profileSection("rt.tiles");
         _ops.moeGroupTilesAsync(expOffset, tileExpert, tileRow0, tileRows,
                                 tileCount, nExperts, maxTiles, tileM);
 

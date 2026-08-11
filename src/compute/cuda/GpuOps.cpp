@@ -299,6 +299,10 @@ struct GpuOps::Impl {
     core::cuda::CudaModule _nvfp4DeintModule;
     core::cuda::CudaKernel _nvfp4DeinterleaveKernel;
     core::cuda::CudaKernel _moeGroupedGemmNvfp4DeintKernel;
+    // Increment 1: de-interleaved uint4 weights + register-staged activation
+    // (no shared memory). Selected inside moeGroupedGemmNvfp4DeintAsync when
+    // MIMIRMIND_MOE_DEINT_REG=1, for the nSeq==1 decode A/B.
+    core::cuda::CudaKernel _moeGroupedGemmNvfp4DeintRegKernel;
     struct DeintBank {
         compute::ComputeBuffer nib;
         compute::ComputeBuffer scale;
@@ -532,6 +536,8 @@ struct GpuOps::Impl {
               _nvfp4DeintModule.getFunction("nvfp4blk_deinterleave")},
           _moeGroupedGemmNvfp4DeintKernel{
               _nvfp4DeintModule.getFunction("moe_grouped_gemm_nvfp4blk_deint")},
+          _moeGroupedGemmNvfp4DeintRegKernel{
+              _nvfp4DeintModule.getFunction("moe_grouped_gemm_nvfp4blk_deint_m1reg")},
           _moePadModule            {loadCudaModule(ctx, "moe_pad")},
           _moePadOffsetsKernel     {_moePadModule.getFunction("moe_pad_offsets")},
           _moeContigToPadKernel    {_moePadModule.getFunction("moe_contig_to_pad")},
@@ -1794,8 +1800,9 @@ void GpuOps::moeGroupBuildAsync(const std::int32_t* expIdx, const float* kw,
     k.setValue(6, toInt32(R, "moeGroupBuild R"));
     k.setValue(7, toInt32(nExperts, "moeGroupBuild nExperts"));
     k.setValue(8, toInt32(K, "moeGroupBuild K"));
-    // v1: single thread does the whole counting-sort build (see kernel).
-    k.launch(_ctx.stream(), 1, 1, 1, 1, 1, 1);
+    // v2: one block, 256 threads — parallel zero/publish + shared-mem histogram/
+    // scan/scatter on thread 0 (bit-identical to the CPU golden; see kernel).
+    k.launch(_ctx.stream(), 1, 1, 1, 256, 1, 1);
 }
 
 void GpuOps::moeGatherRowsAsync(const float* x, const std::int32_t* rowSrcTok,
@@ -1871,8 +1878,9 @@ void GpuOps::moeGroupTilesAsync(const std::int32_t* expOffset,
     k.setValue(5, toInt32(nExperts, "moeGroupTiles nExperts"));
     k.setValue(6, toInt32(maxTiles, "moeGroupTiles maxTiles"));
     k.setValue(7, toInt32(tileM, "moeGroupTiles tileM"));
-    // v1: single thread walks the experts and emits the schedule (see kernel).
-    k.launch(_ctx.stream(), 1, 1, 1, 1, 1, 1);
+    // v2: one block, 256 threads — parallel sentinel-fill + thread-0 walk
+    // (schedule bit-identical to the CPU golden; see kernel).
+    k.launch(_ctx.stream(), 1, 1, 1, 256, 1, 1);
 }
 
 void GpuOps::moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
@@ -1963,7 +1971,15 @@ void GpuOps::moeGroupedGemmNvfp4DeintAsync(
         it = _pimpl->_deintCache.emplace(w, std::move(bank)).first;
     }
 
-    auto& k = _pimpl->_moeGroupedGemmNvfp4DeintKernel;
+    // Increment 1 A/B: MIMIRMIND_MOE_DEINT_REG=1 selects the register-staged
+    // variant (no shared memory: activation coalesced into registers, uint4
+    // weight broadcast), isolating the alignment win from the smem-x conflict.
+    static const bool useReg = []() {
+        const char* r = std::getenv("MIMIRMIND_MOE_DEINT_REG");
+        return r != nullptr && r[0] == '1' && r[1] == '\0';
+    }();
+    auto& k = useReg ? _pimpl->_moeGroupedGemmNvfp4DeintRegKernel
+                     : _pimpl->_moeGroupedGemmNvfp4DeintKernel;
     k.setPtr  (0, x);
     k.setPtr  (1, it->second.nib.get());
     k.setPtr  (2, it->second.scale.get());
@@ -1974,7 +1990,9 @@ void GpuOps::moeGroupedGemmNvfp4DeintAsync(
     k.setValue(7, toInt32(K, "deint K"));
     k.setValue(8, toInt32(N, "deint N"));
     const std::uint32_t nGroups = static_cast<std::uint32_t>((N + 3) / 4);
-    const std::size_t smemBytes = K * sizeof(float);   // MAX_M(1) * K
+    // The register variant uses no shared memory; the smem variant stages the
+    // activation row (MAX_M(1) * K floats).
+    const std::size_t smemBytes = useReg ? 0 : K * sizeof(float);
     k.launch(_ctx.stream(), nGroups, static_cast<std::uint32_t>(maxTiles), 1,
              kLocal, 1, 1, smemBytes);
 }

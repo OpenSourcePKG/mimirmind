@@ -213,6 +213,9 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaModule _nvblkDeintModule;
     ::mimirmind::core::cuda::CudaKernel _nvblkDeinterleaveKernel;
     ::mimirmind::core::cuda::CudaKernel _nvblkDeintVecKernel;
+    // Inc 5: dense register-x + uint4 deint lmhead GEMV (no smem), selected when
+    // MIMIRMIND_DENSE_DEINT_REG=1 (bit-identical to matmul_nvfp4blk_vec).
+    ::mimirmind::core::cuda::CudaKernel _nvblkDeintRegVecKernel;
     struct NvblkDeint { void* nib{nullptr}; void* scale{nullptr}; };
     std::unordered_map<const void*, NvblkDeint> _nvblkDeintCache;
     // cuBLASLt dense BF16 matmul (opt-in). The cast_f32_to_bf16 kernel stages
@@ -374,6 +377,8 @@ struct GpuMatmul::Impl {
               _nvblkDeintModule.getFunction("nvfp4blk_deinterleave")},
           _nvblkDeintVecKernel    {
               _nvblkDeintModule.getFunction("matmul_nvfp4blk_deint_vec")},
+          _nvblkDeintRegVecKernel {
+              _nvblkDeintModule.getFunction("matmul_nvfp4blk_deint_reg_vec")},
           _castToF32Module        {loadCudaModule(ctx, "cast_to_f32")},
           _castF32ToBf16Kernel    {
               _castToF32Module.getFunction("cast_f32_to_bf16")},
@@ -872,7 +877,15 @@ void GpuMatmul::nvblkDeintVec(const void* W, std::size_t N, std::size_t K,
         dk.launch(_ctx.stream(), g, 1, 1, 256, 1, 1);
         it = _pimpl->_nvblkDeintCache.emplace(W, c).first;
     }
-    auto& k = _pimpl->_nvblkDeintVecKernel;
+    // Inc 5 A/B: MIMIRMIND_DENSE_DEINT_REG=1 selects the register-x variant
+    // (no shared memory: activation coalesced into registers, uint4 broadcast),
+    // removing the smem-x MIO stall that made the v1 dense deint neutral.
+    static const bool useReg = []() {
+        const char* r = std::getenv("MIMIRMIND_DENSE_DEINT_REG");
+        return r != nullptr && r[0] == '1' && r[1] == '\0';
+    }();
+    auto& k = useReg ? _pimpl->_nvblkDeintRegVecKernel
+                     : _pimpl->_nvblkDeintVecKernel;
     k.setPtr  (0, X);
     k.setPtr  (1, it->second.nib);
     k.setPtr  (2, it->second.scale);
@@ -880,7 +893,9 @@ void GpuMatmul::nvblkDeintVec(const void* W, std::size_t N, std::size_t K,
     k.setValue(4, static_cast<std::int32_t>(N));
     k.setValue(5, static_cast<std::int32_t>(K));
     const std::uint32_t nGroups = static_cast<std::uint32_t>((N + 3) / 4);
-    k.launch(_ctx.stream(), nGroups, 1, 1, 128, 1, 1, K * sizeof(float));
+    // Register variant uses no shared memory; the v1 variant stages x (K floats).
+    const std::size_t smemBytes = useReg ? 0 : K * sizeof(float);
+    k.launch(_ctx.stream(), nGroups, 1, 1, 128, 1, 1, smemBytes);
 }
 
 bool GpuMatmul::cublasFp8Matmul(const void*  W,

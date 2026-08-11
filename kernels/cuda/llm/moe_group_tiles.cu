@@ -35,16 +35,22 @@
 //        = R/tileM + nExperts. The host sizes both the scratch and grid.x
 // from this, so the grid dimension never depends on a device value.
 //
-// v1 is correctness-first, mirroring the moe_group_build v1 rationale: ONE
-// thread walks the experts and emits tiles sequentially. nExperts <= 256 and
-// maxTiles <= ~R/16 + nExperts (a few hundred) — O(nExperts + tiles) integer
-// ops, negligible next to the expert GEMMs. The sequential walk also makes
-// the schedule deterministic so the CPU golden matches it exactly.
+// v2 (2026-08-11): the whole schedule (maxTiles = ceil(R/tileM)+nExperts, ~258
+// at decode) was written by ONE thread — the sentinel-fill of the ~250-entry
+// tail alone is ~750 sequential global writes/layer, ~23 us/layer = the biggest
+// remaining "route" cost after the warp-topk fix. v2 does the sentinel-fill
+// across all threads of one block, then thread 0 runs the SAME sequential
+// expert walk to overwrite the real tiles [0,t). The walk stays single-thread
+// so the schedule is bit-identical to the CPU golden (the per-expert tile split
+// order is unchanged); only the bulk tail-fill is parallelised.
 //
-// Launch: grid (1,1,1), block (1,1,1) (thread 0 only). No shared memory.
-// Warp-size agnostic by construction (no shuffles / no cross-lane work).
+// Launch: grid (1,1,1), block (256,1,1). No shared memory. Warp-size agnostic.
 
 #include <cuda_runtime.h>
+
+#ifndef MOE_TILES_MAX_EXPERTS
+#define MOE_TILES_MAX_EXPERTS 256
+#endif
 
 extern "C" __global__ void moe_group_tiles(
     const int* __restrict__ expOffset,  // [nExperts+1]  exclusive prefix sum
@@ -56,24 +62,52 @@ extern "C" __global__ void moe_group_tiles(
     const int                maxTiles,
     const int                tileM)
 {
-    if (threadIdx.x != 0 || blockIdx.x != 0) {
-        return;
-    }
-
+    // sc[e] = tile count of expert e, then (after the scan) its start tile.
+    __shared__ int sc[MOE_TILES_MAX_EXPERTS];
+    const int tid      = static_cast<int>(threadIdx.x);
+    const int nthreads = static_cast<int>(blockDim.x);
+    const int nE = (nExperts < MOE_TILES_MAX_EXPERTS) ? nExperts
+                                                      : MOE_TILES_MAX_EXPERTS;
     const int tm = (tileM > 0) ? tileM : 1;
 
-    int t = 0;
-    for (int e = 0; e < nExperts; ++e) {
+    // Parallel sentinel-fill of the whole schedule; the emit below overwrites
+    // the real prefix. __syncthreads orders fill-before-emit.
+    for (int i = tid; i < maxTiles; i += nthreads) {
+        tileExpert[i] = -1;
+        tileRow0[i]   = 0;
+        tileRows[i]   = 0;
+    }
+
+    // Tiles per expert = ceil(count / tileM), 0 for an empty expert.
+    for (int e = tid; e < nE; e += nthreads) {
         const int off = expOffset[e];
         const int end = expOffset[e + 1];
-        int row = off;
-        while (row < end) {
+        sc[e] = (end > off) ? ((end - off + tm - 1) / tm) : 0;
+    }
+    __syncthreads();
+
+    // Exclusive prefix sum (thread 0, shared, deterministic): sc[e] = start tile
+    // of expert e. `acc` ends as the real tile count. Same expert-ascending tile
+    // layout the single-thread v1 walk produced -> bit-identical schedule.
+    if (tid == 0) {
+        int acc = 0;
+        for (int e = 0; e < nE; ++e) {
+            const int c = sc[e];
+            sc[e] = acc;
+            acc  += c;
+        }
+        nTiles[0] = (acc <= maxTiles) ? acc : maxTiles;
+    }
+    __syncthreads();
+
+    // Parallel emit: expert e writes its tiles at [sc[e], sc[e] + count).
+    for (int e = tid; e < nE; e += nthreads) {
+        const int off   = expOffset[e];
+        const int end   = expOffset[e + 1];
+        int       t     = sc[e];
+        for (int row = off; row < end; row += tm, ++t) {
             if (t >= maxTiles) {
-                // Defensive: the host sizes the grid/scratch to the static
-                // upper bound so this never trips; a kernel cannot throw, so
-                // clamp rather than overrun the output buffers.
-                nTiles[0] = t;
-                return;
+                break;                          // defensive; host over-provisions
             }
             int rows = end - row;
             if (rows > tm) {
@@ -82,16 +116,6 @@ extern "C" __global__ void moe_group_tiles(
             tileExpert[t] = e;
             tileRow0[t]   = row;
             tileRows[t]   = rows;
-            row += rows;
-            ++t;
         }
     }
-
-    // Sentinel-fill the unused tail so over-provisioned grid blocks early-exit.
-    for (int i = t; i < maxTiles; ++i) {
-        tileExpert[i] = -1;
-        tileRow0[i]   = 0;
-        tileRows[i]   = 0;
-    }
-    nTiles[0] = t;
 }
