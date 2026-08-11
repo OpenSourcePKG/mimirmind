@@ -1130,6 +1130,11 @@ ServingSession::verifyForward(
                           _e._config.rmsNormEps, normBuf);
     _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, vocab, d_model,
                     normBuf, M, logits, st.vLmScr.as<float>());
+    // MTP-verify breakdown: one profiler "step" per verify round (DECODE_PROFILE
+    // only). Accumulated verify.proj/conv/gdn/tail + moe.gemm/attn/lmhead sections
+    // print every 32 rounds -> shows whether the batched-verify cost is the GDN
+    // recurrence (verify.gdn) or the MoE expert-union (moe.gemm at M=N*(K+1)).
+    _e._ops->profileStepEnd();
     return M;
 }
 

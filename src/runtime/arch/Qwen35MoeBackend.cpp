@@ -2342,6 +2342,7 @@ void Qwen35MoeBackend::runLinearBlockVerify(
     float* const ssmExportBase = ssmExport + blockIdx * (Kp1 * maxBatch * stateElems);
 
     // === Phase 1: weight-heavy projections, BATCHED over M (read once) =====
+    _ops.profileSection("verify.proj");   // MTP-verify breakdown (DECODE_PROFILE)
     _ops.rmsNormAsync(x, M, d_model,
                       static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
     {
@@ -2367,6 +2368,7 @@ void Qwen35MoeBackend::runLinearBlockVerify(
     // post-step state is exported to ssmExportBase — replacing the K+1
     // full-slab recurrent snapshots. The kernel reads stateBase (S_0) but does
     // NOT advance it; the caller commits from ssmExport[a].
+    _ops.profileSection("verify.conv");
     const std::size_t convInBytes = convStateElems * sizeof(float);
     const std::size_t qkvRowBytes = convDim * sizeof(float);
     for (std::size_t j = 0; j < Kp1; ++j) {
@@ -2422,11 +2424,13 @@ void Qwen35MoeBackend::runLinearBlockVerify(
     // ONE fused verify kernel: q/k/v/out time-major [Kp1, N, hV, S], gate/beta
     // [Kp1, N, hV], stateIn [N, stateElems], stateOut [Kp1, N, stateElems]
     // packed with stride N into this layer's export slab.
+    _ops.profileSection("verify.gdn");
     _ops.gatedDeltaNetVerifyBatchedAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
                                          stateBase, ssmExportBase, deltaOut,
                                          N, Kp1, hV, S);
 
     // === Phase 3: gated output norm + out-proj + MoE, BATCHED over M =======
+    _ops.profileSection("verify.tail");
     _ops.rmsNormAsync(deltaOut, M * hV, S,
                       static_cast<const float*>(ssmNormW.usmPtr), eps, qBuf);
     _ops.siluMulAsync(zBuf, qBuf, M * valueDim);
