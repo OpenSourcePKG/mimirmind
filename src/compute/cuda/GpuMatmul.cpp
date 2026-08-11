@@ -430,6 +430,9 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
     if (const char* cf = std::getenv("MIMIRMIND_CUBLAS_FP8")) {
         _useCublasFp8 = (cf[0] != '\0' && !(cf[0] == '0' && cf[1] == '\0'));
     }
+    if (const char* cfp = std::getenv("MIMIRMIND_CUBLAS_FP8_PREFILL")) {
+        _useCublasFp8Prefill = (cfp[0] != '\0' && !(cfp[0] == '0' && cfp[1] == '\0'));
+    }
     if (const char* dv = std::getenv("MIMIRMIND_NVFP4_DEINT")) {
         _useDeintVec = (dv[0] == '1' && dv[1] == '\0');
     }
@@ -438,6 +441,13 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
                     "cuBLASLt per-tensor FP8 (E4M3) dense matmul enabled "
                     "(MIMIRMIND_CUBLAS_FP8=1) — BF16 weights quantised to E4M3 "
                     "(cached) + per-call X quant; hand kernel is the fallback");
+    }
+    if (_useCublasFp8Prefill) {
+        MM_LOG_INFO("hip::GpuMatmul",
+                    "cuBLASLt FP8 batched (M>1) prefill GEMM enabled "
+                    "(MIMIRMIND_CUBLAS_FP8_PREFILL=1) — dense prefill projections "
+                    "run on FP8 tensor cores (RMSNorm inputs bound the per-tensor "
+                    "activation scale); BF16/wmma is the fallback");
     }
     if (_tf32Tc) {
         MM_LOG_INFO("hip::GpuMatmul",
@@ -1260,6 +1270,12 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
         // (M>1) can hold outliers that make the amax/448 scale crush precision,
         // so prefill stays on the higher-fidelity BF16 path below.
         if (_useCublasFp8 && M == 1 && cublasFp8Matmul(W, N, K, X, M, Y)) {
+            return;
+        }
+        // Batched prefill (M>1) on FP8 tensor cores — opt-in, takes precedence
+        // over the BF16 path. Dense prefill projections read RMSNorm outputs, so
+        // the per-tensor activation scale stays well-conditioned.
+        if (_useCublasFp8Prefill && M > 1 && cublasFp8Matmul(W, N, K, X, M, Y)) {
             return;
         }
         if (_useCublas && cublasBf16Matmul(W, N, K, X, M, Y)) {

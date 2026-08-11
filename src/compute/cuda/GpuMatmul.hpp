@@ -358,6 +358,12 @@ private:
     // half the weight bytes of the BF16 cuBLAS path; falls back to the hand
     // kernel if cuBLASLt does not support the shape (e.g. M=1 non-TC).
     bool                           _useCublasFp8{false};
+    // Also route batched (M>1) prefill dense GEMMs through the per-tensor FP8
+    // path. Opt-in MIMIRMIND_CUBLAS_FP8_PREFILL=1. The dense prefill projections
+    // (GDN in_proj_qkv/gate/ssm_out, attn q/k/v/o) all consume RMSNorm outputs,
+    // whose bounded magnitude keeps the per-tensor E4M3 activation scale from
+    // crushing precision — so the M==1-only gate can be lifted for these.
+    bool                           _useCublasFp8Prefill{false};
     // Route the M==1 blocked-NVFP4 vec (shexp / full-attn decode) through the
     // de-interleaved uint4-coalesced kernel. Opt-in MIMIRMIND_NVFP4_DEINT=1.
     bool                           _useDeintVec{false};
