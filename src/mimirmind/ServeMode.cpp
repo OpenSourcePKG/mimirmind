@@ -1587,7 +1587,15 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                 const long v = std::strtol(nv, nullptr, 10);
                 if (v >= 1) nSeqs = {static_cast<std::size_t>(v)};
             }
-            const std::vector<std::size_t> depths = {2, 3};
+            // Runbook (MTP depth1/nSeq1 single-user cell): allow selecting a
+            // single depth so the untested depth1 point can be measured. The
+            // vLLM oracle shows +20% at depth1/single-stream; our net-loss
+            // evidence is all depth2-3/nSeq>=16. MIMIRMIND_MTP_DEPTH=1 -> {1}.
+            std::vector<std::size_t> depths = {2, 3};
+            if (const char* dv = std::getenv("MIMIRMIND_MTP_DEPTH")) {
+                const long v = std::strtol(dv, nullptr, 10);
+                if (v >= 1) depths = {static_cast<std::size_t>(v)};
+            }
             using clk = std::chrono::steady_clock;
 
             // Representative accept-rate (prompt-dependent, batch-invariant).
@@ -1599,6 +1607,43 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                 std::cout << "  accept-rate depth=" << D << ": "
                           << (drafted ? double(accepted) / double(drafted) : 0.0)
                           << " (" << accepted << "/" << drafted << ")\n";
+            }
+
+            // Single-user (nSeq==1) SINGLE-SESSION ratio: plain generate() vs
+            // generateMtp(), timed with warmup + resetCache. This is the true
+            // single-user decode path (the batched generateBatchMtp path is
+            // untested/aborts at depth1). MIMIRMIND_MTP_SINGLE_ONLY=1 reports
+            // just this and returns (skips the batched loop below).
+            if (std::getenv("MIMIRMIND_MTP_SINGLE_ONLY") != nullptr) {
+                ::mimirmind::runtime::GenerateParams sgp{};
+                sgp.maxNewTokens         = maxNew;
+                sgp.sampling.temperature = 0.0F;
+                auto nowMs = []() {
+                    return std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                };
+                e->resetCache(); (void)e->generate(pids, sgp, {}, nullptr, {}, {});
+                e->resetCache(); (void)e->generateMtp(pids, 8, depths.front(), -1);
+                e->resetCache();
+                const double p0 = nowMs();
+                const auto plain = e->generate(pids, sgp, {}, nullptr, {}, {});
+                const double plMs = nowMs() - p0;
+                const double plTps = double(plain.size()) / (plMs / 1000.0);
+                std::cout << "  [single-session nSeq=1] plain=" << plTps
+                          << " tok/s (" << plain.size() << " tok, " << plMs << " ms)\n";
+                for (const std::size_t D : depths) {
+                    e->resetCache();
+                    const double m0 = nowMs();
+                    const auto mo = e->generateMtp(pids, maxNew, D, -1);
+                    const double mMs = nowMs() - m0;
+                    const double mTps = double(mo.size()) / (mMs / 1000.0);
+                    std::cout << "  [single-session nSeq=1] depth=" << D
+                              << " MTP=" << mTps << " tok/s (" << mo.size()
+                              << " tok, " << mMs << " ms) ratio=" << (mTps / plTps)
+                              << "\n";
+                }
+                std::cout.flush();
+                return 0;
             }
 
             auto timeCall = [&](auto&& fn) -> double {
