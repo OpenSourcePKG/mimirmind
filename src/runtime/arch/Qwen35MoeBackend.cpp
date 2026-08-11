@@ -2044,6 +2044,7 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
     // V2 internally falls back to the single-pass V1 for short/unknown
     // (maxSeqLen<=partition) contexts so short-prompt decode keeps V1's speed.
     // MIMIRMIND_PAGED_V1=1 forces the old single-pass path (A/B + rollback).
+    _ops.profileSection("attn.paged");   // decode attn sub-split (paged kernel)
     if (_forcePagedV1) {
         _ops.pagedAttentionDecodeV1Async(
             attnOut, qBuf, ctx.pool->keyPool(denseLayer),
@@ -2060,6 +2061,7 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
     }
 
     // --- output gate + O projection + attn residual ------------------
+    _ops.profileSection("attn.out");   // decode attn sub-split (gate + O proj)
     _ops.sigmoidGateMulAsync(attnOut, gateBuf, nSeq, q_dim, /*gateDim=*/q_dim);
     _gmm.matmulAsync(oW.type, oW.usmPtr, d_model, q_dim,
                      attnOut, nSeq, projOut, mmScratch);
