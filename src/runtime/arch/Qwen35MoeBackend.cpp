@@ -399,6 +399,7 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     void* const vBase = const_cast<void*>(cache.baseV(kvL));
 
     // --- pre-attention RMSNorm ---------------------------------------
+    _ops.profileSection("attn");   // prefill full-attention layer (DECODE_PROFILE)
     trace("attn rmsNorm");
     _ops.rmsNormAsync(x, T, d_model,
                       static_cast<const float*>(attnNorm.usmPtr),
@@ -689,6 +690,7 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     float* const matmulScr = s.matmulScratch.as<float>();
 
     // --- pre-attention RMSNorm ---------------------------------------
+    _ops.profileSection("gdn.proj");   // prefill GDN sub-split (DECODE_PROFILE)
     trace("attn rmsNorm");
     _ops.rmsNormAsync(x, T, d_model,
                       static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
@@ -716,6 +718,7 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     // conv_state persists across decode steps (rolling tail); it is zeroed
     // only at sequence start. After the conv, the last (d_conv-1) rows of
     // conv_input become the new conv_state. conv output reuses qkvMixed.
+    _ops.profileSection("gdn.conv");   // prefill GDN sub-split (conv1d + gather + l2)
     trace("conv1d (rolling state-concat + silu)");
     const std::size_t stateRows = (dConv > 0 ? dConv - 1 : 0);
     if (isSeqStart) {
@@ -746,6 +749,7 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
 
     // --- gated delta-rule recurrence (persistent state) -------------
     // state zeroed only at sequence start; decode steps evolve it in place.
+    _ops.profileSection("gdn.recur");   // prefill GDN sub-split (delta-rule chunk/AR)
     trace("delta-rule recurrence");
     if (isSeqStart) {
         _ops.mulScalarAsync(stateBuf, 0.0F, stateElems);
@@ -759,8 +763,11 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
         const std::size_t cChunk = 64;
         float* const gCum = s.ssmGCum.as<float>();
         float* const a0   = s.ssmA0.as<float>();
+        _ops.profileSection("gdn.k0");   // chunk cumgate (recur sub-split)
         _ops.deltanetChunkCumGateAsync(gateBuf, gCum, T, hV, cChunk);
+        _ops.profileSection("gdn.k1");   // KKT triangular-inverse (recur sub-split)
         _ops.deltanetKktSolveInverseAsync(kBuf, betaBuf, a0, T, hV, S, cChunk);
+        _ops.profileSection("gdn.k2");   // chunk forward (recur sub-split)
         _ops.deltanetChunkForwardAsync(qBuf, kBuf, vBuf, gCum, betaBuf, a0,
                                        stateBuf, deltaOut, T, hV, S, cChunk);
     } else {
@@ -804,6 +811,7 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     // --- gated output norm: ssm_norm(out) * silu(z) ------------------
     // rmsNorm(out) over head_dim -> qBuf (reused as norm buffer), then
     // siluMul(z, n) = silu(z) * n, in place into zBuf.
+    _ops.profileSection("gdn.out");   // prefill GDN sub-split (ssm_norm+out+resid)
     trace("gated ssm_norm x silu(z)");
     _ops.rmsNormAsync(deltaOut, T * hV, S,
                       static_cast<const float*>(ssmNormW.usmPtr), eps, qBuf);
@@ -1655,6 +1663,7 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         void* const banksScratch     = s.moeTcBanksScratch.get();
         const std::size_t banksBytes = s.moeTcBanksScratch.bytes();
 
+        _ops.profileSection("moe.prep");   // row maps + act-quant (prefill sub-split)
         // padded row maps (device only)
         _ops.moePadOffsetsAsync(expOffset, padOffset, nExperts);
         _ops.moeContigToPadAsync(expOffset, padOffset, contigToPad, nExperts, R);
@@ -1671,6 +1680,7 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
 
         // gate + up: N=n_ff_exp, K=d_model. alpha[e] = weight global (folds the
         // per-expert global back in; act gscale=1).
+        _ops.profileSection("moe.gemm");   // gate+up TC GEMM (prefill sub-split)
         _ops.moeGroupedGemmNvfp4TcBanksAsync(
             nExperts, n_ff_exp, d_model, expOffset, padOffset, aBank, sfaBank,
             gateExps.tcNibblePtr, gateExps.tcSfbPtr,
@@ -1682,6 +1692,7 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
             static_cast<const float*>(upExps.tcGlobalsPtr), upPad,
             banksScratch, banksBytes);
 
+        _ops.profileSection("moe.silu");   // silu + intermediate act-quant (sub-split)
         _ops.siluMulAsync(gatePad, upPad, maxPad * n_ff_exp);  // silu(gate)*up
 
         // act-quant the intermediate -> down GEMM: N=d_model, K=n_ff_exp.
@@ -1689,6 +1700,8 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         // (contigToPad), so the intermediate's real rows live there too.
         _ops.moeZeroBytesAsync(sfaBank2, mo::swizzledBlockScaleBytes(maxPad, n_ff_exp / 16));
         _ops.moeActQuantNvfp4RowsAsync(gatePad, aBank2, sfaBank2, 1.0F, contigToPad, R, n_ff_exp);
+
+        _ops.profileSection("moe.dgemm");   // down TC GEMM (prefill sub-split)
         _ops.moeGroupedGemmNvfp4TcBanksAsync(
             nExperts, d_model, n_ff_exp, expOffset, padOffset, aBank2, sfaBank2,
             downExps.tcNibblePtr, downExps.tcSfbPtr,
@@ -1696,6 +1709,7 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
             banksScratch, banksBytes);
 
         // scatter padded expert output back to token order (routed sum).
+        _ops.profileSection("moe.sc");   // scatter expert out (prefill sub-split)
         _ops.moeScatterExpertOutAsync(downPad, padAsn, kwSlot, moeAccumBuf,
                                       d_model, nSeq, K);
     } else if (deviceDrivenGrouped) {

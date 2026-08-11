@@ -874,6 +874,10 @@ std::int32_t ServingSession::prefillSlot(
         st.qb->runBlock(b, xBuf, T, view, sb, /*traceBlock0=*/false);
     }
     st.qb->setPrefillMoeScratch(nullptr, nullptr);
+    // FP4-TC-peak bench: one profiler "step" per prefill chunk (DECODE_PROFILE
+    // only). moe.tc + attn + ... sections print (see MIMIRMIND_PROFILE_EVERY) so
+    // the wide-M FP4-TC MoE GEMM ms is visible for the TFLOP/s / %-peak calc.
+    _e._ops->profileStepEnd();
 
     std::int32_t firstTok = -1;
     if (produceToken) {

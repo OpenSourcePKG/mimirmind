@@ -784,19 +784,25 @@ void GpuOps::profileStepEnd() {
         }
         _pimpl->_profPrev.clear();
     }
-    if (++_pimpl->_profSteps >= 32) {
+    static const int kProfEvery = []() {
+        const char* e = std::getenv("MIMIRMIND_PROFILE_EVERY");
+        const int v = (e != nullptr) ? std::atoi(e) : 0;
+        return (v >= 1) ? v : 32;   // default 32 (per decode step); lower for prefill
+    }();
+    if (++_pimpl->_profSteps >= kProfEvery) {
         double total = 0.0;
         for (auto& p : _pimpl->_profAcc) total += p.second;
         std::string line;
         for (auto& p : _pimpl->_profAcc) {
-            const double perStep = p.second / 32.0;
+            const double perStep = p.second / static_cast<double>(kProfEvery);
             const double pct = (total > 0.0) ? (100.0 * p.second / total) : 0.0;
             line += " " + p.first + "="
                   + std::to_string(perStep).substr(0, 6) + "ms("
                   + std::to_string(static_cast<int>(pct + 0.5)) + "%)";
         }
-        MM_LOG_INFO("decode-prof", "32-step avg, ms/step:{} | total={}",
-                    line, std::to_string(total / 32.0).substr(0, 6));
+        MM_LOG_INFO("decode-prof", "{}-step avg, ms/step:{} | total={}",
+                    std::to_string(kProfEvery), line,
+                    std::to_string(total / static_cast<double>(kProfEvery)).substr(0, 6));
         _pimpl->_profAcc.clear();
         _pimpl->_profSteps = 0;
     }
