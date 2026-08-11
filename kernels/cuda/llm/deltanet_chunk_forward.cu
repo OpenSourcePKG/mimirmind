@@ -113,20 +113,30 @@ void deltanet_chunk_forward(
         }
         __syncthreads();
 
-        // Step 4.5: kq[a,m] = k_m . qs_a  (reduction over i == thread j).
-        for (int a = 0; a < cs; ++a) {
-            for (int m = 0; m <= a; ++m) {
-                const float* km = k + (static_cast<size_t>(c0 + m) * H + h) * S;
-                red[j] = km[j] * qsh[a * S + j];
-                __syncthreads();
-                for (int off = S >> 1; off > 0; off >>= 1) {
-                    if (j < off) red[j] += red[j + off];
-                    __syncthreads();
-                }
-                if (j == 0) kqs[a * C + m] = red[0];
-                __syncthreads();
-            }
+        // Step 4.5: kq[a,m] = k_m . qs_a  (lower-triangular, m<=a).
+        // Perf: the correctness-first variant did one block-wide S-tree reduction
+        // per (a,m) pair -> ~C^2/2 * (2 log S) __syncthreads per chunk (the
+        // dominant cost). Instead each thread owns a strided subset of the
+        // cs*(cs+1)/2 pairs and computes its dot over i independently, so the
+        // whole step needs a SINGLE __syncthreads before step 5 reads kqs. The
+        // per-thread accumulation order differs from the tree reduction, but for
+        // S<=128 fp32 the delta is far inside the chunked-vs-AR parity tolerance.
+        const int nPairs = cs * (cs + 1) / 2;
+        for (int p = j; p < nPairs; p += blockDim.x) {
+            // Decode flat lower-triangular index p -> (a, m), m<=a, via the
+            // triangular-number inverse; fix up float rounding with a bounded
+            // step so a*(a+1)/2 <= p < (a+1)(a+2)/2 holds exactly.
+            int a = static_cast<int>((sqrtf(8.0f * p + 1.0f) - 1.0f) * 0.5f);
+            while ((a + 1) * (a + 2) / 2 <= p) ++a;
+            while (a * (a + 1) / 2 > p) --a;
+            const int m = p - a * (a + 1) / 2;
+            const float* km = k + (static_cast<size_t>(c0 + m) * H + h) * S;
+            const float* qa = qsh + a * S;   // qs_a (== qScale*q_a) in scratch
+            float acc = 0.0f;
+            for (int i = 0; i < S; ++i) acc += km[i] * qa[i];
+            kqs[a * C + m] = acc;
         }
+        __syncthreads();
 
         // Step 5: o_a = exp(G_a) uq_a + sum_{m<=a} exp(G_a-G_m)(k_m.qs_a) d_m.
         for (int a = 0; a < cs; ++a) {
