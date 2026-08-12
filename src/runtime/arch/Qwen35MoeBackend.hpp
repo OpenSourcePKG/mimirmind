@@ -222,6 +222,9 @@ public:
                                 bool                    skipHead);
 
     [[nodiscard]] bool        scalesEmbedding()   const noexcept override { return false; }
+    // FP16-KV prefill routes K/V through an fp32 staging redirect + kv_commit_fp16
+    // (runFullAttentionBlock), so a raw fp32 matmul never hits the fp16 slot.
+    [[nodiscard]] bool supportsFp16KvStaging() const noexcept override { return true; }
     [[nodiscard]] const char* name()              const noexcept override { return "qwen35moe"; }
     [[nodiscard]] bool        needsQGateScratch() const noexcept override { return true; }
     [[nodiscard]] bool        needsSsmScratch()   const noexcept override;

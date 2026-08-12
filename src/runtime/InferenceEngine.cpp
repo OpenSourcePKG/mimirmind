@@ -760,7 +760,12 @@ void InferenceEngine::setKvDtype(KvDtype dtype) {
         // because a raw fp32 K/V matmul would land bytes directly in
         // an fp16-typed slot and corrupt it — the FP16 write path has
         // no staging redirect.
-        if (dtype == KvDtype::FP16 &&
+        // FP16 needs fused-QKV UNLESS the backend routes fp16 K/V writes
+        // through an fp32 staging redirect (project→fp32 scratch→rmsnorm/rope
+        // in fp32→kv_commit_fp16 cast), in which case a raw fp32 matmul never
+        // lands in the fp16 slot. Qwen35's IMRoPE path does exactly this.
+        const bool fp16StagingSafe = _backend->supportsFp16KvStaging();
+        if (dtype == KvDtype::FP16 && !fp16StagingSafe &&
             (_fusedQkv == nullptr || _fusedQkv->find(b) == nullptr)) {
             throw std::runtime_error(
                 std::string{"InferenceEngine::setKvDtype("} + dtypeName +
@@ -925,8 +930,11 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
         _fusedQkv != nullptr && _fusedQkv->anyFused();
     // M10.2 Phase 1a Commit 5 — Q8_0 KV requires a persistent fp32 K/V
     // workspace: rmsnorm_qkv + RoPE run fp32-in-place there and then
-    // `kv_quant_commit_q8_0` folds the rows into the Q8_0 cache slot.
-    const bool withKvFp32Scratch = (_kvDtype == KvDtype::Q8_0);
+    // `kv_quant_commit_q8_0` folds the rows into the Q8_0 cache slot. FP16 KV
+    // on a staging-redirect backend (Qwen35 IMRoPE) needs the same fp32
+    // workspace, folded by kv_commit_fp16 instead.
+    const bool withKvFp32Scratch =
+        (_kvDtype == KvDtype::Q8_0 || _kvDtype == KvDtype::FP16);
     const bool withQGate = _backend->needsQGateScratch();
     const bool withSsm   = _backend->needsSsmScratch();
     _blockBuffers = allocBlockBuffers(*_ops, _config,

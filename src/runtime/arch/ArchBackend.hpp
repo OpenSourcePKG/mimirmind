@@ -130,6 +130,16 @@ public:
     [[nodiscard]] virtual std::pair<std::size_t, std::size_t>
         maxQKVDims() const = 0;
 
+    /// True if this backend routes its FP16-KV writes through an fp32 staging
+    /// redirect (project → fp32 scratch → rmsnorm/rope in fp32 → kv_commit_fp16
+    /// cast into the cache), so a raw fp32 K/V matmul never lands in an fp16
+    /// slot. Backends that DON'T (the plain path writes fp32 straight into the
+    /// cache slot) must return false — the engine then still requires fused-QKV
+    /// for FP16 to avoid corrupting the fp16 cache. Default false.
+    [[nodiscard]] virtual bool supportsFp16KvStaging() const noexcept {
+        return false;
+    }
+
     /// Short identifier for logs ("qwen2", "gemma4").
     [[nodiscard]] virtual const char* name() const noexcept = 0;
 

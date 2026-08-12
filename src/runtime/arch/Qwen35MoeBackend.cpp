@@ -360,10 +360,15 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     trace("enter (full-attn)");
 
     const auto kvDtype = cache.dtype();
-    if (kvDtype != KvDtype::F32) {
+    // FP16 KV uses the Q8_0-style staging redirect: K/V project into an fp32
+    // scratch, rmsnorm + IMRoPE run in fp32 there, then kv_commit_fp16 casts
+    // each row into the fp16 cache (single lossy step). The plain F32 path is
+    // unchanged. Q8_0 is not wired for the Qwen35 IMRoPE path yet.
+    const bool fp16Path = (kvDtype == KvDtype::FP16);
+    if (kvDtype != KvDtype::F32 && !fp16Path) {
         throw std::runtime_error(
-            "Qwen35MoeBackend: only KvDtype::F32 is supported "
-            "(M-Q3N.2 F32-only IMRoPE + staging path)");
+            "Qwen35MoeBackend: only KvDtype::F32 or FP16 is supported "
+            "(FP16 via fp32-staging redirect; Q8_0 not wired for IMRoPE)");
     }
 
     const auto& w    = _weights;
@@ -398,6 +403,19 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     void* const kBase = const_cast<void*>(cache.baseK(kvL));
     void* const vBase = const_cast<void*>(cache.baseV(kvL));
 
+    // FP16 staging redirect (mirror of the Q8_0 path in Qwen2Backend): under
+    // fp16 the K/V pre-attention pipeline (projection, QK-norm, IMRoPE) runs on
+    // an fp32 scratch [T, kv_dim] at row 0; kv_commit_fp16 then casts into the
+    // fp16 cache at the curLen offset. The plain F32 path keeps writing the
+    // cache slot in place (kStaging == kBase, F32, curLen offset).
+    float* const kFp32Scratch = fp16Path ? s.kvKFp32Scratch.as<float>() : nullptr;
+    float* const vFp32Scratch = fp16Path ? s.kvVFp32Scratch.as<float>() : nullptr;
+    void* const kStaging = fp16Path ? static_cast<void*>(kFp32Scratch) : kBase;
+    void* const vStaging = fp16Path ? static_cast<void*>(vFp32Scratch) : vBase;
+    const auto  stagingKvDtype    = fp16Path ? KvDtype::F32 : kvDtype;
+    const std::size_t stagingWriteOffset = fp16Path ? 0 : curLen;
+    const std::size_t stagingWriteStride = fp16Path ? 0 : kv_dim;
+
     // --- pre-attention RMSNorm ---------------------------------------
     _ops.profileSection("attn");   // prefill full-attention layer (DECODE_PROFILE)
     trace("attn rmsNorm");
@@ -416,9 +434,13 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
         _gmm.matmulAsync(qW.type, qW.usmPtr, 2 * q_dim, d_model,
                          normBuf, T, qGateFused, matmulScratch);
         _gmm.matmulAsync(kW.type, kW.usmPtr, kv_dim, d_model,
-                         normBuf, T, static_cast<float*>(kSlot), matmulScratch);
+                         normBuf, T,
+                         fp16Path ? kFp32Scratch : static_cast<float*>(kSlot),
+                         matmulScratch);
         _gmm.matmulAsync(vW.type, vW.usmPtr, kv_dim, d_model,
-                         normBuf, T, static_cast<float*>(vSlot), matmulScratch);
+                         normBuf, T,
+                         fp16Path ? vFp32Scratch : static_cast<float*>(vSlot),
+                         matmulScratch);
     }
 
     trace("split Q|gate");
@@ -427,13 +449,13 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     // --- QK-norm (per-head RMS over head_dim) + V passthrough --------
     trace("QK-norm");
     _ops.rmsNormQkvAsync(
-        qBuf,  static_cast<const float*>(qNorm.usmPtr),
-        kBase, static_cast<const float*>(kNorm.usmPtr),
-        vBase,
+        qBuf,     static_cast<const float*>(qNorm.usmPtr),
+        kStaging, static_cast<const float*>(kNorm.usmPtr),
+        vStaging,
         T * nHeads, T * nKvHeads, head_dim,
         _config.rmsNormEps,
-        /*writeOffset=*/curLen, kv_dim,
-        kvDtype, /*useStagingSlot=*/false);
+        /*writeOffset=*/stagingWriteOffset, kv_dim,
+        stagingKvDtype, /*useStagingSlot=*/fp16Path);
 
     // --- IMRoPE on Q and K -------------------------------------------
     trace("IMRoPE Q+K");
@@ -441,9 +463,19 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
         compute::UnorderedScope u{_ops};
         _ops.mropeInPlaceAsync(qBuf, T, nHeads, head_dim, curLen,
                                _config.ropeFreqBase, _ropeSections);
-        _ops.mropeInPlaceAsync(kBase, T, nKvHeads, head_dim, curLen,
+        // startPos stays curLen (correct positional angles); the write stride
+        // is 0 under fp16 so IMRoPE targets the fp32 scratch row 0.
+        _ops.mropeInPlaceAsync(kStaging, T, nKvHeads, head_dim, curLen,
                                _config.ropeFreqBase, _ropeSections,
-                               /*writeOffsetStride=*/kv_dim, kvDtype);
+                               stagingWriteStride, stagingKvDtype);
+    }
+
+    // --- FP16 commit: cast the roped/normed fp32 K/V scratch into the fp16
+    // cache at the curLen write offset (single lossy step, like Q8_0 commit).
+    if (fp16Path) {
+        trace("KV commit fp16 (K + V)");
+        _ops.kvCommitFp16Async(kFp32Scratch, kBase, T, kv_dim, curLen);
+        _ops.kvCommitFp16Async(vFp32Scratch, vBase, T, kv_dim, curLen);
     }
 
     // --- GQA attention -----------------------------------------------
