@@ -1465,8 +1465,43 @@ void GpuOps::gatedDeltaNetRecurrentAsync(const float* q, const float* k_,
     if (T == 0 || H == 0 || S == 0) {
         return;
     }
+    // P2.a — opt-in smem-staged prefill recurrence. The batched v3 kernel with
+    // grid (H, 1) is exactly the single-sequence smem-staged recurrence (seq=0
+    // zeroes every per-seq stride), and it is bit-identical to the plain AR
+    // kernel (proven byte-for-byte for decode). The plain prefill kernel streams
+    // the [S,S] state 2R+2W/token from global; v3 stages it to dynamic smem once
+    // (1R at start + 1W at end for the whole call). Opt-in MIMIRMIND_GDN_PREFILL_V3=1;
+    // falls back to the plain kernel if the device rejects the >48 KiB smem opt-in.
+    static const bool gdnPrefillV3Req = [] {
+        const char* e = std::getenv("MIMIRMIND_GDN_PREFILL_V3");
+        return e != nullptr && !(e[0] == '0' && e[1] == '\0') && e[0] != '\0';
+    }();
+    const std::size_t gdnSmemBytes =
+        static_cast<std::size_t>(S) * S * sizeof(float);
+    bool usePrefillV3 = false;
+    if (gdnPrefillV3Req) {
+        static const bool v3Ready = [&] {
+            try {
+                _pimpl->_gatedDeltaNetArBatchedV3Kernel
+                    .setMaxDynamicSharedBytes(gdnSmemBytes);
+                MM_LOG_INFO("cudagpuops",
+                            "GDN prefill v3 (smem-staged) enabled: {} bytes "
+                            "dynamic smem (MIMIRMIND_GDN_PREFILL_V3=1)",
+                            gdnSmemBytes);
+                return true;
+            } catch (const core::cuda::CudaDriverError& err) {
+                MM_LOG_WARN("cudagpuops",
+                            "GDN prefill v3 opt-in for {} bytes smem rejected "
+                            "({}); using the plain AR kernel",
+                            gdnSmemBytes, err.what());
+                return false;
+            }
+        }();
+        usePrefillV3 = v3Ready;
+    }
     // grid = H blocks (one per head), block = S threads (one per state column).
-    auto& k = _pimpl->_gatedDeltaNetArKernel;
+    auto& k = usePrefillV3 ? _pimpl->_gatedDeltaNetArBatchedV3Kernel
+                           : _pimpl->_gatedDeltaNetArKernel;
     k.setPtr  (0, q);
     k.setPtr  (1, k_);
     k.setPtr  (2, v);
@@ -1477,10 +1512,11 @@ void GpuOps::gatedDeltaNetRecurrentAsync(const float* q, const float* k_,
     k.setValue(7, toInt32(T, "gdn T"));
     k.setValue(8, toInt32(H, "gdn H"));
     k.setValue(9, toInt32(S, "gdn S"));
-    // grid = H blocks, block = S threads (S <= GATED_DELTANET_AR_MAX_S).
+    // grid = H blocks (× 1 seq for v3), block = S threads (S <= GATED_DELTANET_AR_MAX_S).
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(H), 1, 1,
-             static_cast<std::uint32_t>(S), 1, 1);
+             static_cast<std::uint32_t>(S), 1, 1,
+             usePrefillV3 ? gdnSmemBytes : 0);
 }
 
 void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
