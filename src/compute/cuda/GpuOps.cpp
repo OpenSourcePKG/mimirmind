@@ -212,6 +212,9 @@ struct GpuOps::Impl {
     // Step 3 — FP16 tensor-core FA-2 prefill (q-tiled, opt-in).
     core::cuda::CudaModule _attentionPrefillFlashFp16TcModule;
     core::cuda::CudaKernel _attentionPrefillFlashFp16TcKernel;
+    // Step 3.2 — GQA-head-packed multi-warp FP16 tensor-core FA-2 (opt-in).
+    core::cuda::CudaModule _attentionPrefillFlashFp16GqaTcModule;
+    core::cuda::CudaKernel _attentionPrefillFlashFp16GqaTcKernel;
     core::cuda::CudaModule _attentionPrefillFlashQ8Module;
     core::cuda::CudaKernel _attentionPrefillFlashQ8Kernel;
     core::cuda::CudaModule _attentionPrefillFlashQ8GqaModule;
@@ -224,6 +227,9 @@ struct GpuOps::Impl {
     // P3.b — TF32 tensor-core GQA-head-packed F32 prefill flash (opt-in).
     core::cuda::CudaModule _attentionPrefillFlashF32GqaTcModule;
     core::cuda::CudaKernel _attentionPrefillFlashF32GqaTcKernel;
+    // Multi-warp TF32 FA-2 for the F32 KV path (opt-in, fixes P3.b's flaws).
+    core::cuda::CudaModule _attentionPrefillFlashF32GqaMwtcModule;
+    core::cuda::CudaKernel _attentionPrefillFlashF32GqaMwtcKernel;
 
     core::cuda::CudaModule _qkvSplitModule;
     core::cuda::CudaKernel _qkvSplitKernel;
@@ -444,6 +450,11 @@ struct GpuOps::Impl {
           _attentionPrefillFlashFp16TcKernel{
               _attentionPrefillFlashFp16TcModule.getFunction(
                   "attention_prefill_flash_fp16_tc")},
+          _attentionPrefillFlashFp16GqaTcModule{
+              loadCudaModule(ctx, "attention_prefill_flash_fp16_gqa_tc")},
+          _attentionPrefillFlashFp16GqaTcKernel{
+              _attentionPrefillFlashFp16GqaTcModule.getFunction(
+                  "attention_prefill_flash_fp16_gqa_tc")},
           _attentionPrefillFlashQ8Module{
               loadCudaModule(ctx, "attention_prefill_flash_q8_0")},
           _attentionPrefillFlashQ8Kernel{
@@ -468,6 +479,11 @@ struct GpuOps::Impl {
           _attentionPrefillFlashF32GqaTcKernel{
               _attentionPrefillFlashF32GqaTcModule.getFunction(
                   "attention_prefill_flash_f32_gqa_tc")},
+          _attentionPrefillFlashF32GqaMwtcModule{
+              loadCudaModule(ctx, "attention_prefill_flash_f32_gqa_mwtc")},
+          _attentionPrefillFlashF32GqaMwtcKernel{
+              _attentionPrefillFlashF32GqaMwtcModule.getFunction(
+                  "attention_prefill_flash_f32_gqa_mwtc")},
 
           _qkvSplitModule          {loadCudaModule(ctx, "qkv_split")},
           _qkvSplitKernel          {_qkvSplitModule.getFunction("qkv_split")},
@@ -686,6 +702,33 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
                     "(MIMIRMIND_ATTN_FP16_TC=1) — q-tiled wmma m16n16k16 over the "
                     "fp16 KV cache; bit-near (fp16), parity-gated; scalar fp16 "
                     "kernel is the fallback");
+    }
+
+    // Step 3.2 opt-in: GQA-head-packed multi-warp FP16 tensor-core FA-2.
+    if (const char* fg = std::getenv("MIMIRMIND_ATTN_FP16_GQA_TC")) {
+        _prefillFp16GqaTcEnabled = (fg[0] != '\0' && !(fg[0] == '0' && fg[1] == '\0'));
+    }
+    if (_prefillFp16GqaTcEnabled) {
+        MM_LOG_INFO("cudagpuops",
+                    "FP16 prefill attention -> GQA-head-packed multi-warp "
+                    "tensor-core FA-2 kernel enabled (MIMIRMIND_ATTN_FP16_GQA_TC=1) "
+                    "— one CTA per (kv-head, q-tile), nQPerKv warps share the "
+                    "fp16 K/V tile; M=16 real query rows; bit-near (fp16), "
+                    "parity-gated; falls back to the scalar fp16 kernel");
+    }
+
+    // Multi-warp TF32 FA-2 for the F32 KV path (the path Qwen3-Next prefill
+    // attention actually takes; fixes P3.b's single-warp + M=8-underfill).
+    if (const char* fm = std::getenv("MIMIRMIND_ATTN_F32_MWTC")) {
+        _prefillF32MwtcEnabled = (fm[0] != '\0' && !(fm[0] == '0' && fm[1] == '\0'));
+    }
+    if (_prefillF32MwtcEnabled) {
+        MM_LOG_INFO("cudagpuops",
+                    "F32 prefill attention -> multi-warp TF32 tensor-core FA-2 "
+                    "kernel enabled (MIMIRMIND_ATTN_F32_MWTC=1) — one CTA per "
+                    "(kv-head, q-tile, head-half), HPB warps share the F32 K/V "
+                    "tile; M=16 real query rows; bit-near (TF32), parity-gated; "
+                    "falls back to the F32-GQA/plain kernel");
     }
 
     _prefillFlashKTileQ8Configured = flashPrefillKTileQ8;
@@ -2665,6 +2708,56 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
     // streaming amortisation. Any other value was resolved / rejected
     // in the ctor.
     const std::size_t nQPerKv = nHeads / nKvHeads;
+    // Multi-warp TF32 FA-2 for the F32 KV path (Step 3.2's F32 sibling; the
+    // path Qwen3-Next prefill attention actually takes). Preferred over the
+    // scalar P3.a/P3.b F32 kernels when eligible. Needs a dynamic-smem opt-in
+    // (qS+oRun dominate; sized by HPB=4 head-half, not nQPerKv).
+    constexpr std::size_t kMwtcHpb = 2;   // == ATTN_MW_HPB in the kernel
+                                          // (99 KiB sm_121 dyn-smem cap)
+    bool useF32Mwtc =
+        (kvDtype == runtime::KvDtype::F32) &&
+        _prefillF32MwtcEnabled &&
+        (nQPerKv > 1) &&
+        (nQPerKv <= kFlashPrefillGqaMaxQPerKv) &&
+        (headDim <= kFlashTcMaxHeadDim) &&
+        (headDim % 16 == 0);
+    if (useF32Mwtc) {
+        constexpr std::size_t BQ = 16, BK = 16;
+        auto a128 = [](std::size_t n) { return (n + 127u) & ~std::size_t(127u); };
+        const std::size_t hp = kMwtcHpb;
+        const std::size_t hd = static_cast<std::size_t>(headDim);
+        std::size_t bytes = 0;
+        bytes += a128(hp * BQ * hd * sizeof(float));    // qS
+        bytes += a128(BK * hd * sizeof(float));         // kvS
+        bytes += a128(hp * BQ * hd * sizeof(float));    // oRun
+        bytes += a128(hp * BQ * BK * sizeof(float));    // sS
+        bytes += a128(hp * BQ * BK * sizeof(float));    // pS
+        bytes += a128(hp * BQ * BK * sizeof(float));    // oT
+        bytes += a128(hp * BQ * sizeof(float));         // mSh
+        bytes += a128(hp * BQ * sizeof(float));         // lSh
+        bytes += a128(hp * BQ * sizeof(float));         // aSh
+        if (!_prefillF32MwtcSmemAttempted) {
+            _prefillF32MwtcSmemAttempted = true;
+            try {
+                _pimpl->_attentionPrefillFlashF32GqaMwtcKernel
+                    .setMaxDynamicSharedBytes(bytes);
+                _prefillF32MwtcSmemBytes = bytes;
+                _prefillF32MwtcSmemOk    = true;
+                MM_LOG_INFO("cudagpuops",
+                            "F32 MWTC prefill: dynamic smem opt-in ok "
+                            "({} bytes, HPB={}, headDim={})",
+                            bytes, kMwtcHpb, headDim);
+            } catch (const core::cuda::CudaDriverError& err) {
+                _prefillF32MwtcSmemOk = false;
+                MM_LOG_WARN("cudagpuops",
+                            "F32 MWTC prefill: dynamic smem opt-in for {} bytes "
+                            "rejected ({}); falling back to the F32-GQA/plain "
+                            "kernel", bytes, err.what());
+            }
+        }
+        useF32Mwtc = _prefillF32MwtcSmemOk &&
+                     (bytes <= _prefillF32MwtcSmemBytes);
+    }
     const bool useQ8Gqa =
         (kvDtype == runtime::KvDtype::Q8_0) &&
         !_prefillFlashGqaQ8Disabled &&
@@ -2672,6 +2765,7 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         (nQPerKv <= kFlashPrefillGqaMaxQPerKv);
     // P3.b — opt-in TF32 tensor-core GQA kernel (bit-near, headDim-bounded).
     const bool useF32Tc =
+        !useF32Mwtc &&
         (kvDtype == runtime::KvDtype::F32) &&
         _prefillTcF32Enabled &&
         (nQPerKv > 1) &&
@@ -2680,13 +2774,69 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         (headDim % 16 == 0);
     // P3.a — opt-in GQA-head-packed F32 kernel (bit-exact fast path).
     const bool useF32Gqa =
+        !useF32Mwtc &&
         !useF32Tc &&
         (kvDtype == runtime::KvDtype::F32) &&
         _prefillGqaF32Enabled &&
         (nQPerKv > 1) &&
         (nQPerKv <= kFlashPrefillGqaMaxQPerKv);
+    // Step 3.2 — opt-in GQA-head-packed multi-warp FP16 tensor-core FA-2.
+    // Preferred over the q-tiled Step-3 kernel when eligible: it shares the
+    // K/V tile across the GQA group (nQPerKv warps) instead of re-reading it
+    // per query head. Needs the GQA shape and, on first use, a successful
+    // dynamic-smem opt-in (dominant term oRun = nQPerKv*16*headDim*4).
+    bool useFp16GqaTc =
+        (kvDtype == runtime::KvDtype::FP16) &&
+        _prefillFp16GqaTcEnabled &&
+        (nQPerKv > 1) &&
+        (nQPerKv <= kFlashPrefillGqaMaxQPerKv) &&
+        (headDim <= kFlashTcMaxHeadDim) &&
+        (headDim % 16 == 0);
+    if (useFp16GqaTc) {
+        // Compute the exact dynamic-smem footprint (must match the kernel's
+        // carveSmem() region layout: each region padded up to 128 bytes).
+        constexpr std::size_t BQ = 16, BK = 16;
+        constexpr std::size_t kHalf = 2;   // sizeof(fp16); __half not in host TU
+        auto a128 = [](std::size_t n) { return (n + 127u) & ~std::size_t(127u); };
+        const std::size_t nW = static_cast<std::size_t>(nQPerKv);
+        const std::size_t hd = static_cast<std::size_t>(headDim);
+        std::size_t bytes = 0;
+        bytes += a128(nW * BQ * hd * sizeof(float));    // oRun
+        bytes += a128(BK * hd * kHalf);                 // kvS
+        bytes += a128(nW * BQ * BK * kHalf);            // qStg
+        bytes += a128(nW * BQ * BK * sizeof(float));    // sS
+        bytes += a128(nW * BQ * BK * kHalf);            // pS
+        bytes += a128(nW * BQ * BK * sizeof(float));    // oT
+        bytes += a128(nW * BQ * sizeof(float));         // mSh
+        bytes += a128(nW * BQ * sizeof(float));         // lSh
+        bytes += a128(nW * BQ * sizeof(float));         // aSh
+        if (!_prefillFp16GqaTcSmemAttempted) {
+            _prefillFp16GqaTcSmemAttempted = true;
+            try {
+                _pimpl->_attentionPrefillFlashFp16GqaTcKernel
+                    .setMaxDynamicSharedBytes(bytes);
+                _prefillFp16GqaTcSmemBytes = bytes;
+                _prefillFp16GqaTcSmemOk    = true;
+                MM_LOG_INFO("cudagpuops",
+                            "FP16 GQA-TC prefill: dynamic smem opt-in ok "
+                            "({} bytes, nQPerKv={}, headDim={})",
+                            bytes, nQPerKv, headDim);
+            } catch (const core::cuda::CudaDriverError& err) {
+                _prefillFp16GqaTcSmemOk = false;
+                MM_LOG_WARN("cudagpuops",
+                            "FP16 GQA-TC prefill: dynamic smem opt-in for {} "
+                            "bytes rejected ({}); falling back to the scalar "
+                            "fp16 kernel", bytes, err.what());
+            }
+        }
+        // The opt-in is a one-shot per (headDim,nQPerKv). If a later dispatch
+        // needs more bytes than the cached opt-in, disable for safety.
+        useFp16GqaTc = _prefillFp16GqaTcSmemOk &&
+                       (bytes <= _prefillFp16GqaTcSmemBytes);
+    }
     // Step 3 — opt-in FP16 tensor-core FA-2 kernel (q-tiled, headDim-bounded).
     const bool useFp16Tc =
+        !useFp16GqaTc &&
         (kvDtype == runtime::KvDtype::FP16) &&
         _prefillFp16TcEnabled &&
         (headDim <= kFlashTcMaxHeadDim) &&
@@ -2694,9 +2844,13 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
 
     core::cuda::CudaKernel* kernelPtr = &_pimpl->_attentionPrefillFlashKernel;
     if (kvDtype == runtime::KvDtype::FP16) {
-        kernelPtr = useFp16Tc
-            ? &_pimpl->_attentionPrefillFlashFp16TcKernel
-            : &_pimpl->_attentionPrefillFlashFp16Kernel;
+        if (useFp16GqaTc) {
+            kernelPtr = &_pimpl->_attentionPrefillFlashFp16GqaTcKernel;
+        } else if (useFp16Tc) {
+            kernelPtr = &_pimpl->_attentionPrefillFlashFp16TcKernel;
+        } else {
+            kernelPtr = &_pimpl->_attentionPrefillFlashFp16Kernel;
+        }
     } else if (kvDtype == runtime::KvDtype::Q8_0) {
         if (useQ8Gqa) {
             kernelPtr = (_prefillFlashKTileQ8 == 64)
@@ -2705,6 +2859,8 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         } else {
             kernelPtr = &_pimpl->_attentionPrefillFlashQ8Kernel;
         }
+    } else if (useF32Mwtc) {
+        kernelPtr = &_pimpl->_attentionPrefillFlashF32GqaMwtcKernel;
     } else if (useF32Tc) {
         kernelPtr = &_pimpl->_attentionPrefillFlashF32GqaTcKernel;
     } else if (useF32Gqa) {
@@ -2729,26 +2885,43 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
     kernel.setValue(10, toInt32(slidingWindow, "prefill_flash slidingWindow"));
 
     // Plain kernels: one WG per (query-head, query-position).
-    // GQA-packed kernels (Q8_0 / F32 / F32-TC): one WG per (kv-head, query-position).
-    const std::uint32_t dim0 = (useQ8Gqa || useF32Gqa || useF32Tc)
+    // GQA-packed kernels (Q8_0 / F32 / F32-TC / F32-MWTC / FP16-GQA-TC): one
+    // WG per (kv-head, query-position or q-tile).
+    const std::uint32_t dim0 =
+        (useQ8Gqa || useF32Gqa || useF32Tc || useF32Mwtc || useFp16GqaTc)
         ? static_cast<std::uint32_t>(nKvHeads)
         : static_cast<std::uint32_t>(nHeads);
-    // The tensor-core kernels are warp-collective — full 32-lane block; the
-    // scalar kernels use the 16-lane half-wave.
-    const std::uint32_t blockX = (useF32Tc || useFp16Tc)
-        ? 32u
-        : static_cast<std::uint32_t>(kAttentionLocalSize);
-    // FP16-TC tiles ATTN_TC16_BQ=16 query positions per CTA; every other kernel
-    // takes one WG per query position (dim1 = T_q).
+    // Warp-collective tensor-core kernels use full-warp blocks. Step-3 q-tiled
+    // is a single warp (32); the Step-3.2 GQA kernel runs one warp per query
+    // head (32*nQPerKv); the F32-MWTC kernel runs HPB warps per head-half
+    // (32*min(HPB,nQPerKv)). Scalar kernels use the 16-lane half-wave.
+    const std::size_t mwtcWarps =
+        (nQPerKv < kMwtcHpb) ? nQPerKv : kMwtcHpb;
+    const std::uint32_t blockX =
+        useF32Mwtc   ? static_cast<std::uint32_t>(32 * mwtcWarps)
+      : useFp16GqaTc ? static_cast<std::uint32_t>(32 * nQPerKv)
+      : (useF32Tc || useFp16Tc) ? 32u
+      : static_cast<std::uint32_t>(kAttentionLocalSize);
+    // The q-tiling kernels (Step 3 / 3.2 / F32-MWTC) take BQ=16 query positions
+    // per CTA; every other kernel takes one WG per query position (dim1 = T_q).
     constexpr std::uint32_t kFp16TcBq = 16;
-    const std::uint32_t dim1 = useFp16Tc
+    const std::uint32_t dim1 = (useFp16Tc || useFp16GqaTc || useF32Mwtc)
         ? static_cast<std::uint32_t>((T_q + kFp16TcBq - 1) / kFp16TcBq)
         : static_cast<std::uint32_t>(T_q);
+    // F32-MWTC splits the GQA group into ceil(nQPerKv/HPB) head-halves (grid.z).
+    const std::uint32_t dim2 = useF32Mwtc
+        ? static_cast<std::uint32_t>((nQPerKv + kMwtcHpb - 1) / kMwtcHpb)
+        : 1u;
+    const std::size_t smemBytes =
+        useFp16GqaTc ? _prefillFp16GqaTcSmemBytes
+      : useF32Mwtc  ? _prefillF32MwtcSmemBytes
+      : std::size_t{0};
     kernel.launch(_ctx.stream(),
                   dim0,
                   dim1,
-                  1,
-                  blockX, 1, 1);
+                  dim2,
+                  blockX, 1, 1,
+                  smemBytes);
 }
 
 void GpuOps::attentionDecodeFlashAsync(const float* q, const void* k,

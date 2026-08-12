@@ -518,6 +518,23 @@ private:
     // Step 3 — opt-in FP16 tensor-core FA-2 prefill (q-tiled, needs fp16 KV).
     // Env MIMIRMIND_ATTN_FP16_TC=1. Bit-near (fp16); parity-gated.
     bool                 _prefillFp16TcEnabled{false};
+    // Step 3.2 — opt-in GQA-head-packed multi-warp FP16 tensor-core FA-2.
+    // Env MIMIRMIND_ATTN_FP16_GQA_TC=1. Needs fp16 KV + GQA shape; bit-near.
+    bool                 _prefillFp16GqaTcEnabled{false};
+    // Lazy one-shot dynamic-smem opt-in cache for the Step 3.2 kernel. The
+    // needed byte count depends on runtime headDim/nQPerKv, so the opt-in
+    // (CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES) is attempted on the
+    // first eligible dispatch; on rejection the path falls back to scalar.
+    bool                 _prefillFp16GqaTcSmemAttempted{false};
+    bool                 _prefillFp16GqaTcSmemOk{false};
+    std::size_t          _prefillFp16GqaTcSmemBytes{0};
+    // Multi-warp TF32 FA-2 for the F32 KV path (opt-in, MIMIRMIND_ATTN_F32_MWTC=1).
+    // Bit-near (TF32); parity-gated. Same lazy dynamic-smem opt-in as the fp16
+    // GQA-TC kernel (dominant term qS+oRun = 2 * HPB*16*headDim*4).
+    bool                 _prefillF32MwtcEnabled{false};
+    bool                 _prefillF32MwtcSmemAttempted{false};
+    bool                 _prefillF32MwtcSmemOk{false};
+    std::size_t          _prefillF32MwtcSmemBytes{0};
     std::size_t          _prefillFlashKTileQ8Configured{128};
     std::size_t          _prefillFlashKTileQ8{128};
     std::string          _prefillFlashKTileQ8Source{"pinned (config)"};
