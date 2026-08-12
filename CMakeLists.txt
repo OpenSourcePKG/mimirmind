@@ -764,6 +764,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/rmsnorm_qkv_fp16.cu
         kernels/cuda/llm/rope_inplace.cu
         kernels/cuda/llm/rope_mrope.cu
+        kernels/cuda/llm/rope_mrope_fp16.cu
         kernels/cuda/llm/rope_mrope_batched.cu
         kernels/cuda/llm/split_head_pair.cu
         kernels/cuda/common/sigmoid_gate_mul.cu
