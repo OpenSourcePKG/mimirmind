@@ -22,6 +22,11 @@ class CudaMemoryAllocator;
 
 namespace mimirmind::compute::cuda {
 
+// cuDNN 9 SDPA prefill-attention wrapper (defined in CudnnSdpaPrefill.hpp;
+// only linked when MIMIRMIND_HAVE_CUDNN_SDPA). Forward-declared so the
+// unique_ptr member needs no header here — the .cpp includes the full type.
+class CudnnSdpaPrefill;
+
 /**
  * HIP/ROCm implementation of the backend-neutral `compute::ComputeOps`
  * interface. Parallel to the Level-Zero `compute::l0::GpuOps` — same
@@ -535,6 +540,13 @@ private:
     bool                 _prefillF32MwtcSmemAttempted{false};
     bool                 _prefillF32MwtcSmemOk{false};
     std::size_t          _prefillF32MwtcSmemBytes{0};
+    // cuDNN 9 SDPA prefill-attention path (opt-in, MIMIRMIND_ATTN_CUDNN=1).
+    // Only present when the build linked cuDNN (MIMIRMIND_HAVE_CUDNN_SDPA).
+    // Bit-near (bf16); parity-gated. Single-forward causal only (posOff==0).
+    bool                 _prefillCudnnEnabled{false};
+#if MIMIRMIND_HAVE_CUDNN_SDPA
+    std::unique_ptr<CudnnSdpaPrefill> _cudnnSdpa;   // lazily created on first use
+#endif
     std::size_t          _prefillFlashKTileQ8Configured{128};
     std::size_t          _prefillFlashKTileQ8{128};
     std::string          _prefillFlashKTileQ8Source{"pinned (config)"};

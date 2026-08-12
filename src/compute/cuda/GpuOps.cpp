@@ -5,6 +5,9 @@
 
 #include "core/gpu/cuda/CudaComputeContext.hpp"
 #include "core/gpu/cuda/CudaKernel.hpp"
+#if MIMIRMIND_HAVE_CUDNN_SDPA
+#include "compute/cuda/CudnnSdpaPrefill.hpp"
+#endif
 #include "core/gpu/cuda/CudaMemoryAllocator.hpp"
 #include "core/gpu/cuda/CudaModule.hpp"
 #include "core/gpu/cuda/CudaStream.hpp"
@@ -730,6 +733,28 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
                     "tile; M=16 real query rows; bit-near (TF32), parity-gated; "
                     "falls back to the F32-GQA/plain kernel");
     }
+
+    // cuDNN 9 SDPA prefill attention (the FMHA-library path that beats the
+    // hand-rolled kernels — cuDNN tiles head_dim=256 past the 99 KiB smem wall).
+    if (const char* cd = std::getenv("MIMIRMIND_ATTN_CUDNN")) {
+        _prefillCudnnEnabled = (cd[0] != '\0' && !(cd[0] == '0' && cd[1] == '\0'));
+    }
+#if MIMIRMIND_HAVE_CUDNN_SDPA
+    if (_prefillCudnnEnabled) {
+        MM_LOG_INFO("cudagpuops",
+                    "F32 prefill attention -> cuDNN 9 SDPA (fused flash attention) "
+                    "enabled (MIMIRMIND_ATTN_CUDNN=1) — single-forward causal GQA, "
+                    "F32 staged to bf16; bit-near (bf16), parity-gated; hand kernel "
+                    "is the fallback (posOff>0 / non-causal / cuDNN error)");
+    }
+#else
+    if (_prefillCudnnEnabled) {
+        MM_LOG_WARN("cudagpuops",
+                    "MIMIRMIND_ATTN_CUDNN=1 set but this build was compiled without "
+                    "cuDNN (MIMIRMIND_ENABLE_CUDNN=OFF) — ignored, using hand kernels");
+        _prefillCudnnEnabled = false;
+    }
+#endif
 
     _prefillFlashKTileQ8Configured = flashPrefillKTileQ8;
     if (flashPrefillKTileQ8 == 0) {
@@ -2708,6 +2733,35 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
     // streaming amortisation. Any other value was resolved / rejected
     // in the ctor.
     const std::size_t nQPerKv = nHeads / nKvHeads;
+
+#if MIMIRMIND_HAVE_CUDNN_SDPA
+    // cuDNN 9 SDPA — preferred F32 prefill-attn path when enabled and eligible.
+    // Handles both the first chunk (positionOffset==0, plain causal) and
+    // continuation chunks (positionOffset>0, bottom-right causal): the T_q
+    // queries attend the full cached K/V range [0, positionOffset+T_q). k/v
+    // already point to cache position 0 (the hand kernel reads them the same
+    // way). No sliding-window support -> fall back for SWA. cuDNN casts
+    // F32->bf16 internally; on any cuDNN error runF32Causal returns false.
+    if (_prefillCudnnEnabled &&
+        kvDtype == runtime::KvDtype::F32 &&
+        slidingWindow == 0 &&
+        nKvHeads > 0 && (nHeads % nKvHeads == 0)) {
+        if (!_cudnnSdpa) _cudnnSdpa = std::make_unique<CudnnSdpaPrefill>();
+        if (_cudnnSdpa->runF32Causal(
+                _ctx.stream().handle(),
+                q, static_cast<const float*>(k), static_cast<const float*>(v), out,
+                toInt32(T_q,                 "cudnn_sdpa T_q"),
+                toInt32(positionOffset + T_q, "cudnn_sdpa T_kv"),
+                toInt32(nHeads,   "cudnn_sdpa nHeads"),
+                toInt32(nKvHeads, "cudnn_sdpa nKvHeads"),
+                toInt32(headDim,  "cudnn_sdpa headDim"),
+                scale)) {
+            return;   // cuDNN handled the prefill attention for this chunk
+        }
+        // else: fall through to the hand-written kernel selection below.
+    }
+#endif
+
     // Multi-warp TF32 FA-2 for the F32 KV path (Step 3.2's F32 sibling; the
     // path Qwen3-Next prefill attention actually takes). Preferred over the
     // scalar P3.a/P3.b F32 kernels when eligible. Needs a dynamic-smem opt-in

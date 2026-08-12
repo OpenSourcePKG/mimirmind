@@ -27,15 +27,20 @@ public:
     CudnnSdpaPrefill(const CudnnSdpaPrefill&)            = delete;
     CudnnSdpaPrefill& operator=(const CudnnSdpaPrefill&) = delete;
 
-    /// Causal GQA prefill attention over F32 device tensors, single forward
-    /// (all query positions attend causally to key positions [0, T_q)).
-    ///   q, out : [T_q, nHeads,   headDim] f32
-    ///   k, v   : [T_q, nKvHeads, headDim] f32
-    /// Runs on `stream` (a CUstream / cudaStream_t). Returns false on any cuDNN
-    /// error (caller should fall back to the hand-written kernel).
+    /// Causal GQA prefill attention over F32 device tensors, POSITION-major
+    /// layout ([position, head, dim] — matches the hand kernels / KV cache):
+    ///   q, out : [T_q,  nHeads,   headDim] f32
+    ///   k, v   : [T_kv, nKvHeads, headDim] f32   (full cache prefix + chunk)
+    /// The T_q query positions occupy the LAST rows of the T_kv key range:
+    /// query row i is at absolute position (T_kv - T_q + i) and attends keys
+    /// [0, T_kv - T_q + i] — i.e. bottom-right-aligned causal. For a first
+    /// chunk T_kv == T_q (plain causal). This covers chunked prefill where a
+    /// continuation chunk (positionOffset>0) attends the cached prefix.
+    /// Runs on `stream` (cudaStream_t). Returns false on any cuDNN error.
     bool runF32Causal(void* stream,
                       const float* q, const float* k, const float* v, float* out,
-                      int T_q, int nHeads, int nKvHeads, int headDim, float scale);
+                      int T_q, int T_kv, int nHeads, int nKvHeads, int headDim,
+                      float scale);
 
 private:
     struct Impl;

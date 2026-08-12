@@ -2615,6 +2615,27 @@ if(MIMIRMIND_ENABLE_CUDA AND MIMIRMIND_ENABLE_CUDNN)
             "MIMIRMIND_ENABLE_CUDNN=ON needs -DMIMIRMIND_CUDNN_ROOT=<cudnn dir (include/,lib/)> "
             "and -DMIMIRMIND_CUDNN_FE_ROOT=<dir with cudnn_frontend.h>.")
     endif()
+
+    # ---- mimirmind_cudnn_sdpa — the CudnnSdpaPrefill wrapper as a linkable lib.
+    # Isolates the heavy cudnn-frontend headers into one TU (like the CUTLASS MoE
+    # lib). Exposes MIMIRMIND_HAVE_CUDNN_SDPA + the clean .hpp to the mimirmind
+    # binary so GpuOps can call it behind the macro.
+    add_library(mimirmind_cudnn_sdpa STATIC src/compute/cuda/CudnnSdpaPrefill.cu)
+    target_include_directories(mimirmind_cudnn_sdpa PRIVATE
+        src "${MIMIRMIND_CUDNN_ROOT}/include" "${MIMIRMIND_CUDNN_FE_ROOT}")
+    target_link_directories(mimirmind_cudnn_sdpa PUBLIC "${MIMIRMIND_CUDNN_ROOT}/lib")
+    target_link_libraries(mimirmind_cudnn_sdpa PUBLIC
+        -l:libcudnn.so.9 CUDA::cudart CUDA::nvrtc)
+    set_target_properties(mimirmind_cudnn_sdpa PROPERTIES
+        CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+        POSITION_INDEPENDENT_CODE ON)
+    # Wire into the serving binary: link + feature macro so GpuOps compiles the
+    # cuDNN prefill-attn path. Opt-in at runtime via MIMIRMIND_ATTN_CUDNN=1.
+    if(TARGET mimirmind)
+        target_link_libraries(mimirmind PRIVATE mimirmind_cudnn_sdpa)
+        target_compile_definitions(mimirmind PRIVATE MIMIRMIND_HAVE_CUDNN_SDPA=1)
+    endif()
+
     add_executable(cudnn_sdpa_parity tests/cudnn_sdpa_parity.cu)
     target_include_directories(cudnn_sdpa_parity PRIVATE
         "${MIMIRMIND_CUDNN_ROOT}/include" "${MIMIRMIND_CUDNN_FE_ROOT}")
