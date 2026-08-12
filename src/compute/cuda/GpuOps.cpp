@@ -235,6 +235,9 @@ struct GpuOps::Impl {
 
     core::cuda::CudaModule _mropeModule;
     core::cuda::CudaKernel _mropeKernel;
+    // FP16-KV IMRoPE (attn-FMHA track building block).
+    core::cuda::CudaModule _mropeFp16Module;
+    core::cuda::CudaKernel _mropeFp16Kernel;
     core::cuda::CudaModule _mropeBatchedModule;
     core::cuda::CudaKernel _mropeBatchedKernel;
     core::cuda::CudaModule _splitHeadPairModule;
@@ -469,6 +472,8 @@ struct GpuOps::Impl {
               _matmulQ8_0VecReorderModule.getFunction("matmul_q8_0_vec_reorder")},
           _mropeModule             {loadCudaModule(ctx, "rope_mrope")},
           _mropeKernel             {_mropeModule.getFunction("rope_mrope")},
+          _mropeFp16Module         {loadCudaModule(ctx, "rope_mrope_fp16")},
+          _mropeFp16Kernel         {_mropeFp16Module.getFunction("rope_mrope_fp16")},
           _mropeBatchedModule      {loadCudaModule(ctx, "rope_mrope_batched")},
           _mropeBatchedKernel      {_mropeBatchedModule.getFunction("rope_mrope_batched")},
           _splitHeadPairModule     {loadCudaModule(ctx, "split_head_pair")},
@@ -1270,10 +1275,10 @@ void GpuOps::mropeInPlaceAsync(void* xBase, std::size_t seqLen,
     if (headDim % 2 != 0) {
         throw std::runtime_error("GpuOps::mropeInPlace: headDim must be even");
     }
-    if (kvDtype != runtime::KvDtype::F32) {
+    if (kvDtype == runtime::KvDtype::Q8_0) {
         throw std::runtime_error(
-            "compute::cuda::GpuOps::mropeInPlaceAsync: only KvDtype::F32 "
-            "is supported (M-Q3N.2 F32-only IMRoPE path)");
+            "compute::cuda::GpuOps::mropeInPlaceAsync: kvDtype=Q8_0 not "
+            "supported (no quantised IMRoPE path)");
     }
     const std::size_t halfDim = headDim / 2;
     const std::size_t total   = seqLen * numHeads * halfDim;
@@ -1281,7 +1286,11 @@ void GpuOps::mropeInPlaceAsync(void* xBase, std::size_t seqLen,
     const std::int32_t startI = toInt32(startPos, "mrope startPos");
     stagedInt32ToDevice(_curLenSlotUsm, startI);
 
-    auto& k = _pimpl->_mropeKernel;
+    // F32 -> rope_mrope; FP16 -> rope_mrope_fp16 (identical arg layout, xBase
+    // reinterpreted as __half* in-kernel). FP16 is the attn-FMHA KV path.
+    auto& k = (kvDtype == runtime::KvDtype::FP16)
+                  ? _pimpl->_mropeFp16Kernel
+                  : _pimpl->_mropeKernel;
     k.setPtr  (0, xBase);
     k.setValue(1, toInt32(seqLen,   "mrope seqLen"));
     k.setValue(2, toInt32(numHeads, "mrope numHeads"));
