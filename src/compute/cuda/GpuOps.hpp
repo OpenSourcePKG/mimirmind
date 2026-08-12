@@ -498,6 +498,13 @@ private:
     // afterwards except for the two setter test hooks.
     bool                 _prefillFlashDisabled{false};
     bool                 _prefillFlashGqaQ8Disabled{false};
+    // P3.a — opt-in GQA-head-packed F32 prefill flash. Env
+    // MIMIRMIND_ATTN_PREFILL_GQA=1. Routes the F32 KV prefill path (the
+    // only path Qwen3-Next reaches) through the head-packed kernel that
+    // reads each K/V row once per KV group instead of once per query
+    // head. Bit-exact with the plain kernel; off by default until the
+    // GB10 A/B validates the win.
+    bool                 _prefillGqaF32Enabled{false};
     std::size_t          _prefillFlashKTileQ8Configured{128};
     std::size_t          _prefillFlashKTileQ8{128};
     std::string          _prefillFlashKTileQ8Source{"pinned (config)"};

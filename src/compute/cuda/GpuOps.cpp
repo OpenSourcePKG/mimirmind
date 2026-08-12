@@ -215,6 +215,9 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _attentionPrefillFlashQ8GqaKernel;
     core::cuda::CudaModule _attentionPrefillFlashQ8GqaKtile64Module;
     core::cuda::CudaKernel _attentionPrefillFlashQ8GqaKtile64Kernel;
+    // P3.a — GQA-head-packed F32 prefill flash (opt-in, F32 KV path).
+    core::cuda::CudaModule _attentionPrefillFlashF32GqaModule;
+    core::cuda::CudaKernel _attentionPrefillFlashF32GqaKernel;
 
     core::cuda::CudaModule _qkvSplitModule;
     core::cuda::CudaKernel _qkvSplitKernel;
@@ -435,6 +438,11 @@ struct GpuOps::Impl {
           _attentionPrefillFlashQ8GqaKtile64Kernel{
               _attentionPrefillFlashQ8GqaKtile64Module.getFunction(
                   "attention_prefill_flash_q8_0_gqa")},
+          _attentionPrefillFlashF32GqaModule{
+              loadCudaModule(ctx, "attention_prefill_flash_f32_gqa")},
+          _attentionPrefillFlashF32GqaKernel{
+              _attentionPrefillFlashF32GqaModule.getFunction(
+                  "attention_prefill_flash_f32_gqa")},
 
           _qkvSplitModule          {loadCudaModule(ctx, "qkv_split")},
           _qkvSplitKernel          {_qkvSplitModule.getFunction("qkv_split")},
@@ -610,6 +618,18 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
     _prefillFlashDisabled      = !flashPrefillEnabled;
     _prefillFlashGqaQ8Disabled = !flashPrefillGqaQ8Enabled;
     _q8_0ReorderMode           = q8_0ReorderMode;
+
+    // P3.a opt-in: GQA-head-packed F32 prefill flash (env, default off).
+    if (const char* g = std::getenv("MIMIRMIND_ATTN_PREFILL_GQA")) {
+        _prefillGqaF32Enabled = (g[0] != '\0' && !(g[0] == '0' && g[1] == '\0'));
+    }
+    if (_prefillGqaF32Enabled) {
+        MM_LOG_INFO("hipgpuops",
+                    "F32 prefill attention -> GQA-head-packed kernel enabled "
+                    "(MIMIRMIND_ATTN_PREFILL_GQA=1) — each K/V row read once per "
+                    "KV group instead of once per query head; bit-exact with the "
+                    "plain flash kernel, plain kernel is the fallback");
+    }
 
     _prefillFlashKTileQ8Configured = flashPrefillKTileQ8;
     if (flashPrefillKTileQ8 == 0) {
@@ -2508,6 +2528,12 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         !_prefillFlashGqaQ8Disabled &&
         (nQPerKv > 1) &&
         (nQPerKv <= kFlashPrefillGqaMaxQPerKv);
+    // P3.a — opt-in GQA-head-packed F32 kernel (bit-exact fast path).
+    const bool useF32Gqa =
+        (kvDtype == runtime::KvDtype::F32) &&
+        _prefillGqaF32Enabled &&
+        (nQPerKv > 1) &&
+        (nQPerKv <= kFlashPrefillGqaMaxQPerKv);
 
     core::cuda::CudaKernel* kernelPtr = &_pimpl->_attentionPrefillFlashKernel;
     if (kvDtype == runtime::KvDtype::FP16) {
@@ -2520,6 +2546,8 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         } else {
             kernelPtr = &_pimpl->_attentionPrefillFlashQ8Kernel;
         }
+    } else if (useF32Gqa) {
+        kernelPtr = &_pimpl->_attentionPrefillFlashF32GqaKernel;
     }
     auto& kernel = *kernelPtr;
 
@@ -2540,8 +2568,8 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
     kernel.setValue(10, toInt32(slidingWindow, "prefill_flash slidingWindow"));
 
     // Plain kernels: one WG per (query-head, query-position).
-    // GQA-packed kernel: one WG per (kv-head, query-position).
-    const std::uint32_t dim0 = useQ8Gqa
+    // GQA-packed kernels (Q8_0 or F32): one WG per (kv-head, query-position).
+    const std::uint32_t dim0 = (useQ8Gqa || useF32Gqa)
         ? static_cast<std::uint32_t>(nKvHeads)
         : static_cast<std::uint32_t>(nHeads);
     kernel.launch(_ctx.stream(),
