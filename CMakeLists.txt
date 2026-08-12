@@ -26,6 +26,13 @@ project(mimirmind
 option(MIMIRMIND_ENABLE_L0   "Build the Level Zero backend and all L0-tied consumers" ON)
 option(MIMIRMIND_ENABLE_HIP  "Build the HIP backend (placeholder — no impl on main yet)" OFF)
 option(MIMIRMIND_ENABLE_CUDA "Build the CUDA backend skeleton (DGX Spark bringup)" OFF)
+# cuDNN 9 SDPA (fused flash attention) — the D256 prefill-attn path that the
+# hand-rolled tensor-core kernels cannot beat on sm_121 (99 KiB smem cap).
+# Opt-in; needs cuDNN 9.x + cudnn-frontend headers (see MIMIRMIND_CUDNN_ROOT /
+# MIMIRMIND_CUDNN_FE_ROOT). Requires MIMIRMIND_ENABLE_CUDA.
+option(MIMIRMIND_ENABLE_CUDNN "Build the cuDNN SDPA attention path (GB10 prefill)" OFF)
+set(MIMIRMIND_CUDNN_ROOT    "" CACHE PATH "cuDNN install root (has include/ and lib/)")
+set(MIMIRMIND_CUDNN_FE_ROOT "" CACHE PATH "cudnn-frontend include root (has cudnn_frontend.h)")
 
 # C++23 required — std::expected in src/core/ipc/ for the M-Munin
 # error-return convention (see decisions/2026-07-13-m-munin-scope.md).
@@ -2596,6 +2603,46 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_dependencies(cuda_parity_tests cuda_kernels)
     target_include_directories(cuda_parity_tests PRIVATE tests)
     target_link_libraries(cuda_parity_tests PRIVATE mimirmind_core_cuda)
+endif()
+
+# ---- cudnn_sdpa_parity — cuDNN 9 SDPA (D256 GQA causal prefill) parity/latency
+# Standalone gate: proves our build links cuDNN on aarch64 + the frontend headers
+# compile + the kernel finalizes/runs/is-correct on sm_121. No engine deps.
+#   cmake --build build-cuda --target cudnn_sdpa_parity && ./build-cuda/cudnn_sdpa_parity [seqlen]
+if(MIMIRMIND_ENABLE_CUDA AND MIMIRMIND_ENABLE_CUDNN)
+    if(NOT MIMIRMIND_CUDNN_ROOT OR NOT MIMIRMIND_CUDNN_FE_ROOT)
+        message(FATAL_ERROR
+            "MIMIRMIND_ENABLE_CUDNN=ON needs -DMIMIRMIND_CUDNN_ROOT=<cudnn dir (include/,lib/)> "
+            "and -DMIMIRMIND_CUDNN_FE_ROOT=<dir with cudnn_frontend.h>.")
+    endif()
+    add_executable(cudnn_sdpa_parity tests/cudnn_sdpa_parity.cu)
+    target_include_directories(cudnn_sdpa_parity PRIVATE
+        "${MIMIRMIND_CUDNN_ROOT}/include" "${MIMIRMIND_CUDNN_FE_ROOT}")
+    target_link_directories(cudnn_sdpa_parity PRIVATE "${MIMIRMIND_CUDNN_ROOT}/lib")
+    # libcudnn ships as libcudnn.so.9 (no bare .so symlink in the wheel) — link the
+    # soname directly; -lnvrtc for the frontend's JIT path.
+    target_link_libraries(cudnn_sdpa_parity PRIVATE
+        -l:libcudnn.so.9 CUDA::cudart CUDA::nvrtc)
+    # cudnn-frontend is C++17; pin the dialect (the CUDA target otherwise inherits
+    # the project's higher default) and emit PTX (arch off, like the kernels).
+    set_target_properties(cudnn_sdpa_parity PROPERTIES
+        CUDA_ARCHITECTURES OFF
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON)
+
+    # Inc 2 — the reusable CudnnSdpaPrefill wrapper (F32 in/out) vs a CPU ref.
+    add_executable(cudnn_sdpa_wrapper_test
+        tests/cudnn_sdpa_wrapper_test.cu
+        src/compute/cuda/CudnnSdpaPrefill.cu)
+    target_include_directories(cudnn_sdpa_wrapper_test PRIVATE
+        src "${MIMIRMIND_CUDNN_ROOT}/include" "${MIMIRMIND_CUDNN_FE_ROOT}")
+    target_link_directories(cudnn_sdpa_wrapper_test PRIVATE "${MIMIRMIND_CUDNN_ROOT}/lib")
+    target_link_libraries(cudnn_sdpa_wrapper_test PRIVATE
+        -l:libcudnn.so.9 CUDA::cudart CUDA::nvrtc)
+    set_target_properties(cudnn_sdpa_wrapper_test PROPERTIES
+        CUDA_ARCHITECTURES OFF
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON)
 endif()
 
 # ============================================================================
