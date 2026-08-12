@@ -792,6 +792,20 @@ public:
                                       std::size_t  kvDim,
                                       std::size_t  writeOffset) = 0;
 
+    /// FP16-KV staging commit: cast an fp32 K/V scratch [T, kvDim] into the
+    /// fp16 cache at the curLen `writeOffset`. The fp16 analogue of
+    /// kvQuantCommitQ8Async for models that stage K/V through fp32 (non-fused
+    /// QKV). Default: unsupported — only the CUDA backend overrides it.
+    virtual void kvCommitFp16Async(const float* xSrc,
+                                   void*        kvDst,
+                                   std::size_t  T,
+                                   std::size_t  kvDim,
+                                   std::size_t  writeOffset) {
+        (void)xSrc; (void)kvDst; (void)T; (void)kvDim; (void)writeOffset;
+        throw std::runtime_error(
+            "kvCommitFp16Async: not supported on this backend");
+    }
+
     virtual void qkvSplitAsync(const float*     fused,
                                float*           Yq,
                                void*            YkBase,

@@ -325,6 +325,10 @@ public:
                               std::size_t T, std::size_t kvDim,
                               std::size_t writeOffset) override;
 
+    void kvCommitFp16Async(const float* xSrc, void* kvDst,
+                           std::size_t T, std::size_t kvDim,
+                           std::size_t writeOffset) override;
+
     void qkvSplitAsync(const float* fused, float* Yq,
                        void* YkBase, void* YvBase,
                        std::size_t M, std::size_t Nq, std::size_t Nkv,

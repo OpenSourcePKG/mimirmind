@@ -229,6 +229,9 @@ struct GpuOps::Impl {
 
     core::cuda::CudaModule _kvQuantCommitQ8Module;
     core::cuda::CudaKernel _kvQuantCommitQ8Kernel;
+    // FP16-KV staging commit (fp32 scratch -> fp16 cache cast).
+    core::cuda::CudaModule _kvCommitFp16Module;
+    core::cuda::CudaKernel _kvCommitFp16Kernel;
 
     core::cuda::CudaModule _matmulQ8_0VecReorderModule;
     core::cuda::CudaKernel _matmulQ8_0VecReorderKernel;
@@ -466,6 +469,9 @@ struct GpuOps::Impl {
           _kvQuantCommitQ8Module   {loadCudaModule(ctx, "kv_quant_commit_q8_0")},
           _kvQuantCommitQ8Kernel   {
               _kvQuantCommitQ8Module.getFunction("kv_quant_commit_q8_0")},
+          _kvCommitFp16Module      {loadCudaModule(ctx, "kv_commit_fp16")},
+          _kvCommitFp16Kernel      {
+              _kvCommitFp16Module.getFunction("kv_commit_fp16")},
 
           _matmulQ8_0VecReorderModule{loadCudaModule(ctx, "matmul_q8_0_vec_reorder")},
           _matmulQ8_0VecReorderKernel{
@@ -2391,6 +2397,30 @@ void GpuOps::kvQuantCommitQ8Async(const float* xSrc, void* kvDst,
              static_cast<std::uint32_t>(nBlocksPerRow),
              1,
              kKvQuantCommitLocalSize, 1, 1);
+}
+
+void GpuOps::kvCommitFp16Async(const float* xSrc, void* kvDst,
+                               std::size_t T, std::size_t kvDim,
+                               std::size_t writeOffset) {
+    if (T == 0 || kvDim == 0) {
+        return;
+    }
+    // writeOffset (= curLen) goes through the shared curLen slot so kvDst stays
+    // a stable layer-base pointer across replays; the kernel adds curLen*kvDim.
+    const std::int32_t offI =
+        toInt32(writeOffset, "kvCommitFp16 writeOffset");
+    stagedInt32ToDevice(_curLenSlotUsm, offI);
+
+    const std::size_t total = T * kvDim;
+    auto& k = _pimpl->_kvCommitFp16Kernel;
+    k.setPtr  (0, xSrc);
+    k.setPtr  (1, kvDst);
+    k.setValue(2, toInt32(T,     "kvCommitFp16 T"));
+    k.setValue(3, toInt32(kvDim, "kvCommitFp16 kvDim"));
+    k.setPtr  (4, _curLenSlotUsm);
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
 }
 
 void GpuOps::qkvSplitAsync(const float* fused, float* Yq,
