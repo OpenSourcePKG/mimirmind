@@ -1251,7 +1251,7 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
         // loaded weights are stable) and run it through the TF32/BF16 tensor-core
         // GEMM — the same kernel the BF16 dense projections use, F32 activations
         // staged in-kernel. Default on with _tf32Tc/_bf16Tc (E-FP4.3/.5).
-        if (M > 1 && _useF32TcPrefill && (_tf32Tc || _bf16Tc)) {
+        if (M > 1 && _useF32TcPrefill && _f32TcAllowed && (_tf32Tc || _bf16Tc)) {
             auto cit = _pimpl->_bf16FromF32Cache.find(W);
             if (cit == _pimpl->_bf16FromF32Cache.end()) {
                 const std::size_t wElems = N * K;
