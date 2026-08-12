@@ -762,6 +762,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/rmsnorm_no_weight.cu
         kernels/cuda/llm/rmsnorm_qkv.cu
         kernels/cuda/llm/rmsnorm_qkv_fp16.cu
+        kernels/cuda/llm/rmsnorm_qkv_f32in_fp16out.cu
         kernels/cuda/llm/rope_inplace.cu
         kernels/cuda/llm/rope_mrope.cu
         kernels/cuda/llm/rope_mrope_fp16.cu
