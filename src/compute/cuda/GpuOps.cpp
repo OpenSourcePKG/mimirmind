@@ -209,6 +209,9 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _attentionPrefillFlashKernel;
     core::cuda::CudaModule _attentionPrefillFlashFp16Module;
     core::cuda::CudaKernel _attentionPrefillFlashFp16Kernel;
+    // Step 3 — FP16 tensor-core FA-2 prefill (q-tiled, opt-in).
+    core::cuda::CudaModule _attentionPrefillFlashFp16TcModule;
+    core::cuda::CudaKernel _attentionPrefillFlashFp16TcKernel;
     core::cuda::CudaModule _attentionPrefillFlashQ8Module;
     core::cuda::CudaKernel _attentionPrefillFlashQ8Kernel;
     core::cuda::CudaModule _attentionPrefillFlashQ8GqaModule;
@@ -436,6 +439,11 @@ struct GpuOps::Impl {
               loadCudaModule(ctx, "attention_prefill_flash_fp16")},
           _attentionPrefillFlashFp16Kernel{
               _attentionPrefillFlashFp16Module.getFunction("attention_prefill_flash_fp16")},
+          _attentionPrefillFlashFp16TcModule{
+              loadCudaModule(ctx, "attention_prefill_flash_fp16_tc")},
+          _attentionPrefillFlashFp16TcKernel{
+              _attentionPrefillFlashFp16TcModule.getFunction(
+                  "attention_prefill_flash_fp16_tc")},
           _attentionPrefillFlashQ8Module{
               loadCudaModule(ctx, "attention_prefill_flash_q8_0")},
           _attentionPrefillFlashQ8Kernel{
@@ -666,6 +674,18 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
                     "(MIMIRMIND_ATTN_TC_PREFILL=1) — QK^T and P.V on TF32 tensor "
                     "cores over the head-packed tiling; bit-near (TF32), "
                     "parity-gated; plain/GQA kernel is the fallback");
+    }
+
+    // Step 3 opt-in: FP16 tensor-core FA-2 prefill (requires fp16 KV cache).
+    if (const char* ft = std::getenv("MIMIRMIND_ATTN_FP16_TC")) {
+        _prefillFp16TcEnabled = (ft[0] != '\0' && !(ft[0] == '0' && ft[1] == '\0'));
+    }
+    if (_prefillFp16TcEnabled) {
+        MM_LOG_INFO("hipgpuops",
+                    "FP16 prefill attention -> tensor-core FA-2 kernel enabled "
+                    "(MIMIRMIND_ATTN_FP16_TC=1) — q-tiled wmma m16n16k16 over the "
+                    "fp16 KV cache; bit-near (fp16), parity-gated; scalar fp16 "
+                    "kernel is the fallback");
     }
 
     _prefillFlashKTileQ8Configured = flashPrefillKTileQ8;
@@ -2665,10 +2685,18 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         _prefillGqaF32Enabled &&
         (nQPerKv > 1) &&
         (nQPerKv <= kFlashPrefillGqaMaxQPerKv);
+    // Step 3 — opt-in FP16 tensor-core FA-2 kernel (q-tiled, headDim-bounded).
+    const bool useFp16Tc =
+        (kvDtype == runtime::KvDtype::FP16) &&
+        _prefillFp16TcEnabled &&
+        (headDim <= kFlashTcMaxHeadDim) &&
+        (headDim % 16 == 0);
 
     core::cuda::CudaKernel* kernelPtr = &_pimpl->_attentionPrefillFlashKernel;
     if (kvDtype == runtime::KvDtype::FP16) {
-        kernelPtr = &_pimpl->_attentionPrefillFlashFp16Kernel;
+        kernelPtr = useFp16Tc
+            ? &_pimpl->_attentionPrefillFlashFp16TcKernel
+            : &_pimpl->_attentionPrefillFlashFp16Kernel;
     } else if (kvDtype == runtime::KvDtype::Q8_0) {
         if (useQ8Gqa) {
             kernelPtr = (_prefillFlashKTileQ8 == 64)
@@ -2705,14 +2733,20 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
     const std::uint32_t dim0 = (useQ8Gqa || useF32Gqa || useF32Tc)
         ? static_cast<std::uint32_t>(nKvHeads)
         : static_cast<std::uint32_t>(nHeads);
-    // The TF32 tensor-core kernel is warp-collective — it must launch with a
-    // full 32-lane block; the scalar kernels use the 16-lane half-wave.
-    const std::uint32_t blockX = useF32Tc
+    // The tensor-core kernels are warp-collective — full 32-lane block; the
+    // scalar kernels use the 16-lane half-wave.
+    const std::uint32_t blockX = (useF32Tc || useFp16Tc)
         ? 32u
         : static_cast<std::uint32_t>(kAttentionLocalSize);
+    // FP16-TC tiles ATTN_TC16_BQ=16 query positions per CTA; every other kernel
+    // takes one WG per query position (dim1 = T_q).
+    constexpr std::uint32_t kFp16TcBq = 16;
+    const std::uint32_t dim1 = useFp16Tc
+        ? static_cast<std::uint32_t>((T_q + kFp16TcBq - 1) / kFp16TcBq)
+        : static_cast<std::uint32_t>(T_q);
     kernel.launch(_ctx.stream(),
                   dim0,
-                  static_cast<std::uint32_t>(T_q),
+                  dim1,
                   1,
                   blockX, 1, 1);
 }

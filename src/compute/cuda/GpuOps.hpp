@@ -515,6 +515,9 @@ private:
     // Requires the F32 KV GQA shape (headDim<=256, mult of 16); falls
     // back to the plain kernel otherwise. Implies the head-packed tiling.
     bool                 _prefillTcF32Enabled{false};
+    // Step 3 — opt-in FP16 tensor-core FA-2 prefill (q-tiled, needs fp16 KV).
+    // Env MIMIRMIND_ATTN_FP16_TC=1. Bit-near (fp16); parity-gated.
+    bool                 _prefillFp16TcEnabled{false};
     std::size_t          _prefillFlashKTileQ8Configured{128};
     std::size_t          _prefillFlashKTileQ8{128};
     std::string          _prefillFlashKTileQ8Source{"pinned (config)"};
