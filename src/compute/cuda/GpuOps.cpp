@@ -218,6 +218,9 @@ struct GpuOps::Impl {
     // P3.a — GQA-head-packed F32 prefill flash (opt-in, F32 KV path).
     core::cuda::CudaModule _attentionPrefillFlashF32GqaModule;
     core::cuda::CudaKernel _attentionPrefillFlashF32GqaKernel;
+    // P3.b — TF32 tensor-core GQA-head-packed F32 prefill flash (opt-in).
+    core::cuda::CudaModule _attentionPrefillFlashF32GqaTcModule;
+    core::cuda::CudaKernel _attentionPrefillFlashF32GqaTcKernel;
 
     core::cuda::CudaModule _qkvSplitModule;
     core::cuda::CudaKernel _qkvSplitKernel;
@@ -443,6 +446,11 @@ struct GpuOps::Impl {
           _attentionPrefillFlashF32GqaKernel{
               _attentionPrefillFlashF32GqaModule.getFunction(
                   "attention_prefill_flash_f32_gqa")},
+          _attentionPrefillFlashF32GqaTcModule{
+              loadCudaModule(ctx, "attention_prefill_flash_f32_gqa_tc")},
+          _attentionPrefillFlashF32GqaTcKernel{
+              _attentionPrefillFlashF32GqaTcModule.getFunction(
+                  "attention_prefill_flash_f32_gqa_tc")},
 
           _qkvSplitModule          {loadCudaModule(ctx, "qkv_split")},
           _qkvSplitKernel          {_qkvSplitModule.getFunction("qkv_split")},
@@ -629,6 +637,18 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
                     "(MIMIRMIND_ATTN_PREFILL_GQA=1) — each K/V row read once per "
                     "KV group instead of once per query head; bit-exact with the "
                     "plain flash kernel, plain kernel is the fallback");
+    }
+
+    // P3.b opt-in: TF32 tensor-core GQA-head-packed F32 prefill flash.
+    if (const char* t = std::getenv("MIMIRMIND_ATTN_TC_PREFILL")) {
+        _prefillTcF32Enabled = (t[0] != '\0' && !(t[0] == '0' && t[1] == '\0'));
+    }
+    if (_prefillTcF32Enabled) {
+        MM_LOG_INFO("hipgpuops",
+                    "F32 prefill attention -> TF32 tensor-core GQA kernel enabled "
+                    "(MIMIRMIND_ATTN_TC_PREFILL=1) — QK^T and P.V on TF32 tensor "
+                    "cores over the head-packed tiling; bit-near (TF32), "
+                    "parity-gated; plain/GQA kernel is the fallback");
     }
 
     _prefillFlashKTileQ8Configured = flashPrefillKTileQ8;
@@ -2528,8 +2548,17 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         !_prefillFlashGqaQ8Disabled &&
         (nQPerKv > 1) &&
         (nQPerKv <= kFlashPrefillGqaMaxQPerKv);
+    // P3.b — opt-in TF32 tensor-core GQA kernel (bit-near, headDim-bounded).
+    const bool useF32Tc =
+        (kvDtype == runtime::KvDtype::F32) &&
+        _prefillTcF32Enabled &&
+        (nQPerKv > 1) &&
+        (nQPerKv <= kFlashPrefillGqaMaxQPerKv) &&
+        (headDim <= kFlashTcMaxHeadDim) &&
+        (headDim % 16 == 0);
     // P3.a — opt-in GQA-head-packed F32 kernel (bit-exact fast path).
     const bool useF32Gqa =
+        !useF32Tc &&
         (kvDtype == runtime::KvDtype::F32) &&
         _prefillGqaF32Enabled &&
         (nQPerKv > 1) &&
@@ -2546,6 +2575,8 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         } else {
             kernelPtr = &_pimpl->_attentionPrefillFlashQ8Kernel;
         }
+    } else if (useF32Tc) {
+        kernelPtr = &_pimpl->_attentionPrefillFlashF32GqaTcKernel;
     } else if (useF32Gqa) {
         kernelPtr = &_pimpl->_attentionPrefillFlashF32GqaKernel;
     }
@@ -2568,15 +2599,20 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
     kernel.setValue(10, toInt32(slidingWindow, "prefill_flash slidingWindow"));
 
     // Plain kernels: one WG per (query-head, query-position).
-    // GQA-packed kernels (Q8_0 or F32): one WG per (kv-head, query-position).
-    const std::uint32_t dim0 = (useQ8Gqa || useF32Gqa)
+    // GQA-packed kernels (Q8_0 / F32 / F32-TC): one WG per (kv-head, query-position).
+    const std::uint32_t dim0 = (useQ8Gqa || useF32Gqa || useF32Tc)
         ? static_cast<std::uint32_t>(nKvHeads)
         : static_cast<std::uint32_t>(nHeads);
+    // The TF32 tensor-core kernel is warp-collective — it must launch with a
+    // full 32-lane block; the scalar kernels use the 16-lane half-wave.
+    const std::uint32_t blockX = useF32Tc
+        ? 32u
+        : static_cast<std::uint32_t>(kAttentionLocalSize);
     kernel.launch(_ctx.stream(),
                   dim0,
                   static_cast<std::uint32_t>(T_q),
                   1,
-                  kAttentionLocalSize, 1, 1);
+                  blockX, 1, 1);
 }
 
 void GpuOps::attentionDecodeFlashAsync(const float* q, const void* k,

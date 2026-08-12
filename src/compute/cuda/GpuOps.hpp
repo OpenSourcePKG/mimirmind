@@ -505,6 +505,12 @@ private:
     // head. Bit-exact with the plain kernel; off by default until the
     // GB10 A/B validates the win.
     bool                 _prefillGqaF32Enabled{false};
+    // P3.b — opt-in TF32 tensor-core GQA-head-packed F32 prefill flash.
+    // Env MIMIRMIND_ATTN_TC_PREFILL=1. Runs QK^T and P.V on TF32 tensor
+    // cores (bit-NEAR, not bit-exact — parity-gated with a tolerance).
+    // Requires the F32 KV GQA shape (headDim<=256, mult of 16); falls
+    // back to the plain kernel otherwise. Implies the head-packed tiling.
+    bool                 _prefillTcF32Enabled{false};
     std::size_t          _prefillFlashKTileQ8Configured{128};
     std::size_t          _prefillFlashKTileQ8{128};
     std::string          _prefillFlashKTileQ8Source{"pinned (config)"};
@@ -538,6 +544,11 @@ private:
     // `attention_prefill_flash_q8_0_gqa.hip`. Dispatch falls back to
     // the plain Q8_0 kernel when nQPerKv exceeds this.
     static constexpr std::size_t kFlashPrefillGqaMaxQPerKv = 8;
+    // Cap on headDim for the P3.b TF32 tensor-core prefill kernel — must
+    // match ATTN_TC_MAX_HEADDIM (shared-tile sizing) in
+    // attention_prefill_flash_f32_gqa_tc.cu. Dispatch falls back to the
+    // scalar kernel above this.
+    static constexpr std::size_t kFlashTcMaxHeadDim = 256;
 
     // Attention fan-out. `attentionAsync` dispatches to one of these
     // three helpers based on T_q, T_k, positionOffset and kvDtype,
