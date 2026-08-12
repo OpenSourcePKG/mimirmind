@@ -364,6 +364,13 @@ private:
     // whose bounded magnitude keeps the per-tensor E4M3 activation scale from
     // crushing precision — so the M==1-only gate can be lifted for these.
     bool                           _useCublasFp8Prefill{false};
+    // Route batched (M>1) F32 GEMMs through the BF16/TF32 tensor-core kernel
+    // (weight cast to BF16 once, cached) instead of the per-row F32 vec launches.
+    // Opt-in MIMIRMIND_F32_TC_PREFILL=1: huge win for models with small F32
+    // weights hit at prefill M (the MoE router ffn_gate_inp, GDN ssm_beta/alpha,
+    // shared-expert router), but TF32's 10-bit mantissa is too coarse for the
+    // precision-sensitive encoder/reranker path, so it stays off by default.
+    bool                           _useF32TcPrefill{false};
     // Route the M==1 blocked-NVFP4 vec (shexp / full-attn decode) through the
     // de-interleaved uint4-coalesced kernel. Opt-in MIMIRMIND_NVFP4_DEINT=1.
     bool                           _useDeintVec{false};
