@@ -2686,6 +2686,35 @@ void GpuOps::attentionEncoderAsync(const float* q, const float* k,
                   kAttentionLocalSize, 1, 1);
 }
 
+void GpuOps::attentionEncoderCrossAsync(const float* q, const float* k,
+                                        const float* v, std::size_t Tq,
+                                        std::size_t Tk, std::size_t nHeads,
+                                        std::size_t nKvHeads,
+                                        std::size_t headDim, float scale,
+                                        float* out) {
+    if (Tq == 0 || Tk == 0 || nHeads == 0) {
+        return;
+    }
+    // Same kernel as attentionEncoderAsync — it already reads T_k (arg 4)
+    // independently of the query grid, so distinct Tq/Tk just means launching
+    // grid.y = Tq while passing T_k = Tk. Query (blockIdx.y) attends to all Tk.
+    auto& kernel = _pimpl->_attentionEncoderKernel;
+    kernel.setPtr  (0, q);
+    kernel.setPtr  (1, k);
+    kernel.setPtr  (2, v);
+    kernel.setPtr  (3, out);
+    kernel.setValue(4, toInt32(Tk,       "attnEncCross T_k"));
+    kernel.setValue(5, toInt32(nHeads,   "attnEncCross nHeads"));
+    kernel.setValue(6, toInt32(nKvHeads, "attnEncCross nKvHeads"));
+    kernel.setValue(7, toInt32(headDim,  "attnEncCross headDim"));
+    kernel.setValue(8, scale);
+    kernel.launch(_ctx.stream(),
+                  static_cast<std::uint32_t>(nHeads),
+                  static_cast<std::uint32_t>(Tq),
+                  1,
+                  kAttentionLocalSize, 1, 1);
+}
+
 void GpuOps::attentionEncoderBatchedAsync(const float* q, const float* k,
                                           const float* v, float* out,
                                           const std::int32_t* seqLens,

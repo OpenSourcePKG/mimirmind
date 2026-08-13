@@ -356,6 +356,12 @@ public:
                                std::size_t nKvHeads, std::size_t headDim,
                                float scale, float* out) override;
 
+    void attentionEncoderCrossAsync(const float* q, const float* k,
+                                    const float* v, std::size_t Tq,
+                                    std::size_t Tk, std::size_t nHeads,
+                                    std::size_t nKvHeads, std::size_t headDim,
+                                    float scale, float* out) override;
+
     void attentionEncoderBatchedAsync(const float* q, const float* k,
                                       const float* v, float* out,
                                       const std::int32_t* seqLens,

@@ -8,16 +8,13 @@
 #include "compute/ComputeOps.hpp"
 #include "core/gguf/GgufTypes.hpp"
 
-#include <algorithm>
 #include <cmath>
-#include <limits>
-#include <vector>
 
 namespace mimirmind::runtime::dflash {
 
 namespace {
 // Qwen3.6 drafter config.json constants (match the golden / the checkpoint).
-// TODO(P3.3): parse these from config.json instead of hard-coding.
+// TODO(later): parse these from config.json instead of hard-coding.
 constexpr float kRmsEps   = 1e-6F;    // rms_norm_eps
 constexpr float kRopeBase = 1e7F;     // rope_parameters.rope_theta
 } // namespace
@@ -54,7 +51,6 @@ void DFlashDraftRunner::draftForward(const float* noise,
     const std::size_t nQ    = c.nQHeads;             // 32
     const std::size_t nKv   = c.nKvHeads;            // 8
     const std::size_t inter = c.inter;               // 6144
-    const std::size_t gqa   = nQ / nKv;              // 4
     const std::size_t qDim  = nQ * hd;               // 4096
     const std::size_t kvDim = nKv * hd;              // 1024
     const std::size_t S     = ctxLen + bs;           // total K/V length
@@ -97,8 +93,6 @@ void DFlashDraftRunner::draftForward(const float* noise,
     // h = noise (device->device copy on the stream).
     _ops.appendMemoryCopy(h, noise, bs * H * sizeof(float));
 
-    std::vector<float> hq(bs * qDim), hk(S * kvDim), hv(S * kvDim), ha(bs * qDim);
-
     for (std::size_t L = 0; L < _m.layerCount(); ++L) {
         const auto& w = _m.layer(L);
 
@@ -119,38 +113,11 @@ void DFlashDraftRunner::draftForward(const float* noise,
         _ops.ropeInPlaceAsync(q, bs, nQ, hd, ctxLen, kRopeBase);
         _ops.ropeInPlaceAsync(k, S, nKv, hd, 0, kRopeBase);
 
-        // Host attention (parity path): softmax(Q·Kᵀ·scale)·V, GQA, non-causal.
-        _ops.flush();
-        _ops.readbackToHost(hq.data(), q, bs * qDim * sizeof(float));
-        _ops.readbackToHost(hk.data(), k, S * kvDim * sizeof(float));
-        _ops.readbackToHost(hv.data(), v, S * kvDim * sizeof(float));
-        std::vector<float> sc(S);
-        for (std::size_t qh = 0; qh < nQ; ++qh) {
-            const std::size_t kvh = qh / gqa;
-            for (std::size_t i = 0; i < bs; ++i) {
-                const float* qp = &hq[(i * nQ + qh) * hd];
-                float maxs = -std::numeric_limits<float>::infinity();
-                for (std::size_t j = 0; j < S; ++j) {
-                    const float* kp = &hk[(j * nKv + kvh) * hd];
-                    float dot = 0.0F;
-                    for (std::size_t d = 0; d < hd; ++d) { dot += qp[d] * kp[d]; }
-                    sc[j] = dot * scale;
-                    maxs  = std::max(maxs, sc[j]);
-                }
-                float sum = 0.0F;
-                for (std::size_t j = 0; j < S; ++j) { sc[j] = std::exp(sc[j] - maxs); sum += sc[j]; }
-                const float inv = 1.0F / sum;
-                float* ap = &ha[(i * nQ + qh) * hd];
-                for (std::size_t d = 0; d < hd; ++d) {
-                    float acc = 0.0F;
-                    for (std::size_t j = 0; j < S; ++j) {
-                        acc += sc[j] * hv[(j * nKv + kvh) * hd + d];
-                    }
-                    ap[d] = acc * inv;
-                }
-            }
-        }
-        _ops.uploadHostBytes(attn, ha.data(), bs * qDim * sizeof(float));
+        // Device non-causal GQA block attention (P3.3): Q is the noise block
+        // [bs, nQ, hd], K/V are [ctx ; noise] [S, nKv, hd]; every query attends
+        // to all S keys (full window, block-diffusion bidirectional). Replaces
+        // the earlier host parity loop — stays async on the stream.
+        _ops.attentionEncoderCrossAsync(q, k, v, bs, S, nQ, nKv, hd, scale, attn);
 
         // o_proj, attention residual + post_attn_ln, MLP, MLP residual.
         _mm.matmulAsync(GgmlType::BF16, w.oProj, H, qDim, attn, bs, ao, scr);

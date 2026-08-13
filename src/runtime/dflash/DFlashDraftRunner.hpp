@@ -21,8 +21,9 @@ class DFlashDraftModel;
  *
  * Built incrementally against the z-lab `model.py` reference golden
  * (`tests/dflash_forward_parity_test`):
- *   P3.1 — materializeContext (fc -> hidden_norm)          [this file]
- *   P3.2 — draftForward (6-layer non-causal block attn)    [later]
+ *   P3.1 — materializeContext (fc -> hidden_norm)
+ *   P3.2 — draftForward (6-layer non-causal block attn, host parity attn)
+ *   P3.3 — draftForward block attention on-device (attentionEncoderCross)
  *
  * Not thread-safe. Holds references to the model / ops; they must outlive it.
  */
@@ -50,9 +51,9 @@ public:
     /// block transformer and writes the final-norm output `out` [bs,H] (F32,
     /// device). Rope positions match the reference golden: K over
     /// [0 .. ctxLen+bs-1], Q over [ctxLen .. ctxLen+bs-1]. The attention core
-    /// (softmax(Q·Kᵀ·scale)·V, GQA, non-causal, full window) is computed on the
-    /// host for now — a parity path; a device kernel replaces it in P3.3.
-    /// Blocks internally (syncs for the host attention).
+    /// (softmax(Q·Kᵀ·scale)·V, GQA, non-causal, full window) runs on-device via
+    /// `attentionEncoderCrossAsync` (P3.3). Async on the stream; blocks once at
+    /// the end (flush) before returning `out`.
     void draftForward(const float* noise,
                       const float* target_hidden,
                       std::size_t  bs,

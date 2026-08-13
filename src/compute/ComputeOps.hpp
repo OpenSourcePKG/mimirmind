@@ -849,6 +849,22 @@ public:
             "attentionEncoderAsync: not supported on this backend");
     }
 
+    // Non-causal cross attention with distinct query / key-value lengths.
+    // Same math as attentionEncoderAsync (full-window softmax(Q·Kᵀ·scale)·V,
+    // GQA hkv=(hq*nKvHeads)/nHeads) but Tq != Tk: query (Tq rows) attends to
+    // all Tk keys. Layout q:[Tq,nHeads,headDim], k/v:[Tk,nKvHeads,headDim],
+    // out:[Tq,nHeads,headDim]. Used by the DFlash draft-forward block
+    // attention, where Q is the noise block (bs) and K/V are [ctx ; noise].
+    virtual void attentionEncoderCrossAsync(const float* /*q*/, const float* /*k*/,
+                                            const float* /*v*/, std::size_t /*Tq*/,
+                                            std::size_t /*Tk*/, std::size_t /*nHeads*/,
+                                            std::size_t /*nKvHeads*/,
+                                            std::size_t /*headDim*/, float /*scale*/,
+                                            float* /*out*/) {
+        throw std::runtime_error(
+            "attentionEncoderCrossAsync: not supported on this backend");
+    }
+
     // Batched non-causal encoder attention: B sequences packed as rows
     // r = b*Tmax + t in q/k/v/out ([B*Tmax, nHeads*headDim]). Query (b,pq)
     // attends to keys [0, seqLens[b]) of the same batch; padding rows
