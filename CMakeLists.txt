@@ -434,6 +434,15 @@ if(MIMIRMIND_ENABLE_CUDA)
     target_compile_definitions(mimirmind_core_common PUBLIC MIMIRMIND_HAVE_CUDA=1)
 endif()
 
+# ---- dflash_loader_test — DFlash drafter safetensors inventory validation ---
+# Phase 1 of the DFlash spec-decode track: asserts the full expected tensor
+# inventory of the DFlashDraftModel checkpoint loads with correct shapes/dtype.
+# CPU-only (no CUDA / device upload). Run against the on-box checkpoint:
+#   cmake --build build-cuda --target dflash_loader_test &&
+#   ./build-cuda/dflash_loader_test /opt/mimirmind/models/qwen3.6-35b-a3b-dflash-drafter
+add_executable(dflash_loader_test tests/dflash_loader_test.cpp)
+target_link_libraries(dflash_loader_test PRIVATE mimirmind_core_common)
+
 # ---- mimirmind_core_l0 — Level Zero-tied foundation ------------------------
 #
 # Everything that touches Level Zero handles directly: L0Context, USM
