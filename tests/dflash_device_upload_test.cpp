@@ -93,20 +93,40 @@ int main(int argc, char** argv) {
     expectNonNull("hiddenNorm", model.hiddenNorm());
     expectNonNull("norm", model.norm());
 
-    // Round-trip: read norm.weight back from the device and compare byte-for-
-    // byte with the host safetensors bytes — proves the H2D upload is faithful.
+    // Round-trip proofs of the H2D upload.
     {
         fe::SafetensorsModel sm;
         sm.open(path);
-        const std::span<const std::uint8_t> host = sm.tensorBytes("norm.weight");
-        std::vector<std::uint8_t> dev(host.size());
-        ops.readbackToHost(dev.data(), model.norm(), dev.size());
-        if (host.empty() || std::memcmp(host.data(), dev.data(), host.size()) != 0) {
-            printf("  ROUND-TRIP MISMATCH on norm.weight (%zu bytes)\n", host.size());
+        // (a) A BF16 LINEAR weight round-trips byte-for-byte (uploaded verbatim).
+        const std::span<const std::uint8_t> qh =
+            sm.tensorBytes("layers.0.self_attn.q_proj.weight");
+        std::vector<std::uint8_t> qd(qh.size());
+        ops.readbackToHost(qd.data(), model.layer(0).qProj, qd.size());
+        if (qh.empty() || std::memcmp(qh.data(), qd.data(), qh.size()) != 0) {
+            printf("  ROUND-TRIP MISMATCH on q_proj bf16 (%zu bytes)\n", qh.size());
             ++g_fail;
         } else {
-            printf("round-trip OK: norm.weight %zu bytes byte-identical device<->host\n",
-                   host.size());
+            printf("round-trip OK: q_proj %zu bf16 bytes byte-identical device<->host\n",
+                   qh.size());
+        }
+        // (b) An F32 RMSNorm weight equals the host BF16 widened to F32.
+        const std::span<const std::uint8_t> nh = sm.tensorBytes("norm.weight");
+        const std::size_t n = nh.size() / sizeof(std::uint16_t);
+        const auto* nbf = reinterpret_cast<const std::uint16_t*>(nh.data());
+        std::vector<float> nd(n);
+        ops.readbackToHost(nd.data(), model.norm(), n * sizeof(float));
+        bool ok = !nh.empty();
+        for (std::size_t i = 0; i < n && ok; ++i) {
+            const std::uint32_t bits = static_cast<std::uint32_t>(nbf[i]) << 16;
+            float ref;
+            std::memcpy(&ref, &bits, sizeof(float));
+            if (nd[i] != ref) { ok = false; }
+        }
+        if (!ok) {
+            printf("  NORM F32-WIDEN MISMATCH on norm.weight\n");
+            ++g_fail;
+        } else {
+            printf("norm.weight F32-widen OK: %zu elems match host bf16->f32\n", n);
         }
     }
 

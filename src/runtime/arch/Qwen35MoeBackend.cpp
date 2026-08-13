@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -292,6 +293,34 @@ void Qwen35MoeBackend::traceDump(const char* tag, std::size_t blockIdx,
             static_cast<std::streamsize>(n * sizeof(float)));
 }
 
+void Qwen35MoeBackend::configureHiddenTap(std::span<const std::size_t> tapLayers,
+                                          std::span<float* const>      tapDst) {
+    if (tapLayers.size() != tapDst.size()) {
+        throw std::runtime_error(
+            "Qwen35MoeBackend::configureHiddenTap: tapLayers/tapDst size mismatch");
+    }
+    if (tapLayers.empty()) {
+        clearHiddenTap();
+        return;
+    }
+    _hiddenTapSlot.assign(_config.blockCount, -1);
+    _hiddenTapDst.assign(tapDst.begin(), tapDst.end());
+    for (std::size_t k = 0; k < tapLayers.size(); ++k) {
+        const std::size_t l = tapLayers[k];
+        if (l >= _config.blockCount) {
+            clearHiddenTap();
+            throw std::runtime_error(
+                "Qwen35MoeBackend::configureHiddenTap: tap layer index out of range");
+        }
+        if (tapDst[k] == nullptr) {
+            clearHiddenTap();
+            throw std::runtime_error(
+                "Qwen35MoeBackend::configureHiddenTap: null tap sink pointer");
+        }
+        _hiddenTapSlot[l] = static_cast<int>(k);
+    }
+}
+
 void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
                                 float*        x,
                                 std::size_t   T,
@@ -304,6 +333,21 @@ void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
         runLinearBlock(blockIdx, x, T, cache, s, diag);
     } else {
         runFullAttentionBlock(blockIdx, x, T, cache, s, diag);
+    }
+
+    // M-Cuda.DFlash Phase 2 — hidden-state tap. Copy the residual after this
+    // block into the caller's sink for the tapped layers (position-major,
+    // row = absolute position base+r). CLR-safe device copy on the compute
+    // stream; prod-inert when unconfigured. `base` = cache.length() is this
+    // forward's first absolute position (the same base the ssm dump uses).
+    if (!_hiddenTapDst.empty()) {
+        const int slot = _hiddenTapSlot[blockIdx];
+        if (slot >= 0) {
+            const std::size_t base = cache.length();
+            _ops.appendMemoryCopy(
+                _hiddenTapDst[static_cast<std::size_t>(slot)] + base * s.d_model,
+                x, T * s.d_model * sizeof(float));
+        }
     }
 
     if (_ssmTrace || _ssmDump) {

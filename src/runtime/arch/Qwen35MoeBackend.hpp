@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -175,6 +176,30 @@ public:
     void setPrefillMoeScratch(std::int32_t* expIdx, float* kw) noexcept {
         _prefillMoeExpIdx = expIdx;
         _prefillMoeKw     = kw;
+    }
+
+    /// M-Cuda.DFlash Phase 2 — hidden-state tap. When configured, `runBlock`
+    /// copies the residual stream `x` after each tapped block into the caller's
+    /// per-tap device sink, position-major [maxPos, d_model] (row = absolute
+    /// sequence position `cache.length() + r`). `tapLayers[k]` is the block
+    /// index whose output goes to sink `tapDst[k]`; the DFlash drafter later
+    /// concatenates the 8 sinks per position. The copy is CLR-safe
+    /// (`appendMemoryCopy` on the compute stream, no host op — see
+    /// lesson host-ops-in-runBlock-are-CLR-landmines). Passing an empty span
+    /// disables the tap (the default) — the hot path then costs one
+    /// empty-vector check per block. The caller owns the sink buffers and their
+    /// lifetime; each must hold at least `maxPos * d_model` floats.
+    void configureHiddenTap(std::span<const std::size_t> tapLayers,
+                            std::span<float* const>      tapDst);
+
+    /// Disable the hidden tap (restore the prod-inert path).
+    void clearHiddenTap() noexcept {
+        _hiddenTapSlot.clear();
+        _hiddenTapDst.clear();
+    }
+
+    [[nodiscard]] bool hiddenTapActive() const noexcept {
+        return !_hiddenTapDst.empty();
     }
 
     /// M-Cuda.MTP — one Multi-Token-Prediction draft step. Runs the model's
@@ -481,6 +506,13 @@ private:
     bool        _ssmDump{false};
     std::string _ssmDumpDir{};
     long        _ssmDumpPos{-1};
+
+    // M-Cuda.DFlash Phase 2 — hidden-state tap. `_hiddenTapSlot[blockIdx]` is
+    // the sink index for a tapped block, or -1. `_hiddenTapDst[k]` is the
+    // caller's device buffer for tap k (position-major [maxPos, d_model]). Both
+    // empty => tap disabled (prod-inert default; one empty-check per block).
+    std::vector<int>    _hiddenTapSlot;
+    std::vector<float*> _hiddenTapDst;
 
     // MIMIRMIND_GDN_DUMP=<dir>: dump the GatedDeltaNet recurrence in/out tensors
     // for block MIMIRMIND_GDN_DUMP_BLK (default 0) as one file per tensor:

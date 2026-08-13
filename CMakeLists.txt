@@ -401,6 +401,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/encoder/EncoderRunner.cpp
     src/runtime/encoder/RerankEngine.cpp
     src/runtime/dflash/DFlashDraftModel.cpp
+    src/runtime/dflash/DFlashDraftRunner.cpp
     src/model/XlmRobertaTokenizer.cpp
 )
 
@@ -481,6 +482,40 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_dependencies(dflash_device_upload_test cuda_kernels)
     target_include_directories(dflash_device_upload_test PRIVATE tests)
     target_link_libraries(dflash_device_upload_test PRIVATE
+        mimirmind_core_cuda mimirmind_core_common)
+
+    # ---- dflash_forward_parity_test — DFlash draft-forward vs z-lab golden ---
+    # Phase 3: validates DFlashDraftRunner against the reference golden
+    # (tools/dflash_golden.py). P3.1 = materializeContext (fc -> hidden_norm).
+    #   cmake --build build-cuda --target dflash_forward_parity_test &&
+    #   ./build-cuda/dflash_forward_parity_test <drafter_dir> <golden_dir>
+    add_executable(dflash_forward_parity_test
+        tests/dflash_forward_parity_test.cpp
+        src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/MoeTopKRouteDevice.cpp
+        src/compute/cuda/GpuMatmul.cpp
+        src/compute/GatedDeltaNet.cpp
+        src/compute/Rope.cpp
+        src/compute/Norm.cpp
+        src/compute/Activations.cpp
+        src/compute/Attention.cpp
+        src/compute/Embedding.cpp
+        src/compute/Matmul.cpp
+        src/compute/Dequant.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
+    )
+    add_dependencies(dflash_forward_parity_test cuda_kernels)
+    target_include_directories(dflash_forward_parity_test PRIVATE tests)
+    target_link_libraries(dflash_forward_parity_test PRIVATE
         mimirmind_core_cuda mimirmind_core_common)
 endif()
 

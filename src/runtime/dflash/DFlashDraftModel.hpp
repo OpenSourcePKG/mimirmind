@@ -21,21 +21,23 @@ struct GgufTensor;
 namespace mimirmind::runtime::dflash {
 
 /// Per-layer device weight pointers for one DFlash draft transformer layer.
-/// All tensors are BF16 (raw 16-bit patterns), HF Linear layout [out, in]
-/// which matches ComputeMatmul's `W[N,K]`. RMSNorm weights are [head_dim] or
-/// [hidden]. Pointers are opaque device handles owned by DFlashDraftModel.
+/// LINEAR weights are BF16 (raw 16-bit patterns), HF layout [out, in] which
+/// matches ComputeMatmul's `W[N,K]` (matmulAsync with GgmlType::BF16). RMSNorm
+/// weights are F32 (converted from the BF16 checkpoint on load) because
+/// ComputeOps::rmsNormAsync takes `const float* weight`. Pointers are opaque
+/// device handles owned by DFlashDraftModel.
 struct DFlashDraftLayerWeights {
-    const std::uint16_t* qProj{};   // [nQHeads*headDim, hidden]
-    const std::uint16_t* kProj{};   // [nKvHeads*headDim, hidden]
-    const std::uint16_t* vProj{};   // [nKvHeads*headDim, hidden]
-    const std::uint16_t* oProj{};   // [hidden, nQHeads*headDim]
-    const std::uint16_t* qNorm{};   // [headDim]
-    const std::uint16_t* kNorm{};   // [headDim]
-    const std::uint16_t* inputLn{};        // [hidden]
-    const std::uint16_t* postAttnLn{};     // [hidden]
-    const std::uint16_t* gateProj{};       // [inter, hidden]
-    const std::uint16_t* upProj{};         // [inter, hidden]
-    const std::uint16_t* downProj{};       // [hidden, inter]
+    const std::uint16_t* qProj{};   // bf16 [nQHeads*headDim, hidden]
+    const std::uint16_t* kProj{};   // bf16 [nKvHeads*headDim, hidden]
+    const std::uint16_t* vProj{};   // bf16 [nKvHeads*headDim, hidden]
+    const std::uint16_t* oProj{};   // bf16 [hidden, nQHeads*headDim]
+    const float*         qNorm{};   // f32  [headDim]
+    const float*         kNorm{};   // f32  [headDim]
+    const float*         inputLn{};        // f32  [hidden]
+    const float*         postAttnLn{};     // f32  [hidden]
+    const std::uint16_t* gateProj{};       // bf16 [inter, hidden]
+    const std::uint16_t* upProj{};         // bf16 [inter, hidden]
+    const std::uint16_t* downProj{};       // bf16 [hidden, inter]
 };
 
 /// Architecture dims of a DFlash drafter, derived from the checkpoint's
@@ -95,9 +97,9 @@ public:
     [[nodiscard]] std::size_t layerCount() const noexcept { return _layers.size(); }
 
     // DFlash-specific top-level tensors.
-    [[nodiscard]] const std::uint16_t* fc() const noexcept { return _fc; }                 // [hidden, taps*hidden]
-    [[nodiscard]] const std::uint16_t* hiddenNorm() const noexcept { return _hiddenNorm; } // [hidden], RMSNorm after fc
-    [[nodiscard]] const std::uint16_t* norm() const noexcept { return _norm; }             // [hidden], final RMSNorm
+    [[nodiscard]] const std::uint16_t* fc() const noexcept { return _fc; }                 // bf16 [hidden, taps*hidden]
+    [[nodiscard]] const float*         hiddenNorm() const noexcept { return _hiddenNorm; } // f32  [hidden], RMSNorm after fc
+    [[nodiscard]] const float*         norm() const noexcept { return _norm; }             // f32  [hidden], final RMSNorm
 
     // Borrowed target weights (nullptr until borrowTarget()).
     [[nodiscard]] const core::gguf::GgufTensor* embedTokens() const noexcept { return _embed; }
@@ -113,8 +115,8 @@ private:
     std::vector<DFlashDraftLayerWeights> _layers;
 
     const std::uint16_t* _fc{};
-    const std::uint16_t* _hiddenNorm{};
-    const std::uint16_t* _norm{};
+    const float*         _hiddenNorm{};
+    const float*         _norm{};
 
     const core::gguf::GgufTensor* _embed{};
     const core::gguf::GgufTensor* _lmHead{};

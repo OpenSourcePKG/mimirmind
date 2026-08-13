@@ -10,6 +10,7 @@
 #include "core/safetensors/SafetensorsModel.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -123,6 +124,34 @@ void DFlashDraftModel::load(std::string_view dir, compute::ComputeOps& ops) {
         return p;
     };
 
+    // Upload a 1-D RMSNorm weight, converting BF16 -> F32 on host (the
+    // ComputeOps::rmsNormAsync path takes a `const float* weight`). BF16 is the
+    // upper 16 bits of the F32 pattern, so the widen is a shift. These tensors
+    // are small ([hidden] / [head_dim]).
+    auto uploadF32 = [&](const std::string& name,
+                         const std::vector<std::uint64_t>& want) -> const float* {
+        const auto* t = require(name);
+        if (t->shape != want) {
+            throw std::runtime_error("DFlashDraftModel: tensor '" + name +
+                                     "' shape " + shapeStr(t->shape) +
+                                     " != expected " + shapeStr(want));
+        }
+        const std::span<const std::uint8_t> bytes = sm.tensorBytes(name);
+        const std::size_t n = bytes.size() / sizeof(std::uint16_t);
+        const auto* bf = reinterpret_cast<const std::uint16_t*>(bytes.data());
+        std::vector<float> f(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint32_t bits = static_cast<std::uint32_t>(bf[i]) << 16;
+            std::memcpy(&f[i], &bits, sizeof(float));
+        }
+        compute::ComputeBuffer buf = ops.allocate(n * sizeof(float));
+        ops.uploadHostBytes(buf.get(), f.data(), n * sizeof(float));
+        const auto* p = static_cast<const float*>(buf.get());
+        _owned.push_back(std::move(buf));
+        _uploadedBytes += n * sizeof(float);
+        return p;
+    };
+
     // --- Transformer layers -------------------------------------------------
     _layers.resize(numLayers);
     for (std::size_t l = 0; l < numLayers; ++l) {
@@ -132,19 +161,19 @@ void DFlashDraftModel::load(std::string_view dir, compute::ComputeOps& ops) {
         w.kProj      = upload(p + "self_attn.k_proj.weight", {KV, H});
         w.vProj      = upload(p + "self_attn.v_proj.weight", {KV, H});
         w.oProj      = upload(p + "self_attn.o_proj.weight", {H, Q});
-        w.qNorm      = upload(p + "self_attn.q_norm.weight", {HD});
-        w.kNorm      = upload(p + "self_attn.k_norm.weight", {HD});
-        w.inputLn    = upload(p + "input_layernorm.weight", {H});
-        w.postAttnLn = upload(p + "post_attention_layernorm.weight", {H});
+        w.qNorm      = uploadF32(p + "self_attn.q_norm.weight", {HD});
+        w.kNorm      = uploadF32(p + "self_attn.k_norm.weight", {HD});
+        w.inputLn    = uploadF32(p + "input_layernorm.weight", {H});
+        w.postAttnLn = uploadF32(p + "post_attention_layernorm.weight", {H});
         w.gateProj   = upload(p + "mlp.gate_proj.weight", {I, H});
         w.upProj     = upload(p + "mlp.up_proj.weight", {I, H});
         w.downProj   = upload(p + "mlp.down_proj.weight", {H, I});
     }
 
     // --- DFlash-specific top-level tensors ----------------------------------
-    _fc         = upload("fc.weight", {H, taps * H});
-    _hiddenNorm = upload("hidden_norm.weight", {H});
-    _norm       = upload("norm.weight", {H});
+    _fc         = upload("fc.weight", {H, taps * H});      // bf16 linear
+    _hiddenNorm = uploadF32("hidden_norm.weight", {H});    // f32 RMSNorm weight
+    _norm       = uploadF32("norm.weight", {H});           // f32 RMSNorm weight
 
     // The drafter must NOT ship its own embed/lm_head — those are borrowed.
     for (const char* n : {"embed_tokens.weight", "lm_head.weight",
