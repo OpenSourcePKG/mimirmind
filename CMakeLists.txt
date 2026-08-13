@@ -1122,6 +1122,7 @@ add_executable(mimirmind
     src/runtime/ComputeStack.cpp
     src/runtime/engine/Nvfp4Loader.cpp
     src/runtime/engine/MtpDecoder.cpp
+    src/runtime/engine/DFlashDecoder.cpp
     src/runtime/engine/ServingSession.cpp
     src/runtime/serving/ContinuousBatcher.cpp
     src/runtime/KvCache.cpp

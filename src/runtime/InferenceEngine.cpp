@@ -3,6 +3,7 @@
 
 #include "runtime/InferenceEngine.hpp"
 
+#include "runtime/engine/DFlashDecoder.hpp"
 #include "runtime/engine/MtpDecoder.hpp"
 #include "runtime/engine/Nvfp4Loader.hpp"
 #include "runtime/engine/ServingSession.hpp"
@@ -2257,6 +2258,35 @@ InferenceEngine::generateMtp(std::span<const std::int32_t> promptIds,
     }
     return _mtpDecoder->generate(promptIds, maxNew, mtpDepth, eosId,
                                  draftedOut, acceptedOut);
+}
+
+bool InferenceEngine::dflashAvailable() const noexcept {
+    if (!_weights.has_value()) {
+        return false;
+    }
+    if (dynamic_cast<arch::Qwen35MoeBackend*>(_backend.get()) == nullptr) {
+        return false;
+    }
+    // Needs a borrowable embed + lm_head (tied embeddings are fine).
+    const auto* tokEmb = _weights->find("token_embd.weight");
+    if (tokEmb == nullptr) {
+        tokEmb = _weights->find("tok_embeddings.weight");
+    }
+    return tokEmb != nullptr;
+}
+
+std::vector<std::int32_t>
+InferenceEngine::generateDflash(std::span<const std::int32_t> promptIds,
+                                std::size_t maxNew, std::size_t draftN,
+                                std::int32_t eosId, std::string_view drafterDir,
+                                std::size_t* draftedOut, std::size_t* acceptedOut) {
+    // The DFlash drafter + tap sinks + draft/verify/accept loop live in
+    // engine::DFlashDecoder (a friend collaborator). Constructed lazily.
+    if (_dflashDecoder == nullptr) {
+        _dflashDecoder = std::make_unique<engine::DFlashDecoder>(*this);
+    }
+    return _dflashDecoder->generate(promptIds, maxNew, draftN, eosId, drafterDir,
+                                    draftedOut, acceptedOut);
 }
 
 } // namespace mimirmind::runtime
