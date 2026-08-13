@@ -400,6 +400,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/encoder/EncoderModel.cpp
     src/runtime/encoder/EncoderRunner.cpp
     src/runtime/encoder/RerankEngine.cpp
+    src/runtime/dflash/DFlashDraftModel.cpp
     src/model/XlmRobertaTokenizer.cpp
 )
 
@@ -442,6 +443,46 @@ endif()
 #   ./build-cuda/dflash_loader_test /opt/mimirmind/models/qwen3.6-35b-a3b-dflash-drafter
 add_executable(dflash_loader_test tests/dflash_loader_test.cpp)
 target_link_libraries(dflash_loader_test PRIVATE mimirmind_core_common)
+
+# ---- dflash_device_upload_test — DFlash drafter H2D upload validation -------
+# Phase 1b: loads the BF16 drafter onto the CUDA device via DFlashDraftModel,
+# asserts derived dims + non-null device handles + a byte-identical round-trip.
+# Needs a CUDA device (run on the box). Guarded on the CUDA backend.
+#   cmake --build build-cuda --target dflash_device_upload_test &&
+#   ./build-cuda/dflash_device_upload_test /opt/mimirmind/models/qwen3.6-35b-a3b-dflash-drafter
+if(MIMIRMIND_ENABLE_CUDA)
+    # compute::cuda::GpuOps lives only in the main binary, not in a static lib
+    # — so (like cuda_parity_tests) compile GpuOps.cpp + its compute deps
+    # straight into this test.
+    add_executable(dflash_device_upload_test
+        tests/dflash_device_upload_test.cpp
+        src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/MoeTopKRouteDevice.cpp
+        src/compute/cuda/GpuMatmul.cpp
+        src/compute/GatedDeltaNet.cpp
+        src/compute/Rope.cpp
+        src/compute/Norm.cpp
+        src/compute/Activations.cpp
+        src/compute/Attention.cpp
+        src/compute/Embedding.cpp
+        src/compute/Matmul.cpp
+        src/compute/Dequant.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
+    )
+    add_dependencies(dflash_device_upload_test cuda_kernels)
+    target_include_directories(dflash_device_upload_test PRIVATE tests)
+    target_link_libraries(dflash_device_upload_test PRIVATE
+        mimirmind_core_cuda mimirmind_core_common)
+endif()
 
 # ---- mimirmind_core_l0 — Level Zero-tied foundation ------------------------
 #
