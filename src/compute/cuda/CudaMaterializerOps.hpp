@@ -33,6 +33,7 @@ public:
     CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, ComputeOps& ops);
 
     [[nodiscard]] ComputeBuffer allocate(std::size_t bytes) override;
+    [[nodiscard]] ComputeBuffer allocateWeight(std::size_t bytes) override;
 
     void dequantNvfp4(const void* packed, const void* blockScale, float global,
                       std::uint64_t rows, std::uint64_t in, void* dstBf16) override;

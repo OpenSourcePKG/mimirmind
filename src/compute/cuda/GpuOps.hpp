@@ -430,6 +430,7 @@ public:
     // a deleter closure that calls back with the same kind so the
     // deallocate side hits the matching `cudaFree` path.
     [[nodiscard]] compute::ComputeBuffer allocate(std::size_t bytes) override;
+    [[nodiscard]] compute::ComputeBuffer allocateWeight(std::size_t bytes) override;
     void uploadHostBytes(void* deviceDst, const void* hostSrc,
                          std::size_t bytes) override;
 

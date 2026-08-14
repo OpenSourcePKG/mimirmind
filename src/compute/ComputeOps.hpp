@@ -1005,6 +1005,17 @@ public:
     /// this ops instance's backing allocator.
     [[nodiscard]] virtual ComputeBuffer allocate(std::size_t bytes) = 0;
 
+    /// Allocate `bytes` for an IMMUTABLE weight tensor (written once at load,
+    /// read-only thereafter). Same ownership/free semantics as `allocate`.
+    /// On unified/integrated CUDA parts (GB10) the buffer is already Managed
+    /// (host+device coherent); this variant additionally lets the backend mark
+    /// it read-mostly + device-preferred (`cudaMemAdvise`) so the decode hot
+    /// path reads it device-resident without fault-driven migration. Default =
+    /// `allocate` (no hint) for backends where it makes no difference.
+    [[nodiscard]] virtual ComputeBuffer allocateWeight(std::size_t bytes) {
+        return allocate(bytes);
+    }
+
     /// Synchronous host-to-device copy. Blocks until the transfer is
     /// visible to subsequent GPU dispatches. Used by loaders that need
     /// "the mmap bytes must be on the device before we return".

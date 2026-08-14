@@ -116,7 +116,7 @@ void DFlashDraftModel::load(std::string_view dir, compute::ComputeOps& ops) {
                                      " != expected " + shapeStr(want));
         }
         const std::span<const std::uint8_t> bytes = sm.tensorBytes(name);
-        compute::ComputeBuffer buf = ops.allocate(bytes.size());
+        compute::ComputeBuffer buf = ops.allocateWeight(bytes.size());
         ops.uploadHostBytes(buf.get(), bytes.data(), bytes.size());
         const auto* p = static_cast<const std::uint16_t*>(buf.get());
         _owned.push_back(std::move(buf));
@@ -144,7 +144,7 @@ void DFlashDraftModel::load(std::string_view dir, compute::ComputeOps& ops) {
             const std::uint32_t bits = static_cast<std::uint32_t>(bf[i]) << 16;
             std::memcpy(&f[i], &bits, sizeof(float));
         }
-        compute::ComputeBuffer buf = ops.allocate(n * sizeof(float));
+        compute::ComputeBuffer buf = ops.allocateWeight(n * sizeof(float));
         ops.uploadHostBytes(buf.get(), f.data(), n * sizeof(float));
         const auto* p = static_cast<const float*>(buf.get());
         _owned.push_back(std::move(buf));

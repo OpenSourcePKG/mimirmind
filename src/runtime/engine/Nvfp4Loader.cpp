@@ -352,7 +352,7 @@ void Nvfp4Loader::load(InferenceEngine& e,
                 if (K == 0 || rows == 0 || (K % 32) != 0 || K * rows != t.elems) continue;
                 const std::size_t q8Bytes =
                     (static_cast<std::size_t>(t.elems) / 32) * 34;
-                compute::ComputeBuffer q8 = devOps.allocate(q8Bytes);
+                compute::ComputeBuffer q8 = devOps.allocateWeight(q8Bytes);
                 devOps.quantizeBf16ToQ8_0(q8.get(), t.buffer.get(), rows, K);
                 cudaCtx.stream().synchronize(); // finish before the BF16 buffer frees
                 bytesBefore += static_cast<std::uint64_t>(t.elems) * 2;
@@ -434,9 +434,9 @@ void Nvfp4Loader::load(InferenceEngine& e,
                     const std::size_t sfbBytes =
                         core::modelopt::moeSwizzledScaleBankBytes(
                             static_cast<std::uint64_t>(nExp), tcN, tcK / 16);
-                    compute::ComputeBuffer nibBank  = devOps.allocate(nibBytes);
-                    compute::ComputeBuffer sfbBank  = devOps.allocate(sfbBytes);
-                    compute::ComputeBuffer globBank = devOps.allocate(
+                    compute::ComputeBuffer nibBank  = devOps.allocateWeight(nibBytes);
+                    compute::ComputeBuffer sfbBank  = devOps.allocateWeight(sfbBytes);
+                    compute::ComputeBuffer globBank = devOps.allocateWeight(
                         static_cast<std::size_t>(nExp) * sizeof(float));
                     auto* nibB = static_cast<std::uint8_t*>(nibBank.get());
                     auto* sfbB = static_cast<std::uint8_t*>(sfbBank.get());
@@ -479,7 +479,7 @@ void Nvfp4Loader::load(InferenceEngine& e,
                     //     for the prefill grouped GEMM] --------------------------
                     const std::size_t blkBytes =
                         (static_cast<std::size_t>(it->elems) / 32) * 20;
-                    compute::ComputeBuffer bank = devOps.allocate(blkBytes);
+                    compute::ComputeBuffer bank = devOps.allocateWeight(blkBytes);
                     auto* bankBytes = static_cast<std::uint8_t*>(bank.get());
                     const bool tcAdd = additive && nExp > 0 && tcK % 32 == 0;
                     compute::ComputeBuffer tcNib, tcSfb, tcGlob;
@@ -489,9 +489,9 @@ void Nvfp4Loader::load(InferenceEngine& e,
                     if (tcAdd) {
                         sfbBytes = core::modelopt::moeSwizzledScaleBankBytes(
                             static_cast<std::uint64_t>(nExp), tcN, tcK / 16);
-                        tcNib  = devOps.allocate(static_cast<std::size_t>(it->elems) / 2);
-                        tcSfb  = devOps.allocate(sfbBytes);
-                        tcGlob = devOps.allocate(static_cast<std::size_t>(nExp) * sizeof(float));
+                        tcNib  = devOps.allocateWeight(static_cast<std::size_t>(it->elems) / 2);
+                        tcSfb  = devOps.allocateWeight(sfbBytes);
+                        tcGlob = devOps.allocateWeight(static_cast<std::size_t>(nExp) * sizeof(float));
                         tcNibB = static_cast<std::uint8_t*>(tcNib.get());
                         tcSfbB = static_cast<std::uint8_t*>(tcSfb.get());
                         tcGlobHost.assign(static_cast<std::size_t>(nExp), 0.0f);
@@ -563,7 +563,7 @@ void Nvfp4Loader::load(InferenceEngine& e,
                 const std::size_t qBytes = isGateUp
                     ? (static_cast<std::size_t>(t.elems) / 256) * 144
                     : (static_cast<std::size_t>(t.elems) / 256) * 210;
-                compute::ComputeBuffer q = devOps.allocate(qBytes);
+                compute::ComputeBuffer q = devOps.allocateWeight(qBytes);
                 if (isGateUp) devOps.quantizeBf16ToQ4K(q.get(), t.buffer.get(), t.elems);
                 else          devOps.quantizeBf16ToQ6K(q.get(), t.buffer.get(), t.elems);
                 cudaCtx.stream().synchronize();
@@ -632,7 +632,7 @@ void Nvfp4Loader::load(InferenceEngine& e,
                 if (K == 0 || rows == 0 || (K % 32) != 0 || K * rows != t.elems) continue;
                 const std::size_t fp8Bytes =
                     (static_cast<std::size_t>(t.elems) / 32) * 34;
-                compute::ComputeBuffer fp8 = devOps.allocate(fp8Bytes);
+                compute::ComputeBuffer fp8 = devOps.allocateWeight(fp8Bytes);
                 devOps.quantizeBf16ToFp8(fp8.get(), t.buffer.get(), rows, K);
                 cudaCtx.stream().synchronize();
                 bytesBefore += static_cast<std::uint64_t>(t.elems) * 2;
@@ -720,7 +720,7 @@ void Nvfp4Loader::load(InferenceEngine& e,
                 const float global = devOps.readF32(gs->devPtr);
                 const std::size_t blkBytes =
                     (static_cast<std::size_t>(it->elems) / 32) * 20;
-                compute::ComputeBuffer nb = devOps.allocate(blkBytes);
+                compute::ComputeBuffer nb = devOps.allocateWeight(blkBytes);
                 devOps.repackageNvfp4ToBlk(nb.get(), pk->devPtr, bs->devPtr, global,
                                            src.rows, src.in);
                 cudaCtx.stream().synchronize();
@@ -737,9 +737,9 @@ void Nvfp4Loader::load(InferenceEngine& e,
                     const std::size_t sfbBytes =
                         core::modelopt::moeSwizzledScaleBankBytes(
                             1, src.rows, src.in / 16);
-                    compute::ComputeBuffer tcNib  = devOps.allocate(nibBytes);
-                    compute::ComputeBuffer tcSfb  = devOps.allocate(sfbBytes);
-                    compute::ComputeBuffer tcGlob = devOps.allocate(sizeof(float));
+                    compute::ComputeBuffer tcNib  = devOps.allocateWeight(nibBytes);
+                    compute::ComputeBuffer tcSfb  = devOps.allocateWeight(sfbBytes);
+                    compute::ComputeBuffer tcGlob = devOps.allocateWeight(sizeof(float));
                     devOps.copyBytes(tcNib.get(), pk->devPtr, nibBytes);
                     devOps.swizzleWeightSf(tcSfb.get(), bs->devPtr,
                                            src.rows, src.in);
@@ -799,7 +799,7 @@ void Nvfp4Loader::load(InferenceEngine& e,
                 }
                 const std::size_t fp8Bytes =
                     (static_cast<std::size_t>(t.elems) / 32) * 34;
-                compute::ComputeBuffer fp8 = devOps.allocate(fp8Bytes);
+                compute::ComputeBuffer fp8 = devOps.allocateWeight(fp8Bytes);
                 devOps.quantizeBf16ToFp8(fp8.get(), t.buffer.get(), rows, K);
                 cudaCtx.stream().synchronize();
                 runtime::nvfp4::MaterializedTensor v;

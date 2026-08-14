@@ -998,6 +998,20 @@ compute::ComputeBuffer GpuOps::allocate(std::size_t bytes) {
         &alloc};
 }
 
+// Immutable-weight allocation. Same buffer as allocate() (Managed on unified
+// GB10, Device on discrete), plus a read-mostly + device-preferred hint so the
+// decode hot path reads weights device-resident without fault-driven migration.
+// The hint is a no-op on discrete parts (guarded inside adviseReadMostly).
+// Opt-in until A/B-validated on the target: MIMIRMIND_WEIGHT_ADVISE=1.
+compute::ComputeBuffer GpuOps::allocateWeight(std::size_t bytes) {
+    compute::ComputeBuffer buf = allocate(bytes);
+    static const bool advise = std::getenv("MIMIRMIND_WEIGHT_ADVISE") != nullptr;
+    if (advise && buf.get() != nullptr) {
+        _ctx.allocator().adviseReadMostly(buf.get(), bytes);
+    }
+    return buf;
+}
+
 // Schicht 5.2 — sync host-to-device copy. Blocking hipMemcpy so the
 // caller can assume the bytes have landed on device by return. The
 // stream-async variant lives on `appendMemoryCopy`; loaders that copy
