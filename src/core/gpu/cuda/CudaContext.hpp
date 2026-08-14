@@ -33,6 +33,15 @@ struct DeviceInfo {
     int           warpSize{32};      // 32 on every NVIDIA arch since Kepler
     int           coreClockRateKhz{0};
     bool          isIntegrated{false};// Jetson/Tegra/DGX Spark = true, discrete card = false
+    // Unified-memory capabilities (M-Munin.CUDA shm design + weight placement).
+    // pageableMemoryAccess=1 => GPU kernels may dereference ANY pageable host
+    // pointer (e.g. an mmap'd POSIX-shm segment) directly, no cudaHostRegister
+    // needed. On coherent Grace-Blackwell (GB10) this is expected true.
+    // concurrentManagedAccess=1 => managed buffers can be touched by host+device
+    // concurrently without explicit prefetch.
+    bool          pageableMemoryAccess{false};
+    bool          pageableAccessUsesHostPageTables{false};
+    bool          concurrentManagedAccess{false};
 };
 
 class CudaError : public std::runtime_error {

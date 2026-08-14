@@ -49,6 +49,14 @@ void populate(const cudaDeviceProp& p,
     cudaDeviceGetAttribute(&clockKhz, cudaDevAttrClockRate, index);
     info.coreClockRateKhz = clockKhz;
     info.isIntegrated     = p.integrated != 0;
+    // Unified-memory capabilities (M-Munin.CUDA shm design + weight placement).
+    int pma = 0, pht = 0, cma = 0;
+    cudaDeviceGetAttribute(&pma, cudaDevAttrPageableMemoryAccess, index);
+    cudaDeviceGetAttribute(&pht, cudaDevAttrPageableMemoryAccessUsesHostPageTables, index);
+    cudaDeviceGetAttribute(&cma, cudaDevAttrConcurrentManagedAccess, index);
+    info.pageableMemoryAccess             = pma != 0;
+    info.pageableAccessUsesHostPageTables = pht != 0;
+    info.concurrentManagedAccess          = cma != 0;
 
     backendInfo.name             = info.name;
     backendInfo.uuid             = "";  // p.uuid is available but 16-byte struct; skip in skeleton
@@ -110,9 +118,12 @@ CudaContext::CudaContext(int deviceIndex) {
     populate(p, deviceIndex, _info, _backendInfo);
 
     MM_LOG_INFO("CudaContext",
-                "bound to device #{} ({}, sm_{}{}, SMs={}, warp={}, integrated={})",
+                "bound to device #{} ({}, sm_{}{}, SMs={}, warp={}, integrated={}, "
+                "pageableMemAccess={}, hostPageTables={}, concurrentManaged={})",
                 _deviceIdx, _info.name, _info.computeMajor, _info.computeMinor,
-                _info.numSms, _info.warpSize, _info.isIntegrated);
+                _info.numSms, _info.warpSize, _info.isIntegrated,
+                _info.pageableMemoryAccess, _info.pageableAccessUsesHostPageTables,
+                _info.concurrentManagedAccess);
 }
 
 CudaContext::~CudaContext() = default;
