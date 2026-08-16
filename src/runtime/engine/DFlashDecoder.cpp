@@ -15,6 +15,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -190,6 +193,20 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
 
     float* const logitsSc = _e._logitsScH.as<float>();
 
+    // Conditioning diagnostic (MIMIRMIND_DFLASH_DEBUG): dump per-tap RMS, fused
+    // context RMS, and drafts-vs-true-greedy for the first rounds so we can see
+    // whether the tap hidden is sane and how far the draft is from the target.
+    const bool  dbg      = std::getenv("MIMIRMIND_DFLASH_DEBUG") != nullptr;
+    std::size_t roundIdx = 0;
+    auto rmsOf = [&](const float* dev, std::size_t n) -> double {
+        std::vector<float> h(n);
+        _e._ops->flush();
+        _e._ops->readbackToHost(h.data(), dev, n * sizeof(float));
+        double s = 0.0;
+        for (float v : h) s += static_cast<double>(v) * v;
+        return std::sqrt(s / static_cast<double>(n > 0 ? n : 1));
+    };
+
     while (out.size() < maxNew && !stop) {
         const std::size_t K = std::min(draftN, maxNew - out.size());
 
@@ -250,6 +267,30 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
         }
         const std::int32_t corrected = argmaxHost(vl[a]);
         accepted += a;
+
+        if (dbg && roundIdx < 3) {
+            std::printf("[dflash-dbg] round=%zu ctxLen=%zu token0=%d K=%zu\n",
+                        roundIdx, ctxLen, token0, K);
+            for (std::size_t k = 0; k < _taps; ++k) {
+                std::printf("  tap[%zu](L=%zu) rms=%.4f\n", k, kTapLayers[k],
+                            rmsOf(_tapPtr[k], ctxLen * _d));
+            }
+            {
+                compute::ComputeBuffer cp = _e._ops->allocate(ctxLen * _d * sizeof(float));
+                _runner->materializeContext(_ctxHidden.as<float>(), ctxLen,
+                                            cp.as<float>());
+                std::printf("  ctxProj rms=%.4f (expect ~1 after hidden_norm)\n",
+                            rmsOf(cp.as<float>(), ctxLen * _d));
+            }
+            std::printf("  drafts    =");
+            for (std::int32_t d : drafts) std::printf(" %d", d);
+            std::printf("\n  tgt-greedy=");
+            for (std::size_t i = 0; i <= K; ++i)
+                std::printf(" %d", argmaxHost(vl[i]));
+            std::printf("\n  accepted=%zu\n", a);
+            std::fflush(stdout);
+        }
+        ++roundIdx;
 
         std::vector<std::int32_t> committed(
             vtoks.begin(), vtoks.begin() + static_cast<std::ptrdiff_t>(a + 1));
