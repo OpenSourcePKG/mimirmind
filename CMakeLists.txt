@@ -517,6 +517,40 @@ if(MIMIRMIND_ENABLE_CUDA)
     target_include_directories(dflash_forward_parity_test PRIVATE tests)
     target_link_libraries(dflash_forward_parity_test PRIVATE
         mimirmind_core_cuda mimirmind_core_common)
+
+    # ---- gated_deltanet_fold_test — GDN ReplaySSM fold-kernel golden ---------
+    # Phase-4 Teil 1: gated_deltanet_fold replays the accepted verify prefix into
+    # the committed state; parity vs the CPU recurrence + the device AR kernel.
+    #   cmake --build build-cuda --target gated_deltanet_fold_test &&
+    #   MIMIRMIND_HSACO_DIR=build-cuda/ptx ./build-cuda/gated_deltanet_fold_test
+    add_executable(gated_deltanet_fold_test
+        tests/gated_deltanet_fold_test.cpp
+        src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/MoeTopKRouteDevice.cpp
+        src/compute/cuda/GpuMatmul.cpp
+        src/compute/GatedDeltaNet.cpp
+        src/compute/Rope.cpp
+        src/compute/Norm.cpp
+        src/compute/Activations.cpp
+        src/compute/Attention.cpp
+        src/compute/Embedding.cpp
+        src/compute/Matmul.cpp
+        src/compute/Dequant.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
+    )
+    add_dependencies(gated_deltanet_fold_test cuda_kernels)
+    target_include_directories(gated_deltanet_fold_test PRIVATE tests)
+    target_link_libraries(gated_deltanet_fold_test PRIVATE
+        mimirmind_core_cuda mimirmind_core_common)
 endif()
 
 # ---- mimirmind_core_l0 — Level Zero-tied foundation ------------------------
@@ -874,6 +908,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/gated_deltanet_ar_batched_v2.cu
         kernels/cuda/llm/gated_deltanet_ar_batched_v3.cu
         kernels/cuda/llm/gated_deltanet_verify_batched.cu
+        kernels/cuda/llm/gated_deltanet_fold.cu
         kernels/cuda/llm/argmax_rows.cu
         kernels/cuda/llm/deltanet_gate.cu
         kernels/cuda/llm/deltanet_chunk_cumgate.cu
