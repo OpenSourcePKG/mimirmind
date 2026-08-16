@@ -15,6 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -109,7 +110,9 @@ void DFlashDecoder::ensureLoaded(std::string_view drafterDir) {
     _ctxHidden = _e._ops->allocate(maxPos * _taps * _d * sizeof(float));
     _noise     = _e._ops->allocate(kMaxBlock * _d * sizeof(float));
     _draftOut  = _e._ops->allocate(kMaxBlock * _d * sizeof(float));
-    _logits    = _e._ops->allocate(_vocabLm * sizeof(float));
+    _draftLogits    = _e._ops->allocate((kMaxBlock - 1) * _vocabLm * sizeof(float));
+    _draftArgmaxDev = _e._ops->allocate((kMaxBlock - 1) * sizeof(std::int32_t));
+    _draftArgmaxHost.assign(kMaxBlock - 1, 0);
 
     MM_LOG_INFO("dflash",
                 "DFlashDecoder ready — drafter={} layers={} hidden={} taps={} "
@@ -151,21 +154,6 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
     const auto* lmHead = _model.lmHead();
     const auto* tokEmb = _model.embedTokens();
 
-    auto argmaxDev = [&](float* devLogits) -> std::int32_t {
-        if (_e._logitsHostScratch.size() < _vocabLm) {
-            _e._logitsHostScratch.resize(_vocabLm);
-        }
-        _e._ops->flush();
-        _e._ops->readbackToHost(_e._logitsHostScratch.data(), devLogits,
-                                _vocabLm * sizeof(float));
-        std::size_t best = 0;
-        float       bv   = _e._logitsHostScratch[0];
-        for (std::size_t v = 1; v < _vocabLm; ++v) {
-            if (_e._logitsHostScratch[v] > bv) { bv = _e._logitsHostScratch[v]; best = v; }
-        }
-        return static_cast<std::int32_t>(best);
-    };
-
     // ---- Prefill: trunk forward with the hidden tap live ------------------
     _e.resetCache();
     qb->configureHiddenTap(
@@ -198,6 +186,17 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
     // whether the tap hidden is sane and how far the draft is from the target.
     const bool  dbg      = std::getenv("MIMIRMIND_DFLASH_DEBUG") != nullptr;
     std::size_t roundIdx = 0;
+
+    // Per-phase timing breakdown (MIMIRMIND_DFLASH_TIMING) to localise the
+    // per-round cost: draft-forward vs verify-forward vs the D2H/commit rest.
+    const bool tmg = std::getenv("MIMIRMIND_DFLASH_TIMING") != nullptr;
+    double tDraft = 0, tReadout = 0, tVerify = 0, tRest = 0;
+    std::size_t nTmg = 0;
+    auto nowMs = [] {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
     auto rmsOf = [&](const float* dev, std::size_t n) -> double {
         std::vector<float> h(n);
         _e._ops->flush();
@@ -217,24 +216,35 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
         block.push_back(token0);
         for (std::size_t i = 0; i < K; ++i) block.push_back(_maskTok);
 
+        const double _t0 = tmg ? nowMs() : 0.0;
         compute::embeddingLookup(tokEmb->type, tokEmb->usmPtr, _d, _vocabEmb,
                                  std::span<const std::int32_t>{block},
                                  _noise.as<float>());
 
         _runner->draftForward(_noise.as<float>(), _ctxHidden.as<float>(),
                               K + 1, ctxLen, _draftOut.as<float>());
+        const double _t1 = tmg ? nowMs() : 0.0;
 
         // Readout: borrowed target lm_head on draft positions 1..K. The runner
         // already applied the drafter's final norm, so NO target output_norm.
+        // Batched draft readout (Hebel 1): one lm_head matmul over draft
+        // positions 1..K -> [K, vocab], on-device per-row argmax, then read back
+        // only K token ids — replaces K synchronous full-vocab D2H readbacks.
         std::vector<std::int32_t> drafts;
         drafts.reserve(K);
         float* const draftOut = _draftOut.as<float>();
-        for (std::size_t i = 1; i <= K; ++i) {
-            _e._gmm->matmul(lmHead->type, lmHead->usmPtr, _vocabLm, _d,
-                            draftOut + i * _d, 1, _logits.as<float>(), logitsSc);
-            drafts.push_back(argmaxDev(_logits.as<float>()));
+        _e._gmm->matmulAsync(lmHead->type, lmHead->usmPtr, _vocabLm, _d,
+                             draftOut + _d, K, _draftLogits.as<float>(), logitsSc);
+        _e._ops->argmaxRowsAsync(_draftLogits.as<float>(),
+                                 _draftArgmaxDev.as<std::int32_t>(), K, _vocabLm);
+        _e._ops->flush();
+        _e._ops->readbackToHost(_draftArgmaxHost.data(), _draftArgmaxDev.get(),
+                                K * sizeof(std::int32_t));
+        for (std::size_t i = 0; i < K; ++i) {
+            drafts.push_back(_draftArgmaxHost[i]);
             ++drafted;
         }
+        const double _t2 = tmg ? nowMs() : 0.0;
 
         // ---- Verify: one trunk forward on [token0, drafts...] ------------
         std::vector<std::int32_t> vtoks;
@@ -259,6 +269,7 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
 
         const std::size_t preKvLen = _e._kvCache->length();   // == ctxLen
         auto vl = _e.forwardVerify(vtoks);                    // tap rows [ctxLen, ctxLen+K]
+        const double _t3 = tmg ? nowMs() : 0.0;
 
         // ---- Accept longest greedy prefix -------------------------------
         std::size_t a = 0;
@@ -311,6 +322,13 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
         _e._ops->flush();
         feedContext(preKvLen, preKvLen + a + 1);
         ctxLen = preKvLen + a + 1;
+        if (tmg) {
+            tDraft   += _t1 - _t0;   // embed + 6-layer draft forward
+            tReadout += _t2 - _t1;   // batched lm_head + argmax + K-int D2H
+            tVerify  += _t3 - _t2;   // ssm snapshot + verify trunk forward (M=K+1)
+            tRest    += nowMs() - _t3; // accept scan + partial re-forward + commit + feed
+            ++nTmg;
+        }
 
         // ---- Emit token0 + accepted drafts; corrected -> next token0 -----
         bool cont = emit(token0);
@@ -320,6 +338,19 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
     }
 
     qb->clearHiddenTap();
+
+    if (tmg && nTmg > 0) {
+        const double tot = tDraft + tReadout + tVerify + tRest;
+        std::printf("[dflash-timing] rounds=%zu total=%.1fms/round | "
+                    "draft=%.1f (%.0f%%) readout=%.1f (%.0f%%) "
+                    "verify=%.1f (%.0f%%) rest=%.1f (%.0f%%)\n",
+                    nTmg, tot / nTmg,
+                    tDraft / nTmg,   100.0 * tDraft   / tot,
+                    tReadout / nTmg, 100.0 * tReadout / tot,
+                    tVerify / nTmg,  100.0 * tVerify  / tot,
+                    tRest / nTmg,    100.0 * tRest    / tot);
+        std::fflush(stdout);
+    }
 
     if (draftedOut)  *draftedOut  = drafted;
     if (acceptedOut) *acceptedOut = accepted;

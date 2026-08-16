@@ -106,7 +106,12 @@ private:
     compute::ComputeBuffer _ctxHidden;  // [maxPos, taps*hidden] concat accumulator
     compute::ComputeBuffer _noise;      // [maxBlock, hidden] embedded block
     compute::ComputeBuffer _draftOut;   // [maxBlock, hidden] draft-forward output
-    compute::ComputeBuffer _logits;     // [vocabLm] draft logits
+    // Batched draft readout (Hebel 1): ONE lm_head matmul over the K draft
+    // positions -> [maxBlock-1, vocab], then on-device per-row argmax, so only
+    // K token ids are read back per round instead of K full-vocab D2H copies.
+    compute::ComputeBuffer    _draftLogits;    // [maxBlock-1, vocabLm]
+    compute::ComputeBuffer    _draftArgmaxDev; // [maxBlock-1] device argmax ids
+    std::vector<std::int32_t> _draftArgmaxHost;
     compute::ComputeBuffer _ssmBak;     // GatedDeltaNet state snapshot (verify rollback)
     compute::ComputeBuffer _convBak;    // rolling conv-tail snapshot
 
