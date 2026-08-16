@@ -282,6 +282,10 @@ struct GpuOps::Impl {
     // MV-a: batched GDN verify (T-loop over K+1, per-position state export).
     core::cuda::CudaModule _gatedDeltaNetVerifyBatchedModule;
     core::cuda::CudaKernel _gatedDeltaNetVerifyBatchedKernel;
+    // ReplaySSM: state-only fold of the accepted verify prefix (partial-accept
+    // commit without a trunk re-forward).
+    core::cuda::CudaModule _gatedDeltaNetFoldModule;
+    core::cuda::CudaKernel _gatedDeltaNetFoldKernel;
     // MTP draft-side: per-row device argmax over vocab.
     core::cuda::CudaModule _argmaxRowsModule;
     core::cuda::CudaKernel _argmaxRowsKernel;
@@ -541,6 +545,9 @@ struct GpuOps::Impl {
           _gatedDeltaNetVerifyBatchedModule{loadCudaModule(ctx, "gated_deltanet_verify_batched")},
           _gatedDeltaNetVerifyBatchedKernel{
               _gatedDeltaNetVerifyBatchedModule.getFunction("gated_deltanet_verify_batched")},
+          _gatedDeltaNetFoldModule{loadCudaModule(ctx, "gated_deltanet_fold")},
+          _gatedDeltaNetFoldKernel{
+              _gatedDeltaNetFoldModule.getFunction("gated_deltanet_fold")},
           _argmaxRowsModule{loadCudaModule(ctx, "argmax_rows")},
           _argmaxRowsKernel{_argmaxRowsModule.getFunction("argmax_rows")},
           _deltanetGateModule      {loadCudaModule(ctx, "deltanet_gate")},
@@ -1820,6 +1827,31 @@ void GpuOps::gatedDeltaNetVerifyBatchedAsync(
              static_cast<std::uint32_t>(nSeq), 1,
              static_cast<std::uint32_t>(S), 1, 1,
              gdnSmemBytes);
+}
+
+void GpuOps::gatedDeltaNetFoldAsync(const float* k, const float* v,
+                                    const float* gLog, const float* beta,
+                                    float* state, std::size_t acceptLen,
+                                    std::size_t H, std::size_t S) {
+    // Replay timesteps [0, acceptLen) of the accepted verify window into `state`
+    // in place (state-only gated delta-rule; byte-identical to gated_deltanet_ar
+    // minus the output). k,v [acceptLen,H,S]; gLog,beta [acceptLen,H];
+    // state [H,S,S]. Launch: grid=H, block=S.
+    if (acceptLen == 0 || H == 0 || S == 0) {
+        return;
+    }
+    auto& kern = _pimpl->_gatedDeltaNetFoldKernel;
+    kern.setPtr  (0, k);
+    kern.setPtr  (1, v);
+    kern.setPtr  (2, gLog);
+    kern.setPtr  (3, beta);
+    kern.setPtr  (4, state);
+    kern.setValue(5, toInt32(acceptLen, "fold acceptLen"));
+    kern.setValue(6, toInt32(H, "fold H"));
+    kern.setValue(7, toInt32(S, "fold S"));
+    kern.launch(_ctx.stream(),
+                static_cast<std::uint32_t>(H), 1, 1,
+                static_cast<std::uint32_t>(S), 1, 1);
 }
 
 void GpuOps::argmaxRowsAsync(const float* logits, std::int32_t* out,

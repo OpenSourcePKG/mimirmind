@@ -315,6 +315,21 @@ public:
             "argmaxRowsAsync: not supported on this backend");
     }
 
+    // GDN ReplaySSM fold: replay the accepted verify prefix [0, acceptLen) into
+    // the committed recurrent state in place — state-only (k/v/gLog/beta as the
+    // AR recurrence consumes them; q/output not needed for the state). Lets a
+    // DFlash/MTP partial accept land the committed state without re-forwarding
+    // the trunk. See kernels/cuda/llm/gated_deltanet_fold.cu.
+    virtual void gatedDeltaNetFoldAsync(const float* k, const float* v,
+                                        const float* gLog, const float* beta,
+                                        float* state, std::size_t acceptLen,
+                                        std::size_t H, std::size_t S) {
+        (void)k; (void)v; (void)gLog; (void)beta; (void)state;
+        (void)acceptLen; (void)H; (void)S;
+        throw std::runtime_error(
+            "gatedDeltaNetFoldAsync: not supported on this backend");
+    }
+
     virtual void causalConv1dSiluBatchedAsync(
             const float* convInput, const float* kernel, float* out,
             std::size_t nSeq, std::size_t T, std::size_t channels,

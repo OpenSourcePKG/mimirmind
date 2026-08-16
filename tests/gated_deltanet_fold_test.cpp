@@ -197,6 +197,36 @@ void checkParity(int L, int H, int S, int acceptLen, std::uint32_t seed) {
     const auto stateFold = runFold(ctx, ops, foldK, state0, k, v, gLog, beta,
                                    acceptLen, H, S);
 
+    // Same fold via the ComputeOps API (validates the GpuOps binding) — must be
+    // bit-identical to the raw-kernel launch above.
+    std::vector<float> stateApi;
+    {
+        auto dState = ops.allocate(state0.size() * sizeof(float));
+        auto dk = ops.allocate(k.size() * sizeof(float));
+        auto dv = ops.allocate(v.size() * sizeof(float));
+        auto dg = ops.allocate(gLog.size() * sizeof(float));
+        auto db = ops.allocate(beta.size() * sizeof(float));
+        ops.uploadHostBytes(dState.get(), state0.data(), state0.size() * sizeof(float));
+        ops.uploadHostBytes(dk.get(), k.data(), k.size() * sizeof(float));
+        ops.uploadHostBytes(dv.get(), v.data(), v.size() * sizeof(float));
+        ops.uploadHostBytes(dg.get(), gLog.data(), gLog.size() * sizeof(float));
+        ops.uploadHostBytes(db.get(), beta.data(), beta.size() * sizeof(float));
+        ops.gatedDeltaNetFoldAsync(dk.as<float>(), dv.as<float>(), dg.as<float>(),
+                                   db.as<float>(), dState.as<float>(),
+                                   static_cast<std::size_t>(acceptLen),
+                                   static_cast<std::size_t>(H),
+                                   static_cast<std::size_t>(S));
+        ops.flush();
+        stateApi.resize(state0.size());
+        ops.readbackToHost(stateApi.data(), dState.get(), stateApi.size() * sizeof(float));
+    }
+    double maxAbsApi = 0.0;
+    for (std::size_t i = 0; i < elemsHSS; ++i) {
+        maxAbsApi = std::max(maxAbsApi,
+                             std::abs(static_cast<double>(stateApi[i]) - stateFold[i]));
+    }
+    EXPECT_TRUE(maxAbsApi == 0.0);
+
     double maxAbsCpu = 0.0, maxAbsAr = 0.0;
     for (std::size_t i = 0; i < elemsHSS; ++i) {
         maxAbsCpu = std::max(maxAbsCpu,

@@ -204,6 +204,11 @@ public:
                                          std::size_t nSeq, std::size_t T,
                                          std::size_t H, std::size_t S) override;
 
+    void gatedDeltaNetFoldAsync(const float* k, const float* v, const float* gLog,
+                                const float* beta, float* state,
+                                std::size_t acceptLen, std::size_t H,
+                                std::size_t S) override;
+
     void argmaxRowsAsync(const float* logits, std::int32_t* out,
                          std::size_t nRows, std::size_t vocab) override;
     void deltanetGateAsync(const float* alpha, const float* ssmA,
