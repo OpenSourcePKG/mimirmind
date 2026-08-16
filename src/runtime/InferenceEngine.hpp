@@ -561,6 +561,15 @@ public:
                      std::size_t nSeq, std::size_t maxNew,
                      std::size_t depth, std::int32_t eosId);
 
+    /// DFlash serving-batched spec decode (5.9.1): shared prompt over nSeq slots,
+    /// per-slot block-diffusion draft + batched verify over M=nSeq*(depth+1).
+    [[nodiscard]] std::vector<std::vector<std::int32_t>>
+    generateBatchDflash(std::span<const std::int32_t> prompt,
+                        std::size_t nSeq, std::size_t maxNew, std::size_t depth,
+                        std::int32_t eosId, std::string_view drafterDir,
+                        std::size_t* draftedOut  = nullptr,
+                        std::size_t* acceptedOut = nullptr);
+
     /// M-Cuda.MTP Increment E4 — batched native MTP decode over `prompts`
     /// DIFFERENT prompts (different content AND length) concurrently, the
     /// heterogeneous generalization of generateBatchMtp that a continuous

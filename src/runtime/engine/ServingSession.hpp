@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace mimirmind::runtime { class KvCache; }   // nextn (MTP) KV cache
@@ -83,6 +84,17 @@ public:
     generateBatchMtpMulti(const std::vector<std::vector<std::int32_t>>& prompts,
                           std::size_t maxNew, std::size_t depth,
                           std::int32_t eosId);
+
+    /// DFlash serving-batched spec decode (5.9.1): one shared prompt over nSeq
+    /// slots, block-diffusion draft per slot (DFlashDecoder), batched verify over
+    /// M=nSeq*(depth+1) (the expert-read amortization) + per-slot accept via the
+    /// per-timestep SSM export. `drafterDir` is the DFlash checkpoint dir.
+    [[nodiscard]] std::vector<std::vector<std::int32_t>>
+    generateBatchDflash(std::span<const std::int32_t> prompt,
+                        std::size_t nSeq, std::size_t maxNew, std::size_t depth,
+                        std::int32_t eosId, std::string_view drafterDir,
+                        std::size_t* draftedOut = nullptr,
+                        std::size_t* acceptedOut = nullptr);
 
     [[nodiscard]] std::size_t maxBatch() const noexcept;
     [[nodiscard]] std::size_t maxContext() const noexcept;

@@ -74,6 +74,39 @@ public:
              std::size_t*                  draftedOut,
              std::size_t*                  acceptedOut);
 
+    // ---- Serving-batched reuse (5.9.1) ----------------------------------
+    /// Load the drafter + borrow the target embed/lm_head (idempotent). Public
+    /// wrapper so ServingSession::generateBatchDflash can prepare the drafter.
+    void ensureDflashLoaded(std::string_view drafterDir) { ensureLoaded(drafterDir); }
+
+    /// One-block draft for a single slot: given that slot's context hidden
+    /// `ctxHidden` [ctxLen, taps*hidden] (device) and anchor `token0`, propose K
+    /// tokens (embed [token0, mask x K] -> draftForward -> borrowed lm_head +
+    /// device per-row argmax). Reuses the single-block scratch (call per slot,
+    /// sequentially). Requires ensureDflashLoaded() first.
+    void draftOneBlock(const float* ctxHidden, std::size_t ctxLen,
+                       std::int32_t token0, std::size_t K,
+                       std::vector<std::int32_t>& drafts);
+
+    /// Serving prefill: run the trunk over `prompt` with the 8-tap live, build
+    /// the shared prompt context in the internal accumulator rows [0, promptLen)
+    /// and return the greedy anchor token0. The caller broadcasts
+    /// ctxHidden()[0 .. promptLen*ctxRowStride()) into its per-slot contexts.
+    /// Uses the single-session KV (separate from the serving paged KV, like
+    /// generateBatchMtp's token0 prefill). Requires ensureDflashLoaded() first.
+    [[nodiscard]] std::int32_t buildPromptContext(
+        std::span<const std::int32_t> prompt, std::size_t& promptLen);
+
+    /// Device base of the internal [maxPos, taps*hidden] context accumulator.
+    [[nodiscard]] float* ctxHidden() noexcept;
+    [[nodiscard]] std::size_t ctxRowStride() const noexcept { return _taps * _d; }
+
+    [[nodiscard]] std::size_t hiddenDim() const noexcept { return _d; }
+    [[nodiscard]] std::size_t tapCount() const noexcept { return _taps; }
+    [[nodiscard]] std::span<const std::size_t> tapLayers() const noexcept {
+        return std::span<const std::size_t>{kTapLayers, _taps};
+    }
+
 private:
     /// Load the drafter, borrow the target embed/lm_head, build the runner, and
     /// allocate the tap sinks + context/scratch buffers. Idempotent.

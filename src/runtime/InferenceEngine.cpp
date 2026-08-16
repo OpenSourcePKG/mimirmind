@@ -2219,6 +2219,21 @@ InferenceEngine::generateBatchMtp(std::span<const std::int32_t> prompt,
 }
 
 std::vector<std::vector<std::int32_t>>
+InferenceEngine::generateBatchDflash(std::span<const std::int32_t> prompt,
+                                     std::size_t nSeq, std::size_t maxNew,
+                                     std::size_t depth, std::int32_t eosId,
+                                     std::string_view drafterDir,
+                                     std::size_t* draftedOut,
+                                     std::size_t* acceptedOut) {
+    if (_servingSession == nullptr) {
+        _servingSession = std::make_unique<engine::ServingSession>(*this);
+    }
+    return _servingSession->generateBatchDflash(prompt, nSeq, maxNew, depth,
+                                                eosId, drafterDir, draftedOut,
+                                                acceptedOut);
+}
+
+std::vector<std::vector<std::int32_t>>
 InferenceEngine::generateBatchMtpMulti(
         const std::vector<std::vector<std::int32_t>>& prompts,
         std::size_t maxNew, std::size_t depth, std::int32_t eosId) {

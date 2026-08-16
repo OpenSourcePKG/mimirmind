@@ -434,4 +434,61 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
     return out;
 }
 
+std::int32_t DFlashDecoder::buildPromptContext(
+        std::span<const std::int32_t> prompt, std::size_t& promptLen) {
+    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    if (qb == nullptr) {
+        throw std::runtime_error("buildPromptContext: requires CUDA qwen35moe target");
+    }
+    _e.resetCache();
+    qb->configureHiddenTap(
+        std::span<const std::size_t>{kTapLayers, _taps},
+        std::span<float* const>{_tapPtr.data(), _tapPtr.size()});
+    std::vector<std::int32_t> pvec(prompt.begin(), prompt.end());
+    const auto pf = _e.forwardVerify(pvec);   // tap sinks fill rows [0, P)
+    const std::size_t P = pvec.size();
+    _e.commitVerified(pvec);
+    _e._ops->flush();
+    feedContext(0, P);                        // -> _ctxHidden rows [0, P)
+    qb->clearHiddenTap();
+    promptLen = P;
+    return argmaxHost(pf.back());
+}
+
+float* DFlashDecoder::ctxHidden() noexcept { return _ctxHidden.as<float>(); }
+
+void DFlashDecoder::draftOneBlock(const float* ctxHidden, std::size_t ctxLen,
+                                  std::int32_t token0, std::size_t K,
+                                  std::vector<std::int32_t>& drafts) {
+    drafts.clear();
+    if (K == 0) {
+        return;
+    }
+    const auto* lmHead = _model.lmHead();
+    const auto* tokEmb = _model.embedTokens();
+    float* const logitsSc = _e._logitsScH.as<float>();
+
+    std::vector<std::int32_t> block;
+    block.reserve(K + 1);
+    block.push_back(token0);
+    for (std::size_t i = 0; i < K; ++i) block.push_back(_maskTok);
+
+    compute::embeddingLookup(tokEmb->type, tokEmb->usmPtr, _d, _vocabEmb,
+                             std::span<const std::int32_t>{block},
+                             _noise.as<float>());
+    _runner->draftForward(_noise.as<float>(), ctxHidden, K + 1, ctxLen,
+                          _draftOut.as<float>());
+
+    float* const draftOut = _draftOut.as<float>();
+    _e._gmm->matmulAsync(lmHead->type, lmHead->usmPtr, _vocabLm, _d,
+                         draftOut + _d, K, _draftLogits.as<float>(), logitsSc);
+    _e._ops->argmaxRowsAsync(_draftLogits.as<float>(),
+                             _draftArgmaxDev.as<std::int32_t>(), K, _vocabLm);
+    _e._ops->flush();
+    _e._ops->readbackToHost(_draftArgmaxHost.data(), _draftArgmaxDev.get(),
+                            K * sizeof(std::int32_t));
+    drafts.assign(_draftArgmaxHost.begin(),
+                  _draftArgmaxHost.begin() + static_cast<std::ptrdiff_t>(K));
+}
+
 } // namespace mimirmind::runtime::engine
