@@ -315,6 +315,21 @@ public:
             "argmaxRowsAsync: not supported on this backend");
     }
 
+    // GDN ReplaySSM fold: replay the accepted verify prefix [0, acceptLen) into
+    // the committed recurrent state in place — state-only (k/v/gLog/beta as the
+    // AR recurrence consumes them; q/output not needed for the state). Lets a
+    // DFlash/MTP partial accept land the committed state without re-forwarding
+    // the trunk. See kernels/cuda/llm/gated_deltanet_fold.cu.
+    virtual void gatedDeltaNetFoldAsync(const float* k, const float* v,
+                                        const float* gLog, const float* beta,
+                                        float* state, std::size_t acceptLen,
+                                        std::size_t H, std::size_t S) {
+        (void)k; (void)v; (void)gLog; (void)beta; (void)state;
+        (void)acceptLen; (void)H; (void)S;
+        throw std::runtime_error(
+            "gatedDeltaNetFoldAsync: not supported on this backend");
+    }
+
     virtual void causalConv1dSiluBatchedAsync(
             const float* convInput, const float* kernel, float* out,
             std::size_t nSeq, std::size_t T, std::size_t channels,
@@ -792,6 +807,20 @@ public:
                                       std::size_t  kvDim,
                                       std::size_t  writeOffset) = 0;
 
+    /// FP16-KV staging commit: cast an fp32 K/V scratch [T, kvDim] into the
+    /// fp16 cache at the curLen `writeOffset`. The fp16 analogue of
+    /// kvQuantCommitQ8Async for models that stage K/V through fp32 (non-fused
+    /// QKV). Default: unsupported — only the CUDA backend overrides it.
+    virtual void kvCommitFp16Async(const float* xSrc,
+                                   void*        kvDst,
+                                   std::size_t  T,
+                                   std::size_t  kvDim,
+                                   std::size_t  writeOffset) {
+        (void)xSrc; (void)kvDst; (void)T; (void)kvDim; (void)writeOffset;
+        throw std::runtime_error(
+            "kvCommitFp16Async: not supported on this backend");
+    }
+
     virtual void qkvSplitAsync(const float*     fused,
                                float*           Yq,
                                void*            YkBase,
@@ -833,6 +862,22 @@ public:
                                        float* /*out*/) {
         throw std::runtime_error(
             "attentionEncoderAsync: not supported on this backend");
+    }
+
+    // Non-causal cross attention with distinct query / key-value lengths.
+    // Same math as attentionEncoderAsync (full-window softmax(Q·Kᵀ·scale)·V,
+    // GQA hkv=(hq*nKvHeads)/nHeads) but Tq != Tk: query (Tq rows) attends to
+    // all Tk keys. Layout q:[Tq,nHeads,headDim], k/v:[Tk,nKvHeads,headDim],
+    // out:[Tq,nHeads,headDim]. Used by the DFlash draft-forward block
+    // attention, where Q is the noise block (bs) and K/V are [ctx ; noise].
+    virtual void attentionEncoderCrossAsync(const float* /*q*/, const float* /*k*/,
+                                            const float* /*v*/, std::size_t /*Tq*/,
+                                            std::size_t /*Tk*/, std::size_t /*nHeads*/,
+                                            std::size_t /*nKvHeads*/,
+                                            std::size_t /*headDim*/, float /*scale*/,
+                                            float* /*out*/) {
+        throw std::runtime_error(
+            "attentionEncoderCrossAsync: not supported on this backend");
     }
 
     // Batched non-causal encoder attention: B sequences packed as rows
@@ -974,6 +1019,17 @@ public:
     /// owns the allocation and frees it via the deleter installed by
     /// this ops instance's backing allocator.
     [[nodiscard]] virtual ComputeBuffer allocate(std::size_t bytes) = 0;
+
+    /// Allocate `bytes` for an IMMUTABLE weight tensor (written once at load,
+    /// read-only thereafter). Same ownership/free semantics as `allocate`.
+    /// On unified/integrated CUDA parts (GB10) the buffer is already Managed
+    /// (host+device coherent); this variant additionally lets the backend mark
+    /// it read-mostly + device-preferred (`cudaMemAdvise`) so the decode hot
+    /// path reads it device-resident without fault-driven migration. Default =
+    /// `allocate` (no hint) for backends where it makes no difference.
+    [[nodiscard]] virtual ComputeBuffer allocateWeight(std::size_t bytes) {
+        return allocate(bytes);
+    }
 
     /// Synchronous host-to-device copy. Blocks until the transfer is
     /// visible to subsequent GPU dispatches. Used by loaders that need

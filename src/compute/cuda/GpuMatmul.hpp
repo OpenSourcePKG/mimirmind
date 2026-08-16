@@ -229,6 +229,13 @@ public:
                            std::size_t  M,
                            float*       Y);
 
+    [[nodiscard]] bool f32TcAllowed() const noexcept override {
+        return _f32TcAllowed;
+    }
+    void setF32TcAllowed(bool allowed) noexcept override {
+        _f32TcAllowed = allowed;
+    }
+
     void sync() override;
 
     [[nodiscard]] std::vector<::mimirmind::compute::AutotuneReport>
@@ -358,6 +365,24 @@ private:
     // half the weight bytes of the BF16 cuBLAS path; falls back to the hand
     // kernel if cuBLASLt does not support the shape (e.g. M=1 non-TC).
     bool                           _useCublasFp8{false};
+    // Also route batched (M>1) prefill dense GEMMs through the per-tensor FP8
+    // path. Opt-in MIMIRMIND_CUBLAS_FP8_PREFILL=1. The dense prefill projections
+    // (GDN in_proj_qkv/gate/ssm_out, attn q/k/v/o) all consume RMSNorm outputs,
+    // whose bounded magnitude keeps the per-tensor E4M3 activation scale from
+    // crushing precision — so the M==1-only gate can be lifted for these.
+    bool                           _useCublasFp8Prefill{false};
+    // Route batched (M>1) F32 GEMMs through the BF16/TF32 tensor-core kernel
+    // (weight cast to BF16 once, cached) instead of the per-row F32 vec launches.
+    // Opt-in MIMIRMIND_F32_TC_PREFILL=1: huge win for models with small F32
+    // weights hit at prefill M (the MoE router ffn_gate_inp, GDN ssm_beta/alpha,
+    // shared-expert router), but TF32's 10-bit mantissa is too coarse for the
+    // precision-sensitive encoder/reranker path, so it stays off by default.
+    bool                           _useF32TcPrefill{false};
+    // Runtime gate on the F32->TC downcast, defaulting to allowed so the LLM
+    // prefill uses it whenever `_useF32TcPrefill` is set. Precision-sensitive
+    // callers (the encoder / reranker) flip it off for their forward via
+    // `ScopedExactF32`, keeping their F32 projections bit-exact regardless.
+    bool                           _f32TcAllowed{true};
     // Route the M==1 blocked-NVFP4 vec (shexp / full-attn decode) through the
     // de-interleaved uint4-coalesced kernel. Opt-in MIMIRMIND_NVFP4_DEINT=1.
     bool                           _useDeintVec{false};

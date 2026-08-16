@@ -257,6 +257,17 @@ public:
         return false;
     }
 
+    /// Approximate F32 fast path control. A backend may route batched
+    /// (M>1) F32 GEMMs through a BF16/TF32 tensor-core kernel (weight
+    /// downcast once) — a large prefill win, but TF32's 10-bit mantissa
+    /// is too coarse for precision-sensitive callers (the encoder /
+    /// reranker). Such callers wrap their forward in `ScopedExactF32`
+    /// to force exact-F32 for the scope, independent of the global
+    /// opt-in. Default: no fast path exists, so the getter is false and
+    /// the setter is a no-op. Not thread-safe (matches the class).
+    [[nodiscard]] virtual bool f32TcAllowed() const noexcept { return false; }
+    virtual void setF32TcAllowed(bool /*allowed*/) noexcept {}
+
     /// Flush any pending appends. Safe to call when there's no
     /// pending work — cheap no-op.
     virtual void sync() = 0;
@@ -267,6 +278,30 @@ public:
 
 protected:
     ComputeMatmul() = default;
+};
+
+/**
+ * RAII: forces exact-F32 GEMMs (disables the approximate F32->TC
+ * downcast fast path) for the scope's lifetime, restoring the prior
+ * setting on exit. Precision-sensitive callers (the encoder / reranker)
+ * construct one at the top of their forward so their F32 projections
+ * stay bit-exact even when the LLM prefill has opted the fast path in.
+ * A no-op on backends without the fast path (getter false, setter no-op).
+ */
+class ScopedExactF32 {
+public:
+    explicit ScopedExactF32(ComputeMatmul& mm) noexcept
+        : _mm{mm}, _prev{mm.f32TcAllowed()} { _mm.setF32TcAllowed(false); }
+    ~ScopedExactF32() { _mm.setF32TcAllowed(_prev); }
+
+    ScopedExactF32(const ScopedExactF32&)            = delete;
+    ScopedExactF32& operator=(const ScopedExactF32&) = delete;
+    ScopedExactF32(ScopedExactF32&&)                 = delete;
+    ScopedExactF32& operator=(ScopedExactF32&&)      = delete;
+
+private:
+    ComputeMatmul& _mm;
+    bool           _prev;
 };
 
 } // namespace mimirmind::compute

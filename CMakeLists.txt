@@ -26,6 +26,13 @@ project(mimirmind
 option(MIMIRMIND_ENABLE_L0   "Build the Level Zero backend and all L0-tied consumers" ON)
 option(MIMIRMIND_ENABLE_HIP  "Build the HIP backend (placeholder — no impl on main yet)" OFF)
 option(MIMIRMIND_ENABLE_CUDA "Build the CUDA backend skeleton (DGX Spark bringup)" OFF)
+# cuDNN 9 SDPA (fused flash attention) — the D256 prefill-attn path that the
+# hand-rolled tensor-core kernels cannot beat on sm_121 (99 KiB smem cap).
+# Opt-in; needs cuDNN 9.x + cudnn-frontend headers (see MIMIRMIND_CUDNN_ROOT /
+# MIMIRMIND_CUDNN_FE_ROOT). Requires MIMIRMIND_ENABLE_CUDA.
+option(MIMIRMIND_ENABLE_CUDNN "Build the cuDNN SDPA attention path (GB10 prefill)" OFF)
+set(MIMIRMIND_CUDNN_ROOT    "" CACHE PATH "cuDNN install root (has include/ and lib/)")
+set(MIMIRMIND_CUDNN_FE_ROOT "" CACHE PATH "cudnn-frontend include root (has cudnn_frontend.h)")
 
 # C++23 required — std::expected in src/core/ipc/ for the M-Munin
 # error-return convention (see decisions/2026-07-13-m-munin-scope.md).
@@ -393,6 +400,8 @@ add_library(mimirmind_core_common STATIC
     src/runtime/encoder/EncoderModel.cpp
     src/runtime/encoder/EncoderRunner.cpp
     src/runtime/encoder/RerankEngine.cpp
+    src/runtime/dflash/DFlashDraftModel.cpp
+    src/runtime/dflash/DFlashDraftRunner.cpp
     src/model/XlmRobertaTokenizer.cpp
 )
 
@@ -425,6 +434,123 @@ if(MIMIRMIND_ENABLE_HIP)
 endif()
 if(MIMIRMIND_ENABLE_CUDA)
     target_compile_definitions(mimirmind_core_common PUBLIC MIMIRMIND_HAVE_CUDA=1)
+endif()
+
+# ---- dflash_loader_test — DFlash drafter safetensors inventory validation ---
+# Phase 1 of the DFlash spec-decode track: asserts the full expected tensor
+# inventory of the DFlashDraftModel checkpoint loads with correct shapes/dtype.
+# CPU-only (no CUDA / device upload). Run against the on-box checkpoint:
+#   cmake --build build-cuda --target dflash_loader_test &&
+#   ./build-cuda/dflash_loader_test /opt/mimirmind/models/qwen3.6-35b-a3b-dflash-drafter
+add_executable(dflash_loader_test tests/dflash_loader_test.cpp)
+target_link_libraries(dflash_loader_test PRIVATE mimirmind_core_common)
+
+# ---- dflash_device_upload_test — DFlash drafter H2D upload validation -------
+# Phase 1b: loads the BF16 drafter onto the CUDA device via DFlashDraftModel,
+# asserts derived dims + non-null device handles + a byte-identical round-trip.
+# Needs a CUDA device (run on the box). Guarded on the CUDA backend.
+#   cmake --build build-cuda --target dflash_device_upload_test &&
+#   ./build-cuda/dflash_device_upload_test /opt/mimirmind/models/qwen3.6-35b-a3b-dflash-drafter
+if(MIMIRMIND_ENABLE_CUDA)
+    # compute::cuda::GpuOps lives only in the main binary, not in a static lib
+    # — so (like cuda_parity_tests) compile GpuOps.cpp + its compute deps
+    # straight into this test.
+    add_executable(dflash_device_upload_test
+        tests/dflash_device_upload_test.cpp
+        src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/MoeTopKRouteDevice.cpp
+        src/compute/cuda/GpuMatmul.cpp
+        src/compute/GatedDeltaNet.cpp
+        src/compute/Rope.cpp
+        src/compute/Norm.cpp
+        src/compute/Activations.cpp
+        src/compute/Attention.cpp
+        src/compute/Embedding.cpp
+        src/compute/Matmul.cpp
+        src/compute/Dequant.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
+    )
+    add_dependencies(dflash_device_upload_test cuda_kernels)
+    target_include_directories(dflash_device_upload_test PRIVATE tests)
+    target_link_libraries(dflash_device_upload_test PRIVATE
+        mimirmind_core_cuda mimirmind_core_common)
+
+    # ---- dflash_forward_parity_test — DFlash draft-forward vs z-lab golden ---
+    # Phase 3: validates DFlashDraftRunner against the reference golden
+    # (tools/dflash_golden.py). P3.1 = materializeContext (fc -> hidden_norm).
+    #   cmake --build build-cuda --target dflash_forward_parity_test &&
+    #   ./build-cuda/dflash_forward_parity_test <drafter_dir> <golden_dir>
+    add_executable(dflash_forward_parity_test
+        tests/dflash_forward_parity_test.cpp
+        src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/MoeTopKRouteDevice.cpp
+        src/compute/cuda/GpuMatmul.cpp
+        src/compute/GatedDeltaNet.cpp
+        src/compute/Rope.cpp
+        src/compute/Norm.cpp
+        src/compute/Activations.cpp
+        src/compute/Attention.cpp
+        src/compute/Embedding.cpp
+        src/compute/Matmul.cpp
+        src/compute/Dequant.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
+    )
+    add_dependencies(dflash_forward_parity_test cuda_kernels)
+    target_include_directories(dflash_forward_parity_test PRIVATE tests)
+    target_link_libraries(dflash_forward_parity_test PRIVATE
+        mimirmind_core_cuda mimirmind_core_common)
+
+    # ---- gated_deltanet_fold_test — GDN ReplaySSM fold-kernel golden ---------
+    # Phase-4 Teil 1: gated_deltanet_fold replays the accepted verify prefix into
+    # the committed state; parity vs the CPU recurrence + the device AR kernel.
+    #   cmake --build build-cuda --target gated_deltanet_fold_test &&
+    #   MIMIRMIND_HSACO_DIR=build-cuda/ptx ./build-cuda/gated_deltanet_fold_test
+    add_executable(gated_deltanet_fold_test
+        tests/gated_deltanet_fold_test.cpp
+        src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/MoeTopKRouteDevice.cpp
+        src/compute/cuda/GpuMatmul.cpp
+        src/compute/GatedDeltaNet.cpp
+        src/compute/Rope.cpp
+        src/compute/Norm.cpp
+        src/compute/Activations.cpp
+        src/compute/Attention.cpp
+        src/compute/Embedding.cpp
+        src/compute/Matmul.cpp
+        src/compute/Dequant.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
+    )
+    add_dependencies(gated_deltanet_fold_test cuda_kernels)
+    target_include_directories(gated_deltanet_fold_test PRIVATE tests)
+    target_link_libraries(gated_deltanet_fold_test PRIVATE
+        mimirmind_core_cuda mimirmind_core_common)
 endif()
 
 # ---- mimirmind_core_l0 — Level Zero-tied foundation ------------------------
@@ -709,8 +835,14 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/attention_prefill_flash_fp16.cu
         kernels/cuda/llm/attention_prefill_flash_q8_0.cu
         kernels/cuda/llm/attention_prefill_flash_q8_0_gqa.cu
+        kernels/cuda/llm/attention_prefill_flash_f32_gqa.cu
+        kernels/cuda/llm/attention_prefill_flash_f32_gqa_tc.cu
+        kernels/cuda/llm/attention_prefill_flash_f32_gqa_mwtc.cu
+        kernels/cuda/llm/attention_prefill_flash_fp16_tc.cu
+        kernels/cuda/llm/attention_prefill_flash_fp16_gqa_tc.cu
         kernels/cuda/llm/attention_q8_0.cu
         kernels/cuda/llm/kv_quant_commit_q8_0.cu
+        kernels/cuda/llm/kv_commit_fp16.cu
         kernels/cuda/common/matmul_q8_0_gemm.cu
         kernels/cuda/common/matmul_q8_0_gemm_v2.cu
         kernels/cuda/common/matmul_q8_0_mmq.cu
@@ -760,8 +892,10 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/rmsnorm_no_weight.cu
         kernels/cuda/llm/rmsnorm_qkv.cu
         kernels/cuda/llm/rmsnorm_qkv_fp16.cu
+        kernels/cuda/llm/rmsnorm_qkv_f32in_fp16out.cu
         kernels/cuda/llm/rope_inplace.cu
         kernels/cuda/llm/rope_mrope.cu
+        kernels/cuda/llm/rope_mrope_fp16.cu
         kernels/cuda/llm/rope_mrope_batched.cu
         kernels/cuda/llm/split_head_pair.cu
         kernels/cuda/common/sigmoid_gate_mul.cu
@@ -769,10 +903,12 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/ssm_conv1d.cu
         kernels/cuda/llm/ssm_conv1d_batched.cu
         kernels/cuda/llm/gated_deltanet_ar.cu
+        kernels/cuda/llm/gated_deltanet_ar_r2.cu
         kernels/cuda/llm/gated_deltanet_ar_batched.cu
         kernels/cuda/llm/gated_deltanet_ar_batched_v2.cu
         kernels/cuda/llm/gated_deltanet_ar_batched_v3.cu
         kernels/cuda/llm/gated_deltanet_verify_batched.cu
+        kernels/cuda/llm/gated_deltanet_fold.cu
         kernels/cuda/llm/argmax_rows.cu
         kernels/cuda/llm/deltanet_gate.cu
         kernels/cuda/llm/deltanet_chunk_cumgate.cu
@@ -1021,6 +1157,7 @@ add_executable(mimirmind
     src/runtime/ComputeStack.cpp
     src/runtime/engine/Nvfp4Loader.cpp
     src/runtime/engine/MtpDecoder.cpp
+    src/runtime/engine/DFlashDecoder.cpp
     src/runtime/engine/ServingSession.cpp
     src/runtime/serving/ContinuousBatcher.cpp
     src/runtime/KvCache.cpp
@@ -2587,6 +2724,67 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_dependencies(cuda_parity_tests cuda_kernels)
     target_include_directories(cuda_parity_tests PRIVATE tests)
     target_link_libraries(cuda_parity_tests PRIVATE mimirmind_core_cuda)
+endif()
+
+# ---- cudnn_sdpa_parity — cuDNN 9 SDPA (D256 GQA causal prefill) parity/latency
+# Standalone gate: proves our build links cuDNN on aarch64 + the frontend headers
+# compile + the kernel finalizes/runs/is-correct on sm_121. No engine deps.
+#   cmake --build build-cuda --target cudnn_sdpa_parity && ./build-cuda/cudnn_sdpa_parity [seqlen]
+if(MIMIRMIND_ENABLE_CUDA AND MIMIRMIND_ENABLE_CUDNN)
+    if(NOT MIMIRMIND_CUDNN_ROOT OR NOT MIMIRMIND_CUDNN_FE_ROOT)
+        message(FATAL_ERROR
+            "MIMIRMIND_ENABLE_CUDNN=ON needs -DMIMIRMIND_CUDNN_ROOT=<cudnn dir (include/,lib/)> "
+            "and -DMIMIRMIND_CUDNN_FE_ROOT=<dir with cudnn_frontend.h>.")
+    endif()
+
+    # ---- mimirmind_cudnn_sdpa — the CudnnSdpaPrefill wrapper as a linkable lib.
+    # Isolates the heavy cudnn-frontend headers into one TU (like the CUTLASS MoE
+    # lib). Exposes MIMIRMIND_HAVE_CUDNN_SDPA + the clean .hpp to the mimirmind
+    # binary so GpuOps can call it behind the macro.
+    add_library(mimirmind_cudnn_sdpa STATIC src/compute/cuda/CudnnSdpaPrefill.cu)
+    target_include_directories(mimirmind_cudnn_sdpa PRIVATE
+        src "${MIMIRMIND_CUDNN_ROOT}/include" "${MIMIRMIND_CUDNN_FE_ROOT}")
+    target_link_directories(mimirmind_cudnn_sdpa PUBLIC "${MIMIRMIND_CUDNN_ROOT}/lib")
+    target_link_libraries(mimirmind_cudnn_sdpa PUBLIC
+        -l:libcudnn.so.9 CUDA::cudart CUDA::nvrtc)
+    set_target_properties(mimirmind_cudnn_sdpa PROPERTIES
+        CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+        POSITION_INDEPENDENT_CODE ON)
+    # Wire into the serving binary: link + feature macro so GpuOps compiles the
+    # cuDNN prefill-attn path. Opt-in at runtime via MIMIRMIND_ATTN_CUDNN=1.
+    if(TARGET mimirmind)
+        target_link_libraries(mimirmind PRIVATE mimirmind_cudnn_sdpa)
+        target_compile_definitions(mimirmind PRIVATE MIMIRMIND_HAVE_CUDNN_SDPA=1)
+    endif()
+
+    add_executable(cudnn_sdpa_parity tests/cudnn_sdpa_parity.cu)
+    target_include_directories(cudnn_sdpa_parity PRIVATE
+        "${MIMIRMIND_CUDNN_ROOT}/include" "${MIMIRMIND_CUDNN_FE_ROOT}")
+    target_link_directories(cudnn_sdpa_parity PRIVATE "${MIMIRMIND_CUDNN_ROOT}/lib")
+    # libcudnn ships as libcudnn.so.9 (no bare .so symlink in the wheel) — link the
+    # soname directly; -lnvrtc for the frontend's JIT path.
+    target_link_libraries(cudnn_sdpa_parity PRIVATE
+        -l:libcudnn.so.9 CUDA::cudart CUDA::nvrtc)
+    # cudnn-frontend is C++17; pin the dialect (the CUDA target otherwise inherits
+    # the project's higher default) and emit PTX (arch off, like the kernels).
+    set_target_properties(cudnn_sdpa_parity PROPERTIES
+        CUDA_ARCHITECTURES OFF
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON)
+
+    # Inc 2 — the reusable CudnnSdpaPrefill wrapper (F32 in/out) vs a CPU ref.
+    add_executable(cudnn_sdpa_wrapper_test
+        tests/cudnn_sdpa_wrapper_test.cu
+        src/compute/cuda/CudnnSdpaPrefill.cu)
+    target_include_directories(cudnn_sdpa_wrapper_test PRIVATE
+        src "${MIMIRMIND_CUDNN_ROOT}/include" "${MIMIRMIND_CUDNN_FE_ROOT}")
+    target_link_directories(cudnn_sdpa_wrapper_test PRIVATE "${MIMIRMIND_CUDNN_ROOT}/lib")
+    target_link_libraries(cudnn_sdpa_wrapper_test PRIVATE
+        -l:libcudnn.so.9 CUDA::cudart CUDA::nvrtc)
+    set_target_properties(cudnn_sdpa_wrapper_test PROPERTIES
+        CUDA_ARCHITECTURES OFF
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON)
 endif()
 
 # ============================================================================

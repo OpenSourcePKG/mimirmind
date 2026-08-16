@@ -1169,6 +1169,169 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             return 0;
         }
 
+        // M-Cuda.DFlash Phase 3.4 — DFlash block-diffusion draft validation.
+        // MIMIRMIND_DFLASH_TEST: run generateDflash (block size from
+        // MIMIRMIND_DFLASH_N, default 7 => block_size 8) vs plain greedy
+        // generate() on the same prompt. Output MUST be bit-identical (verify
+        // guarantees correctness); report mean accept-length + decode speedup.
+        // The drafter checkpoint dir comes from MIMIRMIND_DFLASH_DIR.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_DFLASH_TEST") != nullptr) {
+            if (!e->dflashAvailable()) {
+                std::cout << "\n[M-Cuda.DFlash] target not DFlash-capable — skipped\n";
+                std::cout.flush();
+                return 0;
+            }
+            const char* dirEnv = std::getenv("MIMIRMIND_DFLASH_DIR");
+            if (dirEnv == nullptr) {
+                std::cout << "\n[M-Cuda.DFlash] set MIMIRMIND_DFLASH_DIR to the "
+                             "drafter checkpoint dir — skipped\n";
+                std::cout.flush();
+                return 0;
+            }
+            const auto& tok = e->tokenizer();
+            const char* promptEnv = std::getenv("MIMIRMIND_DFLASH_PROMPT");
+            std::vector<std::int32_t> pids = tok.encode(
+                promptEnv != nullptr
+                    ? promptEnv
+                    : "The history of artificial intelligence began when",
+                /*addBos=*/false);
+            if (pids.empty()) pids.push_back(1);
+            std::size_t draftN = 7;
+            if (const char* dv = std::getenv("MIMIRMIND_DFLASH_N")) {
+                const long v = std::strtol(dv, nullptr, 10);
+                if (v >= 1) draftN = static_cast<std::size_t>(v);
+            }
+            std::size_t maxNew = 128;
+            if (const char* mv = std::getenv("MIMIRMIND_DFLASH_MAXNEW")) {
+                const long v = std::strtol(mv, nullptr, 10);
+                if (v >= 1) maxNew = static_cast<std::size_t>(v);
+            }
+            std::cout << "\n[M-Cuda.DFlash] promptTokens=" << pids.size()
+                      << " drafter=" << dirEnv;
+            using clk = std::chrono::steady_clock;
+
+            // Baseline greedy generate().
+            ::mimirmind::runtime::GenerateParams gp{};
+            gp.maxNewTokens         = maxNew;
+            gp.sampling.temperature = 0.0F;
+            e->resetCache();
+            const auto tb0 = clk::now();
+            std::vector<std::int32_t> ref =
+                e->generate(pids, gp, {}, nullptr, {}, {});
+            const double baseMs =
+                std::chrono::duration<double, std::milli>(clk::now() - tb0).count();
+
+            // DFlash greedy generate.
+            std::size_t drafted = 0, accepted = 0;
+            const auto td0 = clk::now();
+            std::vector<std::int32_t> df =
+                e->generateDflash(pids, maxNew, draftN, tok.eosId(), dirEnv,
+                                  &drafted, &accepted);
+            const double dfMs =
+                std::chrono::duration<double, std::milli>(clk::now() - td0).count();
+
+            std::size_t matchLen = 0;
+            const std::size_t cn = std::min(ref.size(), df.size());
+            for (; matchLen < cn; ++matchLen)
+                if (ref[matchLen] != df[matchLen]) break;
+            const bool identical =
+                (ref.size() == df.size()) && (matchLen == ref.size());
+            const double acceptRate =
+                drafted > 0 ? static_cast<double>(accepted) / drafted : 0.0;
+            // Each round emits (accepted_r + 1) tokens => rounds = emitted - accepted.
+            const std::size_t rounds =
+                df.size() > accepted ? df.size() - accepted : 0;
+            const double acceptLen =
+                rounds > 0 ? static_cast<double>(accepted) / rounds : 0.0;
+
+            std::cout << "\n[M-Cuda.DFlash] draftN=" << draftN
+                      << " (block " << (draftN + 1) << ") maxNew=" << maxNew
+                      << "\n  output-identical=" << (identical ? "YES" : "NO")
+                      << " (match " << matchLen << "/" << ref.size() << ", dflash "
+                      << df.size() << ")\n"
+                      << "  accept-len=" << acceptLen << " (accepted " << accepted
+                      << " / rounds " << rounds << "; accept-rate=" << acceptRate
+                      << ", drafted " << drafted << ")\n"
+                      << "  baseline=" << baseMs << " ms  dflash=" << dfMs
+                      << " ms  speedup=" << (dfMs > 0 ? baseMs / dfMs : 0.0)
+                      << "x\n"
+                      << "  => DFlash " << (identical ? "PASS" : "MISMATCH") << "\n";
+            std::cout.flush();
+            return 0;
+        }
+
+        // 5.9.1 — DFlash SERVING-batched spec decode: shared prompt over N slots,
+        // per-slot block-draft -> ONE batched verify over M=N*(K+1) (expert-read
+        // amortization) -> per-slot accept via the per-timestep SSM export. The
+        // >1x lever: speedup vs plain batched decode should rise with N. Also a
+        // correctness signal: all N slots (identical prompt) must produce the
+        // same stream.
+        if (arch == "qwen35moe" &&
+            std::getenv("MIMIRMIND_DFLASH_BATCH") != nullptr) {
+            const char* dirEnv = std::getenv("MIMIRMIND_DFLASH_DIR");
+            if (dirEnv == nullptr) {
+                std::cout << "\n[DFlash.Batch] set MIMIRMIND_DFLASH_DIR\n";
+                std::cout.flush();
+                return 0;
+            }
+            const auto& tok = e->tokenizer();
+            const char* promptEnv = std::getenv("MIMIRMIND_DFLASH_PROMPT");
+            std::vector<std::int32_t> pids = tok.encode(
+                promptEnv != nullptr
+                    ? promptEnv
+                    : "The history of artificial intelligence began when",
+                /*addBos=*/false);
+            if (pids.empty()) pids.push_back(1);
+            std::size_t K = 7, N = 8, maxNew = 96;
+            if (const char* v = std::getenv("MIMIRMIND_DFLASH_N")) {
+                const long x = std::strtol(v, nullptr, 10); if (x >= 1) K = static_cast<std::size_t>(x);
+            }
+            if (const char* v = std::getenv("MIMIRMIND_DFLASH_NSEQ")) {
+                const long x = std::strtol(v, nullptr, 10); if (x >= 1) N = static_cast<std::size_t>(x);
+            }
+            if (const char* v = std::getenv("MIMIRMIND_DFLASH_MAXNEW")) {
+                const long x = std::strtol(v, nullptr, 10); if (x >= 1) maxNew = static_cast<std::size_t>(x);
+            }
+            using clk = std::chrono::steady_clock;
+
+            std::vector<std::vector<std::int32_t>> prompts(N, pids);
+            const auto tb0 = clk::now();
+            const auto base = e->generateBatch(prompts, maxNew, tok.eosId());
+            const double baseMs =
+                std::chrono::duration<double, std::milli>(clk::now() - tb0).count();
+
+            std::size_t drafted = 0, accepted = 0;
+            const auto td0 = clk::now();
+            const auto df = e->generateBatchDflash(pids, N, maxNew, K, tok.eosId(),
+                                                   dirEnv, &drafted, &accepted);
+            const double dfMs =
+                std::chrono::duration<double, std::milli>(clk::now() - td0).count();
+
+            bool allEq = true;
+            for (std::size_t s = 1; s < df.size(); ++s) {
+                if (df[s] != df[0]) allEq = false;
+            }
+            const std::size_t roundsTot = (K > 0 ? drafted / K : 0);
+            const double acceptLen =
+                roundsTot > 0 ? static_cast<double>(accepted) / roundsTot : 0.0;
+            const double acceptRate =
+                drafted > 0 ? static_cast<double>(accepted) / drafted : 0.0;
+            std::cout << "\n[DFlash.Batch] N=" << N << " K=" << K
+                      << " (block " << (K + 1) << ") maxNew=" << maxNew
+                      << " promptTokens=" << pids.size()
+                      << "\n  slots-identical=" << (allEq ? "YES" : "NO")
+                      << " (df[0].len=" << (df.empty() ? 0 : df[0].size()) << ")"
+                      << "\n  accept-len=" << acceptLen
+                      << " accept-rate=" << acceptRate
+                      << " (accepted " << accepted << " / drafted " << drafted << ")"
+                      << "\n  baseline(batch)=" << baseMs << " ms  dflash(batch)="
+                      << dfMs << " ms  speedup=" << (dfMs > 0 ? baseMs / dfMs : 0.0)
+                      << "x\n";
+            std::cout.flush();
+            return 0;
+        }
+
         // M-Cuda.MTP Increment E1 — batched-verify parity gate. With a
         // single slot (N=1), stepServingVerify (full-attention over virtual
         // paged slots + K+1 sequential GatedDeltaNet steps + per-step SSM

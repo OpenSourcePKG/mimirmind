@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -292,6 +293,66 @@ void Qwen35MoeBackend::traceDump(const char* tag, std::size_t blockIdx,
             static_cast<std::streamsize>(n * sizeof(float)));
 }
 
+void Qwen35MoeBackend::configureHiddenTap(std::span<const std::size_t> tapLayers,
+                                          std::span<float* const>      tapDst) {
+    if (tapLayers.size() != tapDst.size()) {
+        throw std::runtime_error(
+            "Qwen35MoeBackend::configureHiddenTap: tapLayers/tapDst size mismatch");
+    }
+    if (tapLayers.empty()) {
+        clearHiddenTap();
+        return;
+    }
+    _hiddenTapSlot.assign(_config.blockCount, -1);
+    _hiddenTapDst.assign(tapDst.begin(), tapDst.end());
+    for (std::size_t k = 0; k < tapLayers.size(); ++k) {
+        const std::size_t l = tapLayers[k];
+        if (l >= _config.blockCount) {
+            clearHiddenTap();
+            throw std::runtime_error(
+                "Qwen35MoeBackend::configureHiddenTap: tap layer index out of range");
+        }
+        if (tapDst[k] == nullptr) {
+            clearHiddenTap();
+            throw std::runtime_error(
+                "Qwen35MoeBackend::configureHiddenTap: null tap sink pointer");
+        }
+        _hiddenTapSlot[l] = static_cast<int>(k);
+    }
+}
+
+std::size_t Qwen35MoeBackend::gdnVHeads()     const noexcept { return _config.ssmNumVHeads(); }
+std::size_t Qwen35MoeBackend::gdnStateSize()  const noexcept { return _config.ssmStateSize; }
+std::size_t Qwen35MoeBackend::gdnConvDim()    const noexcept { return _config.ssmConvDim(); }
+std::size_t Qwen35MoeBackend::gdnConvKernel() const noexcept { return _config.ssmConvKernel; }
+std::size_t Qwen35MoeBackend::layerCount()    const noexcept { return _config.blockCount; }
+bool Qwen35MoeBackend::isRecurrent(std::size_t b) const noexcept {
+    return _config.isRecurrentLayer(b);
+}
+
+void Qwen35MoeBackend::configureGdnCapture(
+        std::span<const std::size_t> recurBlocks,
+        std::span<float* const>      kSinks,
+        std::span<float* const>      vSinks,
+        std::span<float* const>      gSinks,
+        std::span<float* const>      bSinks,
+        std::span<float* const>      convSinks,
+        std::size_t                  maxT) {
+    _gdnCapSlot.assign(_config.blockCount, -1);
+    _gdnCapK.assign(kSinks.begin(), kSinks.end());
+    _gdnCapV.assign(vSinks.begin(), vSinks.end());
+    _gdnCapG.assign(gSinks.begin(), gSinks.end());
+    _gdnCapB.assign(bSinks.begin(), bSinks.end());
+    _gdnCapConv.assign(convSinks.begin(), convSinks.end());
+    _gdnCapMaxT = maxT;
+    for (std::size_t slot = 0; slot < recurBlocks.size(); ++slot) {
+        const std::size_t b = recurBlocks[slot];
+        if (b < _config.blockCount) {
+            _gdnCapSlot[b] = static_cast<int>(slot);
+        }
+    }
+}
+
 void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
                                 float*        x,
                                 std::size_t   T,
@@ -304,6 +365,21 @@ void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
         runLinearBlock(blockIdx, x, T, cache, s, diag);
     } else {
         runFullAttentionBlock(blockIdx, x, T, cache, s, diag);
+    }
+
+    // M-Cuda.DFlash Phase 2 — hidden-state tap. Copy the residual after this
+    // block into the caller's sink for the tapped layers (position-major,
+    // row = absolute position base+r). CLR-safe device copy on the compute
+    // stream; prod-inert when unconfigured. `base` = cache.length() is this
+    // forward's first absolute position (the same base the ssm dump uses).
+    if (!_hiddenTapDst.empty()) {
+        const int slot = _hiddenTapSlot[blockIdx];
+        if (slot >= 0) {
+            const std::size_t base = cache.length();
+            _ops.appendMemoryCopy(
+                _hiddenTapDst[static_cast<std::size_t>(slot)] + base * s.d_model,
+                x, T * s.d_model * sizeof(float));
+        }
     }
 
     if (_ssmTrace || _ssmDump) {
@@ -360,10 +436,15 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     trace("enter (full-attn)");
 
     const auto kvDtype = cache.dtype();
-    if (kvDtype != KvDtype::F32) {
+    // FP16 KV uses the Q8_0-style staging redirect: K/V project into an fp32
+    // scratch, rmsnorm + IMRoPE run in fp32 there, then kv_commit_fp16 casts
+    // each row into the fp16 cache (single lossy step). The plain F32 path is
+    // unchanged. Q8_0 is not wired for the Qwen35 IMRoPE path yet.
+    const bool fp16Path = (kvDtype == KvDtype::FP16);
+    if (kvDtype != KvDtype::F32 && !fp16Path) {
         throw std::runtime_error(
-            "Qwen35MoeBackend: only KvDtype::F32 is supported "
-            "(M-Q3N.2 F32-only IMRoPE + staging path)");
+            "Qwen35MoeBackend: only KvDtype::F32 or FP16 is supported "
+            "(FP16 via fp32-staging redirect; Q8_0 not wired for IMRoPE)");
     }
 
     const auto& w    = _weights;
@@ -398,6 +479,19 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     void* const kBase = const_cast<void*>(cache.baseK(kvL));
     void* const vBase = const_cast<void*>(cache.baseV(kvL));
 
+    // FP16 staging redirect (mirror of the Q8_0 path in Qwen2Backend): under
+    // fp16 the K/V pre-attention pipeline (projection, QK-norm, IMRoPE) runs on
+    // an fp32 scratch [T, kv_dim] at row 0; kv_commit_fp16 then casts into the
+    // fp16 cache at the curLen offset. The plain F32 path keeps writing the
+    // cache slot in place (kStaging == kBase, F32, curLen offset).
+    float* const kFp32Scratch = fp16Path ? s.kvKFp32Scratch.as<float>() : nullptr;
+    float* const vFp32Scratch = fp16Path ? s.kvVFp32Scratch.as<float>() : nullptr;
+    void* const kStaging = fp16Path ? static_cast<void*>(kFp32Scratch) : kBase;
+    void* const vStaging = fp16Path ? static_cast<void*>(vFp32Scratch) : vBase;
+    const auto  stagingKvDtype    = fp16Path ? KvDtype::F32 : kvDtype;
+    const std::size_t stagingWriteOffset = fp16Path ? 0 : curLen;
+    const std::size_t stagingWriteStride = fp16Path ? 0 : kv_dim;
+
     // --- pre-attention RMSNorm ---------------------------------------
     _ops.profileSection("attn");   // prefill full-attention layer (DECODE_PROFILE)
     trace("attn rmsNorm");
@@ -416,9 +510,13 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
         _gmm.matmulAsync(qW.type, qW.usmPtr, 2 * q_dim, d_model,
                          normBuf, T, qGateFused, matmulScratch);
         _gmm.matmulAsync(kW.type, kW.usmPtr, kv_dim, d_model,
-                         normBuf, T, static_cast<float*>(kSlot), matmulScratch);
+                         normBuf, T,
+                         fp16Path ? kFp32Scratch : static_cast<float*>(kSlot),
+                         matmulScratch);
         _gmm.matmulAsync(vW.type, vW.usmPtr, kv_dim, d_model,
-                         normBuf, T, static_cast<float*>(vSlot), matmulScratch);
+                         normBuf, T,
+                         fp16Path ? vFp32Scratch : static_cast<float*>(vSlot),
+                         matmulScratch);
     }
 
     trace("split Q|gate");
@@ -427,13 +525,13 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     // --- QK-norm (per-head RMS over head_dim) + V passthrough --------
     trace("QK-norm");
     _ops.rmsNormQkvAsync(
-        qBuf,  static_cast<const float*>(qNorm.usmPtr),
-        kBase, static_cast<const float*>(kNorm.usmPtr),
-        vBase,
+        qBuf,     static_cast<const float*>(qNorm.usmPtr),
+        kStaging, static_cast<const float*>(kNorm.usmPtr),
+        vStaging,
         T * nHeads, T * nKvHeads, head_dim,
         _config.rmsNormEps,
-        /*writeOffset=*/curLen, kv_dim,
-        kvDtype, /*useStagingSlot=*/false);
+        /*writeOffset=*/stagingWriteOffset, kv_dim,
+        stagingKvDtype, /*useStagingSlot=*/fp16Path);
 
     // --- IMRoPE on Q and K -------------------------------------------
     trace("IMRoPE Q+K");
@@ -441,9 +539,19 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
         compute::UnorderedScope u{_ops};
         _ops.mropeInPlaceAsync(qBuf, T, nHeads, head_dim, curLen,
                                _config.ropeFreqBase, _ropeSections);
-        _ops.mropeInPlaceAsync(kBase, T, nKvHeads, head_dim, curLen,
+        // startPos stays curLen (correct positional angles); the write stride
+        // is 0 under fp16 so IMRoPE targets the fp32 scratch row 0.
+        _ops.mropeInPlaceAsync(kStaging, T, nKvHeads, head_dim, curLen,
                                _config.ropeFreqBase, _ropeSections,
-                               /*writeOffsetStride=*/kv_dim, kvDtype);
+                               stagingWriteStride, stagingKvDtype);
+    }
+
+    // --- FP16 commit: cast the roped/normed fp32 K/V scratch into the fp16
+    // cache at the curLen write offset (single lossy step, like Q8_0 commit).
+    if (fp16Path) {
+        trace("KV commit fp16 (K + V)");
+        _ops.kvCommitFp16Async(kFp32Scratch, kBase, T, kv_dim, curLen);
+        _ops.kvCommitFp16Async(vFp32Scratch, vBase, T, kv_dim, curLen);
     }
 
     // --- GQA attention -----------------------------------------------
@@ -746,6 +854,27 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     trace("L2-norm q,k");
     _ops.l2NormInPlaceAsync(qBuf, T * hV, S, eps);
     _ops.l2NormInPlaceAsync(kBuf, T * hV, S, eps);
+
+    // GDN ReplaySSM verify capture: stash the recurrence inputs (post-L2norm k,
+    // v, gLog=gateBuf, beta) + the conv input ([conv_state | qkv_mixed], which
+    // survives the conv since its output went to qkvMixed) so a DFlash partial
+    // accept can fold the accepted prefix without a trunk re-forward. Placed
+    // BEFORE the recurrence branch so chunked-prefill in-place mutation can't
+    // touch the cached k/beta. Skipped for prefill (T > maxT); prod-inert when
+    // unconfigured (one empty-check per recurrent block). One T=K+1 verify call
+    // => the whole window lands at ring offset 0.
+    if (!_gdnCapSlot.empty() && T <= _gdnCapMaxT) {
+        const int capSlot = _gdnCapSlot[blockIdx];
+        if (capSlot >= 0) {
+            const std::size_t sl = static_cast<std::size_t>(capSlot);
+            _ops.appendMemoryCopy(_gdnCapK[sl],    kBuf,     T * hV * S * sizeof(float));
+            _ops.appendMemoryCopy(_gdnCapV[sl],    vBuf,     T * hV * S * sizeof(float));
+            _ops.appendMemoryCopy(_gdnCapG[sl],    gateBuf,  T * hV * sizeof(float));
+            _ops.appendMemoryCopy(_gdnCapB[sl],    betaBuf,  T * hV * sizeof(float));
+            _ops.appendMemoryCopy(_gdnCapConv[sl], convInput,
+                                  (stateRows + T) * convDim * sizeof(float));
+        }
+    }
 
     // --- gated delta-rule recurrence (persistent state) -------------
     // state zeroed only at sequence start; decode steps evolve it in place.

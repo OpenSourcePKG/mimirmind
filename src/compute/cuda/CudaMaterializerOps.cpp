@@ -84,6 +84,10 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _repackNvblk{_repackNvblkModule.getFunction("repackage_nvfp4_to_blk")},
       _sfSwizzle{_sfSwizzleModule.getFunction("moe_weight_sf_swizzle")} {}
 
+ComputeBuffer CudaMaterializerOps::allocateWeight(std::size_t bytes) {
+    return _ops.allocateWeight(bytes);
+}
+
 ComputeBuffer CudaMaterializerOps::allocate(std::size_t bytes) {
     return _ops.allocate(bytes);
 }

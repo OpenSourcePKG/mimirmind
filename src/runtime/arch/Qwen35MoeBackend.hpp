@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -177,6 +178,62 @@ public:
         _prefillMoeKw     = kw;
     }
 
+    /// M-Cuda.DFlash Phase 2 — hidden-state tap. When configured, `runBlock`
+    /// copies the residual stream `x` after each tapped block into the caller's
+    /// per-tap device sink, position-major [maxPos, d_model] (row = absolute
+    /// sequence position `cache.length() + r`). `tapLayers[k]` is the block
+    /// index whose output goes to sink `tapDst[k]`; the DFlash drafter later
+    /// concatenates the 8 sinks per position. The copy is CLR-safe
+    /// (`appendMemoryCopy` on the compute stream, no host op — see
+    /// lesson host-ops-in-runBlock-are-CLR-landmines). Passing an empty span
+    /// disables the tap (the default) — the hot path then costs one
+    /// empty-vector check per block. The caller owns the sink buffers and their
+    /// lifetime; each must hold at least `maxPos * d_model` floats.
+    void configureHiddenTap(std::span<const std::size_t> tapLayers,
+                            std::span<float* const>      tapDst);
+
+    /// Disable the hidden tap (restore the prod-inert path).
+    void clearHiddenTap() noexcept {
+        _hiddenTapSlot.clear();
+        _hiddenTapDst.clear();
+    }
+
+    [[nodiscard]] bool hiddenTapActive() const noexcept {
+        return !_hiddenTapDst.empty();
+    }
+
+    /// GDN ReplaySSM verify capture (DFlash partial-accept fold). When
+    /// configured, runLinearBlock copies each recurrent block's gated delta-rule
+    /// recurrence inputs (post-L2norm k, v, gLog=gateBuf, beta) and its conv
+    /// input ([conv_state | qkv_mixed], pre-conv) into the caller's per-recurrent
+    /// -block device sinks, so a DFlash partial accept can fold the accepted
+    /// prefix instead of re-forwarding the trunk. `recurBlocks[slot]` is the
+    /// block index for sink slot `slot`; each k/v sink holds `maxT*H_v*S`, each
+    /// g/b sink `maxT*H_v`, each conv sink `((d_conv-1)+maxT)*conv_dim` floats.
+    /// Capture is skipped for T > maxT (prefill). Empty = prod-inert.
+    void configureGdnCapture(std::span<const std::size_t> recurBlocks,
+                             std::span<float* const>      kSinks,
+                             std::span<float* const>      vSinks,
+                             std::span<float* const>      gSinks,
+                             std::span<float* const>      bSinks,
+                             std::span<float* const>      convSinks,
+                             std::size_t                  maxT);
+
+    void clearGdnCapture() noexcept {
+        _gdnCapSlot.clear();
+        _gdnCapK.clear(); _gdnCapV.clear(); _gdnCapG.clear();
+        _gdnCapB.clear(); _gdnCapConv.clear();
+    }
+
+    // GDN dims for the DFlash ReplaySSM ring allocation (defined out-of-line;
+    // LlmConfig is only forward-declared in this header).
+    [[nodiscard]] std::size_t gdnVHeads()     const noexcept;
+    [[nodiscard]] std::size_t gdnStateSize()  const noexcept;
+    [[nodiscard]] std::size_t gdnConvDim()    const noexcept;
+    [[nodiscard]] std::size_t gdnConvKernel() const noexcept;
+    [[nodiscard]] std::size_t layerCount()    const noexcept;
+    [[nodiscard]] bool        isRecurrent(std::size_t b) const noexcept;
+
     /// M-Cuda.MTP — one Multi-Token-Prediction draft step. Runs the model's
     /// native nextn module (blk.<blockCount>): eh_proj(concat(RMSNorm(hidden,
     /// hnorm), RMSNorm(embed(prevTok), enorm))) -> block-<mtp> attn+MoE (own
@@ -222,6 +279,9 @@ public:
                                 bool                    skipHead);
 
     [[nodiscard]] bool        scalesEmbedding()   const noexcept override { return false; }
+    // FP16-KV prefill routes K/V through an fp32 staging redirect + kv_commit_fp16
+    // (runFullAttentionBlock), so a raw fp32 matmul never hits the fp16 slot.
+    [[nodiscard]] bool supportsFp16KvStaging() const noexcept override { return true; }
     [[nodiscard]] const char* name()              const noexcept override { return "qwen35moe"; }
     [[nodiscard]] bool        needsQGateScratch() const noexcept override { return true; }
     [[nodiscard]] bool        needsSsmScratch()   const noexcept override;
@@ -478,6 +538,21 @@ private:
     bool        _ssmDump{false};
     std::string _ssmDumpDir{};
     long        _ssmDumpPos{-1};
+
+    // M-Cuda.DFlash Phase 2 — hidden-state tap. `_hiddenTapSlot[blockIdx]` is
+    // the sink index for a tapped block, or -1. `_hiddenTapDst[k]` is the
+    // caller's device buffer for tap k (position-major [maxPos, d_model]). Both
+    // empty => tap disabled (prod-inert default; one empty-check per block).
+    std::vector<int>    _hiddenTapSlot;
+    std::vector<float*> _hiddenTapDst;
+
+    // GDN ReplaySSM verify capture (DFlash partial-accept fold). _gdnCapSlot
+    // [blockIdx] = per-recurrent-block sink slot, or -1. Per-slot device sinks
+    // for the recurrence inputs + conv input. Empty => prod-inert. Skipped for
+    // T > _gdnCapMaxT (prefill).
+    std::vector<int>    _gdnCapSlot;
+    std::vector<float*> _gdnCapK, _gdnCapV, _gdnCapG, _gdnCapB, _gdnCapConv;
+    std::size_t         _gdnCapMaxT{0};
 
     // MIMIRMIND_GDN_DUMP=<dir>: dump the GatedDeltaNet recurrence in/out tensors
     // for block MIMIRMIND_GDN_DUMP_BLK (default 0) as one file per tensor:

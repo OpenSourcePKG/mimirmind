@@ -240,6 +240,10 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _castBf16E4m3Kernel;
     struct Fp8W { void* data{nullptr}; void* scale{nullptr}; }; // E4M3 + [scale,inv]
     std::unordered_map<const void*, Fp8W> _fp8WeightCache;
+    // F32 weight -> BF16 copy, cached by source pointer (stable loaded weights).
+    // Lets small M>1 F32 GEMMs (e.g. the MoE router) reuse the BF16 tensor-core
+    // kernel instead of the per-row F32 vec launches.
+    std::unordered_map<const void*, void*> _bf16FromF32Cache;
     void*  _xFp8{nullptr};        // staged E4M3 activations (grows on demand)
     std::size_t _xFp8Bytes{0};
     void*  _xScaleDev{nullptr};   // 2 floats [scale, invScale] for X
@@ -253,6 +257,9 @@ struct GpuMatmul::Impl {
         for (auto& kv : _nvblkDeintCache) {
             if (kv.second.nib   != nullptr) { cudaFree(kv.second.nib); }
             if (kv.second.scale != nullptr) { cudaFree(kv.second.scale); }
+        }
+        for (auto& kv : _bf16FromF32Cache) {
+            if (kv.second != nullptr) { cudaFree(kv.second); }
         }
         if (_amaxDev != nullptr)     { cudaFree(_amaxDev); }
         if (_xScaleDev != nullptr)   { cudaFree(_xScaleDev); }
@@ -430,6 +437,12 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
     if (const char* cf = std::getenv("MIMIRMIND_CUBLAS_FP8")) {
         _useCublasFp8 = (cf[0] != '\0' && !(cf[0] == '0' && cf[1] == '\0'));
     }
+    if (const char* cfp = std::getenv("MIMIRMIND_CUBLAS_FP8_PREFILL")) {
+        _useCublasFp8Prefill = (cfp[0] != '\0' && !(cfp[0] == '0' && cfp[1] == '\0'));
+    }
+    if (const char* f32t = std::getenv("MIMIRMIND_F32_TC_PREFILL")) {
+        _useF32TcPrefill = (f32t[0] != '\0' && !(f32t[0] == '0' && f32t[1] == '\0'));
+    }
     if (const char* dv = std::getenv("MIMIRMIND_NVFP4_DEINT")) {
         _useDeintVec = (dv[0] == '1' && dv[1] == '\0');
     }
@@ -438,6 +451,20 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
                     "cuBLASLt per-tensor FP8 (E4M3) dense matmul enabled "
                     "(MIMIRMIND_CUBLAS_FP8=1) — BF16 weights quantised to E4M3 "
                     "(cached) + per-call X quant; hand kernel is the fallback");
+    }
+    if (_useF32TcPrefill) {
+        MM_LOG_INFO("hip::GpuMatmul",
+                    "F32 batched (M>1) prefill GEMM -> BF16 tensor cores enabled "
+                    "(MIMIRMIND_F32_TC_PREFILL=1) — small F32 weights (MoE router, "
+                    "GDN ssm_beta/alpha, shexp router) leave the per-row F32 vec "
+                    "path; F32 vec is the fallback (encoder path unaffected)");
+    }
+    if (_useCublasFp8Prefill) {
+        MM_LOG_INFO("hip::GpuMatmul",
+                    "cuBLASLt FP8 batched (M>1) prefill GEMM enabled "
+                    "(MIMIRMIND_CUBLAS_FP8_PREFILL=1) — dense prefill projections "
+                    "run on FP8 tensor cores (RMSNorm inputs bound the per-tensor "
+                    "activation scale); BF16/wmma is the fallback");
     }
     if (_tf32Tc) {
         MM_LOG_INFO("hip::GpuMatmul",
@@ -1217,6 +1244,47 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
     }
 
     if (type == ::mimirmind::core::gguf::GgmlType::F32) {
+        // Batched (M>1) F32 GEMM: the per-row vec path below launches M kernels
+        // with no weight reuse or tensor cores, so a small-N F32 weight (the MoE
+        // router ffn_gate_inp: N=nExperts, K=d_model) costs ~100x more than it
+        // should at prefill M. Cast the weight to BF16 once (cached by pointer;
+        // loaded weights are stable) and run it through the TF32/BF16 tensor-core
+        // GEMM — the same kernel the BF16 dense projections use, F32 activations
+        // staged in-kernel. Default on with _tf32Tc/_bf16Tc (E-FP4.3/.5).
+        if (M > 1 && _useF32TcPrefill && _f32TcAllowed && (_tf32Tc || _bf16Tc)) {
+            auto cit = _pimpl->_bf16FromF32Cache.find(W);
+            if (cit == _pimpl->_bf16FromF32Cache.end()) {
+                const std::size_t wElems = N * K;
+                void* wBf16 = nullptr;
+                if (cudaMalloc(&wBf16, wElems * sizeof(std::uint16_t))
+                        == cudaSuccess) {
+                    _pimpl->_castF32ToBf16Kernel.setPtr  (0, W);
+                    _pimpl->_castF32ToBf16Kernel.setPtr  (1, wBf16);
+                    _pimpl->_castF32ToBf16Kernel.setValue(2,
+                        static_cast<std::int64_t>(wElems));
+                    _pimpl->_castF32ToBf16Kernel.launch(
+                        _ctx.stream(),
+                        static_cast<std::uint32_t>((wElems + 255) / 256), 1, 1,
+                        256, 1, 1);
+                    cit = _pimpl->_bf16FromF32Cache.emplace(W, wBf16).first;
+                }
+            }
+            if (cit != _pimpl->_bf16FromF32Cache.end()) {
+                auto& tk = _tf32Tc ? _pimpl->_matmulBf16GemmTf32TcKernel
+                                   : _pimpl->_matmulBf16GemmTcKernel;
+                tk.setPtr  (0, X);
+                tk.setPtr  (1, cit->second);
+                tk.setPtr  (2, Y);
+                tk.setValue(3, static_cast<std::int32_t>(K));
+                tk.setValue(4, static_cast<std::int32_t>(N));
+                tk.setValue(5, static_cast<std::int32_t>(M));
+                const std::uint32_t gx = static_cast<std::uint32_t>((N + 15) / 16);
+                const std::uint32_t gy = static_cast<std::uint32_t>((M + 15) / 16);
+                tk.launch(_ctx.stream(), gx, gy, 1, 32, 1, 1);
+                return;
+            }
+        }
+
         // Native F32 vec kernel — no dequant, straight fp32 dot. Same
         // launch shape as the K-quant vec kernels. Motivated by Gemma 4
         // E4B: inp_gate.weight + proj.weight per layer are F32 (~2.6 MiB
@@ -1260,6 +1328,12 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
         // (M>1) can hold outliers that make the amax/448 scale crush precision,
         // so prefill stays on the higher-fidelity BF16 path below.
         if (_useCublasFp8 && M == 1 && cublasFp8Matmul(W, N, K, X, M, Y)) {
+            return;
+        }
+        // Batched prefill (M>1) on FP8 tensor cores — opt-in, takes precedence
+        // over the BF16 path. Dense prefill projections read RMSNorm outputs, so
+        // the per-tensor activation scale stays well-conditioned.
+        if (_useCublasFp8Prefill && M > 1 && cublasFp8Matmul(W, N, K, X, M, Y)) {
             return;
         }
         if (_useCublas && cublasBf16Matmul(W, N, K, X, M, Y)) {

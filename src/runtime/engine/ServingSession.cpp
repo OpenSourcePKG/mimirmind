@@ -9,6 +9,7 @@
 #include "runtime/KvCache.hpp"
 #include "runtime/SsmState.hpp"
 #include "runtime/arch/Qwen35MoeBackend.hpp"
+#include "runtime/engine/DFlashDecoder.hpp"
 #include "runtime/serving/PagedKvPool.hpp"
 #ifdef MIMIRMIND_HAVE_CUDA
 #include "core/gpu/cuda/CudaGraph.hpp"
@@ -118,6 +119,16 @@ struct ServingState {
     std::vector<std::uint8_t>  vGdnSeqStart;         // [(K+1) * maxBatch] per-step GDN start flags
     std::vector<std::int32_t>  vInputTok;
     std::vector<float>         vHostLogits;          // [Mcap * vocab_lm]
+
+    // ---- DFlash serving tap capture (5.9.1) -----------------------------
+    // When armed by generateBatchDflash, verifyForward copies xBuf (the
+    // [M=N*(K+1), d] time-major residual stream, row j*N+s = slot s / verify
+    // position j) after each tapped block {1,6,11,16,22,27,32,37} into per-tap
+    // sinks [verifyMcap, d], so each slot's 8-tap context is built from its
+    // accepted verify positions (no separate tap forward). Inert when unarmed.
+    bool                                dfTapActive{false};
+    std::vector<int>                    dfTapSlot;   // [blockCount] tap-slot or -1
+    std::vector<compute::ComputeBuffer> dfTapSink;   // [taps] each [verifyMcap, d]
 
     // ---- Increment E2: per-slot nextn (MTP) KV + draft scratch ----------
     // One 1-layer nextn self-attention KV cache per physical slot (the MTP
@@ -1124,6 +1135,16 @@ ServingSession::verifyForward(
         } else {
             st.qb->runBlockBatched(b, xBuf, ctxFull, *st.vsb);
         }
+        // DFlash serving tap: stash the residual after each tapped block into
+        // this tap's sink (all M time-major rows at once). CLR-safe device copy.
+        if (st.dfTapActive) {
+            const int k = st.dfTapSlot[b];
+            if (k >= 0) {
+                _e._ops->appendMemoryCopy(
+                    st.dfTapSink[static_cast<std::size_t>(k)].get(), xBuf,
+                    M * d_model * sizeof(float));
+            }
+        }
     }
 
     // --- per-position logits over all M rows -----------------------------
@@ -1621,6 +1642,168 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
         }
         _e._ops->flush();
     }
+    return out;
+}
+
+std::vector<std::vector<std::int32_t>>
+ServingSession::generateBatchDflash(std::span<const std::int32_t> prompt,
+                                    std::size_t nSeq, std::size_t maxNew,
+                                    std::size_t depth, std::int32_t eosId,
+                                    std::string_view drafterDir,
+                                    std::size_t* draftedOut,
+                                    std::size_t* acceptedOut) {
+    if (_e._backend == nullptr) {
+        throw std::runtime_error("generateBatchDflash: no model loaded");
+    }
+    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    if (qb == nullptr) {
+        throw std::runtime_error("generateBatchDflash: requires CUDA qwen35moe");
+    }
+    if (nSeq == 0)  nSeq = 1;
+    if (depth == 0) depth = 1;
+    if (prompt.empty() || maxNew == 0) {
+        return std::vector<std::vector<std::int32_t>>(nSeq);
+    }
+    const std::size_t P = prompt.size();
+    const std::size_t d = _e._config.embeddingLength;
+    const std::size_t K = depth;
+
+    // --- drafter (borrowed via the engine's lazy DFlashDecoder) ----------
+    if (_e._dflashDecoder == nullptr) {
+        _e._dflashDecoder = std::make_unique<DFlashDecoder>(_e);
+    }
+    DFlashDecoder& dfd = *_e._dflashDecoder;
+    dfd.ensureDflashLoaded(drafterDir);
+    const std::size_t taps = dfd.tapCount();
+    const std::size_t rowC = dfd.ctxRowStride();      // taps * d
+
+    ensureServingState(nSeq, P + maxNew + 8);
+    ensureVerifyCapacity(K);
+    auto& st = *_state;
+
+    // --- arm the batched DFlash tap capture in verifyForward -------------
+    st.dfTapSlot.assign(st.blockCount, -1);
+    {
+        const auto tl = dfd.tapLayers();
+        for (std::size_t k = 0; k < tl.size(); ++k) {
+            if (tl[k] < st.blockCount) st.dfTapSlot[tl[k]] = static_cast<int>(k);
+        }
+    }
+    st.dfTapSink.clear();
+    for (std::size_t k = 0; k < taps; ++k) {
+        st.dfTapSink.push_back(
+            _e._ops->allocate(st.verifyMcap * d * sizeof(float)));
+    }
+    st.dfTapActive = true;
+
+    // --- shared prompt context + anchor token0 (single-session tap prefill)
+    std::size_t Pc = 0;
+    const std::int32_t token0v = dfd.buildPromptContext(prompt, Pc);
+    const float* const promptCtx = dfd.ctxHidden();   // rows [0, P), stride rowC
+
+    // Per-slot context accumulators, seeded with the (identical) prompt ctx.
+    std::vector<compute::ComputeBuffer> ctxSlot;
+    std::vector<float*>                 ctxPtr;
+    ctxSlot.reserve(nSeq);
+    ctxPtr.reserve(nSeq);
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        ctxSlot.push_back(
+            _e._ops->allocate(st.maxContext * rowC * sizeof(float)));
+        ctxPtr.push_back(ctxSlot.back().as<float>());
+        _e._ops->appendMemoryCopy(ctxPtr[s], promptCtx, P * rowC * sizeof(float));
+    }
+    _e._ops->flush();
+
+    // --- seed the paged trunk KV + SSM via a lockstep stepServing prefill.
+    for (std::size_t g = 0; g < P; ++g) {
+        std::vector<InferenceEngine::ServingSlotStep> steps(nSeq);
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            steps[s].slot     = static_cast<std::uint32_t>(s);
+            steps[s].token    = prompt[g];
+            steps[s].pos      = static_cast<std::int32_t>(g);
+            steps[s].seqStart = (g == 0);
+        }
+        std::vector<std::int32_t> toks(nSeq, 0);
+        stepServing(steps, toks);
+    }
+
+    // --- per-slot decode state -------------------------------------------
+    std::vector<std::size_t>               basePos(nSeq, P), ctxLen(nSeq, P);
+    std::vector<std::int32_t>              token0(nSeq, token0v);
+    std::vector<std::vector<std::int32_t>> out(nSeq);
+    std::vector<char>                      finished(nSeq, 0);
+    std::vector<std::vector<std::int32_t>> drafts(nSeq);
+    std::size_t drafted = 0, accepted = 0;
+
+    while (true) {
+        std::size_t nDone = 0;
+        for (std::size_t s = 0; s < nSeq; ++s) nDone += (finished[s] != 0);
+        if (nDone == nSeq) break;
+        if (out[0].size() >= maxNew) break;
+        const std::size_t Kr = std::min(K, maxNew - out[0].size());
+
+        // --- block-draft Kr tokens per slot (drafter is cheap; sequential) -
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            if (finished[s] != 0) continue;
+            dfd.draftOneBlock(ctxPtr[s], ctxLen[s], token0[s], Kr, drafts[s]);
+            drafted += Kr;
+        }
+
+        // --- ONE batched verify over [token0, drafts...] per slot --------
+        std::vector<InferenceEngine::VerifySlot> slots(nSeq);
+        std::vector<std::int32_t> vtokTM((Kr + 1) * nSeq);
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            slots[s].slot    = static_cast<std::uint32_t>(s);
+            slots[s].basePos = static_cast<std::int32_t>(basePos[s]);
+            vtokTM[0 * nSeq + s] = token0[s];
+            for (std::size_t j = 1; j <= Kr; ++j) {
+                vtokTM[j * nSeq + s] = drafts[s][j - 1];
+            }
+        }
+        const auto vids = stepServingVerifyIds(slots, vtokTM, Kr);
+
+        // --- per-slot accept-longest-prefix + commit (no re-forward) ------
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            if (finished[s] != 0) continue;
+            std::size_t a = 0;
+            for (std::size_t i = 0; i < Kr; ++i) {
+                if (vids[i * nSeq + s] == drafts[s][i]) ++a; else break;
+            }
+            const std::int32_t corrected = vids[a * nSeq + s];
+            accepted += a;
+
+            auto emit = [&](std::int32_t t) -> bool {
+                out[s].push_back(t);
+                if (eosId >= 0 && t == eosId) { finished[s] = 1; return false; }
+                if (out[s].size() >= maxNew)  { finished[s] = 1; return false; }
+                return true;
+            };
+            bool cont = emit(token0[s]);
+            for (std::size_t i = 0; i < a && cont; ++i) cont = emit(drafts[s][i]);
+
+            // Commit: KV for the accepted a+1 is already correct; restore the
+            // accepted-prefix SSM from the per-timestep export (no re-forward).
+            restoreSlotSsm(s, a, nSeq);
+            // feedContext: append the accepted a+1 positions' 8 taps (captured
+            // in dfTapSink, time-major row j*nSeq+s) into this slot's context.
+            for (std::size_t j = 0; j <= a; ++j) {
+                for (std::size_t k = 0; k < taps; ++k) {
+                    _e._ops->appendMemoryCopy(
+                        ctxPtr[s] + (ctxLen[s] + j) * rowC + k * d,
+                        st.dfTapSink[k].as<float>() + (j * nSeq + s) * d,
+                        d * sizeof(float));
+                }
+            }
+            basePos[s] += a + 1;
+            ctxLen[s]  += a + 1;
+            token0[s]   = corrected;
+        }
+        _e._ops->flush();
+    }
+
+    st.dfTapActive = false;
+    if (draftedOut)  *draftedOut  = drafted;
+    if (acceptedOut) *acceptedOut = accepted;
     return out;
 }
 

@@ -44,9 +44,47 @@ Always frame milestones with the phase they belong to:
 - **Project Envoy** *(Beta)* — GPU kernels, the head learns to speak. M5-M6.
 - **Mimir-1.0** *(Release)* — OpenAI-compatible HTTP, Gemma 4 architecture.
   M7-M9.
+- **Project Sleipnir** — post-Mimir-1.0 Xe-LPG perf & model extensions
+  (M-CLR, M10.2, M8.K/L, M-Probe.1, M9.11, M-Ratatoskr, M-Diff).
+- **Bragi** *(Mimir-2.0)* — serving-class CUDA / DGX Spark GB10
+  (M-CudaBring, CapacityProbe, FP4, Batch, MoeGroup, MTP, DFlash).
+- **Cross-cutting** — M-Munin, M-Hugin, EncoderRunner, Heimdall, LoRA
+  (Loki/Nornir), modality axis, tiered-weight capability.
 
-Full milestone table lives in `README.md` and in the Synaipse note
-`Memory/mimirmind/roadmap`.
+### The Synaipse roadmap is the single source of truth
+
+All milestone planning and progress for this project lives in the
+**Synaipse roadmap** (`Memory/mimirmind/_roadmap.md`), reached
+**only** through the `synaipse_roadmap_*` MCP tools. It is the
+authoritative, structured tree — the prose tables in `README.md`,
+`doc/roadmap.md`, and the note `Memory/mimirmind/roadmap` are narrative
+mirrors, not the ledger. When they disagree, the roadmap tool wins.
+
+Workflow — **every non-trivial task starts and ends at the roadmap**:
+
+1. **Before starting:** `synaipse_roadmap_get` to read the tree, the
+   live "AI is working here" cursor, and the rolled-up summary. Build on
+   current state; do not re-plan from scratch.
+2. **When you begin a step:** `synaipse_roadmap_set_active <stepId>` so
+   the UI shows a live indicator (at most one step is active).
+3. **As you work / when you finish:** `synaipse_roadmap_update_step` to
+   change status (`backlog|planned|in_progress|ai_active|review|blocked|
+   done|cancelled`), book `actualHours`, set `progress`, and record your
+   `evaluation`/`acceptance`. Clear or move the cursor when you move on.
+4. **New work discovered:** `synaipse_roadmap_plan` — pass a single
+   `step` (+ optional `parentId`) to add/replace one node, or the full
+   `steps` tree only when restructuring. Use hierarchical ids (`5.9`,
+   `5.9.1`). Hours/progress roll up to parents; open `dependsOn` flips a
+   step to `blocked` automatically.
+5. **Link the evidence:** `synaipse_roadmap_link_note` to attach the
+   ADR / session / perf-ledger notes that back a step (rendered as
+   `[[wikilinks]]` so backlinks and the graph work).
+
+Keep the detailed *why* in ADR/session notes (`synaipse_write_note`);
+keep the *what/where/status* on the roadmap step. Do not let the two
+narrative doc copies (`README.md`, `doc/roadmap.md`) drift silently —
+update them when a phase materially changes, but treat the roadmap tool
+as canonical.
 
 ## Target Model
 

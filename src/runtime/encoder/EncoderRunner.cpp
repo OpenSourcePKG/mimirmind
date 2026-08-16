@@ -29,6 +29,10 @@ EncoderRunner::forwardLogits(std::span<const std::int32_t> inputIds) {
     if (T == 0) {
         throw std::runtime_error("EncoderRunner: empty input");
     }
+    // The reranker's F32 projections are precision-sensitive: keep them
+    // bit-exact even when the LLM prefill has opted the F32->TC downcast
+    // in (TF32's 10-bit mantissa is too coarse for the encoder parity gate).
+    compute::ScopedExactF32 exactF32{_mm};
     const std::size_t H   = c.hidden;
     const std::size_t ffn = c.ffn;
     const std::size_t nL  = c.numLabels;
@@ -138,6 +142,9 @@ EncoderRunner::forwardLogitsBatch(
         return std::vector<std::vector<float>>(B, std::vector<float>(c.numLabels, 0.0F));
     }
 
+    // Keep the reranker's F32 projections bit-exact even when the LLM prefill
+    // has opted the F32->TC downcast in (see forwardLogits).
+    compute::ScopedExactF32 exactF32{_mm};
     const std::size_t H   = c.hidden;
     const std::size_t ffn = c.ffn;
     const std::size_t nL  = c.numLabels;

@@ -181,10 +181,10 @@ RuntimeSettings parseRuntime(std::string_view      path,
     r.spvDir            = readOpt<std::string>(path, section, j, "spvDir");
     if (r.kvDtype.has_value()) {
         const auto& v = *r.kvDtype;
-        if (!v.empty() && v != "f32" && v != "q8_0") {
+        if (!v.empty() && v != "f32" && v != "fp16" && v != "q8_0") {
             std::ostringstream os;
             os << section << ".kvDtype='" << v
-               << "' — expected \"\", \"f32\", or \"q8_0\"";
+               << "' — expected \"\", \"f32\", \"fp16\", or \"q8_0\"";
             fail(path, os.str());
         }
     }

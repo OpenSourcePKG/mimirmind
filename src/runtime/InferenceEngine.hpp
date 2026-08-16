@@ -80,6 +80,7 @@ class ArchBackend;
 namespace engine {
 class Nvfp4Loader;    // friend collaborator — runs loadModelNvfp4's pipeline
 class MtpDecoder;     // friend collaborator — native MTP greedy decode
+class DFlashDecoder;  // friend collaborator — DFlash block-diffusion draft
 class ServingSession; // friend collaborator — batched / continuous-batch decode
 } // namespace engine
 
@@ -287,6 +288,29 @@ public:
     /// True iff the loaded model carries a native MTP (nextn) head and the
     /// backend supports the MTP draft path (CUDA qwen35moe).
     [[nodiscard]] bool mtpAvailable() const noexcept;
+
+    /**
+     * DFlash block-diffusion speculative decode (Phase 3.4, C1 single-stream).
+     * Drafts a whole `draftN`-token block in ONE forward with the external
+     * DFlash drafter loaded from `drafterDir` (conditioned on the target hidden
+     * taps), verifies in one trunk forward (forwardVerify), accepts the longest
+     * greedy prefix. Bit-identical to greedy generate() at temperature 0.
+     * `draftedOut`/`acceptedOut` (optional) report the accept-rate counters.
+     * The draft/verify/accept loop lives in engine::DFlashDecoder.
+     */
+    [[nodiscard]] std::vector<std::int32_t>
+    generateDflash(std::span<const std::int32_t> promptIds,
+                   std::size_t                    maxNew,
+                   std::size_t                    draftN,
+                   std::int32_t                   eosId,
+                   std::string_view               drafterDir,
+                   std::size_t*                   draftedOut  = nullptr,
+                   std::size_t*                   acceptedOut = nullptr);
+
+    /// True iff the DFlash draft path can run (CUDA qwen35moe target with a
+    /// borrowable embed + lm_head). Does not check the drafter file itself —
+    /// generateDflash throws if the checkpoint is missing.
+    [[nodiscard]] bool dflashAvailable() const noexcept;
 
     /// Drop the persistent KV-cache so the next generate() starts from
     /// scratch. Cache *buffers* stay allocated — only the logical length
@@ -537,6 +561,15 @@ public:
                      std::size_t nSeq, std::size_t maxNew,
                      std::size_t depth, std::int32_t eosId);
 
+    /// DFlash serving-batched spec decode (5.9.1): shared prompt over nSeq slots,
+    /// per-slot block-diffusion draft + batched verify over M=nSeq*(depth+1).
+    [[nodiscard]] std::vector<std::vector<std::int32_t>>
+    generateBatchDflash(std::span<const std::int32_t> prompt,
+                        std::size_t nSeq, std::size_t maxNew, std::size_t depth,
+                        std::int32_t eosId, std::string_view drafterDir,
+                        std::size_t* draftedOut  = nullptr,
+                        std::size_t* acceptedOut = nullptr);
+
     /// M-Cuda.MTP Increment E4 — batched native MTP decode over `prompts`
     /// DIFFERENT prompts (different content AND length) concurrently, the
     /// heterogeneous generalization of generateBatchMtp that a continuous
@@ -730,6 +763,7 @@ private:
     // internals (extracted to keep this translation unit focused).
     friend class engine::Nvfp4Loader;
     friend class engine::MtpDecoder;
+    friend class engine::DFlashDecoder;
     friend class engine::ServingSession;
 
     /// Compute logits over the last hidden state row via final-norm +
@@ -878,6 +912,12 @@ private:
     // reaches back into this engine (forwardVerify / commitVerified / weights /
     // backend / KV+SSM state) as a friend.
     std::unique_ptr<engine::MtpDecoder> _mtpDecoder;
+
+    // --- M-Cuda.DFlash — block-diffusion draft decoder (Phase 3.4) ------
+    // The DFlash drafter (external DFlashDraftModel + runner), tap sinks, and
+    // the draft/verify/accept loop live in engine::DFlashDecoder. Constructed
+    // lazily by generateDflash on first use; a friend like MtpDecoder.
+    std::unique_ptr<engine::DFlashDecoder> _dflashDecoder;
 
     // --- M-Cuda.Batch — batched / continuous-batch decode substrate ----
     // The batched-generation harnesses (generateBatch / generateServingParity)

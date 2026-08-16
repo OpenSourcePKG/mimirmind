@@ -1,5 +1,14 @@
 # Roadmap
 
+> **Canonical source:** the authoritative, machine-tracked roadmap lives
+> in the Synaipse vault at `Memory/mimirmind/_roadmap.md`, reached only
+> through the `synaipse_roadmap_*` MCP tools (structured step tree, live
+> "AI is working here" cursor, rolled-up progress/hours, dependencies).
+> **This document is a narrative mirror** — read it for the story, but
+> when it disagrees with `_roadmap.md`, the roadmap tool wins. Update
+> this file when a phase materially changes; keep per-step status on the
+> roadmap tool. See `CLAUDE.md` → "Roadmap Anchor" for the workflow.
+
 Norse-themed phase names. Each phase has to be runnable and verifiable
 before the next one starts. MimirMind exists to query a *loaded*
 knowledge source; Mimir was the keeper of the *Well of Wisdom* whose

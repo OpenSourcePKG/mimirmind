@@ -22,6 +22,11 @@ class CudaMemoryAllocator;
 
 namespace mimirmind::compute::cuda {
 
+// cuDNN 9 SDPA prefill-attention wrapper (defined in CudnnSdpaPrefill.hpp;
+// only linked when MIMIRMIND_HAVE_CUDNN_SDPA). Forward-declared so the
+// unique_ptr member needs no header here — the .cpp includes the full type.
+class CudnnSdpaPrefill;
+
 /**
  * HIP/ROCm implementation of the backend-neutral `compute::ComputeOps`
  * interface. Parallel to the Level-Zero `compute::l0::GpuOps` — same
@@ -199,6 +204,11 @@ public:
                                          std::size_t nSeq, std::size_t T,
                                          std::size_t H, std::size_t S) override;
 
+    void gatedDeltaNetFoldAsync(const float* k, const float* v, const float* gLog,
+                                const float* beta, float* state,
+                                std::size_t acceptLen, std::size_t H,
+                                std::size_t S) override;
+
     void argmaxRowsAsync(const float* logits, std::int32_t* out,
                          std::size_t nRows, std::size_t vocab) override;
     void deltanetGateAsync(const float* alpha, const float* ssmA,
@@ -325,6 +335,10 @@ public:
                               std::size_t T, std::size_t kvDim,
                               std::size_t writeOffset) override;
 
+    void kvCommitFp16Async(const float* xSrc, void* kvDst,
+                           std::size_t T, std::size_t kvDim,
+                           std::size_t writeOffset) override;
+
     void qkvSplitAsync(const float* fused, float* Yq,
                        void* YkBase, void* YvBase,
                        std::size_t M, std::size_t Nq, std::size_t Nkv,
@@ -346,6 +360,12 @@ public:
                                std::size_t T, std::size_t nHeads,
                                std::size_t nKvHeads, std::size_t headDim,
                                float scale, float* out) override;
+
+    void attentionEncoderCrossAsync(const float* q, const float* k,
+                                    const float* v, std::size_t Tq,
+                                    std::size_t Tk, std::size_t nHeads,
+                                    std::size_t nKvHeads, std::size_t headDim,
+                                    float scale, float* out) override;
 
     void attentionEncoderBatchedAsync(const float* q, const float* k,
                                       const float* v, float* out,
@@ -415,6 +435,7 @@ public:
     // a deleter closure that calls back with the same kind so the
     // deallocate side hits the matching `cudaFree` path.
     [[nodiscard]] compute::ComputeBuffer allocate(std::size_t bytes) override;
+    [[nodiscard]] compute::ComputeBuffer allocateWeight(std::size_t bytes) override;
     void uploadHostBytes(void* deviceDst, const void* hostSrc,
                          std::size_t bytes) override;
 
@@ -498,6 +519,46 @@ private:
     // afterwards except for the two setter test hooks.
     bool                 _prefillFlashDisabled{false};
     bool                 _prefillFlashGqaQ8Disabled{false};
+    // P3.a — opt-in GQA-head-packed F32 prefill flash. Env
+    // MIMIRMIND_ATTN_PREFILL_GQA=1. Routes the F32 KV prefill path (the
+    // only path Qwen3-Next reaches) through the head-packed kernel that
+    // reads each K/V row once per KV group instead of once per query
+    // head. Bit-exact with the plain kernel; off by default until the
+    // GB10 A/B validates the win.
+    bool                 _prefillGqaF32Enabled{false};
+    // P3.b — opt-in TF32 tensor-core GQA-head-packed F32 prefill flash.
+    // Env MIMIRMIND_ATTN_TC_PREFILL=1. Runs QK^T and P.V on TF32 tensor
+    // cores (bit-NEAR, not bit-exact — parity-gated with a tolerance).
+    // Requires the F32 KV GQA shape (headDim<=256, mult of 16); falls
+    // back to the plain kernel otherwise. Implies the head-packed tiling.
+    bool                 _prefillTcF32Enabled{false};
+    // Step 3 — opt-in FP16 tensor-core FA-2 prefill (q-tiled, needs fp16 KV).
+    // Env MIMIRMIND_ATTN_FP16_TC=1. Bit-near (fp16); parity-gated.
+    bool                 _prefillFp16TcEnabled{false};
+    // Step 3.2 — opt-in GQA-head-packed multi-warp FP16 tensor-core FA-2.
+    // Env MIMIRMIND_ATTN_FP16_GQA_TC=1. Needs fp16 KV + GQA shape; bit-near.
+    bool                 _prefillFp16GqaTcEnabled{false};
+    // Lazy one-shot dynamic-smem opt-in cache for the Step 3.2 kernel. The
+    // needed byte count depends on runtime headDim/nQPerKv, so the opt-in
+    // (CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES) is attempted on the
+    // first eligible dispatch; on rejection the path falls back to scalar.
+    bool                 _prefillFp16GqaTcSmemAttempted{false};
+    bool                 _prefillFp16GqaTcSmemOk{false};
+    std::size_t          _prefillFp16GqaTcSmemBytes{0};
+    // Multi-warp TF32 FA-2 for the F32 KV path (opt-in, MIMIRMIND_ATTN_F32_MWTC=1).
+    // Bit-near (TF32); parity-gated. Same lazy dynamic-smem opt-in as the fp16
+    // GQA-TC kernel (dominant term qS+oRun = 2 * HPB*16*headDim*4).
+    bool                 _prefillF32MwtcEnabled{false};
+    bool                 _prefillF32MwtcSmemAttempted{false};
+    bool                 _prefillF32MwtcSmemOk{false};
+    std::size_t          _prefillF32MwtcSmemBytes{0};
+    // cuDNN 9 SDPA prefill-attention path (opt-in, MIMIRMIND_ATTN_CUDNN=1).
+    // Only present when the build linked cuDNN (MIMIRMIND_HAVE_CUDNN_SDPA).
+    // Bit-near (bf16); parity-gated. Single-forward causal only (posOff==0).
+    bool                 _prefillCudnnEnabled{false};
+#if MIMIRMIND_HAVE_CUDNN_SDPA
+    std::unique_ptr<CudnnSdpaPrefill> _cudnnSdpa;   // lazily created on first use
+#endif
     std::size_t          _prefillFlashKTileQ8Configured{128};
     std::size_t          _prefillFlashKTileQ8{128};
     std::string          _prefillFlashKTileQ8Source{"pinned (config)"};
@@ -531,6 +592,11 @@ private:
     // `attention_prefill_flash_q8_0_gqa.hip`. Dispatch falls back to
     // the plain Q8_0 kernel when nQPerKv exceeds this.
     static constexpr std::size_t kFlashPrefillGqaMaxQPerKv = 8;
+    // Cap on headDim for the P3.b TF32 tensor-core prefill kernel — must
+    // match ATTN_TC_MAX_HEADDIM (shared-tile sizing) in
+    // attention_prefill_flash_f32_gqa_tc.cu. Dispatch falls back to the
+    // scalar kernel above this.
+    static constexpr std::size_t kFlashTcMaxHeadDim = 256;
 
     // Attention fan-out. `attentionAsync` dispatches to one of these
     // three helpers based on T_q, T_k, positionOffset and kvDtype,

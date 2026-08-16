@@ -10,6 +10,7 @@ out/
 compile_commands.json
 .DS_Store
 models/
+downloader/
 run-logs/
 run-state/
 config.json
@@ -18,3 +19,6 @@ usbboot/
 # CUTLASS checkout for the NVFP4 tensor-core grouped MoE GEMM (E-d.3);
 # ~200 MiB, fetched to the build box, never committed.
 /third_party/cutlass/
+/doc/note.txt
+# stray npm lockfile — this is a C++/CMake repo, no JS runtime dependency.
+/package-lock.json

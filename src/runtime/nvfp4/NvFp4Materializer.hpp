@@ -28,6 +28,13 @@ struct MaterializerDeviceOps {
 
     [[nodiscard]] virtual compute::ComputeBuffer allocate(std::size_t bytes) = 0;
 
+    /// Immutable-weight allocation (see compute::ComputeOps::allocateWeight).
+    /// Default = allocate; the CUDA adapter routes it through the read-mostly +
+    /// device-preferred hint so weights read device-resident on unified parts.
+    [[nodiscard]] virtual compute::ComputeBuffer allocateWeight(std::size_t bytes) {
+        return allocate(bytes);
+    }
+
     /// packed U8 + F8_E4M3 block scale + F32 global -> BF16 [rows*in] at dst.
     virtual void dequantNvfp4(const void* packed, const void* blockScale, float global,
                               std::uint64_t rows, std::uint64_t in, void* dstBf16) = 0;
