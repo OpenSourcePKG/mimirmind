@@ -321,6 +321,38 @@ void Qwen35MoeBackend::configureHiddenTap(std::span<const std::size_t> tapLayers
     }
 }
 
+std::size_t Qwen35MoeBackend::gdnVHeads()     const noexcept { return _config.ssmNumVHeads(); }
+std::size_t Qwen35MoeBackend::gdnStateSize()  const noexcept { return _config.ssmStateSize; }
+std::size_t Qwen35MoeBackend::gdnConvDim()    const noexcept { return _config.ssmConvDim(); }
+std::size_t Qwen35MoeBackend::gdnConvKernel() const noexcept { return _config.ssmConvKernel; }
+std::size_t Qwen35MoeBackend::layerCount()    const noexcept { return _config.blockCount; }
+bool Qwen35MoeBackend::isRecurrent(std::size_t b) const noexcept {
+    return _config.isRecurrentLayer(b);
+}
+
+void Qwen35MoeBackend::configureGdnCapture(
+        std::span<const std::size_t> recurBlocks,
+        std::span<float* const>      kSinks,
+        std::span<float* const>      vSinks,
+        std::span<float* const>      gSinks,
+        std::span<float* const>      bSinks,
+        std::span<float* const>      convSinks,
+        std::size_t                  maxT) {
+    _gdnCapSlot.assign(_config.blockCount, -1);
+    _gdnCapK.assign(kSinks.begin(), kSinks.end());
+    _gdnCapV.assign(vSinks.begin(), vSinks.end());
+    _gdnCapG.assign(gSinks.begin(), gSinks.end());
+    _gdnCapB.assign(bSinks.begin(), bSinks.end());
+    _gdnCapConv.assign(convSinks.begin(), convSinks.end());
+    _gdnCapMaxT = maxT;
+    for (std::size_t slot = 0; slot < recurBlocks.size(); ++slot) {
+        const std::size_t b = recurBlocks[slot];
+        if (b < _config.blockCount) {
+            _gdnCapSlot[b] = static_cast<int>(slot);
+        }
+    }
+}
+
 void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
                                 float*        x,
                                 std::size_t   T,
@@ -822,6 +854,27 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     trace("L2-norm q,k");
     _ops.l2NormInPlaceAsync(qBuf, T * hV, S, eps);
     _ops.l2NormInPlaceAsync(kBuf, T * hV, S, eps);
+
+    // GDN ReplaySSM verify capture: stash the recurrence inputs (post-L2norm k,
+    // v, gLog=gateBuf, beta) + the conv input ([conv_state | qkv_mixed], which
+    // survives the conv since its output went to qkvMixed) so a DFlash partial
+    // accept can fold the accepted prefix without a trunk re-forward. Placed
+    // BEFORE the recurrence branch so chunked-prefill in-place mutation can't
+    // touch the cached k/beta. Skipped for prefill (T > maxT); prod-inert when
+    // unconfigured (one empty-check per recurrent block). One T=K+1 verify call
+    // => the whole window lands at ring offset 0.
+    if (!_gdnCapSlot.empty() && T <= _gdnCapMaxT) {
+        const int capSlot = _gdnCapSlot[blockIdx];
+        if (capSlot >= 0) {
+            const std::size_t sl = static_cast<std::size_t>(capSlot);
+            _ops.appendMemoryCopy(_gdnCapK[sl],    kBuf,     T * hV * S * sizeof(float));
+            _ops.appendMemoryCopy(_gdnCapV[sl],    vBuf,     T * hV * S * sizeof(float));
+            _ops.appendMemoryCopy(_gdnCapG[sl],    gateBuf,  T * hV * sizeof(float));
+            _ops.appendMemoryCopy(_gdnCapB[sl],    betaBuf,  T * hV * sizeof(float));
+            _ops.appendMemoryCopy(_gdnCapConv[sl], convInput,
+                                  (stateRows + T) * convDim * sizeof(float));
+        }
+    }
 
     // --- gated delta-rule recurrence (persistent state) -------------
     // state zeroed only at sequence start; decode steps evolve it in place.

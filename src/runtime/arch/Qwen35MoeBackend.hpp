@@ -202,6 +202,38 @@ public:
         return !_hiddenTapDst.empty();
     }
 
+    /// GDN ReplaySSM verify capture (DFlash partial-accept fold). When
+    /// configured, runLinearBlock copies each recurrent block's gated delta-rule
+    /// recurrence inputs (post-L2norm k, v, gLog=gateBuf, beta) and its conv
+    /// input ([conv_state | qkv_mixed], pre-conv) into the caller's per-recurrent
+    /// -block device sinks, so a DFlash partial accept can fold the accepted
+    /// prefix instead of re-forwarding the trunk. `recurBlocks[slot]` is the
+    /// block index for sink slot `slot`; each k/v sink holds `maxT*H_v*S`, each
+    /// g/b sink `maxT*H_v`, each conv sink `((d_conv-1)+maxT)*conv_dim` floats.
+    /// Capture is skipped for T > maxT (prefill). Empty = prod-inert.
+    void configureGdnCapture(std::span<const std::size_t> recurBlocks,
+                             std::span<float* const>      kSinks,
+                             std::span<float* const>      vSinks,
+                             std::span<float* const>      gSinks,
+                             std::span<float* const>      bSinks,
+                             std::span<float* const>      convSinks,
+                             std::size_t                  maxT);
+
+    void clearGdnCapture() noexcept {
+        _gdnCapSlot.clear();
+        _gdnCapK.clear(); _gdnCapV.clear(); _gdnCapG.clear();
+        _gdnCapB.clear(); _gdnCapConv.clear();
+    }
+
+    // GDN dims for the DFlash ReplaySSM ring allocation (defined out-of-line;
+    // LlmConfig is only forward-declared in this header).
+    [[nodiscard]] std::size_t gdnVHeads()     const noexcept;
+    [[nodiscard]] std::size_t gdnStateSize()  const noexcept;
+    [[nodiscard]] std::size_t gdnConvDim()    const noexcept;
+    [[nodiscard]] std::size_t gdnConvKernel() const noexcept;
+    [[nodiscard]] std::size_t layerCount()    const noexcept;
+    [[nodiscard]] bool        isRecurrent(std::size_t b) const noexcept;
+
     /// M-Cuda.MTP — one Multi-Token-Prediction draft step. Runs the model's
     /// native nextn module (blk.<blockCount>): eh_proj(concat(RMSNorm(hidden,
     /// hnorm), RMSNorm(embed(prevTok), enorm))) -> block-<mtp> attn+MoE (own
@@ -513,6 +545,14 @@ private:
     // empty => tap disabled (prod-inert default; one empty-check per block).
     std::vector<int>    _hiddenTapSlot;
     std::vector<float*> _hiddenTapDst;
+
+    // GDN ReplaySSM verify capture (DFlash partial-accept fold). _gdnCapSlot
+    // [blockIdx] = per-recurrent-block sink slot, or -1. Per-slot device sinks
+    // for the recurrence inputs + conv input. Empty => prod-inert. Skipped for
+    // T > _gdnCapMaxT (prefill).
+    std::vector<int>    _gdnCapSlot;
+    std::vector<float*> _gdnCapK, _gdnCapV, _gdnCapG, _gdnCapB, _gdnCapConv;
+    std::size_t         _gdnCapMaxT{0};
 
     // MIMIRMIND_GDN_DUMP=<dir>: dump the GatedDeltaNet recurrence in/out tensors
     // for block MIMIRMIND_GDN_DUMP_BLK (default 0) as one file per tensor:

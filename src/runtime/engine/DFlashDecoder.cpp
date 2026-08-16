@@ -114,6 +114,42 @@ void DFlashDecoder::ensureLoaded(std::string_view drafterDir) {
     _draftArgmaxDev = _e._ops->allocate((kMaxBlock - 1) * sizeof(std::int32_t));
     _draftArgmaxHost.assign(kMaxBlock - 1, 0);
 
+    // GDN ReplaySSM fold (MIMIRMIND_DFLASH_FOLD): allocate per-recurrent-block
+    // capture rings and arm the backend so a partial accept can fold the
+    // accepted prefix instead of re-forwarding the trunk.
+    _foldMode = std::getenv("MIMIRMIND_DFLASH_FOLD") != nullptr;
+    if (_foldMode) {
+        auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+        if (qb == nullptr) {
+            _foldMode = false;
+        } else {
+            _hV      = qb->gdnVHeads();
+            _sState  = qb->gdnStateSize();
+            _convDim = qb->gdnConvDim();
+            const std::size_t dConv = qb->gdnConvKernel();
+            const std::size_t stateRows = dConv > 0 ? dConv - 1 : 0;
+            _convStateElems = stateRows * _convDim;
+            _recurBlocks.clear();
+            for (std::size_t b = 0; b < qb->layerCount(); ++b) {
+                if (qb->isRecurrent(b)) _recurBlocks.push_back(b);
+            }
+            const std::size_t nR = _recurBlocks.size();
+            _capK.clear(); _capV.clear(); _capG.clear(); _capB.clear(); _capConv.clear();
+            for (std::size_t r = 0; r < nR; ++r) {
+                _capK.push_back(_e._ops->allocate(kMaxBlock * _hV * _sState * sizeof(float)));
+                _capV.push_back(_e._ops->allocate(kMaxBlock * _hV * _sState * sizeof(float)));
+                _capG.push_back(_e._ops->allocate(kMaxBlock * _hV * sizeof(float)));
+                _capB.push_back(_e._ops->allocate(kMaxBlock * _hV * sizeof(float)));
+                _capConv.push_back(
+                    _e._ops->allocate((stateRows + kMaxBlock) * _convDim * sizeof(float)));
+            }
+            MM_LOG_INFO("dflash",
+                        "DFlash ReplaySSM fold ENABLED — {} recurrent blocks, "
+                        "hV={} S={} convDim={} dConv={}",
+                        nR, _hV, _sState, _convDim, dConv);
+        }
+    }
+
     MM_LOG_INFO("dflash",
                 "DFlashDecoder ready — drafter={} layers={} hidden={} taps={} "
                 "vocab={} mask={}",
@@ -159,6 +195,22 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
     qb->configureHiddenTap(
         std::span<const std::size_t>{kTapLayers, _taps},
         std::span<float* const>{_tapPtr.data(), _tapPtr.size()});
+
+    // Arm the GDN ReplaySSM capture for this decode (disarmed at the end so a
+    // plain generate() on the same backend stays prod-inert).
+    if (_foldMode && !_recurBlocks.empty()) {
+        std::vector<float*> kS, vS, gS, bS, cS;
+        const std::size_t nR = _capK.size();
+        kS.reserve(nR); vS.reserve(nR); gS.reserve(nR); bS.reserve(nR); cS.reserve(nR);
+        for (std::size_t r = 0; r < nR; ++r) {
+            kS.push_back(_capK[r].as<float>());
+            vS.push_back(_capV[r].as<float>());
+            gS.push_back(_capG[r].as<float>());
+            bS.push_back(_capB[r].as<float>());
+            cS.push_back(_capConv[r].as<float>());
+        }
+        qb->configureGdnCapture(_recurBlocks, kS, vS, gS, bS, cS, kMaxBlock);
+    }
 
     std::vector<std::int32_t> prompt(promptIds.begin(), promptIds.end());
     auto pf = _e.forwardVerify(prompt);          // tap sinks fill rows [0, P)
@@ -308,9 +360,33 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
 
         if (a == K) {
             _e.commitVerified(committed);            // tap rows already committed
+        } else if (_foldMode && ssm != nullptr) {
+            // ReplaySSM: restore the SSM recurrent state to the pre-window
+            // checkpoint, fold ONLY the accepted prefix per recurrent block, and
+            // slice the committed conv state from the captured conv input — no
+            // trunk re-forward. The verify forward already wrote provisional KV +
+            // tap rows for all K+1 positions; commitVerified(a+1) commits exactly
+            // the accepted prefix (KV) and feedContext reads the accepted taps.
+            _e._ops->appendMemoryCopy(ssm->statePtr(), _ssmBak.get(), stBytes);
+            const std::size_t aLen = a + 1;
+            for (std::size_t r = 0; r < _recurBlocks.size(); ++r) {
+                const std::size_t b = _recurBlocks[r];
+                float* const stB = ssm->statePtr() + b * ssm->stateLayerStride();
+                _e._ops->gatedDeltaNetFoldAsync(
+                    _capK[r].as<float>(), _capV[r].as<float>(),
+                    _capG[r].as<float>(), _capB[r].as<float>(),
+                    stB, aLen, _hV, _sState);
+                float* const cvB =
+                    ssm->convStatePtr() + b * ssm->convStateLayerStride();
+                _e._ops->appendMemoryCopy(
+                    cvB, _capConv[r].as<float>() + aLen * _convDim,
+                    _convStateElems * sizeof(float));
+            }
+            _e.commitVerified(committed);
         } else {
-            // Partial accept: restore SSM, undo provisional KV, re-forward the
-            // accepted prefix so KV + SSM + tap sinks land on the committed suffix.
+            // Partial accept (re-forward path): restore SSM, undo provisional KV,
+            // re-forward the accepted prefix so KV + SSM + tap sinks land on the
+            // committed suffix.
             if (ssm != nullptr) {
                 _e._ops->appendMemoryCopy(ssm->statePtr(),     _ssmBak.get(),  stBytes);
                 _e._ops->appendMemoryCopy(ssm->convStatePtr(), _convBak.get(), cvBytes);
@@ -338,6 +414,7 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
     }
 
     qb->clearHiddenTap();
+    if (_foldMode) qb->clearGdnCapture();
 
     if (tmg && nTmg > 0) {
         const double tot = tDraft + tReadout + tVerify + tRest;

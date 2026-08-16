@@ -112,6 +112,15 @@ private:
     compute::ComputeBuffer    _draftLogits;    // [maxBlock-1, vocabLm]
     compute::ComputeBuffer    _draftArgmaxDev; // [maxBlock-1] device argmax ids
     std::vector<std::int32_t> _draftArgmaxHost;
+
+    // GDN ReplaySSM (MIMIRMIND_DFLASH_FOLD): replace the partial-accept
+    // re-forward with a fold of the accepted prefix. Per-recurrent-block capture
+    // rings of the verify window's recurrence inputs + conv input, filled by
+    // Qwen35MoeBackend during forwardVerify.
+    bool                                _foldMode{false};
+    std::vector<std::size_t>            _recurBlocks;   // recurrent block indices
+    std::size_t _hV{0}, _sState{0}, _convDim{0}, _convStateElems{0};
+    std::vector<compute::ComputeBuffer> _capK, _capV, _capG, _capB, _capConv;
     compute::ComputeBuffer _ssmBak;     // GatedDeltaNet state snapshot (verify rollback)
     compute::ComputeBuffer _convBak;    // rolling conv-tail snapshot
 
