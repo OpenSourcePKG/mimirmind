@@ -100,6 +100,11 @@ public:
     }
 
     // Classifier head (RobertaClassificationHead: dense -> tanh -> out_proj).
+    // Present only on sequence-classification checkpoints (rerankers). A pure
+    // embedding checkpoint (e.g. bge-m3 dense) ships the encoder + embeddings
+    // only — `hasClassifier()` is false and the head pointers stay null; the
+    // EncoderRunner::embed() path (CLS-pool + L2-norm) needs no head.
+    [[nodiscard]] bool hasClassifier() const noexcept { return _hasClassifier; }
     [[nodiscard]] const float* clsDenseW() const noexcept { return _clsDenseW; }
     [[nodiscard]] const float* clsDenseB() const noexcept { return _clsDenseB; }
     [[nodiscard]] const float* clsOutW() const noexcept { return _clsOutW; }
@@ -117,6 +122,7 @@ private:
     const float* _typeVec{};
     const float* _embLnW{};
     const float* _embLnB{};
+    bool         _hasClassifier{false};
     const float* _clsDenseW{};
     const float* _clsDenseB{};
     const float* _clsOutW{};

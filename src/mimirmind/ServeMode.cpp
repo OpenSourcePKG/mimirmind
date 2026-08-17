@@ -23,6 +23,7 @@
 #include "runtime/ComputeStack.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/encoder/RerankEngine.hpp"
+#include "runtime/encoder/EmbedEngine.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
 #include "runtime/nvfp4/ModelFormatResolver.hpp"
 #include "runtime/perf/PerfRegressionDetector.hpp"
@@ -418,6 +419,12 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     std::vector<std::unique_ptr<::mimirmind::runtime::encoder::RerankEngine>>
         ownedRerankers;
     std::vector<::mimirmind::server::LoadedReranker> loadedRerankers;
+    // Embed (bi-encoder) models: same isolated-compute-stack lifetime rule as
+    // the rerankers — stacks declared before the EmbedEngines they back.
+    std::vector<::mimirmind::runtime::ComputeStack> ownedEmbedStacks;
+    std::vector<std::unique_ptr<::mimirmind::runtime::encoder::EmbedEngine>>
+        ownedEmbedders;
+    std::vector<::mimirmind::server::LoadedEmbedder> loadedEmbedders;
 #ifdef MIMIRMIND_HAVE_L0
     // In attached mode: one MuninClient per loaded model, kept alive
     // for the whole worker lifetime so Munin's implicit-detach logic
@@ -473,6 +480,33 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                             m.path, m.id);
             } catch (const std::exception& x) {
                 std::cerr << "serve: rerank model '" << m.id
+                          << "' load failed: " << x.what() << "\n";
+                return 2;
+            }
+            continue;
+        }
+
+        // Embed models: a dense F32 bi-encoder (EncoderModel without classifier
+        // head + XLM-R tokenizer) behind /v1/embeddings, own isolated stack.
+        if (m.task == ::mimirmind::core::config::ModelTask::Embed) {
+            try {
+                ownedEmbedStacks.push_back(
+                    ::mimirmind::runtime::makeComputeStack(cfg, engineKind));
+                auto& stk = ownedEmbedStacks.back();
+                auto ee = std::make_unique<
+                    ::mimirmind::runtime::encoder::EmbedEngine>(
+                    m.path, *stk.ops, *stk.matmul);
+                ::mimirmind::server::LoadedEmbedder le{};
+                le.id     = m.id;
+                le.title  = m.title;
+                le.engine = ee.get();
+                loadedEmbedders.push_back(std::move(le));
+                ownedEmbedders.push_back(std::move(ee));
+                MM_LOG_INFO("main",
+                            "serve: loaded embed model '{}' (id='{}')",
+                            m.path, m.id);
+            } catch (const std::exception& x) {
+                std::cerr << "serve: embed model '" << m.id
                           << "' load failed: " << x.what() << "\n";
                 return 2;
             }
@@ -2453,7 +2487,8 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 
     ::mimirmind::server::ApiServer server{std::move(loadedEngines), scfg,
                                           drafter.get(),
-                                          std::move(loadedRerankers)};
+                                          std::move(loadedRerankers),
+                                          std::move(loadedEmbedders)};
 
     g_runningServer.store(&server, std::memory_order_release);
     std::signal(SIGINT,  signalStop);

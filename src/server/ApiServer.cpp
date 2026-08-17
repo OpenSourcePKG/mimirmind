@@ -6,6 +6,7 @@
 #include "server/ApiHelpers.hpp"
 #include "server/ChatCompletionHandler.hpp"
 #include "server/RerankHandler.hpp"
+#include "server/EmbeddingsHandler.hpp"
 #include "server/RequestDispatcher.hpp"
 #include "server/RequestTracker.hpp"
 #include "server/SystemStatusBuilder.hpp"
@@ -122,9 +123,14 @@ struct ApiServer::Impl {
     // with task=rerank is configured.
     RerankHandler                         rerankHandler;
 
+    // POST /v1/embeddings — bi-encoder embedding model(s). Empty when no
+    // model with task=embed is configured.
+    EmbeddingsHandler                     embeddingsHandler;
+
     Impl(std::vector<LoadedEngine> in, ServerConfig c,
          runtime::Drafter*         drafter,
-         std::vector<LoadedReranker> rerankers)
+         std::vector<LoadedReranker> rerankers,
+         std::vector<LoadedEmbedder> embedders)
         : dispatcher{std::move(in), c.modelId, drafter,
                      c.speculativeTargetId, c.speculative},
           engine{dispatcher.defaultEngine()},
@@ -132,7 +138,8 @@ struct ApiServer::Impl {
           tenantMetrics{cfg.tenantMetricsPath},
           statusBuilder{engine, dispatcher, requestTracker, cfg.modelId},
           chatHandler{dispatcher, requestTracker, tenantMetrics, cfg},
-          rerankHandler{std::move(rerankers), cfg} {
+          rerankHandler{std::move(rerankers), cfg},
+          embeddingsHandler{std::move(embedders), cfg} {
         makeServer();
         installRoutes();
     }
@@ -281,6 +288,17 @@ struct ApiServer::Impl {
                         rerankHandler.handle(req, res);
                     });
 
+        server->Post("/v1/embeddings",
+                    [this](const httplib::Request& req,
+                           httplib::Response&       res) {
+                        MM_LOG_INFO(
+                            "server",
+                            "POST /v1/embeddings accepted from {} "
+                            "(content-length={} B)",
+                            req.remote_addr, req.body.size());
+                        embeddingsHandler.handle(req, res);
+                    });
+
         server->set_exception_handler(
             [](const httplib::Request& req,
                httplib::Response& res,
@@ -352,6 +370,16 @@ struct ApiServer::Impl {
                 {"task",     "rerank"},
             });
         }
+        for (const auto& m : embeddingsHandler.listModels()) {
+            data.push_back(json{
+                {"id",       m.id},
+                {"title",    m.title},
+                {"object",   "model"},
+                {"created",  0},
+                {"owned_by", "mimirmind"},
+                {"task",     "embed"},
+            });
+        }
         sendJson(res, 200, {
             {"object", "list"},
             {"data",   std::move(data)},
@@ -408,10 +436,12 @@ struct ApiServer::Impl {
 ApiServer::ApiServer(std::vector<LoadedEngine>     engines,
                      ServerConfig                  cfg,
                      runtime::Drafter*             drafter,
-                     std::vector<LoadedReranker>   rerankers)
+                     std::vector<LoadedReranker>   rerankers,
+                     std::vector<LoadedEmbedder>   embedders)
     : _impl{std::make_unique<Impl>(std::move(engines),
                                    std::move(cfg), drafter,
-                                   std::move(rerankers))} {}
+                                   std::move(rerankers),
+                                   std::move(embedders))} {}
 
 ApiServer::~ApiServer() = default;
 

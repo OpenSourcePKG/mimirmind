@@ -21,6 +21,7 @@ class ContinuousBatcher;
 }
 namespace mimirmind::runtime::encoder {
 class RerankEngine;
+class EmbedEngine;
 }
 
 namespace mimirmind::server {
@@ -53,6 +54,18 @@ struct LoadedReranker {
     std::string                     id;
     std::string                     title;
     runtime::encoder::RerankEngine* engine{nullptr};
+};
+
+/**
+ * One loaded bi-encoder embedding model exposed under /v1/embeddings. `engine`
+ * is non-owning — ServeMode keeps the EmbedEngine (and its compute stack) alive
+ * for the process lifetime. Each entry gets its own serialisation mutex inside
+ * EmbeddingsHandler.
+ */
+struct LoadedEmbedder {
+    std::string                    id;
+    std::string                    title;
+    runtime::encoder::EmbedEngine* engine{nullptr};
 };
 
 /// In-process TLS termination settings. When `enabled`, the listener is a
@@ -175,7 +188,8 @@ public:
     ApiServer(std::vector<LoadedEngine>     engines,
               ServerConfig                  cfg,
               runtime::Drafter*             drafter = nullptr,
-              std::vector<LoadedReranker>   rerankers = {});
+              std::vector<LoadedReranker>   rerankers = {},
+              std::vector<LoadedEmbedder>   embedders = {});
     ~ApiServer();
 
     ApiServer(const ApiServer&)            = delete;

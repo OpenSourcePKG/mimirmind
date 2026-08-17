@@ -56,14 +56,16 @@ enum class ModelFormat { Auto, Gguf, Nvfp4 };
  * What a model entry serves. `Chat` = the autoregressive decoder behind
  * /v1/chat/completions (the default). `Rerank` = a bidirectional cross-encoder
  * (EncoderRunner) behind /v1/rerank — no KV cache, no sampler, one score per
- * (query, document) pair.
+ * (query, document) pair. `Embed` = a bi-encoder embedding model (same encoder,
+ * no classifier head) behind /v1/embeddings — CLS-pooled, L2-normalized vector
+ * per input text.
  */
-enum class ModelTask { Chat, Rerank };
+enum class ModelTask { Chat, Rerank, Embed };
 
-/// Parse a `task` string ("chat"|"rerank") or return nullopt.
+/// Parse a `task` string ("chat"|"rerank"|"embed") or return nullopt.
 [[nodiscard]] std::optional<ModelTask> modelTaskFromString(std::string_view s) noexcept;
 
-/// Canonical lower-case name for a task ("chat"|"rerank").
+/// Canonical lower-case name for a task ("chat"|"rerank"|"embed").
 [[nodiscard]] std::string_view modelTaskName(ModelTask t) noexcept;
 
 /**

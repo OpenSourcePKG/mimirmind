@@ -158,16 +158,25 @@ void EncoderModel::load(std::string_view dir, compute::ComputeOps& ops,
         L.outLnB = upload(pre + "output.LayerNorm.bias");
     }
 
-    // Classifier head (dense -> tanh -> out_proj on the <s>/CLS token).
-    _clsDenseW = uploadW("classifier.dense.weight");
-    _clsDenseB = upload("classifier.dense.bias");
-    _clsOutW   = uploadW("classifier.out_proj.weight");
-    _clsOutB   = upload("classifier.out_proj.bias");
-
-    // num_labels from the head if config didn't pin it.
-    if (const auto* op = sm.find("classifier.out_proj.weight");
-        op != nullptr && !op->shape.empty()) {
-        _config.numLabels = static_cast<std::size_t>(op->shape[0]);
+    // Classifier head (dense -> tanh -> out_proj on the <s>/CLS token) —
+    // present only on a sequence-classification checkpoint (reranker). A pure
+    // embedding checkpoint (e.g. bge-m3 dense) ships encoder + embeddings only;
+    // EncoderRunner::embed() pools the CLS hidden directly, so skip the head
+    // when it is absent instead of hard-failing on the missing tensors.
+    if (sm.find("classifier.out_proj.weight") != nullptr) {
+        _clsDenseW = uploadW("classifier.dense.weight");
+        _clsDenseB = upload("classifier.dense.bias");
+        _clsOutW   = uploadW("classifier.out_proj.weight");
+        _clsOutB   = upload("classifier.out_proj.bias");
+        _hasClassifier = true;
+        // num_labels from the head if config didn't pin it.
+        if (const auto* op = sm.find("classifier.out_proj.weight");
+            op != nullptr && !op->shape.empty()) {
+            _config.numLabels = static_cast<std::size_t>(op->shape[0]);
+        }
+    } else {
+        _hasClassifier   = false;
+        _config.numLabels = 0;   // embedding-only checkpoint: no logits
     }
 }
 

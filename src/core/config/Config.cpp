@@ -210,12 +210,14 @@ std::string_view modelFormatName(ModelFormat f) noexcept {
 std::optional<ModelTask> modelTaskFromString(std::string_view s) noexcept {
     if (s == "chat")   return ModelTask::Chat;
     if (s == "rerank") return ModelTask::Rerank;
+    if (s == "embed")  return ModelTask::Embed;
     return std::nullopt;
 }
 
 std::string_view modelTaskName(ModelTask t) noexcept {
     switch (t) {
         case ModelTask::Rerank: return "rerank";
+        case ModelTask::Embed:  return "embed";
         case ModelTask::Chat:
         default:                return "chat";
     }
@@ -259,7 +261,7 @@ ModelEntry parseModel(std::string_view      path,
     if (const auto v = readOpt<std::string>(path, section, j, "task"); v.has_value()) {
         const auto t = modelTaskFromString(*v);
         if (!t.has_value()) {
-            fail(path, section + ".task must be one of \"chat\", \"rerank\"");
+            fail(path, section + ".task must be one of \"chat\", \"rerank\", \"embed\"");
         }
         m.task = *t;
     }

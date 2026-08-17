@@ -10,6 +10,7 @@
 namespace mimirmind::compute {
 class ComputeOps;
 class ComputeMatmul;
+class ComputeBuffer;
 } // namespace mimirmind::compute
 
 namespace mimirmind::runtime::encoder {
@@ -52,7 +53,20 @@ public:
     /// The single rerank relevance logit (numLabels == 1).
     [[nodiscard]] float score(std::span<const std::int32_t> inputIds);
 
+    /// Bi-encoder sentence embedding for one sequence: the shared encoder
+    /// forward, CLS-pooled (row 0 / the <s> token) + L2-normalized → a
+    /// `hidden`-dim unit vector. bge-style CLS pooling; no classifier head.
+    /// Feeds /v1/embeddings.
+    [[nodiscard]] std::vector<float> embed(std::span<const std::int32_t> inputIds);
+
 private:
+    /// Shared single-sequence encoder forward (embeddings + numLayers). Returns
+    /// the device buffer holding the final [T x hidden] hidden state and sets
+    /// `T`. Consumed by the reranker head (forwardLogits) and the embedding
+    /// pooler (embed). Caller must hold a ScopedExactF32 on _mm for the run.
+    [[nodiscard]] compute::ComputeBuffer
+    encodeSingle(std::span<const std::int32_t> inputIds, std::size_t& T);
+
     const EncoderModel&     _m;
     compute::ComputeOps&    _ops;
     compute::ComputeMatmul& _mm;

@@ -269,4 +269,107 @@ float EncoderRunner::score(std::span<const std::int32_t> inputIds) {
     return logits.empty() ? 0.0F : logits.front();
 }
 
+// ---- embedding (bi-encoder) path ---------------------------------------
+//
+// Shares the exact embeddings + 24-layer forward with forwardLogits (kept a
+// dedicated method rather than refactoring the bit-exact-validated reranker
+// body). The caller must hold a ScopedExactF32 for the run; returns the final
+// [T x hidden] hidden state on device. TODO: fold forwardLogits onto this.
+compute::ComputeBuffer
+EncoderRunner::encodeSingle(std::span<const std::int32_t> inputIds,
+                            std::size_t& Tout) {
+    const EncoderConfig& c = _m.config();
+    const std::size_t T = inputIds.size();
+    if (T == 0) {
+        throw std::runtime_error("EncoderRunner::encodeSingle: empty input");
+    }
+    Tout = T;
+    const std::size_t H   = c.hidden;
+    const std::size_t ffn = c.ffn;
+    const float eps       = c.lnEps;
+    const float scale     = 1.0F / std::sqrt(static_cast<float>(c.headDim));
+    const auto  F32       = core::gguf::GgmlType::F32;
+    const auto  WT        = _m.matmulType();
+
+    auto alloc = [&](std::size_t n) { return _ops.allocate(n * sizeof(float)); };
+    auto fp = [](compute::ComputeBuffer& b) { return static_cast<float*>(b.get()); };
+
+    compute::ComputeBuffer xb   = alloc(T * H);
+    compute::ComputeBuffer hb   = alloc(T * H);
+    compute::ComputeBuffer qb   = alloc(T * H);
+    compute::ComputeBuffer kb   = alloc(T * H);
+    compute::ComputeBuffer vb   = alloc(T * H);
+    compute::ComputeBuffer attnb = alloc(T * H);
+    compute::ComputeBuffer aob  = alloc(T * H);
+    compute::ComputeBuffer ln1b = alloc(T * H);
+    compute::ComputeBuffer interb = alloc(T * ffn);
+    compute::ComputeBuffer ffnb = alloc(T * H);
+    compute::ComputeBuffer scr  = alloc(T * ffn);
+
+    float* x    = fp(xb);
+    float* h    = fp(hb);
+    float* q    = fp(qb);
+    float* k    = fp(kb);
+    float* v    = fp(vb);
+    float* attn = fp(attnb);
+    float* ao   = fp(aob);
+    float* ln1  = fp(ln1b);
+    float* inter = fp(interb);
+    float* ffnO = fp(ffnb);
+    float* scratch = fp(scr);
+
+    compute::embeddingLookup(F32, _m.wordEmb(), H, c.vocab, inputIds, x);
+    _ops.encoderEmbedAddAsync(x, _m.posTable(), _m.typeVec(), T, H, c.posOffset);
+    _ops.layerNormAsync(x, T, H, _m.embLnW(), _m.embLnB(), eps, h);
+
+    for (std::size_t i = 0; i < c.numLayers; ++i) {
+        const EncoderLayerWeights& L = _m.layer(i);
+        _mm.matmulAsync(WT, L.qW, H, H, h, T, q, scratch);
+        _ops.addBiasAsync(q, T, H, L.qB);
+        _mm.matmulAsync(WT, L.kW, H, H, h, T, k, scratch);
+        _ops.addBiasAsync(k, T, H, L.kB);
+        _mm.matmulAsync(WT, L.vW, H, H, h, T, v, scratch);
+        _ops.addBiasAsync(v, T, H, L.vB);
+        _ops.attentionEncoderAsync(q, k, v, T, c.heads, c.heads, c.headDim,
+                                   scale, attn);
+        _mm.matmulAsync(WT, L.aoW, H, H, attn, T, ao, scratch);
+        _ops.addBiasAsync(ao, T, H, L.aoB);
+        _ops.addResidualAsync(ao, h, T * H);
+        _ops.layerNormAsync(ao, T, H, L.aoLnW, L.aoLnB, eps, ln1);
+        _mm.matmulAsync(WT, L.fiW, ffn, H, ln1, T, inter, scratch);
+        _ops.addBiasAsync(inter, T, ffn, L.fiB);
+        _ops.geluErfAsync(inter, T * ffn);
+        _mm.matmulAsync(WT, L.foW, H, ffn, inter, T, ffnO, scratch);
+        _ops.addBiasAsync(ffnO, T, H, L.foB);
+        _ops.addResidualAsync(ffnO, ln1, T * H);
+        _ops.layerNormAsync(ffnO, T, H, L.outLnW, L.outLnB, eps, h);
+    }
+    return hb;   // final [T x H] hidden state on device (row 0 = <s>/CLS)
+}
+
+std::vector<float>
+EncoderRunner::embed(std::span<const std::int32_t> inputIds) {
+    // Same F32-exactness guard as the reranker (encoder projections are
+    // precision-sensitive).
+    compute::ScopedExactF32 exactF32{_mm};
+    std::size_t T = 0;
+    compute::ComputeBuffer hb = encodeSingle(inputIds, T);
+    const std::size_t H = _m.config().hidden;
+
+    _ops.flush();
+    // CLS pooling (bge convention): the <s> token = row 0 of the final hidden
+    // state is the sentence embedding. Row-major [T x H], so the first H
+    // floats are row 0.
+    std::vector<float> emb(H);
+    _ops.readbackToHost(emb.data(), hb.get(), H * sizeof(float));
+
+    // L2-normalize to a unit vector (bge embeddings are used with cosine sim).
+    double ss = 0.0;
+    for (float f : emb) ss += static_cast<double>(f) * static_cast<double>(f);
+    const float inv = (ss > 0.0)
+                        ? static_cast<float>(1.0 / std::sqrt(ss)) : 0.0F;
+    for (float& f : emb) f *= inv;
+    return emb;
+}
+
 } // namespace mimirmind::runtime::encoder
