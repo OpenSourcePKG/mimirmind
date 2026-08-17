@@ -60,9 +60,20 @@ executeMaterialization(const std::vector<mo::MaterializationStep>& steps,
 
             switch (s.kind) {
                 case mo::SourceKind::Nvfp4: {
-                    const NvFp4DeviceTensor& bs = require(src, base + ".weight_scale");
-                    const NvFp4DeviceTensor& gs = require(src, base + ".weight_scale_2");
-                    const float global = ops.readF32(gs.devPtr);
+                    // ModelOpt (qwen35moe) reconstructs the scale names from the
+                    // weight base; compressed-tensors (Gemma-4) supplies them
+                    // explicitly (`.weight_scale` / `.weight_global_scale`, the
+                    // packed weight itself being `.weight_packed`).
+                    const std::string bsName = s.blockScaleName.empty()
+                        ? (base + ".weight_scale") : s.blockScaleName;
+                    const std::string gsName = s.globalScaleName.empty()
+                        ? (base + ".weight_scale_2") : s.globalScaleName;
+                    const NvFp4DeviceTensor& bs = require(src, bsName);
+                    const NvFp4DeviceTensor& gs = require(src, gsName);
+                    float global = ops.readF32(gs.devPtr);
+                    // compressed-tensors stores 1/global (6*448/amax); the
+                    // dequant kernel multiplies, so invert it here.
+                    if (s.globalIsReciprocal) global = 1.0F / global;
                     ops.dequantNvfp4(w.devPtr, bs.devPtr, global, s.rows, s.in, dst);
                     break;
                 }

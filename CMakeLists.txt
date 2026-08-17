@@ -375,6 +375,7 @@ add_library(mimirmind_core_common STATIC
     src/core/modelopt/NvFp4Reference.cpp
     src/core/modelopt/Qwen35MoeGgufMap.cpp
     src/core/modelopt/Qwen35MoeMaterializer.cpp
+    src/core/modelopt/Gemma4Materializer.cpp
     src/core/safetensors/SafetensorsDtype.cpp
     src/core/safetensors/SafetensorsHeader.cpp
     src/core/safetensors/SafetensorsIndex.cpp
@@ -396,6 +397,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/nvfp4/NvFp4Materializer.cpp
     src/runtime/nvfp4/NvFp4WeightsMap.cpp
     src/runtime/nvfp4/Qwen35MoeConfig.cpp
+    src/runtime/nvfp4/Gemma4Config.cpp
     src/runtime/nvfp4/ModelFormatResolver.cpp
     src/runtime/encoder/EncoderModel.cpp
     src/runtime/encoder/EncoderRunner.cpp
@@ -482,6 +484,41 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_dependencies(dflash_device_upload_test cuda_kernels)
     target_include_directories(dflash_device_upload_test PRIVATE tests)
     target_link_libraries(dflash_device_upload_test PRIVATE
+        mimirmind_core_cuda mimirmind_core_common)
+
+    # ---- gemma4_nvfp4_materialize_repro — GB10 materialise illegal-access ----
+    # Minimal repro (roadmap 5.12 blocker): synthetic big-then-small widen
+    # probes + a real gemma load with per-tensor widen. Needs a CUDA device.
+    #   cmake --build build-cuda --target gemma4_nvfp4_materialize_repro &&
+    #   ./build-cuda/gemma4_nvfp4_materialize_repro /opt/mimirmind/models/gemma-4-12b-it-nvfp4
+    add_executable(gemma4_nvfp4_materialize_repro
+        tests/gemma4_nvfp4_materialize_repro.cpp
+        src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/CudaMaterializerOps.cpp
+        src/compute/cuda/MoeTopKRouteDevice.cpp
+        src/compute/cuda/GpuMatmul.cpp
+        src/compute/GatedDeltaNet.cpp
+        src/compute/Rope.cpp
+        src/compute/Norm.cpp
+        src/compute/Activations.cpp
+        src/compute/Attention.cpp
+        src/compute/Embedding.cpp
+        src/compute/Matmul.cpp
+        src/compute/Dequant.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
+    )
+    add_dependencies(gemma4_nvfp4_materialize_repro cuda_kernels)
+    target_include_directories(gemma4_nvfp4_materialize_repro PRIVATE tests)
+    target_link_libraries(gemma4_nvfp4_materialize_repro PRIVATE
         mimirmind_core_cuda mimirmind_core_common)
 
     # ---- dflash_forward_parity_test — DFlash draft-forward vs z-lab golden ---

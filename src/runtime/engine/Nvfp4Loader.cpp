@@ -11,14 +11,19 @@
 #include "core/gpu/cuda/CudaComputeContext.hpp"
 #include "core/log/Log.hpp"
 #include "core/modelopt/BlockScaleSwizzle.hpp"
+#include "core/modelopt/Gemma4Materializer.hpp"
 #include "core/modelopt/HfQuantConfig.hpp"
 #include "core/modelopt/Qwen35MoeMaterializer.hpp"
 #include "core/safetensors/SafetensorsModel.hpp"
 #include "runtime/nvfp4/ComputeOpsUploader.hpp"
+#include "runtime/nvfp4/Gemma4Config.hpp"
 #include "runtime/nvfp4/NvFp4WeightsMap.hpp"
 #include "runtime/nvfp4/Qwen35MoeConfig.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -43,6 +48,39 @@ void Nvfp4Loader::load(InferenceEngine&, std::string_view, std::string_view) {
 
 #else
 
+namespace {
+
+/// True if `config.json` names a Gemma-4 model (compressed-tensors
+/// "nvfp4-pack-quantized"), vs a ModelOpt qwen35moe checkpoint. Keyed on the
+/// top-level `model_type` / `architectures[0]` (a Gemma-4 unified multimodal
+/// checkpoint reports e.g. "Gemma4UnifiedForConditionalGeneration").
+bool isGemma4Config(const std::string& configText) {
+    nlohmann::json j =
+        nlohmann::json::parse(configText, nullptr, /*allow_exceptions=*/false);
+    if (!j.is_object()) {
+        return false;
+    }
+    auto lower = [](std::string s) {
+        for (char& ch : s) ch = static_cast<char>(std::tolower(
+                              static_cast<unsigned char>(ch)));
+        return s;
+    };
+    auto contains = [&](const std::string& hay, const char* needle) {
+        return lower(hay).find(needle) != std::string::npos;
+    };
+    if (j.contains("model_type") && j["model_type"].is_string()
+        && contains(j["model_type"].get<std::string>(), "gemma")) {
+        return true;
+    }
+    if (j.contains("architectures") && j["architectures"].is_array()
+        && !j["architectures"].empty() && j["architectures"][0].is_string()) {
+        return contains(j["architectures"][0].get<std::string>(), "gemma");
+    }
+    return false;
+}
+
+} // namespace
+
 void Nvfp4Loader::load(InferenceEngine& e,
                        std::string_view checkpointDir,
                        std::string_view tokenizerGguf) {
@@ -59,9 +97,70 @@ void Nvfp4Loader::load(InferenceEngine& e,
         return ss.str();
     };
 
+    const std::string configText =
+        readText(std::filesystem::path{dir} / "config.json");
+
+    // --- Arch dispatch --------------------------------------------------
+    // compressed-tensors Gemma-4 (dense text tower) takes a dedicated,
+    // self-contained path: a different config schema (quant config lives IN
+    // config.json, not hf_quant_config.json), a different NVFP4 name-triple
+    // (.weight_packed / .weight_scale / .weight_global_scale, reciprocal
+    // global), and none of the qwen35moe post-passes (GDN regroup / MTP /
+    // MoE banks / shared-expert repack). It reuses the generic upload +
+    // dequant + WeightsMap tail. The shared finalize (createArchBackend off
+    // _config.architecture == "gemma4") then selects Gemma4DenseBackend.
+    if (isGemma4Config(configText)) {
+        MM_LOG_INFO("engine",
+                    "loadModelNvfp4: '{}' — Gemma-4 (compressed-tensors, dense "
+                    "text tower)", checkpointDir);
+        e._config = runtime::nvfp4::parseGemma4SafetensorsConfig(configText);
+
+        if (tokenizerGguf.empty()) {
+            e._tokenizer.loadFromHfJson(dir);
+        } else {
+            e._reader.open(tokenizerGguf);
+            e._tokenizer.loadFromGguf(e._reader);
+        }
+
+        runtime::nvfp4::ComputeOpsUploader uploader(*e._ops);
+        e._nvfp4Model = std::make_unique<runtime::nvfp4::NvFp4Model>(
+            runtime::nvfp4::loadNvfp4Model(dir, uploader));
+
+        core::safetensors::SafetensorsModel sm;
+        sm.open(dir);
+        core::modelopt::Gemma4Arch garch;
+        garch.numLayers = static_cast<int>(e._config.blockCount);
+        garch.isFullAttn.assign(e._config.blockCount, false);
+        for (std::size_t L = 0; L < e._config.blockCount; ++L) {
+            // Full-attention where the per-layer SWA mask says NOT sliding.
+            const bool sliding = (L < e._config.slidingWindowPattern.size())
+                                     ? static_cast<bool>(
+                                           e._config.slidingWindowPattern[L])
+                                     : true;
+            garch.isFullAttn[L] = !sliding;
+        }
+        const std::vector<core::modelopt::MaterializationStep> gsteps =
+            core::modelopt::planGemma4Materialization(sm, garch);
+
+        auto& gCudaCtx =
+            static_cast<core::cuda::CudaComputeContext&>(*e._computeCtx);
+        compute::cuda::CudaMaterializerOps gDevOps(gCudaCtx, *e._ops);
+        e._materializedBf16 =
+            runtime::nvfp4::executeMaterialization(gsteps, *e._nvfp4Model,
+                                                   gDevOps);
+        gCudaCtx.stream().synchronize();
+
+        e._weights.emplace(
+            runtime::nvfp4::buildBf16WeightsMap(e._materializedBf16));
+        e._nvfp4Model.reset();
+        MM_LOG_INFO("engine",
+                    "loadModelNvfp4: gemma4 materialised {} BF16 tensors",
+                    e._materializedBf16.size());
+        return;
+    }
+
     // 1. Arch params from config.json (GGUF-metadata parse is GGUF-only).
-    e._config = runtime::nvfp4::parseQwen35MoeSafetensorsConfig(
-        readText(std::filesystem::path{dir} / "config.json"));
+    e._config = runtime::nvfp4::parseQwen35MoeSafetensorsConfig(configText);
 
     // 2. Tokenizer. NVFP4 checkpoints ship no GGUF tokenizer, so by default
     //    parse the checkpoint's HF tokenizer.json directly (byte-level BPE,

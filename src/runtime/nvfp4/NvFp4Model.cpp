@@ -55,13 +55,20 @@ NvFp4Model loadNvfp4Model(const std::string& checkpointDir, DeviceUploader& uplo
     safetensors::SafetensorsModel sm;
     sm.open(checkpointDir); // throws on a missing/malformed checkpoint
 
+    // ModelOpt checkpoints (qwen35moe) ship an hf_quant_config.json driving the
+    // assembler's per-module scheme lookup. compressed-tensors checkpoints
+    // (Gemma-4 "nvfp4-pack-quantized") keep the quant config inside config.json
+    // and expose no hf_quant_config.json — their materializer resolves every
+    // scale sidecar by explicit name from the raw _tensors map, so the assembled
+    // _weights map is not needed. Tolerate the missing file: upload all tensors,
+    // skip the assembly pass.
     const fs::path quantCfg = dir / "hf_quant_config.json";
-    if (!fs::is_regular_file(quantCfg)) {
-        fail("missing hf_quant_config.json in " + checkpointDir);
-    }
+    const bool haveQuantCfg = fs::is_regular_file(quantCfg);
 
     NvFp4Model out;
-    out._config = modelopt::HfQuantConfig::parse(readTextFile(quantCfg));
+    if (haveQuantCfg) {
+        out._config = modelopt::HfQuantConfig::parse(readTextFile(quantCfg));
+    }
 
     // --- upload every tensor to the device -------------------------------
     for (const safetensors::SafetensorsTensor* t : sm.tensors()) {
@@ -83,7 +90,10 @@ NvFp4Model loadNvfp4Model(const std::string& checkpointDir, DeviceUploader& uplo
         out._tensors.emplace(t->name, std::move(dev));
     }
 
-    // --- assemble + validate every quantised weight ----------------------
+    // --- assemble + validate every quantised weight (ModelOpt only) ------
+    if (!haveQuantCfg) {
+        return out; // compressed-tensors: tensors uploaded, no assembly needed
+    }
     const modelopt::ModelOptWeightAssembler assembler(sm, out._config);
     for (const safetensors::SafetensorsTensor* t : sm.tensors()) {
         if (!endsWith(t->name, ".weight")) {

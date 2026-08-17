@@ -45,9 +45,20 @@ struct MaterializationSource {
     SourceKind    kind;
     std::uint64_t rows;          ///< out-features (or product for passthrough vectors)
     std::uint64_t in;            ///< in-features (1 for a 1-D passthrough)
-    std::uint64_t dstElemOffset; ///< element offset into the GGUF tensor (0 unless stacking)
+    std::uint64_t dstElemOffset = 0; ///< element offset into the GGUF tensor (0 unless stacking)
     std::uint64_t srcElemOffset = 0; ///< element offset INTO the source tensor; only used by
                                      ///< Bf16Copy to slice a fused/stacked HF tensor (0 otherwise)
+    /// NVFP4 scale-sidecar overrides. Empty ⇒ the executor reconstructs the
+    /// ModelOpt names from the weight base (`<base>.weight_scale` /
+    /// `<base>.weight_scale_2`), the qwen35moe convention. compressed-tensors
+    /// Gemma-4 sets them explicitly (`.weight_scale` / `.weight_global_scale`,
+    /// the packed tensor itself being `.weight_packed`).
+    std::string blockScaleName;      ///< NVFP4 per-16 block scale (F8_E4M3)
+    std::string globalScaleName;     ///< NVFP4 per-tensor global scale (F32)
+    /// compressed-tensors stores the global scale as its reciprocal
+    /// (6*448/amax); the dequant kernel MULTIPLIES by the global, so the
+    /// executor inverts it first when set. ModelOpt stores it directly (false).
+    bool globalIsReciprocal = false;
 };
 
 /// One GGUF tensor to build from one or more HF sources.
