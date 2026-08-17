@@ -352,6 +352,10 @@ struct GpuOps::Impl {
     // Decode single-user (M==1) register-staged variant: activation in registers
     // instead of shared memory, removing the MIO/short-scoreboard stall.
     core::cuda::CudaKernel _moeGroupedGemmNvfp4M1RegKernel;
+    // Bragi 5.7 (I0): Marlin-style W4A16 TC decode-MoE-GEMM (own PTX module).
+    // Dequant NVFP4 weight -> shared BF16, wmma 16x16x16, BF16 activations.
+    core::cuda::CudaModule _moeGroupedGemmNvfp4W4a16tcModule;
+    core::cuda::CudaKernel _moeGroupedGemmNvfp4W4a16tcKernel;
     // E-d.4b: padding infra (one module, four kernels) + act-quant.
     core::cuda::CudaModule _moePadModule;
     core::cuda::CudaKernel _moePadOffsetsKernel;
@@ -598,6 +602,11 @@ struct GpuOps::Impl {
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m4")},
           _moeGroupedGemmNvfp4M1RegKernel{
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m1reg")},
+          _moeGroupedGemmNvfp4W4a16tcModule{
+              loadCudaModule(ctx, "moe_grouped_gemm_nvfp4blk_w4a16tc")},
+          _moeGroupedGemmNvfp4W4a16tcKernel{
+              _moeGroupedGemmNvfp4W4a16tcModule.getFunction(
+                  "moe_grouped_gemm_nvfp4blk_w4a16tc")},
           _nvfp4DeintModule{loadCudaModule(ctx, "matmul_nvfp4blk_deint_vec")},
           _nvfp4DeinterleaveKernel{
               _nvfp4DeintModule.getFunction("nvfp4blk_deinterleave")},
@@ -2150,6 +2159,28 @@ void GpuOps::moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
     if (N == 0 || K == 0 || maxTiles == 0) {
         return;
     }
+    // Bragi 5.7 (I0, opt-in MIMIRMIND_MOE_DECODE_W4A16TC): route the decode
+    // grouped GEMM through the Marlin-style BF16 tensor-core kernel. Same
+    // args/schedule; 16 output cols per warp-block (wmma TC_N=16), one warp/block.
+    static const bool w4a16tc =
+        std::getenv("MIMIRMIND_MOE_DECODE_W4A16TC") != nullptr;
+    if (decodeSmallM && w4a16tc) {
+        constexpr std::uint32_t kTcN = 16;
+        const std::uint32_t nGroupsTc =
+            static_cast<std::uint32_t>((N + kTcN - 1) / kTcN);
+        auto& kt = _pimpl->_moeGroupedGemmNvfp4W4a16tcKernel;
+        kt.setPtr  (0, x);
+        kt.setPtr  (1, w);
+        kt.setPtr  (2, y);
+        kt.setPtr  (3, tileExpert);
+        kt.setPtr  (4, tileRow0);
+        kt.setPtr  (5, tileRows);
+        kt.setValue(6, toInt32(K, "moeGroupedGemm W4A16TC K"));
+        kt.setValue(7, toInt32(N, "moeGroupedGemm W4A16TC N"));
+        kt.launch(_ctx.stream(), nGroupsTc,
+                  static_cast<std::uint32_t>(maxTiles), 1, 32, 1, 1);
+        return;
+    }
     // Matches matmul_nvfp4blk_gemm's warp layout: 4 output columns per group,
     // 128 threads/block. grid.x tiles N, grid.y indexes the tile schedule.
     constexpr std::uint32_t kOutputsPerGroup = 4;
@@ -2180,6 +2211,27 @@ void GpuOps::moeGroupedGemmNvfp4M1NBAsync(const float* x, const unsigned char* w
                                           std::size_t K, std::size_t N,
                                           std::size_t maxTiles) {
     if (N == 0 || K == 0 || maxTiles == 0) {
+        return;
+    }
+    // Bragi 5.7 (I0, opt-in): the W4A16 TC kernel also covers the M==1 decode
+    // (its tile handles 1..16 rows) — route it through the tensor-core path too.
+    static const bool w4a16tc =
+        std::getenv("MIMIRMIND_MOE_DECODE_W4A16TC") != nullptr;
+    if (w4a16tc) {
+        constexpr std::uint32_t kTcN = 16;
+        const std::uint32_t nGroupsTc =
+            static_cast<std::uint32_t>((N + kTcN - 1) / kTcN);
+        auto& kt = _pimpl->_moeGroupedGemmNvfp4W4a16tcKernel;
+        kt.setPtr  (0, x);
+        kt.setPtr  (1, w);
+        kt.setPtr  (2, y);
+        kt.setPtr  (3, tileExpert);
+        kt.setPtr  (4, tileRow0);
+        kt.setPtr  (5, tileRows);
+        kt.setValue(6, toInt32(K, "moeGroupedGemmM1NB W4A16TC K"));
+        kt.setValue(7, toInt32(N, "moeGroupedGemmM1NB W4A16TC N"));
+        kt.launch(_ctx.stream(), nGroupsTc,
+                  static_cast<std::uint32_t>(maxTiles), 1, 32, 1, 1);
         return;
     }
     // One output column per warp (4 warps/block), activation staged in registers.
