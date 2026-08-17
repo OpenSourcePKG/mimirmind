@@ -424,6 +424,11 @@ void GpuOps::flush() {
     _queue.flush();
 }
 
+// M8.L (4.5.5) — double-buffered chunked prefill, forwarded to the queue.
+void GpuOps::beginDoubleBufferedPrefill() { _queue.beginDoubleBuffered(); }
+void GpuOps::checkpointPrefill()          { _queue.checkpoint(); }
+void GpuOps::endDoubleBufferedPrefill()   { _queue.endDoubleBuffered(); }
+
 void GpuOps::readbackToHost(void* hostDst, const void* deviceSrc,
                             std::size_t bytes) {
     if (bytes == 0) {

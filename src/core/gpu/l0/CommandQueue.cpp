@@ -59,6 +59,18 @@ CommandQueue::CommandQueue(L0Context& ctx)
 
 CommandQueue::~CommandQueue() {
     resetRecording();
+    // M8.L double-buffer teardown: any in-flight submission must complete
+    // before its list/event is destroyed.
+    for (int i = 0; i < 2; ++i) {
+        if (_dbInFlight[i] && _dbEvent[i] != nullptr) {
+            zeEventHostSynchronize(_dbEvent[i],
+                                   std::numeric_limits<std::uint64_t>::max());
+            _dbInFlight[i] = false;
+        }
+        if (_dbEvent[i] != nullptr) { zeEventDestroy(_dbEvent[i]); _dbEvent[i] = nullptr; }
+        if (_dbList[i]  != nullptr) { zeCommandListDestroy(_dbList[i]); _dbList[i] = nullptr; }
+    }
+    if (_dbPool != nullptr) { zeEventPoolDestroy(_dbPool); _dbPool = nullptr; }
     if (_cmdList != nullptr) {
         zeCommandListDestroy(_cmdList);
         _cmdList = nullptr;
@@ -74,12 +86,11 @@ void CommandQueue::appendLaunch(GpuKernel&    kernel,
                                 std::uint32_t groupCountY,
                                 std::uint32_t groupCountZ) {
     ze_group_count_t groups{groupCountX, groupCountY, groupCountZ};
-    // M-CLR.3: route into the recording list while beginRecord/endRecord
-    // is active. The immediate list stays idle in that case (nothing
-    // touches _hasPending) so a stray flush() during recording is a
-    // no-op, which keeps profiler/diagnostic paths safe.
-    ze_command_list_handle_t target =
-        _recording ? _recordList : _cmdList;
+    // Route into the active double-buffer list (M8.L) when armed, else the
+    // recording list while beginRecord/endRecord is active (M-CLR.3), else the
+    // immediate list. The immediate list stays idle during recording/db so a
+    // stray flush() is a no-op, which keeps profiler/diagnostic paths safe.
+    ze_command_list_handle_t target = currentList();
     ZE_CHECK(zeCommandListAppendLaunchKernel(
         target, kernel.handle(), &groups,
         nullptr, 0, nullptr));
@@ -98,7 +109,9 @@ void CommandQueue::appendLaunch(GpuKernel&    kernel,
         ZE_CHECK(zeCommandListAppendBarrier(target, nullptr, 0, nullptr));
     }
 
-    if (!_recording) {
+    if (_dbActive) {
+        _dbHasPending = true;
+    } else if (!_recording) {
         _hasPending = true;
     }
 }
@@ -115,10 +128,14 @@ void CommandQueue::popUnordered() {
             "CommandQueue::popUnordered without matching pushUnordered");
     }
     --_unorderedDepth;
-    // M-CLR.3: `_hasPending` is only tracked on the immediate list; a
-    // group that ended in a recording emits its trailing barrier there.
+    // The trailing barrier goes onto whichever list is active: the db list
+    // (M8.L), else the recording list (M-CLR.3), else the immediate list.
     if (_unorderedDepth == 0) {
-        if (_recording) {
+        if (_dbActive) {
+            if (_dbHasPending) {
+                ZE_CHECK(zeCommandListAppendBarrier(_dbList[_dbCur], nullptr, 0, nullptr));
+            }
+        } else if (_recording) {
             ZE_CHECK(zeCommandListAppendBarrier(_recordList, nullptr, 0, nullptr));
         } else if (_hasPending) {
             ZE_CHECK(zeCommandListAppendBarrier(_cmdList,    nullptr, 0, nullptr));
@@ -127,9 +144,7 @@ void CommandQueue::popUnordered() {
 }
 
 void CommandQueue::appendBarrier() {
-    ze_command_list_handle_t target =
-        _recording ? _recordList : _cmdList;
-    ZE_CHECK(zeCommandListAppendBarrier(target, nullptr, 0, nullptr));
+    ZE_CHECK(zeCommandListAppendBarrier(currentList(), nullptr, 0, nullptr));
 }
 
 void CommandQueue::appendMemoryCopy(void*       dst,
@@ -138,14 +153,15 @@ void CommandQueue::appendMemoryCopy(void*       dst,
     if (nBytes == 0) {
         return;
     }
-    ze_command_list_handle_t target =
-        _recording ? _recordList : _cmdList;
+    ze_command_list_handle_t target = currentList();
     ZE_CHECK(zeCommandListAppendMemoryCopy(
         target, dst, src, nBytes, nullptr, 0, nullptr));
     if (_unorderedDepth == 0) {
         ZE_CHECK(zeCommandListAppendBarrier(target, nullptr, 0, nullptr));
     }
-    if (!_recording) {
+    if (_dbActive) {
+        _dbHasPending = true;
+    } else if (!_recording) {
         _hasPending = true;
     }
 }
@@ -252,6 +268,122 @@ void CommandQueue::resetRecording() noexcept {
         zeCommandListDestroy(_recordList);
         _recordList = nullptr;
     }
+}
+
+// -- M8.L (4.5.5) — double-buffered chunked submit ----------------------
+
+void CommandQueue::ensureDbResources() {
+    if (_dbPool != nullptr) {
+        return;
+    }
+    ze_event_pool_desc_t pDesc{};
+    pDesc.stype = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
+    pDesc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE; // host waits on completion
+    pDesc.count = 2;                               // one event per db list
+    ze_device_handle_t dev = _ctx.device();
+    ZE_CHECK(zeEventPoolCreate(_ctx.context(), &pDesc, 1, &dev, &_dbPool));
+
+    for (int i = 0; i < 2; ++i) {
+        ze_event_desc_t eDesc{};
+        eDesc.stype  = ZE_STRUCTURE_TYPE_EVENT_DESC;
+        eDesc.index  = static_cast<std::uint32_t>(i);
+        eDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST; // signalled to the host
+        eDesc.wait   = ZE_EVENT_SCOPE_FLAG_HOST;
+        ZE_CHECK(zeEventCreate(_dbPool, &eDesc, &_dbEvent[i]));
+
+        ze_command_list_desc_t lDesc{};
+        lDesc.stype                    = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
+        lDesc.commandQueueGroupOrdinal = _ordinal;
+        lDesc.flags                    = 0;
+        ZE_CHECK(zeCommandListCreate(_ctx.context(), _ctx.device(),
+                                     &lDesc, &_dbList[i]));
+    }
+    MM_LOG_INFO("gpu",
+                "CommandQueue: double-buffer armed (lists={}/{}, host-visible "
+                "event pool)",
+                static_cast<const void*>(_dbList[0]),
+                static_cast<const void*>(_dbList[1]));
+}
+
+void CommandQueue::beginDoubleBuffered() {
+    if (_dbActive) {
+        throw std::logic_error(
+            "CommandQueue::beginDoubleBuffered already armed — call "
+            "endDoubleBuffered first");
+    }
+    if (_recording) {
+        throw std::logic_error(
+            "CommandQueue::beginDoubleBuffered while recording — exclusive with "
+            "beginRecord");
+    }
+    if (_hasPending) {
+        throw std::logic_error(
+            "CommandQueue::beginDoubleBuffered while immediate work is pending — "
+            "call flush() first");
+    }
+    ensureDbResources();
+    _dbCur        = 0;
+    _dbHasPending = false;
+    _dbInFlight[0] = _dbInFlight[1] = false;
+    _dbActive     = true;
+}
+
+void CommandQueue::checkpoint() {
+    if (!_dbActive) {
+        throw std::logic_error(
+            "CommandQueue::checkpoint outside beginDoubleBuffered");
+    }
+    const int cur = _dbCur;
+    if (_dbHasPending) {
+        // A trailing barrier that SIGNALS this list's completion event: it both
+        // makes all writes globally visible and fires the event when the list
+        // finishes. Then submit async (no fence, no queue sync).
+        ZE_CHECK(zeCommandListAppendBarrier(_dbList[cur], _dbEvent[cur], 0, nullptr));
+        ZE_CHECK(zeCommandListClose(_dbList[cur]));
+        ZE_CHECK(zeCommandQueueExecuteCommandLists(_queue, 1, &_dbList[cur], nullptr));
+        _dbInFlight[cur] = true;
+        _dbHasPending    = false;
+    }
+    // Swap to the other list. If it still has an outstanding submission, wait on
+    // ONLY its event (never the whole queue) before recycling its buffer — this
+    // is what bounds in-flight work to two lists without the pathological
+    // mid-workload zeCommandQueueSynchronize.
+    const int nxt = 1 - cur;
+    if (_dbInFlight[nxt]) {
+        ZE_CHECK(zeEventHostSynchronize(_dbEvent[nxt],
+                                        std::numeric_limits<std::uint64_t>::max()));
+        ZE_CHECK(zeEventHostReset(_dbEvent[nxt]));
+        ZE_CHECK(zeCommandListReset(_dbList[nxt]));
+        _dbInFlight[nxt] = false;
+    }
+    _dbCur = nxt;
+}
+
+void CommandQueue::endDoubleBuffered() {
+    if (!_dbActive) {
+        return;
+    }
+    if (_dbHasPending) {
+        const int cur = _dbCur;
+        ZE_CHECK(zeCommandListAppendBarrier(_dbList[cur], _dbEvent[cur], 0, nullptr));
+        ZE_CHECK(zeCommandListClose(_dbList[cur]));
+        ZE_CHECK(zeCommandQueueExecuteCommandLists(_queue, 1, &_dbList[cur], nullptr));
+        _dbInFlight[cur] = true;
+        _dbHasPending    = false;
+    }
+    // One final drain of the ≤2 in-flight lists.
+    for (int i = 0; i < 2; ++i) {
+        if (_dbInFlight[i]) {
+            ZE_CHECK(zeEventHostSynchronize(_dbEvent[i],
+                                            std::numeric_limits<std::uint64_t>::max()));
+            ZE_CHECK(zeEventHostReset(_dbEvent[i]));
+            ZE_CHECK(zeCommandListReset(_dbList[i]));
+            _dbInFlight[i] = false;
+        }
+    }
+    _dbActive     = false;
+    _dbCur        = 0;
+    _dbHasPending = false;
 }
 
 } // namespace mimirmind::runtime

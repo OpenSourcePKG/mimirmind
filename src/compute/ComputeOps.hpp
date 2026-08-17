@@ -972,6 +972,23 @@ public:
     /// hold `ComputeOps&`.
     virtual void flush() = 0;
 
+    // -- M8.L (4.5.5) — double-buffered chunked prefill submit ---------
+    //
+    // Bound the in-flight command work of a long prefill WITHOUT the
+    // per-block full-queue sync that flush() does (pathologically slow
+    // mid-workload on Xe-LPG). The long-prefill loop wraps its blocks with
+    // beginDoubleBufferedPrefill() ... checkpointPrefill() per block ...
+    // endDoubleBufferedPrefill(); on L0 these route through the
+    // CommandQueue double-buffer (submit + swap + wait-on-one-event). Every
+    // other backend keeps its own stream semantics — these default to
+    // no-ops, so the caller can invoke them backend-neutrally.
+    virtual void beginDoubleBufferedPrefill() {}
+    virtual void checkpointPrefill()          {}
+    virtual void endDoubleBufferedPrefill()   {}
+    /// True if this backend implements the double-buffered prefill path
+    /// (only the L0 backend does today).
+    [[nodiscard]] virtual bool supportsDoubleBufferedPrefill() const { return false; }
+
     /// Lightweight decode-step self-profiler (MIMIRMIND_DECODE_PROFILE).
     /// `profileSection(name)` closes the previous timed section and opens a new
     /// one named `name` on the compute stream; `profileStepEnd()` closes the

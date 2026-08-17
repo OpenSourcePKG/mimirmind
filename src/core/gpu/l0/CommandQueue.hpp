@@ -161,7 +161,59 @@ public:
     /// implicitly by the destructor. Idempotent.
     void resetRecording() noexcept;
 
+    // -- M8.L (4.5.5) — double-buffered chunked submit ------------------
+    //
+    // The single-list flush() ends every chunk with a full-queue
+    // zeCommandQueueSynchronize — a host-spin that is pathologically slow
+    // mid-workload on Xe-LPG (a single mid-workload flush was measured at
+    // ~6.5 s). Long prefills that submit one un-synced list hang above
+    // ~290-334 tokens because the un-synced GPU work of one submission grows
+    // unbounded. Double-buffered submit bounds the in-flight work to at most
+    // TWO command lists WITHOUT the mid-workload full-queue sync:
+    //
+    //   beginDoubleBuffered();
+    //   for (each prefill block) {
+    //     ...appendLaunch/appendMemoryCopy...   // routed into the active list
+    //     checkpoint();   // close+execute active list w/ signal event, swap to
+    //                     // the other list; wait ONLY on that list's own event
+    //                     // (not the whole queue) before reusing its buffer
+    //   }
+    //   endDoubleBuffered();   // one final drain of the ≤2 in-flight lists
+    //
+    // While active, appendLaunch/appendMemoryCopy/appendBarrier route into the
+    // active double-buffer list. Exclusive with recording (beginRecord). The
+    // classic flush()/dispatch path is unchanged and remains the default.
+
+    /// Arm double-buffered chunked submission. Lazily creates the event pool,
+    /// the two command lists and their completion events. The immediate list
+    /// must be idle (flush() first) and recording must be inactive.
+    void beginDoubleBuffered();
+
+    /// Close the active double-buffer list, execute it on the queue signalling
+    /// its completion event, then swap to the other list — waiting only on
+    /// THAT list's prior event (host-sync on one event, never the whole queue)
+    /// before reusing its buffer. Bounds in-flight work to two submissions.
+    void checkpoint();
+
+    /// Flush the trailing partial list (if any) and host-wait on every
+    /// in-flight double-buffer event, then disarm. Exactly one drain at the end.
+    void endDoubleBuffered();
+
+    /// True while beginDoubleBuffered() is armed (before endDoubleBuffered()).
+    [[nodiscard]] bool isDoubleBuffered() const noexcept { return _dbActive; }
+
 private:
+    /// The list appendLaunch/appendMemoryCopy/appendBarrier currently target:
+    /// the active double-buffer list when armed, else the recording list while
+    /// recording, else the immediate list.
+    [[nodiscard]] ze_command_list_handle_t currentList() const noexcept {
+        if (_dbActive) return _dbList[_dbCur];
+        return _recording ? _recordList : _cmdList;
+    }
+
+    /// Lazily create the shared 2-slot host-visible event pool. Idempotent.
+    void ensureDbResources();
+
     L0Context&                _ctx;
     ze_command_queue_handle_t _queue         {nullptr};
     ze_command_list_handle_t  _cmdList       {nullptr};
@@ -172,6 +224,15 @@ private:
     bool                      _recording     {false};
     bool                      _recordingReady{false};
     std::size_t               _dispatchCount {0};
+
+    // M8.L double-buffer state.
+    ze_event_pool_handle_t    _dbPool        {nullptr};
+    ze_command_list_handle_t  _dbList[2]     {nullptr, nullptr};
+    ze_event_handle_t         _dbEvent[2]    {nullptr, nullptr};
+    bool                      _dbInFlight[2] {false, false};
+    int                       _dbCur         {0};
+    bool                      _dbActive      {false};
+    bool                      _dbHasPending  {false};   ///< work appended to the active list since last checkpoint
 };
 
 /// RAII helper around pushUnordered() / popUnordered(). Construct a

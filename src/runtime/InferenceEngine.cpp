@@ -1287,10 +1287,33 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         constexpr std::size_t kPrefillDrainThreshold = 256;
         const bool drainPerBlock = prefillCount > kPrefillDrainThreshold;
 
+        // M8.L (4.5.5): opt-in double-buffered chunked prefill on L0. Instead
+        // of the per-block full-queue flush() (a mid-workload
+        // zeCommandQueueSynchronize — pathologically slow on Xe-LPG, a single
+        // mid-workload flush measured ~6.5 s), each block ends
+        // with a checkpoint() that submits the built list async and waits only
+        // on the OTHER list's own event — bounding in-flight work to two lists
+        // without the host-spin. Env-gated (default OFF = the safe ace27e8
+        // per-block drain, zero regression) until bit-parity + the on-NUC T_k
+        // sweep validate it. Relies on runBlock() not doing host readbacks
+        // mid-prefill — which it does not (that un-synced accumulation is
+        // exactly what makes the wedge); the bit-parity gate catches any model
+        // that would violate it.
+        static const bool kPrefillDbuf =
+            std::getenv("MIMIRMIND_L0_PREFILL_DBUF") != nullptr;
+        const bool useDbuf = drainPerBlock && kPrefillDbuf
+                          && _ops->supportsDoubleBufferedPrefill();
+        if (useDbuf) {
+            _ops->flush();                     // land prepareForward's pending work
+            _ops->beginDoubleBufferedPrefill();
+        }
+
         for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
             _backend->runBlock(b, xBuf, prefillCount, cache, buffers,
                                _traceBlock0);
-            if (drainPerBlock) {
+            if (useDbuf) {
+                _ops->checkpointPrefill();     // async submit + bounded 2-in-flight
+            } else if (drainPerBlock) {
                 _ops->flush();
             }
             if (onPrefillProgress) {
@@ -1312,6 +1335,13 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                     break;
                 }
             }
+        }
+
+        // M8.L: drain + disarm the double buffer once (both normal exit and
+        // the client-cancel break above) so the immediate list is idle again
+        // before the timing read, KV commit and the decode loop.
+        if (useDbuf) {
+            _ops->endDoubleBufferedPrefill();
         }
 
         // Compute the elapsed prefill time regardless of abort so the

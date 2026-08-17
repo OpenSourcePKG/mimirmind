@@ -470,6 +470,11 @@ public:
     void popUnorderedScope()  override;
     void appendMemoryCopy(void* dst, const void* src, std::size_t bytes) override;
     void flush() override;
+    // M8.L (4.5.5) — double-buffered chunked prefill, forwarded to _queue.
+    void beginDoubleBufferedPrefill() override;
+    void checkpointPrefill()          override;
+    void endDoubleBufferedPrefill()   override;
+    [[nodiscard]] bool supportsDoubleBufferedPrefill() const override { return true; }
     void readbackToHost(void* hostDst, const void* deviceSrc,
                         std::size_t bytes) override;
 
