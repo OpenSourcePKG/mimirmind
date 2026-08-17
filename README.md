@@ -209,7 +209,7 @@ that compiled + probes available).
 |---|---|---|---|
 | **Level Zero** | Intel Xe-LPG (Meteor Lake iGPU, primary target) | production | F32 / F16 / BF16 + all quant matmuls (Q4_K / Q5_K / Q5_0 / Q6_K / Q8_0), flash prefill, DP4A, Command-List Replay |
 | **HIP / ROCm** | AMD RDNA3 (`gfx1101`, RX 7800 XT bring-up rig) | end-to-end `loadModel` proven on Qwen 2.5 (Schicht 6.0, 2026-07-17). Q8_0 native, non-Q8_0 dispatch through a CPU-fallback (Schicht 6.1) using the reference dequant paths — correctness first, native Q4_K / Q5_0 / Q6_K kernels on the follow-up roadmap | Q8_0 GPU + CPU-fallback for the rest |
-| **CUDA** | NVIDIA Blackwell (GB10 on DGX Spark — serving-class **Bragi** target) | bring-up. **Qwen3-Next 35B-A3B** hybrid MoE (`qwen35moe`: full-attention + Gated DeltaNet linear attention + MoE) generates coherent text end-to-end on GB10. The batched-decode kernel axis — per-sequence recurrent state, per-token MoE routing, ragged flash-decode attention — is implemented and parity-verified bit-for-bit against the single-sequence path. PagedAttention + continuous-batching scheduler for multi-tenant serving in progress | F32 + Q4_K / Q5_K / Q6_K / Q8_0, GatedDeltaNet (AR + chunked prefill), fused-K MoE, flash decode |
+| **CUDA** | NVIDIA Blackwell (GB10 on DGX Spark — serving-class **Bragi** target) | bring-up. **Qwen3.5-MoE** (release name Qwen3.6-35B-A3B; HF `model_type: qwen3_5_moe`, arch `Qwen3_5MoeForConditionalGeneration`) hybrid MoE — internal arch id `qwen35moe`: full-attention + Gated DeltaNet linear attention + MoE — generates coherent text end-to-end on GB10. The batched-decode kernel axis — per-sequence recurrent state, per-token MoE routing, ragged flash-decode attention — is implemented and parity-verified bit-for-bit against the single-sequence path. PagedAttention + continuous-batching scheduler for multi-tenant serving in progress | F32 + Q4_K / Q5_K / Q6_K / Q8_0, GatedDeltaNet (AR + chunked prefill), fused-K MoE, flash decode |
 | **CPU** | any x86-64 / ARM64 Linux | reference / fallback / oracle. Full `ComputeOps` interface for F32 KV cache (Qwen 2.5, Gemma 4 baseline); FP16 / Q8_0 KV, DP4A, MoE fused-K throw NotImplemented by design — those are hardware-specific fast paths with no CPU analogue worth writing before there's a perf target | scalar C++ (no SIMD yet), always compiled in |
 
 Level Zero is the Mimir-1.0 production target and where the single-user
@@ -241,8 +241,9 @@ non-blocking decode loop. Removes the request mutex.
 LPDDR5x). Where Mimir-1.0 is single-user on the Intel iGPU, Bragi is
 multi-tenant (≥64 concurrent chats) on CUDA, with NVFP4 weights and
 native Multi-Token-Prediction speculative decoding. Bring-up is live:
-the **Qwen3-Next 35B-A3B** hybrid model (`qwen35moe` — full-attention +
-Gated DeltaNet linear attention + MoE) generates coherent text
+the **Qwen3.5-MoE** hybrid model (release Qwen3.6-35B-A3B, HF
+`model_type: qwen3_5_moe`; internal arch id `qwen35moe` — full-attention
++ Gated DeltaNet linear attention + MoE) generates coherent text
 end-to-end on GB10, and the PagedAttention + continuous-batching
 scheduler is landing. The full batched-decode kernel axis (per-sequence
 recurrent state, per-token MoE routing, ragged flash-decode attention)
