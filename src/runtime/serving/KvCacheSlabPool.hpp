@@ -11,6 +11,7 @@
 #include <vector>
 
 namespace mimirmind::compute { class ComputeOps; }
+namespace mimirmind::runtime::arch { class ArchBackend; }
 
 namespace mimirmind::runtime::serving {
 
@@ -52,6 +53,27 @@ public:
                     std::vector<std::size_t>  kvDimPerLayer,
                     std::vector<std::size_t>  kvSourceLayer = {},
                     KvDtype                   dtype = KvDtype::F32);
+
+    /**
+     * Build a slab pool from a backend's NEUTRAL geometry — the only KV
+     * information the L0 batched-decode path needs, all read through the
+     * `ArchBackend` base interface (no `dynamic_cast` to a concrete arch):
+     *   - `backend.kvDimPerLayer()`        → per-layer KV width (Gemma 4
+     *     SWA/full split comes through verbatim),
+     *   - `backend.kvSourceLayerPerLayer()`→ shared-KV aliasing (E4B).
+     *
+     * Throws `std::invalid_argument` if the backend does NOT implement the
+     * neutral batched-decode kernel (`supportsBatchedDecode() == false`) —
+     * the slab pool would be unusable without it. Today that means
+     * Gemma 4 MoE qualifies; gemma4-dense / E4B / Qwen2 each need their own
+     * `runBlockBatched` first (M9.1 follow-up).
+     */
+    [[nodiscard]] static std::unique_ptr<KvCacheSlabPool> forBackend(
+        compute::ComputeOps&           ops,
+        const arch::ArchBackend&       backend,
+        std::size_t                    maxBatch,
+        std::size_t                    contextCap,
+        KvDtype                        dtype = KvDtype::F32);
 
     KvCacheSlabPool(const KvCacheSlabPool&)            = delete;
     KvCacheSlabPool& operator=(const KvCacheSlabPool&) = delete;

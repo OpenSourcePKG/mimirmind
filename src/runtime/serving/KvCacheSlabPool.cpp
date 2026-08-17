@@ -3,11 +3,36 @@
 
 #include "runtime/serving/KvCacheSlabPool.hpp"
 
+#include "runtime/arch/ArchBackend.hpp"
+
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 namespace mimirmind::runtime::serving {
+
+std::unique_ptr<KvCacheSlabPool> KvCacheSlabPool::forBackend(
+    compute::ComputeOps&     ops,
+    const arch::ArchBackend& backend,
+    std::size_t              maxBatch,
+    std::size_t              contextCap,
+    KvDtype                  dtype)
+{
+    if (!backend.supportsBatchedDecode()) {
+        throw std::invalid_argument(
+            std::string("KvCacheSlabPool::forBackend: backend '") +
+            backend.name() +
+            "' does not implement the neutral batched-decode kernel "
+            "(supportsBatchedDecode() == false) — cannot serve concurrent "
+            "decode from a slab pool");
+    }
+    // Neutral geometry only — no cast to a concrete arch backend.
+    return std::make_unique<KvCacheSlabPool>(
+        ops, maxBatch, contextCap,
+        backend.kvDimPerLayer(),
+        backend.kvSourceLayerPerLayer(),
+        dtype);
+}
 
 KvCacheSlabPool::KvCacheSlabPool(compute::ComputeOps&     ops,
                                  std::size_t              maxBatch,
