@@ -25,7 +25,7 @@
 #include "runtime/thermal/SystemMonitor.hpp"
 #include "runtime/thermal/ThermalGuard.hpp"
 #include "runtime/arch/ArchBackend.hpp"
-#include "runtime/arch/Qwen35MoeBackend.hpp"
+#include "runtime/arch/Qwen3_5MoeBackend.hpp"
 #include "runtime/serving/PagedKvPool.hpp"
 
 #ifdef MIMIRMIND_HAVE_HIP
@@ -40,11 +40,11 @@
 #include "compute/cuda/CudaMaterializerOps.hpp"
 #include "core/gpu/cuda/CudaComputeContext.hpp"
 #include "core/modelopt/HfQuantConfig.hpp"
-#include "core/modelopt/Qwen35MoeMaterializer.hpp"
+#include "core/modelopt/Qwen3_5MoeMaterializer.hpp"
 #include "core/safetensors/SafetensorsModel.hpp"
 #include "runtime/nvfp4/ComputeOpsUploader.hpp"
 #include "runtime/nvfp4/NvFp4WeightsMap.hpp"
-#include "runtime/nvfp4/Qwen35MoeConfig.hpp"
+#include "runtime/nvfp4/Qwen3_5MoeConfig.hpp"
 #include <filesystem>
 #include <sstream>
 #endif
@@ -1143,7 +1143,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     // the linear layers hold a running recurrence whose value at position `lcp`
     // depends on every token in [0, lcp), and that state lives outside the KV
     // cache. Worse, the per-block seq-start zero fires on `cache.length() == 0`
-    // (see Qwen35MoeBackend::runLinearBlock) — a non-zero prefix leaves the KV
+    // (see Qwen3_5MoeBackend::runLinearBlock) — a non-zero prefix leaves the KV
     // length at `lcp`, so the SSM state is never zeroed and carries over from
     // the previous request, degrading generation on every call after the first.
     // Force a full prefill (lcp = 0) so the recurrence replays from a zeroed
@@ -2285,7 +2285,7 @@ bool InferenceEngine::mtpAvailable() const noexcept {
     if (_config.nextnPredictLayers == 0 || !_weights.has_value()) {
         return false;
     }
-    if (dynamic_cast<arch::Qwen35MoeBackend*>(_backend.get()) == nullptr) {
+    if (dynamic_cast<arch::Qwen3_5MoeBackend*>(_backend.get()) == nullptr) {
         return false;
     }
     return _weights->findBlock(_config.blockCount, "nextn.eh_proj.weight") != nullptr;
@@ -2309,7 +2309,7 @@ bool InferenceEngine::dflashAvailable() const noexcept {
     if (!_weights.has_value()) {
         return false;
     }
-    if (dynamic_cast<arch::Qwen35MoeBackend*>(_backend.get()) == nullptr) {
+    if (dynamic_cast<arch::Qwen3_5MoeBackend*>(_backend.get()) == nullptr) {
         return false;
     }
     // Needs a borrowable embed + lm_head (tied embeddings are fine).

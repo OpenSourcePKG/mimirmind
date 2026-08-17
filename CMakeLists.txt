@@ -373,8 +373,8 @@ add_library(mimirmind_core_common STATIC
     src/core/modelopt/ModelOptWeightLayout.cpp
     src/core/modelopt/ModelOptWeightAssembler.cpp
     src/core/modelopt/NvFp4Reference.cpp
-    src/core/modelopt/Qwen35MoeGgufMap.cpp
-    src/core/modelopt/Qwen35MoeMaterializer.cpp
+    src/core/modelopt/Qwen3_5MoeGgufMap.cpp
+    src/core/modelopt/Qwen3_5MoeMaterializer.cpp
     src/core/modelopt/Gemma4Materializer.cpp
     src/core/safetensors/SafetensorsDtype.cpp
     src/core/safetensors/SafetensorsHeader.cpp
@@ -396,7 +396,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/nvfp4/NvFp4Model.cpp
     src/runtime/nvfp4/NvFp4Materializer.cpp
     src/runtime/nvfp4/NvFp4WeightsMap.cpp
-    src/runtime/nvfp4/Qwen35MoeConfig.cpp
+    src/runtime/nvfp4/Qwen3_5MoeConfig.cpp
     src/runtime/nvfp4/Gemma4Config.cpp
     src/runtime/nvfp4/ModelFormatResolver.cpp
     src/runtime/encoder/EncoderModel.cpp
@@ -1218,7 +1218,7 @@ add_executable(mimirmind
     src/runtime/arch/Gemma4E4BBackend.cpp
     src/runtime/arch/Gemma4MoeBackend.cpp
     src/runtime/arch/Qwen2Backend.cpp
-    src/runtime/arch/Qwen35MoeBackend.cpp
+    src/runtime/arch/Qwen3_5MoeBackend.cpp
     src/server/ApiHelpers.cpp
     src/server/ApiServer.cpp
     src/server/ChatCompletionHandler.cpp

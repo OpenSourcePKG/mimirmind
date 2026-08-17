@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "core/modelopt/Qwen35MoeMaterializer.hpp"
+#include "core/modelopt/Qwen3_5MoeMaterializer.hpp"
 
 #include "core/modelopt/ModelOptQuant.hpp"
-#include "core/modelopt/Qwen35MoeGgufMap.hpp"
+#include "core/modelopt/Qwen3_5MoeGgufMap.hpp"
 #include "core/safetensors/SafetensorsModel.hpp"
 
 #include <stdexcept>
@@ -182,9 +182,9 @@ void addFusedStack(std::vector<MaterializationStep>& steps,
 } // namespace
 
 std::vector<MaterializationStep>
-planQwen35MoeMaterialization(const st::SafetensorsModel& model,
+planQwen3_5MoeMaterialization(const st::SafetensorsModel& model,
                              const HfQuantConfig&        cfg,
-                             const Qwen35MoeArch&        arch) {
+                             const Qwen3_5MoeArch&        arch) {
     std::vector<MaterializationStep> steps;
 
     // --- model-level ------------------------------------------------------
@@ -216,7 +216,7 @@ planQwen35MoeMaterialization(const st::SafetensorsModel& model,
     // --- MTP (nextn) head, as GGUF block index numLayers ------------------
     // A full-attention + MoE transformer block (mtp.layers.0.*) plus the four
     // nextn.* projections (mtp.fc / mtp.pre_fc_norm_* / mtp.norm). The backend
-    // (Qwen35MoeBackend::runMtpBlock) addresses it at block index blockCount.
+    // (Qwen3_5MoeBackend::runMtpBlock) addresses it at block index blockCount.
     if (arch.mtpLayers > 0) {
         const std::string blk = "blk." + std::to_string(arch.numLayers) + ".";
         for (const auto& t : qwen35moeNextnTensors()) {

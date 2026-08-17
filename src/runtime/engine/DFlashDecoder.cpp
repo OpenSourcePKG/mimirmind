@@ -6,7 +6,7 @@
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/KvCache.hpp"
 #include "runtime/SsmState.hpp"
-#include "runtime/arch/Qwen35MoeBackend.hpp"
+#include "runtime/arch/Qwen3_5MoeBackend.hpp"
 #include "runtime/dflash/DFlashDraftRunner.hpp"
 #include "compute/ComputeMatmul.hpp"
 #include "compute/Embedding.hpp"
@@ -119,7 +119,7 @@ void DFlashDecoder::ensureLoaded(std::string_view drafterDir) {
     // accepted prefix instead of re-forwarding the trunk.
     _foldMode = std::getenv("MIMIRMIND_DFLASH_FOLD") != nullptr;
     if (_foldMode) {
-        auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+        auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
         if (qb == nullptr) {
             _foldMode = false;
         } else {
@@ -175,7 +175,7 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
                         std::size_t maxNew, std::size_t draftN,
                         std::int32_t eosId, std::string_view drafterDir,
                         std::size_t* draftedOut, std::size_t* acceptedOut) {
-    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
     if (qb == nullptr) {
         throw std::runtime_error("generateDflash: requires CUDA qwen35moe target");
     }
@@ -436,7 +436,7 @@ DFlashDecoder::generate(std::span<const std::int32_t> promptIds,
 
 std::int32_t DFlashDecoder::buildPromptContext(
         std::span<const std::int32_t> prompt, std::size_t& promptLen) {
-    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
     if (qb == nullptr) {
         throw std::runtime_error("buildPromptContext: requires CUDA qwen35moe target");
     }

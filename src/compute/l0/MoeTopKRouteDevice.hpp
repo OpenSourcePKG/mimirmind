@@ -29,7 +29,7 @@ namespace mimirmind::compute::l0 {
  *
  * This is the primary path for the 100 tok/s NUC target (Meteor Lake,
  * Xe-LPG): it replaces the host `compute::moeTopKRoute` + host->USM copy
- * (`Qwen35MoeBackend.cpp:516,579`), the per-layer host round trip that keeps
+ * (`Qwen3_5MoeBackend.cpp:516,579`), the per-layer host round trip that keeps
  * decode launch-bound — the precondition for Command-List-Replay capture.
  *
  * Immovable (holds a non-movable GpuModule); a direct member / local only.

@@ -6,7 +6,7 @@
 // (compute/GatedDeltaNet) on random inputs and asserts they agree. Built
 // and run only on a CUDA host (MIMIRMIND_ENABLE_CUDA); this is the
 // correctness gate the box build exercises before the kernels get wired
-// into the Qwen35MoeBackend recurrent path.
+// into the Qwen3_5MoeBackend recurrent path.
 
 #include "TestFramework.hpp"
 

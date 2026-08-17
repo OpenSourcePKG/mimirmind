@@ -4,7 +4,7 @@
 #pragma once
 
 #include "compute/ComputeBuffer.hpp"
-#include "core/modelopt/Qwen35MoeMaterializer.hpp"
+#include "core/modelopt/Qwen3_5MoeMaterializer.hpp"
 #include "runtime/nvfp4/NvFp4Model.hpp"
 
 #include <cstddef>

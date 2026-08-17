@@ -13,12 +13,12 @@
 #include "core/modelopt/BlockScaleSwizzle.hpp"
 #include "core/modelopt/Gemma4Materializer.hpp"
 #include "core/modelopt/HfQuantConfig.hpp"
-#include "core/modelopt/Qwen35MoeMaterializer.hpp"
+#include "core/modelopt/Qwen3_5MoeMaterializer.hpp"
 #include "core/safetensors/SafetensorsModel.hpp"
 #include "runtime/nvfp4/ComputeOpsUploader.hpp"
 #include "runtime/nvfp4/Gemma4Config.hpp"
 #include "runtime/nvfp4/NvFp4WeightsMap.hpp"
-#include "runtime/nvfp4/Qwen35MoeConfig.hpp"
+#include "runtime/nvfp4/Qwen3_5MoeConfig.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -160,7 +160,7 @@ void Nvfp4Loader::load(InferenceEngine& e,
     }
 
     // 1. Arch params from config.json (GGUF-metadata parse is GGUF-only).
-    e._config = runtime::nvfp4::parseQwen35MoeSafetensorsConfig(configText);
+    e._config = runtime::nvfp4::parseQwen3_5MoeSafetensorsConfig(configText);
 
     // 2. Tokenizer. NVFP4 checkpoints ship no GGUF tokenizer, so by default
     //    parse the checkpoint's HF tokenizer.json directly (byte-level BPE,
@@ -190,13 +190,13 @@ void Nvfp4Loader::load(InferenceEngine& e,
     const core::modelopt::HfQuantConfig hfCfg =
         core::modelopt::HfQuantConfig::parse(
             readText(std::filesystem::path{dir} / "hf_quant_config.json"));
-    const core::modelopt::Qwen35MoeArch arch{
+    const core::modelopt::Qwen3_5MoeArch arch{
         static_cast<int>(e._config.blockCount),
         static_cast<int>(e._config.expertCount),
         4 /* full_attention_interval; layer_types agrees for this model */,
         static_cast<int>(e._config.nextnPredictLayers) /* MTP head blocks */};
     const std::vector<core::modelopt::MaterializationStep> steps =
-        core::modelopt::planQwen35MoeMaterialization(sm, hfCfg, arch);
+        core::modelopt::planQwen3_5MoeMaterialization(sm, hfCfg, arch);
 
     // 5. Dequantise every weight to BF16 on device (weight-only W4A16).
     auto& cudaCtx = static_cast<core::cuda::CudaComputeContext&>(*e._computeCtx);

@@ -78,7 +78,7 @@ struct MaterializationStep {
 };
 
 /// Architecture parameters needed to walk the layers (from config.json).
-struct Qwen35MoeArch {
+struct Qwen3_5MoeArch {
     int numLayers          = 40;
     int numExperts         = 256;
     int fullAttnInterval   = 4;
@@ -100,8 +100,8 @@ struct Qwen35MoeArch {
  * checkpoint (a truncated/mismatched model), naming it.
  */
 [[nodiscard]] std::vector<MaterializationStep>
-planQwen35MoeMaterialization(const safetensors::SafetensorsModel& model,
+planQwen3_5MoeMaterialization(const safetensors::SafetensorsModel& model,
                              const HfQuantConfig&                 cfg,
-                             const Qwen35MoeArch&                 arch);
+                             const Qwen3_5MoeArch&                 arch);
 
 } // namespace mimirmind::core::modelopt

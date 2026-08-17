@@ -34,7 +34,7 @@ namespace mimirmind::runtime::engine {
  *
  * DFlash-specific mechanics vs MTP:
  *   - The draft conditions on the TARGET hidden states at the 8 tap layers
- *     {1,6,11,16,22,27,32,37}, captured via Qwen35MoeBackend::configureHiddenTap
+ *     {1,6,11,16,22,27,32,37}, captured via Qwen3_5MoeBackend::configureHiddenTap
  *     (Phase 2). Each forwardVerify writes the tap sinks position-major at the
  *     absolute committed positions; feedContext() concatenates the 8 sinks per
  *     position into `_ctxHidden` (the [ctxLen, taps*hidden] the runner wants).
@@ -149,7 +149,7 @@ private:
     // GDN ReplaySSM (MIMIRMIND_DFLASH_FOLD): replace the partial-accept
     // re-forward with a fold of the accepted prefix. Per-recurrent-block capture
     // rings of the verify window's recurrence inputs + conv input, filled by
-    // Qwen35MoeBackend during forwardVerify.
+    // Qwen3_5MoeBackend during forwardVerify.
     bool                                _foldMode{false};
     std::vector<std::size_t>            _recurBlocks;   // recurrent block indices
     std::size_t _hV{0}, _sState{0}, _convDim{0}, _convStateElems{0};

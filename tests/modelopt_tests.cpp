@@ -12,7 +12,7 @@
 #include "core/modelopt/HfQuantConfig.hpp"
 #include "core/modelopt/ModelOptQuant.hpp"
 #include "core/modelopt/ModelOptWeightLayout.hpp"
-#include "core/modelopt/Qwen35MoeGgufMap.hpp"
+#include "core/modelopt/Qwen3_5MoeGgufMap.hpp"
 #include "core/safetensors/SafetensorsHeader.hpp"
 
 #include <cmath>
@@ -491,7 +491,7 @@ TEST(dequant_fp8_weight) {
 }
 
 // =======================================================================
-// Qwen35MoeGgufMap — HF<->GGUF name mapping (verified vs the running GGUF)
+// Qwen3_5MoeGgufMap — HF<->GGUF name mapping (verified vs the running GGUF)
 // =======================================================================
 
 namespace {

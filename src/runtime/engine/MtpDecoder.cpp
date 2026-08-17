@@ -7,7 +7,7 @@
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
 #include "runtime/SsmState.hpp"
-#include "runtime/arch/Qwen35MoeBackend.hpp"
+#include "runtime/arch/Qwen3_5MoeBackend.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -19,7 +19,7 @@ MtpDecoder::generate(std::span<const std::int32_t> promptIds,
                      std::size_t maxNew, std::size_t mtpDepth,
                      std::int32_t eosId,
                      std::size_t* draftedOut, std::size_t* acceptedOut) {
-    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
     if (qb == nullptr || !_e.mtpAvailable()) {
         throw std::runtime_error("generateMtp: requires CUDA qwen35moe + MTP head");
     }

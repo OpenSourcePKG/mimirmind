@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "runtime/arch/Qwen35MoeBackend.hpp"
+#include "runtime/arch/Qwen3_5MoeBackend.hpp"
 
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
@@ -63,7 +63,7 @@ requireBlock(const core::gguf::WeightsMap& w, std::size_t blockIdx,
     const auto* t = w.findBlock(blockIdx, suffix);
     if (t == nullptr) {
         throw std::runtime_error(
-            "Qwen35MoeBackend: block " + std::to_string(blockIdx) +
+            "Qwen3_5MoeBackend: block " + std::to_string(blockIdx) +
             " missing tensor '" + std::string(suffix) + "'");
     }
     return *t;
@@ -90,7 +90,7 @@ pickDense(const core::gguf::WeightsMap& w, std::size_t blockIdx,
 
 } // namespace
 
-Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
+Qwen3_5MoeBackend::Qwen3_5MoeBackend(const model::LlmConfig&       config,
                                    const core::gguf::WeightsMap& weights,
                                    const model::FusedQkvWeights* fusedQkv,
                                    compute::ComputeOps&          ops,
@@ -222,7 +222,7 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
         }
     }
     MM_LOG_INFO("qwen35moe",
-                "Qwen35MoeBackend ready — blocks={} ({} full / {} linear) "
+                "Qwen3_5MoeBackend ready — blocks={} ({} full / {} linear) "
                 "d_model={} heads={} kv={} head_dim={} experts={}/{} "
                 "ff_exp={} ff_shexp={} sections=[{},{},{},{}]",
                 _config.blockCount, _config.blockCount - recurrent, recurrent,
@@ -240,7 +240,7 @@ Qwen35MoeBackend::Qwen35MoeBackend(const model::LlmConfig&       config,
     }
 }
 
-std::vector<std::size_t> Qwen35MoeBackend::kvDimPerLayer() const {
+std::vector<std::size_t> Qwen3_5MoeBackend::kvDimPerLayer() const {
     // Full-attention layers own a KV cache of nKvHeads*headDim. The
     // recurrent (GatedDeltaNet) layers keep an SSM state instead of KV;
     // M-Q3N.2 sizes them the same (unused) and M-Q3N.3 replaces that with
@@ -249,17 +249,17 @@ std::vector<std::size_t> Qwen35MoeBackend::kvDimPerLayer() const {
     return std::vector<std::size_t>(_config.blockCount, kvDim);
 }
 
-std::pair<std::size_t, std::size_t> Qwen35MoeBackend::maxQKVDims() const {
+std::pair<std::size_t, std::size_t> Qwen3_5MoeBackend::maxQKVDims() const {
     const std::size_t qDim  = _config.headCount   * _config.headDim();
     const std::size_t kvDim = _config.headCountKv * _config.headDim();
     return {qDim, kvDim};
 }
 
-bool Qwen35MoeBackend::needsSsmScratch() const noexcept {
+bool Qwen3_5MoeBackend::needsSsmScratch() const noexcept {
     return _config.isHybridRecurrent();
 }
 
-void Qwen35MoeBackend::traceNorm(const char* tag, std::size_t blockIdx,
+void Qwen3_5MoeBackend::traceNorm(const char* tag, std::size_t blockIdx,
                                  std::size_t pos, const float* p,
                                  std::size_t n) const {
     _gmm.sync();  // p is a unified-memory pointer; readable after sync.
@@ -274,7 +274,7 @@ void Qwen35MoeBackend::traceNorm(const char* tag, std::size_t blockIdx,
                 pos, blockIdx, tag, std::sqrt(sumSq), maxAbs);
 }
 
-void Qwen35MoeBackend::traceDump(const char* tag, std::size_t blockIdx,
+void Qwen3_5MoeBackend::traceDump(const char* tag, std::size_t blockIdx,
                                  std::size_t pos, const float* p,
                                  std::size_t n) const {
     if (_ssmDumpPos >= 0 && pos != static_cast<std::size_t>(_ssmDumpPos)) {
@@ -293,11 +293,11 @@ void Qwen35MoeBackend::traceDump(const char* tag, std::size_t blockIdx,
             static_cast<std::streamsize>(n * sizeof(float)));
 }
 
-void Qwen35MoeBackend::configureHiddenTap(std::span<const std::size_t> tapLayers,
+void Qwen3_5MoeBackend::configureHiddenTap(std::span<const std::size_t> tapLayers,
                                           std::span<float* const>      tapDst) {
     if (tapLayers.size() != tapDst.size()) {
         throw std::runtime_error(
-            "Qwen35MoeBackend::configureHiddenTap: tapLayers/tapDst size mismatch");
+            "Qwen3_5MoeBackend::configureHiddenTap: tapLayers/tapDst size mismatch");
     }
     if (tapLayers.empty()) {
         clearHiddenTap();
@@ -310,27 +310,27 @@ void Qwen35MoeBackend::configureHiddenTap(std::span<const std::size_t> tapLayers
         if (l >= _config.blockCount) {
             clearHiddenTap();
             throw std::runtime_error(
-                "Qwen35MoeBackend::configureHiddenTap: tap layer index out of range");
+                "Qwen3_5MoeBackend::configureHiddenTap: tap layer index out of range");
         }
         if (tapDst[k] == nullptr) {
             clearHiddenTap();
             throw std::runtime_error(
-                "Qwen35MoeBackend::configureHiddenTap: null tap sink pointer");
+                "Qwen3_5MoeBackend::configureHiddenTap: null tap sink pointer");
         }
         _hiddenTapSlot[l] = static_cast<int>(k);
     }
 }
 
-std::size_t Qwen35MoeBackend::gdnVHeads()     const noexcept { return _config.ssmNumVHeads(); }
-std::size_t Qwen35MoeBackend::gdnStateSize()  const noexcept { return _config.ssmStateSize; }
-std::size_t Qwen35MoeBackend::gdnConvDim()    const noexcept { return _config.ssmConvDim(); }
-std::size_t Qwen35MoeBackend::gdnConvKernel() const noexcept { return _config.ssmConvKernel; }
-std::size_t Qwen35MoeBackend::layerCount()    const noexcept { return _config.blockCount; }
-bool Qwen35MoeBackend::isRecurrent(std::size_t b) const noexcept {
+std::size_t Qwen3_5MoeBackend::gdnVHeads()     const noexcept { return _config.ssmNumVHeads(); }
+std::size_t Qwen3_5MoeBackend::gdnStateSize()  const noexcept { return _config.ssmStateSize; }
+std::size_t Qwen3_5MoeBackend::gdnConvDim()    const noexcept { return _config.ssmConvDim(); }
+std::size_t Qwen3_5MoeBackend::gdnConvKernel() const noexcept { return _config.ssmConvKernel; }
+std::size_t Qwen3_5MoeBackend::layerCount()    const noexcept { return _config.blockCount; }
+bool Qwen3_5MoeBackend::isRecurrent(std::size_t b) const noexcept {
     return _config.isRecurrentLayer(b);
 }
 
-void Qwen35MoeBackend::configureGdnCapture(
+void Qwen3_5MoeBackend::configureGdnCapture(
         std::span<const std::size_t> recurBlocks,
         std::span<float* const>      kSinks,
         std::span<float* const>      vSinks,
@@ -353,7 +353,7 @@ void Qwen35MoeBackend::configureGdnCapture(
     }
 }
 
-void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
+void Qwen3_5MoeBackend::runBlock(std::size_t   blockIdx,
                                 float*        x,
                                 std::size_t   T,
                                 KvCache&      cache,
@@ -417,7 +417,7 @@ void Qwen35MoeBackend::runBlock(std::size_t   blockIdx,
     }
 }
 
-void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
+void Qwen3_5MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
                                              float*        x,
                                              std::size_t   T,
                                              KvCache&      cache,
@@ -443,7 +443,7 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     const bool fp16Path = (kvDtype == KvDtype::FP16);
     if (kvDtype != KvDtype::F32 && !fp16Path) {
         throw std::runtime_error(
-            "Qwen35MoeBackend: only KvDtype::F32 or FP16 is supported "
+            "Qwen3_5MoeBackend: only KvDtype::F32 or FP16 is supported "
             "(FP16 via fp32-staging redirect; Q8_0 not wired for IMRoPE)");
     }
 
@@ -609,7 +609,7 @@ void Qwen35MoeBackend::runFullAttentionBlock(std::size_t   blockIdx,
     _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), T * d_model);
 }
 
-void Qwen35MoeBackend::runMtpDraftStep(const float*  hidden,
+void Qwen3_5MoeBackend::runMtpDraftStep(const float*  hidden,
                                        std::int32_t  prevTok,
                                        KvCache&      mtpCache,
                                        BlockBuffers& s,
@@ -672,7 +672,7 @@ void Qwen35MoeBackend::runMtpDraftStep(const float*  hidden,
     // ehScratch now holds the block-<mtp> output = the next-step MTP hidden.
 }
 
-void Qwen35MoeBackend::runMtpDraftStepBatched(
+void Qwen3_5MoeBackend::runMtpDraftStepBatched(
         const float* hidden, const std::int32_t* prevTok, std::size_t nSeq,
         const BatchedDecodeCtx& ctx, std::size_t kvPoolLayer, BlockBuffers& s,
         float* embScratch, float* catScratch, float* ehScratch,
@@ -731,7 +731,7 @@ void Qwen35MoeBackend::runMtpDraftStepBatched(
     // ehScratch now holds the per-slot block-<mtp> output = next MTP hidden.
 }
 
-void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
+void Qwen3_5MoeBackend::runLinearBlock(std::size_t   blockIdx,
                                       float*        x,
                                       std::size_t   T,
                                       KvCache&      cache,
@@ -993,7 +993,7 @@ void Qwen35MoeBackend::runLinearBlock(std::size_t   blockIdx,
     _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), T * d_model);
 }
 
-void Qwen35MoeBackend::sharedExpertTcGemm(std::size_t N, std::size_t K,
+void Qwen3_5MoeBackend::sharedExpertTcGemm(std::size_t N, std::size_t K,
                                           const float* X, std::size_t M,
                                           const void* wNib, const void* wSfb,
                                           const float* wGlob, float* Y,
@@ -1042,7 +1042,7 @@ void Qwen35MoeBackend::sharedExpertTcGemm(std::size_t N, std::size_t K,
     _ops.appendMemoryCopy(Y, outPad, M * N * sizeof(float));
 }
 
-void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
+void Qwen3_5MoeBackend::runMoeFfn(std::size_t   blockIdx,
                                  const float*  moeInput,
                                  std::size_t   T,
                                  BlockBuffers& s) {
@@ -1073,12 +1073,12 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
     const core::gguf::GgufTensor& gateSrc = fused ? *gateUpFused : *gateExpsP;
     if (gateSrc.dimensions.size() < 3) {
         throw std::runtime_error(
-            "Qwen35MoeBackend: expert gate/gate_up tensor must be 3-D "
+            "Qwen3_5MoeBackend: expert gate/gate_up tensor must be 3-D "
             "[n_embd, n_ff(*2), n_expert]");
     }
     if (fused && (gateSrc.dimensions[1] % 2) != 0) {
         throw std::runtime_error(
-            "Qwen35MoeBackend: fused ffn_gate_up_exps ne1 must be even");
+            "Qwen3_5MoeBackend: fused ffn_gate_up_exps ne1 must be even");
     }
     const std::size_t n_ff_exp =
         fused ? gateSrc.dimensions[1] / 2 : gateSrc.dimensions[1];
@@ -1145,7 +1145,7 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
     const auto [geDown, gbDown] = moeBlockGeom(downExps.type);
     if (geGate == 0 || geUp == 0 || geDown == 0) {
         throw std::runtime_error(
-            "Qwen35MoeBackend: expert weight type(s) not in QuantType registry");
+            "Qwen3_5MoeBackend: expert weight type(s) not in QuantType registry");
     }
     const std::size_t rowBytesGate = (d_model / geGate) * gbGate;
     const std::size_t rowBytesUp   = (d_model / geUp)   * gbUp;
@@ -1294,7 +1294,7 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
                                            ? gateShexp.dimensions[1] : 0;
         if (n_ff_shexp == 0) {
             throw std::runtime_error(
-                "Qwen35MoeBackend: ffn_gate_shexp has unexpected shape");
+                "Qwen3_5MoeBackend: ffn_gate_shexp has unexpected shape");
         }
 
         // gate/up over the batch, silu-mul, down. At T=1 decode the Q8_0
@@ -1385,7 +1385,7 @@ void Qwen35MoeBackend::runMoeFfn(std::size_t   blockIdx,
     }
 }
 
-void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
+void Qwen3_5MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
                                         const float*   moeInput,
                                         std::size_t    nSeq,
                                         std::int32_t*  expIdxSlot,
@@ -1452,7 +1452,7 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
     const auto* gateUpFused = w.findBlock(blockIdx, "ffn_gate_up_exps.weight");
     if (gateUpFused != nullptr) {
         throw std::runtime_error(
-            "Qwen35MoeBackend::runMoeFfnBatched: fused ffn_gate_up_exps layout "
+            "Qwen3_5MoeBackend::runMoeFfnBatched: fused ffn_gate_up_exps layout "
             "is not supported on the batched decode path (need separate Q4_K "
             "gate/up + Q5_K down banks)");
     }
@@ -1465,7 +1465,7 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
 
     if (gateExps.dimensions.size() < 3) {
         throw std::runtime_error(
-            "Qwen35MoeBackend::runMoeFfnBatched: expert gate tensor must be 3-D "
+            "Qwen3_5MoeBackend::runMoeFfnBatched: expert gate tensor must be 3-D "
             "[n_embd, n_ff, n_expert]");
     }
     const std::size_t n_ff_exp = gateExps.dimensions[1];
@@ -1483,7 +1483,7 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
         gateExps.type != upExps.type ||
         (d_model % blkAlign != 0) || (n_ff_exp % blkAlign != 0)) {
         throw std::runtime_error(
-            "Qwen35MoeBackend::runMoeFfnBatched: batched fused-K MoE kernels "
+            "Qwen3_5MoeBackend::runMoeFfnBatched: batched fused-K MoE kernels "
             "unavailable for this model (need Q4_K/NVFP4_BLK/BF16 gate/up + "
             "Q5_K/Q6_K/NVFP4_BLK/BF16 down, d_model/n_ff_exp block-aligned)");
     }
@@ -1524,7 +1524,7 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
         const auto [geDown, gbDown] = moeBlockGeom(downExps.type);
         if (geGate == 0 || geUp == 0 || geDown == 0) {
             throw std::runtime_error(
-                "Qwen35MoeBackend::runMoeFfnBatched: expert weight type(s) not "
+                "Qwen3_5MoeBackend::runMoeFfnBatched: expert weight type(s) not "
                 "in QuantType registry");
         }
         bytesGate = n_ff_exp * ((d_model / geGate) * gbGate);
@@ -1580,7 +1580,7 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
                                            ? gateShexp.dimensions[1] : 0;
         if (n_ff_shexp == 0) {
             throw std::runtime_error(
-                "Qwen35MoeBackend::runMoeFfnBatched: ffn_gate_shexp has "
+                "Qwen3_5MoeBackend::runMoeFfnBatched: ffn_gate_shexp has "
                 "unexpected shape");
         }
 
@@ -1629,7 +1629,7 @@ void Qwen35MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
     }
 }
 
-void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
+void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
                                         const float*   moeInput,
                                         std::size_t    nSeq,
                                         std::int32_t*  expIdxSlot,
@@ -1937,7 +1937,7 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
             const auto [geDown, gbDown] = moeBlockGeom(downExps.type);
             if (geGate == 0 || geUp == 0 || geDown == 0) {
                 throw std::runtime_error(
-                    "Qwen35MoeBackend::runMoeFfnGrouped: expert weight type(s) "
+                    "Qwen3_5MoeBackend::runMoeFfnGrouped: expert weight type(s) "
                     "not in QuantType registry");
             }
             bytesGate = n_ff_exp * ((d_model / geGate) * gbGate);
@@ -1992,7 +1992,7 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
                                            ? gateShexp.dimensions[1] : 0;
         if (n_ff_shexp == 0) {
             throw std::runtime_error(
-                "Qwen35MoeBackend::runMoeFfnGrouped: ffn_gate_shexp has "
+                "Qwen3_5MoeBackend::runMoeFfnGrouped: ffn_gate_shexp has "
                 "unexpected shape");
         }
         float* const expertOutBuf = s.expertOutBuf.as<float>();
@@ -2040,7 +2040,7 @@ void Qwen35MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     }
 }
 
-void Qwen35MoeBackend::runBlockBatched(std::size_t             blockIdx,
+void Qwen3_5MoeBackend::runBlockBatched(std::size_t             blockIdx,
                                        float*                  x,
                                        const BatchedDecodeCtx& ctx,
                                        BlockBuffers&           s) {
@@ -2051,7 +2051,7 @@ void Qwen35MoeBackend::runBlockBatched(std::size_t             blockIdx,
     }
 }
 
-void Qwen35MoeBackend::runFullAttentionBlockBatched(
+void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
         std::size_t blockIdx, float* x, const BatchedDecodeCtx& ctx,
         BlockBuffers& s, std::size_t kvPoolLayer) {
     const std::size_t nSeq = ctx.nSeq;
@@ -2211,7 +2211,7 @@ void Qwen35MoeBackend::runFullAttentionBlockBatched(
     _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nSeq * d_model);
 }
 
-void Qwen35MoeBackend::runLinearBlockBatched(
+void Qwen3_5MoeBackend::runLinearBlockBatched(
         std::size_t blockIdx, float* x, const BatchedDecodeCtx& ctx,
         BlockBuffers& s) {
     const std::size_t nSeq = ctx.nSeq;
@@ -2424,7 +2424,7 @@ void Qwen35MoeBackend::runLinearBlockBatched(
     _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nSeq * d_model);
 }
 
-void Qwen35MoeBackend::runLinearBlockVerify(
+void Qwen3_5MoeBackend::runLinearBlockVerify(
         std::size_t blockIdx, float* x, std::size_t N, std::size_t Kp1,
         std::int32_t* expIdxSlot, float* kwSlot, const std::uint8_t* gdnSeqStart,
         std::size_t maxBatch, float* ssmExport, float* const* convSnap,

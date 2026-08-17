@@ -8,7 +8,7 @@
 // match within fp tolerance.
 //
 // This is the correctness gate before the kernel gets wired into
-// Qwen35MoeBackend (replacing the host top-K + the host->USM copy loop).
+// Qwen3_5MoeBackend (replacing the host top-K + the host->USM copy loop).
 // The kernel is launched directly through the driver API (CudaModule /
 // CudaKernel) so this test needs no new GpuOps / GpuMatmul entry point --
 // it only uses GpuOps for the generic allocate / upload / readback path.

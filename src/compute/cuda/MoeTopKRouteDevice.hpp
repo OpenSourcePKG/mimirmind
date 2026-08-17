@@ -28,7 +28,7 @@ namespace mimirmind::compute::cuda {
  *
  * Replaces the host `compute::moeTopKRoute` + the host->USM copy loop that
  * forces a D2H/host/H2D round trip per MoE layer
- * (`Qwen35MoeBackend.cpp:516,579`) — the ~96 ms/tok host_sync wall that
+ * (`Qwen3_5MoeBackend.cpp:516,579`) — the ~96 ms/tok host_sync wall that
  * keeps decode launch-bound. See milestone M-Q3N.5.
  *
  * Move-only via its members; single-threaded by contract (the kernel's arg

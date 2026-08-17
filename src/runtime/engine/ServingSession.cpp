@@ -8,7 +8,7 @@
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
 #include "runtime/SsmState.hpp"
-#include "runtime/arch/Qwen35MoeBackend.hpp"
+#include "runtime/arch/Qwen3_5MoeBackend.hpp"
 #include "runtime/engine/DFlashDecoder.hpp"
 #include "runtime/serving/PagedKvPool.hpp"
 #ifdef MIMIRMIND_HAVE_CUDA
@@ -51,7 +51,7 @@ struct ServingState {
     const core::gguf::GgufTensor* tokEmb{nullptr};
     const core::gguf::GgufTensor* outNorm{nullptr};
     const core::gguf::GgufTensor* lmHead{nullptr};
-    arch::Qwen35MoeBackend*       qb{nullptr};
+    arch::Qwen3_5MoeBackend*       qb{nullptr};
 
     // Persistent device state.
     std::unique_ptr<serving::PagedKvPool> pool;
@@ -175,7 +175,7 @@ ServingSession::generateBatch(
     if (_e._backend == nullptr) {
         throw std::runtime_error("generateBatch: no model loaded");
     }
-    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
     if (qb == nullptr) {
         throw std::runtime_error(
             "generateBatch: batched serving only supports qwen35moe");
@@ -538,7 +538,7 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     if (_e._backend == nullptr) {
         throw std::runtime_error("ensureServingState: no model loaded");
     }
-    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
     if (qb == nullptr) {
         throw std::runtime_error(
             "ensureServingState: continuous batching only supports qwen35moe");
@@ -1412,7 +1412,7 @@ ServingSession::mtpDraftParity(std::span<const std::int32_t> prompt,
     if (_e._backend == nullptr) {
         throw std::runtime_error("mtpDraftParity: no model loaded");
     }
-    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
     if (qb == nullptr || !_e.mtpAvailable()) {
         throw std::runtime_error(
             "mtpDraftParity: requires CUDA qwen35moe with a nextn head");
@@ -1515,7 +1515,7 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
     if (_e._backend == nullptr) {
         throw std::runtime_error("generateBatchMtp: no model loaded");
     }
-    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
     if (qb == nullptr || !_e.mtpAvailable()) {
         throw std::runtime_error(
             "generateBatchMtp: requires CUDA qwen35moe with a nextn head");
@@ -1655,7 +1655,7 @@ ServingSession::generateBatchDflash(std::span<const std::int32_t> prompt,
     if (_e._backend == nullptr) {
         throw std::runtime_error("generateBatchDflash: no model loaded");
     }
-    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
     if (qb == nullptr) {
         throw std::runtime_error("generateBatchDflash: requires CUDA qwen35moe");
     }
@@ -1814,7 +1814,7 @@ ServingSession::generateBatchMtpMulti(
     if (_e._backend == nullptr) {
         throw std::runtime_error("generateBatchMtpMulti: no model loaded");
     }
-    auto* qb = dynamic_cast<arch::Qwen35MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
     if (qb == nullptr || !_e.mtpAvailable()) {
         throw std::runtime_error(
             "generateBatchMtpMulti: requires CUDA qwen35moe with a nextn head");

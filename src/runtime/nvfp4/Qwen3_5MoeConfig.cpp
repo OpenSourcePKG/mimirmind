@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "runtime/nvfp4/Qwen35MoeConfig.hpp"
+#include "runtime/nvfp4/Qwen3_5MoeConfig.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -17,7 +17,7 @@ namespace {
 }
 } // namespace
 
-model::LlmConfig parseQwen35MoeSafetensorsConfig(std::string_view configJson) {
+model::LlmConfig parseQwen3_5MoeSafetensorsConfig(std::string_view configJson) {
     nlohmann::json top =
         nlohmann::json::parse(configJson.begin(), configJson.end(), nullptr,
                               /*allow_exceptions=*/false);
@@ -46,6 +46,11 @@ model::LlmConfig parseQwen35MoeSafetensorsConfig(std::string_view configJson) {
     };
 
     model::LlmConfig cfg;
+    // Wire arch id kept as the stable legacy "qwen35moe" (== HF model_type
+    // qwen3_5_moe). The C++ classes were renamed Qwen35Moe* -> Qwen3_5Moe* for
+    // accuracy, but this load-bearing identifier stays unchanged so deployed
+    // configs and the arch-match sites keep working. Renaming the wire string
+    // is a separate, Spark-verified step.
     cfg.architecture     = "qwen35moe";
     cfg.blockCount       = reqU("num_hidden_layers");
     cfg.contextLength    = optU("max_position_embeddings", 262144);

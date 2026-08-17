@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "core/modelopt/Qwen35MoeGgufMap.hpp"
+#include "core/modelopt/Qwen3_5MoeGgufMap.hpp"
 
 #include <array>
 

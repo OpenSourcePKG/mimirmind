@@ -92,9 +92,9 @@ struct BatchedDecodeCtx {
  * conv1d + delta-rule kernels. Reaching a full-attention block end-to-end
  * therefore needs input injection (parity harness) until then.
  */
-class Qwen35MoeBackend final : public ArchBackend {
+class Qwen3_5MoeBackend final : public ArchBackend {
 public:
-    Qwen35MoeBackend(const model::LlmConfig&       config,
+    Qwen3_5MoeBackend(const model::LlmConfig&       config,
                      const core::gguf::WeightsMap& weights,
                      const model::FusedQkvWeights* fusedQkv,
                      compute::ComputeOps&          ops,

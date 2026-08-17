@@ -31,6 +31,6 @@ namespace mimirmind::runtime::nvfp4 {
  * (num_hidden_layers, hidden_size, num_attention_heads).
  */
 [[nodiscard]] model::LlmConfig
-parseQwen35MoeSafetensorsConfig(std::string_view configJson);
+parseQwen3_5MoeSafetensorsConfig(std::string_view configJson);
 
 } // namespace mimirmind::runtime::nvfp4

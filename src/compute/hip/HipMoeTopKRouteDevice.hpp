@@ -28,7 +28,7 @@ namespace mimirmind::compute::hip {
  * another session edits it.
  *
  * Replaces the host `compute::moeTopKRoute` + the host->USM copy loop
- * (`Qwen35MoeBackend.cpp:516,579`) — the per-layer host round trip that
+ * (`Qwen3_5MoeBackend.cpp:516,579`) — the per-layer host round trip that
  * keeps decode launch-bound. Removing it is the precondition for HipGraph
  * capture on gfx1101 (see M-HipGraph shelf, unshelved by this milestone).
  *

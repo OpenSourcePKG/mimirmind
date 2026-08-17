@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "core/modelopt/Qwen35MoeMaterializer.hpp" // MaterializationStep + Source
+#include "core/modelopt/Qwen3_5MoeMaterializer.hpp" // MaterializationStep + Source
 
 #include <cstdint>
 #include <vector>
