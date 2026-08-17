@@ -50,7 +50,7 @@ The counsel. Production-queryable.
 |---|---|---|
 | M7 | OpenAI-compatible HTTP API (`/v1/chat/completions`), chat template, streaming | ✅ done — Qwen ChatML, Gemma 2/3, and Gemma 4 templates; non-streaming and SSE both wired |
 | **M8** | **Gemma 4 architecture: hybrid local/global attention, MoE routing, per-layer dims, alt-attn, multi-norm choreography, chat template** | ✅ done (2026-06-30) — coherent output at 145-148 ms/tok on Gemma 4 26B-A4B Q6_K/Q8_0; image tag `e2d1f2f` |
-| M9 | Layer streaming + multi-request concurrency | Open — see Mimir-1.1 and Mimir-2.0 below |
+| M9 | Layer streaming + multi-request concurrency | Open (re-scoped 2026-08-17) — the concurrency stack is *built* but CUDA/Bragi-only (5.4); Xe-LPG needs an L0 port (M9.1) + layer streaming (M9.2). See Mimir-1.1 and Mimir-2.0 below |
 
 ### M8 sub-step breakdown
 
@@ -128,11 +128,21 @@ released for Gemma 4 in mid-2026.
 | M | Item | Status | Expected delta |
 |---|---|---|---|
 | **M-CLR** | Command-List Replay for decode | ✅ done 2026-07-06 | −6.4 % decode on E4B, verified live |
-| **M10.2** | KV cache dtype layer (F32 → FP16 → Q8_0) | 🚧 phase 0 in progress | +2 % on short contexts, +25-40 % at T_k > 3000 |
-| **M8.K** | GEMM Xe-LPG-native rewrite | 🔲 proposed | Prerequisite for the batched-verify path that MTP and spec-dec need |
-| **M9.11** | Speculative decoding framework | 🔲 proposed, blocked on M8.K | 20-40 % decode depending on accept rate |
-| **M-Ratatoskr** | Gemma 4 MTP drafter integration | 🔲 proposed, blocked on M8.K + M9.11 | **up to 3× decode**, quality-neutral (official) |
+| **M10.2** | KV cache dtype layer (F32 → FP16 → Q8_0) | 🚧 ~60 % — FP16 read+write path live; migration + parity + default-on left | +2 % on short contexts, +25-40 % at T_k > 3000 |
+| **M8.K** | GEMM Xe-LPG-native rewrite | 🚧 in progress — v2-GEMM prototypes 1.6-1.9× over matvec | Prerequisite for the batched-verify path that MTP and spec-dec need |
+| **M8.L** | Flash-Prefill T_k-scaling rewrite | 🚧 in progress — per-WG tile SLM independent of T_k | Removes the ~80× T_k>256 prefill regime |
+| **M9.6.6** | GPU clock governor retune | ✅ done 2026-08-17 — headroom-adaptive up-gain + overshoot watchdog | Closes the bench-to-prod gap |
+| **M9.11** | Speculative decoding framework | 🔲 blocked on M8.K | 20-40 % decode — but see the CUDA cross-learning note below |
+| **M-Ratatoskr** | Gemma 4 MTP drafter integration | 🔲 blocked on M8.K + M9.11 | **up to 3× decode**, quality-neutral (official) |
 | **M-Diff** | DiffusionGemma backend | 🔲 deferred, optional | 3-5× decode, explicit quality trade-off, not for prod chat |
+
+> **Cross-learning (2026-08-17, from the CUDA/Bragi tracks):** spec-decode
+> (MTP 5.6, DFlash 5.9) turned out to be a **net loss** against an
+> *optimised* MoE baseline on GB10 — the M=K+1 verify re-reads too many
+> experts with no amortisation. Xe-LPG differs (Gemma 4 is dense / 26B-A4B,
+> far lower per-token verify cost), so a drafter can still pay here — but
+> M9.11/M-Ratatoskr must be benchmarked against the **CLR-optimised** Xe-LPG
+> decode, not a naive baseline. The DFlash ReplaySSM GDN-fold is reusable IP.
 
 ### M-CLR — Command-List Replay ✅
 
@@ -152,11 +162,13 @@ Two phases. **Phase 0** switches K/V storage from F32 to FP16, halving
 KV reads per attention call. **Phase 1** (later) adds Q8_0 for a
 further 2× cut. FP16 is the largest bandwidth-relevant lever for as
 long as KV reads scale linearly with T_k — during long chats and RAG
-prompts, KV traffic dominates the read budget. Phase 0 foundation
-(KvCache API + `runtime.kvDtype` wiring) is committed locally. Attention kernels
-already ship in both F32 and FP16 variants; the read-path dispatcher
-gets wired in the next commits, followed by write-side kernels and the
-backend migration.
+prompts, KV traffic dominates the read budget. **Status ~60 %:** the FP16
+read *and* write path is live end-to-end — dtype-aware `KvCache` alloc +
+striding (incl. Q8_0 block storage), an fp32-staging write redirect into
+`kvCommitFp16Async`, and FP16 attention read kernels on L0 and HIP. It is
+user-selectable via `runtime.kvDtype` but still **default-off/WIP**. Left:
+the backend migration, a dedicated FP16/Q8_0 KV **parity test**, Q8_0 for
+the IMRoPE path, and flipping default-on.
 
 ### M8.K — GEMM Xe-LPG-native rewrite 🔲
 
@@ -165,7 +177,11 @@ on Xe-LPG. Without an Xe-LPG-native GEMM that actually scales
 sub-linearly with M, batched-target-verify (needed for both spec-dec
 and MTP) does not pay off — a single verify of N=4 costs 4× a single
 forward, so the drafter gain is eaten by the verify cost. Roadmap
-note lives in the Synaipse vault.
+note lives in the Synaipse vault. **Started (~40 %):** native L0
+v2-GEMM prototypes (`matmul_{q8_0,q6k,q4k}_gemm_v2`, shrunk SLM
+`X_TILE=256`) land 1.6-1.9× over the matvec loop, with the autotune
+parity gate picking matvec-loop vs GEMM per M-bucket. Full coverage +
+the batched-verify win still to come.
 
 ### M-Ratatoskr — Gemma 4 MTP drafter integration 🔲
 
@@ -216,8 +232,9 @@ next milestone.
 | + M8.K + M-Ratatoskr | **18-23** | **30-38** | **~3×** |
 
 Production numbers are lower today because the GPU clock governor
-throttles aggressively — a separate governor retune (M9.6.6) is
-queued and will close most of the bench-to-prod gap.
+throttles aggressively — the governor retune (M9.6.6) **landed
+2026-08-17** (headroom-adaptive up-gain + overshoot watchdog, fast-down
+safety preserved) and closes most of the bench-to-prod gap.
 
 ## Mimir-1.1 — Concurrency
 
