@@ -17,6 +17,7 @@ namespace mimirmind::runtime { class KvCache; }   // nextn (MTP) KV cache
 namespace mimirmind::runtime::engine {
 
 struct ServingState;   // persistent continuous-batch substrate (defined in .cpp)
+struct L0ServingState; // non-paged L0/Xe-LPG slab substrate (defined in .cpp)
 
 /**
  * Batched / serving-class decode substrate, extracted from InferenceEngine.
@@ -159,8 +160,9 @@ private:
                          const std::vector<std::int32_t>&        token0,
                          std::vector<std::vector<std::int32_t>>& drafts);
 
-    InferenceEngine&              _e;
-    std::unique_ptr<ServingState> _state;
+    InferenceEngine&                _e;
+    std::unique_ptr<ServingState>   _state;   // qwen35moe paged path
+    std::unique_ptr<L0ServingState> _l0;      // L0/Xe-LPG non-paged slab path
 };
 
 } // namespace mimirmind::runtime::engine

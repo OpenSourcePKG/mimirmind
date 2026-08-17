@@ -751,6 +751,13 @@ public:
         return _servingClassEnabled;
     }
 
+    /// True when the loaded backend implements the neutral synchronized
+    /// batched decode (Gemma 4 MoE) — the L0/Xe-LPG serving substrate. The
+    /// serving gate (ServeMode) un-gates the ContinuousBatcher for these
+    /// backends too, not only qwen35moe. Defined out-of-line (needs the
+    /// complete ArchBackend).
+    [[nodiscard]] bool supportsBatchedDecode() const noexcept;
+
     /// The serving-config block that drove the gate decision. Read-only
     /// view for `SystemStatusBuilder`; avoids threading a full `Config`
     /// reference through the builder ctor just for two knobs.

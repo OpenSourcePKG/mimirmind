@@ -49,8 +49,9 @@ ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
     if (maxBatch == 0 || maxContext == 0) {
         throw std::runtime_error("ContinuousBatcher: maxBatch/maxContext > 0");
     }
-    // Build the persistent per-slot serving state up front (throws for a
-    // non-qwen35moe engine, before any request is accepted).
+    // Build the persistent per-slot serving state up front (qwen35moe paged
+    // pool or, on L0/Xe-LPG, the Gemma 4 MoE slab substrate; throws for a
+    // backend that supports neither, before any request is accepted).
     _engine.ensureServingState(maxBatch, maxContext);
     _prefillChunk = _engine.servingPrefillChunk();
     _slots.resize(maxBatch);

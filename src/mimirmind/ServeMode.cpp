@@ -2450,8 +2450,13 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     // batcher's worker thread (multi-tenant continuous batching) rather than
     // the serialised single-session generate() path. Kept alive for the
     // whole server.run() below; its dtor joins the worker on shutdown.
+    // M9.1 — un-gated from qwen35moe-only to any backend that implements the
+    // neutral synchronized batched decode: Gemma 4 MoE on L0/Xe-LPG serves
+    // through the non-paged slab substrate (SlabDecodeStepper) instead of the
+    // paged pool. qwen35moe keeps its CUDA paged path.
     std::unique_ptr<::mimirmind::runtime::serving::ContinuousBatcher> batcher;
-    if (engine.config().architecture == "qwen35moe" &&
+    if ((engine.config().architecture == "qwen35moe" ||
+         engine.supportsBatchedDecode()) &&
         engine.servingClassEnabled()) {
         const std::size_t maxBatch =
             std::max<std::size_t>(1, engine.batchCapacity().sustainableBatch);

@@ -662,16 +662,17 @@ void InferenceEngine::finalizeLoad() {
                 break;
         }
 
-        // E2 guard — Bragi-v1 restricts serving-class (continuous
-        // batching + PagedAttention) to the CUDA path. L0/HIP/CPU
-        // backends stay single-session per the M-Cuda.Batch guardrail.
-        // If the decision above landed on true but the backend isn't
-        // CUDA, either hard-error (operator explicitly asked via Force
-        // — silent downgrade would be surprising) or downgrade+warn
-        // (Auto picked it on probe grounds, operator didn't ask
-        // explicitly).
+        // E2 guard — Bragi-v1 restricted serving-class (continuous batching)
+        // to CUDA. M9.1 relaxes it: a non-CUDA backend that implements the
+        // NEUTRAL synchronized batched decode (Gemma 4 MoE on L0/Xe-LPG,
+        // served through the non-paged slab substrate) is now a valid
+        // serving-class substrate. HIP/CPU and non-batched L0 archs (qwen2)
+        // still stay single-session — they have no runBlockBatched.
+        const bool neutralBatched =
+            _backend != nullptr && _backend->supportsBatchedDecode();
         if (_servingClassEnabled &&
-            _computeCtx->kind() != core::backend::BackendKind::Cuda) {
+            _computeCtx->kind() != core::backend::BackendKind::Cuda &&
+            !neutralBatched) {
             const auto backendName =
                 core::backend::BackendRegistry::name(_computeCtx->kind());
             if (_cfg.serving.enableBatching == TriState::Force) {
@@ -2217,6 +2218,10 @@ std::int32_t InferenceEngine::prefillSlot(std::size_t slot,
 std::size_t InferenceEngine::servingPrefillChunk() const {
     return _servingSession == nullptr ? 0
                                       : _servingSession->prefillChunkSize();
+}
+
+bool InferenceEngine::supportsBatchedDecode() const noexcept {
+    return _backend != nullptr && _backend->supportsBatchedDecode();
 }
 
 std::vector<std::vector<float>>

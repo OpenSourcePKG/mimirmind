@@ -10,7 +10,9 @@
 #include "runtime/SsmState.hpp"
 #include "runtime/arch/Qwen3_5MoeBackend.hpp"
 #include "runtime/engine/DFlashDecoder.hpp"
+#include "runtime/serving/KvCacheSlabPool.hpp"
 #include "runtime/serving/PagedKvPool.hpp"
+#include "runtime/serving/SlabDecodeStepper.hpp"
 #ifdef MIMIRMIND_HAVE_CUDA
 #include "core/gpu/cuda/CudaGraph.hpp"
 #include "compute/cuda/GpuOps.hpp"
@@ -161,6 +163,28 @@ struct ServingState {
     std::vector<std::int32_t>  mtpWriteSlot;
     std::vector<std::int32_t>  mtpPrevTok;           // [maxBatch] host prevTok
     std::vector<float>         mtpHostLogitsB;       // [maxBatch*vocab_lm] batched readback
+};
+
+// =======================================================================
+// Non-paged L0 / Xe-LPG serving substrate (M9.1 / ADR 2026-08-18). One
+// contiguous KvCache slab per slot (KvCacheSlabPool) driven by the
+// backend-neutral ArchBackend::runBlockBatched via SlabDecodeStepper. No
+// paged pool, no SsmState, no MoE routing scratch — Gemma 4 has no GDN and
+// all layers hold KV, so the slab pool IS the per-sequence KvCache contract
+// runBlockBatched already writes into. Selected when the loaded backend is
+// not qwen35moe but implements supportsBatchedDecode() (Gemma 4 MoE).
+// =======================================================================
+struct L0ServingState {
+    std::size_t maxBatch{0};
+    std::size_t maxContext{0};
+    std::size_t prefillChunk{0};
+
+    std::unique_ptr<serving::KvCacheSlabPool>   slab;
+    std::unique_ptr<serving::SlabDecodeStepper> stepper;
+    std::optional<BlockBuffers>                 decodeSb;   // maxT = maxBatch
+    std::optional<BlockBuffers>                 prefillSb;  // maxT = prefillChunk
+
+    std::vector<std::int32_t> stepTokens;   // [maxBatch] decode input staging
 };
 
 ServingSession::ServingSession(InferenceEngine& engine) : _e{engine} {}
@@ -540,8 +564,86 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     }
     auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
     if (qb == nullptr) {
-        throw std::runtime_error(
-            "ensureServingState: continuous batching only supports qwen35moe");
+        // L0 / Xe-LPG path: a backend implementing the neutral synchronized
+        // batched decode (Gemma 4 MoE) serves through the non-paged slab
+        // substrate instead of the qwen35moe paged pool.
+        if (!_e._backend->supportsBatchedDecode()) {
+            throw std::runtime_error(
+                "ensureServingState: continuous batching requires qwen35moe or "
+                "a backend with supportsBatchedDecode()");
+        }
+        if (maxBatch == 0 || maxContext == 0) {
+            throw std::runtime_error(
+                "ensureServingState: maxBatch/maxContext must be > 0");
+        }
+        if (_l0 != nullptr && _l0->maxBatch >= maxBatch &&
+            _l0->maxContext >= maxContext) {
+            return;   // idempotent unless capacity must grow
+        }
+
+        const auto* tokEmb  = _e._weights->find("token_embd.weight");
+        const auto* outNorm = _e._weights->find("output_norm.weight");
+        const auto* lmHead  = _e._weights->find("output.weight");
+        if (lmHead == nullptr) {
+            lmHead = tokEmb;
+        }
+        if (tokEmb == nullptr || outNorm == nullptr || lmHead == nullptr) {
+            throw std::runtime_error(
+                "ensureServingState: embed/norm/lm_head missing");
+        }
+
+        auto l0 = std::make_unique<L0ServingState>();
+        l0->maxBatch   = maxBatch;
+        l0->maxContext = maxContext;
+        // One prefill forward handles up to prefillChunk prompt tokens; the
+        // batcher splits longer prompts into successive appends.
+        l0->prefillChunk = std::min<std::size_t>(maxContext, 512);
+
+        serving::SlabDecodeStepper::Weights w{tokEmb, outNorm, lmHead};
+        serving::SlabDecodeStepper::Dims dims{};
+        dims.dModel   = _e._config.embeddingLength;
+        dims.vocabLm  = lmHead->dimensions.size() >= 2 ? lmHead->dimensions[1]
+                                                       : _e._tokenizer.vocabSize();
+        dims.vocabEmb = tokEmb->dimensions.size() >= 2 ? tokEmb->dimensions[1]
+                                                       : _e._tokenizer.vocabSize();
+        dims.blockCount     = _e._config.blockCount;
+        dims.rmsNormEps     = _e._config.rmsNormEps;
+        dims.scaleEmbedding = _e._backend->scalesEmbedding();
+
+        // Match the engine's configured KV dtype (== the validated M-L0.Batch
+        // harness, which builds its per-seq caches with `_kvDtype` and is
+        // parity-checked under both F32 and Q8_0 on Gemma 4 26B-A4B). The
+        // backend's runBlockBatched honours each cache's own dtype.
+        const KvDtype kvDtype = _e._kvDtype;
+        l0->slab = serving::KvCacheSlabPool::forBackend(
+            *_e._ops, *_e._backend, maxBatch, maxContext, kvDtype);
+        l0->stepper = std::make_unique<serving::SlabDecodeStepper>(
+            *_e._ops, *_e._gmm, *_e._backend, *l0->slab, w, dims,
+            l0->prefillChunk);
+
+        const auto [qDimMax, kvDimMax] = _e._backend->maxQKVDims();
+        const bool withFusedQkv =
+            _e._fusedQkv != nullptr && _e._fusedQkv->anyFused();
+        const bool withKvFp32Scratch =
+            (kvDtype == KvDtype::Q8_0 || kvDtype == KvDtype::FP16);
+        const bool withQGate = _e._backend->needsQGateScratch();
+        const bool withSsm   = _e._backend->needsSsmScratch();
+        l0->decodeSb = allocBlockBuffers(
+            *_e._ops, _e._config, /*maxT=*/maxBatch, /*maxSeq=*/maxContext,
+            qDimMax, kvDimMax, withFusedQkv, withKvFp32Scratch,
+            withQGate, withSsm);
+        l0->prefillSb = allocBlockBuffers(
+            *_e._ops, _e._config, /*maxT=*/l0->prefillChunk, /*maxSeq=*/maxContext,
+            qDimMax, kvDimMax, withFusedQkv, withKvFp32Scratch,
+            withQGate, withSsm);
+        l0->stepTokens.resize(maxBatch);
+
+        MM_LOG_INFO("serving",
+                    "L0 slab serving state: maxBatch={} maxContext={} "
+                    "prefillChunk={} (backend '{}')",
+                    maxBatch, maxContext, l0->prefillChunk, _e._backend->name());
+        _l0 = std::move(l0);
+        return;
     }
     if (maxBatch == 0 || maxContext == 0) {
         throw std::runtime_error("ensureServingState: maxBatch/maxContext must be > 0");
@@ -702,6 +804,33 @@ void ServingSession::stepServing(
         std::span<const InferenceEngine::ServingSlotStep> steps,
         std::span<std::int32_t>                           outTokens) {
     namespace cmp = mimirmind::compute;
+    if (_l0 != nullptr) {
+        // L0 slab path: each slot's slab sits at its own length (its decode
+        // position), so the neutral batched decode needs only the per-slot
+        // input tokens over the contiguous active prefix.
+        const std::size_t nSeq = steps.size();
+        if (nSeq == 0) {
+            return;
+        }
+        if (nSeq > _l0->maxBatch) {
+            throw std::runtime_error("stepServing: nSeq exceeds serving maxBatch");
+        }
+        if (outTokens.size() != nSeq) {
+            throw std::runtime_error("stepServing: outTokens size != steps size");
+        }
+        for (std::size_t i = 0; i < nSeq; ++i) {
+            if (steps[i].slot != i) {
+                throw std::runtime_error(
+                    "stepServing: steps must be ordered by slot over a "
+                    "contiguous prefix (steps[i].slot == i)");
+            }
+            _l0->stepTokens[i] = steps[i].token;
+        }
+        _l0->stepper->step(
+            std::span<const std::int32_t>{_l0->stepTokens.data(), nSeq},
+            outTokens, *_l0->decodeSb);
+        return;
+    }
     if (_state == nullptr) {
         throw std::runtime_error("stepServing: ensureServingState not called");
     }
@@ -801,6 +930,18 @@ std::int32_t ServingSession::prefillSlot(
         std::size_t                   startPos,
         bool                          produceToken) {
     namespace cmp = mimirmind::compute;
+    if (_l0 != nullptr) {
+        if (slot >= _l0->maxBatch) {
+            throw std::runtime_error("prefillSlot: slot out of range");
+        }
+        // A new request (startPos 0) resets its slab; later chunks append at
+        // the slab's current length (== startPos for sequential prefill).
+        if (startPos == 0) {
+            _l0->slab->resetSlot(slot);
+        }
+        return _l0->stepper->prefillSlot(slot, tokens, *_l0->prefillSb,
+                                         produceToken);
+    }
     if (_state == nullptr) {
         throw std::runtime_error("prefillSlot: ensureServingState not called");
     }
@@ -926,6 +1067,9 @@ std::int32_t ServingSession::prefillSlot(
 }
 
 std::size_t ServingSession::prefillChunkSize() const noexcept {
+    if (_l0 != nullptr) {
+        return _l0->prefillChunk;
+    }
     if (_state == nullptr || !_state->chunkedPrefill) {
         return 0;
     }

@@ -68,13 +68,16 @@ public:
         bool        scaleEmbedding;  ///< Gemma: scale embed by sqrt(dModel)
     };
 
-    /// Allocates decode scratch for up to `slabPool.capacity()` rows.
+    /// Allocates decode scratch for up to `slabPool.capacity()` rows and a
+    /// prefill activation buffer for up to `maxPrefillT` tokens (one prompt
+    /// chunk). `maxPrefillT` must be > 0.
     SlabDecodeStepper(compute::ComputeOps&      ops,
                       compute::ComputeMatmul&   gmm,
                       arch::ArchBackend&        backend,
                       KvCacheSlabPool&          slabPool,
                       const Weights&            weights,
-                      const Dims&               dims);
+                      const Dims&               dims,
+                      std::size_t               maxPrefillT);
 
     SlabDecodeStepper(const SlabDecodeStepper&)            = delete;
     SlabDecodeStepper& operator=(const SlabDecodeStepper&) = delete;
@@ -96,7 +99,28 @@ public:
               std::span<std::int32_t>       outTokens,
               BlockBuffers&                 sb);
 
-    [[nodiscard]] std::size_t capacity() const noexcept { return _capacity; }
+    /**
+     * Prefill (or extend) slot `slot`'s slab with a `tokens.size()`-token
+     * chunk via the single-sequence `ArchBackend::runBlock` (T>1). The chunk
+     * is appended at the slab's current `length()` — the caller resets the
+     * slab (`KvCacheSlabPool::resetSlot`) before the first chunk of a new
+     * request and calls this repeatedly for chunked prefill. Commits the
+     * chunk into the slab.
+     *
+     * When `produceToken` is true (the LAST chunk), returns the greedy first
+     * decode token sampled from the final prompt row; otherwise returns -1.
+     * `prefillSb` is caller-owned block scratch sized for `maxT >= tokens.size()`.
+     * Throws if `slot >= capacity()`, `tokens.size() > maxPrefillT`, or the
+     * chunk would overflow the slab's context cap.
+     */
+    [[nodiscard]] std::int32_t
+    prefillSlot(std::size_t                   slot,
+                std::span<const std::int32_t> tokens,
+                BlockBuffers&                 prefillSb,
+                bool                          produceToken);
+
+    [[nodiscard]] std::size_t capacity()    const noexcept { return _capacity; }
+    [[nodiscard]] std::size_t maxPrefillT() const noexcept { return _maxPrefillT; }
 
 private:
     compute::ComputeOps&    _ops;
@@ -107,12 +131,14 @@ private:
     Dims                    _dims;
     float                   _embedScale;   ///< sqrt(dModel) or 1.0
     std::size_t             _capacity;
+    std::size_t             _maxPrefillT;
 
     // Decode scratch (device), sized for `_capacity` rows.
     compute::ComputeBuffer _xBuf;    // [capacity, dModel]
     compute::ComputeBuffer _normBuf; // [capacity, dModel]
     compute::ComputeBuffer _logits;  // [capacity, vocabLm]
     compute::ComputeBuffer _lmScr;   // [max(dModel, vocabLm)]
+    compute::ComputeBuffer _xBufP;   // [maxPrefillT, dModel] prefill activations
 
     // Host staging.
     std::vector<float>    _hostLogits; // [capacity * vocabLm]
