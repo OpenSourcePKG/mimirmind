@@ -390,6 +390,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/serving/PagedKvBlockAllocator.cpp
     src/runtime/serving/PagedKvSequence.cpp
     src/runtime/serving/PagedKvPool.cpp
+    src/runtime/serving/KvCacheSlabPool.cpp
     src/runtime/serving/ChunkedPrefillScheduler.cpp
     src/runtime/serving/RequestScheduler.cpp
     src/runtime/serving/PreemptionPolicy.cpp
