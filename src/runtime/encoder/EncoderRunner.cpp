@@ -25,92 +25,38 @@ EncoderRunner::EncoderRunner(const EncoderModel& model,
 std::vector<float>
 EncoderRunner::forwardLogits(std::span<const std::int32_t> inputIds) {
     const EncoderConfig& c = _m.config();
-    const std::size_t T   = inputIds.size();
-    if (T == 0) {
-        throw std::runtime_error("EncoderRunner: empty input");
-    }
     // The reranker's F32 projections are precision-sensitive: keep them
     // bit-exact even when the LLM prefill has opted the F32->TC downcast
     // in (TF32's 10-bit mantissa is too coarse for the encoder parity gate).
+    // Held across encodeSingle() (which relies on the caller's guard) and the
+    // head below.
     compute::ScopedExactF32 exactF32{_mm};
-    const std::size_t H   = c.hidden;
-    const std::size_t ffn = c.ffn;
-    const std::size_t nL  = c.numLabels;
-    const float eps       = c.lnEps;
-    const float scale     = 1.0F / std::sqrt(static_cast<float>(c.headDim));
-    const auto  F32       = core::gguf::GgmlType::F32;
-    const auto  WT        = _m.matmulType();
+
+    // Shared embeddings + numLayers encoder body. encodeSingle() flushes
+    // before returning, so its intermediate buffers are safely released and
+    // the returned [T x H] hidden state is complete on device (row 0 = CLS).
+    std::size_t T = 0;
+    compute::ComputeBuffer hb = encodeSingle(inputIds, T);
+
+    const std::size_t H  = c.hidden;
+    const std::size_t nL = c.numLabels;
+    const auto        WT = _m.matmulType();
 
     auto alloc = [&](std::size_t n) { return _ops.allocate(n * sizeof(float)); };
     auto fp = [](compute::ComputeBuffer& b) {
         return static_cast<float*>(b.get());
     };
 
-    compute::ComputeBuffer xb   = alloc(T * H);
-    compute::ComputeBuffer hb   = alloc(T * H);
-    compute::ComputeBuffer qb   = alloc(T * H);
-    compute::ComputeBuffer kb   = alloc(T * H);
-    compute::ComputeBuffer vb   = alloc(T * H);
-    compute::ComputeBuffer attnb = alloc(T * H);
-    compute::ComputeBuffer aob  = alloc(T * H);
-    compute::ComputeBuffer ln1b = alloc(T * H);
-    compute::ComputeBuffer interb = alloc(T * ffn);
-    compute::ComputeBuffer ffnb = alloc(T * H);
-    compute::ComputeBuffer scr  = alloc(T * ffn);
+    // Scratch for the head matmuls only touches the CPU-fallback path, which
+    // needs K (== H) F32 elements; c.ffn (>= H) is a safe upper bound.
+    compute::ComputeBuffer scr  = alloc(c.ffn);
     compute::ComputeBuffer clsb = alloc(H);
     compute::ComputeBuffer outb = alloc(nL);
 
-    float* x    = fp(xb);
-    float* h    = fp(hb);
-    float* q    = fp(qb);
-    float* k    = fp(kb);
-    float* v    = fp(vb);
-    float* attn = fp(attnb);
-    float* ao   = fp(aob);
-    float* ln1  = fp(ln1b);
-    float* inter = fp(interb);
-    float* ffnO = fp(ffnb);
+    float* h       = fp(hb);   // final hidden state; row 0 = <s>/CLS token
     float* scratch = fp(scr);
-    float* cls  = fp(clsb);
-    float* out  = fp(outb);
-
-    // ---- embeddings block: word (gather) + pos + type, then LayerNorm ----
-    compute::embeddingLookup(F32, _m.wordEmb(), H, c.vocab, inputIds, x);
-    _ops.encoderEmbedAddAsync(x, _m.posTable(), _m.typeVec(), T, H, c.posOffset);
-    _ops.layerNormAsync(x, T, H, _m.embLnW(), _m.embLnB(), eps, h);
-
-    // ---- encoder layers (post-LN) ----
-    for (std::size_t i = 0; i < c.numLayers; ++i) {
-        const EncoderLayerWeights& L = _m.layer(i);
-
-        // Q/K/V = h * W^T + b
-        _mm.matmulAsync(WT, L.qW, H, H, h, T, q, scratch);
-        _ops.addBiasAsync(q, T, H, L.qB);
-        _mm.matmulAsync(WT, L.kW, H, H, h, T, k, scratch);
-        _ops.addBiasAsync(k, T, H, L.kB);
-        _mm.matmulAsync(WT, L.vW, H, H, h, T, v, scratch);
-        _ops.addBiasAsync(v, T, H, L.vB);
-
-        // bidirectional self-attention
-        _ops.attentionEncoderAsync(q, k, v, T, c.heads, c.heads, c.headDim,
-                                   scale, attn);
-
-        // attention.output.dense + residual(h) + LayerNorm
-        _mm.matmulAsync(WT, L.aoW, H, H, attn, T, ao, scratch);
-        _ops.addBiasAsync(ao, T, H, L.aoB);
-        _ops.addResidualAsync(ao, h, T * H);
-        _ops.layerNormAsync(ao, T, H, L.aoLnW, L.aoLnB, eps, ln1);
-
-        // FFN: intermediate (erf-GELU) + output.dense + residual(ln1) + LN
-        _mm.matmulAsync(WT, L.fiW, ffn, H, ln1, T, inter, scratch);
-        _ops.addBiasAsync(inter, T, ffn, L.fiB);
-        _ops.geluErfAsync(inter, T * ffn);
-        _mm.matmulAsync(WT, L.foW, H, ffn, inter, T, ffnO, scratch);
-        _ops.addBiasAsync(ffnO, T, H, L.foB);
-        _ops.addResidualAsync(ffnO, ln1, T * H);
-        // next layer's input goes back into h
-        _ops.layerNormAsync(ffnO, T, H, L.outLnW, L.outLnB, eps, h);
-    }
+    float* cls     = fp(clsb);
+    float* out     = fp(outb);
 
     // ---- classifier head on the <s>/CLS token (row 0 of h) ----
     _mm.matmulAsync(WT, _m.clsDenseW(), H, H, h, 1, cls, scratch);
@@ -269,12 +215,18 @@ float EncoderRunner::score(std::span<const std::int32_t> inputIds) {
     return logits.empty() ? 0.0F : logits.front();
 }
 
-// ---- embedding (bi-encoder) path ---------------------------------------
+// ---- shared single-sequence encoder body -------------------------------
 //
-// Shares the exact embeddings + 24-layer forward with forwardLogits (kept a
-// dedicated method rather than refactoring the bit-exact-validated reranker
-// body). The caller must hold a ScopedExactF32 for the run; returns the final
-// [T x hidden] hidden state on device. TODO: fold forwardLogits onto this.
+// The one embeddings + numLayers forward driving BOTH consumers: the reranker
+// head (forwardLogits) and the embedding pooler (embed). The caller must hold
+// a ScopedExactF32 for the run and reads row 0 (<s>/CLS) of the returned
+// [T x hidden] hidden state.
+//
+// Flushes before returning: the async layer ops are drained while this
+// method's intermediate buffers are still alive, so releasing them here is
+// safe under the deferred command-list model (a freed oversized USM block is
+// unmapped immediately by the allocator, which would otherwise dangle in an
+// unexecuted command list). The returned hidden state is complete on device.
 compute::ComputeBuffer
 EncoderRunner::encodeSingle(std::span<const std::int32_t> inputIds,
                             std::size_t& Tout) {
@@ -344,6 +296,9 @@ EncoderRunner::encodeSingle(std::span<const std::int32_t> inputIds,
         _ops.addResidualAsync(ffnO, ln1, T * H);
         _ops.layerNormAsync(ffnO, T, H, L.outLnW, L.outLnB, eps, h);
     }
+    // Drain the layer ops before this frame's scratch buffers are released
+    // (see the method contract above). hb outlives this call.
+    _ops.flush();
     return hb;   // final [T x H] hidden state on device (row 0 = <s>/CLS)
 }
 
@@ -353,10 +308,9 @@ EncoderRunner::embed(std::span<const std::int32_t> inputIds) {
     // precision-sensitive).
     compute::ScopedExactF32 exactF32{_mm};
     std::size_t T = 0;
-    compute::ComputeBuffer hb = encodeSingle(inputIds, T);
+    compute::ComputeBuffer hb = encodeSingle(inputIds, T);   // already flushed
     const std::size_t H = _m.config().hidden;
 
-    _ops.flush();
     // CLS pooling (bge convention): the <s> token = row 0 of the final hidden
     // state is the sentence embedding. Row-major [T x H], so the first H
     // floats are row 0.
