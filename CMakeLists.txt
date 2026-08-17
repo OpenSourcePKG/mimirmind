@@ -809,6 +809,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/kv_write_tokens_batched.cu
         kernels/cuda/llm/moe_group_tiles.cu
         kernels/cuda/llm/moe_grouped_gemm_nvfp4blk.cu
+        kernels/cuda/llm/moe_grouped_gemm_nvfp4blk_w4a16tc.cu
         kernels/cuda/llm/matmul_nvfp4blk_deint_vec.cu
         kernels/cuda/llm/moe_act_quant_nvfp4.cu
         kernels/cuda/llm/moe_weight_sf_swizzle.cu

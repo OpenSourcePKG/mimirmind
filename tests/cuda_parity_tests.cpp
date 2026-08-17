@@ -2789,6 +2789,38 @@ void checkMoeGroupedGemmParity(const std::vector<std::int32_t>& counts,
     }
     std::printf("[moe-grouped-gemm] nExp=%d R=%d N=%d K=%d OK\n",
                 nExperts, R, N, K);
+
+    // --- W4A16 TC variant (Bragi 5.7, I0): same weights/activations/schedule,
+    // but the K-contraction runs on BF16 tensor cores (dequant weight -> shared
+    // BF16, BF16 activations, F32 accum). NOT bit-identical (bf16 rounding) —
+    // gate on relL2 vs the F32 grouped golden, same regime as matmul_bf16_gemm_tc.
+    cc::CudaModule tcMod = cc::CudaModule::fromFile(
+        ctx.cudaContext(), resolvePtx("moe_grouped_gemm_nvfp4blk_w4a16tc"));
+    cc::CudaKernel tcKern = tcMod.getFunction("moe_grouped_gemm_nvfp4blk_w4a16tc");
+    auto dYtc = uploadRaw(ops, zeros);
+    tcKern.setPtr  (0, dX.get());
+    tcKern.setPtr  (1, dW.get());
+    tcKern.setPtr  (2, dYtc.get());
+    tcKern.setPtr  (3, dExpert.get());
+    tcKern.setPtr  (4, dRow0.get());
+    tcKern.setPtr  (5, dRows.get());
+    tcKern.setValue(6, K);
+    tcKern.setValue(7, N);
+    const std::uint32_t gxTc = static_cast<std::uint32_t>((N + 15) / 16);  // ceil(N/16)
+    tcKern.launch(ctx.stream(), gxTc, static_cast<std::uint32_t>(maxTiles), 1,
+                  32, 1, 1);                                               // one warp/block
+    ops.flush();
+    auto gotTc = fromDevice(ops, dYtc.get(), static_cast<std::size_t>(R) * N);
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < gotGrp.size(); ++i) {
+        const double d = static_cast<double>(gotTc[i]) - static_cast<double>(gotGrp[i]);
+        num += d * d;
+        den += static_cast<double>(gotGrp[i]) * static_cast<double>(gotGrp[i]);
+    }
+    const double relL2 = (den > 0.0) ? std::sqrt(num / den) : 0.0;
+    std::printf("[moe-grouped-gemm-w4a16tc] nExp=%d R=%d N=%d K=%d relL2=%.5f\n",
+                nExperts, R, N, K, relL2);
+    EXPECT_NEAR(relL2, 0.0, 0.05);                    // BF16 TC vs F32 golden
 }
 
 } // namespace
