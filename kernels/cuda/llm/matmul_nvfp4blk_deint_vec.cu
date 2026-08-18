@@ -36,8 +36,14 @@
 namespace {
 
 __device__ __forceinline__ float dq_e2m1(unsigned nib) {
-    const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-    const float v = mag[nib & 0x7u];
+    // Branchless E2M1 (3-bit magnitude {0,.5,1,1.5,2,3,4,6}) -> fp32 by
+    // constructing the IEEE-754 bit pattern in registers. Avoids the dynamic
+    // index into a local `float mag[8]` array (which lands in local memory =
+    // MIO-pipe traffic on the decode-GEMV's short-scoreboard-bound inner loop).
+    // fp32 exp = 126 + (m>>1); mantissa bit = (m&1)<<22; zeroed when m==0.
+    const unsigned m    = nib & 0x7u;
+    const unsigned bits = ((126u + (m >> 1)) << 23) | ((m & 1u) << 22);
+    const float    v    = __uint_as_float(bits) * static_cast<float>(m != 0u);
     return (nib & 0x8u) ? -v : v;
 }
 
