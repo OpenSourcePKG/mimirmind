@@ -32,7 +32,9 @@
 
 #include <sys/utsname.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -41,11 +43,22 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
+
+// The op-sweep (M-Probe.1.B/C/D) drives concrete backend ops, so it is only
+// compiled when the Level Zero backend is linked in (CMake sets the macro).
+#ifdef MIMIRMIND_PROBE_HAS_L0
+#include "compute/l0/GpuMatmul.hpp"
+#include "compute/l0/GpuOps.hpp"
+#include "core/gpu/l0/L0ComputeContext.hpp"
+#include "core/gpu/l0/UsmAllocator.hpp"
+#include "core/gguf/GgufTypes.hpp"
+#endif
 
 namespace {
 
@@ -144,8 +157,149 @@ const FeatureBit kFeatures[] = {
     {be::BackendFeature::MatrixEngine,        "MatrixEngine"},
 };
 
+// --- Op-sweep (M-Probe.1.B/C/D) ----------------------------------------------
+//
+// Increment 2a: an L0 F32 matmul sweep across M-buckets with an inline
+// double-accumulate reference gate + median/IQR margin. F32 needs no quant
+// encoder and its reference is exact, so this is the safe first op. Quant
+// dtypes (Q8_0 has a row encoder; Q4_K/Q6_K need encoders that don't exist
+// yet) and the cross-backend axis (needs a neutral op-invocation seam that
+// ComputeContext does not expose today) are the remaining 4.6.2 work.
+
+using Clock = std::chrono::steady_clock;
+
+double percentile(std::vector<double>& v, double p) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    const double idx = (p / 100.0) * static_cast<double>(v.size() - 1);
+    const auto lo = static_cast<std::size_t>(idx);
+    const auto hi = std::min(lo + 1, v.size() - 1);
+    const double frac = idx - static_cast<double>(lo);
+    return v[lo] * (1.0 - frac) + v[hi] * frac;
+}
+
+#ifdef MIMIRMIND_PROBE_HAS_L0
+
+// Reference: Y[M,N] = X[M,K] * W[N,K]^T, F64 accumulate (the correctness gold).
+void refMatmulF32(const float* W, const float* X, float* Y,
+                  std::size_t N, std::size_t K, std::size_t M) {
+    for (std::size_t m = 0; m < M; ++m) {
+        for (std::size_t n = 0; n < N; ++n) {
+            double acc = 0.0;
+            const float* wr = W + n * K;
+            const float* xr = X + m * K;
+            for (std::size_t k = 0; k < K; ++k) {
+                acc += static_cast<double>(xr[k]) * static_cast<double>(wr[k]);
+            }
+            Y[m * N + n] = static_cast<float>(acc);
+        }
+    }
+}
+
+// Max |gpu - gold| / max|gold| over all elements.
+double relError(const float* gpu, const float* gold, std::size_t n) {
+    double maxAbsDiff = 0.0, maxAbsGold = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        maxAbsDiff = std::max(maxAbsDiff, std::fabs(static_cast<double>(gpu[i]) -
+                                                    static_cast<double>(gold[i])));
+        maxAbsGold = std::max(maxAbsGold, std::fabs(static_cast<double>(gold[i])));
+    }
+    return maxAbsDiff / (maxAbsGold + 1e-9);
+}
+
+// Run the L0 F32 matmul sweep and return the `ops` array. Throws on device
+// construction failure (caller degrades to no-sweep).
+nlohmann::json runL0MatmulSweep() {
+    namespace cl0 = mimirmind::core::l0;
+    namespace ml0 = mimirmind::compute::l0;
+    using mimirmind::core::gguf::GgmlType;
+
+    nlohmann::json ops = nlohmann::json::array();
+
+    cl0::L0ComputeContext ctx{};
+    ml0::GpuOps           gops{ctx};
+    ml0::GpuMatmul        gmm{ctx, gops};
+    cl0::UsmAllocator&    usm = ctx.allocator();
+
+    constexpr std::size_t N = 2048, K = 2048;  // representative hidden dim
+    const std::size_t Ms[] = {1, 16, 64, 256};
+    constexpr int kWarmup = 3, kReps = 25;
+    constexpr double kTol = 1e-2;   // 1% — separates F32-accum jitter from bugs
+
+    // Deterministic random W [N,K], reused across M-buckets.
+    std::mt19937 rng{0x9e3779b9U};
+    std::uniform_real_distribution<float> dist{-0.05F, 0.05F};
+    std::vector<float> wHost(N * K);
+    for (float& v : wHost) v = dist(rng);
+    const std::size_t wBytes = wHost.size() * sizeof(float);
+    void* wUsm = usm.allocate(wBytes);
+    std::memcpy(wUsm, wHost.data(), wBytes);
+
+    for (std::size_t M : Ms) {
+        std::vector<float> xHost(M * K);
+        for (float& v : xHost) v = dist(rng);
+        const std::size_t xBytes = xHost.size() * sizeof(float);
+        const std::size_t yBytes = M * N * sizeof(float);
+        const std::size_t sBytes = M * N * sizeof(float);  // generous scratch
+
+        void* xUsm = usm.allocate(xBytes);
+        void* yUsm = usm.allocate(yBytes);
+        void* sUsm = usm.allocate(sBytes);
+        std::memcpy(xUsm, xHost.data(), xBytes);
+        std::memset(yUsm, 0, yBytes);
+
+        auto call = [&]() {
+            gmm.matmul(GgmlType::F32, wUsm, N, K,
+                       static_cast<const float*>(xUsm), M,
+                       static_cast<float*>(yUsm), static_cast<float*>(sUsm));
+        };
+
+        for (int w = 0; w < kWarmup; ++w) call();
+        std::vector<double> ms;
+        ms.reserve(kReps);
+        for (int r = 0; r < kReps; ++r) {
+            const auto t0 = Clock::now();
+            call();
+            ms.push_back(std::chrono::duration<double, std::milli>(
+                             Clock::now() - t0).count());
+        }
+
+        std::vector<float> yGold(M * N);
+        refMatmulF32(wHost.data(), xHost.data(), yGold.data(), N, K, M);
+        const double relErr =
+            relError(static_cast<const float*>(yUsm), yGold.data(), M * N);
+
+        const double p50 = percentile(ms, 50.0);
+        const double iqr = percentile(ms, 75.0) - percentile(ms, 25.0);
+        std::string status = "ok";
+        if (relErr >= kTol) status = "parity_fail";       // gate before perf
+        else if (p50 > 0.0 && iqr / p50 > 0.15) status = "inconclusive";
+
+        ops.push_back({
+            {"op", "matmul"},
+            {"dtype", "F32"},
+            {"backend", "LevelZero"},
+            {"shape", {{"N", N}, {"K", K}, {"M", M}}},
+            {"median_ms", p50},
+            {"iqr_ms", iqr},
+            {"reps", kReps},
+            {"parity_max_rel_diff", relErr},
+            {"status", status},
+        });
+
+        usm.deallocate(xUsm, xBytes);
+        usm.deallocate(yUsm, yBytes);
+        usm.deallocate(sUsm, sBytes);
+    }
+    usm.deallocate(wUsm, wBytes);
+    return ops;
+}
+
+#endif  // MIMIRMIND_PROBE_HAS_L0
+
 struct Options {
     bool        printOnly = false;
+    bool        sweep     = false;
     std::string outRoot   = "configs";
     std::string modelId   = "unspecified";
 };
@@ -154,9 +308,11 @@ void printUsage() {
     std::puts(
         "mimirmind-probe — HW fingerprint + probe config artefact (M-Probe.1)\n"
         "\n"
-        "Usage: mimirmind_probe [--print] [--out <dir>] [--model <id>]\n"
+        "Usage: mimirmind_probe [--print] [--sweep] [--out <dir>] [--model <id>]\n"
         "\n"
         "  --print, -p     write the artefact to stdout instead of a file\n"
+        "  --sweep         run the op sweep (L0 F32 matmul x M-bucket) and fill\n"
+        "                  ops[]; without it the artefact is fingerprint-only\n"
         "  --out <dir>     config root (default: configs) ->\n"
         "                  <dir>/hw/{fingerprint}/probe-result.json\n"
         "  --model <id>    tag the artefact with this model id\n"
@@ -168,6 +324,7 @@ bool parseArgs(int argc, char** argv, Options& o) {
         const std::string_view a{argv[i]};
         if (a == "--help" || a == "-h") { printUsage(); return false; }
         else if (a == "--print" || a == "-p") { o.printOnly = true; }
+        else if (a == "--sweep") { o.sweep = true; }
         else if (a == "--out" && i + 1 < argc) { o.outRoot = argv[++i]; }
         else if (a == "--model" && i + 1 < argc) { o.modelId = argv[++i]; }
         else {
@@ -278,17 +435,40 @@ int main(int argc, char** argv) {
 
     const std::string fingerprint = toHex16(fnv1a64(fp.str()));
 
+    // --- Op sweep (optional) -----------------------------------------------
+    // "fingerprint-only" = no measurements (runtime uses defaults).
+    // "swept-partial"    = some ops measured, but NOT the full
+    //                      backend x kernel x dtype matrix (F32 matmul only
+    //                      today) — the runtime must still default anything
+    //                      not present in ops[].
+    json ops = json::array();
+    std::string probeStatus = "fingerprint-only";
+    if (opt.sweep) {
+#ifdef MIMIRMIND_PROBE_HAS_L0
+        try {
+            ops = runL0MatmulSweep();
+            if (!ops.empty()) probeStatus = "swept-partial";
+        } catch (const std::exception& e) {
+            std::fprintf(stderr,
+                         "[warn] op sweep failed (%s) — fingerprint-only\n",
+                         e.what());
+        }
+#else
+        std::fprintf(stderr,
+                     "[warn] --sweep requested but this build has no L0 sweep "
+                     "support — fingerprint-only\n");
+#endif
+    }
+
     // --- Artefact ----------------------------------------------------------
     json artefact = {
         {"schema", "mimirmind-probe-result/v1"},
         {"generated_at", iso8601UtcNow()},
         {"fingerprint", fingerprint},
         {"model_id", opt.modelId},
-        // fingerprint-only until the sweep increments (M-Probe.1.B-F) fill
-        // `ops`; the runtime loader treats this status as "use defaults".
-        {"probe_status", "fingerprint-only"},
+        {"probe_status", probeStatus},
         {"hardware", std::move(hw)},
-        {"ops", json::array()},
+        {"ops", std::move(ops)},
     };
 
     const std::string dump = artefact.dump(2);

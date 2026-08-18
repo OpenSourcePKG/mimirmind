@@ -2639,7 +2639,42 @@ target_link_libraries(mimirmind_probe PRIVATE
 )
 
 if(TARGET mimirmind_core_l0)
+    # The op-sweep (--sweep) drives the concrete L0 compute layer, which this
+    # repo compiles per-consumer (same pattern as prefill_bench) rather than
+    # bundling in a shared lib. Pull in the compute sources it needs + SPV.
+    target_sources(mimirmind_probe PRIVATE
+        src/compute/Activations.cpp
+        src/compute/Attention.cpp
+        src/compute/Dequant.cpp
+        src/compute/Embedding.cpp
+        src/compute/cpu/GpuMatmul.cpp
+        src/compute/cpu/GpuOps.cpp
+        src/compute/l0/GpuMatmul.cpp
+        src/compute/l0/GpuOps.cpp
+        src/compute/l0/MoeTopKRouteDevice.cpp
+        src/compute/l0/MoeGateUpFusedKDevice.cpp
+        src/compute/Matmul.cpp
+        src/compute/MoeRouting.cpp
+        src/compute/Norm.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/GatedDeltaNet.cpp
+        src/compute/Rope.cpp
+        src/compute/Sampling.cpp
+        src/compute/Softmax.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
+    )
+    add_dependencies(mimirmind_probe spv_kernels)
     target_link_libraries(mimirmind_probe PRIVATE mimirmind_core_l0)
+    # Enables the L0 op-sweep (--sweep) in tools/mimirmind-probe.cpp.
+    target_compile_definitions(mimirmind_probe PRIVATE MIMIRMIND_PROBE_HAS_L0=1)
 endif()
 
 if(TARGET mimirmind_core_hip)
