@@ -14,6 +14,7 @@
 #include "runtime/perf/OpProfiler.hpp"
 
 #include <cstddef>
+#include <span>
 
 namespace mimirmind::runtime::arch {
 
@@ -46,8 +47,35 @@ void Gemma4DenseBackend::runBlock(std::size_t   blockIdx,
     trace("enter (dense)");
 
     // Shared attention section. On return `x` holds
-    // sa_out = inpL + post_attention_norm(W_o @ attn(...)).
+    // sa_out = inpL + post_attention_norm(W_o @ attn(...)), and
+    // `projOut = attn_post_norm(attn_out)` for the FFN residual fold.
     runAttentionSection(blockIdx, x, T, cache, s, diag);
+    runFfnDenseSection(blockIdx, x, T, s, diag);
+}
+
+void Gemma4DenseBackend::runBlockBatched(std::size_t                blockIdx,
+                                         float*                     x,
+                                         std::size_t                nSeq,
+                                         std::span<KvCache* const>  caches,
+                                         BlockBuffers&              s,
+                                         bool                       diag) {
+    // M9.1 — batched attention over the per-seq caches, then the dense FFN
+    // tail at T=nSeq. The FFN gate/up/down are plain matmuls at M=nSeq, so
+    // each dense weight read amortizes across the whole batch (unlike the
+    // sparse-MoE tail, where different tokens route to different experts and
+    // the batch re-reads far more expert weights). F32 KV only.
+    runAttentionSectionBatched(blockIdx, x, nSeq, caches, s, diag);
+    runFfnDenseSection(blockIdx, x, nSeq, s, diag);
+}
+
+void Gemma4DenseBackend::runFfnDenseSection(std::size_t   blockIdx,
+                                            float*        x,
+                                            std::size_t   T,
+                                            BlockBuffers& s,
+                                            bool          diag) {
+    auto trace = [&](const char* tag) {
+        if (diag) MM_LOG_INFO("blkdiag-g4d", "blk0 {}", tag);
+    };
 
     const auto* ffnNorm  = requireTensor(blockIdx, "ffn_norm.weight",           "Gemma4DenseBackend");
     const auto* ffnGate  = requireTensor(blockIdx, "ffn_gate.weight",           "Gemma4DenseBackend");
