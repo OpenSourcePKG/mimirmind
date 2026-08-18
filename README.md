@@ -188,14 +188,25 @@ model-extension phase. In flight:
   E2B/E4B/26B-A4B/31B targets. Projected 3× decode speedup once the
   batched-verify GEMM path (M8.K) lands as a prerequisite.
 
-What remains before Mimir-1.0 is "tagged" rather than just "working":
+Mimir-1.0's release-blocking work is complete; the engine is ready to
+tag as RC1:
 
-- **Multi-request concurrency** — the server today serialises requests
-  through a mutex. Per-request KV cache + scratch pool needs to land
-  before the engine can handle parallel users.
-- **KV-cache reuse across turns** for multi-turn chats without re-prefill.
-- **Pegenaut integration** — the sister TypeScript RAG project that
-  this engine was originally built to feed.
+- **Multi-request concurrency** — delivered on Xe-LPG as a backend-neutral,
+  lockless slab batcher (M9.1): concurrent users no longer serialise on a
+  per-engine mutex. Honest scope — on the Meteor Lake iGPU this is a
+  *latency / fairness* feature, not a throughput one: with no matrix engine,
+  batched decode cannot amortise weight reads (confirmed on both sparse-MoE
+  and dense). Serving-class *throughput* concurrency is a Mimir-2.0 / Bragi
+  (GB10) target, not a Mimir-1.0 one.
+- **KV-cache reuse across turns** — a multi-entry prefix cache keeps
+  interleaved conversations warm (M9.4) and reuses their K/V without
+  re-prefill.
+- **Pegenaut integration** — the sister TypeScript RAG project is served
+  chat + embeddings + rerank end-to-end.
+
+Layer streaming for oversized models is *not* a Mimir-1.0 item: on
+unified-memory Xe-LPG the weights already live in system RAM, so it belongs
+to the discrete-GPU tier, not this release.
 
 ## Compute backends
 
@@ -233,8 +244,12 @@ on E4B and E2B once M8.K (Xe-LPG-native GEMM) and M-Ratatoskr
 (Gemma 4 MTP-drafter integration) land. Bandwidth foundation (M10.2
 FP16 KV cache) is in flight now.
 
-**Mimir-1.1: Concurrency.** Per-request KV cache, scratch pool, and a
-non-blocking decode loop. Removes the request mutex.
+**Mimir-1.1: Concurrency.** The per-engine request mutex is already
+removed on the Level-Zero path by M9.1's backend-neutral slab batcher
+(latency / fairness on Xe-LPG — throughput concurrency is a Bragi/GB10
+matter, since the iGPU has no matrix engine to amortise a batch).
+Remaining polish: slot eviction / preemption on the slab path and a
+memory-based batch-capacity probe.
 
 **Mimir-2.0 — Bragi: Serving-class.** The second production platform:
 **NVIDIA DGX Spark** (Grace ARM + Blackwell **GB10**, 128 GB unified

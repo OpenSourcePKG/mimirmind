@@ -238,6 +238,17 @@ safety preserved) and closes most of the bench-to-prod gap.
 
 ## Mimir-1.1 — Concurrency
 
+**Status (2026-08-18): largely delivered by M9.1.** The backend-neutral
+slab batcher un-gated concurrent multi-request decode on Level Zero and
+bypasses the per-engine request mutex, so the Xe-LPG path no longer
+serialises same-model requests. Key finding: on the Meteor Lake iGPU this
+buys *latency / fairness*, not throughput — with no matrix engine, batched
+decode re-reads the weights per sequence (confirmed for both sparse-MoE and
+dense), so a batch does not amortise. Throughput concurrency is a Bragi /
+GB10 concern. Remaining here is polish: slot eviction / preemption on the
+slab path and a memory-based batch-capacity probe. The original design
+notes below are kept for provenance.
+
 Per-request state isolation. Removes the request mutex.
 
 - **Per-request KV cache pool.** Today there is one engine-wide
