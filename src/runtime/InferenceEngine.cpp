@@ -12,6 +12,8 @@
 #include "compute/cpu/GpuMatmul.hpp"
 #include "compute/cpu/GpuOps.hpp"
 #include "core/backend/BackendRegistry.hpp"
+#include "core/backend/HwFingerprint.hpp"
+#include "runtime/ProbeConfig.hpp"
 #include "core/cpu/CpuContext.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "core/gguf/TensorFingerprint.hpp"
@@ -572,7 +574,44 @@ void InferenceEngine::finalizeLoad() {
         // bench (with its own parity gate) and pins the dispatch decision
         // per QuantType. Honours `features.gemm` / `features.dp4a`.
         l0Ops().selfTest(allocator());
-        l0Gmm().autotune(allocator(), _config.embeddingLength, _cfg.features);
+
+        // M-Probe.1 — consult the offline probe artefact for this exact HW
+        // (fingerprint-matched). A hit lets us apply the persisted
+        // kernel-variant decision and skip the online autotune bench;
+        // behaviour-identical on matching hardware, just faster startup. A
+        // miss (the default — no artefact deployed) falls straight through to
+        // the normal online autotune, so this is inert until an operator runs
+        // `mimirmind-probe --sweep` and deploys the result.
+        core::config::FeatureSettings tunedFeatures = _cfg.features;
+        {
+            const std::string fp = core::backend::computeHwFingerprint(
+                core::backend::gatherHostInfo(),
+                core::backend::identityFromBackend(_computeCtx->backend()));
+            const char* dirEnv = std::getenv("MIMIRMIND_PROBE_DIR");
+            const std::string dir =
+                dirEnv ? dirEnv : "/usr/local/share/mimirmind/configs";
+            const auto picks = loadProbePicks(dir, fp);
+            if (picks && picks->hasAutotune && picks->gemmNeverForAllMatmul &&
+                tunedFeatures.gemm == core::config::TriState::Auto) {
+                tunedFeatures.gemm = core::config::TriState::Disable;
+                MM_LOG_INFO("probe",
+                            "probe artefact HIT (fp={} model='{}' status={}) — "
+                            "applying persisted pick (GEMM never wins, matvec "
+                            "everywhere); skipping the online autotune bench",
+                            fp, picks->modelId, picks->probeStatus);
+            } else if (picks) {
+                MM_LOG_INFO("probe",
+                            "probe artefact for fp={} has no actionable pick "
+                            "(hasAutotune={}, gemmNever={}) — online autotune",
+                            fp, picks->hasAutotune, picks->gemmNeverForAllMatmul);
+            } else {
+                MM_LOG_INFO("probe",
+                            "no probe artefact for fp={} under {} — online "
+                            "autotune (run mimirmind-probe --sweep to generate)",
+                            fp, dir);
+            }
+        }
+        l0Gmm().autotune(allocator(), _config.embeddingLength, tunedFeatures);
     } else {
         MM_LOG_INFO("engine",
                     "non-L0 backend ({}) — skipping FusedQkvWeights, "

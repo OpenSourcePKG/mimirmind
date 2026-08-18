@@ -358,6 +358,7 @@ find_package(OpenSSL REQUIRED)
 add_library(mimirmind_core_common STATIC
     src/core/backend/BackendPool.cpp
     src/core/backend/BackendRegistry.cpp
+    src/core/backend/HwFingerprint.cpp
     src/core/config/Config.cpp
     src/core/cpu/CpuContext.cpp
     src/core/gguf/GgufReader.cpp
@@ -1194,6 +1195,7 @@ add_executable(mimirmind
     src/model/Tokenizer.cpp
     src/runtime/BlockBuffers.cpp
     src/runtime/InferenceEngine.cpp
+    src/runtime/ProbeConfig.cpp
     src/runtime/ComputeStack.cpp
     src/runtime/engine/Nvfp4Loader.cpp
     src/runtime/engine/MtpDecoder.cpp

@@ -30,7 +30,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include <sys/utsname.h>
+#include "core/backend/HwFingerprint.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -68,66 +68,8 @@ namespace {
 using json = nlohmann::json;
 namespace be = mimirmind::core::backend;
 
-// FNV-1a 64-bit — the fingerprint is a stable cache key, not a security
-// digest, so a fast dependency-free hash is the right tool (no OpenSSL link).
-std::uint64_t fnv1a64(std::string_view s) {
-    std::uint64_t h = 1469598103934665603ULL;
-    for (char ch : s) {
-        h ^= static_cast<unsigned char>(ch);
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-std::string toHex16(std::uint64_t v) {
-    char buf[17];
-    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(v));
-    return std::string{buf};
-}
-
-// First "model name" line from /proc/cpuinfo (Linux). Empty on failure.
-std::string cpuModel() {
-    std::ifstream f{"/proc/cpuinfo"};
-    std::string line;
-    while (std::getline(f, line)) {
-        const auto colon = line.find(':');
-        if (colon != std::string::npos &&
-            line.compare(0, 10, "model name") == 0) {
-            std::string v = line.substr(colon + 1);
-            const auto b = v.find_first_not_of(" \t");
-            const auto e = v.find_last_not_of(" \t");
-            return (b == std::string::npos) ? std::string{} : v.substr(b, e - b + 1);
-        }
-    }
-    return {};
-}
-
-unsigned cpuThreads() {
-    const unsigned hc = std::thread::hardware_concurrency();
-    return hc ? hc : 0U;
-}
-
-// MemTotal from /proc/meminfo, rounded to whole GiB (a bucket — small RAM
-// jitter across boots must not change the fingerprint).
-std::uint64_t ramGiB() {
-    std::ifstream f{"/proc/meminfo"};
-    std::string key;
-    std::uint64_t kb = 0;
-    if (f >> key >> kb) {
-        if (key == "MemTotal:") {
-            return (kb + (512ULL * 1024ULL)) / (1024ULL * 1024ULL);  // kB -> GiB, rounded
-        }
-    }
-    return 0;
-}
-
-std::string kernelRelease() {
-    struct utsname u{};
-    if (::uname(&u) == 0) {
-        return std::string{u.release};
-    }
-    return {};
-}
+// HW fingerprint + host-info live in core/backend/HwFingerprint (shared with
+// the runtime so both derive an identical fingerprint).
 
 std::string iso8601UtcNow() {
     const auto now = std::chrono::system_clock::now();
@@ -633,24 +575,17 @@ int main(int argc, char** argv) {
     }
 
     // --- Host block (always available) -------------------------------------
-    const std::string hostCpu     = cpuModel();
-    const unsigned    hostThreads = cpuThreads();
-    const std::uint64_t hostRamGiB = ramGiB();
-    const std::string hostKernel  = kernelRelease();
-
+    const be::HwHostInfo host = be::gatherHostInfo();
     json hw;
     hw["host"] = {
-        {"cpu_model", hostCpu},
-        {"cpu_threads", hostThreads},
-        {"ram_gib", hostRamGiB},
-        {"kernel", hostKernel},
+        {"cpu_model", host.cpuModel},
+        {"cpu_threads", host.threads},
+        {"ram_gib", host.ramGiB},
+        {"kernel", host.kernel},
     };
 
-    // Canonical fingerprint string — only STABLE identity fields. Timing,
-    // timestamps and mutable counters never enter it.
-    std::ostringstream fp;
-    fp << "host|" << hostCpu << '|' << hostThreads << '|' << hostRamGiB
-       << '|' << hostKernel;
+    // Filled from the active backend below; drives the shared fingerprint.
+    be::HwProbeIdentity fpId;
 
     // --- Available-backends probe (no construction) ------------------------
     json avail = json::array();
@@ -697,20 +632,15 @@ int main(int argc, char** argv) {
             {"features", features},
         };
 
-        // Fingerprint from stable device identity — NOT clock/mem which can
-        // jitter with governor state, and NOT bandwidth (a heuristic).
-        fp << "|dev|" << be::BackendRegistry::name(b.kind()) << '|' << info.name
-           << '|' << info.uuid << '|' << pci << '|' << info.numComputeUnits;
-        for (const auto& fb : kFeatures) {
-            fp << (b.hasFeature(fb.f) ? '1' : '0');
-        }
+        // Fingerprint identity via the shared builder — single source of
+        // truth so the runtime derives the exact same fingerprint.
+        fpId = be::identityFromBackend(b);
     } catch (const std::exception& e) {
         // No device (e.g. no /dev/dri): host-only fingerprint, backend noted.
         backendJson = {
             {"kind", "none"},
             {"error", e.what()},
         };
-        fp << "|dev|none";
         std::fprintf(stderr,
                      "[warn] backend '%s' could not be constructed (%s) — "
                      "emitting a host-only fingerprint\n",
@@ -718,7 +648,7 @@ int main(int argc, char** argv) {
     }
     hw["backend"] = std::move(backendJson);
 
-    const std::string fingerprint = toHex16(fnv1a64(fp.str()));
+    const std::string fingerprint = be::computeHwFingerprint(host, fpId);
 
     // --- Op sweep (optional) -----------------------------------------------
     // "fingerprint-only" = no measurements (runtime uses defaults).
