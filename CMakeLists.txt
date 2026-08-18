@@ -2622,6 +2622,34 @@ if(TARGET mimirmind_core_cuda)
     target_link_libraries(backend_select_probe PRIVATE mimirmind_core_cuda)
 endif()
 
+# ---- mimirmind_probe — offline probe-driven config generation (M-Probe.1) --
+#
+# Increment 1: HW-fingerprint + config-artefact contract. Constructs the
+# active ComputeContext (same link surface as backend_select_probe), reads
+# the neutral device info + feature flags, and emits
+# configs/hw/{fingerprint}/probe-result.json. The sweep / correctness-gate /
+# margin logic (M-Probe.1.B-F) land in later increments.
+
+add_executable(mimirmind_probe
+    tools/mimirmind-probe.cpp
+)
+
+target_link_libraries(mimirmind_probe PRIVATE
+    mimirmind_core_common   # PUBLIC-exposes third_party/ (vendored nlohmann/json)
+)
+
+if(TARGET mimirmind_core_l0)
+    target_link_libraries(mimirmind_probe PRIVATE mimirmind_core_l0)
+endif()
+
+if(TARGET mimirmind_core_hip)
+    target_link_libraries(mimirmind_probe PRIVATE mimirmind_core_hip)
+endif()
+
+if(TARGET mimirmind_core_cuda)
+    target_link_libraries(mimirmind_probe PRIVATE mimirmind_core_cuda)
+endif()
+
 # ---- install rules --------------------------------------------------------
 #
 # Consolidated install layout so `cmake --install build` (or `make install`)
