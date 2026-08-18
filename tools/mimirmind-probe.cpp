@@ -59,6 +59,7 @@
 #include "core/gpu/l0/L0ComputeContext.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
 #include "core/gguf/GgufTypes.hpp"
+#include "runtime/KvCache.hpp"
 #endif
 
 namespace {
@@ -207,10 +208,46 @@ void refRmsNorm(const float* x, const float* w, float* y,
         for (std::size_t k = 0; k < K; ++k) {
             ss += static_cast<double>(xr[k]) * static_cast<double>(xr[k]);
         }
-        const double inv = 1.0 / std::sqrt(ss / static_cast<double>(K) + eps);
+        const double inv =
+            1.0 / std::sqrt(ss / static_cast<double>(K) + static_cast<double>(eps));
         for (std::size_t k = 0; k < K; ++k) {
             y[m * K + k] = static_cast<float>(static_cast<double>(xr[k]) * inv *
                                               static_cast<double>(w[k]));
+        }
+    }
+}
+
+// Reference causal (prefill self-)attention, F32 KV, GQA. out[i,h,:] =
+// softmax_j<=i( scale * Q[i,h].K[j,kvh] ) . V[j,kvh], kvh = h / (nHeads/nKvHeads).
+void refAttentionCausal(const float* q, const float* k, const float* v, float* out,
+                        std::size_t T, std::size_t nHeads, std::size_t nKvHeads,
+                        std::size_t headDim, float scale) {
+    const std::size_t qDim  = nHeads * headDim;
+    const std::size_t kvDim = nKvHeads * headDim;
+    const std::size_t g     = nHeads / nKvHeads;
+    std::vector<double> s(T);
+    for (std::size_t i = 0; i < T; ++i) {
+        for (std::size_t h = 0; h < nHeads; ++h) {
+            const std::size_t kvh = h / g;
+            const float* qi = q + i * qDim + h * headDim;
+            double mx = -1e300;
+            for (std::size_t j = 0; j <= i; ++j) {
+                const float* kj = k + j * kvDim + kvh * headDim;
+                double dot = 0.0;
+                for (std::size_t d = 0; d < headDim; ++d)
+                    dot += static_cast<double>(qi[d]) * static_cast<double>(kj[d]);
+                s[j] = dot * static_cast<double>(scale);
+                if (s[j] > mx) mx = s[j];
+            }
+            double denom = 0.0;
+            for (std::size_t j = 0; j <= i; ++j) { s[j] = std::exp(s[j] - mx); denom += s[j]; }
+            float* oi = out + i * qDim + h * headDim;
+            for (std::size_t d = 0; d < headDim; ++d) {
+                double acc = 0.0;
+                for (std::size_t j = 0; j <= i; ++j)
+                    acc += s[j] * static_cast<double>(v[j * kvDim + kvh * headDim + d]);
+                oi[d] = static_cast<float>(acc / denom);
+            }
         }
     }
 }
@@ -416,6 +453,84 @@ nlohmann::json runL0Sweep() {
             usm.deallocate(yUsm, yBytes);
         }
         usm.deallocate(wnUsm, wnBytes);
+    }
+
+    // --- attention (prefill causal self-attention, F32 KV, GQA) ------------
+    // The O(T^2) op. T_k = T_q = T, positionOffset 0, full causal (no window).
+    {
+        constexpr std::size_t nHeads = 8, nKvHeads = 2, headDim = 64;
+        const std::size_t qDim  = nHeads * headDim;
+        const std::size_t kvDim = nKvHeads * headDim;
+        const float scale = 1.0F / std::sqrt(static_cast<float>(headDim));
+        const std::size_t Ts[] = {16, 64, 128, 256};
+
+        for (std::size_t T : Ts) {
+            std::vector<float> qHost(T * qDim), kHost(T * kvDim), vHost(T * kvDim);
+            for (float& val : qHost) val = dist(rng);
+            for (float& val : kHost) val = dist(rng);
+            for (float& val : vHost) val = dist(rng);
+            const std::size_t qBytes  = qHost.size() * sizeof(float);
+            const std::size_t kvBytes = kHost.size() * sizeof(float);
+
+            void* qUsm = usm.allocate(qBytes);
+            void* kUsm = usm.allocate(kvBytes);
+            void* vUsm = usm.allocate(kvBytes);
+            void* oUsm = usm.allocate(qBytes);
+            std::memcpy(qUsm, qHost.data(), qBytes);
+            std::memcpy(kUsm, kHost.data(), kvBytes);
+            std::memcpy(vUsm, vHost.data(), kvBytes);
+            std::memset(oUsm, 0, qBytes);
+
+            auto call = [&]() {
+                gops.attentionAsync(static_cast<const float*>(qUsm), kUsm, vUsm,
+                                    T, T, nHeads, nKvHeads, headDim,
+                                    /*positionOffset=*/0, scale,
+                                    static_cast<float*>(oUsm),
+                                    /*slidingWindow=*/0,
+                                    mimirmind::runtime::KvDtype::F32);
+                gops.flush();
+            };
+
+            for (int w = 0; w < kWarmup; ++w) call();
+            std::vector<double> ms;
+            ms.reserve(kReps);
+            for (int r = 0; r < kReps; ++r) {
+                const auto t0 = Clock::now();
+                call();
+                ms.push_back(std::chrono::duration<double, std::milli>(
+                                 Clock::now() - t0).count());
+            }
+
+            std::vector<float> oGold(T * qDim);
+            refAttentionCausal(qHost.data(), kHost.data(), vHost.data(),
+                               oGold.data(), T, nHeads, nKvHeads, headDim, scale);
+            const double relErr =
+                relError(static_cast<const float*>(oUsm), oGold.data(), T * qDim);
+
+            const double p50 = percentile(ms, 50.0);
+            const double iqr = percentile(ms, 75.0) - percentile(ms, 25.0);
+            std::string status = "ok";
+            if (relErr >= kTol) status = "parity_fail";
+            else if (p50 > 0.0 && iqr / p50 > 0.15) status = "inconclusive";
+
+            ops.push_back({
+                {"op", "attention"},
+                {"dtype", "F32"},
+                {"backend", "LevelZero"},
+                {"shape", {{"T", T}, {"nHeads", nHeads},
+                           {"nKvHeads", nKvHeads}, {"headDim", headDim}}},
+                {"median_ms", p50},
+                {"iqr_ms", iqr},
+                {"reps", kReps},
+                {"parity_max_rel_diff", relErr},
+                {"status", status},
+            });
+
+            usm.deallocate(qUsm, qBytes);
+            usm.deallocate(kUsm, kvBytes);
+            usm.deallocate(vUsm, kvBytes);
+            usm.deallocate(oUsm, qBytes);
+        }
     }
 
     return ops;
