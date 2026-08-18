@@ -2458,8 +2458,22 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     if ((engine.config().architecture == "qwen35moe" ||
          engine.supportsBatchedDecode()) &&
         engine.servingClassEnabled()) {
-        const std::size_t maxBatch =
+        std::size_t maxBatch =
             std::max<std::size_t>(1, engine.batchCapacity().sustainableBatch);
+        // Operator override of the batcher's slot count. The v1 BatchCapacity
+        // probe is a coarse bandwidth-tier proxy (Xe-LPG ~70 GB/s pins it to
+        // 1) — not a real device-memory calc — so an operator who knows the
+        // model fits more concurrent slots can set MIMIRMIND_SERVING_MAXBATCH.
+        if (const char* mb = std::getenv("MIMIRMIND_SERVING_MAXBATCH")) {
+            const long v = std::atol(mb);
+            if (v > 0) {
+                maxBatch = static_cast<std::size_t>(v);
+                MM_LOG_INFO("main",
+                            "serve: MIMIRMIND_SERVING_MAXBATCH override — "
+                            "batcher maxBatch={} (probe said {})",
+                            maxBatch, engine.batchCapacity().sustainableBatch);
+            }
+        }
         const std::size_t maxContext = engine.maxContextTokens();
         // Total accepted-but-unfinished cap (running + queued). Beyond it the
         // batcher sheds load with a 503 instead of an unbounded queue.

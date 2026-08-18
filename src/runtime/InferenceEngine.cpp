@@ -675,20 +675,25 @@ void InferenceEngine::finalizeLoad() {
             !neutralBatched) {
             const auto backendName =
                 core::backend::BackendRegistry::name(_computeCtx->kind());
-            if (_cfg.serving.enableBatching == TriState::Force) {
-                throw std::runtime_error{
-                    std::string{"serving.enableBatching=force but backend '"}
-                    + backendName + "' is not CUDA — Bragi-v1 restricts "
-                    "continuous-batching to the CUDA path (L0/HIP/CPU stay "
-                    "single-session). Set serving.enableBatching to \"auto\" "
-                    "or \"disable\", or select a CUDA backend."};
-            }
+            // Downgrade to single-session + warn — even under Force, which now
+            // applies PER-MODEL: a multi-model config may force batching for
+            // its Gemma-4 MoE serving model while an auxiliary model whose
+            // backend has no neutral batched decode (a non-CUDA qwen2, or
+            // HIP/CPU) simply stays single-session, rather than aborting the
+            // whole server. (Was a hard throw under Force before M9.1.)
             _servingClassEnabled = false;
-            MM_LOG_WARN("serving",
-                        "batching would engage but backend '{}' is not CUDA — "
-                        "Bragi-v1 restricts serving-class to CUDA "
-                        "(M-Cuda.Batch guardrail). Falling back to "
-                        "single-session.", backendName);
+            if (_cfg.serving.enableBatching == TriState::Force) {
+                MM_LOG_WARN("serving",
+                            "serving.enableBatching=force but backend '{}' has "
+                            "no neutral batched decode — this model stays "
+                            "single-session (force applies per-model; batchable "
+                            "models still engage).", backendName);
+            } else {
+                MM_LOG_WARN("serving",
+                            "batching would engage but backend '{}' is not CUDA "
+                            "and has no neutral batched decode — falling back "
+                            "to single-session.", backendName);
+            }
         }
 
         MM_LOG_INFO("serving",
