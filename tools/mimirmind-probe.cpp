@@ -715,6 +715,38 @@ int main(int argc, char** argv) {
     os << dump << '\n';
     os.close();
 
+    // --- Ledger (M-Probe.1.F) — append-only provenance of every probe run.
+    // One JSON line per run under <out>/probe-ledger.jsonl so a bad pick can be
+    // traced back to when/where/what it was probed (see the design note).
+    {
+        json gemmPicks = json::object();
+        for (const auto& a : artefact.at("autotune")) {
+            if (a.contains("dtype") && a.contains("gemm_picked")) {
+                gemmPicks[a.at("dtype").get<std::string>()] =
+                    a.at("gemm_picked").get<bool>() ? "gemm" : "matvec";
+            }
+        }
+        const json rec = {
+            {"at", artefact.at("generated_at")},
+            {"fingerprint", fingerprint},
+            {"model_id", opt.modelId},
+            {"device", artefact.at("hardware").at("backend")
+                           .value("device_name", std::string{"none"})},
+            {"kernel", host.kernel},
+            {"probe_status", probeStatus},
+            {"ops", artefact.at("ops").size()},
+            {"gemm_picks", std::move(gemmPicks)},
+        };
+        const fs::path ledgerPath = fs::path{opt.outRoot} / "probe-ledger.jsonl";
+        std::ofstream led{ledgerPath, std::ios::app};
+        if (led) {
+            led << rec.dump() << '\n';
+        } else {
+            std::fprintf(stderr, "[warn] cannot append ledger %s\n",
+                         ledgerPath.c_str());
+        }
+    }
+
     std::printf("mimirmind-probe: fingerprint=%s  backend=%s  ->  %s\n",
                 fingerprint.c_str(),
                 be::BackendRegistry::name(kind),
