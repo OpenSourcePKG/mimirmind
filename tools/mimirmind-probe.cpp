@@ -197,6 +197,24 @@ void refMatmulF32(const float* W, const float* X, float* Y,
     }
 }
 
+// Reference RMSNorm: y[m,k] = x[m,k] / sqrt(mean_k(x^2) + eps) * w[k], per row.
+// Matches the plain (weight-multiplicative, no +1) convention of rmsNormAsync.
+void refRmsNorm(const float* x, const float* w, float* y,
+                std::size_t M, std::size_t K, float eps) {
+    for (std::size_t m = 0; m < M; ++m) {
+        double ss = 0.0;
+        const float* xr = x + m * K;
+        for (std::size_t k = 0; k < K; ++k) {
+            ss += static_cast<double>(xr[k]) * static_cast<double>(xr[k]);
+        }
+        const double inv = 1.0 / std::sqrt(ss / static_cast<double>(K) + eps);
+        for (std::size_t k = 0; k < K; ++k) {
+            y[m * K + k] = static_cast<float>(static_cast<double>(xr[k]) * inv *
+                                              static_cast<double>(w[k]));
+        }
+    }
+}
+
 // Max |gpu - gold| / max|gold| over all elements.
 double relError(const float* gpu, const float* gold, std::size_t n) {
     double maxAbsDiff = 0.0, maxAbsGold = 0.0;
@@ -208,9 +226,9 @@ double relError(const float* gpu, const float* gold, std::size_t n) {
     return maxAbsDiff / (maxAbsGold + 1e-9);
 }
 
-// Run the L0 matmul sweep (F32 + Q8_0) and return the `ops` array. Throws on
-// device construction failure (caller degrades to no-sweep).
-nlohmann::json runL0MatmulSweep() {
+// Run the L0 op sweep (matmul F32+Q8_0, then rmsnorm F32) and return the `ops`
+// array. Throws on device construction failure (caller degrades to no-sweep).
+nlohmann::json runL0Sweep() {
     namespace cl0 = mimirmind::core::l0;
     namespace ml0 = mimirmind::compute::l0;
     namespace mq  = mimirmind::compute::quant;
@@ -331,6 +349,75 @@ nlohmann::json runL0MatmulSweep() {
         }
         usm.deallocate(wUsm, wBytes);
     }
+
+    // --- rmsnorm (F32) -----------------------------------------------------
+    // Element-wise per-row normalisation — a bandwidth-bound op, the opposite
+    // profile to matmul. Async, so flush() before reading the result.
+    {
+        constexpr float eps = 1e-6F;
+        std::vector<float> wNorm(K);
+        for (float& v : wNorm) v = 1.0F + dist(rng);   // ~1.0 gain
+        const std::size_t wnBytes = wNorm.size() * sizeof(float);
+        void* wnUsm = usm.allocate(wnBytes);
+        std::memcpy(wnUsm, wNorm.data(), wnBytes);
+
+        for (std::size_t M : Ms) {
+            std::vector<float> xHost(M * K);
+            for (float& v : xHost) v = dist(rng);
+            const std::size_t xBytes = xHost.size() * sizeof(float);
+            const std::size_t yBytes = M * K * sizeof(float);
+
+            void* xUsm = usm.allocate(xBytes);
+            void* yUsm = usm.allocate(yBytes);
+            std::memcpy(xUsm, xHost.data(), xBytes);
+            std::memset(yUsm, 0, yBytes);
+
+            auto call = [&]() {
+                gops.rmsNormAsync(static_cast<const float*>(xUsm), M, K,
+                                  static_cast<const float*>(wnUsm), eps,
+                                  static_cast<float*>(yUsm));
+                gops.flush();   // async op — sync before the host reads yUsm
+            };
+
+            for (int w = 0; w < kWarmup; ++w) call();
+            std::vector<double> ms;
+            ms.reserve(kReps);
+            for (int r = 0; r < kReps; ++r) {
+                const auto t0 = Clock::now();
+                call();
+                ms.push_back(std::chrono::duration<double, std::milli>(
+                                 Clock::now() - t0).count());
+            }
+
+            std::vector<float> yGold(M * K);
+            refRmsNorm(xHost.data(), wNorm.data(), yGold.data(), M, K, eps);
+            const double relErr =
+                relError(static_cast<const float*>(yUsm), yGold.data(), M * K);
+
+            const double p50 = percentile(ms, 50.0);
+            const double iqr = percentile(ms, 75.0) - percentile(ms, 25.0);
+            std::string status = "ok";
+            if (relErr >= kTol) status = "parity_fail";
+            else if (p50 > 0.0 && iqr / p50 > 0.15) status = "inconclusive";
+
+            ops.push_back({
+                {"op", "rmsnorm"},
+                {"dtype", "F32"},
+                {"backend", "LevelZero"},
+                {"shape", {{"N", K}, {"K", K}, {"M", M}}},
+                {"median_ms", p50},
+                {"iqr_ms", iqr},
+                {"reps", kReps},
+                {"parity_max_rel_diff", relErr},
+                {"status", status},
+            });
+
+            usm.deallocate(xUsm, xBytes);
+            usm.deallocate(yUsm, yBytes);
+        }
+        usm.deallocate(wnUsm, wnBytes);
+    }
+
     return ops;
 }
 
@@ -485,7 +572,7 @@ int main(int argc, char** argv) {
     if (opt.sweep) {
 #ifdef MIMIRMIND_PROBE_HAS_L0
         try {
-            ops = runL0MatmulSweep();
+            ops = runL0Sweep();
             if (!ops.empty()) probeStatus = "swept-partial";
         } catch (const std::exception& e) {
             std::fprintf(stderr,
