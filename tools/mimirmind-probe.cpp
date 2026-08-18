@@ -104,12 +104,18 @@ const FeatureBit kFeatures[] = {
 
 // --- Op-sweep (M-Probe.1.B/C/D) ----------------------------------------------
 //
-// Increment 2a: an L0 F32 matmul sweep across M-buckets with an inline
-// double-accumulate reference gate + median/IQR margin. F32 needs no quant
-// encoder and its reference is exact, so this is the safe first op. Quant
-// dtypes (Q8_0 has a row encoder; Q4_K/Q6_K need encoders that don't exist
-// yet) and the cross-backend axis (needs a neutral op-invocation seam that
-// ComputeContext does not expose today) are the remaining 4.6.2 work.
+// Sweeps the L0 (LevelZero) ops that carry real kernel-variant choices —
+// matmul (F32 + Q8_0) across M-buckets, rmsnorm, and causal attention — each
+// gated on an inline F64-accumulate reference (C, the correctness gold) and
+// guarded by a median/IQR margin (D, an inconclusive verdict when IQR/median
+// exceeds 15 %). The kernel-variant winner (matvec vs GEMM, DP4A on/off) is
+// persisted separately in autotune[] via the engine's own correctness-gated
+// GpuMatmul::autotune(). This is the single-backend deliverable; two axes are
+// deferred by design and tracked as 4.6.4: (1) the Q4_K/Q6_K quant dtypes,
+// which need row encoders that do not exist yet, and (2) the cross-backend
+// axis, which needs a neutral op-invocation seam ComputeContext does not
+// expose today. probe_status therefore stays "swept-partial" — honest, since
+// the full dtype x backend matrix is not yet covered.
 
 using Clock = std::chrono::steady_clock;
 
@@ -652,10 +658,11 @@ int main(int argc, char** argv) {
 
     // --- Op sweep (optional) -----------------------------------------------
     // "fingerprint-only" = no measurements (runtime uses defaults).
-    // "swept-partial"    = some ops measured, but NOT the full
-    //                      backend x kernel x dtype matrix (F32 matmul only
-    //                      today) — the runtime must still default anything
-    //                      not present in ops[].
+    // "swept-partial"    = ops measured (matmul F32/Q8_0, rmsnorm, attention +
+    //                      kernel-variant autotune) but NOT the full backend x
+    //                      kernel x dtype matrix — Q4_K/Q6_K dtypes and the
+    //                      cross-backend axis are deferred (4.6.4). The runtime
+    //                      must still default anything not present in ops[].
     json ops = json::array();
     json autotune = json::array();
     std::string probeStatus = "fingerprint-only";
