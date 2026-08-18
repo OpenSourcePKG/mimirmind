@@ -150,6 +150,66 @@ void Nvfp4Loader::load(InferenceEngine& e,
                                                    gDevOps);
         gCudaCtx.stream().synchronize();
 
+        // 5.13 (M-Cuda.Gemma-NVFP4-TC) — keep the dense projections in native
+        // blocked-NVFP4 instead of the just-materialised BF16, so decode reads
+        // 4-bit weights (¼ the bytes) on the weight-bandwidth-bound path. Same
+        // repackage as the qwen shared-expert keep-path below (repackageNvfp4ToBlk
+        // + isNvfp4Blk → NVFP4_BLK in buildBf16WeightsMap; the Gemma backend
+        // dispatch is type-driven so it routes to matmul_nvfp4blk automatically).
+        // Gemma4 has no experts/GDN → EVERY NVFP4-sourced projection is dense;
+        // norms/embeds are BF16 passthroughs (src.kind != Nvfp4) and stay BF16.
+        // Opt-in, default OFF (prod stays on the BF16 path until A/B'd).
+        if (const char* ge = std::getenv("MIMIRMIND_GEMMA_NVFP4_DECODE");
+            ge != nullptr && std::string_view{ge} != "0") {
+            std::size_t nRepack = 0;
+            std::uint64_t bytesBefore = 0, bytesAfter = 0;
+            for (const auto& step : gsteps) {
+                if (step.sources.size() != 1) continue;
+                const auto& src = step.sources[0];
+                if (src.kind != core::modelopt::SourceKind::Nvfp4) continue;
+                if ((src.in % 32) != 0) continue;
+                auto it = std::find_if(
+                    e._materializedBf16.begin(), e._materializedBf16.end(),
+                    [&](const runtime::nvfp4::MaterializedTensor& t) {
+                        return t.ggufName == step.ggufName;
+                    });
+                if (it == e._materializedBf16.end() || it->isF32) continue;
+                // compressed-tensors gemma4 sets the scale sidecar names
+                // explicitly on the source (packed=.weight_packed,
+                // block=.weight_scale, global=.weight_global_scale stored as a
+                // RECIPROCAL). Use those directly rather than reconstructing the
+                // qwen35moe .weight/.weight_scale_2 convention.
+                const auto* pk = e._nvfp4Model->find(src.hfWeightName);
+                const auto* bs = src.blockScaleName.empty()
+                                     ? nullptr
+                                     : e._nvfp4Model->find(src.blockScaleName);
+                const auto* gs = src.globalScaleName.empty()
+                                     ? nullptr
+                                     : e._nvfp4Model->find(src.globalScaleName);
+                if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
+                float global = gDevOps.readF32(gs->devPtr);
+                if (src.globalIsReciprocal) {
+                    global = 1.0F / global;   // dequant MULTIPLIES by the global
+                }
+                const std::size_t blkBytes =
+                    (static_cast<std::size_t>(it->elems) / 32) * 20;
+                compute::ComputeBuffer nb = gDevOps.allocateWeight(blkBytes);
+                gDevOps.repackageNvfp4ToBlk(nb.get(), pk->devPtr, bs->devPtr,
+                                            global, src.rows, src.in);
+                gCudaCtx.stream().synchronize();
+                bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
+                bytesAfter  += blkBytes;
+                it->buffer     = std::move(nb);   // frees the BF16 buffer (RAII)
+                it->isNvfp4Blk = true;
+                ++nRepack;
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: gemma4 kept {} dense projections native "
+                        "blocked-NVFP4 (MIMIRMIND_GEMMA_NVFP4_DECODE) "
+                        "({} MiB -> {} MiB)",
+                        nRepack, bytesBefore >> 20, bytesAfter >> 20);
+        }
+
         e._weights.emplace(
             runtime::nvfp4::buildBf16WeightsMap(e._materializedBf16));
         e._nvfp4Model.reset();
