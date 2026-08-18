@@ -56,6 +56,7 @@
 #include "compute/l0/GpuMatmul.hpp"
 #include "compute/l0/GpuOps.hpp"
 #include "compute/quant/Q8_0.hpp"
+#include "core/config/Config.hpp"
 #include "core/gpu/l0/L0ComputeContext.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
 #include "core/gguf/GgufTypes.hpp"
@@ -533,7 +534,50 @@ nlohmann::json runL0Sweep() {
         }
     }
 
-    return ops;
+    // --- kernel-variant autotune (matvec vs GEMM / DP4A per QuantType) ------
+    // Reuse the engine's own correctness-gated autotune (its DP4A parity gate
+    // is the M8.H lesson baked in) and persist its decision — the crossover
+    // threshold gemm_min_m and the DP4A pick are exactly what the runtime
+    // would otherwise recompute at every load.
+    nlohmann::json autotune = nlohmann::json::array();
+    try {
+        gmm.autotune(usm, K, mimirmind::core::config::FeatureSettings{});
+        for (const auto& r : gmm.autotuneReport()) {
+            // Per-M vec-vs-GEMM detail only makes sense when a GEMM kernel
+            // exists to compare against.
+            nlohmann::json buckets = nlohmann::json::array();
+            if (r.gemmAvailable) {
+                for (std::size_t b = 0; b < r.mBuckets.size(); ++b) {
+                    if (r.mBuckets[b] == 0) continue;
+                    buckets.push_back({{"M", r.mBuckets[b]},
+                                       {"vec_ms", r.vecMsAtM[b]},
+                                       {"gemm_ms", r.gemmMsAtM[b]}});
+                }
+            }
+            // gemmMinM is the crossover threshold: 0 = unset, SIZE_MAX = GEMM
+            // never wins (matvec everywhere), else the smallest M that picks GEMM.
+            nlohmann::json gemmMinM;
+            if (r.gemmMinM == 0) gemmMinM = nullptr;
+            else if (r.gemmMinM == static_cast<std::size_t>(-1)) gemmMinM = "never";
+            else gemmMinM = r.gemmMinM;
+
+            autotune.push_back({
+                {"dtype", r.name},
+                {"gemm_available", r.gemmAvailable},
+                {"gemm_picked", r.gemmPicked},
+                {"gemm_min_m", gemmMinM},
+                {"dp4a_available", r.dp4aAvailable},
+                {"dp4a_picked", r.dp4aPicked},
+                {"dp4a_ms", r.dp4aMs},
+                {"source", r.source},
+                {"buckets", std::move(buckets)},
+            });
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[warn] autotune skipped (%s)\n", e.what());
+    }
+
+    return nlohmann::json{{"ops", std::move(ops)}, {"autotune", std::move(autotune)}};
 }
 
 #endif  // MIMIRMIND_PROBE_HAS_L0
@@ -683,12 +727,15 @@ int main(int argc, char** argv) {
     //                      today) — the runtime must still default anything
     //                      not present in ops[].
     json ops = json::array();
+    json autotune = json::array();
     std::string probeStatus = "fingerprint-only";
     if (opt.sweep) {
 #ifdef MIMIRMIND_PROBE_HAS_L0
         try {
-            ops = runL0Sweep();
-            if (!ops.empty()) probeStatus = "swept-partial";
+            json sweep = runL0Sweep();
+            ops      = sweep.value("ops", json::array());
+            autotune = sweep.value("autotune", json::array());
+            if (!ops.empty() || !autotune.empty()) probeStatus = "swept-partial";
         } catch (const std::exception& e) {
             std::fprintf(stderr,
                          "[warn] op sweep failed (%s) — fingerprint-only\n",
@@ -710,6 +757,7 @@ int main(int argc, char** argv) {
         {"probe_status", probeStatus},
         {"hardware", std::move(hw)},
         {"ops", std::move(ops)},
+        {"autotune", std::move(autotune)},
     };
 
     const std::string dump = artefact.dump(2);
