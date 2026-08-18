@@ -610,11 +610,13 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         dims.rmsNormEps     = _e._config.rmsNormEps;
         dims.scaleEmbedding = _e._backend->scalesEmbedding();
 
-        // Match the engine's configured KV dtype (== the validated M-L0.Batch
-        // harness, which builds its per-seq caches with `_kvDtype` and is
-        // parity-checked under both F32 and Q8_0 on Gemma 4 26B-A4B). The
-        // backend's runBlockBatched honours each cache's own dtype.
-        const KvDtype kvDtype = _e._kvDtype;
+        // F32 KV only. The Gemma 4 batched-decode attention (M-L0.Batch
+        // Phase 1, runAttentionSectionBatched) supports F32 KV exclusively —
+        // it throws on Q8_0/FP16 — so the serving slab substrate is always
+        // F32, independent of the engine's single-session `_kvDtype` (which
+        // may be Q8_0 on the NUC). This mirrors PagedKvPool's F32 baseline;
+        // the two KV substrates and the single-session cache are separate.
+        const KvDtype kvDtype = KvDtype::F32;
         l0->slab = serving::KvCacheSlabPool::forBackend(
             *_e._ops, *_e._backend, maxBatch, maxContext, kvDtype);
         l0->stepper = std::make_unique<serving::SlabDecodeStepper>(
