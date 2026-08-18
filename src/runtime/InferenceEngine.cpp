@@ -886,6 +886,32 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
                     "pre-allocated for {} tokens dtype={} "
                     "(set via runtime.maxContextTokens / runtime.kvDtype)",
                     _maxContextTokens, dtypeLabel);
+
+        // Multi-entry prefix cache — allocate N-1 backup KvCaches so
+        // interleaved conversations each keep a warm prefix (opt-in via
+        // MIMIRMIND_PREFIX_CACHE_SLOTS). Pure-attention only: SSM/GDN
+        // backends force lcp=0 and must never carry a stale recurrence.
+        _prefixSlots = 1;
+        if (!_backend->needsSsmScratch()) {
+            if (const char* s = std::getenv("MIMIRMIND_PREFIX_CACHE_SLOTS")) {
+                const long v = std::atol(s);
+                if (v > 1) _prefixSlots = static_cast<std::size_t>(v);
+            }
+        }
+        for (std::size_t i = 1; i < _prefixSlots; ++i) {
+            _prefixBackups.push_back(PrefixSlot{
+                std::make_unique<KvCache>(
+                    *_ops, _maxContextTokens,
+                    _backend->kvDimPerLayer(),
+                    _backend->kvSourceLayerPerLayer(), _kvDtype),
+                {}, 0});
+        }
+        if (_prefixSlots > 1) {
+            MM_LOG_INFO("kvcache",
+                        "multi-entry prefix cache: {} slots "
+                        "(1 active + {} backup KvCache @ {} tokens each)",
+                        _prefixSlots, _prefixSlots - 1, _maxContextTokens);
+        }
     }
 
     // Per-sequence GatedDeltaNet recurrent state (hybrid-recurrent models
@@ -1027,6 +1053,86 @@ InferenceEngine::sampleNext(const float*                   hidden,
         recentTokens, effSampling);
 }
 
+// --------------------------------------------------------------------------
+// Multi-entry prefix cache
+//
+// The single-slot prefix cache (M9.1) reuses the last request's leading K/V
+// only when the very next prompt shares that exact prefix. Interleaved
+// conversations (A, B, A, B, ...) therefore evict each other every turn — a
+// cold reprefill each time. This keeps a small pool of backup KvCache slots
+// and, for each new prompt, swaps into the active slot whichever cached
+// sequence shares the longest prefix. The swap is an O(1) exchange of the
+// KvCache pointer and the token vector — no K/V data is copied.
+//
+// Policy (only runs when MIMIRMIND_PREFIX_CACHE_SLOTS > 1):
+//   * If some backup shares a strictly longer prefix than the active slot,
+//     swap it in (the vacated active becomes a backup, keeping its recency).
+//   * Else, if the active shares only a trivial prefix with this prompt
+//     (a fresh conversation), evict the LRU backup instead of the active —
+//     the current active is preserved as a backup so its owner can return.
+//   * Else keep the active slot (it already matches best).
+// SSM/GDN backends are excluded upstream (no backups allocated).
+void InferenceEngine::selectPrefixSlot(std::span<const std::int32_t> promptIds) {
+    if (_prefixBackups.empty() || _backend->needsSsmScratch()) {
+        return;   // single-slot mode or recurrent backend — nothing to do
+    }
+    const std::uint64_t now = ++_prefixTick;
+
+    const std::size_t activeLcp = longestCommonPrefix(
+        promptIds, std::span<const std::int32_t>{_cachedTokens});
+    std::size_t bestLcp = activeLcp;
+    int bestIdx = -1;   // -1 == the active slot
+    for (std::size_t i = 0; i < _prefixBackups.size(); ++i) {
+        const std::size_t l = longestCommonPrefix(
+            promptIds, std::span<const std::int32_t>{_prefixBackups[i].tokens});
+        if (l > bestLcp) {
+            bestLcp = l;
+            bestIdx = static_cast<int>(i);
+        }
+    }
+
+    // "Continuing the active slot" means this prompt extends what the active
+    // cache already holds — the shared prefix covers essentially the whole
+    // cached sequence. If instead the prompt diverges early (it shares only
+    // the chat-template / system-prompt preamble, which every request has in
+    // common), the active slot holds a *different* conversation that we must
+    // preserve before overwriting it. A fixed absolute LCP threshold cannot
+    // tell these apart — the common preamble is tens of tokens — so compare
+    // the match against the active's own cached length instead.
+    constexpr std::size_t kContMargin = 4;   // slack for the last generated token
+    const bool continuingActive =
+        _cachedTokens.empty() ||
+        activeLcp + kContMargin >= _cachedTokens.size();
+
+    if (bestIdx >= 0) {
+        // A backup continues its conversation better than the active — swap
+        // it in. The old active is preserved in that backup slot (with its
+        // own recency) so its owner can come back to it later.
+        PrefixSlot& b = _prefixBackups[static_cast<std::size_t>(bestIdx)];
+        std::swap(_kvCache, b.cache);
+        std::swap(_cachedTokens, b.tokens);
+        b.lastUsed = _activeLastUsed;
+    } else if (!continuingActive) {
+        // A new/foreign conversation while the active holds a different one —
+        // preserve the active by parking it in the least-recently-used
+        // backup; the new conversation takes over that disposable slot.
+        std::size_t lru = 0;
+        for (std::size_t i = 1; i < _prefixBackups.size(); ++i) {
+            if (_prefixBackups[i].lastUsed < _prefixBackups[lru].lastUsed) {
+                lru = i;
+            }
+        }
+        PrefixSlot& b = _prefixBackups[lru];
+        std::swap(_kvCache, b.cache);
+        std::swap(_cachedTokens, b.tokens);
+        b.lastUsed = _activeLastUsed;
+    }
+    // else: continuing the active slot — keep it.
+    // else: the active slot already shares the longest prefix — keep it.
+
+    _activeLastUsed = now;
+}
+
 std::vector<std::int32_t>
 InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                           const GenerateParams&           params,
@@ -1126,13 +1232,21 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     const std::size_t d_model   = _config.embeddingLength;
 
     ensureCapacity(maxT, Tp, maxNew, vocab_lm, d_model);
-    KvCache&      cache   = *_kvCache;
     BlockBuffers& buffers = *_blockBuffers;
 
     float* const xBuf      = _xBufH     .as<float>();
     float* const normFinal = _normFinalH.as<float>();
     float* const logits    = _logitsH   .as<float>();
     float* const logitsSc  = _logitsScH .as<float>();
+
+    // --- Multi-entry prefix cache --------------------------------------
+    // Before the LCP reuse below, swap in the backup slot whose cached
+    // tokens share the longest prefix with this prompt (O(1) pointer swap,
+    // no KV copy). No-op unless MIMIRMIND_PREFIX_CACHE_SLOTS > 1. This lets
+    // interleaved conversations each hit their own warm prefix instead of
+    // the single-slot active cache being evicted by any foreign request.
+    selectPrefixSlot(promptIds);
+    KvCache& cache = *_kvCache;   // bind AFTER the swap — _kvCache may change
 
     // --- M9.1 prefix cache ----------------------------------------------
     //

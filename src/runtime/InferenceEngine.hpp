@@ -953,6 +953,34 @@ private:
     std::size_t                        _cacheVocabLm {0};   // lm-head vocab the logits buf fits
     std::vector<std::int32_t>          _cachedTokens;
 
+    // --- Multi-entry prefix cache (RAG: keep N prefixes warm) -----------
+    // The single active slot above (_kvCache + _cachedTokens) reuses the
+    // LAST request's prefix; any foreign request in between evicts it (a
+    // measured 26x prefill win on the NUC that a single interleaved request
+    // throws away). These extra backup slots keep the N most-recently-distinct
+    // prefixes warm so interleaved conversations each hit their own cached
+    // prefix. Selection is an O(1) pointer swap of the best-LCP slot into the
+    // active _kvCache — NO KV data is copied. Opt-in via
+    // MIMIRMIND_PREFIX_CACHE_SLOTS (N>1); default 1 keeps the single-slot
+    // behaviour + memory. Pure-attention only — SSM/GDN backends force lcp=0
+    // and are never multi-slotted.
+    struct PrefixSlot {
+        std::unique_ptr<KvCache>  cache;
+        std::vector<std::int32_t> tokens;
+        std::uint64_t             lastUsed{0};
+    };
+    std::vector<PrefixSlot>            _prefixBackups;   // N-1 inactive slots
+    std::size_t                       _prefixSlots{1};   // total slots incl. active
+    std::uint64_t                     _prefixTick{0};
+    std::uint64_t                     _activeLastUsed{0};// recency of the active slot
+
+    /// Multi-entry prefix cache: swap the backup slot whose cached tokens
+    /// share the longest prefix with `promptIds` into the active _kvCache /
+    /// _cachedTokens (O(1) pointer swap). No-op when only one slot exists or
+    /// the backend needs SSM scratch. Called at the top of generate() before
+    /// the LCP truncate.
+    void selectPrefixSlot(std::span<const std::int32_t> promptIds);
+
     // Optional non-owning thermal guard. Engine consults it once before
     // prefill (admission) and every few decode tokens (pacing).
     ThermalGuard*                      _thermalGuard{nullptr};
