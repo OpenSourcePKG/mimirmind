@@ -55,6 +55,7 @@
 #ifdef MIMIRMIND_PROBE_HAS_L0
 #include "compute/l0/GpuMatmul.hpp"
 #include "compute/l0/GpuOps.hpp"
+#include "compute/quant/Q8_0.hpp"
 #include "core/gpu/l0/L0ComputeContext.hpp"
 #include "core/gpu/l0/UsmAllocator.hpp"
 #include "core/gguf/GgufTypes.hpp"
@@ -207,91 +208,129 @@ double relError(const float* gpu, const float* gold, std::size_t n) {
     return maxAbsDiff / (maxAbsGold + 1e-9);
 }
 
-// Run the L0 F32 matmul sweep and return the `ops` array. Throws on device
-// construction failure (caller degrades to no-sweep).
+// Run the L0 matmul sweep (F32 + Q8_0) and return the `ops` array. Throws on
+// device construction failure (caller degrades to no-sweep).
 nlohmann::json runL0MatmulSweep() {
     namespace cl0 = mimirmind::core::l0;
     namespace ml0 = mimirmind::compute::l0;
+    namespace mq  = mimirmind::compute::quant;
     using mimirmind::core::gguf::GgmlType;
 
     nlohmann::json ops = nlohmann::json::array();
 
     cl0::L0ComputeContext ctx{};
-    ml0::GpuOps           gops{ctx};
+    ml0::GpuOps           gops{ctx};   // defaults => Q8_0 native layout
     ml0::GpuMatmul        gmm{ctx, gops};
     cl0::UsmAllocator&    usm = ctx.allocator();
 
-    constexpr std::size_t N = 2048, K = 2048;  // representative hidden dim
+    constexpr std::size_t N = 2048, K = 2048;  // representative hidden dim (K%32==0)
     const std::size_t Ms[] = {1, 16, 64, 256};
     constexpr int kWarmup = 3, kReps = 25;
-    constexpr double kTol = 1e-2;   // 1% — separates F32-accum jitter from bugs
+    constexpr double kTol = 1e-2;   // 1% — separates accum jitter from a bug
 
-    // Deterministic random W [N,K], reused across M-buckets.
+    // Deterministic random F32 weights [N,K]; the quant cases encode from these
+    // and the reference matmul runs on the *dequantised* weights so the gate
+    // measures kernel correctness, not the quantisation error itself.
     std::mt19937 rng{0x9e3779b9U};
     std::uniform_real_distribution<float> dist{-0.05F, 0.05F};
-    std::vector<float> wHost(N * K);
-    for (float& v : wHost) v = dist(rng);
-    const std::size_t wBytes = wHost.size() * sizeof(float);
-    void* wUsm = usm.allocate(wBytes);
-    std::memcpy(wUsm, wHost.data(), wBytes);
+    std::vector<float> wF32(N * K);
+    for (float& v : wF32) v = dist(rng);
 
-    for (std::size_t M : Ms) {
-        std::vector<float> xHost(M * K);
-        for (float& v : xHost) v = dist(rng);
-        const std::size_t xBytes = xHost.size() * sizeof(float);
-        const std::size_t yBytes = M * N * sizeof(float);
-        const std::size_t sBytes = M * N * sizeof(float);  // generous scratch
+    struct DtypeCase { GgmlType type; const char* name; };
+    const DtypeCase cases[] = {
+        {GgmlType::F32,  "F32"},
+        {GgmlType::Q8_0, "Q8_0"},
+    };
 
-        void* xUsm = usm.allocate(xBytes);
-        void* yUsm = usm.allocate(yBytes);
-        void* sUsm = usm.allocate(sBytes);
-        std::memcpy(xUsm, xHost.data(), xBytes);
-        std::memset(yUsm, 0, yBytes);
-
-        auto call = [&]() {
-            gmm.matmul(GgmlType::F32, wUsm, N, K,
-                       static_cast<const float*>(xUsm), M,
-                       static_cast<float*>(yUsm), static_cast<float*>(sUsm));
-        };
-
-        for (int w = 0; w < kWarmup; ++w) call();
-        std::vector<double> ms;
-        ms.reserve(kReps);
-        for (int r = 0; r < kReps; ++r) {
-            const auto t0 = Clock::now();
-            call();
-            ms.push_back(std::chrono::duration<double, std::milli>(
-                             Clock::now() - t0).count());
+    for (const DtypeCase& c : cases) {
+        if (!gmm.supports(c.type)) {
+            ops.push_back({{"op", "matmul"}, {"dtype", c.name},
+                           {"backend", "LevelZero"}, {"status", "unsupported"}});
+            continue;
         }
 
-        std::vector<float> yGold(M * N);
-        refMatmulF32(wHost.data(), xHost.data(), yGold.data(), N, K, M);
-        const double relErr =
-            relError(static_cast<const float*>(yUsm), yGold.data(), M * N);
+        // Build the weight buffer in the dtype's layout + the F32 reference
+        // weights the gold matmul reads.
+        std::vector<float> wRef;   // [N,K] F32 — exactly what the kernel sees
+        std::size_t wBytes = 0;
+        void*       wUsm   = nullptr;
 
-        const double p50 = percentile(ms, 50.0);
-        const double iqr = percentile(ms, 75.0) - percentile(ms, 25.0);
-        std::string status = "ok";
-        if (relErr >= kTol) status = "parity_fail";       // gate before perf
-        else if (p50 > 0.0 && iqr / p50 > 0.15) status = "inconclusive";
+        if (c.type == GgmlType::F32) {
+            wRef   = wF32;
+            wBytes = wF32.size() * sizeof(float);
+            wUsm   = usm.allocate(wBytes);
+            std::memcpy(wUsm, wF32.data(), wBytes);
+        } else {  // Q8_0 — encode per row (native 34-byte blocks), then dequant
+            const std::size_t rowBytes = mq::Q8_0::rowBytes(K);
+            wBytes = N * rowBytes;
+            std::vector<std::uint8_t> wQ8(wBytes);
+            for (std::size_t n = 0; n < N; ++n) {
+                mq::Q8_0::quantizeRow(wF32.data() + n * K, K, wQ8.data() + n * rowBytes);
+            }
+            wRef.resize(N * K);
+            mq::Q8_0::instance().dequantToF32(wQ8.data(), N * K, wRef.data());
+            wUsm = usm.allocate(wBytes);
+            std::memcpy(wUsm, wQ8.data(), wBytes);
+        }
 
-        ops.push_back({
-            {"op", "matmul"},
-            {"dtype", "F32"},
-            {"backend", "LevelZero"},
-            {"shape", {{"N", N}, {"K", K}, {"M", M}}},
-            {"median_ms", p50},
-            {"iqr_ms", iqr},
-            {"reps", kReps},
-            {"parity_max_rel_diff", relErr},
-            {"status", status},
-        });
+        for (std::size_t M : Ms) {
+            std::vector<float> xHost(M * K);
+            for (float& v : xHost) v = dist(rng);
+            const std::size_t xBytes = xHost.size() * sizeof(float);
+            const std::size_t yBytes = M * N * sizeof(float);
+            const std::size_t sBytes = M * N * sizeof(float);  // generous scratch
 
-        usm.deallocate(xUsm, xBytes);
-        usm.deallocate(yUsm, yBytes);
-        usm.deallocate(sUsm, sBytes);
+            void* xUsm = usm.allocate(xBytes);
+            void* yUsm = usm.allocate(yBytes);
+            void* sUsm = usm.allocate(sBytes);
+            std::memcpy(xUsm, xHost.data(), xBytes);
+            std::memset(yUsm, 0, yBytes);
+
+            auto call = [&]() {
+                gmm.matmul(c.type, wUsm, N, K,
+                           static_cast<const float*>(xUsm), M,
+                           static_cast<float*>(yUsm), static_cast<float*>(sUsm));
+            };
+
+            for (int w = 0; w < kWarmup; ++w) call();
+            std::vector<double> ms;
+            ms.reserve(kReps);
+            for (int r = 0; r < kReps; ++r) {
+                const auto t0 = Clock::now();
+                call();
+                ms.push_back(std::chrono::duration<double, std::milli>(
+                                 Clock::now() - t0).count());
+            }
+
+            std::vector<float> yGold(M * N);
+            refMatmulF32(wRef.data(), xHost.data(), yGold.data(), N, K, M);
+            const double relErr =
+                relError(static_cast<const float*>(yUsm), yGold.data(), M * N);
+
+            const double p50 = percentile(ms, 50.0);
+            const double iqr = percentile(ms, 75.0) - percentile(ms, 25.0);
+            std::string status = "ok";
+            if (relErr >= kTol) status = "parity_fail";   // gate before perf
+            else if (p50 > 0.0 && iqr / p50 > 0.15) status = "inconclusive";
+
+            ops.push_back({
+                {"op", "matmul"},
+                {"dtype", c.name},
+                {"backend", "LevelZero"},
+                {"shape", {{"N", N}, {"K", K}, {"M", M}}},
+                {"median_ms", p50},
+                {"iqr_ms", iqr},
+                {"reps", kReps},
+                {"parity_max_rel_diff", relErr},
+                {"status", status},
+            });
+
+            usm.deallocate(xUsm, xBytes);
+            usm.deallocate(yUsm, yBytes);
+            usm.deallocate(sUsm, sBytes);
+        }
+        usm.deallocate(wUsm, wBytes);
     }
-    usm.deallocate(wUsm, wBytes);
     return ops;
 }
 
