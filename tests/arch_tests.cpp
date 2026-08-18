@@ -1120,11 +1120,11 @@ TEST(gpuGovernor_adjustForTempRaisesCapWhenCool) {
     mimirmind::runtime::GpuClockGovernor g{d.root};
     g.setTargetTempC(72.0F);
 
-    // Temp 5 °C below target, kGainUp = 10 → delta = +50 MHz, new
-    // cap = 1550. Slow on the cool side is intentional — heatsink
-    // takes 30-60 s to shed load, and a fast recovery re-spikes on
-    // the next burst.
-    EXPECT_EQ(g.adjustForTemp(67.0F), std::uint32_t{1550});
+    // Temp 5 °C below target. M9.6.6 replaced the fixed kGainUp=10 with a
+    // headroom-scaled adaptive up-gain, so with full headroom the 5 °C
+    // error yields +125 MHz → cap = 1625. Slow on the cool side is still
+    // intentional (heatsink takes 30-60 s to shed load) but headroom-aware.
+    EXPECT_EQ(g.adjustForTemp(67.0F), std::uint32_t{1625});
 }
 
 TEST(gpuGovernor_adjustForTempAsymmetricGain) {
@@ -1140,9 +1140,10 @@ TEST(gpuGovernor_adjustForTempAsymmetricGain) {
 
     // Re-arm cap at 1500 and check the cool direction.
     g.setMaxFreqMhz(1500);
-    // -4 °C, kGainUp = 10 → delta = +40, cap → 1540. Hot-side delta
-    // is 10x cool-side — the paranoid 1:10 ratio from M9.6.
-    EXPECT_EQ(g.adjustForTemp(68.0F), std::uint32_t{1540});
+    // -4 °C, M9.6.6 headroom-scaled adaptive up-gain → delta = +80, cap
+    // → 1580. Hot-side (kGainDown=100) still dominates the cool side —
+    // the paranoid asymmetry from M9.6 is preserved.
+    EXPECT_EQ(g.adjustForTemp(68.0F), std::uint32_t{1580});
 }
 
 TEST(gpuGovernor_adjustForTempDeadbandHoldsCap) {

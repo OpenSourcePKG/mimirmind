@@ -60,7 +60,7 @@ TEST(blockLayout_Float32) {
     EXPECT_EQ(qt.blockElements(), 1U);
     EXPECT_EQ(qt.blockBytes(),    4U);
     EXPECT_EQ(qt.name(),          std::string_view{"F32"});
-    EXPECT_EQ(qt.gpuMatmulModule(), std::string_view{});
+    EXPECT_EQ(qt.gpuMatmulModule(), std::string_view{"matmul_f32_vec"});
 }
 
 TEST(blockLayout_Float16) {
@@ -141,14 +141,14 @@ TEST(registry_unsupportedTypes) {
     using namespace mimirmind::core::gguf;
     using namespace mimirmind::compute;
     EXPECT_TRUE(quantType(GgmlType::Q2_K)    == nullptr);
-    EXPECT_TRUE(quantType(GgmlType::Q3_K)    == nullptr);
     EXPECT_TRUE(quantType(GgmlType::Q4_0)    == nullptr);
     EXPECT_TRUE(quantType(GgmlType::Unknown) == nullptr);
+    // Q3_K is now supported (Q3K.cpp) — no longer in the unsupported set.
 }
 
 TEST(registry_allQuantTypes_size) {
     const auto all = mimirmind::compute::allQuantTypes();
-    EXPECT_EQ(all.size(), 8U);
+    EXPECT_EQ(all.size(), 9U);   // + Q3_K
     for (const auto* qt : all) {
         EXPECT_TRUE(qt != nullptr);
     }
