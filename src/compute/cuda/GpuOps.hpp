@@ -257,9 +257,11 @@ public:
     void writeKvTokensBatchedAsync(const float* kProj, const float* vProj,
                                    const std::uint32_t* writeBlockIdDev,
                                    const std::int32_t* writeSlotDev,
-                                   float* kPool, float* vPool,
+                                   void* kPool, void* vPool,
                                    std::size_t nSeq, std::size_t blockSize,
-                                   std::size_t width) override;
+                                   std::size_t width,
+                                   runtime::KvDtype kvDtype
+                                       = runtime::KvDtype::F32) override;
     void moeGroupTilesAsync(const std::int32_t* expOffset,
                             std::int32_t* tileExpert, std::int32_t* tileRow0,
                             std::int32_t* tileRows, std::int32_t* nTiles,
@@ -674,7 +676,8 @@ public:
             const std::int32_t* seqLens, std::size_t numSeqs,
             std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
             std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
-            std::size_t maxSeqLen, float scale, float softcap) override;
+            std::size_t maxSeqLen, float scale, float softcap,
+            runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
     // Publicly readable so callers can compute launch upper bounds
     // for `setReplayMaxKTiles`. Parity with `GpuOps`.
     static constexpr std::size_t kFlashKTileSize   = 64;

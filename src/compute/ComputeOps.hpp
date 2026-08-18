@@ -426,8 +426,9 @@ public:
             const std::int32_t* seqLens, std::size_t numSeqs,
             std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
             std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
-            std::size_t maxSeqLen, float scale, float softcap) {
-        (void)maxSeqLen;
+            std::size_t maxSeqLen, float scale, float softcap,
+            runtime::KvDtype kvDtype = runtime::KvDtype::F32) {
+        (void)maxSeqLen; (void)kvDtype;   // base fallback is F32-only
         pagedAttentionDecodeV1Async(out, query, keyCache, valueCache,
                                     blockTables, seqLens, numSeqs, numHeads,
                                     numKvHeads, headSize, blockSize,
@@ -505,11 +506,14 @@ public:
     virtual void writeKvTokensBatchedAsync(const float* kProj, const float* vProj,
                                            const std::uint32_t* writeBlockIdDev,
                                            const std::int32_t* writeSlotDev,
-                                           float* kPool, float* vPool,
+                                           void* kPool, void* vPool,
                                            std::size_t nSeq, std::size_t blockSize,
-                                           std::size_t width) {
+                                           std::size_t width,
+                                           runtime::KvDtype kvDtype
+                                               = runtime::KvDtype::F32) {
         (void)kProj; (void)vProj; (void)writeBlockIdDev; (void)writeSlotDev;
         (void)kPool; (void)vPool; (void)nSeq; (void)blockSize; (void)width;
+        (void)kvDtype;
         throw std::runtime_error(
             "writeKvTokensBatchedAsync: not supported on this backend");
     }

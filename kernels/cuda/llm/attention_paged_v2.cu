@@ -56,6 +56,17 @@
 // GQA + causal masking rules mirror v1 exactly.
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+// KV element load helper — widens the stored KV element to fp32 for the
+// (fp32) dot-product / accumulate. The compute path stays fp32 regardless
+// of the on-device KV dtype; only the load reinterprets. This is how the
+// fp16-KV entry point halves attention's growing-context read bandwidth
+// (5.14 I1) without touching the softmax/accumulate math.
+__device__ __forceinline__ float pa_ldkv(const float* p, int i) { return p[i]; }
+__device__ __forceinline__ float pa_ldkv(const __half* p, int i) {
+    return __half2float(p[i]);
+}
 
 // Placeholder launch bounds — the eventual body will retune these
 // against sm_120 occupancy. Kept as compile-time constants so the
@@ -87,8 +98,8 @@
 // max_logits) for its partition. Does NOT produce the final output.
 // ---------------------------------------------------------------------
 
-extern "C" __global__ __launch_bounds__(PAGED_ATTN_V2_LOCAL)
-void paged_attention_v2(
+template<typename KVT>
+__device__ __forceinline__ void paged_attention_v2_body(
           float* __restrict__ tmp_out,                  // [num_seqs, num_heads, max_num_partitions, head_size]
           float* __restrict__ exp_sums,                 // [num_seqs, num_heads, max_num_partitions]
           float* __restrict__ max_logits,               // [num_seqs, num_heads, max_num_partitions]
@@ -182,8 +193,8 @@ void paged_attention_v2(
     float m = -1.0e30f;
     float l = 0.0f;
 
-    const float* __restrict__ kbase = static_cast<const float*>(key_cache);
-    const float* __restrict__ vbase = static_cast<const float*>(value_cache);
+    const KVT* __restrict__ kbase = static_cast<const KVT*>(key_cache);
+    const KVT* __restrict__ vbase = static_cast<const KVT*>(value_cache);
     const int*   __restrict__ bt =
         block_tables + static_cast<long>(seq) * max_num_blocks_per_seq;
 
@@ -193,12 +204,12 @@ void paged_attention_v2(
         const long kv_off =
             ((static_cast<long>(blk) * block_size + slot) * num_kv_heads + hkv)
             * head_size;
-        const float* __restrict__ k_p = kbase + kv_off;
+        const KVT* __restrict__ k_p = kbase + kv_off;
 
         float dot = 0.0f;
         #pragma unroll
         for (int i = 0; i < dPerLane; ++i) {
-            dot += qreg[i] * k_p[lane + i * WARP];
+            dot += qreg[i] * pa_ldkv(k_p, lane + i * WARP);
         }
         #pragma unroll
         for (int off = WARP / 2; off > 0; off >>= 1) {
@@ -208,10 +219,10 @@ void paged_attention_v2(
         const float m_new    = fmaxf(m, logit);
         const float rescale  = __expf(m - m_new);
         const float p_exp    = __expf(logit - m_new);
-        const float* __restrict__ v_p = vbase + kv_off;
+        const KVT* __restrict__ v_p = vbase + kv_off;
         #pragma unroll
         for (int i = 0; i < dPerLane; ++i) {
-            acc[i] = acc[i] * rescale + p_exp * v_p[lane + i * WARP];
+            acc[i] = acc[i] * rescale + p_exp * pa_ldkv(v_p, lane + i * WARP);
         }
         l = l * rescale + p_exp;
         m = m_new;
@@ -255,6 +266,52 @@ void paged_attention_v2(
         max_logits[part_idx] = mg;
         exp_sums[part_idx]   = lg;
     }
+}
+
+// Entry points — one per KV dtype. The fp32 name is unchanged (ABI-stable
+// for the existing wrapper); the fp16 variant reinterprets key_cache /
+// value_cache as __half and is selected by the C++ wrapper when the paged
+// pool is fp16 (5.14 I1). Same 16 args → same CudaKernel launch surface.
+extern "C" __global__ __launch_bounds__(PAGED_ATTN_V2_LOCAL)
+void paged_attention_v2(
+          float* __restrict__ tmp_out,
+          float* __restrict__ exp_sums,
+          float* __restrict__ max_logits,
+    const float* __restrict__ query,
+    const void*  __restrict__ key_cache,
+    const void*  __restrict__ value_cache,
+    const int*   __restrict__ block_tables,
+    const int*   __restrict__ seq_lens,
+    const int num_seqs, const int num_heads, const int num_kv_heads,
+    const int head_size, const int block_size,
+    const int max_num_blocks_per_seq, const int max_num_partitions,
+    const float scale)
+{
+    paged_attention_v2_body<float>(
+        tmp_out, exp_sums, max_logits, query, key_cache, value_cache,
+        block_tables, seq_lens, num_seqs, num_heads, num_kv_heads, head_size,
+        block_size, max_num_blocks_per_seq, max_num_partitions, scale);
+}
+
+extern "C" __global__ __launch_bounds__(PAGED_ATTN_V2_LOCAL)
+void paged_attention_v2_fp16(
+          float* __restrict__ tmp_out,
+          float* __restrict__ exp_sums,
+          float* __restrict__ max_logits,
+    const float* __restrict__ query,
+    const void*  __restrict__ key_cache,
+    const void*  __restrict__ value_cache,
+    const int*   __restrict__ block_tables,
+    const int*   __restrict__ seq_lens,
+    const int num_seqs, const int num_heads, const int num_kv_heads,
+    const int head_size, const int block_size,
+    const int max_num_blocks_per_seq, const int max_num_partitions,
+    const float scale)
+{
+    paged_attention_v2_body<__half>(
+        tmp_out, exp_sums, max_logits, query, key_cache, value_cache,
+        block_tables, seq_lens, num_seqs, num_heads, num_kv_heads, head_size,
+        block_size, max_num_blocks_per_seq, max_num_partitions, scale);
 }
 
 // ---------------------------------------------------------------------

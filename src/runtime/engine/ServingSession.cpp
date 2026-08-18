@@ -30,6 +30,19 @@
 
 namespace mimirmind::runtime::engine {
 
+// Serving KV cache element dtype for the CUDA paged pool (5.14 I1). FP16
+// halves the KV read bandwidth of growing-context attention + halves KV
+// memory. Dev-gated for A/B + parity; F32 stays the default so prod is
+// untouched until the win is measured. The server (not a user toggle) will
+// own the final default once validated.
+namespace {
+[[nodiscard]] KvDtype servingKvDtype() noexcept {
+    const char* e = std::getenv("MIMIRMIND_SERVING_KV_FP16");
+    const bool fp16 = (e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0'));
+    return fp16 ? KvDtype::FP16 : KvDtype::F32;
+}
+} // namespace
+
 // =======================================================================
 // Persistent per-slot substrate that lets an external event loop
 // (ContinuousBatcher) admit/decode/complete requests asynchronously. Each
@@ -249,7 +262,7 @@ ServingSession::generateBatch(
     const std::size_t blocksPerSeq = (total + blockSize - 1) / blockSize;
     const std::size_t numBlocks    = nSeq * blocksPerSeq;
     serving::PagedKvPool pool(*_e._ops, nFullAttn, numBlocks, blockSize,
-                              nKvHeads, headDim);
+                              nKvHeads, headDim, servingKvDtype());
 
     SsmState ssm(*_e._ops, blockCount, _e._config.ssmStateElemsPerLayer(),
                  _e._config.ssmConvStateElemsPerLayer(), nSeq);
@@ -700,7 +713,8 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     st->mtpPoolLayer = hasMtp ? nFullAttn
                               : std::numeric_limits<std::size_t>::max();
     st->pool = std::make_unique<serving::PagedKvPool>(
-        *_e._ops, nPoolLayers, st->numBlocks, st->blockSize, nKvHeads, headDim);
+        *_e._ops, nPoolLayers, st->numBlocks, st->blockSize, nKvHeads, headDim,
+        servingKvDtype());
     st->ssm = std::make_unique<SsmState>(
         *_e._ops, st->blockCount, _e._config.ssmStateElemsPerLayer(),
         _e._config.ssmConvStateElemsPerLayer(), maxBatch);
@@ -772,10 +786,16 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         chunk = std::min(chunk, maxContext);
         st->prefillChunk = chunk;
         if (st->chunkedPrefill) {
+            // FP16 KV needs the fp32 staging scratch in the PREFILL path too
+            // (the fp16Path projects K/V into kvKFp32Scratch before the
+            // kv_commit_fp16 cast); F32 prefill writes the cache in place and
+            // does not (5.14 I1).
+            const bool prefillKvFp32Scratch =
+                (servingKvDtype() == KvDtype::FP16);
             st->sbPrefill = allocBlockBuffers(
                 *_e._ops, _e._config, /*maxT=*/chunk, /*maxSeq=*/maxContext,
                 qkv.first, qkv.second, /*withFusedQkv=*/false,
-                /*withKvFp32Scratch=*/false, /*withQGate=*/true,
+                /*withKvFp32Scratch=*/prefillKvFp32Scratch, /*withQGate=*/true,
                 /*withSsm=*/true, /*perSeqConvInput=*/false);
             // SSM state pointers are (re)bound per prefillSlot call to the
             // target slot's slab slice; ssmSlabNSeq is the full slab width so
@@ -984,12 +1004,16 @@ std::int32_t ServingSession::prefillSlot(
         const std::size_t dense = st.qb->fullAttnDenseLayer(b);
         const std::size_t layer =
             (dense == std::numeric_limits<std::size_t>::max()) ? 0 : dense;
-        kBases[b] = st.pool->keyPool(layer)   + slotElemBase;
-        vBases[b] = st.pool->valuePool(layer) + slotElemBase;
+        // Pool base is void*; the per-slot offset is in ELEMENTS, so stride by
+        // the pool's element width (fp32=4, fp16=2) to land on this slot's
+        // region regardless of dtype (5.14 I1).
+        const std::size_t byteOff = slotElemBase * st.pool->elemBytes();
+        kBases[b] = static_cast<char*>(st.pool->keyPool(layer))   + byteOff;
+        vBases[b] = static_cast<char*>(st.pool->valuePool(layer)) + byteOff;
     }
     KvCache view(KvCache::ExternalView{}, /*maxSeq=*/slotCap,
                  std::move(kvDimPerLayer), std::move(kBases), std::move(vBases),
-                 /*initialLength=*/startPos, KvDtype::F32);
+                 /*initialLength=*/startPos, st.pool->dtype());
 
     // Bind the prefill BlockBuffers' SSM state base to this slot's slab slice.
     // runLinearBlock indexes `ssmStatePtr + blockIdx*(ssmSlabNSeq*elems)`, so a

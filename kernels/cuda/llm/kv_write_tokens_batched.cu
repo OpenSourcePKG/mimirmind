@@ -16,6 +16,7 @@
 // Launch: grid.x = nSeq (one block per sequence), block.x = min(width, 256).
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 extern "C" __global__ void kv_write_tokens_batched(
     const float*        __restrict__ kProj,        // [nSeq, width]
@@ -41,5 +42,35 @@ extern "C" __global__ void kv_write_tokens_batched(
          j += static_cast<int>(blockDim.x)) {
         kPool[off + j] = ks[j];
         vPool[off + j] = vs[j];
+    }
+}
+
+// FP16 pool variant (5.14 I1): same scatter, but the K/V rows are still the
+// F32 projections and are cast to __half on store (half the KV bytes). Only
+// the pool pointers change type; the block/slot index math is identical.
+extern "C" __global__ void kv_write_tokens_batched_fp16(
+    const float*        __restrict__ kProj,        // [nSeq, width]
+    const float*        __restrict__ vProj,        // [nSeq, width]
+    const unsigned int* __restrict__ writeBlockId, // [nSeq]
+    const int*          __restrict__ writeSlot,    // [nSeq]
+          __half*       __restrict__ kPool,
+          __half*       __restrict__ vPool,
+    const int                        nSeq,
+    const int                        blockSize,
+    const int                        width)
+{
+    const int seq = static_cast<int>(blockIdx.x);
+    if (seq >= nSeq) {
+        return;
+    }
+    const size_t off =
+        (static_cast<size_t>(writeBlockId[seq]) * static_cast<size_t>(blockSize)
+         + static_cast<size_t>(writeSlot[seq])) * static_cast<size_t>(width);
+    const float* __restrict__ ks = kProj + static_cast<size_t>(seq) * width;
+    const float* __restrict__ vs = vProj + static_cast<size_t>(seq) * width;
+    for (int j = static_cast<int>(threadIdx.x); j < width;
+         j += static_cast<int>(blockDim.x)) {
+        kPool[off + j] = __float2half(ks[j]);
+        vPool[off + j] = __float2half(vs[j]);
     }
 }

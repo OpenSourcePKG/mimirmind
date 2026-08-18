@@ -2174,19 +2174,24 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
     // (maxSeqLen<=partition) contexts so short-prompt decode keeps V1's speed.
     // MIMIRMIND_PAGED_V1=1 forces the old single-pass path (A/B + rollback).
     _ops.profileSection("attn.paged");   // decode attn sub-split (paged kernel)
+    // Pool base pointers are void* (element width follows dtype()); pass them as
+    // addresses — the fp16 V2 kernel variant reinterprets K/V as __half (5.14 I1).
+    const auto  kvDtype = ctx.pool->dtype();
+    const auto* keyBase = static_cast<const float*>(ctx.pool->keyPool(denseLayer));
+    const auto* valBase =
+        static_cast<const float*>(ctx.pool->valuePool(denseLayer));
     if (_forcePagedV1) {
+        // V1 is F32-only; the fp16 pool always routes through V2.
         _ops.pagedAttentionDecodeV1Async(
-            attnOut, qBuf, ctx.pool->keyPool(denseLayer),
-            ctx.pool->valuePool(denseLayer), ctx.blockTablesDev, ctx.seqLensDev,
+            attnOut, qBuf, keyBase, valBase, ctx.blockTablesDev, ctx.seqLensDev,
             nSeq, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
             ctx.maxBlocksPerSeq, attnScale, /*softcap=*/0.0f);
     } else {
         _ops.pagedAttentionDecodeV2Async(
-            attnOut, qBuf, ctx.pool->keyPool(denseLayer),
-            ctx.pool->valuePool(denseLayer), ctx.blockTablesDev, ctx.seqLensDev,
+            attnOut, qBuf, keyBase, valBase, ctx.blockTablesDev, ctx.seqLensDev,
             nSeq, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
             ctx.maxBlocksPerSeq, static_cast<std::size_t>(ctx.maxSeqLen),
-            attnScale, /*softcap=*/0.0f);
+            attnScale, /*softcap=*/0.0f, kvDtype);
     }
 
     // --- output gate + O projection + attn residual ------------------

@@ -200,6 +200,7 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _pagedAttentionV1Kernel;
     core::cuda::CudaModule _pagedAttentionV2Module;
     core::cuda::CudaKernel _pagedAttentionV2Kernel;
+    core::cuda::CudaKernel _pagedAttentionV2Fp16Kernel;   // fp16 KV (5.14 I1)
     core::cuda::CudaKernel _pagedAttentionV2ReduceKernel;
     // Split-K V2 per-partition workspace (grown on demand; RAII-freed).
     compute::ComputeBuffer _pagedV2TmpOut;      // [slots, headSize] fp32
@@ -319,6 +320,7 @@ struct GpuOps::Impl {
     // Device KV scatter (graph-capturable paged-KV write by device index).
     core::cuda::CudaModule _kvWriteTokensModule;
     core::cuda::CudaKernel _kvWriteTokensKernel;
+    core::cuda::CudaKernel _kvWriteTokensFp16Kernel;   // fp16 KV (5.14 I1)
     // M-Cuda.MoeGroup Sub-Step E — device-driven grouped GEMM (tile schedule
     // build + single grouped NVFP4 launch; no expOffset D2H).
     core::cuda::CudaModule _moeGroupTilesModule;
@@ -442,6 +444,8 @@ struct GpuOps::Impl {
           _pagedAttentionV2Module{loadCudaModule(ctx, "attention_paged_v2")},
           _pagedAttentionV2Kernel{
               _pagedAttentionV2Module.getFunction("paged_attention_v2")},
+          _pagedAttentionV2Fp16Kernel{
+              _pagedAttentionV2Module.getFunction("paged_attention_v2_fp16")},
           _pagedAttentionV2ReduceKernel{
               _pagedAttentionV2Module.getFunction("paged_attention_v2_reduce")},
 
@@ -587,6 +591,8 @@ struct GpuOps::Impl {
           _kvWriteTokensModule{loadCudaModule(ctx, "kv_write_tokens_batched")},
           _kvWriteTokensKernel{
               _kvWriteTokensModule.getFunction("kv_write_tokens_batched")},
+          _kvWriteTokensFp16Kernel{
+              _kvWriteTokensModule.getFunction("kv_write_tokens_batched_fp16")},
           _moeGroupTilesModule     {loadCudaModule(ctx, "moe_group_tiles")},
           _moeGroupTilesKernel     {
               _moeGroupTilesModule.getFunction("moe_group_tiles")},
@@ -2099,13 +2105,17 @@ void GpuOps::moeScatterExpertOutAsync(const float* y, const std::int32_t* asnToR
 void GpuOps::writeKvTokensBatchedAsync(const float* kProj, const float* vProj,
                                        const std::uint32_t* writeBlockIdDev,
                                        const std::int32_t* writeSlotDev,
-                                       float* kPool, float* vPool,
+                                       void* kPool, void* vPool,
                                        std::size_t nSeq, std::size_t blockSize,
-                                       std::size_t width) {
+                                       std::size_t width,
+                                       runtime::KvDtype kvDtype) {
     if (nSeq == 0 || width == 0) {
         return;
     }
-    auto& k = _pimpl->_kvWriteTokensKernel;
+    // FP16 pool → cast-on-scatter variant; F32 → straight scatter (5.14 I1).
+    auto& k = (kvDtype == runtime::KvDtype::FP16)
+                  ? _pimpl->_kvWriteTokensFp16Kernel
+                  : _pimpl->_kvWriteTokensKernel;
     k.setPtr  (0, kProj);
     k.setPtr  (1, vProj);
     k.setPtr  (2, writeBlockIdDev);
@@ -3236,10 +3246,13 @@ void GpuOps::pagedAttentionDecodeV2Async(
         const std::int32_t* seqLens, std::size_t numSeqs, std::size_t numHeads,
         std::size_t numKvHeads, std::size_t headSize, std::size_t blockSize,
         std::size_t maxNumBlocksPerSeq, std::size_t maxSeqLen, float scale,
-        float softcap) {
+        float softcap, runtime::KvDtype kvDtype) {
     if (numSeqs == 0 || numHeads == 0 || headSize == 0) {
         return;
     }
+    // keyCache/valueCache are raw pool base addresses; when kvDtype==FP16 they
+    // point at __half elements and the fp16 kernel variant reinterprets them.
+    const bool fp16 = (kvDtype == runtime::KvDtype::FP16);
     // Split-K paged decode: partition the KV into kPartitionSize chunks so many
     // workgroups cover one (head, seq) in parallel (FlashDecoding / vLLM v2).
     // Pass 1 emits per-partition (acc, m, l); pass 2 merges via online-softmax.
@@ -3250,7 +3263,10 @@ void GpuOps::pagedAttentionDecodeV2Async(
     // The split-K kernels are fp32, no-softcap (16-arg CudaKernel cap). Route
     // short/unsplittable contexts and any soft-capped call to the single-pass
     // V1 which handles both.
-    if (maxNumPartitions <= 1 || softcap > 0.0f) {
+    // FP16 KV always takes the V2 path: V1 is F32-only, and all fp16 callers
+    // (qwen35moe full-attn) run with softcap==0, so a single-partition V2 is
+    // both correct and the only FP16-capable route. F32 keeps the V1 shortcut.
+    if (!fp16 && (maxNumPartitions <= 1 || softcap > 0.0f)) {
         pagedAttentionDecodeV1Async(out, query, keyCache, valueCache,
                                     blockTables, seqLens, numSeqs, numHeads,
                                     numKvHeads, headSize, blockSize,
@@ -3274,7 +3290,8 @@ void GpuOps::pagedAttentionDecodeV2Async(
 
     // --- Pass 1: per-partition partial attention -------------------------
     {
-        auto& k = _pimpl->_pagedAttentionV2Kernel;
+        auto& k = fp16 ? _pimpl->_pagedAttentionV2Fp16Kernel
+                       : _pimpl->_pagedAttentionV2Kernel;
         k.setPtr  (0, tmpOut);
         k.setPtr  (1, expSums);
         k.setPtr  (2, maxLog);

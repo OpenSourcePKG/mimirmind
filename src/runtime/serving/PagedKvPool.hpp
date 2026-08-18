@@ -4,6 +4,7 @@
 #pragma once
 
 #include "compute/ComputeBuffer.hpp"
+#include "runtime/KvCache.hpp"   // KvDtype + kvElemBytes
 
 #include <cstddef>
 #include <cstdint>
@@ -56,7 +57,8 @@ public:
                 std::size_t          numBlocks,
                 std::size_t          blockSize,
                 std::size_t          numKvHeads,
-                std::size_t          headDim);
+                std::size_t          headDim,
+                KvDtype              dtype = KvDtype::F32);
 
     PagedKvPool(const PagedKvPool&)            = delete;
     PagedKvPool& operator=(const PagedKvPool&) = delete;
@@ -64,11 +66,20 @@ public:
     PagedKvPool& operator=(PagedKvPool&&)      = delete;
 
     /// Base of the K / V pool for dense full-attention layer `layer`.
-    /// Pass straight as the kernel's `key_cache` / `value_cache`.
-    [[nodiscard]] float*       keyPool(std::size_t layer) noexcept;
-    [[nodiscard]] float*       valuePool(std::size_t layer) noexcept;
-    [[nodiscard]] const float* keyPool(std::size_t layer) const noexcept;
-    [[nodiscard]] const float* valuePool(std::size_t layer) const noexcept;
+    /// Pass straight as the kernel's `key_cache` / `value_cache`. The
+    /// element type is `dtype()` (fp32 or fp16); callers doing pointer
+    /// arithmetic must stride by `elemBytes()`, not sizeof(float).
+    [[nodiscard]] void*       keyPool(std::size_t layer) noexcept;
+    [[nodiscard]] void*       valuePool(std::size_t layer) noexcept;
+    [[nodiscard]] const void* keyPool(std::size_t layer) const noexcept;
+    [[nodiscard]] const void* valuePool(std::size_t layer) const noexcept;
+
+    /// On-device KV element dtype (F32 baseline or FP16 — 5.14 I1).
+    [[nodiscard]] KvDtype     dtype()     const noexcept { return _dtype; }
+    /// Bytes per stored KV element (4 for F32, 2 for FP16).
+    [[nodiscard]] std::size_t elemBytes() const noexcept {
+        return kvElementBytes(_dtype);
+    }
 
     /**
      * Append one sequence's freshly-projected K/V row (already QK-normed
@@ -120,13 +131,15 @@ private:
     std::size_t _blockSize;
     std::size_t _numKvHeads;
     std::size_t _headDim;
+    KvDtype     _dtype;
 
     // One K and one V pool per full-attention layer. Raw pointers cached
     // alongside the RAII owners so the hot path skips the .get() call.
+    // Stored as void* since the element width follows `_dtype` (fp32/fp16).
     std::vector<compute::ComputeBuffer> _kOwners;
     std::vector<compute::ComputeBuffer> _vOwners;
-    std::vector<float*>                 _kPool;
-    std::vector<float*>                 _vPool;
+    std::vector<void*>                  _kPool;
+    std::vector<void*>                  _vPool;
 };
 
 } // namespace mimirmind::runtime::serving
