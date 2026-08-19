@@ -6,6 +6,8 @@
 #include "compute/dsp/MelSpectrogram.hpp"
 #include "runtime/audio/WavReader.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>
@@ -78,10 +80,24 @@ std::string AudioEngine::transcribeMono(std::span<const float> mono,
     if (mono.empty()) {
         return {};
     }
+    // Whisper is trained exclusively on 30-second windows: pad-or-trim the
+    // audio to exactly N_SAMPLES = 30 * 16000 = 480000 samples before the mel
+    // frontend (openai/whisper pad_or_trim). This yields the fixed 3000 mel
+    // frames / 1500 audio-ctx positions the encoder positional embeddings and
+    // the decoder were trained on. Without it the encoder sees a shorter
+    // positional range than training and greedy decode fails to emit EOT
+    // (runaway repetition of the transcript). Windowing audio longer than 30 s
+    // into multiple segments is a later increment.
+    constexpr std::size_t kWhisperSampleRate    = 16000;
+    constexpr std::size_t kWhisperWindowSamples = 30 * kWhisperSampleRate;
+    std::vector<float>    window(kWhisperWindowSamples, 0.0F);
+    const std::size_t     nCopy = std::min(mono.size(), kWhisperWindowSamples);
+    std::copy_n(mono.begin(), nCopy, window.begin());
+
     compute::dsp::MelConfig melCfg{};
     melCfg.nMels = static_cast<int>(_model.config().numMelBins);
     const compute::dsp::MelSpectrogram mel =
-        compute::dsp::logMelSpectrogram(mono, melCfg);
+        compute::dsp::logMelSpectrogram(window, melCfg);
     if (mel.nFrames == 0) {
         return {};
     }
