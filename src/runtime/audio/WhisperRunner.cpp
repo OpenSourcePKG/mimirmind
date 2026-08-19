@@ -249,10 +249,23 @@ WhisperRunner::transcribeGreedy(const float* mel, std::size_t nMels,
         _ops.flush();
         _ops.readbackToHost(hostLogits.data(), logit, vocab * sizeof(float));
 
-        const std::int32_t next =
-            argmaxRow(std::span<const float>{hostLogits});
-        if (next == opt.special.eot) {
-            break;
+        // Language auto-detect: at decoder position 1 predict the language
+        // token (argmax over the language-token range), then force the task
+        // and no-timestamps tokens at positions 2/3 before free decoding.
+        std::int32_t next;
+        if (opt.detectLanguage && t == 1) {
+            next = argmaxRange(std::span<const float>{hostLogits},
+                               opt.special.langEn, opt.special.translate);
+        } else if (opt.detectLanguage && t == 2) {
+            next = opt.translate ? opt.special.translate
+                                 : opt.special.transcribe;
+        } else if (opt.detectLanguage && t == 3 && !opt.timestamps) {
+            next = opt.special.noTimestamps;
+        } else {
+            next = argmaxRow(std::span<const float>{hostLogits});
+            if (next == opt.special.eot) {
+                break;
+            }
         }
         tokens.push_back(next);
     }

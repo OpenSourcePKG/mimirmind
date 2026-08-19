@@ -89,12 +89,11 @@ void TranscriptionsHandler::handle(const httplib::Request& req,
         return;
     }
 
+    // No language (or "auto") -> the engine auto-detects it. Do NOT default to
+    // "en": forcing the wrong language garbles non-English audio.
     std::string language =
         req.has_file("language") ? req.get_file_value("language").content
-                                 : std::string{"en"};
-    if (language.empty()) {
-        language = "en";
-    }
+                                 : std::string{};
 
     // Supported response formats: "json" (default) and "text". The richer
     // verbose_json (segments/timestamps), srt and vtt are later increments.

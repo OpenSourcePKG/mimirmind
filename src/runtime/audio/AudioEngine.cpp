@@ -104,9 +104,16 @@ std::string AudioEngine::transcribeMono(std::span<const float> mono,
 
     WhisperDecodeOptions opt{};
     opt.special    = _special;
-    opt.langToken  = languageToken(language);
     opt.translate  = false;   // task = transcribe
     opt.timestamps = false;
+    // Empty or "auto" language -> let the model detect it (OpenAI Whisper
+    // behaviour). Forcing the wrong language (e.g. "en" on German audio)
+    // produces hallucinated output. A concrete code forces that language.
+    if (language.empty() || language == "auto") {
+        opt.detectLanguage = true;
+    } else {
+        opt.langToken = languageToken(language);
+    }
 
     const std::vector<std::int32_t> ids =
         _runner.transcribeGreedy(mel.data.data(),

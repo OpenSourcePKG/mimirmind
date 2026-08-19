@@ -31,6 +31,12 @@ struct WhisperDecodeOptions {
     std::int32_t langToken{50259};      // language token to force (default en)
     bool         translate{false};      // task: transcribe (false) / translate
     bool         timestamps{false};     // emit timestamp tokens (unsupported yet)
+    // Auto-detect the spoken language: instead of forcing `langToken`, let the
+    // model predict the language token at decoder position 1 (argmax over the
+    // language-token range), then force the task + no-timestamps tokens. This
+    // is what OpenAI's Whisper does when no language is given — forcing the
+    // wrong language (e.g. "en" on German audio) yields hallucinated output.
+    bool         detectLanguage{false};
     std::size_t  maxNewTokens{224};     // hard cap (half of max_target_positions)
 };
 
@@ -39,11 +45,20 @@ struct WhisperDecodeOptions {
  *   [ <|startoftranscript|>, <|lang|>, <|transcribe|/|translate|>,
  *     (<|notimestamps|> unless timestamps) ]
  * Free decoding continues from here until <|endoftext|> or the length cap.
+ * When `detectLanguage` is set the prompt is just [ <|startoftranscript|> ];
+ * WhisperRunner then predicts the language and forces the task/no-timestamps
+ * tokens at positions 2/3.
  */
 [[nodiscard]] std::vector<std::int32_t>
 whisperInitialPromptTokens(const WhisperDecodeOptions& opt);
 
 /// Greedy argmax over one logits row [vocab]. Returns the token id.
 [[nodiscard]] std::int32_t argmaxRow(std::span<const float> logits);
+
+/// Argmax restricted to the half-open id range [lo, hi) — used for Whisper
+/// language detection (mask everything but the language tokens). Returns `lo`
+/// if the range is empty or out of bounds.
+[[nodiscard]] std::int32_t
+argmaxRange(std::span<const float> logits, std::int32_t lo, std::int32_t hi);
 
 } // namespace mimirmind::runtime::audio
