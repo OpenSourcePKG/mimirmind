@@ -24,6 +24,7 @@
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/encoder/RerankEngine.hpp"
 #include "runtime/encoder/EmbedEngine.hpp"
+#include "runtime/audio/AudioEngine.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
 #include "runtime/nvfp4/ModelFormatResolver.hpp"
 #include "runtime/perf/PerfRegressionDetector.hpp"
@@ -425,6 +426,12 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     std::vector<std::unique_ptr<::mimirmind::runtime::encoder::EmbedEngine>>
         ownedEmbedders;
     std::vector<::mimirmind::server::LoadedEmbedder> loadedEmbedders;
+    // Transcribe (Whisper-class ASR) models: same isolated-compute-stack
+    // lifetime rule — stacks declared before the AudioEngines they back.
+    std::vector<::mimirmind::runtime::ComputeStack> ownedTranscribeStacks;
+    std::vector<std::unique_ptr<::mimirmind::runtime::audio::AudioEngine>>
+        ownedTranscribers;
+    std::vector<::mimirmind::server::LoadedTranscriber> loadedTranscribers;
 #ifdef MIMIRMIND_HAVE_L0
     // In attached mode: one MuninClient per loaded model, kept alive
     // for the whole worker lifetime so Munin's implicit-detach logic
@@ -507,6 +514,35 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                             m.path, m.id);
             } catch (const std::exception& x) {
                 std::cerr << "serve: embed model '" << m.id
+                          << "' load failed: " << x.what() << "\n";
+                return 2;
+            }
+            continue;
+        }
+
+        // Transcribe models: a Whisper-class encoder-decoder ASR checkpoint
+        // (AudioEngine = WhisperModel + tokenizer + WhisperRunner) behind
+        // /v1/audio/transcriptions, on its own isolated compute stack — same
+        // pattern as the rerank/embed paths.
+        if (m.task == ::mimirmind::core::config::ModelTask::Transcribe) {
+            try {
+                ownedTranscribeStacks.push_back(
+                    ::mimirmind::runtime::makeComputeStack(cfg, engineKind));
+                auto& stk = ownedTranscribeStacks.back();
+                auto ae = std::make_unique<
+                    ::mimirmind::runtime::audio::AudioEngine>(
+                    m.path, *stk.ops, *stk.matmul);
+                ::mimirmind::server::LoadedTranscriber lt{};
+                lt.id     = m.id;
+                lt.title  = m.title;
+                lt.engine = ae.get();
+                loadedTranscribers.push_back(std::move(lt));
+                ownedTranscribers.push_back(std::move(ae));
+                MM_LOG_INFO("main",
+                            "serve: loaded transcribe model '{}' (id='{}')",
+                            m.path, m.id);
+            } catch (const std::exception& x) {
+                std::cerr << "serve: transcribe model '" << m.id
                           << "' load failed: " << x.what() << "\n";
                 return 2;
             }
@@ -2507,7 +2543,8 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     ::mimirmind::server::ApiServer server{std::move(loadedEngines), scfg,
                                           drafter.get(),
                                           std::move(loadedRerankers),
-                                          std::move(loadedEmbedders)};
+                                          std::move(loadedEmbedders),
+                                          std::move(loadedTranscribers)};
 
     g_runningServer.store(&server, std::memory_order_release);
     std::signal(SIGINT,  signalStop);

@@ -347,6 +347,17 @@ public:
                                       std::size_t         headDim,
                                       float               scale) override;
 
+    void attentionEncoderCrossAsync(const float* q,
+                                    const float* k,
+                                    const float* v,
+                                    std::size_t  Tq,
+                                    std::size_t  Tk,
+                                    std::size_t  nHeads,
+                                    std::size_t  nKvHeads,
+                                    std::size_t  headDim,
+                                    float        scale,
+                                    float*       out) override;
+
     /// Fused scaled accumulate: dst[i] += scale * src[i]. Replaces a
     /// mulScalarAsync(src, scale) + addResidualAsync(dst, src) pair
     /// where the intermediate scaled src is not read elsewhere. Used by

@@ -60,12 +60,12 @@ enum class ModelFormat { Auto, Gguf, Nvfp4 };
  * no classifier head) behind /v1/embeddings — CLS-pooled, L2-normalized vector
  * per input text.
  */
-enum class ModelTask { Chat, Rerank, Embed };
+enum class ModelTask { Chat, Rerank, Embed, Transcribe };
 
-/// Parse a `task` string ("chat"|"rerank"|"embed") or return nullopt.
+/// Parse a `task` string ("chat"|"rerank"|"embed"|"transcribe") or nullopt.
 [[nodiscard]] std::optional<ModelTask> modelTaskFromString(std::string_view s) noexcept;
 
-/// Canonical lower-case name for a task ("chat"|"rerank"|"embed").
+/// Canonical lower-case name for a task ("chat"|"rerank"|"embed"|"transcribe").
 [[nodiscard]] std::string_view modelTaskName(ModelTask t) noexcept;
 
 /**

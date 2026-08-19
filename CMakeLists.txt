@@ -402,6 +402,13 @@ add_library(mimirmind_core_common STATIC
     src/runtime/nvfp4/Qwen3_5MoeConfig.cpp
     src/runtime/nvfp4/Gemma4Config.cpp
     src/runtime/nvfp4/ModelFormatResolver.cpp
+    src/compute/dsp/MelSpectrogram.cpp
+    src/runtime/audio/WhisperModel.cpp
+    src/runtime/audio/WhisperConvStem.cpp
+    src/runtime/audio/WhisperDecode.cpp
+    src/runtime/audio/WhisperRunner.cpp
+    src/runtime/audio/WavReader.cpp
+    src/runtime/audio/AudioEngine.cpp
     src/runtime/encoder/EncoderModel.cpp
     src/runtime/encoder/EncoderRunner.cpp
     src/runtime/encoder/RerankEngine.cpp
@@ -1228,6 +1235,7 @@ add_executable(mimirmind
     src/server/ChatCompletionHandler.cpp
     src/server/RerankHandler.cpp
     src/server/EmbeddingsHandler.cpp
+    src/server/TranscriptionsHandler.cpp
     src/server/ChatRequestParser.cpp
     src/server/PromptTrimmer.cpp
     src/server/RequestDispatcher.cpp
@@ -1543,6 +1551,10 @@ endif()
 
 add_executable(compute_tests
     tests/compute_tests.cpp
+    tests/mel_spectrogram_tests.cpp
+    tests/whisper_model_tests.cpp
+    tests/whisper_forward_tests.cpp
+    tests/wav_reader_tests.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
     src/compute/GatedDeltaNet.cpp

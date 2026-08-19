@@ -848,6 +848,46 @@ void GpuOps::attentionEncoderBatchedAsync(const float* q, const float* k,
                         static_cast<std::uint32_t>(B));
 }
 
+void GpuOps::attentionEncoderCrossAsync(const float* q,
+                                        const float* k,
+                                        const float* v,
+                                        std::size_t  Tq,
+                                        std::size_t  Tk,
+                                        std::size_t  nHeads,
+                                        std::size_t  nKvHeads,
+                                        std::size_t  headDim,
+                                        float        scale,
+                                        float*       out) {
+    if (Tq == 0 || Tk == 0 || nHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (Tk > kAttentionMaxTk) {
+        throw std::runtime_error(
+            "GpuOps::attentionEncoderCrossAsync: Tk=" + std::to_string(Tk) +
+            " exceeds ATTN_ENC_MAX_TK=" + std::to_string(kAttentionMaxTk) +
+            " (scores[] SLM bound in kernels/cl/llm/attention_encoder.cl)");
+    }
+    // Same non-causal kernel as attentionEncoderAsync — it already separates
+    // the query count (launch dim 1) from the key count (T_k param), so cross
+    // attention is a straight reuse: launch Tq query rows over Tk keys.
+    // q/out:[Tq,nHeads,headDim], k/v:[Tk,nKvHeads,headDim].
+    auto& kern = _pimpl->_attentionEncoderKernel;
+    kern.setPtr(0, q);
+    kern.setPtr(1, k);
+    kern.setPtr(2, v);
+    kern.setPtr(3, out);
+    kern.setValue<std::int32_t>(4, toInt32(Tk,       "attnEncX Tk"));
+    kern.setValue<std::int32_t>(5, toInt32(nHeads,   "attnEncX nHeads"));
+    kern.setValue<std::int32_t>(6, toInt32(nKvHeads, "attnEncX nKvHeads"));
+    kern.setValue<std::int32_t>(7, toInt32(headDim,  "attnEncX headDim"));
+    kern.setValue<float>(8, scale);
+    kern.setGroupSize(kAttentionLocalSize, 1, 1);
+    // One workgroup per (head, query-position).
+    _queue.appendLaunch(kern,
+                        static_cast<std::uint32_t>(nHeads),
+                        static_cast<std::uint32_t>(Tq), 1);
+}
+
 void GpuOps::ropeInPlaceAsync(void*            xBase,
                               std::size_t      seqLen,
                               std::size_t      numHeads,
