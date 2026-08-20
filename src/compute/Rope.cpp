@@ -98,6 +98,56 @@ void applyRopeInPlaceWithFactors(float*       x,
                  static_cast<double>(base));
 }
 
+void applyRopeInPlaceInterleaved(float*       x,
+                                 const float* freqFactors,
+                                 std::size_t  seqLen,
+                                 std::size_t  numHeads,
+                                 std::size_t  headDim,
+                                 std::size_t  startPos,
+                                 float        base) {
+    if (headDim % 2 != 0) {
+        throw std::runtime_error("RoPE(interleaved): headDim must be even");
+    }
+    const std::size_t halfDim = headDim / 2;
+    const float       invDim  = 1.0F / static_cast<float>(headDim);
+
+    for (std::size_t p = 0; p < seqLen; ++p) {
+        const float pos = static_cast<float>(startPos + p);
+        for (std::size_t h = 0; h < numHeads; ++h) {
+            float* head = x + (p * numHeads + h) * headDim;
+            for (std::size_t i = 0; i < halfDim; ++i) {
+                float freq = std::pow(base,
+                    -static_cast<float>(2 * i) * invDim);
+                if (freqFactors != nullptr) {
+                    const float f = freqFactors[i];
+                    if (f == 0.0F) {
+                        throw std::runtime_error(
+                            "RoPE(interleaved)-with-factors: freqFactors[" +
+                            std::to_string(i) + "] is zero (would NaN)");
+                    }
+                    freq /= f;
+                }
+                const float theta = pos * freq;
+                const float c     = std::cos(theta);
+                const float s     = std::sin(theta);
+
+                // Adjacent-pair (GPT-J / NORM) layout: (2i, 2i+1).
+                const float a = head[2 * i];
+                const float b = head[2 * i + 1];
+                head[2 * i]     = a * c - b * s;
+                head[2 * i + 1] = a * s + b * c;
+            }
+        }
+    }
+
+    MM_LOG_DEBUG("rope",
+                 "applied-interleaved — seqLen={} heads={} headDim={} "
+                 "startPos={} base={} factors={}",
+                 seqLen, numHeads, headDim, startPos,
+                 static_cast<double>(base),
+                 freqFactors != nullptr);
+}
+
 void applyMropeInPlace(float*              x,
                        std::size_t         seqLen,
                        std::size_t         numHeads,

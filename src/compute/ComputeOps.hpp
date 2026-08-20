@@ -779,6 +779,31 @@ public:
                                              std::size_t      writeOffsetStride = 0,
                                              runtime::KvDtype kvDtype           = runtime::KvDtype::F32) = 0;
 
+    // Interleaved ("GPT-J" / llama.cpp LLAMA_ROPE_TYPE_NORM) RoPE — rotates
+    // ADJACENT pairs (2i, 2i+1) instead of the split pairs (i, i+headDim/2)
+    // of ropeInPlaceAsync. Required by the `llama` architecture (Llama /
+    // Orpheus); Qwen2/2.5/Gemma stay on the split (NEOX) path. `freqFactors`
+    // is optional: nullptr = plain interleaved, non-null applies the "llama3"
+    // proportional scaling (same semantics as ropeInPlaceWithFactorsAsync).
+    // Default impl throws so a backend that has not implemented the
+    // interleaved kernel fails loudly rather than silently mis-rotating.
+    virtual void ropeInPlaceInterleavedAsync(void*            xBase,
+                                             const float*     freqFactors,
+                                             std::size_t      seqLen,
+                                             std::size_t      numHeads,
+                                             std::size_t      headDim,
+                                             std::size_t      startPos,
+                                             float            base,
+                                             std::size_t      writeOffsetStride = 0,
+                                             runtime::KvDtype kvDtype           = runtime::KvDtype::F32) {
+        (void)xBase; (void)freqFactors; (void)seqLen; (void)numHeads;
+        (void)headDim; (void)startPos; (void)base; (void)writeOffsetStride;
+        (void)kvDtype;
+        throw std::runtime_error(
+            "ropeInPlaceInterleavedAsync: interleaved (llama/GPT-J) RoPE not "
+            "implemented on this backend");
+    }
+
     // Interleaved multi-axis RoPE (IMRoPE) — Qwen3-Next / Qwen3.5-VL
     // full-attention layers (`LLM_ROPE_TYPE_IMROPE`). Same split-pair
     // rotation as ropeInPlaceAsync but the per-pair angle base is chosen

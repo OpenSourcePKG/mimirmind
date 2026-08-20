@@ -14,6 +14,9 @@
 #include "core/log/Log.hpp"
 
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -38,8 +41,20 @@ Qwen2Backend::Qwen2Backend(const model::LlmConfig&        config,
     // time; when the checkpoint ships one we route RoPE through the factors
     // kernel (theta_i divided by freqFactors[i]). Absent (all Qwen2/2.5 GGUFs)
     // -> plain RoPE, unchanged. Mirrors GemmaBaseBackend::loadRopeFreqs.
+    // RoPE pairing convention is arch-dependent: the `llama` family
+    // (Llama-1/2/3, Orpheus TTS) uses interleaved (GPT-J) rotation, while
+    // qwen2/qwen2.5 (this backend's other tenant) uses split (NEOX). Both
+    // run through Qwen2Backend, so the pairing is picked here, once.
+    _interleavedRope = (_config.architecture == "llama");
+    MM_LOG_INFO("qwen2", "RoPE style = {} (arch={})",
+                _interleavedRope ? "interleaved/GPT-J (llama)"
+                                 : "split/NEOX (qwen2)",
+                _config.architecture);
+
+    const bool noLlama3Rope =
+        (std::getenv("MIMIRMIND_NO_LLAMA3_ROPE") != nullptr);
     if (const auto* rf = _weights.find("rope_freqs.weight");
-        rf != nullptr && rf->type == core::gguf::GgmlType::F32) {
+        !noLlama3Rope && rf != nullptr && rf->type == core::gguf::GgmlType::F32) {
         const std::size_t halfDim = _config.headDim() / 2;
         if (rf->nelements >= halfDim) {
             _ropeFreqs = static_cast<const float*>(rf->usmPtr);
@@ -84,6 +99,34 @@ std::pair<std::size_t, std::size_t> Qwen2Backend::maxQKVDims() const {
     const std::size_t qDim  = _config.headCount   * _config.headDim();
     const std::size_t kvDim = _config.headCountKv * _config.headDim();
     return {qDim, kvDim};
+}
+
+void Qwen2Backend::dumpStage(const char*  stage,
+                             std::size_t  blockIdx,
+                             const float* p,
+                             std::size_t  Trow,
+                             std::size_t  dim) const {
+    if (_parityDumpPrefix.empty()) {
+        return;
+    }
+    // Drain the queue so the CPU reads finalised values. dumpStage runs only
+    // in the parity workflow (slow, one prefill), so the sync cost is fine.
+    _gmm.sync();
+    const std::string fname =
+        _parityDumpPrefix + "-blk" + std::to_string(blockIdx) +
+        "-" + stage + ".bin";
+    std::ofstream f(fname, std::ios::binary);
+    if (!f) {
+        return;
+    }
+    const std::uint32_t header[3] = {
+        static_cast<std::uint32_t>(blockIdx),
+        static_cast<std::uint32_t>(Trow),
+        static_cast<std::uint32_t>(dim),
+    };
+    f.write(reinterpret_cast<const char*>(header), sizeof(header));
+    f.write(reinterpret_cast<const char*>(p),
+            static_cast<std::streamsize>(Trow * dim * sizeof(float)));
 }
 
 void Qwen2Backend::runBlock(std::size_t   blockIdx,
@@ -161,6 +204,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                       static_cast<const float*>(attnNorm->usmPtr),
                       _config.rmsNormEps,
                       normBuf);
+    dumpStage("attn_norm", blockIdx, normBuf, T, d_model);
 
     auto projectAsync = [&](const core::gguf::GgufTensor* W,
                             std::size_t N, float* dst) {
@@ -294,7 +338,23 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     trace("RoPE Q+K (async, unordered)");
     {
         compute::UnorderedScope u{_ops};
-        if (_ropeFreqs != nullptr) {
+        if (_interleavedRope) {
+            // `llama` architecture (Llama / Orpheus) uses INTERLEAVED
+            // (GPT-J / LLAMA_ROPE_TYPE_NORM) rotation on adjacent pairs
+            // (2i, 2i+1), NOT the split (NEOX) pairs Qwen2/2.5 use. The
+            // nullable freqFactors folds in the "llama3" scaling when the
+            // checkpoint ships rope_freqs.weight. Applying NEOX here (the
+            // else-branches) rotates the wrong coordinate pairs and
+            // silently degenerates generation — the qwen2/llama shared
+            // backend must branch on the arch's rope type.
+            _ops.ropeInPlaceInterleavedAsync(qBuf, _ropeFreqs, T,
+                                             _config.headCount, head_dim, curLen,
+                                             _config.ropeFreqBase);
+            _ops.ropeInPlaceInterleavedAsync(kStagingBase, _ropeFreqs, T,
+                                             _config.headCountKv, head_dim, curLen,
+                                             _config.ropeFreqBase,
+                                             stagingWriteStride, stagingKvDtype);
+        } else if (_ropeFreqs != nullptr) {
             // Proportional ("llama3") RoPE — divide each per-pair frequency by
             // the baked rope_freqs.weight factor. Same call shape as the plain
             // path with freqFactors threaded as the second argument.
@@ -314,6 +374,22 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                                   _config.ropeFreqBase, stagingWriteStride,
                                   stagingKvDtype);
         }
+    }
+
+    // Parity dumps of the position-encoded Q/K and the current V. Only the
+    // tensor-parity workflow (empty cache, curLen==0, F32 or Q8_0 KV) sets a
+    // prefix, so cache base == current-token slot and the fp32 view is exact.
+    // Names/order match parity-diff.py (Qcur_pos, Kcur_pos, Vcur_normed).
+    if (!_parityDumpPrefix.empty()) {
+        const float* kDump = q8Path ? kFp32Scratch
+                                    : static_cast<const float*>(kBase);
+        const float* vDump = q8Path ? vFp32Scratch
+                                    : static_cast<const float*>(vBase);
+        // Names match llama.cpp's llama graph (post-RoPE Qcur/Kcur, Vcur),
+        // so parity-diff pairs them by exact stage tag.
+        dumpStage("Qcur", blockIdx, qBuf,  T, q_dim);
+        dumpStage("Kcur", blockIdx, kDump, T, kv_dim);
+        dumpStage("Vcur", blockIdx, vDump, T, kv_dim);
     }
 
     // M10.2 Phase 1a Commit 5: fold the fp32 K/V staging rows into 32-
@@ -352,6 +428,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     _gmm.matmulAsync(oW->type, oW->usmPtr, d_model, q_dim,
                      attnOutBuf, T,
                      projOutBuf, matmulScratch);
+    dumpStage("attn_out", blockIdx, projOutBuf, T, d_model);
 
     trace("attn residual + ffn rmsNorm (fused)");
     _ops.addRmsNormAsync(x, projOutBuf, T, d_model,
@@ -378,9 +455,11 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     _gmm.matmulAsync(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
                      gateOutBuf, T,
                      projOutBuf, matmulScratch);
+    dumpStage("ffn_mlp", blockIdx, projOutBuf, T, d_model);
 
     trace("ffn residual (async, exit)");
     _ops.addResidualAsync(x, projOutBuf, T * d_model);
+    dumpStage("l_out", blockIdx, x, T, d_model);
     // No sync here — the next block's rmsNormAsync (or sampleNext's
     // final-norm) reads x on the GPU through the same queue, so
     // command-list ordering covers the hand-off.

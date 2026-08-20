@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
     ParityCtx ctx{
         /*.dumpDir =*/ dumpDir,
         /*.pattern =*/ std::regex(
-            R"(^(inp_scaled|attn_norm|Qcur_pos|Kcur_pos|Vcur_normed|attn_post_norm|attn_out|ffn_mlp|ffn_moe|ffn_moe_combined|ffn_post_norm|out_scaled|l_out)(?:-(-?\d+))?$)"),
+            R"(^(inp_scaled|attn_norm|Qcur_pos|Kcur_pos|Vcur_normed|Qcur|Kcur|Vcur|attn_post_norm|attn_out|ffn_mlp|ffn_moe|ffn_moe_combined|ffn_post_norm|out_scaled|l_out)(?:-(-?\d+))?$)"),
         /*.dumped  =*/ 0,
     };
 

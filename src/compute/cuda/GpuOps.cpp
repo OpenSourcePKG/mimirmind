@@ -173,6 +173,11 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _ropeFp16Kernel;
     core::cuda::CudaModule _ropeFfModule;
     core::cuda::CudaKernel _ropeFfKernel;
+    // Interleaved (GPT-J / llama) RoPE — arch=llama; see ropeInPlaceInterleavedAsync.
+    core::cuda::CudaModule _ropeInterleavedModule;
+    core::cuda::CudaKernel _ropeInterleavedKernel;
+    core::cuda::CudaModule _ropeFfInterleavedModule;
+    core::cuda::CudaKernel _ropeFfInterleavedKernel;
 
     core::cuda::CudaModule _attentionModule;
     core::cuda::CudaKernel _attentionKernel;
@@ -407,6 +412,10 @@ struct GpuOps::Impl {
           _ropeFp16Kernel          {_ropeFp16Module.getFunction("rope_inplace_fp16")},
           _ropeFfModule            {loadCudaModule(ctx, "rope_inplace_ff")},
           _ropeFfKernel            {_ropeFfModule.getFunction("rope_inplace_ff")},
+          _ropeInterleavedModule   {loadCudaModule(ctx, "rope_inplace_interleaved")},
+          _ropeInterleavedKernel   {_ropeInterleavedModule.getFunction("rope_inplace_interleaved")},
+          _ropeFfInterleavedModule {loadCudaModule(ctx, "rope_inplace_ff_interleaved")},
+          _ropeFfInterleavedKernel {_ropeFfInterleavedModule.getFunction("rope_inplace_ff_interleaved")},
 
           _attentionModule         {loadCudaModule(ctx, "attention")},
           _attentionKernel         {_attentionModule.getFunction("attention")},
@@ -2485,6 +2494,63 @@ void GpuOps::ropeInPlaceWithFactorsAsync(void* xBase, const float* freqFactors,
     k.launch(_ctx.stream(),
              groupsForN(total, kRopeLocalSize), 1, 1,
              kRopeLocalSize, 1, 1);
+}
+
+void GpuOps::ropeInPlaceInterleavedAsync(void* xBase, const float* freqFactors,
+                                         std::size_t seqLen,
+                                         std::size_t numHeads,
+                                         std::size_t headDim,
+                                         std::size_t startPos, float base,
+                                         std::size_t writeOffsetStride,
+                                         runtime::KvDtype kvDtype) {
+    if (seqLen == 0 || numHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (headDim % 2 != 0) {
+        throw std::runtime_error(
+            "compute::cuda::GpuOps::ropeInPlaceInterleaved: headDim must be even");
+    }
+    // Interleaved kernels are F32-only (Q-rope + the llama K-rope fp32
+    // workspace). FP16/Q8_0 here is a mis-wire — refuse loudly.
+    if (kvDtype != runtime::KvDtype::F32) {
+        throw std::runtime_error(
+            "compute::cuda::GpuOps::ropeInPlaceInterleavedAsync: only F32 KV "
+            "supported (interleaved RoPE runs on the fp32 workspace)");
+    }
+
+    const std::size_t halfDim = headDim / 2;
+    const std::size_t total   = seqLen * numHeads * halfDim;
+
+    const std::int32_t startI = toInt32(startPos, "rope_il startPos");
+    stagedInt32ToDevice(_curLenSlotUsm, startI);
+
+    // freqFactors==null -> plain interleaved; non-null -> llama3 factors.
+    if (freqFactors == nullptr) {
+        auto& k = _pimpl->_ropeInterleavedKernel;
+        k.setPtr  (0, xBase);
+        k.setValue(1, toInt32(seqLen,   "rope_il seqLen"));
+        k.setValue(2, toInt32(numHeads, "rope_il numHeads"));
+        k.setValue(3, toInt32(headDim,  "rope_il headDim"));
+        k.setPtr  (4, _curLenSlotUsm);
+        k.setValue(5, base);
+        k.setValue(6, toInt32(writeOffsetStride, "rope_il writeOffsetStride"));
+        k.launch(_ctx.stream(),
+                 groupsForN(total, kRopeLocalSize), 1, 1,
+                 kRopeLocalSize, 1, 1);
+    } else {
+        auto& k = _pimpl->_ropeFfInterleavedKernel;
+        k.setPtr  (0, xBase);
+        k.setPtr  (1, freqFactors);
+        k.setValue(2, toInt32(seqLen,   "rope_ffil seqLen"));
+        k.setValue(3, toInt32(numHeads, "rope_ffil numHeads"));
+        k.setValue(4, toInt32(headDim,  "rope_ffil headDim"));
+        k.setPtr  (5, _curLenSlotUsm);
+        k.setValue(6, base);
+        k.setValue(7, toInt32(writeOffsetStride, "rope_ffil writeOffsetStride"));
+        k.launch(_ctx.stream(),
+                 groupsForN(total, kRopeLocalSize), 1, 1,
+                 kRopeLocalSize, 1, 1);
+    }
 }
 
 void GpuOps::xQuantI8Async(const float* x, std::int8_t* y, float* scale,

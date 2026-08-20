@@ -139,6 +139,15 @@ public:
                                      std::size_t writeOffsetStride = 0,
                                      runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
 
+    // Interleaved (GPT-J / llama) RoPE — arch=llama. freqFactors nullable
+    // (null = plain, non-null = llama3 scaling). See ComputeOps.hpp.
+    void ropeInPlaceInterleavedAsync(void* xBase, const float* freqFactors,
+                                     std::size_t seqLen, std::size_t numHeads,
+                                     std::size_t headDim, std::size_t startPos,
+                                     float base,
+                                     std::size_t writeOffsetStride = 0,
+                                     runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
+
     void mropeInPlaceAsync(void* xBase, std::size_t seqLen,
                            std::size_t numHeads, std::size_t headDim,
                            std::size_t startPos, float base,

@@ -5,6 +5,9 @@
 
 #include "runtime/arch/ArchBackend.hpp"
 
+#include <cstddef>
+#include <string>
+
 namespace mimirmind::compute {
 class ComputeMatmul;
 class ComputeOps;
@@ -60,7 +63,27 @@ public:
     [[nodiscard]] std::pair<std::size_t, std::size_t>
         maxQKVDims() const override;
 
+    /// Enable per-stage parity dumps (M8.* tensor-parity workflow), mirroring
+    /// GemmaBaseBackend. When set, runBlock writes `<prefix>-blk{N}-<stage>.bin`
+    /// for the dense-Llama stages parity-diff checks (attn_norm, Qcur_pos,
+    /// Kcur_pos, Vcur_normed, attn_out, ffn_mlp, l_out). Empty = disabled. This
+    /// is what makes `mimirmind parity` work for the qwen2/llama forward, the
+    /// oracle path used to localise the Llama-3.2 forward drift (step 8.13.2.1).
+    void setParityDumpPrefix(const std::string& prefix) noexcept override {
+        _parityDumpPrefix = prefix;
+    }
+
 private:
+    /// Write a per-stage parity dump when `_parityDumpPrefix` is set. No-op
+    /// otherwise. Sync-flushes the matmul queue, then writes a 3xu32 header
+    /// {blockIdx, Trow, dim} followed by Trow*dim f32 — the exact layout
+    /// llama-parity-dump emits and parity-diff.py consumes.
+    void dumpStage(const char* stage,
+                   std::size_t blockIdx,
+                   const float* p,
+                   std::size_t Trow,
+                   std::size_t dim) const;
+
     const model::LlmConfig&        _config;
     const core::gguf::WeightsMap&       _weights;
     const model::FusedQkvWeights*  _fusedQkv{nullptr};
@@ -76,6 +99,16 @@ private:
     // (theta_i = pos * base^(-2i/headDim) / freqFactors[i]). Qwen2/2.5 GGUFs
     // carry no such tensor, so they keep plain RoPE (no behaviour change).
     const float*                   _ropeFreqs{nullptr};
+
+    // True for the `llama` architecture (Llama / Orpheus), which uses
+    // INTERLEAVED (GPT-J / LLAMA_ROPE_TYPE_NORM) RoPE — adjacent pairs
+    // (2i, 2i+1) — instead of the split (NEOX) pairs (i, i+headDim/2) that
+    // Qwen2/2.5 use. Resolved once from _config.architecture in the ctor.
+    bool                           _interleavedRope{false};
+
+    // Parity-dump file prefix carried by `diagnostics.parityDump`; empty =
+    // disabled (the default). Set via setParityDumpPrefix() at prefill time.
+    std::string                    _parityDumpPrefix{};
 };
 
 } // namespace mimirmind::runtime::arch

@@ -224,6 +224,7 @@ set(KERNEL_SOURCES
     kernels/cl/common/add_residual.cl
     kernels/cl/common/silu_mul.cl
     kernels/cl/llm/rope_inplace.cl
+    kernels/cl/llm/rope_inplace_interleaved.cl
     kernels/cl/llm/rope_mrope.cl
     kernels/cl/llm/split_head_pair.cl
     kernels/cl/common/sigmoid_gate_mul.cl
@@ -246,6 +247,7 @@ set(KERNEL_SOURCES
     kernels/cl/llm/rmsnorm_qkv.cl
     kernels/cl/common/add_rmsnorm.cl
     kernels/cl/llm/rope_inplace_ff.cl
+    kernels/cl/llm/rope_inplace_ff_interleaved.cl
     kernels/cl/llm/attention.cl
     kernels/cl/llm/attention_flash_partial.cl
     kernels/cl/llm/attention_flash_merge.cl
@@ -945,6 +947,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/rmsnorm_qkv_fp16.cu
         kernels/cuda/llm/rmsnorm_qkv_f32in_fp16out.cu
         kernels/cuda/llm/rope_inplace.cu
+        kernels/cuda/llm/rope_inplace_interleaved.cu
         kernels/cuda/llm/rope_mrope.cu
         kernels/cuda/llm/rope_mrope_fp16.cu
         kernels/cuda/llm/rope_mrope_batched.cu
@@ -971,6 +974,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/gather_heads_from_channels.cu
         kernels/cuda/llm/rope_inplace_fp16.cu
         kernels/cuda/llm/rope_inplace_ff.cu
+        kernels/cuda/llm/rope_inplace_ff_interleaved.cu
         kernels/cuda/common/scaled_add_residual.cu
         kernels/cuda/common/gelu_mul.cu
         kernels/cuda/common/gelu_erf.cu

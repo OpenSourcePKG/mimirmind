@@ -69,6 +69,9 @@ struct GpuOps::Impl {
     runtime::GpuKernel     _siluMulKernel;
     runtime::GpuModule     _ropeModule;
     runtime::GpuKernel     _ropeKernel;
+    // Interleaved (GPT-J / llama) RoPE — arch=llama; see ropeInPlaceInterleavedAsync.
+    runtime::GpuModule     _ropeInterleavedModule;
+    runtime::GpuKernel     _ropeInterleavedKernel;
     runtime::GpuModule     _mulScalarModule;
     runtime::GpuKernel     _mulScalarKernel;
     runtime::GpuModule     _geluMulModule;
@@ -96,6 +99,8 @@ struct GpuOps::Impl {
     runtime::GpuKernel     _addRmsNormKernel;
     runtime::GpuModule     _ropeFfModule;
     runtime::GpuKernel     _ropeFfKernel;
+    runtime::GpuModule     _ropeFfInterleavedModule;
+    runtime::GpuKernel     _ropeFfInterleavedKernel;
     runtime::GpuModule     _attentionModule;
     runtime::GpuKernel     _attentionKernel;
     runtime::GpuModule     _attentionFlashPartialModule;
@@ -171,6 +176,8 @@ struct GpuOps::Impl {
           _siluMulKernel    {_siluMulModule.kernel("silu_mul")},
           _ropeModule       {ctx, "rope_inplace"},
           _ropeKernel       {_ropeModule.kernel("rope_inplace")},
+          _ropeInterleavedModule {ctx, "rope_inplace_interleaved"},
+          _ropeInterleavedKernel {_ropeInterleavedModule.kernel("rope_inplace_interleaved")},
           _mulScalarModule  {ctx, "mul_scalar"},
           _mulScalarKernel  {_mulScalarModule.kernel("mul_scalar")},
           _geluMulModule    {ctx, "gelu_mul"},
@@ -197,6 +204,8 @@ struct GpuOps::Impl {
           _addRmsNormKernel{_addRmsNormModule.kernel("add_rmsnorm")},
           _ropeFfModule    {ctx, "rope_inplace_ff"},
           _ropeFfKernel    {_ropeFfModule.kernel("rope_inplace_ff")},
+          _ropeFfInterleavedModule {ctx, "rope_inplace_ff_interleaved"},
+          _ropeFfInterleavedKernel {_ropeFfInterleavedModule.kernel("rope_inplace_ff_interleaved")},
           _attentionModule {ctx, "attention"},
           _attentionKernel {_attentionModule.kernel("attention")},
           _attentionFlashPartialModule{ctx, "attention_flash_partial"},
@@ -1222,6 +1231,67 @@ void GpuOps::ropeInPlaceWithFactorsAsync(void*            xBase,
     kernel.setGroupSize(kRopeLocalSize, 1, 1);
     _queue.appendLaunch(kernel,
                         groupsForN(total, kRopeLocalSize), 1, 1);
+}
+
+void GpuOps::ropeInPlaceInterleavedAsync(void*            xBase,
+                                         const float*     freqFactors,
+                                         std::size_t      seqLen,
+                                         std::size_t      numHeads,
+                                         std::size_t      headDim,
+                                         std::size_t      startPos,
+                                         float            base,
+                                         std::size_t      writeOffsetStride,
+                                         runtime::KvDtype kvDtype) {
+    if (seqLen == 0 || numHeads == 0 || headDim == 0) {
+        return;
+    }
+    if (headDim % 2 != 0) {
+        throw std::runtime_error(
+            "GpuOps::ropeInPlaceInterleaved: headDim must be even");
+    }
+    // Interleaved kernels are F32-only. The `llama` arch's K-rope always
+    // runs against the fp32 workspace (fp16/Q8_0 KV commit happens after),
+    // and Q-rope is fp32 too — so FP16 here is a mis-wire, refuse loudly.
+    if (kvDtype == runtime::KvDtype::FP16) {
+        throw std::runtime_error(
+            "GpuOps::ropeInPlaceInterleaved: FP16-KV not supported "
+            "(interleaved RoPE runs on the fp32 workspace)");
+    }
+    const std::size_t halfDim = headDim / 2;
+    const std::size_t total   = seqLen * numHeads * halfDim;
+
+    // freqFactors==null -> plain interleaved; non-null -> llama3 factors.
+    // Arg layout mirrors rope_inplace / rope_inplace_ff (freq_factors at
+    // slot 1 shifts the rest by one).
+    *_curLenSlotUsm = toInt32(startPos, "rope_il startPos");
+    if (freqFactors == nullptr) {
+        runtime::GpuKernel& kernel = _pimpl->_ropeInterleavedKernel;
+        kernel.setPtr(0, xBase);
+        kernel.setValue<std::int32_t>(1, toInt32(seqLen,   "rope_il seqLen"));
+        kernel.setValue<std::int32_t>(2, toInt32(numHeads, "rope_il numHeads"));
+        kernel.setValue<std::int32_t>(3, toInt32(headDim,  "rope_il headDim"));
+        kernel.setPtr(4, _curLenSlotUsm);
+        kernel.setValue<float>(5, base);
+        kernel.setValue<std::int32_t>(
+            6, toInt32(writeOffsetStride, "rope_il writeOffsetStride"));
+        kernel.setGroupSize(kRopeLocalSize, 1, 1);
+        _queue.appendLaunch(kernel,
+                            groupsForN(total, kRopeLocalSize), 1, 1);
+    } else {
+        runtime::GpuKernel& kernel = _pimpl->_ropeFfInterleavedKernel;
+        kernel.setPtr(0, xBase);
+        kernel.setPtr(1, freqFactors);
+        kernel.setValue<std::int32_t>(2, toInt32(seqLen,   "rope_ffil seqLen"));
+        kernel.setValue<std::int32_t>(3, toInt32(numHeads, "rope_ffil numHeads"));
+        kernel.setValue<std::int32_t>(4, toInt32(headDim,  "rope_ffil headDim"));
+        kernel.setPtr(5, _curLenSlotUsm);
+        kernel.setValue<float>(6, base);
+        kernel.setValue<std::int32_t>(
+            7, toInt32(writeOffsetStride, "rope_ffil writeOffsetStride"));
+        kernel.setGroupSize(kRopeLocalSize, 1, 1);
+        _queue.appendLaunch(kernel,
+                            groupsForN(total, kRopeLocalSize), 1, 1);
+    }
 }
 
 void GpuOps::scaledAddResidualAsync(float*       dst,
