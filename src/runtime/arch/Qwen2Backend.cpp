@@ -32,6 +32,28 @@ Qwen2Backend::Qwen2Backend(const model::LlmConfig&        config,
                 _config.blockCount, _config.embeddingLength,
                 _config.feedForwardLength, _config.headCount,
                 _config.headCountKv);
+
+    // Proportional RoPE (Llama-3.1/3.2 "llama3" rope scaling). llama.cpp bakes
+    // the per-frequency remap into the `rope_freqs.weight` tensor at conversion
+    // time; when the checkpoint ships one we route RoPE through the factors
+    // kernel (theta_i divided by freqFactors[i]). Absent (all Qwen2/2.5 GGUFs)
+    // -> plain RoPE, unchanged. Mirrors GemmaBaseBackend::loadRopeFreqs.
+    if (const auto* rf = _weights.find("rope_freqs.weight");
+        rf != nullptr && rf->type == core::gguf::GgmlType::F32) {
+        const std::size_t halfDim = _config.headDim() / 2;
+        if (rf->nelements >= halfDim) {
+            _ropeFreqs = static_cast<const float*>(rf->usmPtr);
+            MM_LOG_INFO("qwen2",
+                        "proportional RoPE enabled — rope_freqs.weight has "
+                        "{} float(s), using first {} (llama3 scaling)",
+                        rf->nelements, halfDim);
+        } else {
+            MM_LOG_WARN("qwen2",
+                        "rope_freqs.weight has {} float(s) < headDim/2={} — "
+                        "proportional RoPE disabled, using plain RoPE",
+                        rf->nelements, halfDim);
+        }
+    }
 }
 
 bool Qwen2Backend::decodeQkvClrSafe() const noexcept {
@@ -272,13 +294,26 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     trace("RoPE Q+K (async, unordered)");
     {
         compute::UnorderedScope u{_ops};
-        _ops.ropeInPlaceAsync(qBuf, T,
-                              _config.headCount,   head_dim, curLen,
-                              _config.ropeFreqBase);
-        _ops.ropeInPlaceAsync(kStagingBase, T,
-                              _config.headCountKv, head_dim, curLen,
-                              _config.ropeFreqBase, stagingWriteStride,
-                              stagingKvDtype);
+        if (_ropeFreqs != nullptr) {
+            // Proportional ("llama3") RoPE — divide each per-pair frequency by
+            // the baked rope_freqs.weight factor. Same call shape as the plain
+            // path with freqFactors threaded as the second argument.
+            _ops.ropeInPlaceWithFactorsAsync(qBuf, _ropeFreqs, T,
+                                             _config.headCount, head_dim, curLen,
+                                             _config.ropeFreqBase);
+            _ops.ropeInPlaceWithFactorsAsync(kStagingBase, _ropeFreqs, T,
+                                             _config.headCountKv, head_dim, curLen,
+                                             _config.ropeFreqBase,
+                                             stagingWriteStride, stagingKvDtype);
+        } else {
+            _ops.ropeInPlaceAsync(qBuf, T,
+                                  _config.headCount,   head_dim, curLen,
+                                  _config.ropeFreqBase);
+            _ops.ropeInPlaceAsync(kStagingBase, T,
+                                  _config.headCountKv, head_dim, curLen,
+                                  _config.ropeFreqBase, stagingWriteStride,
+                                  stagingKvDtype);
+        }
     }
 
     // M10.2 Phase 1a Commit 5: fold the fp32 K/V staging rows into 32-

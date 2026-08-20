@@ -67,6 +67,15 @@ private:
     compute::ComputeOps&               _ops;
     compute::ComputeMatmul&            _gmm;
     runtime::OpProfiler&           _op;  // held for parity with Gemma4; not instrumented yet
+
+    // Proportional ("llama3") RoPE frequency factors, [headDim/2] f32 in USM,
+    // or nullptr for plain RoPE. Points at the GGUF `rope_freqs.weight` tensor
+    // when the checkpoint ships one — llama.cpp bakes the Llama-3.1/3.2 rope
+    // scaling (rope_scaling.type == "llama3") into that tensor at conversion
+    // time, and its semantics match ropeInPlaceWithFactorsAsync exactly
+    // (theta_i = pos * base^(-2i/headDim) / freqFactors[i]). Qwen2/2.5 GGUFs
+    // carry no such tensor, so they keep plain RoPE (no behaviour change).
+    const float*                   _ropeFreqs{nullptr};
 };
 
 } // namespace mimirmind::runtime::arch
