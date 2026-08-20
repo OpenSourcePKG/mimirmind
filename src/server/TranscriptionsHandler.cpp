@@ -54,6 +54,12 @@ TranscriptionsHandler::resolve(const std::string& model) {
             return &s;
         }
     }
+    // Lenient single-model fallback: an unmatched id (e.g. an OpenAI client's
+    // default "whisper-1") resolves to the sole loaded model. Only ambiguous
+    // with 2+ models, where the 404 stands.
+    if (_slots.size() == 1) {
+        return &_slots.front();
+    }
     return nullptr;
 }
 
