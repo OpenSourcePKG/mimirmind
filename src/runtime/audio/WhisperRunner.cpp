@@ -163,8 +163,12 @@ WhisperRunner::transcribeGreedy(const float* mel, std::size_t nMels,
     compute::ComputeBuffer sab   = alloc(Tmax * d);
     compute::ComputeBuffer aob   = alloc(Tmax * d);
     compute::ComputeBuffer cqb   = alloc(Tmax * d);
-    compute::ComputeBuffer ckb   = alloc(nCtx * d);
-    compute::ComputeBuffer cvb   = alloc(nCtx * d);
+    // Cross-attn K/V are a function of the FIXED encoder output, so they are
+    // identical across every decode step. Compute them ONCE per layer before
+    // the token loop (nCtx x d each) and reuse — this hoists 2 GEMMs/layer out
+    // of the O(steps) loop (the dominant per-step cost for short transcripts).
+    compute::ComputeBuffer ckAllb = alloc(c.decoderLayers * nCtx * d);
+    compute::ComputeBuffer cvAllb = alloc(c.decoderLayers * nCtx * d);
     compute::ComputeBuffer cab   = alloc(Tmax * d);
     compute::ComputeBuffer cob   = alloc(Tmax * d);
     compute::ComputeBuffer interb = alloc(Tmax * ffn);
@@ -180,9 +184,9 @@ WhisperRunner::transcribeGreedy(const float* mel, std::size_t nMels,
     float* v    = fp(vb);
     float* sa   = fp(sab);
     float* ao   = fp(aob);
-    float* cq   = fp(cqb);
-    float* ck   = fp(ckb);
-    float* cv   = fp(cvb);
+    float* cq    = fp(cqb);
+    float* ckAll = fp(ckAllb);
+    float* cvAll = fp(cvAllb);
     float* ca   = fp(cab);
     float* co   = fp(cob);
     float* inter = fp(interb);
@@ -191,6 +195,17 @@ WhisperRunner::transcribeGreedy(const float* mel, std::size_t nMels,
     float* logit = fp(logitb);
 
     std::vector<float> hostLogits(vocab);
+
+    // Precompute the per-layer cross-attn K/V from the (fixed) encoder output
+    // once. ckW has no bias; cvW does. Each layer's slice is [nCtx, d].
+    for (std::size_t i = 0; i < c.decoderLayers; ++i) {
+        const WhisperDecoderLayer& L = _m.decoderLayer(i);
+        float* cki = ckAll + i * nCtx * d;
+        float* cvi = cvAll + i * nCtx * d;
+        _mm.matmulAsync(WT, L.ckW, d, d, enc, nCtx, cki, scratch);   // no bias
+        _mm.matmulAsync(WT, L.cvW, d, d, enc, nCtx, cvi, scratch);
+        _ops.addBiasAsync(cvi, nCtx, d, L.cvB);
+    }
 
     while (tokens.size() < Tmax) {
         const std::size_t t = tokens.size();
@@ -221,10 +236,10 @@ WhisperRunner::transcribeGreedy(const float* mel, std::size_t nMels,
             _ops.layerNormAsync(ao, t, d, L.crossLnW, L.crossLnB, kLnEps, ln);
             _mm.matmulAsync(WT, L.cqW, d, d, ln, t, cq, scratch);
             _ops.addBiasAsync(cq, t, d, L.cqB);
-            _mm.matmulAsync(WT, L.ckW, d, d, enc, nCtx, ck, scratch); // no bias
-            _mm.matmulAsync(WT, L.cvW, d, d, enc, nCtx, cv, scratch);
-            _ops.addBiasAsync(cv, nCtx, d, L.cvB);
-            _ops.attentionEncoderCrossAsync(cq, ck, cv, t, nCtx, heads, heads,
+            // Reuse this layer's precomputed encoder K/V (constant across steps).
+            const float* cki = ckAll + i * nCtx * d;
+            const float* cvi = cvAll + i * nCtx * d;
+            _ops.attentionEncoderCrossAsync(cq, cki, cvi, t, nCtx, heads, heads,
                                             headDim, scale, ca);
             _mm.matmulAsync(WT, L.coW, d, d, ca, t, co, scratch);
             _ops.addBiasAsync(co, t, d, L.coB);
