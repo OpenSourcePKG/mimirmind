@@ -23,6 +23,10 @@ namespace mimirmind::runtime::encoder {
 class RerankEngine;
 class EmbedEngine;
 }
+namespace mimirmind::runtime::audio {
+class AudioEngine;
+class SpeakEngine;
+}
 
 namespace mimirmind::server {
 
@@ -66,6 +70,31 @@ struct LoadedEmbedder {
     std::string                    id;
     std::string                    title;
     runtime::encoder::EmbedEngine* engine{nullptr};
+};
+
+/**
+ * One loaded Whisper-class ASR model exposed under /v1/audio/transcriptions.
+ * `engine` is non-owning — ServeMode keeps the AudioEngine (and its compute
+ * stack) alive for the process lifetime. Each entry gets its own serialisation
+ * mutex inside TranscriptionsHandler (AudioEngine is not thread-safe).
+ */
+struct LoadedTranscriber {
+    std::string                 id;
+    std::string                 title;
+    runtime::audio::AudioEngine* engine{nullptr};
+};
+
+/**
+ * One loaded Orpheus TTS model exposed under /v1/audio/speech. `engine` is
+ * non-owning — ServeMode keeps the SpeakEngine (and the borrowed InferenceEngine
+ * + SNAC decoder it wraps) alive for the process lifetime. Each entry gets its
+ * own serialisation mutex inside SpeechHandler (the acoustic engine has one KV
+ * cache — one synthesize() at a time).
+ */
+struct LoadedSpeaker {
+    std::string                  id;
+    std::string                  title;
+    runtime::audio::SpeakEngine* engine{nullptr};
 };
 
 /// In-process TLS termination settings. When `enabled`, the listener is a
@@ -185,11 +214,13 @@ public:
     /// the ApiServer wires up the M9.11.4 spec-dec orchestrator for
     /// that target. Other loaded engines dispatch through the plain
     /// generate() path.
-    ApiServer(std::vector<LoadedEngine>     engines,
-              ServerConfig                  cfg,
-              runtime::Drafter*             drafter = nullptr,
-              std::vector<LoadedReranker>   rerankers = {},
-              std::vector<LoadedEmbedder>   embedders = {});
+    ApiServer(std::vector<LoadedEngine>       engines,
+              ServerConfig                    cfg,
+              runtime::Drafter*               drafter = nullptr,
+              std::vector<LoadedReranker>     rerankers = {},
+              std::vector<LoadedEmbedder>     embedders = {},
+              std::vector<LoadedTranscriber>  transcribers = {},
+              std::vector<LoadedSpeaker>      speakers = {});
     ~ApiServer();
 
     ApiServer(const ApiServer&)            = delete;

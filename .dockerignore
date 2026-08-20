@@ -1,6 +1,7 @@
 build/
 build-*/
 out/
+models/
 .claude/
 scratchpad/
 node_modules/

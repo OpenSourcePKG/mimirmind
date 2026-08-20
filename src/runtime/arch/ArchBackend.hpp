@@ -230,8 +230,8 @@ protected:
 /// in Qwen2Backend / Gemma4Backend implementations.
 [[nodiscard]] inline bool
 isSupportedArchitecture(std::string_view architecture) noexcept {
-    return architecture == "qwen2" || architecture == "gemma4" ||
-           architecture == "qwen35moe";
+    return architecture == "qwen2" || architecture == "llama" ||
+           architecture == "gemma4" || architecture == "qwen35moe";
 }
 
 /// Build the backend matching `architecture` ("qwen2" / "gemma4"). Returns

@@ -55,6 +55,34 @@ void applyRopeInPlaceWithFactors(float*        x,
                                  float         base);
 
 /**
+ * Interleaved ("GPT-J" / llama.cpp `LLAMA_ROPE_TYPE_NORM`) RoPE. Rotates
+ * ADJACENT pairs (2i, 2i+1) rather than the split pairs (i, i+headDim/2)
+ * of `applyRopeInPlace` (NEOX). This is the convention the `llama`
+ * architecture uses (Llama-1/2/3, and Llama-3.2-derived checkpoints such
+ * as Orpheus TTS) — as opposed to Qwen2/Qwen2.5/Gemma, which are NEOX.
+ * Using NEOX on a `llama` checkpoint rotates the wrong coordinate pairs:
+ * the self-attention score (relative position 0) still matches, but every
+ * cross-position score is wrong and the error grows with |i-j|, which
+ * silently corrupts generation into degenerate sub-word text.
+ *
+ *   theta_i = pos * base^(-2i/headDim) [ / freqFactors[i] when non-null ]
+ *   x'[2i]     = x[2i] * c - x[2i+1] * s
+ *   x'[2i+1]   = x[2i] * s + x[2i+1] * c
+ *
+ * `freqFactors` is optional: nullptr = plain interleaved RoPE; non-null
+ * points at `headDim/2` f32 values and applies the Llama-3.1/3.2 "llama3"
+ * proportional scaling exactly as `applyRopeInPlaceWithFactors` does for
+ * the NEOX path. Zero factor entries throw. headDim must be even.
+ */
+void applyRopeInPlaceInterleaved(float*        x,
+                                 const float*  freqFactors,
+                                 std::size_t   seqLen,
+                                 std::size_t   numHeads,
+                                 std::size_t   headDim,
+                                 std::size_t   startPos,
+                                 float         base);
+
+/**
  * Interleaved multi-axis RoPE (IMRoPE) — the rotary variant used by
  * Qwen3-Next / Qwen3.5-VL full-attention layers (`LLM_ROPE_TYPE_IMROPE`
  * in llama.cpp). Same split-pair rotation as `applyRopeInPlace`, but the

@@ -200,6 +200,18 @@ public:
                                      std::size_t      writeOffsetStride = 0,
                                      runtime::KvDtype kvDtype           = runtime::KvDtype::F32) override;
 
+    /// Interleaved (GPT-J / llama) RoPE — arch=llama. freqFactors nullable
+    /// (null = plain, non-null = llama3 scaling). See ComputeOps.hpp.
+    void ropeInPlaceInterleavedAsync(void*            xBase,
+                                     const float*     freqFactors,
+                                     std::size_t      seqLen,
+                                     std::size_t      numHeads,
+                                     std::size_t      headDim,
+                                     std::size_t      startPos,
+                                     float            base,
+                                     std::size_t      writeOffsetStride = 0,
+                                     runtime::KvDtype kvDtype           = runtime::KvDtype::F32) override;
+
     /// Interleaved multi-axis RoPE (IMRoPE) — Qwen3-Next full-attention.
     void mropeInPlaceAsync(void*               xBase,
                            std::size_t         seqLen,
@@ -346,6 +358,17 @@ public:
                                       std::size_t         nKvHeads,
                                       std::size_t         headDim,
                                       float               scale) override;
+
+    void attentionEncoderCrossAsync(const float* q,
+                                    const float* k,
+                                    const float* v,
+                                    std::size_t  Tq,
+                                    std::size_t  Tk,
+                                    std::size_t  nHeads,
+                                    std::size_t  nKvHeads,
+                                    std::size_t  headDim,
+                                    float        scale,
+                                    float*       out) override;
 
     /// Fused scaled accumulate: dst[i] += scale * src[i]. Replaces a
     /// mulScalarAsync(src, scale) + addResidualAsync(dst, src) pair

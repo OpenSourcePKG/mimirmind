@@ -7,6 +7,8 @@
 #include "server/ChatCompletionHandler.hpp"
 #include "server/RerankHandler.hpp"
 #include "server/EmbeddingsHandler.hpp"
+#include "server/TranscriptionsHandler.hpp"
+#include "server/SpeechHandler.hpp"
 #include "server/RequestDispatcher.hpp"
 #include "server/RequestTracker.hpp"
 #include "server/SystemStatusBuilder.hpp"
@@ -127,10 +129,20 @@ struct ApiServer::Impl {
     // model with task=embed is configured.
     EmbeddingsHandler                     embeddingsHandler;
 
+    // POST /v1/audio/transcriptions — Whisper-class ASR model(s). Empty when
+    // no model with task=transcribe is configured.
+    TranscriptionsHandler                 transcriptionsHandler;
+
+    // POST /v1/audio/speech — Orpheus TTS model(s). Empty when no model with
+    // task=speak is configured.
+    SpeechHandler                         speechHandler;
+
     Impl(std::vector<LoadedEngine> in, ServerConfig c,
          runtime::Drafter*         drafter,
          std::vector<LoadedReranker> rerankers,
-         std::vector<LoadedEmbedder> embedders)
+         std::vector<LoadedEmbedder> embedders,
+         std::vector<LoadedTranscriber> transcribers,
+         std::vector<LoadedSpeaker> speakers)
         : dispatcher{std::move(in), c.modelId, drafter,
                      c.speculativeTargetId, c.speculative},
           engine{dispatcher.defaultEngine()},
@@ -139,7 +151,9 @@ struct ApiServer::Impl {
           statusBuilder{engine, dispatcher, requestTracker, cfg.modelId},
           chatHandler{dispatcher, requestTracker, tenantMetrics, cfg},
           rerankHandler{std::move(rerankers), cfg},
-          embeddingsHandler{std::move(embedders), cfg} {
+          embeddingsHandler{std::move(embedders), cfg},
+          transcriptionsHandler{std::move(transcribers), cfg},
+          speechHandler{std::move(speakers), cfg} {
         makeServer();
         installRoutes();
     }
@@ -299,6 +313,28 @@ struct ApiServer::Impl {
                         embeddingsHandler.handle(req, res);
                     });
 
+        server->Post("/v1/audio/transcriptions",
+                    [this](const httplib::Request& req,
+                           httplib::Response&       res) {
+                        MM_LOG_INFO(
+                            "server",
+                            "POST /v1/audio/transcriptions accepted from {} "
+                            "(content-length={} B)",
+                            req.remote_addr, req.body.size());
+                        transcriptionsHandler.handle(req, res);
+                    });
+
+        server->Post("/v1/audio/speech",
+                    [this](const httplib::Request& req,
+                           httplib::Response&       res) {
+                        MM_LOG_INFO(
+                            "server",
+                            "POST /v1/audio/speech accepted from {} "
+                            "(content-length={} B)",
+                            req.remote_addr, req.body.size());
+                        speechHandler.handle(req, res);
+                    });
+
         server->set_exception_handler(
             [](const httplib::Request& req,
                httplib::Response& res,
@@ -380,6 +416,26 @@ struct ApiServer::Impl {
                 {"task",     "embed"},
             });
         }
+        for (const auto& m : transcriptionsHandler.listModels()) {
+            data.push_back(json{
+                {"id",       m.id},
+                {"title",    m.title},
+                {"object",   "model"},
+                {"created",  0},
+                {"owned_by", "mimirmind"},
+                {"task",     "transcribe"},
+            });
+        }
+        for (const auto& m : speechHandler.listModels()) {
+            data.push_back(json{
+                {"id",       m.id},
+                {"title",    m.title},
+                {"object",   "model"},
+                {"created",  0},
+                {"owned_by", "mimirmind"},
+                {"task",     "speak"},
+            });
+        }
         sendJson(res, 200, {
             {"object", "list"},
             {"data",   std::move(data)},
@@ -433,15 +489,19 @@ struct ApiServer::Impl {
     }
 };
 
-ApiServer::ApiServer(std::vector<LoadedEngine>     engines,
-                     ServerConfig                  cfg,
-                     runtime::Drafter*             drafter,
-                     std::vector<LoadedReranker>   rerankers,
-                     std::vector<LoadedEmbedder>   embedders)
+ApiServer::ApiServer(std::vector<LoadedEngine>       engines,
+                     ServerConfig                    cfg,
+                     runtime::Drafter*               drafter,
+                     std::vector<LoadedReranker>     rerankers,
+                     std::vector<LoadedEmbedder>     embedders,
+                     std::vector<LoadedTranscriber>  transcribers,
+                     std::vector<LoadedSpeaker>      speakers)
     : _impl{std::make_unique<Impl>(std::move(engines),
                                    std::move(cfg), drafter,
                                    std::move(rerankers),
-                                   std::move(embedders))} {}
+                                   std::move(embedders),
+                                   std::move(transcribers),
+                                   std::move(speakers))} {}
 
 ApiServer::~ApiServer() = default;
 

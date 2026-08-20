@@ -418,6 +418,30 @@ void GpuOps::ropeInPlaceWithFactorsAsync(void*            xBase,
         startPos, base);
 }
 
+void GpuOps::ropeInPlaceInterleavedAsync(void*            xBase,
+                                         const float*     freqFactors,
+                                         std::size_t      seqLen,
+                                         std::size_t      numHeads,
+                                         std::size_t      headDim,
+                                         std::size_t      startPos,
+                                         float            base,
+                                         std::size_t      writeOffsetStride,
+                                         runtime::KvDtype kvDtype) {
+    if (kvDtype != runtime::KvDtype::F32) {
+        throw std::runtime_error(
+            "compute::cpu::GpuOps::ropeInPlaceInterleavedAsync: only "
+            "KvDtype::F32 is supported (F32 reference path)");
+    }
+    // Same writeOffsetStride semantics as ropeInPlaceAsync (F32 elements).
+    // freqFactors may be null (plain interleaved) or the llama3 factors.
+    float* effective = static_cast<float*>(xBase)
+                     + startPos * writeOffsetStride;
+    ::mimirmind::compute::applyRopeInPlaceInterleaved(
+        effective, freqFactors,
+        seqLen, numHeads, headDim,
+        startPos, base);
+}
+
 // ---- Quantisation + KV commit ------------------------------------------
 
 void GpuOps::xQuantI8Async(const float* x,

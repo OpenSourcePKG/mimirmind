@@ -65,6 +65,10 @@ public:
         Gemma4,       ///< Gemma 4 — asymmetric <|turn>/<turn|>. Also has the
                       ///<              thinking-channel markup <|channel>/<channel|>
                       ///<              wrapping the model's response.
+        Llama3,       ///< Llama-3.x (GGUF arch "llama") — <|begin_of_text|> +
+                      ///<              <|start_header_id|>role<|end_header_id|>
+                      ///<              turns terminated by <|eot_id|>. First
+                      ///<              consumer: Orpheus TTS backbone (8.13.2).
     };
 
     /// Pick a template style by GGUF `general.architecture`. Throws

@@ -224,6 +224,7 @@ set(KERNEL_SOURCES
     kernels/cl/common/add_residual.cl
     kernels/cl/common/silu_mul.cl
     kernels/cl/llm/rope_inplace.cl
+    kernels/cl/llm/rope_inplace_interleaved.cl
     kernels/cl/llm/rope_mrope.cl
     kernels/cl/llm/split_head_pair.cl
     kernels/cl/common/sigmoid_gate_mul.cl
@@ -246,6 +247,7 @@ set(KERNEL_SOURCES
     kernels/cl/llm/rmsnorm_qkv.cl
     kernels/cl/common/add_rmsnorm.cl
     kernels/cl/llm/rope_inplace_ff.cl
+    kernels/cl/llm/rope_inplace_ff_interleaved.cl
     kernels/cl/llm/attention.cl
     kernels/cl/llm/attention_flash_partial.cl
     kernels/cl/llm/attention_flash_merge.cl
@@ -402,6 +404,16 @@ add_library(mimirmind_core_common STATIC
     src/runtime/nvfp4/Qwen3_5MoeConfig.cpp
     src/runtime/nvfp4/Gemma4Config.cpp
     src/runtime/nvfp4/ModelFormatResolver.cpp
+    src/compute/dsp/MelSpectrogram.cpp
+    src/runtime/audio/WhisperModel.cpp
+    src/runtime/audio/WhisperConvStem.cpp
+    src/runtime/audio/WhisperDecode.cpp
+    src/runtime/audio/WhisperRunner.cpp
+    src/runtime/audio/WavReader.cpp
+    src/runtime/audio/WavWriter.cpp
+    src/runtime/audio/SnacDecoder.cpp
+    src/runtime/audio/OrpheusCodes.cpp
+    src/runtime/audio/AudioEngine.cpp
     src/runtime/encoder/EncoderModel.cpp
     src/runtime/encoder/EncoderRunner.cpp
     src/runtime/encoder/RerankEngine.cpp
@@ -935,6 +947,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/rmsnorm_qkv_fp16.cu
         kernels/cuda/llm/rmsnorm_qkv_f32in_fp16out.cu
         kernels/cuda/llm/rope_inplace.cu
+        kernels/cuda/llm/rope_inplace_interleaved.cu
         kernels/cuda/llm/rope_mrope.cu
         kernels/cuda/llm/rope_mrope_fp16.cu
         kernels/cuda/llm/rope_mrope_batched.cu
@@ -961,6 +974,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/gather_heads_from_channels.cu
         kernels/cuda/llm/rope_inplace_fp16.cu
         kernels/cuda/llm/rope_inplace_ff.cu
+        kernels/cuda/llm/rope_inplace_ff_interleaved.cu
         kernels/cuda/common/scaled_add_residual.cu
         kernels/cuda/common/gelu_mul.cu
         kernels/cuda/common/gelu_erf.cu
@@ -1195,6 +1209,7 @@ add_executable(mimirmind
     src/model/Tokenizer.cpp
     src/runtime/BlockBuffers.cpp
     src/runtime/InferenceEngine.cpp
+    src/runtime/audio/SpeakEngine.cpp
     src/runtime/ProbeConfig.cpp
     src/runtime/ComputeStack.cpp
     src/runtime/engine/Nvfp4Loader.cpp
@@ -1228,6 +1243,8 @@ add_executable(mimirmind
     src/server/ChatCompletionHandler.cpp
     src/server/RerankHandler.cpp
     src/server/EmbeddingsHandler.cpp
+    src/server/TranscriptionsHandler.cpp
+    src/server/SpeechHandler.cpp
     src/server/ChatRequestParser.cpp
     src/server/PromptTrimmer.cpp
     src/server/RequestDispatcher.cpp
@@ -1543,6 +1560,13 @@ endif()
 
 add_executable(compute_tests
     tests/compute_tests.cpp
+    tests/mel_spectrogram_tests.cpp
+    tests/whisper_model_tests.cpp
+    tests/whisper_forward_tests.cpp
+    tests/wav_reader_tests.cpp
+    tests/wav_writer_tests.cpp
+    tests/snac_decoder_tests.cpp
+    tests/orpheus_codes_tests.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
     src/compute/GatedDeltaNet.cpp
