@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -70,6 +71,12 @@ public:
         std::string     _id;
     };
 
+    /// Cumulative GPU energy (joules) since driver load, from the NVML energy
+    /// counter — or nullopt on non-CUDA builds / GPUs without the counter.
+    /// Snapshotted at request start and again when the status block is built;
+    /// the delta is the request's energy_joules (5.17).
+    [[nodiscard]] static std::optional<double> gpuEnergyJoulesNow();
+
 private:
     struct CurrentRequest {
         std::string request_id;
@@ -82,10 +89,15 @@ private:
         bool        prefill_done{false};
         std::size_t decode_tokens_emitted{0};
         bool        streaming{false};
+        std::optional<double> started_energy_j;  // GPU joules at begin()
     };
 
-    /// Serialise one in-flight request into its status-block shape.
-    static nlohmann::json requestJson(const CurrentRequest& r);
+    /// Serialise one in-flight request into its status-block shape. `nowEnergyJ`
+    /// is the current cumulative GPU joules (sampled once per status build); the
+    /// request's `energy_joules` is `nowEnergyJ - started_energy_j` when both are
+    /// present.
+    static nlohmann::json requestJson(const CurrentRequest& r,
+                                      std::optional<double>  nowEnergyJ);
 
     mutable std::mutex                                _mutex;
     std::unordered_map<std::string, CurrentRequest>   _requests;

@@ -31,8 +31,7 @@ namespace {
 // pays nothing. Used as a fallback on the CUDA (GB10) backend where the sysfs
 // PowerMonitor / GpuClockGovernor do not apply.
 const ::mimirmind::runtime::thermal::NvmlTelemetry& nvmlTelemetry() {
-    static ::mimirmind::runtime::thermal::NvmlTelemetry inst;
-    return inst;
+    return ::mimirmind::runtime::thermal::nvmlTelemetry();
 }
 #endif
 } // namespace
@@ -644,13 +643,21 @@ json SystemStatusBuilder::buildPowerBlock() {
             // Name the domain "package-0" to match the RAPL-domain schema that
             // status clients (Pegenaut) read as the headline "power" figure; the
             // GB10 GPU power is effectively the whole-package draw here.
+            json domain{
+                {"name",      "package-0"},
+                {"watts_now", *s.power_w},
+            };
+            // 5.17: cumulative GPU energy (W*s) when the driver exposes the
+            // NVML energy counter — the GPU analogue of RAPL total_joules.
+            // Pegenaut diffs this across a request for per-request energy.
+            if (s.total_energy_mj.has_value()) {
+                domain["total_joules"] =
+                    static_cast<double>(*s.total_energy_mj) / 1000.0;
+            }
             return json{
                 {"available", true},
                 {"source",    "nvml"},
-                {"domains",   json::array({ json{
-                    {"name",      "package-0"},
-                    {"watts_now", *s.power_w},
-                }})},
+                {"domains",   json::array({ std::move(domain) })},
             };
         }
 #endif

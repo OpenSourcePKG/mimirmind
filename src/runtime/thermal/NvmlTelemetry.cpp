@@ -70,7 +70,18 @@ NvmlTelemetry::Reading NvmlTelemetry::sample() const {
         r.mem_used_mib  = mem.used  / (1024ULL * 1024ULL);
         r.mem_total_mib = mem.total / (1024ULL * 1024ULL);
     }
+    // Cumulative energy counter (millijoules). NOT_SUPPORTED on some GPUs ->
+    // leave nullopt so callers fall back to instantaneous power.
+    unsigned long long ej = 0;
+    if (nvmlDeviceGetTotalEnergyConsumption(dev, &ej) == NVML_SUCCESS) {
+        r.total_energy_mj = static_cast<std::uint64_t>(ej);
+    }
     return r;
+}
+
+const NvmlTelemetry& nvmlTelemetry() {
+    static const NvmlTelemetry inst;
+    return inst;
 }
 
 } // namespace mimirmind::runtime::thermal

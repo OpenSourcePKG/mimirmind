@@ -3,19 +3,34 @@
 
 #include "server/RequestTracker.hpp"
 
+#ifdef MIMIRMIND_HAVE_CUDA
+#include "runtime/thermal/NvmlTelemetry.hpp"
+#endif
+
 namespace mimirmind::server {
 
 using nlohmann::json;
+
+std::optional<double> RequestTracker::gpuEnergyJoulesNow() {
+#ifdef MIMIRMIND_HAVE_CUDA
+    const auto s = runtime::thermal::nvmlTelemetry().sample();
+    if (s.total_energy_mj.has_value()) {
+        return static_cast<double>(*s.total_energy_mj) / 1000.0;
+    }
+#endif
+    return std::nullopt;
+}
 
 void RequestTracker::begin(std::string id, std::size_t promptTokens,
                              std::size_t maxNew, bool streaming) {
     std::lock_guard<std::mutex> lk{_mutex};
     CurrentRequest r;
-    r.request_id     = id;
-    r.started_at     = std::chrono::steady_clock::now();
-    r.prompt_tokens  = promptTokens;
-    r.max_new_tokens = maxNew;
-    r.streaming      = streaming;
+    r.request_id       = id;
+    r.started_at       = std::chrono::steady_clock::now();
+    r.prompt_tokens    = promptTokens;
+    r.max_new_tokens   = maxNew;
+    r.streaming        = streaming;
+    r.started_energy_j = gpuEnergyJoulesNow();
     _requests[std::move(id)] = std::move(r);
 }
 
@@ -50,11 +65,12 @@ void RequestTracker::incrementDecodeTokens(const std::string& id) {
     ++it->second.decode_tokens_emitted;
 }
 
-json RequestTracker::requestJson(const CurrentRequest& r) {
+json RequestTracker::requestJson(const CurrentRequest& r,
+                                 std::optional<double>  nowEnergyJ) {
     const double elapsedMs =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - r.started_at).count();
-    return json{
+    json j{
         {"request_id",      r.request_id},
         {"streaming",       r.streaming},
         {"elapsed_ms",      elapsedMs},
@@ -70,9 +86,20 @@ json RequestTracker::requestJson(const CurrentRequest& r) {
             {"max_new_tokens", r.max_new_tokens},
         }},
     };
+    // 5.17: energy consumed by this request so far (GPU joules), when the NVML
+    // energy counter is available. Non-negative; monotonic counter, wrap-free
+    // at any sane request length.
+    if (r.started_energy_j.has_value() && nowEnergyJ.has_value()) {
+        j["energy_joules"] = *nowEnergyJ - *r.started_energy_j;
+    }
+    return j;
 }
 
 json RequestTracker::buildStatusBlock() const {
+    // Sample the GPU energy counter once for the whole block (outside the lock
+    // — the NVML read is independent of the request map).
+    const std::optional<double> nowEnergyJ = gpuEnergyJoulesNow();
+
     std::lock_guard<std::mutex> lk{_mutex};
     if (_requests.empty()) {
         return json{{"active", false}};
@@ -84,7 +111,7 @@ json RequestTracker::buildStatusBlock() const {
     const CurrentRequest* oldest = nullptr;
     json requests = json::array();
     for (const auto& [id, r] : _requests) {
-        requests.push_back(requestJson(r));
+        requests.push_back(requestJson(r, nowEnergyJ));
         if (oldest == nullptr || r.started_at < oldest->started_at) {
             oldest = &r;
         }
@@ -93,7 +120,7 @@ json RequestTracker::buildStatusBlock() const {
     // Mirror the oldest active request's fields at the top level so the
     // pre-multi-tenant `current_request.request_id` contract keeps
     // working; `requests[]` carries the full concurrent set.
-    json out = requestJson(*oldest);
+    json out = requestJson(*oldest, nowEnergyJ);
     out["active"]   = true;
     out["count"]    = _requests.size();
     out["requests"] = std::move(requests);
