@@ -977,6 +977,88 @@ TEST(mrope_position0_isIdentityRotation) {
 }
 
 // -----------------------------------------------------------------------
+// Interleaved (GPT-J / llama LLAMA_ROPE_TYPE_NORM) RoPE — the arch=llama
+// pairing (2i, 2i+1), distinct from the NEOX (i, i+headDim/2) pairing.
+// -----------------------------------------------------------------------
+
+TEST(rope_interleaved_position0_isIdentity) {
+    using namespace mimirmind::compute;
+    // theta == 0 at position 0 → the rotation is the identity.
+    const std::size_t seqLen = 1, numHeads = 2, headDim = 8;
+    auto v = ropeRamp(seqLen, numHeads, headDim);
+    const auto orig = v;
+    applyRopeInPlaceInterleaved(v.data(), /*freqFactors=*/nullptr,
+                                seqLen, numHeads, headDim,
+                                /*startPos=*/0, 10000.0F);
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        EXPECT_NEAR(v[i], orig[i], 1e-6F);
+    }
+}
+
+TEST(rope_interleaved_rotatesAdjacentPairs) {
+    using namespace mimirmind::compute;
+    // Hand-check the pairing: interleaved rotates the ADJACENT pair
+    // (2i, 2i+1) — NOT the split (i, i+headDim/2) that NEOX uses.
+    const std::size_t seqLen = 1, numHeads = 1, headDim = 4;
+    const std::size_t startPos = 1;    // pos=1 → nonzero theta
+    const float base = 10000.0F;
+    std::vector<float> v = {1.0F, 2.0F, 3.0F, 4.0F};
+    const std::vector<float> in = v;
+    applyRopeInPlaceInterleaved(v.data(), nullptr, seqLen, numHeads, headDim,
+                                startPos, base);
+    const float pos = 1.0F;
+    for (std::size_t i = 0; i < headDim / 2; ++i) {
+        const float freq = std::pow(base,
+            -static_cast<float>(2 * i) / static_cast<float>(headDim));
+        const float th = pos * freq;
+        const float c = std::cos(th), s = std::sin(th);
+        const float a = in[2 * i], b = in[2 * i + 1];
+        EXPECT_NEAR(v[2 * i],     a * c - b * s, 1e-5F);
+        EXPECT_NEAR(v[2 * i + 1], a * s + b * c, 1e-5F);
+    }
+}
+
+TEST(rope_interleaved_differsFromNeox) {
+    using namespace mimirmind::compute;
+    // The whole point of the llama fix: at nonzero positions interleaved
+    // must NOT equal NEOX (they rotate different coordinate pairs). Guards
+    // against a backend accidentally routing llama through the NEOX kernel.
+    const std::size_t seqLen = 3, numHeads = 2, headDim = 8;
+    const std::size_t startPos = 1;
+    const float base = 500000.0F;      // llama rope_base
+    auto neox  = ropeRamp(seqLen, numHeads, headDim);
+    auto inter = neox;
+    applyRopeInPlace(neox.data(), seqLen, numHeads, headDim, startPos, base);
+    applyRopeInPlaceInterleaved(inter.data(), nullptr, seqLen, numHeads,
+                                headDim, startPos, base);
+    float maxAbs = 0.0F;
+    for (std::size_t i = 0; i < inter.size(); ++i) {
+        const float d = std::fabs(inter[i] - neox[i]);
+        if (d > maxAbs) maxAbs = d;
+    }
+    EXPECT_TRUE(maxAbs > 0.1F);   // clearly different, not a rounding delta
+}
+
+TEST(rope_interleaved_nullFactors_equalsUnitFactors) {
+    using namespace mimirmind::compute;
+    // The nullable-freqFactors fold: nullptr must equal an all-1.0 factor
+    // array (both = plain interleaved, no llama3 scaling).
+    const std::size_t seqLen = 2, numHeads = 2, headDim = 8;
+    const std::size_t startPos = 3;
+    const float base = 500000.0F;
+    auto a = ropeRamp(seqLen, numHeads, headDim);
+    auto b = a;
+    const std::vector<float> ones(headDim / 2, 1.0F);
+    applyRopeInPlaceInterleaved(a.data(), nullptr, seqLen, numHeads, headDim,
+                                startPos, base);
+    applyRopeInPlaceInterleaved(b.data(), ones.data(), seqLen, numHeads,
+                                headDim, startPos, base);
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        EXPECT_NEAR(a[i], b[i], 1e-6F);
+    }
+}
+
+// -----------------------------------------------------------------------
 // GatedDeltaNet (Qwen3-Next linear attention) — CPU reference (M-Q3N.3)
 // -----------------------------------------------------------------------
 
