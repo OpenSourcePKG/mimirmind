@@ -566,7 +566,16 @@ private:
     // cuDNN 9 SDPA prefill-attention path (opt-in, MIMIRMIND_ATTN_CUDNN=1).
     // Only present when the build linked cuDNN (MIMIRMIND_HAVE_CUDNN_SDPA).
     // Bit-near (bf16); parity-gated. Single-forward causal only (posOff==0).
-    bool                 _prefillCudnnEnabled{false};
+    // DEFAULT-ON (promoted from experimental env 2026-08-21): cuDNN-9 SDPA
+    // flash prefill attention is a validated, parity-gated win (measured
+    // -19.7% prefill on qwen3.6-35B; hand kernel fallback on posOff>0 /
+    // non-causal / cuDNN-error / no-cuDNN-build). Kept out of the ephemeral
+    // env layer so a from-scratch restart cannot silently drop it and regress
+    // prod to the slow path (see ADR 2026-08-21-hw-fingerprint-perf-profiles +
+    // lesson_spark_prod_drops_perf_flags). MIMIRMIND_ATTN_CUDNN=0 disables for
+    // A/B or a latency-sensitive single-shot use (cold first-touch of a new
+    // shape pays a one-time cuDNN graph build; warm serving dominates).
+    bool                 _prefillCudnnEnabled{true};
 #if MIMIRMIND_HAVE_CUDNN_SDPA
     std::unique_ptr<CudnnSdpaPrefill> _cudnnSdpa;   // lazily created on first use
 #endif
