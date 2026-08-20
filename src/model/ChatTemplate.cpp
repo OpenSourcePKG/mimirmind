@@ -41,6 +41,15 @@ constexpr std::string_view kGemma4EndOfTurn   = "<turn|>";
 constexpr std::string_view kGemma4ChannelStart = "<|channel>";
 constexpr std::string_view kGemma4ChannelEnd   = "<channel|>";
 
+// Llama-3.x special tokens (Llama-3.0/3.1/3.2). The GGUF architecture is
+// "llama" for all of them; this style additionally assumes the Llama-3 header
+// tokens are present in the vocab (requireToken throws otherwise), which also
+// safely rejects a Llama-2 "llama" GGUF that uses the [INST] template instead.
+constexpr std::string_view kLlama3BeginOfText = "<|begin_of_text|>";
+constexpr std::string_view kLlama3StartHeader = "<|start_header_id|>";
+constexpr std::string_view kLlama3EndHeader   = "<|end_header_id|>";
+constexpr std::string_view kLlama3Eot         = "<|eot_id|>";
+
 /// Gemma 3/4 chat roles. The HF Jinja templates emit "user" / "model"
 /// (NOT "assistant"). System messages are prepended to the first user
 /// message because Gemma's training data does not natively use a
@@ -578,6 +587,53 @@ std::vector<std::int32_t> encodeGemma4(const Tokenizer&             tok,
                            kGemma4StartOfTurn, kGemma4EndOfTurn);
 }
 
+/// Llama-3.x chat template. Matches the reference (llama.cpp built-in "llama3"
+/// / HF Jinja) byte-for-byte for the system/user/assistant path:
+///
+///   <|begin_of_text|>
+///   <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>   (per turn)
+///   <|start_header_id|>assistant<|end_header_id|>\n\n                    (gen prompt)
+///
+/// No default system turn is injected (unlike Qwen2.5) — Llama-3 renders one
+/// only when supplied. Special tokens go in as their ids; role names and
+/// content are plain BPE. Tool calling is not wired for this style yet.
+std::vector<std::int32_t> encodeLlama3(const Tokenizer&             tok,
+                                       std::span<const ChatMessage> messages,
+                                       bool                         addGenerationPrompt) {
+    const std::int32_t bos         = requireToken(tok, kLlama3BeginOfText);
+    const std::int32_t startHeader = requireToken(tok, kLlama3StartHeader);
+    const std::int32_t endHeader   = requireToken(tok, kLlama3EndHeader);
+    const std::int32_t eot         = requireToken(tok, kLlama3Eot);
+
+    std::vector<std::int32_t> ids;
+    ids.reserve(64);
+    ids.push_back(bos);
+
+    auto emitTurn = [&](std::string_view role, std::string_view content) {
+        ids.push_back(startHeader);
+        encodeText(tok, role, ids);
+        ids.push_back(endHeader);
+        std::string body{"\n\n"};
+        body.append(content);
+        encodeText(tok, body, ids);
+        ids.push_back(eot);
+    };
+
+    for (const auto& m : messages) {
+        // Llama-3 uses system/user/assistant (tool turns = "ipython", not used
+        // here since tool calling is not wired for this style).
+        emitTurn(chatRoleName(m.role), m.content);
+    }
+
+    if (addGenerationPrompt) {
+        ids.push_back(startHeader);
+        encodeText(tok, "assistant", ids);
+        ids.push_back(endHeader);
+        encodeText(tok, "\n\n", ids);
+    }
+    return ids;
+}
+
 } // namespace
 
 std::string_view chatRoleName(ChatRole r) noexcept {
@@ -616,10 +672,16 @@ ChatTemplate::detectFromArch(std::string_view architecture) {
     if (arch == "gemma4") {
         return Style::Gemma4;
     }
+    // Llama-3.x GGUFs report architecture "llama" (Orpheus TTS backbone, plain
+    // Llama-3.2 chat). The header-token check in encodeLlama3 rejects a Llama-2
+    // "llama" GGUF, whose [INST] template we do not implement.
+    if (arch == "llama") {
+        return Style::Llama3;
+    }
     throw std::runtime_error(
         "ChatTemplate: no hardcoded chat template for architecture '" +
         std::string{architecture} +
-        "' yet — supported: qwen*, gemma2, gemma3, gemma4");
+        "' yet — supported: qwen*, gemma2, gemma3, gemma4, llama");
 }
 
 std::vector<std::int32_t>
@@ -638,6 +700,9 @@ ChatTemplate::encode(Style                        style,
             return encodeGemma3(tok, messages, addGenerationPrompt);
         case Style::Gemma4:
             return encodeGemma4(tok, messages, addGenerationPrompt, tools);
+        case Style::Llama3:
+            // Tool rendering not implemented for Llama-3 yet (tools ignored).
+            return encodeLlama3(tok, messages, addGenerationPrompt);
     }
     throw std::runtime_error("ChatTemplate::encode: unhandled style");
 }
@@ -667,6 +732,15 @@ ChatTemplate::stopIds(Style style, const Tokenizer& tok) {
             }
             break;
         }
+        case Style::Llama3: {
+            // <|eot_id|> ends an assistant turn; the true EOS <|end_of_text|>
+            // is handled by the tokenizer's EOS.
+            const std::int32_t eot = tok.findToken(kLlama3Eot);
+            if (eot >= 0) {
+                ids.push_back(eot);
+            }
+            break;
+        }
     }
     return ids;
 }
@@ -692,6 +766,8 @@ ChatTemplate::toolCallOpenerIds(Style style, const Tokenizer& tok) {
             break;
         case Style::Gemma3:
             break;  // no tool-calling support
+        case Style::Llama3:
+            break;  // tool-calling not wired for Llama-3 yet
     }
     return ids;
 }
@@ -702,6 +778,7 @@ ChatTemplate::toolCallOpenerText(Style style) noexcept {
         case Style::QwenChatML: return "<tool_call>\n";
         case Style::Gemma4:     return {};  // see toolCallOpenerIds — no prefill
         case Style::Gemma3:     return {};
+        case Style::Llama3:     return {};  // no tool support yet
     }
     return {};
 }
@@ -811,6 +888,11 @@ ChatTemplate::cleanResponse(Style style, std::string_view text,
             stripTrailing(out, kGemma4EndOfTurn);
             return out;
         }
+        case Style::Llama3:
+            // <|eot_id|> is normally consumed by stopIds, but strip a trailing
+            // one defensively (mirrors Gemma). No thinking-channel to unwrap.
+            stripTrailing(out, kLlama3Eot);
+            return out;
     }
     return out;
 }
