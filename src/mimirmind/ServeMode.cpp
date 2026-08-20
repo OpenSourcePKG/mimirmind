@@ -25,6 +25,7 @@
 #include "runtime/encoder/RerankEngine.hpp"
 #include "runtime/encoder/EmbedEngine.hpp"
 #include "runtime/audio/AudioEngine.hpp"
+#include "runtime/audio/SpeakEngine.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
 #include "runtime/nvfp4/ModelFormatResolver.hpp"
 #include "runtime/perf/PerfRegressionDetector.hpp"
@@ -432,6 +433,14 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     std::vector<std::unique_ptr<::mimirmind::runtime::audio::AudioEngine>>
         ownedTranscribers;
     std::vector<::mimirmind::server::LoadedTranscriber> loadedTranscribers;
+    // Speak (Orpheus TTS) models: the acoustic InferenceEngine backbone is kept
+    // alive alongside the SpeakEngine that borrows it (declared before the
+    // SpeakEngines so it outlives them).
+    std::vector<std::unique_ptr<::mimirmind::runtime::InferenceEngine>>
+        ownedSpeakBackbones;
+    std::vector<std::unique_ptr<::mimirmind::runtime::audio::SpeakEngine>>
+        ownedSpeakers;
+    std::vector<::mimirmind::server::LoadedSpeaker> loadedSpeakers;
 #ifdef MIMIRMIND_HAVE_L0
     // In attached mode: one MuninClient per loaded model, kept alive
     // for the whole worker lifetime so Munin's implicit-detach logic
@@ -549,6 +558,67 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             continue;
         }
 
+        // Speak (Orpheus TTS) models: a Llama-3.2 acoustic InferenceEngine plus
+        // the SNAC codec decoder (SpeakEngine) behind /v1/audio/speech. The
+        // backbone loads like a chat model (attached / NVFP4 / GGUF) but is a
+        // generate() consumer only (no serving batcher). Requires a `codec`
+        // path = the converted SNAC-24kHz safetensors (scripts/convert-snac.py).
+        if (m.task == ::mimirmind::core::config::ModelTask::Speak) {
+            if (m.codecPath.empty()) {
+                std::cerr << "serve: speak model '" << m.id
+                          << "' requires a 'codec' path (converted SNAC "
+                             "safetensors)\n";
+                return 2;
+            }
+            try {
+                auto e = std::make_unique<::mimirmind::runtime::InferenceEngine>(
+                    cfg, engineKind);
+#ifdef MIMIRMIND_HAVE_L0
+                if (attachedMode) {
+                    auto client =
+                        std::make_unique<::mimirmind::core::ipc::MuninClient>(
+                            e->ctx());
+                    auto result = client->attach(args.attachSocket, m.id);
+                    if (!result) {
+                        std::cerr << "serve: MuninClient::attach for speak id='"
+                                  << m.id << "' failed: " << result.error()
+                                  << "\n";
+                        return 2;
+                    }
+                    e->loadModelAttached(
+                        m.path, result->manifest,
+                        std::span<void* const>{result->chunkBases});
+                    attachedClients.push_back(std::move(client));
+                } else
+#endif
+                {
+                    if (runtime::nvfp4::resolveModelFormat(m.format, m.path)
+                        == core::config::ModelFormat::Nvfp4) {
+                        e->loadModelNvfp4(m.path, m.tokenizerGguf);
+                    } else {
+                        e->loadModel(m.path);
+                    }
+                }
+                auto se = std::make_unique<
+                    ::mimirmind::runtime::audio::SpeakEngine>(*e, m.codecPath);
+                ::mimirmind::server::LoadedSpeaker ls{};
+                ls.id     = m.id;
+                ls.title  = m.title;
+                ls.engine = se.get();
+                loadedSpeakers.push_back(std::move(ls));
+                ownedSpeakers.push_back(std::move(se));
+                ownedSpeakBackbones.push_back(std::move(e));
+                MM_LOG_INFO("main",
+                            "serve: loaded speak model '{}' (id='{}', codec='{}')",
+                            m.path, m.id, m.codecPath);
+            } catch (const std::exception& x) {
+                std::cerr << "serve: speak model '" << m.id
+                          << "' load failed: " << x.what() << "\n";
+                return 2;
+            }
+            continue;
+        }
+
         auto e = std::make_unique<::mimirmind::runtime::InferenceEngine>(
             cfg, engineKind);
 
@@ -591,7 +661,8 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         }
 
         const auto& arch = e->config().architecture;
-        if (arch != "qwen2" && arch != "gemma4" && arch != "qwen35moe") {
+        if (arch != "qwen2" && arch != "llama" && arch != "gemma4" &&
+            arch != "qwen35moe") {
             const std::string msg =
                 "serve: architecture '" + arch + "' (model id '" + m.id +
                 "') is not implemented yet. See "
@@ -2544,7 +2615,8 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                                           drafter.get(),
                                           std::move(loadedRerankers),
                                           std::move(loadedEmbedders),
-                                          std::move(loadedTranscribers)};
+                                          std::move(loadedTranscribers),
+                                          std::move(loadedSpeakers)};
 
     g_runningServer.store(&server, std::memory_order_release);
     std::signal(SIGINT,  signalStop);

@@ -60,12 +60,14 @@ enum class ModelFormat { Auto, Gguf, Nvfp4 };
  * no classifier head) behind /v1/embeddings — CLS-pooled, L2-normalized vector
  * per input text.
  */
-enum class ModelTask { Chat, Rerank, Embed, Transcribe };
+enum class ModelTask { Chat, Rerank, Embed, Transcribe, Speak };
 
-/// Parse a `task` string ("chat"|"rerank"|"embed"|"transcribe") or nullopt.
+/// Parse a `task` string ("chat"|"rerank"|"embed"|"transcribe"|"speak") or
+/// nullopt.
 [[nodiscard]] std::optional<ModelTask> modelTaskFromString(std::string_view s) noexcept;
 
-/// Canonical lower-case name for a task ("chat"|"rerank"|"embed"|"transcribe").
+/// Canonical lower-case name for a task
+/// ("chat"|"rerank"|"embed"|"transcribe"|"speak").
 [[nodiscard]] std::string_view modelTaskName(ModelTask t) noexcept;
 
 /**
@@ -87,6 +89,10 @@ struct ModelEntry {
     // checkpoint ships only an HF tokenizer.json, which we don't parse yet).
     // Ignored for GGUF models (their tokenizer comes from the file itself).
     std::string       tokenizerGguf{};
+    // For `task: speak` (TTS): path to the converted SNAC-24kHz vocoder
+    // safetensors (scripts/convert-snac.py output). The `path` above is the
+    // Orpheus Llama-3.2 acoustic checkpoint; this is its codec decoder.
+    std::string       codecPath{};
     bool              loadOnStart{true};
     RuntimeSettings   runtime{};         // per-model override, merged onto top-level
 

@@ -408,6 +408,9 @@ add_library(mimirmind_core_common STATIC
     src/runtime/audio/WhisperDecode.cpp
     src/runtime/audio/WhisperRunner.cpp
     src/runtime/audio/WavReader.cpp
+    src/runtime/audio/WavWriter.cpp
+    src/runtime/audio/SnacDecoder.cpp
+    src/runtime/audio/OrpheusCodes.cpp
     src/runtime/audio/AudioEngine.cpp
     src/runtime/encoder/EncoderModel.cpp
     src/runtime/encoder/EncoderRunner.cpp
@@ -1202,6 +1205,7 @@ add_executable(mimirmind
     src/model/Tokenizer.cpp
     src/runtime/BlockBuffers.cpp
     src/runtime/InferenceEngine.cpp
+    src/runtime/audio/SpeakEngine.cpp
     src/runtime/ProbeConfig.cpp
     src/runtime/ComputeStack.cpp
     src/runtime/engine/Nvfp4Loader.cpp
@@ -1236,6 +1240,7 @@ add_executable(mimirmind
     src/server/RerankHandler.cpp
     src/server/EmbeddingsHandler.cpp
     src/server/TranscriptionsHandler.cpp
+    src/server/SpeechHandler.cpp
     src/server/ChatRequestParser.cpp
     src/server/PromptTrimmer.cpp
     src/server/RequestDispatcher.cpp
@@ -1555,6 +1560,9 @@ add_executable(compute_tests
     tests/whisper_model_tests.cpp
     tests/whisper_forward_tests.cpp
     tests/wav_reader_tests.cpp
+    tests/wav_writer_tests.cpp
+    tests/snac_decoder_tests.cpp
+    tests/orpheus_codes_tests.cpp
     src/compute/Dequant.cpp
     src/compute/Embedding.cpp
     src/compute/GatedDeltaNet.cpp
