@@ -12,7 +12,7 @@ SOCK_DIR="$(mktemp -d)"
 trap 'rm -rf "$SOCK_DIR"' EXIT
 
 overall=0
-for kind in device managed vmm; do
+for kind in device managed vmm shm; do
     sock="$SOCK_DIR/ipc-$kind.sock"
     echo "=== kind=$kind ==="
     "$BIN" owner "$sock" --kind "$kind" &

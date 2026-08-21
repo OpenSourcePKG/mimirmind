@@ -14,7 +14,7 @@
 // export the memory a long-lived Munin would hold. This rig answers that
 // empirically, the exact analogue of tools/l0-ipc-testrig.cpp.
 //
-// Three mechanisms, selected by --kind:
+// Four mechanisms, selected by --kind:
 //   device  : cudaMalloc + cudaIpcGetMemHandle / cudaIpcOpenMemHandle.
 //             Opaque 64-byte handle, sent verbatim over the socket (no FD).
 //   managed : cudaMallocManaged + cudaIpcGetMemHandle. Expected to fail on
@@ -24,10 +24,27 @@
 //             (CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR); the FD is passed
 //             via SCM_RIGHTS, attacher cuMemImportFromShareableHandle +
 //             cuMemMap. The robust modern path (Dynamo / AnchorTP use it).
+//   shm     : *** THE CHOSEN M-Munin path *** (ADR 2026-08-14,
+//             "M-Munin.CUDA via POSIX-shm"). Owner is HOST-ONLY (models Munin,
+//             which never touches the GPU): memfd_create + ftruncate + mmap =
+//             plain host RAM, filled with a host loop, FD passed via
+//             SCM_RIGHTS. Attacher mmaps the SAME memfd and hands the RAW
+//             host pointer STRAIGHT to a real CUDA kernel — no
+//             cudaHostRegister, no cudaMalloc, no cudaMemcpy — relying on
+//             GB10 pageableMemAccess + hostPageTables (verified step 1a,
+//             d352055). That kernel deref is the linchpin the whole shm plan
+//             rests on; this is its first end-to-end empirical proof. The
+//             kernel read-verifies the owner pattern and writes the attacher
+//             pattern into the poke window; the owner re-reads host-side to
+//             confirm the kernel's writes are coherent back on the host.
+//
+// This file is CUDA (.cu) — the shm path carries a real __global__ kernel, so
+// it must be compiled by nvcc (the earlier device/managed/vmm-only version
+// was a plain .cpp buildable with g++; that no longer holds).
 //
 // Usage (run BOTH, roughly concurrently — or use tools/cuda-ipc-testrig.sh):
-//   ./cuda_ipc_testrig owner    <socket> --kind device|managed|vmm
-//   ./cuda_ipc_testrig attacher <socket> --kind device|managed|vmm
+//   ./cuda_ipc_testrig owner    <socket> --kind device|managed|vmm|shm
+//   ./cuda_ipc_testrig attacher <socket> --kind device|managed|vmm|shm
 //
 // Protocol (mirrors the L0 rig):
 //   Owner allocates 64 MiB, fills an owner-pattern, exports the handle,
@@ -56,9 +73,15 @@
 #include <string_view>
 #include <vector>
 
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U  // not always exposed by <sys/mman.h> without _GNU_SOURCE
+#endif
 
 namespace {
 
@@ -169,13 +192,14 @@ int recvFd(int sock) {
     return fd;
 }
 
-enum class Kind { Device, Managed, Vmm };
+enum class Kind { Device, Managed, Vmm, Shm };
 
 Kind parseKind(std::string_view s) {
     if (s == "device")  return Kind::Device;
     if (s == "managed") return Kind::Managed;
     if (s == "vmm")     return Kind::Vmm;
-    die("unknown --kind (expected device|managed|vmm)");
+    if (s == "shm")     return Kind::Shm;
+    die("unknown --kind (expected device|managed|vmm|shm)");
 }
 
 // A host staging buffer for filling / verifying device memory (works for
@@ -398,6 +422,127 @@ int runAttacherVmm(const std::string& sock) {
     return seen ? 0 : 2;
 }
 
+// =====================================================================
+//  POSIX-shm (memfd) — THE CHOSEN M-Munin path
+//
+//  Owner never touches the GPU (models Munin): it only holds host RAM in a
+//  memfd and hands the FD to the worker. The worker (attacher) mmaps the
+//  same memfd and passes the RAW host pointer directly to a real kernel,
+//  relying on GB10 pageableMemAccess + hostPageTables (no cudaHostRegister).
+// =====================================================================
+
+int makeMemfd(std::size_t sz) {
+    // syscall wrapper so we do not depend on a glibc that exposes
+    // memfd_create() in <sys/mman.h> (avoids _GNU_SOURCE ordering issues).
+    const long fd = ::syscall(SYS_memfd_create, "munin-shm", MFD_CLOEXEC);
+    if (fd < 0) die("memfd_create()");
+    if (::ftruncate(static_cast<int>(fd), static_cast<off_t>(sz)) != 0)
+        die("ftruncate(memfd)");
+    return static_cast<int>(fd);
+}
+
+// The linchpin kernel: dereference an mmap'd shm host pointer DIRECTLY on the
+// SMs. Read-verify every word outside the poke window against expectPat
+// (flagging any mismatch), and write pokePat into the poke window. Reads skip
+// the poke window so there is no read/write race on the same location.
+__global__ void shmVerifyAndPoke(std::uint32_t* p, std::size_t nWords,
+                                 std::size_t pokeWords, std::uint32_t expectPat,
+                                 std::uint32_t pokePat, int* mismatch) {
+    const std::size_t idx    = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = idx; i < nWords; i += stride) {
+        if (i < pokeWords) {
+            p[i] = pokePat;               // kernel WRITE through the shm pointer
+        } else if (p[i] != expectPat) {   // kernel READ through the shm pointer
+            atomicExch(mismatch, 1);
+        }
+    }
+}
+
+int runOwnerShm(const std::string& sock) {
+    // HOST-ONLY, exactly like Munin: no CUDA calls at all on this side.
+    const int mfd = makeMemfd(kSize);
+    void* map = ::mmap(nullptr, kSize, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    if (map == MAP_FAILED) die("mmap(owner)");
+    auto* words = static_cast<std::uint32_t*>(map);
+    for (std::size_t i = 0; i < kSize / 4; ++i) words[i] = kOwnerPat;
+
+    const int lfd = listenSocket(sock);
+    const int cfd = ::accept(lfd, nullptr, nullptr);
+    if (cfd < 0) die("accept()");
+    sendFd(cfd, mfd);                 // hand the memfd to the worker
+
+    char done = 0; readAll(cfd, &done, 1);  // wait for the worker's kernel
+
+    // Verify host-side that the worker's KERNEL writes are coherent back on
+    // the host: first 4 KiB = attacher-pattern, rest still owner-pattern.
+    bool ok = true;
+    for (std::size_t i = 0; i < kPokeBytes / 4; ++i)
+        if (words[i] != kAttacherPat) { ok = false; break; }
+    for (std::size_t i = kPokeBytes / 4; ok && i < kSize / 4; i += 4096)
+        if (words[i] != kOwnerPat) { ok = false; break; }
+
+    writeAll(cfd, "X", 1);
+    ::munmap(map, kSize);
+    ::close(mfd); ::close(cfd); ::close(lfd);
+    ::unlink(sock.c_str());
+    std::printf(ok ? "PASS owner (kind=shm): kernel writes visible host-side\n"
+                   : "FAIL owner (kind=shm): kernel writes NOT visible host-side\n");
+    return ok ? 0 : 2;
+}
+
+int runAttacherShm(const std::string& sock) {
+    ckRt(cudaSetDevice(0), "cudaSetDevice");
+    const int cfd = connectSocket(sock);
+    const int mfd = recvFd(cfd);
+
+    void* map = ::mmap(nullptr, kSize, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    if (map == MAP_FAILED) die("mmap(attacher)");
+    auto* words = static_cast<std::uint32_t*>(map);
+
+    // Sanity: shm is coherent host<->host before we bring in the GPU.
+    bool hostSeen = true;
+    for (std::size_t i = 0; i < kSize / 4; i += 4096)
+        if (words[i] != kOwnerPat) { hostSeen = false; break; }
+
+    // *** THE ACTUAL TEST ***: pass the raw mmap'd host pointer straight to a
+    // kernel. No cudaHostRegister / cudaMalloc / cudaMemcpy. If GB10 cannot
+    // deref host page tables on the SMs, this faults with an illegal address
+    // -> clean go/no-go FAIL.
+    int* mismatch = nullptr;
+    ckRt(cudaMallocManaged(&mismatch, sizeof(int)), "cudaMallocManaged(flag)");
+    *mismatch = 0;
+
+    const std::size_t nWords    = kSize / 4;
+    const std::size_t pokeWords = kPokeBytes / 4;
+    constexpr int kBlock = 256;
+    const int grid = 1024;  // grid-stride; covers the whole buffer
+    shmVerifyAndPoke<<<grid, kBlock>>>(words, nWords, pokeWords,
+                                       kOwnerPat, kAttacherPat, mismatch);
+    const cudaError_t le = cudaGetLastError();
+    if (le != cudaSuccess) die(std::string("kernel launch: ") + cudaGetErrorString(le));
+    const cudaError_t se = cudaDeviceSynchronize();
+    if (se != cudaSuccess) {
+        std::fprintf(stderr,
+            "FAIL attacher (kind=shm): kernel deref of shm pointer faulted: %s\n",
+            cudaGetErrorString(se));
+        return 2;
+    }
+    const bool kernelSeen = (*mismatch == 0);
+
+    writeAll(cfd, "D", 1);
+    char x = 0; readAll(cfd, &x, 1);
+    cudaFree(mismatch);
+    ::munmap(map, kSize);
+    ::close(mfd); ::close(cfd);
+
+    const bool ok = hostSeen && kernelSeen;
+    std::printf(ok ? "PASS attacher (kind=shm): kernel read owner data via shm pointer\n"
+                   : "FAIL attacher (kind=shm): host_seen=%d kernel_seen=%d\n",
+                static_cast<int>(hostSeen), static_cast<int>(kernelSeen));
+    return ok ? 0 : 2;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -417,12 +562,14 @@ int main(int argc, char** argv) {
     }
 
     if (role == "owner") {
-        return kind == Kind::Vmm ? runOwnerVmm(sock)
-                                 : runOwnerRuntime(sock, kind);
+        if (kind == Kind::Vmm) return runOwnerVmm(sock);
+        if (kind == Kind::Shm) return runOwnerShm(sock);
+        return runOwnerRuntime(sock, kind);
     }
     if (role == "attacher") {
-        return kind == Kind::Vmm ? runAttacherVmm(sock)
-                                 : runAttacherRuntime(sock, kind);
+        if (kind == Kind::Vmm) return runAttacherVmm(sock);
+        if (kind == Kind::Shm) return runAttacherShm(sock);
+        return runAttacherRuntime(sock, kind);
     }
     std::fprintf(stderr, "unknown role '%s' (owner|attacher)\n", role.c_str());
     return 1;
