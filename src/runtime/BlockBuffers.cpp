@@ -129,9 +129,17 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         b.kvVFp32Scratch = ops.allocate(kvFp32Bytes);
     }
 
+    // The FFN-result accumulator feeds the shared post-FFN residual add in the
+    // Qwen3_5 base backend (runLinearBlock / runFullAttentionBlock), which reads
+    // s.moeAccumBuf regardless of the FFN flavour. Qwen3_5DenseBackend::runFfn
+    // (dense SwiGLU) writes its down-projection here too, so it must exist even
+    // when the model has no experts — otherwise the dense down matmul writes to
+    // an unallocated buffer (illegal memory access). Cheap ([maxT, d_model]);
+    // allocate it unconditionally.
+    const std::size_t moeBytes = maxT * b.d_model * sizeof(float);
+    b.moeAccumBuf = ops.allocate(moeBytes);
+
     if (config.expertCount > 0) {
-        const std::size_t moeBytes = maxT * b.d_model * sizeof(float);
-        b.moeAccumBuf  = ops.allocate(moeBytes);
         b.expertOutBuf = ops.allocate(moeBytes);
 
         // Expert-grouping scratch (M5i.F). Per-block worst-case row
