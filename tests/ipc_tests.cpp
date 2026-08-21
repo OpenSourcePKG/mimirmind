@@ -1,10 +1,15 @@
 #include "TestFramework.hpp"
 
 #include "core/gguf/GgufTypes.hpp"
+#include "core/ipc/IpcTransport.hpp"
+#include "core/ipc/ShmIpcExporter.hpp"
+#include "core/ipc/ShmIpcImporter.hpp"
 #include "core/ipc/TensorManifest.hpp"
 #include "core/ipc/UnixSocketFrame.hpp"
 
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -22,9 +27,16 @@
 
 using ::mimirmind::core::gguf::GgmlType;
 using ::mimirmind::core::ipc::Frame;
+using ::mimirmind::core::ipc::IpcHandle;
 using ::mimirmind::core::ipc::ManifestEntry;
+using ::mimirmind::core::ipc::ShmIpcExporter;
+using ::mimirmind::core::ipc::ShmIpcImporter;
 using ::mimirmind::core::ipc::TensorManifest;
 using ::mimirmind::core::ipc::UnixSocketFrame;
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
 
 namespace {
 
@@ -345,6 +357,148 @@ TEST(ipc_manifestOverSocketpair_roundTrip) {
     EXPECT_EQ(rparsed->tensors.size(),    1U);
     EXPECT_EQ(rparsed->tensors[0].name,   "output_norm.weight");
     EXPECT_EQ(rparsed->tensors[0].type,   GgmlType::F32);
+}
+
+// ---- ShmIpcExporter / ShmIpcImporter ----------------------------------------
+//
+// The chosen M-Munin.CUDA transport (ADR 2026-08-14, step 1b). These tests
+// exercise the pure-POSIX seam end-to-end: a memfd stands in for a Munin
+// model chunk, the exporter turns it into an IpcHandle, the handle crosses a
+// socketpair via the REAL SCM_RIGHTS wire (UnixSocketFrame), and the importer
+// mmaps the received memfd — exactly the AttachSession -> MuninClient flow for
+// the shm backend, minus the CUDA kernel deref (proven separately in
+// tools/cuda-ipc-testrig --kind shm).
+
+namespace {
+
+constexpr std::uint32_t kShmOwnerPat    = 0xA5A5A5A5u;
+constexpr std::uint32_t kShmAttacherPat = 0x5A5A5A5Au;
+
+// Create a memfd of `len` bytes (syscall wrapper — no glibc memfd_create
+// dependency). Returns -1 on failure.
+int makeMemfd(std::size_t len) {
+    const long fd = ::syscall(SYS_memfd_create, "munin-test-shm", MFD_CLOEXEC);
+    if (fd < 0) return -1;
+    if (::ftruncate(static_cast<int>(fd), static_cast<off_t>(len)) != 0) {
+        ::close(static_cast<int>(fd));
+        return -1;
+    }
+    return static_cast<int>(fd);
+}
+
+std::uint64_t decodeMapLen(const std::array<std::byte, 64>& bytes) {
+    std::uint64_t v = 0;
+    std::memcpy(&v, bytes.data(), sizeof(v));
+    return v;
+}
+
+} // namespace
+
+TEST(shmIpc_exportEncodesLengthAndBorrowsFd) {
+    constexpr std::size_t kLen = 3 * 4096;  // 3 pages
+    const int memfd = makeMemfd(kLen);
+    EXPECT_TRUE(memfd >= 0);
+
+    const int memfds[1]              = {memfd};
+    const std::uint64_t mapBytes[1]  = {kLen};
+    ShmIpcExporter exp{std::span<const int>{memfds, 1},
+                       std::span<const std::uint64_t>{mapBytes, 1}};
+
+    auto h = exp.exportChunk(0, /*base=*/nullptr, /*usedBytes=*/kLen);
+    EXPECT_TRUE(static_cast<bool>(h));
+    EXPECT_EQ(h->fd, memfd);                 // borrowed, not dup'd
+    EXPECT_EQ(decodeMapLen(h->bytes), static_cast<std::uint64_t>(kLen));
+
+    // Out-of-range index is a clean error, not a crash.
+    auto bad = exp.exportChunk(1, nullptr, kLen);
+    EXPECT_TRUE(!static_cast<bool>(bad));
+    EXPECT_TRUE(bad.error().find("out of range") != std::string::npos);
+
+    ::close(memfd);
+}
+
+TEST(shmIpc_roundTripOverScmRights_bothDirectionsCoherent) {
+    constexpr std::size_t kLen   = 4 * 4096;      // 16 KiB
+    constexpr std::size_t kWords = kLen / 4;
+    const int memfd = makeMemfd(kLen);
+    EXPECT_TRUE(memfd >= 0);
+
+    // Server side: map the memfd and fill it with the owner pattern, as
+    // Munin's shm allocator would populate a resident chunk.
+    void* ownerMap = ::mmap(nullptr, kLen, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, memfd, 0);
+    EXPECT_TRUE(ownerMap != MAP_FAILED);
+    auto* ownerWords = static_cast<std::uint32_t*>(ownerMap);
+    for (std::size_t i = 0; i < kWords; ++i) ownerWords[i] = kShmOwnerPat;
+
+    // Export -> ship the handle over the real SCM_RIGHTS wire.
+    const int memfds[1]             = {memfd};
+    const std::uint64_t mapBytes[1] = {kLen};
+    ShmIpcExporter exp{std::span<const int>{memfds, 1},
+                       std::span<const std::uint64_t>{mapBytes, 1}};
+    auto h = exp.exportChunk(0, nullptr, kLen);
+    EXPECT_TRUE(static_cast<bool>(h));
+
+    SocketPair sp;
+    const auto payload =
+        std::span<const std::byte>{h->bytes.data(), h->bytes.size()};
+    const int fdsOut[1] = {h->fd};
+    EXPECT_TRUE(static_cast<bool>(UnixSocketFrame::send(sp.a, payload, fdsOut)));
+
+    auto rframe = UnixSocketFrame::recv(sp.b, /*maxPayloadBytes=*/128);
+    EXPECT_TRUE(static_cast<bool>(rframe));
+    EXPECT_EQ(rframe->payload.size(), 64U);
+    EXPECT_EQ(rframe->fds.size(),     1U);
+
+    // Worker side: import the received (dup'd) memfd.
+    ShmIpcImporter imp;
+    std::span<const std::byte, 64> handleBytes{rframe->payload.data(), 64};
+    auto p = imp.importChunk(handleBytes, rframe->fds[0]);
+    EXPECT_TRUE(static_cast<bool>(p));
+    auto* workerWords = static_cast<std::uint32_t*>(*p);
+
+    // Owner data is visible to the worker's mapping...
+    bool ownerSeen = true;
+    for (std::size_t i = 0; i < kWords; ++i)
+        if (workerWords[i] != kShmOwnerPat) { ownerSeen = false; break; }
+    EXPECT_TRUE(ownerSeen);
+
+    // ...and the worker's writes are coherent back on the owner mapping
+    // (this is what the CUDA kernel does through the same pointer).
+    for (std::size_t i = 0; i < 1024; ++i) workerWords[i] = kShmAttacherPat;
+    bool writesVisible = true;
+    for (std::size_t i = 0; i < 1024; ++i)
+        if (ownerWords[i] != kShmAttacherPat) { writesVisible = false; break; }
+    EXPECT_TRUE(writesVisible);
+
+    // closeChunk releases the worker mapping; a second close is a no-op.
+    imp.closeChunk(*p);
+    imp.closeChunk(*p);
+
+    ::munmap(ownerMap, kLen);
+    ::close(memfd);
+}
+
+TEST(shmIpc_importRejectsBadFdAndZeroLength) {
+    ShmIpcImporter imp;
+
+    std::array<std::byte, 64> okBytes{};
+    const std::uint64_t len = 4096;
+    std::memcpy(okBytes.data(), &len, sizeof(len));
+    auto negFd = imp.importChunk(std::span<const std::byte, 64>{okBytes.data(), 64},
+                                 /*receivedFd=*/-1);
+    EXPECT_TRUE(!static_cast<bool>(negFd));
+    EXPECT_TRUE(negFd.error().find("negative") != std::string::npos);
+
+    // Zero-length handle is refused even with a valid fd.
+    const int memfd = makeMemfd(4096);
+    EXPECT_TRUE(memfd >= 0);
+    std::array<std::byte, 64> zeroBytes{};  // mapLen == 0
+    auto zeroLen = imp.importChunk(std::span<const std::byte, 64>{zeroBytes.data(), 64},
+                                   memfd);
+    EXPECT_TRUE(!static_cast<bool>(zeroLen));
+    EXPECT_TRUE(zeroLen.error().find("zero-length") != std::string::npos);
+    ::close(memfd);
 }
 
 int main() {

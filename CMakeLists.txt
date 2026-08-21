@@ -367,6 +367,8 @@ add_library(mimirmind_core_common STATIC
     src/core/gguf/GgufTypes.cpp
     src/core/gguf/TensorFingerprint.cpp
     src/core/gguf/WeightsMap.cpp
+    src/core/ipc/ShmIpcExporter.cpp
+    src/core/ipc/ShmIpcImporter.cpp
     src/core/ipc/TensorManifest.cpp
     src/core/ipc/UnixSocketFrame.cpp
     src/core/ipc/WireOps.cpp
