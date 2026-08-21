@@ -3,8 +3,10 @@
 
 #include "runtime/arch/ArchBackend.hpp"
 
+#include "model/LlmConfig.hpp"   // config.expertCount — pick dense vs MoE qwen3_5
 #include "runtime/arch/Gemma4Backend.hpp"
 #include "runtime/arch/Qwen2Backend.hpp"
+#include "runtime/arch/Qwen3_5DenseBackend.hpp"
 #include "runtime/arch/Qwen3_5MoeBackend.hpp"
 
 namespace mimirmind::runtime::arch {
@@ -36,6 +38,14 @@ createArchBackend(const std::string&             architecture,
                                                moeFusedDownEnabled);
     }
     if (architecture == "qwen35moe") {
+        // The qwen3_5 arch ships in two FFN flavours (HF model_type
+        // qwen3_5_moe vs the dense qwen3_5 text tower). expertCount == 0 => the
+        // dense SwiGLU variant (e.g. Qwen3.8-27B); otherwise routed experts.
+        if (config.expertCount == 0) {
+            return std::make_unique<Qwen3_5DenseBackend>(config, weights,
+                                                         fusedQkv, ops, gmm,
+                                                         opProfiler);
+        }
         return std::make_unique<Qwen3_5MoeBackend>(config, weights, fusedQkv,
                                                   ops, gmm, opProfiler,
                                                   moeGroupEnabled,
