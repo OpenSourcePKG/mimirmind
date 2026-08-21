@@ -760,6 +760,7 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
     // hand-rolled kernels — cuDNN tiles head_dim=256 past the 99 KiB smem wall).
     if (const char* cd = std::getenv("MIMIRMIND_ATTN_CUDNN")) {
         _prefillCudnnEnabled = (cd[0] != '\0' && !(cd[0] == '0' && cd[1] == '\0'));
+        _prefillCudnnEnvSet  = true;   // env is explicit — Layer-2 profile must not override
     }
 #if MIMIRMIND_HAVE_CUDNN_SDPA
     if (_prefillCudnnEnabled) {

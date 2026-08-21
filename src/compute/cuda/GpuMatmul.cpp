@@ -439,9 +439,11 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
     }
     if (const char* cfp = std::getenv("MIMIRMIND_CUBLAS_FP8_PREFILL")) {
         _useCublasFp8Prefill = (cfp[0] != '\0' && !(cfp[0] == '0' && cfp[1] == '\0'));
+        _cublasFp8PrefillEnvSet = true;   // env is explicit — Layer-2 profile must not override
     }
     if (const char* f32t = std::getenv("MIMIRMIND_F32_TC_PREFILL")) {
         _useF32TcPrefill = (f32t[0] != '\0' && !(f32t[0] == '0' && f32t[1] == '\0'));
+        _f32TcPrefillEnvSet = true;       // env is explicit — Layer-2 profile must not override
     }
     if (const char* dv = std::getenv("MIMIRMIND_NVFP4_DEINT")) {
         _useDeintVec = (dv[0] == '1' && dv[1] == '\0');

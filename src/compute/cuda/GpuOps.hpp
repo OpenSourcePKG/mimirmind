@@ -412,6 +412,19 @@ public:
         return _prefillFlashKTileQ8Source;
     }
 
+    // Layer-2 profile-apply (5.19). No-op unless the build linked cuDNN SDPA;
+    // never overrides an explicit MIMIRMIND_ATTN_CUDNN (env = debug override).
+    void setPrefillCudnn(bool on) noexcept override {
+#if MIMIRMIND_HAVE_CUDNN_SDPA
+        _prefillCudnnEnabled = on;
+#else
+        (void)on;   // no cuDNN in this build — stays on the hand kernel
+#endif
+    }
+    [[nodiscard]] bool prefillCudnnEnvOverridden() const noexcept override {
+        return _prefillCudnnEnvSet;
+    }
+
     [[nodiscard]] core::config::TriState q8_0ReorderMode() const noexcept override {
         return _q8_0ReorderMode;
     }
@@ -576,6 +589,9 @@ private:
     // A/B or a latency-sensitive single-shot use (cold first-touch of a new
     // shape pays a one-time cuDNN graph build; warm serving dominates).
     bool                 _prefillCudnnEnabled{true};
+    // Whether the ctor read an explicit MIMIRMIND_ATTN_CUDNN. If so, the
+    // Layer-2 per-HW profile must not override it (env = debug override, wins).
+    bool                 _prefillCudnnEnvSet{false};
 #if MIMIRMIND_HAVE_CUDNN_SDPA
     std::unique_ptr<CudnnSdpaPrefill> _cudnnSdpa;   // lazily created on first use
 #endif

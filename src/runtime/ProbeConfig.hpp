@@ -24,6 +24,17 @@ struct ProbePicks {
     // features.gemm=Disable — same decision the online autotune would reach
     // on identical hardware, minus the multi-second bench.
     bool        gemmNeverForAllMatmul{false};
+
+    // Layer-2 flag intents parsed from the profile `flags` block. Each is
+    // populated ONLY for a flag entry marked "apply": true — the profile
+    // author's explicit opt-in that the flag is validated-safe to auto-enable
+    // on this hardware. nullopt = "the profile does not drive this flag", so
+    // the runtime keeps its code-default / env value. Lossy or
+    // precision-unvalidated flags stay apply:false (hence nullopt here) until
+    // the DE-goldset gate (5.19 Increment C) clears them.
+    std::optional<bool> applyPrefillCudnn;
+    std::optional<bool> applyF32TcPrefill;
+    std::optional<bool> applyCublasFp8Prefill;
 };
 
 /**
