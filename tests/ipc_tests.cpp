@@ -6,6 +6,7 @@
 #include "core/ipc/ShmIpcImporter.hpp"
 #include "core/ipc/TensorManifest.hpp"
 #include "core/ipc/UnixSocketFrame.hpp"
+#include "munin/ShmChunkAllocator.hpp"
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -18,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <expected>
 #include <string>
 #include <string_view>
@@ -33,6 +35,7 @@ using ::mimirmind::core::ipc::ShmIpcExporter;
 using ::mimirmind::core::ipc::ShmIpcImporter;
 using ::mimirmind::core::ipc::TensorManifest;
 using ::mimirmind::core::ipc::UnixSocketFrame;
+using ::mimirmind::munin::ShmChunkAllocator;
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
@@ -499,6 +502,125 @@ TEST(shmIpc_importRejectsBadFdAndZeroLength) {
     EXPECT_TRUE(!static_cast<bool>(zeroLen));
     EXPECT_TRUE(zeroLen.error().find("zero-length") != std::string::npos);
     ::close(memfd);
+}
+
+// ---- ShmChunkAllocator ------------------------------------------------------
+//
+// The server-side memfd backing store for the shm transport (step 2). The
+// bump/layout math mirrors the L0 ChunkAllocator (already covered in
+// munin_tests); here we lock the mirror and, more importantly, prove the
+// full server->worker data path: pack tensors into memfd chunks, export each
+// chunk via ShmIpcExporter over the real SCM_RIGHTS wire, import on the
+// worker side, and resolve every tensor's pointer via
+// chunkBase[chunkIndex] + chunkOffset.
+
+TEST(shmChunkAlloc_layoutMirrorsChunkAllocator) {
+    // Fits inside the current chunk.
+    auto a = ShmChunkAllocator::layoutInsideChunk(/*used=*/100, /*bytes=*/64,
+                                                  /*align=*/64, /*chunkBytes=*/8192);
+    EXPECT_TRUE(!a.needsNewChunk);
+    EXPECT_EQ(a.offset, 128U);  // alignUp(100,64)=128
+
+    // Does not fit -> fresh chunk.
+    auto b = ShmChunkAllocator::layoutInsideChunk(/*used=*/8100, /*bytes=*/128,
+                                                  /*align=*/64, /*chunkBytes=*/8192);
+    EXPECT_TRUE(b.needsNewChunk);
+    EXPECT_EQ(b.offset, 0U);
+}
+
+TEST(shmChunkAlloc_rejectsOversizedAndZero) {
+    ShmChunkAllocator alloc{8192};
+    bool threwOversize = false;
+    try {
+        (void)alloc.allocate(9000);  // > chunkBytes
+    } catch (const std::exception&) {
+        threwOversize = true;
+    }
+    EXPECT_TRUE(threwOversize);
+
+    bool threwZero = false;
+    try {
+        (void)alloc.allocate(0);
+    } catch (const std::exception&) {
+        threwZero = true;
+    }
+    EXPECT_TRUE(threwZero);
+}
+
+TEST(shmChunkAlloc_endToEnd_attachResolvesTensors) {
+    // 8 KiB chunks force the third tensor into a second chunk, exercising
+    // multi-chunk export/import and per-tensor offset resolution.
+    ShmChunkAllocator alloc{8192};
+
+    struct Tensor {
+        std::size_t                 bytes;
+        std::uint8_t                pattern;
+        ShmChunkAllocator::Allocation alloc{};
+    };
+    Tensor tensors[3] = {
+        {3000, 0x11, {}},
+        {3000, 0x22, {}},
+        {3000, 0x33, {}},
+    };
+
+    for (auto& t : tensors) {
+        t.alloc = alloc.allocate(t.bytes);           // default 64 B align
+        std::memset(t.alloc.ptr, t.pattern, t.bytes); // "load" the tensor
+    }
+
+    // Expect 2 chunks: t0@chunk0 off0, t1@chunk0 off3008, t2@chunk1 off0.
+    EXPECT_EQ(alloc.chunkCount(), 2U);
+    EXPECT_EQ(tensors[0].alloc.chunkIndex, 0U);
+    EXPECT_EQ(tensors[0].alloc.chunkOffset, 0U);
+    EXPECT_EQ(tensors[1].alloc.chunkIndex, 0U);
+    EXPECT_EQ(tensors[1].alloc.chunkOffset, 3008U);   // alignUp(3000,64)
+    EXPECT_EQ(tensors[2].alloc.chunkIndex, 1U);
+    EXPECT_EQ(tensors[2].alloc.chunkOffset, 0U);
+    EXPECT_EQ(alloc.chunkUsedBytes(0), 6008U);
+    EXPECT_EQ(alloc.chunkUsedBytes(1), 3000U);
+    EXPECT_EQ(alloc.bytesUsed(), 9000U);
+
+    // Server: export each chunk; ship over the SCM_RIGHTS wire. Worker:
+    // import and record the per-chunk base pointer in this address space.
+    const std::vector<int>           memfds   = alloc.chunkMemfds();
+    const std::vector<std::uint64_t> mapBytes = alloc.chunkMapBytes();
+    ShmIpcExporter exp{std::span<const int>{memfds},
+                       std::span<const std::uint64_t>{mapBytes}};
+    ShmIpcImporter imp;
+
+    std::vector<void*> workerBases(alloc.chunkCount(), nullptr);
+    for (std::uint32_t i = 0; i < alloc.chunkCount(); ++i) {
+        auto h = exp.exportChunk(i, alloc.chunkBase(i), alloc.chunkUsedBytes(i));
+        EXPECT_TRUE(static_cast<bool>(h));
+
+        SocketPair sp;
+        const auto payload =
+            std::span<const std::byte>{h->bytes.data(), h->bytes.size()};
+        const int fdsOut[1] = {h->fd};
+        EXPECT_TRUE(static_cast<bool>(UnixSocketFrame::send(sp.a, payload, fdsOut)));
+
+        auto rframe = UnixSocketFrame::recv(sp.b, /*maxPayloadBytes=*/128);
+        EXPECT_TRUE(static_cast<bool>(rframe));
+        EXPECT_EQ(rframe->fds.size(), 1U);
+
+        std::span<const std::byte, 64> hb{rframe->payload.data(), 64};
+        auto p = imp.importChunk(hb, rframe->fds[0]);
+        EXPECT_TRUE(static_cast<bool>(p));
+        workerBases[i] = *p;
+    }
+
+    // Worker resolves each tensor via chunkBase[chunkIndex] + chunkOffset
+    // and sees exactly the bytes the server wrote.
+    for (const auto& t : tensors) {
+        const auto* base = static_cast<const std::uint8_t*>(workerBases[t.alloc.chunkIndex]);
+        const std::uint8_t* tp = base + t.alloc.chunkOffset;
+        bool ok = true;
+        for (std::size_t i = 0; i < t.bytes; ++i)
+            if (tp[i] != t.pattern) { ok = false; break; }
+        EXPECT_TRUE(ok);
+    }
+
+    for (void* b : workerBases) imp.closeChunk(b);
 }
 
 int main() {
