@@ -829,6 +829,66 @@ void Nvfp4Loader::load(InferenceEngine& e,
         }
     }
 
+    // 5e-dense. Qwen3_5 DENSE decode bandwidth lever — keep the dense
+    // compressed-tensors NVFP4 projections native 4-bit (blocked-NVFP4) instead
+    // of the just-materialised BF16. The dense 27B is decode weight-bandwidth
+    // bound (~53.7 GiB BF16 / token @ 273 GB/s ≈ 197 ms floor; measured ~346 ms),
+    // and the MLP (ffn_gate/up/down, ff=17408) dominates. Every NVFP4-sourced
+    // dense projection is read every token (no routing), so repackaging E2M1 +
+    // per-16 E4M3 block-scale + global into the single-pointer blocked format the
+    // matmul_nvfp4blk kernels consume (¼ the bytes) is LOSSLESS (the BF16 held
+    // the widened NVFP4 values; re-quantising BF16 would double-quant instead).
+    // compressed-tensors names the sidecars explicitly on the source
+    // (.weight_packed / .weight_scale / .weight_global_scale, reciprocal global)
+    // — use those directly, NOT the ModelOpt .weight/.weight_scale_2 convention.
+    // Opt-in (default OFF until A/B'd on the HTTP anchor); FP8-sourced
+    // projections (late-layer MLP + lm_head) stay BF16 here.
+    if (ctCfg.valid() && e._config.expertCount == 0 && e._nvfp4Model) {
+        const char* de = std::getenv("MIMIRMIND_QWEN_DENSE_NVFP4_DECODE");
+        if (de != nullptr && std::string_view{de} != "0") {
+            std::size_t nRepack = 0;
+            std::uint64_t bytesBefore = 0, bytesAfter = 0;
+            for (const auto& step : steps) {
+                if (step.sources.size() != 1) continue;
+                const auto& src = step.sources[0];
+                if (src.kind != core::modelopt::SourceKind::Nvfp4) continue;
+                if ((src.in % 32) != 0) continue;
+                auto it = std::find_if(
+                    e._materializedBf16.begin(), e._materializedBf16.end(),
+                    [&](const runtime::nvfp4::MaterializedTensor& t) {
+                        return t.ggufName == step.ggufName;
+                    });
+                if (it == e._materializedBf16.end() || it->isF32) continue;
+                const auto* pk = e._nvfp4Model->find(src.hfWeightName);
+                const auto* bs = src.blockScaleName.empty()
+                                     ? nullptr
+                                     : e._nvfp4Model->find(src.blockScaleName);
+                const auto* gs = src.globalScaleName.empty()
+                                     ? nullptr
+                                     : e._nvfp4Model->find(src.globalScaleName);
+                if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
+                float global = devOps.readF32(gs->devPtr);
+                if (src.globalIsReciprocal) global = 1.0F / global;
+                const std::size_t blkBytes =
+                    (static_cast<std::size_t>(it->elems) / 32) * 20;
+                compute::ComputeBuffer nb = devOps.allocateWeight(blkBytes);
+                devOps.repackageNvfp4ToBlk(nb.get(), pk->devPtr, bs->devPtr,
+                                           global, src.rows, src.in);
+                cudaCtx.stream().synchronize();
+                bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
+                bytesAfter  += blkBytes;
+                it->buffer     = std::move(nb);   // frees the BF16 buffer (RAII)
+                it->isNvfp4Blk = true;
+                ++nRepack;
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: qwen3_5 dense kept {} NVFP4 projections "
+                        "native blocked-NVFP4 (MIMIRMIND_QWEN_DENSE_NVFP4_DECODE) "
+                        "({} MiB -> {} MiB)",
+                        nRepack, bytesBefore >> 20, bytesAfter >> 20);
+        }
+    }
+
     // 5f. Keep the dense NVFP4 projections native 4-bit (blocked-NVFP4).
     //
     // The MoE shared-expert projections (ffn_*_shexp) are W4A16_NVFP4 in the
