@@ -1238,6 +1238,7 @@ add_executable(mimirmind
     src/runtime/arch/Gemma4E4BBackend.cpp
     src/runtime/arch/Gemma4MoeBackend.cpp
     src/runtime/arch/Qwen2Backend.cpp
+    src/runtime/arch/Qwen3_5Backend.cpp
     src/runtime/arch/Qwen3_5MoeBackend.cpp
     src/server/ApiHelpers.cpp
     src/server/ApiServer.cpp
