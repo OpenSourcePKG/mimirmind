@@ -376,8 +376,10 @@ add_library(mimirmind_core_common STATIC
     src/core/modelopt/ModelOptWeightLayout.cpp
     src/core/modelopt/ModelOptWeightAssembler.cpp
     src/core/modelopt/NvFp4Reference.cpp
+    src/core/modelopt/CompressedTensorsConfig.cpp
     src/core/modelopt/Qwen3_5MoeGgufMap.cpp
     src/core/modelopt/Qwen3_5MoeMaterializer.cpp
+    src/core/modelopt/Qwen3_5DenseMaterializer.cpp
     src/core/modelopt/Gemma4Materializer.cpp
     src/core/safetensors/SafetensorsDtype.cpp
     src/core/safetensors/SafetensorsHeader.cpp
@@ -984,6 +986,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/x_quant_i8.cu
         kernels/cuda/common/dequant_nvfp4.cu
         kernels/cuda/common/dequant_fp8.cu
+        kernels/cuda/common/dequant_fp8_perchannel.cu
         kernels/cuda/common/cast_to_f32.cu
         kernels/cuda/common/cublas_fp8_quant.cu
         kernels/cuda/llm/neg_exp.cu

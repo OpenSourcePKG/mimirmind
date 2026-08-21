@@ -43,6 +43,13 @@ struct MaterializerDeviceOps {
     virtual void dequantFp8(const void* weight, float scale,
                             std::uint64_t n, void* dstBf16) = 0;
 
+    /// F8_E4M3 weight [rows*in] + per-channel BF16 scale vector `scaleBf16`
+    /// [rows] (one scale per output row) -> BF16 [rows*in] at dst. The
+    /// compressed-tensors FP8 layout used by the dense qwen3_5 checkpoint.
+    virtual void dequantFp8PerChannel(const void* weight, const void* scaleBf16,
+                                      std::uint64_t rows, std::uint64_t in,
+                                      void* dstBf16) = 0;
+
     /// Device-to-device copy of already-BF16 bytes (passthrough tensors).
     virtual void copyBytes(void* dst, const void* src, std::size_t bytes) = 0;
 

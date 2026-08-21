@@ -11,8 +11,10 @@
 #include "core/gpu/cuda/CudaComputeContext.hpp"
 #include "core/log/Log.hpp"
 #include "core/modelopt/BlockScaleSwizzle.hpp"
+#include "core/modelopt/CompressedTensorsConfig.hpp"
 #include "core/modelopt/Gemma4Materializer.hpp"
 #include "core/modelopt/HfQuantConfig.hpp"
+#include "core/modelopt/Qwen3_5DenseMaterializer.hpp"
 #include "core/modelopt/Qwen3_5MoeMaterializer.hpp"
 #include "core/safetensors/SafetensorsModel.hpp"
 #include "runtime/nvfp4/ComputeOpsUploader.hpp"
@@ -247,16 +249,36 @@ void Nvfp4Loader::load(InferenceEngine& e,
     // 4. Build the materialization plan (tensor shapes + per-module schemes).
     core::safetensors::SafetensorsModel sm;
     sm.open(dir);
-    const core::modelopt::HfQuantConfig hfCfg =
-        core::modelopt::HfQuantConfig::parse(
-            readText(std::filesystem::path{dir} / "hf_quant_config.json"));
     const core::modelopt::Qwen3_5MoeArch arch{
         static_cast<int>(e._config.blockCount),
         static_cast<int>(e._config.expertCount),
         4 /* full_attention_interval; layer_types agrees for this model */,
         static_cast<int>(e._config.nextnPredictLayers) /* MTP head blocks */};
-    const std::vector<core::modelopt::MaterializationStep> steps =
-        core::modelopt::planQwen3_5MoeMaterialization(sm, hfCfg, arch);
+
+    // Two quant-config formats share the qwen3_5 arch walk: the ModelOpt MoE
+    // checkpoint (hf_quant_config.json sidecar, per-tensor NVFP4/FP8) and the
+    // compressed-tensors DENSE checkpoint (Qwen3.8-27B: quant config lives IN
+    // config.json, mixed per-channel FP8 / NVFP4 / BF16, dense SwiGLU MLP, no
+    // experts / shared expert / MTP). Detect the latter by a valid
+    // compressed-tensors `quantization_config` + a dense config (expertCount 0),
+    // and swap only the plan — the shared upload, dequant, GatedDeltaNet
+    // value-head regroup, and WeightsMap tail below are format-agnostic. The
+    // MoE-only post-passes (5c-5g) key on expert / shared-expert / MTP tensor
+    // names, so they no-op on the dense plan.
+    const core::modelopt::CompressedTensorsConfig ctCfg =
+        core::modelopt::CompressedTensorsConfig::parse(configText);
+    std::vector<core::modelopt::MaterializationStep> steps;
+    if (ctCfg.valid() && e._config.expertCount == 0) {
+        MM_LOG_INFO("engine",
+                    "loadModelNvfp4: '{}' — qwen3_5 DENSE (compressed-tensors, "
+                    "mixed FP8/NVFP4)", checkpointDir);
+        steps = core::modelopt::planQwen3_5DenseMaterialization(sm, ctCfg, arch);
+    } else {
+        const core::modelopt::HfQuantConfig hfCfg =
+            core::modelopt::HfQuantConfig::parse(
+                readText(std::filesystem::path{dir} / "hf_quant_config.json"));
+        steps = core::modelopt::planQwen3_5MoeMaterialization(sm, hfCfg, arch);
+    }
 
     // 5. Dequantise every weight to BF16 on device (weight-only W4A16).
     auto& cudaCtx = static_cast<core::cuda::CudaComputeContext&>(*e._computeCtx);

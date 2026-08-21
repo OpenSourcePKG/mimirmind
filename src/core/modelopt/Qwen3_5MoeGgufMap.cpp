@@ -55,6 +55,15 @@ constexpr std::array<GgufTensorSource, 8> kMoe = {{
     {"ffn_gate_inp_shexp.weight", "mlp.shared_expert_gate.weight",       WeightXform::Direct},
 }};
 
+// ---- Dense MLP block (dense qwen3_5, e.g. Qwen3.8-27B) -------------------
+// SwiGLU: the dense variant replaces the MoE router + expert banks with a
+// single gate/up/down triple. Byte layout HF [out,in] == GGUF [in,out].
+constexpr std::array<GgufTensorSource, 3> kDenseMlp = {{
+    {"ffn_gate.weight", "mlp.gate_proj.weight", WeightXform::Direct},
+    {"ffn_up.weight",   "mlp.up_proj.weight",   WeightXform::Direct},
+    {"ffn_down.weight", "mlp.down_proj.weight", WeightXform::Direct},
+}};
+
 // ---- MTP (nextn) head projections ---------------------------------------
 // hfSuffix relative to the top-level `mtp.` prefix. The HF checkpoint stores
 // the fused concat as fc(cat(hnorm, enorm)); the GGUF/backend eh_proj expects
@@ -80,6 +89,7 @@ constexpr std::array<GgufTensorSource, 3> kTopLevel = {{
 std::span<const GgufTensorSource> qwen35moeFullAttnTensors() noexcept { return kFullAttn; }
 std::span<const GgufTensorSource> qwen35moeDeltaNetTensors() noexcept { return kDeltaNet; }
 std::span<const GgufTensorSource> qwen35moeMoeTensors() noexcept { return kMoe; }
+std::span<const GgufTensorSource> qwen35DenseMlpTensors() noexcept { return kDenseMlp; }
 std::span<const GgufTensorSource> qwen35moeTopLevelTensors() noexcept { return kTopLevel; }
 std::span<const GgufTensorSource> qwen35moeNextnTensors() noexcept { return kNextn; }
 

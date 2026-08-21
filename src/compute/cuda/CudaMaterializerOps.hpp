@@ -41,6 +41,10 @@ public:
     void dequantFp8(const void* weight, float scale,
                     std::uint64_t n, void* dstBf16) override;
 
+    void dequantFp8PerChannel(const void* weight, const void* scaleBf16,
+                              std::uint64_t rows, std::uint64_t in,
+                              void* dstBf16) override;
+
     void copyBytes(void* dst, const void* src, std::size_t bytes) override;
 
     void widenToF32(void* dstF32, const void* src,
@@ -112,6 +116,7 @@ private:
     ComputeOps&                     _ops;
     core::cuda::CudaModule          _nvfp4Module;
     core::cuda::CudaModule          _fp8Module;
+    core::cuda::CudaModule          _fp8PcModule;
     core::cuda::CudaModule          _castModule;
     core::cuda::CudaModule          _negExpModule;
     core::cuda::CudaModule          _addOneModule;
@@ -123,6 +128,7 @@ private:
     core::cuda::CudaModule          _sfSwizzleModule;
     core::cuda::CudaKernel          _dqNvfp4;
     core::cuda::CudaKernel          _dqFp8;
+    core::cuda::CudaKernel          _dqFp8Pc;
     core::cuda::CudaKernel          _castBf16;
     core::cuda::CudaKernel          _castF16;
     core::cuda::CudaKernel          _negExp;

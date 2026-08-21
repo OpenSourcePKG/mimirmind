@@ -19,7 +19,11 @@ namespace mimirmind::core::modelopt {
 /// How one HF source tensor is turned into (part of) a GGUF BF16 tensor.
 enum class SourceKind : std::uint8_t {
     Nvfp4,           ///< dequant packed U8 + F8 block scale + F32 global -> BF16
-    Fp8,             ///< dequant F8_E4M3 + F32 per-tensor scale -> BF16
+    Fp8,             ///< dequant F8_E4M3 + F32 per-tensor scale -> BF16 (ModelOpt)
+    Fp8PerChannel,   ///< dequant F8_E4M3 + per-channel scale vector [out] (BF16)
+                     ///< -> BF16. The compressed-tensors FP8 layout (dense
+                     ///< qwen3_5): one scale per output row, `<base>.weight_scale`
+                     ///< is `[out, 1]` BF16, NOT the per-tensor F32 scalar of Fp8.
     Bf16Passthrough, ///< already BF16 (norms, router, embed, conv1d, ssm gates) -> WIDEN to F32
     Bf16Copy         ///< already BF16 matmul weight -> BF16 verbatim (no widen); reads a
                      ///< `srcElemOffset`-based slice of the source (MTP fused/stacked experts)

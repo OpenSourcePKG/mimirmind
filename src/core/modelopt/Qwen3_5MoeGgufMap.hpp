@@ -56,6 +56,12 @@ struct GgufTensorSource {
 /// every layer regardless of attention type.
 [[nodiscard]] std::span<const GgufTensorSource> qwen35moeMoeTensors() noexcept;
 
+/// Per-block DENSE MLP tensors (SwiGLU) for the dense qwen3_5 variant
+/// (Qwen3.8-27B) — the `mlp.{gate,up,down}_proj` triple that replaces the MoE
+/// router + expert banks. Same GGUF names (ffn_gate/up/down) the dense backend
+/// (Qwen3_5DenseBackend::runFfn) addresses.
+[[nodiscard]] std::span<const GgufTensorSource> qwen35DenseMlpTensors() noexcept;
+
 /// Model-level tensors (embeddings, final norm, lm_head). `hfSuffix` and
 /// `ggufSuffix` are the full names here.
 [[nodiscard]] std::span<const GgufTensorSource> qwen35moeTopLevelTensors() noexcept;

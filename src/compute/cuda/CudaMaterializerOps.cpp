@@ -62,6 +62,7 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _ops{ops},
       _nvfp4Module{loadModule(ctx.cudaContext(), "dequant_nvfp4")},
       _fp8Module{loadModule(ctx.cudaContext(), "dequant_fp8")},
+      _fp8PcModule{loadModule(ctx.cudaContext(), "dequant_fp8_perchannel")},
       _castModule{loadModule(ctx.cudaContext(), "cast_to_f32")},
       _negExpModule{loadModule(ctx.cudaContext(), "neg_exp")},
       _addOneModule{loadModule(ctx.cudaContext(), "add_one")},
@@ -73,6 +74,7 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _sfSwizzleModule{loadModule(ctx.cudaContext(), "moe_weight_sf_swizzle")},
       _dqNvfp4{_nvfp4Module.getFunction("dequant_nvfp4")},
       _dqFp8{_fp8Module.getFunction("dequant_fp8")},
+      _dqFp8Pc{_fp8PcModule.getFunction("dequant_fp8_perchannel")},
       _castBf16{_castModule.getFunction("cast_bf16_to_f32")},
       _castF16{_castModule.getFunction("cast_f16_to_f32")},
       _negExp{_negExpModule.getFunction("neg_exp_f32")},
@@ -115,6 +117,21 @@ void CudaMaterializerOps::dequantFp8(const void* weight, float scale,
     _dqFp8.setPtr  (2, dstBf16);
     _dqFp8.setValue(3, static_cast<std::int64_t>(n));
     _dqFp8.launch(_ctx.stream(), gridFor(n), 1, 1, kBlock, 1, 1);
+}
+
+void CudaMaterializerOps::dequantFp8PerChannel(const void* weight,
+                                               const void* scaleBf16,
+                                               std::uint64_t rows,
+                                               std::uint64_t in, void* dstBf16) {
+    // Kernel: (weight F8, scale BF16[rows], bf16* out, long rows, long in)
+    const std::uint64_t n = rows * in;
+    _dqFp8Pc.clearArgs();
+    _dqFp8Pc.setPtr  (0, weight);
+    _dqFp8Pc.setPtr  (1, scaleBf16);
+    _dqFp8Pc.setPtr  (2, dstBf16);
+    _dqFp8Pc.setValue(3, static_cast<std::int64_t>(rows));
+    _dqFp8Pc.setValue(4, static_cast<std::int64_t>(in));
+    _dqFp8Pc.launch(_ctx.stream(), gridFor(n), 1, 1, kBlock, 1, 1);
 }
 
 void CudaMaterializerOps::copyBytes(void* dst, const void* src, std::size_t bytes) {

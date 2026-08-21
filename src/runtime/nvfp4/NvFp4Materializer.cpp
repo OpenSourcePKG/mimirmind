@@ -83,6 +83,20 @@ executeMaterialization(const std::vector<mo::MaterializationStep>& steps,
                     ops.dequantFp8(w.devPtr, scale, s.rows * s.in, dst);
                     break;
                 }
+                case mo::SourceKind::Fp8PerChannel: {
+                    // compressed-tensors FP8: `<base>.weight_scale` is a
+                    // per-output-row BF16 vector [rows], not a per-tensor F32
+                    // scalar. Pass the whole scale vector to the kernel.
+                    const NvFp4DeviceTensor& ws = require(src, base + ".weight_scale");
+                    if (ws.dtype != safetensors::SafetensorsDtype::BF16) {
+                        fail("per-channel FP8 scale '" + base +
+                             ".weight_scale' is not BF16 (the kernel widens BF16 "
+                             "per-channel scales); got dtype "
+                             + std::string{safetensors::dtypeName(ws.dtype)});
+                    }
+                    ops.dequantFp8PerChannel(w.devPtr, ws.devPtr, s.rows, s.in, dst);
+                    break;
+                }
                 case mo::SourceKind::Bf16Copy: {
                     // Already-BF16 matmul weight, kept BF16 (no widen). Reads a
                     // slice at `srcElemOffset` — used to split the MTP fused
