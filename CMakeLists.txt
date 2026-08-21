@@ -364,6 +364,7 @@ add_library(mimirmind_core_common STATIC
     src/core/config/Config.cpp
     src/core/cpu/CpuContext.cpp
     src/core/gguf/GgufReader.cpp
+    src/core/gguf/GgufReaderShmChunks.cpp
     src/core/gguf/GgufTypes.cpp
     src/core/gguf/TensorFingerprint.cpp
     src/core/gguf/WeightsMap.cpp
@@ -373,6 +374,7 @@ add_library(mimirmind_core_common STATIC
     src/core/ipc/UnixSocketFrame.cpp
     src/core/ipc/WireOps.cpp
     src/munin/ShmChunkAllocator.cpp
+    src/munin/ShmLoadedModel.cpp
     src/core/modelopt/BlockScaleSwizzle.cpp
     src/core/modelopt/HfQuantConfig.cpp
     src/core/modelopt/ModelOptQuant.cpp

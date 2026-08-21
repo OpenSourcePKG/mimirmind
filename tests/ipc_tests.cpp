@@ -4,9 +4,12 @@
 #include "core/ipc/IpcTransport.hpp"
 #include "core/ipc/ShmIpcExporter.hpp"
 #include "core/ipc/ShmIpcImporter.hpp"
+#include "core/gguf/GgufReader.hpp"
+#include "core/gguf/TensorFingerprint.hpp"
 #include "core/ipc/TensorManifest.hpp"
 #include "core/ipc/UnixSocketFrame.hpp"
 #include "munin/ShmChunkAllocator.hpp"
+#include "munin/ShmLoadedModel.hpp"
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -18,9 +21,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <expected>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -36,6 +42,7 @@ using ::mimirmind::core::ipc::ShmIpcImporter;
 using ::mimirmind::core::ipc::TensorManifest;
 using ::mimirmind::core::ipc::UnixSocketFrame;
 using ::mimirmind::munin::ShmChunkAllocator;
+using ::mimirmind::munin::ShmLoadedModel;
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
@@ -621,6 +628,125 @@ TEST(shmChunkAlloc_endToEnd_attachResolvesTensors) {
     }
 
     for (void* b : workerBases) imp.closeChunk(b);
+}
+
+// ---- GgufReader::loadTensorsIntoShmChunks + ShmLoadedModel ------------------
+//
+// The shm ModelStore load path (step 2-tail): parse a GGUF, copy each
+// tensor's raw payload into memfd chunks, build the wire manifest. We
+// synthesize a minimal GGUF v3 in a temp file (no fixture on disk) so the
+// whole load path is exercised end-to-end, then check chunk placement, the
+// manifest, and that the raw bytes actually landed in the shm chunks.
+
+namespace {
+
+// Minimal GGUF v3 builder. Three 1-D F32 tensors, distinct byte patterns,
+// packed contiguously in the data section. Returns the file bytes.
+std::vector<std::uint8_t> makeMinimalGguf() {
+    std::vector<std::uint8_t> b;
+    auto putU32 = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) b.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+    };
+    auto putU64 = [&](std::uint64_t v) {
+        for (int i = 0; i < 8; ++i) b.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+    };
+    auto putStr = [&](std::string_view s) {
+        putU64(s.size());
+        for (char ch : s) b.push_back(static_cast<std::uint8_t>(ch));
+    };
+
+    constexpr std::uint32_t kMagic     = 0x46554747u; // 'GGUF'
+    constexpr std::uint32_t kAlignment = 32;
+    constexpr std::uint64_t kElems     = 2000;        // F32 -> 8000 bytes/tensor
+    constexpr std::uint64_t kTBytes    = kElems * 4;
+
+    putU32(kMagic);
+    putU32(3);          // version
+    putU64(3);          // tensor count
+    putU64(1);          // metadata count
+
+    // metadata[0]: general.alignment : UInt32 = 32
+    putStr("general.alignment");
+    putU32(4);          // GgufValueType::UInt32
+    putU32(kAlignment);
+
+    // tensor index: name, ndim=1, dim, type=F32(0), fileOffset
+    const char* names[3] = {"a", "bb", "ccc"};
+    for (int i = 0; i < 3; ++i) {
+        putStr(names[i]);
+        putU32(1);                                   // ndim
+        putU64(kElems);                              // dim[0]
+        putU32(0);                                   // GgmlType::F32
+        putU64(static_cast<std::uint64_t>(i) * kTBytes); // fileOffset in data section
+    }
+
+    // pad to alignment, then the data section (3 patterns).
+    while ((b.size() % kAlignment) != 0) b.push_back(0);
+    const std::uint8_t pat[3] = {0x11, 0x22, 0x33};
+    for (int i = 0; i < 3; ++i) {
+        for (std::uint64_t k = 0; k < kTBytes; ++k) b.push_back(pat[i]);
+    }
+    return b;
+}
+
+std::string writeTempGguf(const std::vector<std::uint8_t>& bytes) {
+    std::string path = "/tmp/munin_shm_test_" +
+                       std::to_string(::getpid()) + ".gguf";
+    std::ofstream os(path, std::ios::binary | std::ios::trunc);
+    os.write(reinterpret_cast<const char*>(bytes.data()),
+             static_cast<std::streamsize>(bytes.size()));
+    os.close();
+    return path;
+}
+
+} // namespace
+
+TEST(shmModel_loadGgufIntoShmChunks_buildsManifestAndData) {
+    const std::string path = writeTempGguf(makeMinimalGguf());
+
+    ShmLoadedModel lm{};
+    lm.id     = "test-shm-model";
+    lm.chunks = std::make_unique<ShmChunkAllocator>(/*chunkBytes=*/8192);
+    lm.reader = std::make_unique<::mimirmind::core::gguf::GgufReader>();
+    lm.reader->open(path);
+    EXPECT_EQ(lm.reader->tensorCount(), 3U);
+
+    lm.reader->loadTensorsIntoShmChunks(*lm.chunks);
+    lm.totalBytes  = lm.reader->totalTensorBytes();
+    lm.fingerprint = ::mimirmind::core::gguf::tensorFingerprint(*lm.reader);
+
+    // 8000-byte tensors do not share an 8192-byte chunk -> one chunk each.
+    EXPECT_EQ(lm.chunks->chunkCount(), 3U);
+    EXPECT_EQ(lm.chunks->chunkUsedBytes(0), 8000U);
+    EXPECT_EQ(lm.chunks->chunkUsedBytes(1), 8000U);
+    EXPECT_EQ(lm.chunks->chunkUsedBytes(2), 8000U);
+    EXPECT_EQ(lm.totalBytes, 24000U);
+
+    // Manifest: 3 chunks + 3 tensors, each tensor alone at offset 0 in its
+    // own chunk.
+    const auto m = lm.buildManifest();
+    EXPECT_EQ(m.modelId,        "test-shm-model");
+    EXPECT_EQ(m.chunks.size(),  3U);
+    EXPECT_EQ(m.tensors.size(), 3U);
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(m.chunks[i].bytes,        8000U);
+        EXPECT_EQ(m.tensors[i].chunkIndex,  i);
+        EXPECT_EQ(m.tensors[i].chunkOffset, 0U);
+        EXPECT_EQ(m.tensors[i].bytes,       8000U);
+    }
+
+    // The raw GGUF payload actually landed in the shm chunks: each chunk
+    // holds its tensor's distinct pattern.
+    const std::uint8_t expect[3] = {0x11, 0x22, 0x33};
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        const auto* base = static_cast<const std::uint8_t*>(lm.chunks->chunkBase(i));
+        bool ok = base != nullptr;
+        for (std::uint64_t k = 0; ok && k < 8000; ++k)
+            if (base[k] != expect[i]) { ok = false; }
+        EXPECT_TRUE(ok);
+    }
+
+    ::unlink(path.c_str());
 }
 
 int main() {

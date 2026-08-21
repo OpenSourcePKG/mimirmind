@@ -21,6 +21,7 @@ class ComputeOps;
 
 namespace mimirmind::munin {
 class ChunkAllocator;
+class ShmChunkAllocator;
 }
 
 namespace mimirmind::core::gguf {
@@ -127,6 +128,15 @@ public:
 #ifdef MIMIRMIND_HAVE_L0
     void loadTensorsIntoChunks(::mimirmind::munin::ChunkAllocator& chunks);
 #endif
+
+    /// POSIX-shm analogue of `loadTensorsIntoChunks` for the M-Munin.CUDA
+    /// path: copy each tensor's raw GGUF payload into a `ShmChunkAllocator`
+    /// (memfd-backed host RAM) and record its `{chunkIndex, chunkOffset}`.
+    /// MVP materialization = raw bytes, the attached worker dequantises at
+    /// compute time (ADR 2026-08-14, step 2). Unlike the L0 variant this is
+    /// pure POSIX — no GPU SDK — so it is unconditional in mimirmind_core_common.
+    /// Idempotent; cannot be mixed with `loadTensors` for the same reader.
+    void loadTensorsIntoShmChunks(::mimirmind::munin::ShmChunkAllocator& chunks);
 
     /// Release USM, drop the mmap, reset state. Idempotent.
     void close() noexcept;
