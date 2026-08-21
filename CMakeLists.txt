@@ -1749,6 +1749,27 @@ target_link_libraries(l0_ipc_testrig PRIVATE
 
 endif() # MIMIRMIND_ENABLE_L0 (gpu_tests + prefill_bench + l0_ipc_testrig)
 
+# ---- cuda_ipc_testrig — CUDA-IPC go/no-go gate for the M-Munin GB10 port ----
+#
+# The CUDA analogue of l0_ipc_testrig: does same-host cross-process CUDA
+# memory sharing work on DGX Spark GB10 (unified memory)? Tests classic
+# runtime IPC on cudaMalloc (device) + cudaMallocManaged (managed) memory
+# and the low-level VMM POSIX-FD path (cuMemExportToShareableHandle). Not
+# installed in any runtime image — a bringup diagnostic. Run owner +
+# attacher concurrently, or use tools/cuda-ipc-testrig.sh.
+#
+#   cmake --build build-cuda --target cuda_ipc_testrig
+#   ./tools/cuda-ipc-testrig.sh ./build-cuda/cuda_ipc_testrig
+if(MIMIRMIND_ENABLE_CUDA)
+    add_executable(cuda_ipc_testrig
+        tools/cuda-ipc-testrig.cpp
+    )
+    target_link_libraries(cuda_ipc_testrig PRIVATE
+        CUDA::cudart
+        CUDA::cuda_driver
+    )
+endif()
+
 # ---- hip_probe — HIP-side "toolchain is live end-to-end" diagnostic --------
 #
 # Enumerates all HIP-visible devices, instantiates HipContext on the
