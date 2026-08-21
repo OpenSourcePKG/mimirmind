@@ -627,6 +627,56 @@ void InferenceEngine::finalizeLoad() {
                 core::backend::BackendRegistry::name(_computeCtx->kind()));
 #endif
 
+    // M-Probe.1 / 5.19 — HW-fingerprint + per-HW profile lookup + Layer-2
+    // flag-apply for the CUDA backend. The L0 autotune block above computes the
+    // fingerprint and applies its persisted GEMM-vs-vec pick; CUDA has no online
+    // autotune (dense -> cuBLAS, MoE -> specialised NVFP4/FP4-TC kernels), so
+    // here the profile drives the parity-gated prefill fast-path flags instead.
+    // Only flags the profile opts into ("apply": true) are applied, and never
+    // over an explicit env (env = debug override, wins) — so lossy /
+    // precision-unvalidated flags stay opt-in until the goldset (Increment C).
+    // Keeping them out of the ephemeral container env is the whole point: a
+    // from-scratch restart can no longer silently drop the fast prefill path.
+    // See ADR decisions/2026-08-21-hw-fingerprint-perf-profiles.
+    if (_computeCtx->kind() == core::backend::BackendKind::Cuda) {
+        const std::string fp = core::backend::computeHwFingerprint(
+            core::backend::gatherHostInfo(),
+            core::backend::identityFromBackend(_computeCtx->backend()));
+        const char* dirEnv = std::getenv("MIMIRMIND_PROBE_DIR");
+        const std::string dir =
+            dirEnv ? dirEnv : "/usr/local/share/mimirmind/configs";
+        const auto picks = loadProbePicks(dir, fp);
+        if (!picks) {
+            MM_LOG_INFO("probe",
+                        "HW fingerprint={} backend=Cuda — per-HW profile not "
+                        "deployed under {} (run mimirmind-probe)",
+                        fp, dir);
+        } else {
+            MM_LOG_INFO("probe",
+                        "HW fingerprint={} backend=Cuda — per-HW profile FOUND "
+                        "under {}, applying Layer-2 flags (explicit env wins)",
+                        fp, dir);
+            if (picks->applyPrefillCudnn &&
+                !_ops->prefillCudnnEnvOverridden()) {
+                _ops->setPrefillCudnn(*picks->applyPrefillCudnn);
+                MM_LOG_INFO("probe", "  profile applied: cuDNN SDPA prefill -> {}",
+                            *picks->applyPrefillCudnn ? "on" : "off");
+            }
+            if (picks->applyF32TcPrefill &&
+                !_gmm->f32TcPrefillEnvOverridden()) {
+                _gmm->setF32TcPrefill(*picks->applyF32TcPrefill);
+                MM_LOG_INFO("probe", "  profile applied: F32-TC prefill -> {}",
+                            *picks->applyF32TcPrefill ? "on" : "off");
+            }
+            if (picks->applyCublasFp8Prefill &&
+                !_gmm->cublasFp8PrefillEnvOverridden()) {
+                _gmm->setCublasFp8Prefill(*picks->applyCublasFp8Prefill);
+                MM_LOG_INFO("probe", "  profile applied: cuBLAS-FP8 prefill -> {}",
+                            *picks->applyCublasFp8Prefill ? "on" : "off");
+            }
+        }
+    }
+
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
     // gracefully with the original architecture string in the error.

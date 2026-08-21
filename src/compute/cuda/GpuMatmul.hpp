@@ -236,6 +236,20 @@ public:
         _f32TcAllowed = allowed;
     }
 
+    // Layer-2 profile-apply (5.19). Set only from the runtime after a
+    // fingerprint match, and only where the ctor did not read an explicit env
+    // value (see the *EnvSet flags below) — env is the debug override and wins.
+    void setF32TcPrefill(bool on) noexcept override { _useF32TcPrefill = on; }
+    [[nodiscard]] bool f32TcPrefillEnvOverridden() const noexcept override {
+        return _f32TcPrefillEnvSet;
+    }
+    void setCublasFp8Prefill(bool on) noexcept override {
+        _useCublasFp8Prefill = on;
+    }
+    [[nodiscard]] bool cublasFp8PrefillEnvOverridden() const noexcept override {
+        return _cublasFp8PrefillEnvSet;
+    }
+
     void sync() override;
 
     [[nodiscard]] std::vector<::mimirmind::compute::AutotuneReport>
@@ -371,6 +385,11 @@ private:
     // whose bounded magnitude keeps the per-tensor E4M3 activation scale from
     // crushing precision — so the M==1-only gate can be lifted for these.
     bool                           _useCublasFp8Prefill{false};
+    // Whether the ctor read an explicit MIMIRMIND_{F32_TC,CUBLAS_FP8}_PREFILL
+    // env var. If so, the Layer-2 per-HW profile must not override it (env is
+    // the debug override and wins). See setF32TcPrefill / setCublasFp8Prefill.
+    bool                           _f32TcPrefillEnvSet{false};
+    bool                           _cublasFp8PrefillEnvSet{false};
     // Route batched (M>1) F32 GEMMs through the BF16/TF32 tensor-core kernel
     // (weight cast to BF16 once, cached) instead of the per-row F32 vec launches.
     // Opt-in MIMIRMIND_F32_TC_PREFILL=1: huge win for models with small F32

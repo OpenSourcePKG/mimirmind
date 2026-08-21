@@ -27,6 +27,9 @@ enum class Mode {
     Smoke,
     Serve,
     Parity,
+    QualityGate,   ///< 5.19-C — greedy A/B of the lossy prefill flags vs the
+                   ///<          exact path over a DE goldset; token-exact = safe
+                   ///<          to promote apply:true in the per-HW profile.
 };
 
 /**

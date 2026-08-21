@@ -64,6 +64,24 @@ loadProbePicks(const std::string& dir, const std::string& fingerprint) {
         picks.gemmNeverForAllMatmul = !anyGemmPicked;
     }
 
+    // Layer-2 flag intents. A flag drives the runtime only if its entry opts in
+    // with "apply": true; otherwise it stays advisory (record-only) and the
+    // runtime keeps its own value. This is the quality guardrail — lossy /
+    // precision-unvalidated flags are authored apply:false until goldsetted.
+    const auto flagsIt = j.find("flags");
+    if (flagsIt != j.end() && flagsIt->is_object()) {
+        const auto readFlag =
+            [&flagsIt](const char* key) -> std::optional<bool> {
+            const auto it = flagsIt->find(key);
+            if (it == flagsIt->end() || !it->is_object()) return std::nullopt;
+            if (!it->value("apply", false)) return std::nullopt;
+            return it->value("value", 0) != 0;
+        };
+        picks.applyPrefillCudnn     = readFlag("MIMIRMIND_ATTN_CUDNN");
+        picks.applyF32TcPrefill     = readFlag("MIMIRMIND_F32_TC_PREFILL");
+        picks.applyCublasFp8Prefill = readFlag("MIMIRMIND_CUBLAS_FP8_PREFILL");
+    }
+
     return picks;
 }
 

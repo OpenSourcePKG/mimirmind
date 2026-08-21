@@ -4,6 +4,7 @@
 #include "mimirmind/CliArgs.hpp"
 #include "mimirmind/CliParser.hpp"
 #include "mimirmind/ParityMode.hpp"
+#include "mimirmind/QualityGateMode.hpp"
 #include "mimirmind/ServeMode.hpp"
 #include "mimirmind/SmokeMode.hpp"
 
@@ -77,6 +78,8 @@ int main(int argc, char** argv) {
             case Mode::Smoke:  return mimirmind::cli::runSmoke(args, cfg);
             case Mode::Serve:  return mimirmind::cli::runServe(args, cfg);
             case Mode::Parity: return mimirmind::cli::runParity(args, cfg);
+            case Mode::QualityGate:
+                return mimirmind::cli::runQualityGate(args, cfg);
         }
         return 0;
 #ifdef MIMIRMIND_HAVE_L0

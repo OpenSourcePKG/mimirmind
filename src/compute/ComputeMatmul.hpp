@@ -268,6 +268,22 @@ public:
     [[nodiscard]] virtual bool f32TcAllowed() const noexcept { return false; }
     virtual void setF32TcAllowed(bool /*allowed*/) noexcept {}
 
+    /// Layer-2 per-HW-profile apply hooks (5.19). The runtime, after a
+    /// fingerprint match, may drive these prefill fast-path flags from the
+    /// committed configs/hw/<fp> profile so they survive a restart instead of
+    /// living in ephemeral env. `…EnvOverridden()` reports whether the ctor saw
+    /// an explicit env value — the profile MUST NOT clobber it, so a debug env
+    /// override always wins. Default: no fast path, so the setters are no-ops
+    /// and nothing was env-overridden.
+    virtual void setF32TcPrefill(bool /*on*/) noexcept {}
+    [[nodiscard]] virtual bool f32TcPrefillEnvOverridden() const noexcept {
+        return false;
+    }
+    virtual void setCublasFp8Prefill(bool /*on*/) noexcept {}
+    [[nodiscard]] virtual bool cublasFp8PrefillEnvOverridden() const noexcept {
+        return false;
+    }
+
     /// Flush any pending appends. Safe to call when there's no
     /// pending work — cheap no-op.
     virtual void sync() = 0;

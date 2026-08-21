@@ -19,13 +19,16 @@ const char* const kBanner =
 
 const char* const kUsage =
     "Usage:\n"
-    "  mimirmind [smoke|serve|parity] [options]\n"
+    "  mimirmind [smoke|serve|parity|quality-gate] [options]\n"
     "\n"
     "Modes:\n"
     "  smoke              Run M1-M5 diagnostics + end-to-end generate (default)\n"
     "  serve              Start the OpenAI-compatible HTTP server\n"
     "  parity             Tensor-parity test: run llama.cpp + mimirmind on\n"
     "                     the same prompt, dump per-block hidden state, diff\n"
+    "  quality-gate       5.19-C lossy-tier gate: greedy A/B of the lossy\n"
+    "                     prefill flags (F32_TC/CUBLAS_FP8) vs the exact path\n"
+    "                     over a DE goldset. --max-new sets decode length.\n"
     "\n"
     "Options:\n"
     "  --config PATH      config.json file (default ./config.json).\n"
@@ -63,6 +66,8 @@ bool parseArgs(int argc, char** argv, CliArgs& out) {
             out.mode = Mode::Serve;
         } else if (m == "parity") {
             out.mode = Mode::Parity;
+        } else if (m == "quality-gate") {
+            out.mode = Mode::QualityGate;
         } else if (m == "-h" || m == "--help") {
             std::cout << kUsage;
             std::exit(0);

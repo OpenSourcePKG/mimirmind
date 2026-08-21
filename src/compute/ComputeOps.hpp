@@ -954,6 +954,16 @@ public:
     [[nodiscard]] virtual std::size_t prefillFlashKTileQ8() const noexcept = 0;
     [[nodiscard]] virtual std::string_view prefillFlashKTileQ8Source() const noexcept = 0;
 
+    /// Layer-2 per-HW-profile apply hook (5.19) for the cuDNN SDPA prefill
+    /// attention path. The runtime may drive it from the committed
+    /// configs/hw/<fp> profile after a fingerprint match; `…EnvOverridden()`
+    /// reports whether the ctor saw an explicit MIMIRMIND_ATTN_CUDNN so the
+    /// profile does not clobber a debug override. Default no-op / not overridden.
+    virtual void setPrefillCudnn(bool /*on*/) noexcept {}
+    [[nodiscard]] virtual bool prefillCudnnEnvOverridden() const noexcept {
+        return false;
+    }
+
     [[nodiscard]] virtual core::config::TriState q8_0ReorderMode() const noexcept = 0;
     [[nodiscard]] virtual std::string_view q8_0ReorderModeName() const noexcept = 0;
     [[nodiscard]] virtual std::size_t q8_0ReorderTensorCount() const noexcept = 0;

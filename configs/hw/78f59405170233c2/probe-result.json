@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "fingerprint": "78f59405170233c2",
+  "model_id": "gb10-blackwell-sm121a",
+  "probe_status": "curated-partial",
+
+  "device": {
+    "backend_kind": "Cuda",
+    "device_name": "NVIDIA GB10",
+    "sm_arch": "sm_121a",
+    "notes": "DGX Spark GB10 (Grace ARM + Blackwell). 128 GB unified LPDDR5x, 273 GB/s. Identity UUID/PCI intentionally omitted from the repo — the fingerprint hash already keys the file; raw device serials never get committed.",
+    "features": {
+      "MutableCommandLists": false,
+      "IntegerDotProduct": true,
+      "IpcHandleExport": true,
+      "UnifiedMemoryHost": true,
+      "MatrixEngine": true
+    }
+  },
+
+  "autotune": [],
+  "_autotune_note": "Empty by design: the CUDA backend has no online GEMM-vs-matvec autotune (dense projections route through cuBLAS, MoE through the specialised NVFP4 / FP4-TC kernels). The `autotune` array is populated only for the L0/Xe-LPG backend, where mimirmind-probe sweeps per-QuantType GEMM-vs-vec. A fingerprint match here is a HIT (visibility + Layer-2 hook) but applies no matmul-variant override.",
+
+  "flags": {
+    "_note": "Deployed known-good perf configuration for this GPU (the mimirmind analogue of vLLM's committed per-GPU config JSONs). `apply:true` = the runtime auto-enables this flag at model load from this profile (Layer-2), so it survives a restart without any env; `apply:false` = advisory only (recorded, not driven) until validated. An explicit env var always overrides (debug wins). `default_on` = already the code default; `env_gated` = only active via env until its apply flips true.",
+    "MIMIRMIND_ATTN_CUDNN":         { "value": 1, "apply": true,  "default_on": true,  "since": "b73c641", "effect": "cuDNN-9 SDPA fused flash prefill attention; hand kernel is the parity-gated fallback. Validated (-19.7% prefill), safe to auto-apply." },
+    "MIMIRMIND_F32_TC_PREFILL":     { "value": 1, "apply": true,  "default_on": false, "effect": "F32 small weights (router / GDN beta-alpha / shexp-router) -> BF16-TC instead of per-row F32 vec. Encoder/reranker protected via ScopedExactF32. PROMOTED apply:true 2026-08-21 after the Increment-C quality-gate (thinking-off answer A/B, DE goldset): factual answers 100% token-exact, the one open-ended divergence was a benign synonym ('Stoffe' vs 'Verbindungen'), no wrong answers. Parity-gated F32-vec fallback." },
+    "MIMIRMIND_CUBLAS_FP8_PREFILL": { "value": 1, "apply": true,  "default_on": false, "lossy": true, "effect": "Dense prefill projections -> FP8 (E4M3) tensor cores. Lossy, parity-gated, BF16/wmma fallback. PROMOTED apply:true 2026-08-21 after the Increment-C quality-gate: factual answers 100% token-exact; the two open-ended divergences were equivalent phrasings/clause-reorderings with identical facts, no wrong answers. Revertible to apply:false." },
+    "MIMIRMIND_TF32_TC":            { "value": 1, "default_on": true,  "effect": "Batched M>1 dense -> TF32-TC (already code-default-on)." },
+    "MIMIRMIND_SHEXP_TC":           { "value": 1, "default_on": true,  "effect": "Shared-expert FP4-TC prefill +12% (already code-default-on)." }
+  },
+
+  "matmul": {
+    "_note": "Kernel-variant picks for this GPU. mimirmind's own decisions — NOT Triton BLOCK_M/N/K tiles, because we run hand-CUDA + cuBLAS/CUTLASS, not a Triton JIT. The shape-keyed tile-param table that vLLM's fused_moe/configs carries is a future field (moe.shape_configs) once we mine CUTLASS / benchmark_moe-style sweeps.",
+    "dense_decode_gemv": "cublas-fp8",
+    "dense_prefill_gemm": "cublas-bf16",
+    "moe_routed_prefill": "fp4-tc-grouped-device-driven",
+    "moe_routed_decode":  "nvfp4-uint4-register-x-warp-topk"
+  },
+
+  "provenance": {
+    "derived": "Hand-curated 2026-08-21 from the live Spark prod deploy, not an automated sweep — hence probe_status=curated-partial.",
+    "grounding_commits": ["b14578b (F32_TC prefill)", "0d0f265 (shexp FP4-TC)", "010a05d (decode MoE campaign)", "b73c641 (cuDNN default-on)"],
+    "grounding_notes": ["project_f32_tc_prefill_branch", "lesson_spark_prod_drops_perf_flags", "decisions/2026-08-21-hw-fingerprint-perf-profiles"],
+    "calibration": "The `flags` block is the vLLM-committed-config analogue and is the actionable content today; the runtime loader currently only consumes fingerprint/model_id/probe_status/autotune, so this file registers as a HIT for visibility. Wiring the loader to APPLY `flags` (Layer-2 value-apply) is roadmap 5.19 Increment A.2. Honest scope: measured prefill win of the flag set is -47.5% on a 3438-tok prompt (10.85s -> 5.70s), ~-24% end-to-end RAG."
+  }
+}
