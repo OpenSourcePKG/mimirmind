@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -142,13 +143,21 @@ int runQualityGate(const CliArgs& args, const mm::core::config::Config& cfg) {
         std::string               text;
         std::vector<std::int32_t> ids;
     };
+    // Thinking OFF: for a "thinking" model (Qwen3.x) the reasoning trace
+    // cascades — a one-token prefill perturbation reshuffles the whole scratch
+    // pad even when the final answer is identical, which makes a full-trace
+    // token compare meaningless. enable_thinking=false makes the model answer
+    // directly, so the A/B measures exactly what matters: does the lossy flag
+    // change the ANSWER. (The prefill perturbation itself is unchanged by the
+    // thinking toggle.) Honoured by the Qwen family; a no-op elsewhere.
     std::vector<Item> items;
     for (const auto& prompt : deGoldset()) {
         const mm::model::ChatMessage msg{mm::model::ChatRole::User, prompt};
         std::vector<mm::model::ChatMessage> msgs{msg};
         items.push_back(
-            {prompt, mm::model::ChatTemplate::encode(style, tok, msgs,
-                                                     /*addGenerationPrompt=*/true)});
+            {prompt, mm::model::ChatTemplate::encode(
+                         style, tok, msgs, /*addGenerationPrompt=*/true,
+                         /*tools=*/{}, /*enableThinking=*/std::optional<bool>{false})});
     }
 
     const std::size_t maxNew = args.maxNew > 0 ? args.maxNew : 32;
@@ -183,7 +192,8 @@ int runQualityGate(const CliArgs& args, const mm::core::config::Config& cfg) {
         }
         std::cout << "\n[gate] determinism check passed (exact-path baseline "
                      "reproduces). maxNew=" << maxNew << ", goldset="
-                  << items.size() << " DE prompts.\n";
+                  << items.size() << " DE prompts, thinking=off "
+                     "(comparing final answers).\n";
     }
 
     // Exact-path baseline once per prompt (deterministic, verified above);
