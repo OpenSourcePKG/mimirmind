@@ -627,6 +627,30 @@ void InferenceEngine::finalizeLoad() {
                 core::backend::BackendRegistry::name(_computeCtx->kind()));
 #endif
 
+    // M-Probe.1 / 5.19 — HW-fingerprint + per-HW profile lookup for the CUDA
+    // backend. The L0 autotune block above already computes the fingerprint and
+    // applies its persisted pick; CUDA has no online GEMM-vs-vec autotune (it
+    // routes dense through cuBLAS and MoE through specialised NVFP4/FP4-TC
+    // kernels), so here we only surface the fingerprint + whether a
+    // configs/hw/<fp> profile is deployed — for operator visibility and as the
+    // hook a future value-apply / Layer-2 loader consumes. See ADR
+    // decisions/2026-08-21-hw-fingerprint-perf-profiles.
+    if (_computeCtx->kind() == core::backend::BackendKind::Cuda) {
+        const std::string fp = core::backend::computeHwFingerprint(
+            core::backend::gatherHostInfo(),
+            core::backend::identityFromBackend(_computeCtx->backend()));
+        const char* dirEnv = std::getenv("MIMIRMIND_PROBE_DIR");
+        const std::string dir =
+            dirEnv ? dirEnv : "/usr/local/share/mimirmind/configs";
+        const auto picks = loadProbePicks(dir, fp);
+        MM_LOG_INFO("probe",
+                    "HW fingerprint={} backend=Cuda — per-HW profile {} under "
+                    "{} (configs/hw/<fp>/probe-result.json)",
+                    fp,
+                    picks ? "FOUND" : "not deployed (run mimirmind-probe)",
+                    dir);
+    }
+
     // Pick the arch backend now that weights are available. Returns
     // nullptr for unsupported architectures so generate() can refuse
     // gracefully with the original architecture string in the error.
