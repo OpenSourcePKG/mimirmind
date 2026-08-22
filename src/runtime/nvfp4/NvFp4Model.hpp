@@ -15,6 +15,10 @@
 #include <string_view>
 #include <vector>
 
+namespace mimirmind::core::safetensors {
+class SafetensorsModel;
+}
+
 namespace mimirmind::runtime::nvfp4 {
 
 namespace safetensors = mimirmind::core::safetensors;
@@ -97,6 +101,9 @@ public:
 private:
     friend NvFp4Model loadNvfp4Model(const std::string& checkpointDir,
                                      DeviceUploader&    uploader);
+    friend NvFp4Model loadNvfp4Model(safetensors::SafetensorsModel& sm,
+                                     const std::string&             configDir,
+                                     DeviceUploader&                uploader);
 
     std::vector<compute::ComputeBuffer>       _buffers;   ///< owns device memory
     std::map<std::string, NvFp4DeviceTensor>  _tensors;   ///< HF name -> device tensor
@@ -117,5 +124,16 @@ private:
  */
 [[nodiscard]] NvFp4Model loadNvfp4Model(const std::string& checkpointDir,
                                         DeviceUploader&    uploader);
+
+/**
+ * Attach variant: upload + assemble from an ALREADY-OPEN SafetensorsModel
+ * (e.g. reconstructed from shm memfd chunks on the M-Munin.CUDA attach path)
+ * instead of opening the shards from disk. `configDir` is still the local
+ * checkpoint directory — hf_quant_config.json is read from there. `sm` must
+ * outlive the call (its tensor spans are read during upload).
+ */
+[[nodiscard]] NvFp4Model loadNvfp4Model(safetensors::SafetensorsModel& sm,
+                                        const std::string&             configDir,
+                                        DeviceUploader&                uploader);
 
 } // namespace mimirmind::runtime::nvfp4

@@ -493,6 +493,85 @@ void InferenceEngine::loadModelAttached(
     finalizeLoad();
 }
 
+void InferenceEngine::loadModelAttachedNvfp4(
+        std::string_view                     checkpointDir,
+        std::string_view                     tokenizerGguf,
+        const core::ipc::TensorManifest&     manifest,
+        std::span<void* const>               chunkBases) {
+#ifndef MIMIRMIND_HAVE_CUDA
+    (void)checkpointDir;
+    (void)tokenizerGguf;
+    (void)manifest;
+    (void)chunkBases;
+    throw std::runtime_error("InferenceEngine::loadModelAttachedNvfp4: NVFP4 "
+                             "attach requires the CUDA backend (built without "
+                             "MIMIRMIND_ENABLE_CUDA)");
+#else
+    if (_modelLoaded) {
+        throw std::runtime_error("InferenceEngine: model already loaded");
+    }
+    if (manifest.format != "nvfp4") {
+        throw std::runtime_error(
+            "InferenceEngine::loadModelAttachedNvfp4: manifest.format is '" +
+            manifest.format + "', expected 'nvfp4'");
+    }
+    if (manifest.shards.empty()) {
+        throw std::runtime_error("InferenceEngine::loadModelAttachedNvfp4: "
+                                 "manifest.shards is empty — nothing to attach");
+    }
+
+    // Refuse-on-drift: every shard Munin advertised must match a local file of
+    // the same size under checkpointDir (the worker still has the checkpoint
+    // mounted for config.json / tokenizer.json). Catches a wrong or renamed
+    // checkpoint on the worker before we dereference the wrong bytes.
+    const std::filesystem::path dir{std::string{checkpointDir}};
+    for (const auto& sh : manifest.shards) {
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(dir / sh.name, ec);
+        if (ec || sz != sh.bytes) {
+            throw std::runtime_error(
+                "InferenceEngine::loadModelAttachedNvfp4: local shard '" +
+                sh.name + "' missing or size " + std::to_string(ec ? 0 : sz) +
+                " != Munin-advertised " + std::to_string(sh.bytes) +
+                " — wrong checkpoint mounted on the worker, or Munin loaded a "
+                "different revision. Refusing attach.");
+        }
+    }
+
+    // Reconstruct the checkpoint from the imported shm chunks — each shard's
+    // raw *.safetensors image is a span inside chunkBases[chunkIndex].
+    std::vector<core::safetensors::SafetensorsModel::ShardImage> images;
+    images.reserve(manifest.shards.size());
+    for (const auto& sh : manifest.shards) {
+        if (sh.chunkIndex >= chunkBases.size()) {
+            throw std::runtime_error(
+                "InferenceEngine::loadModelAttachedNvfp4: shard '" + sh.name +
+                "' references chunk " + std::to_string(sh.chunkIndex) +
+                " but only " + std::to_string(chunkBases.size()) +
+                " chunk base(s) were imported");
+        }
+        const auto* base = static_cast<const std::uint8_t*>(chunkBases[sh.chunkIndex]);
+        images.push_back({sh.name,
+                          std::span<const std::uint8_t>(base + sh.chunkOffset, sh.bytes)});
+    }
+    core::safetensors::SafetensorsModel sm;
+    sm.openFromShards(
+        std::span<const core::safetensors::SafetensorsModel::ShardImage>(
+            images.data(), images.size()),
+        manifest.declaredTotalSize);
+
+    MM_LOG_INFO("engine",
+                "loadModelAttachedNvfp4: reconstructed {} shard(s) ({} tensors) "
+                "from shm, materialising via the NVFP4 loader",
+                images.size(), sm.tensorCount());
+
+    // The materialization reads the shards from `sm` (shm-backed) and uploads
+    // BF16 to the device; the text sidecars come from the local checkpointDir.
+    engine::Nvfp4Loader::load(*this, checkpointDir, tokenizerGguf, &sm);
+    finalizeLoad();
+#endif // MIMIRMIND_HAVE_CUDA
+}
+
 void InferenceEngine::finalizeLoad() {
     // Bake the final-logit softcap from LlmConfig into the engine field
     // that the sampler + spec-dec verify read. `MIMIRMIND_DISABLE_SOFTCAP=1`

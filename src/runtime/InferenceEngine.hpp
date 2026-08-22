@@ -252,6 +252,23 @@ public:
                            const core::ipc::TensorManifest&        manifest,
                            std::span<void* const>                  chunkBases);
 
+    /**
+     * Attached-mode load for an NVFP4 checkpoint (M-Munin.CUDA / GB10). The
+     * manifest (`format=="nvfp4"`) describes the raw *.safetensors shards
+     * held in the imported shm chunks; this reconstructs a SafetensorsModel
+     * from those spans and runs the standard NVFP4 materialization
+     * (`Nvfp4Loader::load`) against it, reading the small text sidecars
+     * (config.json / hf_quant_config.json / tokenizer.json) locally from
+     * `checkpointDir`. As a refuse-on-drift check, every manifest shard must
+     * match a local file of the same size under `checkpointDir`. `tokenizerGguf`
+     * (optional) overrides the checkpoint's tokenizer.json. Throws on a
+     * non-CUDA backend, a format/shard mismatch, or a malformed checkpoint.
+     */
+    void loadModelAttachedNvfp4(std::string_view                    checkpointDir,
+                                std::string_view                    tokenizerGguf,
+                                const core::ipc::TensorManifest&    manifest,
+                                std::span<void* const>              chunkBases);
+
     [[nodiscard]] bool modelLoaded() const noexcept { return _modelLoaded; }
 
     /**

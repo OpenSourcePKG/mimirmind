@@ -13,12 +13,10 @@
 #include "core/backend/BackendRegistry.hpp"
 #include "core/config/Config.hpp"
 #ifdef MIMIRMIND_HAVE_L0
-#ifdef MIMIRMIND_HAVE_L0
 #include "core/ipc/MuninClient.hpp"
 #endif
 #ifdef MIMIRMIND_HAVE_CUDA
 #include "core/ipc/ShmMuninClient.hpp"
-#endif
 #endif
 #include "core/log/Log.hpp"
 #include "core/os/GovernorLock.hpp"
@@ -480,9 +478,18 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             return false;
         }
         try {
-            e.loadModelAttached(
-                m.path, result->manifest,
-                std::span<void* const>{result->chunkBases});
+            if (result->manifest.format == "nvfp4") {
+                // GB10 shm attach of an NVFP4 checkpoint: the chunks hold the
+                // raw safetensors shards; the engine reconstructs them and runs
+                // the NVFP4 materialization.
+                e.loadModelAttachedNvfp4(
+                    m.path, m.tokenizerGguf, result->manifest,
+                    std::span<void* const>{result->chunkBases});
+            } else {
+                e.loadModelAttached(
+                    m.path, result->manifest,
+                    std::span<void* const>{result->chunkBases});
+            }
         } catch (const std::exception& x) {
             std::cerr << "serve: loadModelAttached('" << m.id
                       << "') failed: " << x.what() << "\n";

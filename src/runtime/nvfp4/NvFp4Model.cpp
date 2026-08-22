@@ -50,10 +50,15 @@ const NvFp4DeviceWeight* NvFp4Model::weight(std::string_view module) const noexc
 }
 
 NvFp4Model loadNvfp4Model(const std::string& checkpointDir, DeviceUploader& uploader) {
-    const fs::path dir{checkpointDir};
-
     safetensors::SafetensorsModel sm;
     sm.open(checkpointDir); // throws on a missing/malformed checkpoint
+    return loadNvfp4Model(sm, checkpointDir, uploader);
+}
+
+NvFp4Model loadNvfp4Model(safetensors::SafetensorsModel& sm,
+                          const std::string&             configDir,
+                          DeviceUploader&                uploader) {
+    const fs::path dir{configDir};
 
     // ModelOpt checkpoints (qwen35moe) ship an hf_quant_config.json driving the
     // assembler's per-module scheme lookup. compressed-tensors checkpoints

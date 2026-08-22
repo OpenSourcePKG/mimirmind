@@ -43,7 +43,8 @@ namespace mimirmind::runtime::engine {
 
 #ifndef MIMIRMIND_HAVE_CUDA
 
-void Nvfp4Loader::load(InferenceEngine&, std::string_view, std::string_view) {
+void Nvfp4Loader::load(InferenceEngine&, std::string_view, std::string_view,
+                       core::safetensors::SafetensorsModel*) {
     throw std::runtime_error("Nvfp4Loader::load: NVFP4 requires the CUDA "
                              "backend (built without MIMIRMIND_ENABLE_CUDA)");
 }
@@ -83,9 +84,10 @@ bool isGemma4Config(const std::string& configText) {
 
 } // namespace
 
-void Nvfp4Loader::load(InferenceEngine& e,
-                       std::string_view checkpointDir,
-                       std::string_view tokenizerGguf) {
+void Nvfp4Loader::load(InferenceEngine&                     e,
+                       std::string_view                     checkpointDir,
+                       std::string_view                     tokenizerGguf,
+                       core::safetensors::SafetensorsModel* attachedSm) {
     if (e._computeCtx->kind() != core::backend::BackendKind::Cuda) {
         throw std::runtime_error("Nvfp4Loader::load: NVFP4 needs the CUDA "
                                  "backend, but this engine picked another");
@@ -126,10 +128,12 @@ void Nvfp4Loader::load(InferenceEngine& e,
 
         runtime::nvfp4::ComputeOpsUploader uploader(*e._ops);
         e._nvfp4Model = std::make_unique<runtime::nvfp4::NvFp4Model>(
-            runtime::nvfp4::loadNvfp4Model(dir, uploader));
+            attachedSm ? runtime::nvfp4::loadNvfp4Model(*attachedSm, dir, uploader)
+                       : runtime::nvfp4::loadNvfp4Model(dir, uploader));
 
-        core::safetensors::SafetensorsModel sm;
-        sm.open(dir);
+        core::safetensors::SafetensorsModel localSm;
+        if (attachedSm == nullptr) localSm.open(dir);
+        core::safetensors::SafetensorsModel& sm = attachedSm ? *attachedSm : localSm;
         core::modelopt::Gemma4Arch garch;
         garch.numLayers = static_cast<int>(e._config.blockCount);
         garch.isFullAttn.assign(e._config.blockCount, false);
@@ -244,11 +248,13 @@ void Nvfp4Loader::load(InferenceEngine& e,
     // 3. Upload the NVFP4/FP8 weights (+ BF16 passthroughs) to the device.
     runtime::nvfp4::ComputeOpsUploader uploader(*e._ops);
     e._nvfp4Model = std::make_unique<runtime::nvfp4::NvFp4Model>(
-        runtime::nvfp4::loadNvfp4Model(dir, uploader));
+        attachedSm ? runtime::nvfp4::loadNvfp4Model(*attachedSm, dir, uploader)
+                   : runtime::nvfp4::loadNvfp4Model(dir, uploader));
 
     // 4. Build the materialization plan (tensor shapes + per-module schemes).
-    core::safetensors::SafetensorsModel sm;
-    sm.open(dir);
+    core::safetensors::SafetensorsModel localSm;
+    if (attachedSm == nullptr) localSm.open(dir);
+    core::safetensors::SafetensorsModel& sm = attachedSm ? *attachedSm : localSm;
     const core::modelopt::Qwen3_5MoeArch arch{
         static_cast<int>(e._config.blockCount),
         static_cast<int>(e._config.expertCount),

@@ -8,6 +8,9 @@
 namespace mimirmind::runtime {
 class InferenceEngine;
 }
+namespace mimirmind::core::safetensors {
+class SafetensorsModel;
+}
 
 namespace mimirmind::runtime::engine {
 
@@ -28,9 +31,17 @@ public:
     /// Populate `engine` from the NVFP4 checkpoint at `checkpointDir`, taking
     /// the tokenizer from `tokenizerGguf`. Throws on a non-CUDA backend or a
     /// malformed checkpoint. Does NOT call finalizeLoad().
-    static void load(InferenceEngine& engine,
-                     std::string_view checkpointDir,
-                     std::string_view tokenizerGguf);
+    ///
+    /// `attachedSm` is the M-Munin.CUDA attach hook: when non-null, the
+    /// safetensors shards are read from that already-open SafetensorsModel
+    /// (reconstructed from shm memfd chunks) instead of from disk. The small
+    /// text sidecars (config.json / hf_quant_config.json / tokenizer.json)
+    /// are still read locally from `checkpointDir`. `attachedSm` must outlive
+    /// the call.
+    static void load(InferenceEngine&                     engine,
+                     std::string_view                     checkpointDir,
+                     std::string_view                     tokenizerGguf,
+                     core::safetensors::SafetensorsModel* attachedSm = nullptr);
 };
 
 } // namespace mimirmind::runtime::engine
