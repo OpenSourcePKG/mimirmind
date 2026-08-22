@@ -7,6 +7,7 @@
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/TensorFingerprint.hpp"
 #include "core/gguf/WeightsMap.hpp"
+#include "core/safetensors/SafetensorsModel.hpp"
 #include "core/ipc/ShmIpcExporter.hpp"
 #include "core/ipc/ShmMuninClient.hpp"
 #include "core/ipc/TensorManifest.hpp"
@@ -33,6 +34,7 @@
 #include <cstring>
 #include <exception>
 #include <expected>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <string_view>
@@ -50,6 +52,7 @@ using ::mimirmind::core::ipc::TensorManifest;
 using ::mimirmind::core::ipc::UnixSocketFrame;
 using ::mimirmind::core::gguf::WeightsMap;
 using ::mimirmind::core::ipc::ShmMuninClient;
+using ::mimirmind::core::safetensors::SafetensorsModel;
 using ::mimirmind::munin::ShmAttachSession;
 using ::mimirmind::munin::ShmChunkAllocator;
 using ::mimirmind::munin::ShmLoadedModel;
@@ -1043,6 +1046,136 @@ TEST(shmSocketServer_realSocket_attachResolves) {
     server.stop();
     serveThread.join();
     ::unlink(sockPath.c_str());
+}
+
+// ---- NVFP4 shm attach: ShmModelStore -> ShmAttachSession -> shards ----------
+//
+// The full NVFP4 shm data path host-side: ShmModelStore loads a synthesized
+// NVFP4 (safetensors) checkpoint into memfd chunks, ShmAttachSession ships the
+// shard manifest + chunks, ShmMuninClient imports them, and the worker
+// reconstructs the exact SafetensorsModel — sourced from shm — that the NVFP4
+// loader consumes. Only the CUDA materialization of that model is left for
+// on-box (brick 3c).
+
+namespace {
+
+std::vector<std::uint8_t> buildSafetensors(const std::string&               header,
+                                           const std::vector<std::uint8_t>& data) {
+    std::vector<std::uint8_t> buf(sizeof(std::uint64_t));
+    const std::uint64_t n = header.size();
+    std::memcpy(buf.data(), &n, sizeof(n));
+    buf.insert(buf.end(), header.begin(), header.end());
+    buf.insert(buf.end(), data.begin(), data.end());
+    return buf;
+}
+
+void writeBinaryFile(const std::filesystem::path& p, const std::vector<std::uint8_t>& b) {
+    std::ofstream os(p, std::ios::binary | std::ios::trunc);
+    os.write(reinterpret_cast<const char*>(b.data()),
+             static_cast<std::streamsize>(b.size()));
+}
+
+// Minimal 2-shard NVFP4-like safetensors checkpoint under /tmp: shard 1 holds
+// tensor "x" (U8[4], 0x10..), shard 2 holds "z" (U8[4], 0xC0..). Returns dir.
+std::string writeTempNvfp4Checkpoint() {
+    namespace fs = std::filesystem;
+    fs::path dir = fs::path("/tmp") / ("munin_nvfp4_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    std::vector<std::uint8_t> dx(4);
+    for (std::uint8_t i = 0; i < 4; ++i) dx[i] = static_cast<std::uint8_t>(0x10 + i);
+    writeBinaryFile(dir / "model-00001-of-00002.safetensors",
+                    buildSafetensors(
+                        R"({"x.weight":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}})", dx));
+
+    std::vector<std::uint8_t> dz(4);
+    for (std::uint8_t i = 0; i < 4; ++i) dz[i] = static_cast<std::uint8_t>(0xC0 + i);
+    writeBinaryFile(dir / "model-00002-of-00002.safetensors",
+                    buildSafetensors(
+                        R"({"z.weight":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}})", dz));
+
+    const std::string index =
+        R"({"metadata":{"total_size":8},"weight_map":{)"
+        R"("x.weight":"model-00001-of-00002.safetensors",)"
+        R"("z.weight":"model-00002-of-00002.safetensors"}})";
+    std::ofstream ij(dir / "model.safetensors.index.json", std::ios::trunc);
+    ij << index;
+    ij.close();
+
+    return dir.string();
+}
+
+} // namespace
+
+TEST(shmNvfp4_endToEnd_attachReconstructsShards) {
+    const std::string ckpt = writeTempNvfp4Checkpoint();
+
+    ::mimirmind::core::config::Config cfg{};
+    ::mimirmind::core::config::ModelEntry me{};
+    me.id          = "qwen-nvfp4";
+    me.path        = ckpt;
+    me.loadOnStart = true;
+    me.format      = ::mimirmind::core::config::ModelFormat::Nvfp4;
+    cfg.models.push_back(me);
+
+    // NVFP4 path sizes its own chunks; the default arg is only used for GGUF.
+    ShmModelStore store{cfg};
+    EXPECT_EQ(store.size(), 1U);
+    const auto* lm = store.find("qwen-nvfp4");
+    EXPECT_TRUE(lm != nullptr);
+    if (lm != nullptr) {
+        EXPECT_TRUE(lm->isNvfp4);
+        EXPECT_EQ(lm->shards.size(), 2U);
+    }
+
+    SocketPair sp;
+    std::thread server([&] {
+        ShmAttachSession session{sp.a, ::getpid(), /*sessionId=*/1, store};
+        session.run();
+    });
+
+    ShmMuninClient client;
+    auto res = client.attachOnConnectedFd(sp.b, "qwen-nvfp4");
+
+    EXPECT_TRUE(static_cast<bool>(res));
+    if (res) {
+        sp.b = -1;
+        EXPECT_EQ(res->manifest.format,            "nvfp4");
+        EXPECT_EQ(res->manifest.shards.size(),     2U);
+        EXPECT_EQ(res->manifest.declaredTotalSize, std::uint64_t{8});
+
+        // Reconstruct the checkpoint from the imported shm chunks and verify
+        // every tensor reads back the exact bytes the daemon loaded.
+        std::vector<SafetensorsModel::ShardImage> imgs;
+        for (const auto& sh : res->manifest.shards) {
+            const auto* base =
+                static_cast<const std::uint8_t*>(res->chunkBases[sh.chunkIndex]);
+            imgs.push_back({sh.name,
+                            std::span<const std::uint8_t>(base + sh.chunkOffset, sh.bytes)});
+        }
+        SafetensorsModel model;
+        model.openFromShards(
+            std::span<const SafetensorsModel::ShardImage>(imgs.data(), imgs.size()),
+            res->manifest.declaredTotalSize);
+
+        EXPECT_EQ(model.tensorCount(),      2U);
+        EXPECT_EQ(model.declaredTotalSize(), std::uint64_t{8});
+
+        const auto xb = model.tensorBytes("x.weight");
+        EXPECT_EQ(xb.size(), std::size_t{4});
+        EXPECT_EQ(xb[0], std::uint8_t{0x10});
+        EXPECT_EQ(xb[3], std::uint8_t{0x13});
+        const auto zb = model.tensorBytes("z.weight");
+        EXPECT_EQ(zb.size(), std::size_t{4});
+        EXPECT_EQ(zb[0], std::uint8_t{0xC0});
+        EXPECT_EQ(zb[3], std::uint8_t{0xC3});
+    }
+
+    client.detach();
+    server.join();
+    sp.a = -1;
+    std::filesystem::remove_all(ckpt);
 }
 
 int main() {

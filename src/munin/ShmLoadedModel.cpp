@@ -27,6 +27,16 @@ namespace mimirmind::munin {
         m.chunks.push_back(cd);
     }
 
+    if (isNvfp4) {
+        // NVFP4: the chunks hold raw *.safetensors images; ship the shard
+        // list so the worker can wrap each span and openFromShards.
+        m.format            = "nvfp4";
+        m.declaredTotalSize = declaredTotalSize;
+        m.shards            = shards;
+        return m;
+    }
+
+    // GGUF: per-tensor {chunkIndex, chunkOffset}.
     const auto& ts = reader->tensors();
     m.tensors.reserve(ts.size());
     for (const auto& t : ts) {

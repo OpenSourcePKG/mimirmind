@@ -149,7 +149,14 @@ bool ShmAttachSession::handleAttach(std::string_view modelId) noexcept {
         sendErrorAndClose(msg);
         return false;
     }
-    if (lm->reader == nullptr || lm->reader->tensorCount() == 0) {
+    if (lm->isNvfp4) {
+        if (lm->shards.empty()) {
+            std::string msg{"attach: NVFP4 model '"};
+            msg.append(lm->id).append("' has no shards — Munin load is inconsistent");
+            sendErrorAndClose(msg);
+            return false;
+        }
+    } else if (lm->reader == nullptr || lm->reader->tensorCount() == 0) {
         std::string msg{"attach: model '"};
         msg.append(lm->id).append("' has no tensors — Munin load is inconsistent");
         sendErrorAndClose(msg);
@@ -205,11 +212,15 @@ bool ShmAttachSession::handleAttach(std::string_view modelId) noexcept {
     }
 
     _attachedModelId = std::string{modelId};
+    const std::size_t unitCount =
+        lm->isNvfp4 ? lm->shards.size()
+                    : (lm->reader ? lm->reader->tensorCount() : 0);
     MM_LOG_INFO("munin",
-                "shm-session#{}: attach ok, model='{}' tensors={} chunks={} "
+                "shm-session#{}: attach ok, model='{}' {}={} chunks={} "
                 "fingerprint='{}'",
                 _sessionId, _attachedModelId,
-                lm->reader->tensorCount(), handles.size(), lm->fingerprint);
+                lm->isNvfp4 ? "shards" : "tensors",
+                unitCount, handles.size(), lm->fingerprint);
     return true;
 }
 

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace mimirmind::munin {
 
@@ -35,13 +36,27 @@ struct ShmLoadedModel {
     std::string                        fingerprint{};
     std::uint64_t                      totalBytes{0};
     std::unique_ptr<ShmChunkAllocator> chunks{};
+
+    // ---- GGUF mode -------------------------------------------------------
+    // Populated for a GGUF model (format ""/"gguf"): the reader holds the
+    // per-tensor {chunkIndex, chunkOffset}. Null in NVFP4 mode.
     std::unique_ptr<::mimirmind::core::gguf::GgufReader> reader{};
 
+    // ---- NVFP4 mode ------------------------------------------------------
+    // Populated for an NVFP4 (compressed-tensors safetensors) checkpoint:
+    // the chunks hold each shard's raw *.safetensors image and `shards`
+    // describes them. The worker reconstructs a SafetensorsModel via
+    // SafetensorsModel::openFromShards and runs the NVFP4 materialization.
+    bool                                    isNvfp4{false};
+    std::vector<::mimirmind::core::ipc::ShardDesc> shards{};
+    std::uint64_t                           declaredTotalSize{0};
+
     /**
-     * Build the wire manifest (v2): one ChunkDesc per shm chunk (used-byte
-     * footprint) plus every tensor's {name, type, dims, bytes, chunkIndex,
-     * chunkOffset}. The worker pairs it with the imported chunk bases to
-     * resolve each tensor pointer. Mirrors LoadedModel::buildManifest.
+     * Build the wire manifest. GGUF mode (v2): one ChunkDesc per shm chunk
+     * plus every tensor's {name, type, dims, bytes, chunkIndex, chunkOffset}.
+     * NVFP4 mode: format="nvfp4", the same ChunkDescs, plus the shard list +
+     * declaredTotalSize (no per-tensor entries). The worker resolves against
+     * the imported chunk bases either way. Mirrors LoadedModel::buildManifest.
      */
     [[nodiscard]] ::mimirmind::core::ipc::TensorManifest buildManifest() const;
 };
