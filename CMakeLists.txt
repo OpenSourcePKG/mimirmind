@@ -1563,6 +1563,23 @@ target_include_directories(ipc_tests PRIVATE tests)
 
 target_link_libraries(ipc_tests PRIVATE mimirmind_core_common)
 
+# ---- serving_tests — pure-CPU tests for the M-Munin.3 model cache ----------
+#
+# runtime::serving::AttachedModelPool (per-request model switch: LRU
+# materialize/evict cache) is a header-only template exercised with a fake
+# payload — no GPU. Covers hit/switch/evict, LRU with K>1, pin-blocks-eviction,
+# concurrent-same-model-materializes-once, and factory-failure recovery.
+#
+# Run via:   cmake --build build --target serving_tests && build/serving_tests
+
+add_executable(serving_tests
+    tests/serving_tests.cpp
+)
+
+target_include_directories(serving_tests PRIVATE tests)
+
+target_link_libraries(serving_tests PRIVATE mimirmind_core_common)
+
 # ---- munin_tests — Munin wire-op layer + ChunkAllocator layout math --------
 #
 # Covers RequestEnvelope, HealthzResponse, error-envelope helpers, and
