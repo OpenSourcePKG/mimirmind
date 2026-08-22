@@ -1,0 +1,136 @@
+# docker-compose.munin-shm.yml — attached deploy for M-Munin.CUDA (GB10 / POSIX-shm).
+#
+# The CUDA/GB10 counterpart of docker-compose.munin.yml. Instead of L0 IPC
+# handles, Munin holds the models in POSIX-shm (memfd host RAM) and passes the
+# fds over the socket; the attached worker mmaps them and hands the pointers
+# straight to CUDA kernels (GB10 pageableMemAccess + hostPageTables). Same
+# business case: a worker redeploy pulls the small image again while Munin
+# stays up, so the multi-minute model load becomes a ~2 s worker restart.
+#
+# Key differences vs the L0 compose:
+#   - The munin-shm daemon touches NO GPU — ShmModelStore/ShmAttachSession are
+#     pure host code. No /dev/nvidia*, no CUDA runtime, no governor/sysfs.
+#   - Only the worker reserves the GPU (NVIDIA runtime).
+#
+# Prerequisites:
+#   - Prebuilt images (registry push done by the user):
+#       ${MUNIN_SHM_IMAGE:-munin-shm:latest}  — the tiny host-only daemon image
+#       ${MIMIRMIND_IMAGE:-mimirmind:latest}  — the full CUDA inference image
+#   - GGUFs under ${MIMIRMIND_MODELS_DIR} (default: ./models)
+#   - Host config under ${MIMIRMIND_CONFIG_HOST} (default: ./config.json)
+#
+# Bringup:
+#   docker compose -f docker-compose.munin-shm.yml up -d munin-shm
+#   docker compose -f docker-compose.munin-shm.yml logs -f munin-shm
+#   # Expected: "ShmModelStore: N model(s) resident in shm"
+#   docker compose -f docker-compose.munin-shm.yml up -d mimirmind
+#
+# Worker redeploy (the business case):
+#   docker compose -f docker-compose.munin-shm.yml pull mimirmind
+#   docker compose -f docker-compose.munin-shm.yml up -d mimirmind
+#   # Munin keeps the memfds; the new worker re-mmaps them over SCM_RIGHTS.
+
+services:
+
+    # ------------------------------------------------------------------
+    # munin-shm — persistent model-memory daemon (POSIX-shm transport).
+    #             Long-lived, holds all loadOnStart models in memfd host
+    #             RAM and exports the fds to attached workers. No GPU.
+    # ------------------------------------------------------------------
+    munin-shm:
+        image: ${MUNIN_SHM_IMAGE:-munin-shm:latest}
+        container_name: mimirmind-munin-shm
+        pull_policy: always
+        restart: unless-stopped
+
+        # No devices, no CUDA runtime, no sysfs — the daemon computes nothing
+        # and never touches the GPU (see the ADR hard-no list).
+
+        volumes:
+            # Shared socket. Both containers see the same inode through the
+            # named volume; the memfds ride over it via SCM_RIGHTS.
+            - mimirmind_run:/var/run/mimirmind
+
+            # Models read-only. Munin opens the GGUFs, copies the tensors into
+            # memfd host RAM, and closes the mmap.
+            - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
+
+            # Config bind mount — Munin reads runtime.* + models.* from the
+            # same config.json as the worker.
+            - ${MIMIRMIND_CONFIG_HOST:-./config.json}:/etc/mimirmind/config.json:ro
+
+        command:
+            - --config
+            - /etc/mimirmind/config.json
+            - --socket
+            - /var/run/mimirmind/munin.sock
+
+        # Socket existence proves listen() ran — the daemon only binds once
+        # the ShmModelStore has finished loading every model.
+        healthcheck:
+            test: ["CMD", "test", "-S", "/var/run/mimirmind/munin.sock"]
+            interval: 5s
+            timeout: 2s
+            retries: 60
+            start_period: 180s   # allow slow initial model load
+
+    # ------------------------------------------------------------------
+    # mimirmind — attached CUDA inference worker.
+    #             Short-lived, uses shm attach over the Munin socket
+    #             instead of its own weight load.
+    # ------------------------------------------------------------------
+    mimirmind:
+        image: ${MIMIRMIND_IMAGE:-mimirmind:latest}
+        container_name: mimirmind-worker
+        pull_policy: always
+        restart: "no"
+
+        depends_on:
+            munin-shm:
+                condition: service_healthy
+
+        # NVIDIA GPU for the compute backend. The worker dereferences the
+        # mmap'd memfd host pointers directly on the SMs.
+        deploy:
+            resources:
+                reservations:
+                    devices:
+                        - driver: nvidia
+                          count: all
+                          capabilities: [gpu]
+
+        volumes:
+            - mimirmind_run:/var/run/mimirmind
+
+            # Header parse (LlmConfig + tokenizer + fingerprint verify) still
+            # opens the GGUF; the tensor bytes come over shm from Munin.
+            - ${MIMIRMIND_MODELS_DIR:-./models}:/models:ro
+
+            - ./run-logs:/logs:rw
+            - ${MIMIRMIND_STATE_DIR:-./run-state}:/root/.cache/mimirmind:rw
+
+            # Config identical to Munin's — a diverging models[].path trips the
+            # fingerprint-refuse path.
+            - ${MIMIRMIND_CONFIG_HOST:-./config.json}:/etc/mimirmind/config.json:ro
+
+        command:
+            - serve
+            - --config
+            - /etc/mimirmind/config.json
+            - --attach
+            - unix:/var/run/mimirmind/munin.sock
+
+        ports:
+            - "${MIMIRMIND_PORT:-8080}:8080"
+
+        stdin_open: true
+        tty: true
+
+volumes:
+    # tmpfs for fast fd passing; /var/run semantics (not persisted across a
+    # host reboot).
+    mimirmind_run:
+        driver: local
+        driver_opts:
+            type: tmpfs
+            device: tmpfs

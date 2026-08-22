@@ -15,6 +15,7 @@
 #include "munin/ShmChunkAllocator.hpp"
 #include "munin/ShmLoadedModel.hpp"
 #include "munin/ShmModelStore.hpp"
+#include "munin/ShmSocketServer.hpp"
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -28,6 +29,7 @@
 #include <cstdint>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
 #include <exception>
 #include <expected>
@@ -52,6 +54,7 @@ using ::mimirmind::munin::ShmAttachSession;
 using ::mimirmind::munin::ShmChunkAllocator;
 using ::mimirmind::munin::ShmLoadedModel;
 using ::mimirmind::munin::ShmModelStore;
+using ::mimirmind::munin::ShmSocketServer;
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
@@ -916,6 +919,78 @@ TEST(shmDaemon_endToEnd_realSessionAndClient) {
     client.detach();
     server.join();
     sp.a = -1;  // ShmAttachSession's destructor already closed it
+}
+
+// ---- ShmSocketServer over a real filesystem socket --------------------------
+//
+// The full munin-shm accept loop (bind + listen + accept -> ShmAttachSession
+// per connection) against ShmMuninClient::attach() over a real AF_UNIX socket
+// path — the step-4b daemon plumbing end-to-end, not a socketpair. This is the
+// same code the munin_shm executable runs.
+
+TEST(shmSocketServer_realSocket_attachResolves) {
+    const std::string gguf = writeTempGguf(makeMinimalGguf());
+
+    ::mimirmind::core::config::Config cfg{};
+    ::mimirmind::core::config::ModelEntry me{};
+    me.id          = "test-shm-model";
+    me.path        = gguf;
+    me.loadOnStart = true;
+    cfg.models.push_back(me);
+
+    ShmModelStore store{cfg, /*chunkBytes=*/8192};
+    ::unlink(gguf.c_str());
+
+    const std::string sockPath =
+        "/tmp/munin_shm_srv_" + std::to_string(::getpid()) + ".sock";
+    ::unlink(sockPath.c_str());
+
+    ShmSocketServer server{store, sockPath};
+    std::thread serveThread([&] { server.serve(/*shutdownEventFd=*/-1); });
+
+    // Attach, retrying until the accept loop is listening (bounded ~2s).
+    ShmMuninClient client;
+    std::expected<ShmMuninClient::AttachResult, std::string> res =
+        std::unexpected(std::string{"not attempted"});
+    for (int i = 0; i < 200; ++i) {
+        res = client.attach(sockPath, "test-shm-model");
+        if (res) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    EXPECT_TRUE(static_cast<bool>(res));
+    if (res) {
+        WeightsMap wm = WeightsMap::fromAttachedChunked(
+            res->manifest, std::span<void* const>{res->chunkBases});
+        EXPECT_EQ(wm.size(), 3U);
+
+        const char*        names[3]  = {"a", "bb", "ccc"};
+        const std::uint8_t expect[3] = {0x11, 0x22, 0x33};
+        for (int i = 0; i < 3; ++i) {
+            const auto* t = wm.find(names[i]);
+            EXPECT_TRUE(t != nullptr);
+            if (t != nullptr) {
+                const auto* p = static_cast<const std::uint8_t*>(t->usmPtr);
+                bool ok = p != nullptr;
+                for (std::uint64_t k = 0; ok && k < 8000; ++k)
+                    if (p[k] != expect[i]) { ok = false; }
+                EXPECT_TRUE(ok);
+            }
+        }
+
+        // Healthz over a fresh connection reports the resident model.
+        auto hz = ShmMuninClient::healthz(sockPath);
+        EXPECT_TRUE(static_cast<bool>(hz));
+        if (hz) {
+            EXPECT_EQ(hz->models.size(), 1U);
+            EXPECT_EQ(hz->governorOwner, "munin");
+        }
+    }
+
+    client.detach();
+    server.stop();
+    serveThread.join();
+    ::unlink(sockPath.c_str());
 }
 
 int main() {

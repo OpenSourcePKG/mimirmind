@@ -376,8 +376,10 @@ add_library(mimirmind_core_common STATIC
     src/core/ipc/WireOps.cpp
     src/munin/ShmAttachSession.cpp
     src/munin/ShmChunkAllocator.cpp
+    src/munin/ShmDaemon.cpp
     src/munin/ShmLoadedModel.cpp
     src/munin/ShmModelStore.cpp
+    src/munin/ShmSocketServer.cpp
     src/core/modelopt/BlockScaleSwizzle.cpp
     src/core/modelopt/HfQuantConfig.cpp
     src/core/modelopt/ModelOptQuant.cpp
@@ -1355,6 +1357,23 @@ if(MIMIRMIND_ENABLE_L0)
 
     target_link_libraries(munin PRIVATE mimirmind_core_l0)
 endif()
+
+# ---- munin-shm — the CUDA/GB10 (POSIX-shm) Munin daemon ---------------------
+#
+# The counterpart to `munin` for the shm transport (ADR 2026-08-14). Holds
+# models in memfd host RAM and exports them over an AF_UNIX socket to attached
+# workers, which mmap the memfds and hand the pointers straight to CUDA kernels
+# (GB10 pageableMemAccess + hostPageTables). The daemon itself touches no GPU —
+# ShmModelStore / ShmAttachSession / ShmSocketServer / ShmDaemon are pure host
+# code in mimirmind_core_common — so it builds and runs on any host (no L0, no
+# CUDA gate). Only the attaching worker needs the CUDA backend.
+#
+# Run via:
+#   docker compose run --rm munin-shm --config /etc/mimirmind/config.json
+add_executable(munin_shm
+    src/munin/main_shm.cpp
+)
+target_link_libraries(munin_shm PRIVATE mimirmind_core_common)
 
 # ---- Pure-CPU test binaries — always built ---------------------------------
 #
