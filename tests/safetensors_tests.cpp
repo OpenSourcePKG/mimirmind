@@ -12,6 +12,7 @@
 #include "core/safetensors/SafetensorsDtype.hpp"
 #include "core/safetensors/SafetensorsHeader.hpp"
 #include "core/safetensors/SafetensorsIndex.hpp"
+#include "core/safetensors/SafetensorsModel.hpp"
 #include "core/safetensors/SafetensorsReader.hpp"
 
 #include <cstdint>
@@ -308,6 +309,75 @@ TEST(reader_openBytes_rejectsMalformed) {
         reader.openBytes(std::span<const std::uint8_t>(bad.data(), bad.size()), "bad");
     }));
     EXPECT_TRUE(!reader.isOpen());
+}
+
+// =======================================================================
+// SafetensorsModel::openFromShards — multi-shard from in-memory images
+// =======================================================================
+
+TEST(model_openFromShards_unifiesNamespaceAndData) {
+    // Shard 0: x,y (4 B each). Shard 1: z (4 B).
+    const std::string h0 =
+        R"({"x.weight":{"dtype":"U8","shape":[4],"data_offsets":[0,4]},)"
+        R"("y.weight":{"dtype":"U8","shape":[4],"data_offsets":[4,8]}})";
+    std::vector<std::uint8_t> d0(8);
+    for (std::uint8_t i = 0; i < 8; ++i) d0[i] = static_cast<std::uint8_t>(0x10 + i);
+    const auto buf0 = buildFile(h0, d0);
+
+    const std::string h1 =
+        R"({"z.weight":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}})";
+    std::vector<std::uint8_t> d1(4);
+    for (std::uint8_t i = 0; i < 4; ++i) d1[i] = static_cast<std::uint8_t>(0xC0 + i);
+    const auto buf1 = buildFile(h1, d1);
+
+    const st::SafetensorsModel::ShardImage shards[2] = {
+        {"model-00001.safetensors", std::span<const std::uint8_t>(buf0.data(), buf0.size())},
+        {"model-00002.safetensors", std::span<const std::uint8_t>(buf1.data(), buf1.size())},
+    };
+
+    st::SafetensorsModel model;
+    model.openFromShards(std::span<const st::SafetensorsModel::ShardImage>(shards, 2),
+                         /*declaredTotalSize=*/12);
+
+    EXPECT_TRUE(model.isOpen());
+    EXPECT_EQ(model.shardCount(),  std::size_t{2});
+    EXPECT_EQ(model.tensorCount(), std::size_t{3});
+    EXPECT_EQ(model.declaredTotalSize(), std::uint64_t{12});
+
+    EXPECT_TRUE(model.find("x.weight") != nullptr);
+    EXPECT_TRUE(model.find("z.weight") != nullptr);   // resolves across shards
+    EXPECT_TRUE(model.find("nope")     == nullptr);
+
+    const auto zb = model.tensorBytes("z.weight");
+    EXPECT_EQ(zb.size(), std::size_t{4});
+    EXPECT_EQ(zb[0], std::uint8_t{0xC0});
+    EXPECT_EQ(zb[3], std::uint8_t{0xC3});
+
+    model.close();
+    EXPECT_TRUE(!model.isOpen());
+}
+
+TEST(model_openFromShards_rejectsDuplicateTensorAndEmpty) {
+    // Same tensor name in two shards -> reject.
+    const std::string h =
+        R"({"dup.weight":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}})";
+    std::vector<std::uint8_t> d(4, 0x11);
+    const auto buf = buildFile(h, d);
+    const st::SafetensorsModel::ShardImage dupShards[2] = {
+        {"a.safetensors", std::span<const std::uint8_t>(buf.data(), buf.size())},
+        {"b.safetensors", std::span<const std::uint8_t>(buf.data(), buf.size())},
+    };
+    st::SafetensorsModel m1;
+    EXPECT_TRUE(threw([&] {
+        m1.openFromShards(
+            std::span<const st::SafetensorsModel::ShardImage>(dupShards, 2));
+    }));
+
+    // Empty shard list -> reject.
+    st::SafetensorsModel m2;
+    EXPECT_TRUE(threw([&] {
+        m2.openFromShards(std::span<const st::SafetensorsModel::ShardImage>());
+    }));
 }
 
 int main() {

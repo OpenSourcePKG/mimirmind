@@ -49,6 +49,23 @@ public:
     /// appearing in more than one shard.
     void open(std::string_view path);
 
+    /// One in-memory shard for openFromShards(). `bytes` is NON-OWNING and
+    /// must outlive the model (M-Munin shm attach: mmap'd memfd chunk).
+    struct ShardImage {
+        std::string_view              name;   ///< shard filename, for diagnostics
+        std::span<const std::uint8_t> bytes;  ///< the whole *.safetensors image
+    };
+
+    /// Build the model from already-in-memory shards instead of files — the
+    /// M-Munin shm attach path, where each shard lives in an mmap'd memfd
+    /// chunk the worker holds. Parses each via SafetensorsReader::openBytes,
+    /// then indexes exactly like a file-based load (duplicate tensor names
+    /// across shards are rejected). `declaredTotalSize` carries the index's
+    /// `metadata.total_size` (0 = undeclared, as for a single-file load).
+    /// Throws std::runtime_error on an empty shard list or any malformation.
+    void openFromShards(std::span<const ShardImage> shards,
+                        std::uint64_t               declaredTotalSize = 0);
+
     /// Release all shard mmaps and reset. Idempotent.
     void close() noexcept;
 

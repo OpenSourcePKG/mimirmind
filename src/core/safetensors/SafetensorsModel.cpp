@@ -55,6 +55,24 @@ void SafetensorsModel::open(std::string_view path) {
     reindex();
 }
 
+void SafetensorsModel::openFromShards(std::span<const ShardImage> shards,
+                                      std::uint64_t               declaredTotalSize) {
+    close();
+
+    if (shards.empty()) {
+        fail("openFromShards: no shards provided");
+    }
+
+    _shards.reserve(shards.size());
+    for (const ShardImage& sh : shards) {
+        _shards.emplace_back();
+        _shards.back().openBytes(sh.bytes, sh.name);
+    }
+
+    _totalSize = declaredTotalSize;
+    reindex();
+}
+
 void SafetensorsModel::openSingle(std::string_view file) {
     _shards.reserve(1);
     _shards.emplace_back();
