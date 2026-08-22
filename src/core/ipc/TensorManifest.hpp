@@ -29,6 +29,21 @@ struct ChunkDesc {
 };
 
 /**
+ * One safetensors shard for the NVFP4 attach path (M-Munin.CUDA). The
+ * shard's raw *.safetensors image lives at `[chunkOffset, chunkOffset+bytes)`
+ * inside chunk `chunkIndex`; the worker wraps that span in a
+ * `SafetensorsReader::openBytes` and feeds the set to
+ * `SafetensorsModel::openFromShards`. `name` is the original shard filename
+ * (diagnostics + weight-map identity). Present only when `format == "nvfp4"`.
+ */
+struct ShardDesc {
+    std::string   name{};
+    std::uint32_t chunkIndex{0};
+    std::uint64_t chunkOffset{0};
+    std::uint64_t bytes{0};
+};
+
+/**
  * One tensor's metadata in the manifest that Munin sends to an
  * attaching mimirmind worker. `chunkIndex` names the owning chunk from
  * the manifest's `chunks` list; `chunkOffset` is the byte offset inside
@@ -77,7 +92,19 @@ struct TensorManifest {
     std::string                modelId{};           // "google_gemma-4-E4B-it-Q4_K_M"
     std::string                modelFingerprint{};  // opaque identity check
     std::vector<ChunkDesc>     chunks{};            // one entry per exported chunk
+
+    /// Weight-payload interpretation. Empty or "gguf" -> `tensors` carry the
+    /// per-tensor {chunkIndex, chunkOffset} (the original GGUF path). "nvfp4"
+    /// -> `shards` carry raw *.safetensors images in the chunks and `tensors`
+    /// is empty; the worker reconstructs a SafetensorsModel and runs the
+    /// NVFP4 materialization from shm. Optional on the wire (absent = "").
+    std::string                format{};
     std::vector<ManifestEntry> tensors{};
+
+    /// NVFP4 (format=="nvfp4") only: the safetensors shards and the index's
+    /// declared metadata.total_size (0 = undeclared). Empty otherwise.
+    std::vector<ShardDesc>     shards{};
+    std::uint64_t              declaredTotalSize{0};
 
     [[nodiscard]] std::string toJson() const;
 

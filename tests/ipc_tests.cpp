@@ -286,6 +286,58 @@ TEST(tensorManifest_roundTripPopulated) {
     }
 }
 
+TEST(tensorManifest_nvfp4Shards_roundTrip) {
+    TensorManifest m{};
+    m.modelId          = "qwen-nvfp4";
+    m.modelFingerprint = "hs:abcd";
+    m.format           = "nvfp4";
+    m.declaredTotalSize = 123456;
+    m.chunks.push_back({.chunkIndex = 0, .bytes = 2048});
+    m.chunks.push_back({.chunkIndex = 1, .bytes = 1024});
+    m.shards.push_back({.name        = "model-00001-of-00002.safetensors",
+                        .chunkIndex  = 0,
+                        .chunkOffset = 0,
+                        .bytes       = 2048});
+    m.shards.push_back({.name        = "model-00002-of-00002.safetensors",
+                        .chunkIndex  = 1,
+                        .chunkOffset = 0,
+                        .bytes       = 1024});
+
+    auto parsed = TensorManifest::fromJson(m.toJson());
+    EXPECT_TRUE(static_cast<bool>(parsed));
+    EXPECT_EQ(parsed->format,            "nvfp4");
+    EXPECT_EQ(parsed->declaredTotalSize, std::uint64_t{123456});
+    EXPECT_EQ(parsed->tensors.size(),    0U);
+    EXPECT_EQ(parsed->shards.size(),     2U);
+    EXPECT_EQ(parsed->shards[0].name,        "model-00001-of-00002.safetensors");
+    EXPECT_EQ(parsed->shards[0].chunkOffset, std::uint64_t{0});
+    EXPECT_EQ(parsed->shards[1].chunkIndex,  1U);
+    EXPECT_EQ(parsed->shards[1].bytes,       std::uint64_t{1024});
+}
+
+TEST(tensorManifest_shardOutOfRangeChunk_rejects) {
+    // shard references chunk_index=3 but only 1 chunk declared.
+    std::string j = R"({"protocol_version":2,"model_id":"x","model_fingerprint":"y",)"
+                    R"("chunks":[{"chunk_index":0,"bytes":16}],"tensors":[],)"
+                    R"("format":"nvfp4","declared_total_size":16,)"
+                    R"("shards":[{"name":"s","chunk_index":3,"chunk_offset":0,"bytes":16}]})";
+    auto parsed = TensorManifest::fromJson(j);
+    EXPECT_TRUE(!static_cast<bool>(parsed));
+    EXPECT_TRUE(parsed.error().find("chunk_index=3") != std::string::npos);
+}
+
+TEST(tensorManifest_noFormatOrShards_backwardCompatible) {
+    // A pre-NVFP4 manifest with no format/shards/declared_total_size parses
+    // as the GGUF path (format empty, shards empty).
+    std::string j = R"({"protocol_version":2,"model_id":"x","model_fingerprint":"y",)"
+                    R"("chunks":[],"tensors":[]})";
+    auto parsed = TensorManifest::fromJson(j);
+    EXPECT_TRUE(static_cast<bool>(parsed));
+    EXPECT_TRUE(parsed->format.empty());
+    EXPECT_EQ(parsed->shards.size(), 0U);
+    EXPECT_EQ(parsed->declaredTotalSize, std::uint64_t{0});
+}
+
 TEST(tensorManifest_tensorReferencesUnknownChunk_rejects) {
     // Tensor points at chunk_index=2 but the manifest only declares
     // one chunk. Consistency check should refuse at parse time so the

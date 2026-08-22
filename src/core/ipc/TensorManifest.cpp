@@ -41,6 +41,22 @@ std::string TensorManifest::toJson() const {
     }
     j["tensors"] = std::move(arr);
 
+    // NVFP4 shard section (empty + format "" for the GGUF path). Optional
+    // on the wire for readers, but always emitted so the format is explicit.
+    j["format"] = format;
+    auto shardArr = nlohmann::json::array();
+    shardArr.get_ref<nlohmann::json::array_t&>().reserve(shards.size());
+    for (const auto& s : shards) {
+        nlohmann::json e;
+        e["name"]         = s.name;
+        e["chunk_index"]  = s.chunkIndex;
+        e["chunk_offset"] = s.chunkOffset;
+        e["bytes"]        = s.bytes;
+        shardArr.push_back(std::move(e));
+    }
+    j["shards"]              = std::move(shardArr);
+    j["declared_total_size"] = declaredTotalSize;
+
     // Compact serialisation — no indentation, saves ~50% wire bytes on
     // a 720-tensor manifest. Deterministic key order isn't required
     // (the receiver walks the same keys explicitly).
@@ -175,6 +191,57 @@ TensorManifest::fromJson(std::string_view s) {
                 return std::unexpected(os.str());
             }
             m.tensors.push_back(std::move(me));
+        }
+    }
+
+    // ---- NVFP4 shard section (all optional; absent = GGUF path) ----------
+    if (j.contains("format")) {
+        if (!j["format"].is_string()) {
+            return std::unexpected(std::string{"TensorManifest: format must be a string"});
+        }
+        m.format = j["format"].get<std::string>();
+    }
+    if (j.contains("declared_total_size")) {
+        if (!j["declared_total_size"].is_number_unsigned()) {
+            return std::unexpected(std::string{
+                "TensorManifest: declared_total_size must be an unsigned integer"});
+        }
+        m.declaredTotalSize = j["declared_total_size"].get<std::uint64_t>();
+    }
+    if (j.contains("shards")) {
+        if (!j["shards"].is_array()) {
+            return std::unexpected(std::string{"TensorManifest: shards must be an array"});
+        }
+        const auto& arr = j["shards"];
+        m.shards.reserve(arr.size());
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+            const auto& e = arr[i];
+            if (!e.is_object()) {
+                std::ostringstream os;
+                os << "TensorManifest: shards[" << i << "] is not an object";
+                return std::unexpected(os.str());
+            }
+            ShardDesc sd{};
+            try {
+                sd.name        = e.at("name").get<std::string>();
+                sd.chunkIndex  = e.at("chunk_index").get<std::uint32_t>();
+                sd.chunkOffset = e.at("chunk_offset").get<std::uint64_t>();
+                sd.bytes       = e.at("bytes").get<std::uint64_t>();
+            } catch (const nlohmann::json::exception& x) {
+                std::ostringstream os;
+                os << "TensorManifest: shards[" << i
+                   << "]: field extraction failed: " << x.what();
+                return std::unexpected(os.str());
+            }
+            if (sd.chunkIndex >= m.chunks.size()) {
+                std::ostringstream os;
+                os << "TensorManifest: shards[" << i << "] '" << sd.name
+                   << "' references chunk_index=" << sd.chunkIndex
+                   << " but manifest only declares " << m.chunks.size()
+                   << " chunk(s)";
+                return std::unexpected(os.str());
+            }
+            m.shards.push_back(std::move(sd));
         }
     }
     return m;
