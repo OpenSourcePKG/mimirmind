@@ -6,6 +6,9 @@
 #include "core/ipc/ShmIpcImporter.hpp"
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/TensorFingerprint.hpp"
+#include "core/gguf/WeightsMap.hpp"
+#include "core/ipc/ShmIpcExporter.hpp"
+#include "core/ipc/ShmMuninClient.hpp"
 #include "core/ipc/TensorManifest.hpp"
 #include "core/ipc/UnixSocketFrame.hpp"
 #include "munin/ShmChunkAllocator.hpp"
@@ -41,6 +44,8 @@ using ::mimirmind::core::ipc::ShmIpcExporter;
 using ::mimirmind::core::ipc::ShmIpcImporter;
 using ::mimirmind::core::ipc::TensorManifest;
 using ::mimirmind::core::ipc::UnixSocketFrame;
+using ::mimirmind::core::gguf::WeightsMap;
+using ::mimirmind::core::ipc::ShmMuninClient;
 using ::mimirmind::munin::ShmChunkAllocator;
 using ::mimirmind::munin::ShmLoadedModel;
 
@@ -747,6 +752,98 @@ TEST(shmModel_loadGgufIntoShmChunks_buildsManifestAndData) {
     }
 
     ::unlink(path.c_str());
+}
+
+// ---- Full shm attach: server <-> ShmMuninClient -> WeightsMap ---------------
+//
+// The whole M-Munin.CUDA data path in one process, over a real socket: an
+// in-test "Munin" holds a model in memfd chunks (ShmLoadedModel) and speaks
+// the attach wire (manifest + per-chunk HANDLE frames via ShmIpcExporter);
+// ShmMuninClient attaches, imports each chunk (mmap), and the result feeds
+// the backend-neutral WeightsMap::fromAttachedChunked. We then verify every
+// tensor resolves — through the worker's own mappings — to the exact bytes
+// the server loaded. Only the final CUDA-kernel deref of these pointers is
+// left for on-box (proven separately by tools/cuda-ipc-testrig --kind shm).
+
+TEST(shmAttach_endToEnd_clientResolvesWeightsMap) {
+    const std::string path = writeTempGguf(makeMinimalGguf());
+
+    // Server-held model in memfd chunks.
+    ShmLoadedModel lm{};
+    lm.id     = "test-shm-model";
+    lm.chunks = std::make_unique<ShmChunkAllocator>(/*chunkBytes=*/8192);
+    lm.reader = std::make_unique<::mimirmind::core::gguf::GgufReader>();
+    lm.reader->open(path);
+    lm.reader->loadTensorsIntoShmChunks(*lm.chunks);
+    lm.fingerprint = ::mimirmind::core::gguf::tensorFingerprint(*lm.reader);
+    ::unlink(path.c_str());
+
+    SocketPair sp;
+
+    // In-test Munin server on sp.a: read attach request, send manifest, then
+    // one HANDLE frame per chunk (payload + SCM_RIGHTS memfd).
+    std::thread server([&] {
+        auto req = UnixSocketFrame::recv(sp.a, /*maxPayloadBytes=*/64 * 1024);
+        if (!req) return;
+
+        const std::string manifestJson = lm.buildManifest().toJson();
+        if (!UnixSocketFrame::send(
+                sp.a, std::span<const std::byte>{
+                          reinterpret_cast<const std::byte*>(manifestJson.data()),
+                          manifestJson.size()})) {
+            return;
+        }
+
+        const std::vector<int>           memfds   = lm.chunks->chunkMemfds();
+        const std::vector<std::uint64_t> mapBytes = lm.chunks->chunkMapBytes();
+        ::mimirmind::core::ipc::ShmIpcExporter exp{
+            std::span<const int>{memfds}, std::span<const std::uint64_t>{mapBytes}};
+        for (std::uint32_t i = 0; i < lm.chunks->chunkCount(); ++i) {
+            auto h = exp.exportChunk(i, lm.chunks->chunkBase(i),
+                                     lm.chunks->chunkUsedBytes(i));
+            if (!h) return;
+            const int fds[1] = {h->fd};
+            (void)UnixSocketFrame::send(
+                sp.a,
+                std::span<const std::byte>{h->bytes.data(), h->bytes.size()},
+                std::span<const int>{fds, 1});
+        }
+    });
+
+    // Worker on sp.b: attach + import.
+    ShmMuninClient client;
+    auto res = client.attachOnConnectedFd(sp.b, "test-shm-model");
+    server.join();
+
+    EXPECT_TRUE(static_cast<bool>(res));
+    if (res) {
+        sp.b = -1;  // client owns the session fd now; don't double-close.
+
+        EXPECT_EQ(res->manifest.modelId,   "test-shm-model");
+        EXPECT_EQ(res->manifest.tensors.size(), 3U);
+        EXPECT_EQ(res->chunkBases.size(),  3U);
+
+        // Backend-neutral resolver: manifest + imported bases -> tensors.
+        WeightsMap wm = WeightsMap::fromAttachedChunked(
+            res->manifest, std::span<void* const>{res->chunkBases});
+        EXPECT_EQ(wm.size(), 3U);
+
+        // Each tensor's pointer (through the WORKER's mapping) holds the
+        // exact bytes the server loaded from the GGUF.
+        const char*        names[3]  = {"a", "bb", "ccc"};
+        const std::uint8_t expect[3] = {0x11, 0x22, 0x33};
+        for (int i = 0; i < 3; ++i) {
+            const auto* t = wm.find(names[i]);
+            EXPECT_TRUE(t != nullptr);
+            if (t != nullptr) {
+                const auto* p = static_cast<const std::uint8_t*>(t->usmPtr);
+                bool ok = p != nullptr;
+                for (std::uint64_t k = 0; ok && k < 8000; ++k)
+                    if (p[k] != expect[i]) { ok = false; }
+                EXPECT_TRUE(ok);
+            }
+        }
+    }
 }
 
 int main() {
