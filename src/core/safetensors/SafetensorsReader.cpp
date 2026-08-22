@@ -25,8 +25,31 @@ void SafetensorsReader::open(std::string_view path) {
     }
 }
 
+void SafetensorsReader::openBytes(std::span<const std::uint8_t> bytes,
+                                  std::string_view               sourceName) {
+    close();
+
+    // Parse BEFORE committing any state so a malformed image leaves the
+    // reader closed (isOpen() stays false), not half-open with a set span.
+    ParsedSafetensorsHeader parsed = parseSafetensorsHeader(bytes);
+
+    // Non-owning: the caller guarantees `bytes` outlives this reader.
+    _external     = bytes;
+    _externalName = std::string{sourceName};
+    _tensors      = std::move(parsed.tensors);
+    _metadata     = std::move(parsed.metadata);
+    _dataOffset   = parsed.dataOffset;
+
+    _index.clear();
+    for (std::size_t i = 0; i < _tensors.size(); ++i) {
+        _index.emplace(_tensors[i].name, i);
+    }
+}
+
 void SafetensorsReader::close() noexcept {
     _file.close();
+    _external = {};
+    _externalName.clear();
     _tensors.clear();
     _index.clear();
     _metadata.clear();
@@ -45,7 +68,7 @@ const SafetensorsTensor* SafetensorsReader::find(std::string_view name) const no
 
 std::span<const std::uint8_t>
 SafetensorsReader::tensorBytes(const SafetensorsTensor& t) const noexcept {
-    const auto whole = _file.bytes();
+    const auto whole = allBytes();
     if (t.dataEnd > whole.size() || t.dataBegin > t.dataEnd) {
         return {};
     }

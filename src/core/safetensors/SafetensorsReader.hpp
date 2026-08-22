@@ -45,11 +45,24 @@ public:
     /// reported by `parseSafetensorsHeader`.
     void open(std::string_view path);
 
+    /// Parse from an already-in-memory shard image instead of mmap'ing a
+    /// file. `bytes` is NON-OWNING — it must outlive this reader (M-Munin
+    /// shm attach: the bytes live in an mmap'd memfd chunk held by the
+    /// worker's ShmMuninClient). `sourceName` is a label for diagnostics
+    /// (typically the original shard filename). Same parse + index as
+    /// open(); throws std::runtime_error on malformation.
+    void openBytes(std::span<const std::uint8_t> bytes,
+                   std::string_view               sourceName);
+
     /// Release the mmap and reset state. Idempotent.
     void close() noexcept;
 
-    [[nodiscard]] bool             isOpen()      const noexcept { return _file.isOpen(); }
-    [[nodiscard]] std::string_view path()        const noexcept { return _file.path(); }
+    [[nodiscard]] bool isOpen() const noexcept {
+        return _file.isOpen() || !_external.empty();
+    }
+    [[nodiscard]] std::string_view path() const noexcept {
+        return _external.empty() ? _file.path() : std::string_view{_externalName};
+    }
     [[nodiscard]] std::size_t      tensorCount() const noexcept { return _tensors.size(); }
 
     /// Parsed tensors, in ascending name order.
@@ -75,7 +88,15 @@ public:
     [[nodiscard]] std::size_t dataOffset() const noexcept { return _dataOffset; }
 
 private:
+    /// The shard image: the mmap when opened from a file, or the non-owning
+    /// external span when opened via openBytes(). Exactly one is populated.
+    [[nodiscard]] std::span<const std::uint8_t> allBytes() const noexcept {
+        return _external.empty() ? _file.bytes() : _external;
+    }
+
     l0::MappedFile                     _file;
+    std::span<const std::uint8_t>      _external{};   ///< non-owning; set by openBytes()
+    std::string                        _externalName;
     std::vector<SafetensorsTensor>     _tensors;
     std::map<std::string, std::size_t> _index;      ///< name -> _tensors index
     std::map<std::string, std::string> _metadata;

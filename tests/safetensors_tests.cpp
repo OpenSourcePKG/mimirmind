@@ -12,6 +12,7 @@
 #include "core/safetensors/SafetensorsDtype.hpp"
 #include "core/safetensors/SafetensorsHeader.hpp"
 #include "core/safetensors/SafetensorsIndex.hpp"
+#include "core/safetensors/SafetensorsReader.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -252,6 +253,61 @@ TEST(parse_index_rejects_malformed) {
         (void)st::parseSafetensorsIndex(
             R"({"metadata":{"total_size":-5},"weight_map":{"t":"a"}})");
     }));
+}
+
+// =======================================================================
+// SafetensorsReader::openBytes — in-memory shard source (M-Munin shm attach)
+// =======================================================================
+
+TEST(reader_openBytes_parsesAndViewsData) {
+    // Two U8 tensors, 4 bytes each, packed back to back.
+    const std::string header =
+        R"({"a.weight":{"dtype":"U8","shape":[4],"data_offsets":[0,4]},)"
+        R"("b.weight":{"dtype":"U8","shape":[4],"data_offsets":[4,8]}})";
+    std::vector<std::uint8_t> data(8);
+    for (std::uint8_t i = 0; i < 8; ++i) data[i] = static_cast<std::uint8_t>(0x10 + i);
+    const auto buf = buildFile(header, data);
+
+    st::SafetensorsReader reader;
+    reader.openBytes(std::span<const std::uint8_t>(buf.data(), buf.size()),
+                     "shard-0.safetensors");
+
+    EXPECT_TRUE(reader.isOpen());
+    EXPECT_EQ(reader.path(), std::string_view{"shard-0.safetensors"});
+    EXPECT_EQ(reader.tensorCount(), std::size_t{2});
+
+    const auto* a = reader.find("a.weight");
+    EXPECT_TRUE(a != nullptr);
+    if (a != nullptr) {
+        const auto ab = reader.tensorBytes(*a);
+        EXPECT_EQ(ab.size(), std::size_t{4});
+        EXPECT_EQ(ab[0], std::uint8_t{0x10});
+        EXPECT_EQ(ab[3], std::uint8_t{0x13});
+    }
+    const auto* b = reader.find("b.weight");
+    EXPECT_TRUE(b != nullptr);
+    if (b != nullptr) {
+        const auto bb = reader.tensorBytes(*b);
+        EXPECT_EQ(bb.size(), std::size_t{4});
+        EXPECT_EQ(bb[0], std::uint8_t{0x14});
+        EXPECT_EQ(bb[3], std::uint8_t{0x17});
+    }
+
+    // close() clears the external view.
+    reader.close();
+    EXPECT_TRUE(!reader.isOpen());
+}
+
+TEST(reader_openBytes_rejectsMalformed) {
+    // 8-byte header length pointing past the buffer -> parser throws.
+    std::vector<std::uint8_t> bad(sizeof(std::uint64_t), 0);
+    const std::uint64_t huge = 1u << 20;
+    std::memcpy(bad.data(), &huge, sizeof(huge));
+    st::SafetensorsReader reader;
+    EXPECT_TRUE(threw([&] {
+        reader.openBytes(std::span<const std::uint8_t>(bad.data(), bad.size()), "bad");
+    }));
+    EXPECT_TRUE(!reader.isOpen());
 }
 
 int main() {
