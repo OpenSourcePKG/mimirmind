@@ -1773,6 +1773,14 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_executable(cuda_ipc_testrig
         tools/cuda-ipc-testrig.cu
     )
+    # Match the project's other .cu targets: nvcc + the CMake on the GB10
+    # builder does not enable the CUDA23 dialect that a bare .cu target would
+    # otherwise inherit from CMAKE_CXX_STANDARD, so pin CUDA17 explicitly.
+    set_target_properties(cuda_ipc_testrig PROPERTIES
+        CUDA_ARCHITECTURES OFF
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+    )
     target_link_libraries(cuda_ipc_testrig PRIVATE
         CUDA::cudart
         CUDA::cuda_driver

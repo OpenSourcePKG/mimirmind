@@ -13,7 +13,12 @@
 #include "core/backend/BackendRegistry.hpp"
 #include "core/config/Config.hpp"
 #ifdef MIMIRMIND_HAVE_L0
+#ifdef MIMIRMIND_HAVE_L0
 #include "core/ipc/MuninClient.hpp"
+#endif
+#ifdef MIMIRMIND_HAVE_CUDA
+#include "core/ipc/ShmMuninClient.hpp"
+#endif
 #endif
 #include "core/log/Log.hpp"
 #include "core/os/GovernorLock.hpp"
@@ -314,12 +319,13 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     //      failing at boot beats failing on the first request.
     const bool attachedMode = !args.attachSocket.empty();
 
-#ifndef MIMIRMIND_HAVE_L0
+#if !defined(MIMIRMIND_HAVE_L0) && !defined(MIMIRMIND_HAVE_CUDA)
     if (attachedMode) {
-        std::cerr << "serve: --attach requested but this build has no "
-                     "L0 backend compiled in — Munin's IPC surface uses "
-                     "L0 handles, so attached mode is L0-only. Rebuild "
-                     "with -DMIMIRMIND_ENABLE_L0=ON or drop --attach.\n";
+        std::cerr << "serve: --attach requested but this build has neither the "
+                     "L0 nor the CUDA backend compiled in — attached mode needs "
+                     "one of them (L0 IPC handles on Xe-LPG, or GB10 POSIX-shm "
+                     "on CUDA). Rebuild with -DMIMIRMIND_ENABLE_L0=ON or "
+                     "-DMIMIRMIND_ENABLE_CUDA=ON, or drop --attach.\n";
         return 2;
     }
 #endif
@@ -357,12 +363,16 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     // out above if `--attach` was set, so this block is unreachable
     // and its `MuninClient` references would fail to compile without
     // the guard.
-#ifdef MIMIRMIND_HAVE_L0
+#if defined(MIMIRMIND_HAVE_L0) || defined(MIMIRMIND_HAVE_CUDA)
     if (attachedMode) {
         MM_LOG_INFO("main",
                     "serve: attached mode — probing Munin at '{}'",
                     args.attachSocket);
+#ifdef MIMIRMIND_HAVE_L0
         auto hz = ::mimirmind::core::ipc::MuninClient::healthz(args.attachSocket);
+#else
+        auto hz = ::mimirmind::core::ipc::ShmMuninClient::healthz(args.attachSocket);
+#endif
         if (!hz) {
             std::cerr << "serve: Munin healthz failed at '"
                       << args.attachSocket << "': " << hz.error() << "\n";
@@ -441,13 +451,52 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     std::vector<std::unique_ptr<::mimirmind::runtime::audio::SpeakEngine>>
         ownedSpeakers;
     std::vector<::mimirmind::server::LoadedSpeaker> loadedSpeakers;
+    // In attached mode one client per loaded model is kept alive for the
+    // whole worker run so Munin sees the peer-close (implicit detach) only at
+    // shutdown. The transport is chosen at build time — L0 IPC handles on
+    // Xe-LPG, GB10 POSIX-shm on CUDA — and the two client types are unrelated,
+    // so they are parked type-erased.
+    std::vector<std::shared_ptr<void>> attachedKeepAlive;
+
+    // Attach engine `e` to Munin for model `m` over this build's transport and
+    // materialise its WeightsMap via loadModelAttached. Returns false (and
+    // logs) on failure. One implementation shared by both attach sites (chat +
+    // speak); the transport differs only in which client class is used —
+    // loadModelAttached itself is backend-neutral (it takes void* chunk bases).
+    auto attachEngine =
+        [&](::mimirmind::runtime::InferenceEngine& e,
+            const ::mimirmind::core::config::ModelEntry& m) -> bool {
+#if defined(MIMIRMIND_HAVE_L0) || defined(MIMIRMIND_HAVE_CUDA)
 #ifdef MIMIRMIND_HAVE_L0
-    // In attached mode: one MuninClient per loaded model, kept alive
-    // for the whole worker lifetime so Munin's implicit-detach logic
-    // sees the peer-close only when the worker actually shuts down.
-    // L0-only — Munin's IPC surface uses `zeMemOpenIpcHandle`.
-    std::vector<std::unique_ptr<::mimirmind::core::ipc::MuninClient>> attachedClients;
+        auto client =
+            std::make_shared<::mimirmind::core::ipc::MuninClient>(e.ctx());
+#else
+        auto client = std::make_shared<::mimirmind::core::ipc::ShmMuninClient>();
 #endif
+        auto result = client->attach(args.attachSocket, m.id);
+        if (!result) {
+            std::cerr << "serve: attach for id='" << m.id
+                      << "' failed: " << result.error() << "\n";
+            return false;
+        }
+        try {
+            e.loadModelAttached(
+                m.path, result->manifest,
+                std::span<void* const>{result->chunkBases});
+        } catch (const std::exception& x) {
+            std::cerr << "serve: loadModelAttached('" << m.id
+                      << "') failed: " << x.what() << "\n";
+            return false;
+        }
+        attachedKeepAlive.push_back(std::move(client));
+        return true;
+#else
+        (void)e;
+        (void)m;
+        std::cerr << "serve: attached mode is not supported in this build\n";
+        return false;
+#endif
+    };
 
     // Enumerate every compiled-in + runtime-available backend/device
     // once, up-front. Per-model config gets to pick its entry by token
@@ -573,25 +622,11 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             try {
                 auto e = std::make_unique<::mimirmind::runtime::InferenceEngine>(
                     cfg, engineKind);
-#ifdef MIMIRMIND_HAVE_L0
                 if (attachedMode) {
-                    auto client =
-                        std::make_unique<::mimirmind::core::ipc::MuninClient>(
-                            e->ctx());
-                    auto result = client->attach(args.attachSocket, m.id);
-                    if (!result) {
-                        std::cerr << "serve: MuninClient::attach for speak id='"
-                                  << m.id << "' failed: " << result.error()
-                                  << "\n";
+                    if (!attachEngine(*e, m)) {
                         return 2;
                     }
-                    e->loadModelAttached(
-                        m.path, result->manifest,
-                        std::span<void* const>{result->chunkBases});
-                    attachedClients.push_back(std::move(client));
-                } else
-#endif
-                {
+                } else {
                     if (runtime::nvfp4::resolveModelFormat(m.format, m.path)
                         == core::config::ModelFormat::Nvfp4) {
                         e->loadModelNvfp4(m.path, m.tokenizerGguf);
@@ -622,32 +657,14 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         auto e = std::make_unique<::mimirmind::runtime::InferenceEngine>(
             cfg, engineKind);
 
-#ifdef MIMIRMIND_HAVE_L0
         if (attachedMode) {
             MM_LOG_INFO("main",
                         "serve: attaching to Munin for model '{}' "
                         "(local header from '{}')", m.id, m.path);
-            auto client = std::make_unique<::mimirmind::core::ipc::MuninClient>(
-                e->ctx());
-            auto result = client->attach(args.attachSocket, m.id);
-            if (!result) {
-                std::cerr << "serve: MuninClient::attach for id='"
-                          << m.id << "' failed: " << result.error() << "\n";
+            if (!attachEngine(*e, m)) {
                 return 2;
             }
-            try {
-                e->loadModelAttached(m.path,
-                                     result->manifest,
-                                     std::span<void* const>{result->chunkBases});
-            } catch (const std::exception& x) {
-                std::cerr << "serve: loadModelAttached('" << m.id
-                          << "') failed: " << x.what() << "\n";
-                return 2;
-            }
-            attachedClients.push_back(std::move(client));
-        } else
-#endif
-        {
+        } else {
             if (runtime::nvfp4::resolveModelFormat(m.format, m.path)
                 == core::config::ModelFormat::Nvfp4) {
                 MM_LOG_INFO("main", "serve: loading NVFP4 model '{}' (id='{}')",
