@@ -11,8 +11,10 @@
 #include "core/ipc/ShmMuninClient.hpp"
 #include "core/ipc/TensorManifest.hpp"
 #include "core/ipc/UnixSocketFrame.hpp"
+#include "munin/ShmAttachSession.hpp"
 #include "munin/ShmChunkAllocator.hpp"
 #include "munin/ShmLoadedModel.hpp"
+#include "munin/ShmModelStore.hpp"
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -46,8 +48,10 @@ using ::mimirmind::core::ipc::TensorManifest;
 using ::mimirmind::core::ipc::UnixSocketFrame;
 using ::mimirmind::core::gguf::WeightsMap;
 using ::mimirmind::core::ipc::ShmMuninClient;
+using ::mimirmind::munin::ShmAttachSession;
 using ::mimirmind::munin::ShmChunkAllocator;
 using ::mimirmind::munin::ShmLoadedModel;
+using ::mimirmind::munin::ShmModelStore;
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
@@ -844,6 +848,74 @@ TEST(shmAttach_endToEnd_clientResolvesWeightsMap) {
             }
         }
     }
+}
+
+// ---- Full shm daemon loop: ShmModelStore + ShmAttachSession <-> client ------
+//
+// Both production server classes (ShmModelStore loading a real GGUF into
+// memfd chunks, ShmAttachSession speaking the attach wire) against the real
+// ShmMuninClient over a socketpair. This is the step-4 counterpart to the
+// step-3 test — there the server was inline; here it is the shipping code on
+// both ends. Proves a worker can attach to an shm Munin and resolve every
+// tensor to the exact bytes the daemon loaded.
+
+TEST(shmDaemon_endToEnd_realSessionAndClient) {
+    const std::string path = writeTempGguf(makeMinimalGguf());
+
+    // Config-driven daemon store: one model, loaded into memfd chunks.
+    ::mimirmind::core::config::Config cfg{};
+    ::mimirmind::core::config::ModelEntry me{};
+    me.id          = "test-shm-model";
+    me.path        = path;
+    me.loadOnStart = true;
+    cfg.models.push_back(me);
+
+    ShmModelStore store{cfg, /*chunkBytes=*/8192};
+    ::unlink(path.c_str());
+    EXPECT_EQ(store.size(), 1U);
+    EXPECT_TRUE(store.find("test-shm-model") != nullptr);
+
+    SocketPair sp;
+
+    // Real server session on sp.a in its own thread — recv request, send
+    // manifest + HANDLE frames, then block until the worker closes.
+    std::thread server([&] {
+        ShmAttachSession session{sp.a, ::getpid(), /*sessionId=*/1, store};
+        session.run();
+    });
+
+    // Real worker client on sp.b.
+    ShmMuninClient client;
+    auto res = client.attachOnConnectedFd(sp.b, "test-shm-model");
+
+    EXPECT_TRUE(static_cast<bool>(res));
+    if (res) {
+        sp.b = -1;  // client owns the session fd
+        EXPECT_EQ(res->chunkBases.size(), 3U);
+
+        WeightsMap wm = WeightsMap::fromAttachedChunked(
+            res->manifest, std::span<void* const>{res->chunkBases});
+        EXPECT_EQ(wm.size(), 3U);
+
+        const char*        names[3]  = {"a", "bb", "ccc"};
+        const std::uint8_t expect[3] = {0x11, 0x22, 0x33};
+        for (int i = 0; i < 3; ++i) {
+            const auto* t = wm.find(names[i]);
+            EXPECT_TRUE(t != nullptr);
+            if (t != nullptr) {
+                const auto* p = static_cast<const std::uint8_t*>(t->usmPtr);
+                bool ok = p != nullptr;
+                for (std::uint64_t k = 0; ok && k < 8000; ++k)
+                    if (p[k] != expect[i]) { ok = false; }
+                EXPECT_TRUE(ok);
+            }
+        }
+    }
+
+    // Release the worker end so the server's waitForPeerClose returns.
+    client.detach();
+    server.join();
+    sp.a = -1;  // ShmAttachSession's destructor already closed it
 }
 
 int main() {

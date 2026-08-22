@@ -374,8 +374,10 @@ add_library(mimirmind_core_common STATIC
     src/core/ipc/TensorManifest.cpp
     src/core/ipc/UnixSocketFrame.cpp
     src/core/ipc/WireOps.cpp
+    src/munin/ShmAttachSession.cpp
     src/munin/ShmChunkAllocator.cpp
     src/munin/ShmLoadedModel.cpp
+    src/munin/ShmModelStore.cpp
     src/core/modelopt/BlockScaleSwizzle.cpp
     src/core/modelopt/HfQuantConfig.cpp
     src/core/modelopt/ModelOptQuant.cpp
