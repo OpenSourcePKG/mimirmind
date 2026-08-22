@@ -3,9 +3,9 @@
 
 #pragma once
 
+#include "core/ipc/IpcTransport.hpp"
 #include "core/ipc/TensorManifest.hpp"
 #include "core/ipc/WireOps.hpp"
-#include "core/gpu/l0/L0Context.hpp"
 
 #include <expected>
 #include <string>
@@ -15,34 +15,24 @@
 namespace mimirmind::core::ipc {
 
 /**
- * Client-side wrapper for the M-Munin wire protocol. Represents one
- * open connection to a running Munin daemon. Two operations:
+ * Worker-side attach client for the M-Munin wire protocol — backend-neutral
+ * (M-Munin 1b-tail). Represents one connection to a running Munin daemon and
+ * speaks the wire (UnixSocketFrame framing, RequestEnvelope, TensorManifest
+ * v2, N HANDLE frames of 64-byte payload + one SCM_RIGHTS fd). The one
+ * transport-specific step — turning a received handle into a local pointer —
+ * is delegated to an `IpcImporterBackend`: L0IpcImporter (zeMemOpenIpcHandle,
+ * Xe-LPG) or ShmIpcImporter (mmap the memfd, GB10). The resulting chunkBases
+ * feed `WeightsMap::fromAttachedChunked` (GGUF) or, for NVFP4, the shard
+ * reconstruction in `InferenceEngine::loadModelAttachedNvfp4`.
  *
- *   - `healthz(path)`  — probe: is Munin up, which models does it
- *                        hold, who owns the governor? Opens a fresh
- *                        connection each call and closes it on return.
- *
- *   - `attach(path, id)` — attach flow: opens a persistent connection,
- *                          sends the attach request, reads the v2
- *                          manifest, imports N chunk IPC handles via
- *                          `IpcImporter::openChunks`, and hands back
- *                          the manifest plus the resulting per-chunk
- *                          base pointers in this worker's address
- *                          space. The caller resolves per-tensor
- *                          `usmPtr` values via
- *                          `WeightsMap::fromAttachedChunked`.
- *
- * After `attach()` succeeds the socket stays open — the worker keeps
- * this MuninClient alive for its whole run, so Munin observes the
- * eventual peer-close as an implicit detach and can prune its
- * bookkeeping.
- *
- * Not thread-safe; construct one per worker. Blocking I/O throughout.
- * L0 context is a reference — must outlive this object.
+ * The importer is a reference — it MUST outlive this client (the imported
+ * mappings stay valid for the worker's run). Pure host code in
+ * mimirmind_core_common; not thread-safe, one per worker, blocking I/O.
  */
 class MuninClient {
 public:
-    explicit MuninClient(::mimirmind::core::l0::L0Context& l0);
+    explicit MuninClient(IpcImporterBackend& importer) noexcept
+        : _importer{importer} {}
     ~MuninClient();
 
     MuninClient(const MuninClient&)            = delete;
@@ -53,39 +43,32 @@ public:
     [[nodiscard]] static std::expected<HealthzResponse, std::string>
     healthz(std::string_view socketPath) noexcept;
 
-    /**
-     * Successful attach payload. `manifest` describes the model (id,
-     * fingerprint, chunk-layout metadata, per-tensor descriptors);
-     * `chunkBases` holds the worker-side USM pointers returned by
-     * `IpcImporter::openChunks`, in the same order as
-     * `manifest.chunks`.
-     *
-     * Pair them via `WeightsMap::fromAttachedChunked(manifest,
-     * chunkBases)` to obtain the ready-to-use tensor map. The caller
-     * verifies the fingerprint against the local GGUF header before
-     * proceeding to compute.
-     */
     struct AttachResult {
-        TensorManifest      manifest;
-        std::vector<void*>  chunkBases;
+        TensorManifest     manifest;
+        std::vector<void*> chunkBases;  // one per manifest.chunks, in order
     };
 
+    /// Connect to Munin at `socketPath` and run the attach flow for
+    /// `modelId`. On success the session socket stays open (see detach()).
     [[nodiscard]] std::expected<AttachResult, std::string>
     attach(std::string_view socketPath, std::string_view modelId) noexcept;
 
-    /// Diagnostic: session-alive check. False before attach() succeeds
-    /// or after a detach.
+    /// Run the attach protocol on an ALREADY-CONNECTED socket. On success
+    /// takes ownership of `fd`; on failure the caller still owns it. Exposed
+    /// so the flow can be driven over a socketpair in tests.
+    [[nodiscard]] std::expected<AttachResult, std::string>
+    attachOnConnectedFd(int fd, std::string_view modelId) noexcept;
+
     [[nodiscard]] bool isAttached() const noexcept { return _sessionFd >= 0; }
 
-    /// Explicit detach: closes the session socket. Idempotent. Called
-    /// implicitly by the destructor; callers only need this when they
-    /// want to release the Munin-side session before the client object
-    /// itself goes out of scope.
+    /// Close the session socket (idempotent). Does NOT release the imported
+    /// mappings — those are owned by the importer and live for the worker's
+    /// run.
     void detach() noexcept;
 
 private:
-    ::mimirmind::core::l0::L0Context& _l0;
-    int                               _sessionFd{-1};
+    IpcImporterBackend& _importer;
+    int                 _sessionFd{-1};
 };
 
 } // namespace mimirmind::core::ipc

@@ -8,8 +8,7 @@
 #include "core/gguf/TensorFingerprint.hpp"
 #include "core/gguf/WeightsMap.hpp"
 #include "core/safetensors/SafetensorsModel.hpp"
-#include "core/ipc/ShmIpcExporter.hpp"
-#include "core/ipc/ShmMuninClient.hpp"
+#include "core/ipc/MuninClient.hpp"
 #include "core/ipc/TensorManifest.hpp"
 #include "core/ipc/UnixSocketFrame.hpp"
 #include "munin/ShmAttachSession.hpp"
@@ -27,7 +26,6 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
-#include <cstdint>
 #include <cstdint>
 #include <cstdio>
 #include <chrono>
@@ -51,7 +49,7 @@ using ::mimirmind::core::ipc::ShmIpcImporter;
 using ::mimirmind::core::ipc::TensorManifest;
 using ::mimirmind::core::ipc::UnixSocketFrame;
 using ::mimirmind::core::gguf::WeightsMap;
-using ::mimirmind::core::ipc::ShmMuninClient;
+using ::mimirmind::core::ipc::MuninClient;
 using ::mimirmind::core::safetensors::SafetensorsModel;
 using ::mimirmind::munin::ShmAttachSession;
 using ::mimirmind::munin::ShmChunkAllocator;
@@ -873,7 +871,8 @@ TEST(shmAttach_endToEnd_clientResolvesWeightsMap) {
     });
 
     // Worker on sp.b: attach + import.
-    ShmMuninClient client;
+    ShmIpcImporter imp;
+    MuninClient client{imp};
     auto res = client.attachOnConnectedFd(sp.b, "test-shm-model");
     server.join();
 
@@ -943,7 +942,8 @@ TEST(shmDaemon_endToEnd_realSessionAndClient) {
     });
 
     // Real worker client on sp.b.
-    ShmMuninClient client;
+    ShmIpcImporter imp;
+    MuninClient client{imp};
     auto res = client.attachOnConnectedFd(sp.b, "test-shm-model");
 
     EXPECT_TRUE(static_cast<bool>(res));
@@ -1004,8 +1004,9 @@ TEST(shmSocketServer_realSocket_attachResolves) {
     std::thread serveThread([&] { server.serve(/*shutdownEventFd=*/-1); });
 
     // Attach, retrying until the accept loop is listening (bounded ~2s).
-    ShmMuninClient client;
-    std::expected<ShmMuninClient::AttachResult, std::string> res =
+    ShmIpcImporter imp;
+    MuninClient client{imp};
+    std::expected<MuninClient::AttachResult, std::string> res =
         std::unexpected(std::string{"not attempted"});
     for (int i = 0; i < 200; ++i) {
         res = client.attach(sockPath, "test-shm-model");
@@ -1034,7 +1035,7 @@ TEST(shmSocketServer_realSocket_attachResolves) {
         }
 
         // Healthz over a fresh connection reports the resident model.
-        auto hz = ShmMuninClient::healthz(sockPath);
+        auto hz = MuninClient::healthz(sockPath);
         EXPECT_TRUE(static_cast<bool>(hz));
         if (hz) {
             EXPECT_EQ(hz->models.size(), 1U);
@@ -1135,7 +1136,8 @@ TEST(shmNvfp4_endToEnd_attachReconstructsShards) {
         session.run();
     });
 
-    ShmMuninClient client;
+    ShmIpcImporter imp;
+    MuninClient client{imp};
     auto res = client.attachOnConnectedFd(sp.b, "qwen-nvfp4");
 
     EXPECT_TRUE(static_cast<bool>(res));

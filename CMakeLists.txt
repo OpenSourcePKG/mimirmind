@@ -368,9 +368,9 @@ add_library(mimirmind_core_common STATIC
     src/core/gguf/GgufTypes.cpp
     src/core/gguf/TensorFingerprint.cpp
     src/core/gguf/WeightsMap.cpp
+    src/core/ipc/MuninClient.cpp
     src/core/ipc/ShmIpcExporter.cpp
     src/core/ipc/ShmIpcImporter.cpp
-    src/core/ipc/ShmMuninClient.cpp
     src/core/ipc/TensorManifest.cpp
     src/core/ipc/UnixSocketFrame.cpp
     src/core/ipc/WireOps.cpp
@@ -638,7 +638,7 @@ if(MIMIRMIND_ENABLE_L0)
         src/core/gpu/l0/GpuModule.cpp
         src/core/ipc/IpcExporter.cpp
         src/core/ipc/IpcImporter.cpp
-        src/core/ipc/MuninClient.cpp
+        src/core/ipc/L0IpcImporter.cpp
         src/core/gguf/GgufReaderChunks.cpp
         src/munin/ChunkAllocator.cpp
     )

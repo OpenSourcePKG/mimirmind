@@ -12,11 +12,12 @@
 #include "core/backend/BackendPool.hpp"
 #include "core/backend/BackendRegistry.hpp"
 #include "core/config/Config.hpp"
-#ifdef MIMIRMIND_HAVE_L0
 #include "core/ipc/MuninClient.hpp"
+#ifdef MIMIRMIND_HAVE_L0
+#include "core/ipc/L0IpcImporter.hpp"
 #endif
 #ifdef MIMIRMIND_HAVE_CUDA
-#include "core/ipc/ShmMuninClient.hpp"
+#include "core/ipc/ShmIpcImporter.hpp"
 #endif
 #include "core/log/Log.hpp"
 #include "core/os/GovernorLock.hpp"
@@ -366,11 +367,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         MM_LOG_INFO("main",
                     "serve: attached mode — probing Munin at '{}'",
                     args.attachSocket);
-#ifdef MIMIRMIND_HAVE_L0
         auto hz = ::mimirmind::core::ipc::MuninClient::healthz(args.attachSocket);
-#else
-        auto hz = ::mimirmind::core::ipc::ShmMuninClient::healthz(args.attachSocket);
-#endif
         if (!hz) {
             std::cerr << "serve: Munin healthz failed at '"
                       << args.attachSocket << "': " << hz.error() << "\n";
@@ -465,12 +462,16 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         [&](::mimirmind::runtime::InferenceEngine& e,
             const ::mimirmind::core::config::ModelEntry& m) -> bool {
 #if defined(MIMIRMIND_HAVE_L0) || defined(MIMIRMIND_HAVE_CUDA)
+        // Pick the IPC transport at build time; the one MuninClient wire
+        // implementation drives either via the IpcImporterBackend seam.
 #ifdef MIMIRMIND_HAVE_L0
-        auto client =
-            std::make_shared<::mimirmind::core::ipc::MuninClient>(e.ctx());
+        auto importer =
+            std::make_shared<::mimirmind::core::ipc::L0IpcImporter>(e.ctx());
 #else
-        auto client = std::make_shared<::mimirmind::core::ipc::ShmMuninClient>();
+        auto importer = std::make_shared<::mimirmind::core::ipc::ShmIpcImporter>();
 #endif
+        auto client =
+            std::make_shared<::mimirmind::core::ipc::MuninClient>(*importer);
         auto result = client->attach(args.attachSocket, m.id);
         if (!result) {
             std::cerr << "serve: attach for id='" << m.id
@@ -495,6 +496,9 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                       << "') failed: " << x.what() << "\n";
             return false;
         }
+        // The importer owns the imported mappings — keep it alive alongside
+        // (and, being pushed first, destroyed after) the client.
+        attachedKeepAlive.push_back(std::move(importer));
         attachedKeepAlive.push_back(std::move(client));
         return true;
 #else
