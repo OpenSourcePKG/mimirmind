@@ -1847,6 +1847,74 @@ TEST(cuda_ssm_conv1d_batched_parity) {
                 nSeq, T, channels, K, maxErr);
 }
 
+// 5.21 Increment II — VARLEN batched ssm_conv1d: ragged per-slot seqT (each slot
+// carries its own K-1 conv-tail) vs N single-seq convs each with its own T.
+TEST(cuda_ssm_conv1d_batched_varlen_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t channels = 12, K = 4;
+    const std::vector<std::int32_t> seqT = {2, 5, 3};
+    const std::size_t nSeq = seqT.size();
+    std::vector<std::int32_t> inOff(nSeq, 0), outOff(nSeq, 0);
+    std::size_t inTot = 0, outTot = 0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        inOff[s]  = static_cast<std::int32_t>(inTot);
+        outOff[s] = static_cast<std::int32_t>(outTot);
+        inTot  += static_cast<std::size_t>(seqT[s]) + K - 1;   // tail + tokens
+        outTot += static_cast<std::size_t>(seqT[s]);
+    }
+    auto kernel = randVec(K * channels, 0x3733u);
+    std::vector<float> IN(inTot * channels);
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        const std::size_t rows = static_cast<std::size_t>(seqT[s]) + K - 1;
+        auto in = randVec(rows * channels, 0x2700u + static_cast<std::uint32_t>(s)*13u);
+        std::copy(in.begin(), in.end(),
+                  IN.begin() + static_cast<std::size_t>(inOff[s]) * channels);
+    }
+
+    auto dIn  = toDevice(ops, IN);
+    auto dKer = toDevice(ops, kernel);
+    auto dOut = ops.allocate(outTot * channels * sizeof(float));
+    auto dSeqT = ops.allocate(nSeq*sizeof(std::int32_t));
+    auto dInOff = ops.allocate(nSeq*sizeof(std::int32_t));
+    auto dOutOff = ops.allocate(nSeq*sizeof(std::int32_t));
+    ops.uploadHostBytes(dSeqT.get(),   seqT.data(),   nSeq*sizeof(std::int32_t));
+    ops.uploadHostBytes(dInOff.get(),  inOff.data(),  nSeq*sizeof(std::int32_t));
+    ops.uploadHostBytes(dOutOff.get(), outOff.data(), nSeq*sizeof(std::int32_t));
+    std::size_t maxT = 1; for (auto t : seqT) maxT = std::max(maxT, (std::size_t)t);
+    ops.causalConv1dSiluBatchedAsync(
+        static_cast<const float*>(dIn.get()), static_cast<const float*>(dKer.get()),
+        static_cast<float*>(dOut.get()), nSeq, maxT, channels, K,
+        static_cast<const std::int32_t*>(dSeqT.get()),
+        static_cast<const std::int32_t*>(dInOff.get()),
+        static_cast<const std::int32_t*>(dOutOff.get()));
+    ops.flush();
+    auto outB = fromDevice(ops, dOut.get(), outTot * channels);
+
+    double maxErr = 0.0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        const std::size_t tt = static_cast<std::size_t>(seqT[s]);
+        const std::size_t rows = tt + K - 1;
+        std::vector<float> in(IN.begin() + (std::size_t)inOff[s]*channels,
+                              IN.begin() + ((std::size_t)inOff[s]+rows)*channels);
+        auto di = toDevice(ops, in); auto dk = toDevice(ops, kernel);
+        auto doS = ops.allocate(tt*channels*sizeof(float));
+        ops.causalConv1dSiluAsync(static_cast<const float*>(di.get()),
+                                  static_cast<const float*>(dk.get()),
+                                  static_cast<float*>(doS.get()), tt, channels, K);
+        ops.flush();
+        auto outS = fromDevice(ops, doS.get(), tt*channels);
+        for (std::size_t i = 0; i < tt*channels; ++i) {
+            const std::size_t o = (std::size_t)outOff[s]*channels + i;
+            maxErr = std::max(maxErr, std::fabs((double)outB[o] - (double)outS[i]));
+            EXPECT_NEAR(outB[o], outS[i], 1e-5f);
+        }
+    }
+    std::printf("[conv1d-varlen-parity] nSeq=%zu seqT={2,5,3} channels=%zu K=%zu maxErr=%.2e\n",
+                nSeq, channels, K, maxErr);
+}
+
 // M-Cuda.Batch Cat B — batched moe_gate_up_fused_k_q4k vs N single-token
 // runs. Each token has its own x and routed experts; batched output must
 // be byte-identical to running each token alone.

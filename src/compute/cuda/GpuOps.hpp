@@ -186,7 +186,10 @@ public:
                                       const float* kernel, float* out,
                                       std::size_t nSeq, std::size_t T,
                                       std::size_t channels,
-                                      std::size_t kernelSize) override;
+                                      std::size_t kernelSize,
+                                      const std::int32_t* seqT   = nullptr,
+                                      const std::int32_t* inOff  = nullptr,
+                                      const std::int32_t* outOff = nullptr) override;
     void gatedDeltaNetRecurrentAsync(const float* q, const float* k,
                                      const float* v, const float* gLog,
                                      const float* beta, float* state,

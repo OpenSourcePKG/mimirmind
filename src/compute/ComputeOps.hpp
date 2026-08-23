@@ -365,9 +365,12 @@ public:
     virtual void causalConv1dSiluBatchedAsync(
             const float* convInput, const float* kernel, float* out,
             std::size_t nSeq, std::size_t T, std::size_t channels,
-            std::size_t kernelSize) {
+            std::size_t kernelSize,
+            const std::int32_t* seqT   = nullptr,   // 5.21-II varlen (nullptr=uniform)
+            const std::int32_t* inOff  = nullptr,
+            const std::int32_t* outOff = nullptr) {
         (void)convInput; (void)kernel; (void)out; (void)nSeq; (void)T;
-        (void)channels; (void)kernelSize;
+        (void)channels; (void)kernelSize; (void)seqT; (void)inOff; (void)outOff;
         throw std::runtime_error(
             "causalConv1dSiluBatchedAsync: not supported on this backend");
     }

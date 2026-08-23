@@ -1604,14 +1604,19 @@ void GpuOps::causalConv1dSiluBatchedAsync(const float* convInput,
                                           const float* kernel, float* out,
                                           std::size_t nSeq, std::size_t T,
                                           std::size_t channels,
-                                          std::size_t kernelSize) {
-    const std::size_t total = T * channels;
+                                          std::size_t kernelSize,
+                                          const std::int32_t* seqT,
+                                          const std::int32_t* inOff,
+                                          const std::int32_t* outOff) {
+    const std::size_t total = T * channels;   // T = max seqT in the varlen case
     if (nSeq == 0 || total == 0) {
         return;
     }
     // grid = (ceil(T*channels/LOCAL), nSeq); each seq owns its own conv
     // input (caller prepends its rolling conv-tail). Math byte-identical
     // to the single-sequence causalConv1dSiluAsync (M-Cuda.Batch Cat C-P0).
+    // 5.21-II varlen: seqT/inOff/outOff (nullptr => uniform) give per-slot T +
+    // ragged input/output offsets; T must then be passed as max(seqT) for grid.
     auto& k = _pimpl->_ssmConv1dBatchedKernel;
     k.setPtr  (0, convInput);
     k.setPtr  (1, kernel);
@@ -1619,6 +1624,9 @@ void GpuOps::causalConv1dSiluBatchedAsync(const float* convInput,
     k.setValue(3, toInt32(T,          "conv1dB T"));
     k.setValue(4, toInt32(channels,   "conv1dB channels"));
     k.setValue(5, toInt32(kernelSize, "conv1dB K"));
+    k.setPtr  (6, seqT);
+    k.setPtr  (7, inOff);
+    k.setPtr  (8, outOff);
     k.launch(_ctx.stream(),
              groupsForN(total, kElementwiseLocalSize),
              static_cast<std::uint32_t>(nSeq), 1,
