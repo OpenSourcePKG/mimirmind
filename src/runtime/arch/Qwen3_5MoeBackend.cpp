@@ -1715,17 +1715,17 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
             _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
         }
     }
+    const compute::GdnBatchedShape gdnShape{nSeq, /*T=*/1, hV, S, ctx.activeMask};
     if (_gdnGateFuse) {
         // GDN-Inc 2: gate folded in — pass RAW alpha/beta + per-head ssm_a/ssm_dt.
         _ops.gatedDeltaNetRecurrentGateFusedBatchedAsync(
             qBuf, kBuf, vBuf, alphaBuf, betaBuf,
             static_cast<const float*>(ssmA.usmPtr),
             static_cast<const float*>(ssmDt.usmPtr),
-            stateBase, deltaOut, nSeq, /*T=*/1, hV, S, ctx.activeMask);
+            stateBase, deltaOut, gdnShape);
     } else {
         _ops.gatedDeltaNetRecurrentBatchedAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
-                                                stateBase, deltaOut, nSeq,
-                                                /*T=*/1, hV, S, ctx.activeMask);
+                                                stateBase, deltaOut, gdnShape);
     }
 
     // --- gated output norm: ssm_norm(out) * silu(z) ------------------

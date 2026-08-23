@@ -1662,7 +1662,8 @@ TEST(cuda_gated_deltanet_ar_batched_parity) {
         static_cast<const float*>(dQ.get()), static_cast<const float*>(dK.get()),
         static_cast<const float*>(dV.get()), static_cast<const float*>(dG.get()),
         static_cast<const float*>(dB.get()), static_cast<float*>(dS.get()),
-        static_cast<float*>(dOut.get()), nSeq, T, H, S);
+        static_cast<float*>(dOut.get()),
+        mimirmind::compute::GdnBatchedShape{nSeq, T, H, S});
     ops.flush();
     auto outB   = fromDevice(ops, dOut.get(), nSeq*act);
     auto stateB = fromDevice(ops, dS.get(),   nSeq*stt);

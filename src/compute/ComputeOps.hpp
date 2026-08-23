@@ -14,6 +14,20 @@
 
 namespace mimirmind::compute {
 
+/// 5.21 Increment II — shape/control bundle for the batched GatedDeltaNet
+/// recurrence. Groups the scalar dims + per-slot control that grow as the
+/// serving path gains variable-length (T>1/slot, ragged) prefill batching, so
+/// the recurrence method signatures change ONCE. `T` is the uniform per-slot
+/// token count today; the varlen extension (a per-slot `seqT[nSeq]` + ragged
+/// activation offsets) lands on THIS struct, not the method signatures.
+struct GdnBatchedShape {
+    std::size_t         nSeq{0};
+    std::size_t         T{1};                 // uniform tokens/slot (varlen: seqT — Inc II)
+    std::size_t         H{0};                 // value heads (hV)
+    std::size_t         S{0};                 // head/state dim
+    const std::uint8_t* activeMask{nullptr};  // [nSeq] freeze mask; nullptr => all active
+};
+
 /**
  * Backend-neutral kernel-launch interface. Every element-wise +
  * normalisation + attention kernel that the transformer block hits
@@ -280,11 +294,10 @@ public:
 
     virtual void gatedDeltaNetRecurrentBatchedAsync(
             const float* q, const float* k, const float* v, const float* gLog,
-            const float* beta, float* state, float* out, std::size_t nSeq,
-            std::size_t T, std::size_t H, std::size_t S,
-            const std::uint8_t* activeMask = nullptr) {   // 5.21-I freeze mask
+            const float* beta, float* state, float* out,
+            const GdnBatchedShape& shape) {
         (void)q; (void)k; (void)v; (void)gLog; (void)beta; (void)state;
-        (void)out; (void)nSeq; (void)T; (void)H; (void)S; (void)activeMask;
+        (void)out; (void)shape;
         throw std::runtime_error(
             "gatedDeltaNetRecurrentBatchedAsync: not supported on this backend");
     }
@@ -296,12 +309,9 @@ public:
     virtual void gatedDeltaNetRecurrentGateFusedBatchedAsync(
             const float* q, const float* k, const float* v, const float* alpha,
             const float* beta, const float* ssmA, const float* ssmDt,
-            float* state, float* out, std::size_t nSeq, std::size_t T,
-            std::size_t H, std::size_t S,
-            const std::uint8_t* activeMask = nullptr) {   // 5.21-I freeze mask
+            float* state, float* out, const GdnBatchedShape& shape) {
         (void)q; (void)k; (void)v; (void)alpha; (void)beta; (void)ssmA;
-        (void)ssmDt; (void)state; (void)out; (void)nSeq; (void)T; (void)H;
-        (void)S; (void)activeMask;
+        (void)ssmDt; (void)state; (void)out; (void)shape;
         throw std::runtime_error(
             "gatedDeltaNetRecurrentGateFusedBatchedAsync: not supported on this "
             "backend");

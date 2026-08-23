@@ -1710,9 +1710,10 @@ void GpuOps::gatedDeltaNetRecurrentAsync(const float* q, const float* k_,
 
 void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
         const float* q, const float* k_, const float* v, const float* gLog,
-        const float* beta, float* state, float* out, std::size_t nSeq,
-        std::size_t T, std::size_t H, std::size_t S,
-        const std::uint8_t* activeMask) {
+        const float* beta, float* state, float* out,
+        const GdnBatchedShape& shape) {
+    const std::size_t nSeq = shape.nSeq, T = shape.T, H = shape.H, S = shape.S;
+    const std::uint8_t* const activeMask = shape.activeMask;
     if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
         return;
     }
@@ -1785,8 +1786,9 @@ void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
 void GpuOps::gatedDeltaNetRecurrentGateFusedBatchedAsync(
         const float* q, const float* k_, const float* v, const float* alpha,
         const float* beta, const float* ssmA, const float* ssmDt, float* state,
-        float* out, std::size_t nSeq, std::size_t T, std::size_t H,
-        std::size_t S, const std::uint8_t* activeMask) {
+        float* out, const GdnBatchedShape& shape) {
+    const std::size_t nSeq = shape.nSeq, T = shape.T, H = shape.H, S = shape.S;
+    const std::uint8_t* const activeMask = shape.activeMask;
     if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
         return;
     }

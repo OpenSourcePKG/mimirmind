@@ -198,18 +198,13 @@ public:
     void gatedDeltaNetRecurrentBatchedAsync(const float* q, const float* k,
                                             const float* v, const float* gLog,
                                             const float* beta, float* state,
-                                            float* out, std::size_t nSeq,
-                                            std::size_t T, std::size_t H,
-                                            std::size_t S,
-                                            const std::uint8_t* activeMask
-                                                = nullptr) override;
+                                            float* out,
+                                            const GdnBatchedShape& shape) override;
 
     void gatedDeltaNetRecurrentGateFusedBatchedAsync(
             const float* q, const float* k, const float* v, const float* alpha,
             const float* beta, const float* ssmA, const float* ssmDt,
-            float* state, float* out, std::size_t nSeq, std::size_t T,
-            std::size_t H, std::size_t S,
-            const std::uint8_t* activeMask = nullptr) override;
+            float* state, float* out, const GdnBatchedShape& shape) override;
 
     void gatedDeltaNetVerifyBatchedAsync(const float* q, const float* k,
                                          const float* v, const float* gLog,
