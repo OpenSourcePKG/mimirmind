@@ -32,9 +32,11 @@ void gated_deltanet_ar_batched(
     float*       __restrict__ out,
     const int                 T,
     const int                 H,
-    const int                 S)
+    const int                 S,
+    const unsigned char* __restrict__ activeMask)   // 5.21-I: nullptr => all active
 {
     const int seq = blockIdx.y;
+    if (activeMask != nullptr && activeMask[seq] == 0) return;   // 5.21-I: freeze
     const int h   = blockIdx.x;
     const int j   = threadIdx.x;   // state column; block size == S
 

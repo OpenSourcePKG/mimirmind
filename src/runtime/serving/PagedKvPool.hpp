@@ -108,7 +108,8 @@ public:
                             const float*         vProj,
                             const std::uint32_t* writeBlockIdDev,
                             const std::int32_t*  writeSlotDev,
-                            std::size_t          nSeq);
+                            std::size_t          nSeq,
+                            const std::uint8_t*  activeMask = nullptr);
 
     [[nodiscard]] std::size_t numLayers()  const noexcept { return _numLayers; }
     [[nodiscard]] std::size_t numBlocks()  const noexcept { return _numBlocks; }

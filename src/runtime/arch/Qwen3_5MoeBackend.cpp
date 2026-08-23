@@ -1470,7 +1470,8 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
     // otherwise the per-seq host loop (host-computed slot address).
     if (ctx.writeBlockIdDev != nullptr && ctx.writeSlotDev != nullptr) {
         ctx.pool->writeTokensBatched(_ops, denseLayer, kProj, vProj,
-                                     ctx.writeBlockIdDev, ctx.writeSlotDev, nSeq);
+                                     ctx.writeBlockIdDev, ctx.writeSlotDev, nSeq,
+                                     ctx.activeMask);
     } else {
         for (std::size_t seq = 0; seq < nSeq; ++seq) {
             ctx.pool->writeToken(_ops, denseLayer,
@@ -1667,7 +1668,9 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     for (std::size_t seq = 0; seq < nSeq; ++seq) {
         float* const cvState = convBase + seq * convStateElems;
         float* const cvIn    = convInput + seq * dConv * convDim;
-        if (ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
+        const bool frozen = ctx.activeMaskHost != nullptr
+                            && ctx.activeMaskHost[seq] == 0;
+        if (!frozen && ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
             _ops.mulScalarAsync(cvState, 0.0F, convStateElems);
         }
         _ops.appendMemoryCopy(cvIn, cvState, convInBytes);
@@ -1678,7 +1681,11 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
                                       static_cast<const float*>(convW.usmPtr),
                                       qkvMixed, nSeq, /*T=*/1, convDim, dConv);
     // Save each sequence's trailing stateRows rows as the next conv state.
+    // 5.21-I: a frozen slot keeps its conv tail byte-identical (skip the save).
     for (std::size_t seq = 0; seq < nSeq; ++seq) {
+        if (ctx.activeMaskHost != nullptr && ctx.activeMaskHost[seq] == 0) {
+            continue;
+        }
         float* const cvState = convBase + seq * convStateElems;
         float* const cvIn    = convInput + seq * dConv * convDim;
         _ops.appendMemoryCopy(cvState, cvIn + /*T=*/1 * convDim, convInBytes);
@@ -1700,7 +1707,11 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     // --- gated delta-rule recurrence (persistent per-seq state) ------
     _ops.profileSection("gdn.recur");
     for (std::size_t seq = 0; seq < nSeq; ++seq) {
-        if (ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
+        // 5.21-I: a masked (frozen) slot must NOT be zeroed even if seqStart —
+        // freeze dominates; its state stays byte-identical.
+        const bool frozen = ctx.activeMaskHost != nullptr
+                            && ctx.activeMaskHost[seq] == 0;
+        if (!frozen && ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
             _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
         }
     }
@@ -1710,11 +1721,11 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
             qBuf, kBuf, vBuf, alphaBuf, betaBuf,
             static_cast<const float*>(ssmA.usmPtr),
             static_cast<const float*>(ssmDt.usmPtr),
-            stateBase, deltaOut, nSeq, /*T=*/1, hV, S);
+            stateBase, deltaOut, nSeq, /*T=*/1, hV, S, ctx.activeMask);
     } else {
         _ops.gatedDeltaNetRecurrentBatchedAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
                                                 stateBase, deltaOut, nSeq,
-                                                /*T=*/1, hV, S);
+                                                /*T=*/1, hV, S, ctx.activeMask);
     }
 
     // --- gated output norm: ssm_norm(out) * silu(z) ------------------

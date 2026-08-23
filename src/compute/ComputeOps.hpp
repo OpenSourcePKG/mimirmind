@@ -281,9 +281,10 @@ public:
     virtual void gatedDeltaNetRecurrentBatchedAsync(
             const float* q, const float* k, const float* v, const float* gLog,
             const float* beta, float* state, float* out, std::size_t nSeq,
-            std::size_t T, std::size_t H, std::size_t S) {
+            std::size_t T, std::size_t H, std::size_t S,
+            const std::uint8_t* activeMask = nullptr) {   // 5.21-I freeze mask
         (void)q; (void)k; (void)v; (void)gLog; (void)beta; (void)state;
-        (void)out; (void)nSeq; (void)T; (void)H; (void)S;
+        (void)out; (void)nSeq; (void)T; (void)H; (void)S; (void)activeMask;
         throw std::runtime_error(
             "gatedDeltaNetRecurrentBatchedAsync: not supported on this backend");
     }
@@ -296,10 +297,11 @@ public:
             const float* q, const float* k, const float* v, const float* alpha,
             const float* beta, const float* ssmA, const float* ssmDt,
             float* state, float* out, std::size_t nSeq, std::size_t T,
-            std::size_t H, std::size_t S) {
+            std::size_t H, std::size_t S,
+            const std::uint8_t* activeMask = nullptr) {   // 5.21-I freeze mask
         (void)q; (void)k; (void)v; (void)alpha; (void)beta; (void)ssmA;
         (void)ssmDt; (void)state; (void)out; (void)nSeq; (void)T; (void)H;
-        (void)S;
+        (void)S; (void)activeMask;
         throw std::runtime_error(
             "gatedDeltaNetRecurrentGateFusedBatchedAsync: not supported on this "
             "backend");
@@ -523,10 +525,12 @@ public:
                                            std::size_t nSeq, std::size_t blockSize,
                                            std::size_t width,
                                            runtime::KvDtype kvDtype
-                                               = runtime::KvDtype::F32) {
+                                               = runtime::KvDtype::F32,
+                                           const std::uint8_t* activeMask
+                                               = nullptr) {   // 5.21-I freeze mask
         (void)kProj; (void)vProj; (void)writeBlockIdDev; (void)writeSlotDev;
         (void)kPool; (void)vPool; (void)nSeq; (void)blockSize; (void)width;
-        (void)kvDtype;
+        (void)kvDtype; (void)activeMask;
         throw std::runtime_error(
             "writeKvTokensBatchedAsync: not supported on this backend");
     }

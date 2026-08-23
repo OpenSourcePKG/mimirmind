@@ -200,13 +200,16 @@ public:
                                             const float* beta, float* state,
                                             float* out, std::size_t nSeq,
                                             std::size_t T, std::size_t H,
-                                            std::size_t S) override;
+                                            std::size_t S,
+                                            const std::uint8_t* activeMask
+                                                = nullptr) override;
 
     void gatedDeltaNetRecurrentGateFusedBatchedAsync(
             const float* q, const float* k, const float* v, const float* alpha,
             const float* beta, const float* ssmA, const float* ssmDt,
             float* state, float* out, std::size_t nSeq, std::size_t T,
-            std::size_t H, std::size_t S) override;
+            std::size_t H, std::size_t S,
+            const std::uint8_t* activeMask = nullptr) override;
 
     void gatedDeltaNetVerifyBatchedAsync(const float* q, const float* k,
                                          const float* v, const float* gLog,
@@ -272,7 +275,9 @@ public:
                                    std::size_t nSeq, std::size_t blockSize,
                                    std::size_t width,
                                    runtime::KvDtype kvDtype
-                                       = runtime::KvDtype::F32) override;
+                                       = runtime::KvDtype::F32,
+                                   const std::uint8_t* activeMask
+                                       = nullptr) override;
     void moeGroupTilesAsync(const std::int32_t* expOffset,
                             std::int32_t* tileExpert, std::int32_t* tileRow0,
                             std::int32_t* tileRows, std::int32_t* nTiles,

@@ -110,13 +110,15 @@ void PagedKvPool::writeTokensBatched(compute::ComputeOps& ops,
                                      const float*         vProj,
                                      const std::uint32_t* writeBlockIdDev,
                                      const std::int32_t*  writeSlotDev,
-                                     std::size_t          nSeq) {
+                                     std::size_t          nSeq,
+                                     const std::uint8_t*  activeMask) {
     // Scatter the compact per-seq F32 projections into the paged slots. When
     // the pool is FP16 the seam casts F32->__half on write (5.14 I1); F32 is
     // a straight scatter. dtype selects the kernel variant inside GpuOps.
+    // 5.21-I: activeMask (nullptr => all active) freezes a masked slot's KV.
     ops.writeKvTokensBatchedAsync(kProj, vProj, writeBlockIdDev, writeSlotDev,
                                   _kPool[layer], _vPool[layer], nSeq, _blockSize,
-                                  slotElems(), _dtype);
+                                  slotElems(), _dtype, activeMask);
 }
 
 } // namespace mimirmind::runtime::serving

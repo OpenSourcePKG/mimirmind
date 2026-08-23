@@ -27,12 +27,14 @@ extern "C" __global__ void kv_write_tokens_batched(
           float*        __restrict__ vPool,
     const int                        nSeq,
     const int                        blockSize,
-    const int                        width)
+    const int                        width,
+    const unsigned char* __restrict__ activeMask)   // 5.21-I: nullptr => all active
 {
     const int seq = static_cast<int>(blockIdx.x);
     if (seq >= nSeq) {
         return;
     }
+    if (activeMask != nullptr && activeMask[seq] == 0) return;   // 5.21-I: freeze
     const size_t off =
         (static_cast<size_t>(writeBlockId[seq]) * static_cast<size_t>(blockSize)
          + static_cast<size_t>(writeSlot[seq])) * static_cast<size_t>(width);
@@ -57,12 +59,14 @@ extern "C" __global__ void kv_write_tokens_batched_fp16(
           __half*       __restrict__ vPool,
     const int                        nSeq,
     const int                        blockSize,
-    const int                        width)
+    const int                        width,
+    const unsigned char* __restrict__ activeMask)   // 5.21-I: nullptr => all active
 {
     const int seq = static_cast<int>(blockIdx.x);
     if (seq >= nSeq) {
         return;
     }
+    if (activeMask != nullptr && activeMask[seq] == 0) return;   // 5.21-I: freeze
     const size_t off =
         (static_cast<size_t>(writeBlockId[seq]) * static_cast<size_t>(blockSize)
          + static_cast<size_t>(writeSlot[seq])) * static_cast<size_t>(width);

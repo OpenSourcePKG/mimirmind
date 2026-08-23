@@ -1711,7 +1711,8 @@ void GpuOps::gatedDeltaNetRecurrentAsync(const float* q, const float* k_,
 void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
         const float* q, const float* k_, const float* v, const float* gLog,
         const float* beta, float* state, float* out, std::size_t nSeq,
-        std::size_t T, std::size_t H, std::size_t S) {
+        std::size_t T, std::size_t H, std::size_t S,
+        const std::uint8_t* activeMask) {
     if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
         return;
     }
@@ -1773,6 +1774,7 @@ void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
     k.setValue(7, toInt32(T, "gdnB T"));
     k.setValue(8, toInt32(H, "gdnB H"));
     k.setValue(9, toInt32(S, "gdnB S"));
+    k.setPtr  (10, activeMask);   // 5.21-I: nullptr => all-active (bit-identical)
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(H),
              static_cast<std::uint32_t>(nSeq), 1,
@@ -1784,7 +1786,7 @@ void GpuOps::gatedDeltaNetRecurrentGateFusedBatchedAsync(
         const float* q, const float* k_, const float* v, const float* alpha,
         const float* beta, const float* ssmA, const float* ssmDt, float* state,
         float* out, std::size_t nSeq, std::size_t T, std::size_t H,
-        std::size_t S) {
+        std::size_t S, const std::uint8_t* activeMask) {
     if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
         return;
     }
@@ -1824,6 +1826,7 @@ void GpuOps::gatedDeltaNetRecurrentGateFusedBatchedAsync(
     k.setValue(9,  toInt32(T, "gdnGF T"));
     k.setValue(10, toInt32(H, "gdnGF H"));
     k.setValue(11, toInt32(S, "gdnGF S"));
+    k.setPtr  (12, activeMask);   // 5.21-I: nullptr => all-active (bit-identical)
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(H),
              static_cast<std::uint32_t>(nSeq), 1,
@@ -2140,7 +2143,8 @@ void GpuOps::writeKvTokensBatchedAsync(const float* kProj, const float* vProj,
                                        void* kPool, void* vPool,
                                        std::size_t nSeq, std::size_t blockSize,
                                        std::size_t width,
-                                       runtime::KvDtype kvDtype) {
+                                       runtime::KvDtype kvDtype,
+                                       const std::uint8_t* activeMask) {
     if (nSeq == 0 || width == 0) {
         return;
     }
@@ -2157,6 +2161,7 @@ void GpuOps::writeKvTokensBatchedAsync(const float* kProj, const float* vProj,
     k.setValue(6, toInt32(nSeq, "writeKv nSeq"));
     k.setValue(7, toInt32(blockSize, "writeKv blockSize"));
     k.setValue(8, toInt32(width, "writeKv width"));
+    k.setPtr  (9, activeMask);   // 5.21-I: nullptr => all-active (bit-identical)
     const std::uint32_t blk = width < 256 ? static_cast<std::uint32_t>(width) : 256;
     k.launch(_ctx.stream(), static_cast<std::uint32_t>(nSeq), 1, 1, blk, 1, 1);
 }

@@ -65,6 +65,15 @@ struct BatchedDecodeCtx {
 
     // ---- GatedDeltaNet (linear layers) ----
     const std::uint8_t*   isSeqStart{nullptr};     // [nSeq]: 1 => zero SsmState this step
+    // 5.21 Increment I — per-slot active mask. When set, row seq with
+    // activeMask[seq]==0 is FROZEN: all its persistent-state writes (KV scatter,
+    // GDN recurrence, conv tail, seqStart reset) are skipped so its state stays
+    // byte-identical. Enables a prefilling/parked slot to coexist in the batch
+    // without corruption. nullptr => all rows active (bit-identical legacy path).
+    // Mask DOMINATES isSeqStart (freeze wins over zero). `activeMask` = device
+    // pointer (kernels); `activeMaskHost` = host copy (host-side guard loops).
+    const std::uint8_t*   activeMask{nullptr};     // [nSeq] device
+    const std::uint8_t*   activeMaskHost{nullptr}; // [nSeq] host
 };
 
 /**
