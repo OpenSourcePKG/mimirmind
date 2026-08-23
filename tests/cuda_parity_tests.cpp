@@ -1915,6 +1915,67 @@ TEST(cuda_ssm_conv1d_batched_varlen_parity) {
                 nSeq, channels, K, maxErr);
 }
 
+// 5.21 Increment II — VARLEN KV write: the batched KV scatter is per-ROW, so a
+// prefill slot's chunk = several per-token rows with per-token block/slot targets.
+// This locks in that guarantee (per-token placement) + the activeMask freeze that
+// Increment III relies on; the kernel needs no varlen-specific change.
+TEST(cuda_kv_write_tokens_batched_varlen_mask) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t nKvHeads = 2, headSize = 8, width = nKvHeads * headSize;
+    const std::size_t blockSize = 4, numBlocks = 8;
+    // 5 rows: slot A prefill tokens @pos 0,1,2 (block 0 slots 0,1,2), slot B decode
+    // @pos 5 (block 1 slot 1), slot C FROZEN (must not be written).
+    const std::size_t nRow = 5;
+    std::vector<std::uint32_t> wbid = {0, 0, 0, 1, 2};
+    std::vector<std::int32_t>  wslot= {0, 1, 2, 1, 0};
+    std::vector<std::uint8_t>  mask = {1, 1, 1, 1, 0};   // row 4 (slot C) frozen
+
+    std::vector<float> kProj(nRow*width), vProj(nRow*width);
+    for (std::size_t i = 0; i < nRow*width; ++i) { kProj[i] = 1.f + 0.01f*i; vProj[i] = 2.f + 0.01f*i; }
+
+    const std::size_t poolElems = numBlocks*blockSize*width;
+    std::vector<float> kInit(poolElems, -7.f), vInit(poolElems, -9.f);  // sentinel
+    auto dK = toDevice(ops, kInit); auto dV = toDevice(ops, vInit);
+    auto dKp = toDevice(ops, kProj); auto dVp = toDevice(ops, vProj);
+    auto dWb = ops.allocate(nRow*sizeof(std::uint32_t));
+    auto dWs = ops.allocate(nRow*sizeof(std::int32_t));
+    auto dMask = ops.allocate(nRow*sizeof(std::uint8_t));
+    ops.uploadHostBytes(dWb.get(),   wbid.data(),  nRow*sizeof(std::uint32_t));
+    ops.uploadHostBytes(dWs.get(),   wslot.data(), nRow*sizeof(std::int32_t));
+    ops.uploadHostBytes(dMask.get(), mask.data(),  nRow*sizeof(std::uint8_t));
+
+    ops.writeKvTokensBatchedAsync(
+        static_cast<const float*>(dKp.get()), static_cast<const float*>(dVp.get()),
+        static_cast<const std::uint32_t*>(dWb.get()),
+        static_cast<const std::int32_t*>(dWs.get()),
+        dK.get(), dV.get(), nRow, blockSize, width,
+        mimirmind::runtime::KvDtype::F32,
+        static_cast<const std::uint8_t*>(dMask.get()));
+    ops.flush();
+    auto kOut = fromDevice(ops, dK.get(), poolElems);
+    auto vOut = fromDevice(ops, dV.get(), poolElems);
+
+    double maxErr = 0.0;
+    for (std::size_t r = 0; r < nRow; ++r) {
+        const std::size_t off = (static_cast<std::size_t>(wbid[r])*blockSize
+                                 + static_cast<std::size_t>(wslot[r])) * width;
+        for (std::size_t j = 0; j < width; ++j) {
+            if (mask[r] == 0) {   // frozen row: destination must stay sentinel
+                EXPECT_NEAR(kOut[off+j], -7.f, 0.f);
+                EXPECT_NEAR(vOut[off+j], -9.f, 0.f);
+            } else {              // active row: destination == this row's proj
+                maxErr = std::max(maxErr, std::fabs((double)kOut[off+j]-(double)kProj[r*width+j]));
+                EXPECT_NEAR(kOut[off+j], kProj[r*width+j], 0.f);
+                EXPECT_NEAR(vOut[off+j], vProj[r*width+j], 0.f);
+            }
+        }
+    }
+    std::printf("[kv-write-varlen-mask] nRow=%zu width=%zu (row4 frozen) maxErr=%.2e\n",
+                nRow, width, maxErr);
+}
+
 // M-Cuda.Batch Cat B — batched moe_gate_up_fused_k_q4k vs N single-token
 // runs. Each token has its own x and routed experts; batched output must
 // be byte-identical to running each token alone.
