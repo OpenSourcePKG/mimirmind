@@ -1090,6 +1090,18 @@ if(MIMIRMIND_ENABLE_CUDA)
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON)
     target_link_libraries(microbench_nvfp4blk PRIVATE CUDA::cudart)
+
+    # microbench_nvfp4blk_repack — A/B the dense NVFP4 GEMV load pipeline
+    # (prod 20-byte in-place vs repacked 16-aligned nibble/scale streams),
+    # roadmap 5.18.3(a)/5.18.5. Links the prod kernel as the v0 reference +
+    # correctness oracle. See tools/microbench/nvfp4blk_gemv_repack_bench.cu.
+    add_executable(microbench_nvfp4blk_repack
+        tools/microbench/nvfp4blk_gemv_repack_bench.cu
+        kernels/cuda/common/matmul_nvfp4blk_vec.cu)
+    set_target_properties(microbench_nvfp4blk_repack PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(microbench_nvfp4blk_repack PRIVATE CUDA::cudart)
 endif()
 
 # ---- mimirmind_core_cuda — NVIDIA CUDA-tied foundation --------------------
