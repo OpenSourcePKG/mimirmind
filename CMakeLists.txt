@@ -1102,6 +1102,16 @@ if(MIMIRMIND_ENABLE_CUDA)
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON)
     target_link_libraries(microbench_nvfp4blk_repack PRIVATE CUDA::cudart)
+
+    # microbench_nvfp4blk_occ — occupancy / latency-hiding A/B (rows-per-warp
+    # MLP + split-K) on the repacked-aligned layout, roadmap 5.18.3(a) brick 2.
+    add_executable(microbench_nvfp4blk_occ
+        tools/microbench/nvfp4blk_gemv_occ_bench.cu
+        kernels/cuda/common/matmul_nvfp4blk_vec.cu)
+    set_target_properties(microbench_nvfp4blk_occ PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(microbench_nvfp4blk_occ PRIVATE CUDA::cudart)
 endif()
 
 # ---- mimirmind_core_cuda — NVIDIA CUDA-tied foundation --------------------
