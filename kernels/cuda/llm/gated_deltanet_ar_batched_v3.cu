@@ -57,7 +57,9 @@ void gated_deltanet_ar_batched_v3(
     const int                 T,
     const int                 H,
     const int                 S,
-    const unsigned char* __restrict__ activeMask)   // 5.21-I: nullptr => all active
+    const unsigned char* __restrict__ activeMask,   // 5.21-I: nullptr => all active
+    const int* __restrict__ seqT,                   // 5.21-II: nullptr => uniform T
+    const int* __restrict__ seqOff)                 // 5.21-II: per-slot token offset
 {
     const int seq = blockIdx.y;
     if (activeMask != nullptr && activeMask[seq] == 0) return;   // 5.21-I: freeze
@@ -70,9 +72,12 @@ void gated_deltanet_ar_batched_v3(
     __shared__ float ksh[GATED_DELTANET_AR_MAX_S];
     __shared__ float qsh[GATED_DELTANET_AR_MAX_S];
 
-    const size_t actSeqStride   = (size_t)T * H * S;   // q,k,v,out
-    const size_t gateSeqStride  = (size_t)T * H;       // gLog,beta
     const size_t stateSeqStride = (size_t)H * S * S;   // state
+    // 5.21-II varlen: per-slot token count (Tseq) + first-token offset (tokBase,
+    // in token units). nullptr => uniform T (tokBase = seq*T) => bit-identical.
+    const int    Tseq    = (seqT   != nullptr) ? seqT[seq]   : T;
+    const size_t tokBase = (seqOff != nullptr) ? (size_t)seqOff[seq]
+                                               : (size_t)seq * (size_t)T;
 
     float* s = state + (size_t)seq * stateSeqStride + (size_t)h * S * S;
     const float qScale = 1.0f / sqrtf((float)S);
@@ -85,11 +90,10 @@ void gated_deltanet_ar_batched_v3(
     }
     __syncthreads();
 
-    for (int t = 0; t < T; ++t) {
-        const size_t base    = (size_t)seq * actSeqStride
-                             + (size_t)(t * H + h) * S;
-        const size_t gateIdx = (size_t)seq * gateSeqStride
-                             + (size_t)(t * H + h);
+    for (int t = 0; t < Tseq; ++t) {
+        const size_t base    = (tokBase + (size_t)t) * (size_t)H * S
+                             + (size_t)h * S;
+        const size_t gateIdx = (tokBase + (size_t)t) * (size_t)H + (size_t)h;
 
         ksh[j] = k[base + j];
         qsh[j] = q[base + j] * qScale;
@@ -151,7 +155,9 @@ void gated_deltanet_ar_batched_v3_gatefused(
     const int                 T,
     const int                 H,
     const int                 S,
-    const unsigned char* __restrict__ activeMask)   // 5.21-I: nullptr => all active
+    const unsigned char* __restrict__ activeMask,   // 5.21-I: nullptr => all active
+    const int* __restrict__ seqT,                   // 5.21-II: nullptr => uniform T
+    const int* __restrict__ seqOff)                 // 5.21-II: per-slot token offset
 {
     const int seq = blockIdx.y;
     if (activeMask != nullptr && activeMask[seq] == 0) return;   // 5.21-I: freeze
@@ -162,9 +168,12 @@ void gated_deltanet_ar_batched_v3_gatefused(
     __shared__ float ksh[GATED_DELTANET_AR_MAX_S];
     __shared__ float qsh[GATED_DELTANET_AR_MAX_S];
 
-    const size_t actSeqStride   = (size_t)T * H * S;
-    const size_t gateSeqStride  = (size_t)T * H;
     const size_t stateSeqStride = (size_t)H * S * S;
+    // 5.21-II varlen: per-slot token count (Tseq) + first-token offset (tokBase,
+    // in token units). nullptr => uniform T (tokBase = seq*T) => bit-identical.
+    const int    Tseq    = (seqT   != nullptr) ? seqT[seq]   : T;
+    const size_t tokBase = (seqOff != nullptr) ? (size_t)seqOff[seq]
+                                               : (size_t)seq * (size_t)T;
 
     float* s = state + (size_t)seq * stateSeqStride + (size_t)h * S * S;
     const float qScale = 1.0f / sqrtf((float)S);
@@ -176,11 +185,10 @@ void gated_deltanet_ar_batched_v3_gatefused(
     }
     __syncthreads();
 
-    for (int t = 0; t < T; ++t) {
-        const size_t base    = (size_t)seq * actSeqStride
-                             + (size_t)(t * H + h) * S;
-        const size_t gateIdx = (size_t)seq * gateSeqStride
-                             + (size_t)(t * H + h);
+    for (int t = 0; t < Tseq; ++t) {
+        const size_t base    = (tokBase + (size_t)t) * (size_t)H * S
+                             + (size_t)h * S;
+        const size_t gateIdx = (tokBase + (size_t)t) * (size_t)H + (size_t)h;
 
         ksh[j] = k[base + j];
         qsh[j] = q[base + j] * qScale;

@@ -22,10 +22,17 @@ namespace mimirmind::compute {
 /// activation offsets) lands on THIS struct, not the method signatures.
 struct GdnBatchedShape {
     std::size_t         nSeq{0};
-    std::size_t         T{1};                 // uniform tokens/slot (varlen: seqT — Inc II)
+    std::size_t         T{1};                 // uniform tokens/slot (fallback when seqT==nullptr)
     std::size_t         H{0};                 // value heads (hV)
     std::size_t         S{0};                 // head/state dim
     const std::uint8_t* activeMask{nullptr};  // [nSeq] freeze mask; nullptr => all active
+    // 5.21 Increment II — variable-length (ragged) batching. When seqT is set,
+    // slot `seq` carries seqT[seq] tokens (T=1 decode rows, T=chunk prefill rows)
+    // and its activations/out live at token offset seqOff[seq] (prefix-sum of
+    // seqT). nullptr => uniform T layout (slot `seq` at seq*T), bit-identical to
+    // the pre-varlen path. Both are device int32 arrays [nSeq].
+    const std::int32_t* seqT{nullptr};        // [nSeq] per-slot token count
+    const std::int32_t* seqOff{nullptr};      // [nSeq] per-slot first-token offset
 };
 
 /**

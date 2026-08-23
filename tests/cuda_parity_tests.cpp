@@ -1706,6 +1706,96 @@ TEST(cuda_gated_deltanet_ar_batched_parity) {
                 nSeq, T, H, S, maxErr);
 }
 
+// 5.21 Increment II — VARLEN batched GDN recurrence: ragged per-slot seqT
+// (mixed token counts) vs N single-seq runs each with its own T. Proves the
+// ragged seqT/seqOff indexing produces the same math as per-slot decode/prefill.
+TEST(cuda_gated_deltanet_ar_batched_varlen_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t H = 4, S = 16;
+    const std::vector<std::int32_t> seqT = {2, 5, 3};   // ragged per-slot tokens
+    const std::size_t nSeq = seqT.size();
+    std::vector<std::int32_t> seqOff(nSeq, 0);
+    std::size_t totalTok = 0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        seqOff[s] = static_cast<std::int32_t>(totalTok);
+        totalTok += static_cast<std::size_t>(seqT[s]);
+    }
+    const std::size_t hs = H * S, stt = H * S * S;
+
+    std::vector<float> Q(totalTok*hs), K(totalTok*hs), V(totalTok*hs);
+    std::vector<float> G(totalTok*H),  B(totalTok*H),  ST(nSeq*stt);
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        const std::uint32_t o = static_cast<std::uint32_t>(s) * 7u;
+        const std::size_t tt = static_cast<std::size_t>(seqT[s]);
+        const std::size_t to = static_cast<std::size_t>(seqOff[s]);
+        auto q=randVec(tt*hs,0x1a1u+o); auto k=randVec(tt*hs,0x1b2u+o);
+        auto v=randVec(tt*hs,0x1c3u+o); auto g=randVec(tt*H,0x1d4u+o);
+        auto b=randVec(tt*H,0x1e5u+o);  auto st=randVec(stt,0x1f6u+o);
+        std::copy(q.begin(),q.end(),Q.begin()+to*hs);
+        std::copy(k.begin(),k.end(),K.begin()+to*hs);
+        std::copy(v.begin(),v.end(),V.begin()+to*hs);
+        std::copy(g.begin(),g.end(),G.begin()+to*H);
+        std::copy(b.begin(),b.end(),B.begin()+to*H);
+        std::copy(st.begin(),st.end(),ST.begin()+s*stt);
+    }
+
+    auto dQ=toDevice(ops,Q); auto dK=toDevice(ops,K); auto dV=toDevice(ops,V);
+    auto dG=toDevice(ops,G); auto dB=toDevice(ops,B); auto dSt=toDevice(ops,ST);
+    auto dOut = ops.allocate(totalTok*hs*sizeof(float));
+    auto dSeqT = ops.allocate(nSeq*sizeof(std::int32_t));
+    auto dSeqOff = ops.allocate(nSeq*sizeof(std::int32_t));
+    ops.uploadHostBytes(dSeqT.get(),   seqT.data(),   nSeq*sizeof(std::int32_t));
+    ops.uploadHostBytes(dSeqOff.get(), seqOff.data(), nSeq*sizeof(std::int32_t));
+    std::size_t maxT = 1; for (auto t : seqT) maxT = std::max(maxT, (std::size_t)t);
+    mimirmind::compute::GdnBatchedShape shp{
+        nSeq, maxT, H, S, /*activeMask=*/nullptr,
+        static_cast<const std::int32_t*>(dSeqT.get()),
+        static_cast<const std::int32_t*>(dSeqOff.get())};
+    ops.gatedDeltaNetRecurrentBatchedAsync(
+        static_cast<const float*>(dQ.get()), static_cast<const float*>(dK.get()),
+        static_cast<const float*>(dV.get()), static_cast<const float*>(dG.get()),
+        static_cast<const float*>(dB.get()), static_cast<float*>(dSt.get()),
+        static_cast<float*>(dOut.get()), shp);
+    ops.flush();
+    auto outB   = fromDevice(ops, dOut.get(), totalTok*hs);
+    auto stateB = fromDevice(ops, dSt.get(),  nSeq*stt);
+
+    double maxErr = 0.0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        const std::size_t tt = static_cast<std::size_t>(seqT[s]);
+        const std::size_t to = static_cast<std::size_t>(seqOff[s]);
+        std::vector<float> q(Q.begin()+to*hs, Q.begin()+(to+tt)*hs);
+        std::vector<float> k(K.begin()+to*hs, K.begin()+(to+tt)*hs);
+        std::vector<float> v(V.begin()+to*hs, V.begin()+(to+tt)*hs);
+        std::vector<float> g(G.begin()+to*H,  G.begin()+(to+tt)*H);
+        std::vector<float> b(B.begin()+to*H,  B.begin()+(to+tt)*H);
+        std::vector<float> st(ST.begin()+s*stt, ST.begin()+(s+1)*stt);
+        auto dq=toDevice(ops,q); auto dk=toDevice(ops,k); auto dv=toDevice(ops,v);
+        auto dg=toDevice(ops,g); auto db=toDevice(ops,b); auto dst=toDevice(ops,st);
+        auto dSingle = ops.allocate(tt*hs*sizeof(float));
+        ops.gatedDeltaNetRecurrentAsync(
+            static_cast<const float*>(dq.get()), static_cast<const float*>(dk.get()),
+            static_cast<const float*>(dv.get()), static_cast<const float*>(dg.get()),
+            static_cast<const float*>(db.get()), static_cast<float*>(dst.get()),
+            static_cast<float*>(dSingle.get()), tt, H, S);
+        ops.flush();
+        auto outS   = fromDevice(ops, dSingle.get(), tt*hs);
+        auto stateS = fromDevice(ops, dst.get(),     stt);
+        for (std::size_t i = 0; i < tt*hs; ++i) {
+            maxErr = std::max(maxErr, std::fabs((double)outB[to*hs+i]-(double)outS[i]));
+            EXPECT_NEAR(outB[to*hs+i], outS[i], 1e-5f + 1e-6f*std::fabs(outS[i]));
+        }
+        for (std::size_t i = 0; i < stt; ++i) {
+            maxErr = std::max(maxErr, std::fabs((double)stateB[s*stt+i]-(double)stateS[i]));
+            EXPECT_NEAR(stateB[s*stt+i], stateS[i], 1e-5f + 1e-6f*std::fabs(stateS[i]));
+        }
+    }
+    std::printf("[gdn-varlen-parity] nSeq=%zu seqT={2,5,3} H=%zu S=%zu maxErr=%.2e\n",
+                nSeq, H, S, maxErr);
+}
+
 // M-Cuda.Batch Cat C-P0 — batched ssm_conv1d vs N single-sequence runs.
 // Each sequence has its own conv input (its rolling conv-tail prepended);
 // batched output must be byte-identical to running each sequence alone.

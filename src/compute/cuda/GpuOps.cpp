@@ -1776,6 +1776,15 @@ void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
     k.setValue(8, toInt32(H, "gdnB H"));
     k.setValue(9, toInt32(S, "gdnB S"));
     k.setPtr  (10, activeMask);   // 5.21-I: nullptr => all-active (bit-identical)
+    if (useV3) {
+        // 5.21-II varlen: only the v3 kernel carries the ragged seqT/seqOff args.
+        k.setPtr(11, shape.seqT);
+        k.setPtr(12, shape.seqOff);
+    } else if (shape.seqT != nullptr) {
+        throw std::runtime_error(
+            "gatedDeltaNetRecurrentBatchedAsync: varlen (seqT) requires the v3 "
+            "kernel (MIMIRMIND_GDN_V3=1)");
+    }
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(H),
              static_cast<std::uint32_t>(nSeq), 1,
@@ -1829,6 +1838,8 @@ void GpuOps::gatedDeltaNetRecurrentGateFusedBatchedAsync(
     k.setValue(10, toInt32(H, "gdnGF H"));
     k.setValue(11, toInt32(S, "gdnGF S"));
     k.setPtr  (12, activeMask);   // 5.21-I: nullptr => all-active (bit-identical)
+    k.setPtr  (13, shape.seqT);   // 5.21-II varlen (always v3): nullptr => uniform T
+    k.setPtr  (14, shape.seqOff);
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(H),
              static_cast<std::uint32_t>(nSeq), 1,
