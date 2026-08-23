@@ -14,8 +14,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace mimirmind::runtime::serving {
 
@@ -53,6 +55,13 @@ SlabDecodeStepper::SlabDecodeStepper(compute::ComputeOps&    ops,
     if (_dims.dModel == 0 || _dims.vocabLm == 0 || _dims.blockCount == 0) {
         throw std::invalid_argument(
             "SlabDecodeStepper: dModel / vocabLm / blockCount must be > 0");
+    }
+
+    // Blocked-NVFP4 lm_head gate: use the ".nv" sibling (if the loader built
+    // one) only up to this batch size. Default 1 (single-user only); higher
+    // values are for A/B once a crossover is found. env "0" disables.
+    if (const char* lhe = std::getenv("MIMIRMIND_LMHEAD_NVFP4")) {
+        _lmHeadNvMaxT = std::atoi(lhe);
     }
 
     // Decode scratch is sized for the wider of the decode batch (`_capacity`
@@ -125,7 +134,11 @@ std::int32_t SlabDecodeStepper::prefillSlot(
     _ops.rmsNormAsync(lastRow, 1, _dims.dModel,
                       static_cast<const float*>(_w.outNorm->usmPtr),
                       _dims.rmsNormEps, normBuf);
-    _gmm.matmul(_w.lmHead->type, _w.lmHead->usmPtr, _dims.vocabLm, _dims.dModel,
+    // Prefill first-token logits are M=1 -> use the blocked-NVFP4 lm_head
+    // sibling when enabled (1 <= maxT); it is bandwidth-optimal at M=1.
+    const core::gguf::GgufTensor* lhP =
+        (_w.lmHeadNv != nullptr && 1 <= _lmHeadNvMaxT) ? _w.lmHeadNv : _w.lmHead;
+    _gmm.matmul(lhP->type, lhP->usmPtr, _dims.vocabLm, _dims.dModel,
                 normBuf, 1, logits, _lmScr.as<float>());
     _ops.flush();
     _ops.readbackToHost(_hostLogits.data(), logits, _dims.vocabLm * sizeof(float));
@@ -189,7 +202,13 @@ void SlabDecodeStepper::step(std::span<const std::int32_t> tokens,
     _ops.rmsNormAsync(xBuf, nSeq, _dims.dModel,
                       static_cast<const float*>(_w.outNorm->usmPtr),
                       _dims.rmsNormEps, normBuf);
-    _gmm.matmul(_w.lmHead->type, _w.lmHead->usmPtr, _dims.vocabLm, _dims.dModel,
+    // Blocked-NVFP4 lm_head only at low batch (nSeq <= maxT): ~3% faster
+    // single-user; at higher batch keep BF16-TF32-TC (NVFP4 GEMM regresses
+    // -15..-18% @conc16/32, measured).
+    const core::gguf::GgufTensor* lh =
+        (_w.lmHeadNv != nullptr && static_cast<int>(nSeq) <= _lmHeadNvMaxT)
+            ? _w.lmHeadNv : _w.lmHead;
+    _gmm.matmul(lh->type, lh->usmPtr, _dims.vocabLm, _dims.dModel,
                 normBuf, nSeq, logits, _lmScr.as<float>());
     _ops.profileStepEnd();
     _ops.flush();

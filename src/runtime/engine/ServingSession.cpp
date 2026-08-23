@@ -612,7 +612,10 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         // batcher splits longer prompts into successive appends.
         l0->prefillChunk = std::min<std::size_t>(maxContext, 512);
 
-        serving::SlabDecodeStepper::Weights w{tokEmb, outNorm, lmHead};
+        // Optional blocked-NVFP4 lm_head sibling (loader step 5f-lmhead); the
+        // stepper dispatches it only at low batch (MIMIRMIND_LMHEAD_NVFP4).
+        const auto* lmHeadNv = _e._weights->find("output.weight.nv");
+        serving::SlabDecodeStepper::Weights w{tokEmb, outNorm, lmHead, lmHeadNv};
         serving::SlabDecodeStepper::Dims dims{};
         dims.dModel   = _e._config.embeddingLength;
         dims.vocabLm  = lmHead->dimensions.size() >= 2 ? lmHead->dimensions[1]
