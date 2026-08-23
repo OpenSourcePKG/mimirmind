@@ -57,9 +57,11 @@ public:
         const core::gguf::GgufTensor* outNorm;  ///< final RMSNorm weight
         const core::gguf::GgufTensor* lmHead;   ///< output projection (BF16)
         /// Optional native blocked-NVFP4 lm_head sibling ("output.weight.nv").
+        /// Opt-in (MIMIRMIND_LMHEAD_NVFP4>=1), default OFF -> normally null.
         /// Dispatched instead of `lmHead` only at low batch (nSeq <= the
-        /// MIMIRMIND_LMHEAD_NVFP4 threshold): ~3% faster single-user decode,
-        /// while batch (M>1) keeps BF16-TF32-TC which wins there. Null = absent.
+        /// MIMIRMIND_LMHEAD_NVFP4 threshold), while batch (M>1) keeps BF16-TF32-TC.
+        /// NOTE: measured neutral on current main (cuBLAS BF16 lm_head matches it);
+        /// kept only for non-cuBLAS / dense-NVFP4 paths. Null = absent.
         const core::gguf::GgufTensor* lmHeadNv = nullptr;
     };
 

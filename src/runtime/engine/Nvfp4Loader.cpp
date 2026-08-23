@@ -1017,12 +1017,20 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
     // throughput @conc16/32). So we KEEP the BF16 "output.weight" AND add a
     // native blocked-NVFP4 sibling "output.weight.nv" (lossless repack of the
     // original NVFP4 in _nvfp4Model), and SlabDecodeStepper dispatches the .nv
-    // variant only when nSeq <= MIMIRMIND_LMHEAD_NVFP4 (default 1 = single-user
-    // only) and the BF16 copy at higher batch. Costs ~+303 MiB (the NVFP4 copy;
-    // the BF16 stays), trivial on 128 GB. Default ON; =0 disables (no sibling).
+    // variant only when nSeq <= MIMIRMIND_LMHEAD_NVFP4 (single-user only) and the
+    // BF16 copy at higher batch. Costs ~+303 MiB (the NVFP4 copy; the BF16 stays).
+    //
+    // Default OFF (opt-in). Runtime A/B on current main (2026-08-23, config.prof.json,
+    // Qwen3.6-35B primary) showed NO measurable single-user win: 39.41 (BF16) vs 39.33
+    // (NVFP4) tok/s = noise. The earlier +3% (35.6->36.7) was vs an OLD tree; on current
+    // main MIMIRMIND_CUBLAS=1 routes the BF16 lm_head GEMV through cuBLAS-TF32-TC, which
+    // now matches the NVFP4 blocked path, so the sibling earns nothing. Kept as a
+    // conditional opt-in for future non-cuBLAS BF16 paths / dense-NVFP4-only models:
+    // set MIMIRMIND_LMHEAD_NVFP4>=1 to load the sibling (and dispatch it at nSeq<=that).
     if (e._nvfp4Model) {
         const char* lhEnv = std::getenv("MIMIRMIND_LMHEAD_NVFP4");
-        const bool lhOn = (lhEnv == nullptr) || (std::string_view{lhEnv} != "0");
+        const bool lhOn =
+            (lhEnv != nullptr) && (std::string_view{lhEnv} != "0");
         if (lhOn) {
             auto isLmHead = [](std::string_view n) {
                 return n == "output.weight" || n.ends_with(".output.weight");
@@ -1071,7 +1079,7 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
             MM_LOG_INFO("engine",
                         "loadModelNvfp4: added {} lm_head '.nv' blocked-NVFP4 "
                         "sibling(s) (+{} MiB), BF16 kept; NVFP4 used for nSeq<=maxT "
-                        "(MIMIRMIND_LMHEAD_NVFP4, default 1)",
+                        "(MIMIRMIND_LMHEAD_NVFP4 opt-in, default OFF)",
                         nSib, addBytes >> 20);
         }
     }
