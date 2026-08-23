@@ -88,6 +88,7 @@ struct BlockBuffers {
     ComputeBuffer moeXCompact;    // [nRowsMax, d_model]
     ComputeBuffer moeGateCompact; // [nRowsMax, ffPerExpert]
     ComputeBuffer moeUpCompact;   // [nRowsMax, ffPerExpert]
+    ComputeBuffer moeW13Compact;  // [nRowsMax, 2*ffPerExpert] (5.18.8 fused gate+up out)
     ComputeBuffer moeDownCompact; // [nRowsMax, d_model]
 
     // M-Cuda.MoeGroup — device token-grouping build outputs (moe_group_build).

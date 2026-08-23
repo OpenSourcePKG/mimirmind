@@ -1167,7 +1167,35 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         // (+2-4% vs m4). Interleaved layout like GD-b (no de-interleave cache);
         // default-on, mutually exclusive with deint.
         const bool m1nb = _useM1nb && nSeq == 1 && !deint;
-        if (deint) {
+        // 5.18.8: fuse gate+up into ONE stacked-w13 deint GEMM (N=2*n_ff). One
+        // launch instead of two AND double N -> better SM fill on the tileM=4
+        // M=1 kernel. Per-block stacked bank [nExp][2*n_ff][d_model] built once
+        // (gate[e] rows then up[e] rows), mirroring the GDN in_proj concat-cache.
+        // Bit-identical: same weights, same silu*up math (fused split kernel).
+        const bool w13Fused = deint && _moeW13Fuse;
+        if (w13Fused) {
+            const auto [ge, gb] = moeBlockGeom(gateExps.type);   // {32,20} NVFP4_BLK
+            const std::size_t perExpertBytes = n_ff_exp * ((d_model / ge) * gb);
+            compute::ComputeBuffer& w13Buf = _moeW13W[blockIdx];
+            if (w13Buf.bytes() == 0) {
+                w13Buf = _ops.allocate(nExperts * 2 * perExpertBytes);
+                auto* const w13 = static_cast<unsigned char*>(
+                    static_cast<void*>(w13Buf.as<float>()));
+                for (std::size_t e = 0; e < nExperts; ++e) {
+                    _ops.appendMemoryCopy(w13 + e * 2 * perExpertBytes,
+                        gateBase + e * perExpertBytes, perExpertBytes);
+                    _ops.appendMemoryCopy(w13 + e * 2 * perExpertBytes + perExpertBytes,
+                        upBase + e * perExpertBytes, perExpertBytes);
+                }
+            }
+            float* const w13Comp = s.moeW13Compact.as<float>();
+            const auto* const w13Base = static_cast<const unsigned char*>(
+                static_cast<const void*>(w13Buf.as<float>()));
+            _ops.moeGroupedGemmNvfp4DeintAsync(xComp, w13Base, w13Comp,
+                tileExpert, tileRow0, tileRows, d_model, 2 * n_ff_exp, nExperts,
+                maxTiles, smallM);
+            _ops.siluMulSplitAsync(w13Comp, gateComp, R, n_ff_exp);
+        } else if (deint) {
             _ops.moeGroupedGemmNvfp4DeintAsync(xComp, gateBase, gateComp,
                 tileExpert, tileRow0, tileRows, d_model, n_ff_exp, nExperts,
                 maxTiles, smallM);
@@ -1185,7 +1213,9 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
             _ops.moeGroupedGemmNvfp4Async(xComp, upBase, upComp,
                 tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles, smallM);
         }
-        _ops.siluMulAsync(gateComp, upComp, R * n_ff_exp);      // silu(gate)*up
+        if (!w13Fused) {
+            _ops.siluMulAsync(gateComp, upComp, R * n_ff_exp);  // silu(gate)*up
+        }
         // down: weight [nExperts][d_model][n_ff_exp] (N=d_model, K=n_ff_exp)
         if (deint) {
             _ops.moeGroupedGemmNvfp4DeintAsync(gateComp, downBase, downComp,

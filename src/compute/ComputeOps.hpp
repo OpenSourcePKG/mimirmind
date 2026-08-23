@@ -118,6 +118,19 @@ public:
                               const float* up,
                               std::size_t  n) = 0;
 
+    // SwiGLU split for a stacked-w13 grouped-GEMM output (roadmap 5.18.8):
+    //   out[r*nff + j] = silu(w13[r*2nff + j]) * w13[r*2nff + nff + j]
+    // where w13 is [rows][2*nff] laid out per row as [gate(nff) | up(nff)].
+    // Only reached on the CUDA device-driven deint decode path when the MoE
+    // gate+up fusion is enabled (MIMIRMIND_MOE_W13_FUSE=1); default-throws so
+    // non-CUDA backends never silently mis-run it.
+    virtual void siluMulSplitAsync(const float* w13, float* out,
+                                   std::size_t rows, std::size_t nff) {
+        (void)w13; (void)out; (void)rows; (void)nff;
+        throw std::logic_error(
+            "siluMulSplitAsync: w13-fused MoE path is CUDA-only");
+    }
+
     virtual void geluMulAsync(float*       gate,
                               const float* up,
                               std::size_t  n) = 0;

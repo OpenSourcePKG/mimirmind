@@ -331,6 +331,15 @@ protected:
     // Default-on: single-user (nSeq==1) decode uses the register-staged MoE GEMV
     // (m1reg, +2-4% vs m4). MIMIRMIND_MOE_M1NB=0 disables it.
     bool _useM1nb{true};
+    // 5.18.8: fuse the routed-expert gate+up projections into ONE stacked-w13
+    // grouped GEMM (N=2*n_ff) on the device-driven deint decode path, replacing
+    // the two separate gate/up launches. Halves gate/up launches AND doubles N
+    // per launch (better SM fill on the tileM=4 M=1 kernel — the 5.18.5 dispatch/
+    // occupancy residual). Mirrors the GDN in_proj concat-cache + pointer-split
+    // (_gdnQkvzW). Bit-identical (same weights/math, concatenated layout + fused
+    // silu split). nSeq==1 deint only. OPT-IN: MIMIRMIND_MOE_W13_FUSE=1.
+    bool                                _moeW13Fuse{false};
+    std::vector<compute::ComputeBuffer> _moeW13W;  // per-block [nExp][2*n_ff][d_model] blocked
     // Host mirror of the device expert-offset table (moe_group_build output),
     // read back once per grouped MoE layer to drive the per-expert launches
     // (host-driven Option 1 only; the device-driven path never reads it back).

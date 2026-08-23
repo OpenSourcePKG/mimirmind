@@ -153,6 +153,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _addResidualKernel;
     core::cuda::CudaModule _siluMulModule;
     core::cuda::CudaKernel _siluMulKernel;
+    core::cuda::CudaModule _siluMulSplitModule;
+    core::cuda::CudaKernel _siluMulSplitKernel;
     core::cuda::CudaModule _geluMulModule;
     core::cuda::CudaKernel _geluMulKernel;
     core::cuda::CudaModule _geluErfModule;
@@ -391,6 +393,8 @@ struct GpuOps::Impl {
           _addResidualKernel       {_addResidualModule.getFunction("add_residual")},
           _siluMulModule           {loadCudaModule(ctx, "silu_mul")},
           _siluMulKernel           {_siluMulModule.getFunction("silu_mul")},
+          _siluMulSplitModule      {loadCudaModule(ctx, "silu_mul_split")},
+          _siluMulSplitKernel      {_siluMulSplitModule.getFunction("silu_mul_split")},
           _geluMulModule           {loadCudaModule(ctx, "gelu_mul")},
           _geluMulKernel           {_geluMulModule.getFunction("gelu_mul")},
           _geluErfModule           {loadCudaModule(ctx, "gelu_erf")},
@@ -1249,6 +1253,24 @@ void GpuOps::siluMulAsync(float* gate, const float* up, std::size_t n) {
     k.setValue(2, ni);
     k.launch(_ctx.stream(),
              groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::siluMulSplitAsync(const float* w13, float* out,
+                              std::size_t rows, std::size_t nff) {
+    const std::size_t total = rows * nff;
+    if (total == 0) {
+        return;
+    }
+    const std::int32_t rowsI = toInt32(rows, "siluMulSplit rows");
+    const std::int32_t nffI  = toInt32(nff,  "siluMulSplit nff");
+    auto& k = _pimpl->_siluMulSplitKernel;
+    k.setPtr  (0, w13);
+    k.setPtr  (1, out);
+    k.setValue(2, rowsI);
+    k.setValue(3, nffI);
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize), 1, 1,
              kElementwiseLocalSize, 1, 1);
 }
 

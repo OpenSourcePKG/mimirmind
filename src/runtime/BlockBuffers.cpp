@@ -153,6 +153,7 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         b.moeXCompact    = ops.allocate(xBytes);
         b.moeGateCompact = ops.allocate(gateBytes);
         b.moeUpCompact   = ops.allocate(gateBytes);
+        b.moeW13Compact  = ops.allocate(2 * gateBytes);   // 5.18.8 fused gate+up out
         b.moeDownCompact = ops.allocate(xBytes);
 
         // M-Cuda.MoeGroup — device token-grouping outputs (moe_group_build):

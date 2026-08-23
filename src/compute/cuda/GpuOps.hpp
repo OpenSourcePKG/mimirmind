@@ -109,6 +109,8 @@ public:
     void addResidualAsync(float* y, const float* x, std::size_t n) override;
 
     void siluMulAsync(float* gate, const float* up, std::size_t n) override;
+    void siluMulSplitAsync(const float* w13, float* out,
+                           std::size_t rows, std::size_t nff) override;
 
     void geluMulAsync(float* gate, const float* up, std::size_t n) override;
 
