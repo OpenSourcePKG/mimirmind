@@ -91,6 +91,15 @@ RequestDispatcher::RequestDispatcher(
 }
 
 std::vector<RequestDispatcher::ModelEntry> RequestDispatcher::listModels() const {
+    // M-Munin.3 pool mode: the known models live in the provider's registry,
+    // not the (empty) eager engine table.
+    if (_provider != nullptr) {
+        std::vector<ModelEntry> out;
+        for (const auto& m : _provider->listModels()) {
+            out.push_back({m.id, m.title});
+        }
+        return out;
+    }
     std::vector<ModelEntry> out;
     out.reserve(1 + _extraHandles.size());
     out.push_back({_defaultId, _defaultTitle});
@@ -102,6 +111,56 @@ std::vector<RequestDispatcher::ModelEntry> RequestDispatcher::listModels() const
 
 std::optional<RequestDispatcher::Target> RequestDispatcher::resolveTarget(
     const std::string& model, httplib::Response& res) {
+    // M-Munin.3 pool mode: resolve through the provider, which materializes
+    // (and may evict the LRU slot) on a miss. The returned Target carries a
+    // `pin` that keeps the slot alive for the request; spec-dec is off in pool
+    // mode (MVP). The eager path below is used only when no provider is set.
+    if (_provider != nullptr) {
+        const std::string id = model.empty() ? _provider->defaultModelId() : model;
+        if (!_provider->knows(id)) {
+            json body = {
+                {"error", {
+                    {"message", "no such loaded model: '" + model + "'"},
+                    {"type",    "model_not_found"},
+                    {"code",    nullptr},
+                }},
+            };
+            res.status = 400;
+            res.set_content(body.dump(), "application/json");
+            return std::nullopt;
+        }
+        try {
+            auto acq = _provider->acquire(id);
+            if (!acq) {
+                json body = {
+                    {"error", {
+                        {"message", "no such loaded model: '" + model + "'"},
+                        {"type",    "model_not_found"},
+                        {"code",    nullptr},
+                    }},
+                };
+                res.status = 400;
+                res.set_content(body.dump(), "application/json");
+                return std::nullopt;
+            }
+            return Target{acq->engine, acq->mutex, /*spec=*/nullptr,
+                          acq->id, acq->title, std::move(acq->pin)};
+        } catch (const std::exception& x) {
+            MM_LOG_ERROR("server",
+                         "model '{}' materialization failed: {}", id, x.what());
+            json body = {
+                {"error", {
+                    {"message", std::string{"model unavailable: "} + x.what()},
+                    {"type",    "model_unavailable"},
+                    {"code",    nullptr},
+                }},
+            };
+            res.status = 503;
+            res.set_content(body.dump(), "application/json");
+            return std::nullopt;
+        }
+    }
+
     if (model.empty() || model == _defaultId) {
         return Target{_defaultEngine, &_defaultMutex,
                       _speculativeDecoder.get(),

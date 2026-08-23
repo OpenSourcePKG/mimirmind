@@ -4,6 +4,7 @@
 #pragma once
 
 #include "server/ApiServer.hpp"
+#include "server/ModelProvider.hpp"
 
 #include "runtime/spec/SpeculativeDecoder.hpp"
 
@@ -40,6 +41,12 @@ public:
         runtime::SpeculativeDecoder*  spec{nullptr};  // null for extras
         std::string                   id;             // resolved model id
         std::string                   title;
+        /// M-Munin.3: when the target came from a ModelProvider (pool mode),
+        /// this pins the worker-side slot so `engine`/`mutex` stay valid for
+        /// the whole request (incl. async stream). Empty on the eager path,
+        /// where engines are process-lifetime resident. Keep it alive as long
+        /// as the target is in use.
+        std::shared_ptr<void>         pin{};
     };
 
     struct ModelEntry {
@@ -71,6 +78,13 @@ public:
     [[nodiscard]] runtime::SpeculativeDecoder* speculativeDecoder() noexcept { return _speculativeDecoder.get(); }
     [[nodiscard]] runtime::Drafter*            drafter()       noexcept { return _drafter; }
 
+    /// Install a per-request model provider (M-Munin.3 pool mode). When set,
+    /// resolveTarget()/listModels() route through the provider instead of the
+    /// eager engine table; the provider is non-owning and must outlive the
+    /// dispatcher. Passing nullptr (the default) keeps the eager behavior.
+    /// Set once at startup by ServeMode in attached mode.
+    void setModelProvider(ModelProvider* provider) noexcept { _provider = provider; }
+
     /// All loaded models in order: default first, then extras.
     [[nodiscard]] std::vector<ModelEntry> listModels() const;
 
@@ -95,6 +109,7 @@ private:
     runtime::Drafter*                            _drafter{nullptr};
     std::unique_ptr<runtime::SpeculativeDecoder> _speculativeDecoder;
     std::vector<ExtraHandle>                     _extraHandles;
+    ModelProvider*                               _provider{nullptr};  // M-Munin.3, non-owning
 };
 
 } // namespace mimirmind::server
