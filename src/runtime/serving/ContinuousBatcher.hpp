@@ -208,6 +208,17 @@ private:
     // Chunked-prefill chunk size C (InferenceEngine::servingPrefillChunk());
     // 0 => disabled, prompts ingest token-by-token via the decode loop.
     std::size_t      _prefillChunk{0};
+    // 5.21 Tier 1 (prefill/decode interleave): cap how many waiting requests are
+    // admitted+prefilled per worker iteration. Each admitted slot is prefilled
+    // to completion (single-slot, batch=1) before the iteration's decode step,
+    // so a burst of N concurrent prompts would otherwise prefill all N (serial,
+    // batch=1) before any decode runs -> in-flight decode stalls for the whole
+    // burst. Capping admission to K per iteration interleaves a batched decode
+    // step between prefills so in-flight sequences keep decoding while new ones
+    // prefill. 0 => unlimited (legacy: admit all free slots at once).
+    // MIMIRMIND_PREFILL_ADMIT_PER_ITER=<K>. Safe (no partial slot ever enters
+    // the decode batch); overlap only — does NOT batch the prefills themselves.
+    std::size_t      _admitPerIter{0};
 
     std::vector<Slot>                     _slots;
     std::deque<Pending>                   _waiting;

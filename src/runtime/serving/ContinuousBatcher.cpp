@@ -7,6 +7,7 @@
 #include "core/log/Log.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <span>
 #include <string_view>
@@ -54,6 +55,10 @@ ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
     // backend that supports neither, before any request is accepted).
     _engine.ensureServingState(maxBatch, maxContext);
     _prefillChunk = _engine.servingPrefillChunk();
+    if (const char* ap = std::getenv("MIMIRMIND_PREFILL_ADMIT_PER_ITER")) {
+        const long v = std::strtol(ap, nullptr, 10);
+        if (v > 0) _admitPerIter = static_cast<std::size_t>(v);
+    }
     _slots.resize(maxBatch);
     _running = true;
     _worker  = std::thread(&ContinuousBatcher::workerLoop, this);
@@ -335,8 +340,12 @@ void ContinuousBatcher::workerLoop() {
             }
 
             // Admit waiting requests into free slots (lowest index first so
-            // the active set stays a tight prefix).
+            // the active set stays a tight prefix). 5.21 Tier 1: cap admits per
+            // iteration so a burst does not prefill all slots (serial, batch=1)
+            // before any decode step runs — interleaves decode with prefill.
+            std::size_t admitted = 0;
             for (std::size_t i = 0; i < _maxBatch && !_waiting.empty(); ++i) {
+                if (_admitPerIter != 0 && admitted >= _admitPerIter) break;
                 if (_slots[i].occupied) continue;
                 Pending p = std::move(_waiting.front());
                 _waiting.pop_front();
@@ -357,6 +366,7 @@ void ContinuousBatcher::workerLoop() {
                 if (_prefillChunk > 0 && s.promptLen > 0) {
                     toPrefill.push_back(i);
                 }
+                ++admitted;
             }
 
             for (std::size_t i = 0; i < _maxBatch; ++i) {
