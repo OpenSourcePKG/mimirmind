@@ -1065,6 +1065,33 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_custom_target(cuda_kernels ALL DEPENDS ${CUDA_PTX_FILES})
 endif()
 
+# ---- microbench_nvfp4blk — isolated single-kernel NVFP4 GEMV harness --------
+#
+# Roadmap 5.18.6: the sanctioned, zero-reboot-risk replacement for an "ncu
+# probe" (ncu itself stays banned — 2x physical reboot on the GB10 box). It
+# compiles the EXACT prod dense NVFP4 decode kernel (matmul_nvfp4blk_vec)
+# straight into a standalone CUDA-event-timed harness — no HTTP / threads /
+# model loader / KV / graph / serving — and reports us/launch + effective
+# GB/s per dense-projection shape. This is the A/B baseline for the 5.18.3
+# TC-dense / fused-norm+quant kernel work. NOT part of cuda_kernels (that
+# target emits runtime PTX); this links the kernel as a device function.
+#   cmake --build build-cuda --target microbench_nvfp4blk &&
+#   ./build-cuda/microbench_nvfp4blk            # built-in dense-shape sweep
+#   ./build-cuda/microbench_nvfp4blk <K> <N> <iters>
+if(MIMIRMIND_ENABLE_CUDA)
+    add_executable(microbench_nvfp4blk
+        tools/microbench/nvfp4blk_gemv_bench.cu
+        kernels/cuda/common/matmul_nvfp4blk_vec.cu)
+    # This is the first CMake CUDA-language target (the kernels elsewhere are
+    # compiled to PTX via custom commands, bypassing CMake's CUDA dialect), so
+    # pin the dialect explicitly — nvcc 13's CMake integration cannot map the
+    # inferred "CUDA23" default.
+    set_target_properties(microbench_nvfp4blk PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(microbench_nvfp4blk PRIVATE CUDA::cudart)
+endif()
+
 # ---- mimirmind_core_cuda — NVIDIA CUDA-tied foundation --------------------
 #
 # Peer to `mimirmind_core_l0` / `mimirmind_core_hip`. Track 1 lands
