@@ -104,6 +104,13 @@ struct ServingState {
     // prefill forwards use (runMoeFfnBatched via setPrefillMoeScratch).
     compute::ComputeBuffer      prefillExpIdx; // [prefillChunk * expertUsedCount]
     compute::ComputeBuffer      prefillKw;     // [prefillChunk * expertUsedCount]
+    // 5.21-III Teil 4 — varlen prefill driver (prefillSlotVarlen). Per-token ctx
+    // scratch: rope positions + KV write targets [prefillChunk]; per-slot (nSeq=1)
+    // seqT/seqOff/convInOff/startPos [1]. Host staging + device copies.
+    compute::ComputeBuffer      vlRopePosDev, vlWriteBlockIdDev, vlWriteSlotDev;
+    compute::ComputeBuffer      vlSeqTDev, vlSeqOffDev, vlConvInOffDev, vlStartPosDev;
+    std::vector<std::int32_t>   vlRopePosH, vlWriteSlotH, vlStartPosH;
+    std::vector<std::uint32_t>  vlWriteBlockIdH;
 
     // ---- Increment E1: MTP batched-verify scratch (lazily sized) --------
     // Sized for up to `maxBatch` slots × (verifyDepth + 1) verify tokens =
@@ -798,7 +805,10 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
             st->sbPrefill = allocBlockBuffers(
                 *_e._ops, _e._config, /*maxT=*/chunk, /*maxSeq=*/maxContext,
                 qkv.first, qkv.second, /*withFusedQkv=*/false,
-                /*withKvFp32Scratch=*/prefillKvFp32Scratch, /*withQGate=*/true,
+                // 5.21-III: the varlen prefill driver uses runFullAttentionBlock-
+                // Batched, whose kProj/vProj scratch is kvKFp32Scratch — always
+                // allocate it (not just for FP16 KV) so the ragged path has it.
+                /*withKvFp32Scratch=*/true, /*withQGate=*/true,
                 /*withSsm=*/true, /*perSeqConvInput=*/false);
             // SSM state pointers are (re)bound per prefillSlot call to the
             // target slot's slab slice; ssmSlabNSeq is the full slab width so
@@ -808,6 +818,18 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
             st->prefillExpIdx = _e._ops->allocate(chunk * K * sizeof(std::int32_t));
             st->prefillKw     = _e._ops->allocate(chunk * K * sizeof(float));
             st->prefillTokH.resize(chunk);
+            // 5.21-III varlen prefill driver scratch.
+            st->vlRopePosDev      = _e._ops->allocate(chunk * sizeof(std::int32_t));
+            st->vlWriteBlockIdDev = _e._ops->allocate(chunk * sizeof(std::uint32_t));
+            st->vlWriteSlotDev    = _e._ops->allocate(chunk * sizeof(std::int32_t));
+            st->vlSeqTDev      = _e._ops->allocate(sizeof(std::int32_t));
+            st->vlSeqOffDev    = _e._ops->allocate(sizeof(std::int32_t));
+            st->vlConvInOffDev = _e._ops->allocate(sizeof(std::int32_t));
+            st->vlStartPosDev  = _e._ops->allocate(sizeof(std::int32_t));
+            st->vlRopePosH.resize(chunk);
+            st->vlWriteBlockIdH.resize(chunk);
+            st->vlWriteSlotH.resize(chunk);
+            st->vlStartPosH.resize(1);
             MM_LOG_INFO("serving",
                         "chunked prefill ENABLED (chunk={}) — prompts prefill "
                         "as T>1 forwards per slot", chunk);
@@ -986,6 +1008,103 @@ std::int32_t ServingSession::prefillSlot(
     }
     if (startPos + T > st.maxContext) {
         throw std::runtime_error("prefillSlot: startPos+T exceeds maxContext");
+    }
+
+    // 5.21-III Teil 4 — varlen prefill driver: prefill this chunk through the
+    // RAGGED batched forward (runBlockBatched: paged KV + prefill-causal attention
+    // + varlen GDN/conv) instead of the single-session runBlock. nSeq=1, seqT=[T].
+    // Reuses sbPrefill (sized prefillChunk). Env-gated MIMIRMIND_PREFILL_VARLEN=1
+    // for the batched-prefill-vs-single-session A/B (greedy token-match gate).
+    static const bool varlenPrefill = [] {
+        const char* e = std::getenv("MIMIRMIND_PREFILL_VARLEN");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    if (varlenPrefill) {
+        const std::size_t d_model      = st.d_model;
+        const std::size_t blocksPerSeq = st.blocksPerSeq;
+        const std::size_t blockSize    = st.blockSize;
+        for (std::size_t i = 0; i < T; ++i) {
+            const std::size_t pos = startPos + i;
+            st.vlRopePosH[i]      = static_cast<std::int32_t>(pos);
+            st.vlWriteBlockIdH[i] = static_cast<std::uint32_t>(
+                slot * blocksPerSeq + pos / blockSize);
+            st.vlWriteSlotH[i]    = static_cast<std::int32_t>(pos % blockSize);
+        }
+        const std::int32_t seqTv = static_cast<std::int32_t>(T);
+        const std::int32_t zero  = 0;
+        st.vlStartPosH[0] = static_cast<std::int32_t>(startPos);
+        _e._ops->uploadHostBytes(st.vlRopePosDev.get(),      st.vlRopePosH.data(),      T * sizeof(std::int32_t));
+        _e._ops->uploadHostBytes(st.vlWriteBlockIdDev.get(), st.vlWriteBlockIdH.data(), T * sizeof(std::uint32_t));
+        _e._ops->uploadHostBytes(st.vlWriteSlotDev.get(),    st.vlWriteSlotH.data(),    T * sizeof(std::int32_t));
+        _e._ops->uploadHostBytes(st.vlSeqTDev.get(),      &seqTv, sizeof(std::int32_t));
+        _e._ops->uploadHostBytes(st.vlSeqOffDev.get(),    &zero,  sizeof(std::int32_t));
+        _e._ops->uploadHostBytes(st.vlConvInOffDev.get(), &zero,  sizeof(std::int32_t));
+        _e._ops->uploadHostBytes(st.vlStartPosDev.get(),  st.vlStartPosH.data(), sizeof(std::int32_t));
+
+        const std::size_t stateElems     = _e._config.ssmStateElemsPerLayer();
+        const std::size_t convStateElems = _e._config.ssmConvStateElemsPerLayer();
+        BlockBuffers& sb = *st.sbPrefill;
+        sb.ssmStatePtr     = st.ssm->statePtr()     + slot * stateElems;
+        sb.ssmConvStatePtr = st.ssm->convStatePtr() + slot * convStateElems;
+
+        for (std::size_t i = 0; i < T; ++i) st.prefillTokH[i] = tokens[i];
+        float* const xBuf = st.xBufP.as<float>();
+        cmp::embeddingLookup(st.tokEmb->type, st.tokEmb->usmPtr, d_model,
+                             st.vocab_emb,
+                             std::span<const std::int32_t>{st.prefillTokH.data(), T}, xBuf);
+
+        const std::uint8_t seqStartH = (startPos == 0) ? 1u : 0u;
+        arch::BatchedDecodeCtx ctx{};
+        ctx.nSeq            = 1;
+        ctx.pool            = st.pool.get();
+        ctx.writeBlockIdDev = static_cast<const std::uint32_t*>(st.vlWriteBlockIdDev.get());
+        ctx.writeSlotDev    = static_cast<const std::int32_t*>(st.vlWriteSlotDev.get());
+        ctx.blockTablesDev  = static_cast<const std::int32_t*>(st.blockTablesDev.get())
+                              + slot * blocksPerSeq;
+        ctx.maxBlocksPerSeq = blocksPerSeq;
+        ctx.startPosDev     = static_cast<const std::int32_t*>(st.vlStartPosDev.get());
+        ctx.expIdxSlot      = st.prefillExpIdx.as<std::int32_t>();
+        ctx.kwSlot          = st.prefillKw.as<float>();
+        ctx.isSeqStart      = &seqStartH;
+        ctx.nRow            = T;
+        ctx.seqTDev         = static_cast<const std::int32_t*>(st.vlSeqTDev.get());
+        ctx.seqTHost        = &seqTv;
+        ctx.seqOffDev       = static_cast<const std::int32_t*>(st.vlSeqOffDev.get());
+        ctx.convInOffDev    = static_cast<const std::int32_t*>(st.vlConvInOffDev.get());
+        ctx.ropePosDev      = static_cast<const std::int32_t*>(st.vlRopePosDev.get());
+        ctx.maxSeqT         = T;
+
+        st.qb->setPrefillMoeScratch(st.prefillExpIdx.as<std::int32_t>(),
+                                    st.prefillKw.as<float>());
+        for (std::size_t b = 0; b < st.blockCount; ++b) {
+            st.qb->runBlockBatched(b, xBuf, ctx, sb);
+        }
+        st.qb->setPrefillMoeScratch(nullptr, nullptr);
+        _e._ops->profileStepEnd();
+
+        std::int32_t firstTok = -1;
+        if (produceToken) {
+            float* const normBuf = st.normB.as<float>();
+            float* const logits  = st.logitsB.as<float>();
+            _e._ops->rmsNormAsync(xBuf + (T - 1) * d_model, 1, d_model,
+                                  static_cast<const float*>(st.outNorm->usmPtr),
+                                  _e._config.rmsNormEps, normBuf);
+            _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, d_model,
+                            normBuf, 1, logits, st.lmScr.as<float>());
+            _e._ops->flush();
+            _e._ops->readbackToHost(st.hostLogits.data(), logits,
+                                    st.vocab_lm * sizeof(float));
+            std::size_t best = 0; float bv = st.hostLogits[0];
+            for (std::size_t v = 1; v < st.vocab_lm; ++v) {
+                if (st.hostLogits[v] > bv) { bv = st.hostLogits[v]; best = v; }
+            }
+            firstTok = static_cast<std::int32_t>(best);
+        } else {
+            _e._ops->flush();
+        }
+        sb.ssmStatePtr     = st.ssm->statePtr();
+        sb.ssmConvStatePtr = st.ssm->convStatePtr();
+        return firstTok;
     }
 
     const std::size_t d_model  = st.d_model;

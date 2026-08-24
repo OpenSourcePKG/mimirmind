@@ -1628,7 +1628,7 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     // to E4M3 with a SINGLE per-tensor scale, matching vLLM's fused-tensor
     // granularity. The output is contiguous [qkv | gate] / [beta | alpha], so
     // the split is pure pointer arithmetic at nSeq==1. Falls back to 4 matmuls.
-    if (_gdnProjFuse && nSeq == 1) {
+    if (_gdnProjFuse && nSeq == 1 && !ragged) {   // 5.21-III: fusion is nRow==1-only
         auto buildFused = [&](compute::ComputeBuffer& dst,
                               const core::gguf::GgufTensor& wa,
                               const core::gguf::GgufTensor& wb) {
