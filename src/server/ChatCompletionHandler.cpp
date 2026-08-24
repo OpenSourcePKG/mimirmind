@@ -233,6 +233,26 @@ bool ChatCompletionHandler::prepareChatRequest(
     params.sampling.topK = cr.topK;
     params.sampling.seed = cr.seed;
 
+    // Thinking mode must not run greedy. Qwen3 reasoning degenerates into an
+    // endless repetition loop under argmax ("No I will not... No I will not...")
+    // that no history penalty reliably breaks. When reasoning is enabled and the
+    // request is greedy / near-greedy (temp < 0.6 — including the greedy default
+    // used for reference-oracle parity), lift sampling to Qwen3's recommended
+    // thinking preset (temp 0.6, top_p 0.95, top_k 20) so the trace can escape
+    // the loop. This is the "how vLLM does it" guidance for Qwen3 thinking. Only
+    // fills values the client left open (topP==1 / topK==0) and never lowers a
+    // hotter explicit sampling; non-thinking requests keep the deterministic
+    // argmax default untouched (needed for parity tests).
+    if (cr.enableThinking.value_or(false) && params.sampling.temperature < 0.6F) {
+        params.sampling.temperature = 0.6F;
+        if (params.sampling.topP >= 1.0F) params.sampling.topP = 0.95F;
+        if (params.sampling.topK == 0)    params.sampling.topK = 20;
+        MM_LOG_INFO("server",
+                    "thinking sampling floor: reasoning enabled under greedy/near-"
+                    "greedy sampling -> temp=0.6 top_p=0.95 top_k=20 "
+                    "(Qwen3 anti-loop preset)");
+    }
+
     // M7f — repetition-control penalties.
     //
     // Server-side defaults are opinionated: a 26B-A4B-it Q6_K model was
@@ -727,12 +747,13 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                     bool                       preserveThinking,
                     bool                       thinkPreClosed)
             // A `<think>` token makes forStyle() start the cleaner INSIDE the
-            // think block (Qwen pre-opens <think> in the default prompt). But
-            // when the request disabled thinking, the chat template pre-CLOSES
-            // the block (`<think>\n\n</think>\n\n`) so generation is answer
-            // content from the first token — start the cleaner in content mode
-            // (channelStartId = -1), else the whole answer is mislabelled as
-            // reasoning_content and delta.content streams empty.
+            // think block (thinking-on pre-opens <think>). But when thinking is
+            // off — now the DEFAULT, or an explicit enable_thinking=false — the
+            // chat template pre-CLOSES the block (`<think>\n\n</think>\n\n`) so
+            // generation is answer content from the first token — start the
+            // cleaner in content mode (channelStartId = -1), else the whole
+            // answer is mislabelled as reasoning_content and delta.content
+            // streams empty. thinkPreClosed MUST equal !thinkOn in ChatTemplate.
             : cleaner{(preserveThinking || thinkPreClosed)
                 ? model::ResponseCleaner{style, -1, -1}
                 : model::ResponseCleaner::forStyle(style, tok)} {}
@@ -740,7 +761,10 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
     auto state = std::make_shared<StreamState>(
         model::ChatTemplate::detectFromArch(engine.config().architecture),
         engine.tokenizer(), _cfg.preserveThinking,
-        /*thinkPreClosed=*/cr.enableThinking.has_value() && !cr.enableThinking.value());
+        // Mirror ChatTemplate's thinkOn = enableThinking.value_or(false): the
+        // prompt pre-closes the think block whenever thinking is off (default,
+        // or explicit false), so the cleaner must start in content mode.
+        /*thinkPreClosed=*/!cr.enableThinking.value_or(false));
     state->promptIds = std::move(promptIds);
     state->stopIds   = std::move(stopIds);
     state->params    = std::move(params);
