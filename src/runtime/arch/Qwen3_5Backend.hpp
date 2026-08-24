@@ -74,6 +74,24 @@ struct BatchedDecodeCtx {
     // pointer (kernels); `activeMaskHost` = host copy (host-side guard loops).
     const std::uint8_t*   activeMask{nullptr};     // [nSeq] device
     const std::uint8_t*   activeMaskHost{nullptr}; // [nSeq] host
+
+    // ---- 5.21 Increment III — ragged (varlen) mixed prefill+decode ----
+    // When seqTDev != nullptr the batched forward runs the RAGGED path: slot seq
+    // carries seqT[seq] tokens (T=1 decode rows OR T=chunk prefill rows), all
+    // packed into nRow = sum(seqT) activation rows. Every M-op runs over nRow;
+    // per-token rope positions come from ropePosDev; the GDN conv/recurrence use
+    // seqOffDev (token offset = prefix-sum seqT) + convInOffDev (prefix-sum of
+    // seqT+dConv-1); attention branches per row (T=1 -> paged decode-V2, T>1 ->
+    // paged causal prefill with queryOff=seqOffDev, startPos=startPosDev). The
+    // per-token KV targets reuse writeBlockIdDev/writeSlotDev sized [nRow].
+    // nullptr/0 => the T=1 decode path (bit-identical legacy).
+    std::size_t           nRow{0};                 // total tokens (0 => == nSeq)
+    const std::int32_t*   seqTDev{nullptr};        // [nSeq] device: tokens per slot
+    const std::int32_t*   seqTHost{nullptr};       // [nSeq] host copy (host loops)
+    const std::int32_t*   seqOffDev{nullptr};      // [nSeq] device: token offset
+    const std::int32_t*   convInOffDev{nullptr};   // [nSeq] device: conv-input offset
+    const std::int32_t*   ropePosDev{nullptr};     // [nRow] device: per-token rope pos
+    std::size_t           maxSeqT{0};              // host: max(seqT) (attn/conv grid)
 };
 
 /**

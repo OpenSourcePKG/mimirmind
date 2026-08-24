@@ -1372,6 +1372,13 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
     if (nSeq == 0) {
         return;
     }
+    // 5.21-III ragged: nRow activation rows (= nSeq decode / sum(seqT) prefill);
+    // ropePos = per-token rope position (= startPosDev for T=1 decode). Decode
+    // (seqTDev==nullptr) => nRow==nSeq, ropePos==startPosDev => bit-identical.
+    const bool                 ragged  = (ctx.seqTDev != nullptr);
+    const std::size_t          nRow    = ragged ? ctx.nRow : nSeq;
+    const std::int32_t* const  ropePos =
+        (ctx.ropePosDev != nullptr) ? ctx.ropePosDev : ctx.startPosDev;
     _ops.profileSection("attn");
     if (ctx.pool == nullptr) {
         throw std::runtime_error(
@@ -1384,12 +1391,12 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
 
     const auto& w        = _weights;
     const auto& attnNorm = requireBlock(w, blockIdx, "attn_norm.weight");
-    const auto& qW       = pickDense(w, blockIdx, "attn_q.weight", nSeq, _denseFp8MaxT);
-    const auto& kW       = pickDense(w, blockIdx, "attn_k.weight", nSeq, _denseFp8MaxT);
-    const auto& vW       = pickDense(w, blockIdx, "attn_v.weight", nSeq, _denseFp8MaxT);
+    const auto& qW       = pickDense(w, blockIdx, "attn_q.weight", nRow, _denseFp8MaxT);
+    const auto& kW       = pickDense(w, blockIdx, "attn_k.weight", nRow, _denseFp8MaxT);
+    const auto& vW       = pickDense(w, blockIdx, "attn_v.weight", nRow, _denseFp8MaxT);
     const auto& qNorm    = requireBlock(w, blockIdx, "attn_q_norm.weight");
     const auto& kNorm    = requireBlock(w, blockIdx, "attn_k_norm.weight");
-    const auto& oW       = pickDense(w, blockIdx, "attn_output.weight", nSeq, _denseFp8MaxT);
+    const auto& oW       = pickDense(w, blockIdx, "attn_output.weight", nRow, _denseFp8MaxT);
     const auto& attnPost = requireBlock(w, blockIdx, "post_attention_norm.weight");
 
     const std::size_t d_model  = s.d_model;
@@ -1410,38 +1417,38 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
     float* const projOut    = s.projOut.as<float>();
     float* const mmScratch  = s.matmulScratch.as<float>();
 
-    // --- pre-attention RMSNorm (nSeq rows) ---------------------------
-    _ops.rmsNormAsync(x, nSeq, d_model,
+    // --- pre-attention RMSNorm (nRow rows) ---------------------------
+    _ops.rmsNormAsync(x, nRow, d_model,
                       static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
 
-    // --- Q(+gate) / K / V projections (M = nSeq) ---------------------
+    // --- Q(+gate) / K / V projections (M = nRow) ---------------------
     {
         compute::UnorderedScope u{_ops};
         _gmm.matmulAsync(qW.type, qW.usmPtr, 2 * q_dim, d_model,
-                         normBuf, nSeq, qGateFused, mmScratch);
+                         normBuf, nRow, qGateFused, mmScratch);
         _gmm.matmulAsync(kW.type, kW.usmPtr, kv_dim, d_model,
-                         normBuf, nSeq, kProj, mmScratch);
+                         normBuf, nRow, kProj, mmScratch);
         _gmm.matmulAsync(vW.type, vW.usmPtr, kv_dim, d_model,
-                         normBuf, nSeq, vProj, mmScratch);
+                         normBuf, nRow, vProj, mmScratch);
     }
 
-    _ops.splitHeadPairAsync(qGateFused, qBuf, gateBuf, nSeq, nHeads, head_dim);
+    _ops.splitHeadPairAsync(qGateFused, qBuf, gateBuf, nRow, nHeads, head_dim);
 
     // --- QK-norm (per-head RMS over head_dim) ------------------------
     // In place on the compact q/k buffers — the paged path writes K into
     // the pool below (not a contiguous cache), so unlike the single-seq
     // rmsNormQkvAsync there is no fused cache write here. Per-row rmsnorm
     // is in-place safe (each row is independent).
-    _ops.rmsNormAsync(qBuf,  nSeq * nHeads,   head_dim,
+    _ops.rmsNormAsync(qBuf,  nRow * nHeads,   head_dim,
                       static_cast<const float*>(qNorm.usmPtr), eps, qBuf);
-    _ops.rmsNormAsync(kProj, nSeq * nKvHeads, head_dim,
+    _ops.rmsNormAsync(kProj, nRow * nKvHeads, head_dim,
                       static_cast<const float*>(kNorm.usmPtr), eps, kProj);
     // The single-session rmsNormQkv also RMS-normalises V per head (over
     // head_dim, with NO learned weight — kernels/cuda/llm/rmsnorm_qkv.cu V
     // branch). The batched path builds q/k/v separately, so replicate the
     // V normalisation here; without it V enters attention un-normalised and
     // the whole full-attention output is off by V's per-head 1/rms factor.
-    _ops.rmsNormNoWeightAsync(vProj, nSeq * nKvHeads, head_dim, eps, vProj);
+    _ops.rmsNormNoWeightAsync(vProj, nRow * nKvHeads, head_dim, eps, vProj);
 
     // --- IMRoPE on Q and K (per-seq startPos, one token per seq) ------
     // writeOffsetStride MUST be 0 here: the batched mrope writes at
@@ -1453,13 +1460,13 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
     // compact buffer as startPos grows (the pos=2 OOB).
     {
         compute::UnorderedScope u{_ops};
-        _ops.mropeInPlaceBatchedAsync(qBuf, nSeq, q_dim, /*seqLen=*/1,
-                                      nHeads, head_dim, ctx.startPosDev,
+        _ops.mropeInPlaceBatchedAsync(qBuf, nRow, q_dim, /*seqLen=*/1,
+                                      nHeads, head_dim, ropePos,
                                       _config.ropeFreqBase, _ropeSections,
                                       /*writeOffsetStride=*/0,
                                       runtime::KvDtype::F32);
-        _ops.mropeInPlaceBatchedAsync(kProj, nSeq, kv_dim, /*seqLen=*/1,
-                                      nKvHeads, head_dim, ctx.startPosDev,
+        _ops.mropeInPlaceBatchedAsync(kProj, nRow, kv_dim, /*seqLen=*/1,
+                                      nKvHeads, head_dim, ropePos,
                                       _config.ropeFreqBase, _ropeSections,
                                       /*writeOffsetStride=*/0,
                                       runtime::KvDtype::F32);
@@ -1469,8 +1476,10 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
     // Device path (graph-capturable) when the device index arrays are provided;
     // otherwise the per-seq host loop (host-computed slot address).
     if (ctx.writeBlockIdDev != nullptr && ctx.writeSlotDev != nullptr) {
+        // Per-ROW scatter (nRow tokens); for ragged prefill writeBlockId/Slot are
+        // per-token [nRow]. Decode nRow==nSeq (unchanged).
         ctx.pool->writeTokensBatched(_ops, denseLayer, kProj, vProj,
-                                     ctx.writeBlockIdDev, ctx.writeSlotDev, nSeq,
+                                     ctx.writeBlockIdDev, ctx.writeSlotDev, nRow,
                                      ctx.activeMask);
     } else {
         for (std::size_t seq = 0; seq < nSeq; ++seq) {
@@ -1495,7 +1504,16 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
     const auto* keyBase = static_cast<const float*>(ctx.pool->keyPool(denseLayer));
     const auto* valBase =
         static_cast<const float*>(ctx.pool->valuePool(denseLayer));
-    if (_forcePagedV1) {
+    if (ragged) {
+        // 5.21-III: prefill/varlen rows attend CAUSALLY over their chunk + prior
+        // KV (query pq -> keys [0, startPos[seq]+pq]) via the paged pool. Decode
+        // rows (seqT==1) reduce to a single query at startPos. F32 KV only.
+        _ops.pagedAttentionPrefillCausalAsync(
+            attnOut, qBuf, keyBase, valBase, ctx.blockTablesDev,
+            ctx.seqTDev, ctx.seqOffDev, ctx.startPosDev,
+            nSeq, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
+            ctx.maxBlocksPerSeq, ctx.maxSeqT, attnScale, /*softcap=*/0.0f);
+    } else if (_forcePagedV1) {
         // V1 is F32-only; the fp16 pool always routes through V2.
         _ops.pagedAttentionDecodeV1Async(
             attnOut, qBuf, keyBase, valBase, ctx.blockTablesDev, ctx.seqLensDev,
@@ -1511,24 +1529,24 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
 
     // --- output gate + O projection + attn residual ------------------
     _ops.profileSection("attn.out");   // decode attn sub-split (gate + O proj)
-    _ops.sigmoidGateMulAsync(attnOut, gateBuf, nSeq, q_dim, /*gateDim=*/q_dim);
+    _ops.sigmoidGateMulAsync(attnOut, gateBuf, nRow, q_dim, /*gateDim=*/q_dim);
     _gmm.matmulAsync(oW.type, oW.usmPtr, d_model, q_dim,
-                     attnOut, nSeq, projOut, mmScratch);
-    _ops.addResidualAsync(x, projOut, nSeq * d_model);
+                     attnOut, nRow, projOut, mmScratch);
+    _ops.addResidualAsync(x, projOut, nRow * d_model);
 
     // --- post-attention norm -> batched MoE -> FFN residual ----------
-    _ops.rmsNormAsync(x, nSeq, d_model,
+    _ops.rmsNormAsync(x, nRow, d_model,
                       static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
     if (_moeGroupedDecode) {
         // GD-a: expert-grouped decode — amortise routed expert-weight reads
-        // across the batch. preferBlocked=true marks this as decode; TC vs the
-        // device-driven blocked branch is chosen inside via _moeGroupedDecodeTc.
-        runMoeFfnGrouped(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s,
-                         /*preferBlocked=*/true);
+        // across the batch. preferBlocked marks decode; ragged prefill (nRow>nSeq)
+        // uses the batched path (M>1) via preferBlocked=false.
+        runMoeFfnGrouped(blockIdx, normBuf, nRow, ctx.expIdxSlot, ctx.kwSlot, s,
+                         /*preferBlocked=*/!ragged);
     } else {
-        runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
+        runMoeFfnBatched(blockIdx, normBuf, nRow, ctx.expIdxSlot, ctx.kwSlot, s);
     }
-    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nSeq * d_model);
+    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nRow * d_model);
 }
 
 void Qwen3_5MoeBackend::runLinearBlockBatched(
@@ -1540,6 +1558,16 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     _ops.profileSection("gdn.proj");
     if (nSeq == 0) {
         return;
+    }
+    // 5.21-III Stufe 1 (partial): the full-attention block is ragged-ready, but
+    // the GDN block's ragged branch (nRow + varlen conv-state assembly + varlen
+    // recurrence wiring) is NOT wired yet. Fail loud rather than silently run the
+    // GDN layers at nSeq if a caller drives the ragged path before it lands. No
+    // caller sets seqTDev today (the decode path is unaffected / bit-identical).
+    if (ctx.seqTDev != nullptr) {
+        throw std::runtime_error(
+            "runLinearBlockBatched: ragged (varlen) path not yet wired — "
+            "Increment III GDN branch pending");
     }
 
     const auto& w        = _weights;
