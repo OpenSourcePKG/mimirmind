@@ -1559,28 +1559,22 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     if (nSeq == 0) {
         return;
     }
-    // 5.21-III Stufe 1 (partial): the full-attention block is ragged-ready, but
-    // the GDN block's ragged branch (nRow + varlen conv-state assembly + varlen
-    // recurrence wiring) is NOT wired yet. Fail loud rather than silently run the
-    // GDN layers at nSeq if a caller drives the ragged path before it lands. No
-    // caller sets seqTDev today (the decode path is unaffected / bit-identical).
-    if (ctx.seqTDev != nullptr) {
-        throw std::runtime_error(
-            "runLinearBlockBatched: ragged (varlen) path not yet wired — "
-            "Increment III GDN branch pending");
-    }
+    // 5.21-III ragged: nRow activation rows (= nSeq decode / sum(seqT) prefill).
+    // Decode (seqTDev==nullptr) => nRow==nSeq => bit-identical. GDN uses no RoPE.
+    const bool        ragged = (ctx.seqTDev != nullptr);
+    const std::size_t nRow   = ragged ? ctx.nRow : nSeq;
 
     const auto& w        = _weights;
     const auto& attnNorm = requireBlock(w, blockIdx, "attn_norm.weight");
-    const auto& qkvW     = pickDense(w, blockIdx, "attn_qkv.weight", nSeq, _denseFp8MaxT);
-    const auto& gateW    = pickDense(w, blockIdx, "attn_gate.weight", nSeq, _denseFp8MaxT);
+    const auto& qkvW     = pickDense(w, blockIdx, "attn_qkv.weight", nRow, _denseFp8MaxT);
+    const auto& gateW    = pickDense(w, blockIdx, "attn_gate.weight", nRow, _denseFp8MaxT);
     const auto& betaW    = requireBlock(w, blockIdx, "ssm_beta.weight");
     const auto& alphaW   = requireBlock(w, blockIdx, "ssm_alpha.weight");
     const auto& ssmA     = requireBlock(w, blockIdx, "ssm_a");
     const auto& ssmDt    = requireBlock(w, blockIdx, "ssm_dt.bias");
     const auto& convW    = requireBlock(w, blockIdx, "ssm_conv1d.weight");
     const auto& ssmNormW = requireBlock(w, blockIdx, "ssm_norm.weight");
-    const auto& ssmOutW  = pickDense(w, blockIdx, "ssm_out.weight", nSeq, _denseFp8MaxT);
+    const auto& ssmOutW  = pickDense(w, blockIdx, "ssm_out.weight", nRow, _denseFp8MaxT);
     const auto& attnPost = requireBlock(w, blockIdx, "post_attention_norm.weight");
 
     const std::size_t d_model        = s.d_model;
@@ -1623,11 +1617,11 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     float* const stateBase = s.ssmStatePtr     + blockIdx * (slabNSeq * stateElems);
     float* const convBase  = s.ssmConvStatePtr + blockIdx * (slabNSeq * convStateElems);
 
-    // --- pre-attention RMSNorm (nSeq rows) ---------------------------
-    _ops.rmsNormAsync(x, nSeq, d_model,
+    // --- pre-attention RMSNorm (nRow rows) ---------------------------
+    _ops.rmsNormAsync(x, nRow, d_model,
                       static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
 
-    // --- projections (M = nSeq) --------------------------------------
+    // --- projections (M = nRow; fused proj is nSeq==1-only => decode) -
     // GDN-Inc 1: at nSeq==1 decode, fuse qkv+gate -> qkvz and beta+alpha -> ba
     // into ONE fp8 GEMV each (vLLM in_proj_qkvz / in_proj_ba). The fused BF16
     // weight is concatenated once per block and cached; matmulAsync quantises it
@@ -1669,10 +1663,10 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
         alphaBuf = baOut + hV;            // [hV, 2*hV)
     } else {
         compute::UnorderedScope u{_ops};
-        _gmm.matmulAsync(qkvW.type,  qkvW.usmPtr,  convDim,  d_model, normBuf, nSeq, qkvMixed, mmScratch);
-        _gmm.matmulAsync(gateW.type, gateW.usmPtr, valueDim, d_model, normBuf, nSeq, zBuf,     mmScratch);
-        _gmm.matmulAsync(betaW.type, betaW.usmPtr, hV,       d_model, normBuf, nSeq, betaBuf,  mmScratch);
-        _gmm.matmulAsync(alphaW.type,alphaW.usmPtr,hV,       d_model, normBuf, nSeq, alphaBuf, mmScratch);
+        _gmm.matmulAsync(qkvW.type,  qkvW.usmPtr,  convDim,  d_model, normBuf, nRow, qkvMixed, mmScratch);
+        _gmm.matmulAsync(gateW.type, gateW.usmPtr, valueDim, d_model, normBuf, nRow, zBuf,     mmScratch);
+        _gmm.matmulAsync(betaW.type, betaW.usmPtr, hV,       d_model, normBuf, nRow, betaBuf,  mmScratch);
+        _gmm.matmulAsync(alphaW.type,alphaW.usmPtr,hV,       d_model, normBuf, nRow, alphaBuf, mmScratch);
     }
 
     // beta = sigmoid(beta); gLog = ssm_a * softplus(alpha + ssm_dt).
@@ -1680,11 +1674,11 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     // launches are skipped and beta/alpha stay RAW (consumed by the fused
     // recurrence below). MIMIRMIND_GDN_GATE_FUSE=1.
     if (!_gdnGateFuse) {
-        _ops.sigmoidInPlaceAsync(betaBuf, nSeq * hV);
+        _ops.sigmoidInPlaceAsync(betaBuf, nRow * hV);
         _ops.deltanetGateAsync(alphaBuf,
                                static_cast<const float*>(ssmA.usmPtr),
                                static_cast<const float*>(ssmDt.usmPtr),
-                               gateBuf, nSeq, hV);
+                               gateBuf, nRow, hV);
     }
 
     // --- causal conv1d + silu (per-seq rolling state) ----------------
@@ -1693,9 +1687,18 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     _ops.profileSection("gdn.conv");
     const std::size_t convInBytes  = convStateElems * sizeof(float);
     const std::size_t qkvRowBytes  = convDim * sizeof(float);
+    // 5.21-III ragged: slot seq's conv input = [state tail (stateRows) | its
+    // seqT[seq] tokens] at convInOff[seq]; its tokens come from qkvMixed at token
+    // offset seqOff[seq]. Decode (ragged=false): Tslot=1, inRowOff=seq*dConv,
+    // tokOff=seq — exactly the pre-varlen layout.
+    std::size_t inRowRun = 0, tokRun = 0;
     for (std::size_t seq = 0; seq < nSeq; ++seq) {
+        const std::size_t Tslot =
+            ragged ? static_cast<std::size_t>(ctx.seqTHost[seq]) : 1;
+        const std::size_t inRowOff = ragged ? inRowRun : seq * dConv;
+        const std::size_t tokOff   = ragged ? tokRun   : seq;
         float* const cvState = convBase + seq * convStateElems;
-        float* const cvIn    = convInput + seq * dConv * convDim;
+        float* const cvIn    = convInput + inRowOff * convDim;
         const bool frozen = ctx.activeMaskHost != nullptr
                             && ctx.activeMaskHost[seq] == 0;
         if (!frozen && ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
@@ -1703,33 +1706,44 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
         }
         _ops.appendMemoryCopy(cvIn, cvState, convInBytes);
         _ops.appendMemoryCopy(cvIn + stateRows * convDim,
-                              qkvMixed + seq * convDim, qkvRowBytes);
+                              qkvMixed + tokOff * convDim, Tslot * qkvRowBytes);
+        inRowRun += stateRows + Tslot;
+        tokRun   += Tslot;
     }
-    _ops.causalConv1dSiluBatchedAsync(convInput,
-                                      static_cast<const float*>(convW.usmPtr),
-                                      qkvMixed, nSeq, /*T=*/1, convDim, dConv);
-    // Save each sequence's trailing stateRows rows as the next conv state.
+    _ops.causalConv1dSiluBatchedAsync(
+        convInput, static_cast<const float*>(convW.usmPtr), qkvMixed,
+        nSeq, ragged ? ctx.maxSeqT : 1, convDim, dConv,
+        ragged ? ctx.seqTDev : nullptr,
+        ragged ? ctx.convInOffDev : nullptr,
+        ragged ? ctx.seqOffDev : nullptr);
+    // Save each sequence's trailing stateRows rows as the next conv state (the
+    // last stateRows of [state | Tslot tokens] start at row Tslot).
     // 5.21-I: a frozen slot keeps its conv tail byte-identical (skip the save).
+    std::size_t inRowRun2 = 0;
     for (std::size_t seq = 0; seq < nSeq; ++seq) {
+        const std::size_t Tslot =
+            ragged ? static_cast<std::size_t>(ctx.seqTHost[seq]) : 1;
+        const std::size_t inRowOff = ragged ? inRowRun2 : seq * dConv;
+        inRowRun2 += stateRows + Tslot;
         if (ctx.activeMaskHost != nullptr && ctx.activeMaskHost[seq] == 0) {
             continue;
         }
         float* const cvState = convBase + seq * convStateElems;
-        float* const cvIn    = convInput + seq * dConv * convDim;
-        _ops.appendMemoryCopy(cvState, cvIn + /*T=*/1 * convDim, convInBytes);
+        float* const cvIn    = convInput + inRowOff * convDim;
+        _ops.appendMemoryCopy(cvState, cvIn + Tslot * convDim, convInBytes);
     }
 
     // --- split conv into q/k/v (+ GQA repeat H_k -> H_v) + q/k L2-norm ---
     // GDN-Inc 2b: one fused launch (gather q/k/v + norm q/k) vs 3 gathers + 2 norms.
     if (_gdnPrepFuse) {
-        _ops.fusedPostConvPrepAsync(qkvMixed, qBuf, kBuf, vBuf, nSeq, hK, hV, S,
+        _ops.fusedPostConvPrepAsync(qkvMixed, qBuf, kBuf, vBuf, nRow, hK, hV, S,
                                     convDim, keyDim, eps);
     } else {
-        _ops.gatherHeadsFromChannelsAsync(qkvMixed, qBuf, nSeq, 0,          hK, hV, S, convDim);
-        _ops.gatherHeadsFromChannelsAsync(qkvMixed, kBuf, nSeq, keyDim,     hK, hV, S, convDim);
-        _ops.gatherHeadsFromChannelsAsync(qkvMixed, vBuf, nSeq, 2 * keyDim, hV, hV, S, convDim);
-        _ops.l2NormInPlaceAsync(qBuf, nSeq * hV, S, eps);
-        _ops.l2NormInPlaceAsync(kBuf, nSeq * hV, S, eps);
+        _ops.gatherHeadsFromChannelsAsync(qkvMixed, qBuf, nRow, 0,          hK, hV, S, convDim);
+        _ops.gatherHeadsFromChannelsAsync(qkvMixed, kBuf, nRow, keyDim,     hK, hV, S, convDim);
+        _ops.gatherHeadsFromChannelsAsync(qkvMixed, vBuf, nRow, 2 * keyDim, hV, hV, S, convDim);
+        _ops.l2NormInPlaceAsync(qBuf, nRow * hV, S, eps);
+        _ops.l2NormInPlaceAsync(kBuf, nRow * hV, S, eps);
     }
 
     // --- gated delta-rule recurrence (persistent per-seq state) ------
@@ -1743,7 +1757,11 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
             _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
         }
     }
-    const compute::GdnBatchedShape gdnShape{nSeq, /*T=*/1, hV, S, ctx.activeMask};
+    // 5.21-III ragged: per-slot seqT/seqOff drive the recurrence (T fallback =
+    // maxSeqT). Decode (ragged=false) => seqT/seqOff nullptr, T=1 => bit-identical.
+    const compute::GdnBatchedShape gdnShape{
+        nSeq, ragged ? ctx.maxSeqT : 1, hV, S, ctx.activeMask,
+        ragged ? ctx.seqTDev : nullptr, ragged ? ctx.seqOffDev : nullptr};
     if (_gdnGateFuse) {
         // GDN-Inc 2: gate folded in — pass RAW alpha/beta + per-head ssm_a/ssm_dt.
         _ops.gatedDeltaNetRecurrentGateFusedBatchedAsync(
@@ -1758,28 +1776,27 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
 
     // --- gated output norm: ssm_norm(out) * silu(z) ------------------
     _ops.profileSection("gdn.tail");
-    _ops.rmsNormAsync(deltaOut, nSeq * hV, S,
+    _ops.rmsNormAsync(deltaOut, nRow * hV, S,
                       static_cast<const float*>(ssmNormW.usmPtr), eps, qBuf);
-    _ops.siluMulAsync(zBuf, qBuf, nSeq * valueDim);
+    _ops.siluMulAsync(zBuf, qBuf, nRow * valueDim);
 
     // --- output projection ssm_out -----------------------------------
     _gmm.matmulAsync(ssmOutW.type, ssmOutW.usmPtr, d_model, valueDim,
-                     zBuf, nSeq, projOut, mmScratch);
-    _ops.addResidualAsync(x, projOut, nSeq * d_model);
+                     zBuf, nRow, projOut, mmScratch);
+    _ops.addResidualAsync(x, projOut, nRow * d_model);
 
     // --- post-attn norm -> batched MoE -> FFN residual ---------------
-    _ops.rmsNormAsync(x, nSeq, d_model,
+    _ops.rmsNormAsync(x, nRow, d_model,
                       static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
     if (_moeGroupedDecode) {
-        // GD-a: expert-grouped decode — amortise routed expert-weight reads
-        // across the batch. preferBlocked=true marks this as decode; TC vs the
-        // device-driven blocked branch is chosen inside via _moeGroupedDecodeTc.
-        runMoeFfnGrouped(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s,
-                         /*preferBlocked=*/true);
+        // preferBlocked marks decode; ragged prefill (nRow>nSeq) uses the batched
+        // path (M>1) via preferBlocked=false.
+        runMoeFfnGrouped(blockIdx, normBuf, nRow, ctx.expIdxSlot, ctx.kwSlot, s,
+                         /*preferBlocked=*/!ragged);
     } else {
-        runMoeFfnBatched(blockIdx, normBuf, nSeq, ctx.expIdxSlot, ctx.kwSlot, s);
+        runMoeFfnBatched(blockIdx, normBuf, nRow, ctx.expIdxSlot, ctx.kwSlot, s);
     }
-    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nSeq * d_model);
+    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nRow * d_model);
 }
 
 void Qwen3_5MoeBackend::runLinearBlockVerify(
