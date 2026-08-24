@@ -92,6 +92,23 @@ struct BatchedDecodeCtx {
     const std::int32_t*   convInOffDev{nullptr};   // [nSeq] device: conv-input offset
     const std::int32_t*   ropePosDev{nullptr};     // [nRow] device: per-token rope pos
     std::size_t           maxSeqT{0};              // host: max(seqT) (attn/conv grid)
+
+    // 5.21-III HYBRID ATTENTION — in a TRUE mixed prefill+decode forward, route
+    // seqT==1 (decode) rows through the split-K paged decode-V2 kernel instead of
+    // the O(seq_len) prefill-causal path (which is kept only for the seqT>1
+    // prefill rows). Built once per forward by ServingSession::runVarlenPrefill
+    // when the batch holds BOTH row classes. hybDecodeCount==0 => plain ragged
+    // (all rows via prefill-causal), bit-identical to the non-hybrid mixed step.
+    // Prefill-causal skips the decode rows automatically: hybSeqTPrefillDev is
+    // seqTDev with the decode slots' entries set to 0 (its `pq >= seqT` guard).
+    std::size_t           hybDecodeCount{0};              // D = #seqT==1 rows
+    const std::int32_t*   hybDecodeRowMapDev{nullptr};    // [D] query rows (nRow layout)
+    const std::int32_t*   hybDecodeSeqLensDev{nullptr};   // [D] KV length (startPos+1)
+    const std::int32_t*   hybDecodeBlockTablesDev{nullptr}; // [D*maxBlocksPerSeq]
+    const std::int32_t*   hybSeqTPrefillDev{nullptr};    // [nSeq] seqT, decode slots -> 0
+    float*                hybQDecodeScratch{nullptr};     // [D*q_dim] gathered decode Q
+    float*                hybAttnDecodeScratch{nullptr};  // [D*q_dim] decode-V2 out
+    std::size_t           hybMaxDecodeSeqLen{0};          // max(startPos+1) over decode
 };
 
 /**

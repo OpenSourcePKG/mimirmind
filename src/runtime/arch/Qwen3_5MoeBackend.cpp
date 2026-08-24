@@ -1505,12 +1505,34 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
     const auto* valBase =
         static_cast<const float*>(ctx.pool->valuePool(denseLayer));
     if (ragged) {
-        // 5.21-III: prefill/varlen rows attend CAUSALLY over their chunk + prior
-        // KV (query pq -> keys [0, startPos[seq]+pq]) via the paged pool. Decode
-        // rows (seqT==1) reduce to a single query at startPos. F32 KV only.
+        // 5.21-III HYBRID: a TRUE mixed forward routes seqT==1 (decode) rows
+        // through split-K paged decode-V2 (fast for long context) and leaves the
+        // seqT>1 (prefill) rows on the O(seq_len) prefill-causal path. Decode rows
+        // are gathered to a compact [D] set (query rows = hybDecodeRowMapDev),
+        // run through decode-V2, and scattered back into attnOut; prefill-causal
+        // then writes ONLY the prefill rows (hybSeqTPrefillDev zeroes the decode
+        // slots so its `pq >= seqT` guard skips them). hybDecodeCount==0 => the
+        // plain all-rows prefill-causal path (pure prefill / hybrid disabled).
+        if (ctx.hybDecodeCount > 0) {
+            const std::size_t D = ctx.hybDecodeCount;
+            _ops.moeGatherRowsAsync(qBuf, ctx.hybDecodeRowMapDev,
+                                    ctx.hybQDecodeScratch, q_dim, D);
+            _ops.pagedAttentionDecodeV2Async(
+                ctx.hybAttnDecodeScratch, ctx.hybQDecodeScratch, keyBase, valBase,
+                ctx.hybDecodeBlockTablesDev, ctx.hybDecodeSeqLensDev,
+                D, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
+                ctx.maxBlocksPerSeq, ctx.hybMaxDecodeSeqLen, attnScale,
+                /*softcap=*/0.0f, kvDtype);
+            _ops.moeRowsScatterF32Async(ctx.hybAttnDecodeScratch,
+                                        ctx.hybDecodeRowMapDev, attnOut, D, q_dim);
+        }
+        // prefill/varlen rows attend CAUSALLY over their chunk + prior KV (query
+        // pq -> keys [0, startPos[seq]+pq]) via the paged pool. When hybrid is on,
+        // seqTPrefill zeroes the decode slots so only prefill rows are written.
         _ops.pagedAttentionPrefillCausalAsync(
             attnOut, qBuf, keyBase, valBase, ctx.blockTablesDev,
-            ctx.seqTDev, ctx.seqOffDev, ctx.startPosDev,
+            (ctx.hybDecodeCount > 0) ? ctx.hybSeqTPrefillDev : ctx.seqTDev,
+            ctx.seqOffDev, ctx.startPosDev,
             nSeq, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
             ctx.maxBlocksPerSeq, ctx.maxSeqT, attnScale, /*softcap=*/0.0f);
     } else if (_forcePagedV1) {

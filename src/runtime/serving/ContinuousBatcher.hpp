@@ -9,6 +9,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -182,6 +183,11 @@ private:
         std::size_t                     maxNew{0};
         std::size_t                     produced{0};  // generated tokens so far
         std::vector<std::int32_t>       stopIds;
+        // 5.21-III true mixed step: how many prompt tokens have been prefilled so
+        // far (chunk by chunk, interleaved with other slots' decode). == promptLen
+        // means the slot is fully prefilled and now decoding. Only used when
+        // `_mixedStep` (else prefill is eager and this stays 0).
+        std::size_t                     prefillPos{0};
     };
 
     void workerLoop();
@@ -197,6 +203,33 @@ private:
     /// pushed. Runs the GPU work without holding `_mtx`. A prefill failure
     /// fails only that request. Only called when `_prefillChunk > 0`.
     void prefillSlotAdmitted(std::size_t slot);
+
+    /// 5.21-III MULTI-SLOT — prefill a CONTIGUOUS run of just-admitted slots
+    /// (`run` sorted ascending, run[k]==run[0]+k) by batching their prompts
+    /// into ragged `prefillSlotsBatched` forwards (packed up to `_prefillMaxRows`
+    /// tokens/forward), then committing each into decode. A slot whose prompt
+    /// exceeds the per-forward budget falls back to single-slot chunked prefill.
+    /// Runs the GPU work without holding `_mtx`. Only called when
+    /// `_mixedBatchPrefill` is on. A prefill failure fails only the involved
+    /// requests, leaving the rest of the batch's slots retired cleanly.
+    void prefillSlotRunBatched(std::span<const std::size_t> run);
+
+    /// Commit a freshly-prefilled slot into decode state at pos == promptLen
+    /// with its first generated token `firstTok` pushed (stop-condition checks
+    /// included). Caller must NOT hold `_mtx`. Shared by the single-slot and
+    /// multi-slot prefill paths.
+    void commitPrefilledSlot(std::size_t slot,
+                             const std::shared_ptr<ServingRequest>& req,
+                             std::int32_t firstTok);
+
+    /// 5.21-III TRUE MIXED STEP — one ragged forward over the active prefix
+    /// [0,nActive) folding each slot's next PREFILL chunk (seqT>1) OR its DECODE
+    /// token (seqT=1) into the same `runVarlenPrefill` call (vLLM-style prefill
+    /// riding along with decode). Advances prefill positions, distributes decode
+    /// tokens, retires finished requests. Runs the GPU forward without `_mtx`.
+    /// Returns true if a slot was freed (submitters should be woken). Only called
+    /// when `_mixedStep` is on and at least one slot is still prefilling.
+    bool runMixedStep();
 
     InferenceEngine& _engine;
     std::size_t      _maxBatch;
@@ -219,6 +252,32 @@ private:
     // MIMIRMIND_PREFILL_ADMIT_PER_ITER=<K>. Safe (no partial slot ever enters
     // the decode batch); overlap only — does NOT batch the prefills themselves.
     std::size_t      _admitPerIter{0};
+    // 5.21-III MULTI-SLOT — batch newly-admitted slots' prefill into ONE ragged
+    // forward (unlike admit-per-iter, this batches the prefill compute itself).
+    // MIMIRMIND_PREFILL_MIXED_BATCH=1; default OFF. Needs chunked prefill.
+    bool             _mixedBatchPrefill{false};
+    // Per-mixed-forward token budget (InferenceEngine::servingPrefillMaxRows()).
+    std::size_t      _prefillMaxRows{0};
+    // 5.21-III TRUE MIXED STEP — fold each slot's prefill chunk OR decode token
+    // into ONE ragged forward per iteration (prefill overlaps decode, vLLM-style).
+    // Supersedes eager prefill: newly-admitted slots start prefilling in-band.
+    // DEFAULT ON (server-decides, no user toggle): Spark A/B 2026-08-24 validated
+    // green across burst/trickle/decode-heavy — +19% agg / -16% wall / -43% ttft
+    // under load, and bit-identical pure-decode (inert once nothing prefills →
+    // decode-v2 unchanged). Auto-disabled when the substrate has no chunked prefill
+    // (prefillMaxRows==0). Rollback: MIMIRMIND_MIXED_STEP=0.
+    bool             _mixedStep{true};
+    // 5.21-III PRESSURE GATE — only fold prefill into the decode forward when the
+    // wait queue exceeds free-slot capacity (a real backlog). With no backlog,
+    // newly-admitted slots take the eager chunked-prefill path so live decoders
+    // keep the fast decode-v2 step. Default OFF: the 2026-08-24 Spark A/B showed
+    // unconditional folding wins e2e (wall/agg/ttft) at every tested workload —
+    // at conc<=maxBatch the gate reverts to prod and DROPS the +19%/-43% win,
+    // while only recovering the decode_tok_s_est ACCOUNTING artifact. Kept as an
+    // opt-in (MIMIRMIND_MIXED_STEP_PRESSURE=1) for the untested trickle-arrival
+    // regime (steady decode pool + occasional new prefill), which the burst
+    // sweep does not exercise.
+    bool             _mixedStepPressureGate{false};
 
     std::vector<Slot>                     _slots;
     std::deque<Pending>                   _waiting;
