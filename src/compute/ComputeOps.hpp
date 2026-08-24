@@ -448,6 +448,27 @@ public:
             "pagedAttentionDecodeV1Async: not supported on this backend");
     }
 
+    /// 5.21 Increment II — paged, batched, CAUSAL, T>1 prefill attention. Slot
+    /// seq carries seqT[seq] ragged query tokens at token offset queryOff[seq];
+    /// query pq attends KV [0, startPos[seq]+pq] via the block table. maxT =
+    /// max(seqT) sizes the grid's query dim. CUDA-only (default-throws).
+    virtual void pagedAttentionPrefillCausalAsync(
+            float* out, const float* query, const float* keyCache,
+            const float* valueCache, const std::int32_t* blockTables,
+            const std::int32_t* seqT, const std::int32_t* queryOff,
+            const std::int32_t* startPos, std::size_t numSeqs,
+            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
+            std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
+            std::size_t maxT, float scale, float softcap) {
+        (void)out; (void)query; (void)keyCache; (void)valueCache;
+        (void)blockTables; (void)seqT; (void)queryOff; (void)startPos;
+        (void)numSeqs; (void)numHeads; (void)numKvHeads; (void)headSize;
+        (void)blockSize; (void)maxNumBlocksPerSeq; (void)maxT; (void)scale;
+        (void)softcap;
+        throw std::runtime_error(
+            "pagedAttentionPrefillCausalAsync: not supported on this backend");
+    }
+
     /// Split-K (partition-parallel) paged decode attention — kernels
     /// `paged_attention_v2` + `paged_attention_v2_reduce`. Same result as V1
     /// but parallelises the KV traversal across `ceil(maxSeqLen/512)` partitions

@@ -205,6 +205,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _attentionFlashMergeBatchedKernel;
     core::cuda::CudaModule _pagedAttentionV1Module;
     core::cuda::CudaKernel _pagedAttentionV1Kernel;
+    core::cuda::CudaModule _pagedAttentionPrefillCausalModule;
+    core::cuda::CudaKernel _pagedAttentionPrefillCausalKernel;
     core::cuda::CudaModule _pagedAttentionV2Module;
     core::cuda::CudaKernel _pagedAttentionV2Kernel;
     core::cuda::CudaKernel _pagedAttentionV2Fp16Kernel;   // fp16 KV (5.14 I1)
@@ -454,6 +456,11 @@ struct GpuOps::Impl {
           _pagedAttentionV1Module{loadCudaModule(ctx, "attention_paged_v1")},
           _pagedAttentionV1Kernel{
               _pagedAttentionV1Module.getFunction("paged_attention_v1")},
+          _pagedAttentionPrefillCausalModule{
+              loadCudaModule(ctx, "attention_paged_prefill_causal")},
+          _pagedAttentionPrefillCausalKernel{
+              _pagedAttentionPrefillCausalModule.getFunction(
+                  "paged_attention_prefill_causal")},
           _pagedAttentionV2Module{loadCudaModule(ctx, "attention_paged_v2")},
           _pagedAttentionV2Kernel{
               _pagedAttentionV2Module.getFunction("paged_attention_v2")},
@@ -3351,6 +3358,47 @@ void GpuOps::pagedAttentionDecodeV1Async(
                 static_cast<std::uint32_t>(numHeads),
                 static_cast<std::uint32_t>(numSeqs),
                 1,
+                kLocal, 1, 1,
+                smemBytes);
+}
+
+void GpuOps::pagedAttentionPrefillCausalAsync(
+        float* out, const float* query, const float* keyCache,
+        const float* valueCache, const std::int32_t* blockTables,
+        const std::int32_t* seqT, const std::int32_t* queryOff,
+        const std::int32_t* startPos, std::size_t numSeqs, std::size_t numHeads,
+        std::size_t numKvHeads, std::size_t headSize, std::size_t blockSize,
+        std::size_t maxNumBlocksPerSeq, std::size_t maxT, float scale,
+        float softcap) {
+    if (numSeqs == 0 || numHeads == 0 || headSize == 0 || maxT == 0) {
+        return;
+    }
+    // 5.21-II paged causal prefill attention. grid (numHeads, numSeqs, maxT);
+    // block (pq >= seqT[seq]) early-out. Same smem + streaming-softmax as V1, so
+    // pq's output == a V1 decode with seq_len = startPos[seq]+pq+1.
+    constexpr std::uint32_t kLocal = 128;   // == PAGED_ATTN_PREFILL_LOCAL
+    auto& kern = _pimpl->_pagedAttentionPrefillCausalKernel;
+    kern.setPtr  (0, out);
+    kern.setPtr  (1, query);
+    kern.setPtr  (2, keyCache);
+    kern.setPtr  (3, valueCache);
+    kern.setPtr  (4, blockTables);
+    kern.setPtr  (5, seqT);
+    kern.setPtr  (6, queryOff);
+    kern.setPtr  (7, startPos);
+    kern.setValue(8,  toInt32(numSeqs,            "prefC numSeqs"));
+    kern.setValue(9,  toInt32(numHeads,           "prefC numHeads"));
+    kern.setValue(10, toInt32(numKvHeads,         "prefC numKvHeads"));
+    kern.setValue(11, toInt32(headSize,           "prefC headSize"));
+    kern.setValue(12, toInt32(blockSize,          "prefC blockSize"));
+    kern.setValue(13, toInt32(maxNumBlocksPerSeq, "prefC maxBlocks"));
+    kern.setValue(14, scale);
+    kern.setValue(15, softcap);
+    const std::size_t smemBytes = (2 * headSize + kLocal) * sizeof(float);
+    kern.launch(_ctx.stream(),
+                static_cast<std::uint32_t>(numHeads),
+                static_cast<std::uint32_t>(numSeqs),
+                static_cast<std::uint32_t>(maxT),
                 kLocal, 1, 1,
                 smemBytes);
 }

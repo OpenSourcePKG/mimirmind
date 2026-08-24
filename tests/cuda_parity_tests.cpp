@@ -2404,6 +2404,86 @@ TEST(cuda_deltanet_chunk_batched_parity) {
                 nSeq, T, H, S, C, maxErr);
 }
 
+// 5.21 Increment II — VARLEN paged CAUSAL prefill attention: 2 ragged slots
+// (different startPos + seqT) in one launch vs per-(slot,pq) paged_attention_v1
+// decode with seq_len = startPos+pq+1. Same streaming-softmax => byte-exact.
+TEST(cuda_paged_attention_prefill_causal_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const int nHeads = 4, nKvHeads = 2, headSize = 32, blockSize = 4;
+    const std::vector<int> startPos = {3, 1};
+    const std::vector<int> seqT     = {2, 3};
+    const int nSeq  = static_cast<int>(seqT.size());
+    const int kvDim = nKvHeads * headSize;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(headSize));
+
+    std::vector<int> nBlk(nSeq); int maxBlk = 0, numBlocks = 0;
+    for (int s = 0; s < nSeq; ++s) {
+        const int len = startPos[s] + seqT[s];
+        nBlk[s] = (len + blockSize - 1) / blockSize;
+        maxBlk = std::max(maxBlk, nBlk[s]); numBlocks += nBlk[s];
+    }
+    std::vector<int> blockTables(static_cast<std::size_t>(nSeq)*maxBlk, -1);
+    { int nx = 0; for (int s=0;s<nSeq;++s) for (int b=0;b<nBlk[s];++b)
+        blockTables[static_cast<std::size_t>(s)*maxBlk + b] = nx++; }
+
+    std::vector<int> queryOff(nSeq, 0); int totalTok = 0, maxT = 1;
+    for (int s=0;s<nSeq;++s){ queryOff[s]=totalTok; totalTok+=seqT[s]; maxT=std::max(maxT,seqT[s]); }
+
+    auto kPool = randVec(static_cast<std::size_t>(numBlocks)*blockSize*kvDim, 0x51u);
+    auto vPool = randVec(static_cast<std::size_t>(numBlocks)*blockSize*kvDim, 0x52u);
+    auto query = randVec(static_cast<std::size_t>(totalTok)*nHeads*headSize, 0x53u);
+
+    auto dK = toDevice(ops, kPool); auto dV = toDevice(ops, vPool);
+    auto dQ = toDevice(ops, query);
+    auto dBT = uploadRaw(ops, blockTables);
+    auto dSeqT = uploadRaw(ops, seqT);
+    auto dQOff = uploadRaw(ops, queryOff);
+    auto dSP  = uploadRaw(ops, startPos);
+    auto dOut = ops.allocate(static_cast<std::size_t>(totalTok)*nHeads*headSize*sizeof(float));
+
+    ops.pagedAttentionPrefillCausalAsync(
+        static_cast<float*>(dOut.get()), static_cast<const float*>(dQ.get()),
+        static_cast<const float*>(dK.get()), static_cast<const float*>(dV.get()),
+        static_cast<const std::int32_t*>(dBT.get()),
+        static_cast<const std::int32_t*>(dSeqT.get()),
+        static_cast<const std::int32_t*>(dQOff.get()),
+        static_cast<const std::int32_t*>(dSP.get()),
+        nSeq, nHeads, nKvHeads, headSize, blockSize, maxBlk, maxT, scale, 0.0f);
+    ops.flush();
+    auto outB = fromDevice(ops, dOut.get(), static_cast<std::size_t>(totalTok)*nHeads*headSize);
+
+    double maxErr = 0.0;
+    const std::size_t rowElems = static_cast<std::size_t>(nHeads)*headSize;
+    for (int s = 0; s < nSeq; ++s) {
+        std::vector<int> btRow(blockTables.begin()+static_cast<std::size_t>(s)*maxBlk,
+                               blockTables.begin()+static_cast<std::size_t>(s+1)*maxBlk);
+        auto dBTs = uploadRaw(ops, btRow);
+        for (int pq = 0; pq < seqT[s]; ++pq) {
+            const std::size_t tok = static_cast<std::size_t>(queryOff[s]) + pq;
+            std::vector<float> q1(query.begin()+tok*rowElems, query.begin()+(tok+1)*rowElems);
+            std::vector<int> sl = {startPos[s] + pq + 1};
+            auto dq1 = toDevice(ops, q1); auto dsl = uploadRaw(ops, sl);
+            auto do1 = ops.allocate(rowElems*sizeof(float));
+            ops.pagedAttentionDecodeV1Async(
+                static_cast<float*>(do1.get()), static_cast<const float*>(dq1.get()),
+                static_cast<const float*>(dK.get()), static_cast<const float*>(dV.get()),
+                static_cast<const std::int32_t*>(dBTs.get()),
+                static_cast<const std::int32_t*>(dsl.get()),
+                1, nHeads, nKvHeads, headSize, blockSize, maxBlk, scale, 0.0f);
+            ops.flush();
+            auto o1 = fromDevice(ops, do1.get(), rowElems);
+            for (std::size_t i = 0; i < rowElems; ++i) {
+                maxErr = std::max(maxErr, std::fabs((double)outB[tok*rowElems+i]-(double)o1[i]));
+                EXPECT_NEAR(outB[tok*rowElems+i], o1[i], 0.f);
+            }
+        }
+    }
+    std::printf("[paged-prefill-causal-parity] nSeq=%d seqT={2,3} startPos={3,1} maxErr=%.2e\n",
+                nSeq, maxErr);
+}
+
 // M-Cuda.Batch B2 — paged_attention_v1 baseline decode kernel vs a CPU
 // softmax-attention reference. Builds a synthetic paged KV pool (block
 // tables + per-block slots), one query token per sequence, ragged
