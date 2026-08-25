@@ -1114,6 +1114,18 @@ if(MIMIRMIND_ENABLE_CUDA)
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON)
     target_link_libraries(microbench_nvfp4blk_occ PRIVATE CUDA::cudart)
+
+    # microbench_moe_gemv_m1 — isolated M=1 routed-MoE decode-GEMV bandwidth probe
+    # (links the real prod _m1reg kernel), roadmap 5.18.5. Answers whether the
+    # real-decode moe.gemm 22%-peak is the kernel or a small-per-expert/grid-fill
+    # effect (grouping = a batch lever that does not transfer to single-user M=1).
+    add_executable(microbench_moe_gemv_m1
+        tools/microbench/moe_gemv_m1_bench.cu
+        kernels/cuda/llm/moe_grouped_gemm_nvfp4blk.cu)
+    set_target_properties(microbench_moe_gemv_m1 PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(microbench_moe_gemv_m1 PRIVATE CUDA::cudart)
 endif()
 
 # ---- mimirmind_core_cuda — NVIDIA CUDA-tied foundation --------------------
