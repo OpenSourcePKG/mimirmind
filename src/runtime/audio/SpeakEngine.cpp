@@ -8,9 +8,63 @@
 #include "runtime/audio/WavWriter.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <sstream>
+#include <vector>
 
 namespace mimirmind::runtime::audio {
+
+namespace {
+
+// Trim trailing near-silence from the decoded PCM. Orpheus tends to pad
+// terse prompts (e.g. "Hello.") with a quiet tail after the utterance —
+// the audio-token stream is valid and on-slot, the model just keeps
+// emitting low-energy frames before EOS. Only the TAIL is trimmed;
+// leading samples are untouched so the first phoneme's onset is never
+// clipped. The threshold is relative to the utterance's peak window RMS
+// (adapts to overall loudness), and a short margin after the last active
+// window preserves the natural decay.
+void trimTrailingSilence(std::vector<float>& pcm, std::size_t sampleRate) {
+    if (pcm.empty() || sampleRate == 0) {
+        return;
+    }
+    const std::size_t win = std::max<std::size_t>(1, sampleRate / 50); // 20 ms
+    auto windowRms = [&](std::size_t start) {
+        const std::size_t end = std::min(pcm.size(), start + win);
+        double acc = 0.0;
+        for (std::size_t i = start; i < end; ++i) {
+            acc += static_cast<double>(pcm[i]) * static_cast<double>(pcm[i]);
+        }
+        const std::size_t n = end - start;
+        return n ? std::sqrt(acc / static_cast<double>(n)) : 0.0;
+    };
+    double peak = 0.0;
+    for (std::size_t s = 0; s < pcm.size(); s += win) {
+        peak = std::max(peak, windowRms(s));
+    }
+    if (peak <= 0.0) {
+        return;
+    }
+    const double thresh = 0.03 * peak;   // 3% of peak counts as "silence"
+    std::size_t lastActiveEnd = 0;
+    for (std::size_t s = 0; s < pcm.size(); s += win) {
+        if (windowRms(s) >= thresh) {
+            lastActiveEnd = std::min(pcm.size(), s + win);
+        }
+    }
+    if (lastActiveEnd == 0) {
+        return;   // all silent — leave untouched rather than empty it
+    }
+    const std::size_t margin = std::min<std::size_t>(sampleRate / 20,
+                                                     pcm.size()); // 50 ms decay
+    const std::size_t keep = std::min(pcm.size(), lastActiveEnd + margin);
+    if (keep < pcm.size()) {
+        pcm.resize(keep);
+    }
+}
+
+} // namespace
 
 SpeakEngine::SpeakEngine(runtime::InferenceEngine& engine,
                          std::string_view codecPath)
@@ -92,7 +146,9 @@ SpeakEngine::synthesizePcm(std::string_view text, std::string_view voice,
     if (levels.size() != 3 || levels[2].empty()) {
         return {};
     }
-    return _snac.decode(levels);
+    std::vector<float> pcm = _snac.decode(levels);
+    trimTrailingSilence(pcm, sampleRate());
+    return pcm;
 }
 
 std::vector<std::byte>
