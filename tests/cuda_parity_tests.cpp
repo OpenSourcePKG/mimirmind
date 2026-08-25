@@ -1796,6 +1796,62 @@ TEST(cuda_gated_deltanet_ar_batched_varlen_parity) {
                 nSeq, H, S, maxErr);
 }
 
+// 5.21.2 MIXED-STEP OOB HUNT (compute-sanitizer memcheck target) — the FUSED
+// batched GDN recurrence (the prod GDN_GATE_FUSE=1 hot path) at PROD dims
+// (hV=32, S=128 -> the 64 KiB dynamic-smem opt-in path the small-S parity tests
+// never exercise) fed the EXACT mixed-step worst shape: 512-token prefill chunks
+// interleaved with seqT=1 decode rows, buffers COMPACT (totalTok rows) so any
+// padded seq*maxT indexing OOBs against the allocation. No numeric assert — the
+// value is that memcheck flags an out-of-bounds/illegal access with kernel+line.
+// Run:  compute-sanitizer --tool memcheck ./build-cuda/cuda_parity_tests
+// Result 2026-08-25: memcheck-CLEAN (0 errors) -> fused GDN recurrence cleared as
+// the roadmap-5.21.2 mixed-step illegal-access source.
+TEST(cuda_gdn_mixed_step_ragged_prod_dims_memcheck) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t H = 32, S = 128;   // prod qwen3.6: v_heads=32, value_head_dim=128
+    std::vector<std::int32_t> seqT = {512,512,512,1,1,1,1,1,1,1,1,1,1,1,1,1};
+    const std::size_t nSeq = seqT.size();
+    std::vector<std::int32_t> seqOff(nSeq, 0);
+    std::size_t totalTok = 0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        seqOff[s] = static_cast<std::int32_t>(totalTok);
+        totalTok += static_cast<std::size_t>(seqT[s]);
+    }
+    const std::size_t maxT = 512;
+    const std::size_t hs = H * S, stt = H * S * S;
+
+    auto dQ     = toDevice(ops, randVec(totalTok * hs, 0x9110u));
+    auto dK     = toDevice(ops, randVec(totalTok * hs, 0x9220u));
+    auto dV     = toDevice(ops, randVec(totalTok * hs, 0x9330u));
+    auto dAlpha = toDevice(ops, randVec(totalTok * H,  0x9440u));
+    auto dBeta  = toDevice(ops, randVec(totalTok * H,  0x9550u));
+    auto dSsmA  = toDevice(ops, randVec(H, 0x9660u));
+    auto dSsmDt = toDevice(ops, randVec(H, 0x9770u));
+    auto dState = toDevice(ops, randVec(nSeq * stt, 0x9880u));
+    auto dOut   = ops.allocate(totalTok * hs * sizeof(float));
+    auto dSeqT  = ops.allocate(nSeq * sizeof(std::int32_t));
+    auto dSeqOff= ops.allocate(nSeq * sizeof(std::int32_t));
+    ops.uploadHostBytes(dSeqT.get(),   seqT.data(),   nSeq * sizeof(std::int32_t));
+    ops.uploadHostBytes(dSeqOff.get(), seqOff.data(), nSeq * sizeof(std::int32_t));
+
+    mimirmind::compute::GdnBatchedShape shp{
+        nSeq, maxT, H, S, /*activeMask=*/nullptr,
+        static_cast<const std::int32_t*>(dSeqT.get()),
+        static_cast<const std::int32_t*>(dSeqOff.get())};
+    ops.gatedDeltaNetRecurrentGateFusedBatchedAsync(
+        static_cast<const float*>(dQ.get()),     static_cast<const float*>(dK.get()),
+        static_cast<const float*>(dV.get()),     static_cast<const float*>(dAlpha.get()),
+        static_cast<const float*>(dBeta.get()),  static_cast<const float*>(dSsmA.get()),
+        static_cast<const float*>(dSsmDt.get()),
+        static_cast<float*>(dState.get()),       static_cast<float*>(dOut.get()), shp);
+    ops.flush();
+
+    std::printf("[gdn-mixed-memcheck] FUSED prod-dim ragged nSeq=%zu totalTok=%zu H=%zu S=%zu OK\n",
+                nSeq, totalTok, H, S);
+}
+
 // M-Cuda.Batch Cat C-P0 — batched ssm_conv1d vs N single-sequence runs.
 // Each sequence has its own conv input (its rolling conv-tail prepended);
 // batched output must be byte-identical to running each sequence alone.
@@ -3113,6 +3169,43 @@ TEST(cuda_moe_grouped_gemm_parity_nonmult_n) {
 TEST(cuda_moe_grouped_gemm_parity_single_expert) {
     // One expert takes every row -> ceil(R/tileM) tiles, single weight base.
     checkMoeGroupedGemmParity({50, 0, 0}, /*N=*/32, /*K=*/96, 0xB0Bu);
+}
+
+// 5.21.2 MIXED-STEP MoE grouped-PREFILL memcheck coverage at PROD scale.
+// The mixed step (setPrefillMoeScratch -> runMoeFfnGrouped) runs the grouped MoE
+// over the full nRowMax=2048-row ragged batch across ALL 256 prod experts (top-8)
+// — the existing *_k8 tests only reach nExperts=128 / T=512, so the prod scale of
+// moe_group_build / moe_group_tiles / grouped GEMM was untested. These invoke the
+// same parity helpers at prod dims; running the binary under compute-sanitizer
+// memcheck flags any OOB in the token-grouping/tile-schedule/gather-scatter at
+// scale. (qwen3.6: num_experts=256, num_experts_per_tok=8.)
+// Result 2026-08-25: memcheck-CLEAN (0 errors).
+TEST(cuda_moe_group_build_parity_prod2048) {
+    checkMoeGroupParity(/*T=*/2048, /*nExperts=*/256, /*K=*/8, 0xB1620u);
+}
+TEST(cuda_moe_group_tiles_parity_prod2048) {
+    // 256 experts, skewed counts averaging ~64 rows (2048*8/256), both tile
+    // widths the mixed step uses (prefill tileM=16, decode tileM=4).
+    Lcg g{0xC0DE256u};
+    std::vector<std::int32_t> counts(256);
+    for (auto& c : counts) {
+        const float u = (g.next() + 1.0f) * 0.5f;
+        c = static_cast<std::int32_t>(u * 128.0f);
+    }
+    checkMoeGroupTilesParity(counts, /*tileM=*/16);
+    checkMoeGroupTilesParity(counts, /*tileM=*/4);
+}
+TEST(cuda_moe_grouped_gemm_parity_prod) {
+    // 256 experts, skewed counts (some > tileM, some empty) -> multi-tile experts
+    // across the full expert set; the grouped GEMM gather/scatter at prod expert
+    // count.
+    Lcg g{0xEE256u};
+    std::vector<std::int32_t> counts(256);
+    for (auto& c : counts) {
+        const float u = (g.next() + 1.0f) * 0.5f;
+        c = static_cast<std::int32_t>(u * 32.0f);
+    }
+    checkMoeGroupedGemmParity(counts, /*N=*/128, /*K=*/128, 0x5150u);
 }
 
 // NVFP4 de-interleaved vectorised matvec (M=1) — parity vs the 20-byte blocked
