@@ -104,6 +104,36 @@ struct ServingState {
     // prefill forwards use (runMoeFfnBatched via setPrefillMoeScratch).
     compute::ComputeBuffer      prefillExpIdx; // [prefillChunk * expertUsedCount]
     compute::ComputeBuffer      prefillKw;     // [prefillChunk * expertUsedCount]
+    // 5.21-III Teil 4 — varlen prefill driver (prefillSlotVarlen). Per-token ctx
+    // scratch: rope positions + KV write targets [prefillChunk]; per-slot (nSeq=1)
+    // seqT/seqOff/convInOff/startPos [1]. Host staging + device copies.
+    compute::ComputeBuffer      vlRopePosDev, vlWriteBlockIdDev, vlWriteSlotDev;
+    compute::ComputeBuffer      vlSeqTDev, vlSeqOffDev, vlConvInOffDev, vlStartPosDev;
+    std::vector<std::int32_t>   vlRopePosH, vlWriteSlotH, vlStartPosH;
+    std::vector<std::uint32_t>  vlWriteBlockIdH;
+    // 5.21-III MULTI-SLOT wall-fix — batch N contiguous slots' prefill chunks in
+    // ONE forward. sbMixed sized maxT=nRowMax (perSeqConvInput=TRUE so the conv
+    // input holds N per-slot [state-tail | tokens] runs: nRowMax*dConv >=
+    // N*(dConv-1)+nRow always). Per-token vl* arrays are sized nRowMax; per-slot
+    // arrays [maxBatch]. runVarlenPrefill drives it over slots [firstSlot,+N).
+    std::optional<BlockBuffers> sbMixed;           // maxT = nRowMax, perSeqConvInput
+    std::size_t                 nRowMax{0};         // bounded per-step token budget
+    compute::ComputeBuffer      xBufMixed;          // [nRowMax, d_model]
+    compute::ComputeBuffer      mixedExpIdx, mixedKw; // [nRowMax * K]
+    std::vector<std::int32_t>   vlSeqTH, vlSeqOffH, vlConvInOffH; // [maxBatch] per-slot
+    std::vector<std::uint8_t>   vlSeqStartH;        // [maxBatch] per-slot isSeqStart
+    std::vector<std::int32_t>   prefillTokMixedH;   // [nRowMax] host token staging
+    // 5.21-III HYBRID ATTENTION scratch — decode (seqT==1) rows of a mixed forward
+    // gathered to a compact [D] set for split-K paged decode-V2, then scattered
+    // back. Sized for up to maxBatch decode rows. Built per-forward in
+    // runVarlenPrefill when the batch is truly mixed. See BatchedDecodeCtx hyb*.
+    std::size_t                 qDimHyb{0};         // nHeads*headDim (decode-V2 width)
+    compute::ComputeBuffer      hybRowMapDev, hybSeqLensDev; // [maxBatch]
+    compute::ComputeBuffer      hybBlockTablesDev;  // [maxBatch * blocksPerSeq]
+    compute::ComputeBuffer      hybSeqTPrefillDev;  // [maxBatch]
+    compute::ComputeBuffer      hybQDecode, hybAttnDecode; // [maxBatch * qDimHyb]
+    std::vector<std::int32_t>   hybRowMapH, hybSeqLensH, hybSeqTPrefillH; // [maxBatch]
+    std::vector<std::int32_t>   hybBlockTablesH;    // [maxBatch * blocksPerSeq]
 
     // ---- Increment E1: MTP batched-verify scratch (lazily sized) --------
     // Sized for up to `maxBatch` slots × (verifyDepth + 1) verify tokens =
@@ -612,7 +642,10 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         // batcher splits longer prompts into successive appends.
         l0->prefillChunk = std::min<std::size_t>(maxContext, 512);
 
-        serving::SlabDecodeStepper::Weights w{tokEmb, outNorm, lmHead};
+        // Optional blocked-NVFP4 lm_head sibling (loader step 5f-lmhead); the
+        // stepper dispatches it only at low batch (MIMIRMIND_LMHEAD_NVFP4).
+        const auto* lmHeadNv = _e._weights->find("output.weight.nv");
+        serving::SlabDecodeStepper::Weights w{tokEmb, outNorm, lmHead, lmHeadNv};
         serving::SlabDecodeStepper::Dims dims{};
         dims.dModel   = _e._config.embeddingLength;
         dims.vocabLm  = lmHead->dimensions.size() >= 2 ? lmHead->dimensions[1]
@@ -795,7 +828,10 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
             st->sbPrefill = allocBlockBuffers(
                 *_e._ops, _e._config, /*maxT=*/chunk, /*maxSeq=*/maxContext,
                 qkv.first, qkv.second, /*withFusedQkv=*/false,
-                /*withKvFp32Scratch=*/prefillKvFp32Scratch, /*withQGate=*/true,
+                // 5.21-III: the varlen prefill driver uses runFullAttentionBlock-
+                // Batched, whose kProj/vProj scratch is kvKFp32Scratch — always
+                // allocate it (not just for FP16 KV) so the ragged path has it.
+                /*withKvFp32Scratch=*/true, /*withQGate=*/true,
                 /*withSsm=*/true, /*perSeqConvInput=*/false);
             // SSM state pointers are (re)bound per prefillSlot call to the
             // target slot's slab slice; ssmSlabNSeq is the full slab width so
@@ -805,6 +841,51 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
             st->prefillExpIdx = _e._ops->allocate(chunk * K * sizeof(std::int32_t));
             st->prefillKw     = _e._ops->allocate(chunk * K * sizeof(float));
             st->prefillTokH.resize(chunk);
+            // 5.21-III MULTI-SLOT: sbMixed sized nRowMax (bounded token budget) with
+            // perSeqConvInput so the conv input holds N per-slot state-tail|token
+            // runs. Per-token vl* scratch sized nRowMax; per-slot [maxBatch].
+            const std::size_t nRowMax = std::min<std::size_t>(maxContext, 4 * chunk);
+            st->nRowMax = nRowMax;
+            st->sbMixed = allocBlockBuffers(
+                *_e._ops, _e._config, /*maxT=*/nRowMax, /*maxSeq=*/maxContext,
+                qkv.first, qkv.second, /*withFusedQkv=*/false,
+                /*withKvFp32Scratch=*/true, /*withQGate=*/true,
+                /*withSsm=*/true, /*perSeqConvInput=*/true);
+            st->sbMixed->ssmSlabNSeq = st->ssm->nSeq();
+            st->xBufMixed  = _e._ops->allocate(nRowMax * st->d_model * sizeof(float));
+            st->mixedExpIdx = _e._ops->allocate(nRowMax * K * sizeof(std::int32_t));
+            st->mixedKw     = _e._ops->allocate(nRowMax * K * sizeof(float));
+            // 5.21-III varlen prefill driver scratch (per-token nRowMax; per-slot maxBatch).
+            st->vlRopePosDev      = _e._ops->allocate(nRowMax * sizeof(std::int32_t));
+            st->vlWriteBlockIdDev = _e._ops->allocate(nRowMax * sizeof(std::uint32_t));
+            st->vlWriteSlotDev    = _e._ops->allocate(nRowMax * sizeof(std::int32_t));
+            st->vlSeqTDev      = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
+            st->vlSeqOffDev    = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
+            st->vlConvInOffDev = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
+            st->vlStartPosDev  = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
+            st->vlRopePosH.resize(nRowMax);
+            st->vlWriteBlockIdH.resize(nRowMax);
+            st->vlWriteSlotH.resize(nRowMax);
+            st->vlStartPosH.resize(maxBatch);
+            st->vlSeqTH.resize(maxBatch);
+            st->vlSeqOffH.resize(maxBatch);
+            st->vlConvInOffH.resize(maxBatch);
+            st->vlSeqStartH.resize(maxBatch);
+            st->prefillTokMixedH.resize(nRowMax);
+            // 5.21-III hybrid attention scratch (decode rows of a mixed forward).
+            const std::size_t qDimHyb =
+                _e._config.headCount * _e._config.headDim();
+            st->qDimHyb = qDimHyb;
+            st->hybRowMapDev      = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
+            st->hybSeqLensDev     = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
+            st->hybBlockTablesDev = _e._ops->allocate(maxBatch * st->blocksPerSeq * sizeof(std::int32_t));
+            st->hybSeqTPrefillDev = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
+            st->hybQDecode        = _e._ops->allocate(maxBatch * qDimHyb * sizeof(float));
+            st->hybAttnDecode     = _e._ops->allocate(maxBatch * qDimHyb * sizeof(float));
+            st->hybRowMapH.resize(maxBatch);
+            st->hybSeqLensH.resize(maxBatch);
+            st->hybSeqTPrefillH.resize(maxBatch);
+            st->hybBlockTablesH.resize(maxBatch * st->blocksPerSeq);
             MM_LOG_INFO("serving",
                         "chunked prefill ENABLED (chunk={}) — prompts prefill "
                         "as T>1 forwards per slot", chunk);
@@ -946,6 +1027,210 @@ void ServingSession::stepServing(
     }
 }
 
+void ServingSession::runVarlenPrefill(
+        std::size_t                                    firstSlot,
+        std::span<const std::span<const std::int32_t>> chunks,
+        std::span<const std::size_t>                   startPositions,
+        bool                                           produceToken,
+        std::span<std::int32_t>                        outFirstTok) {
+    namespace cmp = mimirmind::compute;
+    if (_state == nullptr) {
+        throw std::runtime_error("runVarlenPrefill: ensureServingState not called");
+    }
+    auto& st = *_state;
+    if (!st.chunkedPrefill || !st.sbMixed.has_value()) {
+        throw std::runtime_error("runVarlenPrefill: mixed prefill not enabled");
+    }
+    const std::size_t N = chunks.size();
+    if (N == 0) {
+        return;
+    }
+    if (N != startPositions.size() || N != outFirstTok.size()) {
+        throw std::runtime_error("runVarlenPrefill: span length mismatch");
+    }
+    if (firstSlot + N > st.maxBatch) {
+        throw std::runtime_error("runVarlenPrefill: slot run out of range");
+    }
+
+    const std::size_t d_model      = st.d_model;
+    const std::size_t blocksPerSeq = st.blocksPerSeq;
+    const std::size_t blockSize    = st.blockSize;
+    const std::size_t dConv        = _e._config.ssmConvKernel;
+    const std::size_t stateRows    = (dConv > 0 ? dConv - 1 : 0);
+
+    // Build per-slot (nSeq=N) + per-token control arrays. Slots are laid out in
+    // token order [slot0 tokens | slot1 tokens | ...]; seqOff[s]/convInOff[s] are
+    // the running token / conv-input-row prefix sums, so the ragged kernels read
+    // each slot's contiguous run. writeBlockId uses the PHYSICAL slot firstSlot+s
+    // (block table slice below is offset to the same run).
+    std::size_t tokRun = 0, convRun = 0, maxSeqT = 0;
+    for (std::size_t s = 0; s < N; ++s) {
+        const std::size_t Ts       = chunks[s].size();
+        const std::size_t sp       = startPositions[s];
+        const std::size_t physSlot = firstSlot + s;
+        if (Ts == 0) {
+            throw std::runtime_error("runVarlenPrefill: empty chunk");
+        }
+        if (sp + Ts > st.maxContext) {
+            throw std::runtime_error("runVarlenPrefill: startPos+T exceeds maxContext");
+        }
+        st.vlSeqTH[s]      = static_cast<std::int32_t>(Ts);
+        st.vlSeqOffH[s]    = static_cast<std::int32_t>(tokRun);
+        st.vlConvInOffH[s] = static_cast<std::int32_t>(convRun);
+        st.vlStartPosH[s]  = static_cast<std::int32_t>(sp);
+        st.vlSeqStartH[s]  = (sp == 0) ? 1u : 0u;
+        for (std::size_t i = 0; i < Ts; ++i) {
+            const std::size_t pos = sp + i;
+            const std::size_t tk  = tokRun + i;
+            st.vlRopePosH[tk]      = static_cast<std::int32_t>(pos);
+            st.vlWriteBlockIdH[tk] = static_cast<std::uint32_t>(
+                physSlot * blocksPerSeq + pos / blockSize);
+            st.vlWriteSlotH[tk]    = static_cast<std::int32_t>(pos % blockSize);
+            st.prefillTokMixedH[tk]= chunks[s][i];
+        }
+        tokRun  += Ts;
+        convRun += stateRows + Ts;
+        maxSeqT  = std::max<std::size_t>(maxSeqT, Ts);
+    }
+    const std::size_t totalTok = tokRun;
+    if (totalTok > st.nRowMax) {
+        throw std::runtime_error("runVarlenPrefill: token budget exceeds nRowMax");
+    }
+
+    _e._ops->uploadHostBytes(st.vlRopePosDev.get(),      st.vlRopePosH.data(),      totalTok * sizeof(std::int32_t));
+    _e._ops->uploadHostBytes(st.vlWriteBlockIdDev.get(), st.vlWriteBlockIdH.data(), totalTok * sizeof(std::uint32_t));
+    _e._ops->uploadHostBytes(st.vlWriteSlotDev.get(),    st.vlWriteSlotH.data(),    totalTok * sizeof(std::int32_t));
+    _e._ops->uploadHostBytes(st.vlSeqTDev.get(),      st.vlSeqTH.data(),      N * sizeof(std::int32_t));
+    _e._ops->uploadHostBytes(st.vlSeqOffDev.get(),    st.vlSeqOffH.data(),    N * sizeof(std::int32_t));
+    _e._ops->uploadHostBytes(st.vlConvInOffDev.get(), st.vlConvInOffH.data(), N * sizeof(std::int32_t));
+    _e._ops->uploadHostBytes(st.vlStartPosDev.get(),  st.vlStartPosH.data(),  N * sizeof(std::int32_t));
+
+    const std::size_t stateElems     = _e._config.ssmStateElemsPerLayer();
+    const std::size_t convStateElems = _e._config.ssmConvStateElemsPerLayer();
+    BlockBuffers& sb = *st.sbMixed;
+    sb.ssmStatePtr     = st.ssm->statePtr()     + firstSlot * stateElems;
+    sb.ssmConvStatePtr = st.ssm->convStatePtr() + firstSlot * convStateElems;
+
+    float* const xBuf = st.xBufMixed.as<float>();
+    cmp::embeddingLookup(st.tokEmb->type, st.tokEmb->usmPtr, d_model, st.vocab_emb,
+                         std::span<const std::int32_t>{st.prefillTokMixedH.data(), totalTok},
+                         xBuf);
+
+    arch::BatchedDecodeCtx ctx{};
+    ctx.nSeq            = N;
+    ctx.pool            = st.pool.get();
+    ctx.writeBlockIdDev = static_cast<const std::uint32_t*>(st.vlWriteBlockIdDev.get());
+    ctx.writeSlotDev    = static_cast<const std::int32_t*>(st.vlWriteSlotDev.get());
+    ctx.blockTablesDev  = static_cast<const std::int32_t*>(st.blockTablesDev.get())
+                          + firstSlot * blocksPerSeq;
+    ctx.maxBlocksPerSeq = blocksPerSeq;
+    ctx.startPosDev     = static_cast<const std::int32_t*>(st.vlStartPosDev.get());
+    ctx.expIdxSlot      = st.mixedExpIdx.as<std::int32_t>();
+    ctx.kwSlot          = st.mixedKw.as<float>();
+    ctx.isSeqStart      = st.vlSeqStartH.data();
+    ctx.nRow            = totalTok;
+    ctx.seqTDev         = static_cast<const std::int32_t*>(st.vlSeqTDev.get());
+    ctx.seqTHost        = st.vlSeqTH.data();
+    ctx.seqOffDev       = static_cast<const std::int32_t*>(st.vlSeqOffDev.get());
+    ctx.convInOffDev    = static_cast<const std::int32_t*>(st.vlConvInOffDev.get());
+    ctx.ropePosDev      = static_cast<const std::int32_t*>(st.vlRopePosDev.get());
+    ctx.maxSeqT         = maxSeqT;
+
+    // 5.21-III HYBRID ATTENTION — if this forward mixes decode (seqT==1) and
+    // prefill (seqT>1) rows, split the decode rows out to split-K paged
+    // decode-V2 instead of the O(seq_len) prefill-causal path. Build the compact
+    // decode maps ONCE here (same for every layer).
+    // MEASURED NEUTRAL (2026-08-24 conc16/64 sweep): the mixed-step decode-rate
+    // drop is intrinsic to overlapping prefill+decode in ONE forward (decode rows
+    // share the MoE-GEMM-dominated forward with prefill rows), NOT the attention
+    // kernel — attention is a small fraction, so routing decode rows to decode-V2
+    // does not move decode_tok_s_est and the per-layer gather/scatter adds a small
+    // overhead. Kept as an opt-in for attention-bound very-long-context regimes.
+    // MIMIRMIND_MIXED_STEP_HYBRID=1 enables (default OFF).
+    static const bool hybridAttn = [] {
+        const char* e = std::getenv("MIMIRMIND_MIXED_STEP_HYBRID");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';   // default OFF (neutral)
+    }();
+    std::size_t decCount = 0, preCount = 0;
+    for (std::size_t s = 0; s < N; ++s) {
+        if (st.vlSeqTH[s] == 1) ++decCount; else ++preCount;
+    }
+    if (hybridAttn && decCount > 0 && preCount > 0) {
+        const std::size_t bps = blocksPerSeq;
+        std::size_t maxDecLen = 0, d = 0;
+        for (std::size_t s = 0; s < N; ++s) {
+            if (st.vlSeqTH[s] == 1) {
+                const std::size_t physSlot = firstSlot + s;
+                const std::size_t sp       = startPositions[s];
+                st.hybRowMapH[d]  = st.vlSeqOffH[s];                   // query row in xBuf/qBuf
+                st.hybSeqLensH[d] = static_cast<std::int32_t>(sp + 1); // KV length
+                for (std::size_t b = 0; b < bps; ++b) {
+                    st.hybBlockTablesH[d * bps + b] =
+                        static_cast<std::int32_t>(physSlot * bps + b);
+                }
+                maxDecLen = std::max(maxDecLen, sp + 1);
+                st.hybSeqTPrefillH[s] = 0;                             // prefill-causal skips it
+                ++d;
+            } else {
+                st.hybSeqTPrefillH[s] = st.vlSeqTH[s];
+            }
+        }
+        _e._ops->uploadHostBytes(st.hybRowMapDev.get(),      st.hybRowMapH.data(),      decCount * sizeof(std::int32_t));
+        _e._ops->uploadHostBytes(st.hybSeqLensDev.get(),     st.hybSeqLensH.data(),     decCount * sizeof(std::int32_t));
+        _e._ops->uploadHostBytes(st.hybBlockTablesDev.get(), st.hybBlockTablesH.data(), decCount * bps * sizeof(std::int32_t));
+        _e._ops->uploadHostBytes(st.hybSeqTPrefillDev.get(), st.hybSeqTPrefillH.data(), N * sizeof(std::int32_t));
+        ctx.hybDecodeCount          = decCount;
+        ctx.hybDecodeRowMapDev      = static_cast<const std::int32_t*>(st.hybRowMapDev.get());
+        ctx.hybDecodeSeqLensDev     = static_cast<const std::int32_t*>(st.hybSeqLensDev.get());
+        ctx.hybDecodeBlockTablesDev = static_cast<const std::int32_t*>(st.hybBlockTablesDev.get());
+        ctx.hybSeqTPrefillDev       = static_cast<const std::int32_t*>(st.hybSeqTPrefillDev.get());
+        ctx.hybQDecodeScratch       = st.hybQDecode.as<float>();
+        ctx.hybAttnDecodeScratch    = st.hybAttnDecode.as<float>();
+        ctx.hybMaxDecodeSeqLen      = maxDecLen;
+    }
+
+    st.qb->setPrefillMoeScratch(st.mixedExpIdx.as<std::int32_t>(),
+                                st.mixedKw.as<float>());
+    for (std::size_t b = 0; b < st.blockCount; ++b) {
+        st.qb->runBlockBatched(b, xBuf, ctx, sb);
+    }
+    st.qb->setPrefillMoeScratch(nullptr, nullptr);
+    _e._ops->profileStepEnd();
+
+    if (produceToken) {
+        // Gather each slot's last-token hidden state, rms-norm into a compact
+        // N-row buffer, then a single M=N lm_head matmul + one readback.
+        float* const normBuf = st.normB.as<float>();
+        float* const logits  = st.logitsB.as<float>();
+        for (std::size_t s = 0; s < N; ++s) {
+            const std::size_t lastRow =
+                static_cast<std::size_t>(st.vlSeqOffH[s]) +
+                static_cast<std::size_t>(st.vlSeqTH[s]) - 1;
+            _e._ops->rmsNormAsync(xBuf + lastRow * d_model, 1, d_model,
+                                  static_cast<const float*>(st.outNorm->usmPtr),
+                                  _e._config.rmsNormEps, normBuf + s * d_model);
+        }
+        _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, d_model,
+                        normBuf, N, logits, st.lmScr.as<float>());
+        _e._ops->flush();
+        _e._ops->readbackToHost(st.hostLogits.data(), logits,
+                                N * st.vocab_lm * sizeof(float));
+        for (std::size_t s = 0; s < N; ++s) {
+            const float* row = st.hostLogits.data() + s * st.vocab_lm;
+            std::size_t best = 0; float bv = row[0];
+            for (std::size_t v = 1; v < st.vocab_lm; ++v) {
+                if (row[v] > bv) { bv = row[v]; best = v; }
+            }
+            outFirstTok[s] = static_cast<std::int32_t>(best);
+        }
+    } else {
+        _e._ops->flush();
+        for (std::size_t s = 0; s < N; ++s) outFirstTok[s] = -1;
+    }
+    sb.ssmStatePtr     = st.ssm->statePtr();
+    sb.ssmConvStatePtr = st.ssm->convStatePtr();
+}
+
 std::int32_t ServingSession::prefillSlot(
         std::size_t                   slot,
         std::span<const std::int32_t> tokens,
@@ -983,6 +1268,26 @@ std::int32_t ServingSession::prefillSlot(
     }
     if (startPos + T > st.maxContext) {
         throw std::runtime_error("prefillSlot: startPos+T exceeds maxContext");
+    }
+
+    // 5.21-III Teil 4 — varlen prefill driver: prefill this chunk through the
+    // RAGGED batched forward (runBlockBatched: paged KV + prefill-causal attention
+    // + varlen GDN/conv) instead of the single-session runBlock. nSeq=1, seqT=[T].
+    // Reuses sbPrefill (sized prefillChunk). Env-gated MIMIRMIND_PREFILL_VARLEN=1
+    // for the batched-prefill-vs-single-session A/B (greedy token-match gate).
+    static const bool varlenPrefill = [] {
+        const char* e = std::getenv("MIMIRMIND_PREFILL_VARLEN");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    if (varlenPrefill) {
+        // N=1 path through the multi-slot driver — the A/B toggle validates the
+        // ragged batched forward against the single-session runBlock below.
+        std::int32_t firstTok = -1;
+        const std::span<const std::int32_t> chunkSpan{tokens.data(), T};
+        runVarlenPrefill(slot, std::span<const std::span<const std::int32_t>>{&chunkSpan, 1},
+                         std::span<const std::size_t>{&startPos, 1}, produceToken,
+                         std::span<std::int32_t>{&firstTok, 1});
+        return firstTok;
     }
 
     const std::size_t d_model  = st.d_model;
@@ -1100,6 +1405,13 @@ std::size_t ServingSession::prefillChunkSize() const noexcept {
         return 0;
     }
     return _state->prefillChunk;
+}
+
+std::size_t ServingSession::prefillMaxRows() const noexcept {
+    if (_state == nullptr || !_state->chunkedPrefill) {
+        return 0;
+    }
+    return _state->nRowMax;
 }
 
 void ServingSession::ensureVerifyCapacity(std::size_t depth) {

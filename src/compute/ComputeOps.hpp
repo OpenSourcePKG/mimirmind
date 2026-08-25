@@ -14,6 +14,27 @@
 
 namespace mimirmind::compute {
 
+/// 5.21 Increment II — shape/control bundle for the batched GatedDeltaNet
+/// recurrence. Groups the scalar dims + per-slot control that grow as the
+/// serving path gains variable-length (T>1/slot, ragged) prefill batching, so
+/// the recurrence method signatures change ONCE. `T` is the uniform per-slot
+/// token count today; the varlen extension (a per-slot `seqT[nSeq]` + ragged
+/// activation offsets) lands on THIS struct, not the method signatures.
+struct GdnBatchedShape {
+    std::size_t         nSeq{0};
+    std::size_t         T{1};                 // uniform tokens/slot (fallback when seqT==nullptr)
+    std::size_t         H{0};                 // value heads (hV)
+    std::size_t         S{0};                 // head/state dim
+    const std::uint8_t* activeMask{nullptr};  // [nSeq] freeze mask; nullptr => all active
+    // 5.21 Increment II — variable-length (ragged) batching. When seqT is set,
+    // slot `seq` carries seqT[seq] tokens (T=1 decode rows, T=chunk prefill rows)
+    // and its activations/out live at token offset seqOff[seq] (prefix-sum of
+    // seqT). nullptr => uniform T layout (slot `seq` at seq*T), bit-identical to
+    // the pre-varlen path. Both are device int32 arrays [nSeq].
+    const std::int32_t* seqT{nullptr};        // [nSeq] per-slot token count
+    const std::int32_t* seqOff{nullptr};      // [nSeq] per-slot first-token offset
+};
+
 /**
  * Backend-neutral kernel-launch interface. Every element-wise +
  * normalisation + attention kernel that the transformer block hits
@@ -117,6 +138,19 @@ public:
     virtual void siluMulAsync(float*       gate,
                               const float* up,
                               std::size_t  n) = 0;
+
+    // SwiGLU split for a stacked-w13 grouped-GEMM output (roadmap 5.18.8):
+    //   out[r*nff + j] = silu(w13[r*2nff + j]) * w13[r*2nff + nff + j]
+    // where w13 is [rows][2*nff] laid out per row as [gate(nff) | up(nff)].
+    // Only reached on the CUDA device-driven deint decode path when the MoE
+    // gate+up fusion is enabled (MIMIRMIND_MOE_W13_FUSE=1); default-throws so
+    // non-CUDA backends never silently mis-run it.
+    virtual void siluMulSplitAsync(const float* w13, float* out,
+                                   std::size_t rows, std::size_t nff) {
+        (void)w13; (void)out; (void)rows; (void)nff;
+        throw std::logic_error(
+            "siluMulSplitAsync: w13-fused MoE path is CUDA-only");
+    }
 
     virtual void geluMulAsync(float*       gate,
                               const float* up,
@@ -267,10 +301,10 @@ public:
 
     virtual void gatedDeltaNetRecurrentBatchedAsync(
             const float* q, const float* k, const float* v, const float* gLog,
-            const float* beta, float* state, float* out, std::size_t nSeq,
-            std::size_t T, std::size_t H, std::size_t S) {
+            const float* beta, float* state, float* out,
+            const GdnBatchedShape& shape) {
         (void)q; (void)k; (void)v; (void)gLog; (void)beta; (void)state;
-        (void)out; (void)nSeq; (void)T; (void)H; (void)S;
+        (void)out; (void)shape;
         throw std::runtime_error(
             "gatedDeltaNetRecurrentBatchedAsync: not supported on this backend");
     }
@@ -282,11 +316,9 @@ public:
     virtual void gatedDeltaNetRecurrentGateFusedBatchedAsync(
             const float* q, const float* k, const float* v, const float* alpha,
             const float* beta, const float* ssmA, const float* ssmDt,
-            float* state, float* out, std::size_t nSeq, std::size_t T,
-            std::size_t H, std::size_t S) {
+            float* state, float* out, const GdnBatchedShape& shape) {
         (void)q; (void)k; (void)v; (void)alpha; (void)beta; (void)ssmA;
-        (void)ssmDt; (void)state; (void)out; (void)nSeq; (void)T; (void)H;
-        (void)S;
+        (void)ssmDt; (void)state; (void)out; (void)shape;
         throw std::runtime_error(
             "gatedDeltaNetRecurrentGateFusedBatchedAsync: not supported on this "
             "backend");
@@ -333,9 +365,12 @@ public:
     virtual void causalConv1dSiluBatchedAsync(
             const float* convInput, const float* kernel, float* out,
             std::size_t nSeq, std::size_t T, std::size_t channels,
-            std::size_t kernelSize) {
+            std::size_t kernelSize,
+            const std::int32_t* seqT   = nullptr,   // 5.21-II varlen (nullptr=uniform)
+            const std::int32_t* inOff  = nullptr,
+            const std::int32_t* outOff = nullptr) {
         (void)convInput; (void)kernel; (void)out; (void)nSeq; (void)T;
-        (void)channels; (void)kernelSize;
+        (void)channels; (void)kernelSize; (void)seqT; (void)inOff; (void)outOff;
         throw std::runtime_error(
             "causalConv1dSiluBatchedAsync: not supported on this backend");
     }
@@ -411,6 +446,27 @@ public:
         (void)maxNumBlocksPerSeq; (void)scale; (void)softcap;
         throw std::runtime_error(
             "pagedAttentionDecodeV1Async: not supported on this backend");
+    }
+
+    /// 5.21 Increment II — paged, batched, CAUSAL, T>1 prefill attention. Slot
+    /// seq carries seqT[seq] ragged query tokens at token offset queryOff[seq];
+    /// query pq attends KV [0, startPos[seq]+pq] via the block table. maxT =
+    /// max(seqT) sizes the grid's query dim. CUDA-only (default-throws).
+    virtual void pagedAttentionPrefillCausalAsync(
+            float* out, const float* query, const float* keyCache,
+            const float* valueCache, const std::int32_t* blockTables,
+            const std::int32_t* seqT, const std::int32_t* queryOff,
+            const std::int32_t* startPos, std::size_t numSeqs,
+            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
+            std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
+            std::size_t maxT, float scale, float softcap) {
+        (void)out; (void)query; (void)keyCache; (void)valueCache;
+        (void)blockTables; (void)seqT; (void)queryOff; (void)startPos;
+        (void)numSeqs; (void)numHeads; (void)numKvHeads; (void)headSize;
+        (void)blockSize; (void)maxNumBlocksPerSeq; (void)maxT; (void)scale;
+        (void)softcap;
+        throw std::runtime_error(
+            "pagedAttentionPrefillCausalAsync: not supported on this backend");
     }
 
     /// Split-K (partition-parallel) paged decode attention — kernels
@@ -510,10 +566,12 @@ public:
                                            std::size_t nSeq, std::size_t blockSize,
                                            std::size_t width,
                                            runtime::KvDtype kvDtype
-                                               = runtime::KvDtype::F32) {
+                                               = runtime::KvDtype::F32,
+                                           const std::uint8_t* activeMask
+                                               = nullptr) {   // 5.21-I freeze mask
         (void)kProj; (void)vProj; (void)writeBlockIdDev; (void)writeSlotDev;
         (void)kPool; (void)vPool; (void)nSeq; (void)blockSize; (void)width;
-        (void)kvDtype;
+        (void)kvDtype; (void)activeMask;
         throw std::runtime_error(
             "writeKvTokensBatchedAsync: not supported on this backend");
     }

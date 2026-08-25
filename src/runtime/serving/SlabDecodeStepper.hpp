@@ -55,7 +55,14 @@ public:
     struct Weights {
         const core::gguf::GgufTensor* tokEmb;   ///< token embedding table
         const core::gguf::GgufTensor* outNorm;  ///< final RMSNorm weight
-        const core::gguf::GgufTensor* lmHead;   ///< output projection
+        const core::gguf::GgufTensor* lmHead;   ///< output projection (BF16)
+        /// Optional native blocked-NVFP4 lm_head sibling ("output.weight.nv").
+        /// Opt-in (MIMIRMIND_LMHEAD_NVFP4>=1), default OFF -> normally null.
+        /// Dispatched instead of `lmHead` only at low batch (nSeq <= the
+        /// MIMIRMIND_LMHEAD_NVFP4 threshold), while batch (M>1) keeps BF16-TF32-TC.
+        /// NOTE: measured neutral on current main (cuBLAS BF16 lm_head matches it);
+        /// kept only for non-cuBLAS / dense-NVFP4 paths. Null = absent.
+        const core::gguf::GgufTensor* lmHeadNv = nullptr;
     };
 
     /// Scalar model dims + flags.
@@ -129,6 +136,9 @@ private:
     KvCacheSlabPool&        _slab;
     Weights                 _w;
     Dims                    _dims;
+    /// Max nSeq at which the blocked-NVFP4 lm_head sibling is used (from
+    /// MIMIRMIND_LMHEAD_NVFP4, default 1 = single-user only; 0 = never).
+    int                     _lmHeadNvMaxT = 1;
     float                   _embedScale;   ///< sqrt(dModel) or 1.0
     std::size_t             _capacity;
     std::size_t             _maxPrefillT;

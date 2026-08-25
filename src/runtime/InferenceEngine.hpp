@@ -522,6 +522,23 @@ public:
     /// `ensureServingState`.
     [[nodiscard]] std::size_t servingPrefillChunk() const;
 
+    /// 5.21-III MULTI-SLOT — prefill N contiguous slots `[firstSlot,firstSlot+N)`
+    /// in ONE ragged batched forward (the continuous-prefill-batching wall-fix).
+    /// `chunks[s]` / `startPositions[s]` describe slot firstSlot+s; the greedy
+    /// next token per slot (or -1 when `produceToken` is false) is written into
+    /// `outFirstTok[s]`. Total tokens must be ≤ `servingPrefillMaxRows()`.
+    /// Requires chunked prefill enabled + a prior `ensureServingState`.
+    void prefillSlotsBatched(std::size_t firstSlot,
+                             std::span<const std::span<const std::int32_t>> chunks,
+                             std::span<const std::size_t>                   startPositions,
+                             bool                                           produceToken,
+                             std::span<std::int32_t>                        outFirstTok);
+
+    /// Per-mixed-forward token budget `nRowMax` (max summed tokens across the
+    /// batched slots of one `prefillSlotsBatched` call), or 0 when chunked
+    /// prefill is disabled. Valid after `ensureServingState`.
+    [[nodiscard]] std::size_t servingPrefillMaxRows() const;
+
     /// M-Cuda.MTP Increment E1 — one batched MTP *verify* forward. `slots`
     /// is a contiguous prefix (slots[s].slot == s, N = slots.size()), each
     /// carrying `depth + 1` verify tokens (token0 + `depth` drafts).

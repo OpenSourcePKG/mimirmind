@@ -65,6 +65,50 @@ struct BatchedDecodeCtx {
 
     // ---- GatedDeltaNet (linear layers) ----
     const std::uint8_t*   isSeqStart{nullptr};     // [nSeq]: 1 => zero SsmState this step
+    // 5.21 Increment I — per-slot active mask. When set, row seq with
+    // activeMask[seq]==0 is FROZEN: all its persistent-state writes (KV scatter,
+    // GDN recurrence, conv tail, seqStart reset) are skipped so its state stays
+    // byte-identical. Enables a prefilling/parked slot to coexist in the batch
+    // without corruption. nullptr => all rows active (bit-identical legacy path).
+    // Mask DOMINATES isSeqStart (freeze wins over zero). `activeMask` = device
+    // pointer (kernels); `activeMaskHost` = host copy (host-side guard loops).
+    const std::uint8_t*   activeMask{nullptr};     // [nSeq] device
+    const std::uint8_t*   activeMaskHost{nullptr}; // [nSeq] host
+
+    // ---- 5.21 Increment III — ragged (varlen) mixed prefill+decode ----
+    // When seqTDev != nullptr the batched forward runs the RAGGED path: slot seq
+    // carries seqT[seq] tokens (T=1 decode rows OR T=chunk prefill rows), all
+    // packed into nRow = sum(seqT) activation rows. Every M-op runs over nRow;
+    // per-token rope positions come from ropePosDev; the GDN conv/recurrence use
+    // seqOffDev (token offset = prefix-sum seqT) + convInOffDev (prefix-sum of
+    // seqT+dConv-1); attention branches per row (T=1 -> paged decode-V2, T>1 ->
+    // paged causal prefill with queryOff=seqOffDev, startPos=startPosDev). The
+    // per-token KV targets reuse writeBlockIdDev/writeSlotDev sized [nRow].
+    // nullptr/0 => the T=1 decode path (bit-identical legacy).
+    std::size_t           nRow{0};                 // total tokens (0 => == nSeq)
+    const std::int32_t*   seqTDev{nullptr};        // [nSeq] device: tokens per slot
+    const std::int32_t*   seqTHost{nullptr};       // [nSeq] host copy (host loops)
+    const std::int32_t*   seqOffDev{nullptr};      // [nSeq] device: token offset
+    const std::int32_t*   convInOffDev{nullptr};   // [nSeq] device: conv-input offset
+    const std::int32_t*   ropePosDev{nullptr};     // [nRow] device: per-token rope pos
+    std::size_t           maxSeqT{0};              // host: max(seqT) (attn/conv grid)
+
+    // 5.21-III HYBRID ATTENTION — in a TRUE mixed prefill+decode forward, route
+    // seqT==1 (decode) rows through the split-K paged decode-V2 kernel instead of
+    // the O(seq_len) prefill-causal path (which is kept only for the seqT>1
+    // prefill rows). Built once per forward by ServingSession::runVarlenPrefill
+    // when the batch holds BOTH row classes. hybDecodeCount==0 => plain ragged
+    // (all rows via prefill-causal), bit-identical to the non-hybrid mixed step.
+    // Prefill-causal skips the decode rows automatically: hybSeqTPrefillDev is
+    // seqTDev with the decode slots' entries set to 0 (its `pq >= seqT` guard).
+    std::size_t           hybDecodeCount{0};              // D = #seqT==1 rows
+    const std::int32_t*   hybDecodeRowMapDev{nullptr};    // [D] query rows (nRow layout)
+    const std::int32_t*   hybDecodeSeqLensDev{nullptr};   // [D] KV length (startPos+1)
+    const std::int32_t*   hybDecodeBlockTablesDev{nullptr}; // [D*maxBlocksPerSeq]
+    const std::int32_t*   hybSeqTPrefillDev{nullptr};    // [nSeq] seqT, decode slots -> 0
+    float*                hybQDecodeScratch{nullptr};     // [D*q_dim] gathered decode Q
+    float*                hybAttnDecodeScratch{nullptr};  // [D*q_dim] decode-V2 out
+    std::size_t           hybMaxDecodeSeqLen{0};          // max(startPos+1) over decode
 };
 
 /**
@@ -331,6 +375,15 @@ protected:
     // Default-on: single-user (nSeq==1) decode uses the register-staged MoE GEMV
     // (m1reg, +2-4% vs m4). MIMIRMIND_MOE_M1NB=0 disables it.
     bool _useM1nb{true};
+    // 5.18.8: fuse the routed-expert gate+up projections into ONE stacked-w13
+    // grouped GEMM (N=2*n_ff) on the device-driven deint decode path, replacing
+    // the two separate gate/up launches. Halves gate/up launches AND doubles N
+    // per launch (better SM fill on the tileM=4 M=1 kernel — the 5.18.5 dispatch/
+    // occupancy residual). Mirrors the GDN in_proj concat-cache + pointer-split
+    // (_gdnQkvzW). Bit-identical (same weights/math, concatenated layout + fused
+    // silu split). nSeq==1 deint only. OPT-IN: MIMIRMIND_MOE_W13_FUSE=1.
+    bool                                _moeW13Fuse{false};
+    std::vector<compute::ComputeBuffer> _moeW13W;  // per-block [nExp][2*n_ff][d_model] blocked
     // Host mirror of the device expert-offset table (moe_group_build output),
     // read back once per grouped MoE layer to drive the per-expert launches
     // (host-driven Option 1 only; the device-driven path never reads it back).

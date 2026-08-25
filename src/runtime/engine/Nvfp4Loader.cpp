@@ -1007,6 +1007,83 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
         }
     }
 
+    // 5f-lmhead. M==1-gated dual-copy for the lm_head (output projection).
+    //
+    // The Qwen3.6-35B MoE ModelOpt checkpoint stores lm_head as W4A16_NVFP4,
+    // but step 5 dequantised it to BF16. Reading the 4-bit form on the M=1
+    // decode/prefill logits GEMV is ~3% faster single-user (bandwidth-bound,
+    // measured HTTP anchor 35.6->36.7 tok/s), BUT at serving batch (M=nSeq>1)
+    // the NVFP4 blocked GEMM loses to BF16-TF32-TC (measured -15..-18% decode
+    // throughput @conc16/32). So we KEEP the BF16 "output.weight" AND add a
+    // native blocked-NVFP4 sibling "output.weight.nv" (lossless repack of the
+    // original NVFP4 in _nvfp4Model), and SlabDecodeStepper dispatches the .nv
+    // variant only when nSeq <= MIMIRMIND_LMHEAD_NVFP4 (single-user only) and the
+    // BF16 copy at higher batch. Costs ~+303 MiB (the NVFP4 copy; the BF16 stays).
+    //
+    // Default OFF (opt-in). Runtime A/B on current main (2026-08-23, config.prof.json,
+    // Qwen3.6-35B primary) showed NO measurable single-user win: 39.41 (BF16) vs 39.33
+    // (NVFP4) tok/s = noise. The earlier +3% (35.6->36.7) was vs an OLD tree; on current
+    // main MIMIRMIND_CUBLAS=1 routes the BF16 lm_head GEMV through cuBLAS-TF32-TC, which
+    // now matches the NVFP4 blocked path, so the sibling earns nothing. Kept as a
+    // conditional opt-in for future non-cuBLAS BF16 paths / dense-NVFP4-only models:
+    // set MIMIRMIND_LMHEAD_NVFP4>=1 to load the sibling (and dispatch it at nSeq<=that).
+    if (e._nvfp4Model) {
+        const char* lhEnv = std::getenv("MIMIRMIND_LMHEAD_NVFP4");
+        const bool lhOn =
+            (lhEnv != nullptr) && (std::string_view{lhEnv} != "0");
+        if (lhOn) {
+            auto isLmHead = [](std::string_view n) {
+                return n == "output.weight" || n.ends_with(".output.weight");
+            };
+            std::size_t nSib = 0;
+            std::uint64_t addBytes = 0;
+            std::vector<runtime::nvfp4::MaterializedTensor> siblings;
+            for (const auto& step : steps) {
+                if (!isLmHead(step.ggufName) || step.sources.size() != 1) continue;
+                const auto& src = step.sources[0];
+                if (src.kind != core::modelopt::SourceKind::Nvfp4) continue;
+                if ((src.in % 32) != 0) continue;
+                auto it = std::find_if(
+                    e._materializedBf16.begin(), e._materializedBf16.end(),
+                    [&](const runtime::nvfp4::MaterializedTensor& t) {
+                        return t.ggufName == step.ggufName;
+                    });
+                if (it == e._materializedBf16.end() || it->isF32) continue;
+                const auto* pk = e._nvfp4Model->find(src.hfWeightName);
+                const std::string base{src.hfWeightName};
+                const std::string baseNoW =
+                    base.size() > 7 ? base.substr(0, base.size() - 7) : base;
+                const auto* bs = e._nvfp4Model->find(baseNoW + ".weight_scale");
+                const auto* gs = e._nvfp4Model->find(baseNoW + ".weight_scale_2");
+                if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
+                const float global = devOps.readF32(gs->devPtr);
+                const std::size_t blkBytes =
+                    (static_cast<std::size_t>(it->elems) / 32) * 20;
+                compute::ComputeBuffer nb = devOps.allocateWeight(blkBytes);
+                devOps.repackageNvfp4ToBlk(nb.get(), pk->devPtr, bs->devPtr, global,
+                                           src.rows, src.in);
+                cudaCtx.stream().synchronize();
+                runtime::nvfp4::MaterializedTensor v;
+                v.ggufName   = it->ggufName + ".nv";  // "output.weight.nv"
+                v.buffer     = std::move(nb);
+                v.ggufDims   = it->ggufDims;
+                v.elems      = it->elems;
+                v.isNvfp4Blk = true;
+                siblings.push_back(std::move(v));
+                addBytes += blkBytes;
+                ++nSib;
+            }
+            for (auto& v : siblings) {
+                e._materializedBf16.push_back(std::move(v));
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: added {} lm_head '.nv' blocked-NVFP4 "
+                        "sibling(s) (+{} MiB), BF16 kept; NVFP4 used for nSeq<=maxT "
+                        "(MIMIRMIND_LMHEAD_NVFP4 opt-in, default OFF)",
+                        nSib, addBytes >> 20);
+        }
+    }
+
     // 5g. M-dependent dense FP8 (dual-copy). KEEP the BF16 dense projections
     // AND add a blocked-FP8 E4M3 ".fp8" variant of each, exposed as a separate
     // WeightsMap tensor. The backend then reads FP8 at low batch (decode is

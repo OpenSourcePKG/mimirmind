@@ -1662,7 +1662,8 @@ TEST(cuda_gated_deltanet_ar_batched_parity) {
         static_cast<const float*>(dQ.get()), static_cast<const float*>(dK.get()),
         static_cast<const float*>(dV.get()), static_cast<const float*>(dG.get()),
         static_cast<const float*>(dB.get()), static_cast<float*>(dS.get()),
-        static_cast<float*>(dOut.get()), nSeq, T, H, S);
+        static_cast<float*>(dOut.get()),
+        mimirmind::compute::GdnBatchedShape{nSeq, T, H, S});
     ops.flush();
     auto outB   = fromDevice(ops, dOut.get(), nSeq*act);
     auto stateB = fromDevice(ops, dS.get(),   nSeq*stt);
@@ -1703,6 +1704,152 @@ TEST(cuda_gated_deltanet_ar_batched_parity) {
     }
     std::printf("[gdn-batched-parity] nSeq=%zu T=%zu H=%zu S=%zu maxErr=%.2e\n",
                 nSeq, T, H, S, maxErr);
+}
+
+// 5.21 Increment II — VARLEN batched GDN recurrence: ragged per-slot seqT
+// (mixed token counts) vs N single-seq runs each with its own T. Proves the
+// ragged seqT/seqOff indexing produces the same math as per-slot decode/prefill.
+TEST(cuda_gated_deltanet_ar_batched_varlen_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t H = 4, S = 16;
+    const std::vector<std::int32_t> seqT = {2, 5, 3};   // ragged per-slot tokens
+    const std::size_t nSeq = seqT.size();
+    std::vector<std::int32_t> seqOff(nSeq, 0);
+    std::size_t totalTok = 0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        seqOff[s] = static_cast<std::int32_t>(totalTok);
+        totalTok += static_cast<std::size_t>(seqT[s]);
+    }
+    const std::size_t hs = H * S, stt = H * S * S;
+
+    std::vector<float> Q(totalTok*hs), K(totalTok*hs), V(totalTok*hs);
+    std::vector<float> G(totalTok*H),  B(totalTok*H),  ST(nSeq*stt);
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        const std::uint32_t o = static_cast<std::uint32_t>(s) * 7u;
+        const std::size_t tt = static_cast<std::size_t>(seqT[s]);
+        const std::size_t to = static_cast<std::size_t>(seqOff[s]);
+        auto q=randVec(tt*hs,0x1a1u+o); auto k=randVec(tt*hs,0x1b2u+o);
+        auto v=randVec(tt*hs,0x1c3u+o); auto g=randVec(tt*H,0x1d4u+o);
+        auto b=randVec(tt*H,0x1e5u+o);  auto st=randVec(stt,0x1f6u+o);
+        std::copy(q.begin(),q.end(),Q.begin()+to*hs);
+        std::copy(k.begin(),k.end(),K.begin()+to*hs);
+        std::copy(v.begin(),v.end(),V.begin()+to*hs);
+        std::copy(g.begin(),g.end(),G.begin()+to*H);
+        std::copy(b.begin(),b.end(),B.begin()+to*H);
+        std::copy(st.begin(),st.end(),ST.begin()+s*stt);
+    }
+
+    auto dQ=toDevice(ops,Q); auto dK=toDevice(ops,K); auto dV=toDevice(ops,V);
+    auto dG=toDevice(ops,G); auto dB=toDevice(ops,B); auto dSt=toDevice(ops,ST);
+    auto dOut = ops.allocate(totalTok*hs*sizeof(float));
+    auto dSeqT = ops.allocate(nSeq*sizeof(std::int32_t));
+    auto dSeqOff = ops.allocate(nSeq*sizeof(std::int32_t));
+    ops.uploadHostBytes(dSeqT.get(),   seqT.data(),   nSeq*sizeof(std::int32_t));
+    ops.uploadHostBytes(dSeqOff.get(), seqOff.data(), nSeq*sizeof(std::int32_t));
+    std::size_t maxT = 1; for (auto t : seqT) maxT = std::max(maxT, (std::size_t)t);
+    mimirmind::compute::GdnBatchedShape shp{
+        nSeq, maxT, H, S, /*activeMask=*/nullptr,
+        static_cast<const std::int32_t*>(dSeqT.get()),
+        static_cast<const std::int32_t*>(dSeqOff.get())};
+    ops.gatedDeltaNetRecurrentBatchedAsync(
+        static_cast<const float*>(dQ.get()), static_cast<const float*>(dK.get()),
+        static_cast<const float*>(dV.get()), static_cast<const float*>(dG.get()),
+        static_cast<const float*>(dB.get()), static_cast<float*>(dSt.get()),
+        static_cast<float*>(dOut.get()), shp);
+    ops.flush();
+    auto outB   = fromDevice(ops, dOut.get(), totalTok*hs);
+    auto stateB = fromDevice(ops, dSt.get(),  nSeq*stt);
+
+    double maxErr = 0.0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        const std::size_t tt = static_cast<std::size_t>(seqT[s]);
+        const std::size_t to = static_cast<std::size_t>(seqOff[s]);
+        std::vector<float> q(Q.begin()+to*hs, Q.begin()+(to+tt)*hs);
+        std::vector<float> k(K.begin()+to*hs, K.begin()+(to+tt)*hs);
+        std::vector<float> v(V.begin()+to*hs, V.begin()+(to+tt)*hs);
+        std::vector<float> g(G.begin()+to*H,  G.begin()+(to+tt)*H);
+        std::vector<float> b(B.begin()+to*H,  B.begin()+(to+tt)*H);
+        std::vector<float> st(ST.begin()+s*stt, ST.begin()+(s+1)*stt);
+        auto dq=toDevice(ops,q); auto dk=toDevice(ops,k); auto dv=toDevice(ops,v);
+        auto dg=toDevice(ops,g); auto db=toDevice(ops,b); auto dst=toDevice(ops,st);
+        auto dSingle = ops.allocate(tt*hs*sizeof(float));
+        ops.gatedDeltaNetRecurrentAsync(
+            static_cast<const float*>(dq.get()), static_cast<const float*>(dk.get()),
+            static_cast<const float*>(dv.get()), static_cast<const float*>(dg.get()),
+            static_cast<const float*>(db.get()), static_cast<float*>(dst.get()),
+            static_cast<float*>(dSingle.get()), tt, H, S);
+        ops.flush();
+        auto outS   = fromDevice(ops, dSingle.get(), tt*hs);
+        auto stateS = fromDevice(ops, dst.get(),     stt);
+        for (std::size_t i = 0; i < tt*hs; ++i) {
+            maxErr = std::max(maxErr, std::fabs((double)outB[to*hs+i]-(double)outS[i]));
+            EXPECT_NEAR(outB[to*hs+i], outS[i], 1e-5f + 1e-6f*std::fabs(outS[i]));
+        }
+        for (std::size_t i = 0; i < stt; ++i) {
+            maxErr = std::max(maxErr, std::fabs((double)stateB[s*stt+i]-(double)stateS[i]));
+            EXPECT_NEAR(stateB[s*stt+i], stateS[i], 1e-5f + 1e-6f*std::fabs(stateS[i]));
+        }
+    }
+    std::printf("[gdn-varlen-parity] nSeq=%zu seqT={2,5,3} H=%zu S=%zu maxErr=%.2e\n",
+                nSeq, H, S, maxErr);
+}
+
+// 5.21.2 MIXED-STEP OOB HUNT (compute-sanitizer memcheck target) — the FUSED
+// batched GDN recurrence (the prod GDN_GATE_FUSE=1 hot path) at PROD dims
+// (hV=32, S=128 -> the 64 KiB dynamic-smem opt-in path the small-S parity tests
+// never exercise) fed the EXACT mixed-step worst shape: 512-token prefill chunks
+// interleaved with seqT=1 decode rows, buffers COMPACT (totalTok rows) so any
+// padded seq*maxT indexing OOBs against the allocation. No numeric assert — the
+// value is that memcheck flags an out-of-bounds/illegal access with kernel+line.
+// Run:  compute-sanitizer --tool memcheck ./build-cuda/cuda_parity_tests
+// Result 2026-08-25: memcheck-CLEAN (0 errors) -> fused GDN recurrence cleared as
+// the roadmap-5.21.2 mixed-step illegal-access source.
+TEST(cuda_gdn_mixed_step_ragged_prod_dims_memcheck) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t H = 32, S = 128;   // prod qwen3.6: v_heads=32, value_head_dim=128
+    std::vector<std::int32_t> seqT = {512,512,512,1,1,1,1,1,1,1,1,1,1,1,1,1};
+    const std::size_t nSeq = seqT.size();
+    std::vector<std::int32_t> seqOff(nSeq, 0);
+    std::size_t totalTok = 0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        seqOff[s] = static_cast<std::int32_t>(totalTok);
+        totalTok += static_cast<std::size_t>(seqT[s]);
+    }
+    const std::size_t maxT = 512;
+    const std::size_t hs = H * S, stt = H * S * S;
+
+    auto dQ     = toDevice(ops, randVec(totalTok * hs, 0x9110u));
+    auto dK     = toDevice(ops, randVec(totalTok * hs, 0x9220u));
+    auto dV     = toDevice(ops, randVec(totalTok * hs, 0x9330u));
+    auto dAlpha = toDevice(ops, randVec(totalTok * H,  0x9440u));
+    auto dBeta  = toDevice(ops, randVec(totalTok * H,  0x9550u));
+    auto dSsmA  = toDevice(ops, randVec(H, 0x9660u));
+    auto dSsmDt = toDevice(ops, randVec(H, 0x9770u));
+    auto dState = toDevice(ops, randVec(nSeq * stt, 0x9880u));
+    auto dOut   = ops.allocate(totalTok * hs * sizeof(float));
+    auto dSeqT  = ops.allocate(nSeq * sizeof(std::int32_t));
+    auto dSeqOff= ops.allocate(nSeq * sizeof(std::int32_t));
+    ops.uploadHostBytes(dSeqT.get(),   seqT.data(),   nSeq * sizeof(std::int32_t));
+    ops.uploadHostBytes(dSeqOff.get(), seqOff.data(), nSeq * sizeof(std::int32_t));
+
+    mimirmind::compute::GdnBatchedShape shp{
+        nSeq, maxT, H, S, /*activeMask=*/nullptr,
+        static_cast<const std::int32_t*>(dSeqT.get()),
+        static_cast<const std::int32_t*>(dSeqOff.get())};
+    ops.gatedDeltaNetRecurrentGateFusedBatchedAsync(
+        static_cast<const float*>(dQ.get()),     static_cast<const float*>(dK.get()),
+        static_cast<const float*>(dV.get()),     static_cast<const float*>(dAlpha.get()),
+        static_cast<const float*>(dBeta.get()),  static_cast<const float*>(dSsmA.get()),
+        static_cast<const float*>(dSsmDt.get()),
+        static_cast<float*>(dState.get()),       static_cast<float*>(dOut.get()), shp);
+    ops.flush();
+
+    std::printf("[gdn-mixed-memcheck] FUSED prod-dim ragged nSeq=%zu totalTok=%zu H=%zu S=%zu OK\n",
+                nSeq, totalTok, H, S);
 }
 
 // M-Cuda.Batch Cat C-P0 — batched ssm_conv1d vs N single-sequence runs.
@@ -1754,6 +1901,135 @@ TEST(cuda_ssm_conv1d_batched_parity) {
     }
     std::printf("[conv1d-batched-parity] nSeq=%zu T=%zu channels=%zu K=%zu maxErr=%.2e\n",
                 nSeq, T, channels, K, maxErr);
+}
+
+// 5.21 Increment II — VARLEN batched ssm_conv1d: ragged per-slot seqT (each slot
+// carries its own K-1 conv-tail) vs N single-seq convs each with its own T.
+TEST(cuda_ssm_conv1d_batched_varlen_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t channels = 12, K = 4;
+    const std::vector<std::int32_t> seqT = {2, 5, 3};
+    const std::size_t nSeq = seqT.size();
+    std::vector<std::int32_t> inOff(nSeq, 0), outOff(nSeq, 0);
+    std::size_t inTot = 0, outTot = 0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        inOff[s]  = static_cast<std::int32_t>(inTot);
+        outOff[s] = static_cast<std::int32_t>(outTot);
+        inTot  += static_cast<std::size_t>(seqT[s]) + K - 1;   // tail + tokens
+        outTot += static_cast<std::size_t>(seqT[s]);
+    }
+    auto kernel = randVec(K * channels, 0x3733u);
+    std::vector<float> IN(inTot * channels);
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        const std::size_t rows = static_cast<std::size_t>(seqT[s]) + K - 1;
+        auto in = randVec(rows * channels, 0x2700u + static_cast<std::uint32_t>(s)*13u);
+        std::copy(in.begin(), in.end(),
+                  IN.begin() + static_cast<std::size_t>(inOff[s]) * channels);
+    }
+
+    auto dIn  = toDevice(ops, IN);
+    auto dKer = toDevice(ops, kernel);
+    auto dOut = ops.allocate(outTot * channels * sizeof(float));
+    auto dSeqT = ops.allocate(nSeq*sizeof(std::int32_t));
+    auto dInOff = ops.allocate(nSeq*sizeof(std::int32_t));
+    auto dOutOff = ops.allocate(nSeq*sizeof(std::int32_t));
+    ops.uploadHostBytes(dSeqT.get(),   seqT.data(),   nSeq*sizeof(std::int32_t));
+    ops.uploadHostBytes(dInOff.get(),  inOff.data(),  nSeq*sizeof(std::int32_t));
+    ops.uploadHostBytes(dOutOff.get(), outOff.data(), nSeq*sizeof(std::int32_t));
+    std::size_t maxT = 1; for (auto t : seqT) maxT = std::max(maxT, (std::size_t)t);
+    ops.causalConv1dSiluBatchedAsync(
+        static_cast<const float*>(dIn.get()), static_cast<const float*>(dKer.get()),
+        static_cast<float*>(dOut.get()), nSeq, maxT, channels, K,
+        static_cast<const std::int32_t*>(dSeqT.get()),
+        static_cast<const std::int32_t*>(dInOff.get()),
+        static_cast<const std::int32_t*>(dOutOff.get()));
+    ops.flush();
+    auto outB = fromDevice(ops, dOut.get(), outTot * channels);
+
+    double maxErr = 0.0;
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        const std::size_t tt = static_cast<std::size_t>(seqT[s]);
+        const std::size_t rows = tt + K - 1;
+        std::vector<float> in(IN.begin() + (std::size_t)inOff[s]*channels,
+                              IN.begin() + ((std::size_t)inOff[s]+rows)*channels);
+        auto di = toDevice(ops, in); auto dk = toDevice(ops, kernel);
+        auto doS = ops.allocate(tt*channels*sizeof(float));
+        ops.causalConv1dSiluAsync(static_cast<const float*>(di.get()),
+                                  static_cast<const float*>(dk.get()),
+                                  static_cast<float*>(doS.get()), tt, channels, K);
+        ops.flush();
+        auto outS = fromDevice(ops, doS.get(), tt*channels);
+        for (std::size_t i = 0; i < tt*channels; ++i) {
+            const std::size_t o = (std::size_t)outOff[s]*channels + i;
+            maxErr = std::max(maxErr, std::fabs((double)outB[o] - (double)outS[i]));
+            EXPECT_NEAR(outB[o], outS[i], 1e-5f);
+        }
+    }
+    std::printf("[conv1d-varlen-parity] nSeq=%zu seqT={2,5,3} channels=%zu K=%zu maxErr=%.2e\n",
+                nSeq, channels, K, maxErr);
+}
+
+// 5.21 Increment II — VARLEN KV write: the batched KV scatter is per-ROW, so a
+// prefill slot's chunk = several per-token rows with per-token block/slot targets.
+// This locks in that guarantee (per-token placement) + the activeMask freeze that
+// Increment III relies on; the kernel needs no varlen-specific change.
+TEST(cuda_kv_write_tokens_batched_varlen_mask) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const std::size_t nKvHeads = 2, headSize = 8, width = nKvHeads * headSize;
+    const std::size_t blockSize = 4, numBlocks = 8;
+    // 5 rows: slot A prefill tokens @pos 0,1,2 (block 0 slots 0,1,2), slot B decode
+    // @pos 5 (block 1 slot 1), slot C FROZEN (must not be written).
+    const std::size_t nRow = 5;
+    std::vector<std::uint32_t> wbid = {0, 0, 0, 1, 2};
+    std::vector<std::int32_t>  wslot= {0, 1, 2, 1, 0};
+    std::vector<std::uint8_t>  mask = {1, 1, 1, 1, 0};   // row 4 (slot C) frozen
+
+    std::vector<float> kProj(nRow*width), vProj(nRow*width);
+    for (std::size_t i = 0; i < nRow*width; ++i) { kProj[i] = 1.f + 0.01f*i; vProj[i] = 2.f + 0.01f*i; }
+
+    const std::size_t poolElems = numBlocks*blockSize*width;
+    std::vector<float> kInit(poolElems, -7.f), vInit(poolElems, -9.f);  // sentinel
+    auto dK = toDevice(ops, kInit); auto dV = toDevice(ops, vInit);
+    auto dKp = toDevice(ops, kProj); auto dVp = toDevice(ops, vProj);
+    auto dWb = ops.allocate(nRow*sizeof(std::uint32_t));
+    auto dWs = ops.allocate(nRow*sizeof(std::int32_t));
+    auto dMask = ops.allocate(nRow*sizeof(std::uint8_t));
+    ops.uploadHostBytes(dWb.get(),   wbid.data(),  nRow*sizeof(std::uint32_t));
+    ops.uploadHostBytes(dWs.get(),   wslot.data(), nRow*sizeof(std::int32_t));
+    ops.uploadHostBytes(dMask.get(), mask.data(),  nRow*sizeof(std::uint8_t));
+
+    ops.writeKvTokensBatchedAsync(
+        static_cast<const float*>(dKp.get()), static_cast<const float*>(dVp.get()),
+        static_cast<const std::uint32_t*>(dWb.get()),
+        static_cast<const std::int32_t*>(dWs.get()),
+        dK.get(), dV.get(), nRow, blockSize, width,
+        mimirmind::runtime::KvDtype::F32,
+        static_cast<const std::uint8_t*>(dMask.get()));
+    ops.flush();
+    auto kOut = fromDevice(ops, dK.get(), poolElems);
+    auto vOut = fromDevice(ops, dV.get(), poolElems);
+
+    double maxErr = 0.0;
+    for (std::size_t r = 0; r < nRow; ++r) {
+        const std::size_t off = (static_cast<std::size_t>(wbid[r])*blockSize
+                                 + static_cast<std::size_t>(wslot[r])) * width;
+        for (std::size_t j = 0; j < width; ++j) {
+            if (mask[r] == 0) {   // frozen row: destination must stay sentinel
+                EXPECT_NEAR(kOut[off+j], -7.f, 0.f);
+                EXPECT_NEAR(vOut[off+j], -9.f, 0.f);
+            } else {              // active row: destination == this row's proj
+                maxErr = std::max(maxErr, std::fabs((double)kOut[off+j]-(double)kProj[r*width+j]));
+                EXPECT_NEAR(kOut[off+j], kProj[r*width+j], 0.f);
+                EXPECT_NEAR(vOut[off+j], vProj[r*width+j], 0.f);
+            }
+        }
+    }
+    std::printf("[kv-write-varlen-mask] nRow=%zu width=%zu (row4 frozen) maxErr=%.2e\n",
+                nRow, width, maxErr);
 }
 
 // M-Cuda.Batch Cat B — batched moe_gate_up_fused_k_q4k vs N single-token
@@ -2182,6 +2458,86 @@ TEST(cuda_deltanet_chunk_batched_parity) {
     }
     std::printf("[chunk-batched-parity] nSeq=%zu T=%zu H=%zu S=%zu C=%zu maxErr=%.2e\n",
                 nSeq, T, H, S, C, maxErr);
+}
+
+// 5.21 Increment II — VARLEN paged CAUSAL prefill attention: 2 ragged slots
+// (different startPos + seqT) in one launch vs per-(slot,pq) paged_attention_v1
+// decode with seq_len = startPos+pq+1. Same streaming-softmax => byte-exact.
+TEST(cuda_paged_attention_prefill_causal_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    const int nHeads = 4, nKvHeads = 2, headSize = 32, blockSize = 4;
+    const std::vector<int> startPos = {3, 1};
+    const std::vector<int> seqT     = {2, 3};
+    const int nSeq  = static_cast<int>(seqT.size());
+    const int kvDim = nKvHeads * headSize;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(headSize));
+
+    std::vector<int> nBlk(nSeq); int maxBlk = 0, numBlocks = 0;
+    for (int s = 0; s < nSeq; ++s) {
+        const int len = startPos[s] + seqT[s];
+        nBlk[s] = (len + blockSize - 1) / blockSize;
+        maxBlk = std::max(maxBlk, nBlk[s]); numBlocks += nBlk[s];
+    }
+    std::vector<int> blockTables(static_cast<std::size_t>(nSeq)*maxBlk, -1);
+    { int nx = 0; for (int s=0;s<nSeq;++s) for (int b=0;b<nBlk[s];++b)
+        blockTables[static_cast<std::size_t>(s)*maxBlk + b] = nx++; }
+
+    std::vector<int> queryOff(nSeq, 0); int totalTok = 0, maxT = 1;
+    for (int s=0;s<nSeq;++s){ queryOff[s]=totalTok; totalTok+=seqT[s]; maxT=std::max(maxT,seqT[s]); }
+
+    auto kPool = randVec(static_cast<std::size_t>(numBlocks)*blockSize*kvDim, 0x51u);
+    auto vPool = randVec(static_cast<std::size_t>(numBlocks)*blockSize*kvDim, 0x52u);
+    auto query = randVec(static_cast<std::size_t>(totalTok)*nHeads*headSize, 0x53u);
+
+    auto dK = toDevice(ops, kPool); auto dV = toDevice(ops, vPool);
+    auto dQ = toDevice(ops, query);
+    auto dBT = uploadRaw(ops, blockTables);
+    auto dSeqT = uploadRaw(ops, seqT);
+    auto dQOff = uploadRaw(ops, queryOff);
+    auto dSP  = uploadRaw(ops, startPos);
+    auto dOut = ops.allocate(static_cast<std::size_t>(totalTok)*nHeads*headSize*sizeof(float));
+
+    ops.pagedAttentionPrefillCausalAsync(
+        static_cast<float*>(dOut.get()), static_cast<const float*>(dQ.get()),
+        static_cast<const float*>(dK.get()), static_cast<const float*>(dV.get()),
+        static_cast<const std::int32_t*>(dBT.get()),
+        static_cast<const std::int32_t*>(dSeqT.get()),
+        static_cast<const std::int32_t*>(dQOff.get()),
+        static_cast<const std::int32_t*>(dSP.get()),
+        nSeq, nHeads, nKvHeads, headSize, blockSize, maxBlk, maxT, scale, 0.0f);
+    ops.flush();
+    auto outB = fromDevice(ops, dOut.get(), static_cast<std::size_t>(totalTok)*nHeads*headSize);
+
+    double maxErr = 0.0;
+    const std::size_t rowElems = static_cast<std::size_t>(nHeads)*headSize;
+    for (int s = 0; s < nSeq; ++s) {
+        std::vector<int> btRow(blockTables.begin()+static_cast<std::size_t>(s)*maxBlk,
+                               blockTables.begin()+static_cast<std::size_t>(s+1)*maxBlk);
+        auto dBTs = uploadRaw(ops, btRow);
+        for (int pq = 0; pq < seqT[s]; ++pq) {
+            const std::size_t tok = static_cast<std::size_t>(queryOff[s]) + pq;
+            std::vector<float> q1(query.begin()+tok*rowElems, query.begin()+(tok+1)*rowElems);
+            std::vector<int> sl = {startPos[s] + pq + 1};
+            auto dq1 = toDevice(ops, q1); auto dsl = uploadRaw(ops, sl);
+            auto do1 = ops.allocate(rowElems*sizeof(float));
+            ops.pagedAttentionDecodeV1Async(
+                static_cast<float*>(do1.get()), static_cast<const float*>(dq1.get()),
+                static_cast<const float*>(dK.get()), static_cast<const float*>(dV.get()),
+                static_cast<const std::int32_t*>(dBTs.get()),
+                static_cast<const std::int32_t*>(dsl.get()),
+                1, nHeads, nKvHeads, headSize, blockSize, maxBlk, scale, 0.0f);
+            ops.flush();
+            auto o1 = fromDevice(ops, do1.get(), rowElems);
+            for (std::size_t i = 0; i < rowElems; ++i) {
+                maxErr = std::max(maxErr, std::fabs((double)outB[tok*rowElems+i]-(double)o1[i]));
+                EXPECT_NEAR(outB[tok*rowElems+i], o1[i], 0.f);
+            }
+        }
+    }
+    std::printf("[paged-prefill-causal-parity] nSeq=%d seqT={2,3} startPos={3,1} maxErr=%.2e\n",
+                nSeq, maxErr);
 }
 
 // M-Cuda.Batch B2 — paged_attention_v1 baseline decode kernel vs a CPU
@@ -2813,6 +3169,43 @@ TEST(cuda_moe_grouped_gemm_parity_nonmult_n) {
 TEST(cuda_moe_grouped_gemm_parity_single_expert) {
     // One expert takes every row -> ceil(R/tileM) tiles, single weight base.
     checkMoeGroupedGemmParity({50, 0, 0}, /*N=*/32, /*K=*/96, 0xB0Bu);
+}
+
+// 5.21.2 MIXED-STEP MoE grouped-PREFILL memcheck coverage at PROD scale.
+// The mixed step (setPrefillMoeScratch -> runMoeFfnGrouped) runs the grouped MoE
+// over the full nRowMax=2048-row ragged batch across ALL 256 prod experts (top-8)
+// — the existing *_k8 tests only reach nExperts=128 / T=512, so the prod scale of
+// moe_group_build / moe_group_tiles / grouped GEMM was untested. These invoke the
+// same parity helpers at prod dims; running the binary under compute-sanitizer
+// memcheck flags any OOB in the token-grouping/tile-schedule/gather-scatter at
+// scale. (qwen3.6: num_experts=256, num_experts_per_tok=8.)
+// Result 2026-08-25: memcheck-CLEAN (0 errors).
+TEST(cuda_moe_group_build_parity_prod2048) {
+    checkMoeGroupParity(/*T=*/2048, /*nExperts=*/256, /*K=*/8, 0xB1620u);
+}
+TEST(cuda_moe_group_tiles_parity_prod2048) {
+    // 256 experts, skewed counts averaging ~64 rows (2048*8/256), both tile
+    // widths the mixed step uses (prefill tileM=16, decode tileM=4).
+    Lcg g{0xC0DE256u};
+    std::vector<std::int32_t> counts(256);
+    for (auto& c : counts) {
+        const float u = (g.next() + 1.0f) * 0.5f;
+        c = static_cast<std::int32_t>(u * 128.0f);
+    }
+    checkMoeGroupTilesParity(counts, /*tileM=*/16);
+    checkMoeGroupTilesParity(counts, /*tileM=*/4);
+}
+TEST(cuda_moe_grouped_gemm_parity_prod) {
+    // 256 experts, skewed counts (some > tileM, some empty) -> multi-tile experts
+    // across the full expert set; the grouped GEMM gather/scatter at prod expert
+    // count.
+    Lcg g{0xEE256u};
+    std::vector<std::int32_t> counts(256);
+    for (auto& c : counts) {
+        const float u = (g.next() + 1.0f) * 0.5f;
+        c = static_cast<std::int32_t>(u * 32.0f);
+    }
+    checkMoeGroupedGemmParity(counts, /*N=*/128, /*K=*/128, 0x5150u);
 }
 
 // NVFP4 de-interleaved vectorised matvec (M=1) — parity vs the 20-byte blocked

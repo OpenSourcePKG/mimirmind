@@ -883,6 +883,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/cuda_probe_kernel.cu
         kernels/cuda/llm/attention_paged_v1.cu
         kernels/cuda/llm/attention_paged_v2.cu
+        kernels/cuda/llm/attention_paged_prefill_causal.cu
         kernels/cuda/common/add_bias.cu
         kernels/cuda/common/add_residual.cu
         kernels/cuda/common/add_rmsnorm.cu
@@ -993,6 +994,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/encoder_embed_add.cu
         kernels/cuda/common/tanh_inplace.cu
         kernels/cuda/common/silu_mul.cu
+        kernels/cuda/common/silu_mul_split.cu
         kernels/cuda/common/x_quant_i8.cu
         kernels/cuda/common/dequant_nvfp4.cu
         kernels/cuda/common/dequant_fp8.cu

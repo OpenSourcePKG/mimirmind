@@ -214,12 +214,16 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
         if (think >= 0) {
             ids.push_back(think);
             // Explicit enable_thinking (OpenAI chat_template_kwargs, like vLLM)
-            // overrides the tools heuristic: enable_thinking=false forces the
-            // empty pre-closed block even WITHOUT tools (direct answer, no
-            // reasoning). This is the fix for agentic RAG whose final answer
-            // call carries no tools but must not leak an unclosed <think>.
-            // Unset (nullopt) keeps the tools-based default.
-            const bool thinkOn = enableThinking.value_or(tools.empty());
+            // overrides: enable_thinking=true opts INTO reasoning; =false forces
+            // the empty pre-closed block (direct answer, no reasoning).
+            // Unset (nullopt) => DEFAULT OFF: an interactive chat gets a direct
+            // answer, not a multi-thousand-token reasoning trace (which also
+            // removes the thinking-loop surface). Reasoning is opt-in per request
+            // via enable_thinking=true. Tool rounds were already pre-closed, so
+            // this only changes the plain-chat/no-tools default. MUST stay in
+            // sync with ChatCompletionHandler's streaming `thinkPreClosed`
+            // (= !thinkOn), else the answer is mislabelled as reasoning_content.
+            const bool thinkOn = enableThinking.value_or(false);
             if (thinkOn) {
                 // pre-OPEN <think>: the model reasons, then closes
                 // with </think>. This is the answer path; the reasoning is

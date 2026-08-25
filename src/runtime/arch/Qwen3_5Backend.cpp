@@ -125,6 +125,10 @@ Qwen3_5Backend::Qwen3_5Backend(const model::LlmConfig&       config,
     }
     _gdnQkvzW.resize(_config.blockCount);
     _gdnBaW.resize(_config.blockCount);
+    if (const char* w13 = std::getenv("MIMIRMIND_MOE_W13_FUSE")) {
+        _moeW13Fuse = (w13[0] == '1' && w13[1] == '\0');
+    }
+    _moeW13W.resize(_config.blockCount);
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
     if (const char* d = std::getenv("MIMIRMIND_SSM_DUMP")) {
         _ssmDump    = true;

@@ -60,8 +60,23 @@ public:
     prefillSlot(std::size_t slot, std::span<const std::int32_t> tokens,
                 std::size_t startPos, bool produceToken);
 
+    /// 5.21-III MULTI-SLOT: prefill N contiguous slots [firstSlot, firstSlot+N)
+    /// in ONE ragged batched forward (sbMixed). chunks[s]/startPositions[s]
+    /// describe slot firstSlot+s; the greedy next-token per slot (or -1 when
+    /// produceToken is false) is written into outFirstTok[s]. Requires the
+    /// slots to be a contiguous run so recurrence state / block-table slices
+    /// address as base + firstSlot*stride + seq*stride.
+    void runVarlenPrefill(std::size_t firstSlot,
+                          std::span<const std::span<const std::int32_t>> chunks,
+                          std::span<const std::size_t>                   startPositions,
+                          bool                                           produceToken,
+                          std::span<std::int32_t>                        outFirstTok);
+
     /// See InferenceEngine::servingPrefillChunk.
     [[nodiscard]] std::size_t prefillChunkSize() const noexcept;
+
+    /// See InferenceEngine::servingPrefillMaxRows.
+    [[nodiscard]] std::size_t prefillMaxRows() const noexcept;
 
     /// See InferenceEngine::stepServingVerify.
     [[nodiscard]] std::vector<std::vector<float>>

@@ -109,6 +109,8 @@ public:
     void addResidualAsync(float* y, const float* x, std::size_t n) override;
 
     void siluMulAsync(float* gate, const float* up, std::size_t n) override;
+    void siluMulSplitAsync(const float* w13, float* out,
+                           std::size_t rows, std::size_t nff) override;
 
     void geluMulAsync(float* gate, const float* up, std::size_t n) override;
 
@@ -184,7 +186,10 @@ public:
                                       const float* kernel, float* out,
                                       std::size_t nSeq, std::size_t T,
                                       std::size_t channels,
-                                      std::size_t kernelSize) override;
+                                      std::size_t kernelSize,
+                                      const std::int32_t* seqT   = nullptr,
+                                      const std::int32_t* inOff  = nullptr,
+                                      const std::int32_t* outOff = nullptr) override;
     void gatedDeltaNetRecurrentAsync(const float* q, const float* k,
                                      const float* v, const float* gLog,
                                      const float* beta, float* state,
@@ -196,15 +201,13 @@ public:
     void gatedDeltaNetRecurrentBatchedAsync(const float* q, const float* k,
                                             const float* v, const float* gLog,
                                             const float* beta, float* state,
-                                            float* out, std::size_t nSeq,
-                                            std::size_t T, std::size_t H,
-                                            std::size_t S) override;
+                                            float* out,
+                                            const GdnBatchedShape& shape) override;
 
     void gatedDeltaNetRecurrentGateFusedBatchedAsync(
             const float* q, const float* k, const float* v, const float* alpha,
             const float* beta, const float* ssmA, const float* ssmDt,
-            float* state, float* out, std::size_t nSeq, std::size_t T,
-            std::size_t H, std::size_t S) override;
+            float* state, float* out, const GdnBatchedShape& shape) override;
 
     void gatedDeltaNetVerifyBatchedAsync(const float* q, const float* k,
                                          const float* v, const float* gLog,
@@ -270,7 +273,9 @@ public:
                                    std::size_t nSeq, std::size_t blockSize,
                                    std::size_t width,
                                    runtime::KvDtype kvDtype
-                                       = runtime::KvDtype::F32) override;
+                                       = runtime::KvDtype::F32,
+                                   const std::uint8_t* activeMask
+                                       = nullptr) override;
     void moeGroupTilesAsync(const std::int32_t* expOffset,
                             std::int32_t* tileExpert, std::int32_t* tileRow0,
                             std::int32_t* tileRows, std::int32_t* nTiles,
@@ -704,6 +709,14 @@ public:
             std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
             std::size_t blockSize, std::size_t maxNumBlocksPerSeq, float scale,
             float softcap) override;
+    void pagedAttentionPrefillCausalAsync(
+            float* out, const float* query, const float* keyCache,
+            const float* valueCache, const std::int32_t* blockTables,
+            const std::int32_t* seqT, const std::int32_t* queryOff,
+            const std::int32_t* startPos, std::size_t numSeqs,
+            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
+            std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
+            std::size_t maxT, float scale, float softcap) override;
     void pagedAttentionDecodeV2Async(
             float* out, const float* query, const float* keyCache,
             const float* valueCache, const std::int32_t* blockTables,

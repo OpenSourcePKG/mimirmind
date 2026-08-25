@@ -153,6 +153,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _addResidualKernel;
     core::cuda::CudaModule _siluMulModule;
     core::cuda::CudaKernel _siluMulKernel;
+    core::cuda::CudaModule _siluMulSplitModule;
+    core::cuda::CudaKernel _siluMulSplitKernel;
     core::cuda::CudaModule _geluMulModule;
     core::cuda::CudaKernel _geluMulKernel;
     core::cuda::CudaModule _geluErfModule;
@@ -203,6 +205,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _attentionFlashMergeBatchedKernel;
     core::cuda::CudaModule _pagedAttentionV1Module;
     core::cuda::CudaKernel _pagedAttentionV1Kernel;
+    core::cuda::CudaModule _pagedAttentionPrefillCausalModule;
+    core::cuda::CudaKernel _pagedAttentionPrefillCausalKernel;
     core::cuda::CudaModule _pagedAttentionV2Module;
     core::cuda::CudaKernel _pagedAttentionV2Kernel;
     core::cuda::CudaKernel _pagedAttentionV2Fp16Kernel;   // fp16 KV (5.14 I1)
@@ -391,6 +395,8 @@ struct GpuOps::Impl {
           _addResidualKernel       {_addResidualModule.getFunction("add_residual")},
           _siluMulModule           {loadCudaModule(ctx, "silu_mul")},
           _siluMulKernel           {_siluMulModule.getFunction("silu_mul")},
+          _siluMulSplitModule      {loadCudaModule(ctx, "silu_mul_split")},
+          _siluMulSplitKernel      {_siluMulSplitModule.getFunction("silu_mul_split")},
           _geluMulModule           {loadCudaModule(ctx, "gelu_mul")},
           _geluMulKernel           {_geluMulModule.getFunction("gelu_mul")},
           _geluErfModule           {loadCudaModule(ctx, "gelu_erf")},
@@ -450,6 +456,11 @@ struct GpuOps::Impl {
           _pagedAttentionV1Module{loadCudaModule(ctx, "attention_paged_v1")},
           _pagedAttentionV1Kernel{
               _pagedAttentionV1Module.getFunction("paged_attention_v1")},
+          _pagedAttentionPrefillCausalModule{
+              loadCudaModule(ctx, "attention_paged_prefill_causal")},
+          _pagedAttentionPrefillCausalKernel{
+              _pagedAttentionPrefillCausalModule.getFunction(
+                  "paged_attention_prefill_causal")},
           _pagedAttentionV2Module{loadCudaModule(ctx, "attention_paged_v2")},
           _pagedAttentionV2Kernel{
               _pagedAttentionV2Module.getFunction("paged_attention_v2")},
@@ -1252,6 +1263,24 @@ void GpuOps::siluMulAsync(float* gate, const float* up, std::size_t n) {
              kElementwiseLocalSize, 1, 1);
 }
 
+void GpuOps::siluMulSplitAsync(const float* w13, float* out,
+                              std::size_t rows, std::size_t nff) {
+    const std::size_t total = rows * nff;
+    if (total == 0) {
+        return;
+    }
+    const std::int32_t rowsI = toInt32(rows, "siluMulSplit rows");
+    const std::int32_t nffI  = toInt32(nff,  "siluMulSplit nff");
+    auto& k = _pimpl->_siluMulSplitKernel;
+    k.setPtr  (0, w13);
+    k.setPtr  (1, out);
+    k.setValue(2, rowsI);
+    k.setValue(3, nffI);
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
 void GpuOps::geluMulAsync(float* gate, const float* up, std::size_t n) {
     if (n == 0) {
         return;
@@ -1582,14 +1611,19 @@ void GpuOps::causalConv1dSiluBatchedAsync(const float* convInput,
                                           const float* kernel, float* out,
                                           std::size_t nSeq, std::size_t T,
                                           std::size_t channels,
-                                          std::size_t kernelSize) {
-    const std::size_t total = T * channels;
+                                          std::size_t kernelSize,
+                                          const std::int32_t* seqT,
+                                          const std::int32_t* inOff,
+                                          const std::int32_t* outOff) {
+    const std::size_t total = T * channels;   // T = max seqT in the varlen case
     if (nSeq == 0 || total == 0) {
         return;
     }
     // grid = (ceil(T*channels/LOCAL), nSeq); each seq owns its own conv
     // input (caller prepends its rolling conv-tail). Math byte-identical
     // to the single-sequence causalConv1dSiluAsync (M-Cuda.Batch Cat C-P0).
+    // 5.21-II varlen: seqT/inOff/outOff (nullptr => uniform) give per-slot T +
+    // ragged input/output offsets; T must then be passed as max(seqT) for grid.
     auto& k = _pimpl->_ssmConv1dBatchedKernel;
     k.setPtr  (0, convInput);
     k.setPtr  (1, kernel);
@@ -1597,6 +1631,9 @@ void GpuOps::causalConv1dSiluBatchedAsync(const float* convInput,
     k.setValue(3, toInt32(T,          "conv1dB T"));
     k.setValue(4, toInt32(channels,   "conv1dB channels"));
     k.setValue(5, toInt32(kernelSize, "conv1dB K"));
+    k.setPtr  (6, seqT);
+    k.setPtr  (7, inOff);
+    k.setPtr  (8, outOff);
     k.launch(_ctx.stream(),
              groupsForN(total, kElementwiseLocalSize),
              static_cast<std::uint32_t>(nSeq), 1,
@@ -1688,8 +1725,10 @@ void GpuOps::gatedDeltaNetRecurrentAsync(const float* q, const float* k_,
 
 void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
         const float* q, const float* k_, const float* v, const float* gLog,
-        const float* beta, float* state, float* out, std::size_t nSeq,
-        std::size_t T, std::size_t H, std::size_t S) {
+        const float* beta, float* state, float* out,
+        const GdnBatchedShape& shape) {
+    const std::size_t nSeq = shape.nSeq, T = shape.T, H = shape.H, S = shape.S;
+    const std::uint8_t* const activeMask = shape.activeMask;
     if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
         return;
     }
@@ -1751,6 +1790,16 @@ void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
     k.setValue(7, toInt32(T, "gdnB T"));
     k.setValue(8, toInt32(H, "gdnB H"));
     k.setValue(9, toInt32(S, "gdnB S"));
+    k.setPtr  (10, activeMask);   // 5.21-I: nullptr => all-active (bit-identical)
+    if (useV3) {
+        // 5.21-II varlen: only the v3 kernel carries the ragged seqT/seqOff args.
+        k.setPtr(11, shape.seqT);
+        k.setPtr(12, shape.seqOff);
+    } else if (shape.seqT != nullptr) {
+        throw std::runtime_error(
+            "gatedDeltaNetRecurrentBatchedAsync: varlen (seqT) requires the v3 "
+            "kernel (MIMIRMIND_GDN_V3=1)");
+    }
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(H),
              static_cast<std::uint32_t>(nSeq), 1,
@@ -1761,8 +1810,9 @@ void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
 void GpuOps::gatedDeltaNetRecurrentGateFusedBatchedAsync(
         const float* q, const float* k_, const float* v, const float* alpha,
         const float* beta, const float* ssmA, const float* ssmDt, float* state,
-        float* out, std::size_t nSeq, std::size_t T, std::size_t H,
-        std::size_t S) {
+        float* out, const GdnBatchedShape& shape) {
+    const std::size_t nSeq = shape.nSeq, T = shape.T, H = shape.H, S = shape.S;
+    const std::uint8_t* const activeMask = shape.activeMask;
     if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
         return;
     }
@@ -1802,6 +1852,9 @@ void GpuOps::gatedDeltaNetRecurrentGateFusedBatchedAsync(
     k.setValue(9,  toInt32(T, "gdnGF T"));
     k.setValue(10, toInt32(H, "gdnGF H"));
     k.setValue(11, toInt32(S, "gdnGF S"));
+    k.setPtr  (12, activeMask);   // 5.21-I: nullptr => all-active (bit-identical)
+    k.setPtr  (13, shape.seqT);   // 5.21-II varlen (always v3): nullptr => uniform T
+    k.setPtr  (14, shape.seqOff);
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(H),
              static_cast<std::uint32_t>(nSeq), 1,
@@ -2118,7 +2171,8 @@ void GpuOps::writeKvTokensBatchedAsync(const float* kProj, const float* vProj,
                                        void* kPool, void* vPool,
                                        std::size_t nSeq, std::size_t blockSize,
                                        std::size_t width,
-                                       runtime::KvDtype kvDtype) {
+                                       runtime::KvDtype kvDtype,
+                                       const std::uint8_t* activeMask) {
     if (nSeq == 0 || width == 0) {
         return;
     }
@@ -2135,6 +2189,7 @@ void GpuOps::writeKvTokensBatchedAsync(const float* kProj, const float* vProj,
     k.setValue(6, toInt32(nSeq, "writeKv nSeq"));
     k.setValue(7, toInt32(blockSize, "writeKv blockSize"));
     k.setValue(8, toInt32(width, "writeKv width"));
+    k.setPtr  (9, activeMask);   // 5.21-I: nullptr => all-active (bit-identical)
     const std::uint32_t blk = width < 256 ? static_cast<std::uint32_t>(width) : 256;
     k.launch(_ctx.stream(), static_cast<std::uint32_t>(nSeq), 1, 1, blk, 1, 1);
 }
@@ -3303,6 +3358,47 @@ void GpuOps::pagedAttentionDecodeV1Async(
                 static_cast<std::uint32_t>(numHeads),
                 static_cast<std::uint32_t>(numSeqs),
                 1,
+                kLocal, 1, 1,
+                smemBytes);
+}
+
+void GpuOps::pagedAttentionPrefillCausalAsync(
+        float* out, const float* query, const float* keyCache,
+        const float* valueCache, const std::int32_t* blockTables,
+        const std::int32_t* seqT, const std::int32_t* queryOff,
+        const std::int32_t* startPos, std::size_t numSeqs, std::size_t numHeads,
+        std::size_t numKvHeads, std::size_t headSize, std::size_t blockSize,
+        std::size_t maxNumBlocksPerSeq, std::size_t maxT, float scale,
+        float softcap) {
+    if (numSeqs == 0 || numHeads == 0 || headSize == 0 || maxT == 0) {
+        return;
+    }
+    // 5.21-II paged causal prefill attention. grid (numHeads, numSeqs, maxT);
+    // block (pq >= seqT[seq]) early-out. Same smem + streaming-softmax as V1, so
+    // pq's output == a V1 decode with seq_len = startPos[seq]+pq+1.
+    constexpr std::uint32_t kLocal = 128;   // == PAGED_ATTN_PREFILL_LOCAL
+    auto& kern = _pimpl->_pagedAttentionPrefillCausalKernel;
+    kern.setPtr  (0, out);
+    kern.setPtr  (1, query);
+    kern.setPtr  (2, keyCache);
+    kern.setPtr  (3, valueCache);
+    kern.setPtr  (4, blockTables);
+    kern.setPtr  (5, seqT);
+    kern.setPtr  (6, queryOff);
+    kern.setPtr  (7, startPos);
+    kern.setValue(8,  toInt32(numSeqs,            "prefC numSeqs"));
+    kern.setValue(9,  toInt32(numHeads,           "prefC numHeads"));
+    kern.setValue(10, toInt32(numKvHeads,         "prefC numKvHeads"));
+    kern.setValue(11, toInt32(headSize,           "prefC headSize"));
+    kern.setValue(12, toInt32(blockSize,          "prefC blockSize"));
+    kern.setValue(13, toInt32(maxNumBlocksPerSeq, "prefC maxBlocks"));
+    kern.setValue(14, scale);
+    kern.setValue(15, softcap);
+    const std::size_t smemBytes = (2 * headSize + kLocal) * sizeof(float);
+    kern.launch(_ctx.stream(),
+                static_cast<std::uint32_t>(numHeads),
+                static_cast<std::uint32_t>(numSeqs),
+                static_cast<std::uint32_t>(maxT),
                 kLocal, 1, 1,
                 smemBytes);
 }

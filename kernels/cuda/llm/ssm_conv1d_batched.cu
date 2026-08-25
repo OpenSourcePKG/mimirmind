@@ -26,27 +26,37 @@ void ssm_conv1d_batched(
     const float* __restrict__ convInput,
     const float* __restrict__ kern,
     float*       __restrict__ out,
-    const int                 T,
+    const int                 T,             // uniform tokens/slot (varlen: max, for grid)
     const int                 channels,
-    const int                 K)
+    const int                 K,
+    // 5.21-II varlen (nullptr => uniform, bit-identical): per-slot token count +
+    // ragged input/output token offsets. inOff = prefix-sum of (seqT[s]+K-1) rows
+    // (each slot's input carries its own K-1 conv-tail); outOff = prefix-sum of
+    // seqT (= the recurrence's seqOff).
+    const int* __restrict__ seqT   = nullptr,
+    const int* __restrict__ inOff  = nullptr,
+    const int* __restrict__ outOff = nullptr)
 {
     const int seq   = blockIdx.y;
+    const int Tseq  = (seqT != nullptr) ? seqT[seq] : T;
     const int gid   = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = T * channels;
+    const int total = Tseq * channels;
     if (gid >= total) {
         return;
     }
     const int c = gid % channels;
     const int t = gid / channels;
 
-    const size_t inSeqStride  = (size_t)(T + K - 1) * channels;
-    const size_t outSeqStride = (size_t)T * channels;
-    const float* in = convInput + (size_t)seq * inSeqStride;
+    const size_t inBase  = (size_t)((inOff  != nullptr) ? inOff[seq]
+                                    : seq * (T + K - 1)) * channels;
+    const size_t outBase = (size_t)((outOff != nullptr) ? outOff[seq]
+                                    : seq * T) * channels;
+    const float* in = convInput + inBase;
 
     float acc = 0.0f;
     for (int kk = 0; kk < K; ++kk) {
         acc += in[(size_t)(t + kk) * channels + c] *
                kern[(size_t)c * K + kk];
     }
-    out[(size_t)seq * outSeqStride + gid] = acc / (1.0f + expf(-acc));  // SiLU
+    out[outBase + (size_t)gid] = acc / (1.0f + expf(-acc));  // SiLU
 }

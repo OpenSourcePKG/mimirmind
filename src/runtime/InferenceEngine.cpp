@@ -2507,6 +2507,24 @@ std::size_t InferenceEngine::servingPrefillChunk() const {
                                       : _servingSession->prefillChunkSize();
 }
 
+void InferenceEngine::prefillSlotsBatched(
+        std::size_t                                    firstSlot,
+        std::span<const std::span<const std::int32_t>> chunks,
+        std::span<const std::size_t>                   startPositions,
+        bool                                           produceToken,
+        std::span<std::int32_t>                        outFirstTok) {
+    if (_servingSession == nullptr) {
+        throw std::runtime_error("prefillSlotsBatched: ensureServingState not called");
+    }
+    _servingSession->runVarlenPrefill(firstSlot, chunks, startPositions,
+                                      produceToken, outFirstTok);
+}
+
+std::size_t InferenceEngine::servingPrefillMaxRows() const {
+    return _servingSession == nullptr ? 0
+                                      : _servingSession->prefillMaxRows();
+}
+
 bool InferenceEngine::supportsBatchedDecode() const noexcept {
     return _backend != nullptr && _backend->supportsBatchedDecode();
 }

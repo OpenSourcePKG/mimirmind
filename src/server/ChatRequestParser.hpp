@@ -66,9 +66,9 @@ struct ChatRequest {
 
     // Reasoning toggle for "thinking" models (Qwen3.6). Mirrors vLLM's
     // `chat_template_kwargs: {enable_thinking: <bool>}`; also accepted as a
-    // top-level `enable_thinking`. nullopt => architecture default (Qwen: think
-    // on unless a tool round). false => force a direct answer (no reasoning),
-    // which is what agentic RAG wants for its final answer turn.
+    // top-level `enable_thinking`. nullopt => server default = thinking OFF
+    // (direct answer — fast, no thinking-loop surface); set true to opt INTO
+    // reasoning. false explicitly forces a direct answer (agentic RAG final turn).
     std::optional<bool>             enableThinking{std::nullopt};
 };
 
