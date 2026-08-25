@@ -266,7 +266,15 @@ private:
     // under load, and bit-identical pure-decode (inert once nothing prefills →
     // decode-v2 unchanged). Auto-disabled when the substrate has no chunked prefill
     // (prefillMaxRows==0). Rollback: MIMIRMIND_MIXED_STEP=0.
-    bool             _mixedStep{true};
+    //
+    // 2026-08-24 REVERTED TO DEFAULT-OFF pending investigation: under real prod
+    // load (full serve set, mixed multi-model traffic) mixedStep=1 triggered a
+    // cudaStreamSynchronize illegal memory access that poisoned the shared CUDA
+    // context -> garbage output from OTHER co-resident models (gemma4). The
+    // isolated A/B sweeps (single model, controlled load) never hit it. Keep the
+    // feature env-opt-in (MIMIRMIND_MIXED_STEP=1) until the illegal access is
+    // root-caused and fixed; prod must run the known-good decode-v2 scheduler.
+    bool             _mixedStep{false};
     // 5.21-III PRESSURE GATE — only fold prefill into the decode forward when the
     // wait queue exceeds free-slot capacity (a real backlog). With no backlog,
     // newly-admitted slots take the eager chunked-prefill path so live decoders
