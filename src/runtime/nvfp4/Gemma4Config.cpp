@@ -105,6 +105,49 @@ model::LlmConfig parseGemma4SafetensorsConfig(std::string_view configJson) {
     cfg.ropeFreqBase    = ropeFull;
     cfg.ropeFreqBaseSwa = ropeSwa;
 
+    // YaRN / rope_scaling long-context extension (roadmap 8.8). Gemma applies
+    // scaling on the GLOBAL (full-attention) layers — the checkpoint nests it
+    // under rope_parameters.full_attention.rope_scaling (a top-level
+    // rope_scaling is also honoured). Absent ⇒ base RoPE ⇒ bit-identical to
+    // today. Consumed DYNAMICALLY (only beyond original_max_position) — see
+    // compute/YarnRope.hpp.
+    const nlohmann::json* rsp = nullptr;
+    if (c.contains("rope_parameters") && c["rope_parameters"].is_object() &&
+        c["rope_parameters"].contains("full_attention") &&
+        c["rope_parameters"]["full_attention"].is_object() &&
+        c["rope_parameters"]["full_attention"].contains("rope_scaling") &&
+        c["rope_parameters"]["full_attention"]["rope_scaling"].is_object()) {
+        rsp = &c["rope_parameters"]["full_attention"]["rope_scaling"];
+    } else if (c.contains("rope_scaling") && c["rope_scaling"].is_object()) {
+        rsp = &c["rope_scaling"];
+    }
+    if (rsp != nullptr) {
+        const auto& rs = *rsp;
+        std::string type;
+        if (rs.contains("rope_type") && rs["rope_type"].is_string()) {
+            type = rs["rope_type"].get<std::string>();
+        } else if (rs.contains("type") && rs["type"].is_string()) {
+            type = rs["type"].get<std::string>();
+        }
+        if (!type.empty() && type != "default" && type != "none") {
+            cfg.ropeScalingType = type;
+            if (rs.contains("factor") && rs["factor"].is_number()) {
+                cfg.ropeScalingFactor = rs["factor"].get<float>();
+            }
+            cfg.ropeOrigMaxPos =
+                (rs.contains("original_max_position_embeddings") &&
+                 rs["original_max_position_embeddings"].is_number())
+                    ? rs["original_max_position_embeddings"].get<std::uint32_t>()
+                    : cfg.contextLength;
+            if (rs.contains("beta_fast") && rs["beta_fast"].is_number()) {
+                cfg.ropeBetaFast = rs["beta_fast"].get<float>();
+            }
+            if (rs.contains("beta_slow") && rs["beta_slow"].is_number()) {
+                cfg.ropeBetaSlow = rs["beta_slow"].get<float>();
+            }
+        }
+    }
+
     // Per-layer SWA mask + KV-head count from `layer_types`. SWA layers keep
     // `num_key_value_heads` (8), full-attention layers `num_global_key_value_
     // heads` (1). The scalar headCountKv is the dominant (SWA) value; the

@@ -162,6 +162,31 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
     ropeFreqBaseSwa = optionalF32("rope.freq_base_swa", ropeFreqBase);
     slidingWindow   = optionalU32("attention.sliding_window", 0);
 
+    // YaRN / rope_scaling long-context extension (roadmap 8.8). llama.cpp
+    // stores these under `<arch>.rope.scaling.*`: `type` is a string
+    // ("none"/"linear"/"yarn"), the rest are numeric. Absent ⇒ base RoPE
+    // (ropeScalingType stays "", factor 1) ⇒ bit-identical to today. The
+    // backend consumes these ONLY when a request exceeds ropeOrigMaxPos
+    // (dynamic gating) — see compute/YarnRope.hpp.
+    if (const auto* st = reader.findMetadata(a + ".rope.scaling.type")) {
+        if (auto s = asString(*st); s && *s != "none") {
+            ropeScalingType = *s;
+            MM_LOG_INFO("config", "{}.rope.scaling.type = {}", a, ropeScalingType);
+        }
+    }
+    if (!ropeScalingType.empty()) {
+        ropeScalingFactor = optionalF32("rope.scaling.factor", 1.0F);
+        ropeOrigMaxPos    = optionalU32("rope.scaling.original_context_length",
+                                        contextLength);
+        ropeBetaFast      = optionalF32("rope.scaling.beta_fast", 32.0F);
+        ropeBetaSlow      = optionalF32("rope.scaling.beta_slow", 1.0F);
+        MM_LOG_INFO("config",
+                    "{} rope_scaling active: type={} factor={} origMaxPos={} "
+                    "betaFast={} betaSlow={}",
+                    a, ropeScalingType, ropeScalingFactor, ropeOrigMaxPos,
+                    ropeBetaFast, ropeBetaSlow);
+    }
+
     // Sliding-window-attention pattern. Stored in GGUF as an array of
     // bools (one per layer) under `<arch>.attention.sliding_window_pattern`.
     // Older Gemma-3 GGUFs used a uniform "every nth layer is SWA" scheme;

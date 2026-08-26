@@ -80,6 +80,47 @@ model::LlmConfig parseQwen3_5MoeSafetensorsConfig(std::string_view configJson) {
     }
     cfg.ropeFreqBaseSwa = cfg.ropeFreqBase;
 
+    // YaRN / rope_scaling long-context extension (roadmap 8.8). HF ships it as
+    // a `rope_scaling` dict (top-level; some checkpoints nest it under
+    // rope_parameters). Absent ⇒ base RoPE ⇒ bit-identical to today. Consumed
+    // DYNAMICALLY (only when a request exceeds original_max_position) — see
+    // compute/YarnRope.hpp.
+    const nlohmann::json* rsp = nullptr;
+    if (c.contains("rope_scaling") && c["rope_scaling"].is_object()) {
+        rsp = &c["rope_scaling"];
+    } else if (c.contains("rope_parameters") &&
+               c["rope_parameters"].is_object() &&
+               (c["rope_parameters"].contains("rope_type") ||
+                c["rope_parameters"].contains("factor"))) {
+        rsp = &c["rope_parameters"];
+    }
+    if (rsp != nullptr) {
+        const auto& rs = *rsp;
+        std::string type;
+        if (rs.contains("rope_type") && rs["rope_type"].is_string()) {
+            type = rs["rope_type"].get<std::string>();
+        } else if (rs.contains("type") && rs["type"].is_string()) {
+            type = rs["type"].get<std::string>();
+        }
+        if (!type.empty() && type != "default" && type != "none") {
+            cfg.ropeScalingType = type;
+            if (rs.contains("factor") && rs["factor"].is_number()) {
+                cfg.ropeScalingFactor = rs["factor"].get<float>();
+            }
+            cfg.ropeOrigMaxPos =
+                (rs.contains("original_max_position_embeddings") &&
+                 rs["original_max_position_embeddings"].is_number())
+                    ? rs["original_max_position_embeddings"].get<std::uint32_t>()
+                    : cfg.contextLength;
+            if (rs.contains("beta_fast") && rs["beta_fast"].is_number()) {
+                cfg.ropeBetaFast = rs["beta_fast"].get<float>();
+            }
+            if (rs.contains("beta_slow") && rs["beta_slow"].is_number()) {
+                cfg.ropeBetaSlow = rs["beta_slow"].get<float>();
+            }
+        }
+    }
+
     // MoE.
     cfg.expertCount                   = optU("num_experts", 0);
     cfg.expertUsedCount               = optU("num_experts_per_tok", 0);
