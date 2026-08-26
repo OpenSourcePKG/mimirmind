@@ -40,7 +40,7 @@ namespace mimirmind::server {
 
 using nlohmann::json;
 
-SystemStatusBuilder::SystemStatusBuilder(runtime::InferenceEngine& engine,
+SystemStatusBuilder::SystemStatusBuilder(runtime::InferenceEngine* engine,
                                           RequestDispatcher&        dispatcher,
                                           RequestTracker&           requestTracker,
                                           std::string_view          modelId)
@@ -53,7 +53,10 @@ SystemStatusBuilder::SystemStatusBuilder(runtime::InferenceEngine& engine,
     // so it represents "right after model load, before any requests".
     // If the monitor is unavailable the snapshot will be empty and
     // totals stay at 0.
-    if (auto* mon = _engine.powerMonitor(); mon != nullptr && mon->available()) {
+    if (_engine == nullptr) {
+        return;   // pool mode: no resident engine to baseline
+    }
+    if (auto* mon = _engine->powerMonitor(); mon != nullptr && mon->available()) {
         std::lock_guard lk{_powerStateMutex};
         _powerBaseline      = mon->snapshot();
         _powerLastStatus    = _powerBaseline;
@@ -63,8 +66,18 @@ SystemStatusBuilder::SystemStatusBuilder(runtime::InferenceEngine& engine,
 }
 
 json SystemStatusBuilder::buildInfo() const {
-    const auto& modelCfg = _engine.config();
-    const auto& tok      = _engine.tokenizer();
+    if (_engine == nullptr) {
+        // M-Munin.3 pool mode: no always-resident engine to describe. The
+        // servable model ids come from /v1/models (the ModelProvider); this
+        // static info block reports only the mode.
+        return json{
+            {"mode", "pooled_model_switch"},
+            {"note", "per-request model-switch pool: no always-resident "
+                     "engine; query /v1/models for servable ids"},
+        };
+    }
+    const auto& modelCfg = _engine->config();
+    const auto& tok      = _engine->tokenizer();
 
     // Model architecture + dims
     json model = {
@@ -113,13 +126,13 @@ json SystemStatusBuilder::buildInfo() const {
     // element_bytes is meaningless on Q8_0 (block-based); reports
     // block_bytes + block_elements so the same JSON shape covers all
     // three dtypes.
-    const auto kvD = _engine.kvDtype();
+    const auto kvD = _engine->kvDtype();
     const char* kvDName = (kvD == runtime::KvDtype::FP16 ? "fp16"
                          : kvD == runtime::KvDtype::Q8_0 ? "q8_0"
                          : kvD == runtime::KvDtype::FP8_E4M3 ? "fp8_e4m3"
                                                          : "f32");
     json kvCache = {
-        {"max_context_tokens", _engine.maxContextTokens()},
+        {"max_context_tokens", _engine->maxContextTokens()},
         {"layer_count",        modelCfg.blockCount},
         {"dtype",              kvDName},
         {"block_bytes",        runtime::kvBlockBytes(kvD)},
@@ -132,9 +145,9 @@ json SystemStatusBuilder::buildInfo() const {
     // `hipGetDeviceProperties` once the backend-neutral surface lands.
     json hardware;
 #ifdef MIMIRMIND_HAVE_L0
-    if (_engine.computeContextKind() == core::backend::BackendKind::LevelZero) {
-        const auto& devInfo  = _engine.ctx().info();
-        const auto& usmLim   = _engine.allocator().limits();
+    if (_engine->computeContextKind() == core::backend::BackendKind::LevelZero) {
+        const auto& devInfo  = _engine->ctx().info();
+        const auto& usmLim   = _engine->allocator().limits();
         hardware = {
         {"device_name",             devInfo.name},
         {"device_uuid",             devInfo.uuid},
@@ -153,7 +166,7 @@ json SystemStatusBuilder::buildInfo() const {
         // and see which backend is bound to this engine.
         hardware = {
             {"backend",   core::backend::BackendRegistry::name(
-                              _engine.computeContextKind())},
+                              _engine->computeContextKind())},
             {"note",      "detailed device descriptors are only wired "
                           "for the L0 backend today"},
         };
@@ -161,7 +174,7 @@ json SystemStatusBuilder::buildInfo() const {
 
     // GPU clock envelope — the static parts of /system/status.gpu_clock.
     json gpuClockEnvelope;
-    if (auto* gov = _engine.gpuClockGovernor();
+    if (auto* gov = _engine->gpuClockGovernor();
         gov != nullptr && gov->available()) {
         gpuClockEnvelope = {
             {"card_path",     std::string{gov->cardPath()}},
@@ -183,7 +196,7 @@ json SystemStatusBuilder::buildInfo() const {
 
     // Thermal profile — static limits only.
     json thermalProfile;
-    if (auto* guard = _engine.thermalGuard(); guard != nullptr) {
+    if (auto* guard = _engine->thermalGuard(); guard != nullptr) {
         const auto& p = guard->profile();
         thermalProfile = {
             {"name",                    p.name},
@@ -217,13 +230,13 @@ json SystemStatusBuilder::buildInfo() const {
 
     // Build / process identity.
     json build = json::object();
-    if (auto* det = _engine.perfRegressionDetector()) {
+    if (auto* det = _engine->perfRegressionDetector()) {
         build["internal_version"] = det->internalVersion();
     }
 
     // Fan envelope — static chip identity.
     json fanEnvelope;
-    if (auto* fc = _engine.fanController();
+    if (auto* fc = _engine->fanController();
         fc != nullptr && fc->available()) {
         fanEnvelope = {
             {"chip_name",         std::string{fc->chipName()}},
@@ -289,7 +302,7 @@ json SystemStatusBuilder::buildInfo() const {
             });
         }
     }
-    const auto engineKind = _engine.computeContextKind();
+    const auto engineKind = _engine->computeContextKind();
     json engineBackend = {
         {"kind",  core::backend::BackendRegistry::name(engineKind)},
         {"token", core::backend::tokenFor(engineKind, /*deviceIx=*/0)},
@@ -301,15 +314,15 @@ json SystemStatusBuilder::buildInfo() const {
     // finalizeLoad(), immutable thereafter for this engine instance).
     // Operators use this to tell "why is this instance single-session"
     // at a glance — reasoning field carries the raw probe inputs.
-    const auto& est = _engine.batchCapacity();
-    const auto& cfgServing = _engine.servingConfig();
+    const auto& est = _engine->batchCapacity();
+    const auto& cfgServing = _engine->servingConfig();
     json serving = {
         {"enable_batching",         cfgServing.enableBatching == core::config::TriState::Auto    ? "auto"
                                   : cfgServing.enableBatching == core::config::TriState::Force   ? "force"
                                                                                                  : "disable"},
         {"min_batch_for_enable",    cfgServing.minBatchForEnable},
         {"sustainable_batch",       est.sustainableBatch},
-        {"serving_class_enabled",   _engine.servingClassEnabled()},
+        {"serving_class_enabled",   _engine->servingClassEnabled()},
         {"probe_recommended",       est.servingClassRecommended},
         {"bandwidth_gbps",          est.bandwidthGBps},
         {"weight_bytes",            est.weightBytes},
@@ -347,7 +360,14 @@ json SystemStatusBuilder::buildInfo() const {
 }
 
 json SystemStatusBuilder::buildStatus() {
-    auto* guard = _engine.thermalGuard();
+    if (_engine == nullptr) {
+        // Pool mode: report only mode + in-flight requests (engine-independent).
+        return json{
+            {"mode",            "pooled_model_switch"},
+            {"current_request", _requestTracker.buildStatusBlock()},
+        };
+    }
+    auto* guard = _engine->thermalGuard();
     json body{
         {"profile_active", guard != nullptr},
     };
@@ -435,7 +455,11 @@ json SystemStatusBuilder::buildStatus() {
 }
 
 json SystemStatusBuilder::buildPerfRegressionBlock() const {
-    auto* det = _engine.perfRegressionDetector();
+    if (_engine == nullptr) {
+        return json{{"available", false},
+                    {"reason", "pooled model-switch mode — no resident engine"}};
+    }
+    auto* det = _engine->perfRegressionDetector();
     if (det == nullptr) {
         return json{
             {"available", false},
@@ -477,7 +501,11 @@ json SystemStatusBuilder::buildPerfRegressionBlock() const {
 }
 
 json SystemStatusBuilder::buildGpuClockBlock() const {
-    auto* gov = _engine.gpuClockGovernor();
+    if (_engine == nullptr) {
+        return json{{"available", false},
+                    {"reason", "pooled model-switch mode — no resident engine"}};
+    }
+    auto* gov = _engine->gpuClockGovernor();
     if (gov == nullptr || !gov->available()) {
 #ifdef MIMIRMIND_HAVE_CUDA
         // No sysfs governor (CUDA/GB10) — report the live SM clock via NVML.
@@ -522,7 +550,11 @@ json SystemStatusBuilder::buildGpuClockBlock() const {
 }
 
 json SystemStatusBuilder::buildFanBlock() const {
-    auto* fc = _engine.fanController();
+    if (_engine == nullptr) {
+        return json{{"available", false},
+                    {"reason", "pooled model-switch mode — no resident engine"}};
+    }
+    auto* fc = _engine->fanController();
     if (fc == nullptr) {
         return json{
             {"available", false},
@@ -547,10 +579,14 @@ json SystemStatusBuilder::buildFanBlock() const {
 }
 
 json SystemStatusBuilder::buildKernelsBlock() const {
+    if (_engine == nullptr) {
+        return json{{"available", false},
+                    {"reason", "pooled model-switch mode — no resident engine"}};
+    }
     json body = json::object();
 
     json matmulByType = json::object();
-    for (const auto& r : _engine.gpuMatmul().autotuneReport()) {
+    for (const auto& r : _engine->gpuMatmul().autotuneReport()) {
         json vecMsAtM  = json::object();
         json gemmMsAtM = json::object();
         for (std::size_t i = 0; i < r.mBuckets.size(); ++i) {
@@ -589,7 +625,7 @@ json SystemStatusBuilder::buildKernelsBlock() const {
     body["matmul"] = std::move(matmulByType);
 
     json fusedJson;
-    if (const auto* fq = _engine.fusedQkv()) {
+    if (const auto* fq = _engine->fusedQkv()) {
         fusedJson = json{
             {"disabled", fq->disabled()},
             {"blocks_fused",    fq->fusedCount()},
@@ -603,18 +639,18 @@ json SystemStatusBuilder::buildKernelsBlock() const {
     }
     body["fused_qkv"] = std::move(fusedJson);
 
-    body["selftest"] = std::string{_engine.gpuOps().selfTestStatus()};
+    body["selftest"] = std::string{_engine->gpuOps().selfTestStatus()};
 
     // Prefill-flash rollback surface — reports the two independent
     // toggles (features.flashPrefill, features.flashPrefillGqaQ8) as the
     // engine sees them post-config. Lets an operator verify a config
     // change actually took effect without diffing the startup log.
     body["prefill_flash"] = json{
-        {"enabled",           _engine.gpuOps().prefillFlashEnabled()},
-        {"gqa_q8_enabled",    _engine.gpuOps().prefillFlashGqaQ8Enabled()},
-        {"k_tile_q8",         _engine.gpuOps().prefillFlashKTileQ8()},
+        {"enabled",           _engine->gpuOps().prefillFlashEnabled()},
+        {"gqa_q8_enabled",    _engine->gpuOps().prefillFlashGqaQ8Enabled()},
+        {"k_tile_q8",         _engine->gpuOps().prefillFlashKTileQ8()},
         {"k_tile_q8_source",  std::string{
-            _engine.gpuOps().prefillFlashKTileQ8Source()}},
+            _engine->gpuOps().prefillFlashKTileQ8Source()}},
     };
 
     // M8.K.Q8_0-Reorder — features.q8_0Reorder as-configured plus the
@@ -624,17 +660,21 @@ json SystemStatusBuilder::buildKernelsBlock() const {
     // per_layer_model_proj weight. Prefill (M>1) still falls back to
     // native GEMM; the reorder kernel is matvec-only.
     body["q8_0_reorder"] = json{
-        {"mode",          std::string{_engine.gpuOps().q8_0ReorderModeName()}},
-        {"active",        _engine.gpuOps().q8_0ReorderTensorCount() > 0},
-        {"tensor_count",  _engine.gpuOps().q8_0ReorderTensorCount()},
-        {"total_bytes",   _engine.gpuOps().q8_0ReorderTotalBytes()},
+        {"mode",          std::string{_engine->gpuOps().q8_0ReorderModeName()}},
+        {"active",        _engine->gpuOps().q8_0ReorderTensorCount() > 0},
+        {"tensor_count",  _engine->gpuOps().q8_0ReorderTensorCount()},
+        {"total_bytes",   _engine->gpuOps().q8_0ReorderTotalBytes()},
     };
 
     return body;
 }
 
 json SystemStatusBuilder::buildPowerBlock() {
-    auto* mon = _engine.powerMonitor();
+    if (_engine == nullptr) {
+        return json{{"available", false},
+                    {"reason", "pooled model-switch mode — no resident engine"}};
+    }
+    auto* mon = _engine->powerMonitor();
     if (mon == nullptr || !mon->available()) {
 #ifdef MIMIRMIND_HAVE_CUDA
         // No RAPL power monitor (CUDA/GB10) — report the live GPU power draw via

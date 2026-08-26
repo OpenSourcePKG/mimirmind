@@ -43,6 +43,7 @@
 #include "runtime/thermal/ThermalGuard.hpp"
 #include "runtime/thermal/ThermalProfile.hpp"
 #include "server/ApiServer.hpp"
+#include "server/AttachedModelProvider.hpp"  // M-Munin.3 pool provider (2b)
 
 #include <atomic>
 #include <chrono>

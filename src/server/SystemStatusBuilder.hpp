@@ -30,7 +30,12 @@ class RequestTracker;
 /// status poll.
 class SystemStatusBuilder {
 public:
-    SystemStatusBuilder(runtime::InferenceEngine& engine,
+    /// `engine` may be nullptr in M-Munin.3 per-request model-switch (pool)
+    /// mode — there is no always-resident default engine. In that case the
+    /// info/status payloads report a reduced "pooled_model_switch" object and
+    /// the per-engine detail blocks report {available:false}. Eager (co-
+    /// resident) mode passes the default engine and behaves as before.
+    SystemStatusBuilder(runtime::InferenceEngine* engine,
                          RequestDispatcher&        dispatcher,
                          RequestTracker&           requestTracker,
                          std::string_view          modelId);
@@ -55,7 +60,7 @@ private:
     [[nodiscard]] nlohmann::json buildKernelsBlock() const;
     [[nodiscard]] nlohmann::json buildPowerBlock();
 
-    runtime::InferenceEngine& _engine;
+    runtime::InferenceEngine* _engine;    // nullptr in pool (model-switch) mode
     RequestDispatcher&        _dispatcher;
     RequestTracker&           _requestTracker;
     std::string               _modelId;

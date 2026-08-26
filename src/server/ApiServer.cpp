@@ -98,7 +98,7 @@ bool parsePemMaterial(const std::string& certPem, const std::string& keyPem,
 
 struct ApiServer::Impl {
     RequestDispatcher                     dispatcher;
-    runtime::InferenceEngine&             engine;    // == dispatcher.defaultEngine()
+    runtime::InferenceEngine*             engine;    // dispatcher.defaultEnginePtr() — null in pool mode
     ServerConfig                          cfg;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
     TlsMaterial                           tls;       // kept alive for `server`
@@ -145,7 +145,7 @@ struct ApiServer::Impl {
          std::vector<LoadedSpeaker> speakers)
         : dispatcher{std::move(in), c.modelId, drafter,
                      c.speculativeTargetId, c.speculative},
-          engine{dispatcher.defaultEngine()},
+          engine{dispatcher.defaultEnginePtr()},
           cfg{std::move(c)},
           tenantMetrics{cfg.tenantMetricsPath},
           statusBuilder{engine, dispatcher, requestTracker, cfg.modelId},
@@ -154,6 +154,10 @@ struct ApiServer::Impl {
           embeddingsHandler{std::move(embedders), cfg},
           transcriptionsHandler{std::move(transcribers), cfg},
           speechHandler{std::move(speakers), cfg} {
+        // M-Munin.3: in pool mode the dispatcher resolves each request through
+        // the provider (materialize-on-miss) instead of the eager engine table;
+        // `engine` (the default) is then null and status reports pool mode.
+        dispatcher.setModelProvider(cfg.modelProvider);
         makeServer();
         installRoutes();
     }

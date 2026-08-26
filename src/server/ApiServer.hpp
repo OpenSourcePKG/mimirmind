@@ -19,6 +19,9 @@ class InferenceEngine;
 namespace mimirmind::runtime::serving {
 class ContinuousBatcher;
 }
+namespace mimirmind::server {
+class ModelProvider;
+}
 namespace mimirmind::runtime::encoder {
 class RerankEngine;
 class EmbedEngine;
@@ -184,6 +187,13 @@ struct ServerConfig {
     /// continuous batching) instead of the serialised single-session
     /// generate() path. nullptr => classic per-engine-mutex generate().
     runtime::serving::ContinuousBatcher* batcher{nullptr};
+
+    /// M-Munin.3 per-request model-switch pool. Non-owning; the caller keeps
+    /// it alive for the server's lifetime. When set, the dispatcher resolves
+    /// each request's model through this provider (materialize-on-miss, evict
+    /// LRU) instead of the eager fixed engine table, and there is no always-
+    /// resident default engine. nullptr => eager, co-resident all-engines mode.
+    ModelProvider* modelProvider{nullptr};
 };
 
 /**
