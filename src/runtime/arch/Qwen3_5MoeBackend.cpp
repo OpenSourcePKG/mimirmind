@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <vector>
 #include <cstdlib>
 #include <fstream>
 #include <span>
@@ -1008,6 +1009,44 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     _ops.profileSection("rt.build");
     _ops.moeGroupBuildAsync(expIdxSlot, kwSlot, expOffset, rowSrcTok, rowKw,
                             asnToRow, R, nExperts, K);
+
+    // --- 5.22 OEA measure-first: unique-expert union at batched decode ------
+    // Env-gated diagnostic (MIMIRMIND_MOE_UNION_PROFILE). Only meaningful at
+    // nSeq>1 — a single-token decode has no batch to piggyback on. Reads
+    // expOffset back and counts non-empty expert groups = how many distinct
+    // expert weight matrices moe.gemm must load this step; that union is the
+    // ceiling OEA (batch-aware piggyback routing) can cut. Sync D2H (~1 KB),
+    // profile-run only; when the env is unset this whole block is skipped so
+    // the prod device-driven path is untouched (no D2H).
+    static const bool kOeaUnionProfile =
+        std::getenv("MIMIRMIND_MOE_UNION_PROFILE") != nullptr;
+    if (kOeaUnionProfile && nSeq > 1) {
+        std::vector<std::int32_t> hostOff(nExperts + 1);
+        _ops.readbackToHost(hostOff.data(), expOffset,
+                            (nExperts + 1) * sizeof(std::int32_t));
+        std::size_t unique = 0;
+        for (std::size_t e = 0; e < nExperts; ++e) {
+            if (hostOff[e + 1] > hostOff[e]) {
+                ++unique;
+            }
+        }
+        static long sumUnique = 0;
+        static long sumT      = 0;
+        static long nCalls    = 0;
+        sumUnique += static_cast<long>(unique);
+        sumT      += static_cast<long>(nSeq);
+        ++nCalls;
+        if ((nCalls % 256) == 0) {
+            MM_LOG_INFO(
+                "moe-oea",
+                "union-profile: avg unique={}/{} ({:.1f}%) @avg T={} over {} "
+                "MoE-layer-steps (this: layer={} T={} unique={} R={})",
+                sumUnique / nCalls, nExperts,
+                100.0 * static_cast<double>(sumUnique) /
+                    (static_cast<double>(nCalls) * static_cast<double>(nExperts)),
+                sumT / nCalls, nCalls, blockIdx, nSeq, unique, R);
+        }
+    }
 
     // --- gather activations into per-expert-contiguous rows (both paths) ---
     _ops.profileSection("rt.gather");
