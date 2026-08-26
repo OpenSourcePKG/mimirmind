@@ -665,6 +665,16 @@ public:
     void setKvDtype(KvDtype dtype);
     [[nodiscard]] KvDtype kvDtype() const noexcept { return _kvDtype; }
 
+    /// Paged serving-pool KV dtype, set from `serving.kvDtype` config. When
+    /// unset the serving path falls back to the MIMIRMIND_SERVING_KV_* env
+    /// flags, then F32 — so this is a config override, not a hard default.
+    /// Governs the CONTINUOUS-BATCHING paged pool only; the non-paged single-
+    /// session cache uses `_kvDtype` (setKvDtype).
+    void setServingKvDtype(KvDtype dtype) noexcept { _servingKvDtypeOverride = dtype; }
+    [[nodiscard]] std::optional<KvDtype> servingKvDtypeOverride() const noexcept {
+        return _servingKvDtypeOverride;
+    }
+
     /// Effective final-logit softcap applied to sampler + spec-dec verify.
     /// Sourced from `LlmConfig::finalLogitSoftcap` at model-load, then
     /// zeroed if the `MIMIRMIND_DISABLE_SOFTCAP=1` env override is set.
@@ -983,6 +993,7 @@ private:
     std::vector<float>                 _logitsHostScratch;
     std::size_t                        _maxContextTokens{8192}; // see setMaxContextTokens
     KvDtype                            _kvDtype{KvDtype::F32};    // see setKvDtype
+    std::optional<KvDtype>             _servingKvDtypeOverride{}; // see setServingKvDtype
     std::size_t                        _cacheMaxT    {0};   // max prompt-chunk scratch was sized for
     std::size_t                        _cacheVocabLm {0};   // lm-head vocab the logits buf fits
     std::vector<std::int32_t>          _cachedTokens;

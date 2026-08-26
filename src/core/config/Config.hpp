@@ -299,6 +299,14 @@ struct ServingSettings {
     // the "batching-overhead pays off around B=8" empirical threshold.
     std::size_t     minBatchForEnable{8};
 
+    // Paged serving-pool KV cache element type: "" (unset) / "f32" / "fp16"
+    // / "fp8". Sets the capacity tier for the CONTINUOUS-BATCHING paged KV
+    // pool (Bragi 5.14/5.16). Unset falls back to the MIMIRMIND_SERVING_KV_*
+    // env flags, then F32. This is the paged-pool analogue of runtime.kvDtype
+    // (which governs the non-paged single-session cache). fp8 ≈ 4× / fp16 ≈ 2×
+    // KV-memory drop → deeper long-context capacity at a small precision cost.
+    std::optional<std::string>  kvDtype{};
+
     // ---- M-Cuda.Batch Phase C knobs ---------------------------------
     //
     // Consumed by RequestScheduler / ChunkedPrefillScheduler /

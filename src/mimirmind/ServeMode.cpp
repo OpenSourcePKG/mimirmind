@@ -416,6 +416,16 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                             "back to f32", v);
             }
         }
+        // serving.kvDtype — paged serving-pool KV tier (config overrides the
+        // MIMIRMIND_SERVING_KV_* env flags; unset → env/F32 fallback in the
+        // serving path). Validated in Config parse to {f32,fp16,fp8}.
+        if (cfg.serving.kvDtype.has_value() && !cfg.serving.kvDtype->empty()) {
+            const std::string_view v{*cfg.serving.kvDtype};
+            if (v == "fp8")       e.setServingKvDtype(::mimirmind::runtime::KvDtype::FP8_E4M3);
+            else if (v == "fp16") e.setServingKvDtype(::mimirmind::runtime::KvDtype::FP16);
+            else if (v == "f32")  e.setServingKvDtype(::mimirmind::runtime::KvDtype::F32);
+            MM_LOG_INFO("main", "serving.kvDtype='{}' → paged serving-pool KV tier", v);
+        }
     };
 
     std::vector<std::unique_ptr<::mimirmind::runtime::InferenceEngine>> ownedEngines;

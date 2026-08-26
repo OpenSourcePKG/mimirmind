@@ -547,13 +547,23 @@ DiagnosticsSettings parseDiagnostics(std::string_view      path,
 ServingSettings parseServing(std::string_view      path,
                              const nlohmann::json& j) {
     checkKnownKeys(path, "serving", j,
-                   {"enableBatching", "minBatchForEnable",
+                   {"enableBatching", "minBatchForEnable", "kvDtype",
                     "tokenBudget", "maxActiveRequests",
                     "maxActiveRequestsPerTenant",
                     "preemptFreeBlockThreshold", "blockSize"});
     ServingSettings s{};
     s.enableBatching = parseTriState(path, "serving", j, "enableBatching",
                                      TriState::Auto);
+    s.kvDtype = readOpt<std::string>(path, "serving", j, "kvDtype");
+    if (s.kvDtype.has_value()) {
+        const auto& v = *s.kvDtype;
+        if (!v.empty() && v != "f32" && v != "fp16" && v != "fp8") {
+            fail(path, "serving.kvDtype='" + v +
+                       "' invalid — expected f32, fp16 or fp8 (the paged "
+                       "serving pool supports these; q8_0 is non-paged only "
+                       "via runtime.kvDtype)");
+        }
+    }
     if (const auto v = readOpt<std::size_t>(path, "serving", j,
                                             "minBatchForEnable"); v) {
         if (*v < 1 || *v > 1024) {

@@ -41,13 +41,20 @@ namespace {
     return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
 }
 
-[[nodiscard]] KvDtype servingKvDtype() noexcept {
+[[nodiscard]] KvDtype servingKvDtypeFromEnv() noexcept {
     // 5.16 FP8/E4M3 capacity tier takes precedence over the 5.14 FP16 tier
     // when both are set (FP8 is the deeper ~4× KV-memory drop). Both default
     // OFF → F32 baseline. FP8 is a CUDA/Bragi serving-paged-pool-only tier.
     if (envFlagSet("MIMIRMIND_SERVING_KV_FP8"))  return KvDtype::FP8_E4M3;
     if (envFlagSet("MIMIRMIND_SERVING_KV_FP16")) return KvDtype::FP16;
     return KvDtype::F32;
+}
+
+// Resolve the paged serving-pool KV dtype: the `serving.kvDtype` config
+// override (via InferenceEngine::setServingKvDtype) wins; when unset we keep
+// the legacy MIMIRMIND_SERVING_KV_* env flags, then F32. Config > env > F32.
+[[nodiscard]] KvDtype servingKvDtypeFor(const InferenceEngine& e) noexcept {
+    return e.servingKvDtypeOverride().value_or(servingKvDtypeFromEnv());
 }
 } // namespace
 
@@ -300,7 +307,7 @@ ServingSession::generateBatch(
     const std::size_t blocksPerSeq = (total + blockSize - 1) / blockSize;
     const std::size_t numBlocks    = nSeq * blocksPerSeq;
     serving::PagedKvPool pool(*_e._ops, nFullAttn, numBlocks, blockSize,
-                              nKvHeads, headDim, servingKvDtype());
+                              nKvHeads, headDim, servingKvDtypeFor(_e));
 
     SsmState ssm(*_e._ops, blockCount, _e._config.ssmStateElemsPerLayer(),
                  _e._config.ssmConvStateElemsPerLayer(), nSeq);
@@ -755,7 +762,7 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
                               : std::numeric_limits<std::size_t>::max();
     st->pool = std::make_unique<serving::PagedKvPool>(
         *_e._ops, nPoolLayers, st->numBlocks, st->blockSize, nKvHeads, headDim,
-        servingKvDtype());
+        servingKvDtypeFor(_e));
     st->ssm = std::make_unique<SsmState>(
         *_e._ops, st->blockCount, _e._config.ssmStateElemsPerLayer(),
         _e._config.ssmConvStateElemsPerLayer(), maxBatch);
@@ -832,7 +839,7 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
             // kv_commit_fp16 cast); F32 prefill writes the cache in place and
             // does not (5.14 I1).
             const bool prefillKvFp32Scratch =
-                (servingKvDtype() == KvDtype::FP16);
+                (servingKvDtypeFor(_e) == KvDtype::FP16);
             st->sbPrefill = allocBlockBuffers(
                 *_e._ops, _e._config, /*maxT=*/chunk, /*maxSeq=*/maxContext,
                 qkv.first, qkv.second, /*withFusedQkv=*/false,
