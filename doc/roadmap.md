@@ -300,10 +300,12 @@ Orthogonal to the milestone phases:
 - F16 / BF16: dequant routines present, no GPU kernels (X stays F32
   through the matmul). Used today only for the small norm/scale
   tensors that don't dominate.
-- Q5_K, Q3_K, IQ-family: not implemented. Adding any of them is a
-  one-class file under `src/compute/quant/` plus one switch case in
-  the registry plus, optionally, a SPIR-V kernel. The interface is
-  designed for it.
+- Q5_K and Q3_K: implemented across L0/Xe-LPG + CUDA + HIP (per-quant
+  `vec` matmul kernels; the Q3_K L0/OpenCL kernel `matmul_q3k_vec.cl`
+  landed 2026-08-26, parity-verified on the NUC). IQ-family: not
+  implemented — a one-class file under `src/compute/quant/` plus one
+  registry switch case plus, optionally, a SPIR-V kernel. The interface
+  is designed for it.
 
 See [`quants.md`](quants.md) for the implementation detail.
 

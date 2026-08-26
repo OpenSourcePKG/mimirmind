@@ -177,16 +177,20 @@ the Level-Zero / SPV-kernel side is verified against CPU reference math
 on real hardware. Command-List Replay (M-CLR) is live in production
 (−6.4 % decode on E4B, verified 2026-07-06).
 
-**Project Sleipnir** is the ongoing post-release performance and
-model-extension phase. In flight:
+**Project Sleipnir** is the post-release performance and
+model-extension phase. Where it landed:
 
-- **M10.2 — KV-Cache dtype layer** (F32 → FP16 → Q8_0). Halves KV reads
-  per attention call — the largest bandwidth-relevant lever for long
-  contexts. Phase 0 foundation committed locally.
-- **M-Ratatoskr — Gemma 4 MTP-drafter integration**. Google's official
-  Multi-Token-Prediction drafters (released 2026-05-05) paired with our
-  E2B/E4B/26B-A4B/31B targets. Projected 3× decode speedup once the
-  batched-verify GEMM path (M8.K) lands as a prerequisite.
+- **M10.2 — KV-Cache dtype layer** (F32 → FP16 → Q8_0). Halves (FP16) or
+  quarters (FP8/E4M3, CUDA/Bragi) KV reads per attention call. **FP16 KV
+  done**; the CUDA **FP8/E4M3 capacity tier** gives ~4× KV headroom at
+  fixed VRAM (env-gated). The largest bandwidth-relevant lever for long
+  contexts / concurrency headroom.
+- **M-Ratatoskr — Gemma 4 MTP-drafter / speculative decoding**. Concluded
+  a **net loss** on the optimised MoE baseline: on Xe-LPG the batched-verify
+  GEMM is hardware-blocked (no matrix engine), and on CUDA/Bragi MTP, DFlash
+  and OEA batch-aware routing were all built + measured but do not beat the
+  tuned batched decode. Reusable IP (drafter loaders, ReplaySSM fold) is
+  banked; revisit only on matrix-engine hardware or a different model.
 
 Mimir-1.0's release-blocking work is complete; the engine is ready to
 tag as RC1:
@@ -220,7 +224,7 @@ that compiled + probes available).
 |---|---|---|---|
 | **Level Zero** | Intel Xe-LPG (Meteor Lake iGPU, primary target) | production | F32 / F16 / BF16 + all quant matmuls (Q4_K / Q5_K / Q5_0 / Q6_K / Q8_0), flash prefill, DP4A, Command-List Replay |
 | **HIP / ROCm** | AMD RDNA3 (`gfx1101`, RX 7800 XT bring-up rig) | end-to-end `loadModel` proven on Qwen 2.5 (Schicht 6.0, 2026-07-17). Q8_0 native, non-Q8_0 dispatch through a CPU-fallback (Schicht 6.1) using the reference dequant paths — correctness first, native Q4_K / Q5_0 / Q6_K kernels on the follow-up roadmap | Q8_0 GPU + CPU-fallback for the rest |
-| **CUDA** | NVIDIA Blackwell (GB10 on DGX Spark — serving-class **Bragi** target) | bring-up. **Qwen3.5-MoE** (release name Qwen3.6-35B-A3B; HF `model_type: qwen3_5_moe`, arch `Qwen3_5MoeForConditionalGeneration`) hybrid MoE — internal arch id `qwen35moe`: full-attention + Gated DeltaNet linear attention + MoE — generates coherent text end-to-end on GB10. The batched-decode kernel axis — per-sequence recurrent state, per-token MoE routing, ragged flash-decode attention — is implemented and parity-verified bit-for-bit against the single-sequence path. PagedAttention + continuous-batching scheduler for multi-tenant serving in progress | F32 + Q4_K / Q5_K / Q6_K / Q8_0, GatedDeltaNet (AR + chunked prefill), fused-K MoE, flash decode |
+| **CUDA** | NVIDIA Blackwell (GB10 on DGX Spark — serving-class **Bragi** target) | bring-up. **Qwen3.5-MoE** (release name Qwen3.6-35B-A3B; HF `model_type: qwen3_5_moe`, arch `Qwen3_5MoeForConditionalGeneration`) hybrid MoE — internal arch id `qwen35moe`: full-attention + Gated DeltaNet linear attention + MoE — generates coherent text end-to-end on GB10. The batched-decode kernel axis — per-sequence recurrent state, per-token MoE routing, ragged flash-decode attention — is implemented and parity-verified bit-for-bit against the single-sequence path. PagedAttention + continuous-batching scheduler live for multi-tenant serving (mixed prefill+decode step default-on); NVFP4 weights, FP8/E4M3 KV capacity tier | F32 + Q4_K / Q5_K / Q6_K / Q8_0 + NVFP4, GatedDeltaNet (AR + chunked prefill), fused-K / expert-grouped MoE, split-K paged flash decode |
 | **CPU** | any x86-64 / ARM64 Linux | reference / fallback / oracle. Full `ComputeOps` interface for F32 KV cache (Qwen 2.5, Gemma 4 baseline); FP16 / Q8_0 KV, DP4A, MoE fused-K throw NotImplemented by design — those are hardware-specific fast paths with no CPU analogue worth writing before there's a perf target | scalar C++ (no SIMD yet), always compiled in |
 
 Level Zero is the Mimir-1.0 production target and where the single-user
@@ -239,10 +243,14 @@ under `src/core/gpu/<backend>/` (context) and `src/compute/<backend>/`
 ## What's coming
 
 **Project Sleipnir: Speed.** Odin's eight-legged mount. The
-post-Mimir-1.0 performance phase, targeting **~3× decode throughput**
-on E4B and E2B once M8.K (Xe-LPG-native GEMM) and M-Ratatoskr
-(Gemma 4 MTP-drafter integration) land. Bandwidth foundation (M10.2
-FP16 KV cache) is in flight now.
+post-Mimir-1.0 performance phase. The original **~3× decode** ambition
+(native GEMM + Gemma 4 MTP-drafter) turned out **hardware-blocked** on
+Meteor Lake Xe-LPG — it has no XMX/DPAS matrix engine, so a batched-verify
+GEMM can't be made sub-linear — and speculative decoding (MTP / DFlash)
+concluded a **net loss** against the optimised MoE baseline on *both*
+platforms. What did land: the KV-cache dtype layer (**FP16 KV** done) plus
+the CLR / prefill campaigns. On CUDA/Bragi this is joined by an **FP8/E4M3
+KV capacity tier** (~4× KV headroom at fixed VRAM).
 
 **Mimir-1.1: Concurrency.** The per-engine request mutex is already
 removed on the Level-Zero path by M9.1's backend-neutral slab batcher
