@@ -212,6 +212,7 @@ if(MIMIRMIND_ENABLE_L0)
 set(KERNEL_SOURCES
     kernels/cl/common/rmsnorm.cl
     kernels/cl/common/matmul_f32_vec.cl
+    kernels/cl/common/matmul_q3k_vec.cl
     kernels/cl/common/matmul_q4k_vec.cl
     kernels/cl/common/matmul_q5k_vec.cl
     kernels/cl/common/matmul_q6k_vec.cl
