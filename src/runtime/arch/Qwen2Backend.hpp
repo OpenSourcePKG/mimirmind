@@ -4,6 +4,7 @@
 #pragma once
 
 #include "runtime/arch/ArchBackend.hpp"
+#include "compute/ComputeBuffer.hpp"
 
 #include <cstddef>
 #include <string>
@@ -99,6 +100,14 @@ private:
     // (theta_i = pos * base^(-2i/headDim) / freqFactors[i]). Qwen2/2.5 GGUFs
     // carry no such tensor, so they keep plain RoPE (no behaviour change).
     const float*                   _ropeFreqs{nullptr};
+
+    // YaRN / rope_scaling long-context extension (roadmap 8.8). Backing store
+    // for the synthesised YaRN/linear freq_factors (populated by loadRopeFreqs
+    // only when the config carries a rope_scaling; otherwise empty and unused),
+    // plus the attention temperature (mscale) applied to the softmax scale.
+    // Dormant (byte-identical to today) for every checkpoint without scaling.
+    compute::ComputeBuffer         _ropeFreqsComputed{};
+    float                          _yarnMscale{1.0F};
 
     // True for the `llama` architecture (Llama / Orpheus), which uses
     // INTERLEAVED (GPT-J / LLAMA_ROPE_TYPE_NORM) RoPE — adjacent pairs

@@ -239,6 +239,10 @@ protected:
     const float*              _ropeFreqsForFullAttn{nullptr};
     /// Backing store for the synthesised p-RoPE freq_factors (see loadRopeFreqs).
     compute::ComputeBuffer    _ropeFreqsComputed{};
+    /// YaRN/rope_scaling attention temperature (mscale). 1.0 = no scaling; set
+    /// by loadRopeFreqs when the config carries a "yarn" rope_scaling. Applied
+    /// as a multiplier on the full-attention softmax scale (roadmap 8.8).
+    float                     _yarnMscale{1.0F};
 
     /// Active when InferenceEngine reads `diagnostics.parityDump` from
     /// config.json and passes the value via setParityDumpPrefix().

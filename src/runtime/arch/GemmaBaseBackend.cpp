@@ -5,6 +5,7 @@
 
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
+#include "compute/YarnRope.hpp"
 #include "model/FusedQkvWeights.hpp"
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/GgufTypes.hpp"
@@ -173,6 +174,62 @@ void GemmaBaseBackend::loadRopeFreqs() {
     } else {
         MM_LOG_INFO("gemma",
                     "no rope_freqs.weight — full-attn layers use plain RoPE");
+    }
+
+    // YaRN / rope_scaling long-context extension (roadmap 8.8). Config-gated:
+    // dormant unless the checkpoint ships a rope_scaling (current prod models
+    // do not → this whole block is skipped → byte-identical to today). When
+    // present it OVERRIDES the full-attention freq_factors above, combining the
+    // p-RoPE identity mask (dims beyond partial_rotary stay zero-padded) with
+    // the YaRN/linear frequency stretch, and sets the attention mscale. Applied
+    // to the GLOBAL (full-attention) layers, matching Gemma's scaling scheme.
+    if (!_config.ropeScalingType.empty() && _config.ropeScalingFactor > 1.0F &&
+        _config.ropeOrigMaxPos > 0) {
+        std::size_t maxHalfDim = 0, fullHeadDim = 0;
+        for (const auto& li : _layers) {
+            maxHalfDim = std::max(maxHalfDim, li.headDim / 2);
+            if (!li.isSwa) fullHeadDim = std::max(fullHeadDim, li.headDim);
+        }
+        if (fullHeadDim == 0) fullHeadDim = 2 * maxHalfDim;
+
+        std::vector<float> sv;                 // per-dim frequency factor
+        float mscale = 1.0F;
+        if (_config.ropeScalingType == "yarn") {
+            sv = compute::computeYarnFreqFactors(
+                fullHeadDim, _config.ropeFreqBase, _config.ropeScalingFactor,
+                _config.ropeOrigMaxPos, _config.ropeBetaFast,
+                _config.ropeBetaSlow);
+            mscale = static_cast<float>(
+                compute::yarnAttentionMscale(_config.ropeScalingFactor));
+        } else {                               // "linear" / uniform interpolation
+            sv.assign(fullHeadDim / 2, _config.ropeScalingFactor);
+        }
+
+        // Preserve the p-RoPE zero-pad: rotate only the first ropeAngles pairs.
+        std::size_t ropeAngles = maxHalfDim;
+        if (_config.ropePartialRotaryFull > 0.0F &&
+            _config.ropePartialRotaryFull < 1.0F) {
+            ropeAngles = static_cast<std::size_t>(
+                _config.ropePartialRotaryFull *
+                static_cast<float>(fullHeadDim)) / 2;
+        }
+        constexpr float kIdentity = 1.0e15F;
+        std::vector<float> factors(maxHalfDim, kIdentity);
+        for (std::size_t i = 0; i < maxHalfDim; ++i) {
+            factors[i] = (i < ropeAngles)
+                             ? (i < sv.size() ? sv[i] : 1.0F)
+                             : kIdentity;
+        }
+        _ropeFreqsComputed = _ops.allocate(maxHalfDim * sizeof(float));
+        _ops.uploadToDevice(_ropeFreqsComputed.as<float>(), factors.data(),
+                            maxHalfDim * sizeof(float));
+        _ropeFreqsForFullAttn = _ropeFreqsComputed.as<float>();
+        _yarnMscale = mscale;
+        MM_LOG_INFO("gemma",
+                    "rope_scaling active: type={} factor={} origMaxPos={} "
+                    "mscale={:.4f} (rotating first {}/{} pairs, rest identity)",
+                    _config.ropeScalingType, _config.ropeScalingFactor,
+                    _config.ropeOrigMaxPos, _yarnMscale, ropeAngles, maxHalfDim);
     }
 }
 
@@ -594,7 +651,7 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
                         cache.baseV(li.kvSourceLayer),
                         T, totalLen,
                         li.nHeads, li.nKvHeads, head_dim,
-                        curLen, /*scale=*/1.0F,
+                        curLen, /*scale=*/_yarnMscale,
                         attnOutBuf,
                         slidingWindow,
                         kvDtype);
@@ -777,7 +834,7 @@ void GemmaBaseBackend::runAttentionSectionBatched(
                             cache.baseV(li.kvSourceLayer),
                             1, totalLen,
                             li.nHeads, li.nKvHeads, head_dim,
-                            curLen, /*scale=*/1.0F,
+                            curLen, /*scale=*/_yarnMscale,
                             aRow,
                             slidingWindow,
                             KvDtype::F32);

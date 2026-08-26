@@ -5,6 +5,7 @@
 
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
+#include "compute/YarnRope.hpp"
 #include "model/FusedQkvWeights.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "model/LlmConfig.hpp"
@@ -68,6 +69,40 @@ Qwen2Backend::Qwen2Backend(const model::LlmConfig&        config,
                         "proportional RoPE disabled, using plain RoPE",
                         rf->nelements, halfDim);
         }
+    }
+
+    // YaRN / rope_scaling long-context extension (roadmap 8.8). Config-gated
+    // and dormant unless the checkpoint ships a rope_scaling — current Qwen2/
+    // 2.5 GGUFs do not, so this is skipped and behaviour is byte-identical.
+    // Only synthesised when no llama3 rope_freqs.weight was loaded above (the
+    // two scalings are mutually exclusive in practice). The factors route
+    // through the SAME kernel _ropeFreqs already feeds (interleaved for llama,
+    // NEOX-with-factors otherwise), and mscale multiplies the softmax scale.
+    if (_ropeFreqs == nullptr && !_config.ropeScalingType.empty() &&
+        _config.ropeScalingFactor > 1.0F && _config.ropeOrigMaxPos > 0) {
+        const std::size_t headDim = _config.headDim();
+        const std::size_t halfDim = headDim / 2;
+        std::vector<float> factors;
+        if (_config.ropeScalingType == "yarn") {
+            factors = compute::computeYarnFreqFactors(
+                headDim, _config.ropeFreqBase, _config.ropeScalingFactor,
+                _config.ropeOrigMaxPos, _config.ropeBetaFast,
+                _config.ropeBetaSlow);
+            _yarnMscale = static_cast<float>(
+                compute::yarnAttentionMscale(_config.ropeScalingFactor));
+        } else {                               // "linear" / uniform
+            factors.assign(halfDim, _config.ropeScalingFactor);
+        }
+        factors.resize(halfDim, 1.0F);
+        _ropeFreqsComputed = _ops.allocate(halfDim * sizeof(float));
+        _ops.uploadToDevice(_ropeFreqsComputed.as<float>(), factors.data(),
+                            halfDim * sizeof(float));
+        _ropeFreqs = _ropeFreqsComputed.as<float>();
+        MM_LOG_INFO("qwen2",
+                    "rope_scaling active: type={} factor={} origMaxPos={} "
+                    "mscale={:.4f} (headDim/2={} freq_factors synthesised)",
+                    _config.ropeScalingType, _config.ropeScalingFactor,
+                    _config.ropeOrigMaxPos, _yarnMscale, halfDim);
     }
 }
 
@@ -412,7 +447,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     // (synchronous matmul below) flushes the queue so attnOutBuf is
     // visible to it by the time it executes.
     trace("attention (GPU)");
-    const float attnScale = 1.0F /
+    const float attnScale = _yarnMscale /
         std::sqrt(static_cast<float>(head_dim));
     _ops.attentionAsync(qBuf,
                         cache.baseK(blockIdx),
