@@ -3279,12 +3279,38 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         useFp16GqaTc ? _prefillFp16GqaTcSmemBytes
       : useF32Mwtc  ? _prefillF32MwtcSmemBytes
       : std::size_t{0};
+    // Fix-3 diagnostic (MIMIRMIND_ATTN_TRACE): localise the ~7700-tok gemma4
+    // illegal-access. Log the chosen variant + dims BEFORE the launch, then
+    // sync AFTER so the fault is attributed to THIS kernel — the last
+    // "variant=…" line without a following "ok" names the crashing launch.
+    static const bool kAttnTrace = std::getenv("MIMIRMIND_ATTN_TRACE") != nullptr;
+    if (kAttnTrace) {
+        const char* variant =
+            useF32Mwtc     ? "F32Mwtc"
+          : useF32Tc       ? "F32Tc"
+          : useF32Gqa      ? "F32Gqa"
+          : useFp16GqaTc   ? "Fp16GqaTc"
+          : useFp16Tc      ? "Fp16Tc"
+          : useQ8Gqa       ? "Q8Gqa"
+                           : "base";
+        MM_LOG_INFO("attn-trace",
+                    "prefill-flash variant={} T_q={} T_kv={} nHeads={} "
+                    "nKvHeads={} headDim={} nQPerKv={} slidingWindow={} "
+                    "grid=({},{},{}) blockX={} smem={}",
+                    variant, T_q, positionOffset + T_q, nHeads, nKvHeads,
+                    headDim, nQPerKv, slidingWindow, dim0, dim1, dim2, blockX,
+                    smemBytes);
+    }
     kernel.launch(_ctx.stream(),
                   dim0,
                   dim1,
                   dim2,
                   blockX, 1, 1,
                   smemBytes);
+    if (kAttnTrace) {
+        _ctx.stream().synchronize();
+        MM_LOG_INFO("attn-trace", "  ok");
+    }
 }
 
 void GpuOps::attentionDecodeFlashAsync(const float* q, const void* k,
