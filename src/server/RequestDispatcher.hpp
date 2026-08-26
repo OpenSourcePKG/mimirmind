@@ -72,6 +72,11 @@ public:
     RequestDispatcher& operator=(RequestDispatcher&&)      = delete;
 
     [[nodiscard]] runtime::InferenceEngine&    defaultEngine() noexcept { return *_defaultEngine; }
+    /// Nullptr-safe accessor: the eager default engine, or nullptr in
+    /// M-Munin.3 pool mode (no always-resident default). Callers on paths that
+    /// can run under a ModelProvider MUST use this instead of defaultEngine()
+    /// so pool mode does not dereference a null default.
+    [[nodiscard]] runtime::InferenceEngine*    defaultEnginePtr() noexcept { return _defaultEngine; }
     [[nodiscard]] const std::string&           defaultId()     const noexcept { return _defaultId; }
     [[nodiscard]] const std::string&           defaultTitle()  const noexcept { return _defaultTitle; }
     [[nodiscard]] std::mutex&                  defaultMutex()  noexcept { return _defaultMutex; }

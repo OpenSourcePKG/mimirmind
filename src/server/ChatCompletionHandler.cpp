@@ -330,8 +330,14 @@ void ChatCompletionHandler::handle(const httplib::Request& req,
     // Thermal admission BEFORE we commit to a stream: a 503 must ship as
     // a plain JSON response, not as half a chunked SSE body. Uses the
     // default engine's thermal guard as a proxy for the whole process —
-    // per-engine thermal separation isn't a thing (single iGPU).
-    if (auto* guard = _dispatcher.defaultEngine().thermalGuard(); guard != nullptr) {
+    // per-engine thermal separation isn't a thing (single iGPU). In M-Munin.3
+    // pool mode there is no always-resident default engine (defaultEnginePtr
+    // is null); thermal admission is skipped there (MVP — thermal is a
+    // single-user/Sleipnir concern, not the pooled multi-model serving path).
+    auto* thermalEngine = _dispatcher.defaultEnginePtr();
+    if (auto* guard = thermalEngine != nullptr ? thermalEngine->thermalGuard()
+                                               : nullptr;
+        guard != nullptr) {
         try {
             guard->checkAdmission();
         } catch (const runtime::ThermalLimitExceeded& e) {
@@ -447,7 +453,7 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     // the engine mutex or call generate() concurrently.
     const bool useBatcher =
         (_cfg.batcher != nullptr &&
-         target->engine == &_dispatcher.defaultEngine());
+         target->engine == _dispatcher.defaultEnginePtr());
     if (useBatcher) {
         try {
             generated = runViaBatcher(*_cfg.batcher, promptIds, params,
@@ -968,7 +974,7 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
             // returning false (client gone) cancels the batcher request.
             const bool useBatcher =
                 (this->_cfg.batcher != nullptr &&
-                 targetEngine == &this->_dispatcher.defaultEngine());
+                 targetEngine == this->_dispatcher.defaultEnginePtr());
             if (useBatcher) {
                 try {
                     generated = runViaBatcher(*this->_cfg.batcher,
