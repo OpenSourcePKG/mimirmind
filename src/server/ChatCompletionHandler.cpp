@@ -16,6 +16,7 @@
 #include "model/Tokenizer.hpp"
 #include "core/log/Log.hpp"
 #include "core/security/ScopedTenant.hpp"
+#include "runtime/CudaContextPoison.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
 #include "runtime/spec/SpeculativeDecoder.hpp"
 #include "runtime/thermal/ThermalGuard.hpp"
@@ -506,6 +507,12 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             return;
         } catch (const std::exception& e) {
             MM_LOG_ERROR("server", "generate failed: {}", e.what());
+            // Fail-fast poison guard: an irrecoverable CUDA fault (e.g. a
+            // long-context gemma4 request) poisons the shared context, after
+            // which EVERY co-resident model (qwen incl.) serves garbage. Hard-
+            // exit for a clean supervisor restart instead of limping on a dead
+            // context. Recoverable errors fall through to the 500 below.
+            runtime::guardCudaPoison("single-session generate()", e.what());
             _metrics.recordError(tenant);
             sendError(res, 500, "server_error",
                       std::string{"generate: "} + e.what());
