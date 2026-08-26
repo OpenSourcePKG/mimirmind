@@ -33,9 +33,10 @@ PagedKvPool::PagedKvPool(compute::ComputeOps& ops,
     }
     // Only per-element dtypes are addressable by the paged pool's flat
     // element layout; Q8_0 (block-encoded) would need a block-aware pool.
-    if (_dtype != KvDtype::F32 && _dtype != KvDtype::FP16) {
+    if (_dtype != KvDtype::F32 && _dtype != KvDtype::FP16 &&
+        _dtype != KvDtype::FP8_E4M3) {
         throw std::invalid_argument(
-            "PagedKvPool: only F32 and FP16 KV dtypes are supported");
+            "PagedKvPool: only F32, FP16 and FP8_E4M3 KV dtypes are supported");
     }
 
     const std::size_t poolElems = _numBlocks * blockElems();
@@ -56,7 +57,8 @@ PagedKvPool::PagedKvPool(compute::ComputeOps& ops,
                 "allocated {} full-attn layers × 2 × {} blocks × {} tok/block "
                 "× {} kv_dim ({}) = {:.1f} MiB total",
                 _numLayers, _numBlocks, _blockSize, slotElems(),
-                _dtype == KvDtype::FP16 ? "fp16" : "fp32",
+                (_dtype == KvDtype::FP16 ? "fp16"
+                     : _dtype == KvDtype::FP8_E4M3 ? "fp8_e4m3" : "fp32"),
                 static_cast<double>(2 * _numLayers * poolBytes) /
                     (1024.0 * 1024.0));
 }
@@ -94,6 +96,15 @@ void PagedKvPool::writeToken(compute::ComputeOps& ops,
                               /*writeOffset=*/rowOff);
         ops.kvCommitFp16Async(vRow, _vPool[layer], /*T=*/1, /*kvDim=*/width,
                               /*writeOffset=*/rowOff);
+        return;
+    }
+    if (_dtype == KvDtype::FP8_E4M3) {
+        // Cast-on-scatter (F32 -> __nv_fp8_e4m3) via the shared fp8 commit —
+        // the 5.16 analogue of the fp16 host-loop fallback above.
+        ops.kvCommitFp8Async(kRow, _kPool[layer], /*T=*/1, /*kvDim=*/width,
+                             /*writeOffset=*/rowOff);
+        ops.kvCommitFp8Async(vRow, _vPool[layer], /*T=*/1, /*kvDim=*/width,
+                             /*writeOffset=*/rowOff);
         return;
     }
     const std::size_t off   = rowOff * width;

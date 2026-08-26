@@ -36,10 +36,18 @@ namespace mimirmind::runtime::engine {
 // untouched until the win is measured. The server (not a user toggle) will
 // own the final default once validated.
 namespace {
+[[nodiscard]] bool envFlagSet(const char* name) noexcept {
+    const char* e = std::getenv(name);
+    return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+}
+
 [[nodiscard]] KvDtype servingKvDtype() noexcept {
-    const char* e = std::getenv("MIMIRMIND_SERVING_KV_FP16");
-    const bool fp16 = (e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0'));
-    return fp16 ? KvDtype::FP16 : KvDtype::F32;
+    // 5.16 FP8/E4M3 capacity tier takes precedence over the 5.14 FP16 tier
+    // when both are set (FP8 is the deeper ~4× KV-memory drop). Both default
+    // OFF → F32 baseline. FP8 is a CUDA/Bragi serving-paged-pool-only tier.
+    if (envFlagSet("MIMIRMIND_SERVING_KV_FP8"))  return KvDtype::FP8_E4M3;
+    if (envFlagSet("MIMIRMIND_SERVING_KV_FP16")) return KvDtype::FP16;
+    return KvDtype::F32;
 }
 } // namespace
 

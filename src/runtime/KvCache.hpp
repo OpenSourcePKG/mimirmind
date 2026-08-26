@@ -29,6 +29,12 @@ enum class KvDtype : std::uint8_t {
                 // Phase 1a target. NOT per-element addressable; use
                 // blockElements()/blockBytes()/rowBytes() and route
                 // through the Q8_0-aware kernels.
+    FP8_E4M3 = 3, // 1 B per element — Bragi 5.16 serving-KV CAPACITY tier
+                  // (~4× KV-memory drop vs F32). Per-element addressable
+                  // like F32/FP16; E4M3 is unscaled (kv_scale == 1.0). Only
+                  // the CUDA serving paged pool + its attention/write kernels
+                  // support it; lossier than FP16 (3 mantissa bits) so it is
+                  // quality-gated, not a throughput lever.
 };
 
 /// Uniform-dtype element size. Only defined for F32 and FP16 — Q8_0
@@ -40,6 +46,7 @@ enum class KvDtype : std::uint8_t {
         case KvDtype::F32:  return 4;
         case KvDtype::FP16: return 2;
         case KvDtype::Q8_0: return 0;    // sentinel — use kvBlockBytes
+        case KvDtype::FP8_E4M3: return 1;
     }
     return 0;
 }
@@ -51,6 +58,7 @@ enum class KvDtype : std::uint8_t {
         case KvDtype::F32:  return 1;
         case KvDtype::FP16: return 1;
         case KvDtype::Q8_0: return 32;
+        case KvDtype::FP8_E4M3: return 1;
     }
     return 1;
 }
@@ -62,6 +70,7 @@ enum class KvDtype : std::uint8_t {
         case KvDtype::F32:  return 4;
         case KvDtype::FP16: return 2;
         case KvDtype::Q8_0: return 34;   // fp16 scale + 32 int8
+        case KvDtype::FP8_E4M3: return 1;
     }
     return 0;
 }

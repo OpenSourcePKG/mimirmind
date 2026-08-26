@@ -2072,6 +2072,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         const auto d = e->kvDtype();
         const char* dName = (d == ::mimirmind::runtime::KvDtype::FP16 ? "fp16"
                            : d == ::mimirmind::runtime::KvDtype::Q8_0 ? "q8_0"
+                           : d == ::mimirmind::runtime::KvDtype::FP8_E4M3 ? "fp8_e4m3"
                                                                       : "f32");
         MM_LOG_INFO("main",
                     "KV cache dtype for '{}': {} (block {} B × {} elem)",

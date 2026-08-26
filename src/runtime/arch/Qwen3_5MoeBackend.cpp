@@ -1534,9 +1534,14 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
             (ctx.hybDecodeCount > 0) ? ctx.hybSeqTPrefillDev : ctx.seqTDev,
             ctx.seqOffDev, ctx.startPosDev,
             nSeq, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
-            ctx.maxBlocksPerSeq, ctx.maxSeqT, attnScale, /*softcap=*/0.0f);
-    } else if (_forcePagedV1) {
-        // V1 is F32-only; the fp16 pool always routes through V2.
+            ctx.maxBlocksPerSeq, ctx.maxSeqT, attnScale, /*softcap=*/0.0f,
+            kvDtype);   // 5.16: fp16/fp8 pool → matching prefill-causal read
+    } else if (_forcePagedV1 && kvDtype == runtime::KvDtype::F32) {
+        // V1 is F32-only; a non-F32 (fp16/fp8) pool always routes through V2
+        // (which reinterprets the pool bytes per dtype). The dtype guard makes
+        // the "fp16 pool always routes through V2" invariant real — a bare
+        // MIMIRMIND_PAGED_V1=1 with a non-F32 pool would otherwise misread the
+        // packed bytes as F32 (5.16; pre-existing latent for fp16).
         _ops.pagedAttentionDecodeV1Async(
             attnOut, qBuf, keyBase, valBase, ctx.blockTablesDev, ctx.seqLensDev,
             nSeq, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),

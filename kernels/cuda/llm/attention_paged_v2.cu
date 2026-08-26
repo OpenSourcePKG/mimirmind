@@ -57,15 +57,20 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 // KV element load helper — widens the stored KV element to fp32 for the
 // (fp32) dot-product / accumulate. The compute path stays fp32 regardless
 // of the on-device KV dtype; only the load reinterprets. This is how the
 // fp16-KV entry point halves attention's growing-context read bandwidth
-// (5.14 I1) without touching the softmax/accumulate math.
+// (5.14 I1) without touching the softmax/accumulate math; the fp8 (E4M3)
+// entry point quarters it (5.16 capacity tier).
 __device__ __forceinline__ float pa_ldkv(const float* p, int i) { return p[i]; }
 __device__ __forceinline__ float pa_ldkv(const __half* p, int i) {
     return __half2float(p[i]);
+}
+__device__ __forceinline__ float pa_ldkv(const __nv_fp8_e4m3* p, int i) {
+    return static_cast<float>(p[i]);
 }
 
 // Placeholder launch bounds — the eventual body will retune these
@@ -91,6 +96,7 @@ __device__ __forceinline__ float pa_ldkv(const __half* p, int i) {
 #define PAGED_ATTN_KV_DTYPE_FP32  0
 #define PAGED_ATTN_KV_DTYPE_FP16  1
 #define PAGED_ATTN_KV_DTYPE_Q8_0  2
+#define PAGED_ATTN_KV_DTYPE_FP8   3
 
 // ---------------------------------------------------------------------
 // Kernel 1: per-partition attention. One workgroup per
@@ -309,6 +315,30 @@ void paged_attention_v2_fp16(
     const float scale)
 {
     paged_attention_v2_body<__half>(
+        tmp_out, exp_sums, max_logits, query, key_cache, value_cache,
+        block_tables, seq_lens, num_seqs, num_heads, num_kv_heads, head_size,
+        block_size, max_num_blocks_per_seq, max_num_partitions, scale);
+}
+
+// FP8/E4M3 variant (5.16 capacity tier): reinterprets key_cache / value_cache
+// as __nv_fp8_e4m3 (1 byte/elem, ~4× KV-memory drop vs F32). Selected by the
+// C++ wrapper when the paged pool is FP8. Same 16 args → same launch surface.
+extern "C" __global__ __launch_bounds__(PAGED_ATTN_V2_LOCAL)
+void paged_attention_v2_fp8(
+          float* __restrict__ tmp_out,
+          float* __restrict__ exp_sums,
+          float* __restrict__ max_logits,
+    const float* __restrict__ query,
+    const void*  __restrict__ key_cache,
+    const void*  __restrict__ value_cache,
+    const int*   __restrict__ block_tables,
+    const int*   __restrict__ seq_lens,
+    const int num_seqs, const int num_heads, const int num_kv_heads,
+    const int head_size, const int block_size,
+    const int max_num_blocks_per_seq, const int max_num_partitions,
+    const float scale)
+{
+    paged_attention_v2_body<__nv_fp8_e4m3>(
         tmp_out, exp_sums, max_logits, query, key_cache, value_cache,
         block_tables, seq_lens, num_seqs, num_heads, num_kv_heads, head_size,
         block_size, max_num_blocks_per_seq, max_num_partitions, scale);

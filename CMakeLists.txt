@@ -910,6 +910,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/attention_q8_0.cu
         kernels/cuda/llm/kv_quant_commit_q8_0.cu
         kernels/cuda/llm/kv_commit_fp16.cu
+        kernels/cuda/llm/kv_commit_fp8.cu
         kernels/cuda/common/matmul_q8_0_gemm.cu
         kernels/cuda/common/matmul_q8_0_gemm_v2.cu
         kernels/cuda/common/matmul_q8_0_mmq.cu

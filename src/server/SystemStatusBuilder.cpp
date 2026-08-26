@@ -116,6 +116,7 @@ json SystemStatusBuilder::buildInfo() const {
     const auto kvD = _engine.kvDtype();
     const char* kvDName = (kvD == runtime::KvDtype::FP16 ? "fp16"
                          : kvD == runtime::KvDtype::Q8_0 ? "q8_0"
+                         : kvD == runtime::KvDtype::FP8_E4M3 ? "fp8_e4m3"
                                                          : "f32");
     json kvCache = {
         {"max_context_tokens", _engine.maxContextTokens()},

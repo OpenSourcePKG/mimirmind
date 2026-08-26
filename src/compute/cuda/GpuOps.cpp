@@ -207,9 +207,12 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _pagedAttentionV1Kernel;
     core::cuda::CudaModule _pagedAttentionPrefillCausalModule;
     core::cuda::CudaKernel _pagedAttentionPrefillCausalKernel;
+    core::cuda::CudaKernel _pagedAttentionPrefillCausalFp16Kernel;  // fp16 KV (5.16)
+    core::cuda::CudaKernel _pagedAttentionPrefillCausalFp8Kernel;   // fp8 KV (5.16)
     core::cuda::CudaModule _pagedAttentionV2Module;
     core::cuda::CudaKernel _pagedAttentionV2Kernel;
     core::cuda::CudaKernel _pagedAttentionV2Fp16Kernel;   // fp16 KV (5.14 I1)
+    core::cuda::CudaKernel _pagedAttentionV2Fp8Kernel;    // fp8 KV (5.16)
     core::cuda::CudaKernel _pagedAttentionV2ReduceKernel;
     // Split-K V2 per-partition workspace (grown on demand; RAII-freed).
     compute::ComputeBuffer _pagedV2TmpOut;      // [slots, headSize] fp32
@@ -254,6 +257,9 @@ struct GpuOps::Impl {
     // FP16-KV staging commit (fp32 scratch -> fp16 cache cast).
     core::cuda::CudaModule _kvCommitFp16Module;
     core::cuda::CudaKernel _kvCommitFp16Kernel;
+    // FP8/E4M3-KV staging commit (fp32 scratch -> fp8 cache cast) — 5.16.
+    core::cuda::CudaModule _kvCommitFp8Module;
+    core::cuda::CudaKernel _kvCommitFp8Kernel;
 
     core::cuda::CudaModule _matmulQ8_0VecReorderModule;
     core::cuda::CudaKernel _matmulQ8_0VecReorderKernel;
@@ -330,6 +336,7 @@ struct GpuOps::Impl {
     core::cuda::CudaModule _kvWriteTokensModule;
     core::cuda::CudaKernel _kvWriteTokensKernel;
     core::cuda::CudaKernel _kvWriteTokensFp16Kernel;   // fp16 KV (5.14 I1)
+    core::cuda::CudaKernel _kvWriteTokensFp8Kernel;    // fp8 KV (5.16)
     // M-Cuda.MoeGroup Sub-Step E — device-driven grouped GEMM (tile schedule
     // build + single grouped NVFP4 launch; no expOffset D2H).
     core::cuda::CudaModule _moeGroupTilesModule;
@@ -461,11 +468,19 @@ struct GpuOps::Impl {
           _pagedAttentionPrefillCausalKernel{
               _pagedAttentionPrefillCausalModule.getFunction(
                   "paged_attention_prefill_causal")},
+          _pagedAttentionPrefillCausalFp16Kernel{
+              _pagedAttentionPrefillCausalModule.getFunction(
+                  "paged_attention_prefill_causal_fp16")},
+          _pagedAttentionPrefillCausalFp8Kernel{
+              _pagedAttentionPrefillCausalModule.getFunction(
+                  "paged_attention_prefill_causal_fp8")},
           _pagedAttentionV2Module{loadCudaModule(ctx, "attention_paged_v2")},
           _pagedAttentionV2Kernel{
               _pagedAttentionV2Module.getFunction("paged_attention_v2")},
           _pagedAttentionV2Fp16Kernel{
               _pagedAttentionV2Module.getFunction("paged_attention_v2_fp16")},
+          _pagedAttentionV2Fp8Kernel{
+              _pagedAttentionV2Module.getFunction("paged_attention_v2_fp8")},
           _pagedAttentionV2ReduceKernel{
               _pagedAttentionV2Module.getFunction("paged_attention_v2_reduce")},
 
@@ -527,6 +542,9 @@ struct GpuOps::Impl {
           _kvCommitFp16Module      {loadCudaModule(ctx, "kv_commit_fp16")},
           _kvCommitFp16Kernel      {
               _kvCommitFp16Module.getFunction("kv_commit_fp16")},
+          _kvCommitFp8Module       {loadCudaModule(ctx, "kv_commit_fp8")},
+          _kvCommitFp8Kernel       {
+              _kvCommitFp8Module.getFunction("kv_commit_fp8")},
 
           _matmulQ8_0VecReorderModule{loadCudaModule(ctx, "matmul_q8_0_vec_reorder")},
           _matmulQ8_0VecReorderKernel{
@@ -613,6 +631,8 @@ struct GpuOps::Impl {
               _kvWriteTokensModule.getFunction("kv_write_tokens_batched")},
           _kvWriteTokensFp16Kernel{
               _kvWriteTokensModule.getFunction("kv_write_tokens_batched_fp16")},
+          _kvWriteTokensFp8Kernel{
+              _kvWriteTokensModule.getFunction("kv_write_tokens_batched_fp8")},
           _moeGroupTilesModule     {loadCudaModule(ctx, "moe_group_tiles")},
           _moeGroupTilesKernel     {
               _moeGroupTilesModule.getFunction("moe_group_tiles")},
@@ -2176,8 +2196,11 @@ void GpuOps::writeKvTokensBatchedAsync(const float* kProj, const float* vProj,
     if (nSeq == 0 || width == 0) {
         return;
     }
-    // FP16 pool → cast-on-scatter variant; F32 → straight scatter (5.14 I1).
-    auto& k = (kvDtype == runtime::KvDtype::FP16)
+    // FP16/FP8 pool → cast-on-scatter variant; F32 → straight scatter
+    // (5.14 I1 / 5.16).
+    auto& k = (kvDtype == runtime::KvDtype::FP8_E4M3)
+                  ? _pimpl->_kvWriteTokensFp8Kernel
+              : (kvDtype == runtime::KvDtype::FP16)
                   ? _pimpl->_kvWriteTokensFp16Kernel
                   : _pimpl->_kvWriteTokensKernel;
     k.setPtr  (0, kProj);
@@ -2683,6 +2706,31 @@ void GpuOps::kvCommitFp16Async(const float* xSrc, void* kvDst,
     k.setPtr  (1, kvDst);
     k.setValue(2, toInt32(T,     "kvCommitFp16 T"));
     k.setValue(3, toInt32(kvDim, "kvCommitFp16 kvDim"));
+    k.setPtr  (4, _curLenSlotUsm);
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::kvCommitFp8Async(const float* xSrc, void* kvDst,
+                              std::size_t T, std::size_t kvDim,
+                              std::size_t writeOffset) {
+    if (T == 0 || kvDim == 0) {
+        return;
+    }
+    // 5.16 fp8/E4M3 twin of kvCommitFp16Async: writeOffset (= curLen) goes
+    // through the shared curLen slot so kvDst stays a stable layer-base pointer
+    // across replays; the kernel adds curLen*kvDim and casts each row to E4M3.
+    const std::int32_t offI =
+        toInt32(writeOffset, "kvCommitFp8 writeOffset");
+    stagedInt32ToDevice(_curLenSlotUsm, offI);
+
+    const std::size_t total = T * kvDim;
+    auto& k = _pimpl->_kvCommitFp8Kernel;
+    k.setPtr  (0, xSrc);
+    k.setPtr  (1, kvDst);
+    k.setValue(2, toInt32(T,     "kvCommitFp8 T"));
+    k.setValue(3, toInt32(kvDim, "kvCommitFp8 kvDim"));
     k.setPtr  (4, _curLenSlotUsm);
     k.launch(_ctx.stream(),
              groupsForN(total, kElementwiseLocalSize), 1, 1,
@@ -3369,15 +3417,22 @@ void GpuOps::pagedAttentionPrefillCausalAsync(
         const std::int32_t* startPos, std::size_t numSeqs, std::size_t numHeads,
         std::size_t numKvHeads, std::size_t headSize, std::size_t blockSize,
         std::size_t maxNumBlocksPerSeq, std::size_t maxT, float scale,
-        float softcap) {
+        float softcap, runtime::KvDtype kvDtype) {
     if (numSeqs == 0 || numHeads == 0 || headSize == 0 || maxT == 0) {
         return;
     }
     // 5.21-II paged causal prefill attention. grid (numHeads, numSeqs, maxT);
     // block (pq >= seqT[seq]) early-out. Same smem + streaming-softmax as V1, so
     // pq's output == a V1 decode with seq_len = startPos[seq]+pq+1.
+    // 5.16: pick the kernel variant by pool dtype so the mixed-step ragged
+    // prefill read reinterprets the pool bytes correctly (fp16/fp8 pools would
+    // otherwise be read as F32 and corrupt prefill attention).
     constexpr std::uint32_t kLocal = 128;   // == PAGED_ATTN_PREFILL_LOCAL
-    auto& kern = _pimpl->_pagedAttentionPrefillCausalKernel;
+    auto& kern = (kvDtype == runtime::KvDtype::FP8_E4M3)
+                     ? _pimpl->_pagedAttentionPrefillCausalFp8Kernel
+                 : (kvDtype == runtime::KvDtype::FP16)
+                     ? _pimpl->_pagedAttentionPrefillCausalFp16Kernel
+                     : _pimpl->_pagedAttentionPrefillCausalKernel;
     kern.setPtr  (0, out);
     kern.setPtr  (1, query);
     kern.setPtr  (2, keyCache);
@@ -3413,9 +3468,12 @@ void GpuOps::pagedAttentionDecodeV2Async(
     if (numSeqs == 0 || numHeads == 0 || headSize == 0) {
         return;
     }
-    // keyCache/valueCache are raw pool base addresses; when kvDtype==FP16 they
-    // point at __half elements and the fp16 kernel variant reinterprets them.
+    // keyCache/valueCache are raw pool base addresses; when kvDtype is FP16/FP8
+    // they point at __half / __nv_fp8_e4m3 elements and the matching kernel
+    // variant reinterprets them (5.14 I1 / 5.16).
     const bool fp16 = (kvDtype == runtime::KvDtype::FP16);
+    const bool fp8  = (kvDtype == runtime::KvDtype::FP8_E4M3);
+    const bool nonF32 = fp16 || fp8;
     // Split-K paged decode: partition the KV into kPartitionSize chunks so many
     // workgroups cover one (head, seq) in parallel (FlashDecoding / vLLM v2).
     // Pass 1 emits per-partition (acc, m, l); pass 2 merges via online-softmax.
@@ -3426,10 +3484,11 @@ void GpuOps::pagedAttentionDecodeV2Async(
     // The split-K kernels are fp32, no-softcap (16-arg CudaKernel cap). Route
     // short/unsplittable contexts and any soft-capped call to the single-pass
     // V1 which handles both.
-    // FP16 KV always takes the V2 path: V1 is F32-only, and all fp16 callers
-    // (qwen35moe full-attn) run with softcap==0, so a single-partition V2 is
-    // both correct and the only FP16-capable route. F32 keeps the V1 shortcut.
-    if (!fp16 && (maxNumPartitions <= 1 || softcap > 0.0f)) {
+    // FP16/FP8 KV always take the V2 path: V1 is F32-only, and all non-F32
+    // callers (qwen35moe full-attn) run with softcap==0, so a single-partition
+    // V2 is both correct and the only non-F32-capable route. F32 keeps the V1
+    // shortcut.
+    if (!nonF32 && (maxNumPartitions <= 1 || softcap > 0.0f)) {
         pagedAttentionDecodeV1Async(out, query, keyCache, valueCache,
                                     blockTables, seqLens, numSeqs, numHeads,
                                     numKvHeads, headSize, blockSize,
@@ -3453,7 +3512,8 @@ void GpuOps::pagedAttentionDecodeV2Async(
 
     // --- Pass 1: per-partition partial attention -------------------------
     {
-        auto& k = fp16 ? _pimpl->_pagedAttentionV2Fp16Kernel
+        auto& k = fp8  ? _pimpl->_pagedAttentionV2Fp8Kernel
+                : fp16 ? _pimpl->_pagedAttentionV2Fp16Kernel
                        : _pimpl->_pagedAttentionV2Kernel;
         k.setPtr  (0, tmpOut);
         k.setPtr  (1, expSums);

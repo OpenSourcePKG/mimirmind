@@ -87,6 +87,7 @@ const char* dtypeName(KvDtype d) noexcept {
         case KvDtype::F32:  return "f32";
         case KvDtype::FP16: return "fp16";
         case KvDtype::Q8_0: return "q8_0";
+        case KvDtype::FP8_E4M3: return "fp8_e4m3";
     }
     return "?";
 }

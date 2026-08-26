@@ -459,12 +459,13 @@ public:
             const std::int32_t* startPos, std::size_t numSeqs,
             std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
             std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
-            std::size_t maxT, float scale, float softcap) {
+            std::size_t maxT, float scale, float softcap,
+            runtime::KvDtype kvDtype = runtime::KvDtype::F32) {
         (void)out; (void)query; (void)keyCache; (void)valueCache;
         (void)blockTables; (void)seqT; (void)queryOff; (void)startPos;
         (void)numSeqs; (void)numHeads; (void)numKvHeads; (void)headSize;
         (void)blockSize; (void)maxNumBlocksPerSeq; (void)maxT; (void)scale;
-        (void)softcap;
+        (void)softcap; (void)kvDtype;
         throw std::runtime_error(
             "pagedAttentionPrefillCausalAsync: not supported on this backend");
     }
@@ -906,6 +907,20 @@ public:
         (void)xSrc; (void)kvDst; (void)T; (void)kvDim; (void)writeOffset;
         throw std::runtime_error(
             "kvCommitFp16Async: not supported on this backend");
+    }
+
+    /// Bragi 5.16 — fp8/E4M3 analogue of kvCommitFp16Async: commit an fp32
+    /// scratch [T, kvDim] into the fp8 serving cache at `writeOffset`, casting
+    /// each element to __nv_fp8_e4m3 (unscaled). CUDA-only; other backends
+    /// throw (serving FP8 KV is a CUDA/Bragi capacity tier).
+    virtual void kvCommitFp8Async(const float* xSrc,
+                                  void*        kvDst,
+                                  std::size_t  T,
+                                  std::size_t  kvDim,
+                                  std::size_t  writeOffset) {
+        (void)xSrc; (void)kvDst; (void)T; (void)kvDim; (void)writeOffset;
+        throw std::runtime_error(
+            "kvCommitFp8Async: not supported on this backend");
     }
 
     virtual void qkvSplitAsync(const float*     fused,

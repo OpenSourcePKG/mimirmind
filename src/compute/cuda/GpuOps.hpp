@@ -355,6 +355,10 @@ public:
                            std::size_t T, std::size_t kvDim,
                            std::size_t writeOffset) override;
 
+    void kvCommitFp8Async(const float* xSrc, void* kvDst,
+                          std::size_t T, std::size_t kvDim,
+                          std::size_t writeOffset) override;
+
     void qkvSplitAsync(const float* fused, float* Yq,
                        void* YkBase, void* YvBase,
                        std::size_t M, std::size_t Nq, std::size_t Nkv,
@@ -716,7 +720,8 @@ public:
             const std::int32_t* startPos, std::size_t numSeqs,
             std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
             std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
-            std::size_t maxT, float scale, float softcap) override;
+            std::size_t maxT, float scale, float softcap,
+            runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
     void pagedAttentionDecodeV2Async(
             float* out, const float* query, const float* keyCache,
             const float* valueCache, const std::int32_t* blockTables,
