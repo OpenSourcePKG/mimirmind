@@ -58,6 +58,13 @@ struct LlmConfig {
     float         attentionScale    {0.0F};
     float         ropeFreqBase      {10000.0F}; // global / full-attention layers
     float         ropeFreqBaseSwa   {10000.0F}; // sliding-window layers (Gemma 3/4)
+    // Gemma 4 p-RoPE: fraction of the full-attention head_dim that is rotated
+    // (partial_rotary_factor from rope_parameters.full_attention). 1.0 = full
+    // rotary. <1 (e.g. 0.25) = only the first partial*head_dim dims rotate, the
+    // rest are identity — the "proportional/pruned" RoPE the global layers use
+    // for long-context stability. When the checkpoint ships no rope_freqs.weight
+    // the backend synthesises the equivalent freq_factors from this.
+    float         ropePartialRotaryFull {1.0F};
     std::uint32_t slidingWindow     {0};        // 0 = disabled (Gemma 3+ uses 4096)
 
     // Gemma 3/4 sliding-window-attention pattern. Empty = all layers are

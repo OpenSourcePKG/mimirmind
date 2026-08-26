@@ -1030,6 +1030,14 @@ void GpuOps::readbackToHost(void* hostDst, const void* deviceSrc,
     _ctx.allocator().copyD2H(hostDst, deviceSrc, bytes);
 }
 
+void GpuOps::uploadToDevice(void* deviceDst, const void* hostSrc,
+                            std::size_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    _ctx.allocator().copyH2D(deviceDst, hostSrc, bytes);
+}
+
 // Schritt 3c.2 — neutral buffer factory. Zero-byte request skips the
 // allocator to keep parity with the L0 side and with the empty
 // ComputeBuffer default-ctor semantics. The deleter closure captures

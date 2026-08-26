@@ -466,6 +466,8 @@ public:
     void profileStepEnd() override;
     void readbackToHost(void* hostDst, const void* deviceSrc,
                         std::size_t bytes) override;
+    void uploadToDevice(void* deviceDst, const void* hostSrc,
+                        std::size_t bytes) override;
 
     // Schritt 3c.2 — neutral buffer factory. Routes through the shared
     // `CudaMemoryAllocator` in `CudaAllocKind::Device` mode and installs

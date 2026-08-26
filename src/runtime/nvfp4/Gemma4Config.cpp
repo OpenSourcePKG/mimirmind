@@ -91,6 +91,16 @@ model::LlmConfig parseGemma4SafetensorsConfig(std::string_view configJson) {
         };
         ropeFull = theta("full_attention", ropeFull);
         ropeSwa  = theta("sliding_attention", ropeSwa);
+        // p-RoPE: the full-attention (global) layers rotate only
+        // partial_rotary_factor * head_dim dims. rope_type "proportional".
+        if (rp.contains("full_attention") && rp["full_attention"].is_object()) {
+            const auto& fa = rp["full_attention"];
+            if (fa.contains("partial_rotary_factor") &&
+                fa["partial_rotary_factor"].is_number()) {
+                cfg.ropePartialRotaryFull =
+                    fa["partial_rotary_factor"].get<float>();
+            }
+        }
     }
     cfg.ropeFreqBase    = ropeFull;
     cfg.ropeFreqBaseSwa = ropeSwa;

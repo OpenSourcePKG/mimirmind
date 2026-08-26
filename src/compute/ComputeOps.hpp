@@ -1147,6 +1147,17 @@ public:
                                 const void* deviceSrc,
                                 std::size_t bytes) = 0;
 
+    /// Host → device copy (the inverse of readbackToHost). For small,
+    /// load-time host-computed tables (e.g. the gemma4 p-RoPE freq_factors
+    /// derived from partial_rotary_factor). Default: unsupported; CUDA
+    /// overrides via the allocator's H2D copy. Not a hot-path primitive.
+    virtual void uploadToDevice(void*       deviceDst,
+                                const void* hostSrc,
+                                std::size_t bytes) {
+        (void)deviceDst; (void)hostSrc; (void)bytes;
+        throw std::runtime_error("uploadToDevice: not supported on this backend");
+    }
+
     // ---- Allocation (Schritt 3c.2) ------------------------------------
     //
     // Neutral buffer factory. Consumers that used to construct

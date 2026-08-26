@@ -16,6 +16,7 @@
 #include "runtime/perf/OpProfiler.hpp"
 
 #include <algorithm>
+#include <vector>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -128,6 +129,47 @@ void GemmaBaseBackend::loadRopeFreqs() {
                         "proportional RoPE disabled, full-attn layers will "
                         "use plain RoPE", rf->nelements, maxHalfDim);
         }
+    } else if (_config.ropePartialRotaryFull > 0.0F &&
+               _config.ropePartialRotaryFull < 1.0F) {
+        // No rope_freqs.weight shipped (gemma4 NVFP4 export), but the global
+        // layers use PARTIAL rotary (p-RoPE): rotate only the first
+        // ropeAngles = (partial_rotary_factor * head_dim)/2 pairs, at the
+        // standard base^(-2i/head_dim) angle; the rest are identity. The
+        // rope-with-factors kernel computes theta_i = pos*base^(-2i/head_dim)
+        // / factors[i], so factor 1.0 keeps the standard angle for the rotated
+        // pairs and a huge factor drives theta_i -> 0 (cos=1, sin=0, i.e. the
+        // vLLM gemma4_rope zero-pad) for the rest. This is the fix for the
+        // long-context garbage: plain (full) RoPE on these SWA-trained-context
+        // global layers extrapolates badly and corrupts past ~a few k tokens.
+        std::size_t maxHalfDim  = 0;
+        std::size_t fullHeadDim = 0;
+        for (const auto& li : _layers) {
+            maxHalfDim = std::max(maxHalfDim, li.headDim / 2);
+            if (!li.isSwa) {
+                fullHeadDim = std::max(fullHeadDim, li.headDim);
+            }
+        }
+        if (fullHeadDim == 0) {
+            fullHeadDim = 2 * maxHalfDim;   // all-SWA fallback (shouldn't happen)
+        }
+        const std::size_t ropeAngles =
+            static_cast<std::size_t>(_config.ropePartialRotaryFull *
+                                     static_cast<float>(fullHeadDim)) / 2;
+        std::vector<float> factors(maxHalfDim, 1.0F);
+        constexpr float kIdentity = 1.0e15F;   // theta_i = pos*base^.../f -> ~0
+        for (std::size_t i = ropeAngles; i < maxHalfDim; ++i) {
+            factors[i] = kIdentity;
+        }
+        _ropeFreqsComputed = _ops.allocate(maxHalfDim * sizeof(float));
+        _ops.uploadToDevice(_ropeFreqsComputed.as<float>(), factors.data(),
+                            maxHalfDim * sizeof(float));
+        _ropeFreqsForFullAttn = _ropeFreqsComputed.as<float>();
+        MM_LOG_INFO("gemma",
+                    "p-RoPE synthesised (no rope_freqs.weight shipped) — "
+                    "partial_rotary_factor={:.3f}: rotating the first {}/{} "
+                    "pairs of the full-attn head_dim={}, rest identity",
+                    _config.ropePartialRotaryFull, ropeAngles, maxHalfDim,
+                    fullHeadDim);
     } else {
         MM_LOG_INFO("gemma",
                     "no rope_freqs.weight — full-attn layers use plain RoPE");

@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include "compute/ComputeBuffer.hpp"
+
 namespace mimirmind::compute {
 class ComputeMatmul;
 class ComputeOps;
@@ -230,8 +232,13 @@ protected:
     std::vector<LayerInfo>    _layers;
 
     /// USM pointer to the global `rope_freqs.weight` (F32 [head_dim/2])
-    /// used as `freq_factors` for full-attention layers only.
+    /// used as `freq_factors` for full-attention layers only. Points either at
+    /// the loaded rope_freqs.weight tensor OR, when the checkpoint ships none
+    /// but the config has partial_rotary_factor<1 (gemma4 NVFP4), at the
+    /// synthesised p-RoPE factors in `_ropeFreqsComputed`.
     const float*              _ropeFreqsForFullAttn{nullptr};
+    /// Backing store for the synthesised p-RoPE freq_factors (see loadRopeFreqs).
+    compute::ComputeBuffer    _ropeFreqsComputed{};
 
     /// Active when InferenceEngine reads `diagnostics.parityDump` from
     /// config.json and passes the value via setParityDumpPrefix().
