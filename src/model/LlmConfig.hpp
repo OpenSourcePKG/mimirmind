@@ -65,6 +65,16 @@ struct LlmConfig {
     // for long-context stability. When the checkpoint ships no rope_freqs.weight
     // the backend synthesises the equivalent freq_factors from this.
     float         ropePartialRotaryFull {1.0F};
+
+    // YaRN / rope_scaling long-context extension (roadmap 8.8). Empty type =
+    // no scaling (base RoPE). "yarn" → NTK-by-parts freq interpolation applied
+    // DYNAMICALLY: only when a request's length exceeds ropeOrigMaxPos, so
+    // short/normal prompts stay bit-identical to base RoPE. See compute/YarnRope.hpp.
+    std::string   ropeScalingType   {};          // "" | "yarn" | "linear"
+    float         ropeScalingFactor {1.0F};      // extension scale (e.g. 4)
+    std::uint32_t ropeOrigMaxPos    {0};         // original_max_position_embeddings
+    float         ropeBetaFast      {32.0F};     // YaRN high-freq correction
+    float         ropeBetaSlow      {1.0F};      // YaRN low-freq correction
     std::uint32_t slidingWindow     {0};        // 0 = disabled (Gemma 3+ uses 4096)
 
     // Gemma 3/4 sliding-window-attention pattern. Empty = all layers are
