@@ -92,6 +92,7 @@ struct BlockBuffers {
     ComputeBuffer moeDownCompact; // [nRowsMax, d_model]
 
     // M-Cuda.MoeGroup — device token-grouping build outputs (moe_group_build).
+    ComputeBuffer moeOeaActive;   // [nExperts] int32 OEA active-expert mask (5.22)
     ComputeBuffer moeGroupOffset; // [nExperts+1] int32 exclusive prefix sum
     ComputeBuffer moeGroupRowTok; // [nRowsMax]   int32 row -> source token
     ComputeBuffer moeGroupRowKw;  // [nRowsMax]   f32   row -> router weight

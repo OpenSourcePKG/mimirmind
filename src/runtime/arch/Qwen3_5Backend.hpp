@@ -436,6 +436,13 @@ protected:
     // for the perf measurement; default off.
     bool _q8Dp4a{false};
 
+    // 5.22 OEA — Opportunistic Expert Activation (batch-aware routing). Default
+    // OFF, lossy. MinShare = expert kept if shared by >= this many batch tokens;
+    // MaxBatch caps OEA to decode-sized batches (prefill must not be rerouted).
+    bool        _moeOeaEnabled{false};
+    int         _moeOeaMinShare{2};
+    std::size_t _moeOeaMaxBatch{128};
+
     // Chunked GatedDeltaNet prefill (K0->K1->K2, M-Q3N.4) auto-gate.
     //
     // For a prefill of length T the delta-rule step runs either the

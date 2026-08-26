@@ -259,6 +259,10 @@ public:
                             float* rowKw, std::int32_t* asnToRow,
                             std::size_t R, std::size_t nExperts,
                             std::size_t K) override;
+    void moeOeaRerouteAsync(const float* logits, std::int32_t* expIdx,
+                            float* kw, std::int32_t* active, std::size_t T,
+                            std::size_t nExperts, std::size_t K, int minShare,
+                            float wScale) override;
     void moeGatherRowsAsync(const float* x, const std::int32_t* rowSrcTok,
                             float* xCompact, std::size_t dModel,
                             std::size_t R) override;

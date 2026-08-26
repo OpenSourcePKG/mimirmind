@@ -328,6 +328,10 @@ struct GpuOps::Impl {
     // row gather, deterministic expert-output scatter).
     core::cuda::CudaModule _moeGroupBuildModule;
     core::cuda::CudaKernel _moeGroupBuildKernel;
+    // 5.22 OEA — batch-aware routing rewrite (active-mask + reroute).
+    core::cuda::CudaModule _moeOeaModule;
+    core::cuda::CudaKernel _moeOeaActiveMaskKernel;
+    core::cuda::CudaKernel _moeOeaRerouteKernel;
     core::cuda::CudaModule _moeGatherRowsModule;
     core::cuda::CudaKernel _moeGatherRowsKernel;
     core::cuda::CudaModule _moeScatterExpertOutModule;
@@ -620,6 +624,11 @@ struct GpuOps::Impl {
           _moeGroupBuildModule     {loadCudaModule(ctx, "moe_group_build")},
           _moeGroupBuildKernel     {
               _moeGroupBuildModule.getFunction("moe_group_build")},
+          _moeOeaModule            {loadCudaModule(ctx, "moe_oea")},
+          _moeOeaActiveMaskKernel  {
+              _moeOeaModule.getFunction("oea_active_mask")},
+          _moeOeaRerouteKernel     {
+              _moeOeaModule.getFunction("oea_reroute")},
           _moeGatherRowsModule     {loadCudaModule(ctx, "moe_gather_rows")},
           _moeGatherRowsKernel     {
               _moeGatherRowsModule.getFunction("moe_gather_rows")},
@@ -2150,6 +2159,43 @@ void GpuOps::moeGroupBuildAsync(const std::int32_t* expIdx, const float* kw,
     // v2: one block, 256 threads — parallel zero/publish + shared-mem histogram/
     // scan/scatter on thread 0 (bit-identical to the CPU golden; see kernel).
     k.launch(_ctx.stream(), 1, 1, 1, 256, 1, 1);
+}
+
+void GpuOps::moeOeaRerouteAsync(const float* logits, std::int32_t* expIdx,
+                                float* kw, std::int32_t* active, std::size_t T,
+                                std::size_t nExperts, std::size_t K,
+                                int minShare, float wScale) {
+    if (T == 0 || nExperts == 0 || K == 0) {
+        return;
+    }
+    const std::int32_t nExpertsI = toInt32(nExperts, "oea nExperts");
+    const std::int32_t Ki        = toInt32(K,        "oea K");
+    const std::int32_t Ri        = toInt32(T * K,    "oea R");
+
+    // 1) Build the active-expert mask (one block; shared histogram over nExperts).
+    {
+        auto& k = _pimpl->_moeOeaActiveMaskKernel;
+        k.setPtr  (0, expIdx);
+        k.setPtr  (1, active);
+        k.setValue(2, Ri);
+        k.setValue(3, nExpertsI);
+        k.setValue(4, Ki);
+        k.setValue(5, static_cast<std::int32_t>(minShare));
+        const std::size_t smemBytes = nExperts * sizeof(std::int32_t);
+        k.launch(_ctx.stream(), 1, 1, 1, 256, 1, 1, smemBytes);
+    }
+    // 2) Re-select each token's top-K among the active set (one warp per token).
+    {
+        auto& k = _pimpl->_moeOeaRerouteKernel;
+        k.setPtr  (0, logits);
+        k.setPtr  (1, active);
+        k.setPtr  (2, expIdx);
+        k.setPtr  (3, kw);
+        k.setValue(4, nExpertsI);
+        k.setValue(5, Ki);
+        k.setValue(6, wScale);
+        k.launch(_ctx.stream(), static_cast<std::uint32_t>(T), 1, 1, 32, 1, 1);
+    }
 }
 
 void GpuOps::moeGatherRowsAsync(const float* x, const std::int32_t* rowSrcTok,

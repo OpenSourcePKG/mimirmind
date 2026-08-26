@@ -164,6 +164,8 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         b.moeGroupRowTok = ops.allocate(nRowsMax * sizeof(std::int32_t));
         b.moeGroupRowKw  = ops.allocate(nRowsMax * sizeof(float));
         b.moeGroupAsnRow = ops.allocate(nRowsMax * sizeof(std::int32_t));
+        // 5.22 OEA — [nExperts] active-expert mask scratch (batch-aware reroute).
+        b.moeOeaActive   = ops.allocate(config.expertCount * sizeof(std::int32_t));
 
         // M-Cuda.MoeGroup Sub-Step E — tile-schedule scratch. Static upper
         // bound maxTiles = ceil(nRowsMax/kMoeTileM) + nExperts, so the grouped-

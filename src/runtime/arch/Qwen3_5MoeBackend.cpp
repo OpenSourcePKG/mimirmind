@@ -130,6 +130,23 @@ Qwen3_5MoeBackend::Qwen3_5MoeBackend(const model::LlmConfig&       config,
     }
     _q8Dp4a               = (std::getenv("MIMIRMIND_Q8_DP4A") != nullptr);
     _moeDeviceTopKEnabled = (std::getenv("MIMIRMIND_MOE_DEVICE_TOPK") != nullptr);
+    // 5.22 OEA — batch-aware routing (default OFF, lossy). MINSHARE = an expert
+    // shared by >= this many batch tokens is kept; singletons drop. MAXBATCH
+    // caps OEA to decode-sized batches (prefill chunks are much larger and must
+    // NOT be OEA-rerouted — the union there is legitimately near-full).
+    _moeOeaEnabled = (std::getenv("MIMIRMIND_MOE_OEA") != nullptr);
+    if (const char* ms = std::getenv("MIMIRMIND_MOE_OEA_MINSHARE")) {
+        const int v = std::atoi(ms);
+        if (v >= 1) {
+            _moeOeaMinShare = v;
+        }
+    }
+    if (const char* mb = std::getenv("MIMIRMIND_MOE_OEA_MAXBATCH")) {
+        const int v = std::atoi(mb);
+        if (v >= 2) {
+            _moeOeaMaxBatch = static_cast<std::size_t>(v);
+        }
+    }
 }
 
 // Polymorphic FFN seam (5.20): routed top-K experts + gated shared expert. When
@@ -1004,6 +1021,19 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     _ops.profileSection("rt.topk");
     _ops.moeTopKRouteDeviceAsync(upOutBuf, expIdxSlot, kwSlot,
                                  nSeq, nExperts, K, wScale);
+
+    // --- 5.22 OEA: batch-aware reroute to cut the unique-expert union -------
+    // Rewrites expIdxSlot/kwSlot in place (top-K among the batch's active-expert
+    // set) so the grouped GEMM below loads fewer distinct expert weights. Decode
+    // batches only: T==1 has no batch to piggyback on, and prefill chunks (T
+    // large) must NOT be rerouted (their near-full union is legitimate), so cap
+    // at _moeOeaMaxBatch. Lossy → env-gated, default OFF (MIMIRMIND_MOE_OEA).
+    if (_moeOeaEnabled && nSeq > 1 && nSeq <= _moeOeaMaxBatch) {
+        _ops.profileSection("rt.oea");
+        _ops.moeOeaRerouteAsync(upOutBuf, expIdxSlot, kwSlot,
+                                s.moeOeaActive.as<std::int32_t>(),
+                                nSeq, nExperts, K, _moeOeaMinShare, wScale);
+    }
 
     // --- group the T*K assignments by expert (device counting sort) --------
     _ops.profileSection("rt.build");

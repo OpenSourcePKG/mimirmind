@@ -539,6 +539,24 @@ public:
         throw std::runtime_error(
             "moeGroupBuildAsync: not supported on this backend");
     }
+
+    /// Bragi 5.22 OEA — batch-aware routing rewrite. Reduces the number of
+    /// UNIQUE experts activated across a T>1 decode batch by rewriting the
+    /// [T,K] top-K routing (expIdx/kw) in place: an expert stays active if it
+    /// is any token's top-1 or is shared by >= minShare tokens; each token then
+    /// re-selects its top-K among the active set (from `logits`, renormalised).
+    /// `active` is a caller-owned [nExperts] int32 scratch. LOSSY; CUDA-only,
+    /// gated by the caller. Default: unsupported.
+    /// See kernels/cuda/llm/moe_oea.cu.
+    virtual void moeOeaRerouteAsync(const float* logits, std::int32_t* expIdx,
+                                    float* kw, std::int32_t* active,
+                                    std::size_t T, std::size_t nExperts,
+                                    std::size_t K, int minShare, float wScale) {
+        (void)logits; (void)expIdx; (void)kw; (void)active; (void)T;
+        (void)nExperts; (void)K; (void)minShare; (void)wScale;
+        throw std::runtime_error(
+            "moeOeaRerouteAsync: not supported on this backend");
+    }
     virtual void moeGatherRowsAsync(const float* x, const std::int32_t* rowSrcTok,
                                     float* xCompact, std::size_t dModel,
                                     std::size_t R) {
