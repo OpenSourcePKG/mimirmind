@@ -22,3 +22,4 @@ usbboot/
 /doc/note.txt
 # stray npm lockfile — this is a C++/CMake repo, no JS runtime dependency.
 /package-lock.json
+/doc/book/
