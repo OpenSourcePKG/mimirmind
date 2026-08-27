@@ -70,6 +70,7 @@ void Gemma4MoeBackend::runBlock(std::size_t   blockIdx,
         if (diag) MM_LOG_INFO("blkdiag-g4m", "blk0 {}", tag);
     };
     trace("enter (moe)");
+    _ops.profileSection("g4.attn");   // MIMIRMIND_DECODE_PROFILE section
 
     // Shared attention section. On return `x` holds
     // sa_out = inpL + post_attention_norm(W_o @ attn(...)).
@@ -127,6 +128,7 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
     // `projOutBuf = attn_post_norm(attn_out)` for us to fold in here.
 
     _op.mark(runtime::OpProfiler::Cat::NORM);
+    _ops.profileSection("g4.pathA");   // MIMIRMIND_DECODE_PROFILE section
     trace("attn residual + ffn_norm (fused)");
     _ops.addRmsNormAsync(x, projOutBuf, T, d_model,
                          static_cast<const float*>(ffnNorm->usmPtr),
@@ -168,6 +170,7 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
     // M5f.4: two rmsNorms on the same input x with different weights and
     // different output buffers — fully independent, can pipeline.
     _op.mark(runtime::OpProfiler::Cat::NORM);
+    _ops.profileSection("g4.moe.route");   // MIMIRMIND_DECODE_PROFILE section
     trace("path B: pre_ffw_norm_2 + router rmsNorm (unordered)");
     {
         compute::UnorderedScope u{_ops};
@@ -326,91 +329,87 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     if (useMoeGrouping) {
-        trace("path B: expert-grouped dispatch");
+        trace("path B (device-grouped): build + gather + per-expert GEMM + scatter");
 
         // Half-of-fused byte offset — points at the "up" rows in each
         // per-expert gate_up_exps.weight block.
         const std::size_t gateBytesHalf = ffPerExpert *
             (d_model / qtGateUp->blockElements()) * qtGateUp->blockBytes();
 
-        // CPU-side permutation. Build per-expert (tokenIdx, weight)
-        // lists, expertOffset prefix-sum, and the flat gather+weight
-        // arrays used by the scatter step below.
-        const std::size_t nRows = T * K;
-        // Reused buckets — clear() keeps each inner vector's capacity so
-        // the 128 nested allocations only happen on the first prefill.
-        auto& expertTokens = _expertTokens;   // sized to nExperts in ctor
-        for (auto& bucket : expertTokens) bucket.clear();
-        for (std::size_t t = 0; t < T; ++t) {
-            for (std::size_t k = 0; k < K; ++k) {
-                const std::size_t e =
-                    static_cast<std::size_t>(_topKIdx[t * K + k]);
-                expertTokens[e].emplace_back(t, _topKWeight[t * K + k]);
-            }
-        }
-        auto& expertOffset = _expertOffset;
-        expertOffset.assign(nExperts + 1, 0);
-        for (std::size_t e = 0; e < nExperts; ++e) {
-            expertOffset[e + 1] =
-                expertOffset[e] + expertTokens[e].size();
-        }
-        // Invariant — every (token, top-k slot) contributes exactly one
-        // compact row, so the sum of per-expert token counts must be
-        // T*K_top. If this trips it means moeTopKRoute produced an
-        // expert index out of [0, nExperts) or the loop above skipped a
-        // pair — either way we'd overwrite past the scratch bounds.
-        if (expertOffset[nExperts] != nRows) {
-            throw std::runtime_error(
-                "Gemma4MoeBackend MoE grouping: expertOffset[nExperts]=" +
-                std::to_string(expertOffset[nExperts]) +
-                " != T*K_top=" + std::to_string(nRows) +
-                " (routing produced out-of-range expert index?)");
+        // M-Gemma4MoE.Prefill: device-driven grouped dispatch. The host
+        // permutation + host gather (a _gmm.sync() + ~T*K*d_model float
+        // memcpy) + host scatter (T*K per-row kernel launches) were the
+        // dominant prefill cost (host-driven grouped-MoE loses to fused-K
+        // on GB10). Replaced with the device moeGroupBuild / moeGatherRows
+        // / moeScatterExpertOut ops (mirrors Qwen3_5MoeBackend). Only the
+        // per-expert launch bounds (nExperts+1 ints) cross to the host.
+        const std::size_t nRows = T * K;   // one compact row per assignment
+
+        auto growBuf = [&](compute::ComputeBuffer& b, std::size_t bytes) {
+            if (b.bytes() < bytes) b = _ops.allocate(bytes);
+        };
+        growBuf(_grpExpIdx,    nRows * sizeof(std::int32_t));
+        growBuf(_grpKw,        nRows * sizeof(float));
+        growBuf(_grpExpOffset, (nExperts + 1) * sizeof(std::int32_t));
+        growBuf(_grpRowSrcTok, nRows * sizeof(std::int32_t));
+        growBuf(_grpRowKw,     nRows * sizeof(float));
+        growBuf(_grpAsnToRow,  nRows * sizeof(std::int32_t));
+
+        // Routing (expIdx/kw) on the device: reuse the device top-K result
+        // if it ran, else upload the host pick buffers (small: T*K each).
+        const std::int32_t* expIdxDev;
+        const float*        kwDev;
+        if (deviceTopKDone) {
+            expIdxDev = _devTopKIdx.as<std::int32_t>();
+            kwDev     = _devTopKWeight.as<float>();
+        } else {
+            _ops.uploadToDevice(_grpExpIdx.as<std::int32_t>(), _topKIdx.data(),
+                                nRows * sizeof(std::int32_t));
+            _ops.uploadToDevice(_grpKw.as<float>(), _topKWeight.data(),
+                                nRows * sizeof(float));
+            expIdxDev = _grpExpIdx.as<std::int32_t>();
+            kwDev     = _grpKw.as<float>();
         }
 
-        // resize() (not assign) — the offset partition covers all of
-        // [0, nRows) so every element is written before it is read.
-        auto& gatherToken = _gatherToken;
-        auto& rowWeight   = _rowWeight;
-        gatherToken.resize(nRows);
-        rowWeight.resize(nRows);
-        for (std::size_t e = 0; e < nExperts; ++e) {
-            const float scale = expDownScalePtr[e];
-            const std::size_t off = expertOffset[e];
-            for (std::size_t i = 0; i < expertTokens[e].size(); ++i) {
-                gatherToken[off + i] = expertTokens[e][i].first;
-                rowWeight[off + i]   =
-                    expertTokens[e][i].second * scale;
-            }
-        }
+        // Device counting-sort: group the T*K assignments by expert →
+        // expOffset (prefix sum), rowSrcTok (compact-row → token), rowKw,
+        // asnToRow (assignment → compact-row).
+        _ops.profileSection("g4.moe.build");   // MIMIRMIND_DECODE_PROFILE section
+        _ops.moeGroupBuildAsync(expIdxDev, kwDev,
+                                _grpExpOffset.as<std::int32_t>(),
+                                _grpRowSrcTok.as<std::int32_t>(),
+                                _grpRowKw.as<float>(),
+                                _grpAsnToRow.as<std::int32_t>(),
+                                nRows, nExperts, K);
 
         float* const xComp    = s.moeXCompact.as<float>();
         float* const gateComp = s.moeGateCompact.as<float>();
         float* const upComp   = s.moeUpCompact.as<float>();
         float* const downComp = s.moeDownCompact.as<float>();
 
-        // Gather X → compact rows. normBuf holds the path-B input
-        // [T, d_model]; sync so the CPU memcpy sees settled memory.
-        _gmm.sync();
-        for (std::size_t i = 0; i < nRows; ++i) {
-            const std::size_t t = gatherToken[i];
-            std::memcpy(xComp + i * d_model,
-                        normBuf + t * d_model,
-                        d_model * sizeof(float));
-        }
+        // Device gather activations into per-expert-contiguous rows.
+        _ops.profileSection("g4.moe.gather");   // MIMIRMIND_DECODE_PROFILE section
+        _ops.moeGatherRowsAsync(normBuf, _grpRowSrcTok.as<std::int32_t>(),
+                                xComp, d_model, nRows);
 
-        // Zero the accumulator; every touched token gets its
-        // contributions summed into it, untouched tokens stay 0.
+        // The ONE small D2H per MoE layer: per-expert launch bounds.
+        _grpOffsetHost.resize(nExperts + 1);
+        _ops.flush();
+        _ops.readbackToHost(_grpOffsetHost.data(),
+                            _grpExpOffset.as<std::int32_t>(),
+                            (nExperts + 1) * sizeof(std::int32_t));
+
+        // Zero the accumulator (the scatter sums each token's K rows in).
         _ops.mulScalarAsync(moeAccumBuf, 0.0F, T * d_model);
 
-        // Per-expert batched matmuls. Skip experts with no routed
-        // tokens; they'd dispatch a matmul with M=0 which the kernel
-        // handles by returning early but the launch overhead isn't
-        // free.
-        trace("path B: per-expert batched matmuls");
+        _ops.profileSection("g4.moe.gemm");   // MIMIRMIND_DECODE_PROFILE section
+        trace("path B (device-grouped): per-expert batched matmuls");
         for (std::size_t e = 0; e < nExperts; ++e) {
-            const std::size_t nRoutedE = expertTokens[e].size();
-            if (nRoutedE == 0) continue;
-            const std::size_t off = expertOffset[e];
+            const std::int32_t off = _grpOffsetHost[e];
+            const std::int32_t end = _grpOffsetHost[e + 1];
+            const std::size_t  Me  = static_cast<std::size_t>(end - off);
+            if (Me == 0) continue;
+            const std::size_t offRows = static_cast<std::size_t>(off);
 
             const auto* Wgu =
                 static_cast<const std::uint8_t*>(expGateUpBase) +
@@ -420,44 +419,42 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
             // Gate rows: first half of the fused gate_up weight block.
             _gmm.matmulAsync(expGateUp->type, Wgu,
                              ffPerExpert, d_model,
-                             xComp + off * d_model, nRoutedE,
-                             gateComp + off * ffPerExpert,
+                             xComp + offRows * d_model, Me,
+                             gateComp + offRows * ffPerExpert,
                              matmulScratch);
             // Up rows: second half, offset in bytes.
             _gmm.matmulAsync(expGateUp->type, Wgu + gateBytesHalf,
                              ffPerExpert, d_model,
-                             xComp + off * d_model, nRoutedE,
-                             upComp + off * ffPerExpert,
+                             xComp + offRows * d_model, Me,
+                             upComp + offRows * ffPerExpert,
                              matmulScratch);
 
             // gelu(gate) * up, in place into gateComp region.
-            _ops.geluMulAsync(gateComp + off * ffPerExpert,
-                              upComp   + off * ffPerExpert,
-                              nRoutedE * ffPerExpert);
+            _ops.geluMulAsync(gateComp + offRows * ffPerExpert,
+                              upComp   + offRows * ffPerExpert,
+                              Me * ffPerExpert);
 
             // Down: gate_activated @ W_d[e]  →  downComp region.
             _gmm.matmulAsync(expDown->type, Wd,
                              d_model, ffPerExpert,
-                             gateComp + off * ffPerExpert, nRoutedE,
-                             downComp + off * d_model,
+                             gateComp + offRows * ffPerExpert, Me,
+                             downComp + offRows * d_model,
                              matmulScratch);
+
+            // Fold the per-expert down scale into the grouped output so the
+            // device scatter below can use the plain router weight (kwDev).
+            // expDownScalePtr is USM (host-readable on the integrated GB10).
+            _ops.mulScalarAsync(downComp + offRows * d_model,
+                                expDownScalePtr[e], Me * d_model);
         }
 
-        // Scatter-accumulate. Each compact row contributes
-        //   accum[t] += weight[i] * downComp[i]
-        // where t is the token that produced that expert selection.
-        // scaledAddResidualAsync appends one kernel per row —
-        // same launch count as the pre-grouping path's inner
-        // scaled-add, so no regression on that op.
-        trace("path B: scatter-accumulate");
-        for (std::size_t i = 0; i < nRows; ++i) {
-            const std::size_t t = gatherToken[i];
-            _ops.scaledAddResidualAsync(
-                moeAccumBuf + t * d_model,
-                downComp    + i * d_model,
-                rowWeight[i],
-                d_model);
-        }
+        // Device scatter-accumulate over the T*K assignments:
+        //   accum[token(a)] += kw[a] * downComp[asnToRow[a]]
+        // (the per-expert down scale is already folded into downComp).
+        _ops.profileSection("g4.moe.scatter");   // MIMIRMIND_DECODE_PROFILE section
+        trace("path B (device-grouped): device scatter-accumulate");
+        _ops.moeScatterExpertOutAsync(downComp, _grpAsnToRow.as<std::int32_t>(),
+                                      kwDev, moeAccumBuf, d_model, T, K);
     } else if (useDeviceDispatch) {
         // M-CLR.MoE Increment 2 — fully device-side expert dispatch for
         // T=1 decode. The device gate_up kernel reads the router pick
@@ -612,6 +609,7 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
     dumpStage("ffn_moe", blockIdx, moeAccumBuf, T, d_model);
 
     _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
+    _ops.profileSection("g4.combine");   // MIMIRMIND_DECODE_PROFILE section
     trace("combined = pathA_out + pathB_out");
     _ops.addResidualAsync(moeAccumBuf, projOutBuf, T * d_model);
     dumpStage("ffn_moe_combined", blockIdx, moeAccumBuf, T, d_model);
@@ -638,6 +636,14 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
     // Close the last phase before returning so its time lands in the
     // accumulator. Cheap no-op when profiling is disabled.
     _op.finish();
+
+    // MIMIRMIND_DECODE_PROFILE: dump the g4.* section breakdown once per
+    // forward. This backend is served single-session (co-resident engine),
+    // so ServingSession's per-step profileStepEnd never fires for it —
+    // trigger it here on the last block. No-op when profiling is disabled.
+    if (blockIdx + 1 == _config.blockCount) {
+        _ops.profileStepEnd();
+    }
 }
 
 void Gemma4MoeBackend::runBlockBatched(std::size_t                blockIdx,

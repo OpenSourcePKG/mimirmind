@@ -122,6 +122,21 @@ private:
     std::vector<std::size_t>  _expertOffset; // [nExperts+1] prefix sum
     std::vector<std::size_t>  _gatherToken;  // [T*K] compact-row → token
     std::vector<float>        _rowWeight;    // [T*K] compact-row weight
+
+    // Device-driven grouped prefill (M-Gemma4MoE.Prefill). Replaces the
+    // host permutation + host gather (a per-layer _gmm.sync() + ~T*K*d_model
+    // float memcpy) + host scatter (T*K per-row kernel launches) with the
+    // device moeGroupBuild / moeGatherRows / moeScatterExpertOut ops —
+    // mirrors Qwen3_5MoeBackend's device-driven grouped path. Only a small
+    // expOffset D2H (nExperts+1 ints) crosses to the host per MoE layer.
+    // Grown lazily to hold R=T*K entries; capacity retained across calls.
+    compute::ComputeBuffer    _grpExpIdx;     // USM [>=T*K] int32 (routing)
+    compute::ComputeBuffer    _grpKw;         // USM [>=T*K] float  (routing)
+    compute::ComputeBuffer    _grpExpOffset;  // USM [nExperts+1] int32
+    compute::ComputeBuffer    _grpRowSrcTok;  // USM [>=T*K] int32
+    compute::ComputeBuffer    _grpRowKw;      // USM [>=T*K] float
+    compute::ComputeBuffer    _grpAsnToRow;   // USM [>=T*K] int32
+    std::vector<std::int32_t> _grpOffsetHost; // [nExperts+1] host readback
 };
 
 } // namespace mimirmind::runtime::arch
