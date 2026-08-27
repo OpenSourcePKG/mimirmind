@@ -753,6 +753,16 @@ void InferenceEngine::finalizeLoad() {
                 MM_LOG_INFO("probe", "  profile applied: cuBLAS-FP8 prefill -> {}",
                             *picks->applyCublasFp8Prefill ? "on" : "off");
             }
+            if (picks->applyMmq && !_gmm->mmqEnvOverridden()) {
+                _gmm->setMmq(*picks->applyMmq);
+                MM_LOG_INFO("probe", "  profile applied: MMQ (Q8_0 int8 GEMM) -> {}",
+                            *picks->applyMmq ? "on" : "off");
+            }
+            if (picks->applyMmqTc && !_gmm->mmqEnvOverridden()) {
+                _gmm->setMmqTc(*picks->applyMmqTc);
+                MM_LOG_INFO("probe", "  profile applied: MMQ tensor-core -> {}",
+                            *picks->applyMmqTc ? "on" : "off");
+            }
         }
     }
 

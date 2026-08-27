@@ -411,9 +411,11 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
     // presence check turns an empty A/B-baseline var into an accidental ON.
     if (const char* mmq = std::getenv("MIMIRMIND_MMQ")) {
         _mmqEnabled = (mmq[0] != '\0' && !(mmq[0] == '0' && mmq[1] == '\0'));
+        _mmqEnvSet  = true;   // env is explicit — Layer-2 profile must not override
     }
     if (const char* tc = std::getenv("MIMIRMIND_MMQ_TC")) {
-        _mmqTc = (tc[0] != '\0' && !(tc[0] == '0' && tc[1] == '\0'));
+        _mmqTc     = (tc[0] != '\0' && !(tc[0] == '0' && tc[1] == '\0'));
+        _mmqEnvSet = true;    // env is explicit — Layer-2 profile must not override
     }
     if (const char* mx = std::getenv("MIMIRMIND_MMQ_MAX_N")) {
         const long v = std::strtol(mx, nullptr, 10);

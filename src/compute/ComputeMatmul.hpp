@@ -283,6 +283,11 @@ public:
     [[nodiscard]] virtual bool cublasFp8PrefillEnvOverridden() const noexcept {
         return false;
     }
+    virtual void setMmq(bool /*on*/) noexcept {}
+    virtual void setMmqTc(bool /*on*/) noexcept {}
+    [[nodiscard]] virtual bool mmqEnvOverridden() const noexcept {
+        return false;
+    }
 
     /// Flush any pending appends. Safe to call when there's no
     /// pending work — cheap no-op.

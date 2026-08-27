@@ -80,6 +80,8 @@ loadProbePicks(const std::string& dir, const std::string& fingerprint) {
         picks.applyPrefillCudnn     = readFlag("MIMIRMIND_ATTN_CUDNN");
         picks.applyF32TcPrefill     = readFlag("MIMIRMIND_F32_TC_PREFILL");
         picks.applyCublasFp8Prefill = readFlag("MIMIRMIND_CUBLAS_FP8_PREFILL");
+        picks.applyMmq              = readFlag("MIMIRMIND_MMQ");
+        picks.applyMmqTc            = readFlag("MIMIRMIND_MMQ_TC");
     }
 
     return picks;

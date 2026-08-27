@@ -249,6 +249,11 @@ public:
     [[nodiscard]] bool cublasFp8PrefillEnvOverridden() const noexcept override {
         return _cublasFp8PrefillEnvSet;
     }
+    void setMmq(bool on) noexcept override { _mmqEnabled = on; }
+    void setMmqTc(bool on) noexcept override { _mmqTc = on; }
+    [[nodiscard]] bool mmqEnvOverridden() const noexcept override {
+        return _mmqEnvSet;
+    }
 
     void sync() override;
 
@@ -390,6 +395,10 @@ private:
     // the debug override and wins). See setF32TcPrefill / setCublasFp8Prefill.
     bool                           _f32TcPrefillEnvSet{false};
     bool                           _cublasFp8PrefillEnvSet{false};
+    // Same guard for MIMIRMIND_MMQ / MIMIRMIND_MMQ_TC (int8 MMQ Q8_0 prefill
+    // GEMM). An explicit env pins the value; otherwise the Layer-2 profile
+    // may set it. See setMmq / setMmqTc / mmqEnvOverridden.
+    bool                           _mmqEnvSet{false};
     // Route batched (M>1) F32 GEMMs through the BF16/TF32 tensor-core kernel
     // (weight cast to BF16 once, cached) instead of the per-row F32 vec launches.
     // Opt-in MIMIRMIND_F32_TC_PREFILL=1: huge win for models with small F32

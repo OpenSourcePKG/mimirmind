@@ -35,6 +35,8 @@ struct ProbePicks {
     std::optional<bool> applyPrefillCudnn;
     std::optional<bool> applyF32TcPrefill;
     std::optional<bool> applyCublasFp8Prefill;
+    std::optional<bool> applyMmq;
+    std::optional<bool> applyMmqTc;
 };
 
 /**
