@@ -522,6 +522,14 @@ public:
             "moeTopKRouteDeviceAsync: not supported on this backend");
     }
 
+    /// True when moeGroupBuildAsync/moeGatherRowsAsync/moeScatterExpertOutAsync
+    /// are actually implemented on this backend (CUDA only — see below).
+    /// Callers must gate `features.moeGroup` on this before engaging the
+    /// device-grouped path: that config flag defaults to on for every
+    /// backend, but the ops themselves throw "not supported" everywhere
+    /// except CUDA.
+    [[nodiscard]] virtual bool supportsMoeGrouping() const { return false; }
+
     /// M-Cuda.MoeGroup: grouped-by-expert MoE prefill building blocks. Turns
     /// flat per-assignment routing (expIdx/kw, R=T*K) into an offset table +
     /// permutation so each expert weight is read once (moeGroupBuildAsync),

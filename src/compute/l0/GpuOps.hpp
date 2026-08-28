@@ -507,6 +507,14 @@ public:
     [[nodiscard]] compute::ComputeBuffer allocate(std::size_t bytes) override;
     void uploadHostBytes(void* deviceDst, const void* hostSrc,
                          std::size_t bytes) override;
+    // uploadToDevice is the same synchronous H2D copy as uploadHostBytes
+    // (USM is host-visible on L0, so both are a plain memcpy) — the two
+    // virtuals arrived from different call sites and were never unified.
+    // Forward rather than duplicate the memcpy.
+    void uploadToDevice(void* deviceDst, const void* hostSrc,
+                        std::size_t bytes) override {
+        uploadHostBytes(deviceDst, hostSrc, bytes);
+    }
 
     [[nodiscard]] std::size_t q8_0ReorderTensorCount() const noexcept override {
         return _q8_0ReorderTensorCount;

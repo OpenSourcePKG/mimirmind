@@ -254,6 +254,7 @@ public:
                                  float* outWeight, std::size_t T,
                                  std::size_t nExperts, std::size_t K,
                                  float wScale) override;
+    [[nodiscard]] bool supportsMoeGrouping() const override { return true; }
     void moeGroupBuildAsync(const std::int32_t* expIdx, const float* kw,
                             std::int32_t* expOffset, std::int32_t* rowSrcTok,
                             float* rowKw, std::int32_t* asnToRow,

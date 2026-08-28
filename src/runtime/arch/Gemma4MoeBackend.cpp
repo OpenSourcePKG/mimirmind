@@ -325,7 +325,13 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
     // Decode (T == 1) still walks the per-token loop below: with only
     // top-K work items there's no batching opportunity and the compact
     // scratch write-back would just add overhead.
-    const bool useMoeGrouping = (T > 1) && _moeGroupEnabled;
+    // features.moeGroup defaults to on for every backend, but
+    // moeGroupBuildAsync/moeGatherRowsAsync/moeScatterExpertOutAsync are
+    // CUDA-only (ComputeOps default throws "not supported on this backend")
+    // — gate on the capability query too so L0/Xe-LPG falls through to the
+    // per-token loop below instead of throwing on every Gemma4 prefill.
+    const bool useMoeGrouping =
+        (T > 1) && _moeGroupEnabled && _ops.supportsMoeGrouping();
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     if (useMoeGrouping) {
