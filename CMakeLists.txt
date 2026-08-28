@@ -943,6 +943,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/matmul_q6k_vec.cu
         kernels/cuda/common/matmul_q8_0_vec.cu
         kernels/cuda/common/matmul_q8_0_vec_dp4a.cu
+        kernels/cuda/common/matmul_q6k_vec_dp4a.cu
         kernels/cuda/common/matmul_q8_0_vec_reorder.cu
         kernels/cuda/llm/moe_down_fused_k_q5k.cu
         kernels/cuda/llm/moe_down_fused_k_q5k_batched.cu
@@ -999,6 +1000,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/silu_mul.cu
         kernels/cuda/common/silu_mul_split.cu
         kernels/cuda/common/x_quant_i8.cu
+        kernels/cuda/common/x_quant_q8_1_blocks.cu
         kernels/cuda/common/dequant_nvfp4.cu
         kernels/cuda/common/dequant_fp8.cu
         kernels/cuda/common/dequant_fp8_perchannel.cu

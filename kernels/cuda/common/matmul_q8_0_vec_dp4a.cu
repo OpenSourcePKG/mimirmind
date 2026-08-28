@@ -1,79 +1,75 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
-// Ported from kernels_hip/matmul_q8_0_vec_dp4a.hip — Track 4 mechanical port, no functional change intended.
-
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Stefan Werfling
 //
-// DP4A matvec for Q8_0 weights with pre-quantised int8 activation.
+// DP4A matvec for Q8_0 weights with pre-quantised int8 activation —
+// warp32 revision (one full 32-lane warp per output row), per-block
+// activation scale (produced by x_quant_q8_1_blocks) instead of one
+// scale for the whole row — matches llama.cpp's vec_dot_q8_0_q8_1_impl
+// (d8_0 × d8_1 per 32-element block), avoiding one row-wide outlier
+// crushing precision for the rest of the row.
 //
-//   Y[n] = xScale × sum_{b=0..nBlocks-1}
-//              d[b] × sum_{i=0..31}( Xq[b*32+i] × Wq[n, b, i] )
+//   Y[n] = sum_{b=0..nBlocks-1}
+//              d[n,b] × Xscale[b] × sum_{i=0..31}( Xq[b*32+i] × Wq[n, b, i] )
 //
-//   Xq:     [K]     int8  (produced by an x-quant kernel)
-//   Xscale: scalar F32    (device pointer to a single float)
-//   W:      [N, K]  Q8_0  (K/32 blocks of 34 B: fp16 d + int8 qs[32])
-//   Y:      [N]     F32
+//   Xq:     [K]        int8  (produced by x_quant_q8_1_blocks)
+//   Xscale: [K/32]     F32   per-block activation scale
+//   W:      [N, K]     Q8_0  (K/32 blocks of 34 B: fp16 d + int8 qs[32])
+//   Y:      [N]        F32
 //
-// The inner accumulator stays in int32 across each 32-element block
-// via a 4-way int8 dot, with only one fp32 multiply per block for
-// d × xScale. That's 4× fewer FP32 muls in the hot loop compared to
-// matmul_q8_0_vec.
+// Prior revision split each 32-lane hardware warp into two 16-lane
+// sub-groups computing TWO DIFFERENT output rows in lockstep (ported from
+// the RDNA3/gfx1101 sub-group-16 geometry via the L0/HIP siblings). On
+// GB10 that halves effective memory coalescing: the two half-warps issue
+// loads against two unrelated weight rows every step instead of one warp
+// reading one contiguous row region, which measured at only ~7-8% of the
+// 273 GB/s roofline (see lesson moe-fuseddown-toggle-neutral-gb10 +
+// q8_0-gemv-gb10-two-negative-tuning-attempts). This revision follows
+// llama.cpp's ggml-cuda mmvq.cu design instead: one full 32-lane warp
+// commits to a single output row, so every load in a warp-step targets
+// the SAME row and is coalesced across contiguous blocks.
 //
-// gfx1101 gotcha: RDNA3 (Navi 32) does NOT expose the pure signed×
-// signed DP4A instruction. It requires `dot1-insts` which is a
-// CDNA/gfx9 feature. gfx1101's dot-insts family only includes
-// `v_dot4_i32_iu8` (signed × unsigned, via `dot8-insts`). Rather than
-// rebias one side to make sudot4 work, the port uses a manual
-// byte-wise expansion here — correct, portable, and the compiler is
-// free to fuse it into v_dot4_i32_iu8 if profitable. Trading the DP4A
-// speedup for correctness is the right call for the parity port; a
-// follow-up perf pass can measure if the manual expansion is
-// competitive or if the rebias-then-sudot4 route wins.
+// Geometry: 4 Q8_0 blocks (128 elements) processed per iteration — 8
+// lanes per block (matching the 8 char4 chunks in a 32-element block) ×
+// 4 blocks = the full 32-lane warp, all reading one row's next 136 B.
+// A tail of 1-3 blocks (K not a multiple of 128) is guarded per-lane.
 //
-// Launch geometry matches matmul_q8_0_vec: WG=64, sg16 mapped
-// explicitly (tid/16, tid%16), warp16_reduce_sum via
-// `__shfl_xor_sync(0xffffffffu, v, off, 16)`.
-//
-// With 16 lanes but only 8 char4 chunks per 32-element block, each
-// outer iteration processes TWO consecutive Q8_0 blocks: lanes 0..7
-// cover block `b`, lanes 8..15 cover block `b+1`.
+// Final reduction is a plain warp32 __shfl_xor_sync tree — every lane
+// holds a partial sum over disjoint blocks of the SAME row, so summing
+// all 32 lanes gives the exact row total (same math as before, wider
+// reduction).
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #ifndef MATMUL_Q8_0_DP4A_LOCAL
-#define MATMUL_Q8_0_DP4A_LOCAL 64
+#define MATMUL_Q8_0_DP4A_LOCAL 128
 #endif
 
-#ifndef MATMUL_Q8_0_DP4A_SG
-#define MATMUL_Q8_0_DP4A_SG 16
-#endif
-
+#define MATMUL_Q8_0_DP4A_WARP 32
 #define MATMUL_Q8_0_DP4A_OUTPUTS_PER_GROUP \
-    (MATMUL_Q8_0_DP4A_LOCAL / MATMUL_Q8_0_DP4A_SG)
+    (MATMUL_Q8_0_DP4A_LOCAL / MATMUL_Q8_0_DP4A_WARP)
 
 #define Q8_0_BLOCK_ELEMENTS 32
 #define Q8_0_BLOCK_BYTES    34
 #define Q8_0_BLOCK_CHAR4S   (Q8_0_BLOCK_ELEMENTS / 4)  // 8
+#define Q8_0_BLOCKS_PER_ITER (MATMUL_Q8_0_DP4A_WARP / Q8_0_BLOCK_CHAR4S) // 4
 
-// 1024 x elements = 32 blocks = 1 KiB SLM per workgroup (int8, so
-// 4× smaller than the fp32 tile in matmul_q8_0_vec).
+// 1024 x elements = 32 blocks = 1 KiB SLM per workgroup (int8).
 #define X_TILE_ELEMENTS 1024
 
-static __device__ __forceinline__ float warp16_reduce_sum(float v) {
-    v += __shfl_xor_sync(0xffffffffu, v, 8, 16);
-    v += __shfl_xor_sync(0xffffffffu, v, 4, 16);
-    v += __shfl_xor_sync(0xffffffffu, v, 2, 16);
-    v += __shfl_xor_sync(0xffffffffu, v, 1, 16);
+static __device__ __forceinline__ float warp32_reduce_sum(float v) {
+    v += __shfl_xor_sync(0xffffffffu, v, 16, 32);
+    v += __shfl_xor_sync(0xffffffffu, v, 8, 32);
+    v += __shfl_xor_sync(0xffffffffu, v, 4, 32);
+    v += __shfl_xor_sync(0xffffffffu, v, 2, 32);
+    v += __shfl_xor_sync(0xffffffffu, v, 1, 32);
     return v;
 }
 
 // Pack 4 int8 bytes into one int32 (little-endian) for __dp4a. Byte-wise
 // on purpose: the Q8_0 qs payload starts at block offset 2 (after the fp16
 // scale), so weight pointers are NOT 4-byte aligned and a plain int load
-// faults on CUDA ("misaligned address"). HIP/gfx1101 tolerated the aligned
-// cast; CUDA does not.
+// faults on CUDA ("misaligned address").
 static __device__ __forceinline__ int load_char4_as_int(const signed char* p) {
     return  static_cast<int>(static_cast<unsigned char>(p[0]))
          | (static_cast<int>(static_cast<unsigned char>(p[1])) << 8)
@@ -81,44 +77,31 @@ static __device__ __forceinline__ int load_char4_as_int(const signed char* p) {
          | (static_cast<int>(static_cast<unsigned char>(p[3])) << 24);
 }
 
-// Signed int8×4 dot product. gfx1101 lacks the pure sdot4 instruction
-// (dot1-insts is CDNA-only). Manual expansion here — the compiler is
-// free to reshape it into v_dot4_i32_iu8 with implicit bias
-// compensation if that turns out faster on Navi 32.
-static __device__ __forceinline__ int dot4_i8(int a, int b) {
-    // Blackwell (and every sm_61+) has a native signed int8×4 dot-product;
-    // __dp4a(a, b, 0) == the manual expansion below, one instruction. The
-    // HIP sibling keeps the manual form because gfx1101 lacks signed sdot4.
-    return __dp4a(a, b, 0);
-}
-
 extern "C" __global__ __launch_bounds__(MATMUL_Q8_0_DP4A_LOCAL)
 void matmul_q8_0_vec_dp4a(
     const signed char*   __restrict__ Xq,
-    const float*         __restrict__ Xscale,
+    const float*         __restrict__ Xscale,   // [K/32], one per block
     const unsigned char* __restrict__ W,
           float*         __restrict__ Y,
     const int                         K,
     const int                         N)
 {
     __shared__ signed char xTile[X_TILE_ELEMENTS];
+    __shared__ float       xScaleTile[X_TILE_ELEMENTS / Q8_0_BLOCK_ELEMENTS];
 
     const int  wg      = blockIdx.x;
     const int  tid     = threadIdx.x;
     const int  lsize   = blockDim.x;
-    const int  sgInWg  = tid / MATMUL_Q8_0_DP4A_SG;
-    const int  sgLocal = tid % MATMUL_Q8_0_DP4A_SG;
-    const int  n       = wg * MATMUL_Q8_0_DP4A_OUTPUTS_PER_GROUP + sgInWg;
-    const bool active  = (n < N);
-    const int  nBlocks = K / Q8_0_BLOCK_ELEMENTS;
+    const int  warpInWg = tid / MATMUL_Q8_0_DP4A_WARP;
+    const int  lane     = tid % MATMUL_Q8_0_DP4A_WARP;
+    const int  n        = wg * MATMUL_Q8_0_DP4A_OUTPUTS_PER_GROUP + warpInWg;
+    const bool active    = (n < N);
+    const int  nBlocks   = K / Q8_0_BLOCK_ELEMENTS;
 
-    const float xScale = *Xscale;
-
-    // Lane assignment for the 2-blocks-per-iteration pattern:
-    //   lanes 0..7  → block b,   char4 index sgLocal
-    //   lanes 8..15 → block b+1, char4 index sgLocal - 8
-    const int laneBlockOff = sgLocal >> 3;
-    const int laneChar4Idx = sgLocal & (Q8_0_BLOCK_CHAR4S - 1);
+    // Lane -> (block-in-group, char4-index) for the 4-blocks-per-iter,
+    // full-warp-per-row layout.
+    const int laneBlockOff = lane / Q8_0_BLOCK_CHAR4S;   // 0..3
+    const int laneChar4Idx = lane % Q8_0_BLOCK_CHAR4S;   // 0..7
 
     float sum = 0.0f;
 
@@ -127,6 +110,10 @@ void matmul_q8_0_vec_dp4a(
                             ? X_TILE_ELEMENTS : (K - tile);
         for (int i = tid; i < tileK; i += lsize) {
             xTile[i] = Xq[tile + i];
+        }
+        const int tileBlocks = tileK / Q8_0_BLOCK_ELEMENTS;
+        for (int i = tid; i < tileBlocks; i += lsize) {
+            xScaleTile[i] = Xscale[tile / Q8_0_BLOCK_ELEMENTS + i];
         }
         __syncthreads();
 
@@ -141,7 +128,7 @@ void matmul_q8_0_vec_dp4a(
                                        ? (blockStart + blocksInTile)
                                        : nBlocks;
 
-            for (int b = blockStart; b < blockEnd; b += 2) {
+            for (int b = blockStart; b < blockEnd; b += Q8_0_BLOCKS_PER_ITER) {
                 const int bMy = b + laneBlockOff;
                 if (bMy < blockEnd) {
                     const unsigned char* __restrict__ block =
@@ -151,15 +138,16 @@ void matmul_q8_0_vec_dp4a(
                     const signed char* wq_ptr =
                         reinterpret_cast<const signed char*>(block + 2);
 
-                    const int xLocalBase =
-                        (bMy - blockStart) * Q8_0_BLOCK_ELEMENTS;
+                    const int localBlock = bMy - blockStart;
+                    const int xLocalBase = localBlock * Q8_0_BLOCK_ELEMENTS;
                     const signed char* xq_ptr = xTile + xLocalBase;
+                    const float xScale = xScaleTile[localBlock];
 
                     const int wq_packed =
                         load_char4_as_int(wq_ptr + laneChar4Idx * 4);
                     const int xq_packed =
                         load_char4_as_int(xq_ptr + laneChar4Idx * 4);
-                    const int dp = dot4_i8(wq_packed, xq_packed);
+                    const int dp = __dp4a(wq_packed, xq_packed, 0);
 
                     sum = __fmaf_rn(static_cast<float>(dp),
                                     d * xScale, sum);
@@ -170,9 +158,9 @@ void matmul_q8_0_vec_dp4a(
         __syncthreads();
     }
 
-    sum = warp16_reduce_sum(sum);
+    sum = warp32_reduce_sum(sum);
 
-    if (active && sgLocal == 0) {
+    if (active && lane == 0) {
         Y[n] = sum;
     }
 }

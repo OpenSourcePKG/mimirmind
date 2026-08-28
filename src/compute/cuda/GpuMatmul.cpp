@@ -151,6 +151,8 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _matmulQ5KMmqKernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ8_0VecDp4aModule;
     ::mimirmind::core::cuda::CudaKernel _matmulQ8_0VecDp4aKernel;
+    ::mimirmind::core::cuda::CudaModule _matmulQ6KVecDp4aModule;
+    ::mimirmind::core::cuda::CudaKernel _matmulQ6KVecDp4aKernel;
     ::mimirmind::core::cuda::CudaModule _moeDownFusedKQ8_0Module;
     ::mimirmind::core::cuda::CudaKernel _moeDownFusedKQ8_0Kernel;
     ::mimirmind::core::cuda::CudaModule _moeDownFusedKQ6KModule;
@@ -294,6 +296,9 @@ struct GpuMatmul::Impl {
           _matmulQ8_0VecDp4aModule{loadCudaModule(ctx, "matmul_q8_0_vec_dp4a")},
           _matmulQ8_0VecDp4aKernel{
               _matmulQ8_0VecDp4aModule.getFunction("matmul_q8_0_vec_dp4a")},
+          _matmulQ6KVecDp4aModule {loadCudaModule(ctx, "matmul_q6k_vec_dp4a")},
+          _matmulQ6KVecDp4aKernel {
+              _matmulQ6KVecDp4aModule.getFunction("matmul_q6k_vec_dp4a")},
           _moeDownFusedKQ8_0Module{loadCudaModule(ctx, "moe_down_fused_k_q8_0")},
           _moeDownFusedKQ8_0Kernel{
               _moeDownFusedKQ8_0Module.getFunction("moe_down_fused_k_q8_0")},
@@ -487,10 +492,10 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
                     _mmqTc ? "tensor-core" : "dp4a", _mmqMaxN);
     }
     MM_LOG_INFO("hip::GpuMatmul",
-                "compute::cuda::GpuMatmul ready — 12 kernels loaded "
+                "compute::cuda::GpuMatmul ready — 13 kernels loaded "
                 "(Q8_0: vec / gemm / gemm_v2 / vec_dp4a / moe_down_fused_k; "
-                "Q6_K: vec / moe_down_fused_k; Q5_0: vec; Q4_K: vec; "
-                "Q5_K: vec; Q3_K: vec; F32: vec)");
+                "Q6_K: vec / vec_dp4a / moe_down_fused_k; Q5_0: vec; "
+                "Q4_K: vec; Q5_K: vec; Q3_K: vec; F32: vec)");
 }
 
 GpuMatmul::~GpuMatmul() = default;
@@ -517,7 +522,8 @@ bool GpuMatmul::dp4aAvailable() const noexcept {
 
 bool GpuMatmul::dp4aAvailable(::mimirmind::core::gguf::GgmlType type)
     const noexcept {
-    return type == ::mimirmind::core::gguf::GgmlType::Q8_0;
+    return type == ::mimirmind::core::gguf::GgmlType::Q8_0
+        || type == ::mimirmind::core::gguf::GgmlType::Q6_K;
 }
 
 bool GpuMatmul::moeDownFusedKAvailable() const noexcept {
@@ -1681,34 +1687,37 @@ void GpuMatmul::matmulDp4aAsync(::mimirmind::core::gguf::GgmlType type,
                                 std::size_t        K,
                                 std::size_t        M,
                                 float*             Y) {
-    if (type != ::mimirmind::core::gguf::GgmlType::Q8_0) {
+    const bool isQ8_0 = type == ::mimirmind::core::gguf::GgmlType::Q8_0;
+    const bool isQ6K  = type == ::mimirmind::core::gguf::GgmlType::Q6_K;
+    if (!isQ8_0 && !isQ6K) {
         throw std::runtime_error(
-            "compute::cuda::GpuMatmul::matmulDp4aAsync: only Q8_0 has a "
-            "DP4A kernel on the HIP side — check dp4aAvailable(type) "
+            "compute::cuda::GpuMatmul::matmulDp4aAsync: only Q8_0/Q6_K have "
+            "a DP4A kernel on the CUDA side — check dp4aAvailable(type) "
             "before dispatching");
     }
     if (M == 0 || N == 0 || K == 0) {
         return;
     }
 
-    // Q8_0 block size = 32 elements. The DP4A kernel processes weights
-    // block-by-block via `v_dot4_i32_iu8` (gfx1101) / manual byte
-    // expansion (any RDNA3 without pure sdot4); K that isn't a
-    // multiple of 32 would leave a partial block at the tail, which
-    // the kernel can't handle. Same guard as L0 GpuMatmul.
-    constexpr std::size_t kBlockElts = 32;
-    if (K % kBlockElts != 0) {
+    // Q8_0 blocks are 32 elements; Q6_K super-blocks are 256. `Xscale` is
+    // one float per 32-wide activation quant block either way (produced by
+    // x_quant_q8_1_blocks) — Q6_K's kernel reads 8 of those per
+    // super-block internally.
+    const std::size_t blockElts = isQ8_0 ? 32 : 256;
+    if (K % blockElts != 0) {
         throw std::runtime_error(
             "compute::cuda::GpuMatmul::matmulDp4aAsync: K=" +
-            std::to_string(K) + " is not a multiple of Q8_0 blockElements="
-            + std::to_string(kBlockElts));
+            std::to_string(K) + " is not a multiple of blockElements=" +
+            std::to_string(blockElts));
     }
+    const std::size_t xScaleBlocksPerRow = K / 32;
 
-    auto& kern = _pimpl->_matmulQ8_0VecDp4aKernel;
+    auto& kern = isQ8_0 ? _pimpl->_matmulQ8_0VecDp4aKernel
+                        : _pimpl->_matmulQ6KVecDp4aKernel;
 
-    // 4 outputs per workgroup, local=64 — same as matmul_q8_0_vec. WG
-    // count in the N dim only; per-row loop iterates over X in the M
-    // dim (same shape as L0 side).
+    // warp32 geometry (kDp4aOutputsPerGroup outputs per WG — see
+    // matmul_q8_0_vec_dp4a.cu / matmul_q6k_vec_dp4a.cu). WG count in the
+    // N dim only; per-row loop iterates over X in the M dim.
     const std::uint32_t nGroups = static_cast<std::uint32_t>(
         (N + kDp4aOutputsPerGroup - 1) / kDp4aOutputsPerGroup);
 
@@ -1719,7 +1728,7 @@ void GpuMatmul::matmulDp4aAsync(::mimirmind::core::gguf::GgmlType type,
 
     for (std::size_t m = 0; m < M; ++m) {
         const std::int8_t* xqRow = Xq + m * K;
-        const float*       xsRow = Xscale + m;
+        const float*       xsRow = Xscale + m * xScaleBlocksPerRow;
         float*             yRow  = Y + m * N;
 
         kern.setPtr(0, xqRow);

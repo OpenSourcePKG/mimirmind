@@ -156,6 +156,15 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         b.moeW13Compact  = ops.allocate(2 * gateBytes);   // 5.18.8 fused gate+up out
         b.moeDownCompact = ops.allocate(xBytes);
 
+        // Per-token expert-loop DP4A scratch (see BlockBuffers.hpp). Both
+        // d_model and ffScratch are guaranteed multiples of 32 by the
+        // Q8_0/Q6_K block-quant guards already enforced elsewhere in the
+        // MoE path, so the /32 block counts below are exact.
+        b.moeXq8GateUp      = ops.allocate(maxT * b.d_model * sizeof(std::int8_t));
+        b.moeXq8GateUpScale = ops.allocate(maxT * (b.d_model / 32) * sizeof(float));
+        b.moeXq8Down        = ops.allocate(maxT * ffScratch * sizeof(std::int8_t));
+        b.moeXq8DownScale   = ops.allocate(maxT * (ffScratch / 32) * sizeof(float));
+
         // M-Cuda.MoeGroup — device token-grouping outputs (moe_group_build):
         // per-expert row-range offsets + the row->token / assignment->row
         // permutation the grouped GEMM gather/scatter consume. Sized on the

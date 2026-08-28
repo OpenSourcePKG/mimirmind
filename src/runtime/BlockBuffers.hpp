@@ -91,6 +91,16 @@ struct BlockBuffers {
     ComputeBuffer moeW13Compact;  // [nRowsMax, 2*ffPerExpert] (5.18.8 fused gate+up out)
     ComputeBuffer moeDownCompact; // [nRowsMax, d_model]
 
+    // Per-token expert-loop DP4A scratch (MIMIRMIND_MOE_EXPERTLOOP_DP4A,
+    // Gemma4MoeBackend decode-only, CUDA). q8_1-block-granular (32-wide)
+    // int8 activation + per-block scale for the warp32 DP4A vec kernels —
+    // gate_up input is shared across all K experts (quantised once per
+    // token), the down input is per-expert (quantised once per k).
+    ComputeBuffer moeXq8GateUp;      // [maxT, d_model]        int8
+    ComputeBuffer moeXq8GateUpScale; // [maxT, d_model/32]     f32
+    ComputeBuffer moeXq8Down;        // [maxT, ffPerExpert]    int8
+    ComputeBuffer moeXq8DownScale;   // [maxT, ffPerExpert/32] f32
+
     // M-Cuda.MoeGroup — device token-grouping build outputs (moe_group_build).
     ComputeBuffer moeOeaActive;   // [nExperts] int32 OEA active-expert mask (5.22)
     ComputeBuffer moeGroupOffset; // [nExperts+1] int32 exclusive prefix sum

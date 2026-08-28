@@ -351,6 +351,9 @@ public:
     void xQuantI8Async(const float* x, std::int8_t* y, float* scale,
                        std::size_t M, std::size_t K) override;
 
+    void xQuantQ8_1BlocksAsync(const float* x, std::int8_t* y,
+                               float* scale, std::size_t K) override;
+
     void kvQuantCommitQ8Async(const float* xSrc, void* kvDst,
                               std::size_t T, std::size_t kvDim,
                               std::size_t writeOffset) override;

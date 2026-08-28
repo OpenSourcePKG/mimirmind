@@ -304,10 +304,14 @@ private:
     static constexpr std::uint32_t kSubgroupSize     = 16;
     static constexpr std::uint32_t kOutputsPerGroup  = kLocalSize / kSubgroupSize;
 
-    static constexpr std::uint32_t kDp4aLocalSize    = 64;
-    static constexpr std::uint32_t kDp4aSubgroupSize = 16;
+    // warp32 revision (one full CUDA warp per output row, matching
+    // llama.cpp's ggml-cuda MMVQ geometry) — see matmul_q8_0_vec_dp4a.cu /
+    // matmul_q6k_vec_dp4a.cu. Was 64/16 (RDNA3-sub-group-16-derived,
+    // two half-warps per row); that halved effective memory coalescing.
+    static constexpr std::uint32_t kDp4aLocalSize    = 128;
+    static constexpr std::uint32_t kDp4aWarpSize     = 32;
     static constexpr std::uint32_t kDp4aOutputsPerGroup =
-        kDp4aLocalSize / kDp4aSubgroupSize;
+        kDp4aLocalSize / kDp4aWarpSize;
 
     static constexpr std::size_t   kGemmMTile        = 8;
     static constexpr std::size_t   kGemmV2MTile      = 8;

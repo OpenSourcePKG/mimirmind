@@ -907,6 +907,21 @@ public:
                                std::size_t  M,
                                std::size_t  K) = 0;
 
+    /// Per-32-element-block symmetric int8 quantisation (ggml q8_1 block
+    /// granularity, scale-only — no offset-sum field, see
+    /// x_quant_q8_1_blocks.cu). Feeds the warp32 DP4A vec kernels
+    /// (matmulDp4aAsync, Q8_0/Q6_K). `K` must be a multiple of 32.
+    /// `scale` is `[K/32]`, one value per block — NOT one per row like
+    /// xQuantI8Async. Default: unsupported; only CUDA overrides it.
+    virtual void xQuantQ8_1BlocksAsync(const float* x,
+                                       std::int8_t* y,
+                                       float*       scale,
+                                       std::size_t  K) {
+        (void)x; (void)y; (void)scale; (void)K;
+        throw std::runtime_error(
+            "xQuantQ8_1BlocksAsync: not supported on this backend");
+    }
+
     virtual void kvQuantCommitQ8Async(const float* xSrc,
                                       void*        kvDst,
                                       std::size_t  T,

@@ -169,6 +169,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _scaledAddResidualKernel;
     core::cuda::CudaModule _xQuantI8Module;
     core::cuda::CudaKernel _xQuantI8Kernel;
+    core::cuda::CudaModule _xQuantQ81BlocksModule;
+    core::cuda::CudaKernel _xQuantQ81BlocksKernel;
     core::cuda::CudaModule _ropeModule;
     core::cuda::CudaKernel _ropeKernel;
     core::cuda::CudaModule _ropeFp16Module;
@@ -423,6 +425,9 @@ struct GpuOps::Impl {
               _scaledAddResidualModule.getFunction("scaled_add_residual")},
           _xQuantI8Module          {loadCudaModule(ctx, "x_quant_i8")},
           _xQuantI8Kernel          {_xQuantI8Module.getFunction("x_quant_i8")},
+          _xQuantQ81BlocksModule   {loadCudaModule(ctx, "x_quant_q8_1_blocks")},
+          _xQuantQ81BlocksKernel   {
+              _xQuantQ81BlocksModule.getFunction("x_quant_q8_1_blocks")},
           _ropeModule              {loadCudaModule(ctx, "rope_inplace")},
           _ropeKernel              {_ropeModule.getFunction("rope_inplace")},
           _ropeFp16Module          {loadCudaModule(ctx, "rope_inplace_fp16")},
@@ -2701,6 +2706,29 @@ void GpuOps::xQuantI8Async(const float* x, std::int8_t* y, float* scale,
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(M), 1, 1,
              kXQuantI8LocalSize, 1, 1);
+}
+
+void GpuOps::xQuantQ8_1BlocksAsync(const float* x, std::int8_t* y,
+                                   float* scale, std::size_t K) {
+    if (K == 0) {
+        return;
+    }
+    if (K % 32 != 0) {
+        throw std::runtime_error(
+            "compute::cuda::GpuOps::xQuantQ8_1BlocksAsync: K=" +
+            std::to_string(K) + " is not a multiple of 32");
+    }
+    const std::int32_t Ki = toInt32(K, "xQuantQ8_1Blocks K");
+    auto& k = _pimpl->_xQuantQ81BlocksKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, y);
+    k.setPtr  (2, scale);
+    k.setValue(3, Ki);
+    // One warp (32 threads) per 32-element block, one block per group.
+    const std::uint32_t nBlocks = static_cast<std::uint32_t>(K / 32);
+    k.launch(_ctx.stream(),
+             nBlocks, 1, 1,
+             32, 1, 1);
 }
 
 void GpuOps::kvQuantCommitQ8Async(const float* xSrc, void* kvDst,

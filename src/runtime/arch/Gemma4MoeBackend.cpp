@@ -501,7 +501,89 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
             s.moeKwScratch.get()     != nullptr &&
             s.moeGateCompact.get()   != nullptr;
 
-        if (useMoeFusedDown) {
+        // llama.cpp-style warp32 MMVQ (int8 dp4a, per-32-block quantised
+        // activation) for the per-token expert loop — opt-in, GB10/CUDA
+        // only. Measured moe.expertloop at only ~7-8% of the 273 GB/s
+        // roofline for the plain fp32 vec path (see lesson
+        // moe-fuseddown-toggle-neutral-gb10-2026-08-28); this replaces
+        // BOTH the gate_up (Q6_K) and down (Q8_0) matmul with the DP4A
+        // warp32 vec kernels instead. Lossy (int8 activation quant) —
+        // unlike every other path in this loop, output is not expected
+        // to be bit-identical to the fp32 baseline. Requires K dims that
+        // satisfy both kernels' block guards (Q6_K needs d_model % 256,
+        // Q8_0/DP4A activation blocks need ffPerExpert % 32) so a future
+        // model with incompatible dims falls back silently instead of
+        // throwing from inside matmulDp4aAsync.
+        static const bool kExpertLoopDp4a =
+            std::getenv("MIMIRMIND_MOE_EXPERTLOOP_DP4A") != nullptr;
+        const bool useExpertLoopDp4a =
+            kExpertLoopDp4a &&
+            T == 1 &&
+            d_model % 256 == 0 &&
+            ffPerExpert % 32 == 0 &&
+            _gmm.dp4aAvailable(expGateUp->type) &&
+            _gmm.dp4aAvailable(expDown->type) &&
+            s.moeXq8GateUp.get()      != nullptr &&
+            s.moeXq8GateUpScale.get() != nullptr &&
+            s.moeXq8Down.get()        != nullptr &&
+            s.moeXq8DownScale.get()   != nullptr;
+
+        if (useExpertLoopDp4a) {
+            _ops.profileSection("g4.moe.expertloop");   // MIMIRMIND_DECODE_PROFILE section
+            trace("path B: per-token expert dispatch (DP4A warp32)");
+            static bool dp4aAnnounced = false;
+            if (!dp4aAnnounced) {
+                dp4aAnnounced = true;
+                MM_LOG_INFO("gemma4moe",
+                            "MoE expert-loop DP4A warp32 active "
+                            "(MIMIRMIND_MOE_EXPERTLOOP_DP4A) — lossy int8 "
+                            "activation quant, not bit-identical to fp32");
+            }
+
+            float* const pathBIn = normBuf;         // T == 1
+            float* const accumT  = moeAccumBuf;
+
+            auto* const xq8Gate      = s.moeXq8GateUp.as<std::int8_t>();
+            auto* const xq8GateScale = s.moeXq8GateUpScale.as<float>();
+            auto* const xq8Down      = s.moeXq8Down.as<std::int8_t>();
+            auto* const xq8DownScale = s.moeXq8DownScale.as<float>();
+
+            // Shared across all K experts (identical input) — quantised
+            // once per token instead of once per expert.
+            _ops.xQuantQ8_1BlocksAsync(pathBIn, xq8Gate, xq8GateScale,
+                                       d_model);
+
+            for (std::size_t k = 0; k < K; ++k) {
+                const std::size_t e =
+                    static_cast<std::size_t>(_topKIdx[k]);
+                const float routerWeight = _topKWeight[k];
+
+                const void* Wgu = expGateUpBase + e * expertBytesGateUp;
+                const void* Wd  = expDownBase   + e * expertBytesDown;
+
+                _ops.profileSection("g4.moe.gateup");   // MIMIRMIND_DECODE_PROFILE section
+                _gmm.matmulDp4aAsync(expGateUp->type, xq8Gate, xq8GateScale,
+                                     Wgu, gateUpFused, d_model, 1,
+                                     gateOutBuf);
+
+                _ops.geluMulAsync(gateOutBuf, gateOutBuf + ffPerExpert,
+                                  ffPerExpert);
+
+                // Per-expert activation (differs each k) — quantised
+                // fresh before the down DP4A matmul.
+                _ops.xQuantQ8_1BlocksAsync(gateOutBuf, xq8Down, xq8DownScale,
+                                           ffPerExpert);
+
+                _ops.profileSection("g4.moe.down");   // MIMIRMIND_DECODE_PROFILE section
+                _gmm.matmulDp4aAsync(expDown->type, xq8Down, xq8DownScale,
+                                     Wd, d_model, ffPerExpert, 1,
+                                     expertOutBuf);
+
+                const float combined = routerWeight * expDownScalePtr[e];
+                _ops.scaledAddResidualAsync(accumT, expertOutBuf, combined,
+                                            d_model);
+            }
+        } else if (useMoeFusedDown) {
             trace("path B: per-token expert dispatch (fused-K down)");
             float* const pathBIn = normBuf;         // T == 1
             float* const accumT  = moeAccumBuf;
@@ -557,6 +639,7 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
                 K,
                 expertBytesDown);
         } else {
+            _ops.profileSection("g4.moe.expertloop");   // MIMIRMIND_DECODE_PROFILE section
             trace("path B: per-token expert dispatch");
             for (std::size_t t = 0; t < T; ++t) {
                 float* const pathBInT  = normBuf      + t * d_model;
@@ -569,6 +652,7 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
                     const void* Wgu = expGateUpBase + e * expertBytesGateUp;
                     const void* Wd  = expDownBase   + e * expertBytesDown;
 
+                    _ops.profileSection("g4.moe.gateup");   // MIMIRMIND_DECODE_PROFILE section
                     _gmm.matmulAsync(expGateUp->type, Wgu,
                                      gateUpFused, d_model,
                                      pathBInT, 1,
@@ -582,6 +666,7 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
                     // scaledAddResidual, and expertOutBuf isn't read by the
                     // CPU inside this loop. Removes T*K_top syncs per MoE
                     // block per prefill call.
+                    _ops.profileSection("g4.moe.down");   // MIMIRMIND_DECODE_PROFILE section
                     _gmm.matmulAsync(expDown->type, Wd,
                                      d_model, ffPerExpert,
                                      gateOutBuf, 1,
