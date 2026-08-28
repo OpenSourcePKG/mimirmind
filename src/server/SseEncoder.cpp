@@ -60,6 +60,34 @@ json SseEncoder::buildReasoningChunk(const std::string& id, std::int64_t created
     return out;
 }
 
+json SseEncoder::buildToolCallChunk(const std::string& id, std::int64_t created,
+                                     const std::string& model, int toolCallIndex,
+                                     const std::string& callId,
+                                     const std::string& name,
+                                     const std::string& argumentsJson) {
+    json out = streamChunkSkeleton(id, created, model);
+    out["choices"] = json::array({
+        json{
+            {"index", 0},
+            {"delta", json{
+                {"tool_calls", json::array({
+                    json{
+                        {"index", toolCallIndex},
+                        {"id",    callId},
+                        {"type",  "function"},
+                        {"function", {
+                            {"name",      name},
+                            {"arguments", argumentsJson},
+                        }},
+                    },
+                })},
+            }},
+            {"finish_reason", nullptr},
+        },
+    });
+    return out;
+}
+
 json SseEncoder::buildFinishChunk(const std::string& id, std::int64_t created,
                                    const std::string& model, std::string_view finishReason) {
     json out = streamChunkSkeleton(id, created, model);

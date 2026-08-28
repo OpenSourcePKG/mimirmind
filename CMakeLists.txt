@@ -1285,6 +1285,7 @@ add_executable(mimirmind
     src/compute/quant/Q8_0.cpp
     src/model/ChatTemplate.cpp
     src/model/ToolCallParser.cpp
+    src/model/ToolCallStreamDetector.cpp
     src/model/FusedQkvWeights.cpp
     src/model/LlmConfig.cpp
     src/model/ResponseCleaner.cpp

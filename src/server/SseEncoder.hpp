@@ -50,6 +50,21 @@ struct SseEncoder {
         const std::string& model,
         std::string_view   reasoning);
 
+    /// Delta chunk carrying one complete, structured tool call — the SSE
+    /// counterpart to the blocking path's `message.tool_calls[]` entry.
+    /// Emitted whole (name + arguments together) once the streaming
+    /// tool-call marker span has closed; no partial-JSON argument streaming
+    /// (spec-compliant either way — Bifröst's Anthropic-SSE translator
+    /// already knows how to consume a whole-chunk tool call).
+    [[nodiscard]] static nlohmann::json buildToolCallChunk(
+        const std::string& id,
+        std::int64_t       created,
+        const std::string& model,
+        int                toolCallIndex,
+        const std::string& callId,
+        const std::string& name,
+        const std::string& argumentsJson);
+
     /// Terminal chunk with `finish_reason`.
     [[nodiscard]] static nlohmann::json buildFinishChunk(
         const std::string& id,

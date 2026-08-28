@@ -13,6 +13,7 @@
 
 #include "model/ResponseCleaner.hpp"
 #include "model/ToolCallParser.hpp"
+#include "model/ToolCallStreamDetector.hpp"
 #include "model/Tokenizer.hpp"
 #include "core/log/Log.hpp"
 #include "core/security/ScopedTenant.hpp"
@@ -703,10 +704,12 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
     // doesn't emit a terminal usage chunk (see prefill_done named
     // event for the token-count signal instead).
     TrimReport                trimReport;
-    // The SSE path streams content deltas and does not yet re-assemble
-    // structured tool_calls (a separate Phase-3 item). tool_choice:"required"
-    // still prefills the opener so the model emits a call, but its text is not
-    // needed here — the block is discarded.
+    // M-FunctionCalling: the SSE path re-assembles structured tool_calls from
+    // the same native markers the blocking path parses (see
+    // ToolCallStreamDetector). tool_choice:"required" prefills the opener
+    // onto the prompt (Qwen only — see ChatTemplate::toolCallOpenerText); its
+    // text seeds the detector so the forced call's body is buffered from the
+    // first generated token instead of leaking as content.
     std::string               forcedToolOpener;
     if (!prepareChatRequest(engine, cr, res, promptIds, stopIds, params,
                             trimReport, forcedToolOpener)) {
@@ -753,9 +756,19 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
         // matching the behaviour ChatTemplate::cleanResponse applies in
         // the non-streaming path. No-op for other chat styles.
         model::ResponseCleaner        cleaner;
+        // M-FunctionCalling: mirrors the blocking path's marker-dispatch, but
+        // token-by-token. toolCallsEnabled gates it off entirely for requests
+        // without tools (or tool_choice:"none") so plain-text streaming is
+        // byte-for-byte unchanged. style picks which parser
+        // (parseQwen/parseGemma) a completed block goes through.
+        bool                          toolCallsEnabled{false};
+        model::ChatTemplate::Style    style{model::ChatTemplate::Style::QwenChatML};
+        model::ToolCallStreamDetector toolCallDetector;
+        int                           nextToolCallIndex{0};
+        bool                          anyToolCallEmitted{false};
         bool                          done{false};
 
-        StreamState(model::ChatTemplate::Style style,
+        StreamState(model::ChatTemplate::Style chatStyle,
                     const model::Tokenizer&    tok,
                     bool                       preserveThinking,
                     bool                       thinkPreClosed)
@@ -768,12 +781,14 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
             // answer is mislabelled as reasoning_content and delta.content
             // streams empty. thinkPreClosed MUST equal !thinkOn in ChatTemplate.
             : cleaner{(preserveThinking || thinkPreClosed)
-                ? model::ResponseCleaner{style, -1, -1}
-                : model::ResponseCleaner::forStyle(style, tok)} {}
+                ? model::ResponseCleaner{chatStyle, -1, -1}
+                : model::ResponseCleaner::forStyle(chatStyle, tok)},
+              style{chatStyle} {}
     };
+    const model::ChatTemplate::Style style =
+        model::ChatTemplate::detectFromArch(engine.config().architecture);
     auto state = std::make_shared<StreamState>(
-        model::ChatTemplate::detectFromArch(engine.config().architecture),
-        engine.tokenizer(), _cfg.preserveThinking,
+        style, engine.tokenizer(), _cfg.preserveThinking,
         // Mirror ChatTemplate's thinkOn = enableThinking.value_or(false): the
         // prompt pre-closes the think block whenever thinking is off (default,
         // or explicit false), so the cleaner must start in content mode.
@@ -785,6 +800,9 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
     state->created   = created;
     state->echoModel = echoModel;
     state->tenantId  = core::security::ScopedTenant::active();
+    state->toolCallsEnabled = !cr.tools.empty() && cr.toolChoice != "none";
+    state->toolCallDetector = model::ToolCallStreamDetector(
+        style, state->toolCallsEnabled, forcedToolOpener);
 
     res.set_chunked_content_provider(
         "text/event-stream",
@@ -801,6 +819,42 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
 
             auto& targetEng = *targetEngine;
             const auto& tok = targetEng.tokenizer();
+
+            // M-FunctionCalling: parse one completed marker-delimited block
+            // (see ToolCallStreamDetector) with the style-appropriate parser
+            // and emit it as a `delta.tool_calls` chunk — the SSE shape
+            // clients (and Bifröst's Anthropic-SSE translator) expect.
+            // Returns false on a write failure (client gone), matching the
+            // other Sse write helpers' contract. A block that fails to parse
+            // (malformed/truncated) falls back to surfacing its raw text as
+            // content rather than silently dropping it.
+            auto emitToolCallBlock = [&](const std::string& block) -> bool {
+                const std::vector<model::ToolCall> calls =
+                    (state->style == model::ChatTemplate::Style::Gemma4)
+                        ? model::ToolCallParser::parseGemma(block)
+                        : model::ToolCallParser::parseQwen(block);
+                if (calls.empty()) {
+                    return SseEncoder::writeSseEvent(
+                        sink,
+                        SseEncoder::buildContentChunk(state->respId, state->created,
+                                          state->echoModel, block));
+                }
+                for (const auto& call : calls) {
+                    const std::string callId =
+                        "call_" + std::to_string(state->nextToolCallIndex);
+                    if (!SseEncoder::writeSseEvent(
+                            sink,
+                            SseEncoder::buildToolCallChunk(
+                                state->respId, state->created, state->echoModel,
+                                state->nextToolCallIndex, callId, call.name,
+                                call.argumentsJson))) {
+                        return false;
+                    }
+                    ++state->nextToolCallIndex;
+                    state->anyToolCallEmitted = true;
+                }
+                return true;
+            };
 
             // 1. Initial role chunk so clients see {role:"assistant"}.
             if (!SseEncoder::writeSseEvent(
@@ -832,6 +886,18 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                 if (isStop(id)) {
                     // Do not surface the stop token's text. The engine
                     // checks isStop on the next iteration and exits.
+                    // M-FunctionCalling: Gemma 4's tool-call closer is one of
+                    // stopIds (see ChatTemplate::toolCallStopIds) — its text
+                    // never reaches the detector below, so finalize here
+                    // instead when a call was in flight.
+                    if (state->toolCallsEnabled && state->toolCallDetector.buffering()) {
+                        state->toolCallDetector.closeOnStop();
+                        if (!emitToolCallBlock(state->toolCallDetector.completedBlock())) {
+                            clientGone = true;
+                            return false;
+                        }
+                        state->toolCallDetector.reset();
+                    }
                     return true;
                 }
                 // Snapshot the per-token progress even for stripped
@@ -875,24 +941,41 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                     return true;
                 }
 
-                state->utf8Pending.append(txt);
-                const std::size_t cut =
-                    SseEncoder::utf8IncompleteTailStart(state->utf8Pending);
-                if (cut == 0) {
-                    return true;     // entire buffer is partial; keep waiting
+                // M-FunctionCalling: detect a native tool-call marker span
+                // within the answer content and buffer it instead of
+                // streaming it as text — see ToolCallStreamDetector. `txt`
+                // comes back shortened to whatever content (if any) precedes
+                // an opener found this token; a no-op when disabled or no
+                // marker is in play, so plain-text streaming is unchanged.
+                const bool toolCallCompleted =
+                    state->toolCallsEnabled && state->toolCallDetector.feed(txt);
+
+                if (!txt.empty()) {
+                    state->utf8Pending.append(txt);
+                    const std::size_t cut =
+                        SseEncoder::utf8IncompleteTailStart(state->utf8Pending);
+                    if (cut > 0) {
+                        std::string emit = state->utf8Pending.substr(0, cut);
+                        state->utf8Pending.erase(0, cut);
+
+                        if (!SseEncoder::writeSseEvent(
+                                sink,
+                                SseEncoder::buildContentChunk(state->respId, state->created,
+                                                  state->echoModel, emit))) {
+                            clientGone = true;
+                            return false;   // abort generate()
+                        }
+                        ++emittedTokens;
+                    }
                 }
 
-                std::string emit = state->utf8Pending.substr(0, cut);
-                state->utf8Pending.erase(0, cut);
-
-                if (!SseEncoder::writeSseEvent(
-                        sink,
-                        SseEncoder::buildContentChunk(state->respId, state->created,
-                                          state->echoModel, emit))) {
-                    clientGone = true;
-                    return false;   // abort generate()
+                if (toolCallCompleted) {
+                    if (!emitToolCallBlock(state->toolCallDetector.completedBlock())) {
+                        clientGone = true;
+                        return false;
+                    }
+                    state->toolCallDetector.reset();
                 }
-                ++emittedTokens;
                 return true;
             };
 
@@ -1056,6 +1139,24 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                 return false;
             }
 
+            // M-FunctionCalling: a call still open here means generation
+            // ended without a closer reaching either the detector (Qwen) or
+            // isStop (Gemma 4) — most likely max_tokens hit mid-call. Finalize
+            // best-effort, mirroring ToolCallParser's tolerance for an
+            // unterminated final block, rather than silently dropping it.
+            // Any text held back purely as a defensive tail against a marker
+            // split across tokens (and that never became part of a call) is
+            // ordinary trailing content — fold it into the normal UTF-8 flush
+            // below instead of a separate write.
+            if (state->toolCallsEnabled) {
+                if (state->toolCallDetector.buffering()) {
+                    state->toolCallDetector.closeOnStop();
+                    (void)emitToolCallBlock(state->toolCallDetector.completedBlock());
+                    state->toolCallDetector.reset();
+                }
+                state->utf8Pending.append(state->toolCallDetector.takePendingFlush());
+            }
+
             // Flush any leftover reasoning buffer first (a model that stops
             // while still "thinking" — e.g. length cutoff mid-<think> — should
             // still surface what it reasoned).
@@ -1084,7 +1185,11 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
             //    exhausted maxNewTokens.
             const bool hitStop = stats.hitStop
                 || (!generated.empty() && isStop(generated.back()));
-            const std::string finish = hitStop ? "stop" : "length";
+            // M-FunctionCalling: matches the blocking path — a turn that
+            // emitted a tool call reports "tool_calls" regardless of which
+            // stop condition ended decoding.
+            const std::string finish = state->anyToolCallEmitted ? "tool_calls"
+                                      : (hitStop ? "stop" : "length");
 
             (void)SseEncoder::writeSseEvent(
                 sink,
