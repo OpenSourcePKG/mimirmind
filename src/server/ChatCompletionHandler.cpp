@@ -780,7 +780,18 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
             // cleaner in content mode (channelStartId = -1), else the whole
             // answer is mislabelled as reasoning_content and delta.content
             // streams empty. thinkPreClosed MUST equal !thinkOn in ChatTemplate.
-            : cleaner{(preserveThinking || thinkPreClosed)
+            //
+            // thinkPreClosed is a QwenChatML-only concept (whether <think> was
+            // pre-closed in the PROMPT) — it says nothing about Gemma4, which
+            // emits its <|channel>thought\n<channel|> wrapper unconditionally,
+            // thinking on or off. Applying the bypass to every style meant a
+            // plain Gemma4 request (enable_thinking unset → thinkPreClosed=true
+            // by construction below) never engaged forStyle()'s channel
+            // detection at all, leaking the raw wrapper into delta.content.
+            // Only preserveThinking (explicit debug passthrough) should bypass
+            // Gemma4's cleaner; Qwen keeps the thinkPreClosed shortcut.
+            : cleaner{(preserveThinking ||
+                       (chatStyle == model::ChatTemplate::Style::QwenChatML && thinkPreClosed))
                 ? model::ResponseCleaner{chatStyle, -1, -1}
                 : model::ResponseCleaner::forStyle(chatStyle, tok)},
               style{chatStyle} {}
