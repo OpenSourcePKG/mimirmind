@@ -380,6 +380,7 @@ FeatureSettings parseFeatures(std::string_view      path,
                               const nlohmann::json& j) {
     checkKnownKeys(path, "features", j,
                    {"clr", "flashPrefill", "flashPrefillGqaQ8",
+                    "flashPrefillGqaQ8Bq",
                     "flashPrefillKTileQ8",
                     "fusedQkv", "moeGroup",
                     "gemm", "gemmV2", "gemmMinM", "dp4a",
@@ -388,6 +389,7 @@ FeatureSettings parseFeatures(std::string_view      path,
     if (const auto v = readOpt<bool>(path, "features", j, "clr");               v) f.clr               = *v;
     if (const auto v = readOpt<bool>(path, "features", j, "flashPrefill");      v) f.flashPrefill      = *v;
     if (const auto v = readOpt<bool>(path, "features", j, "flashPrefillGqaQ8"); v) f.flashPrefillGqaQ8 = *v;
+    if (const auto v = readOpt<bool>(path, "features", j, "flashPrefillGqaQ8Bq"); v) f.flashPrefillGqaQ8Bq = *v;
     if (const auto v = readOpt<std::size_t>(path, "features", j, "flashPrefillKTileQ8"); v) {
         if (*v != 0 && *v != 64 && *v != 128) {
             fail(path,

@@ -99,6 +99,7 @@ makeOps(core::backend::ComputeContext& ctx,
             return std::make_unique<compute::cuda::GpuOps>(
                 static_cast<core::cuda::CudaComputeContext&>(ctx),
                 features.flashPrefill, features.flashPrefillGqaQ8,
+                features.flashPrefillGqaQ8Bq,
                 features.flashPrefillKTileQ8, features.q8_0Reorder);
 #else
             break;

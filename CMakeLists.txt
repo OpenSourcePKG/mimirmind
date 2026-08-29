@@ -903,6 +903,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/attention_prefill_flash_fp16.cu
         kernels/cuda/llm/attention_prefill_flash_q8_0.cu
         kernels/cuda/llm/attention_prefill_flash_q8_0_gqa.cu
+        kernels/cuda/llm/attention_prefill_flash_q8_0_gqa_bq.cu
         kernels/cuda/llm/attention_prefill_flash_f32_gqa.cu
         kernels/cuda/llm/attention_prefill_flash_f32_gqa_tc.cu
         kernels/cuda/llm/attention_prefill_flash_f32_gqa_mwtc.cu

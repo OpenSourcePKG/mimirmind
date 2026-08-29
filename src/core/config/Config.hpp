@@ -172,6 +172,18 @@ struct FeatureSettings {
     // then, plain per-Q-head Q8_0 wins. Suffix ties the flag to the
     // Q8_0-specific kernel; future dtype variants get their own.
     bool                       flashPrefillGqaQ8{false};
+    // R3 — query-row (BQ=4) tiled sibling of the GQA Q8_0 prefill kernel
+    // (attention_prefill_flash_q8_0_gqa_bq). Batches BQ query positions per
+    // CTA on top of GQA head-packing, so a K/V dequant pass is shared
+    // across BQ*nQPerKv slots instead of just nQPerKv — the fix for causal
+    // prefill re-walking the same K-tile once per query position. Needs
+    // flashPrefillGqaQ8=true too (this kernel IS the GQA path, just
+    // row-tiled) and nQPerKv<=4 (smaller than flashPrefillGqaQ8's own
+    // register-array bound, to keep the row-tiled oRun/scores buffers
+    // inside the 48 KiB static-shared budget) — dispatch falls back to
+    // the plain GQA kernel when either condition isn't met. Opt-in and
+    // default off until measured on more than Gemma4's nQPerKv=2 case.
+    bool                       flashPrefillGqaQ8Bq{false};
     // K-tile size baked into the Q8_0 GQA prefill kernel. Compile-time
     // constant in the .cl source; a second SPV is built alongside the
     // default with `-D ATTN_FLASH_PREFILL_KTILE=64`. Runtime picks

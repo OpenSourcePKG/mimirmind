@@ -272,6 +272,7 @@ public:
     }
     [[nodiscard]] bool prefillFlashEnabled()      const noexcept override { return false; }
     [[nodiscard]] bool prefillFlashGqaQ8Enabled() const noexcept override { return false; }
+    [[nodiscard]] bool prefillFlashGqaQ8BqEnabled() const noexcept override { return false; }
     [[nodiscard]] std::size_t prefillFlashKTileQ8() const noexcept override { return 0; }
     [[nodiscard]] std::string_view prefillFlashKTileQ8Source() const noexcept override {
         return "cpu-noop";

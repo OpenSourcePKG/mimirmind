@@ -1065,6 +1065,9 @@ public:
 
     [[nodiscard]] virtual bool prefillFlashEnabled() const noexcept = 0;
     [[nodiscard]] virtual bool prefillFlashGqaQ8Enabled() const noexcept = 0;
+    /// R3 — query-row (BQ) tiled sibling of the GQA Q8_0 prefill kernel.
+    /// CUDA-only; every other backend reports false.
+    [[nodiscard]] virtual bool prefillFlashGqaQ8BqEnabled() const noexcept = 0;
     [[nodiscard]] virtual std::size_t prefillFlashKTileQ8() const noexcept = 0;
     [[nodiscard]] virtual std::string_view prefillFlashKTileQ8Source() const noexcept = 0;
 

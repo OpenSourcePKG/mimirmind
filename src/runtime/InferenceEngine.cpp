@@ -228,6 +228,7 @@ makeGpuOps(core::backend::ComputeContext&        ctx,
                 static_cast<core::cuda::CudaComputeContext&>(ctx),
                 features.flashPrefill,
                 features.flashPrefillGqaQ8,
+                features.flashPrefillGqaQ8Bq,
                 features.flashPrefillKTileQ8,
                 features.q8_0Reorder);
 #else

@@ -63,10 +63,11 @@ public:
     /// resolves the K-tile pick up-front so the dispatch hot path
     /// stays branch-cheap.
     GpuOps(core::cuda::CudaComputeContext& ctx,
-              bool                          flashPrefillEnabled      = true,
-              bool                          flashPrefillGqaQ8Enabled = true,
-              std::size_t                   flashPrefillKTileQ8      = 128,
-              core::config::TriState        q8_0ReorderMode          =
+              bool                          flashPrefillEnabled        = true,
+              bool                          flashPrefillGqaQ8Enabled   = true,
+              bool                          flashPrefillGqaQ8BqEnabled = false,
+              std::size_t                   flashPrefillKTileQ8        = 128,
+              core::config::TriState        q8_0ReorderMode            =
                   core::config::TriState::Disable);
     ~GpuOps() override;
 
@@ -422,6 +423,9 @@ public:
     [[nodiscard]] bool prefillFlashGqaQ8Enabled() const noexcept override {
         return !_prefillFlashGqaQ8Disabled;
     }
+    [[nodiscard]] bool prefillFlashGqaQ8BqEnabled() const noexcept override {
+        return _prefillFlashGqaQ8BqEnabled;
+    }
     [[nodiscard]] std::size_t prefillFlashKTileQ8() const noexcept override {
         return _prefillFlashKTileQ8;
     }
@@ -562,6 +566,9 @@ private:
     // afterwards except for the two setter test hooks.
     bool                 _prefillFlashDisabled{false};
     bool                 _prefillFlashGqaQ8Disabled{false};
+    // R3 — query-row (BQ) tiled GQA Q8_0 kernel. Positive sense (unlike
+    // its siblings) because it defaults OFF: config.features.flashPrefillGqaQ8Bq.
+    bool                 _prefillFlashGqaQ8BqEnabled{false};
     // P3.a — opt-in GQA-head-packed F32 prefill flash. Env
     // MIMIRMIND_ATTN_PREFILL_GQA=1. Routes the F32 KV prefill path (the
     // only path Qwen3-Next reaches) through the head-packed kernel that
@@ -647,6 +654,14 @@ private:
     // `attention_prefill_flash_q8_0_gqa.hip`. Dispatch falls back to
     // the plain Q8_0 kernel when nQPerKv exceeds this.
     static constexpr std::size_t kFlashPrefillGqaMaxQPerKv = 8;
+    // R3 — the BQ-tiled GQA Q8_0 kernel's compile-time
+    // ATTN_FLASH_PREFILL_N_Q_PER_KV_MAX (smaller than the plain GQA
+    // kernel's 8, to keep oRun/scores inside the static-shared budget once
+    // the BQ query-row dimension is added). Dispatch falls back to the
+    // plain (non-BQ) GQA kernel when nQPerKv exceeds this.
+    static constexpr std::size_t kFlashPrefillGqaBqMaxQPerKv = 4;
+    // Must match ATTN_FLASH_PREFILL_BQ in attention_prefill_flash_q8_0_gqa_bq.cu.
+    static constexpr std::uint32_t kFlashPrefillGqaBqRows = 4;
     // Cap on headDim for the P3.b TF32 tensor-core prefill kernel — must
     // match ATTN_TC_MAX_HEADDIM (shared-tile sizing) in
     // attention_prefill_flash_f32_gqa_tc.cu. Dispatch falls back to the

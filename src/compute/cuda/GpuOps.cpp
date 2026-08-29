@@ -239,6 +239,12 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _attentionPrefillFlashQ8GqaKernel;
     core::cuda::CudaModule _attentionPrefillFlashQ8GqaKtile64Module;
     core::cuda::CudaKernel _attentionPrefillFlashQ8GqaKtile64Kernel;
+    // R3 — query-row (BQ) tiled GQA Q8_0 prefill flash (opt-in). Batches
+    // BQ query positions per CTA on top of R1's GQA head-packing, so a
+    // K/V Q8_0 dequant pass is shared across BQ*nQPerKv slots instead of
+    // just nQPerKv. See attention_prefill_flash_q8_0_gqa_bq.cu.
+    core::cuda::CudaModule _attentionPrefillFlashQ8GqaBqModule;
+    core::cuda::CudaKernel _attentionPrefillFlashQ8GqaBqKernel;
     // P3.a — GQA-head-packed F32 prefill flash (opt-in, F32 KV path).
     core::cuda::CudaModule _attentionPrefillFlashF32GqaModule;
     core::cuda::CudaKernel _attentionPrefillFlashF32GqaKernel;
@@ -524,6 +530,11 @@ struct GpuOps::Impl {
           _attentionPrefillFlashQ8GqaKtile64Kernel{
               _attentionPrefillFlashQ8GqaKtile64Module.getFunction(
                   "attention_prefill_flash_q8_0_gqa")},
+          _attentionPrefillFlashQ8GqaBqModule{
+              loadCudaModule(ctx, "attention_prefill_flash_q8_0_gqa_bq")},
+          _attentionPrefillFlashQ8GqaBqKernel{
+              _attentionPrefillFlashQ8GqaBqModule.getFunction(
+                  "attention_prefill_flash_q8_0_gqa_bq")},
           _attentionPrefillFlashF32GqaModule{
               loadCudaModule(ctx, "attention_prefill_flash_f32_gqa")},
           _attentionPrefillFlashF32GqaKernel{
@@ -679,6 +690,7 @@ struct GpuOps::Impl {
 GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
                      bool                          flashPrefillEnabled,
                      bool                          flashPrefillGqaQ8Enabled,
+                     bool                          flashPrefillGqaQ8BqEnabled,
                      std::size_t                   flashPrefillKTileQ8,
                      core::config::TriState        q8_0ReorderMode)
     : _ctx{ctx},
@@ -734,9 +746,12 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
                        core::cuda::CudaAllocKind::HostPinned));
     _scalarRingIdx = 0;
 
-    _prefillFlashDisabled      = !flashPrefillEnabled;
-    _prefillFlashGqaQ8Disabled = !flashPrefillGqaQ8Enabled;
-    _q8_0ReorderMode           = q8_0ReorderMode;
+    _prefillFlashDisabled        = !flashPrefillEnabled;
+    _prefillFlashGqaQ8Disabled   = !flashPrefillGqaQ8Enabled;
+    // The BQ kernel IS the GQA path (just row-tiled) — only meaningful
+    // when GQA itself is enabled too.
+    _prefillFlashGqaQ8BqEnabled  = flashPrefillGqaQ8Enabled && flashPrefillGqaQ8BqEnabled;
+    _q8_0ReorderMode             = q8_0ReorderMode;
 
     // P3.a opt-in: GQA-head-packed F32 prefill flash (env, default off).
     if (const char* g = std::getenv("MIMIRMIND_ATTN_PREFILL_GQA")) {
@@ -844,11 +859,12 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
                 "qkv_split × f32/fp16, kv_quant_commit_q8_0, "
                 "matmul_q8_0_vec_reorder). "
                 "flash_partial_scratch={} bytes, prefill_flash={}, "
-                "prefill_flash_gqa_q8={}, prefill_flash_ktile_q8={}, "
-                "q8_0_reorder={}",
+                "prefill_flash_gqa_q8={}, prefill_flash_gqa_q8_bq={}, "
+                "prefill_flash_ktile_q8={}, q8_0_reorder={}",
                 _flashPartialBytes,
                 _prefillFlashDisabled      ? "disabled (config)" : "enabled",
                 _prefillFlashGqaQ8Disabled ? "disabled (config)" : "enabled",
+                _prefillFlashGqaQ8BqEnabled ? "enabled" : "disabled (config)",
                 _prefillFlashKTileQ8,
                 q8_0ReorderModeName());
 }
@@ -3154,6 +3170,13 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         !_prefillFlashGqaQ8Disabled &&
         (nQPerKv > 1) &&
         (nQPerKv <= kFlashPrefillGqaMaxQPerKv);
+    // R3 — query-row (BQ) tiled sibling of the GQA Q8_0 kernel. Same
+    // eligibility as useQ8Gqa, plus the smaller nQPerKv bound its static
+    // shared memory needs; falls back to the plain GQA kernel otherwise.
+    const bool useQ8GqaBq =
+        useQ8Gqa &&
+        _prefillFlashGqaQ8BqEnabled &&
+        (nQPerKv <= kFlashPrefillGqaBqMaxQPerKv);
     // P3.b — opt-in TF32 tensor-core GQA kernel (bit-near, headDim-bounded).
     const bool useF32Tc =
         !useF32Mwtc &&
@@ -3243,7 +3266,9 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
             kernelPtr = &_pimpl->_attentionPrefillFlashFp16Kernel;
         }
     } else if (kvDtype == runtime::KvDtype::Q8_0) {
-        if (useQ8Gqa) {
+        if (useQ8GqaBq) {
+            kernelPtr = &_pimpl->_attentionPrefillFlashQ8GqaBqKernel;
+        } else if (useQ8Gqa) {
             kernelPtr = (_prefillFlashKTileQ8 == 64)
                 ? &_pimpl->_attentionPrefillFlashQ8GqaKtile64Kernel
                 : &_pimpl->_attentionPrefillFlashQ8GqaKernel;
@@ -3296,8 +3321,12 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
     // The q-tiling kernels (Step 3 / 3.2 / F32-MWTC) take BQ=16 query positions
     // per CTA; every other kernel takes one WG per query position (dim1 = T_q).
     constexpr std::uint32_t kFp16TcBq = 16;
-    const std::uint32_t dim1 = (useFp16Tc || useFp16GqaTc || useF32Mwtc)
+    const std::uint32_t dim1 =
+        (useFp16Tc || useFp16GqaTc || useF32Mwtc)
         ? static_cast<std::uint32_t>((T_q + kFp16TcBq - 1) / kFp16TcBq)
+      : useQ8GqaBq
+        ? static_cast<std::uint32_t>(
+              (T_q + kFlashPrefillGqaBqRows - 1) / kFlashPrefillGqaBqRows)
         : static_cast<std::uint32_t>(T_q);
     // F32-MWTC splits the GQA group into ceil(nQPerKv/HPB) head-halves (grid.z).
     const std::uint32_t dim2 = useF32Mwtc
@@ -3319,6 +3348,7 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
           : useF32Gqa      ? "F32Gqa"
           : useFp16GqaTc   ? "Fp16GqaTc"
           : useFp16Tc      ? "Fp16Tc"
+          : useQ8GqaBq     ? "Q8GqaBq"
           : useQ8Gqa       ? "Q8Gqa"
                            : "base";
         MM_LOG_INFO("attn-trace",

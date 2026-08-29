@@ -460,6 +460,9 @@ public:
     [[nodiscard]] bool prefillFlashGqaQ8Enabled() const noexcept override {
         return !_prefillFlashGqaQ8Disabled;
     }
+    [[nodiscard]] bool prefillFlashGqaQ8BqEnabled() const noexcept override {
+        return false;  // R3 BQ-tiled kernel is CUDA-only.
+    }
     [[nodiscard]] std::size_t prefillFlashKTileQ8() const noexcept override {
         return _prefillFlashKTileQ8;
     }
