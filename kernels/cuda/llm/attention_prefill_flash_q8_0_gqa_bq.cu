@@ -136,7 +136,13 @@ void attention_prefill_flash_q8_0_gqa_bq(
           float* oVecs[NQMAX][BQ];
     #pragma unroll
     for (int qh = 0; qh < NQMAX; ++qh) {
-        const int hq = hkv * nQPerKv + qh;
+        // Inactive slots (qh >= nQPerKv) still get dereferenced below —
+        // acc[qh][m] is computed unconditionally in Pass A and only the
+        // WRITE into scores/oRun is gated by nQPerKv. hq = hkv*nQPerKv+qh
+        // would run past nHeads for the last KV-group's inactive slots
+        // (out-of-bounds global read, caught by compute-sanitizer); clamp
+        // to qh=0 of this group instead, which is always a valid head.
+        const int hq = hkv * nQPerKv + ((qh < nQPerKv) ? qh : 0);
         #pragma unroll
         for (int m = 0; m < BQ; ++m) {
             const int pq = q0 + m;
