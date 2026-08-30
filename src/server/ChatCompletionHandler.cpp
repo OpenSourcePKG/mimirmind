@@ -332,10 +332,11 @@ void ChatCompletionHandler::handle(const httplib::Request& req,
     // Thermal admission BEFORE we commit to a stream: a 503 must ship as
     // a plain JSON response, not as half a chunked SSE body. Uses the
     // default engine's thermal guard as a proxy for the whole process —
-    // per-engine thermal separation isn't a thing (single iGPU). In M-Munin.3
-    // pool mode there is no always-resident default engine (defaultEnginePtr
-    // is null); thermal admission is skipped there (MVP — thermal is a
-    // single-user/Sleipnir concern, not the pooled multi-model serving path).
+    // per-engine thermal separation isn't a thing (single iGPU). ServeMode
+    // keeps the default model eager even under M-Munin.3 pool mode
+    // (defaultEnginePtr() is never null), so this check applies uniformly;
+    // pool-managed (non-default) models don't get their own thermal guard —
+    // the process-wide guard on the default engine is the only one.
     auto* thermalEngine = _dispatcher.defaultEnginePtr();
     if (auto* guard = thermalEngine != nullptr ? thermalEngine->thermalGuard()
                                                : nullptr;
@@ -355,10 +356,16 @@ void ChatCompletionHandler::handle(const httplib::Request& req,
 
     // Serving-class load shedding BEFORE we commit to a stream: like the
     // thermal check above, the continuous batcher stands in as a process-wide
-    // capacity proxy (the default serving-class engine is the batcher's).
-    // Rejecting here ships a clean 503 as plain JSON rather than a truncated
-    // SSE body; submit() still enforces the same bound authoritatively for the
-    // narrow check-then-submit race.
+    // capacity proxy — but only for the DEFAULT engine's batcher. Rejecting
+    // here ships a clean 503 as plain JSON rather than a truncated SSE body;
+    // submit() still enforces the same bound authoritatively for the narrow
+    // check-then-submit race. M-Munin.3 pool-mode models have their own
+    // per-slot batcher (see target->batcher below) that this pre-check does
+    // NOT cover — the model isn't resolved yet at this point in the request.
+    // A pool model at its own capacity is still correctly rejected, just via
+    // runViaBatcher's exception path (below) instead of this early clean-JSON
+    // shortcut; only the "reject before any bytes ship" optimization is
+    // default-engine-only.
     if (_cfg.batcher != nullptr && _cfg.batcher->atCapacity()) {
         MM_LOG_WARN("server",
                     "serving overloaded ({}/{} in flight) — shedding with 503",
@@ -448,17 +455,22 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     };
 
     // M-Cuda.Batch D2e.2 — when a continuous batcher is wired for the
-    // default (serving-class) engine, requests to it are serviced by the
-    // batcher's worker thread (multi-tenant continuous batching) instead of
-    // the per-engine-mutex single-session generate(). The batcher owns the
-    // engine's serving state + GPU stream, so this path must NOT also take
-    // the engine mutex or call generate() concurrently.
-    const bool useBatcher =
-        (_cfg.batcher != nullptr &&
-         target->engine == _dispatcher.defaultEnginePtr());
+    // resolved target, requests to it are serviced by the batcher's worker
+    // thread (multi-tenant continuous batching) instead of the per-engine-
+    // mutex single-session generate(). The batcher owns the engine's serving
+    // state + GPU stream, so this path must NOT also take the engine mutex
+    // or call generate() concurrently. M-Munin.3 (full): a pool-mode target
+    // carries its OWN per-slot batcher (target->batcher); the default engine
+    // still uses the process-wide _cfg.batcher as before.
+    auto* activeBatcher =
+        target->batcher != nullptr
+            ? target->batcher
+            : (target->engine == _dispatcher.defaultEnginePtr() ? _cfg.batcher
+                                                                : nullptr);
+    const bool useBatcher = activeBatcher != nullptr;
     if (useBatcher) {
         try {
-            generated = runViaBatcher(*_cfg.batcher, promptIds, params,
+            generated = runViaBatcher(*activeBatcher, promptIds, params,
                                       stopIds, tenant, onToken);
         } catch (const runtime::serving::ServingTenantQuotaError& e) {
             // Per-tenant fairness shed, not a bug: retryable 429.
@@ -767,6 +779,15 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
         int                           nextToolCallIndex{0};
         bool                          anyToolCallEmitted{false};
         bool                          done{false};
+        // M-Munin.3 (full): keeps a pool-mode target's worker-side slot
+        // pinned for the WHOLE async stream, not just the synchronous part
+        // of handleStream() that resolves it. Without this the slot could
+        // be evicted (and targetEngine/targetMutex/targetSpec below would
+        // dangle) as soon as the local `target` in handleStream() goes out
+        // of scope, well before the chunked content-provider lambda — which
+        // outlives that scope — actually runs. Empty/no-op on the eager
+        // path, where engines are process-lifetime resident.
+        std::shared_ptr<void>        pin{};
 
         StreamState(model::ChatTemplate::Style chatStyle,
                     const model::Tokenizer&    tok,
@@ -814,13 +835,17 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
     state->toolCallsEnabled = !cr.tools.empty() && cr.toolChoice != "none";
     state->toolCallDetector = model::ToolCallStreamDetector(
         style, state->toolCallsEnabled, forcedToolOpener);
+    // M-Munin.3 (full): move (not copy) the pin into state so it outlives
+    // this function — see StreamState::pin.
+    state->pin = std::move(target->pin);
 
     res.set_chunked_content_provider(
         "text/event-stream",
         [this, state,
-         targetEngine = target->engine,
-         targetMutex  = target->mutex,
-         targetSpec   = target->spec]
+         targetEngine  = target->engine,
+         targetMutex   = target->mutex,
+         targetSpec    = target->spec,
+         targetBatcher = target->batcher]
         (std::size_t /*offset*/,
          httplib::DataSink& sink) -> bool {
             if (state->done) {
@@ -1068,17 +1093,24 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                            /*streaming=*/true);
             RequestTracker::Guard requestGuard{&_tracker, state->respId};
             // M-Cuda.Batch D2e.2 — batcher-serviced streaming for the
-            // default (serving-class) engine. The batcher drives onToken per
-            // decoded token exactly like generate(); it has no prefill-phase
-            // callbacks, so a streaming client just sees decode deltas (no
-            // prefill_done / prefill_progress events on this path). onToken
-            // returning false (client gone) cancels the batcher request.
-            const bool useBatcher =
-                (this->_cfg.batcher != nullptr &&
-                 targetEngine == this->_dispatcher.defaultEnginePtr());
+            // resolved target. The batcher drives onToken per decoded token
+            // exactly like generate(); it has no prefill-phase callbacks, so
+            // a streaming client just sees decode deltas (no prefill_done /
+            // prefill_progress events on this path). onToken returning
+            // false (client gone) cancels the batcher request. M-Munin.3
+            // (full): a pool-mode target carries its own per-slot batcher
+            // (targetBatcher); the default engine still uses the
+            // process-wide _cfg.batcher as before.
+            auto* activeBatcher =
+                targetBatcher != nullptr
+                    ? targetBatcher
+                    : (targetEngine == this->_dispatcher.defaultEnginePtr()
+                           ? this->_cfg.batcher
+                           : nullptr);
+            const bool useBatcher = activeBatcher != nullptr;
             if (useBatcher) {
                 try {
-                    generated = runViaBatcher(*this->_cfg.batcher,
+                    generated = runViaBatcher(*activeBatcher,
                                               state->promptIds, state->params,
                                               state->stopIds, state->tenantId,
                                               onToken);

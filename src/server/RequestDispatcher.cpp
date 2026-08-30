@@ -91,46 +91,57 @@ RequestDispatcher::RequestDispatcher(
 }
 
 std::vector<RequestDispatcher::ModelEntry> RequestDispatcher::listModels() const {
-    // M-Munin.3 pool mode: the known models live in the provider's registry,
-    // not the (empty) eager engine table.
-    if (_provider != nullptr) {
-        std::vector<ModelEntry> out;
-        for (const auto& m : _provider->listModels()) {
-            out.push_back({m.id, m.title});
-        }
-        return out;
-    }
+    // M-Munin.3 (full): the default model stays eager even when a provider
+    // is set (ServeMode keeps ONE anchor model resident for thermal/power/
+    // fan/perf monitoring and the draft-model vocab check) — list it plus
+    // any eager extras, THEN the provider's pool-managed models. A provider
+    // model id colliding with the default is deduped (shouldn't happen —
+    // ServeMode never registers the default with the pool — but listModels
+    // must stay correct even if a config does something unexpected).
     std::vector<ModelEntry> out;
     out.reserve(1 + _extraHandles.size());
     out.push_back({_defaultId, _defaultTitle});
     for (const auto& h : _extraHandles) {
         out.push_back({h.id, h.title});
     }
+    if (_provider != nullptr) {
+        for (const auto& m : _provider->listModels()) {
+            if (m.id == _defaultId) continue;
+            out.push_back({m.id, m.title});
+        }
+    }
     return out;
 }
 
 std::optional<RequestDispatcher::Target> RequestDispatcher::resolveTarget(
     const std::string& model, httplib::Response& res) {
+    // M-Munin.3 (full): check the eager default + extras FIRST (unchanged
+    // behavior, zero cost), THEN fall back to the provider (pool mode) for
+    // anything else. ServeMode keeps the default model eager even when a
+    // pool is active — only non-default chat models register with the
+    // provider — so this ordering means "empty or default id" never touches
+    // the provider at all, exactly like the no-provider case.
+    if (model.empty() || model == _defaultId) {
+        return Target{_defaultEngine, &_defaultMutex,
+                      _speculativeDecoder.get(),
+                      _defaultId, _defaultTitle};
+    }
+    for (auto& h : _extraHandles) {
+        if (h.id == model) {
+            return Target{h.engine, h.mutex.get(),
+                          /*spec=*/nullptr,
+                          h.id, h.title};
+        }
+    }
+
     // M-Munin.3 pool mode: resolve through the provider, which materializes
     // (and may evict the LRU slot) on a miss. The returned Target carries a
-    // `pin` that keeps the slot alive for the request; spec-dec is off in pool
-    // mode (MVP). The eager path below is used only when no provider is set.
-    if (_provider != nullptr) {
-        const std::string id = model.empty() ? _provider->defaultModelId() : model;
-        if (!_provider->knows(id)) {
-            json body = {
-                {"error", {
-                    {"message", "no such loaded model: '" + model + "'"},
-                    {"type",    "model_not_found"},
-                    {"code",    nullptr},
-                }},
-            };
-            res.status = 400;
-            res.set_content(body.dump(), "application/json");
-            return std::nullopt;
-        }
+    // `pin` that keeps the slot alive for the request, plus this slot's own
+    // batcher/spec-dec decoder (built per-slot by the provider's factory —
+    // see AttachedModelProvider).
+    if (_provider != nullptr && _provider->knows(model)) {
         try {
-            auto acq = _provider->acquire(id);
+            auto acq = _provider->acquire(model);
             if (!acq) {
                 json body = {
                     {"error", {
@@ -143,11 +154,12 @@ std::optional<RequestDispatcher::Target> RequestDispatcher::resolveTarget(
                 res.set_content(body.dump(), "application/json");
                 return std::nullopt;
             }
-            return Target{acq->engine, acq->mutex, /*spec=*/nullptr,
-                          acq->id, acq->title, std::move(acq->pin)};
+            return Target{acq->engine, acq->mutex, acq->spec,
+                          acq->id, acq->title, acq->batcher,
+                          std::move(acq->pin)};
         } catch (const std::exception& x) {
             MM_LOG_ERROR("server",
-                         "model '{}' materialization failed: {}", id, x.what());
+                         "model '{}' materialization failed: {}", model, x.what());
             json body = {
                 {"error", {
                     {"message", std::string{"model unavailable: "} + x.what()},
@@ -161,18 +173,6 @@ std::optional<RequestDispatcher::Target> RequestDispatcher::resolveTarget(
         }
     }
 
-    if (model.empty() || model == _defaultId) {
-        return Target{_defaultEngine, &_defaultMutex,
-                      _speculativeDecoder.get(),
-                      _defaultId, _defaultTitle};
-    }
-    for (auto& h : _extraHandles) {
-        if (h.id == model) {
-            return Target{h.engine, h.mutex.get(),
-                          /*spec=*/nullptr,
-                          h.id, h.title};
-        }
-    }
     json body = {
         {"error", {
             {"message", "no such loaded model: '" + model + "'"},

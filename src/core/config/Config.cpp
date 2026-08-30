@@ -552,7 +552,8 @@ ServingSettings parseServing(std::string_view      path,
                    {"enableBatching", "minBatchForEnable", "kvDtype",
                     "tokenBudget", "maxActiveRequests",
                     "maxActiveRequestsPerTenant",
-                    "preemptFreeBlockThreshold", "blockSize"});
+                    "preemptFreeBlockThreshold", "blockSize",
+                    "modelPoolCapacity"});
     ServingSettings s{};
     s.enableBatching = parseTriState(path, "serving", j, "enableBatching",
                                      TriState::Auto);
@@ -619,6 +620,17 @@ ServingSettings parseServing(std::string_view      path,
                        "(got " + std::to_string(*v) + ")");
         }
         s.blockSize = *v;
+    }
+    if (const auto v = readOpt<std::size_t>(path, "serving", j,
+                                            "modelPoolCapacity"); v) {
+        // 0 = eager (default); upper bound is a sanity cap, not a real
+        // limit — MVP targets K=1, K>1 is an unverified follow-up per the
+        // ADR, but the parser doesn't need to enforce that itself.
+        if (*v > 64) {
+            fail(path, "serving.modelPoolCapacity must be in 0..64 "
+                       "(got " + std::to_string(*v) + ")");
+        }
+        s.modelPoolCapacity = *v;
     }
     return s;
 }

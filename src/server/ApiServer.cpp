@@ -154,9 +154,12 @@ struct ApiServer::Impl {
           embeddingsHandler{std::move(embedders), cfg},
           transcriptionsHandler{std::move(transcribers), cfg},
           speechHandler{std::move(speakers), cfg} {
-        // M-Munin.3: in pool mode the dispatcher resolves each request through
-        // the provider (materialize-on-miss) instead of the eager engine table;
-        // `engine` (the default) is then null and status reports pool mode.
+        // M-Munin.3 (full): when a provider is set, ServeMode keeps the
+        // default model eager (so `engine`/thermal/batcher/spec-dec above
+        // all have their usual concrete anchor) and only registers
+        // NON-default chat models with the pool; the dispatcher checks the
+        // eager default+extras first and falls back to the provider for
+        // anything else (see RequestDispatcher::resolveTarget).
         dispatcher.setModelProvider(cfg.modelProvider);
         makeServer();
         installRoutes();

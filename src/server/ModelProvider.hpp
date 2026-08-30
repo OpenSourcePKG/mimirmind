@@ -11,6 +11,10 @@
 
 namespace mimirmind::runtime {
 class InferenceEngine;
+class SpeculativeDecoder;
+namespace serving {
+class ContinuousBatcher;
+}
 }
 
 namespace mimirmind::server {
@@ -27,11 +31,19 @@ namespace mimirmind::server {
  * resident and `pin` stays empty.
  */
 struct AcquiredModel {
-    runtime::InferenceEngine* engine{nullptr};
-    std::mutex*               mutex{nullptr};
-    std::shared_ptr<void>     pin{};    // release-on-destroy pin on the slot
-    std::string               id{};
-    std::string               title{};
+    runtime::InferenceEngine*            engine{nullptr};
+    std::mutex*                          mutex{nullptr};
+    std::shared_ptr<void>                pin{};    // release-on-destroy pin on the slot
+    std::string                          id{};
+    std::string                          title{};
+    /// M-Munin.3 (full): this slot's own continuous batcher / spec-dec
+    /// decoder, when the provider builds them per-slot (see
+    /// AttachedModelProvider). Null when the model has no serving-class
+    /// batcher (below the capacity threshold) or spec-dec is off/not
+    /// applicable for it. The eager (non-pooled) path never produces an
+    /// AcquiredModel at all, so these fields only matter in pool mode.
+    runtime::serving::ContinuousBatcher* batcher{nullptr};
+    runtime::SpeculativeDecoder*         spec{nullptr};
 };
 
 /// Minimal model descriptor for /v1/models listing.

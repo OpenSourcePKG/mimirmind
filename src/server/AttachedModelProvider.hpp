@@ -5,6 +5,8 @@
 
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/serving/AttachedModelPool.hpp"
+#include "runtime/serving/ContinuousBatcher.hpp"
+#include "runtime/spec/SpeculativeDecoder.hpp"
 #include "server/ModelProvider.hpp"
 
 #include <cstddef>
@@ -32,6 +34,17 @@ struct PooledEngine {
     std::shared_ptr<void>                     keepAliveClient;
     std::string                               title;
     std::mutex                                mutex;
+    /// M-Munin.3 (full): this slot's own continuous batcher (null if the
+    /// model is below the serving-class capacity threshold or batching is
+    /// disabled) and spec-dec decoder (null if speculative.enabled=false or
+    /// this model isn't the speculative.target). Built by ServeMode's
+    /// factory alongside `engine`, torn down automatically on eviction.
+    /// Declared LAST on purpose: C++ destroys members in reverse
+    /// declaration order, so `spec`/`batcher` (which hold a reference into
+    /// `engine`, e.g. a worker thread that calls back into it) are torn
+    /// down BEFORE `engine` itself.
+    std::unique_ptr<runtime::serving::ContinuousBatcher> batcher;
+    std::unique_ptr<runtime::SpeculativeDecoder>          spec;
 };
 
 /**
@@ -86,7 +99,8 @@ public:
         std::shared_ptr<void> pin =
             std::make_shared<typename Pool::Handle>(std::move(handle));
         return AcquiredModel{payload->engine.get(), &payload->mutex,
-                             std::move(pin), modelId, payload->title};
+                             std::move(pin), modelId, payload->title,
+                             payload->batcher.get(), payload->spec.get()};
     }
 
 private:

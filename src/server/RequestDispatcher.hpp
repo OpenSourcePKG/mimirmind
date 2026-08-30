@@ -41,6 +41,12 @@ public:
         runtime::SpeculativeDecoder*  spec{nullptr};  // null for extras
         std::string                   id;             // resolved model id
         std::string                   title;
+        /// M-Munin.3 (full, pool mode only): this slot's own continuous
+        /// batcher, when the pool built one for it (see
+        /// AttachedModelProvider). Always null on the eager path — the
+        /// eager default engine's batcher lives on ServerConfig::batcher
+        /// instead (ChatCompletionHandler combines both sources).
+        runtime::serving::ContinuousBatcher* batcher{nullptr};
         /// M-Munin.3: when the target came from a ModelProvider (pool mode),
         /// this pins the worker-side slot so `engine`/`mutex` stay valid for
         /// the whole request (incl. async stream). Empty on the eager path,

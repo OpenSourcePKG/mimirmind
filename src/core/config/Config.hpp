@@ -368,6 +368,18 @@ struct ServingSettings {
     // fragmentation on short sequences. Must be a power of 2 for
     // future prefix-cache alignment work.
     std::size_t     blockSize{16};
+
+    // M-Munin.3 (per-request model switch): number of chat models the
+    // worker keeps materialized at once in attached mode. 0 (default) =
+    // eager (today's behaviour, every loadOnStart chat model resident for
+    // the whole worker lifetime — no change for standalone / co-resident
+    // deployments). >0 activates the AttachedModelProvider pool: chat
+    // models materialize lazily on first request and the LRU unpinned
+    // slot evicts when a request needs a model past capacity. Only
+    // meaningful with --attach (Munin); ignored in standalone mode. See
+    // decisions/2026-08-22-m-munin3-per-request-model-switch.md. MVP is
+    // K=1; >1 is a config bump once the pool is proven.
+    std::size_t     modelPoolCapacity{0};
 };
 
 /**
