@@ -398,15 +398,22 @@ void Qwen3_5Backend::runFullAttentionBlock(std::size_t   blockIdx,
     trace("enter (full-attn)");
 
     const auto kvDtype = cache.dtype();
-    // FP16 KV uses the Q8_0-style staging redirect: K/V project into an fp32
-    // scratch, rmsnorm + IMRoPE run in fp32 there, then kv_commit_fp16 casts
-    // each row into the fp16 cache (single lossy step). The plain F32 path is
-    // unchanged. Q8_0 is not wired for the Qwen35 IMRoPE path yet.
-    const bool fp16Path = (kvDtype == KvDtype::FP16);
-    if (kvDtype != KvDtype::F32 && !fp16Path) {
+    // FP16 and Q8_0 KV both use the fp32-staging redirect: K/V project into an
+    // fp32 scratch, rmsnorm + IMRoPE run in fp32 there, then a single commit
+    // kernel casts (fp16) or block-quantises (Q8_0) each row into the packed
+    // cache. RoPE cannot run in-place on fp16/Q8_0 storage, so the staging is
+    // mandatory for both. The plain F32 path writes the cache slot in place and
+    // is unchanged. This mirrors the q8Path/fp16Path already live in
+    // Qwen2Backend/GemmaBaseBackend — same building blocks (kvKFp32Scratch,
+    // kv_quant_commit_q8_0 / kv_commit_fp16), just wired through the IMRoPE path.
+    const bool fp16Path   = (kvDtype == KvDtype::FP16);
+    const bool q8Path     = (kvDtype == KvDtype::Q8_0);
+    const bool stagedPath = fp16Path || q8Path;
+    if (kvDtype != KvDtype::F32 && !stagedPath) {
         throw std::runtime_error(
-            "Qwen3_5Backend: only KvDtype::F32 or FP16 is supported "
-            "(FP16 via fp32-staging redirect; Q8_0 not wired for IMRoPE)");
+            "Qwen3_5Backend: only KvDtype::F32, FP16 or Q8_0 is supported "
+            "(FP16/Q8_0 via fp32-staging redirect; other dtypes e.g. FP8_E4M3 "
+            "are not wired for IMRoPE)");
     }
 
     const auto& w    = _weights;
@@ -441,18 +448,18 @@ void Qwen3_5Backend::runFullAttentionBlock(std::size_t   blockIdx,
     void* const kBase = const_cast<void*>(cache.baseK(kvL));
     void* const vBase = const_cast<void*>(cache.baseV(kvL));
 
-    // FP16 staging redirect (mirror of the Q8_0 path in Qwen2Backend): under
-    // fp16 the K/V pre-attention pipeline (projection, QK-norm, IMRoPE) runs on
-    // an fp32 scratch [T, kv_dim] at row 0; kv_commit_fp16 then casts into the
-    // fp16 cache at the curLen offset. The plain F32 path keeps writing the
-    // cache slot in place (kStaging == kBase, F32, curLen offset).
-    float* const kFp32Scratch = fp16Path ? s.kvKFp32Scratch.as<float>() : nullptr;
-    float* const vFp32Scratch = fp16Path ? s.kvVFp32Scratch.as<float>() : nullptr;
-    void* const kStaging = fp16Path ? static_cast<void*>(kFp32Scratch) : kBase;
-    void* const vStaging = fp16Path ? static_cast<void*>(vFp32Scratch) : vBase;
-    const auto  stagingKvDtype    = fp16Path ? KvDtype::F32 : kvDtype;
-    const std::size_t stagingWriteOffset = fp16Path ? 0 : curLen;
-    const std::size_t stagingWriteStride = fp16Path ? 0 : kv_dim;
+    // Staging redirect (fp16 + Q8_0): the K/V pre-attention pipeline
+    // (projection, QK-norm, IMRoPE) runs on an fp32 scratch [T, kv_dim] at row
+    // 0; the commit kernel below then casts (fp16) or block-quantises (Q8_0)
+    // into the packed cache at the curLen offset. The plain F32 path keeps
+    // writing the cache slot in place (kStaging == kBase, F32, curLen offset).
+    float* const kFp32Scratch = stagedPath ? s.kvKFp32Scratch.as<float>() : nullptr;
+    float* const vFp32Scratch = stagedPath ? s.kvVFp32Scratch.as<float>() : nullptr;
+    void* const kStaging = stagedPath ? static_cast<void*>(kFp32Scratch) : kBase;
+    void* const vStaging = stagedPath ? static_cast<void*>(vFp32Scratch) : vBase;
+    const auto  stagingKvDtype    = stagedPath ? KvDtype::F32 : kvDtype;
+    const std::size_t stagingWriteOffset = stagedPath ? 0 : curLen;
+    const std::size_t stagingWriteStride = stagedPath ? 0 : kv_dim;
 
     // --- pre-attention RMSNorm ---------------------------------------
     _ops.profileSection("attn");   // prefill full-attention layer (DECODE_PROFILE)
@@ -473,11 +480,11 @@ void Qwen3_5Backend::runFullAttentionBlock(std::size_t   blockIdx,
                          normBuf, T, qGateFused, matmulScratch);
         _gmm.matmulAsync(kW.type, kW.usmPtr, kv_dim, d_model,
                          normBuf, T,
-                         fp16Path ? kFp32Scratch : static_cast<float*>(kSlot),
+                         stagedPath ? kFp32Scratch : static_cast<float*>(kSlot),
                          matmulScratch);
         _gmm.matmulAsync(vW.type, vW.usmPtr, kv_dim, d_model,
                          normBuf, T,
-                         fp16Path ? vFp32Scratch : static_cast<float*>(vSlot),
+                         stagedPath ? vFp32Scratch : static_cast<float*>(vSlot),
                          matmulScratch);
     }
 
@@ -493,7 +500,7 @@ void Qwen3_5Backend::runFullAttentionBlock(std::size_t   blockIdx,
         T * nHeads, T * nKvHeads, head_dim,
         _config.rmsNormEps,
         /*writeOffset=*/stagingWriteOffset, kv_dim,
-        stagingKvDtype, /*useStagingSlot=*/fp16Path);
+        stagingKvDtype, /*useStagingSlot=*/stagedPath);
 
     // --- IMRoPE on Q and K -------------------------------------------
     trace("IMRoPE Q+K");
@@ -508,12 +515,18 @@ void Qwen3_5Backend::runFullAttentionBlock(std::size_t   blockIdx,
                                stagingWriteStride, stagingKvDtype);
     }
 
-    // --- FP16 commit: cast the roped/normed fp32 K/V scratch into the fp16
-    // cache at the curLen write offset (single lossy step, like Q8_0 commit).
+    // --- Commit: fold the roped/normed fp32 K/V scratch into the packed cache
+    // at the curLen write offset. FP16 = single cast per element; Q8_0 =
+    // per-32-element-block absmax + quantise. Same immediate/replay semantics
+    // as the Qwen2Backend q8Path. F32 wrote in place, so no commit needed.
     if (fp16Path) {
         trace("KV commit fp16 (K + V)");
         _ops.kvCommitFp16Async(kFp32Scratch, kBase, T, kv_dim, curLen);
         _ops.kvCommitFp16Async(vFp32Scratch, vBase, T, kv_dim, curLen);
+    } else if (q8Path) {
+        trace("KV commit Q8_0 (K + V)");
+        _ops.kvQuantCommitQ8Async(kFp32Scratch, kBase, T, kv_dim, curLen);
+        _ops.kvQuantCommitQ8Async(vFp32Scratch, vBase, T, kv_dim, curLen);
     }
 
     // --- GQA attention -----------------------------------------------
