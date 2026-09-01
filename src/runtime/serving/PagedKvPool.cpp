@@ -4,6 +4,7 @@
 #include "runtime/serving/PagedKvPool.hpp"
 
 #include "compute/ComputeOps.hpp"
+#include "core/gpu/AllocCategory.hpp"
 #include "core/log/Log.hpp"
 
 #include <cstddef>
@@ -42,6 +43,8 @@ PagedKvPool::PagedKvPool(compute::ComputeOps& ops,
     const std::size_t poolElems = _numBlocks * blockElems();
     const std::size_t poolBytes = poolElems * elemBytes();
 
+    // 8.16 Stage B: tag the resident paged-KV slab as KvCache.
+    core::gpu::ScopedAllocCategory _kc{core::gpu::AllocCategory::KvCache};
     _kOwners.reserve(_numLayers);
     _vOwners.reserve(_numLayers);
     _kPool.reserve(_numLayers);

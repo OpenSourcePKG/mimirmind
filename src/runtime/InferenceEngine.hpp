@@ -804,6 +804,13 @@ public:
         bool        deviceMemAvailable{false};
         std::size_t deviceTotalBytes{0};
         std::size_t deviceFreeBytes{0};
+        // 8.16 Stage B — central-allocator per-category live/peak bytes
+        // (index = core::gpu::AllocCategory). allocCatAvailable is true when the
+        // backend tracks categories (any non-zero); then `external` can be
+        // computed as deviceUsed - Σ(allocCatLive) instead of the owner-sum.
+        bool allocCatAvailable{false};
+        std::array<std::uint64_t, core::gpu::kAllocCategoryCount> allocCatLive{};
+        std::array<std::uint64_t, core::gpu::kAllocCategoryCount> allocCatPeak{};
     };
     [[nodiscard]] MemoryTelemetry memoryTelemetry() const;
 

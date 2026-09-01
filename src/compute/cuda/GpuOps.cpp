@@ -975,6 +975,16 @@ core::cuda::CudaMemoryAllocator& GpuOps::allocator() noexcept {
     return _ctx.allocator();
 }
 
+std::array<std::uint64_t, core::gpu::kAllocCategoryCount>
+GpuOps::allocatorCategoryLiveBytes() const {
+    return _ctx.allocator().stats().liveBytesByCategory;
+}
+
+std::array<std::uint64_t, core::gpu::kAllocCategoryCount>
+GpuOps::allocatorCategoryPeakBytes() const {
+    return _ctx.allocator().stats().peakBytesByCategory;
+}
+
 std::string_view GpuOps::q8_0ReorderModeName() const noexcept {
     switch (_q8_0ReorderMode) {
         case core::config::TriState::Auto:    return "auto";

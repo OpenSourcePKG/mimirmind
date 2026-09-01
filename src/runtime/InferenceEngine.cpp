@@ -10,6 +10,7 @@
 
 #include "compute/Embedding.hpp"
 #include "compute/cpu/GpuMatmul.hpp"
+#include "core/gpu/AllocCategory.hpp"
 #include "compute/cpu/GpuOps.hpp"
 #include "core/backend/BackendRegistry.hpp"
 #include "core/backend/HwFingerprint.hpp"
@@ -433,6 +434,13 @@ InferenceEngine::MemoryTelemetry InferenceEngine::memoryTelemetry() const {
         mt.deviceTotalBytes   = total;
         mt.deviceFreeBytes    = _computeCtx->deviceFreeMemoryBytes();
     }
+    // 8.16 Stage B — central-allocator per-category bytes (neutral virtual;
+    // all-zero on backends without tracking -> owner-sum path in the handler).
+    mt.allocCatLive = _ops->allocatorCategoryLiveBytes();
+    mt.allocCatPeak = _ops->allocatorCategoryPeakBytes();
+    std::uint64_t catSum = 0;
+    for (const auto v : mt.allocCatLive) catSum += v;
+    mt.allocCatAvailable = catSum > 0;
     return mt;
 }
 
@@ -448,7 +456,10 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     _tokenizer.loadFromGguf(_reader);
 
     MM_LOG_INFO("engine", "loadModel: copying tensors into USM");
-    _reader.loadTensors(*_ops);
+    {
+        core::gpu::ScopedAllocCategory _wc{core::gpu::AllocCategory::Weights};
+        _reader.loadTensors(*_ops);   // 8.16 Stage B: tag GGUF weights
+    }
 
     _weights.emplace(_reader);
 
@@ -464,7 +475,10 @@ void InferenceEngine::loadModelNvfp4(std::string_view checkpointDir,
     // collaborator) to keep this translation unit focused on generation. It
     // populates _config / _tokenizer / _materializedBf16 / _weights; we run the
     // shared finalize tail here.
-    engine::Nvfp4Loader::load(*this, checkpointDir, tokenizerGguf);
+    {
+        core::gpu::ScopedAllocCategory _wc{core::gpu::AllocCategory::Weights};
+        engine::Nvfp4Loader::load(*this, checkpointDir, tokenizerGguf);
+    }
     finalizeLoad();
 }
 
@@ -591,7 +605,10 @@ void InferenceEngine::loadModelAttachedNvfp4(
 
     // The materialization reads the shards from `sm` (shm-backed) and uploads
     // BF16 to the device; the text sidecars come from the local checkpointDir.
-    engine::Nvfp4Loader::load(*this, checkpointDir, tokenizerGguf, &sm);
+    {
+        core::gpu::ScopedAllocCategory _wc{core::gpu::AllocCategory::Weights};
+        engine::Nvfp4Loader::load(*this, checkpointDir, tokenizerGguf, &sm);
+    }
     finalizeLoad();
 #endif // MIMIRMIND_HAVE_CUDA
 }

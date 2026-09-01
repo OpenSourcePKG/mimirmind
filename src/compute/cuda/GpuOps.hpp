@@ -490,6 +490,12 @@ public:
     void uploadHostBytes(void* deviceDst, const void* hostSrc,
                          std::size_t bytes) override;
 
+    // 8.16 Stage B — project the CUDA allocator's per-category live/peak bytes.
+    [[nodiscard]] std::array<std::uint64_t, core::gpu::kAllocCategoryCount>
+        allocatorCategoryLiveBytes() const override;
+    [[nodiscard]] std::array<std::uint64_t, core::gpu::kAllocCategoryCount>
+        allocatorCategoryPeakBytes() const override;
+
     // ---- HIP-native accessors ----------------------------------------
     //
     // Mirror `GpuOps::queue()` / `allocator()` — consumers that need

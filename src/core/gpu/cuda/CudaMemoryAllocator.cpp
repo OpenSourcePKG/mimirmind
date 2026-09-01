@@ -71,6 +71,30 @@ void CudaMemoryAllocator::recordFree(std::size_t bytes) noexcept {
     _stats.liveBytes = (_stats.liveBytes >= bytes) ? _stats.liveBytes - bytes : 0;
 }
 
+void CudaMemoryAllocator::chargeCategory(void* ptr, std::size_t bytes) noexcept {
+    const auto        cat = gpu::ScopedAllocCategory::current();
+    const std::size_t idx = static_cast<std::size_t>(cat) < gpu::kAllocCategoryCount
+                          ? static_cast<std::size_t>(cat) : 0;
+    std::lock_guard<std::mutex> lk{_catMutex};
+    _ptrCategory[ptr] = cat;
+    _stats.liveBytesByCategory[idx] += bytes;
+    _stats.peakBytesByCategory[idx] =
+        std::max(_stats.peakBytesByCategory[idx], _stats.liveBytesByCategory[idx]);
+}
+
+void CudaMemoryAllocator::unchargeCategory(void* ptr, std::size_t bytes) noexcept {
+    std::lock_guard<std::mutex> lk{_catMutex};
+    const auto it = _ptrCategory.find(ptr);
+    const auto cat = (it != _ptrCategory.end()) ? it->second
+                                                : gpu::AllocCategory::Unknown;
+    const std::size_t idx = static_cast<std::size_t>(cat) < gpu::kAllocCategoryCount
+                          ? static_cast<std::size_t>(cat) : 0;
+    _stats.liveBytesByCategory[idx] =
+        (_stats.liveBytesByCategory[idx] >= bytes)
+            ? _stats.liveBytesByCategory[idx] - bytes : 0;
+    if (it != _ptrCategory.end()) _ptrCategory.erase(it);
+}
+
 void* CudaMemoryAllocator::allocate(std::size_t bytes, CudaAllocKind kind) {
     if (bytes == 0) return nullptr;
 
@@ -96,6 +120,7 @@ void* CudaMemoryAllocator::allocate(std::size_t bytes, CudaAllocKind kind) {
         throw CudaError(std::string("cuda alloc (") + kindName(kind) + ")", rc);
     }
     recordAlloc(bytes);
+    chargeCategory(ptr, bytes);
     return ptr;
 }
 
@@ -118,6 +143,7 @@ void CudaMemoryAllocator::deallocate(void*         ptr,
         MM_LOG_WARN("CudaMem", "free ({}) failed: {}",
                     kindName(kind), cudaGetErrorString(rc));
     }
+    unchargeCategory(ptr, bytes);
     recordFree(bytes);
 }
 

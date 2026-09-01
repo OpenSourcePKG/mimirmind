@@ -4,10 +4,14 @@
 #pragma once
 
 #include "core/gpu/cuda/CudaContext.hpp"
+#include "core/gpu/AllocCategory.hpp"
 #include "core/log/Log.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
 
 namespace mimirmind::core::cuda {
 
@@ -49,6 +53,10 @@ struct CudaMemStats {
     std::uint64_t bytesCopiedD2D      {0};
     std::uint64_t failedAllocs        {0};
     std::uint64_t managedFallbackHits {0};   // DGX-Spark KV-managed count
+    // 8.16 Stage B — live/peak bytes per AllocCategory (index = enum value),
+    // booked from the thread_local ScopedAllocCategory active at allocate().
+    std::array<std::uint64_t, gpu::kAllocCategoryCount> liveBytesByCategory{};
+    std::array<std::uint64_t, gpu::kAllocCategoryCount> peakBytesByCategory{};
 };
 
 /**
@@ -145,8 +153,19 @@ private:
     CudaContext&  _ctx;
     CudaMemStats  _stats{};
 
+    // 8.16 Stage B — per-pointer category so deallocate() decrements the same
+    // bucket allocate() charged (the allocator has no other ptr->size record;
+    // the caller passes `bytes` back but not the category). cudaMalloc/free is
+    // infrequent (persistent weight/KV/scratch buffers, not per-token), so the
+    // map + mutex cost is negligible and keeps the free path correct.
+    std::unordered_map<void*, gpu::AllocCategory> _ptrCategory;
+    std::mutex                                    _catMutex;
+
     void recordAlloc(std::size_t bytes) noexcept;
     void recordFree(std::size_t bytes) noexcept;
+    // Category bookkeeping (index-safe; clamps unknown to 0).
+    void chargeCategory(void* ptr, std::size_t bytes) noexcept;
+    void unchargeCategory(void* ptr, std::size_t bytes) noexcept;
 };
 
 /**

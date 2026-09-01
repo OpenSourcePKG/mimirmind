@@ -5,8 +5,10 @@
 
 #include "compute/ComputeBuffer.hpp"
 #include "core/config/Config.hpp"
+#include "core/gpu/AllocCategory.hpp"
 #include "runtime/KvCache.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -1257,6 +1259,17 @@ public:
     [[nodiscard]] virtual ComputeBuffer allocateWeight(std::size_t bytes) {
         return allocate(bytes);
     }
+
+    /// 8.16 Stage B — live / peak device bytes per core::gpu::AllocCategory
+    /// (index-aligned with the enum) tracked by this backend's central
+    /// allocator, so GET /v1/system/memory can decompose the resident
+    /// footprint instead of a single `external` lump. Default all-zero for
+    /// backends without category tracking (they degrade to the owner-sum
+    /// path). Never throws.
+    [[nodiscard]] virtual std::array<std::uint64_t, core::gpu::kAllocCategoryCount>
+        allocatorCategoryLiveBytes() const { return {}; }
+    [[nodiscard]] virtual std::array<std::uint64_t, core::gpu::kAllocCategoryCount>
+        allocatorCategoryPeakBytes() const { return {}; }
 
     /// Synchronous host-to-device copy. Blocks until the transfer is
     /// visible to subsequent GPU dispatches. Used by loaders that need

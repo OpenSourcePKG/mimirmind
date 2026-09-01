@@ -4,6 +4,7 @@
 #include "runtime/engine/ServingSession.hpp"
 
 #include "compute/Embedding.hpp"
+#include "core/gpu/AllocCategory.hpp"
 #include "core/log/Log.hpp"
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
@@ -769,19 +770,25 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     const std::size_t nPoolLayers = nFullAttn + (hasMtp ? 1 : 0);
     st->mtpPoolLayer = hasMtp ? nFullAttn
                               : std::numeric_limits<std::size_t>::max();
-    st->pool = std::make_unique<serving::PagedKvPool>(
-        *_e._ops, nPoolLayers, st->numBlocks, st->blockSize, nKvHeads, headDim,
-        servingKvDtypeFor(_e));
-    st->ssm = std::make_unique<SsmState>(
-        *_e._ops, st->blockCount, _e._config.ssmStateElemsPerLayer(),
-        _e._config.ssmConvStateElemsPerLayer(), maxBatch);
+    {   // 8.16 Stage B: paged-KV pool + SSM recurrent state = KvCache.
+        core::gpu::ScopedAllocCategory _kc{core::gpu::AllocCategory::KvCache};
+        st->pool = std::make_unique<serving::PagedKvPool>(
+            *_e._ops, nPoolLayers, st->numBlocks, st->blockSize, nKvHeads, headDim,
+            servingKvDtypeFor(_e));
+        st->ssm = std::make_unique<SsmState>(
+            *_e._ops, st->blockCount, _e._config.ssmStateElemsPerLayer(),
+            _e._config.ssmConvStateElemsPerLayer(), maxBatch);
+    }
 
     const auto qkv = qb->maxQKVDims();
-    st->sb = allocBlockBuffers(*_e._ops, _e._config, /*maxT=*/maxBatch,
-                               /*maxSeq=*/maxBatch, qkv.first, qkv.second,
-                               /*withFusedQkv=*/false, /*withKvFp32Scratch=*/true,
-                               /*withQGate=*/true, /*withSsm=*/true,
-                               /*perSeqConvInput=*/true);
+    {   // 8.16 Stage B: the per-slot block-buffer substrate = Session.
+        core::gpu::ScopedAllocCategory _sc{core::gpu::AllocCategory::Session};
+        st->sb = allocBlockBuffers(*_e._ops, _e._config, /*maxT=*/maxBatch,
+                                   /*maxSeq=*/maxBatch, qkv.first, qkv.second,
+                                   /*withFusedQkv=*/false, /*withKvFp32Scratch=*/true,
+                                   /*withQGate=*/true, /*withSsm=*/true,
+                                   /*perSeqConvInput=*/true);
+    }
     st->sb->ssmStatePtr     = st->ssm->statePtr();
     st->sb->ssmConvStatePtr = st->ssm->convStatePtr();
     st->sb->ssmSlabNSeq     = st->ssm->nSeq();

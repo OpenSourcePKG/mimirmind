@@ -493,18 +493,46 @@ json SystemStatusBuilder::buildMemory() const {
         {"kv_paged",      kvPaged},
     };
 
-    // external = deviceUsed - Σ(accounted owners). Explicit residual: library
-    // workspaces (cuBLAS/cuDNN), direct GpuMatmul scratch, and co-resident
-    // models — never 100% decomposable on CUDA (Stage B narrows it).
+    // 8.16 Stage B — central-allocator per-category breakdown (live + peak).
+    // Present only when the backend tracks categories (CUDA today; L0/HIP
+    // return zeros -> owner-sum path). This decomposes what used to be one
+    // `external` lump into weights/kv_cache/session/scratch/unknown.
+    std::uint64_t allocTracked = 0;
+    json allocatorCategories;
+    if (mt.allocCatAvailable) {
+        allocatorCategories = json::object();
+        for (std::size_t i = 0; i < core::gpu::kAllocCategoryCount; ++i) {
+            allocTracked += mt.allocCatLive[i];
+            allocatorCategories[std::string(core::gpu::allocCategoryName(i))] = json{
+                {"live_bytes", mt.allocCatLive[i]},
+                {"peak_bytes", mt.allocCatPeak[i]},
+            };
+        }
+    } else {
+        allocatorCategories = json{
+            {"available", false},
+            {"reason", "central-allocator category tagging not active on this "
+                       "backend"}};
+    }
+
+    // external = deviceUsed - Σ(tracked). With Stage-B category tracking the
+    // subtrahend is the allocator-tracked total (precise); otherwise it falls
+    // back to the owner-sum (weights + kv). Residual = allocations that bypass
+    // the central allocator: GpuMatmul direct cudaMalloc, cuBLAS/cuDNN internal
+    // workspaces, and (on a multi-model host) other engines' allocators.
     json external = mt.deviceMemAvailable
         ? [&] {
-              const std::size_t accounted = mt.weightBytes + mt.kvResidentBytes;
+              const std::size_t accounted = mt.allocCatAvailable
+                  ? static_cast<std::size_t>(allocTracked)
+                  : mt.weightBytes + mt.kvResidentBytes;
               return json{{"available", true},
                           {"bytes", deviceUsed >= accounted
                                         ? deviceUsed - accounted : 0},
-                          {"note", "unaccounted device use: library workspaces "
-                                   "(cuBLAS/cuDNN), direct scratch, co-resident "
-                                   "models"}};
+                          {"basis", mt.allocCatAvailable ? "allocator-tracked"
+                                                         : "owner-sum"},
+                          {"note", "unaccounted device use: GpuMatmul direct "
+                                   "cudaMalloc + cuBLAS/cuDNN workspaces + "
+                                   "other engines (multi-model host)"}};
           }()
         : json{{"available", false},
                {"reason", "device mem-info unavailable"}};
@@ -533,10 +561,11 @@ json SystemStatusBuilder::buildMemory() const {
 #endif
 
     return json{
-        {"device",        device},
-        {"categories",    categories},
-        {"external",      external},
-        {"fragmentation", fragmentation},
+        {"device",               device},
+        {"categories",           categories},
+        {"allocator_categories", allocatorCategories},
+        {"external",             external},
+        {"fragmentation",        fragmentation},
     };
 }
 
