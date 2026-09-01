@@ -238,6 +238,99 @@ __device__ __forceinline__ void grouped_gemm_nvfp4blk_core_m1reg(
     }
 }
 
+// M-REG — decode small-M (M<=MAX_M) grouped GEMM with activations staged in
+// REGISTERS instead of shared memory, extending the m1reg technique (above) to
+// M>1. ncu on the m4 (shared-xTile) kernel at the serving shape (E=256, M~=2)
+// showed ~34% of the 273 GB/s weight-read roofline vs ~48% for m1reg: the
+// per-K-tile smem staging + __syncthreads is the bottleneck at small M. Here
+// each warp still owns one output column n and reads its weight row once, but
+// every lane stages its M rows' activation elements (one per super in the tile)
+// into registers with coalesced global (L2-resident) loads, then the inner loop
+// reads x from registers — no smem, no __syncthreads, no MIO stall. Cost: MAX_M *
+// (GEMM_X_TILE/32) extra registers (M2=16, M4=32 floats); the M2 variant keeps
+// occupancy high for the common conc64 tile. Bit-identical to the shared m4/m16
+// core (same math, same accumulation order per k).
+template <int MAX_M>
+__device__ __forceinline__ void grouped_gemm_nvfp4blk_core_mreg(
+    const float*         __restrict__ X,
+    const unsigned char* __restrict__ W,
+          float*         __restrict__ Y,
+    const int*           __restrict__ tileExpert,
+    const int*           __restrict__ tileRow0,
+    const int*           __restrict__ tileRows,
+    const int                          K,
+    const int                          N)
+{
+    const int tt = blockIdx.y;
+    const int e  = tileExpert[tt];
+    if (e < 0) {
+        return;
+    }
+    const int laneId = threadIdx.x % 32;
+    const int warpId = threadIdx.x / 32;
+    const int n      = blockIdx.x * MATMUL_NVBLK_GEMM_WARPS + warpId;
+    if (n >= N) {
+        return;                                    // whole warp exits together
+    }
+    const int row0   = tileRow0[tt];
+    int M            = tileRows[tt];
+    if (M > MAX_M) {
+        M = MAX_M;
+    }
+    const int nSuper = K / NVBLK_SUPER_ELEMENTS;
+
+    const float*         __restrict__ Xt = X + static_cast<size_t>(row0) * K;
+    float*               __restrict__ Yt = Y + static_cast<size_t>(row0) * N;
+    const unsigned char* __restrict__ Wrow =
+        W + ((static_cast<size_t>(e) * N + n) * nSuper) * NVBLK_SUPER_BYTES;
+
+    float acc[MAX_M];
+#pragma unroll
+    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
+
+    for (int tile = 0; tile < K; tile += GEMM_X_TILE) {
+        // Stage M rows' activation elements (one per super in the tile) into
+        // registers; lanes 0..31 read 32 consecutive floats per super => coalesced.
+        float xr[MAX_M][M1REG_SUPERS_PER_TILE];
+#pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+#pragma unroll
+            for (int j = 0; j < M1REG_SUPERS_PER_TILE; ++j) {
+                const int k = tile + j * NVBLK_SUPER_ELEMENTS + laneId;
+                xr[m][j] = (m < M && k < K)
+                         ? Xt[static_cast<size_t>(m) * K + k] : 0.0f;
+            }
+        }
+        const int superStart = tile / NVBLK_SUPER_ELEMENTS;
+#pragma unroll
+        for (int j = 0; j < M1REG_SUPERS_PER_TILE; ++j) {
+            const int sp = superStart + j;
+            if (sp >= nSuper) {
+                break;
+            }
+            const unsigned char* blk =
+                Wrow + static_cast<size_t>(sp) * NVBLK_SUPER_BYTES;
+            const float s0 = __half2float(*reinterpret_cast<const __half*>(blk));
+            const float s1 = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+            const unsigned char byte = blk[4 + (laneId >> 1)];
+            const unsigned nib = (laneId & 1) ? (byte >> 4) : (byte & 0x0F);
+            const float w = ((laneId < 16) ? s0 : s1) * dq_e2m1(nib);
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                acc[m] = __fmaf_rn(w, xr[m][j], acc[m]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        const float s = warpReduceSum(acc[m]);   // full-warp reduce (no divergence)
+        if (m < M && laneId == 0) {
+            Yt[static_cast<size_t>(m) * N + n] = s;
+        }
+    }
+}
+
 } // namespace
 
 // M16 — prefill / large-M grouped GEMM (16 KB shared, acc[16]).
@@ -274,4 +367,29 @@ void moe_grouped_gemm_nvfp4blk_m1reg(
     const int K, const int N)
 {
     grouped_gemm_nvfp4blk_core_m1reg(X, W, Y, tileExpert, tileRow0, tileRows, K, N);
+}
+
+// M2-REG — decode small-M (M<=2) grouped GEMM, register-staged activations
+// (16 extra float regs). The conc64 common tile (~2 tokens/expert at top-8).
+extern "C" __global__ __launch_bounds__(MATMUL_NVBLK_GEMM_LOCAL)
+void moe_grouped_gemm_nvfp4blk_m2reg(
+    const float* __restrict__ X, const unsigned char* __restrict__ W,
+    float* __restrict__ Y, const int* __restrict__ tileExpert,
+    const int* __restrict__ tileRow0, const int* __restrict__ tileRows,
+    const int K, const int N)
+{
+    grouped_gemm_nvfp4blk_core_mreg<2>(X, W, Y, tileExpert, tileRow0, tileRows, K, N);
+}
+
+// M4-REG — decode small-M (M<=4) grouped GEMM, register-staged activations
+// (32 extra float regs). Replaces the shared-xTile m4 at the serving shape if
+// the register-staging win beats the occupancy cost.
+extern "C" __global__ __launch_bounds__(MATMUL_NVBLK_GEMM_LOCAL)
+void moe_grouped_gemm_nvfp4blk_m4reg(
+    const float* __restrict__ X, const unsigned char* __restrict__ W,
+    float* __restrict__ Y, const int* __restrict__ tileExpert,
+    const int* __restrict__ tileRow0, const int* __restrict__ tileRows,
+    const int K, const int N)
+{
+    grouped_gemm_nvfp4blk_core_mreg<4>(X, W, Y, tileExpert, tileRow0, tileRows, K, N);
 }

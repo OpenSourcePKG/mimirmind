@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <vector>
 
 // Prod kernels under test (extern-C, compiled in via CMake second source).
@@ -31,6 +32,20 @@ extern "C" __global__ void moe_grouped_gemm_nvfp4blk_m4(
 extern "C" __global__ void moe_grouped_gemm_nvfp4blk_m1reg(
     const float* X, const unsigned char* W, float* Y,
     const int* tileExpert, const int* tileRow0, const int* tileRows, int K, int N);
+extern "C" __global__ void moe_grouped_gemm_nvfp4blk_m2reg(
+    const float* X, const unsigned char* W, float* Y,
+    const int* tileExpert, const int* tileRow0, const int* tileRows, int K, int N);
+extern "C" __global__ void moe_grouped_gemm_nvfp4blk_m4reg(
+    const float* X, const unsigned char* W, float* Y,
+    const int* tileExpert, const int* tileRow0, const int* tileRows, int K, int N);
+
+// Kernel selector for the bench/parity harness.
+enum Kern { K_M4 = 0, K_M1REG, K_M2REG, K_M4REG };
+static const char* kernName(Kern k) {
+    switch (k) { case K_M4: return "m4"; case K_M1REG: return "m1reg";
+                 case K_M2REG: return "m2reg"; case K_M4REG: return "m4reg"; }
+    return "?";
+}
 
 static constexpr int   kSuperElems = 32;
 static constexpr int   kSuperBytes = 20;
@@ -60,9 +75,20 @@ static void fillBank(std::vector<unsigned char>& W) {
     }
 }
 
+// Launch the selected kernel (all share the same signature/launch geometry).
+static void launchKern(Kern kern, dim3 grid, dim3 block,
+                       const float* dX, const unsigned char* dW, float* dY,
+                       const int* dTE, const int* dTR0, const int* dTR1, int K, int N) {
+    switch (kern) {
+        case K_M4:    moe_grouped_gemm_nvfp4blk_m4   <<<grid, block>>>(dX, dW, dY, dTE, dTR0, dTR1, K, N); break;
+        case K_M1REG: moe_grouped_gemm_nvfp4blk_m1reg<<<grid, block>>>(dX, dW, dY, dTE, dTR0, dTR1, K, N); break;
+        case K_M2REG: moe_grouped_gemm_nvfp4blk_m2reg<<<grid, block>>>(dX, dW, dY, dTE, dTR0, dTR1, K, N); break;
+        case K_M4REG: moe_grouped_gemm_nvfp4blk_m4reg<<<grid, block>>>(dX, dW, dY, dTE, dTR0, dTR1, K, N); break;
+    }
+}
+
 // Serving-decode launch: E expert-tiles, grid.y=E, M rows per tile (all experts active).
-// useM1reg selects the single-user register-staged kernel (only valid for M==1).
-static void benchShape(const char* tag, int E, int N, int K, int M, int iters, bool useM1reg) {
+static void benchShape(Kern kern, int E, int N, int K, int M, int iters) {
     const int    nSuper = K / kSuperElems;
     const size_t wBytes = static_cast<size_t>(E) * N * nSuper * kSuperBytes;
     const int    rows   = E * M;
@@ -90,10 +116,7 @@ static void benchShape(const char* tag, int E, int N, int K, int M, int iters, b
     dim3 grid((N + kWarps - 1) / kWarps, E, 1);
     dim3 block(kLocal, 1, 1);
     auto launch = [&]() {
-        if (useM1reg)
-            moe_grouped_gemm_nvfp4blk_m1reg<<<grid, block>>>(dX, dW, dY, dTE, dTR0, dTR1, K, N);
-        else
-            moe_grouped_gemm_nvfp4blk_m4<<<grid, block>>>(dX, dW, dY, dTE, dTR0, dTR1, K, N);
+        launchKern(kern, grid, block, dX, dW, dY, dTE, dTR0, dTR1, K, N);
     };
 
     for (int i = 0; i < 10; ++i) launch();
@@ -115,41 +138,93 @@ static void benchShape(const char* tag, int E, int N, int K, int M, int iters, b
     const double usPerTok  = us / static_cast<double>(E * M);
     const double idealUs   = static_cast<double>(wBytes) / (kPeakGBs * 1e9) * 1e6; // weight-read floor
 
-    std::printf("| %-8s E=%-3d M=%d N=%-5d K=%-5d | %8.2f us | %6.1f GB/s | %5.1f%% | %7.3f us/tok | roof %6.1fus |\n",
-                tag, E, M, N, K, us, gbps, pct, usPerTok, idealUs);
+    std::printf("| %-6s E=%-3d M=%d N=%-5d K=%-5d | %8.2f us | %6.1f GB/s | %5.1f%% | %7.3f us/tok | roof %6.1fus |\n",
+                kernName(kern), E, M, N, K, us, gbps, pct, usPerTok, idealUs);
 
     cudaEventDestroy(a); cudaEventDestroy(b);
     cudaFree(dW); cudaFree(dX); cudaFree(dY);
     cudaFree(dTE); cudaFree(dTR0); cudaFree(dTR1);
 }
 
+// Parity: run the reference m4 and a candidate kernel on identical inputs and
+// report max abs diff over Y. The register-staged variants must be bit-identical
+// (same math, same per-k accumulation order) -> expect exactly 0.
+static double parityCheck(Kern cand, int E, int N, int K, int M) {
+    const int    nSuper = K / kSuperElems;
+    const size_t wBytes = static_cast<size_t>(E) * N * nSuper * kSuperBytes;
+    const int    rows   = E * M;
+
+    std::vector<unsigned char> hW(wBytes); fillBank(hW);
+    std::vector<float> hX(static_cast<size_t>(rows) * K);
+    for (size_t i = 0; i < hX.size(); ++i) hX[i] = 0.25f + 0.5f * ((i % 7) / 7.0f);
+    std::vector<int> hTE(E), hTR0(E), hTR1(E, M);
+    for (int t = 0; t < E; ++t) { hTE[t] = t; hTR0[t] = t * M; }
+
+    unsigned char* dW = nullptr; float* dX = nullptr; float* dYr = nullptr; float* dYc = nullptr;
+    int *dTE = nullptr, *dTR0 = nullptr, *dTR1 = nullptr;
+    ck(cudaMalloc(&dW, wBytes), "pW"); ck(cudaMalloc(&dX, hX.size()*sizeof(float)), "pX");
+    ck(cudaMalloc(&dYr, (size_t)rows*N*sizeof(float)), "pYr");
+    ck(cudaMalloc(&dYc, (size_t)rows*N*sizeof(float)), "pYc");
+    ck(cudaMalloc(&dTE, E*sizeof(int)), "pTE"); ck(cudaMalloc(&dTR0, E*sizeof(int)), "pTR0");
+    ck(cudaMalloc(&dTR1, E*sizeof(int)), "pTR1");
+    ck(cudaMemcpy(dW, hW.data(), wBytes, cudaMemcpyHostToDevice), "cW");
+    ck(cudaMemcpy(dX, hX.data(), hX.size()*sizeof(float), cudaMemcpyHostToDevice), "cX");
+    ck(cudaMemcpy(dTE, hTE.data(), E*sizeof(int), cudaMemcpyHostToDevice), "cTE");
+    ck(cudaMemcpy(dTR0, hTR0.data(), E*sizeof(int), cudaMemcpyHostToDevice), "cTR0");
+    ck(cudaMemcpy(dTR1, hTR1.data(), E*sizeof(int), cudaMemcpyHostToDevice), "cTR1");
+
+    dim3 grid((N + kWarps - 1) / kWarps, E, 1); dim3 block(kLocal, 1, 1);
+    launchKern(K_M4, grid, block, dX, dW, dYr, dTE, dTR0, dTR1, K, N);
+    launchKern(cand,  grid, block, dX, dW, dYc, dTE, dTR0, dTR1, K, N);
+    ck(cudaDeviceSynchronize(), "parity sync");
+
+    std::vector<float> hr((size_t)rows*N), hc((size_t)rows*N);
+    ck(cudaMemcpy(hr.data(), dYr, hr.size()*sizeof(float), cudaMemcpyDeviceToHost), "gYr");
+    ck(cudaMemcpy(hc.data(), dYc, hc.size()*sizeof(float), cudaMemcpyDeviceToHost), "gYc");
+    double maxd = 0.0;
+    for (size_t i = 0; i < hr.size(); ++i) {
+        const double d = std::abs(static_cast<double>(hr[i]) - static_cast<double>(hc[i]));
+        if (d > maxd) maxd = d;
+    }
+    cudaFree(dW); cudaFree(dX); cudaFree(dYr); cudaFree(dYc);
+    cudaFree(dTE); cudaFree(dTR0); cudaFree(dTR1);
+    std::printf("# parity %-6s vs m4  E=%d M=%d N=%d K=%d : max|dY|=%.3e  %s\n",
+                kernName(cand), E, M, N, K, maxd, maxd == 0.0 ? "BIT-IDENTICAL" : (maxd < 1e-3 ? "OK" : "MISMATCH"));
+    return maxd;
+}
+
 int main(int argc, char** argv) {
     int dev = 0; cudaSetDevice(dev);
     cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev);
     std::printf("# moe_grouped_serving_bench on %s (sm_%d%d), peak=%.0f GB/s\n",
-                prop.name, prop.major, prop.minor, kPeakGBs);
+                prop.name, prop.major, prop.minor, static_cast<double>(kPeakGBs));
     std::printf("# SERVING decode shape: E=256 experts all active, M rows/expert (conc64 top-8 ~= M2)\n");
-    std::printf("# Qwen3.6-35B-A3B: gate/up N=512 K=2048 ; down N=2048 K=512\n");
-    std::printf("| kernel   shape                  | us/call  | GB/s   | %%peak | us/token   | ideal      |\n");
-    std::printf("|---|---|---|---|---|---|\n");
+    std::printf("# Qwen3.6-35B-A3B: gate/up N=512 K=2048 ; down N=2048 K=512\n\n");
 
     const int iters = (argc > 1) ? std::atoi(argv[1]) : 300;
     const int E = 256;
 
+    std::printf("## parity (register-staged variants must match the shared m4 core)\n");
+    parityCheck(K_M2REG, 64, 512, 2048, 2);
+    parityCheck(K_M4REG, 64, 512, 2048, 4);
+    parityCheck(K_M4REG, 64, 2048, 512, 3);   // ragged M<MAX_M
+    parityCheck(K_M2REG, 64, 2048, 512, 1);   // M<MAX_M
+    std::printf("\n");
+
+    std::printf("## perf (%%peak reading all 256 experts once = weight-BW efficiency)\n");
+    std::printf("| kernel shape                    | us/call  | GB/s   | %%peak | us/token   | ideal      |\n");
+    std::printf("|---|---|---|---|---|---|\n");
     std::printf("# --- gate/up projection (N=512, K=2048) ---\n");
-    benchShape("m1reg", E, 512, 2048, 1, iters, /*useM1reg=*/true);
-    benchShape("m4",    E, 512, 2048, 1, iters, false);
-    benchShape("m4",    E, 512, 2048, 2, iters, false);
-    benchShape("m4",    E, 512, 2048, 4, iters, false);
-
+    benchShape(K_M4,    E, 512, 2048, 2, iters);
+    benchShape(K_M2REG, E, 512, 2048, 2, iters);   // <-- Inc-3 candidate at conc64 M2
+    benchShape(K_M4,    E, 512, 2048, 4, iters);
+    benchShape(K_M4REG, E, 512, 2048, 4, iters);
     std::printf("# --- down projection (N=2048, K=512) ---\n");
-    benchShape("m1reg", E, 2048, 512, 1, iters, /*useM1reg=*/true);
-    benchShape("m4",    E, 2048, 512, 1, iters, false);
-    benchShape("m4",    E, 2048, 512, 2, iters, false);
-    benchShape("m4",    E, 2048, 512, 4, iters, false);
+    benchShape(K_M4,    E, 2048, 512, 2, iters);
+    benchShape(K_M2REG, E, 2048, 512, 2, iters);
+    benchShape(K_M4,    E, 2048, 512, 4, iters);
+    benchShape(K_M4REG, E, 2048, 512, 4, iters);
 
-    std::printf("# Interpretation: %%peak reading all 256 experts once = kernel weight-BW efficiency.\n");
-    std::printf("# us/token should DROP ~linearly M=1->2->4 (batch amortizes the weight read) while\n");
-    std::printf("# GB/s stays flat. If %%peak ~35-40%% -> the m4 kernel is the ~2.7x lever (fixable).\n");
+    std::printf("# Target: m2reg@M2 / m4reg@M4 recover from m4's ~34%%/24%% toward the m1reg ~48%% ceiling.\n");
     return 0;
 }
