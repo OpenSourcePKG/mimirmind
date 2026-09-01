@@ -360,6 +360,15 @@ protected:
     // 2026-08-04) — the isolated win inverts under real serving, so blocked
     // stays the serving default. Enable with MIMIRMIND_GROUPED_MOE_DECODE_TC=1.
     bool _moeGroupedDecodeTc{false};
+    // 5.18.9: batched-decode register-staged grouped GEMM (m2reg). Caps the decode
+    // tile schedule at tileM=2 and routes the device-driven blocked decode GEMM
+    // through the register-staged m2reg kernel (activations in registers, no shared
+    // mem / no __syncthreads). Serving microbench: 34% -> 48% of the weight-BW
+    // roofline at the conc64 shape (M~=2), bit-identical to the shared m4 core.
+    // OPT-IN, DEFAULT-OFF: MIMIRMIND_MOE_DECODE_REG=1; GpuOps reads the same env to
+    // switch the kernel. tileM=2 splits M>2 experts into 2 tiles (time-neutral: 2x
+    // 48% == 1x 24%) so there is no regression for heavy experts.
+    bool _moeDecodeReg{false};
     // Track B: run the dense shared-expert projections through the FP4-TC
     // grouped GEMM (nExp=1) at prefill (M>=kShexpTcMinM) instead of the blocked
     // kernel whose kGemmMaxM=16 loop re-streams the weight ~M/16 times (the

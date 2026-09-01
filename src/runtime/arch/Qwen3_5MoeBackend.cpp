@@ -119,6 +119,9 @@ Qwen3_5MoeBackend::Qwen3_5MoeBackend(const model::LlmConfig&       config,
     if (const char* t = std::getenv("MIMIRMIND_GROUPED_MOE_DECODE_TC")) {
         _moeGroupedDecodeTc = (t[0] == '1' && t[1] == '\0');
     }
+    if (const char* dr = std::getenv("MIMIRMIND_MOE_DECODE_REG")) {
+        _moeDecodeReg = (dr[0] == '1' && dr[1] == '\0');
+    }
     if (const char* st = std::getenv("MIMIRMIND_SHEXP_TC")) {
         _shexpTc = !(st[0] == '0' && st[1] == '\0');
     }
@@ -1223,7 +1226,11 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         // GD-b: decode (preferBlocked) uses tileM=4 + the small-M kernel so the
         // GEMM's shared/register footprint drops and SM occupancy rises (decode
         // M is ~1-2 rows/expert). Prefill keeps tileM=16.
-        const std::size_t tileM    = preferBlocked ? 4 : 16;
+        // 5.18.9: the register-staged m2reg decode kernel handles at most 2 rows/
+        // tile, so cap the schedule at tileM=2 when MIMIRMIND_MOE_DECODE_REG is on
+        // (GpuOps then dispatches m2reg for the smallM path). Buffers are sized for
+        // tileM=2 (BlockBuffers kMoeTileM), so the larger tile count fits.
+        const std::size_t tileM    = preferBlocked ? (_moeDecodeReg ? 2 : 4) : 16;
         const bool        smallM   = preferBlocked;
         const std::size_t maxTiles = (R + tileM - 1) / tileM + nExperts;
         auto* const tileExpert = s.moeGroupTileExpert.as<std::int32_t>();

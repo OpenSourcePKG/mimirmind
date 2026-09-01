@@ -180,8 +180,10 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         // bound maxTiles = ceil(nRowsMax/kMoeTileM) + nExperts, so the grouped-
         // GEMM grid.y is host-sized. GD-b: decode uses tileM=4 (small-M kernel),
         // which produces more tiles than prefill's tileM=16 — size the arrays
-        // for the smallest tileM so both fit.
-        constexpr std::size_t kMoeTileM = 4;
+        // for the smallest tileM so both fit. 5.18.9: the register-staged decode
+        // path (MIMIRMIND_MOE_DECODE_REG) drops decode tileM to 2, so size for 2
+        // (the smallest possible tileM) — a few extra int32/tile, negligible.
+        constexpr std::size_t kMoeTileM = 2;
         const std::size_t maxTiles =
             (nRowsMax + kMoeTileM - 1) / kMoeTileM + config.expertCount;
         b.moeGroupTileExpert = ops.allocate(maxTiles * sizeof(std::int32_t));

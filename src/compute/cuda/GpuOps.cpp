@@ -382,6 +382,13 @@ struct GpuOps::Impl {
     // Decode single-user (M==1) register-staged variant: activation in registers
     // instead of shared memory, removing the MIO/short-scoreboard stall.
     core::cuda::CudaKernel _moeGroupedGemmNvfp4M1RegKernel;
+    // 5.18.9: batched-decode register-staged variant (MAX_M=2). Extends m1reg to
+    // M>1 with 16 extra regs. Serving microbench: 34% -> 48% of peak at the conc64
+    // shape (M~=2). Selected in moeGroupedGemmNvfp4Async when the caller sets the
+    // small-M + register path (MIMIRMIND_MOE_DECODE_REG=1); requires a tileM<=2
+    // schedule (the caller drops tileM to 2 so tiles never exceed MAX_M).
+    core::cuda::CudaKernel _moeGroupedGemmNvfp4M2RegKernel;
+    bool _moeDecodeReg{false};   // MIMIRMIND_MOE_DECODE_REG
     // 5.21.6: wide-M FP16 tensor-core grouped GEMM for PREFILL (W4A16, wmma).
     // Opt-in via MIMIRMIND_MOE_PREFILL_TC=1; replaces the CUDA-core M16 kernel
     // on the prefill (large-M) path only. ~9-15x the CUDA-core kernel in micro-
@@ -682,6 +689,8 @@ struct GpuOps::Impl {
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m4")},
           _moeGroupedGemmNvfp4M1RegKernel{
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m1reg")},
+          _moeGroupedGemmNvfp4M2RegKernel{
+              _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m2reg")},
           _moeGroupedGemmNvfp4TcModule{
               loadCudaModule(ctx, "moe_grouped_gemm_nvfp4blk_tc")},
           _moeGroupedGemmNvfp4TcKernel{
@@ -788,6 +797,18 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
                     "(MIMIRMIND_MOE_PREFILL_TC=1) — grouped GEMM prefill (large-M) "
                     "runs on wmma FP16 tensor cores; decode (small-M) path "
                     "unchanged, CUDA-core kernel is the fallback");
+    }
+    // 5.18.9: register-staged batched-decode grouped GEMM (m2reg, MAX_M=2).
+    // Requires the caller to cap the decode tile schedule at tileM<=2.
+    if (const char* dr = std::getenv("MIMIRMIND_MOE_DECODE_REG")) {
+        _pimpl->_moeDecodeReg = (dr[0] == '1' && dr[1] == '\0');
+    }
+    if (_pimpl->_moeDecodeReg) {
+        MM_LOG_INFO("hipgpuops",
+                    "register-staged decode grouped MoE-GEMM enabled "
+                    "(MIMIRMIND_MOE_DECODE_REG=1) — batched small-M decode runs on "
+                    "the m2reg kernel (activations in registers, tileM<=2); "
+                    "microbench 34%->48% of weight-BW roofline at the conc64 shape");
     }
 
     // P3.a opt-in: GQA-head-packed F32 prefill flash (env, default off).
@@ -2391,8 +2412,14 @@ void GpuOps::moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
     // GD-b: decode uses the small-M (MAX_M=4) kernel — the schedule caps decode
     // tiles at tileM=4, and the smaller shared/register footprint lets the SM
     // run enough warps to hide the memory latency that bottlenecks decode-M.
-    auto& k = decodeSmallM ? _pimpl->_moeGroupedGemmNvfp4M4Kernel
-                           : _pimpl->_moeGroupedGemmNvfp4Kernel;
+    // 5.18.9: with MIMIRMIND_MOE_DECODE_REG the batched decode runs the register-
+    // staged m2reg kernel instead (no shared mem / no __syncthreads; 34%->48% of
+    // the weight-BW roofline at the conc64 shape). The caller MUST cap the tile
+    // schedule at tileM<=2 for this path (m2reg computes at most 2 rows/tile).
+    auto& k = (decodeSmallM && _pimpl->_moeDecodeReg)
+                  ? _pimpl->_moeGroupedGemmNvfp4M2RegKernel
+                  : (decodeSmallM ? _pimpl->_moeGroupedGemmNvfp4M4Kernel
+                                  : _pimpl->_moeGroupedGemmNvfp4Kernel);
     k.setPtr  (0, x);
     k.setPtr  (1, w);
     k.setPtr  (2, y);
