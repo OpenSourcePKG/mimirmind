@@ -69,6 +69,10 @@ public:
     /// follow-up. Never throws.
     [[nodiscard]] std::size_t bandwidthGBps() const noexcept override;
 
+    /// Free bytes of the (unified, on GB10) device pool via
+    /// cudaMemGetInfo. 0 on any CUDA error. Never throws.
+    [[nodiscard]] std::size_t deviceFreeMemoryBytes() const noexcept override;
+
     // ---- CUDA-native accessors ---------------------------------------
 
     [[nodiscard]] CudaContext&              cudaContext() noexcept       { return _ctx; }

@@ -3,6 +3,8 @@
 
 #include "core/gpu/cuda/CudaComputeContext.hpp"
 
+#include <cuda_runtime.h>
+
 namespace mimirmind::core::cuda {
 
 CudaComputeContext::CudaComputeContext(Options opts)
@@ -28,6 +30,16 @@ std::size_t CudaComputeContext::bandwidthGBps() const noexcept {
         case DeviceKind::Unknown:        return 0;
     }
     return 0;
+}
+
+std::size_t CudaComputeContext::deviceFreeMemoryBytes() const noexcept {
+    std::size_t freeB = 0;
+    std::size_t totalB = 0;
+    if (::cudaMemGetInfo(&freeB, &totalB) != cudaSuccess) {
+        ::cudaGetLastError();  // clear the sticky error, stay non-throwing
+        return 0;
+    }
+    return freeB;
 }
 
 } // namespace mimirmind::core::cuda

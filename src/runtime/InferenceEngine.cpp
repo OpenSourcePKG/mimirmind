@@ -831,8 +831,15 @@ void InferenceEngine::finalizeLoad() {
         const std::size_t kvPerTok    = _config.kvBytesPerToken(/*dtypeBytes=*/2);
         const std::size_t ctx         = _maxContextTokens > 0 ? _maxContextTokens
                                                               : _config.contextLength;
+        // Free device memory (0 on backends that can't report it) makes the
+        // probe size the batch from real headroom instead of a bandwidth
+        // tier. On a co-resident multi-model host this is an upper bound
+        // (load-order dependent) — the probe reserves a conservative
+        // fraction and operators pin an exact cap via
+        // MIMIRMIND_SERVING_MAXBATCH; see BatchCapacityProbe::estimate.
+        const std::size_t freeMemBytes = _computeCtx->deviceFreeMemoryBytes();
         _batchCapacity = runtime::serving::BatchCapacityProbe::estimate(
-            bwGBps, weightBytes, kvPerTok, ctx);
+            bwGBps, weightBytes, kvPerTok, ctx, freeMemBytes);
 
         // Config gate — Auto respects the probe, Force overrides on
         // (with a warning if the probe disagreed), Disable overrides off.

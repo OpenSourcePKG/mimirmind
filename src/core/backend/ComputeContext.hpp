@@ -76,6 +76,24 @@ public:
     /// Never throws.
     [[nodiscard]] virtual std::size_t bandwidthGBps() const noexcept { return 0; }
 
+    /// Free device memory in bytes on this backend's currently-selected
+    /// device, at the moment of the call. Used by
+    /// `runtime::serving::BatchCapacityProbe` to size the sustainable
+    /// serving batch from real headroom instead of a bandwidth-tier
+    /// proxy. On unified-memory HW (Grace/GB10) this is the free slice
+    /// of the shared LPDDR pool.
+    ///
+    /// Returns 0 when the backend cannot determine a value — the probe
+    /// interprets 0 as "no memory signal, fall back to the bandwidth
+    /// tier". NOTE: on a co-resident multi-model host the reading
+    /// depends on load order (models not yet loaded still look free),
+    /// so the probe treats this as an upper bound and applies a
+    /// conservative reserve; operators pin an exact cap via
+    /// `MIMIRMIND_SERVING_MAXBATCH` for multi-model serves.
+    ///
+    /// Never throws.
+    [[nodiscard]] virtual std::size_t deviceFreeMemoryBytes() const noexcept { return 0; }
+
 protected:
     ComputeContext() = default;
 };

@@ -350,7 +350,9 @@ TEST(batchProbe_roundToSchedulerStep_powerOfTwo) {
     EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(8),  std::size_t{8});
     EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(16), std::size_t{16});
     EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(32), std::size_t{32});
-    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(64), std::size_t{32});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(64), std::size_t{64});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(128), std::size_t{128});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(256), std::size_t{128});
 }
 
 TEST(batchProbe_roundToSchedulerStep_downRounds) {
@@ -359,7 +361,53 @@ TEST(batchProbe_roundToSchedulerStep_downRounds) {
     EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(7),  std::size_t{4});
     EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(15), std::size_t{8});
     EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(27), std::size_t{16});
+    EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(100), std::size_t{64});
     EXPECT_EQ(BatchCapacityProbe::roundToSchedulerStep(0),  std::size_t{1});
+}
+
+// VRAM-aware (v2) path: batch sized from free-memory headroom.
+TEST(batchProbe_vramAware_sizesFromHeadroom) {
+    using ::mimirmind::runtime::serving::BatchCapacityProbe;
+    // GB10-like: 273 GB/s, 5.6 MiB/seq KV pool (kv/tok=717B x ctx=8192),
+    // ~12 GiB free, 50% reserve → ~6 GiB / 5.6 MiB ≈ 1000 seq, capped 128.
+    const std::size_t kvPerTok = 717;
+    const std::size_t ctx      = 8192;
+    const std::size_t freeB    = std::size_t{12} << 30;
+    const auto est = BatchCapacityProbe::estimate(
+        273, std::size_t{20} << 30, kvPerTok, ctx, freeB);
+    EXPECT_EQ(est.sustainableBatch, BatchCapacityProbe::kMaxServingBatch);
+    EXPECT_TRUE(est.servingClassRecommended);
+    EXPECT_EQ(est.freeVramGB, std::size_t{12});
+}
+
+// VRAM path with a tight pool: big per-seq KV → only a few seqs fit.
+TEST(batchProbe_vramAware_tightPoolLimitsBatch) {
+    using ::mimirmind::runtime::serving::BatchCapacityProbe;
+    // kv/seq = 1 GiB; 8 GiB free, 50% reserve = 4 GiB → 4 seqs → step 4.
+    const std::size_t kvPerTok = std::size_t{1} << 20;      // 1 MiB/tok
+    const std::size_t ctx      = 1024;                       // → 1 GiB/seq
+    const std::size_t freeB    = std::size_t{8} << 30;
+    const auto est = BatchCapacityProbe::estimate(
+        273, std::size_t{4} << 30, kvPerTok, ctx, freeB);
+    EXPECT_EQ(est.sustainableBatch, std::size_t{4});
+}
+
+// Below the serving-bandwidth floor → single-session even with memory.
+TEST(batchProbe_lowBandwidth_forcesSingleSession) {
+    using ::mimirmind::runtime::serving::BatchCapacityProbe;
+    const auto est = BatchCapacityProbe::estimate(
+        60, std::size_t{4} << 30, 717, 8192, std::size_t{64} << 30);
+    EXPECT_EQ(est.sustainableBatch, std::size_t{1});
+    EXPECT_TRUE(!est.servingClassRecommended);
+}
+
+// No memory signal (freeMemoryBytes=0) → v1 bandwidth-tier fallback.
+TEST(batchProbe_noVramSignal_fallsBackToBandwidthTier) {
+    using ::mimirmind::runtime::serving::BatchCapacityProbe;
+    // 273 GB/s (< 400) → tier 16, unchanged from v1.
+    const auto est = BatchCapacityProbe::estimate(
+        273, std::size_t{20} << 30, 717, 8192, /*freeMemoryBytes=*/0);
+    EXPECT_EQ(est.sustainableBatch, std::size_t{16});
 }
 
 TEST(batchProbe_skeletonFallback_isSingleSession) {
