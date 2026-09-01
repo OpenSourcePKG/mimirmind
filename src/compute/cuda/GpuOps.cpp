@@ -2484,6 +2484,8 @@ void GpuOps::moeGroupedGemmNvfp4DeintAsync(
     // nibble bank + fp16 scale bank once; cache by the weight pointer.
     auto it = _pimpl->_deintCache.find(w);
     if (it == _pimpl->_deintCache.end()) {
+        // 8.16 Stage B: the de-interleaved (nib, scale) banks are weight-derived.
+        core::gpu::ScopedAllocCategory _wc{core::gpu::AllocCategory::Weights};
         Impl::DeintBank bank;
         bank.nib   = allocate(totalSupers * 16);
         bank.scale = allocate(totalSupers * 4);

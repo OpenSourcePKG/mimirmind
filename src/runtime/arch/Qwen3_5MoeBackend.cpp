@@ -5,6 +5,7 @@
 
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
+#include "core/gpu/AllocCategory.hpp"
 #include "core/modelopt/BlockScaleSwizzle.hpp" // E-d.4b swizzledBlockScaleBytes
 
 #include <algorithm>
@@ -1272,6 +1273,8 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
             const std::size_t perExpertBytes = n_ff_exp * ((d_model / ge) * gb);
             compute::ComputeBuffer& w13Buf = _moeW13W[blockIdx];
             if (w13Buf.bytes() == 0) {
+                // 8.16 Stage B: the fused w13 stacked bank is weight-derived.
+                core::gpu::ScopedAllocCategory _wc{core::gpu::AllocCategory::Weights};
                 w13Buf = _ops.allocate(nExperts * 2 * perExpertBytes);
                 auto* const w13 = static_cast<unsigned char*>(
                     static_cast<void*>(w13Buf.as<float>()));
