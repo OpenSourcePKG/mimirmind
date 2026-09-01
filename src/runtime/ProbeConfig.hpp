@@ -41,6 +41,9 @@ struct ProbePicks {
     // before the arch backend is constructed; explicit env wins).
     std::optional<bool> applyAttnCudnnPaged;
     std::optional<bool> applyMoeSiluFuse;
+    // 5.18.9: register-staged m2reg batched-decode grouped MoE-GEMM (backend +
+    // GpuOps getenv-owned; applied via setenv before the backend ctor).
+    std::optional<bool> applyMoeDecodeReg;
 };
 
 /**

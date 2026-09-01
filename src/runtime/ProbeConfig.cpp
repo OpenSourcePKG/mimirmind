@@ -84,6 +84,7 @@ loadProbePicks(const std::string& dir, const std::string& fingerprint) {
         picks.applyMmqTc            = readFlag("MIMIRMIND_MMQ_TC");
         picks.applyAttnCudnnPaged   = readFlag("MIMIRMIND_ATTN_CUDNN_PAGED");
         picks.applyMoeSiluFuse      = readFlag("MIMIRMIND_MOE_SILU_FUSE");
+        picks.applyMoeDecodeReg     = readFlag("MIMIRMIND_MOE_DECODE_REG");
     }
 
     return picks;

@@ -388,7 +388,10 @@ struct GpuOps::Impl {
     // small-M + register path (MIMIRMIND_MOE_DECODE_REG=1); requires a tileM<=2
     // schedule (the caller drops tileM to 2 so tiles never exceed MAX_M).
     core::cuda::CudaKernel _moeGroupedGemmNvfp4M2RegKernel;
-    bool _moeDecodeReg{false};   // MIMIRMIND_MOE_DECODE_REG
+    // MIMIRMIND_MOE_DECODE_REG, read LAZILY on first grouped-GEMM dispatch: the
+    // HW-profile applies the flag via setenv AFTER this GpuOps is constructed but
+    // before generate(), so a ctor read would miss the profile value. -1=unread.
+    int _moeDecodeReg{-1};
     // 5.21.6: wide-M FP16 tensor-core grouped GEMM for PREFILL (W4A16, wmma).
     // Opt-in via MIMIRMIND_MOE_PREFILL_TC=1; replaces the CUDA-core M16 kernel
     // on the prefill (large-M) path only. ~9-15x the CUDA-core kernel in micro-
@@ -798,18 +801,9 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
                     "runs on wmma FP16 tensor cores; decode (small-M) path "
                     "unchanged, CUDA-core kernel is the fallback");
     }
-    // 5.18.9: register-staged batched-decode grouped GEMM (m2reg, MAX_M=2).
-    // Requires the caller to cap the decode tile schedule at tileM<=2.
-    if (const char* dr = std::getenv("MIMIRMIND_MOE_DECODE_REG")) {
-        _pimpl->_moeDecodeReg = (dr[0] == '1' && dr[1] == '\0');
-    }
-    if (_pimpl->_moeDecodeReg) {
-        MM_LOG_INFO("hipgpuops",
-                    "register-staged decode grouped MoE-GEMM enabled "
-                    "(MIMIRMIND_MOE_DECODE_REG=1) — batched small-M decode runs on "
-                    "the m2reg kernel (activations in registers, tileM<=2); "
-                    "microbench 34%->48% of weight-BW roofline at the conc64 shape");
-    }
+    // 5.18.9: MIMIRMIND_MOE_DECODE_REG (register-staged m2reg decode GEMM) is read
+    // lazily on first dispatch — see _moeDecodeReg — so the HW-profile setenv,
+    // which runs after this ctor, is still honoured.
 
     // P3.a opt-in: GQA-head-packed F32 prefill flash (env, default off).
     if (const char* g = std::getenv("MIMIRMIND_ATTN_PREFILL_GQA")) {
@@ -2416,7 +2410,13 @@ void GpuOps::moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
     // staged m2reg kernel instead (no shared mem / no __syncthreads; 34%->48% of
     // the weight-BW roofline at the conc64 shape). The caller MUST cap the tile
     // schedule at tileM<=2 for this path (m2reg computes at most 2 rows/tile).
-    auto& k = (decodeSmallM && _pimpl->_moeDecodeReg)
+    // Lazy env read (see _moeDecodeReg): honours the HW-profile setenv that runs
+    // after this GpuOps was constructed.
+    if (_pimpl->_moeDecodeReg < 0) {
+        const char* dr = std::getenv("MIMIRMIND_MOE_DECODE_REG");
+        _pimpl->_moeDecodeReg = (dr != nullptr && dr[0] == '1' && dr[1] == '\0') ? 1 : 0;
+    }
+    auto& k = (decodeSmallM && _pimpl->_moeDecodeReg == 1)
                   ? _pimpl->_moeGroupedGemmNvfp4M2RegKernel
                   : (decodeSmallM ? _pimpl->_moeGroupedGemmNvfp4M4Kernel
                                   : _pimpl->_moeGroupedGemmNvfp4Kernel);

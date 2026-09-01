@@ -782,6 +782,13 @@ void InferenceEngine::finalizeLoad() {
                 MM_LOG_INFO("probe", "  profile applied: MoE silu+quant fuse -> {}",
                             *picks->applyMoeSiluFuse ? "on" : "off");
             }
+            if (picks->applyMoeDecodeReg &&
+                std::getenv("MIMIRMIND_MOE_DECODE_REG") == nullptr) {
+                ::setenv("MIMIRMIND_MOE_DECODE_REG",
+                         *picks->applyMoeDecodeReg ? "1" : "0", 1);
+                MM_LOG_INFO("probe", "  profile applied: MoE decode register-staged -> {}",
+                            *picks->applyMoeDecodeReg ? "on" : "off");
+            }
         }
     }
 

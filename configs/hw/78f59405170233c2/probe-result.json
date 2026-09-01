@@ -77,6 +77,14 @@
       "default_on": false,
       "serving": true,
       "effect": "5.21.8 fused silu(gate)*up + NVFP4 act-quant in one pass in the FP4-TC grouped MoE prefill (skips the padding-row siluMul waste). BIT-IDENTICAL to the siluMul+actQuant two-pass; -9% TTFT (conc16 15.9->14.4s). Revertible to apply:false."
+    },
+    "MIMIRMIND_MOE_DECODE_REG": {
+      "value": 1,
+      "apply": true,
+      "default_on": false,
+      "serving": true,
+      "since": "6b2653d",
+      "effect": "5.18.9 register-staged (m2reg) batched-decode grouped MoE-GEMM: activations in registers (no shared mem / no __syncthreads), decode tileM capped to 2. BIT-IDENTICAL to the shared m4 core; live A/B +8.0% conc64 decode (211.8->228.7 tok/s). Backend+GpuOps getenv-owned -> applied via setenv before the backend ctor (explicit env wins). Revertible to apply:false."
     }
   },
   "matmul": {
