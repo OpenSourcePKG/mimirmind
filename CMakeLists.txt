@@ -1177,6 +1177,18 @@ if(MIMIRMIND_ENABLE_CUDA)
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON)
     target_link_libraries(microbench_moe_serving PRIVATE CUDA::cudart)
+
+    # microbench_gdn_recur — isolated GatedDeltaNet DECODE recurrence roofline
+    # probe (links the real prod v3_gatefused kernel), roadmap 5.18.10 Inc-1.
+    # Settles whether gdn.recur (~16% of conc64 decode) is at the SSM-state
+    # bandwidth floor (=> BF16-state lever) or has kernel headroom.
+    add_executable(microbench_gdn_recur
+        tools/microbench/gdn_recur_bench.cu
+        kernels/cuda/llm/gated_deltanet_ar_batched_v3.cu)
+    set_target_properties(microbench_gdn_recur PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(microbench_gdn_recur PRIVATE CUDA::cudart)
 endif()
 
 # ---- mimirmind_core_cuda — NVIDIA CUDA-tied foundation --------------------
