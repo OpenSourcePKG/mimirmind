@@ -780,6 +780,18 @@ public:
         throw std::runtime_error("moeActQuantNvfp4RowsAsync: not supported on this backend");
     }
 
+    /// 5.21.8: fused silu(gate)*up + row-mapped NVFP4 act-quant in one pass
+    /// (skips the intermediate round-trip AND the padding-row silu of the
+    /// siluMul+actQuant two-pass). Bit-identical to that pair.
+    virtual void moeSiluMulQuantNvfp4RowsAsync(const float* gate, const float* up,
+                                               unsigned char* outNib, unsigned char* outSf,
+                                               float gscale, const std::int32_t* rowMap,
+                                               std::size_t nRows, std::size_t K) {
+        (void)gate; (void)up; (void)outNib; (void)outSf; (void)gscale;
+        (void)rowMap; (void)nRows; (void)K;
+        throw std::runtime_error("moeSiluMulQuantNvfp4RowsAsync: not supported on this backend");
+    }
+
     /// Device scratch bytes moeGroupedGemmNvfp4TcBanksAsync needs for
     /// `nExperts` groups (per-group CUTLASS arrays + workspace). Zero if the
     /// FP4-TC path is unavailable. The caller owns the buffer (per-slot).

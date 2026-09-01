@@ -328,6 +328,10 @@ public:
                                    unsigned char* outSf, float gscale,
                                    const std::int32_t* rowMap,
                                    std::size_t nRows, std::size_t K) override;
+    void moeSiluMulQuantNvfp4RowsAsync(const float* gate, const float* up,
+                                       unsigned char* outNib, unsigned char* outSf,
+                                       float gscale, const std::int32_t* rowMap,
+                                       std::size_t nRows, std::size_t K) override;
     [[nodiscard]] std::size_t
     moeGroupedGemmNvfp4TcBanksScratchBytes(std::size_t nExperts) const noexcept override;
     void moeGroupedGemmNvfp4TcBanksAsync(

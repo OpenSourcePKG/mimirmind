@@ -129,6 +129,9 @@ Qwen3_5MoeBackend::Qwen3_5MoeBackend(const model::LlmConfig&       config,
     if (const char* cp = std::getenv("MIMIRMIND_ATTN_CUDNN_PAGED")) {
         _attnCudnnPaged = (cp[0] == '1' && cp[1] == '\0');
     }
+    if (const char* sf = std::getenv("MIMIRMIND_MOE_SILU_FUSE")) {
+        _moeSiluFuse = (sf[0] == '1' && sf[1] == '\0');
+    }
     if (const char* dm = std::getenv("MIMIRMIND_NVFP4_DEINT")) {
         _useDeintMoe = (dm[0] == '1' && dm[1] == '\0');
     }
@@ -1182,13 +1185,21 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
             banksScratch, banksBytes);
 
         _ops.profileSection("moe.silu");   // silu + intermediate act-quant (sub-split)
-        _ops.siluMulAsync(gatePad, upPad, maxPad * n_ff_exp);  // silu(gate)*up
-
-        // act-quant the intermediate -> down GEMM: N=d_model, K=n_ff_exp.
-        // Row-mapped: the GEMM wrote gate/up outputs at the same padded slots
-        // (contigToPad), so the intermediate's real rows live there too.
+        // Row-mapped act-quant of silu(gate)*up -> down GEMM (N=d_model, K=n_ff_exp).
+        // The gate/up GEMM wrote outputs at the padded slots (contigToPad), so the
+        // real rows live there. sfaBank2 padding must stay zeroed (both paths).
         _ops.moeZeroBytesAsync(sfaBank2, mo::swizzledBlockScaleBytes(maxPad, n_ff_exp / 16));
-        _ops.moeActQuantNvfp4RowsAsync(gatePad, aBank2, sfaBank2, 1.0F, contigToPad, R, n_ff_exp);
+        if (_moeSiluFuse) {
+            // 5.21.8: fused silu*up + quant in one pass over the R real rows —
+            // skips the intermediate round-trip AND the padding-row silu of the
+            // two-pass (siluMul runs over the whole maxPad, ~89% padding). Bit-
+            // identical to the else-branch. ~9x on this sub-split (microbench).
+            _ops.moeSiluMulQuantNvfp4RowsAsync(gatePad, upPad, aBank2, sfaBank2, 1.0F,
+                                               contigToPad, R, n_ff_exp);
+        } else {
+            _ops.siluMulAsync(gatePad, upPad, maxPad * n_ff_exp);  // silu(gate)*up
+            _ops.moeActQuantNvfp4RowsAsync(gatePad, aBank2, sfaBank2, 1.0F, contigToPad, R, n_ff_exp);
+        }
 
         _ops.profileSection("moe.dgemm");   // down TC GEMM (prefill sub-split)
         _ops.moeGroupedGemmNvfp4TcBanksAsync(

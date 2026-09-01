@@ -371,6 +371,10 @@ protected:
     // paged-causal kernel. Default OFF; opt-in MIMIRMIND_ATTN_CUDNN_PAGED=1.
     // Pure-prefill F32 ragged batches only; falls back to the hand kernel.
     bool _attnCudnnPaged{false};
+    // 5.21.8: fuse silu(gate)*up + NVFP4 act-quant into one pass in the FP4-TC
+    // grouped MoE prefill (skips the padding-row siluMul waste). Bit-identical.
+    // Opt-in MIMIRMIND_MOE_SILU_FUSE=1.
+    bool _moeSiluFuse{false};
     // Force the single-pass paged decode (V1) instead of the split-K V2 for
     // full-attention layers. A/B + rollback lever (MIMIRMIND_PAGED_V1=1).
     bool _forcePagedV1{false};
