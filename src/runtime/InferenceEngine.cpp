@@ -764,6 +764,24 @@ void InferenceEngine::finalizeLoad() {
                 MM_LOG_INFO("probe", "  profile applied: MMQ tensor-core -> {}",
                             *picks->applyMmqTc ? "on" : "off");
             }
+            // 5.21.7/8: these two are backend getenv-owned (Qwen3_5MoeBackend
+            // reads them in its ctor, which runs AFTER this block), so apply via
+            // setenv before the backend is picked. Guarded on !getenv so an
+            // explicit env still wins, matching the setter-based flags above.
+            if (picks->applyAttnCudnnPaged &&
+                std::getenv("MIMIRMIND_ATTN_CUDNN_PAGED") == nullptr) {
+                ::setenv("MIMIRMIND_ATTN_CUDNN_PAGED",
+                         *picks->applyAttnCudnnPaged ? "1" : "0", 1);
+                MM_LOG_INFO("probe", "  profile applied: cuDNN paged prefill -> {}",
+                            *picks->applyAttnCudnnPaged ? "on" : "off");
+            }
+            if (picks->applyMoeSiluFuse &&
+                std::getenv("MIMIRMIND_MOE_SILU_FUSE") == nullptr) {
+                ::setenv("MIMIRMIND_MOE_SILU_FUSE",
+                         *picks->applyMoeSiluFuse ? "1" : "0", 1);
+                MM_LOG_INFO("probe", "  profile applied: MoE silu+quant fuse -> {}",
+                            *picks->applyMoeSiluFuse ? "on" : "off");
+            }
         }
     }
 

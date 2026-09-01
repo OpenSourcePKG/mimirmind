@@ -37,6 +37,10 @@ struct ProbePicks {
     std::optional<bool> applyCublasFp8Prefill;
     std::optional<bool> applyMmq;
     std::optional<bool> applyMmqTc;
+    // 5.21.7/8 serving-prefill flags (backend getenv-owned -> applied via setenv
+    // before the arch backend is constructed; explicit env wins).
+    std::optional<bool> applyAttnCudnnPaged;
+    std::optional<bool> applyMoeSiluFuse;
 };
 
 /**

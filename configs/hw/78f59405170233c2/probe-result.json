@@ -7,7 +7,7 @@
     "backend_kind": "Cuda",
     "device_name": "NVIDIA GB10",
     "sm_arch": "sm_121a",
-    "notes": "DGX Spark GB10 (Grace ARM + Blackwell). 128 GB unified LPDDR5x, 273 GB/s. Identity UUID/PCI intentionally omitted from the repo — the fingerprint hash already keys the file; raw device serials never get committed.",
+    "notes": "DGX Spark GB10 (Grace ARM + Blackwell). 128 GB unified LPDDR5x, 273 GB/s. Identity UUID/PCI intentionally omitted from the repo \u2014 the fingerprint hash already keys the file; raw device serials never get committed.",
     "features": {
       "MutableCommandLists": false,
       "IntegerDotProduct": true,
@@ -63,17 +63,31 @@
       "env_gated": true,
       "since": "0ac2195",
       "effect": "tensor-core (wmma) MMQ kernel over dp4a. Validated coherent."
+    },
+    "MIMIRMIND_ATTN_CUDNN_PAGED": {
+      "value": 1,
+      "apply": true,
+      "default_on": false,
+      "serving": true,
+      "effect": "5.21.7 cuDNN-SDPA paged serving-prefill attention (gather paged KV -> cuDNN flash, dequant per pool dtype). LIVE -42% TTFT (conc16 ~28->16s), bit-near/coherent, F32|FP16|FP8 pool, pure-prefill only, fallback to CUDA-core. Backend getenv-owned -> applied via setenv (explicit env wins). Revertible to apply:false."
+    },
+    "MIMIRMIND_MOE_SILU_FUSE": {
+      "value": 1,
+      "apply": true,
+      "default_on": false,
+      "serving": true,
+      "effect": "5.21.8 fused silu(gate)*up + NVFP4 act-quant in one pass in the FP4-TC grouped MoE prefill (skips the padding-row siluMul waste). BIT-IDENTICAL to the siluMul+actQuant two-pass; -9% TTFT (conc16 15.9->14.4s). Revertible to apply:false."
     }
   },
   "matmul": {
-    "_note": "Kernel-variant picks for this GPU. mimirmind's own decisions — NOT Triton BLOCK_M/N/K tiles, because we run hand-CUDA + cuBLAS/CUTLASS, not a Triton JIT. The shape-keyed tile-param table that vLLM's fused_moe/configs carries is a future field (moe.shape_configs) once we mine CUTLASS / benchmark_moe-style sweeps.",
+    "_note": "Kernel-variant picks for this GPU. mimirmind's own decisions \u2014 NOT Triton BLOCK_M/N/K tiles, because we run hand-CUDA + cuBLAS/CUTLASS, not a Triton JIT. The shape-keyed tile-param table that vLLM's fused_moe/configs carries is a future field (moe.shape_configs) once we mine CUTLASS / benchmark_moe-style sweeps.",
     "dense_decode_gemv": "cublas-fp8",
     "dense_prefill_gemm": "cublas-bf16",
     "moe_routed_prefill": "fp4-tc-grouped-device-driven",
     "moe_routed_decode": "nvfp4-uint4-register-x-warp-topk"
   },
   "provenance": {
-    "derived": "Hand-curated 2026-08-21 from the live Spark prod deploy, not an automated sweep — hence probe_status=curated-partial.",
+    "derived": "Hand-curated 2026-08-21 from the live Spark prod deploy, not an automated sweep \u2014 hence probe_status=curated-partial.",
     "grounding_commits": [
       "b14578b (F32_TC prefill)",
       "0d0f265 (shexp FP4-TC)",
