@@ -255,6 +255,14 @@ struct ApiServer::Impl {
                    [this](const httplib::Request&, httplib::Response& res) {
                        sendJson(res, 200, statusBuilder.buildInfo());
                    });
+        // 8.16 Stage A — admin-gated categorized RAM/VRAM breakdown
+        // (weights / paged-KV / device envelope / external residual +
+        // L0 free-list fragmentation). Memory figures are operator-only.
+        server->Get("/v1/system/memory",
+                   [this](const httplib::Request&, httplib::Response& res) {
+                       if (!requireAdmin(res)) return;
+                       sendJson(res, 200, statusBuilder.buildMemory());
+                   });
 
         // Operator-only per-tenant usage accounting. Auth already gated the
         // request to a valid key (pre-routing hook); these two additionally

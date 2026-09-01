@@ -20,6 +20,9 @@
 #ifdef MIMIRMIND_HAVE_CUDA
 #include "runtime/thermal/NvmlTelemetry.hpp"
 #endif
+#ifdef MIMIRMIND_HAVE_L0
+#include "core/gpu/l0/UsmAllocator.hpp"   // 8.16: L0 free-list fragmentation stats
+#endif
 
 #include <limits>
 #include <vector>
@@ -452,6 +455,89 @@ json SystemStatusBuilder::buildStatus() {
     body["perf_regression"] = buildPerfRegressionBlock();
     body["current_request"] = _requestTracker.buildStatusBlock();
     return body;
+}
+
+json SystemStatusBuilder::buildMemory() const {
+    // Pool (per-request model-switch) mode: no resident engine to inspect.
+    if (_engine == nullptr) {
+        return json{
+            {"mode",      "pooled_model_switch"},
+            {"available", false},
+        };
+    }
+
+    const auto mt = _engine->memoryTelemetry();
+    const std::size_t deviceUsed =
+        (mt.deviceMemAvailable && mt.deviceTotalBytes >= mt.deviceFreeBytes)
+            ? mt.deviceTotalBytes - mt.deviceFreeBytes : 0;
+
+    // Device envelope (ground truth from the compute context's mem-info).
+    json device = mt.deviceMemAvailable
+        ? json{{"available",   true},
+               {"total_bytes", mt.deviceTotalBytes},
+               {"free_bytes",  mt.deviceFreeBytes},
+               {"used_bytes",  deviceUsed}}
+        : json{{"available", false},
+               {"reason", "backend does not report device mem-info"}};
+
+    // Resident owner categories (precise sums).
+    json kvPaged{{"serving_active", mt.servingActive}};
+    if (mt.servingActive) {
+        kvPaged["resident_bytes"] = mt.kvResidentBytes;
+        kvPaged["num_blocks"]     = mt.kvNumBlocks;
+        kvPaged["block_size"]     = mt.kvBlockSize;
+        kvPaged["num_layers"]     = mt.kvNumLayers;
+    }
+    json categories{
+        {"weights_bytes", mt.weightBytes},
+        {"kv_paged",      kvPaged},
+    };
+
+    // external = deviceUsed - Σ(accounted owners). Explicit residual: library
+    // workspaces (cuBLAS/cuDNN), direct GpuMatmul scratch, and co-resident
+    // models — never 100% decomposable on CUDA (Stage B narrows it).
+    json external = mt.deviceMemAvailable
+        ? [&] {
+              const std::size_t accounted = mt.weightBytes + mt.kvResidentBytes;
+              return json{{"available", true},
+                          {"bytes", deviceUsed >= accounted
+                                        ? deviceUsed - accounted : 0},
+                          {"note", "unaccounted device use: library workspaces "
+                                   "(cuBLAS/cuDNN), direct scratch, co-resident "
+                                   "models"}};
+          }()
+        : json{{"available", false},
+               {"reason", "device mem-info unavailable"}};
+
+    // Allocator fragmentation — L0 free-list only; the CUDA allocator is a
+    // pass-through (no free-list). Stage B adds central-allocator category
+    // tagging for CUDA/HIP.
+    json fragmentation{
+        {"available", false},
+        {"reason", "free-list fragmentation stats are L0-only (Stage B adds "
+                   "central-allocator category tagging on CUDA/HIP)"}};
+#ifdef MIMIRMIND_HAVE_L0
+    if (_engine->computeContextKind() == core::backend::BackendKind::LevelZero) {
+        const auto s = _engine->allocator().stats();
+        fragmentation = json{
+            {"available",        true},
+            {"live_bytes",       s.liveBytes},
+            {"peak_bytes",       s.peakBytes},
+            {"bytes_requested",  s.bytesRequested},
+            {"bytes_served",     s.bytesServed},
+            {"free_list_hits",   s.freeListHits},
+            {"free_list_misses", s.freeListMisses},
+            {"oversized_allocs", s.oversizedAllocs},
+        };
+    }
+#endif
+
+    return json{
+        {"device",        device},
+        {"categories",    categories},
+        {"external",      external},
+        {"fragmentation", fragmentation},
+    };
 }
 
 json SystemStatusBuilder::buildPerfRegressionBlock() const {

@@ -42,4 +42,14 @@ std::size_t CudaComputeContext::deviceFreeMemoryBytes() const noexcept {
     return freeB;
 }
 
+std::size_t CudaComputeContext::deviceTotalMemoryBytes() const noexcept {
+    std::size_t freeB = 0;
+    std::size_t totalB = 0;
+    if (::cudaMemGetInfo(&freeB, &totalB) != cudaSuccess) {
+        ::cudaGetLastError();  // clear the sticky error, stay non-throwing
+        return 0;
+    }
+    return totalB;
+}
+
 } // namespace mimirmind::core::cuda

@@ -115,6 +115,21 @@ public:
     [[nodiscard]] std::size_t maxBatch() const noexcept;
     [[nodiscard]] std::size_t maxContext() const noexcept;
 
+    /// Resident paged-KV pool footprint for the memory-telemetry route (8.16).
+    /// `active` is false until the serving state has been allocated (no pool
+    /// yet). `residentBytes` = numLayers x 2(K+V) x numBlocks x blockSize x
+    /// numKvHeads x headDim x elemBytes — the full device slab (the pool is
+    /// allocated up-front, not grown per request).
+    struct KvStats {
+        bool        active{false};
+        std::size_t residentBytes{0};
+        std::size_t numLayers{0};
+        std::size_t numBlocks{0};
+        std::size_t blockSize{0};
+        std::size_t elemBytes{0};
+    };
+    [[nodiscard]] KvStats kvStats() const noexcept;
+
 private:
     /// Lazily (re)allocate the Increment-E1 verify scratch for up to
     /// `maxBatch` slots × `depth + 1` verify tokens. Grows monotonically.

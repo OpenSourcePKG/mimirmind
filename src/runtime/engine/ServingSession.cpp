@@ -103,6 +103,15 @@ struct ServingState {
     std::vector<std::int32_t>  inputTok;       // [maxBatch]
     std::vector<float>         hostLogits;     // [maxBatch * vocab_lm]
 
+    // Opt-in on-device greedy argmax (MIMIRMIND_SERVING_GPU_ARGMAX): read back
+    // only nSeq token ids/step (4 B each) instead of the full [maxBatch *
+    // vocab_lm] logits plus a host argmax scan. Removes the per-token
+    // full-logits D2H bubble on the serving decode path (vLLM samples on the
+    // GPU). Greedy-only — the serving decode path applies no temperature here.
+    bool                       gpuArgmax{false};
+    compute::ComputeBuffer     argmaxDev;      // [maxBatch] device per-row argmax ids
+    std::vector<std::int32_t>  argmaxHost;     // [maxBatch] token-id readback
+
     // ---- Increment A: chunked multi-token prefill scratch ---------------
     // A newly-admitted request's prompt is prefilled as a T>1 forward per
     // physical slot (reusing the single-session runBlock path over the slot's
@@ -808,6 +817,13 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     st->isSeqStart.resize(maxBatch);
     st->inputTok.resize(maxBatch);
     st->hostLogits.resize(maxBatch * st->vocab_lm);
+    // Opt-in GPU greedy argmax scratch — allocate only when enabled so the
+    // default path stays byte-for-byte unchanged. See stepServing.
+    st->gpuArgmax = envFlagSet("MIMIRMIND_SERVING_GPU_ARGMAX");
+    if (st->gpuArgmax) {
+        st->argmaxDev = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
+        st->argmaxHost.resize(maxBatch);
+    }
 
     // ---- Increment A: chunked multi-token prefill scratch ---------------
     // Default ON with an env rollback (MIMIRMIND_CHUNKED_PREFILL=0 -> the
@@ -1028,6 +1044,27 @@ void ServingSession::stepServing(
     _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, st.d_model,
                     normBuf, nSeq, logits, st.lmScr.as<float>());
     _e._ops->profileStepEnd();
+
+    if (st.gpuArgmax) {
+        // Opt-in (MIMIRMIND_SERVING_GPU_ARGMAX): greedy argmax on the GPU, read
+        // back only nSeq token ids (4 B each) instead of nSeq * vocab_lm floats
+        // plus a host-side argmax over the whole vocabulary. That full-logits
+        // round-trip is a per-token bubble CUDA graphs do not remove and that
+        // vLLM avoids by sampling on the GPU. Serving decode here is greedy, so
+        // the distribution is not needed on the host. argmax_rows breaks ties to
+        // the lowest index -> bit-identical token to the host scan below.
+        // Mirrors the generateBatch lmHeadSample() path.
+        _e._ops->argmaxRowsAsync(logits, st.argmaxDev.as<std::int32_t>(),
+                                 nSeq, st.vocab_lm);
+        _e._ops->flush();
+        _e._ops->readbackToHost(st.argmaxHost.data(), st.argmaxDev.get(),
+                                nSeq * sizeof(std::int32_t));
+        for (std::size_t i = 0; i < nSeq; ++i) {
+            outTokens[i] = st.argmaxHost[i];
+        }
+        return;
+    }
+
     _e._ops->flush();
     _e._ops->readbackToHost(st.hostLogits.data(), logits,
                             nSeq * st.vocab_lm * sizeof(float));
@@ -2480,6 +2517,25 @@ std::size_t ServingSession::maxBatch() const noexcept {
 
 std::size_t ServingSession::maxContext() const noexcept {
     return _state != nullptr ? _state->maxContext : 0;
+}
+
+ServingSession::KvStats ServingSession::kvStats() const noexcept {
+    KvStats st;
+    if (_state == nullptr || _state->pool == nullptr) {
+        return st;   // active=false: no paged pool allocated yet
+    }
+    const auto& pool = *_state->pool;
+    st.active    = true;
+    st.numLayers = pool.numLayers();
+    st.numBlocks = pool.numBlocks();
+    st.blockSize = pool.blockSize();
+    st.elemBytes = pool.elemBytes();
+    // Full device slab: numLayers x 2(K+V) x numBlocks x blockSize x
+    // numKvHeads x headDim x elemBytes (the pool is allocated up-front).
+    const std::size_t slotElems = pool.numKvHeads() * pool.headDim();
+    st.residentBytes = pool.numLayers() * 2ULL * pool.numBlocks()
+                     * pool.blockSize() * slotElems * pool.elemBytes();
+    return st;
 }
 
 } // namespace mimirmind::runtime::engine

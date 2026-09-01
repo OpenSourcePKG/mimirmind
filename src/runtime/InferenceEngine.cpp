@@ -413,6 +413,29 @@ const core::gguf::WeightsMap& InferenceEngine::weights() const {
     return *_weights;
 }
 
+InferenceEngine::MemoryTelemetry InferenceEngine::memoryTelemetry() const {
+    MemoryTelemetry mt;
+    // Model weights: resident footprint captured by the startup probe.
+    mt.weightBytes = _batchCapacity.weightBytes;
+    // Paged-KV pool (serving path only; absent in single-session generate()).
+    if (_servingSession != nullptr) {
+        const auto kv = _servingSession->kvStats();
+        mt.servingActive   = kv.active;
+        mt.kvResidentBytes = kv.residentBytes;
+        mt.kvNumBlocks     = kv.numBlocks;
+        mt.kvBlockSize     = kv.blockSize;
+        mt.kvNumLayers     = kv.numLayers;
+    }
+    // Device envelope (backend-neutral; 0 on backends that can't report it).
+    const std::size_t total = _computeCtx->deviceTotalMemoryBytes();
+    if (total > 0) {
+        mt.deviceMemAvailable = true;
+        mt.deviceTotalBytes   = total;
+        mt.deviceFreeBytes    = _computeCtx->deviceFreeMemoryBytes();
+    }
+    return mt;
+}
+
 void InferenceEngine::loadModel(std::string_view ggufPath) {
     if (_modelLoaded) {
         throw std::runtime_error("InferenceEngine: model already loaded");

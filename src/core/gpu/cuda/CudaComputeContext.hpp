@@ -73,6 +73,10 @@ public:
     /// cudaMemGetInfo. 0 on any CUDA error. Never throws.
     [[nodiscard]] std::size_t deviceFreeMemoryBytes() const noexcept override;
 
+    /// Total bytes of the (unified, on GB10) device pool via
+    /// cudaMemGetInfo. 0 on any CUDA error. Never throws.
+    [[nodiscard]] std::size_t deviceTotalMemoryBytes() const noexcept override;
+
     // ---- CUDA-native accessors ---------------------------------------
 
     [[nodiscard]] CudaContext&              cudaContext() noexcept       { return _ctx; }

@@ -53,6 +53,11 @@ public:
     /// runtime.
     [[nodiscard]] nlohmann::json buildStatus();
 
+    /// Payload for the admin-gated GET /v1/system/memory — categorized
+    /// RAM/VRAM breakdown (weights / paged-KV / device envelope / external
+    /// residual) + allocator fragmentation where available (8.16 Stage A).
+    [[nodiscard]] nlohmann::json buildMemory() const;
+
 private:
     [[nodiscard]] nlohmann::json buildPerfRegressionBlock() const;
     [[nodiscard]] nlohmann::json buildGpuClockBlock() const;

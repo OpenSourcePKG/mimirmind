@@ -787,6 +787,26 @@ public:
     [[nodiscard]] const runtime::serving::BatchCapacityEstimate&
         batchCapacity() const noexcept { return _batchCapacity; }
 
+    /// Backend-neutral memory-telemetry snapshot for the admin route
+    /// GET /v1/system/memory (8.16 Stage A). Aggregates the resident owner
+    /// categories (model weights, paged-KV pool) and the device envelope
+    /// (total/free via the compute context) so the handler can report
+    /// `external = deviceUsed - Σcategories`. Fragmentation / allocator
+    /// live-bytes are backend-specific and handled by the caller (L0-only).
+    /// deviceMemAvailable is false on backends that cannot report mem-info.
+    struct MemoryTelemetry {
+        std::size_t weightBytes{0};
+        bool        servingActive{false};
+        std::size_t kvResidentBytes{0};
+        std::size_t kvNumBlocks{0};
+        std::size_t kvBlockSize{0};
+        std::size_t kvNumLayers{0};
+        bool        deviceMemAvailable{false};
+        std::size_t deviceTotalBytes{0};
+        std::size_t deviceFreeBytes{0};
+    };
+    [[nodiscard]] MemoryTelemetry memoryTelemetry() const;
+
     /// Effective decision after the probe + the `serving.enableBatching`
     /// config gate. True means the runtime should route through the
     /// batching scheduler (once that scheduler exists — M-Cuda.Batch).

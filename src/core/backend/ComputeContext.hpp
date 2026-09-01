@@ -94,6 +94,13 @@ public:
     /// Never throws.
     [[nodiscard]] virtual std::size_t deviceFreeMemoryBytes() const noexcept { return 0; }
 
+    /// Total device memory in bytes on this backend's currently-selected
+    /// device (the unified LPDDR pool on Grace/GB10). Returns 0 when the
+    /// backend cannot determine it. Paired with deviceFreeMemoryBytes() to
+    /// form the device envelope for the memory-telemetry route (8.16):
+    /// deviceUsed = total - free. Never throws.
+    [[nodiscard]] virtual std::size_t deviceTotalMemoryBytes() const noexcept { return 0; }
+
 protected:
     ComputeContext() = default;
 };
