@@ -10,7 +10,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
+#ifdef __linux__
+#include <execinfo.h>   // 8.16 (a) untagged-alloc backtrace finder (temporary)
+#endif
 
 namespace mimirmind::core::cuda {
 
@@ -75,6 +79,31 @@ void CudaMemoryAllocator::chargeCategory(void* ptr, std::size_t bytes) noexcept 
     const auto        cat = gpu::ScopedAllocCategory::current();
     const std::size_t idx = static_cast<std::size_t>(cat) < gpu::kAllocCategoryCount
                           ? static_cast<std::size_t>(cat) : 0;
+    // 8.16 Stage B (a) — temporary finder: log a backtrace for large UNTAGGED
+    // allocations so the untagged call-sites can be wrapped with a guard.
+    // Env-gated (MIMIRMIND_ALLOC_TRACE=<min-MiB>), off by default -> zero cost.
+    if (cat == gpu::AllocCategory::Unknown) {
+        static const std::size_t traceMinBytes = [] {
+            const char* e = std::getenv("MIMIRMIND_ALLOC_TRACE");
+            const long  mib = (e != nullptr) ? std::strtol(e, nullptr, 10) : 0;
+            return mib > 0 ? static_cast<std::size_t>(mib) * (1ULL << 20) : 0;
+        }();
+        if (traceMinBytes > 0 && bytes >= traceMinBytes) {
+            std::string bt;
+#ifdef __linux__
+            void*  frames[12];
+            const int n = ::backtrace(frames, 12);
+            char** syms = ::backtrace_symbols(frames, n);
+            for (int i = 2; i < n && i < 8; ++i) {   // skip this fn + allocate()
+                bt += "\n    ";
+                bt += (syms != nullptr && syms[i] != nullptr) ? syms[i] : "?";
+            }
+            if (syms != nullptr) std::free(syms);
+#endif
+            MM_LOG_INFO("CudaMem", "ALLOC_TRACE untagged {} MiB:{}",
+                        bytes >> 20, bt);
+        }
+    }
     std::lock_guard<std::mutex> lk{_catMutex};
     _ptrCategory[ptr] = cat;
     _stats.liveBytesByCategory[idx] += bytes;

@@ -4,6 +4,7 @@
 #include "runtime/encoder/EncoderModel.hpp"
 
 #include "compute/ComputeOps.hpp"
+#include "core/gpu/AllocCategory.hpp"
 #include "core/safetensors/SafetensorsDtype.hpp"
 #include "core/safetensors/SafetensorsModel.hpp"
 
@@ -71,6 +72,9 @@ EncoderConfig parseEncoderConfig(std::string_view configJson) {
 
 void EncoderModel::load(std::string_view dir, compute::ComputeOps& ops,
                         core::gguf::GgmlType matmulType) {
+    // 8.16 Stage B: bge-m3 embed/rerank weights load outside the guarded
+    // InferenceEngine path -> tag them Weights (else they land in `unknown`).
+    core::gpu::ScopedAllocCategory _wc{core::gpu::AllocCategory::Weights};
     _matmulType = matmulType;
     const std::filesystem::path root{dir};
     _config = parseEncoderConfig(readTextFile(root / "config.json"));

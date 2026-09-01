@@ -781,14 +781,15 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     }
 
     const auto qkv = qb->maxQKVDims();
-    {   // 8.16 Stage B: the per-slot block-buffer substrate = Session.
-        core::gpu::ScopedAllocCategory _sc{core::gpu::AllocCategory::Session};
-        st->sb = allocBlockBuffers(*_e._ops, _e._config, /*maxT=*/maxBatch,
-                                   /*maxSeq=*/maxBatch, qkv.first, qkv.second,
-                                   /*withFusedQkv=*/false, /*withKvFp32Scratch=*/true,
-                                   /*withQGate=*/true, /*withSsm=*/true,
-                                   /*perSeqConvInput=*/true);
-    }
+    // 8.16 Stage B: everything from here to the end of the CUDA serving-state
+    // setup (block-buffer substrate + per-slot scratch: expIdx/kw/blockTables/
+    // seqLens/startPos/x/norm/logits/lmScr) is the Session substrate.
+    core::gpu::ScopedAllocCategory _sc{core::gpu::AllocCategory::Session};
+    st->sb = allocBlockBuffers(*_e._ops, _e._config, /*maxT=*/maxBatch,
+                               /*maxSeq=*/maxBatch, qkv.first, qkv.second,
+                               /*withFusedQkv=*/false, /*withKvFp32Scratch=*/true,
+                               /*withQGate=*/true, /*withSsm=*/true,
+                               /*perSeqConvInput=*/true);
     st->sb->ssmStatePtr     = st->ssm->statePtr();
     st->sb->ssmConvStatePtr = st->ssm->convStatePtr();
     st->sb->ssmSlabNSeq     = st->ssm->nSeq();
