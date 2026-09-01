@@ -122,6 +122,13 @@ Qwen3_5MoeBackend::Qwen3_5MoeBackend(const model::LlmConfig&       config,
     if (const char* st = std::getenv("MIMIRMIND_SHEXP_TC")) {
         _shexpTc = !(st[0] == '0' && st[1] == '\0');
     }
+    // 5.21.7: cuDNN-SDPA paged serving-prefill attention (gather paged KV ->
+    // cuDNN). Default OFF; opt-in via MIMIRMIND_ATTN_CUDNN_PAGED=1. Only engages
+    // for pure-prefill F32 ragged batches; falls back to the hand kernel
+    // otherwise. Requires a build with cuDNN (MIMIRMIND_HAVE_CUDNN_SDPA).
+    if (const char* cp = std::getenv("MIMIRMIND_ATTN_CUDNN_PAGED")) {
+        _attnCudnnPaged = (cp[0] == '1' && cp[1] == '\0');
+    }
     if (const char* dm = std::getenv("MIMIRMIND_NVFP4_DEINT")) {
         _useDeintMoe = (dm[0] == '1' && dm[1] == '\0');
     }
@@ -1598,6 +1605,29 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
         // prefill/varlen rows attend CAUSALLY over their chunk + prior KV (query
         // pq -> keys [0, startPos[seq]+pq]) via the paged pool. When hybrid is on,
         // seqTPrefill zeroes the decode slots so only prefill rows are written.
+        // 5.21.7: cuDNN-SDPA paged prefill (opt-in). Pure-prefill F32 ragged
+        // batches only (no folded decode rows); gather each seq's paged KV ->
+        // contiguous -> cuDNN flash. ~9x the CUDA-core paged-causal kernel
+        // (the section-profiler prefill wall). Falls back on any miss.
+        bool cudnnDone = false;
+        const bool cudnnKvOk = (kvDtype == runtime::KvDtype::F32 ||
+                                kvDtype == runtime::KvDtype::FP16 ||
+                                kvDtype == runtime::KvDtype::FP8_E4M3);
+        if (_attnCudnnPaged && ctx.hybDecodeCount == 0 && cudnnKvOk &&
+            ctx.seqTHost != nullptr && _ops.pagedPrefillCudnnAvailable()) {
+            const std::size_t kvDim     = nKvHeads * head_dim;
+            const std::size_t maxTkvCap = ctx.maxBlocksPerSeq * ctx.pool->blockSize();
+            const std::size_t needBytes = 2 * maxTkvCap * kvDim * sizeof(float);
+            if (s.cudnnKvScratch.bytes() < needBytes) {
+                s.cudnnKvScratch = _ops.allocate(needBytes);
+            }
+            cudnnDone = _ops.pagedPrefillAttentionCudnnAsync(
+                attnOut, qBuf, keyBase, valBase, ctx.blockTablesDev,
+                ctx.seqTHost, ctx.startPosDev, nSeq, nHeads, nKvHeads, head_dim,
+                ctx.pool->blockSize(), ctx.maxBlocksPerSeq, attnScale,
+                s.cudnnKvScratch.as<float>(), maxTkvCap, kvDtype);
+        }
+        if (!cudnnDone)
         _ops.pagedAttentionPrefillCausalAsync(
             attnOut, qBuf, keyBase, valBase, ctx.blockTablesDev,
             (ctx.hybDecodeCount > 0) ? ctx.hybSeqTPrefillDev : ctx.seqTDev,

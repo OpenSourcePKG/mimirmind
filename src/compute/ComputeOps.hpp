@@ -470,6 +470,37 @@ public:
             "pagedAttentionPrefillCausalAsync: not supported on this backend");
     }
 
+    /// True if a cuDNN-SDPA paged-prefill path is compiled + usable (CUDA build
+    /// with MIMIRMIND_HAVE_CUDNN_SDPA). Backends without it return false so the
+    /// caller keeps the hand-written paged-causal kernel.
+    [[nodiscard]] virtual bool pagedPrefillCudnnAvailable() const noexcept {
+        return false;
+    }
+
+    /// cuDNN-SDPA replacement for pagedAttentionPrefillCausalAsync on the F32
+    /// paged pool: per prefill sequence, gather its paged K/V prefix into a
+    /// contiguous scratch and run cuDNN's fused flash attention. Same result as
+    /// the hand kernel (bf16-near). `seqTHost` drives the host loop; `startPos`
+    /// is device (read back once). `kvScratch` holds 2*maxTkv*numKvHeads*headSize
+    /// floats (K then V). Returns false on any unsupported shape / cuDNN error so
+    /// the caller can fall back. Pure-prefill only (no decode rows in the batch).
+    [[nodiscard]] virtual bool pagedPrefillAttentionCudnnAsync(
+            float* out, const float* query, const void* keyCache,
+            const void* valueCache, const std::int32_t* blockTablesDev,
+            const std::int32_t* seqTHost, const std::int32_t* startPosDev,
+            std::size_t numSeqs, std::size_t numHeads, std::size_t numKvHeads,
+            std::size_t headSize, std::size_t blockSize,
+            std::size_t maxNumBlocksPerSeq, float scale,
+            float* kvScratch, std::size_t maxTkvCap,
+            runtime::KvDtype kvDtype = runtime::KvDtype::F32) {
+        (void)out; (void)query; (void)keyCache; (void)valueCache;
+        (void)blockTablesDev; (void)seqTHost; (void)startPosDev; (void)numSeqs;
+        (void)numHeads; (void)numKvHeads; (void)headSize; (void)blockSize;
+        (void)maxNumBlocksPerSeq; (void)scale; (void)kvScratch; (void)maxTkvCap;
+        (void)kvDtype;
+        return false;
+    }
+
     /// Split-K (partition-parallel) paged decode attention — kernels
     /// `paged_attention_v2` + `paged_attention_v2_reduce`. Same result as V1
     /// but parallelises the KV traversal across `ceil(maxSeqLen/512)` partitions

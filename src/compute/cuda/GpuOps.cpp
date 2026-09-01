@@ -382,6 +382,18 @@ struct GpuOps::Impl {
     // Decode single-user (M==1) register-staged variant: activation in registers
     // instead of shared memory, removing the MIO/short-scoreboard stall.
     core::cuda::CudaKernel _moeGroupedGemmNvfp4M1RegKernel;
+    // 5.21.6: wide-M FP16 tensor-core grouped GEMM for PREFILL (W4A16, wmma).
+    // Opt-in via MIMIRMIND_MOE_PREFILL_TC=1; replaces the CUDA-core M16 kernel
+    // on the prefill (large-M) path only. ~9-15x the CUDA-core kernel in micro-
+    // bench, parity L2rel~2.6e-4. Decode (small-M) path unchanged.
+    core::cuda::CudaModule _moeGroupedGemmNvfp4TcModule;
+    core::cuda::CudaKernel _moeGroupedGemmNvfp4TcKernel;
+    // 5.21.7: paged-KV -> contiguous f32 gather for the cuDNN paged-prefill path
+    // (one variant per pool dtype; all dequantise to f32).
+    core::cuda::CudaModule _kvGatherPagedModule;
+    core::cuda::CudaKernel _kvGatherPagedKernel;      // f32 pool
+    core::cuda::CudaKernel _kvGatherPagedFp16Kernel;  // fp16 pool
+    core::cuda::CudaKernel _kvGatherPagedFp8Kernel;   // fp8-e4m3 pool
     // E-d.4b: padding infra (one module, four kernels) + act-quant.
     core::cuda::CudaModule _moePadModule;
     core::cuda::CudaKernel _moePadOffsetsKernel;
@@ -669,6 +681,17 @@ struct GpuOps::Impl {
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m4")},
           _moeGroupedGemmNvfp4M1RegKernel{
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m1reg")},
+          _moeGroupedGemmNvfp4TcModule{
+              loadCudaModule(ctx, "moe_grouped_gemm_nvfp4blk_tc")},
+          _moeGroupedGemmNvfp4TcKernel{
+              _moeGroupedGemmNvfp4TcModule.getFunction("moe_grouped_gemm_nvfp4blk_tc")},
+          _kvGatherPagedModule{loadCudaModule(ctx, "kv_gather_paged")},
+          _kvGatherPagedKernel{
+              _kvGatherPagedModule.getFunction("kv_gather_paged")},
+          _kvGatherPagedFp16Kernel{
+              _kvGatherPagedModule.getFunction("kv_gather_paged_fp16")},
+          _kvGatherPagedFp8Kernel{
+              _kvGatherPagedModule.getFunction("kv_gather_paged_fp8")},
           _nvfp4DeintModule{loadCudaModule(ctx, "matmul_nvfp4blk_deint_vec")},
           _nvfp4DeinterleaveKernel{
               _nvfp4DeintModule.getFunction("nvfp4blk_deinterleave")},
@@ -752,6 +775,18 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
     // when GQA itself is enabled too.
     _prefillFlashGqaQ8BqEnabled  = flashPrefillGqaQ8Enabled && flashPrefillGqaQ8BqEnabled;
     _q8_0ReorderMode             = q8_0ReorderMode;
+
+    // 5.21.6 opt-in: wide-M FP16 tensor-core PREFILL MoE-GEMM (env, default off).
+    if (const char* mt = std::getenv("MIMIRMIND_MOE_PREFILL_TC")) {
+        _moePrefillTcEnabled = (mt[0] != '\0' && !(mt[0] == '0' && mt[1] == '\0'));
+    }
+    if (_moePrefillTcEnabled) {
+        MM_LOG_INFO("hipgpuops",
+                    "wide-M FP16 tensor-core prefill MoE-GEMM enabled "
+                    "(MIMIRMIND_MOE_PREFILL_TC=1) — grouped GEMM prefill (large-M) "
+                    "runs on wmma FP16 tensor cores; decode (small-M) path "
+                    "unchanged, CUDA-core kernel is the fallback");
+    }
 
     // P3.a opt-in: GQA-head-packed F32 prefill flash (env, default off).
     if (const char* g = std::getenv("MIMIRMIND_ATTN_PREFILL_GQA")) {
@@ -2323,6 +2358,28 @@ void GpuOps::moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
     if (N == 0 || K == 0 || maxTiles == 0) {
         return;
     }
+    // 5.21.6: wide-M FP16 tensor-core prefill path (opt-in). Only for the
+    // large-M prefill launch (never decodeSmallM — decode M=1/4 leaves the wmma
+    // m=16 tile mostly empty, no TC win). Same schedule contract; different
+    // launch geometry (one CTA = kTcWarps warps, each a 16-wide N-block).
+    if (_moePrefillTcEnabled && !decodeSmallM) {
+        constexpr std::uint32_t kTcWarps = 4;   // must match TC_WARPS in the kernel
+        constexpr std::uint32_t kTcTile  = 16;
+        const std::uint32_t nBlocks = static_cast<std::uint32_t>(
+            (N + kTcTile * kTcWarps - 1) / (kTcTile * kTcWarps));
+        auto& tk = _pimpl->_moeGroupedGemmNvfp4TcKernel;
+        tk.setPtr  (0, x);
+        tk.setPtr  (1, w);
+        tk.setPtr  (2, y);
+        tk.setPtr  (3, tileExpert);
+        tk.setPtr  (4, tileRow0);
+        tk.setPtr  (5, tileRows);
+        tk.setValue(6, toInt32(K, "moeGroupedGemmTc K"));
+        tk.setValue(7, toInt32(N, "moeGroupedGemmTc N"));
+        tk.launch(_ctx.stream(), nBlocks, static_cast<std::uint32_t>(maxTiles), 1,
+                  kTcWarps * 32, 1, 1);
+        return;
+    }
     // Matches matmul_nvfp4blk_gemm's warp layout: 4 output columns per group,
     // 128 threads/block. grid.x tiles N, grid.y indexes the tile schedule.
     constexpr std::uint32_t kOutputsPerGroup = 4;
@@ -3594,6 +3651,108 @@ void GpuOps::pagedAttentionPrefillCausalAsync(
                 static_cast<std::uint32_t>(maxT),
                 kLocal, 1, 1,
                 smemBytes);
+}
+
+bool GpuOps::pagedPrefillCudnnAvailable() const noexcept {
+#if MIMIRMIND_HAVE_CUDNN_SDPA
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool GpuOps::pagedPrefillAttentionCudnnAsync(
+        float* out, const float* query, const void* keyCache,
+        const void* valueCache, const std::int32_t* blockTablesDev,
+        const std::int32_t* seqTHost, const std::int32_t* startPosDev,
+        std::size_t numSeqs, std::size_t numHeads, std::size_t numKvHeads,
+        std::size_t headSize, std::size_t blockSize,
+        std::size_t maxNumBlocksPerSeq, float scale,
+        float* kvScratch, std::size_t maxTkvCap, runtime::KvDtype kvDtype) {
+#if MIMIRMIND_HAVE_CUDNN_SDPA
+    if (numSeqs == 0 || numHeads == 0 || headSize == 0 || seqTHost == nullptr) {
+        return false;
+    }
+    if (numKvHeads == 0 || (numHeads % numKvHeads) != 0) {
+        return false;   // cuDNN GQA needs heads divisible by kv-heads
+    }
+    // Select the paged-KV gather variant by pool dtype (all dequant to f32).
+    core::cuda::CudaKernel* gatherK = nullptr;
+    switch (kvDtype) {
+        case runtime::KvDtype::F32:      gatherK = &_pimpl->_kvGatherPagedKernel;     break;
+        case runtime::KvDtype::FP16:     gatherK = &_pimpl->_kvGatherPagedFp16Kernel; break;
+        case runtime::KvDtype::FP8_E4M3: gatherK = &_pimpl->_kvGatherPagedFp8Kernel;  break;
+        default: return false;   // unsupported pool dtype -> caller falls back
+    }
+    if (!_cudnnSdpa) {
+        _cudnnSdpa = std::make_unique<CudnnSdpaPrefill>();
+    }
+    // startPos lives on device; read the small [numSeqs] array back once.
+    std::vector<std::int32_t> startPos(numSeqs);
+    if (cudaMemcpyAsync(startPos.data(), startPosDev,
+                        numSeqs * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                        _ctx.stream().handle()) != cudaSuccess) {
+        return false;
+    }
+    if (cudaStreamSynchronize(_ctx.stream().handle()) != cudaSuccess) {
+        return false;
+    }
+
+    const std::size_t qDim      = numHeads * headSize;
+    const std::size_t kvStride  = maxTkvCap * numKvHeads * headSize;   // K | V split
+    float* const kScratch = kvScratch;
+    float* const vScratch = kvScratch + kvStride;
+    constexpr std::uint32_t kGthr = 256;
+
+    std::size_t qOff = 0;   // running activation-row offset (prefix-sum of seqT)
+    for (std::size_t seq = 0; seq < numSeqs; ++seq) {
+        const int Tq = seqTHost[seq];
+        if (Tq <= 0) {
+            continue;
+        }
+        const int Tkv = startPos[seq] + Tq;
+        if (Tkv <= 0 || static_cast<std::size_t>(Tkv) > maxTkvCap) {
+            return false;   // shape out of scratch budget -> caller falls back
+        }
+        const std::int32_t* btSeq =
+            blockTablesDev + seq * maxNumBlocksPerSeq;
+        const long nElem = static_cast<long>(Tkv) * static_cast<long>(numKvHeads)
+                         * static_cast<long>(headSize);
+        const std::uint32_t grid =
+            static_cast<std::uint32_t>((nElem + kGthr - 1) / kGthr);
+        auto gather = [&](const void* pool, float* dst) {
+            core::cuda::CudaKernel& g = *gatherK;
+            g.setPtr  (0, pool);
+            g.setPtr  (1, btSeq);
+            g.setPtr  (2, dst);
+            g.setValue(3, toInt32(Tkv,        "gather Tkv"));
+            g.setValue(4, toInt32(numKvHeads, "gather nKvHeads"));
+            g.setValue(5, toInt32(headSize,   "gather headSize"));
+            g.setValue(6, toInt32(blockSize,  "gather blockSize"));
+            g.launch(_ctx.stream(), grid, 1, 1, kGthr, 1, 1);
+        };
+        gather(keyCache, kScratch);
+        gather(valueCache, vScratch);
+
+        const float* qPtr = query + qOff * qDim;
+        float*       oPtr = out   + qOff * qDim;
+        if (!_cudnnSdpa->runF32Causal(
+                _ctx.stream().handle(), qPtr, kScratch, vScratch, oPtr,
+                Tq, Tkv, toInt32(numHeads,   "cudnn nHeads"),
+                toInt32(numKvHeads, "cudnn nKvHeads"),
+                toInt32(headSize,   "cudnn headDim"), scale)) {
+            return false;   // cuDNN failed for this shape -> fall back
+        }
+        qOff += static_cast<std::size_t>(Tq);
+    }
+    return true;
+#else
+    (void)out; (void)query; (void)keyCache; (void)valueCache;
+    (void)blockTablesDev; (void)seqTHost; (void)startPosDev; (void)numSeqs;
+    (void)numHeads; (void)numKvHeads; (void)headSize; (void)blockSize;
+    (void)maxNumBlocksPerSeq; (void)scale; (void)kvScratch; (void)maxTkvCap;
+    return false;
+#endif
 }
 
 void GpuOps::pagedAttentionDecodeV2Async(

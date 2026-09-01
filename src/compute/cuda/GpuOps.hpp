@@ -582,6 +582,10 @@ private:
     // Requires the F32 KV GQA shape (headDim<=256, mult of 16); falls
     // back to the plain kernel otherwise. Implies the head-packed tiling.
     bool                 _prefillTcF32Enabled{false};
+    // 5.21.6 — opt-in wide-M FP16 tensor-core PREFILL MoE-GEMM. Env
+    // MIMIRMIND_MOE_PREFILL_TC=1. Selected in moeGroupedGemmNvfp4Async for the
+    // prefill (large-M) path only; decode (small-M) path unchanged. Bit-near.
+    bool                 _moePrefillTcEnabled{false};
     // Step 3 — opt-in FP16 tensor-core FA-2 prefill (q-tiled, needs fp16 KV).
     // Env MIMIRMIND_ATTN_FP16_TC=1. Bit-near (fp16); parity-gated.
     bool                 _prefillFp16TcEnabled{false};
@@ -746,6 +750,16 @@ public:
             std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
             std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
             std::size_t maxT, float scale, float softcap,
+            runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
+    [[nodiscard]] bool pagedPrefillCudnnAvailable() const noexcept override;
+    [[nodiscard]] bool pagedPrefillAttentionCudnnAsync(
+            float* out, const float* query, const void* keyCache,
+            const void* valueCache, const std::int32_t* blockTablesDev,
+            const std::int32_t* seqTHost, const std::int32_t* startPosDev,
+            std::size_t numSeqs, std::size_t numHeads, std::size_t numKvHeads,
+            std::size_t headSize, std::size_t blockSize,
+            std::size_t maxNumBlocksPerSeq, float scale,
+            float* kvScratch, std::size_t maxTkvCap,
             runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
     void pagedAttentionDecodeV2Async(
             float* out, const float* query, const float* keyCache,

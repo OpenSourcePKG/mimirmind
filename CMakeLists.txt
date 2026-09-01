@@ -876,6 +876,8 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/kv_write_tokens_batched.cu
         kernels/cuda/llm/moe_group_tiles.cu
         kernels/cuda/llm/moe_grouped_gemm_nvfp4blk.cu
+        kernels/cuda/llm/moe_grouped_gemm_nvfp4blk_tc.cu
+        kernels/cuda/llm/kv_gather_paged.cu
         kernels/cuda/llm/matmul_nvfp4blk_deint_vec.cu
         kernels/cuda/llm/moe_act_quant_nvfp4.cu
         kernels/cuda/llm/moe_weight_sf_swizzle.cu
@@ -1132,6 +1134,34 @@ if(MIMIRMIND_ENABLE_CUDA)
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON)
     target_link_libraries(microbench_moe_gemv_m1 PRIVATE CUDA::cudart)
+
+    # microbench_moe_gemm_widem — isolated WIDE-M routed-MoE PREFILL-GEMM roofline
+    # probe (links the real prod M16 grouped kernel), roadmap 5.21.5 / Option 1
+    # gate. Answers whether the current M16 CUDA-core prefill GEMM is compute-,
+    # bandwidth-, or latency-bound -> the go/no-go for a wide-M FP4-TC prefill GEMM.
+    #   cmake --build build-cuda --target microbench_moe_gemm_widem &&
+    #   ./build-cuda/microbench_moe_gemm_widem            # M-sweep, gate/up + down
+    add_executable(microbench_moe_gemm_widem
+        tools/microbench/moe_gemm_widem_bench.cu
+        kernels/cuda/llm/moe_grouped_gemm_nvfp4blk.cu)
+    set_target_properties(microbench_moe_gemm_widem PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(microbench_moe_gemm_widem PRIVATE CUDA::cudart)
+
+    # microbench_moe_gemm_tc — parity + perf for the wide-M FP16 tensor-core
+    # prefill MoE-GEMM (moe_grouped_gemm_nvfp4blk_tc) vs the CUDA-core oracle,
+    # roadmap 5.21.6 Increment I. Links both kernels.
+    #   cmake --build build-cuda --target microbench_moe_gemm_tc &&
+    #   ./build-cuda/microbench_moe_gemm_tc            # parity table + M-sweep perf
+    add_executable(microbench_moe_gemm_tc
+        tools/microbench/moe_gemm_tc_bench.cu
+        kernels/cuda/llm/moe_grouped_gemm_nvfp4blk.cu
+        kernels/cuda/llm/moe_grouped_gemm_nvfp4blk_tc.cu)
+    set_target_properties(microbench_moe_gemm_tc PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(microbench_moe_gemm_tc PRIVATE CUDA::cudart)
 endif()
 
 # ---- mimirmind_core_cuda — NVIDIA CUDA-tied foundation --------------------
@@ -3037,6 +3067,13 @@ if(MIMIRMIND_ENABLE_CUDA AND MIMIRMIND_ENABLE_CUDNN)
     if(TARGET mimirmind)
         target_link_libraries(mimirmind PRIVATE mimirmind_cudnn_sdpa)
         target_compile_definitions(mimirmind PRIVATE MIMIRMIND_HAVE_CUDNN_SDPA=1)
+        # Bake the cuDNN lib dir into the binary's RPATH so it resolves
+        # libcudnn.so.9 without a runtime LD_LIBRARY_PATH (the wheel ships no
+        # system-path .so). The binary runs in-place from the build tree, so
+        # BUILD_RPATH is what applies. ${MIMIRMIND_CUDNN_ROOT}/lib is the same
+        # path the container mounts at runtime (/src/... == /opt/mimirmind/...).
+        set_property(TARGET mimirmind APPEND PROPERTY
+            BUILD_RPATH "${MIMIRMIND_CUDNN_ROOT}/lib")
     endif()
 
     add_executable(cudnn_sdpa_parity tests/cudnn_sdpa_parity.cu)

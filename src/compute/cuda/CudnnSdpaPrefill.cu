@@ -25,6 +25,14 @@ __global__ void castF32ToBf16(const float* __restrict__ in, __nv_bfloat16* __res
     std::size_t i = (std::size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2bfloat16(in[i]);
 }
+// Write the two actual seqlens on-device (values marshaled as launch args, so no
+// host buffer + no per-call cudaStreamSynchronize — the old sync serialized every
+// call, which dominated the per-seq serving prefill loop).
+__global__ void setSeqLens(int* __restrict__ seqQ, int* __restrict__ seqKV,
+                           int tq, int tkv) {
+    *seqQ  = tq;
+    *seqKV = tkv;
+}
 __global__ void castBf16ToF32(const __nv_bfloat16* __restrict__ in, float* __restrict__ out,
                               std::size_t n) {
     std::size_t i = (std::size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -72,10 +80,20 @@ struct CudnnSdpaPrefill::Impl {
     // One ragged graph per attention shape (nHeads,nKvHeads,headDim); the
     // variable T_q/T_kv are passed at execute via seq_len tensors, so no
     // per-length rebuild.
-    static uint64_t key(int nHeads, int nKvHeads, int headDim) {
-        return ((uint64_t)(uint32_t)nHeads << 20) |
+    static uint64_t key(int nHeads, int nKvHeads, int headDim, int sBucket) {
+        return ((uint64_t)(uint32_t)sBucket << 32) |
+               ((uint64_t)(uint32_t)nHeads  << 20) |
                ((uint64_t)(uint32_t)nKvHeads << 12) |
                 (uint64_t)(uint32_t)headDim;
+    }
+
+    // Round T_kv up to a power-of-2 bucket in [1024, kSmax]. A graph built for a
+    // tight bucket picks a far better plan than the fixed-8192 one (~5-15x on the
+    // attention term, measured), while keeping the cache to a handful of graphs.
+    static int bucketS(int Tkv) {
+        int s = 1024;
+        while (s < Tkv && s < kSmax) s <<= 1;
+        return s;
     }
 
     template <typename T>
@@ -88,8 +106,9 @@ struct CudnnSdpaPrefill::Impl {
         return true;
     }
 
-    CachedGraph* getOrBuild(int nHeads, int nKvHeads, int headDim, float scale) {
-        uint64_t k = key(nHeads, nKvHeads, headDim);
+    CachedGraph* getOrBuild(int nHeads, int nKvHeads, int headDim, float scale,
+                            int sBucket) {
+        uint64_t k = key(nHeads, nKvHeads, headDim, sBucket);
         auto it = cache.find(k);
         if (it != cache.end()) return &it->second;
 
@@ -99,7 +118,7 @@ struct CudnnSdpaPrefill::Impl {
         g.set_io_data_type(fe::DataType_t::BFLOAT16)
          .set_intermediate_data_type(fe::DataType_t::FLOAT)
          .set_compute_data_type(fe::DataType_t::FLOAT);
-        const int64_t b = 1, S = kSmax;
+        const int64_t b = 1, S = sBucket;
         const int64_t D = headDim;
         // ONE ragged graph built for the max seqlen S. Actual per-call T_q/T_kv
         // come via seq_len tensors + padding mask, so there is no per-length
@@ -177,13 +196,12 @@ bool CudnnSdpaPrefill::runF32Causal(void* stream,
     launchCastTo(k, I.dK, nKV);
     launchCastTo(v, I.dV, nKV);
 
-    // Actual seqlens (bottom-right causal + padding uses these). Tiny sync copy.
-    const int32_t sq = T_q, skv = T_kv;
-    if (cudaMemcpyAsync(I.dSeqQ,  &sq,  sizeof(int32_t), cudaMemcpyHostToDevice, s) != cudaSuccess) return false;
-    if (cudaMemcpyAsync(I.dSeqKV, &skv, sizeof(int32_t), cudaMemcpyHostToDevice, s) != cudaSuccess) return false;
-    if (cudaStreamSynchronize(s) != cudaSuccess) return false;   // sq/skv on stack -> ensure copied
+    // Actual seqlens (bottom-right causal + padding uses these). Set on-device via
+    // a 1-thread kernel — no host buffer, no per-call stream sync.
+    setSeqLens<<<1, 1, 0, s>>>(I.dSeqQ, I.dSeqKV, T_q, T_kv);
 
-    CachedGraph* cg = I.getOrBuild(nHeads, nKvHeads, headDim, scale);
+    CachedGraph* cg = I.getOrBuild(nHeads, nKvHeads, headDim, scale,
+                                   Impl::bucketS(T_kv));
     if (!cg) return false;
     if (cg->workspaceBytes > 0 &&
         !Impl::grow(reinterpret_cast<char*&>(I.dWs), I.wsCap, (std::size_t)cg->workspaceBytes))

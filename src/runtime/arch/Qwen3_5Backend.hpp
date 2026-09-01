@@ -366,6 +366,11 @@ protected:
     // measured stage-R prefill bottleneck). Default-on; only fires when the
     // loader built the shexp TC sidecars. MIMIRMIND_SHEXP_TC=0 rolls back.
     bool _shexpTc{true};
+    // 5.21.7: route the F32 paged serving-prefill attention through cuDNN SDPA
+    // (gather paged KV -> contiguous -> cuDNN flash) instead of the CUDA-core
+    // paged-causal kernel. Default OFF; opt-in MIMIRMIND_ATTN_CUDNN_PAGED=1.
+    // Pure-prefill F32 ragged batches only; falls back to the hand kernel.
+    bool _attnCudnnPaged{false};
     // Force the single-pass paged decode (V1) instead of the split-K V2 for
     // full-attention layers. A/B + rollback lever (MIMIRMIND_PAGED_V1=1).
     bool _forcePagedV1{false};

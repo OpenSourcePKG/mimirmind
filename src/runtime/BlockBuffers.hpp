@@ -46,6 +46,10 @@ struct BlockBuffers {
     ComputeBuffer qBuf;          // [maxT, q_dim]
     ComputeBuffer normBuf;       // [maxT, d_model]
     ComputeBuffer attnOut;       // [maxT, q_dim]
+    // 5.21.7: contiguous K|V scratch for the cuDNN paged-prefill path (gathered
+    // from the paged pool per sequence). Lazily grown to 2*maxContext*kv_dim
+    // floats. Zero-sized unless MIMIRMIND_ATTN_CUDNN_PAGED is used.
+    ComputeBuffer cudnnKvScratch;
     ComputeBuffer projOut;       // [maxT, d_model]
     ComputeBuffer gateOut;       // [maxT, max(ff_dim, gate_up_per_expert)]
     ComputeBuffer upOut;         // [maxT, ff_dim]
