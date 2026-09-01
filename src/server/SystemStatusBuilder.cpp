@@ -26,8 +26,93 @@
 
 #include <limits>
 #include <vector>
+#ifdef __linux__
+#include <array>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <unistd.h>
+#endif
 
 namespace {
+#ifdef __linux__
+// 8.16 Stage B Inc-2 — passive host-VA / physical-RAM view from /proc. On GB10
+// the CPU (Grace) and GPU (Blackwell) share one coherent LPDDR pool, so the
+// kernel's own page accounting is a real, zero-cost window into how the shared
+// RAM is distributed + fragmented — no invasive largest-free-block probe.
+struct HostMemInfo {
+    bool          available{false};
+    std::uint64_t rssBytes{0};        // /proc/self/smaps_rollup Rss
+    std::uint64_t pssBytes{0};        // proportional set size
+    std::uint64_t anonBytes{0};       // Anonymous
+    std::uint64_t memTotalBytes{0};   // /proc/meminfo
+    std::uint64_t memFreeBytes{0};
+    std::uint64_t memAvailBytes{0};
+    // /proc/buddyinfo: free-block count per order (summed across zones), and
+    // the derived largest contiguous free block = highest order with count>0.
+    static constexpr std::size_t kMaxOrders = 16;
+    std::array<std::uint64_t, kMaxOrders> freePagesByOrder{};
+    std::size_t   nOrders{0};
+    std::uint64_t pageSize{4096};
+    std::uint64_t largestFreeContiguousBytes{0};
+    std::uint64_t buddyFreeBytes{0};  // Σ count × (pageSize<<order)
+};
+
+// Read "Key:   N kB" from a /proc file → bytes. 0 when absent.
+std::uint64_t readProcKb(const std::string& path, const char* key) {
+    std::ifstream f{path};
+    std::string   line;
+    const std::string want{key};
+    while (std::getline(f, line)) {
+        if (line.rfind(want, 0) == 0) {
+            std::istringstream ss{line.substr(want.size())};
+            std::uint64_t      kb = 0;
+            ss >> kb;
+            return kb * 1024ULL;
+        }
+    }
+    return 0;
+}
+
+HostMemInfo readHostMemInfo() {
+    HostMemInfo h;
+    h.pageSize = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+    if (h.pageSize == 0) h.pageSize = 4096;
+
+    h.rssBytes  = readProcKb("/proc/self/smaps_rollup", "Rss:");
+    h.pssBytes  = readProcKb("/proc/self/smaps_rollup", "Pss:");
+    h.anonBytes = readProcKb("/proc/self/smaps_rollup", "Anonymous:");
+    h.memTotalBytes = readProcKb("/proc/meminfo", "MemTotal:");
+    h.memFreeBytes  = readProcKb("/proc/meminfo", "MemFree:");
+    h.memAvailBytes = readProcKb("/proc/meminfo", "MemAvailable:");
+
+    // buddyinfo: "Node N, zone NAME  c0 c1 c2 ...cK" — sum counts per order.
+    std::ifstream bf{"/proc/buddyinfo"};
+    std::string   line;
+    while (std::getline(bf, line)) {
+        const auto zonePos = line.find("zone");
+        if (zonePos == std::string::npos) continue;
+        std::istringstream ss{line.substr(zonePos + 4)};
+        std::string        zoneName;
+        ss >> zoneName;                 // skip zone name token
+        std::uint64_t      count = 0;
+        std::size_t        order = 0;
+        while (ss >> count && order < HostMemInfo::kMaxOrders) {
+            h.freePagesByOrder[order] += count;
+            if (order + 1 > h.nOrders) h.nOrders = order + 1;
+            ++order;
+        }
+    }
+    for (std::size_t o = 0; o < h.nOrders; ++o) {
+        const std::uint64_t blockBytes = h.pageSize << o;
+        h.buddyFreeBytes += h.freePagesByOrder[o] * blockBytes;
+        if (h.freePagesByOrder[o] > 0) h.largestFreeContiguousBytes = blockBytes;
+    }
+    h.available = (h.memTotalBytes > 0);
+    return h;
+}
+#endif // __linux__
+
 #ifdef MIMIRMIND_HAVE_CUDA
 // Process-lifetime NVML telemetry reader (observability only; never enforces).
 // Lazily constructed on first status request so a CPU/L0 build without a driver
@@ -560,12 +645,56 @@ json SystemStatusBuilder::buildMemory() const {
     }
 #endif
 
+    // 8.16 Stage B Inc-2 — passive host/physical view from /proc (GB10 unified
+    // pool). process = this serve's resident footprint; system = whole-box RAM;
+    // fragmentation = kernel buddy-allocator free-block histogram + the largest
+    // contiguous free block (the real physical-fragmentation signal that CUDA's
+    // own API cannot give). Linux-only; degrades to available:false elsewhere.
+    json host;
+#ifdef __linux__
+    {
+        const auto h = readHostMemInfo();
+        if (h.available) {
+            json byOrder = json::array();
+            for (std::size_t o = 0; o < h.nOrders; ++o) {
+                byOrder.push_back(json{
+                    {"order",       o},
+                    {"block_bytes", h.pageSize << o},
+                    {"free_blocks", h.freePagesByOrder[o]},
+                });
+            }
+            host = json{
+                {"available", true},
+                {"process", {{"rss_bytes",       h.rssBytes},
+                             {"pss_bytes",       h.pssBytes},
+                             {"anonymous_bytes", h.anonBytes}}},
+                {"system",  {{"mem_total_bytes",     h.memTotalBytes},
+                             {"mem_free_bytes",      h.memFreeBytes},
+                             {"mem_available_bytes", h.memAvailBytes}}},
+                {"fragmentation", {
+                    {"largest_free_contiguous_bytes", h.largestFreeContiguousBytes},
+                    {"buddy_free_bytes",              h.buddyFreeBytes},
+                    {"free_blocks_by_order",          byOrder},
+                    {"note", "kernel buddy-allocator free-page fragmentation of "
+                             "the shared LPDDR pool (CPU+GPU coherent on GB10); "
+                             "largest_free_contiguous_bytes = biggest single "
+                             "physically-contiguous free block"}}},
+            };
+        } else {
+            host = json{{"available", false}, {"reason", "/proc unreadable"}};
+        }
+    }
+#else
+    host = json{{"available", false}, {"reason", "host /proc view is Linux-only"}};
+#endif
+
     return json{
         {"device",               device},
         {"categories",           categories},
         {"allocator_categories", allocatorCategories},
         {"external",             external},
         {"fragmentation",        fragmentation},
+        {"host",                 host},
     };
 }
 
