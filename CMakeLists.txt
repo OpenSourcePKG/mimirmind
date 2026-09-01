@@ -1162,6 +1162,21 @@ if(MIMIRMIND_ENABLE_CUDA)
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON)
     target_link_libraries(microbench_moe_gemm_tc PRIVATE CUDA::cudart)
+
+    # microbench_moe_serving — isolated SERVING-decode grouped-MoE GEMM roofline
+    # probe (links the real prod _m4 / _m1reg kernels), roadmap 5.18.9 Inc-2.
+    # Drives the conc64 shape (E=256 experts all active, M rows/expert) to settle
+    # whether the ~2.7x-above-roofline decode moe.gemm is the _m4 kernel's weight-
+    # bandwidth efficiency at the real serving shape.
+    #   cmake --build build-cudnn --target microbench_moe_serving &&
+    #   ./build-cudnn/microbench_moe_serving            # E=256 M-sweep, gate/up + down
+    add_executable(microbench_moe_serving
+        tools/microbench/moe_grouped_serving_bench.cu
+        kernels/cuda/llm/moe_grouped_gemm_nvfp4blk.cu)
+    set_target_properties(microbench_moe_serving PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(microbench_moe_serving PRIVATE CUDA::cudart)
 endif()
 
 # ---- mimirmind_core_cuda — NVIDIA CUDA-tied foundation --------------------
