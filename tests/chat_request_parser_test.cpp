@@ -140,15 +140,8 @@ TEST(missingMessages_400paramMessages) {
     EXPECT_TRUE(throwsWithParam(b, "messages"));
 }
 
-TEST(contentArray_400paramContent_incr1) {
-    // Increment 2 will concatenate text parts; Increment 1 keeps a clean,
-    // field-tagged 400 (never an opaque type_error).
-    json b = baseBody();
-    b["messages"] = json::array({json{
-        {"role", "user"},
-        {"content", json::array({json{{"type", "text"}, {"text", "hi"}}})}}});
-    EXPECT_TRUE(throwsWithParam(b, "messages[].content"));
-}
+// (content-array behavior is covered by the Increment 2 contentParts_* tests
+//  below — arrays of text parts are now concatenated, not rejected.)
 
 // --- liberal accept: valid standard fields never 400 ----------------------
 
@@ -211,6 +204,122 @@ TEST(contentNull_assistantToolCallOnly_ok) {
     EXPECT_EQ(r.messages.size(), std::size_t{3});
     EXPECT_EQ(r.messages.at(1).toolCalls.size(), std::size_t{1});
     EXPECT_TRUE(r.messages.at(2).toolCallId == "call_1");
+}
+
+// --- Increment 2: content parts, developer role, deprecated functions,
+//     response_format --------------------------------------------------------
+
+TEST(contentParts_textArray_concatenated) {
+    json b = baseBody();
+    b["messages"] = json::array({json{
+        {"role", "user"},
+        {"content", json::array({
+            json{{"type", "text"}, {"text", "Hello "}},
+            json{{"type", "text"}, {"text", "world"}},
+        })}}});
+    const ChatRequest r = parseChatRequest(b);
+    EXPECT_TRUE(r.messages.at(0).content == "Hello world");
+}
+
+TEST(contentParts_ignoresImageParts_noError) {
+    json b = baseBody();
+    b["messages"] = json::array({json{
+        {"role", "user"},
+        {"content", json::array({
+            json{{"type", "text"}, {"text", "look:"}},
+            json{{"type", "image_url"},
+                 {"image_url", {{"url", "data:image/png;base64,AAAA"}}}},
+        })}}});
+    const ChatRequest r = parseChatRequest(b);
+    EXPECT_TRUE(r.messages.at(0).content == "look:");   // image part ignored
+}
+
+TEST(contentScalarNumber_400paramContent) {
+    json b = baseBody();
+    b["messages"] = json::array({json{{"role", "user"}, {"content", 42}}});
+    EXPECT_TRUE(throwsWithParam(b, "messages[].content"));
+}
+
+TEST(developerRole_mappedToSystem) {
+    json b = baseBody();
+    b["messages"] = json::array({
+        json{{"role", "developer"}, {"content", "be terse"}},
+        json{{"role", "user"}, {"content", "hi"}}});
+    const ChatRequest r = parseChatRequest(b);
+    EXPECT_TRUE(r.messages.at(0).role == ::mimirmind::model::ChatRole::System);
+}
+
+TEST(deprecatedFunctions_mappedToTools) {
+    json b = baseBody();
+    b["functions"] = json::array({
+        json{{"name", "get_weather"}, {"description", "w"},
+             {"parameters", json::object()}}});
+    const ChatRequest r = parseChatRequest(b);
+    EXPECT_EQ(r.tools.size(), std::size_t{1});
+    EXPECT_TRUE(r.tools.at(0).name == "get_weather");
+}
+
+TEST(deprecatedFunctionCall_objectForcesNamedCall) {
+    json b = baseBody();
+    b["functions"] = json::array({
+        json{{"name", "get_weather"}}, json{{"name", "other"}}});
+    b["function_call"] = json{{"name", "get_weather"}};
+    const ChatRequest r = parseChatRequest(b);
+    EXPECT_TRUE(r.forcedToolName == "get_weather");
+    EXPECT_TRUE(r.toolChoice == "required");
+    EXPECT_EQ(r.tools.size(), std::size_t{1});     // narrowed to the forced fn
+}
+
+TEST(deprecatedFunctionCall_stringNone) {
+    json b = baseBody();
+    b["functions"]     = json::array({json{{"name", "a"}}});
+    b["function_call"] = "none";
+    const ChatRequest r = parseChatRequest(b);
+    EXPECT_TRUE(r.toolChoice == "none");
+    EXPECT_TRUE(r.forcedToolName.empty());
+}
+
+TEST(modernToolsWin_overDeprecatedFunctions) {
+    json b = baseBody();
+    b["tools"] = json::array({
+        json{{"type", "function"}, {"function", {{"name", "modern"}}}}});
+    b["functions"] = json::array({json{{"name", "legacy"}}});
+    const ChatRequest r = parseChatRequest(b);
+    EXPECT_EQ(r.tools.size(), std::size_t{1});
+    EXPECT_TRUE(r.tools.at(0).name == "modern");    // functions ignored
+}
+
+TEST(responseFormat_types_parsed) {
+    {
+        json b = baseBody();
+        b["response_format"] = json{{"type", "text"}};
+        EXPECT_TRUE(parseChatRequest(b).responseFormat ==
+                    ::mimirmind::server::ResponseFormat::Text);
+    }
+    {
+        json b = baseBody();
+        b["response_format"] = json{{"type", "json_object"}};
+        EXPECT_TRUE(parseChatRequest(b).responseFormat ==
+                    ::mimirmind::server::ResponseFormat::JsonObject);
+    }
+    {
+        json b = baseBody();
+        b["response_format"] = json{
+            {"type", "json_schema"},
+            {"json_schema", {{"name", "x"}, {"schema", json::object()}}}};
+        EXPECT_TRUE(parseChatRequest(b).responseFormat ==
+                    ::mimirmind::server::ResponseFormat::JsonSchema);
+    }
+}
+
+TEST(responseFormat_malformed_400paramResponseFormat) {
+    json b = baseBody();
+    b["response_format"] = 7;   // not an object
+    EXPECT_TRUE(throwsWithParam(b, "response_format"));
+
+    json b2 = baseBody();
+    b2["response_format"] = json{{"type", "yaml"}};   // unknown type
+    EXPECT_TRUE(throwsWithParam(b2, "response_format"));
 }
 
 int main() {

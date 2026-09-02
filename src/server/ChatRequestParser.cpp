@@ -158,7 +158,12 @@ ChatRequest parseChatRequest(const json& body) {
             throw ChatRequestError("messages[].role must be a string",
                                    "messages[].role");
         }
-        const auto roleStr = m["role"].get<std::string>();
+        std::string roleStr = m["role"].get<std::string>();
+        // OpenAI `developer` role == a higher-priority system message; map it
+        // to system (the engine has no separate developer channel).
+        if (roleStr == "developer") {
+            roleStr = "system";
+        }
         model::ChatRole role;
         if (!model::parseChatRole(roleStr, role)) {
             throw ChatRequestError(
@@ -175,12 +180,25 @@ ChatRequest parseChatRequest(const json& body) {
             const auto& c = m["content"];
             if (c.is_string()) {
                 msg.content = c.get<std::string>();
+            } else if (c.is_array()) {
+                // OpenAI multimodal content parts: concatenate the text parts;
+                // ignore image/audio/other parts (vision/audio inference is out
+                // of scope). A well-formed array is never a 400.
+                std::string text;
+                for (const auto& part : c) {
+                    if (part.is_object() &&
+                        part.value("type", std::string{}) == "text" &&
+                        part.contains("text") && part["text"].is_string()) {
+                        text += part["text"].get<std::string>();
+                    }
+                }
+                msg.content = std::move(text);
             } else if (!c.is_null()) {
-                // OpenAI also accepts content arrays (multimodal). Concatenating
-                // the text parts is 8.19 Increment 2; for now this is a clean,
-                // field-tagged 400 rather than an opaque type_error.
+                // A scalar that is neither string nor array (number/bool) is
+                // genuinely malformed.
                 throw ChatRequestError(
-                    "messages[].content: only plain strings are supported",
+                    "messages[].content must be a string or an array of "
+                    "content parts",
                     "messages[].content");
             }
         }
@@ -243,6 +261,40 @@ ChatRequest parseChatRequest(const json& body) {
         }
     }
     parseToolChoice(body, req);
+
+    // Deprecated OpenAI `functions` / `function_call` -> tools / tool_choice.
+    // Only used as a fallback: the modern `tools`/`tool_choice` win if present.
+    if (req.tools.empty() && body.contains("functions") &&
+        body["functions"].is_array()) {
+        for (const auto& fn : body["functions"]) {
+            if (!fn.is_object() || !fn.contains("name") ||
+                !fn["name"].is_string()) {
+                continue;
+            }
+            model::ToolSpec spec;
+            spec.name = fn["name"].get<std::string>();
+            // Wrap in the modern tool shape so it renders in <tools> like a
+            // native tool definition.
+            spec.toolJson =
+                json{{"type", "function"}, {"function", fn}}.dump();
+            req.tools.push_back(std::move(spec));
+        }
+    }
+    if (req.toolChoice.empty() && req.forcedToolName.empty() &&
+        present(body, "function_call")) {
+        const auto& fc = body["function_call"];
+        if (fc.is_string()) {
+            req.toolChoice = fc.get<std::string>();      // none|auto
+        } else if (fc.is_object() && fc.contains("name") &&
+                   fc["name"].is_string()) {
+            req.forcedToolName = fc["name"].get<std::string>();
+            req.toolChoice     = "required";
+        } else {
+            throw ChatRequestError(
+                "function_call must be \"none\"/\"auto\" or {name:...}",
+                "function_call");
+        }
+    }
 
     // Named tool force: narrow the offered toolset to exactly the forced
     // function so the model can only emit that call (paired with the
@@ -312,6 +364,32 @@ ChatRequest parseChatRequest(const json& body) {
         } else {
             throw ChatRequestError("stop must be a string or an array of strings",
                                    "stop");
+        }
+    }
+
+    // OpenAI response_format: {type:"text"|"json_object"|"json_schema"}. Shape
+    // is validated (a malformed value is a 400); the requested format is
+    // recorded on the request. Enforcement (grammar-constrained decoding) is
+    // not yet implemented, so json_object/json_schema are accepted best-effort
+    // and never faked in the response (8.19 Increment 2).
+    if (present(body, "response_format")) {
+        const auto& rf = body["response_format"];
+        if (!rf.is_object() || !rf.contains("type") || !rf["type"].is_string()) {
+            throw ChatRequestError(
+                "response_format must be an object with a string `type`",
+                "response_format");
+        }
+        const auto t = rf["type"].get<std::string>();
+        if (t == "text") {
+            req.responseFormat = ResponseFormat::Text;
+        } else if (t == "json_object") {
+            req.responseFormat = ResponseFormat::JsonObject;
+        } else if (t == "json_schema") {
+            req.responseFormat = ResponseFormat::JsonSchema;
+        } else {
+            throw ChatRequestError(
+                "response_format.type must be text, json_object or json_schema",
+                "response_format");
         }
     }
 

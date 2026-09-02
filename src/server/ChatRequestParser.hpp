@@ -16,6 +16,12 @@
 
 namespace mimirmind::server {
 
+/// OpenAI `response_format.type`. Parsed + carried so the handler/sampler can
+/// honor it where a constraint mechanism exists; today it is best-effort
+/// (no grammar-constrained decoding yet — see 8.19 Increment 2), so JsonObject/
+/// JsonSchema are accepted and recorded but not hard-enforced.
+enum class ResponseFormat { Text, JsonObject, JsonSchema };
+
 /// Thrown by parseChatRequest when a request field carries a malformed value
 /// (wrong JSON type / out of range). `param` names the offending field so the
 /// caller can populate the OpenAI error `param`; empty when not field-specific.
@@ -64,6 +70,12 @@ struct ChatRequest {
     // the existing required-opener/prefill mechanic forces that one call.
     // Empty => no named force.
     std::string                     forcedToolName;
+
+    // OpenAI `response_format`. Default Text (unconstrained). JsonObject /
+    // JsonSchema are parsed + validated and carried here, but enforcement
+    // (grammar-constrained decoding) is not yet implemented — best-effort:
+    // the field is recorded, never faked in the response. See 8.19 Increment 2.
+    ResponseFormat                  responseFormat{ResponseFormat::Text};
 
     // Debug / parity teacher-forcing: raw text appended to the prompt AFTER
     // the chat template's generation prompt (no special tokens, no BOS), so
