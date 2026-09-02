@@ -37,11 +37,14 @@ void sendJson(httplib::Response& res, int status, const json& body) {
 }
 
 void sendError(httplib::Response& res, int status,
-               std::string_view type, std::string_view message) {
+               std::string_view type, std::string_view message,
+               std::string_view param) {
     json body = {
         {"error", {
             {"message", std::string{message}},
             {"type",    std::string{type}},
+            {"param",   param.empty() ? json(nullptr)
+                                      : json(std::string{param})},
             {"code",    nullptr},
         }},
     };

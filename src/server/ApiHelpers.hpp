@@ -24,8 +24,11 @@ namespace mimirmind::server {
 /// `res.status = status; res.set_content(body.dump(), "application/json");`
 void sendJson(httplib::Response& res, int status, const nlohmann::json& body);
 
-/// Emit an OpenAI-shaped `{error: {message, type, code}}` envelope.
+/// Emit an OpenAI-shaped `{error: {message, type, param, code}}` envelope.
+/// `param` names the offending request field for a malformed-input 400 (the
+/// OpenAI `param`); pass empty to emit `param: null` (server/other errors).
 void sendError(httplib::Response& res, int status,
-                std::string_view type, std::string_view message);
+                std::string_view type, std::string_view message,
+                std::string_view param = {});
 
 } // namespace mimirmind::server

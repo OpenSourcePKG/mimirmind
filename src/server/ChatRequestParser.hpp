@@ -10,10 +10,27 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace mimirmind::server {
+
+/// Thrown by parseChatRequest when a request field carries a malformed value
+/// (wrong JSON type / out of range). `param` names the offending field so the
+/// caller can populate the OpenAI error `param`; empty when not field-specific.
+/// A missing OR non-applicable standard field is NOT an error (parse skips it),
+/// so this only ever fires on a value the client actually got wrong.
+class ChatRequestError : public std::runtime_error {
+public:
+    explicit ChatRequestError(const std::string& message, std::string param = {})
+        : std::runtime_error(message), _param(std::move(param)) {}
+
+    [[nodiscard]] const std::string& param() const noexcept { return _param; }
+
+private:
+    std::string _param;
+};
 
 /// Parsed OpenAI-style chat-completions request body.
 ///
@@ -40,6 +57,13 @@ struct ChatRequest {
     // a named function. Empty => "auto".
     std::vector<model::ToolSpec>    tools;
     std::string                     toolChoice;
+
+    // OpenAI named-tool force: tool_choice object
+    // `{type:"function",function:{name:"x"}}`. When set, the parser restricts
+    // `tools` to exactly this function and sets `toolChoice = "required"`, so
+    // the existing required-opener/prefill mechanic forces that one call.
+    // Empty => no named force.
+    std::string                     forcedToolName;
 
     // Debug / parity teacher-forcing: raw text appended to the prompt AFTER
     // the chat template's generation prompt (no special tokens, no BOS), so

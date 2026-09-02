@@ -1708,6 +1708,24 @@ target_include_directories(serving_tests PRIVATE tests)
 
 target_link_libraries(serving_tests PRIVATE mimirmind_core_common)
 
+# ---- chat_request_parser_test — OpenAI /v1/chat/completions request parsing -
+#
+# Pure-CPU (8.19 Increment 1): parseChatRequest robustness helpers + tool_choice
+# object form + malformed->param. Compiles the parser TU directly; the test
+# provides parseChatRole locally so it does not drag in the Tokenizer/
+# ChatTemplate encode machinery (every other model type it uses is header-only).
+#
+# Run via:   cmake --build build --target chat_request_parser_test && \
+#            build/chat_request_parser_test
+add_executable(chat_request_parser_test
+    tests/chat_request_parser_test.cpp
+    src/server/ChatRequestParser.cpp
+)
+
+target_include_directories(chat_request_parser_test PRIVATE tests)
+
+target_link_libraries(chat_request_parser_test PRIVATE mimirmind_core_common)
+
 # ---- munin_tests — Munin wire-op layer + ChunkAllocator layout math --------
 #
 # Covers RequestEnvelope, HealthzResponse, error-envelope helpers, and

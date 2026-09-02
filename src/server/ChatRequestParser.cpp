@@ -6,29 +6,136 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
-#include <stdexcept>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace mimirmind::server {
 
 using nlohmann::json;
 
+namespace {
+
+// --- robustness helpers ---------------------------------------------------
+//
+// "Be liberal in what you accept": a MISSING (or explicit-null) optional field
+// returns nullopt so the caller keeps its default — never an error. A field
+// the client DID send but with the wrong JSON type raises a ChatRequestError
+// naming the field, which the handler maps to a 400 with `param` set. This
+// replaces the bare typed nlohmann accessors (`body[k].get<T>()`) that would
+// otherwise throw an opaque type_error and structurally eliminates the whole
+// "unexpected JSON type -> 400/500" class.
+
+[[noreturn]] void badType(std::string_view key, std::string_view expected) {
+    throw ChatRequestError(std::string{key} + " must be " + std::string{expected},
+                           std::string{key});
+}
+
+[[nodiscard]] bool present(const json& body, const char* key) {
+    return body.contains(key) && !body[key].is_null();
+}
+
+[[nodiscard]] std::optional<std::string>
+optString(const json& body, const char* key) {
+    if (!present(body, key)) return std::nullopt;
+    if (!body[key].is_string()) badType(key, "a string");
+    return body[key].get<std::string>();
+}
+
+[[nodiscard]] std::optional<bool> optBool(const json& body, const char* key) {
+    if (!present(body, key)) return std::nullopt;
+    if (!body[key].is_boolean()) badType(key, "a boolean");
+    return body[key].get<bool>();
+}
+
+// Integer-valued fields (max_tokens, top_k, seed, ...). A JSON float is a wrong
+// type for an integer field -> 400 (OpenAI rejects it too).
+[[nodiscard]] std::optional<std::int64_t>
+optInt(const json& body, const char* key) {
+    if (!present(body, key)) return std::nullopt;
+    if (!body[key].is_number_integer()) badType(key, "an integer");
+    return body[key].get<std::int64_t>();
+}
+
+// Real-valued fields (temperature, top_p, penalties). Accepts int or float.
+[[nodiscard]] std::optional<double>
+optNumber(const json& body, const char* key) {
+    if (!present(body, key)) return std::nullopt;
+    if (!body[key].is_number()) badType(key, "a number");
+    return body[key].get<double>();
+}
+
+// A positive-integer size field: applied only when > 0 (0/negative keep the
+// server default, matching the previous behaviour), but a non-integer value is
+// still a hard 400.
+void readSize(const json& body, const char* key, std::size_t& dst) {
+    if (const auto v = optInt(body, key); v && *v > 0) {
+        dst = static_cast<std::size_t>(*v);
+    }
+}
+
+void readFloat(const json& body, const char* key, float& dst, bool& has) {
+    if (const auto v = optNumber(body, key)) {
+        dst = static_cast<float>(*v);
+        has = true;
+    }
+}
+
+// tool_choice accepts BOTH the string form (none|auto|required) and the OpenAI
+// named-force object `{type:"function",function:{name:"x"}}`. The object sets
+// forcedToolName + toolChoice="required" so the existing required-opener
+// mechanic forces exactly that call (the toolset is narrowed to it later).
+void parseToolChoice(const json& body, ChatRequest& req) {
+    if (!present(body, "tool_choice")) return;
+    const auto& tc = body["tool_choice"];
+
+    if (tc.is_string()) {
+        // none|auto|required. An unknown string is treated leniently as "auto"
+        // (only "none"/"required" carry behaviour downstream) — not a 400.
+        req.toolChoice = tc.get<std::string>();
+        return;
+    }
+    if (tc.is_object()) {
+        std::string name;
+        if (tc.contains("function") && tc["function"].is_object()) {
+            const auto& fn = tc["function"];
+            if (fn.contains("name") && fn["name"].is_string()) {
+                name = fn["name"].get<std::string>();
+            }
+        }
+        if (name.empty()) {
+            throw ChatRequestError(
+                "tool_choice object must be "
+                "{type:\"function\",function:{name:...}}",
+                "tool_choice");
+        }
+        req.forcedToolName = name;
+        req.toolChoice     = "required";
+        return;
+    }
+    throw ChatRequestError(
+        "tool_choice must be a string (none|auto|required) or a "
+        "{type:\"function\",function:{name}} object",
+        "tool_choice");
+}
+
+} // namespace
+
 ChatRequest parseChatRequest(const json& body) {
     ChatRequest req;
 
     if (!body.is_object()) {
-        throw std::runtime_error("request body must be a JSON object");
+        throw ChatRequestError("request body must be a JSON object");
     }
 
-    if (body.contains("model") && body["model"].is_string()) {
-        req.model = body["model"].get<std::string>();
+    if (const auto v = optString(body, "model")) {
+        req.model = *v;
     }
 
     // Debug teacher-forcing (non-OpenAI): raw prefill suffix appended after
     // the generation prompt. See ChatRequest::assistantPrefill.
-    if (body.contains("assistant_prefill") &&
-        body["assistant_prefill"].is_string()) {
-        req.assistantPrefill = body["assistant_prefill"].get<std::string>();
+    if (const auto v = optString(body, "assistant_prefill")) {
+        req.assistantPrefill = *v;
     }
     if (body.contains("assistant_prefill_ids") &&
         body["assistant_prefill_ids"].is_array()) {
@@ -40,17 +147,23 @@ ChatRequest parseChatRequest(const json& body) {
     }
 
     if (!body.contains("messages") || !body["messages"].is_array()) {
-        throw std::runtime_error("messages: missing or not an array");
+        throw ChatRequestError("messages: missing or not an array", "messages");
     }
     for (const auto& m : body["messages"]) {
         if (!m.is_object() || !m.contains("role")) {
-            throw std::runtime_error("messages[]: each entry needs a role");
+            throw ChatRequestError("messages[]: each entry needs a role",
+                                   "messages");
+        }
+        if (!m["role"].is_string()) {
+            throw ChatRequestError("messages[].role must be a string",
+                                   "messages[].role");
         }
         const auto roleStr = m["role"].get<std::string>();
         model::ChatRole role;
         if (!model::parseChatRole(roleStr, role)) {
-            throw std::runtime_error(
-                "messages[].role: unsupported value '" + roleStr + "'");
+            throw ChatRequestError(
+                "messages[].role: unsupported value '" + roleStr + "'",
+                "messages[].role");
         }
         model::ChatMessage msg;
         msg.role = role;
@@ -63,9 +176,12 @@ ChatRequest parseChatRequest(const json& body) {
             if (c.is_string()) {
                 msg.content = c.get<std::string>();
             } else if (!c.is_null()) {
-                // OpenAI also accepts content arrays (multimodal). Not supported.
-                throw std::runtime_error(
-                    "messages[].content: only plain strings are supported");
+                // OpenAI also accepts content arrays (multimodal). Concatenating
+                // the text parts is 8.19 Increment 2; for now this is a clean,
+                // field-tagged 400 rather than an opaque type_error.
+                throw ChatRequestError(
+                    "messages[].content: only plain strings are supported",
+                    "messages[].content");
             }
         }
 
@@ -126,43 +242,46 @@ ChatRequest parseChatRequest(const json& body) {
             req.tools.push_back(std::move(spec));
         }
     }
-    if (body.contains("tool_choice") && body["tool_choice"].is_string()) {
-        req.toolChoice = body["tool_choice"].get<std::string>();
-    }
+    parseToolChoice(body, req);
 
-    auto readSize = [&](const char* key, std::size_t& dst) {
-        if (body.contains(key) && body[key].is_number_integer()) {
-            const auto v = body[key].get<std::int64_t>();
-            if (v > 0) {
-                dst = static_cast<std::size_t>(v);
+    // Named tool force: narrow the offered toolset to exactly the forced
+    // function so the model can only emit that call (paired with the
+    // required-opener prefill via toolChoice=="required"). Forcing a function
+    // that was not offered in `tools` is a genuine malformed request.
+    if (!req.forcedToolName.empty()) {
+        std::vector<model::ToolSpec> only;
+        for (auto& s : req.tools) {
+            if (s.name == req.forcedToolName) {
+                only.push_back(std::move(s));
             }
         }
-    };
-    auto readFloat = [&](const char* key, float& dst, bool& has) {
-        if (body.contains(key) && body[key].is_number()) {
-            dst = body[key].get<float>();
-            has = true;
+        if (only.empty()) {
+            throw ChatRequestError(
+                "tool_choice forces function '" + req.forcedToolName +
+                "' which is not present in tools",
+                "tool_choice");
         }
-    };
+        req.tools = std::move(only);
+    }
 
     // OpenAI: max_completion_tokens (current) overrides max_tokens (legacy).
-    readSize("max_tokens", req.maxTokens);
-    readSize("max_completion_tokens", req.maxTokens);
-    readSize("top_k", req.topK);
+    readSize(body, "max_tokens", req.maxTokens);
+    readSize(body, "max_completion_tokens", req.maxTokens);
+    readSize(body, "top_k", req.topK);
 
     bool hasTopP = false;
-    readFloat("temperature", req.temperature, req.hasTemperature);
-    readFloat("top_p", req.topP, hasTopP);
+    readFloat(body, "temperature", req.temperature, req.hasTemperature);
+    readFloat(body, "top_p", req.topP, hasTopP);
     (void)hasTopP;
 
-    readFloat("frequency_penalty",  req.frequencyPenalty,  req.hasFrequencyPenalty);
-    readFloat("presence_penalty",   req.presencePenalty,   req.hasPresencePenalty);
-    readFloat("repetition_penalty", req.repetitionPenalty, req.hasRepetitionPenalty);
+    readFloat(body, "frequency_penalty",  req.frequencyPenalty,  req.hasFrequencyPenalty);
+    readFloat(body, "presence_penalty",   req.presencePenalty,   req.hasPresencePenalty);
+    readFloat(body, "repetition_penalty", req.repetitionPenalty, req.hasRepetitionPenalty);
 
     // Reasoning toggle (vLLM-compatible). Accept a top-level `enable_thinking`
     // and the nested `chat_template_kwargs: {enable_thinking: <bool>}`.
-    if (body.contains("enable_thinking") && body["enable_thinking"].is_boolean()) {
-        req.enableThinking = body["enable_thinking"].get<bool>();
+    if (const auto v = optBool(body, "enable_thinking")) {
+        req.enableThinking = *v;
     } else if (body.contains("chat_template_kwargs") &&
                body["chat_template_kwargs"].is_object()) {
         const auto& kwargs = body["chat_template_kwargs"];
@@ -172,15 +291,15 @@ ChatRequest parseChatRequest(const json& body) {
         }
     }
 
-    if (body.contains("seed") && body["seed"].is_number_integer()) {
-        req.seed = body["seed"].get<std::uint64_t>();
+    if (const auto v = optInt(body, "seed")) {
+        req.seed = static_cast<std::uint64_t>(*v);
     }
 
-    if (body.contains("stream") && body["stream"].is_boolean()) {
-        req.stream = body["stream"].get<bool>();
+    if (const auto v = optBool(body, "stream")) {
+        req.stream = *v;
     }
 
-    if (body.contains("stop")) {
+    if (body.contains("stop") && !body["stop"].is_null()) {
         const auto& s = body["stop"];
         if (s.is_string()) {
             req.stopStrings.push_back(s.get<std::string>());
@@ -190,6 +309,9 @@ ChatRequest parseChatRequest(const json& body) {
                     req.stopStrings.push_back(e.get<std::string>());
                 }
             }
+        } else {
+            throw ChatRequestError("stop must be a string or an array of strings",
+                                   "stop");
         }
     }
 

@@ -324,6 +324,10 @@ void ChatCompletionHandler::handle(const httplib::Request& req,
     ChatRequest cr;
     try {
         cr = parseChatRequest(body);
+    } catch (const ChatRequestError& e) {
+        // Malformed field value -> 400 with the offending field in `param`.
+        sendError(res, 400, "invalid_request_error", e.what(), e.param());
+        return;
     } catch (const std::exception& e) {
         sendError(res, 400, "invalid_request_error", e.what());
         return;
