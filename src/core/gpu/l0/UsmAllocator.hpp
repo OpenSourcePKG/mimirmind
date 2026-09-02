@@ -4,6 +4,7 @@
 #pragma once
 
 #include "core/gpu/l0/L0Context.hpp"
+#include "core/gpu/AllocCategory.hpp"
 #include "core/log/Log.hpp"
 
 #include <array>
@@ -13,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace mimirmind::core::l0 {
@@ -103,6 +105,10 @@ struct UsmStats {
     std::uint64_t bytesServed        {0};   // sum of bucket sizes handed out
     std::uint64_t oversizedAllocs    {0};   // > kMaxBucketBytes (no recycling)
     std::uint64_t failedAllocs       {0};
+    // 8.16 Stage B — live/peak bytes per AllocCategory (index = enum value),
+    // booked from the thread_local ScopedAllocCategory active at allocate().
+    std::array<std::uint64_t, gpu::kAllocCategoryCount> liveBytesByCategory{};
+    std::array<std::uint64_t, gpu::kAllocCategoryCount> peakBytesByCategory{};
 };
 
 /**
@@ -210,6 +216,9 @@ private:
     mutable std::mutex               _mutex;
     std::array<Bucket, kBucketCount> _buckets{};
     UsmStats                         _stats{};
+    // 8.16 Stage B — per-pointer category so deallocate() decrements the same
+    // bucket allocate() charged (matches the bktSize accounting of liveBytes).
+    std::unordered_map<void*, gpu::AllocCategory> _ptrCategory;
 };
 
 } // namespace mimirmind::core::l0

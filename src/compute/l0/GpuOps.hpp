@@ -510,6 +510,12 @@ public:
     [[nodiscard]] compute::ComputeBuffer allocate(std::size_t bytes) override;
     void uploadHostBytes(void* deviceDst, const void* hostSrc,
                          std::size_t bytes) override;
+
+    // 8.16 Stage B — project the UsmAllocator's per-category live/peak bytes.
+    [[nodiscard]] std::array<std::uint64_t, core::gpu::kAllocCategoryCount>
+        allocatorCategoryLiveBytes() const override;
+    [[nodiscard]] std::array<std::uint64_t, core::gpu::kAllocCategoryCount>
+        allocatorCategoryPeakBytes() const override;
     // uploadToDevice is the same synchronous H2D copy as uploadHostBytes
     // (USM is host-visible on L0, so both are a plain memcpy) — the two
     // virtuals arrived from different call sites and were never unified.

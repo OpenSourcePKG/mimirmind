@@ -471,6 +471,16 @@ compute::ComputeBuffer GpuOps::allocate(std::size_t bytes) {
         &_alloc};
 }
 
+std::array<std::uint64_t, core::gpu::kAllocCategoryCount>
+GpuOps::allocatorCategoryLiveBytes() const {
+    return _alloc.stats().liveBytesByCategory;
+}
+
+std::array<std::uint64_t, core::gpu::kAllocCategoryCount>
+GpuOps::allocatorCategoryPeakBytes() const {
+    return _alloc.stats().peakBytesByCategory;
+}
+
 // Schicht 5.2 — sync host-to-device copy. USM is host-visible on the
 // L0 target GPU, so a plain memcpy already lands in the same memory
 // the GPU reads from. No stream/queue involvement needed.

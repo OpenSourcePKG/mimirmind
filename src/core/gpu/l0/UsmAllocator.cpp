@@ -278,6 +278,17 @@ void* UsmAllocator::allocate(std::size_t bytes) {
                 bkt.peakBytes = bkt.liveBytes;
             }
         }
+
+        // 8.16 Stage B — book bktSize into the thread_local active category
+        // (matches the bktSize basis of liveBytes); ptr->category for free.
+        const auto cat = gpu::ScopedAllocCategory::current();
+        const std::size_t ci = static_cast<std::size_t>(cat) < gpu::kAllocCategoryCount
+                             ? static_cast<std::size_t>(cat) : 0;
+        _ptrCategory[ptr] = cat;
+        _stats.liveBytesByCategory[ci] += bktSize;
+        if (_stats.liveBytesByCategory[ci] > _stats.peakBytesByCategory[ci]) {
+            _stats.peakBytesByCategory[ci] = _stats.liveBytesByCategory[ci];
+        }
     }
 
     MM_LOG_DEBUG("usm",
@@ -315,6 +326,18 @@ void UsmAllocator::deallocate(void* ptr, std::size_t bytes) noexcept {
             --_stats.liveAllocations;
             _stats.liveBytes -= bktSize;
             ++_stats.totalDeallocations;
+        }
+
+        // 8.16 Stage B — uncharge the category allocate() charged for this ptr.
+        const auto catIt = _ptrCategory.find(ptr);
+        if (catIt != _ptrCategory.end()) {
+            const std::size_t ci = static_cast<std::size_t>(catIt->second)
+                                       < gpu::kAllocCategoryCount
+                                 ? static_cast<std::size_t>(catIt->second) : 0;
+            _stats.liveBytesByCategory[ci] =
+                (_stats.liveBytesByCategory[ci] >= bktSize)
+                    ? _stats.liveBytesByCategory[ci] - bktSize : 0;
+            _ptrCategory.erase(catIt);
         }
 
         if (!oversized && wasLive) {
