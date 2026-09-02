@@ -9,9 +9,12 @@
 #include "TestFramework.hpp"
 
 #include "runtime/serving/AttachedModelPool.hpp"
+#include "server/ModelMemoryJson.hpp"
+#include "server/ModelProvider.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -183,6 +186,130 @@ TEST(pool_factoryFailure_throwsAndRecovers) {
     auto h = pool.acquire("a");
     EXPECT_TRUE(pool.isResident("a"));
     EXPECT_EQ(st.created.load(), 1);
+}
+
+// --------------------------------------------------------------------------
+// buildModelsMemoryJson — the additive `models` block of /v1/system/memory.
+// Pure data->JSON shaping, so it needs no engine/GPU: we feed
+// ResidentModelMemory snapshots directly.
+// --------------------------------------------------------------------------
+
+using ::mimirmind::server::ResidentModelMemory;
+using ::mimirmind::server::buildModelsMemoryJson;
+
+TEST(modelsJson_eager_singleDefault_withKv) {
+    std::vector<ResidentModelMemory> resident = {
+        ResidentModelMemory{"primary", "Qwen3.6-35B-A3B NVFP4", /*isDefault=*/true,
+                            /*weightBytes=*/27693715968ULL, /*servingActive=*/true,
+                            /*kvResidentBytes=*/5905580032ULL, /*kvNumBlocks=*/32768ULL}};
+
+    const auto j = buildModelsMemoryJson(resident, /*poolMode=*/false, /*poolCapacity=*/1);
+
+    EXPECT_TRUE(j.at("available").get<bool>());
+    EXPECT_TRUE(j.at("mode").get<std::string>() == "eager");
+    EXPECT_EQ(j.at("capacity").get<std::size_t>(), std::size_t{1});
+    EXPECT_EQ(j.at("resident").size(), std::size_t{1});
+
+    const auto& e0 = j.at("resident").at(0);
+    EXPECT_TRUE(e0.at("id").get<std::string>() == "primary");
+    EXPECT_TRUE(e0.at("title").get<std::string>() == "Qwen3.6-35B-A3B NVFP4");
+    EXPECT_TRUE(e0.at("default").get<bool>());
+    EXPECT_EQ(e0.at("weight_bytes").get<std::size_t>(), std::size_t{27693715968ULL});
+    EXPECT_TRUE(e0.contains("kv"));
+    EXPECT_TRUE(e0.at("kv").at("serving_active").get<bool>());
+    EXPECT_EQ(e0.at("kv").at("resident_bytes").get<std::size_t>(), std::size_t{5905580032ULL});
+    EXPECT_EQ(e0.at("kv").at("num_blocks").get<std::size_t>(), std::size_t{32768ULL});
+}
+
+TEST(modelsJson_eager_multiModel_oneDefault_kvOmittedWhenIdle) {
+    std::vector<ResidentModelMemory> resident = {
+        ResidentModelMemory{"primary", "Primary", true,  1000, true,  200, 8},
+        ResidentModelMemory{"embed",   "BGE-M3",  false, 300,  false, 0,   0},
+        ResidentModelMemory{"rerank",  "Rerank",  false, 250,  false, 0,   0}};
+
+    const auto j = buildModelsMemoryJson(resident, /*poolMode=*/false, /*poolCapacity=*/1);
+
+    EXPECT_TRUE(j.at("available").get<bool>());
+    EXPECT_EQ(j.at("resident").size(), std::size_t{3});
+
+    int defaults = 0;
+    std::size_t weightSum = 0;
+    for (const auto& e : j.at("resident")) {
+        if (e.at("default").get<bool>()) {
+            ++defaults;
+        }
+        weightSum += e.at("weight_bytes").get<std::size_t>();
+    }
+    EXPECT_EQ(defaults, 1);                       // exactly one default
+    EXPECT_EQ(weightSum, std::size_t{1550});      // 1000 + 300 + 250
+
+    // Idle (non-serving) models omit the kv object entirely.
+    EXPECT_TRUE(j.at("resident").at(0).contains("kv"));    // primary serves
+    EXPECT_TRUE(!j.at("resident").at(1).contains("kv"));   // embed idle
+    EXPECT_TRUE(!j.at("resident").at(2).contains("kv"));   // rerank idle
+}
+
+TEST(modelsJson_pool_reportsModeAndCapacity) {
+    std::vector<ResidentModelMemory> resident = {
+        ResidentModelMemory{"qwen4exp", "Qwen3.8-Flash-Next", true, 77000, true, 6000, 4096}};
+
+    const auto j = buildModelsMemoryJson(resident, /*poolMode=*/true, /*poolCapacity=*/4);
+
+    EXPECT_TRUE(j.at("available").get<bool>());
+    EXPECT_TRUE(j.at("mode").get<std::string>() == "pool");
+    EXPECT_EQ(j.at("capacity").get<std::size_t>(), std::size_t{4});
+    EXPECT_EQ(j.at("resident").size(), std::size_t{1});
+}
+
+TEST(modelsJson_empty_reportsUnavailableWithReason) {
+    const std::vector<ResidentModelMemory> none;
+
+    const auto jPool = buildModelsMemoryJson(none, /*poolMode=*/true, /*poolCapacity=*/2);
+    EXPECT_TRUE(!jPool.at("available").get<bool>());
+    EXPECT_TRUE(jPool.contains("reason"));
+    EXPECT_TRUE(!jPool.contains("resident"));
+
+    const auto jEager = buildModelsMemoryJson(none, /*poolMode=*/false, /*poolCapacity=*/1);
+    EXPECT_TRUE(!jEager.at("available").get<bool>());
+    EXPECT_TRUE(jEager.contains("reason"));
+}
+
+// --------------------------------------------------------------------------
+// AttachedModelPool::snapshotResident — read-only slot enumeration that must
+// not disturb LRU order. Uses the FakeModel payload above (no engine/GPU).
+// --------------------------------------------------------------------------
+
+TEST(pool_snapshotResident_listsResident_withoutPerturbingLru) {
+    Stats st;
+    AttachedModelPool<FakeModel> pool{2, {"a", "b", "c"}, mkFactory(st, 0ms)};
+
+    // Materialize a then b (a is now the LRU-oldest, b the newest).
+    pool.acquire("a").reset();
+    pool.acquire("b").reset();
+    EXPECT_EQ(pool.residentCount(), std::size_t{2});
+
+    // Snapshot must see both resident ids and leave residentCount untouched.
+    std::vector<std::string> seen;
+    pool.snapshotResident([&](const std::string& id, const FakeModel&) {
+        seen.push_back(id);
+    });
+    EXPECT_EQ(seen.size(), std::size_t{2});
+    bool hasA = false, hasB = false;
+    for (const auto& id : seen) {
+        hasA = hasA || (id == "a");
+        hasB = hasB || (id == "b");
+    }
+    EXPECT_TRUE(hasA);
+    EXPECT_TRUE(hasB);
+    EXPECT_EQ(pool.residentCount(), std::size_t{2});
+
+    // The snapshot did NOT touch LRU: acquiring c (pool full, k=2) must still
+    // evict the untouched LRU-oldest 'a', not 'b'. If snapshotResident had
+    // bumped lastUsed, 'a' would look fresh and 'b' would be evicted instead.
+    pool.acquire("c").reset();
+    EXPECT_TRUE(!pool.isResident("a"));   // a was the LRU victim
+    EXPECT_TRUE(pool.isResident("b"));
+    EXPECT_TRUE(pool.isResident("c"));
 }
 
 int main() {

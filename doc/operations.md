@@ -452,6 +452,73 @@ The engine still serves chat completions; the per-request
   your `package_temp_hard_c`, the cooling is the bottleneck (not
   the silicon) — chassis / fan investigation needed.
 
+## Memory attribution (`/v1/system/memory`)
+
+`GET /v1/system/memory` (admin-gated) returns a categorized RAM/VRAM
+breakdown: the `device` envelope (ground-truth free/total from the
+backend), the resident-owner `categories` (weights + paged-KV),
+`allocator_categories` (the central-allocator per-category live/peak on
+CUDA/HIP), the `external` residual (device use that bypasses the central
+allocator), `fragmentation` (L0 free-list), and the host `/proc` view.
+
+### Per-model breakdown (`models`)
+
+The additive top-level `models` object attributes memory to each
+**currently-resident model** — so on a multi-model host you can see which
+loaded model owns how much, instead of the co-resident extras disappearing
+into the `external` bucket.
+
+```json
+"models": {
+  "available": true,
+  "mode": "eager",
+  "capacity": 1,
+  "resident": [
+    {
+      "id": "primary",
+      "title": "Qwen3.6-35B-A3B NVFP4",
+      "default": true,
+      "weight_bytes": 27693715968,
+      "kv": {
+        "serving_active": true,
+        "resident_bytes": 5905580032,
+        "num_blocks": 32768
+      }
+    }
+  ]
+}
+```
+
+- `mode` is `"eager"` (co-resident: the default engine plus any extras all
+  stay materialized) or `"pool"` (M-Munin.3 per-request model switch, where
+  models are materialized/evicted on demand). `capacity` is the pool's K in
+  pool mode; `1` in eager mode.
+- `resident` holds one entry per materialized model. Eager mode lists the
+  default engine and every co-resident extra (embeddings, rerank, TTS, …).
+  Pool mode lists the slots currently materialized; a model that is known
+  but not resident does not appear until it is next acquired.
+- `default: true` marks the entry equal to the server's default model
+  (the one used when a request omits `model`).
+- `weight_bytes` is the model's resident weight footprint; the `kv` object
+  gives its paged-KV serving cache and is **omitted entirely** when the
+  engine has no active serving cache (e.g. a single-session or idle model).
+- When nothing is resident (a cold pool with no materialized slot) the
+  block is `{"available": false, "reason": "..."}`.
+
+The per-model `weight_bytes` (plus each `kv.resident_bytes`) sum, together
+with `external` and the device free bytes, back to the `device` envelope —
+so a large unexplained `external` on a multi-model host is now attributable
+model by model. Reading this endpoint is read-only: it snapshots each
+engine's telemetry counters and never takes a generate lock, so it is safe
+to poll while requests are in flight.
+
+Example:
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" \
+  https://your-mimirmind/v1/system/memory | jq .models
+```
+
 ## Watching it from outside
 
 The status endpoint is cheap (one sysfs read per call, capped at

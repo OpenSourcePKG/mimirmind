@@ -99,6 +99,22 @@ public:
     /// All loaded models in order: default first, then extras.
     [[nodiscard]] std::vector<ModelEntry> listModels() const;
 
+    /// Per-resident-model memory snapshot for GET /v1/system/memory. Always
+    /// lists the eager anchor(s) — the always-resident default engine plus
+    /// every co-resident extra — so a multi-model host attributes weight/KV
+    /// bytes per model instead of lumping the extras into `external`. When a
+    /// provider is set (pool mode), the provider's currently-materialized slots
+    /// are appended, deduped against the default (mirrors listModels()).
+    /// Read-only: takes no generate lock.
+    [[nodiscard]] std::vector<ResidentModelMemory> residentModelsMemory() const;
+
+    /// True when a per-request model provider is installed (M-Munin.3 pool
+    /// mode). The default engine can still be eager alongside the pool.
+    [[nodiscard]] bool isPoolMode() const noexcept { return _provider != nullptr; }
+
+    /// Pool capacity (K) when a provider is set; 1 otherwise (eager / K=1).
+    [[nodiscard]] std::size_t poolCapacity() const;
+
     /// Resolve the request's `model` to a dispatch target. Empty or
     /// matching-default returns the default engine. Unknown model id
     /// sends 400 to `res` and returns nullopt.

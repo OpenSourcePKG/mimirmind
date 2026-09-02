@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -52,6 +53,23 @@ struct ProvidedModel {
     std::string title{};
 };
 
+/// Read-only per-resident-model memory snapshot for the additive `models`
+/// block of GET /v1/system/memory. Captured from a model's
+/// `InferenceEngine::memoryTelemetry()` WITHOUT taking that engine's generate
+/// mutex (telemetry counters only), so it never blocks in-flight decoding; in
+/// pool mode it is a best-effort snapshot of the currently-materialized slots.
+/// Deliberately holds only plain fields (no engine handle) so the JSON shaper
+/// and its unit test need no runtime/GPU dependency.
+struct ResidentModelMemory {
+    std::string id{};
+    std::string title{};
+    bool        isDefault{false};
+    std::size_t weightBytes{0};
+    bool        servingActive{false};
+    std::size_t kvResidentBytes{0};
+    std::size_t kvNumBlocks{0};
+};
+
 /**
  * Seam for M-Munin.3 per-request model switching. When a RequestDispatcher is
  * given a provider, it resolves each request's `model` through acquire()
@@ -85,6 +103,20 @@ public:
      * std::runtime_error on a materialization failure.
      */
     [[nodiscard]] virtual std::optional<AcquiredModel> acquire(const std::string& modelId) = 0;
+
+    /// Snapshot of the models this provider currently has materialized, with
+    /// their per-model memory, for GET /v1/system/memory. Read-only: it MUST
+    /// NOT disturb LRU order or take a per-engine generate lock (a short pool-
+    /// lock snapshot is fine). Default: empty — a provider without memory
+    /// introspection simply reports nothing resident. The concrete pool
+    /// provider overrides this.
+    [[nodiscard]] virtual std::vector<ResidentModelMemory> residentModels() const {
+        return {};
+    }
+
+    /// Pool capacity (K): the maximum number of models materialized at once in
+    /// pool mode. Default 1 (the K=1 MVP / eager single-slot case).
+    [[nodiscard]] virtual std::size_t poolCapacity() const { return 1; }
 };
 
 } // namespace mimirmind::server

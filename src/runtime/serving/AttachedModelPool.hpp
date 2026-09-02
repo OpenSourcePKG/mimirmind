@@ -211,6 +211,21 @@ public:
         return _known.contains(modelId);
     }
 
+    /// Read-only snapshot of the resident slots, for status/telemetry. Invokes
+    /// `fn(const std::string& id, const Payload&)` once per currently-
+    /// materialized slot under the pool lock, WITHOUT touching LRU order or
+    /// refcounts (so it never perturbs eviction) and without taking any per-
+    /// engine generate lock. `fn` must be cheap (a telemetry read) — it runs
+    /// inside the short pool critical section. It never contends with the slow
+    /// factory materialization, which runs with the pool lock released.
+    template <class Fn>
+    void snapshotResident(Fn&& fn) const {
+        std::lock_guard<std::mutex> lk{_mx};
+        for (const auto& [id, slot] : _resident) {
+            fn(id, *slot.payload);
+        }
+    }
+
 private:
     struct Slot {
         std::unique_ptr<Payload> payload;

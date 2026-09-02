@@ -113,6 +113,42 @@ std::vector<RequestDispatcher::ModelEntry> RequestDispatcher::listModels() const
     return out;
 }
 
+std::vector<ResidentModelMemory> RequestDispatcher::residentModelsMemory() const {
+    std::vector<ResidentModelMemory> out;
+    // Eager anchor(s): the always-resident default engine + co-resident extras.
+    // memoryTelemetry() is a fast counter/mem-info read; it takes no generate
+    // lock, so this never blocks in-flight decoding.
+    const auto addEng = [&out](const std::string& id, const std::string& title,
+                               bool isDefault, runtime::InferenceEngine* eng) {
+        if (eng == nullptr) {
+            return;
+        }
+        const auto mt = eng->memoryTelemetry();
+        out.push_back(ResidentModelMemory{id, title, isDefault, mt.weightBytes,
+                                          mt.servingActive, mt.kvResidentBytes,
+                                          mt.kvNumBlocks});
+    };
+    addEng(_defaultId, _defaultTitle, /*isDefault=*/true, _defaultEngine);
+    for (const auto& h : _extraHandles) {
+        addEng(h.id, h.title, /*isDefault=*/false, h.engine);
+    }
+    // Pool mode: append the provider's currently-materialized slots, deduped
+    // against the eager default (mirrors listModels()).
+    if (_provider != nullptr) {
+        for (auto& r : _provider->residentModels()) {
+            if (r.id == _defaultId) {
+                continue;
+            }
+            out.push_back(std::move(r));
+        }
+    }
+    return out;
+}
+
+std::size_t RequestDispatcher::poolCapacity() const {
+    return _provider != nullptr ? _provider->poolCapacity() : std::size_t{1};
+}
+
 std::optional<RequestDispatcher::Target> RequestDispatcher::resolveTarget(
     const std::string& model, httplib::Response& res) {
     // M-Munin.3 (full): check the eager default + extras FIRST (unchanged

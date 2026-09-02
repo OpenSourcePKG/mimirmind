@@ -103,6 +103,25 @@ public:
                              payload->batcher.get(), payload->spec.get()};
     }
 
+    [[nodiscard]] std::vector<ResidentModelMemory> residentModels() const override {
+        std::vector<ResidentModelMemory> out;
+        // Read-only pool snapshot: does not disturb LRU or take a generate
+        // lock. memoryTelemetry() is a fast counter read, safe under the pool
+        // lock.
+        _pool.snapshotResident([&](const std::string& id, const PooledEngine& pe) {
+            if (pe.engine == nullptr) {
+                return;
+            }
+            const auto mt = pe.engine->memoryTelemetry();
+            out.push_back(ResidentModelMemory{
+                id, pe.title, id == _defaultId,
+                mt.weightBytes, mt.servingActive, mt.kvResidentBytes, mt.kvNumBlocks});
+        });
+        return out;
+    }
+
+    [[nodiscard]] std::size_t poolCapacity() const override { return _pool.capacity(); }
+
 private:
     [[nodiscard]] static std::vector<std::string>
     idsOf(const std::vector<ProvidedModel>& models) {

@@ -3,6 +3,7 @@
 
 #include "server/SystemStatusBuilder.hpp"
 
+#include "server/ModelMemoryJson.hpp"
 #include "server/RequestDispatcher.hpp"
 #include "server/RequestTracker.hpp"
 
@@ -543,11 +544,24 @@ json SystemStatusBuilder::buildStatus() {
 }
 
 json SystemStatusBuilder::buildMemory() const {
-    // Pool (per-request model-switch) mode: no resident engine to inspect.
+    // Per-resident-model attribution (additive `models` block). Works in both
+    // modes: it enumerates the dispatcher's resident engines (eager default +
+    // extras) and, in pool mode, the provider's materialized slots. Kept
+    // separate from the device/category envelope below so a multi-model host
+    // can attribute weight/KV bytes per model instead of lumping the extras
+    // into `external`.
+    const json models = buildModelsMemoryJson(_dispatcher.residentModelsMemory(),
+                                               _dispatcher.isPoolMode(),
+                                               _dispatcher.poolCapacity());
+
+    // Pool (per-request model-switch) mode with no eager anchor engine: there
+    // is no global device/category envelope to inspect, but the `models` block
+    // (materialized pool slots) still applies.
     if (_engine == nullptr) {
         return json{
             {"mode",      "pooled_model_switch"},
             {"available", false},
+            {"models",    models},
         };
     }
 
@@ -695,6 +709,7 @@ json SystemStatusBuilder::buildMemory() const {
         {"external",             external},
         {"fragmentation",        fragmentation},
         {"host",                 host},
+        {"models",               models},
     };
 }
 
