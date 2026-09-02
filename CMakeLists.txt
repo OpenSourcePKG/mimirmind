@@ -1381,6 +1381,7 @@ add_executable(mimirmind
     src/runtime/arch/Qwen3_5Backend.cpp
     src/runtime/arch/Qwen3_5DenseBackend.cpp
     src/runtime/arch/Qwen3_5MoeBackend.cpp
+    src/runtime/arch/Qwen4ExpBackend.cpp
     src/server/ApiHelpers.cpp
     src/server/ApiServer.cpp
     src/server/ChatCompletionHandler.cpp

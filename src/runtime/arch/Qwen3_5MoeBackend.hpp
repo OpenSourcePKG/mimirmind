@@ -21,8 +21,12 @@ namespace mimirmind::runtime::arch {
  *
  * The dense variant of the same arch is Qwen3_5DenseBackend (SwiGLU FFN, no
  * experts) — it shares this base but not these routed-expert / serving paths.
+ *
+ * NOTE (roadmap 5.27): no longer `final` — Qwen4ExpBackend (Qwen3.8-Flash-Next,
+ * `qwen4_exp`) derives from this to reuse the whole routed-expert + serving +
+ * MTP stack, adding only Hyper-Connections + PLE n-gram embeddings on top.
  */
-class Qwen3_5MoeBackend final : public Qwen3_5Backend {
+class Qwen3_5MoeBackend : public Qwen3_5Backend {
 public:
     Qwen3_5MoeBackend(const model::LlmConfig&       config,
                       const core::gguf::WeightsMap& weights,

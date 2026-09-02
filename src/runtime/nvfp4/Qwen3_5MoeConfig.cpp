@@ -51,7 +51,17 @@ model::LlmConfig parseQwen3_5MoeSafetensorsConfig(std::string_view configJson) {
     // accuracy, but this load-bearing identifier stays unchanged so deployed
     // configs and the arch-match sites keep working. Renaming the wire string
     // is a separate, Spark-verified step.
-    cfg.architecture     = "qwen35moe";
+    //
+    // 5.27 qwen4_exp (Qwen3.8-Flash-Next): the SAME hybrid backbone (GDN +
+    // full-attn + MoE + MTP, parsed identically below) plus Hyper-Connections
+    // and PLE n-gram embeddings. model_type is top-level; route it to the
+    // Qwen4ExpBackend via a distinct arch id so the two new components can hook
+    // in without touching the qwen35moe path.
+    const std::string modelType =
+        (top.contains("model_type") && top["model_type"].is_string())
+            ? top["model_type"].get<std::string>() : std::string{};
+    const bool isQwen4Exp = (modelType == "qwen4_exp");
+    cfg.architecture     = isQwen4Exp ? "qwen4_exp" : "qwen35moe";
     cfg.blockCount       = reqU("num_hidden_layers");
     cfg.contextLength    = optU("max_position_embeddings", 262144);
     cfg.embeddingLength  = reqU("hidden_size");
@@ -135,6 +145,29 @@ model::LlmConfig parseQwen3_5MoeSafetensorsConfig(std::string_view configJson) {
     cfg.ssmInnerSize    = optU("linear_num_value_heads", 0) * optU("linear_value_head_dim", 0);
 
     cfg.nextnPredictLayers = optU("mtp_num_hidden_layers", 0);
+
+    // 5.27 qwen4_exp — Hyper-Connections + PLE n-gram embeddings. Parsed into
+    // LlmConfig now (default-zero for every other arch); consumed by
+    // Qwen4ExpBackend in I-3 (Hyper-Connections) / I-4 (PLE). Values live in the
+    // text_config (`c`), same nesting as the backbone dims above.
+    if (isQwen4Exp) {
+        cfg.ngramSize         = optU("ngram_size", 0);
+        cfg.ngramVocabBase    = optU("ngram_vocab_size_base", 0);
+        cfg.headsPerNgram     = optU("heads_per_ngram", 0);
+        cfg.pleEmbedDim       = optU("ple_embed_dim", 0);
+        cfg.pleConvKernelSize = optU("ple_conv_kernel_size", 0);
+        cfg.splitNgramParts   = optU("split_ngram_parts", 0);
+        if (c.contains("ple_embedding_dtype") && c["ple_embedding_dtype"].is_string()) {
+            cfg.pleEmbeddingDtype = c["ple_embedding_dtype"].get<std::string>();
+        }
+        if (c.contains("ple_layer_ids") && c["ple_layer_ids"].is_array()) {
+            for (const auto& id : c["ple_layer_ids"]) {
+                if (id.is_number_integer()) {
+                    cfg.pleLayerIds.push_back(id.get<std::uint32_t>());
+                }
+            }
+        }
+    }
 
     // Per-layer recurrent mask: `layer_types` is authoritative; else
     // synthesise from full_attention_interval ((b+1)%interval != 0), matching

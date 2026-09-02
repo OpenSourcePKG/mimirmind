@@ -8,6 +8,7 @@
 #include "runtime/arch/Qwen2Backend.hpp"
 #include "runtime/arch/Qwen3_5DenseBackend.hpp"
 #include "runtime/arch/Qwen3_5MoeBackend.hpp"
+#include "runtime/arch/Qwen4ExpBackend.hpp"
 
 namespace mimirmind::runtime::arch {
 
@@ -50,6 +51,15 @@ createArchBackend(const std::string&             architecture,
                                                   ops, gmm, opProfiler,
                                                   moeGroupEnabled,
                                                   moeFusedDownEnabled);
+    }
+    // 5.27 qwen4_exp (Qwen3.8-Flash-Next): same hybrid MoE backbone +
+    // Hyper-Connections + PLE n-gram. Derives from Qwen3_5MoeBackend; the two
+    // new components are stubbed at I-1 (behaves as the MoE backbone).
+    if (architecture == "qwen4_exp") {
+        return std::make_unique<Qwen4ExpBackend>(config, weights, fusedQkv,
+                                                 ops, gmm, opProfiler,
+                                                 moeGroupEnabled,
+                                                 moeFusedDownEnabled);
     }
     return nullptr;
 }

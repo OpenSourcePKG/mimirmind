@@ -231,7 +231,8 @@ protected:
 [[nodiscard]] inline bool
 isSupportedArchitecture(std::string_view architecture) noexcept {
     return architecture == "qwen2" || architecture == "llama" ||
-           architecture == "gemma4" || architecture == "qwen35moe";
+           architecture == "gemma4" || architecture == "qwen35moe" ||
+           architecture == "qwen4_exp";
 }
 
 /// Build the backend matching `architecture` ("qwen2" / "gemma4"). Returns

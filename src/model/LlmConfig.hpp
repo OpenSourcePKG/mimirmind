@@ -121,6 +121,22 @@ struct LlmConfig {
     // stored here so the spec-decode path (M-Q3N.5+) can find them.
     std::uint32_t nextnPredictLayers {0};
 
+    // --- qwen4_exp (Qwen3.8-Flash-Next) extras (roadmap 5.27) ---------------
+    // Same hybrid backbone as qwen3_5_moe PLUS Hyper-Connections (learned multi-
+    // stream residual mixing) and PLE per-layer n-gram embeddings (a ~48 GiB FP8
+    // sparse lookup, ~16 rows/token, served off-VRAM via mmap in I-4). All
+    // default-zero/empty so every other arch is byte-unaffected. Parsed in
+    // Qwen3_5MoeConfig for model_type "qwen4_exp"; consumed by Qwen4ExpBackend
+    // in I-3 (Hyper-Connections) / I-4 (PLE).
+    std::uint32_t              ngramSize         {0};   // n-gram order (e.g. 3)
+    std::uint32_t              ngramVocabBase    {0};   // ngram_vocab_size_base
+    std::uint32_t              headsPerNgram     {0};
+    std::uint32_t              splitNgramParts   {0};
+    std::uint32_t              pleEmbedDim       {0};   // PLE embedding width
+    std::uint32_t              pleConvKernelSize {0};
+    std::vector<std::uint32_t> pleLayerIds       {};    // layers PLE feeds into
+    std::string               pleEmbeddingDtype {};    // e.g. "float8_e4m3fn"
+
     // Interleaved-MRoPE (IMRoPE) dimension sections. Empty on archs without
     // mRoPE. Length 4 when present (Qwen3-Next / Qwen2.5-VL). GGUF key
     // `<arch>.rope.dimension_sections`.
