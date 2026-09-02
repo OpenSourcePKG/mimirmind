@@ -72,6 +72,16 @@ struct SseEncoder {
         const std::string& model,
         std::string_view   finishReason);
 
+    /// Terminal `usage` chunk for `stream_options.include_usage`: an otherwise
+    /// empty chunk (`choices: []`) carrying the token usage, sent after the
+    /// finish chunk and before `data: [DONE]`. Matches the OpenAI shape.
+    [[nodiscard]] static nlohmann::json buildUsageChunk(
+        const std::string& id,
+        std::int64_t       created,
+        const std::string& model,
+        std::size_t        promptTokens,
+        std::size_t        completionTokens);
+
     /// Format `payload` as one SSE event and push it onto `sink`.
     /// Returns false if the sink refused the write — caller should
     /// treat that as "client disconnected".

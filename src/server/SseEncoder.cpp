@@ -26,7 +26,7 @@ json SseEncoder::buildRoleChunk(const std::string& id, std::int64_t created,
     out["choices"] = json::array({
         json{
             {"index",         0},
-            {"delta",         json{{"role", "assistant"}}},
+            {"delta",         json{{"role", "assistant"}, {"refusal", nullptr}}},
             {"finish_reason", nullptr},
         },
     });
@@ -98,6 +98,22 @@ json SseEncoder::buildFinishChunk(const std::string& id, std::int64_t created,
             {"finish_reason", std::string{finishReason}},
         },
     });
+    return out;
+}
+
+json SseEncoder::buildUsageChunk(const std::string& id, std::int64_t created,
+                                  const std::string& model,
+                                  std::size_t promptTokens,
+                                  std::size_t completionTokens) {
+    json out = streamChunkSkeleton(id, created, model);
+    // OpenAI's include_usage terminal chunk carries an EMPTY choices array
+    // (the finish chunk already delivered the final choice) plus usage.
+    out["choices"] = json::array();
+    out["usage"]   = json{
+        {"prompt_tokens",     promptTokens},
+        {"completion_tokens", completionTokens},
+        {"total_tokens",      promptTokens + completionTokens},
+    };
     return out;
 }
 

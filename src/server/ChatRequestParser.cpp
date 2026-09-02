@@ -343,12 +343,36 @@ ChatRequest parseChatRequest(const json& body) {
         }
     }
 
+    // OpenAI reasoning_effort (o-series). Approximate map onto the thinking
+    // toggle ONLY when the client didn't set enable_thinking explicitly: any
+    // effort other than "none" opts into reasoning, "none" forces a direct
+    // answer. A non-string value is malformed.
+    if (!req.enableThinking.has_value()) {
+        if (const auto eff = optString(body, "reasoning_effort")) {
+            req.enableThinking = (*eff != "none");
+        }
+    }
+
     if (const auto v = optInt(body, "seed")) {
         req.seed = static_cast<std::uint64_t>(*v);
     }
 
     if (const auto v = optBool(body, "stream")) {
         req.stream = *v;
+    }
+
+    // OpenAI stream_options: {include_usage: bool}. Parsed regardless of
+    // `stream` (a no-op when not streaming); honored by the streaming path as
+    // a terminal usage chunk before [DONE].
+    if (present(body, "stream_options")) {
+        const auto& so = body["stream_options"];
+        if (!so.is_object()) {
+            throw ChatRequestError("stream_options must be an object",
+                                   "stream_options");
+        }
+        if (const auto iu = optBool(so, "include_usage")) {
+            req.includeUsage = *iu;
+        }
     }
 
     if (body.contains("stop") && !body["stop"].is_null()) {

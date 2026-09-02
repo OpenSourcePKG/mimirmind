@@ -53,6 +53,9 @@ struct ChatRequest {
     std::uint64_t                   seed{0};
     std::vector<std::string>        stopStrings;
     bool                            stream{false};
+    // OpenAI `stream_options.include_usage`: when streaming, emit a terminal
+    // chunk carrying `usage` (with an empty `choices`) just before [DONE].
+    bool                            includeUsage{false};
     std::string                     model;
 
     // M-FunctionCalling. `tools` are the function definitions the client

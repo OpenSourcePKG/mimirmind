@@ -322,6 +322,52 @@ TEST(responseFormat_malformed_400paramResponseFormat) {
     EXPECT_TRUE(throwsWithParam(b2, "response_format"));
 }
 
+// --- Increment 3: stream_options.include_usage, reasoning_effort -----------
+
+TEST(streamOptions_includeUsage_parsed) {
+    json b = baseBody();
+    b["stream"]         = true;
+    b["stream_options"] = json{{"include_usage", true}};
+    const ChatRequest r = parseChatRequest(b);
+    EXPECT_TRUE(r.includeUsage);
+}
+
+TEST(streamOptions_absent_defaultsFalse) {
+    const ChatRequest r = parseChatRequest(baseBody());
+    EXPECT_TRUE(!r.includeUsage);
+}
+
+TEST(streamOptions_notObject_400param) {
+    json b = baseBody();
+    b["stream_options"] = "usage";
+    EXPECT_TRUE(throwsWithParam(b, "stream_options"));
+}
+
+TEST(reasoningEffort_high_enablesThinking) {
+    json b = baseBody();
+    b["reasoning_effort"] = "high";
+    const ChatRequest r = parseChatRequest(b);
+    EXPECT_TRUE(r.enableThinking.has_value());
+    EXPECT_TRUE(r.enableThinking.value());
+}
+
+TEST(reasoningEffort_none_disablesThinking) {
+    json b = baseBody();
+    b["reasoning_effort"] = "none";
+    const ChatRequest r = parseChatRequest(b);
+    EXPECT_TRUE(r.enableThinking.has_value());
+    EXPECT_TRUE(!r.enableThinking.value());
+}
+
+TEST(reasoningEffort_doesNotOverrideExplicitEnableThinking) {
+    json b = baseBody();
+    b["enable_thinking"]  = false;   // explicit wins
+    b["reasoning_effort"] = "high";
+    const ChatRequest r = parseChatRequest(b);
+    EXPECT_TRUE(r.enableThinking.has_value());
+    EXPECT_TRUE(!r.enableThinking.value());
+}
+
 int main() {
     return mm::test::run();
 }

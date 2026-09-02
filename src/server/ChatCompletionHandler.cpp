@@ -637,7 +637,9 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     // / extrapolation-warn actually fired.
     PromptTrimmer::attachTrimUsage(usage, trimReport);
 
-    json message = {{"role", "assistant"}};
+    // `refusal` is part of the OpenAI assistant message shape; null unless the
+    // model produced a safety refusal (mimirmind does not emit one today).
+    json message = {{"role", "assistant"}, {"refusal", nullptr}};
     // Surface the model's thinking separately (vLLM / llama.cpp shape). Present
     // on both the content answer and a tool-call turn — a reasoning model
     // thinks before it decides to call a tool, and clients show that.
@@ -783,6 +785,9 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
         int                           nextToolCallIndex{0};
         bool                          anyToolCallEmitted{false};
         bool                          done{false};
+        // OpenAI stream_options.include_usage: emit a terminal usage chunk
+        // (empty choices + usage) just before [DONE].
+        bool                          includeUsage{false};
         // M-Munin.3 (full): keeps a pool-mode target's worker-side slot
         // pinned for the WHOLE async stream, not just the synchronous part
         // of handleStream() that resolves it. Without this the slot could
@@ -836,6 +841,7 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
     state->created   = created;
     state->echoModel = echoModel;
     state->tenantId  = core::security::ScopedTenant::active();
+    state->includeUsage = cr.includeUsage;
     state->toolCallsEnabled = !cr.tools.empty() && cr.toolChoice != "none";
     state->toolCallDetector = model::ToolCallStreamDetector(
         style, state->toolCallsEnabled, forcedToolOpener);
@@ -1242,6 +1248,16 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                 sink,
                 SseEncoder::buildFinishChunk(state->respId, state->created,
                                  state->echoModel, finish));
+
+            // OpenAI stream_options.include_usage: a terminal usage chunk
+            // (empty choices + usage) after the finish chunk, before [DONE].
+            if (state->includeUsage) {
+                (void)SseEncoder::writeSseEvent(
+                    sink,
+                    SseEncoder::buildUsageChunk(state->respId, state->created,
+                                     state->echoModel, state->promptIds.size(),
+                                     emittedTokens));
+            }
             (void)SseEncoder::writeSseDone(sink);
 
             std::string streamSpecSuffix;
