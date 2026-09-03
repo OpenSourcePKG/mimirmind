@@ -200,6 +200,9 @@ public:
                                  const std::int32_t* seqT   = nullptr,
                                  const std::int32_t* inOff  = nullptr,
                                  const std::int32_t* tokOff = nullptr) override;
+    void gdnRowSplit2Async(const float* in, float* a, float* b,
+                           std::size_t rows, std::size_t wa,
+                           std::size_t wb) override;
     void gdnConvSaveBatchedAsync(const float* convInput, float* convState,
                                  std::size_t nSeq, std::size_t T,
                                  std::size_t channels, std::size_t kernelSize,

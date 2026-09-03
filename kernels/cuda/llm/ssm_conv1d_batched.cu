@@ -111,6 +111,33 @@ void gdn_conv_pack_batched(
     convInput[inBase + (size_t)r * channels + c] = v;
 }
 
+// 5.18.10.3 — batched row split: in[r, 0..wa) -> a[r], in[r, wa..wa+wb) -> b[r]
+// for all rows in ONE launch. Un-interleaves the output of a fused projection
+// GEMM ([row, wa+wb]) back into the two compact consumer buffers, so every
+// downstream kernel (conv pack, siluMul, recurrence) stays unchanged. Pure
+// copies. Launch: grid = dim3(ceil((wa+wb) / LOCAL), rows, 1), block = LOCAL.
+extern "C" __global__ __launch_bounds__(SSM_CONV1D_LOCAL)
+void gdn_row_split2(
+    const float* __restrict__ in,
+    float*       __restrict__ a,
+    float*       __restrict__ b,
+    const int                 wa,
+    const int                 wb)
+{
+    const int r   = blockIdx.y;
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int w   = wa + wb;
+    if (gid >= w) {
+        return;
+    }
+    const float v = in[(size_t)r * w + gid];
+    if (gid < wa) {
+        a[(size_t)r * wa + gid] = v;
+    } else {
+        b[(size_t)r * wb + (gid - wa)] = v;
+    }
+}
+
 // 5.18.10.2 — batched conv-tail SAVE (the third memcpy of the host loop):
 // slot seq's next rolling conv tail = the LAST (K-1) rows of its packed block,
 // i.e. rows [Tslot, Tslot + K - 1). Frozen slots (activeMask[seq]==0) keep

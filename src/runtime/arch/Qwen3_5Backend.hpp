@@ -295,6 +295,13 @@ protected:
     // in_proj_qkvz / in_proj_ba) instead of 2+2 matmuls. nSeq==1 decode only
     // (pointer-split output). MIMIRMIND_GDN_PROJ_FUSE=1; off by default.
     bool                                _gdnProjFuse{false};
+    // 5.18.10.3: batched (M>1) variant of the GDN projection fuse — 2 fused
+    // GEMMs (qkvz + ba) + one row-split kernel each instead of 4 narrow GEMMs
+    // per layer. NOT bit-identical to the 4-GEMM path (the fused BF16 tensor
+    // quantises to E4M3 with a single per-tensor scale on the FP8 matmul path,
+    // same granularity change as the nSeq==1 fuse) → coherence-gated.
+    // OPT-IN, DEFAULT-OFF: MIMIRMIND_GDN_PROJ_FUSE_BATCH=1.
+    bool                                _gdnProjFuseBatch{false};
     std::vector<compute::ComputeBuffer> _gdnQkvzW;    // [convDim+valueDim, d_model] BF16
     std::vector<compute::ComputeBuffer> _gdnBaW;      // [2*hV, d_model] BF16
     compute::ComputeBuffer              _gdnQkvzOut;  // scratch [(convDim+valueDim)]

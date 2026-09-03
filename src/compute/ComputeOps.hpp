@@ -394,6 +394,17 @@ public:
             "gdnConvPackBatchedAsync: not supported on this backend");
     }
 
+    /// 5.18.10.3: batched row split — un-interleave a fused projection GEMM's
+    /// [rows, wa+wb] output into two compact [rows, wa] / [rows, wb] buffers in
+    /// one launch (pure copies), so downstream consumers stay unchanged.
+    virtual void gdnRowSplit2Async(const float* in, float* a, float* b,
+                                   std::size_t rows, std::size_t wa,
+                                   std::size_t wb) {
+        (void)in; (void)a; (void)b; (void)rows; (void)wa; (void)wb;
+        throw std::runtime_error(
+            "gdnRowSplit2Async: not supported on this backend");
+    }
+
     /// 5.18.10.2: batched conv-tail save — each active slot's next rolling
     /// conv tail = the last (K-1) rows of its packed block; frozen slots
     /// (activeMask[seq]==0) keep their tail byte-identical (skipped).

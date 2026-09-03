@@ -292,6 +292,8 @@ struct GpuOps::Impl {
     // 5.18.10.2: batched conv-input pack / conv-tail save (same PTX module).
     core::cuda::CudaKernel _gdnConvPackKernel;
     core::cuda::CudaKernel _gdnConvSaveKernel;
+    // 5.18.10.3: batched row split (fused-projection output un-interleave).
+    core::cuda::CudaKernel _gdnRowSplit2Kernel;
     core::cuda::CudaModule _gatedDeltaNetArModule;
     core::cuda::CudaKernel _gatedDeltaNetArKernel;
     // P2.b — 2-way row-split smem-staged prefill recurrence (opt-in).
@@ -620,6 +622,7 @@ struct GpuOps::Impl {
           _ssmConv1dBatchedKernel  {_ssmConv1dBatchedModule.getFunction("ssm_conv1d_batched")},
           _gdnConvPackKernel       {_ssmConv1dBatchedModule.getFunction("gdn_conv_pack_batched")},
           _gdnConvSaveKernel       {_ssmConv1dBatchedModule.getFunction("gdn_conv_save_batched")},
+          _gdnRowSplit2Kernel      {_ssmConv1dBatchedModule.getFunction("gdn_row_split2")},
           _gatedDeltaNetArModule   {loadCudaModule(ctx, "gated_deltanet_ar")},
           _gatedDeltaNetArKernel   {
               _gatedDeltaNetArModule.getFunction("gated_deltanet_ar")},
@@ -1800,6 +1803,25 @@ void GpuOps::gdnConvPackBatchedAsync(const float* convState,
     k.launch(_ctx.stream(),
              groupsForN(total, kElementwiseLocalSize),
              static_cast<std::uint32_t>(nSeq), 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::gdnRowSplit2Async(const float* in, float* a, float* b,
+                               std::size_t rows, std::size_t wa,
+                               std::size_t wb) {
+    const std::size_t w = wa + wb;
+    if (rows == 0 || w == 0) {
+        return;
+    }
+    auto& k = _pimpl->_gdnRowSplit2Kernel;
+    k.setPtr  (0, in);
+    k.setPtr  (1, a);
+    k.setPtr  (2, b);
+    k.setValue(3, toInt32(wa, "gdnRowSplit2 wa"));
+    k.setValue(4, toInt32(wb, "gdnRowSplit2 wb"));
+    k.launch(_ctx.stream(),
+             groupsForN(w, kElementwiseLocalSize),
+             static_cast<std::uint32_t>(rows), 1,
              kElementwiseLocalSize, 1, 1);
 }
 

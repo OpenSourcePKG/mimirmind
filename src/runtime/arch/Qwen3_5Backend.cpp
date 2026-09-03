@@ -115,6 +115,10 @@ Qwen3_5Backend::Qwen3_5Backend(const model::LlmConfig&       config,
     if (const char* pf = std::getenv("MIMIRMIND_GDN_PROJ_FUSE")) {
         _gdnProjFuse = (pf[0] == '1' && pf[1] == '\0');
     }
+    // 5.18.10.3: batched (M>1) projection fuse — opt-in, coherence-gated.
+    if (const char* pfb = std::getenv("MIMIRMIND_GDN_PROJ_FUSE_BATCH")) {
+        _gdnProjFuseBatch = (pfb[0] == '1' && pfb[1] == '\0');
+    }
     // GDN-Inc 2 / 2b are bit-identical and cost no memory, so they default ON;
     // MIMIRMIND_GDN_GATE_FUSE=0 / MIMIRMIND_GDN_PREP_FUSE=0 roll back.
     if (const char* gf = std::getenv("MIMIRMIND_GDN_GATE_FUSE")) {

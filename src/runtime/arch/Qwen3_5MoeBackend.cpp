@@ -1813,6 +1813,44 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
         zBuf     = qkvzOut + convDim;     // [convDim, convDim+valueDim)
         betaBuf  = baOut;                 // [0, hV)
         alphaBuf = baOut + hV;            // [hV, 2*hV)
+    } else if (_gdnProjFuseBatch) {
+        // 5.18.10.3: batched (M>1) projection fuse — 2 wide GEMMs into
+        // interleaved scratch, then one row-split each back into the compact
+        // consumer buffers (conv pack / siluMul / recurrence stay unchanged).
+        // gdn.proj measured 15.4 ms/step at conc64 = 4.6x its FP8 weight-read
+        // floor; the cost was per-call quant + cuBLASLt overhead across 4
+        // narrow GEMMs x 36 layers. NOT bit-identical to the 4-GEMM path (one
+        // per-tensor E4M3 scale across the fused tensor) → coherence-gated.
+        auto buildFusedB = [&](compute::ComputeBuffer& dst,
+                               const core::gguf::GgufTensor& wa,
+                               const core::gguf::GgufTensor& wb) {
+            if (dst.bytes() == 0) {
+                dst = _ops.allocate(wa.nbytes + wb.nbytes);
+                char* const base =
+                    static_cast<char*>(static_cast<void*>(dst.as<float>()));
+                _ops.appendMemoryCopy(base,             wa.usmPtr, wa.nbytes);
+                _ops.appendMemoryCopy(base + wa.nbytes, wb.usmPtr, wb.nbytes);
+            }
+        };
+        auto growB = [&](compute::ComputeBuffer& b, std::size_t bytes) {
+            if (b.bytes() < bytes) { b = _ops.allocate(bytes); }
+        };
+        buildFusedB(_gdnQkvzW[blockIdx], qkvW,  gateW);
+        buildFusedB(_gdnBaW[blockIdx],   betaW, alphaW);
+        growB(_gdnQkvzOut, (convDim + valueDim) * nRow * sizeof(float));
+        growB(_gdnBaOut,   (std::size_t{2} * hV) * nRow * sizeof(float));
+        float* const qkvzOut = _gdnQkvzOut.as<float>();
+        float* const baOut   = _gdnBaOut.as<float>();
+        {
+            compute::UnorderedScope u{_ops};
+            _gmm.matmulAsync(qkvW.type, _gdnQkvzW[blockIdx].as<float>(),
+                             convDim + valueDim, d_model, normBuf, nRow,
+                             qkvzOut, mmScratch);
+            _gmm.matmulAsync(betaW.type, _gdnBaW[blockIdx].as<float>(),
+                             2 * hV, d_model, normBuf, nRow, baOut, mmScratch);
+        }
+        _ops.gdnRowSplit2Async(qkvzOut, qkvMixed, zBuf, nRow, convDim, valueDim);
+        _ops.gdnRowSplit2Async(baOut, betaBuf, alphaBuf, nRow, hV, hV);
     } else {
         compute::UnorderedScope u{_ops};
         _gmm.matmulAsync(qkvW.type,  qkvW.usmPtr,  convDim,  d_model, normBuf, nRow, qkvMixed, mmScratch);
