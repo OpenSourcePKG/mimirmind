@@ -377,6 +377,39 @@ public:
             "causalConv1dSiluBatchedAsync: not supported on this backend");
     }
 
+    /// 5.18.10.2: batched conv-input pack — builds every slot's
+    /// [conv-tail (K-1 rows) | Tslot token rows] block in ONE launch,
+    /// replacing the 2*nSeq tiny per-layer D2D copies (launch-bound at conc64).
+    /// Pure copies: bit-identical to the memcpy loop.
+    virtual void gdnConvPackBatchedAsync(
+            const float* convState, const float* qkvMixed, float* convInput,
+            std::size_t nSeq, std::size_t T, std::size_t channels,
+            std::size_t kernelSize,
+            const std::int32_t* seqT   = nullptr,   // nullptr => uniform T
+            const std::int32_t* inOff  = nullptr,   // nullptr => seq*(T+K-1)
+            const std::int32_t* tokOff = nullptr) { // nullptr => seq*T
+        (void)convState; (void)qkvMixed; (void)convInput; (void)nSeq; (void)T;
+        (void)channels; (void)kernelSize; (void)seqT; (void)inOff; (void)tokOff;
+        throw std::runtime_error(
+            "gdnConvPackBatchedAsync: not supported on this backend");
+    }
+
+    /// 5.18.10.2: batched conv-tail save — each active slot's next rolling
+    /// conv tail = the last (K-1) rows of its packed block; frozen slots
+    /// (activeMask[seq]==0) keep their tail byte-identical (skipped).
+    virtual void gdnConvSaveBatchedAsync(
+            const float* convInput, float* convState,
+            std::size_t nSeq, std::size_t T, std::size_t channels,
+            std::size_t kernelSize,
+            const unsigned char* activeMask = nullptr,  // nullptr => all active
+            const std::int32_t* seqT  = nullptr,
+            const std::int32_t* inOff = nullptr) {
+        (void)convInput; (void)convState; (void)nSeq; (void)T;
+        (void)channels; (void)kernelSize; (void)activeMask; (void)seqT; (void)inOff;
+        throw std::runtime_error(
+            "gdnConvSaveBatchedAsync: not supported on this backend");
+    }
+
     virtual void mropeInPlaceBatchedAsync(
             void* xBase, std::size_t nSeq, std::size_t xSeqStride,
             std::size_t seqLen, std::size_t numHeads, std::size_t headDim,

@@ -191,6 +191,21 @@ public:
                                       const std::int32_t* seqT   = nullptr,
                                       const std::int32_t* inOff  = nullptr,
                                       const std::int32_t* outOff = nullptr) override;
+    // 5.18.10.2: batched conv-input pack / conv-tail save (replace the
+    // launch-bound per-slot D2D memcpy loops; pure copies, bit-identical).
+    void gdnConvPackBatchedAsync(const float* convState, const float* qkvMixed,
+                                 float* convInput, std::size_t nSeq,
+                                 std::size_t T, std::size_t channels,
+                                 std::size_t kernelSize,
+                                 const std::int32_t* seqT   = nullptr,
+                                 const std::int32_t* inOff  = nullptr,
+                                 const std::int32_t* tokOff = nullptr) override;
+    void gdnConvSaveBatchedAsync(const float* convInput, float* convState,
+                                 std::size_t nSeq, std::size_t T,
+                                 std::size_t channels, std::size_t kernelSize,
+                                 const unsigned char* activeMask = nullptr,
+                                 const std::int32_t* seqT  = nullptr,
+                                 const std::int32_t* inOff = nullptr) override;
     void gatedDeltaNetRecurrentAsync(const float* q, const float* k,
                                      const float* v, const float* gLog,
                                      const float* beta, float* state,

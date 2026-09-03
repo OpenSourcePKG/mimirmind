@@ -60,3 +60,87 @@ void ssm_conv1d_batched(
     }
     out[outBase + (size_t)gid] = acc / (1.0f + expf(-acc));  // SiLU
 }
+
+// 5.18.10.2 — batched conv-input PACK. Replaces the host loop of 2*nSeq tiny
+// cudaMemcpyAsync per layer (state->convInput + tokens->convInput): the
+// 2026-09-03 decode-gap decomposition measured gdn.conv at 18.1 ms/step at
+// conc64 (~16x above its ~1 ms traffic floor) — ~7000 micro-copies per step
+// across 36 GDN layers made the section launch-bound. One launch builds every
+// slot's [conv-tail (K-1 rows) | Tslot token rows] block. Pure copies =
+// bit-identical to the memcpy loop. Frozen slots are packed exactly like the
+// loop did (the copies always ran; only the SAVE is masked).
+//   convState : [nSeq, (K-1)*channels]  per-slot rolling conv tail
+//   qkvMixed  : token rows [*, channels], slot seq's tokens at tokOff(seq)
+//   convInput : [rows, channels], slot seq's block at inOff(seq) rows
+// Decode (seqT==nullptr): Tslot=1, inOff=seq*K, tokOff=seq (pre-varlen layout).
+// Launch: grid = dim3(ceil(maxRows*channels / LOCAL), nSeq, 1), block = LOCAL,
+//         maxRows = (K-1) + T.
+extern "C" __global__ __launch_bounds__(SSM_CONV1D_LOCAL)
+void gdn_conv_pack_batched(
+    const float* __restrict__ convState,
+    const float* __restrict__ qkvMixed,
+    float*       __restrict__ convInput,
+    const int                 T,             // uniform tokens/slot (varlen: max)
+    const int                 channels,
+    const int                 K,
+    const int* __restrict__ seqT,            // nullptr => uniform T
+    const int* __restrict__ inOff,           // nullptr => seq * (T + K - 1)
+    const int* __restrict__ tokOff)          // nullptr => seq * T
+{
+    const int seq       = blockIdx.y;
+    const int stateRows = K - 1;
+    const int Tseq      = (seqT != nullptr) ? seqT[seq] : T;
+    const int rows      = stateRows + Tseq;
+    const int gid       = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= rows * channels) {
+        return;
+    }
+    const int r = gid / channels;
+    const int c = gid % channels;
+
+    const size_t inBase = (size_t)((inOff != nullptr) ? inOff[seq]
+                                   : seq * (T + K - 1)) * channels;
+    float v;
+    if (r < stateRows) {
+        v = convState[((size_t)seq * stateRows + r) * channels + c];
+    } else {
+        const size_t tokBase = (size_t)((tokOff != nullptr) ? tokOff[seq]
+                                        : seq * T) + (r - stateRows);
+        v = qkvMixed[tokBase * channels + c];
+    }
+    convInput[inBase + (size_t)r * channels + c] = v;
+}
+
+// 5.18.10.2 — batched conv-tail SAVE (the third memcpy of the host loop):
+// slot seq's next rolling conv tail = the LAST (K-1) rows of its packed block,
+// i.e. rows [Tslot, Tslot + K - 1). Frozen slots (activeMask[seq]==0) keep
+// their tail byte-identical (skip), exactly like the loop's `continue`.
+// Launch: grid = dim3(ceil((K-1)*channels / LOCAL), nSeq, 1), block = LOCAL.
+extern "C" __global__ __launch_bounds__(SSM_CONV1D_LOCAL)
+void gdn_conv_save_batched(
+    const float* __restrict__ convInput,
+    float*       __restrict__ convState,
+    const int                 T,             // uniform tokens/slot (varlen: max)
+    const int                 channels,
+    const int                 K,
+    const unsigned char* __restrict__ activeMask,   // nullptr => all active
+    const int* __restrict__ seqT,            // nullptr => uniform T
+    const int* __restrict__ inOff)           // nullptr => seq * (T + K - 1)
+{
+    const int seq = blockIdx.y;
+    if (activeMask != nullptr && activeMask[seq] == 0) {
+        return;                              // frozen: tail stays byte-identical
+    }
+    const int stateRows = K - 1;
+    const int Tseq      = (seqT != nullptr) ? seqT[seq] : T;
+    const int gid       = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= stateRows * channels) {
+        return;
+    }
+    const int r = gid / channels;
+    const int c = gid % channels;
+    const size_t inBase = (size_t)((inOff != nullptr) ? inOff[seq]
+                                   : seq * (T + K - 1)) * channels;
+    convState[((size_t)seq * stateRows + r) * channels + c] =
+        convInput[inBase + (size_t)(Tseq + r) * channels + c];
+}

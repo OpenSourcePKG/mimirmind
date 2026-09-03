@@ -308,6 +308,12 @@ protected:
     // conv into one launch (vLLM fused_post_conv_prep). Bit-identical, no memory
     // cost → DEFAULT ON; MIMIRMIND_GDN_PREP_FUSE=0 disables.
     bool                                _gdnPrepFuse{true};
+    // 5.18.10.2 (2026-09-03): replace the per-slot conv-state D2D memcpy loops
+    // (3*nSeq tiny cudaMemcpyAsync per layer, launch-bound at conc64 — the
+    // decode-gap decomposition measured gdn.conv at ~16x its traffic floor)
+    // with one batched pack + one batched save kernel. Pure copies =
+    // bit-identical → DEFAULT ON; MIMIRMIND_GDN_CONV_BATCHPACK=0 disables (A/B).
+    bool                                _gdnConvBatchPack{true};
     // M-Q3N.5: device-side MoE top-K (env MIMIRMIND_MOE_DEVICE_TOPK). When on
     // AND the fully-fused decode path applies, top-K runs on the device and
     // the host moeTopKRoute + host->USM copy are skipped (no per-layer host

@@ -289,6 +289,9 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _ssmConv1dKernel;
     core::cuda::CudaModule _ssmConv1dBatchedModule;
     core::cuda::CudaKernel _ssmConv1dBatchedKernel;
+    // 5.18.10.2: batched conv-input pack / conv-tail save (same PTX module).
+    core::cuda::CudaKernel _gdnConvPackKernel;
+    core::cuda::CudaKernel _gdnConvSaveKernel;
     core::cuda::CudaModule _gatedDeltaNetArModule;
     core::cuda::CudaKernel _gatedDeltaNetArKernel;
     // P2.b — 2-way row-split smem-staged prefill recurrence (opt-in).
@@ -615,6 +618,8 @@ struct GpuOps::Impl {
           _ssmConv1dKernel         {_ssmConv1dModule.getFunction("ssm_conv1d")},
           _ssmConv1dBatchedModule  {loadCudaModule(ctx, "ssm_conv1d_batched")},
           _ssmConv1dBatchedKernel  {_ssmConv1dBatchedModule.getFunction("ssm_conv1d_batched")},
+          _gdnConvPackKernel       {_ssmConv1dBatchedModule.getFunction("gdn_conv_pack_batched")},
+          _gdnConvSaveKernel       {_ssmConv1dBatchedModule.getFunction("gdn_conv_save_batched")},
           _gatedDeltaNetArModule   {loadCudaModule(ctx, "gated_deltanet_ar")},
           _gatedDeltaNetArKernel   {
               _gatedDeltaNetArModule.getFunction("gated_deltanet_ar")},
@@ -1762,6 +1767,62 @@ void GpuOps::causalConv1dSiluBatchedAsync(const float* convInput,
     k.setPtr  (6, seqT);
     k.setPtr  (7, inOff);
     k.setPtr  (8, outOff);
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize),
+             static_cast<std::uint32_t>(nSeq), 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::gdnConvPackBatchedAsync(const float* convState,
+                                     const float* qkvMixed, float* convInput,
+                                     std::size_t nSeq, std::size_t T,
+                                     std::size_t channels,
+                                     std::size_t kernelSize,
+                                     const std::int32_t* seqT,
+                                     const std::int32_t* inOff,
+                                     const std::int32_t* tokOff) {
+    // maxRows = (K-1) + T sizes the grid; varlen slots early-exit past their
+    // own rows. Replaces 2*nSeq cudaMemcpyAsync per layer (5.18.10.2).
+    const std::size_t total = (kernelSize - 1 + T) * channels;
+    if (nSeq == 0 || total == 0) {
+        return;
+    }
+    auto& k = _pimpl->_gdnConvPackKernel;
+    k.setPtr  (0, convState);
+    k.setPtr  (1, qkvMixed);
+    k.setPtr  (2, convInput);
+    k.setValue(3, toInt32(T,          "gdnConvPack T"));
+    k.setValue(4, toInt32(channels,   "gdnConvPack channels"));
+    k.setValue(5, toInt32(kernelSize, "gdnConvPack K"));
+    k.setPtr  (6, seqT);
+    k.setPtr  (7, inOff);
+    k.setPtr  (8, tokOff);
+    k.launch(_ctx.stream(),
+             groupsForN(total, kElementwiseLocalSize),
+             static_cast<std::uint32_t>(nSeq), 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::gdnConvSaveBatchedAsync(const float* convInput, float* convState,
+                                     std::size_t nSeq, std::size_t T,
+                                     std::size_t channels,
+                                     std::size_t kernelSize,
+                                     const unsigned char* activeMask,
+                                     const std::int32_t* seqT,
+                                     const std::int32_t* inOff) {
+    const std::size_t total = (kernelSize - 1) * channels;
+    if (nSeq == 0 || total == 0) {
+        return;
+    }
+    auto& k = _pimpl->_gdnConvSaveKernel;
+    k.setPtr  (0, convInput);
+    k.setPtr  (1, convState);
+    k.setValue(2, toInt32(T,          "gdnConvSave T"));
+    k.setValue(3, toInt32(channels,   "gdnConvSave channels"));
+    k.setValue(4, toInt32(kernelSize, "gdnConvSave K"));
+    k.setPtr  (5, activeMask);
+    k.setPtr  (6, seqT);
+    k.setPtr  (7, inOff);
     k.launch(_ctx.stream(),
              groupsForN(total, kElementwiseLocalSize),
              static_cast<std::uint32_t>(nSeq), 1,

@@ -123,6 +123,10 @@ Qwen3_5Backend::Qwen3_5Backend(const model::LlmConfig&       config,
     if (const char* pcf = std::getenv("MIMIRMIND_GDN_PREP_FUSE")) {
         _gdnPrepFuse = !(pcf[0] == '0' && pcf[1] == '\0');
     }
+    // 5.18.10.2: batched conv-state pack/save (bit-identical) — default ON.
+    if (const char* cbp = std::getenv("MIMIRMIND_GDN_CONV_BATCHPACK")) {
+        _gdnConvBatchPack = !(cbp[0] == '0' && cbp[1] == '\0');
+    }
     _gdnQkvzW.resize(_config.blockCount);
     _gdnBaW.resize(_config.blockCount);
     if (const char* w13 = std::getenv("MIMIRMIND_MOE_W13_FUSE")) {
