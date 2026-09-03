@@ -10,7 +10,15 @@ contains the needle token.
 Usage:
     tools/needle-in-haystack.py --url http://host:8080 \\
         [--count 20] [--context-chars 16000] [--seed 42] \\
-        [--model any] [--max-tokens 32] [--json OUT.json]
+        [--model any] [--max-tokens 32] [--json OUT.json] \\
+        [--concurrency 8] [--api-key sk-...]
+
+`--concurrency N` submits N prompts in flight at once. Besides speed,
+this is required to gate SERVING-path changes that only activate on
+batched decode steps (nSeq > 1): a sequential run decodes every token
+at nSeq == 1 and never exercises the M>1 code path under test.
+`--api-key` sends a Bearer token; https URLs skip certificate
+verification (the serving boxes use self-signed certs).
 
 The suite is the Commit-8 acceptance gate for KvDtype::Q8_0: kernel-
 level parity (gpu_tests attention_*_q8_0_parity, tol 5e-3) is
@@ -35,8 +43,10 @@ so a regression can be reproduced verbatim.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import random
+import ssl
 import statistics
 import string
 import sys
@@ -147,8 +157,26 @@ def build_prompt(rng: random.Random, target_chars: int) -> tuple[str, str, float
     return prompt, needle, position_pct
 
 
+def tls_context(url: str) -> Optional[ssl.SSLContext]:
+    """Unverified TLS for https targets — serving boxes use self-signed certs."""
+    if not url.startswith("https"):
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def auth_headers(api_key: Optional[str]) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 def query_server(url: str, prompt: str, model: str,
-                 max_tokens: int, timeout_s: float) -> tuple[str, float]:
+                 max_tokens: int, timeout_s: float,
+                 api_key: Optional[str] = None) -> tuple[str, float]:
     body = {
         "model": model,
         "messages": [
@@ -163,21 +191,25 @@ def query_server(url: str, prompt: str, model: str,
     req = urllib.request.Request(
         url.rstrip("/") + "/v1/chat/completions",
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=auth_headers(api_key),
         method="POST",
     )
     t0 = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+    with urllib.request.urlopen(req, timeout=timeout_s,
+                                context=tls_context(url)) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     latency_ms = (time.perf_counter() - t0) * 1000.0
     text = payload["choices"][0]["message"]["content"]
     return text, latency_ms
 
 
-def fetch_server_dtype(url: str) -> Optional[str]:
+def fetch_server_dtype(url: str, api_key: Optional[str] = None) -> Optional[str]:
     try:
-        with urllib.request.urlopen(
-                url.rstrip("/") + "/v1/system/info", timeout=5.0) as resp:
+        req = urllib.request.Request(
+            url.rstrip("/") + "/v1/system/info",
+            headers=auth_headers(api_key))
+        with urllib.request.urlopen(req, timeout=5.0,
+                                    context=tls_context(url)) as resp:
             info = json.loads(resp.read().decode("utf-8"))
         return info.get("kv_cache", {}).get("dtype")
     except (urllib.error.URLError, json.JSONDecodeError, KeyError):
@@ -198,42 +230,57 @@ def main() -> int:
                     help="minimum recall fraction to exit 0")
     ap.add_argument("--json",          type=str,   default=None,
                     help="optional path to write full result JSON")
+    ap.add_argument("--concurrency",   type=int,   default=1,
+                    help="prompts in flight at once; >1 exercises the "
+                         "batched (nSeq>1) serving decode path")
+    ap.add_argument("--api-key",       type=str,   default=None,
+                    help="Bearer token for authenticated servers")
     args = ap.parse_args()
 
-    dtype = fetch_server_dtype(args.url) or "unknown"
+    dtype = fetch_server_dtype(args.url, args.api_key) or "unknown"
     print(f"# needle-in-haystack | server={args.url} kv_dtype={dtype} "
           f"count={args.count} ctx≈{args.context_chars}ch "
-          f"seed={args.seed} gate={int(args.pass_gate * 100)}%")
+          f"seed={args.seed} conc={args.concurrency} "
+          f"gate={int(args.pass_gate * 100)}%")
 
+    # Build every prompt up front from the single seeded RNG so the
+    # suite is deterministic regardless of request completion order.
     rng = random.Random(args.seed)
-    results: list[NeedleResult] = []
+    prompts = [build_prompt(rng, args.context_chars)
+               for _ in range(args.count)]
 
-    for i in range(args.count):
-        prompt, needle, pos_pct = build_prompt(rng, args.context_chars)
+    def run_one(i: int) -> NeedleResult:
+        prompt, needle, pos_pct = prompts[i]
         try:
             response, latency = query_server(
                 args.url, prompt, args.model,
-                args.max_tokens, args.timeout)
+                args.max_tokens, args.timeout, args.api_key)
         except (urllib.error.URLError, TimeoutError, KeyError) as exc:
-            print(f"[{i+1:02d}/{args.count}] REQUEST FAILED needle={needle} "
-                  f"err={exc}")
-            results.append(NeedleResult(
+            return NeedleResult(
                 idx=i, needle=needle, position_pct=pos_pct,
                 prompt_chars=len(prompt), latency_ms=0.0,
-                response=str(exc), passed=False))
-            continue
-        passed = needle in response
-        tag = "PASS" if passed else "FAIL"
-        # Trim response for terminal readability but keep enough to see
-        # what the model actually said on a fail.
-        resp_shown = response.strip().replace("\n", " ")[:80]
-        print(f"[{i+1:02d}/{args.count}] {tag} needle={needle} "
-              f"pos={pos_pct:5.1f}% prompt={len(prompt):>6}ch "
-              f"latency={latency:6.0f}ms resp='{resp_shown}'")
-        results.append(NeedleResult(
+                response=str(exc), passed=False)
+        return NeedleResult(
             idx=i, needle=needle, position_pct=pos_pct,
             prompt_chars=len(prompt), latency_ms=latency,
-            response=response, passed=passed))
+            response=response, passed=needle in response)
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, args.concurrency)) as pool:
+        results = list(pool.map(run_one, range(args.count)))
+
+    for r in results:
+        if r.latency_ms == 0.0 and not r.passed:
+            print(f"[{r.idx+1:02d}/{args.count}] REQUEST FAILED "
+                  f"needle={r.needle} err={r.response}")
+            continue
+        tag = "PASS" if r.passed else "FAIL"
+        # Trim response for terminal readability but keep enough to see
+        # what the model actually said on a fail.
+        resp_shown = r.response.strip().replace("\n", " ")[:80]
+        print(f"[{r.idx+1:02d}/{args.count}] {tag} needle={r.needle} "
+              f"pos={r.position_pct:5.1f}% prompt={r.prompt_chars:>6}ch "
+              f"latency={r.latency_ms:6.0f}ms resp='{resp_shown}'")
 
     n_pass    = sum(1 for r in results if r.passed)
     recall    = n_pass / max(1, len(results))
