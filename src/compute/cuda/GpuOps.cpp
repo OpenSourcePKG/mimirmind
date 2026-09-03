@@ -388,9 +388,15 @@ struct GpuOps::Impl {
     // small-M + register path (MIMIRMIND_MOE_DECODE_REG=1); requires a tileM<=2
     // schedule (the caller drops tileM to 2 so tiles never exceed MAX_M).
     core::cuda::CudaKernel _moeGroupedGemmNvfp4M2RegKernel;
+    // 5.18.13: MAX_M=4 register-staged variant (m4reg, <4,4> after the 5.18.12
+    // register fix — 16 staged floats, ThOcc 83.3%). Selected with
+    // MIMIRMIND_MOE_DECODE_REG=4; the caller keeps the tileM=4 schedule, so each
+    // weight read amortizes over up to 4 rows (half the tiles of the m2reg mode).
+    core::cuda::CudaKernel _moeGroupedGemmNvfp4M4RegKernel;
     // MIMIRMIND_MOE_DECODE_REG, read LAZILY on first grouped-GEMM dispatch: the
     // HW-profile applies the flag via setenv AFTER this GpuOps is constructed but
-    // before generate(), so a ctor read would miss the profile value. -1=unread.
+    // before generate(), so a ctor read would miss the profile value. -1=unread;
+    // 0=off, 1=m2reg (tileM<=2 schedule), 4=m4reg (tileM<=4 schedule).
     int _moeDecodeReg{-1};
     // 5.21.6: wide-M FP16 tensor-core grouped GEMM for PREFILL (W4A16, wmma).
     // Opt-in via MIMIRMIND_MOE_PREFILL_TC=1; replaces the CUDA-core M16 kernel
@@ -694,6 +700,8 @@ struct GpuOps::Impl {
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m1reg")},
           _moeGroupedGemmNvfp4M2RegKernel{
               _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m2reg")},
+          _moeGroupedGemmNvfp4M4RegKernel{
+              _moeGroupedGemmNvfp4Module.getFunction("moe_grouped_gemm_nvfp4blk_m4reg")},
           _moeGroupedGemmNvfp4TcModule{
               loadCudaModule(ctx, "moe_grouped_gemm_nvfp4blk_tc")},
           _moeGroupedGemmNvfp4TcKernel{
@@ -2424,9 +2432,15 @@ void GpuOps::moeGroupedGemmNvfp4Async(const float* x, const unsigned char* w,
     // after this GpuOps was constructed.
     if (_pimpl->_moeDecodeReg < 0) {
         const char* dr = std::getenv("MIMIRMIND_MOE_DECODE_REG");
-        _pimpl->_moeDecodeReg = (dr != nullptr && dr[0] == '1' && dr[1] == '\0') ? 1 : 0;
+        _pimpl->_moeDecodeReg =
+            (dr != nullptr && dr[1] == '\0' && dr[0] == '4') ? 4
+          : (dr != nullptr && dr[1] == '\0' && dr[0] == '1') ? 1 : 0;
     }
-    auto& k = (decodeSmallM && _pimpl->_moeDecodeReg == 1)
+    // 5.18.13: mode 4 = m4reg on the tileM=4 schedule (register-fixed <4,4>,
+    // 5.18.12); mode 1 = m2reg on the tileM<=2 schedule; else shared m4.
+    auto& k = (decodeSmallM && _pimpl->_moeDecodeReg == 4)
+                  ? _pimpl->_moeGroupedGemmNvfp4M4RegKernel
+                  : (decodeSmallM && _pimpl->_moeDecodeReg == 1)
                   ? _pimpl->_moeGroupedGemmNvfp4M2RegKernel
                   : (decodeSmallM ? _pimpl->_moeGroupedGemmNvfp4M4Kernel
                                   : _pimpl->_moeGroupedGemmNvfp4Kernel);
