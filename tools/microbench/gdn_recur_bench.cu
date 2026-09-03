@@ -36,12 +36,18 @@ static void ck(cudaError_t e, const char* what) {
     }
 }
 
-// Bench the recurrence at (nSeq, H, S), T=1 decode. bytesState = 2 * nSeq*H*S*S*4
-// (one read + one write of the whole state); io = q/k/v/out + alpha/beta.
-static void benchShape(int nSeq, int H, int S, int iters) {
+// Bench the recurrence at (nSeq, H, S, T). bytesState = 2 * nSeq*H*S*S*4 (one
+// read + one write of the whole state, held in smem across all T steps); io =
+// T rows of q/k/v/out + alpha/beta. T=1 = decode; T>1 = the PREFILL chunk
+// shape (5.21.8 floor-check): the SAME kernel runs T sequential steps per
+// block, so state traffic amortises over T while FLOPs grow ~T — at prefill T
+// the kernel leaves the bandwidth roof and the question becomes whether it
+// reaches the COMPUTE roof or is serial-latency-bound (headroom for a
+// chunked-parallel rewrite).
+static void benchShape(int nSeq, int H, int S, int iters, int T = 1) {
     const std::size_t stateElems = (std::size_t)nSeq * H * S * S;
-    const std::size_t ioSH       = (std::size_t)nSeq * H * S;   // q/k/v/out each
-    const std::size_t gate       = (std::size_t)nSeq * H;       // alpha/beta each
+    const std::size_t ioSH       = (std::size_t)nSeq * T * H * S;   // q/k/v/out each
+    const std::size_t gate       = (std::size_t)nSeq * T * H;       // alpha/beta each
 
     std::vector<float> hState(stateElems, 0.01f), hIO(ioSH, 0.1f),
         hGate(gate, 0.2f), hHead(H, -0.5f);
@@ -67,7 +73,7 @@ static void benchShape(int nSeq, int H, int S, int iters) {
     dim3 block((unsigned)S, 1, 1);
     auto launch = [&]() {
         gated_deltanet_ar_batched_v3_gatefused<<<grid, block, smemBytes>>>(
-            dQ, dK, dV, dA, dB, dSsmA, dSsmDt, dState, dOut, 1, H, S,
+            dQ, dK, dV, dA, dB, dSsmA, dSsmDt, dState, dOut, T, H, S,
             nullptr, nullptr, nullptr);
     };
     for (int i = 0; i < 10; ++i) launch();
@@ -87,8 +93,27 @@ static void benchShape(int nSeq, int H, int S, int iters) {
     const double gbps     = bytes / (us*1e-6) / 1e9;
     const double pct      = gbps / kPeakGBs * 100.0;
     const double idealUs  = bytes / (kPeakGBs*1e9) * 1e6;
-    std::printf("| nSeq=%-3d H=%d S=%d | %8.2f us | %6.1f GB/s | %5.1f%% | state=%5.0f MiB R+W | roof %6.1fus |\n",
-                nSeq, H, S, us, gbps, pct, stateBytes/1048576.0, idealUs);
+    if (T == 1) {
+        std::printf("| nSeq=%-3d H=%d S=%d | %8.2f us | %6.1f GB/s | %5.1f%% | state=%5.0f MiB R+W | roof %6.1fus |\n",
+                    nSeq, H, S, us, gbps, pct, stateBytes/1048576.0, idealUs);
+    } else {
+        // Prefill row: report both roofs plus the launch's parallelism.
+        // FLOP model per (head, step): ~8*S^2 (delta-rule update + readout),
+        // matching the two S-loops in the kernel body.
+        cudaDeviceProp prop{}; cudaGetDeviceProperties(&prop, 0);
+        int clockKHz = 0;   // cudaDeviceProp::clockRate was removed in CUDA 13
+        cudaDeviceGetAttribute(&clockKHz, cudaDevAttrClockRate, 0);
+        const double flops   = (double)nSeq * H * T * 8.0 * S * S;
+        const double gflops  = flops / (us*1e-6) / 1e9;
+        // fp32 peak approx: SMs * 128 lanes * 2 (FMA) * clock.
+        const double peakGf  = (double)prop.multiProcessorCount * 128.0 * 2.0
+                             * ((double)clockKHz * 1e3) / 1e9;
+        const int    blocks  = H * nSeq;
+        std::printf("| nSeq=%-3d T=%-5d | %9.1f us | %6.1f GB/s (%4.1f%%BW) | %7.1f GF/s (%4.1f%%fp32) | %4d blk/%d SM | %6.2f us/tok |\n",
+                    nSeq, T, us, gbps, pct, gflops, 100.0*gflops/peakGf,
+                    blocks, prop.multiProcessorCount,
+                    us / ((double)nSeq * T));
+    }
 
     cudaEventDestroy(a); cudaEventDestroy(b);
     cudaFree(dState); cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dOut);
@@ -124,5 +149,20 @@ int main(int argc, char** argv) {
     benchShape(64, H, S, iters);
     std::printf("# %%peak reading+writing the SSM state once = recur BW efficiency. If ~high (>70%%),\n");
     std::printf("# gdn.recur is at the F32 state-bandwidth floor -> the lever is BF16 state (halves R+W).\n");
+
+    // PREFILL rows (5.21.8 floor-check): same kernel, T = chunk tokens. State
+    // traffic amortises over T, so the bandwidth roof is irrelevant here; the
+    // question is achieved FLOP/s vs the fp32 roof. Far from BOTH roofs =>
+    // the T-sequential chain (2 __syncthreads per token, H*nSeq blocks of S
+    // threads) is latency-bound => a chunked-parallel rewrite has headroom.
+    std::printf("\n# PREFILL shapes (T>1, uniform seqT): serving multi-slot chunked prefill.\n");
+    std::printf("| shape | us/call | traffic | compute | parallelism | per-token |\n");
+    std::printf("|---|---|---|---|---|---|\n");
+    const int pIters = (argc>2) ? std::atoi(argv[2]) : 20;
+    for (int T : {128, 256, 512, 1024, 2048}) benchShape(1, H, S, pIters, T);
+    for (int T : {128, 256, 512})             benchShape(4, H, S, pIters, T);
+    for (int T : {128, 256, 512})             benchShape(16, H, S, pIters, T);
+    std::printf("# If %%fp32 is low AND %%BW is low, gdn.recur prefill is serial/latency-bound\n");
+    std::printf("# -> chunked delta-rule (intra-chunk parallel, FLA-style) is the lever, NOT BF16 state.\n");
     return 0;
 }
