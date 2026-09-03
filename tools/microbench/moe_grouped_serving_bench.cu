@@ -214,14 +214,23 @@ int main(int argc, char** argv) {
     std::printf("## perf (%%peak reading all 256 experts once = weight-BW efficiency)\n");
     std::printf("| kernel shape                    | us/call  | GB/s   | %%peak | us/token   | ideal      |\n");
     std::printf("|---|---|---|---|---|---|\n");
+    // m4reg is the only register-staged kernel SAFE for the tileM=4 decode schedule
+    // (m2reg caps at 2 rows). Bench m4reg across M1/M2/M4 (the real mixed decode
+    // distribution) to predict the drop-in win vs the current shared m4.
     std::printf("# --- gate/up projection (N=512, K=2048) ---\n");
+    benchShape(K_M4,    E, 512, 2048, 1, iters);
+    benchShape(K_M4REG, E, 512, 2048, 1, iters);
     benchShape(K_M4,    E, 512, 2048, 2, iters);
-    benchShape(K_M2REG, E, 512, 2048, 2, iters);   // <-- Inc-3 candidate at conc64 M2
+    benchShape(K_M2REG, E, 512, 2048, 2, iters);   // tileM=2-only ceiling (48%)
+    benchShape(K_M4REG, E, 512, 2048, 2, iters);   // <-- Inc-4 drop-in candidate @M2
     benchShape(K_M4,    E, 512, 2048, 4, iters);
     benchShape(K_M4REG, E, 512, 2048, 4, iters);
     std::printf("# --- down projection (N=2048, K=512) ---\n");
+    benchShape(K_M4,    E, 2048, 512, 1, iters);
+    benchShape(K_M4REG, E, 2048, 512, 1, iters);
     benchShape(K_M4,    E, 2048, 512, 2, iters);
     benchShape(K_M2REG, E, 2048, 512, 2, iters);
+    benchShape(K_M4REG, E, 2048, 512, 2, iters);
     benchShape(K_M4,    E, 2048, 512, 4, iters);
     benchShape(K_M4REG, E, 2048, 512, 4, iters);
 

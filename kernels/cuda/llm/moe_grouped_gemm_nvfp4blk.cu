@@ -246,11 +246,17 @@ __device__ __forceinline__ void grouped_gemm_nvfp4blk_core_m1reg(
 // each warp still owns one output column n and reads its weight row once, but
 // every lane stages its M rows' activation elements (one per super in the tile)
 // into registers with coalesced global (L2-resident) loads, then the inner loop
-// reads x from registers — no smem, no __syncthreads, no MIO stall. Cost: MAX_M *
-// (GEMM_X_TILE/32) extra registers (M2=16, M4=32 floats); the M2 variant keeps
-// occupancy high for the common conc64 tile. Bit-identical to the shared m4/m16
-// core (same math, same accumulation order per k).
-template <int MAX_M>
+// reads x from registers — no smem, no __syncthreads, no MIO stall.
+//
+// SUPERS_PER_TILE bounds the register cost: MAX_M * SUPERS_PER_TILE staged
+// floats per lane. The 2026-09-03 on-site ncu campaign (roadmap 5.18.11)
+// measured the <4, 8> instantiation (32 staged floats) register-capped at
+// 66.7% theoretical occupancy (achieved 67-69%) while m2reg <2, 8> reached
+// 100% — so m4reg halves the K-tile instead (<4, 4>, 16 staged floats, same
+// register budget as m2reg). The k iteration order is unchanged (ascending
+// supers, just consumed in smaller chunks), so results stay bit-identical to
+// the shared m4/m16 core (same math, same accumulation order per k).
+template <int MAX_M, int SUPERS_PER_TILE>
 __device__ __forceinline__ void grouped_gemm_nvfp4blk_core_mreg(
     const float*         __restrict__ X,
     const unsigned char* __restrict__ W,
@@ -288,14 +294,15 @@ __device__ __forceinline__ void grouped_gemm_nvfp4blk_core_mreg(
 #pragma unroll
     for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
 
-    for (int tile = 0; tile < K; tile += GEMM_X_TILE) {
+    constexpr int kTileElems = SUPERS_PER_TILE * NVBLK_SUPER_ELEMENTS;
+    for (int tile = 0; tile < K; tile += kTileElems) {
         // Stage M rows' activation elements (one per super in the tile) into
         // registers; lanes 0..31 read 32 consecutive floats per super => coalesced.
-        float xr[MAX_M][M1REG_SUPERS_PER_TILE];
+        float xr[MAX_M][SUPERS_PER_TILE];
 #pragma unroll
         for (int m = 0; m < MAX_M; ++m) {
 #pragma unroll
-            for (int j = 0; j < M1REG_SUPERS_PER_TILE; ++j) {
+            for (int j = 0; j < SUPERS_PER_TILE; ++j) {
                 const int k = tile + j * NVBLK_SUPER_ELEMENTS + laneId;
                 xr[m][j] = (m < M && k < K)
                          ? Xt[static_cast<size_t>(m) * K + k] : 0.0f;
@@ -303,7 +310,7 @@ __device__ __forceinline__ void grouped_gemm_nvfp4blk_core_mreg(
         }
         const int superStart = tile / NVBLK_SUPER_ELEMENTS;
 #pragma unroll
-        for (int j = 0; j < M1REG_SUPERS_PER_TILE; ++j) {
+        for (int j = 0; j < SUPERS_PER_TILE; ++j) {
             const int sp = superStart + j;
             if (sp >= nSuper) {
                 break;
@@ -378,11 +385,13 @@ void moe_grouped_gemm_nvfp4blk_m2reg(
     const int* __restrict__ tileRow0, const int* __restrict__ tileRows,
     const int K, const int N)
 {
-    grouped_gemm_nvfp4blk_core_mreg<2>(X, W, Y, tileExpert, tileRow0, tileRows, K, N);
+    grouped_gemm_nvfp4blk_core_mreg<2, 8>(X, W, Y, tileExpert, tileRow0, tileRows, K, N);
 }
 
-// M4-REG — decode small-M (M<=4) grouped GEMM, register-staged activations
-// (32 extra float regs). Replaces the shared-xTile m4 at the serving shape if
+// M4-REG — decode small-M (M<=4) grouped GEMM, register-staged activations.
+// Uses a HALVED K-tile (4 supers => 16 staged floats, same register budget as
+// m2reg) — the <4, 8> shape was register-capped at 66.7% theoretical occupancy
+// (ncu, roadmap 5.18.11). Replaces the shared-xTile m4 at the serving shape if
 // the register-staging win beats the occupancy cost.
 extern "C" __global__ __launch_bounds__(MATMUL_NVBLK_GEMM_LOCAL)
 void moe_grouped_gemm_nvfp4blk_m4reg(
@@ -391,5 +400,5 @@ void moe_grouped_gemm_nvfp4blk_m4reg(
     const int* __restrict__ tileRow0, const int* __restrict__ tileRows,
     const int K, const int N)
 {
-    grouped_gemm_nvfp4blk_core_mreg<4>(X, W, Y, tileExpert, tileRow0, tileRows, K, N);
+    grouped_gemm_nvfp4blk_core_mreg<4, 4>(X, W, Y, tileExpert, tileRow0, tileRows, K, N);
 }
