@@ -502,6 +502,17 @@ public:
     void stepServing(std::span<const ServingSlotStep> steps,
                      std::span<std::int32_t>          outTokens);
 
+    /// 8.19.5: set `slot`'s sampling params for its first prefill token and
+    /// every subsequent decode step until the slot is re-admitted. seed==0
+    /// draws a fresh non-deterministic seed; temperature<=0 with neutral
+    /// penalties is greedy argmax (bit-identical to the pre-sampling
+    /// behaviour). `promptTail` seeds the M7f penalty window with the end of
+    /// the prompt. No-op when the CUDA serving state is absent (L0 slab path
+    /// stays greedy — 8.19.5.1).
+    void setServingSlotSampling(std::size_t slot,
+                                const compute::SamplingParams& sampling,
+                                std::span<const std::int32_t> promptTail = {});
+
     /// M-Cuda.Batch Perf (Increment A) — prefill one physical serving `slot`'s
     /// prompt chunk `tokens` at absolute positions `[startPos, startPos+T)` as
     /// a single T>1 forward (reuses the single-session block path over the

@@ -54,8 +54,11 @@ std::vector<std::int32_t> runViaBatcher(
         std::vector<std::int32_t>                 stopIds,
         std::string                               tenantId,
         const std::function<bool(std::int32_t)>&  onToken) {
+    // 8.19.5: hand the request's sampling params to the batcher so the slot
+    // decodes with them (temperature<=0 stays the greedy fast path).
     auto req = batcher.submit(std::move(promptIds), params.maxNewTokens,
-                              std::move(stopIds), std::move(tenantId));
+                              std::move(stopIds), std::move(tenantId),
+                              params.sampling);
     std::vector<std::int32_t> out;
     std::size_t  next = 0;
     std::int32_t t    = 0;

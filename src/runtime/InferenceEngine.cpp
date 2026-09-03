@@ -2578,6 +2578,17 @@ void InferenceEngine::stepServing(std::span<const ServingSlotStep> steps,
     _servingSession->stepServing(steps, outTokens);
 }
 
+void InferenceEngine::setServingSlotSampling(
+        std::size_t slot, const compute::SamplingParams& sampling,
+        std::span<const std::int32_t> promptTail) {
+    // 8.19.5: per-slot sampling for the serving decode path. Called by the
+    // batcher at admission; a missing session (or the L0 slab path) keeps the
+    // greedy default, matching pre-sampling behaviour.
+    if (_servingSession != nullptr) {
+        _servingSession->setSlotSampling(slot, sampling, promptTail);
+    }
+}
+
 std::int32_t InferenceEngine::prefillSlot(std::size_t slot,
                                           std::span<const std::int32_t> tokens,
                                           std::size_t startPos,

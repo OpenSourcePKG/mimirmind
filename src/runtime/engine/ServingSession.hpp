@@ -55,6 +55,17 @@ public:
     void stepServing(std::span<const InferenceEngine::ServingSlotStep> steps,
                      std::span<std::int32_t>                           outTokens);
 
+    /// 8.19.5: set slot's sampling params for all subsequent tokens (first
+    /// prefill token + every decode step) until the next call. seed==0 draws a
+    /// fresh non-deterministic seed. temperature<=0 with neutral penalties ==
+    /// greedy argmax (bit-identical to the pre-sampling behaviour). Call at
+    /// admission. `promptTail` seeds the penalty window with the end of the
+    /// prompt (M7f: an immediate first-token echo of the prompt's last phrase
+    /// is discouraged too); each sampled token is appended afterwards, so the
+    /// repetition/frequency/presence penalties see prompt tail + generated.
+    void setSlotSampling(std::size_t slot, const compute::SamplingParams& sp,
+                         std::span<const std::int32_t> promptTail = {});
+
     /// See InferenceEngine::prefillSlot.
     [[nodiscard]] std::int32_t
     prefillSlot(std::size_t slot, std::span<const std::int32_t> tokens,

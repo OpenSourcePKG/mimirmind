@@ -4,6 +4,7 @@
 #include "runtime/engine/ServingSession.hpp"
 
 #include "compute/Embedding.hpp"
+#include "compute/Sampling.hpp"
 #include "core/gpu/AllocCategory.hpp"
 #include "core/log/Log.hpp"
 #include "runtime/BlockBuffers.hpp"
@@ -103,6 +104,34 @@ struct ServingState {
     std::vector<std::uint8_t>  isSeqStart;     // [maxBatch]
     std::vector<std::int32_t>  inputTok;       // [maxBatch]
     std::vector<float>         hostLogits;     // [maxBatch * vocab_lm]
+
+    // 8.19.5: per-slot sampling. Requests carried temperature/top_p/top_k/seed
+    // all the way to the batcher and were then dropped — serving decoded
+    // greedy-argmax regardless (the Moers hallucination repro: temp=1.0 runs
+    // were byte-identical). Each slot gets its request's SamplingParams and a
+    // seeded compute::Sampler at admission; temperature<=0 keeps the sampler's
+    // plain-argmax fast path, so greedy requests and parity anchors stay
+    // bit-identical. MTP/verify paths remain greedy by design.
+    std::vector<compute::SamplingParams> slotSampling;   // [maxBatch]
+    std::vector<compute::Sampler>        slotSampler;    // [maxBatch]
+    // Per-slot recent-token history feeding the sampler's repetition/
+    // frequency/presence penalties (the M7f anti-loop floor was silently
+    // inert in serving without it). Seeded with the prompt tail at admission,
+    // then every sampled token is appended; bounded by kSlotRecentCap (the
+    // sampler only reads the `penaltyWindow` tail anyway).
+    std::vector<std::vector<std::int32_t>> slotRecent;   // [maxBatch]
+    static constexpr std::size_t kSlotRecentCap = 512;
+
+    /// Append a sampled token to `slot`'s penalty history, trimming in bulk
+    /// (halve when the cap is hit) so the erase cost amortises to O(1)/token.
+    void pushRecent(std::size_t slot, std::int32_t tok) {
+        auto& r = slotRecent[slot];
+        if (r.size() >= kSlotRecentCap) {
+            r.erase(r.begin(),
+                    r.begin() + static_cast<std::ptrdiff_t>(kSlotRecentCap / 2));
+        }
+        r.push_back(tok);
+    }
 
     // Opt-in on-device greedy argmax (MIMIRMIND_SERVING_GPU_ARGMAX): read back
     // only nSeq token ids/step (4 B each) instead of the full [maxBatch *
@@ -825,6 +854,10 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     st->isSeqStart.resize(maxBatch);
     st->inputTok.resize(maxBatch);
     st->hostLogits.resize(maxBatch * st->vocab_lm);
+    // 8.19.5: per-slot sampling state (defaults = greedy; set at admission).
+    st->slotSampling.assign(maxBatch, compute::SamplingParams{});
+    st->slotSampler = std::vector<compute::Sampler>(maxBatch);
+    st->slotRecent.assign(maxBatch, {});
     // Opt-in GPU greedy argmax scratch — allocate only when enabled so the
     // default path stays byte-for-byte unchanged. See stepServing.
     st->gpuArgmax = envFlagSet("MIMIRMIND_SERVING_GPU_ARGMAX");
@@ -942,6 +975,33 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
                 _state->vocab_lm);
 }
 
+void ServingSession::setSlotSampling(std::size_t slot,
+                                     const compute::SamplingParams& sp,
+                                     std::span<const std::int32_t> promptTail) {
+    if (_state == nullptr || slot >= _state->slotSampling.size()) {
+        // CUDA serving state not built (or L0 slab path, which stays greedy —
+        // per-slot sampling there is the 8.19.5.1 follow-up): silently keep
+        // the pre-sampling greedy behaviour.
+        return;
+    }
+    _state->slotSampling[slot] = sp;
+    // Overlay the model's final-logit softcap exactly like the single-session
+    // lmHeadSample path (softcap runs before penalties/temperature in the
+    // sampler; _finalLogitSoftcap already respects MIMIRMIND_DISABLE_SOFTCAP).
+    _state->slotSampling[slot].finalLogitSoftcap = _e._finalLogitSoftcap;
+    // seed==0 => Sampler::reseed(0) draws from std::random_device (documented
+    // contract), so unseeded requests genuinely vary run-to-run.
+    _state->slotSampler[slot].reseed(sp.seed);
+    // Seed the penalty window with the prompt tail (M7f). Only the sampler's
+    // `penaltyWindow` tail is ever read, so cap what we keep.
+    auto& r = _state->slotRecent[slot];
+    r.clear();
+    const std::size_t keep =
+        std::min(promptTail.size(), ServingState::kSlotRecentCap / 2);
+    r.assign(promptTail.end() - static_cast<std::ptrdiff_t>(keep),
+             promptTail.end());
+}
+
 void ServingSession::stepServing(
         std::span<const InferenceEngine::ServingSlotStep> steps,
         std::span<std::int32_t>                           outTokens) {
@@ -1053,13 +1113,26 @@ void ServingSession::stepServing(
                     normBuf, nSeq, logits, st.lmScr.as<float>());
     _e._ops->profileStepEnd();
 
-    if (st.gpuArgmax) {
+    // 8.19.5: the GPU-argmax fast path is a plain argmax — take it only when
+    // every slot in this step both is greedy AND has no active penalties
+    // (penalties reorder logits even under greedy, exactly like the
+    // single-session M7f path). steps[i].slot == i is enforced above.
+    bool allGreedy = true;
+    for (std::size_t i = 0; i < nSeq; ++i) {
+        const auto& p = st.slotSampling[i];
+        const bool penalties = p.penaltyWindow > 0
+            && (p.repetitionPenalty != 1.0F || p.frequencyPenalty != 0.0F
+                || p.presencePenalty != 0.0F)
+            && !st.slotRecent[i].empty();
+        if (p.temperature > 0.0F || penalties) { allGreedy = false; break; }
+    }
+
+    if (st.gpuArgmax && allGreedy) {
         // Opt-in (MIMIRMIND_SERVING_GPU_ARGMAX): greedy argmax on the GPU, read
         // back only nSeq token ids (4 B each) instead of nSeq * vocab_lm floats
         // plus a host-side argmax over the whole vocabulary. That full-logits
         // round-trip is a per-token bubble CUDA graphs do not remove and that
-        // vLLM avoids by sampling on the GPU. Serving decode here is greedy, so
-        // the distribution is not needed on the host. argmax_rows breaks ties to
+        // vLLM avoids by sampling on the GPU. argmax_rows breaks ties to
         // the lowest index -> bit-identical token to the host scan below.
         // Mirrors the generateBatch lmHeadSample() path.
         _e._ops->argmaxRowsAsync(logits, st.argmaxDev.as<std::int32_t>(),
@@ -1078,12 +1151,14 @@ void ServingSession::stepServing(
                             nSeq * st.vocab_lm * sizeof(float));
     for (std::size_t i = 0; i < nSeq; ++i) {
         const float* row = st.hostLogits.data() + i * st.vocab_lm;
-        std::size_t best = 0;
-        float bv = row[0];
-        for (std::size_t v = 1; v < st.vocab_lm; ++v) {
-            if (row[v] > bv) { bv = row[v]; best = v; }
-        }
-        outTokens[i] = static_cast<std::int32_t>(best);
+        // 8.19.5: per-slot sampling. temperature<=0 with neutral penalties
+        // takes the sampler's plain argmax fast path (bit-identical to the
+        // old host scan); the recent-token history feeds the M7f penalties.
+        outTokens[i] = st.slotSampler[i].sample(
+            std::span<const float>(row, st.vocab_lm),
+            std::span<const std::int32_t>(st.slotRecent[i]),
+            st.slotSampling[i]);
+        st.pushRecent(i, outTokens[i]);
     }
 }
 
@@ -1277,11 +1352,15 @@ void ServingSession::runVarlenPrefill(
                                 N * st.vocab_lm * sizeof(float));
         for (std::size_t s = 0; s < N; ++s) {
             const float* row = st.hostLogits.data() + s * st.vocab_lm;
-            std::size_t best = 0; float bv = row[0];
-            for (std::size_t v = 1; v < st.vocab_lm; ++v) {
-                if (row[v] > bv) { bv = row[v]; best = v; }
-            }
-            outFirstTok[s] = static_cast<std::int32_t>(best);
+            // 8.19.5: first token honours the slot's sampling params too
+            // (temperature<=0 with neutral penalties = argmax fast path,
+            // bit-identical). History starts as the prompt tail (M7f).
+            const std::size_t slot = firstSlot + s;
+            outFirstTok[s] = st.slotSampler[slot].sample(
+                std::span<const float>(row, st.vocab_lm),
+                std::span<const std::int32_t>(st.slotRecent[slot]),
+                st.slotSampling[slot]);
+            st.pushRecent(slot, outFirstTok[s]);
         }
     } else {
         _e._ops->flush();
@@ -1437,12 +1516,14 @@ std::int32_t ServingSession::prefillSlot(
         _e._ops->flush();
         _e._ops->readbackToHost(st.hostLogits.data(), logits,
                                 st.vocab_lm * sizeof(float));
-        std::size_t best = 0;
-        float bv = st.hostLogits[0];
-        for (std::size_t v = 1; v < st.vocab_lm; ++v) {
-            if (st.hostLogits[v] > bv) { bv = st.hostLogits[v]; best = v; }
-        }
-        firstTok = static_cast<std::int32_t>(best);
+        // 8.19.5: first token honours the slot's sampling params (argmax fast
+        // path when greedy with neutral penalties — bit-identical to the old
+        // scan). History starts as the prompt tail (M7f).
+        firstTok = st.slotSampler[slot].sample(
+            std::span<const float>(st.hostLogits.data(), st.vocab_lm),
+            std::span<const std::int32_t>(st.slotRecent[slot]),
+            st.slotSampling[slot]);
+        st.pushRecent(slot, firstTok);
     } else {
         // Intermediate chunk: no lm-head. Flush so this chunk's KV/state
         // writes are fully committed before the next (carry) chunk reads

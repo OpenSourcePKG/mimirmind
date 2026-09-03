@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "compute/Sampling.hpp"
+
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -130,10 +132,14 @@ public:
     /// feeds the optional per-tenant admission cap and is stored on the returned
     /// handle. A per-tenant-quota rejection sets `tenantQuotaExceeded` on the
     /// handle (mapped to 429) rather than `overloaded` (503).
+    /// `sampling` (8.19.5) carries the request's temperature/top_p/top_k/seed
+    /// into the slot at admission; the default is greedy argmax, matching the
+    /// pre-sampling behaviour.
     std::shared_ptr<ServingRequest> submit(std::vector<std::int32_t> prompt,
                                            std::size_t               maxNew,
                                            std::vector<std::int32_t> stopIds,
-                                           std::string               tenantId = {});
+                                           std::string               tenantId = {},
+                                           compute::SamplingParams   sampling = {});
 
     /// Request early termination (e.g. the streaming client disconnected).
     /// The worker retires the request at the next iteration and frees its
@@ -171,6 +177,7 @@ private:
         std::vector<std::int32_t>       prompt;
         std::size_t                     maxNew{0};
         std::vector<std::int32_t>       stopIds;
+        compute::SamplingParams         sampling{};  // 8.19.5, set at submit()
     };
 
     struct Slot {

@@ -122,7 +122,8 @@ bool ContinuousBatcher::isStop(std::int32_t tok, const Slot& s) const {
 
 std::shared_ptr<ServingRequest> ContinuousBatcher::submit(
         std::vector<std::int32_t> prompt, std::size_t maxNew,
-        std::vector<std::int32_t> stopIds, std::string tenantId) {
+        std::vector<std::int32_t> stopIds, std::string tenantId,
+        compute::SamplingParams sampling) {
     auto req = std::make_shared<ServingRequest>();
     req->tenantId = std::move(tenantId);
     if (prompt.empty()) {
@@ -185,10 +186,11 @@ std::shared_ptr<ServingRequest> ContinuousBatcher::submit(
             }
         }
         Pending p;
-        p.req     = req;
-        p.prompt  = std::move(prompt);
-        p.maxNew  = maxNew;
-        p.stopIds = std::move(stopIds);
+        p.req      = req;
+        p.prompt   = std::move(prompt);
+        p.maxNew   = maxNew;
+        p.stopIds  = std::move(stopIds);
+        p.sampling = sampling;
         _waiting.push_back(std::move(p));
     }
     _cv.notify_all();
@@ -680,6 +682,14 @@ void ContinuousBatcher::workerLoop() {
                 s.produced  = 0;
                 s.stopIds   = std::move(p.stopIds);
                 s.prefillPos = 0;   // 5.21-III mixed step: start prefilling in-band
+                // 8.19.5: push the request's sampling params into the slot
+                // before any forward touches it (first prefill token + every
+                // decode step honour them); the prompt seeds the M7f penalty
+                // window. Only the worker thread admits slots and drives
+                // stepServing, so no extra synchronisation.
+                _engine.setServingSlotSampling(
+                    i, p.sampling,
+                    std::span<const std::int32_t>(s.prompt));
                 // Chunked prefill: the whole prompt ingests as one or more
                 // T>1 forwards (prefillSlotAdmitted splits it into
                 // _prefillChunk-sized chunks, each carrying KV + recurrent
