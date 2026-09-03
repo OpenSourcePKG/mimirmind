@@ -125,9 +125,15 @@ bool ChatCompletionHandler::prepareChatRequest(
     // without touching the parsed request. Also lets us report the
     // original prompt-token count in the response.
     std::vector<model::ChatMessage> msgs = cr.messages;
+    // 8.19.6: the tool markup is per-model too — Qwen3.5/3.6/3.8 are trained
+    // on the Qwen3-Coder XML format, Qwen2.5/Qwen3 on Hermes JSON. Rendering
+    // the wrong dialect kills tool_choice:"auto" (the model never calls).
+    const model::ChatTemplate::ToolFormat toolFormat =
+        model::ChatTemplate::toolFormatFromArch(
+            targetEngine.config().architecture);
     promptIds = model::ChatTemplate::encode(
         style, tok, msgs, /*addGenerationPrompt=*/true, cr.tools,
-        cr.enableThinking);
+        cr.enableThinking, toolFormat);
 
     // Debug teacher-forcing: append the raw prefill suffix (no BOS, no
     // special tokens) so the engine prefills the whole sequence in one pass.
@@ -573,7 +579,7 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     // instead of being discarded. preserveThinking keeps the raw thinking
     // inline in content (debug / KV-cache-parity mode).
     std::string reasoning;
-    const std::string text     = _cfg.preserveThinking
+    std::string text           = _cfg.preserveThinking
         ? rawText
         : model::ChatTemplate::cleanResponse(
               model::ChatTemplate::detectFromArch(
@@ -600,7 +606,40 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         if (model::ToolCallParser::looksLikeGemmaToolCall(toolText)) {
             toolCalls = model::ToolCallParser::parseGemma(toolText);
         } else if (model::ToolCallParser::looksLikeQwenToolCall(toolText)) {
-            toolCalls = model::ToolCallParser::parseQwen(toolText);
+            // 8.19.6: both Qwen dialects share the outer <tool_call> marker;
+            // try the model's native one first, then the other — Qwen3.6 has
+            // been seen imitating the Hermes shape when driven by agent
+            // prompts, and vice-versa a Hermes model can drift XML-wards.
+            const bool xmlNative =
+                model::ChatTemplate::toolFormatFromArch(
+                    engine.config().architecture) ==
+                model::ChatTemplate::ToolFormat::QwenXml;
+            toolCalls = xmlNative
+                ? model::ToolCallParser::parseQwenXml(toolText, cr.tools)
+                : model::ToolCallParser::parseQwen(toolText);
+            if (toolCalls.empty()) {
+                toolCalls = xmlNative
+                    ? model::ToolCallParser::parseQwen(toolText)
+                    : model::ToolCallParser::parseQwenXml(toolText, cr.tools);
+            }
+            if (toolCalls.empty() &&
+                model::ToolCallParser::looksLikeQwenToolCall(text)) {
+                // Unparseable in every dialect: suppress the marker span from
+                // the visible answer instead of leaking raw markup to the
+                // client (agent transcripts choke on it). Content around the
+                // block is kept.
+                MM_LOG_WARN("server",
+                            "tool-call block failed to parse in any dialect — "
+                            "suppressing {} byte marker span from content",
+                            text.size());
+                std::size_t open;
+                while ((open = text.find("<tool_call>")) != std::string::npos) {
+                    const std::size_t close = text.find("</tool_call>", open);
+                    text.erase(open, close == std::string::npos
+                                         ? std::string::npos
+                                         : close + 12 - open);
+                }
+            }
         } else {
             // Bare-JSON fallback: a reasoning model (Qwen3.6) sometimes emits the
             // call as plain {"name":…,"arguments":…} with no <tool_call> wrapper,
@@ -784,6 +823,12 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
         // (parseQwen/parseGemma) a completed block goes through.
         bool                          toolCallsEnabled{false};
         model::ChatTemplate::Style    style{model::ChatTemplate::Style::QwenChatML};
+        // 8.19.6: which Qwen dialect a completed block is parsed as first
+        // (Hermes JSON vs Qwen3-Coder XML), plus the offered tool schemas the
+        // XML parser needs for parameter-type coercion.
+        model::ChatTemplate::ToolFormat toolFormat{
+            model::ChatTemplate::ToolFormat::HermesJson};
+        std::vector<model::ToolSpec>  toolSpecs;
         model::ToolCallStreamDetector toolCallDetector;
         int                           nextToolCallIndex{0};
         bool                          anyToolCallEmitted{false};
@@ -846,6 +891,9 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
     state->tenantId  = core::security::ScopedTenant::active();
     state->includeUsage = cr.includeUsage;
     state->toolCallsEnabled = !cr.tools.empty() && cr.toolChoice != "none";
+    state->toolFormat       = model::ChatTemplate::toolFormatFromArch(
+        engine.config().architecture);
+    state->toolSpecs        = cr.tools;
     state->toolCallDetector = model::ToolCallStreamDetector(
         style, state->toolCallsEnabled, forcedToolOpener);
     // M-Munin.3 (full): move (not copy) the pin into state so it outlives
@@ -875,18 +923,38 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
             // clients (and Bifröst's Anthropic-SSE translator) expect.
             // Returns false on a write failure (client gone), matching the
             // other Sse write helpers' contract. A block that fails to parse
-            // (malformed/truncated) falls back to surfacing its raw text as
-            // content rather than silently dropping it.
+            // in every dialect is suppressed (with a warning) instead of
+            // leaking raw marker text into an agent transcript.
             auto emitToolCallBlock = [&](const std::string& block) -> bool {
-                const std::vector<model::ToolCall> calls =
-                    (state->style == model::ChatTemplate::Style::Gemma4)
-                        ? model::ToolCallParser::parseGemma(block)
+                // Same native-dialect-first, other-dialect-fallback order as
+                // the blocking path (8.19.6).
+                const std::vector<model::ToolCall> calls = [&] {
+                    if (state->style == model::ChatTemplate::Style::Gemma4) {
+                        return model::ToolCallParser::parseGemma(block);
+                    }
+                    const bool xmlNative = state->toolFormat ==
+                        model::ChatTemplate::ToolFormat::QwenXml;
+                    auto parsed = xmlNative
+                        ? model::ToolCallParser::parseQwenXml(block,
+                                                              state->toolSpecs)
                         : model::ToolCallParser::parseQwen(block);
+                    if (parsed.empty()) {
+                        parsed = xmlNative
+                            ? model::ToolCallParser::parseQwen(block)
+                            : model::ToolCallParser::parseQwenXml(
+                                  block, state->toolSpecs);
+                    }
+                    return parsed;
+                }();
                 if (calls.empty()) {
-                    return SseEncoder::writeSseEvent(
-                        sink,
-                        SseEncoder::buildContentChunk(state->respId, state->created,
-                                          state->echoModel, block));
+                    // Unparseable in every dialect — suppress the raw marker
+                    // span rather than leaking it as content (mirrors the
+                    // blocking path, 8.19.6). Nothing to stream for it.
+                    MM_LOG_WARN("server",
+                                "stream {}: tool-call block failed to parse in "
+                                "any dialect — suppressed {} byte marker span",
+                                state->respId, block.size());
+                    return true;
                 }
                 for (const auto& call : calls) {
                     const std::string callId =

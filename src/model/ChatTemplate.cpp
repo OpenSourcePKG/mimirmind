@@ -93,11 +93,33 @@ void encodeText(const Tokenizer&         tok,
     out.insert(out.end(), ids.begin(), ids.end());
 }
 
+/// Render one tool call in the Qwen3-Coder XML shape the Qwen3.5/3.6/3.8
+/// chat templates use. `argumentsJson` is the OpenAI stringified arguments
+/// object; each key becomes a <parameter=…> block whose value is the raw
+/// string for string arguments and compact JSON for everything else —
+/// mirroring the template's `args_value|string if string else tojson`.
+std::string renderQwenXmlCall(const ToolCall& call) {
+    std::string out = "<tool_call>\n<function=" + call.name + ">\n";
+    const auto args = nlohmann::json::parse(call.argumentsJson,
+                                            /*cb=*/nullptr,
+                                            /*allow_exceptions=*/false);
+    if (!args.is_discarded() && args.is_object()) {
+        for (const auto& [key, value] : args.items()) {
+            out += "<parameter=" + key + ">\n";
+            out += value.is_string() ? value.get<std::string>() : value.dump();
+            out += "\n</parameter>\n";
+        }
+    }
+    out += "</function>\n</tool_call>";
+    return out;
+}
+
 std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
                                      std::span<const ChatMessage> messages,
                                      bool                         addGenerationPrompt,
                                      std::span<const ToolSpec>    tools,
-                                     std::optional<bool>          enableThinking) {
+                                     std::optional<bool>          enableThinking,
+                                     ChatTemplate::ToolFormat     toolFormat) {
     const std::int32_t imStart = requireToken(tok, kQwenImStart);
     const std::int32_t imEnd   = requireToken(tok, kQwenImEnd);
 
@@ -117,12 +139,22 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     // token, exactly as the generation-prompt branch below already does.
     const bool isThinkingFamily = tok.findToken("<think>") >= 0;
 
-    // M-FunctionCalling: Hermes-style tool-spec block Qwen2.5 is trained on.
-    // Rendered into the system turn when the request carries tools; the model
-    // then answers with <tool_call>{...}</tool_call>, which the handler parses
-    // back into structured tool_calls.
+    // M-FunctionCalling: the tool-spec block a model only honours in
+    // tool_choice:"auto" when it matches its own chat template verbatim.
+    // Two trained-on dialects (8.19.6):
+    //   HermesJson — Qwen2.5/Qwen3: block APPENDED to the system content,
+    //     calls as <tool_call>{json}</tool_call>.
+    //   QwenXml — Qwen3.5/3.6/3.8 (Qwen3-Coder format): block PREFIXES the
+    //     system turn (system content follows after a blank line), calls in
+    //     the <function=…>/<parameter=…> XML shape. Wording below is copied
+    //     byte-for-byte from the model's chat_template.jinja — do not
+    //     paraphrase it, auto-mode calling is sensitive to the exact prompt.
+    // Gated on tools actually being offered so a plain chat renders
+    // byte-identically to the pre-8.19.6 encoder regardless of format.
+    const bool xmlTools =
+        (toolFormat == ChatTemplate::ToolFormat::QwenXml) && !tools.empty();
     std::string toolsBlock;
-    if (!tools.empty()) {
+    if (!tools.empty() && !xmlTools) {
         toolsBlock =
             "\n\n# Tools\n\nYou may call one or more functions to assist with "
             "the user query.\n\nYou are provided with function signatures "
@@ -136,6 +168,29 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
             "function name and arguments within <tool_call></tool_call> XML "
             "tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": "
             "<args-json-object>}\n</tool_call>";
+    } else if (!tools.empty()) {
+        toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for (const auto& t : tools) {
+            toolsBlock += "\n";
+            toolsBlock += t.toolJson;
+        }
+        toolsBlock +=
+            "\n</tools>\n\nIf you choose to call a function ONLY reply in the "
+            "following format with NO suffix:\n\n<tool_call>\n"
+            "<function=example_function_name>\n"
+            "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+            "<parameter=example_parameter_2>\nThis is the value for the second "
+            "parameter\nthat can span\nmultiple lines\n</parameter>\n"
+            "</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+            "- Function calls MUST follow the specified format: an inner "
+            "<function=...></function> block must be nested within "
+            "<tool_call></tool_call> XML tags\n"
+            "- Required parameters MUST be specified\n"
+            "- You may provide optional reasoning for your function call in "
+            "natural language BEFORE the function call, but NOT after\n"
+            "- If there is no function call available, answer the question "
+            "like normal with your current knowledge and do not tell the user "
+            "about function calls\n</IMPORTANT>";
     }
 
     auto emitTurn = [&](std::string_view role, std::string_view content) {
@@ -151,7 +206,17 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     // System turn. Without an explicit system: Qwen2.5 gets its default, a
     // thinking model gets none — but if tools are present they still need a
     // home, so emit a (possibly bare) system turn carrying the tools block.
-    if (!hasExplicitSystem) {
+    // QwenXml placement is inverted: the tools block OPENS the system turn
+    // and an explicit system message follows after a blank line, exactly as
+    // the Qwen3.5/3.6 chat template renders it.
+    if (xmlTools && !toolsBlock.empty()) {
+        std::string sys = toolsBlock;
+        if (hasExplicitSystem && !messages.front().content.empty()) {
+            sys += "\n\n";
+            sys += messages.front().content;
+        }
+        emitTurn("system", sys);
+    } else if (!hasExplicitSystem) {
         std::string sys =
             isThinkingFamily ? std::string{} : std::string{kQwenDefaultSystem};
         sys += toolsBlock;
@@ -160,14 +225,69 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
         }
     }
 
-    // When the caller DID supply a system turn, the tools block is appended
-    // to it on its first occurrence.
-    bool explicitSystemToolsPending = hasExplicitSystem && !toolsBlock.empty();
+    // When the caller DID supply a system turn, the Hermes tools block is
+    // appended to it on its first occurrence (QwenXml consumed it above).
+    bool explicitSystemToolsPending =
+        hasExplicitSystem && !toolsBlock.empty() && !xmlTools;
 
-    for (const auto& m : messages) {
+    // Qwen3.5/3.6 templates render an EMPTY pre-closed think block onto every
+    // assistant turn AFTER the last real user query (their last_query_index
+    // logic) — the tool-round assistant turn is in-distribution only with it.
+    // messages.size() sentinel = "no user turn" → no prefix anywhere.
+    std::size_t lastUserIdx = messages.size();
+    if (xmlTools) {
+        for (std::size_t i = messages.size(); i-- > 0;) {
+            if (messages[i].role == ChatRole::User) {
+                lastUserIdx = i;
+                break;
+            }
+        }
+    }
+
+    for (std::size_t mi = 0; mi < messages.size(); ++mi) {
+        const auto& m = messages[mi];
+        if (xmlTools && !toolsBlock.empty() && mi == 0 &&
+            m.role == ChatRole::System) {
+            continue;  // folded into the tools system turn above
+        }
         if (explicitSystemToolsPending && m.role == ChatRole::System) {
             emitTurn("system", m.content + toolsBlock);
             explicitSystemToolsPending = false;
+            continue;
+        }
+        if (xmlTools && m.role == ChatRole::Assistant) {
+            std::string body =
+                (lastUserIdx < messages.size() && mi > lastUserIdx)
+                    ? "<think>\n\n</think>\n\n" : "";
+            body += m.content;
+            for (const auto& call : m.toolCalls) {
+                if (&call == &m.toolCalls.front()) {
+                    if (!m.content.empty()) {
+                        body += "\n\n";
+                    }
+                } else {
+                    body += "\n";
+                }
+                body += renderQwenXmlCall(call);
+            }
+            emitTurn("assistant", body);
+            continue;
+        }
+        if (xmlTools && m.role == ChatRole::Tool) {
+            // Consecutive tool results merge into ONE user turn:
+            // <|im_start|>user\n<tool_response>\nA\n</tool_response>\n
+            // <tool_response>\nB\n</tool_response><|im_end|>.
+            std::string body;
+            std::size_t j = mi;
+            for (; j < messages.size() && messages[j].role == ChatRole::Tool; ++j) {
+                if (!body.empty()) {
+                    body += "\n";
+                }
+                body += "<tool_response>\n" + messages[j].content +
+                        "\n</tool_response>";
+            }
+            emitTurn("user", body);
+            mi = j - 1;
             continue;
         }
         // Assistant turn that invoked tools: render each call as a
@@ -688,17 +808,31 @@ ChatTemplate::detectFromArch(std::string_view architecture) {
         "' yet — supported: qwen*, gemma2, gemma3, gemma4, llama");
 }
 
+ChatTemplate::ToolFormat
+ChatTemplate::toolFormatFromArch(std::string_view architecture) noexcept {
+    const std::string arch = toLower(architecture);
+    // Qwen3.5 / Qwen3.6 / Qwen3.8 (NVFP4 wire ids "qwen35moe" incl. the dense
+    // qwen3_5 tower, "qwen4_exp"; GGUF "qwen3next") ship the Qwen3-Coder XML
+    // tool format in their chat template. Qwen2/2.5/Qwen3 are Hermes-JSON.
+    if (arch.rfind("qwen35", 0) == 0 || arch.rfind("qwen4", 0) == 0 ||
+        arch.rfind("qwen3next", 0) == 0) {
+        return ToolFormat::QwenXml;
+    }
+    return ToolFormat::HermesJson;
+}
+
 std::vector<std::int32_t>
 ChatTemplate::encode(Style                        style,
                      const Tokenizer&             tok,
                      std::span<const ChatMessage> messages,
                      bool                         addGenerationPrompt,
                      std::span<const ToolSpec>    tools,
-                     std::optional<bool>          enableThinking) {
+                     std::optional<bool>          enableThinking,
+                     ToolFormat                   toolFormat) {
     switch (style) {
         case Style::QwenChatML:
             return encodeQwen(tok, messages, addGenerationPrompt, tools,
-                              enableThinking);
+                              enableThinking, toolFormat);
         case Style::Gemma3:
             // Gemma 3 tool rendering not implemented (Gemma 4 is the target).
             return encodeGemma3(tok, messages, addGenerationPrompt);

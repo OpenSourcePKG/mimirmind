@@ -75,6 +75,27 @@ public:
     /// std::runtime_error for architectures we have not hardcoded yet.
     [[nodiscard]] static Style detectFromArch(std::string_view architecture);
 
+    /// Which native tool-calling markup a ChatML (Qwen-family) model was
+    /// trained on. Orthogonal to Style: the turn structure is identical, but
+    /// the tools block wording/placement and the call encoding differ, and a
+    /// model only calls tools in `tool_choice:"auto"` when prompted with the
+    /// exact format from its own chat template.
+    enum class ToolFormat {
+        HermesJson,   ///< Qwen2 / Qwen2.5 / Qwen3: <tool_call>{"name":…,
+                      ///<   "arguments":{…}}</tool_call>, tools block appended
+                      ///<   to the system turn.
+        QwenXml,      ///< Qwen3.5 / Qwen3.6 / Qwen3.8 (qwen35moe, qwen4_exp):
+                      ///<   Qwen3-Coder XML — <tool_call>\n<function=NAME>\n
+                      ///<   <parameter=KEY>\nVALUE\n</parameter>\n</function>\n
+                      ///<   </tool_call>, tools block PREFIXED to the system
+                      ///<   turn, consecutive tool results merged into one
+                      ///<   user turn.
+    };
+
+    /// Pick the tool markup by architecture. Only meaningful for styles that
+    /// support tools; non-Qwen styles ignore it.
+    [[nodiscard]] static ToolFormat toolFormatFromArch(std::string_view architecture) noexcept;
+
     /**
      * Build the token sequence for `messages` using `style`.
      *
@@ -96,7 +117,10 @@ public:
            // Explicit reasoning toggle (OpenAI chat_template_kwargs.enable_thinking,
            // like vLLM). nullopt = architecture default (Qwen: on unless a tool
            // round). Only the Qwen "thinking" family honours it.
-           std::optional<bool>            enableThinking      = std::nullopt);
+           std::optional<bool>            enableThinking      = std::nullopt,
+           // Native tool markup (see toolFormatFromArch). Only consulted by
+           // QwenChatML when `tools` is non-empty.
+           ToolFormat                     toolFormat          = ToolFormat::HermesJson);
 
     /**
      * Token ids that should terminate decoding for `style`, in addition

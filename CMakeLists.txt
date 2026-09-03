@@ -1660,6 +1660,7 @@ add_executable(arch_tests
     src/compute/MoeRouting.cpp
     src/compute/Softmax.cpp
     src/model/ResponseCleaner.cpp
+    src/model/ToolCallParser.cpp
     src/runtime/thermal/GpuClockGovernor.cpp
     src/runtime/thermal/PowerMonitor.cpp
     src/runtime/thermal/SystemMonitor.cpp

@@ -5,6 +5,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <stdexcept>
@@ -148,6 +149,68 @@ struct GemmaValParser {
     }
 };
 
+/// Repair pass for a trivially-truncated Hermes JSON body (a model dropping
+/// the final `}` before `</tool_call>` is a seen-in-the-wild Qwen3.6 failure):
+/// count braces outside strings and append the missing closers. Returns the
+/// discarded sentinel when the body is not salvageable this way.
+json parseWithBraceRepair(std::string_view body) {
+    json parsed = json::parse(body, /*cb=*/nullptr, /*allow_exceptions=*/false);
+    if (!parsed.is_discarded()) {
+        return parsed;
+    }
+    std::int32_t depth = 0;
+    bool         inStr = false;
+    bool         esc   = false;
+    for (char c : body) {
+        if (inStr) {
+            if (esc)            esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"')  inStr = false;
+        } else if (c == '"') {
+            inStr = true;
+        } else if (c == '{') {
+            ++depth;
+        } else if (c == '}') {
+            --depth;
+        }
+    }
+    if (inStr || depth <= 0 || depth > 4) {
+        return json(json::value_t::discarded);
+    }
+    std::string repaired = trimws(body);
+    repaired.append(static_cast<std::size_t>(depth), '}');
+    return json::parse(repaired, /*cb=*/nullptr, /*allow_exceptions=*/false);
+}
+
+/// Coerce one raw XML parameter value to the JSON type the tool's schema
+/// declares for it (vLLM qwen3coder-parser behaviour). Unknown or "string"
+/// type keeps the raw text; a failed conversion falls back to the raw text
+/// rather than dropping the call.
+json coerceXmlParamValue(const std::string& raw, const std::string& type) {
+    if (type.empty() || type == "string") {
+        return raw;
+    }
+    const std::string t = trimws(raw);
+    try {
+        if (type == "integer") {
+            return static_cast<std::int64_t>(std::stoll(t));
+        }
+        if (type == "number") {
+            return std::stod(t);
+        }
+    } catch (...) {
+        return raw;
+    }
+    if (type == "boolean") {
+        if (t == "true")  return true;
+        if (t == "false") return false;
+        return raw;
+    }
+    // object / array / null / anything else: accept valid JSON verbatim.
+    json v = json::parse(t, /*cb=*/nullptr, /*allow_exceptions=*/false);
+    return v.is_discarded() ? json(raw) : v;
+}
+
 /// Normalise the `arguments` field to a compact JSON *string*: OpenAI carries
 /// arguments stringified. Qwen usually emits an object; some models emit an
 /// already-stringified value. Anything else falls back to "{}".
@@ -185,9 +248,10 @@ std::vector<ToolCall> ToolCallParser::parseQwen(std::string_view text) {
 
         const std::string_view body = text.substr(bodyStart, bodyEnd - bodyStart);
 
-        // Parse the inner JSON; skip this block on any error rather than
+        // Parse the inner JSON (with a brace-balance repair retry for a
+        // truncated closer); skip this block on any error rather than
         // aborting the whole response.
-        json parsed = json::parse(body, /*cb=*/nullptr, /*allow_exceptions=*/false);
+        json parsed = parseWithBraceRepair(body);
         if (!parsed.is_discarded() && parsed.is_object()) {
             const auto nameIt = parsed.find("name");
             if (nameIt != parsed.end() && nameIt->is_string()) {
@@ -199,6 +263,135 @@ std::vector<ToolCall> ToolCallParser::parseQwen(std::string_view text) {
                 call.argumentsJson =
                     (argsIt != parsed.end()) ? argumentsToString(*argsIt) : "{}";
 
+                calls.push_back(std::move(call));
+            }
+        }
+
+        if (close == std::string_view::npos) {
+            break;
+        }
+        pos = close + kClose.size();
+    }
+
+    return calls;
+}
+
+std::vector<ToolCall> ToolCallParser::parseQwenXml(
+        std::string_view text, std::span<const ToolSpec> specs) {
+    std::vector<ToolCall> calls;
+
+    // Per-tool parameter-type lookup from the offered schemas:
+    // function.parameters.properties.<key>.type. Parsed once up front.
+    // Missing/unparseable schemas simply leave every value a string.
+    auto paramType = [&specs](const std::string& fn,
+                              const std::string& key) -> std::string {
+        for (const auto& spec : specs) {
+            if (spec.name != fn) {
+                continue;
+            }
+            const json tool = json::parse(spec.toolJson, /*cb=*/nullptr,
+                                          /*allow_exceptions=*/false);
+            if (tool.is_discarded()) {
+                return {};
+            }
+            const json* props = nullptr;
+            if (tool.contains("function") &&
+                tool["function"].contains("parameters") &&
+                tool["function"]["parameters"].contains("properties")) {
+                props = &tool["function"]["parameters"]["properties"];
+            }
+            if (props != nullptr && props->contains(key) &&
+                (*props)[key].contains("type") &&
+                (*props)[key]["type"].is_string()) {
+                return (*props)[key]["type"].get<std::string>();
+            }
+            return {};
+        }
+        return {};
+    };
+
+    constexpr std::string_view kFunc     = "<function=";
+    constexpr std::string_view kFuncEnd  = "</function>";
+    constexpr std::string_view kParam    = "<parameter=";
+    constexpr std::string_view kParamEnd = "</parameter>";
+
+    // The template writes values as `<parameter=k>\nVALUE\n</parameter>` —
+    // strip exactly one framing newline from each side, preserving interior
+    // (and any additional intentional) whitespace of a multi-line value.
+    const auto stripFrame = [](std::string_view v) -> std::string {
+        if (!v.empty() && v.front() == '\n') {
+            v.remove_prefix(1);
+        }
+        if (!v.empty() && v.back() == '\n') {
+            v.remove_suffix(1);
+        }
+        return std::string{v};
+    };
+
+    std::size_t pos = 0;
+    while (true) {
+        const std::size_t open = text.find(kOpen, pos);
+        if (open == std::string_view::npos) {
+            break;
+        }
+        const std::size_t bodyStart = open + kOpen.size();
+        const std::size_t close     = text.find(kClose, bodyStart);
+        // Truncated final block (cut at max_tokens): parse what is there.
+        const std::size_t bodyEnd =
+            (close == std::string_view::npos) ? text.size() : close;
+        const std::string_view body = text.substr(bodyStart, bodyEnd - bodyStart);
+
+        // <function=NAME> header. A body without one (e.g. a Hermes JSON
+        // block) is not this dialect — skip it.
+        const std::size_t fn = body.find(kFunc);
+        if (fn != std::string_view::npos) {
+            const std::size_t nameStart = fn + kFunc.size();
+            const std::size_t nameEnd   = body.find('>', nameStart);
+            const std::string name = (nameEnd != std::string_view::npos)
+                ? trimws(body.substr(nameStart, nameEnd - nameStart))
+                : std::string{};
+            if (!name.empty()) {
+                json args = json::object();
+                std::size_t p = nameEnd + 1;
+                const std::size_t funcEnd = body.find(kFuncEnd, p);
+                const std::size_t paramsEnd =
+                    (funcEnd != std::string_view::npos) ? funcEnd : body.size();
+                while (true) {
+                    const std::size_t ps = body.find(kParam, p);
+                    if (ps == std::string_view::npos || ps >= paramsEnd) {
+                        break;
+                    }
+                    const std::size_t ks = ps + kParam.size();
+                    const std::size_t ke = body.find('>', ks);
+                    if (ke == std::string_view::npos) {
+                        break;
+                    }
+                    const std::string key = trimws(body.substr(ks, ke - ks));
+                    const std::size_t vs  = ke + 1;
+                    std::size_t ve = body.find(kParamEnd, vs);
+                    // Missing closer (truncation): value runs to the next
+                    // parameter opener / function closer / end of body.
+                    std::size_t next = ve;
+                    if (ve == std::string_view::npos || ve > paramsEnd) {
+                        const std::size_t vNext = body.find(kParam, vs);
+                        ve   = std::min(paramsEnd,
+                                        (vNext == std::string_view::npos)
+                                            ? paramsEnd : vNext);
+                        next = ve;
+                    } else {
+                        next = ve + kParamEnd.size();
+                    }
+                    if (!key.empty()) {
+                        args[key] = coerceXmlParamValue(
+                            stripFrame(body.substr(vs, ve - vs)),
+                            paramType(name, key));
+                    }
+                    p = next;
+                }
+                ToolCall call;
+                call.id            = "call_" + std::to_string(calls.size());
+                call.name          = name;
+                call.argumentsJson = args.dump();
                 calls.push_back(std::move(call));
             }
         }

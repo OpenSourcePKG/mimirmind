@@ -5,6 +5,7 @@
 
 #include "model/ToolCall.hpp"
 
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -31,7 +32,26 @@ public:
 
     /// True when `text` contains at least one `<tool_call>` opener — a cheap
     /// pre-check so the hot path (no tools in the request) never parses JSON.
+    /// Shared by parseQwen and parseQwenXml (same outer marker).
     [[nodiscard]] static bool looksLikeQwenToolCall(std::string_view text) noexcept;
+
+    /// Qwen3.5 / Qwen3.6 / Qwen3.8 (Qwen3-Coder XML format): one or more
+    ///   <tool_call>
+    ///   <function=fn>
+    ///   <parameter=key>
+    ///   value
+    ///   </parameter>
+    ///   </function>
+    ///   </tool_call>
+    /// blocks. Parameter values are plain text spanning multiple lines; they
+    /// are coerced to typed JSON via the offered tool's parameter schema in
+    /// `specs` (integer/number/boolean/object/array), defaulting to string —
+    /// mirroring vLLM's qwen3coder tool parser. A truncated final block
+    /// (missing closers, e.g. cut at max_tokens) still yields the complete
+    /// parameters seen so far; a block without a `<function=` header is
+    /// skipped. Ids are synthesised "call_0", "call_1", … in emission order.
+    [[nodiscard]] static std::vector<ToolCall>
+    parseQwenXml(std::string_view text, std::span<const ToolSpec> specs);
 
     /// Gemma 4: one or more blocks in Gemma's custom tool-call DSL
     ///   <|tool_call>call:NAME{key:VALUE,key2:VALUE2,...}<tool_call|>

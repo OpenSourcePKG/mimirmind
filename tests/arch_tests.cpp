@@ -16,6 +16,7 @@
 #include "compute/MoeRouting.hpp"
 #include "compute/Softmax.hpp"
 #include "model/ResponseCleaner.hpp"
+#include "model/ToolCallParser.hpp"
 #include "runtime/thermal/GpuClockGovernor.hpp"
 #include "runtime/Lcp.hpp"
 #include "runtime/thermal/PowerMonitor.hpp"
@@ -49,6 +50,7 @@ TEST(arch_supportedNames) {
     using mimirmind::runtime::arch::isSupportedArchitecture;
     EXPECT_TRUE(isSupportedArchitecture("qwen2"));
     EXPECT_TRUE(isSupportedArchitecture("gemma4"));
+    EXPECT_TRUE(isSupportedArchitecture("llama"));  // Llama-3 via Qwen2Backend
 }
 
 TEST(arch_unsupportedNames) {
@@ -56,7 +58,6 @@ TEST(arch_unsupportedNames) {
     EXPECT_TRUE(!isSupportedArchitecture(""));
     EXPECT_TRUE(!isSupportedArchitecture("qwen3"));
     EXPECT_TRUE(!isSupportedArchitecture("gemma3"));
-    EXPECT_TRUE(!isSupportedArchitecture("llama"));
     EXPECT_TRUE(!isSupportedArchitecture("Qwen2"));   // case-sensitive
     EXPECT_TRUE(!isSupportedArchitecture("Gemma4"));
 }
@@ -1244,6 +1245,119 @@ TEST(thermalProfile_rejectsGpuTargetAboveSoft) {
     } catch (const std::runtime_error&) {
         // expected
     }
+}
+
+// ---- ToolCallParser — Qwen3-Coder XML dialect (8.19.6) ---------------------
+//
+// Qwen3.5/3.6/3.8 chat templates carry tool calls as
+//   <tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n
+//   </function>\n</tool_call>
+// with parameter values typed via the offered tool's JSON schema.
+
+namespace {
+
+std::vector<mimirmind::model::ToolSpec> weatherSpecs() {
+    return {mimirmind::model::ToolSpec{
+        "get_weather",
+        R"({"type":"function","function":{"name":"get_weather",)"
+        R"("description":"d","parameters":{"type":"object","properties":)"
+        R"({"city":{"type":"string"},"days":{"type":"integer"},)"
+        R"("detailed":{"type":"boolean"}},"required":["city"]}}})"}};
+}
+
+} // namespace
+
+TEST(toolParser_qwenXml_basicTypedCall) {
+    using mimirmind::model::ToolCallParser;
+    const auto calls = ToolCallParser::parseQwenXml(
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nBerlin\n</parameter>\n"
+        "<parameter=days>\n3\n</parameter>\n"
+        "<parameter=detailed>\ntrue\n</parameter>\n"
+        "</function>\n</tool_call>",
+        weatherSpecs());
+    EXPECT_EQ(calls.size(), std::size_t{1});
+    EXPECT_TRUE(calls[0].name == "get_weather");
+    EXPECT_TRUE(calls[0].argumentsJson ==
+                R"({"city":"Berlin","days":3,"detailed":true})");
+}
+
+TEST(toolParser_qwenXml_multilineStringStaysRaw) {
+    using mimirmind::model::ToolCallParser;
+    const auto calls = ToolCallParser::parseQwenXml(
+        "prose before\n<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nline one\nline two\n</parameter>\n"
+        "</function>\n</tool_call>",
+        weatherSpecs());
+    EXPECT_EQ(calls.size(), std::size_t{1});
+    EXPECT_TRUE(calls[0].argumentsJson == R"({"city":"line one\nline two"})");
+}
+
+TEST(toolParser_qwenXml_numericStringNotCoerced) {
+    // A "string"-typed parameter whose value looks numeric must STAY a string.
+    using mimirmind::model::ToolCallParser;
+    const auto calls = ToolCallParser::parseQwenXml(
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\n1234\n</parameter>\n</function>\n</tool_call>",
+        weatherSpecs());
+    EXPECT_EQ(calls.size(), std::size_t{1});
+    EXPECT_TRUE(calls[0].argumentsJson == R"({"city":"1234"})");
+}
+
+TEST(toolParser_qwenXml_truncatedBlockStillParses) {
+    // Output cut at max_tokens: no </parameter>/</function>/</tool_call>.
+    using mimirmind::model::ToolCallParser;
+    const auto calls = ToolCallParser::parseQwenXml(
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis",
+        weatherSpecs());
+    EXPECT_EQ(calls.size(), std::size_t{1});
+    EXPECT_TRUE(calls[0].argumentsJson == R"({"city":"Paris"})");
+}
+
+TEST(toolParser_qwenXml_multipleCallsAndIds) {
+    using mimirmind::model::ToolCallParser;
+    const auto calls = ToolCallParser::parseQwenXml(
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>",
+        weatherSpecs());
+    EXPECT_EQ(calls.size(), std::size_t{2});
+    EXPECT_TRUE(calls[0].id == "call_0");
+    EXPECT_TRUE(calls[1].id == "call_1");
+    EXPECT_TRUE(calls[1].argumentsJson == R"({"city":"Oslo"})");
+}
+
+TEST(toolParser_qwenXml_hermesBodyYieldsNothing) {
+    // A Hermes JSON body has no <function=…> header — the XML parser must
+    // skip it (the handler then falls back to parseQwen).
+    using mimirmind::model::ToolCallParser;
+    const auto calls = ToolCallParser::parseQwenXml(
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": "
+        "{\"city\": \"Bonn\"}}\n</tool_call>",
+        weatherSpecs());
+    EXPECT_EQ(calls.size(), std::size_t{0});
+}
+
+TEST(toolParser_qwenHermes_braceRepairRecoversTruncatedJson) {
+    // Seen live: Qwen3.6 imitating Hermes dropped the final '}' before
+    // </tool_call>. The brace-balance repair pass must recover the call.
+    using mimirmind::model::ToolCallParser;
+    const auto calls = ToolCallParser::parseQwen(
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": "
+        "{\"city\": \"Kiel\"}\n</tool_call>");
+    EXPECT_EQ(calls.size(), std::size_t{1});
+    EXPECT_TRUE(calls[0].name == "get_weather");
+    EXPECT_TRUE(calls[0].argumentsJson == R"({"city":"Kiel"})");
+}
+
+TEST(toolParser_qwenHermes_intactJsonStillParses) {
+    using mimirmind::model::ToolCallParser;
+    const auto calls = ToolCallParser::parseQwen(
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": "
+        "{\"city\": \"Kiel\"}}\n</tool_call>");
+    EXPECT_EQ(calls.size(), std::size_t{1});
+    EXPECT_TRUE(calls[0].argumentsJson == R"({"city":"Kiel"})");
 }
 
 int main() {
