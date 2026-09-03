@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 extern "C" __global__ void gated_deltanet_ar_batched_v3_gatefused(
@@ -37,7 +38,7 @@ static void ck(cudaError_t e, const char* what) {
 
 // Bench the recurrence at (nSeq, H, S), T=1 decode. bytesState = 2 * nSeq*H*S*S*4
 // (one read + one write of the whole state); io = q/k/v/out + alpha/beta.
-static void benchShape(int nSeq, int H, int S, int iters, std::size_t smemBytes) {
+static void benchShape(int nSeq, int H, int S, int iters) {
     const std::size_t stateElems = (std::size_t)nSeq * H * S * S;
     const std::size_t ioSH       = (std::size_t)nSeq * H * S;   // q/k/v/out each
     const std::size_t gate       = (std::size_t)nSeq * H;       // alpha/beta each
@@ -61,6 +62,7 @@ static void benchShape(int nSeq, int H, int S, int iters, std::size_t smemBytes)
     ck(cudaMemcpy(dSsmA, hHead.data(), H*sizeof(float), cudaMemcpyHostToDevice), "cSsmA");
     ck(cudaMemcpy(dSsmDt, hHead.data(), H*sizeof(float), cudaMemcpyHostToDevice), "cSsmDt");
 
+    const std::size_t smemBytes = (std::size_t)S * S * sizeof(float);
     dim3 grid((unsigned)H, (unsigned)nSeq, 1);
     dim3 block((unsigned)S, 1, 1);
     auto launch = [&]() {
@@ -108,9 +110,18 @@ int main(int argc, char** argv) {
     std::printf("| shape | us/call | GB/s | %%peak | state traffic | ideal |\n");
     std::printf("|---|---|---|---|---|---|\n");
     const int iters = (argc>1) ? std::atoi(argv[1]) : 500;
-    benchShape(16, H, S, iters, smemBytes);
-    benchShape(32, H, S, iters, smemBytes);
-    benchShape(64, H, S, iters, smemBytes);
+    // Small-nSeq rows (added 5.18.10.1): single/low-user decode. Measured
+    // 2026-09-03: ALREADY at/above the DRAM floor (nSeq=1 ~130% of peak via L2
+    // residency; 2-8 at 81-118%) — there is NO small-nSeq occupancy lever; a
+    // column-split variant (grid.z over state columns, bit-identical) was
+    // built, measured SLOWER at nSeq=1 (15.3 vs 12.0 us) and reverted. The
+    // only remaining recur lever at any nSeq is BF16 state (halves R+W).
+    // NOTE: co-resident prod suppresses these numbers ~25% — solo-GPU runs are
+    // the comparable ones for the 16-64 rows (73-75% solo vs 51-61% co-resident).
+    for (int nSeq : {1, 2, 4, 8}) benchShape(nSeq, H, S, iters);
+    benchShape(16, H, S, iters);
+    benchShape(32, H, S, iters);
+    benchShape(64, H, S, iters);
     std::printf("# %%peak reading+writing the SSM state once = recur BW efficiency. If ~high (>70%%),\n");
     std::printf("# gdn.recur is at the F32 state-bandwidth floor -> the lever is BF16 state (halves R+W).\n");
     return 0;
