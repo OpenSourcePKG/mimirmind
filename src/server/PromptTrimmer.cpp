@@ -21,55 +21,94 @@ bool PromptTrimmer::applyPromptTrim(
     std::size_t                      modelContextLength,
     const model::Tokenizer&          tok,
     model::ChatTemplate::Style       chatStyle,
+    std::span<const model::ToolSpec> tools,
+    std::optional<bool>              enableThinking,
+    model::ChatTemplate::ToolFormat  toolFormat,
     TrimReport&                      report,
     std::string&                     errorMessage) {
     report.originalPromptTokens = promptIds.size();
 
-    // 1. Message-drop-trim loop.
+    // 8.19.8: `max_tokens` is a CEILING on output, never a reservation that
+    // may eat the prompt (OpenAI / vLLM semantics). Before this fix the drop
+    // loop ran against prompt+maxNew, so a routine agent request with
+    // max_tokens 64000 (Claude Code's default) silently trimmed a perfectly
+    // fitting prompt — tools block, task and tool history — down to a
+    // ~37-token remnant and the model hallucinated from it. Message-drop
+    // trimming now fires ONLY when the PROMPT ALONE (+ slack + 1 output
+    // token) overflows the budget; otherwise maxNew is clamped below.
+
+    // 1. Message-drop-trim loop — prompt-alone overflow only. Each iteration
+    //    drops a BATCH of oldest droppable messages sized by a chars/4 token
+    //    estimate of the overflow, then re-encodes once — a per-message
+    //    re-encode capped the old loop at kTrimIterLimit drops, which turned
+    //    any history longer than ~20 messages over budget into a hard 400.
     for (std::size_t iter = 0; iter < kTrimIterLimit; ++iter) {
-        if (promptIds.size() + maxNewTokens + kCapSlack <= maxContextTokens) {
+        if (promptIds.size() + kCapSlack + 1 <= maxContextTokens) {
             break;
         }
-        // Find the LAST user message — must be preserved. Walk backwards.
-        std::size_t lastUserIdx = static_cast<std::size_t>(-1);
-        for (std::size_t i = msgs.size(); i-- > 0; ) {
-            if (msgs[i].role == model::ChatRole::User) {
-                lastUserIdx = i;
+        const std::size_t overflow =
+            promptIds.size() + kCapSlack + 1 - maxContextTokens;
+        std::size_t freedEstimate = 0;
+        bool        droppedAny    = false;
+        while (freedEstimate < overflow) {
+            // Find the LAST user message — must be preserved. Walk backwards.
+            std::size_t lastUserIdx = static_cast<std::size_t>(-1);
+            for (std::size_t i = msgs.size(); i-- > 0; ) {
+                if (msgs[i].role == model::ChatRole::User) {
+                    lastUserIdx = i;
+                    break;
+                }
+            }
+            // Pick the earliest droppable index: not system, not last-user.
+            std::size_t dropIdx = static_cast<std::size_t>(-1);
+            for (std::size_t i = 0; i < msgs.size(); ++i) {
+                if (msgs[i].role == model::ChatRole::System) continue;
+                if (i == lastUserIdx) continue;
+                dropIdx = i;
                 break;
             }
+            if (dropIdx == static_cast<std::size_t>(-1)) {
+                // Only system + last-user left — cannot drop more.
+                break;
+            }
+            std::size_t bytes = msgs[dropIdx].content.size();
+            for (const auto& call : msgs[dropIdx].toolCalls) {
+                bytes += call.name.size() + call.argumentsJson.size();
+            }
+            freedEstimate += bytes / 4 + 16;  // ~4 chars/token + turn markup
+            msgs.erase(msgs.begin() + static_cast<std::ptrdiff_t>(dropIdx));
+            ++report.droppedMessages;
+            droppedAny = true;
         }
-        // Pick the earliest droppable index: not system, not last-user.
-        std::size_t dropIdx = static_cast<std::size_t>(-1);
-        for (std::size_t i = 0; i < msgs.size(); ++i) {
-            if (msgs[i].role == model::ChatRole::System) continue;
-            if (i == lastUserIdx) continue;
-            dropIdx = i;
+        if (!droppedAny) {
             break;
         }
-        if (dropIdx == static_cast<std::size_t>(-1)) {
-            // Only system + last-user left — cannot drop more.
-            break;
-        }
-        msgs.erase(msgs.begin() + static_cast<std::ptrdiff_t>(dropIdx));
-        ++report.droppedMessages;
+        // Re-encode with the SAME tools / thinking / tool-format shape as
+        // the original prompt — the pre-8.19.8 re-encode dropped the tools
+        // block entirely, so a trimmed agent request lost its tools.
         promptIds = model::ChatTemplate::encode(chatStyle, tok, msgs,
-                                                /*addGenerationPrompt=*/true);
+                                                /*addGenerationPrompt=*/true,
+                                                tools, enableThinking,
+                                                toolFormat);
     }
 
-    // 2. Post-trim: clamp maxNew against remaining budget if still too big.
+    // 2. Prompt alone still does not fit → 400, never a silent partial
+    //    prompt.
     const std::size_t Tp = promptIds.size();
+    if (Tp + kCapSlack + 1 > maxContextTokens) {
+        errorMessage =
+            "prompt too long: " + std::to_string(Tp) +
+            " tokens after trimming " + std::to_string(report.droppedMessages) +
+            " message(s) + slack " + std::to_string(kCapSlack) +
+            " does not fit context budget " + std::to_string(maxContextTokens) +
+            " — raise runtime.maxContextTokens or shorten the last "
+            "user message";
+        return false;
+    }
+
+    // 3. Clamp maxNew to the budget the prompt leaves. Output that hits the
+    //    clamped ceiling finishes with finish_reason "length" as usual.
     if (Tp + maxNewTokens + kCapSlack > maxContextTokens) {
-        if (Tp + kCapSlack >= maxContextTokens) {
-            // Prompt alone exhausts the budget even without any completion.
-            errorMessage =
-                "prompt too long: " + std::to_string(Tp) +
-                " tokens after trimming " + std::to_string(report.droppedMessages) +
-                " message(s) + slack " + std::to_string(kCapSlack) +
-                " does not fit context budget " + std::to_string(maxContextTokens) +
-                " — raise runtime.maxContextTokens or shorten the last "
-                "user message";
-            return false;
-        }
         const std::size_t newMax = maxContextTokens - Tp - kCapSlack;
         report.maxNewClampedFrom = maxNewTokens;
         report.maxNewClampedTo   = newMax;

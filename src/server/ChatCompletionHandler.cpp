@@ -191,7 +191,8 @@ bool ChatCompletionHandler::prepareChatRequest(
         if (!PromptTrimmer::applyPromptTrim(msgs, promptIds, params.maxNewTokens,
                              targetEngine.maxContextTokens(),
                              targetEngine.config().contextLength,
-                             tok, style, report, trimErr)) {
+                             tok, style, cr.tools, cr.enableThinking,
+                             toolFormat, report, trimErr)) {
             sendError(res, 400, "invalid_request_error", trimErr);
             return false;
         }

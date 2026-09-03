@@ -10,6 +10,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -48,10 +50,13 @@ struct PromptTrimmer {
     static constexpr std::size_t kCapSlack   = 4;
     static constexpr std::size_t kTrimIterLimit = 20;
 
-    /// Drop oldest droppable messages + clamp `maxNewTokens` until the
-    /// request fits `maxContextTokens`. Returns false only if the prompt
-    /// alone (after all drops) already exceeds the budget — caller maps
-    /// that to a 400 with `errorMessage`.
+    /// 8.19.8 semantics (OpenAI / vLLM): `maxNewTokens` is a CEILING on
+    /// output — it is clamped to whatever budget the full prompt leaves and
+    /// never causes prompt trimming. Messages are dropped (oldest droppable
+    /// first, re-encoded with the same tools/thinking/tool-format shape)
+    /// ONLY when the prompt alone overflows `maxContextTokens`. Returns
+    /// false only if the prompt alone (after all drops) still exceeds the
+    /// budget — caller maps that to a 400 with `errorMessage`.
     [[nodiscard]] static bool applyPromptTrim(
         std::vector<model::ChatMessage>& msgs,
         std::vector<std::int32_t>&       promptIds,
@@ -60,6 +65,9 @@ struct PromptTrimmer {
         std::size_t                      modelContextLength,
         const model::Tokenizer&          tok,
         model::ChatTemplate::Style       chatStyle,
+        std::span<const model::ToolSpec> tools,
+        std::optional<bool>              enableThinking,
+        model::ChatTemplate::ToolFormat  toolFormat,
         TrimReport&                      report,
         std::string&                     errorMessage);
 
