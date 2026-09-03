@@ -84,6 +84,38 @@ bool isGemma4Config(const std::string& configText) {
 
 } // namespace
 
+namespace {
+
+/// 8.19.7: pick up the checkpoint's recommended sampling truncation
+/// (generation_config.json top_p/top_k) as per-model server defaults —
+/// vLLM does the same. Absent file / fields leave the neutral values.
+void applyGenerationConfigDefaults(model::LlmConfig&            cfg,
+                                   const std::filesystem::path& dir) {
+    std::ifstream f(dir / "generation_config.json");
+    if (!f) {
+        return;
+    }
+    const auto j = nlohmann::json::parse(f, /*cb=*/nullptr,
+                                         /*allow_exceptions=*/false);
+    if (j.is_discarded() || !j.is_object()) {
+        return;
+    }
+    if (j.contains("top_p") && j["top_p"].is_number()) {
+        cfg.samplingTopPDefault = j["top_p"].get<float>();
+    }
+    if (j.contains("top_k") && j["top_k"].is_number_integer()) {
+        cfg.samplingTopKDefault = j["top_k"].get<std::uint32_t>();
+    }
+    if (cfg.samplingTopPDefault < 1.0F || cfg.samplingTopKDefault > 0) {
+        MM_LOG_INFO("engine",
+                    "generation_config.json sampling defaults: top_p={} "
+                    "top_k={} (applied when a request samples without its own)",
+                    cfg.samplingTopPDefault, cfg.samplingTopKDefault);
+    }
+}
+
+} // namespace
+
 void Nvfp4Loader::load(InferenceEngine&                     e,
                        std::string_view                     checkpointDir,
                        std::string_view                     tokenizerGguf,
@@ -118,6 +150,7 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                     "loadModelNvfp4: '{}' — Gemma-4 (compressed-tensors, dense "
                     "text tower)", checkpointDir);
         e._config = runtime::nvfp4::parseGemma4SafetensorsConfig(configText);
+        applyGenerationConfigDefaults(e._config, dir);
 
         if (tokenizerGguf.empty()) {
             e._tokenizer.loadFromHfJson(dir);
@@ -227,6 +260,7 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
 
     // 1. Arch params from config.json (GGUF-metadata parse is GGUF-only).
     e._config = runtime::nvfp4::parseQwen3_5MoeSafetensorsConfig(configText);
+    applyGenerationConfigDefaults(e._config, dir);
 
     // 2. Tokenizer. NVFP4 checkpoints ship no GGUF tokenizer, so by default
     //    parse the checkpoint's HF tokenizer.json directly (byte-level BPE,

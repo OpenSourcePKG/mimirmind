@@ -51,6 +51,16 @@ struct LlmConfig {
     std::uint32_t keyLengthSwa      {0};        // SWA-layer key length (Gemma 4)
     std::uint32_t valueLengthSwa    {0};        // SWA-layer value length (Gemma 4)
     float         rmsNormEps        {1e-6F};
+
+    // 8.19.7: model-recommended sampling truncation (HF generation_config
+    // .json top_p/top_k). The server applies these ONLY when a request asks
+    // for sampling (temperature > 0) without its own top_p/top_k — matching
+    // vLLM's generation-config-backed defaults. Untruncated sampling of a
+    // model that ships top_k=20/top_p=0.95 (qwen3.6) produces tail garbage:
+    // foreign tool markup, degenerate call arguments. Neutral values mean
+    // "checkpoint shipped no recommendation" (GGUF path, older exports).
+    float         samplingTopPDefault {1.0F};
+    std::uint32_t samplingTopKDefault {0};
     // Explicit attention softmax scale (GGUF `<arch>.attention.scale`).
     // 0 = unset → attention uses the default 1/sqrt(head_dim). Qwen3-Next
     // (`qwen35moe`) ships this key; llama.cpp:

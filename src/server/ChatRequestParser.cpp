@@ -320,11 +320,10 @@ ChatRequest parseChatRequest(const json& body) {
     readSize(body, "max_tokens", req.maxTokens);
     readSize(body, "max_completion_tokens", req.maxTokens);
     readSize(body, "top_k", req.topK);
+    req.hasTopK = body.contains("top_k") && !body["top_k"].is_null();
 
-    bool hasTopP = false;
     readFloat(body, "temperature", req.temperature, req.hasTemperature);
-    readFloat(body, "top_p", req.topP, hasTopP);
-    (void)hasTopP;
+    readFloat(body, "top_p", req.topP, req.hasTopP);
 
     readFloat(body, "frequency_penalty",  req.frequencyPenalty,  req.hasFrequencyPenalty);
     readFloat(body, "presence_penalty",   req.presencePenalty,   req.hasPresencePenalty);

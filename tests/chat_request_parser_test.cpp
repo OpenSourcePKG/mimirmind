@@ -169,6 +169,24 @@ TEST(validSamplingAndLength_allHonored) {
     EXPECT_EQ(r.stopStrings.size(), std::size_t{2});
     EXPECT_TRUE(r.hasFrequencyPenalty);
     EXPECT_TRUE(r.hasPresencePenalty);
+    // 8.19.7: explicit top_p/top_k are flagged so the handler never
+    // overrides them with the model's generation_config defaults.
+    EXPECT_TRUE(r.hasTopP);
+    EXPECT_TRUE(r.hasTopK);
+}
+
+TEST(samplingWithoutTruncation_flagsStayUnset) {
+    // A request that samples but sends no top_p/top_k (the Claude Code /
+    // Bifröst / Loki shape) must leave the presence flags false — the
+    // handler then applies the model's generation_config truncation.
+    json b = baseBody();
+    b["temperature"] = 1.0;
+    const ChatRequest r = parseChatRequest(b);
+    EXPECT_TRUE(r.hasTemperature);
+    EXPECT_TRUE(!r.hasTopP);
+    EXPECT_TRUE(!r.hasTopK);
+    EXPECT_NEAR(r.topP, 1.0F, 1e-6F);
+    EXPECT_EQ(r.topK, std::size_t{0});
 }
 
 TEST(unknownAndIgnoredStandardFields_neverError) {

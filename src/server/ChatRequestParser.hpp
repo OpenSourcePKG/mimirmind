@@ -50,6 +50,12 @@ struct ChatRequest {
     bool                            hasTemperature{false};
     float                           topP{1.0F};
     std::size_t                     topK{0};
+    // 8.19.7: explicit-presence flags — a request that asks for sampling
+    // (temperature>0) WITHOUT its own top_p/top_k gets the model's
+    // generation_config.json truncation defaults (vLLM behaviour); an
+    // explicit value, even the neutral one, always wins.
+    bool                            hasTopP{false};
+    bool                            hasTopK{false};
     std::uint64_t                   seed{0};
     std::vector<std::string>        stopStrings;
     bool                            stream{false};

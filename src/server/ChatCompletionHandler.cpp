@@ -244,6 +244,50 @@ bool ChatCompletionHandler::prepareChatRequest(
     params.sampling.topK = cr.topK;
     params.sampling.seed = cr.seed;
 
+    // 8.19.7 — model-recommended truncation for sampled requests. A client
+    // that asks for sampling (temperature>0) without its own top_p/top_k
+    // (Claude Code via Bifröst/Loki sends only temperature=1.0) otherwise
+    // samples the FULL distribution, and qwen3.6's tail produces foreign
+    // tool markup and degenerate call arguments. Use the checkpoint's
+    // generation_config.json values (vLLM behaviour); explicit client
+    // values — even neutral ones — always win. Greedy requests unchanged.
+    if (params.sampling.temperature > 0.0F) {
+        const auto& mc = targetEngine.config();
+        if (!cr.hasTopP && mc.samplingTopPDefault < 1.0F) {
+            params.sampling.topP = mc.samplingTopPDefault;
+        }
+        if (!cr.hasTopK && mc.samplingTopKDefault > 0) {
+            params.sampling.topK = mc.samplingTopKDefault;
+        }
+    }
+
+    // 8.19.7 — mid-agent-loop turns decode greedy. Once the transcript
+    // contains a tool result, sampled decoding is measurably unreliable on
+    // qwen3.6 (temp=1.0: ~50% format breakouts untruncated, and even with
+    // recommended truncation ~2/8 fabricated tool results / foreign markup),
+    // while greedy deterministically produces a corrected follow-up call or
+    // an honest answer. Diversity has no value mid-loop; correctness does —
+    // the server decides (same philosophy as the M7f floor). The per-slot
+    // anti-loop floor stays active under greedy (8.19.5). Rollback:
+    // MIMIRMIND_TOOLLOOP_SAMPLED=1 restores client sampling in tool loops.
+    if (!cr.tools.empty() && params.sampling.temperature > 0.0F &&
+        !cr.enableThinking.value_or(false)) {
+        const bool inToolLoop = std::any_of(
+            cr.messages.begin(), cr.messages.end(),
+            [](const model::ChatMessage& m) {
+                return m.role == model::ChatRole::Tool;
+            });
+        const char* keep = std::getenv("MIMIRMIND_TOOLLOOP_SAMPLED");
+        if (inToolLoop && (keep == nullptr || keep[0] == '0')) {
+            MM_LOG_INFO("server",
+                        "tool-loop greedy clamp: temperature {} -> 0 (tools + "
+                        "tool result in transcript; MIMIRMIND_TOOLLOOP_SAMPLED=1 "
+                        "to disable)",
+                        params.sampling.temperature);
+            params.sampling.temperature = 0.0F;
+        }
+    }
+
     // Thinking mode must not run greedy. Qwen3 reasoning degenerates into an
     // endless repetition loop under argmax ("No I will not... No I will not...")
     // that no history penalty reliably breaks. When reasoning is enabled and the
