@@ -84,7 +84,16 @@ loadProbePicks(const std::string& dir, const std::string& fingerprint) {
         picks.applyMmqTc            = readFlag("MIMIRMIND_MMQ_TC");
         picks.applyAttnCudnnPaged   = readFlag("MIMIRMIND_ATTN_CUDNN_PAGED");
         picks.applyMoeSiluFuse      = readFlag("MIMIRMIND_MOE_SILU_FUSE");
-        picks.applyMoeDecodeReg     = readFlag("MIMIRMIND_MOE_DECODE_REG");
+        // 5.18.14: mode-valued flag — pass the profile's integer through
+        // (0=off, 1=m2reg@tileM2, 4=m4reg@tileM4) instead of collapsing to bool.
+        const auto readIntFlag =
+            [&flagsIt](const char* key) -> std::optional<int> {
+            const auto it = flagsIt->find(key);
+            if (it == flagsIt->end() || !it->is_object()) return std::nullopt;
+            if (!it->value("apply", false)) return std::nullopt;
+            return it->value("value", 0);
+        };
+        picks.applyMoeDecodeReg     = readIntFlag("MIMIRMIND_MOE_DECODE_REG");
     }
 
     return picks;

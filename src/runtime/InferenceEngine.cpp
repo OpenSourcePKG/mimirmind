@@ -824,10 +824,13 @@ void InferenceEngine::finalizeLoad() {
             }
             if (picks->applyMoeDecodeReg &&
                 std::getenv("MIMIRMIND_MOE_DECODE_REG") == nullptr) {
-                ::setenv("MIMIRMIND_MOE_DECODE_REG",
-                         *picks->applyMoeDecodeReg ? "1" : "0", 1);
-                MM_LOG_INFO("probe", "  profile applied: MoE decode register-staged -> {}",
-                            *picks->applyMoeDecodeReg ? "on" : "off");
+                // 5.18.14: mode-valued (0=off, 1=m2reg@tileM2, 4=m4reg@tileM4) —
+                // the profile integer goes through verbatim; explicit env wins.
+                const std::string mode = std::to_string(*picks->applyMoeDecodeReg);
+                ::setenv("MIMIRMIND_MOE_DECODE_REG", mode.c_str(), 1);
+                MM_LOG_INFO("probe",
+                            "  profile applied: MoE decode register-staged -> mode {}",
+                            mode);
             }
         }
     }
