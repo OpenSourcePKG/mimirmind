@@ -125,6 +125,39 @@ bool ChatCompletionHandler::prepareChatRequest(
     // without touching the parsed request. Also lets us report the
     // original prompt-token count in the response.
     std::vector<model::ChatMessage> msgs = cr.messages;
+
+    // 8.19.11 — server-side HONESTY FLOOR. Small serve-class models
+    // confabulate confidently on long-tail factual queries (the "Walter Moers
+    // Hauptwerke" repro: three invented book series with years); sampling only
+    // de-loops the failure, it cannot add missing knowledge. When the client
+    // sends NO system message and NO tools (a raw consumer chat), prepend a
+    // minimal honesty instruction so knowledge gaps surface as hedges instead
+    // of fabricated specifics. Deliberately NARROW: any client-provided system
+    // prompt (grounded RAG, agents, parity/needle harnesses) or tool offering
+    // disables the injection, so those flows stay byte-identical. Server
+    // decides (same philosophy as the M7f/anti-loop floors); ops rollback:
+    // MIMIRMIND_HONESTY_FLOOR=0.
+    {
+        static const bool kHonestyFloor = [] {
+            const char* e = std::getenv("MIMIRMIND_HONESTY_FLOOR");
+            return e == nullptr || e[0] != '0';
+        }();
+        const bool hasSystem = std::any_of(
+            msgs.begin(), msgs.end(), [](const model::ChatMessage& m) {
+                return m.role == model::ChatRole::System;
+            });
+        if (kHonestyFloor && !hasSystem && cr.tools.empty()) {
+            model::ChatMessage sys;
+            sys.role    = model::ChatRole::System;
+            sys.content =
+                "You are a helpful assistant. Be honest about the limits of "
+                "your knowledge: when you are not confident about specific "
+                "facts (names, titles, dates, numbers, lists of works), say "
+                "so plainly and share only what you are sure of. Never invent "
+                "titles, citations, or figures to fill a gap.";
+            msgs.insert(msgs.begin(), std::move(sys));
+        }
+    }
     // 8.19.6: the tool markup is per-model too — Qwen3.5/3.6/3.8 are trained
     // on the Qwen3-Coder XML format, Qwen2.5/Qwen3 on Hermes JSON. Rendering
     // the wrong dialect kills tool_choice:"auto" (the model never calls).
