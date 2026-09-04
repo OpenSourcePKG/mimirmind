@@ -1432,6 +1432,35 @@ TEST(toolDetector_fencedBareOpenerNotCaptured) {
     EXPECT_TRUE(all.find("<function=get_weather>") != std::string::npos);
 }
 
+TEST(toolParser_markupSalad_detected) {
+    using mimirmind::model::ToolCallParser;
+    // Captured live (round 7 of the multi-step E2E).
+    EXPECT_TRUE(ToolCallParser::looksLikeToolMarkupSalad(
+        "<tooltool_0>\n\n</invoke>"));
+    EXPECT_TRUE(ToolCallParser::looksLikeToolMarkupSalad(
+        "<|/tool_call_start|>"));
+    // Keyword-FREE tag salad is deliberately NOT matched (surfacing beats
+    // force-re-decoding — a live 44-byte HTML answer was eaten by the old
+    // short-and-tag-dominated rule).
+    EXPECT_TRUE(!ToolCallParser::looksLikeToolMarkupSalad("<x_1></y_2>"));
+    EXPECT_TRUE(!ToolCallParser::looksLikeToolMarkupSalad(
+        "<div class=greeting><span>Hello</span></div>"));
+}
+
+TEST(toolParser_markupSalad_notFooledByProseOrHtml) {
+    using mimirmind::model::ToolCallParser;
+    EXPECT_TRUE(!ToolCallParser::looksLikeToolMarkupSalad(
+        "The answer is 4. No tags here."));
+    // A long legitimate HTML answer: tag-heavy but no tool keywords and
+    // too long for the keyword-free rule.
+    std::string html = "<!doctype html>\n";
+    for (int i = 0; i < 30; ++i) {
+        html += "<div class=\"row\"><span>item</span><p>text body here "
+                "with some real words</p></div>\n";
+    }
+    EXPECT_TRUE(!ToolCallParser::looksLikeToolMarkupSalad(html));
+}
+
 TEST(toolParser_qwenHermes_intactJsonStillParses) {
     using mimirmind::model::ToolCallParser;
     const auto calls = ToolCallParser::parseQwen(

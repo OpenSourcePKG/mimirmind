@@ -220,7 +220,11 @@ std::string argumentsToString(const json& args) {
         return args.get<std::string>();
     }
     if (args.is_object() || args.is_array()) {
-        return args.dump();
+        // Model-derived bytes may hold an invalid UTF-8 sequence
+        // (token-boundary truncation) — dump() must replace, not
+        // throw (a throw here escaped the SSE provider, 8.19.10).
+        return args.dump(-1, ' ', false,
+                         json::error_handler_t::replace);
     }
     return "{}";
 }
@@ -384,7 +388,8 @@ bool parseFunctionSpan(std::string_view          scope,
         p = next;
     }
     out.name          = name;
-    out.argumentsJson = args.dump();
+    out.argumentsJson = args.dump(-1, ' ', false,
+                                  json::error_handler_t::replace);
     endPos = (funcEnd != std::string_view::npos) ? funcEnd + kFuncEnd.size()
                                                  : scope.size();
     return true;
@@ -521,6 +526,40 @@ std::vector<ToolCall> ToolCallParser::parseQwenXmlBare(
     return calls;
 }
 
+bool ToolCallParser::looksLikeToolMarkupSalad(std::string_view text) noexcept {
+    // Keyword-only on purpose: an earlier "short and tag-dominated" fallback
+    // rule ate a legitimate 44-byte HTML answer live (`<div><span>…`). Every
+    // observed salad carries a tool keyword inside a tag (`<tooltool_0>`,
+    // `</invoke>`, `<|/tool_call_start|>`, `<function=…` variants); anything
+    // keyword-free is safer surfaced as content than force-re-decoded.
+    // "call" alone is deliberately NOT a keyword ("tool_call" is covered by
+    // "tool") — onclick="callFoo()"-style attributes would false-positive.
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (text[i] != '<') {
+            continue;
+        }
+        // Tag-like span: `<` … `>` within 64 chars.
+        const std::size_t close = text.find('>', i + 1);
+        if (close == std::string_view::npos || close - i > 64) {
+            continue;
+        }
+        std::string low;
+        low.reserve(close - i);
+        for (std::size_t j = i + 1; j < close; ++j) {
+            low.push_back(static_cast<char>(
+                std::tolower(static_cast<unsigned char>(text[j]))));
+        }
+        static constexpr std::string_view kWords[] = {
+            "tool", "invoke", "function"};
+        for (const auto w : kWords) {
+            if (low.find(w) != std::string::npos) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool ToolCallParser::looksLikeGemmaToolCall(std::string_view text) noexcept {
     return text.find(kGOpen) != std::string_view::npos;
 }
@@ -562,7 +601,8 @@ std::vector<ToolCall> ToolCallParser::parseGemma(std::string_view text) {
                     ToolCall call;
                     call.id            = "call_" + std::to_string(calls.size());
                     call.name          = name;
-                    call.argumentsJson = args.dump();
+                    call.argumentsJson = args.dump(
+                        -1, ' ', false, json::error_handler_t::replace);
                     calls.push_back(std::move(call));
                 } catch (...) {
                     // malformed args → skip this block

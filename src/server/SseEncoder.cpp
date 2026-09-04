@@ -118,7 +118,13 @@ json SseEncoder::buildUsageChunk(const std::string& id, std::int64_t created,
 }
 
 bool SseEncoder::writeSseEvent(httplib::DataSink& sink, const json& payload) {
-    const std::string line = "data: " + payload.dump() + "\n\n";
+    // Payloads carry model-derived text; an invalid UTF-8 byte must not
+    // make dump() throw out of the chunked-content provider (the stream
+    // then dies after the role chunk with no finish_reason — 8.19.10).
+    const std::string line =
+        "data: " +
+        payload.dump(-1, ' ', false, json::error_handler_t::replace) +
+        "\n\n";
     return sink.write(line.data(), line.size());
 }
 
@@ -126,9 +132,11 @@ bool SseEncoder::writeSseNamedEvent(httplib::DataSink&     sink,
                                      std::string_view       name,
                                      const json&            payload) {
     std::string line;
-    line.reserve(name.size() + payload.dump().size() + 16);
+    const std::string data =
+        payload.dump(-1, ' ', false, json::error_handler_t::replace);
+    line.reserve(name.size() + data.size() + 16);
     line.append("event: ").append(name).append("\n");
-    line.append("data: ").append(payload.dump()).append("\n\n");
+    line.append("data: ").append(data).append("\n\n");
     return sink.write(line.data(), line.size());
 }
 

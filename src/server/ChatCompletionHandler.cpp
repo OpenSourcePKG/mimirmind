@@ -723,6 +723,71 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         }
     }
 
+    // 8.19.10 — one-shot salvage re-decode. As the transcript grows qwen3.6
+    // keeps inventing NEW broken tool markup (`<tooltool_0>…</invoke>` was
+    // round 7 live) — a fallback parser cannot catch what has no structure.
+    // When the response starts with '<', parsed into nothing, and smells of
+    // tool markup, re-decode ONCE with the native opener force-prefilled
+    // (the tool_choice:"required" trick): greedy, bounded, invisible to the
+    // client. If even that yields no call, the salad is suppressed rather
+    // than leaked. Interim until grammar-constrained decoding (8.19.11).
+    // Rollback: MIMIRMIND_TOOL_SALVAGE=0.
+    if (!cr.tools.empty() && cr.toolChoice != "none" && toolCalls.empty() &&
+        model::ChatTemplate::detectFromArch(engine.config().architecture) ==
+            model::ChatTemplate::Style::QwenChatML) {
+        const std::size_t nw  = text.find_first_not_of(" \t\n\r");
+        const char*       off = std::getenv("MIMIRMIND_TOOL_SALVAGE");
+        if (nw != std::string::npos && text[nw] == '<' &&
+            (off == nullptr || off[0] != '0') &&
+            model::ToolCallParser::looksLikeToolMarkupSalad(text)) {
+            constexpr std::string_view kSalvageOpener =
+                "<tool_call>\n<function=";
+            const auto openerIds =
+                tok.encode(std::string{kSalvageOpener}, /*addBos=*/false);
+            std::vector<std::int32_t> salvagePrompt = promptIds;
+            salvagePrompt.insert(salvagePrompt.end(),
+                                 openerIds.begin(), openerIds.end());
+            runtime::GenerateParams sp = params;
+            sp.sampling.temperature = 0.0F;
+            sp.maxNewTokens = std::min<std::size_t>(sp.maxNewTokens, 1024);
+            std::vector<std::int32_t> redecoded;
+            runtime::GenerateStats    salvStats;
+            try {
+                if (useBatcher) {
+                    redecoded = runViaBatcher(*activeBatcher, salvagePrompt,
+                                              sp, stopIds, tenant, onToken);
+                } else {
+                    std::lock_guard<std::mutex> lk{*target->mutex};
+                    redecoded = engine.generate(salvagePrompt, sp, onToken,
+                                                &salvStats, onPrefillDone,
+                                                onPrefillProgress);
+                }
+            } catch (const std::exception& e) {
+                MM_LOG_WARN("server", "tool-salvage re-decode failed: {}",
+                            e.what());
+            }
+            if (!redecoded.empty()) {
+                const std::string salvText =
+                    std::string{kSalvageOpener} +
+                    tok.decode(redecoded, /*skipSpecial=*/false);
+                toolCalls =
+                    model::ToolCallParser::parseQwenXml(salvText, cr.tools);
+            }
+            if (!toolCalls.empty()) {
+                MM_LOG_WARN("server",
+                            "tool-salvage: unparseable tool markup ({} bytes) "
+                            "re-decoded into {} call(s)",
+                            text.size(), toolCalls.size());
+            } else {
+                MM_LOG_WARN("server",
+                            "tool-salvage: unparseable tool markup ({} bytes) "
+                            "suppressed — re-decode yielded no call",
+                            text.size());
+                text.clear();
+            }
+        }
+    }
+
     const std::int64_t now   = unixNow();
     const std::string finish = !toolCalls.empty() ? "tool_calls"
                              : (hitStop ? "stop" : "length");
@@ -897,6 +962,14 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
         model::ToolCallStreamDetector toolCallDetector;
         int                           nextToolCallIndex{0};
         bool                          anyToolCallEmitted{false};
+        // 8.19.10 — held-content mode: when tools are offered and the FIRST
+        // visible answer character is '<', content is held server-side until
+        // end-of-turn so an unparseable tool-markup response can be salvaged
+        // (or suppressed) instead of having leaked to the client chunk by
+        // chunk. Plain prose (not starting with '<') streams as before.
+        bool                          contentHoldActive{false};
+        bool                          firstContentSeen{false};
+        std::string                   heldContent;
         bool                          done{false};
         // OpenAI stream_options.include_usage: emit a terminal usage chunk
         // (empty choices + usage) just before [DONE].
@@ -978,6 +1051,13 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                 return false;
             }
             state->done = true;
+            // 8.19.10 — nothing may escape the provider: an uncaught throw
+            // (historically: json::dump on invalid UTF-8 in model-derived
+            // text) tears the chunked stream down after the role chunk with
+            // NO finish_reason, and clients retry-storm. Body kept at its
+            // original indentation; the catch at the bottom closes the
+            // stream properly.
+            try {
 
             auto& targetEng = *targetEngine;
             const auto& tok = targetEng.tokenizer();
@@ -1150,6 +1230,22 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                 const bool toolCallCompleted =
                     state->toolCallsEnabled && state->toolCallDetector.feed(txt);
 
+                // 8.19.10 — decide/apply held-content mode. Detector-held
+                // opener candidates never reach txt, so a proper tool call
+                // does not trip this; only '<'-leading visible content does.
+                if (!txt.empty() && state->toolCallsEnabled &&
+                    !state->firstContentSeen) {
+                    const std::size_t nw = txt.find_first_not_of(" \t\n\r");
+                    if (nw != std::string::npos) {
+                        state->firstContentSeen  = true;
+                        state->contentHoldActive = (txt[nw] == '<');
+                    }
+                }
+                if (!txt.empty() && state->contentHoldActive) {
+                    state->heldContent.append(txt);
+                    txt.clear();
+                }
+
                 if (!txt.empty()) {
                     state->utf8Pending.append(txt);
                     const std::size_t cut =
@@ -1170,6 +1266,21 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                 }
 
                 if (toolCallCompleted) {
+                    // Held prose preceding a real call is ordinary content —
+                    // surface it before the call chunk, then leave hold mode
+                    // (content after a call streams normally).
+                    if (!state->heldContent.empty()) {
+                        if (!SseEncoder::writeSseEvent(
+                                sink,
+                                SseEncoder::buildContentChunk(
+                                    state->respId, state->created,
+                                    state->echoModel, state->heldContent))) {
+                            clientGone = true;
+                            return false;
+                        }
+                        state->heldContent.clear();
+                    }
+                    state->contentHoldActive = false;
                     if (!emitToolCallBlock(state->toolCallDetector.completedBlock())) {
                         clientGone = true;
                         return false;
@@ -1342,6 +1453,15 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                 MM_LOG_ERROR("server",
                              "stream {}: generate failed: {}",
                              state->respId, errorMessage);
+                // 8.19.10 — even a failed stream must TERMINATE properly:
+                // a finish_reason chunk + [DONE]. Clients treat a stream
+                // that just ends after the role chunk as retryable and
+                // retry-storm (~20 empty responses seen live).
+                (void)SseEncoder::writeSseEvent(
+                    sink,
+                    SseEncoder::buildFinishChunk(state->respId, state->created,
+                                                 state->echoModel, "stop"));
+                (void)SseEncoder::writeSseDone(sink);
                 sink.done();
                 return false;
             }
@@ -1362,6 +1482,123 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                     state->toolCallDetector.reset();
                 }
                 state->utf8Pending.append(state->toolCallDetector.takePendingFlush());
+            }
+
+            // 8.19.10 — end-of-turn resolution of HELD content ('<'-leading
+            // answer while tools were offered, buffered server-side instead
+            // of streamed). Try the whole-response fallback parsers first
+            // (bare XML / bare JSON — previously blocking-only), then the
+            // one-shot salvage re-decode for unparseable tool-markup salad;
+            // genuine '<'-leading prose (raw HTML/code) streams out here.
+            if (state->toolCallsEnabled && !state->anyToolCallEmitted &&
+                (state->contentHoldActive || !state->heldContent.empty())) {
+                std::string full = std::move(state->heldContent);
+                state->heldContent.clear();
+                full += state->utf8Pending;
+                state->utf8Pending.clear();
+
+                std::vector<model::ToolCall> calls;
+                if (model::ToolCallParser::looksLikeBareQwenXmlCall(
+                        full, state->toolSpecs)) {
+                    calls = model::ToolCallParser::parseQwenXmlBare(
+                        full, state->toolSpecs);
+                }
+                if (calls.empty()) {
+                    std::vector<std::string> names;
+                    names.reserve(state->toolSpecs.size());
+                    for (const auto& s : state->toolSpecs) {
+                        names.push_back(s.name);
+                    }
+                    if (model::ToolCallParser::looksLikeBareJsonToolCall(full,
+                                                                        names)) {
+                        calls = model::ToolCallParser::parseBareJson(full, names);
+                    }
+                }
+
+                bool saladSuppressed = false;
+                const char* off = std::getenv("MIMIRMIND_TOOL_SALVAGE");
+                if (calls.empty() && (off == nullptr || off[0] != '0') &&
+                    state->style == model::ChatTemplate::Style::QwenChatML &&
+                    model::ToolCallParser::looksLikeToolMarkupSalad(full)) {
+                    // One-shot forced re-decode — the blocking path's twin.
+                    constexpr std::string_view kSalvageOpener =
+                        "<tool_call>\n<function=";
+                    const auto openerIds = tok.encode(
+                        std::string{kSalvageOpener}, /*addBos=*/false);
+                    std::vector<std::int32_t> salvagePrompt = state->promptIds;
+                    salvagePrompt.insert(salvagePrompt.end(),
+                                         openerIds.begin(), openerIds.end());
+                    runtime::GenerateParams sp = state->params;
+                    sp.sampling.temperature = 0.0F;
+                    sp.maxNewTokens =
+                        std::min<std::size_t>(sp.maxNewTokens, 1024);
+                    auto noopToken = [](std::int32_t) { return true; };
+                    std::vector<std::int32_t> redecoded;
+                    try {
+                        if (useBatcher) {
+                            redecoded = runViaBatcher(
+                                *activeBatcher, salvagePrompt, sp,
+                                state->stopIds, state->tenantId, noopToken);
+                        } else {
+                            std::lock_guard<std::mutex> lk{*targetMutex};
+                            runtime::GenerateStats salvStats;
+                            auto noPrefillDone =
+                                [](const runtime::InferenceEngine::PrefillDone&) {};
+                            auto noPrefillProgress =
+                                [](const runtime::InferenceEngine::PrefillProgress&) {
+                                    return true;
+                                };
+                            redecoded = targetEng.generate(
+                                salvagePrompt, sp, noopToken, &salvStats,
+                                noPrefillDone, noPrefillProgress);
+                        }
+                    } catch (const std::exception& e) {
+                        MM_LOG_WARN("server",
+                                    "stream {}: tool-salvage re-decode "
+                                    "failed: {}", state->respId, e.what());
+                    }
+                    if (!redecoded.empty()) {
+                        const std::string salvText =
+                            std::string{kSalvageOpener} +
+                            tok.decode(redecoded, /*skipSpecial=*/false);
+                        calls = model::ToolCallParser::parseQwenXml(
+                            salvText, state->toolSpecs);
+                    }
+                    if (calls.empty()) {
+                        MM_LOG_WARN("server",
+                                    "stream {}: tool-salvage: {} byte markup "
+                                    "salad suppressed — re-decode yielded no "
+                                    "call", state->respId, full.size());
+                        saladSuppressed = true;
+                    } else {
+                        MM_LOG_WARN("server",
+                                    "stream {}: tool-salvage: {} byte markup "
+                                    "salad re-decoded into {} call(s)",
+                                    state->respId, full.size(), calls.size());
+                    }
+                }
+
+                if (!calls.empty()) {
+                    for (const auto& call : calls) {
+                        const std::string callId =
+                            "call_" + std::to_string(state->nextToolCallIndex);
+                        (void)SseEncoder::writeSseEvent(
+                            sink,
+                            SseEncoder::buildToolCallChunk(
+                                state->respId, state->created,
+                                state->echoModel, state->nextToolCallIndex,
+                                callId, call.name, call.argumentsJson));
+                        ++state->nextToolCallIndex;
+                        state->anyToolCallEmitted = true;
+                    }
+                } else if (!saladSuppressed && !full.empty()) {
+                    // Genuine '<'-leading prose — deliver it now in one chunk.
+                    (void)SseEncoder::writeSseEvent(
+                        sink,
+                        SseEncoder::buildContentChunk(state->respId,
+                                                      state->created,
+                                                      state->echoModel, full));
+                }
             }
 
             // Flush any leftover reasoning buffer first (a model that stops
@@ -1441,6 +1678,28 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
 
             sink.done();
             return false;
+            } catch (const std::exception& e) {
+                // 8.19.10 catch-all (see the try at the top): close the
+                // stream with an error chunk + finish_reason + [DONE] so the
+                // client sees a terminated response, never a bare role chunk.
+                MM_LOG_ERROR("server",
+                             "stream {}: provider exception: {}",
+                             state->respId, e.what());
+                json errChunk = SseEncoder::streamChunkSkeleton(
+                    state->respId, state->created, state->echoModel);
+                errChunk["error"] = json{
+                    {"message", std::string{"internal: "} + e.what()},
+                    {"type",    "server_error"},
+                };
+                (void)SseEncoder::writeSseEvent(sink, errChunk);
+                (void)SseEncoder::writeSseEvent(
+                    sink,
+                    SseEncoder::buildFinishChunk(state->respId, state->created,
+                                                 state->echoModel, "stop"));
+                (void)SseEncoder::writeSseDone(sink);
+                sink.done();
+                return false;
+            }
         });
 }
 

@@ -71,6 +71,17 @@ public:
     looksLikeBareQwenXmlCall(std::string_view          text,
                              std::span<const ToolSpec> specs) noexcept;
 
+    /// 8.19.10 — degenerate tool-markup "salad" that no parser can rescue
+    /// (e.g. `<tooltool_0>\n\n</invoke>`): tag-like spans whose content
+    /// smells of tool markup (tool/invoke/function/call inside a `<…>` tag),
+    /// or a short response dominated by tag characters. Used to trigger the
+    /// one-shot salvage re-decode with a force-prefilled opener — NOT a
+    /// parser; there is nothing to parse. Deliberately conservative: long
+    /// tag-heavy answers without the keywords (real HTML/XML output) do NOT
+    /// match.
+    [[nodiscard]] static bool
+    looksLikeToolMarkupSalad(std::string_view text) noexcept;
+
     /// Gemma 4: one or more blocks in Gemma's custom tool-call DSL
     ///   <|tool_call>call:NAME{key:VALUE,key2:VALUE2,...}<tool_call|>
     /// where VALUE is a Gemma-quoted string `<|"|>text<|"|>` (a plain
