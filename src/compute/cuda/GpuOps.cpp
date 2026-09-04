@@ -425,6 +425,7 @@ struct GpuOps::Impl {
     core::cuda::CudaModule _moeActQuantModule;
     core::cuda::CudaKernel _moeActQuantKernel;
     core::cuda::CudaKernel _moeActQuantRowsKernel;
+    core::cuda::CudaKernel _moeActQuantGatherRowsKernel;
     core::cuda::CudaKernel _moeSiluMulQuantRowsKernel;  // 5.21.8 fused silu*up+quant
 
     explicit Impl(core::cuda::CudaContext& ctx)
@@ -739,6 +740,8 @@ struct GpuOps::Impl {
           _moeActQuantModule       {loadCudaModule(ctx, "moe_act_quant_nvfp4")},
           _moeActQuantKernel       {_moeActQuantModule.getFunction("moe_act_quant_nvfp4")},
           _moeActQuantRowsKernel   {_moeActQuantModule.getFunction("moe_act_quant_nvfp4_rows")},
+          _moeActQuantGatherRowsKernel{
+              _moeActQuantModule.getFunction("moe_act_quant_nvfp4_gather_rows")},
           _moeSiluMulQuantRowsKernel{_moeActQuantModule.getFunction("moe_silu_mul_quant_nvfp4_rows")}
     {}
 };
@@ -2767,6 +2770,24 @@ void GpuOps::moeActQuantNvfp4RowsAsync(const float* in, unsigned char* outNib,
     k.setPtr  (4, rowMap);
     k.setValue(5, toInt32(nRows, "moeActQuantRows nRows"));
     k.setValue(6, toInt32(K, "moeActQuantRows K"));
+    const std::uint32_t gy = static_cast<std::uint32_t>(((K / 16) + 255) / 256);
+    k.launch(_ctx.stream(), static_cast<std::uint32_t>(nRows), gy, 1, 256, 1, 1);
+}
+
+void GpuOps::moeActQuantNvfp4GatherRowsAsync(const float* in, unsigned char* outNib,
+                                             unsigned char* outSf, float gscale,
+                                             const std::int32_t* rowMap,
+                                             std::size_t nRows, std::size_t K) {
+    if (nRows == 0 || K == 0) return;
+    // 5.21.10: fused gather + quant — reads COMPACT rows, writes padded slots.
+    auto& k = _pimpl->_moeActQuantGatherRowsKernel;
+    k.setPtr  (0, in);
+    k.setPtr  (1, outNib);
+    k.setPtr  (2, outSf);
+    k.setValue(3, gscale);
+    k.setPtr  (4, rowMap);
+    k.setValue(5, toInt32(nRows, "moeActQuantGatherRows nRows"));
+    k.setValue(6, toInt32(K, "moeActQuantGatherRows K"));
     const std::uint32_t gy = static_cast<std::uint32_t>(((K / 16) + 255) / 256);
     k.launch(_ctx.stream(), static_cast<std::uint32_t>(nRows), gy, 1, 256, 1, 1);
 }

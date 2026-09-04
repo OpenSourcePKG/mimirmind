@@ -189,6 +189,57 @@ void moe_silu_mul_quant_nvfp4_rows(
         *reinterpret_cast<const unsigned char*>(&sfE4m3);
 }
 
+// 5.21.10 FUSED gather + row-mapped act-quant: reads the COMPACT gathered
+// activations (`in[logical]`, the moe_gather_rows output) and writes nibbles +
+// SF at the PADDED row `rowMap[logical]` — replacing the moe_rows_scatter_f32
+// F32 round-trip (write [maxPad,K] then re-read it) that fed
+// moe_act_quant_nvfp4_rows. Values, quant math and output layout are identical
+// to scatter-then-quant, so the result is BIT-IDENTICAL; only the intermediate
+// xPad tensor (and ~2/3 of the moe.prep traffic) disappears.
+extern "C" __global__ __launch_bounds__(ACT_QUANT_NVFP4_LOCAL)
+void moe_act_quant_nvfp4_gather_rows(
+    const float*         __restrict__ in,      // [nRows, K] COMPACT rows
+          unsigned char* __restrict__ out,     // [maxPad, K/2] packed E2M1
+          unsigned char* __restrict__ SFout,   // swizzled UE4M3 (pre-zeroed)
+    const float                        gscale,
+    const int*           __restrict__ rowMap,  // [nRows] padded row per real row
+    const int                          nRows,
+    const int                          K)      // multiple of 16
+{
+    const int nBlocks = K / NVFP4_SF_VEC_SIZE;
+    const int logical = blockIdx.x;
+    const int blk     = blockIdx.y * blockDim.x + threadIdx.x;
+    if (logical >= nRows || blk >= nBlocks) {
+        return;
+    }
+    const int row       = rowMap[logical];
+    const int numKTiles = (nBlocks + 3) / 4;
+
+    const int k0 = blk * NVFP4_SF_VEC_SIZE;
+    const float* __restrict__ src = in + static_cast<long>(logical) * K + k0;
+
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NVFP4_SF_VEC_SIZE; ++i) {
+        amax = fmaxf(amax, fabsf(src[i]));
+    }
+
+    float sfVal = gscale * (amax * (1.0f / 6.0f));
+    const __nv_fp8_e4m3 sfE4m3 = __nv_fp8_e4m3(sfVal);
+    sfVal = static_cast<float>(sfE4m3);
+    const float outScale = (sfVal != 0.0f) ? (gscale / sfVal) : 0.0f;
+
+    unsigned char* __restrict__ dst = out + (static_cast<long>(row) * K + k0) / 2;
+#pragma unroll
+    for (int j = 0; j < NVFP4_SF_VEC_SIZE / 2; ++j) {
+        const unsigned lo = aq_e2m1(src[2 * j]     * outScale);
+        const unsigned hi = aq_e2m1(src[2 * j + 1] * outScale);
+        dst[j] = static_cast<unsigned char>(lo | (hi << 4));
+    }
+    SFout[aq_sf_offset(row, blk, numKTiles)] =
+        *reinterpret_cast<const unsigned char*>(&sfE4m3);
+}
+
 // Row-mapped variant: quantise only `nRows` real rows, each read from and
 // written to the (padded) row `rowMap[blockIdx.x]`. The FP4-TC grouped MoE path
 // pads every expert to 128 rows so its SFA sub-tensor is tile-aligned; the

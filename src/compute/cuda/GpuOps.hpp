@@ -347,6 +347,10 @@ public:
     void moeActQuantNvfp4Async(const float* in, unsigned char* outNib,
                                unsigned char* outSf, float gscale,
                                std::size_t M, std::size_t K) override;
+    void moeActQuantNvfp4GatherRowsAsync(const float* in, unsigned char* outNib,
+                                         unsigned char* outSf, float gscale,
+                                         const std::int32_t* rowMap,
+                                         std::size_t nRows, std::size_t K) override;
     void moeActQuantNvfp4RowsAsync(const float* in, unsigned char* outNib,
                                    unsigned char* outSf, float gscale,
                                    const std::int32_t* rowMap,

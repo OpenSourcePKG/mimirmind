@@ -884,6 +884,7 @@ void Qwen3_5MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
                                        n_ff_exp, d_model, K, bytesDown);
     }
 
+    _ops.profileSection("moe.shexp");   // 5.21.10: own sub-split (see grouped path)
     // --- shared expert (always-on) + sigmoid gate -------------------------
     // Row-parallel over the nSeq tokens: identical to runMoeFfn's shared
     // expert with T := nSeq (the two-matmul + siluMul + down path; the T==1
@@ -1136,7 +1137,9 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         grow(s.moeTcPadOffset,   (nExperts + 1) * sizeof(std::int32_t));
         grow(s.moeTcContigToPad, R * sizeof(std::int32_t));
         grow(s.moeTcPadAsn,      nAsn * sizeof(std::int32_t));
-        grow(s.moeTcXPad,        maxPad * d_model * sizeof(float));
+        // moeTcXPad dropped (5.21.10): the fused gather+quant reads the
+        // compact rows directly, so the [maxPad, d_model] F32 intermediate
+        // (~hundreds of MiB at prefill maxPad) is no longer allocated.
         grow(s.moeTcGatePad,     maxPad * n_ff_exp * sizeof(float));
         grow(s.moeTcUpPad,       maxPad * n_ff_exp * sizeof(float));
         grow(s.moeTcDownPad,     maxPad * d_model * sizeof(float));
@@ -1150,7 +1153,6 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         auto* const padOffset   = s.moeTcPadOffset.as<std::int32_t>();
         auto* const contigToPad = s.moeTcContigToPad.as<std::int32_t>();
         auto* const padAsn      = s.moeTcPadAsn.as<std::int32_t>();
-        float* const xPad    = s.moeTcXPad.as<float>();
         float* const gatePad = s.moeTcGatePad.as<float>();
         float* const upPad   = s.moeTcUpPad.as<float>();
         float* const downPad = s.moeTcDownPad.as<float>();
@@ -1167,14 +1169,16 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         _ops.moeContigToPadAsync(expOffset, padOffset, contigToPad, nExperts, R);
         _ops.moeIndexGatherI32Async(asnToRow, contigToPad, padAsn, nAsn);
 
-        // spread gathered rows -> padded slots; act-quant (SF pre-zeroed).
-        // Only the R real rows are quantised (each at its padded slot via
-        // contigToPad); the padding rows keep the zeroed SF (scale 0 -> act 0)
-        // and their GEMM output is discarded, so quantising them is pure waste
-        // (~64x the real rows at decode M). Bit-identical for the real rows.
-        _ops.moeRowsScatterF32Async(xComp, contigToPad, xPad, R, d_model);
+        // 5.21.10: FUSED gather+quant — read the COMPACT gathered rows and
+        // write nibbles/SF straight at the padded slots. Replaces the
+        // moe_rows_scatter_f32 F32 round-trip (write [maxPad, d_model], then
+        // re-read it for the quant) + the separate quant launch; the xPad
+        // intermediate tensor is gone entirely. Bit-identical (same values,
+        // same quant math, same output layout). Padding rows keep the zeroed
+        // SF (scale 0 -> act 0); their GEMM output is discarded.
         _ops.moeZeroBytesAsync(sfaBank, mo::swizzledBlockScaleBytes(maxPad, d_model / 16));
-        _ops.moeActQuantNvfp4RowsAsync(xPad, aBank, sfaBank, 1.0F, contigToPad, R, d_model);
+        _ops.moeActQuantNvfp4GatherRowsAsync(xComp, aBank, sfaBank, 1.0F,
+                                             contigToPad, R, d_model);
 
         // gate + up: N=n_ff_exp, K=d_model. alpha[e] = weight global (folds the
         // per-expert global back in; act gscale=1).
@@ -1398,6 +1402,10 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
                                       d_model, nSeq, K);
     }
 
+    // 5.21.10: own sub-section — the always-on shared expert (3 GEMMs over
+    // ALL rows + silu + act-quants) previously accrued under "moe.sc",
+    // inflating the scatter's apparent share in the 5.21.8 prefill profile.
+    _ops.profileSection("moe.shexp");
     // --- shared expert (always-on) + sigmoid gate — identical to batched ---
     const auto* upShexp = w.findBlock(blockIdx, "ffn_up_shexp.weight");
     if (upShexp != nullptr) {

@@ -844,6 +844,20 @@ public:
         throw std::runtime_error("moeActQuantNvfp4RowsAsync: not supported on this backend");
     }
 
+    /// 5.21.10: fused gather + row-mapped NVFP4 act-quant — reads the COMPACT
+    /// gathered rows (`in[logical]`) and writes nibbles/SF at the padded row
+    /// `rowMap[logical]`, replacing the moe_rows_scatter_f32 round-trip +
+    /// moeActQuantNvfp4RowsAsync pair. Bit-identical to that pair.
+    virtual void moeActQuantNvfp4GatherRowsAsync(const float* in, unsigned char* outNib,
+                                                 unsigned char* outSf, float gscale,
+                                                 const std::int32_t* rowMap,
+                                                 std::size_t nRows, std::size_t K) {
+        (void)in; (void)outNib; (void)outSf; (void)gscale;
+        (void)rowMap; (void)nRows; (void)K;
+        throw std::runtime_error(
+            "moeActQuantNvfp4GatherRowsAsync: not supported on this backend");
+    }
+
     /// 5.21.8: fused silu(gate)*up + row-mapped NVFP4 act-quant in one pass
     /// (skips the intermediate round-trip AND the padding-row silu of the
     /// siluMul+actQuant two-pass). Bit-identical to that pair.
