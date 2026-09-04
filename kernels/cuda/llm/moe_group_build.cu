@@ -24,21 +24,19 @@
 //                    permutation. -1 for a dropped (malformed) assignment.
 //                    -> lets the scatter run token-major (for k: asnToRow[t*K+k])
 //                       so the K contributions of a token accumulate in a
-//                       fixed order — deterministic, no atomics.
+//                       fixed order — deterministic, no atomics there.
 // Expert e owns rows [expOffset[e], expOffset[e+1]); the weight to use for
 // that range is expert e itself (groups are dense and index-ordered).
 //
-// v1 is correctness-first, mirroring the moe_topk v1 rationale: ONE thread
-// does the whole build. R = T*K is <= prefillChunk*K (<= 512*8 = 4096) and
-// the work is O(R + nExperts) integer ops — negligible next to the expert
-// GEMMs that read hundreds of MB of weights. A block-parallel histogram +
-// scan is a perf follow-up and does not change the result. The stable scatter
-// (assignments visited in ascending index order, `cursor` advanced per
-// expert) makes the permutation deterministic, so the CPU counting-sort
-// reference matches it exactly — the correctness gate.
+// v3 (5.21.11): block-parallel histogram + scatter via shared-memory atomics
+// — the within-expert row order is the atomic claim order, NOT the stable
+// ascending-index order, which every consumer is agnostic to (rows run the
+// grouped GEMM independently; the accumulator scatter is asnToRow-driven in
+// fixed k order) — the model output stays bit-identical. expOffset is exactly
+// deterministic. See the in-body v3 note for the history.
 //
-// Launch: grid (1,1,1), block (1,1,1) (thread 0 only). No shared memory.
-// Warp-size agnostic by construction (no shuffles / no cross-lane work).
+// Launch: grid (1,1,1), block (256,1,1). Shared: (MAX_EXPERTS+1)+MAX_EXPERTS
+// ints. Warp-size agnostic (no shuffles / no cross-lane work).
 
 #include <cuda_runtime.h>
 
@@ -65,12 +63,19 @@ extern "C" __global__ void moe_group_build(
     const int tid      = static_cast<int>(threadIdx.x);
     const int nthreads = static_cast<int>(blockDim.x);
 
-    // v2 (2026-08-11): v1 was single-thread — the O(nExperts) zero + in-place
-    // global prefix-sum + a cursor[nExperts] LOCAL array (register spill) cost
-    // ~13 us/layer. v2 keeps the histogram / scan / stable-scatter on thread 0
-    // (so outputs are bit-identical to the CPU counting-sort golden), but runs
-    // them over SHARED counts (no global RMW, no local-mem cursor) and does the
-    // O(nExperts) zero + expOffset write across all threads of one block.
+    // v3 (2026-09-04, 5.21.11): the v2 histogram + stable scatter still ran
+    // two serial O(R) global-read loops on thread 0 — at prefill R (chunk
+    // tokens * K, up to ~4096 assignments * 48 MoE layers) that single thread
+    // made rt.build ~6% of the whole serving prefill (~400 us/layer). v3
+    // parallelises both phases across the block with shared-memory atomics.
+    // The within-expert row ORDER is no longer the stable ascending-index
+    // order — but every consumer is order-agnostic: each compacted row runs
+    // the grouped GEMM independently and the accumulator scatter walks a
+    // token's K contributions via asnToRow in fixed k order, so the MODEL
+    // OUTPUT is bit-identical to the stable build (verified via byte-equal
+    // greedy responses). expOffset stays exactly deterministic. The parity
+    // test checks the permutation PROPERTIES (bijection, expert-range
+    // membership, payload consistency) instead of the stable order.
     __shared__ int cnt[MOE_GROUP_MAX_EXPERTS + 1];
     __shared__ int cursor[MOE_GROUP_MAX_EXPERTS];
 
@@ -79,15 +84,18 @@ extern "C" __global__ void moe_group_build(
     }
     __syncthreads();
 
-    // 1+2. Histogram (into cnt[e+1]) then exclusive prefix sum — thread 0, in
-    //       shared memory. cnt[e] ends as expert e's row-range start; cnt[nE]=R'.
-    if (tid == 0) {
-        for (int i = 0; i < R; ++i) {
-            const int e = expIdx[i];
-            if (e >= 0 && e < nE) {
-                cnt[e + 1] += 1;            // drop malformed routing defensively
-            }
+    // 1. Histogram (into cnt[e+1]) — parallel, shared-memory atomics.
+    for (int i = tid; i < R; i += nthreads) {
+        const int e = expIdx[i];
+        if (e >= 0 && e < nE) {
+            atomicAdd(&cnt[e + 1], 1);      // drop malformed routing defensively
         }
+    }
+    __syncthreads();
+
+    // 2. Exclusive prefix sum — thread 0 over <= MOE_GROUP_MAX_EXPERTS shared
+    //    ints (negligible). cnt[e] ends as expert e's row-range start.
+    if (tid == 0) {
         for (int e = 1; e <= nE; ++e) {
             cnt[e] += cnt[e - 1];
         }
@@ -107,18 +115,16 @@ extern "C" __global__ void moe_group_build(
     }
     __syncthreads();
 
-    // 3. Stable scatter — thread 0, ascending `i`, so the within-expert order
-    //    matches the CPU counting-sort golden bit-for-bit.
-    if (tid == 0) {
-        for (int i = 0; i < R; ++i) {
-            const int e = expIdx[i];
-            if (e < 0 || e >= nE) {
-                continue;
-            }
-            const int pos  = cursor[e]++;
-            rowSrcTok[pos] = (K > 0) ? (i / K) : 0;  // assignment i -> token t
-            rowKw[pos]     = kw[i];
-            asnToRow[i]    = pos;                     // inverse permutation
+    // 3. Scatter — parallel; each assignment claims its row via an atomic
+    //    cursor bump (within-expert order = claim order, see the v3 note).
+    for (int i = tid; i < R; i += nthreads) {
+        const int e = expIdx[i];
+        if (e < 0 || e >= nE) {
+            continue;
         }
+        const int pos  = atomicAdd(&cursor[e], 1);
+        rowSrcTok[pos] = (K > 0) ? (i / K) : 0;      // assignment i -> token t
+        rowKw[pos]     = kw[i];
+        asnToRow[i]    = pos;                         // inverse permutation
     }
 }

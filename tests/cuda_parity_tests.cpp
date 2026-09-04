@@ -2950,12 +2950,15 @@ TEST(cuda_paged_attention_v2_decode_parity) {
 // M-Cuda.MoeGroup Sub-Step A — device token-grouping build vs CPU golden.
 //
 // moe_group_build turns flat per-assignment routing (expIdx[R], kw[R],
-// R = T*K) into the offset table + stable permutation a grouped-by-expert
-// GEMM consumes: expOffset[nE+1] (exclusive prefix sum), rowSrcTok[R]
-// (source token per compacted row), rowKw[R] (router weight per compacted
-// row). The CPU reference is a plain stable counting sort — the kernel's v1
-// visits assignments in ascending index order, so the two match exactly
-// (offsets, permutation and gathered weights, not just within fp tolerance).
+// R = T*K) into the offset table + permutation a grouped-by-expert GEMM
+// consumes: expOffset[nE+1] (exclusive prefix sum), rowSrcTok[R] (source
+// token per compacted row), rowKw[R] (router weight per compacted row).
+// v3 (5.21.11) scatters block-parallel via atomics, so the WITHIN-EXPERT row
+// order is no longer the stable ascending-index order; every consumer is
+// order-agnostic (rows run the GEMM independently, the accumulator scatter
+// is asnToRow-driven in fixed k order), so the checks below verify the
+// permutation PROPERTIES exactly: offsets vs the CPU histogram, bijection,
+// expert-range membership, and per-assignment payload consistency.
 namespace {
 
 void checkMoeGroupParity(std::size_t T, std::size_t nExperts, std::size_t K,
@@ -2984,27 +2987,14 @@ void checkMoeGroupParity(std::size_t T, std::size_t nExperts, std::size_t K,
         kw[i]     = g.next();                                // any finite weight
     }
 
-    // CPU golden: stable counting sort.
+    // CPU golden: histogram + exclusive prefix sum (the offsets are exactly
+    // deterministic; the within-expert order is checked by property below).
     std::vector<std::int32_t> refOffset(nExperts + 1, 0);
     for (std::size_t i = 0; i < R; ++i) {
         refOffset[expIdx[i] + 1] += 1;
     }
     for (std::size_t e = 1; e <= nExperts; ++e) {
         refOffset[e] += refOffset[e - 1];
-    }
-    std::vector<std::int32_t> refRowTok(R, 0);
-    std::vector<float>        refRowKw(R, 0.0f);
-    std::vector<std::int32_t> refAsnToRow(R, -1);
-    {
-        std::vector<std::int32_t> cursor(refOffset.begin(),
-                                         refOffset.begin() + nExperts);
-        for (std::size_t i = 0; i < R; ++i) {
-            const std::int32_t e = expIdx[i];
-            const std::int32_t pos = cursor[e]++;
-            refRowTok[pos] = static_cast<std::int32_t>(i / K);
-            refRowKw[pos]  = kw[i];
-            refAsnToRow[i] = pos;
-        }
     }
 
     // Device run.
@@ -3024,7 +3014,7 @@ void checkMoeGroupParity(std::size_t T, std::size_t nExperts, std::size_t K,
     kern.setValue(6, static_cast<std::int32_t>(R));
     kern.setValue(7, static_cast<std::int32_t>(nExperts));
     kern.setValue(8, static_cast<std::int32_t>(K));
-    kern.launch(ctx.stream(), 1, 1, 1, 1, 1, 1);
+    kern.launch(ctx.stream(), 1, 1, 1, 256, 1, 1);   // prod launch config
     ops.flush();
 
     auto gotOffset = fromDeviceI32(ops, dOffset.get(), nExperts + 1);
@@ -3032,19 +3022,24 @@ void checkMoeGroupParity(std::size_t T, std::size_t nExperts, std::size_t K,
     auto gotRowKw  = fromDevice   (ops, dRowKw.get(),  R);
     auto gotAsnRow = fromDeviceI32(ops, dAsnRow.get(), R);
 
+    // Offsets: exactly the CPU histogram (order-independent, deterministic).
     for (std::size_t e = 0; e <= nExperts; ++e) {
         EXPECT_EQ(gotOffset[e], refOffset[e]);
     }
     EXPECT_EQ(gotOffset[nExperts], static_cast<std::int32_t>(R));
-    for (std::size_t r = 0; r < R; ++r) {
-        EXPECT_EQ(gotRowTok[r], refRowTok[r]);
-        EXPECT_NEAR(gotRowKw[r], refRowKw[r], 0.0f);
-    }
-    // Inverse-permutation consistency: asnToRow is a bijection [0,R) and
-    // rowSrcTok[asnToRow[i]] == i/K (the assignment's source token).
+    // Permutation properties: asnToRow is a bijection into [0,R); every
+    // assignment lands inside ITS expert's row range; the payload at its row
+    // matches exactly (source token + untouched router weight bits).
+    std::vector<std::uint8_t> seen(R, 0);
     for (std::size_t i = 0; i < R; ++i) {
-        EXPECT_EQ(gotAsnRow[i], refAsnToRow[i]);
-        EXPECT_EQ(gotRowTok[gotAsnRow[i]], static_cast<std::int32_t>(i / K));
+        const std::int32_t pos = gotAsnRow[i];
+        EXPECT_TRUE(pos >= 0 && pos < static_cast<std::int32_t>(R));
+        EXPECT_TRUE(seen[pos] == 0);
+        seen[pos] = 1;
+        const std::int32_t e = expIdx[i];
+        EXPECT_TRUE(pos >= refOffset[e] && pos < refOffset[e + 1]);
+        EXPECT_EQ(gotRowTok[pos], static_cast<std::int32_t>(i / K));
+        EXPECT_NEAR(gotRowKw[pos], kw[i], 0.0f);
     }
     std::printf("[moe-group-build] T=%zu nExp=%zu K=%zu R=%zu OK\n",
                 T, nExperts, K, R);
