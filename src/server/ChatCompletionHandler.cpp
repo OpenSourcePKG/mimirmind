@@ -370,6 +370,11 @@ void ChatCompletionHandler::handle(const httplib::Request& req,
     try {
         body = json::parse(req.body);
     } catch (const std::exception& e) {
+        // Log the reason server-side too — a client stuck in a 400 retry
+        // loop is otherwise undiagnosable from the prod logs (8.19.9 field
+        // lesson: the response body never reaches the operator).
+        MM_LOG_WARN("server", "chat.completions 400: invalid JSON: {}",
+                    e.what());
         sendError(res, 400, "invalid_request_error",
                   std::string{"invalid JSON: "} + e.what());
         return;
@@ -380,9 +385,12 @@ void ChatCompletionHandler::handle(const httplib::Request& req,
         cr = parseChatRequest(body);
     } catch (const ChatRequestError& e) {
         // Malformed field value -> 400 with the offending field in `param`.
+        MM_LOG_WARN("server", "chat.completions 400: {} (param={})",
+                    e.what(), e.param());
         sendError(res, 400, "invalid_request_error", e.what(), e.param());
         return;
     } catch (const std::exception& e) {
+        MM_LOG_WARN("server", "chat.completions 400: {}", e.what());
         sendError(res, 400, "invalid_request_error", e.what());
         return;
     }
