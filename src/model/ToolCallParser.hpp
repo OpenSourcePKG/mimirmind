@@ -53,6 +53,24 @@ public:
     [[nodiscard]] static std::vector<ToolCall>
     parseQwenXml(std::string_view text, std::span<const ToolSpec> specs);
 
+    /// 8.19.9 — same dialect WITHOUT the `<tool_call>` envelope: under
+    /// pressure (repeated error tool_responses) Qwen3.6 emits the bare
+    /// `<function=NAME>…</function>` body, often with a dangling closing
+    /// `</tool_call>` at the end. Same failure class as the bare-JSON leak
+    /// (ffb6a4f): envelope dropped, payload kept. Guard rails: a call is
+    /// accepted only when NAME matches an offered tool in `specs`, and
+    /// `<function=` occurrences inside ```fenced``` code blocks are ignored
+    /// (documentation, not a call). Dangling closers are simply never part
+    /// of a parsed span.
+    [[nodiscard]] static std::vector<ToolCall>
+    parseQwenXmlBare(std::string_view text, std::span<const ToolSpec> specs);
+
+    /// Cheap pre-check for `parseQwenXmlBare`: `text` contains
+    /// `<function=NAME` for at least one offered tool.
+    [[nodiscard]] static bool
+    looksLikeBareQwenXmlCall(std::string_view          text,
+                             std::span<const ToolSpec> specs) noexcept;
+
     /// Gemma 4: one or more blocks in Gemma's custom tool-call DSL
     ///   <|tool_call>call:NAME{key:VALUE,key2:VALUE2,...}<tool_call|>
     /// where VALUE is a Gemma-quoted string `<|"|>text<|"|>` (a plain

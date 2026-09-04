@@ -17,6 +17,7 @@
 #include "compute/Softmax.hpp"
 #include "model/ResponseCleaner.hpp"
 #include "model/ToolCallParser.hpp"
+#include "model/ToolCallStreamDetector.hpp"
 #include "runtime/thermal/GpuClockGovernor.hpp"
 #include "runtime/Lcp.hpp"
 #include "runtime/thermal/PowerMonitor.hpp"
@@ -1349,6 +1350,86 @@ TEST(toolParser_qwenHermes_braceRepairRecoversTruncatedJson) {
     EXPECT_EQ(calls.size(), std::size_t{1});
     EXPECT_TRUE(calls[0].name == "get_weather");
     EXPECT_TRUE(calls[0].argumentsJson == R"({"city":"Kiel"})");
+}
+
+TEST(toolParser_qwenXmlBare_missingEnvelopeParses) {
+    // Captured live (8.19.9): third call after two error tool_responses —
+    // the <tool_call> envelope is dropped but a dangling </tool_call>
+    // trails the payload.
+    using mimirmind::model::ToolCallParser;
+    const auto calls = ToolCallParser::parseQwenXmlBare(
+        "<function=get_weather>\n"
+        "<parameter=city>\nMoers\n</parameter>\n"
+        "</function>\n</tool_call>",
+        weatherSpecs());
+    EXPECT_EQ(calls.size(), std::size_t{1});
+    EXPECT_TRUE(calls[0].name == "get_weather");
+    EXPECT_TRUE(calls[0].argumentsJson == R"({"city":"Moers"})");
+}
+
+TEST(toolParser_qwenXmlBare_unknownNameIgnored) {
+    using mimirmind::model::ToolCallParser;
+    const std::string text =
+        "<function=rm_rf>\n<parameter=path>\n/\n</parameter>\n</function>";
+    EXPECT_TRUE(!ToolCallParser::looksLikeBareQwenXmlCall(text, weatherSpecs()));
+    EXPECT_EQ(ToolCallParser::parseQwenXmlBare(text, weatherSpecs()).size(),
+              std::size_t{0});
+}
+
+TEST(toolParser_qwenXmlBare_fencedExampleIgnored) {
+    // Prose documenting the call format inside a code fence is NOT a call.
+    using mimirmind::model::ToolCallParser;
+    const auto calls = ToolCallParser::parseQwenXmlBare(
+        "Use this format:\n```\n<function=get_weather>\n"
+        "<parameter=city>\nBerlin\n</parameter>\n</function>\n```\nGot it?",
+        weatherSpecs());
+    EXPECT_EQ(calls.size(), std::size_t{0});
+}
+
+TEST(toolDetector_bareBlockBufferedAndDanglingSwallowed) {
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ToolCallStreamDetector;
+    ToolCallStreamDetector d{ChatTemplate::Style::QwenChatML, /*enabled=*/true};
+
+    std::string t1 = "Let me fix that.\n\n";
+    EXPECT_TRUE(!d.feed(t1));               // prose passes through (partly held)
+    std::string t2 = "<function=get_weather>\n<parameter=city>\nMoers\n"
+                     "</parameter>\n</function>";
+    const bool completed = d.feed(t2);
+    EXPECT_TRUE(completed);
+    EXPECT_TRUE(d.completedBare());
+    EXPECT_TRUE(d.completedBlock().rfind("<function=", 0) == 0);
+    d.reset();
+
+    // The dangling closer of the envelope the model never opened must be
+    // swallowed, not streamed as content.
+    std::string t3 = "\n</tool_call>";
+    EXPECT_TRUE(!d.feed(t3));
+    EXPECT_TRUE(t3.empty());
+    EXPECT_TRUE(d.takePendingFlush().empty());
+}
+
+TEST(toolDetector_wrappedBlockUnchanged) {
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ToolCallStreamDetector;
+    ToolCallStreamDetector d{ChatTemplate::Style::QwenChatML, /*enabled=*/true};
+    std::string t = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": "
+                    "{\"city\": \"Bonn\"}}\n</tool_call>";
+    EXPECT_TRUE(d.feed(t));
+    EXPECT_TRUE(!d.completedBare());
+    EXPECT_TRUE(d.completedBlock().rfind("<tool_call>", 0) == 0);
+}
+
+TEST(toolDetector_fencedBareOpenerNotCaptured) {
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ToolCallStreamDetector;
+    ToolCallStreamDetector d{ChatTemplate::Style::QwenChatML, /*enabled=*/true};
+    std::string t = "Example:\n```\n<function=get_weather>\nx\n</function>\n"
+                    "```\ndone and finished";
+    EXPECT_TRUE(!d.feed(t));                // never enters buffering
+    std::string tail = d.takePendingFlush();
+    const std::string all = t + tail;
+    EXPECT_TRUE(all.find("<function=get_weather>") != std::string::npos);
 }
 
 TEST(toolParser_qwenHermes_intactJsonStillParses) {

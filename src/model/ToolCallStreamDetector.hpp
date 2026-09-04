@@ -79,6 +79,16 @@ public:
     /// buffering() — the buffered opener..closer span.
     [[nodiscard]] const std::string& completedBlock() const noexcept { return _buffer; }
 
+    /// 8.19.9: true when the completed block was captured via the BARE
+    /// `<function=` opener (no `<tool_call>` envelope — Qwen3.6 drops it
+    /// under pressure). The buffered span then runs `<function=…</function>`
+    /// and should be parsed with ToolCallParser::parseQwenXmlBare; on a
+    /// parse failure the caller should surface the block as ordinary
+    /// content (the bare capture is speculative), NOT suppress it.
+    /// Valid once feed() returned true / closeOnStop() fired; cleared by
+    /// reset().
+    [[nodiscard]] bool completedBare() const noexcept { return _bare; }
+
     /// Reset to pass-through after handling a completed block, so later
     /// tokens in the same turn are neither buffered nor treated as a new
     /// forced-opener seed.
@@ -95,6 +105,16 @@ private:
 
     std::string_view _open;
     std::string_view _close;
+    // 8.19.9 — bare-payload capture (Qwen styles only, empty otherwise):
+    // `<function=` opens a call whose envelope the model dropped; it closes
+    // at `</function>`, and one dangling `</tool_call>` right after it is
+    // swallowed. Best-effort ``` fence parity gates the bare opener so
+    // fenced documentation is not captured.
+    std::string_view _openBare;
+    std::string_view _closeBare;
+    bool             _bare{false};
+    bool             _inFence{false};
+    bool             _swallowDangling{false};
     bool             _active{false};
     State            _state{State::PassThrough};
     // Held-back tail while scanning for an opener (PassThrough) — may end in

@@ -686,19 +686,31 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                 }
             }
         } else {
+            // 8.19.9 — bare-XML fallback: after repeated error tool_responses
+            // Qwen3.6 drops the <tool_call> envelope but keeps the
+            // <function=…>…</function> payload (often with a dangling
+            // </tool_call> at the end). Same failure class as the bare-JSON
+            // leak (ffb6a4f). Name-gated on the offered tools and fenced
+            // code blocks are ignored, so prose showing an example never
+            // parses as a call.
+            if (model::ToolCallParser::looksLikeBareQwenXmlCall(text, cr.tools)) {
+                toolCalls = model::ToolCallParser::parseQwenXmlBare(text, cr.tools);
+            }
             // Bare-JSON fallback: a reasoning model (Qwen3.6) sometimes emits the
             // call as plain {"name":…,"arguments":…} with no <tool_call> wrapper,
             // which would otherwise leak into content. Run it over the cleaned
             // answer (`text`, already stripped of the <think> reasoning) and gate
             // on the offered tool names so a legit JSON answer is never parsed as
             // a call.
-            std::vector<std::string> toolNames;
-            toolNames.reserve(cr.tools.size());
-            for (const auto& spec : cr.tools) {
-                toolNames.push_back(spec.name);
-            }
-            if (model::ToolCallParser::looksLikeBareJsonToolCall(text, toolNames)) {
-                toolCalls = model::ToolCallParser::parseBareJson(text, toolNames);
+            if (toolCalls.empty()) {
+                std::vector<std::string> toolNames;
+                toolNames.reserve(cr.tools.size());
+                for (const auto& spec : cr.tools) {
+                    toolNames.push_back(spec.name);
+                }
+                if (model::ToolCallParser::looksLikeBareJsonToolCall(text, toolNames)) {
+                    toolCalls = model::ToolCallParser::parseBareJson(text, toolNames);
+                }
             }
         }
     }
@@ -972,10 +984,18 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
             // leaking raw marker text into an agent transcript.
             auto emitToolCallBlock = [&](const std::string& block) -> bool {
                 // Same native-dialect-first, other-dialect-fallback order as
-                // the blocking path (8.19.6).
+                // the blocking path (8.19.6). A block captured via the BARE
+                // `<function=` opener (8.19.9 — envelope dropped) goes
+                // through the name-gated bare parser.
+                const bool bare =
+                    block.rfind("<function=", 0) == 0;
                 const std::vector<model::ToolCall> calls = [&] {
                     if (state->style == model::ChatTemplate::Style::Gemma4) {
                         return model::ToolCallParser::parseGemma(block);
+                    }
+                    if (bare) {
+                        return model::ToolCallParser::parseQwenXmlBare(
+                            block, state->toolSpecs);
                     }
                     const bool xmlNative = state->toolFormat ==
                         model::ChatTemplate::ToolFormat::QwenXml;
@@ -992,6 +1012,16 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                     return parsed;
                 }();
                 if (calls.empty()) {
+                    if (bare) {
+                        // The bare capture is speculative (no envelope): a
+                        // block that fails the name-gated parse is ordinary
+                        // content — surface it instead of suppressing.
+                        return SseEncoder::writeSseEvent(
+                            sink,
+                            SseEncoder::buildContentChunk(
+                                state->respId, state->created,
+                                state->echoModel, block));
+                    }
                     // Unparseable in every dialect — suppress the raw marker
                     // span rather than leaking it as content (mirrors the
                     // blocking path, 8.19.6). Nothing to stream for it.

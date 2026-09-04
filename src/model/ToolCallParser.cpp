@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <utility>
 #include <stdexcept>
 #include <string>
 
@@ -276,57 +277,159 @@ std::vector<ToolCall> ToolCallParser::parseQwen(std::string_view text) {
     return calls;
 }
 
+namespace {
+
+constexpr std::string_view kFunc     = "<function=";
+constexpr std::string_view kFuncEnd  = "</function>";
+constexpr std::string_view kParam    = "<parameter=";
+constexpr std::string_view kParamEnd = "</parameter>";
+
+/// Per-tool parameter-type lookup from the offered schemas:
+/// function.parameters.properties.<key>.type. Missing/unparseable schemas
+/// simply leave every value a string.
+std::string paramTypeFor(std::span<const ToolSpec> specs,
+                         const std::string&        fn,
+                         const std::string&        key) {
+    for (const auto& spec : specs) {
+        if (spec.name != fn) {
+            continue;
+        }
+        const json tool = json::parse(spec.toolJson, /*cb=*/nullptr,
+                                      /*allow_exceptions=*/false);
+        if (tool.is_discarded()) {
+            return {};
+        }
+        const json* props = nullptr;
+        if (tool.contains("function") &&
+            tool["function"].contains("parameters") &&
+            tool["function"]["parameters"].contains("properties")) {
+            props = &tool["function"]["parameters"]["properties"];
+        }
+        if (props != nullptr && props->contains(key) &&
+            (*props)[key].contains("type") &&
+            (*props)[key]["type"].is_string()) {
+            return (*props)[key]["type"].get<std::string>();
+        }
+        return {};
+    }
+    return {};
+}
+
+/// The template writes values as `<parameter=k>\nVALUE\n</parameter>` —
+/// strip exactly one framing newline from each side, preserving interior
+/// (and any additional intentional) whitespace of a multi-line value.
+std::string stripFrame(std::string_view v) {
+    if (!v.empty() && v.front() == '\n') {
+        v.remove_prefix(1);
+    }
+    if (!v.empty() && v.back() == '\n') {
+        v.remove_suffix(1);
+    }
+    return std::string{v};
+}
+
+/// Parse one `<function=NAME>…</function>` span whose "<function=" starts at
+/// `fn` within `scope`. On success fills `out` (id is left to the caller)
+/// and sets `endPos` just past the consumed span (scope end when the closer
+/// is missing — truncation tolerance). Returns false when no parseable
+/// function name is present.
+bool parseFunctionSpan(std::string_view          scope,
+                       std::size_t               fn,
+                       std::span<const ToolSpec> specs,
+                       ToolCall&                 out,
+                       std::size_t&              endPos) {
+    const std::size_t nameStart = fn + kFunc.size();
+    const std::size_t nameEnd   = scope.find('>', nameStart);
+    const std::string name = (nameEnd != std::string_view::npos)
+        ? trimws(scope.substr(nameStart, nameEnd - nameStart))
+        : std::string{};
+    if (name.empty()) {
+        return false;
+    }
+    json args = json::object();
+    std::size_t p = nameEnd + 1;
+    const std::size_t funcEnd = scope.find(kFuncEnd, p);
+    const std::size_t paramsEnd =
+        (funcEnd != std::string_view::npos) ? funcEnd : scope.size();
+    while (true) {
+        const std::size_t ps = scope.find(kParam, p);
+        if (ps == std::string_view::npos || ps >= paramsEnd) {
+            break;
+        }
+        const std::size_t ks = ps + kParam.size();
+        const std::size_t ke = scope.find('>', ks);
+        if (ke == std::string_view::npos) {
+            break;
+        }
+        const std::string key = trimws(scope.substr(ks, ke - ks));
+        const std::size_t vs  = ke + 1;
+        std::size_t ve = scope.find(kParamEnd, vs);
+        // Missing closer (truncation): value runs to the next parameter
+        // opener / function closer / end of scope.
+        std::size_t next = ve;
+        if (ve == std::string_view::npos || ve > paramsEnd) {
+            const std::size_t vNext = scope.find(kParam, vs);
+            ve   = std::min(paramsEnd,
+                            (vNext == std::string_view::npos) ? paramsEnd
+                                                              : vNext);
+            next = ve;
+        } else {
+            next = ve + kParamEnd.size();
+        }
+        if (!key.empty()) {
+            args[key] = coerceXmlParamValue(
+                stripFrame(scope.substr(vs, ve - vs)),
+                paramTypeFor(specs, name, key));
+        }
+        p = next;
+    }
+    out.name          = name;
+    out.argumentsJson = args.dump();
+    endPos = (funcEnd != std::string_view::npos) ? funcEnd + kFuncEnd.size()
+                                                 : scope.size();
+    return true;
+}
+
+/// Byte ranges of ```fenced``` markdown code blocks — a bare <function=…>
+/// inside one is documentation, not a call. Conservative: an unclosed final
+/// fence extends to the end of the text.
+std::vector<std::pair<std::size_t, std::size_t>>
+fencedRanges(std::string_view text) {
+    std::vector<std::pair<std::size_t, std::size_t>> ranges;
+    std::size_t pos = 0;
+    while (true) {
+        const std::size_t open = text.find("```", pos);
+        if (open == std::string_view::npos) {
+            break;
+        }
+        const std::size_t close = text.find("```", open + 3);
+        const std::size_t end   = (close == std::string_view::npos)
+            ? text.size() : close + 3;
+        ranges.emplace_back(open, end);
+        if (close == std::string_view::npos) {
+            break;
+        }
+        pos = end;
+    }
+    return ranges;
+}
+
+bool insideRange(
+        const std::vector<std::pair<std::size_t, std::size_t>>& ranges,
+        std::size_t pos) {
+    for (const auto& [a, b] : ranges) {
+        if (pos >= a && pos < b) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
 std::vector<ToolCall> ToolCallParser::parseQwenXml(
         std::string_view text, std::span<const ToolSpec> specs) {
     std::vector<ToolCall> calls;
-
-    // Per-tool parameter-type lookup from the offered schemas:
-    // function.parameters.properties.<key>.type. Parsed once up front.
-    // Missing/unparseable schemas simply leave every value a string.
-    auto paramType = [&specs](const std::string& fn,
-                              const std::string& key) -> std::string {
-        for (const auto& spec : specs) {
-            if (spec.name != fn) {
-                continue;
-            }
-            const json tool = json::parse(spec.toolJson, /*cb=*/nullptr,
-                                          /*allow_exceptions=*/false);
-            if (tool.is_discarded()) {
-                return {};
-            }
-            const json* props = nullptr;
-            if (tool.contains("function") &&
-                tool["function"].contains("parameters") &&
-                tool["function"]["parameters"].contains("properties")) {
-                props = &tool["function"]["parameters"]["properties"];
-            }
-            if (props != nullptr && props->contains(key) &&
-                (*props)[key].contains("type") &&
-                (*props)[key]["type"].is_string()) {
-                return (*props)[key]["type"].get<std::string>();
-            }
-            return {};
-        }
-        return {};
-    };
-
-    constexpr std::string_view kFunc     = "<function=";
-    constexpr std::string_view kFuncEnd  = "</function>";
-    constexpr std::string_view kParam    = "<parameter=";
-    constexpr std::string_view kParamEnd = "</parameter>";
-
-    // The template writes values as `<parameter=k>\nVALUE\n</parameter>` —
-    // strip exactly one framing newline from each side, preserving interior
-    // (and any additional intentional) whitespace of a multi-line value.
-    const auto stripFrame = [](std::string_view v) -> std::string {
-        if (!v.empty() && v.front() == '\n') {
-            v.remove_prefix(1);
-        }
-        if (!v.empty() && v.back() == '\n') {
-            v.remove_suffix(1);
-        }
-        return std::string{v};
-    };
 
     std::size_t pos = 0;
     while (true) {
@@ -345,53 +448,10 @@ std::vector<ToolCall> ToolCallParser::parseQwenXml(
         // block) is not this dialect — skip it.
         const std::size_t fn = body.find(kFunc);
         if (fn != std::string_view::npos) {
-            const std::size_t nameStart = fn + kFunc.size();
-            const std::size_t nameEnd   = body.find('>', nameStart);
-            const std::string name = (nameEnd != std::string_view::npos)
-                ? trimws(body.substr(nameStart, nameEnd - nameStart))
-                : std::string{};
-            if (!name.empty()) {
-                json args = json::object();
-                std::size_t p = nameEnd + 1;
-                const std::size_t funcEnd = body.find(kFuncEnd, p);
-                const std::size_t paramsEnd =
-                    (funcEnd != std::string_view::npos) ? funcEnd : body.size();
-                while (true) {
-                    const std::size_t ps = body.find(kParam, p);
-                    if (ps == std::string_view::npos || ps >= paramsEnd) {
-                        break;
-                    }
-                    const std::size_t ks = ps + kParam.size();
-                    const std::size_t ke = body.find('>', ks);
-                    if (ke == std::string_view::npos) {
-                        break;
-                    }
-                    const std::string key = trimws(body.substr(ks, ke - ks));
-                    const std::size_t vs  = ke + 1;
-                    std::size_t ve = body.find(kParamEnd, vs);
-                    // Missing closer (truncation): value runs to the next
-                    // parameter opener / function closer / end of body.
-                    std::size_t next = ve;
-                    if (ve == std::string_view::npos || ve > paramsEnd) {
-                        const std::size_t vNext = body.find(kParam, vs);
-                        ve   = std::min(paramsEnd,
-                                        (vNext == std::string_view::npos)
-                                            ? paramsEnd : vNext);
-                        next = ve;
-                    } else {
-                        next = ve + kParamEnd.size();
-                    }
-                    if (!key.empty()) {
-                        args[key] = coerceXmlParamValue(
-                            stripFrame(body.substr(vs, ve - vs)),
-                            paramType(name, key));
-                    }
-                    p = next;
-                }
-                ToolCall call;
-                call.id            = "call_" + std::to_string(calls.size());
-                call.name          = name;
-                call.argumentsJson = args.dump();
+            ToolCall    call;
+            std::size_t spanEnd = 0;
+            if (parseFunctionSpan(body, fn, specs, call, spanEnd)) {
+                call.id = "call_" + std::to_string(calls.size());
                 calls.push_back(std::move(call));
             }
         }
@@ -400,6 +460,62 @@ std::vector<ToolCall> ToolCallParser::parseQwenXml(
             break;
         }
         pos = close + kClose.size();
+    }
+
+    return calls;
+}
+
+bool ToolCallParser::looksLikeBareQwenXmlCall(
+        std::string_view text, std::span<const ToolSpec> specs) noexcept {
+    std::size_t fn = text.find(kFunc);
+    while (fn != std::string_view::npos) {
+        const std::string_view after = text.substr(fn + kFunc.size());
+        for (const auto& spec : specs) {
+            if (!spec.name.empty() &&
+                after.substr(0, spec.name.size()) == spec.name) {
+                return true;
+            }
+        }
+        fn = text.find(kFunc, fn + kFunc.size());
+    }
+    return false;
+}
+
+std::vector<ToolCall> ToolCallParser::parseQwenXmlBare(
+        std::string_view text, std::span<const ToolSpec> specs) {
+    std::vector<ToolCall> calls;
+
+    const auto isOffered = [&specs](const std::string& name) {
+        for (const auto& spec : specs) {
+            if (spec.name == name) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const auto fences = fencedRanges(text);
+
+    std::size_t pos = 0;
+    while (true) {
+        const std::size_t fn = text.find(kFunc, pos);
+        if (fn == std::string_view::npos) {
+            break;
+        }
+        if (insideRange(fences, fn)) {
+            pos = fn + kFunc.size();
+            continue;
+        }
+        ToolCall    call;
+        std::size_t spanEnd = 0;
+        if (parseFunctionSpan(text, fn, specs, call, spanEnd) &&
+            isOffered(call.name)) {
+            call.id = "call_" + std::to_string(calls.size());
+            calls.push_back(std::move(call));
+            pos = spanEnd;
+        } else {
+            pos = fn + kFunc.size();
+        }
     }
 
     return calls;
