@@ -249,7 +249,22 @@ struct GpuMatmul::Impl {
     void*  _xFp8{nullptr};        // staged E4M3 activations (grows on demand)
     std::size_t _xFp8Bytes{0};
     void*  _xScaleDev{nullptr};   // 2 floats [scale, invScale] for X
-    void*  _amaxDev{nullptr};     // 1 float amax scratch
+    void*  _amaxDev{nullptr};     // 1 float amax scratch (kept zeroed by
+                                  // scale_from_amax's consume-and-reset)
+    // 5.18.10.4: cached cuBLASLt plans keyed by packed (N, M, K). The FP8
+    // decode/prefill path issues 72-144 narrow GEMMs per forward; recreating
+    // the matmul desc + three layouts (and letting Lt re-run its internal
+    // heuristic) per call is pure host time that starves the stream. Static
+    // attributes (transposes, scale modes, the FIXED X-scale pointer) are set
+    // once at plan build; only the per-weight A_SCALE_POINTER is updated per
+    // call. Numerics are untouched — bit-identical.
+    struct LtPlan {
+        cublasLtMatmulDesc_t   op{nullptr};
+        cublasLtMatrixLayout_t aL{nullptr};
+        cublasLtMatrixLayout_t bL{nullptr};
+        cublasLtMatrixLayout_t cL{nullptr};
+    };
+    std::unordered_map<std::uint64_t, LtPlan> _ltPlanCache;
 
     ~Impl() {
         for (auto& kv : _fp8WeightCache) {
@@ -262,6 +277,12 @@ struct GpuMatmul::Impl {
         }
         for (auto& kv : _bf16FromF32Cache) {
             if (kv.second != nullptr) { cudaFree(kv.second); }
+        }
+        for (auto& kv : _ltPlanCache) {
+            if (kv.second.cL != nullptr) { cublasLtMatrixLayoutDestroy(kv.second.cL); }
+            if (kv.second.bL != nullptr) { cublasLtMatrixLayoutDestroy(kv.second.bL); }
+            if (kv.second.aL != nullptr) { cublasLtMatrixLayoutDestroy(kv.second.aL); }
+            if (kv.second.op != nullptr) { cublasLtMatmulDescDestroy(kv.second.op); }
         }
         if (_amaxDev != nullptr)     { cudaFree(_amaxDev); }
         if (_xScaleDev != nullptr)   { cudaFree(_xScaleDev); }
@@ -958,10 +979,15 @@ bool GpuMatmul::cublasFp8Matmul(const void*  W,
         _pimpl->_xScaleDev = nullptr;
         return false;
     }
-    if (_pimpl->_amaxDev == nullptr
-            && cudaMalloc(&_pimpl->_amaxDev, sizeof(float)) != cudaSuccess) {
-        _pimpl->_amaxDev = nullptr;
-        return false;
+    if (_pimpl->_amaxDev == nullptr) {
+        if (cudaMalloc(&_pimpl->_amaxDev, sizeof(float)) != cudaSuccess) {
+            _pimpl->_amaxDev = nullptr;
+            return false;
+        }
+        // Zero ONCE — scale_from_amax consume-and-resets it after every use,
+        // so the per-call cudaMemsetAsync launches are gone (5.18.10.4).
+        cudaMemsetAsync(_pimpl->_amaxDev, 0, sizeof(float),
+                        _ctx.stream().handle());
     }
 
     cudaStream_t stream = _ctx.stream().handle();
@@ -984,7 +1010,6 @@ bool GpuMatmul::cublasFp8Matmul(const void*  W,
             return false;
         }
         void* wInv = static_cast<char*>(wScale) + sizeof(float);
-        cudaMemsetAsync(_pimpl->_amaxDev, 0, sizeof(float), stream);
         _pimpl->_amaxBf16Kernel.setPtr  (0, W);
         _pimpl->_amaxBf16Kernel.setPtr  (1, _pimpl->_amaxDev);
         _pimpl->_amaxBf16Kernel.setValue(2, static_cast<std::int64_t>(wElems));
@@ -1020,7 +1045,6 @@ bool GpuMatmul::cublasFp8Matmul(const void*  W,
         _pimpl->_xFp8Bytes = xElems;
     }
     void* xInv = static_cast<char*>(_pimpl->_xScaleDev) + sizeof(float);
-    cudaMemsetAsync(_pimpl->_amaxDev, 0, sizeof(float), stream);
     _pimpl->_amaxF32Kernel.setPtr  (0, X);
     _pimpl->_amaxF32Kernel.setPtr  (1, _pimpl->_amaxDev);
     _pimpl->_amaxF32Kernel.setValue(2, static_cast<std::int64_t>(xElems));
@@ -1038,66 +1062,77 @@ bool GpuMatmul::cublasFp8Matmul(const void*  W,
                                       kLocal, 1, 1);
 
     // ---- cuBLASLt per-tensor FP8 matmul (same col-major layout as BF16) ------
+    // 5.18.10.4: plan (desc + layouts) cached by (N, M, K) — see Impl::LtPlan.
+    // Only the per-weight A scale pointer changes between calls.
     const int nI = static_cast<int>(N);
     const int mI = static_cast<int>(M);
     const int kI = static_cast<int>(K);
-    cublasLtMatmulDesc_t   op = nullptr;
-    cublasLtMatrixLayout_t aL = nullptr, bL = nullptr, cL = nullptr;
-    const cublasOperation_t opT = CUBLAS_OP_T;
-    const cublasOperation_t opN = CUBLAS_OP_N;
-    const std::int32_t scaleMode = CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
-
-    bool ok =
-        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F)
-            == CUBLAS_STATUS_SUCCESS
-        && cublasLtMatmulDescSetAttribute(
-               op, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT))
-            == CUBLAS_STATUS_SUCCESS
-        && cublasLtMatmulDescSetAttribute(
-               op, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN))
-            == CUBLAS_STATUS_SUCCESS
-        && cublasLtMatmulDescSetAttribute(
-               op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &scaleMode, sizeof(scaleMode))
-            == CUBLAS_STATUS_SUCCESS
-        && cublasLtMatmulDescSetAttribute(
-               op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &scaleMode, sizeof(scaleMode))
-            == CUBLAS_STATUS_SUCCESS
-        && cublasLtMatmulDescSetAttribute(
-               op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &wScale, sizeof(wScale))
-            == CUBLAS_STATUS_SUCCESS
-        && cublasLtMatmulDescSetAttribute(
-               op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-               &_pimpl->_xScaleDev, sizeof(void*))
-            == CUBLAS_STATUS_SUCCESS
-        && cublasLtMatrixLayoutCreate(&aL, CUDA_R_8F_E4M3, kI, nI, kI)
-            == CUBLAS_STATUS_SUCCESS
-        && cublasLtMatrixLayoutCreate(&bL, CUDA_R_8F_E4M3, kI, mI, kI)
-            == CUBLAS_STATUS_SUCCESS
-        && cublasLtMatrixLayoutCreate(&cL, CUDA_R_32F, nI, mI, nI)
-            == CUBLAS_STATUS_SUCCESS;
-
-    if (ok) {
-        const float alpha = 1.0f;
-        const float beta  = 0.0f;
-        const cublasStatus_t st = cublasLtMatmul(
-            _pimpl->_ltHandle, op,
-            &alpha,
-            wData,         aL,
-            _pimpl->_xFp8, bL,
-            &beta,
-            Y,             cL,
-            Y,             cL,
-            nullptr,
-            _pimpl->_ltWorkspace, _pimpl->_ltWorkspaceBytes,
-            stream);
-        ok = (st == CUBLAS_STATUS_SUCCESS);
+    const std::uint64_t planKey = (static_cast<std::uint64_t>(N & 0xFFFFFu) << 40)
+                                | (static_cast<std::uint64_t>(M & 0xFFFFFu) << 20)
+                                |  static_cast<std::uint64_t>(K & 0xFFFFFu);
+    auto pit = _pimpl->_ltPlanCache.find(planKey);
+    if (pit == _pimpl->_ltPlanCache.end()) {
+        Impl::LtPlan p{};
+        const cublasOperation_t opT = CUBLAS_OP_T;
+        const cublasOperation_t opN = CUBLAS_OP_N;
+        const std::int32_t scaleMode = CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+        const bool built =
+            cublasLtMatmulDescCreate(&p.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)
+                == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatmulDescSetAttribute(
+                   p.op, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT))
+                == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatmulDescSetAttribute(
+                   p.op, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN))
+                == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatmulDescSetAttribute(
+                   p.op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &scaleMode,
+                   sizeof(scaleMode))
+                == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatmulDescSetAttribute(
+                   p.op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &scaleMode,
+                   sizeof(scaleMode))
+                == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatmulDescSetAttribute(
+                   p.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                   &_pimpl->_xScaleDev, sizeof(void*))
+                == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatrixLayoutCreate(&p.aL, CUDA_R_8F_E4M3, kI, nI, kI)
+                == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatrixLayoutCreate(&p.bL, CUDA_R_8F_E4M3, kI, mI, kI)
+                == CUBLAS_STATUS_SUCCESS
+            && cublasLtMatrixLayoutCreate(&p.cL, CUDA_R_32F, nI, mI, nI)
+                == CUBLAS_STATUS_SUCCESS;
+        if (!built) {
+            if (p.cL != nullptr) { cublasLtMatrixLayoutDestroy(p.cL); }
+            if (p.bL != nullptr) { cublasLtMatrixLayoutDestroy(p.bL); }
+            if (p.aL != nullptr) { cublasLtMatrixLayoutDestroy(p.aL); }
+            if (p.op != nullptr) { cublasLtMatmulDescDestroy(p.op); }
+            return false;
+        }
+        pit = _pimpl->_ltPlanCache.emplace(planKey, p).first;
+    }
+    Impl::LtPlan& plan = pit->second;
+    if (cublasLtMatmulDescSetAttribute(
+            plan.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &wScale,
+            sizeof(wScale)) != CUBLAS_STATUS_SUCCESS) {
+        return false;
     }
 
-    if (cL != nullptr) { cublasLtMatrixLayoutDestroy(cL); }
-    if (bL != nullptr) { cublasLtMatrixLayoutDestroy(bL); }
-    if (aL != nullptr) { cublasLtMatrixLayoutDestroy(aL); }
-    if (op != nullptr) { cublasLtMatmulDescDestroy(op); }
-    return ok;
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    const cublasStatus_t st = cublasLtMatmul(
+        _pimpl->_ltHandle, plan.op,
+        &alpha,
+        wData,         plan.aL,
+        _pimpl->_xFp8, plan.bL,
+        &beta,
+        Y,             plan.cL,
+        Y,             plan.cL,
+        nullptr,
+        _pimpl->_ltWorkspace, _pimpl->_ltWorkspaceBytes,
+        stream);
+    return st == CUBLAS_STATUS_SUCCESS;
 }
 
 void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,

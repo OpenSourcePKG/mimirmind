@@ -63,13 +63,17 @@ void amax_bf16(const __nv_bfloat16* __restrict__ src, float* __restrict__ outMax
 // From a device amax, derive the cuBLAS per-tensor scale (amax/448, the
 // dequant multiplier cuBLAS applies) and its inverse (the quant multiplier).
 // Kept device-side so the decode hot path never D2H-syncs for the X scale.
-extern "C" __global__ void scale_from_amax(const float* __restrict__ amax,
+// 5.18.10.4: consumes-and-RESETS amax (back to 0) so the next amax pass needs
+// no separate cudaMemsetAsync launch — the caller zeroes the buffer once at
+// allocation and this kernel keeps it primed thereafter.
+extern "C" __global__ void scale_from_amax(float* __restrict__ amax,
                                            float* __restrict__ scale,
                                            float* __restrict__ invScale) {
     const float a = *amax;
     const float s = a / 448.0f;
     *scale    = s;
     *invScale = (a > 0.0f) ? (448.0f / a) : 0.0f;
+    *amax     = 0.0f;
 }
 
 extern "C" __global__ __launch_bounds__(CUBLAS_FP8_LOCAL)
