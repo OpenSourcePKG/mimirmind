@@ -319,6 +319,8 @@ ChatRequest parseChatRequest(const json& body) {
     // OpenAI: max_completion_tokens (current) overrides max_tokens (legacy).
     readSize(body, "max_tokens", req.maxTokens);
     readSize(body, "max_completion_tokens", req.maxTokens);
+    readSize(body, "n", req.n);                       // 8.19.12; 0 => 1 below
+    if (req.n == 0) { req.n = 1; }
     readSize(body, "top_k", req.topK);
     req.hasTopK = body.contains("top_k") && !body["top_k"].is_null();
 

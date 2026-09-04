@@ -567,6 +567,42 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             : (target->engine == _dispatcher.defaultEnginePtr() ? _cfg.batcher
                                                                 : nullptr);
     const bool useBatcher = activeBatcher != nullptr;
+
+    // 8.19.12 — OpenAI `n`: extra choices run as PARALLEL batcher
+    // submissions (continuous batching folds them into the same decode
+    // batch), submitted BEFORE the blocking choice-0 wait so all n decode
+    // together. v1 scope: blocking + batcher path + no tools; a fixed seed
+    // is varied per choice (seed+i) so choices genuinely differ, seed==0
+    // keeps the per-slot random_device draw.
+    constexpr std::size_t kMaxN = 8;
+    if (cr.n > kMaxN) {
+        sendError(res, 400, "invalid_request_error",
+                  "n must be between 1 and 8");
+        return;
+    }
+    if (cr.n > 1 && !cr.tools.empty()) {
+        sendError(res, 400, "invalid_request_error",
+                  "n > 1 is not supported together with tools");
+        return;
+    }
+    if (cr.n > 1 && !useBatcher) {
+        sendError(res, 400, "invalid_request_error",
+                  "n > 1 requires the continuous-batching serving path");
+        return;
+    }
+    std::vector<std::shared_ptr<runtime::serving::ServingRequest>> extraReqs;
+    if (useBatcher && cr.n > 1) {
+        for (std::size_t i = 1; i < cr.n; ++i) {
+            runtime::GenerateParams pi = params;
+            if (pi.sampling.seed != 0) {
+                pi.sampling.seed += i;
+            }
+            extraReqs.push_back(activeBatcher->submit(
+                promptIds, params.maxNewTokens, stopIds, tenant,
+                pi.sampling));
+        }
+    }
+
     if (useBatcher) {
         try {
             generated = runViaBatcher(*activeBatcher, promptIds, params,
@@ -886,6 +922,58 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         {"usage", std::move(usage)},
     };
 
+    // 8.19.12 — collect the extra `n` choices (parallel batcher submissions
+    // made before the choice-0 wait). Plain text completions by scope (tools
+    // were 400'd for n>1); each gets the same trailing-stop strip, and its
+    // completion tokens are folded into usage.
+    for (std::size_t ci = 0; ci < extraReqs.size(); ++ci) {
+        auto toks = extraReqs[ci]->waitAll();
+        if (extraReqs[ci]->tenantQuotaExceeded) {
+            _metrics.recordQuotaRejected(tenant);
+            res.set_header("Retry-After", "1");
+            sendError(res, 429, "rate_limit_exceeded",
+                      "tenant quota exceeded while expanding n choices");
+            return;
+        }
+        if (extraReqs[ci]->overloaded) {
+            _metrics.recordOverloadRejected(tenant);
+            res.set_header("Retry-After", "1");
+            sendError(res, 503, "service_unavailable",
+                      "server overloaded while expanding n choices");
+            return;
+        }
+        if (!extraReqs[ci]->error.empty()) {
+            _metrics.recordError(tenant);
+            sendError(res, 500, "server_error",
+                      "n-choice generation failed: " + extraReqs[ci]->error);
+            return;
+        }
+        bool choiceHitStop = false;
+        while (!toks.empty() && isStop(toks.back())) {
+            toks.pop_back();
+            choiceHitStop = true;
+        }
+        const std::string text = tok.decode(toks, /*skipSpecial=*/true);
+        const std::string choiceFinish =
+            (!choiceHitStop && toks.size() >= params.maxNewTokens) ? "length"
+                                                                   : "stop";
+        response["choices"].push_back(json{
+            {"index", static_cast<int>(ci + 1)},
+            {"message", {{"role", "assistant"}, {"content", text}}},
+            {"finish_reason", choiceFinish},
+        });
+        if (response["usage"].contains("completion_tokens")) {
+            response["usage"]["completion_tokens"] =
+                response["usage"]["completion_tokens"].get<std::int64_t>()
+                + static_cast<std::int64_t>(toks.size());
+        }
+        if (response["usage"].contains("total_tokens")) {
+            response["usage"]["total_tokens"] =
+                response["usage"]["total_tokens"].get<std::int64_t>()
+                + static_cast<std::int64_t>(toks.size());
+        }
+    }
+
     // Spec-dec accept-rate is the headline diagnostic for M9.11.4 — it
     // tells operators whether the draft is earning its keep. Suffix
     // stays empty when spec-dec was disabled or fell through.
@@ -913,6 +1001,13 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
 
 void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                                           httplib::Response& res) {
+    // 8.19.12 v1 scope: multiple choices are blocking-only (per-choice SSE
+    // index multiplexing is a separate increment).
+    if (cr.n > 1) {
+        sendError(res, 400, "invalid_request_error",
+                  "n > 1 is not supported with stream=true");
+        return;
+    }
     auto target = _dispatcher.resolveTarget(cr.model, res);
     if (!target) return;
     auto& engine = *target->engine;

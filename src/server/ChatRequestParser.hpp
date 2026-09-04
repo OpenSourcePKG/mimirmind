@@ -59,6 +59,12 @@ struct ChatRequest {
     std::uint64_t                   seed{0};
     std::vector<std::string>        stopStrings;
     bool                            stream{false};
+    // 8.19.12 — OpenAI `n`: number of choices to generate for this request.
+    // v1 supports n>1 only on the blocking continuous-batching path without
+    // tools (the handler 400s otherwise); the extra choices run as parallel
+    // batcher submissions. Client-side self-consistency checks are the
+    // motivating consumer (sample n=3, compare divergence).
+    std::size_t                     n{1};
     // OpenAI `stream_options.include_usage`: when streaming, emit a terminal
     // chunk carrying `usage` (with an empty `choices`) just before [DONE].
     bool                            includeUsage{false};
