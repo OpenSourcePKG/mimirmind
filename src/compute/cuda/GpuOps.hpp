@@ -253,18 +253,23 @@ public:
                                    const float* a0, float* state, float* out,
                                    std::size_t T, std::size_t H, std::size_t S,
                                    std::size_t chunkSize) override;
-    // M-Cuda.Batch Cat C-P1: batched chunked-prefill variants — nSeq
+    // M-Cuda.Batch Cat C-P1 / 5.21.9: batched chunked-prefill variants — nSeq
     // sequences in one launch (grid.y = nSeq), each with its own slabs and
-    // per-sequence state/scratch. CUDA-only, parity-gated.
+    // per-sequence state/scratch. shape.seqT/seqOff enable the serving RAGGED
+    // token-major layout (nullptr => uniform T). CUDA-only, parity-gated.
     void deltanetChunkCumGateBatchedAsync(const float* gLog, float* gCum,
-                                          std::size_t nSeq, std::size_t T,
-                                          std::size_t H, std::size_t chunkSize) override;
+                                          const GdnBatchedShape& shape,
+                                          std::size_t chunkSize) override;
+    void deltanetKktSolveInverseBatchedAsync(const float* k, const float* beta,
+                                             float* a0,
+                                             const GdnBatchedShape& shape,
+                                             std::size_t chunkSize) override;
     void deltanetChunkForwardBatchedAsync(const float* q, const float* k,
                                           const float* v, const float* gCum,
                                           const float* beta, const float* a0,
                                           float* state, float* out,
-                                          std::size_t nSeq, std::size_t T,
-                                          std::size_t H, std::size_t S,
+                                          float* scratch,
+                                          const GdnBatchedShape& shape,
                                           std::size_t chunkSize) override;
     void deltanetKktSolveInverseAsync(const float* k, const float* beta,
                                       float* a0, std::size_t T, std::size_t H,

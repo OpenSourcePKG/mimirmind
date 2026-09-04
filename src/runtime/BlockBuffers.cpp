@@ -108,10 +108,23 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         b.ssmBeta      = ops.allocate(maxT * hV * f);
         b.ssmGate      = ops.allocate(maxT * hV * f);
         // Chunked-prefill (T>1) scratch: K0 cumgate output + K1 inverse a0.
+        // 5.21.9 serving (perSeqConvInput): the batched/ragged pipeline uses
+        // the COMPACT a0 layout [sum(ceil(seqT/C)), H, C, C]. Every slot costs
+        // at least one chunk block, so size for nChunksMax + the max slot
+        // count (64, the serving maxBatch ceiling — the backend falls back to
+        // the AR path if a forward would exceed this capacity). The K2
+        // worker-pool kernel additionally needs a per-worker scratch
+        // (kGdnChunkFwdWorkers * 5 * C * S floats), independent of nSeq.
         const std::size_t cChunk     = 64;
-        const std::size_t nChunksMax = (maxT + cChunk - 1) / cChunk;
+        const std::size_t nChunksMax = (maxT + cChunk - 1) / cChunk
+                                     + (perSeqConvInput ? 64 : 0);
         b.ssmGCum = ops.allocate(maxT * hV * f);
         b.ssmA0   = ops.allocate(nChunksMax * hV * cChunk * cChunk * f);
+        if (perSeqConvInput) {
+            const std::size_t S = config.ssmStateSize;
+            b.ssmChunkScratch = ops.allocate(
+                compute::ComputeOps::kGdnChunkFwdWorkers * 5 * cChunk * S * f);
+        }
         // The persistent recurrent state (ssmStatePtr / ssmConvStatePtr) is
         // NOT allocated here — it lives in a per-sequence SsmState object
         // that the engine binds after this allocation. Only the transient

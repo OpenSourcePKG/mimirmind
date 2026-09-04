@@ -8,6 +8,13 @@
 //
 // Layout (per-sequence stride = T*H): gLog,gCum [nSeq, T, H].
 // Launch: grid = dim3(ceil(H*nChunks / LOCAL), nSeq, 1), block = LOCAL.
+//
+// 5.21.9 ragged serving prefill: optional seqT/seqOff/activeMask (all
+// nullptr => uniform T at stride seq*T*H, bit-identical to the original).
+// With seqOff the activations are the serving RAGGED token-major pack:
+// sequence seq's tokens start at token index seqOff[seq] and run for
+// seqT[seq] tokens; T then only sizes the per-seq chunk-count ceiling
+// (T = maxSeqT). A frozen slot (activeMask 0) is skipped entirely.
 
 #include <cuda_runtime.h>
 
@@ -21,24 +28,30 @@ void deltanet_chunk_cumgate_batched(
           float* __restrict__ gCum,
     const int                 T,
     const int                 H,
-    const int                 C)
+    const int                 C,
+    const unsigned char* __restrict__ activeMask,   // nullptr => all active
+    const int* __restrict__ seqT,                   // nullptr => uniform T
+    const int* __restrict__ seqOff)                 // nullptr => seq*T
 {
-    const int seq     = blockIdx.y;
-    const int nChunks = (T + C - 1) / C;
+    const int seq = blockIdx.y;
+    if (activeMask != nullptr && activeMask[seq] == 0) return;
+    const int Tseq = (seqT != nullptr) ? seqT[seq] : T;
+    const int nChunks = (Tseq + C - 1) / C;
     const int idx     = blockIdx.x * blockDim.x + threadIdx.x;  // h*nChunks + chunk
     if (idx >= H * nChunks) {
         return;
     }
-    const size_t gateStride = (size_t)T * H;
-    const float* __restrict__ gLogS = gLog + (size_t)seq * gateStride;
-    float*       __restrict__ gCumS = gCum + (size_t)seq * gateStride;
+    const size_t tokBase = (seqOff != nullptr) ? (size_t)seqOff[seq]
+                                               : (size_t)seq * (size_t)T;
+    const float* __restrict__ gLogS = gLog + tokBase * H;
+    float*       __restrict__ gCumS = gCum + tokBase * H;
 
     const int h     = idx / nChunks;
     const int chunk = idx % nChunks;
     const int c0    = chunk * C;
     int cs = C;
-    if (c0 + cs > T) {
-        cs = T - c0;
+    if (c0 + cs > Tseq) {
+        cs = Tseq - c0;
     }
 
     float run = 0.0f;

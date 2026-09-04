@@ -201,6 +201,10 @@ struct BlockBuffers {
     // (C=64). Only used on the T>1 chunked path; the AR decode path ignores them.
     ComputeBuffer ssmGCum;
     ComputeBuffer ssmA0;
+    /// 5.21.9 serving-only: per-worker scratch for the batched/ragged chunked
+    /// GDN prefill K2 (kGdnChunkFwdWorkers * 5 * C * S floats). Empty on the
+    /// single-session sizing.
+    ComputeBuffer ssmChunkScratch;
 
     // M-MoE.Fused-Decode — per-layer routing scratches for the fused-K
     // down kernel. The command queue records dispatches lazily, so the

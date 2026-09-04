@@ -451,22 +451,40 @@ public:
             "attentionDecodeFlashBatchedAsync: not supported on this backend");
     }
 
+    /// 5.21.9 — batched/ragged chunked-GDN prefill stage K0 (cumgate). shape.T
+    /// is the per-slot ceiling (maxSeqT on the ragged path); shape.seqT/seqOff
+    /// nullptr => uniform-T layout at stride seq*T (bit-identical to nSeq
+    /// single deltanetChunkCumGateAsync calls). Frozen slots are skipped.
     virtual void deltanetChunkCumGateBatchedAsync(
-            const float* gLog, float* gCum, std::size_t nSeq, std::size_t T,
-            std::size_t H, std::size_t chunkSize) {
-        (void)gLog; (void)gCum; (void)nSeq; (void)T; (void)H; (void)chunkSize;
+            const float* gLog, float* gCum, const GdnBatchedShape& shape,
+            std::size_t chunkSize) {
+        (void)gLog; (void)gCum; (void)shape; (void)chunkSize;
         throw std::runtime_error(
             "deltanetChunkCumGateBatchedAsync: not supported on this backend");
     }
 
+    /// 5.21.9 — batched/ragged K1: per-chunk triangular inverse. a0 layout
+    /// [nSeq, maxChunks, H, C, C] with maxChunks = ceil(shape.T / C).
+    virtual void deltanetKktSolveInverseBatchedAsync(
+            const float* k, const float* beta, float* a0,
+            const GdnBatchedShape& shape, std::size_t chunkSize) {
+        (void)k; (void)beta; (void)a0; (void)shape; (void)chunkSize;
+        throw std::runtime_error(
+            "deltanetKktSolveInverseBatchedAsync: not supported on this backend");
+    }
+
+    /// 5.21.9 — batched/ragged K2 (chunk forward: readout + state carry).
+    /// Worker-pool kernel: kGdnChunkFwdWorkers blocks iterate the (seq, head)
+    /// items, so `scratch` is caller-owned device memory of
+    /// kGdnChunkFwdWorkers * 5 * chunkSize * S floats — independent of nSeq.
+    static constexpr std::size_t kGdnChunkFwdWorkers = 96;
     virtual void deltanetChunkForwardBatchedAsync(
             const float* q, const float* k, const float* v, const float* gCum,
             const float* beta, const float* a0, float* state, float* out,
-            std::size_t nSeq, std::size_t T, std::size_t H, std::size_t S,
+            float* scratch, const GdnBatchedShape& shape,
             std::size_t chunkSize) {
         (void)q; (void)k; (void)v; (void)gCum; (void)beta; (void)a0;
-        (void)state; (void)out; (void)nSeq; (void)T; (void)H; (void)S;
-        (void)chunkSize;
+        (void)state; (void)out; (void)scratch; (void)shape; (void)chunkSize;
         throw std::runtime_error(
             "deltanetChunkForwardBatchedAsync: not supported on this backend");
     }

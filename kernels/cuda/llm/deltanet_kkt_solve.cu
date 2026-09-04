@@ -82,3 +82,90 @@ void deltanet_kkt_solve(
         }
     }
 }
+
+// 5.21.9 — batched/ragged K1 for the serving prefill path. grid =
+// dim3(maxChunks*H, nSeq) with maxChunks = ceil(T/C), T = maxSeqT. a0 uses a
+// COMPACT chunk layout [totalChunks, H, C, C]: sequence seq's chunk c lives
+// at block index chunkBase(seq) + c, where chunkBase = sum over s<seq of
+// ceil(seqT[s]/C) (computed in-kernel from seqT — an O(nSeq) scalar loop,
+// nSeq <= 64). This keeps the a0 allocation proportional to the ACTUAL chunk
+// count (sum(ceil(seqT/C))) instead of nSeq*maxChunks, which explodes on
+// mixed decode+prefill forwards where most slots carry one token.
+// seqT/seqOff/activeMask all nullptr => uniform T at k/beta stride seq*T and
+// chunkBase = seq*maxChunks, math per (seq, chunk, head) bit-identical to
+// nSeq single deltanet_kkt_solve calls. Blocks for chunks beyond a
+// sequence's own ceil(Tseq/C) return (their a0 blocks are never read by
+// K2); frozen slots (activeMask 0) return untouched.
+extern "C" __global__ __launch_bounds__(DELTANET_KKT_MAX_C)
+void deltanet_kkt_solve_batched(
+    const float* __restrict__ kIn,
+    const float* __restrict__ betaIn,
+    float*       __restrict__ a0,
+    const int T, const int H, const int S, const int C,
+    const unsigned char* __restrict__ activeMask,
+    const int* __restrict__ seqT,
+    const int* __restrict__ seqOff)
+{
+    const int seq = blockIdx.y;
+    if (activeMask != nullptr && activeMask[seq] == 0) return;
+    const int maxChunks = (T + C - 1) / C;
+    const int bid = blockIdx.x;                 // c*H + h (grid-side numbering)
+    if (bid >= maxChunks * H) return;
+    const int c = bid / H;
+    const int h = bid % H;
+
+    const int Tseq = (seqT != nullptr) ? seqT[seq] : T;
+    const int nChunks = (Tseq + C - 1) / C;
+    if (c >= nChunks) return;
+    const int c0 = c * C;
+    int cs = C;
+    if (c0 + cs > Tseq) cs = Tseq - c0;
+
+    const size_t tokBase = (seqOff != nullptr) ? (size_t)seqOff[seq]
+                                               : (size_t)seq * (size_t)T;
+    const float* __restrict__ k    = kIn    + tokBase * (size_t)H * S;
+    const float* __restrict__ beta = betaIn + tokBase * H;
+
+    size_t chunkBase;
+    if (seqT != nullptr) {
+        chunkBase = 0;
+        for (int s = 0; s < seq; ++s) chunkBase += (size_t)(seqT[s] + C - 1) / C;
+    } else {
+        chunkBase = (size_t)seq * maxChunks;
+    }
+
+    const int t = threadIdx.x;                  // row a (phase 1) / col m (phase 2)
+    float* a0c = a0 + (chunkBase + c) * H * C * C + (size_t)h * C * C;
+
+    __shared__ float lt[DELTANET_KKT_MAX_C * DELTANET_KKT_MAX_C];
+
+    for (int idx = t; idx < C * C; idx += blockDim.x) {
+        a0c[idx] = 0.0f;
+        lt[idx]  = 0.0f;
+    }
+    __syncthreads();
+
+    // Phase 1: strict-lower Gram (non-FMA, see the single-seq kernel's note).
+    if (t < cs) {
+        const float* ka = k + (static_cast<size_t>(c0 + t) * H + h) * S;
+        const float  ba = beta[(c0 + t) * H + h];
+        for (int m = 0; m < t; ++m) {
+            const float* km = k + (static_cast<size_t>(c0 + m) * H + h) * S;
+            float kk = 0.0f;
+            for (int i = 0; i < S; ++i) kk = __fadd_rn(kk, __fmul_rn(ka[i], km[i]));
+            lt[t * C + m] = __fmul_rn(ba, kk);
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: unit-lower inverse, thread = column m.
+    if (t < cs) {
+        a0c[t * C + t] = 1.0f;
+        for (int a = t + 1; a < cs; ++a) {
+            float acc = 0.0f;
+            for (int p = t; p < a; ++p)
+                acc = __fadd_rn(acc, __fmul_rn(lt[a * C + p], a0c[p * C + t]));
+            a0c[a * C + t] = -acc;
+        }
+    }
+}

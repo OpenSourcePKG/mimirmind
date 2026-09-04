@@ -737,6 +737,177 @@ TEST(cuda_deltanet_chunk_pipeline_vs_recurrent) {
     }
 }
 
+// 5.21.9 — batched/RAGGED chunked pipeline (K0/K1/K2 batched) vs the CPU AR
+// recurrence run independently per sequence. Exercises: ragged token-major
+// packing (seqT/seqOff), partial tail chunks, a single-token slot (the mixed
+// decode+prefill forward), a FROZEN slot (state + out rows must stay
+// untouched), the compact a0 layout, and the K2 worker-pool at both toy and
+// prod width (S=128, C=64, multi-chunk). Tolerance-based: K2 v2's kq
+// reduction order differs from the single-seq kernel by design.
+TEST(cuda_deltanet_chunk_batched_ragged_parity) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+
+    struct Case {
+        std::vector<std::int32_t> seqT;
+        std::vector<std::uint8_t> mask;
+        std::size_t H, S, C;
+        std::uint32_t seed;
+    };
+    const std::vector<Case> cases = {
+        {{5, 1, 9, 4}, {1, 1, 0, 1}, 3, 16, 4, 0x5c1u},   // ragged + frozen
+        {{64},         {1},          2, 128, 64, 0x5c3u}, // one full chunk
+        {{66},         {1},          2, 128, 64, 0x5c4u}, // full + partial tail
+        {{130},        {1},          2, 128, 64, 0x5c2u}, // 3 chunks, seed-matched
+        {{130, 1},     {1, 0},       2, 128, 64, 0x5c2u}, // 2nd slot FROZEN
+        {{130, 1},     {1, 1},       2, 128, 64, 0x5c2u}, // prod width, mixed
+    };
+
+    for (const auto& tc : cases) {
+        const std::size_t nSeq = tc.seqT.size();
+        const std::size_t H = tc.H, S = tc.S, C = tc.C;
+        std::vector<std::int32_t> seqOff(nSeq);
+        std::size_t nRow = 0, maxSeqT = 0, totalChunks = 0;
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            seqOff[s] = static_cast<std::int32_t>(nRow);
+            nRow += static_cast<std::size_t>(tc.seqT[s]);
+            maxSeqT = std::max(maxSeqT, static_cast<std::size_t>(tc.seqT[s]));
+            totalChunks += (static_cast<std::size_t>(tc.seqT[s]) + C - 1) / C;
+        }
+
+        auto q     = randVec(nRow * H * S, tc.seed + 1);
+        auto k     = randVec(nRow * H * S, tc.seed + 2);
+        auto v     = randVec(nRow * H * S, tc.seed + 3);
+        auto gLog  = randVec(nRow * H,     tc.seed + 4);
+        auto beta  = randVec(nRow * H,     tc.seed + 5);
+        auto state = randVec(nSeq * H * S * S, tc.seed + 6);
+        // Prod-conditioned gates: log-decay <= 0 and beta in (0, 0.5) (the
+        // real path sigmoids beta). Raw [-1,1) betas make the 130-step case
+        // non-contractive — state blows up and chaotic amplification of
+        // reduction-order rounding swamps any tolerance.
+        for (auto& g : gLog) g = -std::fabs(g);
+        for (auto& b : beta) b = 0.25f * (b + 1.0f);
+
+        // Golden: independent CPU AR recurrence per ACTIVE sequence on its
+        // ragged slice. Frozen slots keep sentinel out rows + original state.
+        const float kSentinel = 1.0e30f;
+        std::vector<float> refOut(nRow * H * S, kSentinel);
+        std::vector<float> refState = state;
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            if (tc.mask[s] == 0) continue;
+            const std::size_t off = static_cast<std::size_t>(seqOff[s]);
+            ::mimirmind::compute::gatedDeltaNetRecurrent(
+                q.data() + off * H * S, k.data() + off * H * S,
+                v.data() + off * H * S, gLog.data() + off * H,
+                beta.data() + off * H, refState.data() + s * H * S * S,
+                refOut.data() + off * H * S,
+                static_cast<std::size_t>(tc.seqT[s]), H, S);
+        }
+
+        auto dq  = toDevice(ops, q);
+        auto dk  = toDevice(ops, k);
+        auto dv  = toDevice(ops, v);
+        auto dg  = toDevice(ops, gLog);
+        auto db  = toDevice(ops, beta);
+        auto ds  = toDevice(ops, state);
+        auto dst = uploadRaw(ops, tc.seqT);
+        auto dso = uploadRaw(ops, seqOff);
+        auto dam = uploadRaw(ops, tc.mask);
+        std::vector<float> outInit(nRow * H * S, kSentinel);
+        auto dout = toDevice(ops, outInit);
+        auto dgc  = ops.allocate(nRow * H * sizeof(float));
+        auto da0  = ops.allocate(totalChunks * H * C * C * sizeof(float));
+        auto dscr = ops.allocate(
+            ::mimirmind::compute::ComputeOps::kGdnChunkFwdWorkers
+            * 5 * C * S * sizeof(float));
+
+        const ::mimirmind::compute::GdnBatchedShape shape{
+            nSeq, maxSeqT, H, S,
+            static_cast<const std::uint8_t*>(dam.get()),
+            static_cast<const std::int32_t*>(dst.get()),
+            static_cast<const std::int32_t*>(dso.get())};
+        ops.deltanetChunkCumGateBatchedAsync(
+            static_cast<const float*>(dg.get()),
+            static_cast<float*>(dgc.get()), shape, C);
+        ops.deltanetKktSolveInverseBatchedAsync(
+            static_cast<const float*>(dk.get()),
+            static_cast<const float*>(db.get()),
+            static_cast<float*>(da0.get()), shape, C);
+        if (std::getenv("MIMIRMIND_CHUNK_DBG_CPUA0") != nullptr) {
+            // Stage bisect: overwrite the GPU K0/K1 products with the CPU
+            // reference (per active seq, compact layout) so a remaining
+            // mismatch isolates to K2.
+            std::vector<float> cGc(nRow * H, 0.0f);
+            std::size_t cb = 0;
+            std::vector<float> cA0(totalChunks * H * C * C, 0.0f);
+            for (std::size_t s = 0; s < nSeq; ++s) {
+                const std::size_t off = static_cast<std::size_t>(seqOff[s]);
+                const std::size_t Ts  = static_cast<std::size_t>(tc.seqT[s]);
+                if (tc.mask[s] != 0) {
+                    ::mimirmind::compute::deltanetChunkCumGate(
+                        gLog.data() + off * H, cGc.data() + off * H, Ts, H, C);
+                    ::mimirmind::compute::deltanetKktSolveInverse(
+                        k.data() + off * H * S, beta.data() + off * H,
+                        cA0.data() + cb * H * C * C, Ts, H, S, C);
+                }
+                cb += (Ts + C - 1) / C;
+            }
+            ops.uploadHostBytes(dgc.get(), cGc.data(), cGc.size() * sizeof(float));
+            ops.uploadHostBytes(da0.get(), cA0.data(), cA0.size() * sizeof(float));
+        }
+        ops.deltanetChunkForwardBatchedAsync(
+            static_cast<const float*>(dq.get()),
+            static_cast<const float*>(dk.get()),
+            static_cast<const float*>(dv.get()),
+            static_cast<const float*>(dgc.get()),
+            static_cast<const float*>(db.get()),
+            static_cast<const float*>(da0.get()),
+            static_cast<float*>(ds.get()),
+            static_cast<float*>(dout.get()),
+            static_cast<float*>(dscr.get()), shape, C);
+        ops.flush();
+
+        auto gotOut   = fromDevice(ops, dout.get(), nRow * H * S);
+        auto gotState = fromDevice(ops, ds.get(),   nSeq * H * S * S);
+
+        // Locate the worst mismatch per (seq, token) for triage before
+        // asserting — a bare flat-index failure is undebuggable at S=128.
+        double maxErr = 0.0; std::size_t badSeq = 0, badTok = 0, badH = 0;
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            const std::size_t off = static_cast<std::size_t>(seqOff[s]);
+            for (std::size_t t = 0; t < static_cast<std::size_t>(tc.seqT[s]); ++t)
+            for (std::size_t h = 0; h < H; ++h)
+            for (std::size_t i = 0; i < S; ++i) {
+                const std::size_t idx = ((off + t) * H + h) * S + i;
+                if (refOut[idx] == kSentinel) continue;
+                const double e = std::fabs((double)gotOut[idx] - refOut[idx]);
+                if (e > maxErr) { maxErr = e; badSeq = s; badTok = t; badH = h; }
+            }
+        }
+        std::printf("[chunk-ragged-parity] S=%zu C=%zu maxOutErr=%.3e at seq=%zu tok=%zu h=%zu\n",
+                    S, C, maxErr, badSeq, badTok, badH);
+        for (std::size_t i = 0; i < gotOut.size(); ++i) {
+            const float tol = 2e-3f + 5e-3f * std::fabs(refOut[i]);
+            if (refOut[i] == kSentinel) {
+                EXPECT_TRUE(gotOut[i] == kSentinel);   // frozen row untouched
+            } else {
+                EXPECT_NEAR(gotOut[i], refOut[i], tol);
+            }
+        }
+        for (std::size_t s = 0; s < nSeq; ++s) {
+            for (std::size_t i = 0; i < H * S * S; ++i) {
+                const std::size_t idx = s * H * S * S + i;
+                if (tc.mask[s] == 0) {
+                    EXPECT_TRUE(gotState[idx] == state[idx]);   // frozen exact
+                } else {
+                    const float tol = 2e-3f + 5e-3f * std::fabs(refState[idx]);
+                    EXPECT_NEAR(gotState[idx], refState[idx], tol);
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fused-K MoE decode kernels (M-Q3N.4c/.4d). The end-to-end run verified these
 // byte-identical to the sequential per-expert path; these tests isolate that
@@ -2371,8 +2542,9 @@ TEST(cuda_attention_flash_decode_batched_parity) {
 
 // M-Cuda.Batch Cat C-P1 — batched chunked-prefill (cumgate + forward) vs N
 // single-sequence pipelines. kkt-solve (K1) is run per sequence to build the
-// shared a0; the batched cumgate (K0) and forward (K2) must be byte-identical
-// to running each sequence alone.
+// shared a0. K0 stays byte-identical to running each sequence alone; the K2
+// worker-pool rewrite (5.21.9) computes the kq dots in a different reduction
+// order, so K2 is tolerance-equal (1e-5) rather than byte-identical.
 TEST(cuda_deltanet_chunk_batched_parity) {
     CudaComputeContext ctx{};
     GpuOps ops{ctx};
@@ -2402,8 +2574,15 @@ TEST(cuda_deltanet_chunk_batched_parity) {
     auto dGc=ops.allocate(nSeq*gateP*sizeof(float));
     auto dA0=ops.allocate(nSeq*a0P*sizeof(float));
     auto dOut=ops.allocate(nSeq*actP*sizeof(float));
+    auto dScr=ops.allocate(
+        ::mimirmind::compute::ComputeOps::kGdnChunkFwdWorkers
+        * 5 * C * S * sizeof(float));
+    // 5.21.9: shape-based signatures; ragged fields nullptr => uniform-T
+    // layout, semantics of the original Cat C-P1 kernels.
+    const ::mimirmind::compute::GdnBatchedShape uShape{
+        nSeq, T, H, S, nullptr, nullptr, nullptr};
     ops.deltanetChunkCumGateBatchedAsync(static_cast<const float*>(dG.get()),
-        static_cast<float*>(dGc.get()), nSeq, T, H, C);
+        static_cast<float*>(dGc.get()), uShape, C);
     for (std::size_t s = 0; s < nSeq; ++s) {
         ops.deltanetKktSolveInverseAsync(
             static_cast<const float*>(dK.get()) + s*actP,
@@ -2415,7 +2594,7 @@ TEST(cuda_deltanet_chunk_batched_parity) {
         static_cast<const float*>(dV.get()), static_cast<const float*>(dGc.get()),
         static_cast<const float*>(dB.get()), static_cast<const float*>(dA0.get()),
         static_cast<float*>(dS.get()), static_cast<float*>(dOut.get()),
-        nSeq, T, H, S, C);
+        static_cast<float*>(dScr.get()), uShape, C);
     ops.flush();
     auto outB = fromDevice(ops, dOut.get(), nSeq*actP);
     auto stateB = fromDevice(ops, dS.get(), nSeq*stP);

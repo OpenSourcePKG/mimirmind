@@ -330,6 +330,7 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _deltanetChunkForwardBatchedKernel;
     core::cuda::CudaModule _deltanetKktSolveModule;
     core::cuda::CudaKernel _deltanetKktSolveKernel;
+    core::cuda::CudaKernel _deltanetKktSolveBatchedKernel;
     core::cuda::CudaModule _sigmoidInplaceModule;
     core::cuda::CudaKernel _sigmoidInplaceKernel;
     core::cuda::CudaModule _gatherHeadsModule;
@@ -666,6 +667,8 @@ struct GpuOps::Impl {
           _deltanetKktSolveModule{loadCudaModule(ctx, "deltanet_kkt_solve")},
           _deltanetKktSolveKernel{
               _deltanetKktSolveModule.getFunction("deltanet_kkt_solve")},
+          _deltanetKktSolveBatchedKernel{
+              _deltanetKktSolveModule.getFunction("deltanet_kkt_solve_batched")},
           _sigmoidInplaceModule    {loadCudaModule(ctx, "sigmoid_inplace")},
           _sigmoidInplaceKernel    {
               _sigmoidInplaceModule.getFunction("sigmoid_inplace")},
@@ -2187,23 +2190,27 @@ void GpuOps::deltanetChunkCumGateAsync(const float* gLog, float* gCum,
 }
 
 void GpuOps::deltanetChunkCumGateBatchedAsync(const float* gLog, float* gCum,
-                                              std::size_t nSeq, std::size_t T,
-                                              std::size_t H,
+                                              const GdnBatchedShape& shape,
                                               std::size_t chunkSize) {
+    const std::size_t nSeq = shape.nSeq, T = shape.T, H = shape.H;
     if (nSeq == 0 || T == 0 || H == 0) {
         return;
     }
     const std::size_t C       = chunkSize ? chunkSize : 64;
-    const std::size_t nChunks = (T + C - 1) / C;
+    const std::size_t nChunks = (T + C - 1) / C;   // per-slot ceiling (maxSeqT)
     const std::size_t total   = H * nChunks;   // one thread per (head, chunk)
     // grid.y = nSeq; each sequence prefix-sums its own gLog slab (M-Cuda.Batch
-    // Cat C-P1). Byte-identical to nSeq single deltanetChunkCumGateAsync.
+    // Cat C-P1). seqT/seqOff nullptr => uniform T, byte-identical to nSeq
+    // single deltanetChunkCumGateAsync; set => serving ragged pack (5.21.9).
     auto& k = _pimpl->_deltanetChunkCumGateBatchedKernel;
     k.setPtr  (0, gLog);
     k.setPtr  (1, gCum);
     k.setValue(2, toInt32(T, "cumgateB T"));
     k.setValue(3, toInt32(H, "cumgateB H"));
     k.setValue(4, toInt32(C, "cumgateB C"));
+    k.setPtr  (5, shape.activeMask);
+    k.setPtr  (6, shape.seqT);
+    k.setPtr  (7, shape.seqOff);
     k.launch(_ctx.stream(),
              groupsForN(total, kElementwiseLocalSize),
              static_cast<std::uint32_t>(nSeq), 1,
@@ -2256,19 +2263,27 @@ void GpuOps::deltanetChunkForwardAsync(const float* q, const float* k_,
 void GpuOps::deltanetChunkForwardBatchedAsync(
         const float* q, const float* k_, const float* v, const float* gCum,
         const float* beta, const float* a0, float* state, float* out,
-        std::size_t nSeq, std::size_t T, std::size_t H, std::size_t S,
-        std::size_t chunkSize) {
+        float* scratch, const GdnBatchedShape& shape, std::size_t chunkSize) {
+    const std::size_t nSeq = shape.nSeq, T = shape.T, H = shape.H, S = shape.S;
     if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
         return;
     }
     const std::size_t C = chunkSize ? chunkSize : 64;
-    const std::size_t f = sizeof(float);
-    // nSeq copies of the single-seq global scratch ([s0 [H,S,S] + 5 chunk
-    // tensors [H,C,S]]); the kernel offsets by seq*scratchPerSeq. grid.y =
-    // nSeq. Byte-identical to nSeq single deltanetChunkForwardAsync.
-    const std::size_t scratchPerSeq = H * S * S + 5 * H * C * S;
-    auto scratch = allocate(nSeq * scratchPerSeq * f);
-
+    // 5.21.9 worker-pool launch: grid = [G, 1, nSeq] (nSeq rides gridDim.z —
+    // kMaxArgs is exhausted), G workers iterate the (seq, head) items with a
+    // per-WORKER scratch slice, so `scratch` (caller-owned, allocate-once) is
+    // kGdnChunkFwdWorkers * 5 * C * S floats independent of nSeq, and the
+    // launch stays fully async (the old per-call allocate + hard stream sync
+    // would cost 36 host syncs per prefill forward). The per-chunk state
+    // snapshot lives in dynamic smem (S*S*4 = the same >48 KiB opt-in as the
+    // v3 recurrence kernel).
+    // Per-call opt-in (not a static latch): S varies across test fixtures, and
+    // the driver call is cheap. Same >48 KiB opt-in the v3/verify kernels use.
+    const std::size_t fwdSmemBytes = S * S * sizeof(float);
+    _pimpl->_deltanetChunkForwardBatchedKernel
+        .setMaxDynamicSharedBytes(fwdSmemBytes);
+    const std::size_t items = nSeq * H;
+    const std::size_t G = std::min<std::size_t>(kGdnChunkFwdWorkers, items);
     auto& kern = _pimpl->_deltanetChunkForwardBatchedKernel;
     kern.setPtr  (0,  q);
     kern.setPtr  (1,  k_);
@@ -2278,16 +2293,49 @@ void GpuOps::deltanetChunkForwardBatchedAsync(
     kern.setPtr  (5,  a0);
     kern.setPtr  (6,  state);
     kern.setPtr  (7,  out);
-    kern.setPtr  (8,  scratch.get());
+    kern.setPtr  (8,  scratch);
     kern.setValue(9,  toInt32(T, "chunkfwdB T"));
     kern.setValue(10, toInt32(H, "chunkfwdB H"));
-    kern.setValue(11, toInt32(S, "chunkfwdB S"));
+    kern.setValue(11, toInt32(nSeq, "chunkfwdB nSeq"));
     kern.setValue(12, toInt32(C, "chunkfwdB C"));
+    kern.setPtr  (13, shape.activeMask);
+    kern.setPtr  (14, shape.seqT);
+    kern.setPtr  (15, shape.seqOff);
+    // grid MUST stay [G, 1, 1]: any extra grid dimension would replay the
+    // whole item walk per slice (the kernel loops item = blockIdx.x) and
+    // race blocks onto the same state columns. S rides blockDim.x.
     kern.launch(_ctx.stream(),
-                static_cast<std::uint32_t>(H),
+                static_cast<std::uint32_t>(G), 1, 1,
+                static_cast<std::uint32_t>(S), 1, 1,
+                fwdSmemBytes);
+}
+
+void GpuOps::deltanetKktSolveInverseBatchedAsync(
+        const float* k_, const float* beta, float* a0,
+        const GdnBatchedShape& shape, std::size_t chunkSize) {
+    const std::size_t nSeq = shape.nSeq, T = shape.T, H = shape.H, S = shape.S;
+    if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
+        return;
+    }
+    const std::size_t C         = chunkSize ? chunkSize : 64;
+    const std::size_t maxChunks = (T + C - 1) / C;
+    // grid = (maxChunks*H, nSeq); blocks for chunks beyond a sequence's own
+    // ceil(Tseq/C) return in-kernel. a0 layout [nSeq, maxChunks, H, C, C].
+    auto& kern = _pimpl->_deltanetKktSolveBatchedKernel;
+    kern.setPtr  (0, k_);
+    kern.setPtr  (1, beta);
+    kern.setPtr  (2, a0);
+    kern.setValue(3, toInt32(T, "kktB T"));
+    kern.setValue(4, toInt32(H, "kktB H"));
+    kern.setValue(5, toInt32(S, "kktB S"));
+    kern.setValue(6, toInt32(C, "kktB C"));
+    kern.setPtr  (7, shape.activeMask);
+    kern.setPtr  (8, shape.seqT);
+    kern.setPtr  (9, shape.seqOff);
+    kern.launch(_ctx.stream(),
+                static_cast<std::uint32_t>(maxChunks * H),
                 static_cast<std::uint32_t>(nSeq), 1,
-                static_cast<std::uint32_t>(S), 1, 1);
-    _ctx.stream().synchronize();
+                static_cast<std::uint32_t>(C), 1, 1);
 }
 
 void GpuOps::deltanetKktSolveInverseAsync(const float* k_, const float* beta,
