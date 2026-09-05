@@ -1932,12 +1932,14 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
             tokRun   += Tslot;
         }
     }
+    _ops.profileSection("gdn.conv.k");   // 5.21.12: conv1d-silu sub-split
     _ops.causalConv1dSiluBatchedAsync(
         convInput, static_cast<const float*>(convW.usmPtr), qkvMixed,
         nSeq, ragged ? ctx.maxSeqT : 1, convDim, dConv,
         ragged ? ctx.seqTDev : nullptr,
         ragged ? ctx.convInOffDev : nullptr,
         ragged ? ctx.seqOffDev : nullptr);
+    _ops.profileSection("gdn.conv.save");   // 5.21.12: state-tail save sub-split
     // Save each sequence's trailing stateRows rows as the next conv state (the
     // last stateRows of [state | Tslot tokens] start at row Tslot).
     // 5.21-I: a frozen slot keeps its conv tail byte-identical (skip the save).
@@ -1967,6 +1969,7 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
 
     // --- split conv into q/k/v (+ GQA repeat H_k -> H_v) + q/k L2-norm ---
     // GDN-Inc 2b: one fused launch (gather q/k/v + norm q/k) vs 3 gathers + 2 norms.
+    _ops.profileSection("gdn.split");   // 5.21.12: gather+L2norm sub-split
     if (_gdnPrepFuse) {
         _ops.fusedPostConvPrepAsync(qkvMixed, qBuf, kBuf, vBuf, nRow, hK, hV, S,
                                     convDim, keyDim, eps);

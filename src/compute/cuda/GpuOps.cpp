@@ -340,6 +340,7 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _gatherHeadsKernel;
     // GDN-Inc 2b: fused post-conv prep (q/k/v gather + q/k L2-norm) in one launch.
     core::cuda::CudaKernel _fusedPostConvPrepKernel;
+    core::cuda::CudaKernel _fusedPostConvPrepWarpKernel;
 
     // M-Cuda.MoeGroup — grouped-by-expert MoE prefill (token grouping build,
     // row gather, deterministic expert-output scatter).
@@ -688,6 +689,8 @@ struct GpuOps::Impl {
               _gatherHeadsModule.getFunction("gather_heads_from_channels")},
           _fusedPostConvPrepKernel {
               _gatherHeadsModule.getFunction("fused_post_conv_prep")},
+          _fusedPostConvPrepWarpKernel {
+              _gatherHeadsModule.getFunction("fused_post_conv_prep_warp")},
           _moeGroupBuildModule     {loadCudaModule(ctx, "moe_group_build")},
           _moeGroupBuildKernel     {
               _moeGroupBuildModule.getFunction("moe_group_build")},
@@ -1721,6 +1724,29 @@ void GpuOps::fusedPostConvPrepAsync(const float* qkvMixed, float* qOut,
                                     std::size_t keyDim, float eps) {
     const std::size_t rows = T * dstHeads;
     if (rows == 0 || S == 0) {
+        return;
+    }
+    // 5.21.12: warp-coalesced variant (block per row, blockDim.x == S) when S
+    // fits a block — the scalar per-row kernel's loads are fully uncoalesced.
+    // Tolerance-equal (tree vs serial L2 reduction). Arbitrary S > 1024 falls
+    // back to the exact scalar kernel.
+    if (S <= 1024) {
+        auto& kw = _pimpl->_fusedPostConvPrepWarpKernel;
+        kw.setPtr  (0, qkvMixed);
+        kw.setPtr  (1, qOut);
+        kw.setPtr  (2, kOut);
+        kw.setPtr  (3, vOut);
+        kw.setValue(4,  toInt32(T,              "fpcpW T"));
+        kw.setValue(5,  toInt32(srcHeadsKV,     "fpcpW srcHeadsKV"));
+        kw.setValue(6,  toInt32(dstHeads,       "fpcpW dstHeads"));
+        kw.setValue(7,  toInt32(S,              "fpcpW S"));
+        kw.setValue(8,  toInt32(convTotalWidth, "fpcpW convW"));
+        kw.setValue(9,  toInt32(keyDim,         "fpcpW keyDim"));
+        kw.setValue(10, eps);
+        kw.launch(_ctx.stream(),
+                  static_cast<std::uint32_t>(rows), 1, 1,
+                  static_cast<std::uint32_t>(S), 1, 1,
+                  2 * S * sizeof(float));
         return;
     }
     auto& k = _pimpl->_fusedPostConvPrepKernel;
