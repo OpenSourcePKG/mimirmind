@@ -193,3 +193,232 @@ void deltanet_kkt_solve_batched(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 5.21.9 v5 — TENSOR-CORE K1 for the TC chunk pipeline (S=128, C=64 only;
+// dispatched together with deltanet_chunk_forward_batched_tc via
+// MIMIRMIND_GDN_CHUNK_TC — the scalar pipeline keeps the exact kernel above).
+//
+// The 2026-09-05 sub-split profile showed K1 at 9% of the WHOLE serving
+// prefill — 2x the entire TC chunk forward — bound by the serial 64-step
+// phase-2 substitution and uncoalesced Gram reads. This variant:
+//   * Gram lt = tril(diag(b) K K^T, -1) as TF32 wmma GEMMs (m16n16k8) over
+//     an smem-staged K chunk (TF32's 10-bit mantissa chosen over BF16
+//     because the triangular inverse AMPLIFIES operand rounding).
+//   * BLOCKED unit-lower inverse (4x4 blocks of 16): the four diagonal
+//     16x16 inverses run in PARALLEL (16-step chains instead of one
+//     64-step chain), off-diagonal blocks come from block substitution
+//     X_ij = -X_ii (sum_k L_ik X_kj) as TF32 mmas.
+// Result is tolerance-equal (TF32 rounding + reassociation), consumed by a
+// pipeline that rounds a0 to BF16 anyway (the mB mirror in K2-TC).
+//
+// Launch: grid = (maxChunks*H, nSeq), block = 256, dyn smem = C*S*4 (kSh).
+// ---------------------------------------------------------------------------
+
+#include <mma.h>
+using namespace nvcuda;
+
+#define KKT_TC_S 128
+#define KKT_TC_C 64
+#define KKT_TC_B 16          // block edge
+
+extern "C" __global__ __launch_bounds__(256)
+void deltanet_kkt_solve_batched_tc(
+    const float* __restrict__ kIn,
+    const float* __restrict__ betaIn,
+    float*       __restrict__ a0,
+    const int T, const int H, const int S, const int C,
+    const unsigned char* __restrict__ activeMask,
+    const int* __restrict__ seqT,
+    const int* __restrict__ seqOff)
+{
+    constexpr int BS = KKT_TC_B;
+    if (S != KKT_TC_S || C != KKT_TC_C) return;   // host guards
+
+    const int seq = blockIdx.y;
+    if (activeMask != nullptr && activeMask[seq] == 0) return;
+    const int maxChunks = (T + C - 1) / C;
+    const int bid = blockIdx.x;
+    if (bid >= maxChunks * H) return;
+    const int c = bid / H;
+    const int h = bid % H;
+
+    const int Tseq = (seqT != nullptr) ? seqT[seq] : T;
+    const int nChunks = (Tseq + C - 1) / C;
+    if (c >= nChunks) return;
+    const int c0 = c * C;
+    int cs = C;
+    if (c0 + cs > Tseq) cs = Tseq - c0;
+
+    const size_t tokBase = (seqOff != nullptr) ? (size_t)seqOff[seq]
+                                               : (size_t)seq * (size_t)T;
+    const float* __restrict__ k    = kIn    + tokBase * (size_t)H * S;
+    const float* __restrict__ beta = betaIn + tokBase * H;
+
+    size_t chunkBase;
+    if (seqT != nullptr) {
+        chunkBase = 0;
+        for (int s = 0; s < seq; ++s) chunkBase += (size_t)(seqT[s] + C - 1) / C;
+    } else {
+        chunkBase = (size_t)seq * maxChunks;
+    }
+    float* a0c = a0 + (chunkBase + c) * H * C * C + (size_t)h * C * C;
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+
+    if (cs == 1) {
+        if (tid == 0) a0c[0] = 1.0f;
+        return;
+    }
+
+    extern __shared__ float kSh[];                 // [C, S] fp32 K chunk
+    __shared__ float lt[KKT_TC_C * KKT_TC_C];      // Gram (then L)
+    __shared__ float X [KKT_TC_C * KKT_TC_C];      // the inverse
+    __shared__ float sStg[8][KKT_TC_B * KKT_TC_B]; // per-warp staging tile
+
+    // Phase 0: stage the K chunk (zero-pad beyond cs) + zero X.
+    for (int i = tid; i < C * S; i += 256) {
+        const int m = i / S;
+        kSh[i] = (m < cs) ? k[((size_t)(c0 + m) * H + h) * S + i % S] : 0.0f;
+    }
+    for (int i = tid; i < C * C; i += 256) {
+        X[i] = 0.0f;
+    }
+    __syncthreads();
+
+    // Phase A: Gram tiles (block-lower incl. diagonal) as TF32 mma.
+    // 10 lower tiles (i >= j) over 8 warps.
+    {
+        constexpr int kTiles = KKT_TC_S / 8;       // 16 k-steps of 8
+        for (int t = warp; t < 10; t += 8) {
+            // Enumerate lower tiles: (0,0),(1,0),(1,1),(2,0),(2,1),(2,2),...
+            int ti = 0, tj = 0, cnt = 0;
+            for (int i = 0; i < 4 && cnt <= t; ++i) {
+                for (int j = 0; j <= i && cnt <= t; ++j) {
+                    ti = i; tj = j; ++cnt;
+                }
+            }
+            wmma::fragment<wmma::accumulator, BS, BS, 8, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            for (int kk = 0; kk < kTiles; ++kk) {
+                wmma::fragment<wmma::matrix_a, BS, BS, 8,
+                               wmma::precision::tf32, wmma::row_major> aF;
+                wmma::fragment<wmma::matrix_b, BS, BS, 8,
+                               wmma::precision::tf32, wmma::col_major> bF;
+                wmma::load_matrix_sync(
+                    aF, kSh + (size_t)(ti * BS) * S + kk * 8, S);
+                wmma::load_matrix_sync(
+                    bF, kSh + (size_t)(tj * BS) * S + kk * 8, S);
+#pragma unroll
+                for (int e = 0; e < aF.num_elements; ++e)
+                    aF.x[e] = wmma::__float_to_tf32(aF.x[e]);
+#pragma unroll
+                for (int e = 0; e < bF.num_elements; ++e)
+                    bF.x[e] = wmma::__float_to_tf32(bF.x[e]);
+                wmma::mma_sync(acc, aF, bF, acc);
+            }
+            wmma::store_matrix_sync(lt + (size_t)(ti * BS) * C + tj * BS,
+                                    acc, C, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+
+    // Phase A2: apply beta + strict-lower mask (upper tiles were never
+    // written — mask covers them via the m<a condition only inside lower
+    // tiles; explicitly zero everything not strict-lower-in-range).
+    for (int i = tid; i < C * C; i += 256) {
+        const int a = i / C, m = i % C;
+        if (a < cs && m < a) {
+            lt[i] *= beta[(c0 + a) * H + h];
+        } else {
+            lt[i] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Phase B: the four diagonal 16x16 unit-lower inverses IN PARALLEL
+    // (warps 0..3, lane = column within the block).
+    if (warp < 4 && lane < BS) {
+        const int b0r = warp * BS;                 // block row/col base
+        const int m = lane;
+        X[(size_t)(b0r + m) * C + b0r + m] = 1.0f;
+        for (int a = m + 1; a < BS; ++a) {
+            float acc = 0.0f;
+            for (int p = m; p < a; ++p) {
+                acc += lt[(size_t)(b0r + a) * C + b0r + p]
+                     * X[(size_t)(b0r + p) * C + b0r + m];
+            }
+            X[(size_t)(b0r + a) * C + b0r + m] = -acc;
+        }
+    }
+    __syncthreads();
+
+    // Phase C: block substitution, one warp per block column j (j = 0..2);
+    // within a column the i-chain is serial (at most 3 steps).
+    if (warp < 3) {
+        const int j = warp;
+        for (int i = j + 1; i < 4; ++i) {
+            // S16 = sum_{k=j..i-1} L[i][k] @ X[k][j]  (TF32 mma, fp32 acc)
+            wmma::fragment<wmma::accumulator, BS, BS, 8, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            for (int kb = j; kb < i; ++kb) {
+                for (int half = 0; half < 2; ++half) {
+                    wmma::fragment<wmma::matrix_a, BS, BS, 8,
+                                   wmma::precision::tf32, wmma::row_major> aF;
+                    wmma::fragment<wmma::matrix_b, BS, BS, 8,
+                                   wmma::precision::tf32, wmma::row_major> bF;
+                    wmma::load_matrix_sync(
+                        aF, lt + (size_t)(i * BS) * C + kb * BS + half * 8, C);
+                    wmma::load_matrix_sync(
+                        bF, X + (size_t)(kb * BS + half * 8) * C + j * BS, C);
+#pragma unroll
+                    for (int e = 0; e < aF.num_elements; ++e)
+                        aF.x[e] = wmma::__float_to_tf32(aF.x[e]);
+#pragma unroll
+                    for (int e = 0; e < bF.num_elements; ++e)
+                        bF.x[e] = wmma::__float_to_tf32(bF.x[e]);
+                    wmma::mma_sync(acc, aF, bF, acc);
+                }
+            }
+            // Stage -S16, then X[i][j] = X[i][i] @ (-S16).
+            wmma::store_matrix_sync(sStg[warp], acc, BS, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane; e < BS * BS; e += 32) {
+                sStg[warp][e] = -sStg[warp][e];
+            }
+            __syncwarp();
+            wmma::fragment<wmma::accumulator, BS, BS, 8, float> acc2;
+            wmma::fill_fragment(acc2, 0.0f);
+            for (int half = 0; half < 2; ++half) {
+                wmma::fragment<wmma::matrix_a, BS, BS, 8,
+                               wmma::precision::tf32, wmma::row_major> aF;
+                wmma::fragment<wmma::matrix_b, BS, BS, 8,
+                               wmma::precision::tf32, wmma::row_major> bF;
+                wmma::load_matrix_sync(
+                    aF, X + (size_t)(i * BS) * C + i * BS + half * 8, C);
+                wmma::load_matrix_sync(
+                    bF, sStg[warp] + (size_t)half * 8 * BS, BS);
+#pragma unroll
+                for (int e = 0; e < aF.num_elements; ++e)
+                    aF.x[e] = wmma::__float_to_tf32(aF.x[e]);
+#pragma unroll
+                for (int e = 0; e < bF.num_elements; ++e)
+                    bF.x[e] = wmma::__float_to_tf32(bF.x[e]);
+                wmma::mma_sync(acc2, aF, bF, acc2);
+            }
+            wmma::store_matrix_sync(X + (size_t)(i * BS) * C + j * BS,
+                                    acc2, C, wmma::mem_row_major);
+            __syncwarp();
+        }
+    }
+    __syncthreads();
+
+    // Phase D: publish. Rows/cols beyond cs must behave like the exact
+    // kernel (identity diagonal, zero elsewhere) — with the zero-padded K
+    // the Gram rows beyond cs are 0, so X already carries exactly that.
+    for (int i = tid; i < C * C; i += 256) {
+        a0c[i] = X[i];
+    }
+}

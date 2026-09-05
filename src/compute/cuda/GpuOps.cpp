@@ -333,6 +333,7 @@ struct GpuOps::Impl {
     core::cuda::CudaModule _deltanetKktSolveModule;
     core::cuda::CudaKernel _deltanetKktSolveKernel;
     core::cuda::CudaKernel _deltanetKktSolveBatchedKernel;
+    core::cuda::CudaKernel _deltanetKktSolveBatchedTcKernel;
     core::cuda::CudaModule _sigmoidInplaceModule;
     core::cuda::CudaKernel _sigmoidInplaceKernel;
     core::cuda::CudaModule _gatherHeadsModule;
@@ -677,6 +678,8 @@ struct GpuOps::Impl {
               _deltanetKktSolveModule.getFunction("deltanet_kkt_solve")},
           _deltanetKktSolveBatchedKernel{
               _deltanetKktSolveModule.getFunction("deltanet_kkt_solve_batched")},
+          _deltanetKktSolveBatchedTcKernel{
+              _deltanetKktSolveModule.getFunction("deltanet_kkt_solve_batched_tc")},
           _sigmoidInplaceModule    {loadCudaModule(ctx, "sigmoid_inplace")},
           _sigmoidInplaceKernel    {
               _sigmoidInplaceModule.getFunction("sigmoid_inplace")},
@@ -2339,9 +2342,24 @@ void GpuOps::deltanetKktSolveInverseBatchedAsync(
     }
     const std::size_t C         = chunkSize ? chunkSize : 64;
     const std::size_t maxChunks = (T + C - 1) / C;
+    // 5.21.9 v5: the TC chunk pipeline (MIMIRMIND_GDN_CHUNK_TC=1) also takes
+    // the tensor-core K1 (TF32 Gram + blocked triangular inverse) — K1 was
+    // 2x the whole TC forward in the sub-split profile. The scalar pipeline
+    // keeps the exact (bit-identical-to-golden) kernel.
+    static const bool kChunkTc = [] {
+        const char* e = std::getenv("MIMIRMIND_GDN_CHUNK_TC");
+        return e != nullptr && e[0] != '0';
+    }();
+    const bool useTc = kChunkTc && S == 128 && C == 64;
+    auto& kern = useTc ? _pimpl->_deltanetKktSolveBatchedTcKernel
+                       : _pimpl->_deltanetKktSolveBatchedKernel;
+    std::size_t smemBytes = 0;
+    if (useTc) {
+        smemBytes = C * S * sizeof(float);   // kSh staging
+        kern.setMaxDynamicSharedBytes(smemBytes);
+    }
     // grid = (maxChunks*H, nSeq); blocks for chunks beyond a sequence's own
     // ceil(Tseq/C) return in-kernel. a0 layout [nSeq, maxChunks, H, C, C].
-    auto& kern = _pimpl->_deltanetKktSolveBatchedKernel;
     kern.setPtr  (0, k_);
     kern.setPtr  (1, beta);
     kern.setPtr  (2, a0);
@@ -2357,7 +2375,7 @@ void GpuOps::deltanetKktSolveInverseBatchedAsync(
     kern.launch(_ctx.stream(),
                 static_cast<std::uint32_t>(maxChunks * H),
                 static_cast<std::uint32_t>(nSeq), 1,
-                256, 1, 1);
+                256, 1, 1, smemBytes);
 }
 
 void GpuOps::deltanetKktSolveInverseAsync(const float* k_, const float* beta,
