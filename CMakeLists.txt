@@ -1001,6 +1001,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/deltanet_chunk_forward.cu
         kernels/cuda/llm/deltanet_chunk_cumgate_batched.cu
         kernels/cuda/llm/deltanet_chunk_forward_batched.cu
+        kernels/cuda/llm/deltanet_chunk_forward_batched_tc.cu
         kernels/cuda/llm/deltanet_kkt_solve.cu
         kernels/cuda/common/sigmoid_inplace.cu
         kernels/cuda/llm/gather_heads_from_channels.cu

@@ -328,6 +328,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _deltanetChunkCumGateBatchedKernel;
     core::cuda::CudaModule _deltanetChunkForwardBatchedModule;
     core::cuda::CudaKernel _deltanetChunkForwardBatchedKernel;
+    core::cuda::CudaModule _deltanetChunkForwardBatchedTcModule;
+    core::cuda::CudaKernel _deltanetChunkForwardBatchedTcKernel;
     core::cuda::CudaModule _deltanetKktSolveModule;
     core::cuda::CudaKernel _deltanetKktSolveKernel;
     core::cuda::CudaKernel _deltanetKktSolveBatchedKernel;
@@ -665,6 +667,11 @@ struct GpuOps::Impl {
           _deltanetChunkForwardBatchedModule{loadCudaModule(ctx, "deltanet_chunk_forward_batched")},
           _deltanetChunkForwardBatchedKernel{
               _deltanetChunkForwardBatchedModule.getFunction("deltanet_chunk_forward_batched")},
+          _deltanetChunkForwardBatchedTcModule{
+              loadCudaModule(ctx, "deltanet_chunk_forward_batched_tc")},
+          _deltanetChunkForwardBatchedTcKernel{
+              _deltanetChunkForwardBatchedTcModule.getFunction(
+                  "deltanet_chunk_forward_batched_tc")},
           _deltanetKktSolveModule{loadCudaModule(ctx, "deltanet_kkt_solve")},
           _deltanetKktSolveKernel{
               _deltanetKktSolveModule.getFunction("deltanet_kkt_solve")},
@@ -2283,11 +2290,20 @@ void GpuOps::deltanetChunkForwardBatchedAsync(
     // Per-call opt-in (not a static latch): S varies across test fixtures, and
     // the driver call is cheap. Same >48 KiB opt-in the v3/verify kernels use.
     const std::size_t fwdSmemBytes = S * S * sizeof(float);
-    _pimpl->_deltanetChunkForwardBatchedKernel
-        .setMaxDynamicSharedBytes(fwdSmemBytes);
+    // 5.21.9 TC variant (MIMIRMIND_GDN_CHUNK_TC=1): bf16 wmma phases with
+    // fp32 accumulation, 256-thread blocks. Prod GDN shape only (S=128,
+    // C=64); anything else falls back to the scalar kernel. Tolerance-equal
+    // (bf16 operand rounding), NOT bit-identical to the scalar chunk path.
+    static const bool kChunkTc = [] {
+        const char* e = std::getenv("MIMIRMIND_GDN_CHUNK_TC");
+        return e != nullptr && e[0] != '0';
+    }();
+    const bool useTc = kChunkTc && S == 128 && C == 64;
     const std::size_t items = nSeq * H;
     const std::size_t G = std::min<std::size_t>(kGdnChunkFwdWorkers, items);
-    auto& kern = _pimpl->_deltanetChunkForwardBatchedKernel;
+    auto& kern = useTc ? _pimpl->_deltanetChunkForwardBatchedTcKernel
+                       : _pimpl->_deltanetChunkForwardBatchedKernel;
+    kern.setMaxDynamicSharedBytes(fwdSmemBytes);
     kern.setPtr  (0,  q);
     kern.setPtr  (1,  k_);
     kern.setPtr  (2,  v);
@@ -2306,10 +2322,11 @@ void GpuOps::deltanetChunkForwardBatchedAsync(
     kern.setPtr  (15, shape.seqOff);
     // grid MUST stay [G, 1, 1]: any extra grid dimension would replay the
     // whole item walk per slice (the kernel loops item = blockIdx.x) and
-    // race blocks onto the same state columns. S rides blockDim.x.
+    // race blocks onto the same state columns. Scalar kernel: S rides
+    // blockDim.x; TC kernel: fixed 256 threads (8 warps).
     kern.launch(_ctx.stream(),
                 static_cast<std::uint32_t>(G), 1, 1,
-                static_cast<std::uint32_t>(S), 1, 1,
+                useTc ? 256u : static_cast<std::uint32_t>(S), 1, 1,
                 fwdSmemBytes);
 }
 

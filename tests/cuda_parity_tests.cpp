@@ -748,6 +748,14 @@ TEST(cuda_deltanet_chunk_batched_ragged_parity) {
     CudaComputeContext ctx{};
     GpuOps ops{ctx};
 
+    // 5.21.9 TC variant: with MIMIRMIND_GDN_CHUNK_TC=1 the S=128/C=64 cases
+    // dispatch the bf16-wmma kernel (fp32 accumulate). Operand rounding to
+    // bf16 (~0.4% per input) widens the achievable tolerance vs the scalar
+    // pipeline; the serving quality bar is needle+coherence, this fixture
+    // only guards gross math errors on the TC path.
+    const float tolScale =
+        (std::getenv("MIMIRMIND_GDN_CHUNK_TC") != nullptr) ? 8.0f : 1.0f;
+
     struct Case {
         std::vector<std::int32_t> seqT;
         std::vector<std::uint8_t> mask;
@@ -819,7 +827,7 @@ TEST(cuda_deltanet_chunk_batched_ragged_parity) {
         auto da0  = ops.allocate(totalChunks * H * C * C * sizeof(float));
         auto dscr = ops.allocate(
             ::mimirmind::compute::ComputeOps::kGdnChunkFwdWorkers
-            * 5 * C * S * sizeof(float));
+            * 6 * C * S * sizeof(float));
 
         const ::mimirmind::compute::GdnBatchedShape shape{
             nSeq, maxSeqT, H, S,
@@ -887,7 +895,7 @@ TEST(cuda_deltanet_chunk_batched_ragged_parity) {
         std::printf("[chunk-ragged-parity] S=%zu C=%zu maxOutErr=%.3e at seq=%zu tok=%zu h=%zu\n",
                     S, C, maxErr, badSeq, badTok, badH);
         for (std::size_t i = 0; i < gotOut.size(); ++i) {
-            const float tol = 2e-3f + 5e-3f * std::fabs(refOut[i]);
+            const float tol = tolScale * (2e-3f + 5e-3f * std::fabs(refOut[i]));
             if (refOut[i] == kSentinel) {
                 EXPECT_TRUE(gotOut[i] == kSentinel);   // frozen row untouched
             } else {
@@ -900,7 +908,7 @@ TEST(cuda_deltanet_chunk_batched_ragged_parity) {
                 if (tc.mask[s] == 0) {
                     EXPECT_TRUE(gotState[idx] == state[idx]);   // frozen exact
                 } else {
-                    const float tol = 2e-3f + 5e-3f * std::fabs(refState[idx]);
+                    const float tol = tolScale * (2e-3f + 5e-3f * std::fabs(refState[idx]));
                     EXPECT_NEAR(gotState[idx], refState[idx], tol);
                 }
             }
@@ -2576,7 +2584,7 @@ TEST(cuda_deltanet_chunk_batched_parity) {
     auto dOut=ops.allocate(nSeq*actP*sizeof(float));
     auto dScr=ops.allocate(
         ::mimirmind::compute::ComputeOps::kGdnChunkFwdWorkers
-        * 5 * C * S * sizeof(float));
+        * 6 * C * S * sizeof(float));
     // 5.21.9: shape-based signatures; ragged fields nullptr => uniform-T
     // layout, semantics of the original Cat C-P1 kernels.
     const ::mimirmind::compute::GdnBatchedShape uShape{

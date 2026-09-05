@@ -114,7 +114,8 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         // count (64, the serving maxBatch ceiling — the backend falls back to
         // the AR path if a forward would exceed this capacity). The K2
         // worker-pool kernel additionally needs a per-worker scratch
-        // (kGdnChunkFwdWorkers * 5 * C * S floats), independent of nSeq.
+        // (kGdnChunkFwdWorkers * 6 * C * S floats; the TC variant uses the sixth
+        // C*S segment for its bf16 operand mirrors), independent of nSeq.
         const std::size_t cChunk     = 64;
         const std::size_t nChunksMax = (maxT + cChunk - 1) / cChunk
                                      + (perSeqConvInput ? 64 : 0);
@@ -123,7 +124,7 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         if (perSeqConvInput) {
             const std::size_t S = config.ssmStateSize;
             b.ssmChunkScratch = ops.allocate(
-                compute::ComputeOps::kGdnChunkFwdWorkers * 5 * cChunk * S * f);
+                compute::ComputeOps::kGdnChunkFwdWorkers * 6 * cChunk * S * f);
         }
         // The persistent recurrent state (ssmStatePtr / ssmConvStatePtr) is
         // NOT allocated here — it lives in a per-sequence SsmState object

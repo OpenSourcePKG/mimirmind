@@ -476,7 +476,8 @@ public:
     /// 5.21.9 — batched/ragged K2 (chunk forward: readout + state carry).
     /// Worker-pool kernel: kGdnChunkFwdWorkers blocks iterate the (seq, head)
     /// items, so `scratch` is caller-owned device memory of
-    /// kGdnChunkFwdWorkers * 5 * chunkSize * S floats — independent of nSeq.
+    /// kGdnChunkFwdWorkers * 6 * chunkSize * S floats — independent of nSeq
+    /// (segment six holds the TC variant's bf16 operand mirrors).
     static constexpr std::size_t kGdnChunkFwdWorkers = 96;
     virtual void deltanetChunkForwardBatchedAsync(
             const float* q, const float* k, const float* v, const float* gCum,
