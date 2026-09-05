@@ -5,47 +5,49 @@
 //
 // Same contract as deltanet_chunk_forward_batched (worker-pool grid [G,1,1],
 // nSeq as an argument, ragged seqT/seqOff/activeMask, COMPACT a0 layout,
-// per-worker scratch), but the O(C*S) / O(C*C) inner phases run as BF16
-// wmma GEMMs with FP32 accumulation instead of 1-thread-per-state-column
-// scalar loops.
+// per-worker scratch), with the O(C*S)/O(C*C) phases as BF16 wmma GEMMs
+// (FP32 accumulation) instead of 1-thread-per-state-column scalar loops.
 //
-// v2 (staging redesign): v1 converted every A/B tile lane-cooperatively into
-// a warp-private smem staging buffer per mma — that staging dominated the
-// runtime (section 16.7s vs the scalar chunk's 19.5s but still well behind
-// AR's 11.4s). v2 converts each chunk's operands to BF16 ONCE per chunk into
-// per-worker GLOBAL mirrors (kB, qB=Qs, ktB, s0b) and feeds
-// wmma::load_matrix_sync straight from global (row_major, or col_major where
-// the math needs the transpose). Only the two [C,C] coefficient matrices
-// (M from a0*exp-decay, W from kq*exp-decay) are still built tile-wise in a
-// warp-private staging buffer.
+// v3 (register blocking + materialised coefficient mirrors):
+//  * v2 already mirrored the chunk operands to per-worker global BF16 once
+//    per chunk (kB, qB=Qs, ktB, s0b) — that removed v1's dominating per-mma
+//    lane staging (section 16.7s -> 8.79s, first net win over AR).
+//  * v3 assigns each warp an OUTPUT COLUMN stripe and keeps 2-8 accumulator
+//    fragments live, so every B fragment is loaded ONCE per k-tile and
+//    reused across the stripe's row tiles (4-8x fewer B loads — the load
+//    latency was the remaining bottleneck), and materialises the two [C,C]
+//    decay-coefficient matrices (M from a0, W from KQ) as BF16 mirrors so
+//    no tile staging remains at all.
 //
 // Math (identical formulas to the scalar kernel, evaluated as GEMMs):
-//   step 2   U  = K  @ S0,  UQ = Qs @ S0          (C x S) = (C x S)(S x S)
-//   step 2.5 KQ = Qs @ K^T                         (C x C)
-//   step 3   RP[m,:] = b_m (V[m,:] - egc_m U[m,:])           (elementwise)
+//   step 2   U  = K  @ S0,  UQ = Qs @ S0
+//   step 2.5 KQ = Qs @ K^T
+//   step 3   RP[m,:] = b_m (V[m,:] - egc_m U[m,:])          (elementwise)
 //   step 4   D  = M @ RP,  M[a,m] = a0[a,m] e^{g_a-g_m} (m<=a)
 //   step 5   O[a,:] = egc_a UQ[a,:] + (W @ D)[a,:],
 //            W[a,m] = e^{g_a-g_m} KQ[a,m] (m<=a)
 //   step 6   S' = eLast*S0 + Kt^T @ D,  Kt[m,:] = e^{g_last-g_m} K[m,:]
 //
-// Numerics: the persistent state S stays FP32-resident in shared memory
-// across the whole item; GEMM operands are rounded to BF16 at the per-chunk
-// mirror conversion and accumulate in FP32. Tolerance-equal to the scalar
-// chunk pipeline (not bit-identical); serving quality bar = needle+coherence.
+// Numerics: persistent state FP32-resident in smem across the item; GEMM
+// operands rounded to BF16 at the per-chunk mirror conversion, FP32
+// accumulate. Tolerance-equal to the scalar chunk pipeline; serving quality
+// bar = needle + coherence (both green on the v2 math, unchanged here).
 //
-// Shape restriction: S == 128 and C == 64 (the prod GDN shape). The host
-// dispatcher falls back to the scalar kernel otherwise.
+// Shape restriction: S == 128, C == 64 (prod GDN shape); host falls back to
+// the scalar kernel otherwise.
 //
-// Per-worker scratch = 6*C*S floats (192 KiB) as a byte pool:
-//   off   0Ki  uh   fp32 [C,S] (32 KiB)  step-2 out, step-3 in
-//   off  32Ki  uqh  fp32 [C,S] (32 KiB)  step-2 out, step-5 epilogue in
-//   off  64Ki  rphB bf16 [C,S] (16 KiB)  step-3 out, step-4 B
-//   off  80Ki  dB   bf16 [C,S] (16 KiB)  step-4 out, step-5/6 B
-//   off  96Ki  kq   fp32 [C,C] (16 KiB)  step-2.5 out, step-5 W source
-//   off 112Ki  kB   bf16 [C,S] (16 KiB)  K chunk mirror
-//   off 128Ki  qB   bf16 [C,S] (16 KiB)  Qs chunk mirror (q * 1/sqrt(S))
-//   off 144Ki  ktB  bf16 [C,S] (16 KiB)  decay-scaled K mirror (step 6 A)
-//   off 160Ki  s0b  bf16 [S,S] (32 KiB)  per-chunk BF16 state mirror
+// Per-worker scratch = 7*C*S floats (224 KiB) as a byte pool:
+//   off   0Ki  uh    fp32 [C,S] (32 KiB)
+//   off  32Ki  uqh   fp32 [C,S] (32 KiB)
+//   off  64Ki  rphB  bf16 [C,S] (16 KiB)
+//   off  80Ki  dB    bf16 [C,S] (16 KiB)
+//   off  96Ki  kqS   fp32 [C,C] (16 KiB)
+//   off 112Ki  kB    bf16 [C,S] (16 KiB)
+//   off 128Ki  qB    bf16 [C,S] (16 KiB)   (Qs = q * 1/sqrt(S))
+//   off 144Ki  ktB   bf16 [C,S] (16 KiB)
+//   off 160Ki  s0b   bf16 [S,S] (32 KiB)
+//   off 192Ki  mB    bf16 [C,C] ( 8 KiB)
+//   off 200Ki  wB    bf16 [C,C] ( 8 KiB)
 //
 // Launch: grid = [G, 1, 1], block = 256, dynamic smem = S*S*4 (fp32 state).
 
@@ -88,14 +90,13 @@ void deltanet_chunk_forward_batched_tc(
     __shared__ float gc[DCFT_C];
     __shared__ float egc[DCFT_C];
     __shared__ int   itemInfo[4];
-    __shared__ __nv_bfloat16 aStg[DCFT_WARPS][TL * TL]; // M/W tile staging
-    __shared__ float         cStg[DCFT_WARPS][TL * TL]; // accum store tiles
+    __shared__ float cStg[DCFT_WARPS][TL * TL];         // accum store tiles
 
     const int maxChunks = (T + C - 1) / C;
     const size_t stateStride = (size_t)H * S * S;
 
     char* wbase = reinterpret_cast<char*>(scratch)
-                + (size_t)blockIdx.x * 6 * C * S * sizeof(float);
+                + (size_t)blockIdx.x * 7 * C * S * sizeof(float);
     float*         uh   = reinterpret_cast<float*>(wbase);
     float*         uqh  = reinterpret_cast<float*>(wbase + 32 * 1024);
     __nv_bfloat16* rphB = reinterpret_cast<__nv_bfloat16*>(wbase + 64 * 1024);
@@ -105,6 +106,8 @@ void deltanet_chunk_forward_batched_tc(
     __nv_bfloat16* qB   = reinterpret_cast<__nv_bfloat16*>(wbase + 128 * 1024);
     __nv_bfloat16* ktB  = reinterpret_cast<__nv_bfloat16*>(wbase + 144 * 1024);
     __nv_bfloat16* s0b  = reinterpret_cast<__nv_bfloat16*>(wbase + 160 * 1024);
+    __nv_bfloat16* mB   = reinterpret_cast<__nv_bfloat16*>(wbase + 192 * 1024);
+    __nv_bfloat16* wB   = reinterpret_cast<__nv_bfloat16*>(wbase + 200 * 1024);
 
     const float qScale = rsqrtf(static_cast<float>(S));
     const int totalItems = nSeq * H;
@@ -178,9 +181,7 @@ void deltanet_chunk_forward_batched_tc(
             __syncthreads();
             const float gLast = gc[cs - 1];
 
-            // ---- per-chunk BF16 operand mirrors (ONE parallel pass) ------
-            // kB / qB / ktB from global fp32 (zero-padded beyond cs);
-            // s0b from the fp32 smem state.
+            // ---- per-chunk BF16 mirrors (ONE parallel pass) --------------
             for (int i = tid; i < C * S; i += 256) {
                 const int m = i / S, j = i % S;
                 float kv = 0.0f, qv = 0.0f, ktv = 0.0f;
@@ -194,64 +195,82 @@ void deltanet_chunk_forward_batched_tc(
                 qB[i]  = __float2bfloat16(qv);
                 ktB[i] = __float2bfloat16(ktv);
             }
-            for (int i = tid; i < S * S; i += 256) {
-                s0b[i] = __float2bfloat16(s0[i]);
+            // s0b is refreshed by step 6's store loop from chunk to chunk;
+            // only the FIRST chunk mirrors the freshly-loaded state here.
+            if (c0 == 0) {
+                for (int i = tid; i < S * S; i += 256) {
+                    s0b[i] = __float2bfloat16(s0[i]);
+                }
+            }
+            for (int i = tid; i < C * C; i += 256) {
+                const int a = i / C, m = i % C;
+                float x = 0.0f;
+                if (a < cs && m <= a) {
+                    x = a0c[(size_t)a * C + m] * __expf(gc[a] - gc[m]);
+                }
+                mB[i] = __float2bfloat16(x);
             }
             __syncthreads();
 
-            // ---- step 2: U = K @ S0, UQ = Qs @ S0 ------------------------
+            // ---- step 2: U = K @ S0, UQ = Qs @ S0 (warp = column stripe) -
             {
-                const int mT = C / TL, nT = S / TL;        // 4 x 8 per GEMM
-                for (int t = warp; t < 2 * mT * nT; t += DCFT_WARPS) {
-                    const bool isQ = t >= mT * nT;
-                    const int  tt  = isQ ? t - mT * nT : t;
-                    const int  tm  = tt / nT;
-                    const int  tn  = tt % nT;
-                    const __nv_bfloat16* A = isQ ? qB : kB;
-                    float* dst = isQ ? uqh : uh;
-                    FragC acc;
-                    wmma::fill_fragment(acc, 0.0f);
+                const int tn = warp;                   // 8 warps = 8 columns
+                for (int g = 0; g < 2; ++g) {
+                    const __nv_bfloat16* A = (g == 0) ? kB : qB;
+                    float* dst = (g == 0) ? uh : uqh;
+                    FragC acc[4];
+                    for (int tm = 0; tm < 4; ++tm) {
+                        wmma::fill_fragment(acc[tm], 0.0f);
+                    }
                     for (int tk = 0; tk < S / TL; ++tk) {
-                        FragA aF;
                         FragB bF;
                         wmma::load_matrix_sync(
-                            aF, A + (size_t)(tm * TL) * S + tk * TL, S);
-                        wmma::load_matrix_sync(
                             bF, s0b + (size_t)(tk * TL) * S + tn * TL, S);
-                        wmma::mma_sync(acc, aF, bF, acc);
+                        for (int tm = 0; tm < 4; ++tm) {
+                            FragA aF;
+                            wmma::load_matrix_sync(
+                                aF, A + (size_t)(tm * TL) * S + tk * TL, S);
+                            wmma::mma_sync(acc[tm], aF, bF, acc[tm]);
+                        }
                     }
-                    wmma::store_matrix_sync(
-                        dst + (size_t)(tm * TL) * S + tn * TL, acc, S,
-                        wmma::mem_row_major);
+                    for (int tm = 0; tm < 4; ++tm) {
+                        wmma::store_matrix_sync(
+                            dst + (size_t)(tm * TL) * S + tn * TL, acc[tm],
+                            S, wmma::mem_row_major);
+                    }
                 }
             }
             __syncthreads();
 
-            // ---- step 2.5: KQ = Qs @ K^T (B = kB col_major) --------------
+            // ---- step 2.5: KQ = Qs @ K^T (4x4 tiles, warp = (half, col)) -
             {
-                const int mT = C / TL, nT = C / TL;        // 4 x 4
-                for (int t = warp; t < mT * nT; t += DCFT_WARPS) {
-                    const int tm = t / nT;
-                    const int tn = t % nT;
-                    FragC acc;
-                    wmma::fill_fragment(acc, 0.0f);
-                    for (int tk = 0; tk < S / TL; ++tk) {
-                        FragA  aF;
-                        FragBc bF;
+                const int tn = warp % 4;
+                const int th = warp / 4;               // tm half: 0 -> 0..1
+                FragC acc[2];
+                wmma::fill_fragment(acc[0], 0.0f);
+                wmma::fill_fragment(acc[1], 0.0f);
+                for (int tk = 0; tk < S / TL; ++tk) {
+                    FragBc bF;
+                    wmma::load_matrix_sync(
+                        bF, kB + (size_t)(tn * TL) * S + tk * TL, S);
+                    for (int r = 0; r < 2; ++r) {
+                        const int tm = th * 2 + r;
+                        FragA aF;
                         wmma::load_matrix_sync(
                             aF, qB + (size_t)(tm * TL) * S + tk * TL, S);
-                        wmma::load_matrix_sync(
-                            bF, kB + (size_t)(tn * TL) * S + tk * TL, S);
-                        wmma::mma_sync(acc, aF, bF, acc);
+                        wmma::mma_sync(acc[r], aF, bF, acc[r]);
                     }
+                }
+                for (int r = 0; r < 2; ++r) {
+                    const int tm = th * 2 + r;
                     wmma::store_matrix_sync(
-                        kqS + (size_t)(tm * TL) * C + tn * TL, acc, C,
+                        kqS + (size_t)(tm * TL) * C + tn * TL, acc[r], C,
                         wmma::mem_row_major);
                 }
             }
             __syncthreads();
 
-            // ---- step 3: RP = diag(b) (V - diag(egc) U) — bf16 out -------
+            // ---- step 3: RP mirror + W mirror (one parallel pass) --------
             for (int i = tid; i < C * S; i += 256) {
                 const int m = i / S, j = i % S;
                 float r = 0.0f;
@@ -262,37 +281,36 @@ void deltanet_chunk_forward_batched_tc(
                 }
                 rphB[i] = __float2bfloat16(r);
             }
+            for (int i = tid; i < C * C; i += 256) {
+                const int a = i / C, m = i % C;
+                float x = 0.0f;
+                if (a < cs && m <= a) {
+                    x = kqS[(size_t)a * C + m] * __expf(gc[a] - gc[m]);
+                }
+                wB[i] = __float2bfloat16(x);
+            }
             __syncthreads();
 
-            // ---- step 4: D = M @ RP (M staged from a0 * exp decay) -------
+            // ---- step 4: D = M @ RP (warp = column stripe) ---------------
             {
-                const int mT = C / TL, nT = S / TL;
-                for (int t = warp; t < mT * nT; t += DCFT_WARPS) {
-                    const int tm = t / nT;
-                    const int tn = t % nT;
-                    FragC acc;
-                    wmma::fill_fragment(acc, 0.0f);
-                    for (int tk = 0; tk < C / TL; ++tk) {
-                        for (int i = lane; i < TL * TL; i += 32) {
-                            const int a = tm * TL + i / TL;
-                            const int m = tk * TL + i % TL;
-                            float x = 0.0f;
-                            if (a < cs && m <= a) {
-                                x = a0c[(size_t)a * C + m]
-                                  * __expf(gc[a] - gc[m]);
-                            }
-                            aStg[warp][i] = __float2bfloat16(x);
-                        }
-                        __syncwarp();
+                const int tn = warp;
+                FragC acc[4];
+                for (int tm = 0; tm < 4; ++tm) {
+                    wmma::fill_fragment(acc[tm], 0.0f);
+                }
+                for (int tk = 0; tk < C / TL; ++tk) {
+                    FragB bF;
+                    wmma::load_matrix_sync(
+                        bF, rphB + (size_t)(tk * TL) * S + tn * TL, S);
+                    for (int tm = 0; tm < 4; ++tm) {
                         FragA aF;
-                        FragB bF;
-                        wmma::load_matrix_sync(aF, aStg[warp], TL);
                         wmma::load_matrix_sync(
-                            bF, rphB + (size_t)(tk * TL) * S + tn * TL, S);
-                        wmma::mma_sync(acc, aF, bF, acc);
-                        __syncwarp();
+                            aF, mB + (size_t)(tm * TL) * C + tk * TL, C);
+                        wmma::mma_sync(acc[tm], aF, bF, acc[tm]);
                     }
-                    wmma::store_matrix_sync(cStg[warp], acc, TL,
+                }
+                for (int tm = 0; tm < 4; ++tm) {
+                    wmma::store_matrix_sync(cStg[warp], acc[tm], TL,
                                             wmma::mem_row_major);
                     __syncwarp();
                     for (int i = lane; i < TL * TL; i += 32) {
@@ -304,35 +322,26 @@ void deltanet_chunk_forward_batched_tc(
             }
             __syncthreads();
 
-            // ---- step 5: O = diag(egc) UQ + W @ D ------------------------
+            // ---- step 5: O = diag(egc) UQ + W @ D (warp = column) --------
             {
-                const int mT = C / TL, nT = S / TL;
-                for (int t = warp; t < mT * nT; t += DCFT_WARPS) {
-                    const int tm = t / nT;
-                    const int tn = t % nT;
-                    FragC acc;
-                    wmma::fill_fragment(acc, 0.0f);
-                    for (int tk = 0; tk < C / TL; ++tk) {
-                        for (int i = lane; i < TL * TL; i += 32) {
-                            const int a = tm * TL + i / TL;
-                            const int m = tk * TL + i % TL;
-                            float x = 0.0f;
-                            if (a < cs && m <= a) {
-                                x = kqS[(size_t)a * C + m]
-                                  * __expf(gc[a] - gc[m]);
-                            }
-                            aStg[warp][i] = __float2bfloat16(x);
-                        }
-                        __syncwarp();
+                const int tn = warp;
+                FragC acc[4];
+                for (int tm = 0; tm < 4; ++tm) {
+                    wmma::fill_fragment(acc[tm], 0.0f);
+                }
+                for (int tk = 0; tk < C / TL; ++tk) {
+                    FragB bF;
+                    wmma::load_matrix_sync(
+                        bF, dB + (size_t)(tk * TL) * S + tn * TL, S);
+                    for (int tm = 0; tm < 4; ++tm) {
                         FragA aF;
-                        FragB bF;
-                        wmma::load_matrix_sync(aF, aStg[warp], TL);
                         wmma::load_matrix_sync(
-                            bF, dB + (size_t)(tk * TL) * S + tn * TL, S);
-                        wmma::mma_sync(acc, aF, bF, acc);
-                        __syncwarp();
+                            aF, wB + (size_t)(tm * TL) * C + tk * TL, C);
+                        wmma::mma_sync(acc[tm], aF, bF, acc[tm]);
                     }
-                    wmma::store_matrix_sync(cStg[warp], acc, TL,
+                }
+                for (int tm = 0; tm < 4; ++tm) {
+                    wmma::store_matrix_sync(cStg[warp], acc[tm], TL,
                                             wmma::mem_row_major);
                     __syncwarp();
                     for (int i = lane; i < TL * TL; i += 32) {
@@ -347,37 +356,46 @@ void deltanet_chunk_forward_batched_tc(
             }
             __syncthreads();
 
-            // ---- step 6: S' = eLast*S0 + Kt^T @ D (in-place s0 tiles) ----
+            // ---- step 6: S' = eLast*S0 + Kt^T @ D (warp = column) --------
             {
                 const float eLast = egc[cs - 1];
-                const int mT = S / TL, nT = S / TL;        // 8 x 8
-                for (int t = warp; t < mT * nT; t += DCFT_WARPS) {
-                    const int tm = t / nT;
-                    const int tn = t % nT;
+                const int tn = warp;
+                FragC acc[8];
+                for (int tm = 0; tm < 8; ++tm) {
                     for (int i = lane; i < TL * TL; i += 32) {
                         cStg[warp][i] = eLast
                             * s0[(size_t)(tm * TL + i / TL) * S
                                  + tn * TL + i % TL];
                     }
                     __syncwarp();
-                    FragC acc;
-                    wmma::load_matrix_sync(acc, cStg[warp], TL,
+                    wmma::load_matrix_sync(acc[tm], cStg[warp], TL,
                                            wmma::mem_row_major);
-                    for (int tk = 0; tk < C / TL; ++tk) {
+                    __syncwarp();
+                }
+                for (int tk = 0; tk < C / TL; ++tk) {
+                    FragB bF;
+                    wmma::load_matrix_sync(
+                        bF, dB + (size_t)(tk * TL) * S + tn * TL, S);
+                    for (int tm = 0; tm < 8; ++tm) {
                         FragAc aF;
-                        FragB  bF;
                         wmma::load_matrix_sync(
                             aF, ktB + (size_t)(tk * TL) * S + tm * TL, S);
-                        wmma::load_matrix_sync(
-                            bF, dB + (size_t)(tk * TL) * S + tn * TL, S);
-                        wmma::mma_sync(acc, aF, bF, acc);
+                        wmma::mma_sync(acc[tm], aF, bF, acc[tm]);
                     }
-                    wmma::store_matrix_sync(cStg[warp], acc, TL,
+                }
+                for (int tm = 0; tm < 8; ++tm) {
+                    wmma::store_matrix_sync(cStg[warp], acc[tm], TL,
                                             wmma::mem_row_major);
                     __syncwarp();
                     for (int i = lane; i < TL * TL; i += 32) {
-                        s0[(size_t)(tm * TL + i / TL) * S + tn * TL + i % TL]
-                            = cStg[warp][i];
+                        const size_t idx =
+                            (size_t)(tm * TL + i / TL) * S + tn * TL + i % TL;
+                        const float sv = cStg[warp][i];
+                        s0[idx]  = sv;
+                        // Refresh the BF16 mirror in the same pass — the next
+                        // chunk's step 2 reads it, saving the separate
+                        // per-chunk S*S mirror conversion.
+                        s0b[idx] = __float2bfloat16(sv);
                     }
                     __syncwarp();
                 }

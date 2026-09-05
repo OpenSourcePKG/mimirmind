@@ -827,7 +827,7 @@ TEST(cuda_deltanet_chunk_batched_ragged_parity) {
         auto da0  = ops.allocate(totalChunks * H * C * C * sizeof(float));
         auto dscr = ops.allocate(
             ::mimirmind::compute::ComputeOps::kGdnChunkFwdWorkers
-            * 6 * C * S * sizeof(float));
+            * 7 * C * S * sizeof(float));
 
         const ::mimirmind::compute::GdnBatchedShape shape{
             nSeq, maxSeqT, H, S,
@@ -2584,7 +2584,7 @@ TEST(cuda_deltanet_chunk_batched_parity) {
     auto dOut=ops.allocate(nSeq*actP*sizeof(float));
     auto dScr=ops.allocate(
         ::mimirmind::compute::ComputeOps::kGdnChunkFwdWorkers
-        * 6 * C * S * sizeof(float));
+        * 7 * C * S * sizeof(float));
     // 5.21.9: shape-based signatures; ragged fields nullptr => uniform-T
     // layout, semantics of the original Cat C-P1 kernels.
     const ::mimirmind::compute::GdnBatchedShape uShape{
