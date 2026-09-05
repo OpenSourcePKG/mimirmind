@@ -96,7 +96,7 @@ void deltanet_kkt_solve(
 // nSeq single deltanet_kkt_solve calls. Blocks for chunks beyond a
 // sequence's own ceil(Tseq/C) return (their a0 blocks are never read by
 // K2); frozen slots (activeMask 0) return untouched.
-extern "C" __global__ __launch_bounds__(DELTANET_KKT_MAX_C)
+extern "C" __global__ __launch_bounds__(256)
 void deltanet_kkt_solve_batched(
     const float* __restrict__ kIn,
     const float* __restrict__ betaIn,
@@ -121,6 +121,23 @@ void deltanet_kkt_solve_batched(
     int cs = C;
     if (c0 + cs > Tseq) cs = Tseq - c0;
 
+    // v4 fast path: a 1-token chunk's inverse is the 1x1 identity, and K2
+    // only ever reads a0c[0] for it — skip the C*C zeroing (the DECODE slots
+    // of a mixed serving forward all hit this).
+    if (cs == 1) {
+        if (threadIdx.x == 0) {
+            size_t cb;
+            if (seqT != nullptr) {
+                cb = 0;
+                for (int s = 0; s < seq; ++s) cb += (size_t)(seqT[s] + C - 1) / C;
+            } else {
+                cb = (size_t)seq * maxChunks;
+            }
+            a0[(cb + c) * H * C * C + (size_t)h * C * C] = 1.0f;
+        }
+        return;
+    }
+
     const size_t tokBase = (seqOff != nullptr) ? (size_t)seqOff[seq]
                                                : (size_t)seq * (size_t)T;
     const float* __restrict__ k    = kIn    + tokBase * (size_t)H * S;
@@ -134,7 +151,7 @@ void deltanet_kkt_solve_batched(
         chunkBase = (size_t)seq * maxChunks;
     }
 
-    const int t = threadIdx.x;                  // row a (phase 1) / col m (phase 2)
+    const int t = threadIdx.x;
     float* a0c = a0 + (chunkBase + c) * H * C * C + (size_t)h * C * C;
 
     __shared__ float lt[DELTANET_KKT_MAX_C * DELTANET_KKT_MAX_C];
@@ -145,20 +162,27 @@ void deltanet_kkt_solve_batched(
     }
     __syncthreads();
 
-    // Phase 1: strict-lower Gram (non-FMA, see the single-seq kernel's note).
-    if (t < cs) {
-        const float* ka = k + (static_cast<size_t>(c0 + t) * H + h) * S;
-        const float  ba = beta[(c0 + t) * H + h];
-        for (int m = 0; m < t; ++m) {
-            const float* km = k + (static_cast<size_t>(c0 + m) * H + h) * S;
-            float kk = 0.0f;
-            for (int i = 0; i < S; ++i) kk = __fadd_rn(kk, __fmul_rn(ka[i], km[i]));
-            lt[t * C + m] = __fmul_rn(ba, kk);
-        }
+    // Phase 1: strict-lower Gram — v4 (5.21.9): the (a, m) entries are
+    // independent, so distribute the PAIRS across the whole block instead of
+    // one serial row per thread (the old form left thread a computing a dots
+    // serially — the 2026-09-05 sub-split profile showed K1 at 9% of the
+    // whole prefill, 2x the entire TC chunk forward). Each dot keeps its
+    // serial ascending-i non-FMA order, so every entry is BIT-IDENTICAL to
+    // the previous form — only the thread assignment changes.
+    for (int p = t; p < C * C; p += blockDim.x) {
+        const int a = p / C;
+        const int m = p % C;
+        if (a >= cs || m >= a) continue;
+        const float* ka = k + (static_cast<size_t>(c0 + a) * H + h) * S;
+        const float* km = k + (static_cast<size_t>(c0 + m) * H + h) * S;
+        const float  ba = beta[(c0 + a) * H + h];
+        float kk = 0.0f;
+        for (int i = 0; i < S; ++i) kk = __fadd_rn(kk, __fmul_rn(ka[i], km[i]));
+        lt[a * C + m] = __fmul_rn(ba, kk);
     }
     __syncthreads();
 
-    // Phase 2: unit-lower inverse, thread = column m.
+    // Phase 2: unit-lower inverse, thread = column m (unchanged).
     if (t < cs) {
         a0c[t * C + t] = 1.0f;
         for (int a = t + 1; a < cs; ++a) {

@@ -2030,9 +2030,12 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
         }
         float* const gCum = s.ssmGCum.as<float>();
         float* const a0   = s.ssmA0.as<float>();
+        _ops.profileSection("gdn.k0");   // cumgate (chunk sub-split)
         _ops.deltanetChunkCumGateBatchedAsync(gateBuf, gCum, gdnShape, kChunkC);
+        _ops.profileSection("gdn.k1");   // KKT triangular inverse (sub-split)
         _ops.deltanetKktSolveInverseBatchedAsync(kBuf, betaBuf, a0, gdnShape,
                                                  kChunkC);
+        _ops.profileSection("gdn.k2");   // chunk forward (sub-split)
         _ops.deltanetChunkForwardBatchedAsync(
             qBuf, kBuf, vBuf, gCum, betaBuf, a0, stateBase, deltaOut,
             s.ssmChunkScratch.as<float>(), gdnShape, kChunkC);

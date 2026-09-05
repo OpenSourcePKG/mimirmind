@@ -1191,6 +1191,23 @@ if(MIMIRMIND_ENABLE_CUDA)
         CUDA_STANDARD_REQUIRED ON)
     target_link_libraries(microbench_moe_serving PRIVATE CUDA::cudart)
 
+    # microbench_gdn_chunk_tc — chunked-GDN prefill K2 head-to-head probe
+    # (links the real scalar + tensor-core batched chunk-forward kernels),
+    # roadmap 5.21.9 v4. Safe ncu target per the ncu-canary runbook.
+    #   cmake --build build-cudnn --target microbench_gdn_chunk_tc &&
+    #   ./build-cudnn/microbench_gdn_chunk_tc [nSeq] [T] [iters]
+    add_executable(microbench_gdn_chunk_tc
+        tools/microbench/gdn_chunk_tc_bench.cu
+        kernels/cuda/llm/deltanet_chunk_forward_batched.cu
+        kernels/cuda/llm/deltanet_chunk_forward_batched_tc.cu)
+    set_target_properties(microbench_gdn_chunk_tc PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        # BF16 wmma needs >= compute_80 (the PTX kernel build sets this via
+        # its own flags; an executable target must pin it explicitly).
+        CUDA_ARCHITECTURES 80)
+    target_link_libraries(microbench_gdn_chunk_tc PRIVATE CUDA::cudart)
+
     # microbench_gdn_recur — isolated GatedDeltaNet DECODE recurrence roofline
     # probe (links the real prod v3_gatefused kernel), roadmap 5.18.10 Inc-1.
     # Settles whether gdn.recur (~16% of conc64 decode) is at the SSM-state

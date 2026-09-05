@@ -166,6 +166,46 @@ void deltanet_chunk_forward_batched_tc(
         }
         __syncthreads();
 
+        // v4: single-token items (the DECODE slots of a mixed serving
+        // forward) skip the whole chunk apparatus — mirrors, coefficient
+        // GEMMs and a0 are pure overhead for one token. Run the plain
+        // AR delta-rule step instead (same math as the v3 recurrence,
+        // consuming the pre-gated gLog/sigmoided beta this pipeline gets).
+        if (Tseq == 1) {
+            const float g1 = __expf(gCum_[h]);
+            const float b1 = beta_[h];
+            float* ksh = cStg[0];       // [S] k row     (reuse accum tiles)
+            float* qsh = cStg[2];       // [S] scaled q
+            if (tid < S) {
+                const size_t base = (size_t)h * S + tid;
+                ksh[tid] = k_[base];
+                qsh[tid] = q_[base] * qScale;
+            }
+            __syncthreads();
+            if (tid < S) {
+                const int j = tid;
+                float sk = 0.0f;
+                for (int i = 0; i < S; ++i) {
+                    sk += (s0[(size_t)i * S + j] * g1) * ksh[i];
+                }
+                const float dj = (v_[(size_t)h * S + j] - sk) * b1;
+                float oj = 0.0f;
+                for (int i = 0; i < S; ++i) {
+                    const float sij = s0[(size_t)i * S + j] * g1
+                                    + ksh[i] * dj;
+                    s0[(size_t)i * S + j] = sij;
+                    oj += sij * qsh[i];
+                }
+                out_[(size_t)h * S + j] = oj;
+            }
+            __syncthreads();
+            for (int i = tid; i < S * S; i += 256) {
+                st[i] = s0[i];
+            }
+            __syncthreads();
+            continue;
+        }
+
         for (int c0 = 0; c0 < Tseq; c0 += C) {
             const int cs  = (C < Tseq - c0) ? C : (Tseq - c0);
             const int cIx = c0 / C;

@@ -2352,10 +2352,12 @@ void GpuOps::deltanetKktSolveInverseBatchedAsync(
     kern.setPtr  (7, shape.activeMask);
     kern.setPtr  (8, shape.seqT);
     kern.setPtr  (9, shape.seqOff);
+    // v4: 256 threads — phase 1 distributes the independent Gram pairs
+    // across the whole block (bit-identical entries; see the kernel note).
     kern.launch(_ctx.stream(),
                 static_cast<std::uint32_t>(maxChunks * H),
                 static_cast<std::uint32_t>(nSeq), 1,
-                static_cast<std::uint32_t>(C), 1, 1);
+                256, 1, 1);
 }
 
 void GpuOps::deltanetKktSolveInverseAsync(const float* k_, const float* beta,
