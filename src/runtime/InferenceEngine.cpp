@@ -468,11 +468,44 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     finalizeLoad();
 }
 
+void InferenceEngine::applyEarlyLoaderProfileFlags() {
+    if (_computeCtx->kind() != core::backend::BackendKind::Cuda) {
+        return;
+    }
+    if (std::getenv("MIMIRMIND_GROUPED_MOE") != nullptr) {
+        return;   // explicit env wins — do not override
+    }
+    const std::string fp = core::backend::computeHwFingerprint(
+        core::backend::gatherHostInfo(),
+        core::backend::identityFromBackend(_computeCtx->backend()));
+    const char* dirEnv = std::getenv("MIMIRMIND_PROBE_DIR");
+    const std::string dir =
+        dirEnv ? dirEnv : "/usr/local/share/mimirmind/configs";
+    auto picks = loadProbePicks(dir, fp);
+    if (!picks) {
+        return;
+    }
+    if (!_modelIdHint.empty()) {
+        if (auto over = loadModelOverlay(dir, fp, _modelIdHint)) {
+            mergeOverlay(*picks, *over);
+        }
+    }
+    if (picks->applyGroupedMoe) {
+        const std::string mode = std::to_string(*picks->applyGroupedMoe);
+        ::setenv("MIMIRMIND_GROUPED_MOE", mode.c_str(), 1);
+        MM_LOG_INFO("probe",
+                    "early loader flag (pre-Nvfp4Loader): grouped-MoE path -> "
+                    "mode {} (model '{}')",
+                    mode, _modelIdHint);
+    }
+}
+
 void InferenceEngine::loadModelNvfp4(std::string_view checkpointDir,
                                      std::string_view tokenizerGguf) {
     if (_modelLoaded) {
         throw std::runtime_error("InferenceEngine: model already loaded");
     }
+    applyEarlyLoaderProfileFlags();
     // The NVFP4 checkpoint load pipeline lives in engine::Nvfp4Loader (a friend
     // collaborator) to keep this translation unit focused on generation. It
     // populates _config / _tokenizer / _materializedBf16 / _weights; we run the
@@ -610,6 +643,7 @@ void InferenceEngine::loadModelAttachedNvfp4(
 
     // The materialization reads the shards from `sm` (shm-backed) and uploads
     // BF16 to the device; the text sidecars come from the local checkpointDir.
+    applyEarlyLoaderProfileFlags();
     {
         core::gpu::ScopedAllocCategory _wc{core::gpu::AllocCategory::Weights};
         engine::Nvfp4Loader::load(*this, checkpointDir, tokenizerGguf, &sm);
@@ -770,7 +804,7 @@ void InferenceEngine::finalizeLoad() {
         const char* dirEnv = std::getenv("MIMIRMIND_PROBE_DIR");
         const std::string dir =
             dirEnv ? dirEnv : "/usr/local/share/mimirmind/configs";
-        const auto picks = loadProbePicks(dir, fp);
+        auto picks = loadProbePicks(dir, fp);
         if (!picks) {
             MM_LOG_INFO("probe",
                         "HW fingerprint={} backend=Cuda — per-HW profile not "
@@ -781,6 +815,19 @@ void InferenceEngine::finalizeLoad() {
                         "HW fingerprint={} backend=Cuda — per-HW profile FOUND "
                         "under {}, applying Layer-2 flags (explicit env wins)",
                         fp, dir);
+            // Per-(HW x model) overlay: the same flag can be validated-safe on
+            // one checkpoint and unsafe on another on the SAME GPU (e.g.
+            // F32_TC_PREFILL, or GROUPED_MOE's 512-expert TC path). Model wins
+            // over the HW profile; an explicit env still wins over both.
+            if (!_modelIdHint.empty()) {
+                if (auto over = loadModelOverlay(dir, fp, _modelIdHint)) {
+                    mergeOverlay(*picks, *over);
+                    MM_LOG_INFO("probe",
+                                "  per-model overlay FOUND for '{}' — merged "
+                                "(model wins over HW profile)",
+                                _modelIdHint);
+                }
+            }
             if (picks->applyPrefillCudnn &&
                 !_ops->prefillCudnnEnvOverridden()) {
                 _ops->setPrefillCudnn(*picks->applyPrefillCudnn);
@@ -835,6 +882,17 @@ void InferenceEngine::finalizeLoad() {
                 ::setenv("MIMIRMIND_MOE_DECODE_REG", mode.c_str(), 1);
                 MM_LOG_INFO("probe",
                             "  profile applied: MoE decode register-staged -> mode {}",
+                            mode);
+            }
+            // Grouped-MoE path selector (model overlay only; 0=blocked-only,
+            // 3=FP4-TC-only). Backend + loader getenv-owned, so setenv before
+            // the backend ctor; explicit env wins.
+            if (picks->applyGroupedMoe &&
+                std::getenv("MIMIRMIND_GROUPED_MOE") == nullptr) {
+                const std::string mode = std::to_string(*picks->applyGroupedMoe);
+                ::setenv("MIMIRMIND_GROUPED_MOE", mode.c_str(), 1);
+                MM_LOG_INFO("probe",
+                            "  profile applied: grouped-MoE path -> mode {}",
                             mode);
             }
         }

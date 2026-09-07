@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "model_id": "qwen3-coder-next",
+  "_note": "Per-(HW x model) overlay: overrides the GB10 HW profile for this 512-expert compressed-tensors checkpoint. Model wins over the HW profile; explicit env still wins over both.",
+  "flags": {
+    "MIMIRMIND_GROUPED_MOE": {
+      "value": 3,
+      "apply": true,
+      "effect": "FP4-TC grouped MoE path. The blocked device-driven grouped kernels scale catastrophically at 512 experts (rt.gather ~5.4s/chunk, moe.gemm ~71s/forward -> TTFT 35-76s). TC path: TTFT ~2.3s, decode 28 tok/s, AND lower peak mem (drops the blocked bank: 54.5GB vs 57GB)."
+    },
+    "MIMIRMIND_F32_TC_PREFILL": {
+      "value": 0,
+      "apply": true,
+      "effect": "OFF. The F32->BF16 TF32-TC prefill GEMM (matmul_bf16_gemm_tf32_tc) illegal-accesses on this checkpoint at large prefill. The HW profile has it apply:true value:1 (validated on qwen3.6, model-blind); this overlay pins it off for coder-next."
+    }
+  }
+}

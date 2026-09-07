@@ -217,6 +217,12 @@ public:
     /// loaded (no hot-swap in M7a) or the file is malformed.
     void loadModel(std::string_view ggufPath);
 
+    /// Serve model id (config.serve `id`) for the load about to run. Set by the
+    /// serve driver BEFORE loadModel*, so the Layer-2 profile step can look up
+    /// the per-(HW x model) overlay (configs/hw/<fp>/model-overlays/<id>.json). Empty =
+    /// no overlay (HW-profile picks only). Cleared after each load.
+    void setModelIdHint(std::string_view id) { _modelIdHint = std::string{id}; }
+
     /**
      * Load a ModelOpt NVFP4 checkpoint directory (CUDA/Bragi only). Uploads
      * the NVFP4/FP8 weights, dequantises them to BF16 on device (weight-only
@@ -885,6 +891,13 @@ private:
     /// line.
     void finalizeLoad();
 
+    /// Apply profile/overlay flags that the NVFP4 loader itself consumes
+    /// (currently MIMIRMIND_GROUPED_MOE, which selects the expert-bank layout)
+    /// BEFORE Nvfp4Loader::load runs — finalizeLoad's Layer-2 block is too late
+    /// (the banks are already allocated by then). Uses `_modelIdHint` for the
+    /// per-model overlay; explicit env still wins. CUDA-only, no-op otherwise.
+    void applyEarlyLoaderProfileFlags();
+
     /// L0-only downcast helpers for the paths that still reach L0-native
     /// APIs (self-test, KTile-Q8 autotune, CommandQueue / curLenSlot for
     /// CLR record/replay). The paths that call these must first check
@@ -968,6 +981,7 @@ private:
 
     core::gguf::GgufReader                  _reader;
     model::LlmConfig                   _config;
+    std::string                        _modelIdHint;  // per-load, for the profile overlay
     model::Tokenizer                   _tokenizer;
 #ifdef MIMIRMIND_HAVE_CUDA
     // NVFP4 load path (loadModelNvfp4). `_materializedBf16` owns the BF16

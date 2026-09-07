@@ -46,6 +46,14 @@ struct ProbePicks {
     // valued, not a bool: 0=off, 1=m2reg@tileM2, 4=m4reg@tileM4 — the profile's
     // integer `value` is passed through verbatim (5.18.14).
     std::optional<int> applyMoeDecodeReg;
+    // Mode-valued grouped-MoE prefill/decode path selector (0=blocked-only,
+    // 3=FP4-TC-only). MODEL-DEPENDENT: 512-expert checkpoints (Qwen3-Coder-Next)
+    // need the TC path (the blocked device-driven grouped kernels scale
+    // catastrophically at 512 experts — seconds/forward), while it also drops
+    // the blocked bank so peak memory is LOWER. Lives in the per-model overlay,
+    // not the HW profile, because the right value differs per checkpoint on the
+    // same GPU. nullopt = keep code-default / env.
+    std::optional<int> applyGroupedMoe;
 };
 
 /**
@@ -56,5 +64,25 @@ struct ProbePicks {
  */
 [[nodiscard]] std::optional<ProbePicks>
 loadProbePicks(const std::string& dir, const std::string& fingerprint);
+
+/**
+ * Load a per-model flag overlay from
+ * configs/hw/{fingerprint}/model-overlays/{modelId}.json under `dir` and return its
+ * `flags` picks (same schema as the HW profile's flags block: an entry drives
+ * a flag only with "apply": true). This is the (hardware x model) key: the same
+ * flag can be validated-safe on one checkpoint and unsafe on another running on
+ * the same GPU (e.g. F32_TC_PREFILL, or GROUPED_MOE's 512-expert TC path).
+ * Returns nullopt on any miss (no file / parse error), so the caller keeps the
+ * HW-profile picks unchanged. `modelId` is sanitised to a bare filename.
+ */
+[[nodiscard]] std::optional<ProbePicks>
+loadModelOverlay(const std::string& dir, const std::string& fingerprint,
+                 const std::string& modelId);
+
+/**
+ * Overlay `over`'s set (non-nullopt) flag intents onto `base`, model-wins.
+ * Only the Layer-2 flag optionals are merged; identity fields stay `base`'s.
+ */
+void mergeOverlay(ProbePicks& base, const ProbePicks& over);
 
 } // namespace mimirmind::runtime

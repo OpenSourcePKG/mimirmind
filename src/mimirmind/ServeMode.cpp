@@ -500,6 +500,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             return std::nullopt;
         }
         try {
+            e.setModelIdHint(m.id);   // for the per-model profile overlay
             if (result->manifest.format == "nvfp4") {
                 // GB10 shm attach of an NVFP4 checkpoint: the chunks hold the
                 // raw safetensors shards; the engine reconstructs them and runs
@@ -678,6 +679,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                     attachedKeepAlive.push_back(std::move(ka->first));
                     attachedKeepAlive.push_back(std::move(ka->second));
                 } else {
+                    e->setModelIdHint(m.id);   // for the per-model profile overlay
                     if (runtime::nvfp4::resolveModelFormat(m.format, m.path)
                         == core::config::ModelFormat::Nvfp4) {
                         e->loadModelNvfp4(m.path, m.tokenizerGguf);
@@ -732,6 +734,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             attachedKeepAlive.push_back(std::move(ka->first));
             attachedKeepAlive.push_back(std::move(ka->second));
         } else {
+            e->setModelIdHint(m.id);   // for the per-model profile overlay
             if (runtime::nvfp4::resolveModelFormat(m.format, m.path)
                 == core::config::ModelFormat::Nvfp4) {
                 MM_LOG_INFO("main", "serve: loading NVFP4 model '{}' (id='{}')",
