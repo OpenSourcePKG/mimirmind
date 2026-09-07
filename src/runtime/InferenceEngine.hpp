@@ -867,7 +867,8 @@ private:
                             float*                         logits,
                             float*                         matmulScratch,
                             std::span<const std::int32_t>  recentTokens,
-                            const compute::SamplingParams& sampling);
+                            const compute::SamplingParams& sampling,
+                            bool                           skipFinalNorm = false);
 
     /// Allocate (lazily on first call) the persistent KV-cache at the
     /// configured `_maxContextTokens`. Validates that the request fits.
@@ -980,6 +981,7 @@ private:
     std::unique_ptr<model::FusedQkvWeights> _fusedQkv;
     std::unique_ptr<arch::ArchBackend>      _backend;
     bool                               _modelLoaded{false};
+    std::string                        _pleCheckpointDir;  ///< 5.27 I-4: qwen4_exp PLE mmap dir
 
     // --- Persistent inference state (M9.1 prefix cache) -----------------
     // KvCache + BlockBuffers + scratch buffers stay around across

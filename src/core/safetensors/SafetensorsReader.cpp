@@ -75,4 +75,70 @@ SafetensorsReader::tensorBytes(const SafetensorsTensor& t) const noexcept {
     return whole.subspan(t.dataBegin, t.nbytes);
 }
 
+void SafetensorsReader::renameTensors(
+    const std::function<std::string(const std::string&)>& fn) {
+    _index.clear();
+    for (std::size_t i = 0; i < _tensors.size(); ++i) {
+        _tensors[i].name = fn(_tensors[i].name);
+        _index.emplace(_tensors[i].name, i);
+    }
+}
+
+bool SafetensorsReader::addDerivedRowSlice(std::string_view src,
+                                           std::string      newName,
+                                           std::uint64_t    rowBegin,
+                                           std::uint64_t    rowCount) {
+    const SafetensorsTensor* s = find(src);
+    if (s == nullptr || s->shape.empty() || s->shape[0] == 0) {
+        return false;
+    }
+    const std::uint64_t rows = s->shape[0];
+    if (rowBegin + rowCount > rows || rowCount == 0
+        || s->nbytes % rows != 0 || s->nelements % rows != 0) {
+        return false;
+    }
+    const std::size_t bytesPerRow = s->nbytes / rows;
+    const std::uint64_t elemsPerRow = s->nelements / rows;
+    SafetensorsTensor d;
+    d.name      = std::move(newName);
+    d.dtype     = s->dtype;
+    d.shape     = s->shape;
+    d.shape[0]  = rowCount;
+    d.nelements = elemsPerRow * rowCount;
+    d.nbytes    = bytesPerRow * rowCount;
+    d.dataBegin = s->dataBegin + bytesPerRow * rowBegin;
+    d.dataEnd   = d.dataBegin + d.nbytes;
+    _tensors.push_back(std::move(d));   // pointers invalidated; see header
+    return true;
+}
+
+bool SafetensorsReader::duplicateTensorAs(std::string_view src,
+                                          std::string      newName) {
+    const SafetensorsTensor* s = find(src);
+    if (s == nullptr) {
+        return false;
+    }
+    SafetensorsTensor d = *s;
+    d.name = std::move(newName);
+    _tensors.push_back(std::move(d));
+    return true;
+}
+
+bool SafetensorsReader::removeTensor(std::string_view name) {
+    for (auto it = _tensors.begin(); it != _tensors.end(); ++it) {
+        if (it->name == name) {
+            _tensors.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+void SafetensorsReader::rebuildIndex() {
+    _index.clear();
+    for (std::size_t i = 0; i < _tensors.size(); ++i) {
+        _index.emplace(_tensors[i].name, i);
+    }
+}
+
 } // namespace mimirmind::core::safetensors

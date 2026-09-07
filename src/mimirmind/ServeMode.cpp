@@ -746,7 +746,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 
         const auto& arch = e->config().architecture;
         if (arch != "qwen2" && arch != "llama" && arch != "gemma4" &&
-            arch != "qwen35moe") {
+            arch != "qwen35moe" && arch != "qwen4_exp") {
             const std::string msg =
                 "serve: architecture '" + arch + "' (model id '" + m.id +
                 "') is not implemented yet. See "
@@ -2646,6 +2646,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     // paged pool. qwen35moe keeps its CUDA paged path.
     std::unique_ptr<::mimirmind::runtime::serving::ContinuousBatcher> batcher;
     if ((engine.config().architecture == "qwen35moe" ||
+         engine.config().architecture == "qwen4_exp" ||
          engine.supportsBatchedDecode()) &&
         engine.servingClassEnabled()) {
         std::size_t maxBatch =
@@ -2773,7 +2774,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 
             const auto& arch = e.config().architecture;
             if (arch != "qwen2" && arch != "llama" && arch != "gemma4" &&
-                arch != "qwen35moe") {
+                arch != "qwen35moe" && arch != "qwen4_exp") {
                 throw std::runtime_error(
                     "M-Munin.3 pool: architecture '" + arch + "' (model '" +
                     modelId + "') is not implemented");
@@ -2788,7 +2789,8 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 
             // Per-slot continuous batcher — same eligibility + config knobs
             // as the default engine's, above.
-            if ((arch == "qwen35moe" || e.supportsBatchedDecode()) &&
+            if ((arch == "qwen35moe" || arch == "qwen4_exp" ||
+                 e.supportsBatchedDecode()) &&
                 e.servingClassEnabled()) {
                 std::size_t maxBatch =
                     std::max<std::size_t>(1, e.batchCapacity().sustainableBatch);

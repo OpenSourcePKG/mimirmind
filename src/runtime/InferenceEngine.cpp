@@ -29,6 +29,7 @@
 #include "runtime/thermal/ThermalGuard.hpp"
 #include "runtime/arch/ArchBackend.hpp"
 #include "runtime/arch/Qwen3_5MoeBackend.hpp"
+#include "runtime/arch/Qwen4ExpBackend.hpp"
 #include "runtime/serving/PagedKvPool.hpp"
 
 #ifdef MIMIRMIND_HAVE_HIP
@@ -47,6 +48,7 @@
 #include "core/safetensors/SafetensorsModel.hpp"
 #include "runtime/nvfp4/ComputeOpsUploader.hpp"
 #include "runtime/nvfp4/NvFp4WeightsMap.hpp"
+#include "runtime/nvfp4/PleNgramTable.hpp"
 #include "runtime/nvfp4/Qwen3_5MoeConfig.hpp"
 #include <filesystem>
 #include <sstream>
@@ -479,6 +481,9 @@ void InferenceEngine::loadModelNvfp4(std::string_view checkpointDir,
         core::gpu::ScopedAllocCategory _wc{core::gpu::AllocCategory::Weights};
         engine::Nvfp4Loader::load(*this, checkpointDir, tokenizerGguf);
     }
+    // 5.27 I-4: remember the checkpoint dir so finalizeLoad can host-mmap the
+    // off-VRAM PLE n-gram table for qwen4_exp (NVFP4-load path only).
+    _pleCheckpointDir = std::string{checkpointDir};
     finalizeLoad();
 }
 
@@ -847,6 +852,32 @@ void InferenceEngine::finalizeLoad() {
         _config.architecture, _config, *_weights, _fusedQkv.get(),
         *_ops, *_gmm, _opProfiler.value(), _cfg.features.moeGroup,
         _cfg.features.moeFusedDown != core::config::TriState::Disable);
+
+    // 5.27 I-4: for qwen4_exp, host-mmap the off-VRAM PLE n-gram table and hand
+    // it to the backend (with the ple gguf layer + eos). No-op for other archs /
+    // GGUF loads (empty _pleCheckpointDir). The table stays on disk (page-cache);
+    // only the ~16 rows/token the gather touches ever fault in.
+    if (_config.architecture == "qwen4_exp" && !_config.pleLayerIds.empty()
+        && !_pleCheckpointDir.empty()) {
+        auto* q4e = dynamic_cast<arch::Qwen4ExpBackend*>(_backend.get());
+        if (q4e != nullptr) {
+            const int pleGgufLayer = static_cast<int>(_config.pleLayerIds[0]) - 1;
+            const std::size_t ngramHeads =
+                (_config.ngramSize - 1) * _config.headsPerNgram;
+            const std::size_t cols =
+                ngramHeads != 0 ? _config.pleEmbedDim / ngramHeads : 0;
+            runtime::nvfp4::PleNgramTable table;
+            table.open(_pleCheckpointDir,
+                       "model.language_model.layers." + std::to_string(pleGgufLayer),
+                       cols);
+            const std::int64_t rows = table.rowsTotal();
+            q4e->setPleTable(std::move(table), pleGgufLayer,
+                             static_cast<std::int64_t>(_tokenizer.eosId()));
+            MM_LOG_INFO("engine",
+                        "loadModel: qwen4_exp PLE table host-mmap'd off-VRAM "
+                        "(layer {}, {} rows x {} cols)", pleGgufLayer, rows, cols);
+        }
+    }
 
     _modelLoaded = true;
     // Defensive: a previous model's KV state must not survive into the
@@ -1259,7 +1290,8 @@ InferenceEngine::sampleNext(const float*                   hidden,
                             float*                         logits,
                             float*                         matmulScratch,
                             std::span<const std::int32_t>  recentTokens,
-                            const compute::SamplingParams& sampling) {
+                            const compute::SamplingParams& sampling,
+                            bool                           skipFinalNorm) {
     // Final-norm runs on the same queue as the residual-add that
     // produced `hidden`. The subsequent _gmm->matmul flushes and syncs,
     // so CPU argmax sees a fully-resolved logits buffer.
@@ -1270,16 +1302,23 @@ InferenceEngine::sampleNext(const float*                   hidden,
     // norm_shift = 0.0 because the HF reference uses standard weight
     // (init at 1.0) — so the GGUF weight is already the multiplicative
     // scale.
-    _ops->rmsNormAsync(
-        hidden, 1, _config.embeddingLength,
-        static_cast<const float*>(outNorm.usmPtr),
-        _config.rmsNormEps,
-        normScratch);
+    // 5.27 I-3: for Hyper-Connections archs (qwen4_exp) `hidden` is already the
+    // mixer-collapsed, mixer-hc-norm'd state — skip the plain final RMSNorm (the
+    // mixer replaced it) and feed lm_head directly.
+    const float* lmInput = hidden;
+    if (!skipFinalNorm) {
+        _ops->rmsNormAsync(
+            hidden, 1, _config.embeddingLength,
+            static_cast<const float*>(outNorm.usmPtr),
+            _config.rmsNormEps,
+            normScratch);
+        lmInput = normScratch;
+    }
 
     _gmm->matmul(
         lmHead.type, lmHead.usmPtr,
         vocab_lm, _config.embeddingLength,
-        normScratch, 1,
+        lmInput, 1,
         logits, matmulScratch);
 
     // Bring logits over to a plain host buffer before the sampler's
@@ -1768,12 +1807,19 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // prompt so an immediate first-token repeat (e.g. echoing the
         // prompt's last phrase) is discouraged as well. Sampler
         // subspans to `sampling.penaltyWindow` internally.
+        // 5.27 I-3: collapse the Hyper-Connections streams into xBuf (replaces
+        // the plain output_norm) so the last row is the lm_head input.
+        const bool useHc = _backend->usesHyperConnections();
+        if (useHc) {
+            _backend->collapseHyperStreams(prefillCount, buffers, xBuf);
+        }
         const float* lastRow = xBuf + (prefillCount - 1) * d_model;
         std::int32_t nextId = sampleNext(lastRow, vocab_lm,
                                          *outNorm, *lmHead,
                                          normFinal, logits, logitsSc,
                                          promptIds,
-                                         params.sampling);
+                                         params.sampling,
+                                         /*skipFinalNorm=*/useHc);
 
         generated.reserve(maxNew);
         generated.push_back(nextId);
@@ -2090,11 +2136,17 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             }
             cache.commit(1);
 
+            // 5.27 I-3: collapse the HC streams for this decode step (replaces
+            // output_norm) into xBuf before lm_head.
+            if (useHc) {
+                _backend->collapseHyperStreams(1, buffers, xBuf);
+            }
             nextId = sampleNext(xBuf, vocab_lm,
                                 *outNorm, *lmHead,
                                 normFinal, logits, logitsSc,
                                 std::span<const std::int32_t>{generated},
-                                params.sampling);
+                                params.sampling,
+                                /*skipFinalNorm=*/useHc);
             generated.push_back(nextId);
 
             // Per-token telemetry. Both the env-controlled NDJSON sink

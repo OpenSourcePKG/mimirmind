@@ -9,6 +9,7 @@
 
 #include "compute/cuda/CudaMaterializerOps.hpp"
 #include "core/gpu/cuda/CudaComputeContext.hpp"
+#include "core/gpu/cuda/CudaMemoryAllocator.hpp"
 #include "core/log/Log.hpp"
 #include "core/modelopt/BlockScaleSwizzle.hpp"
 #include "core/modelopt/CompressedTensorsConfig.hpp"
@@ -31,6 +32,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -52,6 +54,112 @@ void Nvfp4Loader::load(InferenceEngine&, std::string_view, std::string_view,
 #else
 
 namespace {
+
+// GB10 driver behaviour (verified via OOM-dump forensics on the 122B load):
+// cudaFree hands device pages back to the DRIVER pool, not the OS, and the
+// pool does not serve differently-sized re-allocations — interleaving
+// ~400 MiB source frees with ~500 MiB bank allocations therefore grows the
+// physical footprint monotonically until the global OOM killer fires (or,
+// under pool pressure, live neighbouring managed mappings get corrupted:
+// the blk.7/blk.22 illegal-access ladder). Fix: every big block (expert
+// source slab, expert bank) comes from ONE process-lifetime pool in ONE
+// size class, so a freed source slab physically becomes the next bank.
+constexpr std::size_t kBigBlockMin   = 256ull << 20;
+constexpr std::size_t kBigBlockQuant = 512ull << 20;
+
+struct BigBlockPool {
+    std::mutex                          mtx;
+    std::vector<void*>                  freeBlocks;   // all kBigBlockQuant
+    std::vector<compute::ComputeBuffer> chunks;       // owned for process life
+};
+
+BigBlockPool& bigBlockPool() {
+    static BigBlockPool* p = new BigBlockPool();   // intentionally leaked
+    return *p;
+}
+
+compute::ComputeBuffer bigBlockAlloc(core::cuda::CudaComputeContext& ctx,
+                                     std::size_t bytes) {
+    if (bytes > kBigBlockQuant) {
+        throw std::runtime_error(
+            "bigBlockAlloc: request " + std::to_string(bytes)
+            + " exceeds the 512 MiB block quantum");
+    }
+    auto& pool = bigBlockPool();
+    void* ptr = nullptr;
+    {
+        std::lock_guard<std::mutex> g(pool.mtx);
+        if (!pool.freeBlocks.empty()) {
+            ptr = pool.freeBlocks.back();
+            pool.freeBlocks.pop_back();
+        }
+    }
+    if (ptr == nullptr) {
+        // Managed, not Device: the pool never returns blocks to the driver
+        // (recycling is in-process), so the driver's size-class reuse quirk
+        // cannot bite — and Managed avoids the ~97 GiB device carve-out the
+        // 122B load hit at 180 pooled chunks (90 GiB).
+        void* raw = ctx.allocator().allocate(
+            kBigBlockQuant, core::cuda::CudaAllocKind::Managed);
+        if (raw == nullptr) {
+            throw std::runtime_error(
+                "bigBlockAlloc: OOM allocating a 512 MiB pool block");
+        }
+        compute::ComputeBuffer chunk{
+            raw, kBigBlockQuant,
+            [](void* p, std::size_t b, void* c) noexcept {
+                static_cast<core::cuda::CudaMemoryAllocator*>(c)
+                    ->deallocate(p, b, core::cuda::CudaAllocKind::Managed);
+            },
+            &ctx.allocator()};
+        ptr = raw;
+        std::lock_guard<std::mutex> g(pool.mtx);
+        pool.chunks.push_back(std::move(chunk));
+        static const bool kDiag = std::getenv("MIMIRMIND_Q4E_DIAG") != nullptr;
+        if (kDiag) {
+            MM_LOG_INFO("q4ediag", "pool: new chunk #{} (free={} bytes req={})",
+                        pool.chunks.size(), pool.freeBlocks.size(), bytes);
+        }
+    }
+    // Non-owning view; the "deleter" returns the block to the pool.
+    return compute::ComputeBuffer{
+        ptr, bytes,
+        [](void* p, std::size_t, void*) noexcept {
+            auto& pl = bigBlockPool();
+            std::lock_guard<std::mutex> g(pl.mtx);
+            pl.freeBlocks.push_back(p);
+        },
+        nullptr};
+}
+
+/// DeviceUploader that routes big allocations (the per-expert source slabs)
+/// through the big-block pool and everything else to the plain ComputeOps
+/// path (managed memory — host-readable, as embeddings/norms need).
+class PooledUploader final : public runtime::nvfp4::DeviceUploader {
+public:
+    PooledUploader(core::cuda::CudaComputeContext& ctx,
+                   compute::ComputeOps&            ops) noexcept
+        : _ctx(ctx), _inner(ops) {}
+
+    [[nodiscard]] compute::ComputeBuffer allocate(std::size_t bytes) override {
+        // Pool only quantum-sized blocks (the expert source slabs). Larger
+        // single tensors (embed_tokens / lm_head BF16, ~1.4 GiB) stay on the
+        // managed path — the host reads embeddings directly, and they are
+        // never part of the free/realloc churn the pool exists to absorb.
+        if (bytes >= kBigBlockMin && bytes <= kBigBlockQuant) {
+            return bigBlockAlloc(_ctx, bytes);
+        }
+        return _inner.allocate(bytes);
+    }
+    void uploadHostBytes(void* deviceDst, const void* hostSrc,
+                         std::size_t bytes) override {
+        _inner.uploadHostBytes(deviceDst, hostSrc, bytes);
+    }
+
+private:
+    core::cuda::CudaComputeContext&    _ctx;
+    runtime::nvfp4::ComputeOpsUploader _inner;
+};
 
 /// True if `config.json` names a Gemma-4 model (compressed-tensors
 /// "nvfp4-pack-quantized"), vs a ModelOpt qwen35moe checkpoint. Keyed on the
@@ -112,6 +220,30 @@ void applyGenerationConfigDefaults(model::LlmConfig&            cfg,
                     "top_k={} (applied when a request samples without its own)",
                     cfg.samplingTopPDefault, cfg.samplingTopKDefault);
     }
+}
+
+// Detect whether the checkpoint's chat template actually uses a <think>
+// reasoning block. Qwen3-Coder-Next ships the <think>/</think> tokens in its
+// vocab but its chat_template.jinja never references them — feeding it the
+// empty pre-closed think block (the qwen3.6 "thinking off" prompt shape) is
+// out-of-distribution. Data-driven so it is right for every model without an
+// arch switch; absent template file leaves it unknown (heuristic fallback).
+void detectTemplateThinking(model::LlmConfig&            cfg,
+                            const std::filesystem::path& dir) {
+    std::ifstream f(dir / "chat_template.jinja");
+    if (!f) {
+        return;   // unknown -> encoder keeps its <think>-token heuristic
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string tpl = ss.str();
+    const bool uses = tpl.find("<think>") != std::string::npos
+                      || tpl.find("enable_thinking") != std::string::npos;
+    cfg.templateUsesThink = uses;
+    MM_LOG_INFO("engine",
+                "chat_template.jinja: think block {} (generation prompt {})",
+                uses ? "used" : "NOT used",
+                uses ? "pre-opens <think>" : "plain assistant turn");
 }
 
 } // namespace
@@ -261,6 +393,7 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
     // 1. Arch params from config.json (GGUF-metadata parse is GGUF-only).
     e._config = runtime::nvfp4::parseQwen3_5MoeSafetensorsConfig(configText);
     applyGenerationConfigDefaults(e._config, dir);
+    detectTemplateThinking(e._config, dir);
 
     // 2. Tokenizer. NVFP4 checkpoints ship no GGUF tokenizer, so by default
     //    parse the checkpoint's HF tokenizer.json directly (byte-level BPE,
@@ -280,7 +413,11 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
     }
 
     // 3. Upload the NVFP4/FP8 weights (+ BF16 passthroughs) to the device.
-    runtime::nvfp4::ComputeOpsUploader uploader(*e._ops);
+    // Big allocations (per-expert source slabs) go through the big-block
+    // pool so their frees can be recycled into the expert banks below.
+    auto& poolCtx =
+        static_cast<core::cuda::CudaComputeContext&>(*e._computeCtx);
+    PooledUploader uploader(poolCtx, *e._ops);
     e._nvfp4Model = std::make_unique<runtime::nvfp4::NvFp4Model>(
         attachedSm ? runtime::nvfp4::loadNvfp4Model(*attachedSm, dir, uploader)
                    : runtime::nvfp4::loadNvfp4Model(dir, uploader));
@@ -289,11 +426,38 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
     core::safetensors::SafetensorsModel localSm;
     if (attachedSm == nullptr) localSm.open(dir);
     core::safetensors::SafetensorsModel& sm = attachedSm ? *attachedSm : localSm;
+    // compressed-tensors dialect (Qwen3-Coder-Next): normalise this view to
+    // the ModelOpt names too (idempotent — a no-op if already normalised or
+    // not a compressed-tensors checkpoint).
+    runtime::nvfp4::normalizeCompressedTensorsCheckpoint(sm);
+    // 5.27 I-2: qwen4_exp (Qwen3.8-Flash-Next) reuses this qwen3_5 MoE walk for
+    // the backbone, but its MTP head differs (mtp.fc_embedding/fc_hidden +
+    // mtp.layers.0..23 + hyper_connection_mixer) from the single-nextn-block the
+    // current MTP name builder assumes — so force mtpLayers=0 to skip MTP here.
+    // The 24-layer MTP is a later increment (I-5). The PLE table + vision tower
+    // are skipped at upload (NvFp4Model), and Hyper-Connections are stubbed
+    // (I-3), so this walk loads the qwen4_exp BACKBONE resident (all except PLE).
+    const bool isQwen4Exp = (e._config.architecture == "qwen4_exp");
+    // The single-nextn-block MTP walk requires the fused expert-stacked BF16
+    // layout (mtp.layers.0.mlp.experts.gate_up_proj). Some ModelOpt exports
+    // (Qwen3.5-122B-A10B) ship the MTP experts per-expert instead
+    // (mtp.layers.0.mlp.experts.{E}.gate_proj/up_proj/down_proj); until that
+    // layout is wired up, load those checkpoints without the MTP head —
+    // serving is unaffected, speculative decoding just stays unavailable.
+    const bool hasStackedMtp =
+        sm.find("mtp.layers.0.mlp.experts.gate_up_proj") != nullptr;
+    if (!isQwen4Exp && e._config.nextnPredictLayers > 0 && !hasStackedMtp) {
+        MM_LOG_WARN("engine",
+                    "loadModelNvfp4: MTP head uses a per-expert layout this "
+                    "loader does not materialize yet - loading without MTP");
+    }
     const core::modelopt::Qwen3_5MoeArch arch{
         static_cast<int>(e._config.blockCount),
         static_cast<int>(e._config.expertCount),
         4 /* full_attention_interval; layer_types agrees for this model */,
-        static_cast<int>(e._config.nextnPredictLayers) /* MTP head blocks */};
+        (isQwen4Exp || !hasStackedMtp)
+            ? 0 : static_cast<int>(e._config.nextnPredictLayers),
+        /*hyperConn=*/isQwen4Exp};
 
     // Two quant-config formats share the qwen3_5 arch walk: the ModelOpt MoE
     // checkpoint (hf_quant_config.json sidecar, per-tensor NVFP4/FP8) and the
@@ -314,17 +478,73 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                     "mixed FP8/NVFP4)", checkpointDir);
         steps = core::modelopt::planQwen3_5DenseMaterialization(sm, ctCfg, arch);
     } else {
+        // ModelOpt checkpoints ship hf_quant_config.json; normalised
+        // compressed-tensors MoE checkpoints (Qwen3-Coder-Next) use the
+        // synthetic uniform-NVFP4 equivalent instead.
+        const std::filesystem::path hfQuantPath =
+            std::filesystem::path{dir} / "hf_quant_config.json";
         const core::modelopt::HfQuantConfig hfCfg =
             core::modelopt::HfQuantConfig::parse(
-                readText(std::filesystem::path{dir} / "hf_quant_config.json"));
+                std::filesystem::is_regular_file(hfQuantPath)
+                    ? readText(hfQuantPath)
+                    : runtime::nvfp4::syntheticCtHfQuantConfigJson());
         steps = core::modelopt::planQwen3_5MoeMaterialization(sm, hfCfg, arch);
     }
 
     // 5. Dequantise every weight to BF16 on device (weight-only W4A16).
     auto& cudaCtx = static_cast<core::cuda::CudaComputeContext&>(*e._computeCtx);
     compute::cuda::CudaMaterializerOps devOps(cudaCtx, *e._ops);
+    // 5.27 I-2 streaming repack: for qwen4_exp on the NVFP4 MoE path, DEFER the
+    // routed experts — do not dequant them to BF16 here (the MoE bank repack
+    // below reads the NVFP4 source directly and never touches the BF16), so the
+    // ~225 GiB transient BF16 expert peak that OOMed the 126 GiB checkpoint at
+    // layer ~5 never forms. The deferred tensors carry metadata + an empty
+    // buffer; the repack fills them (a survivor with an empty buffer is caught
+    // by the assert after the MoE block). qwen3.6 keeps the exact BF16 path
+    // (predicate empty) — no change to the live prod load.
+    std::function<bool(const std::string&)> deferExperts{};
+    {
+        const char* mq = std::getenv("MIMIRMIND_NVFP4_MOE");
+        const bool moeNvfp4 = (mq == nullptr) || std::string_view{mq} == "nvfp4";
+        // Qwen3.5-122B-A10B ships the same per-expert NVFP4 main-stack layout
+        // as qwen4_exp (experts.{E}.gate_proj/up_proj/down_proj, each with its
+        // own scale set) — and the same transient-BF16 OOM (a 244 GiB peak on
+        // a 121 GiB part). Defer those experts too — but decide PER LAYER:
+        // qwen3.6-35B is a HYBRID (layers 0-39 per-expert U8, 40+ a different
+        // layout the repack cannot read); a blanket defer left blk.40+ banks
+        // empty and tripped the survivor assert. Only a layer whose expert
+        // weights are really packed NVFP4 (U8) may skip BF16 materialization.
+        const bool perExpertNvfp4 =
+            sm.find("model.language_model.layers.1.mlp.experts.0.gate_proj"
+                    ".weight") != nullptr;
+        if (isQwen4Exp && moeNvfp4) {
+            deferExperts = [](const std::string& n) {
+                return n.size() > 5
+                    && (n.rfind(".ffn_gate_exps.weight") != std::string::npos
+                        || n.rfind(".ffn_up_exps.weight") != std::string::npos
+                        || n.rfind(".ffn_down_exps.weight") != std::string::npos);
+            };
+        } else if (perExpertNvfp4 && moeNvfp4) {
+            deferExperts = [&sm](const std::string& n) {
+                if (n.rfind("blk.", 0) != 0) return false;
+                if (n.rfind(".ffn_gate_exps.weight") == std::string::npos
+                    && n.rfind(".ffn_up_exps.weight") == std::string::npos
+                    && n.rfind(".ffn_down_exps.weight") == std::string::npos) {
+                    return false;
+                }
+                const auto dot = n.find('.', 4);
+                if (dot == std::string::npos) return false;
+                const auto* t = sm.find(
+                    "model.language_model.layers." + n.substr(4, dot - 4)
+                    + ".mlp.experts.0.gate_proj.weight");
+                return t != nullptr
+                    && t->dtype == core::safetensors::SafetensorsDtype::U8;
+            };
+        }
+    }
     e._materializedBf16 =
-        runtime::nvfp4::executeMaterialization(steps, *e._nvfp4Model, devOps);
+        runtime::nvfp4::executeMaterialization(steps, *e._nvfp4Model, devOps,
+                                               deferExperts);
     cudaCtx.stream().synchronize(); // all dequant kernels + D2D copies complete
 
     // 5b. GatedDeltaNet value-head regroup (HF -> GGUF layout).
@@ -536,6 +756,76 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
         }
     }
 
+    // 5.27 I-2 lever (a) — dense-NVFP4 repack of NON-expert projections. Shared
+    // by the qwen3_5 DENSE 27B decode lever (post-MoE, opt-in, below) and the
+    // qwen4_exp peak-memory fix (pre-MoE, default-on, just after this): repack
+    // every single-source, NVFP4-sourced projection matching `keep` from its
+    // just-materialised BF16 image into the blocked-NVFP4 format the
+    // matmul_nvfp4blk kernels consume (¼ the bytes), freeing the BF16 in place
+    // (RAII). Lossless — the BF16 held the widened NVFP4 values. Resolves the
+    // scale sidecars the format-agnostic way: explicit names when the plan
+    // supplies them (compressed-tensors), else reconstructed from the weight
+    // base (ModelOpt: base + ".weight_scale" / ".weight_scale_2"). Skips
+    // tensors an earlier pass already re-quantised (idempotent) and deferred
+    // placeholders (empty buffer). NOTE: leaves the NVFP4 SOURCE resident (as
+    // the dense-27B path always has); freeing it is the separate lever (b).
+    auto repackDenseNvfp4 =
+        [&](const std::function<bool(const std::string&)>& keep, const char* label) {
+            std::size_t nRepack = 0;
+            std::uint64_t bytesBefore = 0, bytesAfter = 0;
+            for (const auto& step : steps) {
+                if (step.sources.size() != 1) continue;
+                const auto& src = step.sources[0];
+                if (src.kind != core::modelopt::SourceKind::Nvfp4) continue;
+                if ((src.in % 32) != 0) continue;
+                if (keep && !keep(step.ggufName)) continue;
+                auto it = std::find_if(
+                    e._materializedBf16.begin(), e._materializedBf16.end(),
+                    [&](const runtime::nvfp4::MaterializedTensor& t) {
+                        return t.ggufName == step.ggufName;
+                    });
+                if (it == e._materializedBf16.end() || it->isF32) continue;
+                if (it->isNvfp4Blk || it->isNvfp4Tc || it->isFp8
+                    || it->isQ8_0 || it->isQ4K || it->isQ6K) continue;
+                if (it->buffer.get() == nullptr) continue; // deferred placeholder
+                const std::string base{src.hfWeightName};
+                const std::string baseNoW =
+                    base.size() > 7 ? base.substr(0, base.size() - 7) : base;
+                const std::string bsName = src.blockScaleName.empty()
+                    ? (baseNoW + ".weight_scale") : src.blockScaleName;
+                const std::string gsName = src.globalScaleName.empty()
+                    ? (baseNoW + ".weight_scale_2") : src.globalScaleName;
+                const auto* pk = e._nvfp4Model->find(src.hfWeightName);
+                const auto* bs = e._nvfp4Model->find(bsName);
+                const auto* gs = e._nvfp4Model->find(gsName);
+                if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
+                float global = devOps.readF32(gs->devPtr);
+                if (src.globalIsReciprocal) global = 1.0F / global;
+                const std::size_t blkBytes =
+                    (static_cast<std::size_t>(it->elems) / 32) * 20;
+                compute::ComputeBuffer nb = devOps.allocateWeight(blkBytes);
+                devOps.repackageNvfp4ToBlk(nb.get(), pk->devPtr, bs->devPtr,
+                                           global, src.rows, src.in);
+                cudaCtx.stream().synchronize();
+                bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
+                bytesAfter  += blkBytes;
+                it->buffer     = std::move(nb);   // frees the BF16 buffer (RAII)
+                it->isNvfp4Blk = true;
+                ++nRepack;
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: {} — repacked {} dense projections "
+                        "BF16 -> blocked-NVFP4 ({} MiB -> {} MiB)",
+                        label, nRepack, bytesBefore >> 20, bytesAfter >> 20);
+        };
+
+    // NOTE (5.27 I-2): qwen4_exp's non-expert projections are UNQUANTISED BF16
+    // in the checkpoint (not NVFP4), so there is no NVFP4 source to repack here.
+    // Their peak-memory fix lives in the materialization plan instead
+    // (Qwen3_5MoeMaterializer: keep the 2-D BF16 matmul projections BF16 verbatim
+    // rather than widening them to F32) — see isBf16MatmulProjection. The
+    // repackDenseNvfp4 lambda above remains for the dense-27B NVFP4 checkpoint.
+
     // 5c. Re-quantise the dense attention projections BF16 -> Q8_0.
     //
     // DEFAULT OFF: empirically this BREAKS coherence on qwen35moe. Q8_0 is a
@@ -567,7 +857,8 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
             std::size_t nQuant = 0;
             std::uint64_t bytesBefore = 0, bytesAfter = 0;
             for (auto& t : e._materializedBf16) {
-                if (t.isF32 || t.ggufDims.size() < 2 || !isProj(t.ggufName)) continue;
+                if (t.isF32 || t.isNvfp4Blk || t.isNvfp4Tc) continue;
+                if (t.ggufDims.size() < 2 || !isProj(t.ggufName)) continue;
                 const std::uint64_t K    = t.ggufDims[0];  // input dim (contiguous)
                 const std::uint64_t rows = t.ggufDims[1];  // output dim
                 if (K == 0 || rows == 0 || (K % 32) != 0 || K * rows != t.elems) continue;
@@ -605,6 +896,10 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                 || n.ends_with(".ffn_up_exps.weight")
                 || n.ends_with(".ffn_down_exps.weight");
         };
+        if (std::getenv("MIMIRMIND_Q4E_DIAG") != nullptr) {
+            MM_LOG_INFO("q4ediag", "reached MoE materialization (moeMode={}); "
+                        "BF16 re-group phase complete", moeMode);
+        }
         if (moeMode == "nvfp4" && e._nvfp4Model) {
             // Routed experts, three modes (MIMIRMIND_GROUPED_MOE):
             //   default = "additive": blocked-NVFP4 bank (decode) + FP4-TC side
@@ -636,6 +931,24 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                 return pk != nullptr && bs != nullptr && gs != nullptr;
             };
 
+            // 5.27 I-2 streaming repack: free an expert step's NVFP4 SOURCE
+            // tensors (packed + block-scale + global-scale) once its bank is
+            // built, so the 63 GiB expert source and the growing 63 GiB banks
+            // never co-reside (the OOM that stopped the load at blk.5 with the
+            // source fully resident). Only meaningful when the source will not
+            // be read again — true for routed experts after their repack.
+            auto releaseStepSources =
+                [&](const core::modelopt::MaterializationStep& st) {
+                    for (const auto& src : st.sources) {
+                        const std::string b{src.hfWeightName};
+                        const std::string bNoW =
+                            b.size() > 7 ? b.substr(0, b.size() - 7) : b;
+                        e._nvfp4Model->releaseTensor(b);
+                        e._nvfp4Model->releaseTensor(bNoW + ".weight_scale");
+                        e._nvfp4Model->releaseTensor(bNoW + ".weight_scale_2");
+                    }
+                };
+
             for (const auto& step : steps) {
                 if (!isExpert(step.ggufName)) continue;
                 auto it = std::find_if(
@@ -649,15 +962,30 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                 const std::uint64_t tcN = step.sources.empty() ? 0 : step.sources.front().rows;
                 const std::uint64_t tcK = step.sources.empty() ? 0 : step.sources.front().in;
 
+                // 5.27 I-2 DIAG (MIMIRMIND_Q4E_DIAG): log every expert step +
+                // sync so a materialization-kernel OOB throws AT the culprit
+                // (with CUDA_LAUNCH_BLOCKING the async launch is already sync,
+                // this pins the tensor name). Temporary; remove after the fix.
+                static const bool kQ4eDiag = std::getenv("MIMIRMIND_Q4E_DIAG") != nullptr;
+                if (kQ4eDiag) {
+                    MM_LOG_INFO("q4ediag",
+                        "expert step gguf={} nExp={} tcN={} tcK={} elems={} path={}",
+                        step.ggufName, nExp, tcN, tcK, it->elems,
+                        (tcOnly && nExp > 0 && tcK % 32 == 0) ? "tcOnly" : "blocked");
+                }
+
                 if (tcOnly && nExp > 0 && tcK % 32 == 0) {
                     // --- FP4-TC-only banks (nibbles = the tensor buffer) -------
                     const std::size_t nibBytes = static_cast<std::size_t>(it->elems) / 2;
                     const std::size_t sfbBytes =
                         core::modelopt::moeSwizzledScaleBankBytes(
                             static_cast<std::uint64_t>(nExp), tcN, tcK / 16);
-                    compute::ComputeBuffer nibBank  = devOps.allocateWeight(nibBytes);
-                    compute::ComputeBuffer sfbBank  = devOps.allocateWeight(sfbBytes);
-                    compute::ComputeBuffer globBank = devOps.allocateWeight(
+                    compute::ComputeBuffer nibBank  =
+                        nibBytes >= kBigBlockMin
+                            ? bigBlockAlloc(cudaCtx, nibBytes)
+                            : devOps.allocateWeight(nibBytes);
+                    compute::ComputeBuffer sfbBank  = devOps.allocateWeightDeviceOnly(sfbBytes);
+                    compute::ComputeBuffer globBank = devOps.allocateWeightDeviceOnly(
                         static_cast<std::size_t>(nExp) * sizeof(float));
                     auto* nibB = static_cast<std::uint8_t*>(nibBank.get());
                     auto* sfbB = static_cast<std::uint8_t*>(sfbBank.get());
@@ -700,7 +1028,17 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                     //     for the prefill grouped GEMM] --------------------------
                     const std::size_t blkBytes =
                         (static_cast<std::size_t>(it->elems) / 32) * 20;
-                    compute::ComputeBuffer bank = devOps.allocateWeight(blkBytes);
+                    compute::ComputeBuffer bank =
+                        blkBytes >= kBigBlockMin
+                            ? bigBlockAlloc(cudaCtx, blkBytes)
+                            : devOps.allocateWeight(blkBytes);
+                    if (bank.get() == nullptr) {
+                        throw std::runtime_error(
+                            "Nvfp4Loader: expert bank alloc failed ("
+                            + step.ggufName + ", "
+                            + std::to_string(blkBytes >> 20) + " MiB) - device"
+                            " memory exhausted during streaming repack");
+                    }
                     auto* bankBytes = static_cast<std::uint8_t*>(bank.get());
                     const bool tcAdd = additive && nExp > 0 && tcK % 32 == 0;
                     compute::ComputeBuffer tcNib, tcSfb, tcGlob;
@@ -710,9 +1048,11 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                     if (tcAdd) {
                         sfbBytes = core::modelopt::moeSwizzledScaleBankBytes(
                             static_cast<std::uint64_t>(nExp), tcN, tcK / 16);
-                        tcNib  = devOps.allocateWeight(static_cast<std::size_t>(it->elems) / 2);
-                        tcSfb  = devOps.allocateWeight(sfbBytes);
-                        tcGlob = devOps.allocateWeight(static_cast<std::size_t>(nExp) * sizeof(float));
+                        tcNib  = (static_cast<std::size_t>(it->elems) / 2) >= kBigBlockMin
+                            ? bigBlockAlloc(cudaCtx, static_cast<std::size_t>(it->elems) / 2)
+                            : devOps.allocateWeight(static_cast<std::size_t>(it->elems) / 2);
+                        tcSfb  = devOps.allocateWeightDeviceOnly(sfbBytes);
+                        tcGlob = devOps.allocateWeightDeviceOnly(static_cast<std::size_t>(nExp) * sizeof(float));
                         tcNibB = static_cast<std::uint8_t*>(tcNib.get());
                         tcSfbB = static_cast<std::uint8_t*>(tcSfb.get());
                         tcGlobHost.assign(static_cast<std::size_t>(nExp), 0.0f);
@@ -727,6 +1067,32 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                         const float global = devOps.readF32(gs->devPtr);
                         const std::size_t byteOff =
                             (static_cast<std::size_t>(src.dstElemOffset) / 32) * 20;
+                        if (kQ4eDiag) {
+                            const auto srcIdx = static_cast<int>(
+                                src.dstElemOffset
+                                / (static_cast<std::uint64_t>(src.rows) * src.in));
+                            static const bool kQ4eDiagV2 =
+                                [] { const char* v = std::getenv("MIMIRMIND_Q4E_DIAG");
+                                     return v != nullptr && v[0] == char(50); }();
+                            if (kQ4eDiagV2 || (srcIdx % 32) == 0) {
+                                cudaCtx.stream().synchronize();
+                                // Liveness probes: a D2H read faults HERE if the
+                                // source buffer was freed (use-after-free) or the
+                                // mapping is gone; passing probes + a faulting
+                                // repack instead point at the kernel/driver.
+                                (void)devOps.readF32(pk->devPtr);
+                                (void)devOps.readF32(
+                                    static_cast<const std::uint8_t*>(pk->devPtr)
+                                    + pk->nbytes - 4);
+                                (void)devOps.readF32(bs->devPtr);
+                                MM_LOG_INFO("q4ediag",
+                                    "  src e={} byteOff={} rows={} in={} pk={} bs={} gs={} sync-ok",
+                                    srcIdx, byteOff, src.rows, src.in,
+                                    static_cast<const void*>(pk->devPtr),
+                                    static_cast<const void*>(bs->devPtr),
+                                    static_cast<const void*>(gs->devPtr));
+                            }
+                        }
                         devOps.repackageNvfp4ToBlk(bankBytes + byteOff, pk->devPtr,
                                                    bs->devPtr, global, src.rows, src.in);
                         if (tcAdd) {
@@ -765,6 +1131,10 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                         ++tcBanks;
                     }
                 }
+                // 5.27 I-2: both repack paths converge here (tcOnly skips the
+                // else); a `!ok` step took `continue` above, so this only runs
+                // for a successfully-repacked expert. Free its NVFP4 source.
+                releaseStepSources(step);
             }
             MM_LOG_INFO("engine",
                         "loadModelNvfp4: routed experts -> {} blocked-NVFP4 + {} "
@@ -846,7 +1216,8 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
             std::size_t nQuant = 0;
             std::uint64_t bytesBefore = 0, bytesAfter = 0;
             for (auto& t : e._materializedBf16) {
-                if (t.isF32 || t.isQ8_0 || t.isQ4K || t.isQ6K) continue;
+                if (t.isF32 || t.isQ8_0 || t.isQ4K || t.isQ6K || t.isNvfp4Blk
+                    || t.isNvfp4Tc) continue;
                 if (t.ggufDims.size() < 2 || !isAttnProj(t.ggufName)) continue;
                 const std::uint64_t K    = t.ggufDims[0];  // input dim (contiguous)
                 const std::uint64_t rows = t.ggufDims[1];  // output dim
@@ -886,46 +1257,9 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
     if (ctCfg.valid() && e._config.expertCount == 0 && e._nvfp4Model) {
         const char* de = std::getenv("MIMIRMIND_QWEN_DENSE_NVFP4_DECODE");
         if (de != nullptr && std::string_view{de} != "0") {
-            std::size_t nRepack = 0;
-            std::uint64_t bytesBefore = 0, bytesAfter = 0;
-            for (const auto& step : steps) {
-                if (step.sources.size() != 1) continue;
-                const auto& src = step.sources[0];
-                if (src.kind != core::modelopt::SourceKind::Nvfp4) continue;
-                if ((src.in % 32) != 0) continue;
-                auto it = std::find_if(
-                    e._materializedBf16.begin(), e._materializedBf16.end(),
-                    [&](const runtime::nvfp4::MaterializedTensor& t) {
-                        return t.ggufName == step.ggufName;
-                    });
-                if (it == e._materializedBf16.end() || it->isF32) continue;
-                const auto* pk = e._nvfp4Model->find(src.hfWeightName);
-                const auto* bs = src.blockScaleName.empty()
-                                     ? nullptr
-                                     : e._nvfp4Model->find(src.blockScaleName);
-                const auto* gs = src.globalScaleName.empty()
-                                     ? nullptr
-                                     : e._nvfp4Model->find(src.globalScaleName);
-                if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
-                float global = devOps.readF32(gs->devPtr);
-                if (src.globalIsReciprocal) global = 1.0F / global;
-                const std::size_t blkBytes =
-                    (static_cast<std::size_t>(it->elems) / 32) * 20;
-                compute::ComputeBuffer nb = devOps.allocateWeight(blkBytes);
-                devOps.repackageNvfp4ToBlk(nb.get(), pk->devPtr, bs->devPtr,
-                                           global, src.rows, src.in);
-                cudaCtx.stream().synchronize();
-                bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
-                bytesAfter  += blkBytes;
-                it->buffer     = std::move(nb);   // frees the BF16 buffer (RAII)
-                it->isNvfp4Blk = true;
-                ++nRepack;
-            }
-            MM_LOG_INFO("engine",
-                        "loadModelNvfp4: qwen3_5 dense kept {} NVFP4 projections "
-                        "native blocked-NVFP4 (MIMIRMIND_QWEN_DENSE_NVFP4_DECODE) "
-                        "({} MiB -> {} MiB)",
-                        nRepack, bytesBefore >> 20, bytesAfter >> 20);
+            // Dense 27B: repack ALL single-source NVFP4 projections (opt-in,
+            // post-MoE — the dense plan has no routed experts to peak against).
+            repackDenseNvfp4({}, "qwen3_5 dense (MIMIRMIND_QWEN_DENSE_NVFP4_DECODE)");
         }
     }
 
@@ -991,6 +1325,11 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                         return t.ggufName == step.ggufName;
                     });
                 if (it == e._materializedBf16.end() || it->isF32) continue;
+                // 5.27 I-2 lever (a): qwen4_exp's pre-MoE dense pass already
+                // repacked the shared experts to blocked-NVFP4 (no TC sidecars,
+                // to fit) — skip them here. No-op for qwen3.6 (its shared experts
+                // reach this pass still BF16), so prod is unchanged.
+                if (it->isNvfp4Blk || it->isNvfp4Tc) continue;
                 const auto* pk = e._nvfp4Model->find(src.hfWeightName);
                 const std::string base{src.hfWeightName};
                 const std::string baseNoW =
@@ -1115,6 +1454,21 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                         "sibling(s) (+{} MiB), BF16 kept; NVFP4 used for nSeq<=maxT "
                         "(MIMIRMIND_LMHEAD_NVFP4 opt-in, default OFF)",
                         nSib, addBytes >> 20);
+        }
+    }
+
+    // 5.27 I-2 streaming-repack safety: every DEFERRED expert (empty BF16
+    // buffer) must have been filled by the MoE bank repack above. A survivor
+    // with an empty buffer would reach the WeightsMap as garbage — fail loud.
+    if (deferExperts) {
+        for (const auto& t : e._materializedBf16) {
+            if (deferExperts(t.ggufName) && t.buffer.bytes() == 0
+                && !t.isNvfp4Blk && !t.isNvfp4Tc && !t.isQ4K && !t.isQ6K) {
+                throw std::runtime_error(
+                    "Nvfp4Loader: deferred expert '" + t.ggufName +
+                    "' was not repacked to an NVFP4 bank (empty buffer) — the "
+                    "MoE repack predicate must match the defer predicate");
+            }
         }
     }
 

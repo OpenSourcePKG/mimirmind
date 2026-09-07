@@ -4,6 +4,9 @@
 #include "runtime/nvfp4/NvFp4Materializer.hpp"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -41,11 +44,23 @@ std::string moduleBase(const std::string& weightName) {
 std::vector<MaterializedTensor>
 executeMaterialization(const std::vector<mo::MaterializationStep>& steps,
                        const NvFp4Model&        src,
-                       MaterializerDeviceOps&   ops) {
+                       MaterializerDeviceOps&   ops,
+                       const std::function<bool(const std::string&)>&
+                           deferToNvfp4Bank) {
     std::vector<MaterializedTensor> out;
     out.reserve(steps.size());
 
     for (const mo::MaterializationStep& step : steps) {
+        // 5.27 I-2: a deferred step (routed expert repacked to an NVFP4 bank
+        // later, reading the NVFP4 source directly) emits a placeholder with
+        // correct metadata but NO buffer — so its BF16 image is never
+        // allocated (removes the ~225 GiB transient BF16 peak for qwen4_exp).
+        if (deferToNvfp4Bank && deferToNvfp4Bank(step.ggufName)) {
+            out.push_back(MaterializedTensor{step.ggufName, compute::ComputeBuffer{},
+                                             step.ggufDims, step.totalElems,
+                                             /*isF32=*/false});
+            continue;
+        }
         // Passthrough tensors materialise to F32 (4 bytes), dequantised
         // NVFP4/FP8 matmul weights to BF16 (2 bytes).
         const std::size_t elemBytes = step.outF32 ? 4 : 2;
@@ -55,6 +70,23 @@ executeMaterialization(const std::vector<mo::MaterializationStep>& steps,
 
         for (const mo::MaterializationSource& s : step.sources) {
             void* dst = dstBase + s.dstElemOffset * elemBytes;
+            // 5.27 I-2 DIAG (MIMIRMIND_Q4E_DIAG + CUDA_LAUNCH_BLOCKING): the
+            // last line printed before a materialization-kernel OOB names the
+            // culprit source. Temporary; remove after the qwen4_exp fix.
+            static const bool kQ4eDiag = std::getenv("MIMIRMIND_Q4E_DIAG") != nullptr;
+            if (kQ4eDiag) {
+                std::fprintf(stderr,
+                    "[q4ediag-mat] gguf=%s src=%s kind=%d rows=%llu in=%llu "
+                    "dstElemOff=%llu totalElems=%llu outF32=%d\n",
+                    step.ggufName.c_str(), s.hfWeightName.c_str(),
+                    static_cast<int>(s.kind),
+                    static_cast<unsigned long long>(s.rows),
+                    static_cast<unsigned long long>(s.in),
+                    static_cast<unsigned long long>(s.dstElemOffset),
+                    static_cast<unsigned long long>(step.totalElems),
+                    step.outF32 ? 1 : 0);
+                std::fflush(stderr);
+            }
             const NvFp4DeviceTensor& w = require(src, s.hfWeightName);
             const std::string base = moduleBase(s.hfWeightName);
 

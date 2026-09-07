@@ -25,6 +25,30 @@ bool endsWith(const std::string& s, std::string_view suf) {
         && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
 }
 
+/// qwen4_exp (Qwen3.8-Flash-Next) has no `input_layernorm` /
+/// `post_attention_layernorm` / `model.language_model.norm` tensors — those
+/// RMSNorms are folded into the per-layer hyper-connections and the top-level
+/// hyper_connection_mixer. Redirect the three norm HF names the qwen3_5 tables
+/// build onto the `hc_norm.weight` tensors that actually carry the weights, so
+/// the backbone materialises. The `attn_hyper_connection.hc_norm` normalises
+/// the attention input (== input_layernorm) and `mlp_hyper_connection.hc_norm`
+/// the MLP input (== post_attention_layernorm), so the slot mapping is
+/// semantically faithful; only the hyper-connection stream-mixing math is
+/// deferred (5.27 I-3). The `.weight` suffix is preserved, so the materialiser
+/// still applies the RMSNorm AddOne convention. Called only when arch.hyperConn.
+std::string remapHyperConnNorm(std::string hf) {
+    const auto sub = [&hf](std::string_view from, std::string_view to) {
+        const auto p = hf.find(from);
+        if (p != std::string::npos) hf.replace(p, from.size(), to);
+    };
+    // Order matters only in that these three keys are mutually non-overlapping.
+    sub("input_layernorm.weight",           "attn_hyper_connection.hc_norm.weight");
+    sub("post_attention_layernorm.weight",  "mlp_hyper_connection.hc_norm.weight");
+    sub("model.language_model.norm.weight",
+        "model.language_model.hyper_connection_mixer.hc_norm.weight");
+    return hf;
+}
+
 const st::SafetensorsTensor& require(const st::SafetensorsModel& m, const std::string& name) {
     const auto* t = m.find(name);
     if (t == nullptr) {
@@ -48,6 +72,30 @@ std::vector<std::uint64_t> ggufDimsFromHf(const std::vector<std::uint64_t>& hf) 
     return out;
 }
 
+/// True for the 2-D dense matmul projections the runtime consumes as BF16
+/// weights (NOT norms/scalars/router/embed, which are read as F32). Used to
+/// keep an UNQUANTISED (BF16-in-checkpoint) projection BF16 verbatim instead
+/// of widening it to F32 — see addDirect (5.27 I-2 qwen4_exp peak fix).
+/// Deliberately excludes ffn_gate_inp* (router, F32), output.weight (lm_head)
+/// and token_embd.weight (embedding), which stay in their F32 form.
+bool isBf16MatmulProjection(const std::string& g) {
+    return endsWith(g, ".attn_qkv.weight")   || endsWith(g, ".attn_gate.weight")
+        || endsWith(g, ".ssm_out.weight")
+        || endsWith(g, ".attn_q.weight")     || endsWith(g, ".attn_k.weight")
+        || endsWith(g, ".attn_v.weight")     || endsWith(g, ".attn_output.weight")
+        || endsWith(g, ".ffn_gate_shexp.weight")
+        || endsWith(g, ".ffn_up_shexp.weight")
+        || endsWith(g, ".ffn_down_shexp.weight")
+        // 5.27 I-3 Hyper-Connections input-mix / block-inject (BF16 matmul
+        // weights, per-layer and the top-level mixer).
+        || endsWith(g, ".input_mix_weight_down.weight")
+        || endsWith(g, ".input_mix_weight_up.weight")
+        || endsWith(g, ".block_inject_weight.weight")
+        // 5.27 I-4 PLE key/value projections (BF16 matmul weights).
+        || endsWith(g, ".ple.key_proj.weight")
+        || endsWith(g, ".ple.value_proj.weight");
+}
+
 /// Resolve a single HF `.weight` to a source descriptor (kind + rows/in).
 MaterializationSource sourceFor(const st::SafetensorsModel& model,
                                 const HfQuantConfig&        cfg,
@@ -59,7 +107,19 @@ MaterializationSource sourceFor(const st::SafetensorsModel& model,
     s.dstElemOffset = dstElemOffset;
 
     const auto scheme = cfg.schemeForTensor(hfWeightName);
-    if (!scheme.has_value()) {
+    // Checkpoint truth wins over a uniform scheme. ModelOpt only quantises
+    // nn.Linear modules; under a top-level `quant_algo` (e.g. the
+    // Qwen3.5-122B-A10B NVFP4 checkpoint) implicitly-unquantised modules such
+    // as embed_tokens are NOT listed in exclude_modules, so the scheme
+    // resolves for them although the tensor is stored BF16. A quantised
+    // source is only real if the tensor actually carries the scheme's packed
+    // dtype (NVFP4 -> U8 nibbles, FP8 -> F8_E4M3).
+    const bool packedInCheckpoint =
+        scheme.has_value()
+        && w.dtype == (*scheme == ModelOptQuantScheme::NVFP4_E2M1_BLK16
+                           ? st::SafetensorsDtype::U8
+                           : st::SafetensorsDtype::F8_E4M3);
+    if (!scheme.has_value() || !packedInCheckpoint) {
         // Unquantised -> BF16 passthrough. rows*in = element count.
         s.kind = SourceKind::Bf16Passthrough;
         s.rows = w.nelements;
@@ -89,6 +149,26 @@ void addDirect(std::vector<MaterializationStep>& steps,
     MaterializationStep step;
     step.ggufName            = ggufName;
     MaterializationSource src = sourceFor(model, cfg, hfWeightName, 0);
+
+    // 5.27 I-2: a checkpoint may store the dense MATMUL projections
+    // (attn_qkv/attn_gate/ssm_out, full-attn q/k/v/output, shared-expert MLP)
+    // UNQUANTISED as BF16 rather than NVFP4/FP8 — qwen4_exp does this (only the
+    // routed experts are NVFP4). sourceFor() then classifies them as
+    // Bf16Passthrough, which WIDENS them to F32 (4 B/elem) — the norm/scalar/
+    // router/embed convention. For a 2-D matmul weight that widen is pure waste:
+    // it doubles a ~42 GiB non-expert block into F32 and OOMs the 128 GiB part
+    // mid-load. The runtime reads these projections as BF16 (identical to the
+    // qwen3.6 path, where the very same names arrive as FP8/NVFP4-dequant BF16),
+    // so keep them BF16 verbatim (Bf16Copy, no widen) — lossless, halves them.
+    // Only the 2-D projections; norms/scalars/conv1d/router/embed stay F32.
+    if (src.kind == SourceKind::Bf16Passthrough && w.shape.size() == 2
+        && isBf16MatmulProjection(ggufName)) {
+        src.kind          = SourceKind::Bf16Copy;
+        src.rows          = w.shape[0];   // out
+        src.in            = w.shape[1];   // in
+        src.srcElemOffset = 0;
+    }
+
     // GGUF dims come from the LOGICAL (dequantised) shape: for a quantised
     // 2-D weight that is [in(ne0), out(ne1)] (NVFP4's packed cols are half of
     // `in`, so the raw shape is wrong); passthrough tensors keep their real
@@ -99,7 +179,8 @@ void addDirect(std::vector<MaterializationStep>& steps,
     step.totalElems = src.rows * src.in;
     // Unquantised passthrough tensors (norms, ssm scalars, conv1d, biases,
     // router, embed) are read as F32 device pointers by the runtime; widen
-    // them here. Dequantised NVFP4/FP8 weights stay BF16.
+    // them here. Dequantised NVFP4/FP8 weights and BF16-verbatim matmul
+    // projections (Bf16Copy above) stay BF16.
     step.outF32     = (src.kind == SourceKind::Bf16Passthrough);
     // The GGUF `ssm_a` (SSM_A_NOSCAN) is the pre-computed decay coefficient
     // A = -exp(A_log); llama.cpp bakes the -exp() into the checkpoint at
@@ -109,7 +190,13 @@ void addDirect(std::vector<MaterializationStep>& steps,
     // sees +A_log, the decay blows up and the state diverges to garbage.
     if (endsWith(ggufName, ".ssm_a")) {
         step.postTransform = PostTransform::NegExp;
-    } else if (endsWith(ggufName, "norm.weight") && !endsWith(ggufName, "ssm_norm.weight")) {
+    } else if ((endsWith(ggufName, "norm.weight") && !endsWith(ggufName, "ssm_norm.weight"))
+               // 5.27 I-4: the PLE RMSNorms (norm_key/query/conv) are also the
+               // (1+w)-centred Qwen4ExpTextRMSNorm convention, but their gguf
+               // suffix ("_key/_query/_conv.weight") doesn't end in "norm.weight".
+               || endsWith(ggufName, ".ple.norm_key.weight")
+               || endsWith(ggufName, ".ple.norm_query.weight")
+               || endsWith(ggufName, ".ple.norm_conv.weight")) {
         // Transformer RMSNorm weights (attn/q/k/post/output norms) are stored
         // centred at 0; llama.cpp bakes the (1 + w) into the GGUF tensor, and
         // the runtime multiplies by it directly. The NVFP4 checkpoint keeps
@@ -187,9 +274,16 @@ planQwen3_5MoeMaterialization(const st::SafetensorsModel& model,
                              const Qwen3_5MoeArch&        arch) {
     std::vector<MaterializationStep> steps;
 
+    // qwen4_exp folds the three RMSNorm slots into hyper-connections; redirect
+    // their HF names when this arch. A no-op passthrough for every other model.
+    const auto hcRemap = [&arch](std::string n) -> std::string {
+        return arch.hyperConn ? remapHyperConnNorm(std::move(n)) : n;
+    };
+
     // --- model-level ------------------------------------------------------
     for (const auto& t : qwen35moeTopLevelTensors()) {
-        addDirect(steps, model, cfg, std::string(t.ggufSuffix), std::string(t.hfSuffix));
+        addDirect(steps, model, cfg, std::string(t.ggufSuffix),
+                  hcRemap(std::string(t.hfSuffix)));
     }
 
     // --- per layer --------------------------------------------------------
@@ -200,7 +294,7 @@ planQwen3_5MoeMaterialization(const st::SafetensorsModel& model,
                                    : qwen35moeDeltaNetTensors();
         for (const auto& t : attnTable) {
             addDirect(steps, model, cfg, blk + std::string(t.ggufSuffix),
-                      qwen35moeHfName(t.hfSuffix, L));
+                      hcRemap(qwen35moeHfName(t.hfSuffix, L)));
         }
         for (const auto& t : qwen35moeMoeTensors()) {
             if (t.xform == WeightXform::StackExperts) {
@@ -208,8 +302,63 @@ planQwen3_5MoeMaterialization(const st::SafetensorsModel& model,
                            t.hfSuffix, L, arch.numExperts);
             } else {
                 addDirect(steps, model, cfg, blk + std::string(t.ggufSuffix),
-                          qwen35moeHfName(t.hfSuffix, L));
+                          hcRemap(qwen35moeHfName(t.hfSuffix, L)));
             }
+        }
+
+        // 5.27 I-3 (qwen4_exp only): per-layer Hyper-Connections weights beyond
+        // the hc_norm (which arrives via the norm remap above as attn_norm /
+        // post_attention_norm). The GatedResidual input-mix (down 4d->lowrank,
+        // up lowrank->4d) + block-inject (4d->hc_count) are unquantised BF16 2-D
+        // matmul weights; addDirect keeps them BF16 verbatim (isBf16Matmul-
+        // Projection). gguf: blk.N.<attn|mlp>_hyper_connection.<name>.weight.
+        if (arch.hyperConn) {
+            static constexpr const char* kHcPerLayer[] = {
+                "attn_hyper_connection.input_mix_weight_down.weight",
+                "attn_hyper_connection.input_mix_weight_up.weight",
+                "attn_hyper_connection.block_inject_weight.weight",
+                "mlp_hyper_connection.input_mix_weight_down.weight",
+                "mlp_hyper_connection.input_mix_weight_up.weight",
+                "mlp_hyper_connection.block_inject_weight.weight",
+            };
+            for (const char* sub : kHcPerLayer) {
+                addDirect(steps, model, cfg, blk + sub, qwen35moeHfName(sub, L));
+            }
+        }
+
+        // 5.27 I-4 (qwen4_exp only): the PLE small weights on the layer that has
+        // per-layer-embedding (ple_layer_ids=[2] -> layer 1). The big n-gram
+        // table (.ple.ple_embedding.ngram_embedding.shard_*) stays OFF-VRAM
+        // (host-mmap, I-4a.2) and is NOT materialised here. key/value_proj are
+        // BF16 matmul weights (Bf16Copy), the 3 norms are (1+w) grouped RMSNorm
+        // (AddOne), conv1d is the dilated depthwise conv kernel. Gated on tensor
+        // presence so only the actual ple layer gets them.
+        if (arch.hyperConn
+            && model.find("model.language_model.layers." + std::to_string(L)
+                          + ".ple.key_proj.weight") != nullptr) {
+            static constexpr const char* kPleWeights[] = {
+                "ple.key_proj.weight", "ple.value_proj.weight", "ple.conv1d.weight",
+                "ple.norm_key.weight", "ple.norm_query.weight", "ple.norm_conv.weight",
+            };
+            for (const char* sub : kPleWeights) {
+                addDirect(steps, model, cfg, blk + sub, qwen35moeHfName(sub, L));
+            }
+        }
+    }
+
+    // 5.27 I-3 (qwen4_exp only): top-level hyper_connection_mixer input-mix
+    // (use_combine=false, no block_inject; its hc_norm arrives via the model.norm
+    // remap as gguf output_norm.weight). Collapses the 4 streams -> d_model and
+    // replaces the final norm before lm_head.
+    if (arch.hyperConn) {
+        static constexpr const char* kHcMixer[] = {
+            "input_mix_weight_down.weight",
+            "input_mix_weight_up.weight",
+        };
+        for (const char* sub : kHcMixer) {
+            addDirect(steps, model, cfg,
+                      std::string("hyper_connection_mixer.") + sub,
+                      std::string("model.language_model.hyper_connection_mixer.") + sub);
         }
     }
 

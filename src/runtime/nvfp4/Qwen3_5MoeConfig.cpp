@@ -144,6 +144,13 @@ model::LlmConfig parseQwen3_5MoeSafetensorsConfig(std::string_view configJson) {
     cfg.ssmGroupCount   = optU("linear_num_key_heads", 0);
     cfg.ssmInnerSize    = optU("linear_num_value_heads", 0) * optU("linear_value_head_dim", 0);
 
+    // GDN output-gate activation (RMSNormGated). Parsed for every arch: absent
+    // (qwen3.6 etc.) -> silu (default false); qwen4_exp sets "sigmoid".
+    if (c.contains("output_gate_type") && c["output_gate_type"].is_string()) {
+        cfg.ssmOutputGateSigmoid =
+            (c["output_gate_type"].get<std::string>() == "sigmoid");
+    }
+
     cfg.nextnPredictLayers = optU("mtp_num_hidden_layers", 0);
 
     // 5.27 qwen4_exp — Hyper-Connections + PLE n-gram embeddings. Parsed into
@@ -151,6 +158,8 @@ model::LlmConfig parseQwen3_5MoeSafetensorsConfig(std::string_view configJson) {
     // Qwen4ExpBackend in I-3 (Hyper-Connections) / I-4 (PLE). Values live in the
     // text_config (`c`), same nesting as the backbone dims above.
     if (isQwen4Exp) {
+        cfg.hcCount           = optU("hc_count", 0);
+        cfg.hcLowrank         = optU("hc_lowrank", 0);
         cfg.ngramSize         = optU("ngram_size", 0);
         cfg.ngramVocabBase    = optU("ngram_vocab_size_base", 0);
         cfg.headsPerNgram     = optU("heads_per_ngram", 0);

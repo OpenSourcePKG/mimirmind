@@ -34,6 +34,11 @@
 #include <cuda_runtime.h>
 
 #ifndef MOE_TOPK_MAX_EXPERTS
+// Default 256 (qwen3.6/gemma4 etc.). A second PTX variant is compiled with
+// -DMOE_TOPK_MAX_EXPERTS=512 (moe_topk_e512.ptx) for qwen4_exp's 512 experts;
+// MoeTopKRouteDevice dispatches by nExperts so ≤256-expert models keep the
+// exact 256 kernel (byte- AND perf-identical). Per-lane cost = ceil(MAX/32)
+// registers × 2 arrays.
 #define MOE_TOPK_MAX_EXPERTS 256
 #endif
 #ifndef MOE_TOPK_MAX_K

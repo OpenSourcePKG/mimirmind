@@ -35,6 +35,14 @@ public:
     [[nodiscard]] ComputeBuffer allocate(std::size_t bytes) override;
     [[nodiscard]] ComputeBuffer allocateWeight(std::size_t bytes) override;
 
+    /// Device-only (cudaMalloc) allocation for buffers only GPU kernels ever
+    /// touch — the streaming-repack expert banks. Keeps their alloc/free
+    /// churn OUT of the managed-memory VA space: interleaving thousands of
+    /// managed frees with fresh managed allocations corrupts live
+    /// neighbouring mappings on GB10 (observed at blk.7/blk.22 of the
+    /// Qwen3.5-122B load; our own free bookkeeping showed no overlap).
+    [[nodiscard]] ComputeBuffer allocateWeightDeviceOnly(std::size_t bytes);
+
     void dequantNvfp4(const void* packed, const void* blockScale, float global,
                       std::uint64_t rows, std::uint64_t in, void* dstBf16) override;
 

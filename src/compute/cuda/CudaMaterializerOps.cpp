@@ -90,6 +90,19 @@ ComputeBuffer CudaMaterializerOps::allocateWeight(std::size_t bytes) {
     return _ops.allocateWeight(bytes);
 }
 
+ComputeBuffer CudaMaterializerOps::allocateWeightDeviceOnly(std::size_t bytes) {
+    auto& alloc = _ctx.allocator();
+    void* ptr = alloc.allocate(bytes, core::cuda::CudaAllocKind::Device);
+    return ComputeBuffer{
+        ptr,
+        bytes,
+        [](void* p, std::size_t b, void* ctx) noexcept {
+            static_cast<core::cuda::CudaMemoryAllocator*>(ctx)
+                ->deallocate(p, b, core::cuda::CudaAllocKind::Device);
+        },
+        &alloc};
+}
+
 ComputeBuffer CudaMaterializerOps::allocate(std::size_t bytes) {
     return _ops.allocate(bytes);
 }

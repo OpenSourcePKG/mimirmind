@@ -59,7 +59,9 @@ core::cuda::CudaModule loadModule(core::cuda::CudaContext& ctx,
 MoeTopKRouteDevice::MoeTopKRouteDevice(core::cuda::CudaComputeContext& ctx)
     : _ctx{ctx},
       _module{loadModule(ctx.cudaContext(), "moe_topk")},
-      _kernel{_module.getFunction("moe_topk")} {}
+      _kernel{_module.getFunction("moe_topk")},
+      _module512{loadModule(ctx.cudaContext(), "moe_topk_e512")},
+      _kernel512{_module512.getFunction("moe_topk")} {}
 
 void MoeTopKRouteDevice::launch(const float*  logits,
                                 std::int32_t* outIdx,
@@ -80,19 +82,23 @@ void MoeTopKRouteDevice::launch(const float*  logits,
             "kMaxExperts/kMaxK together");
     }
 
-    // Args match the moe_topk kernel signature exactly.
-    _kernel.setPtr  (0, logits);
-    _kernel.setPtr  (1, outIdx);
-    _kernel.setPtr  (2, outWeight);
-    _kernel.setValue(3, static_cast<std::int32_t>(nExperts));
-    _kernel.setValue(4, static_cast<std::int32_t>(K));
-    _kernel.setValue(5, wScale);
+    // Dispatch: the base 256-expert kernel for <=256 experts (byte- and
+    // perf-identical to before the e512 variant existed), else the 512 kernel.
+    core::cuda::CudaKernel& k =
+        (nExperts > kBaseExperts) ? _kernel512 : _kernel;
 
-    // Grid: one block per token. Block: 32 (warp-aligned; only thread 0
-    // computes in the v1 kernel). No dynamic shared memory.
-    _kernel.launch(_ctx.stream(),
-                   static_cast<std::uint32_t>(T), 1, 1,
-                   32, 1, 1);
+    // Args match the moe_topk kernel signature exactly.
+    k.setPtr  (0, logits);
+    k.setPtr  (1, outIdx);
+    k.setPtr  (2, outWeight);
+    k.setValue(3, static_cast<std::int32_t>(nExperts));
+    k.setValue(4, static_cast<std::int32_t>(K));
+    k.setValue(5, wScale);
+
+    // Grid: one block (one warp) per token. No dynamic shared memory.
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(T), 1, 1,
+             32, 1, 1);
 }
 
 } // namespace mimirmind::compute::cuda

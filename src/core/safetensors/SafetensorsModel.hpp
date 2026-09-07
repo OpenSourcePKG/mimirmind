@@ -87,9 +87,33 @@ public:
     [[nodiscard]] const SafetensorsTensor* find(std::string_view name) const noexcept;
 
     /// Zero-copy view of a tensor's bytes in its shard's mmap, valid for the
-    /// model's lifetime. Empty span if the name is unknown.
+    /// model's lifetime. Empty span if the name is unknown. A byte override
+    /// (see `overrideTensorBytes`) wins over the mmap view.
     [[nodiscard]] std::span<const std::uint8_t>
     tensorBytes(std::string_view name) const noexcept;
+
+    /// Rename every tensor across all shards through `fn` (identity keeps a
+    /// name) and rebuild the model-level index. Load-time normalisation seam
+    /// for checkpoints in a different naming dialect (compressed-tensors
+    /// `weight_packed`, missing `language_model.` prefix, ...).
+    void normalizeNames(const std::function<std::string(const std::string&)>& fn);
+
+    /// Replace the bytes served for `name` by an owned buffer (the mmap is
+    /// read-only). Used for tiny value fix-ups, e.g. inverting
+    /// compressed-tensors' RECIPROCAL `weight_global_scale` into the direct
+    /// ModelOpt `weight_scale_2` convention.
+    void overrideTensorBytes(std::string_view name,
+                             std::vector<std::uint8_t> bytes);
+
+    /// Fused-projection splits (see SafetensorsReader::addDerivedRowSlice).
+    /// Mutation-batch discipline: run all derive/duplicate calls first, then
+    /// removes, then ONE rebuildIndexes() — find() results and tensors()
+    /// pointers are unreliable between the first mutation and the rebuild.
+    bool deriveRowSlice(std::string_view src, std::string newName,
+                        std::uint64_t rowBegin, std::uint64_t rowCount);
+    bool duplicateTensorAs(std::string_view src, std::string newName);
+    bool removeTensor(std::string_view name);
+    void rebuildIndexes();
 
 private:
     void openSingle(std::string_view file);
@@ -100,6 +124,7 @@ private:
     std::map<std::string, std::size_t> _tensorToShard;  ///< name -> shard idx
     std::vector<const SafetensorsTensor*> _flat;
     std::uint64_t                      _totalSize{0};
+    std::map<std::string, std::vector<std::uint8_t>, std::less<>> _byteOverrides;
 };
 
 } // namespace mimirmind::core::safetensors

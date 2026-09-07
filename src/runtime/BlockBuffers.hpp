@@ -214,6 +214,14 @@ struct BlockBuffers {
     // `blockCount * expertUsedCount`. Only allocated for MoE models.
     ComputeBuffer moeExpIdxScratch;   // [blockCount, expertUsedCount] int32
     ComputeBuffer moeKwScratch;       // [blockCount, expertUsedCount] fp32
+
+    // 5.27 I-3 (qwen4_exp): [nRowsMax = maxT*K] routing slots for the
+    // single-session runFfn -> runMoeFfnGrouped path with tc-only (NVFP4_TC)
+    // routed banks (which the per-token runMoeFfn cannot consume). Distinct from
+    // the moeGroup* build outputs (runMoeFfnGrouped writes routing here, then
+    // moeGroupBuild reads it -> moeGroupRowTok/Kw). Only allocated for MoE models.
+    ComputeBuffer moePrefillExpIdx;   // [nRowsMax] int32
+    ComputeBuffer moePrefillKw;       // [nRowsMax] fp32
 };
 
 /// Allocate a single BlockBuffers. `qDimMax`/`kvDimMax` come from the

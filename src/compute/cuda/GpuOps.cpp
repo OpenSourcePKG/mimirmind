@@ -134,6 +134,17 @@ core::cuda::CudaModule loadCudaModule(core::cuda::CudaContext& ctx,
 struct GpuOps::Impl {
     core::cuda::CudaModule _rmsnormModule;
     core::cuda::CudaKernel _rmsnormKernel;
+    // 5.27 I-3 Hyper-Connections (one module, four kernels).
+    core::cuda::CudaModule _hcModule;
+    core::cuda::CudaKernel _hcGroupedRmsNormKernel;
+    core::cuda::CudaKernel _hcSiluScaleKernel;
+    core::cuda::CudaKernel _hcWeightedMeanKernel;
+    core::cuda::CudaKernel _hcInjectScatterKernel;
+    core::cuda::CudaKernel _hcStreamBroadcastKernel;
+    // 5.27 I-4 PLE (one module, two kernels).
+    core::cuda::CudaModule _pleModule;
+    core::cuda::CudaKernel _pleGateKernel;
+    core::cuda::CudaKernel _pleConvSiluKernel;
     core::cuda::CudaModule _layernormModule;
     core::cuda::CudaKernel _layernormKernel;
     core::cuda::CudaModule _rmsnormGemmaModule;
@@ -346,6 +357,11 @@ struct GpuOps::Impl {
     // row gather, deterministic expert-output scatter).
     core::cuda::CudaModule _moeGroupBuildModule;
     core::cuda::CudaKernel _moeGroupBuildKernel;
+    // Second PTX variant for >256 routed experts (qwen3-coder-next: 512).
+    // Same kernel symbol; moeGroupBuildAsync dispatches by nExperts so
+    // <=256-expert models keep the exact base kernel. Mirrors moe_topk_e512.
+    core::cuda::CudaModule _moeGroupBuildModule512;
+    core::cuda::CudaKernel _moeGroupBuildKernel512;
     // 5.22 OEA — batch-aware routing rewrite (active-mask + reroute).
     core::cuda::CudaModule _moeOeaModule;
     core::cuda::CudaKernel _moeOeaActiveMaskKernel;
@@ -363,6 +379,9 @@ struct GpuOps::Impl {
     // build + single grouped NVFP4 launch; no expOffset D2H).
     core::cuda::CudaModule _moeGroupTilesModule;
     core::cuda::CudaKernel _moeGroupTilesKernel;
+    // >256-expert PTX variant, dispatched by nExperts (see _moeGroupBuild*512).
+    core::cuda::CudaModule _moeGroupTilesModule512;
+    core::cuda::CudaKernel _moeGroupTilesKernel512;
     core::cuda::CudaModule _moeGroupedGemmNvfp4Module;
     core::cuda::CudaKernel _moeGroupedGemmNvfp4Kernel;
     // De-interleaved (uint4-coalesced) NVFP4 grouped decode + its de-interleave
@@ -435,6 +454,15 @@ struct GpuOps::Impl {
     explicit Impl(core::cuda::CudaContext& ctx)
         : _rmsnormModule           {loadCudaModule(ctx, "rmsnorm")},
           _rmsnormKernel           {_rmsnormModule.getFunction("rmsnorm")},
+          _hcModule                {loadCudaModule(ctx, "hyper_connection")},
+          _hcGroupedRmsNormKernel  {_hcModule.getFunction("hc_grouped_rmsnorm")},
+          _hcSiluScaleKernel       {_hcModule.getFunction("hc_silu_scale")},
+          _hcWeightedMeanKernel    {_hcModule.getFunction("hc_weighted_mean_streams")},
+          _hcInjectScatterKernel   {_hcModule.getFunction("hc_inject_scatter")},
+          _hcStreamBroadcastKernel {_hcModule.getFunction("hc_stream_broadcast")},
+          _pleModule               {loadCudaModule(ctx, "ple_forward")},
+          _pleGateKernel           {_pleModule.getFunction("ple_gate")},
+          _pleConvSiluKernel       {_pleModule.getFunction("ple_conv_silu")},
           _layernormModule         {loadCudaModule(ctx, "layernorm")},
           _layernormKernel         {_layernormModule.getFunction("layernorm")},
           _rmsnormGemmaModule      {loadCudaModule(ctx, "rmsnorm_gemma")},
@@ -694,6 +722,9 @@ struct GpuOps::Impl {
           _moeGroupBuildModule     {loadCudaModule(ctx, "moe_group_build")},
           _moeGroupBuildKernel     {
               _moeGroupBuildModule.getFunction("moe_group_build")},
+          _moeGroupBuildModule512  {loadCudaModule(ctx, "moe_group_build_e512")},
+          _moeGroupBuildKernel512  {
+              _moeGroupBuildModule512.getFunction("moe_group_build")},
           _moeOeaModule            {loadCudaModule(ctx, "moe_oea")},
           _moeOeaActiveMaskKernel  {
               _moeOeaModule.getFunction("oea_active_mask")},
@@ -715,6 +746,9 @@ struct GpuOps::Impl {
           _moeGroupTilesModule     {loadCudaModule(ctx, "moe_group_tiles")},
           _moeGroupTilesKernel     {
               _moeGroupTilesModule.getFunction("moe_group_tiles")},
+          _moeGroupTilesModule512  {loadCudaModule(ctx, "moe_group_tiles_e512")},
+          _moeGroupTilesKernel512  {
+              _moeGroupTilesModule512.getFunction("moe_group_tiles")},
           _moeGroupedGemmNvfp4Module{
               loadCudaModule(ctx, "moe_grouped_gemm_nvfp4blk")},
           _moeGroupedGemmNvfp4Kernel{
@@ -1241,6 +1275,130 @@ void GpuOps::rmsNormAsync(const float* x, std::size_t M, std::size_t K,
     k.launch(_ctx.stream(),
              static_cast<std::uint32_t>(M), 1, 1,
              kRmsnormLocalSize, 1, 1);
+}
+
+// --- 5.27 I-3 Hyper-Connections elementwise ops -----------------------------
+void GpuOps::hcGroupedRmsNormAsync(const float* x, const float* wBaked,
+                                   float* normed, std::size_t T, std::size_t hc,
+                                   std::size_t d, float eps) {
+    const std::size_t hcd = hc * d;
+    if (T == 0 || hcd == 0) {
+        return;
+    }
+    auto& k = _pimpl->_hcGroupedRmsNormKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, wBaked);
+    k.setPtr  (2, normed);
+    k.setValue(3, eps);
+    k.setValue(4, toInt32(hcd, "hcGroupedRmsNorm hcd"));
+    k.setValue(5, toInt32(d,   "hcGroupedRmsNorm group"));
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(hc), static_cast<std::uint32_t>(T), 1,
+             256, 1, 1);
+}
+
+void GpuOps::hcSiluScaleAsync(float* x, std::size_t n, float scale) {
+    if (n == 0) {
+        return;
+    }
+    auto& k = _pimpl->_hcSiluScaleKernel;
+    k.setPtr  (0, x);
+    k.setValue(1, toInt32(n, "hcSiluScale n"));
+    k.setValue(2, scale);
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::hcWeightedMeanStreamsAsync(const float* w2, const float* normed,
+                                        float* mixed, std::size_t T,
+                                        std::size_t hc, std::size_t d) {
+    if (T == 0 || d == 0) {
+        return;
+    }
+    auto& k = _pimpl->_hcWeightedMeanKernel;
+    k.setPtr  (0, w2);
+    k.setPtr  (1, normed);
+    k.setPtr  (2, mixed);
+    k.setValue(3, toInt32(T,  "hcWeightedMean T"));
+    k.setValue(4, toInt32(hc, "hcWeightedMean hc"));
+    k.setValue(5, toInt32(d,  "hcWeightedMean d"));
+    k.launch(_ctx.stream(),
+             groupsForN(d, 256), static_cast<std::uint32_t>(T), 1, 256, 1, 1);
+}
+
+void GpuOps::hcInjectScatterAsync(float* x, const float* moduleOut,
+                                  const float* inj, std::size_t T, std::size_t hc,
+                                  std::size_t d) {
+    const std::size_t hcd = hc * d;
+    if (T == 0 || hcd == 0) {
+        return;
+    }
+    auto& k = _pimpl->_hcInjectScatterKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, moduleOut);
+    k.setPtr  (2, inj);
+    k.setValue(3, toInt32(T,  "hcInjectScatter T"));
+    k.setValue(4, toInt32(hc, "hcInjectScatter hc"));
+    k.setValue(5, toInt32(d,  "hcInjectScatter d"));
+    k.launch(_ctx.stream(),
+             groupsForN(hcd, 256), static_cast<std::uint32_t>(T), 1, 256, 1, 1);
+}
+
+void GpuOps::pleGateAsync(const float* keyNormed, const float* queryNormed,
+                          const float* value, float* gated, std::size_t T,
+                          std::size_t hc, std::size_t d) {
+    if (T == 0 || hc == 0 || d == 0) {
+        return;
+    }
+    auto& k = _pimpl->_pleGateKernel;
+    k.setPtr  (0, keyNormed);
+    k.setPtr  (1, queryNormed);
+    k.setPtr  (2, value);
+    k.setPtr  (3, gated);
+    k.setValue(4, toInt32(T,  "pleGate T"));
+    k.setValue(5, toInt32(hc, "pleGate hc"));
+    k.setValue(6, toInt32(d,  "pleGate d"));
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(hc), static_cast<std::uint32_t>(T), 1,
+             256, 1, 1);
+}
+
+void GpuOps::pleConvSiluAsync(const float* x, const float* state, const float* w,
+                              float* out, std::size_t T, std::size_t hcd,
+                              std::size_t K, std::size_t dilation,
+                              std::size_t stateLen) {
+    if (T == 0 || hcd == 0) {
+        return;
+    }
+    auto& k = _pimpl->_pleConvSiluKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, state);   // may be nullptr (zero state / prefill)
+    k.setPtr  (2, w);
+    k.setPtr  (3, out);
+    k.setValue(4, toInt32(T,        "pleConv T"));
+    k.setValue(5, toInt32(hcd,      "pleConv hcd"));
+    k.setValue(6, toInt32(K,        "pleConv K"));
+    k.setValue(7, toInt32(dilation, "pleConv dilation"));
+    k.setValue(8, toInt32(stateLen, "pleConv stateLen"));
+    k.launch(_ctx.stream(),
+             groupsForN(hcd, 256), static_cast<std::uint32_t>(T), 1, 256, 1, 1);
+}
+
+void GpuOps::hcStreamBroadcastAsync(const float* src, float* dst, std::size_t T,
+                                    std::size_t hc, std::size_t d) {
+    const std::size_t hcd = hc * d;
+    if (T == 0 || hcd == 0) {
+        return;
+    }
+    auto& k = _pimpl->_hcStreamBroadcastKernel;
+    k.setPtr  (0, src);
+    k.setPtr  (1, dst);
+    k.setValue(2, toInt32(T,  "hcStreamBroadcast T"));
+    k.setValue(3, toInt32(hc, "hcStreamBroadcast hc"));
+    k.setValue(4, toInt32(d,  "hcStreamBroadcast d"));
+    k.launch(_ctx.stream(),
+             groupsForN(hcd, 256), static_cast<std::uint32_t>(T), 1, 256, 1, 1);
 }
 
 void GpuOps::layerNormAsync(const float* x, std::size_t M, std::size_t K,
@@ -2442,7 +2600,21 @@ void GpuOps::moeGroupBuildAsync(const std::int32_t* expIdx, const float* kw,
     if (R == 0 || nExperts == 0) {
         return;
     }
-    auto& k = _pimpl->_moeGroupBuildKernel;
+    // The base kernel clamps SILENTLY at MOE_GROUP_MAX_EXPERTS=256 (experts
+    // beyond it get garbage expOffset entries -> negative per-expert GEMM row
+    // counts -> illegal access downstream). Dispatch by nExperts, and fail
+    // loudly past the e512 variant's ceiling.
+    constexpr std::size_t kBaseExperts = 256;   // == MOE_GROUP_MAX_EXPERTS
+    constexpr std::size_t kMaxExperts  = 512;   // == e512 variant's ceiling
+    if (nExperts > kMaxExperts) {
+        throw std::runtime_error(
+            "moeGroupBuildAsync: nExperts=" + std::to_string(nExperts) +
+            " exceeds max " + std::to_string(kMaxExperts) +
+            " — bump both moe_group_build.cu's e512 build and kMaxExperts "
+            "together");
+    }
+    auto& k = (nExperts > kBaseExperts) ? _pimpl->_moeGroupBuildKernel512
+                                        : _pimpl->_moeGroupBuildKernel;
     k.setPtr  (0, expIdx);
     k.setPtr  (1, kw);
     k.setPtr  (2, expOffset);
@@ -2567,7 +2739,20 @@ void GpuOps::moeGroupTilesAsync(const std::int32_t* expOffset,
     if (nExperts == 0 || maxTiles == 0) {
         return;
     }
-    auto& k = _pimpl->_moeGroupTilesKernel;
+    // Same silent-clamp hazard as moe_group_build: the base kernel caps at
+    // MOE_TILES_MAX_EXPERTS=256, so dispatch by nExperts and fail loudly past
+    // the e512 variant (kBaseExperts/kMaxExperts as in moeGroupBuildAsync).
+    constexpr std::size_t kBaseExperts = 256;
+    constexpr std::size_t kMaxExperts  = 512;
+    if (nExperts > kMaxExperts) {
+        throw std::runtime_error(
+            "moeGroupTilesAsync: nExperts=" + std::to_string(nExperts) +
+            " exceeds max " + std::to_string(kMaxExperts) +
+            " — bump both moe_group_tiles.cu's e512 build and kMaxExperts "
+            "together");
+    }
+    auto& k = (nExperts > kBaseExperts) ? _pimpl->_moeGroupTilesKernel512
+                                        : _pimpl->_moeGroupTilesKernel;
     k.setPtr  (0, expOffset);
     k.setPtr  (1, tileExpert);
     k.setPtr  (2, tileRow0);

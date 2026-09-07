@@ -43,6 +43,11 @@ const ModelOptSchemeInfo& schemeInfo(ModelOptQuantScheme s) noexcept {
 std::optional<ModelOptQuantScheme>
 schemeFromQuantAlgo(std::string_view quantAlgo) noexcept {
     if (quantAlgo == "W4A16_NVFP4") return ModelOptQuantScheme::NVFP4_E2M1_BLK16;
+    // ModelOpt 0.46+ (qwen4_exp / Qwen3.8-Flash-Next) writes the bare "NVFP4"
+    // as the top-level `quantization.quant_algo` with a uniform group_size:16
+    // and an exclude_modules glob list, instead of the older "W4A16_NVFP4" or a
+    // per-module `quantized_layers` map. Same E2M1 block-16 scheme.
+    if (quantAlgo == "NVFP4")       return ModelOptQuantScheme::NVFP4_E2M1_BLK16;
     if (quantAlgo == "FP8")         return ModelOptQuantScheme::FP8_E4M3;
     return std::nullopt;
 }

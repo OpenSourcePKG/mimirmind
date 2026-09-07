@@ -160,6 +160,21 @@ public:
         return false;
     }
 
+    /// 5.27 I-3: true when this arch keeps a multi-stream Hyper-Connections
+    /// residual state (qwen4_exp). The driver then, after each forward's block
+    /// loop, calls `collapseHyperStreams` to fold the streams into the final
+    /// d_model hidden (which ALSO replaces the plain output_norm) before lm_head.
+    [[nodiscard]] virtual bool usesHyperConnections() const noexcept {
+        return false;
+    }
+
+    /// 5.27 I-3: collapse the Hyper-Connections streams built up over the block
+    /// loop into `out` [T, d_model] (the top-level mixer; replaces output_norm).
+    /// No-op default for every non-HC arch. Only called when
+    /// `usesHyperConnections()` is true.
+    virtual void collapseHyperStreams(std::size_t /*T*/, BlockBuffers& /*s*/,
+                                      float* /*out*/) {}
+
     /// True when this MoE backend runs its decode block with fully
     /// device-side expert dispatch — no host read of the routing between
     /// the router matmul and the accumulator (M-CLR.MoE Increment 2). Such

@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -107,10 +108,21 @@ struct MaterializedTensor {
  *
  * Throws std::runtime_error if a source tensor or its scale sidecar is
  * absent from `src`.
+ *
+ * 5.27 I-2: `deferToNvfp4Bank` (optional) — when it returns true for a step's
+ * GGUF name, that step is NOT dequantised to BF16; a placeholder
+ * MaterializedTensor (correct ggufName/dims/totalElems, EMPTY buffer) is
+ * emitted instead, to be filled by a later NVFP4 repack that reads the NVFP4
+ * source directly (Nvfp4Loader's MoE bank repack). This removes the transient
+ * BF16 peak for the routed experts (~225 GiB for qwen4_exp) that would
+ * otherwise be allocated and immediately discarded. The caller MUST fill every
+ * deferred tensor's buffer afterwards (an empty buffer that survives = a bug).
  */
 [[nodiscard]] std::vector<MaterializedTensor>
 executeMaterialization(const std::vector<core::modelopt::MaterializationStep>& steps,
                        const NvFp4Model&        src,
-                       MaterializerDeviceOps&   ops);
+                       MaterializerDeviceOps&   ops,
+                       const std::function<bool(const std::string&)>&
+                           deferToNvfp4Bank = {});
 
 } // namespace mimirmind::runtime::nvfp4

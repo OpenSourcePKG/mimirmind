@@ -4207,9 +4207,24 @@ TEST(cuda_moe_grouped_nvfp4_tc_banks_multi) {
                                                   resolvePtx("moe_act_quant_nvfp4"));
     cc::CudaKernel kern = mod.getFunction("moe_act_quant_nvfp4");
 
-    const std::vector<int> M{32, 16, 80};
+    // Q4E repro (temporary): override M (comma list) + N/K via env to reproduce
+    // the serving long-prefill failure at large M / real expert dims.
+    std::vector<int> M{32, 16, 80};
+    if (const char* mEnv = std::getenv("Q4E_BANKS_M")) {
+        M.clear();
+        std::string s{mEnv}; std::size_t p = 0;
+        while (p < s.size()) {
+            std::size_t c = s.find(',', p);
+            if (c == std::string::npos) c = s.size();
+            M.push_back(std::atoi(s.substr(p, c - p).c_str()));
+            p = c + 1;
+        }
+    }
     const int G = static_cast<int>(M.size());
-    const int N = 128, K = 128, ksf = K / 16;
+    int Nv = 128, Kv = 128;
+    if (const char* nEnv = std::getenv("Q4E_BANKS_N")) Nv = std::atoi(nEnv);
+    if (const char* kEnv = std::getenv("Q4E_BANKS_K")) Kv = std::atoi(kEnv);
+    const int N = Nv, K = Kv, ksf = K / 16;
     const std::size_t sfbStride = mo::moeSwizzledScaleStride(N, ksf);
 
     std::vector<std::int32_t> expOff(G + 1, 0), padOff(G + 1, 0);
@@ -4264,6 +4279,14 @@ TEST(cuda_moe_grouped_nvfp4_tc_banks_multi) {
     const std::size_t scratchBytes =
         ::mimirmind::kernels::cutlassmoe::groupedNvfp4TcBanksScratchBytes(G);
     auto dScratch = ops.allocate(scratchBytes);
+    // Q4E repro (temporary): simulate the SERVE condition where the caller-owned
+    // banks scratch is reused/uninitialised (not the fresh-zeroed malloc the test
+    // otherwise gets). If CUTLASS's persistent scheduler needs a zeroed workspace,
+    // garbage here reproduces the serving intermittent illegal-access.
+    if (std::getenv("Q4E_GARBAGE_SCRATCH")) {
+        cudaMemset(dScratch.get(), 0xFF, scratchBytes);
+        cudaDeviceSynchronize();
+    }
     const int rc = ::mimirmind::kernels::cutlassmoe::runGroupedNvfp4TcF32Banks(
         G, N, K,
         static_cast<const std::int32_t*>(dExp.get()),

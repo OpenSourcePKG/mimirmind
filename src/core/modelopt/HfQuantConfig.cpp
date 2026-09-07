@@ -127,7 +127,18 @@ HfQuantConfig HfQuantConfig::parse(std::string_view jsonText) {
 
 bool HfQuantConfig::isExcluded(std::string_view name) const noexcept {
     for (const std::string& pat : _exclude) {
+        // exclude_modules entries are MODULE paths, not full tensor names. A
+        // wildcard-free entry such as "lm_head" or
+        // "model.language_model.embed_tokens" must therefore also exclude that
+        // module's tensors ("<module>.weight", "<module>.weight_scale", ...),
+        // not just an exact-named tensor. Match the pattern itself AND its
+        // "<pattern>.*" module-prefix form. Patterns that already carry a
+        // trailing wildcard (e.g. "*.self_attn.*", "mtp.*") are covered by the
+        // first test; the second is a harmless superset for them.
         if (globMatch(pat, name)) {
+            return true;
+        }
+        if (globMatch(std::string(pat) + ".*", name)) {
             return true;
         }
     }

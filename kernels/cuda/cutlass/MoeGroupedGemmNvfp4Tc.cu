@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "cutlass/cutlass.h"
@@ -556,6 +557,11 @@ int runGroupedNvfp4TcF32Banks(
     // No per-call cudaMalloc, no sync: the scratch + workspace persist across
     // calls (caller-owned) and the stream ordering serialises the builder ->
     // GEMM chain against the surrounding MoE ops.
+    if (std::getenv("Q4E_WS_DIAG")) {
+        std::fprintf(stderr,
+            "[nvfp4-tc-banks] Q4E_WS_DIAG groups=%d wsBytes(pre)=%zu real_get_workspace_size=%zu\n",
+            groups, wsBytes, Gemm::get_workspace_size(arguments));
+    }
     cutlass::Status st = gemm.can_implement(arguments);
     if (st != cutlass::Status::kSuccess) {
         std::fprintf(stderr, "[nvfp4-tc-banks] can_implement: %s\n", cutlassGetStatusString(st));

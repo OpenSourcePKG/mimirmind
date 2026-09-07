@@ -91,6 +91,17 @@ struct Qwen3_5MoeArch {
     /// block index `numLayers` (a full-attention + MoE block plus the four
     /// nextn.* projections). 0 = no MTP head loaded.
     int mtpLayers          = 0;
+    /// qwen4_exp (Qwen3.8-Flash-Next) folds the per-layer RMSNorms into
+    /// hyper-connections and the final norm into the top-level
+    /// hyper_connection_mixer, so the three norm slots the qwen3_5 tables name
+    /// (`input_layernorm` / `post_attention_layernorm` /
+    /// `model.language_model.norm`) do NOT exist under those names. When set,
+    /// the plan redirects those three onto the `*.hc_norm.weight` tensors that
+    /// actually carry the weights. The hyper-connection MIXING math itself
+    /// (block_inject_weight + input_mix_weight_down/up, replacing the plain
+    /// residual add) is a separate forward increment (5.27 I-3); this flag only
+    /// gets the norm weights loaded resident so the backbone materialises.
+    bool hyperConn         = false;
 };
 
 /**

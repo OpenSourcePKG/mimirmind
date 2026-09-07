@@ -21,7 +21,22 @@ using safetensors::SafetensorsTensor;
 } // namespace
 
 bool ModelOptWeightAssembler::isQuantized(std::string_view module) const {
-    return _config.schemeForTensor(module).has_value();
+    const auto scheme = _config.schemeForTensor(module);
+    if (!scheme.has_value()) {
+        return false;
+    }
+    // Checkpoint truth wins over a uniform scheme. ModelOpt only quantises
+    // nn.Linear modules; under a top-level `quant_algo` (e.g. the
+    // Qwen3.5-122B-A10B NVFP4 checkpoint) implicitly-unquantised modules such
+    // as embed_tokens are NOT listed in exclude_modules, so the scheme
+    // resolves for them although the tensor is stored BF16. Treat a module as
+    // quantised only if its weight actually carries the scheme's packed
+    // dtype; a missing weight stays "quantised" so assemble() fails loudly.
+    const SafetensorsTensor* w = _model.find(std::string(module) + ".weight");
+    if (w == nullptr) {
+        return true;
+    }
+    return w->dtype == schemeInfo(*scheme).weightDtype;
 }
 
 ModelOptWeight ModelOptWeightAssembler::assemble(std::string_view module) const {

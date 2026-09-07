@@ -93,6 +93,14 @@ public:
     /// module is not quantised.
     [[nodiscard]] const NvFp4DeviceWeight* weight(std::string_view module) const noexcept;
 
+    /// 5.27 I-2 streaming repack: free the device buffer backing an uploaded
+    /// tensor once it has been consumed (e.g. a routed-expert NVFP4 source
+    /// after it is repacked to its bank), so the source and the growing banks
+    /// do not co-reside. The tensor's `find()` entry survives but its devPtr is
+    /// dangling afterwards — only call once the tensor will never be read again.
+    /// No-op for an unknown or already-released name.
+    void releaseTensor(const std::string& name) noexcept;
+
     [[nodiscard]] std::size_t   tensorCount()          const noexcept { return _tensors.size(); }
     [[nodiscard]] std::size_t   quantizedWeightCount() const noexcept { return _weights.size(); }
     [[nodiscard]] std::uint64_t deviceBytes()          const noexcept { return _deviceBytes; }
@@ -106,11 +114,40 @@ private:
                                      DeviceUploader&                uploader);
 
     std::vector<compute::ComputeBuffer>       _buffers;   ///< owns device memory
+    std::map<std::string, std::size_t>        _bufIdx;    ///< HF name -> _buffers slot (5.27 release)
+    /// Live-member refcount per _buffers slot. Per-expert source tensors are
+    /// consolidated into one slab buffer per (layer, projection, tensor kind)
+    /// — thousands of interleaved 1.5 MiB cudaFrees during the streaming
+    /// repack corrupt live neighbouring managed mappings on GB10 (verified:
+    /// no overlapping free in our own bookkeeping, the mapping still died).
+    /// The slab is freed once every member tensor was released.
+    std::vector<std::uint32_t>                _bufRefs;
     std::map<std::string, NvFp4DeviceTensor>  _tensors;   ///< HF name -> device tensor
     std::map<std::string, NvFp4DeviceWeight>  _weights;   ///< module base -> assembled
     modelopt::HfQuantConfig                   _config;
     std::uint64_t                             _deviceBytes{0};
 };
+
+/**
+ * Detect a compressed-tensors "nvfp4-pack-quantized" checkpoint (llm-compressor
+ * export, e.g. Qwen3-Coder-Next) by its tensor-name dialect and normalise it
+ * IN PLACE to the ModelOpt convention every downstream consumer speaks:
+ *   - `model.layers.*`             -> `model.language_model.layers.*`
+ *     (`model.embed_tokens`/`model.norm` likewise)
+ *   - `<m>.weight_packed`          -> `<m>.weight`
+ *   - `<m>.weight_global_scale`    -> `<m>.weight_scale_2`, with the VALUE
+ *     inverted via a byte override (compressed-tensors stores the reciprocal
+ *     of ModelOpt's direct global scale).
+ * Returns true if the dialect was detected and normalised, false untouched.
+ */
+bool normalizeCompressedTensorsCheckpoint(safetensors::SafetensorsModel& sm);
+
+/**
+ * The ModelOpt `hf_quant_config.json` equivalent for a normalised
+ * compressed-tensors NVFP4 checkpoint: uniform NVFP4, group 16, no excludes
+ * (the loader's checkpoint-truth guards route BF16 tensors correctly).
+ */
+[[nodiscard]] std::string syntheticCtHfQuantConfigJson();
 
 /**
  * Open the checkpoint at `checkpointDir` (a directory holding the

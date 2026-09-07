@@ -414,6 +414,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/nvfp4/NvFp4Model.cpp
     src/runtime/nvfp4/NvFp4Materializer.cpp
     src/runtime/nvfp4/NvFp4WeightsMap.cpp
+    src/runtime/nvfp4/PleNgramTable.cpp
     src/runtime/nvfp4/Qwen3_5MoeConfig.cpp
     src/runtime/nvfp4/Gemma4Config.cpp
     src/runtime/nvfp4/ModelFormatResolver.cpp
@@ -1024,6 +1025,8 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/cublas_fp8_quant.cu
         kernels/cuda/llm/neg_exp.cu
         kernels/cuda/llm/add_one.cu
+        kernels/cuda/llm/hyper_connection.cu
+        kernels/cuda/llm/ple_forward.cu
     )
 
     set(PTX_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/ptx)
@@ -1084,6 +1087,99 @@ if(MIMIRMIND_ENABLE_CUDA)
         VERBATIM
     )
     list(APPEND CUDA_PTX_FILES ${CUDA_GQA_KTILE64_PTX})
+
+    # 5.27 I-3: second build of moe_topk.cu with -DMOE_TOPK_MAX_EXPERTS=512 for
+    # qwen4_exp's 512 routed experts -> moe_topk_e512.ptx. Kernel symbol stays
+    # `moe_topk`, so getFunction finds it from either .ptx; MoeTopKRouteDevice
+    # dispatches by nExperts (<=256 uses the base moe_topk.ptx, byte- and
+    # perf-identical for qwen3.6/gemma4). Mirrors the KTILE64 dual-compile above.
+    set(CUDA_MOE_TOPK_E512_CU
+        ${CMAKE_CURRENT_BINARY_DIR}/moe_topk_e512.cu)
+    set(CUDA_MOE_TOPK_E512_PTX
+        ${PTX_OUTPUT_DIR}/moe_topk_e512.ptx)
+    add_custom_command(
+        OUTPUT ${CUDA_MOE_TOPK_E512_CU}
+        COMMAND ${CMAKE_COMMAND} -E copy
+                ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/llm/moe_topk.cu
+                ${CUDA_MOE_TOPK_E512_CU}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/llm/moe_topk.cu
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT ${CUDA_MOE_TOPK_E512_PTX}
+        COMMAND ${NVCC_EXECUTABLE}
+                --ptx
+                -arch=compute_80
+                -DMOE_TOPK_MAX_EXPERTS=512
+                ${CUDA_MOE_TOPK_E512_CU}
+                -o ${CUDA_MOE_TOPK_E512_PTX}
+        DEPENDS ${CUDA_MOE_TOPK_E512_CU}
+        WORKING_DIRECTORY ${PTX_OUTPUT_DIR}
+        COMMENT "nvcc --ptx -> moe_topk_e512.ptx (MAX_EXPERTS=512)"
+        VERBATIM
+    )
+    list(APPEND CUDA_PTX_FILES ${CUDA_MOE_TOPK_E512_PTX})
+
+    # Second build of moe_group_build.cu with -DMOE_GROUP_MAX_EXPERTS=512 for
+    # 512-routed-expert models (qwen3-coder-next) -> moe_group_build_e512.ptx.
+    # Kernel symbol stays `moe_group_build`; GpuOps::moeGroupBuildAsync
+    # dispatches by nExperts (<=256 keeps the base .ptx, byte-identical).
+    # Mirrors the moe_topk_e512 dual-compile above.
+    set(CUDA_MOE_GROUP_E512_CU
+        ${CMAKE_CURRENT_BINARY_DIR}/moe_group_build_e512.cu)
+    set(CUDA_MOE_GROUP_E512_PTX
+        ${PTX_OUTPUT_DIR}/moe_group_build_e512.ptx)
+    add_custom_command(
+        OUTPUT ${CUDA_MOE_GROUP_E512_CU}
+        COMMAND ${CMAKE_COMMAND} -E copy
+                ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/llm/moe_group_build.cu
+                ${CUDA_MOE_GROUP_E512_CU}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/llm/moe_group_build.cu
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT ${CUDA_MOE_GROUP_E512_PTX}
+        COMMAND ${NVCC_EXECUTABLE}
+                --ptx
+                -arch=compute_80
+                -DMOE_GROUP_MAX_EXPERTS=512
+                ${CUDA_MOE_GROUP_E512_CU}
+                -o ${CUDA_MOE_GROUP_E512_PTX}
+        DEPENDS ${CUDA_MOE_GROUP_E512_CU}
+        WORKING_DIRECTORY ${PTX_OUTPUT_DIR}
+        COMMENT "nvcc --ptx -> moe_group_build_e512.ptx (MAX_EXPERTS=512)"
+        VERBATIM
+    )
+    list(APPEND CUDA_PTX_FILES ${CUDA_MOE_GROUP_E512_PTX})
+
+    # Same for moe_group_tiles.cu (device-driven grouped-GEMM schedule) ->
+    # moe_group_tiles_e512.ptx with -DMOE_TILES_MAX_EXPERTS=512.
+    set(CUDA_MOE_TILES_E512_CU
+        ${CMAKE_CURRENT_BINARY_DIR}/moe_group_tiles_e512.cu)
+    set(CUDA_MOE_TILES_E512_PTX
+        ${PTX_OUTPUT_DIR}/moe_group_tiles_e512.ptx)
+    add_custom_command(
+        OUTPUT ${CUDA_MOE_TILES_E512_CU}
+        COMMAND ${CMAKE_COMMAND} -E copy
+                ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/llm/moe_group_tiles.cu
+                ${CUDA_MOE_TILES_E512_CU}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/llm/moe_group_tiles.cu
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT ${CUDA_MOE_TILES_E512_PTX}
+        COMMAND ${NVCC_EXECUTABLE}
+                --ptx
+                -arch=compute_80
+                -DMOE_TILES_MAX_EXPERTS=512
+                ${CUDA_MOE_TILES_E512_CU}
+                -o ${CUDA_MOE_TILES_E512_PTX}
+        DEPENDS ${CUDA_MOE_TILES_E512_CU}
+        WORKING_DIRECTORY ${PTX_OUTPUT_DIR}
+        COMMENT "nvcc --ptx -> moe_group_tiles_e512.ptx (MAX_EXPERTS=512)"
+        VERBATIM
+    )
+    list(APPEND CUDA_PTX_FILES ${CUDA_MOE_TILES_E512_PTX})
 
     add_custom_target(cuda_kernels ALL DEPENDS ${CUDA_PTX_FILES})
 endif()

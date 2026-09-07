@@ -185,7 +185,24 @@ void Qwen3_5MoeBackend::runFfn(std::size_t   blockIdx,
                              _prefillMoeKw, s);
         }
     } else {
-        runMoeFfn(blockIdx, moeInput, T, s);
+        // 5.27 I-3: the single-session runFfn per-token runMoeFfn path cannot
+        // consume tc-only (NVFP4_TC) routed banks (per-expert matmulAsync has no
+        // NVFP4_TC dequant). Route them — at any T, prefill AND decode — through
+        // the self-routing grouped fused-K/TC GEMM instead, using the [nRowsMax]
+        // prefill routing slots. Fires ONLY for NVFP4_TC experts (qwen4_exp
+        // GROUPED_MOE=3); qwen3.6's NVFP4_BLK experts keep the runMoeFfn path.
+        const auto* gExps = _weights.findBlock(blockIdx, "ffn_gate_exps.weight");
+        const bool tcExperts = gExps != nullptr
+            && gExps->type == core::gguf::GgmlType::NVFP4_TC
+            && s.moePrefillExpIdx.get() != nullptr;
+        if (tcExperts) {
+            runMoeFfnGrouped(blockIdx, moeInput, T,
+                             s.moePrefillExpIdx.as<std::int32_t>(),
+                             s.moePrefillKw.as<float>(), s,
+                             /*preferBlocked=*/false);
+        } else {
+            runMoeFfn(blockIdx, moeInput, T, s);
+        }
     }
 }
 
@@ -2054,15 +2071,22 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
                                                 stateBase, deltaOut, gdnShape);
     }
 
-    // --- gated output norm: ssm_norm(out) * silu(z) ------------------
+    // --- gated output norm: ssm_norm(out) * act(z) ------------------
+    // act = silu (qwen3.6 etc.) or sigmoid (qwen4_exp, output_gate_type).
     _ops.profileSection("gdn.tail");
     _ops.rmsNormAsync(deltaOut, nRow * hV, S,
                       static_cast<const float*>(ssmNormW.usmPtr), eps, qBuf);
-    _ops.siluMulAsync(zBuf, qBuf, nRow * valueDim);
+    float* gatedOut = zBuf;
+    if (_config.ssmOutputGateSigmoid) {
+        _ops.sigmoidGateMulAsync(qBuf, zBuf, nRow, valueDim, /*gateDim=*/valueDim);
+        gatedOut = qBuf;
+    } else {
+        _ops.siluMulAsync(zBuf, qBuf, nRow * valueDim);
+    }
 
     // --- output projection ssm_out -----------------------------------
     _gmm.matmulAsync(ssmOutW.type, ssmOutW.usmPtr, d_model, valueDim,
-                     zBuf, nRow, projOut, mmScratch);
+                     gatedOut, nRow, projOut, mmScratch);
     _ops.addResidualAsync(x, projOut, nRow * d_model);
 
     // --- post-attn norm -> batched MoE -> FFN residual ---------------
@@ -2233,9 +2257,15 @@ void Qwen3_5MoeBackend::runLinearBlockVerify(
     _ops.profileSection("verify.tail");
     _ops.rmsNormAsync(deltaOut, M * hV, S,
                       static_cast<const float*>(ssmNormW.usmPtr), eps, qBuf);
-    _ops.siluMulAsync(zBuf, qBuf, M * valueDim);
+    float* gatedOut = zBuf;
+    if (_config.ssmOutputGateSigmoid) {
+        _ops.sigmoidGateMulAsync(qBuf, zBuf, M, valueDim, /*gateDim=*/valueDim);
+        gatedOut = qBuf;
+    } else {
+        _ops.siluMulAsync(zBuf, qBuf, M * valueDim);
+    }
     _gmm.matmulAsync(ssmOutW.type, ssmOutW.usmPtr, d_model, valueDim,
-                     zBuf, M, projOut, mmScratch);
+                     gatedOut, M, projOut, mmScratch);
     _ops.addResidualAsync(x, projOut, M * d_model);
 
     _ops.rmsNormAsync(x, M, d_model,

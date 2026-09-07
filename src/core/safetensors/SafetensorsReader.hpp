@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <span>
 #include <string>
@@ -72,6 +73,31 @@ public:
 
     /// Lookup by exact name, or nullptr. O(log n).
     [[nodiscard]] const SafetensorsTensor* find(std::string_view name) const noexcept;
+
+    /// Rename every tensor through `fn` (identity to keep a name) and rebuild
+    /// the name index. Load-time normalisation seam: lets a checkpoint that
+    /// ships a different naming dialect (e.g. compressed-tensors
+    /// `weight_packed` / no `language_model.` prefix) present the canonical
+    /// names every downstream consumer expects. Data offsets are untouched.
+    void renameTensors(const std::function<std::string(const std::string&)>& fn);
+
+    /// Add a derived tensor that views a consecutive ROW range of an existing
+    /// row-major tensor (fused-projection splits, e.g. GDN in_proj_qkvz ->
+    /// in_proj_qkv + in_proj_z). Rows must divide evenly into the byte size.
+    /// Returns false if `src` is unknown/not sliceable. Caller MUST call
+    /// rebuildIndex() (and the owning model's reindex) after a mutation batch
+    /// — pointers into tensors() are invalidated by the append.
+    bool addDerivedRowSlice(std::string_view src, std::string newName,
+                            std::uint64_t rowBegin, std::uint64_t rowCount);
+
+    /// Duplicate an existing tensor entry under a second name (same bytes).
+    bool duplicateTensorAs(std::string_view src, std::string newName);
+
+    /// Remove a tensor entry (bytes stay in the shard image untouched).
+    bool removeTensor(std::string_view name);
+
+    /// Rebuild the name index after a mutation batch.
+    void rebuildIndex();
 
     /// `__metadata__` key/value pairs (both strings). Empty if absent.
     [[nodiscard]] const std::map<std::string, std::string>& metadata() const noexcept {

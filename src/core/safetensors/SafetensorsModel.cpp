@@ -146,6 +146,10 @@ const SafetensorsTensor* SafetensorsModel::find(std::string_view name) const noe
 
 std::span<const std::uint8_t>
 SafetensorsModel::tensorBytes(std::string_view name) const noexcept {
+    const auto ov = _byteOverrides.find(name);
+    if (ov != _byteOverrides.end()) {
+        return {ov->second.data(), ov->second.size()};
+    }
     const auto it = _tensorToShard.find(std::string(name));
     if (it == _tensorToShard.end()) {
         return {};
@@ -156,6 +160,54 @@ SafetensorsModel::tensorBytes(std::string_view name) const noexcept {
         return {};
     }
     return shard.tensorBytes(*t);
+}
+
+void SafetensorsModel::normalizeNames(
+    const std::function<std::string(const std::string&)>& fn) {
+    for (auto& shard : _shards) {
+        shard.renameTensors(fn);
+    }
+    reindex();
+}
+
+void SafetensorsModel::overrideTensorBytes(std::string_view name,
+                                           std::vector<std::uint8_t> bytes) {
+    _byteOverrides.insert_or_assign(std::string(name), std::move(bytes));
+}
+
+bool SafetensorsModel::deriveRowSlice(std::string_view src, std::string newName,
+                                      std::uint64_t rowBegin,
+                                      std::uint64_t rowCount) {
+    const auto it = _tensorToShard.find(std::string(src));
+    if (it == _tensorToShard.end()) {
+        return false;
+    }
+    return _shards[it->second].addDerivedRowSlice(src, std::move(newName),
+                                                  rowBegin, rowCount);
+}
+
+bool SafetensorsModel::duplicateTensorAs(std::string_view src,
+                                         std::string newName) {
+    const auto it = _tensorToShard.find(std::string(src));
+    if (it == _tensorToShard.end()) {
+        return false;
+    }
+    return _shards[it->second].duplicateTensorAs(src, std::move(newName));
+}
+
+bool SafetensorsModel::removeTensor(std::string_view name) {
+    const auto it = _tensorToShard.find(std::string(name));
+    if (it == _tensorToShard.end()) {
+        return false;
+    }
+    return _shards[it->second].removeTensor(name);
+}
+
+void SafetensorsModel::rebuildIndexes() {
+    for (auto& shard : _shards) {
+        shard.rebuildIndex();
+    }
+    reindex();
 }
 
 } // namespace mimirmind::core::safetensors

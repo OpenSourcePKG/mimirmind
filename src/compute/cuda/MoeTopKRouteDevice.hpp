@@ -36,10 +36,13 @@ namespace mimirmind::compute::cuda {
  */
 class MoeTopKRouteDevice {
 public:
-    // Mirror the kernel's compile-time ceilings (moe_topk.cu). Dispatch of a
-    // larger routing table must bump both sides in lockstep.
-    static constexpr std::size_t kMaxExperts = 256;
-    static constexpr std::size_t kMaxK       = 16;
+    // Ceilings. Two kernel variants are compiled: the base moe_topk.ptx
+    // (MAX_EXPERTS=256) and moe_topk_e512.ptx (=512). launch() dispatches by
+    // nExperts, so ≤256-expert models keep the exact 256 kernel (byte- and
+    // perf-identical); qwen4_exp (512) uses the e512 variant.
+    static constexpr std::size_t kBaseExperts = 256;
+    static constexpr std::size_t kMaxExperts  = 512;  // 5.27: qwen4_exp has 512
+    static constexpr std::size_t kMaxK        = 16;
 
     explicit MoeTopKRouteDevice(core::cuda::CudaComputeContext& ctx);
 
@@ -69,8 +72,10 @@ public:
 
 private:
     core::cuda::CudaComputeContext& _ctx;
-    core::cuda::CudaModule          _module;
+    core::cuda::CudaModule          _module;      // moe_topk.ptx      (<=256 experts)
     core::cuda::CudaKernel          _kernel;
+    core::cuda::CudaModule          _module512;   // moe_topk_e512.ptx (up to 512)
+    core::cuda::CudaKernel          _kernel512;
 };
 
 } // namespace mimirmind::compute::cuda

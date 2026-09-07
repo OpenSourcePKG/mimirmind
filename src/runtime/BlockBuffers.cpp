@@ -214,6 +214,11 @@ BlockBuffers allocBlockBuffers(compute::ComputeOps&    ops,
         const std::size_t kwBytes  = routeSlots * sizeof(float);
         b.moeExpIdxScratch = ops.allocate(idxBytes);
         b.moeKwScratch     = ops.allocate(kwBytes);
+
+        // 5.27 I-3: [nRowsMax] routing slots for the single-session
+        // runMoeFfnGrouped path (tc-only NVFP4_TC routed banks, qwen4_exp).
+        b.moePrefillExpIdx = ops.allocate(nRowsMax * sizeof(std::int32_t));
+        b.moePrefillKw     = ops.allocate(nRowsMax * sizeof(float));
     }
     return b;
 }

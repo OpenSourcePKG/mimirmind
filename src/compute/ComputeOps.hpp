@@ -936,6 +936,70 @@ public:
     /// `beta` gate. Reference: compute::sigmoidInPlace.
     virtual void sigmoidInPlaceAsync(float* y, std::size_t n) = 0;
 
+    // --- Qwen4-Exp Hyper-Connections (5.27 I-3) --------------------------------
+    // CUDA-only elementwise glue for the 4-stream GatedResidual. Default-throw on
+    // every other backend (qwen4_exp is a CUDA/Bragi-only arch). See
+    // kernels/cuda/llm/hyper_connection.cu; math verified by the q4e_hc parity
+    // harness.
+
+    /// Grouped RMSNorm over a [T, hc*d] token-major stream tensor: normalise each
+    /// `d`-chunk (stream) independently, then scale by the (1+w)-baked weight
+    /// `wBaked` [hc*d]. normed = groupRMS(x) * wBaked.
+    virtual void hcGroupedRmsNormAsync(const float* /*x*/, const float* /*wBaked*/,
+                                       float* /*normed*/, std::size_t /*T*/,
+                                       std::size_t /*hc*/, std::size_t /*d*/,
+                                       float /*eps*/) {
+        throw std::runtime_error("hcGroupedRmsNormAsync: not supported on this backend");
+    }
+
+    /// In-place x = silu(x * scale) over n elements.
+    virtual void hcSiluScaleAsync(float* /*x*/, std::size_t /*n*/, float /*scale*/) {
+        throw std::runtime_error("hcSiluScaleAsync: not supported on this backend");
+    }
+
+    /// Weighted stream mean: mixed[t,j] = (1/hc) * sum_g w2[t,g*d+j]*normed[t,g*d+j].
+    virtual void hcWeightedMeanStreamsAsync(const float* /*w2*/,
+                                            const float* /*normed*/, float* /*mixed*/,
+                                            std::size_t /*T*/, std::size_t /*hc*/,
+                                            std::size_t /*d*/) {
+        throw std::runtime_error("hcWeightedMeanStreamsAsync: not supported on this backend");
+    }
+
+    /// Injection scatter (HC residual add): x[t,g*d+j] += inj[t,g]*moduleOut[t,j].
+    virtual void hcInjectScatterAsync(float* /*x*/, const float* /*moduleOut*/,
+                                      const float* /*inj*/, std::size_t /*T*/,
+                                      std::size_t /*hc*/, std::size_t /*d*/) {
+        throw std::runtime_error("hcInjectScatterAsync: not supported on this backend");
+    }
+
+    /// Stream broadcast (embed repeat x hc at forward start): dst[t,g*d+j]=src[t,j].
+    virtual void hcStreamBroadcastAsync(const float* /*src*/, float* /*dst*/,
+                                        std::size_t /*T*/, std::size_t /*hc*/,
+                                        std::size_t /*d*/) {
+        throw std::runtime_error("hcStreamBroadcastAsync: not supported on this backend");
+    }
+
+    // --- Qwen4-Exp PLE device forward (5.27 I-4) ------------------------------
+    // CUDA-only; default-throw elsewhere. See kernels/cuda/llm/ple_forward.cu.
+
+    /// PLE signed-sqrt stream gate: gated[t,g*d+j] = sigmoid(sign(g)*sqrt(max(|g|,
+    /// 1e-6))) * value[t,j], g = (keyNormed·queryNormed over d)/sqrt(d) per
+    /// stream. keyNormed/queryNormed are [T, hc*d]; value [T, d]; gated [T, hc*d].
+    virtual void pleGateAsync(const float* /*keyNormed*/, const float* /*queryNormed*/,
+                              const float* /*value*/, float* /*gated*/,
+                              std::size_t /*T*/, std::size_t /*hc*/, std::size_t /*d*/) {
+        throw std::runtime_error("pleGateAsync: not supported on this backend");
+    }
+
+    /// PLE dilated depthwise causal conv1d + silu over [T, hcd] with a decode
+    /// state [stateLen, hcd] (nullptr = zero state / prefill). w is [hcd, K].
+    virtual void pleConvSiluAsync(const float* /*x*/, const float* /*state*/,
+                                  const float* /*w*/, float* /*out*/, std::size_t /*T*/,
+                                  std::size_t /*hcd*/, std::size_t /*K*/,
+                                  std::size_t /*dilation*/, std::size_t /*stateLen*/) {
+        throw std::runtime_error("pleConvSiluAsync: not supported on this backend");
+    }
+
     /// Per-head channel slice + optional GQA head repeat: turns the fused
     /// conv output into contiguous q / k / v. dst[t,hd,s] =
     /// src[t*convTotalWidth + offset + (hd % srcHeads)*S + s]. dst is

@@ -331,6 +331,10 @@ void Qwen3_5Backend::runBlock(std::size_t   blockIdx,
                                 bool          traceBlock0) {
     const bool diag = (blockIdx == 0 && cache.length() == 0 && traceBlock0);
 
+    // 5.27 I-4 seam: PLE n-gram injection (qwen4_exp, ple layer) before the
+    // attn seam. Default no-op for every other arch.
+    blockEnter(blockIdx, x, T, s);
+
     if (_config.isRecurrentLayer(blockIdx)) {
         runLinearBlock(blockIdx, x, T, cache, s, diag);
     } else {
@@ -385,6 +389,21 @@ void Qwen3_5Backend::runBlock(std::size_t   blockIdx,
             }
         }
     }
+}
+
+// 5.27 I-3 residual-stream seams. Base defaults = the historical inline calls,
+// so qwen3.6 prod and every other qwen3_5 arch are byte-identical.
+void Qwen3_5Backend::blockInputNorm(std::size_t /*blockIdx*/, const float* x,
+                                    std::size_t T, const float* normWeight,
+                                    BlockBuffers& s, float* normBuf,
+                                    bool /*isAttn*/) {
+    _ops.rmsNormAsync(x, T, s.d_model, normWeight, _config.rmsNormEps, normBuf);
+}
+
+void Qwen3_5Backend::blockResidualAdd(std::size_t /*blockIdx*/, float* x,
+                                      const float* moduleOut, std::size_t T,
+                                      BlockBuffers& s, bool /*isAttn*/) {
+    _ops.addResidualAsync(x, moduleOut, T * s.d_model);
 }
 
 void Qwen3_5Backend::runFullAttentionBlock(std::size_t   blockIdx,
@@ -472,9 +491,9 @@ void Qwen3_5Backend::runFullAttentionBlock(std::size_t   blockIdx,
     // --- pre-attention RMSNorm ---------------------------------------
     _ops.profileSection("attn");   // prefill full-attention layer (DECODE_PROFILE)
     trace("attn rmsNorm");
-    _ops.rmsNormAsync(x, T, d_model,
-                      static_cast<const float*>(attnNorm.usmPtr),
-                      _config.rmsNormEps, normBuf);
+    blockInputNorm(blockIdx, x, T,
+                   static_cast<const float*>(attnNorm.usmPtr), s, normBuf,
+                   /*isAttn=*/true);
 
     // --- Q(+gate) / K / V projections --------------------------------
     // attn_q fuses query + per-head output gate: output width is 2*q_dim
@@ -555,13 +574,13 @@ void Qwen3_5Backend::runFullAttentionBlock(std::size_t   blockIdx,
                      attnOutBuf, T, projOutBuf, matmulScratch);
 
     trace("attn residual");
-    _ops.addResidualAsync(x, projOutBuf, T * d_model);   // x = x + attn_out
+    blockResidualAdd(blockIdx, x, projOutBuf, T, s, /*isAttn=*/true);
 
     // --- post-attention norm -> MoE FFN -> FFN residual --------------
     trace("post_attention_norm");
-    _ops.rmsNormAsync(x, T, d_model,
-                      static_cast<const float*>(attnPost.usmPtr),
-                      _config.rmsNormEps, normBuf);
+    blockInputNorm(blockIdx, x, T,
+                   static_cast<const float*>(attnPost.usmPtr), s, normBuf,
+                   /*isAttn=*/false);
 
     trace("FFN");
     // Polymorphic FFN seam: the concrete subclass supplies the FFN over the
@@ -571,7 +590,7 @@ void Qwen3_5Backend::runFullAttentionBlock(std::size_t   blockIdx,
     runFfn(blockIdx, normBuf, T, s);
 
     trace("ffn residual");
-    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), T * d_model);
+    blockResidualAdd(blockIdx, x, s.moeAccumBuf.as<float>(), T, s, /*isAttn=*/false);
 }
 
 void Qwen3_5Backend::runLinearBlock(std::size_t   blockIdx,
@@ -643,8 +662,9 @@ void Qwen3_5Backend::runLinearBlock(std::size_t   blockIdx,
     // --- pre-attention RMSNorm ---------------------------------------
     _ops.profileSection("gdn.proj");   // prefill GDN sub-split (DECODE_PROFILE)
     trace("attn rmsNorm");
-    _ops.rmsNormAsync(x, T, d_model,
-                      static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
+    blockInputNorm(blockIdx, x, T,
+                   static_cast<const float*>(attnNorm.usmPtr), s, normBuf,
+                   /*isAttn=*/true);
 
     // --- projections (all read normBuf, disjoint outputs) ------------
     trace("qkv / gate / beta / alpha projections");
@@ -780,23 +800,30 @@ void Qwen3_5Backend::runLinearBlock(std::size_t   blockIdx,
                     blockIdx, T, hV, S);
     }
 
-    // --- gated output norm: ssm_norm(out) * silu(z) ------------------
-    // rmsNorm(out) over head_dim -> qBuf (reused as norm buffer), then
-    // siluMul(z, n) = silu(z) * n, in place into zBuf.
+    // --- gated output norm: ssm_norm(out) * act(z) ------------------
+    // rmsNorm(out) over head_dim -> qBuf (reused as norm buffer), then gate by
+    // act(z). act = silu (qwen3.6 etc.) or sigmoid (qwen4_exp, output_gate_type).
     _ops.profileSection("gdn.out");   // prefill GDN sub-split (ssm_norm+out+resid)
-    trace("gated ssm_norm x silu(z)");
+    trace("gated ssm_norm x act(z)");
     _ops.rmsNormAsync(deltaOut, T * hV, S,
                       static_cast<const float*>(ssmNormW.usmPtr), eps, qBuf);
-    _ops.siluMulAsync(zBuf, qBuf, T * valueDim);
+    float* gatedOut = zBuf;
+    if (_config.ssmOutputGateSigmoid) {
+        // qBuf *= sigmoid(zBuf) — result in qBuf, fed to ssm_out below.
+        _ops.sigmoidGateMulAsync(qBuf, zBuf, T, valueDim, /*gateDim=*/valueDim);
+        gatedOut = qBuf;
+    } else {
+        _ops.siluMulAsync(zBuf, qBuf, T * valueDim);   // zBuf = silu(z) * n
+    }
 
     // --- output projection ssm_out -----------------------------------
     trace("ssm_out projection");
     _gmm.matmulAsync(ssmOutW.type, ssmOutW.usmPtr, d_model, valueDim,
-                     zBuf, T, projOut, matmulScr);
+                     gatedOut, T, projOut, matmulScr);
 
     // --- attn residual + post-attn-norm -> MoE FFN -> FFN residual ---
     trace("attn residual");
-    _ops.addResidualAsync(x, projOut, T * d_model);
+    blockResidualAdd(blockIdx, x, projOut, T, s, /*isAttn=*/true);
 
     if (diag) {
         const std::size_t posPA = cache.length() + (T > 0 ? T - 1 : 0);
@@ -804,8 +831,9 @@ void Qwen3_5Backend::runLinearBlock(std::size_t   blockIdx,
     }
 
     trace("post_attention_norm");
-    _ops.rmsNormAsync(x, T, d_model,
-                      static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
+    blockInputNorm(blockIdx, x, T,
+                   static_cast<const float*>(attnPost.usmPtr), s, normBuf,
+                   /*isAttn=*/false);
 
     trace("FFN");
     // Polymorphic FFN seam: the concrete subclass supplies the FFN over the
@@ -815,7 +843,7 @@ void Qwen3_5Backend::runLinearBlock(std::size_t   blockIdx,
     runFfn(blockIdx, normBuf, T, s);
 
     trace("ffn residual");
-    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), T * d_model);
+    blockResidualAdd(blockIdx, x, s.moeAccumBuf.as<float>(), T, s, /*isAttn=*/false);
 }
 
 

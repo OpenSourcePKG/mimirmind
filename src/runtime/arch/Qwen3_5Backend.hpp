@@ -245,6 +245,43 @@ protected:
                         std::size_t   T,
                         BlockBuffers& s) = 0;
 
+    /// Residual-stream seams (5.27 I-3). Both block types touch the residual
+    /// state `x` at exactly two point-pairs: the pre-module RMSNorm (writing the
+    /// module input into `normBuf`) and the post-module residual add. Factored
+    /// into these two virtuals so Qwen4ExpBackend can replace the plain
+    /// norm+residual with Hyper-Connections (a 4-stream state + GatedResidual)
+    /// WITHOUT touching the heavy attn/GDN/MoE compute, which stays d_model-wide.
+    /// The base defaults are byte-identical to the historical inline calls, so
+    /// every other qwen3_5 arch (incl. qwen3.6 prod) is unaffected.
+    ///
+    /// `blockInputNorm`: produce the module input from `x` into `normBuf`
+    /// [T, d_model]. `normWeight` is the block's attn_norm / post_attention_norm
+    /// USM pointer; `isAttn` selects the attn (true) vs FFN (false) point.
+    virtual void blockInputNorm(std::size_t   blockIdx,
+                                const float*  x,
+                                std::size_t   T,
+                                const float*  normWeight,
+                                BlockBuffers& s,
+                                float*        normBuf,
+                                bool          isAttn);
+
+    /// `blockResidualAdd`: fold the module output `moduleOut` [T, d_model] back
+    /// into the residual state `x`. Default: x += moduleOut.
+    virtual void blockResidualAdd(std::size_t   blockIdx,
+                                  float*        x,
+                                  const float*  moduleOut,
+                                  std::size_t   T,
+                                  BlockBuffers& s,
+                                  bool          isAttn);
+
+    /// Called once at the very start of `runBlock`, before the attn seam.
+    /// Default no-op. Qwen4ExpBackend uses it to inject the PLE n-gram
+    /// features into its hyper-connection stream state at the ple layer
+    /// (5.27 I-4). `x` is the block residual input (== the 4-stream state for
+    /// qwen4_exp, kept as a backend member).
+    virtual void blockEnter(std::size_t /*blockIdx*/, float* /*x*/,
+                            std::size_t /*T*/, BlockBuffers& /*s*/) {}
+
     /// Full-attention layer forward (the "easy" 1-in-interval layers).
     /// `kvLayerIdx` selects the KvCache layer for the self-attn K/V (defaults
     /// to `blockIdx`). The MTP module reuses this block with its OWN 1-layer

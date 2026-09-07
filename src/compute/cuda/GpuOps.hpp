@@ -369,6 +369,25 @@ public:
         const float* globalsBank, void* dBank,
         void* scratch, std::size_t scratchBytes) override;
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
+    // 5.27 I-3 Hyper-Connections (qwen4_exp).
+    void hcGroupedRmsNormAsync(const float* x, const float* wBaked, float* normed,
+                               std::size_t T, std::size_t hc, std::size_t d,
+                               float eps) override;
+    void hcSiluScaleAsync(float* x, std::size_t n, float scale) override;
+    void hcWeightedMeanStreamsAsync(const float* w2, const float* normed,
+                                    float* mixed, std::size_t T, std::size_t hc,
+                                    std::size_t d) override;
+    void hcInjectScatterAsync(float* x, const float* moduleOut, const float* inj,
+                              std::size_t T, std::size_t hc, std::size_t d) override;
+    void hcStreamBroadcastAsync(const float* src, float* dst, std::size_t T,
+                                std::size_t hc, std::size_t d) override;
+    // 5.27 I-4 PLE.
+    void pleGateAsync(const float* keyNormed, const float* queryNormed,
+                      const float* value, float* gated, std::size_t T,
+                      std::size_t hc, std::size_t d) override;
+    void pleConvSiluAsync(const float* x, const float* state, const float* w,
+                          float* out, std::size_t T, std::size_t hcd, std::size_t K,
+                          std::size_t dilation, std::size_t stateLen) override;
     void gatherHeadsFromChannelsAsync(const float* src, float* dst,
                                       std::size_t T, std::size_t offset,
                                       std::size_t srcHeads, std::size_t dstHeads,
