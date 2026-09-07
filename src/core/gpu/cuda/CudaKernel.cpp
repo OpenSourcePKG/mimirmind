@@ -93,7 +93,7 @@ void CudaKernel::launch(CudaStream&   stream,
     // No allocation. `_argPtrs.data()` was primed at construction and
     // points at `_argStorage[i].data()` for each slot; the driver reads
     // the value pointed to at queue-submit time.
-    cudaDriverCheck("cuLaunchKernel",
+    cudaDriverCheck(("cuLaunchKernel[" + _name + "]").c_str(),
                     cuLaunchKernel(
                         _fn,
                         gridX, gridY, gridZ,

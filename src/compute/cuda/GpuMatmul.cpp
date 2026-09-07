@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -1500,6 +1501,15 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
         }
 
         constexpr std::size_t kGemmMaxM = 16;
+        static const bool diag = []() {
+            const char* e = std::getenv("MIMIRMIND_MATMUL_DIAG");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        if (diag) {
+            std::fprintf(stderr, "[matmul-diag] nvblk_gemm M=%zu N=%zu K=%zu W=%p\n",
+                         M, N, K, static_cast<const void*>(W));
+            std::fflush(stderr);
+        }
         auto& kern = _pimpl->_matmulNvblkGemmKernel;
         for (std::size_t m0 = 0; m0 < M; m0 += kGemmMaxM) {
             const std::size_t mChunk = std::min(kGemmMaxM, M - m0);
