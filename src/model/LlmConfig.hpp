@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,16 @@ using ::mimirmind::core::gguf::typeInfo;
  */
 struct LlmConfig {
     std::string architecture;
+
+    // Whether the model's chat template actually uses a <think> reasoning
+    // block. nullopt = unknown -> the chat encoder falls back to its
+    // <think>-token-presence heuristic (unchanged for GGUF and any model
+    // whose dir was not probed). Set false for models that ship the <think>
+    // token in vocab but never use it in their template (Qwen3-Coder-Next):
+    // injecting the empty pre-closed block into their generation prompt is
+    // out-of-distribution and yields degenerate output (bare <tool_call> +
+    // early EOS).
+    std::optional<bool> templateUsesThink{};
 
     // Required — throws if missing from metadata.
     std::uint32_t blockCount        {0};
@@ -125,6 +136,12 @@ struct LlmConfig {
     std::uint32_t ssmTimeStepRank {0};  // ssm_dt_rank — num v-heads (H_v)
     std::uint32_t ssmGroupCount   {0};  // ssm_n_group — num k-heads  (H_k)
 
+    // GatedDeltaNet output-gate activation. The reference RMSNormGated gates the
+    // normed core-attn output by `ACT2FN[config.output_gate_type or hidden_act]`
+    // (gate). qwen3.6/gemma etc. omit output_gate_type -> silu; qwen4_exp sets
+    // "sigmoid". false (=silu) keeps every existing arch bit-for-bit.
+    bool          ssmOutputGateSigmoid {false};
+
     // NextN / MTP speculative-decode head. >0 ⇒ the model appends
     // `nextnPredictLayers` dense-attention MTP block(s) past the main stack
     // (`blk.<blockCount>.nextn.*`). Not executed in the main forward pass;
@@ -138,6 +155,8 @@ struct LlmConfig {
     // default-zero/empty so every other arch is byte-unaffected. Parsed in
     // Qwen3_5MoeConfig for model_type "qwen4_exp"; consumed by Qwen4ExpBackend
     // in I-3 (Hyper-Connections) / I-4 (PLE).
+    std::uint32_t              hcCount           {0};   // hyper-connection residual streams (hc_count, e.g. 4)
+    std::uint32_t              hcLowrank         {0};   // hyper-connection input-mix bottleneck (hc_lowrank, e.g. 320)
     std::uint32_t              ngramSize         {0};   // n-gram order (e.g. 3)
     std::uint32_t              ngramVocabBase    {0};   // ngram_vocab_size_base
     std::uint32_t              headsPerNgram     {0};

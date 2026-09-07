@@ -119,7 +119,8 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
                                      bool                         addGenerationPrompt,
                                      std::span<const ToolSpec>    tools,
                                      std::optional<bool>          enableThinking,
-                                     ChatTemplate::ToolFormat     toolFormat) {
+                                     ChatTemplate::ToolFormat     toolFormat,
+                                     std::optional<bool>          templateUsesThink) {
     const std::int32_t imStart = requireToken(tok, kQwenImStart);
     const std::int32_t imEnd   = requireToken(tok, kQwenImEnd);
 
@@ -137,6 +138,11 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     // is an out-of-distribution context it was never trained on and yields
     // off-topic / early-EOS garbage. Discriminate on the <think> special
     // token, exactly as the generation-prompt branch below already does.
+    // Qwen3-family detection (drives ONLY the default-system suppression:
+    // Qwen2/2.5 inject a default system turn, Qwen3+ do not). Coder-Next is
+    // Qwen3-family — it ships <think> in vocab — so the token-presence probe
+    // is the right signal here and must stay independent of whether the
+    // template actually USES think (that is templateUsesThink, below).
     const bool isThinkingFamily = tok.findToken("<think>") >= 0;
 
     // M-FunctionCalling: the tool-spec block a model only honours in
@@ -330,8 +336,13 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
         // <think> special token so both families work without an arch
         // switch. Without this, a thinking model emits a spurious </think>
         // and stops immediately.
+        // Inject the <think> block only for models whose template actually
+        // uses it. templateUsesThink is authoritative when the checkpoint was
+        // probed; nullopt falls back to the token-presence heuristic (GGUF /
+        // unprobed models keep their prior behaviour). Coder-Next ships the
+        // token but sets this false -> plain `assistant\n`, no OOD block.
         const std::int32_t think = tok.findToken("<think>");
-        if (think >= 0) {
+        if (think >= 0 && templateUsesThink.value_or(true)) {
             ids.push_back(think);
             // Explicit enable_thinking (OpenAI chat_template_kwargs, like vLLM)
             // overrides: enable_thinking=true opts INTO reasoning; =false forces
@@ -828,11 +839,12 @@ ChatTemplate::encode(Style                        style,
                      bool                         addGenerationPrompt,
                      std::span<const ToolSpec>    tools,
                      std::optional<bool>          enableThinking,
-                     ToolFormat                   toolFormat) {
+                     ToolFormat                   toolFormat,
+                     std::optional<bool>          templateUsesThink) {
     switch (style) {
         case Style::QwenChatML:
             return encodeQwen(tok, messages, addGenerationPrompt, tools,
-                              enableThinking, toolFormat);
+                              enableThinking, toolFormat, templateUsesThink);
         case Style::Gemma3:
             // Gemma 3 tool rendering not implemented (Gemma 4 is the target).
             return encodeGemma3(tok, messages, addGenerationPrompt);

@@ -166,7 +166,8 @@ bool ChatCompletionHandler::prepareChatRequest(
             targetEngine.config().architecture);
     promptIds = model::ChatTemplate::encode(
         style, tok, msgs, /*addGenerationPrompt=*/true, cr.tools,
-        cr.enableThinking, toolFormat);
+        cr.enableThinking, toolFormat,
+        targetEngine.config().templateUsesThink);
 
     // Debug teacher-forcing: append the raw prefill suffix (no BOS, no
     // special tokens) so the engine prefills the whole sequence in one pass.
@@ -225,7 +226,8 @@ bool ChatCompletionHandler::prepareChatRequest(
                              targetEngine.maxContextTokens(),
                              targetEngine.config().contextLength,
                              tok, style, cr.tools, cr.enableThinking,
-                             toolFormat, report, trimErr)) {
+                             toolFormat, targetEngine.config().templateUsesThink,
+                             report, trimErr)) {
             sendError(res, 400, "invalid_request_error", trimErr);
             return false;
         }

@@ -120,7 +120,12 @@ public:
            std::optional<bool>            enableThinking      = std::nullopt,
            // Native tool markup (see toolFormatFromArch). Only consulted by
            // QwenChatML when `tools` is non-empty.
-           ToolFormat                     toolFormat          = ToolFormat::HermesJson);
+           ToolFormat                     toolFormat          = ToolFormat::HermesJson,
+           // Does the model's chat template actually use a <think> block?
+           // nullopt = unknown -> fall back to the <think>-token-presence
+           // heuristic. false suppresses the empty pre-closed block for
+           // non-thinking models that merely ship the token (Coder-Next).
+           std::optional<bool>            templateUsesThink   = std::nullopt);
 
     /**
      * Token ids that should terminate decoding for `style`, in addition

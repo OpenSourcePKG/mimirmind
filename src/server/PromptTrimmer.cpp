@@ -24,6 +24,7 @@ bool PromptTrimmer::applyPromptTrim(
     std::span<const model::ToolSpec> tools,
     std::optional<bool>              enableThinking,
     model::ChatTemplate::ToolFormat  toolFormat,
+    std::optional<bool>              templateUsesThink,
     TrimReport&                      report,
     std::string&                     errorMessage) {
     report.originalPromptTokens = promptIds.size();
@@ -89,7 +90,7 @@ bool PromptTrimmer::applyPromptTrim(
         promptIds = model::ChatTemplate::encode(chatStyle, tok, msgs,
                                                 /*addGenerationPrompt=*/true,
                                                 tools, enableThinking,
-                                                toolFormat);
+                                                toolFormat, templateUsesThink);
     }
 
     // 2. Prompt alone still does not fit → 400, never a silent partial
