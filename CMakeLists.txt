@@ -1472,6 +1472,7 @@ add_executable(mimirmind
     src/compute/quant/Q8_0.cpp
     src/model/ChatTemplate.cpp
     src/model/ToolCallParser.cpp
+    src/model/ToolCallConstraint.cpp
     src/model/ToolCallStreamDetector.cpp
     src/model/FusedQkvWeights.cpp
     src/model/LlmConfig.cpp
@@ -1796,6 +1797,7 @@ add_executable(arch_tests
     src/compute/Softmax.cpp
     src/model/ResponseCleaner.cpp
     src/model/ToolCallParser.cpp
+    src/model/ToolCallConstraint.cpp
     src/model/ToolCallStreamDetector.cpp
     src/runtime/thermal/GpuClockGovernor.cpp
     src/runtime/thermal/PowerMonitor.cpp

@@ -12,6 +12,7 @@
 #include "server/TenantMetrics.hpp"
 
 #include "model/ResponseCleaner.hpp"
+#include "model/ToolCallConstraint.hpp"
 #include "model/ToolCallParser.hpp"
 #include "model/ToolCallStreamDetector.hpp"
 #include "model/Tokenizer.hpp"
@@ -79,6 +80,22 @@ inline void normalizeToolCallNames(std::vector<model::ToolCall>& calls,
     }
 }
 
+/// Build the per-request tool-call grammar constraint (8.19.13.2). Gated on
+/// MIMIRMIND_TOOL_GRAMMAR=1 (default OFF while the constraint is validated), a
+/// non-empty toolset, and tool_choice != "none". Returns nullptr (no
+/// constraint) otherwise, so the sampler is untouched.
+inline std::shared_ptr<model::ToolCallConstraint> makeToolConstraint(
+        std::span<const model::ToolSpec> tools, const model::Tokenizer& tok,
+        const std::string& toolChoice) {
+    static const bool on = []() {
+        const char* e = std::getenv("MIMIRMIND_TOOL_GRAMMAR");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    if (!on || tools.empty() || toolChoice == "none") { return nullptr; }
+    auto c = std::make_shared<model::ToolCallConstraint>(tools, tok);
+    return c->active() ? c : nullptr;
+}
+
 /// Drive one request through the ContinuousBatcher, mirroring the callback
 /// contract of InferenceEngine::generate() so the existing response
 /// formatting can be reused verbatim. Submits the prompt, then delivers
@@ -92,12 +109,14 @@ std::vector<std::int32_t> runViaBatcher(
         const runtime::GenerateParams&            params,
         std::vector<std::int32_t>                 stopIds,
         std::string                               tenantId,
-        const std::function<bool(std::int32_t)>&  onToken) {
+        const std::function<bool(std::int32_t)>&  onToken,
+        std::shared_ptr<model::ToolCallConstraint> constraint = nullptr) {
     // 8.19.5: hand the request's sampling params to the batcher so the slot
     // decodes with them (temperature<=0 stays the greedy fast path).
+    // 8.19.13.2: an optional tool-call grammar constraint rides along.
     auto req = batcher.submit(std::move(promptIds), params.maxNewTokens,
                               std::move(stopIds), std::move(tenantId),
-                              params.sampling);
+                              params.sampling, std::move(constraint));
     std::vector<std::int32_t> out;
     std::size_t  next = 0;
     std::int32_t t    = 0;
@@ -649,7 +668,9 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     if (useBatcher) {
         try {
             generated = runViaBatcher(*activeBatcher, promptIds, params,
-                                      stopIds, tenant, onToken);
+                                      stopIds, tenant, onToken,
+                                      makeToolConstraint(cr.tools, tok,
+                                                         cr.toolChoice));
         } catch (const runtime::serving::ServingTenantQuotaError& e) {
             // Per-tenant fairness shed, not a bug: retryable 429.
             _metrics.recordQuotaRejected(tenant);

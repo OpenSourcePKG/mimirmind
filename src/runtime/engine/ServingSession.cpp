@@ -3,6 +3,8 @@
 
 #include "runtime/engine/ServingSession.hpp"
 
+#include "model/ToolCallConstraint.hpp"
+
 #include "compute/Embedding.hpp"
 #include "compute/Sampling.hpp"
 #include "core/gpu/AllocCategory.hpp"
@@ -114,6 +116,10 @@ struct ServingState {
     // bit-identical. MTP/verify paths remain greedy by design.
     std::vector<compute::SamplingParams> slotSampling;   // [maxBatch]
     std::vector<compute::Sampler>        slotSampler;    // [maxBatch]
+    // 8.19.13.2 — optional per-slot tool-call grammar constraint (nullptr =
+    // none). Masks NAME/KEY regions so the model can only spell an offered
+    // tool name / schema key inside a call.
+    std::vector<std::shared_ptr<model::ToolCallConstraint>> slotConstraint;
     // Per-slot recent-token history feeding the sampler's repetition/
     // frequency/presence penalties (the M7f anti-loop floor was silently
     // inert in serving without it). Seeded with the prompt tail at admission,
@@ -858,6 +864,7 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     st->slotSampling.assign(maxBatch, compute::SamplingParams{});
     st->slotSampler = std::vector<compute::Sampler>(maxBatch);
     st->slotRecent.assign(maxBatch, {});
+    st->slotConstraint.assign(maxBatch, nullptr);
     // Opt-in GPU greedy argmax scratch — allocate only when enabled so the
     // default path stays byte-for-byte unchanged. See stepServing.
     st->gpuArgmax = envFlagSet("MIMIRMIND_SERVING_GPU_ARGMAX");
@@ -1000,6 +1007,15 @@ void ServingSession::setSlotSampling(std::size_t slot,
         std::min(promptTail.size(), ServingState::kSlotRecentCap / 2);
     r.assign(promptTail.end() - static_cast<std::ptrdiff_t>(keep),
              promptTail.end());
+}
+
+void ServingSession::setSlotToolConstraint(
+        std::size_t slot, std::shared_ptr<model::ToolCallConstraint> c) {
+    if (_state == nullptr || slot >= _state->slotConstraint.size()) {
+        return;
+    }
+    if (c) { c->reset(); }
+    _state->slotConstraint[slot] = std::move(c);
 }
 
 void ServingSession::stepServing(
@@ -1150,7 +1166,11 @@ void ServingSession::stepServing(
     _e._ops->readbackToHost(st.hostLogits.data(), logits,
                             nSeq * st.vocab_lm * sizeof(float));
     for (std::size_t i = 0; i < nSeq; ++i) {
-        const float* row = st.hostLogits.data() + i * st.vocab_lm;
+        float* row = st.hostLogits.data() + i * st.vocab_lm;
+        // 8.19.13.2 — mask the tool-call NAME/KEY regions before sampling.
+        if (st.slotConstraint[i] && st.slotConstraint[i]->active()) {
+            st.slotConstraint[i]->maskLogits(row, st.vocab_lm);
+        }
         // 8.19.5: per-slot sampling. temperature<=0 with neutral penalties
         // takes the sampler's plain argmax fast path (bit-identical to the
         // old host scan); the recent-token history feeds the M7f penalties.
@@ -1159,6 +1179,9 @@ void ServingSession::stepServing(
             std::span<const std::int32_t>(st.slotRecent[i]),
             st.slotSampling[i]);
         st.pushRecent(i, outTokens[i]);
+        if (st.slotConstraint[i] && st.slotConstraint[i]->active()) {
+            st.slotConstraint[i]->advance(outTokens[i]);
+        }
     }
 }
 
@@ -1351,16 +1374,22 @@ void ServingSession::runVarlenPrefill(
         _e._ops->readbackToHost(st.hostLogits.data(), logits,
                                 N * st.vocab_lm * sizeof(float));
         for (std::size_t s = 0; s < N; ++s) {
-            const float* row = st.hostLogits.data() + s * st.vocab_lm;
+            float* row = st.hostLogits.data() + s * st.vocab_lm;
             // 8.19.5: first token honours the slot's sampling params too
             // (temperature<=0 with neutral penalties = argmax fast path,
             // bit-identical). History starts as the prompt tail (M7f).
             const std::size_t slot = firstSlot + s;
+            if (st.slotConstraint[slot] && st.slotConstraint[slot]->active()) {
+                st.slotConstraint[slot]->maskLogits(row, st.vocab_lm);   // 8.19.13.2
+            }
             outFirstTok[s] = st.slotSampler[slot].sample(
                 std::span<const float>(row, st.vocab_lm),
                 std::span<const std::int32_t>(st.slotRecent[slot]),
                 st.slotSampling[slot]);
             st.pushRecent(slot, outFirstTok[s]);
+            if (st.slotConstraint[slot] && st.slotConstraint[slot]->active()) {
+                st.slotConstraint[slot]->advance(outFirstTok[s]);
+            }
         }
     } else {
         _e._ops->flush();
@@ -1519,11 +1548,18 @@ std::int32_t ServingSession::prefillSlot(
         // 8.19.5: first token honours the slot's sampling params (argmax fast
         // path when greedy with neutral penalties — bit-identical to the old
         // scan). History starts as the prompt tail (M7f).
+        if (st.slotConstraint[slot] && st.slotConstraint[slot]->active()) {
+            st.slotConstraint[slot]->maskLogits(st.hostLogits.data(),   // 8.19.13.2
+                                                st.vocab_lm);
+        }
         firstTok = st.slotSampler[slot].sample(
             std::span<const float>(st.hostLogits.data(), st.vocab_lm),
             std::span<const std::int32_t>(st.slotRecent[slot]),
             st.slotSampling[slot]);
         st.pushRecent(slot, firstTok);
+        if (st.slotConstraint[slot] && st.slotConstraint[slot]->active()) {
+            st.slotConstraint[slot]->advance(firstTok);
+        }
     } else {
         // Intermediate chunk: no lm-head. Flush so this chunk's KV/state
         // writes are fully committed before the next (carry) chunk reads

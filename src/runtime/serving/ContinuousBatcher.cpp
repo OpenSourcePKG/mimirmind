@@ -123,7 +123,8 @@ bool ContinuousBatcher::isStop(std::int32_t tok, const Slot& s) const {
 std::shared_ptr<ServingRequest> ContinuousBatcher::submit(
         std::vector<std::int32_t> prompt, std::size_t maxNew,
         std::vector<std::int32_t> stopIds, std::string tenantId,
-        compute::SamplingParams sampling) {
+        compute::SamplingParams sampling,
+        std::shared_ptr<model::ToolCallConstraint> constraint) {
     auto req = std::make_shared<ServingRequest>();
     req->tenantId = std::move(tenantId);
     if (prompt.empty()) {
@@ -186,11 +187,12 @@ std::shared_ptr<ServingRequest> ContinuousBatcher::submit(
             }
         }
         Pending p;
-        p.req      = req;
-        p.prompt   = std::move(prompt);
-        p.maxNew   = maxNew;
-        p.stopIds  = std::move(stopIds);
-        p.sampling = sampling;
+        p.req        = req;
+        p.prompt     = std::move(prompt);
+        p.maxNew     = maxNew;
+        p.stopIds    = std::move(stopIds);
+        p.sampling   = sampling;
+        p.constraint = std::move(constraint);
         _waiting.push_back(std::move(p));
     }
     _cv.notify_all();
@@ -690,6 +692,7 @@ void ContinuousBatcher::workerLoop() {
                 _engine.setServingSlotSampling(
                     i, p.sampling,
                     std::span<const std::int32_t>(s.prompt));
+                _engine.setServingSlotToolConstraint(i, p.constraint);  // 8.19.13.2
                 // Chunked prefill: the whole prompt ingests as one or more
                 // T>1 forwards (prefillSlotAdmitted splits it into
                 // _prefillChunk-sized chunks, each carrying KV + recurrent

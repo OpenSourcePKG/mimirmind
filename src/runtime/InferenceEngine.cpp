@@ -2699,6 +2699,14 @@ void InferenceEngine::setServingSlotSampling(
     }
 }
 
+void InferenceEngine::setServingSlotToolConstraint(
+        std::size_t slot, std::shared_ptr<model::ToolCallConstraint> c) {
+    // 8.19.13.2: per-slot tool-call grammar constraint (nullptr = none).
+    if (_servingSession != nullptr) {
+        _servingSession->setSlotToolConstraint(slot, std::move(c));
+    }
+}
+
 std::int32_t InferenceEngine::prefillSlot(std::size_t slot,
                                           std::span<const std::int32_t> tokens,
                                           std::size_t startPos,

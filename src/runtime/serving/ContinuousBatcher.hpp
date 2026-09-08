@@ -21,6 +21,7 @@
 namespace mimirmind::runtime {
 class InferenceEngine;
 }
+namespace mimirmind::model { class ToolCallConstraint; }  // 8.19.13.2
 
 namespace mimirmind::runtime::serving {
 
@@ -135,11 +136,13 @@ public:
     /// `sampling` (8.19.5) carries the request's temperature/top_p/top_k/seed
     /// into the slot at admission; the default is greedy argmax, matching the
     /// pre-sampling behaviour.
-    std::shared_ptr<ServingRequest> submit(std::vector<std::int32_t> prompt,
-                                           std::size_t               maxNew,
-                                           std::vector<std::int32_t> stopIds,
-                                           std::string               tenantId = {},
-                                           compute::SamplingParams   sampling = {});
+    std::shared_ptr<ServingRequest> submit(
+        std::vector<std::int32_t> prompt,
+        std::size_t               maxNew,
+        std::vector<std::int32_t> stopIds,
+        std::string               tenantId   = {},
+        compute::SamplingParams   sampling   = {},
+        std::shared_ptr<model::ToolCallConstraint> constraint = nullptr);
 
     /// Request early termination (e.g. the streaming client disconnected).
     /// The worker retires the request at the next iteration and frees its
@@ -178,6 +181,7 @@ private:
         std::size_t                     maxNew{0};
         std::vector<std::int32_t>       stopIds;
         compute::SamplingParams         sampling{};  // 8.19.5, set at submit()
+        std::shared_ptr<model::ToolCallConstraint> constraint;  // 8.19.13.2
     };
 
     struct Slot {

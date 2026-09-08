@@ -13,6 +13,7 @@
 #include <vector>
 
 namespace mimirmind::runtime { class KvCache; }   // nextn (MTP) KV cache
+namespace mimirmind::model { class ToolCallConstraint; }  // 8.19.13.2
 
 namespace mimirmind::runtime::engine {
 
@@ -65,6 +66,13 @@ public:
     /// repetition/frequency/presence penalties see prompt tail + generated.
     void setSlotSampling(std::size_t slot, const compute::SamplingParams& sp,
                          std::span<const std::int32_t> promptTail = {});
+
+    /// 8.19.13.2 — bind a per-slot grammar constraint (or nullptr to clear).
+    /// When set and active, the per-slot sampler masks each step's logits so
+    /// the model can only spell an offered tool name / schema key inside a
+    /// tool-call. Reset at bind time (start of the slot's response).
+    void setSlotToolConstraint(std::size_t slot,
+                               std::shared_ptr<model::ToolCallConstraint> c);
 
     /// See InferenceEngine::prefillSlot.
     [[nodiscard]] std::int32_t

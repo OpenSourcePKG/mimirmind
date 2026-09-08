@@ -46,6 +46,8 @@ namespace mimirmind::core::config {
 struct Config;
 }
 
+namespace mimirmind::model { class ToolCallConstraint; }  // 8.19.13.2
+
 namespace mimirmind::runtime {
 class FanController;
 class GpuClockGovernor;
@@ -518,6 +520,11 @@ public:
     void setServingSlotSampling(std::size_t slot,
                                 const compute::SamplingParams& sampling,
                                 std::span<const std::int32_t> promptTail = {});
+
+    /// 8.19.13.2 — bind a per-slot tool-call grammar constraint (nullptr =
+    /// none). Delegates to the ServingSession; no-op without one.
+    void setServingSlotToolConstraint(
+        std::size_t slot, std::shared_ptr<model::ToolCallConstraint> c);
 
     /// M-Cuda.Batch Perf (Increment A) — prefill one physical serving `slot`'s
     /// prompt chunk `tokens` at absolute positions `[startPos, startPos+T)` as
