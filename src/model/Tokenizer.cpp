@@ -611,29 +611,70 @@ std::vector<std::int32_t> Tokenizer::encodeGpt2(std::string_view text, bool addB
         word.push_back(bm.byteToUtf8[static_cast<unsigned char>(c)]);
     }
 
-    // Greedy best-rank-pair BPE. Iteratively pick the adjacent pair with
-    // the lowest rank in `_mergesRank` and merge it; stop when no
-    // adjacent pair maps to a merge.
-    while (word.size() > 1) {
-        std::int32_t bestRank = INT32_MAX;
-        std::size_t  bestIdx  = SIZE_MAX;
-        for (std::size_t i = 0; i + 1 < word.size(); ++i) {
+    // Greedy lowest-rank-pair BPE: repeatedly merge the adjacent pair with the
+    // globally lowest merge rank (leftmost on ties) until none remains. Driven
+    // by a min-heap over a doubly-linked list of pieces instead of the naive
+    // scan-and-erase — O(n log n) vs the old O(n^2). The old form (full rescan
+    // per merge + an O(n) vector erase) made tokenising a ~24k-token prompt take
+    // ~190s of pure CPU, blocking real agentic requests. The merge ORDER is
+    // preserved exactly (list-index order is reading order, so min (rank,index)
+    // == globally-lowest-rank, leftmost), so the token output is bit-identical.
+    const std::size_t nPieces = word.size();
+    if (nPieces > 1) {
+        std::vector<int>  prevN(nPieces), nextN(nPieces);
+        std::vector<char> alive(nPieces, 1);
+        for (std::size_t i = 0; i < nPieces; ++i) {
+            prevN[i] = static_cast<int>(i) - 1;
+            nextN[i] = (i + 1 < nPieces) ? static_cast<int>(i + 1) : -1;
+        }
+        // Merge rank of the pair (node i, nextN[i]); INT32_MAX = not a merge.
+        const auto pairRank = [&](int i) -> std::int32_t {
+            if (i < 0 || nextN[i] < 0) { return INT32_MAX; }
             std::string key;
-            key.reserve(word[i].size() + 1 + word[i + 1].size());
+            key.reserve(word[i].size() + 1 + word[nextN[i]].size());
             key.append(word[i]);
             key.push_back(' ');
-            key.append(word[i + 1]);
-            auto it = _mergesRank.find(key);
-            if (it != _mergesRank.end() && it->second < bestRank) {
-                bestRank = it->second;
-                bestIdx  = i;
+            key.append(word[nextN[i]]);
+            const auto it = _mergesRank.find(key);
+            return (it != _mergesRank.end()) ? it->second : INT32_MAX;
+        };
+        using Item = std::pair<std::int32_t, int>;   // (rank, left node index)
+        std::priority_queue<Item, std::vector<Item>, std::greater<Item>> heap;
+        for (std::size_t i = 0; i < nPieces; ++i) {
+            const std::int32_t r = pairRank(static_cast<int>(i));
+            if (r != INT32_MAX) { heap.emplace(r, static_cast<int>(i)); }
+        }
+        while (!heap.empty()) {
+            const Item top = heap.top();
+            heap.pop();
+            const std::int32_t r = top.first;
+            const int          i = top.second;
+            // Stale entry: node merged away, lost its right neighbour, or its
+            // pair rank changed since this entry was pushed (a fresh entry with
+            // the new rank was pushed at that point).
+            if (!alive[i] || nextN[i] < 0 || pairRank(i) != r) { continue; }
+            const int j = nextN[i];
+            word[i] += word[j];
+            alive[j] = 0;
+            const int k = nextN[j];
+            nextN[i] = k;
+            if (k >= 0) { prevN[k] = i; }
+            const int p = prevN[i];
+            if (p >= 0) {
+                const std::int32_t rp = pairRank(p);
+                if (rp != INT32_MAX) { heap.emplace(rp, p); }
             }
+            const std::int32_t ri = pairRank(i);
+            if (ri != INT32_MAX) { heap.emplace(ri, i); }
         }
-        if (bestIdx == SIZE_MAX) {
-            break;
+        // Node 0 never dies (a node dies only as some other node's right
+        // neighbour, and node 0 is nobody's next), so it is the list head.
+        std::vector<std::string> merged;
+        merged.reserve(nPieces);
+        for (int c = 0; c >= 0; c = nextN[c]) {
+            merged.push_back(std::move(word[c]));
         }
-        word[bestIdx] = word[bestIdx] + word[bestIdx + 1];
-        word.erase(word.begin() + static_cast<std::ptrdiff_t>(bestIdx) + 1);
+        word.swap(merged);
     }
 
     std::vector<std::int32_t> out;
