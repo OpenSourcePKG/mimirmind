@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
+#include "mimirmind/AttnBenchMode.hpp"
 #include "mimirmind/CliArgs.hpp"
 #include "mimirmind/CliParser.hpp"
 #include "mimirmind/ParityMode.hpp"
@@ -80,6 +81,8 @@ int main(int argc, char** argv) {
             case Mode::Parity: return mimirmind::cli::runParity(args, cfg);
             case Mode::QualityGate:
                 return mimirmind::cli::runQualityGate(args, cfg);
+            case Mode::AttnBench:
+                return mimirmind::cli::runAttnBench(args, cfg);
         }
         return 0;
 #ifdef MIMIRMIND_HAVE_L0

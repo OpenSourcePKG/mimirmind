@@ -68,6 +68,8 @@ bool parseArgs(int argc, char** argv, CliArgs& out) {
             out.mode = Mode::Parity;
         } else if (m == "quality-gate") {
             out.mode = Mode::QualityGate;
+        } else if (m == "attnbench") {
+            out.mode = Mode::AttnBench;
         } else if (m == "-h" || m == "--help") {
             std::cout << kUsage;
             std::exit(0);

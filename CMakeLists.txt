@@ -1437,6 +1437,7 @@ endif()
 
 add_executable(mimirmind
     src/mimirmind/main.cpp
+    src/mimirmind/AttnBenchMode.cpp
     src/mimirmind/CliParser.cpp
     src/mimirmind/ParityMode.cpp
     src/mimirmind/QualityGateMode.cpp
