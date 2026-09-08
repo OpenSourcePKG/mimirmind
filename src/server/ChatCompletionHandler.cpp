@@ -96,6 +96,53 @@ inline std::shared_ptr<model::ToolCallConstraint> makeToolConstraint(
     return c->active() ? c : nullptr;
 }
 
+/// True when MIMIRMIND_TOOL_GRAMMAR=1 (the 8.19.13.2 token-mask gate).
+inline bool toolGrammarEnabled() {
+    static const bool on = []() {
+        const char* e = std::getenv("MIMIRMIND_TOOL_GRAMMAR");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return on;
+}
+
+/// True if any parsed call names a non-offered tool OR omits a required schema
+/// parameter — i.e. the call is structurally incomplete and the client would
+/// reject it (`required parameter … missing`). Drives the grammar-forced
+/// re-decode (8.19.13.2): a model that drifts to a non-`<function=` tool-call
+/// dialect (seen under agent system prompts) slips past the trigger-dispatched
+/// mask and closes with empty args, which this catches.
+inline bool callsMissingRequired(
+        const std::vector<model::ToolCall>& calls,
+        std::span<const model::ToolSpec>    tools) {
+    for (const auto& c : calls) {
+        const model::ToolSpec* spec = nullptr;
+        for (const auto& t : tools) {
+            if (t.name == c.name) { spec = &t; break; }
+        }
+        if (spec == nullptr) { return true; }   // called a tool not offered
+        const nlohmann::json tj =
+            nlohmann::json::parse(spec->toolJson, nullptr, false);
+        if (tj.is_discarded() || !tj.contains("function")
+            || !tj["function"].is_object()
+            || !tj["function"].contains("parameters")
+            || !tj["function"]["parameters"].is_object()) {
+            continue;
+        }
+        const nlohmann::json& params = tj["function"]["parameters"];
+        if (!params.contains("required") || !params["required"].is_array()) {
+            continue;
+        }
+        const nlohmann::json args =
+            nlohmann::json::parse(c.argumentsJson, nullptr, false);
+        for (const auto& r : params["required"]) {
+            if (!r.is_string()) { continue; }
+            const std::string key = r.get<std::string>();
+            if (!args.is_object() || !args.contains(key)) { return true; }
+        }
+    }
+    return false;
+}
+
 /// Drive one request through the ContinuousBatcher, mirroring the callback
 /// contract of InferenceEngine::generate() so the existing response
 /// formatting can be reused verbatim. Submits the prompt, then delivers
@@ -903,7 +950,16 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     // client. If even that yields no call, the salad is suppressed rather
     // than leaked. Interim until grammar-constrained decoding (8.19.11).
     // Rollback: MIMIRMIND_TOOL_SALVAGE=0.
-    if (!cr.tools.empty() && cr.toolChoice != "none" && toolCalls.empty() &&
+    // 8.19.13.2 — a call parsed but MISSING a required param is also a salvage
+    // trigger: under an agent system prompt the model drifts to a non-`<function=`
+    // dialect (`<read> <file_path>…</path>`) that slips past the trigger-
+    // dispatched mask and closes with empty args. Force a canonical re-decode.
+    const bool grammarOn  = toolGrammarEnabled();
+    const bool missingReq = grammarOn && !toolCalls.empty()
+                          && callsMissingRequired(toolCalls, cr.tools);
+    const std::vector<model::ToolCall> origToolCalls = toolCalls;
+    if (!cr.tools.empty() && cr.toolChoice != "none"
+        && (toolCalls.empty() || missingReq) &&
         model::ChatTemplate::detectFromArch(engine.config().architecture) ==
             model::ChatTemplate::Style::QwenChatML) {
         const std::size_t nw  = text.find_first_not_of(" \t\n\r");
@@ -935,7 +991,8 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                 }
             }
         }
-        if ((saladLike || fenceOrCall) && (off == nullptr || off[0] != '0')) {
+        if ((missingReq || saladLike || fenceOrCall)
+            && (off == nullptr || off[0] != '0')) {
             constexpr std::string_view kSalvageOpener =
                 "<tool_call>\n<function=";
             const auto openerIds =
@@ -946,12 +1003,24 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             runtime::GenerateParams sp = params;
             sp.sampling.temperature = 0.0F;
             sp.maxNewTokens = std::min<std::size_t>(sp.maxNewTokens, 1024);
+            // 8.19.13.2 — the opener `<function=` is now in the PREFILL (never
+            // reaches the matcher, which only sees generated tokens), so drive
+            // the re-decode with a BODY-ROOTED grammar: the NAME is forced from
+            // the first generated token and every required param must appear
+            // before the call can close — regardless of the drifted dialect.
+            std::shared_ptr<model::ToolCallConstraint> forceC;
+            if (grammarOn) {
+                auto c = std::make_shared<model::ToolCallConstraint>(
+                    cr.tools, tok, /*assumeOpenerConsumed=*/true);
+                if (c->active()) { forceC = c; }
+            }
             std::vector<std::int32_t> redecoded;
             runtime::GenerateStats    salvStats;
             try {
                 if (useBatcher) {
                     redecoded = runViaBatcher(*activeBatcher, salvagePrompt,
-                                              sp, stopIds, tenant, onToken);
+                                              sp, stopIds, tenant, onToken,
+                                              forceC);
                 } else {
                     std::lock_guard<std::mutex> lk{*target->mutex};
                     redecoded = engine.generate(salvagePrompt, sp, onToken,
@@ -971,10 +1040,18 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             }
             if (!toolCalls.empty()) {
                 MM_LOG_WARN("server",
-                            "tool-salvage: unparseable tool-intent ({} bytes) "
-                            "re-decoded into {} call(s)",
-                            text.size(), toolCalls.size());
+                            "tool-salvage: {} re-decoded into {} call(s)",
+                            missingReq ? "required-arg-missing call"
+                                       : "unparseable tool-intent",
+                            toolCalls.size());
                 text.clear();   // the leaked intent is superseded by the call
+            } else if (missingReq) {
+                // Forced re-decode produced no call — do not drop below the
+                // original: keep the incomplete call we already had.
+                toolCalls = origToolCalls;
+                MM_LOG_WARN("server",
+                            "tool-salvage: forced re-decode yielded no call for "
+                            "a required-arg-missing call — keeping original");
             } else if (saladLike) {
                 MM_LOG_WARN("server",
                             "tool-salvage: unparseable markup salad ({} bytes) "
@@ -1824,9 +1901,18 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                         }
                     }
                 }
-                if (calls.empty() && (off == nullptr || off[0] != '0') &&
+                // 8.19.13.2 — a parsed-but-required-arg-missing call is also a
+                // salvage trigger (a dialect drift past the trigger-mask closed
+                // it empty); force a canonical, grammar-constrained re-decode.
+                const bool streamGrammarOn  = toolGrammarEnabled();
+                const bool streamMissingReq = streamGrammarOn && !calls.empty()
+                    && callsMissingRequired(calls, state->toolSpecs);
+                const std::vector<model::ToolCall> streamOrigCalls = calls;
+                if ((calls.empty() || streamMissingReq) &&
+                    (off == nullptr || off[0] != '0') &&
                     state->style == model::ChatTemplate::Style::QwenChatML &&
-                    (model::ToolCallParser::looksLikeToolMarkupSalad(full)
+                    (streamMissingReq
+                     || model::ToolCallParser::looksLikeToolMarkupSalad(full)
                      || streamFenceOrCall)) {
                     // One-shot forced re-decode — the blocking path's twin.
                     constexpr std::string_view kSalvageOpener =
@@ -1841,12 +1927,24 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                     sp.maxNewTokens =
                         std::min<std::size_t>(sp.maxNewTokens, 1024);
                     auto noopToken = [](std::int32_t) { return true; };
+                    // Body-rooted grammar for the forced re-decode (blocking
+                    // twin): the prefilled `<function=` never reaches the
+                    // matcher, so root at the call body to force NAME + required
+                    // params from the first generated token.
+                    std::shared_ptr<model::ToolCallConstraint> forceC;
+                    if (streamGrammarOn) {
+                        auto c = std::make_shared<model::ToolCallConstraint>(
+                            state->toolSpecs, tok,
+                            /*assumeOpenerConsumed=*/true);
+                        if (c->active()) { forceC = c; }
+                    }
                     std::vector<std::int32_t> redecoded;
                     try {
                         if (useBatcher) {
                             redecoded = runViaBatcher(
                                 *activeBatcher, salvagePrompt, sp,
-                                state->stopIds, state->tenantId, noopToken);
+                                state->stopIds, state->tenantId, noopToken,
+                                forceC);
                         } else {
                             std::lock_guard<std::mutex> lk{*targetMutex};
                             runtime::GenerateStats salvStats;
@@ -1872,7 +1970,14 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                         calls = model::ToolCallParser::parseQwenXml(
                             salvText, state->toolSpecs);
                     }
-                    if (calls.empty()) {
+                    if (calls.empty() && streamMissingReq) {
+                        // Do not drop below the original incomplete call.
+                        calls = streamOrigCalls;
+                        MM_LOG_WARN("server",
+                                    "stream {}: tool-salvage: forced re-decode "
+                                    "yielded no call for a required-arg-missing "
+                                    "call — keeping original", state->respId);
+                    } else if (calls.empty()) {
                         MM_LOG_WARN("server",
                                     "stream {}: tool-salvage: {} byte markup "
                                     "salad suppressed — re-decode yielded no "

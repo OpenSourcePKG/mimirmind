@@ -128,7 +128,8 @@ struct ToolCallConstraint::Impl {
 };
 
 ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
-                                       const Tokenizer& tok)
+                                       const Tokenizer& tok,
+                                       bool assumeOpenerConsumed)
     : _impl(std::make_unique<Impl>()) {
     if (tools.empty()) { _impl.reset(); return; }
     _impl->tctx  = tokContext(tok);
@@ -197,8 +198,18 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
         ebnf += pr + " ::= " + paramsBody + "\n";
     }
     ebnf += "call_body ::= " + bodyAlts + "\n";
-    ebnf += "root ::= TagDispatch((\"<function=\", call_body), "
-            "loop_after_dispatch=true)\n";
+    if (assumeOpenerConsumed) {
+        // Forced-opener re-decode: `<tool_call>\n<function=` was prefilled into
+        // the prompt (so it never reaches this matcher, which only sees GENERATED
+        // tokens). Root at the body directly -> the NAME is forced from the very
+        // first generated token, whatever dialect the free decode had drifted to.
+        ebnf += "root ::= call_body\n";
+    } else {
+        // Auto mode: free prose until a call opens ITSELF with the `<function=`
+        // trigger (token-robust AC automaton); prose outside a call stays free.
+        ebnf += "root ::= TagDispatch((\"<function=\", call_body), "
+                "loop_after_dispatch=true)\n";
+    }
 
     try {
         auto& tc = *_impl->tctx;

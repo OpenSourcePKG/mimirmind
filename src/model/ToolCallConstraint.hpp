@@ -39,7 +39,16 @@ class Tokenizer;
 class ToolCallConstraint {
 public:
     ToolCallConstraint() = default;
-    ToolCallConstraint(std::span<const ToolSpec> tools, const Tokenizer& tok);
+    /// @param assumeOpenerConsumed  when true the grammar is rooted directly at
+    /// the call body (NOT the `<function=` TagDispatch trigger) — for the
+    /// forced-opener re-decode where `<tool_call>\n<function=` was prefilled
+    /// into the prompt, so the mask must constrain the NAME/params from the very
+    /// first generated token instead of waiting for a trigger that already went
+    /// by in the prefill. Default false = trigger-dispatched (free prose until a
+    /// call opens itself).
+    explicit ToolCallConstraint(std::span<const ToolSpec> tools,
+                                const Tokenizer& tok,
+                                bool assumeOpenerConsumed = false);
     ~ToolCallConstraint();
     ToolCallConstraint(ToolCallConstraint&&) noexcept;
     ToolCallConstraint& operator=(ToolCallConstraint&&) noexcept;
