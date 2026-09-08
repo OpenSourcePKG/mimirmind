@@ -1,0 +1,197 @@
+/*!
+ *  Copyright (c) 2024 by Contributors
+ * \file xgrammar/grammar.cc
+ */
+
+#include <xgrammar/grammar.h>
+
+#include <string>
+
+#include "grammar_functor.h"
+#include "grammar_parser.h"
+#include "grammar_printer.h"
+#include "json_schema_converter.h"
+#include "lark_converter.h"
+#include "regex_converter.h"
+#include "structural_tag.h"
+#include "support/json_serializer.h"
+#include "support/logging.h"
+#include "xgrammar/exception.h"
+
+namespace xgrammar {
+
+/******************* Grammar::Impl *******************/
+
+std::size_t MemorySize(const Grammar::Impl& impl) {
+  /// TODO: Now, we evaluate the memory size of each rule as sizeof(Rule), which counts its
+  /// string members as sizeof(std::string), with an assumption that the strings are small.
+  /// This should be improved in the future.
+  return impl.rules_.size() * sizeof(Grammar::Impl::Rule) +
+         impl.suffix_stop_infos_.size() * sizeof(Grammar::Impl::SuffixStopInfo) +
+         MemorySize(impl.grammar_expr_data_) + MemorySize(impl.grammar_expr_indptr_) +
+         MemorySize(impl.complete_fsm) + MemorySize(impl.per_rule_fsms) +
+         MemorySize(impl.allow_empty_rule_ids);
+}
+
+/******************* Grammar *******************/
+
+std::string Grammar::ToString() const { return GrammarPrinter(*this).ToString(); }
+
+Grammar Grammar::FromEBNF(const std::string& ebnf_string, const std::string& root_rule_name) {
+  auto grammar = ParseEBNF(ebnf_string, root_rule_name);
+  grammar = GrammarNormalizer().Apply(grammar);
+  return grammar;
+}
+
+Grammar Grammar::FromJSONSchema(
+    const std::string& schema,
+    bool any_whitespace,
+    std::optional<int> indent,
+    std::optional<std::pair<std::string, std::string>> separators,
+    bool strict_mode,
+    std::optional<int> max_whitespace_cnt,
+    bool print_converted_ebnf,
+    bool any_order
+) {
+  auto grammar = GrammarNormalizer::Apply(JSONSchemaToGrammar(
+      schema, any_whitespace, indent, separators, strict_mode, max_whitespace_cnt, any_order
+  ));
+  if (print_converted_ebnf) {
+    XGRAMMAR_LOG(INFO) << "Converted EBNF: " << grammar.ToString() << std::endl;
+  }
+  return grammar;
+}
+
+Grammar Grammar::FromRegex(const std::string& regex, bool print_converted_ebnf) {
+  auto ebnf_string = RegexToEBNF(regex);
+  if (print_converted_ebnf) {
+    XGRAMMAR_LOG(INFO) << "Converted EBNF: " << ebnf_string << std::endl;
+  }
+  return FromEBNF(ebnf_string);
+}
+
+Grammar Grammar::FromLark(
+    const std::string& lark_string,
+    const std::optional<TokenizerInfo>& tokenizer_info,
+    const std::vector<NamedGrammar>& named_grammars
+) {
+  return LarkToGrammar(lark_string, tokenizer_info, named_grammars);
+}
+
+std::variant<Grammar, StructuralTagError> Grammar::FromStructuralTag(
+    const std::string& structural_tag_json, const std::optional<TokenizerInfo>& tokenizer_info
+) {
+  return StructuralTagToGrammar(structural_tag_json, tokenizer_info).ToVariant();
+}
+
+// Optimized json grammar for the speed of the grammar matcher
+const std::string kJSONGrammarString = R"(
+root ::= (
+    "{" [ \n\r\t]* members_and_embrace |
+    "[" [ \n\r\t]* elements_or_embrace
+)
+value_non_str ::= (
+    "{" [ \n\r\t]* members_and_embrace |
+    "[" [ \n\r\t]* elements_or_embrace |
+    "0" fraction exponent |
+    [1-9] [0-9]* fraction exponent |
+    "-" [0-9] fraction exponent |
+    "-" [1-9] [0-9]* fraction exponent |
+    "true" |
+    "false" |
+    "null"
+) (= [ \n\r\t]* member_suffix_suffix)
+members_and_embrace ::= ("\"" characters_and_colon [ \n\r\t]* members_suffix | "}") (= [ \n\r\t,}\]])
+members_suffix ::= (
+    value_non_str [ \n\r\t]* member_suffix_suffix |
+    "\"" characters_and_embrace |
+    "\"" characters_and_comma [ \n\r\t]* "\"" characters_and_colon [ \n\r\t]* members_suffix
+) (= [ \n\r\t,}\]])
+member_suffix_suffix ::= (
+    "}" |
+    "," [ \n\r\t]* "\"" characters_and_colon [ \n\r\t]* members_suffix
+) (= [ \n\r\t,}\]])
+elements_or_embrace ::= (
+    "{" [ \n\r\t]* members_and_embrace elements_rest [ \n\r\t]* "]" |
+    "[" [ \n\r\t]* elements_or_embrace elements_rest [ \n\r\t]* "]" |
+    "\"" characters_item elements_rest [ \n\r\t]* "]" |
+    "0" fraction exponent elements_rest [ \n\r\t]* "]" |
+    [1-9] [0-9]* fraction exponent elements_rest [ \n\r\t]* "]" |
+    "-" "0" fraction exponent elements_rest [ \n\r\t]* "]" |
+    "-" [1-9] [0-9]* fraction exponent elements_rest [ \n\r\t]* "]" |
+    "true" elements_rest [ \n\r\t]* "]" |
+    "false" elements_rest [ \n\r\t]* "]" |
+    "null" elements_rest [ \n\r\t]* "]" |
+    "]"
+)
+elements ::= (
+    "{" [ \n\r\t]* members_and_embrace elements_rest |
+    "[" [ \n\r\t]* elements_or_embrace elements_rest |
+    "\"" characters_item elements_rest |
+    "0" fraction exponent elements_rest |
+    [1-9] [0-9]* fraction exponent elements_rest |
+    "-" [0-9] fraction exponent elements_rest |
+    "-" [1-9] [0-9]* fraction exponent elements_rest |
+    "true" elements_rest |
+    "false" elements_rest |
+    "null" elements_rest
+)
+elements_rest ::= (
+    "" |
+    [ \n\r\t]* "," [ \n\r\t]* elements
+)
+characters_and_colon ::= (
+    "\"" [ \n\r\t]* ":" |
+    [^"\\\x00-\x1F] characters_and_colon |
+    "\\" escape characters_and_colon
+) (=[ \n\r\t]* [\"{[0-9tfn-])
+characters_and_comma ::= (
+    "\"" [ \n\r\t]* "," |
+    [^"\\\x00-\x1F] characters_and_comma |
+    "\\" escape characters_and_comma
+) (=[ \n\r\t]* "\"")
+characters_and_embrace ::= (
+    "\"" [ \n\r\t]* "}" |
+    [^"\\\x00-\x1F] characters_and_embrace |
+    "\\" escape characters_and_embrace
+) (=[ \n\r\t]* [},])
+characters_item ::= (
+    "\"" |
+    [^"\\\x00-\x1F] characters_item |
+    "\\" escape characters_item
+) (= [ \n\r\t]* [,\]])
+escape ::= ["\\/bfnrt] | "u" [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9]
+fraction ::= "" | "." [0-9] [0-9]*
+exponent ::= "" |  "e" sign [0-9] [0-9]* | "E" sign [0-9] [0-9]*
+sign ::= "" | "+" | "-"
+)";
+
+Grammar Grammar::BuiltinJSONGrammar() {
+  static const Grammar grammar = FromEBNF(kJSONGrammarString);
+  return grammar;
+}
+
+Grammar Grammar::Union(const std::vector<Grammar>& grammars) {
+  return GrammarUnionFunctor::Apply(grammars);
+}
+
+Grammar Grammar::Concat(const std::vector<Grammar>& grammars) {
+  return GrammarConcatFunctor::Apply(grammars);
+}
+
+std::ostream& operator<<(std::ostream& os, const Grammar& grammar) {
+  os << grammar.ToString();
+  return os;
+}
+
+std::string Grammar::SerializeJSON() const { return AutoSerializeJSON(*this, true); }
+
+std::variant<Grammar, SerializationError> Grammar::DeserializeJSON(const std::string& json_string) {
+  Grammar result{NullObj()};
+  if (auto err = AutoDeserializeJSON(&result, json_string, true, "Grammar")) {
+    return err.value();
+  }
+  return result;
+}
+
+}  // namespace xgrammar

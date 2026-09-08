@@ -1579,6 +1579,13 @@ target_include_directories(mimirmind SYSTEM PRIVATE
 # PUBLIC OpenSSL link, but the exec also compiles ApiServer.cpp against
 # httplib, which needs the macro defined at that TU.
 target_compile_definitions(mimirmind PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+# 8.19.13.2 — vendored xgrammar (MIT, NOT llama.cpp/ggml) for grammar-constrained
+# tool decoding. Header-only picojson/dlpack, cpptrace/python/tests all off.
+if(NOT TARGET xgrammar)
+    add_subdirectory(third_party/xgrammar)
+endif()
+target_link_libraries(mimirmind PRIVATE xgrammar)
+
 target_link_libraries(mimirmind PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
 # Always link the common lib; add backend-specific libs when they exist.
@@ -1809,6 +1816,10 @@ add_executable(arch_tests
 target_include_directories(arch_tests PRIVATE tests)
 
 target_link_libraries(arch_tests PRIVATE mimirmind_core_common)
+if(NOT TARGET xgrammar)
+    add_subdirectory(third_party/xgrammar)
+endif()
+target_link_libraries(arch_tests PRIVATE xgrammar)
 
 # ---- ipc_tests — pure-CPU tests for src/core/ipc primitives ---------------
 #
