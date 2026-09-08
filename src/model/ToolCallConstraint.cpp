@@ -12,6 +12,7 @@
 
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -21,9 +22,15 @@ using nlohmann::json;
 
 namespace {
 
-// Ordered schema-property names of a tool from its OpenAI tool JSON.
-std::vector<std::string> schemaKeys(const std::string& toolJson) {
-    std::vector<std::string> keys;
+// Ordered schema-property names of a tool from its OpenAI tool JSON, each
+// tagged with whether the schema lists it as required.
+struct SchemaParams {
+    std::vector<std::string> keys;      // schema-property order
+    std::vector<bool>        required;  // parallel to keys
+};
+
+SchemaParams schemaParams(const std::string& toolJson) {
+    SchemaParams sp;
     const json t = json::parse(toolJson, nullptr, false);
     if (t.is_discarded() || !t.contains("function")
         || !t["function"].is_object()
@@ -31,13 +38,21 @@ std::vector<std::string> schemaKeys(const std::string& toolJson) {
         || !t["function"]["parameters"].is_object()
         || !t["function"]["parameters"].contains("properties")
         || !t["function"]["parameters"]["properties"].is_object()) {
-        return keys;
+        return sp;
     }
-    const json& props = t["function"]["parameters"]["properties"];
+    const json& params = t["function"]["parameters"];
+    std::set<std::string> req;
+    if (params.contains("required") && params["required"].is_array()) {
+        for (const auto& r : params["required"]) {
+            if (r.is_string()) { req.insert(r.get<std::string>()); }
+        }
+    }
+    const json& props = params["properties"];
     for (auto it = props.begin(); it != props.end(); ++it) {
-        keys.push_back(it.key());
+        sp.keys.push_back(it.key());
+        sp.required.push_back(req.count(it.key()) > 0);
     }
-    return keys;
+    return sp;
 }
 
 // A name/key emitted verbatim into an EBNF double-quoted literal. Tool names and
@@ -132,13 +147,15 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
     // alternative is one offered tool with that tool's keys -> NAME and KEY are
     // both grammar-forced; VALUE is any text.
     std::string ebnf;
-    // Value = any run of chars up to the closer's '<'. Crucially the parameter
-    // terminator starts with '<' (`</parameter>`), NOT with '\n', so [^<]*
-    // ends DETERMINISTICALLY at the first '<' — an ambiguous "\n</parameter>"
-    // terminator lets [^<]* also eat the '\n', which explodes the Earley parser
-    // state (and hangs CompileGrammar). Values that legitimately contain '<'
-    // just end the parameter early, which the downstream parser tolerates.
-    ebnf += "value ::= [^<]*\n";
+    // Value = a NON-EMPTY run of chars up to the closer's '<'. Crucially the
+    // parameter terminator starts with '<' (`</parameter>`), NOT with '\n', so
+    // [^<]+ ends DETERMINISTICALLY at the first '<' — an ambiguous
+    // "\n</parameter>" terminator lets the value also eat the '\n', which
+    // explodes the Earley parser state (and hangs CompileGrammar). Values that
+    // legitimately contain '<' just end the parameter early, which the
+    // downstream parser tolerates. `+` (not `*`) forbids an empty value, so a
+    // required key never collapses to `{"file_path":""}`.
+    ebnf += "value ::= [^<]+\n";
     std::string bodyAlts;
     for (std::size_t i = 0; i < tools.size(); ++i) {
         const std::string nm = ebnfLiteralSafe(tools[i].name);
@@ -146,18 +163,38 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
         if (!bodyAlts.empty()) { bodyAlts += " | "; }
         bodyAlts += "\"" + nm + ">\\n\" " + pr
                   + " \"</function>\\n</tool_call>\"";
-        const auto keys = schemaKeys(tools[i].toolJson);
-        std::string paramAlts;
-        for (const std::string& k : keys) {
-            if (!paramAlts.empty()) { paramAlts += " | "; }
-            paramAlts += "\"<parameter=" + ebnfLiteralSafe(k)
-                       + ">\\n\" value \"</parameter>\\n\"";
+
+        // A parameter block for key k.
+        const auto keyBlock = [](const std::string& k) {
+            return "\"<parameter=" + ebnfLiteralSafe(k)
+                 + ">\\n\" value \"</parameter>\\n\"";
+        };
+        const SchemaParams sp = schemaParams(tools[i].toolJson);
+
+        // opt_i = any run of the OPTIONAL keys (each omittable, any order).
+        const std::string optRule = "opt_" + std::to_string(i);
+        std::string optAlts;
+        for (std::size_t j = 0; j < sp.keys.size(); ++j) {
+            if (sp.required[j]) { continue; }
+            if (!optAlts.empty()) { optAlts += " | "; }
+            optAlts += keyBlock(sp.keys[j]);
         }
-        if (paramAlts.empty()) {
-            ebnf += pr + " ::= \"\"\n";
+        if (optAlts.empty()) {
+            ebnf += optRule + " ::= \"\"\n";
         } else {
-            ebnf += pr + " ::= (" + paramAlts + ")*\n";
+            ebnf += optRule + " ::= (" + optAlts + ")*\n";
         }
+
+        // params_i forces EVERY required key (in schema order) to appear before
+        // the arguments object can close, with optionals free to interleave:
+        //   opt_i  req1  opt_i  req2  opt_i ...  reqN  opt_i
+        // No required keys -> params_i is just opt_i (may be empty).
+        std::string paramsBody = optRule;
+        for (std::size_t j = 0; j < sp.keys.size(); ++j) {
+            if (!sp.required[j]) { continue; }
+            paramsBody += " " + keyBlock(sp.keys[j]) + " " + optRule;
+        }
+        ebnf += pr + " ::= " + paramsBody + "\n";
     }
     ebnf += "call_body ::= " + bodyAlts + "\n";
     ebnf += "root ::= TagDispatch((\"<function=\", call_body), "
