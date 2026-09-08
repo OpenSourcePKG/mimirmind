@@ -42,6 +42,13 @@ public:
                       int T_q, int T_kv, int nHeads, int nKvHeads, int headDim,
                       float scale);
 
+    /// Set the maximum prefill sequence length the cuDNN graphs are built for.
+    /// MUST track the serving runtime.maxContextTokens: a T_kv above this falls
+    /// back to the (much slower) hand kernel. Should be called once at serving
+    /// setup with the resolved per-(HW × model) maxContextTokens. Values <= the
+    /// current cap are ignored (never shrink an already-built graph budget).
+    void setMaxSeqLen(int smax);
+
 private:
     struct Impl;
     Impl* _impl;

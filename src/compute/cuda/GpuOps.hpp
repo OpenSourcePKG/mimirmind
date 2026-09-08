@@ -440,6 +440,11 @@ public:
                                std::size_t nKvHeads, std::size_t headDim,
                                float scale, float* out) override;
 
+    // Track runtime.maxContextTokens so the cuDNN SDPA prefill graphs cover the
+    // full prefill length instead of falling back to the slow hand kernel above
+    // a hardcoded cap (the head_dim=256 prefill cliff). Called at serving setup.
+    void setCudnnPrefillMaxSeqLen(std::size_t smax) override;
+
     void attentionEncoderCrossAsync(const float* q, const float* k,
                                     const float* v, std::size_t Tq,
                                     std::size_t Tk, std::size_t nHeads,
@@ -680,6 +685,9 @@ private:
     bool                 _prefillCudnnEnvSet{false};
 #if MIMIRMIND_HAVE_CUDNN_SDPA
     std::unique_ptr<CudnnSdpaPrefill> _cudnnSdpa;   // lazily created on first use
+    std::size_t _cudnnPrefillSmax{32768};           // max prefill seqlen for the
+                                                    // cuDNN graphs; tracks
+                                                    // runtime.maxContextTokens
 #endif
     std::size_t          _prefillFlashKTileQ8Configured{128};
     std::size_t          _prefillFlashKTileQ8{128};

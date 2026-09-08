@@ -1314,6 +1314,13 @@ public:
     /// hold `ComputeOps&`.
     virtual void flush() = 0;
 
+    /// Backends with a cuDNN SDPA prefill path (CUDA) build their fused
+    /// attention graphs for prefill lengths up to this many tokens; longer
+    /// prefills fall back to a much slower hand kernel. Serving setup calls this
+    /// with the resolved runtime.maxContextTokens so the cap tracks the config
+    /// instead of a hardcoded default. No-op on backends without cuDNN.
+    virtual void setCudnnPrefillMaxSeqLen(std::size_t /*smax*/) {}
+
     // -- M8.L (4.5.5) — double-buffered chunked prefill submit ---------
     //
     // Bound the in-flight command work of a long prefill WITHOUT the

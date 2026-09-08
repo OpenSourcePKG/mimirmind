@@ -45,15 +45,20 @@ struct CachedGraph {
     int64_t workspaceBytes{0};
 };
 
-// Fixed max sequence length the single ragged graph is built for. Covers
-// maxContextTokens=8192; requests beyond fall back to the hand kernel.
-static constexpr int kSmax = 8192;
+// Default max prefill seqlen the cuDNN graphs are built for; overridden at
+// runtime via CudnnSdpaPrefill::setMaxSeqLen (tracks runtime.maxContextTokens).
+// T_kv/T_q beyond the active cap fall back to the (slow, O(n^2)) hand kernel —
+// the head_dim=256 "cliff" (below the cap cuDNN is ~16ms@8k; above it the
+// fallback is 6000ms+@16k). Bucketed per power-of-2 (bucketS), so a higher cap
+// only adds a few cached graphs; the bf16 scratch is sized to the cap once.
+static constexpr int kSmaxDefault = 32768;
 
 }  // namespace
 
 struct CudnnSdpaPrefill::Impl {
     cudnnHandle_t handle{nullptr};
     bool handleOk{false};
+    int  smax{kSmaxDefault};   // active max prefill seqlen (setMaxSeqLen)
     std::unordered_map<uint64_t, CachedGraph> cache;
 
     // bf16 + workspace device scratch (grown on demand).
@@ -90,9 +95,9 @@ struct CudnnSdpaPrefill::Impl {
     // Round T_kv up to a power-of-2 bucket in [1024, kSmax]. A graph built for a
     // tight bucket picks a far better plan than the fixed-8192 one (~5-15x on the
     // attention term, measured), while keeping the cache to a handful of graphs.
-    static int bucketS(int Tkv) {
+    static int bucketS(int Tkv, int smax) {
         int s = 1024;
-        while (s < Tkv && s < kSmax) s <<= 1;
+        while (s < Tkv && s < smax) s <<= 1;
         return s;
     }
 
@@ -168,20 +173,26 @@ struct CudnnSdpaPrefill::Impl {
 CudnnSdpaPrefill::CudnnSdpaPrefill()  : _impl(new Impl()) {}
 CudnnSdpaPrefill::~CudnnSdpaPrefill() { delete _impl; }
 
+void CudnnSdpaPrefill::setMaxSeqLen(int smax) {
+    // Grow-only: never shrink the cap (would strand already-built graphs /
+    // over-tight scratch). Rounds nothing — bucketS handles the power-of-2.
+    if (smax > _impl->smax) { _impl->smax = smax; }
+}
+
 bool CudnnSdpaPrefill::runF32Causal(void* stream,
                                     const float* q, const float* k, const float* v, float* out,
                                     int T_q, int T_kv, int nHeads, int nKvHeads, int headDim,
                                     float scale) {
     Impl& I = *_impl;
     if (!I.handleOk) return false;
-    if (T_kv < T_q || T_kv > kSmax || T_q > kSmax) return false;  // K/V covers Q, within Smax
+    if (T_kv < T_q || T_kv > I.smax || T_q > I.smax) return false;  // K/V covers Q, within Smax
     cudaStream_t s = static_cast<cudaStream_t>(stream);
 
     const std::size_t nQ  = (std::size_t)T_q  * nHeads   * headDim;   // valid Q / O rows
     const std::size_t nKV = (std::size_t)T_kv * nKvHeads * headDim;   // valid K / V rows
     // The ragged graph reads Smax rows -> scratch is Smax-sized (fixed, grown once).
-    const std::size_t capQ  = (std::size_t)kSmax * nHeads   * headDim;
-    const std::size_t capKV = (std::size_t)kSmax * nKvHeads * headDim;
+    const std::size_t capQ  = (std::size_t)I.smax * nHeads   * headDim;
+    const std::size_t capKV = (std::size_t)I.smax * nKvHeads * headDim;
     if (!Impl::grow(I.dQ, I.qCap, capQ) || !Impl::grow(I.dK, I.kCap, capKV) ||
         !Impl::grow(I.dV, I.vCap, capKV) || !Impl::grow(I.dO, I.oCap, capQ))
         return false;
@@ -201,7 +212,7 @@ bool CudnnSdpaPrefill::runF32Causal(void* stream,
     setSeqLens<<<1, 1, 0, s>>>(I.dSeqQ, I.dSeqKV, T_q, T_kv);
 
     CachedGraph* cg = I.getOrBuild(nHeads, nKvHeads, headDim, scale,
-                                   Impl::bucketS(T_kv));
+                                   Impl::bucketS(T_kv, I.smax));
     if (!cg) return false;
     if (cg->workspaceBytes > 0 &&
         !Impl::grow(reinterpret_cast<char*&>(I.dWs), I.wsCap, (std::size_t)cg->workspaceBytes))

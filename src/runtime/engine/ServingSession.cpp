@@ -975,6 +975,10 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     }
 
     _state = std::move(st);
+    // Size the cuDNN SDPA prefill graphs to the full serving context so long
+    // prefills stay on the fused flash path instead of the slow hand-kernel
+    // fallback (the head_dim=256 prefill cliff). Tracks runtime.maxContextTokens.
+    _e._ops->setCudnnPrefillMaxSeqLen(maxContext);
     MM_LOG_INFO("serving",
                 "ensureServingState: maxBatch={} maxContext={} blocksPerSeq={} "
                 "numBlocks={} vocab_lm={}",

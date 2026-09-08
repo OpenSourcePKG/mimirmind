@@ -3629,7 +3629,10 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         kvDtype == runtime::KvDtype::F32 &&
         slidingWindow == 0 &&
         nKvHeads > 0 && (nHeads % nKvHeads == 0)) {
-        if (!_cudnnSdpa) _cudnnSdpa = std::make_unique<CudnnSdpaPrefill>();
+        if (!_cudnnSdpa) {
+            _cudnnSdpa = std::make_unique<CudnnSdpaPrefill>();
+            _cudnnSdpa->setMaxSeqLen(static_cast<int>(_cudnnPrefillSmax));
+        }
         if (_cudnnSdpa->runF32Causal(
                 _ctx.stream().handle(),
                 q, static_cast<const float*>(k), static_cast<const float*>(v), out,
@@ -4126,6 +4129,13 @@ void GpuOps::pagedAttentionPrefillCausalAsync(
                 smemBytes);
 }
 
+void GpuOps::setCudnnPrefillMaxSeqLen(std::size_t smax) {
+    _cudnnPrefillSmax = smax;
+#if MIMIRMIND_HAVE_CUDNN_SDPA
+    if (_cudnnSdpa) { _cudnnSdpa->setMaxSeqLen(static_cast<int>(smax)); }
+#endif
+}
+
 bool GpuOps::pagedPrefillCudnnAvailable() const noexcept {
 #if MIMIRMIND_HAVE_CUDNN_SDPA
     return true;
@@ -4159,6 +4169,7 @@ bool GpuOps::pagedPrefillAttentionCudnnAsync(
     }
     if (!_cudnnSdpa) {
         _cudnnSdpa = std::make_unique<CudnnSdpaPrefill>();
+        _cudnnSdpa->setMaxSeqLen(static_cast<int>(_cudnnPrefillSmax));
     }
     // startPos lives on device; read the small [numSeqs] array back once.
     std::vector<std::int32_t> startPos(numSeqs);
