@@ -486,6 +486,49 @@ bool ToolCallParser::looksLikeBareQwenXmlCall(
     return false;
 }
 
+std::vector<ToolCall> ToolCallParser::parseQwenXmlNoisy(
+        std::string_view text, std::span<const ToolSpec> specs) {
+    // 1. Drop special-token literals the model spuriously emitted mid-call.
+    std::string s{text};
+    for (const char* sp : {"<|im_start|>", "<|im_end|>", "<|endoftext|>"}) {
+        const std::string m{sp};
+        std::size_t p = 0;
+        while ((p = s.find(m, p)) != std::string::npos) {
+            s.erase(p, m.size());
+        }
+    }
+    // 2. Repair a `<` that a stripped special token had replaced, so the XML
+    //    markers are well-formed again. Only touch an occurrence that is not
+    //    already preceded by '<'.
+    const auto repair = [&s](const std::string& marker) {
+        std::size_t p = 0;
+        while ((p = s.find(marker, p)) != std::string::npos) {
+            if (p == 0 || s[p - 1] != '<') {
+                s.insert(p, "<");
+                p += 1 + marker.size();
+            } else {
+                p += marker.size();
+            }
+        }
+    };
+    repair("function=");
+    repair("parameter=");
+    // 3. Parse the repaired text, then keep only calls whose name is offered —
+    //    the guard against turning arbitrary noise into a call.
+    std::vector<ToolCall> calls = parseQwenXml(s, specs);
+    std::vector<ToolCall> kept;
+    for (auto& c : calls) {
+        bool offered = false;
+        for (const auto& spec : specs) {
+            if (spec.name == c.name) { offered = true; break; }
+        }
+        if (offered) {
+            kept.push_back(std::move(c));
+        }
+    }
+    return kept;
+}
+
 std::vector<ToolCall> ToolCallParser::parseQwenXmlBare(
         std::string_view text, std::span<const ToolSpec> specs) {
     std::vector<ToolCall> calls;

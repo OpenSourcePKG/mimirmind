@@ -65,6 +65,17 @@ public:
     [[nodiscard]] static std::vector<ToolCall>
     parseQwenXmlBare(std::string_view text, std::span<const ToolSpec> specs);
 
+    /// Salvage a control-token-noised tool call. Some checkpoints
+    /// (Qwen3-Coder-Next under a heavy tool prompt) inject `<|im_start|>` /
+    /// `<|im_end|>` / `<|endoftext|>` literals into the tool-call span,
+    /// dropping the leading `<` of `<function=` / `<parameter=` so the strict
+    /// parser matches nothing. This strips those special-token literals,
+    /// repairs the missing `<`, then runs parseQwenXml. A call is accepted
+    /// ONLY when NAME matches an offered tool in `specs` — the same guard-rail
+    /// as parseQwenXmlBare — so it never fabricates a call from noise.
+    [[nodiscard]] static std::vector<ToolCall>
+    parseQwenXmlNoisy(std::string_view text, std::span<const ToolSpec> specs);
+
     /// Cheap pre-check for `parseQwenXmlBare`: `text` contains
     /// `<function=NAME` for at least one offered tool.
     [[nodiscard]] static bool

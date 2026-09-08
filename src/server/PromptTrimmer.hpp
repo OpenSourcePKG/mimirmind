@@ -69,6 +69,7 @@ struct PromptTrimmer {
         std::optional<bool>              enableThinking,
         model::ChatTemplate::ToolFormat  toolFormat,
         std::optional<bool>              templateUsesThink,
+        std::optional<bool>              toolDefsStructuredXml,
         TrimReport&                      report,
         std::string&                     errorMessage);
 

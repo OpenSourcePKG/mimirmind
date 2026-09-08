@@ -48,6 +48,15 @@ struct LlmConfig {
     // early EOS).
     std::optional<bool> templateUsesThink{};
 
+    // Whether the model renders tool DEFINITIONS as structured XML
+    // (<function><name>…<parameters><parameter>…, Qwen3-Coder-Next) rather than
+    // qwen3.6's `tool | tojson`. nullopt = unknown -> the chat encoder uses the
+    // qwen3.6 JSON form (unchanged for GGUF / unprobed models). Set from the
+    // checkpoint's chat_template.jinja at load. Feeding a structured-XML model
+    // the JSON form (or vice versa) breaks auto-mode tool calling — the model
+    // emits a bare ```json/```html body instead of a parseable <tool_call>.
+    std::optional<bool> toolDefsStructuredXml{};
+
     // Required — throws if missing from metadata.
     std::uint32_t blockCount        {0};
     std::uint32_t contextLength     {0};

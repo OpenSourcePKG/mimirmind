@@ -125,7 +125,12 @@ public:
            // nullopt = unknown -> fall back to the <think>-token-presence
            // heuristic. false suppresses the empty pre-closed block for
            // non-thinking models that merely ship the token (Coder-Next).
-           std::optional<bool>            templateUsesThink   = std::nullopt);
+           std::optional<bool>            templateUsesThink   = std::nullopt,
+           // Does the model render tool DEFINITIONS as structured XML
+           // (<function><name>…<parameters><parameter>…, Qwen3-Coder-Next) vs
+           // qwen3.6's `tool | tojson`? nullopt/false = the qwen3.6 JSON form.
+           // Only consulted for QwenXml + tools present.
+           std::optional<bool>            toolDefsStructuredXml = std::nullopt);
 
     /**
      * Token ids that should terminate decoding for `style`, in addition

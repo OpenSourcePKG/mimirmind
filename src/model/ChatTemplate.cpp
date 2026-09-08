@@ -114,13 +114,112 @@ std::string renderQwenXmlCall(const ToolCall& call) {
     return out;
 }
 
+// jinja `tojson`-style serialisation: compact but with ", " / ": " separators
+// (nlohmann's dump() has no space option). Used for the <required>/<enum>/...
+// extra-key values in the structured tool-def form so the rendered prompt
+// tracks the model's chat_template output.
+std::string jinjaJson(const nlohmann::json& j) {
+    if (j.is_array()) {
+        std::string s = "[";
+        for (std::size_t i = 0; i < j.size(); ++i) {
+            if (i) { s += ", "; }
+            s += jinjaJson(j[i]);
+        }
+        return s + "]";
+    }
+    if (j.is_object()) {
+        std::string s = "{";
+        bool first = true;
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            if (!first) { s += ", "; }
+            first = false;
+            s += nlohmann::json(it.key()).dump() + ": " + jinjaJson(it.value());
+        }
+        return s + "}";
+    }
+    return j.dump();   // scalar/string, properly escaped
+}
+
+// modeling_qwen3_next's render_extra_keys: any object key not in `handled`
+// is spliced as `\n<key>value</key>` (raw for strings, jinjaJson otherwise).
+std::string renderExtraKeys(const nlohmann::json& obj,
+                            std::initializer_list<const char*> handled) {
+    std::string s;
+    if (!obj.is_object()) { return s; }
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        bool isHandled = false;
+        for (const char* h : handled) {
+            if (it.key() == h) { isHandled = true; break; }
+        }
+        if (isHandled) { continue; }
+        s += "\n<" + it.key() + ">";
+        s += it.value().is_string() ? it.value().get<std::string>()
+                                    : jinjaJson(it.value());
+        s += "</" + it.key() + ">";
+    }
+    return s;
+}
+
+// Render one tool as the STRUCTURED-XML function definition Qwen3-Coder-Next's
+// chat template expects (`<function><name>…<parameters><parameter>…<required>`),
+// as opposed to qwen3.6's `tool | tojson`. Mirrors the model's Jinja exactly so
+// auto-mode tool calling stays in-distribution.
+std::string renderQwenXmlStructuredToolDef(const ToolSpec& t) {
+    const nlohmann::json root =
+        nlohmann::json::parse(t.toolJson, nullptr, /*allow_exceptions=*/false);
+    const nlohmann::json fn =
+        (!root.is_discarded() && root.contains("function")
+         && root["function"].is_object())
+            ? root["function"] : nlohmann::json::object();
+    const std::string name = fn.value("name", t.name);
+    auto trimmed = [](std::string v) {
+        const auto b = v.find_first_not_of(" \t\r\n");
+        const auto e = v.find_last_not_of(" \t\r\n");
+        return b == std::string::npos ? std::string{} : v.substr(b, e - b + 1);
+    };
+    std::string s = "\n<function>\n<name>" + name + "</name>";
+    if (fn.contains("description") && fn["description"].is_string()) {
+        s += "\n<description>" + trimmed(fn["description"].get<std::string>())
+             + "</description>";
+    }
+    s += "\n<parameters>";
+    const nlohmann::json params =
+        (fn.contains("parameters") && fn["parameters"].is_object())
+            ? fn["parameters"] : nlohmann::json::object();
+    if (params.contains("properties") && params["properties"].is_object()) {
+        for (auto it = params["properties"].begin();
+             it != params["properties"].end(); ++it) {
+            const nlohmann::json& pf = it.value();
+            s += "\n<parameter>\n<name>" + it.key() + "</name>";
+            if (pf.contains("type") && pf["type"].is_string()) {
+                s += "\n<type>" + pf["type"].get<std::string>() + "</type>";
+            }
+            if (pf.contains("description") && pf["description"].is_string()) {
+                s += "\n<description>"
+                     + trimmed(pf["description"].get<std::string>())
+                     + "</description>";
+            }
+            s += renderExtraKeys(pf, {"name", "type", "description"});
+            s += "\n</parameter>";
+        }
+    }
+    // params-level extra keys (not type/properties) — emits <required>[…]</required>.
+    s += renderExtraKeys(params, {"type", "properties"});
+    s += "\n</parameters>";
+    // function-level extra keys.
+    s += renderExtraKeys(fn, {"type", "name", "description", "parameters"});
+    s += "\n</function>";
+    return s;
+}
+
 std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
                                      std::span<const ChatMessage> messages,
                                      bool                         addGenerationPrompt,
                                      std::span<const ToolSpec>    tools,
                                      std::optional<bool>          enableThinking,
                                      ChatTemplate::ToolFormat     toolFormat,
-                                     std::optional<bool>          templateUsesThink) {
+                                     std::optional<bool>          templateUsesThink,
+                                     std::optional<bool>          toolDefsStructuredXml) {
     const std::int32_t imStart = requireToken(tok, kQwenImStart);
     const std::int32_t imEnd   = requireToken(tok, kQwenImEnd);
 
@@ -159,6 +258,36 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     // byte-identically to the pre-8.19.6 encoder regardless of format.
     const bool xmlTools =
         (toolFormat == ChatTemplate::ToolFormat::QwenXml) && !tools.empty();
+    // Qwen3-Coder-Next renders tool DEFINITIONS as structured XML
+    // (<function><name>…<parameters><parameter>…<required>) and opens the
+    // system turn with a "You are Qwen…" preamble, whereas qwen3.6 uses
+    // `tool | tojson` and no preamble. Both share the CALL format and the
+    // "If you choose…"/<IMPORTANT> tail. Detected per-model from the checkpoint
+    // template (see LlmConfig::toolDefsStructuredXml); nullopt = the qwen3.6
+    // form, so unprobed/GGUF models are byte-identical to before.
+    const bool structuredXml = xmlTools && toolDefsStructuredXml.value_or(false);
+    // The fixed call-format tail, identical across both Qwen XML dialects.
+    constexpr const char* kQwenXmlTail =
+        "\n</tools>\n\nIf you choose to call a function ONLY reply in the "
+        "following format with NO suffix:\n\n<tool_call>\n"
+        "<function=example_function_name>\n"
+        "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+        "<parameter=example_parameter_2>\nThis is the value for the second "
+        "parameter\nthat can span\nmultiple lines\n</parameter>\n"
+        "</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+        "- Function calls MUST follow the specified format: an inner "
+        "<function=...></function> block must be nested within "
+        "<tool_call></tool_call> XML tags\n"
+        "- Required parameters MUST be specified\n"
+        "- You may provide optional reasoning for your function call in "
+        "natural language BEFORE the function call, but NOT after\n"
+        "- If there is no function call available, answer the question "
+        "like normal with your current knowledge and do not tell the user "
+        "about function calls\n</IMPORTANT>";
+    // Qwen3-Coder-Next default system preamble when the caller sends none.
+    constexpr const char* kQwenAgentPreamble =
+        "You are Qwen, a helpful AI assistant that can interact with a "
+        "computer to solve tasks.";
     std::string toolsBlock;
     if (!tools.empty() && !xmlTools) {
         toolsBlock =
@@ -177,26 +306,14 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     } else if (!tools.empty()) {
         toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
         for (const auto& t : tools) {
-            toolsBlock += "\n";
-            toolsBlock += t.toolJson;
+            if (structuredXml) {
+                toolsBlock += renderQwenXmlStructuredToolDef(t);
+            } else {
+                toolsBlock += "\n";
+                toolsBlock += t.toolJson;
+            }
         }
-        toolsBlock +=
-            "\n</tools>\n\nIf you choose to call a function ONLY reply in the "
-            "following format with NO suffix:\n\n<tool_call>\n"
-            "<function=example_function_name>\n"
-            "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
-            "<parameter=example_parameter_2>\nThis is the value for the second "
-            "parameter\nthat can span\nmultiple lines\n</parameter>\n"
-            "</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
-            "- Function calls MUST follow the specified format: an inner "
-            "<function=...></function> block must be nested within "
-            "<tool_call></tool_call> XML tags\n"
-            "- Required parameters MUST be specified\n"
-            "- You may provide optional reasoning for your function call in "
-            "natural language BEFORE the function call, but NOT after\n"
-            "- If there is no function call available, answer the question "
-            "like normal with your current knowledge and do not tell the user "
-            "about function calls\n</IMPORTANT>";
+        toolsBlock += kQwenXmlTail;
     }
 
     auto emitTurn = [&](std::string_view role, std::string_view content) {
@@ -215,7 +332,18 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     // QwenXml placement is inverted: the tools block OPENS the system turn
     // and an explicit system message follows after a blank line, exactly as
     // the Qwen3.5/3.6 chat template renders it.
-    if (xmlTools && !toolsBlock.empty()) {
+    if (xmlTools && !toolsBlock.empty() && structuredXml) {
+        // Qwen3-Coder-Next: system content (or the default agent preamble) comes
+        // FIRST, then a blank line, then the tools block — the inverse of the
+        // qwen3.6 ordering below.
+        std::string sys =
+            (hasExplicitSystem && !messages.front().content.empty())
+                ? messages.front().content
+                : std::string{kQwenAgentPreamble};
+        sys += "\n\n";
+        sys += toolsBlock;
+        emitTurn("system", sys);
+    } else if (xmlTools && !toolsBlock.empty()) {
         std::string sys = toolsBlock;
         if (hasExplicitSystem && !messages.front().content.empty()) {
             sys += "\n\n";
@@ -840,11 +968,13 @@ ChatTemplate::encode(Style                        style,
                      std::span<const ToolSpec>    tools,
                      std::optional<bool>          enableThinking,
                      ToolFormat                   toolFormat,
-                     std::optional<bool>          templateUsesThink) {
+                     std::optional<bool>          templateUsesThink,
+                     std::optional<bool>          toolDefsStructuredXml) {
     switch (style) {
         case Style::QwenChatML:
             return encodeQwen(tok, messages, addGenerationPrompt, tools,
-                              enableThinking, toolFormat, templateUsesThink);
+                              enableThinking, toolFormat, templateUsesThink,
+                              toolDefsStructuredXml);
         case Style::Gemma3:
             // Gemma 3 tool rendering not implemented (Gemma 4 is the target).
             return encodeGemma3(tok, messages, addGenerationPrompt);

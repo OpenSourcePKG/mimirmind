@@ -244,6 +244,21 @@ void detectTemplateThinking(model::LlmConfig&            cfg,
                 "chat_template.jinja: think block {} (generation prompt {})",
                 uses ? "used" : "NOT used",
                 uses ? "pre-opens <think>" : "plain assistant turn");
+
+    // Tool-definition dialect: Qwen3-Coder-Next renders each tool as structured
+    // XML (via a render_extra_keys macro building <function><name>…), while
+    // qwen3.6 uses `tool | tojson`. Detect the structured form by its macro /
+    // structural markers; anything else keeps the JSON form. Feeding the wrong
+    // form breaks auto-mode tool calling (bare ```json body, no <tool_call>).
+    const bool structuredTools =
+        tpl.find("render_extra_keys") != std::string::npos
+        || (tpl.find("<function>") != std::string::npos
+            && tpl.find("<name>") != std::string::npos);
+    cfg.toolDefsStructuredXml = structuredTools;
+    MM_LOG_INFO("engine",
+                "chat_template.jinja: tool definitions rendered as {}",
+                structuredTools ? "structured XML (<function><name>…)"
+                                : "JSON (tool | tojson)");
 }
 
 } // namespace

@@ -167,7 +167,8 @@ bool ChatCompletionHandler::prepareChatRequest(
     promptIds = model::ChatTemplate::encode(
         style, tok, msgs, /*addGenerationPrompt=*/true, cr.tools,
         cr.enableThinking, toolFormat,
-        targetEngine.config().templateUsesThink);
+        targetEngine.config().templateUsesThink,
+        targetEngine.config().toolDefsStructuredXml);
 
     // Debug teacher-forcing: append the raw prefill suffix (no BOS, no
     // special tokens) so the engine prefills the whole sequence in one pass.
@@ -227,6 +228,7 @@ bool ChatCompletionHandler::prepareChatRequest(
                              targetEngine.config().contextLength,
                              tok, style, cr.tools, cr.enableThinking,
                              toolFormat, targetEngine.config().templateUsesThink,
+                             targetEngine.config().toolDefsStructuredXml,
                              report, trimErr)) {
             sendError(res, 400, "invalid_request_error", trimErr);
             return false;
@@ -746,16 +748,40 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                     ? model::ToolCallParser::parseQwen(toolText)
                     : model::ToolCallParser::parseQwenXml(toolText, cr.tools);
             }
+            if (toolCalls.empty()) {
+                // Salvage a control-token-noised call (Qwen3-Coder-Next injects
+                // <|im_start|> into the tool-call span under heavy tool prompts,
+                // dropping the '<' of <function=). Only offered names survive.
+                toolCalls = model::ToolCallParser::parseQwenXmlNoisy(
+                    toolText, cr.tools);
+                if (!toolCalls.empty()) {
+                    MM_LOG_INFO("server",
+                                "tool-call salvaged from control-token-noised "
+                                "span ({} call(s))",
+                                toolCalls.size());
+                    // The whole visible span was the noised call — drop it so
+                    // the client sees a clean tool-call turn, not raw markup.
+                    const std::size_t open = text.find("<tool_call>");
+                    if (open != std::string::npos) {
+                        text.erase(open);
+                    }
+                }
+            }
             if (toolCalls.empty() &&
                 model::ToolCallParser::looksLikeQwenToolCall(text)) {
                 // Unparseable in every dialect: suppress the marker span from
                 // the visible answer instead of leaking raw markup to the
                 // client (agent transcripts choke on it). Content around the
                 // block is kept.
+                std::string preview = toolText.substr(0, 240);
+                for (char& ch : preview) {
+                    if (ch == '\n') { ch = '#'; }
+                }
                 MM_LOG_WARN("server",
                             "tool-call block failed to parse in any dialect — "
-                            "suppressing {} byte marker span from content",
-                            text.size());
+                            "suppressing {} byte marker span from content; raw="
+                            "[{}]",
+                            text.size(), preview);
                 std::size_t open;
                 while ((open = text.find("<tool_call>")) != std::string::npos) {
                     const std::size_t close = text.find("</tool_call>", open);
@@ -1226,6 +1252,13 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                             ? model::ToolCallParser::parseQwen(block)
                             : model::ToolCallParser::parseQwenXml(
                                   block, state->toolSpecs);
+                    }
+                    if (parsed.empty() && !bare) {
+                        // Control-token-noised call (Qwen3-Coder-Next injects
+                        // <|im_start|> into the span) — strip + repair + parse,
+                        // offered-name-gated. Mirrors the blocking path.
+                        parsed = model::ToolCallParser::parseQwenXmlNoisy(
+                            block, state->toolSpecs);
                     }
                     return parsed;
                 }();
