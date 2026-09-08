@@ -31,6 +31,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <cctype>
 #include <span>
 #include <string>
 
@@ -39,6 +40,44 @@ namespace mimirmind::server {
 using nlohmann::json;
 
 namespace {
+
+/// Resolve a model-emitted tool name to an OFFERED tool (8.19.13.1): exact
+/// match first, then case-insensitive (kills `read` vs `Read`, `write` vs
+/// `Write`), then — when exactly one tool is offered — the sole tool (kills a
+/// canonical-name prior like coder-next's `run_shell_command` for an offered
+/// `run_command`). Returns "" when nothing plausibly matches, so a genuinely
+/// unknown name is not silently rewritten in a multi-tool request.
+inline std::string resolveOfferedName(const std::string& name,
+                                      std::span<const model::ToolSpec> specs) {
+    for (const auto& s : specs) {
+        if (s.name == name) { return name; }
+    }
+    const auto lower = [](std::string s) {
+        for (char& c : s) { c = static_cast<char>(std::tolower(
+                                static_cast<unsigned char>(c))); }
+        return s;
+    };
+    const std::string ln = lower(name);
+    for (const auto& s : specs) {
+        if (lower(s.name) == ln) { return s.name; }
+    }
+    if (specs.size() == 1) { return specs.front().name; }
+    return {};
+}
+
+/// Apply resolveOfferedName to every call, logging a remap.
+inline void normalizeToolCallNames(std::vector<model::ToolCall>& calls,
+                                   std::span<const model::ToolSpec> specs) {
+    for (auto& c : calls) {
+        const std::string resolved = resolveOfferedName(c.name, specs);
+        if (!resolved.empty() && resolved != c.name) {
+            MM_LOG_INFO("server",
+                        "tool-call name '{}' normalised to offered tool '{}'",
+                        c.name, resolved);
+            c.name = resolved;
+        }
+    }
+}
 
 /// Drive one request through the ContinuousBatcher, mirroring the callback
 /// contract of InferenceEngine::generate() so the existing response
@@ -848,9 +887,34 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             model::ChatTemplate::Style::QwenChatML) {
         const std::size_t nw  = text.find_first_not_of(" \t\n\r");
         const char*       off = std::getenv("MIMIRMIND_TOOL_SALVAGE");
-        if (nw != std::string::npos && text[nw] == '<' &&
-            (off == nullptr || off[0] != '0') &&
-            model::ToolCallParser::looksLikeToolMarkupSalad(text)) {
+        // 8.19.13.1 — broaden the re-decode trigger from just '<'-leading
+        // markup salad to EVERY tool-intent leak: a ```tool_code/```bash/
+        // ```python/```json fence, an XML opener, or a bare NAME(args) for an
+        // offered tool. saladLike keeps the original suppress-on-failure
+        // behaviour (foreign markup is not a real answer); the broadened
+        // fence/call intents RESTORE the content on failure (a legit code
+        // answer must not be eaten).
+        const bool saladLike =
+            (nw != std::string::npos && text[nw] == '<' &&
+             model::ToolCallParser::looksLikeToolMarkupSalad(text));
+        // STRONG tool-intent markers only — a ```tool_code fence (Gemma's
+        // tool-call marker) or an XML opener. A bare ```python/```bash/```json
+        // is NOT included: it is ambiguous with a legitimate code answer, and
+        // if it actually holds a call, parseToolCodeCall already caught it
+        // above (so toolCalls would be non-empty and we would not be here).
+        bool fenceOrCall = false;
+        for (const char* h : {"```tool_code", "<function", "<tool_call"}) {
+            if (text.find(h) != std::string::npos) { fenceOrCall = true; break; }
+        }
+        if (!fenceOrCall) {
+            for (const auto& s : cr.tools) {
+                if (!s.name.empty()
+                    && text.find(s.name + "(") != std::string::npos) {
+                    fenceOrCall = true; break;
+                }
+            }
+        }
+        if ((saladLike || fenceOrCall) && (off == nullptr || off[0] != '0')) {
             constexpr std::string_view kSalvageOpener =
                 "<tool_call>\n<function=";
             const auto openerIds =
@@ -886,33 +950,33 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             }
             if (!toolCalls.empty()) {
                 MM_LOG_WARN("server",
-                            "tool-salvage: unparseable tool markup ({} bytes) "
+                            "tool-salvage: unparseable tool-intent ({} bytes) "
                             "re-decoded into {} call(s)",
                             text.size(), toolCalls.size());
-            } else {
+                text.clear();   // the leaked intent is superseded by the call
+            } else if (saladLike) {
                 MM_LOG_WARN("server",
-                            "tool-salvage: unparseable tool markup ({} bytes) "
+                            "tool-salvage: unparseable markup salad ({} bytes) "
                             "suppressed — re-decode yielded no call",
                             text.size());
                 text.clear();
+            } else {
+                // Broadened fence/NAME(args) intent that did not re-decode into
+                // a call — keep the original content (a legit code answer must
+                // not be eaten).
+                MM_LOG_WARN("server",
+                            "tool-salvage: re-decode yielded no call for a "
+                            "fence/call intent ({} bytes) — content preserved",
+                            text.size());
             }
         }
     }
 
-    // Single offered tool: any call must be to it. Coder-Next has a strong
-    // built-in prior for canonical names (emits `run_shell_command` for an
-    // offered `run_command`); when exactly one tool is on offer the mapping is
-    // unambiguous, so normalise the name back to what the client asked for.
-    if (cr.tools.size() == 1 && !toolCalls.empty()) {
-        for (auto& c : toolCalls) {
-            if (c.name != cr.tools.front().name) {
-                MM_LOG_INFO("server",
-                            "tool-call name '{}' remapped to the sole offered "
-                            "tool '{}'",
-                            c.name, cr.tools.front().name);
-                c.name = cr.tools.front().name;
-            }
-        }
+    // Normalise every called name to an offered tool (8.19.13.1): exact,
+    // case-insensitive, or the sole offered tool. Kills read/Read,
+    // run_shell_command/run_command.
+    if (!toolCalls.empty()) {
+        normalizeToolCallNames(toolCalls, cr.tools);
     }
 
     const std::int64_t now   = unixNow();
@@ -1722,9 +1786,27 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
 
                 bool saladSuppressed = false;
                 const char* off = std::getenv("MIMIRMIND_TOOL_SALVAGE");
+                // 8.19.13.1 — broadened tool-intent trigger (blocking twin):
+                // salad OR a fence / XML opener / bare NAME(args) for an offered
+                // tool in the held content.
+                bool streamFenceOrCall = false;
+                for (const char* h : {"```tool_code", "<function", "<tool_call"}) {
+                    if (full.find(h) != std::string::npos) {
+                        streamFenceOrCall = true; break;
+                    }
+                }
+                if (!streamFenceOrCall) {
+                    for (const auto& s : state->toolSpecs) {
+                        if (!s.name.empty()
+                            && full.find(s.name + "(") != std::string::npos) {
+                            streamFenceOrCall = true; break;
+                        }
+                    }
+                }
                 if (calls.empty() && (off == nullptr || off[0] != '0') &&
                     state->style == model::ChatTemplate::Style::QwenChatML &&
-                    model::ToolCallParser::looksLikeToolMarkupSalad(full)) {
+                    (model::ToolCallParser::looksLikeToolMarkupSalad(full)
+                     || streamFenceOrCall)) {
                     // One-shot forced re-decode — the blocking path's twin.
                     constexpr std::string_view kSalvageOpener =
                         "<tool_call>\n<function=";
@@ -1783,14 +1865,9 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                     }
                 }
 
-                // Single offered tool: normalise a canonical-prior name back to
-                // it (blocking-path twin).
-                if (state->toolSpecs.size() == 1 && !calls.empty()) {
-                    for (auto& c : calls) {
-                        if (c.name != state->toolSpecs.front().name) {
-                            c.name = state->toolSpecs.front().name;
-                        }
-                    }
+                // Normalise names to offered tools (blocking-path twin).
+                if (!calls.empty()) {
+                    normalizeToolCallNames(calls, state->toolSpecs);
                 }
                 if (!calls.empty()) {
                     for (const auto& call : calls) {
