@@ -2,6 +2,7 @@
   "schema_version": 1,
   "model_id": "qwen3-coder-next",
   "_note": "Per-(HW x model) overlay: overrides the GB10 HW profile for this 512-expert compressed-tensors checkpoint. Model wins over the HW profile; explicit env still wins over both.",
+  "_note_max_context_tokens": "coder-next is served with runtime.maxContextTokens=32768 (in config.serve.codernext.json, not here — the overlay carries env-style flags, not serve-config fields). That ceiling ALSO sizes the cuDNN SDPA prefill graphs (CudnnSdpaPrefill::setMaxSeqLen tracks it via ServingSession::ensureServingState), so raising it there both admits longer prompts AND keeps them on the fast fused-flash path. Real Claude Code requests are ~24k tokens; 8192 rejected every turn.",
   "flags": {
     "MIMIRMIND_GROUPED_MOE": {
       "value": 3,
@@ -12,6 +13,11 @@
       "value": 0,
       "apply": true,
       "effect": "OFF. The F32->BF16 TF32-TC prefill GEMM (matmul_bf16_gemm_tf32_tc) illegal-accesses on this checkpoint at large prefill. The HW profile has it apply:true value:1 (validated on qwen3.6, model-blind); this overlay pins it off for coder-next."
+    },
+    "MIMIRMIND_ATTN_CUDNN_PAGED": {
+      "value": 1,
+      "apply": true,
+      "effect": "ON. Routes the serving paged-prefill full-attention through the cuDNN 9 SDPA fused-flash path instead of the CUDA-core paged-causal kernel. Only a win now that the cuDNN cap tracks maxContextTokens (was hardcoded 8192): head_dim=256 attention 22714-tok call 13623ms->179ms; end-to-end 22k prefill 240s->84.5s. Needs kvDtype F32/FP16/FP8 (coder-next serving kv=fp8, ok)."
     }
   }
 }
