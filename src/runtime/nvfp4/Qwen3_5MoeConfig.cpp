@@ -3,6 +3,8 @@
 
 #include "runtime/nvfp4/Qwen3_5MoeConfig.hpp"
 
+#include "core/log/Log.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -216,6 +218,75 @@ model::LlmConfig parseQwen3_5MoeSafetensorsConfig(std::string_view configJson) {
     } else if (cfg.ssmConvKernel > 0 && interval > 0) {
         for (std::uint32_t b = 0; b < cfg.blockCount; ++b) {
             cfg.recurrentLayerPattern.push_back((b + 1) % interval != 0);
+        }
+    }
+
+    // --- Config hardening. Read the knobs the engine currently ASSUMES and
+    // fail (or loudly warn) on values it does not implement, instead of silently
+    // mis-loading. The dropped partial_rotary_factor (recall-killer on
+    // qwen3-coder-next) was exactly this class of silent gap: a config key the
+    // parser never read, defaulted wrong, and corrupted the forward pass with no
+    // signal. These guards are no-ops for coder-next + qwen3.6 (whose values all
+    // match the assumptions) and only fire for a future qwen3.x variant that
+    // diverges.
+    auto optB = [&](const char* key, bool def) -> bool {
+        return (c.contains(key) && c[key].is_boolean())
+                   ? c[key].get<bool>() : def;
+    };
+    auto optS = [&](const char* key) -> std::string {
+        return (c.contains(key) && c[key].is_string())
+                   ? c[key].get<std::string>() : std::string{};
+    };
+
+    // Hard-unsupported: these would silently corrupt output. Fail fast, name it.
+    if (optB("attention_bias", false)) {
+        fail("attention_bias=true is not supported (no Q/K/V/O bias is loaded)");
+    }
+    if (optB("use_sliding_window", false)) {
+        fail("use_sliding_window=true is not supported (attention runs full "
+             "window; the sliding-window size is hard-wired to 0)");
+    }
+    const std::string act = optS("hidden_act");
+    if (!act.empty() && act != "silu") {
+        fail("hidden_act '" + act + "' is not supported (SiLU is assumed)");
+    }
+    const std::uint32_t sparseStep = optU("decoder_sparse_step", 1);
+    const bool mlpOnly = c.contains("mlp_only_layers")
+                      && c["mlp_only_layers"].is_array()
+                      && !c["mlp_only_layers"].empty();
+    if (sparseStep != 1 || mlpOnly) {
+        fail("dense/MoE layer interleave is not supported (decoder_sparse_step="
+             + std::to_string(sparseStep) + ", mlp_only_layers "
+             + (mlpOnly ? "non-empty" : "empty")
+             + "); every non-attention layer is loaded as MoE");
+    }
+
+    // Softer mismatches: the engine has ONE fixed behaviour that may not match a
+    // divergent checkpoint. Warn loudly (either it mostly works, or the weight
+    // load fails later with its own clear error) rather than hard-failing.
+    if (c.contains("norm_topk_prob") && c["norm_topk_prob"].is_boolean()
+        && !c["norm_topk_prob"].get<bool>()) {
+        MM_LOG_WARN("model",
+                    "{}: config sets norm_topk_prob=false, but the MoE router "
+                    "always renormalises the top-K weights to sum 1",
+                    cfg.architecture);
+    }
+    if (optB("tie_word_embeddings", false)) {
+        MM_LOG_WARN("model",
+                    "{}: tie_word_embeddings=true; a separate lm_head tensor is "
+                    "still expected (weight load will fail if it is absent)",
+                    cfg.architecture);
+    }
+    if (c.contains("rope_parameters") && c["rope_parameters"].is_object()) {
+        const auto& rp = c["rope_parameters"];
+        if (rp.contains("mrope_interleaved")
+            && rp["mrope_interleaved"].is_boolean()
+            && !rp["mrope_interleaved"].get<bool>()) {
+            MM_LOG_WARN("model",
+                        "{}: rope_parameters.mrope_interleaved=false is not "
+                        "implemented; the IMRoPE kernel applies the interleaved "
+                        "position-axis sector rule",
+                        cfg.architecture);
         }
     }
 
