@@ -895,6 +895,16 @@ void InferenceEngine::finalizeLoad() {
                             "  profile applied: grouped-MoE path -> mode {}",
                             mode);
             }
+            // Prefill chunk size (model overlay). Larger chunks cut the per-chunk
+            // paged-KV re-gather of the cuDNN prefill path (O(n^2) across chunks)
+            // while staying memory-bounded; ServingSession reads it via getenv.
+            if (picks->applyPrefillChunk &&
+                std::getenv("MIMIRMIND_PREFILL_CHUNK") == nullptr) {
+                const std::string c = std::to_string(*picks->applyPrefillChunk);
+                ::setenv("MIMIRMIND_PREFILL_CHUNK", c.c_str(), 1);
+                MM_LOG_INFO("probe",
+                            "  profile applied: prefill chunk -> {} tokens", c);
+            }
         }
     }
 

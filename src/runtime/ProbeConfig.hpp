@@ -54,6 +54,7 @@ struct ProbePicks {
     // not the HW profile, because the right value differs per checkpoint on the
     // same GPU. nullopt = keep code-default / env.
     std::optional<int> applyGroupedMoe;
+    std::optional<int> applyPrefillChunk;   // MIMIRMIND_PREFILL_CHUNK (tokens)
 };
 
 /**

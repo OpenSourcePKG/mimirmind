@@ -44,6 +44,7 @@ void parseFlagsBlock(const nlohmann::json& flags, ProbePicks& picks) {
     if (auto v = readFlag("MIMIRMIND_MOE_SILU_FUSE"))     picks.applyMoeSiluFuse = v;
     if (auto v = readIntFlag("MIMIRMIND_MOE_DECODE_REG")) picks.applyMoeDecodeReg = v;
     if (auto v = readIntFlag("MIMIRMIND_GROUPED_MOE"))    picks.applyGroupedMoe = v;
+    if (auto v = readIntFlag("MIMIRMIND_PREFILL_CHUNK"))  picks.applyPrefillChunk = v;
 }
 
 } // namespace
@@ -168,6 +169,7 @@ void mergeOverlay(ProbePicks& base, const ProbePicks& over) {
     if (over.applyMoeSiluFuse)      base.applyMoeSiluFuse      = over.applyMoeSiluFuse;
     if (over.applyMoeDecodeReg)     base.applyMoeDecodeReg     = over.applyMoeDecodeReg;
     if (over.applyGroupedMoe)       base.applyGroupedMoe       = over.applyGroupedMoe;
+    if (over.applyPrefillChunk)     base.applyPrefillChunk     = over.applyPrefillChunk;
 }
 
 } // namespace mimirmind::runtime

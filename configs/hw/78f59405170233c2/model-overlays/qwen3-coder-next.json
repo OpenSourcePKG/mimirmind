@@ -18,6 +18,11 @@
       "value": 1,
       "apply": true,
       "effect": "ON. Routes the serving paged-prefill full-attention through the cuDNN 9 SDPA fused-flash path instead of the CUDA-core paged-causal kernel. Only a win now that the cuDNN cap tracks maxContextTokens (was hardcoded 8192): head_dim=256 attention 22714-tok call 13623ms->179ms; end-to-end 22k prefill 240s->84.5s. Needs kvDtype F32/FP16/FP8 (coder-next serving kv=fp8, ok)."
+    },
+    "MIMIRMIND_PREFILL_CHUNK": {
+      "value": 8192,
+      "apply": true,
+      "effect": "Prefill chunk = 8192 tokens (default 512). The cuDNN paged-prefill re-gathers the whole paged-KV prefix into a contiguous buffer every chunk (O(n^2) across chunks); bigger chunks mean far fewer re-gathers while staying memory-bounded (8192-row scratch, unlike a full single-chunk 32768). 22k prefill 84.5s (chunk 512) -> 53.2s (chunk 8192), = 240s->53s (4.5x) end-to-end vs the pre-cuDNN-fix baseline. Recall 3/3 unchanged."
     }
   }
 }
