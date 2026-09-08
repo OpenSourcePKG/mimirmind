@@ -57,8 +57,13 @@ std::string ebnfLiteralSafe(const std::string& s) {
 struct TokContext {
     std::shared_ptr<xgrammar::TokenizerInfo>  info;
     std::shared_ptr<xgrammar::GrammarCompiler> compiler;
-    std::int32_t                              triggerToken{-1};
     int                                       vocab{0};
+    // Compiled-grammar cache keyed by the EBNF string — CompileGrammar
+    // preprocesses against the whole (~150k) vocab, so it must run once per
+    // tool-set, not once per request.
+    std::mutex                                 compileMtx;
+    std::map<std::string,
+             std::shared_ptr<xgrammar::CompiledGrammar>> compiledCache;
 };
 
 std::shared_ptr<TokContext> tokContext(const Tokenizer& tok) {
@@ -88,8 +93,10 @@ std::shared_ptr<TokContext> tokContext(const Tokenizer& tok) {
         stops.empty() ? std::nullopt
                       : std::optional<std::vector<std::int32_t>>{stops});
     ctx->compiler = std::make_shared<xgrammar::GrammarCompiler>(*ctx->info);
-    ctx->triggerToken = tok.findToken("<tool_call>");
-    ctx->vocab = vocab;
+    // Authoritative size for the bitmask: xgrammar may pad the vocab, and
+    // FillNextTokenBitmask writes (GetVocabSize()+31)/32 int32 words — sizing
+    // the buffer by the raw tokenizer vocab would let it write out of range.
+    ctx->vocab = ctx->info->GetVocabSize();
     cache.emplace(&tok, ctx);
     return ctx;
 }
@@ -102,7 +109,6 @@ struct ToolCallConstraint::Impl {
     std::unique_ptr<xgrammar::GrammarMatcher>     matcher;   // non-null while in a call
     std::vector<std::int32_t>                     bitmask;   // (vocab+31)/32 ints
     int                                           vocab{0};
-    std::int32_t                                  trigger{-1};
     bool                                          active{false};
 };
 
@@ -126,10 +132,12 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
     // alternative is one offered tool with that tool's keys -> NAME and KEY are
     // both grammar-forced; VALUE is any text.
     std::string ebnf;
-    // Value = any run of chars up to the closer's '<'. Bounding the class (vs
-    // full unicode) keeps the compiled grammar + per-step mask cheap; values
-    // that legitimately contain '<' just end the parameter early, which the
-    // downstream parser tolerates.
+    // Value = any run of chars up to the closer's '<'. Crucially the parameter
+    // terminator starts with '<' (`</parameter>`), NOT with '\n', so [^<]*
+    // ends DETERMINISTICALLY at the first '<' — an ambiguous "\n</parameter>"
+    // terminator lets [^<]* also eat the '\n', which explodes the Earley parser
+    // state (and hangs CompileGrammar). Values that legitimately contain '<'
+    // just end the parameter early, which the downstream parser tolerates.
     ebnf += "value ::= [^<]*\n";
     std::string bodyAlts;
     for (std::size_t i = 0; i < tools.size(); ++i) {
@@ -143,7 +151,7 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
         for (const std::string& k : keys) {
             if (!paramAlts.empty()) { paramAlts += " | "; }
             paramAlts += "\"<parameter=" + ebnfLiteralSafe(k)
-                       + ">\\n\" value \"\\n</parameter>\\n\"";
+                       + ">\\n\" value \"</parameter>\\n\"";
         }
         if (paramAlts.empty()) {
             ebnf += pr + " ::= \"\"\n";
@@ -156,9 +164,21 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
             "loop_after_dispatch=true)\n";
 
     try {
-        const xgrammar::Grammar g = xgrammar::Grammar::FromEBNF(ebnf, "root");
-        _impl->compiled = std::make_shared<xgrammar::CompiledGrammar>(
-            _impl->tctx->compiler->CompileGrammar(g));
+        auto& tc = *_impl->tctx;
+        std::lock_guard<std::mutex> lk{tc.compileMtx};
+        const auto cit = tc.compiledCache.find(ebnf);
+        if (cit != tc.compiledCache.end()) {
+            _impl->compiled = cit->second;   // reuse across requests
+        } else {
+            const xgrammar::Grammar g =
+                xgrammar::Grammar::FromEBNF(ebnf, "root");
+            _impl->compiled = std::make_shared<xgrammar::CompiledGrammar>(
+                tc.compiler->CompileGrammar(g));
+            tc.compiledCache.emplace(ebnf, _impl->compiled);
+            MM_LOG_INFO("tgram",
+                        "compiled tool-call grammar ({} tools, {} cached)",
+                        tools.size(), tc.compiledCache.size());
+        }
     } catch (const std::exception& e) {
         MM_LOG_WARN("tgram", "tool-call grammar compile failed: {}", e.what());
         _impl.reset();
@@ -192,24 +212,33 @@ void ToolCallConstraint::reset() noexcept {
 
 void ToolCallConstraint::advance(std::int32_t token) {
     if (!_impl || !_impl->active || !_impl->matcher) { return; }
-    // Feed every token; TagDispatch keeps prose free and only constrains inside
-    // a dispatched call body. A rejected token (should not happen when the mask
-    // is applied) is ignored so the sampler never stalls.
+    // The lm-head vocab can be padded past the tokenizer vocab the matcher was
+    // built with; such padding ids never appear in a valid call (masked out
+    // inside a call body) and are not in xgrammar's tables, so skip them rather
+    // than index out of range. Feed every in-range token: TagDispatch keeps
+    // prose free and only constrains inside a dispatched call body.
+    if (token < 0 || token >= _impl->vocab) { return; }
     _impl->matcher->AcceptToken(token);
 }
 
 void ToolCallConstraint::maskLogits(float* logits, std::size_t vocab) const {
     if (!_impl || !_impl->active || !_impl->matcher) { return; }
 
+    // ApplyTokenBitmaskInplaceCPU reads shape[0]/strides[0] as a batch row: it
+    // dereferences strides[0] UNCONDITIONALLY (no compact/nullptr fast path), so
+    // both tensors MUST carry an explicit strides array — a nullptr strides
+    // (valid DLPack for a contiguous tensor) segfaults inside xgrammar.
     DLTensor bm{};
     std::int64_t bmShape[1] = {
+        static_cast<std::int64_t>(_impl->bitmask.size())};
+    std::int64_t bmStride[1] = {
         static_cast<std::int64_t>(_impl->bitmask.size())};
     bm.data        = _impl->bitmask.data();
     bm.device      = DLDevice{kDLCPU, 0};
     bm.ndim        = 1;
     bm.dtype       = DLDataType{kDLInt, 32, 1};
     bm.shape       = bmShape;
-    bm.strides     = nullptr;
+    bm.strides     = bmStride;
     bm.byte_offset = 0;
 
     if (!_impl->matcher->FillNextTokenBitmask(&bm)) {
@@ -221,13 +250,14 @@ void ToolCallConstraint::maskLogits(float* logits, std::size_t vocab) const {
     // range when the lm-head vocab is padded past the tokenizer vocab.
     const int n = std::min(static_cast<int>(vocab), _impl->vocab);
     DLTensor lt{};
-    std::int64_t ltShape[1] = {static_cast<std::int64_t>(n)};
+    std::int64_t ltShape[1]  = {static_cast<std::int64_t>(n)};
+    std::int64_t ltStride[1] = {static_cast<std::int64_t>(n)};
     lt.data        = logits;
     lt.device      = DLDevice{kDLCPU, 0};
     lt.ndim        = 1;
     lt.dtype       = DLDataType{kDLFloat, 32, 1};
     lt.shape       = ltShape;
-    lt.strides     = nullptr;
+    lt.strides     = ltStride;
     lt.byte_offset = 0;
 
     xgrammar::ApplyTokenBitmaskInplaceCPU(&lt, bm, n);
