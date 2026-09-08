@@ -90,6 +90,32 @@ model::LlmConfig parseQwen3_5MoeSafetensorsConfig(std::string_view configJson) {
     }
     cfg.ropeFreqBaseSwa = cfg.ropeFreqBase;
 
+    // Partial rotary WITHOUT mrope_section. Qwen3-Next text-only checkpoints
+    // (e.g. qwen3-coder-next: Qwen3NextForCausalLM) carry a flat `rope_theta`
+    // plus `partial_rotary_factor` and NO `rope_parameters`/`mrope_section`.
+    // The block above is the ONLY place ropeSections is populated, so such a
+    // checkpoint falls through with EMPTY sections -> the IMRoPE kernel sees
+    // sectDims==0 and degenerates to FULL-head rotation (rotaryDim == head_dim)
+    // instead of rotating only head_dim*partial_rotary_factor dims. That
+    // corrupts the positional encoding on every full-attention layer, so
+    // long-range attention (and thus long-context recall) collapses to a
+    // recency-only window. Derive the single partial rotary section from
+    // partial_rotary_factor. Text-only -> a single section suffices (the four
+    // IMRoPE position axes are all the sequence position), and the sector rule
+    // then reduces to plain partial NeoX RoPE over the first rotaryDim dims.
+    if (cfg.ropeSections.empty()) {
+        const float prf = optF("partial_rotary_factor", 1.0F);
+        if (prf > 0.0F && prf < 1.0F && cfg.keyLength > 0) {
+            const std::int32_t rotaryDim =
+                static_cast<std::int32_t>(
+                    static_cast<float>(cfg.keyLength) * prf);   // 256*0.25 = 64
+            const std::int32_t sectDims = rotaryDim / 2;        // 32 pairs
+            if (sectDims > 0) {
+                cfg.ropeSections = {sectDims, 0, 0, 0};
+            }
+        }
+    }
+
     // YaRN / rope_scaling long-context extension (roadmap 8.8). HF ships it as
     // a `rope_scaling` dict (top-level; some checkpoints nest it under
     // rope_parameters). Absent ⇒ base RoPE ⇒ bit-identical to today. Consumed
