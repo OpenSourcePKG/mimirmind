@@ -288,6 +288,22 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     constexpr const char* kQwenAgentPreamble =
         "You are Qwen, a helpful AI assistant that can interact with a "
         "computer to solve tasks.";
+    // Coder-Next has a strong Gemma/Gemini `tool_code` prior: given the
+    // template's own (soft) format hint it still replies with a
+    // ```tool_code / ```python / ```bash / ```json fence containing a
+    // Python-style NAME(args) call instead of the <tool_call><function=…>
+    // XML the parser needs. A firm directive flips it to the XML shape (the
+    // model is proven capable — an explicit system prompt elicits it). Only
+    // appended for the structured (coder-next) dialect; qwen3.6 is untouched.
+    constexpr const char* kXmlCallReinforce =
+        "\n\nCRITICAL OUTPUT FORMAT: When you decide to use a function, you "
+        "MUST reply with ONLY the XML block below and nothing else:\n"
+        "<tool_call>\n<function=THE_FUNCTION_NAME>\n<parameter=THE_ARG_NAME>\n"
+        "the value\n</parameter>\n</function>\n</tool_call>\n"
+        "Do NOT write the call as Python, bash, JSON, or a ```tool_code / "
+        "```python / ```bash / ```json code fence. Do NOT write it as "
+        "name(args). Use ONLY exactly one offered function name. If no "
+        "function is needed, answer normally in prose.";
     std::string toolsBlock;
     if (!tools.empty() && !xmlTools) {
         toolsBlock =
@@ -314,6 +330,9 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
             }
         }
         toolsBlock += kQwenXmlTail;
+        if (structuredXml) {
+            toolsBlock += kXmlCallReinforce;
+        }
     }
 
     auto emitTurn = [&](std::string_view role, std::string_view content) {

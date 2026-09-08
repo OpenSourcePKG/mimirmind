@@ -817,6 +817,20 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                     toolCalls = model::ToolCallParser::parseBareJson(text, toolNames);
                 }
             }
+            // tool_code fallback: Coder-Next's native auto reply is a
+            // ```tool_code / ```python fence with a Python NAME(args) call
+            // (no XML envelope). Offered-name + call-syntax gated.
+            if (toolCalls.empty()) {
+                toolCalls = model::ToolCallParser::parseToolCodeCall(
+                    text, cr.tools);
+                if (!toolCalls.empty()) {
+                    MM_LOG_INFO("server",
+                                "tool-call parsed from native tool_code fence "
+                                "({} call(s))",
+                                toolCalls.size());
+                    text.clear();   // the fence was the whole reply
+                }
+            }
         }
     }
 
@@ -881,6 +895,22 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                             "suppressed — re-decode yielded no call",
                             text.size());
                 text.clear();
+            }
+        }
+    }
+
+    // Single offered tool: any call must be to it. Coder-Next has a strong
+    // built-in prior for canonical names (emits `run_shell_command` for an
+    // offered `run_command`); when exactly one tool is on offer the mapping is
+    // unambiguous, so normalise the name back to what the client asked for.
+    if (cr.tools.size() == 1 && !toolCalls.empty()) {
+        for (auto& c : toolCalls) {
+            if (c.name != cr.tools.front().name) {
+                MM_LOG_INFO("server",
+                            "tool-call name '{}' remapped to the sole offered "
+                            "tool '{}'",
+                            c.name, cr.tools.front().name);
+                c.name = cr.tools.front().name;
             }
         }
     }
@@ -1677,6 +1707,18 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                         calls = model::ToolCallParser::parseBareJson(full, names);
                     }
                 }
+                if (calls.empty()) {
+                    // Coder-Next native ```tool_code NAME(args) reply (blocking
+                    // path twin). Offered-name + call-syntax gated.
+                    calls = model::ToolCallParser::parseToolCodeCall(
+                        full, state->toolSpecs);
+                    if (!calls.empty()) {
+                        MM_LOG_INFO("server",
+                                    "stream {}: tool-call parsed from native "
+                                    "tool_code fence ({} call(s))",
+                                    state->respId, calls.size());
+                    }
+                }
 
                 bool saladSuppressed = false;
                 const char* off = std::getenv("MIMIRMIND_TOOL_SALVAGE");
@@ -1741,6 +1783,15 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                     }
                 }
 
+                // Single offered tool: normalise a canonical-prior name back to
+                // it (blocking-path twin).
+                if (state->toolSpecs.size() == 1 && !calls.empty()) {
+                    for (auto& c : calls) {
+                        if (c.name != state->toolSpecs.front().name) {
+                            c.name = state->toolSpecs.front().name;
+                        }
+                    }
+                }
                 if (!calls.empty()) {
                     for (const auto& call : calls) {
                         const std::string callId =

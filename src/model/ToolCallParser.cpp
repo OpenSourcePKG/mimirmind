@@ -486,6 +486,192 @@ bool ToolCallParser::looksLikeBareQwenXmlCall(
     return false;
 }
 
+namespace {
+
+/// Ordered parameter names of a tool (JSON schema `properties`, insertion
+/// order), for mapping positional Python-call args.
+std::vector<std::string> orderedParams(std::span<const ToolSpec> specs,
+                                       const std::string& name) {
+    for (const auto& s : specs) {
+        if (s.name != name) { continue; }
+        const json tool = json::parse(s.toolJson, nullptr, false);
+        if (!tool.is_discarded() && tool.contains("function")
+            && tool["function"].is_object()
+            && tool["function"].contains("parameters")
+            && tool["function"]["parameters"].is_object()
+            && tool["function"]["parameters"].contains("properties")
+            && tool["function"]["parameters"]["properties"].is_object()) {
+            std::vector<std::string> keys;
+            const json& props = tool["function"]["parameters"]["properties"];
+            for (auto it = props.begin(); it != props.end(); ++it) {
+                keys.push_back(it.key());
+            }
+            return keys;
+        }
+    }
+    return {};
+}
+
+/// Split a call arg-list on top-level commas (respecting quotes + brackets).
+std::vector<std::string> splitTopLevel(const std::string& s) {
+    std::vector<std::string> out;
+    std::size_t start = 0, depth = 0;
+    bool inStr = false; char q = 0;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (inStr) {
+            if (c == '\\') { ++i; continue; }
+            if (c == q) { inStr = false; }
+            continue;
+        }
+        if (c == '"' || c == '\'') { inStr = true; q = c; }
+        else if (c == '(' || c == '[' || c == '{') { ++depth; }
+        else if (c == ')' || c == ']' || c == '}') { if (depth) --depth; }
+        else if (c == ',' && depth == 0) {
+            out.push_back(s.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    if (start <= s.size()) { out.push_back(s.substr(start)); }
+    return out;
+}
+
+/// Parse a Python/JSON literal value into JSON (best effort; unknown -> string).
+json parsePyValue(const std::string& raw) {
+    const std::string v = trimws(raw);
+    if (v.size() >= 2 && (v.front() == '"' || v.front() == '\'')
+        && v.back() == v.front()) {
+        // String literal: unescape the common sequences.
+        std::string out;
+        for (std::size_t i = 1; i + 1 < v.size(); ++i) {
+            if (v[i] == '\\' && i + 2 < v.size()) {
+                const char n = v[i + 1];
+                out += (n == 'n') ? '\n' : (n == 't') ? '\t'
+                     : (n == 'r') ? '\r' : n;
+                ++i;
+            } else {
+                out += v[i];
+            }
+        }
+        return out;
+    }
+    if (v == "true" || v == "True")   { return true; }
+    if (v == "false" || v == "False") { return false; }
+    if (v == "None" || v == "null")   { return json(nullptr); }
+    // JSON array/object (Python single-quote variants won't always parse — fall
+    // back to the raw string on failure).
+    if (!v.empty() && (v.front() == '[' || v.front() == '{')) {
+        const json j = json::parse(v, nullptr, false);
+        if (!j.is_discarded()) { return j; }
+    }
+    // number?
+    try {
+        std::size_t used = 0;
+        if (v.find('.') != std::string::npos || v.find('e') != std::string::npos
+            || v.find('E') != std::string::npos) {
+            const double d = std::stod(v, &used);
+            if (used == v.size()) { return d; }
+        } else {
+            const long long n = std::stoll(v, &used);
+            if (used == v.size()) { return static_cast<std::int64_t>(n); }
+        }
+    } catch (...) {
+    }
+    return v;   // bare word / identifier / anything else -> string
+}
+
+} // namespace
+
+std::vector<ToolCall> ToolCallParser::parseToolCodeCall(
+        std::string_view text, std::span<const ToolSpec> specs) {
+    // Coder-Next's native auto reply is a Gemma/Gemini `tool_code` fence with a
+    // Python-style NAME(args) call, e.g.  ```tool_code\nrun_command("ls -la")\n```
+    // (also ```python/```bash/```json, or unfenced). Match an OFFERED tool name
+    // immediately followed by a balanced `(...)`, map positional args to the
+    // schema's parameter order and `key=value` to named, and emit a call. The
+    // offered-name gate makes a false positive (prose mentioning a tool) require
+    // an actual call syntax `name(...)`.
+    const std::string s{text};
+    std::vector<ToolCall> calls;
+    for (const auto& spec : specs) {
+        const std::string& name = spec.name;
+        if (name.empty()) { continue; }
+        std::size_t p = 0;
+        while ((p = s.find(name, p)) != std::string::npos) {
+            const std::size_t after = p + name.size();
+            // identifier boundary before the name
+            if (p > 0 && (std::isalnum(static_cast<unsigned char>(s[p - 1]))
+                          || s[p - 1] == '_' || s[p - 1] == '.')) {
+                p = after; continue;
+            }
+            std::size_t q = after;
+            while (q < s.size() && (s[q] == ' ' || s[q] == '\t')) { ++q; }
+            if (q >= s.size() || s[q] != '(') { p = after; continue; }
+            // balanced parens
+            std::size_t depth = 0, i = q, end = std::string::npos;
+            bool inStr = false; char qc = 0;
+            for (; i < s.size(); ++i) {
+                const char c = s[i];
+                if (inStr) {
+                    if (c == '\\') { ++i; continue; }
+                    if (c == qc) { inStr = false; }
+                    continue;
+                }
+                if (c == '"' || c == '\'') { inStr = true; qc = c; }
+                else if (c == '(') { ++depth; }
+                else if (c == ')') { if (--depth == 0) { end = i; break; } }
+            }
+            if (end == std::string::npos) { p = after; continue; }
+            const std::string argstr = s.substr(q + 1, end - q - 1);
+            json args = json::object();
+            const std::vector<std::string> ordered = orderedParams(specs, name);
+            std::size_t posIdx = 0;
+            for (const std::string& part : splitTopLevel(argstr)) {
+                const std::string a = trimws(part);
+                if (a.empty()) { continue; }
+                // kwarg detection: leading identifier then '=' (not '==').
+                std::size_t eq = std::string::npos;
+                {
+                    bool istr = false; char c2 = 0;
+                    for (std::size_t j = 0; j < a.size(); ++j) {
+                        const char c = a[j];
+                        if (istr) { if (c == '\\') { ++j; continue; }
+                                    if (c == c2) istr = false; continue; }
+                        if (c == '"' || c == '\'') { istr = true; c2 = c; }
+                        else if (c == '=' && (j + 1 >= a.size() || a[j + 1] != '=')
+                                 && (j == 0 || a[j - 1] != '!'
+                                     && a[j - 1] != '<' && a[j - 1] != '>')) {
+                            eq = j; break;
+                        }
+                        else if (c == '(' || c == '[' || c == '{') { break; }
+                    }
+                }
+                std::string key, val;
+                if (eq != std::string::npos) {
+                    key = trimws(a.substr(0, eq));
+                    val = a.substr(eq + 1);
+                } else {
+                    key = (posIdx < ordered.size())
+                              ? ordered[posIdx]
+                              : ("arg" + std::to_string(posIdx));
+                    val = a;
+                    ++posIdx;
+                }
+                if (!key.empty()) { args[key] = parsePyValue(val); }
+            }
+            ToolCall call;
+            call.name = name;
+            call.argumentsJson = args.dump(-1, ' ', false,
+                                           json::error_handler_t::replace);
+            call.id = "call_" + std::to_string(calls.size());
+            calls.push_back(std::move(call));
+            break;   // one call per offered tool
+        }
+        if (!calls.empty()) { break; }   // first matched call wins
+    }
+    return calls;
+}
+
 std::vector<ToolCall> ToolCallParser::parseQwenXmlNoisy(
         std::string_view text, std::span<const ToolSpec> specs) {
     // 1. Drop special-token literals the model spuriously emitted mid-call.

@@ -76,6 +76,15 @@ public:
     [[nodiscard]] static std::vector<ToolCall>
     parseQwenXmlNoisy(std::string_view text, std::span<const ToolSpec> specs);
 
+    /// Parse Coder-Next's native Gemma/Gemini `tool_code` reply: a fenced (or
+    /// unfenced) Python-style `NAME(args)` call where NAME is an OFFERED tool.
+    /// Positional args map to the tool's JSON-schema parameter order,
+    /// `key=value` to named. The offered-name + `name(...)` call-syntax gate
+    /// keeps prose that merely mentions a tool from parsing as a call. Used as
+    /// a fallback when the XML/JSON dialects match nothing.
+    [[nodiscard]] static std::vector<ToolCall>
+    parseToolCodeCall(std::string_view text, std::span<const ToolSpec> specs);
+
     /// Cheap pre-check for `parseQwenXmlBare`: `text` contains
     /// `<function=NAME` for at least one offered tool.
     [[nodiscard]] static bool
