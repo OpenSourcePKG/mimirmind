@@ -68,6 +68,13 @@ struct ResidentModelMemory {
     bool        servingActive{false};
     std::size_t kvResidentBytes{0};
     std::size_t kvNumBlocks{0};
+    // Role the model plays. "chat" is the generative decoder (the only kind in
+    // the generative pool that `capacity`/`mode` describe); "embedding" and
+    // "rerank" are stateless encoder engines that live OUTSIDE that pool and
+    // carry no paged KV cache. Defaults keep chat callers (RequestDispatcher,
+    // ModelProvider) working unchanged via aggregate init.
+    std::string role{"chat"};            // "chat" | "embedding" | "rerank"
+    bool        inGenerativePool{true};  // false for encoder engines
 };
 
 /**

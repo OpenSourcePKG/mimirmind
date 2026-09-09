@@ -161,6 +161,20 @@ struct ApiServer::Impl {
         // eager default+extras first and falls back to the provider for
         // anything else (see RequestDispatcher::resolveTarget).
         dispatcher.setModelProvider(cfg.modelProvider);
+        // GET /v1/system/memory enumerates the non-pool encoder engines
+        // (embedding/rerank) per-model alongside chat. Wired here (not at
+        // statusBuilder construction) because the handlers are constructed
+        // after statusBuilder in the member list.
+        statusBuilder.setAuxModelMemoryProvider([this] {
+            std::vector<ResidentModelMemory> v;
+            for (auto& m : rerankHandler.residentModelsMemory()) {
+                v.push_back(std::move(m));
+            }
+            for (auto& m : embeddingsHandler.residentModelsMemory()) {
+                v.push_back(std::move(m));
+            }
+            return v;
+        });
         makeServer();
         installRoutes();
     }

@@ -4,13 +4,16 @@
 #pragma once
 
 #include "runtime/thermal/PowerMonitor.hpp"
+#include "server/ModelProvider.hpp"   // ResidentModelMemory
 
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace mimirmind::runtime {
 class InferenceEngine;
@@ -58,6 +61,17 @@ public:
     /// residual) + allocator fragmentation where available (8.16 Stage A).
     [[nodiscard]] nlohmann::json buildMemory() const;
 
+    /// Register a provider of non-generative-pool models (embedding / rerank
+    /// encoder engines) so `buildMemory()` enumerates them per-model in
+    /// `models.resident[]` alongside the chat engine, instead of leaving their
+    /// weights folded only into the aggregate allocator total. Set once by
+    /// ApiServer after the handlers are constructed; may return an empty
+    /// vector when no encoder engines are loaded.
+    void setAuxModelMemoryProvider(
+        std::function<std::vector<ResidentModelMemory>()> provider) {
+        _auxModelMemory = std::move(provider);
+    }
+
 private:
     [[nodiscard]] nlohmann::json buildPerfRegressionBlock() const;
     [[nodiscard]] nlohmann::json buildGpuClockBlock() const;
@@ -69,6 +83,10 @@ private:
     RequestDispatcher&        _dispatcher;
     RequestTracker&           _requestTracker;
     std::string               _modelId;
+
+    // Non-pool encoder engines (embedding/rerank) memory snapshot provider.
+    // Empty until ApiServer wires it; returns an empty vector if unset.
+    std::function<std::vector<ResidentModelMemory>()> _auxModelMemory{};
 
     // RAPL baseline snapshot taken at construction — represents "engine
     // idle, server warmed up" since ApiServer wires this up after the

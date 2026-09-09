@@ -59,6 +59,10 @@ public:
     [[nodiscard]] float scorePair(std::string_view query,
                                   std::string_view document) const;
 
+    /// Device bytes held by this reranker's weights (for /v1/system/memory
+    /// per-model attribution). No paged KV cache — encoders are stateless.
+    [[nodiscard]] std::size_t weightBytes() const noexcept { return _model.weightBytes(); }
+
 private:
     EncoderModel               _model;
     model::XlmRobertaTokenizer _tokenizer;

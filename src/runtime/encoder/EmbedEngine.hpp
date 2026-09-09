@@ -52,6 +52,10 @@ public:
     /// Embedding dimensionality (= encoder hidden size).
     [[nodiscard]] std::size_t dim() const noexcept { return _model.config().hidden; }
 
+    /// Device bytes held by this embedding model's weights (for
+    /// /v1/system/memory per-model attribution). No paged KV cache.
+    [[nodiscard]] std::size_t weightBytes() const noexcept { return _model.weightBytes(); }
+
 private:
     EncoderModel               _model;
     model::XlmRobertaTokenizer _tokenizer;

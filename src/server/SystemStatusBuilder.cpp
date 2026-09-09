@@ -550,9 +550,18 @@ json SystemStatusBuilder::buildMemory() const {
     // separate from the device/category envelope below so a multi-model host
     // can attribute weight/KV bytes per model instead of lumping the extras
     // into `external`.
-    const json models = buildModelsMemoryJson(_dispatcher.residentModelsMemory(),
-                                               _dispatcher.isPoolMode(),
-                                               _dispatcher.poolCapacity());
+    // Combine generative-pool models (chat: the dispatcher's eager default +
+    // co-resident extras + any materialized pool slots) with the non-pool
+    // encoder engines (embedding / rerank) so the per-model attribution covers
+    // EVERY loaded model rather than only chat. Each encoder arrives tagged
+    // role="embedding"/"rerank", in_generative_pool=false.
+    std::vector<ResidentModelMemory> resident = _dispatcher.residentModelsMemory();
+    if (_auxModelMemory) {
+        const auto aux = _auxModelMemory();
+        resident.insert(resident.end(), aux.begin(), aux.end());
+    }
+    json models = buildModelsMemoryJson(resident, _dispatcher.isPoolMode(),
+                                        _dispatcher.poolCapacity());
 
     // Pool (per-request model-switch) mode with no eager anchor engine: there
     // is no global device/category envelope to inspect, but the `models` block
@@ -596,17 +605,51 @@ json SystemStatusBuilder::buildMemory() const {
     // Present only when the backend tracks categories (CUDA today; L0/HIP
     // return zeros -> owner-sum path). This decomposes what used to be one
     // `external` lump into weights/kv_cache/session/scratch/unknown.
-    std::uint64_t allocTracked = 0;
+    std::uint64_t allocTracked    = 0;
+    std::uint64_t weightsAllocLive = 0;   // live bytes in the "weights" category
     json allocatorCategories;
     if (mt.allocCatAvailable) {
         allocatorCategories = json::object();
         for (std::size_t i = 0; i < core::gpu::kAllocCategoryCount; ++i) {
             allocTracked += mt.allocCatLive[i];
-            allocatorCategories[std::string(core::gpu::allocCategoryName(i))] = json{
+            const std::string cat{core::gpu::allocCategoryName(i)};
+            if (cat == "weights") {
+                weightsAllocLive = mt.allocCatLive[i];
+            }
+            allocatorCategories[cat] = json{
                 {"live_bytes", mt.allocCatLive[i]},
                 {"peak_bytes", mt.allocCatPeak[i]},
             };
         }
+
+        // Reconcile the "weights" allocator category against the sum of
+        // per-model logical weight footprints. The residual is real weight
+        // memory that isn't part of any model's logical weights: the chat
+        // engine's ALTERNATE weight layouts built by the active perf flags
+        // (NVFP4 deinterleave, MoE dequant-to-register repack, GDN
+        // projection-fuse, F32/BF16 TC-prefill weight copies) plus cuBLAS/cuDNN
+        // internal weight-format workspaces — all tagged Weights but not owned
+        // by a single model's logical total. Naming it closes the books.
+        std::size_t attributed = 0;
+        for (const auto& r : resident) {
+            attributed += r.weightBytes;
+        }
+        const std::size_t residual =
+            weightsAllocLive > attributed
+                ? static_cast<std::size_t>(weightsAllocLive) - attributed
+                : 0;
+        models["weights_reconciliation"] = json{
+            {"allocator_weights_bytes", weightsAllocLive},
+            {"attributed_bytes",        attributed},
+            {"unattributed_bytes",      residual},
+            {"note", "attributed = Σ per-model weight_bytes (logical weights). "
+                     "unattributed = weight-category buffers not owned by a "
+                     "model's logical total: the chat engine's alternate weight "
+                     "layouts from active perf flags (NVFP4 deinterleave, MoE "
+                     "dequant-register repack, GDN projection-fuse, F32/BF16 "
+                     "TC-prefill weight copies) + cuBLAS/cuDNN weight-format "
+                     "workspaces."},
+        };
     } else {
         allocatorCategories = json{
             {"available", false},

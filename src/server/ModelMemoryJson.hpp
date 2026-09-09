@@ -25,9 +25,17 @@ namespace mimirmind::server {
  * Contract (a downstream consumer parses these exact keys):
  *   { "available": true, "mode": "eager"|"pool", "capacity": <K>,
  *     "resident": [ { "id", "title", "default",
+ *                     "role": "chat"|"embedding"|"rerank",
+ *                     "in_generative_pool": <bool>,
  *                     "weight_bytes",
- *                     "kv": { "serving_active", "resident_bytes", "num_blocks" }? } ] }
- * The `kv` object is omitted when the model has no active serving cache.
+ *                     "kv": { "serving_active": <bool>,
+ *                             "resident_bytes"?, "num_blocks"? } } ] }
+ * `mode`/`capacity` describe the GENERATIVE (chat) pool only; encoder engines
+ * (embedding/rerank) are always present in `resident[]` with
+ * `in_generative_pool:false`. The `kv` object is ALWAYS present so clients
+ * render every model consistently: `serving_active:false` (no
+ * resident_bytes/num_blocks) for models with no paged KV cache — which is
+ * every encoder, and any chat model on the single-session path.
  */
 [[nodiscard]] inline nlohmann::json
 buildModelsMemoryJson(const std::vector<ResidentModelMemory>& resident,
@@ -44,19 +52,26 @@ buildModelsMemoryJson(const std::vector<ResidentModelMemory>& resident,
     json arr = json::array();
     for (const auto& r : resident) {
         json entry{
-            {"id",           r.id},
-            {"title",        r.title},
-            {"default",      r.isDefault},
-            {"weight_bytes", r.weightBytes},
+            {"id",                 r.id},
+            {"title",              r.title},
+            {"default",            r.isDefault},
+            {"role",               r.role},
+            {"in_generative_pool", r.inGenerativePool},
+            {"weight_bytes",       r.weightBytes},
         };
-        // Omit `kv` entirely when the engine has no active serving cache
-        // (single-session generate() path, or a not-yet-serving model).
+        // `kv` is ALWAYS present (self-describing). Models with an active
+        // paged serving cache carry the byte/block detail; encoders and any
+        // single-session model report `serving_active:false` with no detail
+        // (they hold no paged KV cache) so a client never has to special-case
+        // a missing field.
         if (r.servingActive) {
             entry["kv"] = json{
                 {"serving_active", true},
                 {"resident_bytes", r.kvResidentBytes},
                 {"num_blocks",     r.kvNumBlocks},
             };
+        } else {
+            entry["kv"] = json{{"serving_active", false}};
         }
         arr.push_back(std::move(entry));
     }

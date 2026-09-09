@@ -221,11 +221,17 @@ TEST(modelsJson_eager_singleDefault_withKv) {
     EXPECT_EQ(e0.at("kv").at("num_blocks").get<std::size_t>(), std::size_t{32768ULL});
 }
 
-TEST(modelsJson_eager_multiModel_oneDefault_kvOmittedWhenIdle) {
-    std::vector<ResidentModelMemory> resident = {
-        ResidentModelMemory{"primary", "Primary", true,  1000, true,  200, 8},
-        ResidentModelMemory{"embed",   "BGE-M3",  false, 300,  false, 0,   0},
-        ResidentModelMemory{"rerank",  "Rerank",  false, 250,  false, 0,   0}};
+TEST(modelsJson_eager_multiModel_encodersTaggedAndKvAlwaysPresent) {
+    // chat serves (has paged KV); embed/rerank are non-pool encoder engines
+    // tagged by role, no KV cache.
+    ResidentModelMemory chat{"primary", "Primary", true, 1000, true, 200, 8};
+    ResidentModelMemory emb{"embed", "BGE-M3", false, 300, false, 0, 0};
+    emb.role = "embedding";
+    emb.inGenerativePool = false;
+    ResidentModelMemory rr{"rerank", "Rerank", false, 250, false, 0, 0};
+    rr.role = "rerank";
+    rr.inGenerativePool = false;
+    const std::vector<ResidentModelMemory> resident = {chat, emb, rr};
 
     const auto j = buildModelsMemoryJson(resident, /*poolMode=*/false, /*poolCapacity=*/1);
 
@@ -239,14 +245,32 @@ TEST(modelsJson_eager_multiModel_oneDefault_kvOmittedWhenIdle) {
             ++defaults;
         }
         weightSum += e.at("weight_bytes").get<std::size_t>();
+        // `kv` is ALWAYS present now, so a client never special-cases a
+        // missing field.
+        EXPECT_TRUE(e.contains("kv"));
+        EXPECT_TRUE(e.contains("role"));
+        EXPECT_TRUE(e.contains("in_generative_pool"));
     }
     EXPECT_EQ(defaults, 1);                       // exactly one default
     EXPECT_EQ(weightSum, std::size_t{1550});      // 1000 + 300 + 250
 
-    // Idle (non-serving) models omit the kv object entirely.
-    EXPECT_TRUE(j.at("resident").at(0).contains("kv"));    // primary serves
-    EXPECT_TRUE(!j.at("resident").at(1).contains("kv"));   // embed idle
-    EXPECT_TRUE(!j.at("resident").at(2).contains("kv"));   // rerank idle
+    // Chat: role chat, in the pool, KV active.
+    const auto& e0 = j.at("resident").at(0);
+    EXPECT_TRUE(e0.at("role").get<std::string>() == "chat");
+    EXPECT_TRUE(e0.at("in_generative_pool").get<bool>());
+    EXPECT_TRUE(e0.at("kv").at("serving_active").get<bool>());
+
+    // Embedding: tagged, outside the pool, kv present but serving_active:false.
+    const auto& e1 = j.at("resident").at(1);
+    EXPECT_TRUE(e1.at("role").get<std::string>() == "embedding");
+    EXPECT_TRUE(!e1.at("in_generative_pool").get<bool>());
+    EXPECT_TRUE(!e1.at("kv").at("serving_active").get<bool>());
+
+    // Rerank: same.
+    const auto& e2 = j.at("resident").at(2);
+    EXPECT_TRUE(e2.at("role").get<std::string>() == "rerank");
+    EXPECT_TRUE(!e2.at("in_generative_pool").get<bool>());
+    EXPECT_TRUE(!e2.at("kv").at("serving_active").get<bool>());
 }
 
 TEST(modelsJson_pool_reportsModeAndCapacity) {

@@ -4,6 +4,7 @@
 #pragma once
 
 #include "server/ApiServer.hpp"
+#include "server/ModelProvider.hpp"   // ResidentModelMemory
 
 #include <httplib.h>
 
@@ -44,6 +45,11 @@ public:
         std::string title;
     };
     [[nodiscard]] std::vector<ModelInfo> listModels() const;
+
+    /// Per-model weight attribution for GET /v1/system/memory. Each entry is
+    /// tagged role="rerank", inGenerativePool=false, servingActive=false
+    /// (encoders hold no paged KV cache).
+    [[nodiscard]] std::vector<ResidentModelMemory> residentModelsMemory() const;
 
 private:
     struct Slot {

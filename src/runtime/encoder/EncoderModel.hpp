@@ -88,6 +88,13 @@ public:
     /// EncoderRunner must pass to ComputeMatmul::matmulAsync for them.
     [[nodiscard]] core::gguf::GgmlType matmulType() const noexcept { return _matmulType; }
 
+    /// Total device bytes uploaded for this model's weights (embeddings +
+    /// per-layer linears/biases/norms + optional classifier head), counted as
+    /// stored: BF16 linears at 2 B/elem, everything else F32 at 4 B/elem.
+    /// This is the model's logical weight footprint (all tagged
+    /// AllocCategory::Weights); it excludes tokenizer/host buffers.
+    [[nodiscard]] std::size_t weightBytes() const noexcept { return _weightBytes; }
+
     // Embeddings block.
     [[nodiscard]] const float* wordEmb() const noexcept { return _wordEmb; }
     [[nodiscard]] const float* posTable() const noexcept { return _posTable; }
@@ -115,6 +122,7 @@ private:
     core::gguf::GgmlType _matmulType{core::gguf::GgmlType::F32};
 
     std::vector<compute::ComputeBuffer> _owned;   // lifetime of every USM buffer
+    std::size_t _weightBytes{0};                  // Σ uploaded weight bytes (as stored)
     std::vector<EncoderLayerWeights>    _layers;
 
     const float* _wordEmb{};

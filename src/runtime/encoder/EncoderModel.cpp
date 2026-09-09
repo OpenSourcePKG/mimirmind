@@ -101,6 +101,7 @@ void EncoderModel::load(std::string_view dir, compute::ComputeOps& ops,
     auto upload = [&](const std::string& name) -> const float* {
         const auto [src, n] = findF32(name);
         compute::ComputeBuffer buf = ops.allocate(n * sizeof(float));
+        _weightBytes += n * sizeof(float);
         ops.uploadHostBytes(buf.get(), src, n * sizeof(float));
         const float* p = static_cast<const float*>(buf.get());
         _owned.push_back(std::move(buf));
@@ -119,12 +120,14 @@ void EncoderModel::load(std::string_view dir, compute::ComputeOps& ops,
                 bf[i] = f32ToBf16(src[i]);
             }
             compute::ComputeBuffer buf = ops.allocate(n * sizeof(std::uint16_t));
+            _weightBytes += n * sizeof(std::uint16_t);
             ops.uploadHostBytes(buf.get(), bf.data(), n * sizeof(std::uint16_t));
             const auto* p = reinterpret_cast<const float*>(buf.get());
             _owned.push_back(std::move(buf));
             return p;
         }
         compute::ComputeBuffer buf = ops.allocate(n * sizeof(float));
+        _weightBytes += n * sizeof(float);
         ops.uploadHostBytes(buf.get(), src, n * sizeof(float));
         const float* p = static_cast<const float*>(buf.get());
         _owned.push_back(std::move(buf));

@@ -40,6 +40,23 @@ std::vector<RerankHandler::ModelInfo> RerankHandler::listModels() const {
     return out;
 }
 
+std::vector<ResidentModelMemory> RerankHandler::residentModelsMemory() const {
+    std::vector<ResidentModelMemory> out;
+    out.reserve(_slots.size());
+    for (const auto& s : _slots) {
+        ResidentModelMemory m{};
+        m.id               = s.id;
+        m.title            = s.title.empty() ? s.id : s.title;
+        m.isDefault        = false;
+        m.weightBytes      = s.engine != nullptr ? s.engine->weightBytes() : 0;
+        m.servingActive    = false;   // encoders hold no paged KV cache
+        m.role             = "rerank";
+        m.inGenerativePool = false;
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+
 RerankHandler::Slot* RerankHandler::resolve(const std::string& model) {
     if (_slots.empty()) {
         return nullptr;
