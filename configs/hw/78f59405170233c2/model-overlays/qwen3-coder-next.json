@@ -23,6 +23,11 @@
       "value": 8192,
       "apply": true,
       "effect": "Prefill chunk = 8192 tokens (default 512). The cuDNN paged-prefill re-gathers the whole paged-KV prefix into a contiguous buffer every chunk (O(n^2) across chunks); bigger chunks mean far fewer re-gathers while staying memory-bounded (8192-row scratch, unlike a full single-chunk 32768). 22k prefill 84.5s (chunk 512) -> 53.2s (chunk 8192), = 240s->53s (4.5x) end-to-end vs the pre-cuDNN-fix baseline. Recall 3/3 unchanged."
+    },
+    "MIMIRMIND_GDN_PROJ_FUSE_BATCH": {
+      "value": 1,
+      "apply": true,
+      "effect": "5.18.10.3 batched GDN input-projection fuse: the 4 narrow qkv/gate/beta/alpha projections (weight-read-bound, gdn.proj was the #1 prefill term at 32%) become 2 wide fused GEMMs + a row-split. gdn.proj 5842ms->3818ms (-35%) at an 8k chunk; 22k prefill 53.0s->46.1s (240s->46s, 5.2x end-to-end). Recall 3/3 unchanged. Now correct at M>1 (was decode-only in GDN-Inc1)."
     }
   }
 }

@@ -905,6 +905,16 @@ void InferenceEngine::finalizeLoad() {
                 MM_LOG_INFO("probe",
                             "  profile applied: prefill chunk -> {} tokens", c);
             }
+            // Batched GDN input-projection fuse (5.18.10.3): 4 narrow projections
+            // -> 2 wide GEMMs, cutting the weight-read-bound gdn.proj term.
+            // Backend reads it via getenv at ctor; explicit env wins.
+            if (picks->applyGdnProjFuseBatch &&
+                std::getenv("MIMIRMIND_GDN_PROJ_FUSE_BATCH") == nullptr) {
+                ::setenv("MIMIRMIND_GDN_PROJ_FUSE_BATCH",
+                         *picks->applyGdnProjFuseBatch ? "1" : "0", 1);
+                MM_LOG_INFO("probe", "  profile applied: GDN proj fuse (batch) -> {}",
+                            *picks->applyGdnProjFuseBatch ? "on" : "off");
+            }
         }
     }
 

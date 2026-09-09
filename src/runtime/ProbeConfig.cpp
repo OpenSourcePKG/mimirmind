@@ -42,6 +42,7 @@ void parseFlagsBlock(const nlohmann::json& flags, ProbePicks& picks) {
     if (auto v = readFlag("MIMIRMIND_MMQ_TC"))            picks.applyMmqTc = v;
     if (auto v = readFlag("MIMIRMIND_ATTN_CUDNN_PAGED"))  picks.applyAttnCudnnPaged = v;
     if (auto v = readFlag("MIMIRMIND_MOE_SILU_FUSE"))     picks.applyMoeSiluFuse = v;
+    if (auto v = readFlag("MIMIRMIND_GDN_PROJ_FUSE_BATCH")) picks.applyGdnProjFuseBatch = v;
     if (auto v = readIntFlag("MIMIRMIND_MOE_DECODE_REG")) picks.applyMoeDecodeReg = v;
     if (auto v = readIntFlag("MIMIRMIND_GROUPED_MOE"))    picks.applyGroupedMoe = v;
     if (auto v = readIntFlag("MIMIRMIND_PREFILL_CHUNK"))  picks.applyPrefillChunk = v;
@@ -170,6 +171,7 @@ void mergeOverlay(ProbePicks& base, const ProbePicks& over) {
     if (over.applyMoeDecodeReg)     base.applyMoeDecodeReg     = over.applyMoeDecodeReg;
     if (over.applyGroupedMoe)       base.applyGroupedMoe       = over.applyGroupedMoe;
     if (over.applyPrefillChunk)     base.applyPrefillChunk     = over.applyPrefillChunk;
+    if (over.applyGdnProjFuseBatch) base.applyGdnProjFuseBatch = over.applyGdnProjFuseBatch;
 }
 
 } // namespace mimirmind::runtime

@@ -55,6 +55,7 @@ struct ProbePicks {
     // same GPU. nullopt = keep code-default / env.
     std::optional<int> applyGroupedMoe;
     std::optional<int> applyPrefillChunk;   // MIMIRMIND_PREFILL_CHUNK (tokens)
+    std::optional<bool> applyGdnProjFuseBatch;  // MIMIRMIND_GDN_PROJ_FUSE_BATCH
 };
 
 /**
