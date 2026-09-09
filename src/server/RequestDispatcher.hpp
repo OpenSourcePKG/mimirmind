@@ -58,6 +58,11 @@ public:
     struct ModelEntry {
         std::string id;
         std::string title;
+        /// Resolved context budget (`InferenceEngine::maxContextTokens()`) for
+        /// the additive `meta.n_ctx` field of GET /v1/models, so clients can
+        /// read the hard context limit the same way they do off llama.cpp.
+        /// 0 = unknown (pool-mode model not currently materialized).
+        std::size_t nCtx{0};
     };
 
     /// `engines` must be non-empty. `modelId` (if set) picks the

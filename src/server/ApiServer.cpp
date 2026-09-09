@@ -417,13 +417,23 @@ struct ApiServer::Impl {
     void handleModels(const httplib::Request&, httplib::Response& res) {
         json data = json::array();
         for (const auto& m : dispatcher.listModels()) {
-            data.push_back(json{
+            json entry{
                 {"id",       m.id},
                 {"title",    m.title.empty() ? m.id : m.title},
                 {"object",   "model"},
                 {"created",  0},
                 {"owned_by", "mimirmind"},
-            });
+            };
+            // Additive OpenAI-style parity with llama.cpp's /v1/models: expose
+            // the hard context limit so clients (e.g. the Loki/Bifröst proxy)
+            // can read it as `meta.n_ctx`. Only fields mimirmind actually knows
+            // are emitted — n_ctx from the engine's resolved maxContextTokens();
+            // n_ctx_train/n_params/etc. are intentionally omitted rather than
+            // faked. 0 = unknown (pool-mode model not currently materialized).
+            if (m.nCtx > 0) {
+                entry["meta"] = json{{"n_ctx", m.nCtx}};
+            }
+            data.push_back(std::move(entry));
         }
         for (const auto& m : rerankHandler.listModels()) {
             data.push_back(json{

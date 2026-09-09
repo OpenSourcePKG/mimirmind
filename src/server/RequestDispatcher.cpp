@@ -98,16 +98,22 @@ std::vector<RequestDispatcher::ModelEntry> RequestDispatcher::listModels() const
     // model id colliding with the default is deduped (shouldn't happen —
     // ServeMode never registers the default with the pool — but listModels
     // must stay correct even if a config does something unexpected).
+    // n_ctx is read from the resident engine (fast counter, no lock). Pool-mode
+    // models the provider knows about but that are not currently materialized
+    // have no engine here, so they list with nCtx=0 (meta.n_ctx omitted).
+    const auto ctxOf = [](runtime::InferenceEngine* eng) -> std::size_t {
+        return eng != nullptr ? eng->maxContextTokens() : std::size_t{0};
+    };
     std::vector<ModelEntry> out;
     out.reserve(1 + _extraHandles.size());
-    out.push_back({_defaultId, _defaultTitle});
+    out.push_back({_defaultId, _defaultTitle, ctxOf(_defaultEngine)});
     for (const auto& h : _extraHandles) {
-        out.push_back({h.id, h.title});
+        out.push_back({h.id, h.title, ctxOf(h.engine)});
     }
     if (_provider != nullptr) {
         for (const auto& m : _provider->listModels()) {
             if (m.id == _defaultId) continue;
-            out.push_back({m.id, m.title});
+            out.push_back({m.id, m.title, /*nCtx=*/0});
         }
     }
     return out;
