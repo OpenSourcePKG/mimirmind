@@ -61,6 +61,10 @@ struct ChatRequest {
     bool                            hasMinP{false};
     // 8.19.14 — OpenAI `logit_bias`: token id -> additive bias (pre-softmax).
     std::vector<std::pair<std::int32_t, float>> logitBias;
+    // 8.19.14 part B — OpenAI `logprobs` (bool) + `top_logprobs` (0..20, only
+    // meaningful when logprobs=true). Populates choices[].logprobs.content[].
+    bool                            logprobs{false};
+    int                             topLogprobs{0};
     std::uint64_t                   seed{0};
     std::vector<std::string>        stopStrings;
     bool                            stream{false};

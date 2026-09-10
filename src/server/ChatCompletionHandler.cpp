@@ -141,6 +141,41 @@ inline std::shared_ptr<model::ToolCallConstraint> makeDecodeConstraint(
     return nullptr;
 }
 
+/// 8.19.14 part B — build the OpenAI `logprobs` object (`{content:[...]}`) from
+/// the generated token stream + its captured per-token logprobs. Emitted over
+/// the GENERATED tokens (the model's raw output, like vLLM); token pieces +
+/// UTF-8 bytes are decoded here (the serving layer stays tokenizer-agnostic).
+inline nlohmann::json buildLogprobsJson(
+        const std::vector<std::int32_t>&                  generated,
+        const std::vector<runtime::TokenLogprobs>&        lp,
+        const model::Tokenizer&                           tok) {
+    const auto bytesOf = [](const std::string& s) {
+        nlohmann::json b = nlohmann::json::array();
+        for (unsigned char c : s) { b.push_back(static_cast<int>(c)); }
+        return b;
+    };
+    const auto decode1 = [&tok](std::int32_t id) {
+        return tok.decode(std::vector<std::int32_t>{id}, /*skipSpecial=*/false);
+    };
+    nlohmann::json content = nlohmann::json::array();
+    for (std::size_t i = 0; i < generated.size() && i < lp.size(); ++i) {
+        if (!lp[i].captured) { continue; }
+        const std::string piece = decode1(generated[i]);
+        nlohmann::json top = nlohmann::json::array();
+        for (const auto& tp : lp[i].top) {
+            const std::string p = decode1(tp.token);
+            top.push_back({{"token", p},
+                           {"logprob", tp.logprob},
+                           {"bytes", bytesOf(p)}});
+        }
+        content.push_back({{"token", piece},
+                           {"logprob", lp[i].logprob},
+                           {"bytes", bytesOf(piece)},
+                           {"top_logprobs", std::move(top)}});
+    }
+    return nlohmann::json{{"content", std::move(content)}};
+}
+
 /// True if any parsed call names a non-offered tool OR omits a required schema
 /// parameter — i.e. the call is structurally incomplete and the client would
 /// reject it (`required parameter … missing`). Drives the grammar-forced
@@ -193,7 +228,8 @@ std::vector<std::int32_t> runViaBatcher(
         std::vector<std::int32_t>                 stopIds,
         std::string                               tenantId,
         const std::function<bool(std::int32_t)>&  onToken,
-        std::shared_ptr<model::ToolCallConstraint> constraint = nullptr) {
+        std::shared_ptr<model::ToolCallConstraint> constraint = nullptr,
+        std::vector<runtime::TokenLogprobs>*       outLp = nullptr) {
     // 8.19.5: hand the request's sampling params to the batcher so the slot
     // decodes with them (temperature<=0 stays the greedy fast path).
     // 8.19.13.2: an optional tool-call grammar constraint rides along.
@@ -211,6 +247,12 @@ std::vector<std::int32_t> runViaBatcher(
     }
     if (aborted) {
         batcher.cancel(req);
+    }
+    // 8.19.14 part B — hand back the per-token logprobs (aligned with `out`);
+    // populated only when the request enabled logprobs.
+    if (outLp != nullptr) {
+        std::lock_guard<std::mutex> lk(req->mtx);
+        *outLp = req->logprobs;
     }
     if (!req->error.empty()) {
         // Per-tenant quota is checked before the whole-server overload: both
@@ -425,6 +467,8 @@ bool ChatCompletionHandler::prepareChatRequest(
     // 8.19.14 — min_p (explicit value, incl. 0, wins) + logit_bias.
     if (cr.hasMinP) { params.sampling.minP = cr.minP; }
     params.sampling.logitBias = cr.logitBias;
+    // 8.19.14 part B — logprobs capture: -1 disabled, else top_logprobs count.
+    params.sampling.logprobsTopN = cr.logprobs ? cr.topLogprobs : -1;
 
     // 8.19.7 — model-recommended truncation for sampled requests. A client
     // that asks for sampling (temperature>0) without its own top_p/top_k
@@ -678,6 +722,7 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
 
     runtime::GenerateStats stats;
     std::vector<std::int32_t> generated;
+    std::vector<runtime::TokenLogprobs> lpVec;   // 8.19.14 part B (batcher path)
 
     // Reserve the response id up-front so the /v1/system/status
     // snapshot can carry it while the request is still running.
@@ -758,7 +803,8 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                                       makeDecodeConstraint(
                                           cr.tools, cr.toolChoice,
                                           cr.responseFormat, cr.jsonSchema,
-                                          tok));
+                                          tok),
+                                      cr.logprobs ? &lpVec : nullptr);
         } catch (const runtime::serving::ServingTenantQuotaError& e) {
             // Per-tenant fairness shed, not a bug: retryable 429.
             _metrics.recordQuotaRejected(tenant);
@@ -1178,6 +1224,10 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                 {"index", 0},
                 {"message", std::move(message)},
                 {"finish_reason", finish},
+                // 8.19.14 part B — OpenAI logprobs (null unless requested).
+                {"logprobs", cr.logprobs
+                                 ? buildLogprobsJson(generated, lpVec, tok)
+                                 : json(nullptr)},
             },
         })},
         {"usage", std::move(usage)},

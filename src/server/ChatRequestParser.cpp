@@ -334,6 +334,18 @@ ChatRequest parseChatRequest(const json& body) {
     // 8.19.14 — min_p (vLLM extra).
     readFloat(body, "min_p", req.minP, req.hasMinP);
 
+    // 8.19.14 part B — logprobs (bool) + top_logprobs (0..20). OpenAI requires
+    // logprobs=true for top_logprobs to apply; we clamp defensively.
+    if (const auto v = optBool(body, "logprobs")) { req.logprobs = *v; }
+    if (present(body, "top_logprobs")) {
+        const auto& tl = body["top_logprobs"];
+        if (!tl.is_number_integer()) {
+            throw ChatRequestError("top_logprobs must be an integer 0..20",
+                                   "top_logprobs");
+        }
+        req.topLogprobs = std::clamp(tl.get<int>(), 0, 20);
+    }
+
     // 8.19.14 — OpenAI logit_bias: {"<token_id>": <bias>, ...}. Keys are token
     // ids as strings; values are additive biases (OpenAI clamps to [-100,100]).
     if (present(body, "logit_bias")) {
