@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <random>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace mimirmind::compute {
@@ -48,6 +49,18 @@ struct SamplingParams {
     /// 1.0 => disabled. Otherwise keep the smallest set of top-sorted
     /// tokens whose cumulative probability >= topP, then renormalize.
     float        topP{1.0F};
+
+    /// 8.19.14 — min-p (vLLM). 0 => disabled. Otherwise, after softmax, drop
+    /// every token whose probability is below `minP * maxProb`, then
+    /// renormalize. Applied BEFORE top-P. Keeps at least the argmax token.
+    float        minP{0.0F};
+
+    /// 8.19.14 — OpenAI `logit_bias`: additive bias per token id, applied to
+    /// the raw logits BEFORE temperature/softmax (like OpenAI/vLLM). Empty =>
+    /// disabled. Non-empty forces the scratch path (and breaks the greedy
+    /// fast-path, since it reorders argmax). Owned here so a per-slot copy
+    /// keeps it alive for the request's lifetime.
+    std::vector<std::pair<std::int32_t, float>> logitBias;
 
     /// Seed for the RNG. 0 => non-deterministic (std::random_device).
     std::uint64_t seed{0};

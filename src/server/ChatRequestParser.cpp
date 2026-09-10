@@ -5,6 +5,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -330,6 +331,35 @@ ChatRequest parseChatRequest(const json& body) {
     readFloat(body, "frequency_penalty",  req.frequencyPenalty,  req.hasFrequencyPenalty);
     readFloat(body, "presence_penalty",   req.presencePenalty,   req.hasPresencePenalty);
     readFloat(body, "repetition_penalty", req.repetitionPenalty, req.hasRepetitionPenalty);
+    // 8.19.14 — min_p (vLLM extra).
+    readFloat(body, "min_p", req.minP, req.hasMinP);
+
+    // 8.19.14 — OpenAI logit_bias: {"<token_id>": <bias>, ...}. Keys are token
+    // ids as strings; values are additive biases (OpenAI clamps to [-100,100]).
+    if (present(body, "logit_bias")) {
+        const auto& lb = body["logit_bias"];
+        if (!lb.is_object()) {
+            throw ChatRequestError(
+                "logit_bias must be an object mapping token id -> bias",
+                "logit_bias");
+        }
+        for (auto it = lb.begin(); it != lb.end(); ++it) {
+            if (!it.value().is_number()) {
+                throw ChatRequestError("logit_bias values must be numbers",
+                                       "logit_bias");
+            }
+            std::int32_t id = 0;
+            try {
+                id = static_cast<std::int32_t>(std::stol(it.key()));
+            } catch (const std::exception&) {
+                throw ChatRequestError(
+                    "logit_bias keys must be integer token ids", "logit_bias");
+            }
+            float bias = it.value().get<float>();
+            bias = std::clamp(bias, -100.0F, 100.0F);
+            req.logitBias.emplace_back(id, bias);
+        }
+    }
 
     // Reasoning toggle (vLLM-compatible). Accept a top-level `enable_thinking`
     // and the nested `chat_template_kwargs: {enable_thinking: <bool>}`.

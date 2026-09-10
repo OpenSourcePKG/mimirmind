@@ -422,6 +422,9 @@ bool ChatCompletionHandler::prepareChatRequest(
     params.sampling.topP = cr.topP;
     params.sampling.topK = cr.topK;
     params.sampling.seed = cr.seed;
+    // 8.19.14 — min_p (explicit value, incl. 0, wins) + logit_bias.
+    if (cr.hasMinP) { params.sampling.minP = cr.minP; }
+    params.sampling.logitBias = cr.logitBias;
 
     // 8.19.7 — model-recommended truncation for sampled requests. A client
     // that asks for sampling (temperature>0) without its own top_p/top_k

@@ -126,6 +126,9 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
     const bool softcapOn = params.finalLogitSoftcap > 0.0F;
     const bool penaltyOn = penaltiesActive(params)
                            && !recentTokens.empty();
+    // 8.19.14 — logit_bias mutates the raw logits and reorders argmax, so it
+    // forces the scratch path AND disqualifies the greedy fast-path below.
+    const bool biasOn    = !params.logitBias.empty();
     // Greedy: deterministic argmax, no RNG use.
     const bool greedy    = (params.temperature <= 0.0F || params.topK == 1);
 
@@ -136,7 +139,7 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
     // V transcendentals that would otherwise run on every greedy token
     // (Gemma 4 ships softcap on by default). Penalties genuinely reorder,
     // so they still force the scratch path below.
-    if (greedy && !penaltyOn) {
+    if (greedy && !penaltyOn && !biasOn) {
         return argmaxRow(logits);
     }
 
@@ -147,7 +150,7 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
     // `softcap(penalty(x))` for repetition and frequency penalties, and
     // the target parity we care about is `penalty(softcap(x))`.
     std::span<const float> effLogits = logits;
-    if (softcapOn || penaltyOn) {
+    if (softcapOn || penaltyOn || biasOn) {
         _penaltyLogits.assign(logits.begin(), logits.end());
         if (softcapOn) {
             applyFinalLogitSoftcapInPlace(std::span<float>{_penaltyLogits},
@@ -155,6 +158,17 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
         }
         if (penaltyOn) {
             applyPenalties(recentTokens, params);
+        }
+        if (biasOn) {
+            // OpenAI logit_bias: additive, pre-temperature. Out-of-range ids
+            // are ignored (defensive).
+            const std::int32_t V =
+                static_cast<std::int32_t>(_penaltyLogits.size());
+            for (const auto& [id, bias] : params.logitBias) {
+                if (id >= 0 && id < V) {
+                    _penaltyLogits[static_cast<std::size_t>(id)] += bias;
+                }
+            }
         }
         effLogits = std::span<const float>{_penaltyLogits};
     }
@@ -218,6 +232,32 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
     const float invSum = static_cast<float>(1.0 / sum);
     for (auto& p : _probs) {
         p *= invSum;
+    }
+
+    // Min-P (8.19.14): drop every token below `minP * maxProb`, then
+    // renormalize. `_probs` is sorted descending, so `_probs[0]` is the max
+    // and the first entry under the threshold cuts the tail. Applied BEFORE
+    // top-P; always keeps at least the argmax token.
+    if (params.minP > 0.0F && kept > 1) {
+        const float thresh = params.minP * _probs[0];
+        std::size_t cut = kept;
+        for (std::size_t i = 1; i < kept; ++i) {
+            if (_probs[i] < thresh) { cut = i; break; }
+        }
+        if (cut < kept) {
+            kept = cut;
+            double cumKept = 0.0;
+            for (std::size_t i = 0; i < kept; ++i) {
+                cumKept += static_cast<double>(_probs[i]);
+            }
+            if (cumKept <= 0.0) {
+                return _idx[0];
+            }
+            const float invCum = static_cast<float>(1.0 / cumKept);
+            for (std::size_t i = 0; i < kept; ++i) {
+                _probs[i] *= invCum;
+            }
+        }
     }
 
     // Top-P (nucleus): walk the sorted probs, accumulate, drop the tail.
