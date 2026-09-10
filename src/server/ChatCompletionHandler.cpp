@@ -145,10 +145,9 @@ inline std::shared_ptr<model::ToolCallConstraint> makeDecodeConstraint(
 /// the generated token stream + its captured per-token logprobs. Emitted over
 /// the GENERATED tokens (the model's raw output, like vLLM); token pieces +
 /// UTF-8 bytes are decoded here (the serving layer stays tokenizer-agnostic).
-inline nlohmann::json buildLogprobsJson(
-        const std::vector<std::int32_t>&                  generated,
-        const std::vector<runtime::TokenLogprobs>&        lp,
-        const model::Tokenizer&                           tok) {
+inline nlohmann::json logprobEntryJson(std::int32_t tokId,
+                                       const runtime::TokenLogprobs& lp,
+                                       const model::Tokenizer& tok) {
     const auto bytesOf = [](const std::string& s) {
         nlohmann::json b = nlohmann::json::array();
         for (unsigned char c : s) { b.push_back(static_cast<int>(c)); }
@@ -157,21 +156,28 @@ inline nlohmann::json buildLogprobsJson(
     const auto decode1 = [&tok](std::int32_t id) {
         return tok.decode(std::vector<std::int32_t>{id}, /*skipSpecial=*/false);
     };
+    const std::string piece = decode1(tokId);
+    nlohmann::json top = nlohmann::json::array();
+    for (const auto& tp : lp.top) {
+        const std::string p = decode1(tp.token);
+        top.push_back({{"token", p},
+                       {"logprob", tp.logprob},
+                       {"bytes", bytesOf(p)}});
+    }
+    return nlohmann::json{{"token", piece},
+                          {"logprob", lp.logprob},
+                          {"bytes", bytesOf(piece)},
+                          {"top_logprobs", std::move(top)}};
+}
+
+inline nlohmann::json buildLogprobsJson(
+        const std::vector<std::int32_t>&                  generated,
+        const std::vector<runtime::TokenLogprobs>&        lp,
+        const model::Tokenizer&                           tok) {
     nlohmann::json content = nlohmann::json::array();
     for (std::size_t i = 0; i < generated.size() && i < lp.size(); ++i) {
         if (!lp[i].captured) { continue; }
-        const std::string piece = decode1(generated[i]);
-        nlohmann::json top = nlohmann::json::array();
-        for (const auto& tp : lp[i].top) {
-            const std::string p = decode1(tp.token);
-            top.push_back({{"token", p},
-                           {"logprob", tp.logprob},
-                           {"bytes", bytesOf(p)}});
-        }
-        content.push_back({{"token", piece},
-                           {"logprob", lp[i].logprob},
-                           {"bytes", bytesOf(piece)},
-                           {"top_logprobs", std::move(top)}});
+        content.push_back(logprobEntryJson(generated[i], lp[i], tok));
     }
     return nlohmann::json{{"content", std::move(content)}};
 }
@@ -229,7 +235,8 @@ std::vector<std::int32_t> runViaBatcher(
         std::string                               tenantId,
         const std::function<bool(std::int32_t)>&  onToken,
         std::shared_ptr<model::ToolCallConstraint> constraint = nullptr,
-        std::vector<runtime::TokenLogprobs>*       outLp = nullptr) {
+        std::vector<runtime::TokenLogprobs>*       outLp = nullptr,
+        const std::function<void(const runtime::TokenLogprobs&)>* onLp = nullptr) {
     // 8.19.5: hand the request's sampling params to the batcher so the slot
     // decodes with them (temperature<=0 stays the greedy fast path).
     // 8.19.13.2: an optional tool-call grammar constraint rides along.
@@ -242,6 +249,12 @@ std::vector<std::int32_t> runViaBatcher(
     bool aborted = false;
     while (req->waitToken(next, t)) {
         out.push_back(t);
+        // 8.19.14 part B — per-token logprob callback (streaming). req->logprobs
+        // is appended under the same lock as the token, so index `next` is ready.
+        if (onLp != nullptr && *onLp) {
+            std::lock_guard<std::mutex> lk(req->mtx);
+            if (next < req->logprobs.size()) { (*onLp)(req->logprobs[next]); }
+        }
         ++next;
         if (onToken && !onToken(t)) { aborted = true; break; }
     }
@@ -1420,6 +1433,8 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
         // 8.19.13.4: response_format JSON enforcement on the streaming path.
         ResponseFormat                responseFormat{ResponseFormat::Text};
         std::string                   jsonSchema;
+        // 8.19.14 part B: emit delta.logprobs chunks on the streaming path.
+        bool                          logprobsWanted{false};
         model::ToolCallStreamDetector toolCallDetector;
         int                           nextToolCallIndex{0};
         bool                          anyToolCallEmitted{false};
@@ -1496,6 +1511,7 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
     state->toolChoice       = cr.toolChoice;
     state->responseFormat   = cr.responseFormat;
     state->jsonSchema       = cr.jsonSchema;
+    state->logprobsWanted   = cr.logprobs;
     state->toolCallDetector = model::ToolCallStreamDetector(
         style, state->toolCallsEnabled, forcedToolOpener);
     // M-Munin.3 (full): move (not copy) the pin into state so it outlives
@@ -1860,6 +1876,23 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                     // grammar (body-rooted for "required" — the opener is
                     // prefilled). Mirrors the blocking path; the streaming
                     // twin previously ran the primary decode unconstrained.
+                    // 8.19.14 part B — per-token logprobs chunk (streaming).
+                    std::function<void(const runtime::TokenLogprobs&)> onLpFn;
+                    if (state->logprobsWanted) {
+                        onLpFn = [&](const runtime::TokenLogprobs& lp) {
+                            if (!lp.captured) { return; }
+                            nlohmann::json content = nlohmann::json::array();
+                            content.push_back(
+                                logprobEntryJson(lp.token, lp, tok));
+                            if (!SseEncoder::writeSseEvent(
+                                    sink, SseEncoder::buildLogprobsChunk(
+                                              state->respId, state->created,
+                                              state->echoModel,
+                                              std::move(content)))) {
+                                clientGone = true;
+                            }
+                        };
+                    }
                     generated = runViaBatcher(*activeBatcher,
                                               state->promptIds, state->params,
                                               state->stopIds, state->tenantId,
@@ -1868,7 +1901,9 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                                                   state->toolSpecs,
                                                   state->toolChoice,
                                                   state->responseFormat,
-                                                  state->jsonSchema, tok));
+                                                  state->jsonSchema, tok),
+                                              /*outLp=*/nullptr,
+                                              onLpFn ? &onLpFn : nullptr);
                 } catch (const runtime::serving::ServingTenantQuotaError& e) {
                     // Race-path 429 (pre-check in handle() sheds the rest).
                     this->_metrics.recordQuotaRejected(state->tenantId);

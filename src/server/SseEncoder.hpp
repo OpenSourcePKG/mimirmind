@@ -65,6 +65,15 @@ struct SseEncoder {
         const std::string& name,
         const std::string& argumentsJson);
 
+    /// 8.19.14 part B — chunk carrying per-token logprobs at
+    /// `choices[0].logprobs.content` (delta empty; the text was already streamed
+    /// as content chunks). `content` is the OpenAI logprobs content array.
+    [[nodiscard]] static nlohmann::json buildLogprobsChunk(
+        const std::string& id,
+        std::int64_t       created,
+        const std::string& model,
+        nlohmann::json     content);
+
     /// Terminal chunk with `finish_reason`.
     [[nodiscard]] static nlohmann::json buildFinishChunk(
         const std::string& id,
