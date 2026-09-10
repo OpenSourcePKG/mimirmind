@@ -861,6 +861,19 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         st->ssm = std::make_unique<SsmState>(
             *_e._ops, st->blockCount, _e._config.ssmStateElemsPerLayer(),
             _e._config.ssmConvStateElemsPerLayer(), maxBatch);
+        // 5.28.1.0 (Inc 0) — per-sequence SSM+conv snapshot size, the storage
+        // budget for the planned GDN prefix-checkpoint (one checkpoint/slot).
+        const std::size_t ssmSnapBytes =
+            st->blockCount *
+            (_e._config.ssmStateElemsPerLayer() +
+             _e._config.ssmConvStateElemsPerLayer()) * sizeof(float);
+        MM_LOG_INFO("ssmstate",
+                    "serving GatedDeltaNet state: {} layers, {}+{} elems/layer, "
+                    "{} MiB per-sequence snapshot (5.28.1 prefix-checkpoint "
+                    "budget), slab nSeq={}",
+                    st->blockCount, _e._config.ssmStateElemsPerLayer(),
+                    _e._config.ssmConvStateElemsPerLayer(),
+                    ssmSnapBytes / (1024 * 1024), maxBatch);
     }
 
     const auto qkv = qb->maxQKVDims();
