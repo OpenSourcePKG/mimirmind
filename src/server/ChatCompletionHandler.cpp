@@ -26,6 +26,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -80,29 +81,64 @@ inline void normalizeToolCallNames(std::vector<model::ToolCall>& calls,
     }
 }
 
-/// Build the per-request tool-call grammar constraint (8.19.13.2). Gated on
-/// MIMIRMIND_TOOL_GRAMMAR=1 (default OFF while the constraint is validated), a
-/// non-empty toolset, and tool_choice != "none". Returns nullptr (no
-/// constraint) otherwise, so the sampler is untouched.
+/// The 8.19.13.2 token-mask gate. 8.19.13.3: default ON (server-decided — this
+/// is what vLLM/llama.cpp do for tool calls, and it is the only thing that
+/// makes tool_choice:"required" structurally leak-proof). Opt-OUT rollback
+/// hatch only: MIMIRMIND_TOOL_GRAMMAR=0 disables the mask (e.g. to A/B a
+/// suspected regression); unset or any other value keeps it ON.
+inline bool toolGrammarEnabled() {
+    static const bool on = []() {
+        const char* e = std::getenv("MIMIRMIND_TOOL_GRAMMAR");
+        return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+
+/// Build the per-request tool-call grammar constraint (8.19.13.2). Active for a
+/// non-empty toolset with tool_choice != "none" while the mask is enabled;
+/// returns nullptr otherwise so the sampler is untouched.
 inline std::shared_ptr<model::ToolCallConstraint> makeToolConstraint(
         std::span<const model::ToolSpec> tools, const model::Tokenizer& tok,
         const std::string& toolChoice) {
-    static const bool on = []() {
-        const char* e = std::getenv("MIMIRMIND_TOOL_GRAMMAR");
-        return e != nullptr && e[0] == '1' && e[1] == '\0';
-    }();
-    if (!on || tools.empty() || toolChoice == "none") { return nullptr; }
+    if (!toolGrammarEnabled() || tools.empty() || toolChoice == "none") {
+        return nullptr;
+    }
+    // 8.19.13.3: trigger-dispatched for BOTH auto and required. The
+    // QwenChatML "required" forced-opener prefills only `<tool_call>\n` (see
+    // toolCallOpenerIds) — NOT `<function=`, which is the TagDispatch trigger.
+    // So the model still emits `<function=` itself; the trigger fires and the
+    // grammar then masks NAME (to an offered tool) + parameter keys from that
+    // point, killing the `<parameter=`/`<|im_end|>`-into-the-NAME leak while
+    // keeping the block parseable (`<function=NAME>…` is what parseQwenXml
+    // keys on). Body-rooted (assumeOpenerConsumed=true) is reserved for the
+    // salvage re-decode, which prefills the fuller `<tool_call>\n<function=`.
     auto c = std::make_shared<model::ToolCallConstraint>(tools, tok);
     return c->active() ? c : nullptr;
 }
 
-/// True when MIMIRMIND_TOOL_GRAMMAR=1 (the 8.19.13.2 token-mask gate).
-inline bool toolGrammarEnabled() {
-    static const bool on = []() {
-        const char* e = std::getenv("MIMIRMIND_TOOL_GRAMMAR");
-        return e != nullptr && e[0] == '1' && e[1] == '\0';
-    }();
-    return on;
+/// 8.19.13.4 — pick the decode-time grammar constraint for the PRIMARY decode:
+/// the tool-call grammar when tools are offered, else a `response_format` JSON
+/// grammar when the client asked for json_object / json_schema (enforced, not
+/// best-effort). Shares the MIMIRMIND_TOOL_GRAMMAR=0 kill-switch. Returns
+/// nullptr (sampler untouched) otherwise. NOTE: JSON mode roots the grammar at
+/// token 0, so it assumes thinking is OFF (the server default) — an explicit
+/// enable_thinking=true together with a JSON response_format is contradictory
+/// and the JSON grammar wins (no <think> can be emitted).
+inline std::shared_ptr<model::ToolCallConstraint> makeDecodeConstraint(
+        std::span<const model::ToolSpec> tools, const std::string& toolChoice,
+        ResponseFormat responseFormat, std::string_view jsonSchema,
+        const model::Tokenizer& tok) {
+    if (!tools.empty()) {
+        return makeToolConstraint(tools, tok, toolChoice);
+    }
+    if (!toolGrammarEnabled()) { return nullptr; }
+    if (responseFormat == ResponseFormat::JsonObject) {
+        return model::ToolCallConstraint::forResponseFormatJson(tok, {});
+    }
+    if (responseFormat == ResponseFormat::JsonSchema) {
+        return model::ToolCallConstraint::forResponseFormatJson(tok, jsonSchema);
+    }
+    return nullptr;
 }
 
 /// True if any parsed call names a non-offered tool OR omits a required schema
@@ -716,8 +752,10 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         try {
             generated = runViaBatcher(*activeBatcher, promptIds, params,
                                       stopIds, tenant, onToken,
-                                      makeToolConstraint(cr.tools, tok,
-                                                         cr.toolChoice));
+                                      makeDecodeConstraint(
+                                          cr.tools, cr.toolChoice,
+                                          cr.responseFormat, cr.jsonSchema,
+                                          tok));
         } catch (const runtime::serving::ServingTenantQuotaError& e) {
             // Per-tenant fairness shed, not a bug: retryable 429.
             _metrics.recordQuotaRejected(tenant);
@@ -1307,6 +1345,12 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
         model::ChatTemplate::ToolFormat toolFormat{
             model::ChatTemplate::ToolFormat::HermesJson};
         std::vector<model::ToolSpec>  toolSpecs;
+        // 8.19.13.3: needed to build the primary-decode grammar constraint with
+        // the right root ("required" prefills the opener → body-rooted).
+        std::string                   toolChoice;
+        // 8.19.13.4: response_format JSON enforcement on the streaming path.
+        ResponseFormat                responseFormat{ResponseFormat::Text};
+        std::string                   jsonSchema;
         model::ToolCallStreamDetector toolCallDetector;
         int                           nextToolCallIndex{0};
         bool                          anyToolCallEmitted{false};
@@ -1380,6 +1424,9 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
     state->toolFormat       = model::ChatTemplate::toolFormatFromArch(
         engine.config().architecture);
     state->toolSpecs        = cr.tools;
+    state->toolChoice       = cr.toolChoice;
+    state->responseFormat   = cr.responseFormat;
+    state->jsonSchema       = cr.jsonSchema;
     state->toolCallDetector = model::ToolCallStreamDetector(
         style, state->toolCallsEnabled, forcedToolOpener);
     // M-Munin.3 (full): move (not copy) the pin into state so it outlives
@@ -1740,10 +1787,19 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
             const bool useBatcher = activeBatcher != nullptr;
             if (useBatcher) {
                 try {
+                    // 8.19.13.3: mask the primary decode to the tool-call
+                    // grammar (body-rooted for "required" — the opener is
+                    // prefilled). Mirrors the blocking path; the streaming
+                    // twin previously ran the primary decode unconstrained.
                     generated = runViaBatcher(*activeBatcher,
                                               state->promptIds, state->params,
                                               state->stopIds, state->tenantId,
-                                              onToken);
+                                              onToken,
+                                              makeDecodeConstraint(
+                                                  state->toolSpecs,
+                                                  state->toolChoice,
+                                                  state->responseFormat,
+                                                  state->jsonSchema, tok));
                 } catch (const runtime::serving::ServingTenantQuotaError& e) {
                     // Race-path 429 (pre-check in handle() sheds the rest).
                     this->_metrics.recordQuotaRejected(state->tenantId);

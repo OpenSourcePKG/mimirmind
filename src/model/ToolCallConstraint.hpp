@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string_view>
 
 namespace mimirmind::model {
 
@@ -49,6 +50,17 @@ public:
     explicit ToolCallConstraint(std::span<const ToolSpec> tools,
                                 const Tokenizer& tok,
                                 bool assumeOpenerConsumed = false);
+
+    /// 8.19.13.4 — build a constraint for OpenAI `response_format` JSON mode
+    /// (the same decode-time xgrammar mask, rooted at token 0 so the WHOLE
+    /// output is constrained). `jsonSchema` empty => any valid JSON
+    /// (json_object); non-empty => that JSON-Schema (json_schema), via
+    /// xgrammar FromJSONSchema. Returns nullptr if compilation fails (the
+    /// sampler is then untouched). The maskLogits/advance/reset machinery is
+    /// grammar-agnostic, so this reuses it verbatim.
+    static std::shared_ptr<ToolCallConstraint> forResponseFormatJson(
+        const Tokenizer& tok, std::string_view jsonSchema);
+
     ~ToolCallConstraint();
     ToolCallConstraint(ToolCallConstraint&&) noexcept;
     ToolCallConstraint& operator=(ToolCallConstraint&&) noexcept;

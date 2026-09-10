@@ -394,9 +394,9 @@ ChatRequest parseChatRequest(const json& body) {
 
     // OpenAI response_format: {type:"text"|"json_object"|"json_schema"}. Shape
     // is validated (a malformed value is a 400); the requested format is
-    // recorded on the request. Enforcement (grammar-constrained decoding) is
-    // not yet implemented, so json_object/json_schema are accepted best-effort
-    // and never faked in the response (8.19 Increment 2).
+    // recorded and ENFORCED via xgrammar decode-time masking (8.19.13.4).
+    // For json_schema the schema object (response_format.json_schema.schema)
+    // is captured verbatim for FromJSONSchema.
     if (present(body, "response_format")) {
         const auto& rf = body["response_format"];
         if (!rf.is_object() || !rf.contains("type") || !rf["type"].is_string()) {
@@ -411,6 +411,18 @@ ChatRequest parseChatRequest(const json& body) {
             req.responseFormat = ResponseFormat::JsonObject;
         } else if (t == "json_schema") {
             req.responseFormat = ResponseFormat::JsonSchema;
+            // OpenAI shape: {type:"json_schema", json_schema:{name, schema:{…}}}.
+            // Capture the inner `schema` (the JSON-Schema object) for xgrammar.
+            if (rf.contains("json_schema") && rf["json_schema"].is_object()
+                && rf["json_schema"].contains("schema")
+                && rf["json_schema"]["schema"].is_object()) {
+                req.jsonSchema = rf["json_schema"]["schema"].dump();
+            } else {
+                throw ChatRequestError(
+                    "response_format.json_schema.schema (a JSON-Schema object) "
+                    "is required when type is json_schema",
+                    "response_format");
+            }
         } else {
             throw ChatRequestError(
                 "response_format.type must be text, json_object or json_schema",

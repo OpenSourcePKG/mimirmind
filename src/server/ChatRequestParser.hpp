@@ -87,10 +87,14 @@ struct ChatRequest {
     std::string                     forcedToolName;
 
     // OpenAI `response_format`. Default Text (unconstrained). JsonObject /
-    // JsonSchema are parsed + validated and carried here, but enforcement
-    // (grammar-constrained decoding) is not yet implemented — best-effort:
-    // the field is recorded, never faked in the response. See 8.19 Increment 2.
+    // JsonSchema are ENFORCED via xgrammar decode-time masking (8.19.13.4):
+    // JsonObject => any valid JSON; JsonSchema => `jsonSchema` below.
     ResponseFormat                  responseFormat{ResponseFormat::Text};
+
+    // OpenAI `response_format.json_schema.schema` (the JSON-Schema object,
+    // serialised). Populated only for ResponseFormat::JsonSchema; empty
+    // otherwise. Fed verbatim to xgrammar's FromJSONSchema.
+    std::string                     jsonSchema;
 
     // Debug / parity teacher-forcing: raw text appended to the prompt AFTER
     // the chat template's generation prompt (no special tokens, no BOS), so
