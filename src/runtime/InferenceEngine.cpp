@@ -2701,11 +2701,12 @@ void InferenceEngine::ensureServingState(std::size_t maxBatch,
 }
 
 void InferenceEngine::stepServing(std::span<const ServingSlotStep> steps,
-                                  std::span<std::int32_t>          outTokens) {
+                                  std::span<std::int32_t>          outTokens,
+                                  std::vector<TokenLogprobs>*      outLp) {
     if (_servingSession == nullptr) {
         throw std::runtime_error("stepServing: ensureServingState not called");
     }
-    _servingSession->stepServing(steps, outTokens);
+    _servingSession->stepServing(steps, outTokens, outLp);
 }
 
 void InferenceEngine::setServingSlotSampling(
@@ -2730,11 +2731,13 @@ void InferenceEngine::setServingSlotToolConstraint(
 std::int32_t InferenceEngine::prefillSlot(std::size_t slot,
                                           std::span<const std::int32_t> tokens,
                                           std::size_t startPos,
-                                          bool produceToken) {
+                                          bool produceToken,
+                                          TokenLogprobs* outLp) {
     if (_servingSession == nullptr) {
         throw std::runtime_error("prefillSlot: ensureServingState not called");
     }
-    return _servingSession->prefillSlot(slot, tokens, startPos, produceToken);
+    return _servingSession->prefillSlot(slot, tokens, startPos, produceToken,
+                                        outLp);
 }
 
 std::size_t InferenceEngine::servingPrefillChunk() const {
@@ -2747,12 +2750,13 @@ void InferenceEngine::prefillSlotsBatched(
         std::span<const std::span<const std::int32_t>> chunks,
         std::span<const std::size_t>                   startPositions,
         bool                                           produceToken,
-        std::span<std::int32_t>                        outFirstTok) {
+        std::span<std::int32_t>                        outFirstTok,
+        std::vector<TokenLogprobs>*                    outLp) {
     if (_servingSession == nullptr) {
         throw std::runtime_error("prefillSlotsBatched: ensureServingState not called");
     }
     _servingSession->runVarlenPrefill(firstSlot, chunks, startPositions,
-                                      produceToken, outFirstTok);
+                                      produceToken, outFirstTok, outLp);
 }
 
 std::size_t InferenceEngine::servingPrefillMaxRows() const {

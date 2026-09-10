@@ -240,6 +240,49 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
     _impl->active = true;
 }
 
+std::shared_ptr<ToolCallConstraint>
+ToolCallConstraint::forResponseFormatJson(const Tokenizer& tok,
+                                          std::string_view jsonSchema) {
+    auto c      = std::shared_ptr<ToolCallConstraint>(new ToolCallConstraint());
+    c->_impl    = std::make_unique<Impl>();
+    auto& impl  = *c->_impl;
+    impl.tctx   = tokContext(tok);
+    impl.vocab  = impl.tctx->vocab;
+
+    // Cache key: distinct from any tool EBNF (which starts with "value ::=").
+    const std::string key = "\x01json\x01" + std::string{jsonSchema};
+    try {
+        auto& tc = *impl.tctx;
+        std::lock_guard<std::mutex> lk{tc.compileMtx};
+        const auto cit = tc.compiledCache.find(key);
+        if (cit != tc.compiledCache.end()) {
+            impl.compiled = cit->second;
+        } else {
+            // Rooted at token 0 (no TagDispatch): the WHOLE output must be a
+            // single JSON value. Empty schema => any JSON (json_object);
+            // otherwise the exact JSON-Schema (json_schema).
+            const xgrammar::Grammar g =
+                jsonSchema.empty()
+                    ? xgrammar::Grammar::BuiltinJSONGrammar()
+                    : xgrammar::Grammar::FromJSONSchema(std::string{jsonSchema});
+            impl.compiled = std::make_shared<xgrammar::CompiledGrammar>(
+                tc.compiler->CompileGrammar(g));
+            tc.compiledCache.emplace(key, impl.compiled);
+            MM_LOG_INFO("tgram", "compiled response_format JSON grammar ({})",
+                        jsonSchema.empty() ? "any" : "schema");
+        }
+    } catch (const std::exception& e) {
+        MM_LOG_WARN("tgram", "response_format JSON grammar compile failed: {}",
+                    e.what());
+        return nullptr;
+    }
+    impl.bitmask.assign(static_cast<std::size_t>((impl.vocab + 31) / 32), 0);
+    impl.matcher =
+        std::make_unique<xgrammar::GrammarMatcher>(*impl.compiled);
+    impl.active = true;
+    return c;
+}
+
 ToolCallConstraint::~ToolCallConstraint() = default;
 ToolCallConstraint::ToolCallConstraint(ToolCallConstraint&&) noexcept = default;
 ToolCallConstraint&

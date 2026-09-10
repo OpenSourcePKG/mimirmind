@@ -275,13 +275,15 @@ void ContinuousBatcher::prefillSlotAdmitted(std::size_t slot) {
     // first generated token (identical to the token-by-token step at pos ==
     // promptLen-1).
     std::int32_t firstTok = -1;
+    TokenLogprobs firstLp;   // 8.19.14 — captured on the last (token-producing) chunk
     try {
         const std::size_t C = _prefillChunk;
         for (std::size_t p = 0; p < L; p += C) {
             const std::size_t t    = std::min(C, L - p);
             const bool        last = (p + t == L);
             const std::span<const std::int32_t> chunk{prompt.data() + p, t};
-            const std::int32_t tk = _engine.prefillSlot(slot, chunk, p, last);
+            const std::int32_t tk = _engine.prefillSlot(
+                slot, chunk, p, last, last ? &firstLp : nullptr);
             if (last) {
                 firstTok = tk;
             }
@@ -303,12 +305,12 @@ void ContinuousBatcher::prefillSlotAdmitted(std::size_t slot) {
         return;
     }
 
-    commitPrefilledSlot(slot, req, firstTok);
+    commitPrefilledSlot(slot, req, firstTok, std::move(firstLp));
 }
 
 void ContinuousBatcher::commitPrefilledSlot(
         std::size_t slot, const std::shared_ptr<ServingRequest>& req,
-        std::int32_t firstTok) {
+        std::int32_t firstTok, TokenLogprobs firstLp) {
     // Commit: the slot enters decode at pos == promptLen with firstTok already
     // produced. (Only the worker thread admits/frees slots, so the slot cannot
     // have been re-used mid-prefill; the guards are defensive.)
@@ -333,6 +335,7 @@ void ContinuousBatcher::commitPrefilledSlot(
         cancelled = s.req->cancelled;
         if (!cancelled) {
             s.req->tokens.push_back(firstTok);
+            s.req->logprobs.push_back(std::move(firstLp));   // 8.19.14
             s.req->cv.notify_all();
         }
     }
@@ -430,10 +433,11 @@ void ContinuousBatcher::prefillSlotRunBatched(std::span<const std::size_t> run) 
 
         const std::size_t N = chunks.size();
         std::vector<std::int32_t> firstTok(N, -1);
+        std::vector<TokenLogprobs> lps(N);   // 8.19.14 (opt-in per slot)
         bool ok = true;
         try {
             _engine.prefillSlotsBatched(run[k], chunks, startPos,
-                                        /*produceToken=*/true, firstTok);
+                                        /*produceToken=*/true, firstTok, &lps);
         } catch (const std::exception& ex) {
             ok = false;
             const std::string msg = std::string("prefill failed: ") + ex.what();
@@ -441,7 +445,8 @@ void ContinuousBatcher::prefillSlotRunBatched(std::span<const std::size_t> run) 
         }
         if (ok) {
             for (std::size_t b = 0; b < N; ++b) {
-                commitPrefilledSlot(run[k + b], reqs[k + b], firstTok[b]);
+                commitPrefilledSlot(run[k + b], reqs[k + b], firstTok[b],
+                                    std::move(lps[b]));
             }
         }
         k = j;
@@ -524,9 +529,10 @@ bool ContinuousBatcher::runMixedStep() {
     }
 
     std::vector<std::int32_t> outTok(nActive, -1);
+    std::vector<TokenLogprobs> lps(nActive);   // 8.19.14 (opt-in per slot)
     try {
         _engine.prefillSlotsBatched(/*firstSlot=*/0, chunks, startPos,
-                                    /*produceToken=*/true, outTok);
+                                    /*produceToken=*/true, outTok, &lps);
     } catch (const std::exception& ex) {
         // A forward failure poisons the whole batch — fail every active request.
         std::lock_guard<std::mutex> lk(_mtx);
@@ -577,6 +583,7 @@ bool ContinuousBatcher::runMixedStep() {
             {
                 std::lock_guard<std::mutex> rl(s.req->mtx);
                 s.req->tokens.push_back(t);
+                s.req->logprobs.push_back(std::move(lps[i]));   // 8.19.14
                 s.req->cv.notify_all();
             }
             s.lastTok = t;
@@ -809,8 +816,9 @@ void ContinuousBatcher::workerLoop() {
         }
 
         toks.assign(nActive, 0);
+        std::vector<TokenLogprobs> lps(nActive);   // 8.19.14 (opt-in per slot)
         try {
-            _engine.stepServing(steps, toks);
+            _engine.stepServing(steps, toks, &lps);
         } catch (const std::exception& ex) {
             // A forward failure poisons the whole batch — fail every active
             // request rather than silently losing tokens.
@@ -854,6 +862,7 @@ void ContinuousBatcher::workerLoop() {
                     {
                         std::lock_guard<std::mutex> rl(s.req->mtx);
                         s.req->tokens.push_back(t);
+                        s.req->logprobs.push_back(std::move(lps[i]));   // 8.19.14
                         s.req->cv.notify_all();
                     }
                     s.lastTok = t;

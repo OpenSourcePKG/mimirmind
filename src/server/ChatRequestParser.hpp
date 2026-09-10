@@ -12,14 +12,14 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace mimirmind::server {
 
-/// OpenAI `response_format.type`. Parsed + carried so the handler/sampler can
-/// honor it where a constraint mechanism exists; today it is best-effort
-/// (no grammar-constrained decoding yet — see 8.19 Increment 2), so JsonObject/
-/// JsonSchema are accepted and recorded but not hard-enforced.
+/// OpenAI `response_format.type`. ENFORCED via xgrammar decode-time masking
+/// (8.19.13.4): JsonObject => any valid JSON; JsonSchema => the request's
+/// `jsonSchema` (FromJSONSchema). Shares the MIMIRMIND_TOOL_GRAMMAR=0 kill-switch.
 enum class ResponseFormat { Text, JsonObject, JsonSchema };
 
 /// Thrown by parseChatRequest when a request field carries a malformed value
@@ -56,6 +56,18 @@ struct ChatRequest {
     // explicit value, even the neutral one, always wins.
     bool                            hasTopP{false};
     bool                            hasTopK{false};
+    // 8.19.14 — min-p (vLLM extra). hasMinP distinguishes "sent 0" from unset.
+    float                           minP{0.0F};
+    bool                            hasMinP{false};
+    // 8.19.14 — OpenAI `logit_bias`: token id -> additive bias (pre-softmax).
+    std::vector<std::pair<std::int32_t, float>> logitBias;
+    // 8.19.14 part B — OpenAI `logprobs` (bool) + `top_logprobs` (0..20, only
+    // meaningful when logprobs=true). Populates choices[].logprobs.content[].
+    bool                            logprobs{false};
+    int                             topLogprobs{0};
+    // 8.19.14 part B — vLLM `bad_words`: raw strings; the handler tokenizes
+    // each to a token-id sequence for compute::SamplingParams::badWords.
+    std::vector<std::string>        badWords;
     std::uint64_t                   seed{0};
     std::vector<std::string>        stopStrings;
     bool                            stream{false};
@@ -87,10 +99,14 @@ struct ChatRequest {
     std::string                     forcedToolName;
 
     // OpenAI `response_format`. Default Text (unconstrained). JsonObject /
-    // JsonSchema are parsed + validated and carried here, but enforcement
-    // (grammar-constrained decoding) is not yet implemented — best-effort:
-    // the field is recorded, never faked in the response. See 8.19 Increment 2.
+    // JsonSchema are ENFORCED via xgrammar decode-time masking (8.19.13.4):
+    // JsonObject => any valid JSON; JsonSchema => `jsonSchema` below.
     ResponseFormat                  responseFormat{ResponseFormat::Text};
+
+    // OpenAI `response_format.json_schema.schema` (the JSON-Schema object,
+    // serialised). Populated only for ResponseFormat::JsonSchema; empty
+    // otherwise. Fed verbatim to xgrammar's FromJSONSchema.
+    std::string                     jsonSchema;
 
     // Debug / parity teacher-forcing: raw text appended to the prompt AFTER
     // the chat template's generation prompt (no special tokens, no BOS), so

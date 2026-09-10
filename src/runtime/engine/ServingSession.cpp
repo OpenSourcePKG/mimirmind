@@ -12,6 +12,7 @@
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
 #include "runtime/SsmState.hpp"
+#include "runtime/TokenLogprobs.hpp"
 #include "runtime/arch/Qwen3_5MoeBackend.hpp"
 #include "runtime/engine/DFlashDecoder.hpp"
 #include "runtime/serving/KvCacheSlabPool.hpp"
@@ -24,6 +25,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -59,6 +61,52 @@ namespace {
 // the legacy MIMIRMIND_SERVING_KV_* env flags, then F32. Config > env > F32.
 [[nodiscard]] KvDtype servingKvDtypeFor(const InferenceEngine& e) noexcept {
     return e.servingKvDtypeOverride().value_or(servingKvDtypeFromEnv());
+}
+
+// 8.19.14 part B — capture logprobs for one decode row from the RAW lm-head
+// logits (full-vocab log-softmax). `chosen` is the emitted token; `topN` is
+// the requested `top_logprobs` count (0 => chosen only). MUST be called on the
+// UNMASKED row for the chosen token's logit; the chosen token is always
+// grammar-allowed, so an in-place mask before this leaves row[chosen] intact —
+// but we capture the logsumexp + top-N from the raw row BEFORE any mask.
+[[nodiscard]] runtime::TokenLogprobs captureLogprobs(
+        const float* row, std::size_t vocab, std::int32_t chosen, int topN) {
+    runtime::TokenLogprobs out;
+    if (row == nullptr || vocab == 0) { return out; }
+    float mx = row[0];
+    for (std::size_t i = 1; i < vocab; ++i) {
+        if (row[i] > mx) { mx = row[i]; }
+    }
+    double se = 0.0;
+    for (std::size_t i = 0; i < vocab; ++i) {
+        se += std::exp(static_cast<double>(row[i] - mx));
+    }
+    const double lse = static_cast<double>(mx) + std::log(se);   // logsumexp
+    out.captured = true;
+    out.token    = chosen;
+    out.logprob  = (chosen >= 0 && static_cast<std::size_t>(chosen) < vocab)
+        ? static_cast<float>(static_cast<double>(row[chosen]) - lse)
+        : 0.0F;
+    const int k = std::max(0, topN);
+    if (k > 0) {
+        const std::size_t kk =
+            std::min<std::size_t>(static_cast<std::size_t>(k), vocab);
+        std::vector<std::int32_t> idx(vocab);
+        for (std::size_t i = 0; i < vocab; ++i) {
+            idx[i] = static_cast<std::int32_t>(i);
+        }
+        std::partial_sort(
+            idx.begin(), idx.begin() + static_cast<std::ptrdiff_t>(kk),
+            idx.end(),
+            [&](std::int32_t a, std::int32_t b) { return row[a] > row[b]; });
+        out.top.reserve(kk);
+        for (std::size_t i = 0; i < kk; ++i) {
+            out.top.push_back(
+                {idx[i], static_cast<float>(
+                             static_cast<double>(row[idx[i]]) - lse)});
+        }
+    }
+    return out;
 }
 } // namespace
 
@@ -813,6 +861,19 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         st->ssm = std::make_unique<SsmState>(
             *_e._ops, st->blockCount, _e._config.ssmStateElemsPerLayer(),
             _e._config.ssmConvStateElemsPerLayer(), maxBatch);
+        // 5.28.1.0 (Inc 0) — per-sequence SSM+conv snapshot size, the storage
+        // budget for the planned GDN prefix-checkpoint (one checkpoint/slot).
+        const std::size_t ssmSnapBytes =
+            st->blockCount *
+            (_e._config.ssmStateElemsPerLayer() +
+             _e._config.ssmConvStateElemsPerLayer()) * sizeof(float);
+        MM_LOG_INFO("ssmstate",
+                    "serving GatedDeltaNet state: {} layers, {}+{} elems/layer, "
+                    "{} MiB per-sequence snapshot (5.28.1 prefix-checkpoint "
+                    "budget), slab nSeq={}",
+                    st->blockCount, _e._config.ssmStateElemsPerLayer(),
+                    _e._config.ssmConvStateElemsPerLayer(),
+                    ssmSnapBytes / (1024 * 1024), maxBatch);
     }
 
     const auto qkv = qb->maxQKVDims();
@@ -1024,7 +1085,8 @@ void ServingSession::setSlotToolConstraint(
 
 void ServingSession::stepServing(
         std::span<const InferenceEngine::ServingSlotStep> steps,
-        std::span<std::int32_t>                           outTokens) {
+        std::span<std::int32_t>                           outTokens,
+        std::vector<runtime::TokenLogprobs>*              outLp) {
     namespace cmp = mimirmind::compute;
     if (_l0 != nullptr) {
         // L0 slab path: each slot's slab sits at its own length (its decode
@@ -1144,7 +1206,10 @@ void ServingSession::stepServing(
             && (p.repetitionPenalty != 1.0F || p.frequencyPenalty != 0.0F
                 || p.presencePenalty != 0.0F)
             && !st.slotRecent[i].empty();
-        if (p.temperature > 0.0F || penalties) { allGreedy = false; break; }
+        // 8.19.14 — a slot requesting logprobs needs the full host-logits row,
+        // so it must leave the GPU-argmax-only fast path too.
+        if (p.temperature > 0.0F || penalties
+            || p.logprobsTopN >= 0) { allGreedy = false; break; }
     }
 
     if (st.gpuArgmax && allGreedy) {
@@ -1169,8 +1234,13 @@ void ServingSession::stepServing(
     _e._ops->flush();
     _e._ops->readbackToHost(st.hostLogits.data(), logits,
                             nSeq * st.vocab_lm * sizeof(float));
+    std::vector<float> rawRow;   // 8.19.14 raw-logits snapshot (opt-in slots)
     for (std::size_t i = 0; i < nSeq; ++i) {
         float* row = st.hostLogits.data() + i * st.vocab_lm;
+        const int lpN = st.slotSampling[i].logprobsTopN;
+        // 8.19.14: snapshot the RAW row before masking so logprobs reflect the
+        // model's own distribution, not the grammar-constrained head.
+        if (lpN >= 0) { rawRow.assign(row, row + st.vocab_lm); }
         // 8.19.13.2 — mask the tool-call NAME/KEY regions before sampling.
         if (st.slotConstraint[i] && st.slotConstraint[i]->active()) {
             st.slotConstraint[i]->maskLogits(row, st.vocab_lm);
@@ -1186,6 +1256,10 @@ void ServingSession::stepServing(
         if (st.slotConstraint[i] && st.slotConstraint[i]->active()) {
             st.slotConstraint[i]->advance(outTokens[i]);
         }
+        if (lpN >= 0 && outLp != nullptr && i < outLp->size()) {
+            (*outLp)[i] = captureLogprobs(rawRow.data(), st.vocab_lm,
+                                          outTokens[i], lpN);
+        }
     }
 }
 
@@ -1194,7 +1268,8 @@ void ServingSession::runVarlenPrefill(
         std::span<const std::span<const std::int32_t>> chunks,
         std::span<const std::size_t>                   startPositions,
         bool                                           produceToken,
-        std::span<std::int32_t>                        outFirstTok) {
+        std::span<std::int32_t>                        outFirstTok,
+        std::vector<runtime::TokenLogprobs>*           outLp) {
     namespace cmp = mimirmind::compute;
     if (_state == nullptr) {
         throw std::runtime_error("runVarlenPrefill: ensureServingState not called");
@@ -1377,12 +1452,15 @@ void ServingSession::runVarlenPrefill(
         _e._ops->flush();
         _e._ops->readbackToHost(st.hostLogits.data(), logits,
                                 N * st.vocab_lm * sizeof(float));
+        std::vector<float> rawRow;   // 8.19.14 raw-logits snapshot (opt-in)
         for (std::size_t s = 0; s < N; ++s) {
             float* row = st.hostLogits.data() + s * st.vocab_lm;
             // 8.19.5: first token honours the slot's sampling params too
             // (temperature<=0 with neutral penalties = argmax fast path,
             // bit-identical). History starts as the prompt tail (M7f).
             const std::size_t slot = firstSlot + s;
+            const int lpN = st.slotSampling[slot].logprobsTopN;
+            if (lpN >= 0) { rawRow.assign(row, row + st.vocab_lm); }
             if (st.slotConstraint[slot] && st.slotConstraint[slot]->active()) {
                 st.slotConstraint[slot]->maskLogits(row, st.vocab_lm);   // 8.19.13.2
             }
@@ -1393,6 +1471,10 @@ void ServingSession::runVarlenPrefill(
             st.pushRecent(slot, outFirstTok[s]);
             if (st.slotConstraint[slot] && st.slotConstraint[slot]->active()) {
                 st.slotConstraint[slot]->advance(outFirstTok[s]);
+            }
+            if (lpN >= 0 && outLp != nullptr && s < outLp->size()) {
+                (*outLp)[s] = captureLogprobs(rawRow.data(), st.vocab_lm,
+                                              outFirstTok[s], lpN);
             }
         }
     } else {
@@ -1407,7 +1489,8 @@ std::int32_t ServingSession::prefillSlot(
         std::size_t                   slot,
         std::span<const std::int32_t> tokens,
         std::size_t                   startPos,
-        bool                          produceToken) {
+        bool                          produceToken,
+        runtime::TokenLogprobs*       outLp) {
     namespace cmp = mimirmind::compute;
     if (_l0 != nullptr) {
         if (slot >= _l0->maxBatch) {
@@ -1552,6 +1635,12 @@ std::int32_t ServingSession::prefillSlot(
         // 8.19.5: first token honours the slot's sampling params (argmax fast
         // path when greedy with neutral penalties — bit-identical to the old
         // scan). History starts as the prompt tail (M7f).
+        const int lpN = st.slotSampling[slot].logprobsTopN;
+        std::vector<float> rawRow;   // 8.19.14 raw snapshot (opt-in)
+        if (lpN >= 0) {
+            rawRow.assign(st.hostLogits.data(),
+                          st.hostLogits.data() + st.vocab_lm);
+        }
         if (st.slotConstraint[slot] && st.slotConstraint[slot]->active()) {
             st.slotConstraint[slot]->maskLogits(st.hostLogits.data(),   // 8.19.13.2
                                                 st.vocab_lm);
@@ -1563,6 +1652,9 @@ std::int32_t ServingSession::prefillSlot(
         st.pushRecent(slot, firstTok);
         if (st.slotConstraint[slot] && st.slotConstraint[slot]->active()) {
             st.slotConstraint[slot]->advance(firstTok);
+        }
+        if (lpN >= 0 && outLp != nullptr) {
+            *outLp = captureLogprobs(rawRow.data(), st.vocab_lm, firstTok, lpN);
         }
     } else {
         // Intermediate chunk: no lm-head. Flush so this chunk's KV/state

@@ -4,6 +4,7 @@
 #pragma once
 
 #include "runtime/InferenceEngine.hpp"   // InferenceEngine + ServingSlotStep
+#include "runtime/TokenLogprobs.hpp"     // 8.19.14 optional logprob capture
 
 #include <cstddef>
 #include <cstdint>
@@ -54,7 +55,8 @@ public:
 
     /// See InferenceEngine::stepServing.
     void stepServing(std::span<const InferenceEngine::ServingSlotStep> steps,
-                     std::span<std::int32_t>                           outTokens);
+                     std::span<std::int32_t>                           outTokens,
+                     std::vector<runtime::TokenLogprobs>* outLp = nullptr);
 
     /// 8.19.5: set slot's sampling params for all subsequent tokens (first
     /// prefill token + every decode step) until the next call. seed==0 draws a
@@ -77,7 +79,8 @@ public:
     /// See InferenceEngine::prefillSlot.
     [[nodiscard]] std::int32_t
     prefillSlot(std::size_t slot, std::span<const std::int32_t> tokens,
-                std::size_t startPos, bool produceToken);
+                std::size_t startPos, bool produceToken,
+                runtime::TokenLogprobs* outLp = nullptr);
 
     /// 5.21-III MULTI-SLOT: prefill N contiguous slots [firstSlot, firstSlot+N)
     /// in ONE ragged batched forward (sbMixed). chunks[s]/startPositions[s]
@@ -89,7 +92,8 @@ public:
                           std::span<const std::span<const std::int32_t>> chunks,
                           std::span<const std::size_t>                   startPositions,
                           bool                                           produceToken,
-                          std::span<std::int32_t>                        outFirstTok);
+                          std::span<std::int32_t>                        outFirstTok,
+                          std::vector<runtime::TokenLogprobs>* outLp = nullptr);
 
     /// See InferenceEngine::servingPrefillChunk.
     [[nodiscard]] std::size_t prefillChunkSize() const noexcept;

@@ -18,6 +18,7 @@
 #include "runtime/BlockBuffers.hpp"
 #include "runtime/KvCache.hpp"
 #include "runtime/SsmState.hpp"
+#include "runtime/TokenLogprobs.hpp"
 #include "runtime/perf/OpProfiler.hpp"
 
 // L0-native includes are only pulled in when the L0 backend is
@@ -508,7 +509,8 @@ public:
     /// and recurrent state persist across calls. Requires a prior
     /// `ensureServingState`.
     void stepServing(std::span<const ServingSlotStep> steps,
-                     std::span<std::int32_t>          outTokens);
+                     std::span<std::int32_t>          outTokens,
+                     std::vector<TokenLogprobs>*      outLp = nullptr);
 
     /// 8.19.5: set `slot`'s sampling params for its first prefill token and
     /// every subsequent decode step until the slot is re-admitted. seed==0
@@ -538,7 +540,8 @@ public:
     /// (see `servingPrefillChunk`) and a prior `ensureServingState`.
     [[nodiscard]] std::int32_t
     prefillSlot(std::size_t slot, std::span<const std::int32_t> tokens,
-                std::size_t startPos, bool produceToken);
+                std::size_t startPos, bool produceToken,
+                TokenLogprobs* outLp = nullptr);
 
     /// Prefill chunk size C (max tokens per `prefillSlot` forward), or 0 when
     /// chunked prefill is disabled (MIMIRMIND_CHUNKED_PREFILL=0) — callers
@@ -556,7 +559,8 @@ public:
                              std::span<const std::span<const std::int32_t>> chunks,
                              std::span<const std::size_t>                   startPositions,
                              bool                                           produceToken,
-                             std::span<std::int32_t>                        outFirstTok);
+                             std::span<std::int32_t>                        outFirstTok,
+                             std::vector<TokenLogprobs>* outLp = nullptr);
 
     /// Per-mixed-forward token budget `nRowMax` (max summed tokens across the
     /// batched slots of one `prefillSlotsBatched` call), or 0 when chunked

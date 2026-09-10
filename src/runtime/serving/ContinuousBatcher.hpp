@@ -4,6 +4,7 @@
 #pragma once
 
 #include "compute/Sampling.hpp"
+#include "runtime/TokenLogprobs.hpp"
 
 #include <condition_variable>
 #include <cstddef>
@@ -57,6 +58,12 @@ struct ServingRequest {
     std::mutex               mtx;
     std::condition_variable  cv;
     std::vector<std::int32_t> tokens;    // generated ids, appended by worker
+    // 8.19.14 part B — parallel to `tokens` (same index, appended under the
+    // same lock). Populated only when the request asked for logprobs
+    // (SamplingParams::logprobsTopN >= 0); otherwise entries stay
+    // captured=false and the handler omits the logprobs field. May be empty
+    // for requests that never enabled logprobs.
+    std::vector<TokenLogprobs> logprobs;
     bool                     done{false};
     bool                     cancelled{false};
     bool                     overloaded{false};  // rejected: in-flight bound hit
@@ -231,7 +238,8 @@ private:
     /// multi-slot prefill paths.
     void commitPrefilledSlot(std::size_t slot,
                              const std::shared_ptr<ServingRequest>& req,
-                             std::int32_t firstTok);
+                             std::int32_t firstTok,
+                             TokenLogprobs firstLp = {});
 
     /// 5.21-III TRUE MIXED STEP — one ragged forward over the active prefix
     /// [0,nActive) folding each slot's next PREFILL chunk (seqT>1) OR its DECODE

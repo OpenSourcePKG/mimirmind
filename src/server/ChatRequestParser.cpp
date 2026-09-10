@@ -5,6 +5,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -330,6 +331,64 @@ ChatRequest parseChatRequest(const json& body) {
     readFloat(body, "frequency_penalty",  req.frequencyPenalty,  req.hasFrequencyPenalty);
     readFloat(body, "presence_penalty",   req.presencePenalty,   req.hasPresencePenalty);
     readFloat(body, "repetition_penalty", req.repetitionPenalty, req.hasRepetitionPenalty);
+    // 8.19.14 — min_p (vLLM extra).
+    readFloat(body, "min_p", req.minP, req.hasMinP);
+
+    // 8.19.14 part B — logprobs (bool) + top_logprobs (0..20). OpenAI requires
+    // logprobs=true for top_logprobs to apply; we clamp defensively.
+    if (const auto v = optBool(body, "logprobs")) { req.logprobs = *v; }
+    if (present(body, "top_logprobs")) {
+        const auto& tl = body["top_logprobs"];
+        if (!tl.is_number_integer()) {
+            throw ChatRequestError("top_logprobs must be an integer 0..20",
+                                   "top_logprobs");
+        }
+        req.topLogprobs = std::clamp(tl.get<int>(), 0, 20);
+    }
+
+    // 8.19.14 part B — vLLM bad_words: array of strings (tokenized by the
+    // handler). Non-string entries are a 400.
+    if (present(body, "bad_words")) {
+        const auto& bw = body["bad_words"];
+        if (!bw.is_array()) {
+            throw ChatRequestError("bad_words must be an array of strings",
+                                   "bad_words");
+        }
+        for (const auto& w : bw) {
+            if (!w.is_string()) {
+                throw ChatRequestError("bad_words entries must be strings",
+                                       "bad_words");
+            }
+            req.badWords.push_back(w.get<std::string>());
+        }
+    }
+
+    // 8.19.14 — OpenAI logit_bias: {"<token_id>": <bias>, ...}. Keys are token
+    // ids as strings; values are additive biases (OpenAI clamps to [-100,100]).
+    if (present(body, "logit_bias")) {
+        const auto& lb = body["logit_bias"];
+        if (!lb.is_object()) {
+            throw ChatRequestError(
+                "logit_bias must be an object mapping token id -> bias",
+                "logit_bias");
+        }
+        for (auto it = lb.begin(); it != lb.end(); ++it) {
+            if (!it.value().is_number()) {
+                throw ChatRequestError("logit_bias values must be numbers",
+                                       "logit_bias");
+            }
+            std::int32_t id = 0;
+            try {
+                id = static_cast<std::int32_t>(std::stol(it.key()));
+            } catch (const std::exception&) {
+                throw ChatRequestError(
+                    "logit_bias keys must be integer token ids", "logit_bias");
+            }
+            float bias = it.value().get<float>();
+            bias = std::clamp(bias, -100.0F, 100.0F);
+            req.logitBias.emplace_back(id, bias);
+        }
+    }
 
     // Reasoning toggle (vLLM-compatible). Accept a top-level `enable_thinking`
     // and the nested `chat_template_kwargs: {enable_thinking: <bool>}`.
@@ -394,9 +453,9 @@ ChatRequest parseChatRequest(const json& body) {
 
     // OpenAI response_format: {type:"text"|"json_object"|"json_schema"}. Shape
     // is validated (a malformed value is a 400); the requested format is
-    // recorded on the request. Enforcement (grammar-constrained decoding) is
-    // not yet implemented, so json_object/json_schema are accepted best-effort
-    // and never faked in the response (8.19 Increment 2).
+    // recorded and ENFORCED via xgrammar decode-time masking (8.19.13.4).
+    // For json_schema the schema object (response_format.json_schema.schema)
+    // is captured verbatim for FromJSONSchema.
     if (present(body, "response_format")) {
         const auto& rf = body["response_format"];
         if (!rf.is_object() || !rf.contains("type") || !rf["type"].is_string()) {
@@ -411,6 +470,18 @@ ChatRequest parseChatRequest(const json& body) {
             req.responseFormat = ResponseFormat::JsonObject;
         } else if (t == "json_schema") {
             req.responseFormat = ResponseFormat::JsonSchema;
+            // OpenAI shape: {type:"json_schema", json_schema:{name, schema:{…}}}.
+            // Capture the inner `schema` (the JSON-Schema object) for xgrammar.
+            if (rf.contains("json_schema") && rf["json_schema"].is_object()
+                && rf["json_schema"].contains("schema")
+                && rf["json_schema"]["schema"].is_object()) {
+                req.jsonSchema = rf["json_schema"]["schema"].dump();
+            } else {
+                throw ChatRequestError(
+                    "response_format.json_schema.schema (a JSON-Schema object) "
+                    "is required when type is json_schema",
+                    "response_format");
+            }
         } else {
             throw ChatRequestError(
                 "response_format.type must be text, json_object or json_schema",

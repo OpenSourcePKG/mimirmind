@@ -26,6 +26,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -80,29 +81,105 @@ inline void normalizeToolCallNames(std::vector<model::ToolCall>& calls,
     }
 }
 
-/// Build the per-request tool-call grammar constraint (8.19.13.2). Gated on
-/// MIMIRMIND_TOOL_GRAMMAR=1 (default OFF while the constraint is validated), a
-/// non-empty toolset, and tool_choice != "none". Returns nullptr (no
-/// constraint) otherwise, so the sampler is untouched.
+/// The 8.19.13.2 token-mask gate. 8.19.13.3: default ON (server-decided — this
+/// is what vLLM/llama.cpp do for tool calls, and it is the only thing that
+/// makes tool_choice:"required" structurally leak-proof). Opt-OUT rollback
+/// hatch only: MIMIRMIND_TOOL_GRAMMAR=0 disables the mask (e.g. to A/B a
+/// suspected regression); unset or any other value keeps it ON.
+inline bool toolGrammarEnabled() {
+    static const bool on = []() {
+        const char* e = std::getenv("MIMIRMIND_TOOL_GRAMMAR");
+        return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+
+/// Build the per-request tool-call grammar constraint (8.19.13.2). Active for a
+/// non-empty toolset with tool_choice != "none" while the mask is enabled;
+/// returns nullptr otherwise so the sampler is untouched.
 inline std::shared_ptr<model::ToolCallConstraint> makeToolConstraint(
         std::span<const model::ToolSpec> tools, const model::Tokenizer& tok,
         const std::string& toolChoice) {
-    static const bool on = []() {
-        const char* e = std::getenv("MIMIRMIND_TOOL_GRAMMAR");
-        return e != nullptr && e[0] == '1' && e[1] == '\0';
-    }();
-    if (!on || tools.empty() || toolChoice == "none") { return nullptr; }
+    if (!toolGrammarEnabled() || tools.empty() || toolChoice == "none") {
+        return nullptr;
+    }
+    // 8.19.13.3: trigger-dispatched for BOTH auto and required. The
+    // QwenChatML "required" forced-opener prefills only `<tool_call>\n` (see
+    // toolCallOpenerIds) — NOT `<function=`, which is the TagDispatch trigger.
+    // So the model still emits `<function=` itself; the trigger fires and the
+    // grammar then masks NAME (to an offered tool) + parameter keys from that
+    // point, killing the `<parameter=`/`<|im_end|>`-into-the-NAME leak while
+    // keeping the block parseable (`<function=NAME>…` is what parseQwenXml
+    // keys on). Body-rooted (assumeOpenerConsumed=true) is reserved for the
+    // salvage re-decode, which prefills the fuller `<tool_call>\n<function=`.
     auto c = std::make_shared<model::ToolCallConstraint>(tools, tok);
     return c->active() ? c : nullptr;
 }
 
-/// True when MIMIRMIND_TOOL_GRAMMAR=1 (the 8.19.13.2 token-mask gate).
-inline bool toolGrammarEnabled() {
-    static const bool on = []() {
-        const char* e = std::getenv("MIMIRMIND_TOOL_GRAMMAR");
-        return e != nullptr && e[0] == '1' && e[1] == '\0';
-    }();
-    return on;
+/// 8.19.13.4 — pick the decode-time grammar constraint for the PRIMARY decode:
+/// the tool-call grammar when tools are offered, else a `response_format` JSON
+/// grammar when the client asked for json_object / json_schema (enforced, not
+/// best-effort). Shares the MIMIRMIND_TOOL_GRAMMAR=0 kill-switch. Returns
+/// nullptr (sampler untouched) otherwise. NOTE: JSON mode roots the grammar at
+/// token 0, so it assumes thinking is OFF (the server default) — an explicit
+/// enable_thinking=true together with a JSON response_format is contradictory
+/// and the JSON grammar wins (no <think> can be emitted).
+inline std::shared_ptr<model::ToolCallConstraint> makeDecodeConstraint(
+        std::span<const model::ToolSpec> tools, const std::string& toolChoice,
+        ResponseFormat responseFormat, std::string_view jsonSchema,
+        const model::Tokenizer& tok) {
+    if (!tools.empty()) {
+        return makeToolConstraint(tools, tok, toolChoice);
+    }
+    if (!toolGrammarEnabled()) { return nullptr; }
+    if (responseFormat == ResponseFormat::JsonObject) {
+        return model::ToolCallConstraint::forResponseFormatJson(tok, {});
+    }
+    if (responseFormat == ResponseFormat::JsonSchema) {
+        return model::ToolCallConstraint::forResponseFormatJson(tok, jsonSchema);
+    }
+    return nullptr;
+}
+
+/// 8.19.14 part B — build the OpenAI `logprobs` object (`{content:[...]}`) from
+/// the generated token stream + its captured per-token logprobs. Emitted over
+/// the GENERATED tokens (the model's raw output, like vLLM); token pieces +
+/// UTF-8 bytes are decoded here (the serving layer stays tokenizer-agnostic).
+inline nlohmann::json logprobEntryJson(std::int32_t tokId,
+                                       const runtime::TokenLogprobs& lp,
+                                       const model::Tokenizer& tok) {
+    const auto bytesOf = [](const std::string& s) {
+        nlohmann::json b = nlohmann::json::array();
+        for (unsigned char c : s) { b.push_back(static_cast<int>(c)); }
+        return b;
+    };
+    const auto decode1 = [&tok](std::int32_t id) {
+        return tok.decode(std::vector<std::int32_t>{id}, /*skipSpecial=*/false);
+    };
+    const std::string piece = decode1(tokId);
+    nlohmann::json top = nlohmann::json::array();
+    for (const auto& tp : lp.top) {
+        const std::string p = decode1(tp.token);
+        top.push_back({{"token", p},
+                       {"logprob", tp.logprob},
+                       {"bytes", bytesOf(p)}});
+    }
+    return nlohmann::json{{"token", piece},
+                          {"logprob", lp.logprob},
+                          {"bytes", bytesOf(piece)},
+                          {"top_logprobs", std::move(top)}};
+}
+
+inline nlohmann::json buildLogprobsJson(
+        const std::vector<std::int32_t>&                  generated,
+        const std::vector<runtime::TokenLogprobs>&        lp,
+        const model::Tokenizer&                           tok) {
+    nlohmann::json content = nlohmann::json::array();
+    for (std::size_t i = 0; i < generated.size() && i < lp.size(); ++i) {
+        if (!lp[i].captured) { continue; }
+        content.push_back(logprobEntryJson(generated[i], lp[i], tok));
+    }
+    return nlohmann::json{{"content", std::move(content)}};
 }
 
 /// True if any parsed call names a non-offered tool OR omits a required schema
@@ -157,7 +234,9 @@ std::vector<std::int32_t> runViaBatcher(
         std::vector<std::int32_t>                 stopIds,
         std::string                               tenantId,
         const std::function<bool(std::int32_t)>&  onToken,
-        std::shared_ptr<model::ToolCallConstraint> constraint = nullptr) {
+        std::shared_ptr<model::ToolCallConstraint> constraint = nullptr,
+        std::vector<runtime::TokenLogprobs>*       outLp = nullptr,
+        const std::function<void(const runtime::TokenLogprobs&)>* onLp = nullptr) {
     // 8.19.5: hand the request's sampling params to the batcher so the slot
     // decodes with them (temperature<=0 stays the greedy fast path).
     // 8.19.13.2: an optional tool-call grammar constraint rides along.
@@ -170,11 +249,23 @@ std::vector<std::int32_t> runViaBatcher(
     bool aborted = false;
     while (req->waitToken(next, t)) {
         out.push_back(t);
+        // 8.19.14 part B — per-token logprob callback (streaming). req->logprobs
+        // is appended under the same lock as the token, so index `next` is ready.
+        if (onLp != nullptr && *onLp) {
+            std::lock_guard<std::mutex> lk(req->mtx);
+            if (next < req->logprobs.size()) { (*onLp)(req->logprobs[next]); }
+        }
         ++next;
         if (onToken && !onToken(t)) { aborted = true; break; }
     }
     if (aborted) {
         batcher.cancel(req);
+    }
+    // 8.19.14 part B — hand back the per-token logprobs (aligned with `out`);
+    // populated only when the request enabled logprobs.
+    if (outLp != nullptr) {
+        std::lock_guard<std::mutex> lk(req->mtx);
+        *outLp = req->logprobs;
     }
     if (!req->error.empty()) {
         // Per-tenant quota is checked before the whole-server overload: both
@@ -386,6 +477,27 @@ bool ChatCompletionHandler::prepareChatRequest(
     params.sampling.topP = cr.topP;
     params.sampling.topK = cr.topK;
     params.sampling.seed = cr.seed;
+    // 8.19.14 — min_p (explicit value, incl. 0, wins) + logit_bias.
+    if (cr.hasMinP) { params.sampling.minP = cr.minP; }
+    params.sampling.logitBias = cr.logitBias;
+    // 8.19.14 part B — logprobs capture: -1 disabled, else top_logprobs count.
+    params.sampling.logprobsTopN = cr.logprobs ? cr.topLogprobs : -1;
+    // 8.19.14 part B — bad_words: tokenize each (no BOS) to a ban sequence.
+    // BPE tokenizes a word differently at a word boundary (a leading space is
+    // part of the piece: " Paris" != "Paris"), so add BOTH the raw and the
+    // space-prefixed encoding — mirrors vLLM adding the add_prefix_space
+    // variant — else a mid-sentence occurrence slips the ban.
+    if (!cr.badWords.empty()) {
+        params.sampling.badWords.reserve(cr.badWords.size() * 2);
+        for (const auto& w : cr.badWords) {
+            for (const std::string& variant : {w, " " + w}) {
+                auto ids = tok.encode(variant, /*addBos=*/false);
+                if (!ids.empty()) {
+                    params.sampling.badWords.push_back(std::move(ids));
+                }
+            }
+        }
+    }
 
     // 8.19.7 — model-recommended truncation for sampled requests. A client
     // that asks for sampling (temperature>0) without its own top_p/top_k
@@ -639,6 +751,7 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
 
     runtime::GenerateStats stats;
     std::vector<std::int32_t> generated;
+    std::vector<runtime::TokenLogprobs> lpVec;   // 8.19.14 part B (batcher path)
 
     // Reserve the response id up-front so the /v1/system/status
     // snapshot can carry it while the request is still running.
@@ -716,8 +829,11 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         try {
             generated = runViaBatcher(*activeBatcher, promptIds, params,
                                       stopIds, tenant, onToken,
-                                      makeToolConstraint(cr.tools, tok,
-                                                         cr.toolChoice));
+                                      makeDecodeConstraint(
+                                          cr.tools, cr.toolChoice,
+                                          cr.responseFormat, cr.jsonSchema,
+                                          tok),
+                                      cr.logprobs ? &lpVec : nullptr);
         } catch (const runtime::serving::ServingTenantQuotaError& e) {
             // Per-tenant fairness shed, not a bug: retryable 429.
             _metrics.recordQuotaRejected(tenant);
@@ -1137,6 +1253,10 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                 {"index", 0},
                 {"message", std::move(message)},
                 {"finish_reason", finish},
+                // 8.19.14 part B — OpenAI logprobs (null unless requested).
+                {"logprobs", cr.logprobs
+                                 ? buildLogprobsJson(generated, lpVec, tok)
+                                 : json(nullptr)},
             },
         })},
         {"usage", std::move(usage)},
@@ -1307,6 +1427,14 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
         model::ChatTemplate::ToolFormat toolFormat{
             model::ChatTemplate::ToolFormat::HermesJson};
         std::vector<model::ToolSpec>  toolSpecs;
+        // 8.19.13.3: needed to build the primary-decode grammar constraint with
+        // the right root ("required" prefills the opener → body-rooted).
+        std::string                   toolChoice;
+        // 8.19.13.4: response_format JSON enforcement on the streaming path.
+        ResponseFormat                responseFormat{ResponseFormat::Text};
+        std::string                   jsonSchema;
+        // 8.19.14 part B: emit delta.logprobs chunks on the streaming path.
+        bool                          logprobsWanted{false};
         model::ToolCallStreamDetector toolCallDetector;
         int                           nextToolCallIndex{0};
         bool                          anyToolCallEmitted{false};
@@ -1380,6 +1508,10 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
     state->toolFormat       = model::ChatTemplate::toolFormatFromArch(
         engine.config().architecture);
     state->toolSpecs        = cr.tools;
+    state->toolChoice       = cr.toolChoice;
+    state->responseFormat   = cr.responseFormat;
+    state->jsonSchema       = cr.jsonSchema;
+    state->logprobsWanted   = cr.logprobs;
     state->toolCallDetector = model::ToolCallStreamDetector(
         style, state->toolCallsEnabled, forcedToolOpener);
     // M-Munin.3 (full): move (not copy) the pin into state so it outlives
@@ -1740,10 +1872,38 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
             const bool useBatcher = activeBatcher != nullptr;
             if (useBatcher) {
                 try {
+                    // 8.19.13.3: mask the primary decode to the tool-call
+                    // grammar (body-rooted for "required" — the opener is
+                    // prefilled). Mirrors the blocking path; the streaming
+                    // twin previously ran the primary decode unconstrained.
+                    // 8.19.14 part B — per-token logprobs chunk (streaming).
+                    std::function<void(const runtime::TokenLogprobs&)> onLpFn;
+                    if (state->logprobsWanted) {
+                        onLpFn = [&](const runtime::TokenLogprobs& lp) {
+                            if (!lp.captured) { return; }
+                            nlohmann::json content = nlohmann::json::array();
+                            content.push_back(
+                                logprobEntryJson(lp.token, lp, tok));
+                            if (!SseEncoder::writeSseEvent(
+                                    sink, SseEncoder::buildLogprobsChunk(
+                                              state->respId, state->created,
+                                              state->echoModel,
+                                              std::move(content)))) {
+                                clientGone = true;
+                            }
+                        };
+                    }
                     generated = runViaBatcher(*activeBatcher,
                                               state->promptIds, state->params,
                                               state->stopIds, state->tenantId,
-                                              onToken);
+                                              onToken,
+                                              makeDecodeConstraint(
+                                                  state->toolSpecs,
+                                                  state->toolChoice,
+                                                  state->responseFormat,
+                                                  state->jsonSchema, tok),
+                                              /*outLp=*/nullptr,
+                                              onLpFn ? &onLpFn : nullptr);
                 } catch (const runtime::serving::ServingTenantQuotaError& e) {
                     // Race-path 429 (pre-check in handle() sheds the rest).
                     this->_metrics.recordQuotaRejected(state->tenantId);

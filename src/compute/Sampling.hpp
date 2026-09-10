@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <random>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace mimirmind::compute {
@@ -49,8 +50,35 @@ struct SamplingParams {
     /// tokens whose cumulative probability >= topP, then renormalize.
     float        topP{1.0F};
 
+    /// 8.19.14 — min-p (vLLM). 0 => disabled. Otherwise, after softmax, drop
+    /// every token whose probability is below `minP * maxProb`, then
+    /// renormalize. Applied BEFORE top-P. Keeps at least the argmax token.
+    float        minP{0.0F};
+
+    /// 8.19.14 — OpenAI `logit_bias`: additive bias per token id, applied to
+    /// the raw logits BEFORE temperature/softmax (like OpenAI/vLLM). Empty =>
+    /// disabled. Non-empty forces the scratch path (and breaks the greedy
+    /// fast-path, since it reorders argmax). Owned here so a per-slot copy
+    /// keeps it alive for the request's lifetime.
+    std::vector<std::pair<std::int32_t, float>> logitBias;
+
+    /// 8.19.14 part B — bad_words (vLLM): each entry is the TOKEN-ID SEQUENCE of
+    /// one banned word. The sampler masks a sequence's LAST token to -inf only
+    /// when the recent-token tail already matches the preceding ids (a
+    /// single-token entry is always masked) — i.e. it forbids COMPLETING a bad
+    /// word, matching vLLM's NoBadWordsLogitsProcessor. Empty => disabled;
+    /// non-empty forces the scratch path and disqualifies the greedy fast-path.
+    std::vector<std::vector<std::int32_t>> badWords;
+
     /// Seed for the RNG. 0 => non-deterministic (std::random_device).
     std::uint64_t seed{0};
+
+    /// 8.19.14 part B — OpenAI logprobs request (NOT a sampling modifier; the
+    /// Sampler ignores it). -1 => disabled (default). >=0 => capture this
+    /// token's log-prob; the value is `top_logprobs` (N alternatives to also
+    /// return, 0 => chosen only). Read by the serving decode path to route the
+    /// slot off the GPU-argmax fast path and fill runtime::TokenLogprobs.
+    int          logprobsTopN{-1};
 
     /// OpenAI-compatible frequency penalty. Range typically [-2, 2].
     /// 0 => disabled. Positive discourages repeat tokens proportional
