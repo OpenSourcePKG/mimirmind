@@ -65,6 +65,9 @@ struct ChatRequest {
     // meaningful when logprobs=true). Populates choices[].logprobs.content[].
     bool                            logprobs{false};
     int                             topLogprobs{0};
+    // 8.19.14 part B — vLLM `bad_words`: raw strings; the handler tokenizes
+    // each to a token-id sequence for compute::SamplingParams::badWords.
+    std::vector<std::string>        badWords;
     std::uint64_t                   seed{0};
     std::vector<std::string>        stopStrings;
     bool                            stream{false};

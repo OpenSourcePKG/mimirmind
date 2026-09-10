@@ -469,6 +469,22 @@ bool ChatCompletionHandler::prepareChatRequest(
     params.sampling.logitBias = cr.logitBias;
     // 8.19.14 part B — logprobs capture: -1 disabled, else top_logprobs count.
     params.sampling.logprobsTopN = cr.logprobs ? cr.topLogprobs : -1;
+    // 8.19.14 part B — bad_words: tokenize each (no BOS) to a ban sequence.
+    // BPE tokenizes a word differently at a word boundary (a leading space is
+    // part of the piece: " Paris" != "Paris"), so add BOTH the raw and the
+    // space-prefixed encoding — mirrors vLLM adding the add_prefix_space
+    // variant — else a mid-sentence occurrence slips the ban.
+    if (!cr.badWords.empty()) {
+        params.sampling.badWords.reserve(cr.badWords.size() * 2);
+        for (const auto& w : cr.badWords) {
+            for (const std::string& variant : {w, " " + w}) {
+                auto ids = tok.encode(variant, /*addBos=*/false);
+                if (!ids.empty()) {
+                    params.sampling.badWords.push_back(std::move(ids));
+                }
+            }
+        }
+    }
 
     // 8.19.7 — model-recommended truncation for sampled requests. A client
     // that asks for sampling (temperature>0) without its own top_p/top_k

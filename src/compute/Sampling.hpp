@@ -62,6 +62,14 @@ struct SamplingParams {
     /// keeps it alive for the request's lifetime.
     std::vector<std::pair<std::int32_t, float>> logitBias;
 
+    /// 8.19.14 part B — bad_words (vLLM): each entry is the TOKEN-ID SEQUENCE of
+    /// one banned word. The sampler masks a sequence's LAST token to -inf only
+    /// when the recent-token tail already matches the preceding ids (a
+    /// single-token entry is always masked) — i.e. it forbids COMPLETING a bad
+    /// word, matching vLLM's NoBadWordsLogitsProcessor. Empty => disabled;
+    /// non-empty forces the scratch path and disqualifies the greedy fast-path.
+    std::vector<std::vector<std::int32_t>> badWords;
+
     /// Seed for the RNG. 0 => non-deterministic (std::random_device).
     std::uint64_t seed{0};
 

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace mimirmind::compute {
@@ -129,6 +130,8 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
     // 8.19.14 — logit_bias mutates the raw logits and reorders argmax, so it
     // forces the scratch path AND disqualifies the greedy fast-path below.
     const bool biasOn    = !params.logitBias.empty();
+    // 8.19.14 — bad_words masks the completing token to -inf; same treatment.
+    const bool badWordsOn = !params.badWords.empty();
     // Greedy: deterministic argmax, no RNG use.
     const bool greedy    = (params.temperature <= 0.0F || params.topK == 1);
 
@@ -139,7 +142,7 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
     // V transcendentals that would otherwise run on every greedy token
     // (Gemma 4 ships softcap on by default). Penalties genuinely reorder,
     // so they still force the scratch path below.
-    if (greedy && !penaltyOn && !biasOn) {
+    if (greedy && !penaltyOn && !biasOn && !badWordsOn) {
         return argmaxRow(logits);
     }
 
@@ -150,7 +153,7 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
     // `softcap(penalty(x))` for repetition and frequency penalties, and
     // the target parity we care about is `penalty(softcap(x))`.
     std::span<const float> effLogits = logits;
-    if (softcapOn || penaltyOn || biasOn) {
+    if (softcapOn || penaltyOn || biasOn || badWordsOn) {
         _penaltyLogits.assign(logits.begin(), logits.end());
         if (softcapOn) {
             applyFinalLogitSoftcapInPlace(std::span<float>{_penaltyLogits},
@@ -159,14 +162,36 @@ std::int32_t Sampler::sample(std::span<const float>        logits,
         if (penaltyOn) {
             applyPenalties(recentTokens, params);
         }
+        const std::int32_t V =
+            static_cast<std::int32_t>(_penaltyLogits.size());
         if (biasOn) {
             // OpenAI logit_bias: additive, pre-temperature. Out-of-range ids
             // are ignored (defensive).
-            const std::int32_t V =
-                static_cast<std::int32_t>(_penaltyLogits.size());
             for (const auto& [id, bias] : params.logitBias) {
                 if (id >= 0 && id < V) {
                     _penaltyLogits[static_cast<std::size_t>(id)] += bias;
+                }
+            }
+        }
+        if (badWordsOn) {
+            // 8.19.14 bad_words: ban the token that would COMPLETE a bad-word
+            // sequence — mask its logit to -inf when the recent-token tail
+            // already matches the sequence's prefix (a 1-token entry always
+            // bans). Mirrors vLLM's NoBadWordsLogitsProcessor.
+            const float negInf = -std::numeric_limits<float>::infinity();
+            const std::size_t rn = recentTokens.size();
+            for (const auto& seq : params.badWords) {
+                if (seq.empty()) { continue; }
+                const std::size_t pfx = seq.size() - 1;
+                bool match = (pfx <= rn);
+                for (std::size_t k = 0; match && k < pfx; ++k) {
+                    if (recentTokens[rn - pfx + k] != seq[k]) { match = false; }
+                }
+                if (match) {
+                    const std::int32_t ban = seq.back();
+                    if (ban >= 0 && ban < V) {
+                        _penaltyLogits[static_cast<std::size_t>(ban)] = negInf;
+                    }
                 }
             }
         }

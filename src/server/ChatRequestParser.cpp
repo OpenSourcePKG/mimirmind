@@ -346,6 +346,23 @@ ChatRequest parseChatRequest(const json& body) {
         req.topLogprobs = std::clamp(tl.get<int>(), 0, 20);
     }
 
+    // 8.19.14 part B — vLLM bad_words: array of strings (tokenized by the
+    // handler). Non-string entries are a 400.
+    if (present(body, "bad_words")) {
+        const auto& bw = body["bad_words"];
+        if (!bw.is_array()) {
+            throw ChatRequestError("bad_words must be an array of strings",
+                                   "bad_words");
+        }
+        for (const auto& w : bw) {
+            if (!w.is_string()) {
+                throw ChatRequestError("bad_words entries must be strings",
+                                       "bad_words");
+            }
+            req.badWords.push_back(w.get<std::string>());
+        }
+    }
+
     // 8.19.14 — OpenAI logit_bias: {"<token_id>": <bias>, ...}. Keys are token
     // ids as strings; values are additive biases (OpenAI clamps to [-100,100]).
     if (present(body, "logit_bias")) {
