@@ -1077,6 +1077,10 @@ void InferenceEngine::resetCache() noexcept {
         _kvCache->reset();
     }
     _cachedTokens.clear();
+    // 5.28.1.1: the SSM snapshot is tied to _cachedTokens; drop it so a fresh
+    // conversation can never restore a stale recurrent state. (The state slab
+    // itself is re-zeroed lazily by the backend on the next length==0 forward.)
+    _ssmSnapValid = false;
 }
 
 void InferenceEngine::setKvDtype(KvDtype dtype) {
@@ -1504,6 +1508,34 @@ void InferenceEngine::selectPrefixSlot(std::span<const std::int32_t> promptIds) 
     _activeLastUsed = now;
 }
 
+bool InferenceEngine::backendNeedsSsmScratch() const noexcept {
+    return _backend != nullptr && _backend->needsSsmScratch();
+}
+
+bool InferenceEngine::gdnPrefixCkptEnabled() {
+    if (_gdnPrefixCkpt < 0) {
+        _gdnPrefixCkpt = 0;
+        if (const char* s = std::getenv("MIMIRMIND_GDN_PREFIX_CKPT")) {
+            if (std::atol(s) > 0) {
+                _gdnPrefixCkpt = 1;
+            }
+        }
+        if (_gdnPrefixCkpt == 1) {
+            MM_LOG_INFO("ssmstate",
+                        "GDN prefix-cache checkpoint ENABLED "
+                        "(MIMIRMIND_GDN_PREFIX_CKPT) — single-session "
+                        "continuation reuse; snapshot ~{} MiB/seq",
+                        _ssmState != nullptr
+                            ? (_ssmState->blockCount() *
+                               (_ssmState->stateLayerStride() +
+                                _ssmState->convStateLayerStride()) *
+                               sizeof(float)) / (1024 * 1024)
+                            : 0);
+        }
+    }
+    return _gdnPrefixCkpt == 1;
+}
+
 std::vector<std::int32_t>
 InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                           const GenerateParams&           params,
@@ -1630,23 +1662,67 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     // re-run prefill for the final prompt token, because sampleNext()
     // reads its hidden state directly from xBuf (the cache only stores
     // K/V, not the hidden state that feeds the lm-head).
-    // Backends with a recurrent SSM/GatedDeltaNet state cannot prefix-reuse:
-    // the linear layers hold a running recurrence whose value at position `lcp`
-    // depends on every token in [0, lcp), and that state lives outside the KV
-    // cache. Worse, the per-block seq-start zero fires on `cache.length() == 0`
-    // (see Qwen3_5MoeBackend::runLinearBlock) — a non-zero prefix leaves the KV
-    // length at `lcp`, so the SSM state is never zeroed and carries over from
-    // the previous request, degrading generation on every call after the first.
-    // Force a full prefill (lcp = 0) so the recurrence replays from a zeroed
-    // state each request. Pure-attention models keep the M9.1 prefix cache.
-    std::size_t lcp = _backend->needsSsmScratch()
-        ? 0
-        : longestCommonPrefix(promptIds,
-                              std::span<const std::int32_t>{_cachedTokens});
-    if (lcp >= Tp) {
-        lcp = Tp - 1;
+    // Backends with a recurrent SSM/GatedDeltaNet state normally cannot
+    // prefix-reuse: the linear layers hold a running recurrence whose value at
+    // position `lcp` depends on every token in [0, lcp), and that state lives
+    // outside the KV cache. The per-block seq-start zero fires on
+    // `cache.length() == 0` (see Qwen3_5MoeBackend::runLinearBlock) — a
+    // non-zero prefix leaves the KV length at `lcp`, so the SSM state is never
+    // zeroed and would carry over from the previous request, degrading
+    // generation on every call after the first (the cross-request
+    // contamination that forced lcp=0). So the default remains lcp=0: a full
+    // prefill replays the recurrence from a zeroed state each request.
+    //
+    // 5.28.1.1: when the GDN prefix-cache checkpoint capability is on AND this
+    // request is a PURE CONTINUATION of the cached sequence (the new prompt
+    // extends the entire cached prefix), restore the end-of-prefill SSM
+    // snapshot instead and reuse the prefix. Reuse is bit-exact for the
+    // recurrence (roadmap 5.28.1.0 gate) so there is no contamination. Any
+    // shorter match (branch / shared preamble only) still falls back to lcp=0;
+    // interior checkpoints that would lift that restriction are Inc 3.
+    bool        ssmReuse = false;
+    std::size_t lcp;
+    if (_backend->needsSsmScratch()) {
+        lcp = 0;
+        if (gdnPrefixCkptEnabled() && _ssmSnapValid && !_cachedTokens.empty()) {
+            const std::size_t match = longestCommonPrefix(
+                promptIds, std::span<const std::int32_t>{_cachedTokens});
+            // The single checkpoint sits at _cachedTokens.size()
+            // (== _ssmSnapTokens). Reuse only when the whole cached sequence is
+            // a prefix of this prompt (pure continuation) and at least one new
+            // token remains to prefill (so the last-token hidden state is still
+            // recomputed). Identical re-submissions (match == Tp) take the safe
+            // full-replay path — the checkpoint is one token past where a
+            // truncated re-prefill would need it.
+            if (match == _cachedTokens.size() && match == _ssmSnapTokens &&
+                match >= 1 && match < Tp) {
+                lcp      = match;
+                ssmReuse = true;
+            }
+        }
+    } else {
+        lcp = longestCommonPrefix(promptIds,
+                                  std::span<const std::int32_t>{_cachedTokens});
+        if (lcp >= Tp) {
+            lcp = Tp - 1;
+        }
     }
     cache.truncate(lcp);
+
+    // 5.28.1.1: restore the recurrent state to position `lcp` before prefill.
+    // runLinearBlock only zeroes the SSM state when cache.length()==0; here
+    // cache.length()==lcp!=0, so without this the linear layers would run on
+    // the previous request's leftover state. The restore lands the exact state
+    // after tokens [0,lcp) into the slab the backend reads (its pointers were
+    // bound in ensureCapacity), so prefill [lcp,Tp) continues the recurrence.
+    if (ssmReuse && _ssmState != nullptr) {
+        const std::size_t stBytes =
+            _ssmState->blockCount() * _ssmState->stateLayerStride() * sizeof(float);
+        const std::size_t cvBytes =
+            _ssmState->blockCount() * _ssmState->convStateLayerStride() * sizeof(float);
+        _ops->appendMemoryCopy(_ssmState->statePtr(),     _ssmSnapState.get(), stBytes);
+        _ops->appendMemoryCopy(_ssmState->convStatePtr(), _ssmSnapConv.get(),  cvBytes);
+    }
     const std::size_t prefillStart = lcp;
     const std::size_t prefillCount = Tp - lcp;
 
@@ -2320,6 +2396,28 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                              generated.begin(),
                              generated.begin() +
                                  static_cast<std::ptrdiff_t>(take));
+
+        // 5.28.1.1: capture the end-of-prefill/decode SSM+conv snapshot so the
+        // next pure-continuation request can restore it instead of replaying
+        // the recurrence from zero. At this point _ssmState holds the state
+        // after all committed tokens, i.e. position _cachedTokens.size() ==
+        // cache.length(). The copy is queued on the same stream as the next
+        // request's restore, so ordering is preserved without an explicit
+        // flush. Opt-in via the GDN prefix-cache checkpoint capability.
+        if (_ssmState != nullptr && gdnPrefixCkptEnabled()) {
+            const std::size_t stBytes =
+                _ssmState->blockCount() * _ssmState->stateLayerStride() * sizeof(float);
+            const std::size_t cvBytes =
+                _ssmState->blockCount() * _ssmState->convStateLayerStride() * sizeof(float);
+            if (_ssmSnapState.get() == nullptr) {
+                _ssmSnapState = _ops->allocate(stBytes);
+                _ssmSnapConv  = _ops->allocate(cvBytes);
+            }
+            _ops->appendMemoryCopy(_ssmSnapState.get(), _ssmState->statePtr(),     stBytes);
+            _ops->appendMemoryCopy(_ssmSnapConv.get(),  _ssmState->convStatePtr(), cvBytes);
+            _ssmSnapValid  = true;
+            _ssmSnapTokens = _cachedTokens.size();
+        }
     }
 
     if (outStats != nullptr) {
@@ -2738,6 +2836,18 @@ std::int32_t InferenceEngine::prefillSlot(std::size_t slot,
     }
     return _servingSession->prefillSlot(slot, tokens, startPos, produceToken,
                                         outLp);
+}
+
+void InferenceEngine::snapshotSlotPromptSsm(std::size_t slot) {
+    if (_servingSession != nullptr) {
+        _servingSession->snapshotSlotPromptSsm(slot);
+    }
+}
+
+void InferenceEngine::restoreSlotPromptSsm(std::size_t slot) {
+    if (_servingSession != nullptr) {
+        _servingSession->restoreSlotPromptSsm(slot);
+    }
 }
 
 std::size_t InferenceEngine::servingPrefillChunk() const {

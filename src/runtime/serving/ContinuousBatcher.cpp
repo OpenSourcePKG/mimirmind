@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <exception>
 #include <span>
 #include <string_view>
@@ -91,6 +92,16 @@ ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
     if (const char* pg = std::getenv("MIMIRMIND_MIXED_STEP_PRESSURE")) {
         _mixedStepPressureGate = (pg[0] == '1' && pg[1] == '\0');
     }
+    // 5.28.1.2.a — GDN warm-slot session affinity. Only for SSM/GatedDeltaNet
+    // backends (the recurrent state is what re-prefill otherwise replays from
+    // zero); pure-attention serving already has no per-turn GDN cost. Server
+    // decides via the capability env; default OFF until on-box concurrency +
+    // HTTP-anchor validation. Warm-slot rides the EAGER prefill path (mixed-step
+    // is a separate, currently-off scheduler); disable it if eager prefill is off.
+    if (const char* wc = std::getenv("MIMIRMIND_GDN_PREFIX_CKPT")) {
+        _warmSlot = (std::atol(wc) > 0) && _engine.backendNeedsSsmScratch() &&
+                    _prefillChunk > 0;
+    }
     _slots.resize(maxBatch);
     _running = true;
     _worker  = std::thread(&ContinuousBatcher::workerLoop, this);
@@ -98,11 +109,12 @@ ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
                 "ContinuousBatcher: started (maxBatch={} maxContext={} "
                 "maxInflight={} maxInflightPerTenant={} eosId={} prefillChunk={} "
                 "mixedBatchPrefill={} mixedStep={} mixedStepPressureGate={} "
-                "prefillMaxRows={})",
+                "prefillMaxRows={} gdnWarmSlot={})",
                 maxBatch, maxContext, _maxInflight,
                 _maxInflightPerTenant, eosId, _prefillChunk,
                 _mixedBatchPrefill ? 1 : 0, _mixedStep ? 1 : 0,
-                (_mixedStep && _mixedStepPressureGate) ? 1 : 0, _prefillMaxRows);
+                (_mixedStep && _mixedStepPressureGate) ? 1 : 0, _prefillMaxRows,
+                _warmSlot ? 1 : 0);
 }
 
 ContinuousBatcher::~ContinuousBatcher() {
@@ -118,6 +130,79 @@ ContinuousBatcher::~ContinuousBatcher() {
 
 bool ContinuousBatcher::isStop(std::int32_t tok, const Slot& s) const {
     return std::find(s.stopIds.begin(), s.stopIds.end(), tok) != s.stopIds.end();
+}
+
+void ContinuousBatcher::retireSlot(Slot& s, bool keepWarm) {
+    // 5.28.1.2.a — a request has ended on this slot. Warm retention keeps the
+    // slot's KV rows + SSM sub-slab + fed-token history alive (occupied=false so
+    // it is admissible, resident=true so findWarmSlot can match it) for a
+    // pure-continuation follow-up. Only when the capability is on AND the slot
+    // actually accumulated a token history (eager-prefilled): a mixed-step or
+    // never-committed slot has no residentTokens and must retire cold. A cold
+    // retire wipes it so the next admit re-zeros the recurrence via seqStart.
+    s.occupied = false;
+    s.req.reset();
+    s.prefillStart = 0;
+    if (keepWarm && _warmSlot && !s.residentTokens.empty()) {
+        s.resident     = true;
+        s.residentTick = ++_warmTick;
+        // Keep s.prompt / residentTokens / KV / SSM in place.
+    } else {
+        s.prompt.clear();
+        s.residentTokens.clear();
+        s.resident = false;
+    }
+}
+
+std::size_t ContinuousBatcher::findWarmSlot(
+        std::span<const std::int32_t> prompt) const {
+    if (!_warmSlot || prompt.empty()) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    std::size_t best = std::numeric_limits<std::size_t>::max();
+    std::size_t bestLen = 0;
+    std::uint64_t bestTick = 0;
+    // Diagnostics: how many resident slots exist and, for the closest one, how
+    // far the token prefix actually matches vs its residentLen. A large LCP that
+    // stops short of residentLen means the follow-up shares only a partial
+    // prefix (reply re-tokenisation / shorter shared context) — which 2a cannot
+    // reuse (the SSM checkpoint sits at residentLen); that is the Inc-3 signal.
+    std::size_t residentCount = 0;
+    std::size_t diagBestLcp = 0, diagRl = 0;
+    for (std::size_t i = 0; i < _slots.size(); ++i) {
+        const Slot& s = _slots[i];
+        if (!s.resident || s.occupied) {
+            continue;
+        }
+        ++residentCount;
+        const std::size_t rl = s.residentTokens.size();
+        // Longest common prefix (for diagnostics + the full-match test below).
+        std::size_t lcp = 0;
+        const std::size_t lim = std::min(rl, prompt.size());
+        while (lcp < lim && s.residentTokens[lcp] == prompt[lcp]) {
+            ++lcp;
+        }
+        if (lcp > diagBestLcp) { diagBestLcp = lcp; diagRl = rl; }
+        // Pure continuation: the WHOLE resident sequence is a STRICT prefix of
+        // the new prompt (>=1 new token to prefill). Anything shorter needs an
+        // interior checkpoint (Inc 3) — fall through to a cold admit.
+        if (rl == 0 || rl >= prompt.size() || lcp != rl) {
+            continue;
+        }
+        if (rl > bestLen || (rl == bestLen && s.residentTick > bestTick)) {
+            best     = i;
+            bestLen  = rl;
+            bestTick = s.residentTick;
+        }
+    }
+    if (best == std::numeric_limits<std::size_t>::max() && residentCount > 0) {
+        MM_LOG_INFO("serving",
+                    "GDN warm-slot MISS: {} resident slot(s), best prefix match "
+                    "{} tok of residentLen {} (new prompt {} tok) — no full "
+                    "continuation, cold prefill",
+                    residentCount, diagBestLcp, diagRl, prompt.size());
+    }
+    return best;
 }
 
 std::shared_ptr<ServingRequest> ContinuousBatcher::submit(
@@ -258,6 +343,7 @@ void ContinuousBatcher::prefillSlotAdmitted(std::size_t slot) {
     // runs without holding _mtx so submitters/streamers never block on it.
     std::vector<std::int32_t>       prompt;
     std::shared_ptr<ServingRequest> req;
+    std::size_t                     start = 0;
     {
         std::lock_guard<std::mutex> lk(_mtx);
         if (!_slots[slot].occupied) {
@@ -265,20 +351,35 @@ void ContinuousBatcher::prefillSlotAdmitted(std::size_t slot) {
         }
         prompt = _slots[slot].prompt;   // copy: read outside the lock
         req    = _slots[slot].req;
+        // 5.28.1.2.a — a warm continuation resumes from lcp: [0,start) KV rows +
+        // SSM state are already resident in this slot, so prefill only the new
+        // tokens. prefillSlot with startPos>0 reuses the KV view [0,startPos) and
+        // does NOT re-zero the recurrence. 0 for a cold admit (full prefill).
+        start  = _slots[slot].prefillStart;
     }
     const std::size_t L = prompt.size();
-    if (L == 0) {
+    if (L == 0 || start >= L) {
         return;
     }
 
-    // Ingest the prompt as chunked T>1 forwards; the final chunk yields the
-    // first generated token (identical to the token-by-token step at pos ==
-    // promptLen-1).
+    // 5.28.1.2.a' — warm reuse (start>0): the slot's live SSM sub-slab still
+    // holds the PREVIOUS request's end-of-sequence state (decode advanced it).
+    // Restore the end-of-prompt checkpoint captured at that request's commit so
+    // the recurrence resumes at `start`; KV[0,start) is already resident (same
+    // slot, same prefix tokens). Queued before the prefill forward on the same
+    // stream, so ordering holds without a sync.
+    if (start > 0) {
+        _engine.restoreSlotPromptSsm(slot);
+    }
+
+    // Ingest the prompt (from `start`) as chunked T>1 forwards; the final chunk
+    // yields the first generated token (identical to the token-by-token step at
+    // pos == promptLen-1).
     std::int32_t firstTok = -1;
     TokenLogprobs firstLp;   // 8.19.14 — captured on the last (token-producing) chunk
     try {
         const std::size_t C = _prefillChunk;
-        for (std::size_t p = 0; p < L; p += C) {
+        for (std::size_t p = start; p < L; p += C) {
             const std::size_t t    = std::min(C, L - p);
             const bool        last = (p + t == L);
             const std::span<const std::int32_t> chunk{prompt.data() + p, t};
@@ -328,6 +429,18 @@ void ContinuousBatcher::commitPrefilledSlot(
     s.prefillPos = s.promptLen;
     s.lastTok  = firstTok;
     s.produced = 1;
+    // 5.28.1.2.a' — the committed KV rows + SSM state now cover exactly the whole
+    // prompt (positions [0, promptLen)); firstTok is sampled but not yet fed.
+    // This is the END-OF-PROMPT boundary: the resident match key is the prompt
+    // token sequence (NOT prompt+reply — a re-embedded assistant reply does not
+    // re-tokenise to the same ids, so an end-of-sequence checkpoint never matches
+    // a follow-up). Snapshot the SSM+conv state HERE, before decode advances the
+    // live sub-slab past the prompt, so a prompt-prefix continuation can restore
+    // it and reuse KV[0,promptLen).
+    if (_warmSlot) {
+        s.residentTokens = s.prompt;
+        _engine.snapshotSlotPromptSsm(slot);
+    }
 
     bool cancelled = false;
     {
@@ -349,9 +462,9 @@ void ContinuousBatcher::commitPrefilledSlot(
             s.req->done = true;
             s.req->cv.notify_all();
         }
-        s.occupied = false;
-        s.req.reset();
-        s.prompt.clear();
+        // Keep the slot warm on a clean stop (EOS/maxNew) so a continuation can
+        // resume; a cancelled request retires cold.
+        retireSlot(s, /*keepWarm=*/!cancelled);
     }
 }
 
@@ -675,6 +788,52 @@ void ContinuousBatcher::workerLoop() {
             // iteration so a burst does not prefill all slots (serial, batch=1)
             // before any decode step runs — interleaves decode with prefill.
             std::size_t admitted = 0;
+
+            // 5.28.1.2.a — warm-slot pass FIRST: route a pure-continuation
+            // follow-up back to its own resident slot and resume from lcp (its
+            // KV rows + SSM sub-slab are still in place), prefilling only the new
+            // tokens. Runs before the cold loop so a continuation reclaims its
+            // warm slot before a cold admit could evict it. No-op unless the GDN
+            // warm-slot capability is on.
+            if (_warmSlot) {
+                for (auto it = _waiting.begin();
+                     it != _waiting.end() &&
+                     (_admitPerIter == 0 || admitted < _admitPerIter); ) {
+                    const std::size_t ws = findWarmSlot(it->prompt);
+                    if (ws == std::numeric_limits<std::size_t>::max()) {
+                        ++it;
+                        continue;
+                    }
+                    Slot& s = _slots[ws];
+                    const std::size_t lcp = s.residentTokens.size();
+                    s.occupied     = true;
+                    s.resident     = false;
+                    s.req          = std::move(it->req);
+                    s.prompt       = std::move(it->prompt);
+                    s.promptLen    = s.prompt.size();
+                    s.pos          = 0;
+                    s.lastTok      = 0;
+                    s.maxNew       = it->maxNew;
+                    s.produced     = 0;
+                    s.stopIds      = std::move(it->stopIds);
+                    s.prefillPos   = 0;
+                    s.prefillStart = lcp;   // resume: prefill only [lcp, promptLen)
+                    _engine.setServingSlotSampling(
+                        ws, it->sampling, std::span<const std::int32_t>(s.prompt));
+                    _engine.setServingSlotToolConstraint(ws, it->constraint);
+                    it = _waiting.erase(it);
+                    // Warm reuse always rides the eager prefill path.
+                    if (_prefillChunk > 0 && s.promptLen > lcp) {
+                        toPrefill.push_back(ws);
+                    }
+                    ++admitted;
+                    MM_LOG_INFO("serving",
+                                "GDN warm-slot HIT: slot={} reused prefix={} tok, "
+                                "prefill only {} new tok (of {}) — KV+SSM resumed",
+                                ws, lcp, s.promptLen - lcp, s.promptLen);
+                }
+            }
+
             for (std::size_t i = 0; i < _maxBatch && !_waiting.empty(); ++i) {
                 if (_admitPerIter != 0 && admitted >= _admitPerIter) break;
                 if (_slots[i].occupied) continue;
@@ -691,6 +850,13 @@ void ContinuousBatcher::workerLoop() {
                 s.produced  = 0;
                 s.stopIds   = std::move(p.stopIds);
                 s.prefillPos = 0;   // 5.21-III mixed step: start prefilling in-band
+                // 5.28.1.2.a — cold admit: this may land on a resident (warm)
+                // slot; evict it. Prefill from 0 so the first chunk's startPos==0
+                // re-zeros the recurrence via seqStart, and drop the stale token
+                // history so findWarmSlot never matches this fresh request.
+                s.prefillStart = 0;
+                s.resident     = false;
+                s.residentTokens.clear();
                 // 8.19.5: push the request's sampling params into the slot
                 // before any forward touches it (first prefill token + every
                 // decode step honour them); the prompt seeds the M7f penalty
@@ -849,12 +1015,18 @@ void ContinuousBatcher::workerLoop() {
                 }
                 if (cancelled) {
                     finish(s.req, "");
-                    s.occupied = false;
-                    s.req.reset();
-                    s.prompt.clear();
+                    retireSlot(s, /*keepWarm=*/false);
                     freedSlot = true;
                     continue;
                 }
+
+                // 5.28.1.2.a' — residentTokens stays == the PROMPT (the match key
+                // + the position of the end-of-prompt SSM checkpoint taken at
+                // commit). We deliberately do NOT extend it with generated tokens:
+                // the reusable checkpoint sits at promptLen, and a follow-up only
+                // shares the prompt prefix anyway (the reply does not re-tokenise
+                // identically). Decode still advances the live SSM sub-slab; the
+                // checkpoint copy taken at commit preserves the promptLen state.
 
                 const bool isGen = (s.pos + 1 >= s.promptLen);
                 if (isGen) {
@@ -877,9 +1049,10 @@ void ContinuousBatcher::workerLoop() {
                             s.req->done = true;
                             s.req->cv.notify_all();
                         }
-                        s.occupied = false;
-                        s.req.reset();
-                        s.prompt.clear();
+                        // Clean stop (EOS/stop-id/maxNew/ctxFull): keep the slot
+                        // warm so a pure-continuation follow-up can resume its
+                        // KV+SSM instead of re-prefilling.
+                        retireSlot(s, /*keepWarm=*/true);
                         freedSlot = true;
                         continue;
                     }

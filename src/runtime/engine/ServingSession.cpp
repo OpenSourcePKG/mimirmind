@@ -140,6 +140,16 @@ struct ServingState {
     std::unique_ptr<SsmState>             ssm;
     std::optional<BlockBuffers>           sb;
 
+    // 5.28.1.2.a' — GDN warm-slot prefix reuse: per-slot END-OF-PROMPT SSM+conv
+    // checkpoint. Captured at commit (pos==promptLen, canonical prompt tokens,
+    // BEFORE decode advances the live sub-slab past the prompt) and restored
+    // into the slot's live sub-slab when a prompt-prefix continuation reuses the
+    // slot. Recurrent layers only (like restoreSlotSsm); each buffer is a packed
+    // [blockCount, stateElemsPerLayer] / [blockCount, convElemsPerLayer] image
+    // for ONE slot (no nSeq dim). Lazily sized to maxBatch.
+    std::vector<compute::ComputeBuffer> promptCkptState;  // [maxBatch]
+    std::vector<compute::ComputeBuffer> promptCkptConv;   // [maxBatch]
+
     // Scratch (device).
     compute::ComputeBuffer expIdxBuf, kwBuf;
     compute::ComputeBuffer blockTablesDev, seqLensDev, startPosDev;
@@ -2260,6 +2270,73 @@ void ServingSession::restoreSlotSsm(std::size_t slot, std::size_t a,
         _e._ops->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
                                   cvSrc + L * cvStride + slot * cvElems,
                                   cvElems * sizeof(float));
+    }
+}
+
+void ServingSession::snapshotSlotPromptSsm(std::size_t slot) {
+    if (_state == nullptr || _state->ssm == nullptr) {
+        return;   // L0 slab path or no serving state — warm-slot is CUDA-only
+    }
+    auto& st = *_state;
+    const std::size_t stStride = st.ssm->stateLayerStride();       // live slab
+    const std::size_t cvStride = st.ssm->convStateLayerStride();
+    const std::size_t stElems  = st.ssm->stateElemsPerLayer();
+    const std::size_t cvElems  = st.ssm->convStateElemsPerLayer();
+    if (st.promptCkptState.empty()) {
+        st.promptCkptState.resize(st.maxBatch);
+        st.promptCkptConv.resize(st.maxBatch);
+    }
+    if (st.promptCkptState[slot].get() == nullptr) {
+        st.promptCkptState[slot] =
+            _e._ops->allocate(st.blockCount * stElems * sizeof(float));
+        st.promptCkptConv[slot] =
+            _e._ops->allocate(st.blockCount * cvElems * sizeof(float));
+    }
+    const float* const stSrc = st.ssm->statePtr();
+    const float* const cvSrc = st.ssm->convStatePtr();
+    float* const stDst = st.promptCkptState[slot].as<float>();
+    float* const cvDst = st.promptCkptConv[slot].as<float>();
+    // Copy this slot's per-layer slice out of the live [blockCount, nSeq, elems]
+    // slab into the packed [blockCount, elems] per-slot checkpoint. Recurrent
+    // layers only — full-attention layers carry no recurrent state.
+    for (std::size_t L = 0; L < st.blockCount; ++L) {
+        if (!_e._config.isRecurrentLayer(L)) {
+            continue;
+        }
+        _e._ops->appendMemoryCopy(stDst + L * stElems,
+                                  stSrc + L * stStride + slot * stElems,
+                                  stElems * sizeof(float));
+        _e._ops->appendMemoryCopy(cvDst + L * cvElems,
+                                  cvSrc + L * cvStride + slot * cvElems,
+                                  cvElems * sizeof(float));
+    }
+}
+
+void ServingSession::restoreSlotPromptSsm(std::size_t slot) {
+    if (_state == nullptr || _state->ssm == nullptr) {
+        return;
+    }
+    auto& st = *_state;
+    if (st.promptCkptState.empty() ||
+        st.promptCkptState[slot].get() == nullptr) {
+        return;   // nothing checkpointed for this slot
+    }
+    const std::size_t stStride = st.ssm->stateLayerStride();
+    const std::size_t cvStride = st.ssm->convStateLayerStride();
+    const std::size_t stElems  = st.ssm->stateElemsPerLayer();
+    const std::size_t cvElems  = st.ssm->convStateElemsPerLayer();
+    float* const stDst = st.ssm->statePtr();
+    float* const cvDst = st.ssm->convStatePtr();
+    const float* const stSrc = st.promptCkptState[slot].as<float>();
+    const float* const cvSrc = st.promptCkptConv[slot].as<float>();
+    for (std::size_t L = 0; L < st.blockCount; ++L) {
+        if (!_e._config.isRecurrentLayer(L)) {
+            continue;
+        }
+        _e._ops->appendMemoryCopy(stDst + L * stStride + slot * stElems,
+                                  stSrc + L * stElems, stElems * sizeof(float));
+        _e._ops->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
+                                  cvSrc + L * cvElems, cvElems * sizeof(float));
     }
 }
 

@@ -138,6 +138,16 @@ public:
     [[nodiscard]] std::size_t maxBatch() const noexcept;
     [[nodiscard]] std::size_t maxContext() const noexcept;
 
+    /// 5.28.1.2.a' — GDN warm-slot prefix reuse. `snapshotSlotPromptSsm` copies
+    /// slot `slot`'s live SSM+conv sub-slab (position == end of its prefill) OUT
+    /// into a persistent per-slot checkpoint; `restoreSlotPromptSsm` copies it
+    /// back into the live sub-slab so a prompt-prefix continuation can resume the
+    /// recurrence at the prompt boundary (KV[0,promptLen) is reused in place).
+    /// No-op on the L0 slab path / when serving state is absent. Device→device,
+    /// queued on the compute stream (no host round-trip, no sync).
+    void snapshotSlotPromptSsm(std::size_t slot);
+    void restoreSlotPromptSsm(std::size_t slot);
+
     /// Resident paged-KV pool footprint for the memory-telemetry route (8.16).
     /// `active` is false until the serving state has been allocated (no pool
     /// yet). `residentBytes` = numLayers x 2(K+V) x numBlocks x blockSize x

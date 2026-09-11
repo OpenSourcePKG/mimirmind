@@ -543,6 +543,12 @@ public:
                 std::size_t startPos, bool produceToken,
                 TokenLogprobs* outLp = nullptr);
 
+    /// 5.28.1.2.a' — GDN warm-slot prefix reuse. Snapshot/restore slot `slot`'s
+    /// end-of-prompt SSM+conv checkpoint (see ServingSession). Snapshot at the
+    /// prefill→decode boundary; restore before a continuation reuse's prefill.
+    void snapshotSlotPromptSsm(std::size_t slot);
+    void restoreSlotPromptSsm(std::size_t slot);
+
     /// Prefill chunk size C (max tokens per `prefillSlot` forward), or 0 when
     /// chunked prefill is disabled (MIMIRMIND_CHUNKED_PREFILL=0) — callers
     /// fall back to the token-by-token prefill path. Valid after
@@ -801,6 +807,10 @@ public:
         return _fusedQkv.get();
     }
 
+    /// 5.28.1.2 — does the loaded backend carry recurrent SSM/GatedDeltaNet
+    /// state (hybrid-recurrent)? Serving warm-slot prefix reuse is gated on this.
+    [[nodiscard]] bool backendNeedsSsmScratch() const noexcept;
+
     [[nodiscard]] const core::gguf::GgufReader& reader()    const noexcept { return _reader; }
     [[nodiscard]] const model::LlmConfig&  config()    const noexcept { return _config; }
     [[nodiscard]] const model::Tokenizer&  tokenizer() const noexcept { return _tokenizer; }
@@ -1020,6 +1030,27 @@ private:
     // and BlockBuffers reallocations. Its pointers are bound into
     // _blockBuffers after each scratch (re)allocation.
     std::unique_ptr<SsmState>          _ssmState;
+
+    // --- 5.28.1.1 GDN prefix-cache checkpoint (single-session) ----------
+    // A single end-of-prefill snapshot of the recurrent SSM + rolling conv
+    // state, captured after each completed generate() at position
+    // _cachedTokens.size(). On a PURE-CONTINUATION follow-up (the new prompt
+    // extends the whole cached sequence) it is restored before prefill so the
+    // GDN prefix is reused instead of replayed from a zeroed state — the reuse
+    // the cross-request-contamination off-switch otherwise forbids. Reuse is
+    // bit-exact for the recurrence (roadmap 5.28.1.0 gate), so no
+    // contamination. Any non-continuation match falls back to lcp=0 (full
+    // replay); interior checkpoints for lcp<cached-length are Inc 3. Opt-in
+    // via capability MIMIRMIND_GDN_PREFIX_CKPT (server decides; env for A/B).
+    compute::ComputeBuffer             _ssmSnapState;     // mirror of _ssmState state slab
+    compute::ComputeBuffer             _ssmSnapConv;      // mirror of _ssmState conv slab
+    bool                               _ssmSnapValid{false};
+    std::size_t                        _ssmSnapTokens{0}; // capture position
+    int                                _gdnPrefixCkpt{-1};// -1 unresolved, 0 off, 1 on
+
+    /// Resolve (once, from MIMIRMIND_GDN_PREFIX_CKPT) and return whether the
+    /// GDN prefix-cache checkpoint capability is enabled. Default OFF.
+    bool gdnPrefixCkptEnabled();
 
     // --- M-Cuda.MTP — native multi-token-prediction draft decoder ------
     // The MTP scratch (private nextn KV cache, per-step buffers, GatedDeltaNet

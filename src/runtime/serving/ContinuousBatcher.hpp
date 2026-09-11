@@ -206,10 +206,38 @@ private:
         // means the slot is fully prefilled and now decoding. Only used when
         // `_mixedStep` (else prefill is eager and this stays 0).
         std::size_t                     prefillPos{0};
+
+        // 5.28.1.2.a — GDN warm-slot session affinity (opt-in, SSM backends).
+        // On clean completion the slot is kept RESIDENT (occupied stays false so
+        // it is admissible, but its KV rows + SSM sub-slab + fed-token history
+        // survive) so a pure-continuation follow-up can resume from lcp instead
+        // of re-prefilling the whole prompt. `residentTokens` is the exact
+        // sequence whose KV+SSM are committed (== positions [0, size)); a new
+        // prompt that has residentTokens as a strict prefix reuses this slot.
+        bool                            resident{false};
+        std::vector<std::int32_t>       residentTokens;
+        std::uint64_t                   residentTick{0};   // LRU recency
+        // Where this slot's prefill begins: 0 for a cold admit; the matched lcp
+        // for a warm continuation reuse (so prefillSlot skips [0,lcp), keeps the
+        // resident KV+SSM, and does NOT re-zero the recurrence).
+        std::size_t                     prefillStart{0};
     };
 
     void workerLoop();
     [[nodiscard]] bool isStop(std::int32_t tok, const Slot& s) const;
+
+    /// 5.28.1.2.a — retire a slot whose request has ended. `keepWarm` keeps it
+    /// RESIDENT (KV+SSM+residentTokens survive) for continuation reuse; false
+    /// wipes it cold (next admit re-zeros via seqStart). Warm retention only
+    /// takes effect when the capability is on and residentTokens is non-empty
+    /// (i.e. the slot was eager-prefilled). Caller MUST hold `_mtx`.
+    void retireSlot(Slot& s, bool keepWarm);
+
+    /// 5.28.1.2.a — find a RESIDENT (warm, unoccupied) slot whose residentTokens
+    /// are a STRICT prefix of `prompt` (pure continuation, >=1 new token). Prefers
+    /// the longest match, then most-recently-used. Returns the slot index or
+    /// SIZE_MAX. Caller MUST hold `_mtx`. No-op unless `_warmSlot`.
+    [[nodiscard]] std::size_t findWarmSlot(std::span<const std::int32_t> prompt) const;
 
     /// Count `tenantId`'s accepted-but-unfinished requests (waiting queue +
     /// occupied slots). Caller MUST hold `_mtx`. Returns 0 for an empty label.
@@ -271,6 +299,14 @@ private:
     // MIMIRMIND_PREFILL_ADMIT_PER_ITER=<K>. Safe (no partial slot ever enters
     // the decode batch); overlap only — does NOT batch the prefills themselves.
     std::size_t      _admitPerIter{0};
+    // 5.28.1.2.a — GDN warm-slot session affinity. When on, completed slots are
+    // kept resident (KV+SSM+token history) and a pure-continuation follow-up is
+    // routed back to its warm slot, resuming from lcp instead of re-prefilling.
+    // Opt-in via MIMIRMIND_GDN_PREFIX_CKPT AND only for SSM/GatedDeltaNet
+    // backends (server decides; default OFF). `_warmTick` is the LRU clock,
+    // touched only by the worker thread under `_mtx`.
+    bool             _warmSlot{false};
+    std::uint64_t    _warmTick{0};
     // 5.21-III MULTI-SLOT — batch newly-admitted slots' prefill into ONE ragged
     // forward (unlike admit-per-iter, this batches the prefill compute itself).
     // MIMIRMIND_PREFILL_MIXED_BATCH=1; default OFF. Needs chunked prefill.
