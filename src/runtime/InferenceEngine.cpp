@@ -2838,15 +2838,33 @@ std::int32_t InferenceEngine::prefillSlot(std::size_t slot,
                                         outLp);
 }
 
-void InferenceEngine::snapshotSlotPromptSsm(std::size_t slot) {
+void InferenceEngine::captureSlotSsmCkpt(std::size_t slot, std::size_t pos) {
     if (_servingSession != nullptr) {
-        _servingSession->snapshotSlotPromptSsm(slot);
+        _servingSession->captureSlotSsmCkpt(slot, pos);
     }
 }
 
-void InferenceEngine::restoreSlotPromptSsm(std::size_t slot) {
+std::size_t InferenceEngine::slotCkptBestPos(std::size_t slot,
+                                             std::size_t lcp) const {
+    return _servingSession == nullptr ? 0
+                                      : _servingSession->slotCkptBestPos(slot, lcp);
+}
+
+void InferenceEngine::restoreSlotSsmCkptAtPos(std::size_t slot, std::size_t pos) {
     if (_servingSession != nullptr) {
-        _servingSession->restoreSlotPromptSsm(slot);
+        _servingSession->restoreSlotSsmCkptAtPos(slot, pos);
+    }
+}
+
+void InferenceEngine::pruneSlotSsmCkpts(std::size_t slot, std::size_t keepMaxPos) {
+    if (_servingSession != nullptr) {
+        _servingSession->pruneSlotSsmCkpts(slot, keepMaxPos);
+    }
+}
+
+void InferenceEngine::clearSlotSsmCkpts(std::size_t slot) {
+    if (_servingSession != nullptr) {
+        _servingSession->clearSlotSsmCkpts(slot);
     }
 }
 

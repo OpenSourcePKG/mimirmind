@@ -543,11 +543,14 @@ public:
                 std::size_t startPos, bool produceToken,
                 TokenLogprobs* outLp = nullptr);
 
-    /// 5.28.1.2.a' — GDN warm-slot prefix reuse. Snapshot/restore slot `slot`'s
-    /// end-of-prompt SSM+conv checkpoint (see ServingSession). Snapshot at the
-    /// prefill→decode boundary; restore before a continuation reuse's prefill.
-    void snapshotSlotPromptSsm(std::size_t slot);
-    void restoreSlotPromptSsm(std::size_t slot);
+    /// 5.28.1.3 — GDN warm-slot prefix reuse: per-slot interior SSM-checkpoint
+    /// ring (see ServingSession). Capture at prefill-chunk boundaries; on a reuse
+    /// pick the best checkpoint <= LCP, restore it, and prune/clear as needed.
+    void        captureSlotSsmCkpt(std::size_t slot, std::size_t pos);
+    [[nodiscard]] std::size_t slotCkptBestPos(std::size_t slot, std::size_t lcp) const;
+    void        restoreSlotSsmCkptAtPos(std::size_t slot, std::size_t pos);
+    void        pruneSlotSsmCkpts(std::size_t slot, std::size_t keepMaxPos);
+    void        clearSlotSsmCkpts(std::size_t slot);
 
     /// Prefill chunk size C (max tokens per `prefillSlot` forward), or 0 when
     /// chunked prefill is disabled (MIMIRMIND_CHUNKED_PREFILL=0) — callers

@@ -231,13 +231,22 @@ private:
     /// wipes it cold (next admit re-zeros via seqStart). Warm retention only
     /// takes effect when the capability is on and residentTokens is non-empty
     /// (i.e. the slot was eager-prefilled). Caller MUST hold `_mtx`.
-    void retireSlot(Slot& s, bool keepWarm);
+    void retireSlot(std::size_t slot, bool keepWarm);
 
     /// 5.28.1.2.a — find a RESIDENT (warm, unoccupied) slot whose residentTokens
     /// are a STRICT prefix of `prompt` (pure continuation, >=1 new token). Prefers
     /// the longest match, then most-recently-used. Returns the slot index or
     /// SIZE_MAX. Caller MUST hold `_mtx`. No-op unless `_warmSlot`.
-    [[nodiscard]] std::size_t findWarmSlot(std::span<const std::int32_t> prompt) const;
+    /// Returns the resident slot to reuse (SIZE_MAX if none) and, via
+    /// `outReusePos`, the interior-checkpoint token position to resume from
+    /// (0 when no slot matches). See the .cpp for the largest-checkpoint<=LCP rule.
+    [[nodiscard]] std::size_t findWarmSlot(std::span<const std::int32_t> prompt,
+                                           std::size_t& outReusePos) const;
+
+    /// 5.28.1.3 LRU-preserve — pick a free slot for a cold admit: lowest
+    /// non-resident free slot, else the least-recently-used resident free slot
+    /// (evict under pressure only), else SIZE_MAX. Caller MUST hold `_mtx`.
+    [[nodiscard]] std::size_t pickColdSlot() const;
 
     /// Count `tenantId`'s accepted-but-unfinished requests (waiting queue +
     /// occupied slots). Caller MUST hold `_mtx`. Returns 0 for an empty label.

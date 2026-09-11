@@ -140,15 +140,21 @@ struct ServingState {
     std::unique_ptr<SsmState>             ssm;
     std::optional<BlockBuffers>           sb;
 
-    // 5.28.1.2.a' — GDN warm-slot prefix reuse: per-slot END-OF-PROMPT SSM+conv
-    // checkpoint. Captured at commit (pos==promptLen, canonical prompt tokens,
-    // BEFORE decode advances the live sub-slab past the prompt) and restored
-    // into the slot's live sub-slab when a prompt-prefix continuation reuses the
-    // slot. Recurrent layers only (like restoreSlotSsm); each buffer is a packed
-    // [blockCount, stateElemsPerLayer] / [blockCount, convElemsPerLayer] image
-    // for ONE slot (no nSeq dim). Lazily sized to maxBatch.
-    std::vector<compute::ComputeBuffer> promptCkptState;  // [maxBatch]
-    std::vector<compute::ComputeBuffer> promptCkptConv;   // [maxBatch]
+    // 5.28.1.3 — GDN warm-slot prefix reuse via INTERIOR SSM+conv checkpoints.
+    // A single fixed checkpoint (2a/2a') structurally cannot hit: the reusable
+    // prefix is always a few tokens short of any late token-aligned checkpoint
+    // (generation-prompt suffix + BPE cross-boundary re-tokenisation). So keep a
+    // bounded RING of checkpoints per slot at interior boundaries (one per prefill
+    // chunk); a follow-up resumes from the largest checkpoint <= its LCP. Each
+    // buffer is a packed [blockCount, stateElemsPerLayer] / [blockCount,
+    // convElemsPerLayer] image for ONE slot (recurrent layers only, no nSeq dim).
+    struct SlotCkptRing {
+        std::vector<std::size_t>            pos;    // token position of each ckpt
+        std::vector<compute::ComputeBuffer> state;  // parallel to pos
+        std::vector<compute::ComputeBuffer> conv;
+    };
+    std::vector<SlotCkptRing>    slotCkpts;         // [maxBatch]
+    static constexpr std::size_t kMaxCkptsPerSlot = 8;  // ~8*83MiB/slot cap
 
     // Scratch (device).
     compute::ComputeBuffer expIdxBuf, kwBuf;
@@ -2273,7 +2279,7 @@ void ServingSession::restoreSlotSsm(std::size_t slot, std::size_t a,
     }
 }
 
-void ServingSession::snapshotSlotPromptSsm(std::size_t slot) {
+void ServingSession::captureSlotSsmCkpt(std::size_t slot, std::size_t pos) {
     if (_state == nullptr || _state->ssm == nullptr) {
         return;   // L0 slab path or no serving state — warm-slot is CUDA-only
     }
@@ -2282,44 +2288,75 @@ void ServingSession::snapshotSlotPromptSsm(std::size_t slot) {
     const std::size_t cvStride = st.ssm->convStateLayerStride();
     const std::size_t stElems  = st.ssm->stateElemsPerLayer();
     const std::size_t cvElems  = st.ssm->convStateElemsPerLayer();
-    if (st.promptCkptState.empty()) {
-        st.promptCkptState.resize(st.maxBatch);
-        st.promptCkptConv.resize(st.maxBatch);
+    if (st.slotCkpts.empty()) {
+        st.slotCkpts.resize(st.maxBatch);
     }
-    if (st.promptCkptState[slot].get() == nullptr) {
-        st.promptCkptState[slot] =
-            _e._ops->allocate(st.blockCount * stElems * sizeof(float));
-        st.promptCkptConv[slot] =
-            _e._ops->allocate(st.blockCount * cvElems * sizeof(float));
+    auto& ring = st.slotCkpts[slot];
+    // Reuse an evicted buffer when the ring is full (drop the smallest pos —
+    // the deepest-prefix checkpoints nearest the end are the most reusable for
+    // a continuation), else allocate.
+    compute::ComputeBuffer sBuf, cBuf;
+    if (ring.pos.size() >= ServingState::kMaxCkptsPerSlot) {
+        sBuf = std::move(ring.state.front());
+        cBuf = std::move(ring.conv.front());
+        ring.pos.erase(ring.pos.begin());
+        ring.state.erase(ring.state.begin());
+        ring.conv.erase(ring.conv.begin());
+    } else {
+        sBuf = _e._ops->allocate(st.blockCount * stElems * sizeof(float));
+        cBuf = _e._ops->allocate(st.blockCount * cvElems * sizeof(float));
     }
-    const float* const stSrc = st.ssm->statePtr();
-    const float* const cvSrc = st.ssm->convStatePtr();
-    float* const stDst = st.promptCkptState[slot].as<float>();
-    float* const cvDst = st.promptCkptConv[slot].as<float>();
+    float* const sDst = sBuf.as<float>();
+    float* const cDst = cBuf.as<float>();
+    const float* const sSrc = st.ssm->statePtr();
+    const float* const cSrc = st.ssm->convStatePtr();
     // Copy this slot's per-layer slice out of the live [blockCount, nSeq, elems]
-    // slab into the packed [blockCount, elems] per-slot checkpoint. Recurrent
+    // slab into a packed [blockCount, elems] per-slot checkpoint. Recurrent
     // layers only — full-attention layers carry no recurrent state.
     for (std::size_t L = 0; L < st.blockCount; ++L) {
         if (!_e._config.isRecurrentLayer(L)) {
             continue;
         }
-        _e._ops->appendMemoryCopy(stDst + L * stElems,
-                                  stSrc + L * stStride + slot * stElems,
+        _e._ops->appendMemoryCopy(sDst + L * stElems,
+                                  sSrc + L * stStride + slot * stElems,
                                   stElems * sizeof(float));
-        _e._ops->appendMemoryCopy(cvDst + L * cvElems,
-                                  cvSrc + L * cvStride + slot * cvElems,
+        _e._ops->appendMemoryCopy(cDst + L * cvElems,
+                                  cSrc + L * cvStride + slot * cvElems,
                                   cvElems * sizeof(float));
     }
+    ring.pos.push_back(pos);
+    ring.state.push_back(std::move(sBuf));
+    ring.conv.push_back(std::move(cBuf));
 }
 
-void ServingSession::restoreSlotPromptSsm(std::size_t slot) {
-    if (_state == nullptr || _state->ssm == nullptr) {
+std::size_t ServingSession::slotCkptBestPos(std::size_t slot,
+                                            std::size_t lcp) const {
+    if (_state == nullptr || _state->slotCkpts.empty() ||
+        slot >= _state->slotCkpts.size()) {
+        return 0;
+    }
+    std::size_t best = 0;
+    for (std::size_t p : _state->slotCkpts[slot].pos) {
+        if (p <= lcp && p > best) {
+            best = p;
+        }
+    }
+    return best;   // 0 == no usable checkpoint (do not reuse)
+}
+
+void ServingSession::restoreSlotSsmCkptAtPos(std::size_t slot, std::size_t pos) {
+    if (_state == nullptr || _state->ssm == nullptr ||
+        _state->slotCkpts.empty() || slot >= _state->slotCkpts.size()) {
         return;
     }
-    auto& st = *_state;
-    if (st.promptCkptState.empty() ||
-        st.promptCkptState[slot].get() == nullptr) {
-        return;   // nothing checkpointed for this slot
+    auto& st  = *_state;
+    auto& ring = st.slotCkpts[slot];
+    std::size_t idx = ring.pos.size();
+    for (std::size_t k = 0; k < ring.pos.size(); ++k) {
+        if (ring.pos[k] == pos) { idx = k; break; }
+    }
+    if (idx == ring.pos.size()) {
+        return;   // no checkpoint at pos — caller must NOT reuse (stale live state)
     }
     const std::size_t stStride = st.ssm->stateLayerStride();
     const std::size_t cvStride = st.ssm->convStateLayerStride();
@@ -2327,8 +2364,8 @@ void ServingSession::restoreSlotPromptSsm(std::size_t slot) {
     const std::size_t cvElems  = st.ssm->convStateElemsPerLayer();
     float* const stDst = st.ssm->statePtr();
     float* const cvDst = st.ssm->convStatePtr();
-    const float* const stSrc = st.promptCkptState[slot].as<float>();
-    const float* const cvSrc = st.promptCkptConv[slot].as<float>();
+    const float* const stSrc = ring.state[idx].as<float>();
+    const float* const cvSrc = ring.conv[idx].as<float>();
     for (std::size_t L = 0; L < st.blockCount; ++L) {
         if (!_e._config.isRecurrentLayer(L)) {
             continue;
@@ -2338,6 +2375,36 @@ void ServingSession::restoreSlotPromptSsm(std::size_t slot) {
         _e._ops->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
                                   cvSrc + L * cvElems, cvElems * sizeof(float));
     }
+}
+
+void ServingSession::pruneSlotSsmCkpts(std::size_t slot, std::size_t keepMaxPos) {
+    // Drop checkpoints beyond `keepMaxPos` (the shared-prefix length on a reuse):
+    // positions > lcp are from the previous request's now-diverged tail and would
+    // be WRONG to reuse. Entries <= keepMaxPos share identical tokens [0,pos) with
+    // the new prompt and stay valid.
+    if (_state == nullptr || _state->slotCkpts.empty() ||
+        slot >= _state->slotCkpts.size()) {
+        return;
+    }
+    auto& ring = _state->slotCkpts[slot];
+    for (std::size_t k = ring.pos.size(); k-- > 0;) {
+        if (ring.pos[k] > keepMaxPos) {
+            ring.pos.erase(ring.pos.begin() + static_cast<std::ptrdiff_t>(k));
+            ring.state.erase(ring.state.begin() + static_cast<std::ptrdiff_t>(k));
+            ring.conv.erase(ring.conv.begin() + static_cast<std::ptrdiff_t>(k));
+        }
+    }
+}
+
+void ServingSession::clearSlotSsmCkpts(std::size_t slot) {
+    if (_state == nullptr || _state->slotCkpts.empty() ||
+        slot >= _state->slotCkpts.size()) {
+        return;
+    }
+    auto& ring = _state->slotCkpts[slot];
+    ring.pos.clear();
+    ring.state.clear();
+    ring.conv.clear();
 }
 
 std::vector<std::vector<std::int32_t>>
