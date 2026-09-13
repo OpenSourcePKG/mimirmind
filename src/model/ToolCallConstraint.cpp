@@ -309,11 +309,33 @@ void ToolCallConstraint::advance(std::int32_t token) {
     // than index out of range. Feed every in-range token: TagDispatch keeps
     // prose free and only constrains inside a dispatched call body.
     if (token < 0 || token >= _impl->vocab) { return; }
-    _impl->matcher->AcceptToken(token);
+    // Once the grammar has accepted a stop token the matcher is TERMINATED;
+    // driving it further asserts inside xgrammar (grammar_matcher.cc:1648
+    // "IsStopTokenAccepted"). After termination the tool call / JSON is complete
+    // and the model is free — stop feeding the matcher. try/catch so a matcher
+    // fault degrades to "unconstrained" instead of 500-ing the request.
+    try {
+        if (_impl->matcher->IsTerminated()) { return; }
+        _impl->matcher->AcceptToken(token);
+    } catch (...) {
+        // keep the sampler alive; grammar faults must never crash the request
+    }
 }
 
 void ToolCallConstraint::maskLogits(float* logits, std::size_t vocab) const {
     if (!_impl || !_impl->active || !_impl->matcher) { return; }
+    // After the grammar accepts a stop token the matcher is TERMINATED;
+    // FillNextTokenBitmask then asserts (grammar_matcher.cc:1648) and 500s the
+    // request. This is the exact bug behind bad tool-mode answers: the tool-call
+    // grammar stayed engaged into the free-text final answer and crashed at EOS.
+    // Once terminated (call/JSON complete) the model is free — no mask. The whole
+    // body is wrapped so ANY xgrammar fault degrades to "unconstrained", never 500.
+    try {
+        if (_impl->matcher->IsTerminated()) { return; }
+    } catch (...) {
+        return;
+    }
+    try {
 
     // ApplyTokenBitmaskInplaceCPU reads shape[0]/strides[0] as a batch row: it
     // dereferences strides[0] UNCONDITIONALLY (no compact/nullptr fast path), so
@@ -352,6 +374,10 @@ void ToolCallConstraint::maskLogits(float* logits, std::size_t vocab) const {
     lt.byte_offset = 0;
 
     xgrammar::ApplyTokenBitmaskInplaceCPU(&lt, bm, n);
+    } catch (...) {
+        // grammar/xgrammar fault -> leave logits untouched (unconstrained) rather
+        // than crash the request.
+    }
 }
 
 } // namespace mimirmind::model

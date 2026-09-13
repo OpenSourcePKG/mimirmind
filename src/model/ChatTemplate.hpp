@@ -166,6 +166,19 @@ public:
     [[nodiscard]] static std::string_view
     toolCallOpenerText(Style style) noexcept;
 
+    /// The FULLER opener the tool-salvage re-decode prefills to force a drifted
+    /// model back onto canonical call syntax (includes the dialect trigger, e.g.
+    /// Qwen `<tool_call>\n<function=`). Empty for styles without a salvage opener.
+    /// Lives here (per-style dispatch) rather than as a literal in the server.
+    [[nodiscard]] static std::string_view
+    toolCallSalvageOpenerText(Style style) noexcept;
+
+    /// Literal substrings signalling the model TRIED to emit a tool call in this
+    /// dialect — the tool-salvage re-decode trigger's marker set. Empty for
+    /// styles without tool support.
+    [[nodiscard]] static std::span<const std::string_view>
+    toolIntentMarkers(Style style) noexcept;
+
     /**
      * Token ids that CLOSE a native tool-call block, to add to the decode
      * stop set when a request carries tools. They make the decoder halt as
