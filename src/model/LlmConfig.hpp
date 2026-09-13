@@ -81,6 +81,28 @@ struct LlmConfig {
     // "checkpoint shipped no recommendation" (GGUF path, older exports).
     float         samplingTopPDefault {1.0F};
     std::uint32_t samplingTopKDefault {0};
+    // 5.x: model-recommended TEMPERATURE from generation_config.json, set ONLY
+    // when the checkpoint ships do_sample=true. The non-thinking anti-loop
+    // sampling floor lifts a greedy request to this (+ the top_p/top_k above) so
+    // the escape values are model-declared, not hardcoded per-arch in the server
+    // (vLLM reads the same field). 0 = no recommendation => floor is a no-op.
+    float         samplingTempDefault {0.0F};
+
+    // 5.x: server-side repetition-control defaults + anti-loop safety floor, moved
+    // out of hardcoded constants in ChatCompletionHandler into per-model config so
+    // a model that does not loop is not saddled with another model's tuned
+    // penalties. Initialisers reproduce the historical constants (behaviour-neutral
+    // default); repetitionPenaltyDefault is also populated from
+    // generation_config.json (HF `repetition_penalty`) when present. penaltyWindow
+    // is a token-count over recent history.
+    float         frequencyPenaltyDefault  {0.5F};
+    float         repetitionPenaltyDefault {1.10F};
+    std::uint32_t penaltyWindowDefault     {64U};
+    // Applied only when the client disabled ALL penalties (leaving greedy with no
+    // escape) — a wider window catches long-block loops the narrow default misses.
+    float         antiLoopRepetition {1.10F};
+    float         antiLoopFrequency  {0.50F};
+    std::uint32_t antiLoopWindow     {256U};
     // Explicit attention softmax scale (GGUF `<arch>.attention.scale`).
     // 0 = unset → attention uses the default 1/sqrt(head_dim). Qwen3-Next
     // (`qwen35moe`) ships this key; llama.cpp:

@@ -1082,6 +1082,39 @@ ChatTemplate::toolCallOpenerText(Style style) noexcept {
     return {};
 }
 
+std::string_view
+ChatTemplate::toolCallSalvageOpenerText(Style style) noexcept {
+    // The FULLER opener the tool-salvage re-decode prefills to force a drifted
+    // model back onto the canonical call syntax — for Qwen ChatML this includes
+    // the `<function=` TagDispatch trigger (which toolCallOpenerText deliberately
+    // omits, since the model normally emits it itself). Per-style here, not
+    // hardcoded in the server. Empty => no salvage opener for this dialect.
+    switch (style) {
+        case Style::QwenChatML: return "<tool_call>\n<function=";
+        case Style::Gemma4:     return {};
+        case Style::Gemma3:     return {};
+        case Style::Llama3:     return {};
+    }
+    return {};
+}
+
+std::span<const std::string_view>
+ChatTemplate::toolIntentMarkers(Style style) noexcept {
+    // Literal substrings that signal the model TRIED to emit a tool call in this
+    // dialect (used by the salvage re-decode trigger). Kept per-style here rather
+    // than as a literal list in the server. QwenChatML keeps Gemma's ```tool_code
+    // fence too as a belt-and-suspenders cross-dialect leak marker.
+    static constexpr std::string_view kQwen[] = {
+        "```tool_code", "<function", "<tool_call"};
+    switch (style) {
+        case Style::QwenChatML: return {kQwen, std::size(kQwen)};
+        case Style::Gemma4:     return {kQwen, std::size(kQwen)};
+        case Style::Gemma3:     return {};
+        case Style::Llama3:     return {};
+    }
+    return {};
+}
+
 std::vector<std::int32_t>
 ChatTemplate::toolCallStopIds(Style style, const Tokenizer& tok) {
     std::vector<std::int32_t> ids;

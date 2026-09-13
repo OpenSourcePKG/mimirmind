@@ -214,11 +214,32 @@ void applyGenerationConfigDefaults(model::LlmConfig&            cfg,
     if (j.contains("top_k") && j["top_k"].is_number_integer()) {
         cfg.samplingTopKDefault = j["top_k"].get<std::uint32_t>();
     }
-    if (cfg.samplingTopPDefault < 1.0F || cfg.samplingTopKDefault > 0) {
+    // 5.x: the checkpoint's recommended TEMPERATURE, but only when it ships
+    // do_sample=true (i.e. the model is meant to be sampled, not argmax'd). This
+    // is what the server's non-thinking anti-loop floor lifts a greedy request to
+    // — model-declared, not hardcoded (vLLM reads the same field). 0 = no
+    // recommendation (GGUF path / do_sample=false) => floor stays a no-op.
+    const bool doSample = j.contains("do_sample") && j["do_sample"].is_boolean()
+                          && j["do_sample"].get<bool>();
+    if (doSample && j.contains("temperature") && j["temperature"].is_number()) {
+        cfg.samplingTempDefault = j["temperature"].get<float>();
+    }
+    // HF-standard repetition_penalty (when the checkpoint ships one) becomes the
+    // server's per-model default repetition penalty — model-declared, not a
+    // hardcoded constant. freq/window stay at the LlmConfig defaults (not
+    // HF-standard fields); those are tunable per model via config, not per arch
+    // in server code.
+    if (j.contains("repetition_penalty") && j["repetition_penalty"].is_number()) {
+        cfg.repetitionPenaltyDefault = j["repetition_penalty"].get<float>();
+    }
+    if (cfg.samplingTopPDefault < 1.0F || cfg.samplingTopKDefault > 0 ||
+        cfg.samplingTempDefault > 0.0F) {
         MM_LOG_INFO("engine",
-                    "generation_config.json sampling defaults: top_p={} "
-                    "top_k={} (applied when a request samples without its own)",
-                    cfg.samplingTopPDefault, cfg.samplingTopKDefault);
+                    "generation_config.json sampling defaults: temp={} top_p={} "
+                    "top_k={} (do_sample={}; applied when a request samples "
+                    "without its own / anti-loop floor)",
+                    cfg.samplingTempDefault, cfg.samplingTopPDefault,
+                    cfg.samplingTopKDefault, doSample ? 1 : 0);
     }
 }
 

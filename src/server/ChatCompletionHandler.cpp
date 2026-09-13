@@ -543,24 +543,85 @@ bool ChatCompletionHandler::prepareChatRequest(
         }
     }
 
-    // Thinking mode must not run greedy. Qwen3 reasoning degenerates into an
-    // endless repetition loop under argmax ("No I will not... No I will not...")
-    // that no history penalty reliably breaks. When reasoning is enabled and the
-    // request is greedy / near-greedy (temp < 0.6 — including the greedy default
-    // used for reference-oracle parity), lift sampling to Qwen3's recommended
-    // thinking preset (temp 0.6, top_p 0.95, top_k 20) so the trace can escape
-    // the loop. This is the "how vLLM does it" guidance for Qwen3 thinking. Only
-    // fills values the client left open (topP==1 / topK==0) and never lowers a
-    // hotter explicit sampling; non-thinking requests keep the deterministic
-    // argmax default untouched (needed for parity tests).
-    if (cr.enableThinking.value_or(false) && params.sampling.temperature < 0.6F) {
-        params.sampling.temperature = 0.6F;
-        if (params.sampling.topP >= 1.0F) params.sampling.topP = 0.95F;
-        if (params.sampling.topK == 0)    params.sampling.topK = 20;
-        MM_LOG_INFO("server",
-                    "thinking sampling floor: reasoning enabled under greedy/near-"
-                    "greedy sampling -> temp=0.6 top_p=0.95 top_k=20 "
-                    "(Qwen3 anti-loop preset)");
+    // Thinking mode must not run greedy: reasoning degenerates into an endless
+    // repetition loop under argmax ("No I will not... No I will not...") that no
+    // history penalty reliably breaks. Lift a greedy/near-greedy reasoning request
+    // to the MODEL'S recommended sampling — sourced from generation_config.json
+    // via LlmConfig, NOT a hardcoded per-arch preset (this is the twin of the
+    // answer-floor migration; a Gemma-4 reasoning variant must not be forced onto
+    // Qwen3's numbers). Only when the checkpoint ships no recommendation do we
+    // fall back to a GENERIC anti-degeneration sampling (same for every model —
+    // any temp>0 escapes the argmax loop; thinking must never be pure argmax).
+    // Fills only values the client left open; never lowers a hotter explicit temp.
+    if (cr.enableThinking.value_or(false)) {
+        const auto& mc = targetEngine.config();
+        constexpr float        kGenericEscapeTemp = 0.6F;   // model-agnostic floor
+        constexpr float        kGenericEscapeTopP = 0.95F;
+        constexpr std::uint32_t kGenericEscapeTopK = 20U;
+        const float thinkTemp = mc.samplingTempDefault > 0.0F
+                                    ? mc.samplingTempDefault : kGenericEscapeTemp;
+        if (params.sampling.temperature < thinkTemp) {
+            params.sampling.temperature = thinkTemp;
+            const float tp = mc.samplingTopPDefault < 1.0F
+                                 ? mc.samplingTopPDefault : kGenericEscapeTopP;
+            const std::uint32_t tk = mc.samplingTopKDefault > 0
+                                 ? mc.samplingTopKDefault : kGenericEscapeTopK;
+            if (params.sampling.topP >= 1.0F) params.sampling.topP = tp;
+            if (params.sampling.topK == 0)    params.sampling.topK = tk;
+            MM_LOG_INFO("server",
+                        "thinking sampling floor: reasoning under greedy/near-greedy "
+                        "-> temp={} top_p={} top_k={} (model generation_config; "
+                        "generic fallback only when the checkpoint ships none)",
+                        params.sampling.temperature, params.sampling.topP,
+                        params.sampling.topK);
+        }
+    }
+
+    // Answer anti-loop sampling floor (non-thinking) — "how vLLM does it".
+    //
+    // A greedy (temp=0) free-text answer on this 3B-active-4bit MoE can
+    // degenerate into a repetition loop (diagnosed 2026-09-13 via the Pegenaut
+    // tool-mode trace: a 4096-token "### Wichtige Hinweise…" ×21 loop that hit
+    // max_tokens; vLLM on the SAME nvfp4 ckpt stays coherent because it runs the
+    // model at its recommended sampling rather than pure argmax). Mirror the
+    // thinking floor: for a NON-thinking request that is greedy / near-greedy
+    // (temp < 0.6), lift to Qwen3's recommended preset (temp 0.6, top_p 0.95,
+    // top_k 20) so the decode can escape a degeneration loop. This runs AFTER the
+    // tool-loop greedy clamp, so a tool-mode final answer is sampled (its call
+    // FORMAT is still guaranteed by the xgrammar ToolCallConstraint). Only fills
+    // values the client left open (topP==1 / topK==0); never lowers a hotter
+    // explicit sampling. Server decides; ops rollback:
+    // MIMIRMIND_ANSWER_SAMPLING_FLOOR=0. SKIPPED for parity teacher-forcing
+    // (assistantPrefill / assistantPrefillIds), which needs deterministic argmax.
+    {
+        const char* off = std::getenv("MIMIRMIND_ANSWER_SAMPLING_FLOOR");
+        const bool floorOn = (off == nullptr || off[0] != '0');
+        const bool teacherForcing =
+            !cr.assistantPrefill.empty() || !cr.assistantPrefillIds.empty();
+        const bool greedy = params.sampling.temperature <= 0.0F ||
+                            params.sampling.topK == 1;
+        const auto& mc = targetEngine.config();
+        // Values are MODEL-DECLARED (generation_config.json do_sample+temperature,
+        // via LlmConfig), NOT a hardcoded per-arch preset — a model that ships no
+        // sampling recommendation (samplingTempDefault==0) makes this a no-op, so
+        // greedy stays greedy. Only a pure-greedy non-thinking request is lifted
+        // (the loop-prone regime); any client that already samples is untouched.
+        // Skipped for parity teacher-forcing; ops rollback via the env.
+        if (floorOn && !teacherForcing && greedy &&
+            !cr.enableThinking.value_or(false) &&
+            mc.samplingTempDefault > 0.0F) {
+            params.sampling.temperature = mc.samplingTempDefault;
+            if (params.sampling.topP >= 1.0F && mc.samplingTopPDefault < 1.0F)
+                params.sampling.topP = mc.samplingTopPDefault;
+            if (params.sampling.topK <= 1 && mc.samplingTopKDefault > 0)
+                params.sampling.topK = mc.samplingTopKDefault;
+            MM_LOG_INFO("server",
+                        "answer sampling floor: non-thinking greedy -> model "
+                        "generation_config sampling temp={} top_p={} top_k={} "
+                        "(MIMIRMIND_ANSWER_SAMPLING_FLOOR=0 to disable)",
+                        params.sampling.temperature, params.sampling.topP,
+                        params.sampling.topK);
+        }
     }
 
     // M7f — repetition-control penalties.
@@ -573,17 +634,18 @@ bool ChatCompletionHandler::prepareChatRequest(
     // (that don't send any penalty) from the same failure mode. Clients
     // that explicitly set a penalty value (including 0) override the
     // default.
-    constexpr float        kDefaultFrequencyPenalty  = 0.5F;
-    constexpr float        kDefaultRepetitionPenalty = 1.10F;
-    constexpr std::uint32_t kDefaultPenaltyWindow    = 64U;
+    // Defaults are per-model (LlmConfig), not hardcoded constants — a model that
+    // does not loop is not saddled with another model's tuned penalties, and
+    // repetitionPenaltyDefault can come from the checkpoint's generation_config.
+    const auto& pmc = targetEngine.config();
 
     params.sampling.frequencyPenalty =
-        cr.hasFrequencyPenalty  ? cr.frequencyPenalty  : kDefaultFrequencyPenalty;
+        cr.hasFrequencyPenalty  ? cr.frequencyPenalty  : pmc.frequencyPenaltyDefault;
     params.sampling.presencePenalty =
         cr.hasPresencePenalty   ? cr.presencePenalty   : 0.0F;
     params.sampling.repetitionPenalty =
-        cr.hasRepetitionPenalty ? cr.repetitionPenalty : kDefaultRepetitionPenalty;
-    params.sampling.penaltyWindow = kDefaultPenaltyWindow;
+        cr.hasRepetitionPenalty ? cr.repetitionPenalty : pmc.repetitionPenaltyDefault;
+    params.sampling.penaltyWindow = pmc.penaltyWindowDefault;
 
     // Anti-repeat safety floor. A client that explicitly disables BOTH the
     // frequency and repetition penalties (e.g. frequency_penalty=0 +
@@ -600,20 +662,18 @@ bool ChatCompletionHandler::prepareChatRequest(
     //      constant words (text/page/about/...) recur, so a FREQUENCY penalty over
     //      a WIDE window breaks it.
     // Apply both, over a wide window, only when the client left it fully open.
-    constexpr float        kAntiLoopFloorRepetition = 1.10F;
-    constexpr float        kAntiLoopFloorFrequency  = 0.50F;
-    constexpr std::uint32_t kAntiLoopFloorWindow    = 256U;
+    // Floor values are per-model (LlmConfig), not hardcoded constants.
     if (params.sampling.frequencyPenalty  <= 0.0F &&
         params.sampling.presencePenalty   <= 0.0F &&
         params.sampling.repetitionPenalty <= 1.0F) {
-        params.sampling.repetitionPenalty = kAntiLoopFloorRepetition;
-        params.sampling.frequencyPenalty  = kAntiLoopFloorFrequency;
-        params.sampling.penaltyWindow     = kAntiLoopFloorWindow;
+        params.sampling.repetitionPenalty = pmc.antiLoopRepetition;
+        params.sampling.frequencyPenalty  = pmc.antiLoopFrequency;
+        params.sampling.penaltyWindow     = pmc.antiLoopWindow;
         MM_LOG_INFO("server",
                     "anti-repeat floor: client disabled all penalties; applying "
                     "repetitionPenalty={} frequencyPenalty={} window={} safeguard",
-                    kAntiLoopFloorRepetition, kAntiLoopFloorFrequency,
-                    kAntiLoopFloorWindow);
+                    pmc.antiLoopRepetition, pmc.antiLoopFrequency,
+                    pmc.antiLoopWindow);
     }
     return true;
 }
@@ -1074,10 +1134,11 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     const bool missingReq = grammarOn && !toolCalls.empty()
                           && callsMissingRequired(toolCalls, cr.tools);
     const std::vector<model::ToolCall> origToolCalls = toolCalls;
+    const model::ChatTemplate::Style salvageStyle =
+        model::ChatTemplate::detectFromArch(engine.config().architecture);
     if (!cr.tools.empty() && cr.toolChoice != "none"
         && (toolCalls.empty() || missingReq) &&
-        model::ChatTemplate::detectFromArch(engine.config().architecture) ==
-            model::ChatTemplate::Style::QwenChatML) {
+        salvageStyle == model::ChatTemplate::Style::QwenChatML) {
         const std::size_t nw  = text.find_first_not_of(" \t\n\r");
         const char*       off = std::getenv("MIMIRMIND_TOOL_SALVAGE");
         // 8.19.13.1 — broaden the re-decode trigger from just '<'-leading
@@ -1096,7 +1157,8 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         // if it actually holds a call, parseToolCodeCall already caught it
         // above (so toolCalls would be non-empty and we would not be here).
         bool fenceOrCall = false;
-        for (const char* h : {"```tool_code", "<function", "<tool_call"}) {
+        for (const std::string_view h :
+             model::ChatTemplate::toolIntentMarkers(salvageStyle)) {
             if (text.find(h) != std::string::npos) { fenceOrCall = true; break; }
         }
         if (!fenceOrCall) {
@@ -1109,8 +1171,8 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         }
         if ((missingReq || saladLike || fenceOrCall)
             && (off == nullptr || off[0] != '0')) {
-            constexpr std::string_view kSalvageOpener =
-                "<tool_call>\n<function=";
+            const std::string_view kSalvageOpener =
+                model::ChatTemplate::toolCallSalvageOpenerText(salvageStyle);
             const auto openerIds =
                 tok.encode(std::string{kSalvageOpener}, /*addBos=*/false);
             std::vector<std::int32_t> salvagePrompt = promptIds;
