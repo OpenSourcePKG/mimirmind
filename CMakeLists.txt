@@ -1859,6 +1859,31 @@ target_include_directories(serving_tests PRIVATE tests)
 
 target_link_libraries(serving_tests PRIVATE mimirmind_core_common)
 
+# ---- gdn_prefix_cache_tests — roadmap 5.28.1.0 Inc-0 correctness gate -------
+#
+# Pure-CPU gate proving the property Inc 1's GDN prefix-cache reuse relies on:
+# checkpointing the recurrent SSM + conv state at position L and resuming over
+# [L, T) reproduces a single continuous forward over [0, T) — bit-exact for the
+# recurrence (decode) and conv paths, bit-exact for the chunked prefill when the
+# split is chunkSize-aligned. Also reproduces the cross-request contamination
+# bug (the reason reuse is force-disabled today) as a standing regression. Runs
+# against the compute::GatedDeltaNet CPU golden — no GPU, no model.
+#
+# Run via:   cmake --build build --target gdn_prefix_cache_tests && \
+#            build/gdn_prefix_cache_tests
+add_executable(gdn_prefix_cache_tests
+    tests/gdn_prefix_cache_tests.cpp
+    src/compute/GatedDeltaNet.cpp
+)
+
+# GatedDeltaNet.cpp is dependency-free (own header + STL), so this gate needs
+# only the src/ include root — NOT mimirmind_core_common. Kept standalone on
+# purpose: the correctness gate must build and run on any C++20 compiler,
+# including a bare dev host, without the full backend toolchain image.
+target_include_directories(gdn_prefix_cache_tests PRIVATE
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # ---- chat_request_parser_test — OpenAI /v1/chat/completions request parsing -
 #
 # Pure-CPU (8.19 Increment 1): parseChatRequest robustness helpers + tool_choice

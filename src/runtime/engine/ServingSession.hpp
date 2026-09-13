@@ -138,6 +138,22 @@ public:
     [[nodiscard]] std::size_t maxBatch() const noexcept;
     [[nodiscard]] std::size_t maxContext() const noexcept;
 
+    /// 5.28.1.3 — GDN warm-slot prefix reuse via a bounded per-slot ring of
+    /// INTERIOR SSM+conv checkpoints. `captureSlotSsmCkpt` copies the slot's live
+    /// sub-slab OUT tagged with token position `pos` (called at each prefill-chunk
+    /// boundary). `slotCkptBestPos` returns the largest checkpoint pos <= `lcp`
+    /// (0 = none usable). `restoreSlotSsmCkptAtPos` copies the checkpoint at `pos`
+    /// back into the live sub-slab (no-op if absent — caller must then NOT reuse).
+    /// `pruneSlotSsmCkpts` drops checkpoints beyond `keepMaxPos` (a reuse's shared
+    /// prefix); `clearSlotSsmCkpts` frees the ring (cold eviction). All no-op on
+    /// the L0 slab path. Device→device, queued on the compute stream.
+    void        captureSlotSsmCkpt(std::size_t slot, std::size_t pos);
+    [[nodiscard]] std::size_t slotCkptBestPos(std::size_t slot,
+                                              std::size_t lcp) const;
+    void        restoreSlotSsmCkptAtPos(std::size_t slot, std::size_t pos);
+    void        pruneSlotSsmCkpts(std::size_t slot, std::size_t keepMaxPos);
+    void        clearSlotSsmCkpts(std::size_t slot);
+
     /// Resident paged-KV pool footprint for the memory-telemetry route (8.16).
     /// `active` is false until the serving state has been allocated (no pool
     /// yet). `residentBytes` = numLayers x 2(K+V) x numBlocks x blockSize x
