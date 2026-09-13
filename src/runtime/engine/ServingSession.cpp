@@ -146,15 +146,16 @@ struct ServingState {
     // (generation-prompt suffix + BPE cross-boundary re-tokenisation). So keep a
     // bounded RING of checkpoints per slot at interior boundaries (one per prefill
     // chunk); a follow-up resumes from the largest checkpoint <= its LCP. Each
-    // buffer is a packed [blockCount, stateElemsPerLayer] / [blockCount,
-    // convElemsPerLayer] image for ONE slot (recurrent layers only, no nSeq dim).
+    // buffer is a densely-packed [nRec, stateElemsPerLayer] / [nRec,
+    // convElemsPerLayer] image for ONE slot (recurrent GatedDeltaNet layers only,
+    // no nSeq dim, no holes for full-attn layers — 5.28.1.4 recurrent-only trim).
     struct SlotCkptRing {
         std::vector<std::size_t>            pos;    // token position of each ckpt
         std::vector<compute::ComputeBuffer> state;  // parallel to pos
         std::vector<compute::ComputeBuffer> conv;
     };
     std::vector<SlotCkptRing>    slotCkpts;         // [maxBatch]
-    static constexpr std::size_t kMaxCkptsPerSlot = 8;  // ~8*83MiB/slot cap
+    static constexpr std::size_t kMaxCkptsPerSlot = 8;  // ~8*63MiB/slot cap (recurrent-only, 5.28.1.4)
 
     // Scratch (device).
     compute::ComputeBuffer expIdxBuf, kwBuf;
@@ -2292,6 +2293,14 @@ void ServingSession::captureSlotSsmCkpt(std::size_t slot, std::size_t pos) {
         st.slotCkpts.resize(st.maxBatch);
     }
     auto& ring = st.slotCkpts[slot];
+    // 5.28.1.4 — recurrent-only trim: the checkpoint stores DENSELY-packed
+    // recurrent layers only (index r = 0..nRec-1), not the full blockCount slab
+    // with holes for full-attention layers. Cuts the per-checkpoint image from
+    // ~83 MiB (all 40 layers) to ~63 MiB (~30 GatedDeltaNet layers) on qwen3.6.
+    std::size_t nRec = 0;
+    for (std::size_t L = 0; L < st.blockCount; ++L) {
+        if (_e._config.isRecurrentLayer(L)) ++nRec;
+    }
     // Reuse an evicted buffer when the ring is full (drop the smallest pos —
     // the deepest-prefix checkpoints nearest the end are the most reusable for
     // a continuation), else allocate.
@@ -2303,26 +2312,28 @@ void ServingSession::captureSlotSsmCkpt(std::size_t slot, std::size_t pos) {
         ring.state.erase(ring.state.begin());
         ring.conv.erase(ring.conv.begin());
     } else {
-        sBuf = _e._ops->allocate(st.blockCount * stElems * sizeof(float));
-        cBuf = _e._ops->allocate(st.blockCount * cvElems * sizeof(float));
+        sBuf = _e._ops->allocate(nRec * stElems * sizeof(float));
+        cBuf = _e._ops->allocate(nRec * cvElems * sizeof(float));
     }
     float* const sDst = sBuf.as<float>();
     float* const cDst = cBuf.as<float>();
     const float* const sSrc = st.ssm->statePtr();
     const float* const cSrc = st.ssm->convStatePtr();
     // Copy this slot's per-layer slice out of the live [blockCount, nSeq, elems]
-    // slab into a packed [blockCount, elems] per-slot checkpoint. Recurrent
-    // layers only — full-attention layers carry no recurrent state.
+    // slab into a packed [nRec, elems] per-slot checkpoint. Recurrent layers only
+    // (full-attention layers carry no recurrent state), densely indexed by r.
+    std::size_t r = 0;
     for (std::size_t L = 0; L < st.blockCount; ++L) {
         if (!_e._config.isRecurrentLayer(L)) {
             continue;
         }
-        _e._ops->appendMemoryCopy(sDst + L * stElems,
+        _e._ops->appendMemoryCopy(sDst + r * stElems,
                                   sSrc + L * stStride + slot * stElems,
                                   stElems * sizeof(float));
-        _e._ops->appendMemoryCopy(cDst + L * cvElems,
+        _e._ops->appendMemoryCopy(cDst + r * cvElems,
                                   cSrc + L * cvStride + slot * cvElems,
                                   cvElems * sizeof(float));
+        ++r;
     }
     ring.pos.push_back(pos);
     ring.state.push_back(std::move(sBuf));
@@ -2366,14 +2377,18 @@ void ServingSession::restoreSlotSsmCkptAtPos(std::size_t slot, std::size_t pos) 
     float* const cvDst = st.ssm->convStatePtr();
     const float* const stSrc = ring.state[idx].as<float>();
     const float* const cvSrc = ring.conv[idx].as<float>();
+    // Unpack the densely-packed [nRec, elems] checkpoint (5.28.1.4 trim) back into
+    // the live [blockCount, nSeq, elems] slab. Dense index r must match capture.
+    std::size_t r = 0;
     for (std::size_t L = 0; L < st.blockCount; ++L) {
         if (!_e._config.isRecurrentLayer(L)) {
             continue;
         }
         _e._ops->appendMemoryCopy(stDst + L * stStride + slot * stElems,
-                                  stSrc + L * stElems, stElems * sizeof(float));
+                                  stSrc + r * stElems, stElems * sizeof(float));
         _e._ops->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
-                                  cvSrc + L * cvElems, cvElems * sizeof(float));
+                                  cvSrc + r * cvElems, cvElems * sizeof(float));
+        ++r;
     }
 }
 

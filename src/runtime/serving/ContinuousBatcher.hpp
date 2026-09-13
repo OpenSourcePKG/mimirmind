@@ -311,9 +311,9 @@ private:
     // 5.28.1.2.a — GDN warm-slot session affinity. When on, completed slots are
     // kept resident (KV+SSM+token history) and a pure-continuation follow-up is
     // routed back to its warm slot, resuming from lcp instead of re-prefilling.
-    // Opt-in via MIMIRMIND_GDN_PREFIX_CKPT AND only for SSM/GatedDeltaNet
-    // backends (server decides; default OFF). `_warmTick` is the LRU clock,
-    // touched only by the worker thread under `_mtx`.
+    // 5.28.1.4: DEFAULT ON for SSM/GatedDeltaNet backends (both gates passed);
+    // opt OUT via MIMIRMIND_GDN_PREFIX_CKPT=0. Set in the ctor. `_warmTick` is the
+    // LRU clock, touched only by the worker thread under `_mtx`.
     bool             _warmSlot{false};
     std::uint64_t    _warmTick{0};
     // 5.21-III MULTI-SLOT — batch newly-admitted slots' prefill into ONE ragged

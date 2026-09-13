@@ -92,12 +92,16 @@ ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
     if (const char* pg = std::getenv("MIMIRMIND_MIXED_STEP_PRESSURE")) {
         _mixedStepPressureGate = (pg[0] == '1' && pg[1] == '\0');
     }
-    // 5.28.1.2.a — GDN warm-slot session affinity. Only for SSM/GatedDeltaNet
-    // backends (the recurrent state is what re-prefill otherwise replays from
-    // zero); pure-attention serving already has no per-turn GDN cost. Server
-    // decides via the capability env; default OFF until on-box concurrency +
-    // HTTP-anchor validation. Warm-slot rides the EAGER prefill path (mixed-step
-    // is a separate, currently-off scheduler); disable it if eager prefill is off.
+    // 5.28.1.4 — GDN warm-slot session affinity: DEFAULT ON for SSM/GatedDeltaNet
+    // backends. Both default-on gates passed on GB10/qwen3.6 (2026-09-13):
+    // hit-rate (51-92% TTFT drop on shared prefixes, ~100% hit, no contamination)
+    // and a 3h memory soak (bounded, 0 errors, 21k req) + recurrent-only ckpt trim.
+    // Only for SSM backends (the recurrent state is what re-prefill otherwise
+    // replays from zero; pure-attention serving has no per-turn GDN cost) and only
+    // on the EAGER prefill path (mixed-step is a separate, currently-off scheduler).
+    // Server can opt OUT via MIMIRMIND_GDN_PREFIX_CKPT=0 (instant rollback, no
+    // rebuild). The single-session generate() path stays opt-in (non-prod).
+    _warmSlot = _engine.backendNeedsSsmScratch() && _prefillChunk > 0;
     if (const char* wc = std::getenv("MIMIRMIND_GDN_PREFIX_CKPT")) {
         _warmSlot = (std::atol(wc) > 0) && _engine.backendNeedsSsmScratch() &&
                     _prefillChunk > 0;
