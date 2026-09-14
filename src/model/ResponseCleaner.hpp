@@ -114,6 +114,11 @@ private:
     bool                _stripLeading {false};
     ThinkPhase          _thinkPhase   {ThinkPhase::Done};
     std::string         _pending;
+    // Closer string for the currently-open reasoning block. Normally the real
+    // "</think>", but a hallucinated pseudo special-token opener (<|WORD_start|>)
+    // sets it to the matching "<|WORD_end|>" so the leaked reasoning is routed to
+    // the reasoning channel instead of the answer text.
+    std::string         _thinkClose   {"</think>"};
 };
 
 } // namespace mimirmind::model

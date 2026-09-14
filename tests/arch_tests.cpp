@@ -542,6 +542,35 @@ TEST(responseCleaner_qwen_thinkTagsSplitAcrossTokens) {
     EXPECT_EQ(out, std::string{"Paris"});
 }
 
+TEST(responseCleaner_qwen_stripsHallucinatedPseudoThinkMarkers) {
+    // A non-thinking request nudged into sampling can make the model INVENT a
+    // reasoning block wrapped in pseudo special-tokens <|mask_start|>...<|mask_end|>
+    // (NOT real tokens — the checkpoint's real markers are <think>/</think> ids).
+    // Those must be routed to reasoning, never leaked into the answer; generic
+    // over the pseudo WORD (not tied to "mask").
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::QwenChatML, /*thinkId=*/-1, -1};
+
+    std::string out;
+    (void)feedAndCapture(c, kFakeTextId,
+                         "<|mask_start|>Thought: reason here<|mask_end|>\n\n", out);
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId, "Die Antwort.", out));
+    EXPECT_EQ(out, std::string{"Die Antwort."});
+}
+
+TEST(responseCleaner_qwen_scrubsStrayPseudoMarker) {
+    // A stray literal marker with no matching opener (<|mask_end|>) is a leak —
+    // real special tokens are ids, never text, so scrub any complete <|...|>.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::QwenChatML, /*thinkId=*/-1, -1};
+
+    std::string out;
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId, "Antwort<|mask_end|> Ende.", out));
+    EXPECT_EQ(out, std::string{"Antwort Ende."});
+}
+
 TEST(responseCleaner_qwen_noThinkPassesThrough) {
     // A response that does NOT open with <think> (Qwen2/2.5 or thinking off)
     // must pass through verbatim, including leading whitespace.
