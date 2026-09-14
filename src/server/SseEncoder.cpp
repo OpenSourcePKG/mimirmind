@@ -118,7 +118,8 @@ json SseEncoder::buildFinishChunk(const std::string& id, std::int64_t created,
 json SseEncoder::buildUsageChunk(const std::string& id, std::int64_t created,
                                   const std::string& model,
                                   std::size_t promptTokens,
-                                  std::size_t completionTokens) {
+                                  std::size_t completionTokens,
+                                  std::size_t cachedTokens) {
     json out = streamChunkSkeleton(id, created, model);
     // OpenAI's include_usage terminal chunk carries an EMPTY choices array
     // (the finish chunk already delivered the final choice) plus usage.
@@ -127,6 +128,8 @@ json SseEncoder::buildUsageChunk(const std::string& id, std::int64_t created,
         {"prompt_tokens",     promptTokens},
         {"completion_tokens", completionTokens},
         {"total_tokens",      promptTokens + completionTokens},
+        // OpenAI/vLLM-compatible prefix-cache visibility (0 on a full cold prefill).
+        {"prompt_tokens_details", json{{"cached_tokens", cachedTokens}}},
     };
     return out;
 }

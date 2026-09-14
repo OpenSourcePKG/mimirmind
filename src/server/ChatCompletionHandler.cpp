@@ -236,7 +236,10 @@ std::vector<std::int32_t> runViaBatcher(
         const std::function<bool(std::int32_t)>&  onToken,
         std::shared_ptr<model::ToolCallConstraint> constraint = nullptr,
         std::vector<runtime::TokenLogprobs>*       outLp = nullptr,
-        const std::function<void(const runtime::TokenLogprobs&)>* onLp = nullptr) {
+        const std::function<void(const runtime::TokenLogprobs&)>* onLp = nullptr,
+        runtime::GenerateStats*                    outStats = nullptr,
+        const std::function<void(const runtime::InferenceEngine::PrefillDone&)>*
+                                                   onPrefillDone = nullptr) {
     // 8.19.5: hand the request's sampling params to the batcher so the slot
     // decodes with them (temperature<=0 stays the greedy fast path).
     // 8.19.13.2: an optional tool-call grammar constraint rides along.
@@ -247,8 +250,26 @@ std::vector<std::int32_t> runViaBatcher(
     std::size_t  next = 0;
     std::int32_t t    = 0;
     bool aborted = false;
+    bool prefillReported = false;
     while (req->waitToken(next, t)) {
         out.push_back(t);
+        // First token means prefill is done — surface the batcher's prefill
+        // telemetry (cached vs freshly-prefilled prompt tokens + prefill wall
+        // time) so a streaming client can emit the prefill_done event, the same
+        // as the single-session path. Fired once.
+        if (!prefillReported) {
+            prefillReported = true;
+            if (onPrefillDone != nullptr && *onPrefillDone) {
+                runtime::InferenceEngine::PrefillDone pd{};
+                {
+                    std::lock_guard<std::mutex> lk(req->mtx);
+                    pd.promptTokens    = req->promptTokens;
+                    pd.prefilledTokens = req->prefilledTokens;
+                    pd.prefillMs       = req->prefillMs;
+                }
+                (*onPrefillDone)(pd);
+            }
+        }
         // 8.19.14 part B — per-token logprob callback (streaming). req->logprobs
         // is appended under the same lock as the token, so index `next` is ready.
         if (onLp != nullptr && *onLp) {
@@ -260,6 +281,17 @@ std::vector<std::int32_t> runViaBatcher(
     }
     if (aborted) {
         batcher.cancel(req);
+    }
+    // Hand the prefill/cache telemetry back into GenerateStats so the serving
+    // path reports the same cached_tokens / prefill_ms the single-session path
+    // does (usage.prompt_tokens_details.cached_tokens + the completion log).
+    if (outStats != nullptr) {
+        std::lock_guard<std::mutex> lk(req->mtx);
+        if (req->prefillSet) {
+            outStats->promptTokens = req->promptTokens;
+            outStats->cachedTokens = req->cachedTokens;
+            outStats->prefillMs    = req->prefillMs;
+        }
     }
     // 8.19.14 part B — hand back the per-token logprobs (aligned with `out`);
     // populated only when the request enabled logprobs.
@@ -904,7 +936,8 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                                           cr.tools, cr.toolChoice,
                                           cr.responseFormat, cr.jsonSchema,
                                           tok),
-                                      cr.logprobs ? &lpVec : nullptr);
+                                      cr.logprobs ? &lpVec : nullptr,
+                                      /*onLp=*/nullptr, /*outStats=*/&stats);
         } catch (const runtime::serving::ServingTenantQuotaError& e) {
             // Per-tenant fairness shed, not a bug: retryable 429.
             _metrics.recordQuotaRejected(tenant);
@@ -1277,6 +1310,15 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         {"completion_tokens", visible.size()},
         {"total_tokens",      promptIds.size() + visible.size()},
     };
+    // OpenAI/vLLM-compatible prefix-cache visibility: how many prompt tokens were
+    // served from the cache (warm-slot / GDN prefix reuse on the serving path, or
+    // the single-session LCP hit) and thus skipped prefill. Lets a client (Pegenaut)
+    // see cache hits + prefill cost instead of the old always-0/0. `cachedTokens`
+    // is populated by both paths via GenerateStats.
+    usage["prompt_tokens_details"] = { {"cached_tokens", stats.cachedTokens} };
+    if (stats.prefillMs > 0.0) {
+        usage["prefill_ms"] = stats.prefillMs;   // mimirmind extension
+    }
     // Extension over the OpenAI shape: per-request energy delta from
     // the RAPL package counter. Quietly omitted when no power monitor
     // was active for this call.
@@ -1966,6 +2008,12 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                             }
                         };
                     }
+                    // Prefill telemetry now flows on the batcher path too:
+                    // hand the prefill_done callback + GenerateStats through so a
+                    // streaming client sees real prefilled/cached tokens instead
+                    // of 0/0 (was single-session-only).
+                    std::function<void(const runtime::InferenceEngine::PrefillDone&)>
+                        onPrefillDoneFn = onPrefillDone;
                     generated = runViaBatcher(*activeBatcher,
                                               state->promptIds, state->params,
                                               state->stopIds, state->tenantId,
@@ -1976,7 +2024,9 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                                                   state->responseFormat,
                                                   state->jsonSchema, tok),
                                               /*outLp=*/nullptr,
-                                              onLpFn ? &onLpFn : nullptr);
+                                              onLpFn ? &onLpFn : nullptr,
+                                              /*outStats=*/&stats,
+                                              &onPrefillDoneFn);
                 } catch (const runtime::serving::ServingTenantQuotaError& e) {
                     // Race-path 429 (pre-check in handle() sheds the rest).
                     this->_metrics.recordQuotaRejected(state->tenantId);
@@ -2297,7 +2347,7 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                     sink,
                     SseEncoder::buildUsageChunk(state->respId, state->created,
                                      state->echoModel, state->promptIds.size(),
-                                     emittedTokens));
+                                     emittedTokens, stats.cachedTokens));
             }
             (void)SseEncoder::writeSseDone(sink);
 

@@ -487,6 +487,17 @@ void ContinuousBatcher::commitPrefilledSlot(
     {
         std::lock_guard<std::mutex> rl(s.req->mtx);
         cancelled = s.req->cancelled;
+        // Prefill telemetry (set once, before the first token is observed): how
+        // much of the prompt was served from the warm-slot/prefix cache vs freshly
+        // prefilled, and the prefill wall time. Mirrors GenerateStats on the
+        // single-session path so serving usage can report cached_tokens.
+        s.req->promptTokens    = s.promptLen;
+        s.req->cachedTokens    = s.prefillStart;
+        s.req->prefilledTokens = s.promptLen - s.prefillStart;
+        s.req->prefillMs       = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now()
+                                     - s.admitAt).count();
+        s.req->prefillSet      = true;
         if (!cancelled) {
             s.req->tokens.push_back(firstTok);
             s.req->logprobs.push_back(std::move(firstLp));   // 8.19.14
@@ -869,6 +880,7 @@ void ContinuousBatcher::workerLoop() {
                     s.stopIds      = std::move(it->stopIds);
                     s.prefillPos   = 0;
                     s.prefillStart = reusePos;   // resume from the interior checkpoint
+                    s.admitAt      = std::chrono::steady_clock::now();
                     _engine.setServingSlotSampling(
                         ws, it->sampling, std::span<const std::int32_t>(s.prompt));
                     _engine.setServingSlotToolConstraint(ws, it->constraint);
@@ -913,6 +925,7 @@ void ContinuousBatcher::workerLoop() {
                 // history so findWarmSlot never matches this fresh request, and
                 // free the slot's stale interior-checkpoint ring.
                 s.prefillStart = 0;
+                s.admitAt      = std::chrono::steady_clock::now();
                 s.resident     = false;
                 s.residentTokens.clear();
                 _engine.clearSlotSsmCkpts(i);

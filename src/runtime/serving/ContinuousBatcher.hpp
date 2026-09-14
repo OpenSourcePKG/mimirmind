@@ -6,6 +6,7 @@
 #include "compute/Sampling.hpp"
 #include "runtime/TokenLogprobs.hpp"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -73,6 +74,19 @@ struct ServingRequest {
     // submit() and immutable thereafter, so the worker and the per-tenant
     // admission scan can read it without extra synchronisation beyond `_mtx`.
     std::string              tenantId;
+
+    // Prefill telemetry, set ONCE by the batcher when the slot finishes prefill
+    // (i.e. the first token is produced), under `mtx`. `cachedTokens` = prompt
+    // tokens served from a warm-slot / prefix-cache hit (their prefill is
+    // skipped); `prefilledTokens` = promptTokens - cachedTokens actually ran the
+    // transformer; `prefillMs` = admission -> first token wall time. Lets the
+    // serving path report the same prefill/cache detail the single-session path
+    // already does (usage.prompt_tokens_details.cached_tokens + prefill_done SSE).
+    std::size_t              promptTokens{0};
+    std::size_t              cachedTokens{0};
+    std::size_t              prefilledTokens{0};
+    double                   prefillMs{0.0};
+    bool                     prefillSet{false};
 
     /// Block until the request completes; returns the full token stream.
     /// On failure the stream may be partial and `error` is set.
@@ -221,6 +235,9 @@ private:
         // for a warm continuation reuse (so prefillSlot skips [0,lcp), keeps the
         // resident KV+SSM, and does NOT re-zero the recurrence).
         std::size_t                     prefillStart{0};
+        // Admission timestamp — used to report the request's prefill wall time
+        // (admission -> first token) in ServingRequest::prefillMs.
+        std::chrono::steady_clock::time_point admitAt{};
     };
 
     void workerLoop();

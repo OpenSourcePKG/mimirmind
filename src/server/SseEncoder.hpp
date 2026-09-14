@@ -89,7 +89,8 @@ struct SseEncoder {
         std::int64_t       created,
         const std::string& model,
         std::size_t        promptTokens,
-        std::size_t        completionTokens);
+        std::size_t        completionTokens,
+        std::size_t        cachedTokens = 0);
 
     /// Format `payload` as one SSE event and push it onto `sink`.
     /// Returns false if the sink refused the write — caller should
