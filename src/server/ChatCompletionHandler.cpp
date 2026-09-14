@@ -610,7 +610,18 @@ bool ChatCompletionHandler::prepareChatRequest(
         if (floorOn && !teacherForcing && greedy &&
             !cr.enableThinking.value_or(false) &&
             mc.samplingTempDefault > 0.0F) {
-            params.sampling.temperature = mc.samplingTempDefault;
+            // Cap the escape temperature: a checkpoint may declare temp=1.0
+            // (qwen3.6), which escapes the loop but adds hedging/noise on factual
+            // output. A model-agnostic ceiling keeps the floor just hot enough to
+            // break degeneration while staying coherent. Not a per-arch preset —
+            // a generic bound (ops-tunable via env).
+            constexpr float kAnswerFloorTempCapDefault = 0.7F;
+            float tempCap = kAnswerFloorTempCapDefault;
+            if (const char* c = std::getenv("MIMIRMIND_ANSWER_FLOOR_TEMP_CAP")) {
+                const float v = std::strtof(c, nullptr);
+                if (v > 0.0F) tempCap = v;
+            }
+            params.sampling.temperature = std::min(mc.samplingTempDefault, tempCap);
             if (params.sampling.topP >= 1.0F && mc.samplingTopPDefault < 1.0F)
                 params.sampling.topP = mc.samplingTopPDefault;
             if (params.sampling.topK <= 1 && mc.samplingTopKDefault > 0)
