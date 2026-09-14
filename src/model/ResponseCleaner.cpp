@@ -47,6 +47,12 @@ ThinkOpen findThinkOpen(const std::string& s) {
         if (content.size() > kSuf.size() &&
             content.compare(content.size() - kSuf.size(), kSuf.size(), kSuf) == 0) {
             const std::string word = content.substr(0, content.size() - kSuf.size());
+            // ChatML structural control tokens (<|im_start|>) can leak as literal
+            // text but are NOT reasoning openers — routing them to reasoning would
+            // swallow the whole answer (the closer "<|im_end|>" never comes as text).
+            // Skip them here; they are dropped as role-header echoes on the answer
+            // path (feedQwenThink) instead. Keep scanning for a genuine pseudo opener.
+            if (word == "im") { scan = gt + 2; continue; }
             if (!best.valid || p < best.pos) {
                 best = {p, (gt + 2) - p, "<|" + word + "_end|>", true};
             }
@@ -196,6 +202,40 @@ bool ResponseCleaner::feedQwenThink(std::string& text, std::string& reasoning) {
             _stripLeading = false;
         }
 
+        // Drop a leaked ChatML role-header echo "<|im_start|>role\n" — a chat
+        // structure control token echoed as literal text (observed when the model
+        // closes an empty <think></think> under enable_thinking and re-emits the
+        // assistant header). It is never part of the answer. Drop through the next
+        // newline; if the newline has not arrived yet, keep dropping across feeds
+        // (_inRoleHeader) so a role word split across tokens cannot leak.
+        if (_inRoleHeader) {
+            const std::size_t nl = _pending.find('\n');
+            if (nl == std::string::npos) {
+                _pending.clear();       // still inside the header line; wait for '\n'
+                break;
+            }
+            _pending.erase(0, nl + 1);
+            _inRoleHeader = false;
+            _stripLeading = true;       // drop any blank line before the answer
+            progress      = true;
+            continue;
+        }
+        if (const std::size_t rh = _pending.find("<|im_start|>");
+            rh != std::string::npos) {
+            emit.append(_pending, 0, rh);   // answer text before the echo (usually none)
+            _pending.erase(0, rh);
+            const std::size_t nl = _pending.find('\n');
+            if (nl == std::string::npos) {
+                _pending.clear();
+                _inRoleHeader = true;   // "<|im_start|>role" without its '\n' yet
+                break;
+            }
+            _pending.erase(0, nl + 1);
+            _stripLeading = true;
+            progress      = true;
+            continue;
+        }
+
         const ThinkOpen open = findThinkOpen(_pending);
         if (!open.valid) {
             // No complete opener: emit all but a partial opener still at the tail.
@@ -212,9 +252,11 @@ bool ResponseCleaner::feedQwenThink(std::string& text, std::string& reasoning) {
     }
 
     // Defensive scrub: any COMPLETE literal "<|...|>" left in the answer is a
-    // stray hallucinated marker (e.g. a closer with no opener) — real special
-    // tokens are token ids, never text. Remove them wholesale (partial ones were
-    // already held back by safeEmitLen, so anything here is complete).
+    // stray hallucinated marker (e.g. a closer with no opener) or a leaked ChatML
+    // control token (<|im_end|>, <|endoftext|>) — real special tokens are token ids,
+    // never text. Remove them wholesale (partial ones were already held back by
+    // safeEmitLen, so anything here is complete). The "<|im_start|>role\n" role
+    // header echo is handled earlier (it also consumes the trailing role word).
     for (std::size_t p = emit.find("<|"); p != std::string::npos;
          p = emit.find("<|", p)) {
         const std::size_t gt = emit.find("|>", p + 2);

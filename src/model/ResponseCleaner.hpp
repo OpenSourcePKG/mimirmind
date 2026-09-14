@@ -112,6 +112,10 @@ private:
     std::int32_t        _channelEndId;
     bool                _inChannel    {false};
     bool                _stripLeading {false};
+    // Mid-drop of a leaked ChatML role-header echo ("<|im_start|>assistant\n"):
+    // the "<|im_start|>" arrived but its terminating newline has not yet, so keep
+    // dropping incoming text (the role word) across feeds until the newline lands.
+    bool                _inRoleHeader {false};
     ThinkPhase          _thinkPhase   {ThinkPhase::Done};
     std::string         _pending;
     // Closer string for the currently-open reasoning block. Normally the real
