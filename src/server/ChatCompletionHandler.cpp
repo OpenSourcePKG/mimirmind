@@ -689,6 +689,15 @@ bool ChatCompletionHandler::prepareChatRequest(
     params.sampling.repetitionPenalty =
         cr.hasRepetitionPenalty ? cr.repetitionPenalty : pmc.repetitionPenaltyDefault;
     params.sampling.penaltyWindow = pmc.penaltyWindowDefault;
+    // Ops override for the frequency/repetition penalty window. mimirmind's
+    // default window is narrow (a few dozen tokens), so a NEAR-repetition loop
+    // whose recurring words are spread over a long answer escapes the penalty
+    // (vLLM applies frequency_penalty over the WHOLE output). Widen via
+    // MIMIRMIND_PENALTY_WINDOW=<tokens> (capped by the per-slot recent history).
+    if (const char* w = std::getenv("MIMIRMIND_PENALTY_WINDOW")) {
+        const long v = std::strtol(w, nullptr, 10);
+        if (v > 0) params.sampling.penaltyWindow = static_cast<std::uint32_t>(v);
+    }
 
     // Anti-repeat safety floor. A client that explicitly disables BOTH the
     // frequency and repetition penalties (e.g. frequency_penalty=0 +

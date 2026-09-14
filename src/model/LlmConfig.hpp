@@ -97,12 +97,18 @@ struct LlmConfig {
     // is a token-count over recent history.
     float         frequencyPenaltyDefault  {0.5F};
     float         repetitionPenaltyDefault {1.10F};
-    std::uint32_t penaltyWindowDefault     {64U};
+    // 5.x: WIDE default window (was 64). vLLM applies frequency_penalty over the
+    // WHOLE output; a narrow window let a NEAR-repetition loop — recurring words
+    // spread over a long answer — escape the penalty (measured: 64 → severe
+    // rambling ~1/6, up to 38 repeated 5-grams + non-terminating runs; 512 →
+    // 0 severe, ≤9). Capped by the per-slot recent history (ServingSession
+    // kSlotRecentCap). Ops override: MIMIRMIND_PENALTY_WINDOW.
+    std::uint32_t penaltyWindowDefault     {512U};
     // Applied only when the client disabled ALL penalties (leaving greedy with no
-    // escape) — a wider window catches long-block loops the narrow default misses.
+    // escape) — a wide window catches long-block / near-repetition loops.
     float         antiLoopRepetition {1.10F};
     float         antiLoopFrequency  {0.50F};
-    std::uint32_t antiLoopWindow     {256U};
+    std::uint32_t antiLoopWindow     {512U};
     // Explicit attention softmax scale (GGUF `<arch>.attention.scale`).
     // 0 = unset → attention uses the default 1/sqrt(head_dim). Qwen3-Next
     // (`qwen35moe`) ships this key; llama.cpp:
