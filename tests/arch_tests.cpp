@@ -571,6 +571,65 @@ TEST(responseCleaner_qwen_scrubsStrayPseudoMarker) {
     EXPECT_EQ(out, std::string{"Antwort Ende."});
 }
 
+TEST(responseCleaner_qwen_stripsChatmlRoleHeaderEcho) {
+    // Fall B: under enable_thinking:true (think pre-opened) a small checkpoint can
+    // close an EMPTY <think></think> and then re-emit the assistant role header as
+    // LITERAL text ("<|im_start|>assistant\n") before the answer. That control-token
+    // echo must be dropped (token + role word + newline), never leaked into content.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::QwenChatML, /*thinkId=*/1, -1};
+
+    std::string out;
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId, "\n",       out)); // empty reasoning
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId, "</think>", out)); // close think
+    (void)feedAndCapture(c, kFakeTextId,
+                         "\n<|im_start|>assistant\nDie Antwort.", out);
+    EXPECT_EQ(out, std::string{"Die Antwort."});
+}
+
+TEST(responseCleaner_qwen_roleHeaderEchoNotTreatedAsReasoning) {
+    // Regression guard for the 95d8bcc opener heuristic: "<|im_start|>" ends in
+    // "_start" but is a ChatML control token, NOT a hallucinated reasoning opener.
+    // It must not be matched as an opener (closer "<|im_end|>" never arrives as
+    // text) — otherwise the WHOLE answer would be swallowed into reasoning_content.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::QwenChatML, /*thinkId=*/-1, -1};
+
+    std::string out;
+    (void)feedAndCapture(c, kFakeTextId,
+                         "<|im_start|>assistant\nParis is the capital.", out);
+    EXPECT_EQ(out, std::string{"Paris is the capital."});
+}
+
+TEST(responseCleaner_qwen_roleHeaderEchoSplitAcrossTokens) {
+    // The role header can arrive split: "<|im_start|>" in one token, then the role
+    // word and its newline in later tokens. The drop must span feeds (_inRoleHeader)
+    // so no "assistant" fragment leaks.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::QwenChatML, /*thinkId=*/-1, -1};
+
+    std::string out;
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId, "<|im_start|>", out));
+    EXPECT_TRUE(!feedAndCapture(c, kFakeTextId, "assist",       out));
+    EXPECT_TRUE(feedAndCapture(c,  kFakeTextId, "ant\nHallo.",  out));
+    EXPECT_EQ(out, std::string{"Hallo."});
+}
+
+TEST(responseCleaner_qwen_scrubsStrayImEnd) {
+    // A leaked bare ChatML control token (<|im_end|>) with no role header is scrubbed
+    // like any stray complete "<|...|>" literal.
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::model::ResponseCleaner;
+    ResponseCleaner c{ChatTemplate::Style::QwenChatML, /*thinkId=*/-1, -1};
+
+    std::string out;
+    EXPECT_TRUE(feedAndCapture(c, kFakeTextId, "Antwort<|im_end|>", out));
+    EXPECT_EQ(out, std::string{"Antwort"});
+}
+
 TEST(responseCleaner_qwen_noThinkPassesThrough) {
     // A response that does NOT open with <think> (Qwen2/2.5 or thinking off)
     // must pass through verbatim, including leading whitespace.

@@ -1807,6 +1807,7 @@ add_executable(arch_tests
     src/model/ToolCallParser.cpp
     src/model/ToolCallConstraint.cpp
     src/model/ToolCallStreamDetector.cpp
+    src/model/Tokenizer.cpp
     src/runtime/thermal/GpuClockGovernor.cpp
     src/runtime/thermal/PowerMonitor.cpp
     src/runtime/thermal/SystemMonitor.cpp
