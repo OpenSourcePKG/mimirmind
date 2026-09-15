@@ -1169,7 +1169,7 @@ bool stripTrailing(std::string& s, std::string_view needle) {
 
 std::string
 ChatTemplate::cleanResponse(Style style, std::string_view text,
-                            std::string* reasoningOut) {
+                            std::string* reasoningOut, bool thinkPreOpened) {
     std::string out{text};
     switch (style) {
         case Style::QwenChatML: {
@@ -1191,6 +1191,22 @@ ChatTemplate::cleanResponse(Style style, std::string_view text,
                                         out.front() == '\t' || out.front() == '\r')) {
                     out.erase(0, 1);
                 }
+                return out;
+            }
+            // No closer. When <think> was PRE-OPENED (enable_thinking:true) the
+            // whole span is an unclosed reasoning block — the model ran out
+            // (max_tokens) or reasoned markerless without ever emitting </think>.
+            // Route it ALL to reasoning with empty content, matching the streaming
+            // ResponseCleaner (which starts InThink and stays there to EOS) and
+            // vLLM's corrected parser (missing end token under thinking-on =
+            // everything is reasoning). Without a pre-open this is a plain
+            // non-thinking answer (Qwen2/2.5 or enable_thinking:false) — leave it
+            // as content.
+            if (thinkPreOpened) {
+                if (reasoningOut != nullptr) {
+                    *reasoningOut = std::move(out);
+                }
+                return std::string{};
             }
             return out;
         }

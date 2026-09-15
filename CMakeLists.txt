@@ -1804,6 +1804,7 @@ add_executable(arch_tests
     src/compute/MoeRouting.cpp
     src/compute/Softmax.cpp
     src/model/ResponseCleaner.cpp
+    src/model/ChatTemplate.cpp
     src/model/ToolCallParser.cpp
     src/model/ToolCallConstraint.cpp
     src/model/ToolCallStreamDetector.cpp

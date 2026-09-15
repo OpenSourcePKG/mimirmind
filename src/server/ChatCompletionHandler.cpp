@@ -1046,7 +1046,11 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
         : model::ChatTemplate::cleanResponse(
               model::ChatTemplate::detectFromArch(
                   engine.config().architecture),
-              rawText, &reasoning);
+              rawText, &reasoning,
+              // enable_thinking:true pre-opens <think>; an unclosed block then
+              // means the whole span is reasoning (mirror the streaming cleaner
+              // + vLLM), not a content answer.
+              /*thinkPreOpened=*/cr.enableThinking.value_or(false));
 
     // M-FunctionCalling: when tools were offered and the model emitted a tool
     // call, surface it as structured tool_calls instead of content. Decode
