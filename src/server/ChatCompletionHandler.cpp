@@ -215,6 +215,18 @@ inline bool callsMissingRequired(
             if (!r.is_string()) { continue; }
             const std::string key = r.get<std::string>();
             if (!args.is_object() || !args.contains(key)) { return true; }
+            // 8.19.13.5 — a required arg present but a DEGENERATE empty/
+            // whitespace-only string (observed: query="\n\n" from a minimal-context
+            // forced tool call decoding into whitespace) is as useless as a missing
+            // one — the tool rejects it ("missing required argument"). Treat it as a
+            // salvage trigger so the (now-sampled) grammar re-decode gets a real
+            // value instead of shipping a dead call.
+            if (const auto& v = args[key]; v.is_string()) {
+                const std::string s = v.get<std::string>();
+                if (s.find_first_not_of(" \t\r\n\f\v") == std::string::npos) {
+                    return true;
+                }
+            }
         }
     }
     return false;
@@ -1236,7 +1248,6 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             salvagePrompt.insert(salvagePrompt.end(),
                                  openerIds.begin(), openerIds.end());
             runtime::GenerateParams sp = params;
-            sp.sampling.temperature = 0.0F;
             sp.maxNewTokens = std::min<std::size_t>(sp.maxNewTokens, 1024);
             // 8.19.13.2 — the opener `<function=` is now in the PREFILL (never
             // reaches the matcher, which only sees generated tokens), so drive
@@ -1248,6 +1259,18 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                 auto c = std::make_shared<model::ToolCallConstraint>(
                     cr.tools, tok, /*assumeOpenerConsumed=*/true);
                 if (c->active()) { forceC = c; }
+            }
+            // 8.19.13.5 — a GREEDY re-decode just repeats the degeneration that
+            // produced the dead call (e.g. query="\n\n"). Do NOT force greedy when a
+            // grammar mask is active: the mask guarantees the tool-call FORMAT at any
+            // temperature, so keep the request's OWN sampling — which the anti-loop
+            // floor has already lifted to the MODEL's declared generation_config values
+            // (via LlmConfig, capped) — so the re-decode escapes the greedy collapse
+            // using per-model sampling, never a hardcoded per-arch preset. WITHOUT a
+            // mask, fall back to the historical greedy salvage (sampled tool calls
+            // break format when nothing constrains them).
+            if (!forceC) {
+                sp.sampling.temperature = 0.0F;
             }
             std::vector<std::int32_t> redecoded;
             runtime::GenerateStats    salvStats;
