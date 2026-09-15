@@ -242,11 +242,15 @@ private:
         // 5.30.1 thinking-token-budget. thinkOpen: the slot is generating inside
         // a pre-opened <think> block (enable_thinking:true) that has not been
         // closed yet. reasoningTokens: generated tokens since the block opened.
-        // When reasoningTokens hits _thinkBudget the next token is forced to
-        // </think> so the model stops reasoning and answers. Inert when
-        // _thinkBudget==0 (thinkOpen stays false).
+        // When reasoningTokens hits _thinkBudget the slot enters `forcing`: it
+        // emits the fixed transition sequence _thinkForceSeq (a short "answer now"
+        // message + </think> + newlines, vLLM-style) one token per step, then the
+        // model generates the answer. forceIdx is the cursor into that sequence.
+        // Inert when _thinkBudget==0 (thinkOpen stays false).
         bool                            thinkOpen{false};
         std::size_t                     reasoningTokens{0};
+        bool                            forcing{false};
+        std::size_t                     forceIdx{0};
     };
 
     void workerLoop();
@@ -260,10 +264,12 @@ private:
 
     /// 5.30.1 — thinking-token-budget enforcement, called once per generated
     /// token. While the slot is inside an open <think> block: a natural </think>
-    /// closes it; otherwise the reasoning token is counted and, once the budget
-    /// is reached, `tok` is REWRITTEN to </think> so the model exits reasoning and
-    /// produces the answer (vLLM thinking_token_budget). No-op when thinkOpen is
-    /// false (budget disabled or block already closed). Worker-thread only.
+    /// closes it; otherwise the reasoning token is counted and, once the budget is
+    /// reached, the slot enters `forcing` and `tok` is REWRITTEN over successive
+    /// calls to each token of _thinkForceSeq (concluding message + </think> +
+    /// newlines, vLLM-style), after which the model generates the answer. No-op
+    /// when thinkOpen is false (budget disabled or block already closed).
+    /// Worker-thread only.
     void applyThinkBudget(Slot& s, std::int32_t& tok) const;
 
     /// 5.28.1.2.a — retire a slot whose request has ended. `keepWarm` keeps it
@@ -399,6 +405,12 @@ private:
     std::size_t      _thinkBudget{0};
     std::int32_t     _thinkStartId{-1};
     std::int32_t     _thinkEndId{-1};
+    // 5.30.1 — the transition FORCED when the budget is spent: a short concluding
+    // message ("answer now") + </think> + trailing newlines, tokenised once in the
+    // ctor. Forcing the bare </think> alone yields garbage on this checkpoint
+    // (measured 2026-09-15); vLLM injects a concluding message before the closer so
+    // the model pivots cleanly to the answer. Always ends with _thinkEndId.
+    std::vector<std::int32_t> _thinkForceSeq;
 
     std::vector<Slot>                     _slots;
     std::deque<Pending>                   _waiting;

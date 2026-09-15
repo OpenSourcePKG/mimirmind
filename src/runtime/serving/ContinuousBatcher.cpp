@@ -118,6 +118,26 @@ ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
             _thinkBudget = static_cast<std::size_t>(v);
         }
     }
+    // Build the forced budget-exceeded transition ONCE: a concluding message that
+    // tells the model to answer now (emitted as the tail of the reasoning) + the
+    // </think> closer + trailing newlines (the training format is "</think>\n\n").
+    // vLLM injects such a message before the closer; forcing the bare </think>
+    // alone made this checkpoint emit garbage (2026-09-15 calibration). Ops can
+    // override the message text via MIMIRMIND_THINKING_BUDGET_MSG.
+    if (_thinkBudget > 0) {
+        const char* msgEnv = std::getenv("MIMIRMIND_THINKING_BUDGET_MSG");
+        const std::string msg =
+            msgEnv != nullptr
+                ? std::string(msgEnv)
+                : std::string("\n\nI have enough information now; I will give the "
+                              "final answer.\n");
+        const auto& tk   = _engine.tokenizer();
+        _thinkForceSeq   = tk.encode(msg, /*addBos=*/false);
+        _thinkForceSeq.push_back(_thinkEndId);
+        for (std::int32_t id : tk.encode("\n\n", /*addBos=*/false)) {
+            _thinkForceSeq.push_back(id);
+        }
+    }
 
     _slots.resize(maxBatch);
     _running = true;
@@ -152,6 +172,8 @@ bool ContinuousBatcher::isStop(std::int32_t tok, const Slot& s) const {
 void ContinuousBatcher::initThinkState(Slot& s) const {
     s.reasoningTokens = 0;
     s.thinkOpen       = false;
+    s.forcing         = false;
+    s.forceIdx        = 0;
     if (_thinkBudget == 0 || _thinkStartId < 0 || _thinkEndId < 0) {
         return;
     }
@@ -171,6 +193,17 @@ void ContinuousBatcher::initThinkState(Slot& s) const {
 }
 
 void ContinuousBatcher::applyThinkBudget(Slot& s, std::int32_t& tok) const {
+    // Draining the forced transition: override each step's token with the next
+    // queued id (concluding message + </think> + newlines) until the sequence is
+    // spent, then the model generates the answer.
+    if (s.forcing) {
+        tok = _thinkForceSeq[s.forceIdx++];
+        if (s.forceIdx >= _thinkForceSeq.size()) {
+            s.forcing   = false;
+            s.thinkOpen = false;
+        }
+        return;
+    }
     if (!s.thinkOpen) {
         return;
     }
@@ -179,12 +212,23 @@ void ContinuousBatcher::applyThinkBudget(Slot& s, std::int32_t& tok) const {
         return;
     }
     if (++s.reasoningTokens >= _thinkBudget) {
-        // Budget spent without a natural close — force </think> so the model
-        // exits reasoning and produces the answer instead of rambling to
-        // max_tokens (this rewrites the token that is committed AND fed back, so
-        // the next forward continues from </think>).
-        tok         = _thinkEndId;
-        s.thinkOpen = false;
+        // Budget spent without a natural close. Force the transition sequence so
+        // the model exits reasoning and answers (instead of rambling to
+        // max_tokens). Each forced token is committed AND fed back, so the next
+        // forward continues from it. Fall back to a bare </think> if the sequence
+        // is somehow empty (defensive; the ctor always pushes _thinkEndId).
+        if (_thinkForceSeq.empty()) {
+            tok         = _thinkEndId;
+            s.thinkOpen = false;
+            return;
+        }
+        s.forcing  = true;
+        s.forceIdx = 0;
+        tok        = _thinkForceSeq[s.forceIdx++];
+        if (s.forceIdx >= _thinkForceSeq.size()) {
+            s.forcing   = false;
+            s.thinkOpen = false;
+        }
     }
 }
 
