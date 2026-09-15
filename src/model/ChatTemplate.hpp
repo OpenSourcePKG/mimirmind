@@ -217,10 +217,20 @@ public:
      * there instead of being discarded, so the blocking chat handler can put
      * it in `message.reasoning_content` (vLLM / llama.cpp reasoning-model
      * shape). Empty when the model produced no thinking.
+     *
+     * `thinkPreOpened` (QwenChatML only) says the generation prompt pre-OPENED
+     * a `<think>` block (enable_thinking:true), so the response begins INSIDE
+     * the reasoning block. When it is true and the model never emits the
+     * closing `</think>` (it ran to max_tokens still reasoning, or reasoned
+     * markerless), the WHOLE output is reasoning — route it all to `reasoningOut`
+     * with empty content, matching the streaming ResponseCleaner (InThink→EOS)
+     * and vLLM's corrected reasoning-parser behaviour. With no pre-open (default),
+     * an absent `</think>` leaves the text as content (Qwen2/2.5 / non-thinking).
      */
     [[nodiscard]] static std::string
     cleanResponse(Style style, std::string_view text,
-                  std::string* reasoningOut = nullptr);
+                  std::string* reasoningOut = nullptr,
+                  bool         thinkPreOpened = false);
 };
 
 } // namespace mimirmind::model

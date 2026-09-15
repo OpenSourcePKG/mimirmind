@@ -643,6 +643,64 @@ TEST(responseCleaner_qwen_noThinkPassesThrough) {
     EXPECT_EQ(out, std::string{"The capital is Paris."});
 }
 
+// =======================================================================
+// ChatTemplate::cleanResponse — non-streaming reasoning split (5.30).
+// Counterpart to the streaming ResponseCleaner above; must agree on where
+// Qwen3 <think> reasoning ends up, especially when the block is never closed.
+// =======================================================================
+
+TEST(cleanResponse_qwen_closedThinkSplits) {
+    using mimirmind::model::ChatTemplate;
+    std::string reasoning;
+    const std::string out = ChatTemplate::cleanResponse(
+        ChatTemplate::Style::QwenChatML, "let me reason</think>\n\nThe answer.",
+        &reasoning, /*thinkPreOpened=*/true);
+    EXPECT_EQ(out, std::string{"The answer."});
+    EXPECT_EQ(reasoning, std::string{"let me reason"});
+}
+
+TEST(cleanResponse_qwen_unclosedPreOpenedIsAllReasoning) {
+    // 5.30: enable_thinking:true pre-opens <think>; the model reasoned to
+    // max_tokens (or markerless) WITHOUT </think>. The whole span is reasoning,
+    // content must be empty — not leaked into the answer (matches the streaming
+    // ResponseCleaner InThink→EOS + vLLM's missing-end-token behaviour).
+    using mimirmind::model::ChatTemplate;
+    std::string reasoning;
+    const std::string out = ChatTemplate::cleanResponse(
+        ChatTemplate::Style::QwenChatML,
+        "Here's a thinking process: 1. Analyze the question 2. Extract facts",
+        &reasoning, /*thinkPreOpened=*/true);
+    EXPECT_TRUE(out.empty());
+    EXPECT_EQ(reasoning,
+              std::string{"Here's a thinking process: 1. Analyze the question 2. Extract facts"});
+}
+
+TEST(cleanResponse_qwen_unclosedNotPreOpenedIsContent) {
+    // enable_thinking:false / Qwen2.5: no pre-open, no </think> → the span is a
+    // plain answer, kept as content (reasoning empty). Guards against the fix
+    // swallowing normal non-thinking answers into reasoning.
+    using mimirmind::model::ChatTemplate;
+    std::string reasoning;
+    const std::string out = ChatTemplate::cleanResponse(
+        ChatTemplate::Style::QwenChatML, "Komponente B nach 1000 Stunden.",
+        &reasoning, /*thinkPreOpened=*/false);
+    EXPECT_EQ(out, std::string{"Komponente B nach 1000 Stunden."});
+    EXPECT_TRUE(reasoning.empty());
+}
+
+TEST(cleanResponse_qwen_closedSplitsEvenWithoutPreOpen) {
+    // A non-thinking request whose model nonetheless emitted its own
+    // <think>…</think> markers still splits (the A1 case): a present closer wins
+    // regardless of pre-open.
+    using mimirmind::model::ChatTemplate;
+    std::string reasoning;
+    const std::string out = ChatTemplate::cleanResponse(
+        ChatTemplate::Style::QwenChatML, "musing</think>Paris.",
+        &reasoning, /*thinkPreOpened=*/false);
+    EXPECT_EQ(out, std::string{"Paris."});
+    EXPECT_EQ(reasoning, std::string{"musing"});
+}
+
 TEST(responseCleaner_gemma3_passThrough) {
     // Gemma 3 has no thinking-channel wrapper, so the cleaner is a no-op
     // even though the IDs were supplied.
