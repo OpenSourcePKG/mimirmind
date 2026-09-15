@@ -106,6 +106,19 @@ ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
         _warmSlot = (std::atol(wc) > 0) && _engine.backendNeedsSsmScratch() &&
                     _prefillChunk > 0;
     }
+    // 5.30.1 — thinking-token-budget: resolve the <think>/</think> token ids once
+    // and read the (server/ops) budget. Default 0 = disabled, so the decode loop
+    // is bit-identical unless an operator sets a budget. Inert if the model has no
+    // <think> tokens (findToken < 0), so this never affects non-thinking models.
+    _thinkStartId = _engine.tokenizer().findToken("<think>");
+    _thinkEndId   = _engine.tokenizer().findToken("</think>");
+    if (const char* tb = std::getenv("MIMIRMIND_THINKING_TOKEN_BUDGET")) {
+        const long v = std::strtol(tb, nullptr, 10);
+        if (v > 0 && _thinkStartId >= 0 && _thinkEndId >= 0) {
+            _thinkBudget = static_cast<std::size_t>(v);
+        }
+    }
+
     _slots.resize(maxBatch);
     _running = true;
     _worker  = std::thread(&ContinuousBatcher::workerLoop, this);
@@ -113,12 +126,12 @@ ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
                 "ContinuousBatcher: started (maxBatch={} maxContext={} "
                 "maxInflight={} maxInflightPerTenant={} eosId={} prefillChunk={} "
                 "mixedBatchPrefill={} mixedStep={} mixedStepPressureGate={} "
-                "prefillMaxRows={} gdnWarmSlot={})",
+                "prefillMaxRows={} gdnWarmSlot={} thinkBudget={})",
                 maxBatch, maxContext, _maxInflight,
                 _maxInflightPerTenant, eosId, _prefillChunk,
                 _mixedBatchPrefill ? 1 : 0, _mixedStep ? 1 : 0,
                 (_mixedStep && _mixedStepPressureGate) ? 1 : 0, _prefillMaxRows,
-                _warmSlot ? 1 : 0);
+                _warmSlot ? 1 : 0, _thinkBudget);
 }
 
 ContinuousBatcher::~ContinuousBatcher() {
@@ -134,6 +147,45 @@ ContinuousBatcher::~ContinuousBatcher() {
 
 bool ContinuousBatcher::isStop(std::int32_t tok, const Slot& s) const {
     return std::find(s.stopIds.begin(), s.stopIds.end(), tok) != s.stopIds.end();
+}
+
+void ContinuousBatcher::initThinkState(Slot& s) const {
+    s.reasoningTokens = 0;
+    s.thinkOpen       = false;
+    if (_thinkBudget == 0 || _thinkStartId < 0 || _thinkEndId < 0) {
+        return;
+    }
+    // enable_thinking:true pre-opens <think> and does NOT close it in the prompt;
+    // enable_thinking:false pre-closes it (<think> ... </think>). The block is
+    // open iff the last <think> token id sits after the last </think> token id.
+    long lastStart = -1;
+    long lastEnd   = -1;
+    for (std::size_t k = 0; k < s.prompt.size(); ++k) {
+        if (s.prompt[k] == _thinkStartId) {
+            lastStart = static_cast<long>(k);
+        } else if (s.prompt[k] == _thinkEndId) {
+            lastEnd = static_cast<long>(k);
+        }
+    }
+    s.thinkOpen = (lastStart >= 0 && lastStart > lastEnd);
+}
+
+void ContinuousBatcher::applyThinkBudget(Slot& s, std::int32_t& tok) const {
+    if (!s.thinkOpen) {
+        return;
+    }
+    if (tok == _thinkEndId) {
+        s.thinkOpen = false;   // the model closed the reasoning block itself
+        return;
+    }
+    if (++s.reasoningTokens >= _thinkBudget) {
+        // Budget spent without a natural close — force </think> so the model
+        // exits reasoning and produces the answer instead of rambling to
+        // max_tokens (this rewrites the token that is committed AND fed back, so
+        // the next forward continues from </think>).
+        tok         = _thinkEndId;
+        s.thinkOpen = false;
+    }
 }
 
 void ContinuousBatcher::retireSlot(std::size_t slot, bool keepWarm) {
@@ -465,6 +517,9 @@ void ContinuousBatcher::commitPrefilledSlot(
     if (!s.occupied || s.req != req) {
         return;
     }
+    // 5.30.1 — the first generated token is the first reasoning token when
+    // <think> was pre-opened; enforce the budget on it too (may force </think>).
+    applyThinkBudget(s, firstTok);
     s.pos      = s.promptLen;
     // Eager prefill drives the slot through the `pos` state machine, not the
     // in-band `prefillPos` one. Mark the whole prompt as ingested so the true
@@ -744,7 +799,8 @@ bool ContinuousBatcher::runMixedStep() {
                 decodeAdvance = true;
             }
 
-            const std::int32_t t = outTok[i];
+            std::int32_t t = outTok[i];
+            applyThinkBudget(s, t);   // 5.30.1 — may rewrite t to </think>
             {
                 std::lock_guard<std::mutex> rl(s.req->mtx);
                 s.req->tokens.push_back(t);
@@ -873,6 +929,7 @@ void ContinuousBatcher::workerLoop() {
                     s.req          = std::move(it->req);
                     s.prompt       = std::move(it->prompt);
                     s.promptLen    = s.prompt.size();
+                    initThinkState(s);   // 5.30.1 thinking-token-budget
                     s.pos          = 0;
                     s.lastTok      = 0;
                     s.maxNew       = it->maxNew;
@@ -913,6 +970,7 @@ void ContinuousBatcher::workerLoop() {
                 s.req       = std::move(p.req);
                 s.prompt    = std::move(p.prompt);
                 s.promptLen = s.prompt.size();
+                initThinkState(s);   // 5.30.1 thinking-token-budget
                 s.pos       = 0;
                 s.lastTok   = 0;
                 s.maxNew    = p.maxNew;
@@ -1102,7 +1160,8 @@ void ContinuousBatcher::workerLoop() {
 
                 const bool isGen = (s.pos + 1 >= s.promptLen);
                 if (isGen) {
-                    const std::int32_t t = toks[i];
+                    std::int32_t t = toks[i];
+                    applyThinkBudget(s, t);   // 5.30.1 — may rewrite t to </think>
                     {
                         std::lock_guard<std::mutex> rl(s.req->mtx);
                         s.req->tokens.push_back(t);

@@ -238,10 +238,33 @@ private:
         // Admission timestamp — used to report the request's prefill wall time
         // (admission -> first token) in ServingRequest::prefillMs.
         std::chrono::steady_clock::time_point admitAt{};
+
+        // 5.30.1 thinking-token-budget. thinkOpen: the slot is generating inside
+        // a pre-opened <think> block (enable_thinking:true) that has not been
+        // closed yet. reasoningTokens: generated tokens since the block opened.
+        // When reasoningTokens hits _thinkBudget the next token is forced to
+        // </think> so the model stops reasoning and answers. Inert when
+        // _thinkBudget==0 (thinkOpen stays false).
+        bool                            thinkOpen{false};
+        std::size_t                     reasoningTokens{0};
     };
 
     void workerLoop();
     [[nodiscard]] bool isStop(std::int32_t tok, const Slot& s) const;
+
+    /// 5.30.1 — set the slot's thinking-budget state at admission by inspecting
+    /// the prompt: an open <think> block (its last <think> token id after the
+    /// last </think>) means enable_thinking:true pre-opened reasoning. No-op when
+    /// the budget is disabled or the model has no <think>/</think> tokens.
+    void initThinkState(Slot& s) const;
+
+    /// 5.30.1 — thinking-token-budget enforcement, called once per generated
+    /// token. While the slot is inside an open <think> block: a natural </think>
+    /// closes it; otherwise the reasoning token is counted and, once the budget
+    /// is reached, `tok` is REWRITTEN to </think> so the model exits reasoning and
+    /// produces the answer (vLLM thinking_token_budget). No-op when thinkOpen is
+    /// false (budget disabled or block already closed). Worker-thread only.
+    void applyThinkBudget(Slot& s, std::int32_t& tok) const;
 
     /// 5.28.1.2.a — retire a slot whose request has ended. `keepWarm` keeps it
     /// RESIDENT (KV+SSM+residentTokens survive) for continuation reuse; false
@@ -367,6 +390,15 @@ private:
     // regime (steady decode pool + occasional new prefill), which the burst
     // sweep does not exercise.
     bool             _mixedStepPressureGate{false};
+    // 5.30.1 — thinking-token-budget: force </think> after this many generated
+    // reasoning tokens when enable_thinking:true left <think> open, so the model
+    // answers instead of rambling to max_tokens (vLLM thinking_token_budget).
+    // 0 => disabled (default; no decode-loop behaviour change). Server/ops knob:
+    // MIMIRMIND_THINKING_TOKEN_BUDGET=<N>. The <think>/</think> token ids are
+    // resolved once in the ctor (<0 when the model has none -> feature inert).
+    std::size_t      _thinkBudget{0};
+    std::int32_t     _thinkStartId{-1};
+    std::int32_t     _thinkEndId{-1};
 
     std::vector<Slot>                     _slots;
     std::deque<Pending>                   _waiting;
