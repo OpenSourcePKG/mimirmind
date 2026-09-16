@@ -73,6 +73,72 @@ std::string ebnfLiteralSafe(const std::string& s) {
     return o;
 }
 
+// --- Integer min/max -> exact digit-wise EBNF (llama.cpp build_min_max_int style)
+// xgrammar / our XML EBNF do not enforce JSON-Schema numeric ranges for free (a
+// documented gap; vLLM sidesteps it by falling back to the regex-FSM `outlines`
+// backend). Instead we COMPILE an integer [lo,hi] range (lo>=0) into a grammar
+// alternation that matches ONLY numbers in the range — the same approach
+// llama.cpp's `build_min_max_int` takes for GBNF. Split [lo,hi] into subranges
+// that each share a prefix + one varying digit + a run of free digits, then emit
+// a per-subrange pattern. This is the "regex for a numeric range" decomposition.
+std::int64_t rangeFillNines(std::int64_t x, int n) {
+    std::int64_t p = 1;
+    for (int i = 0; i < n; ++i) { p *= 10; }
+    return (x / p) * p + (p - 1);
+}
+std::int64_t rangeFillZeros(std::int64_t x, int n) {
+    std::int64_t p = 1;
+    for (int i = 0; i < n; ++i) { p *= 10; }
+    return (x / p) * p;
+}
+// Pattern for a UNIFORM subrange [s,e] (same digit count, prefix-aligned): fixed
+// digits become quoted literals, the single varying digit a [a-b] class, and the
+// trailing all-0..all-9 positions a [0-9]{n} run.
+std::string rangeUniformPattern(const std::string& s, const std::string& e) {
+    std::string pat;
+    int anyCount = 0;
+    bool first = true;
+    const auto add = [&](const std::string& tok) {
+        if (!first) { pat += " "; }
+        pat += tok;
+        first = false;
+    };
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == e[i]) {
+            add(std::string("\"") + s[i] + "\"");
+        } else if (s[i] != '0' || e[i] != '9') {
+            add(std::string("[") + s[i] + "-" + e[i] + "]");
+        } else {
+            ++anyCount;
+        }
+    }
+    if (anyCount > 0) { add("[0-9]{" + std::to_string(anyCount) + "}"); }
+    return pat.empty() ? std::string("\"\"") : pat;
+}
+// Build the EBNF alternation body matching integers in [lo,hi] (0 <= lo <= hi).
+std::string intRangeEbnf(std::int64_t lo, std::int64_t hi) {
+    std::set<std::int64_t> stops{hi};
+    int nines = 1;
+    for (std::int64_t stop = rangeFillNines(lo, nines);
+         lo <= stop && stop < hi; stop = rangeFillNines(lo, ++nines)) {
+        stops.insert(stop);
+    }
+    int zeros = 1;
+    for (std::int64_t stop = rangeFillZeros(hi + 1, zeros) - 1;
+         hi >= stop && stop > lo; stop = rangeFillZeros(hi + 1, ++zeros) - 1) {
+        stops.insert(stop);
+    }
+    std::string body;
+    std::int64_t start = lo;
+    for (std::int64_t stop : stops) {   // std::set iterates ascending
+        if (!body.empty()) { body += " | "; }
+        body += "(" + rangeUniformPattern(std::to_string(start),
+                                          std::to_string(stop)) + ")";
+        start = stop + 1;
+    }
+    return body;
+}
+
 // Per-(tokenizer) xgrammar preprocessing: the TokenizerInfo + a GrammarCompiler
 // bound to it. Building these scans the whole vocab, so cache and share.
 struct TokContext {
@@ -190,8 +256,11 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
     ebnf += "value ::= [!-;=-~] [^<]*\n";
     // Shared base rules for the primitive JSON types — an integer must be digits
     // only, a number a plain decimal, a boolean true/false, so a forced tool call
-    // can't degenerate e.g. `count` into a 150-digit string or a text ramble.
-    ebnf += "value_int ::= \"-\"? [0-9]+\n";
+    // can't degenerate e.g. `count` into a 150-digit string or a text ramble. The
+    // integer is capped at 20 digits (covers any 64-bit value) so an unbounded
+    // integer param can't run away to a 140-digit number even when its schema
+    // declares no maximum; a DECLARED [min,max] gets an exact range rule below.
+    ebnf += "value_int ::= \"-\"? [0-9]{1,20}\n";
     ebnf += "value_num ::= \"-\"? [0-9]+ (\".\" [0-9]+)?\n";
     ebnf += "value_bool ::= \"true\" | \"false\"\n";
     std::string bodyAlts;
@@ -200,13 +269,16 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
     // to the RAW (unquoted) Qwen-XML parameter value (vLLM emits JSON, so it can
     // hand the whole schema to xgrammar's JSON compiler; our wire value carries
     // no JSON quotes, so we read the schema keywords ourselves and emit EBNF):
-    //   enum            -> the exact literal set (a value that cannot ramble);
-    //   integer/number/boolean -> the typed base rule;
-    //   string+maxLength -> a bounded content run ([^<]{0,N-1});
-    //   everything else -> permissive `value`.
-    // (maxLength/pattern/numeric-range are NOT expressible via xgrammar's own JSON
-    // Schema path — a documented gap — so even vLLM leans on this only when the
-    // schema declares them; enum + type are the reliable wins.)
+    //   enum                 -> the exact literal set (a value that cannot ramble);
+    //   integer + min/max     -> an EXACT digit-wise range rule (llama.cpp style);
+    //   integer/number/boolean-> the typed base rule (integer capped at 20 digits);
+    //   string+maxLength      -> a bounded content run ([^<]{0,N-1});
+    //   everything else       -> permissive `value`.
+    // NB two ways exist to enforce JSON-Schema numeric-range/length: (1) IN-GRAMMAR,
+    // compiling the range into the grammar (what we do here + llama.cpp's GBNF), and
+    // (2) a regex-FSM backend (outlines), which vLLM falls back to because xgrammar's
+    // own JSON-Schema path drops ranges/maxLength. We take (1); see the reference
+    // note for the planned per-model-profile toggle between the two.
     // Emits a dedicated rule (named `id`) into `rules` when the schema needs one
     // and returns the rule name to reference; otherwise returns a shared rule.
     const auto valueRuleFromSchema =
@@ -228,7 +300,37 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
         const std::string type =
             (s.contains("type") && s["type"].is_string())
                 ? s["type"].get<std::string>() : std::string{};
-        if (type == "integer") { return "value_int"; }
+        if (type == "integer") {
+            // Exact [min,max] range enforcement (llama.cpp build_min_max_int style)
+            // when the schema DECLARES a maximum and a non-negative floor — the
+            // engine then grammar-forbids anything out of range. Falls back to the
+            // 20-digit-capped value_int for unbounded / negative-floor integers.
+            const auto asInt = [](const json& j, std::int64_t& out) {
+                if (j.is_number_integer()) { out = j.get<std::int64_t>(); return true; }
+                if (j.is_number_float()) { out = static_cast<std::int64_t>(j.get<double>()); return true; }
+                return false;
+            };
+            std::int64_t lo = 0;
+            std::int64_t hi = 0;
+            bool haveLo = s.contains("minimum") && asInt(s["minimum"], lo);
+            const bool haveHi = s.contains("maximum") && asInt(s["maximum"], hi);
+            if (s.contains("exclusiveMaximum") && asInt(s["exclusiveMaximum"], hi)) {
+                --hi;
+            } else if (!haveHi) {
+                return "value_int";   // no usable upper bound -> capped digits
+            }
+            std::int64_t exMin = 0;
+            if (s.contains("exclusiveMinimum") && asInt(s["exclusiveMinimum"], exMin)) {
+                lo = exMin + 1; haveLo = true;
+            }
+            if (!haveLo) { lo = 0; }
+            // Non-negative, ordered, and not so huge the alternation explodes.
+            if (lo >= 0 && lo <= hi && hi < 1000000000000000000LL) {
+                rules += id + " ::= " + intRangeEbnf(lo, hi) + "\n";
+                return id;
+            }
+            return "value_int";
+        }
         if (type == "number")  { return "value_num"; }
         if (type == "boolean") { return "value_bool"; }
         if (type == "string" && s.contains("maxLength")
