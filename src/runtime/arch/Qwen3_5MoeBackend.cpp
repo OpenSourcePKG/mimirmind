@@ -1485,6 +1485,11 @@ void Qwen3_5MoeBackend::runBlockBatched(std::size_t             blockIdx,
                                        float*                  x,
                                        const BatchedDecodeCtx& ctx,
                                        BlockBuffers&           s) {
+    // 5.27 I-9a: PLE n-gram injection seam (qwen4_exp ple layer), matching the
+    // single-session runBlock:336. Default no-op for every other arch. Row count
+    // follows the batched-block convention (ragged prefill = nRow, decode = nSeq).
+    const std::size_t nRow = (ctx.seqTDev != nullptr) ? ctx.nRow : ctx.nSeq;
+    blockEnter(blockIdx, x, nRow, s);
     if (_config.isRecurrentLayer(blockIdx)) {
         runLinearBlockBatched(blockIdx, x, ctx, s);
     } else {
@@ -1545,8 +1550,10 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
     float* const mmScratch  = s.matmulScratch.as<float>();
 
     // --- pre-attention RMSNorm (nRow rows) ---------------------------
-    _ops.rmsNormAsync(x, nRow, d_model,
-                      static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
+    // 5.27 I-9a seam: base = the same rmsNorm; qwen4_exp = HC GatedResidual.
+    blockInputNorm(blockIdx, x, nRow,
+                   static_cast<const float*>(attnNorm.usmPtr), s, normBuf,
+                   /*isAttn=*/true);
 
     // --- Q(+gate) / K / V projections (M = nRow) ---------------------
     {
@@ -1709,11 +1716,13 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
     _ops.sigmoidGateMulAsync(attnOut, gateBuf, nRow, q_dim, /*gateDim=*/q_dim);
     _gmm.matmulAsync(oW.type, oW.usmPtr, d_model, q_dim,
                      attnOut, nRow, projOut, mmScratch);
-    _ops.addResidualAsync(x, projOut, nRow * d_model);
+    blockResidualAdd(blockIdx, x, projOut, nRow, s, /*isAttn=*/true);  // 5.27 I-9a seam
 
     // --- post-attention norm -> batched MoE -> FFN residual ----------
-    _ops.rmsNormAsync(x, nRow, d_model,
-                      static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
+    // 5.27 I-9a seam (isAttn=false): base = rmsNorm; qwen4_exp = HC GatedResidual.
+    blockInputNorm(blockIdx, x, nRow,
+                   static_cast<const float*>(attnPost.usmPtr), s, normBuf,
+                   /*isAttn=*/false);
     if (_moeGroupedDecode) {
         // GD-a: expert-grouped decode — amortise routed expert-weight reads
         // across the batch. preferBlocked marks decode; ragged prefill (nRow>nSeq)
@@ -1723,7 +1732,7 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
     } else {
         runMoeFfnBatched(blockIdx, normBuf, nRow, ctx.expIdxSlot, ctx.kwSlot, s);
     }
-    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nRow * d_model);
+    blockResidualAdd(blockIdx, x, s.moeAccumBuf.as<float>(), nRow, s, /*isAttn=*/false);  // 5.27 I-9a seam
 }
 
 void Qwen3_5MoeBackend::runLinearBlockBatched(
@@ -1795,8 +1804,10 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     float* const convBase  = s.ssmConvStatePtr + blockIdx * (slabNSeq * convStateElems);
 
     // --- pre-attention RMSNorm (nRow rows) ---------------------------
-    _ops.rmsNormAsync(x, nRow, d_model,
-                      static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
+    // 5.27 I-9a seam: base = the same rmsNorm; qwen4_exp = HC GatedResidual.
+    blockInputNorm(blockIdx, x, nRow,
+                   static_cast<const float*>(attnNorm.usmPtr), s, normBuf,
+                   /*isAttn=*/true);
 
     // --- projections (M = nRow; fused proj is nSeq==1-only => decode) -
     // GDN-Inc 1: at nSeq==1 decode, fuse qkv+gate -> qkvz and beta+alpha -> ba
@@ -2087,11 +2098,13 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     // --- output projection ssm_out -----------------------------------
     _gmm.matmulAsync(ssmOutW.type, ssmOutW.usmPtr, d_model, valueDim,
                      gatedOut, nRow, projOut, mmScratch);
-    _ops.addResidualAsync(x, projOut, nRow * d_model);
+    blockResidualAdd(blockIdx, x, projOut, nRow, s, /*isAttn=*/true);  // 5.27 I-9a seam
 
     // --- post-attn norm -> batched MoE -> FFN residual ---------------
-    _ops.rmsNormAsync(x, nRow, d_model,
-                      static_cast<const float*>(attnPost.usmPtr), eps, normBuf);
+    // 5.27 I-9a seam (isAttn=false): base = rmsNorm; qwen4_exp = HC GatedResidual.
+    blockInputNorm(blockIdx, x, nRow,
+                   static_cast<const float*>(attnPost.usmPtr), s, normBuf,
+                   /*isAttn=*/false);
     if (_moeGroupedDecode) {
         // preferBlocked marks decode; ragged prefill (nRow>nSeq) uses the batched
         // path (M>1) via preferBlocked=false.
@@ -2100,7 +2113,7 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     } else {
         runMoeFfnBatched(blockIdx, normBuf, nRow, ctx.expIdxSlot, ctx.kwSlot, s);
     }
-    _ops.addResidualAsync(x, s.moeAccumBuf.as<float>(), nRow * d_model);
+    blockResidualAdd(blockIdx, x, s.moeAccumBuf.as<float>(), nRow, s, /*isAttn=*/false);  // 5.27 I-9a seam
 }
 
 void Qwen3_5MoeBackend::runLinearBlockVerify(
