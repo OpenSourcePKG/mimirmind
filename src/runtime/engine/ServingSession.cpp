@@ -514,11 +514,6 @@ ServingSession::generateBatch(
         cmp::embeddingLookup(tokEmb->type, tokEmb->usmPtr, d_model, vocab_emb,
                              std::span<const std::int32_t>{inputTok.data(), nSeq},
                              xBuf);
-        // 5.27 I-9a: hand this step's tokens to the backend for the PLE n-gram
-        // seam (qwen4_exp). No-op for other archs. Single-sequence semantics
-        // (T=nSeq) — correct at conc=1; per-slot n-gram context is 5.27.11.2.
-        qb->prepareForward(std::span<const std::int32_t>{inputTok.data(), nSeq},
-                           xBuf, nSeq);
         for (std::size_t s = 0; s < nSeq; ++s) {
             writeBlockId[s] = static_cast<std::uint32_t>(s * blocksPerSeq + p / blockSize);
             writeSlot[s]    = static_cast<std::int32_t>(p % blockSize);
@@ -526,6 +521,12 @@ ServingSession::generateBatch(
             startPosH[s]    = static_cast<std::int32_t>(p);
             isSeqStart[s]   = (p == 0) ? 1U : 0U;
         }
+        // 5.27.11.2: per-slot PLE n-gram token feed (qwen4_exp). Each row is one
+        // token of an independent slot; isSeqStart resets that slot's rolling
+        // context. No-op for other archs.
+        qb->prepareForwardBatched(
+            std::span<const std::int32_t>{inputTok.data(), nSeq},
+            std::span<const std::uint8_t>{isSeqStart.data(), nSeq}, nSeq);
         _e._ops->uploadHostBytes(seqLensDev.get(),  seqLensH.data(),  nSeq * sizeof(std::int32_t));
         _e._ops->uploadHostBytes(startPosDev.get(), startPosH.data(), nSeq * sizeof(std::int32_t));
         arch::BatchedDecodeCtx ctx{};

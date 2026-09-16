@@ -239,6 +239,14 @@ public:
     /// cannot contaminate the next. Default no-op.
     virtual void resetForwardContext() {}
 
+    /// 5.27.11.2: batched (per-slot) forward context for the PLE n-gram seam.
+    /// tokIds[nSeq] is one token per active slot this step; isSeqStart[nSeq]
+    /// marks slots beginning a new sequence (reset their own rolling context).
+    /// Selects the per-slot PLE path for the batched forward. Default no-op.
+    virtual void prepareForwardBatched(std::span<const std::int32_t> /*tokIds*/,
+                                       std::span<const std::uint8_t> /*isSeqStart*/,
+                                       std::size_t                   /*nSeq*/) {}
+
 protected:
     ArchBackend() = default;
 };

@@ -945,9 +945,10 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 
             // D2e.1 — generateBatch with DISTINCT prompts. Each batched
             // stream must equal its own single-session greedy generate().
-            // 5.27.11.1: distinct-prompt conc>1 needs per-slot PLE (5.27.11.2) —
-            // run it only for qwen35moe; qwen4_exp validates via NSEQ=1 above.
-            if (arch == "qwen35moe") {
+            // 5.27.11.2: conc>1 per-slot PLE — qwen4_exp runs this too with each
+            // prompt truncated to 1 token (distinct first tokens -> distinct
+            // per-slot n-gram context; single-session also T=1 = apples-to-apples).
+            if (arch == "qwen35moe" || arch == "qwen4_exp") {
             const char* multiPrompts[] = {
                 "The capital of France is",
                 "Once upon a time",
@@ -962,6 +963,9 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             for (const char* mp : multiPrompts) {
                 auto ids = tok.encode(mp, /*addBos=*/false);
                 if (ids.empty()) ids.push_back(1);
+                // 5.27.11.2: qwen4_exp — 1-token prompts isolate per-slot PLE
+                // (distinct first tokens) from prefill-vs-decode numerics.
+                if (arch == "qwen4_exp") ids.resize(1);
                 bprompts.push_back(std::move(ids));
             }
             auto bout = e->generateBatch(bprompts, maxNew, /*eosId=*/-1);

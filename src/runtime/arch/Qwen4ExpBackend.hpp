@@ -74,6 +74,12 @@ public:
     /// start), so a batched run is not contaminated by a prior generation.
     void resetForwardContext() override;
 
+    /// I-9b: per-slot batched PLE context — one token per active slot, with a
+    /// per-slot rolling n-gram context reset on the slot's sequence start.
+    void prepareForwardBatched(std::span<const std::int32_t> tokIds,
+                               std::span<const std::uint8_t> isSeqStart,
+                               std::size_t nSeq) override;
+
 protected:
     /// I-4: at the ple layer, inject the PLE n-gram features into the stream state.
     void blockEnter(std::size_t blockIdx, float* x, std::size_t T,
@@ -106,6 +112,10 @@ private:
     void pleForward(std::size_t T, BlockBuffers& s);
     void growPleScratch(std::size_t T);
     void computeNgramIds(std::size_t T, std::vector<std::int64_t>& outIds) const;
+    // I-9b: per-slot batched variant — one 1-token n-gram per active slot, each
+    // hashed against its own rolling context (_pleCtxSlot).
+    void computeNgramIdsBatched(std::size_t nSeq,
+                                std::vector<std::int64_t>& outIds) const;
 
     nvfp4::PleNgramTable       _pleTable;
     int                        _pleGgufLayer{-1};
@@ -123,6 +133,10 @@ private:
     std::vector<std::int32_t>  _pleTokens;
     std::array<std::int32_t, 2> _pleCtx{};
     bool                       _pleCtxInit{false};
+    // I-9b: per-slot rolling 2-token n-gram context (batched serving), indexed by
+    // active-slot id. _pleBatchedNSeq>0 selects the per-slot PLE path this forward.
+    std::vector<std::array<std::int32_t, 2>> _pleCtxSlot;
+    std::size_t                _pleBatchedNSeq{0};
     // Host + device scratch.
     std::vector<float>         _pleEmbHost;
     std::vector<std::int64_t>  _pleIdsHost;
