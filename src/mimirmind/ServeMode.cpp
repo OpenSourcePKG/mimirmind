@@ -2701,12 +2701,13 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     }
 
     std::unique_ptr<::mimirmind::runtime::serving::ContinuousBatcher> batcher;
-    // 5.27.11.1 interim: qwen4_exp is EXCLUDED from the continuous batcher until
-    // 5.27.11.2 wires per-slot PLE into the paged batched forward — it serves via
-    // single-session generate() (correct via 5.27.10) meanwhile. The batched
-    // block-loop seams are already HC/PLE-correct (generateBatch conc=1 parity);
-    // only the paged output-collapse sites + per-slot PLE remain.
+    // 5.27.11.2: qwen4_exp re-enabled for the continuous batcher — the paged
+    // stepServing (decode) and prefillSlot (single-slot prefill) forward now carry
+    // per-slot PLE n-gram + the HC stream collapse, and the batcher forces
+    // single-slot prefill for qwen4_exp (no ragged varlen). conc>1 batched forward
+    // is slot-correct + coherent (5.27.11.2).
     if ((engine.config().architecture == "qwen35moe" ||
+         engine.config().architecture == "qwen4_exp" ||
          engine.supportsBatchedDecode()) &&
         engine.servingClassEnabled()) {
         std::size_t maxBatch =

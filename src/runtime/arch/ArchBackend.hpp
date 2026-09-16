@@ -247,6 +247,15 @@ public:
                                        std::span<const std::uint8_t> /*isSeqStart*/,
                                        std::size_t                   /*nSeq*/) {}
 
+    /// 5.27.11.2: single-slot prefill forward context (qwen4_exp PLE n-gram). A
+    /// prefill chunk of `tokens` for one serving slot; `seqStart` (startPos==0)
+    /// resets that slot's rolling context. Uses the slot's own context around the
+    /// single-session n-gram path (prefill goes through single-session runBlock).
+    /// Default no-op.
+    virtual void prepareForwardSlot(std::size_t                   /*slot*/,
+                                    std::span<const std::int32_t> /*tokens*/,
+                                    bool                          /*seqStart*/) {}
+
 protected:
     ArchBackend() = default;
 };

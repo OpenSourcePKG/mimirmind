@@ -265,6 +265,7 @@ void Qwen4ExpBackend::setPleTable(nvfp4::PleNgramTable&& table, int pleGgufLayer
 void Qwen4ExpBackend::prepareForward(std::span<const std::int32_t> tokIds,
                                      const float* /*hiddenStates*/, std::size_t T) {
     _pleBatchedNSeq = 0;   // single-sequence PLE path
+    _pleSlotStore   = -1;  // no per-slot store-back
     _pleTokens.assign(tokIds.begin(), tokIds.end());
     // Prefill (T>1) starts a new sequence → reset the rolling n-gram context to
     // EOS (matches the reference's initial eos-pad). Decode (T=1) carries it.
@@ -292,6 +293,7 @@ void Qwen4ExpBackend::prepareForwardBatched(std::span<const std::int32_t> tokIds
                                             std::span<const std::uint8_t> isSeqStart,
                                             std::size_t nSeq) {
     _pleBatchedNSeq = nSeq;
+    _pleSlotStore   = -1;
     _pleTokens.assign(tokIds.begin(),
                       tokIds.begin() + static_cast<std::ptrdiff_t>(nSeq));
     if (_pleCtxSlot.size() < nSeq) {
@@ -304,6 +306,26 @@ void Qwen4ExpBackend::prepareForwardBatched(std::span<const std::int32_t> tokIds
                               static_cast<std::int32_t>(_pleEos)};
         }
     }
+}
+
+// I-9b: single-slot prefill. Prefill goes through the single-session runBlock, so
+// pleForward uses the single-session n-gram path over _pleCtx; load the slot's
+// own rolling context here and mark it for store-back after the roll.
+void Qwen4ExpBackend::prepareForwardSlot(std::size_t slot,
+                                         std::span<const std::int32_t> tokens,
+                                         bool seqStart) {
+    _pleBatchedNSeq = 0;
+    _pleTokens.assign(tokens.begin(), tokens.end());
+    if (_pleCtxSlot.size() <= slot) {
+        _pleCtxSlot.resize(slot + 1, {static_cast<std::int32_t>(_pleEos),
+                                      static_cast<std::int32_t>(_pleEos)});
+    }
+    if (seqStart) {
+        _pleCtxSlot[slot] = {static_cast<std::int32_t>(_pleEos),
+                             static_cast<std::int32_t>(_pleEos)};
+    }
+    _pleCtx       = _pleCtxSlot[slot];
+    _pleSlotStore = static_cast<std::ptrdiff_t>(slot);
 }
 
 void Qwen4ExpBackend::blockEnter(std::size_t blockIdx, float* /*x*/, std::size_t T,
@@ -500,6 +522,12 @@ void Qwen4ExpBackend::pleForward(std::size_t T, BlockBuffers& s) {
     } else if (T == 1) {
         _pleCtx[0] = _pleCtx[1];
         _pleCtx[1] = _pleTokens[0];
+    }
+    // I-9b: single-slot prefill — persist the rolled context back to the slot so
+    // the next chunk of the same request continues its n-gram history.
+    if (_pleBatchedNSeq == 0 && _pleSlotStore >= 0 &&
+        static_cast<std::size_t>(_pleSlotStore) < _pleCtxSlot.size()) {
+        _pleCtxSlot[static_cast<std::size_t>(_pleSlotStore)] = _pleCtx;
     }
 }
 

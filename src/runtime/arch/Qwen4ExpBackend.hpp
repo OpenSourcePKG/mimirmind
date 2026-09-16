@@ -80,6 +80,12 @@ public:
                                std::span<const std::uint8_t> isSeqStart,
                                std::size_t nSeq) override;
 
+    /// I-9b: single-slot prefill — load the slot's rolling context around the
+    /// single-session n-gram path, roll + store it back (prefill uses runBlock).
+    void prepareForwardSlot(std::size_t slot,
+                            std::span<const std::int32_t> tokens,
+                            bool seqStart) override;
+
 protected:
     /// I-4: at the ple layer, inject the PLE n-gram features into the stream state.
     void blockEnter(std::size_t blockIdx, float* x, std::size_t T,
@@ -137,6 +143,9 @@ private:
     // active-slot id. _pleBatchedNSeq>0 selects the per-slot PLE path this forward.
     std::vector<std::array<std::int32_t, 2>> _pleCtxSlot;
     std::size_t                _pleBatchedNSeq{0};
+    // I-9b: single-slot prefill store-back target (>=0 -> after the single-session
+    // n-gram roll, write _pleCtx back into _pleCtxSlot[_pleSlotStore]); -1 = none.
+    std::ptrdiff_t             _pleSlotStore{-1};
     // Host + device scratch.
     std::vector<float>         _pleEmbHost;
     std::vector<std::int64_t>  _pleIdsHost;
