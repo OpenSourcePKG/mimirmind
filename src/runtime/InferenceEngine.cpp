@@ -915,6 +915,17 @@ void InferenceEngine::finalizeLoad() {
                 MM_LOG_INFO("probe", "  profile applied: GDN proj fuse (batch) -> {}",
                             *picks->applyGdnProjFuseBatch ? "on" : "off");
             }
+            // Answer-floor temperature-lift cap (model overlay). Applied to the
+            // per-model LlmConfig — NOT a process env — so co-resident models each
+            // keep their own value; explicit MIMIRMIND_ANSWER_FLOOR_TEMP_CAP still
+            // wins (read per-request in the ChatCompletionHandler answer floor).
+            if (picks->applyAnswerFloorTempCap &&
+                std::getenv("MIMIRMIND_ANSWER_FLOOR_TEMP_CAP") == nullptr) {
+                _config.answerFloorTempCap = *picks->applyAnswerFloorTempCap;
+                MM_LOG_INFO("probe",
+                            "  profile applied: answer-floor temp cap -> {}",
+                            _config.answerFloorTempCap);
+            }
         }
     }
 

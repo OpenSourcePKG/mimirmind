@@ -87,6 +87,15 @@ struct LlmConfig {
     // the escape values are model-declared, not hardcoded per-arch in the server
     // (vLLM reads the same field). 0 = no recommendation => floor is a no-op.
     float         samplingTempDefault {0.0F};
+    // 5.x: CAP on the non-thinking answer-floor temperature lift. 0 = the lift is
+    // OFF (a greedy answer stays greedy — temp 0 — and the repetition/frequency
+    // penalties below carry loop-protection). This is per-(machine,model) config,
+    // NOT a server constant: on a small-active model (qwen3.6 3B-A) lifting a
+    // greedy tool-answer to temp>0 garbles the formatting, so its profile keeps
+    // this 0; a checkpoint that still loops under penalties can re-enable a hot
+    // cap (e.g. 0.7) via its HW-fingerprint model overlay. Ops override:
+    // MIMIRMIND_ANSWER_FLOOR_TEMP_CAP.
+    float         answerFloorTempCap {0.0F};
 
     // 5.x: server-side repetition-control defaults + anti-loop safety floor, moved
     // out of hardcoded constants in ChatCompletionHandler into per-model config so

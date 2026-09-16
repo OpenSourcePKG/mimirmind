@@ -659,23 +659,38 @@ bool ChatCompletionHandler::prepareChatRequest(
             // output. A model-agnostic ceiling keeps the floor just hot enough to
             // break degeneration while staying coherent. Not a per-arch preset —
             // a generic bound (ops-tunable via env).
-            constexpr float kAnswerFloorTempCapDefault = 0.7F;
-            float tempCap = kAnswerFloorTempCapDefault;
+            // The temperature-lift CAP is per-(machine,model) config
+            // (LlmConfig.answerFloorTempCap), NOT a server constant. Its default is
+            // 0 = lift OFF: on a small-active model (qwen3.6 3B-A) lifting a greedy
+            // tool-answer to temp>0 garbles the summarisation — broken markdown /
+            // hallucinated `<result_list>`/`<ref_list>`/HTML tags, early stops,
+            // non-determinism — while the repetition + frequency penalties applied
+            // below ALREADY break the greedy loops this lift was meant to escape
+            // (A/B on the Pegenaut tool-answer path: temp 0.7 and even 0.3 stay
+            // messy + non-deterministic, temp 0 + penalties is clean, deterministic,
+            // loop-free). A checkpoint that still loops under penalties re-enables a
+            // hot cap via its HW-fingerprint model overlay. Ops override:
+            // MIMIRMIND_ANSWER_FLOOR_TEMP_CAP. cap <= 0 => sampling untouched
+            // (greedy stays greedy).
+            float tempCap = mc.answerFloorTempCap;
             if (const char* c = std::getenv("MIMIRMIND_ANSWER_FLOOR_TEMP_CAP")) {
                 const float v = std::strtof(c, nullptr);
-                if (v > 0.0F) tempCap = v;
+                if (v >= 0.0F) tempCap = v;
             }
-            params.sampling.temperature = std::min(mc.samplingTempDefault, tempCap);
-            if (params.sampling.topP >= 1.0F && mc.samplingTopPDefault < 1.0F)
-                params.sampling.topP = mc.samplingTopPDefault;
-            if (params.sampling.topK <= 1 && mc.samplingTopKDefault > 0)
-                params.sampling.topK = mc.samplingTopKDefault;
-            MM_LOG_INFO("server",
-                        "answer sampling floor: non-thinking greedy -> model "
-                        "generation_config sampling temp={} top_p={} top_k={} "
-                        "(MIMIRMIND_ANSWER_SAMPLING_FLOOR=0 to disable)",
-                        params.sampling.temperature, params.sampling.topP,
-                        params.sampling.topK);
+            if (tempCap > 0.0F) {
+                params.sampling.temperature =
+                    std::min(mc.samplingTempDefault, tempCap);
+                if (params.sampling.topP >= 1.0F && mc.samplingTopPDefault < 1.0F)
+                    params.sampling.topP = mc.samplingTopPDefault;
+                if (params.sampling.topK <= 1 && mc.samplingTopKDefault > 0)
+                    params.sampling.topK = mc.samplingTopKDefault;
+                MM_LOG_INFO("server",
+                            "answer sampling floor: non-thinking greedy -> model "
+                            "generation_config sampling temp={} top_p={} top_k={} "
+                            "(MIMIRMIND_ANSWER_SAMPLING_FLOOR=0 to disable)",
+                            params.sampling.temperature, params.sampling.topP,
+                            params.sampling.topK);
+            }
         }
     }
 
