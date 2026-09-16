@@ -104,7 +104,15 @@ struct LlmConfig {
     // default); repetitionPenaltyDefault is also populated from
     // generation_config.json (HF `repetition_penalty`) when present. penaltyWindow
     // is a token-count over recent history.
-    float         frequencyPenaltyDefault  {0.5F};
+    // 5.31: DEFAULT 0 (was 0.5). A per-token frequency penalty punishes RECURRING
+    // tokens — but a list/table answer legitimately repeats structure ("- ", "(",
+    // "Roman", years), so a 0.5 penalty made the model DRIFT off the clean list
+    // format, truncate early, and even fall into its OWN loop (A/B on the Pegenaut
+    // tool-answer path: freq 0.5 -> looping+short; freq ~0 -> full clean list).
+    // qwen3.6's generation_config ships NO frequency_penalty, and vLLM defaults it
+    // to 0 — so mimirmind was imposing an aggression the model never asked for. The
+    // repetition penalty below (1.10, exact-token) stays as the loop guard.
+    float         frequencyPenaltyDefault  {0.0F};
     float         repetitionPenaltyDefault {1.10F};
     // 5.x: WIDE default window (was 64). vLLM applies frequency_penalty over the
     // WHOLE output; a narrow window let a NEAR-repetition loop — recurring words
@@ -116,7 +124,11 @@ struct LlmConfig {
     // Applied only when the client disabled ALL penalties (leaving greedy with no
     // escape) — a wide window catches long-block / near-repetition loops.
     float         antiLoopRepetition {1.10F};
-    float         antiLoopFrequency  {0.50F};
+    // 5.31: DEFAULT 0 (was 0.50) — same reason as frequencyPenaltyDefault: the
+    // frequency penalty degrades structured/list answers. If a client disables all
+    // penalties, the safety floor now re-applies only the exact-token repetition
+    // penalty (1.10), not a frequency penalty.
+    float         antiLoopFrequency  {0.0F};
     std::uint32_t antiLoopWindow     {512U};
     // Explicit attention softmax scale (GGUF `<arch>.attention.scale`).
     // 0 = unset → attention uses the default 1/sqrt(head_dim). Qwen3-Next
