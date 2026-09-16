@@ -43,43 +43,6 @@ const core::gguf::GgufTensor& requireTopT(const core::gguf::WeightsMap& w,
     return *t;
 }
 
-// I-6 diagnostic (MIMIRMIND_Q4E_DIAG): readback + log L2/max/nan of a device
-// buffer to localise where the qwen4_exp forward diverges. Temporary.
-void dumpNorm(compute::ComputeOps& ops, compute::ComputeMatmul& gmm,
-              const char* tag, const float* dev, std::size_t n,
-              std::size_t nRows = 1) {
-    static const bool diag = std::getenv("MIMIRMIND_Q4E_DIAG") != nullptr;
-    if (!diag || dev == nullptr || n == 0) return;
-    gmm.sync();
-    std::vector<float> h(n);
-    ops.readbackToHost(h.data(), dev, n * sizeof(float));
-    double ss = 0.0; float mx = 0.0F; std::size_t bad = 0;
-    for (float v : h) {
-        ss += static_cast<double>(v) * v;
-        if (std::fabs(v) > mx) mx = std::fabs(v);
-        if (std::isnan(v) || std::isinf(v)) ++bad;
-    }
-    // 5.27.11.2 localization: when the buffer holds nRows independent rows and
-    // those rows SHOULD be identical (e.g. batched decode of identical prompts),
-    // maxRowDiff pinpoints the first op that makes identical rows diverge.
-    if (nRows > 1 && n % nRows == 0) {
-        const std::size_t rl = n / nRows;
-        float maxRowDiff = 0.0F;
-        for (std::size_t r = 1; r < nRows; ++r) {
-            for (std::size_t j = 0; j < rl; ++j) {
-                const float d = std::fabs(h[r * rl + j] - h[j]);
-                if (d > maxRowDiff) maxRowDiff = d;
-            }
-        }
-        MM_LOG_INFO("q4ediag",
-                    "{} l2={:.4g} max={:.4g} nan/inf={} rows={} maxRowDiff={:.4g}",
-                    tag, std::sqrt(ss), mx, bad, nRows, maxRowDiff);
-        return;
-    }
-    MM_LOG_INFO("q4ediag", "{} l2={:.4g} max={:.4g} nan/inf={}", tag,
-                std::sqrt(ss), mx, bad);
-}
-
 // --- I-4 PLE n-gram hashing (host; verified in tools/microbench/q4e_ngram_*) --
 bool isPrime(std::int64_t v) {
     if (v < 2) return false;
@@ -213,27 +176,16 @@ void Qwen4ExpBackend::blockInputNorm(std::size_t blockIdx, const float* x,
     const std::string prefix =
         isAttn ? "attn_hyper_connection." : "mlp_hyper_connection.";
     hcGatedResidual(blockIdx, T, normWeight, prefix, /*combine=*/true, s, normBuf);
-
-    if (blockIdx == 0) {
-        dumpNorm(_ops, _gmm, "blk0 stream-in", _hcStreams.as<float>(), T * hc * d,
-                 /*nRows=*/T);
-        dumpNorm(_ops, _gmm, isAttn ? "blk0 attn-mixed" : "blk0 mlp-mixed",
-                 normBuf, T * d);
-    }
 }
 
-void Qwen4ExpBackend::blockResidualAdd(std::size_t blockIdx, float* /*x*/,
+void Qwen4ExpBackend::blockResidualAdd(std::size_t /*blockIdx*/, float* /*x*/,
                                        const float* moduleOut, std::size_t T,
-                                       BlockBuffers& /*s*/, bool isAttn) {
+                                       BlockBuffers& /*s*/, bool /*isAttn*/) {
     const std::size_t d  = _config.embeddingLength;
     const std::size_t hc = _config.hcCount;
     // Scatter the module output into every stream: H_g += inj_g * out.
     _ops.hcInjectScatterAsync(_hcStreams.as<float>(), moduleOut,
                               _hcInj.as<float>(), T, hc, d);
-    if (!isAttn) {  // end of the block — trajectory of the stream-state norm.
-        dumpNorm(_ops, _gmm, ("blk" + std::to_string(blockIdx) + " out").c_str(),
-                 _hcStreams.as<float>(), T * hc * d, /*nRows=*/T);
-    }
 }
 
 void Qwen4ExpBackend::setPleTable(nvfp4::PleNgramTable&& table, int pleGgufLayer,
@@ -501,14 +453,9 @@ void Qwen4ExpBackend::pleForward(std::size_t T, BlockBuffers& s) {
                               _pleConvOut.as<float>(), T, hcd, K, dilation, stateLen);
     }
 
-    dumpNorm(_ops, _gmm, "ple emb", emb, T * embDim);
-    dumpNorm(_ops, _gmm, "ple gated", _pleGated.as<float>(), T * hcd);
-    dumpNorm(_ops, _gmm, "ple conv", _pleConvOut.as<float>(), T * hcd);
-
     // 4. streams += gated + conv.
     _ops.addResidualAsync(streams, _pleGated.as<float>(), T * hcd);
     _ops.addResidualAsync(streams, _pleConvOut.as<float>(), T * hcd);
-    dumpNorm(_ops, _gmm, "ple streams-after", streams, T * hcd, /*nRows=*/T);
 
     // 5. roll the n-gram context forward (per-slot in batched mode).
     if (_pleBatchedNSeq > 0) {
@@ -539,7 +486,6 @@ void Qwen4ExpBackend::collapseHyperStreams(std::size_t T, BlockBuffers& s,
     hcGatedResidual(kMixerBlock, T,
                     static_cast<const float*>(mixerNorm.usmPtr),
                     "hyper_connection_mixer.", /*combine=*/false, s, out);
-    dumpNorm(_ops, _gmm, "mixer out (pre-lmhead)", out, T * _config.embeddingLength);
 }
 
 } // namespace mimirmind::runtime::arch

@@ -70,23 +70,6 @@ executeMaterialization(const std::vector<mo::MaterializationStep>& steps,
 
         for (const mo::MaterializationSource& s : step.sources) {
             void* dst = dstBase + s.dstElemOffset * elemBytes;
-            // 5.27 I-2 DIAG (MIMIRMIND_Q4E_DIAG + CUDA_LAUNCH_BLOCKING): the
-            // last line printed before a materialization-kernel OOB names the
-            // culprit source. Temporary; remove after the qwen4_exp fix.
-            static const bool kQ4eDiag = std::getenv("MIMIRMIND_Q4E_DIAG") != nullptr;
-            if (kQ4eDiag) {
-                std::fprintf(stderr,
-                    "[q4ediag-mat] gguf=%s src=%s kind=%d rows=%llu in=%llu "
-                    "dstElemOff=%llu totalElems=%llu outF32=%d\n",
-                    step.ggufName.c_str(), s.hfWeightName.c_str(),
-                    static_cast<int>(s.kind),
-                    static_cast<unsigned long long>(s.rows),
-                    static_cast<unsigned long long>(s.in),
-                    static_cast<unsigned long long>(s.dstElemOffset),
-                    static_cast<unsigned long long>(step.totalElems),
-                    step.outF32 ? 1 : 0);
-                std::fflush(stderr);
-            }
             const NvFp4DeviceTensor& w = require(src, s.hfWeightName);
             const std::string base = moduleBase(s.hfWeightName);
 
