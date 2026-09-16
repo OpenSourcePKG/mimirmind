@@ -46,7 +46,8 @@ const core::gguf::GgufTensor& requireTopT(const core::gguf::WeightsMap& w,
 // I-6 diagnostic (MIMIRMIND_Q4E_DIAG): readback + log L2/max/nan of a device
 // buffer to localise where the qwen4_exp forward diverges. Temporary.
 void dumpNorm(compute::ComputeOps& ops, compute::ComputeMatmul& gmm,
-              const char* tag, const float* dev, std::size_t n) {
+              const char* tag, const float* dev, std::size_t n,
+              std::size_t nRows = 1) {
     static const bool diag = std::getenv("MIMIRMIND_Q4E_DIAG") != nullptr;
     if (!diag || dev == nullptr || n == 0) return;
     gmm.sync();
@@ -57,6 +58,23 @@ void dumpNorm(compute::ComputeOps& ops, compute::ComputeMatmul& gmm,
         ss += static_cast<double>(v) * v;
         if (std::fabs(v) > mx) mx = std::fabs(v);
         if (std::isnan(v) || std::isinf(v)) ++bad;
+    }
+    // 5.27.11.2 localization: when the buffer holds nRows independent rows and
+    // those rows SHOULD be identical (e.g. batched decode of identical prompts),
+    // maxRowDiff pinpoints the first op that makes identical rows diverge.
+    if (nRows > 1 && n % nRows == 0) {
+        const std::size_t rl = n / nRows;
+        float maxRowDiff = 0.0F;
+        for (std::size_t r = 1; r < nRows; ++r) {
+            for (std::size_t j = 0; j < rl; ++j) {
+                const float d = std::fabs(h[r * rl + j] - h[j]);
+                if (d > maxRowDiff) maxRowDiff = d;
+            }
+        }
+        MM_LOG_INFO("q4ediag",
+                    "{} l2={:.4g} max={:.4g} nan/inf={} rows={} maxRowDiff={:.4g}",
+                    tag, std::sqrt(ss), mx, bad, nRows, maxRowDiff);
+        return;
     }
     MM_LOG_INFO("q4ediag", "{} l2={:.4g} max={:.4g} nan/inf={}", tag,
                 std::sqrt(ss), mx, bad);
@@ -197,7 +215,8 @@ void Qwen4ExpBackend::blockInputNorm(std::size_t blockIdx, const float* x,
     hcGatedResidual(blockIdx, T, normWeight, prefix, /*combine=*/true, s, normBuf);
 
     if (blockIdx == 0) {
-        dumpNorm(_ops, _gmm, "blk0 stream-in", _hcStreams.as<float>(), T * hc * d);
+        dumpNorm(_ops, _gmm, "blk0 stream-in", _hcStreams.as<float>(), T * hc * d,
+                 /*nRows=*/T);
         dumpNorm(_ops, _gmm, isAttn ? "blk0 attn-mixed" : "blk0 mlp-mixed",
                  normBuf, T * d);
     }
@@ -213,7 +232,7 @@ void Qwen4ExpBackend::blockResidualAdd(std::size_t blockIdx, float* /*x*/,
                               _hcInj.as<float>(), T, hc, d);
     if (!isAttn) {  // end of the block — trajectory of the stream-state norm.
         dumpNorm(_ops, _gmm, ("blk" + std::to_string(blockIdx) + " out").c_str(),
-                 _hcStreams.as<float>(), T * hc * d);
+                 _hcStreams.as<float>(), T * hc * d, /*nRows=*/T);
     }
 }
 
@@ -438,9 +457,27 @@ void Qwen4ExpBackend::pleForward(std::size_t T, BlockBuffers& s) {
     _ops.hcGroupedRmsNormAsync(_pleGated.as<float>(),
                                static_cast<const float*>(ncW.usmPtr),
                                _pleGvn.as<float>(), T, hc, d, eps);
-    _ops.pleConvSiluAsync(_pleGvn.as<float>(), /*state=*/nullptr,
-                          static_cast<const float*>(cW.usmPtr),
-                          _pleConvOut.as<float>(), T, hcd, K, dilation, stateLen);
+    // 5.27.11.2: the dilated (dilation=ngramSize) causal conv1d convolves along
+    // the T dimension. In SINGLE-SESSION T is one sequence's tokens (correct
+    // temporal conv). In BATCHED DECODE the T=nSeq rows are INDEPENDENT slots
+    // (one token each), so a temporal conv would reach across slots — with
+    // dilation=3 a row at position p pulls the slot at p-3, mixing slots at
+    // nSeq>=4 (localized via per-row diag: rows identical through blk0, diverge
+    // at the PLE conv). Run the conv PER ROW as an independent T=1 sequence
+    // (zero state), matching the single-session decode step. Prefill still goes
+    // through the single-session runBlock path (T=prompt), unaffected.
+    if (_pleBatchedNSeq > 0) {
+        for (std::size_t r = 0; r < _pleBatchedNSeq; ++r) {
+            _ops.pleConvSiluAsync(_pleGvn.as<float>() + r * hcd, /*state=*/nullptr,
+                                  static_cast<const float*>(cW.usmPtr),
+                                  _pleConvOut.as<float>() + r * hcd,
+                                  /*T=*/1, hcd, K, dilation, stateLen);
+        }
+    } else {
+        _ops.pleConvSiluAsync(_pleGvn.as<float>(), /*state=*/nullptr,
+                              static_cast<const float*>(cW.usmPtr),
+                              _pleConvOut.as<float>(), T, hcd, K, dilation, stateLen);
+    }
 
     dumpNorm(_ops, _gmm, "ple emb", emb, T * embDim);
     dumpNorm(_ops, _gmm, "ple gated", _pleGated.as<float>(), T * hcd);
@@ -449,7 +486,7 @@ void Qwen4ExpBackend::pleForward(std::size_t T, BlockBuffers& s) {
     // 4. streams += gated + conv.
     _ops.addResidualAsync(streams, _pleGated.as<float>(), T * hcd);
     _ops.addResidualAsync(streams, _pleConvOut.as<float>(), T * hcd);
-    dumpNorm(_ops, _gmm, "ple streams-after", streams, T * hcd);
+    dumpNorm(_ops, _gmm, "ple streams-after", streams, T * hcd, /*nRows=*/T);
 
     // 5. roll the n-gram context forward (per-slot in batched mode).
     if (_pleBatchedNSeq > 0) {
