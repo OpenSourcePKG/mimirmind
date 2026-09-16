@@ -148,15 +148,40 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
     // alternative is one offered tool with that tool's keys -> NAME and KEY are
     // both grammar-forced; VALUE is any text.
     std::string ebnf;
-    // Value = a NON-EMPTY run of chars up to the closer's '<'. Crucially the
-    // parameter terminator starts with '<' (`</parameter>`), NOT with '\n', so
-    // [^<]+ ends DETERMINISTICALLY at the first '<' — an ambiguous
-    // "\n</parameter>" terminator lets the value also eat the '\n', which
-    // explodes the Earley parser state (and hangs CompileGrammar). Values that
-    // legitimately contain '<' just end the parameter early, which the
-    // downstream parser tolerates. `+` (not `*`) forbids an empty value, so a
-    // required key never collapses to `{"file_path":""}`.
-    ebnf += "value ::= [^<]+\n";
+    // Value = a run of chars up to the closer's '<', that must LEAD with a
+    // non-whitespace character. Crucially the parameter terminator starts with
+    // '<' (`</parameter>`), NOT with '\n', so the value ends DETERMINISTICALLY
+    // at the first '<' — an ambiguous "\n</parameter>" terminator lets the value
+    // also eat the '\n', which explodes the Earley parser state (and hangs
+    // CompileGrammar). Values that legitimately contain '<' just end the
+    // parameter early, which the downstream parser tolerates.
+    //
+    // 5.31 — a plain `[^<]+` forbids only the ZERO-length value; it still ACCEPTS
+    // a whitespace-only value (`"\n"`, `"\n\n"`, spaces), because [^<] matches
+    // every char except '<' — including \t\r\n and space. On a minimal-context
+    // forced tool call the 3B-active model's cheapest way to satisfy the mask is
+    // exactly that whitespace filler (raw logits peak on the newline that closes
+    // the empty parameter), so it shipped dead calls like `{"query":"\n"}`
+    // ~40-60% of the time even through the grammar-masked salvage re-decode
+    // (confirmed live via cuda-gdb, chat-trace 2bd53443). Requiring a leading
+    // NON-whitespace char removes that escape hatch grammatically at any
+    // temperature: the model must commit a real character, and once it does it
+    // pulls content from context (e.g. the author name). Value = one leading
+    // "content" char then any run of non-'<'.
+    //
+    // Expressing "non-whitespace" is constrained by xgrammar's char-class lexer:
+    // it does NOT accept `\t`/`\n`/`\r` escapes (only `^ $ \ . * + ? ( ) [ ] { }
+    // | / -`), rejects a literal newline in a class, and its PARSER rejects the
+    // regex escapes `\s`/`\S`/`\d`/`\w` ("escape not supported yet in EBNF"). So
+    // whitespace cannot be named at all. Instead the leading char is a POSITIVE
+    // class of printable-ASCII content via range endpoints only: [!-;] = 0x21..
+    // 0x3B and [=-~] = 0x3D..0x7E — every printable ASCII char EXCEPT space
+    // (0x20), the C0 controls (incl. \t \n \r), and '<' (0x3C). The REST stays
+    // `[^<]*` (any non-'<', incl. spaces/UTF-8), so only the FIRST char is
+    // constrained. Limitation: a value whose very first char is non-ASCII (e.g.
+    // "Über…") is disallowed — acceptable for web-search queries, which lead with
+    // ASCII; the tail is unrestricted.
+    ebnf += "value ::= [!-;=-~] [^<]*\n";
     std::string bodyAlts;
     for (std::size_t i = 0; i < tools.size(); ++i) {
         const std::string nm = ebnfLiteralSafe(tools[i].name);
