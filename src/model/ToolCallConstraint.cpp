@@ -23,14 +23,15 @@ using nlohmann::json;
 namespace {
 
 // Ordered schema-property names of a tool from its OpenAI tool JSON, each
-// tagged with whether the schema lists it as required and its JSON Schema type
-// ("integer"/"number"/"boolean"/"string"/… or "" if absent) — the type drives a
-// per-value grammar rule so an integer param can't decode into a 150-digit
-// string or a whitespace ramble.
+// tagged with whether the schema lists it as required and carrying the full
+// per-property JSON subschema — the subschema is compiled into a per-value
+// grammar rule (like vLLM compiling the tool JSON Schema), so `type`, `enum`
+// and `maxLength` all constrain the value "for free" from what the schema
+// declares, instead of a hardcoded per-arch value rule.
 struct SchemaParams {
     std::vector<std::string> keys;      // schema-property order
     std::vector<bool>        required;  // parallel to keys
-    std::vector<std::string> types;     // parallel to keys; JSON Schema "type"
+    std::vector<json>        schema;    // parallel to keys; the property subschema
 };
 
 SchemaParams schemaParams(const std::string& toolJson) {
@@ -55,12 +56,7 @@ SchemaParams schemaParams(const std::string& toolJson) {
     for (auto it = props.begin(); it != props.end(); ++it) {
         sp.keys.push_back(it.key());
         sp.required.push_back(req.count(it.key()) > 0);
-        std::string ty;
-        if (it.value().is_object() && it.value().contains("type")
-            && it.value()["type"].is_string()) {
-            ty = it.value()["type"].get<std::string>();
-        }
-        sp.types.push_back(ty);
+        sp.schema.push_back(it.value());
     }
     return sp;
 }
@@ -192,21 +188,58 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
     // "Über…") is disallowed — acceptable for web-search queries, which lead with
     // ASCII; the tail is unrestricted.
     ebnf += "value ::= [!-;=-~] [^<]*\n";
-    // Type-specific value rules (JSON Schema "type"): an integer param must be
-    // digits only, a number a plain decimal, a boolean true/false — so a forced
-    // tool call can't degenerate e.g. `count` into a 150-digit string or a
-    // whitespace/text ramble. Anything else (string/array/object/unknown) keeps
-    // the permissive `value` rule. Positive integers only (optional leading '-'):
+    // Shared base rules for the primitive JSON types — an integer must be digits
+    // only, a number a plain decimal, a boolean true/false, so a forced tool call
+    // can't degenerate e.g. `count` into a 150-digit string or a text ramble.
     ebnf += "value_int ::= \"-\"? [0-9]+\n";
     ebnf += "value_num ::= \"-\"? [0-9]+ (\".\" [0-9]+)?\n";
     ebnf += "value_bool ::= \"true\" | \"false\"\n";
     std::string bodyAlts;
-    // The grammar rule name for a param of the given JSON Schema type.
-    const auto valueRuleFor = [](const std::string& type) -> const char* {
+    // Compile a property's JSON subschema into the grammar rule its value must
+    // follow — the vLLM "feed the schema, the type comes for free" idea, adapted
+    // to the RAW (unquoted) Qwen-XML parameter value (vLLM emits JSON, so it can
+    // hand the whole schema to xgrammar's JSON compiler; our wire value carries
+    // no JSON quotes, so we read the schema keywords ourselves and emit EBNF):
+    //   enum            -> the exact literal set (a value that cannot ramble);
+    //   integer/number/boolean -> the typed base rule;
+    //   string+maxLength -> a bounded content run ([^<]{0,N-1});
+    //   everything else -> permissive `value`.
+    // (maxLength/pattern/numeric-range are NOT expressible via xgrammar's own JSON
+    // Schema path — a documented gap — so even vLLM leans on this only when the
+    // schema declares them; enum + type are the reliable wins.)
+    // Emits a dedicated rule (named `id`) into `rules` when the schema needs one
+    // and returns the rule name to reference; otherwise returns a shared rule.
+    const auto valueRuleFromSchema =
+        [](const json& s, const std::string& id, std::string& rules) -> std::string {
+        if (!s.is_object()) { return "value"; }
+        if (s.contains("enum") && s["enum"].is_array() && !s["enum"].empty()) {
+            std::string alts;
+            for (const auto& e : s["enum"]) {
+                std::string lit;
+                if (e.is_string())              { lit = e.get<std::string>(); }
+                else if (e.is_number_integer()) { lit = std::to_string(e.get<std::int64_t>()); }
+                else if (e.is_boolean())        { lit = e.get<bool>() ? "true" : "false"; }
+                else { continue; }   // float/object/array enum member: no literal
+                if (!alts.empty()) { alts += " | "; }
+                alts += "\"" + ebnfLiteralSafe(lit) + "\"";
+            }
+            if (!alts.empty()) { rules += id + " ::= " + alts + "\n"; return id; }
+        }
+        const std::string type =
+            (s.contains("type") && s["type"].is_string())
+                ? s["type"].get<std::string>() : std::string{};
         if (type == "integer") { return "value_int"; }
         if (type == "number")  { return "value_num"; }
         if (type == "boolean") { return "value_bool"; }
-        return "value";  // string / array / object / unknown
+        if (type == "string" && s.contains("maxLength")
+            && s["maxLength"].is_number_integer()) {
+            const std::int64_t n = s["maxLength"].get<std::int64_t>();
+            if (n >= 1 && n <= 8192) {
+                rules += id + " ::= [!-;=-~] [^<]{0," + std::to_string(n - 1) + "}\n";
+                return id;
+            }
+        }
+        return "value";   // string (unbounded) / array / object / unknown
     };
     for (std::size_t i = 0; i < tools.size(); ++i) {
         const std::string nm = ebnfLiteralSafe(tools[i].name);
@@ -215,12 +248,20 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
         bodyAlts += "\"" + nm + ">\\n\" " + pr
                   + " \"</function>\\n</tool_call>\"";
 
-        // A parameter block for key k, typed by its JSON Schema "type".
-        const auto keyBlock = [&](const std::string& k, const std::string& type) {
-            return "\"<parameter=" + ebnfLiteralSafe(k) + ">\\n\" "
-                 + valueRuleFor(type) + " \"</parameter>\\n\"";
-        };
         const SchemaParams sp = schemaParams(tools[i].toolJson);
+        // Compile each property's subschema into its value rule ONCE (a key can
+        // be referenced by both the optional and the required block below).
+        std::vector<std::string> keyRule(sp.keys.size());
+        for (std::size_t j = 0; j < sp.keys.size(); ++j) {
+            keyRule[j] = valueRuleFromSchema(
+                sp.schema[j],
+                "pv_" + std::to_string(i) + "_" + std::to_string(j), ebnf);
+        }
+        // A parameter block for key j, using its schema-compiled value rule.
+        const auto keyBlock = [&](std::size_t j) {
+            return "\"<parameter=" + ebnfLiteralSafe(sp.keys[j]) + ">\\n\" "
+                 + keyRule[j] + " \"</parameter>\\n\"";
+        };
 
         // opt_i = any run of the OPTIONAL keys (each omittable, any order).
         const std::string optRule = "opt_" + std::to_string(i);
@@ -228,7 +269,7 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
         for (std::size_t j = 0; j < sp.keys.size(); ++j) {
             if (sp.required[j]) { continue; }
             if (!optAlts.empty()) { optAlts += " | "; }
-            optAlts += keyBlock(sp.keys[j], sp.types[j]);
+            optAlts += keyBlock(j);
         }
         if (optAlts.empty()) {
             ebnf += optRule + " ::= \"\"\n";
@@ -243,7 +284,7 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
         std::string paramsBody = optRule;
         for (std::size_t j = 0; j < sp.keys.size(); ++j) {
             if (!sp.required[j]) { continue; }
-            paramsBody += " " + keyBlock(sp.keys[j], sp.types[j]) + " " + optRule;
+            paramsBody += " " + keyBlock(j) + " " + optRule;
         }
         ebnf += pr + " ::= " + paramsBody + "\n";
     }
