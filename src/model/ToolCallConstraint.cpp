@@ -23,10 +23,14 @@ using nlohmann::json;
 namespace {
 
 // Ordered schema-property names of a tool from its OpenAI tool JSON, each
-// tagged with whether the schema lists it as required.
+// tagged with whether the schema lists it as required and its JSON Schema type
+// ("integer"/"number"/"boolean"/"string"/… or "" if absent) — the type drives a
+// per-value grammar rule so an integer param can't decode into a 150-digit
+// string or a whitespace ramble.
 struct SchemaParams {
     std::vector<std::string> keys;      // schema-property order
     std::vector<bool>        required;  // parallel to keys
+    std::vector<std::string> types;     // parallel to keys; JSON Schema "type"
 };
 
 SchemaParams schemaParams(const std::string& toolJson) {
@@ -51,6 +55,12 @@ SchemaParams schemaParams(const std::string& toolJson) {
     for (auto it = props.begin(); it != props.end(); ++it) {
         sp.keys.push_back(it.key());
         sp.required.push_back(req.count(it.key()) > 0);
+        std::string ty;
+        if (it.value().is_object() && it.value().contains("type")
+            && it.value()["type"].is_string()) {
+            ty = it.value()["type"].get<std::string>();
+        }
+        sp.types.push_back(ty);
     }
     return sp;
 }
@@ -182,7 +192,22 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
     // "Über…") is disallowed — acceptable for web-search queries, which lead with
     // ASCII; the tail is unrestricted.
     ebnf += "value ::= [!-;=-~] [^<]*\n";
+    // Type-specific value rules (JSON Schema "type"): an integer param must be
+    // digits only, a number a plain decimal, a boolean true/false — so a forced
+    // tool call can't degenerate e.g. `count` into a 150-digit string or a
+    // whitespace/text ramble. Anything else (string/array/object/unknown) keeps
+    // the permissive `value` rule. Positive integers only (optional leading '-'):
+    ebnf += "value_int ::= \"-\"? [0-9]+\n";
+    ebnf += "value_num ::= \"-\"? [0-9]+ (\".\" [0-9]+)?\n";
+    ebnf += "value_bool ::= \"true\" | \"false\"\n";
     std::string bodyAlts;
+    // The grammar rule name for a param of the given JSON Schema type.
+    const auto valueRuleFor = [](const std::string& type) -> const char* {
+        if (type == "integer") { return "value_int"; }
+        if (type == "number")  { return "value_num"; }
+        if (type == "boolean") { return "value_bool"; }
+        return "value";  // string / array / object / unknown
+    };
     for (std::size_t i = 0; i < tools.size(); ++i) {
         const std::string nm = ebnfLiteralSafe(tools[i].name);
         const std::string pr = "params_" + std::to_string(i);
@@ -190,10 +215,10 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
         bodyAlts += "\"" + nm + ">\\n\" " + pr
                   + " \"</function>\\n</tool_call>\"";
 
-        // A parameter block for key k.
-        const auto keyBlock = [](const std::string& k) {
-            return "\"<parameter=" + ebnfLiteralSafe(k)
-                 + ">\\n\" value \"</parameter>\\n\"";
+        // A parameter block for key k, typed by its JSON Schema "type".
+        const auto keyBlock = [&](const std::string& k, const std::string& type) {
+            return "\"<parameter=" + ebnfLiteralSafe(k) + ">\\n\" "
+                 + valueRuleFor(type) + " \"</parameter>\\n\"";
         };
         const SchemaParams sp = schemaParams(tools[i].toolJson);
 
@@ -203,7 +228,7 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
         for (std::size_t j = 0; j < sp.keys.size(); ++j) {
             if (sp.required[j]) { continue; }
             if (!optAlts.empty()) { optAlts += " | "; }
-            optAlts += keyBlock(sp.keys[j]);
+            optAlts += keyBlock(sp.keys[j], sp.types[j]);
         }
         if (optAlts.empty()) {
             ebnf += optRule + " ::= \"\"\n";
@@ -218,7 +243,7 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
         std::string paramsBody = optRule;
         for (std::size_t j = 0; j < sp.keys.size(); ++j) {
             if (!sp.required[j]) { continue; }
-            paramsBody += " " + keyBlock(sp.keys[j]) + " " + optRule;
+            paramsBody += " " + keyBlock(sp.keys[j], sp.types[j]) + " " + optRule;
         }
         ebnf += pr + " ::= " + paramsBody + "\n";
     }
