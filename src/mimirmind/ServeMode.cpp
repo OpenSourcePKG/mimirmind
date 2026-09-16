@@ -2647,6 +2647,45 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     // neutral synchronized batched decode: Gemma 4 MoE on L0/Xe-LPG serves
     // through the non-paged slab substrate (SlabDecodeStepper) instead of the
     // paged pool. qwen35moe keeps its CUDA paged path.
+    // ---- 5.27.10 fix: main-thread warmup of process-global lazy CUDA state,
+    // in particular the CUTLASS NVFP4-TC grouped GEMM ("nvfp4-tc-banks").
+    // Serve requests run on the batcher _worker / httplib pool threads. If the
+    // FIRST process-wide touch of the CUTLASS grouped kernel (its lazy
+    // initialize()) happens on such a worker thread — which never called
+    // cudaSetDevice and does not own the CudaContext — it returns kErrorInternal
+    // (rc=2) and poisons the context, crashing the first request intermittently
+    // (~60%, _Exit(70)). Forcing one tiny single-session generate() HERE — on
+    // the main thread that constructed the CudaContext, before any batcher
+    // worker exists — establishes that lazy state on the context-owning thread,
+    // so the workers only ever re-use the already-initialized kernel. Guarded so
+    // a warmup failure can never block serving; effectively a no-op for archs
+    // that don't drive the TC-banks path.
+    if (engine.servingClassEnabled()) {
+        try {
+            const auto& wtok = engine.tokenizer();
+            auto warmIds = wtok.encode("Hi", /*addBos=*/true);
+            if (warmIds.empty()) {
+                warmIds.push_back(wtok.eosId());
+            }
+            ::mimirmind::runtime::GenerateParams wgp{};
+            wgp.maxNewTokens         = 1;
+            wgp.sampling.temperature = 0.0F;
+            engine.resetCache();
+            (void)engine.generate(warmIds, wgp, {}, nullptr, {}, {});
+            engine.resetCache();
+            MM_LOG_INFO("main",
+                        "serve: main-thread kernel warmup done (default engine "
+                        "'{}') — nvfp4-tc-banks initialized on the context "
+                        "thread (5.27.10)",
+                        defaultId);
+        } catch (const std::exception& warmEx) {
+            MM_LOG_WARN("main",
+                        "serve: main-thread kernel warmup failed ({}); serving "
+                        "continues (worker first-init may still race — 5.27.10)",
+                        warmEx.what());
+        }
+    }
+
     std::unique_ptr<::mimirmind::runtime::serving::ContinuousBatcher> batcher;
     if ((engine.config().architecture == "qwen35moe" ||
          engine.config().architecture == "qwen4_exp" ||
