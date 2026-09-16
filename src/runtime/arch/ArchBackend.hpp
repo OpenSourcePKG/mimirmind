@@ -233,6 +233,12 @@ public:
                                 const float*                  /*hiddenStates*/,
                                 std::size_t                   /*T*/) {}
 
+    /// 5.27 I-9a: reset any per-sequence forward context the backend carries
+    /// across steps (qwen4_exp: the PLE rolling n-gram context). Called at a
+    /// sequence start (resetCache / a fresh batched run) so a prior generation
+    /// cannot contaminate the next. Default no-op.
+    virtual void resetForwardContext() {}
+
 protected:
     ArchBackend() = default;
 };

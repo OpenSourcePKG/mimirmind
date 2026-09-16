@@ -253,6 +253,14 @@ void Qwen4ExpBackend::prepareForward(std::span<const std::int32_t> tokIds,
     }
 }
 
+void Qwen4ExpBackend::resetForwardContext() {
+    // Sequence start: the rolling 2-token n-gram context starts as the
+    // reference's initial eos-pad (mirrors setPleTable / prepareForward T>1).
+    _pleCtx = {static_cast<std::int32_t>(_pleEos),
+               static_cast<std::int32_t>(_pleEos)};
+    _pleCtxInit = true;
+}
+
 void Qwen4ExpBackend::blockEnter(std::size_t blockIdx, float* /*x*/, std::size_t T,
                                  BlockBuffers& s) {
     if (static_cast<int>(blockIdx) == _pleGgufLayer && _pleTable.isOpen()) {

@@ -70,6 +70,10 @@ public:
     void prepareForward(std::span<const std::int32_t> tokIds,
                         const float* hiddenStates, std::size_t T) override;
 
+    /// I-9a: reset the rolling 2-token PLE n-gram context to EOS (sequence
+    /// start), so a batched run is not contaminated by a prior generation.
+    void resetForwardContext() override;
+
 protected:
     /// I-4: at the ple layer, inject the PLE n-gram features into the stream state.
     void blockEnter(std::size_t blockIdx, float* x, std::size_t T,

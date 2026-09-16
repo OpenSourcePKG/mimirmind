@@ -372,6 +372,11 @@ ServingSession::generateBatch(
         throw std::runtime_error(
             "generateBatch: batched serving only supports qwen35moe");
     }
+    // 5.27 I-9a: a fresh batched run starts a new sequence per slot — clear any
+    // carried per-sequence forward context (qwen4_exp PLE n-gram rolling context)
+    // so a prior single-session/batched run cannot contaminate it. No-op for
+    // other archs.
+    qb->resetForwardContext();
     const std::size_t nSeq = prompts.size();
     if (nSeq == 0 || maxNew == 0) {
         throw std::runtime_error("generateBatch: empty request");
@@ -509,6 +514,11 @@ ServingSession::generateBatch(
         cmp::embeddingLookup(tokEmb->type, tokEmb->usmPtr, d_model, vocab_emb,
                              std::span<const std::int32_t>{inputTok.data(), nSeq},
                              xBuf);
+        // 5.27 I-9a: hand this step's tokens to the backend for the PLE n-gram
+        // seam (qwen4_exp). No-op for other archs. Single-sequence semantics
+        // (T=nSeq) — correct at conc=1; per-slot n-gram context is 5.27.11.2.
+        qb->prepareForward(std::span<const std::int32_t>{inputTok.data(), nSeq},
+                           xBuf, nSeq);
         for (std::size_t s = 0; s < nSeq; ++s) {
             writeBlockId[s] = static_cast<std::uint32_t>(s * blocksPerSeq + p / blockSize);
             writeSlot[s]    = static_cast<std::int32_t>(p % blockSize);
@@ -636,11 +646,21 @@ ServingSession::generateBatch(
     auto argmaxDev = _e._ops->allocate(nSeq * sizeof(std::int32_t));
     std::vector<std::int32_t> toksHost(nSeq);
     auto lmHeadSample = [&]() -> std::vector<std::int32_t> {
-        _e._ops->rmsNormAsync(xBuf, nSeq, d_model,
-                              static_cast<const float*>(outNorm->usmPtr),
-                              _e._config.rmsNormEps, normBuf);
+        // 5.27 I-9a: for Hyper-Connections archs (qwen4_exp) the top-level mixer
+        // collapse REPLACES output_norm — collapse the 4 streams into xBuf and
+        // feed lm_head directly (skip the plain final RMSNorm). Mirrors the
+        // single-session useHc + sampleNext(skipFinalNorm=true).
+        const float* lmIn = normBuf;
+        if (qb->usesHyperConnections()) {
+            qb->collapseHyperStreams(nSeq, sb, xBuf);
+            lmIn = xBuf;
+        } else {
+            _e._ops->rmsNormAsync(xBuf, nSeq, d_model,
+                                  static_cast<const float*>(outNorm->usmPtr),
+                                  _e._config.rmsNormEps, normBuf);
+        }
         _e._gmm->matmul(lmHead->type, lmHead->usmPtr, vocab_lm, d_model,
-                        normBuf, nSeq, logits, lmScr.as<float>());
+                        lmIn, nSeq, logits, lmScr.as<float>());
         _e._ops->argmaxRowsAsync(logits, argmaxDev.as<std::int32_t>(),
                                  nSeq, vocab_lm);
         _e._ops->flush();

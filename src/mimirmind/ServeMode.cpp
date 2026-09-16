@@ -871,7 +871,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         // (generateServingParity) against single-seq greedy generate() on
         // this freshly-loaded model, print the comparison, and exit before
         // the HTTP server starts. qwen35moe only.
-        if (arch == "qwen35moe" &&
+        if ((arch == "qwen35moe" || arch == "qwen4_exp") &&
             std::getenv("MIMIRMIND_SERVING_PARITY") != nullptr) {
             const auto& tok = e->tokenizer();
             std::vector<std::int32_t> promptIds =
@@ -899,7 +899,13 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                 const long v = std::strtol(mn, nullptr, 10);
                 if (v > 0) maxNew = static_cast<std::size_t>(v);
             }
-            const std::size_t nSeq   = 2;
+            // 5.27.11.1: conc configurable — qwen4_exp conc=1 parity uses NSEQ=1
+            // (per-slot PLE for nSeq>1 is 5.27.11.2).
+            std::size_t nSeq = 2;
+            if (const char* ns = std::getenv("MIMIRMIND_PARITY_NSEQ")) {
+                const long v = std::strtol(ns, nullptr, 10);
+                if (v > 0) nSeq = static_cast<std::size_t>(v);
+            }
 
             ::mimirmind::runtime::GenerateParams gp{};
             gp.maxNewTokens         = maxNew;
@@ -939,6 +945,9 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 
             // D2e.1 — generateBatch with DISTINCT prompts. Each batched
             // stream must equal its own single-session greedy generate().
+            // 5.27.11.1: distinct-prompt conc>1 needs per-slot PLE (5.27.11.2) —
+            // run it only for qwen35moe; qwen4_exp validates via NSEQ=1 above.
+            if (arch == "qwen35moe") {
             const char* multiPrompts[] = {
                 "The capital of France is",
                 "Once upon a time",
@@ -982,6 +991,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             }
             std::cout << "  => generateBatch "
                       << (allBatchOk ? "PASS" : "CHECK") << "\n";
+            }  // end qwen35moe-only D2e distinct-prompt block (5.27.11.1)
             std::cout.flush();
             return 0;
         }
@@ -2687,8 +2697,12 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     }
 
     std::unique_ptr<::mimirmind::runtime::serving::ContinuousBatcher> batcher;
+    // 5.27.11.1 interim: qwen4_exp is EXCLUDED from the continuous batcher until
+    // 5.27.11.2 wires per-slot PLE into the paged batched forward — it serves via
+    // single-session generate() (correct via 5.27.10) meanwhile. The batched
+    // block-loop seams are already HC/PLE-correct (generateBatch conc=1 parity);
+    // only the paged output-collapse sites + per-slot PLE remain.
     if ((engine.config().architecture == "qwen35moe" ||
-         engine.config().architecture == "qwen4_exp" ||
          engine.supportsBatchedDecode()) &&
         engine.servingClassEnabled()) {
         std::size_t maxBatch =

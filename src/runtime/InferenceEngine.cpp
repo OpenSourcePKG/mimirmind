@@ -1081,6 +1081,11 @@ void InferenceEngine::resetCache() noexcept {
     // conversation can never restore a stale recurrent state. (The state slab
     // itself is re-zeroed lazily by the backend on the next length==0 forward.)
     _ssmSnapValid = false;
+    // 5.27 I-9a: clear any per-sequence forward context (qwen4_exp PLE n-gram
+    // rolling context) so a fresh conversation starts clean. No-op for others.
+    if (_backend != nullptr) {
+        _backend->resetForwardContext();
+    }
 }
 
 void InferenceEngine::setKvDtype(KvDtype dtype) {

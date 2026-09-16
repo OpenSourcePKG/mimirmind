@@ -119,6 +119,16 @@ Qwen3_5Backend::Qwen3_5Backend(const model::LlmConfig&       config,
     if (const char* pfb = std::getenv("MIMIRMIND_GDN_PROJ_FUSE_BATCH")) {
         _gdnProjFuseBatch = (pfb[0] == '1' && pfb[1] == '\0');
     }
+    // 5.27.11.1: the fused GDN input projection (one per-tensor E4M3 scale across
+    // the concatenated qkvz/ba tensor) is NOT bit-identical to the single-session
+    // separate-GEMM path. For qwen4_exp this ~0.25% delta flips the greedy argmax
+    // (localized via serving-parity + Q4E_DIAG), so the batched serving forward
+    // would diverge from single-session generate(). Force the fuse OFF for
+    // qwen4_exp so batched decode is bit-faithful; qwen35moe keeps the perf opt.
+    if (_config.architecture == "qwen4_exp") {
+        _gdnProjFuse      = false;
+        _gdnProjFuseBatch = false;
+    }
     // GDN-Inc 2 / 2b are bit-identical and cost no memory, so they default ON;
     // MIMIRMIND_GDN_GATE_FUSE=0 / MIMIRMIND_GDN_PREP_FUSE=0 roll back.
     if (const char* gf = std::getenv("MIMIRMIND_GDN_GATE_FUSE")) {
