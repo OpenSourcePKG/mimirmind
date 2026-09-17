@@ -10,6 +10,8 @@
 #include <xgrammar/xgrammar.h>
 #include <dlpack/dlpack.h>
 
+#include <cstdint>
+#include <cstdio>
 #include <map>
 #include <mutex>
 #include <set>
@@ -139,6 +141,85 @@ std::string intRangeEbnf(std::int64_t lo, std::int64_t hi) {
     return body;
 }
 
+// --- Float/number ranges: llama.cpp does NOT do these (only integer), because a
+// decimal fraction is unbounded in length. We enforce the UPPER bound EXACTLY —
+// a decimal fraction g of up to K digits with 0.g <= 0.f (f = max's fractional
+// digits, trailing zeros stripped). This is the meaningful constraint for float
+// tool params (temperature<=2, top_p<=1): the value can't EXCEED max. Combined
+// with an exact integer-part range, the number is bounded <= max; the lower side
+// (>= min) is kept a superset (never rejects a valid in-range value -> never
+// breaks tool-calling), which matters only for the rare min>0 float.
+std::string numFracLeEbnf(const std::string& fRaw, int k) {
+    std::string f = fRaw;
+    while (!f.empty() && f.back() == '0') { f.pop_back(); }   // 0.50 == 0.5
+    if (f.empty()) {                                          // <= 0.0 => all zeros
+        return "\"0\"{1," + std::to_string(k) + "}";
+    }
+    std::string alts;
+    const auto add = [&](const std::string& s) {
+        if (!alts.empty()) { alts += " | "; }
+        alts += "(" + s + ")";
+    };
+    std::string prefix;
+    for (std::size_t i = 0; i < f.size(); ++i) {
+        // (a) equal prefix, a digit strictly below f[i], then any tail
+        if (f[i] > '0') {
+            std::string s;
+            if (!prefix.empty()) { s += "\"" + prefix + "\" "; }
+            s += std::string("[0-") + static_cast<char>(f[i] - 1) + "]";
+            const int rem = k - static_cast<int>(i) - 1;
+            if (rem > 0) { s += " [0-9]{0," + std::to_string(rem) + "}"; }
+            add(s);
+        }
+        // (b) exact prefix of f of length i+1 (a shorter value is <= 0.f)
+        add("\"" + prefix + f[i] + "\"");
+        prefix += f[i];
+    }
+    // (c) f followed by trailing zeros only (still == 0.f)
+    const int rem = k - static_cast<int>(f.size());
+    if (rem > 0) { add("\"" + f + "\" \"0\"{1," + std::to_string(rem) + "}"); }
+    return alts;
+}
+// Non-negative double -> integer part + fractional digit string (no exponent, no
+// trailing zeros). Used to compile a number [min,max] range.
+void decimalParts(double v, std::int64_t& ip, std::string& frac) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.12f", v);
+    std::string s(buf);
+    const auto dot = s.find('.');
+    ip = std::stoll(s.substr(0, dot));
+    frac = s.substr(dot + 1);
+    while (!frac.empty() && frac.back() == '0') { frac.pop_back(); }
+}
+// EBNF matching a decimal number in [min,max] (0 <= min <= max): integer part
+// exact via intRangeEbnf, the top integer part's fraction bounded by numFracLeEbnf.
+std::string numRangeEbnf(double minV, double maxV) {
+    constexpr int kFrac = 15;
+    std::int64_t iMin = 0;
+    std::int64_t iMax = 0;
+    std::string fMin;
+    std::string fMax;
+    decimalParts(minV, iMin, fMin);
+    decimalParts(maxV, iMax, fMax);
+    std::string alts;
+    const auto add = [&](const std::string& s) {
+        if (!alts.empty()) { alts += " | "; }
+        alts += "(" + s + ")";
+    };
+    // integer part in [iMin, iMax-1]: any (capped) fraction -> always < iMax <= max.
+    // NB the intRangeEbnf body is an alternation, so it MUST be parenthesised
+    // before the optional-fraction suffix, else the suffix binds to only its last
+    // alternative (`A | B | C X` == `A | B | (C X)`).
+    if (iMin <= iMax - 1) {
+        add("(" + intRangeEbnf(iMin, iMax - 1)
+            + ") (\".\" [0-9]{1," + std::to_string(kFrac) + "})?");
+    }
+    // integer part == iMax: bare, or with a fraction <= frac(max)
+    add("\"" + std::to_string(iMax) + "\" (\".\" ("
+        + numFracLeEbnf(fMax, kFrac) + "))?");
+    return alts;
+}
+
 // Per-(tokenizer) xgrammar preprocessing: the TokenizerInfo + a GrammarCompiler
 // bound to it. Building these scans the whole vocab, so cache and share.
 struct TokContext {
@@ -261,7 +342,7 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
     // integer param can't run away to a 140-digit number even when its schema
     // declares no maximum; a DECLARED [min,max] gets an exact range rule below.
     ebnf += "value_int ::= \"-\"? [0-9]{1,20}\n";
-    ebnf += "value_num ::= \"-\"? [0-9]+ (\".\" [0-9]+)?\n";
+    ebnf += "value_num ::= \"-\"? [0-9]{1,20} (\".\" [0-9]{1,15})?\n";
     ebnf += "value_bool ::= \"true\" | \"false\"\n";
     std::string bodyAlts;
     // Compile a property's JSON subschema into the grammar rule its value must
@@ -331,7 +412,30 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
             }
             return "value_int";
         }
-        if (type == "number")  { return "value_num"; }
+        if (type == "number") {
+            // Float [min,max]: enforce the UPPER bound exactly (integer part range
+            // + top fraction <= max's fraction); lower side stays a superset (never
+            // rejects a valid value). Only when a finite maximum and non-negative
+            // floor are declared; else fall back to the digit-capped value_num.
+            const auto asNum = [](const json& j, double& out) {
+                if (j.is_number()) { out = j.get<double>(); return true; }
+                return false;
+            };
+            double minV = 0.0;
+            double maxV = 0.0;
+            const bool haveMin = s.contains("minimum") && asNum(s["minimum"], minV);
+            bool haveMax = s.contains("maximum") && asNum(s["maximum"], maxV);
+            if (!haveMax && s.contains("exclusiveMaximum")
+                && asNum(s["exclusiveMaximum"], maxV)) {
+                haveMax = true;   // treated inclusively (superset-safe)
+            }
+            if (!haveMin) { minV = 0.0; }
+            if (haveMax && minV >= 0.0 && minV <= maxV && maxV < 1e15) {
+                rules += id + " ::= " + numRangeEbnf(minV, maxV) + "\n";
+                return id;
+            }
+            return "value_num";
+        }
         if (type == "boolean") { return "value_bool"; }
         if (type == "string" && s.contains("maxLength")
             && s["maxLength"].is_number_integer()) {
