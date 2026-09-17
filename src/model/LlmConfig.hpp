@@ -97,6 +97,23 @@ struct LlmConfig {
     // MIMIRMIND_ANSWER_FLOOR_TEMP_CAP.
     float         answerFloorTempCap {0.0F};
 
+    // 5.31: model-recommended THINKING sampling — distinct from the generic
+    // generation_config sampling above. A checkpoint's generation_config.json
+    // ships ONE do_sample temperature (qwen3.6: 1.0) that the vendor's model
+    // card OVERRIDES for reasoning (Qwen3 thinking preset: temp 0.6, top_p 0.95,
+    // top_k 20; explicitly NOT the generic 1.0). The thinking floor blindly
+    // reused samplingTempDefault=1.0, which is too hot for a small-active model's
+    // long reasoning chain -> the chain drifts and derails (measured: temp 1.0
+    // thinking runs go off-topic mid-chain on qwen3.6 3B-A). These carry the
+    // vendor's THINKING recommendation per-(machine,model) via the HW-fingerprint
+    // overlay, taking priority over generation_config in the thinking floor.
+    // 0 / 1.0 / 0 (unset) = fall back to samplingTempDefault/TopP/TopK, then to
+    // the generic anti-degeneration values in the handler. Ops override:
+    // MIMIRMIND_THINKING_TEMP / _TOP_P / _TOP_K.
+    float         thinkingTemp {0.0F};
+    float         thinkingTopP {1.0F};
+    std::uint32_t thinkingTopK {0};
+
     // 5.x: server-side repetition-control defaults + anti-loop safety floor, moved
     // out of hardcoded constants in ChatCompletionHandler into per-model config so
     // a model that does not loop is not saddled with another model's tuned

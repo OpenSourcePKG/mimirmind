@@ -61,6 +61,13 @@ struct ProbePicks {
     // lift capped here for a checkpoint that loops under penalties alone. Lives in
     // the per-model overlay (checkpoint-specific), applied to LlmConfig.
     std::optional<float> applyAnswerFloorTempCap;  // LlmConfig.answerFloorTempCap
+    // Model-recommended THINKING sampling for this (machine, model): the vendor's
+    // reasoning preset (Qwen3: 0.6 / 0.95 / 20), which overrides the generic
+    // generation_config temperature in the thinking floor. Lives in the per-model
+    // overlay; applied to LlmConfig.thinkingTemp/TopP/TopK.
+    std::optional<float> applyThinkingTemp;  // LlmConfig.thinkingTemp
+    std::optional<float> applyThinkingTopP;  // LlmConfig.thinkingTopP
+    std::optional<int>   applyThinkingTopK;  // LlmConfig.thinkingTopK
 };
 
 /**

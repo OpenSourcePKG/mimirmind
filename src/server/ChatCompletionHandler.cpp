@@ -602,20 +602,29 @@ bool ChatCompletionHandler::prepareChatRequest(
         constexpr float        kGenericEscapeTemp = 0.6F;   // model-agnostic floor
         constexpr float        kGenericEscapeTopP = 0.95F;
         constexpr std::uint32_t kGenericEscapeTopK = 20U;
-        const float thinkTemp = mc.samplingTempDefault > 0.0F
-                                    ? mc.samplingTempDefault : kGenericEscapeTemp;
+        // Priority: the model's THINKING preset (overlay: thinkingTemp/TopP/TopK,
+        // the vendor's reasoning recommendation) BEFORE the generic
+        // generation_config sampling (samplingTempDefault etc.). qwen3.6 ships a
+        // do_sample temp of 1.0 in generation_config, but its card's reasoning
+        // preset is 0.6 — reusing 1.0 over a long chain derails a 3B-active model.
+        // Falls back to generation_config, then to the model-agnostic escape values.
+        const float thinkTemp = mc.thinkingTemp > 0.0F        ? mc.thinkingTemp
+                              : mc.samplingTempDefault > 0.0F ? mc.samplingTempDefault
+                                                              : kGenericEscapeTemp;
         if (params.sampling.temperature < thinkTemp) {
             params.sampling.temperature = thinkTemp;
-            const float tp = mc.samplingTopPDefault < 1.0F
-                                 ? mc.samplingTopPDefault : kGenericEscapeTopP;
-            const std::uint32_t tk = mc.samplingTopKDefault > 0
-                                 ? mc.samplingTopKDefault : kGenericEscapeTopK;
+            const float tp = mc.thinkingTopP < 1.0F        ? mc.thinkingTopP
+                           : mc.samplingTopPDefault < 1.0F ? mc.samplingTopPDefault
+                                                           : kGenericEscapeTopP;
+            const std::uint32_t tk = mc.thinkingTopK > 0        ? mc.thinkingTopK
+                                   : mc.samplingTopKDefault > 0 ? mc.samplingTopKDefault
+                                                               : kGenericEscapeTopK;
             if (params.sampling.topP >= 1.0F) params.sampling.topP = tp;
             if (params.sampling.topK == 0)    params.sampling.topK = tk;
             MM_LOG_INFO("server",
                         "thinking sampling floor: reasoning under greedy/near-greedy "
-                        "-> temp={} top_p={} top_k={} (model generation_config; "
-                        "generic fallback only when the checkpoint ships none)",
+                        "-> temp={} top_p={} top_k={} (model thinking preset > "
+                        "generation_config > generic fallback)",
                         params.sampling.temperature, params.sampling.topP,
                         params.sampling.topK);
         }

@@ -926,6 +926,32 @@ void InferenceEngine::finalizeLoad() {
                             "  profile applied: answer-floor temp cap -> {}",
                             _config.answerFloorTempCap);
             }
+            // Model THINKING sampling (overlay): the vendor's reasoning preset,
+            // overriding the generic generation_config temperature in the thinking
+            // floor (qwen3.6 ships do_sample temp=1.0, too hot for a long reasoning
+            // chain on a 3B-active model -> derails; card recommends 0.6). Per-model
+            // LlmConfig, not a process env; explicit MIMIRMIND_THINKING_* still wins.
+            if (picks->applyThinkingTemp &&
+                std::getenv("MIMIRMIND_THINKING_TEMP") == nullptr) {
+                _config.thinkingTemp = *picks->applyThinkingTemp;
+            }
+            if (picks->applyThinkingTopP &&
+                std::getenv("MIMIRMIND_THINKING_TOP_P") == nullptr) {
+                _config.thinkingTopP = *picks->applyThinkingTopP;
+            }
+            if (picks->applyThinkingTopK &&
+                std::getenv("MIMIRMIND_THINKING_TOP_K") == nullptr) {
+                _config.thinkingTopK =
+                    static_cast<std::uint32_t>(*picks->applyThinkingTopK);
+            }
+            if (picks->applyThinkingTemp || picks->applyThinkingTopP ||
+                picks->applyThinkingTopK) {
+                MM_LOG_INFO("probe",
+                            "  profile applied: thinking sampling -> temp={} "
+                            "top_p={} top_k={}",
+                            _config.thinkingTemp, _config.thinkingTopP,
+                            _config.thinkingTopK);
+            }
         }
     }
 
