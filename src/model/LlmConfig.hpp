@@ -114,6 +114,17 @@ struct LlmConfig {
     float         thinkingTopP {1.0F};
     std::uint32_t thinkingTopK {0};
 
+    // 8.19.11 -> 5.31: server-side HONESTY FLOOR (prepend a "hedge, don't
+    // confabulate" system prompt when a request ships NO system and NO tools).
+    // DEFAULT OFF: an oracle A/B (2026-09-17, qwen3.6 vs vLLM) showed it makes the
+    // model REFUSE long-tail knowledge questions that the un-floored vLLM answers
+    // at par — over-refusal is worse than the confabulation it was meant to curb,
+    // and grounded/agentic flows (which carry a system prompt or tools) never hit
+    // it anyway. Per-(machine,model) via the HW-fingerprint overlay, NOT a server
+    // env-default: a checkpoint that genuinely over-confabulates can re-enable it
+    // in its overlay. Ops override: MIMIRMIND_HONESTY_FLOOR (0/1) still wins.
+    bool          honestyFloor {false};
+
     // 5.x: server-side repetition-control defaults + anti-loop safety floor, moved
     // out of hardcoded constants in ChatCompletionHandler into per-model config so
     // a model that does not loop is not saddled with another model's tuned

@@ -952,6 +952,15 @@ void InferenceEngine::finalizeLoad() {
                             _config.thinkingTemp, _config.thinkingTopP,
                             _config.thinkingTopK);
             }
+            // Honesty floor (model overlay). Default is OFF in LlmConfig; an
+            // overlay can re-enable it per checkpoint. Per-model LlmConfig, not a
+            // process env; explicit MIMIRMIND_HONESTY_FLOOR still wins per-request.
+            if (picks->applyHonestyFloor &&
+                std::getenv("MIMIRMIND_HONESTY_FLOOR") == nullptr) {
+                _config.honestyFloor = *picks->applyHonestyFloor;
+                MM_LOG_INFO("probe", "  profile applied: honesty floor -> {}",
+                            _config.honestyFloor ? "on" : "off");
+            }
         }
     }
 

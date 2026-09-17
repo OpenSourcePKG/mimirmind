@@ -377,10 +377,15 @@ bool ChatCompletionHandler::prepareChatRequest(
     // disables the injection, so those flows stay byte-identical. Server
     // decides (same philosophy as the M7f/anti-loop floors); ops rollback:
     // MIMIRMIND_HONESTY_FLOOR=0.
+    // 5.31: DEFAULT OFF, per-(machine,model). An oracle A/B showed the floor makes
+    // the model REFUSE long-tail knowledge questions that the un-floored vLLM
+    // answers at par, so it now defaults off (LlmConfig.honestyFloor) and a
+    // checkpoint re-enables it via its overlay. Explicit env still wins per-request.
     {
-        static const bool kHonestyFloor = [] {
+        const bool kHonestyFloor = [&] {
             const char* e = std::getenv("MIMIRMIND_HONESTY_FLOOR");
-            return e == nullptr || e[0] != '0';
+            if (e != nullptr) return e[0] != '0';         // ops override wins
+            return targetEngine.config().honestyFloor;    // per-model default (off)
         }();
         const bool hasSystem = std::any_of(
             msgs.begin(), msgs.end(), [](const model::ChatMessage& m) {

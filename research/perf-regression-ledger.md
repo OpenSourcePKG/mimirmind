@@ -347,3 +347,36 @@ top_p=0.95 top_k=20".
 6-24s vs think-on 21-128s and needs answer-budget headroom). This fix only makes
 opt-in thinking COHERENT instead of derailing. No perf regression on the default
 non-thinking path (guarded by `cr.enableThinking`).
+
+---
+
+## 2026-09-17 — Honesty floor: default OFF, per-model overlay (quality, not perf)
+
+**Change:** the server honesty floor (8.19.11 — prepend a "hedge, don't
+confabulate" system prompt when a request ships NO system and NO tools) now
+defaults **OFF** and is a per-(machine,model) overlay toggle
+(`LlmConfig.honestyFloor`, overlay flag `MIMIRMIND_HONESTY_FLOOR`), not an
+env-default-ON server constant.
+
+**Why:** oracle A/B (2026-09-17, qwen3.6 vs vLLM, plain chat) — the floor made
+the model REFUSE long-tail knowledge questions ("Liste die Werke von Walter
+Moers") that the un-floored vLLM answers at par. Over-refusal is worse than the
+confabulation it was meant to curb; grounded/agentic flows carry a system prompt
+or tools and never hit the floor anyway.
+
+**Files:** LlmConfig.hpp, ProbeConfig.{hpp,cpp}, InferenceEngine.cpp,
+ChatCompletionHandler.cpp. Commit <pending>. Ops override: env
+MIMIRMIND_HONESTY_FLOOR=1 re-enables per-request; an overlay can re-enable it for
+a checkpoint that over-confabulates.
+
+**Validation (deployed Release, no system + no tools, temp=0):**
+- Walter Moers: was REFUSE → now ATTEMPTS (frames correctly, lists; confabulates
+  specific titles exactly as vLLM does — model ceiling, needs the search tool).
+- Photosynthesis / capital-of-Australia: unchanged, correct → no regression.
+- Long-tail (Liechtenstein heads of gov): attempts + self-hedges ("Fürst vs
+  Ministerpräsident is a separate office") though confabulates specifics.
+
+**Regression watch:** grounded RAG / agentic / parity / needle flows unaffected
+(all carry a system prompt or tools → floor never applied, byte-identical). The
+tradeoff (more confabulation on ungrounded long-tail facts) is accepted and
+matches the vLLM oracle; the real remedy is the (now-fixed) search tool path.

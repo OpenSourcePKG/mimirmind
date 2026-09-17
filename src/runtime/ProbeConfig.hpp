@@ -68,6 +68,10 @@ struct ProbePicks {
     std::optional<float> applyThinkingTemp;  // LlmConfig.thinkingTemp
     std::optional<float> applyThinkingTopP;  // LlmConfig.thinkingTopP
     std::optional<int>   applyThinkingTopK;  // LlmConfig.thinkingTopK
+    // Honesty-floor toggle for this (machine, model). Default is OFF (see
+    // LlmConfig.honestyFloor); an overlay can re-enable it for a checkpoint that
+    // over-confabulates. Applied to LlmConfig.honestyFloor.
+    std::optional<bool>  applyHonestyFloor;  // LlmConfig.honestyFloor
 };
 
 /**

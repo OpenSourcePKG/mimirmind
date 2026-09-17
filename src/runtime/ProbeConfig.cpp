@@ -57,6 +57,7 @@ void parseFlagsBlock(const nlohmann::json& flags, ProbePicks& picks) {
     if (auto v = readFloatFlag("MIMIRMIND_THINKING_TEMP"))  picks.applyThinkingTemp = v;
     if (auto v = readFloatFlag("MIMIRMIND_THINKING_TOP_P")) picks.applyThinkingTopP = v;
     if (auto v = readIntFlag("MIMIRMIND_THINKING_TOP_K"))   picks.applyThinkingTopK = v;
+    if (auto v = readFlag("MIMIRMIND_HONESTY_FLOOR"))       picks.applyHonestyFloor = v;
 }
 
 } // namespace
@@ -188,6 +189,7 @@ void mergeOverlay(ProbePicks& base, const ProbePicks& over) {
     if (over.applyThinkingTemp) base.applyThinkingTemp = over.applyThinkingTemp;
     if (over.applyThinkingTopP) base.applyThinkingTopP = over.applyThinkingTopP;
     if (over.applyThinkingTopK) base.applyThinkingTopK = over.applyThinkingTopK;
+    if (over.applyHonestyFloor) base.applyHonestyFloor = over.applyHonestyFloor;
 }
 
 } // namespace mimirmind::runtime
