@@ -18,6 +18,14 @@
 #include <string>
 #include <vector>
 
+// xgrammar's internal regex->EBNF converter (cpp/regex_converter.h, not in the
+// public include/). FromRegex() uses it; we call it directly to splice a JSON-Schema
+// `pattern` into our tool-call value grammar. Forward-declared to avoid depending on
+// the internal header path; the symbol lives in libxgrammar.a.
+namespace xgrammar {
+std::string RegexToEBNF(const std::string& regex, bool with_rule_name);
+}  // namespace xgrammar
+
 namespace mimirmind::model {
 
 using nlohmann::json;
@@ -437,6 +445,27 @@ ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
             return "value_num";
         }
         if (type == "boolean") { return "value_bool"; }
+        // string `pattern` (regex): compile it to EBNF via xgrammar's own regex
+        // converter (the one FromRegex uses) and splice it as the value rule. This
+        // covers the full common regex language (char classes, quantifiers, groups,
+        // alternation, anchors, \d/\w/\s) — the converter emits EBNF that FromEBNF
+        // accepts, sidestepping the char-class-escape limits of hand-written EBNF.
+        // Takes precedence over maxLength (xgrammar/vLLM likewise drop length when a
+        // pattern is present). A convert failure falls through to maxLength/value.
+        if (type == "string" && s.contains("pattern") && s["pattern"].is_string()) {
+            const std::string pat = s["pattern"].get<std::string>();
+            if (!pat.empty()) {
+                try {
+                    const std::string body = xgrammar::RegexToEBNF(pat, false);
+                    if (!body.empty()) {
+                        rules += id + " ::= (" + body + ")\n";
+                        return id;
+                    }
+                } catch (const std::exception&) {
+                    // unsupported regex -> fall through to maxLength / permissive
+                }
+            }
+        }
         if (type == "string" && s.contains("maxLength")
             && s["maxLength"].is_number_integer()) {
             const std::int64_t n = s["maxLength"].get<std::int64_t>();
