@@ -141,6 +141,10 @@ Qwen3_5Backend::Qwen3_5Backend(const model::LlmConfig&       config,
     if (const char* cbp = std::getenv("MIMIRMIND_GDN_CONV_BATCHPACK")) {
         _gdnConvBatchPack = !(cbp[0] == '0' && cbp[1] == '\0');
     }
+    // 5.18.21.6: opt-in fused conv1d-silu + post-conv prep (A/B).
+    if (const char* csf = std::getenv("MIMIRMIND_GDN_CONV_SPLIT_FUSE")) {
+        _gdnConvSplitFuse = (csf[0] == '1' && csf[1] == '\0');
+    }
     _gdnQkvzW.resize(_config.blockCount);
     _gdnBaW.resize(_config.blockCount);
     if (const char* w13 = std::getenv("MIMIRMIND_MOE_W13_FUSE")) {

@@ -111,6 +111,104 @@ void gdn_conv_pack_batched(
     convInput[inBase + (size_t)r * channels + c] = v;
 }
 
+// 5.18.21.6 — FUSED conv1d-silu + post-conv prep. Collapses gdn.conv.k
+// (ssm_conv1d_batched -> qkvMixed) + gdn.split (fused_post_conv_prep_warp reads
+// qkvMixed) into ONE launch: the per-head q/k/v reads are replaced by an on-the-fly
+// causal conv1d + SiLU, so the qkvMixed intermediate never touches HBM (one fewer
+// launch + one fewer [nRow, channels] round-trip). Result is tolerance-equal to the
+// two-kernel path (the conv Sigma_kk order + SiLU are byte-identical to
+// ssm_conv1d_batched; the two L2 sum-of-squares use the same shared-memory tree as
+// fused_post_conv_prep_warp, so identical reassociation). ONE BLOCK per compact
+// (t_global, head) row, blockDim.x == S (guarded host-side for the prod S shape).
+//
+// Ragged: the conv window for compact token t_global lives in convInput at row
+// winRow = convInOff[seq] + (t_global - seqOff[seq]); the owning seq is found by a
+// cheap lane-0 scan of seqOff (nSeq <= 64). convInput/kern/layout match
+// ssm_conv1d_batched + fused_post_conv_prep_warp exactly.
+//   convInput : [totalConvRows, channels]      (packed [state | tokens] per seq)
+//   kern      : [channels, K]
+//   q/k/vOut  : [nRow, dstHeads, S]
+// Launch: grid = nRow*dstHeads, block = S, shared = 2*S floats + 1 int (winRow).
+extern "C" __global__ __launch_bounds__(1024)
+void gdn_conv_split_fuse(
+    const float* __restrict__ convInput,
+    const float* __restrict__ kern,
+    const int*   __restrict__ seqOff,      // [nSeq+1] compact-token prefix sum
+    const int*   __restrict__ convInOff,   // [nSeq] conv-input row offset per seq
+    float*       __restrict__ qOut,
+    float*       __restrict__ kOut,
+    float*       __restrict__ vOut,
+    const int                 nRow,        // total compact tokens
+    const int                 nSeq,
+    const int                 srcHeadsKV,  // = hK (GQA source heads for q/k)
+    const int                 dstHeads,    // = hV
+    const int                 S,
+    const int                 channels,    // = convDim (convInput/qkvMixed width)
+    const int                 keyDim,      // = hK * S
+    const int                 K,           // conv kernel width (d_conv)
+    const float               eps)
+{
+    const int rowIdx = blockIdx.x;                  // (t_global, head)
+    if (rowIdx >= nRow * dstHeads) {
+        return;
+    }
+    const int h       = rowIdx % dstHeads;
+    const int tGlobal = rowIdx / dstHeads;
+    const int s       = threadIdx.x;                // one element per thread (s < S)
+
+    extern __shared__ float smem[];                 // [0,S): q sq | [S,2S): k sq
+    __shared__ int winRow;
+    if (s == 0) {
+        // find owning seq: seqOff[seq] <= tGlobal < seqOff[seq+1]  (nSeq small).
+        // seqOff may hold only nSeq start offsets, so the last seq's upper bound
+        // is nRow (never read seqOff[nSeq]).
+        int seq = nSeq - 1;
+        for (int e = 0; e < nSeq; ++e) {
+            const int lo = seqOff[e];
+            const int hi = (e + 1 < nSeq) ? seqOff[e + 1] : nRow;
+            if (tGlobal >= lo && tGlobal < hi) { seq = e; break; }
+        }
+        winRow = convInOff[seq] + (tGlobal - seqOff[seq]);
+    }
+    __syncthreads();
+    const int wr = winRow;
+
+    const int srcHeadKV = h % srcHeadsKV;           // GQA repeat for q/k
+    const int cq = srcHeadKV * S + s;               // q channel
+    const int ck = keyDim + srcHeadKV * S + s;      // k channel
+    const int cv = 2 * keyDim + h * S + s;          // v channel (no repeat)
+
+    // inline causal conv1d + SiLU for the three channels (byte-identical math).
+    float aq = 0.0f, ak = 0.0f, av = 0.0f;
+    for (int kk = 0; kk < K; ++kk) {
+        const size_t inRow = (size_t)(wr + kk) * channels;
+        aq += convInput[inRow + cq] * kern[(size_t)cq * K + kk];
+        ak += convInput[inRow + ck] * kern[(size_t)ck * K + kk];
+        av += convInput[inRow + cv] * kern[(size_t)cv * K + kk];
+    }
+    const float xq = aq / (1.0f + expf(-aq));       // SiLU
+    const float xk = ak / (1.0f + expf(-ak));
+    const float xv = av / (1.0f + expf(-av));
+
+    smem[s]     = xq * xq;
+    smem[S + s] = xk * xk;
+    __syncthreads();
+    for (int off = S >> 1; off > 0; off >>= 1) {
+        if (s < off) {
+            smem[s]     += smem[s + off];
+            smem[S + s] += smem[S + s + off];
+        }
+        __syncthreads();
+    }
+    const float qScale = 1.0f / fmaxf(sqrtf(smem[0]), eps);
+    const float kScale = 1.0f / fmaxf(sqrtf(smem[S]), eps);
+
+    const size_t dstRow = (size_t)rowIdx * S;
+    qOut[dstRow + s] = xq * qScale;
+    kOut[dstRow + s] = xk * kScale;
+    vOut[dstRow + s] = xv;
+}
+
 // 5.18.10.3 — batched row split: in[r, 0..wa) -> a[r], in[r, wa..wa+wb) -> b[r]
 // for all rows in ONE launch. Un-interleaves the output of a fused projection
 // GEMM ([row, wa+wb]) back into the two compact consumer buffers, so every

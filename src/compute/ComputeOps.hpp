@@ -377,6 +377,23 @@ public:
             "causalConv1dSiluBatchedAsync: not supported on this backend");
     }
 
+    /// 5.18.21.6: fused conv1d-silu + post-conv prep (q/k/v gather + q/k L2-norm)
+    /// in one launch, skipping the qkvMixed round-trip between conv.k and split.
+    virtual void gdnConvSplitFuseAsync(
+            const float* convInput, const float* kernel,
+            const std::int32_t* seqOff, const std::int32_t* convInOff,
+            float* qOut, float* kOut, float* vOut,
+            std::size_t nRow, std::size_t nSeq, std::size_t srcHeadsKV,
+            std::size_t dstHeads, std::size_t S, std::size_t channels,
+            std::size_t keyDim, std::size_t kernelSize, float eps) {
+        (void)convInput; (void)kernel; (void)seqOff; (void)convInOff;
+        (void)qOut; (void)kOut; (void)vOut; (void)nRow; (void)nSeq;
+        (void)srcHeadsKV; (void)dstHeads; (void)S; (void)channels;
+        (void)keyDim; (void)kernelSize; (void)eps;
+        throw std::runtime_error(
+            "gdnConvSplitFuseAsync: not supported on this backend");
+    }
+
     /// 5.18.10.2: batched conv-input pack — builds every slot's
     /// [conv-tail (K-1 rows) | Tslot token rows] block in ONE launch,
     /// replacing the 2*nSeq tiny per-layer D2D copies (launch-bound at conc64).

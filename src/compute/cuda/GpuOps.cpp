@@ -308,6 +308,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _gdnConvSaveKernel;
     // 5.18.10.3: batched row split (fused-projection output un-interleave).
     core::cuda::CudaKernel _gdnRowSplit2Kernel;
+    // 5.18.21.6: fused conv1d-silu + post-conv prep (skips the qkvMixed round-trip).
+    core::cuda::CudaKernel _gdnConvSplitFuseKernel;
     core::cuda::CudaModule _gatedDeltaNetArModule;
     core::cuda::CudaKernel _gatedDeltaNetArKernel;
     // P2.b — 2-way row-split smem-staged prefill recurrence (opt-in).
@@ -660,6 +662,7 @@ struct GpuOps::Impl {
           _gdnConvPackKernel       {_ssmConv1dBatchedModule.getFunction("gdn_conv_pack_batched")},
           _gdnConvSaveKernel       {_ssmConv1dBatchedModule.getFunction("gdn_conv_save_batched")},
           _gdnRowSplit2Kernel      {_ssmConv1dBatchedModule.getFunction("gdn_row_split2")},
+          _gdnConvSplitFuseKernel  {_ssmConv1dBatchedModule.getFunction("gdn_conv_split_fuse")},
           _gatedDeltaNetArModule   {loadCudaModule(ctx, "gated_deltanet_ar")},
           _gatedDeltaNetArKernel   {
               _gatedDeltaNetArModule.getFunction("gated_deltanet_ar")},
@@ -1925,6 +1928,45 @@ void GpuOps::fusedPostConvPrepAsync(const float* qkvMixed, float* qOut,
     k.launch(_ctx.stream(),
              groupsForN(rows, kElementwiseLocalSize), 1, 1,
              kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::gdnConvSplitFuseAsync(const float* convInput, const float* kernel,
+                                   const std::int32_t* seqOff,
+                                   const std::int32_t* convInOff,
+                                   float* qOut, float* kOut, float* vOut,
+                                   std::size_t nRow, std::size_t nSeq,
+                                   std::size_t srcHeadsKV, std::size_t dstHeads,
+                                   std::size_t S, std::size_t channels,
+                                   std::size_t keyDim, std::size_t kernelSize,
+                                   float eps) {
+    const std::size_t rows = nRow * dstHeads;
+    if (rows == 0 || S == 0) {
+        return;
+    }
+    // 5.18.21.6: fused conv1d-silu + post-conv prep. One block per (t_global,head),
+    // blockDim.x == S. Requires S <= 1024 (block cap); caller falls back to the
+    // conv.k + split two-kernel path otherwise.
+    auto& k = _pimpl->_gdnConvSplitFuseKernel;
+    k.setPtr  (0, convInput);
+    k.setPtr  (1, kernel);
+    k.setPtr  (2, seqOff);
+    k.setPtr  (3, convInOff);
+    k.setPtr  (4, qOut);
+    k.setPtr  (5, kOut);
+    k.setPtr  (6, vOut);
+    k.setValue(7,  toInt32(nRow,       "gcsf nRow"));
+    k.setValue(8,  toInt32(nSeq,       "gcsf nSeq"));
+    k.setValue(9,  toInt32(srcHeadsKV, "gcsf srcHeadsKV"));
+    k.setValue(10, toInt32(dstHeads,   "gcsf dstHeads"));
+    k.setValue(11, toInt32(S,          "gcsf S"));
+    k.setValue(12, toInt32(channels,   "gcsf channels"));
+    k.setValue(13, toInt32(keyDim,     "gcsf keyDim"));
+    k.setValue(14, toInt32(kernelSize, "gcsf K"));
+    k.setValue(15, eps);
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(rows), 1, 1,
+             static_cast<std::uint32_t>(S), 1, 1,
+             2 * S * sizeof(float));
 }
 
 void GpuOps::causalConv1dSiluAsync(const float* convInput, const float* kernel,

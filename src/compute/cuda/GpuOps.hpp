@@ -191,6 +191,17 @@ public:
                                       const std::int32_t* seqT   = nullptr,
                                       const std::int32_t* inOff  = nullptr,
                                       const std::int32_t* outOff = nullptr) override;
+    // 5.18.21.6: fused conv1d-silu + post-conv prep (q/k/v gather + q/k L2-norm)
+    // in one launch — skips the qkvMixed round-trip between conv.k and split.
+    void gdnConvSplitFuseAsync(const float* convInput, const float* kernel,
+                               const std::int32_t* seqOff,
+                               const std::int32_t* convInOff,
+                               float* qOut, float* kOut, float* vOut,
+                               std::size_t nRow, std::size_t nSeq,
+                               std::size_t srcHeadsKV, std::size_t dstHeads,
+                               std::size_t S, std::size_t channels,
+                               std::size_t keyDim, std::size_t kernelSize,
+                               float eps) override;
     // 5.18.10.2: batched conv-input pack / conv-tail save (replace the
     // launch-bound per-slot D2D memcpy loops; pure copies, bit-identical).
     void gdnConvPackBatchedAsync(const float* convState, const float* qkvMixed,

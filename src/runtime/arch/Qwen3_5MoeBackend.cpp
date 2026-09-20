@@ -1971,13 +1971,21 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
             tokRun   += Tslot;
         }
     }
-    _ops.profileSection("gdn.conv.k");   // 5.21.12: conv1d-silu sub-split
-    _ops.causalConv1dSiluBatchedAsync(
-        convInput, static_cast<const float*>(convW.usmPtr), qkvMixed,
-        nSeq, ragged ? ctx.maxSeqT : 1, convDim, dConv,
-        ragged ? ctx.seqTDev : nullptr,
-        ragged ? ctx.convInOffDev : nullptr,
-        ragged ? ctx.seqOffDev : nullptr);
+    // 5.18.21.6: when the fused conv+split path is active, the conv1d-silu is
+    // computed on the fly inside the split kernel (no qkvMixed round-trip), so
+    // this standalone conv.k launch is skipped. Ragged + conv-batch-pack only
+    // (the fused kernel reads convInput via the ragged convInOff/seqOff layout).
+    const bool convSplitFused =
+        _gdnConvSplitFuse && ragged && _gdnConvBatchPack && S <= 1024;
+    if (!convSplitFused) {
+        _ops.profileSection("gdn.conv.k");   // 5.21.12: conv1d-silu sub-split
+        _ops.causalConv1dSiluBatchedAsync(
+            convInput, static_cast<const float*>(convW.usmPtr), qkvMixed,
+            nSeq, ragged ? ctx.maxSeqT : 1, convDim, dConv,
+            ragged ? ctx.seqTDev : nullptr,
+            ragged ? ctx.convInOffDev : nullptr,
+            ragged ? ctx.seqOffDev : nullptr);
+    }
     _ops.profileSection("gdn.conv.save");   // 5.21.12: state-tail save sub-split
     // Save each sequence's trailing stateRows rows as the next conv state (the
     // last stateRows of [state | Tslot tokens] start at row Tslot).
@@ -2009,7 +2017,14 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     // --- split conv into q/k/v (+ GQA repeat H_k -> H_v) + q/k L2-norm ---
     // GDN-Inc 2b: one fused launch (gather q/k/v + norm q/k) vs 3 gathers + 2 norms.
     _ops.profileSection("gdn.split");   // 5.21.12: gather+L2norm sub-split
-    if (_gdnPrepFuse) {
+    if (convSplitFused) {
+        // 5.18.21.6: fused conv1d-silu + gather + q/k L2-norm in one launch,
+        // reading convInput directly (skips the qkvMixed write+read).
+        _ops.gdnConvSplitFuseAsync(
+            convInput, static_cast<const float*>(convW.usmPtr),
+            ctx.seqOffDev, ctx.convInOffDev, qBuf, kBuf, vBuf,
+            nRow, nSeq, hK, hV, S, convDim, keyDim, dConv, eps);
+    } else if (_gdnPrepFuse) {
         _ops.fusedPostConvPrepAsync(qkvMixed, qBuf, kBuf, vBuf, nRow, hK, hV, S,
                                     convDim, keyDim, eps);
     } else {

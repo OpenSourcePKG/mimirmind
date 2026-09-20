@@ -358,6 +358,12 @@ protected:
     // with one batched pack + one batched save kernel. Pure copies =
     // bit-identical → DEFAULT ON; MIMIRMIND_GDN_CONV_BATCHPACK=0 disables (A/B).
     bool                                _gdnConvBatchPack{true};
+    // 5.18.21.6: fuse conv1d-silu (gdn.conv.k) + post-conv prep (gdn.split) into
+    // ONE launch, skipping the qkvMixed round-trip. Ragged serving prefill only,
+    // S<=1024; needs conv-batch-pack (ragged convInOff/seqOff layout). Tolerance-
+    // equal to the two-kernel path (same conv math + same warp L2 tree) →
+    // opt-in for A/B; MIMIRMIND_GDN_CONV_SPLIT_FUSE=1 enables.
+    bool                                _gdnConvSplitFuse{false};
     // M-Q3N.5: device-side MoE top-K (env MIMIRMIND_MOE_DEVICE_TOPK). When on
     // AND the fully-fused decode path applies, top-K runs on the device and
     // the host moeTopKRoute + host->USM copy are skipped (no per-layer host
