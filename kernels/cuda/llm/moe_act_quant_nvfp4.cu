@@ -198,13 +198,18 @@ void moe_silu_mul_quant_nvfp4_rows(
 // xPad tensor (and ~2/3 of the moe.prep traffic) disappears.
 extern "C" __global__ __launch_bounds__(ACT_QUANT_NVFP4_LOCAL)
 void moe_act_quant_nvfp4_gather_rows(
-    const float*         __restrict__ in,      // [nRows, K] COMPACT rows
+    const float*         __restrict__ in,      // [nRows, K] COMPACT rows (or ungathered
+                                               // source [*, K] when srcMap != nullptr)
           unsigned char* __restrict__ out,     // [maxPad, K/2] packed E2M1
           unsigned char* __restrict__ SFout,   // swizzled UE4M3 (pre-zeroed)
     const float                        gscale,
     const int*           __restrict__ rowMap,  // [nRows] padded row per real row
     const int                          nRows,
-    const int                          K)      // multiple of 16
+    const int                          K,       // multiple of 16
+    const int*           __restrict__ srcMap)  // 5.18.21: optional [nRows] src-token per
+                                               // logical row. nullptr => read `in` compact
+                                               // at `logical` (5.21.10); non-null => FUSED
+                                               // gather from ungathered `in` at srcMap[logical].
 {
     const int nBlocks = K / NVFP4_SF_VEC_SIZE;
     const int logical = blockIdx.x;
@@ -216,7 +221,10 @@ void moe_act_quant_nvfp4_gather_rows(
     const int numKTiles = (nBlocks + 3) / 4;
 
     const int k0 = blk * NVFP4_SF_VEC_SIZE;
-    const float* __restrict__ src = in + static_cast<long>(logical) * K + k0;
+    // 5.18.21: srcMap != nullptr fuses the gather — read the ungathered source at
+    // the logical row's source token; else read `in` compact at `logical`.
+    const int srcRow = (srcMap != nullptr) ? srcMap[logical] : logical;
+    const float* __restrict__ src = in + static_cast<long>(srcRow) * K + k0;
 
     float amax = 0.0f;
 #pragma unroll

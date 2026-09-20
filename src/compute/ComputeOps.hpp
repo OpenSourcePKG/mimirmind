@@ -852,9 +852,10 @@ public:
     virtual void moeActQuantNvfp4GatherRowsAsync(const float* in, unsigned char* outNib,
                                                  unsigned char* outSf, float gscale,
                                                  const std::int32_t* rowMap,
-                                                 std::size_t nRows, std::size_t K) {
+                                                 std::size_t nRows, std::size_t K,
+                                                 const std::int32_t* srcMap = nullptr) {
         (void)in; (void)outNib; (void)outSf; (void)gscale;
-        (void)rowMap; (void)nRows; (void)K;
+        (void)rowMap; (void)nRows; (void)K; (void)srcMap;
         throw std::runtime_error(
             "moeActQuantNvfp4GatherRowsAsync: not supported on this backend");
     }

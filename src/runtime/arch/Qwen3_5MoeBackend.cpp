@@ -1112,10 +1112,6 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         }
     }
 
-    // --- gather activations into per-expert-contiguous rows (both paths) ---
-    _ops.profileSection("rt.gather");
-    _ops.moeGatherRowsAsync(moeInput, rowSrcTok, xComp, d_model, R);
-
     // FP4-tensor-core grouped path: the routed experts are the NVFP4_TC format
     // (loader built the nibble + swizzled-SFB + globals banks) and CUTLASS is
     // linked. Type-driven, so it is the default whenever those banks exist.
@@ -1125,12 +1121,22 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     // 2026-08-04 A/B), default-on. When the TC sidecar banks are absent
     // (blocked-only =0 load) tcNibblePtr is null and decode falls through to
     // the device-driven blocked branch below — never the host-driven loop.
+    // (Computed before the gather so the TC path can skip the standalone gather.)
     const bool tcGrouped =
         (!preferBlocked || _moeGroupedDecodeTc) &&
         _ops.moeGroupedGemmNvfp4TcAvailable() &&
         gateExps.tcNibblePtr != nullptr &&
         upExps.tcNibblePtr   != nullptr &&
         downExps.tcNibblePtr != nullptr;
+
+    // --- gather activations into per-expert-contiguous rows ---
+    // 5.18.21: the TC path FUSES this gather into the act-quant (moe.prep reads
+    // the ungathered moeInput directly via rowSrcTok), so xComp is only built for
+    // the non-TC scalar (device-driven / host-driven) paths that consume it.
+    if (!tcGrouped) {
+        _ops.profileSection("rt.gather");
+        _ops.moeGatherRowsAsync(moeInput, rowSrcTok, xComp, d_model, R);
+    }
 
     const bool deviceDrivenGrouped =
         !tcGrouped && (_moeGroupedDeviceDriven || preferBlocked) &&
@@ -1194,8 +1200,12 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         // same quant math, same output layout). Padding rows keep the zeroed
         // SF (scale 0 -> act 0); their GEMM output is discarded.
         _ops.moeZeroBytesAsync(sfaBank, mo::swizzledBlockScaleBytes(maxPad, d_model / 16));
-        _ops.moeActQuantNvfp4GatherRowsAsync(xComp, aBank, sfaBank, 1.0F,
-                                             contigToPad, R, d_model);
+        // 5.18.21 FUSED gather+act-quant: read the ungathered moeInput directly at
+        // each logical row's source token (rowSrcTok) — skips the standalone
+        // rt.gather + the xComp [R, d_model] intermediate. Bit-identical (xComp[r]
+        // was exactly moeInput[rowSrcTok[r]]).
+        _ops.moeActQuantNvfp4GatherRowsAsync(moeInput, aBank, sfaBank, 1.0F,
+                                             contigToPad, R, d_model, rowSrcTok);
 
         // gate + up: N=n_ff_exp, K=d_model. alpha[e] = weight global (folds the
         // per-expert global back in; act gscale=1).
