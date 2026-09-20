@@ -3,6 +3,29 @@
 Post-deploy performance entries. Newest first. Box = Spark GB10 (xd-ki-pkg1),
 model qwen3.6-35B-A3B-NVFP4 unless noted.
 
+## 2026-09-21 — GDN conv+split fusion (5.18.21.6) — DEPLOYED, ~3% prefill
+
+**Change:** commit `2419978`. New `gdn_conv_split_fuse` kernel folds the standalone
+conv1d-silu (`gdn.conv.k`) into the warp post-conv-prep (`gdn.split`): each q/k/v read
+becomes an inline causal conv1d+SiLU reading `convInput` directly, so the `qkvMixed`
+intermediate never touches HBM and one launch is dropped. Same conv Σ-order + SiLU + the
+same shared-memory L2 tree as the two-kernel path → output matches baseline. Gated behind
+`MIMIRMIND_GDN_CONV_SPLIT_FUSE` (default OFF), ragged serving prefill + conv-batch-pack +
+S≤1024; falls back otherwise.
+
+**Deploy:** flag made durable in `prod_recreate.sh` (backup `prod_recreate.sh.pre-convsplit`);
+prod recreated, `MIMIRMIND_GDN_CONV_SPLIT_FUSE=1` live, PROD_OK.
+
+**A/B + prod validation (@~3.3-3.5k tok, full prod flags):**
+- Stage-pair: `gdn.conv.k` 6.16 + `gdn.split` 7.56 = **13.72 ms/chunk** (baseline) →
+  `gdn.conv.k` ABSENT + `gdn.split` 7.82 = **7.82 ms/chunk** (fused) = ~5.9 ms/chunk saved.
+- Prod warm prefill **0.542 ms/tok** vs 0.561 baseline = **~3% faster/token**.
+- Parity: coherence OK, Walter-Moers byte-identical head + no loop (both A/B phases + prod).
+
+**Rollback:** `MIMIRMIND_GDN_CONV_SPLIT_FUSE=0` (env) or restore `prod_recreate.sh.pre-convsplit`.
+Context: this is the one compute win of the 5.18.21 prefill campaign; the remaining ~3x vs
+vLLM is at the CUTLASS sm120 floor (MoE-GEMM) + distributed micro-inefficiency, not reachable.
+
 ## 2026-09-20 — FRESH vLLM prefill head-to-head (5.18.21.5) — 3.6x gap is REAL, NOT stale
 
 **Measurement:** prefill_h2h.sh, client-timed TTFT (max_tokens=1, temp=0, per-run nonce → no
