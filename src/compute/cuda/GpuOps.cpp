@@ -20,12 +20,15 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
-#include <unordered_map>
 #include <filesystem>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 
 namespace mimirmind::compute::cuda {
 
@@ -3077,6 +3080,24 @@ void GpuOps::moeGroupedGemmNvfp4TcBanksAsync(
     const float* globalsBank, void* dBank,
     void* scratch, std::size_t scratchBytes) {
 #ifdef MIMIRMIND_HAVE_CUTLASS_MOE
+    // 5.27.10 diagnostic (env MIMIRMIND_BANKS_DIAG): the FIRST process-wide call
+    // into the CUTLASS NVFP4-TC grouped GEMM lazily initializes it. If that
+    // first call lands on a serve worker thread that never ran cudaSetDevice,
+    // gemm.initialize() returns kErrorInternal and poisons the context (5.27.10).
+    // Log the calling thread + current CUDA device ONCE so smoke (main thread)
+    // vs serve (worker thread) can be compared, and to verify the warmup fix.
+    static std::atomic<bool> firstBanksCall{true};
+    if (std::getenv("MIMIRMIND_BANKS_DIAG") != nullptr &&
+        firstBanksCall.exchange(false)) {
+        int dev = -999;
+        const cudaError_t drc = cudaGetDevice(&dev);
+        std::ostringstream tid;
+        tid << std::this_thread::get_id();
+        MM_LOG_INFO("nvfp4-tc-banks",
+                    "first banks call: thread={} cudaGetDevice={} (getDeviceRc={}) "
+                    "nExperts={} N={} K={}",
+                    tid.str(), dev, static_cast<int>(drc), nExperts, N, K);
+    }
     // Scratch is caller-owned (per-slot BlockBuffers) — no shared GpuOps state,
     // so concurrent prefills never collide on it.
     const int rc = kernels::cutlassmoe::runGroupedNvfp4TcF32Banks(

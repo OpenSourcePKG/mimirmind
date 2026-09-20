@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "model_id": "qwen3.6",
+  "_note": "Per-(HW x model) overlay for qwen3.6 (Qwen3-Next 35B-A3B NVFP4) on GB10. Overrides the HW profile for this checkpoint; model wins over the HW profile, explicit env wins over both.",
+  "_note_thinking_sampling": "qwen3.6 is a thinking model. Its generation_config.json ships a generic do_sample temperature of 1.0, but the Qwen3 model card's REASONING preset is temp=0.6, top_p=0.95, top_k=20. The server's thinking floor reused the generic 1.0, which is too hot for a long reasoning chain on a 3B-ACTIVE MoE: the chain drifts and derails mid-thought (measured 2026-09-17: temp 1.0 thinking went off-topic into unrelated content; the answer was also truncated because reasoning ate the token budget). These flags pin the vendor's thinking preset so enable_thinking=true is coherent. Thinking stays default-OFF at the server; this only governs the sampling WHEN a request opts into thinking.",
+  "flags": {
+    "MIMIRMIND_THINKING_TEMP": {
+      "value": 0.6,
+      "apply": true,
+      "effect": "Thinking-phase temperature 0.6 (Qwen3 reasoning preset), overriding the generic generation_config 1.0 that derailed long reasoning chains on this 3B-active model."
+    },
+    "MIMIRMIND_THINKING_TOP_P": {
+      "value": 0.95,
+      "apply": true,
+      "effect": "Thinking-phase top_p 0.95 (Qwen3 reasoning preset)."
+    },
+    "MIMIRMIND_THINKING_TOP_K": {
+      "value": 20,
+      "apply": true,
+      "effect": "Thinking-phase top_k 20 (Qwen3 reasoning preset)."
+    }
+  }
+}

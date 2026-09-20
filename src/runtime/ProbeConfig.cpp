@@ -33,6 +33,12 @@ void parseFlagsBlock(const nlohmann::json& flags, ProbePicks& picks) {
         if (!it->value("apply", false)) return std::nullopt;
         return it->value("value", 0);
     };
+    const auto readFloatFlag = [&flags](const char* key) -> std::optional<float> {
+        const auto it = flags.find(key);
+        if (it == flags.end() || !it->is_object()) return std::nullopt;
+        if (!it->value("apply", false)) return std::nullopt;
+        return it->value("value", 0.0F);
+    };
     // Only overwrite when the flag is present-and-applied, so an overlay that
     // omits a key leaves the base value in place (see mergeOverlay).
     if (auto v = readFlag("MIMIRMIND_ATTN_CUDNN"))        picks.applyPrefillCudnn = v;
@@ -46,6 +52,12 @@ void parseFlagsBlock(const nlohmann::json& flags, ProbePicks& picks) {
     if (auto v = readIntFlag("MIMIRMIND_MOE_DECODE_REG")) picks.applyMoeDecodeReg = v;
     if (auto v = readIntFlag("MIMIRMIND_GROUPED_MOE"))    picks.applyGroupedMoe = v;
     if (auto v = readIntFlag("MIMIRMIND_PREFILL_CHUNK"))  picks.applyPrefillChunk = v;
+    if (auto v = readFloatFlag("MIMIRMIND_ANSWER_FLOOR_TEMP_CAP"))
+        picks.applyAnswerFloorTempCap = v;
+    if (auto v = readFloatFlag("MIMIRMIND_THINKING_TEMP"))  picks.applyThinkingTemp = v;
+    if (auto v = readFloatFlag("MIMIRMIND_THINKING_TOP_P")) picks.applyThinkingTopP = v;
+    if (auto v = readIntFlag("MIMIRMIND_THINKING_TOP_K"))   picks.applyThinkingTopK = v;
+    if (auto v = readFlag("MIMIRMIND_HONESTY_FLOOR"))       picks.applyHonestyFloor = v;
 }
 
 } // namespace
@@ -172,6 +184,12 @@ void mergeOverlay(ProbePicks& base, const ProbePicks& over) {
     if (over.applyGroupedMoe)       base.applyGroupedMoe       = over.applyGroupedMoe;
     if (over.applyPrefillChunk)     base.applyPrefillChunk     = over.applyPrefillChunk;
     if (over.applyGdnProjFuseBatch) base.applyGdnProjFuseBatch = over.applyGdnProjFuseBatch;
+    if (over.applyAnswerFloorTempCap)
+        base.applyAnswerFloorTempCap = over.applyAnswerFloorTempCap;
+    if (over.applyThinkingTemp) base.applyThinkingTemp = over.applyThinkingTemp;
+    if (over.applyThinkingTopP) base.applyThinkingTopP = over.applyThinkingTopP;
+    if (over.applyThinkingTopK) base.applyThinkingTopK = over.applyThinkingTopK;
+    if (over.applyHonestyFloor) base.applyHonestyFloor = over.applyHonestyFloor;
 }
 
 } // namespace mimirmind::runtime

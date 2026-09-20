@@ -56,6 +56,22 @@ struct ProbePicks {
     std::optional<int> applyGroupedMoe;
     std::optional<int> applyPrefillChunk;   // MIMIRMIND_PREFILL_CHUNK (tokens)
     std::optional<bool> applyGdnProjFuseBatch;  // MIMIRMIND_GDN_PROJ_FUSE_BATCH
+    // Answer-floor temperature-lift cap for this (machine, model). 0 = keep a
+    // greedy answer greedy (penalties carry loop-protection); >0 = re-enable the
+    // lift capped here for a checkpoint that loops under penalties alone. Lives in
+    // the per-model overlay (checkpoint-specific), applied to LlmConfig.
+    std::optional<float> applyAnswerFloorTempCap;  // LlmConfig.answerFloorTempCap
+    // Model-recommended THINKING sampling for this (machine, model): the vendor's
+    // reasoning preset (Qwen3: 0.6 / 0.95 / 20), which overrides the generic
+    // generation_config temperature in the thinking floor. Lives in the per-model
+    // overlay; applied to LlmConfig.thinkingTemp/TopP/TopK.
+    std::optional<float> applyThinkingTemp;  // LlmConfig.thinkingTemp
+    std::optional<float> applyThinkingTopP;  // LlmConfig.thinkingTopP
+    std::optional<int>   applyThinkingTopK;  // LlmConfig.thinkingTopK
+    // Honesty-floor toggle for this (machine, model). Default is OFF (see
+    // LlmConfig.honestyFloor); an overlay can re-enable it for a checkpoint that
+    // over-confabulates. Applied to LlmConfig.honestyFloor.
+    std::optional<bool>  applyHonestyFloor;  // LlmConfig.honestyFloor
 };
 
 /**

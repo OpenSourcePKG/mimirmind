@@ -87,6 +87,43 @@ struct LlmConfig {
     // the escape values are model-declared, not hardcoded per-arch in the server
     // (vLLM reads the same field). 0 = no recommendation => floor is a no-op.
     float         samplingTempDefault {0.0F};
+    // 5.x: CAP on the non-thinking answer-floor temperature lift. 0 = the lift is
+    // OFF (a greedy answer stays greedy — temp 0 — and the repetition/frequency
+    // penalties below carry loop-protection). This is per-(machine,model) config,
+    // NOT a server constant: on a small-active model (qwen3.6 3B-A) lifting a
+    // greedy tool-answer to temp>0 garbles the formatting, so its profile keeps
+    // this 0; a checkpoint that still loops under penalties can re-enable a hot
+    // cap (e.g. 0.7) via its HW-fingerprint model overlay. Ops override:
+    // MIMIRMIND_ANSWER_FLOOR_TEMP_CAP.
+    float         answerFloorTempCap {0.0F};
+
+    // 5.31: model-recommended THINKING sampling — distinct from the generic
+    // generation_config sampling above. A checkpoint's generation_config.json
+    // ships ONE do_sample temperature (qwen3.6: 1.0) that the vendor's model
+    // card OVERRIDES for reasoning (Qwen3 thinking preset: temp 0.6, top_p 0.95,
+    // top_k 20; explicitly NOT the generic 1.0). The thinking floor blindly
+    // reused samplingTempDefault=1.0, which is too hot for a small-active model's
+    // long reasoning chain -> the chain drifts and derails (measured: temp 1.0
+    // thinking runs go off-topic mid-chain on qwen3.6 3B-A). These carry the
+    // vendor's THINKING recommendation per-(machine,model) via the HW-fingerprint
+    // overlay, taking priority over generation_config in the thinking floor.
+    // 0 / 1.0 / 0 (unset) = fall back to samplingTempDefault/TopP/TopK, then to
+    // the generic anti-degeneration values in the handler. Ops override:
+    // MIMIRMIND_THINKING_TEMP / _TOP_P / _TOP_K.
+    float         thinkingTemp {0.0F};
+    float         thinkingTopP {1.0F};
+    std::uint32_t thinkingTopK {0};
+
+    // 8.19.11 -> 5.31: server-side HONESTY FLOOR (prepend a "hedge, don't
+    // confabulate" system prompt when a request ships NO system and NO tools).
+    // DEFAULT OFF: an oracle A/B (2026-09-17, qwen3.6 vs vLLM) showed it makes the
+    // model REFUSE long-tail knowledge questions that the un-floored vLLM answers
+    // at par — over-refusal is worse than the confabulation it was meant to curb,
+    // and grounded/agentic flows (which carry a system prompt or tools) never hit
+    // it anyway. Per-(machine,model) via the HW-fingerprint overlay, NOT a server
+    // env-default: a checkpoint that genuinely over-confabulates can re-enable it
+    // in its overlay. Ops override: MIMIRMIND_HONESTY_FLOOR (0/1) still wins.
+    bool          honestyFloor {false};
 
     // 5.x: server-side repetition-control defaults + anti-loop safety floor, moved
     // out of hardcoded constants in ChatCompletionHandler into per-model config so
@@ -95,7 +132,15 @@ struct LlmConfig {
     // default); repetitionPenaltyDefault is also populated from
     // generation_config.json (HF `repetition_penalty`) when present. penaltyWindow
     // is a token-count over recent history.
-    float         frequencyPenaltyDefault  {0.5F};
+    // 5.31: DEFAULT 0 (was 0.5). A per-token frequency penalty punishes RECURRING
+    // tokens — but a list/table answer legitimately repeats structure ("- ", "(",
+    // "Roman", years), so a 0.5 penalty made the model DRIFT off the clean list
+    // format, truncate early, and even fall into its OWN loop (A/B on the Pegenaut
+    // tool-answer path: freq 0.5 -> looping+short; freq ~0 -> full clean list).
+    // qwen3.6's generation_config ships NO frequency_penalty, and vLLM defaults it
+    // to 0 — so mimirmind was imposing an aggression the model never asked for. The
+    // repetition penalty below (1.10, exact-token) stays as the loop guard.
+    float         frequencyPenaltyDefault  {0.0F};
     float         repetitionPenaltyDefault {1.10F};
     // 5.x: WIDE default window (was 64). vLLM applies frequency_penalty over the
     // WHOLE output; a narrow window let a NEAR-repetition loop — recurring words
@@ -107,7 +152,11 @@ struct LlmConfig {
     // Applied only when the client disabled ALL penalties (leaving greedy with no
     // escape) — a wide window catches long-block / near-repetition loops.
     float         antiLoopRepetition {1.10F};
-    float         antiLoopFrequency  {0.50F};
+    // 5.31: DEFAULT 0 (was 0.50) — same reason as frequencyPenaltyDefault: the
+    // frequency penalty degrades structured/list answers. If a client disables all
+    // penalties, the safety floor now re-applies only the exact-token repetition
+    // penalty (1.10), not a frequency penalty.
+    float         antiLoopFrequency  {0.0F};
     std::uint32_t antiLoopWindow     {512U};
     // Explicit attention softmax scale (GGUF `<arch>.attention.scale`).
     // 0 = unset → attention uses the default 1/sqrt(head_dim). Qwen3-Next

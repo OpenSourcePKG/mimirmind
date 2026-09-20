@@ -372,6 +372,11 @@ ServingSession::generateBatch(
         throw std::runtime_error(
             "generateBatch: batched serving only supports qwen35moe");
     }
+    // 5.27 I-9a: a fresh batched run starts a new sequence per slot — clear any
+    // carried per-sequence forward context (qwen4_exp PLE n-gram rolling context)
+    // so a prior single-session/batched run cannot contaminate it. No-op for
+    // other archs.
+    qb->resetForwardContext();
     const std::size_t nSeq = prompts.size();
     if (nSeq == 0 || maxNew == 0) {
         throw std::runtime_error("generateBatch: empty request");
@@ -516,6 +521,12 @@ ServingSession::generateBatch(
             startPosH[s]    = static_cast<std::int32_t>(p);
             isSeqStart[s]   = (p == 0) ? 1U : 0U;
         }
+        // 5.27.11.2: per-slot PLE n-gram token feed (qwen4_exp). Each row is one
+        // token of an independent slot; isSeqStart resets that slot's rolling
+        // context. No-op for other archs.
+        qb->prepareForwardBatched(
+            std::span<const std::int32_t>{inputTok.data(), nSeq},
+            std::span<const std::uint8_t>{isSeqStart.data(), nSeq}, nSeq);
         _e._ops->uploadHostBytes(seqLensDev.get(),  seqLensH.data(),  nSeq * sizeof(std::int32_t));
         _e._ops->uploadHostBytes(startPosDev.get(), startPosH.data(), nSeq * sizeof(std::int32_t));
         arch::BatchedDecodeCtx ctx{};
@@ -636,11 +647,21 @@ ServingSession::generateBatch(
     auto argmaxDev = _e._ops->allocate(nSeq * sizeof(std::int32_t));
     std::vector<std::int32_t> toksHost(nSeq);
     auto lmHeadSample = [&]() -> std::vector<std::int32_t> {
-        _e._ops->rmsNormAsync(xBuf, nSeq, d_model,
-                              static_cast<const float*>(outNorm->usmPtr),
-                              _e._config.rmsNormEps, normBuf);
+        // 5.27 I-9a: for Hyper-Connections archs (qwen4_exp) the top-level mixer
+        // collapse REPLACES output_norm — collapse the 4 streams into xBuf and
+        // feed lm_head directly (skip the plain final RMSNorm). Mirrors the
+        // single-session useHc + sampleNext(skipFinalNorm=true).
+        const float* lmIn = normBuf;
+        if (qb->usesHyperConnections()) {
+            qb->collapseHyperStreams(nSeq, sb, xBuf);
+            lmIn = xBuf;
+        } else {
+            _e._ops->rmsNormAsync(xBuf, nSeq, d_model,
+                                  static_cast<const float*>(outNorm->usmPtr),
+                                  _e._config.rmsNormEps, normBuf);
+        }
         _e._gmm->matmul(lmHead->type, lmHead->usmPtr, vocab_lm, d_model,
-                        normBuf, nSeq, logits, lmScr.as<float>());
+                        lmIn, nSeq, logits, lmScr.as<float>());
         _e._ops->argmaxRowsAsync(logits, argmaxDev.as<std::int32_t>(),
                                  nSeq, vocab_lm);
         _e._ops->flush();
@@ -1200,16 +1221,28 @@ void ServingSession::stepServing(
     ctx.kwSlot          = st.kwBuf.as<float>();
     ctx.isSeqStart      = st.isSeqStart.data();
 
+    // 5.27.11.2: per-slot PLE n-gram token feed (qwen4_exp). No-op for other archs.
+    st.qb->prepareForwardBatched(
+        std::span<const std::int32_t>{st.inputTok.data(), nSeq},
+        std::span<const std::uint8_t>{st.isSeqStart.data(), nSeq}, nSeq);
     for (std::size_t b = 0; b < st.blockCount; ++b) {
         st.qb->runBlockBatched(b, xBuf, ctx, *st.sb);
     }
 
     _e._ops->profileSection("lmhead");
-    _e._ops->rmsNormAsync(xBuf, nSeq, st.d_model,
-                          static_cast<const float*>(st.outNorm->usmPtr),
-                          _e._config.rmsNormEps, normBuf);
+    // 5.27.11.2: HC archs (qwen4_exp) collapse the streams (mixer replaces
+    // output_norm) into xBuf and feed lm_head directly; others rms-norm as before.
+    const float* lmIn = normBuf;
+    if (st.qb->usesHyperConnections()) {
+        st.qb->collapseHyperStreams(nSeq, *st.sb, xBuf);
+        lmIn = xBuf;
+    } else {
+        _e._ops->rmsNormAsync(xBuf, nSeq, st.d_model,
+                              static_cast<const float*>(st.outNorm->usmPtr),
+                              _e._config.rmsNormEps, normBuf);
+    }
     _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, st.d_model,
-                    normBuf, nSeq, logits, st.lmScr.as<float>());
+                    lmIn, nSeq, logits, st.lmScr.as<float>());
     _e._ops->profileStepEnd();
 
     // 8.19.5: the GPU-argmax fast path is a plain argmax — take it only when
@@ -1613,6 +1646,9 @@ std::int32_t ServingSession::prefillSlot(
                          st.vocab_emb,
                          std::span<const std::int32_t>{st.prefillTokH.data(), T},
                          xBuf);
+    // 5.27.11.2: per-slot PLE n-gram context for this prefill chunk (qwen4_exp);
+    // startPos==0 is the request's sequence start. No-op for other archs.
+    st.qb->prepareForwardSlot(slot, tokens, /*seqStart=*/startPos == 0);
 
     // One T>1 forward reusing the single-session block path. runBlock reads
     // cache.length() == startPos for the causal boundary / KV write offset and
@@ -1641,11 +1677,19 @@ std::int32_t ServingSession::prefillSlot(
         // promptLen-1 (isGen). Intermediate chunks skip this.
         float* const normBuf = st.normB.as<float>();
         float* const logits  = st.logitsB.as<float>();
-        _e._ops->rmsNormAsync(xBuf + (T - 1) * d_model, 1, d_model,
-                              static_cast<const float*>(st.outNorm->usmPtr),
-                              _e._config.rmsNormEps, normBuf);
+        // 5.27.11.2: HC archs (qwen4_exp) collapse the T-row streams (mixer
+        // replaces output_norm) and take the last prompt row; others rms-norm it.
+        const float* lmIn = normBuf;
+        if (st.qb->usesHyperConnections()) {
+            st.qb->collapseHyperStreams(T, sb, xBuf);
+            lmIn = xBuf + (T - 1) * d_model;
+        } else {
+            _e._ops->rmsNormAsync(xBuf + (T - 1) * d_model, 1, d_model,
+                                  static_cast<const float*>(st.outNorm->usmPtr),
+                                  _e._config.rmsNormEps, normBuf);
+        }
         _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, d_model,
-                        normBuf, 1, logits, st.lmScr.as<float>());
+                        lmIn, 1, logits, st.lmScr.as<float>());
         _e._ops->flush();
         _e._ops->readbackToHost(st.hostLogits.data(), logits,
                                 st.vocab_lm * sizeof(float));

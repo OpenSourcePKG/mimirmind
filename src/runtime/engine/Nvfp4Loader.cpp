@@ -115,11 +115,6 @@ compute::ComputeBuffer bigBlockAlloc(core::cuda::CudaComputeContext& ctx,
         ptr = raw;
         std::lock_guard<std::mutex> g(pool.mtx);
         pool.chunks.push_back(std::move(chunk));
-        static const bool kDiag = std::getenv("MIMIRMIND_Q4E_DIAG") != nullptr;
-        if (kDiag) {
-            MM_LOG_INFO("q4ediag", "pool: new chunk #{} (free={} bytes req={})",
-                        pool.chunks.size(), pool.freeBlocks.size(), bytes);
-        }
     }
     // Non-owning view; the "deleter" returns the block to the pool.
     return compute::ComputeBuffer{
@@ -932,10 +927,6 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                 || n.ends_with(".ffn_up_exps.weight")
                 || n.ends_with(".ffn_down_exps.weight");
         };
-        if (std::getenv("MIMIRMIND_Q4E_DIAG") != nullptr) {
-            MM_LOG_INFO("q4ediag", "reached MoE materialization (moeMode={}); "
-                        "BF16 re-group phase complete", moeMode);
-        }
         if (moeMode == "nvfp4" && e._nvfp4Model) {
             // Routed experts, three modes (MIMIRMIND_GROUPED_MOE):
             //   default = "additive": blocked-NVFP4 bank (decode) + FP4-TC side
@@ -997,18 +988,6 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                 const int nExp = static_cast<int>(step.sources.size());
                 const std::uint64_t tcN = step.sources.empty() ? 0 : step.sources.front().rows;
                 const std::uint64_t tcK = step.sources.empty() ? 0 : step.sources.front().in;
-
-                // 5.27 I-2 DIAG (MIMIRMIND_Q4E_DIAG): log every expert step +
-                // sync so a materialization-kernel OOB throws AT the culprit
-                // (with CUDA_LAUNCH_BLOCKING the async launch is already sync,
-                // this pins the tensor name). Temporary; remove after the fix.
-                static const bool kQ4eDiag = std::getenv("MIMIRMIND_Q4E_DIAG") != nullptr;
-                if (kQ4eDiag) {
-                    MM_LOG_INFO("q4ediag",
-                        "expert step gguf={} nExp={} tcN={} tcK={} elems={} path={}",
-                        step.ggufName, nExp, tcN, tcK, it->elems,
-                        (tcOnly && nExp > 0 && tcK % 32 == 0) ? "tcOnly" : "blocked");
-                }
 
                 if (tcOnly && nExp > 0 && tcK % 32 == 0) {
                     // --- FP4-TC-only banks (nibbles = the tensor buffer) -------
@@ -1103,32 +1082,6 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                         const float global = devOps.readF32(gs->devPtr);
                         const std::size_t byteOff =
                             (static_cast<std::size_t>(src.dstElemOffset) / 32) * 20;
-                        if (kQ4eDiag) {
-                            const auto srcIdx = static_cast<int>(
-                                src.dstElemOffset
-                                / (static_cast<std::uint64_t>(src.rows) * src.in));
-                            static const bool kQ4eDiagV2 =
-                                [] { const char* v = std::getenv("MIMIRMIND_Q4E_DIAG");
-                                     return v != nullptr && v[0] == char(50); }();
-                            if (kQ4eDiagV2 || (srcIdx % 32) == 0) {
-                                cudaCtx.stream().synchronize();
-                                // Liveness probes: a D2H read faults HERE if the
-                                // source buffer was freed (use-after-free) or the
-                                // mapping is gone; passing probes + a faulting
-                                // repack instead point at the kernel/driver.
-                                (void)devOps.readF32(pk->devPtr);
-                                (void)devOps.readF32(
-                                    static_cast<const std::uint8_t*>(pk->devPtr)
-                                    + pk->nbytes - 4);
-                                (void)devOps.readF32(bs->devPtr);
-                                MM_LOG_INFO("q4ediag",
-                                    "  src e={} byteOff={} rows={} in={} pk={} bs={} gs={} sync-ok",
-                                    srcIdx, byteOff, src.rows, src.in,
-                                    static_cast<const void*>(pk->devPtr),
-                                    static_cast<const void*>(bs->devPtr),
-                                    static_cast<const void*>(gs->devPtr));
-                            }
-                        }
                         devOps.repackageNvfp4ToBlk(bankBytes + byteOff, pk->devPtr,
                                                    bs->devPtr, global, src.rows, src.in);
                         if (tcAdd) {

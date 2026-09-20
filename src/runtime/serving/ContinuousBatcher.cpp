@@ -92,6 +92,15 @@ ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
     if (const char* pg = std::getenv("MIMIRMIND_MIXED_STEP_PRESSURE")) {
         _mixedStepPressureGate = (pg[0] == '1' && pg[1] == '\0');
     }
+    // 5.27.11.2: qwen4_exp — force single-slot prefill (no ragged runVarlenPrefill)
+    // and no mixed prefill+decode step. The PLE dilated conv is only per-row-
+    // correct in the pure single-slot prefill (single-session runBlock, T=prompt)
+    // and pure batched-decode (T=1 per slot) paths; a ragged varlen prefill would
+    // need a batched ragged PLE n-gram (deferred). Small prefill-throughput cost.
+    if (_engine.config().architecture == "qwen4_exp") {
+        _mixedBatchPrefill = false;
+        _mixedStep         = false;
+    }
     // 5.28.1.4 — GDN warm-slot session affinity: DEFAULT ON for SSM/GatedDeltaNet
     // backends. Both default-on gates passed on GB10/qwen3.6 (2026-09-13):
     // hit-rate (51-92% TTFT drop on shared prefixes, ~100% hit, no contamination)

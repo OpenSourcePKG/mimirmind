@@ -43,25 +43,6 @@ const core::gguf::GgufTensor& requireTopT(const core::gguf::WeightsMap& w,
     return *t;
 }
 
-// I-6 diagnostic (MIMIRMIND_Q4E_DIAG): readback + log L2/max/nan of a device
-// buffer to localise where the qwen4_exp forward diverges. Temporary.
-void dumpNorm(compute::ComputeOps& ops, compute::ComputeMatmul& gmm,
-              const char* tag, const float* dev, std::size_t n) {
-    static const bool diag = std::getenv("MIMIRMIND_Q4E_DIAG") != nullptr;
-    if (!diag || dev == nullptr || n == 0) return;
-    gmm.sync();
-    std::vector<float> h(n);
-    ops.readbackToHost(h.data(), dev, n * sizeof(float));
-    double ss = 0.0; float mx = 0.0F; std::size_t bad = 0;
-    for (float v : h) {
-        ss += static_cast<double>(v) * v;
-        if (std::fabs(v) > mx) mx = std::fabs(v);
-        if (std::isnan(v) || std::isinf(v)) ++bad;
-    }
-    MM_LOG_INFO("q4ediag", "{} l2={:.4g} max={:.4g} nan/inf={}", tag,
-                std::sqrt(ss), mx, bad);
-}
-
 // --- I-4 PLE n-gram hashing (host; verified in tools/microbench/q4e_ngram_*) --
 bool isPrime(std::int64_t v) {
     if (v < 2) return false;
@@ -195,26 +176,16 @@ void Qwen4ExpBackend::blockInputNorm(std::size_t blockIdx, const float* x,
     const std::string prefix =
         isAttn ? "attn_hyper_connection." : "mlp_hyper_connection.";
     hcGatedResidual(blockIdx, T, normWeight, prefix, /*combine=*/true, s, normBuf);
-
-    if (blockIdx == 0) {
-        dumpNorm(_ops, _gmm, "blk0 stream-in", _hcStreams.as<float>(), T * hc * d);
-        dumpNorm(_ops, _gmm, isAttn ? "blk0 attn-mixed" : "blk0 mlp-mixed",
-                 normBuf, T * d);
-    }
 }
 
-void Qwen4ExpBackend::blockResidualAdd(std::size_t blockIdx, float* /*x*/,
+void Qwen4ExpBackend::blockResidualAdd(std::size_t /*blockIdx*/, float* /*x*/,
                                        const float* moduleOut, std::size_t T,
-                                       BlockBuffers& /*s*/, bool isAttn) {
+                                       BlockBuffers& /*s*/, bool /*isAttn*/) {
     const std::size_t d  = _config.embeddingLength;
     const std::size_t hc = _config.hcCount;
     // Scatter the module output into every stream: H_g += inj_g * out.
     _ops.hcInjectScatterAsync(_hcStreams.as<float>(), moduleOut,
                               _hcInj.as<float>(), T, hc, d);
-    if (!isAttn) {  // end of the block — trajectory of the stream-state norm.
-        dumpNorm(_ops, _gmm, ("blk" + std::to_string(blockIdx) + " out").c_str(),
-                 _hcStreams.as<float>(), T * hc * d);
-    }
 }
 
 void Qwen4ExpBackend::setPleTable(nvfp4::PleNgramTable&& table, int pleGgufLayer,
@@ -245,12 +216,68 @@ void Qwen4ExpBackend::setPleTable(nvfp4::PleNgramTable&& table, int pleGgufLayer
 
 void Qwen4ExpBackend::prepareForward(std::span<const std::int32_t> tokIds,
                                      const float* /*hiddenStates*/, std::size_t T) {
+    _pleBatchedNSeq = 0;   // single-sequence PLE path
+    _pleSlotStore   = -1;  // no per-slot store-back
     _pleTokens.assign(tokIds.begin(), tokIds.end());
     // Prefill (T>1) starts a new sequence → reset the rolling n-gram context to
     // EOS (matches the reference's initial eos-pad). Decode (T=1) carries it.
     if (T > 1) {
         _pleCtx = {static_cast<std::int32_t>(_pleEos), static_cast<std::int32_t>(_pleEos)};
     }
+}
+
+void Qwen4ExpBackend::resetForwardContext() {
+    // Sequence start: the rolling 2-token n-gram context starts as the
+    // reference's initial eos-pad (mirrors setPleTable / prepareForward T>1).
+    _pleCtx = {static_cast<std::int32_t>(_pleEos),
+               static_cast<std::int32_t>(_pleEos)};
+    _pleCtxInit = true;
+    _pleBatchedNSeq = 0;
+    for (auto& c : _pleCtxSlot) {
+        c = {static_cast<std::int32_t>(_pleEos),
+             static_cast<std::int32_t>(_pleEos)};
+    }
+}
+
+// I-9b: per-slot batched PLE context. One token per active slot this step; slots
+// flagged isSeqStart reset their own rolling n-gram context to the eos-pad.
+void Qwen4ExpBackend::prepareForwardBatched(std::span<const std::int32_t> tokIds,
+                                            std::span<const std::uint8_t> isSeqStart,
+                                            std::size_t nSeq) {
+    _pleBatchedNSeq = nSeq;
+    _pleSlotStore   = -1;
+    _pleTokens.assign(tokIds.begin(),
+                      tokIds.begin() + static_cast<std::ptrdiff_t>(nSeq));
+    if (_pleCtxSlot.size() < nSeq) {
+        _pleCtxSlot.resize(nSeq, {static_cast<std::int32_t>(_pleEos),
+                                  static_cast<std::int32_t>(_pleEos)});
+    }
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        if (!isSeqStart.empty() && isSeqStart[s] != 0) {
+            _pleCtxSlot[s] = {static_cast<std::int32_t>(_pleEos),
+                              static_cast<std::int32_t>(_pleEos)};
+        }
+    }
+}
+
+// I-9b: single-slot prefill. Prefill goes through the single-session runBlock, so
+// pleForward uses the single-session n-gram path over _pleCtx; load the slot's
+// own rolling context here and mark it for store-back after the roll.
+void Qwen4ExpBackend::prepareForwardSlot(std::size_t slot,
+                                         std::span<const std::int32_t> tokens,
+                                         bool seqStart) {
+    _pleBatchedNSeq = 0;
+    _pleTokens.assign(tokens.begin(), tokens.end());
+    if (_pleCtxSlot.size() <= slot) {
+        _pleCtxSlot.resize(slot + 1, {static_cast<std::int32_t>(_pleEos),
+                                      static_cast<std::int32_t>(_pleEos)});
+    }
+    if (seqStart) {
+        _pleCtxSlot[slot] = {static_cast<std::int32_t>(_pleEos),
+                             static_cast<std::int32_t>(_pleEos)};
+    }
+    _pleCtx       = _pleCtxSlot[slot];
+    _pleSlotStore = static_cast<std::ptrdiff_t>(slot);
 }
 
 void Qwen4ExpBackend::blockEnter(std::size_t blockIdx, float* /*x*/, std::size_t T,
@@ -298,6 +325,45 @@ void Qwen4ExpBackend::computeNgramIds(std::size_t T,
             outIds[t * nh + j] = full[static_cast<std::size_t>(Lh - T + t) * nh + j];
 }
 
+// I-9b: batched n-gram ids — each of the nSeq rows is one token of an independent
+// slot, hashed against that slot's own rolling 2-token context (_pleCtxSlot). The
+// per-slot [ctx0, ctx1, token] history + last-position extraction matches the
+// single-session decode (T=1) result exactly, so conc=1 == single-session.
+void Qwen4ExpBackend::computeNgramIdsBatched(
+        std::size_t nSeq, std::vector<std::int64_t>& outIds) const {
+    const int          nh  = _pleNgramHeads;
+    const std::int32_t eos = static_cast<std::int32_t>(_pleEos);
+    outIds.resize(nSeq * static_cast<std::size_t>(nh));
+    for (std::size_t s = 0; s < nSeq; ++s) {
+        const std::vector<std::int32_t> hist = {
+            _pleCtxSlot[s][0], _pleCtxSlot[s][1], _pleTokens[s]};
+        std::vector<std::int32_t> shiftedLast(static_cast<std::size_t>(_pleNgramSize));
+        for (int sh = 0; sh < _pleNgramSize; ++sh) {
+            const auto sv = shiftRightIgnoreEos(hist, sh, eos);
+            shiftedLast[static_cast<std::size_t>(sh)] = sv.back();
+        }
+        for (int ngram = 2; ngram <= _pleNgramSize; ++ngram) {
+            const int start = (ngram - 2) * _pleHeadsPerNgram;
+            std::uint64_t mixed = static_cast<std::uint64_t>(shiftedLast[0])
+                                * static_cast<std::uint64_t>(_pleMult[0]);
+            for (int pos = 1; pos < ngram; ++pos)
+                mixed ^= static_cast<std::uint64_t>(
+                             shiftedLast[static_cast<std::size_t>(pos)])
+                       * static_cast<std::uint64_t>(
+                             _pleMult[static_cast<std::size_t>(pos)]);
+            const std::int64_t m = static_cast<std::int64_t>(mixed);
+            for (int j = 0; j < _pleHeadsPerNgram; ++j) {
+                const std::int64_t hv =
+                    _pleHeadVocab[static_cast<std::size_t>(start + j)];
+                const std::int64_t r = ((m % hv) + hv) % hv;
+                outIds[s * static_cast<std::size_t>(nh)
+                       + static_cast<std::size_t>(start + j)]
+                    = r + _pleHeadOff[static_cast<std::size_t>(start + j)];
+            }
+        }
+    }
+}
+
 void Qwen4ExpBackend::growPleScratch(std::size_t T) {
     if (T <= _pleCapT) return;
     const std::size_t d = _config.embeddingLength;
@@ -330,7 +396,11 @@ void Qwen4ExpBackend::pleForward(std::size_t T, BlockBuffers& s) {
     const std::size_t stateLen = (K - 1) * dilation;
 
     // 1. host: n-gram ids -> gather+dequant [T, embDim] F32 -> device.
-    computeNgramIds(T, _pleIdsHost);
+    if (_pleBatchedNSeq > 0) {
+        computeNgramIdsBatched(T, _pleIdsHost);   // T == nSeq (one row per slot)
+    } else {
+        computeNgramIds(T, _pleIdsHost);
+    }
     _pleTable.gatherDequantF32(_pleIdsHost, _pleEmbHost.data());
     _ops.uploadHostBytes(_pleEmb.get(), _pleEmbHost.data(), T * embDim * sizeof(float));
 
@@ -361,26 +431,50 @@ void Qwen4ExpBackend::pleForward(std::size_t T, BlockBuffers& s) {
     _ops.hcGroupedRmsNormAsync(_pleGated.as<float>(),
                                static_cast<const float*>(ncW.usmPtr),
                                _pleGvn.as<float>(), T, hc, d, eps);
-    _ops.pleConvSiluAsync(_pleGvn.as<float>(), /*state=*/nullptr,
-                          static_cast<const float*>(cW.usmPtr),
-                          _pleConvOut.as<float>(), T, hcd, K, dilation, stateLen);
-
-    dumpNorm(_ops, _gmm, "ple emb", emb, T * embDim);
-    dumpNorm(_ops, _gmm, "ple gated", _pleGated.as<float>(), T * hcd);
-    dumpNorm(_ops, _gmm, "ple conv", _pleConvOut.as<float>(), T * hcd);
+    // 5.27.11.2: the dilated (dilation=ngramSize) causal conv1d convolves along
+    // the T dimension. In SINGLE-SESSION T is one sequence's tokens (correct
+    // temporal conv). In BATCHED DECODE the T=nSeq rows are INDEPENDENT slots
+    // (one token each), so a temporal conv would reach across slots — with
+    // dilation=3 a row at position p pulls the slot at p-3, mixing slots at
+    // nSeq>=4 (localized via per-row diag: rows identical through blk0, diverge
+    // at the PLE conv). Run the conv PER ROW as an independent T=1 sequence
+    // (zero state), matching the single-session decode step. Prefill still goes
+    // through the single-session runBlock path (T=prompt), unaffected.
+    if (_pleBatchedNSeq > 0) {
+        for (std::size_t r = 0; r < _pleBatchedNSeq; ++r) {
+            _ops.pleConvSiluAsync(_pleGvn.as<float>() + r * hcd, /*state=*/nullptr,
+                                  static_cast<const float*>(cW.usmPtr),
+                                  _pleConvOut.as<float>() + r * hcd,
+                                  /*T=*/1, hcd, K, dilation, stateLen);
+        }
+    } else {
+        _ops.pleConvSiluAsync(_pleGvn.as<float>(), /*state=*/nullptr,
+                              static_cast<const float*>(cW.usmPtr),
+                              _pleConvOut.as<float>(), T, hcd, K, dilation, stateLen);
+    }
 
     // 4. streams += gated + conv.
     _ops.addResidualAsync(streams, _pleGated.as<float>(), T * hcd);
     _ops.addResidualAsync(streams, _pleConvOut.as<float>(), T * hcd);
-    dumpNorm(_ops, _gmm, "ple streams-after", streams, T * hcd);
 
-    // 5. roll the 2-token n-gram context forward.
-    if (T >= 2) {
+    // 5. roll the n-gram context forward (per-slot in batched mode).
+    if (_pleBatchedNSeq > 0) {
+        for (std::size_t s = 0; s < _pleBatchedNSeq && s < _pleCtxSlot.size(); ++s) {
+            _pleCtxSlot[s][0] = _pleCtxSlot[s][1];
+            _pleCtxSlot[s][1] = _pleTokens[s];
+        }
+    } else if (T >= 2) {
         _pleCtx[0] = _pleTokens[T - 2];
         _pleCtx[1] = _pleTokens[T - 1];
     } else if (T == 1) {
         _pleCtx[0] = _pleCtx[1];
         _pleCtx[1] = _pleTokens[0];
+    }
+    // I-9b: single-slot prefill — persist the rolled context back to the slot so
+    // the next chunk of the same request continues its n-gram history.
+    if (_pleBatchedNSeq == 0 && _pleSlotStore >= 0 &&
+        static_cast<std::size_t>(_pleSlotStore) < _pleCtxSlot.size()) {
+        _pleCtxSlot[static_cast<std::size_t>(_pleSlotStore)] = _pleCtx;
     }
 }
 
@@ -392,7 +486,6 @@ void Qwen4ExpBackend::collapseHyperStreams(std::size_t T, BlockBuffers& s,
     hcGatedResidual(kMixerBlock, T,
                     static_cast<const float*>(mixerNorm.usmPtr),
                     "hyper_connection_mixer.", /*combine=*/false, s, out);
-    dumpNorm(_ops, _gmm, "mixer out (pre-lmhead)", out, T * _config.embeddingLength);
 }
 
 } // namespace mimirmind::runtime::arch

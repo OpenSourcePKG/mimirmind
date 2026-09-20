@@ -915,6 +915,52 @@ void InferenceEngine::finalizeLoad() {
                 MM_LOG_INFO("probe", "  profile applied: GDN proj fuse (batch) -> {}",
                             *picks->applyGdnProjFuseBatch ? "on" : "off");
             }
+            // Answer-floor temperature-lift cap (model overlay). Applied to the
+            // per-model LlmConfig — NOT a process env — so co-resident models each
+            // keep their own value; explicit MIMIRMIND_ANSWER_FLOOR_TEMP_CAP still
+            // wins (read per-request in the ChatCompletionHandler answer floor).
+            if (picks->applyAnswerFloorTempCap &&
+                std::getenv("MIMIRMIND_ANSWER_FLOOR_TEMP_CAP") == nullptr) {
+                _config.answerFloorTempCap = *picks->applyAnswerFloorTempCap;
+                MM_LOG_INFO("probe",
+                            "  profile applied: answer-floor temp cap -> {}",
+                            _config.answerFloorTempCap);
+            }
+            // Model THINKING sampling (overlay): the vendor's reasoning preset,
+            // overriding the generic generation_config temperature in the thinking
+            // floor (qwen3.6 ships do_sample temp=1.0, too hot for a long reasoning
+            // chain on a 3B-active model -> derails; card recommends 0.6). Per-model
+            // LlmConfig, not a process env; explicit MIMIRMIND_THINKING_* still wins.
+            if (picks->applyThinkingTemp &&
+                std::getenv("MIMIRMIND_THINKING_TEMP") == nullptr) {
+                _config.thinkingTemp = *picks->applyThinkingTemp;
+            }
+            if (picks->applyThinkingTopP &&
+                std::getenv("MIMIRMIND_THINKING_TOP_P") == nullptr) {
+                _config.thinkingTopP = *picks->applyThinkingTopP;
+            }
+            if (picks->applyThinkingTopK &&
+                std::getenv("MIMIRMIND_THINKING_TOP_K") == nullptr) {
+                _config.thinkingTopK =
+                    static_cast<std::uint32_t>(*picks->applyThinkingTopK);
+            }
+            if (picks->applyThinkingTemp || picks->applyThinkingTopP ||
+                picks->applyThinkingTopK) {
+                MM_LOG_INFO("probe",
+                            "  profile applied: thinking sampling -> temp={} "
+                            "top_p={} top_k={}",
+                            _config.thinkingTemp, _config.thinkingTopP,
+                            _config.thinkingTopK);
+            }
+            // Honesty floor (model overlay). Default is OFF in LlmConfig; an
+            // overlay can re-enable it per checkpoint. Per-model LlmConfig, not a
+            // process env; explicit MIMIRMIND_HONESTY_FLOOR still wins per-request.
+            if (picks->applyHonestyFloor &&
+                std::getenv("MIMIRMIND_HONESTY_FLOOR") == nullptr) {
+                _config.honestyFloor = *picks->applyHonestyFloor;
+                MM_LOG_INFO("probe", "  profile applied: honesty floor -> {}",
+                            _config.honestyFloor ? "on" : "off");
+            }
         }
     }
 
@@ -1081,6 +1127,11 @@ void InferenceEngine::resetCache() noexcept {
     // conversation can never restore a stale recurrent state. (The state slab
     // itself is re-zeroed lazily by the backend on the next length==0 forward.)
     _ssmSnapValid = false;
+    // 5.27 I-9a: clear any per-sequence forward context (qwen4_exp PLE n-gram
+    // rolling context) so a fresh conversation starts clean. No-op for others.
+    if (_backend != nullptr) {
+        _backend->resetForwardContext();
+    }
 }
 
 void InferenceEngine::setKvDtype(KvDtype dtype) {

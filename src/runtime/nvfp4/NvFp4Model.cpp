@@ -62,13 +62,7 @@ void NvFp4Model::releaseTensor(const std::string& name) noexcept {
     if (it == _bufIdx.end()) {
         return;
     }
-    static const bool kDiag = std::getenv("MIMIRMIND_Q4E_DIAG") != nullptr;
     const std::size_t idx = it->second;
-    if (kDiag) {
-        MM_LOG_INFO("q4ediag", "release '{}' ptr={} bytes={} refs={}",
-                    name, _buffers[idx].get(), _buffers[idx].bytes(),
-                    idx < _bufRefs.size() ? _bufRefs[idx] : 1);
-    }
     // Slab members share one buffer; the device memory goes away with the
     // LAST member released (refcount), not the first.
     if (idx >= _bufRefs.size() || _bufRefs[idx] <= 1

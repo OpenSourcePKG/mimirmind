@@ -871,7 +871,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         // (generateServingParity) against single-seq greedy generate() on
         // this freshly-loaded model, print the comparison, and exit before
         // the HTTP server starts. qwen35moe only.
-        if (arch == "qwen35moe" &&
+        if ((arch == "qwen35moe" || arch == "qwen4_exp") &&
             std::getenv("MIMIRMIND_SERVING_PARITY") != nullptr) {
             const auto& tok = e->tokenizer();
             std::vector<std::int32_t> promptIds =
@@ -899,7 +899,13 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                 const long v = std::strtol(mn, nullptr, 10);
                 if (v > 0) maxNew = static_cast<std::size_t>(v);
             }
-            const std::size_t nSeq   = 2;
+            // 5.27.11.1: conc configurable — qwen4_exp conc=1 parity uses NSEQ=1
+            // (per-slot PLE for nSeq>1 is 5.27.11.2).
+            std::size_t nSeq = 2;
+            if (const char* ns = std::getenv("MIMIRMIND_PARITY_NSEQ")) {
+                const long v = std::strtol(ns, nullptr, 10);
+                if (v > 0) nSeq = static_cast<std::size_t>(v);
+            }
 
             ::mimirmind::runtime::GenerateParams gp{};
             gp.maxNewTokens         = maxNew;
@@ -939,6 +945,10 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
 
             // D2e.1 — generateBatch with DISTINCT prompts. Each batched
             // stream must equal its own single-session greedy generate().
+            // 5.27.11.2: conc>1 per-slot PLE — qwen4_exp runs this too with each
+            // prompt truncated to 1 token (distinct first tokens -> distinct
+            // per-slot n-gram context; single-session also T=1 = apples-to-apples).
+            if (arch == "qwen35moe" || arch == "qwen4_exp") {
             const char* multiPrompts[] = {
                 "The capital of France is",
                 "Once upon a time",
@@ -953,6 +963,9 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             for (const char* mp : multiPrompts) {
                 auto ids = tok.encode(mp, /*addBos=*/false);
                 if (ids.empty()) ids.push_back(1);
+                // 5.27.11.2: qwen4_exp — 1-token prompts isolate per-slot PLE
+                // (distinct first tokens) from prefill-vs-decode numerics.
+                if (arch == "qwen4_exp") ids.resize(1);
                 bprompts.push_back(std::move(ids));
             }
             auto bout = e->generateBatch(bprompts, maxNew, /*eosId=*/-1);
@@ -982,6 +995,7 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
             }
             std::cout << "  => generateBatch "
                       << (allBatchOk ? "PASS" : "CHECK") << "\n";
+            }  // end qwen35moe-only D2e distinct-prompt block (5.27.11.1)
             std::cout.flush();
             return 0;
         }
@@ -2647,7 +2661,51 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     // neutral synchronized batched decode: Gemma 4 MoE on L0/Xe-LPG serves
     // through the non-paged slab substrate (SlabDecodeStepper) instead of the
     // paged pool. qwen35moe keeps its CUDA paged path.
+    // ---- 5.27.10 fix: main-thread warmup of process-global lazy CUDA state,
+    // in particular the CUTLASS NVFP4-TC grouped GEMM ("nvfp4-tc-banks").
+    // Serve requests run on the batcher _worker / httplib pool threads. If the
+    // FIRST process-wide touch of the CUTLASS grouped kernel (its lazy
+    // initialize()) happens on such a worker thread — which never called
+    // cudaSetDevice and does not own the CudaContext — it returns kErrorInternal
+    // (rc=2) and poisons the context, crashing the first request intermittently
+    // (~60%, _Exit(70)). Forcing one tiny single-session generate() HERE — on
+    // the main thread that constructed the CudaContext, before any batcher
+    // worker exists — establishes that lazy state on the context-owning thread,
+    // so the workers only ever re-use the already-initialized kernel. Guarded so
+    // a warmup failure can never block serving; effectively a no-op for archs
+    // that don't drive the TC-banks path.
+    if (engine.servingClassEnabled()) {
+        try {
+            const auto& wtok = engine.tokenizer();
+            auto warmIds = wtok.encode("Hi", /*addBos=*/true);
+            if (warmIds.empty()) {
+                warmIds.push_back(wtok.eosId());
+            }
+            ::mimirmind::runtime::GenerateParams wgp{};
+            wgp.maxNewTokens         = 1;
+            wgp.sampling.temperature = 0.0F;
+            engine.resetCache();
+            (void)engine.generate(warmIds, wgp, {}, nullptr, {}, {});
+            engine.resetCache();
+            MM_LOG_INFO("main",
+                        "serve: main-thread kernel warmup done (default engine "
+                        "'{}') — nvfp4-tc-banks initialized on the context "
+                        "thread (5.27.10)",
+                        defaultId);
+        } catch (const std::exception& warmEx) {
+            MM_LOG_WARN("main",
+                        "serve: main-thread kernel warmup failed ({}); serving "
+                        "continues (worker first-init may still race — 5.27.10)",
+                        warmEx.what());
+        }
+    }
+
     std::unique_ptr<::mimirmind::runtime::serving::ContinuousBatcher> batcher;
+    // 5.27.11.2: qwen4_exp re-enabled for the continuous batcher — the paged
+    // stepServing (decode) and prefillSlot (single-slot prefill) forward now carry
+    // per-slot PLE n-gram + the HC stream collapse, and the batcher forces
+    // single-slot prefill for qwen4_exp (no ragged varlen). conc>1 batched forward
+    // is slot-correct + coherent (5.27.11.2).
     if ((engine.config().architecture == "qwen35moe" ||
          engine.config().architecture == "qwen4_exp" ||
          engine.supportsBatchedDecode()) &&

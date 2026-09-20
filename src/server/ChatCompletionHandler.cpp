@@ -215,6 +215,18 @@ inline bool callsMissingRequired(
             if (!r.is_string()) { continue; }
             const std::string key = r.get<std::string>();
             if (!args.is_object() || !args.contains(key)) { return true; }
+            // 8.19.13.5 — a required arg present but a DEGENERATE empty/
+            // whitespace-only string (observed: query="\n\n" from a minimal-context
+            // forced tool call decoding into whitespace) is as useless as a missing
+            // one — the tool rejects it ("missing required argument"). Treat it as a
+            // salvage trigger so the (now-sampled) grammar re-decode gets a real
+            // value instead of shipping a dead call.
+            if (const auto& v = args[key]; v.is_string()) {
+                const std::string s = v.get<std::string>();
+                if (s.find_first_not_of(" \t\r\n\f\v") == std::string::npos) {
+                    return true;
+                }
+            }
         }
     }
     return false;
@@ -365,10 +377,15 @@ bool ChatCompletionHandler::prepareChatRequest(
     // disables the injection, so those flows stay byte-identical. Server
     // decides (same philosophy as the M7f/anti-loop floors); ops rollback:
     // MIMIRMIND_HONESTY_FLOOR=0.
+    // 5.31: DEFAULT OFF, per-(machine,model). An oracle A/B showed the floor makes
+    // the model REFUSE long-tail knowledge questions that the un-floored vLLM
+    // answers at par, so it now defaults off (LlmConfig.honestyFloor) and a
+    // checkpoint re-enables it via its overlay. Explicit env still wins per-request.
     {
-        static const bool kHonestyFloor = [] {
+        const bool kHonestyFloor = [&] {
             const char* e = std::getenv("MIMIRMIND_HONESTY_FLOOR");
-            return e == nullptr || e[0] != '0';
+            if (e != nullptr) return e[0] != '0';         // ops override wins
+            return targetEngine.config().honestyFloor;    // per-model default (off)
         }();
         const bool hasSystem = std::any_of(
             msgs.begin(), msgs.end(), [](const model::ChatMessage& m) {
@@ -590,20 +607,29 @@ bool ChatCompletionHandler::prepareChatRequest(
         constexpr float        kGenericEscapeTemp = 0.6F;   // model-agnostic floor
         constexpr float        kGenericEscapeTopP = 0.95F;
         constexpr std::uint32_t kGenericEscapeTopK = 20U;
-        const float thinkTemp = mc.samplingTempDefault > 0.0F
-                                    ? mc.samplingTempDefault : kGenericEscapeTemp;
+        // Priority: the model's THINKING preset (overlay: thinkingTemp/TopP/TopK,
+        // the vendor's reasoning recommendation) BEFORE the generic
+        // generation_config sampling (samplingTempDefault etc.). qwen3.6 ships a
+        // do_sample temp of 1.0 in generation_config, but its card's reasoning
+        // preset is 0.6 — reusing 1.0 over a long chain derails a 3B-active model.
+        // Falls back to generation_config, then to the model-agnostic escape values.
+        const float thinkTemp = mc.thinkingTemp > 0.0F        ? mc.thinkingTemp
+                              : mc.samplingTempDefault > 0.0F ? mc.samplingTempDefault
+                                                              : kGenericEscapeTemp;
         if (params.sampling.temperature < thinkTemp) {
             params.sampling.temperature = thinkTemp;
-            const float tp = mc.samplingTopPDefault < 1.0F
-                                 ? mc.samplingTopPDefault : kGenericEscapeTopP;
-            const std::uint32_t tk = mc.samplingTopKDefault > 0
-                                 ? mc.samplingTopKDefault : kGenericEscapeTopK;
+            const float tp = mc.thinkingTopP < 1.0F        ? mc.thinkingTopP
+                           : mc.samplingTopPDefault < 1.0F ? mc.samplingTopPDefault
+                                                           : kGenericEscapeTopP;
+            const std::uint32_t tk = mc.thinkingTopK > 0        ? mc.thinkingTopK
+                                   : mc.samplingTopKDefault > 0 ? mc.samplingTopKDefault
+                                                               : kGenericEscapeTopK;
             if (params.sampling.topP >= 1.0F) params.sampling.topP = tp;
             if (params.sampling.topK == 0)    params.sampling.topK = tk;
             MM_LOG_INFO("server",
                         "thinking sampling floor: reasoning under greedy/near-greedy "
-                        "-> temp={} top_p={} top_k={} (model generation_config; "
-                        "generic fallback only when the checkpoint ships none)",
+                        "-> temp={} top_p={} top_k={} (model thinking preset > "
+                        "generation_config > generic fallback)",
                         params.sampling.temperature, params.sampling.topP,
                         params.sampling.topK);
         }
@@ -647,23 +673,38 @@ bool ChatCompletionHandler::prepareChatRequest(
             // output. A model-agnostic ceiling keeps the floor just hot enough to
             // break degeneration while staying coherent. Not a per-arch preset —
             // a generic bound (ops-tunable via env).
-            constexpr float kAnswerFloorTempCapDefault = 0.7F;
-            float tempCap = kAnswerFloorTempCapDefault;
+            // The temperature-lift CAP is per-(machine,model) config
+            // (LlmConfig.answerFloorTempCap), NOT a server constant. Its default is
+            // 0 = lift OFF: on a small-active model (qwen3.6 3B-A) lifting a greedy
+            // tool-answer to temp>0 garbles the summarisation — broken markdown /
+            // hallucinated `<result_list>`/`<ref_list>`/HTML tags, early stops,
+            // non-determinism — while the repetition + frequency penalties applied
+            // below ALREADY break the greedy loops this lift was meant to escape
+            // (A/B on the Pegenaut tool-answer path: temp 0.7 and even 0.3 stay
+            // messy + non-deterministic, temp 0 + penalties is clean, deterministic,
+            // loop-free). A checkpoint that still loops under penalties re-enables a
+            // hot cap via its HW-fingerprint model overlay. Ops override:
+            // MIMIRMIND_ANSWER_FLOOR_TEMP_CAP. cap <= 0 => sampling untouched
+            // (greedy stays greedy).
+            float tempCap = mc.answerFloorTempCap;
             if (const char* c = std::getenv("MIMIRMIND_ANSWER_FLOOR_TEMP_CAP")) {
                 const float v = std::strtof(c, nullptr);
-                if (v > 0.0F) tempCap = v;
+                if (v >= 0.0F) tempCap = v;
             }
-            params.sampling.temperature = std::min(mc.samplingTempDefault, tempCap);
-            if (params.sampling.topP >= 1.0F && mc.samplingTopPDefault < 1.0F)
-                params.sampling.topP = mc.samplingTopPDefault;
-            if (params.sampling.topK <= 1 && mc.samplingTopKDefault > 0)
-                params.sampling.topK = mc.samplingTopKDefault;
-            MM_LOG_INFO("server",
-                        "answer sampling floor: non-thinking greedy -> model "
-                        "generation_config sampling temp={} top_p={} top_k={} "
-                        "(MIMIRMIND_ANSWER_SAMPLING_FLOOR=0 to disable)",
-                        params.sampling.temperature, params.sampling.topP,
-                        params.sampling.topK);
+            if (tempCap > 0.0F) {
+                params.sampling.temperature =
+                    std::min(mc.samplingTempDefault, tempCap);
+                if (params.sampling.topP >= 1.0F && mc.samplingTopPDefault < 1.0F)
+                    params.sampling.topP = mc.samplingTopPDefault;
+                if (params.sampling.topK <= 1 && mc.samplingTopKDefault > 0)
+                    params.sampling.topK = mc.samplingTopKDefault;
+                MM_LOG_INFO("server",
+                            "answer sampling floor: non-thinking greedy -> model "
+                            "generation_config sampling temp={} top_p={} top_k={} "
+                            "(MIMIRMIND_ANSWER_SAMPLING_FLOOR=0 to disable)",
+                            params.sampling.temperature, params.sampling.topP,
+                            params.sampling.topK);
+            }
         }
     }
 
@@ -1236,7 +1277,6 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             salvagePrompt.insert(salvagePrompt.end(),
                                  openerIds.begin(), openerIds.end());
             runtime::GenerateParams sp = params;
-            sp.sampling.temperature = 0.0F;
             sp.maxNewTokens = std::min<std::size_t>(sp.maxNewTokens, 1024);
             // 8.19.13.2 — the opener `<function=` is now in the PREFILL (never
             // reaches the matcher, which only sees generated tokens), so drive
@@ -1248,6 +1288,18 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                 auto c = std::make_shared<model::ToolCallConstraint>(
                     cr.tools, tok, /*assumeOpenerConsumed=*/true);
                 if (c->active()) { forceC = c; }
+            }
+            // 8.19.13.5 — a GREEDY re-decode just repeats the degeneration that
+            // produced the dead call (e.g. query="\n\n"). Do NOT force greedy when a
+            // grammar mask is active: the mask guarantees the tool-call FORMAT at any
+            // temperature, so keep the request's OWN sampling — which the anti-loop
+            // floor has already lifted to the MODEL's declared generation_config values
+            // (via LlmConfig, capped) — so the re-decode escapes the greedy collapse
+            // using per-model sampling, never a hardcoded per-arch preset. WITHOUT a
+            // mask, fall back to the historical greedy salvage (sampled tool calls
+            // break format when nothing constrains them).
+            if (!forceC) {
+                sp.sampling.temperature = 0.0F;
             }
             std::vector<std::int32_t> redecoded;
             runtime::GenerateStats    salvStats;

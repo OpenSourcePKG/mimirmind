@@ -70,6 +70,22 @@ public:
     void prepareForward(std::span<const std::int32_t> tokIds,
                         const float* hiddenStates, std::size_t T) override;
 
+    /// I-9a: reset the rolling 2-token PLE n-gram context to EOS (sequence
+    /// start), so a batched run is not contaminated by a prior generation.
+    void resetForwardContext() override;
+
+    /// I-9b: per-slot batched PLE context — one token per active slot, with a
+    /// per-slot rolling n-gram context reset on the slot's sequence start.
+    void prepareForwardBatched(std::span<const std::int32_t> tokIds,
+                               std::span<const std::uint8_t> isSeqStart,
+                               std::size_t nSeq) override;
+
+    /// I-9b: single-slot prefill — load the slot's rolling context around the
+    /// single-session n-gram path, roll + store it back (prefill uses runBlock).
+    void prepareForwardSlot(std::size_t slot,
+                            std::span<const std::int32_t> tokens,
+                            bool seqStart) override;
+
 protected:
     /// I-4: at the ple layer, inject the PLE n-gram features into the stream state.
     void blockEnter(std::size_t blockIdx, float* x, std::size_t T,
@@ -102,6 +118,10 @@ private:
     void pleForward(std::size_t T, BlockBuffers& s);
     void growPleScratch(std::size_t T);
     void computeNgramIds(std::size_t T, std::vector<std::int64_t>& outIds) const;
+    // I-9b: per-slot batched variant — one 1-token n-gram per active slot, each
+    // hashed against its own rolling context (_pleCtxSlot).
+    void computeNgramIdsBatched(std::size_t nSeq,
+                                std::vector<std::int64_t>& outIds) const;
 
     nvfp4::PleNgramTable       _pleTable;
     int                        _pleGgufLayer{-1};
@@ -119,6 +139,13 @@ private:
     std::vector<std::int32_t>  _pleTokens;
     std::array<std::int32_t, 2> _pleCtx{};
     bool                       _pleCtxInit{false};
+    // I-9b: per-slot rolling 2-token n-gram context (batched serving), indexed by
+    // active-slot id. _pleBatchedNSeq>0 selects the per-slot PLE path this forward.
+    std::vector<std::array<std::int32_t, 2>> _pleCtxSlot;
+    std::size_t                _pleBatchedNSeq{0};
+    // I-9b: single-slot prefill store-back target (>=0 -> after the single-session
+    // n-gram roll, write _pleCtx back into _pleCtxSlot[_pleSlotStore]); -1 = none.
+    std::ptrdiff_t             _pleSlotStore{-1};
     // Host + device scratch.
     std::vector<float>         _pleEmbHost;
     std::vector<std::int64_t>  _pleIdsHost;

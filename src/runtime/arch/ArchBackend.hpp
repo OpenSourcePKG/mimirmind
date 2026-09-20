@@ -233,6 +233,29 @@ public:
                                 const float*                  /*hiddenStates*/,
                                 std::size_t                   /*T*/) {}
 
+    /// 5.27 I-9a: reset any per-sequence forward context the backend carries
+    /// across steps (qwen4_exp: the PLE rolling n-gram context). Called at a
+    /// sequence start (resetCache / a fresh batched run) so a prior generation
+    /// cannot contaminate the next. Default no-op.
+    virtual void resetForwardContext() {}
+
+    /// 5.27.11.2: batched (per-slot) forward context for the PLE n-gram seam.
+    /// tokIds[nSeq] is one token per active slot this step; isSeqStart[nSeq]
+    /// marks slots beginning a new sequence (reset their own rolling context).
+    /// Selects the per-slot PLE path for the batched forward. Default no-op.
+    virtual void prepareForwardBatched(std::span<const std::int32_t> /*tokIds*/,
+                                       std::span<const std::uint8_t> /*isSeqStart*/,
+                                       std::size_t                   /*nSeq*/) {}
+
+    /// 5.27.11.2: single-slot prefill forward context (qwen4_exp PLE n-gram). A
+    /// prefill chunk of `tokens` for one serving slot; `seqStart` (startPos==0)
+    /// resets that slot's rolling context. Uses the slot's own context around the
+    /// single-session n-gram path (prefill goes through single-session runBlock).
+    /// Default no-op.
+    virtual void prepareForwardSlot(std::size_t                   /*slot*/,
+                                    std::span<const std::int32_t> /*tokens*/,
+                                    bool                          /*seqStart*/) {}
+
 protected:
     ArchBackend() = default;
 };
