@@ -3,6 +3,61 @@
 Post-deploy performance entries. Newest first. Box = Spark GB10 (xd-ki-pkg1),
 model qwen3.6-35B-A3B-NVFP4 unless noted.
 
+## 2026-09-20 — FRESH vLLM prefill head-to-head (5.18.21.5) — 3.6x gap is REAL, NOT stale
+
+**Measurement:** prefill_h2h.sh, client-timed TTFT (max_tokens=1, temp=0, per-run nonce → no
+prefix-cache), ~3468tok, clk 2405MHz, sanctioned swap.
+- **mimirmind** current prod (4.7.1 + glue-fusion + cuDNN-paged + all prod flags): **~1945ms** (0.56 ms/tok)
+- **vLLM** nvcr 26.06, same NVFP4 model: **~541ms** (0.156 ms/tok)
+- **Gap = 3.6x** — reproduced on CURRENT prod; the 09-15 anchor was NOT stale.
+
+**Redirect:** attn is NOT the main lever (O(T²) slope ⇒ attn ~20-30% at 3468tok; zeroing it still
+leaves ~2.5-3x). The 3.6x is dominated by the LINEAR terms — MoE-glue (dgemm/prep/scatter/silu/gather
+~38%) + GDN/mamba (~31%), each ~3x slower/token than vLLM. MoE-GEMM is already parity (3 neutral
+levers). vLLM's edge = fused MoE glue + optimized mamba chunked-scan. Next real levers: GDN prefill
+(Phase 2) + MoE-glue fusion. FlashInfer attn kernel = dead end on GB10 (sm_121=FA2 class).
+Note: research/2026-09-20-attn-prefill-oracle-flashinfer-not-a-lever-gb10.
+
+## 2026-09-20 — CUTLASS v4.4.2 → v4.7.1 bump (5.18.21.2) — PERF-NEUTRAL
+
+**Change:** `third_party/cutlass` git checkout v4.4.2 → v4.7.1 (vLLM's version), rebuild
+`mimirmind_cutlass_moe` + relink `mimirmind`. Built clean — NO API breaks (RasterOrderOptions
+detail-ns + CollectiveBuilder/KernelScheduleAuto compatible; `[100%] Built target mimirmind` rc=0).
+
+**Serve-A/B (ab_cutlass471.sh, prod config.serve.json, clock 2405MHz confirmed under load):**
+- Warm prefill **171 / 173 / 172 ms / 319tok** = IDENTICAL to 4.4.2's 170–172ms → **perf-neutral**.
+- Coherence OK; Walter-Moers 1194 chars, no loop → numerics stable under the new schedule.
+
+**Verdict:** REFUTES the "4.4.2 KernelScheduleAuto resolves to a weaker sm120 FP4 schedule"
+hypothesis (was the "highest-ceiling" delta-2 lever). 3rd consecutive neutral MoE-GEMM result
+(after w13-fusion + glue-fusion) → the prefill gap vs vLLM is NOT in the MoE GEMM; it is
+distributed (confirms Phase-0). Prod currently LIVE on the 4.7.1 binary. No baseline-binary
+backup (root-owned build dir); revert = `git checkout v4.4.2` + rebuild. keep-vs-revert: user decision.
+
+## 2026-09-20 — MoE glue-fusion: fuse per-expert gather into TC act-quant (5.18.21.2)
+
+**Deploy:** commit 922f778 (branch feat/moe-tc-w13-fusion-raster; build-cudnn binary
+live on prod via docker start re-exec). The standalone `rt.gather` (~4%/9.2ms of warm
+prefill) is fused INTO the TC-path act-quant via an optional `srcMap` on
+`moe_act_quant_nvfp4_gather_rows` — reads ungathered `moeInput` at `rowSrcTok[logical]`,
+skips the `xComp` intermediate. Bit-identical by design; `rt.gather` retained only for
+the non-TC scalar decode path (M=1 `runMoeFfn`).
+
+**Serve-A/B (ab_gluew13.sh, sanctioned swap):**
+- `rt.gather` GONE from all TC-prefill profiler lines (0 occurrences); decode M=1 keeps
+  it (0.18ms, intended).
+- PROD-config warm prefill = **170–172ms / 319tok** (cold 629ms) = 0.536ms/tok vs baseline
+  0.543ms/tok (215ms/396tok) → **on-par, bit-identical, NO regression**. TTFT win in the
+  noise at this prompt size; net = clean structural simplification (fewer launches, no
+  intermediate buffer).
+- Coherence OK ("Hauptstadt Frankreich = Paris"); Walter-Moers open-ended = no degeneration
+  loop (rep-penalty prod default, still load-bearing).
+
+**Gotcha:** profile prefill TTFT on prod `config.serve.json`, NOT `config.gdbprofile.json`
+— the latter's GDN-chunked-TC path is degraded (`gdn.k2=212ms/52%`) and drowns any MoE
+delta. `c067f8f` (w13 gate+up fusion, gateup=1) = perf-neutral, likely env-gated OFF.
+Full detail: research/2026-09-20-qwen36-serve-prefill-runtime-profile-cutlass-tc-already.
+
 ## 2026-09-17 — string `pattern` (regex) grammar enforcement (5.31)
 
 **Deploy:** commit d5872d1. A JSON-Schema string `pattern` is compiled to EBNF via

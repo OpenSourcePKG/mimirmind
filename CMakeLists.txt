@@ -1370,9 +1370,10 @@ endif()
 # GEMM that beats batched fused-K on GB10. Compiled as REAL sm_121a SASS (not
 # the --ptx compute_80 path the other kernels use), because the CUTLASS host
 # API needs a concrete SASS instantiation linked into the binary. Header-only
-# CUTLASS is fetched to third_party/cutlass on the build box (v4.4.2, ~200 MiB,
-# NOT committed); the whole target is skipped when it is absent, and callers
-# fall back to the scalar grouped / batched path.
+# CUTLASS is fetched to third_party/cutlass on the build box (v4.7.1, ~200 MiB,
+# NOT committed; validated on GB10/sm_121a 2026-09-20, perf-neutral vs 4.4.2 but
+# kept as the vLLM-aligned base); the whole target is skipped when it is absent,
+# and callers fall back to the scalar grouped / batched path.
 #
 # Arch is pinned explicitly (compute_121a/sm_121a) rather than via
 # CMAKE_CUDA_ARCHITECTURES so the block-scaled fp4 mma lowers; keep the target
