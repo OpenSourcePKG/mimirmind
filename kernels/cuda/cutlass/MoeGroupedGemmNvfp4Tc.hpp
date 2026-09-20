@@ -130,4 +130,39 @@ namespace mimirmind::kernels::cutlassmoe {
 /// once and reuse across calls so the GEMM does no per-call malloc and no sync.
 [[nodiscard]] std::size_t groupedNvfp4TcBanksScratchBytes(int groups);
 
+/**
+ * Banks variant, gate+up FUSED (5.18.21). Submits BOTH the gate and up
+ * projections as ONE grouped GEMM of 2*groups groups (gate = [0,groups),
+ * up = [groups,2*groups)). The projections share the activation banks
+ * (`aBank`/`sfaBank`); each keeps its own weight bank (`*BBank`), swizzled SFB
+ * (`*SfbBank`), per-expert global (`*GlobalsBank` -> per-group alpha) and F32
+ * output bank (`*DBank`). Bit-identical to two separate runGroupedNvfp4TcF32Banks
+ * calls, but one CUTLASS can_implement/initialize/run instead of two. `N` = the
+ * per-projection output width (n_ff), `K` = d_model. `scratch` must be sized via
+ * groupedNvfp4TcBanksGateUpScratchBytes(groups). Runs on `stream`; returns 0 on success.
+ */
+[[nodiscard]] int runGroupedNvfp4TcF32BanksGateUp(
+    int                  groups,
+    int                  N,
+    int                  K,
+    const int*           dExpOffset,
+    const int*           dPadOffset,
+    const void*          aBank,
+    const void*          sfaBank,
+    const void*          gateBBank,
+    const void*          gateSfbBank,
+    const float*         gateGlobalsBank,
+    void*                gateDBank,
+    const void*          upBBank,
+    const void*          upSfbBank,
+    const float*         upGlobalsBank,
+    void*                upDBank,
+    void*                scratch,
+    std::size_t          scratchBytes,
+    CUstream_st*         stream);
+
+/// Bytes of caller-owned device scratch runGroupedNvfp4TcF32BanksGateUp needs for
+/// `groups` experts (it internally submits 2*groups groups).
+[[nodiscard]] std::size_t groupedNvfp4TcBanksGateUpScratchBytes(int groups);
+
 } // namespace mimirmind::kernels::cutlassmoe

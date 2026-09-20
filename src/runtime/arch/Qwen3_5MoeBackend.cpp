@@ -1165,7 +1165,7 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         grow(s.moeTcABank2,      maxPad * (n_ff_exp / 2));
         grow(s.moeTcSfaBank2,    mo::swizzledBlockScaleBytes(maxPad, n_ff_exp / 16));
         grow(s.moeTcBanksScratch,
-             _ops.moeGroupedGemmNvfp4TcBanksScratchBytes(nExperts));
+             _ops.moeGroupedGemmNvfp4TcBanksGateUpScratchBytes(nExperts));
 
         auto* const padOffset   = s.moeTcPadOffset.as<std::int32_t>();
         auto* const contigToPad = s.moeTcContigToPad.as<std::int32_t>();
@@ -1200,13 +1200,14 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         // gate + up: N=n_ff_exp, K=d_model. alpha[e] = weight global (folds the
         // per-expert global back in; act gscale=1).
         _ops.profileSection("moe.gemm");   // gate+up TC GEMM (prefill sub-split)
-        _ops.moeGroupedGemmNvfp4TcBanksAsync(
+        // 5.18.21: gate+up in ONE grouped GEMM (2*nExperts groups) — one CUTLASS
+        // can_implement/initialize/run instead of two, and A/SFA read once.
+        // Bit-identical to the two separate banks calls: gate -> gatePad, up ->
+        // upPad, each group keeps its own per-expert alpha (weight global).
+        _ops.moeGroupedGemmNvfp4TcBanksGateUpAsync(
             nExperts, n_ff_exp, d_model, expOffset, padOffset, aBank, sfaBank,
             gateExps.tcNibblePtr, gateExps.tcSfbPtr,
             static_cast<const float*>(gateExps.tcGlobalsPtr), gatePad,
-            banksScratch, banksBytes);
-        _ops.moeGroupedGemmNvfp4TcBanksAsync(
-            nExperts, n_ff_exp, d_model, expOffset, padOffset, aBank, sfaBank,
             upExps.tcNibblePtr, upExps.tcSfbPtr,
             static_cast<const float*>(upExps.tcGlobalsPtr), upPad,
             banksScratch, banksBytes);

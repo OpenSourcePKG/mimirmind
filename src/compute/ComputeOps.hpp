@@ -899,6 +899,37 @@ public:
             "moeGroupedGemmNvfp4TcBanksAsync: not supported on this backend");
     }
 
+    /// Device scratch bytes moeGroupedGemmNvfp4TcBanksGateUpAsync needs for
+    /// `nExperts` experts (it submits 2*nExperts groups internally).
+    [[nodiscard]] virtual std::size_t
+    moeGroupedGemmNvfp4TcBanksGateUpScratchBytes(std::size_t nExperts) const noexcept {
+        (void)nExperts;
+        return 0;
+    }
+
+    /// 5.18.21: gate+up FUSED CUTLASS grouped GEMM — both projections in ONE
+    /// launch (2*nExperts groups) sharing the activation banks, each keeping its
+    /// own weight/SFB/global/output bank. Bit-identical to two
+    /// moeGroupedGemmNvfp4TcBanksAsync calls; halves the per-call CUTLASS setup.
+    /// `N` = per-projection width (n_ff), `K` = d_model. `scratch` caller-owned,
+    /// sized >= moeGroupedGemmNvfp4TcBanksGateUpScratchBytes(nExperts).
+    virtual void moeGroupedGemmNvfp4TcBanksGateUpAsync(
+        std::size_t nExperts, std::size_t N, std::size_t K,
+        const std::int32_t* expOffset, const std::int32_t* padOffset,
+        const void* aBank, const void* sfaBank,
+        const void* gateBBank, const void* gateSfbBank,
+        const float* gateGlobalsBank, void* gateDBank,
+        const void* upBBank, const void* upSfbBank,
+        const float* upGlobalsBank, void* upDBank,
+        void* scratch, std::size_t scratchBytes) {
+        (void)nExperts; (void)N; (void)K; (void)expOffset; (void)padOffset;
+        (void)aBank; (void)sfaBank; (void)gateBBank; (void)gateSfbBank;
+        (void)gateGlobalsBank; (void)gateDBank; (void)upBBank; (void)upSfbBank;
+        (void)upGlobalsBank; (void)upDBank; (void)scratch; (void)scratchBytes;
+        throw std::runtime_error(
+            "moeGroupedGemmNvfp4TcBanksGateUpAsync: not supported on this backend");
+    }
+
     /// M-CLR.MoE Increment 2: device-indexed fused gate+up projection for
     /// Gemma 4 MoE T=1 decode. Reads the router pick `expIdx[k]` on the
     /// device (no host round-trip on the routing) and folds the per-expert

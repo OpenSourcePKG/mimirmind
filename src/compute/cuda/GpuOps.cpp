@@ -3118,6 +3118,50 @@ void GpuOps::moeGroupedGemmNvfp4TcBanksAsync(
 #endif
 }
 
+std::size_t GpuOps::moeGroupedGemmNvfp4TcBanksGateUpScratchBytes(
+    std::size_t nExperts) const noexcept {
+#ifdef MIMIRMIND_HAVE_CUTLASS_MOE
+    return kernels::cutlassmoe::groupedNvfp4TcBanksGateUpScratchBytes(
+        static_cast<int>(nExperts));
+#else
+    (void)nExperts;
+    return 0;
+#endif
+}
+
+void GpuOps::moeGroupedGemmNvfp4TcBanksGateUpAsync(
+    std::size_t nExperts, std::size_t N, std::size_t K,
+    const std::int32_t* expOffset, const std::int32_t* padOffset,
+    const void* aBank, const void* sfaBank,
+    const void* gateBBank, const void* gateSfbBank,
+    const float* gateGlobalsBank, void* gateDBank,
+    const void* upBBank, const void* upSfbBank,
+    const float* upGlobalsBank, void* upDBank,
+    void* scratch, std::size_t scratchBytes) {
+#ifdef MIMIRMIND_HAVE_CUTLASS_MOE
+    // Scratch is caller-owned (per-slot BlockBuffers) — concurrent prefills
+    // never collide. 5.18.21: gate+up in one grouped GEMM (2*nExperts groups).
+    const int rc = kernels::cutlassmoe::runGroupedNvfp4TcF32BanksGateUp(
+        static_cast<int>(nExperts), static_cast<int>(N), static_cast<int>(K),
+        expOffset, padOffset, aBank, sfaBank,
+        gateBBank, gateSfbBank, gateGlobalsBank, gateDBank,
+        upBBank, upSfbBank, upGlobalsBank, upDBank,
+        scratch, scratchBytes, _ctx.stream().handle());
+    if (rc != 0) {
+        throw std::runtime_error(
+            "moeGroupedGemmNvfp4TcBanksGateUpAsync: CUTLASS grouped GEMM failed rc="
+            + std::to_string(rc));
+    }
+#else
+    (void)nExperts; (void)N; (void)K; (void)expOffset; (void)padOffset;
+    (void)aBank; (void)sfaBank; (void)gateBBank; (void)gateSfbBank;
+    (void)gateGlobalsBank; (void)gateDBank; (void)upBBank; (void)upSfbBank;
+    (void)upGlobalsBank; (void)upDBank; (void)scratch; (void)scratchBytes;
+    throw std::runtime_error(
+        "moeGroupedGemmNvfp4TcBanksGateUpAsync: CUTLASS not linked in this build");
+#endif
+}
+
 void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
     if (n == 0) {
         return;

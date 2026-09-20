@@ -368,6 +368,17 @@ public:
         const void* bBank, const void* sfbBank,
         const float* globalsBank, void* dBank,
         void* scratch, std::size_t scratchBytes) override;
+    [[nodiscard]] std::size_t
+    moeGroupedGemmNvfp4TcBanksGateUpScratchBytes(std::size_t nExperts) const noexcept override;
+    void moeGroupedGemmNvfp4TcBanksGateUpAsync(
+        std::size_t nExperts, std::size_t N, std::size_t K,
+        const std::int32_t* expOffset, const std::int32_t* padOffset,
+        const void* aBank, const void* sfaBank,
+        const void* gateBBank, const void* gateSfbBank,
+        const float* gateGlobalsBank, void* gateDBank,
+        const void* upBBank, const void* upSfbBank,
+        const float* upGlobalsBank, void* upDBank,
+        void* scratch, std::size_t scratchBytes) override;
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
     // 5.27 I-3 Hyper-Connections (qwen4_exp).
     void hcGroupedRmsNormAsync(const float* x, const float* wBaked, float* normed,

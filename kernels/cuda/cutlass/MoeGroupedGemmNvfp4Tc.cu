@@ -194,6 +194,58 @@ __global__ void buildGroupArraysBanksKernel(
     layoutSFB[e] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
 }
 
+// Banks builder, gate+up FUSED (5.18.21): builds 2*G groups so ONE grouped GEMM
+// covers both the gate and up projections. Groups [0,G) = gate, [G,2G) = up.
+// Both projections read the SAME activation rows (A/SFA share aBank/sfaBank);
+// only B/SFB (weights), D (output bank) and alpha (per-expert global) differ.
+// Bit-identical to two separate banks GEMMs — one launch + one CUTLASS
+// can_implement/initialize/run instead of two (the real per-call overhead).
+__global__ void buildGroupArraysBanksGateUpKernel(
+    const int* __restrict__ expOffset, const int* __restrict__ padOffset,
+    int G, int N, int K,
+    const unsigned char* __restrict__ aBank, const unsigned char* __restrict__ sfaBank,
+    const unsigned char* __restrict__ gateB, const unsigned char* __restrict__ gateSFB,
+    const float* __restrict__ gateGlobals, unsigned char* __restrict__ gateD,
+    const unsigned char* __restrict__ upB, const unsigned char* __restrict__ upSFB,
+    const float* __restrict__ upGlobals, unsigned char* __restrict__ upD,
+    UnderlyingProblem* __restrict__ problems,
+    const GemmElementA** __restrict__ ptrA, const GemmElementB** __restrict__ ptrB,
+    const ElementSF** __restrict__ ptrSFA, const ElementSF** __restrict__ ptrSFB,
+    ElementDOut** __restrict__ ptrD, const float** __restrict__ ptrAlpha,
+    StrideA* __restrict__ strideA, StrideB* __restrict__ strideB,
+    StrideC* __restrict__ strideC, StrideD* __restrict__ strideD,
+    LayoutSFA* __restrict__ layoutSFA, LayoutSFB* __restrict__ layoutSFB) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= 2 * G) return;
+    const bool isUp = idx >= G;
+    const int  e    = isUp ? (idx - G) : idx;
+    const int  M        = expOffset[e + 1] - expOffset[e];
+    const long padRow   = padOffset[e];
+    const long ksfTiles = ((static_cast<long>(K) / 16) + 3) / 4;
+    const long nMTiles  = (N + 127) / 128;
+    const long sfbStride  = 512L * nMTiles * ksfTiles;         // moeSwizzledScaleStride(N,K/16)
+    const long sfaTileOff = 512L * ksfTiles * (padRow / 128);  // big-SFA tile of expert e
+
+    const unsigned char* bBank   = isUp ? upB       : gateB;
+    const unsigned char* sfbBank = isUp ? upSFB     : gateSFB;
+    const float*         globals = isUp ? upGlobals : gateGlobals;
+    unsigned char*       dBank   = isUp ? upD       : gateD;
+
+    problems[idx]  = UnderlyingProblem{M, N, K};
+    ptrA[idx]      = reinterpret_cast<const GemmElementA*>(aBank + padRow * (static_cast<long>(K) / 2));
+    ptrSFA[idx]    = reinterpret_cast<const ElementSF*>(sfaBank + sfaTileOff);
+    ptrB[idx]      = reinterpret_cast<const GemmElementB*>(bBank + static_cast<long>(e) * N * (static_cast<long>(K) / 2));
+    ptrSFB[idx]    = reinterpret_cast<const ElementSF*>(sfbBank + static_cast<long>(e) * sfbStride);
+    ptrD[idx]      = reinterpret_cast<ElementDOut*>(dBank + padRow * N * static_cast<long>(sizeof(ElementDOut)));
+    ptrAlpha[idx]  = globals + e;
+    strideA[idx]   = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    strideB[idx]   = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    strideC[idx]   = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+    strideD[idx]   = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
+    layoutSFA[idx] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, N, K, 1));
+    layoutSFB[idx] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
+}
+
 // --- E-d.4c: pre-allocated scratch layout for the banks GEMM ---------------
 // The per-group CUTLASS arrays + the CUTLASS workspace live in one caller-owned
 // buffer so the banks GEMM does no per-call cudaMalloc and never syncs (the
@@ -357,7 +409,13 @@ int runGroupedNvfp4TcF32(
     fusion_args.dAlpha = {_0{}, _0{}, 1};
     fusion_args.dBeta  = {_0{}, _0{}, 0};
 
+    // 5.18.21: pin the tile raster to AlongM (mirrors vLLM's sm120 grouped
+    // FP4 kernel, nvfp4_blockwise_moe_kernel.cu:559-561). The default leaves
+    // raster_order Heuristic; AlongM improves B-weight L2 reuse across the
+    // grouped-N MoE GEMM on GB10. Numerically identical (schedule-only).
+    using RasterOrderOptions = cutlass::gemm::kernel::detail::RasterOrderOptions;
     typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
+    scheduler.raster_order = RasterOrderOptions::AlongM;
 
     arguments = typename Gemm::Arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
@@ -543,7 +601,13 @@ int runGroupedNvfp4TcF32Banks(
     fusion_args.dAlpha = {_0{}, _0{}, 1};
     fusion_args.dBeta  = {_0{}, _0{}, 0};
 
+    // 5.18.21: pin the tile raster to AlongM (mirrors vLLM's sm120 grouped
+    // FP4 kernel, nvfp4_blockwise_moe_kernel.cu:559-561). The default leaves
+    // raster_order Heuristic; AlongM improves B-weight L2 reuse across the
+    // grouped-N MoE GEMM on GB10. Numerically identical (schedule-only).
+    using RasterOrderOptions = cutlass::gemm::kernel::detail::RasterOrderOptions;
     typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
+    scheduler.raster_order = RasterOrderOptions::AlongM;
 
     arguments = typename Gemm::Arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
@@ -585,6 +649,109 @@ std::size_t groupedNvfp4TcBanksScratchBytes(int groups) {
     return layoutBanksScratch(nullptr, groups, banksWorkspaceBytes(groups)).total;
 }
 
+// Banks variant, gate+up FUSED (5.18.21). Same contract as runGroupedNvfp4TcF32Banks
+// but submits BOTH the gate and up projections in ONE grouped GEMM of 2*groups
+// groups (gate = [0,groups), up = [groups,2*groups)). The two projections share
+// the activation banks (aBank/sfaBank); each keeps its own weight bank, output
+// bank and per-expert alpha, so the result is bit-identical to two separate
+// runGroupedNvfp4TcF32Banks calls — one CUTLASS can_implement/initialize/run
+// instead of two. `scratch` must be sized via groupedNvfp4TcBanksGateUpScratchBytes.
+int runGroupedNvfp4TcF32BanksGateUp(
+    int                  groups,
+    int                  N,
+    int                  K,
+    const int*           dExpOffset,
+    const int*           dPadOffset,
+    const void*          aBank,
+    const void*          sfaBank,
+    const void*          gateBBank,
+    const void*          gateSfbBank,
+    const float*         gateGlobalsBank,
+    void*                gateDBank,
+    const void*          upBBank,
+    const void*          upSfbBank,
+    const float*         upGlobalsBank,
+    void*                upDBank,
+    void*                scratch,
+    std::size_t          scratchBytes,
+    CUstream_st*         streamRaw) {
+
+    if (groups <= 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(streamRaw);
+
+    const int groups2   = 2 * groups;
+    const std::size_t wsBytes = banksWorkspaceBytes(groups2);
+    BanksScratch sc = layoutBanksScratch(scratch, groups2, wsBytes);
+    if (scratch == nullptr || scratchBytes < sc.total) {
+        std::fprintf(stderr, "[nvfp4-tc-banks-gu] scratch too small: have %zu need %zu\n",
+                     scratchBytes, sc.total);
+        return 4;
+    }
+
+    const int threads = 64;
+    const int blocks  = (groups2 + threads - 1) / threads;
+    buildGroupArraysBanksGateUpKernel<<<blocks, threads, 0, stream>>>(
+        dExpOffset, dPadOffset, groups, N, K,
+        static_cast<const unsigned char*>(aBank), static_cast<const unsigned char*>(sfaBank),
+        static_cast<const unsigned char*>(gateBBank), static_cast<const unsigned char*>(gateSfbBank),
+        gateGlobalsBank, static_cast<unsigned char*>(gateDBank),
+        static_cast<const unsigned char*>(upBBank), static_cast<const unsigned char*>(upSfbBank),
+        upGlobalsBank, static_cast<unsigned char*>(upDBank),
+        sc.problems, sc.pA, sc.pB, sc.pSFA, sc.pSFB, sc.pD, sc.pAlpha,
+        sc.sA, sc.sB, sc.sC, sc.sD, sc.lSFA, sc.lSFB);
+
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = 0;
+    hw_info.sm_count  = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+
+    typename Gemm::Arguments arguments;
+    decltype(arguments.epilogue.thread) fusion_args;
+    fusion_args.alpha = 0;
+    fusion_args.beta  = 0;
+    fusion_args.alpha_ptr = nullptr;
+    fusion_args.beta_ptr  = nullptr;
+    fusion_args.alpha_ptr_array = sc.pAlpha;
+    fusion_args.beta_ptr_array  = nullptr;
+    fusion_args.dAlpha = {_0{}, _0{}, 1};
+    fusion_args.dBeta  = {_0{}, _0{}, 0};
+
+    using RasterOrderOptions = cutlass::gemm::kernel::detail::RasterOrderOptions;
+    typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
+    scheduler.raster_order = RasterOrderOptions::AlongM;
+
+    arguments = typename Gemm::Arguments{
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {groups2, sc.problems, nullptr},
+        {sc.pA, sc.sA, sc.pB, sc.sB,
+         sc.pSFA, sc.lSFA, sc.pSFB, sc.lSFB},
+        {fusion_args, nullptr, sc.sC, sc.pD, sc.sD},
+        hw_info, scheduler};
+
+    Gemm gemm;
+    cutlass::Status st = gemm.can_implement(arguments);
+    if (st != cutlass::Status::kSuccess) {
+        std::fprintf(stderr, "[nvfp4-tc-banks-gu] can_implement: %s\n", cutlassGetStatusString(st));
+        return 1;
+    }
+    st = gemm.initialize(arguments, sc.workspace, stream);
+    if (st != cutlass::Status::kSuccess) {
+        std::fprintf(stderr, "[nvfp4-tc-banks-gu] initialize: %s\n", cutlassGetStatusString(st));
+        return 2;
+    }
+    st = gemm.run(stream);
+    if (st != cutlass::Status::kSuccess) {
+        std::fprintf(stderr, "[nvfp4-tc-banks-gu] run: %s\n", cutlassGetStatusString(st));
+        return 3;
+    }
+    return 0;
+}
+
+std::size_t groupedNvfp4TcBanksGateUpScratchBytes(int groups) {
+    if (groups <= 0) return 0;
+    const int groups2 = 2 * groups;
+    return layoutBanksScratch(nullptr, groups2, banksWorkspaceBytes(groups2)).total;
+}
+
 #else // no SM120/SM121 support in this build
 
 bool nvfp4TcAvailable() noexcept { return false; }
@@ -613,6 +780,16 @@ int runGroupedNvfp4TcF32Banks(int, int, int, const int*, const int*,
 }
 
 std::size_t groupedNvfp4TcBanksScratchBytes(int) { return 0; }
+
+int runGroupedNvfp4TcF32BanksGateUp(int, int, int, const int*, const int*,
+                                     const void*, const void*, const void*,
+                                     const void*, const float*, void*,
+                                     const void*, const void*, const float*, void*,
+                                     void*, std::size_t, CUstream_st*) {
+    return -1;
+}
+
+std::size_t groupedNvfp4TcBanksGateUpScratchBytes(int) { return 0; }
 
 #endif
 
