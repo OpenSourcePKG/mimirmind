@@ -1888,6 +1888,21 @@ target_include_directories(gdn_prefix_cache_tests PRIVATE
     tests
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# ---- gdn_prefix_index_tests — roadmap 5.28.1.2.b cross-slot prefix index gate -
+#
+# Pure-CPU gate for the host-side keyed prefix index (GdnPrefixIndex, header-only):
+# largest-block-aligned-prefix match, the exact-token guard vs hash collisions
+# (wrong-prefix restore = contamination), refcount pinning, bounded LRU eviction.
+# No GPU, no model, header-only dep -> builds+runs on a bare host.
+# Run via:   cmake --build build --target gdn_prefix_index_tests && \
+#            build/gdn_prefix_index_tests
+add_executable(gdn_prefix_index_tests
+    tests/gdn_prefix_index_tests.cpp
+)
+target_include_directories(gdn_prefix_index_tests PRIVATE
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # ---- chat_request_parser_test — OpenAI /v1/chat/completions request parsing -
 #
 # Pure-CPU (8.19 Increment 1): parseChatRequest robustness helpers + tool_choice
