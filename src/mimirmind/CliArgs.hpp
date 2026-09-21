@@ -32,6 +32,8 @@ enum class Mode {
                    ///<          to promote apply:true in the per-HW profile.
     AttnBench,     ///< disposable prefill-attention microbench (no model load);
                    ///<          times attentionPrefillFlashAsync at head_dim=256.
+    GdnBench,      ///< disposable GatedDeltaNet chunk-forward (gdn.k2) microbench;
+                   ///<          times deltanetChunkForwardBatchedAsync at H=32,S=128,C=64.
 };
 
 /**
