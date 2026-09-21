@@ -2919,6 +2919,52 @@ void InferenceEngine::clearSlotSsmCkpts(std::size_t slot) {
     }
 }
 
+// --- 5.28.1.2.b cross-slot GDN prefix sharing (delegating wrappers) --------
+std::uint64_t InferenceEngine::snapshotSlotToPrefixImage(
+        std::size_t slot, std::size_t pos, const std::int32_t* tokens) {
+    return _servingSession == nullptr
+               ? 0
+               : _servingSession->snapshotSlotToPrefixImage(slot, pos, tokens);
+}
+
+bool InferenceEngine::lookupPrefixImage(std::span<const std::int32_t> prompt,
+                                        std::size_t& outPos,
+                                        std::uint64_t& outPayload) {
+    outPos = 0;
+    outPayload = 0;
+    return _servingSession != nullptr &&
+           _servingSession->lookupPrefixImage(prompt.data(), prompt.size(),
+                                              outPos, outPayload);
+}
+
+bool InferenceEngine::restorePrefixImageToSlot(std::size_t slot,
+                                               std::uint64_t payload) {
+    return _servingSession != nullptr &&
+           _servingSession->restorePrefixImageToSlot(slot, payload);
+}
+
+void InferenceEngine::acquirePrefixImage(std::uint64_t payload) {
+    if (_servingSession != nullptr) {
+        _servingSession->acquirePrefixImage(payload);
+    }
+}
+
+void InferenceEngine::releasePrefixImage(std::uint64_t payload) {
+    if (_servingSession != nullptr) {
+        _servingSession->releasePrefixImage(payload);
+    }
+}
+
+bool InferenceEngine::crossSlotEnabled() const {
+    return _servingSession != nullptr && _servingSession->crossSlotEnabled();
+}
+
+void InferenceEngine::drainPrefixImageFrees() {
+    if (_servingSession != nullptr) {
+        _servingSession->drainPrefixImageFrees();
+    }
+}
+
 std::size_t InferenceEngine::servingPrefillChunk() const {
     return _servingSession == nullptr ? 0
                                       : _servingSession->prefillChunkSize();

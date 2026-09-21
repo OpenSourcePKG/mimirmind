@@ -235,6 +235,10 @@ private:
         // for a warm continuation reuse (so prefillSlot skips [0,lcp), keeps the
         // resident KV+SSM, and does NOT re-zero the recurrence).
         std::size_t                     prefillStart{0};
+        // 5.28.1.2.b — if this slot was admitted via a CROSS-SLOT prefix-store
+        // HIT, the pinned store entry it restored from (0 = none). Released back
+        // to the store on retire so LRU eviction can reclaim it.
+        std::uint64_t                   xslotPayload{0};
         // Admission timestamp — used to report the request's prefill wall time
         // (admission -> first token) in ServingRequest::prefillMs.
         std::chrono::steady_clock::time_point admitAt{};
@@ -362,6 +366,12 @@ private:
     // LRU clock, touched only by the worker thread under `_mtx`.
     bool             _warmSlot{false};
     std::uint64_t    _warmTick{0};
+    // 5.28.1.2.b — CROSS-SLOT GDN prefix sharing. When on, a fresh admission can
+    // restore a shared prefix (SSM+conv+KV) produced by a now-recycled slot from
+    // a global keyed store, prefilling only the divergent tail (the multi-tenant
+    // RAG win the same-slot warm path cannot deliver). Cap default OFF; opt in via
+    // MIMIRMIND_GDN_XSLOT=1. Set in the ctor (the store lives in ServingSession).
+    bool             _xslot{false};
     // 5.21-III MULTI-SLOT — batch newly-admitted slots' prefill into ONE ragged
     // forward (unlike admit-per-iter, this batches the prefill compute itself).
     // MIMIRMIND_PREFILL_MIXED_BATCH=1; default OFF. Needs chunked prefill.

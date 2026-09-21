@@ -552,6 +552,20 @@ public:
     void        pruneSlotSsmCkpts(std::size_t slot, std::size_t keepMaxPos);
     void        clearSlotSsmCkpts(std::size_t slot);
 
+    /// 5.28.1.2.b — CROSS-SLOT GDN prefix sharing (copy-based, cap default OFF via
+    /// MIMIRMIND_GDN_XSLOT). Global keyed store so a prefix produced by one slot
+    /// can be restored into another (the ring above is same-slot only). Delegates
+    /// to the ServingSession; no-op without one. See ServingSession for semantics.
+    std::uint64_t snapshotSlotToPrefixImage(std::size_t slot, std::size_t pos,
+                                            const std::int32_t* tokens);
+    bool          lookupPrefixImage(std::span<const std::int32_t> prompt,
+                                    std::size_t& outPos, std::uint64_t& outPayload);
+    bool          restorePrefixImageToSlot(std::size_t slot, std::uint64_t payload);
+    void          acquirePrefixImage(std::uint64_t payload);
+    void          releasePrefixImage(std::uint64_t payload);
+    [[nodiscard]] bool crossSlotEnabled() const;
+    void          drainPrefixImageFrees();
+
     /// Prefill chunk size C (max tokens per `prefillSlot` forward), or 0 when
     /// chunked prefill is disabled (MIMIRMIND_CHUNKED_PREFILL=0) — callers
     /// fall back to the token-by-token prefill path. Valid after

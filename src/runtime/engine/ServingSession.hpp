@@ -154,6 +154,35 @@ public:
     void        pruneSlotSsmCkpts(std::size_t slot, std::size_t keepMaxPos);
     void        clearSlotSsmCkpts(std::size_t slot);
 
+    /// 5.28.1.2.b — CROSS-SLOT GDN prefix sharing (copy-based, cap default OFF via
+    /// MIMIRMIND_GDN_XSLOT). A global keyed store of {recurrent-only SSM+conv image
+    /// + prefix KV rows [0,pos)} lets ANY slot restore a prefix produced by a
+    /// now-recycled slot (the per-slot ring above is same-slot only).
+    ///
+    /// `snapshotSlotToPrefixImage` copies slot `slot`'s live state at `pos` (a
+    /// checkpoint boundary; tokens[0,pos) is the key) OUT into the store; returns
+    /// the new entry's payload id (0 = not stored: xslot off / invalid pos / dup).
+    /// `lookupPrefixImage` returns the largest cached block-aligned prefix that
+    /// EXACTLY equals prompt[0,pos) (hash + full token compare guards
+    /// contamination). `restorePrefixImageToSlot` copies that image's SSM+conv +
+    /// KV rows INTO `slot`; the caller then prefills [pos, promptLen).
+    /// `acquire/releasePrefixImage` refcount-pin an entry for a live slot's
+    /// lifetime so it survives LRU eviction. All device copies queue on the compute
+    /// stream; no-op on the L0 slab path / when xslot is off.
+    std::uint64_t snapshotSlotToPrefixImage(std::size_t slot, std::size_t pos,
+                                            const std::int32_t* tokens);
+    bool        lookupPrefixImage(const std::int32_t* prompt,
+                                  std::size_t promptLen, std::size_t& outPos,
+                                  std::uint64_t& outPayload);
+    bool        restorePrefixImageToSlot(std::size_t slot, std::uint64_t payload);
+    void        acquirePrefixImage(std::uint64_t payload);
+    void        releasePrefixImage(std::uint64_t payload);
+    [[nodiscard]] bool crossSlotEnabled() const;
+    /// 2b.2 — release cross-slot store images deferred by snapshot's LRU eviction
+    /// (flushes once then bulk-frees; no-op when nothing pending). Call at a
+    /// post-flush safe point (end of a slot's prefill).
+    void        drainPrefixImageFrees();
+
     /// Resident paged-KV pool footprint for the memory-telemetry route (8.16).
     /// `active` is false until the serving state has been allocated (no pool
     /// yet). `residentBytes` = numLayers x 2(K+V) x numBlocks x blockSize x

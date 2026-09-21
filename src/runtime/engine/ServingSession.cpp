@@ -15,6 +15,7 @@
 #include "runtime/TokenLogprobs.hpp"
 #include "runtime/arch/Qwen3_5MoeBackend.hpp"
 #include "runtime/engine/DFlashDecoder.hpp"
+#include "runtime/serving/GdnPrefixIndex.hpp"
 #include "runtime/serving/KvCacheSlabPool.hpp"
 #include "runtime/serving/PagedKvPool.hpp"
 #include "runtime/serving/SlabDecodeStepper.hpp"
@@ -33,6 +34,8 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
+#include <vector>
 
 namespace mimirmind::runtime::engine {
 
@@ -156,6 +159,33 @@ struct ServingState {
     };
     std::vector<SlotCkptRing>    slotCkpts;         // [maxBatch]
     static constexpr std::size_t kMaxCkptsPerSlot = 8;  // ~8*63MiB/slot cap (recurrent-only, 5.28.1.4)
+
+    // 5.28.1.2.b — CROSS-SLOT GDN prefix sharing (copy-based). The per-slot ring
+    // above is same-slot only (a continuation must land on its own still-resident
+    // slot). This is a GLOBAL keyed store so ANY admitted slot can restore a
+    // shared prefix produced by a now-recycled slot — the multi-tenant RAG win.
+    // Each PrefixImage holds the recurrent-only SSM+conv checkpoint (dense
+    // [nRec, elems], the 5.28.1.4 trim) PLUS the prefix KV rows [0,pos) copied out
+    // of the producing slot's static block-run. `GdnPrefixIndex` (host, tested)
+    // keys these by a block-aligned token prefix + refcount/LRU; `prefixImages`
+    // owns the device memory. Cap default OFF (MIMIRMIND_GDN_XSLOT=1 opts in).
+    struct PrefixImage {
+        compute::ComputeBuffer state;   // [nRec, stateElemsPerLayer] dense
+        compute::ComputeBuffer conv;    // [nRec, convElemsPerLayer] dense
+        compute::ComputeBuffer kv;      // [nFullAttn, 2(K,V), pos, slotElems] dtype
+        std::size_t            pos{0};  // block-aligned prefix length (tokens)
+    };
+    bool                                            xslot{false};
+    std::unique_ptr<GdnPrefixIndex>        prefixIndex;
+    std::unordered_map<std::uint64_t, PrefixImage>  prefixImages;
+    std::uint64_t                                   nextPayloadId{1};
+    // 5.28.1.2.b (2b.2) — deferred device frees. An evicted/dup image's producer
+    // fill-copies are stream-ordered, so freeing it inline would need a full
+    // flush (a per-insert stall once the store is at its LRU cap). Instead the
+    // images move here and drainPrefixImageFrees() releases them in bulk after a
+    // flush at a safe point (end of a slot's prefill), amortizing one flush over
+    // a whole prefill's evictions.
+    std::vector<PrefixImage>                        pendingFree;
 
     // Scratch (device).
     compute::ComputeBuffer expIdxBuf, kwBuf;
@@ -946,6 +976,39 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
                              st->blockTablesH.size() * sizeof(std::int32_t));
     st->seqLensDev  = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
     st->startPosDev = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
+
+    // 5.28.1.2.b — cross-slot GDN prefix sharing store. Cap default OFF
+    // (MIMIRMIND_GDN_XSLOT=1 opts in); LRU entry cap via MIMIRMIND_GDN_XSLOT_MAX.
+    // Key granularity == the prefill chunk (the SSM-checkpoint boundary, so the
+    // stored SSM state and KV both align at the same positions).
+    // 5.28.1.2.b DEFAULT ON for GDN-hybrid (recurrent) backends — gates green
+    // 2026-09-21 (correctness bit-exact + memory-bounded soak + RAG ~50% TTFT /
+    // hit-rate 29->67%). Opt out via MIMIRMIND_GDN_XSLOT=0. No recurrent layers =>
+    // nothing to share, stays off (and the store ops no-op on ssm==nullptr).
+    bool hasRecurrent = false;
+    for (std::size_t L = 0; L < st->blockCount; ++L) {
+        if (_e._config.isRecurrentLayer(L)) { hasRecurrent = true; break; }
+    }
+    st->xslot = hasRecurrent;
+    if (const char* xs = std::getenv("MIMIRMIND_GDN_XSLOT")) {
+        st->xslot = (std::atol(xs) > 0) && hasRecurrent;
+    }
+    // Default 64: one entry per distinct RAG prefix (the producer caches only the
+    // DEEPEST 512-boundary per prefix, so entries ~= distinct working-set prefixes,
+    // not prefixes x boundaries). ~133 MiB/entry -> ~8.5 GiB at 64, trivial on the
+    // 128 GB unified pool. cap=8 was too small for multi-tenant RAG (bench 09-21).
+    std::size_t xslotMax = 64;
+    if (const char* xm = std::getenv("MIMIRMIND_GDN_XSLOT_MAX")) {
+        const long v = std::atol(xm);
+        if (v > 0) xslotMax = static_cast<std::size_t>(v);
+    }
+    const std::size_t xblk = prefillChunkSize() ? prefillChunkSize() : 512;
+    st->prefixIndex = std::make_unique<GdnPrefixIndex>(xblk, xslotMax);
+    if (st->xslot) {
+        MM_LOG_INFO("serving",
+                    "5.28.1.2.b cross-slot GDN prefix sharing ENABLED "
+                    "(blockSize={} tok, maxEntries={})", xblk, xslotMax);
+    }
 
     st->xBufB   = _e._ops->allocate(maxBatch * st->d_model  * sizeof(float));
     st->normB   = _e._ops->allocate(maxBatch * st->d_model  * sizeof(float));
@@ -2464,6 +2527,213 @@ void ServingSession::clearSlotSsmCkpts(std::size_t slot) {
     ring.pos.clear();
     ring.state.clear();
     ring.conv.clear();
+}
+
+// --- 5.28.1.2.b cross-slot GDN prefix sharing (copy-based) ----------------
+//
+// snapshot / restore mirror captureSlotSsmCkpt / restoreSlotSsmCkptAtPos but
+// (a) copy IN/OUT of a GLOBAL keyed store (not the per-slot ring), so a prefix
+// produced by slot A can be restored into slot B, and (b) also carry the prefix
+// KV rows [0,pos) — the SSM alone is useless in serving because the attention KV
+// cannot be rebuilt over [0,pos) without re-advancing (and clobbering) the
+// recurrence. Copies are queued on the compute stream (NOT synced here): the
+// producer queues them before the next prefill chunk advances the live SSM slab,
+// and every consumer restore is queued after on the same stream, so a single
+// worker thread + one stream keeps them correctly ordered without a stall.
+
+std::uint64_t ServingSession::snapshotSlotToPrefixImage(
+        std::size_t slot, std::size_t pos, const std::int32_t* tokens) {
+    if (_state == nullptr || _state->ssm == nullptr || _state->pool == nullptr ||
+        !_state->xslot || _state->prefixIndex == nullptr || tokens == nullptr ||
+        pos == 0) {
+        return GdnPrefixIndex::kNone;
+    }
+    auto& st = *_state;
+    const std::size_t blk = st.prefixIndex->blockSize();
+    if ((pos % blk) != 0 || pos > st.maxContext) {
+        return GdnPrefixIndex::kNone;   // must be a checkpoint boundary
+    }
+    // --- SSM + conv copy-OUT into a dense recurrent-only image (mirror capture)
+    const std::size_t stStride = st.ssm->stateLayerStride();
+    const std::size_t cvStride = st.ssm->convStateLayerStride();
+    const std::size_t stElems  = st.ssm->stateElemsPerLayer();
+    const std::size_t cvElems  = st.ssm->convStateElemsPerLayer();
+    std::size_t nRec = 0;
+    for (std::size_t L = 0; L < st.blockCount; ++L) {
+        if (_e._config.isRecurrentLayer(L)) ++nRec;
+    }
+    ServingState::PrefixImage img;
+    img.pos   = pos;
+    img.state = _e._ops->allocate(nRec * stElems * sizeof(float));
+    img.conv  = _e._ops->allocate(nRec * cvElems * sizeof(float));
+    float* const       sDst = img.state.as<float>();
+    float* const       cDst = img.conv.as<float>();
+    const float* const sSrc = st.ssm->statePtr();
+    const float* const cSrc = st.ssm->convStatePtr();
+    {
+        std::size_t r = 0;
+        for (std::size_t L = 0; L < st.blockCount; ++L) {
+            if (!_e._config.isRecurrentLayer(L)) continue;
+            _e._ops->appendMemoryCopy(sDst + r * stElems,
+                                      sSrc + L * stStride + slot * stElems,
+                                      stElems * sizeof(float));
+            _e._ops->appendMemoryCopy(cDst + r * cvElems,
+                                      cSrc + L * cvStride + slot * cvElems,
+                                      cvElems * sizeof(float));
+            ++r;
+        }
+    }
+    // --- KV rows [0,pos) copy-OUT. Slot s owns physical blocks
+    // [s*blocksPerSeq, ...) contiguously, so positions [0,pos) are a single
+    // contiguous element run per full-attention layer (excl. the MTP pool layer).
+    const std::size_t nFullAttn =
+        (st.mtpPoolLayer == std::numeric_limits<std::size_t>::max())
+            ? st.pool->numLayers() : st.mtpPoolLayer;
+    const std::size_t slotElems = st.pool->slotElems();
+    const std::size_t eb        = st.pool->elemBytes();
+    const std::size_t kvBlk     = st.pool->blockSize();
+    const std::size_t startElem = slot * st.blocksPerSeq * kvBlk * slotElems;
+    const std::size_t nElem     = pos * slotElems;
+    img.kv = _e._ops->allocate(nFullAttn * 2 * nElem * eb);
+    std::uint8_t* const kvDst = static_cast<std::uint8_t*>(img.kv.get());
+    for (std::size_t L = 0; L < nFullAttn; ++L) {
+        const std::uint8_t* kSrc =
+            static_cast<const std::uint8_t*>(st.pool->keyPool(L)) + startElem * eb;
+        const std::uint8_t* vSrc =
+            static_cast<const std::uint8_t*>(st.pool->valuePool(L)) + startElem * eb;
+        _e._ops->appendMemoryCopy(kvDst + (L * 2 + 0) * nElem * eb, kSrc,
+                                  nElem * eb);
+        _e._ops->appendMemoryCopy(kvDst + (L * 2 + 1) * nElem * eb, vSrc,
+                                  nElem * eb);
+    }
+    // --- register in the keyed index (host). A duplicate prefix bounces our id
+    // back in `evicted` (keep the existing entry); LRU victims also come back —
+    // free every returned image's device memory.
+    const std::uint64_t pid = st.nextPayloadId++;
+    std::vector<std::uint64_t> evicted;
+    st.prefixIndex->insert(tokens, pos, pid, evicted);
+    // Freeing a device image (an evicted LRU victim OR our own `img` when the
+    // prefix was already cached) is an IMMEDIATE host-side free, but the producer
+    // fill-copies are queued stream-ordered — freeing a buffer with an in-flight
+    // copy is a use-after-free. 2b.2: DEFER the frees — move the images to
+    // pendingFree and release them in bulk from drainPrefixImageFrees() after a
+    // flush at a safe point (end of prefill), instead of a per-insert flush stall.
+    bool ourIdBounced = false;   // dup prefix -> keep the existing entry
+    for (const std::uint64_t e : evicted) {
+        if (e == pid) { ourIdBounced = true; continue; }
+        auto node = st.prefixImages.extract(e);   // LRU victim -> defer its free
+        if (!node.empty()) {
+            st.pendingFree.push_back(std::move(node.mapped()));
+        }
+    }
+    if (ourIdBounced) {
+        st.pendingFree.push_back(std::move(img));   // dup: defer our redundant img
+        return GdnPrefixIndex::kNone;
+    }
+    st.prefixImages.emplace(pid, std::move(img));
+    return pid;
+}
+
+bool ServingSession::lookupPrefixImage(const std::int32_t* prompt,
+                                       std::size_t promptLen, std::size_t& outPos,
+                                       std::uint64_t& outPayload) {
+    outPos = 0;
+    outPayload = GdnPrefixIndex::kNone;
+    if (_state == nullptr || !_state->xslot || _state->prefixIndex == nullptr) {
+        return false;
+    }
+    const auto hit = _state->prefixIndex->lookup(prompt, promptLen);
+    if (!hit.found || _state->prefixImages.count(hit.payload) == 0) {
+        return false;
+    }
+    outPos     = hit.pos;
+    outPayload = hit.payload;
+    return true;
+}
+
+bool ServingSession::restorePrefixImageToSlot(std::size_t slot,
+                                              std::uint64_t payload) {
+    if (_state == nullptr || _state->ssm == nullptr || _state->pool == nullptr ||
+        !_state->xslot) {
+        return false;
+    }
+    auto& st = *_state;
+    const auto it = st.prefixImages.find(payload);
+    if (it == st.prefixImages.end()) {
+        return false;   // evicted between lookup and restore -> caller cold-prefills
+    }
+    ServingState::PrefixImage& img = it->second;
+    const std::size_t pos = img.pos;
+    // --- SSM + conv copy-IN into this slot's live slab slice (mirror restore) --
+    const std::size_t stStride = st.ssm->stateLayerStride();
+    const std::size_t cvStride = st.ssm->convStateLayerStride();
+    const std::size_t stElems  = st.ssm->stateElemsPerLayer();
+    const std::size_t cvElems  = st.ssm->convStateElemsPerLayer();
+    float* const       stDst = st.ssm->statePtr();
+    float* const       cvDst = st.ssm->convStatePtr();
+    const float* const stSrc = img.state.as<float>();
+    const float* const cvSrc = img.conv.as<float>();
+    std::size_t r = 0;
+    for (std::size_t L = 0; L < st.blockCount; ++L) {
+        if (!_e._config.isRecurrentLayer(L)) continue;
+        _e._ops->appendMemoryCopy(stDst + L * stStride + slot * stElems,
+                                  stSrc + r * stElems, stElems * sizeof(float));
+        _e._ops->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
+                                  cvSrc + r * cvElems, cvElems * sizeof(float));
+        ++r;
+    }
+    // --- KV rows [0,pos) copy-IN into this slot's static block-run -----------
+    const std::size_t nFullAttn =
+        (st.mtpPoolLayer == std::numeric_limits<std::size_t>::max())
+            ? st.pool->numLayers() : st.mtpPoolLayer;
+    const std::size_t slotElems = st.pool->slotElems();
+    const std::size_t eb        = st.pool->elemBytes();
+    const std::size_t kvBlk     = st.pool->blockSize();
+    const std::size_t startElem = slot * st.blocksPerSeq * kvBlk * slotElems;
+    const std::size_t nElem     = pos * slotElems;
+    const std::uint8_t* const kvSrc =
+        static_cast<const std::uint8_t*>(img.kv.get());
+    for (std::size_t L = 0; L < nFullAttn; ++L) {
+        std::uint8_t* kDst =
+            static_cast<std::uint8_t*>(st.pool->keyPool(L)) + startElem * eb;
+        std::uint8_t* vDst =
+            static_cast<std::uint8_t*>(st.pool->valuePool(L)) + startElem * eb;
+        _e._ops->appendMemoryCopy(kDst, kvSrc + (L * 2 + 0) * nElem * eb,
+                                  nElem * eb);
+        _e._ops->appendMemoryCopy(vDst, kvSrc + (L * 2 + 1) * nElem * eb,
+                                  nElem * eb);
+    }
+    return true;
+}
+
+void ServingSession::acquirePrefixImage(std::uint64_t payload) {
+    if (_state != nullptr && _state->xslot && _state->prefixIndex != nullptr) {
+        _state->prefixIndex->acquire(payload);
+    }
+}
+
+void ServingSession::releasePrefixImage(std::uint64_t payload) {
+    if (_state != nullptr && _state->xslot && _state->prefixIndex != nullptr) {
+        _state->prefixIndex->release(payload);
+    }
+}
+
+bool ServingSession::crossSlotEnabled() const {
+    return _state != nullptr && _state->xslot;
+}
+
+void ServingSession::drainPrefixImageFrees() {
+    // 5.28.1.2.b (2b.2) — release deferred cross-slot store images. Called at a
+    // safe point (end of a slot's prefill, after prefillSlot already flushed);
+    // the flush here guarantees every queued fill-copy has completed before the
+    // host-side frees, so a bulk clear() can never race an in-flight copy. No-op
+    // (and NO flush) when nothing is pending — the common case, so this adds no
+    // stall until the store is churning at its LRU cap.
+    if (_state == nullptr || _state->pendingFree.empty()) {
+        return;
+    }
+    _e._ops->flush();
+    _state->pendingFree.clear();   // ComputeBuffer dtors free the device memory
 }
 
 std::vector<std::vector<std::int32_t>>

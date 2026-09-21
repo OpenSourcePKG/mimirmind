@@ -115,6 +115,16 @@ ContinuousBatcher::ContinuousBatcher(InferenceEngine& engine,
         _warmSlot = (std::atol(wc) > 0) && _engine.backendNeedsSsmScratch() &&
                     _prefillChunk > 0;
     }
+    // 5.28.1.2.b — cross-slot prefix sharing. DEFAULT ON for GDN/SSM backends with
+    // chunked prefill (gates green 2026-09-21: correctness + memory-bounded + RAG
+    // ~50% TTFT). Same precondition as the warm-slot path. Opt out via
+    // MIMIRMIND_GDN_XSLOT=0. The ServingSession-side store defaults on with the same
+    // recurrent-backend precondition, so both sides agree regardless of ctor order.
+    _xslot = _engine.backendNeedsSsmScratch() && _prefillChunk > 0;
+    if (const char* xs = std::getenv("MIMIRMIND_GDN_XSLOT")) {
+        _xslot = (std::atol(xs) > 0) && _engine.backendNeedsSsmScratch() &&
+                 _prefillChunk > 0;
+    }
     // 5.30.1 — thinking-token-budget: resolve the <think>/</think> token ids once
     // and read the (server/ops) budget. Default 0 = disabled, so the decode loop
     // is bit-identical unless an operator sets a budget. Inert if the model has no
@@ -254,6 +264,13 @@ void ContinuousBatcher::retireSlot(std::size_t slot, bool keepWarm) {
     s.occupied = false;
     s.req.reset();
     s.prefillStart = 0;
+    // 5.28.1.2.b — unpin the cross-slot store entry this slot restored from (if
+    // any) so LRU can reclaim it once no live slot references it. The store entry
+    // itself survives the slot recycle — that is the whole point of cross-slot.
+    if (s.xslotPayload != 0) {
+        _engine.releasePrefixImage(s.xslotPayload);
+        s.xslotPayload = 0;
+    }
     if (keepWarm && _warmSlot && !s.residentTokens.empty()) {
         s.resident     = true;
         s.residentTick = ++_warmTick;
@@ -519,6 +536,11 @@ void ContinuousBatcher::prefillSlotAdmitted(std::size_t slot) {
     // pos == promptLen-1).
     std::int32_t firstTok = -1;
     TokenLogprobs firstLp;   // 8.19.14 — captured on the last (token-producing) chunk
+    // 5.28.1.2.b — the deepest block-aligned boundary (<= L); the only position the
+    // cross-slot producer snapshots (one store entry per prefix). 0 if the prompt
+    // is shorter than one chunk (nothing to cache).
+    const std::size_t xslotDeepest =
+        (_xslot && _prefillChunk > 0) ? (L / _prefillChunk) * _prefillChunk : 0;
     try {
         const std::size_t C = _prefillChunk;
         for (std::size_t p = start; p < L; p += C) {
@@ -538,6 +560,18 @@ void ContinuousBatcher::prefillSlotAdmitted(std::size_t slot) {
             if (_warmSlot) {
                 _engine.captureSlotSsmCkpt(slot, p + t);
             }
+            // 5.28.1.2.b PRODUCER — publish this prefix to the GLOBAL cross-slot
+            // store: SSM+conv state (live now, at p+t) + KV[0,p+t). Queued on the
+            // same stream BEFORE the next chunk's forward advances the live SSM
+            // slab, so the copies read the correct state@(p+t) without a per-chunk
+            // sync. Only the DEEPEST block boundary (largest 512-multiple <= L) is
+            // cached — one entry per prefix (a later request sharing the full
+            // prefix restores here and prefills only its divergent tail), which
+            // keeps the store's working set = distinct prefixes, not prefixes x
+            // boundaries (bench 09-21: caching every boundary blew the LRU cap).
+            if (_xslot && (p + t) == xslotDeepest && xslotDeepest > 0) {
+                _engine.snapshotSlotToPrefixImage(slot, xslotDeepest, prompt.data());
+            }
         }
     } catch (const std::exception& ex) {
         std::lock_guard<std::mutex> lk(_mtx);
@@ -554,6 +588,13 @@ void ContinuousBatcher::prefillSlotAdmitted(std::size_t slot) {
             s.prompt.clear();
         }
         return;
+    }
+
+    // 5.28.1.2.b (2b.2) — release cross-slot store images deferred by this
+    // prefill's LRU evictions. Safe here: the chunk loop's last prefillSlot
+    // already flushed, so every deferred image's fill-copies have completed.
+    if (_xslot) {
+        _engine.drainPrefixImageFrees();
     }
 
     commitPrefilledSlot(slot, req, firstTok, std::move(firstLp));
@@ -979,6 +1020,7 @@ void ContinuousBatcher::workerLoop() {
                     _engine.pruneSlotSsmCkpts(ws, lcp);
                     s.occupied     = true;
                     s.resident     = false;
+                    s.xslotPayload = 0;   // 5.28.1.2.b — same-slot reuse, no store pin
                     s.req          = std::move(it->req);
                     s.prompt       = std::move(it->prompt);
                     s.promptLen    = s.prompt.size();
@@ -1006,6 +1048,71 @@ void ContinuousBatcher::workerLoop() {
                 }
             }
 
+            // 5.28.1.2.b — CROSS-SLOT pass: for requests the same-slot warm pass
+            // could not place, consult the GLOBAL prefix store. A hit restores a
+            // shared prefix (SSM+conv+KV) produced by a now-recycled slot into a
+            // fresh cold slot and prefills only the divergent tail — the
+            // multi-tenant RAG win. Runs after the warm pass (same-slot reuse is
+            // cheaper: no copy) and before the cold loop. Cap OFF unless _xslot.
+            if (_xslot) {
+                for (auto it = _waiting.begin();
+                     it != _waiting.end() &&
+                     (_admitPerIter == 0 || admitted < _admitPerIter); ) {
+                    std::size_t   xpos = 0;
+                    std::uint64_t xpid = 0;
+                    if (!_engine.lookupPrefixImage(it->prompt, xpos, xpid) ||
+                        xpos == 0 || xpos >= it->prompt.size()) {
+                        ++it;
+                        continue;   // no usable cross-slot prefix -> cold loop
+                    }
+                    const std::size_t i = pickColdSlot();
+                    if (i == std::numeric_limits<std::size_t>::max()) {
+                        break;      // no free slot this iteration
+                    }
+                    // Copy the stored SSM+conv+KV[0,xpos) into the chosen slot.
+                    // If the entry was evicted between lookup and here, fall back
+                    // to the cold loop for this request.
+                    if (!_engine.restorePrefixImageToSlot(i, xpid)) {
+                        ++it;
+                        continue;
+                    }
+                    _engine.acquirePrefixImage(xpid);   // pin for the slot lifetime
+                    Slot& s = _slots[i];
+                    // The cold pick may land on a warm-RESIDENT slot: wipe its
+                    // stale interior checkpoint ring so prefillSlotAdmitted's
+                    // same-slot restoreSlotSsmCkptAtPos(xpos) is a no-op and the
+                    // cross-slot SSM we just copied in survives.
+                    _engine.clearSlotSsmCkpts(i);
+                    s.occupied     = true;
+                    s.resident     = false;
+                    s.xslotPayload = xpid;
+                    s.req          = std::move(it->req);
+                    s.prompt       = std::move(it->prompt);
+                    s.promptLen    = s.prompt.size();
+                    initThinkState(s);   // 5.30.1 thinking-token-budget
+                    s.pos          = 0;
+                    s.lastTok      = 0;
+                    s.maxNew       = it->maxNew;
+                    s.produced     = 0;
+                    s.stopIds      = std::move(it->stopIds);
+                    s.prefillPos   = 0;
+                    s.prefillStart = xpos;   // KV+SSM for [0,xpos) copied in
+                    s.admitAt      = std::chrono::steady_clock::now();
+                    _engine.setServingSlotSampling(
+                        i, it->sampling, std::span<const std::int32_t>(s.prompt));
+                    _engine.setServingSlotToolConstraint(i, it->constraint);
+                    it = _waiting.erase(it);
+                    if (_prefillChunk > 0 && s.promptLen > xpos) {
+                        toPrefill.push_back(i);
+                    }
+                    ++admitted;
+                    MM_LOG_INFO("serving",
+                                "GDN cross-slot HIT: slot={} resume@{} tok, prefill "
+                                "only {} new tok (of {}) — KV+SSM copied from store",
+                                i, xpos, s.promptLen - xpos, s.promptLen);
+                }
+            }
+
             while (!_waiting.empty()) {
                 if (_admitPerIter != 0 && admitted >= _admitPerIter) break;
                 // 5.28.1.3 LRU-preserve: prefer a truly-cold free slot so a
@@ -1020,6 +1127,7 @@ void ContinuousBatcher::workerLoop() {
                 _waiting.pop_front();
                 Slot& s     = _slots[i];
                 s.occupied  = true;
+                s.xslotPayload = 0;   // 5.28.1.2.b — cold full prefill, no store pin
                 s.req       = std::move(p.req);
                 s.prompt    = std::move(p.prompt);
                 s.promptLen = s.prompt.size();
