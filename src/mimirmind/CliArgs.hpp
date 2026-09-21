@@ -34,6 +34,8 @@ enum class Mode {
                    ///<          times attentionPrefillFlashAsync at head_dim=256.
     GdnBench,      ///< disposable GatedDeltaNet chunk-forward (gdn.k2) microbench;
                    ///<          times deltanetChunkForwardBatchedAsync at H=32,S=128,C=64.
+    MoeBench,      ///< disposable decode MoE-GEMM microbench (5.28.2 de-risk); times
+                   ///<          moeGroupedGemmNvfp4DeintAsync at M=1..8, reports GB/s vs peak.
 };
 
 /**

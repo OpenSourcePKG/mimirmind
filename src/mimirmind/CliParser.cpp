@@ -72,6 +72,8 @@ bool parseArgs(int argc, char** argv, CliArgs& out) {
             out.mode = Mode::AttnBench;
         } else if (m == "gdnbench") {
             out.mode = Mode::GdnBench;
+        } else if (m == "moebench") {
+            out.mode = Mode::MoeBench;
         } else if (m == "-h" || m == "--help") {
             std::cout << kUsage;
             std::exit(0);

@@ -1440,6 +1440,7 @@ add_executable(mimirmind
     src/mimirmind/main.cpp
     src/mimirmind/AttnBenchMode.cpp
     src/mimirmind/GdnBenchMode.cpp
+    src/mimirmind/MoeBenchMode.cpp
     src/mimirmind/CliParser.cpp
     src/mimirmind/ParityMode.cpp
     src/mimirmind/QualityGateMode.cpp

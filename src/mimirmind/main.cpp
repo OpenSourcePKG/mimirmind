@@ -3,6 +3,7 @@
 
 #include "mimirmind/AttnBenchMode.hpp"
 #include "mimirmind/GdnBenchMode.hpp"
+#include "mimirmind/MoeBenchMode.hpp"
 #include "mimirmind/CliArgs.hpp"
 #include "mimirmind/CliParser.hpp"
 #include "mimirmind/ParityMode.hpp"
@@ -86,6 +87,8 @@ int main(int argc, char** argv) {
                 return mimirmind::cli::runAttnBench(args, cfg);
             case Mode::GdnBench:
                 return mimirmind::cli::runGdnBench(args, cfg);
+            case Mode::MoeBench:
+                return mimirmind::cli::runMoeBench(args, cfg);
         }
         return 0;
 #ifdef MIMIRMIND_HAVE_L0
