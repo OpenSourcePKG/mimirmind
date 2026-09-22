@@ -19,6 +19,7 @@
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
 #include "runtime/serving/MetricsRegistry.hpp"
+#include "core/gpu/AllocCategory.hpp"
 #include "core/log/Log.hpp"
 #include "core/security/ScopedTenant.hpp"
 
@@ -265,9 +266,11 @@ struct ApiServer::Impl {
     // 8.20 — declare the server-level Prometheus families (counters/histograms
     // are updated per finished request in TenantMetrics) and register the
     // pull-based slot/queue gauges (evaluated at scrape against the live
-    // batcher). Idempotent; called once from installRoutes(). KV-block +
-    // memory gauges are 8.20.3 (need the scheduler/8.16 owner-stats path — the
-    // production batcher owns a per-slot KvCache, not a PagedKvBlockAllocator).
+    // batcher). Idempotent; called once from installRoutes(). 8.20.3 adds the
+    // memory + KV gauges: KV capacity/category from engine->memoryTelemetry()
+    // (the 8.16 owner-stats), and live KV occupancy via the batcher's new
+    // kvTokensInUse() (the prod path owns a per-slot KvCache, not a
+    // PagedKvBlockAllocator, so "used" is summed from the running slots).
     void registerServerMetrics() {
         auto& reg = runtime::serving::MetricsRegistry::instance();
         reg.declareCounter("mimirmind_prompt_tokens_total",
@@ -292,6 +295,63 @@ struct ApiServer::Impl {
             reg.registerGauge("mimirmind_queue_depth",
                               "Waiting request queue depth.",
                               [b] { return static_cast<double>(b->queueDepth()); });
+            reg.registerGauge("mimirmind_kv_tokens_used",
+                              "KV tokens held by occupied slots (live sequence lengths).",
+                              [b] { return static_cast<double>(b->kvTokensInUse()); });
+        }
+
+        // 8.20.3 — memory + KV-capacity gauges from the 8.16 owner-stats
+        // telemetry. Pull-based: engine->memoryTelemetry() is a cheap const
+        // snapshot (one backend mem-info query + array copies, no generate-lock)
+        // evaluated ONLY at scrape time — never on the decode hot path, so the
+        // decode anchor stays neutral. `engine` is null only in model-pool mode.
+        if (auto* e = engine) {
+            reg.registerGauge("mimirmind_device_memory_total_bytes",
+                              "Total device memory, bytes (backend mem-info).",
+                              [e] { return static_cast<double>(e->memoryTelemetry().deviceTotalBytes); });
+            reg.registerGauge("mimirmind_device_memory_free_bytes",
+                              "Free device memory, bytes (backend mem-info).",
+                              [e] { return static_cast<double>(e->memoryTelemetry().deviceFreeBytes); });
+            reg.registerGauge(
+                "mimirmind_device_memory_used_bytes",
+                "Used device memory, bytes (total - free).",
+                [e] {
+                    const auto mt = e->memoryTelemetry();
+                    const std::size_t used = mt.deviceTotalBytes >= mt.deviceFreeBytes
+                        ? mt.deviceTotalBytes - mt.deviceFreeBytes
+                        : 0;
+                    return static_cast<double>(used);
+                });
+            reg.registerGauge("mimirmind_model_weight_bytes",
+                              "Resident model weight bytes (startup capacity probe).",
+                              [e] { return static_cast<double>(e->memoryTelemetry().weightBytes); });
+            reg.registerGauge("mimirmind_kv_bytes_resident",
+                              "Paged-KV pool device slab, bytes (allocated up-front).",
+                              [e] { return static_cast<double>(e->memoryTelemetry().kvResidentBytes); });
+            reg.registerGauge("mimirmind_kv_blocks_total",
+                              "Total KV blocks in the pool.",
+                              [e] { return static_cast<double>(e->memoryTelemetry().kvNumBlocks); });
+            reg.registerGauge(
+                "mimirmind_kv_tokens_capacity",
+                "Total KV token capacity (blocks * block size in tokens).",
+                [e] {
+                    const auto mt = e->memoryTelemetry();
+                    return static_cast<double>(mt.kvNumBlocks * mt.kvBlockSize);
+                });
+
+            // Central-allocator per-category live bytes (CUDA tracks these; L0/
+            // HIP report zero → owner-sum fallback). Registered only when the
+            // backend actually tracks categories, so non-CUDA scrapes stay clean.
+            if (e->memoryTelemetry().allocCatAvailable) {
+                for (std::size_t i = 0; i < core::gpu::kAllocCategoryCount; ++i) {
+                    const std::string name =
+                        "mimirmind_alloc_" +
+                        std::string{core::gpu::allocCategoryName(i)} + "_bytes";
+                    reg.registerGauge(
+                        name, "Central-allocator live bytes for this category.",
+                        [e, i] { return static_cast<double>(e->memoryTelemetry().allocCatLive[i]); });
+                }
+            }
         }
     }
 

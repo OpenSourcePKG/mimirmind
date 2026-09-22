@@ -466,6 +466,17 @@ std::size_t ContinuousBatcher::queueDepth() const {
     return _waiting.size();
 }
 
+std::size_t ContinuousBatcher::kvTokensInUse() const {
+    std::lock_guard<std::mutex> lk(_mtx);
+    std::size_t n = 0;
+    for (const auto& s : _slots) {
+        if (s.occupied) {
+            n += s.pos;   // filled KV positions [0, pos) for this running slot
+        }
+    }
+    return n;
+}
+
 std::size_t ContinuousBatcher::countTenantLocked(
         std::string_view tenantId) const {
     // Derive per-tenant occupancy from live state rather than a maintained

@@ -189,6 +189,12 @@ public:
     [[nodiscard]] std::size_t activeSlots() const;
     [[nodiscard]] std::size_t queueDepth() const;
 
+    /// 8.20.3 metrics gauge: KV tokens held by occupied slots — the sum of each
+    /// running decoder's current sequence length (`Slot::pos`, i.e. the filled
+    /// KV positions). Live KV-pool occupancy vs the up-front capacity reported
+    /// by the memory telemetry. Thread-safe.
+    [[nodiscard]] std::size_t kvTokensInUse() const;
+
     /// Accepted-but-unfinished requests currently owned by `tenantId` (running
     /// slots + waiting queue). Thread-safe. Returns 0 for an empty tenant label.
     [[nodiscard]] std::size_t inflightForTenant(std::string_view tenantId) const;
