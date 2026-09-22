@@ -392,14 +392,20 @@ private:
     // decode-v2 unchanged). Auto-disabled when the substrate has no chunked prefill
     // (prefillMaxRows==0). Rollback: MIMIRMIND_MIXED_STEP=0.
     //
-    // 2026-08-24 REVERTED TO DEFAULT-OFF pending investigation: under real prod
-    // load (full serve set, mixed multi-model traffic) mixedStep=1 triggered a
-    // cudaStreamSynchronize illegal memory access that poisoned the shared CUDA
-    // context -> garbage output from OTHER co-resident models (gemma4). The
-    // isolated A/B sweeps (single model, controlled load) never hit it. Keep the
-    // feature env-opt-in (MIMIRMIND_MIXED_STEP=1) until the illegal access is
-    // root-caused and fixed; prod must run the known-good decode-v2 scheduler.
-    bool             _mixedStep{false};
+    // 2026-08-24 the multi-model wedge: under real prod load (full serve set,
+    // mixed multi-model traffic) mixedStep=1 triggered a non-deterministic kernel
+    // WEDGE (hang, 96% util, no exception) — the isolated single-model A/B sweeps
+    // never hit it, so the feature was reverted to env-opt-in for a year.
+    // 2026-09-22 ROOT-CAUSED + FIXED (5.21.14): GpuOps::uploadHostBytes ran a plain
+    // cudaMemcpy(H2D) on the LEGACY DEFAULT stream while all compute runs on
+    // per-engine NON-BLOCKING streams — the mixed-path varlen uploads (loop-bound
+    // seqT/seqOff) were unordered w.r.t. the consuming kernels, benign single-model
+    // but a race multi-model (corrupt bound -> runaway-loop kernel). Fixed by
+    // enqueuing on the engine stream (cudaMemcpyAsync). Validated on-box: sustained
+    // heavy multi-model MIXED_STEP load (48-conc cold multi-chunk prefill + embed +
+    // rerank, prefix-cache off) ran 8/8 rounds, 48/48 each, 0 CUDA errors, no wedge.
+    // Back to DEFAULT ON (server-decides). Rollback: MIMIRMIND_MIXED_STEP=0.
+    bool             _mixedStep{true};
     // 5.21-III PRESSURE GATE — only fold prefill into the decode forward when the
     // wait queue exceeds free-slot capacity (a real backlog). With no backlog,
     // newly-admitted slots take the eager chunked-prefill path so live decoders
