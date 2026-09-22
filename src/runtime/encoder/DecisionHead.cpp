@@ -52,6 +52,20 @@ std::vector<float> readF32Exact(const std::filesystem::path& p, std::size_t expe
     return out;
 }
 
+// Write a float32 array little-endian (matches readF32Exact + the trainer's
+// `.astype('<f4').tofile()`).
+void writeF32(const std::filesystem::path& p, const std::vector<float>& v) {
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("DecisionHead: cannot write " + p.string());
+    }
+    out.write(reinterpret_cast<const char*>(v.data()),
+              static_cast<std::streamsize>(v.size() * sizeof(float)));
+    if (!out) {
+        throw std::runtime_error("DecisionHead: short write on " + p.string());
+    }
+}
+
 } // namespace
 
 DecisionHead DecisionHead::loadFromDir(const std::filesystem::path& dir) {
@@ -86,6 +100,59 @@ DecisionHead DecisionHead::loadFromDir(const std::filesystem::path& dir) {
     h._weight = readF32Exact(dir / "weight.f32", k * h._hidden);
     h._bias   = readF32Exact(dir / "bias.f32", k);
     return h;
+}
+
+void DecisionHead::writeToDir(const std::filesystem::path& dir, const Spec& spec) {
+    if (spec.name.empty()) {
+        throw std::runtime_error("DecisionHead::writeToDir: 'name' must be non-empty");
+    }
+    if (spec.labels.size() < 2) {
+        throw std::runtime_error("DecisionHead::writeToDir '" + spec.name +
+                                 "': needs >= 2 labels");
+    }
+    if (spec.hidden == 0) {
+        throw std::runtime_error("DecisionHead::writeToDir '" + spec.name +
+                                 "': hidden must be > 0");
+    }
+    if (!(spec.temperature > 0.0F)) {
+        throw std::runtime_error("DecisionHead::writeToDir '" + spec.name +
+                                 "': temperature must be > 0");
+    }
+    const std::size_t k = spec.labels.size();
+    if (spec.weight.size() != k * spec.hidden) {
+        throw std::runtime_error(
+            "DecisionHead::writeToDir '" + spec.name + "': weight has " +
+            std::to_string(spec.weight.size()) + " floats, expected " +
+            std::to_string(k * spec.hidden) + " (labels*hidden)");
+    }
+    if (spec.bias.size() != k) {
+        throw std::runtime_error(
+            "DecisionHead::writeToDir '" + spec.name + "': bias has " +
+            std::to_string(spec.bias.size()) + " floats, expected " +
+            std::to_string(k));
+    }
+
+    std::filesystem::create_directories(dir);
+
+    nlohmann::json j;
+    j["name"]        = spec.name;
+    j["labels"]      = spec.labels;
+    j["hidden"]      = spec.hidden;
+    j["temperature"] = spec.temperature;
+    j["threshold"]   = spec.threshold;
+    if (!spec.encoder.empty()) {
+        j["encoder"] = spec.encoder;
+    }
+    {
+        std::ofstream out(dir / "head.json", std::ios::binary | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("DecisionHead: cannot write " +
+                                     (dir / "head.json").string());
+        }
+        out << j.dump(2);
+    }
+    writeF32(dir / "weight.f32", spec.weight);
+    writeF32(dir / "bias.f32", spec.bias);
 }
 
 DecisionHead::Result DecisionHead::decide(std::span<const float> emb) const {

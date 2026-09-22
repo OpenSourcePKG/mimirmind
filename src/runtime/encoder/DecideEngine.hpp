@@ -65,6 +65,18 @@ public:
     [[nodiscard]] std::vector<Answer>
     decide(std::string_view text, std::span<const std::string> questions) const;
 
+    /// Install or replace a trained head at runtime (8.23 head push): validates
+    /// + persists the head under `headsDir/<spec.name>` (temp-write, load-verify,
+    /// atomic rename) and swaps it into the live head set — so a fresh head goes
+    /// live without a serve restart, and survives one (it is on disk). Throws on
+    /// a headsDir-less engine, an unsafe name, a hidden-dim mismatch, or a bad
+    /// spec. NOT thread-safe: the caller (DecideHandler) serialises it against
+    /// decide() under the per-model mutex.
+    void upsertHead(const DecisionHead::Spec& spec);
+
+    /// The configured heads directory (empty → runtime head push is rejected).
+    [[nodiscard]] const std::string& headsDir() const noexcept { return _headsDir; }
+
     /// The loaded head names (question keys), for /v1/models + diagnostics.
     [[nodiscard]] std::vector<std::string> headNames() const;
 
@@ -85,6 +97,7 @@ private:
     model::XlmRobertaTokenizer _tokenizer;
     mutable EncoderRunner      _runner;
     std::vector<DecisionHead>  _heads;
+    std::string                _headsDir;   // persistence root for pushed heads
 };
 
 } // namespace mimirmind::runtime::encoder

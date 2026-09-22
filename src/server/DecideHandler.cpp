@@ -195,4 +195,100 @@ void DecideHandler::handle(const httplib::Request& req, httplib::Response& res) 
     sendJson(res, 200, out);
 }
 
+void DecideHandler::handleUpload(const httplib::Request& req, httplib::Response& res) {
+    if (_slots.empty()) {
+        sendError(res, 404, "model_not_found",
+                  "no decision model is loaded (configure a model with task=decide)");
+        return;
+    }
+
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const std::exception& e) {
+        sendError(res, 400, "invalid_request_error",
+                  std::string{"invalid JSON: "} + e.what());
+        return;
+    }
+    if (!body.is_object()) {
+        sendError(res, 400, "invalid_request_error", "body must be a JSON object");
+        return;
+    }
+
+    const std::string model = body.value("model", std::string{});
+    Slot* slot = resolve(model);
+    if (slot == nullptr) {
+        sendError(res, 400, "model_not_found",
+                  "unknown decision model '" + model + "'");
+        return;
+    }
+    if (slot->engine->headsDir().empty()) {
+        sendError(res, 409, "not_configured",
+                  "decision model '" + slot->id +
+                  "' has no headsDir configured — head upload is disabled");
+        return;
+    }
+
+    // Required fields.
+    if (!body.contains("name") || !body["name"].is_string()) {
+        sendError(res, 400, "invalid_request_error", "'name' (string) is required");
+        return;
+    }
+    if (!body.contains("labels") || !body["labels"].is_array()) {
+        sendError(res, 400, "invalid_request_error",
+                  "'labels' (array of strings) is required");
+        return;
+    }
+    if (!body.contains("hidden") || !body["hidden"].is_number_unsigned()) {
+        sendError(res, 400, "invalid_request_error",
+                  "'hidden' (positive integer) is required");
+        return;
+    }
+    if (!body.contains("weight") || !body["weight"].is_array()) {
+        sendError(res, 400, "invalid_request_error",
+                  "'weight' (array of floats, labels*hidden row-major) is required");
+        return;
+    }
+    if (!body.contains("bias") || !body["bias"].is_array()) {
+        sendError(res, 400, "invalid_request_error",
+                  "'bias' (array of floats, one per label) is required");
+        return;
+    }
+
+    runtime::encoder::DecisionHead::Spec spec{};
+    try {
+        spec.name        = body["name"].get<std::string>();
+        spec.labels      = body["labels"].get<std::vector<std::string>>();
+        spec.hidden      = body["hidden"].get<std::size_t>();
+        spec.temperature = body.value("temperature", 1.0F);
+        spec.threshold   = body.value("threshold", 0.0F);
+        spec.encoder     = body.value("encoder", std::string{});
+        spec.weight      = body["weight"].get<std::vector<float>>();
+        spec.bias        = body["bias"].get<std::vector<float>>();
+    } catch (const std::exception& e) {
+        sendError(res, 400, "invalid_request_error",
+                  std::string{"malformed head fields: "} + e.what());
+        return;
+    }
+
+    try {
+        const std::lock_guard<std::mutex> lk{*slot->mutex};
+        slot->engine->upsertHead(spec);
+    } catch (const std::exception& e) {
+        // Bad shape / hidden mismatch / unsafe name — the engine validated and
+        // rejected it before touching the live head set.
+        sendError(res, 400, "invalid_request_error",
+                  std::string{"head rejected: "} + e.what());
+        return;
+    }
+
+    json out;
+    out["model"]  = slot->id;
+    out["name"]   = spec.name;
+    out["labels"] = spec.labels;
+    out["heads"]  = slot->engine->headNames();
+    out["status"] = "ok";
+    sendJson(res, 200, out);
+}
+
 } // namespace mimirmind::server

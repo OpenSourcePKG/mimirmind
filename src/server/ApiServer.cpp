@@ -464,6 +464,21 @@ struct ApiServer::Impl {
                         decideHandler.handle(req, res);
                     });
 
+        // 8.23 head push — admin-only: the offline trainer POSTs a finished
+        // head (JSON spec + inline weight/bias) and the DecideEngine persists +
+        // hot-reloads it, so a new head goes live without a serve restart.
+        server->Post("/v1/decide/heads",
+                    [this](const httplib::Request& req,
+                           httplib::Response&       res) {
+                        if (!requireAdmin(res)) return;
+                        MM_LOG_INFO(
+                            "server",
+                            "POST /v1/decide/heads accepted from {} "
+                            "(content-length={} B)",
+                            req.remote_addr, req.body.size());
+                        decideHandler.handleUpload(req, res);
+                    });
+
         server->Post("/v1/audio/transcriptions",
                     [this](const httplib::Request& req,
                            httplib::Response&       res) {

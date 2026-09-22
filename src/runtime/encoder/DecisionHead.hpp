@@ -60,9 +60,29 @@ public:
         bool              confident{false};    // p >= threshold
     };
 
+    /// In-memory head definition for the upload/reload path (8.23 head push):
+    /// the same fields the on-disk contract carries, weights inline. `weight`
+    /// is row-major `[labels.size() * hidden]`, `bias` is `[labels.size()]`.
+    struct Spec {
+        std::string              name;
+        std::vector<std::string> labels;
+        std::size_t              hidden{0};
+        float                    temperature{1.0F};
+        float                    threshold{0.0F};
+        std::string              encoder;        // optional, informational
+        std::vector<float>       weight;
+        std::vector<float>       bias;
+    };
+
     /// Load a head from `dir` (head.json + weight.f32 + bias.f32). Throws
     /// std::runtime_error on any missing/malformed file or shape mismatch.
     [[nodiscard]] static DecisionHead loadFromDir(const std::filesystem::path& dir);
+
+    /// Serialize a validated Spec to `dir` as the on-disk contract (head.json +
+    /// weight.f32 + bias.f32), creating `dir` if needed. Validates every field
+    /// and the weight/bias shapes; throws std::runtime_error on any mismatch so
+    /// a bad push never writes a half-formed head. Round-trips with loadFromDir.
+    static void writeToDir(const std::filesystem::path& dir, const Spec& spec);
 
     /// The question key this head answers (e.g. "tool"). Matched against the
     /// request `questions` object.

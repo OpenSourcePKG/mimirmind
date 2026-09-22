@@ -16,7 +16,7 @@ DecideEngine::DecideEngine(std::string_view encoderDir,
                            std::string_view headsDir,
                            compute::ComputeOps& ops,
                            compute::ComputeMatmul& matmul)
-    : _runner{_model, ops, matmul} {
+    : _runner{_model, ops, matmul}, _headsDir{headsDir} {
     // Same frozen bge-m3 substrate as EmbedEngine: BF16 linear weights (TC GEMM
     // at M>1), F32 activations, CLS-pool + L2-normalize. The decision heads sit
     // on top of that unit embedding.
@@ -56,6 +56,51 @@ DecideEngine::DecideEngine(std::string_view encoderDir,
             _heads.push_back(std::move(h));
         }
     }
+}
+
+void DecideEngine::upsertHead(const DecisionHead::Spec& spec) {
+    if (_headsDir.empty()) {
+        throw std::runtime_error(
+            "DecideEngine: no headsDir configured — cannot persist a pushed head");
+    }
+    // Path safety: the name becomes a directory under headsDir.
+    if (spec.name.find('/') != std::string::npos ||
+        spec.name.find('\\') != std::string::npos ||
+        spec.name.find("..") != std::string::npos ||
+        spec.name == "." || spec.name == "..") {
+        throw std::runtime_error("DecideEngine: unsafe head name '" + spec.name + "'");
+    }
+    if (spec.hidden != _model.config().hidden) {
+        throw std::runtime_error(
+            "DecideEngine: head '" + spec.name + "' hidden " +
+            std::to_string(spec.hidden) + " != encoder hidden " +
+            std::to_string(_model.config().hidden));
+    }
+
+    namespace fs = std::filesystem;
+    const fs::path root{_headsDir};
+    const fs::path finalDir = root / spec.name;
+    const fs::path tmpDir   = root / ("." + spec.name + ".tmp");
+
+    // Write + validate-by-load in a temp dir, then atomically swap into place so
+    // a bad push can never corrupt a live head's on-disk copy.
+    fs::remove_all(tmpDir);
+    DecisionHead::writeToDir(tmpDir, spec);
+    DecisionHead loaded = DecisionHead::loadFromDir(tmpDir);   // re-validates on disk
+    fs::remove_all(finalDir);
+    fs::rename(tmpDir, finalDir);
+
+    for (auto& h : _heads) {
+        if (h.name() == spec.name) {
+            h = std::move(loaded);
+            MM_LOG_INFO("decide", "reloaded decision head '{}' ({} labels)",
+                        spec.name, spec.labels.size());
+            return;
+        }
+    }
+    _heads.push_back(std::move(loaded));
+    MM_LOG_INFO("decide", "installed decision head '{}' ({} labels)",
+                spec.name, spec.labels.size());
 }
 
 const DecisionHead* DecideEngine::findHead(std::string_view name) const {

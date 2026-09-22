@@ -45,6 +45,13 @@ public:
 
     void handle(const httplib::Request& req, httplib::Response& res);
 
+    /// POST /v1/decide/heads — admin-only runtime head push (8.23). Body is a
+    /// JSON head spec { name, labels[], hidden, temperature?, threshold?,
+    /// encoder?, weight[], bias[], model? }; persists it under the model's
+    /// headsDir and hot-reloads the DecideEngine so it goes live without a
+    /// restart. The route applies requireAdmin before calling this.
+    void handleUpload(const httplib::Request& req, httplib::Response& res);
+
     [[nodiscard]] bool empty() const noexcept { return _slots.empty(); }
 
     struct ModelInfo {
