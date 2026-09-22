@@ -114,8 +114,20 @@ void TenantMetrics::recordSuccess(const std::string& tenant,
     reg.incCounter("mimirmind_prompt_tokens_total",     static_cast<double>(promptTokens),     mlabel);
     reg.incCounter("mimirmind_generation_tokens_total", static_cast<double>(completionTokens), mlabel);
     reg.incCounter("mimirmind_requests_total", 1.0, {{"model", model}, {"status", "ok"}});
-    reg.observe("mimirmind_ttft_seconds", prefillMs / 1000.0, mlabel);
-    reg.observe("mimirmind_e2e_seconds", (prefillMs + decodeMs) / 1000.0, mlabel);
+    // Latency histograms: only observe when the timing is actually populated.
+    // prefillMs (TTFT, admit->first-token) is unset (0) on the mixed-step folded
+    // path, and decodeMs is unset (0) on the streaming path — both are serving
+    // telemetry gaps (ContinuousBatcher.cpp prefillSet is on the non-folded slot
+    // loop; streaming does not accumulate decodeMs). Observing those 0s would sum
+    // the histogram to 0; skip them so the buckets reflect real latencies. (Gaps
+    // tracked as a serving-telemetry follow-up; the counters/gauges are unaffected.)
+    if (prefillMs > 0.0) {
+        reg.observe("mimirmind_ttft_seconds", prefillMs / 1000.0, mlabel);
+    }
+    const double e2eMs = prefillMs + decodeMs;
+    if (e2eMs > 0.0) {
+        reg.observe("mimirmind_e2e_seconds", e2eMs / 1000.0, mlabel);
+    }
 }
 
 void TenantMetrics::recordQuotaRejected(const std::string& tenant) {
