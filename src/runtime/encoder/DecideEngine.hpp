@@ -7,6 +7,7 @@
 #include "runtime/encoder/DecisionHead.hpp"
 #include "runtime/encoder/EncoderModel.hpp"
 #include "runtime/encoder/EncoderRunner.hpp"
+#include "runtime/encoder/LinearProbeTrainer.hpp"
 
 #include <cstddef>
 #include <span>
@@ -64,6 +65,40 @@ public:
     /// `hasHead=false`. One encoder forward is shared across all heads.
     [[nodiscard]] std::vector<Answer>
     decide(std::string_view text, std::span<const std::string> questions) const;
+
+    /// One labelled training example for in-process head training.
+    struct TrainExample {
+        std::string text;
+        std::string label;
+    };
+
+    /// Fit metrics + the installed head, returned by trainHead.
+    struct TrainReport {
+        std::string              name;
+        std::vector<std::string> labels;
+        std::size_t              nExamples{0};
+        std::size_t              nTrain{0};
+        std::size_t              nVal{0};
+        double                   trainAccuracy{0.0};
+        double                   valAccuracy{0.0};
+        double                   finalLoss{0.0};
+        std::size_t              epochs{0};
+    };
+
+    /// Train a typed-decision head IN-PROCESS from labelled examples (8.23): embed
+    /// each text through the SAME resident bge-m3 path inference uses (so train
+    /// features == serve features), fit a softmax linear probe
+    /// (LinearProbeTrainer), then persist + hot-reload it via upsertHead. `labels`
+    /// fixes the class order when non-empty (else inferred sorted-unique from the
+    /// data); `temperature`/`threshold` are baked into the head. This is the only
+    /// training MimirMind does — a convex fit over frozen features, no framework.
+    /// Throws on an empty set, an unknown example label, < 2 classes, or a
+    /// headsDir-less engine. NOT thread-safe: serialise under the per-model mutex.
+    TrainReport trainHead(const std::string& name,
+                          const std::vector<std::string>& labels,
+                          const std::vector<TrainExample>& examples,
+                          const LinearProbeTrainer::Config& cfg,
+                          float temperature, float threshold);
 
     /// Install or replace a trained head at runtime (8.23 head push): validates
     /// + persists the head under `headsDir/<spec.name>` (temp-write, load-verify,

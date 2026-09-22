@@ -291,4 +291,123 @@ void DecideHandler::handleUpload(const httplib::Request& req, httplib::Response&
     sendJson(res, 200, out);
 }
 
+void DecideHandler::handleTrain(const httplib::Request& req, httplib::Response& res) {
+    if (_slots.empty()) {
+        sendError(res, 404, "model_not_found",
+                  "no decision model is loaded (configure a model with task=decide)");
+        return;
+    }
+
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const std::exception& e) {
+        sendError(res, 400, "invalid_request_error",
+                  std::string{"invalid JSON: "} + e.what());
+        return;
+    }
+    if (!body.is_object()) {
+        sendError(res, 400, "invalid_request_error", "body must be a JSON object");
+        return;
+    }
+
+    const std::string model = body.value("model", std::string{});
+    Slot* slot = resolve(model);
+    if (slot == nullptr) {
+        sendError(res, 400, "model_not_found", "unknown decision model '" + model + "'");
+        return;
+    }
+    if (slot->engine->headsDir().empty()) {
+        sendError(res, 409, "not_configured",
+                  "decision model '" + slot->id +
+                  "' has no headsDir configured — training is disabled");
+        return;
+    }
+
+    if (!body.contains("name") || !body["name"].is_string()) {
+        sendError(res, 400, "invalid_request_error", "'name' (string) is required");
+        return;
+    }
+    if (!body.contains("examples") || !body["examples"].is_array() || body["examples"].empty()) {
+        sendError(res, 400, "invalid_request_error",
+                  "'examples' (non-empty array of {text,label}) is required");
+        return;
+    }
+    // Bound the request so a runaway payload cannot exhaust memory.
+    if (body["examples"].size() > 200000) {
+        sendError(res, 400, "invalid_request_error", "too many examples (max 200000)");
+        return;
+    }
+
+    const std::string name = body["name"].get<std::string>();
+
+    std::vector<std::string> labels;
+    if (body.contains("labels")) {
+        if (!body["labels"].is_array()) {
+            sendError(res, 400, "invalid_request_error", "'labels' must be an array of strings");
+            return;
+        }
+        try {
+            labels = body["labels"].get<std::vector<std::string>>();
+        } catch (const std::exception& e) {
+            sendError(res, 400, "invalid_request_error",
+                      std::string{"'labels' must be strings: "} + e.what());
+            return;
+        }
+    }
+
+    std::vector<runtime::encoder::DecideEngine::TrainExample> examples;
+    examples.reserve(body["examples"].size());
+    for (const auto& ex : body["examples"]) {
+        if (!ex.is_object() || !ex.contains("text") || !ex["text"].is_string() ||
+            !ex.contains("label") || !ex["label"].is_string()) {
+            sendError(res, 400, "invalid_request_error",
+                      "each example must be an object {text:string, label:string}");
+            return;
+        }
+        examples.push_back({ex["text"].get<std::string>(), ex["label"].get<std::string>()});
+    }
+
+    runtime::encoder::LinearProbeTrainer::Config cfg{};
+    if (body.contains("epochs") && body["epochs"].is_number_unsigned()) {
+        cfg.epochs = body["epochs"].get<std::size_t>();
+    }
+    if (body.contains("lr") && body["lr"].is_number()) {
+        cfg.lr = body["lr"].get<double>();
+    }
+    if (body.contains("l2") && body["l2"].is_number()) {
+        cfg.l2 = body["l2"].get<double>();
+    }
+    if (body.contains("val_split") && body["val_split"].is_number()) {
+        cfg.valSplit = body["val_split"].get<double>();
+    }
+    const float temperature = body.value("temperature", 1.0F);
+    const float threshold   = body.value("threshold", 0.0F);
+
+    runtime::encoder::DecideEngine::TrainReport rep;
+    try {
+        const std::lock_guard<std::mutex> lk{*slot->mutex};
+        rep = slot->engine->trainHead(name, labels, examples, cfg, temperature, threshold);
+    } catch (const std::exception& e) {
+        sendError(res, 400, "invalid_request_error",
+                  std::string{"training failed: "} + e.what());
+        return;
+    }
+
+    json out;
+    out["model"]          = slot->id;
+    out["name"]           = rep.name;
+    out["labels"]         = rep.labels;
+    out["n_examples"]     = rep.nExamples;
+    out["n_train"]        = rep.nTrain;
+    out["n_val"]          = rep.nVal;
+    out["train_accuracy"] = rep.trainAccuracy;
+    out["val_accuracy"]   = rep.valAccuracy;
+    out["loss"]           = rep.finalLoss;
+    out["epochs"]         = rep.epochs;
+    out["heads"]          = slot->engine->headNames();
+    out["status"]         = "ok";
+    sendJson(res, 200, out);
+}
+
 } // namespace mimirmind::server

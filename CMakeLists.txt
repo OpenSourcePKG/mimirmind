@@ -434,6 +434,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/encoder/EmbedEngine.cpp
     src/runtime/encoder/DecisionHead.cpp
     src/runtime/encoder/DecideEngine.cpp
+    src/runtime/encoder/LinearProbeTrainer.cpp
     src/runtime/dflash/DFlashDraftModel.cpp
     src/runtime/dflash/DFlashDraftRunner.cpp
     src/model/XlmRobertaTokenizer.cpp

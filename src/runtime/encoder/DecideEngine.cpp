@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <set>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace mimirmind::runtime::encoder {
 
@@ -56,6 +58,88 @@ DecideEngine::DecideEngine(std::string_view encoderDir,
             _heads.push_back(std::move(h));
         }
     }
+}
+
+DecideEngine::TrainReport DecideEngine::trainHead(
+        const std::string& name, const std::vector<std::string>& labelsIn,
+        const std::vector<TrainExample>& examples,
+        const LinearProbeTrainer::Config& cfg, float temperature, float threshold) {
+    if (examples.empty()) {
+        throw std::runtime_error("DecideEngine::trainHead '" + name + "': no examples");
+    }
+
+    // Label vocabulary: explicit order when given, else sorted-unique from data.
+    std::vector<std::string> labels = labelsIn;
+    if (labels.empty()) {
+        std::set<std::string> uniq;
+        for (const auto& e : examples) {
+            uniq.insert(e.label);
+        }
+        labels.assign(uniq.begin(), uniq.end());
+    }
+    if (labels.size() < 2) {
+        throw std::runtime_error("DecideEngine::trainHead '" + name + "': need >= 2 labels");
+    }
+    std::unordered_map<std::string, std::int32_t> labelIdx;
+    for (std::size_t i = 0; i < labels.size(); ++i) {
+        labelIdx[labels[i]] = static_cast<std::int32_t>(i);
+    }
+
+    // Embed every example through the SAME path decide() uses → train features
+    // are identical to serve features.
+    const std::size_t D = _model.config().hidden;
+    std::vector<float>        features;
+    std::vector<std::int32_t> y;
+    features.reserve(examples.size() * D);
+    y.reserve(examples.size());
+
+    for (const auto& e : examples) {
+        const auto it = labelIdx.find(e.label);
+        if (it == labelIdx.end()) {
+            throw std::runtime_error(
+                "DecideEngine::trainHead '" + name + "': example label '" +
+                e.label + "' is not in the label set");
+        }
+        const std::vector<std::int32_t> ids = _tokenizer.encodeSingle(e.text);
+        const std::vector<float> emb = _runner.embed(ids);
+        if (emb.size() != D) {
+            throw std::runtime_error("DecideEngine::trainHead: embedding dim mismatch");
+        }
+        features.insert(features.end(), emb.begin(), emb.end());
+        y.push_back(it->second);
+    }
+
+    const LinearProbeTrainer::Result res =
+        LinearProbeTrainer::train(features, D, y, labels.size(), cfg);
+
+    DecisionHead::Spec spec{};
+    spec.name        = name;
+    spec.labels      = labels;
+    spec.hidden      = D;
+    spec.temperature = temperature > 0.0F ? temperature : 1.0F;
+    spec.threshold   = threshold;
+    spec.encoder     = "bge-m3";
+    spec.weight      = res.weight;
+    spec.bias        = res.bias;
+    upsertHead(spec);   // persist + hot-reload (re-validates on disk)
+
+    MM_LOG_INFO("decide",
+                "trained head '{}' on {} examples ({} train / {} val): "
+                "train_acc={:.3f} val_acc={:.3f} loss={:.4f}",
+                name, examples.size(), res.nTrain, res.nVal,
+                res.trainAccuracy, res.valAccuracy, res.finalLoss);
+
+    TrainReport rep{};
+    rep.name          = name;
+    rep.labels        = labels;
+    rep.nExamples     = examples.size();
+    rep.nTrain        = res.nTrain;
+    rep.nVal          = res.nVal;
+    rep.trainAccuracy = res.trainAccuracy;
+    rep.valAccuracy   = res.valAccuracy;
+    rep.finalLoss     = res.finalLoss;
+    rep.epochs        = res.epochsRun;
+    return rep;
 }
 
 void DecideEngine::upsertHead(const DecisionHead::Spec& spec) {

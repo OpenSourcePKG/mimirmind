@@ -479,6 +479,22 @@ struct ApiServer::Impl {
                         decideHandler.handleUpload(req, res);
                     });
 
+        // 8.23 in-process head training — admin-only: Pegenaut delivers labelled
+        // examples, mimirmind embeds them on the resident bge-m3 encoder, fits a
+        // softmax linear probe, and installs the head live. The only training the
+        // engine does — a convex fit over frozen features, no external trainer.
+        server->Post("/v1/decide/train",
+                    [this](const httplib::Request& req,
+                           httplib::Response&       res) {
+                        if (!requireAdmin(res)) return;
+                        MM_LOG_INFO(
+                            "server",
+                            "POST /v1/decide/train accepted from {} "
+                            "(content-length={} B)",
+                            req.remote_addr, req.body.size());
+                        decideHandler.handleTrain(req, res);
+                    });
+
         server->Post("/v1/audio/transcriptions",
                     [this](const httplib::Request& req,
                            httplib::Response&       res) {

@@ -52,6 +52,13 @@ public:
     /// restart. The route applies requireAdmin before calling this.
     void handleUpload(const httplib::Request& req, httplib::Response& res);
 
+    /// POST /v1/decide/train — admin-only IN-PROCESS head training (8.23). Body
+    /// { name, labels?, examples:[{text,label}], model?, epochs?, lr?, l2?,
+    /// val_split?, temperature?, threshold? }; embeds each text through the
+    /// resident bge-m3 encoder, fits a softmax linear probe, and installs +
+    /// hot-reloads the head. The route applies requireAdmin before calling this.
+    void handleTrain(const httplib::Request& req, httplib::Response& res);
+
     [[nodiscard]] bool empty() const noexcept { return _slots.empty(); }
 
     struct ModelInfo {
