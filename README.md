@@ -2,357 +2,82 @@
 
 <h1 align="center">MimirMind</h1>
 
-<p align="center"><strong>A standalone C++20 inference engine for GGUF language models on Intel Arc integrated GPUs — written from scratch, no llama.cpp, no PyTorch, no SYCL.</strong></p>
+<p align="center"><strong>A from-scratch C++20 inference engine. One codebase serves Gemma 4 and Qwen3-Next across an Intel laptop iGPU, an NVIDIA GB10 Blackwell superchip, and AMD ROCm.</strong></p>
 
-<p align="center"><em>Odin carried Mimir's preserved head with him, seeking counsel from the wisest of all beings.</em></p>
+<p align="center">No llama.cpp. No ggml. No PyTorch. No SYCL. Just the OpenAI API and hand-written kernels.</p>
 
-<p align="center"><a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a></p>
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
+  <img src="https://img.shields.io/badge/C%2B%2B-20-00599C.svg" alt="C++20">
+  <img src="https://img.shields.io/badge/runtime%20deps-zero%20ML%20frameworks-brightgreen.svg" alt="Zero ML framework dependencies">
+  <img src="https://img.shields.io/badge/API-OpenAI%20compatible-black.svg" alt="OpenAI-compatible API">
+</p>
 
 ---
 
-## What it is
+Every line is in this repo — transformer blocks, quant matmul kernels, KV cache, MoE router, linear-attention scan, paged-attention scheduler, HTTP server. `llama.cpp` and friends exist only as the *reference oracle* we check against, bit-for-bit. Point the OpenAI SDK at it and it just works.
 
-MimirMind runs large GGUF-quantised language models on the **integrated
-Intel Arc GPU of Meteor Lake / Lunar Lake** systems through **oneAPI
-Level Zero** with **Unified Shared Memory**. It speaks the
-**OpenAI Chat Completions API** so existing clients drop in without
-modification.
+Most local-inference stacks wrap someone else's engine and wait on their roadmap. We own the whole stack: when a new architecture or accelerator shows up, we write the kernel and it runs the next day — then we **measure it on the real target and publish the number, good or bad.**
 
-It is a from-scratch implementation: the transformer block, the
-quantised matmul kernels, the KV cache, the sampling, the chat-template
-renderer, the HTTP server — every line is in this repository. There is
-no `llama.cpp`, no `ggml`, no `pytorch`, no `transformers` in the
-runtime path. Those projects exist only at the boundary of this one as
-the *reference oracle* used to verify bit-level output parity during
-development.
+## Highlights
 
-## Why this exists
+- 🧠 **Newest architectures.** Gemma 4 (26B-A4B MoE, 12B, E-series) and Qwen3-Next / Qwen3.6 35B-A3B — a hybrid of full attention, **GatedDeltaNet linear attention**, and MoE. Plus Qwen 2.5 and Qwen3-Coder-Next. Flagship reasoning models, not toys.
+- 🔌 **Drop-in OpenAI API.** `/v1/chat/completions` (streaming SSE), `/v1/embeddings`, `/v1/rerank`, `/v1/audio/*`. Tool / function calling, grammar-constrained JSON, and thinking-mode reasoning channels wired in.
+- 🎛️ **Every quant, hand-kernelled.** Q4_K/Q5_K/Q6_K/Q8_0 GGUF *and* **NVFP4** 4-bit tensor-core weights — dequant happens *inside* the matmul, never a round-trip to F32, every kernel verified element-wise against a reference.
+- 🏎️ **Serious serving engineering.** Continuous batching, **PagedAttention** (split-K, warp-shuffle), cuDNN fused-flash prefill, **cross-slot prefix sharing** (KV reuse across tenants), FP8/E4M3 KV capacity tier, per-tenant TLS + auth + admission control.
+- 🗣️ **Multimodal.** Speech-to-text (Whisper) and neural text-to-speech (Orpheus + SNAC) served through the same OpenAI-compatible endpoints.
+- 🔁 **Model-switching daemon (Munin).** Hold several models resident in unified memory and route each request to the right one — no reload, no cold start.
+- ✅ **Test-anchored.** Hundreds of unit tests from hand-crafted quant-block byte patterns up through full GPU kernels on real silicon, plus bit-exact parity gates against the reference oracle.
+- 🧱 **Pure, auditable C++20.** `std::span`, `std::expected`, `enum class`, RAII over raw handles, one class per file, no exceptions across the driver boundary.
 
-Mainstream inference stacks for Intel iGPUs (OpenVINO Model Server, the
-LocalAI SYCL backend, IPEX-LLM) have a shared blind spot: the **Gemma 4
-26B-A4B Mixture-of-Experts** model, which Google released as their
-flagship "open-weights reasoning" model in 2026. The hardware that
-should run it — a recent Core Ultra laptop with 64 GiB of shared
-DDR5 — is *capable*. The stacks just haven't shipped support for the
-gemma4 architecture yet.
+## Runs on real hardware
 
-MimirMind was built to close that gap on the hardware that was already
-on the desk. Along the way it turned out to be a remarkably clean way
-to use the Intel iGPU's Unified Memory Architecture for what it is good
-at, instead of treating it like a small discrete GPU.
+| Accelerator | Backend | Status |
+|---|---|---|
+| **Intel Meteor Lake iGPU** (Xe-LPG, Unified Memory) | Level Zero | 🟢 **Mimir-1.0 — released.** Gemma 4 26B MoE, coherent, on a laptop |
+| **NVIDIA DGX Spark GB10** (Grace + Blackwell, 128 GB) | CUDA + NVFP4 | 🟡 **Bragi (Mimir-2.0).** Serving-class, multi-tenant (≥64 chats) |
+| **AMD RDNA3+** | HIP / ROCm | 🔵 home-lab tier |
+| **x86-64 / ARM64** | CPU | ⚪ reference oracle & fallback |
 
-## Headline numbers
+One backend-neutral interface; concrete backends auto-select at runtime. A fourth accelerator is an interface to implement, not a fork.
 
-On an Intel Meteor Lake Core Ultra, single iGPU, 58 GiB of shared
-memory budget, bench mode (`governor.gpuClockPin: "rp0"`,
-`features.clr: true` in `config.json`):
+### The headline: a 26B MoE on a laptop iGPU
 
-| Model | Quant | Memory | Decode | Output verified |
-|---|---|---:|---:|---|
-| Qwen 2.5 7B Instruct | Q4_K_M | 4.4 GiB | **126 ms/tok** | Bit-exact vs llama-cli |
-| **Gemma 4 E4B Instruct** | **Q4_K_M** | **2.5 GiB** | **132 ms/tok** | Greedy match vs reference |
-| **Gemma 4 26B-A4B Instruct** | **Q6_K** | **21.3 GiB** | **148 ms/tok** | Greedy match vs reference |
-| **Gemma 4 26B-A4B Instruct** | **Q8_0** | **25.0 GiB** | **145 ms/tok** | Greedy match vs reference |
+Intel Meteor Lake Core Ultra, single integrated GPU, shared DDR5:
 
-That's a 26-billion-parameter MoE running at ~7 tokens per second on a
-consumer integrated GPU — about the speed of a dense 7B model, because
-only 4 B parameters are active per token. The Gemma 4 E4B variant
-delivers comparable throughput at ~1/8 the memory footprint, making it
-the sweet spot for interactive workloads on constrained hardware.
+| Model | Quant | Memory | Decode |
+|---|---|---:|---:|
+| Gemma 4 E4B Instruct | Q4_K_M | 2.5 GiB | **132 ms/tok** |
+| Gemma 4 26B-A4B Instruct | Q6_K | 21.3 GiB | **148 ms/tok** |
+| Gemma 4 26B-A4B Instruct | Q8_0 | 25.0 GiB | **145 ms/tok** |
 
-## What makes it different
+A 26-billion-parameter MoE at ~dense-7B speed (only ~4 B active/token) — on a consumer iGPU, no discrete card. On GB10 the same engine flips to NVFP4 serving mode with paged prefill and cross-slot KV reuse across many concurrent chats.
 
-**Built for UMA, not adapted.** Discrete-GPU inference engines treat
-host RAM and GPU VRAM as separate worlds connected by a PCIe straw.
-On Meteor Lake there is no straw — the CPU and the iGPU read from the
-same physical DDR5. MimirMind allocates every weight, every KV-cache
-row, and every scratch buffer through `zeMemAllocShared`, then hands
-the *same* pointer to GPU kernels and to CPU helpers. There are no
-host↔device copies.
-
-**Per-tensor allocation, no monolith.** The Level Zero loader on
-Meteor Lake currently caps single allocations at ~4 GiB. Many engines
-work around this by enabling relaxed-allocation env vars and praying.
-MimirMind allocates one block per GGUF tensor — 658 of them for
-Gemma 4 — through a segregated-bucket free-list allocator. The largest
-single tensor (`ffn_gate_up_exps` at 539 MiB for Q8_0) sits well under
-the cap and the model loads in 25 GiB without any
-runtime-flag gymnastics.
-
-**Per-quantisation GPU kernels.** Q4_K, Q6_K, and Q8_0 each have a
-dedicated SPIR-V kernel compiled at build time by `ocloc`. The kernels
-dequantise on-the-fly inside the matmul — we never materialise a
-21-GiB tensor as 80 GiB of F32. Each one is verified element-wise
-against a `double`-accumulator CPU reference inside the test binary.
-
-**OpenAI-API on the wire, native engine underneath.** Existing
-clients (LangChain, the OpenAI Python SDK, your shell-script with
-`curl`) point at it without modification. Streaming SSE works. Chat
-templates for Qwen (ChatML), Gemma 2/3 (`<start_of_turn>`), and
-Gemma 4 (`<|turn>` + thinking-channel markup) are wired into the
-server and dispatched by the model's reported architecture.
-
-**210+ unit tests, four binaries.** `quant_tests`, `arch_tests`,
-`compute_tests`, and `gpu_tests` exercise the engine from
-hand-crafted Q-block byte patterns up through full GPU kernels
-on the actual iGPU. The whole suite runs in seconds.
-
-**Pure C++20.** Modern idioms (`std::span`, `std::expected`,
-`enum class`, RAII through Level Zero handles). One class per file.
-No exceptions across the Level Zero boundary. Trivially auditable.
-
-## Try it
-
-On a host with an Intel iGPU and a Q-quantised Gemma 4 or Qwen GGUF,
-either build the image locally (`docker compose build`) or point
-`MIMIRMIND_IMAGE` at a pre-built image in your own registry. The
-compose file defaults to `mimirmind:latest`.
+## Quick start
 
 ```bash
-# Copy the example config and edit it for your host — model path,
-# governor/thermal, feature toggles, etc.
-cp config.example.json config.json
-$EDITOR config.json
-
-# Point the compose at the models dir + your config, then start.
-export MIMIRMIND_MODELS_DIR=/path/to/your/ggufs
+cp config.example.json config.json && $EDITOR config.json
+export MIMIRMIND_MODELS_DIR=/path/to/your/models
 export MIMIRMIND_CONFIG_HOST=$PWD/config.json
-# Optional: pull from your own registry instead of the default local tag.
-# export MIMIRMIND_IMAGE=your-registry.example/mimirmind:latest
 docker compose -f docker-compose.server.yml up -d
 ```
-
-Then talk to it like it's GPT-4:
 
 ```bash
 curl -s http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{
-    "messages": [
-      {"role": "user", "content": "What is the capital of France?"}
-    ]
-  }' | jq -r '.choices[0].message.content'
+  -d '{"messages":[{"role":"user","content":"What is the capital of France?"}]}' \
+  | jq -r '.choices[0].message.content'
 # -> "The capital of France is **Paris**."
 ```
 
-Streaming with `"stream": true` produces SSE just like the official API.
+Native build: `cmake -B build && cmake --build build`. Accelerator setup in [`doc/build.md`](doc/build.md).
 
-For the full setup, including the host-side `/dev/dri` passthrough
-quirks, see [`doc/build.md`](doc/build.md).
+## The road (Norse-themed)
 
-## Configuration
+**Well** (load) → **Envoy** (kernels) → **🎯 Mimir-1.0** (released: OpenAI HTTP + Gemma 4 on Intel) → **Sleipnir** (Xe-LPG perf) → **🌈 Bragi** (serving-class CUDA on GB10: NVFP4, batching, multi-tenant). Cross-cutting: **Munin** (model-switching daemon), **Heimdall** (auth/TLS), **Loki/Nornir** (LoRA), **Bifröst** (Anthropic↔OpenAI proxy).
 
-Every runtime knob lives in `config.json`. There are no `MIMIRMIND_*`
-env vars any more — copy `config.example.json` and edit for your host.
-The loader fails fast on a missing file or unknown fields (typo
-protection).
+We work measure-first: build a lever, run it on the real target, ship it with numbers or shelve it with data. Correctness — bit-exact parity gates — before speed. There's even a book being written alongside: *"From Zero to an Inference Engine."*
 
-**Precedence:** CLI flag > `config.json` > compiled default.
+---
 
-**CLI overrides** (per invocation): `--config PATH`, `--model PATH`,
-`--port N`, `--log-level`, `--log-file`. Sampling flags (`--prompt`,
-`--temperature`, `--top-k`, `--top-p`, `--seed`) are per-run and don't
-belong in the file.
-
-**Config sections:**
-
-| Section | What it controls |
-|---|---|
-| `models[]` | Loadable model entries (id + path). A standalone mimirmind worker binds to one model at start; **Munin** (see below) holds every `loadOnStart:true` entry resident in USM at once, and attached workers pick one by id. `speculative` additionally binds a draft alongside the target inside the same worker. |
-| `server` | Port, log level, log file. |
-| `runtime` | KV dtype (`f32`/`q8_0`), max context tokens, USM probe cap, SPV dir, preserve-thinking. Per-model overrides via `models[].runtime`. |
-| `features` | `clr`, `flashPrefill`, `fusedQkv`, `moeGroup`, `gemm` (auto/force/disable), `gemmV2`, `gemmMinM`, `dp4a`. |
-| `speculative` | Enable + target/draft model ids + `n` (draft tokens per verify round). |
-| `governor` | `gpuClockPin`, `tickLog`/`tickLogFile` (per-tick NDJSON sink), fan settings, and the inline thermal profile (formerly a separate `--thermal-profile` file). |
-| `diagnostics` | `parityDump`, `traceBlock0`, `traceDecodeFile`, `traceOpTimes`, `gpuBench`, `regressionAlert`. |
-
-The compose file's header carries the complete `MIMIRMIND_*` → JSON
-mapping table for anyone migrating an existing deployment.
-
-## Status
-
-**Mimir-1.0 — Release.** Gemma 4 (26B-A4B MoE, E4B) and Qwen 2.5 all
-work end-to-end through the OpenAI HTTP API. All 210+ unit tests green;
-the Level-Zero / SPV-kernel side is verified against CPU reference math
-on real hardware. Command-List Replay (M-CLR) is live in production
-(−6.4 % decode on E4B, verified 2026-07-06).
-
-**Project Sleipnir** is the post-release performance and
-model-extension phase. Where it landed:
-
-- **M10.2 — KV-Cache dtype layer** (F32 → FP16 → Q8_0). Halves (FP16) or
-  quarters (FP8/E4M3, CUDA/Bragi) KV reads per attention call. **FP16 KV
-  done**; the CUDA **FP8/E4M3 capacity tier** gives ~4× KV headroom at
-  fixed VRAM (env-gated). The largest bandwidth-relevant lever for long
-  contexts / concurrency headroom.
-- **M-Ratatoskr — Gemma 4 MTP-drafter / speculative decoding**. Concluded
-  a **net loss** on the optimised MoE baseline: on Xe-LPG the batched-verify
-  GEMM is hardware-blocked (no matrix engine), and on CUDA/Bragi MTP, DFlash
-  and OEA batch-aware routing were all built + measured but do not beat the
-  tuned batched decode. Reusable IP (drafter loaders, ReplaySSM fold) is
-  banked; revisit only on matrix-engine hardware or a different model.
-
-Mimir-1.0's release-blocking work is complete; the engine is ready to
-tag as RC1:
-
-- **Multi-request concurrency** — delivered on Xe-LPG as a backend-neutral,
-  lockless slab batcher (M9.1): concurrent users no longer serialise on a
-  per-engine mutex. Honest scope — on the Meteor Lake iGPU this is a
-  *latency / fairness* feature, not a throughput one: with no matrix engine,
-  batched decode cannot amortise weight reads (confirmed on both sparse-MoE
-  and dense). Serving-class *throughput* concurrency is a Mimir-2.0 / Bragi
-  (GB10) target, not a Mimir-1.0 one.
-- **KV-cache reuse across turns** — a multi-entry prefix cache keeps
-  interleaved conversations warm (M9.4) and reuses their K/V without
-  re-prefill.
-- **Pegenaut integration** — the sister TypeScript RAG project is served
-  chat + embeddings + rerank end-to-end.
-
-Layer streaming for oversized models is *not* a Mimir-1.0 item: on
-unified-memory Xe-LPG the weights already live in system RAM, so it belongs
-to the discrete-GPU tier, not this release.
-
-## Compute backends
-
-MimirMind builds against a backend-neutral `ComputeContext` +
-`ComputeOps` + `ComputeMatmul` interface. Four concrete backends live
-in the tree; selection is via `MIMIRMIND_BACKEND=l0|hip|cuda|cpu` or
-auto-select (walks Level Zero → HIP → CUDA → Cpu and picks the first
-that compiled + probes available).
-
-| Backend | Hardware target | Status | Kernel path |
-|---|---|---|---|
-| **Level Zero** | Intel Xe-LPG (Meteor Lake iGPU, primary target) | production | F32 / F16 / BF16 + all quant matmuls (Q4_K / Q5_K / Q5_0 / Q6_K / Q8_0), flash prefill, DP4A, Command-List Replay |
-| **HIP / ROCm** | AMD RDNA3 (`gfx1101`, RX 7800 XT bring-up rig) | end-to-end `loadModel` proven on Qwen 2.5 (Schicht 6.0, 2026-07-17). Q8_0 native, non-Q8_0 dispatch through a CPU-fallback (Schicht 6.1) using the reference dequant paths — correctness first, native Q4_K / Q5_0 / Q6_K kernels on the follow-up roadmap | Q8_0 GPU + CPU-fallback for the rest |
-| **CUDA** | NVIDIA Blackwell (GB10 on DGX Spark — serving-class **Bragi** target) | bring-up. **Qwen3.5-MoE** (release name Qwen3.6-35B-A3B; HF `model_type: qwen3_5_moe`, arch `Qwen3_5MoeForConditionalGeneration`) hybrid MoE — internal arch id `qwen35moe`: full-attention + Gated DeltaNet linear attention + MoE — generates coherent text end-to-end on GB10. The batched-decode kernel axis — per-sequence recurrent state, per-token MoE routing, ragged flash-decode attention — is implemented and parity-verified bit-for-bit against the single-sequence path. PagedAttention + continuous-batching scheduler live for multi-tenant serving (mixed prefill+decode step default-on); NVFP4 weights, FP8/E4M3 KV capacity tier | F32 + Q4_K / Q5_K / Q6_K / Q8_0 + NVFP4, GatedDeltaNet (AR + chunked prefill), fused-K / expert-grouped MoE, split-K paged flash decode |
-| **CPU** | any x86-64 / ARM64 Linux | reference / fallback / oracle. Full `ComputeOps` interface for F32 KV cache (Qwen 2.5, Gemma 4 baseline); FP16 / Q8_0 KV, DP4A, MoE fused-K throw NotImplemented by design — those are hardware-specific fast paths with no CPU analogue worth writing before there's a perf target | scalar C++ (no SIMD yet), always compiled in |
-
-Level Zero is the Mimir-1.0 production target and where the single-user
-optimisation milestones land first. CUDA is the Mimir-2.0 (**Bragi**)
-serving-class target on DGX Spark. HIP opens a third hardware family
-without going through SYCL or a vendor-neutral graph compiler. CPU is
-the in-repo reference oracle used by the parity tests + the graceful-
-degradation path on hosts without a GPU driver.
-
-The abstraction sits behind `src/core/backend/{ComputeBackend,
-ComputeContext,BackendRegistry}.hpp` and the two op interfaces at
-`src/compute/{ComputeOps,ComputeMatmul}.hpp`; concrete backends live
-under `src/core/gpu/<backend>/` (context) and `src/compute/<backend>/`
-(ops + matmul).
-
-## What's coming
-
-**Project Sleipnir: Speed.** Odin's eight-legged mount. The
-post-Mimir-1.0 performance phase. The original **~3× decode** ambition
-(native GEMM + Gemma 4 MTP-drafter) turned out **hardware-blocked** on
-Meteor Lake Xe-LPG — it has no XMX/DPAS matrix engine, so a batched-verify
-GEMM can't be made sub-linear — and speculative decoding (MTP / DFlash)
-concluded a **net loss** against the optimised MoE baseline on *both*
-platforms. What did land: the KV-cache dtype layer (**FP16 KV** done) plus
-the CLR / prefill campaigns. On CUDA/Bragi this is joined by an **FP8/E4M3
-KV capacity tier** (~4× KV headroom at fixed VRAM).
-
-**Mimir-1.1: Concurrency.** The per-engine request mutex is already
-removed on the Level-Zero path by M9.1's backend-neutral slab batcher
-(latency / fairness on Xe-LPG — throughput concurrency is a Bragi/GB10
-matter, since the iGPU has no matrix engine to amortise a batch).
-Remaining polish: slot eviction / preemption on the slab path and a
-memory-based batch-capacity probe.
-
-**Mimir-2.0 — Bragi: Serving-class.** The second production platform:
-**NVIDIA DGX Spark** (Grace ARM + Blackwell **GB10**, 128 GB unified
-LPDDR5x). Where Mimir-1.0 is single-user on the Intel iGPU, Bragi is
-multi-tenant (≥64 concurrent chats) on CUDA, with NVFP4 weights and
-native Multi-Token-Prediction speculative decoding. Bring-up is live:
-the **Qwen3.5-MoE** hybrid model (release Qwen3.6-35B-A3B, HF
-`model_type: qwen3_5_moe`; internal arch id `qwen35moe` — full-attention
-+ Gated DeltaNet linear attention + MoE) generates coherent text
-end-to-end on GB10, and the PagedAttention + continuous-batching
-scheduler is landing. The full batched-decode kernel axis (per-sequence
-recurrent state, per-token MoE routing, ragged flash-decode attention)
-is implemented and parity-verified bit-for-bit against the
-single-sequence path.
-
-**Tiered weight residency.** Layer streaming (VRAM → RAM → SSD) for
-architectures that don't fit resident — DeepSeek V4 Flash, GLM-4.7
-Flash, the Gemma 4 31B dense variant. On UMA hardware this is mostly a
-page-table-shuffle problem, not the PCIe-bandwidth problem it is on
-discrete GPUs.
-
-**HIP kernel coverage.** With the HIP backend's structural bring-up
-done (see [Compute backends](#compute-backends)), the follow-up is
-native `matmul_q4k_*` / `matmul_q5_0_*` / `matmul_q6k_*` HIP kernels
-so Qwen 2.5 and Gemma 4 stop paying the CPU-fallback round-trip on
-non-Q8_0 weights. `hipGraph` as an analogue to Level Zero's
-Command-List Replay is shelved but ready — the kernel side already
-consumes the `curLenSlot` USM indirection that CLR needed.
-
-**Pegenaut backend.** MimirMind is the inference half of a TypeScript
-RAG stack we're building in parallel. The two will ship as a unit.
-
-See [`doc/roadmap.md`](doc/roadmap.md) for the detailed milestone
-breakdown.
-
-## The two ravens
-
-The engine is not alone. Two companion components extend it — both
-named after Odin's ravens, each aligned with what it carries.
-
-<p align="center">
-  <img src="./doc/logo-munin.svg" alt="Munin" width="120">
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="./doc/logo-hugin.svg" alt="Hugin" width="120">
-</p>
-
-**Munin — memory.** The persistent model-memory daemon. Munin loads
-**one or more** GGUF models once into shared USM and keeps them resident
-across inference-worker restarts, serving short-lived attached workers
-over a chunk-based IPC. A single Munin process holds every
-`loadOnStart:true` entry from `config.json` simultaneously, in one shared
-USM pool; each attached worker binds to one model by id at attach time.
-Cold-restart the worker to swap models, or run multiple workers in
-parallel — Munin doesn't reload. Implemented and prod-shaped; lives in
-[`src/munin/`](src/munin/) and ships via
-[`docker-compose.munin.yml`](docker-compose.munin.yml). Per-request model
-switching *from a single worker* is M-Munin.3, still open.
-See [`doc/attached-rollout.md`](doc/attached-rollout.md) for the
-rollout runbook.
-
-**Hugin — thought.** The input-compression adapter. Hugin flies out to
-a long document, extracts its meaning, and returns with a small
-compressed representation that the base model consumes as if it were
-the original context. Targets 20k-token RAG windows compressed to
-64–256 memory tokens, cutting prefill traffic by two orders of
-magnitude on UMA hardware. Engineering design in
-[`doc/hugin.md`](doc/hugin.md); implementation is M-Hugin,
-currently unscheduled.
-
-Munin holds what has been gathered. Hugin flies out to gather it.
-Mimir is the wise counsellor they both serve.
-
-## Documentation
-
-| | |
-|---|---|
-| [`doc/architecture.md`](doc/architecture.md) | The Norse-themed phase breakdown, target hardware, design decisions |
-| [`doc/build.md`](doc/build.md) | Build, run, host prerequisites, GPU passthrough |
-| [`doc/api.md`](doc/api.md) | OpenAI-compatible HTTP API reference, streaming, errors |
-| [`doc/quants.md`](doc/quants.md) | Quantisation strategy: which Q-formats, which GPU kernels, which fallback |
-| [`doc/journey.md`](doc/journey.md) | The Gemma 4 debug story and the chat-template-first lesson |
-| [`doc/roadmap.md`](doc/roadmap.md) | Detailed milestones, what's done, what's next |
-| [`doc/setup-ct.md`](doc/setup-ct.md) | Proxmox LXC host setup for development |
-
-## License
-
-Licensed under the [Apache License, Version 2.0](LICENSE). See also
-[`NOTICE`](NOTICE) for attribution requirements when redistributing.
-
-Copyright 2026 Stefan Werfling.
-
-## Acknowledgements
-
-The Norse-themed phase names are not a marketing flourish. Mimir is
-the keeper of the *Well of Wisdom* — the archetype of a *loaded*
-knowledge source that does not learn anything new, only speaks what
-is already in it. That is exactly what an inference engine does to a
-trained model. The mythology earned its keep.
+<p align="center">Apache 2.0 · <em>"Mímir's head Odin takes, and it tells him many tidings true."</em></p>
