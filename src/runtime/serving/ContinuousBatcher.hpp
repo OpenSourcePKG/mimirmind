@@ -416,7 +416,19 @@ private:
     // opt-in (MIMIRMIND_MIXED_STEP_PRESSURE=1) for the untested trickle-arrival
     // regime (steady decode pool + occasional new prefill), which the burst
     // sweep does not exercise.
-    bool             _mixedStepPressureGate{false};
+    //
+    // 2026-09-22 flipped DEFAULT ON alongside the wedge fix + mixed-step default-on.
+    // A cache-OFF prefill-saturation A/B (conc32/64, ~1778-tok cold multi-chunk
+    // prefills) showed UNCONDITIONAL folding LOSING badly (conc64 agg 27.7 vs 49.9,
+    // ttft_p50 52s vs 34s) — under saturation the decode rows ride the heavy
+    // MoE-GEMM prefill forward and starve. The pressure gate folds ONLY when the
+    // wait queue actually exceeds free slots (a genuine burst > maxBatch), so at/below
+    // capacity live decoders stay on decode-v2. Honest tension: the 2026-08-24 A/B
+    // found unconditional folding wins at conc<=maxBatch in the representative
+    // (cache-on) regime, so the gate may leave some win on the table there — a
+    // cache-ON burst A/B would settle it; the gate is the conservative default that
+    // provably avoids the saturation regression. Rollback: MIMIRMIND_MIXED_STEP_PRESSURE=0.
+    bool             _mixedStepPressureGate{true};
     // 5.30.1 — thinking-token-budget: force </think> after this many generated
     // reasoning tokens when enable_thinking:true left <think> open, so the model
     // answers instead of rambling to max_tokens (vLLM thinking_token_budget).
