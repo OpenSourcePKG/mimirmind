@@ -56,9 +56,11 @@ public:
 
     /// A completed (200) request: add its prompt/completion token counts,
     /// energy (J), and prefill/decode wall-time (ms) to the tenant's totals.
+    /// `model` labels the server-level Prometheus families (8.20); empty is OK.
     void recordSuccess(const std::string& tenant,
                        std::uint64_t promptTokens, std::uint64_t completionTokens,
-                       double energyJoules, double prefillMs, double decodeMs);
+                       double energyJoules, double prefillMs, double decodeMs,
+                       const std::string& model = {});
 
     /// A request shed by the per-tenant admission quota (429).
     void recordQuotaRejected(const std::string& tenant);

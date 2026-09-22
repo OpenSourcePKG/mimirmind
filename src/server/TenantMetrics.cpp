@@ -4,6 +4,7 @@
 #include "server/TenantMetrics.hpp"
 
 #include "runtime/serving/ContinuousBatcher.hpp"
+#include "runtime/serving/MetricsRegistry.hpp"
 #include "core/log/Log.hpp"
 
 #include <chrono>
@@ -91,34 +92,60 @@ void TenantMetrics::recordSuccess(const std::string& tenant,
                                   std::uint64_t promptTokens,
                                   std::uint64_t completionTokens,
                                   double energyJoules, double prefillMs,
-                                  double decodeMs) {
-    std::lock_guard<std::mutex> lk(_mtx);
-    TenantStat& s = touchLocked(tenant);
-    s.requests_ok        += 1;
-    s.prompt_tokens      += promptTokens;
-    s.completion_tokens  += completionTokens;
-    if (energyJoules > 0.0) s.energy_joules += energyJoules;
-    s.prefill_ms         += prefillMs;
-    s.decode_ms          += decodeMs;
-    _cv.notify_all();
+                                  double decodeMs, const std::string& model) {
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        TenantStat& s = touchLocked(tenant);
+        s.requests_ok        += 1;
+        s.prompt_tokens      += promptTokens;
+        s.completion_tokens  += completionTokens;
+        if (energyJoules > 0.0) s.energy_joules += energyJoules;
+        s.prefill_ms         += prefillMs;
+        s.decode_ms          += decodeMs;
+        _cv.notify_all();
+    }
+    // 8.20 — server-level Prometheus families (per-model), in addition to the
+    // per-tenant accounting above. Latency in SECONDS (ms/1000); TTFT = prefill,
+    // e2e = prefill+decode. Registry has its own lock (no lock-order issue: it
+    // never calls back here); families are declared at server init.
+    namespace ms = ::mimirmind::runtime::serving;
+    auto& reg = ms::MetricsRegistry::instance();
+    const ms::MetricsRegistry::Labels mlabel{{"model", model}};
+    reg.incCounter("mimirmind_prompt_tokens_total",     static_cast<double>(promptTokens),     mlabel);
+    reg.incCounter("mimirmind_generation_tokens_total", static_cast<double>(completionTokens), mlabel);
+    reg.incCounter("mimirmind_requests_total", 1.0, {{"model", model}, {"status", "ok"}});
+    reg.observe("mimirmind_ttft_seconds", prefillMs / 1000.0, mlabel);
+    reg.observe("mimirmind_e2e_seconds", (prefillMs + decodeMs) / 1000.0, mlabel);
 }
 
 void TenantMetrics::recordQuotaRejected(const std::string& tenant) {
-    std::lock_guard<std::mutex> lk(_mtx);
-    touchLocked(tenant).rejected_quota += 1;
-    _cv.notify_all();
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        touchLocked(tenant).rejected_quota += 1;
+        _cv.notify_all();
+    }
+    ::mimirmind::runtime::serving::MetricsRegistry::instance().incCounter(
+        "mimirmind_requests_total", 1.0, {{"status", "rejected_quota"}});
 }
 
 void TenantMetrics::recordOverloadRejected(const std::string& tenant) {
-    std::lock_guard<std::mutex> lk(_mtx);
-    touchLocked(tenant).rejected_overload += 1;
-    _cv.notify_all();
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        touchLocked(tenant).rejected_overload += 1;
+        _cv.notify_all();
+    }
+    ::mimirmind::runtime::serving::MetricsRegistry::instance().incCounter(
+        "mimirmind_requests_total", 1.0, {{"status", "rejected_overload"}});
 }
 
 void TenantMetrics::recordError(const std::string& tenant) {
-    std::lock_guard<std::mutex> lk(_mtx);
-    touchLocked(tenant).errors += 1;
-    _cv.notify_all();
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        touchLocked(tenant).errors += 1;
+        _cv.notify_all();
+    }
+    ::mimirmind::runtime::serving::MetricsRegistry::instance().incCounter(
+        "mimirmind_requests_total", 1.0, {{"status", "error"}});
 }
 
 nlohmann::json TenantMetrics::snapshotJson(

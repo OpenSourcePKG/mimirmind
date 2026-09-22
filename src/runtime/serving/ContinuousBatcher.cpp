@@ -452,6 +452,20 @@ std::size_t ContinuousBatcher::inflight() const {
     return n;
 }
 
+std::size_t ContinuousBatcher::activeSlots() const {
+    std::lock_guard<std::mutex> lk(_mtx);
+    std::size_t n = 0;
+    for (const auto& s : _slots) {
+        if (s.occupied) ++n;
+    }
+    return n;
+}
+
+std::size_t ContinuousBatcher::queueDepth() const {
+    std::lock_guard<std::mutex> lk(_mtx);
+    return _waiting.size();
+}
+
 std::size_t ContinuousBatcher::countTenantLocked(
         std::string_view tenantId) const {
     // Derive per-tenant occupancy from live state rather than a maintained

@@ -17,6 +17,7 @@
 #include "model/ChatTemplate.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
+#include "runtime/serving/MetricsRegistry.hpp"
 #include "core/log/Log.hpp"
 #include "core/security/ScopedTenant.hpp"
 
@@ -251,8 +252,42 @@ struct ApiServer::Impl {
             });
     }
 
+    // 8.20 — declare the server-level Prometheus families (counters/histograms
+    // are updated per finished request in TenantMetrics) and register the
+    // pull-based slot/queue gauges (evaluated at scrape against the live
+    // batcher). Idempotent; called once from installRoutes(). KV-block +
+    // memory gauges are 8.20.3 (need the scheduler/8.16 owner-stats path — the
+    // production batcher owns a per-slot KvCache, not a PagedKvBlockAllocator).
+    void registerServerMetrics() {
+        auto& reg = runtime::serving::MetricsRegistry::instance();
+        reg.declareCounter("mimirmind_prompt_tokens_total",
+                           "Prompt tokens processed (label: model).");
+        reg.declareCounter("mimirmind_generation_tokens_total",
+                           "Generation tokens produced (label: model).");
+        reg.declareCounter("mimirmind_requests_total",
+                           "Chat requests by outcome (labels: model, status).");
+        reg.declareHistogram(
+            "mimirmind_ttft_seconds", "Time to first token, seconds.",
+            runtime::serving::MetricsRegistry::latencyBuckets());
+        reg.declareHistogram(
+            "mimirmind_e2e_seconds", "End-to-end request latency, seconds.",
+            runtime::serving::MetricsRegistry::latencyBuckets());
+        if (auto* b = cfg.batcher) {
+            reg.registerGauge("mimirmind_slots_active",
+                              "Occupied serving slots (running decoders).",
+                              [b] { return static_cast<double>(b->activeSlots()); });
+            reg.registerGauge("mimirmind_slots_max",
+                              "Max serving slots (maxBatch).",
+                              [b] { return static_cast<double>(b->maxBatch()); });
+            reg.registerGauge("mimirmind_queue_depth",
+                              "Waiting request queue depth.",
+                              [b] { return static_cast<double>(b->queueDepth()); });
+        }
+    }
+
     void installRoutes() {
         installAuthHook();   // pre-routing: runs before every route match
+        registerServerMetrics();   // 8.20 — declare families + gauges once
         server->Get("/health", [this](const httplib::Request& req,
                                      httplib::Response&       res) {
             handleHealth(req, res);
@@ -292,10 +327,16 @@ struct ApiServer::Impl {
         server->Get("/metrics",
                    [this](const httplib::Request&, httplib::Response& res) {
                        if (!requireAdmin(res)) return;
-                       // OpenMetrics/Prometheus text exposition format.
+                       // OpenMetrics/Prometheus text exposition format: the
+                       // per-tenant accounting (TenantMetrics) + the 8.20
+                       // server-level families (token counters, TTFT/e2e
+                       // histograms, slot/queue gauges) from MetricsRegistry.
+                       std::string body =
+                           tenantMetrics.snapshotOpenMetrics(cfg.batcher);
+                       body += runtime::serving::MetricsRegistry::instance()
+                                   .exposition();
                        res.set_content(
-                           tenantMetrics.snapshotOpenMetrics(cfg.batcher),
-                           "text/plain; version=0.0.4; charset=utf-8");
+                           body, "text/plain; version=0.0.4; charset=utf-8");
                        res.status = 200;
                    });
         server->Post("/v1/chat/completions",

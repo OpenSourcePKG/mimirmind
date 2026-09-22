@@ -1515,7 +1515,8 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                 finish, specSuffix);
 
     _metrics.recordSuccess(tenant, promptIds.size(), visible.size(),
-                           stats.packageJoules, stats.prefillMs, stats.decodeMs);
+                           stats.packageJoules, stats.prefillMs, stats.decodeMs,
+                           echoModel);
     sendJson(res, 200, response);
 }
 
@@ -2439,7 +2440,8 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
 
             this->_metrics.recordSuccess(
                 state->tenantId, state->promptIds.size(), emittedTokens,
-                stats.packageJoules, stats.prefillMs, stats.decodeMs);
+                stats.packageJoules, stats.prefillMs, stats.decodeMs,
+                state->echoModel);
 
             sink.done();
             return false;

@@ -184,6 +184,11 @@ public:
     [[nodiscard]] std::size_t inflight() const;
     [[nodiscard]] bool        atCapacity() const { return inflight() >= _maxInflight; }
 
+    /// 8.20 metrics gauges: occupied serving slots (running decoders) and the
+    /// waiting-queue depth, split out of the combined `inflight()`. Thread-safe.
+    [[nodiscard]] std::size_t activeSlots() const;
+    [[nodiscard]] std::size_t queueDepth() const;
+
     /// Accepted-but-unfinished requests currently owned by `tenantId` (running
     /// slots + waiting queue). Thread-safe. Returns 0 for an empty tenant label.
     [[nodiscard]] std::size_t inflightForTenant(std::string_view tenantId) const;
