@@ -3,6 +3,24 @@
 Post-deploy performance entries. Newest first. Box = Spark GB10 (xd-ki-pkg1),
 model qwen3.6-35B-A3B-NVFP4 unless noted.
 
+## 2026-09-22 — Prometheus /metrics memory + KV gauges (8.20.3) — DEPLOYED, decode-NEUTRAL
+
+**Change:** memory + KV gauges on `/metrics` (device total/free/used, model_weight_bytes,
+kv_bytes_resident, kv_blocks_total, kv_tokens_capacity, kv_tokens_used, per-AllocCategory
+live bytes). Sourced from `engine->memoryTelemetry()` (the 8.16 owner-stats snapshot) + a new
+`ContinuousBatcher::kvTokensInUse()` summing per-slot `Slot::pos`. Completes 8.20.
+
+**Deploy:** build-cudnn green, restart-deployed to prod (main+8.23 already live; this adds the gauges).
+
+**Perf:** decode-anchor NEUTRAL by construction — gauges are pull-only, evaluated solely on
+`/metrics` scrape (never on the decode path); `kvTokensInUse()` takes the batcher mutex briefly,
+same as the existing `activeSlots()` gauge. No counters/atomics added to the token loop. Prod
+soak-adjacent check: mixed-step default-on, 0 CUDA errors. Gauges cross-check exactly vs
+`/v1/system/memory` (weights 27.6 GB, kv resident 47.2 GB, capacity 131072×16); kv_tokens_used
+tracks a live decode (0→55→78→102→0).
+
+**Rollback:** revert the commit (gauges are additive; no runtime flag). No perf risk to roll back for.
+
 ## 2026-09-21 — GDN conv+split fusion (5.18.21.6) — DEPLOYED, ~3% prefill
 
 **Change:** commit `2419978`. New `gdn_conv_split_fuse` kernel folds the standalone
