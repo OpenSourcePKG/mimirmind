@@ -3,6 +3,25 @@
 Post-deploy performance entries. Newest first. Box = Spark GB10 (xd-ki-pkg1),
 model qwen3.6-35B-A3B-NVFP4 unless noted.
 
+## 2026-09-22 — /v1/decide/heads + /v1/decide/train (8.23.6/8.23.7) — DEPLOYED, decode-NEUTRAL
+
+**Change:** admin endpoints for runtime head upload (`POST /v1/decide/heads`) and
+in-process head training (`POST /v1/decide/train`: embed on bge-m3 → softmax linear
+probe → hot-reload). New `LinearProbeTrainer` + `DecideEngine::trainHead/upsertHead`.
+All off the chat path; prod has no decide model so both routes 404 (inert).
+
+**Deploy:** pushed (origin/main); prod runs the rebuilt build-cudnn binary (8.20.3
+gauges present, mixedStep=1 pressureGate=1 confirmed).
+
+**Anchor (like-for-like `loadtest_kv`, qwen3.6, maxtok96 ctxmult20):** conc32 agg
+71.7 / decode_est 97.3 tok/s / ttft_p50 8.78 vs the same-session earlier soak conc32
+agg 72.9 / decode 98.0 / ttft 8.37 → within run noise (−1.6% agg / −0.7% decode) =
+NEUTRAL. conc64 agg ~99 / decode ~150 (scales up), 0 errors, coherence OK
+("Merkur, Venus, Mars"), SM clock healthy (boost to 3003 MHz). Neutral by
+construction — the new code never touches the decode loop.
+
+**Rollback:** revert the commits (additive; no runtime flag).
+
 ## 2026-09-22 — Prometheus /metrics memory + KV gauges (8.20.3) — DEPLOYED, decode-NEUTRAL
 
 **Change:** memory + KV gauges on `/metrics` (device total/free/used, model_weight_bytes,
