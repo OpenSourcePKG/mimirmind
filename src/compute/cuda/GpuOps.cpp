@@ -1265,12 +1265,25 @@ void GpuOps::uploadHostBytes(void*       deviceDst,
                              const void* hostSrc,
                              std::size_t bytes) {
     if (bytes == 0) return;
-    const cudaError_t rc = cudaMemcpy(
-        deviceDst, hostSrc, bytes, cudaMemcpyHostToDevice);
+    // 5.21.14 — enqueue on the ENGINE stream, NOT the legacy default stream.
+    // A plain cudaMemcpy(H2D) runs on stream 0, which does NOT order against the
+    // per-engine NON-BLOCKING compute stream — a stream-hygiene race that is
+    // benign single-model but corrupts under multi-model load (the mixed-step
+    // wedge: unordered uploads to the varlen loop-bound buffers seqT/seqOff ->
+    // runaway-loop kernel, 96% util, no exception).
+    //
+    // No explicit drain needed and none added (a per-step full sync would
+    // serialize decode): for PAGEABLE host memory (the callers pass std::vector)
+    // cudaMemcpyAsync(H2D) copies src -> staging BEFORE returning, so the caller
+    // may reuse/mutate the source immediately (the historical host-sync contract
+    // is preserved), while the staging -> device DMA is enqueued on the engine
+    // stream and thus correctly ordered ahead of every consuming kernel.
+    const cudaError_t rc = cudaMemcpyAsync(
+        deviceDst, hostSrc, bytes, cudaMemcpyHostToDevice, _ctx.stream().handle());
     if (rc != cudaSuccess) {
         throw std::runtime_error(
             std::string{"compute::cuda::GpuOps::uploadHostBytes: "
-                        "cudaMemcpy(H2D) failed: "} + cudaGetErrorString(rc));
+                        "cudaMemcpyAsync(H2D) failed: "} + cudaGetErrorString(rc));
     }
 }
 
