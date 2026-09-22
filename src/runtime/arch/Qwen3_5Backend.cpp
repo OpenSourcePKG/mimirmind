@@ -152,6 +152,13 @@ Qwen3_5Backend::Qwen3_5Backend(const model::LlmConfig&       config,
     }
     _moeW13W.resize(_config.blockCount);
     _ssmTrace = (std::getenv("MIMIRMIND_SSM_TRACE") != nullptr);
+    _ssmBf16Sim = (std::getenv("MIMIRMIND_SSM_BF16_SIM") != nullptr);
+    if (_ssmBf16Sim) {
+        MM_LOG_INFO("qwen35moe",
+                    "MIMIRMIND_SSM_BF16_SIM active — recurrent SSM+conv state "
+                    "rounded to bf16 precision each step (5.18.10.4 coherence "
+                    "de-risk; NOT a perf/prod path)");
+    }
     if (const char* d = std::getenv("MIMIRMIND_SSM_DUMP")) {
         _ssmDump    = true;
         _ssmDumpDir = d;

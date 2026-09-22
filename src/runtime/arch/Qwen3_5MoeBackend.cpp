@@ -2140,6 +2140,16 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
         runMoeFfnBatched(blockIdx, normBuf, nRow, ctx.expIdxSlot, ctx.kwSlot, s);
     }
     blockResidualAdd(blockIdx, x, s.moeAccumBuf.as<float>(), nRow, s, /*isAttn=*/false);  // 5.27 I-9a seam
+
+    // 5.18.10.4 — BF16 SSM-state coherence de-risk (gated MIMIRMIND_SSM_BF16_SIM):
+    // round this recurrent layer's state+conv slab slice to bf16 precision AFTER
+    // the recurrence advanced it, so the next step/chunk reads the bf16-rounded
+    // state. Simulates bf16 storage (the only remaining gdn.recur decode lever)
+    // WITHOUT the invasive F32->BF16 storage change. Perf-irrelevant (coherence).
+    if (_ssmBf16Sim) {
+        _ops.roundBf16InplaceAsync(stateBase, slabNSeq * stateElems);
+        _ops.roundBf16InplaceAsync(convBase,  slabNSeq * convStateElems);
+    }
 }
 
 void Qwen3_5MoeBackend::runLinearBlockVerify(

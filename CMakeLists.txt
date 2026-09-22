@@ -1022,6 +1022,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/dequant_fp8.cu
         kernels/cuda/common/dequant_fp8_perchannel.cu
         kernels/cuda/common/cast_to_f32.cu
+        kernels/cuda/common/ssm_round_bf16.cu
         kernels/cuda/common/cublas_fp8_quant.cu
         kernels/cuda/llm/neg_exp.cu
         kernels/cuda/llm/add_one.cu

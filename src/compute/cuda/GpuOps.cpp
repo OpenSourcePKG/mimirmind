@@ -169,6 +169,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _siluMulKernel;
     core::cuda::CudaModule _siluMulSplitModule;
     core::cuda::CudaKernel _siluMulSplitKernel;
+    core::cuda::CudaModule _ssmRoundBf16Module;   // 5.18.10.4 bf16-state de-risk sim
+    core::cuda::CudaKernel _ssmRoundBf16Kernel;
     core::cuda::CudaModule _geluMulModule;
     core::cuda::CudaKernel _geluMulKernel;
     core::cuda::CudaModule _geluErfModule;
@@ -489,6 +491,8 @@ struct GpuOps::Impl {
           _siluMulKernel           {_siluMulModule.getFunction("silu_mul")},
           _siluMulSplitModule      {loadCudaModule(ctx, "silu_mul_split")},
           _siluMulSplitKernel      {_siluMulSplitModule.getFunction("silu_mul_split")},
+          _ssmRoundBf16Module      {loadCudaModule(ctx, "ssm_round_bf16")},
+          _ssmRoundBf16Kernel      {_ssmRoundBf16Module.getFunction("ssm_round_bf16")},
           _geluMulModule           {loadCudaModule(ctx, "gelu_mul")},
           _geluMulKernel           {_geluMulModule.getFunction("gelu_mul")},
           _geluErfModule           {loadCudaModule(ctx, "gelu_erf")},
@@ -1577,6 +1581,21 @@ void GpuOps::siluMulAsync(float* gate, const float* up, std::size_t n) {
     k.setPtr  (0, gate);
     k.setPtr  (1, up);
     k.setValue(2, ni);
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::roundBf16InplaceAsync(float* buf, std::size_t n) {
+    // 5.18.10.4 — round an F32 buffer to bf16 precision in place (simulate bf16
+    // SSM-state storage; coherence de-risk only, gated by the backend).
+    if (n == 0 || buf == nullptr) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "roundBf16 n");
+    auto& k = _pimpl->_ssmRoundBf16Kernel;
+    k.setPtr  (0, buf);
+    k.setValue(1, ni);
     k.launch(_ctx.stream(),
              groupsForN(n, kElementwiseLocalSize), 1, 1,
              kElementwiseLocalSize, 1, 1);

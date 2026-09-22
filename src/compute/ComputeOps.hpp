@@ -141,6 +141,13 @@ public:
                               const float* up,
                               std::size_t  n) = 0;
 
+    /// 5.18.10.4 — round an F32 buffer to BF16 precision IN PLACE (simulate bf16
+    /// SSM-state storage for the coherence de-risk; gated by the backend via
+    /// MIMIRMIND_SSM_BF16_SIM). Default no-op so non-CUDA backends ignore it.
+    virtual void roundBf16InplaceAsync(float* buf, std::size_t n) {
+        (void)buf; (void)n;
+    }
+
     // SwiGLU split for a stacked-w13 grouped-GEMM output (roadmap 5.18.8):
     //   out[r*nff + j] = silu(w13[r*2nff + j]) * w13[r*2nff + nff + j]
     // where w13 is [rows][2*nff] laid out per row as [gate(nff) | up(nff)].

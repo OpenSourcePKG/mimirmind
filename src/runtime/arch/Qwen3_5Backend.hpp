@@ -470,6 +470,10 @@ protected:
     // each forward. Localises the M-Q3N.3 length-degeneration bug (state
     // saturation) without an external reference. No-op / zero cost when off.
     bool _ssmTrace{false};
+    // 5.18.10.4 — BF16 SSM-state coherence de-risk: round the recurrent state to
+    // bf16 precision after each recurrence advance (MIMIRMIND_SSM_BF16_SIM),
+    // simulating bf16 storage without the invasive dtype change. Coherence only.
+    bool _ssmBf16Sim{false};
 
     // MIMIRMIND_SSM_DUMP=<dir>: directional per-block residual-stream dump.
     // Unlike _ssmTrace (l2+max, norm-blind), this writes the RAW last-token
