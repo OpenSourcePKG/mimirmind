@@ -326,6 +326,10 @@ struct GpuOps::Impl {
     // GDN-Inc 2: v3 with the decay gate + beta-sigmoid folded in (from the same
     // module). Removes the deltanet_gate + sigmoid_inplace launches per layer.
     core::cuda::CudaKernel _gatedDeltaNetArBatchedV3GateFusedKernel;
+    // 5.18.10.5 Inc-1 — bf16-state v3 decode kernel + f32->bf16 cast (own module).
+    core::cuda::CudaModule _gatedDeltaNetArBatchedV3Bf16Module;
+    core::cuda::CudaKernel _gatedDeltaNetArBatchedV3Bf16Kernel;
+    core::cuda::CudaKernel _castF32ToBf16Kernel;
     // MV-a: batched GDN verify (T-loop over K+1, per-position state export).
     core::cuda::CudaModule _gatedDeltaNetVerifyBatchedModule;
     core::cuda::CudaKernel _gatedDeltaNetVerifyBatchedKernel;
@@ -685,6 +689,13 @@ struct GpuOps::Impl {
           _gatedDeltaNetArBatchedV3GateFusedKernel{
               _gatedDeltaNetArBatchedV3Module.getFunction(
                   "gated_deltanet_ar_batched_v3_gatefused")},
+          _gatedDeltaNetArBatchedV3Bf16Module{
+              loadCudaModule(ctx, "gated_deltanet_ar_batched_v3_bf16")},
+          _gatedDeltaNetArBatchedV3Bf16Kernel{
+              _gatedDeltaNetArBatchedV3Bf16Module.getFunction(
+                  "gated_deltanet_ar_batched_v3_bf16")},
+          _castF32ToBf16Kernel{
+              _gatedDeltaNetArBatchedV3Bf16Module.getFunction("cast_f32_to_bf16")},
           _gatedDeltaNetVerifyBatchedModule{loadCudaModule(ctx, "gated_deltanet_verify_batched")},
           _gatedDeltaNetVerifyBatchedKernel{
               _gatedDeltaNetVerifyBatchedModule.getFunction("gated_deltanet_verify_batched")},
@@ -2280,6 +2291,53 @@ void GpuOps::gatedDeltaNetRecurrentBatchedAsync(
              static_cast<std::uint32_t>(nSeq), 1,
              static_cast<std::uint32_t>(S), 1, 1,
              useV3 ? gdnSmemBytes : 0);
+}
+
+void GpuOps::gatedDeltaNetRecurrentBatchedV3Bf16Async(
+        const float* q, const float* k_, const float* v, const float* gLog,
+        const float* beta, void* stateBf16, float* out,
+        const GdnBatchedShape& shape) {
+    // 5.18.10.5 Inc-1 — bf16-state v3 decode kernel (isolated). Same smem-staged
+    // f32 recurrence as v3; only the single global state load/store is bf16.
+    const std::size_t nSeq = shape.nSeq, T = shape.T, H = shape.H, S = shape.S;
+    if (nSeq == 0 || T == 0 || H == 0 || S == 0) {
+        return;
+    }
+    const std::size_t gdnSmemBytes = static_cast<std::size_t>(S) * S * sizeof(float);
+    auto& k = _pimpl->_gatedDeltaNetArBatchedV3Bf16Kernel;
+    k.setMaxDynamicSharedBytes(gdnSmemBytes);   // same >48 KiB opt-in as v3
+    k.setPtr  (0, q);
+    k.setPtr  (1, k_);
+    k.setPtr  (2, v);
+    k.setPtr  (3, gLog);
+    k.setPtr  (4, beta);
+    k.setPtr  (5, stateBf16);
+    k.setPtr  (6, out);
+    k.setValue(7, toInt32(T, "gdnBf16 T"));
+    k.setValue(8, toInt32(H, "gdnBf16 H"));
+    k.setValue(9, toInt32(S, "gdnBf16 S"));
+    k.setPtr  (10, shape.activeMask);
+    k.setPtr  (11, shape.seqT);
+    k.setPtr  (12, shape.seqOff);
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(H),
+             static_cast<std::uint32_t>(nSeq), 1,
+             static_cast<std::uint32_t>(S), 1, 1,
+             gdnSmemBytes);
+}
+
+void GpuOps::castF32ToBf16Async(const float* src, void* dst, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "castF32ToBf16 n");
+    auto& k = _pimpl->_castF32ToBf16Kernel;
+    k.setPtr  (0, src);
+    k.setPtr  (1, dst);
+    k.setValue(2, ni);
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
 }
 
 void GpuOps::gatedDeltaNetRecurrentGateFusedBatchedAsync(

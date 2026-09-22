@@ -141,6 +141,62 @@ int runGdnBench(const CliArgs& args, const ::mimirmind::core::config::Config& cf
                     nS, G, (double)G / 48.0, ms, tflops, tflops / 250.0 * 100.0);
         std::fflush(stdout);
     }
+    // 5.18.10.5 Inc-1 — bf16-state v3 AR/decode kernel vs f32 v3, nSeq sweep at
+    // T=1 (decode). The recurrent state R+W is the only reducible gdn.recur term
+    // (DRAM-floor-bound at conc, 5.18.10.1); bf16 halves it. Run with
+    // MIMIRMIND_GDN_V3=1 so the f32 baseline uses the v3 kernel. Parity is by
+    // construction (identical f32-smem math; only the single global load/store is
+    // bf16) + coherence-gated (5.18.10.4 needle 14/14). This section confirms the
+    // BANDWIDTH win at the kernel level before the invasive shared-buffer wiring.
+    std::printf("[gdnbench] --- Inc-1 bf16-state v3 AR (decode, T=1) vs f32 v3 ---\n");
+    constexpr std::size_t Td = 1;
+    for (std::size_t nS : {std::size_t{1}, std::size_t{2}, std::size_t{4},
+                           std::size_t{8}, std::size_t{16}, std::size_t{32},
+                           std::size_t{64}}) {
+        compute::ComputeBuffer q     = ops.allocate(nS * Td * H * S * sizeof(float));
+        compute::ComputeBuffer k     = ops.allocate(nS * Td * H * S * sizeof(float));
+        compute::ComputeBuffer v     = ops.allocate(nS * Td * H * S * sizeof(float));
+        compute::ComputeBuffer gLog  = ops.allocate(nS * Td * H * sizeof(float));
+        compute::ComputeBuffer beta  = ops.allocate(nS * Td * H * sizeof(float));
+        compute::ComputeBuffer stF   = ops.allocate(nS * H * S * S * sizeof(float));
+        compute::ComputeBuffer stBf  = ops.allocate(nS * H * S * S * 2);   // bf16 bytes
+        compute::ComputeBuffer outF  = ops.allocate(nS * Td * H * S * sizeof(float));
+        compute::ComputeBuffer outB  = ops.allocate(nS * Td * H * S * sizeof(float));
+        ops.castF32ToBf16Async(stF.as<float>(), stBf.get(), nS * H * S * S);
+        compute::GdnBatchedShape shape;
+        shape.nSeq = nS; shape.T = Td; shape.H = H; shape.S = S;
+        auto f32 = [&]() {
+            ops.gatedDeltaNetRecurrentBatchedAsync(
+                q.as<float>(), k.as<float>(), v.as<float>(), gLog.as<float>(),
+                beta.as<float>(), stF.as<float>(), outF.as<float>(), shape);
+        };
+        auto bf16 = [&]() {
+            ops.gatedDeltaNetRecurrentBatchedV3Bf16Async(
+                q.as<float>(), k.as<float>(), v.as<float>(), gLog.as<float>(),
+                beta.as<float>(), stBf.get(), outB.as<float>(), shape);
+        };
+        f32(); bf16(); ops.flush();   // warmup
+        constexpr int N = 50;
+        auto tm = [&](auto&& fn) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < N; ++i) fn();
+            ops.flush();
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t0).count() / N;
+        };
+        const double msF = tm(f32), msB = tm(bf16);
+        // State R+W bytes (read once + write once per call): f32 = 2*4, bf16 = 2*2.
+        const double stElems = (double)nS * H * S * S;
+        const double gbF = stElems * 2 * 4 / (msF * 1e-3) / 1e9;
+        const double gbB = stElems * 2 * 2 / (msB * 1e-3) / 1e9;
+        std::printf("[gdnbench]   nSeq=%2zu | f32 %7.4f ms (%5.1f GB/s) | bf16 %7.4f ms "
+                    "(%5.1f GB/s) | speedup %4.2fx\n",
+                    nS, msF, gbF, msB, gbB, msF / msB);
+        std::fflush(stdout);
+    }
+    std::printf("[gdnbench] Inc-1 note: bf16 should approach ~2x at conc (state "
+                "DRAM-bound); ~1x at nSeq=1 (state L2-served, 5.18.10.1).\n");
+
     std::printf("[gdnbench] done\n");
     return 0;
 }

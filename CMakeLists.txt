@@ -994,6 +994,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/gated_deltanet_ar_batched.cu
         kernels/cuda/llm/gated_deltanet_ar_batched_v2.cu
         kernels/cuda/llm/gated_deltanet_ar_batched_v3.cu
+        kernels/cuda/llm/gated_deltanet_ar_batched_v3_bf16.cu
         kernels/cuda/llm/gated_deltanet_verify_batched.cu
         kernels/cuda/llm/gated_deltanet_fold.cu
         kernels/cuda/llm/argmax_rows.cu

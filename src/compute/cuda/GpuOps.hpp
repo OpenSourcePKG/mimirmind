@@ -235,6 +235,15 @@ public:
                                             float* out,
                                             const GdnBatchedShape& shape) override;
 
+    // 5.18.10.5 Inc-1 — bf16-state v3 decode kernel (isolated) + f32->bf16 cast.
+    // `stateBf16` is a __nv_bfloat16 buffer (void* to keep the header CUDA-free).
+    // GpuOps-only (concrete); not on the ComputeOps abstraction.
+    void gatedDeltaNetRecurrentBatchedV3Bf16Async(
+            const float* q, const float* k, const float* v, const float* gLog,
+            const float* beta, void* stateBf16, float* out,
+            const GdnBatchedShape& shape);
+    void castF32ToBf16Async(const float* src, void* dst, std::size_t n);
+
     void gatedDeltaNetRecurrentGateFusedBatchedAsync(
             const float* q, const float* k, const float* v, const float* alpha,
             const float* beta, const float* ssmA, const float* ssmDt,
