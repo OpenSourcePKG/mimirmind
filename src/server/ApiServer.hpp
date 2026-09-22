@@ -25,6 +25,7 @@ class ModelProvider;
 namespace mimirmind::runtime::encoder {
 class RerankEngine;
 class EmbedEngine;
+class DecideEngine;
 }
 namespace mimirmind::runtime::audio {
 class AudioEngine;
@@ -73,6 +74,18 @@ struct LoadedEmbedder {
     std::string                    id;
     std::string                    title;
     runtime::encoder::EmbedEngine* engine{nullptr};
+};
+
+/**
+ * One loaded "System-One" typed-decision model exposed under /v1/decide (8.23).
+ * `engine` is non-owning — ServeMode keeps the DecideEngine (bge-m3 encoder +
+ * decision heads + its compute stack) alive for the process lifetime. Each
+ * entry gets its own serialisation mutex inside DecideHandler.
+ */
+struct LoadedDecider {
+    std::string                     id;
+    std::string                     title;
+    runtime::encoder::DecideEngine* engine{nullptr};
 };
 
 /**
@@ -230,7 +243,8 @@ public:
               std::vector<LoadedReranker>     rerankers = {},
               std::vector<LoadedEmbedder>     embedders = {},
               std::vector<LoadedTranscriber>  transcribers = {},
-              std::vector<LoadedSpeaker>      speakers = {});
+              std::vector<LoadedSpeaker>      speakers = {},
+              std::vector<LoadedDecider>      deciders = {});
     ~ApiServer();
 
     ApiServer(const ApiServer&)            = delete;

@@ -28,6 +28,7 @@
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/encoder/RerankEngine.hpp"
 #include "runtime/encoder/EmbedEngine.hpp"
+#include "runtime/encoder/DecideEngine.hpp"
 #include "runtime/audio/AudioEngine.hpp"
 #include "runtime/audio/SpeakEngine.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
@@ -443,6 +444,12 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
     std::vector<std::unique_ptr<::mimirmind::runtime::encoder::EmbedEngine>>
         ownedEmbedders;
     std::vector<::mimirmind::server::LoadedEmbedder> loadedEmbedders;
+    // Decide (8.23 System-One typed-decision) models: same isolated-compute-
+    // stack lifetime rule — stacks declared before the DecideEngines they back.
+    std::vector<::mimirmind::runtime::ComputeStack> ownedDecideStacks;
+    std::vector<std::unique_ptr<::mimirmind::runtime::encoder::DecideEngine>>
+        ownedDeciders;
+    std::vector<::mimirmind::server::LoadedDecider> loadedDeciders;
     // Transcribe (Whisper-class ASR) models: same isolated-compute-stack
     // lifetime rule — stacks declared before the AudioEngines they back.
     std::vector<::mimirmind::runtime::ComputeStack> ownedTranscribeStacks;
@@ -621,6 +628,34 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                             m.path, m.id);
             } catch (const std::exception& x) {
                 std::cerr << "serve: embed model '" << m.id
+                          << "' load failed: " << x.what() << "\n";
+                return 2;
+            }
+            continue;
+        }
+
+        // Decide models (8.23 System-One): the same bge-m3 encoder as an embed
+        // model plus trained decision heads, behind /v1/decide, on its own
+        // isolated compute stack — same lifetime rule as the embed branch.
+        if (m.task == ::mimirmind::core::config::ModelTask::Decide) {
+            try {
+                ownedDecideStacks.push_back(
+                    ::mimirmind::runtime::makeComputeStack(cfg, engineKind));
+                auto& stk = ownedDecideStacks.back();
+                auto de = std::make_unique<
+                    ::mimirmind::runtime::encoder::DecideEngine>(
+                    m.path, m.decideHeadsDir, *stk.ops, *stk.matmul);
+                ::mimirmind::server::LoadedDecider ld{};
+                ld.id     = m.id;
+                ld.title  = m.title;
+                ld.engine = de.get();
+                MM_LOG_INFO("main",
+                            "serve: loaded decide model '{}' (id='{}', {} heads)",
+                            m.path, m.id, de->headCount());
+                loadedDeciders.push_back(std::move(ld));
+                ownedDeciders.push_back(std::move(de));
+            } catch (const std::exception& x) {
+                std::cerr << "serve: decide model '" << m.id
                           << "' load failed: " << x.what() << "\n";
                 return 2;
             }
@@ -2912,7 +2947,8 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                                           std::move(loadedRerankers),
                                           std::move(loadedEmbedders),
                                           std::move(loadedTranscribers),
-                                          std::move(loadedSpeakers)};
+                                          std::move(loadedSpeakers),
+                                          std::move(loadedDeciders)};
 
     g_runningServer.store(&server, std::memory_order_release);
     std::signal(SIGINT,  signalStop);

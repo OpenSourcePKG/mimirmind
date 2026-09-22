@@ -60,7 +60,7 @@ enum class ModelFormat { Auto, Gguf, Nvfp4 };
  * no classifier head) behind /v1/embeddings — CLS-pooled, L2-normalized vector
  * per input text.
  */
-enum class ModelTask { Chat, Rerank, Embed, Transcribe, Speak };
+enum class ModelTask { Chat, Rerank, Embed, Transcribe, Speak, Decide };
 
 /// Parse a `task` string ("chat"|"rerank"|"embed"|"transcribe"|"speak") or
 /// nullopt.
@@ -93,6 +93,12 @@ struct ModelEntry {
     // safetensors (scripts/convert-snac.py output). The `path` above is the
     // Orpheus Llama-3.2 acoustic checkpoint; this is its codec decoder.
     std::string       codecPath{};
+    // For `task: decide` (8.23 System-One): directory of trained decision
+    // heads. Each immediate subdirectory holding a head.json is loaded as one
+    // typed-decision head (keyed by its `name`). `path` above points at the
+    // bge-m3 encoder dir. Empty => head-less engine (fallback-only) until heads
+    // are dropped in.
+    std::string       decideHeadsDir{};
     bool              loadOnStart{true};
     RuntimeSettings   runtime{};         // per-model override, merged onto top-level
 

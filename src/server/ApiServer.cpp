@@ -6,6 +6,7 @@
 #include "server/ApiHelpers.hpp"
 #include "server/ChatCompletionHandler.hpp"
 #include "server/RerankHandler.hpp"
+#include "server/DecideHandler.hpp"
 #include "server/EmbeddingsHandler.hpp"
 #include "server/TranscriptionsHandler.hpp"
 #include "server/SpeechHandler.hpp"
@@ -130,6 +131,10 @@ struct ApiServer::Impl {
     // model with task=embed is configured.
     EmbeddingsHandler                     embeddingsHandler;
 
+    // POST /v1/decide — "System-One" typed-decision model(s). Empty when no
+    // model with task=decide is configured.
+    DecideHandler                         decideHandler;
+
     // POST /v1/audio/transcriptions — Whisper-class ASR model(s). Empty when
     // no model with task=transcribe is configured.
     TranscriptionsHandler                 transcriptionsHandler;
@@ -143,7 +148,8 @@ struct ApiServer::Impl {
          std::vector<LoadedReranker> rerankers,
          std::vector<LoadedEmbedder> embedders,
          std::vector<LoadedTranscriber> transcribers,
-         std::vector<LoadedSpeaker> speakers)
+         std::vector<LoadedSpeaker> speakers,
+         std::vector<LoadedDecider> deciders)
         : dispatcher{std::move(in), c.modelId, drafter,
                      c.speculativeTargetId, c.speculative},
           engine{dispatcher.defaultEnginePtr()},
@@ -153,6 +159,7 @@ struct ApiServer::Impl {
           chatHandler{dispatcher, requestTracker, tenantMetrics, cfg},
           rerankHandler{std::move(rerankers), cfg},
           embeddingsHandler{std::move(embedders), cfg},
+          decideHandler{std::move(deciders), cfg},
           transcriptionsHandler{std::move(transcribers), cfg},
           speechHandler{std::move(speakers), cfg} {
         // M-Munin.3 (full): when a provider is set, ServeMode keeps the
@@ -172,6 +179,9 @@ struct ApiServer::Impl {
                 v.push_back(std::move(m));
             }
             for (auto& m : embeddingsHandler.residentModelsMemory()) {
+                v.push_back(std::move(m));
+            }
+            for (auto& m : decideHandler.residentModelsMemory()) {
                 v.push_back(std::move(m));
             }
             return v;
@@ -383,6 +393,17 @@ struct ApiServer::Impl {
                         embeddingsHandler.handle(req, res);
                     });
 
+        server->Post("/v1/decide",
+                    [this](const httplib::Request& req,
+                           httplib::Response&       res) {
+                        MM_LOG_INFO(
+                            "server",
+                            "POST /v1/decide accepted from {} "
+                            "(content-length={} B)",
+                            req.remote_addr, req.body.size());
+                        decideHandler.handle(req, res);
+                    });
+
         server->Post("/v1/audio/transcriptions",
                     [this](const httplib::Request& req,
                            httplib::Response&       res) {
@@ -496,6 +517,16 @@ struct ApiServer::Impl {
                 {"task",     "embed"},
             });
         }
+        for (const auto& m : decideHandler.listModels()) {
+            data.push_back(json{
+                {"id",       m.id},
+                {"title",    m.title},
+                {"object",   "model"},
+                {"created",  0},
+                {"owned_by", "mimirmind"},
+                {"task",     "decide"},
+            });
+        }
         for (const auto& m : transcriptionsHandler.listModels()) {
             data.push_back(json{
                 {"id",       m.id},
@@ -575,13 +606,15 @@ ApiServer::ApiServer(std::vector<LoadedEngine>       engines,
                      std::vector<LoadedReranker>     rerankers,
                      std::vector<LoadedEmbedder>     embedders,
                      std::vector<LoadedTranscriber>  transcribers,
-                     std::vector<LoadedSpeaker>      speakers)
+                     std::vector<LoadedSpeaker>      speakers,
+                     std::vector<LoadedDecider>      deciders)
     : _impl{std::make_unique<Impl>(std::move(engines),
                                    std::move(cfg), drafter,
                                    std::move(rerankers),
                                    std::move(embedders),
                                    std::move(transcribers),
-                                   std::move(speakers))} {}
+                                   std::move(speakers),
+                                   std::move(deciders))} {}
 
 ApiServer::~ApiServer() = default;
 

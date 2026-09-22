@@ -213,6 +213,7 @@ std::optional<ModelTask> modelTaskFromString(std::string_view s) noexcept {
     if (s == "embed")      return ModelTask::Embed;
     if (s == "transcribe") return ModelTask::Transcribe;
     if (s == "speak")      return ModelTask::Speak;
+    if (s == "decide")     return ModelTask::Decide;
     return std::nullopt;
 }
 
@@ -222,6 +223,7 @@ std::string_view modelTaskName(ModelTask t) noexcept {
         case ModelTask::Embed:      return "embed";
         case ModelTask::Transcribe: return "transcribe";
         case ModelTask::Speak:      return "speak";
+        case ModelTask::Decide:     return "decide";
         case ModelTask::Chat:
         default:                    return "chat";
     }
@@ -238,7 +240,7 @@ ModelEntry parseModel(std::string_view      path,
     }
     checkKnownKeys(path, section, j,
                    {"id", "title", "path", "format", "tokenizerGguf", "codec",
-                    "loadOnStart", "runtime", "backend", "task"});
+                    "headsDir", "loadOnStart", "runtime", "backend", "task"});
 
     ModelEntry m{};
     if (!j.contains("id") || !j["id"].is_string() || j["id"].get<std::string>().empty()) {
@@ -265,12 +267,15 @@ ModelEntry parseModel(std::string_view      path,
     if (const auto v = readOpt<std::string>(path, section, j, "codec"); v.has_value()) {
         m.codecPath = *v;
     }
+    if (const auto v = readOpt<std::string>(path, section, j, "headsDir"); v.has_value()) {
+        m.decideHeadsDir = *v;
+    }
     if (const auto v = readOpt<std::string>(path, section, j, "task"); v.has_value()) {
         const auto t = modelTaskFromString(*v);
         if (!t.has_value()) {
             fail(path, section +
                  ".task must be one of \"chat\", \"rerank\", \"embed\", "
-                 "\"transcribe\", \"speak\"");
+                 "\"transcribe\", \"speak\", \"decide\"");
         }
         m.task = *t;
     }

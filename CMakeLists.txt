@@ -432,6 +432,8 @@ add_library(mimirmind_core_common STATIC
     src/runtime/encoder/EncoderRunner.cpp
     src/runtime/encoder/RerankEngine.cpp
     src/runtime/encoder/EmbedEngine.cpp
+    src/runtime/encoder/DecisionHead.cpp
+    src/runtime/encoder/DecideEngine.cpp
     src/runtime/dflash/DFlashDraftModel.cpp
     src/runtime/dflash/DFlashDraftRunner.cpp
     src/model/XlmRobertaTokenizer.cpp
@@ -1523,6 +1525,7 @@ add_executable(mimirmind
     src/server/ChatCompletionHandler.cpp
     src/server/RerankHandler.cpp
     src/server/EmbeddingsHandler.cpp
+    src/server/DecideHandler.cpp
     src/server/TranscriptionsHandler.cpp
     src/server/SpeechHandler.cpp
     src/server/ChatRequestParser.cpp
