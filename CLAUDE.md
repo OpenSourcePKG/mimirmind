@@ -11,14 +11,24 @@ targeting two production platforms:
    concurrent chats), NVFP4 weights, native MTP speculative decoding.
    Ships as `Mimir-2.0` = phase **Bragi**.
 
-Loads pre-trained models; **does not train them**. The one scoped exception
-(8.23): MimirMind may fit a *tiny linear-probe head* on top of a **frozen**
-encoder (bge-m3) — a convex softmax regression over already-computed
-embeddings, no backprop through the network, no training framework. This is
-the "System-One" typed-decision head trained in-process via
-`POST /v1/decide/train`; it is head-fitting on frozen features, not
-model training. HIP/ROCm (AMD RDNA3+) sits as a home-lab / sandbox tier — not
-a committed production target.
+Loads pre-trained models. **Base-model pretraining is out of scope** — the
+engine does not pretrain or fully fine-tune the networks it serves. But a
+*training capability* around frozen bases is **in scope and growing**, and is
+intended to expand into many areas over time:
+
+- **Decision head (shipped, 8.23):** a *tiny linear-probe head* fit on top of a
+  **frozen** encoder (bge-m3) — a convex softmax regression over
+  already-computed embeddings, no backprop through the network, no training
+  framework. The "System-One" typed-decision head trained in-process via
+  `POST /v1/decide/train`; head-fitting on frozen features, not model training.
+- **Hugin (planned):** distills an input-compression adapter/encoder against a
+  **frozen** base model (self-distillation, ICAE-style objective).
+- **M-Loki + Nornir (planned):** LoRA adapter support at runtime plus a separate
+  Nornir trainer producing weight-delta adapters keyed to a base-model hash.
+
+The unifying rule: we train *adapters, heads, and compression modules* around a
+frozen base — never the base weights themselves. HIP/ROCm (AMD RDNA3+) sits as a
+home-lab / sandbox tier — not a committed production target.
 
 Sister project: `pegenaut` (TypeScript RAG stack, separate repo). MimirMind
 is intended to eventually serve as a drop-in OpenAI-compatible inference
