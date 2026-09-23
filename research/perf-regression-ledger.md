@@ -3,6 +3,46 @@
 Post-deploy performance entries. Newest first. Box = Spark GB10 (xd-ki-pkg1),
 model qwen3.6-35B-A3B-NVFP4 unless noted.
 
+## 2026-09-23 — KV/memory idle-growth investigation — NO LEAK (reserved+ratcheted plateau)
+
+**Trigger:** user report "KV cache ~50 GB on GB10 and keeps growing even when idle".
+
+**Live check (box xd-ki-pkg1, container `mimirmind-serve` up 14h, maxBatch=64,
+neither `MIMIRMIND_GDN_XSLOT` nor `MIMIRMIND_GDN_PREFIX_CKPT` set → code-default ON):**
+- System (unified LPDDR5x): 121 GB total / 83 GB used / 36 free.
+- Process RSS `VmRSS` = 78.08 GB; `VmHWM` = 78.10 GB ≈ current.
+- **Idle proof:** 0 inference requests in 15 min (only 5s `GET /v1/system/status`
+  health-polls). RSS **bit-identical 78081652 kB across 3 samples over 4 min**
+  (12:58:33 / 13:00:33 / 13:02:33) → flat, NOT growing.
+
+**Verdict — NO leak.** The 78 GB is a reserved + high-water-ratcheted plateau:
+- Weights (NVFP4) 27.6 GB — fixed.
+- Base paged-KV pool 47.2 GB — reserved ONCE at boot to capacity
+  (`kv_tokens_capacity` 131072 × maxBatch 64), never grows/frees. = `kv_bytes_resident`.
+- → 74.8 GB fixed floor; remaining ~3 GB = retained GDN warm-state.
+- Per-slot GDN ckpt rings (`keepWarm=true` after clean request end,
+  `ServingSession.cpp:155-161,2415`, `ContinuousBatcher.cpp:254-283`) + cross-slot
+  xslot prefix store (`MIMIRMIND_GDN_XSLOT`, cap 64 **entries**, `ServingSession.cpp:172-181,2597`,
+  `GdnPrefixIndex.hpp`) **persist across request-end AND idle by design** — evicted
+  only on a NEW insert, never released while idle. So memory ratchets UP during load
+  and stays at the high-water mark. That is the perceived "keeps growing".
+
+**Findings (code weaknesses, not active bugs):**
+1. xslot store capped by ENTRY count (64), **not by bytes** — each entry holds full
+   prefix KV rows `[0,pos)`, scales with prefix len up to maxContext → worst-case tens of GB.
+2. xslot `PrefixImage` allocs are **not** wrapped in a `ScopedAllocCategory` →
+   invisible to `kv_bytes_resident`/`alloc_kv_cache`; land in `alloc_unknown`+`device_used`.
+   The KV gauges UNDERSTATE GDN retained state.
+3. Refcount-leak risk: a request ending without `retireSlot` (crash/exception path)
+   leaves its xslot entry pinned forever → could grow past 64. Not observed (RSS flat).
+
+**Memory-reclaim levers (if plateau too high for co-residency) — NOT a leak fix:**
+dominant term is the 47 GB reserved base KV pool → `MIMIRMIND_SERVING_MAXBATCH` 64→32
+or smaller `maxContext`; secondary `MIMIRMIND_GDN_XSLOT[_MAX]` / `MIMIRMIND_GDN_PREFIX_CKPT=0`.
+
+**Follow-up:** roadmap 5.28.8 (xslot byte-cap + AllocCategory-wrap + retireSlot audit).
+No deploy, no code change. Prod untouched.
+
 ## 2026-09-22 — /v1/decide/heads + /v1/decide/train (8.23.6/8.23.7) — DEPLOYED, decode-NEUTRAL
 
 **Change:** admin endpoints for runtime head upload (`POST /v1/decide/heads`) and
