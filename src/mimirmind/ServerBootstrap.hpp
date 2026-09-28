@@ -4,10 +4,15 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 
 namespace mimirmind::runtime {
 class InferenceEngine;
 class Drafter;
+class SystemMonitor;
+class ThermalGuard;
+class PowerMonitor;
+class PerfRegressionDetector;
 } // namespace mimirmind::runtime
 
 namespace mimirmind::core::config {
@@ -45,6 +50,38 @@ public:
     [[nodiscard]] static SpeculativeSetup buildSpeculative(
         const core::config::Config&    cfg,
         const runtime::InferenceEngine& targetEngine);
+
+    /**
+     * Process-wide thermal / power / fan ancillaries, built from
+     * `cfg.governor` + `cfg.diagnostics` and wired into `engine`.
+     *
+     * Returns the owning objects that `runServe` must keep alive past
+     * `ApiServer::run` (they are consulted by every engine's generate()
+     * through the non-owning setters below). Member order is load-bearing:
+     * `monitor` is declared before `guard` because `ThermalGuard` holds a
+     * `SystemMonitor&`, so `monitor` must outlive `guard` (declared-first =
+     * destroyed-last). The GpuClockGovernor and FanController are kept as
+     * function-local statics inside the method (program lifetime, as before)
+     * and are not returned — only their raw pointers are wired into `engine`.
+     *
+     * `attachedMode` (Munin worker) skips the sysfs-writing regulators
+     * (governor / fan) per the M-Munin "Governor-Sonderregel"; the read-only
+     * SystemMonitor + ThermalGuard are still installed. `fatalExitCode`, when
+     * set, means a required sensor was missing in standalone mode and
+     * `runServe` must abort with that code.
+     */
+    struct Ancillaries {
+        std::unique_ptr<runtime::SystemMonitor>          monitor;
+        std::unique_ptr<runtime::ThermalGuard>           guard;
+        std::unique_ptr<runtime::PowerMonitor>           powerMonitor;
+        std::unique_ptr<runtime::PerfRegressionDetector> perfDetector;
+        std::optional<int>                               fatalExitCode;
+    };
+
+    [[nodiscard]] static Ancillaries wireThermalGovernorFan(
+        runtime::InferenceEngine&   engine,
+        const core::config::Config& cfg,
+        bool                        attachedMode);
 };
 
 } // namespace mimirmind::cli
