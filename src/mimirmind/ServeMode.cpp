@@ -1019,61 +1019,12 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         }
     }
 
-    std::unique_ptr<::mimirmind::runtime::serving::ContinuousBatcher> batcher;
-    // 5.27.11.2: qwen4_exp re-enabled for the continuous batcher — the paged
-    // stepServing (decode) and prefillSlot (single-slot prefill) forward now carry
-    // per-slot PLE n-gram + the HC stream collapse, and the batcher forces
-    // single-slot prefill for qwen4_exp (no ragged varlen). conc>1 batched forward
-    // is slot-correct + coherent (5.27.11.2).
-    if ((engine.config().architecture == "qwen35moe" ||
-         engine.config().architecture == "qwen4_exp" ||
-         engine.supportsBatchedDecode()) &&
-        engine.servingClassEnabled()) {
-        std::size_t maxBatch =
-            std::max<std::size_t>(1, engine.batchCapacity().sustainableBatch);
-        // Operator override of the batcher's slot count. The v1 BatchCapacity
-        // probe is a coarse bandwidth-tier proxy (Xe-LPG ~70 GB/s pins it to
-        // 1) — not a real device-memory calc — so an operator who knows the
-        // model fits more concurrent slots can set MIMIRMIND_SERVING_MAXBATCH.
-        if (const char* mb = std::getenv("MIMIRMIND_SERVING_MAXBATCH")) {
-            const long v = std::atol(mb);
-            if (v > 0) {
-                maxBatch = static_cast<std::size_t>(v);
-                MM_LOG_INFO("main",
-                            "serve: MIMIRMIND_SERVING_MAXBATCH override — "
-                            "batcher maxBatch={} (probe said {})",
-                            maxBatch, engine.batchCapacity().sustainableBatch);
-            }
-        }
-        const std::size_t maxContext = engine.maxContextTokens();
-        // Total accepted-but-unfinished cap (running + queued). Beyond it the
-        // batcher sheds load with a 503 instead of an unbounded queue.
-        const std::size_t maxInflight = cfg.serving.maxActiveRequests;
-        // Per-tenant fairness cap (0 = off). Keeps one API-key tenant from
-        // eating the whole maxInflight budget and starving co-tenants.
-        const std::size_t maxInflightPerTenant =
-            cfg.serving.maxActiveRequestsPerTenant;
-        try {
-            batcher = std::make_unique<
-                ::mimirmind::runtime::serving::ContinuousBatcher>(
-                engine, maxBatch, maxContext, engine.tokenizer().eosId(),
-                maxInflight, maxInflightPerTenant);
-            scfg.batcher = batcher.get();
-            MM_LOG_INFO("main",
-                        "serve: continuous batcher ENABLED for default engine "
-                        "'{}' (maxBatch={} maxContext={} maxInflight={} "
-                        "maxInflightPerTenant={})",
-                        defaultId, maxBatch, maxContext,
-                        batcher->maxInflight(),
-                        batcher->maxInflightPerTenant());
-        } catch (const std::exception& e) {
-            MM_LOG_WARN("main",
-                        "serve: continuous batcher init failed ({}); falling "
-                        "back to single-session generate()", e.what());
-            batcher.reset();
-            scfg.batcher = nullptr;
-        }
-    }
+    // Continuous batcher for the default engine (see ServerBootstrap). Held as
+    // a runServe local so it outlives ApiServer::run; its dtor joins the worker
+    // on shutdown. Null when the engine is not serving-class-eligible or init
+    // failed — the handler then falls back to single-session generate().
+    auto batcher = ServerBootstrap::buildDefaultBatcher(engine, cfg, defaultId);
+    scfg.batcher = batcher.get();
 
     // M-Munin.3 (full): worker-side materialize/evict pool for the
     // non-default chat models registered above (`poolChatModels`). Builds a

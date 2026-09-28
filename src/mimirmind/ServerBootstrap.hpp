@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace mimirmind::runtime {
 class InferenceEngine;
@@ -14,6 +15,10 @@ class ThermalGuard;
 class PowerMonitor;
 class PerfRegressionDetector;
 } // namespace mimirmind::runtime
+
+namespace mimirmind::runtime::serving {
+class ContinuousBatcher;
+} // namespace mimirmind::runtime::serving
 
 namespace mimirmind::core::config {
 struct Config;
@@ -82,6 +87,19 @@ public:
         runtime::InferenceEngine&   engine,
         const core::config::Config& cfg,
         bool                        attachedMode);
+
+    /**
+     * Continuous batcher for the default/eager engine, or null when the engine
+     * is not serving-class-eligible or the batcher failed to initialise (the
+     * caller then falls back to single-session generate()). Caller wires
+     * `scfg.batcher = result.get()` and keeps the returned owner alive for the
+     * server's lifetime — the batcher's dtor joins its worker on shutdown.
+     * `defaultId` is used only for log lines.
+     */
+    [[nodiscard]] static std::unique_ptr<runtime::serving::ContinuousBatcher>
+    buildDefaultBatcher(runtime::InferenceEngine&    engine,
+                        const core::config::Config&  cfg,
+                        const std::string&           defaultId);
 };
 
 } // namespace mimirmind::cli
