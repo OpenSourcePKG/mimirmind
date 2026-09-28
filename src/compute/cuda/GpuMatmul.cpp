@@ -84,7 +84,7 @@ std::filesystem::path resolveHsacoPath(std::string_view name) {
 ::mimirmind::core::cuda::CudaModule loadCudaModule(
     ::mimirmind::core::cuda::CudaContext& ctx, std::string_view name) {
     const auto path = resolveHsacoPath(name);
-    MM_LOG_INFO("hip::GpuMatmul", "loading module '{}' from {}",
+    MM_LOG_INFO("cuda::GpuMatmul", "loading module '{}' from {}",
                 std::string{name}, path.string());
     return ::mimirmind::core::cuda::CudaModule::fromFile(ctx, path.string());
 }
@@ -458,7 +458,7 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
         _useCublas = (cb[0] != '\0' && !(cb[0] == '0' && cb[1] == '\0'));
     }
     if (_useCublas) {
-        MM_LOG_INFO("hip::GpuMatmul",
+        MM_LOG_INFO("cuda::GpuMatmul",
                     "cuBLASLt dense BF16 matmul enabled (MIMIRMIND_CUBLAS=1) — "
                     "decode GEMV (M==1) and batched GEMM (M>1) route through "
                     "cublasLtMatmul; hand kernels remain the fallback");
@@ -478,42 +478,42 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
         _useDeintVec = (dv[0] == '1' && dv[1] == '\0');
     }
     if (_useCublasFp8) {
-        MM_LOG_INFO("hip::GpuMatmul",
+        MM_LOG_INFO("cuda::GpuMatmul",
                     "cuBLASLt per-tensor FP8 (E4M3) dense matmul enabled "
                     "(MIMIRMIND_CUBLAS_FP8=1) — BF16 weights quantised to E4M3 "
                     "(cached) + per-call X quant; hand kernel is the fallback");
     }
     if (_useF32TcPrefill) {
-        MM_LOG_INFO("hip::GpuMatmul",
+        MM_LOG_INFO("cuda::GpuMatmul",
                     "F32 batched (M>1) prefill GEMM -> BF16 tensor cores enabled "
                     "(MIMIRMIND_F32_TC_PREFILL=1) — small F32 weights (MoE router, "
                     "GDN ssm_beta/alpha, shexp router) leave the per-row F32 vec "
                     "path; F32 vec is the fallback (encoder path unaffected)");
     }
     if (_useCublasFp8Prefill) {
-        MM_LOG_INFO("hip::GpuMatmul",
+        MM_LOG_INFO("cuda::GpuMatmul",
                     "cuBLASLt FP8 batched (M>1) prefill GEMM enabled "
                     "(MIMIRMIND_CUBLAS_FP8_PREFILL=1) — dense prefill projections "
                     "run on FP8 tensor cores (RMSNorm inputs bound the per-tensor "
                     "activation scale); BF16/wmma is the fallback");
     }
     if (_tf32Tc) {
-        MM_LOG_INFO("hip::GpuMatmul",
+        MM_LOG_INFO("cuda::GpuMatmul",
                     "E-FP4.5 TF32 tensor-core GEMM enabled for batched (M>1) "
                     "dense matmuls — fidelity variant (MIMIRMIND_TF32_TC=0 to "
                     "disable, falls back to BF16-TC)");
     } else if (_bf16Tc) {
-        MM_LOG_INFO("hip::GpuMatmul",
+        MM_LOG_INFO("cuda::GpuMatmul",
                     "E-FP4.3 BF16 tensor-core GEMM enabled for batched (M>1) "
                     "dense matmuls (MIMIRMIND_BF16_TC=0 to disable)");
     }
     if (_mmqEnabled) {
-        MM_LOG_INFO("hip::GpuMatmul",
+        MM_LOG_INFO("cuda::GpuMatmul",
                     "M-Cuda.MMQ enabled — Q8_0 prefill (M>1) uses int8 {} MMQ "
                     "for N<={} (lm_head/vocab stays fp32)",
                     _mmqTc ? "tensor-core" : "dp4a", _mmqMaxN);
     }
-    MM_LOG_INFO("hip::GpuMatmul",
+    MM_LOG_INFO("cuda::GpuMatmul",
                 "compute::cuda::GpuMatmul ready — 13 kernels loaded "
                 "(Q8_0: vec / gemm / gemm_v2 / vec_dp4a / moe_down_fused_k; "
                 "Q6_K: vec / vec_dp4a / moe_down_fused_k; Q5_0: vec; "
@@ -628,7 +628,7 @@ void GpuMatmul::autotune(
     if (envMinM > 0) {
         _gemmMinM       = envMinM;
         _autotuneSource = "cfg_gemm_min_m";
-        MM_LOG_INFO("hip::GpuMatmul",
+        MM_LOG_INFO("cuda::GpuMatmul",
                     "autotune: features.gemmMinM={} — Q8_0 pinned, bench "
                     "skipped", envMinM);
         return;
@@ -636,7 +636,7 @@ void GpuMatmul::autotune(
     if (forceDisable) {
         _gemmMinM       = kGemmMinMNever;
         _autotuneSource = "cfg_disable_gemm";
-        MM_LOG_INFO("hip::GpuMatmul",
+        MM_LOG_INFO("cuda::GpuMatmul",
                     "autotune: features.gemm=disable — Q8_0 pinned to "
                     "matvec-loop");
         return;
@@ -644,7 +644,7 @@ void GpuMatmul::autotune(
     if (forceEnable) {
         _gemmMinM       = 2;   // GEMM whenever M > 1
         _autotuneSource = "cfg_force_gemm";
-        MM_LOG_INFO("hip::GpuMatmul",
+        MM_LOG_INFO("cuda::GpuMatmul",
                     "autotune: features.gemm=force — Q8_0 pinned to GEMM "
                     "(gemmMinM=2)");
         return;
@@ -652,7 +652,7 @@ void GpuMatmul::autotune(
     if (forceEnableDp4a && !forceDisableDp4a) {
         _useDp4a        = true;
         _autotuneSource = "cfg_force_dp4a";
-        MM_LOG_INFO("hip::GpuMatmul",
+        MM_LOG_INFO("cuda::GpuMatmul",
                     "autotune: features.dp4a=force — Q8_0 pinned to DP4A "
                     "path (matmulAsync currently requires pre-quantised "
                     "input; auto-from-float wiring lands in a follow-up)");
@@ -796,7 +796,7 @@ void GpuMatmul::autotune(
                 << " vec=" << _vecMsAtM[bi] << "ms"
                 << " gemm=" << _gemmMsAtM[bi] << "ms";
     }
-    MM_LOG_INFO("hip::GpuMatmul", "{}", summary.str());
+    MM_LOG_INFO("cuda::GpuMatmul", "{}", summary.str());
 }
 
 // ---- Stubbed matmul-launch overrides --------------------------------
@@ -1590,7 +1590,7 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
 
         if (!_cpuFallbackLogged) {
             _cpuFallbackLogged = true;
-            MM_LOG_INFO("hip::GpuMatmul",
+            MM_LOG_INFO("cuda::GpuMatmul",
                         "CPU fallback active — dispatching '{}' (and any "
                         "other non-Q8_0 type this session) through "
                         "compute::matmul on the host. W/X are copied D2H, "

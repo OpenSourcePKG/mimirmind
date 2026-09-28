@@ -43,7 +43,7 @@ constexpr const char* kDefaultPtxDir = "/usr/local/share/mimirmind/ptx";
 std::int32_t toInt32(std::size_t v, const char* tag) {
     if (v > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::runtime_error(
-            std::string{"hip::GpuOps: "} + tag +
+            std::string{"cuda::GpuOps: "} + tag +
             " overflows int32 ("  + std::to_string(v) + ")");
     }
     return static_cast<std::int32_t>(v);
@@ -55,7 +55,7 @@ std::int32_t toInt32(std::size_t v, const char* tag) {
 std::uint32_t groupsForN(std::size_t n, std::uint32_t local) {
     const std::size_t g = (n + local - 1) / local;
     if (g > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::runtime_error("hip::GpuOps: workgroup count overflows uint32");
+        throw std::runtime_error("cuda::GpuOps: workgroup count overflows uint32");
     }
     return static_cast<std::uint32_t>(g);
 }
@@ -99,7 +99,7 @@ std::filesystem::path resolveHsacoPath(std::string_view name) {
     }
 
     throw std::runtime_error(
-        "hip::GpuOps: cannot find " + filename +
+        "cuda::GpuOps: cannot find " + filename +
         " — set MIMIRMIND_HSACO_DIR or install to " + kDefaultPtxDir);
 }
 
@@ -110,7 +110,7 @@ std::filesystem::path resolveHsacoPath(std::string_view name) {
 core::cuda::CudaModule loadCudaModule(core::cuda::CudaContext& ctx,
                                    std::string_view       name) {
     const auto path = resolveHsacoPath(name);
-    MM_LOG_INFO("hipgpuops", "loading module '{}' from {}",
+    MM_LOG_INFO("cudagpuops", "loading module '{}' from {}",
                 std::string{name}, path.string());
     return core::cuda::CudaModule::fromFile(ctx, path.string());
 }
@@ -885,7 +885,7 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
         _moePrefillTcEnabled = (mt[0] != '\0' && !(mt[0] == '0' && mt[1] == '\0'));
     }
     if (_moePrefillTcEnabled) {
-        MM_LOG_INFO("hipgpuops",
+        MM_LOG_INFO("cudagpuops",
                     "wide-M FP16 tensor-core prefill MoE-GEMM enabled "
                     "(MIMIRMIND_MOE_PREFILL_TC=1) — grouped GEMM prefill (large-M) "
                     "runs on wmma FP16 tensor cores; decode (small-M) path "
@@ -900,7 +900,7 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
         _prefillGqaF32Enabled = (g[0] != '\0' && !(g[0] == '0' && g[1] == '\0'));
     }
     if (_prefillGqaF32Enabled) {
-        MM_LOG_INFO("hipgpuops",
+        MM_LOG_INFO("cudagpuops",
                     "F32 prefill attention -> GQA-head-packed kernel enabled "
                     "(MIMIRMIND_ATTN_PREFILL_GQA=1) — each K/V row read once per "
                     "KV group instead of once per query head; bit-exact with the "
@@ -912,7 +912,7 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
         _prefillTcF32Enabled = (t[0] != '\0' && !(t[0] == '0' && t[1] == '\0'));
     }
     if (_prefillTcF32Enabled) {
-        MM_LOG_INFO("hipgpuops",
+        MM_LOG_INFO("cudagpuops",
                     "F32 prefill attention -> TF32 tensor-core GQA kernel enabled "
                     "(MIMIRMIND_ATTN_TC_PREFILL=1) — QK^T and P.V on TF32 tensor "
                     "cores over the head-packed tiling; bit-near (TF32), "
@@ -924,7 +924,7 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
         _prefillFp16TcEnabled = (ft[0] != '\0' && !(ft[0] == '0' && ft[1] == '\0'));
     }
     if (_prefillFp16TcEnabled) {
-        MM_LOG_INFO("hipgpuops",
+        MM_LOG_INFO("cudagpuops",
                     "FP16 prefill attention -> tensor-core FA-2 kernel enabled "
                     "(MIMIRMIND_ATTN_FP16_TC=1) — q-tiled wmma m16n16k16 over the "
                     "fp16 KV cache; bit-near (fp16), parity-gated; scalar fp16 "
@@ -990,13 +990,13 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
         _prefillFlashKTileQ8Source = "pinned (config)";
     } else {
         throw std::runtime_error(
-            "hip::GpuOps: features.flashPrefillKTileQ8=" +
+            "cuda::GpuOps: features.flashPrefillKTileQ8=" +
             std::to_string(flashPrefillKTileQ8) +
             " unexpected — Config.cpp parser should have rejected this");
     }
 
-    MM_LOG_INFO("hipgpuops",
-                "hip::GpuOps ready — 32 modules loaded (rmsnorm variants, "
+    MM_LOG_INFO("cudagpuops",
+                "cuda::GpuOps ready — 32 modules loaded (rmsnorm variants, "
                 "elementwise, rope, attention decode/prefill × f32/fp16/Q8_0, "
                 "qkv_split × f32/fp16, kv_quant_commit_q8_0, "
                 "matmul_q8_0_vec_reorder). "
@@ -1088,7 +1088,7 @@ void GpuOps::noteQ8_0ReorderApplied(std::size_t bytes,
                                        std::string_view label) noexcept {
     _q8_0ReorderTensorCount += 1;
     _q8_0ReorderTotalBytes  += bytes;
-    MM_LOG_INFO("hipgpuops",
+    MM_LOG_INFO("cudagpuops",
                 "q8_0 reorder applied to '{}' ({} bytes) — running total "
                 "tensors={} bytes={}",
                 std::string{label}, bytes,
