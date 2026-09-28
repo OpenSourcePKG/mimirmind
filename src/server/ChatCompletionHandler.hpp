@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 
+namespace mimirmind::model {
+class Tokenizer;
+} // namespace mimirmind::model
+
 namespace mimirmind::server {
 
 class RequestDispatcher;
@@ -51,6 +55,15 @@ private:
         runtime::GenerateParams&       params,
         TrimReport&                    report,
         std::string&                   forcedToolOpener);
+
+    /// The sampling-policy block of prepareChatRequest, extracted verbatim
+    /// (8.30.5, pure move): client sampling params + model-default overlay,
+    /// tool-loop greedy clamp, thinking / answer anti-loop floors, and the M7f
+    /// repetition penalties + safety floor. Mutates only `params.sampling`.
+    void applySamplingPolicy(runtime::InferenceEngine& targetEngine,
+                             const ChatRequest&        cr,
+                             const model::Tokenizer&   tok,
+                             runtime::GenerateParams&  params);
 
     void handleBlocking(const ChatRequest& cr, httplib::Response& res);
     void handleStream  (const ChatRequest& cr, httplib::Response& res);

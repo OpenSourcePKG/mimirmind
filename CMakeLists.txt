@@ -1523,6 +1523,8 @@ add_executable(mimirmind
     src/server/ApiHelpers.cpp
     src/server/ApiServer.cpp
     src/server/ChatCompletionHandler.cpp
+    src/server/ChatResponseBuilder.cpp
+    src/server/ToolCallExtractor.cpp
     src/server/RerankHandler.cpp
     src/server/EmbeddingsHandler.cpp
     src/server/DecideHandler.cpp

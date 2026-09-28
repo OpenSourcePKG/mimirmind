@@ -5,11 +5,13 @@
 
 #include "server/ApiHelpers.hpp"
 #include "server/ChatRequestParser.hpp"
+#include "server/ChatResponseBuilder.hpp"
 #include "server/PromptTrimmer.hpp"
 #include "server/RequestDispatcher.hpp"
 #include "server/RequestTracker.hpp"
 #include "server/SseEncoder.hpp"
 #include "server/TenantMetrics.hpp"
+#include "server/ToolCallExtractor.hpp"
 
 #include "model/ResponseCleaner.hpp"
 #include "model/ToolCallConstraint.hpp"
@@ -520,6 +522,15 @@ bool ChatCompletionHandler::prepareChatRequest(
         }
     }
 
+    applySamplingPolicy(targetEngine, cr, tok, params);
+    return true;
+}
+
+void ChatCompletionHandler::applySamplingPolicy(
+    runtime::InferenceEngine& targetEngine,
+    const ChatRequest&        cr,
+    const model::Tokenizer&   tok,
+    runtime::GenerateParams&  params) {
     if (cr.hasTemperature) {
         params.sampling.temperature = cr.temperature;
     }
@@ -768,7 +779,6 @@ bool ChatCompletionHandler::prepareChatRequest(
                     pmc.antiLoopRepetition, pmc.antiLoopFrequency,
                     pmc.antiLoopWindow);
     }
-    return true;
 }
 
 void ChatCompletionHandler::handle(const httplib::Request& req,
@@ -1117,35 +1127,27 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             // try the model's native one first, then the other — Qwen3.6 has
             // been seen imitating the Hermes shape when driven by agent
             // prompts, and vice-versa a Hermes model can drift XML-wards.
-            const bool xmlNative =
+            // 8.30.5 — the native-first / other-dialect / noisy-salvage ladder
+            // now lives in ToolCallExtractor::parseQwenDialects; `usedNoisy` is
+            // set iff the control-token-noised salvage is what produced the
+            // result, so the noisy-specific log + content suppression below
+            // reproduce the previous behaviour byte-for-byte.
+            const model::ChatTemplate::ToolFormat toolFormat =
                 model::ChatTemplate::toolFormatFromArch(
-                    engine.config().architecture) ==
-                model::ChatTemplate::ToolFormat::QwenXml;
-            toolCalls = xmlNative
-                ? model::ToolCallParser::parseQwenXml(toolText, cr.tools)
-                : model::ToolCallParser::parseQwen(toolText);
-            if (toolCalls.empty()) {
-                toolCalls = xmlNative
-                    ? model::ToolCallParser::parseQwen(toolText)
-                    : model::ToolCallParser::parseQwenXml(toolText, cr.tools);
-            }
-            if (toolCalls.empty()) {
-                // Salvage a control-token-noised call (Qwen3-Coder-Next injects
-                // <|im_start|> into the tool-call span under heavy tool prompts,
-                // dropping the '<' of <function=). Only offered names survive.
-                toolCalls = model::ToolCallParser::parseQwenXmlNoisy(
-                    toolText, cr.tools);
-                if (!toolCalls.empty()) {
-                    MM_LOG_INFO("server",
-                                "tool-call salvaged from control-token-noised "
-                                "span ({} call(s))",
-                                toolCalls.size());
-                    // The whole visible span was the noised call — drop it so
-                    // the client sees a clean tool-call turn, not raw markup.
-                    const std::size_t open = text.find("<tool_call>");
-                    if (open != std::string::npos) {
-                        text.erase(open);
-                    }
+                    engine.config().architecture);
+            bool usedNoisy = false;
+            toolCalls = ToolCallExtractor::parseQwenDialects(
+                toolText, toolFormat, cr.tools, /*tryNoisy=*/true, &usedNoisy);
+            if (usedNoisy) {
+                MM_LOG_INFO("server",
+                            "tool-call salvaged from control-token-noised "
+                            "span ({} call(s))",
+                            toolCalls.size());
+                // The whole visible span was the noised call — drop it so
+                // the client sees a clean tool-call turn, not raw markup.
+                const std::size_t open = text.find("<tool_call>");
+                if (open != std::string::npos) {
+                    text.erase(open);
                 }
             }
             if (toolCalls.empty() &&
@@ -1179,38 +1181,18 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             // leak (ffb6a4f). Name-gated on the offered tools and fenced
             // code blocks are ignored, so prose showing an example never
             // parses as a call.
-            if (model::ToolCallParser::looksLikeBareQwenXmlCall(text, cr.tools)) {
-                toolCalls = model::ToolCallParser::parseQwenXmlBare(text, cr.tools);
-            }
-            // Bare-JSON fallback: a reasoning model (Qwen3.6) sometimes emits the
-            // call as plain {"name":…,"arguments":…} with no <tool_call> wrapper,
-            // which would otherwise leak into content. Run it over the cleaned
-            // answer (`text`, already stripped of the <think> reasoning) and gate
-            // on the offered tool names so a legit JSON answer is never parsed as
-            // a call.
-            if (toolCalls.empty()) {
-                std::vector<std::string> toolNames;
-                toolNames.reserve(cr.tools.size());
-                for (const auto& spec : cr.tools) {
-                    toolNames.push_back(spec.name);
-                }
-                if (model::ToolCallParser::looksLikeBareJsonToolCall(text, toolNames)) {
-                    toolCalls = model::ToolCallParser::parseBareJson(text, toolNames);
-                }
-            }
-            // tool_code fallback: Coder-Next's native auto reply is a
-            // ```tool_code / ```python fence with a Python NAME(args) call
-            // (no XML envelope). Offered-name + call-syntax gated.
-            if (toolCalls.empty()) {
-                toolCalls = model::ToolCallParser::parseToolCodeCall(
-                    text, cr.tools);
-                if (!toolCalls.empty()) {
-                    MM_LOG_INFO("server",
-                                "tool-call parsed from native tool_code fence "
-                                "({} call(s))",
-                                toolCalls.size());
-                    text.clear();   // the fence was the whole reply
-                }
+            // 8.30.5 — the bare-XML → bare-JSON → tool_code fallback ladder now
+            // lives in ToolCallExtractor::extractBareFallbacks (shared with the
+            // streaming held-content path). The tool_code-specific log + content
+            // clear stay here (blocking-only side-effect).
+            auto fb = ToolCallExtractor::extractBareFallbacks(text, cr.tools);
+            toolCalls = std::move(fb.calls);
+            if (fb.fromToolCode) {
+                MM_LOG_INFO("server",
+                            "tool-call parsed from native tool_code fence "
+                            "({} call(s))",
+                            toolCalls.size());
+                text.clear();   // the fence was the whole reply
             }
         }
     }
@@ -1323,7 +1305,7 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                     std::string{kSalvageOpener} +
                     tok.decode(redecoded, /*skipSpecial=*/false);
                 toolCalls =
-                    model::ToolCallParser::parseQwenXml(salvText, cr.tools);
+                    ToolCallExtractor::parseCanonicalXml(salvText, cr.tools);
             }
             if (!toolCalls.empty()) {
                 MM_LOG_WARN("server",
@@ -1370,77 +1352,19 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
 
     const std::string echoModel = target->id;
 
-    json usage = {
-        {"prompt_tokens",     promptIds.size()},
-        {"completion_tokens", visible.size()},
-        {"total_tokens",      promptIds.size() + visible.size()},
-    };
-    // OpenAI/vLLM-compatible prefix-cache visibility: how many prompt tokens were
-    // served from the cache (warm-slot / GDN prefix reuse on the serving path, or
-    // the single-session LCP hit) and thus skipped prefill. Lets a client (Pegenaut)
-    // see cache hits + prefill cost instead of the old always-0/0. `cachedTokens`
-    // is populated by both paths via GenerateStats.
-    usage["prompt_tokens_details"] = { {"cached_tokens", stats.cachedTokens} };
-    if (stats.prefillMs > 0.0) {
-        usage["prefill_ms"] = stats.prefillMs;   // mimirmind extension
-    }
-    // Extension over the OpenAI shape: per-request energy delta from
-    // the RAPL package counter. Quietly omitted when no power monitor
-    // was active for this call.
-    if (stats.packageJoules > 0.0) {
-        usage["package_joules"] = stats.packageJoules;
-    }
-    // M-PT — length-discipline metadata. Only present when trim / clamp
-    // / extrapolation-warn actually fired.
-    PromptTrimmer::attachTrimUsage(usage, trimReport);
+    // 8.30.5 — usage / assistant-message / completion-envelope construction now
+    // lives in ChatResponseBuilder (shared token accounting; identical shape).
+    json usage = ChatResponseBuilder::buildUsage(
+        promptIds.size(), visible.size(), stats, trimReport);
 
-    // `refusal` is part of the OpenAI assistant message shape; null unless the
-    // model produced a safety refusal (mimirmind does not emit one today).
-    json message = {{"role", "assistant"}, {"refusal", nullptr}};
-    // Surface the model's thinking separately (vLLM / llama.cpp shape). Present
-    // on both the content answer and a tool-call turn — a reasoning model
-    // thinks before it decides to call a tool, and clients show that.
-    if (!reasoning.empty()) {
-        message["reasoning_content"] = reasoning;
-    }
-    if (toolCalls.empty()) {
-        message["content"] = text;
-    } else {
-        // OpenAI shape: content null, calls under tool_calls[]. arguments is a
-        // JSON *string* (already normalised by the parser).
-        message["content"] = nullptr;
-        json tcArr = json::array();
-        for (const auto& call : toolCalls) {
-            tcArr.push_back({
-                {"id",   call.id},
-                {"type", "function"},
-                {"function", {
-                    {"name",      call.name},
-                    {"arguments", call.argumentsJson},
-                }},
-            });
-        }
-        message["tool_calls"] = std::move(tcArr);
-    }
+    json message =
+        ChatResponseBuilder::buildAssistantMessage(text, toolCalls, reasoning);
 
-    json response = {
-        {"id",      respId},
-        {"object",  "chat.completion"},
-        {"created", now},
-        {"model",   echoModel},
-        {"choices", json::array({
-            json{
-                {"index", 0},
-                {"message", std::move(message)},
-                {"finish_reason", finish},
-                // 8.19.14 part B — OpenAI logprobs (null unless requested).
-                {"logprobs", cr.logprobs
-                                 ? buildLogprobsJson(generated, lpVec, tok)
-                                 : json(nullptr)},
-            },
-        })},
-        {"usage", std::move(usage)},
-    };
+    json response = ChatResponseBuilder::buildCompletion(
+        respId, now, echoModel, std::move(message), finish,
+        // 8.19.14 part B — OpenAI logprobs (null unless requested).
+        cr.logprobs ? buildLogprobsJson(generated, lpVec, tok) : json(nullptr),
+        std::move(usage));
 
     // 8.19.12 — collect the extra `n` choices (parallel batcher submissions
     // made before the choice-0 wait). Plain text completions by scope (tools
@@ -1482,16 +1406,7 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             {"message", {{"role", "assistant"}, {"content", text}}},
             {"finish_reason", choiceFinish},
         });
-        if (response["usage"].contains("completion_tokens")) {
-            response["usage"]["completion_tokens"] =
-                response["usage"]["completion_tokens"].get<std::int64_t>()
-                + static_cast<std::int64_t>(toks.size());
-        }
-        if (response["usage"].contains("total_tokens")) {
-            response["usage"]["total_tokens"] =
-                response["usage"]["total_tokens"].get<std::int64_t>()
-                + static_cast<std::int64_t>(toks.size());
-        }
+        ChatResponseBuilder::addCompletionTokens(response["usage"], toks.size());
     }
 
     // Spec-dec accept-rate is the headline diagnostic for M9.11.4 — it
@@ -1738,35 +1653,13 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                 // through the name-gated bare parser.
                 const bool bare =
                     block.rfind("<function=", 0) == 0;
-                const std::vector<model::ToolCall> calls = [&] {
-                    if (state->style == model::ChatTemplate::Style::Gemma4) {
-                        return model::ToolCallParser::parseGemma(block);
-                    }
-                    if (bare) {
-                        return model::ToolCallParser::parseQwenXmlBare(
-                            block, state->toolSpecs);
-                    }
-                    const bool xmlNative = state->toolFormat ==
-                        model::ChatTemplate::ToolFormat::QwenXml;
-                    auto parsed = xmlNative
-                        ? model::ToolCallParser::parseQwenXml(block,
-                                                              state->toolSpecs)
-                        : model::ToolCallParser::parseQwen(block);
-                    if (parsed.empty()) {
-                        parsed = xmlNative
-                            ? model::ToolCallParser::parseQwen(block)
-                            : model::ToolCallParser::parseQwenXml(
-                                  block, state->toolSpecs);
-                    }
-                    if (parsed.empty() && !bare) {
-                        // Control-token-noised call (Qwen3-Coder-Next injects
-                        // <|im_start|> into the span) — strip + repair + parse,
-                        // offered-name-gated. Mirrors the blocking path.
-                        parsed = model::ToolCallParser::parseQwenXmlNoisy(
-                            block, state->toolSpecs);
-                    }
-                    return parsed;
-                }();
+                // 8.30.5 — same block ladder as the blocking path, shared via
+                // ToolCallExtractor::extractBlock (Gemma → parseGemma; bare →
+                // parseQwenXmlBare; else native-first / other / noisy salvage).
+                const std::vector<model::ToolCall> calls =
+                    ToolCallExtractor::extractBlock(
+                        block, state->style, state->toolFormat,
+                        state->toolSpecs, bare);
                 if (calls.empty()) {
                     if (bare) {
                         // The bare capture is speculative (no envelope): a
@@ -2201,34 +2094,18 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                 full += state->utf8Pending;
                 state->utf8Pending.clear();
 
-                std::vector<model::ToolCall> calls;
-                if (model::ToolCallParser::looksLikeBareQwenXmlCall(
-                        full, state->toolSpecs)) {
-                    calls = model::ToolCallParser::parseQwenXmlBare(
-                        full, state->toolSpecs);
-                }
-                if (calls.empty()) {
-                    std::vector<std::string> names;
-                    names.reserve(state->toolSpecs.size());
-                    for (const auto& s : state->toolSpecs) {
-                        names.push_back(s.name);
-                    }
-                    if (model::ToolCallParser::looksLikeBareJsonToolCall(full,
-                                                                        names)) {
-                        calls = model::ToolCallParser::parseBareJson(full, names);
-                    }
-                }
-                if (calls.empty()) {
-                    // Coder-Next native ```tool_code NAME(args) reply (blocking
-                    // path twin). Offered-name + call-syntax gated.
-                    calls = model::ToolCallParser::parseToolCodeCall(
-                        full, state->toolSpecs);
-                    if (!calls.empty()) {
-                        MM_LOG_INFO("server",
-                                    "stream {}: tool-call parsed from native "
-                                    "tool_code fence ({} call(s))",
-                                    state->respId, calls.size());
-                    }
+                // 8.30.5 — bare-XML → bare-JSON → tool_code fallback ladder,
+                // shared with the blocking else branch via
+                // ToolCallExtractor::extractBareFallbacks. The tool_code log line
+                // stays here (stream-specific wording).
+                auto streamFb =
+                    ToolCallExtractor::extractBareFallbacks(full, state->toolSpecs);
+                std::vector<model::ToolCall> calls = std::move(streamFb.calls);
+                if (streamFb.fromToolCode) {
+                    MM_LOG_INFO("server",
+                                "stream {}: tool-call parsed from native "
+                                "tool_code fence ({} call(s))",
+                                state->respId, calls.size());
                 }
 
                 bool saladSuppressed = false;
@@ -2316,7 +2193,7 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                         const std::string salvText =
                             std::string{kSalvageOpener} +
                             tok.decode(redecoded, /*skipSpecial=*/false);
-                        calls = model::ToolCallParser::parseQwenXml(
+                        calls = ToolCallExtractor::parseCanonicalXml(
                             salvText, state->toolSpecs);
                     }
                     if (calls.empty() && streamMissingReq) {
