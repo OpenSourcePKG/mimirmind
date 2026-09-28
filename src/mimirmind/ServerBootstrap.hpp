@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace mimirmind::runtime {
 class InferenceEngine;
@@ -14,17 +17,45 @@ class SystemMonitor;
 class ThermalGuard;
 class PowerMonitor;
 class PerfRegressionDetector;
+struct ComputeStack;
 } // namespace mimirmind::runtime
 
 namespace mimirmind::runtime::serving {
 class ContinuousBatcher;
 } // namespace mimirmind::runtime::serving
 
+namespace mimirmind::runtime::encoder {
+class RerankEngine;
+class EmbedEngine;
+class DecideEngine;
+} // namespace mimirmind::runtime::encoder
+
+namespace mimirmind::runtime::audio {
+class AudioEngine;
+class SpeakEngine;
+} // namespace mimirmind::runtime::audio
+
+namespace mimirmind::server {
+struct LoadedEngine;
+struct LoadedReranker;
+struct LoadedEmbedder;
+struct LoadedDecider;
+struct LoadedTranscriber;
+struct LoadedSpeaker;
+} // namespace mimirmind::server
+
 namespace mimirmind::core::config {
 struct Config;
+struct ModelEntry;
 } // namespace mimirmind::core::config
 
+namespace mimirmind::core::backend {
+class BackendPool;
+} // namespace mimirmind::core::backend
+
 namespace mimirmind::cli {
+
+struct CliArgs;
 
 /**
  * Boot-time construction helpers for `mimirmind serve`. Each method builds
@@ -100,6 +131,69 @@ public:
     buildDefaultBatcher(runtime::InferenceEngine&    engine,
                         const core::config::Config&  cfg,
                         const std::string&           defaultId);
+
+    /**
+     * Every `loadOnStart:true` model, loaded into its own engine/stack. Filled
+     * by `loadModels` via out-parameter (NOT returned by value) because the
+     * loaded Rerank/Embed/Decide/Transcribe engines hold references into the
+     * ComputeStack vectors that precede them here — a by-value return would
+     * move those vectors and dangle the references. Member order is
+     * destruction-order-critical: each `owned*Stacks` vector is declared BEFORE
+     * the engines it backs, so the engines (which free USM through the stacks'
+     * ops) are destroyed first. `runServe` holds this for the whole serve
+     * lifetime; `loadedEngines` / `loaded*` are std::move'd into the ApiServer,
+     * the `owned*` vectors keep the concrete objects alive behind them.
+     *
+     * `exitCode`, when set, means loading hit a fatal config/attach error (or a
+     * dev/bench env-mode ran and produced its own exit code); `runServe`
+     * returns it instead of booting the HTTP server.
+     */
+    struct LoadedModels {
+        std::vector<std::unique_ptr<runtime::InferenceEngine>>        ownedEngines;
+        std::vector<server::LoadedEngine>                            loadedEngines;
+        std::vector<runtime::ComputeStack>                           ownedRerankStacks;
+        std::vector<std::unique_ptr<runtime::encoder::RerankEngine>> ownedRerankers;
+        std::vector<server::LoadedReranker>                          loadedRerankers;
+        std::vector<runtime::ComputeStack>                           ownedEmbedStacks;
+        std::vector<std::unique_ptr<runtime::encoder::EmbedEngine>>  ownedEmbedders;
+        std::vector<server::LoadedEmbedder>                          loadedEmbedders;
+        std::vector<runtime::ComputeStack>                           ownedDecideStacks;
+        std::vector<std::unique_ptr<runtime::encoder::DecideEngine>> ownedDeciders;
+        std::vector<server::LoadedDecider>                           loadedDeciders;
+        std::vector<runtime::ComputeStack>                           ownedTranscribeStacks;
+        std::vector<std::unique_ptr<runtime::audio::AudioEngine>>    ownedTranscribers;
+        std::vector<server::LoadedTranscriber>                       loadedTranscribers;
+        std::vector<std::unique_ptr<runtime::InferenceEngine>>       ownedSpeakBackbones;
+        std::vector<std::unique_ptr<runtime::audio::SpeakEngine>>    ownedSpeakers;
+        std::vector<server::LoadedSpeaker>                           loadedSpeakers;
+        std::vector<std::shared_ptr<void>>                           attachedKeepAlive;
+        std::vector<core::config::ModelEntry>                        poolChatModels;
+        std::optional<int>                                           exitCode;
+    };
+
+    /// Attach-to-Munin callback: materialises engine `e` for model `m` and
+    /// returns the (importer, client) keep-alive pair, or nullopt on failure.
+    /// Kept as a `runServe` local (the M-Munin.3 pool factory captures it too);
+    /// passed in here rather than owned so both attach sites share one impl.
+    using AttachKeepAlive =
+        std::pair<std::shared_ptr<void>, std::shared_ptr<void>>;
+    using AttachEngineFn = std::function<std::optional<AttachKeepAlive>(
+        runtime::InferenceEngine&, const core::config::ModelEntry&)>;
+
+    /**
+     * Load every `loadOnStart:true` model into `out`. Attached-mode workers
+     * first probe Munin's healthz. `backendPool` and `attachEngine` stay owned
+     * by `runServe` (the pool factory reuses them), so they are passed in by
+     * reference. Sets `out.exitCode` on any fatal boot error or when a dev/bench
+     * env-mode handled the run.
+     */
+    static void loadModels(LoadedModels&                 out,
+                           const core::config::Config&   cfg,
+                           const cli::CliArgs&           args,
+                           core::backend::BackendPool&   backendPool,
+                           const AttachEngineFn&         attachEngine,
+                           const std::string&            defaultId,
+                           bool                          attachedMode);
 };
 
 } // namespace mimirmind::cli

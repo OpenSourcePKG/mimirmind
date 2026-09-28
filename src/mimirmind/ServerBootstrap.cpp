@@ -3,10 +3,27 @@
 
 #include "mimirmind/ServerBootstrap.hpp"
 
+#include "mimirmind/CliArgs.hpp"
+#include "mimirmind/ServingBenchModes.hpp"
+
+#ifdef MIMIRMIND_HAVE_L0
+#include "compute/l0/GpuOps.hpp"
+#endif
+#include "core/backend/BackendPool.hpp"
+#include "core/backend/BackendRegistry.hpp"
 #include "core/config/Config.hpp"
+#include "core/ipc/MuninClient.hpp"
 #include "core/log/Log.hpp"
 #include "model/Tokenizer.hpp"
+#include "runtime/ComputeStack.hpp"
 #include "runtime/InferenceEngine.hpp"
+#include "runtime/KvCache.hpp"
+#include "runtime/audio/AudioEngine.hpp"
+#include "runtime/audio/SpeakEngine.hpp"
+#include "runtime/encoder/DecideEngine.hpp"
+#include "runtime/encoder/EmbedEngine.hpp"
+#include "runtime/encoder/RerankEngine.hpp"
+#include "runtime/nvfp4/ModelFormatResolver.hpp"
 #include "runtime/perf/PerfRegressionDetector.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
 #include "runtime/spec/Drafter.hpp"
@@ -18,6 +35,7 @@
 #include "runtime/thermal/SystemMonitor.hpp"
 #include "runtime/thermal/ThermalGuard.hpp"
 #include "runtime/thermal/ThermalProfile.hpp"
+#include "server/ApiServer.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -26,9 +44,12 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 namespace mimirmind::cli {
 
@@ -523,6 +544,383 @@ ServerBootstrap::buildDefaultBatcher(runtime::InferenceEngine&    engine,
                     "serve: continuous batcher init failed ({}); falling "
                     "back to single-session generate()", e.what());
         return nullptr;
+    }
+}
+
+void ServerBootstrap::loadModels(LoadedModels&                 out,
+                                 const core::config::Config&   cfg,
+                                 const cli::CliArgs&           args,
+                                 core::backend::BackendPool&   backendPool,
+                                 const AttachEngineFn&         attachEngine,
+                                 const std::string&            defaultId,
+                                 bool                          attachedMode) {
+    // Probed once before the per-model attach loop so a dead Munin does not
+    // manifest as N confusing per-model attach errors. The whole Munin/attach
+    // chain is L0/CUDA-only; a build without either already refused --attach.
+#if defined(MIMIRMIND_HAVE_L0) || defined(MIMIRMIND_HAVE_CUDA)
+    if (attachedMode) {
+        MM_LOG_INFO("main",
+                    "serve: attached mode — probing Munin at '{}'",
+                    args.attachSocket);
+        auto hz = ::mimirmind::core::ipc::MuninClient::healthz(args.attachSocket);
+        if (!hz) {
+            std::cerr << "serve: Munin healthz failed at '"
+                      << args.attachSocket << "': " << hz.error() << "\n";
+            out.exitCode = 2;
+            return;
+        }
+        if (hz->governorOwner != "munin") {
+            std::cerr << "serve: refusing to attach — Munin reports "
+                         "governor_owner='" << hz->governorOwner
+                      << "', expected 'munin'. Standalone-worker "
+                         "handoff back to Munin is not part of "
+                         "Schritt 8-minimal (M-Munin ADR).\n";
+            out.exitCode = 2;
+            return;
+        }
+        MM_LOG_INFO("main",
+                    "serve: Munin healthz ok — pid={} models={} owner={}",
+                    hz->pid, hz->models.size(), hz->governorOwner);
+        for (const auto& mm : hz->models) {
+            MM_LOG_INFO("main",
+                        "  munin-model id='{}' fingerprint='{}' bytes={}",
+                        mm.id, mm.fingerprint, mm.totalBytes);
+        }
+    }
+#else
+    (void)args;
+    (void)attachedMode;
+#endif
+
+    // Per-model runtime overrides (context / KV dtype), applied AFTER load so
+    // they can inspect the loaded model state.
+    auto applyRuntimeOverrides =
+        [&cfg](::mimirmind::runtime::InferenceEngine& e,
+               const ::mimirmind::core::config::RuntimeSettings& rt) {
+        if (rt.maxContextTokens.has_value() && *rt.maxContextTokens > 0) {
+            e.setMaxContextTokens(*rt.maxContextTokens);
+        }
+        if (rt.kvDtype.has_value()) {
+            const std::string_view v{*rt.kvDtype};
+            if (v == "fp16")           e.setKvDtype(::mimirmind::runtime::KvDtype::FP16);
+            else if (v == "q8_0")      e.setKvDtype(::mimirmind::runtime::KvDtype::Q8_0);
+            else if (v == "f32" || v.empty())
+                                       e.setKvDtype(::mimirmind::runtime::KvDtype::F32);
+            else {
+                MM_LOG_WARN("main",
+                            "runtime.kvDtype='{}' unrecognised — falling "
+                            "back to f32", v);
+            }
+        }
+        if (cfg.serving.kvDtype.has_value() && !cfg.serving.kvDtype->empty()) {
+            const std::string_view v{*cfg.serving.kvDtype};
+            if (v == "fp8")       e.setServingKvDtype(::mimirmind::runtime::KvDtype::FP8_E4M3);
+            else if (v == "fp16") e.setServingKvDtype(::mimirmind::runtime::KvDtype::FP16);
+            else if (v == "f32")  e.setServingKvDtype(::mimirmind::runtime::KvDtype::F32);
+            MM_LOG_INFO("main", "serving.kvDtype='{}' → paged serving-pool KV tier", v);
+        }
+    };
+
+    for (const auto& m : cfg.models) {
+        if (!m.loadOnStart) continue;
+        ::mimirmind::core::backend::BackendKind engineKind{};
+        try {
+            const std::string token = m.backend.empty() ? std::string{"auto"} : m.backend;
+            auto& entry = backendPool.selectByToken(token);
+            engineKind  = entry.kind;
+            MM_LOG_INFO("main",
+                        "serve: model '{}' bound to backend '{}' via token '{}'",
+                        m.id,
+                        ::mimirmind::core::backend::BackendRegistry::name(entry.kind),
+                        entry.token);
+        } catch (const std::exception& x) {
+            std::cerr << "serve: model '" << m.id
+                      << "' backend='" << m.backend << "' cannot be "
+                      << "resolved: " << x.what() << "\n";
+            out.exitCode = 2;
+            return;
+        }
+        // Rerank models take a separate path: a dense F32 cross-encoder behind
+        // /v1/rerank, with its own isolated compute stack.
+        if (m.task == ::mimirmind::core::config::ModelTask::Rerank) {
+            try {
+                out.ownedRerankStacks.push_back(
+                    ::mimirmind::runtime::makeComputeStack(cfg, engineKind));
+                auto& stk = out.ownedRerankStacks.back();
+                auto re = std::make_unique<
+                    ::mimirmind::runtime::encoder::RerankEngine>(
+                    m.path, *stk.ops, *stk.matmul);
+                ::mimirmind::server::LoadedReranker lr{};
+                lr.id     = m.id;
+                lr.title  = m.title;
+                lr.engine = re.get();
+                out.loadedRerankers.push_back(std::move(lr));
+                out.ownedRerankers.push_back(std::move(re));
+                MM_LOG_INFO("main",
+                            "serve: loaded rerank model '{}' (id='{}')",
+                            m.path, m.id);
+            } catch (const std::exception& x) {
+                std::cerr << "serve: rerank model '" << m.id
+                          << "' load failed: " << x.what() << "\n";
+                out.exitCode = 2;
+                return;
+            }
+            continue;
+        }
+
+        // Embed models: a dense F32 bi-encoder behind /v1/embeddings.
+        if (m.task == ::mimirmind::core::config::ModelTask::Embed) {
+            try {
+                out.ownedEmbedStacks.push_back(
+                    ::mimirmind::runtime::makeComputeStack(cfg, engineKind));
+                auto& stk = out.ownedEmbedStacks.back();
+                auto ee = std::make_unique<
+                    ::mimirmind::runtime::encoder::EmbedEngine>(
+                    m.path, *stk.ops, *stk.matmul);
+                ::mimirmind::server::LoadedEmbedder le{};
+                le.id     = m.id;
+                le.title  = m.title;
+                le.engine = ee.get();
+                out.loadedEmbedders.push_back(std::move(le));
+                out.ownedEmbedders.push_back(std::move(ee));
+                MM_LOG_INFO("main",
+                            "serve: loaded embed model '{}' (id='{}')",
+                            m.path, m.id);
+            } catch (const std::exception& x) {
+                std::cerr << "serve: embed model '" << m.id
+                          << "' load failed: " << x.what() << "\n";
+                out.exitCode = 2;
+                return;
+            }
+            continue;
+        }
+
+        // Decide models (8.23 System-One): bge-m3 encoder + trained decision
+        // heads behind /v1/decide.
+        if (m.task == ::mimirmind::core::config::ModelTask::Decide) {
+            try {
+                out.ownedDecideStacks.push_back(
+                    ::mimirmind::runtime::makeComputeStack(cfg, engineKind));
+                auto& stk = out.ownedDecideStacks.back();
+                auto de = std::make_unique<
+                    ::mimirmind::runtime::encoder::DecideEngine>(
+                    m.path, m.decideHeadsDir, *stk.ops, *stk.matmul);
+                ::mimirmind::server::LoadedDecider ld{};
+                ld.id     = m.id;
+                ld.title  = m.title;
+                ld.engine = de.get();
+                MM_LOG_INFO("main",
+                            "serve: loaded decide model '{}' (id='{}', {} heads)",
+                            m.path, m.id, de->headCount());
+                out.loadedDeciders.push_back(std::move(ld));
+                out.ownedDeciders.push_back(std::move(de));
+            } catch (const std::exception& x) {
+                std::cerr << "serve: decide model '" << m.id
+                          << "' load failed: " << x.what() << "\n";
+                out.exitCode = 2;
+                return;
+            }
+            continue;
+        }
+
+        // Transcribe models: a Whisper-class ASR checkpoint behind
+        // /v1/audio/transcriptions.
+        if (m.task == ::mimirmind::core::config::ModelTask::Transcribe) {
+            try {
+                out.ownedTranscribeStacks.push_back(
+                    ::mimirmind::runtime::makeComputeStack(cfg, engineKind));
+                auto& stk = out.ownedTranscribeStacks.back();
+                auto ae = std::make_unique<
+                    ::mimirmind::runtime::audio::AudioEngine>(
+                    m.path, *stk.ops, *stk.matmul);
+                ::mimirmind::server::LoadedTranscriber lt{};
+                lt.id     = m.id;
+                lt.title  = m.title;
+                lt.engine = ae.get();
+                out.loadedTranscribers.push_back(std::move(lt));
+                out.ownedTranscribers.push_back(std::move(ae));
+                MM_LOG_INFO("main",
+                            "serve: loaded transcribe model '{}' (id='{}')",
+                            m.path, m.id);
+            } catch (const std::exception& x) {
+                std::cerr << "serve: transcribe model '" << m.id
+                          << "' load failed: " << x.what() << "\n";
+                out.exitCode = 2;
+                return;
+            }
+            continue;
+        }
+
+        // Speak (Orpheus TTS) models: an acoustic InferenceEngine backbone plus
+        // the SNAC codec decoder behind /v1/audio/speech.
+        if (m.task == ::mimirmind::core::config::ModelTask::Speak) {
+            if (m.codecPath.empty()) {
+                std::cerr << "serve: speak model '" << m.id
+                          << "' requires a 'codec' path (converted SNAC "
+                             "safetensors)\n";
+                out.exitCode = 2;
+                return;
+            }
+            try {
+                auto e = std::make_unique<::mimirmind::runtime::InferenceEngine>(
+                    cfg, engineKind);
+                if (attachedMode) {
+                    auto ka = attachEngine(*e, m);
+                    if (!ka) {
+                        out.exitCode = 2;
+                        return;
+                    }
+                    out.attachedKeepAlive.push_back(std::move(ka->first));
+                    out.attachedKeepAlive.push_back(std::move(ka->second));
+                } else {
+                    e->setModelIdHint(m.id);   // for the per-model profile overlay
+                    if (runtime::nvfp4::resolveModelFormat(m.format, m.path)
+                        == core::config::ModelFormat::Nvfp4) {
+                        e->loadModelNvfp4(m.path, m.tokenizerGguf);
+                    } else {
+                        e->loadModel(m.path);
+                    }
+                }
+                auto se = std::make_unique<
+                    ::mimirmind::runtime::audio::SpeakEngine>(*e, m.codecPath);
+                ::mimirmind::server::LoadedSpeaker ls{};
+                ls.id     = m.id;
+                ls.title  = m.title;
+                ls.engine = se.get();
+                out.loadedSpeakers.push_back(std::move(ls));
+                out.ownedSpeakers.push_back(std::move(se));
+                out.ownedSpeakBackbones.push_back(std::move(e));
+                MM_LOG_INFO("main",
+                            "serve: loaded speak model '{}' (id='{}', codec='{}')",
+                            m.path, m.id, m.codecPath);
+            } catch (const std::exception& x) {
+                std::cerr << "serve: speak model '" << m.id
+                          << "' load failed: " << x.what() << "\n";
+                out.exitCode = 2;
+                return;
+            }
+            continue;
+        }
+
+        // M-Munin.3 (full): non-default chat models defer to the pool instead of
+        // eager-loading here.
+        if (attachedMode && cfg.serving.modelPoolCapacity > 0 &&
+            m.id != defaultId) {
+            out.poolChatModels.push_back(m);
+            MM_LOG_INFO("main",
+                        "serve: model '{}' registered with the pool "
+                        "(lazy materialize, capacity={})",
+                        m.id, cfg.serving.modelPoolCapacity);
+            continue;
+        }
+
+        auto e = std::make_unique<::mimirmind::runtime::InferenceEngine>(
+            cfg, engineKind);
+
+        if (attachedMode) {
+            MM_LOG_INFO("main",
+                        "serve: attaching to Munin for model '{}' "
+                        "(local header from '{}')", m.id, m.path);
+            auto ka = attachEngine(*e, m);
+            if (!ka) {
+                out.exitCode = 2;
+                return;
+            }
+            out.attachedKeepAlive.push_back(std::move(ka->first));
+            out.attachedKeepAlive.push_back(std::move(ka->second));
+        } else {
+            e->setModelIdHint(m.id);   // for the per-model profile overlay
+            if (runtime::nvfp4::resolveModelFormat(m.format, m.path)
+                == core::config::ModelFormat::Nvfp4) {
+                MM_LOG_INFO("main", "serve: loading NVFP4 model '{}' (id='{}')",
+                            m.path, m.id);
+                e->loadModelNvfp4(m.path, m.tokenizerGguf);
+            } else {
+                MM_LOG_INFO("main", "serve: loading model '{}' (id='{}')",
+                            m.path, m.id);
+                e->loadModel(m.path);
+            }
+        }
+
+        const auto& arch = e->config().architecture;
+        if (arch != "qwen2" && arch != "llama" && arch != "gemma4" &&
+            arch != "qwen35moe" && arch != "qwen4_exp") {
+            const std::string msg =
+                "serve: architecture '" + arch + "' (model id '" + m.id +
+                "') is not implemented yet. See "
+                "Memory/mimirmind/research/m8-gemma4-staging.md.";
+            MM_LOG_ERROR("main", "{}", msg);
+            std::cerr << msg << "\n";
+            out.exitCode = 2;
+            return;
+        }
+        // setKvDtype + setMaxContextTokens inspect loaded model state, so apply
+        // the per-model runtime overrides AFTER loadModel.
+        applyRuntimeOverrides(*e, cfg.effectiveRuntime(m.id));
+        if (const auto benchExit =
+                ServingBenchModes::maybeRun(*e, arch, cfg)) {
+            out.exitCode = *benchExit;
+            return;
+        }
+        // M9.8b — cross-block sanity check on the effective runtime. The
+        // plain-attention fallback holds scores[ATTN_MAX_TK] in 64 KiB SLM, so a
+        // forced plain path (features.prefillFlash: false) above kAttentionMaxTk
+        // would throw deep in GpuOps::attentionPlainAsync on the first request.
+        {
+            const auto effMaxCtx = e->maxContextTokens();
+#ifdef MIMIRMIND_HAVE_L0
+            if (effMaxCtx > ::mimirmind::compute::l0::GpuOps::kAttentionMaxTk
+                && !cfg.features.flashPrefill) {
+                const std::string msg =
+                    "serve: model '" + m.id + "' has effective "
+                    "runtime.maxContextTokens=" + std::to_string(effMaxCtx) +
+                    " > kAttentionMaxTk=" +
+                    std::to_string(
+                        ::mimirmind::compute::l0::GpuOps::kAttentionMaxTk) +
+                    " while features.prefillFlash=false — the "
+                    "plain-attention fallback cannot hold "
+                    "scores[ATTN_MAX_TK] in SLM at that context "
+                    "length. Set features.prefillFlash=true (default) "
+                    "OR reduce runtime.maxContextTokens below " +
+                    std::to_string(
+                        ::mimirmind::compute::l0::GpuOps::kAttentionMaxTk) + ".";
+                MM_LOG_ERROR("main", "{}", msg);
+                std::cerr << msg << "\n";
+                out.exitCode = 2;
+                return;
+            }
+#else
+            (void)effMaxCtx;
+#endif
+            if (effMaxCtx > 24576
+                && e->kvDtype() == ::mimirmind::runtime::KvDtype::F32) {
+                MM_LOG_WARN("main",
+                            "runtime.maxContextTokens={} for model '{}' "
+                            "with kvDtype=f32: the KV cache will consume "
+                            "several GiB on Gemma-4-class geometries. "
+                            "Consider kvDtype=q8_0 or kvDtype=fp16 on "
+                            "shared-24 GiB hosts.",
+                            effMaxCtx, m.id);
+            }
+        }
+
+        const auto d = e->kvDtype();
+        const char* dName = (d == ::mimirmind::runtime::KvDtype::FP16 ? "fp16"
+                           : d == ::mimirmind::runtime::KvDtype::Q8_0 ? "q8_0"
+                           : d == ::mimirmind::runtime::KvDtype::FP8_E4M3 ? "fp8_e4m3"
+                                                                      : "f32");
+        MM_LOG_INFO("main",
+                    "KV cache dtype for '{}': {} (block {} B × {} elem)",
+                    m.id, dName,
+                    ::mimirmind::runtime::kvBlockBytes(d),
+                    ::mimirmind::runtime::kvBlockElements(d));
+
+        ::mimirmind::server::LoadedEngine le{};
+        le.id     = m.id;
+        le.title  = m.title;
+        le.engine = e.get();
+        out.loadedEngines.push_back(std::move(le));
+        out.ownedEngines.push_back(std::move(e));
     }
 }
 
