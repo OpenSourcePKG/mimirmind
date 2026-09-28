@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
+// The attn/gdn/moe microbenchmark subcommands boot a CUDA compute context
+// directly, so their headers (and TUs) exist only in a CUDA build.
+#ifdef MIMIRMIND_HAVE_CUDA
 #include "mimirmind/AttnBenchMode.hpp"
 #include "mimirmind/GdnBenchMode.hpp"
 #include "mimirmind/MoeBenchMode.hpp"
+#endif
 #include "mimirmind/CliArgs.hpp"
 #include "mimirmind/CliParser.hpp"
 #include "mimirmind/ParityMode.hpp"
@@ -84,11 +88,19 @@ int main(int argc, char** argv) {
             case Mode::QualityGate:
                 return mimirmind::cli::runQualityGate(args, cfg);
             case Mode::AttnBench:
-                return mimirmind::cli::runAttnBench(args, cfg);
             case Mode::GdnBench:
-                return mimirmind::cli::runGdnBench(args, cfg);
             case Mode::MoeBench:
+#ifdef MIMIRMIND_HAVE_CUDA
+                if (args.mode == Mode::AttnBench)
+                    return mimirmind::cli::runAttnBench(args, cfg);
+                if (args.mode == Mode::GdnBench)
+                    return mimirmind::cli::runGdnBench(args, cfg);
                 return mimirmind::cli::runMoeBench(args, cfg);
+#else
+                std::cerr << "attnbench/gdnbench/moebench require a CUDA build "
+                             "(configure with -DMIMIRMIND_ENABLE_CUDA=ON)\n";
+                return 2;
+#endif
         }
         return 0;
 #ifdef MIMIRMIND_HAVE_L0

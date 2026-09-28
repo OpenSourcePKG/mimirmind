@@ -1443,13 +1443,12 @@ endif()
 
 add_executable(mimirmind
     src/mimirmind/main.cpp
-    src/mimirmind/AttnBenchMode.cpp
-    src/mimirmind/GdnBenchMode.cpp
-    src/mimirmind/MoeBenchMode.cpp
     src/mimirmind/CliParser.cpp
     src/mimirmind/ParityMode.cpp
     src/mimirmind/QualityGateMode.cpp
     src/mimirmind/ServeMode.cpp
+    src/mimirmind/ServerBootstrap.cpp
+    src/mimirmind/ServingBenchModes.cpp
     src/mimirmind/SmokeMode.cpp
     src/mimirmind/diagnostics/SmokeSuite.cpp
     src/compute/Activations.cpp
@@ -1574,6 +1573,12 @@ if(MIMIRMIND_ENABLE_CUDA)
         src/compute/cuda/GpuOps.cpp
         src/compute/cuda/MoeTopKRouteDevice.cpp
         src/compute/cuda/CudaMaterializerOps.cpp
+        # CUDA-only microbenchmark subcommands (attnbench/gdnbench/moebench).
+        # They #include the CUDA compute-context headers unconditionally, so
+        # they must not be compiled into an L0-/HIP-only executable.
+        src/mimirmind/AttnBenchMode.cpp
+        src/mimirmind/GdnBenchMode.cpp
+        src/mimirmind/MoeBenchMode.cpp
     )
     add_dependencies(mimirmind cuda_kernels)
 endif()
