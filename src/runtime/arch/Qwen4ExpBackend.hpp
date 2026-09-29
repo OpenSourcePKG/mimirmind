@@ -5,6 +5,7 @@
 
 #include "compute/ComputeBuffer.hpp"
 #include "compute/IHyperConnectionOps.hpp"
+#include "compute/IPleOps.hpp"
 #include "runtime/arch/Qwen3_5MoeBackend.hpp"
 #include "runtime/nvfp4/PleNgramTable.hpp"
 
@@ -110,6 +111,11 @@ private:
     // IHyperConnectionOps; hcOps() hands it back and throws on a backend that
     // does not (the same failure the former base-class throw-default gave).
     [[nodiscard]] compute::IHyperConnectionOps& hcOps() const;
+
+    // The backend's PLE device-forward ops (8.30.6 ISP-split), same story as
+    // hcOps(): qwen4_exp is CUDA/Bragi-only, so `_ops` is expected to implement
+    // IPleOps; pleOps() hands it back and throws on a backend that does not.
+    [[nodiscard]] compute::IPleOps& pleOps() const;
 
     // GatedResidual over the stream state `_hcStreams` -> `mixed` [T, d_model].
     // `combine` (per-layer) also computes the injection weights into `_hcInj`;

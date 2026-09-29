@@ -23,6 +23,7 @@ namespace mimirmind::compute {
 class IHyperConnectionOps;
 class IMoeGroupedOps;
 class IPagedAttentionOps;
+class IPleOps;
 
 /// 5.21 Increment II — shape/control bundle for the batched GatedDeltaNet
 /// recurrence. Groups the scalar dims + per-slot control that grow as the
@@ -834,24 +835,12 @@ public:
     }
 
     // --- Qwen4-Exp PLE device forward (5.27 I-4) ------------------------------
-    // CUDA-only; default-throw elsewhere. See kernels/cuda/llm/ple_forward.cu.
-
-    /// PLE signed-sqrt stream gate: gated[t,g*d+j] = sigmoid(sign(g)*sqrt(max(|g|,
-    /// 1e-6))) * value[t,j], g = (keyNormed·queryNormed over d)/sqrt(d) per
-    /// stream. keyNormed/queryNormed are [T, hc*d]; value [T, d]; gated [T, hc*d].
-    virtual void pleGateAsync(const float* /*keyNormed*/, const float* /*queryNormed*/,
-                              const float* /*value*/, float* /*gated*/,
-                              std::size_t /*T*/, std::size_t /*hc*/, std::size_t /*d*/) {
-        throw std::runtime_error("pleGateAsync: not supported on this backend");
-    }
-
-    /// PLE dilated depthwise causal conv1d + silu over [T, hcd] with a decode
-    /// state [stateLen, hcd] (nullptr = zero state / prefill). w is [hcd, K].
-    virtual void pleConvSiluAsync(const float* /*x*/, const float* /*state*/,
-                                  const float* /*w*/, float* /*out*/, std::size_t /*T*/,
-                                  std::size_t /*hcd*/, std::size_t /*K*/,
-                                  std::size_t /*dilation*/, std::size_t /*stateLen*/) {
-        throw std::runtime_error("pleConvSiluAsync: not supported on this backend");
+    // The two CUDA-only PLE ops (signed-sqrt gate + conv1d/silu) moved to
+    // IPleOps (8.30.6 ISP-split); reach them through this accessor. Returns
+    // nullptr on backends without PLE (every arch but qwen4_exp on CUDA/Bragi)
+    // — no throw-default stubs on the neutral base.
+    [[nodiscard]] virtual IPleOps* pleOps() noexcept {
+        return nullptr;
     }
 
     /// Per-head channel slice + optional GQA head repeat: turns the fused

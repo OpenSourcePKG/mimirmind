@@ -7,6 +7,7 @@
 #include "compute/IHyperConnectionOps.hpp"
 #include "compute/IMoeGroupedOps.hpp"
 #include "compute/IPagedAttentionOps.hpp"
+#include "compute/IPleOps.hpp"
 #include "compute/cuda/MoeTopKRouteDevice.hpp"
 #include "core/config/Config.hpp"
 #include "runtime/KvCache.hpp"
@@ -61,7 +62,8 @@ class CudnnSdpaPrefill;
 class GpuOps : public ::mimirmind::compute::ComputeOps,
                public ::mimirmind::compute::IHyperConnectionOps,
                public ::mimirmind::compute::IMoeGroupedOps,
-               public ::mimirmind::compute::IPagedAttentionOps {
+               public ::mimirmind::compute::IPagedAttentionOps,
+               public ::mimirmind::compute::IPleOps {
 public:
     /// Same 4-arg shape as `GpuOps` — the config knobs propagate 1:1
     /// so a config.json that steered the L0 backend keeps steering
@@ -430,7 +432,10 @@ public:
                               std::size_t T, std::size_t hc, std::size_t d) override;
     void hcStreamBroadcastAsync(const float* src, float* dst, std::size_t T,
                                 std::size_t hc, std::size_t d) override;
-    // 5.27 I-4 PLE.
+    // 5.27 I-4 PLE — the CUDA backend implements the segregated IPleOps
+    // interface (8.30.6); the accessor hands it back.
+    [[nodiscard]] ::mimirmind::compute::IPleOps*
+        pleOps() noexcept override { return this; }
     void pleGateAsync(const float* keyNormed, const float* queryNormed,
                       const float* value, float* gated, std::size_t T,
                       std::size_t hc, std::size_t d) override;

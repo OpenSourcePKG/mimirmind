@@ -6,6 +6,7 @@
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
 #include "compute/IHyperConnectionOps.hpp"
+#include "compute/IPleOps.hpp"
 #include "core/gguf/WeightsMap.hpp"
 #include "core/log/Log.hpp"
 #include "model/LlmConfig.hpp"
@@ -101,6 +102,15 @@ compute::IHyperConnectionOps& Qwen4ExpBackend::hcOps() const {
     throw std::runtime_error(
         "Qwen4ExpBackend: the loaded compute backend provides no "
         "Hyper-Connections ops (qwen4_exp is a CUDA/Bragi-only arch)");
+}
+
+compute::IPleOps& Qwen4ExpBackend::pleOps() const {
+    if (auto* ple = _ops.pleOps()) {
+        return *ple;
+    }
+    throw std::runtime_error(
+        "Qwen4ExpBackend: the loaded compute backend provides no PLE "
+        "device-forward ops (qwen4_exp is a CUDA/Bragi-only arch)");
 }
 
 void Qwen4ExpBackend::growHcScratch(std::size_t T) {
@@ -436,7 +446,7 @@ void Qwen4ExpBackend::pleForward(std::size_t T, BlockBuffers& s) {
                                _pleQryN.as<float>(), T, hc, d, eps);
 
     // 3. signed-sqrt gate -> gated value; norm_conv; dilated conv+silu.
-    _ops.pleGateAsync(_pleKeyN.as<float>(), _pleQryN.as<float>(), _pleVal.as<float>(),
+    pleOps().pleGateAsync(_pleKeyN.as<float>(), _pleQryN.as<float>(), _pleVal.as<float>(),
                       _pleGated.as<float>(), T, hc, d);
     hcOps().hcGroupedRmsNormAsync(_pleGated.as<float>(),
                                static_cast<const float*>(ncW.usmPtr),
@@ -452,13 +462,13 @@ void Qwen4ExpBackend::pleForward(std::size_t T, BlockBuffers& s) {
     // through the single-session runBlock path (T=prompt), unaffected.
     if (_pleBatchedNSeq > 0) {
         for (std::size_t r = 0; r < _pleBatchedNSeq; ++r) {
-            _ops.pleConvSiluAsync(_pleGvn.as<float>() + r * hcd, /*state=*/nullptr,
+            pleOps().pleConvSiluAsync(_pleGvn.as<float>() + r * hcd, /*state=*/nullptr,
                                   static_cast<const float*>(cW.usmPtr),
                                   _pleConvOut.as<float>() + r * hcd,
                                   /*T=*/1, hcd, K, dilation, stateLen);
         }
     } else {
-        _ops.pleConvSiluAsync(_pleGvn.as<float>(), /*state=*/nullptr,
+        pleOps().pleConvSiluAsync(_pleGvn.as<float>(), /*state=*/nullptr,
                               static_cast<const float*>(cW.usmPtr),
                               _pleConvOut.as<float>(), T, hcd, K, dilation, stateLen);
     }
