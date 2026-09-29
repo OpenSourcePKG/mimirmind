@@ -4,6 +4,7 @@
 #include "compute/l0/GpuOps.hpp"
 
 #include "compute/Attention.hpp"
+#include "compute/detail/LaunchGuards.hpp"
 #include "compute/l0/MoeGateUpFusedKDevice.hpp"
 #include "compute/l0/MoeTopKRouteDevice.hpp"
 #include "core/gpu/l0/L0Context.hpp"
@@ -34,20 +35,11 @@ namespace mimirmind::compute::l0 {
 namespace {
 
 std::int32_t toInt32(std::size_t v, const char* tag) {
-    if (v > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::runtime_error(
-            std::string{"GpuOps: "} + tag +
-            " overflows int32 ("  + std::to_string(v) + ")");
-    }
-    return static_cast<std::int32_t>(v);
+    return detail::toInt32(v, tag, "GpuOps");
 }
 
 std::uint32_t groupsForN(std::size_t n, std::uint32_t local) {
-    const std::size_t g = (n + local - 1) / local;
-    if (g > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::runtime_error("GpuOps: workgroup count overflows uint32");
-    }
-    return static_cast<std::uint32_t>(g);
+    return detail::groupsForN(n, local, "GpuOps");
 }
 
 } // namespace

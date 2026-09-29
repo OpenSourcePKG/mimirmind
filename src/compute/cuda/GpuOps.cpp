@@ -3,6 +3,8 @@
 
 #include "compute/cuda/GpuOps.hpp"
 
+#include "compute/detail/LaunchGuards.hpp"
+
 #include "core/gpu/cuda/CudaComputeContext.hpp"
 #include "core/gpu/cuda/CudaKernel.hpp"
 #if MIMIRMIND_HAVE_CUDNN_SDPA
@@ -36,28 +38,16 @@ namespace {
 
 constexpr const char* kDefaultPtxDir = "/usr/local/share/mimirmind/ptx";
 
-// Range-check + narrow to int32 for kernel scalar args. Kernels bind
-// their shape arguments as `const int` so an oversized `size_t` would
-// silently truncate — this helper throws instead, matching the L0
-// side's `toInt32` in GpuOps.cpp.
+// Range-check + narrow to int32 / ceil-div grid geometry for kernel scalar
+// args: thin backend-labelled wrappers over the shared guards in
+// compute/detail/LaunchGuards.hpp (8.30.2). Messages keep the "cuda::GpuOps"
+// label so diagnostics are unchanged.
 std::int32_t toInt32(std::size_t v, const char* tag) {
-    if (v > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::runtime_error(
-            std::string{"cuda::GpuOps: "} + tag +
-            " overflows int32 ("  + std::to_string(v) + ")");
-    }
-    return static_cast<std::int32_t>(v);
+    return detail::toInt32(v, tag, "cuda::GpuOps");
 }
 
-// Ceiling division for launch grid geometry. Same shape as the L0
-// `groupsForN`. Throws if the resulting group count would overflow a
-// `uint32_t` (kernel launch API takes 32-bit dims).
 std::uint32_t groupsForN(std::size_t n, std::uint32_t local) {
-    const std::size_t g = (n + local - 1) / local;
-    if (g > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::runtime_error("cuda::GpuOps: workgroup count overflows uint32");
-    }
-    return static_cast<std::uint32_t>(g);
+    return detail::groupsForN(n, local, "cuda::GpuOps");
 }
 
 // Resolve `<name>.ptx` in one of:
