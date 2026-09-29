@@ -4332,9 +4332,15 @@ void GpuOps::pagedAttentionPrefillCausalAsync(
 }
 
 void GpuOps::setCudnnPrefillMaxSeqLen(std::size_t smax) {
-    _cudnnPrefillSmax = smax;
 #if MIMIRMIND_HAVE_CUDNN_SDPA
+    // _cudnnPrefillSmax only exists in cuDNN-SDPA builds; without it this setter
+    // is a no-op (there is no cuDNN graph to reconfigure). Keeping the member
+    // access under the same guard as its declaration lets CUDA test targets
+    // that link no cuDNN-SDPA still compile (see roadmap 8.30.10 / .9 family).
+    _cudnnPrefillSmax = smax;
     if (_cudnnSdpa) { _cudnnSdpa->setMaxSeqLen(static_cast<int>(smax)); }
+#else
+    (void)smax;
 #endif
 }
 
