@@ -84,7 +84,8 @@ namespace engine {
 class Nvfp4Loader;    // friend collaborator — runs loadModelNvfp4's pipeline
 class MtpDecoder;     // friend collaborator — native MTP greedy decode
 class DFlashDecoder;  // friend collaborator — DFlash block-diffusion draft
-class ServingSession; // friend collaborator — batched / continuous-batch decode
+class ServingSession; // collaborator — batched / continuous-batch decode
+                      // (reaches the engine via public accessors, not friend)
 } // namespace engine
 
 /**
@@ -820,6 +821,33 @@ public:
     [[nodiscard]] compute::ComputeMatmul&       gpuMatmul()        noexcept { return *_gmm; }
     [[nodiscard]] const compute::ComputeMatmul& gpuMatmul()  const noexcept { return *_gmm; }
     [[nodiscard]] const compute::ComputeOps&    gpuOps()     const noexcept { return *_ops; }
+
+    /// Narrow non-const seams for the `ServingSession` collaborator (8.30.7).
+    /// The batched / continuous-batch decode path drives the same compute
+    /// backend, matmul, arch backend and host staging buffer the standalone
+    /// path uses. These replace the former `friend`-level reach into private
+    /// members (`_ops`, `_gmm`, `_backend`, `_xBufH`): serving now depends on
+    /// these named accessors, not on the engine's private layout.
+    [[nodiscard]] compute::ComputeOps*     ops()     noexcept { return _ops.get(); }
+    [[nodiscard]] compute::ComputeMatmul*  gmm()     noexcept { return _gmm.get(); }
+    [[nodiscard]] arch::ArchBackend*       backend() noexcept { return _backend.get(); }
+    [[nodiscard]] const arch::ArchBackend* backend() const noexcept { return _backend.get(); }
+    [[nodiscard]] compute::ComputeBuffer&  hostXBuffer() noexcept { return _xBufH; }
+    /// Lazily construct (on first call) and return the native DFlash decoder.
+    /// Shared by `generateDflash` and the serving DFlash path so the
+    /// lazy-build lives on the engine, not in the collaborator.
+    engine::DFlashDecoder& ensureDflashDecoder();
+
+#ifdef MIMIRMIND_HAVE_CUDA
+    /// Guarded downcast of `_ops` to the concrete CUDA GpuOps — only valid
+    /// when the runtime picked the CUDA backend. Used by the CUDA-graph
+    /// decode capture path (M-Q3N.5 K4) in the standalone loop and in the
+    /// ServingSession collaborator (a narrow, guarded seam — 8.30.7).
+    [[nodiscard]] compute::cuda::GpuOps& cudaOps() noexcept {
+        return static_cast<compute::cuda::GpuOps&>(*_ops);
+    }
+#endif
+
     [[nodiscard]] const model::FusedQkvWeights* fusedQkv() const noexcept {
         return _fusedQkv.get();
     }
@@ -897,7 +925,11 @@ private:
     friend class engine::Nvfp4Loader;
     friend class engine::MtpDecoder;
     friend class engine::DFlashDecoder;
-    friend class engine::ServingSession;
+    // engine::ServingSession is no longer a friend (8.30.7): the batched /
+    // continuous-batch decode path reaches the engine through the narrow
+    // public accessors above (ops()/gmm()/backend()/hostXBuffer()/kvDtype()/
+    // config()/tokenizer()/weights()/fusedQkv()/cudaOps()/ensureDflashDecoder())
+    // instead of its private layout.
 
     /// Compute logits over the last hidden state row via final-norm +
     /// lm_head, then draw one token id using `_sampler` and `params`.
@@ -962,14 +994,6 @@ private:
     [[nodiscard]] const ::mimirmind::core::l0::L0ComputeContext& l0ComputeContext() const;
 #endif
 
-#ifdef MIMIRMIND_HAVE_CUDA
-    /// Guarded downcast of `_ops` to the concrete CUDA GpuOps — only valid
-    /// when the runtime picked the CUDA backend. Used by the CUDA-graph
-    /// decode capture path (M-Q3N.5 K4).
-    [[nodiscard]] compute::cuda::GpuOps& cudaOps() noexcept {
-        return static_cast<compute::cuda::GpuOps&>(*_ops);
-    }
-#endif
 
     // Held by reference for the whole process lifetime. Provided by main().
     const Config&                              _cfg;

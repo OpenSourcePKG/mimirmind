@@ -3101,11 +3101,15 @@ InferenceEngine::generateDflash(std::span<const std::int32_t> promptIds,
                                 std::size_t* draftedOut, std::size_t* acceptedOut) {
     // The DFlash drafter + tap sinks + draft/verify/accept loop live in
     // engine::DFlashDecoder (a friend collaborator). Constructed lazily.
+    return ensureDflashDecoder().generate(promptIds, maxNew, draftN, eosId,
+                                          drafterDir, draftedOut, acceptedOut);
+}
+
+engine::DFlashDecoder& InferenceEngine::ensureDflashDecoder() {
     if (_dflashDecoder == nullptr) {
         _dflashDecoder = std::make_unique<engine::DFlashDecoder>(*this);
     }
-    return _dflashDecoder->generate(promptIds, maxNew, draftN, eosId, drafterDir,
-                                    draftedOut, acceptedOut);
+    return *_dflashDecoder;
 }
 
 } // namespace mimirmind::runtime

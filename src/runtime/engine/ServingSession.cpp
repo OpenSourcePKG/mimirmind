@@ -394,10 +394,10 @@ ServingSession::generateBatch(
         std::size_t maxNew, std::int32_t eosId) {
     namespace cmp = mimirmind::compute;
 
-    if (_e._backend == nullptr) {
+    if (_e.backend() == nullptr) {
         throw std::runtime_error("generateBatch: no model loaded");
     }
-    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e.backend());
     if (qb == nullptr) {
         throw std::runtime_error(
             "generateBatch: batched serving only supports qwen35moe");
@@ -421,9 +421,9 @@ ServingSession::generateBatch(
         maxTp  = std::max(maxTp, Tps[s]);
     }
 
-    const auto* tokEmb  = _e._weights->find("token_embd.weight");
-    const auto* outNorm = _e._weights->find("output_norm.weight");
-    const auto* lmHead  = _e._weights->find("output.weight");
+    const auto* tokEmb  = _e.weights().find("token_embd.weight");
+    const auto* outNorm = _e.weights().find("output_norm.weight");
+    const auto* lmHead  = _e.weights().find("output.weight");
     if (lmHead == nullptr) {
         lmHead = tokEmb;
     }
@@ -431,34 +431,34 @@ ServingSession::generateBatch(
         throw std::runtime_error("generateBatch: embed/norm/lm_head missing");
     }
 
-    const std::size_t d_model   = _e._config.embeddingLength;
+    const std::size_t d_model   = _e.config().embeddingLength;
     const std::size_t vocab_lm  = lmHead->dimensions.size() >= 2
-                                      ? lmHead->dimensions[1] : _e._tokenizer.vocabSize();
+                                      ? lmHead->dimensions[1] : _e.tokenizer().vocabSize();
     const std::size_t vocab_emb = tokEmb->dimensions.size() >= 2
-                                      ? tokEmb->dimensions[1] : _e._tokenizer.vocabSize();
+                                      ? tokEmb->dimensions[1] : _e.tokenizer().vocabSize();
     const std::size_t total     = maxTp + maxNew;
 
-    const std::size_t nKvHeads   = _e._config.headCountKv;
-    const std::size_t headDim    = _e._config.headDim();
-    const std::size_t K          = _e._config.expertUsedCount;
-    const std::size_t blockCount = _e._config.blockCount;
+    const std::size_t nKvHeads   = _e.config().headCountKv;
+    const std::size_t headDim    = _e.config().headDim();
+    const std::size_t K          = _e.config().expertUsedCount;
+    const std::size_t blockCount = _e.config().blockCount;
     std::size_t nFullAttn = 0;
     for (std::size_t b = 0; b < blockCount; ++b) {
-        if (!_e._config.isRecurrentLayer(b)) ++nFullAttn;
+        if (!_e.config().isRecurrentLayer(b)) ++nFullAttn;
     }
 
     // Paged pool with contiguous blocks per sequence (validation harness).
     const std::size_t blockSize    = 16;
     const std::size_t blocksPerSeq = (total + blockSize - 1) / blockSize;
     const std::size_t numBlocks    = nSeq * blocksPerSeq;
-    serving::PagedKvPool pool(*_e._ops, nFullAttn, numBlocks, blockSize,
+    serving::PagedKvPool pool(*_e.ops(), nFullAttn, numBlocks, blockSize,
                               nKvHeads, headDim, servingKvDtypeFor(_e));
 
-    SsmState ssm(*_e._ops, blockCount, _e._config.ssmStateElemsPerLayer(),
-                 _e._config.ssmConvStateElemsPerLayer(), nSeq);
+    SsmState ssm(*_e.ops(), blockCount, _e.config().ssmStateElemsPerLayer(),
+                 _e.config().ssmConvStateElemsPerLayer(), nSeq);
 
     const auto qkv = qb->maxQKVDims();
-    BlockBuffers sb = allocBlockBuffers(*_e._ops, _e._config, /*maxT=*/nSeq,
+    BlockBuffers sb = allocBlockBuffers(*_e.ops(), _e.config(), /*maxT=*/nSeq,
                                         /*maxSeq=*/nSeq, qkv.first, qkv.second,
                                         /*withFusedQkv=*/false,
                                         /*withKvFp32Scratch=*/true,
@@ -468,8 +468,8 @@ ServingSession::generateBatch(
     sb.ssmConvStatePtr = ssm.convStatePtr();
     sb.ssmSlabNSeq     = ssm.nSeq();
 
-    auto expIdxBuf = _e._ops->allocate(nSeq * K * sizeof(std::int32_t));
-    auto kwBuf     = _e._ops->allocate(nSeq * K * sizeof(float));
+    auto expIdxBuf = _e.ops()->allocate(nSeq * K * sizeof(std::int32_t));
+    auto kwBuf     = _e.ops()->allocate(nSeq * K * sizeof(float));
 
     std::vector<std::int32_t> blockTablesH(nSeq * blocksPerSeq);
     for (std::size_t s = 0; s < nSeq; ++s) {
@@ -478,16 +478,16 @@ ServingSession::generateBatch(
                 static_cast<std::int32_t>(s * blocksPerSeq + i);
         }
     }
-    auto blockTablesDev = _e._ops->allocate(blockTablesH.size() * sizeof(std::int32_t));
-    _e._ops->uploadHostBytes(blockTablesDev.get(), blockTablesH.data(),
+    auto blockTablesDev = _e.ops()->allocate(blockTablesH.size() * sizeof(std::int32_t));
+    _e.ops()->uploadHostBytes(blockTablesDev.get(), blockTablesH.data(),
                              blockTablesH.size() * sizeof(std::int32_t));
-    auto seqLensDev  = _e._ops->allocate(nSeq * sizeof(std::int32_t));
-    auto startPosDev = _e._ops->allocate(nSeq * sizeof(std::int32_t));
+    auto seqLensDev  = _e.ops()->allocate(nSeq * sizeof(std::int32_t));
+    auto startPosDev = _e.ops()->allocate(nSeq * sizeof(std::int32_t));
 
-    auto xBufB   = _e._ops->allocate(nSeq * d_model  * sizeof(float));
-    auto normB   = _e._ops->allocate(nSeq * d_model  * sizeof(float));
-    auto logitsB = _e._ops->allocate(nSeq * vocab_lm * sizeof(float));
-    auto lmScr   = _e._ops->allocate(std::max(d_model, vocab_lm) * sizeof(float));
+    auto xBufB   = _e.ops()->allocate(nSeq * d_model  * sizeof(float));
+    auto normB   = _e.ops()->allocate(nSeq * d_model  * sizeof(float));
+    auto logitsB = _e.ops()->allocate(nSeq * vocab_lm * sizeof(float));
+    auto lmScr   = _e.ops()->allocate(std::max(d_model, vocab_lm) * sizeof(float));
     float* const xBuf   = xBufB.as<float>();
     float* const normBuf= normB.as<float>();
     float* const logits = logitsB.as<float>();
@@ -557,8 +557,8 @@ ServingSession::generateBatch(
         qb->prepareForwardBatched(
             std::span<const std::int32_t>{inputTok.data(), nSeq},
             std::span<const std::uint8_t>{isSeqStart.data(), nSeq}, nSeq);
-        _e._ops->uploadHostBytes(seqLensDev.get(),  seqLensH.data(),  nSeq * sizeof(std::int32_t));
-        _e._ops->uploadHostBytes(startPosDev.get(), startPosH.data(), nSeq * sizeof(std::int32_t));
+        _e.ops()->uploadHostBytes(seqLensDev.get(),  seqLensH.data(),  nSeq * sizeof(std::int32_t));
+        _e.ops()->uploadHostBytes(startPosDev.get(), startPosH.data(), nSeq * sizeof(std::int32_t));
         arch::BatchedDecodeCtx ctx{};
         ctx.nSeq            = nSeq;
         ctx.pool            = &pool;
@@ -574,7 +574,7 @@ ServingSession::generateBatch(
         ctx.isSeqStart      = isSeqStart.data();
 
         if (timing) {
-            _e._ops->flush();
+            _e.ops()->flush();
             tPre += std::chrono::duration<double, std::milli>(clk::now() - tp0).count();
         }
         if (ohMode) {
@@ -587,11 +587,11 @@ ServingSession::generateBatch(
                 qb->runBlockBatched(b, xBuf, ctx, sb);
                 const double dt =
                     std::chrono::duration<double, std::milli>(clk::now() - tb0).count();
-                if (_e._config.isRecurrentLayer(b)) dLin += dt; else dFull += dt;
+                if (_e.config().isRecurrentLayer(b)) dLin += dt; else dFull += dt;
             }
             const double tdisp = dFull + dLin;
             const auto tf0 = clk::now();
-            _e._ops->flush();
+            _e.ops()->flush();
             const double tdrain =
                 std::chrono::duration<double, std::milli>(clk::now() - tf0).count();
             if (p >= 4) {
@@ -611,14 +611,14 @@ ServingSession::generateBatch(
                 // is), and run the full-attention blocks eager (varlen). The
                 // segment's graph is stored at its start-block index.
                 for (std::size_t b = 0; b < blockCount; ) {
-                    if (!_e._config.isRecurrentLayer(b)) {
+                    if (!_e.config().isRecurrentLayer(b)) {
                         qb->runBlockBatched(b, xBuf, ctx, sb);      // full-attn eager
                         ++b;
                         continue;
                     }
                     std::size_t segEnd = b;
                     while (segEnd < blockCount &&
-                           _e._config.isRecurrentLayer(segEnd)) {
+                           _e.config().isRecurrentLayer(segEnd)) {
                         ++segEnd;
                     }
                     auto runSeg = [&] {
@@ -658,10 +658,10 @@ ServingSession::generateBatch(
                     const auto tb0 = timing ? clk::now() : clk::time_point{};
                     qb->runBlockBatched(b, xBuf, ctx, sb);
                     if (timing) {
-                        _e._ops->flush();
+                        _e.ops()->flush();
                         const double dt =
                             std::chrono::duration<double, std::milli>(clk::now() - tb0).count();
-                        if (_e._config.isRecurrentLayer(b)) tLin += dt; else tFull += dt;
+                        if (_e.config().isRecurrentLayer(b)) tLin += dt; else tFull += dt;
                     }
                 }
             }
@@ -674,7 +674,7 @@ ServingSession::generateBatch(
     // vocabulary. That host round-trip is a big per-step cost that CUDA graphs
     // do not remove (it is not launch overhead) and that vLLM avoids by sampling
     // on the GPU.
-    auto argmaxDev = _e._ops->allocate(nSeq * sizeof(std::int32_t));
+    auto argmaxDev = _e.ops()->allocate(nSeq * sizeof(std::int32_t));
     std::vector<std::int32_t> toksHost(nSeq);
     auto lmHeadSample = [&]() -> std::vector<std::int32_t> {
         // 5.27 I-9a: for Hyper-Connections archs (qwen4_exp) the top-level mixer
@@ -686,16 +686,16 @@ ServingSession::generateBatch(
             qb->collapseHyperStreams(nSeq, sb, xBuf);
             lmIn = xBuf;
         } else {
-            _e._ops->rmsNormAsync(xBuf, nSeq, d_model,
+            _e.ops()->rmsNormAsync(xBuf, nSeq, d_model,
                                   static_cast<const float*>(outNorm->usmPtr),
-                                  _e._config.rmsNormEps, normBuf);
+                                  _e.config().rmsNormEps, normBuf);
         }
-        _e._gmm->matmul(lmHead->type, lmHead->usmPtr, vocab_lm, d_model,
+        _e.gmm()->matmul(lmHead->type, lmHead->usmPtr, vocab_lm, d_model,
                         lmIn, nSeq, logits, lmScr.as<float>());
-        _e._ops->argmaxRowsAsync(logits, argmaxDev.as<std::int32_t>(),
+        _e.ops()->argmaxRowsAsync(logits, argmaxDev.as<std::int32_t>(),
                                  nSeq, vocab_lm);
-        _e._ops->flush();
-        _e._ops->readbackToHost(toksHost.data(), argmaxDev.get(),
+        _e.ops()->flush();
+        _e.ops()->readbackToHost(toksHost.data(), argmaxDev.get(),
                                 nSeq * sizeof(std::int32_t));
         return toksHost;
     };
@@ -778,15 +778,15 @@ ServingSession::generateServingParity(std::span<const std::int32_t> promptIds,
 
 void ServingSession::ensureServingState(std::size_t maxBatch,
                                         std::size_t maxContext) {
-    if (_e._backend == nullptr) {
+    if (_e.backend() == nullptr) {
         throw std::runtime_error("ensureServingState: no model loaded");
     }
-    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e.backend());
     if (qb == nullptr) {
         // L0 / Xe-LPG path: a backend implementing the neutral synchronized
         // batched decode (Gemma 4 MoE) serves through the non-paged slab
         // substrate instead of the qwen35moe paged pool.
-        if (!_e._backend->supportsBatchedDecode()) {
+        if (!_e.backend()->supportsBatchedDecode()) {
             throw std::runtime_error(
                 "ensureServingState: continuous batching requires qwen35moe or "
                 "a backend with supportsBatchedDecode()");
@@ -800,9 +800,9 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
             return;   // idempotent unless capacity must grow
         }
 
-        const auto* tokEmb  = _e._weights->find("token_embd.weight");
-        const auto* outNorm = _e._weights->find("output_norm.weight");
-        const auto* lmHead  = _e._weights->find("output.weight");
+        const auto* tokEmb  = _e.weights().find("token_embd.weight");
+        const auto* outNorm = _e.weights().find("output_norm.weight");
+        const auto* lmHead  = _e.weights().find("output.weight");
         if (lmHead == nullptr) {
             lmHead = tokEmb;
         }
@@ -820,17 +820,17 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
 
         // Optional blocked-NVFP4 lm_head sibling (loader step 5f-lmhead); the
         // stepper dispatches it only at low batch (MIMIRMIND_LMHEAD_NVFP4).
-        const auto* lmHeadNv = _e._weights->find("output.weight.nv");
+        const auto* lmHeadNv = _e.weights().find("output.weight.nv");
         serving::SlabDecodeStepper::Weights w{tokEmb, outNorm, lmHead, lmHeadNv};
         serving::SlabDecodeStepper::Dims dims{};
-        dims.dModel   = _e._config.embeddingLength;
+        dims.dModel   = _e.config().embeddingLength;
         dims.vocabLm  = lmHead->dimensions.size() >= 2 ? lmHead->dimensions[1]
-                                                       : _e._tokenizer.vocabSize();
+                                                       : _e.tokenizer().vocabSize();
         dims.vocabEmb = tokEmb->dimensions.size() >= 2 ? tokEmb->dimensions[1]
-                                                       : _e._tokenizer.vocabSize();
-        dims.blockCount     = _e._config.blockCount;
-        dims.rmsNormEps     = _e._config.rmsNormEps;
-        dims.scaleEmbedding = _e._backend->scalesEmbedding();
+                                                       : _e.tokenizer().vocabSize();
+        dims.blockCount     = _e.config().blockCount;
+        dims.rmsNormEps     = _e.config().rmsNormEps;
+        dims.scaleEmbedding = _e.backend()->scalesEmbedding();
 
         // F32 KV only. The Gemma 4 batched-decode attention (M-L0.Batch
         // Phase 1, runAttentionSectionBatched) supports F32 KV exclusively —
@@ -840,24 +840,24 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         // the two KV substrates and the single-session cache are separate.
         const KvDtype kvDtype = KvDtype::F32;
         l0->slab = serving::KvCacheSlabPool::forBackend(
-            *_e._ops, *_e._backend, maxBatch, maxContext, kvDtype);
+            *_e.ops(), *_e.backend(), maxBatch, maxContext, kvDtype);
         l0->stepper = std::make_unique<serving::SlabDecodeStepper>(
-            *_e._ops, *_e._gmm, *_e._backend, *l0->slab, w, dims,
+            *_e.ops(), *_e.gmm(), *_e.backend(), *l0->slab, w, dims,
             l0->prefillChunk);
 
-        const auto [qDimMax, kvDimMax] = _e._backend->maxQKVDims();
+        const auto [qDimMax, kvDimMax] = _e.backend()->maxQKVDims();
         const bool withFusedQkv =
-            _e._fusedQkv != nullptr && _e._fusedQkv->anyFused();
+            _e.fusedQkv() != nullptr && _e.fusedQkv()->anyFused();
         const bool withKvFp32Scratch =
             (kvDtype == KvDtype::Q8_0 || kvDtype == KvDtype::FP16);
-        const bool withQGate = _e._backend->needsQGateScratch();
-        const bool withSsm   = _e._backend->needsSsmScratch();
+        const bool withQGate = _e.backend()->needsQGateScratch();
+        const bool withSsm   = _e.backend()->needsSsmScratch();
         l0->decodeSb = allocBlockBuffers(
-            *_e._ops, _e._config, /*maxT=*/maxBatch, /*maxSeq=*/maxContext,
+            *_e.ops(), _e.config(), /*maxT=*/maxBatch, /*maxSeq=*/maxContext,
             qDimMax, kvDimMax, withFusedQkv, withKvFp32Scratch,
             withQGate, withSsm);
         l0->prefillSb = allocBlockBuffers(
-            *_e._ops, _e._config, /*maxT=*/l0->prefillChunk, /*maxSeq=*/maxContext,
+            *_e.ops(), _e.config(), /*maxT=*/l0->prefillChunk, /*maxSeq=*/maxContext,
             qDimMax, kvDimMax, withFusedQkv, withKvFp32Scratch,
             withQGate, withSsm);
         l0->stepTokens.resize(maxBatch);
@@ -865,7 +865,7 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         MM_LOG_INFO("serving",
                     "L0 slab serving state: maxBatch={} maxContext={} "
                     "prefillChunk={} (backend '{}')",
-                    maxBatch, maxContext, l0->prefillChunk, _e._backend->name());
+                    maxBatch, maxContext, l0->prefillChunk, _e.backend()->name());
         _l0 = std::move(l0);
         return;
     }
@@ -878,9 +878,9 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         return;
     }
 
-    const auto* tokEmb  = _e._weights->find("token_embd.weight");
-    const auto* outNorm = _e._weights->find("output_norm.weight");
-    const auto* lmHead  = _e._weights->find("output.weight");
+    const auto* tokEmb  = _e.weights().find("token_embd.weight");
+    const auto* outNorm = _e.weights().find("output_norm.weight");
+    const auto* lmHead  = _e.weights().find("output.weight");
     if (lmHead == nullptr) {
         lmHead = tokEmb;
     }
@@ -896,23 +896,23 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         (maxContext + st->blockSize - 1) / st->blockSize;
     st->numBlocks  = maxBatch * st->blocksPerSeq;
 
-    st->d_model   = _e._config.embeddingLength;
+    st->d_model   = _e.config().embeddingLength;
     st->vocab_lm  = lmHead->dimensions.size() >= 2 ? lmHead->dimensions[1]
-                                                   : _e._tokenizer.vocabSize();
+                                                   : _e.tokenizer().vocabSize();
     st->vocab_emb = tokEmb->dimensions.size() >= 2 ? tokEmb->dimensions[1]
-                                                   : _e._tokenizer.vocabSize();
-    st->blockCount = _e._config.blockCount;
+                                                   : _e.tokenizer().vocabSize();
+    st->blockCount = _e.config().blockCount;
     st->tokEmb  = tokEmb;
     st->outNorm = outNorm;
     st->lmHead  = lmHead;
     st->qb      = qb;
 
-    const std::size_t nKvHeads = _e._config.headCountKv;
-    const std::size_t headDim  = _e._config.headDim();
-    const std::size_t K        = _e._config.expertUsedCount;
+    const std::size_t nKvHeads = _e.config().headCountKv;
+    const std::size_t headDim  = _e.config().headDim();
+    const std::size_t K        = _e.config().expertUsedCount;
     std::size_t nFullAttn = 0;
     for (std::size_t b = 0; b < st->blockCount; ++b) {
-        if (!_e._config.isRecurrentLayer(b)) ++nFullAttn;
+        if (!_e.config().isRecurrentLayer(b)) ++nFullAttn;
     }
 
     // Increment E5b: one extra paged layer holds the nextn (MTP) KV so the
@@ -924,23 +924,23 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     {   // 8.16 Stage B: paged-KV pool + SSM recurrent state = KvCache.
         core::gpu::ScopedAllocCategory _kc{core::gpu::AllocCategory::KvCache};
         st->pool = std::make_unique<serving::PagedKvPool>(
-            *_e._ops, nPoolLayers, st->numBlocks, st->blockSize, nKvHeads, headDim,
+            *_e.ops(), nPoolLayers, st->numBlocks, st->blockSize, nKvHeads, headDim,
             servingKvDtypeFor(_e));
         st->ssm = std::make_unique<SsmState>(
-            *_e._ops, st->blockCount, _e._config.ssmStateElemsPerLayer(),
-            _e._config.ssmConvStateElemsPerLayer(), maxBatch);
+            *_e.ops(), st->blockCount, _e.config().ssmStateElemsPerLayer(),
+            _e.config().ssmConvStateElemsPerLayer(), maxBatch);
         // 5.28.1.0 (Inc 0) — per-sequence SSM+conv snapshot size, the storage
         // budget for the planned GDN prefix-checkpoint (one checkpoint/slot).
         const std::size_t ssmSnapBytes =
             st->blockCount *
-            (_e._config.ssmStateElemsPerLayer() +
-             _e._config.ssmConvStateElemsPerLayer()) * sizeof(float);
+            (_e.config().ssmStateElemsPerLayer() +
+             _e.config().ssmConvStateElemsPerLayer()) * sizeof(float);
         MM_LOG_INFO("ssmstate",
                     "serving GatedDeltaNet state: {} layers, {}+{} elems/layer, "
                     "{} MiB per-sequence snapshot (5.28.1 prefix-checkpoint "
                     "budget), slab nSeq={}",
-                    st->blockCount, _e._config.ssmStateElemsPerLayer(),
-                    _e._config.ssmConvStateElemsPerLayer(),
+                    st->blockCount, _e.config().ssmStateElemsPerLayer(),
+                    _e.config().ssmConvStateElemsPerLayer(),
                     ssmSnapBytes / (1024 * 1024), maxBatch);
     }
 
@@ -949,7 +949,7 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     // setup (block-buffer substrate + per-slot scratch: expIdx/kw/blockTables/
     // seqLens/startPos/x/norm/logits/lmScr) is the Session substrate.
     core::gpu::ScopedAllocCategory _sc{core::gpu::AllocCategory::Session};
-    st->sb = allocBlockBuffers(*_e._ops, _e._config, /*maxT=*/maxBatch,
+    st->sb = allocBlockBuffers(*_e.ops(), _e.config(), /*maxT=*/maxBatch,
                                /*maxSeq=*/maxBatch, qkv.first, qkv.second,
                                /*withFusedQkv=*/false, /*withKvFp32Scratch=*/true,
                                /*withQGate=*/true, /*withSsm=*/true,
@@ -958,8 +958,8 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     st->sb->ssmConvStatePtr = st->ssm->convStatePtr();
     st->sb->ssmSlabNSeq     = st->ssm->nSeq();
 
-    st->expIdxBuf = _e._ops->allocate(maxBatch * K * sizeof(std::int32_t));
-    st->kwBuf     = _e._ops->allocate(maxBatch * K * sizeof(float));
+    st->expIdxBuf = _e.ops()->allocate(maxBatch * K * sizeof(std::int32_t));
+    st->kwBuf     = _e.ops()->allocate(maxBatch * K * sizeof(float));
 
     // Static per-slot block table: slot s owns physical blocks
     // [s*blocksPerSeq, (s+1)*blocksPerSeq). Uploaded once.
@@ -971,11 +971,11 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         }
     }
     st->blockTablesDev =
-        _e._ops->allocate(st->blockTablesH.size() * sizeof(std::int32_t));
-    _e._ops->uploadHostBytes(st->blockTablesDev.get(), st->blockTablesH.data(),
+        _e.ops()->allocate(st->blockTablesH.size() * sizeof(std::int32_t));
+    _e.ops()->uploadHostBytes(st->blockTablesDev.get(), st->blockTablesH.data(),
                              st->blockTablesH.size() * sizeof(std::int32_t));
-    st->seqLensDev  = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
-    st->startPosDev = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
+    st->seqLensDev  = _e.ops()->allocate(maxBatch * sizeof(std::int32_t));
+    st->startPosDev = _e.ops()->allocate(maxBatch * sizeof(std::int32_t));
 
     // 5.28.1.2.b — cross-slot GDN prefix sharing store. Cap default OFF
     // (MIMIRMIND_GDN_XSLOT=1 opts in); LRU entry cap via MIMIRMIND_GDN_XSLOT_MAX.
@@ -987,7 +987,7 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     // nothing to share, stays off (and the store ops no-op on ssm==nullptr).
     bool hasRecurrent = false;
     for (std::size_t L = 0; L < st->blockCount; ++L) {
-        if (_e._config.isRecurrentLayer(L)) { hasRecurrent = true; break; }
+        if (_e.config().isRecurrentLayer(L)) { hasRecurrent = true; break; }
     }
     st->xslot = hasRecurrent;
     if (const char* xs = std::getenv("MIMIRMIND_GDN_XSLOT")) {
@@ -1010,10 +1010,10 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
                     "(blockSize={} tok, maxEntries={})", xblk, xslotMax);
     }
 
-    st->xBufB   = _e._ops->allocate(maxBatch * st->d_model  * sizeof(float));
-    st->normB   = _e._ops->allocate(maxBatch * st->d_model  * sizeof(float));
-    st->logitsB = _e._ops->allocate(maxBatch * st->vocab_lm * sizeof(float));
-    st->lmScr   = _e._ops->allocate(std::max(st->d_model, st->vocab_lm) * sizeof(float));
+    st->xBufB   = _e.ops()->allocate(maxBatch * st->d_model  * sizeof(float));
+    st->normB   = _e.ops()->allocate(maxBatch * st->d_model  * sizeof(float));
+    st->logitsB = _e.ops()->allocate(maxBatch * st->vocab_lm * sizeof(float));
+    st->lmScr   = _e.ops()->allocate(std::max(st->d_model, st->vocab_lm) * sizeof(float));
 
     st->writeBlockId.resize(maxBatch);
     st->writeSlot.resize(maxBatch);
@@ -1031,7 +1031,7 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     // default path stays byte-for-byte unchanged. See stepServing.
     st->gpuArgmax = envFlagSet("MIMIRMIND_SERVING_GPU_ARGMAX");
     if (st->gpuArgmax) {
-        st->argmaxDev = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
+        st->argmaxDev = _e.ops()->allocate(maxBatch * sizeof(std::int32_t));
         st->argmaxHost.resize(maxBatch);
     }
 
@@ -1067,7 +1067,7 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
             const bool prefillKvFp32Scratch =
                 (servingKvDtypeFor(_e) == KvDtype::FP16);
             st->sbPrefill = allocBlockBuffers(
-                *_e._ops, _e._config, /*maxT=*/chunk, /*maxSeq=*/maxContext,
+                *_e.ops(), _e.config(), /*maxT=*/chunk, /*maxSeq=*/maxContext,
                 qkv.first, qkv.second, /*withFusedQkv=*/false,
                 // 5.21-III: the varlen prefill driver uses runFullAttentionBlock-
                 // Batched, whose kProj/vProj scratch is kvKFp32Scratch — always
@@ -1078,9 +1078,9 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
             // target slot's slab slice; ssmSlabNSeq is the full slab width so
             // the per-layer stride matches stepServing's slab layout.
             st->sbPrefill->ssmSlabNSeq = st->ssm->nSeq();
-            st->xBufP = _e._ops->allocate(chunk * st->d_model * sizeof(float));
-            st->prefillExpIdx = _e._ops->allocate(chunk * K * sizeof(std::int32_t));
-            st->prefillKw     = _e._ops->allocate(chunk * K * sizeof(float));
+            st->xBufP = _e.ops()->allocate(chunk * st->d_model * sizeof(float));
+            st->prefillExpIdx = _e.ops()->allocate(chunk * K * sizeof(std::int32_t));
+            st->prefillKw     = _e.ops()->allocate(chunk * K * sizeof(float));
             st->prefillTokH.resize(chunk);
             // 5.21-III MULTI-SLOT: sbMixed sized nRowMax (bounded token budget) with
             // perSeqConvInput so the conv input holds N per-slot state-tail|token
@@ -1088,22 +1088,22 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
             const std::size_t nRowMax = std::min<std::size_t>(maxContext, 4 * chunk);
             st->nRowMax = nRowMax;
             st->sbMixed = allocBlockBuffers(
-                *_e._ops, _e._config, /*maxT=*/nRowMax, /*maxSeq=*/maxContext,
+                *_e.ops(), _e.config(), /*maxT=*/nRowMax, /*maxSeq=*/maxContext,
                 qkv.first, qkv.second, /*withFusedQkv=*/false,
                 /*withKvFp32Scratch=*/true, /*withQGate=*/true,
                 /*withSsm=*/true, /*perSeqConvInput=*/true);
             st->sbMixed->ssmSlabNSeq = st->ssm->nSeq();
-            st->xBufMixed  = _e._ops->allocate(nRowMax * st->d_model * sizeof(float));
-            st->mixedExpIdx = _e._ops->allocate(nRowMax * K * sizeof(std::int32_t));
-            st->mixedKw     = _e._ops->allocate(nRowMax * K * sizeof(float));
+            st->xBufMixed  = _e.ops()->allocate(nRowMax * st->d_model * sizeof(float));
+            st->mixedExpIdx = _e.ops()->allocate(nRowMax * K * sizeof(std::int32_t));
+            st->mixedKw     = _e.ops()->allocate(nRowMax * K * sizeof(float));
             // 5.21-III varlen prefill driver scratch (per-token nRowMax; per-slot maxBatch).
-            st->vlRopePosDev      = _e._ops->allocate(nRowMax * sizeof(std::int32_t));
-            st->vlWriteBlockIdDev = _e._ops->allocate(nRowMax * sizeof(std::uint32_t));
-            st->vlWriteSlotDev    = _e._ops->allocate(nRowMax * sizeof(std::int32_t));
-            st->vlSeqTDev      = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
-            st->vlSeqOffDev    = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
-            st->vlConvInOffDev = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
-            st->vlStartPosDev  = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
+            st->vlRopePosDev      = _e.ops()->allocate(nRowMax * sizeof(std::int32_t));
+            st->vlWriteBlockIdDev = _e.ops()->allocate(nRowMax * sizeof(std::uint32_t));
+            st->vlWriteSlotDev    = _e.ops()->allocate(nRowMax * sizeof(std::int32_t));
+            st->vlSeqTDev      = _e.ops()->allocate(maxBatch * sizeof(std::int32_t));
+            st->vlSeqOffDev    = _e.ops()->allocate(maxBatch * sizeof(std::int32_t));
+            st->vlConvInOffDev = _e.ops()->allocate(maxBatch * sizeof(std::int32_t));
+            st->vlStartPosDev  = _e.ops()->allocate(maxBatch * sizeof(std::int32_t));
             st->vlRopePosH.resize(nRowMax);
             st->vlWriteBlockIdH.resize(nRowMax);
             st->vlWriteSlotH.resize(nRowMax);
@@ -1115,14 +1115,14 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
             st->prefillTokMixedH.resize(nRowMax);
             // 5.21-III hybrid attention scratch (decode rows of a mixed forward).
             const std::size_t qDimHyb =
-                _e._config.headCount * _e._config.headDim();
+                _e.config().headCount * _e.config().headDim();
             st->qDimHyb = qDimHyb;
-            st->hybRowMapDev      = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
-            st->hybSeqLensDev     = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
-            st->hybBlockTablesDev = _e._ops->allocate(maxBatch * st->blocksPerSeq * sizeof(std::int32_t));
-            st->hybSeqTPrefillDev = _e._ops->allocate(maxBatch * sizeof(std::int32_t));
-            st->hybQDecode        = _e._ops->allocate(maxBatch * qDimHyb * sizeof(float));
-            st->hybAttnDecode     = _e._ops->allocate(maxBatch * qDimHyb * sizeof(float));
+            st->hybRowMapDev      = _e.ops()->allocate(maxBatch * sizeof(std::int32_t));
+            st->hybSeqLensDev     = _e.ops()->allocate(maxBatch * sizeof(std::int32_t));
+            st->hybBlockTablesDev = _e.ops()->allocate(maxBatch * st->blocksPerSeq * sizeof(std::int32_t));
+            st->hybSeqTPrefillDev = _e.ops()->allocate(maxBatch * sizeof(std::int32_t));
+            st->hybQDecode        = _e.ops()->allocate(maxBatch * qDimHyb * sizeof(float));
+            st->hybAttnDecode     = _e.ops()->allocate(maxBatch * qDimHyb * sizeof(float));
             st->hybRowMapH.resize(maxBatch);
             st->hybSeqLensH.resize(maxBatch);
             st->hybSeqTPrefillH.resize(maxBatch);
@@ -1140,7 +1140,7 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     // Size the cuDNN SDPA prefill graphs to the full serving context so long
     // prefills stay on the fused flash path instead of the slow hand-kernel
     // fallback (the head_dim=256 prefill cliff). Tracks runtime.maxContextTokens.
-    _e._ops->setCudnnPrefillMaxSeqLen(maxContext);
+    _e.ops()->setCudnnPrefillMaxSeqLen(maxContext);
     MM_LOG_INFO("serving",
                 "ensureServingState: maxBatch={} maxContext={} blocksPerSeq={} "
                 "numBlocks={} vocab_lm={}",
@@ -1161,7 +1161,7 @@ void ServingSession::setSlotSampling(std::size_t slot,
     // Overlay the model's final-logit softcap exactly like the single-session
     // lmHeadSample path (softcap runs before penalties/temperature in the
     // sampler; _finalLogitSoftcap already respects MIMIRMIND_DISABLE_SOFTCAP).
-    _state->slotSampling[slot].finalLogitSoftcap = _e._finalLogitSoftcap;
+    _state->slotSampling[slot].finalLogitSoftcap = _e.finalLogitSoftcap();
     // seed==0 => Sampler::reseed(0) draws from std::random_device (documented
     // contract), so unseeded requests genuinely vary run-to-run.
     _state->slotSampler[slot].reseed(sp.seed);
@@ -1250,9 +1250,9 @@ void ServingSession::stepServing(
         st.startPosH[i]    = static_cast<std::int32_t>(pos);
         st.isSeqStart[i]   = s.seqStart ? 1U : 0U;
     }
-    _e._ops->uploadHostBytes(st.seqLensDev.get(),  st.seqLensH.data(),
+    _e.ops()->uploadHostBytes(st.seqLensDev.get(),  st.seqLensH.data(),
                              nSeq * sizeof(std::int32_t));
-    _e._ops->uploadHostBytes(st.startPosDev.get(), st.startPosH.data(),
+    _e.ops()->uploadHostBytes(st.startPosDev.get(), st.startPosH.data(),
                              nSeq * sizeof(std::int32_t));
 
     float* const xBuf   = st.xBufB.as<float>();
@@ -1292,7 +1292,7 @@ void ServingSession::stepServing(
         st.qb->runBlockBatched(b, xBuf, ctx, *st.sb);
     }
 
-    _e._ops->profileSection("lmhead");
+    _e.ops()->profileSection("lmhead");
     // 5.27.11.2: HC archs (qwen4_exp) collapse the streams (mixer replaces
     // output_norm) into xBuf and feed lm_head directly; others rms-norm as before.
     const float* lmIn = normBuf;
@@ -1300,13 +1300,13 @@ void ServingSession::stepServing(
         st.qb->collapseHyperStreams(nSeq, *st.sb, xBuf);
         lmIn = xBuf;
     } else {
-        _e._ops->rmsNormAsync(xBuf, nSeq, st.d_model,
+        _e.ops()->rmsNormAsync(xBuf, nSeq, st.d_model,
                               static_cast<const float*>(st.outNorm->usmPtr),
-                              _e._config.rmsNormEps, normBuf);
+                              _e.config().rmsNormEps, normBuf);
     }
-    _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, st.d_model,
+    _e.gmm()->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, st.d_model,
                     lmIn, nSeq, logits, st.lmScr.as<float>());
-    _e._ops->profileStepEnd();
+    _e.ops()->profileStepEnd();
 
     // 8.19.5: the GPU-argmax fast path is a plain argmax — take it only when
     // every slot in this step both is greedy AND has no active penalties
@@ -1333,10 +1333,10 @@ void ServingSession::stepServing(
         // vLLM avoids by sampling on the GPU. argmax_rows breaks ties to
         // the lowest index -> bit-identical token to the host scan below.
         // Mirrors the generateBatch lmHeadSample() path.
-        _e._ops->argmaxRowsAsync(logits, st.argmaxDev.as<std::int32_t>(),
+        _e.ops()->argmaxRowsAsync(logits, st.argmaxDev.as<std::int32_t>(),
                                  nSeq, st.vocab_lm);
-        _e._ops->flush();
-        _e._ops->readbackToHost(st.argmaxHost.data(), st.argmaxDev.get(),
+        _e.ops()->flush();
+        _e.ops()->readbackToHost(st.argmaxHost.data(), st.argmaxDev.get(),
                                 nSeq * sizeof(std::int32_t));
         for (std::size_t i = 0; i < nSeq; ++i) {
             outTokens[i] = st.argmaxHost[i];
@@ -1344,8 +1344,8 @@ void ServingSession::stepServing(
         return;
     }
 
-    _e._ops->flush();
-    _e._ops->readbackToHost(st.hostLogits.data(), logits,
+    _e.ops()->flush();
+    _e.ops()->readbackToHost(st.hostLogits.data(), logits,
                             nSeq * st.vocab_lm * sizeof(float));
     std::vector<float> rawRow;   // 8.19.14 raw-logits snapshot (opt-in slots)
     for (std::size_t i = 0; i < nSeq; ++i) {
@@ -1405,7 +1405,7 @@ void ServingSession::runVarlenPrefill(
     const std::size_t d_model      = st.d_model;
     const std::size_t blocksPerSeq = st.blocksPerSeq;
     const std::size_t blockSize    = st.blockSize;
-    const std::size_t dConv        = _e._config.ssmConvKernel;
+    const std::size_t dConv        = _e.config().ssmConvKernel;
     const std::size_t stateRows    = (dConv > 0 ? dConv - 1 : 0);
 
     // Build per-slot (nSeq=N) + per-token control arrays. Slots are laid out in
@@ -1447,16 +1447,16 @@ void ServingSession::runVarlenPrefill(
         throw std::runtime_error("runVarlenPrefill: token budget exceeds nRowMax");
     }
 
-    _e._ops->uploadHostBytes(st.vlRopePosDev.get(),      st.vlRopePosH.data(),      totalTok * sizeof(std::int32_t));
-    _e._ops->uploadHostBytes(st.vlWriteBlockIdDev.get(), st.vlWriteBlockIdH.data(), totalTok * sizeof(std::uint32_t));
-    _e._ops->uploadHostBytes(st.vlWriteSlotDev.get(),    st.vlWriteSlotH.data(),    totalTok * sizeof(std::int32_t));
-    _e._ops->uploadHostBytes(st.vlSeqTDev.get(),      st.vlSeqTH.data(),      N * sizeof(std::int32_t));
-    _e._ops->uploadHostBytes(st.vlSeqOffDev.get(),    st.vlSeqOffH.data(),    N * sizeof(std::int32_t));
-    _e._ops->uploadHostBytes(st.vlConvInOffDev.get(), st.vlConvInOffH.data(), N * sizeof(std::int32_t));
-    _e._ops->uploadHostBytes(st.vlStartPosDev.get(),  st.vlStartPosH.data(),  N * sizeof(std::int32_t));
+    _e.ops()->uploadHostBytes(st.vlRopePosDev.get(),      st.vlRopePosH.data(),      totalTok * sizeof(std::int32_t));
+    _e.ops()->uploadHostBytes(st.vlWriteBlockIdDev.get(), st.vlWriteBlockIdH.data(), totalTok * sizeof(std::uint32_t));
+    _e.ops()->uploadHostBytes(st.vlWriteSlotDev.get(),    st.vlWriteSlotH.data(),    totalTok * sizeof(std::int32_t));
+    _e.ops()->uploadHostBytes(st.vlSeqTDev.get(),      st.vlSeqTH.data(),      N * sizeof(std::int32_t));
+    _e.ops()->uploadHostBytes(st.vlSeqOffDev.get(),    st.vlSeqOffH.data(),    N * sizeof(std::int32_t));
+    _e.ops()->uploadHostBytes(st.vlConvInOffDev.get(), st.vlConvInOffH.data(), N * sizeof(std::int32_t));
+    _e.ops()->uploadHostBytes(st.vlStartPosDev.get(),  st.vlStartPosH.data(),  N * sizeof(std::int32_t));
 
-    const std::size_t stateElems     = _e._config.ssmStateElemsPerLayer();
-    const std::size_t convStateElems = _e._config.ssmConvStateElemsPerLayer();
+    const std::size_t stateElems     = _e.config().ssmStateElemsPerLayer();
+    const std::size_t convStateElems = _e.config().ssmConvStateElemsPerLayer();
     BlockBuffers& sb = *st.sbMixed;
     sb.ssmStatePtr     = st.ssm->statePtr()     + firstSlot * stateElems;
     sb.ssmConvStatePtr = st.ssm->convStatePtr() + firstSlot * convStateElems;
@@ -1525,10 +1525,10 @@ void ServingSession::runVarlenPrefill(
                 st.hybSeqTPrefillH[s] = st.vlSeqTH[s];
             }
         }
-        _e._ops->uploadHostBytes(st.hybRowMapDev.get(),      st.hybRowMapH.data(),      decCount * sizeof(std::int32_t));
-        _e._ops->uploadHostBytes(st.hybSeqLensDev.get(),     st.hybSeqLensH.data(),     decCount * sizeof(std::int32_t));
-        _e._ops->uploadHostBytes(st.hybBlockTablesDev.get(), st.hybBlockTablesH.data(), decCount * bps * sizeof(std::int32_t));
-        _e._ops->uploadHostBytes(st.hybSeqTPrefillDev.get(), st.hybSeqTPrefillH.data(), N * sizeof(std::int32_t));
+        _e.ops()->uploadHostBytes(st.hybRowMapDev.get(),      st.hybRowMapH.data(),      decCount * sizeof(std::int32_t));
+        _e.ops()->uploadHostBytes(st.hybSeqLensDev.get(),     st.hybSeqLensH.data(),     decCount * sizeof(std::int32_t));
+        _e.ops()->uploadHostBytes(st.hybBlockTablesDev.get(), st.hybBlockTablesH.data(), decCount * bps * sizeof(std::int32_t));
+        _e.ops()->uploadHostBytes(st.hybSeqTPrefillDev.get(), st.hybSeqTPrefillH.data(), N * sizeof(std::int32_t));
         ctx.hybDecodeCount          = decCount;
         ctx.hybDecodeRowMapDev      = static_cast<const std::int32_t*>(st.hybRowMapDev.get());
         ctx.hybDecodeSeqLensDev     = static_cast<const std::int32_t*>(st.hybSeqLensDev.get());
@@ -1545,7 +1545,7 @@ void ServingSession::runVarlenPrefill(
         st.qb->runBlockBatched(b, xBuf, ctx, sb);
     }
     st.qb->setPrefillMoeScratch(nullptr, nullptr);
-    _e._ops->profileStepEnd();
+    _e.ops()->profileStepEnd();
 
     if (produceToken) {
         // Gather each slot's last-token hidden state, rms-norm into a compact
@@ -1556,14 +1556,14 @@ void ServingSession::runVarlenPrefill(
             const std::size_t lastRow =
                 static_cast<std::size_t>(st.vlSeqOffH[s]) +
                 static_cast<std::size_t>(st.vlSeqTH[s]) - 1;
-            _e._ops->rmsNormAsync(xBuf + lastRow * d_model, 1, d_model,
+            _e.ops()->rmsNormAsync(xBuf + lastRow * d_model, 1, d_model,
                                   static_cast<const float*>(st.outNorm->usmPtr),
-                                  _e._config.rmsNormEps, normBuf + s * d_model);
+                                  _e.config().rmsNormEps, normBuf + s * d_model);
         }
-        _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, d_model,
+        _e.gmm()->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, d_model,
                         normBuf, N, logits, st.lmScr.as<float>());
-        _e._ops->flush();
-        _e._ops->readbackToHost(st.hostLogits.data(), logits,
+        _e.ops()->flush();
+        _e.ops()->readbackToHost(st.hostLogits.data(), logits,
                                 N * st.vocab_lm * sizeof(float));
         std::vector<float> rawRow;   // 8.19.14 raw-logits snapshot (opt-in)
         for (std::size_t s = 0; s < N; ++s) {
@@ -1591,7 +1591,7 @@ void ServingSession::runVarlenPrefill(
             }
         }
     } else {
-        _e._ops->flush();
+        _e.ops()->flush();
         for (std::size_t s = 0; s < N; ++s) outFirstTok[s] = -1;
     }
     sb.ssmStatePtr     = st.ssm->statePtr();
@@ -1659,8 +1659,8 @@ std::int32_t ServingSession::prefillSlot(
     }
 
     const std::size_t d_model  = st.d_model;
-    const std::size_t nKvHeads = _e._config.headCountKv;
-    const std::size_t headDim  = _e._config.headDim();
+    const std::size_t nKvHeads = _e.config().headCountKv;
+    const std::size_t headDim  = _e.config().headDim();
     const std::size_t kvDim    = nKvHeads * headDim;
     const std::size_t slotCap  = st.blocksPerSeq * st.blockSize;   // tokens
     const std::size_t slotElemBase = slot * slotCap * kvDim;       // elements
@@ -1694,8 +1694,8 @@ std::int32_t ServingSession::prefillSlot(
     // lands on exactly this slot's per-layer state — the same memory
     // stepServing evolves during decode. Kernels bake the pointer at enqueue,
     // so restoring the base afterwards is safe without a sync.
-    const std::size_t stateElems     = _e._config.ssmStateElemsPerLayer();
-    const std::size_t convStateElems = _e._config.ssmConvStateElemsPerLayer();
+    const std::size_t stateElems     = _e.config().ssmStateElemsPerLayer();
+    const std::size_t convStateElems = _e.config().ssmConvStateElemsPerLayer();
     BlockBuffers& sb = *st.sbPrefill;
     sb.ssmStatePtr     = st.ssm->statePtr()     + slot * stateElems;
     sb.ssmConvStatePtr = st.ssm->convStatePtr() + slot * convStateElems;
@@ -1731,7 +1731,7 @@ std::int32_t ServingSession::prefillSlot(
     // FP4-TC-peak bench: one profiler "step" per prefill chunk (DECODE_PROFILE
     // only). moe.tc + attn + ... sections print (see MIMIRMIND_PROFILE_EVERY) so
     // the wide-M FP4-TC MoE GEMM ms is visible for the TFLOP/s / %-peak calc.
-    _e._ops->profileStepEnd();
+    _e.ops()->profileStepEnd();
 
     std::int32_t firstTok = -1;
     if (produceToken) {
@@ -1747,14 +1747,14 @@ std::int32_t ServingSession::prefillSlot(
             st.qb->collapseHyperStreams(T, sb, xBuf);
             lmIn = xBuf + (T - 1) * d_model;
         } else {
-            _e._ops->rmsNormAsync(xBuf + (T - 1) * d_model, 1, d_model,
+            _e.ops()->rmsNormAsync(xBuf + (T - 1) * d_model, 1, d_model,
                                   static_cast<const float*>(st.outNorm->usmPtr),
-                                  _e._config.rmsNormEps, normBuf);
+                                  _e.config().rmsNormEps, normBuf);
         }
-        _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, d_model,
+        _e.gmm()->matmul(st.lmHead->type, st.lmHead->usmPtr, st.vocab_lm, d_model,
                         lmIn, 1, logits, st.lmScr.as<float>());
-        _e._ops->flush();
-        _e._ops->readbackToHost(st.hostLogits.data(), logits,
+        _e.ops()->flush();
+        _e.ops()->readbackToHost(st.hostLogits.data(), logits,
                                 st.vocab_lm * sizeof(float));
         // 8.19.5: first token honours the slot's sampling params (argmax fast
         // path when greedy with neutral penalties — bit-identical to the old
@@ -1784,7 +1784,7 @@ std::int32_t ServingSession::prefillSlot(
         // Intermediate chunk: no lm-head. Flush so this chunk's KV/state
         // writes are fully committed before the next (carry) chunk reads
         // them — matches the single-chunk path's implicit flush.
-        _e._ops->flush();
+        _e.ops()->flush();
     }
 
     // Restore the prefill SSM base to the slab origin so the next prefillSlot
@@ -1827,13 +1827,13 @@ void ServingSession::ensureVerifyCapacity(std::size_t depth) {
     const std::size_t Mcap    = st.maxBatch * (K + 1);
     const std::size_t d_model = st.d_model;
     const std::size_t vocab   = st.vocab_lm;
-    const std::size_t nExp    = _e._config.expertUsedCount;
+    const std::size_t nExp    = _e.config().expertUsedCount;
 
     st.verifyDepth = K;
     st.verifyMcap  = Mcap;
 
     const auto qkv = st.qb->maxQKVDims();
-    st.vsb = allocBlockBuffers(*_e._ops, _e._config, /*maxT=*/Mcap,
+    st.vsb = allocBlockBuffers(*_e.ops(), _e.config(), /*maxT=*/Mcap,
                                /*maxSeq=*/Mcap, qkv.first, qkv.second,
                                /*withFusedQkv=*/false, /*withKvFp32Scratch=*/true,
                                /*withQGate=*/true, /*withSsm=*/true,
@@ -1845,17 +1845,17 @@ void ServingSession::ensureVerifyCapacity(std::size_t depth) {
     st.vsb->ssmConvStatePtr = st.ssm->convStatePtr();
     st.vsb->ssmSlabNSeq     = st.ssm->nSeq();
 
-    st.vExpIdx = _e._ops->allocate(Mcap * nExp * sizeof(std::int32_t));
-    st.vKw     = _e._ops->allocate(Mcap * nExp * sizeof(float));
+    st.vExpIdx = _e.ops()->allocate(Mcap * nExp * sizeof(std::int32_t));
+    st.vKw     = _e.ops()->allocate(Mcap * nExp * sizeof(float));
     st.vBlockTablesDev =
-        _e._ops->allocate(Mcap * st.blocksPerSeq * sizeof(std::int32_t));
-    st.vSeqLensDev  = _e._ops->allocate(Mcap * sizeof(std::int32_t));
-    st.vStartPosDev = _e._ops->allocate(Mcap * sizeof(std::int32_t));
-    st.vXBuf    = _e._ops->allocate(Mcap * d_model * sizeof(float));
-    st.vNormB   = _e._ops->allocate(Mcap * d_model * sizeof(float));
-    st.vLogitsB = _e._ops->allocate(Mcap * vocab   * sizeof(float));
-    st.vArgmaxDev = _e._ops->allocate(Mcap * sizeof(std::int32_t));
-    st.vLmScr   = _e._ops->allocate(std::max(d_model, vocab) * sizeof(float));
+        _e.ops()->allocate(Mcap * st.blocksPerSeq * sizeof(std::int32_t));
+    st.vSeqLensDev  = _e.ops()->allocate(Mcap * sizeof(std::int32_t));
+    st.vStartPosDev = _e.ops()->allocate(Mcap * sizeof(std::int32_t));
+    st.vXBuf    = _e.ops()->allocate(Mcap * d_model * sizeof(float));
+    st.vNormB   = _e.ops()->allocate(Mcap * d_model * sizeof(float));
+    st.vLogitsB = _e.ops()->allocate(Mcap * vocab   * sizeof(float));
+    st.vArgmaxDev = _e.ops()->allocate(Mcap * sizeof(std::int32_t));
+    st.vLmScr   = _e.ops()->allocate(std::max(d_model, vocab) * sizeof(float));
 
     // MV-d: one compact recurrent-state export [blockCount, Kp1, maxBatch,
     // stateElems] (the fused verify kernel writes each layer's slab, packed
@@ -1864,13 +1864,13 @@ void ServingSession::ensureVerifyCapacity(std::size_t depth) {
     const std::size_t stateElems = st.ssm->stateElemsPerLayer();
     const std::size_t exportElems =
         st.ssm->blockCount() * (K + 1) * st.maxBatch * stateElems;
-    st.ssmExport = _e._ops->allocate(exportElems * sizeof(float));
+    st.ssmExport = _e.ops()->allocate(exportElems * sizeof(float));
 
     const std::size_t cvImgElems = st.ssm->blockCount() * st.ssm->convStateLayerStride();
     st.convSnap.clear();
     st.convSnap.reserve(K + 1);
     for (std::size_t j = 0; j <= K; ++j) {
-        st.convSnap.push_back(_e._ops->allocate(cvImgElems * sizeof(float)));
+        st.convSnap.push_back(_e.ops()->allocate(cvImgElems * sizeof(float)));
     }
 
     st.vBlockTablesH.assign(Mcap * st.blocksPerSeq, 0);
@@ -1967,11 +1967,11 @@ ServingSession::verifyForward(
         }
     }
 
-    _e._ops->uploadHostBytes(st.vBlockTablesDev.get(), st.vBlockTablesH.data(),
+    _e.ops()->uploadHostBytes(st.vBlockTablesDev.get(), st.vBlockTablesH.data(),
                              M * bps * sizeof(std::int32_t));
-    _e._ops->uploadHostBytes(st.vSeqLensDev.get(),  st.vSeqLensH.data(),
+    _e.ops()->uploadHostBytes(st.vSeqLensDev.get(),  st.vSeqLensH.data(),
                              M * sizeof(std::int32_t));
-    _e._ops->uploadHostBytes(st.vStartPosDev.get(), st.vStartPosH.data(),
+    _e.ops()->uploadHostBytes(st.vStartPosDev.get(), st.vStartPosH.data(),
                              M * sizeof(std::int32_t));
 
     float* const xBuf = st.vXBuf.as<float>();
@@ -2002,7 +2002,7 @@ ServingSession::verifyForward(
     }
 
     for (std::size_t b = 0; b < st.blockCount; ++b) {
-        if (_e._config.isRecurrentLayer(b)) {
+        if (_e.config().isRecurrentLayer(b)) {
             // MV-c/d: GatedDeltaNet verify — ONE batched layer over M=N*(K+1)
             // rows (proj/out-proj/MoE read each weight once vs K+1x), conv per
             // position, and ONE fused verify kernel for the recurrence that
@@ -2019,7 +2019,7 @@ ServingSession::verifyForward(
         if (st.dfTapActive) {
             const int k = st.dfTapSlot[b];
             if (k >= 0) {
-                _e._ops->appendMemoryCopy(
+                _e.ops()->appendMemoryCopy(
                     st.dfTapSink[static_cast<std::size_t>(k)].get(), xBuf,
                     M * d_model * sizeof(float));
             }
@@ -2029,16 +2029,16 @@ ServingSession::verifyForward(
     // --- per-position logits over all M rows -----------------------------
     float* const normBuf = st.vNormB.as<float>();
     float* const logits  = st.vLogitsB.as<float>();
-    _e._ops->rmsNormAsync(xBuf, M, d_model,
+    _e.ops()->rmsNormAsync(xBuf, M, d_model,
                           static_cast<const float*>(st.outNorm->usmPtr),
-                          _e._config.rmsNormEps, normBuf);
-    _e._gmm->matmul(st.lmHead->type, st.lmHead->usmPtr, vocab, d_model,
+                          _e.config().rmsNormEps, normBuf);
+    _e.gmm()->matmul(st.lmHead->type, st.lmHead->usmPtr, vocab, d_model,
                     normBuf, M, logits, st.vLmScr.as<float>());
     // MTP-verify breakdown: one profiler "step" per verify round (DECODE_PROFILE
     // only). Accumulated verify.proj/conv/gdn/tail + moe.gemm/attn/lmhead sections
     // print every 32 rounds -> shows whether the batched-verify cost is the GDN
     // recurrence (verify.gdn) or the MoE expert-union (moe.gemm at M=N*(K+1)).
-    _e._ops->profileStepEnd();
+    _e.ops()->profileStepEnd();
     return M;
 }
 
@@ -2054,8 +2054,8 @@ ServingSession::stepServingVerify(
     auto& st = *_state;
     const std::size_t vocab  = st.vocab_lm;
     float* const      logits = st.vLogitsB.as<float>();
-    _e._ops->flush();
-    _e._ops->readbackToHost(st.vHostLogits.data(), logits,
+    _e.ops()->flush();
+    _e.ops()->readbackToHost(st.vHostLogits.data(), logits,
                             M * vocab * sizeof(float));
 
     std::vector<std::vector<float>> out;
@@ -2081,10 +2081,10 @@ ServingSession::stepServingVerifyIds(
     float* const      logits = st.vLogitsB.as<float>();
     // Device argmax over each of the M rows, then read back only the M ids
     // instead of the full M*vocab logits (tens of MB → a few bytes).
-    _e._ops->argmaxRowsAsync(logits, st.vArgmaxDev.as<std::int32_t>(),
+    _e.ops()->argmaxRowsAsync(logits, st.vArgmaxDev.as<std::int32_t>(),
                              static_cast<int>(M), static_cast<int>(vocab));
-    _e._ops->flush();
-    _e._ops->readbackToHost(st.vArgmaxHost.data(), st.vArgmaxDev.get(),
+    _e.ops()->flush();
+    _e.ops()->readbackToHost(st.vArgmaxHost.data(), st.vArgmaxDev.get(),
                             M * sizeof(std::int32_t));
     return {st.vArgmaxHost.begin(),
             st.vArgmaxHost.begin() + static_cast<std::ptrdiff_t>(M)};
@@ -2103,36 +2103,36 @@ void ServingSession::ensureMtpServingState() {
     }
     const std::size_t d        = st.d_model;
     const std::size_t vocab    = st.vocab_lm;
-    const std::size_t nKvHeads = _e._config.headCountKv;
-    const std::size_t headDim  = _e._config.headDim();
+    const std::size_t nKvHeads = _e.config().headCountKv;
+    const std::size_t headDim  = _e.config().headDim();
 
     st.mtpKv.clear();
     st.mtpKv.reserve(st.maxBatch);
     for (std::size_t s = 0; s < st.maxBatch; ++s) {
         st.mtpKv.push_back(std::make_unique<KvCache>(
-            *_e._ops, /*nLayers=*/1, st.maxContext, nKvHeads, headDim, _e._kvDtype));
+            *_e.ops(), /*nLayers=*/1, st.maxContext, nKvHeads, headDim, _e.kvDtype()));
     }
-    st.mtpEmb         = _e._ops->allocate(d * sizeof(float));
-    st.mtpCat         = _e._ops->allocate(2 * d * sizeof(float));
-    st.mtpEh          = _e._ops->allocate(d * sizeof(float));
-    st.mtpDraftLogits = _e._ops->allocate(vocab * sizeof(float));
-    st.mtpLmScr       = _e._ops->allocate(std::max(d, vocab) * sizeof(float));
-    st.mtpHid         = _e._ops->allocate(st.maxBatch * d * sizeof(float));
+    st.mtpEmb         = _e.ops()->allocate(d * sizeof(float));
+    st.mtpCat         = _e.ops()->allocate(2 * d * sizeof(float));
+    st.mtpEh          = _e.ops()->allocate(d * sizeof(float));
+    st.mtpDraftLogits = _e.ops()->allocate(vocab * sizeof(float));
+    st.mtpLmScr       = _e.ops()->allocate(std::max(d, vocab) * sizeof(float));
+    st.mtpHid         = _e.ops()->allocate(st.maxBatch * d * sizeof(float));
     st.mtpHostLogits.assign(vocab, 0.0F);
 
     // Increment E5b — batched nextn draft scratch (nSeq rows at a time).
     const std::size_t B = st.maxBatch;
     st.nextnLen.assign(B, 0);
-    st.mtpEmbB         = _e._ops->allocate(B * d * sizeof(float));
-    st.mtpCatB         = _e._ops->allocate(B * 2 * d * sizeof(float));
-    st.mtpEhB          = _e._ops->allocate(B * d * sizeof(float));
-    st.mtpTmpE         = _e._ops->allocate(B * d * sizeof(float));
-    st.mtpTmpH         = _e._ops->allocate(B * d * sizeof(float));
-    st.mtpSeedHid      = _e._ops->allocate(B * d * sizeof(float));
-    st.mtpDraftLogitsB = _e._ops->allocate(B * vocab * sizeof(float));
-    st.mtpLmScrB       = _e._ops->allocate(std::max(d, vocab) * sizeof(float));
-    st.mtpSeqLensDev   = _e._ops->allocate(B * sizeof(std::int32_t));
-    st.mtpStartPosDev  = _e._ops->allocate(B * sizeof(std::int32_t));
+    st.mtpEmbB         = _e.ops()->allocate(B * d * sizeof(float));
+    st.mtpCatB         = _e.ops()->allocate(B * 2 * d * sizeof(float));
+    st.mtpEhB          = _e.ops()->allocate(B * d * sizeof(float));
+    st.mtpTmpE         = _e.ops()->allocate(B * d * sizeof(float));
+    st.mtpTmpH         = _e.ops()->allocate(B * d * sizeof(float));
+    st.mtpSeedHid      = _e.ops()->allocate(B * d * sizeof(float));
+    st.mtpDraftLogitsB = _e.ops()->allocate(B * vocab * sizeof(float));
+    st.mtpLmScrB       = _e.ops()->allocate(std::max(d, vocab) * sizeof(float));
+    st.mtpSeqLensDev   = _e.ops()->allocate(B * sizeof(std::int32_t));
+    st.mtpStartPosDev  = _e.ops()->allocate(B * sizeof(std::int32_t));
     st.mtpSeqLensH.assign(B, 0);
     st.mtpStartPosH.assign(B, 0);
     st.mtpWriteBlockId.assign(B, 0);
@@ -2164,8 +2164,8 @@ void ServingSession::draftKInto(KvCache& kv, const float* hidden0,
         // one nextn draft step: writes logits into dlog, next hidden into eh.
         st.qb->runMtpDraftStep(hcur, prev, kv, *st.sb, emb, cat, eh, dlog, lmSc);
         kv.commit(1);
-        _e._ops->flush();
-        _e._ops->readbackToHost(st.mtpHostLogits.data(), dlog, vocab * sizeof(float));
+        _e.ops()->flush();
+        _e.ops()->readbackToHost(st.mtpHostLogits.data(), dlog, vocab * sizeof(float));
         std::size_t best = 0;
         float       bv   = st.mtpHostLogits[0];
         for (std::size_t v = 1; v < vocab; ++v) {
@@ -2188,7 +2188,7 @@ void ServingSession::mtpSeedBatched(std::size_t nSeq, const float* promptHiddens
     for (std::size_t s = 0; s < nSeq; ++s) st.nextnLen[s] = 0;
     for (std::size_t g = 0; g + 1 < P; ++g) {
         for (std::size_t s = 0; s < nSeq; ++s) {
-            _e._ops->appendMemoryCopy(seedHid + s * d, promptHiddens + g * d,
+            _e.ops()->appendMemoryCopy(seedHid + s * d, promptHiddens + g * d,
                                       d * sizeof(float));
             st.mtpPrevTok[s]      = prompt[g + 1];
             st.mtpWriteBlockId[s] = static_cast<std::uint32_t>(s * bps + g / bsz);
@@ -2196,9 +2196,9 @@ void ServingSession::mtpSeedBatched(std::size_t nSeq, const float* promptHiddens
             st.mtpSeqLensH[s]     = static_cast<std::int32_t>(g + 1);
             st.mtpStartPosH[s]    = static_cast<std::int32_t>(g);
         }
-        _e._ops->uploadHostBytes(st.mtpSeqLensDev.get(),  st.mtpSeqLensH.data(),
+        _e.ops()->uploadHostBytes(st.mtpSeqLensDev.get(),  st.mtpSeqLensH.data(),
                                  nSeq * sizeof(std::int32_t));
-        _e._ops->uploadHostBytes(st.mtpStartPosDev.get(), st.mtpStartPosH.data(),
+        _e.ops()->uploadHostBytes(st.mtpStartPosDev.get(), st.mtpStartPosH.data(),
                                  nSeq * sizeof(std::int32_t));
         arch::BatchedDecodeCtx ctx{};
         ctx.nSeq            = nSeq;
@@ -2245,9 +2245,9 @@ void ServingSession::draftBatchRound(
             st.mtpSeqLensH[s]     = static_cast<std::int32_t>(pos + 1);
             st.mtpStartPosH[s]    = static_cast<std::int32_t>(pos);
         }
-        _e._ops->uploadHostBytes(st.mtpSeqLensDev.get(),  st.mtpSeqLensH.data(),
+        _e.ops()->uploadHostBytes(st.mtpSeqLensDev.get(),  st.mtpSeqLensH.data(),
                                  nSeq * sizeof(std::int32_t));
-        _e._ops->uploadHostBytes(st.mtpStartPosDev.get(), st.mtpStartPosH.data(),
+        _e.ops()->uploadHostBytes(st.mtpStartPosDev.get(), st.mtpStartPosH.data(),
                                  nSeq * sizeof(std::int32_t));
         arch::BatchedDecodeCtx ctx{};
         ctx.nSeq            = nSeq;
@@ -2269,10 +2269,10 @@ void ServingSession::draftBatchRound(
         // Device argmax over vocab -> read back only nSeq token ids (was the
         // full nSeq*vocab logits, ~19 MB/step). Lowest-index tie-break matches
         // the previous host scan, so the drafted ids are identical.
-        _e._ops->argmaxRowsAsync(st.mtpDraftLogitsB.as<float>(),
+        _e.ops()->argmaxRowsAsync(st.mtpDraftLogitsB.as<float>(),
                                  st.vArgmaxDev.as<std::int32_t>(), nSeq, vocab);
-        _e._ops->flush();
-        _e._ops->readbackToHost(st.vArgmaxHost.data(), st.vArgmaxDev.get(),
+        _e.ops()->flush();
+        _e.ops()->readbackToHost(st.vArgmaxHost.data(), st.vArgmaxDev.get(),
                                 nSeq * sizeof(std::int32_t));
         for (std::size_t s = 0; s < nSeq; ++s) {
             const std::int32_t best = st.vArgmaxHost[s];
@@ -2288,10 +2288,10 @@ InferenceEngine::MtpDraftParityResult
 ServingSession::mtpDraftParity(std::span<const std::int32_t> prompt,
                                std::size_t nSeq, std::size_t depth) {
     InferenceEngine::MtpDraftParityResult res{};
-    if (_e._backend == nullptr) {
+    if (_e.backend() == nullptr) {
         throw std::runtime_error("mtpDraftParity: no model loaded");
     }
-    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e.backend());
     if (qb == nullptr || !_e.mtpAvailable()) {
         throw std::runtime_error(
             "mtpDraftParity: requires CUDA qwen35moe with a nextn head");
@@ -2302,7 +2302,7 @@ ServingSession::mtpDraftParity(std::span<const std::int32_t> prompt,
     if (nSeq == 0)  nSeq = 1;
     if (depth == 0) depth = 1;
     const std::size_t P = prompt.size();
-    const std::size_t d = _e._config.embeddingLength;
+    const std::size_t d = _e.config().embeddingLength;
 
     ensureServingState(nSeq, P + depth + 8);
     ensureMtpServingState();
@@ -2314,7 +2314,7 @@ ServingSession::mtpDraftParity(std::span<const std::int32_t> prompt,
     _e.resetCache();
     const std::vector<std::int32_t> pvec(prompt.begin(), prompt.end());
     const auto pf = _e.forwardVerify(pvec);
-    float* const xBuf = _e._xBufH.as<float>();
+    float* const xBuf = _e.hostXBuffer().as<float>();
     const float* const hidS = xBuf + (P - 1) * d;
     std::size_t t0 = 0;
     {
@@ -2343,8 +2343,8 @@ ServingSession::mtpDraftParity(std::span<const std::int32_t> prompt,
     };
 
     // --- reference: independent single-sequence nextn KV cache -----------
-    KvCache refKv(*_e._ops, /*nLayers=*/1, st.maxContext,
-                  _e._config.headCountKv, _e._config.headDim(), _e._kvDtype);
+    KvCache refKv(*_e.ops(), /*nLayers=*/1, st.maxContext,
+                  _e.config().headCountKv, _e.config().headDim(), _e.kvDtype());
     seed(refKv);
     draftKInto(refKv, hidS, token0, depth, res.refDrafts);
 
@@ -2375,13 +2375,13 @@ void ServingSession::restoreSlotSsm(std::size_t slot, std::size_t a,
     const std::size_t Kp1        = st.verifyDepth + 1;
     const std::size_t expLStride = Kp1 * st.maxBatch * stElems;    // export slab
     for (std::size_t L = 0; L < st.blockCount; ++L) {
-        if (!_e._config.isRecurrentLayer(L)) {
+        if (!_e.config().isRecurrentLayer(L)) {
             continue;   // full-attention layers keep no recurrent state
         }
-        _e._ops->appendMemoryCopy(stDst + L * stStride + slot * stElems,
+        _e.ops()->appendMemoryCopy(stDst + L * stStride + slot * stElems,
                                   exp + L * expLStride + (a * N + slot) * stElems,
                                   stElems * sizeof(float));
-        _e._ops->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
+        _e.ops()->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
                                   cvSrc + L * cvStride + slot * cvElems,
                                   cvElems * sizeof(float));
     }
@@ -2406,7 +2406,7 @@ void ServingSession::captureSlotSsmCkpt(std::size_t slot, std::size_t pos) {
     // ~83 MiB (all 40 layers) to ~63 MiB (~30 GatedDeltaNet layers) on qwen3.6.
     std::size_t nRec = 0;
     for (std::size_t L = 0; L < st.blockCount; ++L) {
-        if (_e._config.isRecurrentLayer(L)) ++nRec;
+        if (_e.config().isRecurrentLayer(L)) ++nRec;
     }
     // Reuse an evicted buffer when the ring is full (drop the smallest pos —
     // the deepest-prefix checkpoints nearest the end are the most reusable for
@@ -2419,8 +2419,8 @@ void ServingSession::captureSlotSsmCkpt(std::size_t slot, std::size_t pos) {
         ring.state.erase(ring.state.begin());
         ring.conv.erase(ring.conv.begin());
     } else {
-        sBuf = _e._ops->allocate(nRec * stElems * sizeof(float));
-        cBuf = _e._ops->allocate(nRec * cvElems * sizeof(float));
+        sBuf = _e.ops()->allocate(nRec * stElems * sizeof(float));
+        cBuf = _e.ops()->allocate(nRec * cvElems * sizeof(float));
     }
     float* const sDst = sBuf.as<float>();
     float* const cDst = cBuf.as<float>();
@@ -2431,13 +2431,13 @@ void ServingSession::captureSlotSsmCkpt(std::size_t slot, std::size_t pos) {
     // (full-attention layers carry no recurrent state), densely indexed by r.
     std::size_t r = 0;
     for (std::size_t L = 0; L < st.blockCount; ++L) {
-        if (!_e._config.isRecurrentLayer(L)) {
+        if (!_e.config().isRecurrentLayer(L)) {
             continue;
         }
-        _e._ops->appendMemoryCopy(sDst + r * stElems,
+        _e.ops()->appendMemoryCopy(sDst + r * stElems,
                                   sSrc + L * stStride + slot * stElems,
                                   stElems * sizeof(float));
-        _e._ops->appendMemoryCopy(cDst + r * cvElems,
+        _e.ops()->appendMemoryCopy(cDst + r * cvElems,
                                   cSrc + L * cvStride + slot * cvElems,
                                   cvElems * sizeof(float));
         ++r;
@@ -2488,12 +2488,12 @@ void ServingSession::restoreSlotSsmCkptAtPos(std::size_t slot, std::size_t pos) 
     // the live [blockCount, nSeq, elems] slab. Dense index r must match capture.
     std::size_t r = 0;
     for (std::size_t L = 0; L < st.blockCount; ++L) {
-        if (!_e._config.isRecurrentLayer(L)) {
+        if (!_e.config().isRecurrentLayer(L)) {
             continue;
         }
-        _e._ops->appendMemoryCopy(stDst + L * stStride + slot * stElems,
+        _e.ops()->appendMemoryCopy(stDst + L * stStride + slot * stElems,
                                   stSrc + r * stElems, stElems * sizeof(float));
-        _e._ops->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
+        _e.ops()->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
                                   cvSrc + r * cvElems, cvElems * sizeof(float));
         ++r;
     }
@@ -2560,12 +2560,12 @@ std::uint64_t ServingSession::snapshotSlotToPrefixImage(
     const std::size_t cvElems  = st.ssm->convStateElemsPerLayer();
     std::size_t nRec = 0;
     for (std::size_t L = 0; L < st.blockCount; ++L) {
-        if (_e._config.isRecurrentLayer(L)) ++nRec;
+        if (_e.config().isRecurrentLayer(L)) ++nRec;
     }
     ServingState::PrefixImage img;
     img.pos   = pos;
-    img.state = _e._ops->allocate(nRec * stElems * sizeof(float));
-    img.conv  = _e._ops->allocate(nRec * cvElems * sizeof(float));
+    img.state = _e.ops()->allocate(nRec * stElems * sizeof(float));
+    img.conv  = _e.ops()->allocate(nRec * cvElems * sizeof(float));
     float* const       sDst = img.state.as<float>();
     float* const       cDst = img.conv.as<float>();
     const float* const sSrc = st.ssm->statePtr();
@@ -2573,11 +2573,11 @@ std::uint64_t ServingSession::snapshotSlotToPrefixImage(
     {
         std::size_t r = 0;
         for (std::size_t L = 0; L < st.blockCount; ++L) {
-            if (!_e._config.isRecurrentLayer(L)) continue;
-            _e._ops->appendMemoryCopy(sDst + r * stElems,
+            if (!_e.config().isRecurrentLayer(L)) continue;
+            _e.ops()->appendMemoryCopy(sDst + r * stElems,
                                       sSrc + L * stStride + slot * stElems,
                                       stElems * sizeof(float));
-            _e._ops->appendMemoryCopy(cDst + r * cvElems,
+            _e.ops()->appendMemoryCopy(cDst + r * cvElems,
                                       cSrc + L * cvStride + slot * cvElems,
                                       cvElems * sizeof(float));
             ++r;
@@ -2594,16 +2594,16 @@ std::uint64_t ServingSession::snapshotSlotToPrefixImage(
     const std::size_t kvBlk     = st.pool->blockSize();
     const std::size_t startElem = slot * st.blocksPerSeq * kvBlk * slotElems;
     const std::size_t nElem     = pos * slotElems;
-    img.kv = _e._ops->allocate(nFullAttn * 2 * nElem * eb);
+    img.kv = _e.ops()->allocate(nFullAttn * 2 * nElem * eb);
     std::uint8_t* const kvDst = static_cast<std::uint8_t*>(img.kv.get());
     for (std::size_t L = 0; L < nFullAttn; ++L) {
         const std::uint8_t* kSrc =
             static_cast<const std::uint8_t*>(st.pool->keyPool(L)) + startElem * eb;
         const std::uint8_t* vSrc =
             static_cast<const std::uint8_t*>(st.pool->valuePool(L)) + startElem * eb;
-        _e._ops->appendMemoryCopy(kvDst + (L * 2 + 0) * nElem * eb, kSrc,
+        _e.ops()->appendMemoryCopy(kvDst + (L * 2 + 0) * nElem * eb, kSrc,
                                   nElem * eb);
-        _e._ops->appendMemoryCopy(kvDst + (L * 2 + 1) * nElem * eb, vSrc,
+        _e.ops()->appendMemoryCopy(kvDst + (L * 2 + 1) * nElem * eb, vSrc,
                                   nElem * eb);
     }
     // --- register in the keyed index (host). A duplicate prefix bounces our id
@@ -2675,10 +2675,10 @@ bool ServingSession::restorePrefixImageToSlot(std::size_t slot,
     const float* const cvSrc = img.conv.as<float>();
     std::size_t r = 0;
     for (std::size_t L = 0; L < st.blockCount; ++L) {
-        if (!_e._config.isRecurrentLayer(L)) continue;
-        _e._ops->appendMemoryCopy(stDst + L * stStride + slot * stElems,
+        if (!_e.config().isRecurrentLayer(L)) continue;
+        _e.ops()->appendMemoryCopy(stDst + L * stStride + slot * stElems,
                                   stSrc + r * stElems, stElems * sizeof(float));
-        _e._ops->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
+        _e.ops()->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
                                   cvSrc + r * cvElems, cvElems * sizeof(float));
         ++r;
     }
@@ -2698,9 +2698,9 @@ bool ServingSession::restorePrefixImageToSlot(std::size_t slot,
             static_cast<std::uint8_t*>(st.pool->keyPool(L)) + startElem * eb;
         std::uint8_t* vDst =
             static_cast<std::uint8_t*>(st.pool->valuePool(L)) + startElem * eb;
-        _e._ops->appendMemoryCopy(kDst, kvSrc + (L * 2 + 0) * nElem * eb,
+        _e.ops()->appendMemoryCopy(kDst, kvSrc + (L * 2 + 0) * nElem * eb,
                                   nElem * eb);
-        _e._ops->appendMemoryCopy(vDst, kvSrc + (L * 2 + 1) * nElem * eb,
+        _e.ops()->appendMemoryCopy(vDst, kvSrc + (L * 2 + 1) * nElem * eb,
                                   nElem * eb);
     }
     return true;
@@ -2732,7 +2732,7 @@ void ServingSession::drainPrefixImageFrees() {
     if (_state == nullptr || _state->pendingFree.empty()) {
         return;
     }
-    _e._ops->flush();
+    _e.ops()->flush();
     _state->pendingFree.clear();   // ComputeBuffer dtors free the device memory
 }
 
@@ -2740,10 +2740,10 @@ std::vector<std::vector<std::int32_t>>
 ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
                                  std::size_t nSeq, std::size_t maxNew,
                                  std::size_t depth, std::int32_t eosId) {
-    if (_e._backend == nullptr) {
+    if (_e.backend() == nullptr) {
         throw std::runtime_error("generateBatchMtp: no model loaded");
     }
-    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e.backend());
     if (qb == nullptr || !_e.mtpAvailable()) {
         throw std::runtime_error(
             "generateBatchMtp: requires CUDA qwen35moe with a nextn head");
@@ -2754,7 +2754,7 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
         return std::vector<std::vector<std::int32_t>>(nSeq);
     }
     const std::size_t P = prompt.size();
-    const std::size_t d = _e._config.embeddingLength;
+    const std::size_t d = _e.config().embeddingLength;
 
     ensureServingState(nSeq, P + maxNew + 8);
     ensureMtpServingState();
@@ -2776,7 +2776,7 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
     _e.resetCache();
     const std::vector<std::int32_t> pvec(prompt.begin(), prompt.end());
     const auto pf = _e.forwardVerify(pvec);
-    float* const xBufH = _e._xBufH.as<float>();
+    float* const xBufH = _e.hostXBuffer().as<float>();
     const std::int32_t token0v = argmax(pf.back());
 
     // Increment E5b: seed the BATCHED nextn KV (paged pool layer, all slots
@@ -2785,7 +2785,7 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
     float* const mtpHid = st.mtpHid.as<float>();
     mtpSeedBatched(nSeq, xBufH, prompt);
     for (std::size_t s = 0; s < nSeq; ++s) {
-        _e._ops->appendMemoryCopy(mtpHid + s * d, xBufH + (P - 1) * d,
+        _e.ops()->appendMemoryCopy(mtpHid + s * d, xBufH + (P - 1) * d,
                                   d * sizeof(float));
     }
 
@@ -2864,11 +2864,11 @@ ServingSession::generateBatchMtp(std::span<const std::int32_t> prompt,
             // state, so commit from the export for EVERY accept a (0..K).
             restoreSlotSsm(s, a, nSeq);
             st.nextnLen[s] = nextnPre[s] + a + 1;
-            _e._ops->appendMemoryCopy(mtpHid + s * d, vX + (a * nSeq + s) * d,
+            _e.ops()->appendMemoryCopy(mtpHid + s * d, vX + (a * nSeq + s) * d,
                                       d * sizeof(float));
             token0[s] = corrected;
         }
-        _e._ops->flush();
+        _e.ops()->flush();
     }
     return out;
 }
@@ -2880,10 +2880,10 @@ ServingSession::generateBatchDflash(std::span<const std::int32_t> prompt,
                                     std::string_view drafterDir,
                                     std::size_t* draftedOut,
                                     std::size_t* acceptedOut) {
-    if (_e._backend == nullptr) {
+    if (_e.backend() == nullptr) {
         throw std::runtime_error("generateBatchDflash: no model loaded");
     }
-    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e.backend());
     if (qb == nullptr) {
         throw std::runtime_error("generateBatchDflash: requires CUDA qwen35moe");
     }
@@ -2893,14 +2893,11 @@ ServingSession::generateBatchDflash(std::span<const std::int32_t> prompt,
         return std::vector<std::vector<std::int32_t>>(nSeq);
     }
     const std::size_t P = prompt.size();
-    const std::size_t d = _e._config.embeddingLength;
+    const std::size_t d = _e.config().embeddingLength;
     const std::size_t K = depth;
 
     // --- drafter (borrowed via the engine's lazy DFlashDecoder) ----------
-    if (_e._dflashDecoder == nullptr) {
-        _e._dflashDecoder = std::make_unique<DFlashDecoder>(_e);
-    }
-    DFlashDecoder& dfd = *_e._dflashDecoder;
+    DFlashDecoder& dfd = _e.ensureDflashDecoder();
     dfd.ensureDflashLoaded(drafterDir);
     const std::size_t taps = dfd.tapCount();
     const std::size_t rowC = dfd.ctxRowStride();      // taps * d
@@ -2920,7 +2917,7 @@ ServingSession::generateBatchDflash(std::span<const std::int32_t> prompt,
     st.dfTapSink.clear();
     for (std::size_t k = 0; k < taps; ++k) {
         st.dfTapSink.push_back(
-            _e._ops->allocate(st.verifyMcap * d * sizeof(float)));
+            _e.ops()->allocate(st.verifyMcap * d * sizeof(float)));
     }
     st.dfTapActive = true;
 
@@ -2936,11 +2933,11 @@ ServingSession::generateBatchDflash(std::span<const std::int32_t> prompt,
     ctxPtr.reserve(nSeq);
     for (std::size_t s = 0; s < nSeq; ++s) {
         ctxSlot.push_back(
-            _e._ops->allocate(st.maxContext * rowC * sizeof(float)));
+            _e.ops()->allocate(st.maxContext * rowC * sizeof(float)));
         ctxPtr.push_back(ctxSlot.back().as<float>());
-        _e._ops->appendMemoryCopy(ctxPtr[s], promptCtx, P * rowC * sizeof(float));
+        _e.ops()->appendMemoryCopy(ctxPtr[s], promptCtx, P * rowC * sizeof(float));
     }
-    _e._ops->flush();
+    _e.ops()->flush();
 
     // --- seed the paged trunk KV + SSM via a lockstep stepServing prefill.
     for (std::size_t g = 0; g < P; ++g) {
@@ -3016,7 +3013,7 @@ ServingSession::generateBatchDflash(std::span<const std::int32_t> prompt,
             // in dfTapSink, time-major row j*nSeq+s) into this slot's context.
             for (std::size_t j = 0; j <= a; ++j) {
                 for (std::size_t k = 0; k < taps; ++k) {
-                    _e._ops->appendMemoryCopy(
+                    _e.ops()->appendMemoryCopy(
                         ctxPtr[s] + (ctxLen[s] + j) * rowC + k * d,
                         st.dfTapSink[k].as<float>() + (j * nSeq + s) * d,
                         d * sizeof(float));
@@ -3026,7 +3023,7 @@ ServingSession::generateBatchDflash(std::span<const std::int32_t> prompt,
             ctxLen[s]  += a + 1;
             token0[s]   = corrected;
         }
-        _e._ops->flush();
+        _e.ops()->flush();
     }
 
     st.dfTapActive = false;
@@ -3039,10 +3036,10 @@ std::vector<std::vector<std::int32_t>>
 ServingSession::generateBatchMtpMulti(
         const std::vector<std::vector<std::int32_t>>& prompts,
         std::size_t maxNew, std::size_t depth, std::int32_t eosId) {
-    if (_e._backend == nullptr) {
+    if (_e.backend() == nullptr) {
         throw std::runtime_error("generateBatchMtpMulti: no model loaded");
     }
-    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e._backend.get());
+    auto* qb = dynamic_cast<arch::Qwen3_5MoeBackend*>(_e.backend());
     if (qb == nullptr || !_e.mtpAvailable()) {
         throw std::runtime_error(
             "generateBatchMtpMulti: requires CUDA qwen35moe with a nextn head");
@@ -3057,7 +3054,7 @@ ServingSession::generateBatchMtpMulti(
             throw std::runtime_error("generateBatchMtpMulti: empty prompt");
         }
     }
-    const std::size_t d = _e._config.embeddingLength;
+    const std::size_t d = _e.config().embeddingLength;
 
     // Physical slot p handles prompt order[p], sorted by DESCENDING length so
     // the token-by-token prefill always steps a contiguous slot prefix
@@ -3101,7 +3098,7 @@ ServingSession::generateBatchMtpMulti(
         basePos[p] = P;
         _e.resetCache();
         const auto pf = _e.forwardVerify(pr);
-        float* const xBufH = _e._xBufH.as<float>();
+        float* const xBufH = _e.hostXBuffer().as<float>();
         token0[p] = argmax(pf.back());
         st.mtpKv[p]->reset();
         {
@@ -3116,9 +3113,9 @@ ServingSession::generateBatchMtpMulti(
                 st.mtpKv[p]->commit(1);
             }
         }
-        _e._ops->appendMemoryCopy(mtpHid + p * d, xBufH + (P - 1) * d,
+        _e.ops()->appendMemoryCopy(mtpHid + p * d, xBufH + (P - 1) * d,
                                   d * sizeof(float));
-        _e._ops->flush();   // land the hidden copy before the next slot's forward
+        _e.ops()->flush();   // land the hidden copy before the next slot's forward
     }
 
     // --- seed the paged trunk KV + SSM via a sorted-descending lockstep
@@ -3192,11 +3189,11 @@ ServingSession::generateBatchMtpMulti(
             // Fused verify kernel leaves live state at S_0 → commit every a.
             restoreSlotSsm(p, a, N);
             st.mtpKv[p]->truncate(mtpPre[p] + a + 1);
-            _e._ops->appendMemoryCopy(mtpHid + p * d, vX + (a * N + p) * d,
+            _e.ops()->appendMemoryCopy(mtpHid + p * d, vX + (a * N + p) * d,
                                       d * sizeof(float));
             token0[p] = corrected;
         }
-        _e._ops->flush();
+        _e.ops()->flush();
     }
 
     // --- restore input order ---------------------------------------------
