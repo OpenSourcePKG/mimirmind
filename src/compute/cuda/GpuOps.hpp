@@ -5,6 +5,7 @@
 
 #include "compute/ComputeOps.hpp"
 #include "compute/IHyperConnectionOps.hpp"
+#include "compute/IMoeGroupedOps.hpp"
 #include "compute/cuda/MoeTopKRouteDevice.hpp"
 #include "core/config/Config.hpp"
 #include "runtime/KvCache.hpp"
@@ -57,7 +58,8 @@ class CudnnSdpaPrefill;
  * Not thread-safe. Construct once at startup, share across the engine.
  */
 class GpuOps : public ::mimirmind::compute::ComputeOps,
-               public ::mimirmind::compute::IHyperConnectionOps {
+               public ::mimirmind::compute::IHyperConnectionOps,
+               public ::mimirmind::compute::IMoeGroupedOps {
 public:
     /// Same 4-arg shape as `GpuOps` — the config knobs propagate 1:1
     /// so a config.json that steered the L0 backend keeps steering
@@ -354,7 +356,12 @@ public:
                                        std::size_t nExperts,
                                        std::size_t maxTiles,
                                        bool decodeSmallM = false) override;
-    // E-d.4b FP4-tensor-core grouped MoE.
+    // E-d.4b FP4-tensor-core grouped MoE. The CUDA backend implements the
+    // segregated IMoeGroupedOps interface (8.30.6); the accessor hands it back
+    // so callers reach these without base-class throw-default stubs. Availability
+    // + scratch-size queries stay on ComputeOps.
+    [[nodiscard]] ::mimirmind::compute::IMoeGroupedOps*
+        moeGroupedOps() noexcept override { return this; }
     [[nodiscard]] bool moeGroupedGemmNvfp4TcAvailable() const noexcept override;
     void moeZeroBytesAsync(void* dst, std::size_t bytes) override;
     void moePadOffsetsAsync(const std::int32_t* expOffset,

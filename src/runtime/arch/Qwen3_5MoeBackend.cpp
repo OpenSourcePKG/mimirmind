@@ -5,6 +5,7 @@
 
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
+#include "compute/IMoeGroupedOps.hpp"
 #include "core/gpu/AllocCategory.hpp"
 #include "core/modelopt/BlockScaleSwizzle.hpp" // E-d.4b swizzledBlockScaleBytes
 
@@ -168,6 +169,16 @@ Qwen3_5MoeBackend::Qwen3_5MoeBackend(const model::LlmConfig&       config,
 // Polymorphic FFN seam (5.20): routed top-K experts + gated shared expert. When
 // the prefill routing hook is set (setPrefillMoeScratch) and T>1, route through
 // the amortised batched / grouped fused-K path; otherwise the per-token path.
+compute::IMoeGroupedOps& Qwen3_5MoeBackend::mgOps() const {
+    if (auto* mg = _ops.moeGroupedOps()) {
+        return *mg;
+    }
+    throw std::runtime_error(
+        "Qwen3_5MoeBackend: the loaded compute backend provides no FP4-TC "
+        "grouped-MoE ops (CUDA/Bragi only); guard these paths with "
+        "moeGroupedGemmNvfp4TcAvailable()");
+}
+
 void Qwen3_5MoeBackend::runFfn(std::size_t   blockIdx,
                                const float*  moeInput,
                                std::size_t   T,
@@ -365,10 +376,10 @@ void Qwen3_5MoeBackend::sharedExpertTcGemm(std::size_t N, std::size_t K,
     // Quantise the M real rows into the swizzled aBank/sfaBank. The pad tail
     // [M,padM) keeps its zeroed SFA (scale 0 -> act 0), so those GEMM rows are 0
     // and discarded; gscale=1 since the weight global folds in via globalsBank.
-    _ops.moeZeroBytesAsync(sfaBank, mo::swizzledBlockScaleBytes(padM, K / 16));
-    _ops.moeActQuantNvfp4Async(X, aBank, sfaBank, 1.0F, M, K);
+    mgOps().moeZeroBytesAsync(sfaBank, mo::swizzledBlockScaleBytes(padM, K / 16));
+    mgOps().moeActQuantNvfp4Async(X, aBank, sfaBank, 1.0F, M, K);
 
-    _ops.moeGroupedGemmNvfp4TcBanksAsync(
+    mgOps().moeGroupedGemmNvfp4TcBanksAsync(
         1, N, K, expOffset, padOffset, aBank, sfaBank, wNib, wSfb, wGlob,
         outPad, s.shexpTcBanksScratch.get(), s.shexpTcBanksScratch.bytes());
 
@@ -1188,9 +1199,9 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
 
         _ops.profileSection("moe.prep");   // row maps + act-quant (prefill sub-split)
         // padded row maps (device only)
-        _ops.moePadOffsetsAsync(expOffset, padOffset, nExperts);
-        _ops.moeContigToPadAsync(expOffset, padOffset, contigToPad, nExperts, R);
-        _ops.moeIndexGatherI32Async(asnToRow, contigToPad, padAsn, nAsn);
+        mgOps().moePadOffsetsAsync(expOffset, padOffset, nExperts);
+        mgOps().moeContigToPadAsync(expOffset, padOffset, contigToPad, nExperts, R);
+        mgOps().moeIndexGatherI32Async(asnToRow, contigToPad, padAsn, nAsn);
 
         // 5.21.10: FUSED gather+quant — read the COMPACT gathered rows and
         // write nibbles/SF straight at the padded slots. Replaces the
@@ -1199,12 +1210,12 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         // intermediate tensor is gone entirely. Bit-identical (same values,
         // same quant math, same output layout). Padding rows keep the zeroed
         // SF (scale 0 -> act 0); their GEMM output is discarded.
-        _ops.moeZeroBytesAsync(sfaBank, mo::swizzledBlockScaleBytes(maxPad, d_model / 16));
+        mgOps().moeZeroBytesAsync(sfaBank, mo::swizzledBlockScaleBytes(maxPad, d_model / 16));
         // 5.18.21 FUSED gather+act-quant: read the ungathered moeInput directly at
         // each logical row's source token (rowSrcTok) — skips the standalone
         // rt.gather + the xComp [R, d_model] intermediate. Bit-identical (xComp[r]
         // was exactly moeInput[rowSrcTok[r]]).
-        _ops.moeActQuantNvfp4GatherRowsAsync(moeInput, aBank, sfaBank, 1.0F,
+        mgOps().moeActQuantNvfp4GatherRowsAsync(moeInput, aBank, sfaBank, 1.0F,
                                              contigToPad, R, d_model, rowSrcTok);
 
         // gate + up: N=n_ff_exp, K=d_model. alpha[e] = weight global (folds the
@@ -1214,7 +1225,7 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         // can_implement/initialize/run instead of two, and A/SFA read once.
         // Bit-identical to the two separate banks calls: gate -> gatePad, up ->
         // upPad, each group keeps its own per-expert alpha (weight global).
-        _ops.moeGroupedGemmNvfp4TcBanksGateUpAsync(
+        mgOps().moeGroupedGemmNvfp4TcBanksGateUpAsync(
             nExperts, n_ff_exp, d_model, expOffset, padOffset, aBank, sfaBank,
             gateExps.tcNibblePtr, gateExps.tcSfbPtr,
             static_cast<const float*>(gateExps.tcGlobalsPtr), gatePad,
@@ -1226,21 +1237,21 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         // Row-mapped act-quant of silu(gate)*up -> down GEMM (N=d_model, K=n_ff_exp).
         // The gate/up GEMM wrote outputs at the padded slots (contigToPad), so the
         // real rows live there. sfaBank2 padding must stay zeroed (both paths).
-        _ops.moeZeroBytesAsync(sfaBank2, mo::swizzledBlockScaleBytes(maxPad, n_ff_exp / 16));
+        mgOps().moeZeroBytesAsync(sfaBank2, mo::swizzledBlockScaleBytes(maxPad, n_ff_exp / 16));
         if (_moeSiluFuse) {
             // 5.21.8: fused silu*up + quant in one pass over the R real rows —
             // skips the intermediate round-trip AND the padding-row silu of the
             // two-pass (siluMul runs over the whole maxPad, ~89% padding). Bit-
             // identical to the else-branch. ~9x on this sub-split (microbench).
-            _ops.moeSiluMulQuantNvfp4RowsAsync(gatePad, upPad, aBank2, sfaBank2, 1.0F,
+            mgOps().moeSiluMulQuantNvfp4RowsAsync(gatePad, upPad, aBank2, sfaBank2, 1.0F,
                                                contigToPad, R, n_ff_exp);
         } else {
             _ops.siluMulAsync(gatePad, upPad, maxPad * n_ff_exp);  // silu(gate)*up
-            _ops.moeActQuantNvfp4RowsAsync(gatePad, aBank2, sfaBank2, 1.0F, contigToPad, R, n_ff_exp);
+            mgOps().moeActQuantNvfp4RowsAsync(gatePad, aBank2, sfaBank2, 1.0F, contigToPad, R, n_ff_exp);
         }
 
         _ops.profileSection("moe.dgemm");   // down TC GEMM (prefill sub-split)
-        _ops.moeGroupedGemmNvfp4TcBanksAsync(
+        mgOps().moeGroupedGemmNvfp4TcBanksAsync(
             nExperts, d_model, n_ff_exp, expOffset, padOffset, aBank2, sfaBank2,
             downExps.tcNibblePtr, downExps.tcSfbPtr,
             static_cast<const float*>(downExps.tcGlobalsPtr), downPad,
@@ -1668,7 +1679,7 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
                 D, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
                 ctx.maxBlocksPerSeq, ctx.hybMaxDecodeSeqLen, attnScale,
                 /*softcap=*/0.0f, kvDtype);
-            _ops.moeRowsScatterF32Async(ctx.hybAttnDecodeScratch,
+            mgOps().moeRowsScatterF32Async(ctx.hybAttnDecodeScratch,
                                         ctx.hybDecodeRowMapDev, attnOut, D, q_dim);
         }
         // prefill/varlen rows attend CAUSALLY over their chunk + prior KV (query

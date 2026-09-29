@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "compute/IMoeGroupedOps.hpp"
 #include "runtime/arch/Qwen3_5Backend.hpp"
 
 namespace mimirmind::runtime::arch {
@@ -106,6 +107,13 @@ public:
                                 bool                    skipHead);
 
 protected:
+    // The backend's FP4-tensor-core grouped-MoE ops (8.30.6 ISP-split). Only
+    // reached inside moeGroupedGemmNvfp4TcAvailable()-gated paths (CUDA/Bragi);
+    // mgOps() hands the interface back and throws a clear error if the backend
+    // does not provide it — the same unsupported-backend failure the former
+    // base-class throw-defaults gave, at one named seam.
+    [[nodiscard]] compute::IMoeGroupedOps& mgOps() const;
+
     /// FFN seam: routed top-K experts + gated shared expert.
     void runFfn(std::size_t   blockIdx,
                 const float*  moeInput,

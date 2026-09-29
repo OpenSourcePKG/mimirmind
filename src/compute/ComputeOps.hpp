@@ -21,6 +21,7 @@ namespace mimirmind::compute {
 /// `ComputeOps` accessor that returns nullptr on backends without them — so the
 /// neutral base carries no throw-default stubs for them.
 class IHyperConnectionOps;
+class IMoeGroupedOps;
 
 /// 5.21 Increment II — shape/control bundle for the batched GatedDeltaNet
 /// recurrence. Groups the scalar dims + per-slot control that grow as the
@@ -816,90 +817,14 @@ public:
         return false;
     }
 
-    /// Async device memset to zero (pre-zero the swizzled SF banks' padding).
-    virtual void moeZeroBytesAsync(void* dst, std::size_t bytes) {
-        (void)dst; (void)bytes;
-        throw std::runtime_error("moeZeroBytesAsync: not supported on this backend");
-    }
-
-    /// padOffset = prefix of round_up(count_e, 128); padOffset[nExperts]=totalPad.
-    virtual void moePadOffsetsAsync(const std::int32_t* expOffset,
-                                    std::int32_t* padOffset, std::size_t nExperts) {
-        (void)expOffset; (void)padOffset; (void)nExperts;
-        throw std::runtime_error("moePadOffsetsAsync: not supported on this backend");
-    }
-
-    /// contigToPad[r] = padded row of contiguous gathered row r.
-    virtual void moeContigToPadAsync(const std::int32_t* expOffset,
-                                     const std::int32_t* padOffset,
-                                     std::int32_t* contigToPad,
-                                     std::size_t nExperts, std::size_t R) {
-        (void)expOffset; (void)padOffset; (void)contigToPad; (void)nExperts; (void)R;
-        throw std::runtime_error("moeContigToPadAsync: not supported on this backend");
-    }
-
-    /// dst[idxMap[r]] = src[r] over `dim`-wide rows (spread to padded slots).
-    virtual void moeRowsScatterF32Async(const float* src, const std::int32_t* idxMap,
-                                        float* dst, std::size_t nRows, std::size_t dim) {
-        (void)src; (void)idxMap; (void)dst; (void)nRows; (void)dim;
-        throw std::runtime_error("moeRowsScatterF32Async: not supported on this backend");
-    }
-
-    /// dst[i] = (src[i] < 0) ? -1 : idxMap[src[i]]  (remap an index array).
-    virtual void moeIndexGatherI32Async(const std::int32_t* src,
-                                        const std::int32_t* idxMap,
-                                        std::int32_t* dst, std::size_t n) {
-        (void)src; (void)idxMap; (void)dst; (void)n;
-        throw std::runtime_error("moeIndexGatherI32Async: not supported on this backend");
-    }
-
-    /// F32 [M,K] activations -> NVFP4 nibbles [M,K/2] + swizzled UE4M3 SFA. The
-    /// caller pre-zeroes `outNib`/`outSf` (padding). K % 16 == 0.
-    virtual void moeActQuantNvfp4Async(const float* in, unsigned char* outNib,
-                                       unsigned char* outSf, float gscale,
-                                       std::size_t M, std::size_t K) {
-        (void)in; (void)outNib; (void)outSf; (void)gscale; (void)M; (void)K;
-        throw std::runtime_error("moeActQuantNvfp4Async: not supported on this backend");
-    }
-
-    /// Row-mapped activation quantiser: quantise only `nRows` rows, each read
-    /// from / written to padded row `rowMap[i]`. The FP4-TC MoE path uses this to
-    /// skip the 128-row padding slots (their SF stays pre-zeroed) — at decode M
-    /// this avoids ~64x wasted act-quant work vs the dense variant over maxPad.
-    virtual void moeActQuantNvfp4RowsAsync(const float* in, unsigned char* outNib,
-                                           unsigned char* outSf, float gscale,
-                                           const std::int32_t* rowMap,
-                                           std::size_t nRows, std::size_t K) {
-        (void)in; (void)outNib; (void)outSf; (void)gscale;
-        (void)rowMap; (void)nRows; (void)K;
-        throw std::runtime_error("moeActQuantNvfp4RowsAsync: not supported on this backend");
-    }
-
-    /// 5.21.10: fused gather + row-mapped NVFP4 act-quant — reads the COMPACT
-    /// gathered rows (`in[logical]`) and writes nibbles/SF at the padded row
-    /// `rowMap[logical]`, replacing the moe_rows_scatter_f32 round-trip +
-    /// moeActQuantNvfp4RowsAsync pair. Bit-identical to that pair.
-    virtual void moeActQuantNvfp4GatherRowsAsync(const float* in, unsigned char* outNib,
-                                                 unsigned char* outSf, float gscale,
-                                                 const std::int32_t* rowMap,
-                                                 std::size_t nRows, std::size_t K,
-                                                 const std::int32_t* srcMap = nullptr) {
-        (void)in; (void)outNib; (void)outSf; (void)gscale;
-        (void)rowMap; (void)nRows; (void)K; (void)srcMap;
-        throw std::runtime_error(
-            "moeActQuantNvfp4GatherRowsAsync: not supported on this backend");
-    }
-
-    /// 5.21.8: fused silu(gate)*up + row-mapped NVFP4 act-quant in one pass
-    /// (skips the intermediate round-trip AND the padding-row silu of the
-    /// siluMul+actQuant two-pass). Bit-identical to that pair.
-    virtual void moeSiluMulQuantNvfp4RowsAsync(const float* gate, const float* up,
-                                               unsigned char* outNib, unsigned char* outSf,
-                                               float gscale, const std::int32_t* rowMap,
-                                               std::size_t nRows, std::size_t K) {
-        (void)gate; (void)up; (void)outNib; (void)outSf; (void)gscale;
-        (void)rowMap; (void)nRows; (void)K;
-        throw std::runtime_error("moeSiluMulQuantNvfp4RowsAsync: not supported on this backend");
+    /// FP4-tensor-core grouped-MoE ops moved to IMoeGroupedOps (8.30.6
+    /// ISP-split); reach them through this accessor. Returns nullptr on
+    /// backends without the CUTLASS NVFP4-TC grouped path (every backend but
+    /// CUDA/Bragi) — no throw-default stubs on the neutral base. The
+    /// availability + scratch-size queries below stay here (safe false/0
+    /// defaults, some consulted before this interface is reached).
+    [[nodiscard]] virtual IMoeGroupedOps* moeGroupedOps() noexcept {
+        return nullptr;
     }
 
     /// Device scratch bytes moeGroupedGemmNvfp4TcBanksAsync needs for
@@ -911,54 +836,12 @@ public:
         return 0;
     }
 
-    /// CUTLASS block-scaled NVFP4 grouped GEMM, one expert per group, F32 out.
-    /// Banks + device expOffset/padOffset; all per-group pointers built on
-    /// device (no D2H). N,K shared. `scratch` is caller-owned (per-slot), sized
-    /// >= moeGroupedGemmNvfp4TcBanksScratchBytes(nExperts). See
-    /// runGroupedNvfp4TcF32Banks.
-    virtual void moeGroupedGemmNvfp4TcBanksAsync(
-        std::size_t nExperts, std::size_t N, std::size_t K,
-        const std::int32_t* expOffset, const std::int32_t* padOffset,
-        const void* aBank, const void* sfaBank,
-        const void* bBank, const void* sfbBank,
-        const float* globalsBank, void* dBank,
-        void* scratch, std::size_t scratchBytes) {
-        (void)nExperts; (void)N; (void)K; (void)expOffset; (void)padOffset;
-        (void)aBank; (void)sfaBank; (void)bBank; (void)sfbBank;
-        (void)globalsBank; (void)dBank; (void)scratch; (void)scratchBytes;
-        throw std::runtime_error(
-            "moeGroupedGemmNvfp4TcBanksAsync: not supported on this backend");
-    }
-
     /// Device scratch bytes moeGroupedGemmNvfp4TcBanksGateUpAsync needs for
     /// `nExperts` experts (it submits 2*nExperts groups internally).
     [[nodiscard]] virtual std::size_t
     moeGroupedGemmNvfp4TcBanksGateUpScratchBytes(std::size_t nExperts) const noexcept {
         (void)nExperts;
         return 0;
-    }
-
-    /// 5.18.21: gate+up FUSED CUTLASS grouped GEMM — both projections in ONE
-    /// launch (2*nExperts groups) sharing the activation banks, each keeping its
-    /// own weight/SFB/global/output bank. Bit-identical to two
-    /// moeGroupedGemmNvfp4TcBanksAsync calls; halves the per-call CUTLASS setup.
-    /// `N` = per-projection width (n_ff), `K` = d_model. `scratch` caller-owned,
-    /// sized >= moeGroupedGemmNvfp4TcBanksGateUpScratchBytes(nExperts).
-    virtual void moeGroupedGemmNvfp4TcBanksGateUpAsync(
-        std::size_t nExperts, std::size_t N, std::size_t K,
-        const std::int32_t* expOffset, const std::int32_t* padOffset,
-        const void* aBank, const void* sfaBank,
-        const void* gateBBank, const void* gateSfbBank,
-        const float* gateGlobalsBank, void* gateDBank,
-        const void* upBBank, const void* upSfbBank,
-        const float* upGlobalsBank, void* upDBank,
-        void* scratch, std::size_t scratchBytes) {
-        (void)nExperts; (void)N; (void)K; (void)expOffset; (void)padOffset;
-        (void)aBank; (void)sfaBank; (void)gateBBank; (void)gateSfbBank;
-        (void)gateGlobalsBank; (void)gateDBank; (void)upBBank; (void)upSfbBank;
-        (void)upGlobalsBank; (void)upDBank; (void)scratch; (void)scratchBytes;
-        throw std::runtime_error(
-            "moeGroupedGemmNvfp4TcBanksGateUpAsync: not supported on this backend");
     }
 
     /// M-CLR.MoE Increment 2: device-indexed fused gate+up projection for
