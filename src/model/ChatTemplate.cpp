@@ -212,6 +212,154 @@ std::string renderQwenXmlStructuredToolDef(const ToolSpec& t) {
     return s;
 }
 
+// Build the Qwen tools system block. Two trained-on dialects (8.19.6):
+//   HermesJson (Qwen2.5/Qwen3, !xmlTools): a "# Tools" section listing the
+//     tool JSON inside <tools></tools>, calls as <tool_call>{json}</tool_call>.
+//   QwenXml (Qwen3.5/3.6/3.8 Coder format, xmlTools): the <tools> block with a
+//     fixed call-format tail; `structuredXml` (coder-next) additionally renders
+//     each tool as a <function> definition and appends a firm XML-call
+//     reinforcement. All wording is copied byte-for-byte from the model's
+//     chat_template.jinja — do NOT paraphrase, auto-mode calling is sensitive
+//     to the exact prompt. Returns "" when no tools are offered so a plain chat
+//     renders byte-identically to the pre-8.19.6 encoder. Behaviour-neutral
+//     extract of encodeQwen's inline block (roadmap 8.30.11.3).
+std::string buildQwenToolsBlock(std::span<const ToolSpec> tools,
+                                bool xmlTools, bool structuredXml) {
+    // The fixed call-format tail, identical across both Qwen XML dialects.
+    constexpr const char* kQwenXmlTail =
+        "\n</tools>\n\nIf you choose to call a function ONLY reply in the "
+        "following format with NO suffix:\n\n<tool_call>\n"
+        "<function=example_function_name>\n"
+        "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+        "<parameter=example_parameter_2>\nThis is the value for the second "
+        "parameter\nthat can span\nmultiple lines\n</parameter>\n"
+        "</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+        "- Function calls MUST follow the specified format: an inner "
+        "<function=...></function> block must be nested within "
+        "<tool_call></tool_call> XML tags\n"
+        "- Required parameters MUST be specified\n"
+        "- You may provide optional reasoning for your function call in "
+        "natural language BEFORE the function call, but NOT after\n"
+        "- If there is no function call available, answer the question "
+        "like normal with your current knowledge and do not tell the user "
+        "about function calls\n</IMPORTANT>";
+    // Coder-Next has a strong Gemma/Gemini `tool_code` prior: given the
+    // template's own (soft) format hint it still replies with a
+    // ```tool_code / ```python / ```bash / ```json fence containing a
+    // Python-style NAME(args) call instead of the <tool_call><function=…>
+    // XML the parser needs. A firm directive flips it to the XML shape (the
+    // model is proven capable — an explicit system prompt elicits it). Only
+    // appended for the structured (coder-next) dialect; qwen3.6 is untouched.
+    constexpr const char* kXmlCallReinforce =
+        "\n\nCRITICAL OUTPUT FORMAT: When you decide to use a function, you "
+        "MUST reply with ONLY the XML block below and nothing else:\n"
+        "<tool_call>\n<function=THE_FUNCTION_NAME>\n<parameter=THE_ARG_NAME>\n"
+        "the value\n</parameter>\n</function>\n</tool_call>\n"
+        "Do NOT write the call as Python, bash, JSON, or a ```tool_code / "
+        "```python / ```bash / ```json code fence. Do NOT write it as "
+        "name(args). Use ONLY exactly one offered function name. If no "
+        "function is needed, answer normally in prose.";
+
+    std::string toolsBlock;
+    if (tools.empty()) {
+        return toolsBlock;
+    }
+    if (!xmlTools) {
+        toolsBlock =
+            "\n\n# Tools\n\nYou may call one or more functions to assist with "
+            "the user query.\n\nYou are provided with function signatures "
+            "within <tools></tools> XML tags:\n<tools>";
+        for (const auto& t : tools) {
+            toolsBlock += "\n";
+            toolsBlock += t.toolJson;
+        }
+        toolsBlock +=
+            "\n</tools>\n\nFor each function call, return a json object with "
+            "function name and arguments within <tool_call></tool_call> XML "
+            "tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": "
+            "<args-json-object>}\n</tool_call>";
+    } else {
+        toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for (const auto& t : tools) {
+            if (structuredXml) {
+                toolsBlock += renderQwenXmlStructuredToolDef(t);
+            } else {
+                toolsBlock += "\n";
+                toolsBlock += t.toolJson;
+            }
+        }
+        toolsBlock += kQwenXmlTail;
+        if (structuredXml) {
+            toolsBlock += kXmlCallReinforce;
+        }
+    }
+    return toolsBlock;
+}
+
+// Append the assistant generation prompt (and, for thinking models, the
+// pre-opened / pre-closed <think> block) to `ids`. Behaviour-neutral extract
+// of encodeQwen's addGenerationPrompt block (roadmap 8.30.11.3).
+void appendQwenGenerationPrompt(const Tokenizer&           tok,
+                               std::int32_t                imStart,
+                               std::optional<bool>         enableThinking,
+                               std::optional<bool>         templateUsesThink,
+                               std::vector<std::int32_t>&  ids) {
+    ids.push_back(imStart);
+    encodeText(tok, "assistant\n", ids);
+    // Qwen3 "thinking" models (Qwen3 / Qwen3.5 / Qwen3.6 `qwen35moe`)
+    // pre-open a <think> block in the default generation prompt — the
+    // model is trained to continue *inside* it and close with </think>.
+    // Their HF/GGUF chat_template appends '<think>\n' after
+    // 'assistant\n' (default) or '<think>\n\n</think>\n\n' when thinking
+    // is disabled. Qwen2 / Qwen2.5 have no <think> token and use a plain
+    // ChatML generation prompt. Auto-detect by the presence of the
+    // <think> special token so both families work without an arch
+    // switch. Without this, a thinking model emits a spurious </think>
+    // and stops immediately.
+    // Inject the <think> block only for models whose template actually
+    // uses it. templateUsesThink is authoritative when the checkpoint was
+    // probed; nullopt falls back to the token-presence heuristic (GGUF /
+    // unprobed models keep their prior behaviour). Coder-Next ships the
+    // token but sets this false -> plain `assistant\n`, no OOD block.
+    const std::int32_t think = tok.findToken("<think>");
+    if (think >= 0 && templateUsesThink.value_or(true)) {
+        ids.push_back(think);
+        // Explicit enable_thinking (OpenAI chat_template_kwargs, like vLLM)
+        // overrides: enable_thinking=true opts INTO reasoning; =false forces
+        // the empty pre-closed block (direct answer, no reasoning).
+        // Unset (nullopt) => DEFAULT OFF: an interactive chat gets a direct
+        // answer, not a multi-thousand-token reasoning trace (which also
+        // removes the thinking-loop surface). Reasoning is opt-in per request
+        // via enable_thinking=true. Tool rounds were already pre-closed, so
+        // this only changes the plain-chat/no-tools default. MUST stay in
+        // sync with ChatCompletionHandler's streaming `thinkPreClosed`
+        // (= !thinkOn), else the answer is mislabelled as reasoning_content.
+        const bool thinkOn = enableThinking.value_or(false);
+        if (thinkOn) {
+            // pre-OPEN <think>: the model reasons, then closes
+            // with </think>. This is the answer path; the reasoning is
+            // surfaced as reasoning_content.
+            encodeText(tok, "\n", ids);
+        } else {
+            // Tool round → pre-CLOSE an empty think block (Qwen3's
+            // "thinking disabled" prompt shape: <think>\n\n</think>\n\n)
+            // so the model emits the tool call directly instead of a
+            // multi-thousand-token chain-of-thought. Tool selection does
+            // not need deep reasoning, and those think blocks made agentic
+            // RAG unusably slow (~4096 tokens / round). The final answer
+            // (sent without tools) still reasons.
+            encodeText(tok, "\n\n", ids);
+            const std::int32_t thinkEnd = tok.findToken("</think>");
+            if (thinkEnd >= 0) {
+                ids.push_back(thinkEnd);
+            } else {
+                encodeText(tok, "</think>", ids);
+            }
+            encodeText(tok, "\n\n", ids);
+        }
+    }
+}
+
 std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
                                      std::span<const ChatMessage> messages,
                                      bool                         addGenerationPrompt,
@@ -266,74 +414,13 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     // template (see LlmConfig::toolDefsStructuredXml); nullopt = the qwen3.6
     // form, so unprobed/GGUF models are byte-identical to before.
     const bool structuredXml = xmlTools && toolDefsStructuredXml.value_or(false);
-    // The fixed call-format tail, identical across both Qwen XML dialects.
-    constexpr const char* kQwenXmlTail =
-        "\n</tools>\n\nIf you choose to call a function ONLY reply in the "
-        "following format with NO suffix:\n\n<tool_call>\n"
-        "<function=example_function_name>\n"
-        "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
-        "<parameter=example_parameter_2>\nThis is the value for the second "
-        "parameter\nthat can span\nmultiple lines\n</parameter>\n"
-        "</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
-        "- Function calls MUST follow the specified format: an inner "
-        "<function=...></function> block must be nested within "
-        "<tool_call></tool_call> XML tags\n"
-        "- Required parameters MUST be specified\n"
-        "- You may provide optional reasoning for your function call in "
-        "natural language BEFORE the function call, but NOT after\n"
-        "- If there is no function call available, answer the question "
-        "like normal with your current knowledge and do not tell the user "
-        "about function calls\n</IMPORTANT>";
     // Qwen3-Coder-Next default system preamble when the caller sends none.
     constexpr const char* kQwenAgentPreamble =
         "You are Qwen, a helpful AI assistant that can interact with a "
         "computer to solve tasks.";
-    // Coder-Next has a strong Gemma/Gemini `tool_code` prior: given the
-    // template's own (soft) format hint it still replies with a
-    // ```tool_code / ```python / ```bash / ```json fence containing a
-    // Python-style NAME(args) call instead of the <tool_call><function=…>
-    // XML the parser needs. A firm directive flips it to the XML shape (the
-    // model is proven capable — an explicit system prompt elicits it). Only
-    // appended for the structured (coder-next) dialect; qwen3.6 is untouched.
-    constexpr const char* kXmlCallReinforce =
-        "\n\nCRITICAL OUTPUT FORMAT: When you decide to use a function, you "
-        "MUST reply with ONLY the XML block below and nothing else:\n"
-        "<tool_call>\n<function=THE_FUNCTION_NAME>\n<parameter=THE_ARG_NAME>\n"
-        "the value\n</parameter>\n</function>\n</tool_call>\n"
-        "Do NOT write the call as Python, bash, JSON, or a ```tool_code / "
-        "```python / ```bash / ```json code fence. Do NOT write it as "
-        "name(args). Use ONLY exactly one offered function name. If no "
-        "function is needed, answer normally in prose.";
-    std::string toolsBlock;
-    if (!tools.empty() && !xmlTools) {
-        toolsBlock =
-            "\n\n# Tools\n\nYou may call one or more functions to assist with "
-            "the user query.\n\nYou are provided with function signatures "
-            "within <tools></tools> XML tags:\n<tools>";
-        for (const auto& t : tools) {
-            toolsBlock += "\n";
-            toolsBlock += t.toolJson;
-        }
-        toolsBlock +=
-            "\n</tools>\n\nFor each function call, return a json object with "
-            "function name and arguments within <tool_call></tool_call> XML "
-            "tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": "
-            "<args-json-object>}\n</tool_call>";
-    } else if (!tools.empty()) {
-        toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
-        for (const auto& t : tools) {
-            if (structuredXml) {
-                toolsBlock += renderQwenXmlStructuredToolDef(t);
-            } else {
-                toolsBlock += "\n";
-                toolsBlock += t.toolJson;
-            }
-        }
-        toolsBlock += kQwenXmlTail;
-        if (structuredXml) {
-            toolsBlock += kXmlCallReinforce;
-        }
-    }
+
+    const std::string toolsBlock =
+        buildQwenToolsBlock(tools, xmlTools, structuredXml);
 
     auto emitTurn = [&](std::string_view role, std::string_view content) {
         ids.push_back(imStart);
@@ -471,60 +558,8 @@ std::vector<std::int32_t> encodeQwen(const Tokenizer&             tok,
     }
 
     if (addGenerationPrompt) {
-        ids.push_back(imStart);
-        encodeText(tok, "assistant\n", ids);
-        // Qwen3 "thinking" models (Qwen3 / Qwen3.5 / Qwen3.6 `qwen35moe`)
-        // pre-open a <think> block in the default generation prompt — the
-        // model is trained to continue *inside* it and close with </think>.
-        // Their HF/GGUF chat_template appends '<think>\n' after
-        // 'assistant\n' (default) or '<think>\n\n</think>\n\n' when thinking
-        // is disabled. Qwen2 / Qwen2.5 have no <think> token and use a plain
-        // ChatML generation prompt. Auto-detect by the presence of the
-        // <think> special token so both families work without an arch
-        // switch. Without this, a thinking model emits a spurious </think>
-        // and stops immediately.
-        // Inject the <think> block only for models whose template actually
-        // uses it. templateUsesThink is authoritative when the checkpoint was
-        // probed; nullopt falls back to the token-presence heuristic (GGUF /
-        // unprobed models keep their prior behaviour). Coder-Next ships the
-        // token but sets this false -> plain `assistant\n`, no OOD block.
-        const std::int32_t think = tok.findToken("<think>");
-        if (think >= 0 && templateUsesThink.value_or(true)) {
-            ids.push_back(think);
-            // Explicit enable_thinking (OpenAI chat_template_kwargs, like vLLM)
-            // overrides: enable_thinking=true opts INTO reasoning; =false forces
-            // the empty pre-closed block (direct answer, no reasoning).
-            // Unset (nullopt) => DEFAULT OFF: an interactive chat gets a direct
-            // answer, not a multi-thousand-token reasoning trace (which also
-            // removes the thinking-loop surface). Reasoning is opt-in per request
-            // via enable_thinking=true. Tool rounds were already pre-closed, so
-            // this only changes the plain-chat/no-tools default. MUST stay in
-            // sync with ChatCompletionHandler's streaming `thinkPreClosed`
-            // (= !thinkOn), else the answer is mislabelled as reasoning_content.
-            const bool thinkOn = enableThinking.value_or(false);
-            if (thinkOn) {
-                // pre-OPEN <think>: the model reasons, then closes
-                // with </think>. This is the answer path; the reasoning is
-                // surfaced as reasoning_content.
-                encodeText(tok, "\n", ids);
-            } else {
-                // Tool round → pre-CLOSE an empty think block (Qwen3's
-                // "thinking disabled" prompt shape: <think>\n\n</think>\n\n)
-                // so the model emits the tool call directly instead of a
-                // multi-thousand-token chain-of-thought. Tool selection does
-                // not need deep reasoning, and those think blocks made agentic
-                // RAG unusably slow (~4096 tokens / round). The final answer
-                // (sent without tools) still reasons.
-                encodeText(tok, "\n\n", ids);
-                const std::int32_t thinkEnd = tok.findToken("</think>");
-                if (thinkEnd >= 0) {
-                    ids.push_back(thinkEnd);
-                } else {
-                    encodeText(tok, "</think>", ids);
-                }
-                encodeText(tok, "\n\n", ids);
-            }
-        }
+        appendQwenGenerationPrompt(tok, imStart, enableThinking,
+                                   templateUsesThink, ids);
     }
 
     return ids;
