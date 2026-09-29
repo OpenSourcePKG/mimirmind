@@ -6,6 +6,7 @@
 #include "compute/ComputeOps.hpp"
 #include "compute/IHyperConnectionOps.hpp"
 #include "compute/IMoeGroupedOps.hpp"
+#include "compute/IPagedAttentionOps.hpp"
 #include "compute/cuda/MoeTopKRouteDevice.hpp"
 #include "core/config/Config.hpp"
 #include "runtime/KvCache.hpp"
@@ -59,7 +60,8 @@ class CudnnSdpaPrefill;
  */
 class GpuOps : public ::mimirmind::compute::ComputeOps,
                public ::mimirmind::compute::IHyperConnectionOps,
-               public ::mimirmind::compute::IMoeGroupedOps {
+               public ::mimirmind::compute::IMoeGroupedOps,
+               public ::mimirmind::compute::IPagedAttentionOps {
 public:
     /// Same 4-arg shape as `GpuOps` — the config knobs propagate 1:1
     /// so a config.json that steered the L0 backend keeps steering
@@ -846,6 +848,11 @@ public:
                                           float scale, std::size_t slidingWindow,
                                           runtime::KvDtype kvDtype
                                               = runtime::KvDtype::F32) override;
+    // Paged attention: the CUDA backend implements the segregated
+    // IPagedAttentionOps interface (8.30.6); the accessor hands it back. The
+    // cuDNN query/graceful pair stays on ComputeOps.
+    [[nodiscard]] ::mimirmind::compute::IPagedAttentionOps*
+        pagedAttentionOps() noexcept override { return this; }
     void pagedAttentionDecodeV1Async(
             float* out, const float* query, const float* keyCache,
             const float* valueCache, const std::int32_t* blockTables,

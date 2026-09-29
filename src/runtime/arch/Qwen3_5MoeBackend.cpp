@@ -6,6 +6,7 @@
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
 #include "compute/IMoeGroupedOps.hpp"
+#include "compute/IPagedAttentionOps.hpp"
 #include "core/gpu/AllocCategory.hpp"
 #include "core/modelopt/BlockScaleSwizzle.hpp" // E-d.4b swizzledBlockScaleBytes
 
@@ -177,6 +178,16 @@ compute::IMoeGroupedOps& Qwen3_5MoeBackend::mgOps() const {
         "Qwen3_5MoeBackend: the loaded compute backend provides no FP4-TC "
         "grouped-MoE ops (CUDA/Bragi only); guard these paths with "
         "moeGroupedGemmNvfp4TcAvailable()");
+}
+
+compute::IPagedAttentionOps& Qwen3_5MoeBackend::paOps() const {
+    if (auto* pa = _ops.pagedAttentionOps()) {
+        return *pa;
+    }
+    throw std::runtime_error(
+        "Qwen3_5MoeBackend: the loaded compute backend provides no paged "
+        "attention ops (CUDA/Bragi serving only; the L0 substrate is "
+        "non-paged slab)");
 }
 
 void Qwen3_5MoeBackend::runFfn(std::size_t   blockIdx,
@@ -1673,7 +1684,7 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
             const std::size_t D = ctx.hybDecodeCount;
             _ops.moeGatherRowsAsync(qBuf, ctx.hybDecodeRowMapDev,
                                     ctx.hybQDecodeScratch, q_dim, D);
-            _ops.pagedAttentionDecodeV2Async(
+            paOps().pagedAttentionDecodeV2Async(
                 ctx.hybAttnDecodeScratch, ctx.hybQDecodeScratch, keyBase, valBase,
                 ctx.hybDecodeBlockTablesDev, ctx.hybDecodeSeqLensDev,
                 D, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
@@ -1708,7 +1719,7 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
                 s.cudnnKvScratch.as<float>(), maxTkvCap, kvDtype);
         }
         if (!cudnnDone)
-        _ops.pagedAttentionPrefillCausalAsync(
+        paOps().pagedAttentionPrefillCausalAsync(
             attnOut, qBuf, keyBase, valBase, ctx.blockTablesDev,
             (ctx.hybDecodeCount > 0) ? ctx.hybSeqTPrefillDev : ctx.seqTDev,
             ctx.seqOffDev, ctx.startPosDev,
@@ -1721,12 +1732,12 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
         // the "fp16 pool always routes through V2" invariant real — a bare
         // MIMIRMIND_PAGED_V1=1 with a non-F32 pool would otherwise misread the
         // packed bytes as F32 (5.16; pre-existing latent for fp16).
-        _ops.pagedAttentionDecodeV1Async(
+        paOps().pagedAttentionDecodeV1Async(
             attnOut, qBuf, keyBase, valBase, ctx.blockTablesDev, ctx.seqLensDev,
             nSeq, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
             ctx.maxBlocksPerSeq, attnScale, /*softcap=*/0.0f);
     } else {
-        _ops.pagedAttentionDecodeV2Async(
+        paOps().pagedAttentionDecodeV2Async(
             attnOut, qBuf, keyBase, valBase, ctx.blockTablesDev, ctx.seqLensDev,
             nSeq, nHeads, nKvHeads, head_dim, ctx.pool->blockSize(),
             ctx.maxBlocksPerSeq, static_cast<std::size_t>(ctx.maxSeqLen),

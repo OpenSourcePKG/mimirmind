@@ -4,6 +4,7 @@
 #pragma once
 
 #include "compute/IMoeGroupedOps.hpp"
+#include "compute/IPagedAttentionOps.hpp"
 #include "runtime/arch/Qwen3_5Backend.hpp"
 
 namespace mimirmind::runtime::arch {
@@ -113,6 +114,13 @@ protected:
     // does not provide it — the same unsupported-backend failure the former
     // base-class throw-defaults gave, at one named seam.
     [[nodiscard]] compute::IMoeGroupedOps& mgOps() const;
+
+    // The backend's paged-attention ops (8.30.6 ISP-split). Only reached on the
+    // CUDA paged-KV serving path (the L0 substrate is non-paged slab); paOps()
+    // hands the interface back and throws a clear error if the backend does not
+    // provide it — the same unsupported-backend failure the former base-class
+    // throw-defaults gave.
+    [[nodiscard]] compute::IPagedAttentionOps& paOps() const;
 
     /// FFN seam: routed top-K experts + gated shared expert.
     void runFfn(std::size_t   blockIdx,

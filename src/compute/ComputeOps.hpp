@@ -22,6 +22,7 @@ namespace mimirmind::compute {
 /// neutral base carries no throw-default stubs for them.
 class IHyperConnectionOps;
 class IMoeGroupedOps;
+class IPagedAttentionOps;
 
 /// 5.21 Increment II — shape/control bundle for the batched GatedDeltaNet
 /// recurrence. Groups the scalar dims + per-slot control that grow as the
@@ -521,49 +522,13 @@ public:
             "deltanetChunkForwardBatchedAsync: not supported on this backend");
     }
 
-    /// M-Cuda.Batch B2/D2a — paged-KV decode attention. One query token per
-    /// sequence; each sequence reads its KV from the shared physical pool
-    /// (PagedKvPool) via its block table. `keyCache`/`valueCache` are the
-    /// per-layer pool bases [numBlocks, blockSize, numKvHeads, headSize];
-    /// `blockTables` [numSeqs, maxNumBlocksPerSeq] int32 (-1 sentinel);
-    /// `seqLens` [numSeqs] int32. `query`/`out` [numSeqs, numHeads, headSize].
-    /// fp32 baseline (kernel `paged_attention_v1`). Default: unsupported;
-    /// CUDA overrides.
-    virtual void pagedAttentionDecodeV1Async(
-            float* out, const float* query, const float* keyCache,
-            const float* valueCache, const std::int32_t* blockTables,
-            const std::int32_t* seqLens, std::size_t numSeqs,
-            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
-            std::size_t blockSize, std::size_t maxNumBlocksPerSeq, float scale,
-            float softcap) {
-        (void)out; (void)query; (void)keyCache; (void)valueCache;
-        (void)blockTables; (void)seqLens; (void)numSeqs; (void)numHeads;
-        (void)numKvHeads; (void)headSize; (void)blockSize;
-        (void)maxNumBlocksPerSeq; (void)scale; (void)softcap;
-        throw std::runtime_error(
-            "pagedAttentionDecodeV1Async: not supported on this backend");
-    }
-
-    /// 5.21 Increment II — paged, batched, CAUSAL, T>1 prefill attention. Slot
-    /// seq carries seqT[seq] ragged query tokens at token offset queryOff[seq];
-    /// query pq attends KV [0, startPos[seq]+pq] via the block table. maxT =
-    /// max(seqT) sizes the grid's query dim. CUDA-only (default-throws).
-    virtual void pagedAttentionPrefillCausalAsync(
-            float* out, const float* query, const float* keyCache,
-            const float* valueCache, const std::int32_t* blockTables,
-            const std::int32_t* seqT, const std::int32_t* queryOff,
-            const std::int32_t* startPos, std::size_t numSeqs,
-            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
-            std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
-            std::size_t maxT, float scale, float softcap,
-            runtime::KvDtype kvDtype = runtime::KvDtype::F32) {
-        (void)out; (void)query; (void)keyCache; (void)valueCache;
-        (void)blockTables; (void)seqT; (void)queryOff; (void)startPos;
-        (void)numSeqs; (void)numHeads; (void)numKvHeads; (void)headSize;
-        (void)blockSize; (void)maxNumBlocksPerSeq; (void)maxT; (void)scale;
-        (void)softcap; (void)kvDtype;
-        throw std::runtime_error(
-            "pagedAttentionPrefillCausalAsync: not supported on this backend");
+    // Paged (block-table) attention decode/prefill ops moved to
+    // IPagedAttentionOps (8.30.6 ISP-split); reach them through this
+    // accessor. Returns nullptr on backends without the paged path (the L0
+    // serving substrate uses the non-paged slab) — no throw-default stubs on
+    // the neutral base. The cuDNN query/graceful pair below stays here.
+    [[nodiscard]] virtual IPagedAttentionOps* pagedAttentionOps() noexcept {
+        return nullptr;
     }
 
     /// True if a cuDNN-SDPA paged-prefill path is compiled + usable (CUDA build
@@ -595,28 +560,6 @@ public:
         (void)maxNumBlocksPerSeq; (void)scale; (void)kvScratch; (void)maxTkvCap;
         (void)kvDtype;
         return false;
-    }
-
-    /// Split-K (partition-parallel) paged decode attention — kernels
-    /// `paged_attention_v2` + `paged_attention_v2_reduce`. Same result as V1
-    /// but parallelises the KV traversal across `ceil(maxSeqLen/512)` partitions
-    /// so long-context decode fills the GPU (FlashDecoding / vLLM v2 pattern).
-    /// Workspace is managed internally by the implementation. Default: fall back
-    /// to the single-pass V1 (correct, just not partition-parallel); CUDA
-    /// overrides with the real split-K path.
-    virtual void pagedAttentionDecodeV2Async(
-            float* out, const float* query, const float* keyCache,
-            const float* valueCache, const std::int32_t* blockTables,
-            const std::int32_t* seqLens, std::size_t numSeqs,
-            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
-            std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
-            std::size_t maxSeqLen, float scale, float softcap,
-            runtime::KvDtype kvDtype = runtime::KvDtype::F32) {
-        (void)maxSeqLen; (void)kvDtype;   // base fallback is F32-only
-        pagedAttentionDecodeV1Async(out, query, keyCache, valueCache,
-                                    blockTables, seqLens, numSeqs, numHeads,
-                                    numKvHeads, headSize, blockSize,
-                                    maxNumBlocksPerSeq, scale, softcap);
     }
 
     /// Chunked-prefill stage K1: per-chunk ungated triangular inverse A0
