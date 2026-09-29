@@ -4,6 +4,7 @@
 #pragma once
 
 #include "compute/ComputeBuffer.hpp"
+#include "compute/IHyperConnectionOps.hpp"
 #include "runtime/arch/Qwen3_5MoeBackend.hpp"
 #include "runtime/nvfp4/PleNgramTable.hpp"
 
@@ -104,6 +105,12 @@ protected:
                           std::size_t T, BlockBuffers& s, bool isAttn) override;
 
 private:
+    // The backend's Hyper-Connections ops (8.30.6 ISP-split). qwen4_exp is a
+    // CUDA/Bragi-only arch, so `_ops` is expected to implement
+    // IHyperConnectionOps; hcOps() hands it back and throws on a backend that
+    // does not (the same failure the former base-class throw-default gave).
+    [[nodiscard]] compute::IHyperConnectionOps& hcOps() const;
+
     // GatedResidual over the stream state `_hcStreams` -> `mixed` [T, d_model].
     // `combine` (per-layer) also computes the injection weights into `_hcInj`;
     // the mixer (combine=false) skips them. `normWeight` is the hc_norm.

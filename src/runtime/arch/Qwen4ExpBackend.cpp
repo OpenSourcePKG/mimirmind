@@ -5,6 +5,7 @@
 
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
+#include "compute/IHyperConnectionOps.hpp"
 #include "core/gguf/WeightsMap.hpp"
 #include "core/log/Log.hpp"
 #include "model/LlmConfig.hpp"
@@ -93,6 +94,15 @@ Qwen4ExpBackend::Qwen4ExpBackend(const model::LlmConfig&       config,
     : Qwen3_5MoeBackend(config, weights, fusedQkv, ops, gmm, opProfiler,
                         moeGroupEnabled, moeFusedDownEnabled) {}
 
+compute::IHyperConnectionOps& Qwen4ExpBackend::hcOps() const {
+    if (auto* hc = _ops.hyperConnectionOps()) {
+        return *hc;
+    }
+    throw std::runtime_error(
+        "Qwen4ExpBackend: the loaded compute backend provides no "
+        "Hyper-Connections ops (qwen4_exp is a CUDA/Bragi-only arch)");
+}
+
 void Qwen4ExpBackend::growHcScratch(std::size_t T) {
     if (T <= _hcCapT) {
         return;
@@ -129,7 +139,7 @@ void Qwen4ExpBackend::hcGatedResidual(std::size_t blockIdx, std::size_t T,
     float* const scratch = s.matmulScratch.as<float>();
 
     // normed = groupedRMSNorm(streams) * (1+w) hc_norm
-    _ops.hcGroupedRmsNormAsync(streams, normWeight, normed, T, hc, d, eps);
+    hcOps().hcGroupedRmsNormAsync(streams, normWeight, normed, T, hc, d, eps);
 
     // input-mix: w1 = silu(down(normed)/hc); w2 = sigmoid(up(w1))
     const auto& downW = (blockIdx == kMixerBlock)
@@ -139,12 +149,12 @@ void Qwen4ExpBackend::hcGatedResidual(std::size_t blockIdx, std::size_t T,
         ? requireTopT(_weights, modulePrefix + "input_mix_weight_up.weight")
         : requireBlockT(_weights, blockIdx, modulePrefix + "input_mix_weight_up.weight");
     _gmm.matmulAsync(downW.type, downW.usmPtr, lowrank, hcd, normed, T, w1, scratch);
-    _ops.hcSiluScaleAsync(w1, T * lowrank, invHc);
+    hcOps().hcSiluScaleAsync(w1, T * lowrank, invHc);
     _gmm.matmulAsync(upW.type, upW.usmPtr, hcd, lowrank, w1, T, w2, scratch);
     _ops.sigmoidInPlaceAsync(w2, T * hcd);
 
     // mixed = mean_g(w2 * normed)
-    _ops.hcWeightedMeanStreamsAsync(w2, normed, mixed, T, hc, d);
+    hcOps().hcWeightedMeanStreamsAsync(w2, normed, mixed, T, hc, d);
 
     if (!combine) {
         return;
@@ -170,7 +180,7 @@ void Qwen4ExpBackend::blockInputNorm(std::size_t blockIdx, const float* x,
     // layer-1 injection is deferred to I-4; without it the streams start as the
     // plain repeated embedding.)
     if (blockIdx == 0 && isAttn) {
-        _ops.hcStreamBroadcastAsync(x, _hcStreams.as<float>(), T, hc, d);
+        hcOps().hcStreamBroadcastAsync(x, _hcStreams.as<float>(), T, hc, d);
     }
 
     const std::string prefix =
@@ -184,7 +194,7 @@ void Qwen4ExpBackend::blockResidualAdd(std::size_t /*blockIdx*/, float* /*x*/,
     const std::size_t d  = _config.embeddingLength;
     const std::size_t hc = _config.hcCount;
     // Scatter the module output into every stream: H_g += inj_g * out.
-    _ops.hcInjectScatterAsync(_hcStreams.as<float>(), moduleOut,
+    hcOps().hcInjectScatterAsync(_hcStreams.as<float>(), moduleOut,
                               _hcInj.as<float>(), T, hc, d);
 }
 
@@ -418,17 +428,17 @@ void Qwen4ExpBackend::pleForward(std::size_t T, BlockBuffers& s) {
     // 2. key = norm_key(key_proj(emb)); value = value_proj(emb);
     //    query = norm_query(streams).
     _gmm.matmulAsync(kW.type, kW.usmPtr, hcd, embDim, emb, T, _pleKey.as<float>(), scratch);
-    _ops.hcGroupedRmsNormAsync(_pleKey.as<float>(),
+    hcOps().hcGroupedRmsNormAsync(_pleKey.as<float>(),
                                static_cast<const float*>(nkW.usmPtr),
                                _pleKeyN.as<float>(), T, hc, d, eps);
     _gmm.matmulAsync(vW.type, vW.usmPtr, d, embDim, emb, T, _pleVal.as<float>(), scratch);
-    _ops.hcGroupedRmsNormAsync(streams, static_cast<const float*>(nqW.usmPtr),
+    hcOps().hcGroupedRmsNormAsync(streams, static_cast<const float*>(nqW.usmPtr),
                                _pleQryN.as<float>(), T, hc, d, eps);
 
     // 3. signed-sqrt gate -> gated value; norm_conv; dilated conv+silu.
     _ops.pleGateAsync(_pleKeyN.as<float>(), _pleQryN.as<float>(), _pleVal.as<float>(),
                       _pleGated.as<float>(), T, hc, d);
-    _ops.hcGroupedRmsNormAsync(_pleGated.as<float>(),
+    hcOps().hcGroupedRmsNormAsync(_pleGated.as<float>(),
                                static_cast<const float*>(ncW.usmPtr),
                                _pleGvn.as<float>(), T, hc, d, eps);
     // 5.27.11.2: the dilated (dilation=ngramSize) causal conv1d convolves along

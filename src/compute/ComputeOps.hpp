@@ -16,6 +16,12 @@
 
 namespace mimirmind::compute {
 
+/// Segregated capability interfaces (8.30.6 ISP-split): concerns that only some
+/// backends implement live in their own interface and are reached through a
+/// `ComputeOps` accessor that returns nullptr on backends without them — so the
+/// neutral base carries no throw-default stubs for them.
+class IHyperConnectionOps;
+
 /// 5.21 Increment II — shape/control bundle for the batched GatedDeltaNet
 /// recurrence. Groups the scalar dims + per-slot control that grow as the
 /// serving path gains variable-length (T>1/slot, ragged) prefill batching, so
@@ -993,46 +999,12 @@ public:
     virtual void sigmoidInPlaceAsync(float* y, std::size_t n) = 0;
 
     // --- Qwen4-Exp Hyper-Connections (5.27 I-3) --------------------------------
-    // CUDA-only elementwise glue for the 4-stream GatedResidual. Default-throw on
-    // every other backend (qwen4_exp is a CUDA/Bragi-only arch). See
-    // kernels/cuda/llm/hyper_connection.cu; math verified by the q4e_hc parity
-    // harness.
-
-    /// Grouped RMSNorm over a [T, hc*d] token-major stream tensor: normalise each
-    /// `d`-chunk (stream) independently, then scale by the (1+w)-baked weight
-    /// `wBaked` [hc*d]. normed = groupRMS(x) * wBaked.
-    virtual void hcGroupedRmsNormAsync(const float* /*x*/, const float* /*wBaked*/,
-                                       float* /*normed*/, std::size_t /*T*/,
-                                       std::size_t /*hc*/, std::size_t /*d*/,
-                                       float /*eps*/) {
-        throw std::runtime_error("hcGroupedRmsNormAsync: not supported on this backend");
-    }
-
-    /// In-place x = silu(x * scale) over n elements.
-    virtual void hcSiluScaleAsync(float* /*x*/, std::size_t /*n*/, float /*scale*/) {
-        throw std::runtime_error("hcSiluScaleAsync: not supported on this backend");
-    }
-
-    /// Weighted stream mean: mixed[t,j] = (1/hc) * sum_g w2[t,g*d+j]*normed[t,g*d+j].
-    virtual void hcWeightedMeanStreamsAsync(const float* /*w2*/,
-                                            const float* /*normed*/, float* /*mixed*/,
-                                            std::size_t /*T*/, std::size_t /*hc*/,
-                                            std::size_t /*d*/) {
-        throw std::runtime_error("hcWeightedMeanStreamsAsync: not supported on this backend");
-    }
-
-    /// Injection scatter (HC residual add): x[t,g*d+j] += inj[t,g]*moduleOut[t,j].
-    virtual void hcInjectScatterAsync(float* /*x*/, const float* /*moduleOut*/,
-                                      const float* /*inj*/, std::size_t /*T*/,
-                                      std::size_t /*hc*/, std::size_t /*d*/) {
-        throw std::runtime_error("hcInjectScatterAsync: not supported on this backend");
-    }
-
-    /// Stream broadcast (embed repeat x hc at forward start): dst[t,g*d+j]=src[t,j].
-    virtual void hcStreamBroadcastAsync(const float* /*src*/, float* /*dst*/,
-                                        std::size_t /*T*/, std::size_t /*hc*/,
-                                        std::size_t /*d*/) {
-        throw std::runtime_error("hcStreamBroadcastAsync: not supported on this backend");
+    // The five CUDA-only elementwise HC ops moved to IHyperConnectionOps
+    // (8.30.6 ISP-split); reach them through the accessor below. Returns nullptr
+    // on backends without Hyper-Connections (every arch but qwen4_exp on
+    // CUDA/Bragi) — no throw-default stubs on the neutral base.
+    [[nodiscard]] virtual IHyperConnectionOps* hyperConnectionOps() noexcept {
+        return nullptr;
     }
 
     // --- Qwen4-Exp PLE device forward (5.27 I-4) ------------------------------

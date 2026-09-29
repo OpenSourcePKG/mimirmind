@@ -4,6 +4,7 @@
 #pragma once
 
 #include "compute/ComputeOps.hpp"
+#include "compute/IHyperConnectionOps.hpp"
 #include "compute/cuda/MoeTopKRouteDevice.hpp"
 #include "core/config/Config.hpp"
 #include "runtime/KvCache.hpp"
@@ -55,7 +56,8 @@ class CudnnSdpaPrefill;
  *
  * Not thread-safe. Construct once at startup, share across the engine.
  */
-class GpuOps : public ::mimirmind::compute::ComputeOps {
+class GpuOps : public ::mimirmind::compute::ComputeOps,
+               public ::mimirmind::compute::IHyperConnectionOps {
 public:
     /// Same 4-arg shape as `GpuOps` — the config knobs propagate 1:1
     /// so a config.json that steered the L0 backend keeps steering
@@ -402,7 +404,12 @@ public:
         const float* upGlobalsBank, void* upDBank,
         void* scratch, std::size_t scratchBytes) override;
     void sigmoidInPlaceAsync(float* y, std::size_t n) override;
-    // 5.27 I-3 Hyper-Connections (qwen4_exp).
+
+    // 5.27 I-3 Hyper-Connections (qwen4_exp) — the CUDA backend implements the
+    // segregated IHyperConnectionOps interface (8.30.6); the accessor hands it
+    // back so callers reach these without a base-class throw-default stub.
+    [[nodiscard]] ::mimirmind::compute::IHyperConnectionOps*
+        hyperConnectionOps() noexcept override { return this; }
     void hcGroupedRmsNormAsync(const float* x, const float* wBaked, float* normed,
                                std::size_t T, std::size_t hc, std::size_t d,
                                float eps) override;
