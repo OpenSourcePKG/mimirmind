@@ -375,8 +375,8 @@ void GpuOps::deltanetGateAsync(const float* alpha,
     ::mimirmind::compute::deltanetGate(alpha, ssmA, ssmDt, gLog, T, H);
 }
 
-void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
-    ::mimirmind::compute::sigmoidInPlace(y, n);
+void GpuOps::sigmoidInPlaceAsync(std::span<float> y) {
+    ::mimirmind::compute::sigmoidInPlace(y.data(), y.size());
 }
 
 void GpuOps::gatherHeadsFromChannelsAsync(const float* src,

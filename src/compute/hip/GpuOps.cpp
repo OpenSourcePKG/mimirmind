@@ -1075,12 +1075,13 @@ void GpuOps::deltanetChunkForwardAsync(const float* q, const float* k_,
     _ctx.stream().synchronize();
 }
 
-void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
+void GpuOps::sigmoidInPlaceAsync(std::span<float> y) {
+    const std::size_t n = y.size();
     if (n == 0) {
         return;
     }
     auto& k = _pimpl->_sigmoidInplaceKernel;
-    k.setPtr  (0, y);
+    k.setPtr  (0, y.data());
     k.setValue(1, toInt32(n, "sigmoidInplace n"));
     k.launch(_ctx.stream(),
              groupsForN(n, kElementwiseLocalSize), 1, 1,

@@ -118,7 +118,7 @@ public:
     void addResidualAsync(float* y, const float* x, std::size_t n) override;
 
     void siluMulAsync(float* gate, const float* up, std::size_t n) override;
-    void roundBf16InplaceAsync(float* buf, std::size_t n) override;
+    void roundBf16InplaceAsync(std::span<float> buf) override;
     void siluMulSplitAsync(const float* w13, float* out,
                            std::size_t rows, std::size_t nff) override;
 
@@ -414,7 +414,7 @@ public:
         const void* upBBank, const void* upSfbBank,
         const float* upGlobalsBank, void* upDBank,
         void* scratch, std::size_t scratchBytes) override;
-    void sigmoidInPlaceAsync(float* y, std::size_t n) override;
+    void sigmoidInPlaceAsync(std::span<float> y) override;
 
     // 5.27 I-3 Hyper-Connections (qwen4_exp) — the CUDA backend implements the
     // segregated IHyperConnectionOps interface (8.30.6); the accessor hands it

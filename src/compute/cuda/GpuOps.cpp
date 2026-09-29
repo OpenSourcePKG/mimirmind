@@ -1600,15 +1600,16 @@ void GpuOps::siluMulAsync(float* gate, const float* up, std::size_t n) {
              kElementwiseLocalSize, 1, 1);
 }
 
-void GpuOps::roundBf16InplaceAsync(float* buf, std::size_t n) {
+void GpuOps::roundBf16InplaceAsync(std::span<float> buf) {
     // 5.18.10.4 — round an F32 buffer to bf16 precision in place (simulate bf16
     // SSM-state storage; coherence de-risk only, gated by the backend).
-    if (n == 0 || buf == nullptr) {
+    const std::size_t n = buf.size();
+    if (n == 0 || buf.data() == nullptr) {
         return;
     }
     const std::int32_t ni = toInt32(n, "roundBf16 n");
     auto& k = _pimpl->_ssmRoundBf16Kernel;
-    k.setPtr  (0, buf);
+    k.setPtr  (0, buf.data());
     k.setValue(1, ni);
     k.launch(_ctx.stream(),
              groupsForN(n, kElementwiseLocalSize), 1, 1,
@@ -3289,12 +3290,13 @@ void GpuOps::moeGroupedGemmNvfp4TcBanksGateUpAsync(
 #endif
 }
 
-void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
+void GpuOps::sigmoidInPlaceAsync(std::span<float> y) {
+    const std::size_t n = y.size();
     if (n == 0) {
         return;
     }
     auto& k = _pimpl->_sigmoidInplaceKernel;
-    k.setPtr  (0, y);
+    k.setPtr  (0, y.data());
     k.setValue(1, toInt32(n, "sigmoidInplace n"));
     k.launch(_ctx.stream(),
              groupsForN(n, kElementwiseLocalSize), 1, 1,

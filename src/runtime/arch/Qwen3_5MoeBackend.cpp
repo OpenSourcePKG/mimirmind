@@ -1933,7 +1933,7 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     // launches are skipped and beta/alpha stay RAW (consumed by the fused
     // recurrence below). MIMIRMIND_GDN_GATE_FUSE=1.
     if (!_gdnGateFuse) {
-        _ops.sigmoidInPlaceAsync(betaBuf, nRow * hV);
+        _ops.sigmoidInPlaceAsync({betaBuf, nRow * hV});
         _ops.deltanetGateAsync(alphaBuf,
                                static_cast<const float*>(ssmA.usmPtr),
                                static_cast<const float*>(ssmDt.usmPtr),
@@ -2101,7 +2101,7 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
         // The chunk kernels consume gLog + sigmoided beta; the gate-fused
         // decode path keeps alpha/beta RAW, so materialise them here.
         if (_gdnGateFuse) {
-            _ops.sigmoidInPlaceAsync(betaBuf, nRow * hV);
+            _ops.sigmoidInPlaceAsync({betaBuf, nRow * hV});
             _ops.deltanetGateAsync(alphaBuf,
                                    static_cast<const float*>(ssmA.usmPtr),
                                    static_cast<const float*>(ssmDt.usmPtr),
@@ -2169,8 +2169,8 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
     // state. Simulates bf16 storage (the only remaining gdn.recur decode lever)
     // WITHOUT the invasive F32->BF16 storage change. Perf-irrelevant (coherence).
     if (_ssmBf16Sim) {
-        _ops.roundBf16InplaceAsync(stateBase, slabNSeq * stateElems);
-        _ops.roundBf16InplaceAsync(convBase,  slabNSeq * convStateElems);
+        _ops.roundBf16InplaceAsync({stateBase, slabNSeq * stateElems});
+        _ops.roundBf16InplaceAsync({convBase,  slabNSeq * convStateElems});
     }
 }
 
@@ -2247,7 +2247,7 @@ void Qwen3_5MoeBackend::runLinearBlockVerify(
         _gmm.matmulAsync(betaW.type, betaW.usmPtr, hV,       d_model, normBuf, M, betaBuf,  mmScratch);
         _gmm.matmulAsync(alphaW.type,alphaW.usmPtr,hV,       d_model, normBuf, M, alphaBuf, mmScratch);
     }
-    _ops.sigmoidInPlaceAsync(betaBuf, M * hV);
+    _ops.sigmoidInPlaceAsync({betaBuf, M * hV});
     _ops.deltanetGateAsync(alphaBuf,
                            static_cast<const float*>(ssmA.usmPtr),
                            static_cast<const float*>(ssmDt.usmPtr),

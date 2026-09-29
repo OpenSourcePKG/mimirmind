@@ -11,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 
@@ -153,8 +154,8 @@ public:
     /// 5.18.10.4 — round an F32 buffer to BF16 precision IN PLACE (simulate bf16
     /// SSM-state storage for the coherence de-risk; gated by the backend via
     /// MIMIRMIND_SSM_BF16_SIM). Default no-op so non-CUDA backends ignore it.
-    virtual void roundBf16InplaceAsync(float* buf, std::size_t n) {
-        (void)buf; (void)n;
+    virtual void roundBf16InplaceAsync(std::span<float> buf) {
+        (void)buf;
     }
 
     // SwiGLU split for a stacked-w13 grouped-GEMM output (roadmap 5.18.8):
@@ -823,7 +824,7 @@ public:
 
     /// In-place logistic sigmoid: y[i] = 1/(1+exp(-y[i])). GatedDeltaNet
     /// `beta` gate. Reference: compute::sigmoidInPlace.
-    virtual void sigmoidInPlaceAsync(float* y, std::size_t n) = 0;
+    virtual void sigmoidInPlaceAsync(std::span<float> y) = 0;
 
     // --- Qwen4-Exp Hyper-Connections (5.27 I-3) --------------------------------
     // The five CUDA-only elementwise HC ops moved to IHyperConnectionOps

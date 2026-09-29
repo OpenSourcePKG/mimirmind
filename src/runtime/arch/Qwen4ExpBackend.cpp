@@ -161,7 +161,7 @@ void Qwen4ExpBackend::hcGatedResidual(std::size_t blockIdx, std::size_t T,
     _gmm.matmulAsync(downW.type, downW.usmPtr, lowrank, hcd, normed, T, w1, scratch);
     hcOps().hcSiluScaleAsync(w1, T * lowrank, invHc);
     _gmm.matmulAsync(upW.type, upW.usmPtr, hcd, lowrank, w1, T, w2, scratch);
-    _ops.sigmoidInPlaceAsync(w2, T * hcd);
+    _ops.sigmoidInPlaceAsync({w2, T * hcd});
 
     // mixed = mean_g(w2 * normed)
     hcOps().hcWeightedMeanStreamsAsync(w2, normed, mixed, T, hc, d);
@@ -175,7 +175,7 @@ void Qwen4ExpBackend::hcGatedResidual(std::size_t blockIdx, std::size_t T,
     float* const inj = _hcInj.as<float>();
     _gmm.matmulAsync(biW.type, biW.usmPtr, hc, hcd, normed, T, inj, scratch);
     _ops.mulScalarAsync(inj, invHc, T * hc);
-    _ops.sigmoidInPlaceAsync(inj, T * hc);
+    _ops.sigmoidInPlaceAsync({inj, T * hc});
     _ops.mulScalarAsync(inj, 2.0F, T * hc);
 }
 

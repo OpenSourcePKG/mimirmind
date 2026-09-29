@@ -707,7 +707,7 @@ void Qwen3_5Backend::runLinearBlock(std::size_t   blockIdx,
 
     // beta = sigmoid(beta); gLog = -exp(ssm_a) * softplus(alpha + ssm_dt).
     trace("beta sigmoid + decay gate");
-    _ops.sigmoidInPlaceAsync(betaBuf, T * hV);
+    _ops.sigmoidInPlaceAsync({betaBuf, T * hV});
     _ops.deltanetGateAsync(alphaBuf,
                            static_cast<const float*>(ssmA.usmPtr),
                            static_cast<const float*>(ssmDt.usmPtr),

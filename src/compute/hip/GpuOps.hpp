@@ -161,7 +161,7 @@ public:
                                    float* state, float* out,
                                    std::size_t T, std::size_t H,
                                    std::size_t S, std::size_t chunkSize) override;
-    void sigmoidInPlaceAsync(float* y, std::size_t n) override;
+    void sigmoidInPlaceAsync(std::span<float> y) override;
     void gatherHeadsFromChannelsAsync(const float* src, float* dst,
                                       std::size_t T, std::size_t offset,
                                       std::size_t srcHeads, std::size_t dstHeads,

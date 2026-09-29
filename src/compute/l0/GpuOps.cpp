@@ -1125,11 +1125,12 @@ void GpuOps::deltanetGateAsync(const float* alpha,
     _queue.appendLaunch(k, groupsForN(total, kElementwiseLocalSize), 1, 1);
 }
 
-void GpuOps::sigmoidInPlaceAsync(float* y, std::size_t n) {
+void GpuOps::sigmoidInPlaceAsync(std::span<float> y) {
+    const std::size_t n = y.size();
     if (n == 0) {
         return;
     }
-    _pimpl->_sigmoidInplaceKernel.setPtr(0, y);
+    _pimpl->_sigmoidInplaceKernel.setPtr(0, y.data());
     _pimpl->_sigmoidInplaceKernel.setValue<std::int32_t>(
         1, toInt32(n, "sigmoidInplace n"));
     _pimpl->_sigmoidInplaceKernel.setGroupSize(kElementwiseLocalSize, 1, 1);

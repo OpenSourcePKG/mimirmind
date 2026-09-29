@@ -271,7 +271,7 @@ public:
                            std::size_t  T,
                            std::size_t  H) override;
 
-    void sigmoidInPlaceAsync(float* y, std::size_t n) override;
+    void sigmoidInPlaceAsync(std::span<float> y) override;
 
     void moeTopKRouteDeviceAsync(const float* logits,
                                  std::int32_t* outIdx,
