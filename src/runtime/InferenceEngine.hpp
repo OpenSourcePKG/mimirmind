@@ -954,6 +954,99 @@ private:
     void ensureCapacity(std::size_t maxT, std::size_t Tp, std::size_t maxNew,
                        std::size_t vocab_lm, std::size_t d_model);
 
+    // -- generate() decomposition (roadmap 8.30.11.1) ------------------
+    // generate() is split into an orchestrator plus cohesive phase helpers
+    // that keep full access to the engine internals. The structs carry the
+    // load-time-stable tensors/dims and the per-request host-scratch
+    // pointers between phases so each signature stays small. All moves are
+    // behaviour-neutral extract-method.
+
+    /// lm-head / embedding / final-norm tensors resolved once per call.
+    struct GenTensors {
+        const core::gguf::GgufTensor* tokEmb{nullptr};
+        const core::gguf::GgufTensor* outNorm{nullptr};
+        const core::gguf::GgufTensor* lmHead{nullptr};
+    };
+
+    /// Dimensions derived from the prompt + resolved tensors.
+    struct GenDims {
+        std::size_t Tp{0};        // prompt token count
+        std::size_t maxNew{0};    // params.maxNewTokens
+        std::size_t vocabLm{0};   // lm-head output width
+        std::size_t vocabEmb{0};  // embedding table width
+        std::size_t dModel{0};    // _config.embeddingLength
+    };
+
+    /// Per-request host-scratch pointers into the persistent USM buffers.
+    struct GenScratch {
+        float* xBuf{nullptr};
+        float* normFinal{nullptr};
+        float* logits{nullptr};
+        float* logitsSc{nullptr};
+    };
+
+    /// Bundle handed to runPrefill/runDecode so each phase signature stays
+    /// small while retaining member access for everything else.
+    struct GenContext {
+        GenTensors tensors;
+        GenDims    dims;
+        GenScratch scratch;
+        bool       embedScaleEnabled{false};
+        float      embedScale{1.0F};
+    };
+
+    /// M9.1 / 5.28.1.1 prefix-reuse decision for one prompt.
+    struct PrefixReusePlan {
+        std::size_t lcp{0};           // reusable leading tokens
+        bool        ssmReuse{false};  // recurrent-state checkpoint restored
+        std::size_t prefillStart{0};  // == lcp
+        std::size_t prefillCount{0};  // Tp - lcp
+    };
+
+    /// Decide how many leading prompt tokens can reuse the cached KV/SSM
+    /// state, truncate the cache to that point and (on SSM continuation)
+    /// restore the recurrent checkpoint. Behaviour-neutral extract of the
+    /// M9.1 prefix-cache block.
+    [[nodiscard]] PrefixReusePlan
+    planPrefixReuse(std::span<const std::int32_t> promptIds,
+                    std::size_t Tp, KvCache& cache);
+
+    /// Scale the token-embedding rows by sqrt(d_model) for the Gemma
+    /// family; no-op otherwise. `enabled`/`scale` are precomputed once per
+    /// call and carried in GenContext.
+    void applyEmbeddingScale(float* dst, std::size_t T,
+                             bool enabled, float scale) const;
+
+    /// Prefill phase: embedding lookup + per-block forward over the
+    /// [prefillStart, Tp) suffix, drain / double-buffer handling, timing
+    /// and KV commit. Sets `prefillAborted` when the client cancels
+    /// mid-prefill. Returns elapsed prefill milliseconds (computed even on
+    /// abort).
+    double runPrefill(const GenContext&               ctx,
+                      const PrefixReusePlan&          plan,
+                      std::span<const std::int32_t>   promptIds,
+                      KvCache&                        cache,
+                      BlockBuffers&                   buffers,
+                      const PrefillCallback&          onPrefillDone,
+                      const PrefillProgressCallback&  onPrefillProgress,
+                      bool&                           prefillAborted);
+
+    /// Decode phase: sampler seeding, first-token sample, the CLR /
+    /// CUDA-graph / immediate decode loop, per-token telemetry and the
+    /// perf-detector run-complete hook. Appends to `generated`, sets
+    /// `decMs` / `hitStop` / `aborted`.
+    void runDecode(const GenContext&              ctx,
+                   std::span<const std::int32_t>  promptIds,
+                   std::size_t                    prefillCount,
+                   const GenerateParams&          params,
+                   KvCache&                       cache,
+                   BlockBuffers&                  buffers,
+                   const TokenCallback&           onToken,
+                   std::vector<std::int32_t>&     generated,
+                   double&                        decMs,
+                   bool&                          hitStop,
+                   bool&                          aborted);
+
     /// Shared tail of loadModel / loadModelAttached. Runs after
     /// `_weights` is populated (standalone: from `_reader`; attached:
     /// from IPC-imported tensors). Builds FusedQkvWeights, autotunes,

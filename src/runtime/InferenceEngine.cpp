@@ -21,6 +21,7 @@
 #include "core/config/Config.hpp"
 #include "runtime/thermal/FanController.hpp"
 #include "runtime/Lcp.hpp"
+#include "runtime/RequestTelemetryScope.hpp"
 #include "core/log/Log.hpp"
 #include "runtime/thermal/GpuClockGovernor.hpp"
 #include "runtime/perf/PerfRegressionDetector.hpp"
@@ -1594,16 +1595,12 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
                           GenerateStats*                  outStats,
                           const PrefillCallback&          onPrefillDone,
                           const PrefillProgressCallback&  onPrefillProgress) {
-    namespace cmp = mimirmind::compute;
-    using clock = std::chrono::steady_clock;
-
     if (!_modelLoaded) {
         throw std::runtime_error("InferenceEngine::generate: no model loaded");
     }
     if (promptIds.empty()) {
         throw std::runtime_error("InferenceEngine::generate: empty prompt");
     }
-
     if (_backend == nullptr) {
         throw std::runtime_error(
             "generate: architecture '" + _config.architecture +
@@ -1613,808 +1610,97 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
             "list of supported architectures.");
     }
 
-    // M9.2 thermal admission. Throws ThermalLimitExceeded if any hard
-    // limit in the configured profile is currently breached; ApiServer
-    // turns that into HTTP 503 + Retry-After. Skips silently when no
-    // guard is installed (op chose to run unprotected).
-    if (_thermalGuard != nullptr) {
-        _thermalGuard->checkAdmission();
+    // Per-request environmental telemetry. Construction runs M9.2 thermal
+    // admission (throws ThermalLimitExceeded here → ApiServer turns that
+    // into HTTP 503 + Retry-After, before any side effect), then the
+    // M9.11.b proactive fan boost and the RAPL start snapshot. RAII: the
+    // fan is released back to auto on every exit, including exceptions.
+    RequestTelemetryScope telemetry{_thermalGuard, _fanController, _powerMonitor};
+
+    // -- Resolve tensors + dimensions (once per call) --------------------
+    GenContext  ctx{};
+    GenTensors& tensors = ctx.tensors;
+    tensors.tokEmb = _weights->find("token_embd.weight");
+    if (tensors.tokEmb == nullptr) {
+        tensors.tokEmb = _weights->find("tok_embeddings.weight");
+    }
+    tensors.outNorm = _weights->find("output_norm.weight");
+    tensors.lmHead  = _weights->find("output.weight");
+    if (tensors.lmHead == nullptr) {
+        tensors.lmHead = _weights->find("token_embd.weight");
     }
 
-    // M9.11.b proactive fan boost. Ramp the chassis fan up before
-    // prefill so the GPU clock governor has thermal headroom when
-    // matmul starts pulling watts. RAII guard so an exception during
-    // prefill/decode still releases the fan back to auto — leaving the
-    // fan pinned at 100 % across an entire idle period would be loud
-    // and would burn power.
-    struct FanBoostGuard {
-        FanController* fc;
-        explicit FanBoostGuard(FanController* c) : fc{c} {
-            if (fc != nullptr && fc->available()) {
-                (void)fc->boost();
-            }
-        }
-        ~FanBoostGuard() {
-            if (fc != nullptr && fc->available()) {
-                fc->releaseToAuto();
-            }
-        }
-        FanBoostGuard(const FanBoostGuard&)            = delete;
-        FanBoostGuard& operator=(const FanBoostGuard&) = delete;
-    };
-    FanBoostGuard fanBoost{_fanController};
-
-    // Snapshot RAPL counters at the start so generate() can report how
-    // much energy the request consumed. No-op when the monitor is
-    // unavailable or absent.
-    PowerMonitor::Snapshot powerStart{};
-    if (_powerMonitor != nullptr && _powerMonitor->available()) {
-        powerStart = _powerMonitor->snapshot();
-    }
-
-    const auto* tokEmb = _weights->find("token_embd.weight");
-    if (tokEmb == nullptr) {
-        tokEmb = _weights->find("tok_embeddings.weight");
-    }
-    const auto* outNorm = _weights->find("output_norm.weight");
-    const auto* lmHead  = _weights->find("output.weight");
-    if (lmHead == nullptr) {
-        lmHead = _weights->find("token_embd.weight");
-    }
-
-    if (tokEmb == nullptr) {
+    if (tensors.tokEmb == nullptr) {
         throw std::runtime_error("generate: token embedding tensor missing");
     }
-    if (outNorm == nullptr ||
-        outNorm->type != core::gguf::GgmlType::F32) {
+    if (tensors.outNorm == nullptr ||
+        tensors.outNorm->type != core::gguf::GgmlType::F32) {
         throw std::runtime_error(
             "generate: output_norm.weight missing or not F32");
     }
-    if (lmHead == nullptr) {
+    if (tensors.lmHead == nullptr) {
         throw std::runtime_error("generate: lm_head tensor missing");
     }
 
-    const std::size_t Tp        = promptIds.size();
-    const std::size_t maxNew    = params.maxNewTokens;
-    const std::size_t vocab_lm  = lmHead->dimensions.size() >= 2
-                                    ? lmHead->dimensions[1]
-                                    : _tokenizer.vocabSize();
-    const std::size_t vocab_emb = tokEmb->dimensions.size() >= 2
-                                    ? tokEmb->dimensions[1]
-                                    : _tokenizer.vocabSize();
-    const std::size_t maxT      = std::max<std::size_t>(Tp, 1);
-    const std::size_t d_model   = _config.embeddingLength;
+    GenDims& dims = ctx.dims;
+    dims.Tp       = promptIds.size();
+    dims.maxNew   = params.maxNewTokens;
+    dims.vocabLm  = tensors.lmHead->dimensions.size() >= 2
+                        ? tensors.lmHead->dimensions[1]
+                        : _tokenizer.vocabSize();
+    dims.vocabEmb = tensors.tokEmb->dimensions.size() >= 2
+                        ? tensors.tokEmb->dimensions[1]
+                        : _tokenizer.vocabSize();
+    dims.dModel   = _config.embeddingLength;
+    const std::size_t maxT = std::max<std::size_t>(dims.Tp, 1);
 
-    ensureCapacity(maxT, Tp, maxNew, vocab_lm, d_model);
+    ensureCapacity(maxT, dims.Tp, dims.maxNew, dims.vocabLm, dims.dModel);
     BlockBuffers& buffers = *_blockBuffers;
 
-    float* const xBuf      = _xBufH     .as<float>();
-    float* const normFinal = _normFinalH.as<float>();
-    float* const logits    = _logitsH   .as<float>();
-    float* const logitsSc  = _logitsScH .as<float>();
+    ctx.scratch.xBuf      = _xBufH     .as<float>();
+    ctx.scratch.normFinal = _normFinalH.as<float>();
+    ctx.scratch.logits    = _logitsH   .as<float>();
+    ctx.scratch.logitsSc  = _logitsScH .as<float>();
 
-    // --- Multi-entry prefix cache --------------------------------------
-    // Before the LCP reuse below, swap in the backup slot whose cached
-    // tokens share the longest prefix with this prompt (O(1) pointer swap,
-    // no KV copy). No-op unless MIMIRMIND_PREFIX_CACHE_SLOTS > 1. This lets
-    // interleaved conversations each hit their own warm prefix instead of
-    // the single-slot active cache being evicted by any foreign request.
-    selectPrefixSlot(promptIds);
-    KvCache& cache = *_kvCache;   // bind AFTER the swap — _kvCache may change
-
-    // --- M9.1 prefix cache ----------------------------------------------
-    //
-    // _cachedTokens holds the ids whose K/V state is currently sitting in
-    // `cache` from a previous generate() call. Compute how many leading
-    // tokens of the new prompt match — those tokens can re-use the
-    // existing KV rows.
-    //
-    // Clamp to Tp - 1: even on a perfect prefix match we still need to
-    // re-run prefill for the final prompt token, because sampleNext()
-    // reads its hidden state directly from xBuf (the cache only stores
-    // K/V, not the hidden state that feeds the lm-head).
-    // Backends with a recurrent SSM/GatedDeltaNet state normally cannot
-    // prefix-reuse: the linear layers hold a running recurrence whose value at
-    // position `lcp` depends on every token in [0, lcp), and that state lives
-    // outside the KV cache. The per-block seq-start zero fires on
-    // `cache.length() == 0` (see Qwen3_5MoeBackend::runLinearBlock) — a
-    // non-zero prefix leaves the KV length at `lcp`, so the SSM state is never
-    // zeroed and would carry over from the previous request, degrading
-    // generation on every call after the first (the cross-request
-    // contamination that forced lcp=0). So the default remains lcp=0: a full
-    // prefill replays the recurrence from a zeroed state each request.
-    //
-    // 5.28.1.1: when the GDN prefix-cache checkpoint capability is on AND this
-    // request is a PURE CONTINUATION of the cached sequence (the new prompt
-    // extends the entire cached prefix), restore the end-of-prefill SSM
-    // snapshot instead and reuse the prefix. Reuse is bit-exact for the
-    // recurrence (roadmap 5.28.1.0 gate) so there is no contamination. Any
-    // shorter match (branch / shared preamble only) still falls back to lcp=0;
-    // interior checkpoints that would lift that restriction are Inc 3.
-    bool        ssmReuse = false;
-    std::size_t lcp;
-    if (_backend->capabilities().needsSsmScratch) {
-        lcp = 0;
-        if (gdnPrefixCkptEnabled() && _ssmSnapValid && !_cachedTokens.empty()) {
-            const std::size_t match = longestCommonPrefix(
-                promptIds, std::span<const std::int32_t>{_cachedTokens});
-            // The single checkpoint sits at _cachedTokens.size()
-            // (== _ssmSnapTokens). Reuse only when the whole cached sequence is
-            // a prefix of this prompt (pure continuation) and at least one new
-            // token remains to prefill (so the last-token hidden state is still
-            // recomputed). Identical re-submissions (match == Tp) take the safe
-            // full-replay path — the checkpoint is one token past where a
-            // truncated re-prefill would need it.
-            if (match == _cachedTokens.size() && match == _ssmSnapTokens &&
-                match >= 1 && match < Tp) {
-                lcp      = match;
-                ssmReuse = true;
-            }
-        }
-    } else {
-        lcp = longestCommonPrefix(promptIds,
-                                  std::span<const std::int32_t>{_cachedTokens});
-        if (lcp >= Tp) {
-            lcp = Tp - 1;
-        }
-    }
-    cache.truncate(lcp);
-
-    // 5.28.1.1: restore the recurrent state to position `lcp` before prefill.
-    // runLinearBlock only zeroes the SSM state when cache.length()==0; here
-    // cache.length()==lcp!=0, so without this the linear layers would run on
-    // the previous request's leftover state. The restore lands the exact state
-    // after tokens [0,lcp) into the slab the backend reads (its pointers were
-    // bound in ensureCapacity), so prefill [lcp,Tp) continues the recurrence.
-    if (ssmReuse && _ssmState != nullptr) {
-        const std::size_t stBytes =
-            _ssmState->blockCount() * _ssmState->stateLayerStride() * sizeof(float);
-        const std::size_t cvBytes =
-            _ssmState->blockCount() * _ssmState->convStateLayerStride() * sizeof(float);
-        _ops->appendMemoryCopy(_ssmState->statePtr(),     _ssmSnapState.get(), stBytes);
-        _ops->appendMemoryCopy(_ssmState->convStatePtr(), _ssmSnapConv.get(),  cvBytes);
-    }
-    const std::size_t prefillStart = lcp;
-    const std::size_t prefillCount = Tp - lcp;
-
-    // Gemma family scales the token embedding by sqrt(d_model) before
-    // it enters the first block — the per-token vectors are otherwise
-    // in the ~0.05 range and attention/FFN expects them at unit-ish
-    // scale. Qwen/Llama don't do this. Backend tells us.
-    const bool  embedScaleEnabled = _backend->capabilities().scalesEmbedding;
-    const float embedScale = embedScaleEnabled
-        ? std::sqrt(static_cast<float>(d_model))
+    // Gemma family scales the token embedding by sqrt(d_model) before it
+    // enters the first block — the per-token vectors are otherwise in the
+    // ~0.05 range and attention/FFN expects them at unit-ish scale.
+    // Qwen/Llama don't do this. Backend tells us. Computed once here and
+    // carried in the context so prefill and decode share the same value.
+    ctx.embedScaleEnabled = _backend->capabilities().scalesEmbedding;
+    ctx.embedScale = ctx.embedScaleEnabled
+        ? std::sqrt(static_cast<float>(dims.dModel))
         : 1.0F;
-    auto scaleEmbeddingIfNeeded = [&](float* dst, std::size_t T) {
-        if (embedScaleEnabled && T > 0) {
-            _ops->mulScalarAsync(dst, embedScale, T * d_model);
-        }
-    };
 
-    // -- Prefill ---------------------------------------------------------
-    //
-    // Optional parity-test dump. `diagnostics.parityDump: "PREFIX"` in
-    // config.json makes the backend write PREFIX-blk{N}-<stage>.bin at
-    // multiple stages inside each block during prefill. Format matches
-    // llama-parity-dump.
-
-    if (!_cfg.diagnostics.parityDump.empty()) {
-        const std::string& dumpPrefix = _cfg.diagnostics.parityDump;
-        _backend->setParityDumpPrefix(dumpPrefix.c_str());
-        // Log the token sequence so the operator can hand the same tokens
-        // to llama-parity-dump and compare block-0 outputs.
-        std::string idsCsv;
-        const std::size_t nShow = std::min(promptIds.size(), std::size_t{48});
-        for (std::size_t i = 0; i < nShow; ++i) {
-            if (!idsCsv.empty()) idsCsv.push_back(',');
-            idsCsv += std::to_string(promptIds[i]);
-        }
-        MM_LOG_INFO("parity",
-                    "diagnostics.parityDump={} — prefill token count={}, "
-                    "first {}: [{}]",
-                    dumpPrefix, promptIds.size(), nShow, idsCsv);
-        // dumpStage() sync-flushes the GPU and writes T*d_model*4 bytes per
-        // stage. On a 42-block E4B with ~6 stages/block this scales to
-        // multi-GB per request; a 3431-token prefill has been observed to
-        // stall for >30 minutes with the flag left on in production.
-        if (prefillCount > 256) {
-            MM_LOG_WARN("parity",
-                        "diagnostics.parityDump is set with prefillCount={} — "
-                        "expect multi-GB synchronous disk writes and severely "
-                        "degraded prefill throughput. Clear the field for "
-                        "production traffic.",
-                        prefillCount);
-        }
-    }
+    // -- Prefix cache ----------------------------------------------------
+    // Swap in the backup slot whose cached tokens share the longest prefix
+    // with this prompt (O(1) pointer swap, no KV copy). No-op unless
+    // MIMIRMIND_PREFIX_CACHE_SLOTS > 1. Bind the cache AFTER the swap —
+    // _kvCache may change. planPrefixReuse() then decides the reusable
+    // prefix, truncates the cache and restores any SSM checkpoint.
+    selectPrefixSlot(promptIds);
+    KvCache&              cache = *_kvCache;
+    const PrefixReusePlan plan  = planPrefixReuse(promptIds, dims.Tp, cache);
 
     std::vector<std::int32_t> generated;
-    double                    preMs   = 0.0;
-    double                    decMs   = 0.0;
-    bool                      hitStop = false;
-    bool                      aborted         = false;
-    bool                      prefillAborted  = false;
+    double preMs          = 0.0;
+    double decMs          = 0.0;
+    bool   hitStop        = false;
+    bool   aborted        = false;
+    bool   prefillAborted = false;
 
     try {
-        const auto preT0 = clock::now();
-        const auto prefillIds = promptIds.subspan(prefillStart, prefillCount);
-        cmp::embeddingLookup(
-            tokEmb->type, tokEmb->usmPtr,
-            d_model, vocab_emb,
-            prefillIds, xBuf);
-        scaleEmbeddingIfNeeded(xBuf, prefillCount);
+        preMs = runPrefill(ctx, plan, promptIds, cache, buffers,
+                           onPrefillDone, onPrefillProgress, prefillAborted);
 
-        // Parity-dump the post-embed-scale hidden state so we can diff
-        // it against llama.cpp's `inp_scaled` tensor. Written as
-        // `<prefix>-blk0-input_scaled.bin` for parity-diff to pick up.
-        // No-op unless `diagnostics.parityDump` is non-empty.
-        if (!_cfg.diagnostics.parityDump.empty()) {
-            const std::string& dumpPrefix = _cfg.diagnostics.parityDump;
-            // scaleEmbeddingIfNeeded submitted `mulScalarAsync` — it's
-            // still queued on the GPU. Flush before the CPU reads xBuf,
-            // otherwise the dump captures the un-scaled embedding and
-            // parity-diff reports a spurious factor-of-sqrt(n_embd)
-            // divergence (RMSNorm inside block 0 cancels it so the
-            // rest of the pipeline still runs on the scaled value).
-            _ops->flush();
-            const std::string fname =
-                dumpPrefix + "-blk0-inp_scaled.bin";
-            std::ofstream f(fname, std::ios::binary);
-            if (f) {
-                const std::uint32_t hdr[3] = {
-                    0U,
-                    static_cast<std::uint32_t>(prefillCount),
-                    static_cast<std::uint32_t>(d_model),
-                };
-                f.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
-                f.write(reinterpret_cast<const char*>(xBuf),
-                        static_cast<std::streamsize>(prefillCount * d_model *
-                                                     sizeof(float)));
-            }
-        }
-
-        // Per-forward architecture hook. Non-E-series backends no-op;
-        // Gemma4E4BBackend dequantizes its PLE slices AND runs the
-        // per_layer_model_proj chain on the token embeddings before
-        // the block loop starts.
-        _backend->prepareForward(prefillIds, xBuf, prefillCount);
-
-        // L0 long-prefill wedge guard. runBlock() only submits async ops
-        // and never flushes, so a whole multi-block prefill otherwise
-        // piles into one immediate command list whose final
-        // zeCommandQueueSynchronize never returns above ~370-520 prompt
-        // tokens on Xe-LPG (100% CPU busy-poll — the L0-long-prefill-hang;
-        // reproduced at 519 tokens, hung >5 min). Draining the queue once
-        // per block bounds the in-flight command list and makes it
-        // complete — the same side effect that the per-op-category flush
-        // in OpProfiler (diagnostics.traceOpTimes=true) had, which is why
-        // tracing masked the hang.
-        //
-        // The drain is NOT free: it breaks the cross-block submission
-        // pipelining that keeps the Xe-LPG queue busy without host
-        // round-trips, so an always-on per-block flush drags a 149-token
-        // prefill from ~0.12 s to ~10 s (measured). We therefore gate it
-        // on prompt length: short prompts (the common interactive-chat
-        // case) keep the fast single-flush path with zero regression;
-        // only long prompts — which are exactly the ones that wedge, and
-        // were already multi-second on the pre-Bragi build — pay for
-        // safety. Prompts up to ~260 tokens completed unflushed in every
-        // test; the threshold sits below that. Reducing the large-prompt
-        // cost (chunked prefill / double-buffered command lists) is a
-        // follow-up. Decode is a single small block replayed via CLR
-        // (self-syncs), so it never reaches this loop.
-        constexpr std::size_t kPrefillDrainThreshold = 256;
-        const bool drainPerBlock = prefillCount > kPrefillDrainThreshold;
-
-        // M8.L (4.5.5): opt-in double-buffered chunked prefill on L0. Instead
-        // of the per-block full-queue flush() (a mid-workload
-        // zeCommandQueueSynchronize — pathologically slow on Xe-LPG, a single
-        // mid-workload flush measured ~6.5 s), each block ends
-        // with a checkpoint() that submits the built list async and waits only
-        // on the OTHER list's own event — bounding in-flight work to two lists
-        // without the host-spin. Env-gated (default OFF = the safe ace27e8
-        // per-block drain, zero regression) until bit-parity + the on-NUC T_k
-        // sweep validate it. Relies on runBlock() not doing host readbacks
-        // mid-prefill — which it does not (that un-synced accumulation is
-        // exactly what makes the wedge); the bit-parity gate catches any model
-        // that would violate it.
-        static const bool kPrefillDbuf =
-            std::getenv("MIMIRMIND_L0_PREFILL_DBUF") != nullptr;
-        const bool useDbuf = drainPerBlock && kPrefillDbuf
-                          && _ops->supportsDoubleBufferedPrefill();
-        if (useDbuf) {
-            _ops->flush();                     // land prepareForward's pending work
-            _ops->beginDoubleBufferedPrefill();
-        }
-
-        for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
-            _backend->runBlock(b, xBuf, prefillCount, cache, buffers,
-                               _traceBlock0);
-            if (useDbuf) {
-                _ops->checkpointPrefill();     // async submit + bounded 2-in-flight
-            } else if (drainPerBlock) {
-                _ops->flush();
-            }
-            if (onPrefillProgress) {
-                const auto now = clock::now();
-                const double elapsedMs =
-                    std::chrono::duration<double, std::milli>(now - preT0)
-                        .count();
-                const bool keepGoing = onPrefillProgress(PrefillProgress{
-                    static_cast<std::size_t>(b) + 1,
-                    static_cast<std::size_t>(_config.blockCount),
-                    elapsedMs,
-                });
-                if (!keepGoing) {
-                    // M7g client-cancel during prefill. Break at the next
-                    // block barrier — the currently-executing block has
-                    // already finished by the time we're here.
-                    prefillAborted = true;
-                    aborted        = true;
-                    break;
-                }
-            }
-        }
-
-        // M8.L: drain + disarm the double buffer once (both normal exit and
-        // the client-cancel break above) so the immediate list is idle again
-        // before the timing read, KV commit and the decode loop.
-        if (useDbuf) {
-            _ops->endDoubleBufferedPrefill();
-        }
-
-        // Compute the elapsed prefill time regardless of abort so the
-        // operator can see how far the client got in outStats + logs.
-        const auto preT1 = clock::now();
-        preMs =
-            std::chrono::duration<double, std::milli>(preT1 - preT0).count();
-
-        if (prefillAborted) {
-            // Partial KV writes are invalid without a matching commit.
-            // Wiping keeps the next request honest and avoids any bogus
-            // prefix-cache hits on the aborted prompt.
-            resetCache();
-        } else {
-            cache.commit(prefillCount);
-            if (onPrefillDone) {
-                onPrefillDone(PrefillDone{Tp, prefillCount, preMs});
-            }
-        }
-
-        _traceBlock0 = false;  // diagnostic done; mute for further calls
-
-        // The rest of the try body — sampler seeding, first sample, decode
-        // loop, per-token telemetry, perf-detector run-complete — is decode
-        // work that a client cancelling during prefill has explicitly asked
-        // us not to do (M7g). Wrap it in a single conditional so control
-        // flow stays linear.
+        // The decode work — sampler seeding, first sample, the decode loop,
+        // per-token telemetry, perf-detector run-complete — is work that a
+        // client cancelling during prefill has explicitly asked us not to
+        // do (M7g). Skip the whole phase on a prefill abort.
         if (!prefillAborted) {
-        // Reseed the sampler per generate() call so deterministic seeds
-        // produce reproducible streams. seed == 0 ⇒ random_device.
-        _sampler.reseed(params.sampling.seed);
-
-        auto isStop = [&](std::int32_t id) -> bool {
-            if (id == _tokenizer.eosId()) {
-                return true;
-            }
-            for (auto s : params.stopIds) {
-                if (id == s) {
-                    return true;
-                }
-            }
-            return false;
-        };
-
-        // Sample first new token from the last prefill row. xBuf only
-        // holds the freshly-prefilled suffix, so the last row sits at
-        // (prefillCount - 1) * d_model — not (Tp - 1).
-        //
-        // M7f: seed the penalty window with the last stretch of the
-        // prompt so an immediate first-token repeat (e.g. echoing the
-        // prompt's last phrase) is discouraged as well. Sampler
-        // subspans to `sampling.penaltyWindow` internally.
-        // 5.27 I-3: collapse the Hyper-Connections streams into xBuf (replaces
-        // the plain output_norm) so the last row is the lm_head input.
-        const bool useHc = _backend->capabilities().usesHyperConnections;
-        if (useHc) {
-            _backend->collapseHyperStreams(prefillCount, buffers, xBuf);
+            runDecode(ctx, promptIds, plan.prefillCount, params, cache,
+                      buffers, onToken, generated, decMs, hitStop, aborted);
         }
-        const float* lastRow = xBuf + (prefillCount - 1) * d_model;
-        std::int32_t nextId = sampleNext(lastRow, vocab_lm,
-                                         *outNorm, *lmHead,
-                                         normFinal, logits, logitsSc,
-                                         promptIds,
-                                         params.sampling,
-                                         /*skipFinalNorm=*/useHc);
-
-        generated.reserve(maxNew);
-        generated.push_back(nextId);
-
-        if (onToken && !onToken(nextId)) {
-            aborted = true;
-        }
-
-        // -- Decode loop -------------------------------------------------
-
-        const auto decT0 = clock::now();
-
-        // M-CLR.4: opt-in Command-List-Replay for the decode block loop.
-        // Step 1 stays immediate (warms the KV cache with the first
-        // sampled token). Step 2 records the block loop into a
-        // persistent command list and executes it via replay. Steps 3+
-        // update the shared USM curLen slot and re-execute the same
-        // recorded list — no per-token appendLaunch, no per-token
-        // barrier setup, no per-kernel arg binding.
-        const bool clrEnvOn = _cfg.features.clr;
-        // MoE models were historically NOT CLR-safe: the host top-K path
-        // in `Gemma4MoeBackend::runBlock` (`cmp::moeTopKRoute` reading the
-        // router matmul output on the CPU) plus per-expert matmul dispatches
-        // that captured a fixed expert weight pointer via setPtr at record
-        // time meant steps 3+ replayed step-2's stale expert selection —
-        // repetition loop, noise tokens. Confirmed on L0_TARGET_HOST with
-        // Gemma 4 26B-A4B-it-Q6_K under both KvDtype::F32 and KvDtype::Q8_0.
-        //
-        // M-CLR.MoE Increment 2 removed that breach: with device expert
-        // dispatch (MIMIRMIND_MOE_DEVICE_TOPK) the router pick is read on
-        // the GPU (device top-K → device gate_up → fused-K down) and no host
-        // op touches the routing, so the block records cleanly and each
-        // replay re-derives the routing from the current hidden state. The
-        // router matmul being synchronous is NOT a breach: flush() is a
-        // no-op while recording (it early-returns on !_hasPending, which
-        // appendLaunch never sets during a record). The lift is gated per
-        // backend by `capabilities().moeDecodeClrSafe` below; a MoE model without device
-        // dispatch still runs immediate-mode decode.
-        // Schicht 5.5 — CLR record/replay lives on the L0 CommandQueue.
-        // HIP has no equivalent (hipGraph would be the door, but not
-        // wired). Adding the kind-gate here disables every downstream
-        // `l0Ops().queue()` / `curLenSlot()` call in the decode path
-        // via the existing `if (clrEnabled)` blocks — one flag, all
-        // sites covered.
-        // M-CLR.MoE Increment 3: an MoE backend running fully device-side
-        // expert dispatch (Increment 2) has no host routing read in the
-        // decode block, so the stale-expert breach above no longer applies
-        // and CLR may capture the block. Gated behind the backend's own
-        // capabilities().moeDecodeClrSafe so a host-routing fallback path can never be
-        // recorded.
-        const bool moeClrSafe =
-            _config.expertCount > 0 && _backend->capabilities().moeDecodeClrSafe;
-        // Dense decode is CLR-safe only when the backend writes K/V through
-        // a replay-stable destination. A backend that falls onto the
-        // unfused-QKV path (mixed-quant QKV that FusedQkvWeights refuses to
-        // fuse — e.g. Qwen2.5 Q4_K_M with attn_v=Q6_K != attn_q/k=Q4_K)
-        // bakes a per-token K/V slot pointer into the recording; replayed
-        // steps clobber that stale slot, stalling the KV cache and
-        // degenerating output after the first (recorded) step. Gate on the
-        // backend's own report so such models drop to immediate-mode decode.
-        const bool qkvClrSafe = _backend->capabilities().decodeQkvClrSafe;
-        const bool clrEnabled =
-            clrEnvOn &&
-            (_config.expertCount == 0 || moeClrSafe) &&
-            qkvClrSafe &&
-            (_computeCtx->kind() == core::backend::BackendKind::LevelZero);
-        if (clrEnvOn && _config.expertCount == 0 && !qkvClrSafe) {
-            MM_LOG_WARN("engine",
-                        "features.clr=true requested but disabled — this "
-                        "model's QKV is not fully fused, so decode uses the "
-                        "unfused K/V path that bakes a per-token cache slot "
-                        "into the CLR recording; replaying it would clobber "
-                        "the stale slot and corrupt generation. Immediate-"
-                        "mode decode used instead (see "
-                        "ArchBackend::decodeQkvClrSafe).");
-        }
-        if (clrEnvOn && _config.expertCount > 0 && !moeClrSafe) {
-            MM_LOG_WARN("engine",
-                        "features.clr=true requested but disabled "
-                        "for this MoE model (expertCount={}) — CLR replay "
-                        "of the MoE decode block is not yet verified "
-                        "(see Gemma4MoeBackend::moeDecodeClrSafe). "
-                        "Immediate-mode decode used instead.",
-                        _config.expertCount);
-        } else if (clrEnvOn && moeClrSafe) {
-            MM_LOG_INFO("engine",
-                        "features.clr=true — MoE decode is CLR-safe via "
-                        "device expert dispatch (expertCount={}); "
-                        "record/replay enabled",
-                        _config.expertCount);
-        }
-#ifdef MIMIRMIND_HAVE_L0
-        if (clrEnabled) {
-            MM_LOG_INFO("engine",
-                        "features.clr=true — decode uses record/replay "
-                        "from step 2 on");
-            l0Ops().queue().resetRecording();
-            // Right-size the FlashAttention partial launch geometry to
-            // what THIS generate() call could possibly need. `kFlashMaxKTiles`
-            // is a coarse upper bound (32768 / 64 = 512 post-M9.8b) that
-            // wastes ~511/512 work-groups per attention call at typical
-            // chat context. Bound by prompt + max_new saves 30-90 ms/tok
-            // on short-context E4B.
-            const std::size_t maxCurLen =
-                promptIds.size() + params.maxNewTokens;
-            const std::size_t replayKTiles = std::min(
-                (maxCurLen + compute::l0::GpuOps::kFlashKTileSize - 1) /
-                    compute::l0::GpuOps::kFlashKTileSize,
-                compute::l0::GpuOps::kFlashMaxKTiles);
-            _ops->setReplayMaxKTiles(replayKTiles);
-            MM_LOG_INFO("engine",
-                        "features.clr right-sized flash launch "
-                        "geometry to {} k-tiles (max curLen {})",
-                        replayKTiles, maxCurLen);
-        } else {
-            _ops->setReplayMaxKTiles(0);
-        }
-#else
-        // No L0 compiled in — CLR is L0-native. Always immediate mode.
-        (void)clrEnabled;
-        _ops->setReplayMaxKTiles(0);
-#endif
-
-#ifdef MIMIRMIND_HAVE_CUDA
-        // M-Q3N.5 K4: CUDA-graph decode capture. Reset any graph from a prior
-        // generate() (a different length => a different capture), then arm on
-        // the CUDA backend when features.clr is on. MoE needs device-top-K
-        // (MIMIRMIND_MOE_DEVICE_TOPK) so the decode block is host-sync-free;
-        // if a residual sync remains, cudaStreamEndCapture throws and we fall
-        // back to immediate mode for the rest of the run.
-        _cudaDecodeGraph    = core::cuda::CudaGraph{};
-        _cudaGraphDisabled  = false;
-        // Opt-in via MIMIRMIND_CUDA_GRAPH (NOT features.clr) — experimental,
-        // off by default until the decode-replay path is bit-identical to
-        // immediate mode (a divergence remains under investigation).
-        const bool cudaGraphEnabled =
-            std::getenv("MIMIRMIND_CUDA_GRAPH") != nullptr &&
-            _computeCtx->kind() == core::backend::BackendKind::Cuda;
-        if (cudaGraphEnabled) {
-            const std::size_t maxCurLen =
-                promptIds.size() + params.maxNewTokens;
-            const std::size_t replayKTiles = std::min(
-                (maxCurLen + compute::cuda::GpuOps::kFlashKTileSize - 1) /
-                    compute::cuda::GpuOps::kFlashKTileSize,
-                compute::cuda::GpuOps::kFlashMaxKTiles);
-            cudaOps().setReplayMaxKTiles(replayKTiles);
-            MM_LOG_INFO("engine",
-                        "features.clr on CUDA — decode-graph capture armed, "
-                        "flash geometry right-sized to {} k-tiles "
-                        "(max curLen {})",
-                        replayKTiles, maxCurLen);
-        }
-#endif
-
-        // Inter-token thermal pacing — consult guard every kPaceWindow
-        // tokens so /sys reads don't dominate the inner loop. Window of
-        // 4 keeps overhead under a millisecond per token at ~145 ms/tok
-        // decode while still reacting to a fast temperature climb
-        // within ~500 ms.
-        constexpr std::size_t kPaceWindow = 4;
-        // The GPU clock governor adjusts the iGPU max-freq cap; this
-        // happens at a slower cadence than the per-token pacing
-        // because a fresh sysfs write costs ~200 µs and reaches the
-        // hardware on the next dispatch. 8 tokens at ~145 ms each is
-        // ~1.2 s between adjustments — well within the package
-        // thermal time constant.
-        constexpr std::size_t kGovernorWindow = 8;
-
-        for (std::size_t step = 1;
-             !aborted && step < maxNew && cache.length() < _maxContextTokens;
-             ++step)
-        {
-            if (isStop(nextId)) {
-                hitStop = true;
-                break;
-            }
-
-            if (_thermalGuard != nullptr && (step % kPaceWindow) == 0) {
-                const auto pause = _thermalGuard->paceForCurrentReading();
-                if (pause.count() > 0) {
-                    std::this_thread::sleep_for(pause);
-                }
-            }
-
-            if (_gpuGovernor != nullptr && !_gpuGovernor->pinned()
-                && _governorMonitor != nullptr
-                && (step % kGovernorWindow) == 0) {
-                (void)_gpuGovernor->tick(*_governorMonitor);
-            }
-
-            const auto tokT0 = clock::now();
-
-            std::array<std::int32_t, 1> oneId{nextId};
-            cmp::embeddingLookup(
-                tokEmb->type, tokEmb->usmPtr,
-                d_model, vocab_emb,
-                oneId, xBuf);
-            scaleEmbeddingIfNeeded(xBuf, 1);
-
-            _backend->prepareForward(
-                std::span<const std::int32_t>{oneId}, xBuf, 1);
-
-            // M-CLR.4: three modes for the block loop:
-            //   step == 1                 → immediate (warm)
-            //   step == 2 && clrEnabled   → record + replay-once
-            //   step >  2 && recording    → update curLen slot + replay
-            //
-            // CLR is L0-native (record/replay live on the L0 CommandQueue).
-            // HIP-only or CPU-only builds compile only the immediate path;
-            // `clrEnabled` is forced to false above under the same guard.
-#ifdef MIMIRMIND_HAVE_L0
-            if (clrEnabled && l0Ops().queue().hasRecording()) {
-                // Replay-only path. `scaleEmbeddingIfNeeded` above queued a
-                // `mulScalarAsync` (embedding scale) into the IMMEDIATE list;
-                // the recorded block loop reads xBuf, so that scale must
-                // execute before replay() or block 0 reads the unscaled
-                // embedding and the whole step diverges. The step-1 record
-                // path below flushes for the same reason — E4B masks it via
-                // a flush inside prepareForward, but MoE / Dense have a
-                // no-op prepareForward and need this explicit drain. (Bug:
-                // MoE decode replay produced token noise from step 2 without
-                // this — M-CLR.MoE Increment 3 root cause.)
-                _ops->flush();
-                // Update the shared USM slot so every recorded rope /
-                // attention / qkv_split / rmsnorm_qkv kernel sees the
-                // current KV-cache length.
-                *l0Ops().curLenSlot() =
-                    static_cast<std::int32_t>(cache.length());
-                l0Ops().queue().replay();
-            } else if (clrEnabled && step == 1) {
-                // Step 1 records into the persistent list AND executes it
-                // via a first replay(). Subsequent steps reuse the
-                // recording without re-dispatching.
-                //
-                // `scaleEmbeddingIfNeeded` above dispatches `mulScalarAsync`
-                // into the immediate list whenever the backend scales its
-                // embeddings (all Gemma-4 variants do). `beginRecord()`
-                // requires the immediate list to be idle — the E4B backend
-                // used to mask this by flushing internally inside its
-                // `prepareForward`, but MoE / Dense have a no-op default
-                // and would trip the "immediate work is pending" throw.
-                // Flush the immediate list explicitly so the invariant
-                // holds independently of the backend.
-                _ops->flush();
-                l0Ops().queue().beginRecord();
-                for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
-                    _backend->runBlock(b, xBuf, 1, cache, buffers, false);
-                }
-                l0Ops().queue().endRecord();
-                l0Ops().queue().replay();
-            } else
-#endif
-#ifdef MIMIRMIND_HAVE_CUDA
-            if (cudaGraphEnabled && _cudaDecodeGraph.valid()) {
-                // Replay: update the curLen slot outside the graph (stream-
-                // ordered before the launch), replay the captured prefix, then
-                // run the final (non-capturable) block immediately.
-                cudaOps().updateDecodeCurLen(
-                    static_cast<std::int32_t>(cache.length()));
-                _cudaDecodeGraph.launch(cudaOps().stream());
-                _backend->runBlock(_config.blockCount - 1, xBuf, 1, cache,
-                                   buffers, false);
-            } else if (cudaGraphEnabled && step == 2) {
-                // Warmup-before-capture (vLLM's dummy-run pattern): step 1 runs
-                // the first decode-shaped forward in IMMEDIATE mode (the else
-                // branch below), so all lazy decode-shape work — cuBLAS(Lt)
-                // workspace + algo selection, dynamic-smem opt-in
-                // (cudaFuncSetAttribute), first-touch scratch allocs — happens
-                // BEFORE capture. Capturing at step 1 recorded those illegal ops
-                // and always failed at block 0 (GDN). Capture the warmed trunk at
-                // step 2. The engine now owns the curLen slot
-                // (per-kernel staging off) and pre-sets it; the embedding /
-                // scale enqueued above run before capture (drained by the
-                // sync), so only the block loop is captured.
-                cudaOps().setPerKernelCurLenStaging(false);
-                cudaOps().updateDecodeCurLen(
-                    static_cast<std::int32_t>(cache.length()));
-                cudaOps().stream().synchronize();
-                try {
-                    // Capture all but the final block. Qwen3-Next-style models
-                    // have a heterogeneous last trunk layer (gate/up quant with
-                    // no fused-K kernel => host top-K => a mid-record sync that
-                    // cannot be captured); it runs immediately after the graph.
-                    // If an EARLIER block is also non-capturable the capture
-                    // throws and we fall back to full immediate mode below.
-                    const std::uint32_t nCap =
-                        _config.blockCount > 0 ? _config.blockCount - 1 : 0;
-                    _cudaDecodeGraph.capture(cudaOps().stream(), [&] {
-                        for (std::uint32_t b = 0; b < nCap; ++b) {
-                            _backend->runBlock(b, xBuf, 1, cache, buffers, false);
-                        }
-                    });
-                    _cudaDecodeGraph.launch(cudaOps().stream());
-                    _backend->runBlock(_config.blockCount - 1, xBuf, 1, cache,
-                                       buffers, false);
-                } catch (const std::exception& e) {
-                    // Residual host sync mid-record (e.g. device-top-K off) —
-                    // fall back to immediate mode for the rest of the run.
-                    MM_LOG_WARN("engine",
-                                "CUDA-graph decode capture failed ({}); "
-                                "falling back to immediate mode", e.what());
-                    _cudaGraphDisabled = true;
-                    cudaOps().setPerKernelCurLenStaging(true);
-                    for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
-                        _backend->runBlock(b, xBuf, 1, cache, buffers, false);
-                    }
-                }
-            } else
-#endif
-            {
-                for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
-                    _backend->runBlock(b, xBuf, 1, cache, buffers, false);
-                }
-            }
-            cache.commit(1);
-
-            // 5.27 I-3: collapse the HC streams for this decode step (replaces
-            // output_norm) into xBuf before lm_head.
-            if (useHc) {
-                _backend->collapseHyperStreams(1, buffers, xBuf);
-            }
-            nextId = sampleNext(xBuf, vocab_lm,
-                                *outNorm, *lmHead,
-                                normFinal, logits, logitsSc,
-                                std::span<const std::int32_t>{generated},
-                                params.sampling,
-                                /*skipFinalNorm=*/useHc);
-            generated.push_back(nextId);
-
-            // Per-token telemetry. Both the env-controlled NDJSON sink
-            // and the in-process perf-regression detector (when set)
-            // consume the same three numbers (wall_ms, cap_mhz, pkg_c),
-            // so the sensor reads happen once.
-            // sampleNext sync-waits on the lmHead matmul so tokT1 is
-            // real wall-time including the whole layer chain.
-            if (_decodeTrace != nullptr || _perfDetector != nullptr) {
-                const auto tokT1 = clock::now();
-                const double tokMs = std::chrono::duration<double, std::milli>(
-                    tokT1 - tokT0).count();
-                std::uint32_t cap = 0;
-                double pkg = -1.0;
-                if (_gpuGovernor != nullptr) {
-                    cap = _gpuGovernor->currentCapMhz();
-                }
-                if (_governorMonitor != nullptr) {
-                    const auto r = _governorMonitor->read();
-                    if (r.package_temp_c.has_value()) {
-                        pkg = static_cast<double>(*r.package_temp_c);
-                    }
-                }
-                if (_decodeTrace != nullptr) {
-                    std::fprintf(_decodeTrace,
-                                 "{\"tok\":%zu,\"wall_ms\":%.3f,"
-                                 "\"cap_mhz\":%u,\"pkg_c\":%.1f}\n",
-                                 step, tokMs, cap, pkg);
-                }
-                if (_perfDetector != nullptr) {
-                    _perfDetector->onDecodeToken(
-                        PerfRegressionDetector::Sample{tokMs, cap, pkg});
-                }
-                // M8.K.0 diagnostic: emits a per-category share summary
-                // every 50 tokens when diagnostics.traceOpTimes=true.
-                // No-op otherwise. Only present on L0 today (see ctor).
-                if (_opProfiler) {
-                    _opProfiler->maybeDumpAndReset(step);
-                }
-            }
-
-            if (onToken && !onToken(nextId)) {
-                aborted = true;
-            }
-        }
-
-        if (_decodeTrace != nullptr) {
-            std::fflush(_decodeTrace);
-        }
-
-        const auto decT1 = clock::now();
-        decMs =
-            std::chrono::duration<double, std::milli>(decT1 - decT0).count();
-
-        // Detector consults the ring buffer once per run — computes p50,
-        // compares against the rolling baseline, alerts + persists.
-        // Never throws (noexcept), so it stays outside the try body's
-        // hot path but inside the outer generate() try where a failure
-        // is at worst logged.
-        if (_perfDetector != nullptr) {
-            _perfDetector->onRunComplete(generated.size());
-        }
-        } // if (!prefillAborted) — M7g decode-phase wrapper
     } catch (...) {
         // Mid-flight failure leaves the KV state partially written.
         // Discarding the cache is cheap and keeps the next call honest.
@@ -2422,7 +1708,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         throw;
     }
 
-    // -- Update the prefix cache so the next generate() can resume -----
+    // -- Update the prefix cache so the next generate() can resume -------
     //
     // Maintain the invariant `_cachedTokens.size() == cache.length()`.
     // cache.length() at this point is: prefillStart + prefillCount +
@@ -2435,9 +1721,9 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     // the next request see a bogus prefix-cache hit on a prompt whose
     // KV was never actually committed.
     if (!prefillAborted) {
-        const std::size_t finalLen   = cache.length();
-        const std::size_t genFromCache = (finalLen > Tp) ? (finalLen - Tp) : 0;
-        const std::size_t take       = std::min(genFromCache, generated.size());
+        const std::size_t finalLen     = cache.length();
+        const std::size_t genFromCache = (finalLen > dims.Tp) ? (finalLen - dims.Tp) : 0;
+        const std::size_t take         = std::min(genFromCache, generated.size());
 
         _cachedTokens.clear();
         _cachedTokens.reserve(finalLen);
@@ -2472,27 +1758,766 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     }
 
     if (outStats != nullptr) {
-        outStats->promptTokens    = Tp;
+        outStats->promptTokens    = dims.Tp;
         outStats->generatedTokens = generated.size();
-        outStats->cachedTokens    = lcp;
+        outStats->cachedTokens    = plan.lcp;
         outStats->prefillMs       = preMs;
         outStats->decodeMs        = decMs;
         outStats->hitStop         = hitStop;
 
-        if (_powerMonitor != nullptr && _powerMonitor->available() &&
-            !powerStart.raw_energy_uj.empty()) {
-            const auto powerEnd = _powerMonitor->snapshot();
-            const auto joules   = _powerMonitor->energyBetween(powerStart, powerEnd);
-            // The first discovered domain is the package socket (intel-rapl:0).
-            // Report that as the headline figure. Operators who want the
-            // per-sub-domain split can scrape /v1/system/status.
-            if (!joules.empty()) {
-                outStats->packageJoules = joules.front();
-            }
+        // The first discovered RAPL domain is the package socket
+        // (intel-rapl:0). Report that as the headline figure; operators
+        // who want the per-sub-domain split scrape /v1/system/status.
+        if (const auto joules = telemetry.packageJoules(); joules.has_value()) {
+            outStats->packageJoules = *joules;
         }
     }
 
     return generated;
+}
+
+InferenceEngine::PrefixReusePlan
+InferenceEngine::planPrefixReuse(std::span<const std::int32_t> promptIds,
+                                 std::size_t Tp, KvCache& cache) {
+    // -- M9.1 prefix cache -----------------------------------------------
+    //
+    // _cachedTokens holds the ids whose K/V state is currently sitting in
+    // `cache` from a previous generate() call. Compute how many leading
+    // tokens of the new prompt match — those tokens can re-use the
+    // existing KV rows.
+    //
+    // Clamp to Tp - 1: even on a perfect prefix match we still need to
+    // re-run prefill for the final prompt token, because sampleNext()
+    // reads its hidden state directly from xBuf (the cache only stores
+    // K/V, not the hidden state that feeds the lm-head).
+    // Backends with a recurrent SSM/GatedDeltaNet state normally cannot
+    // prefix-reuse: the linear layers hold a running recurrence whose value at
+    // position `lcp` depends on every token in [0, lcp), and that state lives
+    // outside the KV cache. The per-block seq-start zero fires on
+    // `cache.length() == 0` (see Qwen3_5MoeBackend::runLinearBlock) — a
+    // non-zero prefix leaves the KV length at `lcp`, so the SSM state is never
+    // zeroed and would carry over from the previous request, degrading
+    // generation on every call after the first (the cross-request
+    // contamination that forced lcp=0). So the default remains lcp=0: a full
+    // prefill replays the recurrence from a zeroed state each request.
+    //
+    // 5.28.1.1: when the GDN prefix-cache checkpoint capability is on AND this
+    // request is a PURE CONTINUATION of the cached sequence (the new prompt
+    // extends the entire cached prefix), restore the end-of-prefill SSM
+    // snapshot instead and reuse the prefix. Reuse is bit-exact for the
+    // recurrence (roadmap 5.28.1.0 gate) so there is no contamination. Any
+    // shorter match (branch / shared preamble only) still falls back to lcp=0;
+    // interior checkpoints that would lift that restriction are Inc 3.
+    PrefixReusePlan plan{};
+    if (_backend->capabilities().needsSsmScratch) {
+        plan.lcp = 0;
+        if (gdnPrefixCkptEnabled() && _ssmSnapValid && !_cachedTokens.empty()) {
+            const std::size_t match = longestCommonPrefix(
+                promptIds, std::span<const std::int32_t>{_cachedTokens});
+            // The single checkpoint sits at _cachedTokens.size()
+            // (== _ssmSnapTokens). Reuse only when the whole cached sequence is
+            // a prefix of this prompt (pure continuation) and at least one new
+            // token remains to prefill (so the last-token hidden state is still
+            // recomputed). Identical re-submissions (match == Tp) take the safe
+            // full-replay path — the checkpoint is one token past where a
+            // truncated re-prefill would need it.
+            if (match == _cachedTokens.size() && match == _ssmSnapTokens &&
+                match >= 1 && match < Tp) {
+                plan.lcp      = match;
+                plan.ssmReuse = true;
+            }
+        }
+    } else {
+        plan.lcp = longestCommonPrefix(
+            promptIds, std::span<const std::int32_t>{_cachedTokens});
+        if (plan.lcp >= Tp) {
+            plan.lcp = Tp - 1;
+        }
+    }
+    cache.truncate(plan.lcp);
+
+    // 5.28.1.1: restore the recurrent state to position `lcp` before prefill.
+    // runLinearBlock only zeroes the SSM state when cache.length()==0; here
+    // cache.length()==lcp!=0, so without this the linear layers would run on
+    // the previous request's leftover state. The restore lands the exact state
+    // after tokens [0,lcp) into the slab the backend reads (its pointers were
+    // bound in ensureCapacity), so prefill [lcp,Tp) continues the recurrence.
+    if (plan.ssmReuse && _ssmState != nullptr) {
+        const std::size_t stBytes =
+            _ssmState->blockCount() * _ssmState->stateLayerStride() * sizeof(float);
+        const std::size_t cvBytes =
+            _ssmState->blockCount() * _ssmState->convStateLayerStride() * sizeof(float);
+        _ops->appendMemoryCopy(_ssmState->statePtr(),     _ssmSnapState.get(), stBytes);
+        _ops->appendMemoryCopy(_ssmState->convStatePtr(), _ssmSnapConv.get(),  cvBytes);
+    }
+    plan.prefillStart = plan.lcp;
+    plan.prefillCount = Tp - plan.lcp;
+    return plan;
+}
+
+void InferenceEngine::applyEmbeddingScale(float* dst, std::size_t T,
+                                          bool enabled, float scale) const {
+    if (enabled && T > 0) {
+        _ops->mulScalarAsync(dst, scale, T * _config.embeddingLength);
+    }
+}
+
+double
+InferenceEngine::runPrefill(const GenContext&               ctx,
+                            const PrefixReusePlan&          plan,
+                            std::span<const std::int32_t>   promptIds,
+                            KvCache&                        cache,
+                            BlockBuffers&                   buffers,
+                            const PrefillCallback&          onPrefillDone,
+                            const PrefillProgressCallback&  onPrefillProgress,
+                            bool&                           prefillAborted) {
+    namespace cmp = mimirmind::compute;
+    using clock = std::chrono::steady_clock;
+
+    const GenTensors& tensors      = ctx.tensors;
+    const std::size_t Tp           = ctx.dims.Tp;
+    const std::size_t d_model      = ctx.dims.dModel;
+    const std::size_t vocab_emb    = ctx.dims.vocabEmb;
+    const std::size_t prefillStart = plan.prefillStart;
+    const std::size_t prefillCount = plan.prefillCount;
+    float* const      xBuf         = ctx.scratch.xBuf;
+
+    prefillAborted = false;
+
+    // -- Prefill ---------------------------------------------------------
+    //
+    // Optional parity-test dump. `diagnostics.parityDump: "PREFIX"` in
+    // config.json makes the backend write PREFIX-blk{N}-<stage>.bin at
+    // multiple stages inside each block during prefill. Format matches
+    // llama-parity-dump.
+    if (!_cfg.diagnostics.parityDump.empty()) {
+        const std::string& dumpPrefix = _cfg.diagnostics.parityDump;
+        _backend->setParityDumpPrefix(dumpPrefix.c_str());
+        // Log the token sequence so the operator can hand the same tokens
+        // to llama-parity-dump and compare block-0 outputs.
+        std::string idsCsv;
+        const std::size_t nShow = std::min(promptIds.size(), std::size_t{48});
+        for (std::size_t i = 0; i < nShow; ++i) {
+            if (!idsCsv.empty()) idsCsv.push_back(',');
+            idsCsv += std::to_string(promptIds[i]);
+        }
+        MM_LOG_INFO("parity",
+                    "diagnostics.parityDump={} — prefill token count={}, "
+                    "first {}: [{}]",
+                    dumpPrefix, promptIds.size(), nShow, idsCsv);
+        // dumpStage() sync-flushes the GPU and writes T*d_model*4 bytes per
+        // stage. On a 42-block E4B with ~6 stages/block this scales to
+        // multi-GB per request; a 3431-token prefill has been observed to
+        // stall for >30 minutes with the flag left on in production.
+        if (prefillCount > 256) {
+            MM_LOG_WARN("parity",
+                        "diagnostics.parityDump is set with prefillCount={} — "
+                        "expect multi-GB synchronous disk writes and severely "
+                        "degraded prefill throughput. Clear the field for "
+                        "production traffic.",
+                        prefillCount);
+        }
+    }
+
+    const auto preT0 = clock::now();
+    const auto prefillIds = promptIds.subspan(prefillStart, prefillCount);
+    cmp::embeddingLookup(
+        tensors.tokEmb->type, tensors.tokEmb->usmPtr,
+        d_model, vocab_emb,
+        prefillIds, xBuf);
+    applyEmbeddingScale(xBuf, prefillCount, ctx.embedScaleEnabled, ctx.embedScale);
+
+    // Parity-dump the post-embed-scale hidden state so we can diff
+    // it against llama.cpp's `inp_scaled` tensor. Written as
+    // `<prefix>-blk0-input_scaled.bin` for parity-diff to pick up.
+    // No-op unless `diagnostics.parityDump` is non-empty.
+    if (!_cfg.diagnostics.parityDump.empty()) {
+        const std::string& dumpPrefix = _cfg.diagnostics.parityDump;
+        // applyEmbeddingScale submitted `mulScalarAsync` — it's still
+        // queued on the GPU. Flush before the CPU reads xBuf, otherwise
+        // the dump captures the un-scaled embedding and parity-diff
+        // reports a spurious factor-of-sqrt(n_embd) divergence (RMSNorm
+        // inside block 0 cancels it so the rest of the pipeline still
+        // runs on the scaled value).
+        _ops->flush();
+        const std::string fname =
+            dumpPrefix + "-blk0-inp_scaled.bin";
+        std::ofstream f(fname, std::ios::binary);
+        if (f) {
+            const std::uint32_t hdr[3] = {
+                0U,
+                static_cast<std::uint32_t>(prefillCount),
+                static_cast<std::uint32_t>(d_model),
+            };
+            f.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+            f.write(reinterpret_cast<const char*>(xBuf),
+                    static_cast<std::streamsize>(prefillCount * d_model *
+                                                 sizeof(float)));
+        }
+    }
+
+    // Per-forward architecture hook. Non-E-series backends no-op;
+    // Gemma4E4BBackend dequantizes its PLE slices AND runs the
+    // per_layer_model_proj chain on the token embeddings before
+    // the block loop starts.
+    _backend->prepareForward(prefillIds, xBuf, prefillCount);
+
+    // L0 long-prefill wedge guard. runBlock() only submits async ops
+    // and never flushes, so a whole multi-block prefill otherwise
+    // piles into one immediate command list whose final
+    // zeCommandQueueSynchronize never returns above ~370-520 prompt
+    // tokens on Xe-LPG (100% CPU busy-poll — the L0-long-prefill-hang;
+    // reproduced at 519 tokens, hung >5 min). Draining the queue once
+    // per block bounds the in-flight command list and makes it
+    // complete — the same side effect that the per-op-category flush
+    // in OpProfiler (diagnostics.traceOpTimes=true) had, which is why
+    // tracing masked the hang.
+    //
+    // The drain is NOT free: it breaks the cross-block submission
+    // pipelining that keeps the Xe-LPG queue busy without host
+    // round-trips, so an always-on per-block flush drags a 149-token
+    // prefill from ~0.12 s to ~10 s (measured). We therefore gate it
+    // on prompt length: short prompts (the common interactive-chat
+    // case) keep the fast single-flush path with zero regression;
+    // only long prompts — which are exactly the ones that wedge, and
+    // were already multi-second on the pre-Bragi build — pay for
+    // safety. Prompts up to ~260 tokens completed unflushed in every
+    // test; the threshold sits below that. Reducing the large-prompt
+    // cost (chunked prefill / double-buffered command lists) is a
+    // follow-up. Decode is a single small block replayed via CLR
+    // (self-syncs), so it never reaches this loop.
+    constexpr std::size_t kPrefillDrainThreshold = 256;
+    const bool drainPerBlock = prefillCount > kPrefillDrainThreshold;
+
+    // M8.L (4.5.5): opt-in double-buffered chunked prefill on L0. Instead
+    // of the per-block full-queue flush() (a mid-workload
+    // zeCommandQueueSynchronize — pathologically slow on Xe-LPG, a single
+    // mid-workload flush measured ~6.5 s), each block ends
+    // with a checkpoint() that submits the built list async and waits only
+    // on the OTHER list's own event — bounding in-flight work to two lists
+    // without the host-spin. Env-gated (default OFF = the safe ace27e8
+    // per-block drain, zero regression) until bit-parity + the on-NUC T_k
+    // sweep validate it. Relies on runBlock() not doing host readbacks
+    // mid-prefill — which it does not (that un-synced accumulation is
+    // exactly what makes the wedge); the bit-parity gate catches any model
+    // that would violate it.
+    static const bool kPrefillDbuf =
+        std::getenv("MIMIRMIND_L0_PREFILL_DBUF") != nullptr;
+    const bool useDbuf = drainPerBlock && kPrefillDbuf
+                      && _ops->supportsDoubleBufferedPrefill();
+    if (useDbuf) {
+        _ops->flush();                     // land prepareForward's pending work
+        _ops->beginDoubleBufferedPrefill();
+    }
+
+    for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
+        _backend->runBlock(b, xBuf, prefillCount, cache, buffers,
+                           _traceBlock0);
+        if (useDbuf) {
+            _ops->checkpointPrefill();     // async submit + bounded 2-in-flight
+        } else if (drainPerBlock) {
+            _ops->flush();
+        }
+        if (onPrefillProgress) {
+            const auto now = clock::now();
+            const double elapsedMs =
+                std::chrono::duration<double, std::milli>(now - preT0)
+                    .count();
+            const bool keepGoing = onPrefillProgress(PrefillProgress{
+                static_cast<std::size_t>(b) + 1,
+                static_cast<std::size_t>(_config.blockCount),
+                elapsedMs,
+            });
+            if (!keepGoing) {
+                // M7g client-cancel during prefill. Break at the next
+                // block barrier — the currently-executing block has
+                // already finished by the time we're here.
+                prefillAborted = true;
+                break;
+            }
+        }
+    }
+
+    // M8.L: drain + disarm the double buffer once (both normal exit and
+    // the client-cancel break above) so the immediate list is idle again
+    // before the timing read, KV commit and the decode loop.
+    if (useDbuf) {
+        _ops->endDoubleBufferedPrefill();
+    }
+
+    // Compute the elapsed prefill time regardless of abort so the
+    // operator can see how far the client got in outStats + logs.
+    const auto preT1 = clock::now();
+    const double preMs =
+        std::chrono::duration<double, std::milli>(preT1 - preT0).count();
+
+    if (prefillAborted) {
+        // Partial KV writes are invalid without a matching commit.
+        // Wiping keeps the next request honest and avoids any bogus
+        // prefix-cache hits on the aborted prompt.
+        resetCache();
+    } else {
+        cache.commit(prefillCount);
+        if (onPrefillDone) {
+            onPrefillDone(PrefillDone{Tp, prefillCount, preMs});
+        }
+    }
+
+    _traceBlock0 = false;  // diagnostic done; mute for further calls
+    return preMs;
+}
+
+void
+InferenceEngine::runDecode(const GenContext&              ctx,
+                           std::span<const std::int32_t>  promptIds,
+                           std::size_t                    prefillCount,
+                           const GenerateParams&          params,
+                           KvCache&                       cache,
+                           BlockBuffers&                  buffers,
+                           const TokenCallback&           onToken,
+                           std::vector<std::int32_t>&     generated,
+                           double&                        decMs,
+                           bool&                          hitStop,
+                           bool&                          aborted) {
+    namespace cmp = mimirmind::compute;
+    using clock = std::chrono::steady_clock;
+
+    const GenTensors& tensors   = ctx.tensors;
+    const std::size_t vocab_lm  = ctx.dims.vocabLm;
+    const std::size_t vocab_emb = ctx.dims.vocabEmb;
+    const std::size_t d_model   = ctx.dims.dModel;
+    const std::size_t maxNew    = ctx.dims.maxNew;
+    float* const xBuf      = ctx.scratch.xBuf;
+    float* const normFinal = ctx.scratch.normFinal;
+    float* const logits    = ctx.scratch.logits;
+    float* const logitsSc  = ctx.scratch.logitsSc;
+
+    // Reseed the sampler per generate() call so deterministic seeds
+    // produce reproducible streams. seed == 0 ⇒ random_device.
+    _sampler.reseed(params.sampling.seed);
+
+    auto isStop = [&](std::int32_t id) -> bool {
+        if (id == _tokenizer.eosId()) {
+            return true;
+        }
+        for (auto s : params.stopIds) {
+            if (id == s) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Sample first new token from the last prefill row. xBuf only
+    // holds the freshly-prefilled suffix, so the last row sits at
+    // (prefillCount - 1) * d_model — not (Tp - 1).
+    //
+    // M7f: seed the penalty window with the last stretch of the
+    // prompt so an immediate first-token repeat (e.g. echoing the
+    // prompt's last phrase) is discouraged as well. Sampler
+    // subspans to `sampling.penaltyWindow` internally.
+    // 5.27 I-3: collapse the Hyper-Connections streams into xBuf (replaces
+    // the plain output_norm) so the last row is the lm_head input.
+    const bool useHc = _backend->capabilities().usesHyperConnections;
+    if (useHc) {
+        _backend->collapseHyperStreams(prefillCount, buffers, xBuf);
+    }
+    const float* lastRow = xBuf + (prefillCount - 1) * d_model;
+    std::int32_t nextId = sampleNext(lastRow, vocab_lm,
+                                     *tensors.outNorm, *tensors.lmHead,
+                                     normFinal, logits, logitsSc,
+                                     promptIds,
+                                     params.sampling,
+                                     /*skipFinalNorm=*/useHc);
+
+    generated.reserve(maxNew);
+    generated.push_back(nextId);
+
+    if (onToken && !onToken(nextId)) {
+        aborted = true;
+    }
+
+    // -- Decode loop -------------------------------------------------
+
+    const auto decT0 = clock::now();
+
+    // M-CLR.4: opt-in Command-List-Replay for the decode block loop.
+    // Step 1 stays immediate (warms the KV cache with the first
+    // sampled token). Step 2 records the block loop into a
+    // persistent command list and executes it via replay. Steps 3+
+    // update the shared USM curLen slot and re-execute the same
+    // recorded list — no per-token appendLaunch, no per-token
+    // barrier setup, no per-kernel arg binding.
+    const bool clrEnvOn = _cfg.features.clr;
+    // MoE models were historically NOT CLR-safe: the host top-K path
+    // in `Gemma4MoeBackend::runBlock` (`cmp::moeTopKRoute` reading the
+    // router matmul output on the CPU) plus per-expert matmul dispatches
+    // that captured a fixed expert weight pointer via setPtr at record
+    // time meant steps 3+ replayed step-2's stale expert selection —
+    // repetition loop, noise tokens. Confirmed on L0_TARGET_HOST with
+    // Gemma 4 26B-A4B-it-Q6_K under both KvDtype::F32 and KvDtype::Q8_0.
+    //
+    // M-CLR.MoE Increment 2 removed that breach: with device expert
+    // dispatch (MIMIRMIND_MOE_DEVICE_TOPK) the router pick is read on
+    // the GPU (device top-K → device gate_up → fused-K down) and no host
+    // op touches the routing, so the block records cleanly and each
+    // replay re-derives the routing from the current hidden state. The
+    // router matmul being synchronous is NOT a breach: flush() is a
+    // no-op while recording (it early-returns on !_hasPending, which
+    // appendLaunch never sets during a record). The lift is gated per
+    // backend by `capabilities().moeDecodeClrSafe` below; a MoE model without device
+    // dispatch still runs immediate-mode decode.
+    // Schicht 5.5 — CLR record/replay lives on the L0 CommandQueue.
+    // HIP has no equivalent (hipGraph would be the door, but not
+    // wired). Adding the kind-gate here disables every downstream
+    // `l0Ops().queue()` / `curLenSlot()` call in the decode path
+    // via the existing `if (clrEnabled)` blocks — one flag, all
+    // sites covered.
+    // M-CLR.MoE Increment 3: an MoE backend running fully device-side
+    // expert dispatch (Increment 2) has no host routing read in the
+    // decode block, so the stale-expert breach above no longer applies
+    // and CLR may capture the block. Gated behind the backend's own
+    // capabilities().moeDecodeClrSafe so a host-routing fallback path can never be
+    // recorded.
+    const bool moeClrSafe =
+        _config.expertCount > 0 && _backend->capabilities().moeDecodeClrSafe;
+    // Dense decode is CLR-safe only when the backend writes K/V through
+    // a replay-stable destination. A backend that falls onto the
+    // unfused-QKV path (mixed-quant QKV that FusedQkvWeights refuses to
+    // fuse — e.g. Qwen2.5 Q4_K_M with attn_v=Q6_K != attn_q/k=Q4_K)
+    // bakes a per-token K/V slot pointer into the recording; replayed
+    // steps clobber that stale slot, stalling the KV cache and
+    // degenerating output after the first (recorded) step. Gate on the
+    // backend's own report so such models drop to immediate-mode decode.
+    const bool qkvClrSafe = _backend->capabilities().decodeQkvClrSafe;
+    const bool clrEnabled =
+        clrEnvOn &&
+        (_config.expertCount == 0 || moeClrSafe) &&
+        qkvClrSafe &&
+        (_computeCtx->kind() == core::backend::BackendKind::LevelZero);
+    if (clrEnvOn && _config.expertCount == 0 && !qkvClrSafe) {
+        MM_LOG_WARN("engine",
+                    "features.clr=true requested but disabled — this "
+                    "model's QKV is not fully fused, so decode uses the "
+                    "unfused K/V path that bakes a per-token cache slot "
+                    "into the CLR recording; replaying it would clobber "
+                    "the stale slot and corrupt generation. Immediate-"
+                    "mode decode used instead (see "
+                    "ArchBackend::decodeQkvClrSafe).");
+    }
+    if (clrEnvOn && _config.expertCount > 0 && !moeClrSafe) {
+        MM_LOG_WARN("engine",
+                    "features.clr=true requested but disabled "
+                    "for this MoE model (expertCount={}) — CLR replay "
+                    "of the MoE decode block is not yet verified "
+                    "(see Gemma4MoeBackend::moeDecodeClrSafe). "
+                    "Immediate-mode decode used instead.",
+                    _config.expertCount);
+    } else if (clrEnvOn && moeClrSafe) {
+        MM_LOG_INFO("engine",
+                    "features.clr=true — MoE decode is CLR-safe via "
+                    "device expert dispatch (expertCount={}); "
+                    "record/replay enabled",
+                    _config.expertCount);
+    }
+#ifdef MIMIRMIND_HAVE_L0
+    if (clrEnabled) {
+        MM_LOG_INFO("engine",
+                    "features.clr=true — decode uses record/replay "
+                    "from step 2 on");
+        l0Ops().queue().resetRecording();
+        // Right-size the FlashAttention partial launch geometry to
+        // what THIS generate() call could possibly need. `kFlashMaxKTiles`
+        // is a coarse upper bound (32768 / 64 = 512 post-M9.8b) that
+        // wastes ~511/512 work-groups per attention call at typical
+        // chat context. Bound by prompt + max_new saves 30-90 ms/tok
+        // on short-context E4B.
+        const std::size_t maxCurLen =
+            promptIds.size() + params.maxNewTokens;
+        const std::size_t replayKTiles = std::min(
+            (maxCurLen + compute::l0::GpuOps::kFlashKTileSize - 1) /
+                compute::l0::GpuOps::kFlashKTileSize,
+            compute::l0::GpuOps::kFlashMaxKTiles);
+        _ops->setReplayMaxKTiles(replayKTiles);
+        MM_LOG_INFO("engine",
+                    "features.clr right-sized flash launch "
+                    "geometry to {} k-tiles (max curLen {})",
+                    replayKTiles, maxCurLen);
+    } else {
+        _ops->setReplayMaxKTiles(0);
+    }
+#else
+    // No L0 compiled in — CLR is L0-native. Always immediate mode.
+    (void)clrEnabled;
+    _ops->setReplayMaxKTiles(0);
+#endif
+
+#ifdef MIMIRMIND_HAVE_CUDA
+    // M-Q3N.5 K4: CUDA-graph decode capture. Reset any graph from a prior
+    // generate() (a different length => a different capture), then arm on
+    // the CUDA backend when features.clr is on. MoE needs device-top-K
+    // (MIMIRMIND_MOE_DEVICE_TOPK) so the decode block is host-sync-free;
+    // if a residual sync remains, cudaStreamEndCapture throws and we fall
+    // back to immediate mode for the rest of the run.
+    _cudaDecodeGraph    = core::cuda::CudaGraph{};
+    _cudaGraphDisabled  = false;
+    // Opt-in via MIMIRMIND_CUDA_GRAPH (NOT features.clr) — experimental,
+    // off by default until the decode-replay path is bit-identical to
+    // immediate mode (a divergence remains under investigation).
+    const bool cudaGraphEnabled =
+        std::getenv("MIMIRMIND_CUDA_GRAPH") != nullptr &&
+        _computeCtx->kind() == core::backend::BackendKind::Cuda;
+    if (cudaGraphEnabled) {
+        const std::size_t maxCurLen =
+            promptIds.size() + params.maxNewTokens;
+        const std::size_t replayKTiles = std::min(
+            (maxCurLen + compute::cuda::GpuOps::kFlashKTileSize - 1) /
+                compute::cuda::GpuOps::kFlashKTileSize,
+            compute::cuda::GpuOps::kFlashMaxKTiles);
+        cudaOps().setReplayMaxKTiles(replayKTiles);
+        MM_LOG_INFO("engine",
+                    "features.clr on CUDA — decode-graph capture armed, "
+                    "flash geometry right-sized to {} k-tiles "
+                    "(max curLen {})",
+                    replayKTiles, maxCurLen);
+    }
+#endif
+
+    // Inter-token thermal pacing — consult guard every kPaceWindow
+    // tokens so /sys reads don't dominate the inner loop. Window of
+    // 4 keeps overhead under a millisecond per token at ~145 ms/tok
+    // decode while still reacting to a fast temperature climb
+    // within ~500 ms.
+    constexpr std::size_t kPaceWindow = 4;
+    // The GPU clock governor adjusts the iGPU max-freq cap; this
+    // happens at a slower cadence than the per-token pacing
+    // because a fresh sysfs write costs ~200 µs and reaches the
+    // hardware on the next dispatch. 8 tokens at ~145 ms each is
+    // ~1.2 s between adjustments — well within the package
+    // thermal time constant.
+    constexpr std::size_t kGovernorWindow = 8;
+
+    for (std::size_t step = 1;
+         !aborted && step < maxNew && cache.length() < _maxContextTokens;
+         ++step)
+    {
+        if (isStop(nextId)) {
+            hitStop = true;
+            break;
+        }
+
+        if (_thermalGuard != nullptr && (step % kPaceWindow) == 0) {
+            const auto pause = _thermalGuard->paceForCurrentReading();
+            if (pause.count() > 0) {
+                std::this_thread::sleep_for(pause);
+            }
+        }
+
+        if (_gpuGovernor != nullptr && !_gpuGovernor->pinned()
+            && _governorMonitor != nullptr
+            && (step % kGovernorWindow) == 0) {
+            (void)_gpuGovernor->tick(*_governorMonitor);
+        }
+
+        const auto tokT0 = clock::now();
+
+        std::array<std::int32_t, 1> oneId{nextId};
+        cmp::embeddingLookup(
+            tensors.tokEmb->type, tensors.tokEmb->usmPtr,
+            d_model, vocab_emb,
+            oneId, xBuf);
+        applyEmbeddingScale(xBuf, 1, ctx.embedScaleEnabled, ctx.embedScale);
+
+        _backend->prepareForward(
+            std::span<const std::int32_t>{oneId}, xBuf, 1);
+
+        // M-CLR.4: three modes for the block loop:
+        //   step == 1                 → immediate (warm)
+        //   step == 2 && clrEnabled   → record + replay-once
+        //   step >  2 && recording    → update curLen slot + replay
+        //
+        // CLR is L0-native (record/replay live on the L0 CommandQueue).
+        // HIP-only or CPU-only builds compile only the immediate path;
+        // `clrEnabled` is forced to false above under the same guard.
+#ifdef MIMIRMIND_HAVE_L0
+        if (clrEnabled && l0Ops().queue().hasRecording()) {
+            // Replay-only path. `applyEmbeddingScale` above queued a
+            // `mulScalarAsync` (embedding scale) into the IMMEDIATE list;
+            // the recorded block loop reads xBuf, so that scale must
+            // execute before replay() or block 0 reads the unscaled
+            // embedding and the whole step diverges. The step-1 record
+            // path below flushes for the same reason — E4B masks it via
+            // a flush inside prepareForward, but MoE / Dense have a
+            // no-op prepareForward and need this explicit drain. (Bug:
+            // MoE decode replay produced token noise from step 2 without
+            // this — M-CLR.MoE Increment 3 root cause.)
+            _ops->flush();
+            // Update the shared USM slot so every recorded rope /
+            // attention / qkv_split / rmsnorm_qkv kernel sees the
+            // current KV-cache length.
+            *l0Ops().curLenSlot() =
+                static_cast<std::int32_t>(cache.length());
+            l0Ops().queue().replay();
+        } else if (clrEnabled && step == 1) {
+            // Step 1 records into the persistent list AND executes it
+            // via a first replay(). Subsequent steps reuse the
+            // recording without re-dispatching.
+            //
+            // `applyEmbeddingScale` above dispatches `mulScalarAsync`
+            // into the immediate list whenever the backend scales its
+            // embeddings (all Gemma-4 variants do). `beginRecord()`
+            // requires the immediate list to be idle — the E4B backend
+            // used to mask this by flushing internally inside its
+            // `prepareForward`, but MoE / Dense have a no-op default
+            // and would trip the "immediate work is pending" throw.
+            // Flush the immediate list explicitly so the invariant
+            // holds independently of the backend.
+            _ops->flush();
+            l0Ops().queue().beginRecord();
+            for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
+                _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+            }
+            l0Ops().queue().endRecord();
+            l0Ops().queue().replay();
+        } else
+#endif
+#ifdef MIMIRMIND_HAVE_CUDA
+        if (cudaGraphEnabled && _cudaDecodeGraph.valid()) {
+            // Replay: update the curLen slot outside the graph (stream-
+            // ordered before the launch), replay the captured prefix, then
+            // run the final (non-capturable) block immediately.
+            cudaOps().updateDecodeCurLen(
+                static_cast<std::int32_t>(cache.length()));
+            _cudaDecodeGraph.launch(cudaOps().stream());
+            _backend->runBlock(_config.blockCount - 1, xBuf, 1, cache,
+                               buffers, false);
+        } else if (cudaGraphEnabled && step == 2) {
+            // Warmup-before-capture (vLLM's dummy-run pattern): step 1 runs
+            // the first decode-shaped forward in IMMEDIATE mode (the else
+            // branch below), so all lazy decode-shape work — cuBLAS(Lt)
+            // workspace + algo selection, dynamic-smem opt-in
+            // (cudaFuncSetAttribute), first-touch scratch allocs — happens
+            // BEFORE capture. Capturing at step 1 recorded those illegal ops
+            // and always failed at block 0 (GDN). Capture the warmed trunk at
+            // step 2. The engine now owns the curLen slot
+            // (per-kernel staging off) and pre-sets it; the embedding /
+            // scale enqueued above run before capture (drained by the
+            // sync), so only the block loop is captured.
+            cudaOps().setPerKernelCurLenStaging(false);
+            cudaOps().updateDecodeCurLen(
+                static_cast<std::int32_t>(cache.length()));
+            cudaOps().stream().synchronize();
+            try {
+                // Capture all but the final block. Qwen3-Next-style models
+                // have a heterogeneous last trunk layer (gate/up quant with
+                // no fused-K kernel => host top-K => a mid-record sync that
+                // cannot be captured); it runs immediately after the graph.
+                // If an EARLIER block is also non-capturable the capture
+                // throws and we fall back to full immediate mode below.
+                const std::uint32_t nCap =
+                    _config.blockCount > 0 ? _config.blockCount - 1 : 0;
+                _cudaDecodeGraph.capture(cudaOps().stream(), [&] {
+                    for (std::uint32_t b = 0; b < nCap; ++b) {
+                        _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+                    }
+                });
+                _cudaDecodeGraph.launch(cudaOps().stream());
+                _backend->runBlock(_config.blockCount - 1, xBuf, 1, cache,
+                                   buffers, false);
+            } catch (const std::exception& e) {
+                // Residual host sync mid-record (e.g. device-top-K off) —
+                // fall back to immediate mode for the rest of the run.
+                MM_LOG_WARN("engine",
+                            "CUDA-graph decode capture failed ({}); "
+                            "falling back to immediate mode", e.what());
+                _cudaGraphDisabled = true;
+                cudaOps().setPerKernelCurLenStaging(true);
+                for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
+                    _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+                }
+            }
+        } else
+#endif
+        {
+            for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
+                _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+            }
+        }
+        cache.commit(1);
+
+        // 5.27 I-3: collapse the HC streams for this decode step (replaces
+        // output_norm) into xBuf before lm_head.
+        if (useHc) {
+            _backend->collapseHyperStreams(1, buffers, xBuf);
+        }
+        nextId = sampleNext(xBuf, vocab_lm,
+                            *tensors.outNorm, *tensors.lmHead,
+                            normFinal, logits, logitsSc,
+                            std::span<const std::int32_t>{generated},
+                            params.sampling,
+                            /*skipFinalNorm=*/useHc);
+        generated.push_back(nextId);
+
+        // Per-token telemetry. Both the env-controlled NDJSON sink
+        // and the in-process perf-regression detector (when set)
+        // consume the same three numbers (wall_ms, cap_mhz, pkg_c),
+        // so the sensor reads happen once.
+        // sampleNext sync-waits on the lmHead matmul so tokT1 is
+        // real wall-time including the whole layer chain.
+        if (_decodeTrace != nullptr || _perfDetector != nullptr) {
+            const auto tokT1 = clock::now();
+            const double tokMs = std::chrono::duration<double, std::milli>(
+                tokT1 - tokT0).count();
+            std::uint32_t cap = 0;
+            double pkg = -1.0;
+            if (_gpuGovernor != nullptr) {
+                cap = _gpuGovernor->currentCapMhz();
+            }
+            if (_governorMonitor != nullptr) {
+                const auto r = _governorMonitor->read();
+                if (r.package_temp_c.has_value()) {
+                    pkg = static_cast<double>(*r.package_temp_c);
+                }
+            }
+            if (_decodeTrace != nullptr) {
+                std::fprintf(_decodeTrace,
+                             "{\"tok\":%zu,\"wall_ms\":%.3f,"
+                             "\"cap_mhz\":%u,\"pkg_c\":%.1f}\n",
+                             step, tokMs, cap, pkg);
+            }
+            if (_perfDetector != nullptr) {
+                _perfDetector->onDecodeToken(
+                    PerfRegressionDetector::Sample{tokMs, cap, pkg});
+            }
+            // M8.K.0 diagnostic: emits a per-category share summary
+            // every 50 tokens when diagnostics.traceOpTimes=true.
+            // No-op otherwise. Only present on L0 today (see ctor).
+            if (_opProfiler) {
+                _opProfiler->maybeDumpAndReset(step);
+            }
+        }
+
+        if (onToken && !onToken(nextId)) {
+            aborted = true;
+        }
+    }
+
+    if (_decodeTrace != nullptr) {
+        std::fflush(_decodeTrace);
+    }
+
+    const auto decT1 = clock::now();
+    decMs =
+        std::chrono::duration<double, std::milli>(decT1 - decT0).count();
+
+    // Detector consults the ring buffer once per run — computes p50,
+    // compares against the rolling baseline, alerts + persists.
+    // Never throws (noexcept), so it stays outside the try body's
+    // hot path but inside the outer generate() try where a failure
+    // is at worst logged.
+    if (_perfDetector != nullptr) {
+        _perfDetector->onRunComplete(generated.size());
+    }
 }
 
 std::vector<std::vector<std::int32_t>>

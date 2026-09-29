@@ -1488,6 +1488,7 @@ add_executable(mimirmind
     src/model/Tokenizer.cpp
     src/runtime/BlockBuffers.cpp
     src/runtime/InferenceEngine.cpp
+    src/runtime/RequestTelemetryScope.cpp
     src/runtime/audio/SpeakEngine.cpp
     src/runtime/ProbeConfig.cpp
     src/runtime/ComputeStack.cpp
