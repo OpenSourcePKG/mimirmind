@@ -58,10 +58,6 @@ void Gemma4Backend::runBlockBatched(std::size_t                blockIdx,
     _impl->runBlockBatched(blockIdx, x, nSeq, caches, buffers, diag);
 }
 
-bool Gemma4Backend::supportsBatchedDecode() const noexcept {
-    return _impl->supportsBatchedDecode();
-}
-
 std::vector<std::size_t> Gemma4Backend::kvDimPerLayer() const {
     return _impl->kvDimPerLayer();
 }
@@ -84,8 +80,12 @@ void Gemma4Backend::prepareForward(std::span<const std::int32_t> tokIds,
     _impl->prepareForward(tokIds, hiddenStates, T);
 }
 
-bool Gemma4Backend::moeDecodeClrSafe() const noexcept {
-    return _impl->moeDecodeClrSafe();
+ArchCapabilities Gemma4Backend::computeCapabilities() const noexcept {
+    ArchCapabilities caps;
+    caps.scalesEmbedding     = true;                    // Gemma scales by sqrt(d)
+    caps.supportsBatchedDecode = _impl->supportsBatchedDecode();  // Dense/MoE/E4B
+    caps.moeDecodeClrSafe      = _impl->moeDecodeClrSafe();       // device-dispatch gate
+    return caps;
 }
 
 } // namespace mimirmind::runtime::arch

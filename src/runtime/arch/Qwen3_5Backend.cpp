@@ -246,8 +246,16 @@ std::pair<std::size_t, std::size_t> Qwen3_5Backend::maxQKVDims() const {
     return {qDim, kvDim};
 }
 
-bool Qwen3_5Backend::needsSsmScratch() const noexcept {
-    return _config.isHybridRecurrent();
+ArchCapabilities Qwen3_5Backend::computeCapabilities() const noexcept {
+    ArchCapabilities caps;
+    caps.scalesEmbedding = false;
+    // FP16-KV prefill routes K/V through an fp32 staging redirect +
+    // kv_commit_fp16 (runFullAttentionBlock), so a raw fp32 matmul never hits
+    // the fp16 slot.
+    caps.supportsFp16KvStaging = true;
+    caps.needsQGateScratch     = true;
+    caps.needsSsmScratch       = _config.isHybridRecurrent();
+    return caps;
 }
 
 void Qwen3_5Backend::traceNorm(const char* tag, std::size_t blockIdx,

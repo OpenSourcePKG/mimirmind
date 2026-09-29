@@ -370,7 +370,7 @@ struct ServingState {
 // paged pool, no SsmState, no MoE routing scratch — Gemma 4 has no GDN and
 // all layers hold KV, so the slab pool IS the per-sequence KvCache contract
 // runBlockBatched already writes into. Selected when the loaded backend is
-// not qwen35moe but implements supportsBatchedDecode() (Gemma 4 MoE).
+// not qwen35moe but reports capabilities().supportsBatchedDecode (Gemma 4 MoE).
 // =======================================================================
 struct L0ServingState {
     std::size_t maxBatch{0};
@@ -682,7 +682,7 @@ ServingSession::generateBatch(
         // feed lm_head directly (skip the plain final RMSNorm). Mirrors the
         // single-session useHc + sampleNext(skipFinalNorm=true).
         const float* lmIn = normBuf;
-        if (qb->usesHyperConnections()) {
+        if (qb->capabilities().usesHyperConnections) {
             qb->collapseHyperStreams(nSeq, sb, xBuf);
             lmIn = xBuf;
         } else {
@@ -786,10 +786,10 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         // L0 / Xe-LPG path: a backend implementing the neutral synchronized
         // batched decode (Gemma 4 MoE) serves through the non-paged slab
         // substrate instead of the qwen35moe paged pool.
-        if (!_e.backend()->supportsBatchedDecode()) {
+        if (!_e.backend()->capabilities().supportsBatchedDecode) {
             throw std::runtime_error(
                 "ensureServingState: continuous batching requires qwen35moe or "
-                "a backend with supportsBatchedDecode()");
+                "a backend that reports supportsBatchedDecode");
         }
         if (maxBatch == 0 || maxContext == 0) {
             throw std::runtime_error(
@@ -830,7 +830,7 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
                                                        : _e.tokenizer().vocabSize();
         dims.blockCount     = _e.config().blockCount;
         dims.rmsNormEps     = _e.config().rmsNormEps;
-        dims.scaleEmbedding = _e.backend()->scalesEmbedding();
+        dims.scaleEmbedding = _e.backend()->capabilities().scalesEmbedding;
 
         // F32 KV only. The Gemma 4 batched-decode attention (M-L0.Batch
         // Phase 1, runAttentionSectionBatched) supports F32 KV exclusively —
@@ -850,8 +850,8 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
             _e.fusedQkv() != nullptr && _e.fusedQkv()->anyFused();
         const bool withKvFp32Scratch =
             (kvDtype == KvDtype::Q8_0 || kvDtype == KvDtype::FP16);
-        const bool withQGate = _e.backend()->needsQGateScratch();
-        const bool withSsm   = _e.backend()->needsSsmScratch();
+        const bool withQGate = _e.backend()->capabilities().needsQGateScratch;
+        const bool withSsm   = _e.backend()->capabilities().needsSsmScratch;
         l0->decodeSb = allocBlockBuffers(
             *_e.ops(), _e.config(), /*maxT=*/maxBatch, /*maxSeq=*/maxContext,
             qDimMax, kvDimMax, withFusedQkv, withKvFp32Scratch,
@@ -1296,7 +1296,7 @@ void ServingSession::stepServing(
     // 5.27.11.2: HC archs (qwen4_exp) collapse the streams (mixer replaces
     // output_norm) into xBuf and feed lm_head directly; others rms-norm as before.
     const float* lmIn = normBuf;
-    if (st.qb->usesHyperConnections()) {
+    if (st.qb->capabilities().usesHyperConnections) {
         st.qb->collapseHyperStreams(nSeq, *st.sb, xBuf);
         lmIn = xBuf;
     } else {
@@ -1743,7 +1743,7 @@ std::int32_t ServingSession::prefillSlot(
         // 5.27.11.2: HC archs (qwen4_exp) collapse the T-row streams (mixer
         // replaces output_norm) and take the last prompt row; others rms-norm it.
         const float* lmIn = normBuf;
-        if (st.qb->usesHyperConnections()) {
+        if (st.qb->capabilities().usesHyperConnections) {
             st.qb->collapseHyperStreams(T, sb, xBuf);
             lmIn = xBuf + (T - 1) * d_model;
         } else {

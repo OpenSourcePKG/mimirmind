@@ -18,12 +18,12 @@ std::unique_ptr<KvCacheSlabPool> KvCacheSlabPool::forBackend(
     std::size_t              contextCap,
     KvDtype                  dtype)
 {
-    if (!backend.supportsBatchedDecode()) {
+    if (!backend.capabilities().supportsBatchedDecode) {
         throw std::invalid_argument(
             std::string("KvCacheSlabPool::forBackend: backend '") +
             backend.name() +
             "' does not implement the neutral batched-decode kernel "
-            "(supportsBatchedDecode() == false) — cannot serve concurrent "
+            "(capabilities().supportsBatchedDecode == false) — cannot serve concurrent "
             "decode from a slab pool");
     }
     // Neutral geometry only — no cast to a concrete arch backend.

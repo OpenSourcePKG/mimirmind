@@ -438,7 +438,7 @@ public:
      * done or `maxNew` tokens are produced. Returns one token stream per
      * prompt (excluding the prompt).
      *
-     * Requires `_backend->supportsBatchedDecode()` (L0 Gemma 4 MoE) and
+     * Requires `_backend->capabilities().supportsBatchedDecode` (L0 Gemma 4 MoE) and
      * F32 KV; throws otherwise. Not thread-safe — one call at a time, like
      * generate().
      */

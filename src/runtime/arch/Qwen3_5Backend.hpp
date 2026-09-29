@@ -220,13 +220,7 @@ public:
     [[nodiscard]] std::size_t layerCount()    const noexcept;
     [[nodiscard]] bool        isRecurrent(std::size_t b) const noexcept;
 
-    [[nodiscard]] bool        scalesEmbedding()   const noexcept override { return false; }
-    // FP16-KV prefill routes K/V through an fp32 staging redirect + kv_commit_fp16
-    // (runFullAttentionBlock), so a raw fp32 matmul never hits the fp16 slot.
-    [[nodiscard]] bool supportsFp16KvStaging() const noexcept override { return true; }
     [[nodiscard]] const char* name()              const noexcept override { return "qwen35moe"; }
-    [[nodiscard]] bool        needsQGateScratch() const noexcept override { return true; }
-    [[nodiscard]] bool        needsSsmScratch()   const noexcept override;
 
     [[nodiscard]] std::vector<std::size_t>
         kvDimPerLayer() const override;
@@ -234,6 +228,11 @@ public:
         maxQKVDims() const override;
 
 protected:
+    /// Qwen3-Next family capabilities: no embedding scale, FP16-KV staging,
+    /// per-head [Q|gate] scratch, and SSM scratch iff the config is hybrid-
+    /// recurrent. Qwen4ExpBackend extends this (Hyper-Connections).
+    [[nodiscard]] ArchCapabilities computeCapabilities() const noexcept override;
+
     /// Polymorphic FFN seam (5.20). Called by runFullAttentionBlock /
     /// runLinearBlock after the post-attention norm; the concrete subclass
     /// runs its FFN over `ffnInput` [T, d_model] and writes the result into

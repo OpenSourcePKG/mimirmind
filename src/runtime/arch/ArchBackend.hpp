@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -45,6 +46,38 @@ using ::mimirmind::core::gguf::GgufTensor;
 using ::mimirmind::core::gguf::GgmlType;
 using ::mimirmind::core::gguf::WeightsMap;
 using ::mimirmind::core::gguf::typeInfo;
+
+/// Load-time-stable capability flags an architecture backend reports to the
+/// engine. Replaces the former eight individual `virtual bool` capability
+/// queries (8.30.8): a backend now populates ONE struct in
+/// `computeCapabilities()` instead of overriding N predicate virtuals. Each
+/// field mirrors the semantics of the query it replaces; the defaults match
+/// the old default-return of each removed virtual.
+struct ArchCapabilities {
+    /// `runBlockBatched` is implemented (synchronized batched decode; L0
+    /// Gemma 4 MoE). The engine checks this before allocating per-sequence state.
+    bool supportsBatchedDecode = false;
+    /// Token embedding must be scaled by sqrt(d_model) before block 0 (Gemma).
+    bool scalesEmbedding = false;
+    /// FP16-KV writes route through an fp32 staging redirect + kv_commit_fp16,
+    /// so a raw fp32 K/V matmul never lands in an fp16 slot.
+    bool supportsFp16KvStaging = false;
+    /// Needs the per-head fused [Q|gate] scratch (Qwen3-Next full-attn gate).
+    bool needsQGateScratch = false;
+    /// Needs the GatedDeltaNet linear-layer scratch (Qwen3-Next hybrid-recurrent).
+    bool needsSsmScratch = false;
+    /// Keeps a multi-stream Hyper-Connections residual state (qwen4_exp); the
+    /// driver folds the streams via `collapseHyperStreams` before lm_head.
+    bool usesHyperConnections = false;
+    /// MoE decode block runs fully device-side expert dispatch — no host
+    /// routing read — so it is Command-List-Replay-capturable.
+    bool moeDecodeClrSafe = false;
+    /// Dense decode writes K/V through a replay-stable destination. Default
+    /// true; a backend that can fall onto the unfused per-token-slot path
+    /// (mixed-quant QKV that FusedQkvWeights refuses to fuse) reports false so
+    /// InferenceEngine keeps decode in immediate mode.
+    bool decodeQkvClrSafe = true;
+};
 
 /**
  * Architecture-specific block forward + per-call hooks.
@@ -96,17 +129,17 @@ public:
             "this architecture backend");
     }
 
-    /// True when `runBlockBatched` is implemented for this backend (L0
-    /// Gemma 4 MoE in Phase 1). InferenceEngine's batched harness checks
-    /// this before allocating per-sequence state. Default false.
-    [[nodiscard]] virtual bool supportsBatchedDecode() const noexcept {
-        return false;
+    /// The backend's load-time-stable capability flags (8.30.8). Computed
+    /// once, lazily, on first call — after full construction, so a Qwen
+    /// subclass reports its most-derived values (a constructor cannot call
+    /// the most-derived `computeCapabilities`). Thread-safe: `std::call_once`
+    /// guards the single computation, and the result is immutable afterwards,
+    /// so concurrent serving threads read it without a lock. Prefer caching
+    /// the reference locally when reading several flags.
+    [[nodiscard]] const ArchCapabilities& capabilities() const noexcept {
+        std::call_once(_capsOnce, [this] { _caps = computeCapabilities(); });
+        return _caps;
     }
-
-    /// True if the arch needs the token embedding to be scaled by
-    /// sqrt(d_model) before the first block (Gemma family). InferenceEngine
-    /// reads this to centralise the scale on prefill + decode.
-    [[nodiscard]] virtual bool scalesEmbedding() const noexcept = 0;
 
     /// KV-cache row width per layer (nKvHeads(l) * headDim(l)). Used by
     /// InferenceEngine to size the KV cache. Length must == blockCount.
@@ -130,43 +163,8 @@ public:
     [[nodiscard]] virtual std::pair<std::size_t, std::size_t>
         maxQKVDims() const = 0;
 
-    /// True if this backend routes its FP16-KV writes through an fp32 staging
-    /// redirect (project → fp32 scratch → rmsnorm/rope in fp32 → kv_commit_fp16
-    /// cast into the cache), so a raw fp32 K/V matmul never lands in an fp16
-    /// slot. Backends that DON'T (the plain path writes fp32 straight into the
-    /// cache slot) must return false — the engine then still requires fused-QKV
-    /// for FP16 to avoid corrupting the fp16 cache. Default false.
-    [[nodiscard]] virtual bool supportsFp16KvStaging() const noexcept {
-        return false;
-    }
-
     /// Short identifier for logs ("qwen2", "gemma4").
     [[nodiscard]] virtual const char* name() const noexcept = 0;
-
-    /// True if the arch needs the per-head fused [Q|gate] scratch buffers
-    /// (`BlockBuffers::qGateFused` / `gateScratch`). Qwen3-Next full-
-    /// attention fuses the query projection with a per-head output gate;
-    /// every other arch leaves this false. InferenceEngine reads it when
-    /// sizing block scratch.
-    [[nodiscard]] virtual bool needsQGateScratch() const noexcept {
-        return false;
-    }
-
-    /// True if the arch needs the GatedDeltaNet linear-layer scratch
-    /// (`BlockBuffers::ssm*`). Qwen3-Next hybrid-recurrent models set this;
-    /// every other arch leaves it false. Read by InferenceEngine when
-    /// sizing block scratch.
-    [[nodiscard]] virtual bool needsSsmScratch() const noexcept {
-        return false;
-    }
-
-    /// 5.27 I-3: true when this arch keeps a multi-stream Hyper-Connections
-    /// residual state (qwen4_exp). The driver then, after each forward's block
-    /// loop, calls `collapseHyperStreams` to fold the streams into the final
-    /// d_model hidden (which ALSO replaces the plain output_norm) before lm_head.
-    [[nodiscard]] virtual bool usesHyperConnections() const noexcept {
-        return false;
-    }
 
     /// 5.27 I-3: collapse the Hyper-Connections streams built up over the block
     /// loop into `out` [T, d_model] (the top-level mixer; replaces output_norm).
@@ -174,35 +172,6 @@ public:
     /// `usesHyperConnections()` is true.
     virtual void collapseHyperStreams(std::size_t /*T*/, BlockBuffers& /*s*/,
                                       float* /*out*/) {}
-
-    /// True when this MoE backend runs its decode block with fully
-    /// device-side expert dispatch — no host read of the routing between
-    /// the router matmul and the accumulator (M-CLR.MoE Increment 2). Such
-    /// a block is Command-List-Replay-capturable: InferenceEngine may then
-    /// enable CLR for the decode loop even though expertCount > 0. Dense
-    /// (expertCount == 0) backends never need this; the MoE default is
-    /// false (host routing bakes stale expert picks into the recording).
-    /// Gemma4MoeBackend overrides it to reflect the device-dispatch gate.
-    [[nodiscard]] virtual bool moeDecodeClrSafe() const noexcept {
-        return false;
-    }
-
-    /// True when this backend's dense (non-MoE) decode block writes K/V
-    /// through a Command-List-Replay-safe destination — a stable cache
-    /// base plus the device-side curLen slot, as the fused-QKV split does.
-    /// The UNFUSED QKV path instead projects K/V straight into
-    /// `cache.writeSlotK/V()`, a host-computed per-token pointer baked into
-    /// the recording at capture time; a replayed decode step then re-writes
-    /// that same stale slot instead of the current one, so the KV cache
-    /// never advances and generation degenerates after the first (recorded)
-    /// step. A backend that can fall onto the unfused path for the loaded
-    /// weights (e.g. mixed-quant QKV that FusedQkvWeights refuses to fuse)
-    /// must override this to report false so InferenceEngine keeps decode in
-    /// immediate mode. Default true: backends whose QKV is always fused (or
-    /// which never use per-token slot writes) are replay-safe.
-    [[nodiscard]] virtual bool decodeQkvClrSafe() const noexcept {
-        return true;
-    }
 
     /// Enable per-stage parity dumps. PREFIX is the same string carried by
     /// `diagnostics.parityDump` in config.json: each stage writes a file at
@@ -258,6 +227,18 @@ public:
 
 protected:
     ArchBackend() = default;
+
+    /// Build this backend's capability flags (8.30.8). Replaces the former
+    /// eight individual capability virtuals. Called once, lazily, by
+    /// `capabilities()` after full construction — so a Qwen subclass reports
+    /// its most-derived values (a constructor cannot). Must be a pure
+    /// function of load-time-stable state (config / fused-QKV / delegated
+    /// impl); it runs at most once per backend instance.
+    [[nodiscard]] virtual ArchCapabilities computeCapabilities() const = 0;
+
+private:
+    mutable ArchCapabilities _caps{};
+    mutable std::once_flag   _capsOnce;
 };
 
 /// True iff `architecture` matches one of the backends `createArchBackend`

@@ -106,23 +106,25 @@ Qwen2Backend::Qwen2Backend(const model::LlmConfig&        config,
     }
 }
 
-bool Qwen2Backend::decodeQkvClrSafe() const noexcept {
-    // Replay-safe only if EVERY block's QKV is fused: the fused split writes
-    // K/V through a stable cache base + device curLen slot, whereas the
-    // unfused else-branch in runBlock projects K/V into cache.writeSlotK/V()
-    // — a per-token pointer baked into the CLR recording, so replays clobber
-    // the recorded slot and stall the KV cache (garbage after the first
-    // step). FusedQkvWeights skips any block with mixed-quant QKV (e.g.
-    // Qwen2.5 Q4_K_M: attn_v=Q6_K != attn_q/k=Q4_K), leaving find() == null.
-    if (_fusedQkv == nullptr) {
-        return false;
-    }
-    for (std::size_t b = 0; b < _config.blockCount; ++b) {
+ArchCapabilities Qwen2Backend::computeCapabilities() const noexcept {
+    ArchCapabilities caps;                 // dense Llama/Qwen2 defaults
+    caps.scalesEmbedding = false;
+    // decodeQkvClrSafe: replay-safe only if EVERY block's QKV is fused (the
+    // fused split writes K/V through a stable cache base + device curLen slot),
+    // whereas the unfused else-branch in runBlock projects K/V into
+    // cache.writeSlotK/V() — a per-token pointer baked into the CLR recording,
+    // so replays clobber the recorded slot and stall the KV cache (garbage
+    // after the first step). FusedQkvWeights skips any block with mixed-quant
+    // QKV (e.g. Qwen2.5 Q4_K_M: attn_v=Q6_K != attn_q/k=Q4_K), leaving
+    // find() == null.
+    bool allFused = _fusedQkv != nullptr;
+    for (std::size_t b = 0; allFused && b < _config.blockCount; ++b) {
         if (_fusedQkv->find(b) == nullptr) {
-            return false;
+            allFused = false;
         }
     }
-    return true;
+    caps.decodeQkvClrSafe = allFused;
+    return caps;
 }
 
 std::vector<std::size_t> Qwen2Backend::kvDimPerLayer() const {

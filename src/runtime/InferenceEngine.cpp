@@ -1078,7 +1078,7 @@ void InferenceEngine::finalizeLoad() {
         // serving-class substrate. HIP/CPU and non-batched L0 archs (qwen2)
         // still stay single-session — they have no runBlockBatched.
         const bool neutralBatched =
-            _backend != nullptr && _backend->supportsBatchedDecode();
+            _backend != nullptr && _backend->capabilities().supportsBatchedDecode;
         if (_servingClassEnabled &&
             _computeCtx->kind() != core::backend::BackendKind::Cuda &&
             !neutralBatched) {
@@ -1189,7 +1189,7 @@ void InferenceEngine::setKvDtype(KvDtype dtype) {
         // through an fp32 staging redirect (project→fp32 scratch→rmsnorm/rope
         // in fp32→kv_commit_fp16 cast), in which case a raw fp32 matmul never
         // lands in the fp16 slot. Qwen35's IMRoPE path does exactly this.
-        const bool fp16StagingSafe = _backend->supportsFp16KvStaging();
+        const bool fp16StagingSafe = _backend->capabilities().supportsFp16KvStaging;
         if (dtype == KvDtype::FP16 && !fp16StagingSafe &&
             (_fusedQkv == nullptr || _fusedQkv->find(b) == nullptr)) {
             throw std::runtime_error(
@@ -1310,7 +1310,7 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
         // MIMIRMIND_PREFIX_CACHE_SLOTS). Pure-attention only: SSM/GDN
         // backends force lcp=0 and must never carry a stale recurrence.
         _prefixSlots = 1;
-        if (!_backend->needsSsmScratch()) {
+        if (!_backend->capabilities().needsSsmScratch) {
             if (const char* s = std::getenv("MIMIRMIND_PREFIX_CACHE_SLOTS")) {
                 const long v = std::atol(s);
                 if (v > 1) _prefixSlots = static_cast<std::size_t>(v);
@@ -1337,7 +1337,7 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     // context-length-independent — and it lives here rather than inside the
     // transient BlockBuffers so it survives scratch reallocation and can
     // become one-per-sequence for multi-tenant serving.
-    if (_ssmState == nullptr && _backend->needsSsmScratch()) {
+    if (_ssmState == nullptr && _backend->capabilities().needsSsmScratch) {
         _ssmState = std::make_unique<SsmState>(
             *_ops, _config.blockCount,
             _config.ssmStateElemsPerLayer(),
@@ -1386,8 +1386,8 @@ void InferenceEngine::ensureCapacity(std::size_t maxT, std::size_t Tp,
     // workspace, folded by kv_commit_fp16 instead.
     const bool withKvFp32Scratch =
         (_kvDtype == KvDtype::Q8_0 || _kvDtype == KvDtype::FP16);
-    const bool withQGate = _backend->needsQGateScratch();
-    const bool withSsm   = _backend->needsSsmScratch();
+    const bool withQGate = _backend->capabilities().needsQGateScratch;
+    const bool withSsm   = _backend->capabilities().needsSsmScratch;
     _blockBuffers = allocBlockBuffers(*_ops, _config,
                                       maxT, _maxContextTokens,
                                       qDimMax, kvDimMax,
@@ -1499,7 +1499,7 @@ InferenceEngine::sampleNext(const float*                   hidden,
 //   * Else keep the active slot (it already matches best).
 // SSM/GDN backends are excluded upstream (no backups allocated).
 void InferenceEngine::selectPrefixSlot(std::span<const std::int32_t> promptIds) {
-    if (_prefixBackups.empty() || _backend->needsSsmScratch()) {
+    if (_prefixBackups.empty() || _backend->capabilities().needsSsmScratch) {
         return;   // single-slot mode or recurrent backend — nothing to do
     }
     const std::uint64_t now = ++_prefixTick;
@@ -1560,7 +1560,7 @@ void InferenceEngine::selectPrefixSlot(std::span<const std::int32_t> promptIds) 
 }
 
 bool InferenceEngine::backendNeedsSsmScratch() const noexcept {
-    return _backend != nullptr && _backend->needsSsmScratch();
+    return _backend != nullptr && _backend->capabilities().needsSsmScratch;
 }
 
 bool InferenceEngine::gdnPrefixCkptEnabled() {
@@ -1733,7 +1733,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     // interior checkpoints that would lift that restriction are Inc 3.
     bool        ssmReuse = false;
     std::size_t lcp;
-    if (_backend->needsSsmScratch()) {
+    if (_backend->capabilities().needsSsmScratch) {
         lcp = 0;
         if (gdnPrefixCkptEnabled() && _ssmSnapValid && !_cachedTokens.empty()) {
             const std::size_t match = longestCommonPrefix(
@@ -1781,7 +1781,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
     // it enters the first block — the per-token vectors are otherwise
     // in the ~0.05 range and attention/FFN expects them at unit-ish
     // scale. Qwen/Llama don't do this. Backend tells us.
-    const bool  embedScaleEnabled = _backend->scalesEmbedding();
+    const bool  embedScaleEnabled = _backend->capabilities().scalesEmbedding;
     const float embedScale = embedScaleEnabled
         ? std::sqrt(static_cast<float>(d_model))
         : 1.0F;
@@ -2014,7 +2014,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // subspans to `sampling.penaltyWindow` internally.
         // 5.27 I-3: collapse the Hyper-Connections streams into xBuf (replaces
         // the plain output_norm) so the last row is the lm_head input.
-        const bool useHc = _backend->usesHyperConnections();
+        const bool useHc = _backend->capabilities().usesHyperConnections;
         if (useHc) {
             _backend->collapseHyperStreams(prefillCount, buffers, xBuf);
         }
@@ -2061,7 +2061,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // router matmul being synchronous is NOT a breach: flush() is a
         // no-op while recording (it early-returns on !_hasPending, which
         // appendLaunch never sets during a record). The lift is gated per
-        // backend by `moeDecodeClrSafe()` below; a MoE model without device
+        // backend by `capabilities().moeDecodeClrSafe` below; a MoE model without device
         // dispatch still runs immediate-mode decode.
         // Schicht 5.5 — CLR record/replay lives on the L0 CommandQueue.
         // HIP has no equivalent (hipGraph would be the door, but not
@@ -2073,10 +2073,10 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // expert dispatch (Increment 2) has no host routing read in the
         // decode block, so the stale-expert breach above no longer applies
         // and CLR may capture the block. Gated behind the backend's own
-        // moeDecodeClrSafe() so a host-routing fallback path can never be
+        // capabilities().moeDecodeClrSafe so a host-routing fallback path can never be
         // recorded.
         const bool moeClrSafe =
-            _config.expertCount > 0 && _backend->moeDecodeClrSafe();
+            _config.expertCount > 0 && _backend->capabilities().moeDecodeClrSafe;
         // Dense decode is CLR-safe only when the backend writes K/V through
         // a replay-stable destination. A backend that falls onto the
         // unfused-QKV path (mixed-quant QKV that FusedQkvWeights refuses to
@@ -2085,7 +2085,7 @@ InferenceEngine::generate(std::span<const std::int32_t>   promptIds,
         // steps clobber that stale slot, stalling the KV cache and
         // degenerating output after the first (recorded) step. Gate on the
         // backend's own report so such models drop to immediate-mode decode.
-        const bool qkvClrSafe = _backend->decodeQkvClrSafe();
+        const bool qkvClrSafe = _backend->capabilities().decodeQkvClrSafe;
         const bool clrEnabled =
             clrEnvOn &&
             (_config.expertCount == 0 || moeClrSafe) &&
@@ -2507,7 +2507,7 @@ InferenceEngine::generateBatchL0(
     if (prompts.empty()) {
         throw std::runtime_error("generateBatchL0: no prompts");
     }
-    if (!_backend->supportsBatchedDecode()) {
+    if (!_backend->capabilities().supportsBatchedDecode) {
         throw std::runtime_error(
             "generateBatchL0: the active backend does not implement "
             "synchronized batched decode (L0 Gemma 4 MoE only in Phase 1)");
@@ -2586,7 +2586,7 @@ InferenceEngine::generateBatchL0(
     }
     const std::span<KvCache* const> cacheSpan{cachePtrs};
 
-    const bool  embedScaleEnabled = _backend->scalesEmbedding();
+    const bool  embedScaleEnabled = _backend->capabilities().scalesEmbedding;
     const float embedScale = embedScaleEnabled
         ? std::sqrt(static_cast<float>(d_model))
         : 1.0F;
@@ -2755,7 +2755,7 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
     float* const logitsSc  = _logitsScH .as<float>();
 
     // Gemma-family sqrt(d_model) embedding scale, delegated to backend.
-    const bool  embedScaleEnabled = _backend->scalesEmbedding();
+    const bool  embedScaleEnabled = _backend->capabilities().scalesEmbedding;
     const float embedScale = embedScaleEnabled
         ? std::sqrt(static_cast<float>(d_model)) : 1.0F;
 
@@ -2990,7 +2990,7 @@ std::size_t InferenceEngine::servingPrefillMaxRows() const {
 }
 
 bool InferenceEngine::supportsBatchedDecode() const noexcept {
-    return _backend != nullptr && _backend->supportsBatchedDecode();
+    return _backend != nullptr && _backend->capabilities().supportsBatchedDecode;
 }
 
 std::vector<std::vector<float>>

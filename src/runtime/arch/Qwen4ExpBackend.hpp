@@ -48,11 +48,6 @@ public:
                     bool                          moeGroupEnabled     = true,
                     bool                          moeFusedDownEnabled = false);
 
-    /// I-3: this arch keeps a 4-stream residual state, so the driver must NOT
-    /// apply the plain final output_norm — the top-level hyper_connection_mixer
-    /// (below) collapses the streams AND replaces that norm.
-    [[nodiscard]] bool usesHyperConnections() const noexcept override { return true; }
-
     /// I-3: collapse the 4 hyper-connection streams (built up across the block
     /// loop) into the final d_model hidden state via the top-level
     /// hyper_connection_mixer (GatedResidual, use_combine=false). Writes `out`
@@ -87,6 +82,16 @@ public:
                             bool seqStart) override;
 
 protected:
+    /// Qwen3-Next capabilities plus Hyper-Connections (I-3): this arch keeps a
+    /// 4-stream residual state, so the driver must NOT apply the plain final
+    /// output_norm — the top-level hyper_connection_mixer (collapseHyperStreams)
+    /// collapses the streams AND replaces that norm.
+    [[nodiscard]] ArchCapabilities computeCapabilities() const noexcept override {
+        ArchCapabilities caps = Qwen3_5Backend::computeCapabilities();
+        caps.usesHyperConnections = true;
+        return caps;
+    }
+
     /// I-4: at the ple layer, inject the PLE n-gram features into the stream state.
     void blockEnter(std::size_t blockIdx, float* x, std::size_t T,
                     BlockBuffers& s) override;

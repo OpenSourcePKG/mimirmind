@@ -69,9 +69,6 @@ public:
                          BlockBuffers&              buffers,
                          bool                       diag) override;
 
-    [[nodiscard]] bool supportsBatchedDecode() const noexcept override;
-
-    [[nodiscard]] bool        scalesEmbedding() const noexcept override { return true; }
     [[nodiscard]] const char* name()            const noexcept override { return "gemma4"; }
 
     [[nodiscard]] std::vector<std::size_t>
@@ -87,7 +84,10 @@ public:
                         const float*                  hiddenStates,
                         std::size_t                   T) override;
 
-    [[nodiscard]] bool moeDecodeClrSafe() const noexcept override;
+protected:
+    /// Gemma always scales the embedding; batched-decode + MoE-CLR safety are
+    /// delegated to the concrete impl (Dense/MoE/E4B). All other flags default.
+    [[nodiscard]] ArchCapabilities computeCapabilities() const noexcept override;
 
 private:
     std::unique_ptr<GemmaBaseBackend> _impl;
