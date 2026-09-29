@@ -42,6 +42,8 @@ struct LoadedEmbedder;
 struct LoadedDecider;
 struct LoadedTranscriber;
 struct LoadedSpeaker;
+struct ServerConfig;
+class AttachedModelProvider;
 } // namespace mimirmind::server
 
 namespace mimirmind::core::config {
@@ -194,6 +196,55 @@ public:
                            const AttachEngineFn&         attachEngine,
                            const std::string&            defaultId,
                            bool                          attachedMode);
+
+    /**
+     * Attach engine `e` to Munin for model `m` over this build's IPC transport
+     * (L0 IPC handles on Xe-LPG, POSIX-shm on CUDA) and materialise its weights
+     * via loadModelAttached / loadModelAttachedNvfp4. Returns the (importer,
+     * client) keep-alive pair, or nullopt (and logs) on failure. This is the
+     * single shared implementation behind the `AttachEngineFn` that both
+     * `loadModels` and `buildModelProvider` consume; the caller decides where
+     * the keep-alive lives.
+     */
+    [[nodiscard]] static std::optional<AttachKeepAlive>
+    attachEngineToMunin(runtime::InferenceEngine&       e,
+                        const core::config::ModelEntry& m,
+                        const std::string&              attachSocket);
+
+    /**
+     * 5.27.10: force one tiny main-thread generate() so process-global lazy
+     * CUDA state (in particular the CUTLASS NVFP4-TC grouped GEMM,
+     * "nvfp4-tc-banks") initialises on the context-owning main thread before
+     * any batcher / httplib worker touches it — a first worker-thread touch
+     * poisons the context and crashes the first request. Guarded so a warmup
+     * failure never blocks serving; a no-op for archs that don't drive the
+     * TC-banks path or engines that are not serving-class. `defaultId` is used
+     * only for log lines.
+     */
+    static void warmupDefaultEngine(runtime::InferenceEngine& engine,
+                                    const std::string&        defaultId);
+
+    /**
+     * M-Munin.3 (full): build the worker-side materialise/evict pool provider
+     * for the non-default chat models (`poolChatModels`). Its factory attaches
+     * to Munin, materialises, and — mirroring the default engine's setup —
+     * wires each slot's OWN continuous batcher and, if it is the configured
+     * `speculative.target`, its OWN spec-dec decoder sharing the default's
+     * drafter. Returns nullptr when there are no pool models. The caller wires
+     * `scfg.modelProvider = result.get()` and keeps the owner alive for the
+     * server's lifetime. `backendPool` / `attachEngine` outlive the provider
+     * (owned by `runServe`); the ancillary monitors are snapshotted from
+     * `defaultEngine`.
+     */
+    [[nodiscard]] static std::unique_ptr<server::AttachedModelProvider>
+    buildModelProvider(runtime::InferenceEngine&                    defaultEngine,
+                       const core::config::Config&                  cfg,
+                       core::backend::BackendPool&                  backendPool,
+                       const AttachEngineFn&                        attachEngine,
+                       const server::ServerConfig&                  scfg,
+                       runtime::Drafter*                            drafter,
+                       const std::vector<core::config::ModelEntry>& poolChatModels,
+                       const std::string&                           defaultId);
 };
 
 } // namespace mimirmind::cli

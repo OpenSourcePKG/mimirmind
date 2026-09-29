@@ -13,6 +13,12 @@
 #include "core/backend/BackendRegistry.hpp"
 #include "core/config/Config.hpp"
 #include "core/ipc/MuninClient.hpp"
+#ifdef MIMIRMIND_HAVE_L0
+#include "core/ipc/L0IpcImporter.hpp"
+#endif
+#ifdef MIMIRMIND_HAVE_CUDA
+#include "core/ipc/ShmIpcImporter.hpp"
+#endif
 #include "core/log/Log.hpp"
 #include "model/Tokenizer.hpp"
 #include "runtime/ComputeStack.hpp"
@@ -29,6 +35,7 @@
 #include "runtime/spec/Drafter.hpp"
 #include "runtime/spec/ModelDrafter.hpp"
 #include "runtime/spec/NGramDrafter.hpp"
+#include "runtime/spec/SpeculativeDecoder.hpp"
 #include "runtime/thermal/FanController.hpp"
 #include "runtime/thermal/GpuClockGovernor.hpp"
 #include "runtime/thermal/PowerMonitor.hpp"
@@ -36,8 +43,10 @@
 #include "runtime/thermal/ThermalGuard.hpp"
 #include "runtime/thermal/ThermalProfile.hpp"
 #include "server/ApiServer.hpp"
+#include "server/AttachedModelProvider.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -45,6 +54,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -922,6 +932,240 @@ void ServerBootstrap::loadModels(LoadedModels&                 out,
         out.loadedEngines.push_back(std::move(le));
         out.ownedEngines.push_back(std::move(e));
     }
+}
+
+std::optional<ServerBootstrap::AttachKeepAlive>
+ServerBootstrap::attachEngineToMunin(runtime::InferenceEngine&       e,
+                                     const core::config::ModelEntry& m,
+                                     const std::string&              attachSocket) {
+#if defined(MIMIRMIND_HAVE_L0) || defined(MIMIRMIND_HAVE_CUDA)
+    // Pick the IPC transport at build time; the one MuninClient wire
+    // implementation drives either via the IpcImporterBackend seam.
+#ifdef MIMIRMIND_HAVE_L0
+    auto importer =
+        std::make_shared<::mimirmind::core::ipc::L0IpcImporter>(e.ctx());
+#else
+    auto importer = std::make_shared<::mimirmind::core::ipc::ShmIpcImporter>();
+#endif
+    auto client =
+        std::make_shared<::mimirmind::core::ipc::MuninClient>(*importer);
+    auto result = client->attach(attachSocket, m.id);
+    if (!result) {
+        std::cerr << "serve: attach for id='" << m.id
+                  << "' failed: " << result.error() << "\n";
+        return std::nullopt;
+    }
+    try {
+        e.setModelIdHint(m.id);   // for the per-model profile overlay
+        if (result->manifest.format == "nvfp4") {
+            // GB10 shm attach of an NVFP4 checkpoint: the chunks hold the raw
+            // safetensors shards; the engine reconstructs them and runs the
+            // NVFP4 materialization.
+            e.loadModelAttachedNvfp4(
+                m.path, m.tokenizerGguf, result->manifest,
+                std::span<void* const>{result->chunkBases});
+        } else {
+            e.loadModelAttached(
+                m.path, result->manifest,
+                std::span<void* const>{result->chunkBases});
+        }
+    } catch (const std::exception& x) {
+        std::cerr << "serve: loadModelAttached('" << m.id
+                  << "') failed: " << x.what() << "\n";
+        return std::nullopt;
+    }
+    // The importer owns the imported mappings — keep it alive alongside (and,
+    // being first in the pair, destroyed after) the client.
+    return AttachKeepAlive{std::move(importer), std::move(client)};
+#else
+    (void)e;
+    (void)m;
+    (void)attachSocket;
+    std::cerr << "serve: attached mode is not supported in this build\n";
+    return std::nullopt;
+#endif
+}
+
+void ServerBootstrap::warmupDefaultEngine(runtime::InferenceEngine& engine,
+                                          const std::string&        defaultId) {
+    if (!engine.servingClassEnabled()) {
+        return;
+    }
+    try {
+        const auto& wtok = engine.tokenizer();
+        auto warmIds = wtok.encode("Hi", /*addBos=*/true);
+        if (warmIds.empty()) {
+            warmIds.push_back(wtok.eosId());
+        }
+        ::mimirmind::runtime::GenerateParams wgp{};
+        wgp.maxNewTokens         = 1;
+        wgp.sampling.temperature = 0.0F;
+        engine.resetCache();
+        (void)engine.generate(warmIds, wgp, {}, nullptr, {}, {});
+        engine.resetCache();
+        MM_LOG_INFO("main",
+                    "serve: main-thread kernel warmup done (default engine "
+                    "'{}') — nvfp4-tc-banks initialized on the context "
+                    "thread (5.27.10)",
+                    defaultId);
+    } catch (const std::exception& warmEx) {
+        MM_LOG_WARN("main",
+                    "serve: main-thread kernel warmup failed ({}); serving "
+                    "continues (worker first-init may still race — 5.27.10)",
+                    warmEx.what());
+    }
+}
+
+std::unique_ptr<server::AttachedModelProvider>
+ServerBootstrap::buildModelProvider(
+        runtime::InferenceEngine&                    defaultEngine,
+        const core::config::Config&                  cfg,
+        core::backend::BackendPool&                  backendPool,
+        const AttachEngineFn&                        attachEngine,
+        const server::ServerConfig&                  scfg,
+        runtime::Drafter*                            drafter,
+        const std::vector<core::config::ModelEntry>& poolChatModels,
+        const std::string&                           defaultId) {
+    if (poolChatModels.empty()) {
+        return nullptr;
+    }
+    std::vector<::mimirmind::server::ProvidedModel> provided;
+    provided.reserve(poolChatModels.size());
+    for (const auto& m : poolChatModels) {
+        provided.push_back({m.id, m.title});
+    }
+    // Captured by value/pointer: cfg and backendPool outlive the server (owned
+    // by runServe, same as attachEngine — passed by reference here, also a
+    // runServe-lifetime object). The ancillary monitor pointers, the shared
+    // drafter and the speculative config are snapshotted now (constructed once
+    // and never rebuilt).
+    auto factory =
+        [&cfg, &backendPool, &attachEngine,
+         specCfg          = scfg.speculative,
+         thermalGuardPtr  = defaultEngine.thermalGuard(),
+         powerMonitorPtr  = defaultEngine.powerMonitor(),
+         fanControllerPtr = defaultEngine.fanController(),
+         perfDetectorPtr  = defaultEngine.perfRegressionDetector(),
+         drafterPtr       = drafter]
+        (const std::string& modelId)
+            -> std::unique_ptr<::mimirmind::server::PooledEngine> {
+        const ::mimirmind::core::config::ModelEntry* modelEntry = nullptr;
+        for (const auto& mm : cfg.models) {
+            if (mm.id == modelId) { modelEntry = &mm; break; }
+        }
+        if (modelEntry == nullptr) {
+            throw std::runtime_error(
+                "M-Munin.3 pool: model '" + modelId + "' not found in config");
+        }
+        const auto& m = *modelEntry;
+
+        const std::string token =
+            m.backend.empty() ? std::string{"auto"} : m.backend;
+        auto& backendEntry = backendPool.selectByToken(token);
+
+        auto payload = std::make_unique<::mimirmind::server::PooledEngine>();
+        payload->engine = std::make_unique<::mimirmind::runtime::InferenceEngine>(
+            cfg, backendEntry.kind);
+        payload->title = m.title;
+
+        auto ka = attachEngine(*payload->engine, m);
+        if (!ka) {
+            throw std::runtime_error(
+                "M-Munin.3 pool: attach failed for model '" + modelId + "'");
+        }
+        payload->keepAliveImporter = std::move(ka->first);
+        payload->keepAliveClient   = std::move(ka->second);
+
+        auto& e = *payload->engine;
+
+        // Same per-model runtime overrides as the eager path.
+        const auto rt = cfg.effectiveRuntime(m.id);
+        if (rt.maxContextTokens.has_value() && *rt.maxContextTokens > 0) {
+            e.setMaxContextTokens(*rt.maxContextTokens);
+        }
+        if (rt.kvDtype.has_value()) {
+            const std::string_view v{*rt.kvDtype};
+            if (v == "fp16")      e.setKvDtype(::mimirmind::runtime::KvDtype::FP16);
+            else if (v == "q8_0") e.setKvDtype(::mimirmind::runtime::KvDtype::Q8_0);
+            else if (v == "f32" || v.empty())
+                                  e.setKvDtype(::mimirmind::runtime::KvDtype::F32);
+        }
+        if (cfg.serving.kvDtype.has_value() && !cfg.serving.kvDtype->empty()) {
+            const std::string_view v{*cfg.serving.kvDtype};
+            if (v == "fp8")       e.setServingKvDtype(::mimirmind::runtime::KvDtype::FP8_E4M3);
+            else if (v == "fp16") e.setServingKvDtype(::mimirmind::runtime::KvDtype::FP16);
+            else if (v == "f32")  e.setServingKvDtype(::mimirmind::runtime::KvDtype::F32);
+        }
+
+        const auto& arch = e.config().architecture;
+        if (arch != "qwen2" && arch != "llama" && arch != "gemma4" &&
+            arch != "qwen35moe" && arch != "qwen4_exp") {
+            throw std::runtime_error(
+                "M-Munin.3 pool: architecture '" + arch + "' (model '" +
+                modelId + "') is not implemented");
+        }
+
+        // Propagate the process-wide ancillary monitors — same pattern as the
+        // eager "extras" propagation.
+        if (thermalGuardPtr  != nullptr) e.setThermalGuard(thermalGuardPtr);
+        if (powerMonitorPtr  != nullptr) e.setPowerMonitor(powerMonitorPtr);
+        if (perfDetectorPtr  != nullptr) e.setPerfRegressionDetector(perfDetectorPtr);
+        if (fanControllerPtr != nullptr) e.setFanController(fanControllerPtr);
+
+        // Per-slot continuous batcher — same eligibility + config knobs as the
+        // default engine's.
+        if ((arch == "qwen35moe" || arch == "qwen4_exp" ||
+             e.supportsBatchedDecode()) &&
+            e.servingClassEnabled()) {
+            std::size_t maxBatch =
+                std::max<std::size_t>(1, e.batchCapacity().sustainableBatch);
+            if (const char* mb = std::getenv("MIMIRMIND_SERVING_MAXBATCH")) {
+                const long v = std::atol(mb);
+                if (v > 0) maxBatch = static_cast<std::size_t>(v);
+            }
+            try {
+                payload->batcher = std::make_unique<
+                    ::mimirmind::runtime::serving::ContinuousBatcher>(
+                    e, maxBatch, e.maxContextTokens(), e.tokenizer().eosId(),
+                    cfg.serving.maxActiveRequests,
+                    cfg.serving.maxActiveRequestsPerTenant);
+                MM_LOG_INFO("main",
+                            "serve: pool slot '{}' continuous batcher ENABLED "
+                            "(maxBatch={} maxContext={})",
+                            modelId, maxBatch, e.maxContextTokens());
+            } catch (const std::exception& x) {
+                MM_LOG_WARN("main",
+                            "serve: pool slot '{}' continuous batcher init "
+                            "failed ({}); single-session generate() only",
+                            modelId, x.what());
+                payload->batcher.reset();
+            }
+        }
+
+        // Per-slot spec-dec — ONLY when this model is the configured
+        // speculative.target. `drafterPtr` is shared with the default engine's
+        // SpeculativeDecoder, but RequestDispatcher's own constructor already
+        // refuses to build ITS decoder unless speculative.target names the
+        // default — so at most ONE of {default engine, this pool slot} ever
+        // actually calls into the shared draft model.
+        if (drafterPtr != nullptr && cfg.speculative.enabled &&
+            cfg.speculative.target == modelId) {
+            payload->spec = std::make_unique<::mimirmind::runtime::SpeculativeDecoder>(
+                e, *drafterPtr, specCfg);
+            MM_LOG_INFO("main",
+                        "serve: pool slot '{}' is the speculative.target "
+                        "— spec-dec decoder built", modelId);
+        }
+
+        return payload;
+    };
+
+    auto modelProvider = std::make_unique<::mimirmind::server::AttachedModelProvider>(
+        cfg.serving.modelPoolCapacity, std::move(provided), defaultId, factory);
+    MM_LOG_INFO("main",
+                "serve: M-Munin.3 pool ENABLED — capacity={} models={}",
+                cfg.serving.modelPoolCapacity, poolChatModels.size());
+    return modelProvider;
 }
 
 } // namespace mimirmind::cli
