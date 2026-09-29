@@ -165,8 +165,39 @@ json SystemStatusBuilder::buildInfo() const {
                      "engine; query /v1/models for servable ids"},
         };
     }
+
+    // Build / process identity.
+    json build = json::object();
+    if (auto* det = _engine->perfRegressionDetector()) {
+        build["internal_version"] = det->internalVersion();
+    }
+
+    const auto engineKind = _engine->computeContextKind();
+    json engineBackend = {
+        {"kind",  core::backend::BackendRegistry::name(engineKind)},
+        {"token", core::backend::tokenFor(engineKind, /*deviceIx=*/0)},
+    };
+
+    return json{
+        {"model",                  buildModelBlock()},
+        {"tokenizer",              buildTokenizerBlock()},
+        {"kv_cache",               buildKvCacheBlock()},
+        {"hardware",               buildHardwareBlock()},
+        {"backend_pool",           buildBackendPoolBlock()},
+        {"engine_backend",         engineBackend},
+        {"serving",                buildServingBlock()},
+        {"gpu_clock_envelope",     buildGpuClockEnvelopeBlock()},
+        {"fan_envelope",           buildFanEnvelopeBlock()},
+        {"thermal_profile",        buildThermalProfileBlock()},
+        {"perf_regression_config", buildPerfRegressionConfigBlock()},
+        {"kernels",                buildKernelsBlock()},
+        {"speculative_decoding",   buildSpeculativeDecodingBlock()},
+        {"build",                  build},
+    };
+}
+
+json SystemStatusBuilder::buildModelBlock() const {
     const auto& modelCfg = _engine->config();
-    const auto& tok      = _engine->tokenizer();
 
     // Model architecture + dims
     json model = {
@@ -200,9 +231,14 @@ json SystemStatusBuilder::buildInfo() const {
         model["expert_count"]      = modelCfg.expertCount;
         model["expert_used_count"] = modelCfg.expertUsedCount;
     }
+    return model;
+}
+
+json SystemStatusBuilder::buildTokenizerBlock() const {
+    const auto& tok = _engine->tokenizer();
 
     // Tokenizer
-    json tokenizer = {
+    return json{
         {"model",      std::string{tok.modelType()}},
         {"vocab_size", tok.vocabSize()},
         {"bos_id",     tok.bosId()},
@@ -210,6 +246,10 @@ json SystemStatusBuilder::buildInfo() const {
         {"unk_id",     tok.unknownId()},
         {"pad_id",     tok.padId()},
     };
+}
+
+json SystemStatusBuilder::buildKvCacheBlock() const {
+    const auto& modelCfg = _engine->config();
 
     // KV cache — hard limit the engine will admit. M10.2 Phase 1a —
     // element_bytes is meaningless on Q8_0 (block-based); reports
@@ -220,14 +260,16 @@ json SystemStatusBuilder::buildInfo() const {
                          : kvD == runtime::KvDtype::Q8_0 ? "q8_0"
                          : kvD == runtime::KvDtype::FP8_E4M3 ? "fp8_e4m3"
                                                          : "f32");
-    json kvCache = {
+    return json{
         {"max_context_tokens", _engine->maxContextTokens()},
         {"layer_count",        modelCfg.blockCount},
         {"dtype",              kvDName},
         {"block_bytes",        runtime::kvBlockBytes(kvD)},
         {"block_elements",     runtime::kvBlockElements(kvD)},
     };
+}
 
+json SystemStatusBuilder::buildHardwareBlock() const {
     // Hardware descriptor — populated from L0 device info + USM limits
     // when the runtime picked L0. HIP-only / CPU-only builds report a
     // minimal placeholder here; a HIP-aware version can plumb through
@@ -260,7 +302,10 @@ json SystemStatusBuilder::buildInfo() const {
                           "for the L0 backend today"},
         };
     }
+    return hardware;
+}
 
+json SystemStatusBuilder::buildGpuClockEnvelopeBlock() const {
     // GPU clock envelope — the static parts of /system/status.gpu_clock.
     json gpuClockEnvelope;
     if (auto* gov = _engine->gpuClockGovernor();
@@ -282,7 +327,10 @@ json SystemStatusBuilder::buildInfo() const {
     } else {
         gpuClockEnvelope = nullptr;
     }
+    return gpuClockEnvelope;
+}
 
+json SystemStatusBuilder::buildThermalProfileBlock() const {
     // Thermal profile — static limits only.
     json thermalProfile;
     if (auto* guard = _engine->thermalGuard(); guard != nullptr) {
@@ -301,8 +349,11 @@ json SystemStatusBuilder::buildInfo() const {
     } else {
         thermalProfile = nullptr;
     }
+    return thermalProfile;
+}
 
-    json perfRegressionConfig = {
+json SystemStatusBuilder::buildPerfRegressionConfigBlock() const {
+    return json{
         {"threshold_ratio",
          runtime::PerfRegressionDetector::kAlertThreshold},
         {"baseline_window_days",
@@ -316,13 +367,9 @@ json SystemStatusBuilder::buildInfo() const {
         {"min_baseline_n",
          runtime::PerfRegressionDetector::kMinBaselineN},
     };
+}
 
-    // Build / process identity.
-    json build = json::object();
-    if (auto* det = _engine->perfRegressionDetector()) {
-        build["internal_version"] = det->internalVersion();
-    }
-
+json SystemStatusBuilder::buildFanEnvelopeBlock() const {
     // Fan envelope — static chip identity.
     json fanEnvelope;
     if (auto* fc = _engine->fanController();
@@ -341,7 +388,10 @@ json SystemStatusBuilder::buildInfo() const {
     } else {
         fanEnvelope = nullptr;
     }
+    return fanEnvelope;
+}
 
+json SystemStatusBuilder::buildSpeculativeDecodingBlock() const {
     // M9.11.1 + M9.11.4 — Speculative-decoding readiness. The drafter
     // kind selects which model-specific fields we report — `model`
     // exposes the backing engine's arch/block/embedding, `ngram` its
@@ -370,7 +420,10 @@ json SystemStatusBuilder::buildInfo() const {
             {"status", "disabled"},
         };
     }
+    return speculativeDecoding;
+}
 
+json SystemStatusBuilder::buildBackendPoolBlock() const {
     // Backend pool — every compiled-in + available device the process
     // could bind an engine to. Also reports which entry this engine
     // actually bound to, so operators can tell "process saw the dGPU
@@ -378,25 +431,21 @@ json SystemStatusBuilder::buildInfo() const {
     // Discovery is cheap (a few microseconds); running it per
     // /system/info call keeps the builder stateless.
     json poolJson = json::array();
-    {
-        core::backend::BackendPool pool;
-        pool.discoverAll();
-        for (const auto& e : pool.entries()) {
-            poolJson.push_back({
-                {"kind",      core::backend::BackendRegistry::name(e.kind)},
-                {"device_ix", e.deviceIx},
-                {"token",     e.token},
-                {"name",      e.name},
-                {"detail",    e.detail},
-            });
-        }
+    core::backend::BackendPool pool;
+    pool.discoverAll();
+    for (const auto& e : pool.entries()) {
+        poolJson.push_back({
+            {"kind",      core::backend::BackendRegistry::name(e.kind)},
+            {"device_ix", e.deviceIx},
+            {"token",     e.token},
+            {"name",      e.name},
+            {"detail",    e.detail},
+        });
     }
-    const auto engineKind = _engine->computeContextKind();
-    json engineBackend = {
-        {"kind",  core::backend::BackendRegistry::name(engineKind)},
-        {"token", core::backend::tokenFor(engineKind, /*deviceIx=*/0)},
-    };
+    return poolJson;
+}
 
+json SystemStatusBuilder::buildServingBlock() const {
     // M-Startup.CapacityProbe / Bragi — startup probe snapshot + the
     // resulting serving-class gate decision. Sourced from
     // `InferenceEngine::batchCapacity()` (populated once in
@@ -405,7 +454,7 @@ json SystemStatusBuilder::buildInfo() const {
     // at a glance — reasoning field carries the raw probe inputs.
     const auto& est = _engine->batchCapacity();
     const auto& cfgServing = _engine->servingConfig();
-    json serving = {
+    return json{
         {"enable_batching",         cfgServing.enableBatching == core::config::TriState::Auto    ? "auto"
                                   : cfgServing.enableBatching == core::config::TriState::Force   ? "force"
                                                                                                  : "disable"},
@@ -428,23 +477,6 @@ json SystemStatusBuilder::buildInfo() const {
         {"max_active_requests",             cfgServing.maxActiveRequests},
         {"preempt_free_block_threshold",    cfgServing.preemptFreeBlockThreshold},
         {"block_size",                      cfgServing.blockSize},
-    };
-
-    return json{
-        {"model",                  model},
-        {"tokenizer",              tokenizer},
-        {"kv_cache",               kvCache},
-        {"hardware",               hardware},
-        {"backend_pool",           poolJson},
-        {"engine_backend",         engineBackend},
-        {"serving",                serving},
-        {"gpu_clock_envelope",     gpuClockEnvelope},
-        {"fan_envelope",           fanEnvelope},
-        {"thermal_profile",        thermalProfile},
-        {"perf_regression_config", perfRegressionConfig},
-        {"kernels",                buildKernelsBlock()},
-        {"speculative_decoding",   speculativeDecoding},
-        {"build",                  build},
     };
 }
 

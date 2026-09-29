@@ -79,6 +79,22 @@ private:
     [[nodiscard]] nlohmann::json buildKernelsBlock() const;
     [[nodiscard]] nlohmann::json buildPowerBlock();
 
+    // Static /system/info envelope blocks (roadmap 8.30.11.3). Each builds
+    // one independent sub-object of buildInfo() and assumes `_engine` is
+    // non-null (buildInfo() handles the pool-mode early-return first).
+    // Behaviour-neutral extract-method of the former inline blocks.
+    [[nodiscard]] nlohmann::json buildModelBlock() const;
+    [[nodiscard]] nlohmann::json buildTokenizerBlock() const;
+    [[nodiscard]] nlohmann::json buildKvCacheBlock() const;
+    [[nodiscard]] nlohmann::json buildHardwareBlock() const;
+    [[nodiscard]] nlohmann::json buildGpuClockEnvelopeBlock() const;
+    [[nodiscard]] nlohmann::json buildThermalProfileBlock() const;
+    [[nodiscard]] nlohmann::json buildPerfRegressionConfigBlock() const;
+    [[nodiscard]] nlohmann::json buildFanEnvelopeBlock() const;
+    [[nodiscard]] nlohmann::json buildSpeculativeDecodingBlock() const;
+    [[nodiscard]] nlohmann::json buildBackendPoolBlock() const;
+    [[nodiscard]] nlohmann::json buildServingBlock() const;
+
     runtime::InferenceEngine* _engine;    // nullptr in pool (model-switch) mode
     RequestDispatcher&        _dispatcher;
     RequestTracker&           _requestTracker;
