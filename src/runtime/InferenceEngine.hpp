@@ -838,6 +838,31 @@ public:
     /// lazy-build lives on the engine, not in the collaborator.
     engine::DFlashDecoder& ensureDflashDecoder();
 
+    /// Serving seam (8.30.11.3). Three access modes centralise the
+    /// `_servingSession` lifecycle/guard boilerplate that the batched / MTP /
+    /// DFlash entry points below used to repeat inline:
+    ///   - `serving()`        lazily constructs the ServingSession on first use
+    ///                        (the single home of the create-on-first-use
+    ///                        pattern; used by every batch/generate entry).
+    ///   - `servingOrThrow()` returns the existing session or throws
+    ///                        `<ctx>: ensureServingState not called` — for the
+    ///                        step/prefill paths that require a prepared state.
+    ///   - `servingOrNull()`  returns the pointer WITHOUT creating one, so the
+    ///                        null-safe query + no-op-setter paths keep their
+    ///                        "missing session stays missing" semantics (e.g.
+    ///                        the L0-slab path must keep the greedy default).
+    /// Also the public access seam through which ServingSession's own state
+    /// collaborators land without re-exposing engine internals (prerequisite
+    /// for 8.30.7 clause 2).
+    engine::ServingSession& serving();
+    engine::ServingSession& servingOrThrow(const char* ctx);
+    [[nodiscard]] engine::ServingSession* servingOrNull() noexcept {
+        return _servingSession.get();
+    }
+    [[nodiscard]] const engine::ServingSession* servingOrNull() const noexcept {
+        return _servingSession.get();
+    }
+
 #ifdef MIMIRMIND_HAVE_CUDA
     /// Guarded downcast of `_ops` to the concrete CUDA GpuOps — only valid
     /// when the runtime picked the CUDA backend. Used by the CUDA-graph

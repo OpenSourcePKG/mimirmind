@@ -2847,40 +2847,47 @@ void InferenceEngine::commitVerified(
 // --- Serving substrate ------------------------------------------------
 // The batched-generation harnesses + persistent continuous-batch state live
 // in engine::ServingSession (a friend collaborator, lazily constructed).
+engine::ServingSession& InferenceEngine::serving() {
+    // Single home of the create-on-first-use lifecycle the batch / generate /
+    // MTP / DFlash entry points used to repeat inline (8.30.11.3 seam).
+    if (_servingSession == nullptr) {
+        _servingSession = std::make_unique<engine::ServingSession>(*this);
+    }
+    return *_servingSession;
+}
+
+engine::ServingSession& InferenceEngine::servingOrThrow(const char* ctx) {
+    // For the step/prefill paths that require a prepared serving state: never
+    // lazily create — a missing session is a caller error.
+    if (_servingSession == nullptr) {
+        throw std::runtime_error(std::string(ctx) +
+                                 ": ensureServingState not called");
+    }
+    return *_servingSession;
+}
+
 std::vector<std::vector<std::int32_t>>
 InferenceEngine::generateBatch(
         const std::vector<std::vector<std::int32_t>>& prompts,
         std::size_t maxNew, std::int32_t eosId) {
-    if (_servingSession == nullptr) {
-        _servingSession = std::make_unique<engine::ServingSession>(*this);
-    }
-    return _servingSession->generateBatch(prompts, maxNew, eosId);
+    return serving().generateBatch(prompts, maxNew, eosId);
 }
 
 std::vector<std::vector<std::int32_t>>
 InferenceEngine::generateServingParity(std::span<const std::int32_t> promptIds,
                                        std::size_t nSeq, std::size_t maxNew) {
-    if (_servingSession == nullptr) {
-        _servingSession = std::make_unique<engine::ServingSession>(*this);
-    }
-    return _servingSession->generateServingParity(promptIds, nSeq, maxNew);
+    return serving().generateServingParity(promptIds, nSeq, maxNew);
 }
 
 void InferenceEngine::ensureServingState(std::size_t maxBatch,
                                          std::size_t maxContext) {
-    if (_servingSession == nullptr) {
-        _servingSession = std::make_unique<engine::ServingSession>(*this);
-    }
-    _servingSession->ensureServingState(maxBatch, maxContext);
+    serving().ensureServingState(maxBatch, maxContext);
 }
 
 void InferenceEngine::stepServing(std::span<const ServingSlotStep> steps,
                                   std::span<std::int32_t>          outTokens,
                                   std::vector<TokenLogprobs>*      outLp) {
-    if (_servingSession == nullptr) {
-        throw std::runtime_error("stepServing: ensureServingState not called");
-    }
-    _servingSession->stepServing(steps, outTokens, outLp);
+    servingOrThrow("stepServing").stepServing(steps, outTokens, outLp);
 }
 
 void InferenceEngine::setServingSlotSampling(
@@ -2907,11 +2914,8 @@ std::int32_t InferenceEngine::prefillSlot(std::size_t slot,
                                           std::size_t startPos,
                                           bool produceToken,
                                           TokenLogprobs* outLp) {
-    if (_servingSession == nullptr) {
-        throw std::runtime_error("prefillSlot: ensureServingState not called");
-    }
-    return _servingSession->prefillSlot(slot, tokens, startPos, produceToken,
-                                        outLp);
+    return servingOrThrow("prefillSlot").prefillSlot(slot, tokens, startPos,
+                                                     produceToken, outLp);
 }
 
 void InferenceEngine::captureSlotSsmCkpt(std::size_t slot, std::size_t pos) {
@@ -3002,11 +3006,9 @@ void InferenceEngine::prefillSlotsBatched(
         bool                                           produceToken,
         std::span<std::int32_t>                        outFirstTok,
         std::vector<TokenLogprobs>*                    outLp) {
-    if (_servingSession == nullptr) {
-        throw std::runtime_error("prefillSlotsBatched: ensureServingState not called");
-    }
-    _servingSession->runVarlenPrefill(firstSlot, chunks, startPositions,
-                                      produceToken, outFirstTok, outLp);
+    servingOrThrow("prefillSlotsBatched")
+        .runVarlenPrefill(firstSlot, chunks, startPositions, produceToken,
+                          outFirstTok, outLp);
 }
 
 std::size_t InferenceEngine::servingPrefillMaxRows() const {
@@ -3022,29 +3024,21 @@ std::vector<std::vector<float>>
 InferenceEngine::stepServingVerify(std::span<const VerifySlot>   slots,
                                    std::span<const std::int32_t> tokensTimeMajor,
                                    std::size_t                   depth) {
-    if (_servingSession == nullptr) {
-        throw std::runtime_error("stepServingVerify: ensureServingState not called");
-    }
-    return _servingSession->stepServingVerify(slots, tokensTimeMajor, depth);
+    return servingOrThrow("stepServingVerify")
+        .stepServingVerify(slots, tokensTimeMajor, depth);
 }
 
 InferenceEngine::MtpDraftParityResult
 InferenceEngine::mtpDraftParity(std::span<const std::int32_t> prompt,
                                 std::size_t nSeq, std::size_t depth) {
-    if (_servingSession == nullptr) {
-        _servingSession = std::make_unique<engine::ServingSession>(*this);
-    }
-    return _servingSession->mtpDraftParity(prompt, nSeq, depth);
+    return serving().mtpDraftParity(prompt, nSeq, depth);
 }
 
 std::vector<std::vector<std::int32_t>>
 InferenceEngine::generateBatchMtp(std::span<const std::int32_t> prompt,
                                   std::size_t nSeq, std::size_t maxNew,
                                   std::size_t depth, std::int32_t eosId) {
-    if (_servingSession == nullptr) {
-        _servingSession = std::make_unique<engine::ServingSession>(*this);
-    }
-    return _servingSession->generateBatchMtp(prompt, nSeq, maxNew, depth, eosId);
+    return serving().generateBatchMtp(prompt, nSeq, maxNew, depth, eosId);
 }
 
 std::vector<std::vector<std::int32_t>>
@@ -3054,22 +3048,16 @@ InferenceEngine::generateBatchDflash(std::span<const std::int32_t> prompt,
                                      std::string_view drafterDir,
                                      std::size_t* draftedOut,
                                      std::size_t* acceptedOut) {
-    if (_servingSession == nullptr) {
-        _servingSession = std::make_unique<engine::ServingSession>(*this);
-    }
-    return _servingSession->generateBatchDflash(prompt, nSeq, maxNew, depth,
-                                                eosId, drafterDir, draftedOut,
-                                                acceptedOut);
+    return serving().generateBatchDflash(prompt, nSeq, maxNew, depth,
+                                         eosId, drafterDir, draftedOut,
+                                         acceptedOut);
 }
 
 std::vector<std::vector<std::int32_t>>
 InferenceEngine::generateBatchMtpMulti(
         const std::vector<std::vector<std::int32_t>>& prompts,
         std::size_t maxNew, std::size_t depth, std::int32_t eosId) {
-    if (_servingSession == nullptr) {
-        _servingSession = std::make_unique<engine::ServingSession>(*this);
-    }
-    return _servingSession->generateBatchMtpMulti(prompts, maxNew, depth, eosId);
+    return serving().generateBatchMtpMulti(prompts, maxNew, depth, eosId);
 }
 
 std::size_t InferenceEngine::servingMaxBatch() const noexcept {
