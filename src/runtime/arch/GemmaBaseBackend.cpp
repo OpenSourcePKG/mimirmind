@@ -303,51 +303,44 @@ void GemmaBaseBackend::dumpStage(const char* stage,
             static_cast<std::streamsize>(Trow * dim * sizeof(float)));
 }
 
-void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
-                                           float*        x,
-                                           std::size_t   T,
-                                           KvCache&      cache,
-                                           BlockBuffers& s,
-                                           bool          diag) {
-    auto trace = [&](const char* tag) {
-        if (diag) MM_LOG_INFO("blkdiag-g", "blk0 {}", tag);
-    };
-
+GemmaBaseBackend::AttnSectionState
+GemmaBaseBackend::prepareAttentionSection(std::size_t blockIdx, std::size_t T,
+                                          KvCache& cache, BlockBuffers& s) {
+    AttnSectionState st{};
+    st.blockIdx = blockIdx;
     const auto& li = _layers[blockIdx];
+    st.li = &li;
 
-    const auto* attnNorm = requireTensor(blockIdx, "attn_norm.weight",         "GemmaBase");
-    const auto* qW       = requireTensor(blockIdx, "attn_q.weight",            "GemmaBase");
-    const auto* qNorm    = requireTensor(blockIdx, "attn_q_norm.weight",       "GemmaBase");
-    const auto* oW       = requireTensor(blockIdx, "attn_output.weight",       "GemmaBase");
-    const auto* attnPost = requireTensor(blockIdx, "post_attention_norm.weight", "GemmaBase");
+    st.attnNorm = requireTensor(blockIdx, "attn_norm.weight",           "GemmaBase");
+    st.qW       = requireTensor(blockIdx, "attn_q.weight",              "GemmaBase");
+    st.qNorm    = requireTensor(blockIdx, "attn_q_norm.weight",         "GemmaBase");
+    st.oW       = requireTensor(blockIdx, "attn_output.weight",         "GemmaBase");
+    st.attnPost = requireTensor(blockIdx, "post_attention_norm.weight", "GemmaBase");
 
     // K/V weights are only needed when this layer owns its K/V cache.
     // Shared-KV layers (Gemma 4 E4B: 18 trailing) skip the K/V projection
     // entirely and read from `kvSourceLayer`'s cache during attention.
-    const core::gguf::GgufTensor* kW    = nullptr;
-    const core::gguf::GgufTensor* kNorm = nullptr;
-    const core::gguf::GgufTensor* vW    = nullptr;
     if (li.ownsKv) {
-        kW    = requireTensor(blockIdx, "attn_k.weight",      "GemmaBase");
-        kNorm = requireTensor(blockIdx, "attn_k_norm.weight", "GemmaBase");
+        st.kW    = requireTensor(blockIdx, "attn_k.weight",      "GemmaBase");
+        st.kNorm = requireTensor(blockIdx, "attn_k_norm.weight", "GemmaBase");
         // vW is optional — altAttention layers derive V from the raw K.
         if (!li.altAttention) {
-            vW = requireTensor(blockIdx, "attn_v.weight", "GemmaBase");
+            st.vW = requireTensor(blockIdx, "attn_v.weight", "GemmaBase");
         }
     }
 
-    const std::size_t d_model  = s.d_model;
-    const std::size_t q_dim    = li.qDim;
-    const std::size_t kv_dim   = li.kvDim;
-    const std::size_t head_dim = li.headDim;
-    const std::size_t curLen   = cache.length();
-    const std::size_t totalLen = curLen + T;
+    st.d_model  = s.d_model;
+    st.qDim     = li.qDim;
+    st.kvDim    = li.kvDim;
+    st.headDim  = li.headDim;
+    st.curLen   = cache.length();
+    st.totalLen = st.curLen + T;
 
-    float* const normBuf       = s.normBuf.as<float>();
-    float* const qBuf          = s.qBuf.as<float>();
-    float* const attnOutBuf    = s.attnOut.as<float>();
-    float* const projOutBuf    = s.projOut.as<float>();
-    float* const matmulScratch = s.matmulScratch.as<float>();
+    st.normBuf       = s.normBuf.as<float>();
+    st.qBuf          = s.qBuf.as<float>();
+    st.attnOutBuf    = s.attnOut.as<float>();
+    st.projOutBuf    = s.projOut.as<float>();
+    st.matmulScratch = s.matmulScratch.as<float>();
     // scoreScratch was the CPU-attention softmax row buffer; the GPU
     // attention kernel keeps the score row in SLM, so it's unused here.
     (void)s.scoreScratch;
@@ -365,15 +358,15 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // const on baseK/V is an API guardrail against read-path callers.
     // M10.2 Commit 5: slots are typed void*; ops methods branch on
     // `kvDtype` internally to pick f32 vs fp16 kernel variants.
-    void* const kSlot = li.ownsKv ? cache.writeSlotK(blockIdx) : nullptr;
-    void* const vSlot = li.ownsKv ? cache.writeSlotV(blockIdx) : nullptr;
-    void* const kBase = li.ownsKv
+    st.kSlot = li.ownsKv ? cache.writeSlotK(blockIdx) : nullptr;
+    st.vSlot = li.ownsKv ? cache.writeSlotV(blockIdx) : nullptr;
+    st.kBase = li.ownsKv
         ? const_cast<void*>(cache.baseK(blockIdx))
         : nullptr;
-    void* const vBase = li.ownsKv
+    st.vBase = li.ownsKv
         ? const_cast<void*>(cache.baseV(blockIdx))
         : nullptr;
-    const auto kvDtype = cache.dtype();
+    st.kvDtype = cache.dtype();
 
     // M10.2 Phase 1a Commit 5: under Q8_0 KV the entire pre-quantise
     // pipeline (fused qkv_split → rmsnorm_qkv → RoPE) runs against the
@@ -381,33 +374,43 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // folds each row into a 32-element Q8_0 block inside the cache slot.
     // Shared-KV blocks skip the K/V pipeline entirely, so they never
     // touch the staging buffers.
-    const bool q8Path = (kvDtype == KvDtype::Q8_0) && li.ownsKv;
-    float* const kFp32Scratch = q8Path ? s.kvKFp32Scratch.as<float>() : nullptr;
-    float* const vFp32Scratch = q8Path ? s.kvVFp32Scratch.as<float>() : nullptr;
-    void* const kStagingBase  = q8Path
-        ? static_cast<void*>(kFp32Scratch)
-        : kBase;
-    void* const vStagingBase  = q8Path
-        ? static_cast<void*>(vFp32Scratch)
-        : vBase;
-    const auto stagingKvDtype  = q8Path ? KvDtype::F32 : kvDtype;
-    const std::size_t stagingWriteOffset = q8Path ? 0 : curLen;
-    const std::size_t stagingWriteStride = q8Path ? 0 : kv_dim;
+    st.q8Path = (st.kvDtype == KvDtype::Q8_0) && li.ownsKv;
+    st.kFp32Scratch = st.q8Path ? s.kvKFp32Scratch.as<float>() : nullptr;
+    st.vFp32Scratch = st.q8Path ? s.kvVFp32Scratch.as<float>() : nullptr;
+    st.kStagingBase = st.q8Path
+        ? static_cast<void*>(st.kFp32Scratch)
+        : st.kBase;
+    st.vStagingBase = st.q8Path
+        ? static_cast<void*>(st.vFp32Scratch)
+        : st.vBase;
+    st.stagingKvDtype     = st.q8Path ? KvDtype::F32 : st.kvDtype;
+    st.stagingWriteOffset = st.q8Path ? 0 : st.curLen;
+    st.stagingWriteStride = st.q8Path ? 0 : st.kvDim;
+    return st;
+}
+
+void GemmaBaseBackend::projectAndNormQkv(const AttnSectionState& st, float* x,
+                                         std::size_t T, KvCache& cache,
+                                         BlockBuffers& s, bool diag) {
+    auto trace = [&](const char* tag) {
+        if (diag) MM_LOG_INFO("blkdiag-g", "blk0 {}", tag);
+    };
+    const auto& li = *st.li;
 
     // --- pre-attention RMSNorm ----------------------------------------
 
     _op.mark(runtime::OpProfiler::Cat::NORM);
     trace("attn rmsNorm");
-    _ops.rmsNormAsync(x, T, d_model,
-                      static_cast<const float*>(attnNorm->usmPtr),
+    _ops.rmsNormAsync(x, T, st.d_model,
+                      static_cast<const float*>(st.attnNorm->usmPtr),
                       _config.rmsNormEps,
-                      normBuf);
-    dumpStage("attn_norm", blockIdx, normBuf, T, d_model);
+                      st.normBuf);
+    dumpStage("attn_norm", st.blockIdx, st.normBuf, T, st.d_model);
 
     auto projectAsync = [&](const core::gguf::GgufTensor* W,
                             std::size_t N, float* dst) {
-        _gmm.matmulAsync(W->type, W->usmPtr, N, d_model,
-                         normBuf, T, dst, matmulScratch);
+        _gmm.matmulAsync(W->type, W->usmPtr, N, st.d_model,
+                         st.normBuf, T, dst, st.matmulScratch);
     };
 
     // M5i.B: Fused Q+K+V — one matmul into a staging buffer, then a
@@ -418,7 +421,7 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // is also skipped for shared-KV layers — no K/V to compute.
     const model::FusedQkvWeights::Block* fBlk =
         (_fusedQkv != nullptr && !li.altAttention && li.ownsKv)
-            ? _fusedQkv->find(blockIdx)
+            ? _fusedQkv->find(st.blockIdx)
             : nullptr;
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
@@ -437,22 +440,22 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         if (T == 1 && fBlk->reorderUsmPtr != nullptr
                    && fBlk->type == core::gguf::GgmlType::Q8_0) {
             _ops.matmulQ8_0VecReorderAsync(fBlk->reorderUsmPtr,
-                                           Nfused, d_model,
-                                           normBuf, qkvFused);
+                                           Nfused, st.d_model,
+                                           st.normBuf, qkvFused);
         } else {
-            _gmm.matmulAsync(fBlk->type, fBlk->usmPtr, Nfused, d_model,
-                             normBuf, T, qkvFused, matmulScratch);
+            _gmm.matmulAsync(fBlk->type, fBlk->usmPtr, Nfused, st.d_model,
+                             st.normBuf, T, qkvFused, st.matmulScratch);
         }
         // M10.2 Phase 1a Commit 5: Q8_0 scatters K/V into the fp32
         // staging buffers (writeOffset=0, dtype=F32); rmsnorm_qkv +
         // RoPE below stay on the staging pointers, and
         // kv_quant_commit_q8_0 folds the results into the actual cache
         // slot.
-        _ops.qkvSplitAsync(qkvFused, qBuf, kStagingBase, vStagingBase,
+        _ops.qkvSplitAsync(qkvFused, st.qBuf, st.kStagingBase, st.vStagingBase,
                            T, fBlk->Nq, fBlk->Nkv, fBlk->hasV,
-                           stagingWriteOffset,
-                           stagingKvDtype,
-                           /*useStagingSlot=*/q8Path);
+                           st.stagingWriteOffset,
+                           st.stagingKvDtype,
+                           /*useStagingSlot=*/st.q8Path);
     } else if (li.ownsKv) {
         // M5f.4: Q/K/V projections write disjoint buffers. The pop inserts
         // a single barrier so the norms below see all three matmul outputs.
@@ -466,14 +469,14 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         trace("Q+K+V projections (matmulAsync, unordered)");
         {
             compute::UnorderedScope u{_ops};
-            projectAsync(qW, q_dim, qBuf);
-            projectAsync(kW, kv_dim,
-                         q8Path ? kFp32Scratch
-                                : static_cast<float*>(kSlot));
+            projectAsync(st.qW, st.qDim, st.qBuf);
+            projectAsync(st.kW, st.kvDim,
+                         st.q8Path ? st.kFp32Scratch
+                                   : static_cast<float*>(st.kSlot));
             if (!li.altAttention) {
-                projectAsync(vW, kv_dim,
-                             q8Path ? vFp32Scratch
-                                    : static_cast<float*>(vSlot));
+                projectAsync(st.vW, st.kvDim,
+                             st.q8Path ? st.vFp32Scratch
+                                       : static_cast<float*>(st.vSlot));
             }
         }
     } else {
@@ -481,7 +484,7 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // layer's cache during attentionAsync below (populated earlier
         // in this same forward pass by that layer's own compute).
         trace("Q-only projection (shared-KV layer)");
-        projectAsync(qW, q_dim, qBuf);
+        projectAsync(st.qW, st.qDim, st.qBuf);
     }
 
     if (li.altAttention && li.ownsKv) {
@@ -508,13 +511,13 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // rope + kv_quant_commit_q8_0 see the raw K in the V staging
         // just like the F32 / FP16 paths.
         trace("alt-attn V = raw K (device memcpy)");
-        if (q8Path) {
+        if (st.q8Path) {
             _ops.appendMemoryCopy(
-                vFp32Scratch, kFp32Scratch,
-                T * kv_dim * sizeof(float));
+                st.vFp32Scratch, st.kFp32Scratch,
+                T * st.kvDim * sizeof(float));
         } else {
             _ops.appendMemoryCopy(
-                vSlot, kSlot, T * cache.rowBytes(blockIdx));
+                st.vSlot, st.kSlot, T * cache.rowBytes(st.blockIdx));
         }
     }
 
@@ -531,21 +534,29 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // rmsnorm_qkv kernel body runs unchanged, we just point it at
         // the staging rows the projection above wrote.
         _ops.rmsNormQkvAsync(
-            qBuf,          static_cast<const float*>(qNorm->usmPtr),
-            kStagingBase,  static_cast<const float*>(kNorm->usmPtr),
-            vStagingBase,
-            T * li.nHeads, T * li.nKvHeads, head_dim,
+            st.qBuf,          static_cast<const float*>(st.qNorm->usmPtr),
+            st.kStagingBase,  static_cast<const float*>(st.kNorm->usmPtr),
+            st.vStagingBase,
+            T * li.nHeads, T * li.nKvHeads, st.headDim,
             _config.rmsNormEps,
-            stagingWriteOffset, kv_dim,
-            stagingKvDtype,
-            /*useStagingSlot=*/q8Path);
+            st.stagingWriteOffset, st.kvDim,
+            st.stagingKvDtype,
+            /*useStagingSlot=*/st.q8Path);
     } else {
         trace("Q-norm only (shared-KV layer)");
-        _ops.rmsNormAsync(qBuf, T * li.nHeads, head_dim,
-                          static_cast<const float*>(qNorm->usmPtr),
+        _ops.rmsNormAsync(st.qBuf, T * li.nHeads, st.headDim,
+                          static_cast<const float*>(st.qNorm->usmPtr),
                           _config.rmsNormEps,
-                          qBuf);
+                          st.qBuf);
     }
+}
+
+void GemmaBaseBackend::applyRopeAndCommitKv(const AttnSectionState& st,
+                                            std::size_t T, bool diag) {
+    auto trace = [&](const char* tag) {
+        if (diag) MM_LOG_INFO("blkdiag-g", "blk0 {}", tag);
+    };
+    const auto& li = *st.li;
 
     // RoPE Q always runs. RoPE K only when the layer owns K/V.
     // M-CLR.2 Wave 3b: K-rope now targets the cache BASE and passes
@@ -566,31 +577,31 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         trace("RoPE Q+K (unordered)");
         compute::UnorderedScope u{_ops};
         if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
-            _ops.ropeInPlaceWithFactorsAsync(qBuf, _ropeFreqsForFullAttn, T,
-                                             li.nHeads, head_dim, curLen,
+            _ops.ropeInPlaceWithFactorsAsync(st.qBuf, _ropeFreqsForFullAttn, T,
+                                             li.nHeads, st.headDim, st.curLen,
                                              li.ropeBase);
-            _ops.ropeInPlaceWithFactorsAsync(kStagingBase,
+            _ops.ropeInPlaceWithFactorsAsync(st.kStagingBase,
                                              _ropeFreqsForFullAttn, T,
-                                             li.nKvHeads, head_dim, curLen,
+                                             li.nKvHeads, st.headDim, st.curLen,
                                              li.ropeBase,
-                                             stagingWriteStride,
-                                             stagingKvDtype);
+                                             st.stagingWriteStride,
+                                             st.stagingKvDtype);
         } else {
-            _ops.ropeInPlaceAsync(qBuf, T, li.nHeads, head_dim, curLen,
+            _ops.ropeInPlaceAsync(st.qBuf, T, li.nHeads, st.headDim, st.curLen,
                                   li.ropeBase);
-            _ops.ropeInPlaceAsync(kStagingBase, T, li.nKvHeads, head_dim, curLen,
-                                  li.ropeBase,
-                                  stagingWriteStride,
-                                  stagingKvDtype);
+            _ops.ropeInPlaceAsync(st.kStagingBase, T, li.nKvHeads, st.headDim,
+                                  st.curLen, li.ropeBase,
+                                  st.stagingWriteStride,
+                                  st.stagingKvDtype);
         }
     } else {
         trace("RoPE Q only (shared-KV layer)");
         if (!li.isSwa && _ropeFreqsForFullAttn != nullptr) {
-            _ops.ropeInPlaceWithFactorsAsync(qBuf, _ropeFreqsForFullAttn, T,
-                                             li.nHeads, head_dim, curLen,
+            _ops.ropeInPlaceWithFactorsAsync(st.qBuf, _ropeFreqsForFullAttn, T,
+                                             li.nHeads, st.headDim, st.curLen,
                                              li.ropeBase);
         } else {
-            _ops.ropeInPlaceAsync(qBuf, T, li.nHeads, head_dim, curLen,
+            _ops.ropeInPlaceAsync(st.qBuf, T, li.nHeads, st.headDim, st.curLen,
                                   li.ropeBase);
         }
     }
@@ -602,17 +613,17 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
         // M10.2 Phase 1a Commit 5: under Q8_0 the raw (post-rope) K/V
         // still lives in the fp32 staging just before quantisation —
         // dump *that* so parity vs a CPU reference stays meaningful.
-        if (kvDtype == KvDtype::F32) {
-            dumpStage("Kcur_pos",    blockIdx,
-                      static_cast<float*>(kSlot), T, kv_dim);
-            dumpStage("Vcur_normed", blockIdx,
-                      static_cast<float*>(vSlot), T, kv_dim);
-        } else if (q8Path) {
-            dumpStage("Kcur_pos",    blockIdx, kFp32Scratch, T, kv_dim);
-            dumpStage("Vcur_normed", blockIdx, vFp32Scratch, T, kv_dim);
+        if (st.kvDtype == KvDtype::F32) {
+            dumpStage("Kcur_pos",    st.blockIdx,
+                      static_cast<float*>(st.kSlot), T, st.kvDim);
+            dumpStage("Vcur_normed", st.blockIdx,
+                      static_cast<float*>(st.vSlot), T, st.kvDim);
+        } else if (st.q8Path) {
+            dumpStage("Kcur_pos",    st.blockIdx, st.kFp32Scratch, T, st.kvDim);
+            dumpStage("Vcur_normed", st.blockIdx, st.vFp32Scratch, T, st.kvDim);
         }
     }
-    dumpStage("Qcur_pos", blockIdx, qBuf, T, q_dim);
+    dumpStage("Qcur_pos", st.blockIdx, st.qBuf, T, st.qDim);
 
     // M10.2 Phase 1a Commit 5: fold the fp32 K/V staging rows into 32-
     // element Q8_0 blocks inside the actual cache slots. The commit
@@ -620,15 +631,24 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // → kv_dim/32 blocks of 34 B each). Shared-KV blocks skip this —
     // their attention reads from the source layer's cache which was
     // already committed earlier in the same forward pass.
-    if (q8Path) {
+    if (st.q8Path) {
         trace("KV commit Q8_0 (K + V)");
-        _ops.kvQuantCommitQ8Async(kFp32Scratch,
-                                  static_cast<void*>(kBase),
-                                  T, kv_dim, curLen);
-        _ops.kvQuantCommitQ8Async(vFp32Scratch,
-                                  static_cast<void*>(vBase),
-                                  T, kv_dim, curLen);
+        _ops.kvQuantCommitQ8Async(st.kFp32Scratch,
+                                  static_cast<void*>(st.kBase),
+                                  T, st.kvDim, st.curLen);
+        _ops.kvQuantCommitQ8Async(st.vFp32Scratch,
+                                  static_cast<void*>(st.vBase),
+                                  T, st.kvDim, st.curLen);
     }
+}
+
+void GemmaBaseBackend::attendAndProject(const AttnSectionState& st,
+                                        std::size_t T, KvCache& cache,
+                                        bool diag) {
+    auto trace = [&](const char* tag) {
+        if (diag) MM_LOG_INFO("blkdiag-g", "blk0 {}", tag);
+    };
+    const auto& li = *st.li;
 
     // M5f.3: attention on the GPU. Gemma 4's f_attention_scale = 1.0
     // (gemma4.cpp:11), so we pass scale=1.0 directly — no sqrt(head_dim)
@@ -646,29 +666,43 @@ void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
     // tokens. See M5i.J.1 Synaipse ticket.
     const std::size_t slidingWindow =
         li.isSwa ? static_cast<std::size_t>(_config.slidingWindow) : 0;
-    _ops.attentionAsync(qBuf,
+    _ops.attentionAsync(st.qBuf,
                         cache.baseK(li.kvSourceLayer),
                         cache.baseV(li.kvSourceLayer),
-                        T, totalLen,
-                        li.nHeads, li.nKvHeads, head_dim,
-                        curLen, /*scale=*/_yarnMscale,
-                        attnOutBuf,
+                        T, st.totalLen,
+                        li.nHeads, li.nKvHeads, st.headDim,
+                        st.curLen, /*scale=*/_yarnMscale,
+                        st.attnOutBuf,
                         slidingWindow,
-                        kvDtype);
+                        st.kvDtype);
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     trace("O projection");
-    _gmm.matmulAsync(oW->type, oW->usmPtr, d_model, q_dim,
-                attnOutBuf, T,
-                projOutBuf, matmulScratch);
+    _gmm.matmulAsync(st.oW->type, st.oW->usmPtr, st.d_model, st.qDim,
+                st.attnOutBuf, T,
+                st.projOutBuf, st.matmulScratch);
 
     _op.mark(runtime::OpProfiler::Cat::NORM);
     trace("attn_post_norm");
-    _ops.rmsNormAsync(projOutBuf, T, d_model,
-                      static_cast<const float*>(attnPost->usmPtr),
+    _ops.rmsNormAsync(st.projOutBuf, T, st.d_model,
+                      static_cast<const float*>(st.attnPost->usmPtr),
                       _config.rmsNormEps,
-                      projOutBuf);            // in-place
-    dumpStage("attn_post_norm", blockIdx, projOutBuf, T, d_model);
+                      st.projOutBuf);            // in-place
+    dumpStage("attn_post_norm", st.blockIdx, st.projOutBuf, T, st.d_model);
+}
+
+void GemmaBaseBackend::runAttentionSection(std::size_t   blockIdx,
+                                           float*        x,
+                                           std::size_t   T,
+                                           KvCache&      cache,
+                                           BlockBuffers& s,
+                                           bool          diag) {
+    // Behaviour-neutral stage-split (roadmap 8.30.11.3): resolve the section
+    // state once, then run the three GPU-work stages in order.
+    const AttnSectionState st = prepareAttentionSection(blockIdx, T, cache, s);
+    projectAndNormQkv(st, x, T, cache, s, diag);
+    applyRopeAndCommitKv(st, T, diag);
+    attendAndProject(st, T, cache, diag);
 
     // Fusion boundary: the residual add + ffn_norm rmsnorm that always
     // follow this attention section are fused by the caller via

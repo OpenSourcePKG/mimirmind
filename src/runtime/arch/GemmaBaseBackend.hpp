@@ -32,6 +32,7 @@ namespace mimirmind::runtime {
 class BlockBuffers;
 class KvCache;
 class OpProfiler;
+enum class KvDtype : std::uint8_t;   // defined in runtime/KvCache.hpp
 } // namespace mimirmind::runtime
 
 namespace mimirmind::runtime::arch {
@@ -155,6 +156,79 @@ protected:
         bool        ownsKv;
         std::size_t kvSourceLayer;    // = blockIdx when ownsKv, else the reuse source
     };
+
+    /// Load-time-stable tensors, dims, KV slots and Q8_0-staging pointers a
+    /// single attention section works on. Computed once by
+    /// `prepareAttentionSection` and threaded through the stage helpers so
+    /// each keeps a small signature at zero hot-path cost (roadmap 8.30.11.3
+    /// stage-split of the former 373-line runAttentionSection). `kW`/`kNorm`/
+    /// `vW` are null for shared-KV layers (and `vW` also for altAttention).
+    struct AttnSectionState {
+        std::size_t                   blockIdx{0};
+        const LayerInfo*              li{nullptr};
+        const core::gguf::GgufTensor* attnNorm{nullptr};
+        const core::gguf::GgufTensor* qW{nullptr};
+        const core::gguf::GgufTensor* qNorm{nullptr};
+        const core::gguf::GgufTensor* oW{nullptr};
+        const core::gguf::GgufTensor* attnPost{nullptr};
+        const core::gguf::GgufTensor* kW{nullptr};
+        const core::gguf::GgufTensor* kNorm{nullptr};
+        const core::gguf::GgufTensor* vW{nullptr};
+
+        std::size_t d_model{0};
+        std::size_t qDim{0};
+        std::size_t kvDim{0};
+        std::size_t headDim{0};
+        std::size_t curLen{0};
+        std::size_t totalLen{0};
+
+        float* normBuf{nullptr};
+        float* qBuf{nullptr};
+        float* attnOutBuf{nullptr};
+        float* projOutBuf{nullptr};
+        float* matmulScratch{nullptr};
+
+        void*   kSlot{nullptr};
+        void*   vSlot{nullptr};
+        void*   kBase{nullptr};
+        void*   vBase{nullptr};
+        KvDtype kvDtype{};
+
+        // M10.2 Phase 1a Commit 5 Q8_0 staging.
+        bool        q8Path{false};
+        float*      kFp32Scratch{nullptr};
+        float*      vFp32Scratch{nullptr};
+        void*       kStagingBase{nullptr};
+        void*       vStagingBase{nullptr};
+        KvDtype     stagingKvDtype{};
+        std::size_t stagingWriteOffset{0};
+        std::size_t stagingWriteStride{0};
+    };
+
+    /// Resolve the tensors, dims, KV slots and Q8_0-staging pointers for one
+    /// attention section. Behaviour-neutral extract of the former inline
+    /// setup block; no GPU work is queued here.
+    [[nodiscard]] AttnSectionState
+    prepareAttentionSection(std::size_t blockIdx, std::size_t T,
+                            KvCache& cache, BlockBuffers& s);
+
+    /// Stage 1: pre-attention RMSNorm, Q/K/V projection (fused / split /
+    /// Q-only), alt-attention V=raw-K copy, and the per-tensor Q/K/V norms.
+    void projectAndNormQkv(const AttnSectionState& st, float* x,
+                           std::size_t T, KvCache& cache, BlockBuffers& s,
+                           bool diag);
+
+    /// Stage 2: RoPE on Q (and K for own-KV layers), parity dumps, and the
+    /// Q8_0 K/V cache commit. Works entirely through the pointers captured in
+    /// `st`, so it needs no KvCache/BlockBuffers handle.
+    void applyRopeAndCommitKv(const AttnSectionState& st, std::size_t T,
+                              bool diag);
+
+    /// Stage 3: GPU attention, output projection and `post_attention_norm`.
+    /// On return `s.projOut` (captured in `st.projOutBuf`) holds
+    /// `attn_post_norm(W_o @ attn(...))`.
+    void attendAndProject(const AttnSectionState& st, std::size_t T,
+                          KvCache& cache, bool diag);
 
     /// Fill `_layers` from `_config` + `_weights`. Called from constructor.
     void buildLayerInfos();

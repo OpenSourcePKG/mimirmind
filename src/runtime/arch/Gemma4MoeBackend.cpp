@@ -94,17 +94,11 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
         if (diag) MM_LOG_INFO("blkdiag-g4m", "blk0 {}", tag);
     };
 
-    // FFN tensors (Path A dense weights + MoE router + expert bank +
-    // per-side / combined norms + layer output scale).
-    const auto* ffnNorm     = requireTensor(blockIdx, "ffn_norm.weight",           "Gemma4MoeBackend");
-    const auto* ffnGate     = requireTensor(blockIdx, "ffn_gate.weight",           "Gemma4MoeBackend");
-    const auto* ffnUp       = requireTensor(blockIdx, "ffn_up.weight",             "Gemma4MoeBackend");
-    const auto* ffnDown     = requireTensor(blockIdx, "ffn_down.weight",           "Gemma4MoeBackend");
-    const auto* ffwPost1    = requireTensor(blockIdx, "post_ffw_norm_1.weight",    "Gemma4MoeBackend");
-    const auto* ffwPost     = requireTensor(blockIdx, "post_ffw_norm.weight",      "Gemma4MoeBackend");
-    const auto* outScale    = requireTensor(blockIdx, "layer_output_scale.weight", "Gemma4MoeBackend");
+    // Path A (dense SwiGLU) runs first in its own method; here we resolve
+    // only the MoE router + expert-bank tensors and the buffers the routing
+    // and expert-dispatch below consume. The combine/output stage resolves
+    // its own norms (roadmap 8.30.11.3 stage-split of the 652-line method).
     const auto* preNorm2    = requireTensor(blockIdx, "pre_ffw_norm_2.weight",     "Gemma4MoeBackend");
-    const auto* postNorm2   = requireTensor(blockIdx, "post_ffw_norm_2.weight",    "Gemma4MoeBackend");
     const auto* routerScale = requireTensor(blockIdx, "ffn_gate_inp.scale",        "Gemma4MoeBackend");
     const auto* routerW     = requireTensor(blockIdx, "ffn_gate_inp.weight",       "Gemma4MoeBackend");
     const auto* expGateUp   = requireTensor(blockIdx, "ffn_gate_up_exps.weight",   "Gemma4MoeBackend");
@@ -112,58 +106,18 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
     const auto* expDownScale= requireTensor(blockIdx, "ffn_down_exps.scale",       "Gemma4MoeBackend");
 
     const std::size_t d_model  = s.d_model;
-    const std::size_t ff_dim   = s.ff_dim;
 
     float* const normBuf       = s.normBuf.as<float>();
     float* const attnOutBuf    = s.attnOut.as<float>();
-    float* const projOutBuf    = s.projOut.as<float>();
     float* const gateOutBuf    = s.gateOut.as<float>();
     float* const upOutBuf      = s.upOut.as<float>();
     float* const matmulScratch = s.matmulScratch.as<float>();
     float* const moeAccumBuf   = s.moeAccumBuf.as<float>();
     float* const expertOutBuf  = s.expertOutBuf.as<float>();
 
-    // --- FFN path A — dense SwiGLU with GELU ---------------------------
-    // Fused attn-residual + ffn_norm: runAttentionSection left
-    // `projOutBuf = attn_post_norm(attn_out)` for us to fold in here.
-
-    _op.mark(runtime::OpProfiler::Cat::NORM);
-    _ops.profileSection("g4.pathA");   // MIMIRMIND_DECODE_PROFILE section
-    trace("attn residual + ffn_norm (fused)");
-    _ops.addRmsNormAsync(x, projOutBuf, T, d_model,
-                         static_cast<const float*>(ffnNorm->usmPtr),
-                         _config.rmsNormEps,
-                         normBuf);
-    dumpStage("attn_out", blockIdx, x, T, d_model);
-
-    // M5f.4: FFN gate + up read normBuf, write disjoint outputs.
-    _op.mark(runtime::OpProfiler::Cat::MATMUL);
-    trace("FFN gate+up proj (unordered)");
-    {
-        compute::UnorderedScope u{_ops};
-        _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
-                         normBuf, T, gateOutBuf, matmulScratch);
-        _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
-                         normBuf, T, upOutBuf, matmulScratch);
-    }
-
-    _op.mark(runtime::OpProfiler::Cat::ACTIVATION);
-    trace("GELU + mul (fused)");
-    _ops.geluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
-
-    _op.mark(runtime::OpProfiler::Cat::MATMUL);
-    trace("FFN down proj");
-    _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
-                gateOutBuf, T,
-                projOutBuf, matmulScratch);
-
-    _op.mark(runtime::OpProfiler::Cat::NORM);
-    trace("post_ffw_norm_1 (path A post)");
-    _ops.rmsNormAsync(projOutBuf, T, d_model,
-                      static_cast<const float*>(ffwPost1->usmPtr),
-                      _config.rmsNormEps,
-                      projOutBuf);            // in-place
-    dumpStage("ffn_mlp", blockIdx, projOutBuf, T, d_model);
+    // FFN Path A — dense SwiGLU with GELU. Leaves `s.projOut` =
+    // post_ffw_norm_1(down(gelu(gate)*up)) for the combine stage below.
+    runFfnDensePathA(blockIdx, x, T, s, diag);
 
     // --- Path B — MoE -------------------------------------------------
 
@@ -690,6 +644,91 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
             }
         }
     }
+
+    // Combine Path A + Path B outputs, apply post-norm, ffn residual and the
+    // layer output scale (roadmap 8.30.11.3 stage-split).
+    combineAndScaleFfnOutputs(blockIdx, x, T, s, diag);
+}
+
+void Gemma4MoeBackend::runFfnDensePathA(std::size_t blockIdx, float* x,
+                                        std::size_t T, BlockBuffers& s,
+                                        bool diag) {
+    auto trace = [&](const char* tag) {
+        if (diag) MM_LOG_INFO("blkdiag-g4m", "blk0 {}", tag);
+    };
+
+    const auto* ffnNorm  = requireTensor(blockIdx, "ffn_norm.weight",        "Gemma4MoeBackend");
+    const auto* ffnGate  = requireTensor(blockIdx, "ffn_gate.weight",        "Gemma4MoeBackend");
+    const auto* ffnUp    = requireTensor(blockIdx, "ffn_up.weight",          "Gemma4MoeBackend");
+    const auto* ffnDown  = requireTensor(blockIdx, "ffn_down.weight",        "Gemma4MoeBackend");
+    const auto* ffwPost1 = requireTensor(blockIdx, "post_ffw_norm_1.weight", "Gemma4MoeBackend");
+
+    const std::size_t d_model = s.d_model;
+    const std::size_t ff_dim  = s.ff_dim;
+
+    float* const normBuf       = s.normBuf.as<float>();
+    float* const projOutBuf    = s.projOut.as<float>();
+    float* const gateOutBuf    = s.gateOut.as<float>();
+    float* const upOutBuf      = s.upOut.as<float>();
+    float* const matmulScratch = s.matmulScratch.as<float>();
+
+    // --- FFN path A — dense SwiGLU with GELU ---------------------------
+    // Fused attn-residual + ffn_norm: runAttentionSection left
+    // `projOutBuf = attn_post_norm(attn_out)` for us to fold in here.
+
+    _op.mark(runtime::OpProfiler::Cat::NORM);
+    _ops.profileSection("g4.pathA");   // MIMIRMIND_DECODE_PROFILE section
+    trace("attn residual + ffn_norm (fused)");
+    _ops.addRmsNormAsync(x, projOutBuf, T, d_model,
+                         static_cast<const float*>(ffnNorm->usmPtr),
+                         _config.rmsNormEps,
+                         normBuf);
+    dumpStage("attn_out", blockIdx, x, T, d_model);
+
+    // M5f.4: FFN gate + up read normBuf, write disjoint outputs.
+    _op.mark(runtime::OpProfiler::Cat::MATMUL);
+    trace("FFN gate+up proj (unordered)");
+    {
+        compute::UnorderedScope u{_ops};
+        _gmm.matmulAsync(ffnGate->type, ffnGate->usmPtr, ff_dim, d_model,
+                         normBuf, T, gateOutBuf, matmulScratch);
+        _gmm.matmulAsync(ffnUp->type, ffnUp->usmPtr, ff_dim, d_model,
+                         normBuf, T, upOutBuf, matmulScratch);
+    }
+
+    _op.mark(runtime::OpProfiler::Cat::ACTIVATION);
+    trace("GELU + mul (fused)");
+    _ops.geluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
+
+    _op.mark(runtime::OpProfiler::Cat::MATMUL);
+    trace("FFN down proj");
+    _gmm.matmul(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
+                gateOutBuf, T,
+                projOutBuf, matmulScratch);
+
+    _op.mark(runtime::OpProfiler::Cat::NORM);
+    trace("post_ffw_norm_1 (path A post)");
+    _ops.rmsNormAsync(projOutBuf, T, d_model,
+                      static_cast<const float*>(ffwPost1->usmPtr),
+                      _config.rmsNormEps,
+                      projOutBuf);            // in-place
+    dumpStage("ffn_mlp", blockIdx, projOutBuf, T, d_model);
+}
+
+void Gemma4MoeBackend::combineAndScaleFfnOutputs(std::size_t blockIdx, float* x,
+                                                 std::size_t T, BlockBuffers& s,
+                                                 bool diag) {
+    auto trace = [&](const char* tag) {
+        if (diag) MM_LOG_INFO("blkdiag-g4m", "blk0 {}", tag);
+    };
+
+    const auto* postNorm2 = requireTensor(blockIdx, "post_ffw_norm_2.weight",     "Gemma4MoeBackend");
+    const auto* ffwPost   = requireTensor(blockIdx, "post_ffw_norm.weight",       "Gemma4MoeBackend");
+    const auto* outScale  = requireTensor(blockIdx, "layer_output_scale.weight",  "Gemma4MoeBackend");
+
+    const std::size_t d_model = s.d_model;
+    float* const projOutBuf  = s.projOut.as<float>();
+    float* const moeAccumBuf = s.moeAccumBuf.as<float>();
 
     _op.mark(runtime::OpProfiler::Cat::NORM);
     trace("path B: post_ffw_norm_2");

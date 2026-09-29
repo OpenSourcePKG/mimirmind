@@ -82,6 +82,28 @@ private:
                           BlockBuffers& s,
                           bool          diag);
 
+    /// Stage 1 of runFfnMoeSection: FFN dense Path A (attn-residual +
+    /// ffn_norm fusion, SwiGLU gate/up + GELU, down projection,
+    /// post_ffw_norm_1). Resolves its own Path-A tensors and leaves
+    /// `s.projOut` for the combine stage. Behaviour-neutral extract
+    /// (roadmap 8.30.11.3).
+    void runFfnDensePathA(std::size_t   blockIdx,
+                          float*        x,
+                          std::size_t   T,
+                          BlockBuffers& s,
+                          bool          diag);
+
+    /// Final stage of runFfnMoeSection: post_ffw_norm_2 on the MoE output,
+    /// combine Path A + Path B, post_ffw_norm, ffn residual and the layer
+    /// output scale (plus the once-per-forward decode-profile flush).
+    /// Reads `s.projOut` (Path A) + `s.moeAccumBuf` (Path B). Behaviour-
+    /// neutral extract (roadmap 8.30.11.3).
+    void combineAndScaleFfnOutputs(std::size_t   blockIdx,
+                                   float*        x,
+                                   std::size_t   T,
+                                   BlockBuffers& s,
+                                   bool          diag);
+
     /// `features.moeGroup` at construction — routes T>1 through the
     /// expert-grouped batched dispatch path in runBlock(). Off falls back
     /// to per-token dispatch even during prefill.
