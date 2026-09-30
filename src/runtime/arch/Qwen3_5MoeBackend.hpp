@@ -152,6 +152,24 @@ protected:
                           BlockBuffers&  s,
                           bool           preferBlocked = false);
 
+    // runMoeFfnGrouped helpers (extracted verbatim; 8.30.11.4). runMoeGroupedTc
+    // is the FP4-tensor-core grouped-GEMM branch (act-quant -> gate+up -> silu ->
+    // down -> scatter). runMoeOeaUnionProfile is the env-gated OEA union
+    // diagnostic (MIMIRMIND_MOE_UNION_PROFILE); no-op unless enabled + nSeq>1.
+    void runMoeGroupedTc(BlockBuffers& s, const float* moeInput,
+                         const core::gguf::GgufTensor& gateExps,
+                         const core::gguf::GgufTensor& upExps,
+                         const core::gguf::GgufTensor& downExps,
+                         const std::int32_t* expOffset,
+                         const std::int32_t* asnToRow,
+                         const std::int32_t* rowSrcTok, const float* kwSlot,
+                         float* moeAccumBuf, std::size_t R, std::size_t nExperts,
+                         std::size_t K, std::size_t d_model, std::size_t n_ff_exp,
+                         std::size_t nSeq);
+    void runMoeOeaUnionProfile(const std::int32_t* expOffset, std::size_t nExperts,
+                               std::size_t nSeq, std::size_t R,
+                               std::size_t blockIdx);
+
     /// Track B — one shared-expert projection through the CUTLASS block-scaled
     /// NVFP4 tensor-core GEMM as a single group (nExp=1).
     void sharedExpertTcGemm(std::size_t   N,

@@ -987,6 +987,159 @@ void Qwen3_5MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
     }
 }
 
+void Qwen3_5MoeBackend::runMoeOeaUnionProfile(
+        const std::int32_t* expOffset, std::size_t nExperts,
+        std::size_t nSeq, std::size_t R, std::size_t blockIdx) {
+    static const bool kOeaUnionProfile =
+        std::getenv("MIMIRMIND_MOE_UNION_PROFILE") != nullptr;
+    if (!kOeaUnionProfile || nSeq <= 1) {
+        return;
+    }
+        std::vector<std::int32_t> hostOff(nExperts + 1);
+        _ops.readbackToHost(hostOff.data(), expOffset,
+                            (nExperts + 1) * sizeof(std::int32_t));
+        std::size_t unique = 0;
+        for (std::size_t e = 0; e < nExperts; ++e) {
+            if (hostOff[e + 1] > hostOff[e]) {
+                ++unique;
+            }
+        }
+        static long sumUnique = 0;
+        static long sumT      = 0;
+        static long nCalls    = 0;
+        sumUnique += static_cast<long>(unique);
+        sumT      += static_cast<long>(nSeq);
+        ++nCalls;
+        if ((nCalls % 256) == 0) {
+            MM_LOG_INFO(
+                "moe-oea",
+                "union-profile: avg unique={}/{} ({:.1f}%) @avg T={} over {} "
+                "MoE-layer-steps (this: layer={} T={} unique={} R={})",
+                sumUnique / nCalls, nExperts,
+                100.0 * static_cast<double>(sumUnique) /
+                    (static_cast<double>(nCalls) * static_cast<double>(nExperts)),
+                sumT / nCalls, nCalls, blockIdx, nSeq, unique, R);
+        }
+}
+
+void Qwen3_5MoeBackend::runMoeGroupedTc(
+        BlockBuffers& s, const float* moeInput,
+        const core::gguf::GgufTensor& gateExps,
+        const core::gguf::GgufTensor& upExps,
+        const core::gguf::GgufTensor& downExps,
+        const std::int32_t* expOffset, const std::int32_t* asnToRow,
+        const std::int32_t* rowSrcTok, const float* kwSlot,
+        float* moeAccumBuf, std::size_t R, std::size_t nExperts,
+        std::size_t K, std::size_t d_model, std::size_t n_ff_exp,
+        std::size_t nSeq) {
+        // --- Sub-Step E-d: FP4-tensor-core grouped GEMM (F32 out) ----------
+        // Each expert padded to 128 rows so its SFA sub-tensor is tile-aligned
+        // in one big act-quant; every per-group pointer built on device from
+        // expOffset/padOffset — nothing crosses to the host.
+        namespace mo = core::modelopt;
+        const std::size_t maxPad = R + nExperts * 128;
+        const std::size_t nAsn   = R;                    // nSeq * K assignments
+        // Per-slot scratch lives in BlockBuffers (concurrent-prefill safe);
+        // lazily grown to the current maxPad on first / larger use.
+        auto grow = [&](compute::ComputeBuffer& buf, std::size_t bytes) {
+            if (buf.bytes() < bytes) buf = _ops.allocate(bytes);
+        };
+        grow(s.moeTcPadOffset,   (nExperts + 1) * sizeof(std::int32_t));
+        grow(s.moeTcContigToPad, R * sizeof(std::int32_t));
+        grow(s.moeTcPadAsn,      nAsn * sizeof(std::int32_t));
+        // moeTcXPad dropped (5.21.10): the fused gather+quant reads the
+        // compact rows directly, so the [maxPad, d_model] F32 intermediate
+        // (~hundreds of MiB at prefill maxPad) is no longer allocated.
+        grow(s.moeTcGatePad,     maxPad * n_ff_exp * sizeof(float));
+        grow(s.moeTcUpPad,       maxPad * n_ff_exp * sizeof(float));
+        grow(s.moeTcDownPad,     maxPad * d_model * sizeof(float));
+        grow(s.moeTcABank,       maxPad * (d_model / 2));
+        grow(s.moeTcSfaBank,     mo::swizzledBlockScaleBytes(maxPad, d_model / 16));
+        grow(s.moeTcABank2,      maxPad * (n_ff_exp / 2));
+        grow(s.moeTcSfaBank2,    mo::swizzledBlockScaleBytes(maxPad, n_ff_exp / 16));
+        grow(s.moeTcBanksScratch,
+             _ops.moeGroupedGemmNvfp4TcBanksGateUpScratchBytes(nExperts));
+
+        auto* const padOffset   = s.moeTcPadOffset.as<std::int32_t>();
+        auto* const contigToPad = s.moeTcContigToPad.as<std::int32_t>();
+        auto* const padAsn      = s.moeTcPadAsn.as<std::int32_t>();
+        float* const gatePad = s.moeTcGatePad.as<float>();
+        float* const upPad   = s.moeTcUpPad.as<float>();
+        float* const downPad = s.moeTcDownPad.as<float>();
+        auto* const aBank    = s.moeTcABank.as<unsigned char>();
+        auto* const sfaBank  = s.moeTcSfaBank.as<unsigned char>();
+        auto* const aBank2   = s.moeTcABank2.as<unsigned char>();
+        auto* const sfaBank2 = s.moeTcSfaBank2.as<unsigned char>();
+        void* const banksScratch     = s.moeTcBanksScratch.get();
+        const std::size_t banksBytes = s.moeTcBanksScratch.bytes();
+
+        _ops.profileSection("moe.prep");   // row maps + act-quant (prefill sub-split)
+        // padded row maps (device only)
+        mgOps().moePadOffsetsAsync(expOffset, padOffset, nExperts);
+        mgOps().moeContigToPadAsync(expOffset, padOffset, contigToPad, nExperts, R);
+        mgOps().moeIndexGatherI32Async(asnToRow, contigToPad, padAsn, nAsn);
+
+        // 5.21.10: FUSED gather+quant — read the COMPACT gathered rows and
+        // write nibbles/SF straight at the padded slots. Replaces the
+        // moe_rows_scatter_f32 F32 round-trip (write [maxPad, d_model], then
+        // re-read it for the quant) + the separate quant launch; the xPad
+        // intermediate tensor is gone entirely. Bit-identical (same values,
+        // same quant math, same output layout). Padding rows keep the zeroed
+        // SF (scale 0 -> act 0); their GEMM output is discarded.
+        mgOps().moeZeroBytesAsync(sfaBank, mo::swizzledBlockScaleBytes(maxPad, d_model / 16));
+        // 5.18.21 FUSED gather+act-quant: read the ungathered moeInput directly at
+        // each logical row's source token (rowSrcTok) — skips the standalone
+        // rt.gather + the xComp [R, d_model] intermediate. Bit-identical (xComp[r]
+        // was exactly moeInput[rowSrcTok[r]]).
+        mgOps().moeActQuantNvfp4GatherRowsAsync(moeInput, aBank, sfaBank, 1.0F,
+                                             contigToPad, R, d_model, rowSrcTok);
+
+        // gate + up: N=n_ff_exp, K=d_model. alpha[e] = weight global (folds the
+        // per-expert global back in; act gscale=1).
+        _ops.profileSection("moe.gemm");   // gate+up TC GEMM (prefill sub-split)
+        // 5.18.21: gate+up in ONE grouped GEMM (2*nExperts groups) — one CUTLASS
+        // can_implement/initialize/run instead of two, and A/SFA read once.
+        // Bit-identical to the two separate banks calls: gate -> gatePad, up ->
+        // upPad, each group keeps its own per-expert alpha (weight global).
+        mgOps().moeGroupedGemmNvfp4TcBanksGateUpAsync(
+            nExperts, n_ff_exp, d_model, expOffset, padOffset, aBank, sfaBank,
+            gateExps.tcNibblePtr, gateExps.tcSfbPtr,
+            static_cast<const float*>(gateExps.tcGlobalsPtr), gatePad,
+            upExps.tcNibblePtr, upExps.tcSfbPtr,
+            static_cast<const float*>(upExps.tcGlobalsPtr), upPad,
+            banksScratch, banksBytes);
+
+        _ops.profileSection("moe.silu");   // silu + intermediate act-quant (sub-split)
+        // Row-mapped act-quant of silu(gate)*up -> down GEMM (N=d_model, K=n_ff_exp).
+        // The gate/up GEMM wrote outputs at the padded slots (contigToPad), so the
+        // real rows live there. sfaBank2 padding must stay zeroed (both paths).
+        mgOps().moeZeroBytesAsync(sfaBank2, mo::swizzledBlockScaleBytes(maxPad, n_ff_exp / 16));
+        if (_moeSiluFuse) {
+            // 5.21.8: fused silu*up + quant in one pass over the R real rows —
+            // skips the intermediate round-trip AND the padding-row silu of the
+            // two-pass (siluMul runs over the whole maxPad, ~89% padding). Bit-
+            // identical to the else-branch. ~9x on this sub-split (microbench).
+            mgOps().moeSiluMulQuantNvfp4RowsAsync(gatePad, upPad, aBank2, sfaBank2, 1.0F,
+                                               contigToPad, R, n_ff_exp);
+        } else {
+            _ops.siluMulAsync(gatePad, upPad, maxPad * n_ff_exp);  // silu(gate)*up
+            mgOps().moeActQuantNvfp4RowsAsync(gatePad, aBank2, sfaBank2, 1.0F, contigToPad, R, n_ff_exp);
+        }
+
+        _ops.profileSection("moe.dgemm");   // down TC GEMM (prefill sub-split)
+        mgOps().moeGroupedGemmNvfp4TcBanksAsync(
+            nExperts, d_model, n_ff_exp, expOffset, padOffset, aBank2, sfaBank2,
+            downExps.tcNibblePtr, downExps.tcSfbPtr,
+            static_cast<const float*>(downExps.tcGlobalsPtr), downPad,
+            banksScratch, banksBytes);
+
+        // scatter padded expert output back to token order (routed sum).
+        _ops.profileSection("moe.sc");   // scatter expert out (prefill sub-split)
+        _ops.moeScatterExpertOutAsync(downPad, padAsn, kwSlot, moeAccumBuf,
+                                      d_model, nSeq, K);
+}
+
+
 void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
                                         const float*   moeInput,
                                         std::size_t    nSeq,
@@ -1104,35 +1257,7 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     // ceiling OEA (batch-aware piggyback routing) can cut. Sync D2H (~1 KB),
     // profile-run only; when the env is unset this whole block is skipped so
     // the prod device-driven path is untouched (no D2H).
-    static const bool kOeaUnionProfile =
-        std::getenv("MIMIRMIND_MOE_UNION_PROFILE") != nullptr;
-    if (kOeaUnionProfile && nSeq > 1) {
-        std::vector<std::int32_t> hostOff(nExperts + 1);
-        _ops.readbackToHost(hostOff.data(), expOffset,
-                            (nExperts + 1) * sizeof(std::int32_t));
-        std::size_t unique = 0;
-        for (std::size_t e = 0; e < nExperts; ++e) {
-            if (hostOff[e + 1] > hostOff[e]) {
-                ++unique;
-            }
-        }
-        static long sumUnique = 0;
-        static long sumT      = 0;
-        static long nCalls    = 0;
-        sumUnique += static_cast<long>(unique);
-        sumT      += static_cast<long>(nSeq);
-        ++nCalls;
-        if ((nCalls % 256) == 0) {
-            MM_LOG_INFO(
-                "moe-oea",
-                "union-profile: avg unique={}/{} ({:.1f}%) @avg T={} over {} "
-                "MoE-layer-steps (this: layer={} T={} unique={} R={})",
-                sumUnique / nCalls, nExperts,
-                100.0 * static_cast<double>(sumUnique) /
-                    (static_cast<double>(nCalls) * static_cast<double>(nExperts)),
-                sumT / nCalls, nCalls, blockIdx, nSeq, unique, R);
-        }
-    }
+    runMoeOeaUnionProfile(expOffset, nExperts, nSeq, R, blockIdx);
 
     // FP4-tensor-core grouped path: the routed experts are the NVFP4_TC format
     // (loader built the nibble + swizzled-SFB + globals banks) and CUTLASS is
@@ -1167,111 +1292,9 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
         downExps.type == core::gguf::GgmlType::NVFP4_BLK;
 
     if (tcGrouped) {
-        // --- Sub-Step E-d: FP4-tensor-core grouped GEMM (F32 out) ----------
-        // Each expert padded to 128 rows so its SFA sub-tensor is tile-aligned
-        // in one big act-quant; every per-group pointer built on device from
-        // expOffset/padOffset — nothing crosses to the host.
-        namespace mo = core::modelopt;
-        const std::size_t maxPad = R + nExperts * 128;
-        const std::size_t nAsn   = R;                    // nSeq * K assignments
-        // Per-slot scratch lives in BlockBuffers (concurrent-prefill safe);
-        // lazily grown to the current maxPad on first / larger use.
-        auto grow = [&](compute::ComputeBuffer& buf, std::size_t bytes) {
-            if (buf.bytes() < bytes) buf = _ops.allocate(bytes);
-        };
-        grow(s.moeTcPadOffset,   (nExperts + 1) * sizeof(std::int32_t));
-        grow(s.moeTcContigToPad, R * sizeof(std::int32_t));
-        grow(s.moeTcPadAsn,      nAsn * sizeof(std::int32_t));
-        // moeTcXPad dropped (5.21.10): the fused gather+quant reads the
-        // compact rows directly, so the [maxPad, d_model] F32 intermediate
-        // (~hundreds of MiB at prefill maxPad) is no longer allocated.
-        grow(s.moeTcGatePad,     maxPad * n_ff_exp * sizeof(float));
-        grow(s.moeTcUpPad,       maxPad * n_ff_exp * sizeof(float));
-        grow(s.moeTcDownPad,     maxPad * d_model * sizeof(float));
-        grow(s.moeTcABank,       maxPad * (d_model / 2));
-        grow(s.moeTcSfaBank,     mo::swizzledBlockScaleBytes(maxPad, d_model / 16));
-        grow(s.moeTcABank2,      maxPad * (n_ff_exp / 2));
-        grow(s.moeTcSfaBank2,    mo::swizzledBlockScaleBytes(maxPad, n_ff_exp / 16));
-        grow(s.moeTcBanksScratch,
-             _ops.moeGroupedGemmNvfp4TcBanksGateUpScratchBytes(nExperts));
-
-        auto* const padOffset   = s.moeTcPadOffset.as<std::int32_t>();
-        auto* const contigToPad = s.moeTcContigToPad.as<std::int32_t>();
-        auto* const padAsn      = s.moeTcPadAsn.as<std::int32_t>();
-        float* const gatePad = s.moeTcGatePad.as<float>();
-        float* const upPad   = s.moeTcUpPad.as<float>();
-        float* const downPad = s.moeTcDownPad.as<float>();
-        auto* const aBank    = s.moeTcABank.as<unsigned char>();
-        auto* const sfaBank  = s.moeTcSfaBank.as<unsigned char>();
-        auto* const aBank2   = s.moeTcABank2.as<unsigned char>();
-        auto* const sfaBank2 = s.moeTcSfaBank2.as<unsigned char>();
-        void* const banksScratch     = s.moeTcBanksScratch.get();
-        const std::size_t banksBytes = s.moeTcBanksScratch.bytes();
-
-        _ops.profileSection("moe.prep");   // row maps + act-quant (prefill sub-split)
-        // padded row maps (device only)
-        mgOps().moePadOffsetsAsync(expOffset, padOffset, nExperts);
-        mgOps().moeContigToPadAsync(expOffset, padOffset, contigToPad, nExperts, R);
-        mgOps().moeIndexGatherI32Async(asnToRow, contigToPad, padAsn, nAsn);
-
-        // 5.21.10: FUSED gather+quant — read the COMPACT gathered rows and
-        // write nibbles/SF straight at the padded slots. Replaces the
-        // moe_rows_scatter_f32 F32 round-trip (write [maxPad, d_model], then
-        // re-read it for the quant) + the separate quant launch; the xPad
-        // intermediate tensor is gone entirely. Bit-identical (same values,
-        // same quant math, same output layout). Padding rows keep the zeroed
-        // SF (scale 0 -> act 0); their GEMM output is discarded.
-        mgOps().moeZeroBytesAsync(sfaBank, mo::swizzledBlockScaleBytes(maxPad, d_model / 16));
-        // 5.18.21 FUSED gather+act-quant: read the ungathered moeInput directly at
-        // each logical row's source token (rowSrcTok) — skips the standalone
-        // rt.gather + the xComp [R, d_model] intermediate. Bit-identical (xComp[r]
-        // was exactly moeInput[rowSrcTok[r]]).
-        mgOps().moeActQuantNvfp4GatherRowsAsync(moeInput, aBank, sfaBank, 1.0F,
-                                             contigToPad, R, d_model, rowSrcTok);
-
-        // gate + up: N=n_ff_exp, K=d_model. alpha[e] = weight global (folds the
-        // per-expert global back in; act gscale=1).
-        _ops.profileSection("moe.gemm");   // gate+up TC GEMM (prefill sub-split)
-        // 5.18.21: gate+up in ONE grouped GEMM (2*nExperts groups) — one CUTLASS
-        // can_implement/initialize/run instead of two, and A/SFA read once.
-        // Bit-identical to the two separate banks calls: gate -> gatePad, up ->
-        // upPad, each group keeps its own per-expert alpha (weight global).
-        mgOps().moeGroupedGemmNvfp4TcBanksGateUpAsync(
-            nExperts, n_ff_exp, d_model, expOffset, padOffset, aBank, sfaBank,
-            gateExps.tcNibblePtr, gateExps.tcSfbPtr,
-            static_cast<const float*>(gateExps.tcGlobalsPtr), gatePad,
-            upExps.tcNibblePtr, upExps.tcSfbPtr,
-            static_cast<const float*>(upExps.tcGlobalsPtr), upPad,
-            banksScratch, banksBytes);
-
-        _ops.profileSection("moe.silu");   // silu + intermediate act-quant (sub-split)
-        // Row-mapped act-quant of silu(gate)*up -> down GEMM (N=d_model, K=n_ff_exp).
-        // The gate/up GEMM wrote outputs at the padded slots (contigToPad), so the
-        // real rows live there. sfaBank2 padding must stay zeroed (both paths).
-        mgOps().moeZeroBytesAsync(sfaBank2, mo::swizzledBlockScaleBytes(maxPad, n_ff_exp / 16));
-        if (_moeSiluFuse) {
-            // 5.21.8: fused silu*up + quant in one pass over the R real rows —
-            // skips the intermediate round-trip AND the padding-row silu of the
-            // two-pass (siluMul runs over the whole maxPad, ~89% padding). Bit-
-            // identical to the else-branch. ~9x on this sub-split (microbench).
-            mgOps().moeSiluMulQuantNvfp4RowsAsync(gatePad, upPad, aBank2, sfaBank2, 1.0F,
-                                               contigToPad, R, n_ff_exp);
-        } else {
-            _ops.siluMulAsync(gatePad, upPad, maxPad * n_ff_exp);  // silu(gate)*up
-            mgOps().moeActQuantNvfp4RowsAsync(gatePad, aBank2, sfaBank2, 1.0F, contigToPad, R, n_ff_exp);
-        }
-
-        _ops.profileSection("moe.dgemm");   // down TC GEMM (prefill sub-split)
-        mgOps().moeGroupedGemmNvfp4TcBanksAsync(
-            nExperts, d_model, n_ff_exp, expOffset, padOffset, aBank2, sfaBank2,
-            downExps.tcNibblePtr, downExps.tcSfbPtr,
-            static_cast<const float*>(downExps.tcGlobalsPtr), downPad,
-            banksScratch, banksBytes);
-
-        // scatter padded expert output back to token order (routed sum).
-        _ops.profileSection("moe.sc");   // scatter expert out (prefill sub-split)
-        _ops.moeScatterExpertOutAsync(downPad, padAsn, kwSlot, moeAccumBuf,
-                                      d_model, nSeq, K);
+        runMoeGroupedTc(s, moeInput, gateExps, upExps, downExps,
+                        expOffset, asnToRow, rowSrcTok, kwSlot, moeAccumBuf,
+                        R, nExperts, K, d_model, n_ff_exp, nSeq);
     } else if (deviceDrivenGrouped) {
         // --- Option 2: fully device-driven grouped GEMM (Sub-Step E) -------
         // moe_group_tiles builds a compact per-tile (expert, row-range)
