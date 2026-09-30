@@ -596,6 +596,11 @@ public:
     void updateDecodeCurLen(std::int32_t v);
 
 private:
+    // 8.30.11.4 — ctor helper: allocate the persistent device scratch (flash
+    // partial-tile buffer, curLen + staging-offset slots, scalar staging ring)
+    // and set up decode-profiling events. Grouped out of the GpuOps ctor.
+    void initPersistentScratch();
+
     core::cuda::CudaComputeContext& _ctx;
 
     // 8.30.11.4 — the segregated FP4-TC grouped-MoE ops, owned here and handed

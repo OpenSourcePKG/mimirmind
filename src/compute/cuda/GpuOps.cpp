@@ -741,19 +741,8 @@ struct GpuOps::Impl {
     {}
 };
 
-GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
-                     bool                          flashPrefillEnabled,
-                     bool                          flashPrefillGqaQ8Enabled,
-                     bool                          flashPrefillGqaQ8BqEnabled,
-                     std::size_t                   flashPrefillKTileQ8,
-                     core::config::TriState        q8_0ReorderMode)
-    : _ctx{ctx},
-      _mgo{_ctx},
-      _pao{_ctx},
-      _pimpl{std::make_unique<Impl>(ctx.cudaContext())},
-      _moeTopKRoute{ctx}
-{
-    auto& alloc = ctx.allocator();
+void GpuOps::initPersistentScratch() {
+    auto& alloc = _ctx.allocator();
 
     // Persistent FlashAttention partial-tile scratch — same layout +
     // worst-case sizing as the L0 side. Reused across every decode.
@@ -798,6 +787,21 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
     // Pinned source lets `cudaMemcpyAsync` truly enqueue without
     // stalling. Ring cycles cleanly (256 slots > any in-flight batch).
     _scalarRing.init(alloc);
+}
+
+GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
+                     bool                          flashPrefillEnabled,
+                     bool                          flashPrefillGqaQ8Enabled,
+                     bool                          flashPrefillGqaQ8BqEnabled,
+                     std::size_t                   flashPrefillKTileQ8,
+                     core::config::TriState        q8_0ReorderMode)
+    : _ctx{ctx},
+      _mgo{_ctx},
+      _pao{_ctx},
+      _pimpl{std::make_unique<Impl>(ctx.cudaContext())},
+      _moeTopKRoute{ctx}
+{
+    initPersistentScratch();
 
     _prefillFlashDisabled        = !flashPrefillEnabled;
     _prefillFlashGqaQ8Disabled   = !flashPrefillGqaQ8Enabled;
