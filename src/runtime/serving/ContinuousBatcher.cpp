@@ -1022,56 +1022,7 @@ void ContinuousBatcher::workerLoop() {
             // prefilling only [reusePos, promptLen). Runs before the cold loop so
             // a continuation reclaims its warm slot before a cold admit could
             // evict it. No-op unless the GDN warm-slot capability is on.
-            if (_warmSlot) {
-                for (auto it = _waiting.begin();
-                     it != _waiting.end() &&
-                     (_admitPerIter == 0 || admitted < _admitPerIter); ) {
-                    std::size_t reusePos = 0;
-                    const std::size_t ws = findWarmSlot(it->prompt, reusePos);
-                    if (ws == std::numeric_limits<std::size_t>::max()) {
-                        ++it;
-                        continue;
-                    }
-                    Slot& s = _slots[ws];
-                    // Compute the token-LCP against the resident sequence so we can
-                    // prune the diverged tail (checkpoints > LCP are from the
-                    // previous request and would be WRONG to reuse next time).
-                    std::size_t lcp = 0;
-                    const std::size_t lim =
-                        std::min(s.residentTokens.size(), it->prompt.size());
-                    while (lcp < lim && s.residentTokens[lcp] == it->prompt[lcp]) {
-                        ++lcp;
-                    }
-                    _engine.pruneSlotSsmCkpts(ws, lcp);
-                    s.occupied     = true;
-                    s.resident     = false;
-                    s.xslotPayload = 0;   // 5.28.1.2.b — same-slot reuse, no store pin
-                    s.req          = std::move(it->req);
-                    s.prompt       = std::move(it->prompt);
-                    s.promptLen    = s.prompt.size();
-                    initThinkState(s);   // 5.30.1 thinking-token-budget
-                    s.pos          = 0;
-                    s.lastTok      = 0;
-                    s.maxNew       = it->maxNew;
-                    s.produced     = 0;
-                    s.stopIds      = std::move(it->stopIds);
-                    s.prefillPos   = 0;
-                    s.prefillStart = reusePos;   // resume from the interior checkpoint
-                    s.admitAt      = std::chrono::steady_clock::now();
-                    _engine.setServingSlotSampling(
-                        ws, it->sampling, std::span<const std::int32_t>(s.prompt));
-                    _engine.setServingSlotToolConstraint(ws, it->constraint);
-                    it = _waiting.erase(it);
-                    if (_prefillChunk > 0 && s.promptLen > reusePos) {
-                        toPrefill.push_back(ws);
-                    }
-                    ++admitted;
-                    MM_LOG_INFO("serving",
-                                "GDN warm-slot HIT: slot={} resume@{} tok (LCP {}), "
-                                "prefill only {} new tok (of {}) — KV+SSM resumed",
-                                ws, reusePos, lcp, s.promptLen - reusePos, s.promptLen);
-                }
-            }
+            admitWarmSlots(admitted, toPrefill);
 
             // 5.28.1.2.b — CROSS-SLOT pass: for requests the same-slot warm pass
             // could not place, consult the GLOBAL prefix store. A hit restores a
@@ -1079,124 +1030,9 @@ void ContinuousBatcher::workerLoop() {
             // fresh cold slot and prefills only the divergent tail — the
             // multi-tenant RAG win. Runs after the warm pass (same-slot reuse is
             // cheaper: no copy) and before the cold loop. Cap OFF unless _xslot.
-            if (_xslot) {
-                for (auto it = _waiting.begin();
-                     it != _waiting.end() &&
-                     (_admitPerIter == 0 || admitted < _admitPerIter); ) {
-                    std::size_t   xpos = 0;
-                    std::uint64_t xpid = 0;
-                    if (!_engine.lookupPrefixImage(it->prompt, xpos, xpid) ||
-                        xpos == 0 || xpos >= it->prompt.size()) {
-                        ++it;
-                        continue;   // no usable cross-slot prefix -> cold loop
-                    }
-                    const std::size_t i = pickColdSlot();
-                    if (i == std::numeric_limits<std::size_t>::max()) {
-                        break;      // no free slot this iteration
-                    }
-                    // Copy the stored SSM+conv+KV[0,xpos) into the chosen slot.
-                    // If the entry was evicted between lookup and here, fall back
-                    // to the cold loop for this request.
-                    if (!_engine.restorePrefixImageToSlot(i, xpid)) {
-                        ++it;
-                        continue;
-                    }
-                    _engine.acquirePrefixImage(xpid);   // pin for the slot lifetime
-                    Slot& s = _slots[i];
-                    // The cold pick may land on a warm-RESIDENT slot: wipe its
-                    // stale interior checkpoint ring so prefillSlotAdmitted's
-                    // same-slot restoreSlotSsmCkptAtPos(xpos) is a no-op and the
-                    // cross-slot SSM we just copied in survives.
-                    _engine.clearSlotSsmCkpts(i);
-                    s.occupied     = true;
-                    s.resident     = false;
-                    s.xslotPayload = xpid;
-                    s.req          = std::move(it->req);
-                    s.prompt       = std::move(it->prompt);
-                    s.promptLen    = s.prompt.size();
-                    initThinkState(s);   // 5.30.1 thinking-token-budget
-                    s.pos          = 0;
-                    s.lastTok      = 0;
-                    s.maxNew       = it->maxNew;
-                    s.produced     = 0;
-                    s.stopIds      = std::move(it->stopIds);
-                    s.prefillPos   = 0;
-                    s.prefillStart = xpos;   // KV+SSM for [0,xpos) copied in
-                    s.admitAt      = std::chrono::steady_clock::now();
-                    _engine.setServingSlotSampling(
-                        i, it->sampling, std::span<const std::int32_t>(s.prompt));
-                    _engine.setServingSlotToolConstraint(i, it->constraint);
-                    it = _waiting.erase(it);
-                    if (_prefillChunk > 0 && s.promptLen > xpos) {
-                        toPrefill.push_back(i);
-                    }
-                    ++admitted;
-                    MM_LOG_INFO("serving",
-                                "GDN cross-slot HIT: slot={} resume@{} tok, prefill "
-                                "only {} new tok (of {}) — KV+SSM copied from store",
-                                i, xpos, s.promptLen - xpos, s.promptLen);
-                }
-            }
+            admitCrossSlots(admitted, toPrefill);
 
-            while (!_waiting.empty()) {
-                if (_admitPerIter != 0 && admitted >= _admitPerIter) break;
-                // 5.28.1.3 LRU-preserve: prefer a truly-cold free slot so a
-                // resident (warm) slot is only evicted under real slot pressure
-                // (LRU). Identical to the old lowest-free pick when the warm-slot
-                // capability is off (no slot is ever resident then).
-                const std::size_t i = pickColdSlot();
-                if (i == std::numeric_limits<std::size_t>::max()) {
-                    break;   // no free slot this iteration
-                }
-                Pending p = std::move(_waiting.front());
-                _waiting.pop_front();
-                Slot& s     = _slots[i];
-                s.occupied  = true;
-                s.xslotPayload = 0;   // 5.28.1.2.b — cold full prefill, no store pin
-                s.req       = std::move(p.req);
-                s.prompt    = std::move(p.prompt);
-                s.promptLen = s.prompt.size();
-                initThinkState(s);   // 5.30.1 thinking-token-budget
-                s.pos       = 0;
-                s.lastTok   = 0;
-                s.maxNew    = p.maxNew;
-                s.produced  = 0;
-                s.stopIds   = std::move(p.stopIds);
-                s.prefillPos = 0;   // 5.21-III mixed step: start prefilling in-band
-                // 5.28.1.3 — cold admit: this may land on a resident (warm) slot;
-                // evict it. Prefill from 0 so the first chunk's startPos==0
-                // re-zeros the recurrence via seqStart, drop the stale token
-                // history so findWarmSlot never matches this fresh request, and
-                // free the slot's stale interior-checkpoint ring.
-                s.prefillStart = 0;
-                s.admitAt      = std::chrono::steady_clock::now();
-                s.resident     = false;
-                s.residentTokens.clear();
-                _engine.clearSlotSsmCkpts(i);
-                // 8.19.5: push the request's sampling params into the slot
-                // before any forward touches it (first prefill token + every
-                // decode step honour them); the prompt seeds the M7f penalty
-                // window. Only the worker thread admits slots and drives
-                // stepServing, so no extra synchronisation.
-                _engine.setServingSlotSampling(
-                    i, p.sampling,
-                    std::span<const std::int32_t>(s.prompt));
-                _engine.setServingSlotToolConstraint(i, p.constraint);  // 8.19.13.2
-                // Chunked prefill: the whole prompt ingests as one or more
-                // T>1 forwards (prefillSlotAdmitted splits it into
-                // _prefillChunk-sized chunks, each carrying KV + recurrent
-                // state forward), replacing token-by-token prompt ingestion.
-                // The TRUE mixed step (_mixedStep) instead prefills in-band with
-                // decode — no eager prefill, so it skips toPrefill. Under the
-                // pressure gate, a mixed-step slot admitted with no backlog still
-                // takes the eager path (keeps live decoders on the fast path).
-                const bool eagerPrefill =
-                    !_mixedStep || (_mixedStepPressureGate && !prefillPressure);
-                if (_prefillChunk > 0 && s.promptLen > 0 && eagerPrefill) {
-                    toPrefill.push_back(i);
-                }
-                ++admitted;
-            }
+            admitColdSlots(admitted, toPrefill, prefillPressure);
 
             for (std::size_t i = 0; i < _maxBatch; ++i) {
                 if (_slots[i].occupied) nActive = i + 1;
@@ -1382,5 +1218,186 @@ void ContinuousBatcher::workerLoop() {
         }
     }
 }
+
+void ContinuousBatcher::admitWarmSlots(std::size_t& admitted,
+                                        std::vector<std::size_t>& toPrefill) {
+            if (_warmSlot) {
+                for (auto it = _waiting.begin();
+                     it != _waiting.end() &&
+                     (_admitPerIter == 0 || admitted < _admitPerIter); ) {
+                    std::size_t reusePos = 0;
+                    const std::size_t ws = findWarmSlot(it->prompt, reusePos);
+                    if (ws == std::numeric_limits<std::size_t>::max()) {
+                        ++it;
+                        continue;
+                    }
+                    Slot& s = _slots[ws];
+                    // Compute the token-LCP against the resident sequence so we can
+                    // prune the diverged tail (checkpoints > LCP are from the
+                    // previous request and would be WRONG to reuse next time).
+                    std::size_t lcp = 0;
+                    const std::size_t lim =
+                        std::min(s.residentTokens.size(), it->prompt.size());
+                    while (lcp < lim && s.residentTokens[lcp] == it->prompt[lcp]) {
+                        ++lcp;
+                    }
+                    _engine.pruneSlotSsmCkpts(ws, lcp);
+                    s.occupied     = true;
+                    s.resident     = false;
+                    s.xslotPayload = 0;   // 5.28.1.2.b — same-slot reuse, no store pin
+                    s.req          = std::move(it->req);
+                    s.prompt       = std::move(it->prompt);
+                    s.promptLen    = s.prompt.size();
+                    initThinkState(s);   // 5.30.1 thinking-token-budget
+                    s.pos          = 0;
+                    s.lastTok      = 0;
+                    s.maxNew       = it->maxNew;
+                    s.produced     = 0;
+                    s.stopIds      = std::move(it->stopIds);
+                    s.prefillPos   = 0;
+                    s.prefillStart = reusePos;   // resume from the interior checkpoint
+                    s.admitAt      = std::chrono::steady_clock::now();
+                    _engine.setServingSlotSampling(
+                        ws, it->sampling, std::span<const std::int32_t>(s.prompt));
+                    _engine.setServingSlotToolConstraint(ws, it->constraint);
+                    it = _waiting.erase(it);
+                    if (_prefillChunk > 0 && s.promptLen > reusePos) {
+                        toPrefill.push_back(ws);
+                    }
+                    ++admitted;
+                    MM_LOG_INFO("serving",
+                                "GDN warm-slot HIT: slot={} resume@{} tok (LCP {}), "
+                                "prefill only {} new tok (of {}) — KV+SSM resumed",
+                                ws, reusePos, lcp, s.promptLen - reusePos, s.promptLen);
+                }
+            }
+}
+
+void ContinuousBatcher::admitCrossSlots(std::size_t& admitted,
+                                         std::vector<std::size_t>& toPrefill) {
+            if (_xslot) {
+                for (auto it = _waiting.begin();
+                     it != _waiting.end() &&
+                     (_admitPerIter == 0 || admitted < _admitPerIter); ) {
+                    std::size_t   xpos = 0;
+                    std::uint64_t xpid = 0;
+                    if (!_engine.lookupPrefixImage(it->prompt, xpos, xpid) ||
+                        xpos == 0 || xpos >= it->prompt.size()) {
+                        ++it;
+                        continue;   // no usable cross-slot prefix -> cold loop
+                    }
+                    const std::size_t i = pickColdSlot();
+                    if (i == std::numeric_limits<std::size_t>::max()) {
+                        break;      // no free slot this iteration
+                    }
+                    // Copy the stored SSM+conv+KV[0,xpos) into the chosen slot.
+                    // If the entry was evicted between lookup and here, fall back
+                    // to the cold loop for this request.
+                    if (!_engine.restorePrefixImageToSlot(i, xpid)) {
+                        ++it;
+                        continue;
+                    }
+                    _engine.acquirePrefixImage(xpid);   // pin for the slot lifetime
+                    Slot& s = _slots[i];
+                    // The cold pick may land on a warm-RESIDENT slot: wipe its
+                    // stale interior checkpoint ring so prefillSlotAdmitted's
+                    // same-slot restoreSlotSsmCkptAtPos(xpos) is a no-op and the
+                    // cross-slot SSM we just copied in survives.
+                    _engine.clearSlotSsmCkpts(i);
+                    s.occupied     = true;
+                    s.resident     = false;
+                    s.xslotPayload = xpid;
+                    s.req          = std::move(it->req);
+                    s.prompt       = std::move(it->prompt);
+                    s.promptLen    = s.prompt.size();
+                    initThinkState(s);   // 5.30.1 thinking-token-budget
+                    s.pos          = 0;
+                    s.lastTok      = 0;
+                    s.maxNew       = it->maxNew;
+                    s.produced     = 0;
+                    s.stopIds      = std::move(it->stopIds);
+                    s.prefillPos   = 0;
+                    s.prefillStart = xpos;   // KV+SSM for [0,xpos) copied in
+                    s.admitAt      = std::chrono::steady_clock::now();
+                    _engine.setServingSlotSampling(
+                        i, it->sampling, std::span<const std::int32_t>(s.prompt));
+                    _engine.setServingSlotToolConstraint(i, it->constraint);
+                    it = _waiting.erase(it);
+                    if (_prefillChunk > 0 && s.promptLen > xpos) {
+                        toPrefill.push_back(i);
+                    }
+                    ++admitted;
+                    MM_LOG_INFO("serving",
+                                "GDN cross-slot HIT: slot={} resume@{} tok, prefill "
+                                "only {} new tok (of {}) — KV+SSM copied from store",
+                                i, xpos, s.promptLen - xpos, s.promptLen);
+                }
+            }
+}
+
+void ContinuousBatcher::admitColdSlots(std::size_t& admitted,
+                                       std::vector<std::size_t>& toPrefill,
+                                       bool prefillPressure) {
+            while (!_waiting.empty()) {
+                if (_admitPerIter != 0 && admitted >= _admitPerIter) break;
+                // 5.28.1.3 LRU-preserve: prefer a truly-cold free slot so a
+                // resident (warm) slot is only evicted under real slot pressure
+                // (LRU). Identical to the old lowest-free pick when the warm-slot
+                // capability is off (no slot is ever resident then).
+                const std::size_t i = pickColdSlot();
+                if (i == std::numeric_limits<std::size_t>::max()) {
+                    break;   // no free slot this iteration
+                }
+                Pending p = std::move(_waiting.front());
+                _waiting.pop_front();
+                Slot& s     = _slots[i];
+                s.occupied  = true;
+                s.xslotPayload = 0;   // 5.28.1.2.b — cold full prefill, no store pin
+                s.req       = std::move(p.req);
+                s.prompt    = std::move(p.prompt);
+                s.promptLen = s.prompt.size();
+                initThinkState(s);   // 5.30.1 thinking-token-budget
+                s.pos       = 0;
+                s.lastTok   = 0;
+                s.maxNew    = p.maxNew;
+                s.produced  = 0;
+                s.stopIds   = std::move(p.stopIds);
+                s.prefillPos = 0;   // 5.21-III mixed step: start prefilling in-band
+                // 5.28.1.3 — cold admit: this may land on a resident (warm) slot;
+                // evict it. Prefill from 0 so the first chunk's startPos==0
+                // re-zeros the recurrence via seqStart, drop the stale token
+                // history so findWarmSlot never matches this fresh request, and
+                // free the slot's stale interior-checkpoint ring.
+                s.prefillStart = 0;
+                s.admitAt      = std::chrono::steady_clock::now();
+                s.resident     = false;
+                s.residentTokens.clear();
+                _engine.clearSlotSsmCkpts(i);
+                // 8.19.5: push the request's sampling params into the slot
+                // before any forward touches it (first prefill token + every
+                // decode step honour them); the prompt seeds the M7f penalty
+                // window. Only the worker thread admits slots and drives
+                // stepServing, so no extra synchronisation.
+                _engine.setServingSlotSampling(
+                    i, p.sampling,
+                    std::span<const std::int32_t>(s.prompt));
+                _engine.setServingSlotToolConstraint(i, p.constraint);  // 8.19.13.2
+                // Chunked prefill: the whole prompt ingests as one or more
+                // T>1 forwards (prefillSlotAdmitted splits it into
+                // _prefillChunk-sized chunks, each carrying KV + recurrent
+                // state forward), replacing token-by-token prompt ingestion.
+                // The TRUE mixed step (_mixedStep) instead prefills in-band with
+                // decode — no eager prefill, so it skips toPrefill. Under the
+                // pressure gate, a mixed-step slot admitted with no backlog still
+                // takes the eager path (keeps live decoders on the fast path).
+                const bool eagerPrefill =
+                    !_mixedStep || (_mixedStepPressureGate && !prefillPressure);
+                if (_prefillChunk > 0 && s.promptLen > 0 && eagerPrefill) {
+                    toPrefill.push_back(i);
+                }
+                ++admitted;
+            }
+}
+
 
 } // namespace mimirmind::runtime::serving

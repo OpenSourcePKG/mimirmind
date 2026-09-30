@@ -269,6 +269,20 @@ private:
     };
 
     void workerLoop();
+
+    /// workerLoop admission passes, extracted verbatim. Each runs UNDER the
+    /// caller's _mtx lock (workerLoop holds it) and shares the per-iteration
+    /// `admitted` counter + `toPrefill` list by reference, exactly as the inlined
+    /// passes did. Warm/cross self-guard on _warmSlot/_xslot. admitColdSlots also
+    /// takes the pressure-gate decision (eager-prefill vs in-band mixed prefill).
+    void admitWarmSlots(std::size_t& admitted,
+                        std::vector<std::size_t>& toPrefill);
+    void admitCrossSlots(std::size_t& admitted,
+                         std::vector<std::size_t>& toPrefill);
+    void admitColdSlots(std::size_t& admitted,
+                        std::vector<std::size_t>& toPrefill,
+                        bool prefillPressure);
+
     [[nodiscard]] bool isStop(std::int32_t tok, const Slot& s) const;
 
     /// 5.30.1 — set the slot's thinking-budget state at admission by inspecting
