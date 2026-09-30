@@ -1140,6 +1140,212 @@ void Qwen3_5MoeBackend::runMoeGroupedTc(
 }
 
 
+void Qwen3_5MoeBackend::runMoeGroupedDeviceDriven(
+        std::size_t blockIdx, bool preferBlocked, BlockBuffers& s,
+        const core::gguf::GgufTensor& gateExps,
+        const core::gguf::GgufTensor& upExps,
+        const core::gguf::GgufTensor& downExps,
+        const MoeGroupedArgs& a) {
+    // Destructure into the exact locals the moved body used (8.30.11.4).
+    const std::size_t R        = a.R;
+    const std::size_t nExperts = a.nExperts;
+    const std::size_t d_model  = a.d_model;
+    const std::size_t n_ff_exp = a.n_ff_exp;
+    const std::size_t nSeq     = a.nSeq;
+    float* const      xComp    = a.xComp;
+    float* const      gateComp = a.gateComp;
+    float* const      upComp   = a.upComp;
+    float* const      downComp = a.downComp;
+    auto* const       expOffset = a.expOffset;
+    {
+        // --- Option 2: fully device-driven grouped GEMM (Sub-Step E) -------
+        // moe_group_tiles builds a compact per-tile (expert, row-range)
+        // schedule on the device; ONE moe_grouped_gemm_nvfp4blk launch per
+        // projection consumes it, reading the tile assignment on the device.
+        // No expOffset D2H, no per-expert host loop — nothing crosses to the
+        // host, so the stream is never drained mid-layer (the killer that
+        // made the host-driven path lose to fused-K on GB10).
+        // GD-b: decode (preferBlocked) uses tileM=4 + the small-M kernel so the
+        // GEMM's shared/register footprint drops and SM occupancy rises (decode
+        // M is ~1-2 rows/expert). Prefill keeps tileM=16.
+        // 5.18.9: the register-staged m2reg decode kernel handles at most 2 rows/
+        // tile, so cap the schedule at tileM=2 when MIMIRMIND_MOE_DECODE_REG=1
+        // (GpuOps then dispatches m2reg for the smallM path). Buffers are sized for
+        // tileM=2 (BlockBuffers kMoeTileM), so the larger tile count fits.
+        // 5.18.13: MIMIRMIND_MOE_DECODE_REG=4 keeps tileM=4 and dispatches the
+        // register-fixed m4reg kernel (5.18.12) — half the tiles of mode 1, each
+        // weight read amortized over up to 4 rows.
+        const std::size_t tileM    = preferBlocked ? (_moeDecodeReg == 1 ? 2 : 4) : 16;
+        const bool        smallM   = preferBlocked;
+        const std::size_t maxTiles = (R + tileM - 1) / tileM + nExperts;
+        auto* const tileExpert = s.moeGroupTileExpert.as<std::int32_t>();
+        auto* const tileRow0   = s.moeGroupTileRow0.as<std::int32_t>();
+        auto* const tileRows   = s.moeGroupTileRows.as<std::int32_t>();
+        auto* const tileCount  = s.moeGroupTileCount.as<std::int32_t>();
+
+        _ops.profileSection("rt.tiles");
+        _ops.moeGroupTilesAsync(expOffset, tileExpert, tileRow0, tileRows,
+                                tileCount, nExperts, maxTiles, tileM);
+
+        const auto* const gateBase =
+            static_cast<const unsigned char*>(gateExps.usmPtr);
+        const auto* const upBase =
+            static_cast<const unsigned char*>(upExps.usmPtr);
+        const auto* const downBase =
+            static_cast<const unsigned char*>(downExps.usmPtr);
+
+        _ops.profileSection("moe.gemm");
+        // gate/up: weight [nExperts][n_ff_exp][d_model] (N=n_ff_exp, K=d_model)
+        // Single-user decode (nSeq==1 => <=1 row/tile) can take the de-inter-
+        // leaved uint4-coalesced kernel (~2x DRAM bandwidth); everything else
+        // stays on the interleaved GD-b path.
+        const bool deint = _useDeintMoe && nSeq == 1;
+        // M1-REG: single-user (nSeq==1) register-staged decode kernel — the
+        // activation lives in registers instead of shared memory, removing the
+        // ncu-measured MIO/short-scoreboard stall without spending occupancy
+        // (+2-4% vs m4). Interleaved layout like GD-b (no de-interleave cache);
+        // default-on, mutually exclusive with deint.
+        const bool m1nb = _useM1nb && nSeq == 1 && !deint;
+        // 5.18.8: fuse gate+up into ONE stacked-w13 deint GEMM (N=2*n_ff). One
+        // launch instead of two AND double N -> better SM fill on the tileM=4
+        // M=1 kernel. Per-block stacked bank [nExp][2*n_ff][d_model] built once
+        // (gate[e] rows then up[e] rows), mirroring the GDN in_proj concat-cache.
+        // Bit-identical: same weights, same silu*up math (fused split kernel).
+        const bool w13Fused = deint && _moeW13Fuse;
+        if (w13Fused) {
+            const auto [ge, gb] = moeBlockGeom(gateExps.type);   // {32,20} NVFP4_BLK
+            const std::size_t perExpertBytes = n_ff_exp * ((d_model / ge) * gb);
+            compute::ComputeBuffer& w13Buf = _moeW13W[blockIdx];
+            if (w13Buf.bytes() == 0) {
+                // 8.16 Stage B: the fused w13 stacked bank is weight-derived.
+                core::gpu::ScopedAllocCategory _wc{core::gpu::AllocCategory::Weights};
+                w13Buf = _ops.allocate(nExperts * 2 * perExpertBytes);
+                auto* const w13 = static_cast<unsigned char*>(
+                    static_cast<void*>(w13Buf.as<float>()));
+                for (std::size_t e = 0; e < nExperts; ++e) {
+                    _ops.appendMemoryCopy(w13 + e * 2 * perExpertBytes,
+                        gateBase + e * perExpertBytes, perExpertBytes);
+                    _ops.appendMemoryCopy(w13 + e * 2 * perExpertBytes + perExpertBytes,
+                        upBase + e * perExpertBytes, perExpertBytes);
+                }
+            }
+            float* const w13Comp = s.moeW13Compact.as<float>();
+            const auto* const w13Base = static_cast<const unsigned char*>(
+                static_cast<const void*>(w13Buf.as<float>()));
+            _ops.moeGroupedGemmNvfp4DeintAsync(xComp, w13Base, w13Comp,
+                tileExpert, tileRow0, tileRows, d_model, 2 * n_ff_exp, nExperts,
+                maxTiles, smallM);
+            _ops.siluMulSplitAsync(w13Comp, gateComp, R, n_ff_exp);
+        } else if (deint) {
+            _ops.moeGroupedGemmNvfp4DeintAsync(xComp, gateBase, gateComp,
+                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, nExperts,
+                maxTiles, smallM);
+            _ops.moeGroupedGemmNvfp4DeintAsync(xComp, upBase, upComp,
+                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, nExperts,
+                maxTiles, smallM);
+        } else if (m1nb) {
+            _ops.moeGroupedGemmNvfp4M1NBAsync(xComp, gateBase, gateComp,
+                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles);
+            _ops.moeGroupedGemmNvfp4M1NBAsync(xComp, upBase, upComp,
+                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles);
+        } else {
+            _ops.moeGroupedGemmNvfp4Async(xComp, gateBase, gateComp,
+                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles, smallM);
+            _ops.moeGroupedGemmNvfp4Async(xComp, upBase, upComp,
+                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles, smallM);
+        }
+        if (!w13Fused) {
+            _ops.siluMulAsync(gateComp, upComp, R * n_ff_exp);  // silu(gate)*up
+        }
+        // down: weight [nExperts][d_model][n_ff_exp] (N=d_model, K=n_ff_exp)
+        if (deint) {
+            _ops.moeGroupedGemmNvfp4DeintAsync(gateComp, downBase, downComp,
+                tileExpert, tileRow0, tileRows, n_ff_exp, d_model, nExperts,
+                maxTiles, smallM);
+        } else if (m1nb) {
+            _ops.moeGroupedGemmNvfp4M1NBAsync(gateComp, downBase, downComp,
+                tileExpert, tileRow0, tileRows, n_ff_exp, d_model, maxTiles);
+        } else {
+            _ops.moeGroupedGemmNvfp4Async(gateComp, downBase, downComp,
+                tileExpert, tileRow0, tileRows, n_ff_exp, d_model, maxTiles, smallM);
+        }
+    }
+}
+
+void Qwen3_5MoeBackend::runMoeGroupedHostDriven(
+        const core::gguf::GgufTensor& gateExps,
+        const core::gguf::GgufTensor& upExps,
+        const core::gguf::GgufTensor& downExps,
+        float* matmulScratch, const MoeGroupedArgs& a) {
+    // Destructure into the exact locals the moved body used (8.30.11.4).
+    const std::size_t nExperts = a.nExperts;
+    const std::size_t d_model  = a.d_model;
+    const std::size_t n_ff_exp = a.n_ff_exp;
+    float* const      xComp    = a.xComp;
+    float* const      gateComp = a.gateComp;
+    float* const      upComp   = a.upComp;
+    float* const      downComp = a.downComp;
+    auto* const       expOffset = a.expOffset;
+    {
+        // --- Option 1: host-driven grouped (correct but slower on GB10) ----
+        // The per-expert launch bounds are the only thing that must cross to
+        // the host — one small D2H (nExperts+1 ints) per MoE layer. This
+        // stream drain is exactly why Option 1 loses; the device-driven
+        // branch above avoids it.
+        _groupOffsetHost.resize(nExperts + 1);
+        _ops.flush();
+        _ops.readbackToHost(_groupOffsetHost.data(), expOffset,
+                            (nExperts + 1) * sizeof(std::int32_t));
+
+        // Per-expert byte strides (separate banks, one block per expert).
+        std::size_t bytesGate = 0, bytesUp = 0, bytesDown = 0;
+        if (gateExps.type == core::gguf::GgmlType::BF16) {
+            bytesGate = n_ff_exp * d_model * sizeof(std::uint16_t);
+            bytesUp   = n_ff_exp * d_model * sizeof(std::uint16_t);
+            bytesDown = d_model * n_ff_exp * sizeof(std::uint16_t);
+        } else {
+            const auto [geGate, gbGate] = moeBlockGeom(gateExps.type);
+            const auto [geUp,   gbUp]   = moeBlockGeom(upExps.type);
+            const auto [geDown, gbDown] = moeBlockGeom(downExps.type);
+            if (geGate == 0 || geUp == 0 || geDown == 0) {
+                throw std::runtime_error(
+                    "Qwen3_5MoeBackend::runMoeFfnGrouped: expert weight type(s) "
+                    "not in QuantType registry");
+            }
+            bytesGate = n_ff_exp * ((d_model / geGate) * gbGate);
+            bytesUp   = n_ff_exp * ((d_model / geUp)   * gbUp);
+            bytesDown = d_model * ((n_ff_exp / geDown) * gbDown);
+        }
+        const auto* const gateBase = static_cast<const std::uint8_t*>(gateExps.usmPtr);
+        const auto* const upBase   = static_cast<const std::uint8_t*>(upExps.usmPtr);
+        const auto* const downBase = static_cast<const std::uint8_t*>(downExps.usmPtr);
+
+        // --- one dense GEMM per expert over its M=count[e] grouped rows ----
+        // Each expert weight is read once per 16-row GEMM chunk. Experts with
+        // no routed tokens are skipped (an M=0 launch is pure overhead).
+        for (std::size_t e = 0; e < nExperts; ++e) {
+            const std::int32_t off = _groupOffsetHost[e];
+            const std::int32_t end = _groupOffsetHost[e + 1];
+            const std::size_t  Me  = static_cast<std::size_t>(end - off);
+            if (Me == 0) {
+                continue;
+            }
+            const float* xE    = xComp    + static_cast<std::size_t>(off) * d_model;
+            float*       gateE = gateComp + static_cast<std::size_t>(off) * n_ff_exp;
+            float*       upE   = upComp   + static_cast<std::size_t>(off) * n_ff_exp;
+            float*       downE = downComp + static_cast<std::size_t>(off) * d_model;
+
+            _gmm.matmulAsync(gateExps.type, gateBase + e * bytesGate,
+                             n_ff_exp, d_model, xE, Me, gateE, matmulScratch);
+            _gmm.matmulAsync(upExps.type, upBase + e * bytesUp,
+                             n_ff_exp, d_model, xE, Me, upE, matmulScratch);
+            _ops.siluMulAsync(gateE, upE, Me * n_ff_exp);      // silu(gate)*up
+            _gmm.matmulAsync(downExps.type, downBase + e * bytesDown,
+                             d_model, n_ff_exp, gateE, Me, downE, matmulScratch);
+        }
+    }
+}
+
 void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
                                         const float*   moeInput,
                                         std::size_t    nSeq,
@@ -1296,174 +1502,16 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
                         expOffset, asnToRow, rowSrcTok, kwSlot, moeAccumBuf,
                         R, nExperts, K, d_model, n_ff_exp, nSeq);
     } else if (deviceDrivenGrouped) {
-        // --- Option 2: fully device-driven grouped GEMM (Sub-Step E) -------
-        // moe_group_tiles builds a compact per-tile (expert, row-range)
-        // schedule on the device; ONE moe_grouped_gemm_nvfp4blk launch per
-        // projection consumes it, reading the tile assignment on the device.
-        // No expOffset D2H, no per-expert host loop — nothing crosses to the
-        // host, so the stream is never drained mid-layer (the killer that
-        // made the host-driven path lose to fused-K on GB10).
-        // GD-b: decode (preferBlocked) uses tileM=4 + the small-M kernel so the
-        // GEMM's shared/register footprint drops and SM occupancy rises (decode
-        // M is ~1-2 rows/expert). Prefill keeps tileM=16.
-        // 5.18.9: the register-staged m2reg decode kernel handles at most 2 rows/
-        // tile, so cap the schedule at tileM=2 when MIMIRMIND_MOE_DECODE_REG=1
-        // (GpuOps then dispatches m2reg for the smallM path). Buffers are sized for
-        // tileM=2 (BlockBuffers kMoeTileM), so the larger tile count fits.
-        // 5.18.13: MIMIRMIND_MOE_DECODE_REG=4 keeps tileM=4 and dispatches the
-        // register-fixed m4reg kernel (5.18.12) — half the tiles of mode 1, each
-        // weight read amortized over up to 4 rows.
-        const std::size_t tileM    = preferBlocked ? (_moeDecodeReg == 1 ? 2 : 4) : 16;
-        const bool        smallM   = preferBlocked;
-        const std::size_t maxTiles = (R + tileM - 1) / tileM + nExperts;
-        auto* const tileExpert = s.moeGroupTileExpert.as<std::int32_t>();
-        auto* const tileRow0   = s.moeGroupTileRow0.as<std::int32_t>();
-        auto* const tileRows   = s.moeGroupTileRows.as<std::int32_t>();
-        auto* const tileCount  = s.moeGroupTileCount.as<std::int32_t>();
-
-        _ops.profileSection("rt.tiles");
-        _ops.moeGroupTilesAsync(expOffset, tileExpert, tileRow0, tileRows,
-                                tileCount, nExperts, maxTiles, tileM);
-
-        const auto* const gateBase =
-            static_cast<const unsigned char*>(gateExps.usmPtr);
-        const auto* const upBase =
-            static_cast<const unsigned char*>(upExps.usmPtr);
-        const auto* const downBase =
-            static_cast<const unsigned char*>(downExps.usmPtr);
-
-        _ops.profileSection("moe.gemm");
-        // gate/up: weight [nExperts][n_ff_exp][d_model] (N=n_ff_exp, K=d_model)
-        // Single-user decode (nSeq==1 => <=1 row/tile) can take the de-inter-
-        // leaved uint4-coalesced kernel (~2x DRAM bandwidth); everything else
-        // stays on the interleaved GD-b path.
-        const bool deint = _useDeintMoe && nSeq == 1;
-        // M1-REG: single-user (nSeq==1) register-staged decode kernel — the
-        // activation lives in registers instead of shared memory, removing the
-        // ncu-measured MIO/short-scoreboard stall without spending occupancy
-        // (+2-4% vs m4). Interleaved layout like GD-b (no de-interleave cache);
-        // default-on, mutually exclusive with deint.
-        const bool m1nb = _useM1nb && nSeq == 1 && !deint;
-        // 5.18.8: fuse gate+up into ONE stacked-w13 deint GEMM (N=2*n_ff). One
-        // launch instead of two AND double N -> better SM fill on the tileM=4
-        // M=1 kernel. Per-block stacked bank [nExp][2*n_ff][d_model] built once
-        // (gate[e] rows then up[e] rows), mirroring the GDN in_proj concat-cache.
-        // Bit-identical: same weights, same silu*up math (fused split kernel).
-        const bool w13Fused = deint && _moeW13Fuse;
-        if (w13Fused) {
-            const auto [ge, gb] = moeBlockGeom(gateExps.type);   // {32,20} NVFP4_BLK
-            const std::size_t perExpertBytes = n_ff_exp * ((d_model / ge) * gb);
-            compute::ComputeBuffer& w13Buf = _moeW13W[blockIdx];
-            if (w13Buf.bytes() == 0) {
-                // 8.16 Stage B: the fused w13 stacked bank is weight-derived.
-                core::gpu::ScopedAllocCategory _wc{core::gpu::AllocCategory::Weights};
-                w13Buf = _ops.allocate(nExperts * 2 * perExpertBytes);
-                auto* const w13 = static_cast<unsigned char*>(
-                    static_cast<void*>(w13Buf.as<float>()));
-                for (std::size_t e = 0; e < nExperts; ++e) {
-                    _ops.appendMemoryCopy(w13 + e * 2 * perExpertBytes,
-                        gateBase + e * perExpertBytes, perExpertBytes);
-                    _ops.appendMemoryCopy(w13 + e * 2 * perExpertBytes + perExpertBytes,
-                        upBase + e * perExpertBytes, perExpertBytes);
-                }
-            }
-            float* const w13Comp = s.moeW13Compact.as<float>();
-            const auto* const w13Base = static_cast<const unsigned char*>(
-                static_cast<const void*>(w13Buf.as<float>()));
-            _ops.moeGroupedGemmNvfp4DeintAsync(xComp, w13Base, w13Comp,
-                tileExpert, tileRow0, tileRows, d_model, 2 * n_ff_exp, nExperts,
-                maxTiles, smallM);
-            _ops.siluMulSplitAsync(w13Comp, gateComp, R, n_ff_exp);
-        } else if (deint) {
-            _ops.moeGroupedGemmNvfp4DeintAsync(xComp, gateBase, gateComp,
-                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, nExperts,
-                maxTiles, smallM);
-            _ops.moeGroupedGemmNvfp4DeintAsync(xComp, upBase, upComp,
-                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, nExperts,
-                maxTiles, smallM);
-        } else if (m1nb) {
-            _ops.moeGroupedGemmNvfp4M1NBAsync(xComp, gateBase, gateComp,
-                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles);
-            _ops.moeGroupedGemmNvfp4M1NBAsync(xComp, upBase, upComp,
-                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles);
-        } else {
-            _ops.moeGroupedGemmNvfp4Async(xComp, gateBase, gateComp,
-                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles, smallM);
-            _ops.moeGroupedGemmNvfp4Async(xComp, upBase, upComp,
-                tileExpert, tileRow0, tileRows, d_model, n_ff_exp, maxTiles, smallM);
-        }
-        if (!w13Fused) {
-            _ops.siluMulAsync(gateComp, upComp, R * n_ff_exp);  // silu(gate)*up
-        }
-        // down: weight [nExperts][d_model][n_ff_exp] (N=d_model, K=n_ff_exp)
-        if (deint) {
-            _ops.moeGroupedGemmNvfp4DeintAsync(gateComp, downBase, downComp,
-                tileExpert, tileRow0, tileRows, n_ff_exp, d_model, nExperts,
-                maxTiles, smallM);
-        } else if (m1nb) {
-            _ops.moeGroupedGemmNvfp4M1NBAsync(gateComp, downBase, downComp,
-                tileExpert, tileRow0, tileRows, n_ff_exp, d_model, maxTiles);
-        } else {
-            _ops.moeGroupedGemmNvfp4Async(gateComp, downBase, downComp,
-                tileExpert, tileRow0, tileRows, n_ff_exp, d_model, maxTiles, smallM);
-        }
+        runMoeGroupedDeviceDriven(blockIdx, preferBlocked, s, gateExps, upExps,
+                                  downExps,
+                                  MoeGroupedArgs{xComp, gateComp, upComp, downComp,
+                                                 expOffset, R, nExperts, d_model,
+                                                 n_ff_exp, nSeq});
     } else {
-        // --- Option 1: host-driven grouped (correct but slower on GB10) ----
-        // The per-expert launch bounds are the only thing that must cross to
-        // the host — one small D2H (nExperts+1 ints) per MoE layer. This
-        // stream drain is exactly why Option 1 loses; the device-driven
-        // branch above avoids it.
-        _groupOffsetHost.resize(nExperts + 1);
-        _ops.flush();
-        _ops.readbackToHost(_groupOffsetHost.data(), expOffset,
-                            (nExperts + 1) * sizeof(std::int32_t));
-
-        // Per-expert byte strides (separate banks, one block per expert).
-        std::size_t bytesGate = 0, bytesUp = 0, bytesDown = 0;
-        if (gateExps.type == core::gguf::GgmlType::BF16) {
-            bytesGate = n_ff_exp * d_model * sizeof(std::uint16_t);
-            bytesUp   = n_ff_exp * d_model * sizeof(std::uint16_t);
-            bytesDown = d_model * n_ff_exp * sizeof(std::uint16_t);
-        } else {
-            const auto [geGate, gbGate] = moeBlockGeom(gateExps.type);
-            const auto [geUp,   gbUp]   = moeBlockGeom(upExps.type);
-            const auto [geDown, gbDown] = moeBlockGeom(downExps.type);
-            if (geGate == 0 || geUp == 0 || geDown == 0) {
-                throw std::runtime_error(
-                    "Qwen3_5MoeBackend::runMoeFfnGrouped: expert weight type(s) "
-                    "not in QuantType registry");
-            }
-            bytesGate = n_ff_exp * ((d_model / geGate) * gbGate);
-            bytesUp   = n_ff_exp * ((d_model / geUp)   * gbUp);
-            bytesDown = d_model * ((n_ff_exp / geDown) * gbDown);
-        }
-        const auto* const gateBase = static_cast<const std::uint8_t*>(gateExps.usmPtr);
-        const auto* const upBase   = static_cast<const std::uint8_t*>(upExps.usmPtr);
-        const auto* const downBase = static_cast<const std::uint8_t*>(downExps.usmPtr);
-
-        // --- one dense GEMM per expert over its M=count[e] grouped rows ----
-        // Each expert weight is read once per 16-row GEMM chunk. Experts with
-        // no routed tokens are skipped (an M=0 launch is pure overhead).
-        for (std::size_t e = 0; e < nExperts; ++e) {
-            const std::int32_t off = _groupOffsetHost[e];
-            const std::int32_t end = _groupOffsetHost[e + 1];
-            const std::size_t  Me  = static_cast<std::size_t>(end - off);
-            if (Me == 0) {
-                continue;
-            }
-            const float* xE    = xComp    + static_cast<std::size_t>(off) * d_model;
-            float*       gateE = gateComp + static_cast<std::size_t>(off) * n_ff_exp;
-            float*       upE   = upComp   + static_cast<std::size_t>(off) * n_ff_exp;
-            float*       downE = downComp + static_cast<std::size_t>(off) * d_model;
-
-            _gmm.matmulAsync(gateExps.type, gateBase + e * bytesGate,
-                             n_ff_exp, d_model, xE, Me, gateE, matmulScratch);
-            _gmm.matmulAsync(upExps.type, upBase + e * bytesUp,
-                             n_ff_exp, d_model, xE, Me, upE, matmulScratch);
-            _ops.siluMulAsync(gateE, upE, Me * n_ff_exp);      // silu(gate)*up
-            _gmm.matmulAsync(downExps.type, downBase + e * bytesDown,
-                             d_model, n_ff_exp, gateE, Me, downE, matmulScratch);
-        }
+        runMoeGroupedHostDriven(gateExps, upExps, downExps, matmulScratch,
+                                MoeGroupedArgs{xComp, gateComp, upComp, downComp,
+                                               expOffset, R, nExperts, d_model,
+                                               n_ff_exp, nSeq});
     }
 
     // --- scatter the grouped output back to token order (routed sum) -------

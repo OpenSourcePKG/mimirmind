@@ -170,6 +170,36 @@ protected:
                                std::size_t nSeq, std::size_t R,
                                std::size_t blockIdx);
 
+    // runMoeFfnGrouped scalar (non-TC) grouped-GEMM branches (8.30.11.4),
+    // extracted verbatim. deviceDriven = the fully device-scheduled blocked-NVFP4
+    // path (moe_group_tiles -> one grouped GEMM/projection, nothing crosses to
+    // the host); hostDriven = the correct-but-slower per-expert loop (one D2H of
+    // the group offsets, one dense GEMM per expert). Shared compact buffers + dims
+    // are one named MoeGroupedArgs struct (same swap-proofing as GdnConvArgs);
+    // each helper destructures the fields it uses back into identical locals.
+    struct MoeGroupedArgs {
+        float*        xComp;
+        float*        gateComp;
+        float*        upComp;
+        float*        downComp;
+        std::int32_t* expOffset;
+        std::size_t   R;
+        std::size_t   nExperts;
+        std::size_t   d_model;
+        std::size_t   n_ff_exp;
+        std::size_t   nSeq;
+    };
+    void runMoeGroupedDeviceDriven(std::size_t blockIdx, bool preferBlocked,
+                                   BlockBuffers& s,
+                                   const core::gguf::GgufTensor& gateExps,
+                                   const core::gguf::GgufTensor& upExps,
+                                   const core::gguf::GgufTensor& downExps,
+                                   const MoeGroupedArgs& a);
+    void runMoeGroupedHostDriven(const core::gguf::GgufTensor& gateExps,
+                                 const core::gguf::GgufTensor& upExps,
+                                 const core::gguf::GgufTensor& downExps,
+                                 float* matmulScratch, const MoeGroupedArgs& a);
+
     // runLinearBlockBatched GDN gated-delta-rule recurrence stage (8.30.11.4),
     // extracted verbatim. Its ~14 inputs are passed as one named struct (not
     // positional) so the many same-type float* buffers cannot be swapped; the
