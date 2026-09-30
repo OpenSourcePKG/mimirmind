@@ -45,6 +45,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -482,7 +483,7 @@ TEST(cuda_sigmoid_inplace_parity) {
     ::mimirmind::compute::sigmoidInPlace(ref.data(), n);
 
     auto buf = toDevice(ops, host);
-    ops.sigmoidInPlaceAsync(static_cast<float*>(buf.get()), n);
+    ops.sigmoidInPlaceAsync(std::span<float>{static_cast<float*>(buf.get()), n});
     ops.flush();
     auto got = fromDevice(ops, buf.get(), n);
 
