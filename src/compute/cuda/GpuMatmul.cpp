@@ -249,6 +249,10 @@ struct GpuMatmul::Impl {
     std::unordered_map<const void*, void*> _bf16FromF32Cache;
     void*  _xFp8{nullptr};        // staged E4M3 activations (grows on demand)
     std::size_t _xFp8Bytes{0};
+    void*  _dp4aXq{nullptr};      // DP4A-from-float: int8 X (grows on demand)
+    std::size_t _dp4aXqBytes{0};
+    void*  _dp4aScale{nullptr};   // DP4A-from-float: per-row X scale
+    std::size_t _dp4aScaleBytes{0};
     void*  _xScaleDev{nullptr};   // 2 floats [scale, invScale] for X
     void*  _amaxDev{nullptr};     // 1 float amax scratch (kept zeroed by
                                   // scale_from_amax's consume-and-reset)
@@ -288,6 +292,8 @@ struct GpuMatmul::Impl {
         if (_amaxDev != nullptr)     { cudaFree(_amaxDev); }
         if (_xScaleDev != nullptr)   { cudaFree(_xScaleDev); }
         if (_xFp8 != nullptr)        { cudaFree(_xFp8); }
+        if (_dp4aXq != nullptr)      { cudaFree(_dp4aXq); }
+        if (_dp4aScale != nullptr)   { cudaFree(_dp4aScale); }
         if (_xBf16 != nullptr)       { cudaFree(_xBf16); }
         if (_ltWorkspace != nullptr) { cudaFree(_ltWorkspace); }
         if (_ltHandle != nullptr)    { cublasLtDestroy(_ltHandle); }
@@ -1595,21 +1601,43 @@ void GpuMatmul::matmulQ8_0Async(::mimirmind::core::gguf::GgmlType type,
     }
 
     if (_useDp4a) {
-        // Quantise X → int8 into engine-owned scratch (allocated by the
-        // caller through _ops), then DP4A-matvec. K must be a multiple
-        // of 32 — matmulDp4aAsync enforces the same guard.
-        //
-        // Sub-F.4 scope: DP4A auto-scratch not yet wired (the L0 side
-        // owns `_dp4aXqUsm` / `_dp4aScaleUsm` on GpuMatmul); a full
-        // DP4A-from-float dispatch lands together with the DP4A
-        // auto-pick bench. Until then `_useDp4a=true` requires the
-        // caller to have quantised upfront.
-        throw std::runtime_error(
-            "compute::cuda::GpuMatmul::matmulAsync: _useDp4a=true but the "
-            "DP4A-from-float scratch is not owned by this class yet — "
-            "call matmulDp4aAsync with pre-quantised Xq/Xscale (from "
-            "GpuOps::xQuantI8Async) instead. Auto-DP4A-from-float lands "
-            "in a follow-up commit.");
+        // DP4A-from-float dispatch (8.30.11.5.2): quantise X -> int8 with a
+        // per-row scale into class-owned scratch (grown on demand), then run
+        // the int8 DP4A matvec — the same two-step the L0 side does via
+        // _dp4aXqUsm/_dp4aScaleUsm. This is the real int8 path vLLM uses for
+        // Q8_0 activations; before this, features.dp4a=Force set _useDp4a but
+        // every dispatch threw here (autotune logged success -> first-token
+        // 500). K%32 is re-checked by matmulDp4aAsync.
+        const std::size_t xqBytes    = M * K;                 // int8 per element
+        const std::size_t scaleBytes = M * sizeof(float);     // one scale per row
+        if (xqBytes > _pimpl->_dp4aXqBytes) {
+            if (_pimpl->_dp4aXq != nullptr) { cudaFree(_pimpl->_dp4aXq); }
+            _pimpl->_dp4aXq = nullptr;
+            _pimpl->_dp4aXqBytes = 0;
+            if (cudaMalloc(&_pimpl->_dp4aXq, xqBytes) != cudaSuccess) {
+                throw std::runtime_error(
+                    "compute::cuda::GpuMatmul::matmulAsync: DP4A Xq scratch "
+                    "alloc failed (" + std::to_string(xqBytes) + " bytes)");
+            }
+            _pimpl->_dp4aXqBytes = xqBytes;
+        }
+        if (scaleBytes > _pimpl->_dp4aScaleBytes) {
+            if (_pimpl->_dp4aScale != nullptr) { cudaFree(_pimpl->_dp4aScale); }
+            _pimpl->_dp4aScale = nullptr;
+            _pimpl->_dp4aScaleBytes = 0;
+            if (cudaMalloc(&_pimpl->_dp4aScale, scaleBytes) != cudaSuccess) {
+                throw std::runtime_error(
+                    "compute::cuda::GpuMatmul::matmulAsync: DP4A scale scratch "
+                    "alloc failed (" + std::to_string(scaleBytes) + " bytes)");
+            }
+            _pimpl->_dp4aScaleBytes = scaleBytes;
+        }
+        auto* xq = static_cast<std::int8_t*>(_pimpl->_dp4aXq);
+        auto* xs = static_cast<float*>(_pimpl->_dp4aScale);
+        _ops.xQuantI8Async(X, xq, xs, M, K);
+        matmulDp4aAsync(::mimirmind::core::gguf::GgmlType::Q8_0,
+                        xq, xs, W, N, K, M, Y);
+        return;
     }
 
     if (M >= _gemmMinM) {
