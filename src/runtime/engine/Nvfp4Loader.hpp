@@ -83,6 +83,25 @@ private:
         const std::vector<core::modelopt::MaterializationStep>& steps,
         core::cuda::CudaComputeContext&                         cudaCtx,
         compute::cuda::CudaMaterializerOps&                     devOps);
+
+    /// 5b'. Optional (MIMIRMIND_MTP_EHSWAP) MTP eh_proj concat-half swap — swaps
+    /// the hnorm/enorm input halves of blk.<N>.nextn.eh_proj.weight in place.
+    static void applyMtpEhProjSwap(InferenceEngine&                e,
+                                   core::cuda::CudaComputeContext& cudaCtx);
+
+    /// 5c. Optional (MIMIRMIND_NVFP4_Q8_PROJ) re-quant of the dense attention
+    /// projections BF16 -> Q8_0. Default off (linear Q8_0 crushes FP8/NVFP4-origin
+    /// log-distributed weights); kept for A/B.
+    static void requantDenseAttnProjQ8_0(
+        InferenceEngine& e, core::cuda::CudaComputeContext& cudaCtx,
+        compute::cuda::CudaMaterializerOps& devOps);
+
+    /// 5e. Optional (MIMIRMIND_NVFP4_ATTN_FP8) re-quant of the dense attention
+    /// projections BF16 -> blocked-FP8 (E4M3), preserving the log format per
+    /// 32-block. Default off; `gdn` restores the memory-saving path.
+    static void requantDenseAttnProjFp8(
+        InferenceEngine& e, core::cuda::CudaComputeContext& cudaCtx,
+        compute::cuda::CudaMaterializerOps& devOps);
 };
 
 } // namespace mimirmind::runtime::engine
