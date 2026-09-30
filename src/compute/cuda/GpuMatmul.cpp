@@ -136,6 +136,29 @@ double medianMs(std::vector<double> xs) {
 // for exotic types with a QuantTypeRegistry entry that lack a native
 // kernel (e.g. F16 / BF16 / F32 direct matmul).
 struct GpuMatmul::Impl {
+    // #8 (8.30.11.5.4): every device scratch / cache below allocates through the
+    // shared CudaMemoryAllocator instead of raw cudaMalloc, so GpuMatmul's
+    // buffers show up in allocator telemetry and free through one path. The
+    // allocator's deallocate() byte count is stats-only (it has no ptr->size
+    // record), so a size is tracked per buffer purely to keep those stats right.
+    ::mimirmind::core::cuda::CudaMemoryAllocator& _alloc;
+    // Device alloc/free via _alloc. dalloc returns nullptr on OOM so the callers
+    // that must succeed keep their `if (!p) throw` guard (same shape they had on
+    // a failed cudaMalloc); dfree is nullptr-safe and noexcept.
+    [[nodiscard]] void* dalloc(std::size_t bytes) noexcept {
+        if (bytes == 0) { return nullptr; }
+        try {
+            return _alloc.allocate(
+                bytes, ::mimirmind::core::cuda::CudaAllocKind::Device);
+        } catch (...) {
+            return nullptr;
+        }
+    }
+    void dfree(void* p, std::size_t bytes) noexcept {
+        _alloc.deallocate(p, bytes,
+                          ::mimirmind::core::cuda::CudaAllocKind::Device);
+    }
+
     ::mimirmind::core::cuda::CudaModule _matmulQ8_0VecModule;
     ::mimirmind::core::cuda::CudaKernel _matmulQ8_0VecKernel;
     ::mimirmind::core::cuda::CudaModule _matmulQ8_0GemmModule;
@@ -219,7 +242,10 @@ struct GpuMatmul::Impl {
     // Inc 5: dense register-x + uint4 deint lmhead GEMV (no smem), selected when
     // MIMIRMIND_DENSE_DEINT_REG=1 (bit-identical to matmul_nvfp4blk_vec).
     ::mimirmind::core::cuda::CudaKernel _nvblkDeintRegVecKernel;
-    struct NvblkDeint { void* nib{nullptr}; void* scale{nullptr}; };
+    struct NvblkDeint {
+        void* nib{nullptr}; void* scale{nullptr};
+        std::size_t nibBytes{0}; std::size_t scaleBytes{0};
+    };
     std::unordered_map<const void*, NvblkDeint> _nvblkDeintCache;
     // cuBLASLt dense BF16 matmul (opt-in). The cast_f32_to_bf16 kernel stages
     // the F32 activation into `_xBf16` before the tensor-core GEMM; the handle
@@ -241,12 +267,16 @@ struct GpuMatmul::Impl {
     ::mimirmind::core::cuda::CudaKernel _scaleFromAmaxKernel;
     ::mimirmind::core::cuda::CudaKernel _castF32E4m3Kernel;
     ::mimirmind::core::cuda::CudaKernel _castBf16E4m3Kernel;
-    struct Fp8W { void* data{nullptr}; void* scale{nullptr}; }; // E4M3 + [scale,inv]
+    struct Fp8W {   // E4M3 + [scale,inv]
+        void* data{nullptr}; void* scale{nullptr};
+        std::size_t dataBytes{0}; std::size_t scaleBytes{0};
+    };
     std::unordered_map<const void*, Fp8W> _fp8WeightCache;
     // F32 weight -> BF16 copy, cached by source pointer (stable loaded weights).
     // Lets small M>1 F32 GEMMs (e.g. the MoE router) reuse the BF16 tensor-core
     // kernel instead of the per-row F32 vec launches.
-    std::unordered_map<const void*, void*> _bf16FromF32Cache;
+    struct Bf16FromF32 { void* buf{nullptr}; std::size_t bytes{0}; };
+    std::unordered_map<const void*, Bf16FromF32> _bf16FromF32Cache;
     void*  _xFp8{nullptr};        // staged E4M3 activations (grows on demand)
     std::size_t _xFp8Bytes{0};
     void*  _dp4aXq{nullptr};      // DP4A-from-float: int8 X (grows on demand)
@@ -273,15 +303,15 @@ struct GpuMatmul::Impl {
 
     ~Impl() {
         for (auto& kv : _fp8WeightCache) {
-            if (kv.second.data  != nullptr) { cudaFree(kv.second.data); }
-            if (kv.second.scale != nullptr) { cudaFree(kv.second.scale); }
+            dfree(kv.second.data,  kv.second.dataBytes);
+            dfree(kv.second.scale, kv.second.scaleBytes);
         }
         for (auto& kv : _nvblkDeintCache) {
-            if (kv.second.nib   != nullptr) { cudaFree(kv.second.nib); }
-            if (kv.second.scale != nullptr) { cudaFree(kv.second.scale); }
+            dfree(kv.second.nib,   kv.second.nibBytes);
+            dfree(kv.second.scale, kv.second.scaleBytes);
         }
         for (auto& kv : _bf16FromF32Cache) {
-            if (kv.second != nullptr) { cudaFree(kv.second); }
+            dfree(kv.second.buf, kv.second.bytes);
         }
         for (auto& kv : _ltPlanCache) {
             if (kv.second.cL != nullptr) { cublasLtMatrixLayoutDestroy(kv.second.cL); }
@@ -289,18 +319,20 @@ struct GpuMatmul::Impl {
             if (kv.second.aL != nullptr) { cublasLtMatrixLayoutDestroy(kv.second.aL); }
             if (kv.second.op != nullptr) { cublasLtMatmulDescDestroy(kv.second.op); }
         }
-        if (_amaxDev != nullptr)     { cudaFree(_amaxDev); }
-        if (_xScaleDev != nullptr)   { cudaFree(_xScaleDev); }
-        if (_xFp8 != nullptr)        { cudaFree(_xFp8); }
-        if (_dp4aXq != nullptr)      { cudaFree(_dp4aXq); }
-        if (_dp4aScale != nullptr)   { cudaFree(_dp4aScale); }
-        if (_xBf16 != nullptr)       { cudaFree(_xBf16); }
-        if (_ltWorkspace != nullptr) { cudaFree(_ltWorkspace); }
+        dfree(_amaxDev,     sizeof(float));
+        dfree(_xScaleDev,   2 * sizeof(float));
+        dfree(_xFp8,        _xFp8Bytes);
+        dfree(_dp4aXq,      _dp4aXqBytes);
+        dfree(_dp4aScale,   _dp4aScaleBytes);
+        dfree(_xBf16,       _xBf16Bytes);
+        dfree(_ltWorkspace, _ltWorkspaceBytes);
         if (_ltHandle != nullptr)    { cublasLtDestroy(_ltHandle); }
     }
 
-    explicit Impl(::mimirmind::core::cuda::CudaContext& ctx)
-        : _matmulQ8_0VecModule    {loadCudaModule(ctx, "matmul_q8_0_vec")},
+    explicit Impl(::mimirmind::core::cuda::CudaContext& ctx,
+                  ::mimirmind::core::cuda::CudaMemoryAllocator& alloc)
+        : _alloc{alloc},
+          _matmulQ8_0VecModule    {loadCudaModule(ctx, "matmul_q8_0_vec")},
           _matmulQ8_0VecKernel    {
               _matmulQ8_0VecModule.getFunction("matmul_q8_0_vec")},
           _matmulQ8_0GemmModule   {loadCudaModule(ctx, "matmul_q8_0_gemm")},
@@ -438,7 +470,7 @@ GpuMatmul::GpuMatmul(::mimirmind::core::cuda::CudaComputeContext& ctx,
                      GpuOps& ops)
     : _ctx{ctx},
       _ops{ops},
-      _pimpl{std::make_unique<Impl>(ctx.cudaContext())}
+      _pimpl{std::make_unique<Impl>(ctx.cudaContext(), ctx.allocator())}
 {
     // Value-aware so `env MIMIRMIND_MMQ=` (empty) reads as OFF — a bare
     // presence check turns an empty A/B-baseline var into an accidental ON.
@@ -848,9 +880,8 @@ bool GpuMatmul::cublasBf16Matmul(const void*  W,
             return false;
         }
         _pimpl->_ltWorkspaceBytes = std::size_t{32} * 1024 * 1024;   // 32 MiB
-        if (cudaMalloc(&_pimpl->_ltWorkspace, _pimpl->_ltWorkspaceBytes)
-                != cudaSuccess) {
-            _pimpl->_ltWorkspace      = nullptr;
+        _pimpl->_ltWorkspace = _pimpl->dalloc(_pimpl->_ltWorkspaceBytes);
+        if (_pimpl->_ltWorkspace == nullptr) {
             _pimpl->_ltWorkspaceBytes = 0;   // matmul still runs, no scratch
         }
     }
@@ -860,11 +891,11 @@ bool GpuMatmul::cublasBf16Matmul(const void*  W,
     const std::size_t needBytes = elems * sizeof(std::uint16_t);   // BF16 = 2B
     if (needBytes > _pimpl->_xBf16Bytes) {
         if (_pimpl->_xBf16 != nullptr) {
-            cudaFree(_pimpl->_xBf16);
+            _pimpl->dfree(_pimpl->_xBf16, _pimpl->_xBf16Bytes);
             _pimpl->_xBf16 = nullptr;
         }
-        if (cudaMalloc(&_pimpl->_xBf16, needBytes) != cudaSuccess) {
-            _pimpl->_xBf16      = nullptr;
+        _pimpl->_xBf16 = _pimpl->dalloc(needBytes);
+        if (_pimpl->_xBf16 == nullptr) {
             _pimpl->_xBf16Bytes = 0;
             return false;
         }
@@ -941,11 +972,15 @@ void GpuMatmul::nvblkDeintVec(const void* W, std::size_t N, std::size_t K,
     auto it = _pimpl->_nvblkDeintCache.find(W);
     if (it == _pimpl->_nvblkDeintCache.end()) {
         Impl::NvblkDeint c;
-        if (cudaMalloc(&c.nib, totalSupers * 16) != cudaSuccess) {
+        c.nibBytes   = totalSupers * 16;
+        c.scaleBytes = totalSupers * 4;
+        c.nib = _pimpl->dalloc(c.nibBytes);
+        if (c.nib == nullptr) {
             return;
         }
-        if (cudaMalloc(&c.scale, totalSupers * 4) != cudaSuccess) {
-            cudaFree(c.nib);
+        c.scale = _pimpl->dalloc(c.scaleBytes);
+        if (c.scale == nullptr) {
+            _pimpl->dfree(c.nib, c.nibBytes);
             return;
         }
         auto& dk = _pimpl->_nvblkDeinterleaveKernel;
@@ -991,20 +1026,20 @@ bool GpuMatmul::cublasFp8Matmul(const void*  W,
             return false;
         }
         _pimpl->_ltWorkspaceBytes = std::size_t{32} * 1024 * 1024;
-        if (cudaMalloc(&_pimpl->_ltWorkspace, _pimpl->_ltWorkspaceBytes)
-                != cudaSuccess) {
-            _pimpl->_ltWorkspace      = nullptr;
+        _pimpl->_ltWorkspace = _pimpl->dalloc(_pimpl->_ltWorkspaceBytes);
+        if (_pimpl->_ltWorkspace == nullptr) {
             _pimpl->_ltWorkspaceBytes = 0;
         }
     }
-    if (_pimpl->_xScaleDev == nullptr
-            && cudaMalloc(&_pimpl->_xScaleDev, 2 * sizeof(float)) != cudaSuccess) {
-        _pimpl->_xScaleDev = nullptr;
-        return false;
+    if (_pimpl->_xScaleDev == nullptr) {
+        _pimpl->_xScaleDev = _pimpl->dalloc(2 * sizeof(float));
+        if (_pimpl->_xScaleDev == nullptr) {
+            return false;
+        }
     }
     if (_pimpl->_amaxDev == nullptr) {
-        if (cudaMalloc(&_pimpl->_amaxDev, sizeof(float)) != cudaSuccess) {
-            _pimpl->_amaxDev = nullptr;
+        _pimpl->_amaxDev = _pimpl->dalloc(sizeof(float));
+        if (_pimpl->_amaxDev == nullptr) {
             return false;
         }
         // Zero ONCE — scale_from_amax consume-and-resets it after every use,
@@ -1023,13 +1058,14 @@ bool GpuMatmul::cublasFp8Matmul(const void*  W,
     auto wit = _pimpl->_fp8WeightCache.find(W);
     if (wit == _pimpl->_fp8WeightCache.end()) {
         const std::size_t wElems = N * K;
-        void* wData  = nullptr;
-        void* wScale = nullptr;
-        if (cudaMalloc(&wData, wElems) != cudaSuccess) {
+        const std::size_t wScaleBytes = 2 * sizeof(float);
+        void* wData  = _pimpl->dalloc(wElems);
+        if (wData == nullptr) {
             return false;
         }
-        if (cudaMalloc(&wScale, 2 * sizeof(float)) != cudaSuccess) {
-            cudaFree(wData);
+        void* wScale = _pimpl->dalloc(wScaleBytes);
+        if (wScale == nullptr) {
+            _pimpl->dfree(wData, wElems);
             return false;
         }
         void* wInv = static_cast<char*>(wScale) + sizeof(float);
@@ -1049,7 +1085,7 @@ bool GpuMatmul::cublasFp8Matmul(const void*  W,
         _pimpl->_castBf16E4m3Kernel.launch(_ctx.stream(), gridOf(wElems), 1, 1,
                                            kLocal, 1, 1);
         wit = _pimpl->_fp8WeightCache.emplace(
-            W, Impl::Fp8W{wData, wScale}).first;
+            W, Impl::Fp8W{wData, wScale, wElems, wScaleBytes}).first;
     }
     void* wData  = wit->second.data;
     void* wScale = wit->second.scale;
@@ -1058,10 +1094,11 @@ bool GpuMatmul::cublasFp8Matmul(const void*  W,
     const std::size_t xElems = M * K;
     if (xElems > _pimpl->_xFp8Bytes) {
         if (_pimpl->_xFp8 != nullptr) {
-            cudaFree(_pimpl->_xFp8);
+            _pimpl->dfree(_pimpl->_xFp8, _pimpl->_xFp8Bytes);
             _pimpl->_xFp8 = nullptr;
         }
-        if (cudaMalloc(&_pimpl->_xFp8, xElems) != cudaSuccess) {
+        _pimpl->_xFp8 = _pimpl->dalloc(xElems);
+        if (_pimpl->_xFp8 == nullptr) {
             _pimpl->_xFp8Bytes = 0;
             return false;
         }
@@ -1267,9 +1304,9 @@ void GpuMatmul::matmulF32Async(const void* W, std::size_t N, std::size_t K,
             auto cit = _pimpl->_bf16FromF32Cache.find(W);
             if (cit == _pimpl->_bf16FromF32Cache.end()) {
                 const std::size_t wElems = N * K;
-                void* wBf16 = nullptr;
-                if (cudaMalloc(&wBf16, wElems * sizeof(std::uint16_t))
-                        == cudaSuccess) {
+                const std::size_t wBf16Bytes = wElems * sizeof(std::uint16_t);
+                void* wBf16 = _pimpl->dalloc(wBf16Bytes);
+                if (wBf16 != nullptr) {
                     _pimpl->_castF32ToBf16Kernel.setPtr  (0, W);
                     _pimpl->_castF32ToBf16Kernel.setPtr  (1, wBf16);
                     _pimpl->_castF32ToBf16Kernel.setValue(2,
@@ -1278,14 +1315,15 @@ void GpuMatmul::matmulF32Async(const void* W, std::size_t N, std::size_t K,
                         _ctx.stream(),
                         static_cast<std::uint32_t>((wElems + 255) / 256), 1, 1,
                         256, 1, 1);
-                    cit = _pimpl->_bf16FromF32Cache.emplace(W, wBf16).first;
+                    cit = _pimpl->_bf16FromF32Cache.emplace(
+                        W, Impl::Bf16FromF32{wBf16, wBf16Bytes}).first;
                 }
             }
             if (cit != _pimpl->_bf16FromF32Cache.end()) {
                 auto& tk = _tf32Tc ? _pimpl->_matmulBf16GemmTf32TcKernel
                                    : _pimpl->_matmulBf16GemmTcKernel;
                 tk.setPtr  (0, X);
-                tk.setPtr  (1, cit->second);
+                tk.setPtr  (1, cit->second.buf);
                 tk.setPtr  (2, Y);
                 tk.setValue(3, static_cast<std::int32_t>(K));
                 tk.setValue(4, static_cast<std::int32_t>(N));
@@ -1611,10 +1649,13 @@ void GpuMatmul::matmulQ8_0Async(::mimirmind::core::gguf::GgmlType type,
         const std::size_t xqBytes    = M * K;                 // int8 per element
         const std::size_t scaleBytes = M * sizeof(float);     // one scale per row
         if (xqBytes > _pimpl->_dp4aXqBytes) {
-            if (_pimpl->_dp4aXq != nullptr) { cudaFree(_pimpl->_dp4aXq); }
+            if (_pimpl->_dp4aXq != nullptr) {
+                _pimpl->dfree(_pimpl->_dp4aXq, _pimpl->_dp4aXqBytes);
+            }
             _pimpl->_dp4aXq = nullptr;
             _pimpl->_dp4aXqBytes = 0;
-            if (cudaMalloc(&_pimpl->_dp4aXq, xqBytes) != cudaSuccess) {
+            _pimpl->_dp4aXq = _pimpl->dalloc(xqBytes);
+            if (_pimpl->_dp4aXq == nullptr) {
                 throw std::runtime_error(
                     "compute::cuda::GpuMatmul::matmulAsync: DP4A Xq scratch "
                     "alloc failed (" + std::to_string(xqBytes) + " bytes)");
@@ -1622,10 +1663,13 @@ void GpuMatmul::matmulQ8_0Async(::mimirmind::core::gguf::GgmlType type,
             _pimpl->_dp4aXqBytes = xqBytes;
         }
         if (scaleBytes > _pimpl->_dp4aScaleBytes) {
-            if (_pimpl->_dp4aScale != nullptr) { cudaFree(_pimpl->_dp4aScale); }
+            if (_pimpl->_dp4aScale != nullptr) {
+                _pimpl->dfree(_pimpl->_dp4aScale, _pimpl->_dp4aScaleBytes);
+            }
             _pimpl->_dp4aScale = nullptr;
             _pimpl->_dp4aScaleBytes = 0;
-            if (cudaMalloc(&_pimpl->_dp4aScale, scaleBytes) != cudaSuccess) {
+            _pimpl->_dp4aScale = _pimpl->dalloc(scaleBytes);
+            if (_pimpl->_dp4aScale == nullptr) {
                 throw std::runtime_error(
                     "compute::cuda::GpuMatmul::matmulAsync: DP4A scale scratch "
                     "alloc failed (" + std::to_string(scaleBytes) + " bytes)");
