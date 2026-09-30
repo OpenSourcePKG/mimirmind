@@ -1531,6 +1531,8 @@ add_executable(mimirmind
     src/server/ChatResponseBuilder.cpp
     src/server/ToolCallExtractor.cpp
     src/server/ToolCallSalvage.cpp
+    src/server/BatcherRunner.cpp
+    src/server/LogprobsBuilder.cpp
     src/server/RerankHandler.cpp
     src/server/EmbeddingsHandler.cpp
     src/server/DecideHandler.cpp

@@ -11,10 +11,12 @@
 #include "server/RequestTracker.hpp"
 #include "server/SseEncoder.hpp"
 #include "server/TenantMetrics.hpp"
+#include "server/LogprobsBuilder.hpp"
 #include "server/ToolCallExtractor.hpp"
 
 #include "model/ResponseCleaner.hpp"
 #include "model/ToolCallConstraint.hpp"
+#include "server/BatcherRunner.hpp"
 #include "server/ChatStreamState.hpp"
 #include "server/ToolCallSalvage.hpp"
 #include "model/ToolCallParser.hpp"
@@ -145,46 +147,6 @@ inline std::shared_ptr<model::ToolCallConstraint> makeDecodeConstraint(
     return nullptr;
 }
 
-/// 8.19.14 part B — build the OpenAI `logprobs` object (`{content:[...]}`) from
-/// the generated token stream + its captured per-token logprobs. Emitted over
-/// the GENERATED tokens (the model's raw output, like vLLM); token pieces +
-/// UTF-8 bytes are decoded here (the serving layer stays tokenizer-agnostic).
-inline nlohmann::json logprobEntryJson(std::int32_t tokId,
-                                       const runtime::TokenLogprobs& lp,
-                                       const model::Tokenizer& tok) {
-    const auto bytesOf = [](const std::string& s) {
-        nlohmann::json b = nlohmann::json::array();
-        for (unsigned char c : s) { b.push_back(static_cast<int>(c)); }
-        return b;
-    };
-    const auto decode1 = [&tok](std::int32_t id) {
-        return tok.decode(std::vector<std::int32_t>{id}, /*skipSpecial=*/false);
-    };
-    const std::string piece = decode1(tokId);
-    nlohmann::json top = nlohmann::json::array();
-    for (const auto& tp : lp.top) {
-        const std::string p = decode1(tp.token);
-        top.push_back({{"token", p},
-                       {"logprob", tp.logprob},
-                       {"bytes", bytesOf(p)}});
-    }
-    return nlohmann::json{{"token", piece},
-                          {"logprob", lp.logprob},
-                          {"bytes", bytesOf(piece)},
-                          {"top_logprobs", std::move(top)}};
-}
-
-inline nlohmann::json buildLogprobsJson(
-        const std::vector<std::int32_t>&                  generated,
-        const std::vector<runtime::TokenLogprobs>&        lp,
-        const model::Tokenizer&                           tok) {
-    nlohmann::json content = nlohmann::json::array();
-    for (std::size_t i = 0; i < generated.size() && i < lp.size(); ++i) {
-        if (!lp[i].captured) { continue; }
-        content.push_back(logprobEntryJson(generated[i], lp[i], tok));
-    }
-    return nlohmann::json{{"content", std::move(content)}};
-}
 
 /// True if any parsed call names a non-offered tool OR omits a required schema
 /// parameter — i.e. the call is structurally incomplete and the client would
@@ -236,99 +198,6 @@ inline bool callsMissingRequired(
     return false;
 }
 
-/// Drive one request through the ContinuousBatcher, mirroring the callback
-/// contract of InferenceEngine::generate() so the existing response
-/// formatting can be reused verbatim. Submits the prompt, then delivers
-/// each generated token to `onToken` in order; if `onToken` returns false
-/// (client gone) the request is cancelled. Returns the full generated
-/// stream (including any trailing stop token — the caller strips it, as it
-/// does for generate()). M-Cuda.Batch D2e.2.
-std::vector<std::int32_t> runViaBatcher(
-        runtime::serving::ContinuousBatcher&      batcher,
-        std::vector<std::int32_t>                 promptIds,
-        const runtime::GenerateParams&            params,
-        std::vector<std::int32_t>                 stopIds,
-        std::string                               tenantId,
-        const std::function<bool(std::int32_t)>&  onToken,
-        std::shared_ptr<model::ToolCallConstraint> constraint = nullptr,
-        std::vector<runtime::TokenLogprobs>*       outLp = nullptr,
-        const std::function<void(const runtime::TokenLogprobs&)>* onLp = nullptr,
-        runtime::GenerateStats*                    outStats = nullptr,
-        const std::function<void(const runtime::InferenceEngine::PrefillDone&)>*
-                                                   onPrefillDone = nullptr) {
-    // 8.19.5: hand the request's sampling params to the batcher so the slot
-    // decodes with them (temperature<=0 stays the greedy fast path).
-    // 8.19.13.2: an optional tool-call grammar constraint rides along.
-    auto req = batcher.submit(std::move(promptIds), params.maxNewTokens,
-                              std::move(stopIds), std::move(tenantId),
-                              params.sampling, std::move(constraint));
-    std::vector<std::int32_t> out;
-    std::size_t  next = 0;
-    std::int32_t t    = 0;
-    bool aborted = false;
-    bool prefillReported = false;
-    while (req->waitToken(next, t)) {
-        out.push_back(t);
-        // First token means prefill is done — surface the batcher's prefill
-        // telemetry (cached vs freshly-prefilled prompt tokens + prefill wall
-        // time) so a streaming client can emit the prefill_done event, the same
-        // as the single-session path. Fired once.
-        if (!prefillReported) {
-            prefillReported = true;
-            if (onPrefillDone != nullptr && *onPrefillDone) {
-                runtime::InferenceEngine::PrefillDone pd{};
-                {
-                    std::lock_guard<std::mutex> lk(req->mtx);
-                    pd.promptTokens    = req->promptTokens;
-                    pd.prefilledTokens = req->prefilledTokens;
-                    pd.prefillMs       = req->prefillMs;
-                }
-                (*onPrefillDone)(pd);
-            }
-        }
-        // 8.19.14 part B — per-token logprob callback (streaming). req->logprobs
-        // is appended under the same lock as the token, so index `next` is ready.
-        if (onLp != nullptr && *onLp) {
-            std::lock_guard<std::mutex> lk(req->mtx);
-            if (next < req->logprobs.size()) { (*onLp)(req->logprobs[next]); }
-        }
-        ++next;
-        if (onToken && !onToken(t)) { aborted = true; break; }
-    }
-    if (aborted) {
-        batcher.cancel(req);
-    }
-    // Hand the prefill/cache telemetry back into GenerateStats so the serving
-    // path reports the same cached_tokens / prefill_ms the single-session path
-    // does (usage.prompt_tokens_details.cached_tokens + the completion log).
-    if (outStats != nullptr) {
-        std::lock_guard<std::mutex> lk(req->mtx);
-        if (req->prefillSet) {
-            outStats->promptTokens = req->promptTokens;
-            outStats->cachedTokens = req->cachedTokens;
-            outStats->prefillMs    = req->prefillMs;
-        }
-    }
-    // 8.19.14 part B — hand back the per-token logprobs (aligned with `out`);
-    // populated only when the request enabled logprobs.
-    if (outLp != nullptr) {
-        std::lock_guard<std::mutex> lk(req->mtx);
-        *outLp = req->logprobs;
-    }
-    if (!req->error.empty()) {
-        // Per-tenant quota is checked before the whole-server overload: both
-        // set `error`, but a quota rejection is the caller's own fault (429),
-        // not server saturation (503).
-        if (req->tenantQuotaExceeded) {
-            throw runtime::serving::ServingTenantQuotaError(req->error);
-        }
-        if (req->overloaded) {
-            throw runtime::serving::ServingOverloadedError(req->error);
-        }
-        throw std::runtime_error(req->error);
-    }
-    return out;
-}
 
 } // namespace
 
@@ -848,7 +717,7 @@ void ChatCompletionHandler::handle(const httplib::Request& req,
     // per-slot batcher (see target->batcher below) that this pre-check does
     // NOT cover — the model isn't resolved yet at this point in the request.
     // A pool model at its own capacity is still correctly rejected, just via
-    // runViaBatcher's exception path (below) instead of this early clean-JSON
+    // BatcherRunner::run's exception path (below) instead of this early clean-JSON
     // shortcut; only the "reject before any bytes ship" optimization is
     // default-engine-only.
     if (_cfg.batcher != nullptr && _cfg.batcher->atCapacity()) {
@@ -992,7 +861,7 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
 
     if (useBatcher) {
         try {
-            generated = runViaBatcher(*activeBatcher, promptIds, params,
+            generated = BatcherRunner::run(*activeBatcher, promptIds, params,
                                       stopIds, tenant, onToken,
                                       makeDecodeConstraint(
                                           cr.tools, cr.toolChoice,
@@ -1263,7 +1132,7 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
                                  std::shared_ptr<model::ToolCallConstraint> fc)
                              -> std::vector<std::int32_t> {
                 if (useBatcher) {
-                    return runViaBatcher(*activeBatcher, sprompt, sp, stopIds,
+                    return BatcherRunner::run(*activeBatcher, sprompt, sp, stopIds,
                                          tenant, onToken, fc);
                 }
                 std::lock_guard<std::mutex> lk{*target->mutex};
@@ -1339,7 +1208,7 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
     json response = ChatResponseBuilder::buildCompletion(
         respId, now, echoModel, std::move(message), finish,
         // 8.19.14 part B — OpenAI logprobs (null unless requested).
-        cr.logprobs ? buildLogprobsJson(generated, lpVec, tok) : json(nullptr),
+        cr.logprobs ? LogprobsBuilder::buildJson(generated, lpVec, tok) : json(nullptr),
         std::move(usage));
 
     // 8.19.12 — collect the extra `n` choices (parallel batcher submissions
@@ -1849,7 +1718,7 @@ bool ChatCompletionHandler::runStreamSession(
                             if (!lp.captured) { return; }
                             nlohmann::json content = nlohmann::json::array();
                             content.push_back(
-                                logprobEntryJson(lp.token, lp, tok));
+                                LogprobsBuilder::entryJson(lp.token, lp, tok));
                             if (!SseEncoder::writeSseEvent(
                                     sink, SseEncoder::buildLogprobsChunk(
                                               state->respId, state->created,
@@ -1865,7 +1734,7 @@ bool ChatCompletionHandler::runStreamSession(
                     // of 0/0 (was single-session-only).
                     std::function<void(const runtime::InferenceEngine::PrefillDone&)>
                         onPrefillDoneFn = onPrefillDone;
-                    generated = runViaBatcher(*activeBatcher,
+                    generated = BatcherRunner::run(*activeBatcher,
                                               state->promptIds, state->params,
                                               state->stopIds, state->tenantId,
                                               onToken,
@@ -2044,7 +1913,7 @@ bool ChatCompletionHandler::runStreamSession(
                         -> std::vector<std::int32_t> {
                         auto noopToken = [](std::int32_t) { return true; };
                         if (useBatcher) {
-                            return runViaBatcher(
+                            return BatcherRunner::run(
                                 *activeBatcher, sprompt, sp, state->stopIds,
                                 state->tenantId, noopToken, fc);
                         }
