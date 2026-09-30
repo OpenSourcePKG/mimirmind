@@ -1479,6 +1479,8 @@ add_executable(mimirmind
     src/compute/quant/Q6K.cpp
     src/compute/quant/Q8_0.cpp
     src/model/ChatTemplate.cpp
+    src/model/chat/ChatEncoderCommon.cpp
+    src/model/chat/QwenChatEncoder.cpp
     src/model/ToolCallParser.cpp
     src/model/ToolCallConstraint.cpp
     src/model/ToolCallStreamDetector.cpp
@@ -1823,6 +1825,8 @@ add_executable(arch_tests
     src/compute/Softmax.cpp
     src/model/ResponseCleaner.cpp
     src/model/ChatTemplate.cpp
+    src/model/chat/ChatEncoderCommon.cpp
+    src/model/chat/QwenChatEncoder.cpp
     src/model/ToolCallParser.cpp
     src/model/ToolCallConstraint.cpp
     src/model/ToolCallStreamDetector.cpp
