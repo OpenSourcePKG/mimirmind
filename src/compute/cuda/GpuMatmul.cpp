@@ -613,15 +613,23 @@ void GpuMatmul::autotune(
     std::size_t                                       hiddenDim,
     const ::mimirmind::core::config::FeatureSettings& features) {
 
+    _useGemmV2 = features.gemmV2;
+    if (applyAutotuneOverrides(features)) {
+        return;
+    }
+    runQ8_0GemmAutotuneBench(alloc, hiddenDim);
+}
+
+bool GpuMatmul::applyAutotuneOverrides(
+    const ::mimirmind::core::config::FeatureSettings& features) {
+
     using ::mimirmind::core::config::TriState;
-    using ::mimirmind::compute::kAutotuneMBuckets;
 
     const bool forceDisable    = features.gemm == TriState::Disable;
     const bool forceEnable     = features.gemm == TriState::Force;
     const bool forceDisableDp4a = features.dp4a == TriState::Disable;
     const bool forceEnableDp4a  = features.dp4a == TriState::Force;
     const std::size_t envMinM  = features.gemmMinM.value_or(std::size_t{0});
-    _useGemmV2                 = features.gemmV2;
 
     // features.gemmMinM — pin the crossover threshold and skip the bench.
     // Highest-priority override; features.gemm loses to it.
@@ -631,7 +639,7 @@ void GpuMatmul::autotune(
         MM_LOG_INFO("cuda::GpuMatmul",
                     "autotune: features.gemmMinM={} — Q8_0 pinned, bench "
                     "skipped", envMinM);
-        return;
+        return true;
     }
     if (forceDisable) {
         _gemmMinM       = kGemmMinMNever;
@@ -639,7 +647,7 @@ void GpuMatmul::autotune(
         MM_LOG_INFO("cuda::GpuMatmul",
                     "autotune: features.gemm=disable — Q8_0 pinned to "
                     "matvec-loop");
-        return;
+        return true;
     }
     if (forceEnable) {
         _gemmMinM       = 2;   // GEMM whenever M > 1
@@ -647,7 +655,7 @@ void GpuMatmul::autotune(
         MM_LOG_INFO("cuda::GpuMatmul",
                     "autotune: features.gemm=force — Q8_0 pinned to GEMM "
                     "(gemmMinM=2)");
-        return;
+        return true;
     }
     if (forceEnableDp4a && !forceDisableDp4a) {
         _useDp4a        = true;
@@ -656,8 +664,16 @@ void GpuMatmul::autotune(
                     "autotune: features.dp4a=force — Q8_0 pinned to DP4A "
                     "path (matmulAsync currently requires pre-quantised "
                     "input; auto-from-float wiring lands in a follow-up)");
-        return;
+        return true;
     }
+    return false;
+}
+
+void GpuMatmul::runQ8_0GemmAutotuneBench(
+    ::mimirmind::core::cuda::CudaMemoryAllocator& alloc,
+    std::size_t                                   hiddenDim) {
+
+    using ::mimirmind::compute::kAutotuneMBuckets;
 
     // ---- Bench-driven path -------------------------------------------
 

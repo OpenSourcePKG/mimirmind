@@ -489,6 +489,16 @@ private:
     void matmulQ8_0Async(::mimirmind::core::gguf::GgmlType type,
                          const void* W, std::size_t N, std::size_t K,
                          const float* X, std::size_t M, float* Y);
+
+    // autotune() helpers (extracted verbatim). applyAutotuneOverrides handles
+    // the config-driven pins (features.gemmMinM / gemm / dp4a) and returns true
+    // when one fired (bench skipped); runQ8_0GemmAutotuneBench runs the Q8_0
+    // GEMM-vs-matvec crossover bench and derives _gemmMinM.
+    [[nodiscard]] bool applyAutotuneOverrides(
+        const ::mimirmind::core::config::FeatureSettings& features);
+    void runQ8_0GemmAutotuneBench(
+        ::mimirmind::core::cuda::CudaMemoryAllocator& alloc,
+        std::size_t                                   hiddenDim);
 };
 
 } // namespace mimirmind::compute::cuda
