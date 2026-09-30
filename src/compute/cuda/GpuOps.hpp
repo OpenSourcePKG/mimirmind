@@ -8,6 +8,7 @@
 #include "compute/IMoeGroupedOps.hpp"
 #include "compute/IPagedAttentionOps.hpp"
 #include "compute/IPleOps.hpp"
+#include "compute/cuda/CudaMoeGroupedOps.hpp"
 #include "compute/cuda/MoeTopKRouteDevice.hpp"
 #include "core/config/Config.hpp"
 #include "runtime/KvCache.hpp"
@@ -61,7 +62,6 @@ class CudnnSdpaPrefill;
  */
 class GpuOps : public ::mimirmind::compute::ComputeOps,
                public ::mimirmind::compute::IHyperConnectionOps,
-               public ::mimirmind::compute::IMoeGroupedOps,
                public ::mimirmind::compute::IPagedAttentionOps,
                public ::mimirmind::compute::IPleOps {
 public:
@@ -360,60 +360,17 @@ public:
                                        std::size_t nExperts,
                                        std::size_t maxTiles,
                                        bool decodeSmallM = false) override;
-    // E-d.4b FP4-tensor-core grouped MoE. The CUDA backend implements the
-    // segregated IMoeGroupedOps interface (8.30.6); the accessor hands it back
-    // so callers reach these without base-class throw-default stubs. Availability
-    // + scratch-size queries stay on ComputeOps.
+    // E-d.4b FP4-tensor-core grouped MoE. The 11 device ops live in
+    // CudaMoeGroupedOps (8.30.11.4); GpuOps owns one instance (_mgo) and hands it
+    // back from the accessor. Availability + scratch-size queries stay on GpuOps
+    // (ComputeOps virtuals; consulted before the interface is reached).
     [[nodiscard]] ::mimirmind::compute::IMoeGroupedOps*
-        moeGroupedOps() noexcept override { return this; }
+        moeGroupedOps() noexcept override { return &_mgo; }
     [[nodiscard]] bool moeGroupedGemmNvfp4TcAvailable() const noexcept override;
-    void moeZeroBytesAsync(void* dst, std::size_t bytes) override;
-    void moePadOffsetsAsync(const std::int32_t* expOffset,
-                            std::int32_t* padOffset, std::size_t nExperts) override;
-    void moeContigToPadAsync(const std::int32_t* expOffset,
-                             const std::int32_t* padOffset,
-                             std::int32_t* contigToPad,
-                             std::size_t nExperts, std::size_t R) override;
-    void moeRowsScatterF32Async(const float* src, const std::int32_t* idxMap,
-                                float* dst, std::size_t nRows, std::size_t dim) override;
-    void moeIndexGatherI32Async(const std::int32_t* src, const std::int32_t* idxMap,
-                                std::int32_t* dst, std::size_t n) override;
-    void moeActQuantNvfp4Async(const float* in, unsigned char* outNib,
-                               unsigned char* outSf, float gscale,
-                               std::size_t M, std::size_t K) override;
-    void moeActQuantNvfp4GatherRowsAsync(const float* in, unsigned char* outNib,
-                                         unsigned char* outSf, float gscale,
-                                         const std::int32_t* rowMap,
-                                         std::size_t nRows, std::size_t K,
-                                         const std::int32_t* srcMap = nullptr) override;
-    void moeActQuantNvfp4RowsAsync(const float* in, unsigned char* outNib,
-                                   unsigned char* outSf, float gscale,
-                                   const std::int32_t* rowMap,
-                                   std::size_t nRows, std::size_t K) override;
-    void moeSiluMulQuantNvfp4RowsAsync(const float* gate, const float* up,
-                                       unsigned char* outNib, unsigned char* outSf,
-                                       float gscale, const std::int32_t* rowMap,
-                                       std::size_t nRows, std::size_t K) override;
     [[nodiscard]] std::size_t
     moeGroupedGemmNvfp4TcBanksScratchBytes(std::size_t nExperts) const noexcept override;
-    void moeGroupedGemmNvfp4TcBanksAsync(
-        std::size_t nExperts, std::size_t N, std::size_t K,
-        const std::int32_t* expOffset, const std::int32_t* padOffset,
-        const void* aBank, const void* sfaBank,
-        const void* bBank, const void* sfbBank,
-        const float* globalsBank, void* dBank,
-        void* scratch, std::size_t scratchBytes) override;
     [[nodiscard]] std::size_t
     moeGroupedGemmNvfp4TcBanksGateUpScratchBytes(std::size_t nExperts) const noexcept override;
-    void moeGroupedGemmNvfp4TcBanksGateUpAsync(
-        std::size_t nExperts, std::size_t N, std::size_t K,
-        const std::int32_t* expOffset, const std::int32_t* padOffset,
-        const void* aBank, const void* sfaBank,
-        const void* gateBBank, const void* gateSfbBank,
-        const float* gateGlobalsBank, void* gateDBank,
-        const void* upBBank, const void* upSfbBank,
-        const float* upGlobalsBank, void* upDBank,
-        void* scratch, std::size_t scratchBytes) override;
     void sigmoidInPlaceAsync(std::span<float> y) override;
 
     // 5.27 I-3 Hyper-Connections (qwen4_exp) — the CUDA backend implements the
@@ -639,6 +596,10 @@ public:
 
 private:
     core::cuda::CudaComputeContext& _ctx;
+
+    // 8.30.11.4 — the segregated FP4-TC grouped-MoE ops, owned here and handed
+    // back from moeGroupedOps(). Constructed after _ctx (uses it).
+    CudaMoeGroupedOps _mgo;
 
     struct Impl;
     std::unique_ptr<Impl>         _pimpl;

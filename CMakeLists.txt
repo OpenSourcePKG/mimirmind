@@ -493,6 +493,7 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_executable(dflash_device_upload_test
         tests/dflash_device_upload_test.cpp
         src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/CudaMoeGroupedOps.cpp
         src/compute/cuda/MoeTopKRouteDevice.cpp
         src/compute/cuda/GpuMatmul.cpp
         src/compute/GatedDeltaNet.cpp
@@ -530,6 +531,7 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_executable(gemma4_nvfp4_materialize_repro
         tests/gemma4_nvfp4_materialize_repro.cpp
         src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/CudaMoeGroupedOps.cpp
         src/compute/cuda/CudaMaterializerOps.cpp
         src/compute/cuda/MoeTopKRouteDevice.cpp
         src/compute/cuda/GpuMatmul.cpp
@@ -568,6 +570,7 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_executable(dflash_forward_parity_test
         tests/dflash_forward_parity_test.cpp
         src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/CudaMoeGroupedOps.cpp
         src/compute/cuda/MoeTopKRouteDevice.cpp
         src/compute/cuda/GpuMatmul.cpp
         src/compute/GatedDeltaNet.cpp
@@ -605,6 +608,7 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_executable(gated_deltanet_fold_test
         tests/gated_deltanet_fold_test.cpp
         src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/CudaMoeGroupedOps.cpp
         src/compute/cuda/MoeTopKRouteDevice.cpp
         src/compute/cuda/GpuMatmul.cpp
         src/compute/GatedDeltaNet.cpp
@@ -1583,6 +1587,7 @@ if(MIMIRMIND_ENABLE_CUDA)
     target_sources(mimirmind PRIVATE
         src/compute/cuda/GpuMatmul.cpp
         src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/CudaMoeGroupedOps.cpp
         src/compute/cuda/MoeTopKRouteDevice.cpp
         src/compute/cuda/CudaMaterializerOps.cpp
         # CUDA-only microbenchmark subcommands (attnbench/gdnbench/moebench).
@@ -3293,6 +3298,7 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_executable(cuda_parity_tests
         tests/cuda_parity_tests.cpp
         src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/CudaMoeGroupedOps.cpp
         src/compute/cuda/MoeTopKRouteDevice.cpp
         src/compute/cuda/GpuMatmul.cpp
         src/compute/GatedDeltaNet.cpp
