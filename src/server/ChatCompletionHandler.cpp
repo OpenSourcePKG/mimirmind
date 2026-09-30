@@ -1502,8 +1502,19 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
          targetMutex   = target->mutex,
          targetSpec    = target->spec,
          targetBatcher = target->batcher]
-        (std::size_t /*offset*/,
-         httplib::DataSink& sink) -> bool {
+        (std::size_t /*offset*/, httplib::DataSink& sink) -> bool {
+            return runStreamSession(state, targetEngine, targetMutex,
+                                    targetSpec, targetBatcher, sink);
+        });
+}
+
+bool ChatCompletionHandler::runStreamSession(
+        std::shared_ptr<ChatStreamState>     state,
+        runtime::InferenceEngine*            targetEngine,
+        std::mutex*                          targetMutex,
+        runtime::SpeculativeDecoder*         targetSpec,
+        runtime::serving::ContinuousBatcher* targetBatcher,
+        httplib::DataSink&                   sink) {
             if (state->done) {
                 return false;
             }
@@ -2210,7 +2221,6 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                 sink.done();
                 return false;
             }
-        });
 }
 
 } // namespace mimirmind::server
