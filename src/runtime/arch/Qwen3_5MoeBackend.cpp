@@ -1883,6 +1883,149 @@ void Qwen3_5MoeBackend::runGdnRecurrence(
 }
 
 
+void Qwen3_5MoeBackend::runGdnConvAndSplit(const BatchedDecodeCtx& ctx,
+                                           const GdnConvArgs& r) {
+    // Destructure back into the exact locals the moved body used, so the
+    // conv1d+silu -> q/k/v-split stage below is byte-identical to its former
+    // inline form (8.30.11.4). convSplitFused stays internal to this stage.
+    const std::size_t nSeq           = r.nSeq;
+    const std::size_t nRow           = r.nRow;
+    const bool        ragged         = r.ragged;
+    const std::size_t convStateElems = r.convStateElems;
+    const std::size_t convDim        = r.convDim;
+    const std::size_t dConv          = r.dConv;
+    const std::size_t stateRows      = r.stateRows;
+    const std::size_t S              = r.S;
+    const std::size_t hK             = r.hK;
+    const std::size_t hV             = r.hV;
+    const std::size_t keyDim         = r.keyDim;
+    const float       eps            = r.eps;
+    float* const      convBase       = r.convBase;
+    float*            qkvMixed       = r.qkvMixed;
+    float* const      convInput      = r.convInput;
+    float* const      qBuf           = r.qBuf;
+    float* const      kBuf           = r.kBuf;
+    float* const      vBuf           = r.vBuf;
+    const auto&       convW          = *r.convW;
+
+    // --- causal conv1d + silu (per-seq rolling state) ----------------
+    // convInput[seq] = [convState[seq] (stateRows) | qkvMixed[seq] (1 row)].
+    // Serving BlockBuffers must size ssmConvInput to nSeq*dConv*convDim.
+    _ops.profileSection("gdn.conv");
+    const std::size_t convInBytes  = convStateElems * sizeof(float);
+    const std::size_t qkvRowBytes  = convDim * sizeof(float);
+    // 5.21-III ragged: slot seq's conv input = [state tail (stateRows) | its
+    // seqT[seq] tokens] at convInOff[seq]; its tokens come from qkvMixed at token
+    // offset seqOff[seq]. Decode (ragged=false): Tslot=1, inRowOff=seq*dConv,
+    // tokOff=seq — exactly the pre-varlen layout.
+    // 5.18.10.2: the per-slot copy loop below issued 2*nSeq tiny cudaMemcpyAsync
+    // per layer (plus nSeq more in the save loop) — ~7000 micro-launches per
+    // conc64 step across the GDN layers, making gdn.conv launch-bound at ~16x
+    // its traffic floor (18.1 ms/step measured 2026-09-03). The batched pack
+    // kernel builds every slot's [conv-tail | tokens] block in ONE launch;
+    // pure copies = bit-identical. The rare seqStart state-zeroing keeps its
+    // original order (before the pack reads the state).
+    if (_gdnConvBatchPack) {
+        for (std::size_t seq = 0; seq < nSeq; ++seq) {
+            const bool frozen = ctx.activeMaskHost != nullptr
+                                && ctx.activeMaskHost[seq] == 0;
+            if (!frozen && ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
+                _ops.mulScalarAsync(convBase + seq * convStateElems, 0.0F,
+                                    convStateElems);
+            }
+        }
+        _ops.gdnConvPackBatchedAsync(
+            convBase, qkvMixed, convInput, nSeq,
+            ragged ? ctx.maxSeqT : 1, convDim, dConv,
+            ragged ? ctx.seqTDev : nullptr,
+            ragged ? ctx.convInOffDev : nullptr,
+            ragged ? ctx.seqOffDev : nullptr);
+    } else {
+        std::size_t inRowRun = 0, tokRun = 0;
+        for (std::size_t seq = 0; seq < nSeq; ++seq) {
+            const std::size_t Tslot =
+                ragged ? static_cast<std::size_t>(ctx.seqTHost[seq]) : 1;
+            const std::size_t inRowOff = ragged ? inRowRun : seq * dConv;
+            const std::size_t tokOff   = ragged ? tokRun   : seq;
+            float* const cvState = convBase + seq * convStateElems;
+            float* const cvIn    = convInput + inRowOff * convDim;
+            const bool frozen = ctx.activeMaskHost != nullptr
+                                && ctx.activeMaskHost[seq] == 0;
+            if (!frozen && ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
+                _ops.mulScalarAsync(cvState, 0.0F, convStateElems);
+            }
+            _ops.appendMemoryCopy(cvIn, cvState, convInBytes);
+            _ops.appendMemoryCopy(cvIn + stateRows * convDim,
+                                  qkvMixed + tokOff * convDim, Tslot * qkvRowBytes);
+            inRowRun += stateRows + Tslot;
+            tokRun   += Tslot;
+        }
+    }
+    // 5.18.21.6: when the fused conv+split path is active, the conv1d-silu is
+    // computed on the fly inside the split kernel (no qkvMixed round-trip), so
+    // this standalone conv.k launch is skipped. Ragged + conv-batch-pack only
+    // (the fused kernel reads convInput via the ragged convInOff/seqOff layout).
+    const bool convSplitFused =
+        _gdnConvSplitFuse && ragged && _gdnConvBatchPack && S <= 1024;
+    if (!convSplitFused) {
+        _ops.profileSection("gdn.conv.k");   // 5.21.12: conv1d-silu sub-split
+        _ops.causalConv1dSiluBatchedAsync(
+            convInput, static_cast<const float*>(convW.usmPtr), qkvMixed,
+            nSeq, ragged ? ctx.maxSeqT : 1, convDim, dConv,
+            ragged ? ctx.seqTDev : nullptr,
+            ragged ? ctx.convInOffDev : nullptr,
+            ragged ? ctx.seqOffDev : nullptr);
+    }
+    _ops.profileSection("gdn.conv.save");   // 5.21.12: state-tail save sub-split
+    // Save each sequence's trailing stateRows rows as the next conv state (the
+    // last stateRows of [state | Tslot tokens] start at row Tslot).
+    // 5.21-I: a frozen slot keeps its conv tail byte-identical (skip the save).
+    // 5.18.10.2: batched save kernel (frozen skip via device activeMask).
+    if (_gdnConvBatchPack) {
+        _ops.gdnConvSaveBatchedAsync(
+            convInput, convBase, nSeq,
+            ragged ? ctx.maxSeqT : 1, convDim, dConv,
+            ctx.activeMask,
+            ragged ? ctx.seqTDev : nullptr,
+            ragged ? ctx.convInOffDev : nullptr);
+    } else {
+        std::size_t inRowRun2 = 0;
+        for (std::size_t seq = 0; seq < nSeq; ++seq) {
+            const std::size_t Tslot =
+                ragged ? static_cast<std::size_t>(ctx.seqTHost[seq]) : 1;
+            const std::size_t inRowOff = ragged ? inRowRun2 : seq * dConv;
+            inRowRun2 += stateRows + Tslot;
+            if (ctx.activeMaskHost != nullptr && ctx.activeMaskHost[seq] == 0) {
+                continue;
+            }
+            float* const cvState = convBase + seq * convStateElems;
+            float* const cvIn    = convInput + inRowOff * convDim;
+            _ops.appendMemoryCopy(cvState, cvIn + Tslot * convDim, convInBytes);
+        }
+    }
+
+    // --- split conv into q/k/v (+ GQA repeat H_k -> H_v) + q/k L2-norm ---
+    // GDN-Inc 2b: one fused launch (gather q/k/v + norm q/k) vs 3 gathers + 2 norms.
+    _ops.profileSection("gdn.split");   // 5.21.12: gather+L2norm sub-split
+    if (convSplitFused) {
+        // 5.18.21.6: fused conv1d-silu + gather + q/k L2-norm in one launch,
+        // reading convInput directly (skips the qkvMixed write+read).
+        _ops.gdnConvSplitFuseAsync(
+            convInput, static_cast<const float*>(convW.usmPtr),
+            ctx.seqOffDev, ctx.convInOffDev, qBuf, kBuf, vBuf,
+            nRow, nSeq, hK, hV, S, convDim, keyDim, dConv, eps);
+    } else if (_gdnPrepFuse) {
+        _ops.fusedPostConvPrepAsync(qkvMixed, qBuf, kBuf, vBuf, nRow, hK, hV, S,
+                                    convDim, keyDim, eps);
+    } else {
+        _ops.gatherHeadsFromChannelsAsync(qkvMixed, qBuf, nRow, 0,          hK, hV, S, convDim);
+        _ops.gatherHeadsFromChannelsAsync(qkvMixed, kBuf, nRow, keyDim,     hK, hV, S, convDim);
+        _ops.gatherHeadsFromChannelsAsync(qkvMixed, vBuf, nRow, 2 * keyDim, hV, hV, S, convDim);
+        _ops.l2NormInPlaceAsync(qBuf, nRow * hV, S, eps);
+        _ops.l2NormInPlaceAsync(kBuf, nRow * hV, S, eps);
+    }
+}
+
 void Qwen3_5MoeBackend::runLinearBlockBatched(
         std::size_t blockIdx, float* x, const BatchedDecodeCtx& ctx,
         BlockBuffers& s) {
@@ -2055,122 +2198,12 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
                                gateBuf, nRow, hV);
     }
 
-    // --- causal conv1d + silu (per-seq rolling state) ----------------
-    // convInput[seq] = [convState[seq] (stateRows) | qkvMixed[seq] (1 row)].
-    // Serving BlockBuffers must size ssmConvInput to nSeq*dConv*convDim.
-    _ops.profileSection("gdn.conv");
-    const std::size_t convInBytes  = convStateElems * sizeof(float);
-    const std::size_t qkvRowBytes  = convDim * sizeof(float);
-    // 5.21-III ragged: slot seq's conv input = [state tail (stateRows) | its
-    // seqT[seq] tokens] at convInOff[seq]; its tokens come from qkvMixed at token
-    // offset seqOff[seq]. Decode (ragged=false): Tslot=1, inRowOff=seq*dConv,
-    // tokOff=seq — exactly the pre-varlen layout.
-    // 5.18.10.2: the per-slot copy loop below issued 2*nSeq tiny cudaMemcpyAsync
-    // per layer (plus nSeq more in the save loop) — ~7000 micro-launches per
-    // conc64 step across the GDN layers, making gdn.conv launch-bound at ~16x
-    // its traffic floor (18.1 ms/step measured 2026-09-03). The batched pack
-    // kernel builds every slot's [conv-tail | tokens] block in ONE launch;
-    // pure copies = bit-identical. The rare seqStart state-zeroing keeps its
-    // original order (before the pack reads the state).
-    if (_gdnConvBatchPack) {
-        for (std::size_t seq = 0; seq < nSeq; ++seq) {
-            const bool frozen = ctx.activeMaskHost != nullptr
-                                && ctx.activeMaskHost[seq] == 0;
-            if (!frozen && ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
-                _ops.mulScalarAsync(convBase + seq * convStateElems, 0.0F,
-                                    convStateElems);
-            }
-        }
-        _ops.gdnConvPackBatchedAsync(
-            convBase, qkvMixed, convInput, nSeq,
-            ragged ? ctx.maxSeqT : 1, convDim, dConv,
-            ragged ? ctx.seqTDev : nullptr,
-            ragged ? ctx.convInOffDev : nullptr,
-            ragged ? ctx.seqOffDev : nullptr);
-    } else {
-        std::size_t inRowRun = 0, tokRun = 0;
-        for (std::size_t seq = 0; seq < nSeq; ++seq) {
-            const std::size_t Tslot =
-                ragged ? static_cast<std::size_t>(ctx.seqTHost[seq]) : 1;
-            const std::size_t inRowOff = ragged ? inRowRun : seq * dConv;
-            const std::size_t tokOff   = ragged ? tokRun   : seq;
-            float* const cvState = convBase + seq * convStateElems;
-            float* const cvIn    = convInput + inRowOff * convDim;
-            const bool frozen = ctx.activeMaskHost != nullptr
-                                && ctx.activeMaskHost[seq] == 0;
-            if (!frozen && ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
-                _ops.mulScalarAsync(cvState, 0.0F, convStateElems);
-            }
-            _ops.appendMemoryCopy(cvIn, cvState, convInBytes);
-            _ops.appendMemoryCopy(cvIn + stateRows * convDim,
-                                  qkvMixed + tokOff * convDim, Tslot * qkvRowBytes);
-            inRowRun += stateRows + Tslot;
-            tokRun   += Tslot;
-        }
-    }
-    // 5.18.21.6: when the fused conv+split path is active, the conv1d-silu is
-    // computed on the fly inside the split kernel (no qkvMixed round-trip), so
-    // this standalone conv.k launch is skipped. Ragged + conv-batch-pack only
-    // (the fused kernel reads convInput via the ragged convInOff/seqOff layout).
-    const bool convSplitFused =
-        _gdnConvSplitFuse && ragged && _gdnConvBatchPack && S <= 1024;
-    if (!convSplitFused) {
-        _ops.profileSection("gdn.conv.k");   // 5.21.12: conv1d-silu sub-split
-        _ops.causalConv1dSiluBatchedAsync(
-            convInput, static_cast<const float*>(convW.usmPtr), qkvMixed,
-            nSeq, ragged ? ctx.maxSeqT : 1, convDim, dConv,
-            ragged ? ctx.seqTDev : nullptr,
-            ragged ? ctx.convInOffDev : nullptr,
-            ragged ? ctx.seqOffDev : nullptr);
-    }
-    _ops.profileSection("gdn.conv.save");   // 5.21.12: state-tail save sub-split
-    // Save each sequence's trailing stateRows rows as the next conv state (the
-    // last stateRows of [state | Tslot tokens] start at row Tslot).
-    // 5.21-I: a frozen slot keeps its conv tail byte-identical (skip the save).
-    // 5.18.10.2: batched save kernel (frozen skip via device activeMask).
-    if (_gdnConvBatchPack) {
-        _ops.gdnConvSaveBatchedAsync(
-            convInput, convBase, nSeq,
-            ragged ? ctx.maxSeqT : 1, convDim, dConv,
-            ctx.activeMask,
-            ragged ? ctx.seqTDev : nullptr,
-            ragged ? ctx.convInOffDev : nullptr);
-    } else {
-        std::size_t inRowRun2 = 0;
-        for (std::size_t seq = 0; seq < nSeq; ++seq) {
-            const std::size_t Tslot =
-                ragged ? static_cast<std::size_t>(ctx.seqTHost[seq]) : 1;
-            const std::size_t inRowOff = ragged ? inRowRun2 : seq * dConv;
-            inRowRun2 += stateRows + Tslot;
-            if (ctx.activeMaskHost != nullptr && ctx.activeMaskHost[seq] == 0) {
-                continue;
-            }
-            float* const cvState = convBase + seq * convStateElems;
-            float* const cvIn    = convInput + inRowOff * convDim;
-            _ops.appendMemoryCopy(cvState, cvIn + Tslot * convDim, convInBytes);
-        }
-    }
-
-    // --- split conv into q/k/v (+ GQA repeat H_k -> H_v) + q/k L2-norm ---
-    // GDN-Inc 2b: one fused launch (gather q/k/v + norm q/k) vs 3 gathers + 2 norms.
-    _ops.profileSection("gdn.split");   // 5.21.12: gather+L2norm sub-split
-    if (convSplitFused) {
-        // 5.18.21.6: fused conv1d-silu + gather + q/k L2-norm in one launch,
-        // reading convInput directly (skips the qkvMixed write+read).
-        _ops.gdnConvSplitFuseAsync(
-            convInput, static_cast<const float*>(convW.usmPtr),
-            ctx.seqOffDev, ctx.convInOffDev, qBuf, kBuf, vBuf,
-            nRow, nSeq, hK, hV, S, convDim, keyDim, dConv, eps);
-    } else if (_gdnPrepFuse) {
-        _ops.fusedPostConvPrepAsync(qkvMixed, qBuf, kBuf, vBuf, nRow, hK, hV, S,
-                                    convDim, keyDim, eps);
-    } else {
-        _ops.gatherHeadsFromChannelsAsync(qkvMixed, qBuf, nRow, 0,          hK, hV, S, convDim);
-        _ops.gatherHeadsFromChannelsAsync(qkvMixed, kBuf, nRow, keyDim,     hK, hV, S, convDim);
-        _ops.gatherHeadsFromChannelsAsync(qkvMixed, vBuf, nRow, 2 * keyDim, hV, hV, S, convDim);
-        _ops.l2NormInPlaceAsync(qBuf, nRow * hV, S, eps);
-        _ops.l2NormInPlaceAsync(kBuf, nRow * hV, S, eps);
-    }
+    // --- causal conv1d+silu -> q/k/v split + L2-norm (8.30.11.4 stage) ---
+    runGdnConvAndSplit(ctx,
+                       GdnConvArgs{convBase, qkvMixed, convInput, qBuf, kBuf,
+                                   vBuf, &convW, nSeq, nRow, convStateElems,
+                                   convDim, dConv, stateRows, S, hK, hV, keyDim,
+                                   eps, ragged});
 
     // --- gated delta-rule recurrence (persistent per-seq state) ------
     _ops.profileSection("gdn.recur");

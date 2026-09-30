@@ -196,6 +196,34 @@ protected:
                           const core::gguf::GgufTensor& ssmDt,
                           const GdnRecurArgs& r);
 
+    // runLinearBlockBatched causal-conv1d+silu -> q/k/v split stage (8.30.11.4),
+    // extracted verbatim. Same named-struct discipline as GdnRecurArgs so the
+    // many same-type float* buffers cannot be swapped; the helper destructures
+    // them back into identically-named locals, keeping the moved body
+    // byte-identical. `convSplitFused` stays internal to the stage.
+    struct GdnConvArgs {
+        float*                        convBase;
+        float*                        qkvMixed;
+        float*                        convInput;
+        float*                        qBuf;
+        float*                        kBuf;
+        float*                        vBuf;
+        const core::gguf::GgufTensor* convW;
+        std::size_t                   nSeq;
+        std::size_t                   nRow;
+        std::size_t                   convStateElems;
+        std::size_t                   convDim;
+        std::size_t                   dConv;
+        std::size_t                   stateRows;
+        std::size_t                   S;
+        std::size_t                   hK;
+        std::size_t                   hV;
+        std::size_t                   keyDim;
+        float                         eps;
+        bool                          ragged;
+    };
+    void runGdnConvAndSplit(const BatchedDecodeCtx& ctx, const GdnConvArgs& r);
+
     /// Track B — one shared-expert projection through the CUTLASS block-scaled
     /// NVFP4 tensor-core GEMM as a single group (nExp=1).
     void sharedExpertTcGemm(std::size_t   N,
