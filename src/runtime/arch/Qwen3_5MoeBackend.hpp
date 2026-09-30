@@ -254,6 +254,30 @@ protected:
     };
     void runGdnConvAndSplit(const BatchedDecodeCtx& ctx, const GdnConvArgs& r);
 
+    // runLinearBlockBatched GDN input-projection stage (8.30.11.4), extracted
+    // verbatim: the 3-way qkv/gate/beta/alpha projection (fused-nSeq1 / fused-
+    // batch / 4-matmul). Inputs go through a named GdnProjArgs struct; the four
+    // OUTPUT buffers are float*& (the fused-nSeq1 branch REASSIGNS them to the
+    // fused-output slices), so the helper writes them back to the caller.
+    struct GdnProjArgs {
+        const core::gguf::GgufTensor* qkvW;
+        const core::gguf::GgufTensor* gateW;
+        const core::gguf::GgufTensor* betaW;
+        const core::gguf::GgufTensor* alphaW;
+        float*                        normBuf;
+        float*                        mmScratch;
+        std::size_t                   nSeq;
+        std::size_t                   nRow;
+        std::size_t                   d_model;
+        std::size_t                   convDim;
+        std::size_t                   valueDim;
+        std::size_t                   hV;
+        bool                          ragged;
+    };
+    void runGdnProjections(std::size_t blockIdx, const GdnProjArgs& r,
+                           float*& qkvMixed, float*& zBuf,
+                           float*& betaBuf, float*& alphaBuf);
+
     /// Track B — one shared-expert projection through the CUTLASS block-scaled
     /// NVFP4 tensor-core GEMM as a single group (nExp=1).
     void sharedExpertTcGemm(std::size_t   N,
