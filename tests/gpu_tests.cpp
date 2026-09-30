@@ -3473,7 +3473,7 @@ TEST(gdn_sigmoid_inplace_parity) {
 
     UsmBuf buf(n * sizeof(float));
     std::memcpy(buf.raw(), host.data(), host.size() * sizeof(float));
-    fx().ops.sigmoidInPlaceAsync(buf.as<float>(), n);
+    fx().ops.sigmoidInPlaceAsync(std::span<float>{buf.as<float>(), n});
     fx().queue.flush();
 
     EXPECT_ARRAY_NEAR("gdn_sigmoid_inplace_parity", buf.as<float>(),
