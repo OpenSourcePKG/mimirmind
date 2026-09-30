@@ -5,6 +5,7 @@
 
 #include "model/Tokenizer.hpp"
 #include "model/chat/ChatEncoderCommon.hpp"
+#include "model/chat/Llama3ChatEncoder.hpp"
 #include "model/chat/QwenChatEncoder.hpp"
 
 #include <nlohmann/json.hpp>
@@ -39,10 +40,6 @@ constexpr std::string_view kGemma4ChannelEnd   = "<channel|>";
 // "llama" for all of them; this style additionally assumes the Llama-3 header
 // tokens are present in the vocab (requireToken throws otherwise), which also
 // safely rejects a Llama-2 "llama" GGUF that uses the [INST] template instead.
-constexpr std::string_view kLlama3BeginOfText = "<|begin_of_text|>";
-constexpr std::string_view kLlama3StartHeader = "<|start_header_id|>";
-constexpr std::string_view kLlama3EndHeader   = "<|end_header_id|>";
-constexpr std::string_view kLlama3Eot         = "<|eot_id|>";
 
 /// Gemma 3/4 chat roles. The HF Jinja templates emit "user" / "model"
 /// (NOT "assistant"). System messages are prepended to the first user
@@ -412,52 +409,6 @@ std::vector<std::int32_t> encodeGemma4(const Tokenizer&             tok,
                            kGemma4StartOfTurn, kGemma4EndOfTurn);
 }
 
-/// Llama-3.x chat template. Matches the reference (llama.cpp built-in "llama3"
-/// / HF Jinja) byte-for-byte for the system/user/assistant path:
-///
-///   <|begin_of_text|>
-///   <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>   (per turn)
-///   <|start_header_id|>assistant<|end_header_id|>\n\n                    (gen prompt)
-///
-/// No default system turn is injected (unlike Qwen2.5) — Llama-3 renders one
-/// only when supplied. Special tokens go in as their ids; role names and
-/// content are plain BPE. Tool calling is not wired for this style yet.
-std::vector<std::int32_t> encodeLlama3(const Tokenizer&             tok,
-                                       std::span<const ChatMessage> messages,
-                                       bool                         addGenerationPrompt) {
-    const std::int32_t bos         = requireToken(tok, kLlama3BeginOfText);
-    const std::int32_t startHeader = requireToken(tok, kLlama3StartHeader);
-    const std::int32_t endHeader   = requireToken(tok, kLlama3EndHeader);
-    const std::int32_t eot         = requireToken(tok, kLlama3Eot);
-
-    std::vector<std::int32_t> ids;
-    ids.reserve(64);
-    ids.push_back(bos);
-
-    auto emitTurn = [&](std::string_view role, std::string_view content) {
-        ids.push_back(startHeader);
-        encodeText(tok, role, ids);
-        ids.push_back(endHeader);
-        std::string body{"\n\n"};
-        body.append(content);
-        encodeText(tok, body, ids);
-        ids.push_back(eot);
-    };
-
-    for (const auto& m : messages) {
-        // Llama-3 uses system/user/assistant (tool turns = "ipython", not used
-        // here since tool calling is not wired for this style).
-        emitTurn(chatRoleName(m.role), m.content);
-    }
-
-    if (addGenerationPrompt) {
-        ids.push_back(startHeader);
-        encodeText(tok, "assistant", ids);
-        ids.push_back(endHeader);
-        encodeText(tok, "\n\n", ids);
-    }
-    return ids;
-}
 
 } // namespace
 
@@ -545,7 +496,8 @@ ChatTemplate::encode(Style                        style,
             return encodeGemma4(tok, messages, addGenerationPrompt, tools);
         case Style::Llama3:
             // Tool rendering not implemented for Llama-3 yet (tools ignored).
-            return encodeLlama3(tok, messages, addGenerationPrompt);
+            return chat::Llama3ChatEncoder::encode(tok, messages,
+                                                   addGenerationPrompt);
     }
     throw std::runtime_error("ChatTemplate::encode: unhandled style");
 }
@@ -578,7 +530,7 @@ ChatTemplate::stopIds(Style style, const Tokenizer& tok) {
         case Style::Llama3: {
             // <|eot_id|> ends an assistant turn; the true EOS <|end_of_text|>
             // is handled by the tokenizer's EOS.
-            const std::int32_t eot = tok.findToken(kLlama3Eot);
+            const std::int32_t eot = tok.findToken(chat::kLlama3Eot);
             if (eot >= 0) {
                 ids.push_back(eot);
             }
@@ -783,7 +735,7 @@ ChatTemplate::cleanResponse(Style style, std::string_view text,
         case Style::Llama3:
             // <|eot_id|> is normally consumed by stopIds, but strip a trailing
             // one defensively (mirrors Gemma). No thinking-channel to unwrap.
-            stripTrailing(out, kLlama3Eot);
+            stripTrailing(out, chat::kLlama3Eot);
             return out;
     }
     return out;
