@@ -1544,6 +1544,7 @@ if(MIMIRMIND_ENABLE_L0)
     target_sources(mimirmind PRIVATE
         src/compute/l0/GpuMatmul.cpp
         src/compute/l0/GpuOps.cpp
+        src/compute/l0/L0GpuOpsSelfTest.cpp
         src/compute/l0/MoeTopKRouteDevice.cpp
         src/compute/l0/MoeGateUpFusedKDevice.cpp
         # L0-tied support code — Formatting prints Level-Zero device
@@ -2043,6 +2044,7 @@ add_executable(gpu_tests
     src/compute/cpu/GpuOps.cpp
     src/compute/l0/GpuMatmul.cpp
     src/compute/l0/GpuOps.cpp
+    src/compute/l0/L0GpuOpsSelfTest.cpp
     src/compute/l0/MoeTopKRouteDevice.cpp
     src/compute/l0/MoeGateUpFusedKDevice.cpp
     src/compute/Matmul.cpp
@@ -2095,6 +2097,7 @@ add_executable(prefill_bench
     src/compute/cpu/GpuOps.cpp
     src/compute/l0/GpuMatmul.cpp
     src/compute/l0/GpuOps.cpp
+    src/compute/l0/L0GpuOpsSelfTest.cpp
     src/compute/l0/MoeTopKRouteDevice.cpp
     src/compute/l0/MoeGateUpFusedKDevice.cpp
     src/compute/Matmul.cpp
@@ -3127,6 +3130,7 @@ if(TARGET mimirmind_core_l0)
         src/compute/cpu/GpuOps.cpp
         src/compute/l0/GpuMatmul.cpp
         src/compute/l0/GpuOps.cpp
+        src/compute/l0/L0GpuOpsSelfTest.cpp
         src/compute/l0/MoeTopKRouteDevice.cpp
         src/compute/l0/MoeGateUpFusedKDevice.cpp
         src/compute/Matmul.cpp

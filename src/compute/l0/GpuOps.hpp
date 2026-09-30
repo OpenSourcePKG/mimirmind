@@ -443,6 +443,13 @@ public:
     /// Runs in < 5 ms on any Intel iGPU. Idempotent, cheap to repeat.
     void selfTest(core::l0::UsmAllocator& allocator);
 
+    /// The load-time self-test runner (roadmap 8.30.11.3) drives the kernel
+    /// parity checks through this GpuOps, including the internal
+    /// `attentionPrefillFlashAsync`. It is a tightly-coupled diagnostic
+    /// collaborator, so it gets friend access rather than widening the public
+    /// kernel surface just for the test.
+    friend class L0GpuOpsSelfTest;
+
     /// "pending" | "ok" — populated by selfTest(). Exposed via
     /// /v1/system/status so the deploy can be verified without pulling
     /// docker logs.
