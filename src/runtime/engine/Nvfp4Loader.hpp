@@ -22,6 +22,7 @@ class CudaMaterializerOps;
 }
 namespace mimirmind::core::modelopt {
 struct MaterializationStep;
+class CompressedTensorsConfig;
 }
 
 namespace mimirmind::runtime::engine {
@@ -116,6 +117,37 @@ private:
         compute::cuda::CudaMaterializerOps&                     devOps,
         const std::function<bool(const std::string&)>&          keep,
         const char*                                             label);
+
+    /// 5e-dense. Opt-in (MIMIRMIND_QWEN_DENSE_NVFP4_DECODE) dense-27B bandwidth
+    /// lever: repack ALL single-source NVFP4 dense projections to blocked-NVFP4.
+    static void applyDenseNvfp4DecodeLever(
+        InferenceEngine&                                        e,
+        const std::vector<core::modelopt::MaterializationStep>& steps,
+        core::cuda::CudaComputeContext&                         cudaCtx,
+        compute::cuda::CudaMaterializerOps&                     devOps,
+        const core::modelopt::CompressedTensorsConfig&          ctCfg);
+
+    /// 5f. Keep the MoE shared-expert (ffn_*_shexp) NVFP4 projections native
+    /// blocked-NVFP4 (+ additive FP4-TC sidecars for the prefill grouped GEMM).
+    static void repackSharedExpertsNvfp4(
+        InferenceEngine&                                        e,
+        const std::vector<core::modelopt::MaterializationStep>& steps,
+        core::cuda::CudaComputeContext&                         cudaCtx,
+        compute::cuda::CudaMaterializerOps&                     devOps);
+
+    /// 5f-lmhead. Opt-in (MIMIRMIND_LMHEAD_NVFP4) dual-copy: keep BF16 lm_head
+    /// and add a blocked-NVFP4 ".nv" sibling for single-user (nSeq<=maxT) decode.
+    static void addLmHeadNvfp4Sibling(
+        InferenceEngine&                                        e,
+        const std::vector<core::modelopt::MaterializationStep>& steps,
+        core::cuda::CudaComputeContext&                         cudaCtx,
+        compute::cuda::CudaMaterializerOps&                     devOps);
+
+    /// 5g. Opt-in (MIMIRMIND_DENSE_FP8_LOWM) M-dependent dual-copy: keep BF16
+    /// dense projections and add a blocked-FP8 E4M3 ".fp8" variant for low-batch.
+    static void addDenseFp8LowMVariants(
+        InferenceEngine& e, core::cuda::CudaComputeContext& cudaCtx,
+        compute::cuda::CudaMaterializerOps& devOps);
 };
 
 } // namespace mimirmind::runtime::engine

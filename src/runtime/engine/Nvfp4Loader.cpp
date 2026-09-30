@@ -875,6 +875,305 @@ void Nvfp4Loader::repackDenseNvfp4(
                 label, nRepack, bytesBefore >> 20, bytesAfter >> 20);
 }
 
+void Nvfp4Loader::applyDenseNvfp4DecodeLever(
+        InferenceEngine&                                        e,
+        const std::vector<core::modelopt::MaterializationStep>& steps,
+        core::cuda::CudaComputeContext&                         cudaCtx,
+        compute::cuda::CudaMaterializerOps&                     devOps,
+        const core::modelopt::CompressedTensorsConfig&          ctCfg) {
+    // 5e-dense. Qwen3_5 DENSE decode bandwidth lever — keep the dense
+    // compressed-tensors NVFP4 projections native 4-bit (blocked-NVFP4) instead
+    // of the just-materialised BF16. The dense 27B is decode weight-bandwidth
+    // bound (~53.7 GiB BF16 / token @ 273 GB/s ≈ 197 ms floor; measured ~346 ms),
+    // and the MLP (ffn_gate/up/down, ff=17408) dominates. Every NVFP4-sourced
+    // dense projection is read every token (no routing), so repackaging E2M1 +
+    // per-16 E4M3 block-scale + global into the single-pointer blocked format the
+    // matmul_nvfp4blk kernels consume (¼ the bytes) is LOSSLESS (the BF16 held
+    // the widened NVFP4 values; re-quantising BF16 would double-quant instead).
+    // compressed-tensors names the sidecars explicitly on the source
+    // (.weight_packed / .weight_scale / .weight_global_scale, reciprocal global)
+    // — use those directly, NOT the ModelOpt .weight/.weight_scale_2 convention.
+    // Opt-in (default OFF until A/B'd on the HTTP anchor); FP8-sourced
+    // projections (late-layer MLP + lm_head) stay BF16 here.
+    if (ctCfg.valid() && e._config.expertCount == 0 && e._nvfp4Model) {
+        const char* de = std::getenv("MIMIRMIND_QWEN_DENSE_NVFP4_DECODE");
+        if (de != nullptr && std::string_view{de} != "0") {
+            // Dense 27B: repack ALL single-source NVFP4 projections (opt-in,
+            // post-MoE — the dense plan has no routed experts to peak against).
+            repackDenseNvfp4(e, steps, cudaCtx, devOps, {}, "qwen3_5 dense (MIMIRMIND_QWEN_DENSE_NVFP4_DECODE)");
+        }
+    }
+}
+
+void Nvfp4Loader::repackSharedExpertsNvfp4(
+        InferenceEngine&                                        e,
+        const std::vector<core::modelopt::MaterializationStep>& steps,
+        core::cuda::CudaComputeContext&                         cudaCtx,
+        compute::cuda::CudaMaterializerOps&                     devOps) {
+    // 5f. Keep the dense NVFP4 projections native 4-bit (blocked-NVFP4).
+    //
+    // The MoE shared-expert projections (ffn_*_shexp) are W4A16_NVFP4 in the
+    // checkpoint and go through the dense matmulAsync (always active, read every
+    // token). Their BF16 materialisation holds exactly the NVFP4 values widened,
+    // so keeping them 4-bit is LOSSLESS (no re-quant; re-quantising BF16 back to
+    // the very coarse E2M1 would double-quant and degrade). Repackage the
+    // original NVFP4 (packed E2M1 + per-16 E4M3 block-scale + global, still
+    // resident in _nvfp4Model) into a single-pointer blocked format the
+    // matmul_nvfp4blk kernels consume (embedded folded scale, no plumbing).
+    //
+    // NB: the full-attention self_attn.{q,k,v,o} are NOT quantised in this
+    // checkpoint (no quantized_layers entry) — they stay full-precision BF16 by
+    // design, so there is no native NVFP4 form to keep for them.
+    // MIMIRMIND_NVFP4_SHEXP=0 keeps BF16 (A/B).
+    if (e._nvfp4Model) {
+        // DEFAULT ON: the shared experts stay native blocked-NVFP4 alongside the
+        // routed experts. An earlier "routed-NVFP4 + shared-NVFP4 degenerates"
+        // report was a MISDIAGNOSIS (it compared different prompts): a 40-block
+        // probe shows shared-NVFP4 matches shared-BF16 to <=0.18% with no NaN,
+        // and an A/B with repetition_penalty has the both-NVFP4 output as the
+        // MOST coherent of the set. The residual short-prompt greedy repetition
+        // collapse is identical with shared BF16, so it is a decode/chat-template
+        // artefact, not a quant bug. MIMIRMIND_NVFP4_SHEXP=0 keeps BF16 for A/B.
+        const char* faenv = std::getenv("MIMIRMIND_NVFP4_SHEXP");
+        const bool faNvblk = (faenv == nullptr) || (std::string_view{faenv} != "0");
+        if (faNvblk) {
+            auto isFullAttn = [](std::string_view n) {
+                return n.ends_with(".ffn_gate_shexp.weight")
+                    || n.ends_with(".ffn_up_shexp.weight")
+                    || n.ends_with(".ffn_down_shexp.weight");
+            };
+            // Track B (stage R prefill fix): in addition to the blocked-NVFP4
+            // bank (kept for decode), build FP4-tensor-core sidecars (plain
+            // E2M1 nibbles + swizzled UE4M3 SFB + F32 global) for each shared
+            // expert so the prefill path can run it through the CUTLASS grouped
+            // GEMM as a single group (nExp=1). The dense blocked kernel's
+            // kGemmMaxM=16 loop re-streams the whole weight ~M/16 times at large
+            // M — the measured 48 s@7.6k prefill bottleneck. A shared expert is
+            // a single matrix, so its sidecar is the nExp=1, eIdx=0 degenerate
+            // case of the routed tcAdd path above. Additive in every TC mode;
+            // skipped only when CUTLASS is absent or GROUPED_MOE=0 forces
+            // blocked-only. The generic NvFp4WeightsMap bridge exposes these as
+            // tcNibblePtr/tcSfbPtr/tcGlobalsPtr once tcSfbBank is set.
+            const bool tcAvail = e._ops->moeGroupedGemmNvfp4TcAvailable();
+            const char* gEnv = std::getenv("MIMIRMIND_GROUPED_MOE");
+            const std::string_view gv =
+                gEnv ? std::string_view(gEnv) : std::string_view();
+            const bool shexpTcAdd = tcAvail && (gv != "0");
+            std::size_t nRepack = 0, tcSidecars = 0;
+            std::uint64_t bytesBefore = 0, bytesAfter = 0;
+            for (const auto& step : steps) {
+                if (!isFullAttn(step.ggufName) || step.sources.size() != 1) continue;
+                const auto& src = step.sources[0];
+                if (src.kind != core::modelopt::SourceKind::Nvfp4) continue;
+                if ((src.in % 32) != 0) continue;
+                auto it = std::find_if(
+                    e._materializedBf16.begin(), e._materializedBf16.end(),
+                    [&](const runtime::nvfp4::MaterializedTensor& t) {
+                        return t.ggufName == step.ggufName;
+                    });
+                if (it == e._materializedBf16.end() || it->isF32) continue;
+                // 5.27 I-2 lever (a): qwen4_exp's pre-MoE dense pass already
+                // repacked the shared experts to blocked-NVFP4 (no TC sidecars,
+                // to fit) — skip them here. No-op for qwen3.6 (its shared experts
+                // reach this pass still BF16), so prod is unchanged.
+                if (it->isNvfp4Blk || it->isNvfp4Tc) continue;
+                const auto* pk = e._nvfp4Model->find(src.hfWeightName);
+                const std::string base{src.hfWeightName};
+                const std::string baseNoW = stripDotWeight(base);
+                const auto* bs = e._nvfp4Model->find(baseNoW + ".weight_scale");
+                const auto* gs = e._nvfp4Model->find(baseNoW + ".weight_scale_2");
+                if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
+                const float global = devOps.readF32(gs->devPtr);
+                const std::size_t blkBytes =
+                    (static_cast<std::size_t>(it->elems) / 32) * 20;
+                compute::ComputeBuffer nb = repackNvfp4Blk(
+                    devOps, cudaCtx, blkBytes, pk, bs, global,
+                    src.rows, src.in);
+                bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
+                bytesAfter  += blkBytes;
+                it->buffer     = std::move(nb); // frees the BF16 buffer (RAII)
+                it->isNvfp4Blk = true;
+                ++nRepack;
+
+                // Additive FP4-TC sidecar (single matrix -> nExp=1, eIdx=0).
+                if (shexpTcAdd) {
+                    const std::size_t nibBytes =
+                        static_cast<std::size_t>(it->elems) / 2;
+                    const std::size_t sfbBytes =
+                        core::modelopt::moeSwizzledScaleBankBytes(
+                            1, src.rows, src.in / 16);
+                    compute::ComputeBuffer tcNib  = devOps.allocateWeight(nibBytes);
+                    compute::ComputeBuffer tcSfb  = devOps.allocateWeight(sfbBytes);
+                    compute::ComputeBuffer tcGlob = devOps.allocateWeight(sizeof(float));
+                    devOps.copyBytes(tcNib.get(), pk->devPtr, nibBytes);
+                    devOps.swizzleWeightSf(tcSfb.get(), bs->devPtr,
+                                           src.rows, src.in);
+                    e._ops->uploadHostBytes(tcGlob.get(), &global, sizeof(float));
+                    cudaCtx.stream().synchronize();
+                    bytesAfter        += nibBytes + sfbBytes;
+                    it->tcNibbleBank   = std::move(tcNib);
+                    it->tcSfbBank      = std::move(tcSfb);
+                    it->tcGlobalsBank  = std::move(tcGlob);
+                    ++tcSidecars;
+                }
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: kept {} dense NVFP4 (shared-expert) "
+                        "projections native blocked-NVFP4 (+{} FP4-TC sidecars) "
+                        "({} MiB -> {} MiB)",
+                        nRepack, tcSidecars, bytesBefore >> 20, bytesAfter >> 20);
+        }
+    }
+}
+
+void Nvfp4Loader::addLmHeadNvfp4Sibling(
+        InferenceEngine&                                        e,
+        const std::vector<core::modelopt::MaterializationStep>& steps,
+        core::cuda::CudaComputeContext&                         cudaCtx,
+        compute::cuda::CudaMaterializerOps&                     devOps) {
+    // 5f-lmhead. M==1-gated dual-copy for the lm_head (output projection).
+    //
+    // The Qwen3.6-35B MoE ModelOpt checkpoint stores lm_head as W4A16_NVFP4,
+    // but step 5 dequantised it to BF16. Reading the 4-bit form on the M=1
+    // decode/prefill logits GEMV is ~3% faster single-user (bandwidth-bound,
+    // measured HTTP anchor 35.6->36.7 tok/s), BUT at serving batch (M=nSeq>1)
+    // the NVFP4 blocked GEMM loses to BF16-TF32-TC (measured -15..-18% decode
+    // throughput @conc16/32). So we KEEP the BF16 "output.weight" AND add a
+    // native blocked-NVFP4 sibling "output.weight.nv" (lossless repack of the
+    // original NVFP4 in _nvfp4Model), and SlabDecodeStepper dispatches the .nv
+    // variant only when nSeq <= MIMIRMIND_LMHEAD_NVFP4 (single-user only) and the
+    // BF16 copy at higher batch. Costs ~+303 MiB (the NVFP4 copy; the BF16 stays).
+    //
+    // Default OFF (opt-in). Runtime A/B on current main (2026-08-23, config.prof.json,
+    // Qwen3.6-35B primary) showed NO measurable single-user win: 39.41 (BF16) vs 39.33
+    // (NVFP4) tok/s = noise. The earlier +3% (35.6->36.7) was vs an OLD tree; on current
+    // main MIMIRMIND_CUBLAS=1 routes the BF16 lm_head GEMV through cuBLAS-TF32-TC, which
+    // now matches the NVFP4 blocked path, so the sibling earns nothing. Kept as a
+    // conditional opt-in for future non-cuBLAS BF16 paths / dense-NVFP4-only models:
+    // set MIMIRMIND_LMHEAD_NVFP4>=1 to load the sibling (and dispatch it at nSeq<=that).
+    if (e._nvfp4Model) {
+        const char* lhEnv = std::getenv("MIMIRMIND_LMHEAD_NVFP4");
+        const bool lhOn =
+            (lhEnv != nullptr) && (std::string_view{lhEnv} != "0");
+        if (lhOn) {
+            auto isLmHead = [](std::string_view n) {
+                return n == "output.weight" || n.ends_with(".output.weight");
+            };
+            std::size_t nSib = 0;
+            std::uint64_t addBytes = 0;
+            std::vector<runtime::nvfp4::MaterializedTensor> siblings;
+            for (const auto& step : steps) {
+                if (!isLmHead(step.ggufName) || step.sources.size() != 1) continue;
+                const auto& src = step.sources[0];
+                if (src.kind != core::modelopt::SourceKind::Nvfp4) continue;
+                if ((src.in % 32) != 0) continue;
+                auto it = std::find_if(
+                    e._materializedBf16.begin(), e._materializedBf16.end(),
+                    [&](const runtime::nvfp4::MaterializedTensor& t) {
+                        return t.ggufName == step.ggufName;
+                    });
+                if (it == e._materializedBf16.end() || it->isF32) continue;
+                const auto* pk = e._nvfp4Model->find(src.hfWeightName);
+                const std::string base{src.hfWeightName};
+                const std::string baseNoW = stripDotWeight(base);
+                const auto* bs = e._nvfp4Model->find(baseNoW + ".weight_scale");
+                const auto* gs = e._nvfp4Model->find(baseNoW + ".weight_scale_2");
+                if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
+                const float global = devOps.readF32(gs->devPtr);
+                const std::size_t blkBytes =
+                    (static_cast<std::size_t>(it->elems) / 32) * 20;
+                compute::ComputeBuffer nb = repackNvfp4Blk(
+                    devOps, cudaCtx, blkBytes, pk, bs, global,
+                    src.rows, src.in);
+                runtime::nvfp4::MaterializedTensor v;
+                v.ggufName   = it->ggufName + ".nv";  // "output.weight.nv"
+                v.buffer     = std::move(nb);
+                v.ggufDims   = it->ggufDims;
+                v.elems      = it->elems;
+                v.isNvfp4Blk = true;
+                siblings.push_back(std::move(v));
+                addBytes += blkBytes;
+                ++nSib;
+            }
+            for (auto& v : siblings) {
+                e._materializedBf16.push_back(std::move(v));
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: added {} lm_head '.nv' blocked-NVFP4 "
+                        "sibling(s) (+{} MiB), BF16 kept; NVFP4 used for nSeq<=maxT "
+                        "(MIMIRMIND_LMHEAD_NVFP4 opt-in, default OFF)",
+                        nSib, addBytes >> 20);
+        }
+    }
+}
+
+void Nvfp4Loader::addDenseFp8LowMVariants(
+        InferenceEngine& e, core::cuda::CudaComputeContext& cudaCtx,
+        compute::cuda::CudaMaterializerOps& devOps) {
+    // 5g. M-dependent dense FP8 (dual-copy). KEEP the BF16 dense projections
+    // AND add a blocked-FP8 E4M3 ".fp8" variant of each, exposed as a separate
+    // WeightsMap tensor. The backend then reads FP8 at low batch (decode is
+    // memory-bound there: FP8 halves the always-read dense traffic, +~15%
+    // single-request, bit-coherent since these projections are natively FP8 in
+    // the checkpoint) and the BF16 copy at high batch (compute-bound, where the
+    // TF32 tensor-core path wins). Opt-in via MIMIRMIND_DENSE_FP8_LOWM=<maxSeq>
+    // (the FP8 copy costs ~1.3 GiB — trivial on 128 GB unified). Independent of
+    // the static 5e MIMIRMIND_NVFP4_ATTN_FP8 replace-in-place path.
+    {
+        const char* lowmEnv = std::getenv("MIMIRMIND_DENSE_FP8_LOWM");
+        if (lowmEnv != nullptr && std::atoi(lowmEnv) > 0) {
+            auto isDense = [](std::string_view n) {
+                return n.ends_with(".attn_qkv.weight")
+                    || n.ends_with(".attn_gate.weight")
+                    || n.ends_with(".ssm_out.weight")
+                    || n.ends_with(".attn_q.weight")
+                    || n.ends_with(".attn_k.weight")
+                    || n.ends_with(".attn_v.weight")
+                    || n.ends_with(".attn_output.weight");
+            };
+            std::vector<runtime::nvfp4::MaterializedTensor> variants;
+            std::size_t   nDual = 0;
+            std::uint64_t addBytes = 0;
+            for (auto& t : e._materializedBf16) {
+                if (t.isF32 || t.isQ8_0 || t.isQ4K || t.isQ6K || t.isFp8 ||
+                    t.isNvfp4Blk) {
+                    continue;
+                }
+                if (t.ggufDims.size() < 2 || !isDense(t.ggufName)) {
+                    continue;
+                }
+                const std::uint64_t K    = t.ggufDims[0];
+                const std::uint64_t rows = t.ggufDims[1];
+                if (K == 0 || rows == 0 || (K % 32) != 0 || K * rows != t.elems) {
+                    continue;
+                }
+                const std::size_t fp8Bytes =
+                    (static_cast<std::size_t>(t.elems) / 32) * 34;
+                compute::ComputeBuffer fp8 = devOps.allocateWeight(fp8Bytes);
+                devOps.quantizeBf16ToFp8(fp8.get(), t.buffer.get(), rows, K);
+                cudaCtx.stream().synchronize();
+                runtime::nvfp4::MaterializedTensor v;
+                v.ggufName = t.ggufName + ".fp8";
+                v.buffer   = std::move(fp8);
+                v.ggufDims = t.ggufDims;
+                v.elems    = t.elems;
+                v.isFp8    = true;
+                variants.push_back(std::move(v));
+                addBytes += fp8Bytes;
+                ++nDual;
+            }
+            for (auto& v : variants) {
+                e._materializedBf16.push_back(std::move(v));
+            }
+            MM_LOG_INFO("engine",
+                        "loadModelNvfp4: M-dependent dense FP8 — added {} FP8 "
+                        "'.fp8' variants (+{} MiB), BF16 kept (FP8 used for "
+                        "nSeq<={})",
+                        nDual, addBytes >> 20, std::atoi(lowmEnv));
+        }
+    }
+}
+
 void Nvfp4Loader::applyMtpEhProjSwap(InferenceEngine&                e,
                                      core::cuda::CudaComputeContext& cudaCtx) {
     // 5b'. MTP eh_proj concat-half swap. The HF checkpoint stores the fused
@@ -1307,218 +1606,11 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
 
     requantDenseAttnProjFp8(e, cudaCtx, devOps);
 
-    // 5e-dense. Qwen3_5 DENSE decode bandwidth lever — keep the dense
-    // compressed-tensors NVFP4 projections native 4-bit (blocked-NVFP4) instead
-    // of the just-materialised BF16. The dense 27B is decode weight-bandwidth
-    // bound (~53.7 GiB BF16 / token @ 273 GB/s ≈ 197 ms floor; measured ~346 ms),
-    // and the MLP (ffn_gate/up/down, ff=17408) dominates. Every NVFP4-sourced
-    // dense projection is read every token (no routing), so repackaging E2M1 +
-    // per-16 E4M3 block-scale + global into the single-pointer blocked format the
-    // matmul_nvfp4blk kernels consume (¼ the bytes) is LOSSLESS (the BF16 held
-    // the widened NVFP4 values; re-quantising BF16 would double-quant instead).
-    // compressed-tensors names the sidecars explicitly on the source
-    // (.weight_packed / .weight_scale / .weight_global_scale, reciprocal global)
-    // — use those directly, NOT the ModelOpt .weight/.weight_scale_2 convention.
-    // Opt-in (default OFF until A/B'd on the HTTP anchor); FP8-sourced
-    // projections (late-layer MLP + lm_head) stay BF16 here.
-    if (ctCfg.valid() && e._config.expertCount == 0 && e._nvfp4Model) {
-        const char* de = std::getenv("MIMIRMIND_QWEN_DENSE_NVFP4_DECODE");
-        if (de != nullptr && std::string_view{de} != "0") {
-            // Dense 27B: repack ALL single-source NVFP4 projections (opt-in,
-            // post-MoE — the dense plan has no routed experts to peak against).
-            repackDenseNvfp4(e, steps, cudaCtx, devOps, {}, "qwen3_5 dense (MIMIRMIND_QWEN_DENSE_NVFP4_DECODE)");
-        }
-    }
+    applyDenseNvfp4DecodeLever(e, steps, cudaCtx, devOps, ctCfg);
 
-    // 5f. Keep the dense NVFP4 projections native 4-bit (blocked-NVFP4).
-    //
-    // The MoE shared-expert projections (ffn_*_shexp) are W4A16_NVFP4 in the
-    // checkpoint and go through the dense matmulAsync (always active, read every
-    // token). Their BF16 materialisation holds exactly the NVFP4 values widened,
-    // so keeping them 4-bit is LOSSLESS (no re-quant; re-quantising BF16 back to
-    // the very coarse E2M1 would double-quant and degrade). Repackage the
-    // original NVFP4 (packed E2M1 + per-16 E4M3 block-scale + global, still
-    // resident in _nvfp4Model) into a single-pointer blocked format the
-    // matmul_nvfp4blk kernels consume (embedded folded scale, no plumbing).
-    //
-    // NB: the full-attention self_attn.{q,k,v,o} are NOT quantised in this
-    // checkpoint (no quantized_layers entry) — they stay full-precision BF16 by
-    // design, so there is no native NVFP4 form to keep for them.
-    // MIMIRMIND_NVFP4_SHEXP=0 keeps BF16 (A/B).
-    if (e._nvfp4Model) {
-        // DEFAULT ON: the shared experts stay native blocked-NVFP4 alongside the
-        // routed experts. An earlier "routed-NVFP4 + shared-NVFP4 degenerates"
-        // report was a MISDIAGNOSIS (it compared different prompts): a 40-block
-        // probe shows shared-NVFP4 matches shared-BF16 to <=0.18% with no NaN,
-        // and an A/B with repetition_penalty has the both-NVFP4 output as the
-        // MOST coherent of the set. The residual short-prompt greedy repetition
-        // collapse is identical with shared BF16, so it is a decode/chat-template
-        // artefact, not a quant bug. MIMIRMIND_NVFP4_SHEXP=0 keeps BF16 for A/B.
-        const char* faenv = std::getenv("MIMIRMIND_NVFP4_SHEXP");
-        const bool faNvblk = (faenv == nullptr) || (std::string_view{faenv} != "0");
-        if (faNvblk) {
-            auto isFullAttn = [](std::string_view n) {
-                return n.ends_with(".ffn_gate_shexp.weight")
-                    || n.ends_with(".ffn_up_shexp.weight")
-                    || n.ends_with(".ffn_down_shexp.weight");
-            };
-            // Track B (stage R prefill fix): in addition to the blocked-NVFP4
-            // bank (kept for decode), build FP4-tensor-core sidecars (plain
-            // E2M1 nibbles + swizzled UE4M3 SFB + F32 global) for each shared
-            // expert so the prefill path can run it through the CUTLASS grouped
-            // GEMM as a single group (nExp=1). The dense blocked kernel's
-            // kGemmMaxM=16 loop re-streams the whole weight ~M/16 times at large
-            // M — the measured 48 s@7.6k prefill bottleneck. A shared expert is
-            // a single matrix, so its sidecar is the nExp=1, eIdx=0 degenerate
-            // case of the routed tcAdd path above. Additive in every TC mode;
-            // skipped only when CUTLASS is absent or GROUPED_MOE=0 forces
-            // blocked-only. The generic NvFp4WeightsMap bridge exposes these as
-            // tcNibblePtr/tcSfbPtr/tcGlobalsPtr once tcSfbBank is set.
-            const bool tcAvail = e._ops->moeGroupedGemmNvfp4TcAvailable();
-            const char* gEnv = std::getenv("MIMIRMIND_GROUPED_MOE");
-            const std::string_view gv =
-                gEnv ? std::string_view(gEnv) : std::string_view();
-            const bool shexpTcAdd = tcAvail && (gv != "0");
-            std::size_t nRepack = 0, tcSidecars = 0;
-            std::uint64_t bytesBefore = 0, bytesAfter = 0;
-            for (const auto& step : steps) {
-                if (!isFullAttn(step.ggufName) || step.sources.size() != 1) continue;
-                const auto& src = step.sources[0];
-                if (src.kind != core::modelopt::SourceKind::Nvfp4) continue;
-                if ((src.in % 32) != 0) continue;
-                auto it = std::find_if(
-                    e._materializedBf16.begin(), e._materializedBf16.end(),
-                    [&](const runtime::nvfp4::MaterializedTensor& t) {
-                        return t.ggufName == step.ggufName;
-                    });
-                if (it == e._materializedBf16.end() || it->isF32) continue;
-                // 5.27 I-2 lever (a): qwen4_exp's pre-MoE dense pass already
-                // repacked the shared experts to blocked-NVFP4 (no TC sidecars,
-                // to fit) — skip them here. No-op for qwen3.6 (its shared experts
-                // reach this pass still BF16), so prod is unchanged.
-                if (it->isNvfp4Blk || it->isNvfp4Tc) continue;
-                const auto* pk = e._nvfp4Model->find(src.hfWeightName);
-                const std::string base{src.hfWeightName};
-                const std::string baseNoW = stripDotWeight(base);
-                const auto* bs = e._nvfp4Model->find(baseNoW + ".weight_scale");
-                const auto* gs = e._nvfp4Model->find(baseNoW + ".weight_scale_2");
-                if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
-                const float global = devOps.readF32(gs->devPtr);
-                const std::size_t blkBytes =
-                    (static_cast<std::size_t>(it->elems) / 32) * 20;
-                compute::ComputeBuffer nb = repackNvfp4Blk(
-                    devOps, cudaCtx, blkBytes, pk, bs, global,
-                    src.rows, src.in);
-                bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
-                bytesAfter  += blkBytes;
-                it->buffer     = std::move(nb); // frees the BF16 buffer (RAII)
-                it->isNvfp4Blk = true;
-                ++nRepack;
+    repackSharedExpertsNvfp4(e, steps, cudaCtx, devOps);
 
-                // Additive FP4-TC sidecar (single matrix -> nExp=1, eIdx=0).
-                if (shexpTcAdd) {
-                    const std::size_t nibBytes =
-                        static_cast<std::size_t>(it->elems) / 2;
-                    const std::size_t sfbBytes =
-                        core::modelopt::moeSwizzledScaleBankBytes(
-                            1, src.rows, src.in / 16);
-                    compute::ComputeBuffer tcNib  = devOps.allocateWeight(nibBytes);
-                    compute::ComputeBuffer tcSfb  = devOps.allocateWeight(sfbBytes);
-                    compute::ComputeBuffer tcGlob = devOps.allocateWeight(sizeof(float));
-                    devOps.copyBytes(tcNib.get(), pk->devPtr, nibBytes);
-                    devOps.swizzleWeightSf(tcSfb.get(), bs->devPtr,
-                                           src.rows, src.in);
-                    e._ops->uploadHostBytes(tcGlob.get(), &global, sizeof(float));
-                    cudaCtx.stream().synchronize();
-                    bytesAfter        += nibBytes + sfbBytes;
-                    it->tcNibbleBank   = std::move(tcNib);
-                    it->tcSfbBank      = std::move(tcSfb);
-                    it->tcGlobalsBank  = std::move(tcGlob);
-                    ++tcSidecars;
-                }
-            }
-            MM_LOG_INFO("engine",
-                        "loadModelNvfp4: kept {} dense NVFP4 (shared-expert) "
-                        "projections native blocked-NVFP4 (+{} FP4-TC sidecars) "
-                        "({} MiB -> {} MiB)",
-                        nRepack, tcSidecars, bytesBefore >> 20, bytesAfter >> 20);
-        }
-    }
-
-    // 5f-lmhead. M==1-gated dual-copy for the lm_head (output projection).
-    //
-    // The Qwen3.6-35B MoE ModelOpt checkpoint stores lm_head as W4A16_NVFP4,
-    // but step 5 dequantised it to BF16. Reading the 4-bit form on the M=1
-    // decode/prefill logits GEMV is ~3% faster single-user (bandwidth-bound,
-    // measured HTTP anchor 35.6->36.7 tok/s), BUT at serving batch (M=nSeq>1)
-    // the NVFP4 blocked GEMM loses to BF16-TF32-TC (measured -15..-18% decode
-    // throughput @conc16/32). So we KEEP the BF16 "output.weight" AND add a
-    // native blocked-NVFP4 sibling "output.weight.nv" (lossless repack of the
-    // original NVFP4 in _nvfp4Model), and SlabDecodeStepper dispatches the .nv
-    // variant only when nSeq <= MIMIRMIND_LMHEAD_NVFP4 (single-user only) and the
-    // BF16 copy at higher batch. Costs ~+303 MiB (the NVFP4 copy; the BF16 stays).
-    //
-    // Default OFF (opt-in). Runtime A/B on current main (2026-08-23, config.prof.json,
-    // Qwen3.6-35B primary) showed NO measurable single-user win: 39.41 (BF16) vs 39.33
-    // (NVFP4) tok/s = noise. The earlier +3% (35.6->36.7) was vs an OLD tree; on current
-    // main MIMIRMIND_CUBLAS=1 routes the BF16 lm_head GEMV through cuBLAS-TF32-TC, which
-    // now matches the NVFP4 blocked path, so the sibling earns nothing. Kept as a
-    // conditional opt-in for future non-cuBLAS BF16 paths / dense-NVFP4-only models:
-    // set MIMIRMIND_LMHEAD_NVFP4>=1 to load the sibling (and dispatch it at nSeq<=that).
-    if (e._nvfp4Model) {
-        const char* lhEnv = std::getenv("MIMIRMIND_LMHEAD_NVFP4");
-        const bool lhOn =
-            (lhEnv != nullptr) && (std::string_view{lhEnv} != "0");
-        if (lhOn) {
-            auto isLmHead = [](std::string_view n) {
-                return n == "output.weight" || n.ends_with(".output.weight");
-            };
-            std::size_t nSib = 0;
-            std::uint64_t addBytes = 0;
-            std::vector<runtime::nvfp4::MaterializedTensor> siblings;
-            for (const auto& step : steps) {
-                if (!isLmHead(step.ggufName) || step.sources.size() != 1) continue;
-                const auto& src = step.sources[0];
-                if (src.kind != core::modelopt::SourceKind::Nvfp4) continue;
-                if ((src.in % 32) != 0) continue;
-                auto it = std::find_if(
-                    e._materializedBf16.begin(), e._materializedBf16.end(),
-                    [&](const runtime::nvfp4::MaterializedTensor& t) {
-                        return t.ggufName == step.ggufName;
-                    });
-                if (it == e._materializedBf16.end() || it->isF32) continue;
-                const auto* pk = e._nvfp4Model->find(src.hfWeightName);
-                const std::string base{src.hfWeightName};
-                const std::string baseNoW = stripDotWeight(base);
-                const auto* bs = e._nvfp4Model->find(baseNoW + ".weight_scale");
-                const auto* gs = e._nvfp4Model->find(baseNoW + ".weight_scale_2");
-                if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
-                const float global = devOps.readF32(gs->devPtr);
-                const std::size_t blkBytes =
-                    (static_cast<std::size_t>(it->elems) / 32) * 20;
-                compute::ComputeBuffer nb = repackNvfp4Blk(
-                    devOps, cudaCtx, blkBytes, pk, bs, global,
-                    src.rows, src.in);
-                runtime::nvfp4::MaterializedTensor v;
-                v.ggufName   = it->ggufName + ".nv";  // "output.weight.nv"
-                v.buffer     = std::move(nb);
-                v.ggufDims   = it->ggufDims;
-                v.elems      = it->elems;
-                v.isNvfp4Blk = true;
-                siblings.push_back(std::move(v));
-                addBytes += blkBytes;
-                ++nSib;
-            }
-            for (auto& v : siblings) {
-                e._materializedBf16.push_back(std::move(v));
-            }
-            MM_LOG_INFO("engine",
-                        "loadModelNvfp4: added {} lm_head '.nv' blocked-NVFP4 "
-                        "sibling(s) (+{} MiB), BF16 kept; NVFP4 used for nSeq<=maxT "
-                        "(MIMIRMIND_LMHEAD_NVFP4 opt-in, default OFF)",
-                        nSib, addBytes >> 20);
-        }
-    }
+    addLmHeadNvfp4Sibling(e, steps, cudaCtx, devOps);
 
     // 5.27 I-2 streaming-repack safety: every DEFERRED expert (empty BF16
     // buffer) must have been filled by the MoE bank repack above. A survivor
@@ -1535,68 +1627,7 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
         }
     }
 
-    // 5g. M-dependent dense FP8 (dual-copy). KEEP the BF16 dense projections
-    // AND add a blocked-FP8 E4M3 ".fp8" variant of each, exposed as a separate
-    // WeightsMap tensor. The backend then reads FP8 at low batch (decode is
-    // memory-bound there: FP8 halves the always-read dense traffic, +~15%
-    // single-request, bit-coherent since these projections are natively FP8 in
-    // the checkpoint) and the BF16 copy at high batch (compute-bound, where the
-    // TF32 tensor-core path wins). Opt-in via MIMIRMIND_DENSE_FP8_LOWM=<maxSeq>
-    // (the FP8 copy costs ~1.3 GiB — trivial on 128 GB unified). Independent of
-    // the static 5e MIMIRMIND_NVFP4_ATTN_FP8 replace-in-place path.
-    {
-        const char* lowmEnv = std::getenv("MIMIRMIND_DENSE_FP8_LOWM");
-        if (lowmEnv != nullptr && std::atoi(lowmEnv) > 0) {
-            auto isDense = [](std::string_view n) {
-                return n.ends_with(".attn_qkv.weight")
-                    || n.ends_with(".attn_gate.weight")
-                    || n.ends_with(".ssm_out.weight")
-                    || n.ends_with(".attn_q.weight")
-                    || n.ends_with(".attn_k.weight")
-                    || n.ends_with(".attn_v.weight")
-                    || n.ends_with(".attn_output.weight");
-            };
-            std::vector<runtime::nvfp4::MaterializedTensor> variants;
-            std::size_t   nDual = 0;
-            std::uint64_t addBytes = 0;
-            for (auto& t : e._materializedBf16) {
-                if (t.isF32 || t.isQ8_0 || t.isQ4K || t.isQ6K || t.isFp8 ||
-                    t.isNvfp4Blk) {
-                    continue;
-                }
-                if (t.ggufDims.size() < 2 || !isDense(t.ggufName)) {
-                    continue;
-                }
-                const std::uint64_t K    = t.ggufDims[0];
-                const std::uint64_t rows = t.ggufDims[1];
-                if (K == 0 || rows == 0 || (K % 32) != 0 || K * rows != t.elems) {
-                    continue;
-                }
-                const std::size_t fp8Bytes =
-                    (static_cast<std::size_t>(t.elems) / 32) * 34;
-                compute::ComputeBuffer fp8 = devOps.allocateWeight(fp8Bytes);
-                devOps.quantizeBf16ToFp8(fp8.get(), t.buffer.get(), rows, K);
-                cudaCtx.stream().synchronize();
-                runtime::nvfp4::MaterializedTensor v;
-                v.ggufName = t.ggufName + ".fp8";
-                v.buffer   = std::move(fp8);
-                v.ggufDims = t.ggufDims;
-                v.elems    = t.elems;
-                v.isFp8    = true;
-                variants.push_back(std::move(v));
-                addBytes += fp8Bytes;
-                ++nDual;
-            }
-            for (auto& v : variants) {
-                e._materializedBf16.push_back(std::move(v));
-            }
-            MM_LOG_INFO("engine",
-                        "loadModelNvfp4: M-dependent dense FP8 — added {} FP8 "
-                        "'.fp8' variants (+{} MiB), BF16 kept (FP8 used for "
-                        "nSeq<={})",
-                        nDual, addBytes >> 20, std::atoi(lowmEnv));
-        }
-    }
+    addDenseFp8LowMVariants(e, cudaCtx, devOps);
 
     // 6. Expose the BF16 tensors as a GGUF-convention WeightsMap.
     e._weights.emplace(runtime::nvfp4::buildBf16WeightsMap(e._materializedBf16));
