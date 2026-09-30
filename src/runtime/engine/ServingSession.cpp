@@ -304,32 +304,36 @@ struct ServingState {
     // the SlotSsmCheckpointRing collaborator above; ServingSession delegates.
     SlotSsmCheckpointRing        ckptRing;
 
-    // 5.28.1.2.b — CROSS-SLOT GDN prefix sharing (copy-based). The per-slot ring
-    // above is same-slot only (a continuation must land on its own still-resident
-    // slot). This is a GLOBAL keyed store so ANY admitted slot can restore a
-    // shared prefix produced by a now-recycled slot — the multi-tenant RAG win.
-    // Each PrefixImage holds the recurrent-only SSM+conv checkpoint (dense
-    // [nRec, elems], the 5.28.1.4 trim) PLUS the prefix KV rows [0,pos) copied out
-    // of the producing slot's static block-run. `GdnPrefixIndex` (host, tested)
-    // keys these by a block-aligned token prefix + refcount/LRU; `prefixImages`
-    // owns the device memory. Cap default OFF (MIMIRMIND_GDN_XSLOT=1 opts in).
-    struct PrefixImage {
-        compute::ComputeBuffer state;   // [nRec, stateElemsPerLayer] dense
-        compute::ComputeBuffer conv;    // [nRec, convElemsPerLayer] dense
-        compute::ComputeBuffer kv;      // [nFullAttn, 2(K,V), pos, slotElems] dtype
-        std::size_t            pos{0};  // block-aligned prefix length (tokens)
+    // 5.28.1.2.b / 8.30.11.4 — CROSS-SLOT GDN prefix sharing (copy-based),
+    // grouped out of the ServingState god-struct into one owning sub-struct. The
+    // per-slot ckptRing above is same-slot only; this is a GLOBAL keyed store so
+    // ANY admitted slot can restore a shared prefix produced by a now-recycled
+    // slot — the multi-tenant RAG win. Each PrefixImage holds the recurrent-only
+    // SSM+conv checkpoint (dense [nRec, elems], the 5.28.1.4 trim) PLUS the prefix
+    // KV rows [0,pos) copied out of the producing slot's static block-run.
+    // `GdnPrefixIndex` (host, tested) keys these by a block-aligned token prefix +
+    // refcount/LRU; `prefixImages` owns the device memory. The snapshot/lookup/
+    // restore/acquire/release/drain LOGIC stays on ServingSession — it needs the
+    // engine's pool/ssm/dims, so it is serving-orchestration that USES this store,
+    // not the store's own behaviour. Cap default OFF (MIMIRMIND_GDN_XSLOT=1).
+    struct CrossSlotPrefixStore {
+        struct PrefixImage {
+            compute::ComputeBuffer state;   // [nRec, stateElemsPerLayer] dense
+            compute::ComputeBuffer conv;    // [nRec, convElemsPerLayer] dense
+            compute::ComputeBuffer kv;      // [nFullAttn, 2(K,V), pos, slotElems] dtype
+            std::size_t            pos{0};  // block-aligned prefix length (tokens)
+        };
+        bool                                            xslot{false};
+        std::unique_ptr<GdnPrefixIndex>                 prefixIndex;
+        std::unordered_map<std::uint64_t, PrefixImage>  prefixImages;
+        std::uint64_t                                   nextPayloadId{1};
+        // 5.28.1.2.b (2b.2) — deferred device frees. An evicted/dup image's
+        // producer fill-copies are stream-ordered, so freeing it inline would need
+        // a full flush; instead the images move here and drainPrefixImageFrees()
+        // releases them in bulk after a flush at a safe point (end of prefill).
+        std::vector<PrefixImage>                        pendingFree;
     };
-    bool                                            xslot{false};
-    std::unique_ptr<GdnPrefixIndex>        prefixIndex;
-    std::unordered_map<std::uint64_t, PrefixImage>  prefixImages;
-    std::uint64_t                                   nextPayloadId{1};
-    // 5.28.1.2.b (2b.2) — deferred device frees. An evicted/dup image's producer
-    // fill-copies are stream-ordered, so freeing it inline would need a full
-    // flush (a per-insert stall once the store is at its LRU cap). Instead the
-    // images move here and drainPrefixImageFrees() releases them in bulk after a
-    // flush at a safe point (end of a slot's prefill), amortizing one flush over
-    // a whole prefill's evictions.
-    std::vector<PrefixImage>                        pendingFree;
+    CrossSlotPrefixStore         xstore;
 
     // Scratch (device).
     compute::ComputeBuffer expIdxBuf, kwBuf;
@@ -1133,9 +1137,9 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
     for (std::size_t L = 0; L < st->blockCount; ++L) {
         if (_e.config().isRecurrentLayer(L)) { hasRecurrent = true; break; }
     }
-    st->xslot = hasRecurrent;
+    st->xstore.xslot = hasRecurrent;
     if (const char* xs = std::getenv("MIMIRMIND_GDN_XSLOT")) {
-        st->xslot = (std::atol(xs) > 0) && hasRecurrent;
+        st->xstore.xslot = (std::atol(xs) > 0) && hasRecurrent;
     }
     // Default 64: one entry per distinct RAG prefix (the producer caches only the
     // DEEPEST 512-boundary per prefix, so entries ~= distinct working-set prefixes,
@@ -1147,8 +1151,8 @@ void ServingSession::ensureServingState(std::size_t maxBatch,
         if (v > 0) xslotMax = static_cast<std::size_t>(v);
     }
     const std::size_t xblk = prefillChunkSize() ? prefillChunkSize() : 512;
-    st->prefixIndex = std::make_unique<GdnPrefixIndex>(xblk, xslotMax);
-    if (st->xslot) {
+    st->xstore.prefixIndex = std::make_unique<GdnPrefixIndex>(xblk, xslotMax);
+    if (st->xstore.xslot) {
         MM_LOG_INFO("serving",
                     "5.28.1.2.b cross-slot GDN prefix sharing ENABLED "
                     "(blockSize={} tok, maxEntries={})", xblk, xslotMax);
@@ -2584,12 +2588,12 @@ void ServingSession::clearSlotSsmCkpts(std::size_t slot) {
 std::uint64_t ServingSession::snapshotSlotToPrefixImage(
         std::size_t slot, std::size_t pos, const std::int32_t* tokens) {
     if (_state == nullptr || _state->ssm == nullptr || _state->pool == nullptr ||
-        !_state->xslot || _state->prefixIndex == nullptr || tokens == nullptr ||
+        !_state->xstore.xslot || _state->xstore.prefixIndex == nullptr || tokens == nullptr ||
         pos == 0) {
         return GdnPrefixIndex::kNone;
     }
     auto& st = *_state;
-    const std::size_t blk = st.prefixIndex->blockSize();
+    const std::size_t blk = st.xstore.prefixIndex->blockSize();
     if ((pos % blk) != 0 || pos > st.maxContext) {
         return GdnPrefixIndex::kNone;   // must be a checkpoint boundary
     }
@@ -2602,7 +2606,7 @@ std::uint64_t ServingSession::snapshotSlotToPrefixImage(
     for (std::size_t L = 0; L < st.blockCount; ++L) {
         if (_e.config().isRecurrentLayer(L)) ++nRec;
     }
-    ServingState::PrefixImage img;
+    ServingState::CrossSlotPrefixStore::PrefixImage img;
     img.pos   = pos;
     img.state = _e.ops()->allocate(nRec * stElems * sizeof(float));
     img.conv  = _e.ops()->allocate(nRec * cvElems * sizeof(float));
@@ -2649,9 +2653,9 @@ std::uint64_t ServingSession::snapshotSlotToPrefixImage(
     // --- register in the keyed index (host). A duplicate prefix bounces our id
     // back in `evicted` (keep the existing entry); LRU victims also come back —
     // free every returned image's device memory.
-    const std::uint64_t pid = st.nextPayloadId++;
+    const std::uint64_t pid = st.xstore.nextPayloadId++;
     std::vector<std::uint64_t> evicted;
-    st.prefixIndex->insert(tokens, pos, pid, evicted);
+    st.xstore.prefixIndex->insert(tokens, pos, pid, evicted);
     // Freeing a device image (an evicted LRU victim OR our own `img` when the
     // prefix was already cached) is an IMMEDIATE host-side free, but the producer
     // fill-copies are queued stream-ordered — freeing a buffer with an in-flight
@@ -2661,16 +2665,16 @@ std::uint64_t ServingSession::snapshotSlotToPrefixImage(
     bool ourIdBounced = false;   // dup prefix -> keep the existing entry
     for (const std::uint64_t e : evicted) {
         if (e == pid) { ourIdBounced = true; continue; }
-        auto node = st.prefixImages.extract(e);   // LRU victim -> defer its free
+        auto node = st.xstore.prefixImages.extract(e);   // LRU victim -> defer its free
         if (!node.empty()) {
-            st.pendingFree.push_back(std::move(node.mapped()));
+            st.xstore.pendingFree.push_back(std::move(node.mapped()));
         }
     }
     if (ourIdBounced) {
-        st.pendingFree.push_back(std::move(img));   // dup: defer our redundant img
+        st.xstore.pendingFree.push_back(std::move(img));   // dup: defer our redundant img
         return GdnPrefixIndex::kNone;
     }
-    st.prefixImages.emplace(pid, std::move(img));
+    st.xstore.prefixImages.emplace(pid, std::move(img));
     return pid;
 }
 
@@ -2679,11 +2683,11 @@ bool ServingSession::lookupPrefixImage(const std::int32_t* prompt,
                                        std::uint64_t& outPayload) {
     outPos = 0;
     outPayload = GdnPrefixIndex::kNone;
-    if (_state == nullptr || !_state->xslot || _state->prefixIndex == nullptr) {
+    if (_state == nullptr || !_state->xstore.xslot || _state->xstore.prefixIndex == nullptr) {
         return false;
     }
-    const auto hit = _state->prefixIndex->lookup(prompt, promptLen);
-    if (!hit.found || _state->prefixImages.count(hit.payload) == 0) {
+    const auto hit = _state->xstore.prefixIndex->lookup(prompt, promptLen);
+    if (!hit.found || _state->xstore.prefixImages.count(hit.payload) == 0) {
         return false;
     }
     outPos     = hit.pos;
@@ -2694,15 +2698,15 @@ bool ServingSession::lookupPrefixImage(const std::int32_t* prompt,
 bool ServingSession::restorePrefixImageToSlot(std::size_t slot,
                                               std::uint64_t payload) {
     if (_state == nullptr || _state->ssm == nullptr || _state->pool == nullptr ||
-        !_state->xslot) {
+        !_state->xstore.xslot) {
         return false;
     }
     auto& st = *_state;
-    const auto it = st.prefixImages.find(payload);
-    if (it == st.prefixImages.end()) {
+    const auto it = st.xstore.prefixImages.find(payload);
+    if (it == st.xstore.prefixImages.end()) {
         return false;   // evicted between lookup and restore -> caller cold-prefills
     }
-    ServingState::PrefixImage& img = it->second;
+    ServingState::CrossSlotPrefixStore::PrefixImage& img = it->second;
     const std::size_t pos = img.pos;
     // --- SSM + conv copy-IN into this slot's live slab slice (mirror restore) --
     const std::size_t stStride = st.ssm->stateLayerStride();
@@ -2747,19 +2751,19 @@ bool ServingSession::restorePrefixImageToSlot(std::size_t slot,
 }
 
 void ServingSession::acquirePrefixImage(std::uint64_t payload) {
-    if (_state != nullptr && _state->xslot && _state->prefixIndex != nullptr) {
-        _state->prefixIndex->acquire(payload);
+    if (_state != nullptr && _state->xstore.xslot && _state->xstore.prefixIndex != nullptr) {
+        _state->xstore.prefixIndex->acquire(payload);
     }
 }
 
 void ServingSession::releasePrefixImage(std::uint64_t payload) {
-    if (_state != nullptr && _state->xslot && _state->prefixIndex != nullptr) {
-        _state->prefixIndex->release(payload);
+    if (_state != nullptr && _state->xstore.xslot && _state->xstore.prefixIndex != nullptr) {
+        _state->xstore.prefixIndex->release(payload);
     }
 }
 
 bool ServingSession::crossSlotEnabled() const {
-    return _state != nullptr && _state->xslot;
+    return _state != nullptr && _state->xstore.xslot;
 }
 
 void ServingSession::drainPrefixImageFrees() {
@@ -2769,11 +2773,11 @@ void ServingSession::drainPrefixImageFrees() {
     // host-side frees, so a bulk clear() can never race an in-flight copy. No-op
     // (and NO flush) when nothing is pending — the common case, so this adds no
     // stall until the store is churning at its LRU cap.
-    if (_state == nullptr || _state->pendingFree.empty()) {
+    if (_state == nullptr || _state->xstore.pendingFree.empty()) {
         return;
     }
     _e.ops()->flush();
-    _state->pendingFree.clear();   // ComputeBuffer dtors free the device memory
+    _state->xstore.pendingFree.clear();   // ComputeBuffer dtors free the device memory
 }
 
 std::vector<std::vector<std::int32_t>>
