@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -102,6 +103,19 @@ private:
     static void requantDenseAttnProjFp8(
         InferenceEngine& e, core::cuda::CudaComputeContext& cudaCtx,
         compute::cuda::CudaMaterializerOps& devOps);
+
+    /// 5.27 I-2 lever (a) — repack every single-source, NVFP4-sourced projection
+    /// matching `keep` (empty = all) from its just-materialised BF16 image into
+    /// the blocked-NVFP4 format (¼ the bytes), freeing the BF16 in place (RAII).
+    /// Lossless. Was a load()-local [&] lambda (8.30.11.4); leaves the NVFP4
+    /// source resident.
+    static void repackDenseNvfp4(
+        InferenceEngine&                                        e,
+        const std::vector<core::modelopt::MaterializationStep>& steps,
+        core::cuda::CudaComputeContext&                         cudaCtx,
+        compute::cuda::CudaMaterializerOps&                     devOps,
+        const std::function<bool(const std::string&)>&          keep,
+        const char*                                             label);
 };
 
 } // namespace mimirmind::runtime::engine

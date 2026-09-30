@@ -822,6 +822,59 @@ void Nvfp4Loader::buildMoeExpertBanks(
 }
 
 
+void Nvfp4Loader::repackDenseNvfp4(
+        InferenceEngine&                                        e,
+        const std::vector<core::modelopt::MaterializationStep>& steps,
+        core::cuda::CudaComputeContext&                         cudaCtx,
+        compute::cuda::CudaMaterializerOps&                     devOps,
+        const std::function<bool(const std::string&)>&          keep,
+        const char*                                             label) {
+    std::size_t nRepack = 0;
+    std::uint64_t bytesBefore = 0, bytesAfter = 0;
+    for (const auto& step : steps) {
+        if (step.sources.size() != 1) continue;
+        const auto& src = step.sources[0];
+        if (src.kind != core::modelopt::SourceKind::Nvfp4) continue;
+        if ((src.in % 32) != 0) continue;
+        if (keep && !keep(step.ggufName)) continue;
+        auto it = std::find_if(
+            e._materializedBf16.begin(), e._materializedBf16.end(),
+            [&](const runtime::nvfp4::MaterializedTensor& t) {
+                return t.ggufName == step.ggufName;
+            });
+        if (it == e._materializedBf16.end() || it->isF32) continue;
+        if (it->isNvfp4Blk || it->isNvfp4Tc || it->isFp8
+            || it->isQ8_0 || it->isQ4K || it->isQ6K) continue;
+        if (it->buffer.get() == nullptr) continue; // deferred placeholder
+        const std::string base{src.hfWeightName};
+        const std::string baseNoW = stripDotWeight(base);
+        const std::string bsName = src.blockScaleName.empty()
+            ? (baseNoW + ".weight_scale") : src.blockScaleName;
+        const std::string gsName = src.globalScaleName.empty()
+            ? (baseNoW + ".weight_scale_2") : src.globalScaleName;
+        const auto* pk = e._nvfp4Model->find(src.hfWeightName);
+        const auto* bs = e._nvfp4Model->find(bsName);
+        const auto* gs = e._nvfp4Model->find(gsName);
+        if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
+        float global = devOps.readF32(gs->devPtr);
+        if (src.globalIsReciprocal) global = 1.0F / global;
+        const std::size_t blkBytes =
+            (static_cast<std::size_t>(it->elems) / 32) * 20;
+        compute::ComputeBuffer nb = repackNvfp4Blk(
+            devOps, cudaCtx, blkBytes, pk, bs, global,
+            src.rows, src.in);
+        bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
+        bytesAfter  += blkBytes;
+        it->buffer     = std::move(nb);   // frees the BF16 buffer (RAII)
+        it->isNvfp4Blk = true;
+        ++nRepack;
+    }
+    MM_LOG_INFO("engine",
+                "loadModelNvfp4: {} — repacked {} dense projections "
+                "BF16 -> blocked-NVFP4 ({} MiB -> {} MiB)",
+                label, nRepack, bytesBefore >> 20, bytesAfter >> 20);
+}
+
 void Nvfp4Loader::applyMtpEhProjSwap(InferenceEngine&                e,
                                      core::cuda::CudaComputeContext& cudaCtx) {
     // 5b'. MTP eh_proj concat-half swap. The HF checkpoint stores the fused
@@ -1232,60 +1285,13 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
     // tensors an earlier pass already re-quantised (idempotent) and deferred
     // placeholders (empty buffer). NOTE: leaves the NVFP4 SOURCE resident (as
     // the dense-27B path always has); freeing it is the separate lever (b).
-    auto repackDenseNvfp4 =
-        [&](const std::function<bool(const std::string&)>& keep, const char* label) {
-            std::size_t nRepack = 0;
-            std::uint64_t bytesBefore = 0, bytesAfter = 0;
-            for (const auto& step : steps) {
-                if (step.sources.size() != 1) continue;
-                const auto& src = step.sources[0];
-                if (src.kind != core::modelopt::SourceKind::Nvfp4) continue;
-                if ((src.in % 32) != 0) continue;
-                if (keep && !keep(step.ggufName)) continue;
-                auto it = std::find_if(
-                    e._materializedBf16.begin(), e._materializedBf16.end(),
-                    [&](const runtime::nvfp4::MaterializedTensor& t) {
-                        return t.ggufName == step.ggufName;
-                    });
-                if (it == e._materializedBf16.end() || it->isF32) continue;
-                if (it->isNvfp4Blk || it->isNvfp4Tc || it->isFp8
-                    || it->isQ8_0 || it->isQ4K || it->isQ6K) continue;
-                if (it->buffer.get() == nullptr) continue; // deferred placeholder
-                const std::string base{src.hfWeightName};
-                const std::string baseNoW = stripDotWeight(base);
-                const std::string bsName = src.blockScaleName.empty()
-                    ? (baseNoW + ".weight_scale") : src.blockScaleName;
-                const std::string gsName = src.globalScaleName.empty()
-                    ? (baseNoW + ".weight_scale_2") : src.globalScaleName;
-                const auto* pk = e._nvfp4Model->find(src.hfWeightName);
-                const auto* bs = e._nvfp4Model->find(bsName);
-                const auto* gs = e._nvfp4Model->find(gsName);
-                if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
-                float global = devOps.readF32(gs->devPtr);
-                if (src.globalIsReciprocal) global = 1.0F / global;
-                const std::size_t blkBytes =
-                    (static_cast<std::size_t>(it->elems) / 32) * 20;
-                compute::ComputeBuffer nb = repackNvfp4Blk(
-                    devOps, cudaCtx, blkBytes, pk, bs, global,
-                    src.rows, src.in);
-                bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
-                bytesAfter  += blkBytes;
-                it->buffer     = std::move(nb);   // frees the BF16 buffer (RAII)
-                it->isNvfp4Blk = true;
-                ++nRepack;
-            }
-            MM_LOG_INFO("engine",
-                        "loadModelNvfp4: {} — repacked {} dense projections "
-                        "BF16 -> blocked-NVFP4 ({} MiB -> {} MiB)",
-                        label, nRepack, bytesBefore >> 20, bytesAfter >> 20);
-        };
 
     // NOTE (5.27 I-2): qwen4_exp's non-expert projections are UNQUANTISED BF16
     // in the checkpoint (not NVFP4), so there is no NVFP4 source to repack here.
     // Their peak-memory fix lives in the materialization plan instead
     // (Qwen3_5MoeMaterializer: keep the 2-D BF16 matmul projections BF16 verbatim
     // rather than widening them to F32) — see isBf16MatmulProjection. The
-    // repackDenseNvfp4 lambda above remains for the dense-27B NVFP4 checkpoint.
+    // repackDenseNvfp4 helper remains for the dense-27B NVFP4 checkpoint.
 
     requantDenseAttnProjQ8_0(e, cudaCtx, devOps);
 
@@ -1320,7 +1326,7 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
         if (de != nullptr && std::string_view{de} != "0") {
             // Dense 27B: repack ALL single-source NVFP4 projections (opt-in,
             // post-MoE — the dense plan has no routed experts to peak against).
-            repackDenseNvfp4({}, "qwen3_5 dense (MIMIRMIND_QWEN_DENSE_NVFP4_DECODE)");
+            repackDenseNvfp4(e, steps, cudaCtx, devOps, {}, "qwen3_5 dense (MIMIRMIND_QWEN_DENSE_NVFP4_DECODE)");
         }
     }
 
