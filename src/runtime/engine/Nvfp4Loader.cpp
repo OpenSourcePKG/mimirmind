@@ -277,6 +277,31 @@ void detectTemplateThinking(model::LlmConfig&            cfg,
                                 : "JSON (tool | tojson)");
 }
 
+/// Strip a trailing ".weight" (7 chars) from an NVFP4 tensor base name to get
+/// the sidecar-scale stem (`<stem>.weight_scale` / `.weight_scale_2`). Matches
+/// the historical inline logic exactly: drops the last 7 chars when the name is
+/// longer than 7, else returns it unchanged (no suffix check).
+std::string stripDotWeight(const std::string& name) {
+    return name.size() > 7 ? name.substr(0, name.size() - 7) : name;
+}
+
+/// The single-projection NVFP4 -> blocked-NVFP4 repack shared by every dense
+/// keep-path (Gemma-4 dense, qwen3_5 dense, shared experts, lm_head sibling):
+/// allocate the blocked buffer, run the repackage kernel, and sync. `blkBytes`
+/// is (elems/32)*20; the caller keeps it for its own byte accounting.
+compute::ComputeBuffer repackNvfp4Blk(
+        compute::cuda::CudaMaterializerOps& devOps,
+        core::cuda::CudaComputeContext&     cudaCtx,
+        std::size_t                         blkBytes,
+        const runtime::nvfp4::NvFp4DeviceTensor* pk,
+        const runtime::nvfp4::NvFp4DeviceTensor* bs,
+        float global, std::uint64_t rows, std::uint64_t in) {
+    compute::ComputeBuffer nb = devOps.allocateWeight(blkBytes);
+    devOps.repackageNvfp4ToBlk(nb.get(), pk->devPtr, bs->devPtr, global, rows, in);
+    cudaCtx.stream().synchronize();
+    return nb;
+}
+
 } // namespace
 
 void Nvfp4Loader::loadGemma4(InferenceEngine&                     e,
@@ -371,10 +396,9 @@ void Nvfp4Loader::loadGemma4(InferenceEngine&                     e,
                 }
                 const std::size_t blkBytes =
                     (static_cast<std::size_t>(it->elems) / 32) * 20;
-                compute::ComputeBuffer nb = gDevOps.allocateWeight(blkBytes);
-                gDevOps.repackageNvfp4ToBlk(nb.get(), pk->devPtr, bs->devPtr,
-                                            global, src.rows, src.in);
-                gCudaCtx.stream().synchronize();
+                compute::ComputeBuffer nb = repackNvfp4Blk(
+                    gDevOps, gCudaCtx, blkBytes, pk, bs, global,
+                    src.rows, src.in);
                 bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
                 bytesAfter  += blkBytes;
                 it->buffer     = std::move(nb);   // frees the BF16 buffer (RAII)
@@ -573,8 +597,7 @@ void Nvfp4Loader::buildMoeExpertBanks(
                                const runtime::nvfp4::NvFp4DeviceTensor*& gs) {
                 pk = e._nvfp4Model->find(src.hfWeightName);
                 const std::string base{src.hfWeightName};
-                const std::string baseNoW =
-                    base.size() > 7 ? base.substr(0, base.size() - 7) : base;
+                const std::string baseNoW = stripDotWeight(base);
                 bs = e._nvfp4Model->find(baseNoW + ".weight_scale");
                 gs = e._nvfp4Model->find(baseNoW + ".weight_scale_2");
                 return pk != nullptr && bs != nullptr && gs != nullptr;
@@ -1079,8 +1102,7 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                     || it->isQ8_0 || it->isQ4K || it->isQ6K) continue;
                 if (it->buffer.get() == nullptr) continue; // deferred placeholder
                 const std::string base{src.hfWeightName};
-                const std::string baseNoW =
-                    base.size() > 7 ? base.substr(0, base.size() - 7) : base;
+                const std::string baseNoW = stripDotWeight(base);
                 const std::string bsName = src.blockScaleName.empty()
                     ? (baseNoW + ".weight_scale") : src.blockScaleName;
                 const std::string gsName = src.globalScaleName.empty()
@@ -1093,10 +1115,9 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                 if (src.globalIsReciprocal) global = 1.0F / global;
                 const std::size_t blkBytes =
                     (static_cast<std::size_t>(it->elems) / 32) * 20;
-                compute::ComputeBuffer nb = devOps.allocateWeight(blkBytes);
-                devOps.repackageNvfp4ToBlk(nb.get(), pk->devPtr, bs->devPtr,
-                                           global, src.rows, src.in);
-                cudaCtx.stream().synchronize();
+                compute::ComputeBuffer nb = repackNvfp4Blk(
+                    devOps, cudaCtx, blkBytes, pk, bs, global,
+                    src.rows, src.in);
                 bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
                 bytesAfter  += blkBytes;
                 it->buffer     = std::move(nb);   // frees the BF16 buffer (RAII)
@@ -1340,18 +1361,16 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                 if (it->isNvfp4Blk || it->isNvfp4Tc) continue;
                 const auto* pk = e._nvfp4Model->find(src.hfWeightName);
                 const std::string base{src.hfWeightName};
-                const std::string baseNoW =
-                    base.size() > 7 ? base.substr(0, base.size() - 7) : base;
+                const std::string baseNoW = stripDotWeight(base);
                 const auto* bs = e._nvfp4Model->find(baseNoW + ".weight_scale");
                 const auto* gs = e._nvfp4Model->find(baseNoW + ".weight_scale_2");
                 if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
                 const float global = devOps.readF32(gs->devPtr);
                 const std::size_t blkBytes =
                     (static_cast<std::size_t>(it->elems) / 32) * 20;
-                compute::ComputeBuffer nb = devOps.allocateWeight(blkBytes);
-                devOps.repackageNvfp4ToBlk(nb.get(), pk->devPtr, bs->devPtr, global,
-                                           src.rows, src.in);
-                cudaCtx.stream().synchronize();
+                compute::ComputeBuffer nb = repackNvfp4Blk(
+                    devOps, cudaCtx, blkBytes, pk, bs, global,
+                    src.rows, src.in);
                 bytesBefore += static_cast<std::uint64_t>(it->elems) * 2;
                 bytesAfter  += blkBytes;
                 it->buffer     = std::move(nb); // frees the BF16 buffer (RAII)
@@ -1432,18 +1451,16 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
                 if (it == e._materializedBf16.end() || it->isF32) continue;
                 const auto* pk = e._nvfp4Model->find(src.hfWeightName);
                 const std::string base{src.hfWeightName};
-                const std::string baseNoW =
-                    base.size() > 7 ? base.substr(0, base.size() - 7) : base;
+                const std::string baseNoW = stripDotWeight(base);
                 const auto* bs = e._nvfp4Model->find(baseNoW + ".weight_scale");
                 const auto* gs = e._nvfp4Model->find(baseNoW + ".weight_scale_2");
                 if (pk == nullptr || bs == nullptr || gs == nullptr) continue;
                 const float global = devOps.readF32(gs->devPtr);
                 const std::size_t blkBytes =
                     (static_cast<std::size_t>(it->elems) / 32) * 20;
-                compute::ComputeBuffer nb = devOps.allocateWeight(blkBytes);
-                devOps.repackageNvfp4ToBlk(nb.get(), pk->devPtr, bs->devPtr, global,
-                                           src.rows, src.in);
-                cudaCtx.stream().synchronize();
+                compute::ComputeBuffer nb = repackNvfp4Blk(
+                    devOps, cudaCtx, blkBytes, pk, bs, global,
+                    src.rows, src.in);
                 runtime::nvfp4::MaterializedTensor v;
                 v.ggufName   = it->ggufName + ".nv";  // "output.weight.nv"
                 v.buffer     = std::move(nb);

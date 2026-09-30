@@ -17,6 +17,7 @@
 namespace mimirmind::core::cuda {
 class CudaComputeContext;
 class CudaMemoryAllocator;
+class CudaKernel;
 }
 namespace mimirmind::core::config {
 struct FeatureSettings;
@@ -303,6 +304,10 @@ private:
     static constexpr std::uint32_t kVecLocalSize     = 128;  // vec path (matches MATMUL_Q8_0_LOCAL)
     static constexpr std::uint32_t kSubgroupSize     = 16;
     static constexpr std::uint32_t kOutputsPerGroup  = kLocalSize / kSubgroupSize;
+    // Fixed accumulator bound of the chunked GEMM kernels (BF16/FP8/NVFP4_BLK);
+    // must match GEMM_MAX_M in the corresponding .cu. M is chunked to this so
+    // weights are re-read once per chunk, not once per activation row.
+    static constexpr std::size_t   kGemmMaxM         = 16;
 
     // warp32 revision (one full CUDA warp per output row, matching
     // llama.cpp's ggml-cuda MMVQ geometry) — see matmul_q8_0_vec_dp4a.cu /
@@ -465,6 +470,14 @@ private:
     // dispatcher checks the type and forwards. matmulCpuFallbackAsync and
     // matmulQ8_0Async additionally take `type` (the fallback dequant lookup
     // and the Q8_0 MMQ guard read it).
+    // Shared per-row matvec launch for the K-quant / F16-scale vec kernels
+    // (Q5_0/Q6_K/Q3_K/Q4_K/Q5_K): identical launch geometry, differing only in
+    // the kernel and the block-element count (used for the K%block guard +
+    // error label). Collapses five byte-identical branch bodies into one.
+    void matmulKQuantVecAsync(::mimirmind::core::cuda::CudaKernel& kern,
+                              std::size_t kBlockElts, const char* quantName,
+                              const void* W, std::size_t N, std::size_t K,
+                              const float* X, std::size_t M, float* Y);
     void matmulQ5_0Async(const void* W, std::size_t N, std::size_t K,
                          const float* X, std::size_t M, float* Y);
     void matmulQ6KAsync(const void* W, std::size_t N, std::size_t K,

@@ -1183,139 +1183,69 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
     matmulQ8_0Async(type, W, N, K, X, M, Y);
 }
 
+void GpuMatmul::matmulKQuantVecAsync(::mimirmind::core::cuda::CudaKernel& kern,
+                                     std::size_t kBlockElts,
+                                     const char* quantName,
+                                     const void* W, std::size_t N, std::size_t K,
+                                     const float* X, std::size_t M, float* Y) {
+    // Per-row matvec loop shared by the K-quant / F16-scale vec kernels. Same
+    // launch geometry for all (128 threads = 4 warps × 32 lanes, one warp per
+    // output row, *_OUTPUTS_PER_GROUP = 4); each quant differs only in its
+    // block-element count. K must be a multiple of the (super-)block size.
+    if (K % kBlockElts != 0) {
+        throw std::runtime_error(
+            std::string("compute::cuda::GpuMatmul::matmulAsync: K=") +
+            std::to_string(K) + " is not a multiple of " + quantName +
+            " blockElements=" + std::to_string(kBlockElts));
+    }
+    const std::uint32_t nGroups = static_cast<std::uint32_t>(
+        (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
+
+    for (std::size_t m = 0; m < M; ++m) {
+        const float* xRow = X + m * K;
+        float*       yRow = Y + m * N;
+
+        kern.setPtr  (0, xRow);
+        kern.setPtr  (1, W);
+        kern.setPtr  (2, yRow);
+        kern.setValue(3, static_cast<std::int32_t>(K));
+        kern.setValue(4, static_cast<std::int32_t>(N));
+
+        kern.launch(_ctx.stream(),
+                    nGroups, 1, 1,
+                    kVecLocalSize, 1, 1);
+    }
+}
+
 void GpuMatmul::matmulQ5_0Async(const void* W, std::size_t N, std::size_t K,
                                 const float* X, std::size_t M, float* Y) {
-        // Native Q5_0 vec kernel — same launch geometry as the Q8_0
-        // vec path (128 threads = 4 warps × 32 lanes, one warp per
-        // output row, MATMUL_Q5_0_OUTPUTS_PER_GROUP = 4). Q5_0 blocks
-        // are 32 elements / 22 bytes with fp16 scale + u32 high-bits
-        // + 16 packed nibbles; the kernel handles the bit-extraction
-        // per lane. Per-row matvec loop over M like Q8_0's fallback.
-        constexpr std::size_t kBlockElts = 32;
-        if (K % kBlockElts != 0) {
-            throw std::runtime_error(
-                "compute::cuda::GpuMatmul::matmulAsync: K=" +
-                std::to_string(K) + " is not a multiple of Q5_0 "
-                "blockElements=" + std::to_string(kBlockElts));
-        }
-        const std::uint32_t nGroups = static_cast<std::uint32_t>(
-            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
-
-        auto& kern = _pimpl->_matmulQ5_0VecKernel;
-        for (std::size_t m = 0; m < M; ++m) {
-            const float* xRow = X + m * K;
-            float*       yRow = Y + m * N;
-
-            kern.setPtr  (0, xRow);
-            kern.setPtr  (1, W);
-            kern.setPtr  (2, yRow);
-            kern.setValue(3, static_cast<std::int32_t>(K));
-            kern.setValue(4, static_cast<std::int32_t>(N));
-
-            kern.launch(_ctx.stream(),
-                        nGroups, 1, 1,
-                        kVecLocalSize, 1, 1);
-        }
+    // Q5_0 blocks are 32 elements / 22 bytes (fp16 scale + u32 high-bits +
+    // 16 packed nibbles); the kernel handles the per-lane bit-extraction.
+    matmulKQuantVecAsync(_pimpl->_matmulQ5_0VecKernel, 32, "Q5_0",
+                         W, N, K, X, M, Y);
 }
 
 void GpuMatmul::matmulQ6KAsync(const void* W, std::size_t N, std::size_t K,
                                const float* X, std::size_t M, float* Y) {
-        // Native Q6_K vec kernel — Q5_0-shape launch (128 threads =
-        // 4 warps × 32 lanes, MATMUL_Q6K_OUTPUTS_PER_GROUP = 4), but
-        // block is 256 elements / 210 bytes with ql/qh/sc/d fields.
-        // K must be a multiple of the super-block size.
-        constexpr std::size_t kBlockElts = 256;
-        if (K % kBlockElts != 0) {
-            throw std::runtime_error(
-                "compute::cuda::GpuMatmul::matmulAsync: K=" +
-                std::to_string(K) + " is not a multiple of Q6_K "
-                "blockElements=" + std::to_string(kBlockElts));
-        }
-        const std::uint32_t nGroups = static_cast<std::uint32_t>(
-            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
-
-        auto& kern = _pimpl->_matmulQ6KVecKernel;
-        for (std::size_t m = 0; m < M; ++m) {
-            const float* xRow = X + m * K;
-            float*       yRow = Y + m * N;
-
-            kern.setPtr  (0, xRow);
-            kern.setPtr  (1, W);
-            kern.setPtr  (2, yRow);
-            kern.setValue(3, static_cast<std::int32_t>(K));
-            kern.setValue(4, static_cast<std::int32_t>(N));
-
-            kern.launch(_ctx.stream(),
-                        nGroups, 1, 1,
-                        kVecLocalSize, 1, 1);
-        }
+    // Q6_K block is 256 elements / 210 bytes with ql/qh/sc/d fields.
+    matmulKQuantVecAsync(_pimpl->_matmulQ6KVecKernel, 256, "Q6_K",
+                         W, N, K, X, M, Y);
 }
 
 void GpuMatmul::matmulQ3KAsync(const void* W, std::size_t N, std::size_t K,
                                const float* X, std::size_t M, float* Y) {
-        // Native Q3_K vec kernel — same launch shape as Q6_K but block
-        // is 256 elements / 110 bytes with hmask[32] / qs[64] /
-        // scales[12] (packed 16 x 6-bit) / fp16 d. Signed 3-bit quant:
-        // value = d * (scale - 32) * (low_2 - (high_1 ? 0 : 4)).
-        // K must be a multiple of the super-block size.
-        constexpr std::size_t kBlockElts = 256;
-        if (K % kBlockElts != 0) {
-            throw std::runtime_error(
-                "compute::cuda::GpuMatmul::matmulAsync: K=" +
-                std::to_string(K) + " is not a multiple of Q3_K "
-                "blockElements=" + std::to_string(kBlockElts));
-        }
-        const std::uint32_t nGroups = static_cast<std::uint32_t>(
-            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
-
-        auto& kern = _pimpl->_matmulQ3KVecKernel;
-        for (std::size_t m = 0; m < M; ++m) {
-            const float* xRow = X + m * K;
-            float*       yRow = Y + m * N;
-
-            kern.setPtr  (0, xRow);
-            kern.setPtr  (1, W);
-            kern.setPtr  (2, yRow);
-            kern.setValue(3, static_cast<std::int32_t>(K));
-            kern.setValue(4, static_cast<std::int32_t>(N));
-
-            kern.launch(_ctx.stream(),
-                        nGroups, 1, 1,
-                        kVecLocalSize, 1, 1);
-        }
+        // Q3_K block is 256 elements / 110 bytes: hmask[32] / qs[64] /
+        // scales[12] (packed 16 x 6-bit) / fp16 d. Signed 3-bit quant.
+    matmulKQuantVecAsync(_pimpl->_matmulQ3KVecKernel, 256, "Q3_K",
+                         W, N, K, X, M, Y);
 }
 
 void GpuMatmul::matmulQ4KAsync(const void* W, std::size_t N, std::size_t K,
                                const float* X, std::size_t M, float* Y) {
-        // Native Q4_K vec kernel — same launch as Q6_K but block is
-        // 256 elements / 144 bytes with d/dmin/scales[12]/qs[128]
-        // layout. Asymmetric quant: value = d*scale*nibble - dmin*min
-        // per sub-block. K must be a multiple of the super-block size.
-        constexpr std::size_t kBlockElts = 256;
-        if (K % kBlockElts != 0) {
-            throw std::runtime_error(
-                "compute::cuda::GpuMatmul::matmulAsync: K=" +
-                std::to_string(K) + " is not a multiple of Q4_K "
-                "blockElements=" + std::to_string(kBlockElts));
-        }
-        const std::uint32_t nGroups = static_cast<std::uint32_t>(
-            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
-
-        auto& kern = _pimpl->_matmulQ4KVecKernel;
-        for (std::size_t m = 0; m < M; ++m) {
-            const float* xRow = X + m * K;
-            float*       yRow = Y + m * N;
-
-            kern.setPtr  (0, xRow);
-            kern.setPtr  (1, W);
-            kern.setPtr  (2, yRow);
-            kern.setValue(3, static_cast<std::int32_t>(K));
-            kern.setValue(4, static_cast<std::int32_t>(N));
-
-            kern.launch(_ctx.stream(),
-                        nGroups, 1, 1,
-                        kVecLocalSize, 1, 1);
-        }
+        // Q4_K block is 256 elements / 144 bytes: d/dmin/scales[12]/qs[128].
+        // Asymmetric quant: value = d*scale*nibble - dmin*min per sub-block.
+    matmulKQuantVecAsync(_pimpl->_matmulQ4KVecKernel, 256, "Q4_K",
+                         W, N, K, X, M, Y);
 }
 
 void GpuMatmul::matmulF32Async(const void* W, std::size_t N, std::size_t K,
@@ -1453,7 +1383,6 @@ void GpuMatmul::matmulBf16Async(const void* W, std::size_t N, std::size_t K,
             return;
         }
 
-        constexpr std::size_t kGemmMaxM = 16;   // == GEMM_MAX_M in the .cu
         auto& kern = _pimpl->_matmulBf16GemmKernel;
         for (std::size_t m0 = 0; m0 < M; m0 += kGemmMaxM) {
             const std::size_t mChunk = std::min(kGemmMaxM, M - m0);
@@ -1493,7 +1422,6 @@ void GpuMatmul::matmulFp8Async(const void* W, std::size_t N, std::size_t K,
             return;
         }
 
-        constexpr std::size_t kGemmMaxM = 16;   // == GEMM_MAX_M in the .cu
         auto& kern = _pimpl->_matmulFp8GemmKernel;
         for (std::size_t m0 = 0; m0 < M; m0 += kGemmMaxM) {
             const std::size_t mChunk = std::min(kGemmMaxM, M - m0);
@@ -1530,7 +1458,6 @@ void GpuMatmul::matmulNvfp4BlkAsync(const void* W, std::size_t N, std::size_t K,
             return;
         }
 
-        constexpr std::size_t kGemmMaxM = 16;
         static const bool diag = []() {
             const char* e = std::getenv("MIMIRMIND_MATMUL_DIAG");
             return e != nullptr && e[0] != '\0' && e[0] != '0';
@@ -1555,37 +1482,11 @@ void GpuMatmul::matmulNvfp4BlkAsync(const void* W, std::size_t N, std::size_t K,
 
 void GpuMatmul::matmulQ5KAsync(const void* W, std::size_t N, std::size_t K,
                                const float* X, std::size_t M, float* Y) {
-        // Native Q5_K vec kernel — Q4_K-shape launch, block is 256
-        // elements / 176 bytes: d/dmin/scales[12] identical to Q4_K
-        // plus qh[32] (one high-bit per element, 2-bit shift per pair)
-        // + qs[128] nibbles. Q5_K appears in Gemma 4 Q4_K_M for
-        // attn_k / attn_output — hitting this on every draft step of
-        // M9.11 speculative decoding.
-        constexpr std::size_t kBlockElts = 256;
-        if (K % kBlockElts != 0) {
-            throw std::runtime_error(
-                "compute::cuda::GpuMatmul::matmulAsync: K=" +
-                std::to_string(K) + " is not a multiple of Q5_K "
-                "blockElements=" + std::to_string(kBlockElts));
-        }
-        const std::uint32_t nGroups = static_cast<std::uint32_t>(
-            (N + kOutputsPerGroup - 1) / kOutputsPerGroup);
-
-        auto& kern = _pimpl->_matmulQ5KVecKernel;
-        for (std::size_t m = 0; m < M; ++m) {
-            const float* xRow = X + m * K;
-            float*       yRow = Y + m * N;
-
-            kern.setPtr  (0, xRow);
-            kern.setPtr  (1, W);
-            kern.setPtr  (2, yRow);
-            kern.setValue(3, static_cast<std::int32_t>(K));
-            kern.setValue(4, static_cast<std::int32_t>(N));
-
-            kern.launch(_ctx.stream(),
-                        nGroups, 1, 1,
-                        kVecLocalSize, 1, 1);
-        }
+        // Q5_K block is 256 elements / 176 bytes: d/dmin/scales[12] as Q4_K
+        // plus qh[32] (one high-bit per element) + qs[128] nibbles. Appears in
+        // Gemma 4 Q4_K_M for attn_k / attn_output (every M9.11 draft step).
+    matmulKQuantVecAsync(_pimpl->_matmulQ5KVecKernel, 256, "Q5_K",
+                         W, N, K, X, M, Y);
 }
 
 void GpuMatmul::matmulCpuFallbackAsync(::mimirmind::core::gguf::GgmlType type,
@@ -1621,11 +1522,16 @@ void GpuMatmul::matmulCpuFallbackAsync(::mimirmind::core::gguf::GgmlType type,
 
         if (!_cpuFallbackLogged) {
             _cpuFallbackLogged = true;
-            MM_LOG_INFO("cuda::GpuMatmul",
+            // WARN, not INFO: this is a correctness-only host path that runs at
+            // ~seconds/token (full D2H -> host matmul -> H2D per dispatch). On
+            // the CUDA backend it should be unreachable — every shipped weight
+            // type has a native kernel above — so hitting it signals a missing
+            // kernel for '{}', not normal operation.
+            MM_LOG_WARN("cuda::GpuMatmul",
                         "CPU fallback active — dispatching '{}' (and any "
                         "other non-Q8_0 type this session) through "
                         "compute::matmul on the host. W/X are copied D2H, "
-                        "Y is copied H2D. Slow by design; native HIP "
+                        "Y is copied H2D. Slow by design; native CUDA "
                         "kernels replace this per type. Further "
                         "per-dispatch logs suppressed.",
                         qt->name());
