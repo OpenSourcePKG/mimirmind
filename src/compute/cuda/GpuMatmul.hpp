@@ -459,6 +459,36 @@ private:
     // De-interleaves W once (cached by pointer) then launches the vec kernel.
     void nvblkDeintVec(const void* W, std::size_t N, std::size_t K,
                        const float* X, float* Y);
+
+    // Per-weight-type launch paths dispatched by matmulAsync. Each is the
+    // verbatim body of the corresponding `if (type == …)` branch; the
+    // dispatcher checks the type and forwards. matmulCpuFallbackAsync and
+    // matmulQ8_0Async additionally take `type` (the fallback dequant lookup
+    // and the Q8_0 MMQ guard read it).
+    void matmulQ5_0Async(const void* W, std::size_t N, std::size_t K,
+                         const float* X, std::size_t M, float* Y);
+    void matmulQ6KAsync(const void* W, std::size_t N, std::size_t K,
+                        const float* X, std::size_t M, float* Y);
+    void matmulQ3KAsync(const void* W, std::size_t N, std::size_t K,
+                        const float* X, std::size_t M, float* Y);
+    void matmulQ4KAsync(const void* W, std::size_t N, std::size_t K,
+                        const float* X, std::size_t M, float* Y);
+    void matmulF32Async(const void* W, std::size_t N, std::size_t K,
+                        const float* X, std::size_t M, float* Y);
+    void matmulBf16Async(const void* W, std::size_t N, std::size_t K,
+                         const float* X, std::size_t M, float* Y);
+    void matmulFp8Async(const void* W, std::size_t N, std::size_t K,
+                        const float* X, std::size_t M, float* Y);
+    void matmulNvfp4BlkAsync(const void* W, std::size_t N, std::size_t K,
+                             const float* X, std::size_t M, float* Y);
+    void matmulQ5KAsync(const void* W, std::size_t N, std::size_t K,
+                        const float* X, std::size_t M, float* Y);
+    void matmulCpuFallbackAsync(::mimirmind::core::gguf::GgmlType type,
+                                const void* W, std::size_t N, std::size_t K,
+                                const float* X, std::size_t M, float* Y);
+    void matmulQ8_0Async(::mimirmind::core::gguf::GgmlType type,
+                         const void* W, std::size_t N, std::size_t K,
+                         const float* X, std::size_t M, float* Y);
 };
 
 } // namespace mimirmind::compute::cuda

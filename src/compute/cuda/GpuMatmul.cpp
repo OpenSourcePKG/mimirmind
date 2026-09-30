@@ -1145,16 +1145,30 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
                             float*          Y,
                             float*          scratch) {
     // The caller-provided `scratch` is a device pointer for HIP and
-    // therefore not host-writable. The CPU fallback below allocates
-    // its own host scratch; on the Q8_0 GPU path scratch is unused
-    // entirely (Q8_0 kernels don't need dequant workspace).
+    // therefore not host-writable. The CPU fallback allocates its own
+    // host scratch; the Q8_0 GPU path does not need dequant workspace.
     (void)scratch;
 
     if (M == 0 || N == 0 || K == 0) {
         return;
     }
 
-    if (type == ::mimirmind::core::gguf::GgmlType::Q5_0) {
+    if (type == ::mimirmind::core::gguf::GgmlType::Q5_0)      { matmulQ5_0Async(W, N, K, X, M, Y);     return; }
+    if (type == ::mimirmind::core::gguf::GgmlType::Q6_K)      { matmulQ6KAsync(W, N, K, X, M, Y);      return; }
+    if (type == ::mimirmind::core::gguf::GgmlType::Q3_K)      { matmulQ3KAsync(W, N, K, X, M, Y);      return; }
+    if (type == ::mimirmind::core::gguf::GgmlType::Q4_K)      { matmulQ4KAsync(W, N, K, X, M, Y);      return; }
+    if (type == ::mimirmind::core::gguf::GgmlType::F32)       { matmulF32Async(W, N, K, X, M, Y);      return; }
+    if (type == ::mimirmind::core::gguf::GgmlType::BF16)      { matmulBf16Async(W, N, K, X, M, Y);     return; }
+    if (type == ::mimirmind::core::gguf::GgmlType::FP8_E4M3)  { matmulFp8Async(W, N, K, X, M, Y);      return; }
+    if (type == ::mimirmind::core::gguf::GgmlType::NVFP4_BLK) { matmulNvfp4BlkAsync(W, N, K, X, M, Y); return; }
+    if (type == ::mimirmind::core::gguf::GgmlType::Q5_K)      { matmulQ5KAsync(W, N, K, X, M, Y);      return; }
+    if (type != ::mimirmind::core::gguf::GgmlType::Q8_0)      { matmulCpuFallbackAsync(type, W, N, K, X, M, Y); return; }
+
+    matmulQ8_0Async(type, W, N, K, X, M, Y);
+}
+
+void GpuMatmul::matmulQ5_0Async(const void* W, std::size_t N, std::size_t K,
+                                const float* X, std::size_t M, float* Y) {
         // Native Q5_0 vec kernel — same launch geometry as the Q8_0
         // vec path (128 threads = 4 warps × 32 lanes, one warp per
         // output row, MATMUL_Q5_0_OUTPUTS_PER_GROUP = 4). Q5_0 blocks
@@ -1186,10 +1200,10 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
                         nGroups, 1, 1,
                         kVecLocalSize, 1, 1);
         }
-        return;
-    }
+}
 
-    if (type == ::mimirmind::core::gguf::GgmlType::Q6_K) {
+void GpuMatmul::matmulQ6KAsync(const void* W, std::size_t N, std::size_t K,
+                               const float* X, std::size_t M, float* Y) {
         // Native Q6_K vec kernel — Q5_0-shape launch (128 threads =
         // 4 warps × 32 lanes, MATMUL_Q6K_OUTPUTS_PER_GROUP = 4), but
         // block is 256 elements / 210 bytes with ql/qh/sc/d fields.
@@ -1219,10 +1233,10 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
                         nGroups, 1, 1,
                         kVecLocalSize, 1, 1);
         }
-        return;
-    }
+}
 
-    if (type == ::mimirmind::core::gguf::GgmlType::Q3_K) {
+void GpuMatmul::matmulQ3KAsync(const void* W, std::size_t N, std::size_t K,
+                               const float* X, std::size_t M, float* Y) {
         // Native Q3_K vec kernel — same launch shape as Q6_K but block
         // is 256 elements / 110 bytes with hmask[32] / qs[64] /
         // scales[12] (packed 16 x 6-bit) / fp16 d. Signed 3-bit quant:
@@ -1253,10 +1267,10 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
                         nGroups, 1, 1,
                         kVecLocalSize, 1, 1);
         }
-        return;
-    }
+}
 
-    if (type == ::mimirmind::core::gguf::GgmlType::Q4_K) {
+void GpuMatmul::matmulQ4KAsync(const void* W, std::size_t N, std::size_t K,
+                               const float* X, std::size_t M, float* Y) {
         // Native Q4_K vec kernel — same launch as Q6_K but block is
         // 256 elements / 144 bytes with d/dmin/scales[12]/qs[128]
         // layout. Asymmetric quant: value = d*scale*nibble - dmin*min
@@ -1286,10 +1300,10 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
                         nGroups, 1, 1,
                         kVecLocalSize, 1, 1);
         }
-        return;
-    }
+}
 
-    if (type == ::mimirmind::core::gguf::GgmlType::F32) {
+void GpuMatmul::matmulF32Async(const void* W, std::size_t N, std::size_t K,
+                               const float* X, std::size_t M, float* Y) {
         // Batched (M>1) F32 GEMM: the per-row vec path below launches M kernels
         // with no weight reuse or tensor cores, so a small-N F32 weight (the MoE
         // router ffn_gate_inp: N=nExperts, K=d_model) costs ~100x more than it
@@ -1354,10 +1368,10 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
                         nGroups, 1, 1,
                         kVecLocalSize, 1, 1);
         }
-        return;
-    }
+}
 
-    if (type == ::mimirmind::core::gguf::GgmlType::BF16) {
+void GpuMatmul::matmulBf16Async(const void* W, std::size_t N, std::size_t K,
+                                const float* X, std::size_t M, float* Y) {
         // Native BF16 matmul — reads 2-byte BF16 weights and widens each to
         // fp32 in the FMA. The NVFP4 checkpoints materialise their
         // (dequantised) weights to BF16, notably every MoE expert bank;
@@ -1441,10 +1455,10 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
                         nGroups, 1, 1,
                         kVecLocalSize, 1, 1);
         }
-        return;
-    }
+}
 
-    if (type == ::mimirmind::core::gguf::GgmlType::FP8_E4M3) {
+void GpuMatmul::matmulFp8Async(const void* W, std::size_t N, std::size_t K,
+                               const float* X, std::size_t M, float* Y) {
         // Blocked-FP8 (E4M3) matmul — 1-byte log-format weights (34 B / 32).
         // Same warp layout as BF16 (LOCAL=128, 4 outputs/group); the scale is
         // embedded per block so no scale plumbing is needed. Used for the
@@ -1475,10 +1489,10 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
             kern.setValue(5, static_cast<std::int32_t>(mChunk));
             kern.launch(_ctx.stream(), nGroups, 1, 1, kVecLocalSize, 1, 1);
         }
-        return;
-    }
+}
 
-    if (type == ::mimirmind::core::gguf::GgmlType::NVFP4_BLK) {
+void GpuMatmul::matmulNvfp4BlkAsync(const void* W, std::size_t N, std::size_t K,
+                                    const float* X, std::size_t M, float* Y) {
         // Blocked-NVFP4 (E2M1) matmul — native 4-bit weights kept resident
         // (20 B / 32 elems). Same warp layout as BF16; scales embedded per
         // super-block, so no plumbing. Full-attention projections.
@@ -1521,10 +1535,10 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
             kern.setValue(5, static_cast<std::int32_t>(mChunk));
             kern.launch(_ctx.stream(), nGroups, 1, 1, kVecLocalSize, 1, 1);
         }
-        return;
-    }
+}
 
-    if (type == ::mimirmind::core::gguf::GgmlType::Q5_K) {
+void GpuMatmul::matmulQ5KAsync(const void* W, std::size_t N, std::size_t K,
+                               const float* X, std::size_t M, float* Y) {
         // Native Q5_K vec kernel — Q4_K-shape launch, block is 256
         // elements / 176 bytes: d/dmin/scales[12] identical to Q4_K
         // plus qh[32] (one high-bit per element, 2-bit shift per pair)
@@ -1556,10 +1570,11 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
                         nGroups, 1, 1,
                         kVecLocalSize, 1, 1);
         }
-        return;
-    }
+}
 
-    if (type != ::mimirmind::core::gguf::GgmlType::Q8_0) {
+void GpuMatmul::matmulCpuFallbackAsync(::mimirmind::core::gguf::GgmlType type,
+                                       const void* W, std::size_t N, std::size_t K,
+                                       const float* X, std::size_t M, float* Y) {
         // CPU fallback for weight types without a HIP matmul kernel
         // today (Q4_K / Q5_K / Q6_K / F16 / BF16 / F32, or any other
         // type present in compute::QuantTypeRegistry).
@@ -1627,9 +1642,11 @@ void GpuMatmul::matmulAsync(::mimirmind::core::gguf::GgmlType type,
                                      cpuScratch.data());
 
         alloc.copyH2D(Y, yHost.data(), yBytes);
-        return;
-    }
+}
 
+void GpuMatmul::matmulQ8_0Async(::mimirmind::core::gguf::GgmlType type,
+                                const void* W, std::size_t N, std::size_t K,
+                                const float* X, std::size_t M, float* Y) {
     // Dispatch by autotune state:
     //   1. useDp4a set (autotune / features.dp4a=Force) → quant + DP4A
     //   2. else M >= gemmMinM AND GEMM available → batched GEMM (V2 if
