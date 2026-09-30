@@ -6,13 +6,19 @@
 #include "model/ChatTemplate.hpp"   // ChatMessage, ChatRole
 #include "model/ToolCall.hpp"       // ToolSpec
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace minja {
 class chat_template;
+}
+
+namespace mimirmind::model {
+class Tokenizer;
 }
 
 namespace mimirmind::model::chat {
@@ -57,6 +63,18 @@ public:
     /// chat_template_kwargs-style extra-context var (like vLLM) when set.
     /// Returns the rendered prompt string. Throws on a Jinja render error.
     [[nodiscard]] std::string render(
+        std::span<const ChatMessage> messages,
+        std::span<const ToolSpec>    tools,
+        bool                         addGenerationPrompt,
+        std::optional<bool>          enableThinking = std::nullopt) const;
+
+    /// render() + special-token-aware tokenisation of the result — the rendered
+    /// prompt carries special markup (`<|im_start|>` …) as literal text, so it
+    /// is tokenised with parseSpecial=true (addBos=false; the template already
+    /// emits the bos token where the model wants it). This is the prompt the
+    /// decoder continues from.
+    [[nodiscard]] std::vector<std::int32_t> encode(
+        const Tokenizer&             tok,
         std::span<const ChatMessage> messages,
         std::span<const ToolSpec>    tools,
         bool                         addGenerationPrompt,

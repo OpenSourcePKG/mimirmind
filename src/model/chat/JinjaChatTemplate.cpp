@@ -3,6 +3,8 @@
 
 #include "model/chat/JinjaChatTemplate.hpp"
 
+#include "model/Tokenizer.hpp"
+
 #include <minja/chat-template.hpp>   // third_party/minja — pulls minja.hpp + nlohmann
 
 #include <nlohmann/json.hpp>
@@ -108,6 +110,19 @@ std::string JinjaChatTemplate::render(std::span<const ChatMessage> messages,
             {{"enable_thinking", *enableThinking}});
     }
     return _tmpl->apply(in);
+}
+
+std::vector<std::int32_t> JinjaChatTemplate::encode(
+    const Tokenizer&             tok,
+    std::span<const ChatMessage> messages,
+    std::span<const ToolSpec>    tools,
+    bool                         addGenerationPrompt,
+    std::optional<bool>          enableThinking) const {
+    const std::string prompt =
+        render(messages, tools, addGenerationPrompt, enableThinking);
+    // parseSpecial=true: the rendered prompt's <|…|> markup becomes single
+    // special ids; addBos=false: the template already emitted bos as text.
+    return tok.encode(prompt, /*addBos=*/false, /*parseSpecial=*/true);
 }
 
 } // namespace mimirmind::model::chat

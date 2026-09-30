@@ -17,6 +17,7 @@
 #include "compute/Softmax.hpp"
 #include "model/ResponseCleaner.hpp"
 #include "model/chat/JinjaChatTemplate.hpp"
+#include "model/Tokenizer.hpp"
 #include "model/ToolCallParser.hpp"
 #include "model/ToolCallStreamDetector.hpp"
 #include "runtime/thermal/GpuClockGovernor.hpp"
@@ -1709,6 +1710,48 @@ TEST(jinja_render_assistantToolCallArgumentsAreObject) {
     // Object re-serialised, not a JSON-in-a-string ("{\"city\"...").
     EXPECT_TRUE(out.find(R"(CALL get_weather {"city": "Kiel"})") != std::string::npos ||
                 out.find(R"(CALL get_weather {"city":"Kiel"})") != std::string::npos);
+}
+
+// ---- 8.24.3b parse-special split (pure, no vocab needed) --------------------
+
+TEST(tokenizer_splitOnSpecials_chatmlTurn) {
+    using mimirmind::model::Tokenizer;
+    // longest-first, as buildSpecialTexts() produces.
+    const std::vector<std::string> specials = {"<|im_start|>", "<|im_end|>"};
+    const auto segs = Tokenizer::splitOnSpecials("<|im_start|>user\nhi<|im_end|>",
+                                                 specials);
+    EXPECT_EQ(segs.size(), std::size_t{3});
+    EXPECT_TRUE(segs[0].first && segs[0].second == "<|im_start|>");
+    EXPECT_TRUE(!segs[1].first && segs[1].second == "user\nhi");
+    EXPECT_TRUE(segs[2].first && segs[2].second == "<|im_end|>");
+}
+
+TEST(tokenizer_splitOnSpecials_adjacentAndEdges) {
+    using mimirmind::model::Tokenizer;
+    const std::vector<std::string> specials = {"<|im_start|>", "<s>"};
+    // special at start, two adjacent specials, then free text to the end.
+    const auto segs = Tokenizer::splitOnSpecials("<s><|im_start|>hi", specials);
+    EXPECT_EQ(segs.size(), std::size_t{3});
+    EXPECT_TRUE(segs[0].first && segs[0].second == "<s>");
+    EXPECT_TRUE(segs[1].first && segs[1].second == "<|im_start|>");
+    EXPECT_TRUE(!segs[2].first && segs[2].second == "hi");
+}
+
+TEST(tokenizer_splitOnSpecials_longestFirstWins) {
+    using mimirmind::model::Tokenizer;
+    // "<|im_start|>" must win over the shorter "<|im" prefix (longest-first).
+    const std::vector<std::string> specials = {"<|im_start|>", "<|im"};
+    const auto segs = Tokenizer::splitOnSpecials("<|im_start|>x", specials);
+    EXPECT_EQ(segs.size(), std::size_t{2});
+    EXPECT_TRUE(segs[0].first && segs[0].second == "<|im_start|>");
+    EXPECT_TRUE(!segs[1].first && segs[1].second == "x");
+}
+
+TEST(tokenizer_splitOnSpecials_noSpecials) {
+    using mimirmind::model::Tokenizer;
+    const auto segs = Tokenizer::splitOnSpecials("plain text", {});
+    EXPECT_EQ(segs.size(), std::size_t{1});
+    EXPECT_TRUE(!segs[0].first && segs[0].second == "plain text");
 }
 
 int main() {

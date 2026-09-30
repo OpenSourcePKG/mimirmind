@@ -248,11 +248,14 @@ void Tokenizer::loadFromGguf(const GgufReader& reader) {
         }
     }
 
+    buildSpecialTexts();
+
     MM_LOG_INFO("tok",
                 "vocab loaded: {} tokens, {} merges, bos={} eos={} unk={} "
-                "pad={} add_space_prefix={}",
+                "pad={} add_space_prefix={} specials={}",
                 _tokens.size(), _mergesRank.size(),
-                _bosId, _eosId, _unknownId, _padId, _addSpacePrefix);
+                _bosId, _eosId, _unknownId, _padId, _addSpacePrefix,
+                _specialTexts.size());
 }
 
 void Tokenizer::loadFromHfJson(const std::string& checkpointDir) {
@@ -305,6 +308,7 @@ void Tokenizer::loadFromHfJson(const std::string& checkpointDir) {
         entries.emplace_back(id, it.key());
         maxId = std::max(maxId, id);
     }
+    std::vector<std::int32_t> hfSpecialIds;
     if (const auto addedIt = tj.find("added_tokens");
         addedIt != tj.end() && addedIt->is_array()) {
         for (const auto& a : *addedIt) {
@@ -314,6 +318,9 @@ void Tokenizer::loadFromHfJson(const std::string& checkpointDir) {
             const auto id = a["id"].get<std::int32_t>();
             entries.emplace_back(id, a["content"].get<std::string>());
             maxId = std::max(maxId, id);
+            if (a.value("special", false)) {
+                hfSpecialIds.push_back(id);   // control token → mark type=3 below
+            }
         }
     }
     if (maxId < 0) {
@@ -327,6 +334,14 @@ void Tokenizer::loadFromHfJson(const std::string& checkpointDir) {
     for (auto& [id, text] : entries) {
         _tokens[static_cast<std::size_t>(id)].text = text;  // score=0, type=1
         _byText[text] = id;  // last-write-wins, mirrors the GGUF path
+    }
+    // Mark HF special added_tokens as control (type 3) so buildSpecialTexts()
+    // collects them uniformly with the GGUF control/user-defined tokens (the HF
+    // path otherwise leaves every token at type=1).
+    for (const std::int32_t sid : hfSpecialIds) {
+        if (sid >= 0 && static_cast<std::size_t>(sid) < _tokens.size()) {
+            _tokens[static_cast<std::size_t>(sid)].type = 3;
+        }
     }
 
     // ---- 2. merges -> rank (index). tokenizer.json stores them either as
@@ -389,11 +404,13 @@ void Tokenizer::loadFromHfJson(const std::string& checkpointDir) {
 
     _addSpacePrefix = false;  // gpt2 byte-level BPE never prepends a ▁.
 
+    buildSpecialTexts();
+
     MM_LOG_INFO("tok",
                 "HF tokenizer.json loaded: {} tokens, {} merges, bos={} eos={} "
-                "unk={} pad={}",
+                "unk={} pad={} specials={}",
                 _tokens.size(), _mergesRank.size(),
-                _bosId, _eosId, _unknownId, _padId);
+                _bosId, _eosId, _unknownId, _padId, _specialTexts.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +426,96 @@ std::vector<std::int32_t> Tokenizer::encode(std::string_view text, bool addBos) 
         return encodeGpt2(text, addBos);
     }
     return encodeSpm(text, addBos);
+}
+
+void Tokenizer::buildSpecialTexts() {
+    std::vector<std::string> v;
+    auto add = [&](std::string_view s) {
+        if (!s.empty()) {
+            v.emplace_back(s);
+        }
+    };
+    // GGUF marks control (3) / user-defined (4); loadFromHfJson re-marks its
+    // special added_tokens type=3, so this covers both load paths.
+    for (const TokenInfo& t : _tokens) {
+        if (t.type == 3 || t.type == 4) {
+            add(t.text);
+        }
+    }
+    // bos/eos/pad/unk are special by definition even if not type-marked.
+    for (const std::int32_t id : {_bosId, _eosId, _padId, _unknownId}) {
+        if (id >= 0 && static_cast<std::size_t>(id) < _tokens.size()) {
+            add(_tokens[static_cast<std::size_t>(id)].text);
+        }
+    }
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    // Longest-first: the greedy scan must prefer the longest matching special.
+    std::sort(v.begin(), v.end(),
+              [](const std::string& a, const std::string& b) {
+                  return a.size() != b.size() ? a.size() > b.size() : a < b;
+              });
+    _specialTexts = std::move(v);
+}
+
+std::vector<std::pair<bool, std::string>> Tokenizer::splitOnSpecials(
+    std::string_view text, const std::vector<std::string>& specialsLongestFirst) {
+    std::vector<std::pair<bool, std::string>> out;
+    std::string run;
+    std::size_t i = 0;
+    while (i < text.size()) {
+        const std::string* hit = nullptr;
+        for (const std::string& s : specialsLongestFirst) {
+            if (!s.empty() && i + s.size() <= text.size() &&
+                text.compare(i, s.size(), s) == 0) {
+                hit = &s;   // first match = longest (list is longest-first)
+                break;
+            }
+        }
+        if (hit != nullptr) {
+            if (!run.empty()) {
+                out.emplace_back(false, std::move(run));
+                run.clear();
+            }
+            out.emplace_back(true, *hit);
+            i += hit->size();
+        } else {
+            run.push_back(text[i]);
+            ++i;
+        }
+    }
+    if (!run.empty()) {
+        out.emplace_back(false, std::move(run));
+    }
+    return out;
+}
+
+std::vector<std::int32_t> Tokenizer::encode(std::string_view text, bool addBos,
+                                            bool parseSpecial) const {
+    if (!parseSpecial) {
+        return encode(text, addBos);
+    }
+    if (_tokens.empty()) {
+        MM_LOG_WARN("tok", "encode(parseSpecial) called before load");
+        return {};
+    }
+    std::vector<std::int32_t> ids;
+    if (addBos && _bosId >= 0) {
+        ids.push_back(_bosId);
+    }
+    for (const auto& [isSpecial, piece] : splitOnSpecials(text, _specialTexts)) {
+        if (isSpecial) {
+            const std::int32_t id = findToken(piece);
+            if (id >= 0) {
+                ids.push_back(id);
+                continue;
+            }
+            // Should not happen (piece came from the vocab); BPE-fallback.
+        }
+        const std::vector<std::int32_t> sub = encode(piece, /*addBos=*/false);
+        ids.insert(ids.end(), sub.begin(), sub.end());
+    }
+    return ids;
 }
 
 std::string Tokenizer::decode(std::span<const std::int32_t> ids, bool skipSpecial) const {

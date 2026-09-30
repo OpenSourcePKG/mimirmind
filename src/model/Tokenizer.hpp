@@ -62,6 +62,32 @@ public:
 
     [[nodiscard]] std::vector<std::int32_t> encode(std::string_view text,
                                                    bool addBos = true) const;
+
+    /// Special-token-aware encode (8.24.3, for the Jinja chat-template path):
+    /// the input carries special markup (`<|im_start|>` …) as literal text, so
+    /// with `parseSpecial=true` the string is split on the known special tokens
+    /// — each special becomes its single vocab id, each free-text run is BPE'd
+    /// (addBos=false) — mirroring llama.cpp `parse_special=true`. With
+    /// `parseSpecial=false` this is identical to `encode(text, addBos)`.
+    /// NOTE: for SentencePiece vocabs the per-run space-prefix is a known
+    /// parity nuance validated per-family in 8.24.5; the GPT-2 (Qwen) path is
+    /// exact.
+    [[nodiscard]] std::vector<std::int32_t> encode(std::string_view text,
+                                                   bool addBos,
+                                                   bool parseSpecial) const;
+
+    /// Split `text` into (isSpecial, piece) segments by greedy longest-first
+    /// match against `specialsLongestFirst` (must be pre-sorted longest-first).
+    /// Pure + static so the scan is unit-testable without a loaded vocab.
+    [[nodiscard]] static std::vector<std::pair<bool, std::string>> splitOnSpecials(
+        std::string_view text, const std::vector<std::string>& specialsLongestFirst);
+
+    /// The special/added tokens (bos/eos/pad/unk + GGUF control/user-defined +
+    /// HF special added_tokens), sorted longest-first for the parse-special scan.
+    [[nodiscard]] const std::vector<std::string>& specialTexts() const noexcept {
+        return _specialTexts;
+    }
+
     [[nodiscard]] std::string                decode(std::span<const std::int32_t> ids,
                                                     bool skipSpecial = false) const;
 
@@ -93,9 +119,19 @@ private:
     [[nodiscard]] std::string                decodeSpm (std::span<const std::int32_t> ids, bool skipSpecial) const;
     [[nodiscard]] std::string                decodeGpt2(std::span<const std::int32_t> ids, bool skipSpecial) const;
 
+    /// Collect the special/added tokens into `_specialTexts` (longest-first).
+    /// Called at the end of both load paths. Uses TokenInfo.type (GGUF sets
+    /// 3=control/4=user-defined; loadFromHfJson marks special added_tokens
+    /// type=3) plus the resolved bos/eos/pad/unk texts.
+    void buildSpecialTexts();
+
     std::vector<TokenInfo>                        _tokens{};
     std::unordered_map<std::string, std::int32_t> _byText{};
     std::string                                   _modelType{};
+
+    /// Special/added token texts, sorted longest-first for the parse-special
+    /// greedy scan (8.24.3). Empty until buildSpecialTexts() runs.
+    std::vector<std::string>                      _specialTexts{};
 
     // Populated only for the gpt2 model. Maps "first second" (the merges
     // file format with a literal space separator) to its rank (lower = preferred).
