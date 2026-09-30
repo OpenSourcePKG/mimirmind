@@ -27,6 +27,9 @@ class UsmAllocator;
 namespace mimirmind::core::config {
 struct FeatureSettings;
 }
+namespace mimirmind::compute {
+class QuantType;   // defined in compute/QuantType.hpp (included in the .cpp)
+}
 
 namespace mimirmind::compute::l0 {
 
@@ -283,6 +286,50 @@ private:
         double      lastDp4aMs{0.0};      // 0 unless DP4A available
         std::string autotuneSource;       // "bench" | "env_force_gemm" | ...
     };
+
+    // Shared per-run bench state threaded through the autotune() stage
+    // helpers (roadmap 8.30.11.3). The X/Y/scratch USM is sized for the
+    // largest M-bucket; each stage slices a prefix. Owned by autotune().
+    struct AutotuneBench {
+        core::l0::UsmAllocator* allocator{nullptr};
+        void*       xUsm{nullptr};
+        void*       yUsm{nullptr};
+        void*       sUsm{nullptr};
+        std::size_t N{0};
+        std::size_t K{0};
+        std::size_t Mmax{0};
+    };
+
+    // autotune() decomposition (roadmap 8.30.11.3). Each helper runs one
+    // cohesive stage on a single QuantType `entry`, mutating its dispatch-
+    // control fields (gemmMinM / useGemmV2 / useDp4a) exactly as the former
+    // inline blocks did; behaviour-neutral extract-method.
+    /// Handle the config-override short-circuits (features.gemmMinM /
+    /// gemm=disable / gemm=force). Returns true when an override was applied
+    /// and autotune() should return immediately.
+    [[nodiscard]] bool applyAutotuneOverrides(
+        const core::config::FeatureSettings& features);
+    /// CPU-vs-GPU matvec parity check at M=1 (diagnostic; allocates its own
+    /// synthetic weights). Runs for every type, GEMM kernel or not.
+    void benchVecParity(core::gguf::GgmlType type, Entry& entry,
+                        const QuantType* qt, const AutotuneBench& b);
+    /// GEMM-v1 warmup + matvec-vs-GEMM parity gate + per-bucket timing +
+    /// gemmMinM derivation. Returns false on parity fail (caller skips type).
+    [[nodiscard]] bool benchGemmV1AndThreshold(core::gguf::GgmlType type,
+                                               Entry& entry,
+                                               const QuantType* qt,
+                                               const AutotuneBench& b,
+                                               void* wUsm);
+    /// GEMM-v2 warmup + v2 parity gate + per-bucket timing + (features.gemmV2)
+    /// re-derivation of gemmMinM from the v2 timings. No-op without a v2 kernel.
+    void benchGemmV2(core::gguf::GgmlType type, Entry& entry,
+                     const QuantType* qt, const AutotuneBench& b, void* wUsm,
+                     const core::config::FeatureSettings& features);
+    /// DP4A parity gate + timing at M=16 and the dp4a-vs-best pick. No-op
+    /// without a DP4A slot or when features.dp4a=disable.
+    void benchDp4a(core::gguf::GgmlType type, Entry& entry,
+                   const QuantType* qt, const AutotuneBench& b, void* wUsm,
+                   bool forceEnableDp4a, bool forceDisableDp4a);
 
     core::l0::L0Context&    _ctx;
     GpuOps&                _ops;
