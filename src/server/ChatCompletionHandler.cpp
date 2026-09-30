@@ -15,6 +15,7 @@
 
 #include "model/ResponseCleaner.hpp"
 #include "model/ToolCallConstraint.hpp"
+#include "server/ToolCallSalvage.hpp"
 #include "model/ToolCallParser.hpp"
 #include "model/ToolCallStreamDetector.hpp"
 #include "model/Tokenizer.hpp"
@@ -1253,53 +1254,27 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
             && (off == nullptr || off[0] != '0')) {
             const std::string_view kSalvageOpener =
                 model::ChatTemplate::toolCallSalvageOpenerText(salvageStyle);
-            const auto openerIds =
-                tok.encode(std::string{kSalvageOpener}, /*addBos=*/false);
-            std::vector<std::int32_t> salvagePrompt = promptIds;
-            salvagePrompt.insert(salvagePrompt.end(),
-                                 openerIds.begin(), openerIds.end());
-            runtime::GenerateParams sp = params;
-            sp.maxNewTokens = std::min<std::size_t>(sp.maxNewTokens, 1024);
-            // 8.19.13.2 — the opener `<function=` is now in the PREFILL (never
-            // reaches the matcher, which only sees generated tokens), so drive
-            // the re-decode with a BODY-ROOTED grammar: the NAME is forced from
-            // the first generated token and every required param must appear
-            // before the call can close — regardless of the drifted dialect.
-            std::shared_ptr<model::ToolCallConstraint> forceC;
-            if (grammarOn) {
-                auto c = std::make_shared<model::ToolCallConstraint>(
-                    cr.tools, tok, /*assumeOpenerConsumed=*/true);
-                if (c->active()) { forceC = c; }
-            }
-            // 8.19.13.5 — a GREEDY re-decode just repeats the degeneration that
-            // produced the dead call (e.g. query="\n\n"). Do NOT force greedy when a
-            // grammar mask is active: the mask guarantees the tool-call FORMAT at any
-            // temperature, so keep the request's OWN sampling — which the anti-loop
-            // floor has already lifted to the MODEL's declared generation_config values
-            // (via LlmConfig, capped) — so the re-decode escapes the greedy collapse
-            // using per-model sampling, never a hardcoded per-arch preset. WITHOUT a
-            // mask, fall back to the historical greedy salvage (sampled tool calls
-            // break format when nothing constrains them).
-            if (!forceC) {
-                sp.sampling.temperature = 0.0F;
-            }
-            std::vector<std::int32_t> redecoded;
-            runtime::GenerateStats    salvStats;
-            try {
+            // 8.30.11.2 — shared salvage re-decode core (ToolCallSalvage);
+            // blocking keeps the request's own sampling under a grammar mask,
+            // greedy otherwise (alwaysGreedy=false). Executor: batcher-or-engine.
+            auto redecoder = [&](const std::vector<std::int32_t>& sprompt,
+                                 const runtime::GenerateParams&    sp,
+                                 std::shared_ptr<model::ToolCallConstraint> fc)
+                             -> std::vector<std::int32_t> {
                 if (useBatcher) {
-                    redecoded = runViaBatcher(*activeBatcher, salvagePrompt,
-                                              sp, stopIds, tenant, onToken,
-                                              forceC);
-                } else {
-                    std::lock_guard<std::mutex> lk{*target->mutex};
-                    redecoded = engine.generate(salvagePrompt, sp, onToken,
-                                                &salvStats, onPrefillDone,
-                                                onPrefillProgress);
+                    return runViaBatcher(*activeBatcher, sprompt, sp, stopIds,
+                                         tenant, onToken, fc);
                 }
-            } catch (const std::exception& e) {
-                MM_LOG_WARN("server", "tool-salvage re-decode failed: {}",
-                            e.what());
-            }
+                std::lock_guard<std::mutex> lk{*target->mutex};
+                runtime::GenerateStats salvStats;
+                return engine.generate(sprompt, sp, onToken, &salvStats,
+                                       onPrefillDone, onPrefillProgress);
+            };
+            const std::vector<std::int32_t> redecoded =
+                ToolCallSalvage::redecode(promptIds, params, cr.tools, tok,
+                                          salvageStyle, grammarOn,
+                                          /*alwaysGreedy=*/false, redecoder,
+                                          /*logCtx=*/"");
             if (!redecoded.empty()) {
                 const std::string salvText =
                     std::string{kSalvageOpener} +
@@ -2143,52 +2118,37 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
                     // One-shot forced re-decode — the blocking path's twin.
                     constexpr std::string_view kSalvageOpener =
                         "<tool_call>\n<function=";
-                    const auto openerIds = tok.encode(
-                        std::string{kSalvageOpener}, /*addBos=*/false);
-                    std::vector<std::int32_t> salvagePrompt = state->promptIds;
-                    salvagePrompt.insert(salvagePrompt.end(),
-                                         openerIds.begin(), openerIds.end());
-                    runtime::GenerateParams sp = state->params;
-                    sp.sampling.temperature = 0.0F;
-                    sp.maxNewTokens =
-                        std::min<std::size_t>(sp.maxNewTokens, 1024);
-                    auto noopToken = [](std::int32_t) { return true; };
-                    // Body-rooted grammar for the forced re-decode (blocking
-                    // twin): the prefilled `<function=` never reaches the
-                    // matcher, so root at the call body to force NAME + required
-                    // params from the first generated token.
-                    std::shared_ptr<model::ToolCallConstraint> forceC;
-                    if (streamGrammarOn) {
-                        auto c = std::make_shared<model::ToolCallConstraint>(
-                            state->toolSpecs, tok,
-                            /*assumeOpenerConsumed=*/true);
-                        if (c->active()) { forceC = c; }
-                    }
-                    std::vector<std::int32_t> redecoded;
-                    try {
+                    // 8.30.11.2 — shared salvage re-decode core (ToolCallSalvage);
+                    // streaming always forces greedy (alwaysGreedy=true).
+                    auto redecoder =
+                        [&](const std::vector<std::int32_t>& sprompt,
+                            const runtime::GenerateParams&    sp,
+                            std::shared_ptr<model::ToolCallConstraint> fc)
+                        -> std::vector<std::int32_t> {
+                        auto noopToken = [](std::int32_t) { return true; };
                         if (useBatcher) {
-                            redecoded = runViaBatcher(
-                                *activeBatcher, salvagePrompt, sp,
-                                state->stopIds, state->tenantId, noopToken,
-                                forceC);
-                        } else {
-                            std::lock_guard<std::mutex> lk{*targetMutex};
-                            runtime::GenerateStats salvStats;
-                            auto noPrefillDone =
-                                [](const runtime::InferenceEngine::PrefillDone&) {};
-                            auto noPrefillProgress =
-                                [](const runtime::InferenceEngine::PrefillProgress&) {
-                                    return true;
-                                };
-                            redecoded = targetEng.generate(
-                                salvagePrompt, sp, noopToken, &salvStats,
-                                noPrefillDone, noPrefillProgress);
+                            return runViaBatcher(
+                                *activeBatcher, sprompt, sp, state->stopIds,
+                                state->tenantId, noopToken, fc);
                         }
-                    } catch (const std::exception& e) {
-                        MM_LOG_WARN("server",
-                                    "stream {}: tool-salvage re-decode "
-                                    "failed: {}", state->respId, e.what());
-                    }
+                        std::lock_guard<std::mutex> lk{*targetMutex};
+                        runtime::GenerateStats salvStats;
+                        auto noPrefillDone =
+                            [](const runtime::InferenceEngine::PrefillDone&) {};
+                        auto noPrefillProgress =
+                            [](const runtime::InferenceEngine::PrefillProgress&) {
+                                return true;
+                            };
+                        return targetEng.generate(
+                            sprompt, sp, noopToken, &salvStats,
+                            noPrefillDone, noPrefillProgress);
+                    };
+                    const std::vector<std::int32_t> redecoded =
+                        ToolCallSalvage::redecode(
+                            state->promptIds, state->params, state->toolSpecs,
+                            tok, state->style, streamGrammarOn,
+                            /*alwaysGreedy=*/true, redecoder,
+                            "stream " + state->respId + ": ");
                     if (!redecoded.empty()) {
                         const std::string salvText =
                             std::string{kSalvageOpener} +
