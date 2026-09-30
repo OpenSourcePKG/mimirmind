@@ -3,13 +3,24 @@
 
 #pragma once
 
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace mimirmind::runtime {
 class InferenceEngine;
 }
 namespace mimirmind::core::safetensors {
 class SafetensorsModel;
+}
+namespace mimirmind::core::cuda {
+class CudaComputeContext;
+}
+namespace mimirmind::compute::cuda {
+class CudaMaterializerOps;
+}
+namespace mimirmind::core::modelopt {
+struct MaterializationStep;
 }
 
 namespace mimirmind::runtime::engine {
@@ -42,6 +53,35 @@ public:
                      std::string_view                     checkpointDir,
                      std::string_view                     tokenizerGguf,
                      core::safetensors::SafetensorsModel* attachedSm = nullptr);
+
+private:
+    // Post-plan stages of load(), extracted verbatim so the pipeline reads as
+    // a sequence of named passes. All are friends of InferenceEngine (as the
+    // enclosing class is) and are compiled only under MIMIRMIND_HAVE_CUDA;
+    // in a non-CUDA build load()'s stub never ODR-uses them.
+
+    /// The compressed-tensors Gemma-4 (dense text tower) load path: its own
+    /// config schema + NVFP4 name-triple, none of the qwen35moe post-passes.
+    /// Populates the engine and returns; the caller then `return`s from load().
+    static void loadGemma4(InferenceEngine&                     e,
+                           const std::string&                   dir,
+                           const std::string&                   configText,
+                           std::string_view                     checkpointDir,
+                           std::string_view                     tokenizerGguf,
+                           core::safetensors::SafetensorsModel* attachedSm);
+
+    /// GatedDeltaNet value-head regroup (HF -> GGUF layout), a pure element
+    /// permutation of the vDim value channels + the per-head decay/beta tensors.
+    static void regroupGatedDeltaNetValueHeads(
+        InferenceEngine& e, core::cuda::CudaComputeContext& cudaCtx);
+
+    /// MoE routed-expert bank repack (blocked-NVFP4 [+ additive FP4-TC sidecars]
+    /// / FP4-TC-only / K-quant), with streaming source release to bound the peak.
+    static void buildMoeExpertBanks(
+        InferenceEngine&                                        e,
+        const std::vector<core::modelopt::MaterializationStep>& steps,
+        core::cuda::CudaComputeContext&                         cudaCtx,
+        compute::cuda::CudaMaterializerOps&                     devOps);
 };
 
 } // namespace mimirmind::runtime::engine
