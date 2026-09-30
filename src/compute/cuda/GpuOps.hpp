@@ -9,6 +9,7 @@
 #include "compute/IPagedAttentionOps.hpp"
 #include "compute/IPleOps.hpp"
 #include "compute/cuda/CudaMoeGroupedOps.hpp"
+#include "compute/cuda/CudaPagedAttentionOps.hpp"
 #include "compute/cuda/MoeTopKRouteDevice.hpp"
 #include "core/config/Config.hpp"
 #include "runtime/KvCache.hpp"
@@ -62,7 +63,6 @@ class CudnnSdpaPrefill;
  */
 class GpuOps : public ::mimirmind::compute::ComputeOps,
                public ::mimirmind::compute::IHyperConnectionOps,
-               public ::mimirmind::compute::IPagedAttentionOps,
                public ::mimirmind::compute::IPleOps {
 public:
     /// Same 4-arg shape as `GpuOps` — the config knobs propagate 1:1
@@ -601,6 +601,10 @@ private:
     // back from moeGroupedOps(). Constructed after _ctx (uses it).
     CudaMoeGroupedOps _mgo;
 
+    // 8.30.11.4 — the segregated paged-attention ops, owned here and handed
+    // back from pagedAttentionOps(). Constructed after _ctx (uses it).
+    CudaPagedAttentionOps _pao;
+
     struct Impl;
     std::unique_ptr<Impl>         _pimpl;
 
@@ -829,27 +833,13 @@ public:
                                           float scale, std::size_t slidingWindow,
                                           runtime::KvDtype kvDtype
                                               = runtime::KvDtype::F32) override;
-    // Paged attention: the CUDA backend implements the segregated
-    // IPagedAttentionOps interface (8.30.6); the accessor hands it back. The
-    // cuDNN query/graceful pair stays on ComputeOps.
+    // Paged attention: the 3 device ops (decode V1 / split-K V2 / causal T>1
+    // prefill) live in CudaPagedAttentionOps (8.30.11.4); GpuOps owns one
+    // instance (_pao) and hands it back from the accessor. The cuDNN
+    // query/graceful pair stays on GpuOps (ComputeOps virtuals; consulted to
+    // pick the path before this interface is reached).
     [[nodiscard]] ::mimirmind::compute::IPagedAttentionOps*
-        pagedAttentionOps() noexcept override { return this; }
-    void pagedAttentionDecodeV1Async(
-            float* out, const float* query, const float* keyCache,
-            const float* valueCache, const std::int32_t* blockTables,
-            const std::int32_t* seqLens, std::size_t numSeqs,
-            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
-            std::size_t blockSize, std::size_t maxNumBlocksPerSeq, float scale,
-            float softcap) override;
-    void pagedAttentionPrefillCausalAsync(
-            float* out, const float* query, const float* keyCache,
-            const float* valueCache, const std::int32_t* blockTables,
-            const std::int32_t* seqT, const std::int32_t* queryOff,
-            const std::int32_t* startPos, std::size_t numSeqs,
-            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
-            std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
-            std::size_t maxT, float scale, float softcap,
-            runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
+        pagedAttentionOps() noexcept override { return &_pao; }
     [[nodiscard]] bool pagedPrefillCudnnAvailable() const noexcept override;
     [[nodiscard]] bool pagedPrefillAttentionCudnnAsync(
             float* out, const float* query, const void* keyCache,
@@ -859,14 +849,6 @@ public:
             std::size_t headSize, std::size_t blockSize,
             std::size_t maxNumBlocksPerSeq, float scale,
             float* kvScratch, std::size_t maxTkvCap,
-            runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
-    void pagedAttentionDecodeV2Async(
-            float* out, const float* query, const float* keyCache,
-            const float* valueCache, const std::int32_t* blockTables,
-            const std::int32_t* seqLens, std::size_t numSeqs,
-            std::size_t numHeads, std::size_t numKvHeads, std::size_t headSize,
-            std::size_t blockSize, std::size_t maxNumBlocksPerSeq,
-            std::size_t maxSeqLen, float scale, float softcap,
             runtime::KvDtype kvDtype = runtime::KvDtype::F32) override;
     // Publicly readable so callers can compute launch upper bounds
     // for `setReplayMaxKTiles`. Parity with `GpuOps`.

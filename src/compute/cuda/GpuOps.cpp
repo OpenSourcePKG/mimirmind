@@ -211,23 +211,6 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _attentionFlashPartialBatchedKernel;
     core::cuda::CudaModule _attentionFlashMergeBatchedModule;
     core::cuda::CudaKernel _attentionFlashMergeBatchedKernel;
-    core::cuda::CudaModule _pagedAttentionV1Module;
-    core::cuda::CudaKernel _pagedAttentionV1Kernel;
-    core::cuda::CudaModule _pagedAttentionPrefillCausalModule;
-    core::cuda::CudaKernel _pagedAttentionPrefillCausalKernel;
-    core::cuda::CudaKernel _pagedAttentionPrefillCausalFp16Kernel;  // fp16 KV (5.16)
-    core::cuda::CudaKernel _pagedAttentionPrefillCausalFp8Kernel;   // fp8 KV (5.16)
-    core::cuda::CudaModule _pagedAttentionV2Module;
-    core::cuda::CudaKernel _pagedAttentionV2Kernel;
-    core::cuda::CudaKernel _pagedAttentionV2Fp16Kernel;   // fp16 KV (5.14 I1)
-    core::cuda::CudaKernel _pagedAttentionV2Fp8Kernel;    // fp8 KV (5.16)
-    core::cuda::CudaKernel _pagedAttentionV2ReduceKernel;
-    // Split-K V2 per-partition workspace (grown on demand; RAII-freed).
-    compute::ComputeBuffer _pagedV2TmpOut;      // [slots, headSize] fp32
-    compute::ComputeBuffer _pagedV2ExpSums;     // [slots] fp32
-    compute::ComputeBuffer _pagedV2MaxLogits;   // [slots] fp32
-    std::size_t            _pagedV2SlotCap{0};   // slots = nSeq*nHeads*maxNumPartitions
-    std::size_t            _pagedV2HeadDimCap{0};
 
     core::cuda::CudaModule _attentionPrefillFlashModule;
     core::cuda::CudaKernel _attentionPrefillFlashKernel;
@@ -535,30 +518,6 @@ struct GpuOps::Impl {
           _attentionFlashMergeBatchedModule{loadCudaModule(ctx, "attention_flash_merge_batched")},
           _attentionFlashMergeBatchedKernel{
               _attentionFlashMergeBatchedModule.getFunction("attention_flash_merge_batched")},
-          _pagedAttentionV1Module{loadCudaModule(ctx, "attention_paged_v1")},
-          _pagedAttentionV1Kernel{
-              _pagedAttentionV1Module.getFunction("paged_attention_v1")},
-          _pagedAttentionPrefillCausalModule{
-              loadCudaModule(ctx, "attention_paged_prefill_causal")},
-          _pagedAttentionPrefillCausalKernel{
-              _pagedAttentionPrefillCausalModule.getFunction(
-                  "paged_attention_prefill_causal")},
-          _pagedAttentionPrefillCausalFp16Kernel{
-              _pagedAttentionPrefillCausalModule.getFunction(
-                  "paged_attention_prefill_causal_fp16")},
-          _pagedAttentionPrefillCausalFp8Kernel{
-              _pagedAttentionPrefillCausalModule.getFunction(
-                  "paged_attention_prefill_causal_fp8")},
-          _pagedAttentionV2Module{loadCudaModule(ctx, "attention_paged_v2")},
-          _pagedAttentionV2Kernel{
-              _pagedAttentionV2Module.getFunction("paged_attention_v2")},
-          _pagedAttentionV2Fp16Kernel{
-              _pagedAttentionV2Module.getFunction("paged_attention_v2_fp16")},
-          _pagedAttentionV2Fp8Kernel{
-              _pagedAttentionV2Module.getFunction("paged_attention_v2_fp8")},
-          _pagedAttentionV2ReduceKernel{
-              _pagedAttentionV2Module.getFunction("paged_attention_v2_reduce")},
-
           _attentionPrefillFlashModule{loadCudaModule(ctx, "attention_prefill_flash")},
           _attentionPrefillFlashKernel{
               _attentionPrefillFlashModule.getFunction("attention_prefill_flash")},
@@ -790,6 +749,7 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
                      core::config::TriState        q8_0ReorderMode)
     : _ctx{ctx},
       _mgo{_ctx},
+      _pao{_ctx},
       _pimpl{std::make_unique<Impl>(ctx.cudaContext())},
       _moeTopKRoute{ctx}
 {
@@ -4041,93 +4001,7 @@ void GpuOps::attentionDecodeFlashBatchedAsync(
                        kAttentionLocalSize, 1, 1);
 }
 
-void GpuOps::pagedAttentionDecodeV1Async(
-        float* out, const float* query, const float* keyCache,
-        const float* valueCache, const std::int32_t* blockTables,
-        const std::int32_t* seqLens, std::size_t numSeqs, std::size_t numHeads,
-        std::size_t numKvHeads, std::size_t headSize, std::size_t blockSize,
-        std::size_t maxNumBlocksPerSeq, float scale, float softcap) {
-    if (numSeqs == 0 || numHeads == 0 || headSize == 0) {
-        return;
-    }
-    // Baseline paged decode attention (fp32). Grid (numHeads, numSeqs); one
-    // workgroup owns one (head, sequence). Dynamic SMEM holds the query row,
-    // the per-dim accumulator and the reduction scratch:
-    // (2*headSize + PAGED_ATTN_V1_LOCAL) floats. kLocal MUST match the
-    // kernel's __launch_bounds__ (PagedAttentionV1::kBlockThreads).
-    constexpr std::uint32_t kLocal = 128;   // == PAGED_ATTN_V1_LOCAL
-    auto& kern = _pimpl->_pagedAttentionV1Kernel;
-    kern.setPtr  (0, out);
-    kern.setPtr  (1, query);
-    kern.setPtr  (2, keyCache);
-    kern.setPtr  (3, valueCache);
-    kern.setPtr  (4, blockTables);
-    kern.setPtr  (5, seqLens);
-    kern.setValue(6,  toInt32(numSeqs,            "pagedV1 numSeqs"));
-    kern.setValue(7,  toInt32(numHeads,           "pagedV1 numHeads"));
-    kern.setValue(8,  toInt32(numKvHeads,         "pagedV1 numKvHeads"));
-    kern.setValue(9,  toInt32(headSize,           "pagedV1 headSize"));
-    kern.setValue(10, toInt32(blockSize,          "pagedV1 blockSize"));
-    kern.setValue(11, toInt32(maxNumBlocksPerSeq, "pagedV1 maxBlocks"));
-    kern.setValue(12, scale);
-    kern.setValue(13, softcap);
-    kern.setValue(14, static_cast<std::int32_t>(0));   // PAGED_ATTN_KV_DTYPE_FP32
-    const std::size_t smemBytes = (2 * headSize + kLocal) * sizeof(float);
-    kern.launch(_ctx.stream(),
-                static_cast<std::uint32_t>(numHeads),
-                static_cast<std::uint32_t>(numSeqs),
-                1,
-                kLocal, 1, 1,
-                smemBytes);
-}
 
-void GpuOps::pagedAttentionPrefillCausalAsync(
-        float* out, const float* query, const float* keyCache,
-        const float* valueCache, const std::int32_t* blockTables,
-        const std::int32_t* seqT, const std::int32_t* queryOff,
-        const std::int32_t* startPos, std::size_t numSeqs, std::size_t numHeads,
-        std::size_t numKvHeads, std::size_t headSize, std::size_t blockSize,
-        std::size_t maxNumBlocksPerSeq, std::size_t maxT, float scale,
-        float softcap, runtime::KvDtype kvDtype) {
-    if (numSeqs == 0 || numHeads == 0 || headSize == 0 || maxT == 0) {
-        return;
-    }
-    // 5.21-II paged causal prefill attention. grid (numHeads, numSeqs, maxT);
-    // block (pq >= seqT[seq]) early-out. Same smem + streaming-softmax as V1, so
-    // pq's output == a V1 decode with seq_len = startPos[seq]+pq+1.
-    // 5.16: pick the kernel variant by pool dtype so the mixed-step ragged
-    // prefill read reinterprets the pool bytes correctly (fp16/fp8 pools would
-    // otherwise be read as F32 and corrupt prefill attention).
-    constexpr std::uint32_t kLocal = 128;   // == PAGED_ATTN_PREFILL_LOCAL
-    auto& kern = (kvDtype == runtime::KvDtype::FP8_E4M3)
-                     ? _pimpl->_pagedAttentionPrefillCausalFp8Kernel
-                 : (kvDtype == runtime::KvDtype::FP16)
-                     ? _pimpl->_pagedAttentionPrefillCausalFp16Kernel
-                     : _pimpl->_pagedAttentionPrefillCausalKernel;
-    kern.setPtr  (0, out);
-    kern.setPtr  (1, query);
-    kern.setPtr  (2, keyCache);
-    kern.setPtr  (3, valueCache);
-    kern.setPtr  (4, blockTables);
-    kern.setPtr  (5, seqT);
-    kern.setPtr  (6, queryOff);
-    kern.setPtr  (7, startPos);
-    kern.setValue(8,  toInt32(numSeqs,            "prefC numSeqs"));
-    kern.setValue(9,  toInt32(numHeads,           "prefC numHeads"));
-    kern.setValue(10, toInt32(numKvHeads,         "prefC numKvHeads"));
-    kern.setValue(11, toInt32(headSize,           "prefC headSize"));
-    kern.setValue(12, toInt32(blockSize,          "prefC blockSize"));
-    kern.setValue(13, toInt32(maxNumBlocksPerSeq, "prefC maxBlocks"));
-    kern.setValue(14, scale);
-    kern.setValue(15, softcap);
-    const std::size_t smemBytes = (2 * headSize + kLocal) * sizeof(float);
-    kern.launch(_ctx.stream(),
-                static_cast<std::uint32_t>(numHeads),
-                static_cast<std::uint32_t>(numSeqs),
-                static_cast<std::uint32_t>(maxT),
-                kLocal, 1, 1,
-                smemBytes);
-}
 
 void GpuOps::setCudnnPrefillMaxSeqLen(std::size_t smax) {
 #if MIMIRMIND_HAVE_CUDNN_SDPA
@@ -4245,111 +4119,6 @@ bool GpuOps::pagedPrefillAttentionCudnnAsync(
 #endif
 }
 
-void GpuOps::pagedAttentionDecodeV2Async(
-        float* out, const float* query, const float* keyCache,
-        const float* valueCache, const std::int32_t* blockTables,
-        const std::int32_t* seqLens, std::size_t numSeqs, std::size_t numHeads,
-        std::size_t numKvHeads, std::size_t headSize, std::size_t blockSize,
-        std::size_t maxNumBlocksPerSeq, std::size_t maxSeqLen, float scale,
-        float softcap, runtime::KvDtype kvDtype) {
-    if (numSeqs == 0 || numHeads == 0 || headSize == 0) {
-        return;
-    }
-    // keyCache/valueCache are raw pool base addresses; when kvDtype is FP16/FP8
-    // they point at __half / __nv_fp8_e4m3 elements and the matching kernel
-    // variant reinterprets them (5.14 I1 / 5.16).
-    const bool fp16 = (kvDtype == runtime::KvDtype::FP16);
-    const bool fp8  = (kvDtype == runtime::KvDtype::FP8_E4M3);
-    const bool nonF32 = fp16 || fp8;
-    // Split-K paged decode: partition the KV into kPartitionSize chunks so many
-    // workgroups cover one (head, seq) in parallel (FlashDecoding / vLLM v2).
-    // Pass 1 emits per-partition (acc, m, l); pass 2 merges via online-softmax.
-    constexpr std::int32_t  kPartitionSize = 512;  // == PAGED_ATTN_V2_PARTITION_SIZE
-    constexpr std::uint32_t kLocal         = 128;  // == PAGED_ATTN_V2_LOCAL
-    const std::size_t maxNumPartitions =
-        (maxSeqLen + kPartitionSize - 1) / static_cast<std::size_t>(kPartitionSize);
-    // The split-K kernels are fp32, no-softcap (16-arg CudaKernel cap). Route
-    // short/unsplittable contexts and any soft-capped call to the single-pass
-    // V1 which handles both.
-    // FP16/FP8 KV always take the V2 path: V1 is F32-only, and all non-F32
-    // callers (qwen35moe full-attn) run with softcap==0, so a single-partition
-    // V2 is both correct and the only non-F32-capable route. F32 keeps the V1
-    // shortcut.
-    if (!nonF32 && (maxNumPartitions <= 1 || softcap > 0.0f)) {
-        pagedAttentionDecodeV1Async(out, query, keyCache, valueCache,
-                                    blockTables, seqLens, numSeqs, numHeads,
-                                    numKvHeads, headSize, blockSize,
-                                    maxNumBlocksPerSeq, scale, softcap);
-        return;
-    }
-
-    // Grow the per-partition workspace on demand (RAII buffers in Impl).
-    const std::size_t slots = numSeqs * numHeads * maxNumPartitions;
-    if (slots > _pimpl->_pagedV2SlotCap
-            || headSize > _pimpl->_pagedV2HeadDimCap) {
-        _pimpl->_pagedV2TmpOut    = allocate(slots * headSize * sizeof(float));
-        _pimpl->_pagedV2ExpSums   = allocate(slots * sizeof(float));
-        _pimpl->_pagedV2MaxLogits = allocate(slots * sizeof(float));
-        _pimpl->_pagedV2SlotCap    = slots;
-        _pimpl->_pagedV2HeadDimCap = headSize;
-    }
-    float* tmpOut  = _pimpl->_pagedV2TmpOut.as<float>();
-    float* expSums = _pimpl->_pagedV2ExpSums.as<float>();
-    float* maxLog  = _pimpl->_pagedV2MaxLogits.as<float>();
-
-    // --- Pass 1: per-partition partial attention -------------------------
-    {
-        auto& k = fp8  ? _pimpl->_pagedAttentionV2Fp8Kernel
-                : fp16 ? _pimpl->_pagedAttentionV2Fp16Kernel
-                       : _pimpl->_pagedAttentionV2Kernel;
-        k.setPtr  (0, tmpOut);
-        k.setPtr  (1, expSums);
-        k.setPtr  (2, maxLog);
-        k.setPtr  (3, query);
-        k.setPtr  (4, keyCache);
-        k.setPtr  (5, valueCache);
-        k.setPtr  (6, blockTables);
-        k.setPtr  (7, seqLens);
-        k.setValue(8,  toInt32(numSeqs,            "pagedV2 numSeqs"));
-        k.setValue(9,  toInt32(numHeads,           "pagedV2 numHeads"));
-        k.setValue(10, toInt32(numKvHeads,         "pagedV2 numKvHeads"));
-        k.setValue(11, toInt32(headSize,           "pagedV2 headSize"));
-        k.setValue(12, toInt32(blockSize,          "pagedV2 blockSize"));
-        k.setValue(13, toInt32(maxNumBlocksPerSeq, "pagedV2 maxBlocks"));
-        k.setValue(14, toInt32(maxNumPartitions,   "pagedV2 maxParts"));
-        k.setValue(15, scale);   // partition_size / softcap / dtype are compile-time
-        // smem = [nWarps*headSize (acc) | nWarps (m) | nWarps (l)].
-        const std::size_t nWarps = kLocal / 32;
-        const std::size_t smemBytes =
-            (nWarps * headSize + 2 * nWarps) * sizeof(float);
-        k.launch(_ctx.stream(),
-                 static_cast<std::uint32_t>(numHeads),
-                 static_cast<std::uint32_t>(numSeqs),
-                 static_cast<std::uint32_t>(maxNumPartitions),
-                 kLocal, 1, 1,
-                 smemBytes);
-    }
-    // --- Pass 2: online-softmax reduce across partitions -----------------
-    {
-        auto& k = _pimpl->_pagedAttentionV2ReduceKernel;
-        k.setPtr  (0, out);
-        k.setPtr  (1, expSums);
-        k.setPtr  (2, maxLog);
-        k.setPtr  (3, tmpOut);
-        k.setPtr  (4, seqLens);
-        k.setValue(5, toInt32(numSeqs,          "pagedV2r numSeqs"));
-        k.setValue(6, toInt32(numHeads,         "pagedV2r numHeads"));
-        k.setValue(7, toInt32(headSize,         "pagedV2r headSize"));
-        k.setValue(8, toInt32(maxNumPartitions, "pagedV2r maxParts"));
-        const std::size_t smemBytes = kLocal * sizeof(float);
-        k.launch(_ctx.stream(),
-                 static_cast<std::uint32_t>(numHeads),
-                 static_cast<std::uint32_t>(numSeqs),
-                 1,
-                 kLocal, 1, 1,
-                 smemBytes);
-    }
-}
 
 void GpuOps::matmulQ8_0VecReorderAsync(const void* wReordered,
                                           std::size_t N, std::size_t K,
