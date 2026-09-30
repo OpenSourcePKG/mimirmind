@@ -16,6 +16,7 @@
 #include "compute/MoeRouting.hpp"
 #include "compute/Softmax.hpp"
 #include "model/ResponseCleaner.hpp"
+#include "model/chat/JinjaChatTemplate.hpp"
 #include "model/ToolCallParser.hpp"
 #include "model/ToolCallStreamDetector.hpp"
 #include "runtime/thermal/GpuClockGovernor.hpp"
@@ -1614,6 +1615,100 @@ TEST(toolParser_qwenHermes_intactJsonStillParses) {
         "{\"city\": \"Kiel\"}}\n</tool_call>");
     EXPECT_EQ(calls.size(), std::size_t{1});
     EXPECT_TRUE(calls[0].argumentsJson == R"({"city":"Kiel"})");
+}
+
+// ---- 8.24.3 JinjaChatTemplate render core ----------------------------------
+
+TEST(jinja_render_basicChatmlTurns) {
+    using mimirmind::model::ChatMessage;
+    using mimirmind::model::ChatRole;
+    using mimirmind::model::chat::JinjaChatTemplate;
+
+    // A ChatML-ish template exercising for/if + role/content + gen prompt.
+    JinjaChatTemplate t(
+        "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}"
+        "<|im_end|>\n{% endfor %}"
+        "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}",
+        /*bos*/ "", /*eos*/ "<|im_end|>");
+
+    std::vector<ChatMessage> msgs = {
+        {ChatRole::System, "you are helpful", {}, {}},
+        {ChatRole::User,   "hi",              {}, {}},
+    };
+    const std::string out = t.render(msgs, {}, /*addGenerationPrompt=*/true);
+
+    EXPECT_TRUE(out.find("<|im_start|>system\nyou are helpful<|im_end|>") != std::string::npos);
+    EXPECT_TRUE(out.find("<|im_start|>user\nhi<|im_end|>") != std::string::npos);
+    // add_generation_prompt appends the assistant header at the tail.
+    EXPECT_TRUE(out.size() >= 20 &&
+                out.rfind("<|im_start|>assistant\n") == out.size() - 22);
+}
+
+TEST(jinja_render_noGenerationPromptOmitsAssistantHeader) {
+    using mimirmind::model::ChatMessage;
+    using mimirmind::model::ChatRole;
+    using mimirmind::model::chat::JinjaChatTemplate;
+    JinjaChatTemplate t(
+        "{% for m in messages %}[{{ m.role }}]{{ m.content }}{% endfor %}"
+        "{% if add_generation_prompt %}[assistant]{% endif %}",
+        "", "");
+    std::vector<ChatMessage> msgs = {{ChatRole::User, "q", {}, {}}};
+    const std::string on  = t.render(msgs, {}, true);
+    const std::string off = t.render(msgs, {}, false);
+    EXPECT_TRUE(on  == "[user]q[assistant]");
+    EXPECT_TRUE(off == "[user]q");
+}
+
+TEST(jinja_render_toolsAndEnableThinkingPassThrough) {
+    using mimirmind::model::ChatMessage;
+    using mimirmind::model::ChatRole;
+    using mimirmind::model::ToolSpec;
+    using mimirmind::model::chat::JinjaChatTemplate;
+
+    // Template reads tools[].function.name and the enable_thinking kwarg.
+    JinjaChatTemplate t(
+        "{% if enable_thinking %}THINK\n{% endif %}"
+        "{% if tools %}{% for tool in tools %}TOOL={{ tool.function.name }}\n"
+        "{% endfor %}{% endif %}"
+        "{% for m in messages %}{{ m.role }}:{{ m.content }}\n{% endfor %}",
+        "", "");
+    std::vector<ChatMessage> msgs = {{ChatRole::User, "weather?", {}, {}}};
+    std::vector<ToolSpec>    tools = {
+        {"get_weather",
+         R"({"type":"function","function":{"name":"get_weather","parameters":{}}})"}
+    };
+    const std::string out = t.render(msgs, tools, /*gen*/ false,
+                                     /*enableThinking=*/true);
+    EXPECT_TRUE(out.find("THINK\n") != std::string::npos);
+    EXPECT_TRUE(out.find("TOOL=get_weather\n") != std::string::npos);
+    EXPECT_TRUE(out.find("user:weather?") != std::string::npos);
+
+    // enable_thinking=false → no THINK block.
+    const std::string noThink = t.render(msgs, tools, false, /*enableThinking=*/false);
+    EXPECT_TRUE(noThink.find("THINK") == std::string::npos);
+}
+
+TEST(jinja_render_assistantToolCallArgumentsAreObject) {
+    using mimirmind::model::ChatMessage;
+    using mimirmind::model::ChatRole;
+    using mimirmind::model::ToolCall;
+    using mimirmind::model::chat::JinjaChatTemplate;
+
+    // argumentsJson (a JSON string) must reach the template as an OBJECT so
+    // `tojson` re-serialises it (HF/vLLM convention), not as a quoted string.
+    JinjaChatTemplate t(
+        "{% for m in messages %}{% if m.tool_calls %}"
+        "{% for tc in m.tool_calls %}CALL {{ tc.function.name }} "
+        "{{ tc.function.arguments | tojson }}{% endfor %}"
+        "{% else %}{{ m.role }}:{{ m.content }}{% endif %}{% endfor %}",
+        "", "");
+    ChatMessage asst{ChatRole::Assistant, "", {}, {}};
+    asst.toolCalls.push_back(ToolCall{"call_0", "get_weather", R"({"city":"Kiel"})"});
+    std::vector<ChatMessage> msgs = {asst};
+    const std::string out = t.render(msgs, {}, false);
+    // Object re-serialised, not a JSON-in-a-string ("{\"city\"...").
+    EXPECT_TRUE(out.find(R"(CALL get_weather {"city": "Kiel"})") != std::string::npos ||
+                out.find(R"(CALL get_weather {"city":"Kiel"})") != std::string::npos);
 }
 
 int main() {

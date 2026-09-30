@@ -1492,6 +1492,7 @@ add_executable(mimirmind
     src/model/chat/QwenChatEncoder.cpp
     src/model/chat/Llama3ChatEncoder.cpp
     src/model/chat/GemmaChatEncoder.cpp
+    src/model/chat/JinjaChatTemplate.cpp
     src/model/ToolCallParser.cpp
     src/model/ToolCallConstraint.cpp
     src/model/ToolCallStreamDetector.cpp
@@ -1845,6 +1846,7 @@ add_executable(arch_tests
     src/model/chat/QwenChatEncoder.cpp
     src/model/chat/Llama3ChatEncoder.cpp
     src/model/chat/GemmaChatEncoder.cpp
+    src/model/chat/JinjaChatTemplate.cpp
     src/model/ToolCallParser.cpp
     src/model/ToolCallConstraint.cpp
     src/model/ToolCallStreamDetector.cpp
