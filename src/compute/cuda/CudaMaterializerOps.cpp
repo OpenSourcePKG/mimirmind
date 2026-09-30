@@ -72,6 +72,7 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _quantFp8Module{loadModule(ctx.cudaContext(), "quantize_bf16_to_fp8")},
       _repackNvblkModule{loadModule(ctx.cudaContext(), "repackage_nvfp4_to_blk")},
       _sfSwizzleModule{loadModule(ctx.cudaContext(), "moe_weight_sf_swizzle")},
+      _gdnRegroupModule{loadModule(ctx.cudaContext(), "gdn_regroup")},
       _dqNvfp4{_nvfp4Module.getFunction("dequant_nvfp4")},
       _dqFp8{_fp8Module.getFunction("dequant_fp8")},
       _dqFp8Pc{_fp8PcModule.getFunction("dequant_fp8_perchannel")},
@@ -84,7 +85,9 @@ CudaMaterializerOps::CudaMaterializerOps(core::cuda::CudaComputeContext& ctx, Co
       _quantQ6K{_quantQ6KModule.getFunction("quantize_bf16_to_q6k")},
       _quantFp8{_quantFp8Module.getFunction("quantize_bf16_to_fp8")},
       _repackNvblk{_repackNvblkModule.getFunction("repackage_nvfp4_to_blk")},
-      _sfSwizzle{_sfSwizzleModule.getFunction("moe_weight_sf_swizzle")} {}
+      _sfSwizzle{_sfSwizzleModule.getFunction("moe_weight_sf_swizzle")},
+      _gdnGatherRows{_gdnRegroupModule.getFunction("gdn_gather_rows")},
+      _gdnGatherCols{_gdnRegroupModule.getFunction("gdn_gather_cols")} {}
 
 ComputeBuffer CudaMaterializerOps::allocateWeight(std::size_t bytes) {
     return _ops.allocateWeight(bytes);
@@ -311,6 +314,56 @@ void CudaMaterializerOps::swizzleWeightSf(void* dstSlot, const void* srcScales,
                       static_cast<std::uint32_t>(rows),
                       static_cast<std::uint32_t>((ksf + kLocal - 1) / kLocal), 1,
                       kLocal, 1, 1);
+}
+
+namespace {
+// 1-D grid sized to cover `total` bytes at `kBlock` threads, capped so the
+// grid-stride loop in the gather kernels handles any overflow.
+std::uint32_t gatherGrid(long long total, std::uint32_t kBlock) {
+    std::uint64_t nBlocks =
+        (static_cast<std::uint64_t>(total) + kBlock - 1) / kBlock;
+    if (nBlocks > 65535ULL) { nBlocks = 65535ULL; }
+    if (nBlocks == 0ULL)    { nBlocks = 1ULL; }
+    return static_cast<std::uint32_t>(nBlocks);
+}
+} // namespace
+
+void CudaMaterializerOps::permuteRowsAsync(void* dst, const void* src,
+                                           const int* permDev,
+                                           std::uint64_t nRows,
+                                           std::size_t rowBytes) {
+    const long long total =
+        static_cast<long long>(nRows) * static_cast<long long>(rowBytes);
+    if (total <= 0) { return; }
+    constexpr std::uint32_t kBlock = 256;
+    _gdnGatherRows.clearArgs();
+    _gdnGatherRows.setPtr  (0, src);
+    _gdnGatherRows.setPtr  (1, permDev);
+    _gdnGatherRows.setPtr  (2, dst);
+    _gdnGatherRows.setValue(3, static_cast<std::int64_t>(nRows));
+    _gdnGatherRows.setValue(4, static_cast<std::int64_t>(rowBytes));
+    _gdnGatherRows.launch(_ctx.stream(), gatherGrid(total, kBlock), 1, 1,
+                          kBlock, 1, 1);
+}
+
+void CudaMaterializerOps::permuteColsAsync(void* dst, const void* src,
+                                           const int* permDev,
+                                           std::uint64_t rows, std::uint64_t cols,
+                                           std::size_t elemBytes) {
+    const long long total = static_cast<long long>(rows)
+                          * static_cast<long long>(cols)
+                          * static_cast<long long>(elemBytes);
+    if (total <= 0) { return; }
+    constexpr std::uint32_t kBlock = 256;
+    _gdnGatherCols.clearArgs();
+    _gdnGatherCols.setPtr  (0, src);
+    _gdnGatherCols.setPtr  (1, permDev);
+    _gdnGatherCols.setPtr  (2, dst);
+    _gdnGatherCols.setValue(3, static_cast<std::int64_t>(rows));
+    _gdnGatherCols.setValue(4, static_cast<std::int64_t>(cols));
+    _gdnGatherCols.setValue(5, static_cast<std::int64_t>(elemBytes));
+    _gdnGatherCols.launch(_ctx.stream(), gatherGrid(total, kBlock), 1, 1,
+                          kBlock, 1, 1);
 }
 
 float CudaMaterializerOps::readF32(const void* devPtr) {

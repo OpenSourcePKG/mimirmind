@@ -421,7 +421,8 @@ void Nvfp4Loader::loadGemma4(InferenceEngine&                     e,
 }
 
 void Nvfp4Loader::regroupGatedDeltaNetValueHeads(
-        InferenceEngine& e, core::cuda::CudaComputeContext& cudaCtx) {
+        InferenceEngine& e, core::cuda::CudaComputeContext& cudaCtx,
+        compute::cuda::CudaMaterializerOps& devOps) {
         const std::size_t KH  = e._config.ssmNumKHeads();   // num k heads (16)
         const std::size_t VH  = e._config.ssmNumVHeads();   // num v heads (32)
         const std::size_t HD  = e._config.ssmHeadDim();     // head dim (128)
@@ -452,6 +453,32 @@ void Nvfp4Loader::regroupGatedDeltaNetValueHeads(
                     permHead[j * KH + k] = k * GQA + j;
                 }
             }
+            // Upload the two index arrays to device once (int, values < vDim/VH).
+            // The gathers run on-device, so the whole regroup never round-trips
+            // the tensors through host memory — but the result is byte-identical
+            // to the old host memcpy loop (same permutation, same bytes).
+            std::vector<int> permI(vDim), permHeadI(VH);
+            for (std::size_t i = 0; i < vDim; ++i) {
+                permI[i] = static_cast<int>(perm[i]);
+            }
+            for (std::size_t i = 0; i < VH; ++i) {
+                permHeadI[i] = static_cast<int>(permHead[i]);
+            }
+            compute::ComputeBuffer permDev =
+                devOps.allocateWeight(vDim * sizeof(int));
+            compute::ComputeBuffer permHeadDev =
+                devOps.allocateWeight(VH * sizeof(int));
+            e._ops->uploadHostBytes(permDev.get(), permI.data(),
+                                    vDim * sizeof(int));
+            e._ops->uploadHostBytes(permHeadDev.get(), permHeadI.data(),
+                                    VH * sizeof(int));
+            const auto* permDevI     = static_cast<const int*>(permDev.get());
+            const auto* permHeadDevI = static_cast<const int*>(permHeadDev.get());
+            // Each gather writes to fresh scratch (a device gather cannot alias
+            // src=dst), then a D2D copy folds it back into `base`; both are on
+            // the context stream, and a per-tensor sync makes the scratch safe
+            // to free (the old host path was likewise synchronous per tensor via
+            // readbackToHost).
             auto regroupRows = [&](runtime::nvfp4::MaterializedTensor& t,
                                    std::size_t rowStart) {
                 const std::size_t inCols    = t.ggufDims[0];
@@ -460,13 +487,11 @@ void Nvfp4Loader::regroupGatedDeltaNetValueHeads(
                 const std::size_t nbytes    = vDim * rowBytes;
                 auto* base = static_cast<std::uint8_t*>(t.buffer.get())
                              + rowStart * rowBytes;
-                std::vector<std::uint8_t> in(nbytes), out(nbytes);
-                e._ops->readbackToHost(in.data(), base, nbytes);
-                for (std::size_t r = 0; r < vDim; ++r) {
-                    std::memcpy(out.data() + r * rowBytes,
-                                in.data() + perm[r] * rowBytes, rowBytes);
-                }
-                e._ops->uploadHostBytes(base, out.data(), nbytes);
+                compute::ComputeBuffer scratch = devOps.allocateWeight(nbytes);
+                devOps.permuteRowsAsync(scratch.get(), base, permDevI,
+                                        vDim, rowBytes);
+                devOps.copyBytes(base, scratch.get(), nbytes);
+                cudaCtx.stream().synchronize();
             };
             auto regroupCols = [&](runtime::nvfp4::MaterializedTensor& t) {
                 const std::size_t cols      = t.ggufDims[0];  // == vDim
@@ -474,17 +499,11 @@ void Nvfp4Loader::regroupGatedDeltaNetValueHeads(
                 const std::size_t elemBytes = t.isF32 ? 4 : 2;
                 const std::size_t nbytes    = rows * cols * elemBytes;
                 auto* base = static_cast<std::uint8_t*>(t.buffer.get());
-                std::vector<std::uint8_t> in(nbytes), out(nbytes);
-                e._ops->readbackToHost(in.data(), base, nbytes);
-                for (std::size_t r = 0; r < rows; ++r) {
-                    const std::size_t ro = r * cols;
-                    for (std::size_t c = 0; c < cols; ++c) {
-                        std::memcpy(out.data() + (ro + c) * elemBytes,
-                                    in.data() + (ro + perm[c]) * elemBytes,
-                                    elemBytes);
-                    }
-                }
-                e._ops->uploadHostBytes(base, out.data(), nbytes);
+                compute::ComputeBuffer scratch = devOps.allocateWeight(nbytes);
+                devOps.permuteColsAsync(scratch.get(), base, permDevI,
+                                        rows, cols, elemBytes);
+                devOps.copyBytes(base, scratch.get(), nbytes);
+                cudaCtx.stream().synchronize();
             };
             // Permute the VH output rows (one per value head) of a per-head
             // projection weight ([VH, inCols] row-major), or the VH elements of
@@ -495,25 +514,21 @@ void Nvfp4Loader::regroupGatedDeltaNetValueHeads(
                 const std::size_t rowBytes  = inCols * elemBytes;
                 const std::size_t nbytes    = VH * rowBytes;
                 auto* base = static_cast<std::uint8_t*>(t.buffer.get());
-                std::vector<std::uint8_t> in(nbytes), out(nbytes);
-                e._ops->readbackToHost(in.data(), base, nbytes);
-                for (std::size_t r = 0; r < VH; ++r) {
-                    std::memcpy(out.data() + r * rowBytes,
-                                in.data() + permHead[r] * rowBytes, rowBytes);
-                }
-                e._ops->uploadHostBytes(base, out.data(), nbytes);
+                compute::ComputeBuffer scratch = devOps.allocateWeight(nbytes);
+                devOps.permuteRowsAsync(scratch.get(), base, permHeadDevI,
+                                        VH, rowBytes);
+                devOps.copyBytes(base, scratch.get(), nbytes);
+                cudaCtx.stream().synchronize();
             };
             auto regroupHeadVec = [&](runtime::nvfp4::MaterializedTensor& t) {
                 const std::size_t elemBytes = t.isF32 ? 4 : 2;
                 const std::size_t nbytes    = VH * elemBytes;
                 auto* base = static_cast<std::uint8_t*>(t.buffer.get());
-                std::vector<std::uint8_t> in(nbytes), out(nbytes);
-                e._ops->readbackToHost(in.data(), base, nbytes);
-                for (std::size_t r = 0; r < VH; ++r) {
-                    std::memcpy(out.data() + r * elemBytes,
-                                in.data() + permHead[r] * elemBytes, elemBytes);
-                }
-                e._ops->uploadHostBytes(base, out.data(), nbytes);
+                compute::ComputeBuffer scratch = devOps.allocateWeight(nbytes);
+                devOps.permuteRowsAsync(scratch.get(), base, permHeadDevI,
+                                        VH, elemBytes);
+                devOps.copyBytes(base, scratch.get(), nbytes);
+                cudaCtx.stream().synchronize();
             };
             auto numElems = [](const runtime::nvfp4::MaterializedTensor& t) {
                 std::size_t n = 1;
@@ -1020,7 +1035,7 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
     // long-generation degeneration bug (vLLM-oracle-localised): the recurrence
     // applied every value head's decay/beta to the wrong head, invisible per
     // token but compounding over the sequence.
-    regroupGatedDeltaNetValueHeads(e, cudaCtx);
+    regroupGatedDeltaNetValueHeads(e, cudaCtx, devOps);
 
     // 5b'. MTP eh_proj concat-half swap. The HF checkpoint stores the fused
     // pre-fc projection as fc(cat(hnorm, enorm)) — hidden-norm half first. The

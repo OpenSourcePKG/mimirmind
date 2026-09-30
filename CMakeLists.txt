@@ -949,6 +949,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/matmul_fp8_vec.cu
         kernels/cuda/common/matmul_fp8_gemm.cu
         kernels/cuda/common/repackage_nvfp4_to_blk.cu
+        kernels/cuda/common/gdn_regroup.cu
         kernels/cuda/common/matmul_nvfp4blk_vec.cu
         kernels/cuda/common/matmul_nvfp4blk_gemm.cu
         kernels/cuda/llm/moe_gate_up_fused_k_nvfp4blk_batched.cu

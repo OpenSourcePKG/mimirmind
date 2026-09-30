@@ -119,6 +119,22 @@ public:
     void swizzleWeightSf(void* dstSlot, const void* srcScales,
                          std::uint64_t rows, std::uint64_t in);
 
+    /**
+     * GatedDeltaNet value-head regroup gathers, run on-device to replace the
+     * per-tensor readbackToHost -> host permute -> uploadHostBytes round-trip.
+     * `permDev` is a device-resident int index array; `src`/`dst` MUST NOT alias
+     * (the loader gathers into scratch, then copies back). Byte-granular, so the
+     * output is bit-identical to the host memcpy loop. Enqueued on the stream.
+     *
+     * permuteRowsAsync: dst row r = src row permDev[r], `rowBytes` per row.
+     * permuteColsAsync: within each row, col c = src col permDev[c].
+     */
+    void permuteRowsAsync(void* dst, const void* src, const int* permDev,
+                          std::uint64_t nRows, std::size_t rowBytes);
+    void permuteColsAsync(void* dst, const void* src, const int* permDev,
+                          std::uint64_t rows, std::uint64_t cols,
+                          std::size_t elemBytes);
+
 private:
     core::cuda::CudaComputeContext& _ctx;
     ComputeOps&                     _ops;
@@ -134,6 +150,7 @@ private:
     core::cuda::CudaModule          _quantFp8Module;
     core::cuda::CudaModule          _repackNvblkModule;
     core::cuda::CudaModule          _sfSwizzleModule;
+    core::cuda::CudaModule          _gdnRegroupModule;
     core::cuda::CudaKernel          _dqNvfp4;
     core::cuda::CudaKernel          _dqFp8;
     core::cuda::CudaKernel          _dqFp8Pc;
@@ -147,6 +164,8 @@ private:
     core::cuda::CudaKernel          _quantFp8;
     core::cuda::CudaKernel          _repackNvblk;
     core::cuda::CudaKernel          _sfSwizzle;
+    core::cuda::CudaKernel          _gdnGatherRows;
+    core::cuda::CudaKernel          _gdnGatherCols;
 };
 
 } // namespace mimirmind::compute::cuda

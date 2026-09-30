@@ -73,7 +73,8 @@ private:
     /// GatedDeltaNet value-head regroup (HF -> GGUF layout), a pure element
     /// permutation of the vDim value channels + the per-head decay/beta tensors.
     static void regroupGatedDeltaNetValueHeads(
-        InferenceEngine& e, core::cuda::CudaComputeContext& cudaCtx);
+        InferenceEngine& e, core::cuda::CudaComputeContext& cudaCtx,
+        compute::cuda::CudaMaterializerOps& devOps);
 
     /// MoE routed-expert bank repack (blocked-NVFP4 [+ additive FP4-TC sidecars]
     /// / FP4-TC-only / K-quant), with streaming source release to bound the peak.
