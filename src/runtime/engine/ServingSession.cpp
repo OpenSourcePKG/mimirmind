@@ -114,6 +114,154 @@ namespace {
 } // namespace
 
 // =======================================================================
+// 5.28.1.3 / 8.30.11.4 — GDN warm-slot checkpoint ring, extracted from the
+// ServingState god-struct into an owning collaborator. Holds the per-slot ring
+// of interior SSM+conv checkpoints and the capture/restore/prune/clear logic;
+// the engine bits it needs (the live SsmState slab, the compute ops for the
+// device copies, the recurrent-layer predicate + dims) are passed in per call,
+// so it stays free of any InferenceEngine/ServingState back-reference. Bodies
+// are the former ServingSession::*SlotSsmCkpt* methods verbatim (only the access
+// prefixes changed: _state->slotCkpts -> slots, st.ssm-> -> ssm., _e.ops()-> ->
+// ops., _e.config() -> config); the _state/ssm null-guards stay in the thin
+// ServingSession delegators, the slots-empty/bounds guards live here.
+// =======================================================================
+struct SlotSsmCheckpointRing {
+    // One densely-packed [nRec, elems] recurrent-only image per checkpoint for
+    // ONE slot (5.28.1.4 recurrent-only trim). `pos`/`state`/`conv` are parallel.
+    struct Ring {
+        std::vector<std::size_t>            pos;    // token position of each ckpt
+        std::vector<compute::ComputeBuffer> state;  // parallel to pos
+        std::vector<compute::ComputeBuffer> conv;
+    };
+    std::vector<Ring>            slots;         // [maxBatch]
+    static constexpr std::size_t kMaxPerSlot = 8;  // ~8*63MiB/slot cap (recurrent-only)
+
+    void capture(std::size_t slot, std::size_t pos, std::size_t maxBatch,
+                 std::size_t blockCount, SsmState& ssm, compute::ComputeOps& ops,
+                 const model::LlmConfig& config) {
+        const std::size_t stStride = ssm.stateLayerStride();       // live slab
+        const std::size_t cvStride = ssm.convStateLayerStride();
+        const std::size_t stElems  = ssm.stateElemsPerLayer();
+        const std::size_t cvElems  = ssm.convStateElemsPerLayer();
+        if (slots.empty()) {
+            slots.resize(maxBatch);
+        }
+        auto& ring = slots[slot];
+        // 5.28.1.4 recurrent-only trim: store DENSELY-packed recurrent layers
+        // only (index r = 0..nRec-1), not the full blockCount slab with holes.
+        std::size_t nRec = 0;
+        for (std::size_t L = 0; L < blockCount; ++L) {
+            if (config.isRecurrentLayer(L)) ++nRec;
+        }
+        // Reuse an evicted buffer when the ring is full (drop the smallest pos),
+        // else allocate.
+        compute::ComputeBuffer sBuf, cBuf;
+        if (ring.pos.size() >= kMaxPerSlot) {
+            sBuf = std::move(ring.state.front());
+            cBuf = std::move(ring.conv.front());
+            ring.pos.erase(ring.pos.begin());
+            ring.state.erase(ring.state.begin());
+            ring.conv.erase(ring.conv.begin());
+        } else {
+            sBuf = ops.allocate(nRec * stElems * sizeof(float));
+            cBuf = ops.allocate(nRec * cvElems * sizeof(float));
+        }
+        float* const sDst = sBuf.as<float>();
+        float* const cDst = cBuf.as<float>();
+        const float* const sSrc = ssm.statePtr();
+        const float* const cSrc = ssm.convStatePtr();
+        std::size_t r = 0;
+        for (std::size_t L = 0; L < blockCount; ++L) {
+            if (!config.isRecurrentLayer(L)) {
+                continue;
+            }
+            ops.appendMemoryCopy(sDst + r * stElems,
+                                 sSrc + L * stStride + slot * stElems,
+                                 stElems * sizeof(float));
+            ops.appendMemoryCopy(cDst + r * cvElems,
+                                 cSrc + L * cvStride + slot * cvElems,
+                                 cvElems * sizeof(float));
+            ++r;
+        }
+        ring.pos.push_back(pos);
+        ring.state.push_back(std::move(sBuf));
+        ring.conv.push_back(std::move(cBuf));
+    }
+
+    [[nodiscard]] std::size_t bestPos(std::size_t slot, std::size_t lcp) const {
+        if (slots.empty() || slot >= slots.size()) {
+            return 0;
+        }
+        std::size_t best = 0;
+        for (std::size_t p : slots[slot].pos) {
+            if (p <= lcp && p > best) {
+                best = p;
+            }
+        }
+        return best;   // 0 == no usable checkpoint (do not reuse)
+    }
+
+    void restore(std::size_t slot, std::size_t pos, std::size_t blockCount,
+                 SsmState& ssm, compute::ComputeOps& ops,
+                 const model::LlmConfig& config) {
+        if (slots.empty() || slot >= slots.size()) {
+            return;
+        }
+        auto& ring = slots[slot];
+        std::size_t idx = ring.pos.size();
+        for (std::size_t k = 0; k < ring.pos.size(); ++k) {
+            if (ring.pos[k] == pos) { idx = k; break; }
+        }
+        if (idx == ring.pos.size()) {
+            return;   // no checkpoint at pos — caller must NOT reuse
+        }
+        const std::size_t stStride = ssm.stateLayerStride();
+        const std::size_t cvStride = ssm.convStateLayerStride();
+        const std::size_t stElems  = ssm.stateElemsPerLayer();
+        const std::size_t cvElems  = ssm.convStateElemsPerLayer();
+        float* const stDst = ssm.statePtr();
+        float* const cvDst = ssm.convStatePtr();
+        const float* const stSrc = ring.state[idx].as<float>();
+        const float* const cvSrc = ring.conv[idx].as<float>();
+        std::size_t r = 0;
+        for (std::size_t L = 0; L < blockCount; ++L) {
+            if (!config.isRecurrentLayer(L)) {
+                continue;
+            }
+            ops.appendMemoryCopy(stDst + L * stStride + slot * stElems,
+                                 stSrc + r * stElems, stElems * sizeof(float));
+            ops.appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
+                                 cvSrc + r * cvElems, cvElems * sizeof(float));
+            ++r;
+        }
+    }
+
+    void prune(std::size_t slot, std::size_t keepMaxPos) {
+        if (slots.empty() || slot >= slots.size()) {
+            return;
+        }
+        auto& ring = slots[slot];
+        for (std::size_t k = ring.pos.size(); k-- > 0;) {
+            if (ring.pos[k] > keepMaxPos) {
+                ring.pos.erase(ring.pos.begin() + static_cast<std::ptrdiff_t>(k));
+                ring.state.erase(ring.state.begin() + static_cast<std::ptrdiff_t>(k));
+                ring.conv.erase(ring.conv.begin() + static_cast<std::ptrdiff_t>(k));
+            }
+        }
+    }
+
+    void clear(std::size_t slot) {
+        if (slots.empty() || slot >= slots.size()) {
+            return;
+        }
+        auto& ring = slots[slot];
+        ring.pos.clear();
+        ring.state.clear();
+        ring.conv.clear();
+    }
+};
+
+// =======================================================================
 // Persistent per-slot substrate that lets an external event loop
 // (ContinuousBatcher) admit/decode/complete requests asynchronously. Each
 // of the `maxBatch` physical slots owns a contiguous run of paged-KV blocks
@@ -152,13 +300,9 @@ struct ServingState {
     // buffer is a densely-packed [nRec, stateElemsPerLayer] / [nRec,
     // convElemsPerLayer] image for ONE slot (recurrent GatedDeltaNet layers only,
     // no nSeq dim, no holes for full-attn layers — 5.28.1.4 recurrent-only trim).
-    struct SlotCkptRing {
-        std::vector<std::size_t>            pos;    // token position of each ckpt
-        std::vector<compute::ComputeBuffer> state;  // parallel to pos
-        std::vector<compute::ComputeBuffer> conv;
-    };
-    std::vector<SlotCkptRing>    slotCkpts;         // [maxBatch]
-    static constexpr std::size_t kMaxCkptsPerSlot = 8;  // ~8*63MiB/slot cap (recurrent-only, 5.28.1.4)
+    // 8.30.11.4 — the ring + its capture/restore/prune/clear logic now live in
+    // the SlotSsmCheckpointRing collaborator above; ServingSession delegates.
+    SlotSsmCheckpointRing        ckptRing;
 
     // 5.28.1.2.b — CROSS-SLOT GDN prefix sharing (copy-based). The per-slot ring
     // above is same-slot only (a continuation must land on its own still-resident
@@ -2391,142 +2535,38 @@ void ServingSession::captureSlotSsmCkpt(std::size_t slot, std::size_t pos) {
     if (_state == nullptr || _state->ssm == nullptr) {
         return;   // L0 slab path or no serving state — warm-slot is CUDA-only
     }
-    auto& st = *_state;
-    const std::size_t stStride = st.ssm->stateLayerStride();       // live slab
-    const std::size_t cvStride = st.ssm->convStateLayerStride();
-    const std::size_t stElems  = st.ssm->stateElemsPerLayer();
-    const std::size_t cvElems  = st.ssm->convStateElemsPerLayer();
-    if (st.slotCkpts.empty()) {
-        st.slotCkpts.resize(st.maxBatch);
-    }
-    auto& ring = st.slotCkpts[slot];
-    // 5.28.1.4 — recurrent-only trim: the checkpoint stores DENSELY-packed
-    // recurrent layers only (index r = 0..nRec-1), not the full blockCount slab
-    // with holes for full-attention layers. Cuts the per-checkpoint image from
-    // ~83 MiB (all 40 layers) to ~63 MiB (~30 GatedDeltaNet layers) on qwen3.6.
-    std::size_t nRec = 0;
-    for (std::size_t L = 0; L < st.blockCount; ++L) {
-        if (_e.config().isRecurrentLayer(L)) ++nRec;
-    }
-    // Reuse an evicted buffer when the ring is full (drop the smallest pos —
-    // the deepest-prefix checkpoints nearest the end are the most reusable for
-    // a continuation), else allocate.
-    compute::ComputeBuffer sBuf, cBuf;
-    if (ring.pos.size() >= ServingState::kMaxCkptsPerSlot) {
-        sBuf = std::move(ring.state.front());
-        cBuf = std::move(ring.conv.front());
-        ring.pos.erase(ring.pos.begin());
-        ring.state.erase(ring.state.begin());
-        ring.conv.erase(ring.conv.begin());
-    } else {
-        sBuf = _e.ops()->allocate(nRec * stElems * sizeof(float));
-        cBuf = _e.ops()->allocate(nRec * cvElems * sizeof(float));
-    }
-    float* const sDst = sBuf.as<float>();
-    float* const cDst = cBuf.as<float>();
-    const float* const sSrc = st.ssm->statePtr();
-    const float* const cSrc = st.ssm->convStatePtr();
-    // Copy this slot's per-layer slice out of the live [blockCount, nSeq, elems]
-    // slab into a packed [nRec, elems] per-slot checkpoint. Recurrent layers only
-    // (full-attention layers carry no recurrent state), densely indexed by r.
-    std::size_t r = 0;
-    for (std::size_t L = 0; L < st.blockCount; ++L) {
-        if (!_e.config().isRecurrentLayer(L)) {
-            continue;
-        }
-        _e.ops()->appendMemoryCopy(sDst + r * stElems,
-                                  sSrc + L * stStride + slot * stElems,
-                                  stElems * sizeof(float));
-        _e.ops()->appendMemoryCopy(cDst + r * cvElems,
-                                  cSrc + L * cvStride + slot * cvElems,
-                                  cvElems * sizeof(float));
-        ++r;
-    }
-    ring.pos.push_back(pos);
-    ring.state.push_back(std::move(sBuf));
-    ring.conv.push_back(std::move(cBuf));
+    _state->ckptRing.capture(slot, pos, _state->maxBatch, _state->blockCount,
+                             *_state->ssm, *_e.ops(), _e.config());
 }
 
 std::size_t ServingSession::slotCkptBestPos(std::size_t slot,
                                             std::size_t lcp) const {
-    if (_state == nullptr || _state->slotCkpts.empty() ||
-        slot >= _state->slotCkpts.size()) {
+    if (_state == nullptr) {
         return 0;
     }
-    std::size_t best = 0;
-    for (std::size_t p : _state->slotCkpts[slot].pos) {
-        if (p <= lcp && p > best) {
-            best = p;
-        }
-    }
-    return best;   // 0 == no usable checkpoint (do not reuse)
+    return _state->ckptRing.bestPos(slot, lcp);
 }
 
 void ServingSession::restoreSlotSsmCkptAtPos(std::size_t slot, std::size_t pos) {
-    if (_state == nullptr || _state->ssm == nullptr ||
-        _state->slotCkpts.empty() || slot >= _state->slotCkpts.size()) {
+    if (_state == nullptr || _state->ssm == nullptr) {
         return;
     }
-    auto& st  = *_state;
-    auto& ring = st.slotCkpts[slot];
-    std::size_t idx = ring.pos.size();
-    for (std::size_t k = 0; k < ring.pos.size(); ++k) {
-        if (ring.pos[k] == pos) { idx = k; break; }
-    }
-    if (idx == ring.pos.size()) {
-        return;   // no checkpoint at pos — caller must NOT reuse (stale live state)
-    }
-    const std::size_t stStride = st.ssm->stateLayerStride();
-    const std::size_t cvStride = st.ssm->convStateLayerStride();
-    const std::size_t stElems  = st.ssm->stateElemsPerLayer();
-    const std::size_t cvElems  = st.ssm->convStateElemsPerLayer();
-    float* const stDst = st.ssm->statePtr();
-    float* const cvDst = st.ssm->convStatePtr();
-    const float* const stSrc = ring.state[idx].as<float>();
-    const float* const cvSrc = ring.conv[idx].as<float>();
-    // Unpack the densely-packed [nRec, elems] checkpoint (5.28.1.4 trim) back into
-    // the live [blockCount, nSeq, elems] slab. Dense index r must match capture.
-    std::size_t r = 0;
-    for (std::size_t L = 0; L < st.blockCount; ++L) {
-        if (!_e.config().isRecurrentLayer(L)) {
-            continue;
-        }
-        _e.ops()->appendMemoryCopy(stDst + L * stStride + slot * stElems,
-                                  stSrc + r * stElems, stElems * sizeof(float));
-        _e.ops()->appendMemoryCopy(cvDst + L * cvStride + slot * cvElems,
-                                  cvSrc + r * cvElems, cvElems * sizeof(float));
-        ++r;
-    }
+    _state->ckptRing.restore(slot, pos, _state->blockCount,
+                             *_state->ssm, *_e.ops(), _e.config());
 }
 
 void ServingSession::pruneSlotSsmCkpts(std::size_t slot, std::size_t keepMaxPos) {
-    // Drop checkpoints beyond `keepMaxPos` (the shared-prefix length on a reuse):
-    // positions > lcp are from the previous request's now-diverged tail and would
-    // be WRONG to reuse. Entries <= keepMaxPos share identical tokens [0,pos) with
-    // the new prompt and stay valid.
-    if (_state == nullptr || _state->slotCkpts.empty() ||
-        slot >= _state->slotCkpts.size()) {
+    if (_state == nullptr) {
         return;
     }
-    auto& ring = _state->slotCkpts[slot];
-    for (std::size_t k = ring.pos.size(); k-- > 0;) {
-        if (ring.pos[k] > keepMaxPos) {
-            ring.pos.erase(ring.pos.begin() + static_cast<std::ptrdiff_t>(k));
-            ring.state.erase(ring.state.begin() + static_cast<std::ptrdiff_t>(k));
-            ring.conv.erase(ring.conv.begin() + static_cast<std::ptrdiff_t>(k));
-        }
-    }
+    _state->ckptRing.prune(slot, keepMaxPos);
 }
 
 void ServingSession::clearSlotSsmCkpts(std::size_t slot) {
-    if (_state == nullptr || _state->slotCkpts.empty() ||
-        slot >= _state->slotCkpts.size()) {
+    if (_state == nullptr) {
         return;
     }
-    auto& ring = _state->slotCkpts[slot];
-    ring.pos.clear();
-    ring.state.clear();
-    ring.conv.clear();
+    _state->ckptRing.clear(slot);
 }
 
 // --- 5.28.1.2.b cross-slot GDN prefix sharing (copy-based) ----------------
