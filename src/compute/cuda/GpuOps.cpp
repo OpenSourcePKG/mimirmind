@@ -797,10 +797,7 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
     // profiling showed the GPU was 96% idle in decode as a result.
     // Pinned source lets `cudaMemcpyAsync` truly enqueue without
     // stalling. Ring cycles cleanly (256 slots > any in-flight batch).
-    _scalarRing = static_cast<std::int32_t*>(
-        alloc.allocate(kScalarRingSize * sizeof(std::int32_t),
-                       core::cuda::CudaAllocKind::HostPinned));
-    _scalarRingIdx = 0;
+    _scalarRing.init(alloc);
 
     _prefillFlashDisabled        = !flashPrefillEnabled;
     _prefillFlashGqaQ8Disabled   = !flashPrefillGqaQ8Enabled;
@@ -942,11 +939,7 @@ GpuOps::GpuOps(core::cuda::CudaComputeContext& ctx,
 
 GpuOps::~GpuOps() {
     auto& alloc = _ctx.allocator();
-    if (_scalarRing) {
-        alloc.deallocate(_scalarRing,
-                         kScalarRingSize * sizeof(std::int32_t),
-                         core::cuda::CudaAllocKind::HostPinned);
-    }
+    // _scalarRing (ScalarStagingRing) frees its pinned buffer in its own dtor.
     if (_stagingOffsetSlotUsm) {
         alloc.deallocate(_stagingOffsetSlotUsm, sizeof(std::int32_t),
                          core::cuda::CudaAllocKind::Device);
@@ -969,19 +962,13 @@ void GpuOps::stagedInt32ToDevice(std::int32_t* devicePtr,
     if (!_perKernelCurLenStaging && devicePtr == _curLenSlotUsm) {
         return;
     }
-    std::int32_t* slot = &_scalarRing[_scalarRingIdx];
-    *slot = value;
-    _scalarRingIdx = (_scalarRingIdx + 1) & (kScalarRingSize - 1);
-    appendMemoryCopy(devicePtr, slot, sizeof(std::int32_t));
+    appendMemoryCopy(devicePtr, _scalarRing.stage(value), sizeof(std::int32_t));
 }
 
 void GpuOps::updateDecodeCurLen(std::int32_t v) {
     // Raw staging bypassing the gate — the single per-token curLen update the
     // engine issues outside the captured region.
-    std::int32_t* slot = &_scalarRing[_scalarRingIdx];
-    *slot = v;
-    _scalarRingIdx = (_scalarRingIdx + 1) & (kScalarRingSize - 1);
-    appendMemoryCopy(_curLenSlotUsm, slot, sizeof(std::int32_t));
+    appendMemoryCopy(_curLenSlotUsm, _scalarRing.stage(v), sizeof(std::int32_t));
 }
 
 // ---- Real (non-stub) implementations --------------------------------

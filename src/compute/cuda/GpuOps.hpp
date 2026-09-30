@@ -10,6 +10,7 @@
 #include "compute/IPleOps.hpp"
 #include "compute/cuda/CudaMoeGroupedOps.hpp"
 #include "compute/cuda/CudaPagedAttentionOps.hpp"
+#include "compute/cuda/ScalarStagingRing.hpp"
 #include "compute/cuda/MoeTopKRouteDevice.hpp"
 #include "core/config/Config.hpp"
 #include "runtime/KvCache.hpp"
@@ -638,16 +639,11 @@ private:
     std::size_t          _flashPartialBytes{0};
     std::size_t          _replayMaxKTiles{0};
 
-    // Pinned host ring buffer for scalar-int32 H2D updates. Each
-    // `stagedInt32ToDevice` call cycles to the next slot, writes the
-    // value, and issues `cudaMemcpyAsync` from that slot — which is
-    // truly async because the source is pinned (pageable-source
-    // cudaMemcpyAsync silently falls back to synchronous on ROCm). The
-    // ring size is generous vs. the max in-flight copies in one
-    // decode-step (< 100 per token, cycles cleanly).
-    static constexpr std::size_t kScalarRingSize = 256;
-    std::int32_t*        _scalarRing{nullptr};
-    std::size_t          _scalarRingIdx{0};
+    // Pinned host ring buffer for scalar-int32 H2D updates (8.30.11.4:
+    // ScalarStagingRing collaborator, RAII). Each stagedInt32ToDevice /
+    // updateDecodeCurLen call stages a value into the next pinned slot (truly
+    // async H2D because the source is pinned) — see the class doc.
+    ScalarStagingRing _scalarRing;
 
     /// Stage `value` into the next pinned slot, issue an async H2D copy
     /// on the compute stream, and return. The device slot sees the
