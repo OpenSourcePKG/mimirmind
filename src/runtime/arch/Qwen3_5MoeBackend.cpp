@@ -1791,6 +1791,98 @@ void Qwen3_5MoeBackend::runFullAttentionBlockBatched(
     blockResidualAdd(blockIdx, x, s.moeAccumBuf.as<float>(), nRow, s, /*isAttn=*/false);  // 5.27 I-9a seam
 }
 
+void Qwen3_5MoeBackend::runGdnRecurrence(
+        const BatchedDecodeCtx& ctx, BlockBuffers& s,
+        const core::gguf::GgufTensor& ssmA,
+        const core::gguf::GgufTensor& ssmDt,
+        const GdnRecurArgs& r) {
+    float* const stateBase = r.stateBase;
+    const std::size_t stateElems = r.stateElems;
+    float* const qBuf = r.qBuf;
+    float* const kBuf = r.kBuf;
+    float* const vBuf = r.vBuf;
+    float* const alphaBuf = r.alphaBuf;
+    float* const betaBuf = r.betaBuf;
+    float* const gateBuf = r.gateBuf;
+    float* const deltaOut = r.deltaOut;
+    const std::size_t nRow = r.nRow;
+    const std::size_t hV = r.hV;
+    const std::size_t S = r.S;
+    const std::size_t nSeq = r.nSeq;
+    const bool ragged = r.ragged;
+    for (std::size_t seq = 0; seq < nSeq; ++seq) {
+        // 5.21-I: a masked (frozen) slot must NOT be zeroed even if seqStart —
+        // freeze dominates; its state stays byte-identical.
+        const bool frozen = ctx.activeMaskHost != nullptr
+                            && ctx.activeMaskHost[seq] == 0;
+        if (!frozen && ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
+            _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
+        }
+    }
+    // 5.21-III ragged: per-slot seqT/seqOff drive the recurrence (T fallback =
+    // maxSeqT). Decode (ragged=false) => seqT/seqOff nullptr, T=1 => bit-identical.
+    const compute::GdnBatchedShape gdnShape{
+        nSeq, ragged ? ctx.maxSeqT : 1, hV, S, ctx.activeMask,
+        ragged ? ctx.seqTDev : nullptr, ragged ? ctx.seqOffDev : nullptr};
+
+    // 5.21.9 — chunked delta-rule for the RAGGED serving prefill. The
+    // T-sequential AR recurrence is the top post-cuDNN prefill term (21.4%,
+    // measured <4% fp32 / <10% BW = serial-latency-bound); the chunked
+    // pipeline (K0 cumgate -> K1 triangular inverse -> K2 chunk forward, the
+    // same math the single-session path runs parity-proven) replaces it when
+    // the largest slot chunk reaches _gdnChunkMinT (same knob family:
+    // MIMIRMIND_GDN_CHUNK / MIMIRMIND_GDN_CHUNK_MIN_T; default disabled).
+    // Guard on the compact-a0 capacity: every slot costs >=1 chunk block, so
+    // a forward whose sum(ceil(seqT/C)) exceeds the ssmA0 allocation falls
+    // back to the AR path (correctness never depends on the flag).
+    bool gdnChunked = false;
+    constexpr std::size_t kChunkC = 64;
+    if (ragged && ctx.maxSeqT >= _gdnChunkMinT && ctx.seqTHost != nullptr
+        && s.ssmChunkScratch.bytes() != 0 && s.ssmA0.bytes() != 0) {
+        std::size_t totalChunks = 0;
+        for (std::size_t seq = 0; seq < nSeq; ++seq) {
+            totalChunks += (static_cast<std::size_t>(ctx.seqTHost[seq])
+                            + kChunkC - 1) / kChunkC;
+        }
+        const std::size_t capChunks =
+            s.ssmA0.bytes() / (hV * kChunkC * kChunkC * sizeof(float));
+        gdnChunked = (totalChunks <= capChunks);
+    }
+    if (gdnChunked) {
+        // The chunk kernels consume gLog + sigmoided beta; the gate-fused
+        // decode path keeps alpha/beta RAW, so materialise them here.
+        if (_gdnGateFuse) {
+            _ops.sigmoidInPlaceAsync({betaBuf, nRow * hV});
+            _ops.deltanetGateAsync(alphaBuf,
+                                   static_cast<const float*>(ssmA.usmPtr),
+                                   static_cast<const float*>(ssmDt.usmPtr),
+                                   gateBuf, nRow, hV);
+        }
+        float* const gCum = s.ssmGCum.as<float>();
+        float* const a0   = s.ssmA0.as<float>();
+        _ops.profileSection("gdn.k0");   // cumgate (chunk sub-split)
+        _ops.deltanetChunkCumGateBatchedAsync(gateBuf, gCum, gdnShape, kChunkC);
+        _ops.profileSection("gdn.k1");   // KKT triangular inverse (sub-split)
+        _ops.deltanetKktSolveInverseBatchedAsync(kBuf, betaBuf, a0, gdnShape,
+                                                 kChunkC);
+        _ops.profileSection("gdn.k2");   // chunk forward (sub-split)
+        _ops.deltanetChunkForwardBatchedAsync(
+            qBuf, kBuf, vBuf, gCum, betaBuf, a0, stateBase, deltaOut,
+            s.ssmChunkScratch.as<float>(), gdnShape, kChunkC);
+    } else if (_gdnGateFuse) {
+        // GDN-Inc 2: gate folded in — pass RAW alpha/beta + per-head ssm_a/ssm_dt.
+        _ops.gatedDeltaNetRecurrentGateFusedBatchedAsync(
+            qBuf, kBuf, vBuf, alphaBuf, betaBuf,
+            static_cast<const float*>(ssmA.usmPtr),
+            static_cast<const float*>(ssmDt.usmPtr),
+            stateBase, deltaOut, gdnShape);
+    } else {
+        _ops.gatedDeltaNetRecurrentBatchedAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
+                                                stateBase, deltaOut, gdnShape);
+    }
+}
+
+
 void Qwen3_5MoeBackend::runLinearBlockBatched(
         std::size_t blockIdx, float* x, const BatchedDecodeCtx& ctx,
         BlockBuffers& s) {
@@ -2082,76 +2174,10 @@ void Qwen3_5MoeBackend::runLinearBlockBatched(
 
     // --- gated delta-rule recurrence (persistent per-seq state) ------
     _ops.profileSection("gdn.recur");
-    for (std::size_t seq = 0; seq < nSeq; ++seq) {
-        // 5.21-I: a masked (frozen) slot must NOT be zeroed even if seqStart —
-        // freeze dominates; its state stays byte-identical.
-        const bool frozen = ctx.activeMaskHost != nullptr
-                            && ctx.activeMaskHost[seq] == 0;
-        if (!frozen && ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
-            _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
-        }
-    }
-    // 5.21-III ragged: per-slot seqT/seqOff drive the recurrence (T fallback =
-    // maxSeqT). Decode (ragged=false) => seqT/seqOff nullptr, T=1 => bit-identical.
-    const compute::GdnBatchedShape gdnShape{
-        nSeq, ragged ? ctx.maxSeqT : 1, hV, S, ctx.activeMask,
-        ragged ? ctx.seqTDev : nullptr, ragged ? ctx.seqOffDev : nullptr};
-
-    // 5.21.9 — chunked delta-rule for the RAGGED serving prefill. The
-    // T-sequential AR recurrence is the top post-cuDNN prefill term (21.4%,
-    // measured <4% fp32 / <10% BW = serial-latency-bound); the chunked
-    // pipeline (K0 cumgate -> K1 triangular inverse -> K2 chunk forward, the
-    // same math the single-session path runs parity-proven) replaces it when
-    // the largest slot chunk reaches _gdnChunkMinT (same knob family:
-    // MIMIRMIND_GDN_CHUNK / MIMIRMIND_GDN_CHUNK_MIN_T; default disabled).
-    // Guard on the compact-a0 capacity: every slot costs >=1 chunk block, so
-    // a forward whose sum(ceil(seqT/C)) exceeds the ssmA0 allocation falls
-    // back to the AR path (correctness never depends on the flag).
-    bool gdnChunked = false;
-    constexpr std::size_t kChunkC = 64;
-    if (ragged && ctx.maxSeqT >= _gdnChunkMinT && ctx.seqTHost != nullptr
-        && s.ssmChunkScratch.bytes() != 0 && s.ssmA0.bytes() != 0) {
-        std::size_t totalChunks = 0;
-        for (std::size_t seq = 0; seq < nSeq; ++seq) {
-            totalChunks += (static_cast<std::size_t>(ctx.seqTHost[seq])
-                            + kChunkC - 1) / kChunkC;
-        }
-        const std::size_t capChunks =
-            s.ssmA0.bytes() / (hV * kChunkC * kChunkC * sizeof(float));
-        gdnChunked = (totalChunks <= capChunks);
-    }
-    if (gdnChunked) {
-        // The chunk kernels consume gLog + sigmoided beta; the gate-fused
-        // decode path keeps alpha/beta RAW, so materialise them here.
-        if (_gdnGateFuse) {
-            _ops.sigmoidInPlaceAsync({betaBuf, nRow * hV});
-            _ops.deltanetGateAsync(alphaBuf,
-                                   static_cast<const float*>(ssmA.usmPtr),
-                                   static_cast<const float*>(ssmDt.usmPtr),
-                                   gateBuf, nRow, hV);
-        }
-        float* const gCum = s.ssmGCum.as<float>();
-        float* const a0   = s.ssmA0.as<float>();
-        _ops.profileSection("gdn.k0");   // cumgate (chunk sub-split)
-        _ops.deltanetChunkCumGateBatchedAsync(gateBuf, gCum, gdnShape, kChunkC);
-        _ops.profileSection("gdn.k1");   // KKT triangular inverse (sub-split)
-        _ops.deltanetKktSolveInverseBatchedAsync(kBuf, betaBuf, a0, gdnShape,
-                                                 kChunkC);
-        _ops.profileSection("gdn.k2");   // chunk forward (sub-split)
-        _ops.deltanetChunkForwardBatchedAsync(
-            qBuf, kBuf, vBuf, gCum, betaBuf, a0, stateBase, deltaOut,
-            s.ssmChunkScratch.as<float>(), gdnShape, kChunkC);
-    } else if (_gdnGateFuse) {
-        // GDN-Inc 2: gate folded in — pass RAW alpha/beta + per-head ssm_a/ssm_dt.
-        _ops.gatedDeltaNetRecurrentGateFusedBatchedAsync(
-            qBuf, kBuf, vBuf, alphaBuf, betaBuf,
-            static_cast<const float*>(ssmA.usmPtr),
-            static_cast<const float*>(ssmDt.usmPtr),
-            stateBase, deltaOut, gdnShape);
-    } else {
-        _ops.gatedDeltaNetRecurrentBatchedAsync(qBuf, kBuf, vBuf, gateBuf, betaBuf,
-                                                stateBase, deltaOut, gdnShape);
-    }
+    runGdnRecurrence(ctx, s, ssmA, ssmDt,
+                     GdnRecurArgs{stateBase, stateElems, qBuf, kBuf, vBuf,
+                                  alphaBuf, betaBuf, gateBuf, deltaOut,
+                                  nRow, hV, S, nSeq, ragged});
 
     // --- gated output norm: ssm_norm(out) * act(z) ------------------
     // act = silu (qwen3.6 etc.) or sigmoid (qwen4_exp, output_gate_type).

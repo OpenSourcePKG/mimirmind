@@ -170,6 +170,32 @@ protected:
                                std::size_t nSeq, std::size_t R,
                                std::size_t blockIdx);
 
+    // runLinearBlockBatched GDN gated-delta-rule recurrence stage (8.30.11.4),
+    // extracted verbatim. Its ~14 inputs are passed as one named struct (not
+    // positional) so the many same-type float* buffers cannot be swapped; the
+    // helper destructures them back into identically-named locals, keeping the
+    // moved body byte-identical.
+    struct GdnRecurArgs {
+        float*      stateBase;
+        std::size_t stateElems;
+        float*      qBuf;
+        float*      kBuf;
+        float*      vBuf;
+        float*      alphaBuf;
+        float*      betaBuf;
+        float*      gateBuf;
+        float*      deltaOut;
+        std::size_t nRow;
+        std::size_t hV;
+        std::size_t S;
+        std::size_t nSeq;
+        bool        ragged;
+    };
+    void runGdnRecurrence(const BatchedDecodeCtx& ctx, BlockBuffers& s,
+                          const core::gguf::GgufTensor& ssmA,
+                          const core::gguf::GgufTensor& ssmDt,
+                          const GdnRecurArgs& r);
+
     /// Track B — one shared-expert projection through the CUTLASS block-scaled
     /// NVFP4 tensor-core GEMM as a single group (nExp=1).
     void sharedExpertTcGemm(std::size_t   N,
