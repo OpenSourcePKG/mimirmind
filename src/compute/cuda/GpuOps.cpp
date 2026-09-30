@@ -3793,24 +3793,11 @@ void GpuOps::attentionEncoderBatchedAsync(const float* q, const float* k,
                   kAttentionLocalSize, 1, 1);
 }
 
-void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
-                                        const void* v,
-                                        std::size_t T_q,
-                                        std::size_t nHeads,
-                                        std::size_t nKvHeads,
-                                        std::size_t headDim,
-                                        std::size_t positionOffset,
-                                        float scale, float* out,
-                                        std::size_t slidingWindow,
-                                        runtime::KvDtype kvDtype) {
-    // Under Q8_0 with GQA shape, route to the head-packed kernel when
-    // the config allows and nQPerKv is within the packed kernel's cap.
-    // K-tile pick: 64 → smaller-SLM variant (higher occupancy on the
-    // heavy per-Q-head register pressure); 128 → default M5i.J
-    // streaming amortisation. Any other value was resolved / rejected
-    // in the ctor.
-    const std::size_t nQPerKv = nHeads / nKvHeads;
-
+bool GpuOps::tryAttnPrefillCudnn(
+        const float* q, const void* k, const void* v, std::size_t T_q,
+        std::size_t nHeads, std::size_t nKvHeads, std::size_t headDim,
+        std::size_t positionOffset, float scale, float* out,
+        std::size_t slidingWindow, runtime::KvDtype kvDtype) {
 #if MIMIRMIND_HAVE_CUDNN_SDPA
     // cuDNN 9 SDPA — preferred F32 prefill-attn path when enabled and eligible.
     // Handles both the first chunk (positionOffset==0, plain causal) and
@@ -3836,26 +3823,20 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
                 toInt32(nKvHeads, "cudnn_sdpa nKvHeads"),
                 toInt32(headDim,  "cudnn_sdpa headDim"),
                 scale)) {
-            return;   // cuDNN handled the prefill attention for this chunk
+            return true;   // cuDNN handled the prefill attention for this chunk
         }
         // else: fall through to the hand-written kernel selection below.
     }
 #endif
+    (void)q; (void)k; (void)v; (void)T_q; (void)nHeads; (void)nKvHeads;
+    (void)headDim; (void)positionOffset; (void)scale; (void)out;
+    (void)slidingWindow; (void)kvDtype;
+    return false;
+}
 
-    // Multi-warp TF32 FA-2 for the F32 KV path (Step 3.2's F32 sibling; the
-    // path Qwen3-Next prefill attention actually takes). Preferred over the
-    // scalar P3.a/P3.b F32 kernels when eligible. Needs a dynamic-smem opt-in
-    // (qS+oRun dominate; sized by HPB=4 head-half, not nQPerKv).
+void GpuOps::resolveF32MwtcPrefillSmem(bool& useF32Mwtc, std::size_t headDim) {
+    if (!useF32Mwtc) { return; }
     constexpr std::size_t kMwtcHpb = 2;   // == ATTN_MW_HPB in the kernel
-                                          // (99 KiB sm_121 dyn-smem cap)
-    bool useF32Mwtc =
-        (kvDtype == runtime::KvDtype::F32) &&
-        _prefillF32MwtcEnabled &&
-        (nQPerKv > 1) &&
-        (nQPerKv <= kFlashPrefillGqaMaxQPerKv) &&
-        (headDim <= kFlashTcMaxHeadDim) &&
-        (headDim % 16 == 0);
-    if (useF32Mwtc) {
         constexpr std::size_t BQ = 16, BK = 16;
         auto a128 = [](std::size_t n) { return (n + 127u) & ~std::size_t(127u); };
         const std::size_t hp = kMwtcHpb;
@@ -3891,7 +3872,93 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         }
         useF32Mwtc = _prefillF32MwtcSmemOk &&
                      (bytes <= _prefillF32MwtcSmemBytes);
+}
+
+void GpuOps::resolveFp16GqaTcPrefillSmem(bool& useFp16GqaTc,
+                                         std::size_t nQPerKv,
+                                         std::size_t headDim) {
+    if (!useFp16GqaTc) { return; }
+        // Compute the exact dynamic-smem footprint (must match the kernel's
+        // carveSmem() region layout: each region padded up to 128 bytes).
+        constexpr std::size_t BQ = 16, BK = 16;
+        constexpr std::size_t kHalf = 2;   // sizeof(fp16); __half not in host TU
+        auto a128 = [](std::size_t n) { return (n + 127u) & ~std::size_t(127u); };
+        const std::size_t nW = static_cast<std::size_t>(nQPerKv);
+        const std::size_t hd = static_cast<std::size_t>(headDim);
+        std::size_t bytes = 0;
+        bytes += a128(nW * BQ * hd * sizeof(float));    // oRun
+        bytes += a128(BK * hd * kHalf);                 // kvS
+        bytes += a128(nW * BQ * BK * kHalf);            // qStg
+        bytes += a128(nW * BQ * BK * sizeof(float));    // sS
+        bytes += a128(nW * BQ * BK * kHalf);            // pS
+        bytes += a128(nW * BQ * BK * sizeof(float));    // oT
+        bytes += a128(nW * BQ * sizeof(float));         // mSh
+        bytes += a128(nW * BQ * sizeof(float));         // lSh
+        bytes += a128(nW * BQ * sizeof(float));         // aSh
+        if (!_prefillFp16GqaTcSmemAttempted) {
+            _prefillFp16GqaTcSmemAttempted = true;
+            try {
+                _pimpl->_attentionPrefillFlashFp16GqaTcKernel
+                    .setMaxDynamicSharedBytes(bytes);
+                _prefillFp16GqaTcSmemBytes = bytes;
+                _prefillFp16GqaTcSmemOk    = true;
+                MM_LOG_INFO("cudagpuops",
+                            "FP16 GQA-TC prefill: dynamic smem opt-in ok "
+                            "({} bytes, nQPerKv={}, headDim={})",
+                            bytes, nQPerKv, headDim);
+            } catch (const core::cuda::CudaDriverError& err) {
+                _prefillFp16GqaTcSmemOk = false;
+                MM_LOG_WARN("cudagpuops",
+                            "FP16 GQA-TC prefill: dynamic smem opt-in for {} "
+                            "bytes rejected ({}); falling back to the scalar "
+                            "fp16 kernel", bytes, err.what());
+            }
+        }
+        // The opt-in is a one-shot per (headDim,nQPerKv). If a later dispatch
+        // needs more bytes than the cached opt-in, disable for safety.
+        useFp16GqaTc = _prefillFp16GqaTcSmemOk &&
+                       (bytes <= _prefillFp16GqaTcSmemBytes);
+}
+
+
+void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
+                                        const void* v,
+                                        std::size_t T_q,
+                                        std::size_t nHeads,
+                                        std::size_t nKvHeads,
+                                        std::size_t headDim,
+                                        std::size_t positionOffset,
+                                        float scale, float* out,
+                                        std::size_t slidingWindow,
+                                        runtime::KvDtype kvDtype) {
+    // Under Q8_0 with GQA shape, route to the head-packed kernel when
+    // the config allows and nQPerKv is within the packed kernel's cap.
+    // K-tile pick: 64 → smaller-SLM variant (higher occupancy on the
+    // heavy per-Q-head register pressure); 128 → default M5i.J
+    // streaming amortisation. Any other value was resolved / rejected
+    // in the ctor.
+    const std::size_t nQPerKv = nHeads / nKvHeads;
+
+    if (tryAttnPrefillCudnn(q, k, v, T_q, nHeads, nKvHeads, headDim,
+                            positionOffset, scale, out, slidingWindow,
+                            kvDtype)) {
+        return;   // cuDNN handled the prefill attention for this chunk
     }
+
+    // Multi-warp TF32 FA-2 for the F32 KV path (Step 3.2's F32 sibling; the
+    // path Qwen3-Next prefill attention actually takes). Preferred over the
+    // scalar P3.a/P3.b F32 kernels when eligible. Needs a dynamic-smem opt-in
+    // (qS+oRun dominate; sized by HPB=4 head-half, not nQPerKv).
+    constexpr std::size_t kMwtcHpb = 2;   // == ATTN_MW_HPB in the kernel
+                                          // (99 KiB sm_121 dyn-smem cap)
+    bool useF32Mwtc =
+        (kvDtype == runtime::KvDtype::F32) &&
+        _prefillF32MwtcEnabled &&
+        (nQPerKv > 1) &&
+        (nQPerKv <= kFlashPrefillGqaMaxQPerKv) &&
+        (headDim <= kFlashTcMaxHeadDim) &&
+        (headDim % 16 == 0);
+    resolveF32MwtcPrefillSmem(useF32Mwtc, headDim);
     const bool useQ8Gqa =
         (kvDtype == runtime::KvDtype::Q8_0) &&
         !_prefillFlashGqaQ8Disabled &&
@@ -3933,48 +4000,7 @@ void GpuOps::attentionPrefillFlashAsync(const float* q, const void* k,
         (nQPerKv <= kFlashPrefillGqaMaxQPerKv) &&
         (headDim <= kFlashTcMaxHeadDim) &&
         (headDim % 16 == 0);
-    if (useFp16GqaTc) {
-        // Compute the exact dynamic-smem footprint (must match the kernel's
-        // carveSmem() region layout: each region padded up to 128 bytes).
-        constexpr std::size_t BQ = 16, BK = 16;
-        constexpr std::size_t kHalf = 2;   // sizeof(fp16); __half not in host TU
-        auto a128 = [](std::size_t n) { return (n + 127u) & ~std::size_t(127u); };
-        const std::size_t nW = static_cast<std::size_t>(nQPerKv);
-        const std::size_t hd = static_cast<std::size_t>(headDim);
-        std::size_t bytes = 0;
-        bytes += a128(nW * BQ * hd * sizeof(float));    // oRun
-        bytes += a128(BK * hd * kHalf);                 // kvS
-        bytes += a128(nW * BQ * BK * kHalf);            // qStg
-        bytes += a128(nW * BQ * BK * sizeof(float));    // sS
-        bytes += a128(nW * BQ * BK * kHalf);            // pS
-        bytes += a128(nW * BQ * BK * sizeof(float));    // oT
-        bytes += a128(nW * BQ * sizeof(float));         // mSh
-        bytes += a128(nW * BQ * sizeof(float));         // lSh
-        bytes += a128(nW * BQ * sizeof(float));         // aSh
-        if (!_prefillFp16GqaTcSmemAttempted) {
-            _prefillFp16GqaTcSmemAttempted = true;
-            try {
-                _pimpl->_attentionPrefillFlashFp16GqaTcKernel
-                    .setMaxDynamicSharedBytes(bytes);
-                _prefillFp16GqaTcSmemBytes = bytes;
-                _prefillFp16GqaTcSmemOk    = true;
-                MM_LOG_INFO("cudagpuops",
-                            "FP16 GQA-TC prefill: dynamic smem opt-in ok "
-                            "({} bytes, nQPerKv={}, headDim={})",
-                            bytes, nQPerKv, headDim);
-            } catch (const core::cuda::CudaDriverError& err) {
-                _prefillFp16GqaTcSmemOk = false;
-                MM_LOG_WARN("cudagpuops",
-                            "FP16 GQA-TC prefill: dynamic smem opt-in for {} "
-                            "bytes rejected ({}); falling back to the scalar "
-                            "fp16 kernel", bytes, err.what());
-            }
-        }
-        // The opt-in is a one-shot per (headDim,nQPerKv). If a later dispatch
-        // needs more bytes than the cached opt-in, disable for safety.
-        useFp16GqaTc = _prefillFp16GqaTcSmemOk &&
-                       (bytes <= _prefillFp16GqaTcSmemBytes);
-    }
+    resolveFp16GqaTcPrefillSmem(useFp16GqaTc, nQPerKv, headDim);
     // Step 3 — opt-in FP16 tensor-core FA-2 kernel (q-tiled, headDim-bounded).
     const bool useFp16Tc =
         !useFp16GqaTc &&

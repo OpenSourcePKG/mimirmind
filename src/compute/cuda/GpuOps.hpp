@@ -643,6 +643,21 @@ private:
     struct Impl;
     std::unique_ptr<Impl>         _pimpl;
 
+    // attentionPrefillFlashAsync helpers (extracted verbatim; 8.30.11.4). The
+    // cuDNN early-return and the two dynamic-smem opt-in blocks are self-contained
+    // pieces of the prefill-attn kernel selection; the interdependent eligibility
+    // flags + the final launch cascade stay inline.
+    [[nodiscard]] bool tryAttnPrefillCudnn(
+        const float* q, const void* k, const void* v, std::size_t T_q,
+        std::size_t nHeads, std::size_t nKvHeads, std::size_t headDim,
+        std::size_t positionOffset, float scale, float* out,
+        std::size_t slidingWindow, runtime::KvDtype kvDtype);
+    // Resolve the one-shot dynamic-smem opt-in for the F32 multi-warp-TC / FP16
+    // GQA-TC prefill kernels; clears the `use*` flag if the opt-in was rejected.
+    void resolveF32MwtcPrefillSmem(bool& useF32Mwtc, std::size_t headDim);
+    void resolveFp16GqaTcPrefillSmem(bool& useFp16GqaTc, std::size_t nQPerKv,
+                                     std::size_t headDim);
+
     // M-Q3N.5 device-side MoE top-K router launcher (holds the moe_topk
     // module + kernel; loaded once). Delegated to by moeTopKRouteDeviceAsync.
     MoeTopKRouteDevice            _moeTopKRoute;
