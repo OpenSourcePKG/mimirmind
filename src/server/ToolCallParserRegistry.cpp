@@ -34,6 +34,38 @@ const IToolCallParser* ToolCallParserRegistry::get(std::string_view name) const 
     return nullptr;
 }
 
+const IToolCallParser* ToolCallParserRegistry::resolve(
+    std::string_view configName, std::string_view architecture) const noexcept {
+    // 1. Explicit per-model config wins (nullptr if it names an unknown parser).
+    if (!configName.empty()) {
+        return get(configName);
+    }
+    // 2. Auto-detect from the model's chat style + tool format. detectFromArch
+    //    throws on an architecture we have not hardcoded — treat that as "no
+    //    auto-detect" (nullptr) rather than propagating.
+    using CT = model::ChatTemplate;
+    CT::Style style{};
+    try {
+        style = CT::detectFromArch(architecture);
+    } catch (...) {
+        return nullptr;
+    }
+    switch (style) {
+    case CT::Style::Gemma4:
+        return get("gemma");
+    case CT::Style::QwenChatML:
+        return CT::toolFormatFromArch(architecture) == CT::ToolFormat::QwenXml
+                   ? get("qwen3-coder-xml")
+                   : get("hermes");
+    case CT::Style::Gemma3:
+    case CT::Style::Llama3:
+    default:
+        // No dedicated parser yet (Gemma3 DSL differs; Llama3 deferred) — the
+        // caller keeps its current behaviour.
+        return nullptr;
+    }
+}
+
 std::vector<std::string_view> ToolCallParserRegistry::names() const {
     std::vector<std::string_view> out;
     out.reserve(_parsers.size());

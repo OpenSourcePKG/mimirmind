@@ -24,6 +24,19 @@ public:
     /// Resolve a parser by registry name; nullptr if unknown (caller falls back).
     [[nodiscard]] const IToolCallParser* get(std::string_view name) const noexcept;
 
+    /// 8.25.4 — server-side parser selection (no user toggle). Priority:
+    ///   1. explicit `configName` (per-model config.serve.json tool_call_parser) —
+    ///      wins even over auto-detect; nullptr if it names an unknown parser
+    ///      (a misconfiguration the caller surfaces / falls back on).
+    ///   2. auto-detect from the model `architecture` (chat-style + tool-format):
+    ///      Gemma4 -> "gemma"; QwenChatML -> "qwen3-coder-xml" (QwenXml) or
+    ///      "hermes" (HermesJson).
+    ///   3. nullptr for anything else (Gemma3 / Llama3 / unknown arch) — the
+    ///      caller keeps its current behaviour.
+    /// Never throws (an unknown architecture is treated as "no auto-detect").
+    [[nodiscard]] const IToolCallParser* resolve(std::string_view configName,
+                                                 std::string_view architecture) const noexcept;
+
     /// All registered parser names (for logging / diagnostics / config validation).
     [[nodiscard]] std::vector<std::string_view> names() const;
 

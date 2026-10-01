@@ -69,6 +69,13 @@ struct LlmConfig {
     // is proven (8.24.5/8.24.6). Ops override: MIMIRMIND_ENABLE_JINJA.
     bool enableJinja{false};
 
+    // Server-decided tool-call PARSER selection (8.25.4). Empty -> auto-detect
+    // from the architecture (chat-style + tool-format) via
+    // ToolCallParserRegistry::resolve; a non-empty name (per-model
+    // config.serve.json tool_call_parser) pins a specific registered parser
+    // ("qwen3-coder-xml" / "hermes" / "gemma"). Never a user/request toggle.
+    std::string toolCallParser{};
+
     // Required — throws if missing from metadata.
     std::uint32_t blockCount        {0};
     std::uint32_t contextLength     {0};

@@ -1853,6 +1853,39 @@ TEST(toolparser_gemma_extract) {
     EXPECT_TRUE(!p.matches("<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"));
 }
 
+TEST(toolparser_registry_resolve_explicitWins) {
+    using mimirmind::server::ToolCallParserRegistry;
+    const auto& reg = ToolCallParserRegistry::instance();
+    // Explicit config name wins over auto-detect (even a mismatched arch).
+    const auto* p = reg.resolve("gemma", "qwen35moe");
+    EXPECT_TRUE(p != nullptr);
+    EXPECT_EQ(p->name(), std::string_view{"gemma"});
+    // Explicit-but-unknown -> nullptr (misconfiguration; caller falls back).
+    EXPECT_TRUE(reg.resolve("no-such-parser", "qwen35moe") == nullptr);
+}
+
+TEST(toolparser_registry_resolve_autoDetect) {
+    using mimirmind::server::ToolCallParserRegistry;
+    const auto& reg = ToolCallParserRegistry::instance();
+    // QwenXml archs (qwen3.5/3.6/3.8) -> qwen3-coder-xml.
+    EXPECT_EQ(reg.resolve("", "qwen35moe")->name(),
+              std::string_view{"qwen3-coder-xml"});
+    // Hermes-JSON archs (qwen2/qwen3) -> hermes.
+    EXPECT_EQ(reg.resolve("", "qwen2")->name(), std::string_view{"hermes"});
+    // Gemma 4 -> gemma.
+    EXPECT_EQ(reg.resolve("", "gemma4")->name(), std::string_view{"gemma"});
+}
+
+TEST(toolparser_registry_resolve_unknownArchIsNull) {
+    using mimirmind::server::ToolCallParserRegistry;
+    const auto& reg = ToolCallParserRegistry::instance();
+    // Gemma3 / Llama3 have no dedicated parser yet -> nullptr (keep current).
+    EXPECT_TRUE(reg.resolve("", "gemma3") == nullptr);
+    EXPECT_TRUE(reg.resolve("", "llama") == nullptr);
+    // An architecture detectFromArch() does not know must NOT throw -> nullptr.
+    EXPECT_TRUE(reg.resolve("", "totally-unknown-arch") == nullptr);
+}
+
 int main() {
     return mm::test::run();
 }
