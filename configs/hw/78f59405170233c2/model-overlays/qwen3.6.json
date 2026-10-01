@@ -23,6 +23,11 @@
       "value": 1,
       "apply": true,
       "effect": "Render chat prompts from the model's own chat_template.jinja via minja instead of the hand-transcribed encodeQwen. Validated 2026-10-01: jinja render == vLLM (HF transformers.apply_chat_template) byte-for-byte on all 6 anchor shapes incl the tools block. Fixes encodeQwen's compact-JSON tools-block drift (t.dump() vs the spaced tojson the model was trained on). Server decides; explicit MIMIRMIND_ENABLE_JINJA env still wins."
+    },
+    "MIMIRMIND_GDN_PROJ_FUSE_BATCH": {
+      "value": 1,
+      "apply": true,
+      "effect": "Fuse the GDN input/output projections into 2 wide FP8 GEMMs instead of 4 narrow ones (removes per-call quant + cuBLASLt overhead). Measured 2026-10-02 on GB10: gdn.proj 12.8->9.0 ms/step, single-stream decode 16.5->17.5 tok/s (+6%). Coherence goldset (30 prompts, greedy, off vs on): OFF 30/30 == ON 30/30 correct, 0 degradations, only benign wording-drift on 3 free-form prompts (fused per-tensor E4M3 scale, not bit-identical). Server decides; explicit env still wins."
     }
   }
 }
