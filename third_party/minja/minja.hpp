@@ -1806,7 +1806,22 @@ private:
       if (it == end) return nullptr;
       if (*it == '"' || *it == '\'') {
         auto str = parseString();
-        if (str) return std::make_shared<Value>(*str);
+        if (str) {
+          // MIMIRMIND-PATCH (2026-10-01, diverges from upstream google/minja):
+          // Jinja2/Python implicit adjacent string-literal concatenation,
+          // "a" "b" => "ab". parseString() skips leading whitespace (incl.
+          // newlines) and returns nullptr when the next token is not a string,
+          // so this folds any run of adjacent literals and is a no-op otherwise.
+          // Strictly additive: adjacent literals previously raised "Expected
+          // closing parenthesis in call args" (e.g. Gemma4's multi-line
+          // raise_exception), so no template that parsed before can change.
+          // Upstream lacks this; re-apply after any minja upgrade. Report at
+          // https://github.com/google/minja .
+          while (auto more = parseString()) {
+            *str += *more;
+          }
+          return std::make_shared<Value>(*str);
+        }
       }
       static std::regex prim_tok(R"(true\b|True\b|false\b|False\b|None\b)");
       auto token = consumeToken(prim_tok);
