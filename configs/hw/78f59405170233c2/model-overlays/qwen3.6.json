@@ -18,6 +18,11 @@
       "value": 20,
       "apply": true,
       "effect": "Thinking-phase top_k 20 (Qwen3 reasoning preset)."
+    },
+    "MIMIRMIND_ENABLE_JINJA": {
+      "value": 1,
+      "apply": true,
+      "effect": "Render chat prompts from the model's own chat_template.jinja via minja instead of the hand-transcribed encodeQwen. Validated 2026-10-01: jinja render == vLLM (HF transformers.apply_chat_template) byte-for-byte on all 6 anchor shapes incl the tools block. Fixes encodeQwen's compact-JSON tools-block drift (t.dump() vs the spaced tojson the model was trained on). Server decides; explicit MIMIRMIND_ENABLE_JINJA env still wins."
     }
   }
 }
