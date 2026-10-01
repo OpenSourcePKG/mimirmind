@@ -52,6 +52,36 @@ using nlohmann::json;
 
 namespace {
 
+/// Resolve the effective enable_thinking for a request. An explicit request
+/// value always wins. When UNSET, the default is thinking-ON for the FIRST-TURN
+/// tool decision (tools offered, tool_choice != "none", and no tool result yet
+/// in the transcript), OFF otherwise.
+///
+/// Why (2026-10-01, measured vs vLLM@nvfp4, same quant + same jinja template):
+/// with thinking forced OFF (the old default) qwen3.6 under-fires tools and
+/// hallucinates — 3/8 on clear weather questions vs vLLM's 7/8. vLLM leaves
+/// thinking ON (its template default) so the model reasons "identify intent ->
+/// call the tool" before deciding. Our engine with enable_thinking=true scores
+/// 8/8. So the regression was NEVER the quant or the prompt (both identical to
+/// vLLM) — it was our thinking-OFF policy suppressing the tool-decision reasoning.
+/// Scope is deliberately the first-turn decision only: tool-LOOP continuations
+/// (a tool result already present) keep the greedy clamp + stay fast, and plain
+/// chat stays thinking-off, so grounded-RAG latency is unaffected (it also sets
+/// enable_thinking:false explicitly, which still wins). Server decides.
+inline bool resolveThinking(const ChatRequest& cr) {
+    if (cr.enableThinking.has_value()) {
+        return *cr.enableThinking;
+    }
+    const bool toolsOffered = !cr.tools.empty() && cr.toolChoice != "none";
+    if (!toolsOffered) {
+        return false;
+    }
+    const bool inToolLoop = std::any_of(
+        cr.messages.begin(), cr.messages.end(),
+        [](const model::ChatMessage& m) { return m.role == model::ChatRole::Tool; });
+    return !inToolLoop;   // reason on the first tool decision, not mid-loop
+}
+
 /// Resolve a model-emitted tool name to an OFFERED tool (8.19.13.1): exact
 /// match first, then case-insensitive (kills `read` vs `Read`, `write` vs
 /// `Write`), then — when exactly one tool is offered — the sole tool (kills a
@@ -306,12 +336,12 @@ bool ChatCompletionHandler::prepareChatRequest(
             const std::string eosText = tok.eosId() >= 0
                 ? std::string{tok.tokenText(tok.eosId())} : std::string{};
             model::chat::JinjaChatTemplate jt(cfg.chatTemplate, bosText, eosText);
-            // Resolve enable_thinking exactly as the hardcoded encoder does
-            // (QwenChatEncoder: value_or(false) — qwen default is thinking OFF)
-            // and pass a CONCRETE value, so the template renders the same
-            // generation-prompt shape (pre-closed <think>\n\n</think>\n\n) rather
-            // than its own unset default (which pre-opens <think>). 8.24.5.
-            const std::optional<bool> effThinking{cr.enableThinking.value_or(false)};
+            // Resolve enable_thinking (resolveThinking: first-turn tool decisions
+            // default thinking-ON for vLLM-parity tool-firing; explicit wins) and
+            // pass a CONCRETE value so the template renders a matching
+            // generation-prompt shape (pre-opened <think> when reasoning, else the
+            // pre-closed <think>\n\n</think>\n\n). 8.24.5 / 2026-10-01 tool-fix.
+            const std::optional<bool> effThinking{resolveThinking(cr)};
             promptIds = jt.encode(tok, msgs, cr.tools,
                                   /*addGenerationPrompt=*/true, effThinking);
             jinjaOk = true;
@@ -326,7 +356,7 @@ bool ChatCompletionHandler::prepareChatRequest(
     if (!jinjaOk) {
         promptIds = model::ChatTemplate::encode(
             style, tok, msgs, /*addGenerationPrompt=*/true, cr.tools,
-            cr.enableThinking, toolFormat,
+            std::optional<bool>{resolveThinking(cr)}, toolFormat,
             cfg.templateUsesThink, cfg.toolDefsStructuredXml);
     }
 
@@ -386,7 +416,7 @@ bool ChatCompletionHandler::prepareChatRequest(
         if (!PromptTrimmer::applyPromptTrim(msgs, promptIds, params.maxNewTokens,
                              targetEngine.maxContextTokens(),
                              targetEngine.config().contextLength,
-                             tok, style, cr.tools, cr.enableThinking,
+                             tok, style, cr.tools, std::optional<bool>{resolveThinking(cr)},
                              toolFormat, targetEngine.config().templateUsesThink,
                              targetEngine.config().toolDefsStructuredXml,
                              report, trimErr)) {
@@ -499,7 +529,7 @@ void ChatCompletionHandler::applySamplingPolicy(
     // anti-loop floor stays active under greedy (8.19.5). Rollback:
     // MIMIRMIND_TOOLLOOP_SAMPLED=1 restores client sampling in tool loops.
     if (!cr.tools.empty() && params.sampling.temperature > 0.0F &&
-        !cr.enableThinking.value_or(false)) {
+        !resolveThinking(cr)) {
         const bool inToolLoop = std::any_of(
             cr.messages.begin(), cr.messages.end(),
             [](const model::ChatMessage& m) {
@@ -526,7 +556,7 @@ void ChatCompletionHandler::applySamplingPolicy(
     // fall back to a GENERIC anti-degeneration sampling (same for every model —
     // any temp>0 escapes the argmax loop; thinking must never be pure argmax).
     // Fills only values the client left open; never lowers a hotter explicit temp.
-    if (cr.enableThinking.value_or(false)) {
+    if (resolveThinking(cr)) {
         const auto& mc = targetEngine.config();
         constexpr float        kGenericEscapeTemp = 0.6F;   // model-agnostic floor
         constexpr float        kGenericEscapeTopP = 0.95F;
@@ -590,7 +620,7 @@ void ChatCompletionHandler::applySamplingPolicy(
         // (the loop-prone regime); any client that already samples is untouched.
         // Skipped for parity teacher-forcing; ops rollback via the env.
         if (floorOn && !teacherForcing && greedy &&
-            !cr.enableThinking.value_or(false) &&
+            !resolveThinking(cr) &&
             mc.samplingTempDefault > 0.0F) {
             // Cap the escape temperature: a checkpoint may declare temp=1.0
             // (qwen3.6), which escapes the loop but adds hedging/noise on factual
@@ -1014,7 +1044,7 @@ void ChatCompletionHandler::handleBlocking(const ChatRequest& cr,
               // enable_thinking:true pre-opens <think>; an unclosed block then
               // means the whole span is reasoning (mirror the streaming cleaner
               // + vLLM), not a content answer.
-              /*thinkPreOpened=*/cr.enableThinking.value_or(false));
+              /*thinkPreOpened=*/resolveThinking(cr));
 
     // M-FunctionCalling: when tools were offered and the model emitted a tool
     // call, surface it as structured tool_calls instead of content. Decode
@@ -1383,7 +1413,7 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
         // Mirror ChatTemplate's thinkOn = enableThinking.value_or(false): the
         // prompt pre-closes the think block whenever thinking is off (default,
         // or explicit false), so the cleaner must start in content mode.
-        /*thinkPreClosed=*/!cr.enableThinking.value_or(false));
+        /*thinkPreClosed=*/!resolveThinking(cr));
     state->promptIds = std::move(promptIds);
     state->stopIds   = std::move(stopIds);
     state->params    = std::move(params);
