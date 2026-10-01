@@ -1542,6 +1542,7 @@ add_executable(mimirmind
     src/server/ToolCallExtractor.cpp
     src/server/ToolCallSalvage.cpp
     src/server/QwenToolParser.cpp
+    src/server/GemmaToolParser.cpp
     src/server/ToolCallParserRegistry.cpp
     src/server/BatcherRunner.cpp
     src/server/LogprobsBuilder.cpp
@@ -1855,6 +1856,7 @@ add_executable(arch_tests
     src/model/Tokenizer.cpp
     src/server/ToolCallExtractor.cpp
     src/server/QwenToolParser.cpp
+    src/server/GemmaToolParser.cpp
     src/server/ToolCallParserRegistry.cpp
     src/runtime/thermal/GpuClockGovernor.cpp
     src/runtime/thermal/PowerMonitor.cpp

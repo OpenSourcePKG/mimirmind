@@ -4,6 +4,7 @@
 #include "server/ToolCallParserRegistry.hpp"
 
 #include "model/ChatTemplate.hpp"
+#include "server/GemmaToolParser.hpp"
 #include "server/QwenToolParser.hpp"
 
 namespace mimirmind::server {
@@ -16,6 +17,7 @@ ToolCallParserRegistry::ToolCallParserRegistry() {
         "qwen3-coder-xml", model::ChatTemplate::ToolFormat::QwenXml));
     _parsers.push_back(std::make_unique<QwenToolParser>(
         "hermes", model::ChatTemplate::ToolFormat::HermesJson));
+    _parsers.push_back(std::make_unique<GemmaToolParser>());
 }
 
 const ToolCallParserRegistry& ToolCallParserRegistry::instance() {

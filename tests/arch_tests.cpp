@@ -20,6 +20,7 @@
 #include "model/Tokenizer.hpp"
 #include "model/ToolCallParser.hpp"
 #include "model/ToolCallStreamDetector.hpp"
+#include "server/GemmaToolParser.hpp"
 #include "server/IToolCallParser.hpp"
 #include "server/QwenToolParser.hpp"
 #include "server/ToolCallParserRegistry.hpp"
@@ -1773,9 +1774,11 @@ TEST(toolparser_registry_hasBuiltins) {
     const auto& reg = ToolCallParserRegistry::instance();
     EXPECT_TRUE(reg.get("qwen3-coder-xml") != nullptr);
     EXPECT_TRUE(reg.get("hermes") != nullptr);
+    EXPECT_TRUE(reg.get("gemma") != nullptr);
     EXPECT_TRUE(reg.get("does-not-exist") == nullptr);
     EXPECT_EQ(reg.get("qwen3-coder-xml")->name(), std::string_view{"qwen3-coder-xml"});
-    EXPECT_TRUE(reg.names().size() >= std::size_t{2});
+    EXPECT_EQ(reg.get("gemma")->name(), std::string_view{"gemma"});
+    EXPECT_TRUE(reg.names().size() >= std::size_t{3});
 }
 
 TEST(toolparser_qwen_xmlDialect_extract) {
@@ -1832,6 +1835,22 @@ TEST(toolparser_qwen_streamingBlock) {
     const auto calls = p.extractBlock(block, kWeatherSpecs, /*bare=*/false);
     EXPECT_EQ(calls.size(), std::size_t{1});
     EXPECT_EQ(calls[0].name, std::string{"get_weather"});
+}
+
+TEST(toolparser_gemma_extract) {
+    using mimirmind::server::GemmaToolParser;
+    GemmaToolParser p;
+    // Gemma 4 DSL: <|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>
+    const std::string block =
+        "<|tool_call>call:get_weather{city:<|\"|>London<|\"|>}<tool_call|>";
+    EXPECT_TRUE(p.matches(block));
+    const auto r = p.extract(block, kWeatherSpecs);
+    EXPECT_EQ(r.calls.size(), std::size_t{1});
+    EXPECT_EQ(r.calls[0].name, std::string{"get_weather"});
+    EXPECT_TRUE(r.calls[0].argumentsJson.find("London") != std::string::npos);
+    EXPECT_TRUE(r.sawToolMarkup);
+    // A Qwen-style block must NOT match the Gemma parser (distinct markers).
+    EXPECT_TRUE(!p.matches("<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"));
 }
 
 int main() {
