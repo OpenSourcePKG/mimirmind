@@ -22,6 +22,7 @@
 #include "model/ToolCallParser.hpp"
 #include "model/ToolCallStreamDetector.hpp"
 #include "model/Tokenizer.hpp"
+#include "model/chat/JinjaChatTemplate.hpp"
 #include "core/log/Log.hpp"
 #include "core/security/ScopedTenant.hpp"
 #include "runtime/CudaContextPoison.hpp"
@@ -282,11 +283,44 @@ bool ChatCompletionHandler::prepareChatRequest(
     const model::ChatTemplate::ToolFormat toolFormat =
         model::ChatTemplate::toolFormatFromArch(
             targetEngine.config().architecture);
-    promptIds = model::ChatTemplate::encode(
-        style, tok, msgs, /*addGenerationPrompt=*/true, cr.tools,
-        cr.enableThinking, toolFormat,
-        targetEngine.config().templateUsesThink,
-        targetEngine.config().toolDefsStructuredXml);
+    // 8.24.4 — opt-in Jinja renderer gate. The SERVER decides (never the
+    // client): per-model LlmConfig.enableJinja, ops override MIMIRMIND_ENABLE_JINJA.
+    // When on AND the model shipped a chat_template, render it via minja;
+    // otherwise (default) — and on any render/parse error — fall back to the
+    // hardcoded per-family encoder, so default behaviour is byte-identical.
+    const model::LlmConfig& cfg = targetEngine.config();
+    const bool useJinja = [&]() {
+        if (const char* e = std::getenv("MIMIRMIND_ENABLE_JINJA")) {
+            return e[0] != '0';           // ops override wins
+        }
+        return cfg.enableJinja;           // per-model default (off)
+    }() && !cfg.chatTemplate.empty();
+
+    bool jinjaOk = false;
+    if (useJinja) {
+        try {
+            const std::string bosText = tok.bosId() >= 0
+                ? std::string{tok.tokenText(tok.bosId())} : std::string{};
+            const std::string eosText = tok.eosId() >= 0
+                ? std::string{tok.tokenText(tok.eosId())} : std::string{};
+            model::chat::JinjaChatTemplate jt(cfg.chatTemplate, bosText, eosText);
+            promptIds = jt.encode(tok, msgs, cr.tools,
+                                  /*addGenerationPrompt=*/true, cr.enableThinking);
+            jinjaOk = true;
+            MM_LOG_INFO("server", "chat prompt via Jinja renderer ({} tokens)",
+                        promptIds.size());
+        } catch (const std::exception& ex) {
+            MM_LOG_WARN("server",
+                        "Jinja chat-template render failed ({}) — falling back "
+                        "to the hardcoded encoder", ex.what());
+        }
+    }
+    if (!jinjaOk) {
+        promptIds = model::ChatTemplate::encode(
+            style, tok, msgs, /*addGenerationPrompt=*/true, cr.tools,
+            cr.enableThinking, toolFormat,
+            cfg.templateUsesThink, cfg.toolDefsStructuredXml);
+    }
 
     // Debug teacher-forcing: append the raw prefill suffix (no BOS, no
     // special tokens) so the engine prefills the whole sequence in one pass.

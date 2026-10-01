@@ -57,6 +57,18 @@ struct LlmConfig {
     // emits a bare ```json/```html body instead of a parseable <tool_call>.
     std::optional<bool> toolDefsStructuredXml{};
 
+    // The model's own Jinja chat_template, stored verbatim for the opt-in
+    // JinjaChatTemplate renderer (8.24): from GGUF `tokenizer.chat_template`
+    // or the HF `chat_template.jinja`. Empty when the model ships none.
+    std::string chatTemplate;
+
+    // Server-decided opt-in for the Jinja renderer (8.24.4). Default OFF ->
+    // behaviour identical to the hardcoded ChatTemplate encoders; the encode
+    // path falls back to them when this is off, the template is empty, or a
+    // render/parse error occurs. Flipped per-model once its prompt-token parity
+    // is proven (8.24.5/8.24.6). Ops override: MIMIRMIND_ENABLE_JINJA.
+    bool enableJinja{false};
+
     // Required — throws if missing from metadata.
     std::uint32_t blockCount        {0};
     std::uint32_t contextLength     {0};

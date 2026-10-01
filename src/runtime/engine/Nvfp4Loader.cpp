@@ -253,6 +253,8 @@ void detectTemplateThinking(model::LlmConfig&            cfg,
     std::stringstream ss;
     ss << f.rdbuf();
     const std::string tpl = ss.str();
+    // 8.24: store the raw template for the opt-in JinjaChatTemplate renderer.
+    cfg.chatTemplate = tpl;
     const bool uses = tpl.find("<think>") != std::string::npos
                       || tpl.find("enable_thinking") != std::string::npos;
     cfg.templateUsesThink = uses;

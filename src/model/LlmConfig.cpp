@@ -59,6 +59,17 @@ void LlmConfig::parseFromGguf(const GgufReader& reader) {
     architecture = *archStr;
     MM_LOG_INFO("config", "architecture = '{}'", architecture);
 
+    // The model's embedded Jinja chat template (8.24). Stored verbatim for the
+    // opt-in JinjaChatTemplate renderer; absent on many GGUFs (empty -> the
+    // hardcoded encoders stay in charge).
+    if (const auto* ctV = reader.findMetadata("tokenizer.chat_template")) {
+        if (auto ct = asString(*ctV)) {
+            chatTemplate = *ct;
+            MM_LOG_INFO("config", "tokenizer.chat_template present ({} chars)",
+                        chatTemplate.size());
+        }
+    }
+
     const std::string& a = architecture;
 
     auto requireU32 = [&](const std::string& suffix) -> std::uint32_t {
