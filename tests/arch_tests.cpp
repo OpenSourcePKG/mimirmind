@@ -20,6 +20,9 @@
 #include "model/Tokenizer.hpp"
 #include "model/ToolCallParser.hpp"
 #include "model/ToolCallStreamDetector.hpp"
+#include "server/IToolCallParser.hpp"
+#include "server/QwenToolParser.hpp"
+#include "server/ToolCallParserRegistry.hpp"
 #include "runtime/thermal/GpuClockGovernor.hpp"
 #include "runtime/Lcp.hpp"
 #include "runtime/thermal/PowerMonitor.hpp"
@@ -1752,6 +1755,83 @@ TEST(tokenizer_splitOnSpecials_noSpecials) {
     const auto segs = Tokenizer::splitOnSpecials("plain text", {});
     EXPECT_EQ(segs.size(), std::size_t{1});
     EXPECT_TRUE(!segs[0].first && segs[0].second == "plain text");
+}
+
+// ---- 8.25.2 — IToolCallParser interface + named registry -------------------
+
+namespace {
+// The offered tool the XML parser needs for parameter-type coercion.
+const std::vector<mimirmind::model::ToolSpec> kWeatherSpecs = {
+    {"get_weather",
+     R"({"type":"function","function":{"name":"get_weather",)"
+     R"("parameters":{"type":"object","properties":{"city":{"type":"string"}},)"
+     R"("required":["city"]}}})"}};
+}  // namespace
+
+TEST(toolparser_registry_hasBuiltins) {
+    using mimirmind::server::ToolCallParserRegistry;
+    const auto& reg = ToolCallParserRegistry::instance();
+    EXPECT_TRUE(reg.get("qwen3-coder-xml") != nullptr);
+    EXPECT_TRUE(reg.get("hermes") != nullptr);
+    EXPECT_TRUE(reg.get("does-not-exist") == nullptr);
+    EXPECT_EQ(reg.get("qwen3-coder-xml")->name(), std::string_view{"qwen3-coder-xml"});
+    EXPECT_TRUE(reg.names().size() >= std::size_t{2});
+}
+
+TEST(toolparser_qwen_xmlDialect_extract) {
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::server::QwenToolParser;
+    QwenToolParser p{"qwen3-coder-xml", ChatTemplate::ToolFormat::QwenXml};
+    const std::string block =
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nLondon\n"
+        "</parameter>\n</function>\n</tool_call>";
+    EXPECT_TRUE(p.matches(block));
+    const auto r = p.extract(block, kWeatherSpecs);
+    EXPECT_EQ(r.calls.size(), std::size_t{1});
+    EXPECT_EQ(r.calls[0].name, std::string{"get_weather"});
+    EXPECT_TRUE(r.calls[0].argumentsJson.find("London") != std::string::npos);
+    EXPECT_TRUE(r.sawToolMarkup);
+}
+
+TEST(toolparser_qwen_hermesDialect_extract) {
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::server::QwenToolParser;
+    // A Hermes-JSON call; the registry's "hermes" parser tries it natively first,
+    // but the ladder also catches it under the XML-native parser (native-first,
+    // then the other dialect) — assert both resolve it.
+    const std::string block =
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": "
+        "{\"city\": \"London\"}}\n</tool_call>";
+    for (auto fmt : {ChatTemplate::ToolFormat::HermesJson,
+                     ChatTemplate::ToolFormat::QwenXml}) {
+        QwenToolParser p{"x", fmt};
+        const auto r = p.extract(block, kWeatherSpecs);
+        EXPECT_EQ(r.calls.size(), std::size_t{1});
+        EXPECT_EQ(r.calls[0].name, std::string{"get_weather"});
+    }
+}
+
+TEST(toolparser_qwen_plainProse_noCalls) {
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::server::QwenToolParser;
+    QwenToolParser p{"qwen3-coder-xml", ChatTemplate::ToolFormat::QwenXml};
+    const std::string prose = "The weather in London is mild and cloudy today.";
+    EXPECT_TRUE(!p.matches(prose));
+    const auto r = p.extract(prose, kWeatherSpecs);
+    EXPECT_EQ(r.calls.size(), std::size_t{0});
+    EXPECT_TRUE(!r.sawToolMarkup);
+}
+
+TEST(toolparser_qwen_streamingBlock) {
+    using mimirmind::model::ChatTemplate;
+    using mimirmind::server::QwenToolParser;
+    QwenToolParser p{"qwen3-coder-xml", ChatTemplate::ToolFormat::QwenXml};
+    const std::string block =
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nLondon\n"
+        "</parameter>\n</function>\n</tool_call>";
+    const auto calls = p.extractBlock(block, kWeatherSpecs, /*bare=*/false);
+    EXPECT_EQ(calls.size(), std::size_t{1});
+    EXPECT_EQ(calls[0].name, std::string{"get_weather"});
 }
 
 int main() {
