@@ -12,7 +12,9 @@
 #include "server/SseEncoder.hpp"
 #include "server/TenantMetrics.hpp"
 #include "server/LogprobsBuilder.hpp"
+#include "server/IToolCallParser.hpp"
 #include "server/ToolCallExtractor.hpp"
+#include "server/ToolCallParserRegistry.hpp"
 
 #include "model/ResponseCleaner.hpp"
 #include "model/ToolCallConstraint.hpp"
@@ -1394,6 +1396,13 @@ void ChatCompletionHandler::handleStream(const ChatRequest& cr,
     state->toolFormat       = model::ChatTemplate::toolFormatFromArch(
         engine.config().architecture);
     state->toolSpecs        = cr.tools;
+    // 8.25.6 — resolve the model's tool-call parser once (server-decided:
+    // config.serve.json tool_call_parser, else auto-detect from arch). nullptr
+    // for styles without a registered parser -> emitToolCallBlock keeps the
+    // legacy extractBlock dispatch. For qwen3.6 this yields QwenToolParser whose
+    // extractBlock is byte-identical to the old extractBlock(QwenChatML, QwenXml).
+    state->toolParser       = ToolCallParserRegistry::instance().resolve(
+        engine.config().toolCallParser, engine.config().architecture);
     state->toolChoice       = cr.toolChoice;
     state->responseFormat   = cr.responseFormat;
     state->jsonSchema       = cr.jsonSchema;
@@ -1454,13 +1463,19 @@ bool ChatCompletionHandler::runStreamSession(
                 // through the name-gated bare parser.
                 const bool bare =
                     block.rfind("<function=", 0) == 0;
-                // 8.30.5 — same block ladder as the blocking path, shared via
-                // ToolCallExtractor::extractBlock (Gemma → parseGemma; bare →
-                // parseQwenXmlBare; else native-first / other / noisy salvage).
+                // 8.25.6 — route the block parse through the server-resolved
+                // parser (registry). QwenToolParser/GemmaToolParser wrap the same
+                // ToolCallExtractor::extractBlock ladder (8.30.5), so this is
+                // byte-identical to the former inline dispatch; it just selects
+                // the parser per-model instead of branching on style/toolFormat
+                // here. nullptr (unmapped style) keeps the legacy dispatch.
                 const std::vector<model::ToolCall> calls =
-                    ToolCallExtractor::extractBlock(
-                        block, state->style, state->toolFormat,
-                        state->toolSpecs, bare);
+                    state->toolParser
+                        ? state->toolParser->extractBlock(
+                              block, state->toolSpecs, bare)
+                        : ToolCallExtractor::extractBlock(
+                              block, state->style, state->toolFormat,
+                              state->toolSpecs, bare);
                 if (calls.empty()) {
                     if (bare) {
                         // The bare capture is speculative (no envelope): a

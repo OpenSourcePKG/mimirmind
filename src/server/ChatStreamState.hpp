@@ -21,6 +21,8 @@ class Tokenizer;
 
 namespace mimirmind::server {
 
+class IToolCallParser;   // 8.25.6 — resolved tool-call parser (registry)
+
 /// Per-stream state for ChatCompletionHandler::handleStream — the whole
 /// SSE-chat state machine in one shared object so the async content-provider
 /// (which may run on a different pool thread and outlives the synchronous part
@@ -62,6 +64,12 @@ struct ChatStreamState {
     model::ChatTemplate::ToolFormat toolFormat{
         model::ChatTemplate::ToolFormat::HermesJson};
     std::vector<model::ToolSpec>  toolSpecs;
+    // 8.25.6 — the server-resolved tool-call parser for this model (registry,
+    // keyed by config.serve.json tool_call_parser + arch auto-detect). nullptr
+    // for styles without a registered parser -> the stream block path keeps the
+    // legacy ToolCallExtractor::extractBlock dispatch. Non-owning: the registry
+    // owns the process-lifetime const instance.
+    const IToolCallParser*        toolParser{nullptr};
     // 8.19.13.3: needed to build the primary-decode grammar constraint with
     // the right root ("required" prefills the opener → body-rooted).
     std::string                   toolChoice;
