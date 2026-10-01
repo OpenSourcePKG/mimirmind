@@ -318,9 +318,12 @@ void Tokenizer::loadFromHfJson(const std::string& checkpointDir) {
             const auto id = a["id"].get<std::int32_t>();
             entries.emplace_back(id, a["content"].get<std::string>());
             maxId = std::max(maxId, id);
-            if (a.value("special", false)) {
-                hfSpecialIds.push_back(id);   // control token → mark type=3 below
-            }
+            // EVERY added_token is matched atomically at encode time (HF/llama.cpp
+            // semantics) — e.g. Qwen's <think>/</think> are added_tokens with
+            // special=false but must still tokenise to their single id, not be
+            // BPE'd. The `special` flag governs only decode-skipping, which here
+            // is id-based (bos/eos/pad), so marking them all control is safe.
+            hfSpecialIds.push_back(id);
         }
     }
     if (maxId < 0) {
@@ -335,9 +338,10 @@ void Tokenizer::loadFromHfJson(const std::string& checkpointDir) {
         _tokens[static_cast<std::size_t>(id)].text = text;  // score=0, type=1
         _byText[text] = id;  // last-write-wins, mirrors the GGUF path
     }
-    // Mark HF special added_tokens as control (type 3) so buildSpecialTexts()
+    // Mark every HF added_token as control (type 3) so buildSpecialTexts()
     // collects them uniformly with the GGUF control/user-defined tokens (the HF
-    // path otherwise leaves every token at type=1).
+    // path otherwise leaves every token at type=1), giving the parse-special
+    // scan the full atomic-match set.
     for (const std::int32_t sid : hfSpecialIds) {
         if (sid >= 0 && static_cast<std::size_t>(sid) < _tokens.size()) {
             _tokens[static_cast<std::size_t>(sid)].type = 3;

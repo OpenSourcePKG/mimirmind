@@ -304,8 +304,14 @@ bool ChatCompletionHandler::prepareChatRequest(
             const std::string eosText = tok.eosId() >= 0
                 ? std::string{tok.tokenText(tok.eosId())} : std::string{};
             model::chat::JinjaChatTemplate jt(cfg.chatTemplate, bosText, eosText);
+            // Resolve enable_thinking exactly as the hardcoded encoder does
+            // (QwenChatEncoder: value_or(false) — qwen default is thinking OFF)
+            // and pass a CONCRETE value, so the template renders the same
+            // generation-prompt shape (pre-closed <think>\n\n</think>\n\n) rather
+            // than its own unset default (which pre-opens <think>). 8.24.5.
+            const std::optional<bool> effThinking{cr.enableThinking.value_or(false)};
             promptIds = jt.encode(tok, msgs, cr.tools,
-                                  /*addGenerationPrompt=*/true, cr.enableThinking);
+                                  /*addGenerationPrompt=*/true, effThinking);
             jinjaOk = true;
             MM_LOG_INFO("server", "chat prompt via Jinja renderer ({} tokens)",
                         promptIds.size());
