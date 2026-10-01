@@ -72,6 +72,10 @@ struct ProbePicks {
     // LlmConfig.honestyFloor); an overlay can re-enable it for a checkpoint that
     // over-confabulates. Applied to LlmConfig.honestyFloor.
     std::optional<bool>  applyHonestyFloor;  // LlmConfig.honestyFloor
+    // Per-(machine, model) opt-in for the Jinja chat-template renderer (8.24.6).
+    // Default OFF (LlmConfig.enableJinja); a profile flips it on once the family
+    // is prompt-token bit-parat (8.24.5). Applied to LlmConfig.enableJinja.
+    std::optional<bool>  applyEnableJinja;    // LlmConfig.enableJinja
 };
 
 /**

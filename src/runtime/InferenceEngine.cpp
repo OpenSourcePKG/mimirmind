@@ -962,6 +962,16 @@ void InferenceEngine::finalizeLoad() {
                 MM_LOG_INFO("probe", "  profile applied: honesty floor -> {}",
                             _config.honestyFloor ? "on" : "off");
             }
+            // Jinja chat-template renderer opt-in (model overlay, 8.24.6). Default
+            // OFF in LlmConfig; a profile flips it on once the family is prompt-
+            // token bit-parat (8.24.5). Explicit MIMIRMIND_ENABLE_JINJA wins
+            // per-process (handled in ChatCompletionHandler).
+            if (picks->applyEnableJinja &&
+                std::getenv("MIMIRMIND_ENABLE_JINJA") == nullptr) {
+                _config.enableJinja = *picks->applyEnableJinja;
+                MM_LOG_INFO("probe", "  profile applied: jinja renderer -> {}",
+                            _config.enableJinja ? "on" : "off");
+            }
         }
     }
 
