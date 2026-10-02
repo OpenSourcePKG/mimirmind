@@ -1224,6 +1224,22 @@ if(MIMIRMIND_ENABLE_CUDA)
         CUDA_STANDARD_REQUIRED ON)
     target_link_libraries(microbench_nvfp4blk PRIVATE CUDA::cudart)
 
+    # microbench_fp8_dense — isolated FP8 (E4M3) dense GEMV at the gdn.proj M=1
+    # shapes (5.18.30.6). Self-contained (kernels in the .cu); measures %roofline
+    # vs the ~38%peak cuBLASLt-FP8 the engine runs today. Real sm_121a SASS so
+    # the FP8 intrinsics lower (compute_121a, like the cutlass-moe target).
+    #   cmake --build build-cudnn --target microbench_fp8_dense &&
+    #   ./build-cudnn/microbench_fp8_dense          # gdn.proj shape sweep
+    add_executable(microbench_fp8_dense
+        tools/microbench/fp8_dense_gemv_bench.cu)
+    set_target_properties(microbench_fp8_dense PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_ARCHITECTURES OFF)
+    target_compile_options(microbench_fp8_dense PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_121a,code=sm_121a>)
+    target_link_libraries(microbench_fp8_dense PRIVATE CUDA::cudart)
+
     # microbench_nvfp4blk_repack — A/B the dense NVFP4 GEMV load pipeline
     # (prod 20-byte in-place vs repacked 16-aligned nibble/scale streams),
     # roadmap 5.18.3(a)/5.18.5. Links the prod kernel as the v0 reference +
