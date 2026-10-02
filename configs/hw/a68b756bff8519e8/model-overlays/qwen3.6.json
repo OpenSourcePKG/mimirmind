@@ -33,6 +33,11 @@
       "value": 1,
       "apply": true,
       "effect": "Route the DECODE MoE expert GEMM through the CUTLASS NVFP4 block-scaled tensor-core grouped kernel (runGroupedNvfp4TcF32Banks, same kernel prefill already uses; mirrors vLLM run_fp4_blockwise_scaled_group_mm_sm120) instead of the hand register-staged m2reg/m4reg path. The TC path also fuses the gather into act-quant and skips the separate scatter. Measured 2026-10-02 on GB10 (A/B, aggregate decode tok/s): conc1 15.1->21.6, conc4 45.5->64.7, conc8 65.3->92.3 = +42% across the real 4-8-user operating point. Reverses the 2026-08-04 GD-c -3.5% verdict (today's fused act-quant 5.18.21 + m4reg baseline flipped it). Coherence goldset (30 prompts, greedy, off vs on): OFF 30/30 == ON 30/30 correct, 0 degradations, 25/30 bit-identical, 5 benign free-form wording drifts. Requires the NVFP4_TC sidecar banks (built when prefill-TC is on). Server decides; explicit env still wins."
+    },
+    "MIMIRMIND_SHEXP_TC_MINM": {
+      "value": 1,
+      "apply": true,
+      "effect": "Lower the shared-expert CUTLASS-TC threshold from 64 to 1 so the shared expert runs on the NVFP4 tensor-core grouped kernel at decode-M too (not just prefill). The M>=64 gate was the stale 'blocked wins at low M' assumption, same as the routed-MoE decode-TC gate that flipped from -3.5% to +42%. Measured 2026-10-02 on GB10 (A/B, aggregate decode tok/s, on top of decode-TC): conc1 18.3->19.9 (+9%), conc4 57.7->62.5 (+8%), conc8 72.4->83.7 (+16%); gain grows with concurrency (shared expert runs over all rows). Coherence goldset: OFF 30/30 == ON 30/30 correct, 0 degradations, 27/30 bit-identical, 3 benign free-form drifts. Needs the binary with the _shexpTcMinM env-gate (committed 2026-10-02). Server decides; explicit env still wins."
     }
   }
 }
