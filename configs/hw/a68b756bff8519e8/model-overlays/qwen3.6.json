@@ -28,6 +28,11 @@
       "value": 1,
       "apply": true,
       "effect": "Fuse the GDN input/output projections into 2 wide FP8 GEMMs instead of 4 narrow ones (removes per-call quant + cuBLASLt overhead). Measured 2026-10-02 on GB10: gdn.proj 12.8->9.0 ms/step, single-stream decode 16.5->17.5 tok/s (+6%). Coherence goldset (30 prompts, greedy, off vs on): OFF 30/30 == ON 30/30 correct, 0 degradations, only benign wording-drift on 3 free-form prompts (fused per-tensor E4M3 scale, not bit-identical). Server decides; explicit env still wins."
+    },
+    "MIMIRMIND_GROUPED_MOE_DECODE_TC": {
+      "value": 1,
+      "apply": true,
+      "effect": "Route the DECODE MoE expert GEMM through the CUTLASS NVFP4 block-scaled tensor-core grouped kernel (runGroupedNvfp4TcF32Banks, same kernel prefill already uses; mirrors vLLM run_fp4_blockwise_scaled_group_mm_sm120) instead of the hand register-staged m2reg/m4reg path. The TC path also fuses the gather into act-quant and skips the separate scatter. Measured 2026-10-02 on GB10 (A/B, aggregate decode tok/s): conc1 15.1->21.6, conc4 45.5->64.7, conc8 65.3->92.3 = +42% across the real 4-8-user operating point. Reverses the 2026-08-04 GD-c -3.5% verdict (today's fused act-quant 5.18.21 + m4reg baseline flipped it). Coherence goldset (30 prompts, greedy, off vs on): OFF 30/30 == ON 30/30 correct, 0 degradations, 25/30 bit-identical, 5 benign free-form wording drifts. Requires the NVFP4_TC sidecar banks (built when prefill-TC is on). Server decides; explicit env still wins."
     }
   }
 }
