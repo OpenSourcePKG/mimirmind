@@ -49,6 +49,8 @@ void parseFlagsBlock(const nlohmann::json& flags, ProbePicks& picks) {
     if (auto v = readFlag("MIMIRMIND_ATTN_CUDNN_PAGED"))  picks.applyAttnCudnnPaged = v;
     if (auto v = readFlag("MIMIRMIND_MOE_SILU_FUSE"))     picks.applyMoeSiluFuse = v;
     if (auto v = readFlag("MIMIRMIND_GDN_PROJ_FUSE_BATCH")) picks.applyGdnProjFuseBatch = v;
+    if (auto v = readFlag("MIMIRMIND_GROUPED_MOE_DECODE_TC")) picks.applyGroupedMoeDecodeTc = v;
+    if (auto v = readIntFlag("MIMIRMIND_SHEXP_TC_MINM"))   picks.applyShexpTcMinM = v;
     if (auto v = readIntFlag("MIMIRMIND_MOE_DECODE_REG")) picks.applyMoeDecodeReg = v;
     if (auto v = readIntFlag("MIMIRMIND_GROUPED_MOE"))    picks.applyGroupedMoe = v;
     if (auto v = readIntFlag("MIMIRMIND_PREFILL_CHUNK"))  picks.applyPrefillChunk = v;
@@ -185,6 +187,8 @@ void mergeOverlay(ProbePicks& base, const ProbePicks& over) {
     if (over.applyGroupedMoe)       base.applyGroupedMoe       = over.applyGroupedMoe;
     if (over.applyPrefillChunk)     base.applyPrefillChunk     = over.applyPrefillChunk;
     if (over.applyGdnProjFuseBatch) base.applyGdnProjFuseBatch = over.applyGdnProjFuseBatch;
+    if (over.applyGroupedMoeDecodeTc) base.applyGroupedMoeDecodeTc = over.applyGroupedMoeDecodeTc;
+    if (over.applyShexpTcMinM)      base.applyShexpTcMinM      = over.applyShexpTcMinM;
     if (over.applyAnswerFloorTempCap)
         base.applyAnswerFloorTempCap = over.applyAnswerFloorTempCap;
     if (over.applyThinkingTemp) base.applyThinkingTemp = over.applyThinkingTemp;

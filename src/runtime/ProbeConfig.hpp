@@ -56,6 +56,8 @@ struct ProbePicks {
     std::optional<int> applyGroupedMoe;
     std::optional<int> applyPrefillChunk;   // MIMIRMIND_PREFILL_CHUNK (tokens)
     std::optional<bool> applyGdnProjFuseBatch;  // MIMIRMIND_GDN_PROJ_FUSE_BATCH
+    std::optional<bool> applyGroupedMoeDecodeTc; // MIMIRMIND_GROUPED_MOE_DECODE_TC
+    std::optional<int>  applyShexpTcMinM;        // MIMIRMIND_SHEXP_TC_MINM
     // Answer-floor temperature-lift cap for this (machine, model). 0 = keep a
     // greedy answer greedy (penalties carry loop-protection); >0 = re-enable the
     // lift capped here for a checkpoint that loops under penalties alone. Lives in

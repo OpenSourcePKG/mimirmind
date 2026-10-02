@@ -916,6 +916,25 @@ void InferenceEngine::finalizeLoad() {
                 MM_LOG_INFO("probe", "  profile applied: GDN proj fuse (batch) -> {}",
                             *picks->applyGdnProjFuseBatch ? "on" : "off");
             }
+            // 5.18.30: route the decode MoE expert GEMM through CUTLASS NVFP4-TC
+            // (vs hand m2reg/m4reg). Backend reads it via getenv at ctor; explicit
+            // env wins. +42% decode conc1/4/8, coherence goldset ship-safe.
+            if (picks->applyGroupedMoeDecodeTc &&
+                std::getenv("MIMIRMIND_GROUPED_MOE_DECODE_TC") == nullptr) {
+                ::setenv("MIMIRMIND_GROUPED_MOE_DECODE_TC",
+                         *picks->applyGroupedMoeDecodeTc ? "1" : "0", 1);
+                MM_LOG_INFO("probe", "  profile applied: grouped-MoE decode TC -> {}",
+                            *picks->applyGroupedMoeDecodeTc ? "on" : "off");
+            }
+            // 5.18.30: shared-expert CUTLASS-TC threshold (decode-M when lowered).
+            // Backend reads it via getenv at ctor; explicit env wins. +8-16% decode.
+            if (picks->applyShexpTcMinM &&
+                std::getenv("MIMIRMIND_SHEXP_TC_MINM") == nullptr) {
+                const std::string m = std::to_string(*picks->applyShexpTcMinM);
+                ::setenv("MIMIRMIND_SHEXP_TC_MINM", m.c_str(), 1);
+                MM_LOG_INFO("probe",
+                            "  profile applied: shexp TC min-M -> {}", m);
+            }
             // Answer-floor temperature-lift cap (model overlay). Applied to the
             // per-model LlmConfig — NOT a process env — so co-resident models each
             // keep their own value; explicit MIMIRMIND_ANSWER_FLOOR_TEMP_CAP still
