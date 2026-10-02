@@ -432,6 +432,12 @@ protected:
     // measured stage-R prefill bottleneck). Default-on; only fires when the
     // loader built the shexp TC sidecars. MIMIRMIND_SHEXP_TC=0 rolls back.
     bool _shexpTc{true};
+    // Min M (rows) at which the shared expert takes the CUTLASS NVFP4-TC grouped
+    // path instead of the blocked kernel. Default 64 (the old prefill crossover,
+    // same rationale as the routed-MoE decode-TC gate that flipped from -3.5% to
+    // +42% once the engine matured). MIMIRMIND_SHEXP_TC_MINM lowers it (e.g. 1)
+    // to put the shared expert on TC at decode-M too.
+    std::size_t _shexpTcMinM{64};
     // 5.21.7: route the F32 paged serving-prefill attention through cuDNN SDPA
     // (gather paged KV -> contiguous -> cuDNN flash) instead of the CUDA-core
     // paged-causal kernel. Default OFF; opt-in MIMIRMIND_ATTN_CUDNN_PAGED=1.

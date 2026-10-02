@@ -41,7 +41,8 @@ namespace {
 // Below it (decode, small chunks) the blocked kGemmMaxM=16 kernel wins on
 // launch overhead; the TC path only pays off once the M/16 weight re-reads it
 // avoids dominate. Matches the routed-MoE "prefill takes TC" M>=64 crossover.
-constexpr std::size_t kShexpTcMinM = 64;
+// The threshold is now the runtime member _shexpTcMinM (default 64, env
+// MIMIRMIND_SHEXP_TC_MINM) so decode-M shexp-TC can be measured/enabled.
 
 // Block geometry (elements, bytes) for an expert weight type. NVFP4_BLK is a
 // runtime-only blocked format (32-element super-blocks of 20 bytes) not in the
@@ -129,6 +130,12 @@ Qwen3_5MoeBackend::Qwen3_5MoeBackend(const model::LlmConfig&       config,
     }
     if (const char* st = std::getenv("MIMIRMIND_SHEXP_TC")) {
         _shexpTc = !(st[0] == '0' && st[1] == '\0');
+    }
+    if (const char* sm = std::getenv("MIMIRMIND_SHEXP_TC_MINM")) {
+        const long v = std::strtol(sm, nullptr, 10);
+        if (v >= 1) {
+            _shexpTcMinM = static_cast<std::size_t>(v);
+        }
     }
     // 5.21.7: cuDNN-SDPA paged serving-prefill attention (gather paged KV ->
     // cuDNN). Default OFF; opt-in via MIMIRMIND_ATTN_CUDNN_PAGED=1. Only engages
@@ -678,7 +685,7 @@ void Qwen3_5MoeBackend::runMoeFfn(std::size_t   blockIdx,
             _ops.xQuantI8Async(gateOutBuf, xq, xs, 1, n_ff_shexp);
             _gmm.matmulDp4aAsync(downShexp.type, xq, xs, downShexp.usmPtr,
                                  d_model, n_ff_shexp, 1, expertOutBuf);
-        } else if (_shexpTc && T >= kShexpTcMinM &&
+        } else if (_shexpTc && T >= _shexpTcMinM &&
                    _ops.moeGroupedGemmNvfp4TcAvailable() &&
                    gateShexp.tcNibblePtr != nullptr &&
                    upShexp->tcNibblePtr  != nullptr &&
@@ -942,7 +949,7 @@ void Qwen3_5MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
                 "unexpected shape");
         }
 
-        if (_shexpTc && nSeq >= kShexpTcMinM &&
+        if (_shexpTc && nSeq >= _shexpTcMinM &&
             _ops.moeGroupedGemmNvfp4TcAvailable() &&
             gateShexp.tcNibblePtr != nullptr &&
             upShexp->tcNibblePtr  != nullptr &&
@@ -1541,7 +1548,7 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
                 "unexpected shape");
         }
         float* const expertOutBuf = s.expertOutBuf.as<float>();
-        if (_shexpTc && nSeq >= kShexpTcMinM &&
+        if (_shexpTc && nSeq >= _shexpTcMinM &&
             _ops.moeGroupedGemmNvfp4TcAvailable() &&
             gateShexp.tcNibblePtr != nullptr &&
             upShexp->tcNibblePtr  != nullptr &&
