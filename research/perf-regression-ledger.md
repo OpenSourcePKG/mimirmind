@@ -535,3 +535,64 @@ a checkpoint that over-confabulates.
 (all carry a system prompt or tools → floor never applied, byte-identical). The
 tradeoff (more confabulation on ungrounded long-tail facts) is accepted and
 matches the vLLM oracle; the real remedy is the (now-fixed) search tool path.
+
+---
+
+## 2026-10-02 — Decode-gap campaign (5.18.30): flip matmul stages onto CUTLASS-TC
+
+**Change (qwen3.6, GB10, serving decode):** route the DECODE MoE expert GEMM AND
+the shared expert through the existing CUTLASS NVFP4 block-scaled tensor-core
+grouped kernel (the one prefill already used; mirrors vLLM's
+run_fp4_blockwise_scaled_group_mm), instead of the hand register-staged
+m2reg/m4reg + blocked paths. Two overlay flags, no new kernel:
+- `MIMIRMIND_GROUPED_MOE_DECODE_TC=1` — routed-expert GEMM on CUTLASS-TC (also
+  fuses the gather into act-quant + skips the separate scatter).
+- `MIMIRMIND_SHEXP_TC_MINM=1` — lower the shared-expert CUTLASS-TC threshold from
+  64 to 1 so it takes TC at decode-M too (`_shexpTcMinM` env-gate, commit b29b65a).
+
+**Why:** the single-stream decode gap vs vLLM (re-measured 2026-10-01) is kernel-
+compute, not CUDA-graph (graph is +3% for us — we're launch-lean). The stages ran
+on hand CUDA-core paths gated off at low M on a stale "blocked wins at low M"
+assumption — the same assumption behind the 2026-08-04 GD-c -3.5% verdict, which
+today's engine (fused act-quant 5.18.21 + m4reg baseline + device-driven grouping)
+flipped positive.
+
+**Measured (server decode-prof, cudaEvent, 32-step avg, overlay-only vs forced-off):**
+- moe.gemm 14.8 -> 5.30 ms/step (-64% on that stage; now <= vLLM's marlin 6.2 ms)
+- moe.shexp 9.37 -> 8.03 ms/step
+- total decode step 49.1 -> 43.2 ms/step (-12%)
+Per-stage is the RELIABLE number; HTTP conc throughput was too noisy to A/B cleanly
+this session (box in a low-power platform state ~11-22 W under load vs ~38 W
+healthy, SM 2405 MHz, throttle-flags 0x0 -> lesson_spark_power_mode_throttle, host
+power-mode reset = user action). The earlier "+42%" conc8 A/B was run-variance
+inflated; the durable per-step win is ~12%.
+
+**Also tested + REJECTED (no-go, measured):** marlin WNA16 port (moe.gemm already
+<= vLLM after decode-TC), CUDA-graph (neutral), router F32->TC (rt.gemm 5.9 ms was
+a profiler artifact, no-op), FP8-vec gdn.proj (microbench 74-89% peak vs cuBLASLt
+38%, but NO in-engine win -> d2e not serving-predictive; reverted, kept the
+microbench_fp8_dense tool). gdn.proj stays on cuBLASLt-FP8 (9.3 ms).
+
+**DEPLOY-CORRECTNESS BUG (fixed, important):** the two overlay flags were first
+"shipped" by adding them to the qwen3.6 overlay JSON with apply:true — but they
+were NOT applied: `ProbeConfig::mergeOverlay` copies ProbePicks fields over->base
+only for KNOWN fields, and these two were never wired. For hours prod ran only the
+GDN-fuse (+6%), not decode-TC/shexp, despite the "shipped live" claim (the A/Bs
+used explicit container env, so they were valid, just never applied in the
+restarted prod). FIX: wire a ProbeConfig overlay flag at FOUR points — ProbeConfig.hpp
+(ProbePicks field), parseFlagsBlock (readFlag), **mergeOverlay (copy over->base,
+the easily-missed one)**, InferenceEngine (setenv before backend ctor). Verified
+post-fix: boot log "profile applied: grouped-MoE decode TC -> on" + "shexp TC
+min-M -> 1", moe.gemm 5.30 ms via overlay-only.
+
+**Quality / regression watch:** coherence goldsets (30 prompts, greedy, off vs on)
+SHIP-SAFE for both flags (OFF 30/30 == ON 30/30, 0 degradations, benign free-form
+wording drift only — the TC path uses a fused per-tensor E4M3 scale, not
+bit-identical). Live verify: goldset 30/30, tool-fire/no-fire correct; multi-chat
+8/8 + 16/16 distinct concurrent chats each correct (no cross-talk). Prefill /
+agentic / needle flows unaffected (the flags only touch the decode MoE path).
+
+**Files:** configs/hw/{78f59405170233c2,a68b756bff8519e8}/model-overlays/qwen3.6.json,
+src/runtime/arch/Qwen3_5Backend.hpp + Qwen3_5MoeBackend.cpp (shexp env-gate),
+src/runtime/ProbeConfig.{hpp,cpp} + InferenceEngine.cpp (overlay wiring fix),
+tools/microbench/fp8_dense_gemv_bench.cu (de-risk tool). Commits local (user pushes).
