@@ -27,6 +27,7 @@
 #include "runtime/audio/AudioEngine.hpp"
 #include "runtime/audio/SpeakEngine.hpp"
 #include "runtime/encoder/DecideEngine.hpp"
+#include "runtime/encoder/laya/LayaSystemOne.hpp"
 #include "runtime/encoder/EmbedEngine.hpp"
 #include "runtime/encoder/RerankEngine.hpp"
 #include "runtime/nvfp4/ModelFormatResolver.hpp"
@@ -726,6 +727,34 @@ void ServerBootstrap::loadModels(LoadedModels&                 out,
                 out.ownedDeciders.push_back(std::move(de));
             } catch (const std::exception& x) {
                 std::cerr << "serve: decide model '" << m.id
+                          << "' load failed: " << x.what() << "\n";
+                out.exitCode = 2;
+                return;
+            }
+            continue;
+        }
+
+        // SystemOne models (8.27): native Laya ModernBERT backbone + decision
+        // head + tokenizer behind /v1/systemone.
+        if (m.task == ::mimirmind::core::config::ModelTask::SystemOne) {
+            try {
+                out.ownedSystemOneStacks.push_back(
+                    ::mimirmind::runtime::makeComputeStack(cfg, engineKind));
+                auto& stk = out.ownedSystemOneStacks.back();
+                auto so = std::make_unique<
+                    ::mimirmind::runtime::encoder::laya::LayaSystemOne>(
+                    *stk.ops, *stk.matmul);
+                so->load(m.path, ::mimirmind::core::gguf::GgmlType::F32, /*nHeadLayers=*/2);
+                ::mimirmind::server::LoadedSystemOne ls{};
+                ls.id     = m.id;
+                ls.title  = m.title;
+                ls.engine = so.get();
+                MM_LOG_INFO("main",
+                            "serve: loaded systemone model '{}' (id='{}')", m.path, m.id);
+                out.loadedSystemOnes.push_back(std::move(ls));
+                out.ownedSystemOnes.push_back(std::move(so));
+            } catch (const std::exception& x) {
+                std::cerr << "serve: systemone model '" << m.id
                           << "' load failed: " << x.what() << "\n";
                 out.exitCode = 2;
                 return;

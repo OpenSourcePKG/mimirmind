@@ -126,6 +126,8 @@ public:
     void geluMulAsync(float* gate, const float* up, std::size_t n) override;
 
     void geluErfAsync(float* x, std::size_t n) override;
+    void geluErfMulAsync(float* gate, const float* up, std::size_t n) override;
+    void reluAsync(float* x, std::size_t n) override;
 
     void tanhInPlaceAsync(float* x, std::size_t n) override;
 
@@ -451,6 +453,10 @@ public:
                                std::size_t T, std::size_t nHeads,
                                std::size_t nKvHeads, std::size_t headDim,
                                float scale, float* out) override;
+    void attentionEncoderWindowedAsync(const float* q, const float* k, const float* v,
+                                       std::size_t T, std::size_t nHeads,
+                                       std::size_t nKvHeads, std::size_t headDim,
+                                       float scale, std::size_t window, float* out) override;
 
     // Track runtime.maxContextTokens so the cuDNN SDPA prefill graphs cover the
     // full prefill length instead of falling back to the slow hand kernel above

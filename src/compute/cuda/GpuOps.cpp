@@ -165,6 +165,10 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _geluMulKernel;
     core::cuda::CudaModule _geluErfModule;
     core::cuda::CudaKernel _geluErfKernel;
+    core::cuda::CudaModule _geluErfMulModule;
+    core::cuda::CudaKernel _geluErfMulKernel;
+    core::cuda::CudaModule _reluModule;
+    core::cuda::CudaKernel _reluKernel;
     core::cuda::CudaModule _encoderEmbedAddModule;
     core::cuda::CudaKernel _encoderEmbedAddKernel;
     core::cuda::CudaModule _tanhModule;
@@ -193,6 +197,8 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _attentionKernel;
     core::cuda::CudaModule _attentionEncoderModule;
     core::cuda::CudaKernel _attentionEncoderKernel;
+    core::cuda::CudaModule _attentionEncoderWindowedModule;
+    core::cuda::CudaKernel _attentionEncoderWindowedKernel;
     core::cuda::CudaModule _attentionEncoderBatchedModule;
     core::cuda::CudaKernel _attentionEncoderBatchedKernel;
     core::cuda::CudaModule _attentionFp16Module;
@@ -463,6 +469,10 @@ struct GpuOps::Impl {
           _geluMulKernel           {_geluMulModule.getFunction("gelu_mul")},
           _geluErfModule           {loadCudaModule(ctx, "gelu_erf")},
           _geluErfKernel           {_geluErfModule.getFunction("gelu_erf")},
+          _geluErfMulModule        {loadCudaModule(ctx, "gelu_erf_mul")},
+          _geluErfMulKernel        {_geluErfMulModule.getFunction("gelu_erf_mul")},
+          _reluModule              {loadCudaModule(ctx, "relu")},
+          _reluKernel              {_reluModule.getFunction("relu")},
           _encoderEmbedAddModule   {loadCudaModule(ctx, "encoder_embed_add")},
           _encoderEmbedAddKernel   {_encoderEmbedAddModule.getFunction("encoder_embed_add")},
           _tanhModule              {loadCudaModule(ctx, "tanh_inplace")},
@@ -492,6 +502,8 @@ struct GpuOps::Impl {
           _attentionKernel         {_attentionModule.getFunction("attention")},
           _attentionEncoderModule  {loadCudaModule(ctx, "attention_encoder")},
           _attentionEncoderKernel  {_attentionEncoderModule.getFunction("attention_encoder")},
+          _attentionEncoderWindowedModule {loadCudaModule(ctx, "attention_encoder_windowed")},
+          _attentionEncoderWindowedKernel {_attentionEncoderWindowedModule.getFunction("attention_encoder_windowed")},
           _attentionEncoderBatchedModule {loadCudaModule(ctx, "attention_encoder_batched")},
           _attentionEncoderBatchedKernel {_attentionEncoderBatchedModule.getFunction("attention_encoder_batched")},
           _attentionFp16Module     {loadCudaModule(ctx, "attention_fp16")},
@@ -1573,6 +1585,33 @@ void GpuOps::geluMulAsync(float* gate, const float* up, std::size_t n) {
     k.setPtr  (0, gate);
     k.setPtr  (1, up);
     k.setValue(2, ni);
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::geluErfMulAsync(float* gate, const float* up, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "geluErfMul n");
+    auto& k = _pimpl->_geluErfMulKernel;
+    k.setPtr  (0, gate);
+    k.setPtr  (1, up);
+    k.setValue(2, ni);
+    k.launch(_ctx.stream(),
+             groupsForN(n, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::reluAsync(float* x, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::int32_t ni = toInt32(n, "relu n");
+    auto& k = _pimpl->_reluKernel;
+    k.setPtr  (0, x);
+    k.setValue(1, ni);
     k.launch(_ctx.stream(),
              groupsForN(n, kElementwiseLocalSize), 1, 1,
              kElementwiseLocalSize, 1, 1);
@@ -3458,6 +3497,33 @@ void GpuOps::attentionEncoderAsync(const float* q, const float* k,
     kernel.setValue(7, toInt32(headDim,  "attnEnc headDim"));
     kernel.setValue(8, scale);
     // One workgroup per (head, query-position); every query sees all keys.
+    kernel.launch(_ctx.stream(),
+                  static_cast<std::uint32_t>(nHeads),
+                  static_cast<std::uint32_t>(T),
+                  1,
+                  kAttentionLocalSize, 1, 1);
+}
+
+void GpuOps::attentionEncoderWindowedAsync(const float* q, const float* k,
+                                           const float* v, std::size_t T,
+                                           std::size_t nHeads, std::size_t nKvHeads,
+                                           std::size_t headDim, float scale,
+                                           std::size_t window, float* out) {
+    if (T == 0 || nHeads == 0) {
+        return;
+    }
+    auto& kernel = _pimpl->_attentionEncoderWindowedKernel;
+    kernel.setPtr  (0, q);
+    kernel.setPtr  (1, k);
+    kernel.setPtr  (2, v);
+    kernel.setPtr  (3, out);
+    kernel.setValue(4, toInt32(T,        "attnEncWin T_k"));
+    kernel.setValue(5, toInt32(nHeads,   "attnEncWin nHeads"));
+    kernel.setValue(6, toInt32(nKvHeads, "attnEncWin nKvHeads"));
+    kernel.setValue(7, toInt32(headDim,  "attnEncWin headDim"));
+    kernel.setValue(8, scale);
+    kernel.setValue(9, toInt32(window,   "attnEncWin window"));
+    // One workgroup per (head, query-position); each query sees keys |kk-pq|<=window.
     kernel.launch(_ctx.stream(),
                   static_cast<std::uint32_t>(nHeads),
                   static_cast<std::uint32_t>(T),

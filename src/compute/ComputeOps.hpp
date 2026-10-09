@@ -183,6 +183,22 @@ public:
             "geluErfAsync: not supported on this backend");
     }
 
+    // GLU with EXACT (erf) GELU, in place on `gate`: gate[i] =
+    // gelu_erf(gate[i]) * up[i]. ModernBERT (Laya) GeGLU uses erf, not the
+    // tanh approximation of geluMulAsync. Default-throws (encoder/ModernBERT
+    // backends implement it).
+    virtual void geluErfMulAsync(float* /*gate*/, const float* /*up*/,
+                                 std::size_t /*n*/) {
+        throw std::runtime_error(
+            "geluErfMulAsync: not supported on this backend");
+    }
+
+    // In-place ReLU: x[i] = max(x[i], 0). FFN activation of the standard torch
+    // TransformerEncoderLayer (Laya decision-head layers). Default-throws.
+    virtual void reluAsync(float* /*x*/, std::size_t /*n*/) {
+        throw std::runtime_error("reluAsync: not supported on this backend");
+    }
+
     // In-place tanh — RoBERTa/XLM-R classifier head activation (EncoderRunner
     // reranker: dense -> tanh -> out_proj). Default-throws (encoder-only).
     virtual void tanhInPlaceAsync(float* /*x*/, std::size_t /*n*/) {
@@ -1035,6 +1051,20 @@ public:
                                        float* /*out*/) {
         throw std::runtime_error(
             "attentionEncoderAsync: not supported on this backend");
+    }
+
+    // Local (sliding-window) non-causal encoder attention: query pq attends to
+    // keys kk with |kk-pq| <= window (ModernBERT sliding_attention layers,
+    // window = local_attention/2). window==0 would attend to all keys. Same
+    // layout/GQA as attentionEncoderAsync. Default-throws.
+    virtual void attentionEncoderWindowedAsync(const float* /*q*/, const float* /*k*/,
+                                               const float* /*v*/, std::size_t /*T*/,
+                                               std::size_t /*nHeads*/,
+                                               std::size_t /*nKvHeads*/,
+                                               std::size_t /*headDim*/, float /*scale*/,
+                                               std::size_t /*window*/, float* /*out*/) {
+        throw std::runtime_error(
+            "attentionEncoderWindowedAsync: not supported on this backend");
     }
 
     // Non-causal cross attention with distinct query / key-value lengths.

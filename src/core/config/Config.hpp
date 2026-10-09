@@ -60,7 +60,7 @@ enum class ModelFormat { Auto, Gguf, Nvfp4 };
  * no classifier head) behind /v1/embeddings — CLS-pooled, L2-normalized vector
  * per input text.
  */
-enum class ModelTask { Chat, Rerank, Embed, Transcribe, Speak, Decide };
+enum class ModelTask { Chat, Rerank, Embed, Transcribe, Speak, Decide, SystemOne };
 
 /// Parse a `task` string ("chat"|"rerank"|"embed"|"transcribe"|"speak") or
 /// nullopt.

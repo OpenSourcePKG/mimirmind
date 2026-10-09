@@ -29,6 +29,9 @@ class RerankEngine;
 class EmbedEngine;
 class DecideEngine;
 } // namespace mimirmind::runtime::encoder
+namespace mimirmind::runtime::encoder::laya {
+class LayaSystemOne;
+} // namespace mimirmind::runtime::encoder::laya
 
 namespace mimirmind::runtime::audio {
 class AudioEngine;
@@ -40,6 +43,7 @@ struct LoadedEngine;
 struct LoadedReranker;
 struct LoadedEmbedder;
 struct LoadedDecider;
+struct LoadedSystemOne;
 struct LoadedTranscriber;
 struct LoadedSpeaker;
 struct ServerConfig;
@@ -162,6 +166,9 @@ public:
         std::vector<runtime::ComputeStack>                           ownedDecideStacks;
         std::vector<std::unique_ptr<runtime::encoder::DecideEngine>> ownedDeciders;
         std::vector<server::LoadedDecider>                           loadedDeciders;
+        std::vector<runtime::ComputeStack>                               ownedSystemOneStacks;
+        std::vector<std::unique_ptr<runtime::encoder::laya::LayaSystemOne>> ownedSystemOnes;
+        std::vector<server::LoadedSystemOne>                             loadedSystemOnes;
         std::vector<runtime::ComputeStack>                           ownedTranscribeStacks;
         std::vector<std::unique_ptr<runtime::audio::AudioEngine>>    ownedTranscribers;
         std::vector<server::LoadedTranscriber>                       loadedTranscribers;

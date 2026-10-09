@@ -31,6 +31,7 @@
 #include "runtime/encoder/RerankEngine.hpp"
 #include "runtime/encoder/EmbedEngine.hpp"
 #include "runtime/encoder/DecideEngine.hpp"
+#include "runtime/encoder/laya/LayaSystemOne.hpp"
 #include "runtime/audio/AudioEngine.hpp"
 #include "runtime/audio/SpeakEngine.hpp"
 #include "runtime/serving/ContinuousBatcher.hpp"
@@ -499,7 +500,10 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
         return *models.exitCode;
     }
 
-    if (models.ownedEngines.empty()) {
+    if (models.ownedEngines.empty() && models.loadedRerankers.empty() &&
+        models.loadedEmbedders.empty() && models.loadedDeciders.empty() &&
+        models.loadedSystemOnes.empty() && models.loadedTranscribers.empty() &&
+        models.loadedSpeakers.empty()) {
         std::cerr << "serve: no model with loadOnStart:true in config.json — "
                      "nothing to serve\n";
         return 2;
@@ -637,7 +641,8 @@ int runServe(const CliArgs& args, const ::mimirmind::core::config::Config& cfg) 
                                           std::move(models.loadedEmbedders),
                                           std::move(models.loadedTranscribers),
                                           std::move(models.loadedSpeakers),
-                                          std::move(models.loadedDeciders)};
+                                          std::move(models.loadedDeciders),
+                                          std::move(models.loadedSystemOnes)};
 
     g_runningServer.store(&server, std::memory_order_release);
     std::signal(SIGINT,  signalStop);

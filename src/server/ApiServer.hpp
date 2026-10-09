@@ -27,6 +27,9 @@ class RerankEngine;
 class EmbedEngine;
 class DecideEngine;
 }
+namespace mimirmind::runtime::encoder::laya {
+class LayaSystemOne;
+}
 namespace mimirmind::runtime::audio {
 class AudioEngine;
 class SpeakEngine;
@@ -86,6 +89,19 @@ struct LoadedDecider {
     std::string                     id;
     std::string                     title;
     runtime::encoder::DecideEngine* engine{nullptr};
+};
+
+/**
+ * One loaded native Laya typed-decision model exposed under /v1/systemone
+ * (8.27). `engine` is non-owning — ServeMode keeps the LayaSystemOne (ModernBERT
+ * backbone + decision head + tokenizer + its compute stack) alive for the
+ * process lifetime. Each entry gets its own serialisation mutex inside
+ * SystemOneHandler.
+ */
+struct LoadedSystemOne {
+    std::string                            id;
+    std::string                            title;
+    runtime::encoder::laya::LayaSystemOne* engine{nullptr};
 };
 
 /**
@@ -244,7 +260,8 @@ public:
               std::vector<LoadedEmbedder>     embedders = {},
               std::vector<LoadedTranscriber>  transcribers = {},
               std::vector<LoadedSpeaker>      speakers = {},
-              std::vector<LoadedDecider>      deciders = {});
+              std::vector<LoadedDecider>      deciders = {},
+              std::vector<LoadedSystemOne>    systemOnes = {});
     ~ApiServer();
 
     ApiServer(const ApiServer&)            = delete;

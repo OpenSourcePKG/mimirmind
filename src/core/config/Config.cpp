@@ -214,6 +214,7 @@ std::optional<ModelTask> modelTaskFromString(std::string_view s) noexcept {
     if (s == "transcribe") return ModelTask::Transcribe;
     if (s == "speak")      return ModelTask::Speak;
     if (s == "decide")     return ModelTask::Decide;
+    if (s == "systemone")  return ModelTask::SystemOne;
     return std::nullopt;
 }
 
@@ -224,6 +225,7 @@ std::string_view modelTaskName(ModelTask t) noexcept {
         case ModelTask::Transcribe: return "transcribe";
         case ModelTask::Speak:      return "speak";
         case ModelTask::Decide:     return "decide";
+        case ModelTask::SystemOne:  return "systemone";
         case ModelTask::Chat:
         default:                    return "chat";
     }
@@ -275,7 +277,7 @@ ModelEntry parseModel(std::string_view      path,
         if (!t.has_value()) {
             fail(path, section +
                  ".task must be one of \"chat\", \"rerank\", \"embed\", "
-                 "\"transcribe\", \"speak\", \"decide\"");
+                 "\"transcribe\", \"speak\", \"decide\", \"systemone\"");
         }
         m.task = *t;
     }

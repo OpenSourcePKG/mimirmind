@@ -7,6 +7,7 @@
 #include "server/ChatCompletionHandler.hpp"
 #include "server/RerankHandler.hpp"
 #include "server/DecideHandler.hpp"
+#include "server/SystemOneHandler.hpp"
 #include "server/EmbeddingsHandler.hpp"
 #include "server/TranscriptionsHandler.hpp"
 #include "server/SpeechHandler.hpp"
@@ -144,13 +145,18 @@ struct ApiServer::Impl {
     // task=speak is configured.
     SpeechHandler                         speechHandler;
 
+    // POST /v1/systemone — native Laya typed-decision model(s). Empty when no
+    // model with task=systemone is configured.
+    SystemOneHandler                      systemOneHandler;
+
     Impl(std::vector<LoadedEngine> in, ServerConfig c,
          runtime::Drafter*         drafter,
          std::vector<LoadedReranker> rerankers,
          std::vector<LoadedEmbedder> embedders,
          std::vector<LoadedTranscriber> transcribers,
          std::vector<LoadedSpeaker> speakers,
-         std::vector<LoadedDecider> deciders)
+         std::vector<LoadedDecider> deciders,
+         std::vector<LoadedSystemOne> systemOnes)
         : dispatcher{std::move(in), c.modelId, drafter,
                      c.speculativeTargetId, c.speculative},
           engine{dispatcher.defaultEnginePtr()},
@@ -162,7 +168,8 @@ struct ApiServer::Impl {
           embeddingsHandler{std::move(embedders), cfg},
           decideHandler{std::move(deciders), cfg},
           transcriptionsHandler{std::move(transcribers), cfg},
-          speechHandler{std::move(speakers), cfg} {
+          speechHandler{std::move(speakers), cfg},
+          systemOneHandler{std::move(systemOnes), cfg} {
         // M-Munin.3 (full): when a provider is set, ServeMode keeps the
         // default model eager (so `engine`/thermal/batcher/spec-dec above
         // all have their usual concrete anchor) and only registers
@@ -464,6 +471,17 @@ struct ApiServer::Impl {
                         decideHandler.handle(req, res);
                     });
 
+        server->Post("/v1/systemone",
+                    [this](const httplib::Request& req,
+                           httplib::Response&       res) {
+                        MM_LOG_INFO(
+                            "server",
+                            "POST /v1/systemone accepted from {} "
+                            "(content-length={} B)",
+                            req.remote_addr, req.body.size());
+                        systemOneHandler.handle(req, res);
+                    });
+
         // 8.23 head push — admin-only: the offline trainer POSTs a finished
         // head (JSON spec + inline weight/bias) and the DecideEngine persists +
         // hot-reloads it, so a new head goes live without a serve restart.
@@ -618,6 +636,16 @@ struct ApiServer::Impl {
                 {"task",     "decide"},
             });
         }
+        for (const auto& m : systemOneHandler.listModels()) {
+            data.push_back(json{
+                {"id",       m.id},
+                {"title",    m.title},
+                {"object",   "model"},
+                {"created",  0},
+                {"owned_by", "mimirmind"},
+                {"task",     "systemone"},
+            });
+        }
         for (const auto& m : transcriptionsHandler.listModels()) {
             data.push_back(json{
                 {"id",       m.id},
@@ -698,14 +726,16 @@ ApiServer::ApiServer(std::vector<LoadedEngine>       engines,
                      std::vector<LoadedEmbedder>     embedders,
                      std::vector<LoadedTranscriber>  transcribers,
                      std::vector<LoadedSpeaker>      speakers,
-                     std::vector<LoadedDecider>      deciders)
+                     std::vector<LoadedDecider>      deciders,
+                     std::vector<LoadedSystemOne>    systemOnes)
     : _impl{std::make_unique<Impl>(std::move(engines),
                                    std::move(cfg), drafter,
                                    std::move(rerankers),
                                    std::move(embedders),
                                    std::move(transcribers),
                                    std::move(speakers),
-                                   std::move(deciders))} {}
+                                   std::move(deciders),
+                                   std::move(systemOnes))} {}
 
 ApiServer::~ApiServer() = default;
 

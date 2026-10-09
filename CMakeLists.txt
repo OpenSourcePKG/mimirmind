@@ -430,6 +430,12 @@ add_library(mimirmind_core_common STATIC
     src/runtime/audio/AudioEngine.cpp
     src/runtime/encoder/EncoderModel.cpp
     src/runtime/encoder/EncoderRunner.cpp
+    src/runtime/encoder/laya/LayaTokenizer.cpp
+    src/runtime/encoder/laya/LayaEncoderModel.cpp
+    src/runtime/encoder/laya/LayaEncoderRunner.cpp
+    src/runtime/encoder/laya/LayaDecisionHead.cpp
+    src/runtime/encoder/laya/LayaDecisionRunner.cpp
+    src/runtime/encoder/laya/LayaSystemOne.cpp
     src/runtime/encoder/RerankEngine.cpp
     src/runtime/encoder/EmbedEngine.cpp
     src/runtime/encoder/DecisionHead.cpp
@@ -917,6 +923,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/add_rmsnorm.cu
         kernels/cuda/llm/attention.cu
         kernels/cuda/llm/attention_encoder.cu
+        kernels/cuda/llm/attention_encoder_windowed.cu
         kernels/cuda/llm/attention_encoder_batched.cu
         kernels/cuda/llm/attention_flash_merge.cu
         kernels/cuda/llm/attention_flash_partial.cu
@@ -1025,6 +1032,8 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/common/scaled_add_residual.cu
         kernels/cuda/common/gelu_mul.cu
         kernels/cuda/common/gelu_erf.cu
+        kernels/cuda/common/gelu_erf_mul.cu
+        kernels/cuda/common/relu.cu
         kernels/cuda/common/encoder_embed_add.cu
         kernels/cuda/common/tanh_inplace.cu
         kernels/cuda/common/silu_mul.cu
@@ -1565,6 +1574,7 @@ add_executable(mimirmind
     src/server/RerankHandler.cpp
     src/server/EmbeddingsHandler.cpp
     src/server/DecideHandler.cpp
+    src/server/SystemOneHandler.cpp
     src/server/TranscriptionsHandler.cpp
     src/server/SpeechHandler.cpp
     src/server/ChatRequestParser.cpp
@@ -3363,6 +3373,127 @@ if(MIMIRMIND_ENABLE_CUDA)
     add_dependencies(cuda_parity_tests cuda_kernels)
     target_include_directories(cuda_parity_tests PRIVATE tests)
     target_link_libraries(cuda_parity_tests PRIVATE mimirmind_core_cuda)
+endif()
+
+# ---- laya_parity — native ModernBERT (Laya) backbone parity harness (8.27.2) -
+#
+# Runs LayaEncoderModel/LayaEncoderRunner on fixed token ids and prints the
+# mean-pooled embedding, to diff against the upstream python ModernBERT ref.
+# Box-only (CUDA device). LayaEncoderModel/Runner come from mimirmind_core_cuda;
+# the explicit compute sources mirror cuda_parity_tests' link closure.
+#   docker run --rm --gpus all -v /opt/mimirmind:/src -w /src mimirmind:builder-cuda \
+#     bash -lc "cmake --build build-cudnn -j16 --target laya_parity"
+#   ./build-cudnn/laya_parity <model_dir> [ids_file]
+if(MIMIRMIND_ENABLE_CUDA)
+    add_executable(laya_parity
+        tools/laya_parity.cpp
+        src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/CudaMoeGroupedOps.cpp
+        src/compute/cuda/CudaPagedAttentionOps.cpp
+        src/compute/cuda/MoeTopKRouteDevice.cpp
+        src/compute/cuda/GpuMatmul.cpp
+        src/compute/GatedDeltaNet.cpp
+        src/compute/Rope.cpp
+        src/compute/Norm.cpp
+        src/compute/Activations.cpp
+        src/compute/Attention.cpp
+        src/compute/Embedding.cpp
+        src/compute/Matmul.cpp
+        src/compute/Dequant.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q4_0.cpp
+        src/compute/quant/Q4_1.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q5_1.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
+    )
+    add_dependencies(laya_parity cuda_kernels)
+    target_link_libraries(laya_parity PRIVATE mimirmind_core_cuda)
+endif()
+
+# ---- laya_decide_parity — Laya decision-head parity harness (8.27.3) --------
+if(MIMIRMIND_ENABLE_CUDA)
+    add_executable(laya_decide_parity
+        tools/laya_decide_parity.cpp
+        src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/CudaMoeGroupedOps.cpp
+        src/compute/cuda/CudaPagedAttentionOps.cpp
+        src/compute/cuda/MoeTopKRouteDevice.cpp
+        src/compute/cuda/GpuMatmul.cpp
+        src/compute/GatedDeltaNet.cpp
+        src/compute/Rope.cpp
+        src/compute/Norm.cpp
+        src/compute/Activations.cpp
+        src/compute/Attention.cpp
+        src/compute/Embedding.cpp
+        src/compute/Matmul.cpp
+        src/compute/Dequant.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q4_0.cpp
+        src/compute/quant/Q4_1.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q5_1.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
+    )
+    add_dependencies(laya_decide_parity cuda_kernels)
+    target_link_libraries(laya_decide_parity PRIVATE mimirmind_core_cuda)
+endif()
+
+# ---- laya_tok_parity — native LayaTokenizer parity harness (8.27.4) ---------
+# Pure CPU (no CUDA used); links mimirmind_core_cuda only for LayaTokenizer +
+# nlohmann/include resolution.
+if(MIMIRMIND_ENABLE_CUDA)
+    add_executable(laya_tok_parity tools/laya_tok_parity.cpp)
+    target_link_libraries(laya_tok_parity PRIVATE mimirmind_core_cuda)
+endif()
+
+# ---- laya_systemone_parity — end-to-end Laya decision parity (8.27.4) --------
+if(MIMIRMIND_ENABLE_CUDA)
+    add_executable(laya_systemone_parity
+        tools/laya_systemone_parity.cpp
+        src/compute/cuda/GpuOps.cpp
+        src/compute/cuda/CudaMoeGroupedOps.cpp
+        src/compute/cuda/CudaPagedAttentionOps.cpp
+        src/compute/cuda/MoeTopKRouteDevice.cpp
+        src/compute/cuda/GpuMatmul.cpp
+        src/compute/GatedDeltaNet.cpp
+        src/compute/Rope.cpp
+        src/compute/Norm.cpp
+        src/compute/Activations.cpp
+        src/compute/Attention.cpp
+        src/compute/Embedding.cpp
+        src/compute/Matmul.cpp
+        src/compute/Dequant.cpp
+        src/compute/QuantTypeRegistry.cpp
+        src/compute/quant/Bfloat16.cpp
+        src/compute/quant/Float16.cpp
+        src/compute/quant/Float32.cpp
+        src/compute/quant/Q3K.cpp
+        src/compute/quant/Q4K.cpp
+        src/compute/quant/Q5K.cpp
+        src/compute/quant/Q4_0.cpp
+        src/compute/quant/Q4_1.cpp
+        src/compute/quant/Q5_0.cpp
+        src/compute/quant/Q5_1.cpp
+        src/compute/quant/Q6K.cpp
+        src/compute/quant/Q8_0.cpp
+    )
+    add_dependencies(laya_systemone_parity cuda_kernels)
+    target_link_libraries(laya_systemone_parity PRIVATE mimirmind_core_cuda)
 endif()
 
 # ---- cudnn_sdpa_parity — cuDNN 9 SDPA (D256 GQA causal prefill) parity/latency
