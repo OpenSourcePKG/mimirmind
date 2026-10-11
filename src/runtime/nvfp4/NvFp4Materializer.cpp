@@ -112,6 +112,21 @@ executeMaterialization(const std::vector<mo::MaterializationStep>& steps,
                     ops.dequantFp8PerChannel(w.devPtr, ws.devPtr, s.rows, s.in, dst);
                     break;
                 }
+                case mo::SourceKind::Fp8Block128: {
+                    // DeepSeek-V3 / Kolibri-1 block-scaled FP8: `<base>.
+                    // weight_scale_inv` is an F32 grid of one scale per 128x128
+                    // weight tile, shape [ceil(rows/128), ceil(in/128)].
+                    const std::string sName = s.blockScaleInvName.empty()
+                        ? (base + ".weight_scale_inv") : s.blockScaleInvName;
+                    const NvFp4DeviceTensor& sc = require(src, sName);
+                    if (sc.dtype != safetensors::SafetensorsDtype::F32) {
+                        fail("block-128 FP8 scale '" + sName + "' is not F32 (the "
+                             "dequant kernel reads an F32 tile-scale grid); got "
+                             "dtype " + std::string{safetensors::dtypeName(sc.dtype)});
+                    }
+                    ops.dequantFp8Block128(w.devPtr, sc.devPtr, s.rows, s.in, dst);
+                    break;
+                }
                 case mo::SourceKind::Bf16Copy: {
                     // Already-BF16 matmul weight, kept BF16 (no widen). Reads a
                     // slice at `srcElemOffset` — used to split the MTP fused

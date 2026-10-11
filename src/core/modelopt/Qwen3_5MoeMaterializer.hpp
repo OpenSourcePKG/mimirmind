@@ -24,6 +24,10 @@ enum class SourceKind : std::uint8_t {
                      ///< -> BF16. The compressed-tensors FP8 layout (dense
                      ///< qwen3_5): one scale per output row, `<base>.weight_scale`
                      ///< is `[out, 1]` BF16, NOT the per-tensor F32 scalar of Fp8.
+    Fp8Block128,     ///< dequant F8_E4M3 + a per-(128x128)-tile F32 scale grid
+                     ///< `<base>.weight_scale_inv` [ceil(out/128), ceil(in/128)]
+                     ///< -> BF16. The DeepSeek-V3 / Kolibri-1 block-scaled FP8
+                     ///< layout (`weight_block_size [128,128]`).
     Bf16Passthrough, ///< already BF16 (norms, router, embed, conv1d, ssm gates) -> WIDEN to F32
     Bf16Copy         ///< already BF16 matmul weight -> BF16 verbatim (no widen); reads a
                      ///< `srcElemOffset`-based slice of the source (MTP fused/stacked experts)
@@ -59,6 +63,9 @@ struct MaterializationSource {
     /// the packed tensor itself being `.weight_packed`).
     std::string blockScaleName;      ///< NVFP4 per-16 block scale (F8_E4M3)
     std::string globalScaleName;     ///< NVFP4 per-tensor global scale (F32)
+    /// Fp8Block128 per-(128x128)-tile scale grid name. Empty ⇒ the executor
+    /// reconstructs `<base>.weight_scale_inv` from the weight base.
+    std::string blockScaleInvName;
     /// compressed-tensors stores the global scale as its reciprocal
     /// (6*448/amax); the dequant kernel MULTIPLIES by the global, so the
     /// executor inverts it first when set. ModelOpt stores it directly (false).

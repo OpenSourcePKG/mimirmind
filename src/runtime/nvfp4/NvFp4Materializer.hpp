@@ -51,6 +51,14 @@ struct MaterializerDeviceOps {
                                       std::uint64_t rows, std::uint64_t in,
                                       void* dstBf16) = 0;
 
+    /// F8_E4M3 weight [rows*in] + a per-(128x128)-tile F32 scale grid
+    /// `scaleInvF32` [ceil(rows/128)*ceil(in/128)] (row-major) -> BF16 [rows*in]
+    /// at dst. The DeepSeek-V3 / Kolibri-1 block-scaled FP8 layout
+    /// (`<base>.weight_scale_inv`, `weight_block_size [128,128]`).
+    virtual void dequantFp8Block128(const void* weight, const void* scaleInvF32,
+                                    std::uint64_t rows, std::uint64_t in,
+                                    void* dstBf16) = 0;
+
     /// Device-to-device copy of already-BF16 bytes (passthrough tensors).
     virtual void copyBytes(void* dst, const void* src, std::size_t bytes) = 0;
 
