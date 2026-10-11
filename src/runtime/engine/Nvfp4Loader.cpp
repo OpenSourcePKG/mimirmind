@@ -20,6 +20,7 @@
 #include "core/safetensors/SafetensorsModel.hpp"
 #include "runtime/nvfp4/ComputeOpsUploader.hpp"
 #include "runtime/nvfp4/Gemma4Config.hpp"
+#include "runtime/nvfp4/Kolibri1Config.hpp"
 #include "runtime/nvfp4/NvFp4WeightsMap.hpp"
 #include "runtime/nvfp4/Qwen3_5MoeConfig.hpp"
 
@@ -1388,6 +1389,20 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
     if (isGemma4Config(configText)) {
         loadGemma4(e, dir, configText, checkpointDir, tokenizerGguf, attachedSm);
         return;
+    }
+
+    // 5.34 Kolibri-1 (Aleph-Alpha `kolibri1`): pure-attention SWA+full GQA MoE.
+    // I-1 seam — parse the config into the runtime model config (so arch params
+    // + the arch id that selects Kolibri1Backend are live), then stop: the FP8
+    // 128x128 block weight materialise (5.34.4 / I-3) and the forward (5.34.5 /
+    // 5.34.6) are not implemented yet.
+    if (runtime::nvfp4::isKolibri1Config(configText)) {
+        e._config = runtime::nvfp4::parseKolibri1SafetensorsConfig(configText);
+        throw std::runtime_error(
+            "kolibri1 loader: config parsed (" + std::to_string(e._config.blockCount)
+            + " layers, " + std::to_string(e._config.expertCount)
+            + " experts), but FP8 128x128 block weight materialise is not yet "
+              "implemented (roadmap 5.34.4 / I-3)");
     }
 
     // 1. Arch params from config.json (GGUF-metadata parse is GGUF-only).

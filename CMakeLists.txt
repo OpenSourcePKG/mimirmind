@@ -417,6 +417,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/nvfp4/PleNgramTable.cpp
     src/runtime/nvfp4/Qwen3_5MoeConfig.cpp
     src/runtime/nvfp4/Gemma4Config.cpp
+    src/runtime/nvfp4/Kolibri1Config.cpp
     src/runtime/nvfp4/ModelFormatResolver.cpp
     src/compute/dsp/MelSpectrogram.cpp
     src/runtime/audio/WhisperModel.cpp
@@ -1555,6 +1556,7 @@ add_executable(mimirmind
     src/runtime/arch/Gemma4DenseBackend.cpp
     src/runtime/arch/Gemma4E4BBackend.cpp
     src/runtime/arch/Gemma4MoeBackend.cpp
+    src/runtime/arch/Kolibri1Backend.cpp
     src/runtime/arch/Qwen2Backend.cpp
     src/runtime/arch/Qwen3_5Backend.cpp
     src/runtime/arch/Qwen3_5DenseBackend.cpp

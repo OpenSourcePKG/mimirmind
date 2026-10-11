@@ -5,6 +5,7 @@
 
 #include "model/LlmConfig.hpp"   // config.expertCount — pick dense vs MoE qwen3_5
 #include "runtime/arch/Gemma4Backend.hpp"
+#include "runtime/arch/Kolibri1Backend.hpp"
 #include "runtime/arch/Qwen2Backend.hpp"
 #include "runtime/arch/Qwen3_5DenseBackend.hpp"
 #include "runtime/arch/Qwen3_5MoeBackend.hpp"
@@ -60,6 +61,15 @@ createArchBackend(const std::string&             architecture,
                                                  ops, gmm, opProfiler,
                                                  moeGroupEnabled,
                                                  moeFusedDownEnabled);
+    }
+    // 5.34 kolibri1 (Aleph-Alpha Kolibri-1): pure-attention SWA+full GQA MoE.
+    // I-1 seam — selected here; the forward (attention 5.34.5 / MoE 5.34.6)
+    // throws until implemented.
+    if (architecture == "kolibri1") {
+        return std::make_unique<Kolibri1Backend>(config, weights, fusedQkv,
+                                                  ops, gmm, opProfiler,
+                                                  moeGroupEnabled,
+                                                  moeFusedDownEnabled);
     }
     return nullptr;
 }

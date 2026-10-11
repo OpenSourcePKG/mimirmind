@@ -251,7 +251,7 @@ private:
 isSupportedArchitecture(std::string_view architecture) noexcept {
     return architecture == "qwen2" || architecture == "llama" ||
            architecture == "gemma4" || architecture == "qwen35moe" ||
-           architecture == "qwen4_exp";
+           architecture == "qwen4_exp" || architecture == "kolibri1";
 }
 
 /// Build the backend matching `architecture` ("qwen2" / "gemma4"). Returns
