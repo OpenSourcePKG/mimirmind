@@ -74,6 +74,13 @@ ChatTemplate::detectFromArch(std::string_view architecture) {
     if (arch.rfind("qwen", 0) == 0) {
         return Style::QwenChatML;
     }
+    // Kolibri-1 (Aleph-Alpha) ships a ChatML (<|im_start|>/<|im_end|>) template.
+    // The hardcoded ChatML encoder is the fallback for the serving path; the
+    // model's own jinja template (tokenizer_config.json) is preferred when the
+    // Jinja renderer is enabled and cfg.chatTemplate is populated.
+    if (arch == "kolibri1") {
+        return Style::QwenChatML;
+    }
     // Gemma 2 and Gemma 3 share <start_of_turn>/<end_of_turn> — they
     // also share the role/role naming. Gemma 2 GGUFs report arch
     // "gemma2"; Gemma 3 reports "gemma3".

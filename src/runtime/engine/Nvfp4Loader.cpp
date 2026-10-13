@@ -487,15 +487,36 @@ void Nvfp4Loader::loadKolibri1(InferenceEngine&                     e,
                                                deferExperts);
     cudaCtx.stream().synchronize();
 
-    // 6. Stream the deferred routed experts into stacked blocked-FP8 banks.
-    buildMoeExpertBanksFp8Block128(e, steps, cudaCtx, devOps);
+    // 6. Stream the deferred routed experts into stacked expert banks. The
+    //    checkpoint decides the bank type per the plan's expert source kind:
+    //    Nvfp4 (I-9 offline requant, 5.34.10) -> FP4-TC banks via the shared
+    //    buildMoeExpertBanks; Fp8Block128 (the native FP8 baseline) -> blocked
+    //    FP8 banks. A mixed checkpoint (NVFP4 routed experts, FP8 shared/attn)
+    //    is fine — the shared expert and attention stay on their FP8/BF16 path.
+    const bool expertsNvfp4 = [&steps] {
+        for (const auto& st : steps) {
+            if (st.ggufName.find(".ffn_gate_exps.weight") != std::string::npos) {
+                return !st.sources.empty()
+                    && st.sources.front().kind
+                           == core::modelopt::SourceKind::Nvfp4;
+            }
+        }
+        return false;
+    }();
+    if (expertsNvfp4) {
+        buildMoeExpertBanks(e, steps, cudaCtx, devOps);
+    } else {
+        buildMoeExpertBanksFp8Block128(e, steps, cudaCtx, devOps);
+    }
 
-    // 6b. Survivor check: every deferred expert must now hold an FP8 bank.
+    // 6b. Survivor check: every deferred expert must now hold a real bank
+    //     (FP8 blocked, or an NVFP4-TC / NVFP4-blk bank from buildMoeExpertBanks).
     for (const auto& t : e._materializedBf16) {
-        if (deferExperts(t.ggufName) && t.buffer.bytes() == 0 && !t.isFp8) {
+        if (deferExperts(t.ggufName) && t.buffer.bytes() == 0
+            && !t.isFp8 && !t.isNvfp4Tc && !t.isNvfp4Blk) {
             throw std::runtime_error(
                 "Nvfp4Loader: deferred Kolibri-1 expert '" + t.ggufName +
-                "' was not repacked to an FP8 bank (empty buffer)");
+                "' was not repacked to a bank (empty buffer)");
         }
     }
 

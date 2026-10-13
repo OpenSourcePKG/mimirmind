@@ -883,7 +883,7 @@ void ServerBootstrap::loadModels(LoadedModels&                 out,
 
         const auto& arch = e->config().architecture;
         if (arch != "qwen2" && arch != "llama" && arch != "gemma4" &&
-            arch != "qwen35moe" && arch != "qwen4_exp") {
+            arch != "qwen35moe" && arch != "qwen4_exp" && arch != "kolibri1") {
             const std::string msg =
                 "serve: architecture '" + arch + "' (model id '" + m.id +
                 "') is not implemented yet. See "

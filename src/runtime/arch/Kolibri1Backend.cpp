@@ -6,6 +6,7 @@
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
 #include "core/gguf/WeightsMap.hpp"
+#include "core/modelopt/BlockScaleSwizzle.hpp"
 #include "core/log/Log.hpp"
 #include "model/LlmConfig.hpp"
 #include "runtime/BlockBuffers.hpp"
@@ -219,31 +220,62 @@ void Kolibri1Backend::runKolibriMoe(std::size_t blockIdx, const float* din,
         }
     }
 
-    // --- routed experts (sequential per-token FP8 GEMV) ------------------
-    // Per-expert byte strides for the stacked FP8_E4M3 32-block banks
-    // (34 B / 32 elems). gate/up: [nFfExp, d_model]; down: [d_model, nFfExp].
-    constexpr std::size_t kBlkElems = 32, kBlkBytes = 34;
-    const std::size_t bytesGU   = (nFfExp * d_model / kBlkElems) * kBlkBytes;
-    const std::size_t bytesDown = (d_model * nFfExp / kBlkElems) * kBlkBytes;
-    const auto* const gateBase = static_cast<const std::uint8_t*>(gExps.usmPtr);
-    const auto* const upBase   = static_cast<const std::uint8_t*>(uExps.usmPtr);
-    const auto* const downBase = static_cast<const std::uint8_t*>(dExps.usmPtr);
-
     _ops.mulScalarAsync(moeAccum, 0.0F, T * d_model);
-    for (std::size_t t = 0; t < T; ++t) {
-        const float* const xt     = din      + t * d_model;
-        float* const       accumT = moeAccum + t * d_model;
-        for (std::size_t k = 0; k < K; ++k) {
-            const std::size_t e  = static_cast<std::size_t>(_selIdx[t * K + k]);
-            const float       wk = _selW[t * K + k];
-            const void* Wg = gateBase + e * bytesGU;
-            const void* Wu = upBase   + e * bytesGU;
-            const void* Wd = downBase + e * bytesDown;
-            _gmm.matmulAsync(gExps.type, Wg, nFfExp, d_model, xt, 1, gateOut, scratch);
-            _gmm.matmulAsync(uExps.type, Wu, nFfExp, d_model, xt, 1, upOut,   scratch);
-            _ops.siluMulAsync(gateOut, upOut, nFfExp);          // silu(gate)*up
-            _gmm.matmulAsync(dExps.type, Wd, d_model, nFfExp, gateOut, 1, expertOut, scratch);
-            _ops.scaledAddResidualAsync(accumT, expertOut, wk, d_model);
+
+    if (gExps.type == core::gguf::GgmlType::NVFP4_TC) {
+        // --- routed experts, FP4-tensor-core fused-K (I-9 / 5.34.10) --------
+        // One launch each for gate+up and down over all T rows x K experts,
+        // instead of the T*K*3 per-token GEMVs below. The host sigmoid-top6
+        // selection (above) is kept (Kolibri's select-on-bias routing is
+        // bespoke); its indices/weights ride the per-token USM slots the
+        // batched TC kernels read on the stream. moeGateCompact holds the
+        // [T*K, nFfExp] silu(gate)*up activation the down kernel consumes.
+        namespace mo = core::modelopt;
+        float* const gateActAll = buffers.moeGateCompact.as<float>();
+        auto* const  expIdx     = buffers.moePrefillExpIdx.as<std::int32_t>();
+        auto* const  kwDev      = buffers.moePrefillKw.as<float>();
+        for (std::size_t i = 0; i < T * K; ++i) {
+            expIdx[i] = _selIdx[i];
+            kwDev[i]  = _selW[i];
+        }
+        const std::size_t sfbGu = mo::moeSwizzledScaleStride(nFfExp, d_model / 16);
+        const std::size_t sfbDn = mo::moeSwizzledScaleStride(d_model, nFfExp / 16);
+        _gmm.moeGateUpFusedKTcBatchedAsync(
+            din, gExps.tcNibblePtr, uExps.tcNibblePtr,
+            gExps.tcSfbPtr, uExps.tcSfbPtr,
+            static_cast<const float*>(gExps.tcGlobalsPtr),
+            static_cast<const float*>(uExps.tcGlobalsPtr),
+            expIdx, gateActAll, T, d_model, nFfExp, K, sfbGu);
+        _gmm.moeDownFusedKTcBatchedAsync(
+            gateActAll, dExps.tcNibblePtr, dExps.tcSfbPtr,
+            static_cast<const float*>(dExps.tcGlobalsPtr),
+            expIdx, kwDev, moeAccum, T, nFfExp, d_model, K, sfbDn);
+    } else {
+        // --- routed experts (sequential per-token FP8 GEMV) ----------------
+        // Per-expert byte strides for the stacked FP8_E4M3 32-block banks
+        // (34 B / 32 elems). gate/up: [nFfExp, d_model]; down: [d_model, nFfExp].
+        constexpr std::size_t kBlkElems = 32, kBlkBytes = 34;
+        const std::size_t bytesGU   = (nFfExp * d_model / kBlkElems) * kBlkBytes;
+        const std::size_t bytesDown = (d_model * nFfExp / kBlkElems) * kBlkBytes;
+        const auto* const gateBase = static_cast<const std::uint8_t*>(gExps.usmPtr);
+        const auto* const upBase   = static_cast<const std::uint8_t*>(uExps.usmPtr);
+        const auto* const downBase = static_cast<const std::uint8_t*>(dExps.usmPtr);
+
+        for (std::size_t t = 0; t < T; ++t) {
+            const float* const xt     = din      + t * d_model;
+            float* const       accumT = moeAccum + t * d_model;
+            for (std::size_t k = 0; k < K; ++k) {
+                const std::size_t e  = static_cast<std::size_t>(_selIdx[t * K + k]);
+                const float       wk = _selW[t * K + k];
+                const void* Wg = gateBase + e * bytesGU;
+                const void* Wu = upBase   + e * bytesGU;
+                const void* Wd = downBase + e * bytesDown;
+                _gmm.matmulAsync(gExps.type, Wg, nFfExp, d_model, xt, 1, gateOut, scratch);
+                _gmm.matmulAsync(uExps.type, Wu, nFfExp, d_model, xt, 1, upOut,   scratch);
+                _ops.siluMulAsync(gateOut, upOut, nFfExp);          // silu(gate)*up
+                _gmm.matmulAsync(dExps.type, Wd, d_model, nFfExp, gateOut, 1, expertOut, scratch);
+                _ops.scaledAddResidualAsync(accumT, expertOut, wk, d_model);
+            }
         }
     }
 

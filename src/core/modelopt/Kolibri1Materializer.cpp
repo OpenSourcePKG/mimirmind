@@ -61,9 +61,25 @@ bool hasBlockScaleInv(const st::SafetensorsModel& m, const std::string& weightNa
     return m.find(base + ".weight_scale_inv") != nullptr;
 }
 
-/// Resolve one HF `.weight` to a source descriptor (kind + rows/in). Fp8Block128
-/// when a `.weight_scale_inv` sibling is present (rows=shape[0], in=shape[1],
-/// unpacked — F8 is one byte/elem), else an unquantised BF16 passthrough.
+/// A routed expert that has been offline NVFP4-requanted (I-9 / 5.34.10) carries
+/// the ModelOpt W4A16 layout: a U8 packed `.weight` [out, in/2] plus a sibling
+/// per-tensor F32 global `<base>.weight_scale_2` (and the per-group-16 F8 block
+/// scale `<base>.weight_scale`). The checkpoint stays mixed — only the routed
+/// experts are NVFP4; the shared expert, attention and lm_head keep their
+/// FP8-128block / bf16 form — so classification is per-tensor by checkpoint
+/// truth, exactly like hasBlockScaleInv.
+bool hasNvfp4Sidecar(const st::SafetensorsModel& m, const std::string& weightName) {
+    if (!endsWith(weightName, ".weight")) {
+        return false;
+    }
+    const std::string base = weightName.substr(0, weightName.size() - 7);
+    return m.find(base + ".weight_scale_2") != nullptr;
+}
+
+/// Resolve one HF `.weight` to a source descriptor (kind + rows/in). Nvfp4 when a
+/// `.weight_scale_2` sibling is present (U8 packed: in = 2*shape[1] logical),
+/// Fp8Block128 when a `.weight_scale_inv` sibling is present (rows=shape[0],
+/// in=shape[1], unpacked F8), else an unquantised BF16 passthrough.
 MaterializationSource sourceFor(const st::SafetensorsModel& model,
                                 const std::string&          hfWeightName,
                                 std::uint64_t               dstElemOffset) {
@@ -71,7 +87,17 @@ MaterializationSource sourceFor(const st::SafetensorsModel& model,
     MaterializationSource s;
     s.hfWeightName  = hfWeightName;
     s.dstElemOffset = dstElemOffset;
-    if (hasBlockScaleInv(model, hfWeightName)) {
+    if (hasNvfp4Sidecar(model, hfWeightName)) {
+        if (w.shape.size() != 2) {
+            fail("NVFP4 tensor '" + hfWeightName + "' is not 2-D");
+        }
+        // The buildMoeExpertBanks consumer reconstructs the `.weight_scale` /
+        // `.weight_scale_2` sidecars from the base (the qwen/ModelOpt tails), so
+        // no explicit blockScaleName/globalScaleName override is needed here.
+        s.kind = SourceKind::Nvfp4;
+        s.rows = w.shape[0];        // out features
+        s.in   = w.shape[1] * 2;    // LOGICAL in features (U8 packs 2 nibbles/byte)
+    } else if (hasBlockScaleInv(model, hfWeightName)) {
         if (w.shape.size() != 2) {
             fail("block-128 FP8 tensor '" + hfWeightName + "' is not 2-D");
         }
@@ -126,9 +152,9 @@ void addStacked(std::vector<MaterializationStep>& steps,
         const std::string hf =
             hfPrefix + std::to_string(e) + "." + projSuffix + ".weight";
         MaterializationSource src = sourceFor(model, hf, 0);
-        if (src.kind != SourceKind::Fp8Block128) {
-            fail("routed expert '" + hf + "' is not block-128 FP8 (no "
-                 "weight_scale_inv sibling)");
+        if (src.kind != SourceKind::Fp8Block128 && src.kind != SourceKind::Nvfp4) {
+            fail("routed expert '" + hf + "' is neither block-128 FP8 "
+                 "(.weight_scale_inv) nor NVFP4 (.weight_scale_2)");
         }
         if (e == 0) {
             perExpert = src.rows * src.in;
