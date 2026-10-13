@@ -610,6 +610,27 @@ public:
             "moeTopKRouteDeviceAsync: not supported on this backend");
     }
 
+    /// Kolibri-1 device-side sigmoid-top-K router (DeepSeek-V3 select-on-bias):
+    /// select top-K by (logits[e] + bias[e]); weight = sigmoid(logits[sel])
+    /// (unbiased, NO renormalisation) * wScale. logits [T,nExperts], bias
+    /// [nExperts]; outIdx [T,K] int32; outWeight [T,K] F32. Removes the per-layer
+    /// host sync of the host-side selection. Default: unsupported; CUDA overrides.
+    virtual void moeSigmoidTopKRouteBiasDeviceAsync(
+            const float* logits, const float* bias, std::int32_t* outIdx,
+            float* outWeight, std::size_t T, std::size_t nExperts,
+            std::size_t K, float wScale) {
+        (void)logits; (void)bias; (void)outIdx; (void)outWeight;
+        (void)T; (void)nExperts; (void)K; (void)wScale;
+        throw std::runtime_error(
+            "moeSigmoidTopKRouteBiasDeviceAsync: not supported on this backend");
+    }
+
+    /// True when the sigmoid-top-K bias router kernel is loaded (CUDA). Lets the
+    /// backend keep a host fallback where it is not. Default false.
+    [[nodiscard]] virtual bool moeSigmoidTopKRouteBiasDeviceAvailable() const noexcept {
+        return false;
+    }
+
     /// True when moeGroupBuildAsync/moeGatherRowsAsync/moeScatterExpertOutAsync
     /// are actually implemented on this backend (CUDA only — see below).
     /// Callers must gate `features.moeGroup` on this before engaging the

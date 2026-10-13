@@ -310,31 +310,49 @@ void Kolibri1Backend::runKolibriMoe(std::size_t blockIdx, const float* din,
     // --- router: logits = din @ gate^T  [T, nExperts] --------------------
     // Reuse gateOut as the logits buffer (freed before the expert loop below;
     // [maxT, ff] >= [T, nExperts] since nExperts <= ff capacity).
-    float* const logits = gateOut;
-    _gmm.matmul(routerW.type, routerW.usmPtr, nExperts, d_model, din, T, logits,
-                scratch);  // synchronous — host reads logits next
-
     // Sigmoid top-6 with DeepSeek-V3-style bias: SELECT on (logits + bias),
     // WEIGHT by sigmoid(unbiased logit), NO renormalisation (norm_topk_prob
     // false). Bias affects selection only.
-    const float* const bias = static_cast<const float*>(biasT.usmPtr);
-    _selIdx.assign(T * K, 0);
-    _selW.assign(T * K, 0.0F);
-    std::vector<char> chosen(nExperts);
-    for (std::size_t t = 0; t < T; ++t) {
-        const float* lg = logits + t * nExperts;
-        std::fill(chosen.begin(), chosen.end(), char{0});
-        for (std::size_t k = 0; k < K; ++k) {
-            int   best      = -1;
-            float bestScore = -std::numeric_limits<float>::infinity();
-            for (std::size_t e = 0; e < nExperts; ++e) {
-                if (chosen[e]) continue;
-                const float sc = lg[e] + bias[e];
-                if (sc > bestScore) { bestScore = sc; best = static_cast<int>(e); }
+    float* const       logits = gateOut;
+    const float* const bias   = static_cast<const float*>(biasT.usmPtr);
+
+    // Device-side router keeps the whole MoE block on-stream (no per-layer host
+    // sync). Only on the FP4-TC path, where the fused-K kernels read the routing
+    // from the per-token USM slots the device kernel writes. The FP8 fallback
+    // keeps the host selection (its per-token GEMV loop reads _selIdx on the CPU).
+    const bool useDeviceRouter =
+        (gExps.type == core::gguf::GgmlType::NVFP4_TC)
+        && _ops.moeSigmoidTopKRouteBiasDeviceAvailable();
+
+    if (useDeviceRouter) {
+        _gmm.matmulAsync(routerW.type, routerW.usmPtr, nExperts, d_model, din, T,
+                         logits, scratch);
+        _ops.moeSigmoidTopKRouteBiasDeviceAsync(
+            logits, bias,
+            buffers.moePrefillExpIdx.as<std::int32_t>(),
+            buffers.moePrefillKw.as<float>(),
+            T, nExperts, K, /*wScale=*/1.0F);
+    } else {
+        _gmm.matmul(routerW.type, routerW.usmPtr, nExperts, d_model, din, T,
+                    logits, scratch);  // synchronous — host reads logits next
+        _selIdx.assign(T * K, 0);
+        _selW.assign(T * K, 0.0F);
+        std::vector<char> chosen(nExperts);
+        for (std::size_t t = 0; t < T; ++t) {
+            const float* lg = logits + t * nExperts;
+            std::fill(chosen.begin(), chosen.end(), char{0});
+            for (std::size_t k = 0; k < K; ++k) {
+                int   best      = -1;
+                float bestScore = -std::numeric_limits<float>::infinity();
+                for (std::size_t e = 0; e < nExperts; ++e) {
+                    if (chosen[e]) continue;
+                    const float sc = lg[e] + bias[e];
+                    if (sc > bestScore) { bestScore = sc; best = static_cast<int>(e); }
+                }
+                chosen[static_cast<std::size_t>(best)] = 1;
+                _selIdx[t * K + k] = best;
+                _selW[t * K + k]   = 1.0F / (1.0F + std::exp(-lg[static_cast<std::size_t>(best)]));
             }
-            chosen[static_cast<std::size_t>(best)] = 1;
-            _selIdx[t * K + k] = best;
-            _selW[t * K + k]   = 1.0F / (1.0F + std::exp(-lg[static_cast<std::size_t>(best)]));
         }
     }
 
@@ -343,18 +361,22 @@ void Kolibri1Backend::runKolibriMoe(std::size_t blockIdx, const float* din,
     if (gExps.type == core::gguf::GgmlType::NVFP4_TC) {
         // --- routed experts, FP4-tensor-core fused-K (I-9 / 5.34.10) --------
         // One launch each for gate+up and down over all T rows x K experts,
-        // instead of the T*K*3 per-token GEMVs below. The host sigmoid-top6
-        // selection (above) is kept (Kolibri's select-on-bias routing is
-        // bespoke); its indices/weights ride the per-token USM slots the
-        // batched TC kernels read on the stream. moeGateCompact holds the
-        // [T*K, nFfExp] silu(gate)*up activation the down kernel consumes.
+        // instead of the T*K*3 per-token GEMVs below. Routing rides the per-token
+        // USM slots (moePrefillExpIdx/Kw) — written on-device by the sigmoid-top-K
+        // bias router (useDeviceRouter) or copied from the host selection.
+        // moeGateCompact holds the [T*K, nFfExp] silu(gate)*up activation the down
+        // kernel consumes.
         namespace mo = core::modelopt;
         float* const gateActAll = buffers.moeGateCompact.as<float>();
         auto* const  expIdx     = buffers.moePrefillExpIdx.as<std::int32_t>();
         auto* const  kwDev      = buffers.moePrefillKw.as<float>();
-        for (std::size_t i = 0; i < T * K; ++i) {
-            expIdx[i] = _selIdx[i];
-            kwDev[i]  = _selW[i];
+        if (!useDeviceRouter) {
+            // Host selection path: copy the host indices/weights into the USM
+            // slots. (The device router already wrote them in place.)
+            for (std::size_t i = 0; i < T * K; ++i) {
+                expIdx[i] = _selIdx[i];
+                kwDev[i]  = _selW[i];
+            }
         }
         const std::size_t sfbGu = mo::moeSwizzledScaleStride(nFfExp, d_model / 16);
         const std::size_t sfbDn = mo::moeSwizzledScaleStride(d_model, nFfExp / 16);

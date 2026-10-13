@@ -337,6 +337,9 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _deltanetKktSolveBatchedTcKernel;
     core::cuda::CudaModule _sigmoidInplaceModule;
     core::cuda::CudaKernel _sigmoidInplaceKernel;
+    // Kolibri-1 device-side sigmoid-top-K router (select-on-bias, no renorm).
+    core::cuda::CudaModule _moeSigmoidTopKBiasModule;
+    core::cuda::CudaKernel _moeSigmoidTopKBiasKernel;
     core::cuda::CudaModule _gatherHeadsModule;
     core::cuda::CudaKernel _gatherHeadsKernel;
     // GDN-Inc 2b: fused post-conv prep (q/k/v gather + q/k L2-norm) in one launch.
@@ -683,6 +686,9 @@ struct GpuOps::Impl {
           _sigmoidInplaceModule    {loadCudaModule(ctx, "sigmoid_inplace")},
           _sigmoidInplaceKernel    {
               _sigmoidInplaceModule.getFunction("sigmoid_inplace")},
+          _moeSigmoidTopKBiasModule{loadCudaModule(ctx, "moe_topk_sigmoid_bias")},
+          _moeSigmoidTopKBiasKernel{
+              _moeSigmoidTopKBiasModule.getFunction("moe_topk_sigmoid_bias")},
           _gatherHeadsModule       {loadCudaModule(ctx, "gather_heads_from_channels")},
           _gatherHeadsKernel       {
               _gatherHeadsModule.getFunction("gather_heads_from_channels")},
@@ -2685,6 +2691,27 @@ void GpuOps::moeTopKRouteDeviceAsync(const float* logits, std::int32_t* outIdx,
                                      std::size_t nExperts, std::size_t K,
                                      float wScale) {
     _moeTopKRoute.launch(logits, outIdx, outWeight, T, nExperts, K, wScale);
+}
+
+void GpuOps::moeSigmoidTopKRouteBiasDeviceAsync(
+        const float* logits, const float* bias, std::int32_t* outIdx,
+        float* outWeight, std::size_t T, std::size_t nExperts, std::size_t K,
+        float wScale) {
+    if (T == 0) {
+        return;
+    }
+    // One warp (block.x=32) per token; the kernel's MOE_TOPK_MAX_EXPERTS=512
+    // build covers Kolibri-1's 384 routed experts.
+    auto& k = _pimpl->_moeSigmoidTopKBiasKernel;
+    k.setPtr  (0, logits);
+    k.setPtr  (1, bias);
+    k.setPtr  (2, outIdx);
+    k.setPtr  (3, outWeight);
+    k.setValue(4, toInt32(nExperts, "moeSigmoidTopKRouteBias nExperts"));
+    k.setValue(5, toInt32(K,        "moeSigmoidTopKRouteBias K"));
+    k.setValue(6, wScale);
+    k.launch(_ctx.stream(), toInt32(T, "moeSigmoidTopKRouteBias T"), 1, 1,
+             32, 1, 1);
 }
 
 void GpuOps::moeGroupBuildAsync(const std::int32_t* expIdx, const float* kw,

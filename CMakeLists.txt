@@ -901,6 +901,7 @@ endif()
 if(MIMIRMIND_ENABLE_CUDA)
     set(CUDA_KERNEL_SOURCES
         kernels/cuda/llm/moe_topk.cu
+        kernels/cuda/llm/moe_topk_sigmoid_bias.cu
         kernels/cuda/llm/moe_group_build.cu
         kernels/cuda/llm/moe_oea.cu
         kernels/cuda/llm/moe_gather_rows.cu

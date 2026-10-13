@@ -310,6 +310,13 @@ public:
                                  float* outWeight, std::size_t T,
                                  std::size_t nExperts, std::size_t K,
                                  float wScale) override;
+    void moeSigmoidTopKRouteBiasDeviceAsync(const float* logits, const float* bias,
+                                            std::int32_t* outIdx, float* outWeight,
+                                            std::size_t T, std::size_t nExperts,
+                                            std::size_t K, float wScale) override;
+    [[nodiscard]] bool moeSigmoidTopKRouteBiasDeviceAvailable() const noexcept override {
+        return true;
+    }
     [[nodiscard]] bool supportsMoeGrouping() const override { return true; }
     void moeGroupBuildAsync(const std::int32_t* expIdx, const float* kw,
                             std::int32_t* expOffset, std::int32_t* rowSrcTok,
