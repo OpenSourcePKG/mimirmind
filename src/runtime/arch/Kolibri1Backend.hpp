@@ -5,6 +5,8 @@
 
 #include "runtime/arch/ArchBackend.hpp"
 
+#include <span>
+
 namespace mimirmind::compute {
 class ComputeMatmul;
 class ComputeOps;
@@ -63,6 +65,16 @@ public:
                   KvCache&      cache,
                   BlockBuffers& buffers,
                   bool          traceBlock0) override;
+
+    /// I-8 (5.34.9): synchronized batched decode — nSeq lock-step T=1 rows,
+    /// each with its own contiguous F32 KvCache. Matmuls batch at M=nSeq; only
+    /// attention + RoPE loop per sequence.
+    void runBlockBatched(std::size_t               blockIdx,
+                         float*                    x,
+                         std::size_t               nSeq,
+                         std::span<KvCache* const> caches,
+                         BlockBuffers&             buffers,
+                         bool                      diag) override;
 
     [[nodiscard]] std::vector<std::size_t> kvDimPerLayer() const override;
 

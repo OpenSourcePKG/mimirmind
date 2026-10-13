@@ -169,6 +169,124 @@ void Kolibri1Backend::runBlock(std::size_t   blockIdx,
     dumpStage("l_out", L, x, T, d_model);
 }
 
+void Kolibri1Backend::runBlockBatched(std::size_t               blockIdx,
+                                      float*                    x,
+                                      std::size_t               nSeq,
+                                      std::span<KvCache* const> caches,
+                                      BlockBuffers&             buffers,
+                                      bool                      diag) {
+    // Synchronized batched decode (I-8 / 5.34.9): nSeq lock-step decode rows
+    // (each T=1), each owning its own contiguous F32 KvCache at its own length.
+    // The position-independent matmuls (Q/K/V/O proj + MoE) run at M=nSeq; only
+    // attention + RoPE loop per sequence (per-seq position + cache). Mirrors the
+    // single-session runBlock wiring (plain RMSNorm sandwich, NoPE on full-attn,
+    // per-head QK-norm, sigmoid-top6 MoE) — see runBlock for the rationale.
+    (void)diag;
+    const std::size_t L        = blockIdx;
+    const std::size_t d_model  = _config.embeddingLength;
+    const std::size_t headDim  = _config.headDim(L);
+    const std::size_t nHeads   = _config.headCount;
+    const std::size_t nKvHeads = _config.headCountKvFor(L);
+    const std::size_t qDim     = nHeads * headDim;
+    const std::size_t kvDim    = nKvHeads * headDim;
+    const float       eps      = _config.rmsNormEps;
+    const bool        isSliding = (L < _config.slidingWindowPattern.size())
+                                  && static_cast<bool>(_config.slidingWindowPattern[L]);
+
+    if (caches.size() != nSeq) {
+        throw std::runtime_error("Kolibri1Backend::runBlockBatched: caches.size() != nSeq");
+    }
+    for (std::size_t i = 0; i < nSeq; ++i) {
+        if (caches[i] == nullptr || caches[i]->dtype() != KvDtype::F32) {
+            throw std::runtime_error(
+                "Kolibri1Backend::runBlockBatched: batched decode needs a non-null F32 KV cache per slot");
+        }
+    }
+
+    const auto& attnNorm = requireBlk(_weights, L, "attn_norm.weight");
+    const auto& qW       = requireBlk(_weights, L, "attn_q.weight");
+    const auto& kW       = requireBlk(_weights, L, "attn_k.weight");
+    const auto& vW       = requireBlk(_weights, L, "attn_v.weight");
+    const auto& oW       = requireBlk(_weights, L, "attn_output.weight");
+    const auto& qNorm    = requireBlk(_weights, L, "attn_q_norm.weight");
+    const auto& kNorm    = requireBlk(_weights, L, "attn_k_norm.weight");
+    const auto& postAttn = requireBlk(_weights, L, "post_attn_norm.weight");
+    const auto& preFfn   = requireBlk(_weights, L, "post_attention_norm.weight");
+    const auto& postFfn  = requireBlk(_weights, L, "post_ffn_norm.weight");
+
+    float* const normBuf  = buffers.normBuf.as<float>();
+    float* const qBuf     = buffers.qBuf.as<float>();
+    float* const attnOut  = buffers.attnOut.as<float>();
+    float* const projOut  = buffers.projOut.as<float>();
+    float* const scratch  = buffers.matmulScratch.as<float>();
+
+    // --- attention: batched pre-norm + Q proj --------------------------
+    _ops.rmsNormAsync(x, nSeq, d_model,
+                      static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
+    _gmm.matmulAsync(qW.type, qW.usmPtr, qDim, d_model, normBuf, nSeq, qBuf, scratch);
+
+    // --- per-sequence K/V proj + fused QK-norm + RoPE + attention -------
+    // Byte-identical to the single-session runBlock attention (T=1) per slot,
+    // just looped over the nSeq independent caches (the matmuls above already
+    // amortised the weight read at M=nSeq).
+    const float       scale    = _config.attentionScaleFor(headDim);
+    const std::size_t window   = isSliding ? _config.slidingWindow : 0;
+    const float       ropeBase = _config.ropeFreqBaseSwa;
+    for (std::size_t i = 0; i < nSeq; ++i) {
+        KvCache&          cache    = *caches[i];
+        const std::size_t curLen   = cache.length();
+        const std::size_t totalLen = curLen + 1;
+        float* const      xRow     = normBuf + i * d_model;
+        float* const      qRow     = qBuf    + i * qDim;
+        float* const      aRow     = attnOut + i * qDim;
+        float* const      kSlot    = cache.writeSlotKf32(L);
+        float* const      vSlot    = cache.writeSlotVf32(L);
+
+        {
+            compute::UnorderedScope u{_ops};
+            _gmm.matmulAsync(kW.type, kW.usmPtr, kvDim, d_model, xRow, 1, kSlot, scratch);
+            _gmm.matmulAsync(vW.type, vW.usmPtr, kvDim, d_model, xRow, 1, vSlot, scratch);
+        }
+        // Per-head QK-RMSNorm (Q in qRow, K written back into the cache at
+        // curLen; V passes through), the same fused op the single-session path
+        // uses.
+        _ops.rmsNormQkvAsync(qRow, static_cast<const float*>(qNorm.usmPtr),
+                             const_cast<void*>(cache.baseK(L)),
+                             static_cast<const float*>(kNorm.usmPtr),
+                             const_cast<void*>(cache.baseV(L)),
+                             nHeads, nKvHeads, headDim, eps,
+                             /*writeOffset=*/curLen, kvDim,
+                             KvDtype::F32, /*useStagingSlot=*/false);
+        // RoPE only on sliding layers (full-attention is NoPE), per-seq startPos.
+        if (isSliding) {
+            compute::UnorderedScope u{_ops};
+            _ops.ropeInPlaceAsync(qRow, 1, nHeads, headDim, curLen, ropeBase);
+            _ops.ropeInPlaceAsync(const_cast<void*>(cache.baseK(L)), 1, nKvHeads,
+                                  headDim, curLen, ropeBase,
+                                  /*writeOffsetStride=*/kvDim, KvDtype::F32);
+        }
+        _ops.attentionAsync(qRow, cache.baseK(L), cache.baseV(L),
+                            /*T_q=*/1, /*T_k=*/totalLen, nHeads, nKvHeads, headDim,
+                            /*positionOffset=*/curLen, scale, aRow,
+                            window, cache.dtype());
+    }
+
+    // --- batched O proj + post-attn norm + residual ---------------------
+    _gmm.matmulAsync(oW.type, oW.usmPtr, d_model, qDim, attnOut, nSeq, projOut, scratch);
+    _ops.rmsNormAsync(projOut, nSeq, d_model,
+                      static_cast<const float*>(postAttn.usmPtr), eps, projOut);
+    _ops.addResidualAsync(x, projOut, nSeq * d_model);
+
+    // --- MoE FFN sublayer (batched T=nSeq; FP4-TC fused-K when NVFP4) ----
+    _ops.rmsNormAsync(x, nSeq, d_model,
+                      static_cast<const float*>(preFfn.usmPtr), eps, normBuf);
+    runKolibriMoe(L, normBuf, nSeq, buffers);
+    float* const moeAccum = buffers.moeAccumBuf.as<float>();
+    _ops.rmsNormAsync(moeAccum, nSeq, d_model,
+                      static_cast<const float*>(postFfn.usmPtr), eps, moeAccum);
+    _ops.addResidualAsync(x, moeAccum, nSeq * d_model);
+}
+
 void Kolibri1Backend::runKolibriMoe(std::size_t blockIdx, const float* din,
                                     std::size_t T, BlockBuffers& buffers) {
     const std::size_t d_model   = _config.embeddingLength;
@@ -334,11 +452,15 @@ std::pair<std::size_t, std::size_t> Kolibri1Backend::maxQKVDims() const {
 }
 
 ArchCapabilities Kolibri1Backend::computeCapabilities() const {
-    // Pure-attention MoE. Batched decode / CLR-safe MoE decode are not wired at
-    // the I-4 forward (they turn on as the serving paths land, I-6+). The
-    // ArchCapabilities defaults (everything false except decodeQkvClrSafe) are
-    // the correct conservative starting point.
-    return ArchCapabilities{};
+    // Pure-attention MoE. I-8 (5.34.9): synchronized batched decode is wired
+    // (runBlockBatched — per-seq F32 caches, matmuls at M=nSeq, MoE via the
+    // FP4-TC batched fused-K path at T=nSeq), so the ContinuousBatcher can serve
+    // conc>1. CLR-safe MoE decode (device-side routing) stays off — the router
+    // top-6 select-on-bias is a host read. Everything else keeps the
+    // conservative pure-attention defaults.
+    ArchCapabilities caps{};
+    caps.supportsBatchedDecode = true;
+    return caps;
 }
 
 } // namespace mimirmind::runtime::arch
