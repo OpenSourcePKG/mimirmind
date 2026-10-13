@@ -392,6 +392,7 @@ add_library(mimirmind_core_common STATIC
     src/core/modelopt/Qwen3_5MoeMaterializer.cpp
     src/core/modelopt/Qwen3_5DenseMaterializer.cpp
     src/core/modelopt/Gemma4Materializer.cpp
+    src/core/modelopt/Kolibri1Materializer.cpp
     src/core/safetensors/SafetensorsDtype.cpp
     src/core/safetensors/SafetensorsHeader.cpp
     src/core/safetensors/SafetensorsIndex.cpp

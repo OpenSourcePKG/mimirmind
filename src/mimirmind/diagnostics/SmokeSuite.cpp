@@ -826,7 +826,12 @@ void runM4deGenerate(mimirmind::runtime::InferenceEngine& engine,
         chatStops = mm::model::ChatTemplate::stopIds(style, tok);
         displayPrompt = tok.decode(promptIds, /*skipSpecial=*/false);
     } else {
-        promptIds = tok.encode(args.prompt, /*addBos=*/false);
+        // parseSpecial=true so a pre-formatted prompt containing special/chat
+        // tokens (e.g. a chat-template-rendered "<|im_start|>…") maps them to
+        // their ids instead of byte-level-BPE'ing the literal characters — the
+        // same behaviour the server chat path uses (JinjaChatTemplate). Plain
+        // prompts without specials are unaffected (identical token stream).
+        promptIds = tok.encode(args.prompt, /*addBos=*/false, /*parseSpecial=*/true);
         displayPrompt = tok.decode(promptIds, /*skipSpecial=*/false);
     }
 

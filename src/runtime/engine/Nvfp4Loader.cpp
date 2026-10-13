@@ -15,6 +15,7 @@
 #include "core/modelopt/CompressedTensorsConfig.hpp"
 #include "core/modelopt/Gemma4Materializer.hpp"
 #include "core/modelopt/HfQuantConfig.hpp"
+#include "core/modelopt/Kolibri1Materializer.hpp"
 #include "core/modelopt/Qwen3_5DenseMaterializer.hpp"
 #include "core/modelopt/Qwen3_5MoeMaterializer.hpp"
 #include "core/safetensors/SafetensorsModel.hpp"
@@ -421,6 +422,207 @@ void Nvfp4Loader::loadGemma4(InferenceEngine&                     e,
         MM_LOG_INFO("engine",
                     "loadModelNvfp4: gemma4 materialised {} BF16 tensors",
                     e._materializedBf16.size());
+}
+
+void Nvfp4Loader::loadKolibri1(InferenceEngine&                     e,
+                               const std::string&                   dir,
+                               const std::string&                   configText,
+                               std::string_view                     checkpointDir,
+                               std::string_view                     tokenizerGguf,
+                               core::safetensors::SafetensorsModel* attachedSm) {
+    MM_LOG_INFO("engine",
+                "loadModelNvfp4: '{}' — Kolibri-1 (pure-attention MoE, FP8 "
+                "128x128-block)", checkpointDir);
+    // 1. Arch params from config.json.
+    e._config = runtime::nvfp4::parseKolibri1SafetensorsConfig(configText);
+    applyGenerationConfigDefaults(e._config, dir);
+    detectTemplateThinking(e._config, dir);
+
+    // 2. Tokenizer — plain GPT-2/Qwen byte-level BPE (I-2), parsed from the
+    //    checkpoint's tokenizer.json unless an explicit GGUF tokenizer wins.
+    if (tokenizerGguf.empty()) {
+        e._tokenizer.loadFromHfJson(dir);
+    } else {
+        e._reader.open(tokenizerGguf);
+        e._tokenizer.loadFromGguf(e._reader);
+    }
+
+    // 3. Upload the FP8 weights (+ F32 block-scale grids + BF16 passthroughs)
+    //    to the device. The routed-expert sources go through the big-block pool
+    //    (one consolidated slab per layer+projection via expertSlabKey) so each
+    //    freed slab physically becomes the next expert bank during the streaming
+    //    requant below.
+    auto& poolCtx =
+        static_cast<core::cuda::CudaComputeContext&>(*e._computeCtx);
+    PooledUploader uploader(poolCtx, *e._ops);
+    e._nvfp4Model = std::make_unique<runtime::nvfp4::NvFp4Model>(
+        attachedSm ? runtime::nvfp4::loadNvfp4Model(*attachedSm, dir, uploader)
+                   : runtime::nvfp4::loadNvfp4Model(dir, uploader));
+
+    // 4. Build the materialization plan (checkpoint-truth FP8/BF16 classes).
+    core::safetensors::SafetensorsModel localSm;
+    if (attachedSm == nullptr) localSm.open(dir);
+    core::safetensors::SafetensorsModel& sm = attachedSm ? *attachedSm : localSm;
+    const core::modelopt::Kolibri1Arch karch{
+        static_cast<int>(e._config.blockCount),
+        static_cast<int>(e._config.expertCount)};
+    const std::vector<core::modelopt::MaterializationStep> steps =
+        core::modelopt::planKolibri1Materialization(sm, karch);
+
+    // 5. Dequantise to BF16/F32 on device, DEFERRING the routed experts — their
+    //    full BF16 image (~156 GiB across 50 layers x 384 experts) would OOM the
+    //    128 GiB part. The deferred steps emit empty placeholders; the streaming
+    //    requant fills them straight into blocked-FP8 banks.
+    auto& cudaCtx = static_cast<core::cuda::CudaComputeContext&>(*e._computeCtx);
+    compute::cuda::CudaMaterializerOps devOps(cudaCtx, *e._ops);
+    const std::function<bool(const std::string&)> deferExperts =
+        [](const std::string& n) {
+            return n.size() > 5
+                && (n.rfind(".ffn_gate_exps.weight") != std::string::npos
+                    || n.rfind(".ffn_up_exps.weight") != std::string::npos
+                    || n.rfind(".ffn_down_exps.weight") != std::string::npos);
+        };
+    e._materializedBf16 =
+        runtime::nvfp4::executeMaterialization(steps, *e._nvfp4Model, devOps,
+                                               deferExperts);
+    cudaCtx.stream().synchronize();
+
+    // 6. Stream the deferred routed experts into stacked blocked-FP8 banks.
+    buildMoeExpertBanksFp8Block128(e, steps, cudaCtx, devOps);
+
+    // 6b. Survivor check: every deferred expert must now hold an FP8 bank.
+    for (const auto& t : e._materializedBf16) {
+        if (deferExperts(t.ggufName) && t.buffer.bytes() == 0 && !t.isFp8) {
+            throw std::runtime_error(
+                "Nvfp4Loader: deferred Kolibri-1 expert '" + t.ggufName +
+                "' was not repacked to an FP8 bank (empty buffer)");
+        }
+    }
+
+    // 7. Expose the result as a GGUF-convention WeightsMap and drop the uploads.
+    e._weights.emplace(runtime::nvfp4::buildBf16WeightsMap(e._materializedBf16));
+    e._nvfp4Model.reset();
+    MM_LOG_INFO("engine",
+                "loadModelNvfp4: kolibri1 materialised {} tensors",
+                e._materializedBf16.size());
+}
+
+void Nvfp4Loader::buildMoeExpertBanksFp8Block128(
+        InferenceEngine&                                        e,
+        const std::vector<core::modelopt::MaterializationStep>& steps,
+        core::cuda::CudaComputeContext&                         cudaCtx,
+        compute::cuda::CudaMaterializerOps&                     devOps) {
+    if (!e._nvfp4Model) {
+        return;
+    }
+    auto isExpert = [](std::string_view n) {
+        return n.ends_with(".ffn_gate_exps.weight")
+            || n.ends_with(".ffn_up_exps.weight")
+            || n.ends_with(".ffn_down_exps.weight");
+    };
+
+    // Free a repacked step's FP8 source slab (the per-expert `.weight` + its
+    // `.weight_scale_inv` grid). expertSlabKey grouped all of a (layer,
+    // projection)'s experts into ONE pool block, refcounted by member count;
+    // releasing every member (384 weights + 384 scale grids) drops the refcount
+    // to zero and returns the ~480 MiB block to the pool, where the next bank
+    // (~510 MiB, same size class) reuses it.
+    auto releaseStepSources =
+        [&](const core::modelopt::MaterializationStep& st) {
+            for (const auto& src : st.sources) {
+                const std::string b{src.hfWeightName};
+                const std::string bNoW =
+                    b.size() > 7 ? b.substr(0, b.size() - 7) : b;
+                e._nvfp4Model->releaseTensor(b);
+                e._nvfp4Model->releaseTensor(bNoW + ".weight_scale_inv");
+            }
+        };
+
+    compute::ComputeBuffer scratch;       // BF16 image of ONE expert, reused
+    std::uint64_t          scratchElems = 0;
+    std::size_t            nBanks = 0;
+    std::uint64_t          bytesEquivBf16 = 0, bytesAfter = 0;
+
+    for (const auto& step : steps) {
+        if (!isExpert(step.ggufName)) {
+            continue;
+        }
+        auto it = std::find_if(
+            e._materializedBf16.begin(), e._materializedBf16.end(),
+            [&](const runtime::nvfp4::MaterializedTensor& t) {
+                return t.ggufName == step.ggufName;
+            });
+        if (it == e._materializedBf16.end()) {
+            continue;
+        }
+        if ((it->elems % 32) != 0) {
+            throw std::runtime_error(
+                "Nvfp4Loader: Kolibri-1 expert bank '" + step.ggufName +
+                "' has an element count not divisible by 32 (FP8 32-block)");
+        }
+        const std::size_t bankBytes =
+            (static_cast<std::size_t>(it->elems) / 32) * 34;
+        compute::ComputeBuffer bank =
+            (bankBytes >= kBigBlockMin && bankBytes <= kBigBlockQuant)
+                ? bigBlockAlloc(cudaCtx, bankBytes)
+                : devOps.allocateWeight(bankBytes);
+        if (bank.get() == nullptr) {
+            throw std::runtime_error(
+                "Nvfp4Loader: Kolibri-1 expert bank alloc failed ("
+                + step.ggufName + ", " + std::to_string(bankBytes >> 20)
+                + " MiB) — device memory exhausted during streaming requant");
+        }
+        auto* bankPtr = static_cast<std::uint8_t*>(bank.get());
+
+        for (const auto& src : step.sources) {
+            if (src.kind != core::modelopt::SourceKind::Fp8Block128) {
+                throw std::runtime_error(
+                    "Nvfp4Loader: Kolibri-1 expert source '" + src.hfWeightName
+                    + "' is not block-128 FP8");
+            }
+            const runtime::nvfp4::NvFp4DeviceTensor* w =
+                e._nvfp4Model->find(src.hfWeightName);
+            const std::string base = stripDotWeight(src.hfWeightName);
+            const runtime::nvfp4::NvFp4DeviceTensor* sc =
+                e._nvfp4Model->find(base + ".weight_scale_inv");
+            if (w == nullptr || sc == nullptr) {
+                throw std::runtime_error(
+                    "Nvfp4Loader: Kolibri-1 expert source '" + src.hfWeightName
+                    + "' (or its .weight_scale_inv) is not resident");
+            }
+            const std::uint64_t perExpert = src.rows * src.in;
+            if (scratchElems < perExpert) {
+                scratch = devOps.allocateWeight(
+                    static_cast<std::size_t>(perExpert) * 2);  // BF16
+                scratchElems = perExpert;
+            }
+            // On-disk FP8 128x128-block -> BF16 scratch -> 32-block FP8 bank.
+            // Both kernels run on the context stream, so the quantize reads a
+            // completed dequant and the next expert's dequant waits on this
+            // quantize — scratch is safely reused without a per-expert sync.
+            devOps.dequantFp8Block128(w->devPtr, sc->devPtr, src.rows, src.in,
+                                      scratch.get());
+            const std::size_t byteOff =
+                (static_cast<std::size_t>(src.dstElemOffset) / 32) * 34;
+            devOps.quantizeBf16ToFp8(bankPtr + byteOff, scratch.get(),
+                                     src.rows, src.in);
+        }
+        // All dequant/quantize kernels for this step are enqueued; sync before
+        // freeing the sources they read (releaseStepSources) and before the
+        // scratch is reused by the next step.
+        cudaCtx.stream().synchronize();
+
+        bytesEquivBf16 += static_cast<std::uint64_t>(it->elems) * 2;
+        bytesAfter     += bankBytes;
+        it->buffer = std::move(bank);   // fills the deferred placeholder
+        it->isFp8  = true;
+        ++nBanks;
+        releaseStepSources(step);
+    }
+    MM_LOG_INFO("engine",
+                "loadModelNvfp4: kolibri1 routed experts -> {} blocked-FP8 "
+                "E4M3 banks (deferred BF16 {} MiB -> FP8 {} MiB)",
+                nBanks, bytesEquivBf16 >> 20, bytesAfter >> 20);
 }
 
 void Nvfp4Loader::regroupGatedDeltaNetValueHeads(
@@ -1391,18 +1593,14 @@ void Nvfp4Loader::load(InferenceEngine&                     e,
         return;
     }
 
-    // 5.34 Kolibri-1 (Aleph-Alpha `kolibri1`): pure-attention SWA+full GQA MoE.
-    // I-1 seam — parse the config into the runtime model config (so arch params
-    // + the arch id that selects Kolibri1Backend are live), then stop: the FP8
-    // 128x128 block weight materialise (5.34.4 / I-3) and the forward (5.34.5 /
-    // 5.34.6) are not implemented yet.
+    // 5.34 Kolibri-1 (Aleph-Alpha `kolibri1`): pure-attention SWA+full GQA MoE,
+    // FP8 128x128-block weights. Self-contained load path (I-3): its own planner
+    // + a streaming routed-expert requant to blocked-FP8. The forward (I-4/I-5)
+    // is still stubbed in Kolibri1Backend, so this loads the weights resident but
+    // a generate call will throw until the forward lands.
     if (runtime::nvfp4::isKolibri1Config(configText)) {
-        e._config = runtime::nvfp4::parseKolibri1SafetensorsConfig(configText);
-        throw std::runtime_error(
-            "kolibri1 loader: config parsed (" + std::to_string(e._config.blockCount)
-            + " layers, " + std::to_string(e._config.expertCount)
-            + " experts), but FP8 128x128 block weight materialise is not yet "
-              "implemented (roadmap 5.34.4 / I-3)");
+        loadKolibri1(e, dir, configText, checkpointDir, tokenizerGguf, attachedSm);
+        return;
     }
 
     // 1. Arch params from config.json (GGUF-metadata parse is GGUF-only).

@@ -73,21 +73,41 @@ public:
         return "kolibri1";
     }
 
+    /// Enable per-stage parity dumps (`<prefix>-blk{N}-<stage>.bin`), for
+    /// layer-parity against the aleph-alpha-inference vLLM oracle (I-4/I-5
+    /// acceptance). Empty prefix = disabled.
+    void setParityDumpPrefix(const std::string& prefix) noexcept override {
+        _parityDumpPrefix = prefix;
+    }
+
 protected:
     [[nodiscard]] ArchCapabilities computeCapabilities() const override;
 
 private:
-    // _config is read now (kvDimPerLayer / maxQKVDims); the rest are held for
-    // the forward that lands in I-3+ (FP8 materialise / attention / MoE) and are
-    // [[maybe_unused]] until then so the I-1 seam compiles warning-clean.
-    const model::LlmConfig&                      _config;
-    [[maybe_unused]] const core::gguf::WeightsMap& _weights;
-    [[maybe_unused]] const model::FusedQkvWeights* _fusedQkv;
-    [[maybe_unused]] compute::ComputeOps&          _ops;
-    [[maybe_unused]] compute::ComputeMatmul&       _gmm;
-    [[maybe_unused]] runtime::OpProfiler&          _opProfiler;
-    [[maybe_unused]] bool                          _moeGroupEnabled;
-    [[maybe_unused]] bool                          _moeFusedDownEnabled;
+    /// MoE FFN sublayer (sigmoid top-6 select-on-bias, no renorm, always-on
+    /// shared expert). Reads `din` [T, d_model], writes the expert-weighted
+    /// result into `buffers.moeAccumBuf` [T, d_model] (caller adds the residual).
+    void runKolibriMoe(std::size_t blockIdx, const float* din, std::size_t T,
+                       BlockBuffers& buffers);
+
+    /// Dump one [Trow, dim] F32 stage to `<prefix>-blk{N}-<stage>.bin` (no-op
+    /// when the prefix is empty); matches the llama-parity-dump layout.
+    void dumpStage(const char* stage, std::size_t blockIdx, const float* p,
+                   std::size_t Trow, std::size_t dim);
+
+    const model::LlmConfig&        _config;
+    const core::gguf::WeightsMap&  _weights;
+    const model::FusedQkvWeights*  _fusedQkv;
+    compute::ComputeOps&           _ops;
+    compute::ComputeMatmul&        _gmm;
+    runtime::OpProfiler&           _opProfiler;
+    bool                           _moeGroupEnabled;
+    bool                           _moeFusedDownEnabled;
+    std::string                    _parityDumpPrefix;
+    // Host-side top-6 routing scratch (sigmoid select-on-bias, no renorm),
+    // grown to T*expertUsedCount per call; reused across calls.
+    std::vector<int>               _selIdx;
+    std::vector<float>             _selW;
 };
 
 } // namespace mimirmind::runtime::arch

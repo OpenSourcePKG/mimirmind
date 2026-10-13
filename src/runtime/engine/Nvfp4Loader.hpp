@@ -72,6 +72,33 @@ private:
                            std::string_view                     tokenizerGguf,
                            core::safetensors::SafetensorsModel* attachedSm);
 
+    /// 5.34 (I-3) The Kolibri-1 (Aleph-Alpha `kolibri1`) pure-attention MoE load
+    /// path: FP8 128x128-block weights (DeepSeek-V3 `weight_scale_inv` grids),
+    /// bf16 norms/router/embeds. Its own planner (planKolibri1Materialization)
+    /// and a streaming routed-expert requant (buildMoeExpertBanksFp8Block128)
+    /// that never forms the full BF16 expert image. Self-contained like
+    /// loadGemma4 — none of the qwen35moe GDN / MTP post-passes apply.
+    static void loadKolibri1(InferenceEngine&                     e,
+                             const std::string&                   dir,
+                             const std::string&                   configText,
+                             std::string_view                     checkpointDir,
+                             std::string_view                     tokenizerGguf,
+                             core::safetensors::SafetensorsModel* attachedSm);
+
+    /// 5.34 (I-3) Stream the DEFERRED routed-expert steps (ffn_*_exps) into
+    /// stacked blocked-FP8 (E4M3) banks: per expert, dequant the on-disk FP8
+    /// 128x128-block source to a small BF16 scratch, requant that to the 32-block
+    /// FP8 the matmul_fp8 kernels consume, and write it into the bank at the
+    /// expert's offset — freeing each (layer, projection) source slab once its
+    /// bank is built, so the ~75 GiB source and the ~80 GiB banks never fully
+    /// co-reside (the dequant->BF16 image would peak at ~156 GiB and OOM the
+    /// 128 GiB GB10). Fills the empty placeholders executeMaterialization left.
+    static void buildMoeExpertBanksFp8Block128(
+        InferenceEngine&                                        e,
+        const std::vector<core::modelopt::MaterializationStep>& steps,
+        core::cuda::CudaComputeContext&                         cudaCtx,
+        compute::cuda::CudaMaterializerOps&                     devOps);
+
     /// GatedDeltaNet value-head regroup (HF -> GGUF layout), a pure element
     /// permutation of the vDim value channels + the per-head decay/beta tensors.
     static void regroupGatedDeltaNetValueHeads(

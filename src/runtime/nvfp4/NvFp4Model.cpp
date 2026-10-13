@@ -431,8 +431,14 @@ NvFp4Model loadNvfp4Model(safetensors::SafetensorsModel& sm,
     // share one allocation, released as a whole once every member was
     // consumed. ~144 large frees instead of ~74k interleaved small ones.
     auto expertSlabKey = [](const std::string& n) -> std::string {
-        static const char* kPre = "model.language_model.layers.";
-        if (n.rfind(kPre, 0) != 0) return {};
+        // qwen35moe / qwen4_exp nest the stack under `model.language_model.
+        // layers.`; Kolibri-1 uses the flatter `model.layers.`. Accept either —
+        // the two prefixes diverge at char 8 ("layers" vs "language"), so one
+        // never prefix-matches the other, and the key below is derived from the
+        // text up to `.mlp.experts.`, keeping the slab keys disjoint per model.
+        static const char* kPreQwen = "model.language_model.layers.";
+        static const char* kPreFlat = "model.layers.";
+        if (n.rfind(kPreQwen, 0) != 0 && n.rfind(kPreFlat, 0) != 0) return {};
         const auto ex = n.find(".mlp.experts.");
         if (ex == std::string::npos) return {};
         const auto eBeg = ex + 13;
@@ -453,7 +459,12 @@ NvFp4Model loadNvfp4Model(safetensors::SafetensorsModel& sm,
                               "down_proj.weight", "gate_proj.weight_scale",
                               "up_proj.weight_scale", "down_proj.weight_scale",
                               "gate_proj.weight_scale_2", "up_proj.weight_scale_2",
-                              "down_proj.weight_scale_2"}) {
+                              "down_proj.weight_scale_2",
+                              // Kolibri-1 DeepSeek-V3 FP8 128x128-block scale
+                              // grids (one F32 grid per expert projection).
+                              "gate_proj.weight_scale_inv",
+                              "up_proj.weight_scale_inv",
+                              "down_proj.weight_scale_inv"}) {
             if (tail == k) {
                 const auto projDot = tail.find('.');
                 return n.substr(0, ex) + "|" + tail.substr(0, projDot);
