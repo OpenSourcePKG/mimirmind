@@ -3466,6 +3466,16 @@ if(MIMIRMIND_ENABLE_CUDA)
     target_link_libraries(laya_tok_parity PRIVATE mimirmind_core_cuda)
 endif()
 
+# ---- kolibri_tok_parity — native Tokenizer parity harness (I-2 / 5.34.3) ----
+# Pure CPU; encodes a DE+EN corpus with the native byte-level BPE for id-parity
+# vs the HF tokenizers oracle + a decode round-trip check.
+if(MIMIRMIND_ENABLE_CUDA)
+    # model::Tokenizer is compiled per-executable (not in a lib), so pull its TU
+    # directly; mimirmind_core_cuda covers its helper/json symbols.
+    add_executable(kolibri_tok_parity tools/kolibri_tok_parity.cpp src/model/Tokenizer.cpp)
+    target_link_libraries(kolibri_tok_parity PRIVATE mimirmind_core_cuda)
+endif()
+
 # ---- laya_systemone_parity — end-to-end Laya decision parity (8.27.4) --------
 if(MIMIRMIND_ENABLE_CUDA)
     add_executable(laya_systemone_parity
