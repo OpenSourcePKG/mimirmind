@@ -7,6 +7,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 
@@ -63,12 +64,73 @@ void parseFlagsBlock(const nlohmann::json& flags, ProbePicks& picks) {
     if (auto v = readFlag("MIMIRMIND_ENABLE_JINJA"))        picks.applyEnableJinja = v;
 }
 
+// Kernel release the artefact was probed on: the probe tool records it under
+// hardware.host.kernel; hand-curated profiles may carry provenance.kernel.
+std::string probedKernelOf(const nlohmann::json& j) {
+    const auto hw = j.find("hardware");
+    if (hw != j.end() && hw->is_object()) {
+        const auto host = hw->find("host");
+        if (host != hw->end() && host->is_object()) {
+            return host->value("kernel", std::string{});
+        }
+    }
+    const auto prov = j.find("provenance");
+    if (prov != j.end() && prov->is_object()) {
+        return prov->value("kernel", std::string{});
+    }
+    return {};
+}
+
+// Device name an artefact was authored for (curated: device.device_name;
+// probe tool: hardware.backend.device_name).
+std::string deviceNameOf(const nlohmann::json& j) {
+    const auto dev = j.find("device");
+    if (dev != j.end() && dev->is_object()) {
+        return dev->value("device_name", std::string{});
+    }
+    const auto hw = j.find("hardware");
+    if (hw != j.end() && hw->is_object()) {
+        const auto be = hw->find("backend");
+        if (be != hw->end() && be->is_object()) {
+            return be->value("device_name", std::string{});
+        }
+    }
+    return {};
+}
+
 } // namespace
 
-std::optional<ProbePicks>
-loadProbePicks(const std::string& dir, const std::string& fingerprint) {
+std::vector<std::string>
+findProfilesForDevice(const std::string& dir, const std::string& deviceName) {
     namespace fs = std::filesystem;
-    const fs::path path = fs::path{dir} / "hw" / fingerprint / "probe-result.json";
+    std::vector<std::string> out;
+    if (deviceName.empty()) {
+        return out;
+    }
+    std::error_code ec;
+    fs::directory_iterator it{fs::path{dir} / "hw", ec};
+    if (ec) {
+        return out;
+    }
+    for (const auto& entry : it) {
+        const fs::path path = entry.path() / "probe-result.json";
+        std::ifstream f{path};
+        if (!f) {
+            continue;
+        }
+        const nlohmann::json j = nlohmann::json::parse(f, nullptr, /*allow_exceptions=*/false);
+        if (j.is_object() && deviceNameOf(j) == deviceName) {
+            out.push_back(entry.path().filename().string());
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::optional<ProbePicks>
+loadProbePicks(const std::string& dir, const std::string& key) {
+    namespace fs = std::filesystem;
+    const fs::path path = fs::path{dir} / "hw" / key / "probe-result.json";
 
     std::error_code ec;
     if (!fs::exists(path, ec)) {
@@ -91,16 +153,20 @@ loadProbePicks(const std::string& dir, const std::string& fingerprint) {
 
     ProbePicks picks;
     picks.fingerprint = j.value("fingerprint", std::string{});
+    picks.hwClass     = j.value("hw_class", std::string{});
     picks.modelId     = j.value("model_id", std::string{});
     picks.probeStatus = j.value("probe_status", std::string{});
+    picks.probedKernel = probedKernelOf(j);
 
-    // Defensive: the fingerprint lives in the path AND the file; a mismatch
-    // means a stale/corrupt artefact — refuse it rather than apply the wrong
-    // hardware's picks.
-    if (picks.fingerprint != fingerprint) {
+    // Defensive: the key lives in the path AND the file; a mismatch means a
+    // stale/corrupt artefact — refuse it rather than apply the wrong
+    // hardware's picks. The directory may be keyed by the exact fingerprint or
+    // by the stable hw-class key (5.19.1).
+    if (picks.fingerprint != key && picks.hwClass != key) {
         MM_LOG_WARN("probe",
-                    "probe artefact {} fingerprint '{}' != expected '{}' — ignoring",
-                    path.string(), picks.fingerprint, fingerprint);
+                    "probe artefact {} names fingerprint '{}' / hw_class '{}', "
+                    "expected '{}' — ignoring",
+                    path.string(), picks.fingerprint, picks.hwClass, key);
         return std::nullopt;
     }
 
@@ -130,7 +196,7 @@ loadProbePicks(const std::string& dir, const std::string& fingerprint) {
 }
 
 std::optional<ProbePicks>
-loadModelOverlay(const std::string& dir, const std::string& fingerprint,
+loadModelOverlay(const std::string& dir, const std::string& key,
                  const std::string& modelId) {
     namespace fs = std::filesystem;
     if (modelId.empty()) {
@@ -147,7 +213,7 @@ loadModelOverlay(const std::string& dir, const std::string& fingerprint,
     // Dir name is "model-overlays", NOT "models" — the latter is .gitignore'd
     // (model weight directories), which would leave the overlay untracked.
     const fs::path path =
-        fs::path{dir} / "hw" / fingerprint / "model-overlays" / (modelId + ".json");
+        fs::path{dir} / "hw" / key / "model-overlays" / (modelId + ".json");
 
     std::error_code ec;
     if (!fs::exists(path, ec)) {

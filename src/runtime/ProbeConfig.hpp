@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace mimirmind::runtime {
 
@@ -15,7 +16,9 @@ namespace mimirmind::runtime {
  * a miss falls back to the normal online autotune (no behaviour change).
  */
 struct ProbePicks {
-    std::string fingerprint;   // as read from the artefact
+    std::string fingerprint;   // as read from the artefact (exact HW it was probed on)
+    std::string hwClass;       // `hw_class` as read from the artefact (5.19.1), may be empty
+    std::string probedKernel;  // kernel release the artefact was probed on, may be empty
     std::string modelId;       // model_id tag in the artefact
     std::string probeStatus;   // "fingerprint-only" | "swept-partial" | ...
     bool        hasAutotune{false};
@@ -81,17 +84,28 @@ struct ProbePicks {
 };
 
 /**
- * Load configs/hw/{fingerprint}/probe-result.json under `dir` and extract the
- * actionable picks. Returns nullopt on any miss: no dir/file, a fingerprint
- * mismatch inside the file, or a parse error (logged, never throws). The
+ * Load configs/hw/{key}/probe-result.json under `dir` and extract the
+ * actionable picks. `key` is either the exact HW fingerprint or the stable
+ * hw-class key (5.19.1); the artefact must name the same key in its
+ * `fingerprint` or `hw_class` field. Returns nullopt on any miss: no dir/file,
+ * a key mismatch inside the file, or a parse error (logged, never throws). The
  * caller stays on its defaults on nullopt.
  */
 [[nodiscard]] std::optional<ProbePicks>
-loadProbePicks(const std::string& dir, const std::string& fingerprint);
+loadProbePicks(const std::string& dir, const std::string& key);
+
+/**
+ * Names of the profile directories under `dir`/hw whose artefact was authored
+ * for `deviceName` (`device.device_name` or `hardware.backend.device_name`).
+ * Diagnostic only: lets a lookup miss say "a profile for this GPU exists, but
+ * its key drifted" instead of failing silently. Never throws.
+ */
+[[nodiscard]] std::vector<std::string>
+findProfilesForDevice(const std::string& dir, const std::string& deviceName);
 
 /**
  * Load a per-model flag overlay from
- * configs/hw/{fingerprint}/model-overlays/{modelId}.json under `dir` and return its
+ * configs/hw/{key}/model-overlays/{modelId}.json under `dir` and return its
  * `flags` picks (same schema as the HW profile's flags block: an entry drives
  * a flag only with "apply": true). This is the (hardware x model) key: the same
  * flag can be validated-safe on one checkpoint and unsafe on another running on
@@ -100,7 +114,7 @@ loadProbePicks(const std::string& dir, const std::string& fingerprint);
  * HW-profile picks unchanged. `modelId` is sanitised to a bare filename.
  */
 [[nodiscard]] std::optional<ProbePicks>
-loadModelOverlay(const std::string& dir, const std::string& fingerprint,
+loadModelOverlay(const std::string& dir, const std::string& key,
                  const std::string& modelId);
 
 /**

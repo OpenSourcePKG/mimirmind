@@ -2079,6 +2079,25 @@ add_executable(thermal_tests
 target_include_directories(thermal_tests PRIVATE tests)
 target_link_libraries(thermal_tests PRIVATE mimirmind_core_common)
 
+# ---- probe_config_tests — per-HW profile keys + lookup (5.19.1) -------------
+add_executable(probe_config_tests
+    tests/probe_config_tests.cpp
+    src/runtime/ProbeConfig.cpp
+)
+target_include_directories(probe_config_tests PRIVATE tests)
+# HwFingerprint lives in core_common next to BackendRegistry, whose backend
+# probe symbols come from the concrete backend libs (same as backend_tests).
+target_link_libraries(probe_config_tests PRIVATE mimirmind_core_common)
+if(MIMIRMIND_ENABLE_L0)
+    target_link_libraries(probe_config_tests PRIVATE mimirmind_core_l0)
+endif()
+if(MIMIRMIND_ENABLE_HIP)
+    target_link_libraries(probe_config_tests PRIVATE mimirmind_core_hip)
+endif()
+if(MIMIRMIND_ENABLE_CUDA)
+    target_link_libraries(probe_config_tests PRIVATE mimirmind_core_cuda)
+endif()
+
 # ---- L0-backed integration binaries ----------------------------------------
 #
 # gpu_tests / prefill_bench / l0_ipc_testrig all need libze_loader plus the
@@ -3627,7 +3646,8 @@ foreach(mm_cpu_test
         arch_tests
         ipc_tests
         compute_tests
-        thermal_tests)
+        thermal_tests
+        probe_config_tests)
     mm_register_test(${mm_cpu_test} cpu)
 endforeach()
 

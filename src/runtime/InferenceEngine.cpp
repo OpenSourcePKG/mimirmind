@@ -801,6 +801,7 @@ core::config::FeatureSettings InferenceEngine::l0AutotuneFeatures() const {
     const std::string& fp    = profile.fingerprint;
     const std::string& dir   = profile.dir;
     const auto&        picks = profile.picks;
+    ProfileOverlayApplier::logDrift(profile);
     if (picks && picks->hasAutotune && picks->gemmNeverForAllMatmul &&
         tunedFeatures.gemm == core::config::TriState::Auto) {
         tunedFeatures.gemm = core::config::TriState::Disable;
@@ -842,16 +843,22 @@ void InferenceEngine::applyCudaProfile() {
     const ResolvedProfile profile =
         ProfileOverlayApplier::resolve(*_computeCtx, _modelIdHint);
     if (!profile.picks) {
-        MM_LOG_INFO("probe",
-                    "HW fingerprint={} backend=Cuda — per-HW profile not "
-                    "deployed under {} (run mimirmind-probe)",
-                    profile.fingerprint, profile.dir);
+        // WARN, not INFO: on CUDA the profile carries the serving fast paths, and
+        // a silent miss cost GB10 prod its Layer-2 flags twice (5.19.1).
+        MM_LOG_WARN("probe",
+                    "HW fingerprint={} hw-class={} backend=Cuda — per-HW profile "
+                    "not deployed under {} (run mimirmind-probe)",
+                    profile.fingerprint, profile.hwClass, profile.dir);
+        ProfileOverlayApplier::logDrift(profile);
         return;
     }
     MM_LOG_INFO("probe",
                 "HW fingerprint={} backend=Cuda — per-HW profile FOUND "
-                "under {}, applying Layer-2 flags (explicit env wins)",
-                profile.fingerprint, profile.dir);
+                "under {}{}, applying Layer-2 flags (explicit env wins)",
+                profile.fingerprint, profile.dir,
+                profile.viaHwClass ? " via hw-class " + profile.hwClass
+                                   : std::string{});
+    ProfileOverlayApplier::logDrift(profile);
     if (profile.overlayMerged) {
         MM_LOG_INFO("probe",
                     "  per-model overlay FOUND for '{}' — merged "

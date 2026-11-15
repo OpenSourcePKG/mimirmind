@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
 
 namespace mimirmind::runtime {
 
@@ -23,22 +24,67 @@ ProfileOverlayApplier::ProfileOverlayApplier(compute::ComputeOps&    ops,
 ResolvedProfile ProfileOverlayApplier::resolve(
     const core::backend::ComputeContext& ctx, const std::string& modelIdHint) {
     ResolvedProfile out;
-    out.fingerprint = core::backend::computeHwFingerprint(
-        core::backend::gatherHostInfo(),
-        core::backend::identityFromBackend(ctx.backend()));
+    const core::backend::HwHostInfo      host = core::backend::gatherHostInfo();
+    const core::backend::HwProbeIdentity id =
+        core::backend::identityFromBackend(ctx.backend());
+    out.fingerprint = core::backend::computeHwFingerprint(host, id);
+    out.hwClass     = core::backend::computeHwClassKey(host, id);
+    out.hostKernel  = host.kernel;
+    out.deviceName  = id.deviceName;
     const char* dirEnv = std::getenv("MIMIRMIND_PROBE_DIR");
     out.dir = dirEnv ? dirEnv : "/usr/local/share/mimirmind/configs";
+    // Exact fingerprint first (back-compat, per-unit profiles), then the stable
+    // hw-class key so a kernel/driver update no longer drops the profile.
     out.picks = loadProbePicks(out.dir, out.fingerprint);
+    if (out.picks) {
+        out.matchedKey = out.fingerprint;
+    } else if ((out.picks = loadProbePicks(out.dir, out.hwClass))) {
+        out.matchedKey = out.hwClass;
+        out.viaHwClass = true;
+    }
     // Per-(HW x model) overlay: the same flag can be validated-safe on one
     // checkpoint and unsafe on another on the SAME GPU (e.g. F32_TC_PREFILL, or
     // GROUPED_MOE's 512-expert TC path). Model wins over the HW profile.
     if (out.picks && !modelIdHint.empty()) {
-        if (auto over = loadModelOverlay(out.dir, out.fingerprint, modelIdHint)) {
+        if (auto over = loadModelOverlay(out.dir, out.matchedKey, modelIdHint)) {
             mergeOverlay(*out.picks, *over);
             out.overlayMerged = true;
         }
     }
     return out;
+}
+
+void ProfileOverlayApplier::logDrift(const ResolvedProfile& profile) {
+    if (profile.picks) {
+        const ProbePicks& p = *profile.picks;
+        const bool sameHost = p.fingerprint == profile.fingerprint;
+        if (profile.viaHwClass && !sameHost) {
+            MM_LOG_WARN("probe",
+                        "per-HW profile matched via hw-class {} only: probed on "
+                        "fingerprint {} (kernel '{}'), running fingerprint {} "
+                        "(kernel '{}') — applying it (flags are parity-gated); "
+                        "re-run mimirmind-probe to refresh its provenance",
+                        profile.hwClass, p.fingerprint, p.probedKernel,
+                        profile.fingerprint, profile.hostKernel);
+        }
+        return;
+    }
+    const std::vector<std::string> siblings =
+        findProfilesForDevice(profile.dir, profile.deviceName);
+    if (siblings.empty()) {
+        return;
+    }
+    std::string list;
+    for (const auto& s : siblings) {
+        list += list.empty() ? s : ", " + s;
+    }
+    MM_LOG_WARN("probe",
+                "per-HW profile(s) for '{}' exist under {}/hw ({}) but neither "
+                "fingerprint {} nor hw-class {} matches — identity drift, the "
+                "Layer-2 flags are NOT applied; re-key the profile to hw-class {} "
+                "or re-run mimirmind-probe",
+                profile.deviceName, profile.dir, list, profile.fingerprint,
+                profile.hwClass, profile.hwClass);
 }
 
 void ProfileOverlayApplier::apply(const ProbePicks& picks) {

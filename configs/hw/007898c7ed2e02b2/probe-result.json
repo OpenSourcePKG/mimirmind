@@ -1,9 +1,10 @@
 {
   "schema_version": 1,
-  "fingerprint": "a68b756bff8519e8",
+  "fingerprint": "d9fef024d2baed49",
+  "hw_class": "007898c7ed2e02b2",
+  "_key_note": "Keyed by the stable hw-class key (5.19.1): no kernel release, no device UUID, so host kernel/driver updates keep this profile findable. `fingerprint` + provenance.kernel record the exact host it was last validated on; a hw-class hit on a different host logs a WARN but still applies (all flags are parity-gated). History: 78f59405 (2026-08-21) -> a68b756b (CUDA 13.3, 2026-09-15) -> d9fef024 (kernel 7.0.0-1025, 2026-11-08).",
   "model_id": "gb10-blackwell-sm121a",
   "probe_status": "curated-partial",
-  "_rekey_note": "Re-keyed 2026-09-15 from fingerprint 78f59405170233c2: the HW fingerprint drifted (very likely the CUDA 13.3 update) so the runtime logged 'per-HW profile not deployed' and prod silently ran without the Layer-2 profile flags. Same GB10 Blackwell hardware + validated flag set; CUDA 13.3 does not change the correctness of these parity-gated flags. If the fingerprint drifts again, re-key or re-run mimirmind-probe.",
   "device": {
     "backend_kind": "Cuda",
     "device_name": "NVIDIA GB10",
@@ -108,6 +109,8 @@
       "lesson_spark_prod_drops_perf_flags",
       "decisions/2026-08-21-hw-fingerprint-perf-profiles"
     ],
-    "calibration": "The `flags` block is the vLLM-committed-config analogue and is the actionable content today; the runtime loader currently only consumes fingerprint/model_id/probe_status/autotune, so this file registers as a HIT for visibility. Wiring the loader to APPLY `flags` (Layer-2 value-apply) is roadmap 5.19 Increment A.2. Honest scope: measured prefill win of the flag set is -47.5% on a 3438-tok prompt (10.85s -> 5.70s), ~-24% end-to-end RAG."
+    "calibration": "The `flags` block is the vLLM-committed-config analogue and is the actionable content today; the runtime loader currently only consumes fingerprint/model_id/probe_status/autotune, so this file registers as a HIT for visibility. Wiring the loader to APPLY `flags` (Layer-2 value-apply) is roadmap 5.19 Increment A.2. Honest scope: measured prefill win of the flag set is -47.5% on a 3438-tok prompt (10.85s -> 5.70s), ~-24% end-to-end RAG.",
+    "kernel": "7.0.0-1025-nvidia",
+    "revalidated": "2026-11-15: boot-log A/B on GB10 (kernel 7.0.0-1025-nvidia, fingerprint d9fef024d2baed49), all 7 apply:true flags applied, Kolibri-1 serving-class ENABLED, coherent completion."
   }
 }

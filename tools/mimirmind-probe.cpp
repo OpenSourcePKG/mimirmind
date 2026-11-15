@@ -7,9 +7,9 @@
 // contract. It enumerates the active compute backend + host, derives a
 // stable hardware fingerprint, and writes
 //
-//     configs/hw/{fingerprint}/probe-result.json
+//     configs/hw/{hw_class}/probe-result.json   (5.19.1; exact fingerprint kept inside)
 //
-// The runtime reads that artefact *lookup-only* (match on fingerprint, fall
+// The runtime reads that artefact *lookup-only* (match on fingerprint, then hw_class; fall
 // back to defaults on a miss) — no runtime autotune (that is a CLR landmine;
 // see the M-Probe.1 design note). The backend x kernel-variant x shape sweep,
 // the CPU-gold correctness gate, and the median/IQR margin guards
@@ -547,7 +547,7 @@ void printUsage() {
         "  --sweep         run the op sweep (L0 F32 matmul x M-bucket) and fill\n"
         "                  ops[]; without it the artefact is fingerprint-only\n"
         "  --out <dir>     config root (default: configs) ->\n"
-        "                  <dir>/hw/{fingerprint}/probe-result.json\n"
+        "                  <dir>/hw/{hw_class}/probe-result.json\n"
         "  --model <id>    tag the artefact with this model id\n"
         "  --help, -h      this help\n");
 }
@@ -655,6 +655,10 @@ int main(int argc, char** argv) {
     hw["backend"] = std::move(backendJson);
 
     const std::string fingerprint = be::computeHwFingerprint(host, fpId);
+    // 5.19.1: the artefact is keyed (directory) by the stable hw-class key so
+    // a kernel/driver update keeps it findable; the exact fingerprint and the
+    // host kernel stay in the file as provenance.
+    const std::string hwClass = be::computeHwClassKey(host, fpId);
 
     // --- Op sweep (optional) -----------------------------------------------
     // "fingerprint-only" = no measurements (runtime uses defaults).
@@ -690,6 +694,7 @@ int main(int argc, char** argv) {
         {"schema", "mimirmind-probe-result/v1"},
         {"generated_at", iso8601UtcNow()},
         {"fingerprint", fingerprint},
+        {"hw_class", hwClass},
         {"model_id", opt.modelId},
         {"probe_status", probeStatus},
         {"hardware", std::move(hw)},
@@ -705,7 +710,7 @@ int main(int argc, char** argv) {
     }
 
     namespace fs = std::filesystem;
-    const fs::path dir = fs::path{opt.outRoot} / "hw" / fingerprint;
+    const fs::path dir = fs::path{opt.outRoot} / "hw" / hwClass;
     std::error_code ec;
     fs::create_directories(dir, ec);
     if (ec) {
@@ -736,6 +741,7 @@ int main(int argc, char** argv) {
         const json rec = {
             {"at", artefact.at("generated_at")},
             {"fingerprint", fingerprint},
+            {"hw_class", hwClass},
             {"model_id", opt.modelId},
             {"device", artefact.at("hardware").at("backend")
                            .value("device_name", std::string{"none"})},
@@ -754,8 +760,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("mimirmind-probe: fingerprint=%s  backend=%s  ->  %s\n",
-                fingerprint.c_str(),
+    std::printf("mimirmind-probe: fingerprint=%s  hw_class=%s  backend=%s  ->  %s\n",
+                fingerprint.c_str(), hwClass.c_str(),
                 be::BackendRegistry::name(kind),
                 out.c_str());
     return 0;

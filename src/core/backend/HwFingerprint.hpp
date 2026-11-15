@@ -58,4 +58,14 @@ class ComputeBackend;   // fwd
 [[nodiscard]] std::string computeHwFingerprint(const HwHostInfo&      host,
                                                const HwProbeIdentity& id);
 
+/// Stable hardware-CLASS key (roadmap 5.19.1), the fallback lookup key for
+/// per-HW profiles. Same canonical identity as the fingerprint MINUS the
+/// fields that drift on unchanged hardware or differ per physical unit: the
+/// kernel release (host updates) and the device UUID (serial), with RAM
+/// bucketed to 8 GiB so kernel-reserved-memory jitter cannot flip it. Two boxes
+/// of the same SKU share a class key — like vLLM's device_name-keyed configs.
+/// Deterministic 16-hex-char FNV-1a-64, disjoint from the fingerprint space.
+[[nodiscard]] std::string computeHwClassKey(const HwHostInfo&      host,
+                                            const HwProbeIdentity& id);
+
 } // namespace mimirmind::core::backend

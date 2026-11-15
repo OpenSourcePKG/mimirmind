@@ -111,4 +111,25 @@ std::string computeHwFingerprint(const HwHostInfo& host, const HwProbeIdentity& 
     return toHex16(fnv1a64(fp.str()));
 }
 
+std::string computeHwClassKey(const HwHostInfo& host, const HwProbeIdentity& id) {
+    // Same stability contract as computeHwFingerprint (order and separators are
+    // load-bearing). Deliberately EXCLUDES host.kernel and id.uuid: a kernel or
+    // driver update on the same GPU must keep finding its profile (5.19.1 —
+    // the fingerprint drifted twice on GB10 and prod silently lost its Layer-2
+    // flags). The "hwclass/v1" prefix keeps the key space disjoint from the
+    // fingerprint's.
+    const std::uint64_t ramBucketGiB = ((host.ramGiB + 4U) / 8U) * 8U;
+    std::ostringstream key;
+    key << "hwclass/v1|host|" << host.cpuModel << '|' << host.threads << '|'
+        << ramBucketGiB;
+    if (id.haveBackend) {
+        key << "|dev|" << id.backendKind << '|' << id.deviceName << '|' << id.pci
+            << '|' << id.numComputeUnits;
+        for (bool f : id.features) key << (f ? '1' : '0');
+    } else {
+        key << "|dev|none";
+    }
+    return toHex16(fnv1a64(key.str()));
+}
+
 } // namespace mimirmind::core::backend

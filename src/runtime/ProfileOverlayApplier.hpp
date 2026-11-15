@@ -23,8 +23,13 @@ namespace mimirmind::runtime {
  * per-(HW x model) overlay merged in when one was requested and found).
  */
 struct ResolvedProfile {
-    std::string               fingerprint;
+    std::string               fingerprint;    // exact HW fingerprint of this host
+    std::string               hwClass;        // stable hw-class key (5.19.1)
+    std::string               hostKernel;     // running kernel release
+    std::string               deviceName;     // backend device name
     std::string               dir;
+    std::string               matchedKey;     // profile dir that hit; empty on a miss
+    bool                      viaHwClass{false};  // hit on the hw-class fallback
     std::optional<ProbePicks> picks;          // nullopt = no profile deployed
     bool                      overlayMerged{false};
 };
@@ -50,11 +55,21 @@ public:
                           model::LlmConfig&       config) noexcept;
 
     /// Fingerprint the host + backend and load the profile from
-    /// `$MIMIRMIND_PROBE_DIR` (default /usr/local/share/mimirmind/configs).
-    /// A non-empty `modelIdHint` also merges that model's overlay (model wins).
+    /// `$MIMIRMIND_PROBE_DIR` (default /usr/local/share/mimirmind/configs):
+    /// configs/hw/<exact fingerprint>/ first, then configs/hw/<hw-class key>/
+    /// (5.19.1 — survives kernel/driver updates). A non-empty `modelIdHint`
+    /// also merges that model's overlay from the matched dir (model wins).
+    /// Silent; call logDrift() once per load for the diagnostics.
     [[nodiscard]] static ResolvedProfile
     resolve(const core::backend::ComputeContext& ctx,
             const std::string&                   modelIdHint);
+
+    /// WARN when the profile only matched via the hw-class fallback on a host
+    /// that differs from where it was probed (kernel / exact fingerprint), or
+    /// when nothing matched although a profile for the same device exists
+    /// under another key. Silent identity drift dropped the GB10 Layer-2 flags
+    /// twice before 5.19.1.
+    static void logDrift(const ResolvedProfile& profile);
 
     /// Apply every flag `picks` opts into (explicit env wins).
     void apply(const ProbePicks& picks);
