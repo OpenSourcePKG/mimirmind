@@ -19,8 +19,10 @@ namespace {
 
 namespace fs = std::filesystem;
 
+/// Standard FNV-1a 64 (offset basis 0xcbf29ce484222325) — external tools
+/// (Hugin, rune authoring) must be able to reproduce this value.
 std::string fnv1aHex(std::string_view s) {
-    std::uint64_t h = 1469598103934665603ULL;
+    std::uint64_t h = 0xcbf29ce484222325ULL;
     for (const char ch : s) {
         const auto c = static_cast<unsigned char>(ch);
         h ^= c;

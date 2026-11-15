@@ -18,6 +18,10 @@ namespace mimirmind::core::backend {
 
 namespace {
 
+// NOTE: the offset basis below is NOT the standard FNV-1a 64 one
+// (0xcbf29ce484222325 = 14695981039346656037; a digit is missing). It is kept
+// deliberately: the resulting fingerprints are persisted as configs/hw/<fp>
+// directory names, so changing it would orphan every per-HW profile.
 std::uint64_t fnv1a64(std::string_view s) {
     std::uint64_t h = 1469598103934665603ULL;
     for (char ch : s) {

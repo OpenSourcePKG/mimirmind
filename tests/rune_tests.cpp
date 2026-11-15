@@ -659,6 +659,10 @@ TEST(checkpointFingerprint_matchesShardSetFormula) {
         std::ofstream(dir / "model.safetensors", std::ios::binary) << std::string(100, 'x');
     }
     const std::vector<mimirmind::core::safetensors::ShardSize> one = {{"model.safetensors", 100}};
+    // Pinned against an independent standard FNV-1a 64 of
+    // "model.safetensors:100;total:0" — external authoring tools rely on it.
+    EXPECT_EQ(mimirmind::core::safetensors::shardSetFingerprint(one, 0),
+              std::string{"nvfp4:07eb5b978ad457b3"});
     EXPECT_EQ(mimirmind::core::safetensors::checkpointFingerprint(dir.string()),
               mimirmind::core::safetensors::shardSetFingerprint(one, 0));
 
