@@ -242,7 +242,7 @@ ModelEntry parseModel(std::string_view      path,
     }
     checkKnownKeys(path, section, j,
                    {"id", "title", "path", "format", "tokenizerGguf", "codec",
-                    "headsDir", "loadOnStart", "runtime", "backend", "task"});
+                    "headsDir", "runes", "loadOnStart", "runtime", "backend", "task"});
 
     ModelEntry m{};
     if (!j.contains("id") || !j["id"].is_string() || j["id"].get<std::string>().empty()) {
@@ -271,6 +271,18 @@ ModelEntry parseModel(std::string_view      path,
     }
     if (const auto v = readOpt<std::string>(path, section, j, "headsDir"); v.has_value()) {
         m.decideHeadsDir = *v;
+    }
+    if (j.contains("runes")) {
+        const auto& rj = j["runes"];
+        if (!rj.is_array()) {
+            fail(path, section + ".runes must be an array of file paths");
+        }
+        for (const auto& r : rj) {
+            if (!r.is_string() || r.get<std::string>().empty()) {
+                fail(path, section + ".runes entries must be non-empty strings");
+            }
+            m.runes.push_back(r.get<std::string>());
+        }
     }
     if (const auto v = readOpt<std::string>(path, section, j, "task"); v.has_value()) {
         const auto t = modelTaskFromString(*v);

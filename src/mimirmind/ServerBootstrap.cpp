@@ -813,6 +813,7 @@ void ServerBootstrap::loadModels(LoadedModels&                 out,
                     out.attachedKeepAlive.push_back(std::move(ka->second));
                 } else {
                     e->setModelIdHint(m.id);   // for the per-model profile overlay
+                    e->setRunes(m.runes);      // 7.1 Futhark
                     if (runtime::nvfp4::resolveModelFormat(m.format, m.path)
                         == core::config::ModelFormat::Nvfp4) {
                         e->loadModelNvfp4(m.path, m.tokenizerGguf);
@@ -869,6 +870,7 @@ void ServerBootstrap::loadModels(LoadedModels&                 out,
             out.attachedKeepAlive.push_back(std::move(ka->second));
         } else {
             e->setModelIdHint(m.id);   // for the per-model profile overlay
+            e->setRunes(m.runes);      // 7.1 Futhark
             if (runtime::nvfp4::resolveModelFormat(m.format, m.path)
                 == core::config::ModelFormat::Nvfp4) {
                 MM_LOG_INFO("main", "serve: loading NVFP4 model '{}' (id='{}')",
@@ -986,6 +988,7 @@ ServerBootstrap::attachEngineToMunin(runtime::InferenceEngine&       e,
     }
     try {
         e.setModelIdHint(m.id);   // for the per-model profile overlay
+        e.setRunes(m.runes);      // 7.1 Futhark (refused on attached loads)
         if (result->manifest.format == "nvfp4") {
             // GB10 shm attach of an NVFP4 checkpoint: the chunks hold the raw
             // safetensors shards; the engine reconstructs them and runs the

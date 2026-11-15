@@ -398,6 +398,8 @@ add_library(mimirmind_core_common STATIC
     src/core/safetensors/SafetensorsIndex.cpp
     src/core/safetensors/SafetensorsModel.cpp
     src/core/safetensors/SafetensorsReader.cpp
+    src/core/safetensors/CheckpointFingerprint.cpp
+    src/core/rune/Futhark.cpp
     src/core/rune/RuneApplier.cpp
     src/core/rune/RuneFile.cpp
     src/core/rune/RuneFormat.cpp

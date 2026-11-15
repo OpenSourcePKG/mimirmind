@@ -7,6 +7,7 @@
 #include "core/gguf/TensorFingerprint.hpp"
 #include "core/log/Log.hpp"
 #include "core/os/MappedFile.hpp"
+#include "core/safetensors/CheckpointFingerprint.hpp"
 #include "core/safetensors/SafetensorsIndex.hpp"
 
 #include <cstdint>
@@ -28,20 +29,6 @@ namespace {
 
 using ::mimirmind::core::config::ModelEntry;
 using ::mimirmind::core::config::ModelFormat;
-
-/// FNV-1a of `s`, as 16 lowercase hex chars. Used to fingerprint an NVFP4
-/// checkpoint from its shard {name, size} set + declared total — cheap and
-/// reproducible by the attaching worker from the same local files.
-std::string fnv1aHex(std::string_view s) {
-    std::uint64_t h = 1469598103934665603ULL;
-    for (const unsigned char c : s) {
-        h ^= c;
-        h *= 1099511628211ULL;
-    }
-    char buf[17];
-    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
-    return std::string{buf};
-}
 
 /// Decide whether an entry is an NVFP4 checkpoint. Explicit format wins;
 /// Auto probes the filesystem (a directory is a safetensors checkpoint, a
@@ -128,7 +115,7 @@ void loadNvfp4Into(ShmLoadedModel& lm, const std::string& path) {
     const std::size_t chunkBytes = static_cast<std::size_t>(alignUp4k(maxShard));
     lm.chunks = std::make_unique<ShmChunkAllocator>(chunkBytes);
 
-    std::string fpAcc;
+    std::vector<::mimirmind::core::safetensors::ShardSize> fpShards;
     for (const auto& s : layout.shards) {
         ::mimirmind::core::l0::MappedFile mf(s.full.string());  // throws if unreadable
         const auto bytes = mf.bytes();
@@ -143,17 +130,14 @@ void loadNvfp4Into(ShmLoadedModel& lm, const std::string& path) {
         lm.shards.push_back(std::move(sd));
 
         lm.totalBytes += bytes.size();
-        fpAcc += s.name;
-        fpAcc += ':';
-        fpAcc += std::to_string(bytes.size());
-        fpAcc += ';';
+        fpShards.push_back({s.name, bytes.size()});
     }
 
     lm.isNvfp4           = true;
     lm.declaredTotalSize = layout.declaredTotalSize;
-    fpAcc += "total:";
-    fpAcc += std::to_string(layout.declaredTotalSize);
-    lm.fingerprint = "nvfp4:" + fnv1aHex(fpAcc);
+    // Shared with the engine (Futhark binds Runes to this identity).
+    lm.fingerprint = ::mimirmind::core::safetensors::shardSetFingerprint(
+        fpShards, layout.declaredTotalSize);
 }
 
 /// Load a GGUF model: raw tensor bytes into memfd chunks + tensor fingerprint.

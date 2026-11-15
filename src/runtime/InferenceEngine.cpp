@@ -16,6 +16,8 @@
 #include "core/backend/HwFingerprint.hpp"
 #include "runtime/ProbeConfig.hpp"
 #include "runtime/ProfileOverlayApplier.hpp"
+#include "core/rune/Futhark.hpp"
+#include "core/safetensors/CheckpointFingerprint.hpp"
 #include "core/cpu/CpuContext.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "core/gguf/TensorFingerprint.hpp"
@@ -458,6 +460,9 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
 
     _config.parseFromGguf(_reader);
     _tokenizer.loadFromGguf(_reader);
+    if (!_runePaths.empty()) {
+        _runeBaseFingerprint = core::gguf::tensorFingerprint(_reader);
+    }
 
     MM_LOG_INFO("engine", "loadModel: copying tensors into USM");
     {
@@ -498,6 +503,9 @@ void InferenceEngine::loadModelNvfp4(std::string_view checkpointDir,
     if (_modelLoaded) {
         throw std::runtime_error("InferenceEngine: model already loaded");
     }
+    if (!_runePaths.empty()) {
+        _runeBaseFingerprint = core::safetensors::checkpointFingerprint(checkpointDir);
+    }
     applyEarlyLoaderProfileFlags();
     // The NVFP4 checkpoint load pipeline lives in engine::Nvfp4Loader (a friend
     // collaborator) to keep this translation unit focused on generation. It
@@ -524,6 +532,7 @@ void InferenceEngine::loadModelAttached(
         throw std::runtime_error("InferenceEngine::loadModelAttached: "
                                  "manifest.tensors is empty — nothing to attach");
     }
+    refuseRunesOnSharedWeights();
 
     MM_LOG_INFO("engine",
                 "loadModelAttached: opening '{}' (header only)", ggufPath);
@@ -588,6 +597,7 @@ void InferenceEngine::loadModelAttachedNvfp4(
         throw std::runtime_error("InferenceEngine::loadModelAttachedNvfp4: "
                                  "manifest.shards is empty — nothing to attach");
     }
+    refuseRunesOnSharedWeights();
 
     // Refuse-on-drift: every shard Munin advertised must match a local file of
     // the same size under checkpointDir (the worker still has the checkpoint
@@ -648,6 +658,7 @@ void InferenceEngine::loadModelAttachedNvfp4(
 void InferenceEngine::finalizeLoad() {
     bakeFinalLogitSoftcap();
     logLoadDiagnostics();
+    applyRunes();   // 7.1 Futhark — before ANY derived weight copy is built
     prepareL0ComputePath();
     applyCudaProfile();
 
@@ -677,6 +688,60 @@ void InferenceEngine::finalizeLoad() {
                 _config.headCount, _config.headCountKv);
 
     probeBatchCapacity();
+}
+
+void InferenceEngine::refuseRunesOnSharedWeights() const {
+    if (_runePaths.empty()) {
+        return;
+    }
+    // Munin-attached weights live in memory shared with the daemon and every
+    // other attached worker; patching them in place would change the model
+    // for all of them. Runes on attached loads need a copy-on-write overlay
+    // (follow-up) — until then refuse loudly instead of silently skipping.
+    throw std::runtime_error(
+        "InferenceEngine: model '" + _modelIdHint + "' has " +
+        std::to_string(_runePaths.size()) +
+        " rune(s) configured, but runes are not supported on Munin-attached "
+        "(shared) weights yet. Load the model standalone or remove `runes`.");
+}
+
+void InferenceEngine::applyRunes() {
+    if (_runePaths.empty()) {
+        return;
+    }
+    const std::vector<std::string> paths = std::move(_runePaths);
+    _runePaths.clear();
+    const std::string base = std::move(_runeBaseFingerprint);
+    _runeBaseFingerprint.clear();
+    if (base.empty()) {
+        throw std::runtime_error("Futhark: no base fingerprint for this load path — "
+                                 "cannot bind runes");
+    }
+
+    core::rune::FutharkDeviceIo io;
+    io.readback = [this](void* dst, const void* src, std::size_t n) {
+        _ops->readbackToHost(dst, src, n);
+    };
+    io.upload = [this](void* dst, const void* src, std::size_t n) {
+        _ops->uploadHostBytes(dst, src, n);
+    };
+    core::rune::Futhark futhark{std::move(io)};
+    auto res = futhark.applyFiles(paths, base, *_weights);
+    if (!res) {
+        MM_LOG_ERROR("futhark", "model '{}': rune apply failed: {}", _modelIdHint,
+                     res.error());
+        throw std::runtime_error("Futhark: " + res.error());
+    }
+    for (const auto& rep : res->reports) {
+        MM_LOG_INFO("futhark", "model '{}': rune '{}' applied — {} op(s), {} tensor(s)",
+                    _modelIdHint, rep.runeName, rep.opsApplied, rep.touched.size());
+        for (const auto& t : rep.touched) {
+            MM_LOG_INFO("futhark", "  {}: {} -> {}", t.name, t.hashBefore, t.hashAfter);
+        }
+    }
+    MM_LOG_INFO("futhark", "model '{}': {} rune(s) over base '{}', uploaded {} tensor(s) "
+                "/ {} bytes", _modelIdHint, res->reports.size(), base,
+                res->tensorsUploaded, res->bytesUploaded);
 }
 
 void InferenceEngine::bakeFinalLogitSoftcap() {

@@ -99,6 +99,12 @@ struct ModelEntry {
     // bge-m3 encoder dir. Empty => head-less engine (fallback-only) until heads
     // are dropped in.
     std::string       decideHeadsDir{};
+    // 7.1 Futhark: Rune overlay files applied in order right after the weights
+    // are loaded (before any derived copy is built). Each rune is bound to this
+    // model's base fingerprint and per-tensor content hashes; a rune that does
+    // not apply cleanly fails the load. The base model file is never modified —
+    // remove the entry to get the unmodified model back.
+    std::vector<std::string> runes{};
     bool              loadOnStart{true};
     RuntimeSettings   runtime{};         // per-model override, merged onto top-level
 

@@ -227,6 +227,11 @@ public:
     /// no overlay (HW-profile picks only). Cleared after each load.
     void setModelIdHint(std::string_view id) { _modelIdHint = std::string{id}; }
 
+    /// 7.1 Futhark: Rune files (config `models[].runes`) to apply, in order,
+    /// during the load about to run. Set BEFORE loadModel*. Empty = none (the
+    /// load path is then byte-identical to a build without Futhark).
+    void setRunes(std::vector<std::string> runePaths) { _runePaths = std::move(runePaths); }
+
     /**
      * Load a ModelOpt NVFP4 checkpoint directory (CUDA/Bragi only). Uploads
      * the NVFP4/FP8 weights, dequantises them to BF16 on device (weight-only
@@ -1082,6 +1087,12 @@ private:
     // finalizeLoad stages (8.30.11.6), in call order.
     void bakeFinalLogitSoftcap();
     void logLoadDiagnostics();
+    /// 7.1 Futhark: apply `_runePaths` to `_weights` (no-op when empty). Must
+    /// run before any derived weight copy is built. Throws on any rune error;
+    /// the device weights are then left unmodified.
+    void applyRunes();
+    /// Throws when runes are configured for a Munin-attached (shared) load.
+    void refuseRunesOnSharedWeights() const;
     /// FusedQkvWeights + GPU-op self-test + matmul autotune (L0-only paths).
     void prepareL0ComputePath();
 #ifdef MIMIRMIND_HAVE_L0
@@ -1179,6 +1190,11 @@ private:
     core::gguf::GgufReader                  _reader;
     model::LlmConfig                   _config;
     std::string                        _modelIdHint;  // per-load, for the profile overlay
+    std::vector<std::string>           _runePaths;    ///< 7.1 Futhark, per-load
+    /// 7.1: base identity the Runes are bound to, set by each load path
+    /// (GGUF tensorFingerprint / NVFP4 shard-set fingerprint). Empty for
+    /// Munin-attached loads, whose weights are shared and never patched.
+    std::string                        _runeBaseFingerprint;
     model::Tokenizer                   _tokenizer;
 #ifdef MIMIRMIND_HAVE_CUDA
     // NVFP4 load path (loadModelNvfp4). `_materializedBf16` owns the BF16

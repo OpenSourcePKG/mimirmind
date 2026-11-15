@@ -4,13 +4,19 @@
 
 #include "TestFramework.hpp"
 
+#include "core/gguf/GgufReader.hpp"
+#include "core/gguf/WeightsMap.hpp"
+#include "core/rune/Futhark.hpp"
 #include "core/rune/RuneApplier.hpp"
 #include "core/rune/RuneFile.hpp"
 #include "core/rune/RuneFormat.hpp"
+#include "core/safetensors/CheckpointFingerprint.hpp"
 
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
@@ -19,6 +25,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 namespace rn = mimirmind::core::rune;
 
@@ -479,6 +487,193 @@ TEST(apply_viaSerializedFile_endToEnd) {
     rn::RuneApplier applier;
     EXPECT_TRUE(applier.apply(loaded, kBase, model.resolver()).has_value());
     EXPECT_TRUE(model.f32("blk.0.attn_output.weight") == (std::vector<float>{0.25f, -0.5f, 4.0f}));
+}
+
+// ======================================================================
+// Futhark — staged apply over a WeightsMap with injected device I/O
+// ======================================================================
+
+namespace {
+
+namespace gg = mimirmind::core::gguf;
+
+/// "Device" memory: separate host buffers the engine would only reach via
+/// readback/upload. Counts transfers and can fail one upload on demand.
+struct FakeDevice {
+    std::map<std::string, std::vector<float>> mem;
+    int         readbacks{0};
+    int         uploads{0};
+    const void* failUploadTo{nullptr};
+
+    rn::FutharkDeviceIo io() {
+        rn::FutharkDeviceIo d;
+        d.readback = [this](void* dst, const void* src, std::size_t n) {
+            ++readbacks;
+            std::memcpy(dst, src, n);
+        };
+        d.upload = [this](void* dst, const void* src, std::size_t n) {
+            if (dst == failUploadTo) {
+                failUploadTo = nullptr;   // fail once, then let the restore through
+                std::memcpy(dst, src, n / 2);   // simulate a torn copy
+                throw std::runtime_error("injected upload failure");
+            }
+            ++uploads;
+            std::memcpy(dst, src, n);
+        };
+        return d;
+    }
+
+    gg::GgufTensor f32Tensor(const std::string& name, std::uint64_t cols, std::uint64_t rows) {
+        gg::GgufTensor t;
+        t.name       = name;
+        t.type       = gg::GgmlType::F32;
+        t.dimensions = {cols, rows};
+        t.nelements  = cols * rows;
+        t.nbytes     = cols * rows * 4;
+        t.usmPtr     = mem.at(name).data();
+        return t;
+    }
+
+    std::string hash(const std::string& name) const {
+        const auto& v = mem.at(name);
+        return rn::tensorContentHash(v.data(), v.size() * 4);
+    }
+};
+
+} // namespace
+
+TEST(futhark_stackedRunes_uploadOncePerTensor) {
+    FakeDevice dev;
+    dev.mem["w"] = {1, 2, 3, 4};
+    const auto weights = gg::WeightsMap::fromOwnedTensors({dev.f32Tensor("w", 2, 2)});
+    const std::string h0 = dev.hash("w");
+    const std::vector<float> mid = {2, 4, 6, 8};
+    const std::string h1 = rn::tensorContentHash(mid.data(), mid.size() * 4);
+
+    std::vector<rn::RuneFile> runes;
+    runes.push_back(makeRune({scaleOp("w", h0, "s", rn::RuneScaleAxis::Cols)},
+                             {{"s", {2.0f, 2.0f}}}));
+    runes.push_back(makeRune({writeSlice("w", h1, "r", 1, 2)}, {{"r", {9.0f, 9.0f}}}));
+
+    rn::Futhark f{dev.io()};
+    const auto r = f.apply(runes, kBase, weights);
+    EXPECT_TRUE(r.has_value());
+    EXPECT_EQ(r->reports.size(), std::size_t{2});
+    EXPECT_EQ(r->tensorsUploaded, std::size_t{1});
+    EXPECT_EQ(dev.readbacks, 1);
+    EXPECT_EQ(dev.uploads, 1);
+    EXPECT_TRUE(dev.mem["w"] == (std::vector<float>{2, 4, 9, 9}));
+}
+
+TEST(futhark_failingRune_neverTouchesDevice) {
+    FakeDevice dev;
+    dev.mem["a"] = {1, 2};
+    dev.mem["b"] = {3, 4};
+    const auto weights = gg::WeightsMap::fromOwnedTensors(
+        {dev.f32Tensor("a", 2, 1), dev.f32Tensor("b", 2, 1)});
+    std::vector<rn::RuneFile> runes;
+    runes.push_back(makeRune({scaleOp("a", dev.hash("a"), "s", rn::RuneScaleAxis::Cols)},
+                             {{"s", {5.0f, 5.0f}}}));
+    runes.push_back(makeRune({scaleOp("b", "fnv1a64:2222222222222222", "s",
+                                      rn::RuneScaleAxis::Cols)},
+                             {{"s", {5.0f, 5.0f}}}));
+    rn::Futhark f{dev.io()};
+    const auto r = f.apply(runes, kBase, weights);
+    EXPECT_TRUE(!r.has_value());
+    EXPECT_EQ(dev.uploads, 0);
+    EXPECT_TRUE(dev.mem["a"] == (std::vector<float>{1, 2}));
+    EXPECT_TRUE(dev.mem["b"] == (std::vector<float>{3, 4}));
+}
+
+TEST(futhark_refusesDerivedSiblingAndQuantTargets) {
+    FakeDevice dev;
+    dev.mem["output.weight"]    = {1, 2};
+    dev.mem["output.weight.nv"] = {0, 0};
+    dev.mem["q"]                = {1, 2};
+    auto q = dev.f32Tensor("q", 2, 1);
+    q.type = gg::GgmlType::Q8_0;
+    const auto weights = gg::WeightsMap::fromOwnedTensors(
+        {dev.f32Tensor("output.weight", 2, 1), dev.f32Tensor("output.weight.nv", 2, 1), q});
+    rn::Futhark f{dev.io()};
+
+    std::vector<rn::RuneFile> r1;
+    r1.push_back(makeRune({scaleOp("output.weight", dev.hash("output.weight"), "s",
+                                   rn::RuneScaleAxis::Cols)},
+                          {{"s", {2.0f, 2.0f}}}));
+    const auto a = f.apply(r1, kBase, weights);
+    EXPECT_TRUE(!a.has_value());
+    EXPECT_TRUE(a.error().find("derived copies") != std::string::npos);
+
+    std::vector<rn::RuneFile> r2;
+    r2.push_back(makeRune({scaleOp("q", dev.hash("q"), "s", rn::RuneScaleAxis::Cols)},
+                          {{"s", {2.0f, 2.0f}}}));
+    const auto b = f.apply(r2, kBase, weights);
+    EXPECT_TRUE(!b.has_value());
+    EXPECT_TRUE(b.error().find("quantised") != std::string::npos);
+
+    EXPECT_EQ(dev.readbacks, 0);   // refused targets are never even read back
+    EXPECT_EQ(dev.uploads, 0);
+}
+
+TEST(futhark_uploadFailure_restoresDevice) {
+    FakeDevice dev;
+    dev.mem["a"] = {1, 2};
+    dev.mem["b"] = {3, 4};
+    const auto weights = gg::WeightsMap::fromOwnedTensors(
+        {dev.f32Tensor("a", 2, 1), dev.f32Tensor("b", 2, 1)});
+    std::vector<rn::RuneFile> runes;
+    runes.push_back(makeRune({scaleOp("a", dev.hash("a"), "s", rn::RuneScaleAxis::Cols),
+                              scaleOp("b", dev.hash("b"), "s", rn::RuneScaleAxis::Cols)},
+                             {{"s", {7.0f, 7.0f}}}));
+    dev.failUploadTo = dev.mem["b"].data();
+    rn::Futhark f{dev.io()};
+    const auto r = f.apply(runes, kBase, weights);
+    EXPECT_TRUE(!r.has_value());
+    EXPECT_TRUE(r.error().find("restored to the base model") != std::string::npos);
+    EXPECT_TRUE(dev.mem["a"] == (std::vector<float>{1, 2}));
+    EXPECT_TRUE(dev.mem["b"] == (std::vector<float>{3, 4}));
+}
+
+TEST(futhark_wrongBaseFingerprint_refused) {
+    FakeDevice dev;
+    dev.mem["w"] = {1, 2};
+    const auto weights = gg::WeightsMap::fromOwnedTensors({dev.f32Tensor("w", 2, 1)});
+    std::vector<rn::RuneFile> runes;
+    runes.push_back(makeRune({scaleOp("w", dev.hash("w"), "s", rn::RuneScaleAxis::Cols)},
+                             {{"s", {2.0f, 2.0f}}}));
+    rn::Futhark f{dev.io()};
+    EXPECT_TRUE(!f.apply(runes, "some-other-model", weights).has_value());
+    EXPECT_EQ(dev.uploads, 0);
+}
+
+// ======================================================================
+// Checkpoint fingerprint (shared with Munin)
+// ======================================================================
+
+TEST(checkpointFingerprint_matchesShardSetFormula) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() /
+                         ("rune_tests_ckpt_" + std::to_string(::getpid()));
+    fs::create_directories(dir);
+    {
+        std::ofstream(dir / "model.safetensors", std::ios::binary) << std::string(100, 'x');
+    }
+    const std::vector<mimirmind::core::safetensors::ShardSize> one = {{"model.safetensors", 100}};
+    EXPECT_EQ(mimirmind::core::safetensors::checkpointFingerprint(dir.string()),
+              mimirmind::core::safetensors::shardSetFingerprint(one, 0));
+
+    {
+        std::ofstream(dir / "a.safetensors", std::ios::binary) << std::string(10, 'a');
+        std::ofstream(dir / "b.safetensors", std::ios::binary) << std::string(20, 'b');
+        std::ofstream(dir / "model.safetensors.index.json")
+            << R"({"metadata":{"total_size":30},"weight_map":{"x":"a.safetensors","y":"b.safetensors"}})";
+    }
+    const std::vector<mimirmind::core::safetensors::ShardSize> two = {{"a.safetensors", 10},
+                                                                     {"b.safetensors", 20}};
+    const std::string fp = mimirmind::core::safetensors::checkpointFingerprint(dir.string());
+    EXPECT_EQ(fp, mimirmind::core::safetensors::shardSetFingerprint(two, 30));
+    EXPECT_EQ(fp.substr(0, 6), std::string{"nvfp4:"});
+    fs::remove_all(dir);
 }
 
 int main() {
