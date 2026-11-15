@@ -1079,6 +1079,23 @@ private:
     /// line.
     void finalizeLoad();
 
+    // finalizeLoad stages (8.30.11.6), in call order.
+    void bakeFinalLogitSoftcap();
+    void logLoadDiagnostics();
+    /// FusedQkvWeights + GPU-op self-test + matmul autotune (L0-only paths).
+    void prepareL0ComputePath();
+#ifdef MIMIRMIND_HAVE_L0
+    /// `_cfg.features` with the offline probe artefact's autotune pick applied.
+    [[nodiscard]] core::config::FeatureSettings l0AutotuneFeatures() const;
+#endif
+    /// Per-HW profile + per-model overlay Layer-2 flags (CUDA only). Must run
+    /// before the arch backend is constructed (getenv-owned flags).
+    void applyCudaProfile();
+    void attachQwen4ExpPleTable();
+    /// BatchCapacityProbe estimate + serving-class gate (needs `_backend`).
+    void probeBatchCapacity();
+    void gateServingClass();
+
     /// Apply profile/overlay flags that the NVFP4 loader itself consumes
     /// (currently MIMIRMIND_GROUPED_MOE, which selects the expert-bank layout)
     /// BEFORE Nvfp4Loader::load runs — finalizeLoad's Layer-2 block is too late

@@ -15,6 +15,7 @@
 #include "core/backend/BackendRegistry.hpp"
 #include "core/backend/HwFingerprint.hpp"
 #include "runtime/ProbeConfig.hpp"
+#include "runtime/ProfileOverlayApplier.hpp"
 #include "core/cpu/CpuContext.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "core/gguf/TensorFingerprint.hpp"
@@ -476,20 +477,11 @@ void InferenceEngine::applyEarlyLoaderProfileFlags() {
     if (std::getenv("MIMIRMIND_GROUPED_MOE") != nullptr) {
         return;   // explicit env wins — do not override
     }
-    const std::string fp = core::backend::computeHwFingerprint(
-        core::backend::gatherHostInfo(),
-        core::backend::identityFromBackend(_computeCtx->backend()));
-    const char* dirEnv = std::getenv("MIMIRMIND_PROBE_DIR");
-    const std::string dir =
-        dirEnv ? dirEnv : "/usr/local/share/mimirmind/configs";
-    auto picks = loadProbePicks(dir, fp);
+    const ResolvedProfile profile =
+        ProfileOverlayApplier::resolve(*_computeCtx, _modelIdHint);
+    const auto& picks = profile.picks;
     if (!picks) {
         return;
-    }
-    if (!_modelIdHint.empty()) {
-        if (auto over = loadModelOverlay(dir, fp, _modelIdHint)) {
-            mergeOverlay(*picks, *over);
-        }
     }
     if (picks->applyGroupedMoe) {
         const std::string mode = std::to_string(*picks->applyGroupedMoe);
@@ -654,6 +646,40 @@ void InferenceEngine::loadModelAttachedNvfp4(
 }
 
 void InferenceEngine::finalizeLoad() {
+    bakeFinalLogitSoftcap();
+    logLoadDiagnostics();
+    prepareL0ComputePath();
+    applyCudaProfile();
+
+    // Pick the arch backend now that weights are available. Returns
+    // nullptr for unsupported architectures so generate() can refuse
+    // gracefully with the original architecture string in the error.
+    // Schicht 5.1 — arch backends now consume ComputeOps / ComputeMatmul
+    // through the base. `_ops` / `_gmm` are unique_ptr<Base>, deref-passes
+    // the referenced instance. OpProfiler is still L0-only (guarded on
+    // ctor); if a HIP model-load path lands (Schicht 5.2+ around
+    // GgufReader), the profiler needs its own backend-neutral variant.
+    _backend = arch::createArchBackend(
+        _config.architecture, _config, *_weights, _fusedQkv.get(),
+        *_ops, *_gmm, _opProfiler.value(), _cfg.features.moeGroup,
+        _cfg.features.moeFusedDown != core::config::TriState::Disable);
+    attachQwen4ExpPleTable();
+
+    _modelLoaded = true;
+    // Defensive: a previous model's KV state must not survive into the
+    // new model. The current API throws on loadModel-while-loaded so
+    // this is theoretical, but it keeps the invariant local.
+    resetCache();
+    MM_LOG_INFO("engine",
+                "loadModel: ready — arch={} blocks={} d_model={} ff={} heads={} kv={}",
+                _config.architecture, _config.blockCount,
+                _config.embeddingLength, _config.feedForwardLength,
+                _config.headCount, _config.headCountKv);
+
+    probeBatchCapacity();
+}
+
+void InferenceEngine::bakeFinalLogitSoftcap() {
     // Bake the final-logit softcap from LlmConfig into the engine field
     // that the sampler + spec-dec verify read. `MIMIRMIND_DISABLE_SOFTCAP=1`
     // is a correctness rollback — clears the value to zero so we get
@@ -676,7 +702,9 @@ void InferenceEngine::finalizeLoad() {
                         _finalLogitSoftcap);
         }
     }
+}
 
+void InferenceEngine::logLoadDiagnostics() {
     // One-shot architecture diagnostic. For gemma4 also dump the first
     // shared-KV block (block 5 in the standard 26B-A4B layout) — we
     // need to see if its Q tensor has a different output dim than block 0,
@@ -687,7 +715,9 @@ void InferenceEngine::finalizeLoad() {
         logBlockTensorInventory(_reader, 5);
     }
     logTensorTaxonomy(_reader);
+}
 
+void InferenceEngine::prepareL0ComputePath() {
     // M5i.B: Try to fuse per-block attn_q/k/v weights so the QKV
     // projections can dispatch as one matmul. The class no-ops when
     // `features.fusedQkv` is false or when a block doesn't qualify
@@ -697,8 +727,6 @@ void InferenceEngine::finalizeLoad() {
     // (Q6_K/Q4_K) with attn_k (Q5_K) per own-KV block, which would kill
     // fusion entirely — the requant-to-Q8_0 path rescues those blocks
     // at load time (quality neutral-to-better, ~70 MiB overhead on E4B).
-    const bool requantToQ8_0 =
-        (_config.architecture == "gemma4") && (_config.sharedKvLayers > 0);
     // Schicht 5.4 — FusedQkvWeights + load-time diagnostics are L0-only.
     // On HIP `_fusedQkv` stays nullptr (downstream code already handles
     // "fusion off"). selfTest / autotune / autotune-KTile-Q8 stay skipped
@@ -706,6 +734,8 @@ void InferenceEngine::finalizeLoad() {
     // equivalents don't exist yet and aren't blockers for a load attempt.
 #ifdef MIMIRMIND_HAVE_L0
     if (_computeCtx->kind() == core::backend::BackendKind::LevelZero) {
+        const bool requantToQ8_0 =
+            (_config.architecture == "gemma4") && (_config.sharedKvLayers > 0);
         _fusedQkv = std::make_unique<model::FusedQkvWeights>(
             *_weights, allocator(), _config.blockCount,
             _cfg.features.fusedQkv,
@@ -735,42 +765,9 @@ void InferenceEngine::finalizeLoad() {
         // per QuantType. Honours `features.gemm` / `features.dp4a`.
         l0Ops().selfTest(allocator());
 
-        // M-Probe.1 — consult the offline probe artefact for this exact HW
-        // (fingerprint-matched). A hit lets us apply the persisted
-        // kernel-variant decision and skip the online autotune bench;
-        // behaviour-identical on matching hardware, just faster startup. A
-        // miss (the default — no artefact deployed) falls straight through to
-        // the normal online autotune, so this is inert until an operator runs
-        // `mimirmind-probe --sweep` and deploys the result.
-        core::config::FeatureSettings tunedFeatures = _cfg.features;
-        {
-            const std::string fp = core::backend::computeHwFingerprint(
-                core::backend::gatherHostInfo(),
-                core::backend::identityFromBackend(_computeCtx->backend()));
-            const char* dirEnv = std::getenv("MIMIRMIND_PROBE_DIR");
-            const std::string dir =
-                dirEnv ? dirEnv : "/usr/local/share/mimirmind/configs";
-            const auto picks = loadProbePicks(dir, fp);
-            if (picks && picks->hasAutotune && picks->gemmNeverForAllMatmul &&
-                tunedFeatures.gemm == core::config::TriState::Auto) {
-                tunedFeatures.gemm = core::config::TriState::Disable;
-                MM_LOG_INFO("probe",
-                            "probe artefact HIT (fp={} model='{}' status={}) — "
-                            "applying persisted pick (GEMM never wins, matvec "
-                            "everywhere); skipping the online autotune bench",
-                            fp, picks->modelId, picks->probeStatus);
-            } else if (picks) {
-                MM_LOG_INFO("probe",
-                            "probe artefact for fp={} has no actionable pick "
-                            "(hasAutotune={}, gemmNever={}) — online autotune",
-                            fp, picks->hasAutotune, picks->gemmNeverForAllMatmul);
-            } else {
-                MM_LOG_INFO("probe",
-                            "no probe artefact for fp={} under {} — online "
-                            "autotune (run mimirmind-probe --sweep to generate)",
-                            fp, dir);
-            }
-        }
+        // M-Probe.1 — persisted autotune pick from the offline probe artefact.
+        const core::config::FeatureSettings tunedFeatures =
+            l0AutotuneFeatures();
         l0Gmm().autotune(allocator(), _config.embeddingLength, tunedFeatures);
     } else {
         MM_LOG_INFO("engine",
@@ -786,9 +783,50 @@ void InferenceEngine::finalizeLoad() {
                 "GPU-op self-test, and matmul autotune (L0-only paths)",
                 core::backend::BackendRegistry::name(_computeCtx->kind()));
 #endif
+}
 
+#ifdef MIMIRMIND_HAVE_L0
+core::config::FeatureSettings InferenceEngine::l0AutotuneFeatures() const {
+    // M-Probe.1 — consult the offline probe artefact for this exact HW
+    // (fingerprint-matched). A hit lets us apply the persisted
+    // kernel-variant decision and skip the online autotune bench;
+    // behaviour-identical on matching hardware, just faster startup. A
+    // miss (the default — no artefact deployed) falls straight through to
+    // the normal online autotune, so this is inert until an operator runs
+    // `mimirmind-probe --sweep` and deploys the result.
+    core::config::FeatureSettings tunedFeatures = _cfg.features;
+    // HW profile only — the per-model overlay carries no autotune pick.
+    const ResolvedProfile profile =
+        ProfileOverlayApplier::resolve(*_computeCtx, /*modelIdHint=*/{});
+    const std::string& fp    = profile.fingerprint;
+    const std::string& dir   = profile.dir;
+    const auto&        picks = profile.picks;
+    if (picks && picks->hasAutotune && picks->gemmNeverForAllMatmul &&
+        tunedFeatures.gemm == core::config::TriState::Auto) {
+        tunedFeatures.gemm = core::config::TriState::Disable;
+        MM_LOG_INFO("probe",
+                    "probe artefact HIT (fp={} model='{}' status={}) — "
+                    "applying persisted pick (GEMM never wins, matvec "
+                    "everywhere); skipping the online autotune bench",
+                    fp, picks->modelId, picks->probeStatus);
+    } else if (picks) {
+        MM_LOG_INFO("probe",
+                    "probe artefact for fp={} has no actionable pick "
+                    "(hasAutotune={}, gemmNever={}) — online autotune",
+                    fp, picks->hasAutotune, picks->gemmNeverForAllMatmul);
+    } else {
+        MM_LOG_INFO("probe",
+                    "no probe artefact for fp={} under {} — online "
+                    "autotune (run mimirmind-probe --sweep to generate)",
+                    fp, dir);
+    }
+    return tunedFeatures;
+}
+#endif
+
+void InferenceEngine::applyCudaProfile() {
     // M-Probe.1 / 5.19 — HW-fingerprint + per-HW profile lookup + Layer-2
-    // flag-apply for the CUDA backend. The L0 autotune block above computes the
+    // flag-apply for the CUDA backend. prepareL0ComputePath() computes the
     // fingerprint and applies its persisted GEMM-vs-vec pick; CUDA has no online
     // autotune (dense -> cuBLAS, MoE -> specialised NVFP4/FP4-TC kernels), so
     // here the profile drives the parity-gated prefill fast-path flags instead.
@@ -798,215 +836,32 @@ void InferenceEngine::finalizeLoad() {
     // Keeping them out of the ephemeral container env is the whole point: a
     // from-scratch restart can no longer silently drop the fast prefill path.
     // See ADR decisions/2026-08-21-hw-fingerprint-perf-profiles.
-    if (_computeCtx->kind() == core::backend::BackendKind::Cuda) {
-        const std::string fp = core::backend::computeHwFingerprint(
-            core::backend::gatherHostInfo(),
-            core::backend::identityFromBackend(_computeCtx->backend()));
-        const char* dirEnv = std::getenv("MIMIRMIND_PROBE_DIR");
-        const std::string dir =
-            dirEnv ? dirEnv : "/usr/local/share/mimirmind/configs";
-        auto picks = loadProbePicks(dir, fp);
-        if (!picks) {
-            MM_LOG_INFO("probe",
-                        "HW fingerprint={} backend=Cuda — per-HW profile not "
-                        "deployed under {} (run mimirmind-probe)",
-                        fp, dir);
-        } else {
-            MM_LOG_INFO("probe",
-                        "HW fingerprint={} backend=Cuda — per-HW profile FOUND "
-                        "under {}, applying Layer-2 flags (explicit env wins)",
-                        fp, dir);
-            // Per-(HW x model) overlay: the same flag can be validated-safe on
-            // one checkpoint and unsafe on another on the SAME GPU (e.g.
-            // F32_TC_PREFILL, or GROUPED_MOE's 512-expert TC path). Model wins
-            // over the HW profile; an explicit env still wins over both.
-            if (!_modelIdHint.empty()) {
-                if (auto over = loadModelOverlay(dir, fp, _modelIdHint)) {
-                    mergeOverlay(*picks, *over);
-                    MM_LOG_INFO("probe",
-                                "  per-model overlay FOUND for '{}' — merged "
-                                "(model wins over HW profile)",
-                                _modelIdHint);
-                }
-            }
-            if (picks->applyPrefillCudnn &&
-                !_ops->prefillCudnnEnvOverridden()) {
-                _ops->setPrefillCudnn(*picks->applyPrefillCudnn);
-                MM_LOG_INFO("probe", "  profile applied: cuDNN SDPA prefill -> {}",
-                            *picks->applyPrefillCudnn ? "on" : "off");
-            }
-            if (picks->applyF32TcPrefill &&
-                !_gmm->f32TcPrefillEnvOverridden()) {
-                _gmm->setF32TcPrefill(*picks->applyF32TcPrefill);
-                MM_LOG_INFO("probe", "  profile applied: F32-TC prefill -> {}",
-                            *picks->applyF32TcPrefill ? "on" : "off");
-            }
-            if (picks->applyCublasFp8Prefill &&
-                !_gmm->cublasFp8PrefillEnvOverridden()) {
-                _gmm->setCublasFp8Prefill(*picks->applyCublasFp8Prefill);
-                MM_LOG_INFO("probe", "  profile applied: cuBLAS-FP8 prefill -> {}",
-                            *picks->applyCublasFp8Prefill ? "on" : "off");
-            }
-            if (picks->applyMmq && !_gmm->mmqEnvOverridden()) {
-                _gmm->setMmq(*picks->applyMmq);
-                MM_LOG_INFO("probe", "  profile applied: MMQ (Q8_0 int8 GEMM) -> {}",
-                            *picks->applyMmq ? "on" : "off");
-            }
-            if (picks->applyMmqTc && !_gmm->mmqEnvOverridden()) {
-                _gmm->setMmqTc(*picks->applyMmqTc);
-                MM_LOG_INFO("probe", "  profile applied: MMQ tensor-core -> {}",
-                            *picks->applyMmqTc ? "on" : "off");
-            }
-            // 5.21.7/8: these two are backend getenv-owned (Qwen3_5MoeBackend
-            // reads them in its ctor, which runs AFTER this block), so apply via
-            // setenv before the backend is picked. Guarded on !getenv so an
-            // explicit env still wins, matching the setter-based flags above.
-            if (picks->applyAttnCudnnPaged &&
-                std::getenv("MIMIRMIND_ATTN_CUDNN_PAGED") == nullptr) {
-                ::setenv("MIMIRMIND_ATTN_CUDNN_PAGED",
-                         *picks->applyAttnCudnnPaged ? "1" : "0", 1);
-                MM_LOG_INFO("probe", "  profile applied: cuDNN paged prefill -> {}",
-                            *picks->applyAttnCudnnPaged ? "on" : "off");
-            }
-            if (picks->applyMoeSiluFuse &&
-                std::getenv("MIMIRMIND_MOE_SILU_FUSE") == nullptr) {
-                ::setenv("MIMIRMIND_MOE_SILU_FUSE",
-                         *picks->applyMoeSiluFuse ? "1" : "0", 1);
-                MM_LOG_INFO("probe", "  profile applied: MoE silu+quant fuse -> {}",
-                            *picks->applyMoeSiluFuse ? "on" : "off");
-            }
-            if (picks->applyMoeDecodeReg &&
-                std::getenv("MIMIRMIND_MOE_DECODE_REG") == nullptr) {
-                // 5.18.14: mode-valued (0=off, 1=m2reg@tileM2, 4=m4reg@tileM4) —
-                // the profile integer goes through verbatim; explicit env wins.
-                const std::string mode = std::to_string(*picks->applyMoeDecodeReg);
-                ::setenv("MIMIRMIND_MOE_DECODE_REG", mode.c_str(), 1);
-                MM_LOG_INFO("probe",
-                            "  profile applied: MoE decode register-staged -> mode {}",
-                            mode);
-            }
-            // Grouped-MoE path selector (model overlay only; 0=blocked-only,
-            // 3=FP4-TC-only). Backend + loader getenv-owned, so setenv before
-            // the backend ctor; explicit env wins.
-            if (picks->applyGroupedMoe &&
-                std::getenv("MIMIRMIND_GROUPED_MOE") == nullptr) {
-                const std::string mode = std::to_string(*picks->applyGroupedMoe);
-                ::setenv("MIMIRMIND_GROUPED_MOE", mode.c_str(), 1);
-                MM_LOG_INFO("probe",
-                            "  profile applied: grouped-MoE path -> mode {}",
-                            mode);
-            }
-            // Prefill chunk size (model overlay). Larger chunks cut the per-chunk
-            // paged-KV re-gather of the cuDNN prefill path (O(n^2) across chunks)
-            // while staying memory-bounded; ServingSession reads it via getenv.
-            if (picks->applyPrefillChunk &&
-                std::getenv("MIMIRMIND_PREFILL_CHUNK") == nullptr) {
-                const std::string c = std::to_string(*picks->applyPrefillChunk);
-                ::setenv("MIMIRMIND_PREFILL_CHUNK", c.c_str(), 1);
-                MM_LOG_INFO("probe",
-                            "  profile applied: prefill chunk -> {} tokens", c);
-            }
-            // Batched GDN input-projection fuse (5.18.10.3): 4 narrow projections
-            // -> 2 wide GEMMs, cutting the weight-read-bound gdn.proj term.
-            // Backend reads it via getenv at ctor; explicit env wins.
-            if (picks->applyGdnProjFuseBatch &&
-                std::getenv("MIMIRMIND_GDN_PROJ_FUSE_BATCH") == nullptr) {
-                ::setenv("MIMIRMIND_GDN_PROJ_FUSE_BATCH",
-                         *picks->applyGdnProjFuseBatch ? "1" : "0", 1);
-                MM_LOG_INFO("probe", "  profile applied: GDN proj fuse (batch) -> {}",
-                            *picks->applyGdnProjFuseBatch ? "on" : "off");
-            }
-            // 5.18.30: route the decode MoE expert GEMM through CUTLASS NVFP4-TC
-            // (vs hand m2reg/m4reg). Backend reads it via getenv at ctor; explicit
-            // env wins. +42% decode conc1/4/8, coherence goldset ship-safe.
-            if (picks->applyGroupedMoeDecodeTc &&
-                std::getenv("MIMIRMIND_GROUPED_MOE_DECODE_TC") == nullptr) {
-                ::setenv("MIMIRMIND_GROUPED_MOE_DECODE_TC",
-                         *picks->applyGroupedMoeDecodeTc ? "1" : "0", 1);
-                MM_LOG_INFO("probe", "  profile applied: grouped-MoE decode TC -> {}",
-                            *picks->applyGroupedMoeDecodeTc ? "on" : "off");
-            }
-            // 5.18.30: shared-expert CUTLASS-TC threshold (decode-M when lowered).
-            // Backend reads it via getenv at ctor; explicit env wins. +8-16% decode.
-            if (picks->applyShexpTcMinM &&
-                std::getenv("MIMIRMIND_SHEXP_TC_MINM") == nullptr) {
-                const std::string m = std::to_string(*picks->applyShexpTcMinM);
-                ::setenv("MIMIRMIND_SHEXP_TC_MINM", m.c_str(), 1);
-                MM_LOG_INFO("probe",
-                            "  profile applied: shexp TC min-M -> {}", m);
-            }
-            // Answer-floor temperature-lift cap (model overlay). Applied to the
-            // per-model LlmConfig — NOT a process env — so co-resident models each
-            // keep their own value; explicit MIMIRMIND_ANSWER_FLOOR_TEMP_CAP still
-            // wins (read per-request in the ChatCompletionHandler answer floor).
-            if (picks->applyAnswerFloorTempCap &&
-                std::getenv("MIMIRMIND_ANSWER_FLOOR_TEMP_CAP") == nullptr) {
-                _config.answerFloorTempCap = *picks->applyAnswerFloorTempCap;
-                MM_LOG_INFO("probe",
-                            "  profile applied: answer-floor temp cap -> {}",
-                            _config.answerFloorTempCap);
-            }
-            // Model THINKING sampling (overlay): the vendor's reasoning preset,
-            // overriding the generic generation_config temperature in the thinking
-            // floor (qwen3.6 ships do_sample temp=1.0, too hot for a long reasoning
-            // chain on a 3B-active model -> derails; card recommends 0.6). Per-model
-            // LlmConfig, not a process env; explicit MIMIRMIND_THINKING_* still wins.
-            if (picks->applyThinkingTemp &&
-                std::getenv("MIMIRMIND_THINKING_TEMP") == nullptr) {
-                _config.thinkingTemp = *picks->applyThinkingTemp;
-            }
-            if (picks->applyThinkingTopP &&
-                std::getenv("MIMIRMIND_THINKING_TOP_P") == nullptr) {
-                _config.thinkingTopP = *picks->applyThinkingTopP;
-            }
-            if (picks->applyThinkingTopK &&
-                std::getenv("MIMIRMIND_THINKING_TOP_K") == nullptr) {
-                _config.thinkingTopK =
-                    static_cast<std::uint32_t>(*picks->applyThinkingTopK);
-            }
-            if (picks->applyThinkingTemp || picks->applyThinkingTopP ||
-                picks->applyThinkingTopK) {
-                MM_LOG_INFO("probe",
-                            "  profile applied: thinking sampling -> temp={} "
-                            "top_p={} top_k={}",
-                            _config.thinkingTemp, _config.thinkingTopP,
-                            _config.thinkingTopK);
-            }
-            // Honesty floor (model overlay). Default is OFF in LlmConfig; an
-            // overlay can re-enable it per checkpoint. Per-model LlmConfig, not a
-            // process env; explicit MIMIRMIND_HONESTY_FLOOR still wins per-request.
-            if (picks->applyHonestyFloor &&
-                std::getenv("MIMIRMIND_HONESTY_FLOOR") == nullptr) {
-                _config.honestyFloor = *picks->applyHonestyFloor;
-                MM_LOG_INFO("probe", "  profile applied: honesty floor -> {}",
-                            _config.honestyFloor ? "on" : "off");
-            }
-            // Jinja chat-template renderer opt-in (model overlay, 8.24.6). Default
-            // OFF in LlmConfig; a profile flips it on once the family is prompt-
-            // token bit-parat (8.24.5). Explicit MIMIRMIND_ENABLE_JINJA wins
-            // per-process (handled in ChatCompletionHandler).
-            if (picks->applyEnableJinja &&
-                std::getenv("MIMIRMIND_ENABLE_JINJA") == nullptr) {
-                _config.enableJinja = *picks->applyEnableJinja;
-                MM_LOG_INFO("probe", "  profile applied: jinja renderer -> {}",
-                            _config.enableJinja ? "on" : "off");
-            }
-        }
+    if (_computeCtx->kind() != core::backend::BackendKind::Cuda) {
+        return;
     }
+    const ResolvedProfile profile =
+        ProfileOverlayApplier::resolve(*_computeCtx, _modelIdHint);
+    if (!profile.picks) {
+        MM_LOG_INFO("probe",
+                    "HW fingerprint={} backend=Cuda — per-HW profile not "
+                    "deployed under {} (run mimirmind-probe)",
+                    profile.fingerprint, profile.dir);
+        return;
+    }
+    MM_LOG_INFO("probe",
+                "HW fingerprint={} backend=Cuda — per-HW profile FOUND "
+                "under {}, applying Layer-2 flags (explicit env wins)",
+                profile.fingerprint, profile.dir);
+    if (profile.overlayMerged) {
+        MM_LOG_INFO("probe",
+                    "  per-model overlay FOUND for '{}' — merged "
+                    "(model wins over HW profile)",
+                    _modelIdHint);
+    }
+    ProfileOverlayApplier{*_ops, *_gmm, _config}.apply(*profile.picks);
+}
 
-    // Pick the arch backend now that weights are available. Returns
-    // nullptr for unsupported architectures so generate() can refuse
-    // gracefully with the original architecture string in the error.
-    // Schicht 5.1 — arch backends now consume ComputeOps / ComputeMatmul
-    // through the base. `_ops` / `_gmm` are unique_ptr<Base>, deref-passes
-    // the referenced instance. OpProfiler is still L0-only (guarded on
-    // ctor); if a HIP model-load path lands (Schicht 5.2+ around
-    // GgufReader), the profiler needs its own backend-neutral variant.
-    _backend = arch::createArchBackend(
-        _config.architecture, _config, *_weights, _fusedQkv.get(),
-        *_ops, *_gmm, _opProfiler.value(), _cfg.features.moeGroup,
-        _cfg.features.moeFusedDown != core::config::TriState::Disable);
-
+void InferenceEngine::attachQwen4ExpPleTable() {
     // 5.27 I-4: for qwen4_exp, host-mmap the off-VRAM PLE n-gram table and hand
     // it to the backend (with the ple gguf layer + eos). No-op for other archs /
     // GGUF loads (empty _pleCheckpointDir). The table stays on disk (page-cache);
@@ -1032,18 +887,9 @@ void InferenceEngine::finalizeLoad() {
                         "(layer {}, {} rows x {} cols)", pleGgufLayer, rows, cols);
         }
     }
+}
 
-    _modelLoaded = true;
-    // Defensive: a previous model's KV state must not survive into the
-    // new model. The current API throws on loadModel-while-loaded so
-    // this is theoretical, but it keeps the invariant local.
-    resetCache();
-    MM_LOG_INFO("engine",
-                "loadModel: ready — arch={} blocks={} d_model={} ff={} heads={} kv={}",
-                _config.architecture, _config.blockCount,
-                _config.embeddingLength, _config.feedForwardLength,
-                _config.headCount, _config.headCountKv);
-
+void InferenceEngine::probeBatchCapacity() {
     // M-Startup.CapacityProbe — HW-roofline probe + serving-class gate.
     // Backend-agnostic: takes scalar inputs, so the probe lib doesn't
     // link against any backend SDK. Log both the raw estimate and the
@@ -1052,99 +898,102 @@ void InferenceEngine::finalizeLoad() {
     // Phase 0 and matches what M-Cuda.Batch will use — safe estimator
     // even while _kvDtype is still F32 today (over-estimates batch, not
     // under, so the gate stays conservative).
-    {
-        const std::size_t bwGBps      = _computeCtx->bandwidthGBps();
-        // Reader-borrowed (GGUF) path fills totalTensorBytes(); the non-GGUF
-        // (NVFP4 -> synthesised tensors) path leaves the reader empty, so fall
-        // back to the resident weight footprint from the WeightsMap. Without
-        // this the probe sees weight=0, reports "insufficient probe data", and
-        // pins serving-class off on the Spark NVFP4 path.
-        std::size_t weightBytes = _reader.totalTensorBytes();
-        if (weightBytes == 0 && _weights.has_value()) {
-            weightBytes = _weights->totalTensorBytes();
-        }
-        const std::size_t kvPerTok    = _config.kvBytesPerToken(/*dtypeBytes=*/2);
-        const std::size_t ctx         = _maxContextTokens > 0 ? _maxContextTokens
-                                                              : _config.contextLength;
-        // Free device memory (0 on backends that can't report it) makes the
-        // probe size the batch from real headroom instead of a bandwidth
-        // tier. On a co-resident multi-model host this is an upper bound
-        // (load-order dependent) — the probe reserves a conservative
-        // fraction and operators pin an exact cap via
-        // MIMIRMIND_SERVING_MAXBATCH; see BatchCapacityProbe::estimate.
-        const std::size_t freeMemBytes = _computeCtx->deviceFreeMemoryBytes();
-        _batchCapacity = runtime::serving::BatchCapacityProbe::estimate(
-            bwGBps, weightBytes, kvPerTok, ctx, freeMemBytes);
+    const std::size_t bwGBps      = _computeCtx->bandwidthGBps();
+    // Reader-borrowed (GGUF) path fills totalTensorBytes(); the non-GGUF
+    // (NVFP4 -> synthesised tensors) path leaves the reader empty, so fall
+    // back to the resident weight footprint from the WeightsMap. Without
+    // this the probe sees weight=0, reports "insufficient probe data", and
+    // pins serving-class off on the Spark NVFP4 path.
+    std::size_t weightBytes = _reader.totalTensorBytes();
+    if (weightBytes == 0 && _weights.has_value()) {
+        weightBytes = _weights->totalTensorBytes();
+    }
+    const std::size_t kvPerTok    = _config.kvBytesPerToken(/*dtypeBytes=*/2);
+    const std::size_t ctx         = _maxContextTokens > 0 ? _maxContextTokens
+                                                          : _config.contextLength;
+    // Free device memory (0 on backends that can't report it) makes the
+    // probe size the batch from real headroom instead of a bandwidth
+    // tier. On a co-resident multi-model host this is an upper bound
+    // (load-order dependent) — the probe reserves a conservative
+    // fraction and operators pin an exact cap via
+    // MIMIRMIND_SERVING_MAXBATCH; see BatchCapacityProbe::estimate.
+    const std::size_t freeMemBytes = _computeCtx->deviceFreeMemoryBytes();
+    _batchCapacity = runtime::serving::BatchCapacityProbe::estimate(
+        bwGBps, weightBytes, kvPerTok, ctx, freeMemBytes);
 
-        // Config gate — Auto respects the probe, Force overrides on
-        // (with a warning if the probe disagreed), Disable overrides off.
-        // No user-per-request toggle (feedback_no_user_toggles).
-        using core::config::TriState;
-        switch (_cfg.serving.enableBatching) {
-            case TriState::Auto:
-                _servingClassEnabled = _batchCapacity.servingClassRecommended
-                    && _batchCapacity.sustainableBatch >= _cfg.serving.minBatchForEnable;
-                break;
-            case TriState::Force:
-                _servingClassEnabled = true;
-                if (!_batchCapacity.servingClassRecommended) {
-                    MM_LOG_WARN("serving",
-                                "serving.enableBatching=force but probe reports "
-                                "sustainableBatch={} < minBatchForEnable={} — "
-                                "enabling anyway on operator request",
-                                _batchCapacity.sustainableBatch,
-                                _cfg.serving.minBatchForEnable);
-                }
-                break;
-            case TriState::Disable:
-                _servingClassEnabled = false;
-                break;
-        }
+    gateServingClass();
 
-        // E2 guard — Bragi-v1 restricted serving-class (continuous batching)
-        // to CUDA. M9.1 relaxes it: a non-CUDA backend that implements the
-        // NEUTRAL synchronized batched decode (Gemma 4 MoE on L0/Xe-LPG,
-        // served through the non-paged slab substrate) is now a valid
-        // serving-class substrate. HIP/CPU and non-batched L0 archs (qwen2)
-        // still stay single-session — they have no runBlockBatched.
-        const bool neutralBatched =
-            _backend != nullptr && _backend->capabilities().supportsBatchedDecode;
-        if (_servingClassEnabled &&
-            _computeCtx->kind() != core::backend::BackendKind::Cuda &&
-            !neutralBatched) {
-            const auto backendName =
-                core::backend::BackendRegistry::name(_computeCtx->kind());
-            // Downgrade to single-session + warn — even under Force, which now
-            // applies PER-MODEL: a multi-model config may force batching for
-            // its Gemma-4 MoE serving model while an auxiliary model whose
-            // backend has no neutral batched decode (a non-CUDA qwen2, or
-            // HIP/CPU) simply stays single-session, rather than aborting the
-            // whole server. (Was a hard throw under Force before M9.1.)
-            _servingClassEnabled = false;
-            if (_cfg.serving.enableBatching == TriState::Force) {
+    using core::config::TriState;
+    MM_LOG_INFO("serving",
+                "BatchCapacityProbe: {}", _batchCapacity.reasoning);
+    MM_LOG_INFO("serving",
+                "serving-class {} (config.enableBatching={}, minBatch={}, probeRecommended={})",
+                _servingClassEnabled ? "ENABLED" : "disabled",
+                _cfg.serving.enableBatching == TriState::Auto    ? "auto"
+              : _cfg.serving.enableBatching == TriState::Force   ? "force"
+                                                                 : "disable",
+                _cfg.serving.minBatchForEnable,
+                _batchCapacity.servingClassRecommended);
+}
+
+void InferenceEngine::gateServingClass() {
+    // Config gate — Auto respects the probe, Force overrides on
+    // (with a warning if the probe disagreed), Disable overrides off.
+    // No user-per-request toggle (feedback_no_user_toggles).
+    using core::config::TriState;
+    switch (_cfg.serving.enableBatching) {
+        case TriState::Auto:
+            _servingClassEnabled = _batchCapacity.servingClassRecommended
+                && _batchCapacity.sustainableBatch >= _cfg.serving.minBatchForEnable;
+            break;
+        case TriState::Force:
+            _servingClassEnabled = true;
+            if (!_batchCapacity.servingClassRecommended) {
                 MM_LOG_WARN("serving",
-                            "serving.enableBatching=force but backend '{}' has "
-                            "no neutral batched decode — this model stays "
-                            "single-session (force applies per-model; batchable "
-                            "models still engage).", backendName);
-            } else {
-                MM_LOG_WARN("serving",
-                            "batching would engage but backend '{}' is not CUDA "
-                            "and has no neutral batched decode — falling back "
-                            "to single-session.", backendName);
+                            "serving.enableBatching=force but probe reports "
+                            "sustainableBatch={} < minBatchForEnable={} — "
+                            "enabling anyway on operator request",
+                            _batchCapacity.sustainableBatch,
+                            _cfg.serving.minBatchForEnable);
             }
-        }
+            break;
+        case TriState::Disable:
+            _servingClassEnabled = false;
+            break;
+    }
 
-        MM_LOG_INFO("serving",
-                    "BatchCapacityProbe: {}", _batchCapacity.reasoning);
-        MM_LOG_INFO("serving",
-                    "serving-class {} (config.enableBatching={}, minBatch={}, probeRecommended={})",
-                    _servingClassEnabled ? "ENABLED" : "disabled",
-                    _cfg.serving.enableBatching == TriState::Auto    ? "auto"
-                  : _cfg.serving.enableBatching == TriState::Force   ? "force"
-                                                                     : "disable",
-                    _cfg.serving.minBatchForEnable,
-                    _batchCapacity.servingClassRecommended);
+    // E2 guard — Bragi-v1 restricted serving-class (continuous batching)
+    // to CUDA. M9.1 relaxes it: a non-CUDA backend that implements the
+    // NEUTRAL synchronized batched decode (Gemma 4 MoE on L0/Xe-LPG,
+    // served through the non-paged slab substrate) is now a valid
+    // serving-class substrate. HIP/CPU and non-batched L0 archs (qwen2)
+    // still stay single-session — they have no runBlockBatched.
+    const bool neutralBatched =
+        _backend != nullptr && _backend->capabilities().supportsBatchedDecode;
+    if (_servingClassEnabled &&
+        _computeCtx->kind() != core::backend::BackendKind::Cuda &&
+        !neutralBatched) {
+        const auto backendName =
+            core::backend::BackendRegistry::name(_computeCtx->kind());
+        // Downgrade to single-session + warn — even under Force, which now
+        // applies PER-MODEL: a multi-model config may force batching for
+        // its Gemma-4 MoE serving model while an auxiliary model whose
+        // backend has no neutral batched decode (a non-CUDA qwen2, or
+        // HIP/CPU) simply stays single-session, rather than aborting the
+        // whole server. (Was a hard throw under Force before M9.1.)
+        _servingClassEnabled = false;
+        if (_cfg.serving.enableBatching == TriState::Force) {
+            MM_LOG_WARN("serving",
+                        "serving.enableBatching=force but backend '{}' has "
+                        "no neutral batched decode — this model stays "
+                        "single-session (force applies per-model; batchable "
+                        "models still engage).", backendName);
+        } else {
+            MM_LOG_WARN("serving",
+                        "batching would engage but backend '{}' is not CUDA "
+                        "and has no neutral batched decode — falling back "
+                        "to single-session.", backendName);
+        }
     }
 }
 

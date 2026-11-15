@@ -1534,6 +1534,7 @@ add_executable(mimirmind
     src/runtime/RequestTelemetryScope.cpp
     src/runtime/audio/SpeakEngine.cpp
     src/runtime/ProbeConfig.cpp
+    src/runtime/ProfileOverlayApplier.cpp
     src/runtime/ComputeStack.cpp
     src/runtime/engine/Nvfp4Loader.cpp
     src/runtime/engine/MtpDecoder.cpp
