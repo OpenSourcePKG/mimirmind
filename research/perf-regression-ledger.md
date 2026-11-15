@@ -3,6 +3,25 @@
 Post-deploy performance entries. Newest first. Box = Spark GB10 (xd-ki-pkg1),
 model qwen3.6-35B-A3B-NVFP4 unless noted.
 
+## 2026-11-15 — Layer-2 profile silently dropped 2026-11-08..15 (fingerprint drift) — FIXED (5.19.1)
+
+**Model:** Kolibri-1 (prod chat primary). **Binary:** `fb75762d` (= `0c83f029` +
+8.30.11.6 refactor + 5.19.1), rollback `build-cudnn/mimirmind.prodbak_5191`.
+
+**Regression window:** a host kernel update (7.0.0-1019 -> 7.0.0-1025-nvidia,
+reboot 2026-11-08) changed the HW fingerprint `a68b756b` -> `d9fef024`. Every
+boot since then logged `per-HW profile not deployed` at INFO and ran WITHOUT
+cuDNN SDPA prefill, cuBLAS-FP8 prefill, MMQ, MMQ-TC, cuDNN paged prefill,
+MoE silu+quant fuse, and MoE decode reg mode 4. Second occurrence (first:
+CUDA 13.3 update, 2026-09-15). **No perf delta was measured for the window.**
+The flag set's last anchored win was -47.5% prefill on qwen3.6 (5.19).
+
+**Fix:** profiles now also resolve via a stable hw-class key (no kernel
+release, no device UUID). GB10 = `configs/hw/007898c7ed2e02b2`. A miss now
+WARNs, and names stale same-device profile dirs. Boot-log A/B: all 7 flags
+applied, every non-probe boot line identical to baseline, coherent completion.
+ADR `decisions/2026-11-15-hw-class-key-profile-fallback`.
+
 ## 2026-09-23 — KV/memory idle-growth investigation — NO LEAK (reserved+ratcheted plateau)
 
 **Trigger:** user report "KV cache ~50 GB on GB10 and keeps growing even when idle".
