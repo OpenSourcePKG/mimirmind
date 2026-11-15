@@ -282,6 +282,8 @@ void PerfRegressionDetector::persistBaseline() noexcept {
                     "baseline write failed: {}",
                     std::string_view{e.what()});
     } catch (...) {
+        MM_LOG_WARN("perf_regression",
+                    "baseline write failed: non-std exception");
     }
 }
 

@@ -286,7 +286,36 @@ struct ToolCallConstraint::Impl {
     std::vector<std::int32_t>                     bitmask;   // (vocab+31)/32 ints
     int                                           vocab{0};
     bool                                          active{false};
+    // A matcher fault degrades the request to "unconstrained"; warn once per
+    // constraint instance (one request) so it is visible without per-token spam.
+    bool                                          faultLogged{false};
 };
+
+namespace {
+
+// Report an xgrammar fault that was absorbed to keep the request alive. Must be
+// called from inside a catch block (inspects the in-flight exception).
+void noteMatcherFault(bool& faultLogged, const char* where) noexcept {
+    if (faultLogged) { return; }
+    faultLogged = true;
+    try {
+        std::string what = "non-std exception";
+        try {
+            throw;
+        } catch (const std::exception& e) {
+            what = e.what();
+        } catch (...) {
+        }
+        MM_LOG_WARN("tgram",
+                    "grammar matcher fault in {} — constraint degraded to "
+                    "unconstrained for this request: {}",
+                    where, what);
+    } catch (...) {
+        // logging must never take the sampler down
+    }
+}
+
+} // namespace
 
 ToolCallConstraint::ToolCallConstraint(std::span<const ToolSpec> tools,
                                        const Tokenizer& tok,
@@ -623,7 +652,8 @@ void ToolCallConstraint::reset() noexcept {
     try {
         _impl->matcher->Reset();
     } catch (...) {
-        // Reset is noexcept-intended; swallow to keep the sampler alive.
+        // Reset is noexcept-intended; keep the sampler alive.
+        noteMatcherFault(_impl->faultLogged, "reset");
     }
 }
 
@@ -645,6 +675,7 @@ void ToolCallConstraint::advance(std::int32_t token) {
         _impl->matcher->AcceptToken(token);
     } catch (...) {
         // keep the sampler alive; grammar faults must never crash the request
+        noteMatcherFault(_impl->faultLogged, "advance");
     }
 }
 
@@ -659,6 +690,7 @@ void ToolCallConstraint::maskLogits(float* logits, std::size_t vocab) const {
     try {
         if (_impl->matcher->IsTerminated()) { return; }
     } catch (...) {
+        noteMatcherFault(_impl->faultLogged, "maskLogits");
         return;
     }
     try {
@@ -703,6 +735,7 @@ void ToolCallConstraint::maskLogits(float* logits, std::size_t vocab) const {
     } catch (...) {
         // grammar/xgrammar fault -> leave logits untouched (unconstrained) rather
         // than crash the request.
+        noteMatcherFault(_impl->faultLogged, "maskLogits");
     }
 }
 
