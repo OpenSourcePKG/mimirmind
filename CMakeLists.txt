@@ -1484,16 +1484,11 @@ endif()
 # keep the exec buildable on a host without either SDK we gate the
 # per-backend source additions here.
 
-add_executable(mimirmind
-    src/mimirmind/main.cpp
-    src/mimirmind/CliParser.cpp
-    src/mimirmind/ParityMode.cpp
-    src/mimirmind/QualityGateMode.cpp
-    src/mimirmind/ServeMode.cpp
-    src/mimirmind/ServerBootstrap.cpp
-    src/mimirmind/ServingBenchModes.cpp
-    src/mimirmind/SmokeMode.cpp
-    src/mimirmind/diagnostics/SmokeSuite.cpp
+# Engine sources (everything but the CLI driver) as an OBJECT library, so the
+# serving binary and the Hugin companion (roadmap 7.2) link the SAME forward —
+# no second forward implementation. Object files, not a static archive, so
+# static registrars are never dropped by the linker.
+add_library(mimirmind_engine OBJECT
     src/compute/Activations.cpp
     src/compute/Attention.cpp
     src/compute/Dequant.cpp
@@ -1597,13 +1592,27 @@ add_executable(mimirmind
     src/server/TenantMetrics.cpp
 )
 
+add_executable(mimirmind
+    src/mimirmind/main.cpp
+    src/mimirmind/CliParser.cpp
+    src/mimirmind/ParityMode.cpp
+    src/mimirmind/QualityGateMode.cpp
+    src/mimirmind/ServeMode.cpp
+    src/mimirmind/ServerBootstrap.cpp
+    src/mimirmind/ServingBenchModes.cpp
+    src/mimirmind/SmokeMode.cpp
+    src/mimirmind/diagnostics/SmokeSuite.cpp
+)
+
 if(MIMIRMIND_ENABLE_L0)
-    target_sources(mimirmind PRIVATE
+    target_sources(mimirmind_engine PRIVATE
         src/compute/l0/GpuMatmul.cpp
         src/compute/l0/GpuOps.cpp
         src/compute/l0/L0GpuOpsSelfTest.cpp
         src/compute/l0/MoeTopKRouteDevice.cpp
         src/compute/l0/MoeGateUpFusedKDevice.cpp
+    )
+    target_sources(mimirmind PRIVATE
         # L0-tied support code — Formatting prints Level-Zero device
         # type strings. Only reachable from L0-guarded call sites, so
         # add it only when L0 is on. OpProfiler + FusedQkvWeights are
@@ -1611,14 +1620,16 @@ if(MIMIRMIND_ENABLE_L0)
         # real bodies, non-L0 build gets trivial stubs.
         src/mimirmind/diagnostics/Formatting.cpp
     )
+    add_dependencies(mimirmind_engine spv_kernels)
     add_dependencies(mimirmind spv_kernels)
 endif()
 
 if(MIMIRMIND_ENABLE_HIP)
-    target_sources(mimirmind PRIVATE
+    target_sources(mimirmind_engine PRIVATE
         src/compute/hip/GpuMatmul.cpp
         src/compute/hip/GpuOps.cpp
     )
+    add_dependencies(mimirmind_engine hip_kernels)
     add_dependencies(mimirmind hip_kernels)
 endif()
 
@@ -1629,13 +1640,15 @@ if(MIMIRMIND_ENABLE_CUDA)
     # names — Track 4 preserves them so `cuModuleGetFunction("rmsnorm")`
     # resolves against the same string `hipModuleGetFunction("rmsnorm")`
     # uses on the HIP side.
-    target_sources(mimirmind PRIVATE
+    target_sources(mimirmind_engine PRIVATE
         src/compute/cuda/GpuMatmul.cpp
         src/compute/cuda/GpuOps.cpp
         src/compute/cuda/CudaMoeGroupedOps.cpp
         src/compute/cuda/CudaPagedAttentionOps.cpp
         src/compute/cuda/MoeTopKRouteDevice.cpp
         src/compute/cuda/CudaMaterializerOps.cpp
+    )
+    target_sources(mimirmind PRIVATE
         # CUDA-only microbenchmark subcommands (attnbench/gdnbench/moebench).
         # They #include the CUDA compute-context headers unconditionally, so
         # they must not be compiled into an L0-/HIP-only executable.
@@ -1643,12 +1656,13 @@ if(MIMIRMIND_ENABLE_CUDA)
         src/mimirmind/GdnBenchMode.cpp
         src/mimirmind/MoeBenchMode.cpp
     )
+    add_dependencies(mimirmind_engine cuda_kernels)
     add_dependencies(mimirmind cuda_kernels)
 endif()
 
 # cpp-httplib is only used by the server, not by mimirmind_core. SYSTEM so
 # upstream code does not trip our strict warning flags.
-target_include_directories(mimirmind SYSTEM PRIVATE
+target_include_directories(mimirmind_engine SYSTEM PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib
 )
 
@@ -1656,27 +1670,39 @@ target_include_directories(mimirmind SYSTEM PRIVATE
 # security helpers already come in transitively via mimirmind_core_common's
 # PUBLIC OpenSSL link, but the exec also compiles ApiServer.cpp against
 # httplib, which needs the macro defined at that TU.
-target_compile_definitions(mimirmind PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+target_compile_definitions(mimirmind_engine PUBLIC CPPHTTPLIB_OPENSSL_SUPPORT)
 # 8.19.13.2 — vendored xgrammar (MIT, NOT llama.cpp/ggml) for grammar-constrained
 # tool decoding. Header-only picojson/dlpack, cpptrace/python/tests all off.
 if(NOT TARGET xgrammar)
     add_subdirectory(third_party/xgrammar)
 endif()
-target_link_libraries(mimirmind PRIVATE xgrammar)
+target_link_libraries(mimirmind_engine PUBLIC xgrammar)
 
-target_link_libraries(mimirmind PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(mimirmind_engine PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
 # Always link the common lib; add backend-specific libs when they exist.
-target_link_libraries(mimirmind PRIVATE mimirmind_core_common)
+target_link_libraries(mimirmind_engine PUBLIC mimirmind_core_common)
 if(MIMIRMIND_ENABLE_L0)
-    target_link_libraries(mimirmind PRIVATE mimirmind_core_l0)
+    target_link_libraries(mimirmind_engine PUBLIC mimirmind_core_l0)
 endif()
 if(MIMIRMIND_ENABLE_HIP)
-    target_link_libraries(mimirmind PRIVATE mimirmind_core_hip)
+    target_link_libraries(mimirmind_engine PUBLIC mimirmind_core_hip)
 endif()
 if(MIMIRMIND_ENABLE_CUDA)
-    target_link_libraries(mimirmind PRIVATE mimirmind_core_cuda)
+    target_link_libraries(mimirmind_engine PUBLIC mimirmind_core_cuda)
 endif()
+# Executables linking the engine repeat the core libs DIRECTLY, in this order:
+# mimirmind_core_common (BackendRegistry) references the backend libs'
+# probeBackend()/createComputeContext(), and the backend libs depend on
+# common — through the OBJECT lib alone CMake would order backend-before-common
+# and the static link leaves the registry hooks unresolved.
+set(MIMIRMIND_ENGINE_LINK_LIBS mimirmind_engine mimirmind_core_common)
+foreach(_mm_backend mimirmind_core_l0 mimirmind_core_hip mimirmind_core_cuda)
+    if(TARGET ${_mm_backend})
+        list(APPEND MIMIRMIND_ENGINE_LINK_LIBS ${_mm_backend})
+    endif()
+endforeach()
+target_link_libraries(mimirmind PRIVATE ${MIMIRMIND_ENGINE_LINK_LIBS})
 
 # ---- munin — persistent model-memory daemon (M-Munin Schritt 7) -------------
 #
@@ -1842,33 +1868,24 @@ target_link_libraries(rune_tests PRIVATE mimirmind_core_common)
 #   cmake --build build --target hugin hugin_tests && build/hugin_tests
 #   claude mcp add hugin -- $PWD/build/hugin --model /path/to/model.gguf
 
-add_library(mimirmind_hugin STATIC
+# 7.2 Inc-2: Hugin links the engine OBJECT library (the same forward as the
+# serving binary) — so the quant/dequant sources come from there, not twice.
+# OBJECT libs on both sides: every object is linked, nothing dropped.
+add_library(mimirmind_hugin OBJECT
+    src/hugin/ForwardTools.cpp
     src/hugin/InspectTools.cpp
+    src/hugin/LogitMath.cpp
     src/hugin/McpServer.cpp
     src/hugin/ModelView.cpp
-    src/compute/Dequant.cpp
-    src/compute/QuantTypeRegistry.cpp
-    src/compute/quant/Bfloat16.cpp
-    src/compute/quant/Float16.cpp
-    src/compute/quant/Float32.cpp
-    src/compute/quant/Q3K.cpp
-    src/compute/quant/Q4K.cpp
-    src/compute/quant/Q4_0.cpp
-    src/compute/quant/Q4_1.cpp
-    src/compute/quant/Q5K.cpp
-    src/compute/quant/Q5_0.cpp
-    src/compute/quant/Q5_1.cpp
-    src/compute/quant/Q6K.cpp
-    src/compute/quant/Q8_0.cpp
 )
-target_link_libraries(mimirmind_hugin PUBLIC mimirmind_core_common)
+target_link_libraries(mimirmind_hugin PUBLIC mimirmind_engine)
 
 add_executable(hugin src/hugin/main.cpp)
-target_link_libraries(hugin PRIVATE mimirmind_hugin)
+target_link_libraries(hugin PRIVATE mimirmind_hugin ${MIMIRMIND_ENGINE_LINK_LIBS})
 
 add_executable(hugin_tests tests/hugin_tests.cpp)
 target_include_directories(hugin_tests PRIVATE tests)
-target_link_libraries(hugin_tests PRIVATE mimirmind_hugin)
+target_link_libraries(hugin_tests PRIVATE mimirmind_hugin ${MIMIRMIND_ENGINE_LINK_LIBS})
 
 # ---- nvfp4_tests — NVFP4 runtime integration (format resolve + loader) ------
 #
@@ -3616,8 +3633,8 @@ if(MIMIRMIND_ENABLE_CUDA AND MIMIRMIND_ENABLE_CUDNN)
     # Wire into the serving binary: link + feature macro so GpuOps compiles the
     # cuDNN prefill-attn path. Opt-in at runtime via MIMIRMIND_ATTN_CUDNN=1.
     if(TARGET mimirmind)
-        target_link_libraries(mimirmind PRIVATE mimirmind_cudnn_sdpa)
-        target_compile_definitions(mimirmind PRIVATE MIMIRMIND_HAVE_CUDNN_SDPA=1)
+        target_link_libraries(mimirmind_engine PUBLIC mimirmind_cudnn_sdpa)
+        target_compile_definitions(mimirmind_engine PUBLIC MIMIRMIND_HAVE_CUDNN_SDPA=1)
         # Bake the cuDNN lib dir into the binary's RPATH so it resolves
         # libcudnn.so.9 without a runtime LD_LIBRARY_PATH (the wheel ships no
         # system-path .so). The binary runs in-place from the build tree, so
@@ -3625,6 +3642,10 @@ if(MIMIRMIND_ENABLE_CUDA AND MIMIRMIND_ENABLE_CUDNN)
         # path the container mounts at runtime (/src/... == /opt/mimirmind/...).
         set_property(TARGET mimirmind APPEND PROPERTY
             BUILD_RPATH "${MIMIRMIND_CUDNN_ROOT}/lib")
+        if(TARGET hugin)
+            set_property(TARGET hugin APPEND PROPERTY
+                BUILD_RPATH "${MIMIRMIND_CUDNN_ROOT}/lib")
+        endif()
     endif()
 
     add_executable(cudnn_sdpa_parity tests/cudnn_sdpa_parity.cu)

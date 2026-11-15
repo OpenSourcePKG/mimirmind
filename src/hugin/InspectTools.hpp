@@ -31,6 +31,10 @@ public:
 
     void registerOn(McpServer& server);
 
+    /// Path of the currently opened model ("" = none). The forward tools
+    /// follow it, so open_model retargets them too.
+    [[nodiscard]] std::string modelPath() const { return _model ? _model->path() : std::string{}; }
+
 private:
     [[nodiscard]] const ModelView& model() const;
 

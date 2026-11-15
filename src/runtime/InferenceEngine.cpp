@@ -2670,7 +2670,8 @@ InferenceEngine::generateBatchL0(
 }
 
 std::vector<std::vector<float>>
-InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
+InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens,
+                               ForwardProbe*                 probe) {
     namespace cmp = mimirmind::compute;
 
     if (!_modelLoaded) {
@@ -2743,28 +2744,16 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
 
     _backend->prepareForward(newTokens, xBuf, N);
 
-    // Batched block forward. runBlock writes provisional K/V rows to
-    // [curLen, curLen+N); commit is deferred to commitVerified().
-    for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
-        _backend->runBlock(b, xBuf, N, cache, buffers, false);
-    }
-
-    // Per-position logits. rmsNorm + lmHead matmul is cheap next to the
-    // block chain, so no need to batch M=N here — a loop keeps the
-    // scratch requirement at vocab_lm floats (M=1).
-    //
+    // Per-row logits: rmsNorm(final) + lmHead into _logitsHostScratch.
     // `logits` is device memory on HIP discrete (HipAllocKind::Device).
     // A bulk D→H copy is required before the host-side vector copy —
     // otherwise `emplace_back(logits, logits + vocab_lm)` reads stale
     // or unmapped device pages and the caller sees garbage. On L0 UMA
     // the readback is a no-op-cost intra-address-space memcpy.
-    std::vector<std::vector<float>> out;
-    out.reserve(N);
     if (_logitsHostScratch.size() < vocab_lm) {
         _logitsHostScratch.resize(vocab_lm);
     }
-    for (std::size_t i = 0; i < N; ++i) {
-        const float* row = xBuf + i * d_model;
+    const auto rowLogits = [&](const float* row) {
         _ops->rmsNormAsync(row, 1, d_model,
                           static_cast<const float*>(outNorm->usmPtr),
                           _config.rmsNormEps, normFinal);
@@ -2773,9 +2762,49 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens) {
                     logits, logitsSc);
         _ops->readbackToHost(_logitsHostScratch.data(), logits,
                              vocab_lm * sizeof(float));
-        out.emplace_back(_logitsHostScratch.begin(),
-                         _logitsHostScratch.begin() +
-                             static_cast<std::ptrdiff_t>(vocab_lm));
+        return std::vector<float>(_logitsHostScratch.begin(),
+                                  _logitsHostScratch.begin() +
+                                      static_cast<std::ptrdiff_t>(vocab_lm));
+    };
+    const auto listed = [](const std::vector<std::uint32_t>& v, std::uint32_t b) {
+        return std::find(v.begin(), v.end(), b) != v.end();
+    };
+    std::size_t lensPos = N - 1;
+    if (probe != nullptr) {
+        probe->hidden.clear();
+        probe->lens.clear();
+        if (probe->lensPosition != static_cast<std::size_t>(-1)) {
+            if (probe->lensPosition >= N) {
+                throw std::runtime_error("forwardVerify: probe lensPosition out of range");
+            }
+            lensPos = probe->lensPosition;
+        }
+    }
+
+    // Batched block forward. runBlock writes provisional K/V rows to
+    // [curLen, curLen+N); commit is deferred to commitVerified().
+    for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
+        _backend->runBlock(b, xBuf, N, cache, buffers, false);
+        if (probe == nullptr) {
+            continue;
+        }
+        if (listed(probe->hiddenBlocks, b)) {
+            std::vector<float> h(N * d_model);
+            _ops->readbackToHost(h.data(), xBuf, h.size() * sizeof(float));
+            probe->hidden.emplace(b, std::move(h));
+        }
+        if (listed(probe->lensBlocks, b)) {
+            probe->lens.emplace(b, rowLogits(xBuf + lensPos * d_model));
+        }
+    }
+
+    // Per-position logits. rmsNorm + lmHead matmul is cheap next to the
+    // block chain, so no need to batch M=N here — a loop keeps the
+    // scratch requirement at vocab_lm floats (M=1).
+    std::vector<std::vector<float>> out;
+    out.reserve(N);
+    for (std::size_t i = 0; i < N; ++i) {
+        out.push_back(rowLogits(xBuf + i * d_model));
     }
     return out;
 }

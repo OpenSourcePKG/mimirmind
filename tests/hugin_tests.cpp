@@ -1,11 +1,15 @@
-// Hugin 7.2 Inc-1 — MCP server + inspect tools, driven in-process through the
-// JSON-RPC layer against a synthesized GGUF (no fixture on disk, no GPU).
+// Hugin 7.2 Inc-1/Inc-2 — MCP server + inspect tools, driven in-process through
+// the JSON-RPC layer against a synthesized GGUF (no fixture on disk, no GPU);
+// the host-side logit math of the forward tools. The forward tools themselves
+// run the engine and are validated end-to-end against a real model.
 
 #include "TestFramework.hpp"
 
 #include "core/rune/RuneFile.hpp"
 #include "core/rune/RuneFormat.hpp"
+#include "hugin/ForwardTools.hpp"
 #include "hugin/InspectTools.hpp"
+#include "hugin/LogitMath.hpp"
 #include "hugin/McpServer.hpp"
 
 #include <algorithm>
@@ -61,9 +65,13 @@ struct Fixture {
     std::string     path = writeTestGguf();
     hg::McpServer   server{"hugin", "test"};
     hg::InspectTools tools{path};
+    hg::ForwardTools forwardTools{[this] { return tools.modelPath(); }};
     int             nextId{1};
 
-    Fixture() { tools.registerOn(server); }
+    Fixture() {
+        tools.registerOn(server);
+        forwardTools.registerOn(server);
+    }
     ~Fixture() { std::filesystem::remove(path); }
 
     json rpc(const std::string& method, json params = json::object()) {
@@ -108,8 +116,11 @@ TEST(mcp_initialize_and_toolsList) {
         names.push_back(t["name"]);
         EXPECT_TRUE(t.contains("inputSchema"));
     }
-    EXPECT_TRUE(names == (std::vector<std::string>{"list_tensors", "model_info", "open_model", "rune_check",
-                                                   "rune_inspect", "tensor_hash", "tensor_stats"}));
+    std::sort(names.begin(), names.end());
+    EXPECT_TRUE(names == (std::vector<std::string>{"activations", "list_tensors", "logit_lens", "model_info",
+                                                   "next_token", "open_model", "perplexity", "rune_check",
+                                                   "rune_compare", "rune_inspect", "tensor_hash", "tensor_stats",
+                                                   "tokenize"}));
 }
 
 TEST(mcp_protocolErrors) {
@@ -215,6 +226,39 @@ TEST(tools_withoutModel_reportToolError) {
                                     {"params", {{"name", "model_info"}}}}))["result"];
     EXPECT_TRUE(r["isError"].get<bool>());
     EXPECT_TRUE(r["content"][0]["text"].get<std::string>().find("open_model") != std::string::npos);
+}
+
+TEST(forwardTools_withoutModel_reportToolError_noEngineBuilt) {
+    hg::McpServer    server{"hugin", "test"};
+    hg::ForwardTools fwd{[] { return std::string{}; }};
+    fwd.registerOn(server);
+    for (const char* tool : {"next_token", "perplexity", "logit_lens", "activations", "tokenize"}) {
+        const json r = (*server.handle({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                        {"params", {{"name", tool}, {"arguments", {{"text", "hi"}}}}}}))["result"];
+        EXPECT_TRUE(r["isError"].get<bool>());
+        EXPECT_TRUE(r["content"][0]["text"].get<std::string>().find("open_model") != std::string::npos);
+    }
+}
+
+TEST(logitMath_logSoftmax_topK_rank_entropy_kl) {
+    const std::vector<float> logits{1.0f, 3.0f, 2.0f, 3.0f};
+    const auto lp = hg::LogitMath::logSoftmax(logits);
+    double total = 0;
+    for (double v : lp) total += std::exp(v);
+    EXPECT_TRUE(nearD(total, 1.0));
+    EXPECT_TRUE(nearD(lp[1] - lp[0], 2.0));
+    EXPECT_TRUE(hg::LogitMath::topK(lp, 3) == (std::vector<std::int32_t>{1, 3, 2}));   // ties by index
+    EXPECT_EQ(hg::LogitMath::rankOf(lp, 3), std::size_t{1});
+    EXPECT_EQ(hg::LogitMath::rankOf(lp, 0), std::size_t{3});
+    const std::vector<float> uniform(4, 0.5f);
+    const auto lu = hg::LogitMath::logSoftmax(uniform);
+    EXPECT_TRUE(nearD(hg::LogitMath::entropy(lu), std::log(4.0)));
+    EXPECT_TRUE(nearD(hg::LogitMath::kl(lp, lp), 0.0));
+    // KL(p||u) = log(n) - H(p)
+    EXPECT_TRUE(nearD(hg::LogitMath::kl(lp, lu), std::log(4.0) - hg::LogitMath::entropy(lp)));
+    std::vector<float> capped{100.0f, -100.0f, 0.0f};
+    hg::LogitMath::softcap(capped, 30.0f);
+    EXPECT_TRUE(capped[0] < 30.0f && capped[0] > 29.0f && capped[1] > -30.0f && capped[2] == 0.0f);
 }
 
 int main() {

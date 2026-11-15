@@ -62,6 +62,7 @@ class ThermalGuard;
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -379,9 +380,26 @@ public:
      * Throws if the KV cache would overflow (`cache.length() + N` past
      * the configured max), or if the model isn't loaded, or if
      * newTokens is empty.
+     *
+     * `probe` (7.2 Hugin, optional): observe the residual stream of THIS
+     * forward without a second forward implementation. After each block
+     * listed in `hiddenBlocks` the full [N x d_model] hidden state is copied
+     * to the host; after each block in `lensBlocks` the hidden row at
+     * `lensPosition` is projected through the model's own final norm +
+     * lm_head (logit lens). Null probe = the unchanged verify path.
      */
+    struct ForwardProbe {
+        std::vector<std::uint32_t> hiddenBlocks;
+        std::vector<std::uint32_t> lensBlocks;
+        /// Position (0..N-1) for the lens; SIZE_MAX = last position.
+        std::size_t lensPosition{static_cast<std::size_t>(-1)};
+        /// Filled by forwardVerify: block -> [N * d_model] / block -> [vocab].
+        std::map<std::uint32_t, std::vector<float>> hidden;
+        std::map<std::uint32_t, std::vector<float>> lens;
+    };
     std::vector<std::vector<float>> forwardVerify(
-        std::span<const std::int32_t> newTokens);
+        std::span<const std::int32_t> newTokens,
+        ForwardProbe*                 probe = nullptr);
 
     /**
      * M9.11.3 companion — commit `k` of the N speculative rows that
