@@ -231,7 +231,7 @@ on its engine's mutable scratch + sampler state.
 - Multi-stage Dockerfile: `builder` (toolchain only), `build` (source
   + compile), `llamacpp` (the reference oracle for parity dumps),
   `runtime` (no toolchain, just the binary + SPV blobs).
-- CMake ≥ 3.21, Ninja, C++20, strict warnings (`-Wall -Wextra
+- CMake ≥ 3.21, Ninja, C++23, strict warnings (`-Wall -Wextra
   -Wpedantic -Wshadow -Wconversion -Wsign-conversion ...`).
 - Tests are CMake targets in their own right: `quant_tests`,
   `arch_tests`, `compute_tests`, `gpu_tests`. The first three are pure

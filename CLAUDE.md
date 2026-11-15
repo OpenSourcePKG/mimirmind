@@ -37,7 +37,7 @@ Bragi extends the same API to multi-tenant workloads.
 
 ## Codebase Conventions
 
-- **Language:** C++20.
+- **Language:** C++23 (`CMAKE_CXX_STANDARD 23`; required for `std::expected`).
 - **Build:** CMake ≥ 3.21, `cmake -B build && cmake --build build`.
 - **Layout:** one class per file, `PascalCase` filenames, headers `.hpp`,
   sources `.cpp`. Namespaces follow folders (`mimirmind::runtime`, etc.).

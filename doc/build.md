@@ -284,7 +284,7 @@ repo:
 - `level-zero`, `level-zero-dev`
 - `intel-opencl-icd`, `intel-level-zero-gpu`
 - `intel-ocloc` (for compiling `*.cl` to `.spv` at build time)
-- GCC 14 (for C++20 with `<format>` and `<source_location>` support)
+- GCC 14 (C++23: `<expected>`, `<format>`, `<source_location>`)
 
 The runtime image is the same Ubuntu base with only the runtime
 libraries — no toolchain, no source — plus `python3` and

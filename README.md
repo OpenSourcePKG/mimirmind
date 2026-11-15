@@ -2,13 +2,13 @@
 
 <h1 align="center">MimirMind</h1>
 
-<p align="center"><strong>A from-scratch C++20 inference engine. One codebase serves Gemma 4 and Qwen3-Next across an Intel laptop iGPU, an NVIDIA GB10 Blackwell superchip, and AMD ROCm.</strong></p>
+<p align="center"><strong>A from-scratch C++23 inference engine. One codebase serves Gemma 4 and Qwen3-Next across an Intel laptop iGPU, an NVIDIA GB10 Blackwell superchip, and AMD ROCm.</strong></p>
 
 <p align="center">No llama.cpp. No ggml. No PyTorch. No SYCL. Just the OpenAI API and hand-written kernels.</p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
-  <img src="https://img.shields.io/badge/C%2B%2B-20-00599C.svg" alt="C++20">
+  <img src="https://img.shields.io/badge/C%2B%2B-23-00599C.svg" alt="C++23">
   <img src="https://img.shields.io/badge/runtime%20deps-zero%20ML%20frameworks-brightgreen.svg" alt="Zero ML framework dependencies">
   <img src="https://img.shields.io/badge/API-OpenAI%20compatible-black.svg" alt="OpenAI-compatible API">
 </p>
@@ -28,7 +28,7 @@ Most local-inference stacks wrap someone else's engine and wait on their roadmap
 - 🗣️ **Multimodal.** Speech-to-text (Whisper) and neural text-to-speech (Orpheus + SNAC) served through the same OpenAI-compatible endpoints.
 - 🔁 **Model-switching daemon (Munin).** Hold several models resident in unified memory and route each request to the right one — no reload, no cold start.
 - ✅ **Test-anchored.** Hundreds of unit tests from hand-crafted quant-block byte patterns up through full GPU kernels on real silicon, plus bit-exact parity gates against the reference oracle.
-- 🧱 **Pure, auditable C++20.** `std::span`, `std::expected`, `enum class`, RAII over raw handles, one class per file, no exceptions across the driver boundary.
+- 🧱 **Pure, auditable C++23.** `std::span`, `std::expected`, `enum class`, RAII over raw handles, one class per file, no exceptions across the driver boundary.
 
 ## Runs on real hardware
 
