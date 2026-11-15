@@ -398,6 +398,9 @@ add_library(mimirmind_core_common STATIC
     src/core/safetensors/SafetensorsIndex.cpp
     src/core/safetensors/SafetensorsModel.cpp
     src/core/safetensors/SafetensorsReader.cpp
+    src/core/rune/RuneApplier.cpp
+    src/core/rune/RuneFile.cpp
+    src/core/rune/RuneFormat.cpp
     src/core/os/MappedFile.cpp
     src/core/log/Log.cpp
     src/core/os/GovernorLock.cpp
@@ -1811,6 +1814,22 @@ add_executable(safetensors_tests
 target_include_directories(safetensors_tests PRIVATE tests)
 
 target_link_libraries(safetensors_tests PRIVATE mimirmind_core_common)
+
+# ---- rune_tests — Rune format + host-side applier (Futhark core, 7.1) ---------
+#
+# Pure-CPU: hand-built Runes applied to host buffers. Covers the container
+# round trip, every manifest rejection, exact op math, all-or-nothing apply,
+# hash chaining for stacked runes, and rollback.
+#
+# Run via:   cmake --build build --target rune_tests && build/rune_tests
+
+add_executable(rune_tests
+    tests/rune_tests.cpp
+)
+
+target_include_directories(rune_tests PRIVATE tests)
+
+target_link_libraries(rune_tests PRIVATE mimirmind_core_common)
 
 # ---- nvfp4_tests — NVFP4 runtime integration (format resolve + loader) ------
 #

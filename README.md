@@ -74,7 +74,7 @@ Native build: `cmake -B build && cmake --build build`. Accelerator setup in [`do
 
 ## The road (Norse-themed)
 
-**Well** (load) → **Envoy** (kernels) → **🎯 Mimir-1.0** (released: OpenAI HTTP + Gemma 4 on Intel) → **Sleipnir** (Xe-LPG perf) → **🌈 Bragi** (serving-class CUDA on GB10: NVFP4, batching, multi-tenant). Cross-cutting: **Munin** (model-switching daemon), **Heimdall** (auth/TLS), **Loki/Nornir** (LoRA), **Bifröst** (Anthropic↔OpenAI proxy).
+**Well** (load) → **Envoy** (kernels) → **🎯 Mimir-1.0** (released: OpenAI HTTP + Gemma 4 on Intel) → **Sleipnir** (Xe-LPG perf) → **🌈 Bragi** (serving-class CUDA on GB10: NVFP4, batching, multi-tenant). Cross-cutting: **Munin** (model-switching daemon), **Heimdall** (auth/TLS), **Hugin** (model surgery + adapter training, Runes applied by **Futhark**), **Bifröst** (Anthropic↔OpenAI proxy).
 
 We work measure-first: build a lever, run it on the real target, ship it with numbers or shelve it with data. Correctness — bit-exact parity gates — before speed. There's even a book being written alongside: *"From Zero to an Inference Engine."*
 

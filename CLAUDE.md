@@ -21,13 +21,19 @@ intended to expand into many areas over time:
   already-computed embeddings, no backprop through the network, no training
   framework. The "System-One" typed-decision head trained in-process via
   `POST /v1/decide/train`; head-fitting on frozen features, not model training.
-- **Hugin (planned):** distills an input-compression adapter/encoder against a
-  **frozen** base model (self-distillation, ICAE-style objective).
-- **M-Loki + Nornir (planned):** LoRA adapter support at runtime plus a separate
-  Nornir trainer producing weight-delta adapters keyed to a base-model hash.
+- **Hugin (planned, roadmap 7):** a separate C++ companion process running
+  alongside mimirmind (no Python). It attaches to the Munin-shared base
+  weights and does model surgery (inspect / locate / edit, driven by Claude
+  via an MCP server) and adapter training (own C++ backward core: LoRA-SFT,
+  DAgger, anti-repetition, GKD, pruning + healing, later the input-compression
+  encoder). Every change it produces is written to a **Rune** file.
+- **Futhark (planned):** the in-engine Rune applier — validates the base-model
+  hash and applies a Rune after load (overwrite / load-time mask / low-rank or
+  steering overlay), with quiesce, cache flush, and rollback.
 
-The unifying rule: we train *adapters, heads, and compression modules* around a
-frozen base — never the base weights themselves. HIP/ROCm (AMD RDNA3+) sits as a
+The unifying rule: **the base model file is never modified.** Every weight
+change is a versioned Rune, hash-bound to the base model, applied after load,
+and fully reversible by removing the Rune. HIP/ROCm (AMD RDNA3+) sits as a
 home-lab / sandbox tier — not a committed production target.
 
 Sister project: `pegenaut` (TypeScript RAG stack, separate repo). MimirMind
@@ -64,8 +70,9 @@ Always frame milestones with the phase they belong to:
   (M-CLR, M10.2, M8.K/L, M-Probe.1, M9.11, M-Ratatoskr, M-Diff).
 - **Bragi** *(Mimir-2.0)* — serving-class CUDA / DGX Spark GB10
   (M-CudaBring, CapacityProbe, FP4, Batch, MoeGroup, MTP, DFlash).
-- **Cross-cutting** — M-Munin, M-Hugin, EncoderRunner, Heimdall, LoRA
-  (Loki/Nornir), modality axis, tiered-weight capability.
+- **Cross-cutting** — M-Munin, M-Hugin + Futhark (model surgery, adapter
+  training, Runes), EncoderRunner, Heimdall, modality axis, tiered-weight
+  capability.
 
 ### The Synaipse roadmap is the single source of truth
 
