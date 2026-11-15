@@ -1833,6 +1833,43 @@ target_include_directories(rune_tests PRIVATE tests)
 
 target_link_libraries(rune_tests PRIVATE mimirmind_core_common)
 
+# ---- hugin — adaptation companion: MCP server + inspect tools (7.2) ----------
+#
+# Separate process Claude talks to over stdio (MCP). Inc-1 is host-only (GGUF
+# mmap, dequant, Futhark dry run) — no device, no forward pass. The library
+# holds everything but main() so hugin_tests can drive the tools in-process.
+#
+#   cmake --build build --target hugin hugin_tests && build/hugin_tests
+#   claude mcp add hugin -- $PWD/build/hugin --model /path/to/model.gguf
+
+add_library(mimirmind_hugin STATIC
+    src/hugin/InspectTools.cpp
+    src/hugin/McpServer.cpp
+    src/hugin/ModelView.cpp
+    src/compute/Dequant.cpp
+    src/compute/QuantTypeRegistry.cpp
+    src/compute/quant/Bfloat16.cpp
+    src/compute/quant/Float16.cpp
+    src/compute/quant/Float32.cpp
+    src/compute/quant/Q3K.cpp
+    src/compute/quant/Q4K.cpp
+    src/compute/quant/Q4_0.cpp
+    src/compute/quant/Q4_1.cpp
+    src/compute/quant/Q5K.cpp
+    src/compute/quant/Q5_0.cpp
+    src/compute/quant/Q5_1.cpp
+    src/compute/quant/Q6K.cpp
+    src/compute/quant/Q8_0.cpp
+)
+target_link_libraries(mimirmind_hugin PUBLIC mimirmind_core_common)
+
+add_executable(hugin src/hugin/main.cpp)
+target_link_libraries(hugin PRIVATE mimirmind_hugin)
+
+add_executable(hugin_tests tests/hugin_tests.cpp)
+target_include_directories(hugin_tests PRIVATE tests)
+target_link_libraries(hugin_tests PRIVATE mimirmind_hugin)
+
 # ---- nvfp4_tests — NVFP4 runtime integration (format resolve + loader) ------
 #
 # Standalone test binary. No CUDA — the loader is exercised against a

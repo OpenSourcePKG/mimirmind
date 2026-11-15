@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <span>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -152,6 +153,12 @@ public:
     [[nodiscard]] const std::map<std::string, MetadataValue>& metadata() const noexcept { return _metadata; }
 
     [[nodiscard]] const GgufTensor*    findTensor(std::string_view name) const noexcept;
+
+    /// Host view of a tensor's raw bytes inside the mmapped file (read-only,
+    /// valid while the reader is open). Empty span when `t` lies outside the
+    /// file. Used by host-side tools (Hugin) that inspect weights without a
+    /// device upload.
+    [[nodiscard]] std::span<const std::uint8_t> tensorFileBytes(const GgufTensor& t) const noexcept;
     [[nodiscard]] const MetadataValue* findMetadata(std::string_view key) const noexcept;
 
 private:

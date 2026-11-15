@@ -377,6 +377,15 @@ void GgufReader::close() noexcept {
     _totalTensorBytes = 0;
 }
 
+std::span<const std::uint8_t> GgufReader::tensorFileBytes(const GgufTensor& t) const noexcept {
+    const auto file = _file.bytes();
+    const std::size_t begin = _tensorDataOffset + static_cast<std::size_t>(t.fileOffset);
+    if (begin > file.size() || t.nbytes > file.size() - begin) {
+        return {};
+    }
+    return file.subspan(begin, t.nbytes);
+}
+
 const GgufTensor* GgufReader::findTensor(std::string_view name) const noexcept {
     for (const auto& t : _tensors) {
         if (t.name == name) {
