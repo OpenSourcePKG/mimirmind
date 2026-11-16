@@ -1872,11 +1872,13 @@ target_link_libraries(rune_tests PRIVATE mimirmind_core_common)
 # serving binary) — so the quant/dequant sources come from there, not twice.
 # OBJECT libs on both sides: every object is linked, nothing dropped.
 add_library(mimirmind_hugin OBJECT
+    src/hugin/ForwardSupport.cpp
     src/hugin/ForwardTools.cpp
     src/hugin/InspectTools.cpp
     src/hugin/LogitMath.cpp
     src/hugin/McpServer.cpp
     src/hugin/ModelView.cpp
+    src/hugin/SurgeryTools.cpp
 )
 target_link_libraries(mimirmind_hugin PUBLIC mimirmind_engine)
 

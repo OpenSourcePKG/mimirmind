@@ -8,6 +8,7 @@
 #include "core/rune/RuneFile.hpp"
 #include "core/rune/RuneFormat.hpp"
 #include "hugin/ForwardTools.hpp"
+#include "hugin/SurgeryTools.hpp"
 #include "hugin/InspectTools.hpp"
 #include "hugin/LogitMath.hpp"
 #include "hugin/McpServer.hpp"
@@ -66,11 +67,13 @@ struct Fixture {
     hg::McpServer   server{"hugin", "test"};
     hg::InspectTools tools{path};
     hg::ForwardTools forwardTools{[this] { return hg::ForwardTools::Target{tools.modelPath(), {}}; }};
+    hg::SurgeryTools surgery{forwardTools};
     int             nextId{1};
 
     Fixture() {
         tools.registerOn(server);
         forwardTools.registerOn(server);
+        surgery.registerOn(server);
     }
     ~Fixture() { std::filesystem::remove(path); }
 
@@ -117,10 +120,11 @@ TEST(mcp_initialize_and_toolsList) {
         EXPECT_TRUE(t.contains("inputSchema"));
     }
     std::sort(names.begin(), names.end());
-    EXPECT_TRUE(names == (std::vector<std::string>{"activations", "attention_pattern", "eval", "expert_usage", "list_tensors", "logit_lens", "model_info",
-                                                   "next_token", "open_model", "perplexity", "rune_check",
-                                                   "rune_compare", "rune_inspect", "tensor_hash", "tensor_stats",
-                                                   "tokenize"}));
+    EXPECT_TRUE(names == (std::vector<std::string>{"ablate_preview", "activations", "attention_pattern", "causal_trace",
+                                                   "eval", "expert_usage", "generate", "list_tensors", "logit_lens",
+                                                   "model_info", "next_token", "open_model", "perplexity", "rune_check",
+                                                   "rune_compare", "rune_inspect", "steer_list", "steer_preview",
+                                                   "steer_vector", "tensor_hash", "tensor_stats", "tokenize"}));
 }
 
 TEST(mcp_protocolErrors) {
@@ -239,6 +243,30 @@ TEST(forwardTools_withoutModel_reportToolError_noEngineBuilt) {
         EXPECT_TRUE(r["isError"].get<bool>());
         EXPECT_TRUE(r["content"][0]["text"].get<std::string>().find("open_model") != std::string::npos);
     }
+}
+
+TEST(surgeryTools_withoutModel_reportToolError_steerListEmpty) {
+    hg::McpServer    server{"hugin", "test"};
+    hg::ForwardTools fwd{[] { return hg::ForwardTools::Target{}; }};
+    hg::SurgeryTools surgery{fwd};
+    surgery.registerOn(server);
+    const auto call = [&](const char* tool, json args) {
+        return (*server.handle({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                {"params", {{"name", tool}, {"arguments", std::move(args)}}}}))["result"];
+    };
+    const json calls[] = {
+        json{{"tool", "causal_trace"}, {"args", {{"clean", "a"}, {"corrupt", "b"}}}},
+        json{{"tool", "steer_vector"}, {"args", {{"name", "v"}, {"positive", {"a"}}, {"negative", {"b"}}, {"block", 0}}}},
+        json{{"tool", "steer_preview"}, {"args", {{"text", "hi"}, {"vector", "v"}}}},
+        json{{"tool", "ablate_preview"}, {"args", {{"text", "hi"}, {"block", 0}, {"heads", {0}}}}},
+        json{{"tool", "generate"}, {"args", {{"text", "hi"}}}}};
+    for (const auto& c : calls) {
+        const json r = call(c["tool"].get<std::string>().c_str(), c["args"]);
+        EXPECT_TRUE(r["isError"].get<bool>());
+        EXPECT_TRUE(r["content"][0]["text"].get<std::string>().find("open_model") != std::string::npos);
+    }
+    const json list = call("steer_list", json::object());
+    EXPECT_TRUE(!list.value("isError", false));
 }
 
 TEST(logitMath_logSoftmax_topK_rank_entropy_kl) {

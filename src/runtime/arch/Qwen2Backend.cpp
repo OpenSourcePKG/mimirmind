@@ -467,8 +467,9 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
 
     // 7.2 Hugin: per-head attention context (pre O-projection) + the exact
     // score scale, so attention patterns rebuilt from Qcur/Kcur can be
-    // checked against what the kernel actually produced.
-    tapStage(_gmm, _ops, "attn_ctx", blockIdx, attnOutBuf, T, q_dim);
+    // checked against what the kernel actually produced. 7.3: editable
+    // (head ablation previews zero a head's slice here).
+    tapStageMutable(_gmm, _ops, "attn_ctx", blockIdx, attnOutBuf, T, q_dim);
     tapStageHost("attn_scale", blockIdx, &attnScale, 1, 1);
 
     trace("O projection (matmulAsync — in-stream ordered, no sync needed)");

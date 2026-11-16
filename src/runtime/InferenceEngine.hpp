@@ -404,6 +404,28 @@ public:
             std::size_t        cols{0};
             std::vector<float> data;
         };
+        /// 7.3 Hugin write hooks (previews / activation patching), applied in
+        /// this forward only. Residual edits run right after their block,
+        /// BEFORE that block's hidden/lens capture, in list order.
+        struct ResidualEdit {
+            enum class Mode { Set, Add };
+            std::uint32_t      block{0};
+            Mode               mode{Mode::Add};
+            /// Row to edit (0..N-1); SIZE_MAX = every row.
+            std::size_t        position{static_cast<std::size_t>(-1)};
+            std::vector<float> values;   // [d_model]
+        };
+        std::vector<ResidualEdit> residualEdits;
+        /// Per-stage in-place edit (ArchBackend::StageTap::edit) at stages the
+        /// backend marks editable (llama/qwen2: "attn_ctx"). Return true when
+        /// `data` [rows x cols] was changed.
+        struct StageEdit {
+            std::string   stage;
+            std::uint32_t block{0};
+            std::function<bool(std::vector<float>& data, std::size_t rows,
+                               std::size_t cols)> fn;
+        };
+        std::vector<StageEdit> stageEdits;
         /// Filled by forwardVerify: block -> [N * d_model] / block -> [vocab] /
         /// (stage, block) -> captured stage.
         std::map<std::uint32_t, std::vector<float>> hidden;

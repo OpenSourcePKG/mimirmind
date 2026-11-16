@@ -240,6 +240,14 @@ public:
         std::function<void(std::string_view stage, std::size_t block,
                            std::vector<float>&& data, std::size_t rows,
                            std::size_t cols)>                           onStage;
+        /// 7.3 Hugin (optional): edit a stage in place. Called only at stages
+        /// a backend marks editable (tapStageMutable); returns true when it
+        /// changed `data`, which is then written back to the device buffer
+        /// before the forward continues. Diagnostic/preview path only — the
+        /// serving engine never installs a tap.
+        std::function<bool(std::string_view stage, std::size_t block,
+                           std::vector<float>& data, std::size_t rows,
+                           std::size_t cols)>                           edit;
     };
     void setStageTap(StageTap tap) { _stageTap = std::move(tap); }
     void clearStageTap() noexcept { _stageTap = StageTap{}; }
@@ -255,6 +263,12 @@ protected:
     void tapStage(compute::ComputeMatmul& gmm, compute::ComputeOps& ops,
                   std::string_view stage, std::size_t block,
                   const float* device, std::size_t rows, std::size_t cols) const;
+    /// Like tapStage, but the stage may be edited in place (StageTap::edit)
+    /// and is written back to `device` when changed. onStage then observes
+    /// the edited values.
+    void tapStageMutable(compute::ComputeMatmul& gmm, compute::ComputeOps& ops,
+                         std::string_view stage, std::size_t block,
+                         float* device, std::size_t rows, std::size_t cols) const;
     /// Host values -> tap (no-op unless stageTapWants).
     void tapStageHost(std::string_view stage, std::size_t block,
                       const float* host, std::size_t rows, std::size_t cols) const;

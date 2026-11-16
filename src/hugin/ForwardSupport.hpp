@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Stefan Werfling
+
+#pragma once
+
+#include "runtime/InferenceEngine.hpp"
+
+#include <nlohmann/json.hpp>
+
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string>
+#include <vector>
+
+/**
+ * Helpers shared by Hugin's forward-based tool groups (ForwardTools,
+ * SurgeryTools): argument parsing, the stateless forward, log-probs and
+ * top-k rendering. Free functions so tool lambdas call them unqualified via
+ * `using namespace forward_support;`.
+ */
+namespace mimirmind::hugin::forward_support {
+
+using Engine = runtime::InferenceEngine;
+
+/// JSON-schema object with `properties` / `required`.
+nlohmann::json schema(nlohmann::json properties, nlohmann::json required = nlohmann::json::array());
+
+/// text / tokens / add_bos input properties, plus `extra`.
+nlohmann::json textProps(nlohmann::json extra = nlohmann::json::object());
+
+/// Token ids from `tokens` or `text` (+ add_bos); throws when empty.
+std::vector<std::int32_t> inputTokens(const Engine& e, const nlohmann::json& a);
+
+/// Same, for a text under a different key (e.g. "clean" / "corrupt").
+std::vector<std::int32_t> textTokens(const Engine& e, const std::string& text, bool addBos);
+
+std::string piece(const Engine& e, std::int32_t id);
+
+/// One stateless forward: empty cache in, empty cache out.
+std::vector<std::vector<float>> forward(Engine& e, std::span<const std::int32_t> ids,
+                                        Engine::ForwardProbe* probe = nullptr);
+
+/// Final soft-cap + log-softmax of one logits row.
+std::vector<double> logProbs(const Engine& e, std::vector<float> logits);
+
+nlohmann::json topJson(const Engine& e, const std::vector<double>& logp, std::size_t k);
+
+/// Requested `blocks` (default: all), validated, sorted, unique.
+std::vector<std::uint32_t> blockList(const Engine& e, const nlohmann::json& a);
+
+/// `position` (negative counts from the end; default last) validated against n.
+std::size_t positionArg(const nlohmann::json& a, std::size_t n);
+
+} // namespace mimirmind::hugin::forward_support

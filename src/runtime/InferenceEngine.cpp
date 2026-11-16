@@ -2780,9 +2780,8 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens,
         probe->hidden.clear();
         probe->lens.clear();
         probe->stageData.clear();
-        if (!probe->stages.empty()) {
-            arch::ArchBackend::StageTap tap;
-            tap.wants = [probe](std::string_view stage, std::size_t block) {
+        if (!probe->stages.empty() || !probe->stageEdits.empty()) {
+            const auto observed = [probe](std::string_view stage, std::size_t block) {
                 const bool nameOk = std::find(probe->stages.begin(), probe->stages.end(),
                                               stage) != probe->stages.end();
                 const bool blockOk = probe->stageBlocks.empty() ||
@@ -2790,11 +2789,33 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens,
                               static_cast<std::uint32_t>(block)) != probe->stageBlocks.end();
                 return nameOk && blockOk;
             };
-            tap.onStage = [probe](std::string_view stage, std::size_t block,
-                                  std::vector<float>&& data, std::size_t rows,
-                                  std::size_t cols) {
-                probe->stageData[{std::string{stage}, static_cast<std::uint32_t>(block)}] =
-                    ForwardProbe::Stage{rows, cols, std::move(data)};
+            const auto edited = [probe](std::string_view stage, std::size_t block) {
+                return std::any_of(probe->stageEdits.begin(), probe->stageEdits.end(),
+                                   [&](const ForwardProbe::StageEdit& e) {
+                                       return e.stage == stage && e.block == block;
+                                   });
+            };
+            arch::ArchBackend::StageTap tap;
+            tap.wants = [observed, edited](std::string_view stage, std::size_t block) {
+                return observed(stage, block) || edited(stage, block);
+            };
+            tap.onStage = [probe, observed](std::string_view stage, std::size_t block,
+                                            std::vector<float>&& data, std::size_t rows,
+                                            std::size_t cols) {
+                if (observed(stage, block)) {
+                    probe->stageData[{std::string{stage}, static_cast<std::uint32_t>(block)}] =
+                        ForwardProbe::Stage{rows, cols, std::move(data)};
+                }
+            };
+            tap.edit = [probe](std::string_view stage, std::size_t block,
+                               std::vector<float>& data, std::size_t rows, std::size_t cols) {
+                bool changed = false;
+                for (const auto& e : probe->stageEdits) {
+                    if (e.stage == stage && e.block == block && e.fn) {
+                        changed = e.fn(data, rows, cols) || changed;
+                    }
+                }
+                return changed;
             };
             _backend->setStageTap(std::move(tap));
             tapGuard.b = _backend.get();
@@ -2813,6 +2834,35 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens,
         _backend->runBlock(b, xBuf, N, cache, buffers, false);
         if (probe == nullptr) {
             continue;
+        }
+        // 7.3 residual write hooks (host round trip; preview path only).
+        bool anyEdit = false;
+        for (const auto& re : probe->residualEdits) {
+            anyEdit = anyEdit || re.block == b;
+        }
+        if (anyEdit) {
+            std::vector<float> h(N * d_model);
+            _ops->readbackToHost(h.data(), xBuf, h.size() * sizeof(float));
+            for (const auto& re : probe->residualEdits) {
+                if (re.block != b) {
+                    continue;
+                }
+                if (re.values.size() != d_model) {
+                    throw std::runtime_error("forwardVerify: residual edit needs d_model values");
+                }
+                const bool all = re.position == static_cast<std::size_t>(-1);
+                if (!all && re.position >= N) {
+                    throw std::runtime_error("forwardVerify: residual edit position out of range");
+                }
+                for (std::size_t r = all ? 0 : re.position; r < (all ? N : re.position + 1); ++r) {
+                    float* row = h.data() + r * d_model;
+                    for (std::size_t i = 0; i < d_model; ++i) {
+                        row[i] = re.mode == ForwardProbe::ResidualEdit::Mode::Set
+                                     ? re.values[i] : row[i] + re.values[i];
+                    }
+                }
+            }
+            _ops->uploadHostBytes(xBuf, h.data(), h.size() * sizeof(float));
         }
         if (listed(probe->hiddenBlocks, b)) {
             std::vector<float> h(N * d_model);

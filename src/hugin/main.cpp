@@ -8,6 +8,7 @@
 #include "hugin/ForwardTools.hpp"
 #include "hugin/InspectTools.hpp"
 #include "hugin/McpServer.hpp"
+#include "hugin/SurgeryTools.hpp"
 
 #include <cstdio>
 #include <exception>
@@ -20,7 +21,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.2.0";
+constexpr const char* kVersion = "0.3.0";
 
 void usage() {
     std::cerr << "usage: hugin [--model <file.gguf | nvfp4-checkpoint-dir>] [--tokenizer-gguf <file.gguf>]\n"
@@ -71,8 +72,10 @@ int main(int argc, char** argv) {
         mimirmind::hugin::ForwardTools forwardTools{[&inspect] {
             return mimirmind::hugin::ForwardTools::Target{inspect.modelPath(), inspect.tokenizerGguf()};
         }};
+        mimirmind::hugin::SurgeryTools surgery{forwardTools};
         inspect.registerOn(server);
         forwardTools.registerOn(server);
+        surgery.registerOn(server);
         std::cerr << "hugin " << kVersion << ": MCP server ready on stdio"
                   << (model.empty() ? std::string{} : " (model '" + model + "')") << "\n";
         server.run(std::cin, proto);

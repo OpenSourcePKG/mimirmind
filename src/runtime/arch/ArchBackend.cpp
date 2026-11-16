@@ -88,6 +88,21 @@ void ArchBackend::tapStage(compute::ComputeMatmul& gmm, compute::ComputeOps& ops
     _stageTap.onStage(stage, block, std::move(host), rows, cols);
 }
 
+void ArchBackend::tapStageMutable(compute::ComputeMatmul& gmm, compute::ComputeOps& ops,
+                                  std::string_view stage, std::size_t block,
+                                  float* device, std::size_t rows, std::size_t cols) const {
+    if (!stageTapWants(stage, block)) {
+        return;
+    }
+    gmm.sync();
+    std::vector<float> host(rows * cols);
+    ops.readbackToHost(host.data(), device, host.size() * sizeof(float));
+    if (_stageTap.edit && _stageTap.edit(stage, block, host, rows, cols)) {
+        ops.uploadHostBytes(device, host.data(), host.size() * sizeof(float));
+    }
+    _stageTap.onStage(stage, block, std::move(host), rows, cols);
+}
+
 void ArchBackend::tapStageHost(std::string_view stage, std::size_t block,
                                const float* host, std::size_t rows, std::size_t cols) const {
     if (!stageTapWants(stage, block)) {

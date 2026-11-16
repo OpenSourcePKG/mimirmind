@@ -65,6 +65,14 @@ public:
 
     void registerOn(McpServer& server);
 
+    /// The base engine (lazy load / reload on a changed target). Shared with
+    /// SurgeryTools so both tool groups run on one resident model.
+    runtime::InferenceEngine& engine() { return base(); }
+
+    /// Identity of the current target (path + tokenizer); session state that
+    /// is only valid for one model (steering vectors) keys on it.
+    [[nodiscard]] std::string targetKey() const;
+
 private:
     struct Loaded;
 
