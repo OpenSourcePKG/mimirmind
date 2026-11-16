@@ -676,6 +676,7 @@ void InferenceEngine::finalizeLoad() {
         _cfg.features.moeFusedDown != core::config::TriState::Disable);
     attachQwen4ExpPleTable();
     installRuneSteers();
+    installRuneExpertMasks();
 
     _modelLoaded = true;
     // Defensive: a previous model's KV state must not survive into the
@@ -740,6 +741,59 @@ void InferenceEngine::installRuneSteers() {
     _runeSteerHost.clear();
 }
 
+void InferenceEngine::installRuneExpertMasks() {
+    _runeMaskDev.clear();
+    if (_runeMaskHost.empty()) {
+        return;
+    }
+    if (!_backend) {
+        throw std::runtime_error("Futhark: rune expert mask needs an arch backend "
+                                 "(architecture '" + _config.architecture + "')");
+    }
+    const std::size_t nExperts = _config.expertCount;
+    const std::size_t topK     = _config.expertUsedCount;
+    if (nExperts == 0) {
+        throw std::runtime_error("Futhark: expert mask rune on model '" + _modelIdHint +
+                                 "', which has no MoE experts");
+    }
+    std::vector<std::pair<std::size_t, const float*>> masks;
+    _runeMaskDev.reserve(_runeMaskHost.size());
+    for (const auto& [block, keep] : _runeMaskHost) {
+        const std::string where = "Futhark: expert mask on block " + std::to_string(block);
+        if (block >= _config.blockCount) {
+            throw std::runtime_error(where + " but the model has " +
+                                     std::to_string(_config.blockCount) + " blocks");
+        }
+        if (keep.size() != nExperts) {
+            throw std::runtime_error(where + " has " + std::to_string(keep.size()) +
+                                     " experts, the model has " + std::to_string(nExperts));
+        }
+        std::vector<float> bias(nExperts, 0.0F);
+        std::size_t        kept = 0;
+        for (std::size_t e = 0; e < nExperts; ++e) {
+            if (keep[e] != 0) {
+                ++kept;
+            } else {
+                bias[e] = arch::ArchBackend::kExpertMaskedLogit;
+            }
+        }
+        // Top-K must still find K real experts, or the router would pick masked
+        // ones (with ~0 weight) and the block would silently degrade.
+        if (kept < topK) {
+            throw std::runtime_error(where + " keeps " + std::to_string(kept) +
+                                     " experts, fewer than top-K " + std::to_string(topK));
+        }
+        _runeMaskDev.push_back(_ops->allocate(nExperts * sizeof(float)));
+        _ops->uploadHostBytes(_runeMaskDev.back().as<float>(), bias.data(),
+                              nExperts * sizeof(float));
+        masks.emplace_back(block, _runeMaskDev.back().as<float>());
+        MM_LOG_INFO("futhark", "model '{}': block {} router masks {} of {} experts",
+                    _modelIdHint, block, nExperts - kept, nExperts);
+    }
+    _backend->setExpertMasks(*_ops, nExperts, masks);
+    _runeMaskHost.clear();
+}
+
 void InferenceEngine::applyRunes() {
     if (_runePaths.empty()) {
         return;
@@ -768,10 +822,25 @@ void InferenceEngine::applyRunes() {
         throw std::runtime_error("Futhark: " + res.error());
     }
     _runeSteerHost.clear();
+    _runeMaskHost.clear();
     for (const auto& rep : res->reports) {
         MM_LOG_INFO("futhark", "model '{}': rune '{}' applied — {} op(s), {} tensor(s), "
-                    "{} steer overlay(s)", _modelIdHint, rep.runeName, rep.opsApplied,
-                    rep.touched.size(), rep.steers.size());
+                    "{} steer overlay(s), {} expert mask(s)", _modelIdHint, rep.runeName,
+                    rep.opsApplied, rep.touched.size(), rep.steers.size(),
+                    rep.expertMasks.size());
+        for (const auto& m : rep.expertMasks) {
+            auto& acc = _runeMaskHost[m.block];
+            if (acc.empty()) {
+                acc = m.keep;
+            } else if (acc.size() != m.keep.size()) {
+                throw std::runtime_error("Futhark: expert masks for block " +
+                                         std::to_string(m.block) + " differ in length");
+            } else {
+                for (std::size_t e = 0; e < acc.size(); ++e) {
+                    acc[e] = static_cast<std::uint8_t>(acc[e] & m.keep[e]);
+                }
+            }
+        }
         for (const auto& st : rep.steers) {
             auto& acc = _runeSteerHost[st.block];
             if (acc.empty()) {

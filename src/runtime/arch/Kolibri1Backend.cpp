@@ -327,6 +327,7 @@ void Kolibri1Backend::runKolibriMoe(std::size_t blockIdx, const float* din,
     if (useDeviceRouter) {
         _gmm.matmulAsync(routerW.type, routerW.usmPtr, nExperts, d_model, din, T,
                          logits, scratch);
+        (void)applyExpertMask(blockIdx, logits, T);   // 7.3 rune expert disable
         _ops.moeSigmoidTopKRouteBiasDeviceAsync(
             logits, bias,
             buffers.moePrefillExpIdx.as<std::int32_t>(),
@@ -335,6 +336,9 @@ void Kolibri1Backend::runKolibriMoe(std::size_t blockIdx, const float* din,
     } else {
         _gmm.matmul(routerW.type, routerW.usmPtr, nExperts, d_model, din, T,
                     logits, scratch);  // synchronous — host reads logits next
+        if (applyExpertMask(blockIdx, logits, T)) {   // 7.3 rune expert disable
+            _gmm.sync();
+        }
         _selIdx.assign(T * K, 0);
         _selW.assign(T * K, 0.0F);
         std::vector<char> chosen(nExperts);

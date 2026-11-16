@@ -37,6 +37,8 @@ enum class KvDtype : std::uint8_t;   // defined in runtime/KvCache.hpp
 
 namespace mimirmind::runtime::arch {
 
+class ArchBackend;
+
 /**
  * Shared behaviour for the Gemma family of transformer backends.
  *
@@ -63,6 +65,10 @@ public:
 
     GemmaBaseBackend(const GemmaBaseBackend&)            = delete;
     GemmaBaseBackend& operator=(const GemmaBaseBackend&) = delete;
+
+    /// The ArchBackend that owns this impl (Gemma4Backend). Its load-time
+    /// overlays (7.3 rune expert masks) are read through it.
+    void setOwner(const ArchBackend* owner) noexcept { _owner = owner; }
 
     /// Variant-specific block execution. Each derived class calls
     /// `runAttentionSection` for the shared prefix, then does its own
@@ -127,6 +133,11 @@ public:
     }
 
 protected:
+    /// 7.3 rune expert disable, forwarded to the owning ArchBackend; true when
+    /// a mask was enqueued on `logits` [rows, nExperts].
+    [[nodiscard]] bool applyExpertMask(std::size_t block, float* logits, std::size_t rows) const;
+
+    const ArchBackend* _owner{nullptr};
     GemmaBaseBackend(const model::LlmConfig&        config,
                      const core::gguf::WeightsMap&       weights,
                      const model::FusedQkvWeights*  fusedQkv,

@@ -270,6 +270,29 @@ public:
         }
     }
 
+    /// 7.3 Rune expert disable (Futhark Mask op on a router): a device bias
+    /// [nExperts] per MoE block, 0 for kept experts and kExpertMaskedLogit for
+    /// disabled ones, added to the router logits before any top-K (host or
+    /// device, single-session or batched). Set once at load, before any graph
+    /// capture; the caller owns the device memory. One mask per block (the
+    /// caller ANDs stacked masks).
+    static constexpr float kExpertMaskedLogit = -1.0e30F;
+    void setExpertMasks(compute::ComputeOps& ops, std::size_t nExperts,
+                        const std::vector<std::pair<std::size_t, const float*>>& masks);
+    [[nodiscard]] bool hasExpertMasks() const noexcept { return _maskOps != nullptr; }
+    /// Call right after the router matmul wrote `logits` [rows, nExperts].
+    /// Returns true when a mask was enqueued: a caller whose top-K reads the
+    /// logits on the host must then sync the stream first. No work (and no
+    /// device op) when `block` has no mask.
+    [[nodiscard]] bool applyExpertMask(std::size_t block, float* logits, std::size_t rows) const {
+        if (_maskOps != nullptr && block < _maskByBlock.size() &&
+            _maskByBlock[block] != nullptr) {
+            addExpertMask(_maskByBlock[block], logits, rows);
+            return true;
+        }
+        return false;
+    }
+
 protected:
     ArchBackend() = default;
 
@@ -308,10 +331,14 @@ protected:
 
 private:
     void addResidualSteer(const float* steer, float* x, std::size_t rows) const;
+    void addExpertMask(const float* bias, float* logits, std::size_t rows) const;
 
     compute::ComputeOps*     _steerOps{nullptr};
     std::size_t              _steerDModel{0};
     std::vector<const float*> _steerByBlock;
+    compute::ComputeOps*     _maskOps{nullptr};
+    std::size_t              _maskNExperts{0};
+    std::vector<const float*> _maskByBlock;
     StageTap                 _stageTap{};
     mutable ArchCapabilities _caps{};
     mutable std::once_flag   _capsOnce;

@@ -112,6 +112,35 @@ void ArchBackend::setResidualSteers(
     }
 }
 
+void ArchBackend::setExpertMasks(
+    compute::ComputeOps& ops, std::size_t nExperts,
+    const std::vector<std::pair<std::size_t, const float*>>& masks) {
+    _maskByBlock.clear();
+    _maskOps      = nullptr;
+    _maskNExperts = nExperts;
+    for (const auto& [block, bias] : masks) {
+        if (bias == nullptr) {
+            continue;
+        }
+        if (_maskByBlock.size() <= block) {
+            _maskByBlock.resize(block + 1, nullptr);
+        }
+        if (_maskByBlock[block] != nullptr) {
+            throw std::runtime_error("setExpertMasks: two expert masks for block " +
+                                     std::to_string(block) + " (combine them first)");
+        }
+        _maskByBlock[block] = bias;
+    }
+    if (!_maskByBlock.empty()) {
+        _maskOps = &ops;
+    }
+}
+
+void ArchBackend::addExpertMask(const float* bias, float* logits, std::size_t rows) const {
+    // logits[r, e] += bias[e]: 0 for kept experts, kExpertMaskedLogit for disabled.
+    _maskOps->addBiasAsync(logits, rows, _maskNExperts, bias);
+}
+
 void ArchBackend::addResidualSteer(const float* steer, float* x, std::size_t rows) const {
     // Broadcast row add on the device stream: x[r, :] += steer for every row.
     _steerOps->addBiasAsync(x, rows, _steerDModel, steer);

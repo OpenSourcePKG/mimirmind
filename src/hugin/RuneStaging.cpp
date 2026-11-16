@@ -331,6 +331,81 @@ void RuneStaging::registerOn(McpServer& server) {
         });
 
     server.addTool(
+        "rune_stage_experts",
+        "Write an expert disable as a staged Rune: a Mask op on blk.<block>.ffn_gate_inp.weight "
+        "(the MoE router). The engine pushes the disabled experts' router logits to -inf before "
+        "top-K on every path, so they are never routed to; no weight changes, works for any "
+        "weight format (GGUF and NVFP4). Use expert_usage first to see which experts fire, "
+        "rune_compare to preview. Guardrails: disabled / block experts <= 'max_expert_fraction' "
+        "(default 0.125, ceiling 0.25), and at least top-K experts stay enabled.",
+        schema({{"name", {{"type", "string"}}},
+                {"block", {{"type", "integer"}}},
+                {"experts", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
+                {"max_expert_fraction", {{"type", "number"}}},
+                {"note", {{"type", "string"}}}},
+               {"name", "block", "experts"}),
+        [this](const json& a) {
+            const std::string name = checkedName(a);
+            const std::string base = baseFingerprint();   // also: model loaded?
+            Engine& e = _forward.engine();
+            const std::size_t nExp = e.config().expertCount;
+            const std::size_t topK = e.config().expertUsedCount;
+            if (nExp == 0) {
+                throw std::runtime_error("the loaded model has no MoE experts");
+            }
+            const auto blk = blockList(e, json{{"blocks", json::array({a.at("block")})}}).front();
+            std::vector<std::size_t> experts;
+            for (const auto& x : a.at("experts")) {
+                const auto v = x.get<std::int64_t>();
+                if (v < 0 || v >= static_cast<std::int64_t>(nExp)) {
+                    throw std::runtime_error("expert " + std::to_string(v) + " out of range (0.." +
+                                             std::to_string(nExp - 1) + ")");
+                }
+                experts.push_back(static_cast<std::size_t>(v));
+            }
+            std::sort(experts.begin(), experts.end());
+            experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
+            if (experts.empty()) {
+                throw std::runtime_error("'experts' must not be empty");
+            }
+            const double maxFrac = budgetArg(a, "max_expert_fraction", 0.125, kMaxExpertFraction);
+            const double frac    = static_cast<double>(experts.size()) / static_cast<double>(nExp);
+            if (frac > maxFrac) {
+                throw std::runtime_error("edit budget exceeded: " + std::to_string(experts.size()) +
+                                         "/" + std::to_string(nExp) +
+                                         " experts > max_expert_fraction " + std::to_string(maxFrac));
+            }
+            if (nExp - experts.size() < topK) {
+                throw std::runtime_error("disabling " + std::to_string(experts.size()) +
+                                         " experts leaves fewer than top-K " + std::to_string(topK));
+            }
+            const std::string target = "blk." + std::to_string(blk) + ".ffn_gate_inp.weight";
+            std::vector<float> keep(nExp, 1.0F);
+            for (const auto x : experts) {
+                keep[x] = 0.0F;
+            }
+            json params{{"block", blk}, {"experts", experts}, {"block_experts", nExp},
+                        {"top_k", topK}, {"expert_fraction", frac}, {"target", target}};
+            rn::RuneManifest man;
+            man.name            = name;
+            man.baseFingerprint = base;
+            man.provenanceJson  = json{{"tool", "hugin"}, {"hugin_version", _version},
+                                       {"kind", "disable_experts"}, {"created_at", nowIso()},
+                                       {"note", a.value("note", std::string{})},
+                                       {"params", params},
+                                       {"budget", {{"max_expert_fraction", maxFrac}}}}.dump();
+            rn::RuneOp op;
+            op.kind    = rn::RuneOpKind::Mask;
+            op.target  = target;
+            op.payload = "experts." + target;
+            man.ops.push_back(op);
+            const rn::RuneFile rune{std::move(man), {{op.payload, std::move(keep)}}};
+            json out = stage(name, "disable_experts", rune.serialize(), params);
+            out["base_fingerprint"] = base;
+            return out;
+        });
+
+    server.addTool(
         "rune_gate",
         "Gate a staged Rune: forward-only goldset eval on the base model and on the model with "
         "the Rune applied by Futhark (the engine's own load path), on a 'target' set (what the "

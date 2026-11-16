@@ -149,6 +149,12 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
                 nExperts, d_model,
                 attnOutBuf, T,
                 upOutBuf, matmulScratch);
+    // 7.3 rune expert disable: masked logits before either top-K; the sync
+    // keeps the host top-K below reading the masked values (matmul() above
+    // already synced, so this adds no new sync point to the block).
+    if (applyExpertMask(blockIdx, upOutBuf, T)) {
+        _gmm.sync();
+    }
 
     // Reused scratch — resize() retains capacity, so no allocation in
     // steady state. moeTopKRoute writes all T*K entries, so the

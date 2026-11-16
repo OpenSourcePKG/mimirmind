@@ -46,7 +46,8 @@ inline constexpr std::uint32_t kRuneFormatVersion = 1;
 enum class RuneOpKind : std::uint8_t {
     WriteSlice,        ///< overwrite rows [rowBegin,rowEnd) with payload values
     Scale,             ///< multiply each row (or column) by a payload factor
-    Mask,              ///< load-time removal of experts/heads/layers (not yet applicable)
+    Mask,              ///< expert disable on a router (`blk.<i>.ffn_gate_inp.weight`): overlay,
+                       ///< payload [n_experts] of 0 (disabled) / 1 (kept); other targets refused
     LowRank,           ///< overlay y = Wx + s*B(Ax) (not yet applicable)
     Steer,             ///< residual-stream activation offset after one block (overlay, no weight change)
     WriteQuantBlocks,  ///< overwrite pre-quantised NVFP4 blocks (not yet applicable)
@@ -74,6 +75,14 @@ struct RuneOp {
 /// Returns the block index, or nullopt for any other spelling.
 [[nodiscard]] std::optional<std::uint32_t> steerBlockOf(std::string_view target) noexcept;
 
+/// Expert-mask target spelling: `blk.<i>.ffn_gate_inp.weight` = the MoE router
+/// of block i. Returns the block index, or nullopt for any other spelling.
+[[nodiscard]] std::optional<std::uint32_t> expertMaskBlockOf(std::string_view target) noexcept;
+
+/// True for op kinds that are engine overlays (no weight bytes change, the
+/// tensor_hash is optional and the base fingerprint binds the rune).
+[[nodiscard]] bool opKindIsOverlay(RuneOpKind k) noexcept;
+
 /// Parsed manifest.
 struct RuneManifest {
     std::uint32_t       version{kRuneFormatVersion};
@@ -90,7 +99,7 @@ struct RuneManifest {
 [[nodiscard]] std::optional<RuneOpKind> opKindFromName(std::string_view s) noexcept;
 
 /// True for op kinds this build can apply (weight ops on the host applier,
-/// Steer as an engine activation overlay).
+/// Steer / expert Mask as engine overlays).
 [[nodiscard]] bool opKindApplicable(RuneOpKind k) noexcept;
 
 /// FNV-1a 64 over `bytes`, formatted as `fnv1a64:<16 lowercase hex>`. Identity

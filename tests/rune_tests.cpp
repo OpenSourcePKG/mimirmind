@@ -757,6 +757,69 @@ TEST(apply_steer_touchesNoWeight_reportsScaledVector) {
     EXPECT_TRUE(!applier.apply(bad, kBase, model.resolver()).has_value());
 }
 
+namespace {
+
+rn::RuneOp maskOp(const std::string& target, const std::string& payload) {
+    rn::RuneOp op;
+    op.kind    = rn::RuneOpKind::Mask;
+    op.target  = target;
+    op.payload = payload;
+    return op;
+}
+
+} // namespace
+
+TEST(expertMask_serializeParse_roundTrip_andTargetSpelling) {
+    EXPECT_TRUE(rn::opKindApplicable(rn::RuneOpKind::Mask));
+    EXPECT_TRUE(rn::opKindIsOverlay(rn::RuneOpKind::Mask));
+    EXPECT_TRUE(!rn::opKindIsOverlay(rn::RuneOpKind::Scale));
+    EXPECT_TRUE(*rn::expertMaskBlockOf("blk.7.ffn_gate_inp.weight") == 7U);
+    EXPECT_TRUE(!rn::expertMaskBlockOf("blk.7.ffn_gate_inp_shexp.weight"));
+    EXPECT_TRUE(!rn::expertMaskBlockOf("blk.7"));
+    EXPECT_TRUE(!rn::expertMaskBlockOf("x.ffn_gate_inp.weight"));
+    const auto rune  = makeRune({maskOp("blk.2.ffn_gate_inp.weight", "m")}, {{"m", {1, 0, 1, 1}}});
+    const auto back  = rn::RuneFile::parse(rune.serialize());
+    const auto& op   = back.manifest().ops.at(0);
+    EXPECT_TRUE(op.kind == rn::RuneOpKind::Mask);
+    EXPECT_EQ(op.target, std::string{"blk.2.ffn_gate_inp.weight"});
+    EXPECT_TRUE(op.tensorHash.empty());
+    // Only router targets; a payload is required.
+    EXPECT_TRUE(threw([] { (void)makeRune({maskOp("blk.2.attn_output.weight", "m")}, {{"m", {1, 0}}}); }));
+    EXPECT_TRUE(threw([] { (void)makeRune({maskOp("blk.2.ffn_gate_inp.weight", "nope")}, {{"m", {1, 0}}}); }));
+}
+
+TEST(apply_expertMask_touchesNoWeight_reportsKeepMask) {
+    FakeModel model;
+    model.addF32("blk.2.ffn_gate_inp.weight", 2, 4, {1, 2, 3, 4, 5, 6, 7, 8});   // 4 experts
+    const std::string h = model.hash("blk.2.ffn_gate_inp.weight");
+    const auto rune = makeRune({maskOp("blk.2.ffn_gate_inp.weight", "m")}, {{"m", {1, 0, 1, 0}}});
+    rn::RuneApplier applier;
+    const auto r = applier.apply(rune, kBase, model.resolver());
+    EXPECT_TRUE(r.has_value());
+    EXPECT_EQ(r->opsApplied, std::size_t{1});
+    EXPECT_TRUE(r->touched.empty());
+    EXPECT_EQ(r->expertMasks.size(), std::size_t{1});
+    EXPECT_EQ(r->expertMasks[0].block, 2U);
+    EXPECT_TRUE(r->expertMasks[0].keep == (std::vector<std::uint8_t>{1, 0, 1, 0}));
+    EXPECT_EQ(model.hash("blk.2.ffn_gate_inp.weight"), h);
+}
+
+TEST(apply_expertMask_refusals) {
+    FakeModel model;
+    model.addF32("blk.2.ffn_gate_inp.weight", 2, 4, {1, 2, 3, 4, 5, 6, 7, 8});
+    const auto refused = [&](const char* target, std::vector<float> m, const char* needle) {
+        const auto rune = makeRune({maskOp(target, "m")}, {{"m", std::move(m)}});
+        rn::RuneApplier applier;
+        const auto r = applier.apply(rune, kBase, model.resolver());
+        return !r.has_value() && r.error().find(needle) != std::string::npos;
+    };
+    EXPECT_TRUE(refused("blk.2.ffn_gate_inp.weight", {1, 0.5f, 1, 1}, "0 (disabled) or 1"));
+    EXPECT_TRUE(refused("blk.2.ffn_gate_inp.weight", {1, 1, 1, 1}, "disables no expert"));
+    EXPECT_TRUE(refused("blk.2.ffn_gate_inp.weight", {0, 0, 0, 0}, "every expert"));
+    EXPECT_TRUE(refused("blk.2.ffn_gate_inp.weight", {1, 0, 1}, "router has 4 experts"));
+    EXPECT_TRUE(refused("blk.3.ffn_gate_inp.weight", {1, 0, 1, 1}, "not a MoE block"));
+}
+
 TEST(apply_q8_0_columnMask_zeroesExactBlocksOnly) {
     FakeModel model;
     model.tensors["o"] = q8Tensor(128, 3);   // 4 blocks per row

@@ -12,6 +12,7 @@
 #include "model/LlmConfig.hpp"
 #include "core/gguf/WeightsMap.hpp"
 #include "runtime/BlockBuffers.hpp"
+#include "runtime/arch/ArchBackend.hpp"
 #include "runtime/KvCache.hpp"
 #include "core/log/Log.hpp"
 #include "runtime/perf/OpProfiler.hpp"
@@ -888,6 +889,11 @@ void GemmaBaseBackend::runAttentionSectionBatched(
     _ops.rmsNormAsync(projOutBuf, nSeq, d_model,
                       static_cast<const float*>(attnPost->usmPtr),
                       _config.rmsNormEps, projOutBuf);
+}
+
+bool GemmaBaseBackend::applyExpertMask(std::size_t block, float* logits,
+                                       std::size_t rows) const {
+    return _owner != nullptr && _owner->applyExpertMask(block, logits, rows);
 }
 
 } // namespace mimirmind::runtime::arch

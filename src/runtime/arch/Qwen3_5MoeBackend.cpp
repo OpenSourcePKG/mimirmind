@@ -496,9 +496,13 @@ void Qwen3_5MoeBackend::runMoeFfn(std::size_t   blockIdx,
     if (deviceTopK) {
         _gmm.matmulAsync(routerW.type, routerW.usmPtr, nExperts, d_model,
                          moeInput, T, upOutBuf, matmulScratch);
+        (void)applyExpertMask(blockIdx, upOutBuf, T);   // 7.3 rune expert disable
     } else {
         _gmm.matmul(routerW.type, routerW.usmPtr, nExperts, d_model,
                     moeInput, T, upOutBuf, matmulScratch);  // upOutBuf [T, nExperts]
+        if (applyExpertMask(blockIdx, upOutBuf, T)) {   // 7.3 rune expert disable
+            _gmm.sync();
+        }
     }
 
     _topKIdx.resize(T * K);
@@ -891,6 +895,7 @@ void Qwen3_5MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
                              ? _config.expertWeightsScale : 1.0F;
     _gmm.matmulAsync(routerW.type, routerW.usmPtr, nExperts, d_model,
                      moeInput, nSeq, upOutBuf, matmulScratch);
+    (void)applyExpertMask(blockIdx, upOutBuf, nSeq);   // 7.3 rune expert disable
     _ops.moeTopKRouteDeviceAsync(upOutBuf, expIdxSlot, kwSlot,
                                  nSeq, nExperts, K, wScale);
 
@@ -1461,6 +1466,7 @@ void Qwen3_5MoeBackend::runMoeFfnGrouped(std::size_t    blockIdx,
     _ops.profileSection("rt.gemm");   // route sub-breakdown (DECODE_PROFILE only)
     _gmm.matmulAsync(routerW.type, routerW.usmPtr, nExperts, d_model,
                      moeInput, nSeq, upOutBuf, matmulScratch);
+    (void)applyExpertMask(blockIdx, upOutBuf, nSeq);   // 7.3 rune expert disable
     _ops.profileSection("rt.topk");
     _ops.moeTopKRouteDeviceAsync(upOutBuf, expIdxSlot, kwSlot,
                                  nSeq, nExperts, K, wScale);

@@ -243,8 +243,22 @@ void InspectTools::registerOn(McpServer& server) {
                     touched.push_back({{"tensor", t.name}, {"hash_before", t.hashBefore},
                                        {"hash_after", t.hashAfter}});
                 }
+                json overlays = json::array();
+                for (const auto& st : rep.steers) {
+                    overlays.push_back({{"kind", "steer"}, {"block", st.block}});
+                }
+                for (const auto& em : rep.expertMasks) {
+                    std::vector<std::size_t> off;
+                    for (std::size_t e = 0; e < em.keep.size(); ++e) {
+                        if (em.keep[e] == 0) {
+                            off.push_back(e);
+                        }
+                    }
+                    overlays.push_back({{"kind", "disable_experts"}, {"block", em.block},
+                                        {"experts", off}});
+                }
                 runes.push_back({{"name", rep.runeName}, {"ops", rep.opsApplied},
-                                 {"touched", touched}});
+                                 {"touched", touched}, {"overlays", overlays}});
             }
             return json{{"ok", true}, {"base_fingerprint", m.fingerprint()}, {"runes", runes}};
         });

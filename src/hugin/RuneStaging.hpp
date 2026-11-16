@@ -36,6 +36,9 @@ class SurgeryTools;
  *  - rune_stage_ablate  zero attention heads via a 0/1 column Scale on
  *                       blk.N.attn_output.weight (F32/F16/BF16, exact Q8_0
  *                       masking); budget: fraction of the block's heads
+ *  - rune_stage_experts disable MoE experts of one block via a router Mask op
+ *                       (engine overlay: logit -> -inf before top-K, any
+ *                       weight format); budget: fraction of the block's experts
  *  - rune_gate          goldset eval base vs rune on a target set and an
  *                       optional control set; green/red by thresholds; red
  *                       moves the rune to rejected/ (auto-rollback)
@@ -53,6 +56,7 @@ public:
     /// Hard ceilings the per-call budget arguments can never exceed.
     static constexpr double kMaxSteerRelativeNorm = 2.0;
     static constexpr double kMaxHeadFraction      = 0.5;
+    static constexpr double kMaxExpertFraction    = 0.25;
 
 private:
     enum class State { Staged, Committed, Rejected };

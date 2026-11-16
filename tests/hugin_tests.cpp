@@ -128,7 +128,7 @@ TEST(mcp_initialize_and_toolsList) {
                                                    "eval", "expert_usage", "generate", "list_tensors", "logit_lens",
                                                    "model_info", "next_token", "open_model", "perplexity", "rune_check",
                                                    "rune_commit", "rune_compare", "rune_gate", "rune_inspect", "rune_list",
-                                                   "rune_rollback", "rune_stage_ablate", "rune_stage_steer",
+                                                   "rune_rollback", "rune_stage_ablate", "rune_stage_experts", "rune_stage_steer",
                                                    "steer_list", "steer_preview", "steer_vector", "tensor_hash",
                                                    "tensor_stats", "tokenize"}));
 }
@@ -300,6 +300,8 @@ TEST(runeStaging_guards_withoutModel_andUnknownNames) {
     EXPECT_TRUE(errText(call("rune_stage_steer", {{"name", "s"}, {"vector", "v"}, {"alpha", 1.0}}))
                     .find("open_model") != std::string::npos);
     EXPECT_TRUE(errText(call("rune_stage_ablate", {{"name", "a"}, {"block", 0}, {"heads", {0}}}))
+                    .find("open_model") != std::string::npos);
+    EXPECT_TRUE(errText(call("rune_stage_experts", {{"name", "e"}, {"block", 0}, {"experts", {0}}}))
                     .find("open_model") != std::string::npos);
     EXPECT_TRUE(errText(call("rune_stage_steer", {{"name", "../x"}, {"vector", "v"}, {"alpha", 1.0}}))
                     .find("rune name") != std::string::npos);

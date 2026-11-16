@@ -112,6 +112,40 @@ std::string checkQ8Mask(std::span<const float> p, RuneScaleAxis axis) {
     return {};
 }
 
+/// Expert mask (Mask op on a router): every factor 0 or 1, at least one expert
+/// disabled and one kept, one factor per expert = per router row. The router
+/// must exist in the loaded model (that also proves the block is MoE); its
+/// encoding does not matter since no byte of it changes.
+std::string checkExpertMask(const RuneOp& op, std::span<const float> p,
+                            const RuneTensorResolver& resolve) {
+    std::size_t kept = 0;
+    for (const float f : p) {
+        if (f != 0.0F && f != 1.0F) {
+            return "expert mask factors must be 0 (disabled) or 1 (kept)";
+        }
+        kept += f != 0.0F ? 1 : 0;
+    }
+    if (kept == p.size()) {
+        return "expert mask disables no expert";
+    }
+    if (kept == 0) {
+        return "expert mask disables every expert";
+    }
+    const std::optional<RuneTensorView> v = resolve(op.target);
+    if (!v) {
+        return "router tensor not found in the loaded model (not a MoE block?)";
+    }
+    std::uint64_t rows = 1;
+    for (std::size_t i = 1; i < v->dims.size(); ++i) {
+        rows *= v->dims[i];
+    }
+    if (v->dims.empty() || rows != p.size()) {
+        return "expert mask has " + std::to_string(p.size()) + " factors, router has " +
+               std::to_string(rows) + " experts";
+    }
+    return {};
+}
+
 float readElem(const std::byte* base, RuneElemType t, std::size_t i) noexcept {
     if (t == RuneElemType::F32) {
         float v = 0.0f;
@@ -220,6 +254,13 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
             }
             continue;   // activation overlay — no target tensor
         }
+        if (op.kind == RuneOpKind::Mask) {
+            if (std::string err = checkExpertMask(op, rune.payload(op.payload), resolve);
+                !err.empty()) {
+                return std::unexpected(ctx + ": " + err);
+            }
+            continue;   // router overlay — no weight changes
+        }
         if (views.find(op.target) == views.end()) {
             std::optional<RuneTensorView> v = resolve(op.target);
             if (!v) {
@@ -271,6 +312,18 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
 
     for (std::size_t i = 0; i < man.ops.size(); ++i) {
         const RuneOp& op = man.ops[i];
+        if (op.kind == RuneOpKind::Mask) {
+            const std::span<const float> p = rune.payload(op.payload);
+            RuneExpertMask m;
+            m.block = *expertMaskBlockOf(op.target);
+            m.keep.resize(p.size());
+            for (std::size_t e = 0; e < p.size(); ++e) {
+                m.keep[e] = p[e] != 0.0F ? 1 : 0;
+            }
+            report.expertMasks.push_back(std::move(m));
+            ++report.opsApplied;
+            continue;
+        }
         if (op.kind == RuneOpKind::Steer) {
             const std::span<const float> p = rune.payload(op.payload);
             RuneSteer st;

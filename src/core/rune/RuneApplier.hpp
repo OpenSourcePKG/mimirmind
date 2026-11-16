@@ -63,12 +63,20 @@ struct RuneSteer {
     std::vector<float>  values;
 };
 
+/// A Mask op resolved for the engine: experts with keep[e] == 0 are never
+/// routed to in `block` (router logit pushed to -inf before top-K).
+struct RuneExpertMask {
+    std::uint32_t              block{0};
+    std::vector<std::uint8_t>  keep;   ///< [n_experts], 1 = kept, 0 = disabled
+};
+
 /// Result of a successful apply.
 struct RuneApplyReport {
     std::string                     runeName;
     std::size_t                     opsApplied{0};
     std::vector<RuneTouchedTensor>  touched;
     std::vector<RuneSteer>          steers;   ///< activation overlays; no weight touched
+    std::vector<RuneExpertMask>     expertMasks;   ///< router overlays; no weight touched
 };
 
 /**
@@ -94,6 +102,9 @@ struct RuneApplyReport {
  *
  * Steer ops touch no weight: they are validated (finite payload) and handed
  * back in `RuneApplyReport::steers` for the engine's residual overlay.
+ * Mask ops (expert disable) touch no weight either: target = a block's router,
+ * payload = one 0/1 factor per expert (= router rows), at least one expert
+ * disabled and one kept; handed back in `RuneApplyReport::expertMasks`.
  */
 class RuneApplier {
 public:

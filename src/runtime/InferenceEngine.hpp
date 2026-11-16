@@ -1144,7 +1144,8 @@ private:
     /// run before any derived weight copy is built. Throws on any rune error;
     /// the device weights are then left unmodified.
     void applyRunes();
-    void installRuneSteers();   // after the arch backend exists
+    void installRuneSteers();        // after the arch backend exists
+    void installRuneExpertMasks();   // after the arch backend exists
     /// Throws when runes are configured for a Munin-attached (shared) load.
     void refuseRunesOnSharedWeights() const;
     /// FusedQkvWeights + GPU-op self-test + matmul autotune (L0-only paths).
@@ -1331,6 +1332,10 @@ private:
     /// then device copies owned here for the backend's lifetime.
     std::map<std::uint32_t, std::vector<float>> _runeSteerHost;
     std::vector<compute::ComputeBuffer>         _runeSteerDev;
+    /// 7.3 Rune expert disable: keep masks from Futhark (ANDed per block),
+    /// then device router biases owned here for the backend's lifetime.
+    std::map<std::uint32_t, std::vector<std::uint8_t>> _runeMaskHost;
+    std::vector<compute::ComputeBuffer>                 _runeMaskDev;
     compute::ComputeBuffer             _normFinalH;
     compute::ComputeBuffer             _logitsH;
     compute::ComputeBuffer             _logitsScH;

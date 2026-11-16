@@ -66,12 +66,12 @@ RuneOp parseOp(const json& j, std::size_t idx) {
     }
     op.kind       = *k;
     op.target = requireString(j, "target", ctx);
-    if (op.kind == RuneOpKind::Steer) {
-        // Activation overlay: no weight is bound, the base fingerprint is.
+    if (opKindIsOverlay(op.kind)) {
+        // Engine overlay: no weight is bound, the base fingerprint is.
         if (j.contains("tensor_hash")) {
             op.tensorHash = requireString(j, "tensor_hash", ctx);
         }
-        if (j.contains("alpha")) {
+        if (op.kind == RuneOpKind::Steer && j.contains("alpha")) {
             if (!j["alpha"].is_number()) {
                 fail(ctx + ": field 'alpha' is not a number");
             }
@@ -103,7 +103,7 @@ json opToJson(const RuneOp& op) {
     json j;
     j["op"]          = std::string{opKindName(op.kind)};
     j["target"]      = op.target;
-    if (op.kind != RuneOpKind::Steer || !op.tensorHash.empty()) {
+    if (!opKindIsOverlay(op.kind) || !op.tensorHash.empty()) {
         j["tensor_hash"] = op.tensorHash;
     }
     if (op.kind == RuneOpKind::Steer) {
@@ -160,7 +160,7 @@ void RuneFile::validate() const {
         if (op.target.empty()) {
             fail(ctx + ": empty target");
         }
-        const bool hashOptional = op.kind == RuneOpKind::Steer && op.tensorHash.empty();
+        const bool hashOptional = opKindIsOverlay(op.kind) && op.tensorHash.empty();
         if (!hashOptional && !wellFormedHash(op.tensorHash)) {
             fail(ctx + ": tensor_hash '" + op.tensorHash +
                  "' is not of the form fnv1a64:<16 hex>");
@@ -173,8 +173,12 @@ void RuneFile::validate() const {
                 fail(ctx + ": alpha is not finite");
             }
         }
-        const bool needsPayload = op.kind == RuneOpKind::WriteSlice ||
-                                  op.kind == RuneOpKind::Scale || op.kind == RuneOpKind::Steer;
+        if (op.kind == RuneOpKind::Mask && !expertMaskBlockOf(op.target)) {
+            fail(ctx + ": mask target must be a router 'blk.<i>.ffn_gate_inp.weight', got '" +
+                 op.target + "'");
+        }
+        const bool needsPayload = op.kind != RuneOpKind::LowRank &&
+                                  op.kind != RuneOpKind::WriteQuantBlocks;
         if (!needsPayload) {
             continue;
         }

@@ -45,7 +45,21 @@ std::optional<RuneOpKind> opKindFromName(std::string_view s) noexcept {
 }
 
 bool opKindApplicable(RuneOpKind k) noexcept {
-    return k == RuneOpKind::WriteSlice || k == RuneOpKind::Scale || k == RuneOpKind::Steer;
+    return k == RuneOpKind::WriteSlice || k == RuneOpKind::Scale || k == RuneOpKind::Steer ||
+           k == RuneOpKind::Mask;
+}
+
+bool opKindIsOverlay(RuneOpKind k) noexcept {
+    return k == RuneOpKind::Steer || k == RuneOpKind::Mask;
+}
+
+std::optional<std::uint32_t> expertMaskBlockOf(std::string_view target) noexcept {
+    constexpr std::string_view kSuffix = ".ffn_gate_inp.weight";
+    if (target.size() <= kSuffix.size() ||
+        target.substr(target.size() - kSuffix.size()) != kSuffix) {
+        return std::nullopt;
+    }
+    return steerBlockOf(target.substr(0, target.size() - kSuffix.size()));
 }
 
 std::optional<std::uint32_t> steerBlockOf(std::string_view target) noexcept {

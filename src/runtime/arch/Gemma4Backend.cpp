@@ -35,6 +35,7 @@ Gemma4Backend::Gemma4Backend(const model::LlmConfig&        config,
         _impl = std::make_unique<Gemma4DenseBackend>(
             config, weights, fusedQkv, ops, gmm, opProfiler);
     }
+    _impl->setOwner(this);
 }
 
 // Out-of-line so `GemmaBaseBackend` needs only a forward-decl in the .hpp.
