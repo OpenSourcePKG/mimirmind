@@ -65,7 +65,7 @@ struct Fixture {
     std::string     path = writeTestGguf();
     hg::McpServer   server{"hugin", "test"};
     hg::InspectTools tools{path};
-    hg::ForwardTools forwardTools{[this] { return tools.modelPath(); }};
+    hg::ForwardTools forwardTools{[this] { return hg::ForwardTools::Target{tools.modelPath(), {}}; }};
     int             nextId{1};
 
     Fixture() {
@@ -117,7 +117,7 @@ TEST(mcp_initialize_and_toolsList) {
         EXPECT_TRUE(t.contains("inputSchema"));
     }
     std::sort(names.begin(), names.end());
-    EXPECT_TRUE(names == (std::vector<std::string>{"activations", "list_tensors", "logit_lens", "model_info",
+    EXPECT_TRUE(names == (std::vector<std::string>{"activations", "attention_pattern", "eval", "expert_usage", "list_tensors", "logit_lens", "model_info",
                                                    "next_token", "open_model", "perplexity", "rune_check",
                                                    "rune_compare", "rune_inspect", "tensor_hash", "tensor_stats",
                                                    "tokenize"}));
@@ -230,9 +230,10 @@ TEST(tools_withoutModel_reportToolError) {
 
 TEST(forwardTools_withoutModel_reportToolError_noEngineBuilt) {
     hg::McpServer    server{"hugin", "test"};
-    hg::ForwardTools fwd{[] { return std::string{}; }};
+    hg::ForwardTools fwd{[] { return hg::ForwardTools::Target{}; }};
     fwd.registerOn(server);
-    for (const char* tool : {"next_token", "perplexity", "logit_lens", "activations", "tokenize"}) {
+    for (const char* tool : {"next_token", "perplexity", "logit_lens", "activations", "tokenize",
+                             "attention_pattern", "expert_usage"}) {
         const json r = (*server.handle({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
                                         {"params", {{"name", tool}, {"arguments", {{"text", "hi"}}}}}}))["result"];
         EXPECT_TRUE(r["isError"].get<bool>());
@@ -259,6 +260,45 @@ TEST(logitMath_logSoftmax_topK_rank_entropy_kl) {
     std::vector<float> capped{100.0f, -100.0f, 0.0f};
     hg::LogitMath::softcap(capped, 30.0f);
     EXPECT_TRUE(capped[0] < 30.0f && capped[0] > 29.0f && capped[1] > -30.0f && capped[2] == 0.0f);
+}
+
+TEST(eval_withoutModel_andBadGoldset_reportToolError) {
+    hg::McpServer    server{"hugin", "test"};
+    hg::ForwardTools fwd{[] { return hg::ForwardTools::Target{}; }};
+    fwd.registerOn(server);
+    const auto call = [&](json args) {
+        return (*server.handle({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                {"params", {{"name", "eval"}, {"arguments", std::move(args)}}}}))["result"];
+    };
+    // Goldset problems are reported before any engine is needed.
+    const json noSet = call(json::object());
+    EXPECT_TRUE(noSet["isError"].get<bool>());
+    EXPECT_TRUE(noSet["content"][0]["text"].get<std::string>().find("items") != std::string::npos);
+    const json missing = call({{"path", "/nonexistent/goldset.jsonl"}});
+    EXPECT_TRUE(missing["content"][0]["text"].get<std::string>().find("cannot open") != std::string::npos);
+    const json noModel = call({{"items", {{{"prompt", "a"}, {"expect", " b"}}}}});
+    EXPECT_TRUE(noModel["content"][0]["text"].get<std::string>().find("open_model") != std::string::npos);
+}
+
+TEST(openModel_checkpointDir_forwardOnly) {
+    Fixture f;
+    const std::string dir = (std::filesystem::temp_directory_path() /
+                             ("hugin_ckpt_" + std::to_string(::getpid()))).string();
+    std::filesystem::create_directories(dir);
+    const auto [e1, r] = f.call("open_model", {{"path", dir}, {"tokenizer_gguf", "/x/tok.gguf"}});
+    EXPECT_TRUE(!e1);
+    EXPECT_EQ(r["format"].get<std::string>(), std::string{"nvfp4"});
+    EXPECT_EQ(f.tools.modelPath(), dir);
+    EXPECT_EQ(f.tools.tokenizerGguf(), std::string{"/x/tok.gguf"});
+    const auto [e2, msg] = f.call("model_info");
+    EXPECT_TRUE(e2);
+    EXPECT_TRUE(msg.get<std::string>().find("GGUF-only") != std::string::npos);
+    // Back to a GGUF: inspection works again and the tokenizer override is cleared.
+    const auto [e3, back] = f.call("open_model", {{"path", f.path}});
+    EXPECT_TRUE(!e3);
+    EXPECT_EQ(back["format"].get<std::string>(), std::string{"gguf"});
+    EXPECT_TRUE(f.tools.tokenizerGguf().empty());
+    std::filesystem::remove_all(dir);
 }
 
 int main() {

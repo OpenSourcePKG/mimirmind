@@ -27,18 +27,28 @@ namespace mimirmind::hugin {
 class InspectTools {
 public:
     /// `initialModel` may be empty (then open_model must be called first).
-    explicit InspectTools(const std::string& initialModel);
+    /// `initialModel` may be a GGUF file or an NVFP4 checkpoint directory.
+    explicit InspectTools(const std::string& initialModel, std::string tokenizerGguf = {});
 
     void registerOn(McpServer& server);
 
-    /// Path of the currently opened model ("" = none). The forward tools
-    /// follow it, so open_model retargets them too.
-    [[nodiscard]] std::string modelPath() const { return _model ? _model->path() : std::string{}; }
+    /// Path of the currently opened model ("" = none): a GGUF file or an
+    /// NVFP4 checkpoint directory. The forward tools follow it, so open_model
+    /// retargets them too.
+    [[nodiscard]] std::string modelPath() const {
+        return _model ? _model->path() : _checkpointDir;
+    }
+    /// Tokenizer GGUF for an NVFP4 checkpoint ("" = the checkpoint's own).
+    [[nodiscard]] const std::string& tokenizerGguf() const noexcept { return _tokenizerGguf; }
 
 private:
     [[nodiscard]] const ModelView& model() const;
 
+    void open(const std::string& path, std::string tokenizerGguf);
+
     std::unique_ptr<ModelView> _model;
+    std::string                _checkpointDir;   // NVFP4: forward tools only
+    std::string                _tokenizerGguf;
 };
 
 } // namespace mimirmind::hugin

@@ -143,6 +143,7 @@ void Qwen2Backend::dumpStage(const char*  stage,
                              const float* p,
                              std::size_t  Trow,
                              std::size_t  dim) const {
+    tapStage(_gmm, _ops, stage, blockIdx, p, Trow, dim);   // 7.2 Hugin (no-op unless asked)
     if (_parityDumpPrefix.empty()) {
         return;
     }
@@ -417,7 +418,10 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     // tensor-parity workflow (empty cache, curLen==0, F32 or Q8_0 KV) sets a
     // prefix, so cache base == current-token slot and the fp32 view is exact.
     // Names/order match parity-diff.py (Qcur_pos, Kcur_pos, Vcur_normed).
-    if (!_parityDumpPrefix.empty()) {
+    // Also feeds the 7.2 Hugin stage tap (same empty-cache precondition: the
+    // hugin forward always starts from curLen==0).
+    if (!_parityDumpPrefix.empty() || stageTapWants("Qcur", blockIdx) ||
+        stageTapWants("Kcur", blockIdx) || stageTapWants("Vcur", blockIdx)) {
         const float* kDump = q8Path ? kFp32Scratch
                                     : static_cast<const float*>(kBase);
         const float* vDump = q8Path ? vFp32Scratch
@@ -460,6 +464,12 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                         attnOutBuf,
                         /*slidingWindow=*/0,
                         kvDtype);
+
+    // 7.2 Hugin: per-head attention context (pre O-projection) + the exact
+    // score scale, so attention patterns rebuilt from Qcur/Kcur can be
+    // checked against what the kernel actually produced.
+    tapStage(_gmm, _ops, "attn_ctx", blockIdx, attnOutBuf, T, q_dim);
+    tapStageHost("attn_scale", blockIdx, &attnScale, 1, 1);
 
     trace("O projection (matmulAsync — in-stream ordered, no sync needed)");
     _gmm.matmulAsync(oW->type, oW->usmPtr, d_model, q_dim,

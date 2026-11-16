@@ -34,15 +34,30 @@ namespace mimirmind::hugin {
  *                    vs the previous block, strongest dimensions
  *  - rune_compare    base vs the same model with runes applied by Futhark at
  *                    load: per-position KL, top-1 agreement, perplexity delta
+ *  - attention_pattern  per-head attention weights of one block, rebuilt from
+ *                    the backend's post-RoPE Q/K stage tap, self-checked
+ *                    against the kernel's own attention output
+ *  - eval            forward-only goldset eval (exact continuation or
+ *                    multiple choice), optionally base vs rune with flips
+ *  - expert_usage    MoE routing actually taken per block (stage tap of the
+ *                    selected expert ids/weights): usage histogram, load
+ *                    entropy, per-token picks
  *
  * Every forward starts from an empty KV cache (resetCache) — tools are
  * stateless with respect to each other.
  */
 class ForwardTools {
 public:
-    /// `modelPath` is asked on each call so open_model (InspectTools) also
-    /// retargets the forward tools; a changed path reloads the engine.
-    explicit ForwardTools(std::function<std::string()> modelPath);
+    /// What the forward tools run on: a GGUF file or an NVFP4 checkpoint
+    /// directory (+ optional tokenizer GGUF).
+    struct Target {
+        std::string path;
+        std::string tokenizerGguf;
+    };
+
+    /// `target` is asked on each call so open_model (InspectTools) also
+    /// retargets the forward tools; a changed target reloads the engine.
+    explicit ForwardTools(std::function<Target()> target);
     ~ForwardTools();
 
     ForwardTools(const ForwardTools&)            = delete;
@@ -55,9 +70,9 @@ private:
 
     runtime::InferenceEngine& base();
     runtime::InferenceEngine& withRunes(const std::vector<std::string>& runes);
-    std::unique_ptr<Loaded>   load(const std::string& path, const std::vector<std::string>& runes) const;
+    std::unique_ptr<Loaded>   load(const Target& t, const std::vector<std::string>& runes) const;
 
-    std::function<std::string()> _modelPath;
+    std::function<Target()>      _target;
     std::unique_ptr<Loaded>      _base;
     std::unique_ptr<Loaded>      _variant;
 };

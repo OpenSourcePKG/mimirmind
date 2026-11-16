@@ -2770,9 +2770,35 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens,
         return std::find(v.begin(), v.end(), b) != v.end();
     };
     std::size_t lensPos = N - 1;
+    // Stage tap (7.2 Hugin): installed for this forward only, removed on every
+    // exit path so a throwing block never leaves a tap on the backend.
+    struct TapGuard {
+        arch::ArchBackend* b{nullptr};
+        ~TapGuard() { if (b != nullptr) b->clearStageTap(); }
+    } tapGuard;
     if (probe != nullptr) {
         probe->hidden.clear();
         probe->lens.clear();
+        probe->stageData.clear();
+        if (!probe->stages.empty()) {
+            arch::ArchBackend::StageTap tap;
+            tap.wants = [probe](std::string_view stage, std::size_t block) {
+                const bool nameOk = std::find(probe->stages.begin(), probe->stages.end(),
+                                              stage) != probe->stages.end();
+                const bool blockOk = probe->stageBlocks.empty() ||
+                    std::find(probe->stageBlocks.begin(), probe->stageBlocks.end(),
+                              static_cast<std::uint32_t>(block)) != probe->stageBlocks.end();
+                return nameOk && blockOk;
+            };
+            tap.onStage = [probe](std::string_view stage, std::size_t block,
+                                  std::vector<float>&& data, std::size_t rows,
+                                  std::size_t cols) {
+                probe->stageData[{std::string{stage}, static_cast<std::uint32_t>(block)}] =
+                    ForwardProbe::Stage{rows, cols, std::move(data)};
+            };
+            _backend->setStageTap(std::move(tap));
+            tapGuard.b = _backend.get();
+        }
         if (probe->lensPosition != static_cast<std::size_t>(-1)) {
             if (probe->lensPosition >= N) {
                 throw std::runtime_error("forwardVerify: probe lensPosition out of range");

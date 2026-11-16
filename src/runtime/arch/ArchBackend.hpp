@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -225,8 +226,45 @@ public:
                                     std::span<const std::int32_t> /*tokens*/,
                                     bool                          /*seqStart*/) {}
 
+    /**
+     * 7.2 Hugin: observe named intermediate stages of the forward (e.g.
+     * post-RoPE "Qcur"/"Kcur", "Vcur", the pre-O-projection attention context
+     * "attn_ctx"). `wants(stage, block)` gates the readback, so an installed
+     * tap costs nothing for stages nobody asked for; `onStage` receives a
+     * host copy [rows x cols] f32. Which stages exist is per backend; an
+     * empty tap (the default) disables everything. Diagnostic path only —
+     * the tap syncs the queue before each readback.
+     */
+    struct StageTap {
+        std::function<bool(std::string_view stage, std::size_t block)> wants;
+        std::function<void(std::string_view stage, std::size_t block,
+                           std::vector<float>&& data, std::size_t rows,
+                           std::size_t cols)>                           onStage;
+    };
+    void setStageTap(StageTap tap) { _stageTap = std::move(tap); }
+    void clearStageTap() noexcept { _stageTap = StageTap{}; }
+
 protected:
     ArchBackend() = default;
+
+    /// True iff a tap is installed and wants (stage, block).
+    [[nodiscard]] bool stageTapWants(std::string_view stage, std::size_t block) const {
+        return _stageTap.wants && _stageTap.onStage && _stageTap.wants(stage, block);
+    }
+    /// Device buffer -> host copy -> tap (no-op unless stageTapWants).
+    void tapStage(compute::ComputeMatmul& gmm, compute::ComputeOps& ops,
+                  std::string_view stage, std::size_t block,
+                  const float* device, std::size_t rows, std::size_t cols) const;
+    /// Host values -> tap (no-op unless stageTapWants).
+    void tapStageHost(std::string_view stage, std::size_t block,
+                      const float* host, std::size_t rows, std::size_t cols) const;
+    /// Integer stages (e.g. MoE expert ids): delivered to the tap as exact
+    /// floats (ids < 2^24). Device and host variants.
+    void tapStageI32(compute::ComputeMatmul& gmm, compute::ComputeOps& ops,
+                     std::string_view stage, std::size_t block,
+                     const std::int32_t* device, std::size_t rows, std::size_t cols) const;
+    void tapStageHostI32(std::string_view stage, std::size_t block,
+                         const std::int32_t* host, std::size_t rows, std::size_t cols) const;
 
     /// Build this backend's capability flags (8.30.8). Replaces the former
     /// eight individual capability virtuals. Called once, lazily, by
@@ -237,6 +275,7 @@ protected:
     [[nodiscard]] virtual ArchCapabilities computeCapabilities() const = 0;
 
 private:
+    StageTap                 _stageTap{};
     mutable ArchCapabilities _caps{};
     mutable std::once_flag   _capsOnce;
 };

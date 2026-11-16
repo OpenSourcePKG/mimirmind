@@ -355,6 +355,15 @@ void Kolibri1Backend::runKolibriMoe(std::size_t blockIdx, const float* din,
             }
         }
     }
+    // 7.2 Hugin: the routing actually taken (no-op unless a stage tap asks).
+    if (useDeviceRouter) {
+        tapStageI32(_gmm, _ops, "moe_topk_idx", blockIdx,
+                    buffers.moePrefillExpIdx.as<std::int32_t>(), T, K);
+        tapStage(_gmm, _ops, "moe_topk_w", blockIdx, buffers.moePrefillKw.as<float>(), T, K);
+    } else {
+        tapStageHostI32("moe_topk_idx", blockIdx, _selIdx.data(), T, K);
+        tapStageHost("moe_topk_w", blockIdx, _selW.data(), T, K);
+    }
 
     _ops.mulScalarAsync(moeAccum, 0.0F, T * d_model);
 

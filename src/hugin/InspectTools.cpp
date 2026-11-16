@@ -9,6 +9,7 @@
 #include "core/rune/RuneFormat.hpp"
 
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <stdexcept>
 
@@ -51,14 +52,31 @@ std::vector<std::string> stringList(const json& args, const char* key) {
 
 } // namespace
 
-InspectTools::InspectTools(const std::string& initialModel) {
+InspectTools::InspectTools(const std::string& initialModel, std::string tokenizerGguf) {
     if (!initialModel.empty()) {
-        _model = std::make_unique<ModelView>(initialModel);
+        open(initialModel, std::move(tokenizerGguf));
     }
+}
+
+void InspectTools::open(const std::string& path, std::string tokenizerGguf) {
+    if (std::filesystem::is_directory(path)) {
+        // NVFP4 checkpoint: the weights only exist after the engine's device
+        // materialisation, so only the forward tools can use it.
+        _model.reset();
+        _checkpointDir = path;
+    } else {
+        _model = std::make_unique<ModelView>(path);
+        _checkpointDir.clear();
+    }
+    _tokenizerGguf = std::move(tokenizerGguf);
 }
 
 const ModelView& InspectTools::model() const {
     if (!_model) {
+        if (!_checkpointDir.empty()) {
+            throw std::runtime_error("'" + _checkpointDir + "' is an NVFP4 checkpoint — the weight "
+                                     "inspection tools are GGUF-only; the forward tools work on it");
+        }
         throw std::runtime_error("no model loaded — call open_model first");
     }
     return *_model;
@@ -66,12 +84,21 @@ const ModelView& InspectTools::model() const {
 
 void InspectTools::registerOn(McpServer& server) {
     server.addTool(
-        "open_model", "Open a GGUF model for inspection (read-only mmap, no GPU).",
-        schema({{"path", {{"type", "string"}, {"description", "absolute path to a .gguf file"}}}},
+        "open_model",
+        "Open a model: a GGUF file (weight inspection via read-only mmap + forward tools) or an "
+        "NVFP4 checkpoint directory (forward tools only; needs a CUDA build/GPU). "
+        "'tokenizer_gguf' supplies the tokenizer for NVFP4 checkpoints that need one.",
+        schema({{"path", {{"type", "string"}, {"description", "absolute path to a .gguf file or checkpoint dir"}}},
+                {"tokenizer_gguf", {{"type", "string"}}}},
                {"path"}),
         [this](const json& a) {
-            _model = std::make_unique<ModelView>(a.at("path").get<std::string>());
-            return json{{"path", _model->path()}, {"base_fingerprint", _model->fingerprint()}};
+            open(a.at("path").get<std::string>(), a.value("tokenizer_gguf", std::string{}));
+            if (!_model) {
+                return json{{"path", _checkpointDir}, {"format", "nvfp4"},
+                            {"weight_inspection", false}};
+            }
+            return json{{"path", _model->path()}, {"format", "gguf"},
+                        {"base_fingerprint", _model->fingerprint()}};
         });
 
     server.addTool(

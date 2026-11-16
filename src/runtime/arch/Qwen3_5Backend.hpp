@@ -580,6 +580,10 @@ protected:
     // nullptr => per-token runMoeFfn (the historical single-session path).
     std::int32_t* _prefillMoeExpIdx{nullptr};
     float*        _prefillMoeKw{nullptr};
+
+    // 7.2 Hugin stage tap: set when this block's routing was already tapped
+    // (host path), so the slot-based tap in runFfn does not read stale slots.
+    bool _routeTapped{false};
 };
 
 } // namespace mimirmind::runtime::arch

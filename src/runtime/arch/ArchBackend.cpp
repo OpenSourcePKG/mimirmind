@@ -10,6 +10,8 @@
 #include "runtime/arch/Qwen3_5DenseBackend.hpp"
 #include "runtime/arch/Qwen3_5MoeBackend.hpp"
 #include "runtime/arch/Qwen4ExpBackend.hpp"
+#include "compute/ComputeMatmul.hpp"
+#include "compute/ComputeOps.hpp"
 
 namespace mimirmind::runtime::arch {
 
@@ -72,6 +74,52 @@ createArchBackend(const std::string&             architecture,
                                                   moeFusedDownEnabled);
     }
     return nullptr;
+}
+
+void ArchBackend::tapStage(compute::ComputeMatmul& gmm, compute::ComputeOps& ops,
+                           std::string_view stage, std::size_t block,
+                           const float* device, std::size_t rows, std::size_t cols) const {
+    if (!stageTapWants(stage, block)) {
+        return;
+    }
+    gmm.sync();   // the producing kernels may still be in flight
+    std::vector<float> host(rows * cols);
+    ops.readbackToHost(host.data(), device, host.size() * sizeof(float));
+    _stageTap.onStage(stage, block, std::move(host), rows, cols);
+}
+
+void ArchBackend::tapStageHost(std::string_view stage, std::size_t block,
+                               const float* host, std::size_t rows, std::size_t cols) const {
+    if (!stageTapWants(stage, block)) {
+        return;
+    }
+    _stageTap.onStage(stage, block, std::vector<float>(host, host + rows * cols), rows, cols);
+}
+
+void ArchBackend::tapStageI32(compute::ComputeMatmul& gmm, compute::ComputeOps& ops,
+                              std::string_view stage, std::size_t block,
+                              const std::int32_t* device, std::size_t rows,
+                              std::size_t cols) const {
+    if (!stageTapWants(stage, block)) {
+        return;
+    }
+    gmm.sync();
+    std::vector<std::int32_t> ids(rows * cols);
+    ops.readbackToHost(ids.data(), device, ids.size() * sizeof(std::int32_t));
+    tapStageHostI32(stage, block, ids.data(), rows, cols);
+}
+
+void ArchBackend::tapStageHostI32(std::string_view stage, std::size_t block,
+                                  const std::int32_t* host, std::size_t rows,
+                                  std::size_t cols) const {
+    if (!stageTapWants(stage, block)) {
+        return;
+    }
+    std::vector<float> v(rows * cols);
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        v[i] = static_cast<float>(host[i]);
+    }
+    _stageTap.onStage(stage, block, std::move(v), rows, cols);
 }
 
 } // namespace mimirmind::runtime::arch

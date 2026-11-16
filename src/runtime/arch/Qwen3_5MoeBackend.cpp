@@ -201,6 +201,17 @@ void Qwen3_5MoeBackend::runFfn(std::size_t   blockIdx,
                                const float*  moeInput,
                                std::size_t   T,
                                BlockBuffers& s) {
+    // 7.2 Hugin: the slot-based (batched / grouped) routes write the routing
+    // into [T*K] device slots; when such a path falls back to runMoeFfn, that
+    // path taps its own host routing and sets _routeTapped instead.
+    _routeTapped = false;
+    const auto tapSlots = [&](const std::int32_t* idx, const float* kw) {
+        if (!_routeTapped) {
+            const std::size_t K = _config.expertUsedCount;
+            tapStageI32(_gmm, _ops, "moe_topk_idx", blockIdx, idx, T, K);
+            tapStage(_gmm, _ops, "moe_topk_w", blockIdx, kw, T, K);
+        }
+    };
     if (_prefillMoeExpIdx != nullptr && T > 1) {
         const auto* gExpsRoute =
             _weights.findBlock(blockIdx, "ffn_gate_exps.weight");
@@ -213,6 +224,7 @@ void Qwen3_5MoeBackend::runFfn(std::size_t   blockIdx,
             runMoeFfnBatched(blockIdx, moeInput, T, _prefillMoeExpIdx,
                              _prefillMoeKw, s);
         }
+        tapSlots(_prefillMoeExpIdx, _prefillMoeKw);
     } else {
         // 5.27 I-3: the single-session runFfn per-token runMoeFfn path cannot
         // consume tc-only (NVFP4_TC) routed banks (per-expert matmulAsync has no
@@ -229,6 +241,7 @@ void Qwen3_5MoeBackend::runFfn(std::size_t   blockIdx,
                              s.moePrefillExpIdx.as<std::int32_t>(),
                              s.moePrefillKw.as<float>(), s,
                              /*preferBlocked=*/false);
+            tapSlots(s.moePrefillExpIdx.as<std::int32_t>(), s.moePrefillKw.as<float>());
         } else {
             runMoeFfn(blockIdx, moeInput, T, s);
         }
@@ -493,6 +506,11 @@ void Qwen3_5MoeBackend::runMoeFfn(std::size_t   blockIdx,
     if (!deviceTopK) {
         cmp::moeTopKRoute(upOutBuf, T, nExperts, K,
                           _topKIdx.data(), _topKWeight.data());
+        // 7.2 Hugin: host routing (no-op unless a stage tap asks). The
+        // device-top-K decode path is tapped where it writes its slots below.
+        tapStageHostI32("moe_topk_idx", blockIdx, _topKIdx.data(), T, K);
+        tapStageHost("moe_topk_w", blockIdx, _topKWeight.data(), T, K);
+        _routeTapped = true;
     }
 
     // Optional router-weight scale (llama.cpp w_scale); 0 = unset = 1.0.
@@ -559,6 +577,9 @@ void Qwen3_5MoeBackend::runMoeFfn(std::size_t   blockIdx,
             // expIdxSlot (never the host _topKIdx fallback).
             _ops.moeTopKRouteDeviceAsync(upOutBuf, expIdxSlot, kwSlot,
                                          T, nExperts, K, wScale);
+            tapStageI32(_gmm, _ops, "moe_topk_idx", blockIdx, expIdxSlot, T, K);
+            tapStage(_gmm, _ops, "moe_topk_w", blockIdx, kwSlot, T, K);
+            _routeTapped = true;
         } else {
             for (std::size_t k = 0; k < K; ++k) {
                 expIdxSlot[k] = _topKIdx[k];

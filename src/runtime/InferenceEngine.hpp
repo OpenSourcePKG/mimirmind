@@ -66,6 +66,7 @@ class ThermalGuard;
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -393,9 +394,21 @@ public:
         std::vector<std::uint32_t> lensBlocks;
         /// Position (0..N-1) for the lens; SIZE_MAX = last position.
         std::size_t lensPosition{static_cast<std::size_t>(-1)};
-        /// Filled by forwardVerify: block -> [N * d_model] / block -> [vocab].
+        /// Named backend stages (ArchBackend::StageTap, e.g. "Qcur", "Kcur",
+        /// "Vcur", "attn_ctx", "attn_scale") to capture in `stageBlocks`
+        /// (empty = every block). Which names exist is per architecture.
+        std::vector<std::string>   stages;
+        std::vector<std::uint32_t> stageBlocks;
+        struct Stage {
+            std::size_t        rows{0};
+            std::size_t        cols{0};
+            std::vector<float> data;
+        };
+        /// Filled by forwardVerify: block -> [N * d_model] / block -> [vocab] /
+        /// (stage, block) -> captured stage.
         std::map<std::uint32_t, std::vector<float>> hidden;
         std::map<std::uint32_t, std::vector<float>> lens;
+        std::map<std::pair<std::string, std::uint32_t>, Stage> stageData;
     };
     std::vector<std::vector<float>> forwardVerify(
         std::span<const std::int32_t> newTokens,

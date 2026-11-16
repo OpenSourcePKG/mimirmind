@@ -23,7 +23,7 @@ namespace {
 constexpr const char* kVersion = "0.2.0";
 
 void usage() {
-    std::cerr << "usage: hugin [--model <file.gguf>]\n"
+    std::cerr << "usage: hugin [--model <file.gguf | nvfp4-checkpoint-dir>] [--tokenizer-gguf <file.gguf>]\n"
                  "  Runs an MCP server on stdin/stdout (newline-delimited JSON-RPC 2.0).\n"
                  "  Register with Claude Code, e.g.:\n"
                  "    claude mcp add hugin -- /path/to/hugin --model /path/to/model.gguf\n";
@@ -33,10 +33,13 @@ void usage() {
 
 int main(int argc, char** argv) {
     std::string model;
+    std::string tokenizerGguf;
     for (int i = 1; i < argc; ++i) {
         const std::string_view a = argv[i];
         if (a == "--model" && i + 1 < argc) {
             model = argv[++i];
+        } else if (a == "--tokenizer-gguf" && i + 1 < argc) {
+            tokenizerGguf = argv[++i];
         } else if (a == "--help" || a == "-h") {
             usage();
             return 0;
@@ -64,8 +67,10 @@ int main(int argc, char** argv) {
 
     try {
         mimirmind::hugin::McpServer    server{"hugin", kVersion};
-        mimirmind::hugin::InspectTools inspect{model};
-        mimirmind::hugin::ForwardTools forwardTools{[&inspect] { return inspect.modelPath(); }};
+        mimirmind::hugin::InspectTools inspect{model, tokenizerGguf};
+        mimirmind::hugin::ForwardTools forwardTools{[&inspect] {
+            return mimirmind::hugin::ForwardTools::Target{inspect.modelPath(), inspect.tokenizerGguf()};
+        }};
         inspect.registerOn(server);
         forwardTools.registerOn(server);
         std::cerr << "hugin " << kVersion << ": MCP server ready on stdio"
