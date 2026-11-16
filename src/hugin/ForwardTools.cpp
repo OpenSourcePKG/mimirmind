@@ -25,143 +25,6 @@ using nlohmann::json;
 using Engine = runtime::InferenceEngine;
 using namespace forward_support;
 
-/// Per-token log-probs of ids[1..] under `logits` (position i predicts i+1).
-std::vector<double> tokenLogProbs(const Engine& e, const std::vector<std::vector<float>>& logits,
-                                  std::span<const std::int32_t> ids) {
-    std::vector<double> out;
-    for (std::size_t i = 0; i + 1 < ids.size(); ++i) {
-        const auto lp = logProbs(e, logits[i]);
-        out.push_back(lp[static_cast<std::size_t>(ids[i + 1])]);
-    }
-    return out;
-}
-
-std::size_t nonFiniteCount(const std::vector<double>& v) {
-    return static_cast<std::size_t>(
-        std::count_if(v.begin(), v.end(), [](double x) { return !std::isfinite(x); }));
-}
-
-double perplexityOf(const std::vector<double>& lps) {
-    if (lps.empty()) {
-        return 0.0;
-    }
-    double nll = 0.0;
-    for (double lp : lps) {
-        nll -= lp;
-    }
-    return std::exp(nll / static_cast<double>(lps.size()));
-}
-
-/// Teacher-forced score of `cont` after `prompt` in one forward.
-struct ContinuationScore {
-    double      logprob{0};
-    bool        greedyMatch{true};   // every continuation token is the argmax
-    std::size_t firstRank{0};
-    std::size_t tokens{0};
-};
-
-ContinuationScore scoreContinuation(Engine& e, const std::vector<std::int32_t>& prompt,
-                                    const std::vector<std::int32_t>& cont) {
-    if (prompt.empty() || cont.empty()) {
-        throw std::runtime_error("eval item needs a non-empty prompt and continuation");
-    }
-    std::vector<std::int32_t> ids = prompt;
-    ids.insert(ids.end(), cont.begin(), cont.end());
-    const auto lg = forward(e, ids);
-    ContinuationScore sc;
-    sc.tokens = cont.size();
-    for (std::size_t j = 0; j < cont.size(); ++j) {
-        const auto lp  = logProbs(e, lg[prompt.size() - 1 + j]);
-        const auto tok = static_cast<std::size_t>(cont[j]);
-        sc.logprob += lp[tok];
-        const std::size_t rank = LogitMath::rankOf(lp, tok);
-        if (j == 0) {
-            sc.firstRank = rank;
-        }
-        sc.greedyMatch = sc.greedyMatch && rank == 0;
-    }
-    return sc;
-}
-
-/// Goldset items: inline array or a .json (array) / .jsonl file.
-json loadGoldset(const json& a) {
-    if (a.contains("items")) {
-        return a["items"];
-    }
-    if (!a.contains("path")) {
-        throw std::runtime_error("pass 'items' or 'path'");
-    }
-    const std::string path = a["path"].get<std::string>();
-    std::ifstream f(path);
-    if (!f) {
-        throw std::runtime_error("cannot open goldset '" + path + "'");
-    }
-    std::stringstream ss;
-    ss << f.rdbuf();
-    const std::string text = ss.str();
-    const auto first = text.find_first_not_of(" \t\r\n");
-    if (first != std::string::npos && text[first] == '[') {
-        return json::parse(text);
-    }
-    json items = json::array();
-    std::istringstream lines(text);
-    std::string line;
-    while (std::getline(lines, line)) {
-        if (line.find_first_not_of(" \t\r") != std::string::npos) {
-            items.push_back(json::parse(line));
-        }
-    }
-    return items;
-}
-
-/// One eval item on one engine: {"prompt", "expect"} (exact continuation) or
-/// {"prompt", "choices":[...], "answer": idx} (multiple choice by logprob).
-json evalItem(Engine& e, const json& item, bool addBos) {
-    const auto prompt = e.tokenizer().encode(item.at("prompt").get<std::string>(), addBos);
-    const auto encodeCont = [&](const std::string& t) { return e.tokenizer().encode(t, false); };
-    if (item.contains("choices")) {
-        const auto choices = item["choices"].get<std::vector<std::string>>();
-        const auto answer  = item.at("answer").get<std::size_t>();
-        if (answer >= choices.size()) {
-            throw std::runtime_error("eval item 'answer' out of range");
-        }
-        std::vector<double> lps;
-        for (const auto& c : choices) {
-            lps.push_back(scoreContinuation(e, prompt, encodeCont(c)).logprob);
-        }
-        const auto best = static_cast<std::size_t>(
-            std::max_element(lps.begin(), lps.end()) - lps.begin());
-        return json{{"kind", "choice"}, {"correct", best == answer}, {"picked", best},
-                    {"logprob", lps[answer]}, {"choice_logprobs", lps}};
-    }
-    const auto sc = scoreContinuation(e, prompt, encodeCont(item.at("expect").get<std::string>()));
-    return json{{"kind", "expect"}, {"correct", sc.greedyMatch}, {"logprob", sc.logprob},
-                {"tokens", sc.tokens}, {"first_rank", sc.firstRank}};
-}
-
-json evalRun(Engine& e, const json& items, bool addBos, json& rows) {
-    std::size_t correct = 0, nonFinite = 0;
-    double      lpSum   = 0;
-    for (std::size_t i = 0; i < items.size(); ++i) {
-        json r = evalItem(e, items[i], addBos);
-        correct += r["correct"].get<bool>() ? 1U : 0U;
-        const double lp = r["logprob"].get<double>();
-        if (std::isfinite(lp)) {
-            lpSum += lp;
-        } else {
-            ++nonFinite;   // NaN/Inf logits from the forward: report, don't poison the mean
-        }
-        if (rows.size() <= i) {
-            rows.push_back(json{{"index", i}, {"id", items[i].contains("id") ? items[i]["id"] : json(i)}});
-        }
-        rows[i]["base_or_run"] = std::move(r);
-    }
-    const double n = static_cast<double>(std::max<std::size_t>(1, items.size()));
-    const double finiteN = static_cast<double>(std::max<std::size_t>(1, items.size() - nonFinite));
-    return json{{"items", items.size()}, {"accuracy", static_cast<double>(correct) / n},
-                {"mean_logprob", lpSum / finiteN}, {"non_finite_items", nonFinite}};
-}
-
 } // namespace
 
 struct ForwardTools::Loaded {
@@ -199,6 +62,10 @@ bool sameTarget(const ForwardTools::Target& a, const ForwardTools::Target& b) {
     return a.path == b.path && a.tokenizerGguf == b.tokenizerGguf;
 }
 } // namespace
+
+void ForwardTools::dropVariant() noexcept {
+    _variant.reset();
+}
 
 std::string ForwardTools::targetKey() const {
     const Target t = _target();

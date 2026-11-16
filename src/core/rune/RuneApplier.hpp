@@ -22,7 +22,9 @@ enum class RuneElemType : std::uint8_t {
     F32,
     F16,
     BF16,
-    Unsupported,   ///< quantised / packed layouts — refused, never silently skipped
+    Q8_0,          ///< GGML Q8_0 (f16 scale + 32 int8 per block along ne0): Scale with
+                   ///< 0/1 factors only (exact masking, e.g. head ablation)
+    Unsupported,   ///< other quantised / packed layouts — refused, never silently skipped
 };
 
 /**
@@ -54,11 +56,19 @@ struct RuneTouchedTensor {
     std::string   hashAfter;    ///< content hash after all of the rune's ops
 };
 
+/// A Steer op resolved for the engine: add `values` (payload x alpha,
+/// d_model floats) to the residual stream after `block`, every row.
+struct RuneSteer {
+    std::uint32_t       block{0};
+    std::vector<float>  values;
+};
+
 /// Result of a successful apply.
 struct RuneApplyReport {
     std::string                     runeName;
     std::size_t                     opsApplied{0};
     std::vector<RuneTouchedTensor>  touched;
+    std::vector<RuneSteer>          steers;   ///< activation overlays; no weight touched
 };
 
 /**
@@ -78,7 +88,12 @@ struct RuneApplyReport {
  *    (latest apply first) for a runtime undo without reloading the model.
  *
  * Math is done in F32 and rounded back to the target encoding with
- * round-to-nearest-even.
+ * round-to-nearest-even. Q8_0 targets accept only Scale with factors in
+ * {0, 1} (uniform per 32-column block for axis=cols), which zeroes whole
+ * blocks and is therefore exact.
+ *
+ * Steer ops touch no weight: they are validated (finite payload) and handed
+ * back in `RuneApplyReport::steers` for the engine's residual overlay.
  */
 class RuneApplier {
 public:

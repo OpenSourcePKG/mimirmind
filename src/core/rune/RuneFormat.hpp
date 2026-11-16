@@ -48,7 +48,7 @@ enum class RuneOpKind : std::uint8_t {
     Scale,             ///< multiply each row (or column) by a payload factor
     Mask,              ///< load-time removal of experts/heads/layers (not yet applicable)
     LowRank,           ///< overlay y = Wx + s*B(Ax) (not yet applicable)
-    Steer,             ///< residual-stream activation offset (not yet applicable)
+    Steer,             ///< residual-stream activation offset after one block (overlay, no weight change)
     WriteQuantBlocks,  ///< overwrite pre-quantised NVFP4 blocks (not yet applicable)
 };
 
@@ -67,7 +67,12 @@ struct RuneOp {
     std::uint64_t rowBegin{0};   ///< WriteSlice only
     std::uint64_t rowEnd{0};     ///< WriteSlice only (exclusive)
     RuneScaleAxis axis{RuneScaleAxis::Rows};   ///< Scale only
+    double        alpha{1.0};    ///< Steer only: payload multiplier
 };
+
+/// Steer target spelling: `blk.<i>` = the residual stream after block i.
+/// Returns the block index, or nullopt for any other spelling.
+[[nodiscard]] std::optional<std::uint32_t> steerBlockOf(std::string_view target) noexcept;
 
 /// Parsed manifest.
 struct RuneManifest {
@@ -84,7 +89,8 @@ struct RuneManifest {
 /// Inverse of `opKindName`; nullopt for unknown spellings.
 [[nodiscard]] std::optional<RuneOpKind> opKindFromName(std::string_view s) noexcept;
 
-/// True for op kinds the host applier can execute in this build.
+/// True for op kinds this build can apply (weight ops on the host applier,
+/// Steer as an engine activation overlay).
 [[nodiscard]] bool opKindApplicable(RuneOpKind k) noexcept;
 
 /// FNV-1a 64 over `bytes`, formatted as `fnv1a64:<16 lowercase hex>`. Identity

@@ -675,6 +675,7 @@ void InferenceEngine::finalizeLoad() {
         *_ops, *_gmm, _opProfiler.value(), _cfg.features.moeGroup,
         _cfg.features.moeFusedDown != core::config::TriState::Disable);
     attachQwen4ExpPleTable();
+    installRuneSteers();
 
     _modelLoaded = true;
     // Defensive: a previous model's KV state must not survive into the
@@ -705,6 +706,40 @@ void InferenceEngine::refuseRunesOnSharedWeights() const {
         "(shared) weights yet. Load the model standalone or remove `runes`.");
 }
 
+void InferenceEngine::installRuneSteers() {
+    _runeSteerDev.clear();
+    if (_runeSteerHost.empty()) {
+        return;
+    }
+    if (!_backend) {
+        throw std::runtime_error("Futhark: rune steer overlay needs an arch backend "
+                                 "(architecture '" + _config.architecture + "')");
+    }
+    const std::size_t dModel = _config.embeddingLength;
+    std::vector<std::pair<std::size_t, const float*>> steers;
+    _runeSteerDev.reserve(_runeSteerHost.size());
+    for (const auto& [block, values] : _runeSteerHost) {
+        if (block >= _config.blockCount) {
+            throw std::runtime_error("Futhark: steer on block " + std::to_string(block) +
+                                     " but the model has " +
+                                     std::to_string(_config.blockCount) + " blocks");
+        }
+        if (values.size() != dModel) {
+            throw std::runtime_error("Futhark: steer on block " + std::to_string(block) +
+                                     " has " + std::to_string(values.size()) +
+                                     " values, model d_model is " + std::to_string(dModel));
+        }
+        _runeSteerDev.push_back(_ops->allocate(dModel * sizeof(float)));
+        _ops->uploadHostBytes(_runeSteerDev.back().as<float>(), values.data(),
+                              dModel * sizeof(float));
+        steers.emplace_back(block, _runeSteerDev.back().as<float>());
+        MM_LOG_INFO("futhark", "model '{}': steer overlay after block {} (||v|| applied "
+                    "on every forward path)", _modelIdHint, block);
+    }
+    _backend->setResidualSteers(*_ops, dModel, steers);
+    _runeSteerHost.clear();
+}
+
 void InferenceEngine::applyRunes() {
     if (_runePaths.empty()) {
         return;
@@ -732,9 +767,24 @@ void InferenceEngine::applyRunes() {
                      res.error());
         throw std::runtime_error("Futhark: " + res.error());
     }
+    _runeSteerHost.clear();
     for (const auto& rep : res->reports) {
-        MM_LOG_INFO("futhark", "model '{}': rune '{}' applied — {} op(s), {} tensor(s)",
-                    _modelIdHint, rep.runeName, rep.opsApplied, rep.touched.size());
+        MM_LOG_INFO("futhark", "model '{}': rune '{}' applied — {} op(s), {} tensor(s), "
+                    "{} steer overlay(s)", _modelIdHint, rep.runeName, rep.opsApplied,
+                    rep.touched.size(), rep.steers.size());
+        for (const auto& st : rep.steers) {
+            auto& acc = _runeSteerHost[st.block];
+            if (acc.empty()) {
+                acc.assign(st.values.size(), 0.0F);
+            }
+            if (acc.size() != st.values.size()) {
+                throw std::runtime_error("Futhark: steer vectors for block " +
+                                         std::to_string(st.block) + " differ in length");
+            }
+            for (std::size_t i = 0; i < acc.size(); ++i) {
+                acc[i] += st.values[i];
+            }
+        }
         for (const auto& t : rep.touched) {
             MM_LOG_INFO("futhark", "  {}: {} -> {}", t.name, t.hashBefore, t.hashAfter);
         }
@@ -1963,6 +2013,7 @@ InferenceEngine::runPrefill(const GenContext&               ctx,
     for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
         _backend->runBlock(b, xBuf, prefillCount, cache, buffers,
                            _traceBlock0);
+        _backend->applyResidualSteer(b, xBuf, prefillCount);
         if (useDbuf) {
             _ops->checkpointPrefill();     // async submit + bounded 2-in-flight
         } else if (drainPerBlock) {
@@ -2326,6 +2377,7 @@ InferenceEngine::runDecode(const GenContext&              ctx,
             l0Ops().queue().beginRecord();
             for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
                 _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+                _backend->applyResidualSteer(b, xBuf, 1);
             }
             l0Ops().queue().endRecord();
             l0Ops().queue().replay();
@@ -2341,6 +2393,7 @@ InferenceEngine::runDecode(const GenContext&              ctx,
             _cudaDecodeGraph.launch(cudaOps().stream());
             _backend->runBlock(_config.blockCount - 1, xBuf, 1, cache,
                                buffers, false);
+            _backend->applyResidualSteer(_config.blockCount - 1, xBuf, 1);
         } else if (cudaGraphEnabled && step == 2) {
             // Warmup-before-capture (vLLM's dummy-run pattern): step 1 runs
             // the first decode-shaped forward in IMMEDIATE mode (the else
@@ -2369,11 +2422,13 @@ InferenceEngine::runDecode(const GenContext&              ctx,
                 _cudaDecodeGraph.capture(cudaOps().stream(), [&] {
                     for (std::uint32_t b = 0; b < nCap; ++b) {
                         _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+                        _backend->applyResidualSteer(b, xBuf, 1);
                     }
                 });
                 _cudaDecodeGraph.launch(cudaOps().stream());
                 _backend->runBlock(_config.blockCount - 1, xBuf, 1, cache,
                                    buffers, false);
+                _backend->applyResidualSteer(_config.blockCount - 1, xBuf, 1);
             } catch (const std::exception& e) {
                 // Residual host sync mid-record (e.g. device-top-K off) —
                 // fall back to immediate mode for the rest of the run.
@@ -2384,6 +2439,7 @@ InferenceEngine::runDecode(const GenContext&              ctx,
                 cudaOps().setPerKernelCurLenStaging(true);
                 for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
                     _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+                    _backend->applyResidualSteer(b, xBuf, 1);
                 }
             }
         } else
@@ -2391,6 +2447,7 @@ InferenceEngine::runDecode(const GenContext&              ctx,
         {
             for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
                 _backend->runBlock(b, xBuf, 1, cache, buffers, false);
+                _backend->applyResidualSteer(b, xBuf, 1);
             }
         }
         cache.commit(1);
@@ -2594,6 +2651,7 @@ InferenceEngine::generateBatchL0(
         const bool drainPerBlock = Tp > kPrefillDrainThreshold;
         for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
             _backend->runBlock(b, xBuf, Tp, *caches[i], buffers, false);
+            _backend->applyResidualSteer(b, xBuf, Tp);
             if (drainPerBlock) {
                 _ops->flush();
             }
@@ -2643,6 +2701,7 @@ InferenceEngine::generateBatchL0(
 
         for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
             _backend->runBlockBatched(b, xBuf, nSeq, cacheSpan, buffers, false);
+            _backend->applyResidualSteer(b, xBuf, nSeq);
         }
         for (std::size_t i = 0; i < nSeq; ++i) {
             caches[i]->commit(1);
@@ -2832,6 +2891,7 @@ InferenceEngine::forwardVerify(std::span<const std::int32_t> newTokens,
     // [curLen, curLen+N); commit is deferred to commitVerified().
     for (std::uint32_t b = 0; b < _config.blockCount; ++b) {
         _backend->runBlock(b, xBuf, N, cache, buffers, false);
+        _backend->applyResidualSteer(b, xBuf, N);
         if (probe == nullptr) {
             continue;
         }

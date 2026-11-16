@@ -52,6 +52,9 @@ public:
         std::size_t        negatives{0};
     };
 
+    /// Session steering vector by name; throws when unknown / model changed.
+    const SteerVector& steerVector(const std::string& name) { return vector(name); }
+
 private:
     const SteerVector& vector(const std::string& name);
     void               dropStaleVectors();

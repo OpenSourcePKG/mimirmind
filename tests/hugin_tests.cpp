@@ -8,6 +8,7 @@
 #include "core/rune/RuneFile.hpp"
 #include "core/rune/RuneFormat.hpp"
 #include "hugin/ForwardTools.hpp"
+#include "hugin/RuneStaging.hpp"
 #include "hugin/SurgeryTools.hpp"
 #include "hugin/InspectTools.hpp"
 #include "hugin/LogitMath.hpp"
@@ -68,12 +69,15 @@ struct Fixture {
     hg::InspectTools tools{path};
     hg::ForwardTools forwardTools{[this] { return hg::ForwardTools::Target{tools.modelPath(), {}}; }};
     hg::SurgeryTools surgery{forwardTools};
+    hg::RuneStaging  staging{forwardTools, surgery,
+                             std::filesystem::temp_directory_path() / "hugin_tests_runes", "test"};
     int             nextId{1};
 
     Fixture() {
         tools.registerOn(server);
         forwardTools.registerOn(server);
         surgery.registerOn(server);
+        staging.registerOn(server);
     }
     ~Fixture() { std::filesystem::remove(path); }
 
@@ -123,8 +127,10 @@ TEST(mcp_initialize_and_toolsList) {
     EXPECT_TRUE(names == (std::vector<std::string>{"ablate_preview", "activations", "attention_pattern", "causal_trace",
                                                    "eval", "expert_usage", "generate", "list_tensors", "logit_lens",
                                                    "model_info", "next_token", "open_model", "perplexity", "rune_check",
-                                                   "rune_compare", "rune_inspect", "steer_list", "steer_preview",
-                                                   "steer_vector", "tensor_hash", "tensor_stats", "tokenize"}));
+                                                   "rune_commit", "rune_compare", "rune_gate", "rune_inspect", "rune_list",
+                                                   "rune_rollback", "rune_stage_ablate", "rune_stage_steer",
+                                                   "steer_list", "steer_preview", "steer_vector", "tensor_hash",
+                                                   "tensor_stats", "tokenize"}));
 }
 
 TEST(mcp_protocolErrors) {
@@ -208,11 +214,17 @@ TEST(tools_runeCheck_dryRun_matchesPrediction_andNeverWrites) {
     EXPECT_EQ(insp["ops"][0]["axis"].get<std::string>(), std::string{"cols"});
     EXPECT_EQ(insp["ops"][0]["payload_values"].get<int>(), 3);
 
-    const std::string quant = writeRune(base, "q", "fnv1a64:0000000000000000", std::vector<float>(32, 1.0f));
+    // Q8_0 accepts only exact 0/1 masking (7.3); a 0.5 scale is refused.
+    const std::string hashQ = f.call("tensor_hash", {{"name", "q"}}).second["tensor_hash"].get<std::string>();
+    const std::string quant = writeRune(base, "q", hashQ, std::vector<float>(32, 0.5f));
     const auto [e3, rq] = f.call("rune_check", {{"paths", {quant}}});
     EXPECT_TRUE(!e3);
     EXPECT_TRUE(!rq["ok"].get<bool>());
-    EXPECT_TRUE(rq["error"].get<std::string>().find("quantised") != std::string::npos);
+    EXPECT_TRUE(rq["error"].get<std::string>().find("0 or 1") != std::string::npos);
+    const std::string mask = writeRune(base, "q", hashQ, std::vector<float>(32, 0.0f));
+    const auto [e5, rm] = f.call("rune_check", {{"paths", {mask}}});
+    EXPECT_TRUE(!e5);
+    EXPECT_TRUE(rm["ok"].get<bool>());
 
     const std::string wrongBase = writeRune("other-model", "w", hashW, {2.0f, 2.0f, 2.0f});
     const auto [e4, rb] = f.call("rune_check", {{"paths", {wrongBase}}});
@@ -267,6 +279,39 @@ TEST(surgeryTools_withoutModel_reportToolError_steerListEmpty) {
     }
     const json list = call("steer_list", json::object());
     EXPECT_TRUE(!list.value("isError", false));
+}
+
+TEST(runeStaging_guards_withoutModel_andUnknownNames) {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("hugin_rs_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    hg::McpServer    server{"hugin", "test"};
+    hg::ForwardTools fwd{[] { return hg::ForwardTools::Target{}; }};
+    hg::SurgeryTools surgery{fwd};
+    hg::RuneStaging  staging{fwd, surgery, dir, "test"};
+    staging.registerOn(server);
+    const auto call = [&](const char* tool, json args) {
+        return (*server.handle({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                {"params", {{"name", tool}, {"arguments", std::move(args)}}}}))["result"];
+    };
+    const auto errText = [](const json& r) {
+        return r["isError"].get<bool>() ? r["content"][0]["text"].get<std::string>() : std::string{};
+    };
+    EXPECT_TRUE(errText(call("rune_stage_steer", {{"name", "s"}, {"vector", "v"}, {"alpha", 1.0}}))
+                    .find("open_model") != std::string::npos);
+    EXPECT_TRUE(errText(call("rune_stage_ablate", {{"name", "a"}, {"block", 0}, {"heads", {0}}}))
+                    .find("open_model") != std::string::npos);
+    EXPECT_TRUE(errText(call("rune_stage_steer", {{"name", "../x"}, {"vector", "v"}, {"alpha", 1.0}}))
+                    .find("rune name") != std::string::npos);
+    EXPECT_TRUE(errText(call("rune_stage_steer", {{"name", "a/b"}, {"vector", "v"}, {"alpha", 1.0}}))
+                    .find("[A-Za-z0-9._-]") != std::string::npos);
+    EXPECT_TRUE(errText(call("rune_gate", {{"name", "nope"}, {"target", {{"items", json::array()}}}}))
+                    .find("no rune named") != std::string::npos);
+    EXPECT_TRUE(errText(call("rune_commit", {{"name", "nope"}})).find("no rune named") != std::string::npos);
+    EXPECT_TRUE(errText(call("rune_rollback", {{"name", "nope"}})).find("no rune named") != std::string::npos);
+    const json list = call("rune_list", json::object());
+    EXPECT_TRUE(!list.value("isError", false));
+    std::filesystem::remove_all(dir);
 }
 
 TEST(logitMath_logSoftmax_topK_rank_entropy_kl) {

@@ -69,9 +69,21 @@ public:
     /// SurgeryTools so both tool groups run on one resident model.
     runtime::InferenceEngine& engine() { return base(); }
 
+    /// The same model with `runes` applied by Futhark at load (one variant
+    /// engine is kept besides the base; a different rune list reloads it).
+    runtime::InferenceEngine& engineWithRunes(const std::vector<std::string>& runes) {
+        return withRunes(runes);
+    }
+
+    /// Drop the rune variant engine (e.g. after a staged rune file changed).
+    void dropVariant() noexcept;
+
     /// Identity of the current target (path + tokenizer); session state that
     /// is only valid for one model (steering vectors) keys on it.
     [[nodiscard]] std::string targetKey() const;
+
+    /// The current target (as InspectTools / open_model set it).
+    [[nodiscard]] Target target() const { return _target(); }
 
 private:
     struct Loaded;

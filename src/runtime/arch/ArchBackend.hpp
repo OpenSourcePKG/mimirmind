@@ -252,6 +252,24 @@ public:
     void setStageTap(StageTap tap) { _stageTap = std::move(tap); }
     void clearStageTap() noexcept { _stageTap = StageTap{}; }
 
+    /// 7.3 Rune Steer overlay (Futhark): a device vector [dModel] per block,
+    /// added to every row of the residual stream right after that block on
+    /// every forward path (prefill, decode, batched serving, verify). Set once
+    /// at load, before any graph capture; the caller owns the device memory
+    /// for the backend's lifetime. Several steers on one block must be summed
+    /// by the caller (one vector per block).
+    void setResidualSteers(compute::ComputeOps& ops, std::size_t dModel,
+                           const std::vector<std::pair<std::size_t, const float*>>& steers);
+    [[nodiscard]] bool hasResidualSteers() const noexcept { return _steerOps != nullptr; }
+    /// Call after runBlock / runBlockBatched with the rows that block wrote.
+    /// No work (and no device op) when no steer is registered for `block`.
+    void applyResidualSteer(std::size_t block, float* x, std::size_t rows) const {
+        if (_steerOps != nullptr && block < _steerByBlock.size() &&
+            _steerByBlock[block] != nullptr) {
+            addResidualSteer(_steerByBlock[block], x, rows);
+        }
+    }
+
 protected:
     ArchBackend() = default;
 
@@ -289,6 +307,11 @@ protected:
     [[nodiscard]] virtual ArchCapabilities computeCapabilities() const = 0;
 
 private:
+    void addResidualSteer(const float* steer, float* x, std::size_t rows) const;
+
+    compute::ComputeOps*     _steerOps{nullptr};
+    std::size_t              _steerDModel{0};
+    std::vector<const float*> _steerByBlock;
     StageTap                 _stageTap{};
     mutable ArchCapabilities _caps{};
     mutable std::once_flag   _capsOnce;

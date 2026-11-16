@@ -741,6 +741,7 @@ ServingSession::generateBatch(
             for (std::size_t b = 0; b < blockCount; ++b) {
                 const auto tb0 = clk::now();
                 qb->runBlockBatched(b, xBuf, ctx, sb);
+                qb->applyResidualSteer(b, xBuf, (ctx.nRow != 0 ? ctx.nRow : ctx.nSeq));
                 const double dt =
                     std::chrono::duration<double, std::milli>(clk::now() - tb0).count();
                 if (_e.config().isRecurrentLayer(b)) dLin += dt; else dFull += dt;
@@ -769,6 +770,7 @@ ServingSession::generateBatch(
                 for (std::size_t b = 0; b < blockCount; ) {
                     if (!_e.config().isRecurrentLayer(b)) {
                         qb->runBlockBatched(b, xBuf, ctx, sb);      // full-attn eager
+                        qb->applyResidualSteer(b, xBuf, (ctx.nRow != 0 ? ctx.nRow : ctx.nSeq));
                         ++b;
                         continue;
                     }
@@ -780,6 +782,7 @@ ServingSession::generateBatch(
                     auto runSeg = [&] {
                         for (std::size_t bb = b; bb < segEnd; ++bb) {
                             qb->runBlockBatched(bb, xBuf, ctx, sb);
+                            qb->applyResidualSteer(bb, xBuf, (ctx.nRow != 0 ? ctx.nRow : ctx.nSeq));
                         }
                     };
                     core::cuda::CudaGraph& g = blockGraphs[b];
@@ -813,6 +816,7 @@ ServingSession::generateBatch(
                 for (std::size_t b = 0; b < blockCount; ++b) {
                     const auto tb0 = timing ? clk::now() : clk::time_point{};
                     qb->runBlockBatched(b, xBuf, ctx, sb);
+                    qb->applyResidualSteer(b, xBuf, (ctx.nRow != 0 ? ctx.nRow : ctx.nSeq));
                     if (timing) {
                         _e.ops()->flush();
                         const double dt =
@@ -1446,6 +1450,7 @@ void ServingSession::stepServing(
         std::span<const std::uint8_t>{st.isSeqStart.data(), nSeq}, nSeq);
     for (std::size_t b = 0; b < st.blockCount; ++b) {
         st.qb->runBlockBatched(b, xBuf, ctx, *st.sb);
+        st.qb->applyResidualSteer(b, xBuf, (ctx.nRow != 0 ? ctx.nRow : ctx.nSeq));
     }
 
     _e.ops()->profileSection("lmhead");
@@ -1699,6 +1704,7 @@ void ServingSession::runVarlenPrefill(
                                 st.mixedKw.as<float>());
     for (std::size_t b = 0; b < st.blockCount; ++b) {
         st.qb->runBlockBatched(b, xBuf, ctx, sb);
+        st.qb->applyResidualSteer(b, xBuf, (ctx.nRow != 0 ? ctx.nRow : ctx.nSeq));
     }
     st.qb->setPrefillMoeScratch(nullptr, nullptr);
     _e.ops()->profileStepEnd();
@@ -1882,6 +1888,7 @@ std::int32_t ServingSession::prefillSlot(
                                 st.prefillKw.as<float>());
     for (std::size_t b = 0; b < st.blockCount; ++b) {
         st.qb->runBlock(b, xBuf, T, view, sb, /*traceBlock0=*/false);
+        st.qb->applyResidualSteer(b, xBuf, T);
     }
     st.qb->setPrefillMoeScratch(nullptr, nullptr);
     // FP4-TC-peak bench: one profiler "step" per prefill chunk (DECODE_PROFILE
@@ -2169,6 +2176,7 @@ ServingSession::verifyForward(
                 st.mtp.ssmExport.as<float>(), convSnapBases.data(), *st.mtp.vsb);
         } else {
             st.qb->runBlockBatched(b, xBuf, ctxFull, *st.mtp.vsb);
+            st.qb->applyResidualSteer(b, xBuf, (ctxFull.nRow != 0 ? ctxFull.nRow : ctxFull.nSeq));
         }
         // DFlash serving tap: stash the residual after each tapped block into
         // this tap's sink (all M time-major rows at once). CLR-safe device copy.

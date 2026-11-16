@@ -117,6 +117,7 @@ std::int32_t SlabDecodeStepper::prefillSlot(
     const bool drainPerBlock = T > kPrefillDrainThreshold;
     for (std::size_t b = 0; b < _dims.blockCount; ++b) {
         _backend.runBlock(b, xBufP, T, cache, prefillSb, /*traceBlock0=*/false);
+        _backend.applyResidualSteer(b, xBufP, T);
         if (drainPerBlock) {
             _ops.flush();
         }
@@ -189,6 +190,7 @@ void SlabDecodeStepper::step(std::span<const std::int32_t> tokens,
 
     for (std::size_t b = 0; b < _dims.blockCount; ++b) {
         _backend.runBlockBatched(b, xBuf, nSeq, caches, sb, /*diag=*/false);
+        _backend.applyResidualSteer(b, xBuf, nSeq);
     }
 
     // Advance every active slab by one token — the runBlockBatched contract

@@ -52,4 +52,34 @@ std::vector<std::uint32_t> blockList(const Engine& e, const nlohmann::json& a);
 /// `position` (negative counts from the end; default last) validated against n.
 std::size_t positionArg(const nlohmann::json& a, std::size_t n);
 
+/// Per-token log-probs of ids[1..] under `logits` (position i predicts i+1).
+std::vector<double> tokenLogProbs(const Engine& e, const std::vector<std::vector<float>>& logits,
+                                  std::span<const std::int32_t> ids);
+
+std::size_t nonFiniteCount(const std::vector<double>& v);
+
+double perplexityOf(const std::vector<double>& lps);
+
+/// Teacher-forced score of `cont` after `prompt` in one forward.
+struct ContinuationScore {
+    double      logprob{0};
+    bool        greedyMatch{true};   // every continuation token is the argmax
+    std::size_t firstRank{0};
+    std::size_t tokens{0};
+};
+
+ContinuationScore scoreContinuation(Engine& e, const std::vector<std::int32_t>& prompt,
+                                    const std::vector<std::int32_t>& cont);
+
+/// Goldset items: inline `items` array or a .json (array) / .jsonl file at `path`.
+nlohmann::json loadGoldset(const nlohmann::json& a);
+
+/// One eval item: {"prompt", "expect"} (exact continuation, greedy match) or
+/// {"prompt", "choices":[...], "answer": idx} (multiple choice by logprob).
+nlohmann::json evalItem(Engine& e, const nlohmann::json& item, bool addBos);
+
+/// Whole goldset on one engine; per-item results land in rows[i]["base_or_run"].
+/// Summary: items, accuracy, mean_logprob (finite items), non_finite_items.
+nlohmann::json evalRun(Engine& e, const nlohmann::json& items, bool addBos, nlohmann::json& rows);
+
 } // namespace mimirmind::hugin::forward_support

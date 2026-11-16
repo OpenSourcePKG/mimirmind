@@ -3,6 +3,7 @@
 
 #include "core/rune/RuneApplier.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
@@ -88,6 +89,29 @@ std::size_t elemSize(RuneElemType t) noexcept {
     }
 }
 
+constexpr std::size_t kQ8Block      = 32;
+constexpr std::size_t kQ8BlockBytes = 34;   // f16 scale + 32 x int8
+
+/// Q8_0 Scale is exact only as masking: every factor 0 or 1, and for
+/// axis=cols uniform within each 32-column block.
+std::string checkQ8Mask(std::span<const float> p, RuneScaleAxis axis) {
+    for (const float f : p) {
+        if (f != 0.0F && f != 1.0F) {
+            return "Q8_0 targets accept only scale factors 0 or 1 (exact masking)";
+        }
+    }
+    if (axis == RuneScaleAxis::Cols) {
+        for (std::size_t b = 0; b < p.size(); b += kQ8Block) {
+            for (std::size_t k = 1; k < kQ8Block && b + k < p.size(); ++k) {
+                if (p[b + k] != p[b]) {
+                    return "Q8_0 column mask must be uniform within each 32-column block";
+                }
+            }
+        }
+    }
+    return {};
+}
+
 float readElem(const std::byte* base, RuneElemType t, std::size_t i) noexcept {
     if (t == RuneElemType::F32) {
         float v = 0.0f;
@@ -131,6 +155,14 @@ std::string checkTarget(const RuneTensorView& v, Geometry& g) {
     std::uint64_t n = 1;
     for (const auto d : v.dims) {
         n *= d;
+    }
+    if (v.type == RuneElemType::Q8_0) {
+        if (v.dims[0] % kQ8Block != 0 || v.bytes.size() != n / kQ8Block * kQ8BlockBytes) {
+            return "target '" + v.name + "' Q8_0 byte size does not match dims";
+        }
+        g.cols = v.dims[0];
+        g.rows = n / g.cols;
+        return {};
     }
     if (v.bytes.size() != n * elemSize(v.type)) {
         return "target '" + v.name + "' byte size does not match dims x element size";
@@ -182,6 +214,12 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
         if (!opKindApplicable(op.kind)) {
             return std::unexpected(ctx + ": op kind not applicable in this build");
         }
+        if (op.kind == RuneOpKind::Steer) {
+            if (!allFinite(rune.payload(op.payload))) {
+                return std::unexpected(ctx + ": payload contains NaN/Inf");
+            }
+            continue;   // activation overlay — no target tensor
+        }
         if (views.find(op.target) == views.end()) {
             std::optional<RuneTensorView> v = resolve(op.target);
             if (!v) {
@@ -197,6 +235,9 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
         const std::span<const float> p = rune.payload(op.payload);
         if (!allFinite(p)) {
             return std::unexpected(ctx + ": payload contains NaN/Inf");
+        }
+        if (v.type == RuneElemType::Q8_0 && op.kind != RuneOpKind::Scale) {
+            return std::unexpected(ctx + ": Q8_0 targets accept only scale (0/1 masking)");
         }
         if (op.kind == RuneOpKind::WriteSlice) {
             if (op.rowEnd > g.rows) {
@@ -214,6 +255,11 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
                 return std::unexpected(ctx + ": payload has " + std::to_string(p.size()) +
                                        " factors, expected " + std::to_string(want));
             }
+            if (v.type == RuneElemType::Q8_0) {
+                if (std::string err = checkQ8Mask(p, op.axis); !err.empty()) {
+                    return std::unexpected(ctx + ": " + err);
+                }
+            }
         }
     }
 
@@ -224,7 +270,19 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
     report.runeName = man.name;
 
     for (std::size_t i = 0; i < man.ops.size(); ++i) {
-        const RuneOp&         op = man.ops[i];
+        const RuneOp& op = man.ops[i];
+        if (op.kind == RuneOpKind::Steer) {
+            const std::span<const float> p = rune.payload(op.payload);
+            RuneSteer st;
+            st.block = *steerBlockOf(op.target);
+            st.values.resize(p.size());
+            for (std::size_t k = 0; k < p.size(); ++k) {
+                st.values[k] = static_cast<float>(static_cast<double>(p[k]) * op.alpha);
+            }
+            report.steers.push_back(std::move(st));
+            ++report.opsApplied;
+            continue;
+        }
         const RuneTensorView& v  = views.at(op.target);
         const std::string     ctx = who + " op[" + std::to_string(i) + "] (" +
                                     std::string{opKindName(op.kind)} + " on '" + op.target + "')";
@@ -246,7 +304,22 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
         (void)checkTarget(v, g);
         const std::span<const float> p    = rune.payload(op.payload);
         std::byte*                   base = v.bytes.data();
-        if (op.kind == RuneOpKind::WriteSlice) {
+        if (v.type == RuneElemType::Q8_0) {
+            // Exact masking: a 0 factor zeroes the whole 32-element block
+            // (scale and quants); a 1 factor leaves it untouched.
+            const std::uint64_t blocksPerRow = g.cols / kQ8Block;
+            for (std::uint64_t r = 0; r < g.rows; ++r) {
+                for (std::uint64_t b = 0; b < blocksPerRow; ++b) {
+                    const float s = op.axis == RuneScaleAxis::Rows
+                                        ? p[r] : p[static_cast<std::size_t>(b * kQ8Block)];
+                    if (s == 0.0F) {
+                        std::byte* blk = base + static_cast<std::size_t>(
+                                                    (r * blocksPerRow + b) * kQ8BlockBytes);
+                        std::fill_n(blk, kQ8BlockBytes, std::byte{0});
+                    }
+                }
+            }
+        } else if (op.kind == RuneOpKind::WriteSlice) {
             const std::size_t first = static_cast<std::size_t>(op.rowBegin * g.cols);
             for (std::size_t k = 0; k < p.size(); ++k) {
                 writeElem(base, v.type, first + k, p[k]);

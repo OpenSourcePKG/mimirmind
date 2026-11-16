@@ -88,6 +88,35 @@ void ArchBackend::tapStage(compute::ComputeMatmul& gmm, compute::ComputeOps& ops
     _stageTap.onStage(stage, block, std::move(host), rows, cols);
 }
 
+void ArchBackend::setResidualSteers(
+    compute::ComputeOps& ops, std::size_t dModel,
+    const std::vector<std::pair<std::size_t, const float*>>& steers) {
+    _steerByBlock.clear();
+    _steerOps    = nullptr;
+    _steerDModel = dModel;
+    for (const auto& [block, vec] : steers) {
+        if (vec == nullptr) {
+            continue;
+        }
+        if (_steerByBlock.size() <= block) {
+            _steerByBlock.resize(block + 1, nullptr);
+        }
+        if (_steerByBlock[block] != nullptr) {
+            throw std::runtime_error("setResidualSteers: two steer vectors for block " +
+                                     std::to_string(block) + " (sum them first)");
+        }
+        _steerByBlock[block] = vec;
+    }
+    if (!_steerByBlock.empty()) {
+        _steerOps = &ops;
+    }
+}
+
+void ArchBackend::addResidualSteer(const float* steer, float* x, std::size_t rows) const {
+    // Broadcast row add on the device stream: x[r, :] += steer for every row.
+    _steerOps->addBiasAsync(x, rows, _steerDModel, steer);
+}
+
 void ArchBackend::tapStageMutable(compute::ComputeMatmul& gmm, compute::ComputeOps& ops,
                                   std::string_view stage, std::size_t block,
                                   float* device, std::size_t rows, std::size_t cols) const {

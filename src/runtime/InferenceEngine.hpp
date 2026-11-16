@@ -1144,6 +1144,7 @@ private:
     /// run before any derived weight copy is built. Throws on any rune error;
     /// the device weights are then left unmodified.
     void applyRunes();
+    void installRuneSteers();   // after the arch backend exists
     /// Throws when runes are configured for a Munin-attached (shared) load.
     void refuseRunesOnSharedWeights() const;
     /// FusedQkvWeights + GPU-op self-test + matmul autotune (L0-only paths).
@@ -1326,6 +1327,10 @@ private:
     bool                                    _servingClassEnabled{false};
 
     compute::ComputeBuffer             _xBufH;
+    /// 7.3 Rune Steer overlay: host vectors from Futhark (summed per block),
+    /// then device copies owned here for the backend's lifetime.
+    std::map<std::uint32_t, std::vector<float>> _runeSteerHost;
+    std::vector<compute::ComputeBuffer>         _runeSteerDev;
     compute::ComputeBuffer             _normFinalH;
     compute::ComputeBuffer             _logitsH;
     compute::ComputeBuffer             _logitsScH;

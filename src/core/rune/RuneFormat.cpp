@@ -45,7 +45,23 @@ std::optional<RuneOpKind> opKindFromName(std::string_view s) noexcept {
 }
 
 bool opKindApplicable(RuneOpKind k) noexcept {
-    return k == RuneOpKind::WriteSlice || k == RuneOpKind::Scale;
+    return k == RuneOpKind::WriteSlice || k == RuneOpKind::Scale || k == RuneOpKind::Steer;
+}
+
+std::optional<std::uint32_t> steerBlockOf(std::string_view target) noexcept {
+    constexpr std::string_view kPrefix = "blk.";
+    if (target.size() <= kPrefix.size() || target.substr(0, kPrefix.size()) != kPrefix ||
+        target.size() > kPrefix.size() + 9) {
+        return std::nullopt;
+    }
+    std::uint32_t v = 0;
+    for (const char c : target.substr(kPrefix.size())) {
+        if (c < '0' || c > '9') {
+            return std::nullopt;
+        }
+        v = v * 10U + static_cast<std::uint32_t>(c - '0');
+    }
+    return v;
 }
 
 std::string tensorContentHash(const void* bytes, std::size_t n) noexcept {

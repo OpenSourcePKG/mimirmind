@@ -7,6 +7,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -64,8 +65,21 @@ RuneOp parseOp(const json& j, std::size_t idx) {
         fail(ctx + ": unknown op '" + kind + "'");
     }
     op.kind       = *k;
-    op.target     = requireString(j, "target", ctx);
-    op.tensorHash = requireString(j, "tensor_hash", ctx);
+    op.target = requireString(j, "target", ctx);
+    if (op.kind == RuneOpKind::Steer) {
+        // Activation overlay: no weight is bound, the base fingerprint is.
+        if (j.contains("tensor_hash")) {
+            op.tensorHash = requireString(j, "tensor_hash", ctx);
+        }
+        if (j.contains("alpha")) {
+            if (!j["alpha"].is_number()) {
+                fail(ctx + ": field 'alpha' is not a number");
+            }
+            op.alpha = j["alpha"].get<double>();
+        }
+    } else {
+        op.tensorHash = requireString(j, "tensor_hash", ctx);
+    }
     if (j.contains("payload")) {
         op.payload = requireString(j, "payload", ctx);
     }
@@ -89,7 +103,12 @@ json opToJson(const RuneOp& op) {
     json j;
     j["op"]          = std::string{opKindName(op.kind)};
     j["target"]      = op.target;
-    j["tensor_hash"] = op.tensorHash;
+    if (op.kind != RuneOpKind::Steer || !op.tensorHash.empty()) {
+        j["tensor_hash"] = op.tensorHash;
+    }
+    if (op.kind == RuneOpKind::Steer) {
+        j["alpha"] = op.alpha;
+    }
     if (!op.payload.empty()) {
         j["payload"] = op.payload;
     }
@@ -141,12 +160,21 @@ void RuneFile::validate() const {
         if (op.target.empty()) {
             fail(ctx + ": empty target");
         }
-        if (!wellFormedHash(op.tensorHash)) {
+        const bool hashOptional = op.kind == RuneOpKind::Steer && op.tensorHash.empty();
+        if (!hashOptional && !wellFormedHash(op.tensorHash)) {
             fail(ctx + ": tensor_hash '" + op.tensorHash +
                  "' is not of the form fnv1a64:<16 hex>");
         }
-        const bool needsPayload =
-            op.kind == RuneOpKind::WriteSlice || op.kind == RuneOpKind::Scale;
+        if (op.kind == RuneOpKind::Steer) {
+            if (!steerBlockOf(op.target)) {
+                fail(ctx + ": steer target must be 'blk.<i>', got '" + op.target + "'");
+            }
+            if (!std::isfinite(op.alpha)) {
+                fail(ctx + ": alpha is not finite");
+            }
+        }
+        const bool needsPayload = op.kind == RuneOpKind::WriteSlice ||
+                                  op.kind == RuneOpKind::Scale || op.kind == RuneOpKind::Steer;
         if (!needsPayload) {
             continue;
         }

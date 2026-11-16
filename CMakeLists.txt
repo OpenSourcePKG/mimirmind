@@ -1878,6 +1878,7 @@ add_library(mimirmind_hugin OBJECT
     src/hugin/LogitMath.cpp
     src/hugin/McpServer.cpp
     src/hugin/ModelView.cpp
+    src/hugin/RuneStaging.cpp
     src/hugin/SurgeryTools.cpp
 )
 target_link_libraries(mimirmind_hugin PUBLIC mimirmind_engine)

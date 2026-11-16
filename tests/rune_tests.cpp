@@ -12,6 +12,7 @@
 #include "core/rune/RuneFormat.hpp"
 #include "core/safetensors/CheckpointFingerprint.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -181,6 +182,7 @@ TEST(opKind_names_roundTrip) {
     EXPECT_TRUE(rn::opKindApplicable(rn::RuneOpKind::WriteSlice));
     EXPECT_TRUE(rn::opKindApplicable(rn::RuneOpKind::Scale));
     EXPECT_TRUE(!rn::opKindApplicable(rn::RuneOpKind::LowRank));
+    EXPECT_TRUE(rn::opKindApplicable(rn::RuneOpKind::Steer));
 }
 
 TEST(contentHash_formatAndDeterminism) {
@@ -591,7 +593,7 @@ TEST(futhark_refusesDerivedSiblingAndQuantTargets) {
     dev.mem["output.weight.nv"] = {0, 0};
     dev.mem["q"]                = {1, 2};
     auto q = dev.f32Tensor("q", 2, 1);
-    q.type = gg::GgmlType::Q8_0;
+    q.type = gg::GgmlType::Q4_K;   // Q8_0 is maskable since 7.3; K-quants stay refused
     const auto weights = gg::WeightsMap::fromOwnedTensors(
         {dev.f32Tensor("output.weight", 2, 1), dev.f32Tensor("output.weight.nv", 2, 1), q});
     rn::Futhark f{dev.io()};
@@ -678,6 +680,133 @@ TEST(checkpointFingerprint_matchesShardSetFormula) {
     EXPECT_EQ(fp, mimirmind::core::safetensors::shardSetFingerprint(two, 30));
     EXPECT_EQ(fp.substr(0, 6), std::string{"nvfp4:"});
     fs::remove_all(dir);
+}
+
+// ======================================================================
+// 7.3 — Steer overlay ops + exact Q8_0 masking
+// ======================================================================
+
+namespace {
+
+rn::RuneOp steerOp(const std::string& target, const std::string& payload, double alpha) {
+    rn::RuneOp op;
+    op.kind    = rn::RuneOpKind::Steer;
+    op.target  = target;
+    op.payload = payload;
+    op.alpha   = alpha;
+    return op;
+}
+
+/// Q8_0 tensor: `rows` x `cols` (cols % 32 == 0), block j of row r has scale
+/// 1.0 (f16 0x3C00) and quants (r*7 + j*3 + k) % 100 - 50.
+FakeTensor q8Tensor(std::uint64_t cols, std::uint64_t rows) {
+    FakeTensor t;
+    t.type = rn::RuneElemType::Q8_0;
+    t.dims = {cols, rows};
+    const std::uint64_t bpr = cols / 32;
+    t.bytes.resize(static_cast<std::size_t>(rows * bpr * 34));
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        for (std::uint64_t j = 0; j < bpr; ++j) {
+            std::byte* b = t.bytes.data() + (r * bpr + j) * 34;
+            b[0] = std::byte{0x00};
+            b[1] = std::byte{0x3C};
+            for (std::uint64_t k = 0; k < 32; ++k) {
+                b[2 + k] = static_cast<std::byte>(static_cast<std::int8_t>((r * 7 + j * 3 + k) % 100) - 50);
+            }
+        }
+    }
+    return t;
+}
+
+} // namespace
+
+TEST(steer_serializeParse_roundTrip_andHashOptional) {
+    const auto rune = makeRune({steerOp("blk.3", "v", 1.5)}, {{"v", {0.5f, -1.0f, 2.0f}}});
+    const auto bytes = rune.serialize();
+    const auto back  = rn::RuneFile::parse(bytes);
+    EXPECT_EQ(back.manifest().ops.size(), std::size_t{1});
+    const auto& op = back.manifest().ops[0];
+    EXPECT_TRUE(op.kind == rn::RuneOpKind::Steer);
+    EXPECT_EQ(op.target, std::string{"blk.3"});
+    EXPECT_TRUE(op.tensorHash.empty());
+    EXPECT_TRUE(op.alpha == 1.5);
+    EXPECT_TRUE(*rn::steerBlockOf("blk.12") == 12U);
+    EXPECT_TRUE(!rn::steerBlockOf("blk.1.attn_output.weight"));
+    EXPECT_TRUE(!rn::steerBlockOf("blk."));
+    // Bad target / missing payload are format errors.
+    EXPECT_TRUE(threw([] { (void)makeRune({steerOp("output.weight", "v", 1.0)}, {{"v", {1.0f}}}); }));
+    EXPECT_TRUE(threw([] { (void)makeRune({steerOp("blk.0", "missing", 1.0)}, {{"v", {1.0f}}}); }));
+}
+
+TEST(apply_steer_touchesNoWeight_reportsScaledVector) {
+    FakeModel model;
+    model.addF32("w", 2, 1, {1, 2});
+    const std::string h = model.hash("w");
+    const auto rune = makeRune({steerOp("blk.4", "v", -2.0)}, {{"v", {0.5f, 1.0f, -3.0f}}});
+    rn::RuneApplier applier;
+    const auto r = applier.apply(rune, kBase, model.resolver());
+    EXPECT_TRUE(r.has_value());
+    EXPECT_EQ(r->opsApplied, std::size_t{1});
+    EXPECT_TRUE(r->touched.empty());
+    EXPECT_EQ(r->steers.size(), std::size_t{1});
+    EXPECT_EQ(r->steers[0].block, 4U);
+    EXPECT_TRUE(r->steers[0].values == (std::vector<float>{-1.0f, -2.0f, 6.0f}));
+    EXPECT_EQ(model.hash("w"), h);
+    const auto bad = makeRune({steerOp("blk.0", "v", 1.0)},
+                              {{"v", {std::numeric_limits<float>::quiet_NaN()}}});
+    EXPECT_TRUE(!applier.apply(bad, kBase, model.resolver()).has_value());
+}
+
+TEST(apply_q8_0_columnMask_zeroesExactBlocksOnly) {
+    FakeModel model;
+    model.tensors["o"] = q8Tensor(128, 3);   // 4 blocks per row
+    const auto before = model.tensors["o"].bytes;
+    std::vector<float> mask(128, 1.0f);
+    std::fill(mask.begin() + 64, mask.begin() + 96, 0.0f);   // block 2 of every row
+    const auto rune = makeRune({scaleOp("o", model.hash("o"), "m", rn::RuneScaleAxis::Cols)},
+                               {{"m", mask}});
+    rn::RuneApplier applier;
+    EXPECT_TRUE(applier.apply(rune, kBase, model.resolver()).has_value());
+    const auto& after = model.tensors["o"].bytes;
+    for (std::size_t r = 0; r < 3; ++r) {
+        for (std::size_t j = 0; j < 4; ++j) {
+            for (std::size_t k = 0; k < 34; ++k) {
+                const std::size_t i = (r * 4 + j) * 34 + k;
+                if (j == 2) {
+                    EXPECT_TRUE(after[i] == std::byte{0});
+                } else {
+                    EXPECT_TRUE(after[i] == before[i]);
+                }
+            }
+        }
+    }
+    EXPECT_EQ(applier.rollback(), std::size_t{1});
+    EXPECT_TRUE(model.tensors["o"].bytes == before);
+}
+
+TEST(apply_q8_0_rejectsNonMaskAndPartialBlocks) {
+    FakeModel model;
+    model.tensors["o"] = q8Tensor(64, 2);
+    const auto before = model.tensors["o"].bytes;
+    rn::RuneApplier applier;
+    std::vector<float> half(64, 0.5f);
+    const auto a = applier.apply(makeRune({scaleOp("o", model.hash("o"), "m", rn::RuneScaleAxis::Cols)},
+                                          {{"m", half}}), kBase, model.resolver());
+    EXPECT_TRUE(!a.has_value());
+    std::vector<float> partial(64, 1.0f);
+    partial[5] = 0.0f;   // not uniform within block 0
+    const auto b = applier.apply(makeRune({scaleOp("o", model.hash("o"), "m", rn::RuneScaleAxis::Cols)},
+                                          {{"m", partial}}), kBase, model.resolver());
+    EXPECT_TRUE(!b.has_value());
+    EXPECT_TRUE(b.error().find("uniform") != std::string::npos);
+    const auto c = applier.apply(makeRune({writeSlice("o", model.hash("o"), "p", 0, 1)},
+                                          {{"p", std::vector<float>(64, 0.0f)}}), kBase, model.resolver());
+    EXPECT_TRUE(!c.has_value());
+    EXPECT_TRUE(model.tensors["o"].bytes == before);
+    // Row mask with 0/1 is fine.
+    EXPECT_TRUE(applier.apply(makeRune({scaleOp("o", model.hash("o"), "r", rn::RuneScaleAxis::Rows)},
+                                       {{"r", {1.0f, 0.0f}}}), kBase, model.resolver()).has_value());
+    for (std::size_t i = 68; i < 136; ++i) EXPECT_TRUE(model.tensors["o"].bytes[i] == std::byte{0});
 }
 
 int main() {
