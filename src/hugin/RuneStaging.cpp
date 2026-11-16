@@ -420,11 +420,13 @@ void RuneStaging::registerOn(McpServer& server) {
                                     {"max_control_logprob_drop", maxLpDrop}};
             json side = readSidecar(State::Staged, name);
             side["gate"]   = result;
-            side["status"] = green ? "staged (gate green)" : "rejected (gate red)";
+            const bool autoReject = !green && a.value("auto_reject", true);
+            side["status"] = green ? "staged (gate green)"
+                                   : (autoReject ? "rejected (gate red)" : "staged (gate red)");
             side["history"].push_back({{"at", nowIso()}, {"event", green ? "gate_green" : "gate_red"}});
             writeSidecar(State::Staged, name, side);
             audit(green ? "gate_green" : "gate_red", name, {{"rune_hash", hash}, {"reasons", reasons}});
-            if (!green && a.value("auto_reject", true)) {
+            if (autoReject) {
                 move(State::Staged, State::Rejected, name);
                 audit("auto_rollback", name, {{"to", "rejected"}});
                 result["moved_to"] = "rejected";
