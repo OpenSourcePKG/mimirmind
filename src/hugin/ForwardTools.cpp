@@ -479,13 +479,16 @@ void ForwardTools::registerOn(McpServer& server) {
         "MoE routing actually taken by the engine (stage tap at the router's selection, so it "
         "reflects bias / device top-K exactly). Per block: distinct experts used, load entropy, "
         "top experts by token count and by routing weight; 'position' adds that token's picks. "
-        "Supported: qwen35moe-family and kolibri1 backends.",
+        "With 'runes' the routing of the rune-applied model is reported (e.g. to prove an expert "
+        "disable). Supported: qwen35moe-family and kolibri1 backends.",
         schema(textProps({{"blocks", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
                           {"position", {{"type", "integer"}}},
-                          {"top_k", {{"type", "integer"}}}}),
+                          {"top_k", {{"type", "integer"}}},
+                          {"runes", {{"type", "array"}, {"items", {{"type", "string"}}}}}}),
                {}),
         [this](const json& a) {
-            Engine&    e   = base();
+            const auto runes = a.value("runes", std::vector<std::string>{});
+            Engine&    e   = runes.empty() ? base() : withRunes(runes);
             const auto ids = inputTokens(e, a);
             Engine::ForwardProbe probe;
             probe.stages = {"moe_topk_idx", "moe_topk_w"};
@@ -568,6 +571,9 @@ void ForwardTools::registerOn(McpServer& server) {
             for (const double c : totalCount) neverUsed += c == 0 ? 1U : 0U;
             json out{{"tokens", ids.size()}, {"experts", nExperts}, {"moe_blocks", blocks.size()},
                      {"never_used_experts", neverUsed}, {"top_overall", overall}, {"blocks", blocks}};
+            if (!runes.empty()) {
+                out["runes"] = runes;
+            }
             if (pos) {
                 out["position"] = *pos;
                 out["token_at_position"] = piece(e, ids[*pos]);
