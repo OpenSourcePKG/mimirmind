@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 /**
@@ -31,6 +32,12 @@ nlohmann::json textProps(nlohmann::json extra = nlohmann::json::object());
 
 /// Token ids from `tokens` or `text` (+ add_bos); throws when empty.
 std::vector<std::int32_t> inputTokens(const Engine& e, const nlohmann::json& a);
+
+/// Prompt text -> ids with special markup parsed (`<|im_start|>` etc. become
+/// their single token id, as the engine's chat-template path encodes them), so
+/// a rendered chat prompt reaches the forward exactly as in serving. Plain text
+/// without special markup encodes as before.
+std::vector<std::int32_t> encodeText(const Engine& e, std::string_view text, bool addBos);
 
 /// Same, for a text under a different key (e.g. "clean" / "corrupt").
 std::vector<std::int32_t> textTokens(const Engine& e, const std::string& text, bool addBos);

@@ -20,7 +20,8 @@ json schema(json properties, json required) {
 }
 
 json textProps(json extra) {
-    json p{{"text", {{"type", "string"}, {"description", "raw text (no chat template is applied)"}}},
+    json p{{"text", {{"type", "string"}, {"description", "raw text (no chat template is applied; special "
+                                                        "markup such as <|im_start|> maps to its token id)"}}},
            {"tokens", {{"type", "array"}, {"items", {{"type", "integer"}}},
                        {"description", "token ids; used instead of text when given"}}},
            {"add_bos", {{"type", "boolean"}, {"description", "prepend BOS when tokenizing text (default true)"}}}};
@@ -35,7 +36,7 @@ std::vector<std::int32_t> inputTokens(const Engine& e, const json& a) {
     if (a.contains("tokens")) {
         ids = a["tokens"].get<std::vector<std::int32_t>>();
     } else if (a.contains("text")) {
-        ids = e.tokenizer().encode(a["text"].get<std::string>(), a.value("add_bos", true));
+        ids = encodeText(e, a["text"].get<std::string>(), a.value("add_bos", true));
     } else {
         throw std::runtime_error("pass 'text' or 'tokens'");
     }
@@ -108,8 +109,12 @@ std::size_t positionArg(const json& a, std::size_t n) {
     return static_cast<std::size_t>(q);
 }
 
+std::vector<std::int32_t> encodeText(const Engine& e, std::string_view text, bool addBos) {
+    return e.tokenizer().encode(text, addBos, /*parseSpecial=*/true);
+}
+
 std::vector<std::int32_t> textTokens(const Engine& e, const std::string& text, bool addBos) {
-    auto ids = e.tokenizer().encode(text, addBos);
+    auto ids = encodeText(e, text, addBos);
     if (ids.empty()) {
         throw std::runtime_error("input tokenizes to zero tokens");
     }
@@ -201,7 +206,7 @@ json loadGoldset(const json& a) {
 /// One eval item on one engine: {"prompt", "expect"} (exact continuation) or
 /// {"prompt", "choices":[...], "answer": idx} (multiple choice by logprob).
 json evalItem(Engine& e, const json& item, bool addBos) {
-    const auto prompt = e.tokenizer().encode(item.at("prompt").get<std::string>(), addBos);
+    const auto prompt = encodeText(e, item.at("prompt").get<std::string>(), addBos);
     const auto encodeCont = [&](const std::string& t) { return e.tokenizer().encode(t, false); };
     if (item.contains("choices")) {
         const auto choices = item["choices"].get<std::vector<std::string>>();
