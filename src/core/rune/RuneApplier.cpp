@@ -89,22 +89,34 @@ std::size_t elemSize(RuneElemType t) noexcept {
     }
 }
 
+// Block-scaled encodings (Q8_0, FP8_E4M3_B32): f16 scale + 32 one-byte values
+// per block along ne0.
 constexpr std::size_t kQ8Block      = 32;
-constexpr std::size_t kQ8BlockBytes = 34;   // f16 scale + 32 x int8
+constexpr std::size_t kQ8BlockBytes = 34;
 
-/// Q8_0 Scale is exact only as masking: every factor 0 or 1, and for
-/// axis=cols uniform within each 32-column block.
-std::string checkQ8Mask(std::span<const float> p, RuneScaleAxis axis) {
+bool isBlockScaled(RuneElemType t) noexcept {
+    return t == RuneElemType::Q8_0 || t == RuneElemType::FP8_E4M3_B32;
+}
+
+const char* typeName(RuneElemType t) noexcept {
+    return t == RuneElemType::Q8_0 ? "Q8_0" : "FP8_E4M3";
+}
+
+/// Block-scaled Scale: finite non-negative factors, for axis=cols uniform
+/// within each 32-column block (one factor per block scale). Exactness of
+/// factors other than 0/1 is checked per block when applied.
+std::string checkBlockScale(RuneElemType t, std::span<const float> p, RuneScaleAxis axis) {
     for (const float f : p) {
-        if (f != 0.0F && f != 1.0F) {
-            return "Q8_0 targets accept only scale factors 0 or 1 (exact masking)";
+        if (!(f >= 0.0F)) {
+            return std::string{typeName(t)} + " targets accept only non-negative scale factors";
         }
     }
     if (axis == RuneScaleAxis::Cols) {
         for (std::size_t b = 0; b < p.size(); b += kQ8Block) {
             for (std::size_t k = 1; k < kQ8Block && b + k < p.size(); ++k) {
                 if (p[b + k] != p[b]) {
-                    return "Q8_0 column mask must be uniform within each 32-column block";
+                    return std::string{typeName(t)} +
+                           " column scale must be uniform within each 32-column block";
                 }
             }
         }
@@ -175,8 +187,8 @@ struct Geometry {
 std::string checkTarget(const RuneTensorView& v, Geometry& g) {
     if (v.type == RuneElemType::Unsupported) {
         return "target '" + v.name +
-               "' has a quantised/packed encoding — only F32/F16/BF16 targets are "
-               "patchable in this build";
+               "' has a quantised/packed encoding — only F32/F16/BF16 targets (and exact "
+               "block scales on Q8_0 / FP8_E4M3) are patchable in this build";
     }
     if (v.hasDerivedCopies) {
         return "target '" + v.name +
@@ -190,9 +202,9 @@ std::string checkTarget(const RuneTensorView& v, Geometry& g) {
     for (const auto d : v.dims) {
         n *= d;
     }
-    if (v.type == RuneElemType::Q8_0) {
+    if (isBlockScaled(v.type)) {
         if (v.dims[0] % kQ8Block != 0 || v.bytes.size() != n / kQ8Block * kQ8BlockBytes) {
-            return "target '" + v.name + "' Q8_0 byte size does not match dims";
+            return "target '" + v.name + "' " + typeName(v.type) + " byte size does not match dims";
         }
         g.cols = v.dims[0];
         g.rows = n / g.cols;
@@ -277,8 +289,9 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
         if (!allFinite(p)) {
             return std::unexpected(ctx + ": payload contains NaN/Inf");
         }
-        if (v.type == RuneElemType::Q8_0 && op.kind != RuneOpKind::Scale) {
-            return std::unexpected(ctx + ": Q8_0 targets accept only scale (0/1 masking)");
+        if (isBlockScaled(v.type) && op.kind != RuneOpKind::Scale) {
+            return std::unexpected(ctx + ": " + typeName(v.type) +
+                                   " targets accept only scale (exact block scales)");
         }
         if (op.kind == RuneOpKind::WriteSlice) {
             if (op.rowEnd > g.rows) {
@@ -296,8 +309,8 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
                 return std::unexpected(ctx + ": payload has " + std::to_string(p.size()) +
                                        " factors, expected " + std::to_string(want));
             }
-            if (v.type == RuneElemType::Q8_0) {
-                if (std::string err = checkQ8Mask(p, op.axis); !err.empty()) {
+            if (isBlockScaled(v.type)) {
+                if (std::string err = checkBlockScale(v.type, p, op.axis); !err.empty()) {
                     return std::unexpected(ctx + ": " + err);
                 }
             }
@@ -357,19 +370,39 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
         (void)checkTarget(v, g);
         const std::span<const float> p    = rune.payload(op.payload);
         std::byte*                   base = v.bytes.data();
-        if (v.type == RuneElemType::Q8_0) {
-            // Exact masking: a 0 factor zeroes the whole 32-element block
-            // (scale and quants); a 1 factor leaves it untouched.
+        if (isBlockScaled(v.type)) {
+            // Exact block scaling: a 0 factor zeroes the whole 32-element block
+            // (scale and values); 1 leaves it; any other factor multiplies the
+            // block's f16 scale and must be exact in f16, else the rune is refused.
             const std::uint64_t blocksPerRow = g.cols / kQ8Block;
             for (std::uint64_t r = 0; r < g.rows; ++r) {
                 for (std::uint64_t b = 0; b < blocksPerRow; ++b) {
-                    const float s = op.axis == RuneScaleAxis::Rows
+                    const float f = op.axis == RuneScaleAxis::Rows
                                         ? p[r] : p[static_cast<std::size_t>(b * kQ8Block)];
-                    if (s == 0.0F) {
-                        std::byte* blk = base + static_cast<std::size_t>(
-                                                    (r * blocksPerRow + b) * kQ8BlockBytes);
+                    std::byte* blk = base + static_cast<std::size_t>(
+                                                (r * blocksPerRow + b) * kQ8BlockBytes);
+                    if (f == 0.0F) {
                         std::fill_n(blk, kQ8BlockBytes, std::byte{0});
+                        continue;
                     }
+                    if (f == 1.0F) {
+                        continue;
+                    }
+                    std::uint16_t sBits = 0;
+                    std::memcpy(&sBits, blk, sizeof(sBits));
+                    const float         sOld  = halfBitsToFloat(sBits);
+                    const float         sNew  = sOld * f;
+                    const std::uint16_t nBits = floatToHalfBits(sNew);
+                    if (!std::isfinite(sNew) || halfBitsToFloat(nBits) != sNew ||
+                        static_cast<double>(sOld) * static_cast<double>(f) !=
+                            static_cast<double>(sNew)) {
+                        restore(backups);
+                        return std::unexpected(
+                            ctx + ": block scale " + std::to_string(sOld) + " x " +
+                            std::to_string(f) + " (row " + std::to_string(r) + ", block " +
+                            std::to_string(b) + ") is not exact in f16 — use a power-of-two factor");
+                    }
+                    std::memcpy(blk, &nBits, sizeof(nBits));
                 }
             }
         } else if (op.kind == RuneOpKind::WriteSlice) {

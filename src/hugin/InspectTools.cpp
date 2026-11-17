@@ -37,7 +37,8 @@ json tensorJson(const gg::GgufTensor& t) {
             {"cols", ModelView::colsOf(t)},
             {"bytes", t.nbytes},
             {"rune_patchable", patchable(t.type)},
-            {"rune_maskable", patchable(t.type) || t.type == gg::GgmlType::Q8_0}};
+            {"rune_maskable", patchable(t.type) || t.type == gg::GgmlType::Q8_0 ||
+                                  t.type == gg::GgmlType::FP8_E4M3}};
 }
 
 std::vector<std::string> stringList(const json& args, const char* key) {

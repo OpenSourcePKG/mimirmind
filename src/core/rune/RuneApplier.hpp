@@ -22,8 +22,12 @@ enum class RuneElemType : std::uint8_t {
     F32,
     F16,
     BF16,
-    Q8_0,          ///< GGML Q8_0 (f16 scale + 32 int8 per block along ne0): Scale with
-                   ///< 0/1 factors only (exact masking, e.g. head ablation)
+    Q8_0,          ///< GGML Q8_0 (f16 scale + 32 int8 per block along ne0): exact Scale
+                   ///< only (see FP8_E4M3_B32)
+    FP8_E4M3_B32,  ///< blocked FP8 (f16 scale + 32 E4M3 per block along ne0, the loader's
+                   ///< attention format): exact Scale only — factor 0 zeroes a block, any
+                   ///< other factor multiplies its f16 scale and must stay exactly
+                   ///< representable (powers of two), e.g. head ablation / amplification
     Unsupported,   ///< other quantised / packed layouts — refused, never silently skipped
 };
 
@@ -96,9 +100,11 @@ struct RuneApplyReport {
  *    (latest apply first) for a runtime undo without reloading the model.
  *
  * Math is done in F32 and rounded back to the target encoding with
- * round-to-nearest-even. Q8_0 targets accept only Scale with factors in
- * {0, 1} (uniform per 32-column block for axis=cols), which zeroes whole
- * blocks and is therefore exact.
+ * round-to-nearest-even. Block-scaled targets (Q8_0, FP8_E4M3_B32) accept only
+ * Scale with factors uniform per 32-column block (axis=cols): 0 zeroes the
+ * block, 1 leaves it, any other factor multiplies the block's f16 scale and
+ * is refused unless the product is exact in f16 (powers of two) — so a block
+ * Scale never introduces rounding.
  *
  * Steer ops touch no weight: they are validated (finite payload) and handed
  * back in `RuneApplyReport::steers` for the engine's residual overlay.

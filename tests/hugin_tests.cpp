@@ -125,10 +125,11 @@ TEST(mcp_initialize_and_toolsList) {
     }
     std::sort(names.begin(), names.end());
     EXPECT_TRUE(names == (std::vector<std::string>{"ablate_preview", "activations", "attention_pattern", "causal_trace",
-                                                   "eval", "expert_usage", "generate", "list_tensors", "logit_lens",
+                                                   "eval", "eval_preview", "expert_usage", "generate", "list_tensors", "logit_lens",
                                                    "model_info", "next_token", "open_model", "perplexity", "rune_check",
                                                    "rune_commit", "rune_compare", "rune_gate", "rune_inspect", "rune_list",
-                                                   "rune_rollback", "rune_stage_ablate", "rune_stage_experts", "rune_stage_steer",
+                                                   "rune_rollback", "rune_stage_ablate", "rune_stage_experts", "rune_stage_heads",
+                                                   "rune_stage_steer",
                                                    "steer_list", "steer_preview", "steer_vector", "tensor_hash",
                                                    "tensor_stats", "tokenize"}));
 }
@@ -214,13 +215,13 @@ TEST(tools_runeCheck_dryRun_matchesPrediction_andNeverWrites) {
     EXPECT_EQ(insp["ops"][0]["axis"].get<std::string>(), std::string{"cols"});
     EXPECT_EQ(insp["ops"][0]["payload_values"].get<int>(), 3);
 
-    // Q8_0 accepts only exact 0/1 masking (7.3); a 0.5 scale is refused.
+    // Q8_0 accepts only exact block scales (7.3); 0.3 is not exact in f16 and is refused.
     const std::string hashQ = f.call("tensor_hash", {{"name", "q"}}).second["tensor_hash"].get<std::string>();
-    const std::string quant = writeRune(base, "q", hashQ, std::vector<float>(32, 0.5f));
+    const std::string quant = writeRune(base, "q", hashQ, std::vector<float>(32, 0.3f));
     const auto [e3, rq] = f.call("rune_check", {{"paths", {quant}}});
     EXPECT_TRUE(!e3);
     EXPECT_TRUE(!rq["ok"].get<bool>());
-    EXPECT_TRUE(rq["error"].get<std::string>().find("0 or 1") != std::string::npos);
+    EXPECT_TRUE(rq["error"].get<std::string>().find("not exact") != std::string::npos);
     const std::string mask = writeRune(base, "q", hashQ, std::vector<float>(32, 0.0f));
     const auto [e5, rm] = f.call("rune_check", {{"paths", {mask}}});
     EXPECT_TRUE(!e5);
@@ -271,7 +272,10 @@ TEST(surgeryTools_withoutModel_reportToolError_steerListEmpty) {
         json{{"tool", "steer_vector"}, {"args", {{"name", "v"}, {"positive", {"a"}}, {"negative", {"b"}}, {"block", 0}}}},
         json{{"tool", "steer_preview"}, {"args", {{"text", "hi"}, {"vector", "v"}}}},
         json{{"tool", "ablate_preview"}, {"args", {{"text", "hi"}, {"block", 0}, {"heads", {0}}}}},
-        json{{"tool", "generate"}, {"args", {{"text", "hi"}}}}};
+        json{{"tool", "generate"}, {"args", {{"text", "hi"}}}},
+        json{{"tool", "eval_preview"},
+             {"args", {{"items", json::array({{{"prompt", "a"}, {"expect", "b"}}})},
+                       {"head_edits", json::array({{{"block", 0}, {"heads", {0}}, {"scale", 2.0}}})}}}}};
     for (const auto& c : calls) {
         const json r = call(c["tool"].get<std::string>().c_str(), c["args"]);
         EXPECT_TRUE(r["isError"].get<bool>());

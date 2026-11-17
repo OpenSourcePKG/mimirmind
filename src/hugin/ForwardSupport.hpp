@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -75,18 +76,26 @@ struct ContinuationScore {
     std::size_t tokens{0};
 };
 
+/// Installs per-forward interventions (7.3 previews) into a fresh probe for
+/// an n-token forward. Null = plain forward.
+using ProbeSetup = std::function<void(Engine::ForwardProbe& probe, std::size_t n)>;
+
 ContinuationScore scoreContinuation(Engine& e, const std::vector<std::int32_t>& prompt,
-                                    const std::vector<std::int32_t>& cont);
+                                    const std::vector<std::int32_t>& cont,
+                                    const ProbeSetup* setup = nullptr);
 
 /// Goldset items: inline `items` array or a .json (array) / .jsonl file at `path`.
 nlohmann::json loadGoldset(const nlohmann::json& a);
 
 /// One eval item: {"prompt", "expect"} (exact continuation, greedy match) or
 /// {"prompt", "choices":[...], "answer": idx} (multiple choice by logprob).
-nlohmann::json evalItem(Engine& e, const nlohmann::json& item, bool addBos);
+nlohmann::json evalItem(Engine& e, const nlohmann::json& item, bool addBos,
+                        const ProbeSetup* setup = nullptr);
 
 /// Whole goldset on one engine; per-item results land in rows[i]["base_or_run"].
 /// Summary: items, accuracy, mean_logprob (finite items), non_finite_items.
-nlohmann::json evalRun(Engine& e, const nlohmann::json& items, bool addBos, nlohmann::json& rows);
+/// `setup` (optional) applies the same interventions to every forward.
+nlohmann::json evalRun(Engine& e, const nlohmann::json& items, bool addBos, nlohmann::json& rows,
+                       const ProbeSetup* setup = nullptr);
 
 } // namespace mimirmind::hugin::forward_support

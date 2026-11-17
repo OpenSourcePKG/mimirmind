@@ -143,10 +143,25 @@ void Kolibri1Backend::runBlock(std::size_t   blockIdx,
     // Attention: full-causal on full layers (window 0), sliding-513 on SWA.
     const std::size_t window = isSliding ? _config.slidingWindow : 0;
     const float       scale  = _config.attentionScaleFor(headDim);
+
+    // 7.3 Hugin: post-norm/post-RoPE Q, the whole K/V history this attention
+    // reads (F32 cache rows [0, totalLen)), and the window, so attention
+    // patterns can be rebuilt exactly. No-op unless a stage tap asks.
+    tapStage(_gmm, _ops, "Qcur", L, qBuf, T, qDim);
+    tapStage(_gmm, _ops, "Kcur", L, static_cast<const float*>(cache.baseK(L)), totalLen, kvDim);
+    tapStage(_gmm, _ops, "Vcur", L, static_cast<const float*>(cache.baseV(L)), totalLen, kvDim);
+
     _ops.attentionAsync(qBuf, cache.baseK(L), cache.baseV(L),
                         /*T_q=*/T, /*T_k=*/totalLen, nHeads, nKvHeads, headDim,
                         /*positionOffset=*/curLen, scale, attnOut,
                         window, cache.dtype());
+
+    // 7.3 Hugin: per-head attention context before the O-projection, editable
+    // (head ablation / scaling previews), plus the exact score scale + window.
+    tapStageMutable(_gmm, _ops, "attn_ctx", L, attnOut, T, qDim);
+    tapStageHost("attn_scale", L, &scale, 1, 1);
+    const float windowF = static_cast<float>(window);
+    tapStageHost("attn_window", L, &windowF, 1, 1);
 
     // Output projection, post-attn norm, residual add.
     _gmm.matmulAsync(oW.type, oW.usmPtr, d_model, qDim, attnOut, T, projOut, scratch);

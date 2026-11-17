@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -339,11 +340,16 @@ void ForwardTools::registerOn(McpServer& server) {
         "the engine's own post-RoPE Q/K (stage tap) with the kernel's exact scale. Per head: "
         "entropy, weight on BOS and on itself, top-k attended tokens. 'consistency' compares "
         "weights x V against the attention output the kernel produced (proves the pattern). "
-        "Supported where the backend exposes the stages (llama / qwen2 today).",
+        "'span' [start, end) adds each head's weight mass on that token range and ranks the "
+        "heads by it (e.g. which heads read the system instruction). Sliding-window layers are "
+        "masked like the kernel. Supported where the backend exposes the stages (llama / qwen2 / "
+        "kolibri1 today).",
         schema(textProps({{"block", {{"type", "integer"}}},
                           {"heads", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
                           {"position", {{"type", "integer"}}},
                           {"top_k", {{"type", "integer"}}},
+                          {"span", {{"type", "array"}, {"items", {{"type", "integer"}}},
+                                    {"description", "[start, end) token positions"}}},
                           {"full", {{"type", "boolean"}, {"description", "include the full weight row per head"}}}}),
                {"block"}),
         [this](const json& a) {
@@ -352,7 +358,7 @@ void ForwardTools::registerOn(McpServer& server) {
             const auto blk = blockList(e, json{{"blocks", json::array({a.at("block")})}}).front();
             const std::size_t pos = positionArg(a, ids.size());
             Engine::ForwardProbe probe;
-            probe.stages      = {"Qcur", "Kcur", "Vcur", "attn_ctx", "attn_scale"};
+            probe.stages      = {"Qcur", "Kcur", "Vcur", "attn_ctx", "attn_scale", "attn_window"};
             probe.stageBlocks = {blk};
             (void)forward(e, ids, &probe);
             const auto get = [&](const char* name) -> const Engine::ForwardProbe::Stage& {
@@ -360,7 +366,7 @@ void ForwardTools::registerOn(McpServer& server) {
                 if (it == probe.stageData.end()) {
                     throw std::runtime_error("architecture '" + e.config().architecture +
                                              "' does not expose stage '" + name +
-                                             "' (attention_pattern supports llama/qwen2 today)");
+                                             "' (attention_pattern supports llama/qwen2/kolibri1 today)");
                 }
                 return it->second;
             };
@@ -369,12 +375,32 @@ void ForwardTools::registerOn(McpServer& server) {
             const auto& V = get("Vcur");
             const auto& C = get("attn_ctx");
             const double scale = get("attn_scale").data.at(0);
-            const std::size_t H   = e.config().headCount;
-            const std::size_t Hkv = e.config().headCountKv;
-            const std::size_t hd  = e.config().headDim();
-            if (Q.cols != H * hd || K.cols != Hkv * hd || V.cols != Hkv * hd || C.cols != H * hd ||
-                Q.rows != ids.size() || K.rows < ids.size()) {
+            // Per-layer geometry from the captured shapes (GQA width and head
+            // dim may differ per layer, e.g. kolibri1 SWA vs full layers).
+            const std::size_t H = e.config().headCount;
+            if (H == 0 || C.cols % H != 0) {
+                throw std::runtime_error("attn_ctx width is not a multiple of the head count");
+            }
+            const std::size_t hd  = C.cols / H;
+            const std::size_t Hkv = hd > 0 ? K.cols / hd : 0;
+            if (Q.cols != H * hd || Hkv == 0 || K.cols != Hkv * hd || V.cols != Hkv * hd ||
+                H % Hkv != 0 || Q.rows != ids.size() || K.rows < ids.size() || V.rows < ids.size()) {
                 throw std::runtime_error("unexpected stage shapes for attention_pattern");
+            }
+            std::size_t window = 0;
+            if (const auto it = probe.stageData.find({"attn_window", blk}); it != probe.stageData.end()) {
+                window = static_cast<std::size_t>(it->second.data.at(0));
+            }
+            std::size_t spanLo = 0, spanHi = 0;
+            const bool hasSpan = a.contains("span");
+            if (hasSpan) {
+                const auto sp = a["span"].get<std::vector<std::int64_t>>();
+                if (sp.size() != 2 || sp[0] < 0 || sp[1] <= sp[0] ||
+                    sp[1] > static_cast<std::int64_t>(ids.size())) {
+                    throw std::runtime_error("'span' must be [start, end) with 0 <= start < end <= tokens");
+                }
+                spanLo = static_cast<std::size_t>(sp[0]);
+                spanHi = static_cast<std::size_t>(sp[1]);
             }
             std::vector<std::size_t> heads;
             if (a.contains("heads")) {
@@ -389,15 +415,18 @@ void ForwardTools::registerOn(McpServer& server) {
             const std::size_t k = a.value("top_k", std::size_t{5});
             const bool full     = a.value("full", false);
             const std::size_t n = pos + 1;   // causal: keys 0..pos
+            // Sliding window as the kernel applies it: keys [n - window, n).
+            const std::size_t kMin = (window > 0 && n > window) ? n - window : 0;
             double maxErr = 0, maxRef = 0;
             std::vector<double> avg(n, 0.0);
             json out = json::array();
+            std::vector<std::pair<double, std::size_t>> bySpan;
             for (const auto h : heads) {
                 const std::size_t kvh = h / (H / Hkv);
                 const float* q = Q.data.data() + pos * Q.cols + h * hd;
-                std::vector<double> w(n);
+                std::vector<double> w(n, 0.0);
                 double mx = -1e300;
-                for (std::size_t j = 0; j < n; ++j) {
+                for (std::size_t j = kMin; j < n; ++j) {
                     const float* kr = K.data.data() + j * K.cols + kvh * hd;
                     double dot = 0;
                     for (std::size_t d = 0; d < hd; ++d) dot += static_cast<double>(q[d]) * static_cast<double>(kr[d]);
@@ -405,12 +434,13 @@ void ForwardTools::registerOn(McpServer& server) {
                     mx = std::max(mx, w[j]);
                 }
                 double z = 0;
-                for (auto& x : w) { x = std::exp(x - mx); z += x; }
-                double ent = 0;
-                for (std::size_t j = 0; j < n; ++j) {
+                for (std::size_t j = kMin; j < n; ++j) { w[j] = std::exp(w[j] - mx); z += w[j]; }
+                double ent = 0, spanW = 0;
+                for (std::size_t j = kMin; j < n; ++j) {
                     w[j] /= z;
                     avg[j] += w[j] / static_cast<double>(heads.size());
                     if (w[j] > 0) ent -= w[j] * std::log(w[j]);
+                    if (hasSpan && j >= spanLo && j < spanHi) spanW += w[j];
                 }
                 for (std::size_t d = 0; d < hd; ++d) {
                     double ctx = 0;
@@ -426,6 +456,10 @@ void ForwardTools::registerOn(McpServer& server) {
                 }
                 json o{{"head", h}, {"kv_head", kvh}, {"entropy", ent}, {"bos_weight", w[0]},
                        {"self_weight", w[pos]}, {"top", top}};
+                if (hasSpan) {
+                    o["span_weight"] = spanW;
+                    bySpan.emplace_back(spanW, h);
+                }
                 if (full) o["weights"] = w;
                 out.push_back(std::move(o));
             }
@@ -434,10 +468,19 @@ void ForwardTools::registerOn(McpServer& server) {
                 avgTop.push_back({{"pos", j}, {"token", piece(e, ids[static_cast<std::size_t>(j)])},
                                   {"weight", avg[static_cast<std::size_t>(j)]}});
             }
-            return json{{"block", blk}, {"position", pos}, {"query_token", piece(e, ids[pos])},
-                        {"heads", H}, {"kv_heads", Hkv}, {"head_dim", hd}, {"scale", scale},
-                        {"consistency", {{"max_abs_err", maxErr}, {"max_abs_ref", maxRef}}},
-                        {"head_average_top", avgTop}, {"per_head", out}};
+            json res{{"block", blk}, {"position", pos}, {"query_token", piece(e, ids[pos])},
+                     {"heads", H}, {"kv_heads", Hkv}, {"head_dim", hd}, {"scale", scale},
+                     {"window", window},
+                     {"consistency", {{"max_abs_err", maxErr}, {"max_abs_ref", maxRef}}},
+                     {"head_average_top", avgTop}, {"per_head", out}};
+            if (hasSpan) {
+                std::sort(bySpan.begin(), bySpan.end(), std::greater<>{});
+                json ranked = json::array();
+                for (const auto& [wgt, h] : bySpan) ranked.push_back({{"head", h}, {"span_weight", wgt}});
+                res["span"] = {spanLo, spanHi};
+                res["heads_by_span_weight"] = ranked;
+            }
+            return res;
         });
 
     server.addTool(

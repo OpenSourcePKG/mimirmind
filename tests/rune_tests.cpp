@@ -847,15 +847,17 @@ TEST(apply_q8_0_columnMask_zeroesExactBlocksOnly) {
     EXPECT_TRUE(model.tensors["o"].bytes == before);
 }
 
-TEST(apply_q8_0_rejectsNonMaskAndPartialBlocks) {
+TEST(apply_q8_0_rejectsInexactScaleAndPartialBlocks) {
     FakeModel model;
     model.tensors["o"] = q8Tensor(64, 2);
     const auto before = model.tensors["o"].bytes;
     rn::RuneApplier applier;
-    std::vector<float> half(64, 0.5f);
+    std::vector<float> inexact(64, 0.3f);   // 1.0 x 0.3 is not exact in f16
     const auto a = applier.apply(makeRune({scaleOp("o", model.hash("o"), "m", rn::RuneScaleAxis::Cols)},
-                                          {{"m", half}}), kBase, model.resolver());
+                                          {{"m", inexact}}), kBase, model.resolver());
     EXPECT_TRUE(!a.has_value());
+    EXPECT_TRUE(a.error().find("not exact") != std::string::npos);
+    EXPECT_TRUE(model.tensors["o"].bytes == before);
     std::vector<float> partial(64, 1.0f);
     partial[5] = 0.0f;   // not uniform within block 0
     const auto b = applier.apply(makeRune({scaleOp("o", model.hash("o"), "m", rn::RuneScaleAxis::Cols)},
@@ -870,6 +872,66 @@ TEST(apply_q8_0_rejectsNonMaskAndPartialBlocks) {
     EXPECT_TRUE(applier.apply(makeRune({scaleOp("o", model.hash("o"), "r", rn::RuneScaleAxis::Rows)},
                                        {{"r", {1.0f, 0.0f}}}), kBase, model.resolver()).has_value());
     for (std::size_t i = 68; i < 136; ++i) EXPECT_TRUE(model.tensors["o"].bytes[i] == std::byte{0});
+}
+
+TEST(apply_fp8_blockScale_powerOfTwo_isExact_onlyScaleFieldChanges) {
+    FakeModel model;
+    FakeTensor t = q8Tensor(128, 2);   // same 34-byte block layout: f16 scale + 32 bytes
+    t.type = rn::RuneElemType::FP8_E4M3_B32;
+    model.tensors["o"] = std::move(t);
+    const auto before = model.tensors["o"].bytes;
+    // "head" = columns 32..95 (blocks 1 and 2) amplified x4, block 3 ablated.
+    std::vector<float> f(128, 1.0f);
+    std::fill(f.begin() + 32, f.begin() + 96, 4.0f);
+    std::fill(f.begin() + 96, f.end(), 0.0f);
+    rn::RuneApplier applier;
+    EXPECT_TRUE(applier.apply(makeRune({scaleOp("o", model.hash("o"), "m", rn::RuneScaleAxis::Cols)},
+                                       {{"m", f}}), kBase, model.resolver()).has_value());
+    const auto& after = model.tensors["o"].bytes;
+    for (std::size_t r = 0; r < 2; ++r) {
+        for (std::size_t j = 0; j < 4; ++j) {
+            const std::size_t o = (r * 4 + j) * 34;
+            std::uint16_t sb = 0;
+            std::memcpy(&sb, after.data() + o, 2);
+            if (j == 0) {
+                EXPECT_TRUE(rn::halfBitsToFloat(sb) == 1.0f);
+            } else if (j < 3) {
+                EXPECT_TRUE(rn::halfBitsToFloat(sb) == 4.0f);
+            } else {
+                EXPECT_TRUE(sb == 0);
+            }
+            for (std::size_t k = 2; k < 34; ++k) {   // values untouched unless ablated
+                EXPECT_TRUE(after[o + k] == (j == 3 ? std::byte{0} : before[o + k]));
+            }
+        }
+    }
+    EXPECT_EQ(applier.rollback(), std::size_t{1});
+    EXPECT_TRUE(model.tensors["o"].bytes == before);
+}
+
+TEST(apply_fp8_blockScale_inexactOrOverflow_refused_andRestored) {
+    FakeModel model;
+    FakeTensor t = q8Tensor(64, 2);
+    t.type = rn::RuneElemType::FP8_E4M3_B32;
+    model.tensors["o"] = std::move(t);
+    const auto before = model.tensors["o"].bytes;
+    rn::RuneApplier applier;
+    // 1.0 x 5 = 5 is exact in f16 — fine; 1.0 x 65536 overflows f16.
+    std::vector<float> five(64, 1.0f);
+    std::fill(five.begin(), five.begin() + 32, 5.0f);
+    EXPECT_TRUE(applier.apply(makeRune({scaleOp("o", model.hash("o"), "m", rn::RuneScaleAxis::Cols)},
+                                       {{"m", five}}), kBase, model.resolver()).has_value());
+    EXPECT_EQ(applier.rollback(), std::size_t{1});
+    const auto big = applier.apply(makeRune({scaleOp("o", model.hash("o"), "m", rn::RuneScaleAxis::Cols)},
+                                            {{"m", std::vector<float>(64, 65536.0f)}}),
+                                   kBase, model.resolver());
+    EXPECT_TRUE(!big.has_value());
+    EXPECT_TRUE(big.error().find("not exact") != std::string::npos);
+    const auto neg = applier.apply(makeRune({scaleOp("o", model.hash("o"), "m", rn::RuneScaleAxis::Cols)},
+                                            {{"m", std::vector<float>(64, -2.0f)}}),
+                                   kBase, model.resolver());
+    EXPECT_TRUE(!neg.has_value());
+    EXPECT_TRUE(model.tensors["o"].bytes == before);
 }
 
 int main() {

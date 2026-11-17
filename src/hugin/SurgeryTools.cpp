@@ -25,14 +25,20 @@ constexpr std::size_t kAllPositions   = static_cast<std::size_t>(-1);
 constexpr std::size_t kMaxGenerate    = 256;
 constexpr std::size_t kDefaultForward = 400;
 
-/// One forward's interventions (steer and/or head ablation).
+/// Scale attention heads of one block (their attn_ctx slice, before the
+/// O-projection): 0 = ablation, > 1 = amplification.
+struct HeadEdit {
+    std::uint32_t            block{0};
+    std::vector<std::size_t> heads;
+    double                   scale{0};
+};
+
+/// One forward's interventions (steer and/or head edits).
 struct Interventions {
     const SurgeryTools::SteerVector* steer{nullptr};
     double                           alpha{0};
     bool                             steerLastOnly{false};
-    bool                             ablate{false};
-    std::uint32_t                    ablateBlock{0};
-    std::vector<std::size_t>         ablateHeads;
+    std::vector<HeadEdit>            headEdits;
 };
 
 std::uint32_t blockArg(const Engine& e, const json& v) {
@@ -65,11 +71,34 @@ bool lastOnlyArg(const json& a) {
     return m == "last";
 }
 
-/// Installs `iv` into `probe` for an n-token forward. The returned flag turns
-/// true once the backend actually reached the ablation stage — an
-/// architecture without an editable attn_ctx would otherwise silently no-op.
-std::shared_ptr<bool> install(const Engine& e, const Interventions& iv, std::size_t n, Probe& probe) {
-    auto reached = std::make_shared<bool>(!iv.ablate);
+/// {block, heads, scale (default 0)} -> HeadEdit.
+HeadEdit headEditArg(const Engine& e, const json& v) {
+    HeadEdit he;
+    he.block = blockArg(e, v.at("block"));
+    he.heads = headList(e, v.at("heads"));
+    he.scale = v.value("scale", 0.0);
+    if (!std::isfinite(he.scale)) {
+        throw std::runtime_error("head 'scale' must be finite");
+    }
+    return he;
+}
+
+/// Per-head-edit "reached" flags: an architecture without an editable attn_ctx
+/// would otherwise silently no-op.
+using Reached = std::shared_ptr<std::vector<char>>;
+
+void requireReached(const Engine& e, const Reached& reached) {
+    if (std::find(reached->begin(), reached->end(), char{0}) != reached->end()) {
+        throw std::runtime_error("architecture '" + e.config().architecture +
+                                 "' does not expose an editable attn_ctx stage "
+                                 "(head edits support llama / qwen2 / kolibri1 today)");
+    }
+}
+
+/// Installs `iv` into `probe` for an n-token forward, marking `reached[i]`
+/// once head edit i hit its stage.
+void installInto(const Engine& e, const Interventions& iv, std::size_t n, Probe& probe,
+                 const Reached& reached) {
     if (iv.steer != nullptr && iv.alpha != 0.0) {
         Probe::ResidualEdit re;
         re.block    = iv.steer->block;
@@ -81,40 +110,39 @@ std::shared_ptr<bool> install(const Engine& e, const Interventions& iv, std::siz
         }
         probe.residualEdits.push_back(std::move(re));
     }
-    if (iv.ablate) {
-        const std::size_t H     = e.config().headCount;
-        const auto        heads = iv.ablateHeads;
+    const std::size_t H = e.config().headCount;
+    for (std::size_t i = 0; i < iv.headEdits.size(); ++i) {
+        const HeadEdit& he = iv.headEdits[i];
         probe.stageEdits.push_back(Probe::StageEdit{
-            "attn_ctx", iv.ablateBlock,
-            [H, heads, reached](std::vector<float>& data, std::size_t rows, std::size_t cols) {
+            "attn_ctx", he.block,
+            [H, he, reached, i](std::vector<float>& data, std::size_t rows, std::size_t cols) {
                 if (H == 0 || cols % H != 0) {
                     throw std::runtime_error("attn_ctx width is not a multiple of the head count");
                 }
                 const std::size_t hd = cols / H;
+                const auto        f  = static_cast<float>(he.scale);
                 for (std::size_t r = 0; r < rows; ++r) {
-                    for (const auto h : heads) {
-                        std::fill_n(data.begin() + static_cast<std::ptrdiff_t>(r * cols + h * hd),
-                                    hd, 0.0F);
+                    for (const auto h : he.heads) {
+                        float* p = data.data() + r * cols + h * hd;
+                        for (std::size_t d = 0; d < hd; ++d) {
+                            p[d] = f == 0.0F ? 0.0F : p[d] * f;
+                        }
                     }
                 }
-                *reached = true;
+                (*reached)[i] = 1;
                 return true;
             }});
     }
-    return reached;
 }
 
 /// Forward with interventions; returns all logits rows.
 std::vector<std::vector<float>> runWith(Engine& e, std::span<const std::int32_t> ids,
                                         const Interventions& iv) {
     Probe probe;
-    const auto reached = install(e, iv, ids.size(), probe);
+    const auto reached = std::make_shared<std::vector<char>>(iv.headEdits.size(), char{0});
+    installInto(e, iv, ids.size(), probe, reached);
     auto lg = forward(e, ids, &probe);
-    if (!*reached) {
-        throw std::runtime_error("architecture '" + e.config().architecture +
-                                 "' does not expose an editable attn_ctx stage "
-                                 "(head ablation supports llama / qwen2 today)");
-    }
+    requireReached(e, reached);
     return lg;
 }
 
@@ -194,6 +222,7 @@ void SurgeryTools::dropStaleVectors() {
     const std::string key = _forward.targetKey();
     if (key != _vectorsKey) {
         _vectors.clear();
+        _baseEvals.clear();
         _vectorsKey = key;
     }
 }
@@ -208,6 +237,28 @@ const SurgeryTools::SteerVector& SurgeryTools::vector(const std::string& name) {
 }
 
 void SurgeryTools::registerOn(McpServer& server) {
+    // steer {vector, alpha, positions} / ablate {block, heads, scale} /
+    // head_edits [{block, heads, scale}] -> Interventions.
+    const auto interventionsArg = [this](const json& a) {
+        Engine&       e = _forward.engine();
+        Interventions iv;
+        if (a.contains("steer")) {
+            const json& st   = a["steer"];
+            iv.steer         = &vector(st.at("vector").get<std::string>());
+            iv.alpha         = st.value("alpha", 1.0);
+            iv.steerLastOnly = lastOnlyArg(st);
+        }
+        if (a.contains("ablate")) {
+            iv.headEdits.push_back(headEditArg(e, a["ablate"]));
+        }
+        if (a.contains("head_edits")) {
+            for (const auto& he : a["head_edits"]) {
+                iv.headEdits.push_back(headEditArg(e, he));
+            }
+        }
+        return iv;
+    };
+
     server.addTool(
         "causal_trace",
         "Activation patching (forward only). Runs the 'clean' and the 'corrupt' prompt (same token "
@@ -437,12 +488,14 @@ void SurgeryTools::registerOn(McpServer& server) {
     server.addTool(
         "ablate_preview",
         "Preview zeroing attention heads of one block (their slice of the attention output, "
-        "before the O-projection). With 'heads': next-token shift vs the intact model (KL, top-k, "
-        "optional target) and optional greedy text. With 'scan': each head ablated alone, ranked "
-        "by KL (and target-probability drop). Preview only — nothing is written. Supported where "
-        "the backend exposes an editable attn_ctx (llama / qwen2 today).",
+        "before the O-projection), or scaling them by 'scale' (default 0 = ablation, > 1 = "
+        "amplification). With 'heads': next-token shift vs the intact model (KL, top-k, "
+        "optional target) and optional greedy text. With 'scan': each head edited alone, ranked "
+        "by KL (and target-probability change). Preview only — nothing is written. Supported "
+        "where the backend exposes an editable attn_ctx (llama / qwen2 / kolibri1 today).",
         schema(textProps({{"block", {{"type", "integer"}}},
                           {"heads", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
+                          {"scale", {{"type", "number"}}},
                           {"scan", {{"type", "boolean"}}},
                           {"target", {{"type", "string"}}},
                           {"top_k", {{"type", "integer"}}},
@@ -452,8 +505,10 @@ void SurgeryTools::registerOn(McpServer& server) {
             Engine&    e   = _forward.engine();
             const auto ids = inputTokens(e, a);
             Interventions iv;
-            iv.ablate      = true;
-            iv.ablateBlock = blockArg(e, a.at("block"));
+            HeadEdit he;
+            he.block = blockArg(e, a.at("block"));
+            he.scale = a.value("scale", 0.0);
+            iv.headEdits = {he};
             const std::size_t k = a.value("top_k", std::size_t{5});
             const auto target   = targetArg(e, a);
             const auto baseLp   = lastLogProbs(e, ids, Interventions{});
@@ -463,7 +518,7 @@ void SurgeryTools::registerOn(McpServer& server) {
                 std::vector<Row> rows;
                 const auto b1 = LogitMath::topK(baseLp, 1).front();
                 for (std::size_t h = 0; h < H; ++h) {
-                    iv.ablateHeads = {h};
+                    iv.headEdits.front().heads = {h};
                     const auto lp = lastLogProbs(e, ids, iv);
                     double dT = 0;
                     if (target) {
@@ -479,15 +534,16 @@ void SurgeryTools::registerOn(McpServer& server) {
                     if (target) r["target_prob_delta"] = rows[i].dTarget;
                     out.push_back(std::move(r));
                 }
-                return json{{"block", iv.ablateBlock}, {"heads", H}, {"ranked", out}};
+                return json{{"block", he.block}, {"scale", he.scale}, {"heads", H}, {"ranked", out}};
             }
             if (!a.contains("heads")) {
                 throw std::runtime_error("pass 'heads' or 'scan': true");
             }
-            iv.ablateHeads = headList(e, a["heads"]);
+            iv.headEdits.front().heads = headList(e, a["heads"]);
             json out = shiftJson(e, baseLp, lastLogProbs(e, ids, iv), k, target);
-            out["block"] = iv.ablateBlock;
-            out["heads"] = iv.ablateHeads;
+            out["block"] = he.block;
+            out["heads"] = iv.headEdits.front().heads;
+            out["scale"] = he.scale;
             const std::size_t gen = maxTokensArg(a, 0);
             if (gen > 0) {
                 out["base_text"]    = e.tokenizer().decode(greedy(e, ids, gen, Interventions{}));
@@ -499,30 +555,91 @@ void SurgeryTools::registerOn(McpServer& server) {
     server.addTool(
         "generate",
         "Greedy continuation (repeated stateless forwards of the engine — slow, for inspection, "
-        "not serving), optionally with a steering vector {vector, alpha, positions} and/or a head "
-        "ablation {block, heads} applied to every forward.",
+        "not serving), optionally with a steering vector {vector, alpha, positions}, a head "
+        "ablation {block, heads, scale} and/or 'head_edits' [{block, heads, scale}] applied to "
+        "every forward.",
         schema(textProps({{"max_tokens", {{"type", "integer"}}},
                           {"steer", {{"type", "object"}}},
-                          {"ablate", {{"type", "object"}}}}),
+                          {"ablate", {{"type", "object"}}},
+                          {"head_edits", {{"type", "array"}, {"items", {{"type", "object"}}}}}}),
                {}),
-        [this](const json& a) {
+        [this, interventionsArg](const json& a) {
             Engine&    e   = _forward.engine();
             const auto ids = inputTokens(e, a);
-            Interventions iv;
-            if (a.contains("steer")) {
-                const json& s    = a["steer"];
-                iv.steer         = &vector(s.at("vector").get<std::string>());
-                iv.alpha         = s.value("alpha", 1.0);
-                iv.steerLastOnly = lastOnlyArg(s);
-            }
-            if (a.contains("ablate")) {
-                iv.ablate      = true;
-                iv.ablateBlock = blockArg(e, a["ablate"].at("block"));
-                iv.ablateHeads = headList(e, a["ablate"].at("heads"));
-            }
+            const Interventions iv = interventionsArg(a);
             const auto out = greedy(e, ids, maxTokensArg(a, 32), iv);
             return json{{"prompt_tokens", ids.size()}, {"tokens", out},
                         {"text", e.tokenizer().decode(out)}};
+        });
+
+    server.addTool(
+        "eval_preview",
+        "Goldset eval (same items and scoring as 'eval') with interventions applied to every "
+        "forward: 'steer' {vector, alpha, positions} and/or 'head_edits' [{block, heads, scale}] "
+        "(scale 0 = ablate, > 1 = amplify). Compares against the unedited model; the base result "
+        "of a goldset 'path' is cached for this model, so sweeps only pay the edited runs. "
+        "Preview only — nothing is written; a passing setting is then written as a Rune.",
+        schema({{"items", {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                {"path", {{"type", "string"}}},
+                {"steer", {{"type", "object"}}},
+                {"head_edits", {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                {"add_bos", {{"type", "boolean"}}},
+                {"detail", {{"type", "boolean"}}}}),
+        [this, interventionsArg](const json& a) {
+            Engine& e = _forward.engine();
+            dropStaleVectors();   // also drops cached base evals of another model
+            const json items = loadGoldset(a);
+            if (!items.is_array() || items.empty()) {
+                throw std::runtime_error("goldset is empty");
+            }
+            const bool addBos = a.value("add_bos", true);
+            const Interventions iv = interventionsArg(a);
+            if (iv.headEdits.empty() && (iv.steer == nullptr || iv.alpha == 0.0)) {
+                throw std::runtime_error("pass 'steer' (alpha != 0) and/or 'head_edits'");
+            }
+
+            json baseSum, baseRows = json::array();
+            const std::string cacheKey =
+                a.contains("path") ? a["path"].get<std::string>() + (addBos ? "#bos" : "#nobos") : "";
+            bool cached = false;
+            if (const auto it = _baseEvals.find(cacheKey); !cacheKey.empty() && it != _baseEvals.end()) {
+                baseSum  = it->second.first;
+                baseRows = it->second.second;
+                cached   = true;
+            } else {
+                baseSum = evalRun(e, items, addBos, baseRows);
+                if (!cacheKey.empty()) {
+                    _baseEvals[cacheKey] = {baseSum, baseRows};
+                }
+            }
+
+            const auto reached = std::make_shared<std::vector<char>>(iv.headEdits.size(), char{0});
+            const ProbeSetup setup = [&](Probe& probe, std::size_t n) {
+                installInto(e, iv, n, probe, reached);
+            };
+            json editRows = json::array();
+            const json editSum = evalRun(e, items, addBos, editRows, &setup);
+            requireReached(e, reached);
+
+            json out{{"base", baseSum}, {"edited", editSum}, {"base_cached", cached},
+                     {"delta_accuracy",
+                      editSum["accuracy"].get<double>() - baseSum["accuracy"].get<double>()},
+                     {"delta_mean_logprob",
+                      editSum["mean_logprob"].get<double>() - baseSum["mean_logprob"].get<double>()}};
+            json flips = json::array(), rows = json::array();
+            for (std::size_t i = 0; i < editRows.size(); ++i) {
+                const json& b = baseRows[i]["base_or_run"];
+                const json& r = editRows[i]["base_or_run"];
+                if (b["correct"] != r["correct"]) {
+                    flips.push_back({{"index", i}, {"id", editRows[i]["id"]}, {"now_correct", r["correct"]}});
+                }
+                rows.push_back({{"index", i}, {"id", editRows[i]["id"]}, {"base", b}, {"edited", r}});
+            }
+            out["flips"] = flips;
+            if (a.value("detail", false)) {
+                out["per_item"] = rows;
+            }
+            return out;
         });
 }
 

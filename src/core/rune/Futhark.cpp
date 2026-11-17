@@ -19,6 +19,7 @@ RuneElemType elemTypeOf(gguf::GgmlType t) noexcept {
         case gguf::GgmlType::F16:  return RuneElemType::F16;
         case gguf::GgmlType::BF16: return RuneElemType::BF16;
         case gguf::GgmlType::Q8_0: return RuneElemType::Q8_0;
+        case gguf::GgmlType::FP8_E4M3: return RuneElemType::FP8_E4M3_B32;
         default:                   return RuneElemType::Unsupported;
     }
 }

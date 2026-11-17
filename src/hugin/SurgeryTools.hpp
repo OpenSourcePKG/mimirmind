@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <map>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -29,9 +30,12 @@ class ForwardTools;
  *                    prompt sets (mean residual difference, last position)
  *  - steer_preview   next-token shift (KL, top-k) and optional greedy text,
  *                    base vs steered
- *  - ablate_preview  zero attention heads of one block (pre O-projection):
- *                    shift, or a per-head scan ranked by effect
- *  - generate        greedy continuation with optional steer / ablate
+ *  - ablate_preview  zero (or scale by 'scale') attention heads of one block
+ *                    (pre O-projection): shift, or a per-head scan ranked by
+ *                    effect
+ *  - generate        greedy continuation with optional steer / head edits
+ *  - eval_preview    goldset eval (as `eval`) with steer / head edits applied
+ *                    to every forward, against the cached base result
  *  - steer_list      steering vectors of this session
  *
  * Steering vectors live in the session and are dropped when open_model
@@ -62,6 +66,8 @@ private:
     ForwardTools&                        _forward;
     std::string                          _vectorsKey;
     std::map<std::string, SteerVector>   _vectors;
+    /// eval_preview base results per goldset path (dropped with the vectors).
+    std::map<std::string, std::pair<nlohmann::json, nlohmann::json>> _baseEvals;
 };
 
 } // namespace mimirmind::hugin

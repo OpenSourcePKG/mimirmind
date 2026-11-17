@@ -150,13 +150,18 @@ double perplexityOf(const std::vector<double>& lps) {
 
 /// Teacher-forced score of `cont` after `prompt` in one forward.
 ContinuationScore scoreContinuation(Engine& e, const std::vector<std::int32_t>& prompt,
-                                    const std::vector<std::int32_t>& cont) {
+                                    const std::vector<std::int32_t>& cont,
+                                    const ProbeSetup* setup) {
     if (prompt.empty() || cont.empty()) {
         throw std::runtime_error("eval item needs a non-empty prompt and continuation");
     }
     std::vector<std::int32_t> ids = prompt;
     ids.insert(ids.end(), cont.begin(), cont.end());
-    const auto lg = forward(e, ids);
+    Engine::ForwardProbe probe;
+    if (setup != nullptr && *setup) {
+        (*setup)(probe, ids.size());
+    }
+    const auto lg = forward(e, ids, (setup != nullptr && *setup) ? &probe : nullptr);
     ContinuationScore sc;
     sc.tokens = cont.size();
     for (std::size_t j = 0; j < cont.size(); ++j) {
@@ -205,7 +210,7 @@ json loadGoldset(const json& a) {
 
 /// One eval item on one engine: {"prompt", "expect"} (exact continuation) or
 /// {"prompt", "choices":[...], "answer": idx} (multiple choice by logprob).
-json evalItem(Engine& e, const json& item, bool addBos) {
+json evalItem(Engine& e, const json& item, bool addBos, const ProbeSetup* setup) {
     const auto prompt = encodeText(e, item.at("prompt").get<std::string>(), addBos);
     const auto encodeCont = [&](const std::string& t) { return e.tokenizer().encode(t, false); };
     if (item.contains("choices")) {
@@ -216,23 +221,23 @@ json evalItem(Engine& e, const json& item, bool addBos) {
         }
         std::vector<double> lps;
         for (const auto& c : choices) {
-            lps.push_back(scoreContinuation(e, prompt, encodeCont(c)).logprob);
+            lps.push_back(scoreContinuation(e, prompt, encodeCont(c), setup).logprob);
         }
         const auto best = static_cast<std::size_t>(
             std::max_element(lps.begin(), lps.end()) - lps.begin());
         return json{{"kind", "choice"}, {"correct", best == answer}, {"picked", best},
                     {"logprob", lps[answer]}, {"choice_logprobs", lps}};
     }
-    const auto sc = scoreContinuation(e, prompt, encodeCont(item.at("expect").get<std::string>()));
+    const auto sc = scoreContinuation(e, prompt, encodeCont(item.at("expect").get<std::string>()), setup);
     return json{{"kind", "expect"}, {"correct", sc.greedyMatch}, {"logprob", sc.logprob},
                 {"tokens", sc.tokens}, {"first_rank", sc.firstRank}};
 }
 
-json evalRun(Engine& e, const json& items, bool addBos, json& rows) {
+json evalRun(Engine& e, const json& items, bool addBos, json& rows, const ProbeSetup* setup) {
     std::size_t correct = 0, nonFinite = 0;
     double      lpSum   = 0;
     for (std::size_t i = 0; i < items.size(); ++i) {
-        json r = evalItem(e, items[i], addBos);
+        json r = evalItem(e, items[i], addBos, setup);
         correct += r["correct"].get<bool>() ? 1U : 0U;
         const double lp = r["logprob"].get<double>();
         if (std::isfinite(lp)) {

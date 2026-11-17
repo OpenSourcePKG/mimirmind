@@ -18,6 +18,7 @@
 #include <ctime>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <stdexcept>
 
@@ -183,6 +184,144 @@ json RuneStaging::stage(const std::string& name, const std::string& kind,
                 {"rune_hash", hash}, {"next", "rune_gate"}};
 }
 
+json RuneStaging::stageHeadScales(const json& a, const std::string& name, const std::string& kind,
+                                  std::vector<HeadScale> specs) const {
+    const auto t = _forward.target();
+    if (t.path.empty()) {
+        throw std::runtime_error("no model loaded — call open_model first");
+    }
+    if (specs.empty()) {
+        throw std::runtime_error("no head edits given");
+    }
+    const bool checkpoint = fs::is_directory(t.path);
+    // GGUF: the file bytes. Checkpoint: the bytes the engine holds after load
+    // (e.g. FP8 attention requantised to 32-blocks) — what Futhark hashes.
+    std::optional<ModelView> mv;
+    if (!checkpoint) {
+        mv.emplace(t.path);
+    }
+    const std::string base = checkpoint ? baseFingerprint() : mv->fingerprint();
+    Engine& e = _forward.engine();
+    const std::size_t H  = e.config().headCount;
+    const double maxFrac  = budgetArg(a, "max_head_fraction", 0.25, kMaxHeadFraction);
+    const double maxScale = budgetArg(a, "max_scale", 8.0, kMaxHeadScale);
+
+    std::sort(specs.begin(), specs.end(),
+              [](const HeadScale& x, const HeadScale& y) { return x.block < y.block; });
+    rn::RuneManifest man;
+    man.name            = name;
+    man.baseFingerprint = base;
+    std::vector<std::pair<std::string, std::vector<float>>> payloads;
+    json edits = json::array();
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+        HeadScale& sp = specs[i];
+        if (i > 0 && specs[i - 1].block == sp.block) {
+            throw std::runtime_error("block " + std::to_string(sp.block) +
+                                     " appears twice — one head_edits entry per block");
+        }
+        const auto blk = blockList(e, json{{"blocks", json::array({sp.block})}}).front();
+        std::sort(sp.heads.begin(), sp.heads.end());
+        sp.heads.erase(std::unique(sp.heads.begin(), sp.heads.end()), sp.heads.end());
+        if (sp.heads.empty()) {
+            throw std::runtime_error("'heads' must not be empty (block " + std::to_string(blk) + ")");
+        }
+        if (sp.heads.back() >= H) {
+            throw std::runtime_error("head " + std::to_string(sp.heads.back()) + " out of range");
+        }
+        if (!std::isfinite(sp.scale) || sp.scale < 0.0 || sp.scale > maxScale) {
+            throw std::runtime_error("edit budget exceeded: scale " + std::to_string(sp.scale) +
+                                     " must be in [0, max_scale " + std::to_string(maxScale) + "]");
+        }
+        const double frac = static_cast<double>(sp.heads.size()) / static_cast<double>(H);
+        if (frac > maxFrac) {
+            throw std::runtime_error("edit budget exceeded: " + std::to_string(sp.heads.size()) + "/" +
+                                     std::to_string(H) + " heads in block " + std::to_string(blk) +
+                                     " > max_head_fraction " + std::to_string(maxFrac));
+        }
+        const std::string target = "blk." + std::to_string(blk) + ".attn_output.weight";
+        gg::GgmlType          type{};
+        std::uint64_t         cols = 0;
+        std::vector<std::uint8_t> bytes;
+        if (mv) {
+            const auto& tensor = mv->require(target);
+            type  = tensor.type;
+            cols  = ModelView::colsOf(tensor);
+            const auto b = mv->bytes(tensor);
+            bytes.assign(b.begin(), b.end());
+        } else {
+            const auto* tensor = e.weights().find(target);
+            if (tensor == nullptr || tensor->usmPtr == nullptr || tensor->dimensions.empty()) {
+                throw std::runtime_error("'" + target + "' not found in the loaded model");
+            }
+            type = tensor->type;
+            cols = tensor->dimensions[0];
+            bytes.resize(tensor->nbytes);
+            e.ops()->readbackToHost(bytes.data(), tensor->usmPtr, bytes.size());
+        }
+        const bool blockScaled = type == gg::GgmlType::Q8_0 || type == gg::GgmlType::FP8_E4M3;
+        const bool okType = blockScaled || type == gg::GgmlType::F32 || type == gg::GgmlType::F16 ||
+                            type == gg::GgmlType::BF16;
+        if (!okType) {
+            throw std::runtime_error("'" + target + "' is " + std::string{gg::typeInfo(type).name} +
+                                     " — head runes support F32/F16/BF16/Q8_0/FP8_E4M3 only");
+        }
+        if (H == 0 || cols % H != 0) {
+            throw std::runtime_error("'" + target + "' has " + std::to_string(cols) +
+                                     " input columns, not a multiple of the head count " +
+                                     std::to_string(H));
+        }
+        const std::size_t hd = static_cast<std::size_t>(cols / H);
+        if (blockScaled) {
+            if (hd % 32 != 0) {
+                throw std::runtime_error("head_dim is not a multiple of the 32-element block");
+            }
+            if (sp.scale != 0.0 && sp.scale != 1.0 &&
+                std::exp2(std::round(std::log2(sp.scale))) != sp.scale) {
+                throw std::runtime_error("'" + target + "' is block-scaled (" +
+                                         std::string{gg::typeInfo(type).name} +
+                                         "): the scale must be 0 or a power of two to stay exact");
+            }
+        }
+        std::vector<float> factors(static_cast<std::size_t>(cols), 1.0F);
+        for (const auto h : sp.heads) {
+            std::fill_n(factors.begin() + static_cast<std::ptrdiff_t>(h * hd), hd,
+                        static_cast<float>(sp.scale));
+        }
+        rn::RuneOp op;
+        op.kind       = rn::RuneOpKind::Scale;
+        op.target     = target;
+        op.tensorHash = rn::tensorContentHash(bytes.data(), bytes.size());
+        op.payload    = "heads." + target;
+        op.axis       = rn::RuneScaleAxis::Cols;
+        man.ops.push_back(op);
+        payloads.emplace_back(op.payload, std::move(factors));
+        edits.push_back({{"block", blk}, {"heads", sp.heads}, {"scale", sp.scale},
+                         {"head_fraction", frac}, {"target", target},
+                         {"target_type", std::string{gg::typeInfo(type).name}}});
+    }
+    json params{{"head_edits", edits}, {"block_heads", H}};
+    if (edits.size() == 1) {   // single-block summary (rune_stage_ablate compatibility)
+        params["block"]         = edits[0]["block"];
+        params["heads"]         = edits[0]["heads"];
+        params["head_fraction"] = edits[0]["head_fraction"];
+        params["target"]        = edits[0]["target"];
+        params["target_type"]   = edits[0]["target_type"];
+    }
+    man.provenanceJson = json{{"tool", "hugin"}, {"hugin_version", _version},
+                              {"kind", kind}, {"created_at", nowIso()},
+                              {"note", a.value("note", std::string{})},
+                              {"params", params},
+                              {"budget", {{"max_head_fraction", maxFrac}, {"max_scale", maxScale}}}}.dump();
+    std::map<std::string, std::vector<float>> payloadMap;
+    for (auto& [k, v] : payloads) {
+        payloadMap.emplace(k, std::move(v));
+    }
+    const rn::RuneFile rune{std::move(man), std::move(payloadMap)};
+    json out = stage(name, kind, rune.serialize(), params);
+    out["base_fingerprint"] = rune.manifest().baseFingerprint;
+    return out;
+}
+
 void RuneStaging::registerOn(McpServer& server) {
     server.addTool(
         "rune_stage_steer",
@@ -240,9 +379,9 @@ void RuneStaging::registerOn(McpServer& server) {
         "rune_stage_ablate",
         "Write a head ablation as a staged Rune: a 0/1 column Scale on blk.<block>.attn_output."
         "weight that zeroes the given heads' input columns of the O-projection (= the "
-        "ablate_preview intervention baked into the weight). Needs a GGUF target with "
-        "F32/F16/BF16 or Q8_0 attn_output (Q8_0: exact block masking). Guardrail: heads / "
-        "block heads <= 'max_head_fraction' (default 0.25, ceiling 0.5).",
+        "ablate_preview intervention baked into the weight). Same targets as rune_stage_heads "
+        "(F32/F16/BF16, exact Q8_0 / FP8_E4M3 block masking; GGUF and NVFP4 checkpoints). "
+        "Guardrail: heads / block heads <= 'max_head_fraction' (default 0.25, ceiling 0.5).",
         schema({{"name", {{"type", "string"}}},
                 {"block", {{"type", "integer"}}},
                 {"heads", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
@@ -251,84 +390,40 @@ void RuneStaging::registerOn(McpServer& server) {
                {"name", "block", "heads"}),
         [this](const json& a) {
             const std::string name = checkedName(a);
-            const auto t = _forward.target();
-            if (t.path.empty()) {
-                throw std::runtime_error("no model loaded — call open_model first");
+            HeadScale spec;
+            spec.block = static_cast<std::uint32_t>(a.at("block").get<std::int64_t>());
+            spec.heads = a.at("heads").get<std::vector<std::size_t>>();
+            spec.scale = 0.0;
+            return stageHeadScales(a, name, "ablate_heads", {spec});
+        });
+
+    server.addTool(
+        "rune_stage_heads",
+        "Write a head scaling as a staged Rune: for each {block, heads, scale} a column Scale on "
+        "blk.<block>.attn_output.weight that multiplies those heads' input columns of the "
+        "O-projection by 'scale' (0 = ablate, > 1 = amplify) — the ablate_preview / eval_preview "
+        "head_edits intervention baked into the weight. Targets: F32/F16/BF16 attn_output "
+        "(rounded to the encoding), Q8_0 / FP8_E4M3 block scales (exact: 0 or power-of-two "
+        "factors), GGUF and NVFP4 checkpoints. Guardrails: heads per block / block heads <= "
+        "'max_head_fraction' (default 0.25, ceiling 0.5) and scale <= 'max_scale' (default 8, "
+        "ceiling 16).",
+        schema({{"name", {{"type", "string"}}},
+                {"head_edits", {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                {"max_head_fraction", {{"type", "number"}}},
+                {"max_scale", {{"type", "number"}}},
+                {"note", {{"type", "string"}}}},
+               {"name", "head_edits"}),
+        [this](const json& a) {
+            const std::string name = checkedName(a);
+            std::vector<HeadScale> specs;
+            for (const auto& he : a.at("head_edits")) {
+                HeadScale spec;
+                spec.block = static_cast<std::uint32_t>(he.at("block").get<std::int64_t>());
+                spec.heads = he.at("heads").get<std::vector<std::size_t>>();
+                spec.scale = he.value("scale", 0.0);
+                specs.push_back(std::move(spec));
             }
-            if (fs::is_directory(t.path)) {
-                throw std::runtime_error("head-ablation runes need a GGUF model (NVFP4 attn_output "
-                                         "is not maskable exactly in this build)");
-            }
-            Engine& e = _forward.engine();
-            const auto blk = blockList(e, json{{"blocks", json::array({a.at("block")})}}).front();
-            const std::size_t H  = e.config().headCount;
-            const std::size_t hd = e.config().headDim();
-            std::vector<std::size_t> heads;
-            for (const auto& h : a.at("heads")) {
-                const auto v = h.get<std::int64_t>();
-                if (v < 0 || v >= static_cast<std::int64_t>(H)) {
-                    throw std::runtime_error("head " + std::to_string(v) + " out of range");
-                }
-                heads.push_back(static_cast<std::size_t>(v));
-            }
-            std::sort(heads.begin(), heads.end());
-            heads.erase(std::unique(heads.begin(), heads.end()), heads.end());
-            if (heads.empty()) {
-                throw std::runtime_error("'heads' must not be empty");
-            }
-            const double maxFrac = budgetArg(a, "max_head_fraction", 0.25, kMaxHeadFraction);
-            const double frac    = static_cast<double>(heads.size()) / static_cast<double>(H);
-            if (frac > maxFrac) {
-                throw std::runtime_error("edit budget exceeded: " + std::to_string(heads.size()) + "/" +
-                                         std::to_string(H) + " heads > max_head_fraction " +
-                                         std::to_string(maxFrac));
-            }
-            const ModelView mv{t.path};
-            const std::string target = "blk." + std::to_string(blk) + ".attn_output.weight";
-            const auto& tensor = mv.require(target);
-            const bool okType = tensor.type == gg::GgmlType::F32 || tensor.type == gg::GgmlType::F16 ||
-                                tensor.type == gg::GgmlType::BF16 || tensor.type == gg::GgmlType::Q8_0;
-            if (!okType) {
-                throw std::runtime_error("'" + target + "' is " +
-                                         std::string{gg::typeInfo(tensor.type).name} +
-                                         " — ablation runes support F32/F16/BF16/Q8_0 only");
-            }
-            const std::size_t cols = ModelView::colsOf(tensor);
-            if (cols != H * hd) {
-                throw std::runtime_error("'" + target + "' has " + std::to_string(cols) +
-                                         " input columns, expected heads x head_dim = " +
-                                         std::to_string(H * hd));
-            }
-            if (tensor.type == gg::GgmlType::Q8_0 && hd % 32 != 0) {
-                throw std::runtime_error("head_dim is not a multiple of the Q8_0 block (32)");
-            }
-            std::vector<float> factors(cols, 1.0F);
-            for (const auto h : heads) {
-                std::fill_n(factors.begin() + static_cast<std::ptrdiff_t>(h * hd), hd, 0.0F);
-            }
-            const auto bytes = mv.bytes(tensor);
-            json params{{"block", blk}, {"heads", heads}, {"block_heads", H},
-                        {"head_fraction", frac}, {"target", target},
-                        {"target_type", std::string{gg::typeInfo(tensor.type).name}}};
-            rn::RuneManifest man;
-            man.name            = name;
-            man.baseFingerprint = mv.fingerprint();
-            man.provenanceJson  = json{{"tool", "hugin"}, {"hugin_version", _version},
-                                       {"kind", "ablate_heads"}, {"created_at", nowIso()},
-                                       {"note", a.value("note", std::string{})},
-                                       {"params", params},
-                                       {"budget", {{"max_head_fraction", maxFrac}}}}.dump();
-            rn::RuneOp op;
-            op.kind       = rn::RuneOpKind::Scale;
-            op.target     = target;
-            op.tensorHash = rn::tensorContentHash(bytes.data(), bytes.size());
-            op.payload    = "mask." + target;
-            op.axis       = rn::RuneScaleAxis::Cols;
-            man.ops.push_back(op);
-            const rn::RuneFile rune{std::move(man), {{op.payload, std::move(factors)}}};
-            json out = stage(name, "ablate_heads", rune.serialize(), params);
-            out["base_fingerprint"] = rune.manifest().baseFingerprint;
-            return out;
+            return stageHeadScales(a, name, "scale_heads", std::move(specs));
         });
 
     server.addTool(

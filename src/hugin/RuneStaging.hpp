@@ -7,8 +7,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace mimirmind::hugin {
 
@@ -34,8 +37,13 @@ class SurgeryTools;
  *  - rune_stage_steer   session steering vector -> Steer op (overlay after a
  *                       block); budget: |alpha|·||v|| / mean residual norm
  *  - rune_stage_ablate  zero attention heads via a 0/1 column Scale on
- *                       blk.N.attn_output.weight (F32/F16/BF16, exact Q8_0
- *                       masking); budget: fraction of the block's heads
+ *                       blk.N.attn_output.weight; budget: fraction of the
+ *                       block's heads
+ *  - rune_stage_heads   scale attention heads of one or more blocks (0 =
+ *                       ablate, > 1 = amplify) via column Scales on the
+ *                       O-projections (F32/F16/BF16, exact block scales on
+ *                       Q8_0 / FP8_E4M3 — GGUF and NVFP4 checkpoints);
+ *                       budget: head fraction per block + max scale
  *  - rune_stage_experts disable MoE experts of one block via a router Mask op
  *                       (engine overlay: logit -> -inf before top-K, any
  *                       weight format); budget: fraction of the block's experts
@@ -57,6 +65,7 @@ public:
     static constexpr double kMaxSteerRelativeNorm = 2.0;
     static constexpr double kMaxHeadFraction      = 0.5;
     static constexpr double kMaxExpertFraction    = 0.25;
+    static constexpr double kMaxHeadScale         = 16.0;
 
 private:
     enum class State { Staged, Committed, Rejected };
@@ -76,6 +85,17 @@ private:
 
     /// Base fingerprint of the current target (what the rune binds to).
     [[nodiscard]] std::string baseFingerprint() const;
+
+    /// Scale `heads` of `block` by `scale` (0 = ablate).
+    struct HeadScale {
+        std::uint32_t            block{0};
+        std::vector<std::size_t> heads;
+        double                   scale{0};
+    };
+    /// Column-Scale rune over blk.N.attn_output.weight for every spec, bound
+    /// to the target bytes the engine actually holds; budgets from `a`.
+    nlohmann::json stageHeadScales(const nlohmann::json& a, const std::string& name,
+                                   const std::string& kind, std::vector<HeadScale> specs) const;
 
     /// Writes staged/<name>.rune + sidecar; returns the summary.
     nlohmann::json stage(const std::string& name, const std::string& kind,
