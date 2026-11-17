@@ -18,6 +18,7 @@
 #include <ctime>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 
 namespace mimirmind::hugin {
@@ -438,41 +439,58 @@ void RuneStaging::registerOn(McpServer& server) {
 
             json reasons = json::array();
             json result{{"rune_hash", hash}, {"at", nowIso()}};
-            const auto evalBoth = [&](const json& set, const char* label) -> json {
-                const json items = loadGoldset(set);
-                if (!items.is_array() || items.empty()) {
+            // Base runs first for every set, then the rune runs: with a single
+            // resident engine (--single-engine, models too large for base + variant)
+            // that is two loads instead of four.
+            struct SetEval {
+                json items;
+                json rowsB = json::array();
+                json b;
+            };
+            const auto evalBase = [&](const json& set, const char* label) {
+                SetEval s;
+                s.items = loadGoldset(set);
+                if (!s.items.is_array() || s.items.empty()) {
                     throw std::runtime_error(std::string{label} + " set is empty");
                 }
-                json rowsB = json::array(), rowsR = json::array();
-                const json b = evalRun(_forward.engine(), items, addBos, rowsB);
-                const json r = evalRun(_forward.engineWithRunes({path.string()}), items, addBos, rowsR);
+                s.b = evalRun(_forward.engine(), s.items, addBos, s.rowsB);
+                return s;
+            };
+            const auto evalRune = [&](const SetEval& s) -> json {
+                json rowsR = json::array();
+                const json r = evalRun(_forward.engineWithRunes({path.string()}), s.items, addBos, rowsR);
                 json flips = json::array();
-                for (std::size_t i = 0; i < items.size(); ++i) {
-                    const bool cb = rowsB[i]["base_or_run"]["correct"].get<bool>();
+                for (std::size_t i = 0; i < s.items.size(); ++i) {
+                    const bool cb = s.rowsB[i]["base_or_run"]["correct"].get<bool>();
                     const bool cr = rowsR[i]["base_or_run"]["correct"].get<bool>();
                     if (cb != cr) {
-                        flips.push_back({{"index", i}, {"id", rowsB[i]["id"]}, {"now_correct", cr}});
+                        flips.push_back({{"index", i}, {"id", s.rowsB[i]["id"]}, {"now_correct", cr}});
                     }
                 }
-                return json{{"base", b}, {"rune", r},
-                            {"delta_accuracy", r["accuracy"].get<double>() - b["accuracy"].get<double>()},
+                return json{{"base", s.b}, {"rune", r},
+                            {"delta_accuracy", r["accuracy"].get<double>() - s.b["accuracy"].get<double>()},
                             {"delta_mean_logprob",
-                             r["mean_logprob"].get<double>() - b["mean_logprob"].get<double>()},
+                             r["mean_logprob"].get<double>() - s.b["mean_logprob"].get<double>()},
                             {"new_non_finite", r["non_finite_items"].get<std::size_t>() >
-                                                   b["non_finite_items"].get<std::size_t>()},
+                                                   s.b["non_finite_items"].get<std::size_t>()},
                             {"flips", flips}};
             };
             _forward.dropVariant();   // never reuse an engine built from older bytes
             try {
-                const json tgt = evalBoth(a.at("target"), "target");
+                const SetEval tgtBase = evalBase(a.at("target"), "target");
+                std::optional<SetEval> ctlBase;
+                if (a.contains("control")) {
+                    ctlBase = evalBase(a["control"], "control");
+                }
+                const json tgt = evalRune(tgtBase);
                 result["target"] = tgt;
                 const double dAcc = tgt["delta_accuracy"].get<double>();
                 const double dLp  = tgt["delta_mean_logprob"].get<double>();
                 if (dAcc < 0) reasons.push_back("target accuracy dropped");
                 if (!(dAcc > 0 || dLp > minGain)) reasons.push_back("target did not improve");
                 if (tgt["new_non_finite"].get<bool>()) reasons.push_back("target: new non-finite items");
-                if (a.contains("control")) {
-                    const json ctl = evalBoth(a["control"], "control");
+                if (ctlBase) {
+                    const json ctl = evalRune(*ctlBase);
                     result["control"] = ctl;
                     if (-ctl["delta_accuracy"].get<double>() > maxAccDrop)
                         reasons.push_back("control accuracy dropped beyond budget");

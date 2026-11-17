@@ -78,6 +78,14 @@ public:
     /// Drop the rune variant engine (e.g. after a staged rune file changed).
     void dropVariant() noexcept;
 
+    /// Keep at most ONE engine resident (--single-engine): loading the rune
+    /// variant releases the base and vice versa, for models too large to hold
+    /// base + variant at once (Kolibri-1 78B on a 128 GB GB10). References
+    /// returned by engine() / engineWithRunes() are invalidated by the next
+    /// call to the other one.
+    void setSingleEngine(bool on) noexcept { _singleEngine = on; }
+    [[nodiscard]] bool singleEngine() const noexcept { return _singleEngine; }
+
     /// Identity of the current target (path + tokenizer); session state that
     /// is only valid for one model (steering vectors) keys on it.
     [[nodiscard]] std::string targetKey() const;
@@ -95,6 +103,7 @@ private:
     std::function<Target()>      _target;
     std::unique_ptr<Loaded>      _base;
     std::unique_ptr<Loaded>      _variant;
+    bool                         _singleEngine{false};
 };
 
 } // namespace mimirmind::hugin

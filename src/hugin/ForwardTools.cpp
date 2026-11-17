@@ -86,13 +86,22 @@ Engine& ForwardTools::base() {
 }
 
 Engine& ForwardTools::withRunes(const std::vector<std::string>& runes) {
-    (void)base();   // validates the target and keeps base/variant on the same model
-    if (!_variant || !sameTarget(_variant->target, _base->target) || _variant->runes != runes) {
-        // One engine at a time besides the base: drop the old variant first so
-        // two large models are never resident at once beyond base + variant.
-        _variant.reset();
-        _variant = load(_base->target, runes);
+    const Target t = _target();
+    if (t.path.empty()) {
+        throw std::runtime_error("no model loaded — call open_model first");
     }
+    if (_variant && sameTarget(_variant->target, t) && _variant->runes == runes) {
+        return *_variant->engine;
+    }
+    // One engine at a time besides the base: drop the old variant first so
+    // two large models are never resident at once beyond base + variant.
+    _variant.reset();
+    if (_singleEngine) {
+        _base.reset();   // base is reloaded lazily by the next base()
+    } else {
+        (void)base();    // keeps base/variant on the same model
+    }
+    _variant = load(t, runes);
     return *_variant->engine;
 }
 
@@ -286,11 +295,15 @@ void ForwardTools::registerOn(McpServer& server) {
             if (runes.empty()) {
                 throw std::runtime_error("'runes' must not be empty");
             }
-            Engine&    b   = base();
-            const auto ids = inputTokens(b, a);
-            const auto lb  = forward(b, ids);
-            Engine&    r   = withRunes(runes);
-            const auto lr  = forward(r, ids);
+            const Engine* bp = &base();
+            const auto    ids = inputTokens(*bp, a);
+            const auto    lb  = forward(base(), ids);
+            Engine&       r   = withRunes(runes);
+            const auto    lr  = forward(r, ids);
+            // --single-engine released the base when the variant loaded; the
+            // variant has the same tokenizer and logit softcap (runes change
+            // weights only), so it stands in for the base's metadata below.
+            const Engine& b = _singleEngine ? r : *bp;
             json   positions = json::array();
             double klSum = 0, klMax = 0;
             std::size_t agree = 0;
