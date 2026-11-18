@@ -15,6 +15,7 @@
 #include "hugin/LogitMath.hpp"
 #include "hugin/McpServer.hpp"
 #include "hugin/SeparationMath.hpp"
+#include "hugin/TreeParzenEstimator.hpp"
 #include "compute/IRuneSteerOps.hpp"
 #include "compute/cpu/GpuOps.hpp"
 #include "core/cpu/CpuContext.hpp"
@@ -563,6 +564,59 @@ TEST(surgery_causalityKeys_canonical) {
     EXPECT_TRUE(hg::vectorKey("fr", 1.0) == hg::vectorKey("fr", 1.0));
     EXPECT_TRUE(hg::vectorKey("fr", 1.0) != hg::vectorKey("fr", 0.5));
     EXPECT_TRUE(hg::vectorKey("fr", 1.0) != hg::vectorKey("de", 1.0));
+}
+
+TEST(tpe_pareto_and_rank) {
+    using T = mimirmind::hugin::TreeParzenEstimator;
+    std::vector<T::Trial> tr{{{0}, {1, 5}, true}, {{0}, {2, 2}, true}, {{0}, {3, 3}, true},
+                             {{0}, {5, 1}, true}, {{0}, {0, 0}, false}};
+    const auto front = T::paretoFront(tr);
+    EXPECT_TRUE(front == (std::vector<std::size_t>{0, 1, 3}));   // infeasible (0,0) excluded
+    const auto order = T::rank(tr);
+    EXPECT_TRUE(order.back() == 4);                                 // infeasible last
+    EXPECT_TRUE(order[3] == 2);                                     // dominated by (2,2)
+}
+
+TEST(tpe_minimises_quadratic_better_than_random) {
+    using T = mimirmind::hugin::TreeParzenEstimator;
+    using K = T::Param::Kind;
+    const std::vector<T::Param> space{{"x", K::Float, -5, 5}, {"k", K::Int, 1, 64, true},
+                                      {"c", K::Choice, 0, 0, false, 4}};
+    // Optimum x = 1.5, k = 16, c = 2.
+    const auto f = [](const std::vector<double>& p) {
+        const double lk = std::log2(p[1]) - 4.0;
+        return (p[0] - 1.5) * (p[0] - 1.5) + lk * lk + (p[2] == 2.0 ? 0.0 : 2.0);
+    };
+    double tpeBest = 0, rndBest = 0;
+    for (std::uint64_t seed = 1; seed <= 5; ++seed) {
+        T tpe(space, 1, {8, 0.25, 24, seed});
+        T rnd(space, 1, {1000, 0.25, 24, seed});   // never leaves the startup phase
+        double bt = 1e9, br = 1e9;
+        for (int i = 0; i < 40; ++i) {
+            auto p = tpe.suggest();
+            EXPECT_TRUE(p[1] >= 1 && p[1] <= 64 && p[1] == std::round(p[1]));
+            EXPECT_TRUE(p[2] >= 0 && p[2] <= 3 && p[2] == std::round(p[2]));
+            const double y = f(p);
+            bt = std::min(bt, y);
+            tpe.tell(std::move(p), {y}, true);
+            auto q = rnd.suggest();
+            const double z = f(q);
+            br = std::min(br, z);
+            rnd.tell(std::move(q), {z}, true);
+        }
+        tpeBest += bt;
+        rndBest += br;
+        EXPECT_TRUE(bt < 1.0);
+    }
+    EXPECT_TRUE(tpeBest < 0.5 * rndBest);   // summed over the five seeds
+    // Determinism: same seed, same suggestions.
+    T a(space, 1, {2, 0.25, 24, 42}), b(space, 1, {2, 0.25, 24, 42});
+    for (int i = 0; i < 6; ++i) {
+        const auto pa = a.suggest(), pb = b.suggest();
+        EXPECT_TRUE(pa == pb);
+        a.tell(pa, {f(pa)}, true);
+        b.tell(pb, {f(pb)}, true);
+    }
 }
 
 int main() {
