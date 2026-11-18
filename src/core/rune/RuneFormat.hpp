@@ -51,6 +51,16 @@ enum class RuneOpKind : std::uint8_t {
     LowRank,           ///< overlay y = Wx + s*B(Ax) (not yet applicable)
     Steer,             ///< residual-stream activation offset after one block (overlay, no weight change)
     WriteQuantBlocks,  ///< overwrite pre-quantised NVFP4 blocks (not yet applicable)
+    SteerProject,      ///< 7.11 overlay: remove alpha x the component of the residual along a
+                       ///< direction after one block, x -= alpha (x.d) d (d unit, 0 < alpha <= 1)
+    SteerIf,           ///< 7.11 overlay: a steer (add or project) applied only to rows whose
+                       ///< condition score cos(x_Lc, w) at block Lc exceeds a threshold (CAST)
+};
+
+/// How a SteerIf op changes the rows it gates on.
+enum class RuneSteerMode : std::uint8_t {
+    Add,       ///< x += alpha * payload
+    Project,   ///< x -= alpha * (x.d) d, d = payload / ||payload||
 };
 
 /// Axis of a `Scale` op.
@@ -68,10 +78,15 @@ struct RuneOp {
     std::uint64_t rowBegin{0};   ///< WriteSlice only
     std::uint64_t rowEnd{0};     ///< WriteSlice only (exclusive)
     RuneScaleAxis axis{RuneScaleAxis::Rows};   ///< Scale only
-    double        alpha{1.0};    ///< Steer only: payload multiplier
+    double        alpha{1.0};    ///< Steer / SteerProject / SteerIf: payload multiplier
+    RuneSteerMode steerMode{RuneSteerMode::Add};   ///< SteerIf only
+    std::string   condition;     ///< SteerIf only: payload name of the condition direction w
+    std::uint32_t conditionBlock{0};   ///< SteerIf only: block whose output residual is scored
+    double        threshold{0.0};      ///< SteerIf only: gate = cos(x, w) > threshold
 };
 
-/// Steer target spelling: `blk.<i>` = the residual stream after block i.
+/// Steer target spelling (Steer / SteerProject / SteerIf): `blk.<i>` = the
+/// residual stream after block i.
 /// Returns the block index, or nullopt for any other spelling.
 [[nodiscard]] std::optional<std::uint32_t> steerBlockOf(std::string_view target) noexcept;
 
@@ -82,6 +97,13 @@ struct RuneOp {
 /// True for op kinds that are engine overlays (no weight bytes change, the
 /// tensor_hash is optional and the base fingerprint binds the rune).
 [[nodiscard]] bool opKindIsOverlay(RuneOpKind k) noexcept;
+
+/// True for the residual-stream steer overlays (Steer, SteerProject, SteerIf).
+[[nodiscard]] bool opKindIsSteer(RuneOpKind k) noexcept;
+
+/// Manifest spelling of a steer mode ("add" / "project") and its inverse.
+[[nodiscard]] std::string_view steerModeName(RuneSteerMode m) noexcept;
+[[nodiscard]] std::optional<RuneSteerMode> steerModeFromName(std::string_view s) noexcept;
 
 /// Parsed manifest.
 struct RuneManifest {

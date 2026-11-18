@@ -155,6 +155,9 @@ struct GpuOps::Impl {
     core::cuda::CudaKernel _addBiasKernel;
     core::cuda::CudaModule _addResidualModule;
     core::cuda::CudaKernel _addResidualKernel;
+    core::cuda::CudaModule _runeSteerModule;
+    core::cuda::CudaKernel _runeRowDotKernel;
+    core::cuda::CudaKernel _runeSteerRowsKernel;
     core::cuda::CudaModule _siluMulModule;
     core::cuda::CudaKernel _siluMulKernel;
     core::cuda::CudaModule _siluMulSplitModule;
@@ -462,6 +465,9 @@ struct GpuOps::Impl {
           _addBiasKernel           {_addBiasModule.getFunction("add_bias")},
           _addResidualModule       {loadCudaModule(ctx, "add_residual")},
           _addResidualKernel       {_addResidualModule.getFunction("add_residual")},
+          _runeSteerModule         {loadCudaModule(ctx, "rune_steer")},
+          _runeRowDotKernel        {_runeSteerModule.getFunction("rune_row_dot")},
+          _runeSteerRowsKernel     {_runeSteerModule.getFunction("rune_steer_rows")},
           _siluMulModule           {loadCudaModule(ctx, "silu_mul")},
           _siluMulKernel           {_siluMulModule.getFunction("silu_mul")},
           _siluMulSplitModule      {loadCudaModule(ctx, "silu_mul_split")},
@@ -1517,6 +1523,45 @@ void GpuOps::addBiasAsync(float* y, std::size_t M, std::size_t K,
     k.setValue(3, Ki);
     k.launch(_ctx.stream(),
              groupsForN(M * K, kElementwiseLocalSize), 1, 1,
+             kElementwiseLocalSize, 1, 1);
+}
+
+void GpuOps::rowDotAsync(const float* x, std::size_t rows, std::size_t d, const float* w,
+                         float* out, bool normalize) {
+    if (rows == 0) {
+        return;
+    }
+    const std::int32_t di = toInt32(d, "runeRowDot d");
+    auto& k = _pimpl->_runeRowDotKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, w);
+    k.setPtr  (2, out);
+    k.setValue(3, di);
+    k.setValue(4, static_cast<std::int32_t>(normalize ? 1 : 0));
+    k.launch(_ctx.stream(),
+             static_cast<std::uint32_t>(toInt32(rows, "runeRowDot rows")), 1, 1,
+             kRuneDotLocalSize, 1, 1);
+}
+
+void GpuOps::steerRowsAsync(float* x, std::size_t rows, std::size_t d, const float* v,
+                            float alpha, const float* gate, float threshold,
+                            const float* coef) {
+    if (rows == 0 || d == 0) {
+        return;
+    }
+    const std::int32_t ri = toInt32(rows, "runeSteerRows rows");
+    const std::int32_t di = toInt32(d, "runeSteerRows d");
+    auto& k = _pimpl->_runeSteerRowsKernel;
+    k.setPtr  (0, x);
+    k.setPtr  (1, v);
+    k.setPtr  (2, gate);
+    k.setPtr  (3, coef);
+    k.setValue(4, alpha);
+    k.setValue(5, threshold);
+    k.setValue(6, ri);
+    k.setValue(7, di);
+    k.launch(_ctx.stream(),
+             groupsForN(rows * d, kElementwiseLocalSize), 1, 1,
              kElementwiseLocalSize, 1, 1);
 }
 

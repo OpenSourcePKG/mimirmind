@@ -376,6 +376,54 @@ void RuneStaging::registerOn(McpServer& server) {
         });
 
     server.addTool(
+        "rune_stage_steer_if",
+        "Write a projection or conditional steer (roadmap 7.11) as a staged Rune — exactly the "
+        "spec steer_if_preview shows: 'vector' (steer_vector), 'mode' add | project, 'alpha', "
+        "optional 'condition' (condition_vector) + 'threshold'. With a condition: a steer_if op "
+        "(only rows with cos(h_condition_block, c) > threshold are changed, per token); "
+        "without: a steer_project op (mode project only). Guardrails: projection alpha in "
+        "(0, 1]; add mode |alpha|·||v|| / mean residual norm <= 'max_relative_norm' (default "
+        "0.5, ceiling 2.0). Nothing is activated — run rune_gate next.",
+        schema({{"name", {{"type", "string"}}},
+                {"vector", {{"type", "string"}}},
+                {"alpha", {{"type", "number"}}},
+                {"mode", {{"type", "string"}, {"enum", {"add", "project"}}}},
+                {"condition", {{"type", "string"}}},
+                {"threshold", {{"type", "number"}}},
+                {"max_relative_norm", {{"type", "number"}}},
+                {"note", {{"type", "string"}, {"description", "why this edit (kept in provenance)"}}}},
+               {"name", "vector", "alpha"}),
+        [this](const json& a) {
+            const std::string name = checkedName(a);
+            const std::string base = baseFingerprint();   // also: model loaded?
+            auto spec = _surgery.condSteerSpec(a);
+            const double maxRel = budgetArg(a, "max_relative_norm", 0.5, kMaxSteerRelativeNorm);
+            if (spec.op.steerMode == rn::RuneSteerMode::Add &&
+                spec.op.kind == rn::RuneOpKind::SteerIf) {
+                const double rel = spec.params["relative_norm"].get<double>();
+                if (!(rel > 0) || rel > maxRel) {
+                    throw std::runtime_error("edit budget exceeded: relative norm " +
+                                             std::to_string(rel) + " > max_relative_norm " +
+                                             std::to_string(maxRel));
+                }
+            }
+            const std::string kind{rn::opKindName(spec.op.kind)};
+            rn::RuneManifest man;
+            man.name            = name;
+            man.baseFingerprint = base;
+            man.provenanceJson  = json{{"tool", "hugin"}, {"hugin_version", _version},
+                                       {"kind", kind}, {"created_at", nowIso()},
+                                       {"note", a.value("note", std::string{})},
+                                       {"params", spec.params},
+                                       {"budget", {{"max_relative_norm", maxRel}}}}.dump();
+            man.ops.push_back(spec.op);
+            const rn::RuneFile rune{std::move(man), std::move(spec.payloads)};
+            json out = stage(name, kind, rune.serialize(), spec.params);
+            out["base_fingerprint"] = rune.manifest().baseFingerprint;
+            return out;
+        });
+
+    server.addTool(
         "rune_stage_ablate",
         "Write a head ablation as a staged Rune: a 0/1 column Scale on blk.<block>.attn_output."
         "weight that zeroes the given heads' input columns of the O-projection (= the "

@@ -4,6 +4,7 @@
 #pragma once
 
 #include "compute/ComputeOps.hpp"
+#include "compute/IRuneSteerOps.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -38,7 +39,8 @@ namespace mimirmind::compute::cpu {
  *
  * Not thread-safe. Construct once at startup, share across the engine.
  */
-class GpuOps : public ::mimirmind::compute::ComputeOps {
+class GpuOps : public ::mimirmind::compute::ComputeOps,
+               public ::mimirmind::compute::IRuneSteerOps {
 public:
     explicit GpuOps(::mimirmind::core::cpu::CpuContext& ctx);
     ~GpuOps() override = default;
@@ -160,6 +162,16 @@ public:
                            std::size_t  H) override;
 
     void sigmoidInPlaceAsync(std::span<float> y) override;
+
+    // 7.11 Rune projection / conditional steer (reference implementation).
+    [[nodiscard]] ::mimirmind::compute::IRuneSteerOps* runeSteerOps() noexcept override {
+        return this;
+    }
+    void rowDotAsync(const float* x, std::size_t rows, std::size_t d, const float* w,
+                     float* out, bool normalize) override;
+    void steerRowsAsync(float* x, std::size_t rows, std::size_t d, const float* v,
+                        float alpha, const float* gate, float threshold,
+                        const float* coef) override;
 
     void gatherHeadsFromChannelsAsync(const float* src,
                                       float*       dst,

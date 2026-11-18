@@ -71,11 +71,30 @@ RuneOp parseOp(const json& j, std::size_t idx) {
         if (j.contains("tensor_hash")) {
             op.tensorHash = requireString(j, "tensor_hash", ctx);
         }
-        if (op.kind == RuneOpKind::Steer && j.contains("alpha")) {
+        if (opKindIsSteer(op.kind) && j.contains("alpha")) {
             if (!j["alpha"].is_number()) {
                 fail(ctx + ": field 'alpha' is not a number");
             }
             op.alpha = j["alpha"].get<double>();
+        }
+        if (op.kind == RuneOpKind::SteerIf) {
+            const std::string mode = requireString(j, "mode", ctx);
+            const auto m = steerModeFromName(mode);
+            if (!m) {
+                fail(ctx + ": mode must be 'add' or 'project', got '" + mode + "'");
+            }
+            op.steerMode = *m;
+            op.condition = requireString(j, "condition", ctx);
+            const std::uint64_t cb = requireUint(j, "condition_block", ctx);
+            if (cb > 0xFFFFFFFFULL) {
+                fail(ctx + ": condition_block out of range");
+            }
+            op.conditionBlock = static_cast<std::uint32_t>(cb);
+            const json& th = requireField(j, "threshold", ctx);
+            if (!th.is_number()) {
+                fail(ctx + ": field 'threshold' is not a number");
+            }
+            op.threshold = th.get<double>();
         }
     } else {
         op.tensorHash = requireString(j, "tensor_hash", ctx);
@@ -106,8 +125,14 @@ json opToJson(const RuneOp& op) {
     if (!opKindIsOverlay(op.kind) || !op.tensorHash.empty()) {
         j["tensor_hash"] = op.tensorHash;
     }
-    if (op.kind == RuneOpKind::Steer) {
+    if (opKindIsSteer(op.kind)) {
         j["alpha"] = op.alpha;
+    }
+    if (op.kind == RuneOpKind::SteerIf) {
+        j["mode"]            = std::string{steerModeName(op.steerMode)};
+        j["condition"]       = op.condition;
+        j["condition_block"] = op.conditionBlock;
+        j["threshold"]       = op.threshold;
     }
     if (!op.payload.empty()) {
         j["payload"] = op.payload;
@@ -165,12 +190,39 @@ void RuneFile::validate() const {
             fail(ctx + ": tensor_hash '" + op.tensorHash +
                  "' is not of the form fnv1a64:<16 hex>");
         }
-        if (op.kind == RuneOpKind::Steer) {
-            if (!steerBlockOf(op.target)) {
+        if (opKindIsSteer(op.kind)) {
+            const auto blk = steerBlockOf(op.target);
+            if (!blk) {
                 fail(ctx + ": steer target must be 'blk.<i>', got '" + op.target + "'");
             }
             if (!std::isfinite(op.alpha)) {
                 fail(ctx + ": alpha is not finite");
+            }
+            const bool project = op.kind == RuneOpKind::SteerProject ||
+                                 (op.kind == RuneOpKind::SteerIf &&
+                                  op.steerMode == RuneSteerMode::Project);
+            // A projection with alpha > 1 reflects the component (installs the
+            // opposite behaviour) instead of removing it; alpha <= 0 is a no-op
+            // or an amplification. Both are refused (7.12 guardrail).
+            if (project && !(op.alpha > 0.0 && op.alpha <= 1.0)) {
+                fail(ctx + ": projection alpha must be in (0, 1], got " +
+                     std::to_string(op.alpha));
+            }
+            if (op.kind == RuneOpKind::SteerIf) {
+                if (op.conditionBlock > *blk) {
+                    fail(ctx + ": condition_block " + std::to_string(op.conditionBlock) +
+                         " is after the steered block " + std::to_string(*blk) +
+                         " (the condition must be known when the steer runs)");
+                }
+                if (!std::isfinite(op.threshold) || op.threshold <= -1.0 ||
+                    op.threshold >= 1.0) {
+                    fail(ctx + ": threshold must be a cosine in (-1, 1)");
+                }
+                const auto ct = _payloads.find(op.condition);
+                if (op.condition.empty() || ct == _payloads.end() || ct->second.empty()) {
+                    fail(ctx + ": condition payload '" + op.condition +
+                         "' not present in the container");
+                }
             }
         }
         if (op.kind == RuneOpKind::Mask && !expertMaskBlockOf(op.target)) {

@@ -8,6 +8,7 @@
 #include "compute/IMoeGroupedOps.hpp"
 #include "compute/IPagedAttentionOps.hpp"
 #include "compute/IPleOps.hpp"
+#include "compute/IRuneSteerOps.hpp"
 #include "compute/cuda/CudaMoeGroupedOps.hpp"
 #include "compute/cuda/CudaPagedAttentionOps.hpp"
 #include "compute/cuda/ScalarStagingRing.hpp"
@@ -64,7 +65,8 @@ class CudnnSdpaPrefill;
  */
 class GpuOps : public ::mimirmind::compute::ComputeOps,
                public ::mimirmind::compute::IHyperConnectionOps,
-               public ::mimirmind::compute::IPleOps {
+               public ::mimirmind::compute::IPleOps,
+               public ::mimirmind::compute::IRuneSteerOps {
 public:
     /// Same 4-arg shape as `GpuOps` — the config knobs propagate 1:1
     /// so a config.json that steered the L0 backend keeps steering
@@ -388,6 +390,16 @@ public:
     // back so callers reach these without a base-class throw-default stub.
     [[nodiscard]] ::mimirmind::compute::IHyperConnectionOps*
         hyperConnectionOps() noexcept override { return this; }
+
+    // 7.11 Rune projection / conditional steer (kernels/cuda/common/rune_steer.cu).
+    [[nodiscard]] ::mimirmind::compute::IRuneSteerOps* runeSteerOps() noexcept override {
+        return this;
+    }
+    void rowDotAsync(const float* x, std::size_t rows, std::size_t d, const float* w,
+                     float* out, bool normalize) override;
+    void steerRowsAsync(float* x, std::size_t rows, std::size_t d, const float* v,
+                        float alpha, const float* gate, float threshold,
+                        const float* coef) override;
     void hcGroupedRmsNormAsync(const float* x, const float* wBaked, float* normed,
                                std::size_t T, std::size_t hc, std::size_t d,
                                float eps) override;
@@ -751,6 +763,7 @@ private:
     // consume their own local macros; parity is maintained by
     // convention (mirrored from `GpuOps` kernel constants).
     static constexpr std::uint32_t kRmsnormLocalSize      = 128;
+    static constexpr std::uint32_t kRuneDotLocalSize      = 256;   // == RUNE_DOT_LOCAL
     static constexpr std::uint32_t kLayernormLocalSize    = 128;
     static constexpr std::uint32_t kElementwiseLocalSize  = 256;
     static constexpr std::uint32_t kRopeLocalSize         = 256;

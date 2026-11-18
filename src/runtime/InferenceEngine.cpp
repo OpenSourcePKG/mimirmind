@@ -677,6 +677,7 @@ void InferenceEngine::finalizeLoad() {
     attachQwen4ExpPleTable();
     installRuneSteers();
     installRuneExpertMasks();
+    installConditionalSteers({});
 
     _modelLoaded = true;
     // Defensive: a previous model's KV state must not survive into the
@@ -739,6 +740,91 @@ void InferenceEngine::installRuneSteers() {
     }
     _backend->setResidualSteers(*_ops, dModel, steers);
     _runeSteerHost.clear();
+}
+
+void InferenceEngine::installConditionalSteers(
+    const std::vector<core::rune::RuneCondSteer>& extra) {
+    if (_runeCondSteers.empty() && extra.empty()) {
+        if (_backend) {
+            _backend->clearConditionalSteers();
+        }
+        _runeCondDev.clear();
+        _previewCondOffset = 0;
+        return;
+    }
+    if (!_backend) {
+        throw std::runtime_error("Futhark: projection / conditional steer needs an arch "
+                                 "backend (architecture '" + _config.architecture + "')");
+    }
+    if (_ops->runeSteerOps() == nullptr) {
+        throw std::runtime_error("Futhark: model '" + _modelIdHint + "' has projection / "
+                                 "conditional steer runes, but this compute backend has no "
+                                 "IRuneSteerOps (CPU and CUDA only)");
+    }
+    const std::size_t dModel = _config.embeddingLength;
+    std::vector<arch::ArchBackend::SteerCondition>   conds;
+    std::vector<arch::ArchBackend::ConditionalSteer> steers;
+    std::vector<compute::ComputeBuffer>              dev;
+    auto upload = [&](const std::vector<float>& v) -> const float* {
+        dev.push_back(_ops->allocate(dModel * sizeof(float)));
+        _ops->uploadHostBytes(dev.back().as<float>(), v.data(), dModel * sizeof(float));
+        return dev.back().as<float>();
+    };
+    std::size_t condCount = 0;
+    auto add = [&](const core::rune::RuneCondSteer& st, bool preview) {
+        const std::string where = std::string{preview ? "preview" : "Futhark"} +
+                                  ": conditional steer on block " + std::to_string(st.block);
+        if (st.block >= _config.blockCount ||
+            (st.hasCondition && st.conditionBlock >= _config.blockCount)) {
+            throw std::runtime_error(where + " but the model has " +
+                                     std::to_string(_config.blockCount) + " blocks");
+        }
+        if (st.values.size() != dModel ||
+            (st.hasCondition && st.condition.size() != dModel)) {
+            throw std::runtime_error(where + ": vector length != d_model " +
+                                     std::to_string(dModel));
+        }
+        arch::ArchBackend::ConditionalSteer cs;
+        cs.block   = st.block;
+        cs.project = st.mode == core::rune::RuneSteerMode::Project;
+        cs.values  = upload(st.values);
+        cs.alpha   = st.alpha;
+        if (st.hasCondition) {
+            conds.push_back({st.conditionBlock, upload(st.condition), st.threshold});
+            cs.condition = static_cast<int>(conds.size() - 1);
+            ++condCount;
+        }
+        steers.push_back(cs);
+        MM_LOG_INFO("futhark", "model '{}': {} {} steer after block {}{}", _modelIdHint,
+                    preview ? "preview" : "rune", cs.project ? "projection" : "add",
+                    st.block,
+                    st.hasCondition ? " gated on cos(x_" + std::to_string(st.conditionBlock) +
+                                      ", c) > " + std::to_string(st.threshold)
+                                    : std::string{});
+    };
+    for (const auto& st : _runeCondSteers) {
+        add(st, false);
+    }
+    _previewCondOffset = condCount;
+    for (const auto& st : extra) {
+        add(st, true);
+    }
+    _backend->setConditionalSteers(*_ops, dModel, std::move(conds), std::move(steers));
+    _runeCondDev = std::move(dev);
+}
+
+void InferenceEngine::setPreviewConditionalSteers(
+    std::vector<core::rune::RuneCondSteer> extra) {
+    _gmm->sync();   // no in-flight forward may still read the old overlay buffers
+    installConditionalSteers(extra);
+}
+
+std::vector<float> InferenceEngine::previewConditionScores(std::size_t i,
+                                                           std::size_t rows) const {
+    if (!_backend) {
+        throw std::runtime_error("previewConditionScores: no arch backend");
+    }
+    return _backend->readConditionScores(_previewCondOffset + i, rows);
 }
 
 void InferenceEngine::installRuneExpertMasks() {
@@ -823,11 +909,15 @@ void InferenceEngine::applyRunes() {
     }
     _runeSteerHost.clear();
     _runeMaskHost.clear();
+    _runeCondSteers.clear();
     for (const auto& rep : res->reports) {
         MM_LOG_INFO("futhark", "model '{}': rune '{}' applied — {} op(s), {} tensor(s), "
-                    "{} steer overlay(s), {} expert mask(s)", _modelIdHint, rep.runeName,
-                    rep.opsApplied, rep.touched.size(), rep.steers.size(),
+                    "{} steer overlay(s), {} projection/conditional steer(s), {} expert "
+                    "mask(s)", _modelIdHint, rep.runeName, rep.opsApplied,
+                    rep.touched.size(), rep.steers.size(), rep.condSteers.size(),
                     rep.expertMasks.size());
+        _runeCondSteers.insert(_runeCondSteers.end(), rep.condSteers.begin(),
+                               rep.condSteers.end());
         for (const auto& m : rep.expertMasks) {
             auto& acc = _runeMaskHost[m.block];
             if (acc.empty()) {

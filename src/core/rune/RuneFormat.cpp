@@ -15,13 +15,15 @@ struct KindName {
     std::string_view name;
 };
 
-constexpr std::array<KindName, 6> kKindNames{{
+constexpr std::array<KindName, 8> kKindNames{{
     {RuneOpKind::WriteSlice,       "write_slice"},
     {RuneOpKind::Scale,            "scale"},
     {RuneOpKind::Mask,             "mask"},
     {RuneOpKind::LowRank,          "lowrank"},
     {RuneOpKind::Steer,            "steer"},
     {RuneOpKind::WriteQuantBlocks, "write_quant_blocks"},
+    {RuneOpKind::SteerProject,     "steer_project"},
+    {RuneOpKind::SteerIf,          "steer_if"},
 }};
 
 } // namespace
@@ -45,12 +47,30 @@ std::optional<RuneOpKind> opKindFromName(std::string_view s) noexcept {
 }
 
 bool opKindApplicable(RuneOpKind k) noexcept {
-    return k == RuneOpKind::WriteSlice || k == RuneOpKind::Scale || k == RuneOpKind::Steer ||
+    return k == RuneOpKind::WriteSlice || k == RuneOpKind::Scale || opKindIsSteer(k) ||
            k == RuneOpKind::Mask;
 }
 
 bool opKindIsOverlay(RuneOpKind k) noexcept {
-    return k == RuneOpKind::Steer || k == RuneOpKind::Mask;
+    return opKindIsSteer(k) || k == RuneOpKind::Mask;
+}
+
+bool opKindIsSteer(RuneOpKind k) noexcept {
+    return k == RuneOpKind::Steer || k == RuneOpKind::SteerProject || k == RuneOpKind::SteerIf;
+}
+
+std::string_view steerModeName(RuneSteerMode m) noexcept {
+    return m == RuneSteerMode::Project ? "project" : "add";
+}
+
+std::optional<RuneSteerMode> steerModeFromName(std::string_view s) noexcept {
+    if (s == "add") {
+        return RuneSteerMode::Add;
+    }
+    if (s == "project") {
+        return RuneSteerMode::Project;
+    }
+    return std::nullopt;
 }
 
 std::optional<std::uint32_t> expertMaskBlockOf(std::string_view target) noexcept {

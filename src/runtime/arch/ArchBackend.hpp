@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "compute/ComputeBuffer.hpp"
 #include "core/gguf/GgufTypes.hpp"
 
 #include <cstddef>
@@ -268,7 +269,43 @@ public:
             _steerByBlock[block] != nullptr) {
             addResidualSteer(_steerByBlock[block], x, rows);
         }
+        if (block < _condAtBlock.size() && _condAtBlock[block]) {
+            applyConditionalSteers(block, x, rows);
+        }
     }
+
+    /// 7.11 Rune projection / conditional steer overlays (Futhark
+    /// steer_project / steer_if). A condition scores every row of the residual
+    /// after its block as cos(x_r, direction); a steer gated on it changes only
+    /// the rows whose score is > threshold. Rows are independent, so the gate is
+    /// per token on every forward path (prefill, decode, batched, ragged,
+    /// graph) without a row -> sequence map. Order at one block: the summed
+    /// plain steers, then the conditions anchored there are scored, then the
+    /// projection / conditional steers in registration order. Device vectors
+    /// are owned by the caller for the backend's lifetime; set once at load,
+    /// before any graph capture.
+    struct SteerCondition {
+        std::size_t  block{0};
+        const float* direction{nullptr};   ///< device, unit [dModel]
+        float        threshold{0.0F};
+    };
+    struct ConditionalSteer {
+        std::size_t  block{0};
+        bool         project{false};       ///< false: x += v; true: x -= alpha (x.v) v
+        const float* values{nullptr};      ///< device [dModel] (unit when project)
+        float        alpha{1.0F};          ///< project only
+        int          condition{-1};        ///< index into the conditions, -1 = every row
+    };
+    void setConditionalSteers(compute::ComputeOps& ops, std::size_t dModel,
+                              std::vector<SteerCondition> conditions,
+                              std::vector<ConditionalSteer> steers);
+    void clearConditionalSteers() noexcept;
+    [[nodiscard]] bool hasConditionalSteers() const noexcept { return _condOps != nullptr; }
+    /// Host copy of the last condition scores written for `condition` (rows of
+    /// the most recent forward that reached its block). Diagnostic (Hugin
+    /// preview / calibration); syncs the stream.
+    [[nodiscard]] std::vector<float> readConditionScores(std::size_t condition,
+                                                         std::size_t rows) const;
 
     /// 7.3 Rune expert disable (Futhark Mask op on a router): a device bias
     /// [nExperts] per MoE block, 0 for kept experts and kExpertMaskedLogit for
@@ -332,6 +369,12 @@ protected:
 private:
     void addResidualSteer(const float* steer, float* x, std::size_t rows) const;
     void addExpertMask(const float* bias, float* logits, std::size_t rows) const;
+    void applyConditionalSteers(std::size_t block, float* x, std::size_t rows) const;
+    /// Grows the per-condition score buffers + the projection scratch to
+    /// `rows`. Old buffers are kept alive (a captured graph may still point at
+    /// them); the initial capacity covers every decode batch, so growth only
+    /// happens on large (uncaptured) prefill forwards.
+    void ensureConditionalCapacity(std::size_t rows) const;
 
     compute::ComputeOps*     _steerOps{nullptr};
     std::size_t              _steerDModel{0};
@@ -339,6 +382,15 @@ private:
     compute::ComputeOps*     _maskOps{nullptr};
     std::size_t              _maskNExperts{0};
     std::vector<const float*> _maskByBlock;
+    compute::ComputeOps*      _condOps{nullptr};
+    std::size_t               _condDModel{0};
+    std::vector<SteerCondition>   _conditions;
+    std::vector<ConditionalSteer> _condSteers;
+    std::vector<bool>             _condAtBlock;   ///< block has a condition or a cond. steer
+    mutable std::size_t                          _condCapacity{0};
+    mutable std::vector<compute::ComputeBuffer>  _condScores;    ///< one per condition
+    mutable compute::ComputeBuffer               _condProj;      ///< projection coefficients
+    mutable std::vector<compute::ComputeBuffer>  _condRetired;   ///< outgrown, kept alive
     StageTap                 _stageTap{};
     mutable ArchCapabilities _caps{};
     mutable std::once_flag   _capsOnce;

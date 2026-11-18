@@ -934,6 +934,123 @@ TEST(apply_fp8_blockScale_inexactOrOverflow_refused_andRestored) {
     EXPECT_TRUE(model.tensors["o"].bytes == before);
 }
 
+// ======================================================================
+// 7.11 — steer_project / steer_if (projection + conditional overlays)
+// ======================================================================
+
+namespace {
+
+rn::RuneOp projectOp(const std::string& target, const std::string& payload, double alpha) {
+    rn::RuneOp op = steerOp(target, payload, alpha);
+    op.kind = rn::RuneOpKind::SteerProject;
+    return op;
+}
+
+rn::RuneOp steerIfOp(const std::string& target, const std::string& payload, double alpha,
+                     rn::RuneSteerMode mode, const std::string& cond, std::uint32_t condBlock,
+                     double threshold) {
+    rn::RuneOp op = steerOp(target, payload, alpha);
+    op.kind           = rn::RuneOpKind::SteerIf;
+    op.steerMode      = mode;
+    op.condition      = cond;
+    op.conditionBlock = condBlock;
+    op.threshold      = threshold;
+    return op;
+}
+
+} // namespace
+
+TEST(steerIf_steerProject_serializeParse_roundTrip) {
+    const auto rune = makeRune(
+        {projectOp("blk.2", "d", 0.5),
+         steerIfOp("blk.7", "v", 3.0, rn::RuneSteerMode::Add, "c", 5, 0.25),
+         steerIfOp("blk.7", "d", 1.0, rn::RuneSteerMode::Project, "c", 7, -0.5)},
+        {{"d", {1.0f, 0.0f, 0.0f}}, {"v", {0.5f, -1.0f, 2.0f}}, {"c", {0.0f, 3.0f, 4.0f}}});
+    const auto back = rn::RuneFile::parse(rune.serialize());
+    const auto& ops = back.manifest().ops;
+    EXPECT_EQ(ops.size(), std::size_t{3});
+    EXPECT_TRUE(ops[0].kind == rn::RuneOpKind::SteerProject);
+    EXPECT_TRUE(ops[0].alpha == 0.5);
+    EXPECT_TRUE(ops[1].kind == rn::RuneOpKind::SteerIf);
+    EXPECT_TRUE(ops[1].steerMode == rn::RuneSteerMode::Add);
+    EXPECT_EQ(ops[1].condition, std::string{"c"});
+    EXPECT_EQ(ops[1].conditionBlock, 5U);
+    EXPECT_TRUE(ops[1].threshold == 0.25);
+    EXPECT_TRUE(ops[2].steerMode == rn::RuneSteerMode::Project);
+    EXPECT_TRUE(rn::opKindIsOverlay(rn::RuneOpKind::SteerIf));
+    EXPECT_TRUE(rn::opKindIsSteer(rn::RuneOpKind::SteerProject));
+    EXPECT_TRUE(*rn::opKindFromName("steer_if") == rn::RuneOpKind::SteerIf);
+    EXPECT_TRUE(*rn::opKindFromName("steer_project") == rn::RuneOpKind::SteerProject);
+}
+
+TEST(steerIf_steerProject_formatGuards) {
+    const std::map<std::string, std::vector<float>> p{{"v", {1.0f, 2.0f}}, {"c", {1.0f, 0.0f}}};
+    // Projection alpha must be in (0, 1]: > 1 reflects, <= 0 amplifies / no-op.
+    EXPECT_TRUE(threw([&] { (void)makeRune({projectOp("blk.1", "v", 1.5)}, p); }));
+    EXPECT_TRUE(threw([&] { (void)makeRune({projectOp("blk.1", "v", 0.0)}, p); }));
+    EXPECT_TRUE(threw([&] {
+        (void)makeRune({steerIfOp("blk.1", "v", 2.0, rn::RuneSteerMode::Project, "c", 1, 0.1)}, p);
+    }));
+    // Add-mode steer_if may use any finite alpha.
+    EXPECT_TRUE(!threw([&] {
+        (void)makeRune({steerIfOp("blk.1", "v", -4.0, rn::RuneSteerMode::Add, "c", 1, 0.1)}, p);
+    }));
+    // Condition scored after the steered block / missing / bad threshold.
+    EXPECT_TRUE(threw([&] {
+        (void)makeRune({steerIfOp("blk.1", "v", 1.0, rn::RuneSteerMode::Add, "c", 2, 0.1)}, p);
+    }));
+    EXPECT_TRUE(threw([&] {
+        (void)makeRune({steerIfOp("blk.1", "v", 1.0, rn::RuneSteerMode::Add, "nope", 1, 0.1)}, p);
+    }));
+    EXPECT_TRUE(threw([&] {
+        (void)makeRune({steerIfOp("blk.1", "v", 1.0, rn::RuneSteerMode::Add, "c", 1, 1.0)}, p);
+    }));
+}
+
+TEST(apply_steerIf_steerProject_resolvesUnitVectors) {
+    FakeModel model;
+    model.addF32("w", 2, 1, {1, 2});
+    const std::string h = model.hash("w");
+    const auto rune = makeRune(
+        {projectOp("blk.2", "d", 0.5),
+         steerIfOp("blk.6", "v", -2.0, rn::RuneSteerMode::Add, "c", 3, 0.25)},
+        {{"d", {0.0f, 3.0f, 4.0f}}, {"v", {0.5f, 1.0f, -3.0f}}, {"c", {2.0f, 0.0f, 0.0f}}});
+    rn::RuneApplier applier;
+    const auto r = applier.apply(rune, kBase, model.resolver());
+    EXPECT_TRUE(r.has_value());
+    EXPECT_EQ(r->opsApplied, std::size_t{2});
+    EXPECT_TRUE(r->touched.empty());
+    EXPECT_TRUE(r->steers.empty());
+    EXPECT_EQ(r->condSteers.size(), std::size_t{2});
+    const auto& pj = r->condSteers[0];
+    EXPECT_EQ(pj.block, 2U);
+    EXPECT_TRUE(pj.mode == rn::RuneSteerMode::Project);
+    EXPECT_TRUE(!pj.hasCondition);
+    EXPECT_TRUE(pj.alpha == 0.5f);
+    EXPECT_TRUE(pj.values == (std::vector<float>{0.0f, 0.6f, 0.8f}));
+    const auto& si = r->condSteers[1];
+    EXPECT_EQ(si.block, 6U);
+    EXPECT_TRUE(si.mode == rn::RuneSteerMode::Add);
+    EXPECT_TRUE(si.values == (std::vector<float>{-1.0f, -2.0f, 6.0f}));
+    EXPECT_TRUE(si.hasCondition);
+    EXPECT_EQ(si.conditionBlock, 3U);
+    EXPECT_TRUE(si.condition == (std::vector<float>{1.0f, 0.0f, 0.0f}));
+    EXPECT_TRUE(si.threshold == 0.25f);
+    EXPECT_EQ(model.hash("w"), h);
+    // Zero direction / length mismatch / NaN condition are refused at apply.
+    EXPECT_TRUE(!applier.apply(makeRune({projectOp("blk.1", "d", 1.0)}, {{"d", {0.0f, 0.0f}}}),
+                               kBase, model.resolver()).has_value());
+    EXPECT_TRUE(!applier.apply(makeRune({steerIfOp("blk.1", "v", 1.0, rn::RuneSteerMode::Add,
+                                                   "c", 0, 0.0)},
+                                        {{"v", {1.0f, 2.0f}}, {"c", {1.0f, 0.0f, 0.0f}}}),
+                               kBase, model.resolver()).has_value());
+    EXPECT_TRUE(!applier.apply(makeRune({steerIfOp("blk.1", "v", 1.0, rn::RuneSteerMode::Add,
+                                                   "c", 0, 0.0)},
+                                        {{"v", {1.0f, 2.0f}},
+                                         {"c", {std::numeric_limits<float>::quiet_NaN(), 1.0f}}}),
+                               kBase, model.resolver()).has_value());
+}
+
 int main() {
     return mm::test::run();
 }

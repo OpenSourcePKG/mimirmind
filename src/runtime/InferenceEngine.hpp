@@ -10,6 +10,7 @@
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/WeightsMap.hpp"
 #include "core/ipc/TensorManifest.hpp"
+#include "core/rune/RuneApplier.hpp"
 #include "model/FusedQkvWeights.hpp"
 #include "core/config/Config.hpp"
 #include "model/LlmConfig.hpp"
@@ -435,6 +436,17 @@ public:
     std::vector<std::vector<float>> forwardVerify(
         std::span<const std::int32_t> newTokens,
         ForwardProbe*                 probe = nullptr);
+
+    /// 7.11 Hugin preview: install projection / conditional steers on top of
+    /// the load-time rune overlays, through the SAME backend overlay a rune
+    /// uses (preview == rune by construction). Empty = only the rune ones
+    /// again. Diagnostic path; never called by serving.
+    void setPreviewConditionalSteers(std::vector<core::rune::RuneCondSteer> extra);
+    /// Condition scores (cos) of the i-th conditional steer of the preview
+    /// set, for the first `rows` rows of the last forward that reached its
+    /// condition block.
+    [[nodiscard]] std::vector<float> previewConditionScores(std::size_t i,
+                                                            std::size_t rows) const;
 
     /**
      * M9.11.3 companion — commit `k` of the N speculative rows that
@@ -1146,6 +1158,8 @@ private:
     void applyRunes();
     void installRuneSteers();        // after the arch backend exists
     void installRuneExpertMasks();   // after the arch backend exists
+    /// 7.11: rune projection / conditional steers (+ optional preview set).
+    void installConditionalSteers(const std::vector<core::rune::RuneCondSteer>& extra);
     /// Throws when runes are configured for a Munin-attached (shared) load.
     void refuseRunesOnSharedWeights() const;
     /// FusedQkvWeights + GPU-op self-test + matmul autotune (L0-only paths).
@@ -1332,6 +1346,11 @@ private:
     /// then device copies owned here for the backend's lifetime.
     std::map<std::uint32_t, std::vector<float>> _runeSteerHost;
     std::vector<compute::ComputeBuffer>         _runeSteerDev;
+    /// 7.11 Rune projection / conditional steers (kept on the host so a Hugin
+    /// preview set can be layered on top and removed again).
+    std::vector<core::rune::RuneCondSteer>      _runeCondSteers;
+    std::vector<compute::ComputeBuffer>         _runeCondDev;
+    std::size_t                                 _previewCondOffset{0};
     /// 7.3 Rune expert disable: keep masks from Futhark (ANDed per block),
     /// then device router biases owned here for the backend's lifetime.
     std::map<std::uint32_t, std::vector<std::uint8_t>> _runeMaskHost;

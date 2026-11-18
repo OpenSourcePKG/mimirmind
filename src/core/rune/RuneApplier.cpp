@@ -227,6 +227,47 @@ bool allFinite(std::span<const float> p) noexcept {
     return true;
 }
 
+double l2Norm(std::span<const float> p) noexcept {
+    double s = 0.0;
+    for (const float x : p) {
+        s += static_cast<double>(x) * static_cast<double>(x);
+    }
+    return std::sqrt(s);
+}
+
+std::vector<float> unitVector(std::span<const float> p) {
+    const double n = l2Norm(p);
+    std::vector<float> out(p.size());
+    for (std::size_t k = 0; k < p.size(); ++k) {
+        out[k] = static_cast<float>(static_cast<double>(p[k]) / n);
+    }
+    return out;
+}
+
+/// SteerProject / SteerIf -> engine form (phase 1 checked norms + finiteness).
+RuneCondSteer resolveCondSteer(const RuneOp& op, const RuneFile& rune) {
+    const std::span<const float> p = rune.payload(op.payload);
+    RuneCondSteer st;
+    st.block = *steerBlockOf(op.target);
+    st.mode  = op.kind == RuneOpKind::SteerProject ? RuneSteerMode::Project : op.steerMode;
+    if (st.mode == RuneSteerMode::Project) {
+        st.values = unitVector(p);
+        st.alpha  = static_cast<float>(op.alpha);
+    } else {
+        st.values.resize(p.size());
+        for (std::size_t k = 0; k < p.size(); ++k) {
+            st.values[k] = static_cast<float>(static_cast<double>(p[k]) * op.alpha);
+        }
+    }
+    if (op.kind == RuneOpKind::SteerIf) {
+        st.hasCondition   = true;
+        st.conditionBlock = op.conditionBlock;
+        st.condition      = unitVector(rune.payload(op.condition));
+        st.threshold      = static_cast<float>(op.threshold);
+    }
+    return st;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -260,9 +301,29 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
         if (!opKindApplicable(op.kind)) {
             return std::unexpected(ctx + ": op kind not applicable in this build");
         }
-        if (op.kind == RuneOpKind::Steer) {
-            if (!allFinite(rune.payload(op.payload))) {
+        if (opKindIsSteer(op.kind)) {
+            const std::span<const float> p = rune.payload(op.payload);
+            if (!allFinite(p)) {
                 return std::unexpected(ctx + ": payload contains NaN/Inf");
+            }
+            const bool project = op.kind == RuneOpKind::SteerProject ||
+                                 (op.kind == RuneOpKind::SteerIf &&
+                                  op.steerMode == RuneSteerMode::Project);
+            if (project && l2Norm(p) == 0.0) {
+                return std::unexpected(ctx + ": projection direction is zero");
+            }
+            if (op.kind == RuneOpKind::SteerIf) {
+                const std::span<const float> c = rune.payload(op.condition);
+                if (!allFinite(c)) {
+                    return std::unexpected(ctx + ": condition contains NaN/Inf");
+                }
+                if (c.size() != p.size()) {
+                    return std::unexpected(ctx + ": condition has " + std::to_string(c.size()) +
+                                           " values, payload " + std::to_string(p.size()));
+                }
+                if (l2Norm(c) == 0.0) {
+                    return std::unexpected(ctx + ": condition direction is zero");
+                }
             }
             continue;   // activation overlay — no target tensor
         }
@@ -346,6 +407,11 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
                 st.values[k] = static_cast<float>(static_cast<double>(p[k]) * op.alpha);
             }
             report.steers.push_back(std::move(st));
+            ++report.opsApplied;
+            continue;
+        }
+        if (op.kind == RuneOpKind::SteerProject || op.kind == RuneOpKind::SteerIf) {
+            report.condSteers.push_back(resolveCondSteer(op, rune));
             ++report.opsApplied;
             continue;
         }

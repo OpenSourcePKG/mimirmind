@@ -67,6 +67,24 @@ struct RuneSteer {
     std::vector<float>  values;
 };
 
+/// A SteerProject / SteerIf op resolved for the engine (7.11). On the rows it
+/// gates on, after `block`:
+///   Add:     x += values                      (values = payload x alpha)
+///   Project: x -= alpha * (x . values) values (values = unit direction)
+/// The gate is 1 for every row without a condition; with one it is
+/// [ cos(x_conditionBlock, condition) > threshold ] per row, read on the
+/// residual after `conditionBlock` (condition = unit direction).
+struct RuneCondSteer {
+    std::uint32_t       block{0};
+    RuneSteerMode       mode{RuneSteerMode::Add};
+    std::vector<float>  values;
+    float               alpha{1.0F};   ///< Project only (Add folds alpha into values)
+    bool                hasCondition{false};
+    std::uint32_t       conditionBlock{0};
+    std::vector<float>  condition;
+    float               threshold{0.0F};
+};
+
 /// A Mask op resolved for the engine: experts with keep[e] == 0 are never
 /// routed to in `block` (router logit pushed to -inf before top-K).
 struct RuneExpertMask {
@@ -80,6 +98,7 @@ struct RuneApplyReport {
     std::size_t                     opsApplied{0};
     std::vector<RuneTouchedTensor>  touched;
     std::vector<RuneSteer>          steers;   ///< activation overlays; no weight touched
+    std::vector<RuneCondSteer>      condSteers;   ///< 7.11 projection / conditional overlays
     std::vector<RuneExpertMask>     expertMasks;   ///< router overlays; no weight touched
 };
 

@@ -248,6 +248,16 @@ void InspectTools::registerOn(McpServer& server) {
                 for (const auto& st : rep.steers) {
                     overlays.push_back({{"kind", "steer"}, {"block", st.block}});
                 }
+                for (const auto& cs : rep.condSteers) {
+                    json o{{"kind", cs.hasCondition ? "steer_if" : "steer_project"},
+                           {"block", cs.block},
+                           {"mode", std::string{rn::steerModeName(cs.mode)}}};
+                    if (cs.hasCondition) {
+                        o["condition_block"] = cs.conditionBlock;
+                        o["threshold"]       = cs.threshold;
+                    }
+                    overlays.push_back(std::move(o));
+                }
                 for (const auto& em : rep.expertMasks) {
                     std::vector<std::size_t> off;
                     for (std::size_t e = 0; e < em.keep.size(); ++e) {

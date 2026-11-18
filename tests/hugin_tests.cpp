@@ -14,6 +14,9 @@
 #include "hugin/InspectTools.hpp"
 #include "hugin/LogitMath.hpp"
 #include "hugin/McpServer.hpp"
+#include "compute/IRuneSteerOps.hpp"
+#include "compute/cpu/GpuOps.hpp"
+#include "core/cpu/CpuContext.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -126,12 +129,13 @@ TEST(mcp_initialize_and_toolsList) {
     }
     std::sort(names.begin(), names.end());
     EXPECT_TRUE(names == (std::vector<std::string>{"ablate_preview", "activations", "attention_pattern", "causal_trace",
-                                                   "eval", "eval_preview", "expert_usage", "generate", "list_tensors", "logit_lens",
+                                                   "condition_vector", "eval", "eval_preview", "expert_usage", "generate", "list_tensors", "logit_lens",
                                                    "model_info", "next_token", "open_model", "perplexity", "rune_check",
                                                    "rune_commit", "rune_compare", "rune_gate", "rune_inspect", "rune_list",
                                                    "rune_rollback", "rune_stage_ablate", "rune_stage_experts", "rune_stage_heads",
-                                                   "rune_stage_steer",
-                                                   "steer_list", "steer_preview", "steer_vector", "tensor_hash",
+                                                   "rune_stage_steer", "rune_stage_steer_if",
+                                                   "steer_if_preview", "steer_list", "steer_preview",
+                                                   "steer_vector", "tensor_hash",
                                                    "tensor_stats", "tokenize"}));
 }
 
@@ -304,6 +308,8 @@ TEST(runeStaging_guards_withoutModel_andUnknownNames) {
     };
     EXPECT_TRUE(errText(call("rune_stage_steer", {{"name", "s"}, {"vector", "v"}, {"alpha", 1.0}}))
                     .find("open_model") != std::string::npos);
+    EXPECT_TRUE(errText(call("rune_stage_steer_if", {{"name", "c"}, {"vector", "v"}, {"alpha", 1.0}}))
+                    .find("open_model") != std::string::npos);
     EXPECT_TRUE(errText(call("rune_stage_ablate", {{"name", "a"}, {"block", 0}, {"heads", {0}}}))
                     .find("open_model") != std::string::npos);
     EXPECT_TRUE(errText(call("rune_stage_experts", {{"name", "e"}, {"block", 0}, {"experts", {0}}}))
@@ -443,6 +449,42 @@ TEST(openModel_checkpointDir_forwardOnly) {
     EXPECT_EQ(back["format"].get<std::string>(), std::string{"gguf"});
     EXPECT_TRUE(f.tools.tokenizerGguf().empty());
     std::filesystem::remove_all(dir);
+}
+
+// 7.11 — the CPU reference of the projection / conditional steer ops.
+TEST(runeSteerOps_cpu_rowDot_gate_and_projection) {
+    mimirmind::core::cpu::CpuContext ctx;
+    mimirmind::compute::cpu::GpuOps  ops{ctx};
+    mimirmind::compute::IRuneSteerOps* rs = ops.runeSteerOps();
+    EXPECT_TRUE(rs != nullptr);
+    constexpr std::size_t d = 4;
+    // 3 rows: aligned with c, orthogonal to c, zero.
+    std::vector<float> x{2, 0, 0, 0,   0, 3, 4, 0,   0, 0, 0, 0};
+    const std::vector<float> c{1, 0, 0, 0};
+    std::vector<float> score(3, -9.0F);
+    rs->rowDotAsync(x.data(), 3, d, c.data(), score.data(), /*normalize=*/true);
+    EXPECT_TRUE(score == (std::vector<float>{1.0F, 0.0F, 0.0F}));
+    rs->rowDotAsync(x.data(), 3, d, c.data(), score.data(), /*normalize=*/false);
+    EXPECT_TRUE(score == (std::vector<float>{2.0F, 0.0F, 0.0F}));
+    // Gated add: only row 0 (cos 1 > 0.5) changes.
+    rs->rowDotAsync(x.data(), 3, d, c.data(), score.data(), true);
+    const std::vector<float> v{0, 0, 0, 1};
+    std::vector<float> y = x;
+    rs->steerRowsAsync(y.data(), 3, d, v.data(), 2.0F, score.data(), 0.5F, nullptr);
+    EXPECT_TRUE(y == (std::vector<float>{2, 0, 0, 2,   0, 3, 4, 0,   0, 0, 0, 0}));
+    // Ungated projection with alpha 1 removes the component along the unit
+    // direction exactly: x -= (x.u) u.
+    const std::vector<float> u{0, 0.6F, 0.8F, 0};
+    std::vector<float> coef(3);
+    std::vector<float> z = x;
+    rs->rowDotAsync(z.data(), 3, d, u.data(), coef.data(), false);
+    rs->steerRowsAsync(z.data(), 3, d, u.data(), -1.0F, nullptr, 0.0F, coef.data());
+    std::vector<float> after(3);
+    rs->rowDotAsync(z.data(), 3, d, u.data(), after.data(), false);
+    for (const float a : after) {
+        EXPECT_TRUE(std::fabs(a) < 1e-6F);
+    }
+    EXPECT_TRUE(z[0] == 2.0F);   // row 0 had no component along u
 }
 
 int main() {

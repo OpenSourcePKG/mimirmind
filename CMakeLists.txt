@@ -928,6 +928,7 @@ if(MIMIRMIND_ENABLE_CUDA)
         kernels/cuda/llm/attention_paged_prefill_causal.cu
         kernels/cuda/common/add_bias.cu
         kernels/cuda/common/add_residual.cu
+        kernels/cuda/common/rune_steer.cu
         kernels/cuda/common/add_rmsnorm.cu
         kernels/cuda/llm/attention.cu
         kernels/cuda/llm/attention_encoder.cu

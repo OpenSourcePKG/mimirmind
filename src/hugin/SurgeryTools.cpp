@@ -6,6 +6,8 @@
 #include "hugin/ForwardSupport.hpp"
 #include "hugin/ForwardTools.hpp"
 #include "hugin/LogitMath.hpp"
+#include "core/rune/RuneApplier.hpp"
+#include "runtime/encoder/LinearProbeTrainer.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -222,6 +224,7 @@ void SurgeryTools::dropStaleVectors() {
     const std::string key = _forward.targetKey();
     if (key != _vectorsKey) {
         _vectors.clear();
+        _conditions.clear();
         _baseEvals.clear();
         _vectorsKey = key;
     }
@@ -236,7 +239,383 @@ const SurgeryTools::SteerVector& SurgeryTools::vector(const std::string& name) {
     return it->second;
 }
 
+const SurgeryTools::ConditionVector& SurgeryTools::conditionVector(const std::string& name) {
+    dropStaleVectors();
+    const auto it = _conditions.find(name);
+    if (it == _conditions.end()) {
+        throw std::runtime_error("no condition '" + name + "' — build it with condition_vector");
+    }
+    return it->second;
+}
+
+namespace {
+
+/// Removes the preview overlay on scope exit (also on a throwing tool call),
+/// so a failed preview never leaves the session engine steered.
+class PreviewOverlay {
+public:
+    PreviewOverlay(Engine& e, std::vector<core::rune::RuneCondSteer> steers) : _e(e) {
+        _e.setPreviewConditionalSteers(std::move(steers));
+    }
+    ~PreviewOverlay() {
+        try {
+            _e.setPreviewConditionalSteers({});
+        } catch (...) {
+            // Destructor: the engine reports its own error; nothing to unwind.
+        }
+    }
+    PreviewOverlay(const PreviewOverlay&)            = delete;
+    PreviewOverlay& operator=(const PreviewOverlay&) = delete;
+
+private:
+    Engine& _e;
+};
+
+/// Fraction of `scores[from, to)` above `threshold` (0 for an empty range).
+double fireRate(const std::vector<float>& scores, std::size_t from, std::size_t to,
+                double threshold) {
+    if (to <= from) {
+        return 0.0;
+    }
+    std::size_t n = 0;
+    for (std::size_t i = from; i < to; ++i) {
+        n += static_cast<double>(scores[i]) > threshold ? std::size_t{1} : std::size_t{0};
+    }
+    return static_cast<double>(n) / static_cast<double>(to - from);
+}
+
+} // namespace
+
+/// 7.11: the conditional-steer tools (condition_vector, steer_if_preview).
+void SurgeryTools::registerConditionalOn(McpServer& server) {
+    server.addTool(
+        "condition_vector",
+        "Fit the condition of a conditional steer (CAST-style, roadmap 7.11): a binary linear "
+        "probe (softmax regression, the 8.23 trainer) on the L2-normalised residual after "
+        "'block', positive vs negative prompts. 'positions': 'generated' (default — the rows "
+        "that produce the first 'max_tokens' greedy tokens of the base model, i.e. where a "
+        "per-token gate has to fire during the answer), 'last' or 'all'. Result: a unit "
+        "direction + cosine threshold (rows with cos(h, direction) > threshold are 'on'), "
+        "train/val accuracy, per-class score ranges and per-prompt fire rates. Stored in this "
+        "session under 'name'. 'threshold' overrides the fitted one.",
+        schema({{"name", {{"type", "string"}}},
+                {"positive", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"negative", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"block", {{"type", "integer"}}},
+                {"positions", {{"type", "string"}, {"enum", {"generated", "last", "all"}}}},
+                {"max_tokens", {{"type", "integer"}}},
+                {"l2", {{"type", "number"}}},
+                {"threshold", {{"type", "number"}}},
+                {"add_bos", {{"type", "boolean"}}}},
+               {"name", "positive", "negative", "block"}),
+        [this](const json& a) {
+            Engine& e = _forward.engine();
+            dropStaleVectors();
+            const auto        blk    = blockArg(e, a.at("block"));
+            const bool        addBos = a.value("add_bos", true);
+            const std::string mode   = a.value("positions", std::string{"generated"});
+            if (mode != "generated" && mode != "last" && mode != "all") {
+                throw std::runtime_error("'positions' must be generated, last or all");
+            }
+            const std::size_t gen = maxTokensArg(a, 16);
+            const std::size_t d   = e.config().embeddingLength;
+
+            std::vector<float>        feats;
+            std::vector<std::int32_t> labels;
+            struct Span { std::size_t begin; std::size_t end; int label; std::string text; };
+            std::vector<Span> spans;
+            const auto collect = [&](const json& texts, int label) {
+                if (!texts.is_array() || texts.empty()) {
+                    throw std::runtime_error("'positive' and 'negative' must be non-empty arrays");
+                }
+                for (const auto& t : texts) {
+                    const std::string text = t.get<std::string>();
+                    auto              seq  = textTokens(e, text, addBos);
+                    const std::size_t n    = seq.size();
+                    std::size_t from = 0, to = n;
+                    if (mode == "last") {
+                        from = n - 1;
+                    } else if (mode == "generated") {
+                        const auto out = generateGreedy(e, seq, gen);
+                        seq.insert(seq.end(), out.begin(), out.end());
+                        from = n - 1;
+                        to   = n - 1 + std::max<std::size_t>(out.size(), 1);
+                    }
+                    Probe probe;
+                    probe.hiddenBlocks = {blk};
+                    (void)forward(e, seq, &probe);
+                    const auto& h = probe.hidden.at(blk);
+                    const std::size_t begin = labels.size();
+                    for (std::size_t r = from; r < to; ++r) {
+                        const std::span<const float> row{h.data() + r * d, d};
+                        const double nrm = l2(row);
+                        for (std::size_t i = 0; i < d; ++i) {
+                            feats.push_back(nrm > 0 ? static_cast<float>(static_cast<double>(row[i]) / nrm) : 0.0F);
+                        }
+                        labels.push_back(label);
+                    }
+                    spans.push_back({begin, labels.size(), label, text});
+                }
+            };
+            collect(a.at("positive"), 1);
+            collect(a.at("negative"), 0);
+
+            runtime::encoder::LinearProbeTrainer::Config cfg;
+            cfg.l2 = a.value("l2", cfg.l2);
+            const auto fit = runtime::encoder::LinearProbeTrainer::train(feats, d, labels, 2, cfg);
+            std::vector<float> w(d);
+            for (std::size_t i = 0; i < d; ++i) {
+                w[i] = fit.weight[d + i] - fit.weight[i];
+            }
+            const double nw = l2(w);
+            if (!(nw > 0)) {
+                throw std::runtime_error("probe weight is zero — the classes are not separable here");
+            }
+            ConditionVector c;
+            c.block = blk;
+            c.direction.resize(d);
+            for (std::size_t i = 0; i < d; ++i) {
+                c.direction[i] = static_cast<float>(static_cast<double>(w[i]) / nw);
+            }
+            const double b = static_cast<double>(fit.bias[1]) - static_cast<double>(fit.bias[0]);
+            c.threshold = a.contains("threshold") ? a["threshold"].get<double>() : -b / nw;
+            if (!(c.threshold > -1.0 && c.threshold < 1.0)) {
+                throw std::runtime_error("threshold " + std::to_string(c.threshold) +
+                                         " is not a cosine in (-1, 1); pass 'threshold'");
+            }
+            c.positions     = mode;
+            c.trainAccuracy = fit.trainAccuracy;
+            c.valAccuracy   = fit.valAccuracy;
+
+            // Cosine of every row (features are unit rows) + stats at the threshold.
+            std::vector<float> score(labels.size());
+            for (std::size_t r = 0; r < labels.size(); ++r) {
+                double s = 0;
+                for (std::size_t i = 0; i < d; ++i) {
+                    s += static_cast<double>(feats[r * d + i]) * static_cast<double>(c.direction[i]);
+                }
+                score[r] = static_cast<float>(s);
+            }
+            std::size_t correct = 0;
+            double lo[2] = {1, 1}, hi[2] = {-1, -1}, sum[2] = {0, 0};
+            std::size_t cnt[2] = {0, 0};
+            for (std::size_t r = 0; r < labels.size(); ++r) {
+                const int  l  = labels[r];
+                const bool on = static_cast<double>(score[r]) > c.threshold;
+                correct += (on == (l == 1)) ? 1 : 0;
+                lo[l] = std::min(lo[l], static_cast<double>(score[r]));
+                hi[l] = std::max(hi[l], static_cast<double>(score[r]));
+                sum[l] += static_cast<double>(score[r]);
+                ++cnt[l];
+            }
+            c.positiveRows = cnt[1];
+            c.negativeRows = cnt[0];
+            json prompts = json::array();
+            for (const auto& sp : spans) {
+                prompts.push_back({{"label", sp.label == 1 ? "positive" : "negative"},
+                                   {"rows", sp.end - sp.begin},
+                                   {"fire_rate", fireRate(score, sp.begin, sp.end, c.threshold)},
+                                   {"text", sp.text.substr(0, 80)}});
+            }
+            const auto cls = [&](int l) {
+                return json{{"rows", cnt[l]}, {"min", lo[l]}, {"max", hi[l]},
+                            {"mean", cnt[l] ? sum[l] / static_cast<double>(cnt[l]) : 0.0}};
+            };
+            const std::string name = a.at("name").get<std::string>();
+            _conditions[name] = c;
+            return json{{"name", name}, {"block", blk}, {"positions", mode},
+                        {"threshold", c.threshold}, {"fitted_threshold", -b / nw},
+                        {"train_accuracy", c.trainAccuracy}, {"val_accuracy", c.valAccuracy},
+                        {"accuracy_at_threshold",
+                         static_cast<double>(correct) / static_cast<double>(labels.size())},
+                        {"positive", cls(1)}, {"negative", cls(0)}, {"prompts", prompts}};
+        });
+
+    server.addTool(
+        "steer_if_preview",
+        "Preview a projection or conditional steer (roadmap 7.11) through the SAME engine "
+        "overlay a steer_if / steer_project Rune installs (preview == rune by construction). "
+        "'vector' = a steer_vector; 'mode' 'add' (x += alpha v) or 'project' (x -= alpha (x.u) u, "
+        "u = v/|v|, 0 < alpha <= 1); 'condition' (optional) = a condition_vector — then only "
+        "rows with cos(h, c) > threshold are changed, per token. For each of 'prompts': base and "
+        "edited greedy text (KV-cached serving decode) and the gate fire rate over prompt and "
+        "answer rows. Optional goldset ('items' / 'path') evaluated base vs edited with "
+        "per-check regressions. Preview only — the overlay is removed afterwards.",
+        schema({{"vector", {{"type", "string"}}},
+                {"alpha", {{"type", "number"}}},
+                {"mode", {{"type", "string"}, {"enum", {"add", "project"}}}},
+                {"condition", {{"type", "string"}}},
+                {"threshold", {{"type", "number"}}},
+                {"prompts", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"max_tokens", {{"type", "integer"}}},
+                {"items", {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                {"path", {{"type", "string"}}},
+                {"add_bos", {{"type", "boolean"}}},
+                {"detail", {{"type", "boolean"}}}},
+               {"vector"}),
+        [this](const json& a) {
+            Engine& e = _forward.engine();
+            dropStaleVectors();
+            const bool addBos = a.value("add_bos", true);
+            core::rune::RuneCondSteer cs = condSteerArg(a);
+            const std::size_t gen = maxTokensArg(a, 48);
+            const auto decode = [&](const std::vector<std::int32_t>& t) { return e.tokenizer().decode(t); };
+
+            // Everything unedited first, then ONE overlay install for the edited runs.
+            std::vector<std::vector<std::int32_t>> ids;
+            std::vector<std::string>               baseText;
+            if (a.contains("prompts")) {
+                for (const auto& p : a["prompts"]) {
+                    ids.push_back(textTokens(e, p.get<std::string>(), addBos));
+                    baseText.push_back(decode(generateGreedy(e, ids.back(), gen)));
+                }
+            }
+            json items;
+            json baseSum, baseRows = json::array();
+            if (a.contains("items") || a.contains("path")) {
+                items = loadGoldset(a);
+                baseSum = evalRun(e, items, addBos, baseRows);
+            }
+
+            json out{{"vector", a["vector"]}, {"block", cs.block},
+                     {"mode", std::string{core::rune::steerModeName(cs.mode)}},
+                     {"alpha", a.value("alpha", 1.0)}};
+            if (cs.hasCondition) {
+                out["condition"]       = a["condition"];
+                out["condition_block"] = cs.conditionBlock;
+                out["threshold"]       = cs.threshold;
+            }
+            {
+                PreviewOverlay overlay{e, {cs}};
+                json runs = json::array();
+                for (std::size_t i = 0; i < ids.size(); ++i) {
+                    const auto edited = generateGreedy(e, ids[i], gen);
+                    json r{{"prompt", a["prompts"][i]}, {"base_text", baseText[i]},
+                           {"edited_text", decode(edited)}};
+                    r["changed"] = r["base_text"] != r["edited_text"];
+                    if (cs.hasCondition) {
+                        // One full forward over prompt + edited answer: the gate
+                        // scores of exactly the rows serving would gate on.
+                        auto seq = ids[i];
+                        seq.insert(seq.end(), edited.begin(), edited.end());
+                        (void)forward(e, seq);
+                        const auto sc = e.previewConditionScores(0, seq.size());
+                        r["fire_rate_prompt"] = fireRate(sc, 0, ids[i].size(), cs.threshold);
+                        r["fire_rate_answer"] =
+                            fireRate(sc, ids[i].size() - 1, seq.size() - 1, cs.threshold);
+                    }
+                    runs.push_back(std::move(r));
+                }
+                out["runs"] = runs;
+                if (!items.is_null()) {
+                    json editRows = json::array();
+                    const json editSum = evalRun(e, items, addBos, editRows);
+                    out["eval"] = {{"base", baseSum}, {"edited", editSum},
+                                   {"check_regressions", checkRegressions(baseRows, editRows)}};
+                    json flips = json::array();
+                    for (std::size_t i = 0; i < editRows.size(); ++i) {
+                        const json& b = baseRows[i]["base_or_run"];
+                        const json& r = editRows[i]["base_or_run"];
+                        if (b.value("correct", false) != r.value("correct", false)) {
+                            flips.push_back({{"index", i}, {"id", editRows[i]["id"]},
+                                             {"now_correct", r.value("correct", false)}});
+                        }
+                    }
+                    out["eval"]["flips"] = flips;
+                    if (a.value("detail", false)) {
+                        out["eval"]["per_item"] = editRows;
+                    }
+                }
+            }
+            return out;
+        });
+}
+
+SurgeryTools::CondSteerSpec SurgeryTools::condSteerSpec(const json& a) {
+    const SteerVector& v = vector(a.at("vector").get<std::string>());
+    const double alpha = a.value("alpha", 1.0);
+    const std::string mode = a.value("mode", std::string{"add"});
+    if (mode != "add" && mode != "project") {
+        throw std::runtime_error("'mode' must be add or project");
+    }
+    if (!std::isfinite(alpha) || alpha == 0.0) {
+        throw std::runtime_error("'alpha' must be finite and non-zero");
+    }
+    const bool project = mode == "project";
+    if (project && !(alpha > 0.0 && alpha <= 1.0)) {
+        throw std::runtime_error("projection alpha must be in (0, 1] (> 1 reflects the "
+                                 "component and installs the opposite behaviour)");
+    }
+    if (project && !(l2(v.values) > 0)) {
+        throw std::runtime_error("steering vector is zero");
+    }
+    CondSteerSpec spec;
+    const std::string block = "blk." + std::to_string(v.block);
+    spec.op.target  = block;
+    spec.op.payload = "steer." + block;
+    spec.op.alpha   = alpha;
+    spec.payloads.emplace(spec.op.payload, v.values);
+    spec.params = {{"vector", a["vector"]}, {"block", v.block}, {"alpha", alpha},
+                   {"mode", mode}, {"vector_norm", v.norm},
+                   {"mean_residual_norm", v.residualNorm},
+                   {"relative_norm", v.residualNorm > 0
+                                         ? (project ? alpha : std::fabs(alpha) * v.norm / v.residualNorm)
+                                         : 0.0},
+                   {"positives", v.positives}, {"negatives", v.negatives}};
+    if (a.contains("condition")) {
+        const ConditionVector& c = conditionVector(a["condition"].get<std::string>());
+        if (c.block > v.block) {
+            throw std::runtime_error("condition block " + std::to_string(c.block) +
+                                     " is after the steered block " + std::to_string(v.block));
+        }
+        const double thr = a.value("threshold", c.threshold);
+        if (!(thr > -1.0 && thr < 1.0)) {
+            throw std::runtime_error("'threshold' must be a cosine in (-1, 1)");
+        }
+        spec.op.kind           = core::rune::RuneOpKind::SteerIf;
+        spec.op.steerMode      = project ? core::rune::RuneSteerMode::Project
+                                         : core::rune::RuneSteerMode::Add;
+        spec.op.condition      = "cond." + block;
+        spec.op.conditionBlock = c.block;
+        spec.op.threshold      = thr;
+        spec.payloads.emplace(spec.op.condition, c.direction);
+        spec.params["condition"]          = a["condition"];
+        spec.params["condition_block"]    = c.block;
+        spec.params["threshold"]          = thr;
+        spec.params["condition_positions"] = c.positions;
+        spec.params["condition_val_accuracy"] = c.valAccuracy;
+    } else if (project) {
+        spec.op.kind = core::rune::RuneOpKind::SteerProject;
+    } else {
+        throw std::runtime_error("an ungated add steer is steer_preview / rune_stage_steer; pass "
+                                 "'condition' or mode 'project'");
+    }
+    return spec;
+}
+
+core::rune::RuneCondSteer SurgeryTools::condSteerArg(const json& a) {
+    // Resolve through the real Futhark applier, so the preview overlay is
+    // bit-identical to what a staged Rune of the same spec installs.
+    CondSteerSpec spec = condSteerSpec(a);
+    core::rune::RuneManifest man;
+    man.name            = "preview";
+    man.baseFingerprint = "preview";
+    man.ops.push_back(spec.op);
+    const core::rune::RuneFile rune{std::move(man), std::move(spec.payloads)};
+    core::rune::RuneApplier applier;
+    auto rep = applier.apply(rune, "preview",
+                             [](std::string_view) { return std::optional<core::rune::RuneTensorView>{}; });
+    if (!rep) {
+        throw std::runtime_error(rep.error());
+    }
+    if (rep->condSteers.size() != 1) {
+        throw std::runtime_error("internal: expected one conditional steer");
+    }
+    return rep->condSteers.front();
+}
+
 void SurgeryTools::registerOn(McpServer& server) {
+    registerConditionalOn(server);
     // steer {vector, alpha, positions} / ablate {block, heads, scale} /
     // head_edits [{block, heads, scale}] -> Interventions.
     const auto interventionsArg = [this](const json& a) {

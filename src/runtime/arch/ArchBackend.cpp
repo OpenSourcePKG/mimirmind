@@ -12,6 +12,9 @@
 #include "runtime/arch/Qwen4ExpBackend.hpp"
 #include "compute/ComputeMatmul.hpp"
 #include "compute/ComputeOps.hpp"
+#include "compute/IRuneSteerOps.hpp"
+
+#include <algorithm>
 
 namespace mimirmind::runtime::arch {
 
@@ -139,6 +142,143 @@ void ArchBackend::setExpertMasks(
 void ArchBackend::addExpertMask(const float* bias, float* logits, std::size_t rows) const {
     // logits[r, e] += bias[e]: 0 for kept experts, kExpertMaskedLogit for disabled.
     _maskOps->addBiasAsync(logits, rows, _maskNExperts, bias);
+}
+
+void ArchBackend::setConditionalSteers(compute::ComputeOps& ops, std::size_t dModel,
+                                       std::vector<SteerCondition> conditions,
+                                       std::vector<ConditionalSteer> steers) {
+    clearConditionalSteers();
+    if (steers.empty()) {
+        if (!conditions.empty()) {
+            throw std::runtime_error("setConditionalSteers: conditions without a steer");
+        }
+        return;
+    }
+    if (ops.runeSteerOps() == nullptr) {
+        throw std::runtime_error("setConditionalSteers: this compute backend has no "
+                                 "projection / conditional steer ops (IRuneSteerOps)");
+    }
+    std::size_t maxBlock = 0;
+    for (const auto& c : conditions) {
+        if (c.direction == nullptr) {
+            throw std::runtime_error("setConditionalSteers: condition without a direction");
+        }
+        maxBlock = std::max(maxBlock, c.block);
+    }
+    for (const auto& s : steers) {
+        if (s.values == nullptr) {
+            throw std::runtime_error("setConditionalSteers: steer without values");
+        }
+        if (s.condition >= 0) {
+            const auto ci = static_cast<std::size_t>(s.condition);
+            if (ci >= conditions.size()) {
+                throw std::runtime_error("setConditionalSteers: steer references condition " +
+                                         std::to_string(s.condition) + " of " +
+                                         std::to_string(conditions.size()));
+            }
+            if (conditions[ci].block > s.block) {
+                throw std::runtime_error("setConditionalSteers: condition on block " +
+                                         std::to_string(conditions[ci].block) +
+                                         " is scored after the steered block " +
+                                         std::to_string(s.block));
+            }
+        }
+        maxBlock = std::max(maxBlock, s.block);
+    }
+    _condAtBlock.assign(maxBlock + 1, false);
+    for (const auto& c : conditions) {
+        _condAtBlock[c.block] = true;
+    }
+    for (const auto& s : steers) {
+        _condAtBlock[s.block] = true;
+    }
+    _conditions = std::move(conditions);
+    _condSteers = std::move(steers);
+    _condDModel = dModel;
+    _condOps    = &ops;
+    // Covers every decode batch and typical prefill chunks, so no allocation
+    // happens inside a captured graph.
+    constexpr std::size_t kInitialRows = 65536;
+    ensureConditionalCapacity(kInitialRows);
+}
+
+void ArchBackend::clearConditionalSteers() noexcept {
+    _condOps = nullptr;
+    _conditions.clear();
+    _condSteers.clear();
+    _condAtBlock.clear();
+    _condScores.clear();
+    _condProj = compute::ComputeBuffer{};
+    _condRetired.clear();
+    _condCapacity = 0;
+}
+
+void ArchBackend::ensureConditionalCapacity(std::size_t rows) const {
+    if (rows <= _condCapacity) {
+        return;
+    }
+    const std::size_t cap   = std::max(rows, _condCapacity * 2);
+    const std::size_t bytes = cap * sizeof(float);
+    for (auto& b : _condScores) {
+        _condRetired.push_back(std::move(b));
+    }
+    _condScores.clear();
+    for (std::size_t i = 0; i < _conditions.size(); ++i) {
+        _condScores.push_back(_condOps->allocate(bytes));
+    }
+    if (_condProj) {
+        _condRetired.push_back(std::move(_condProj));
+    }
+    _condProj     = _condOps->allocate(bytes);
+    _condCapacity = cap;
+}
+
+void ArchBackend::applyConditionalSteers(std::size_t block, float* x, std::size_t rows) const {
+    if (_condOps == nullptr || rows == 0) {
+        return;
+    }
+    ensureConditionalCapacity(rows);
+    compute::IRuneSteerOps& rs = *_condOps->runeSteerOps();
+    for (std::size_t i = 0; i < _conditions.size(); ++i) {
+        if (_conditions[i].block == block) {
+            rs.rowDotAsync(x, rows, _condDModel, _conditions[i].direction,
+                           _condScores[i].as<float>(), /*normalize=*/true);
+        }
+    }
+    for (const auto& s : _condSteers) {
+        if (s.block != block) {
+            continue;
+        }
+        const float* gate      = nullptr;
+        float        threshold = 0.0F;
+        if (s.condition >= 0) {
+            const auto ci = static_cast<std::size_t>(s.condition);
+            gate      = _condScores[ci].as<float>();
+            threshold = _conditions[ci].threshold;
+        }
+        if (s.project) {
+            // x -= alpha (x.v) v, v unit: coefficient = x.v, scale = -alpha.
+            rs.rowDotAsync(x, rows, _condDModel, s.values, _condProj.as<float>(),
+                           /*normalize=*/false);
+            rs.steerRowsAsync(x, rows, _condDModel, s.values, -s.alpha, gate, threshold,
+                              _condProj.as<float>());
+        } else {
+            rs.steerRowsAsync(x, rows, _condDModel, s.values, 1.0F, gate, threshold, nullptr);
+        }
+    }
+}
+
+std::vector<float> ArchBackend::readConditionScores(std::size_t condition,
+                                                    std::size_t rows) const {
+    if (_condOps == nullptr || condition >= _conditions.size()) {
+        throw std::runtime_error("readConditionScores: no condition " +
+                                 std::to_string(condition));
+    }
+    rows = std::min(rows, _condCapacity);
+    std::vector<float> out(rows);
+    _condOps->readbackToHost(out.data(), _condScores[condition].as<float>(),
+                             rows * sizeof(float));
+    return out;
 }
 
 void ArchBackend::addResidualSteer(const float* steer, float* x, std::size_t rows) const {

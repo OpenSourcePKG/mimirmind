@@ -25,6 +25,7 @@ class IHyperConnectionOps;
 class IMoeGroupedOps;
 class IPagedAttentionOps;
 class IPleOps;
+class IRuneSteerOps;
 
 /// 5.21 Increment II — shape/control bundle for the batched GatedDeltaNet
 /// recurrence. Groups the scalar dims + per-slot control that grow as the
@@ -878,6 +879,14 @@ public:
     // nullptr on backends without PLE (every arch but qwen4_exp on CUDA/Bragi)
     // — no throw-default stubs on the neutral base.
     [[nodiscard]] virtual IPleOps* pleOps() noexcept {
+        return nullptr;
+    }
+
+    // --- 7.11 Rune projection / conditional steer ------------------------------
+    // Row-wise dot + gated row add for Futhark `steer_project` / `steer_if`
+    // (IRuneSteerOps, ISP-split). nullptr on backends without them; the engine
+    // then refuses such a rune at load instead of silently skipping it.
+    [[nodiscard]] virtual IRuneSteerOps* runeSteerOps() noexcept {
         return nullptr;
     }
 

@@ -375,6 +375,38 @@ void GpuOps::deltanetGateAsync(const float* alpha,
     ::mimirmind::compute::deltanetGate(alpha, ssmA, ssmDt, gLog, T, H);
 }
 
+void GpuOps::rowDotAsync(const float* x, std::size_t rows, std::size_t d, const float* w,
+                         float* out, bool normalize) {
+    for (std::size_t r = 0; r < rows; ++r) {
+        const float* row = x + r * d;
+        double dot = 0.0;
+        double sq  = 0.0;
+        for (std::size_t k = 0; k < d; ++k) {
+            dot += static_cast<double>(row[k]) * static_cast<double>(w[k]);
+            sq  += static_cast<double>(row[k]) * static_cast<double>(row[k]);
+        }
+        if (normalize) {
+            dot = sq > 0.0 ? dot / std::sqrt(sq) : 0.0;
+        }
+        out[r] = static_cast<float>(dot);
+    }
+}
+
+void GpuOps::steerRowsAsync(float* x, std::size_t rows, std::size_t d, const float* v,
+                            float alpha, const float* gate, float threshold,
+                            const float* coef) {
+    for (std::size_t r = 0; r < rows; ++r) {
+        if (gate != nullptr && !(gate[r] > threshold)) {
+            continue;
+        }
+        const float s = alpha * (coef != nullptr ? coef[r] : 1.0F);
+        float* row = x + r * d;
+        for (std::size_t k = 0; k < d; ++k) {
+            row[k] += s * v[k];
+        }
+    }
+}
+
 void GpuOps::sigmoidInPlaceAsync(std::span<float> y) {
     ::mimirmind::compute::sigmoidInPlace(y.data(), y.size());
 }

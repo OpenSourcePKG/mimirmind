@@ -4,6 +4,8 @@
 #pragma once
 
 #include "hugin/McpServer.hpp"
+#include "core/rune/RuneApplier.hpp"
+#include "core/rune/RuneFile.hpp"
 
 #include <cstdint>
 #include <map>
@@ -37,6 +39,15 @@ class ForwardTools;
  *  - eval_preview    goldset eval (as `eval`) with steer / head edits applied
  *                    to every forward, against the cached base result
  *  - steer_list      steering vectors of this session
+ *  - condition_vector  (7.11) fit a linear probe on the normalised residual at
+ *                    one block (positive vs negative prompts, at the last /
+ *                    every / generated positions): a unit direction + cosine
+ *                    threshold, the condition of a conditional steer
+ *  - steer_if_preview  (7.11) a steer (add or projection), optionally gated
+ *                    per token on a condition, installed through the SAME
+ *                    engine overlay a steer_if / steer_project Rune uses;
+ *                    base vs edited greedy text (KV-cached serving decode),
+ *                    gate fire rates, optional goldset eval
  *
  * Steering vectors live in the session and are dropped when open_model
  * switches the target.
@@ -59,13 +70,41 @@ public:
     /// Session steering vector by name; throws when unknown / model changed.
     const SteerVector& steerVector(const std::string& name) { return vector(name); }
 
+    /// 7.11 condition of a conditional steer: rows with cos(h_block, direction)
+    /// > threshold are gated on.
+    struct ConditionVector {
+        std::uint32_t      block{0};
+        std::vector<float> direction;   ///< unit [d_model]
+        double             threshold{0};
+        std::string        positions;   ///< "last" | "all" | "generated"
+        std::size_t        positiveRows{0};
+        std::size_t        negativeRows{0};
+        double             trainAccuracy{0};
+        double             valAccuracy{0};
+    };
+    const ConditionVector& conditionVector(const std::string& name);
+
+    /// {vector, alpha, mode, condition?, threshold?} -> the Rune op + payloads
+    /// of a projection / conditional steer. rune_stage_steer_if writes exactly
+    /// this; steer_if_preview resolves it through the real RuneApplier
+    /// (condSteerArg), so preview and staged Rune install the same overlay.
+    struct CondSteerSpec {
+        core::rune::RuneOp                         op;
+        std::map<std::string, std::vector<float>>  payloads;
+        nlohmann::json                             params;
+    };
+    CondSteerSpec             condSteerSpec(const nlohmann::json& a);
+    core::rune::RuneCondSteer condSteerArg(const nlohmann::json& a);
+
 private:
+    void               registerConditionalOn(McpServer& server);
     const SteerVector& vector(const std::string& name);
     void               dropStaleVectors();
 
     ForwardTools&                        _forward;
     std::string                          _vectorsKey;
     std::map<std::string, SteerVector>   _vectors;
+    std::map<std::string, ConditionVector> _conditions;
     /// eval_preview base results per goldset path (dropped with the vectors).
     std::map<std::string, std::pair<nlohmann::json, nlohmann::json>> _baseEvals;
 };
