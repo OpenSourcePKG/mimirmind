@@ -84,18 +84,35 @@ ContinuationScore scoreContinuation(Engine& e, const std::vector<std::int32_t>& 
                                     const std::vector<std::int32_t>& cont,
                                     const ProbeSetup* setup = nullptr);
 
+/// Greedy continuation of `prompt`, stopping at EOS / the chat template's stop
+/// ids. Without `setup` it runs the engine's KV-cached generate() (the serving
+/// decode path, fast); with `setup` every step is a stateless forward with the
+/// interventions installed (slow, but the edits apply to every token).
+std::vector<std::int32_t> generateGreedy(Engine& e, const std::vector<std::int32_t>& prompt,
+                                         std::size_t maxTokens, const ProbeSetup* setup = nullptr);
+
 /// Goldset items: inline `items` array or a .json (array) / .jsonl file at `path`.
 nlohmann::json loadGoldset(const nlohmann::json& a);
 
-/// One eval item: {"prompt", "expect"} (exact continuation, greedy match) or
-/// {"prompt", "choices":[...], "answer": idx} (multiple choice by logprob).
+/// One eval item: {"prompt", "expect"} (exact continuation, greedy match),
+/// {"prompt", "choices":[...], "answer": idx} (multiple choice by logprob) or
+/// {"prompt", "generate": {...}} (greedy free generation checked by
+/// GenerationCheck: language, code-mixing, regex facts; result carries
+/// "checks" and "text", and no logprob).
 nlohmann::json evalItem(Engine& e, const nlohmann::json& item, bool addBos,
                         const ProbeSetup* setup = nullptr);
 
 /// Whole goldset on one engine; per-item results land in rows[i]["base_or_run"].
-/// Summary: items, accuracy, mean_logprob (finite items), non_finite_items.
+/// Summary: items, accuracy, mean_logprob (finite scored items; generate
+/// items have no logprob and are left out), non_finite_items, generate_items.
 /// `setup` (optional) applies the same interventions to every forward.
 nlohmann::json evalRun(Engine& e, const nlohmann::json& items, bool addBos, nlohmann::json& rows,
                        const ProbeSetup* setup = nullptr);
+
+/// Per-check regressions of generate items between two evalRun row sets: every
+/// check that passed on `baseRows` and fails on `runRows`, as
+/// [{index, id, check, base_text, text}]. Checks a base answer already failed
+/// are not counted, so a known base error never blocks an edit.
+nlohmann::json checkRegressions(const nlohmann::json& baseRows, const nlohmann::json& runRows);
 
 } // namespace mimirmind::hugin::forward_support

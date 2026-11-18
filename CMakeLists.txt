@@ -1874,6 +1874,7 @@ target_link_libraries(rune_tests PRIVATE mimirmind_core_common)
 add_library(mimirmind_hugin OBJECT
     src/hugin/ForwardSupport.cpp
     src/hugin/ForwardTools.cpp
+    src/hugin/GenerationCheck.cpp
     src/hugin/InspectTools.cpp
     src/hugin/LogitMath.cpp
     src/hugin/McpServer.cpp

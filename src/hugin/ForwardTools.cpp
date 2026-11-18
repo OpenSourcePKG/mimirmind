@@ -487,7 +487,10 @@ void ForwardTools::registerOn(McpServer& server) {
         "eval",
         "Forward-only goldset eval (teacher-forced, no sampling). Items: {prompt, expect} -> "
         "correct iff every expected token is the argmax; or {prompt, choices[], answer} -> "
-        "correct iff the answer has the highest total logprob. Goldset inline ('items') or a "
+        "correct iff the answer has the highest total logprob; or {prompt, generate:{max_tokens, "
+        "lang:'de'|'en', max_other_markers, match:[regex], no_match:[regex]}} -> greedy free "
+        "generation (KV-cached), correct iff every check passes (answer language, no code-mixing, "
+        "facts). Goldset inline ('items') or a "
         ".json/.jsonl file ('path'). With 'runes' the same set also runs on the rune-applied "
         "model and the deltas are reported.",
         schema({{"items", {{"type", "array"}, {"items", {{"type", "object"}}}}},
@@ -524,6 +527,7 @@ void ForwardTools::registerOn(McpServer& server) {
                     }
                 }
                 out["flips"] = flips;
+                out["check_regressions"] = checkRegressions(baseRows, runeRows);
             }
             if (a.value("detail", false)) {
                 out["per_item"] = rows;

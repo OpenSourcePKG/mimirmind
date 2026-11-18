@@ -8,6 +8,7 @@
 #include "core/rune/RuneFile.hpp"
 #include "core/rune/RuneFormat.hpp"
 #include "hugin/ForwardTools.hpp"
+#include "hugin/GenerationCheck.hpp"
 #include "hugin/RuneStaging.hpp"
 #include "hugin/SurgeryTools.hpp"
 #include "hugin/InspectTools.hpp"
@@ -357,6 +358,70 @@ TEST(eval_withoutModel_andBadGoldset_reportToolError) {
     EXPECT_TRUE(missing["content"][0]["text"].get<std::string>().find("cannot open") != std::string::npos);
     const json noModel = call({{"items", {{{"prompt", "a"}, {"expect", " b"}}}}});
     EXPECT_TRUE(noModel["content"][0]["text"].get<std::string>().find("open_model") != std::string::npos);
+}
+
+TEST(generationCheck_language_mixing_and_facts) {
+    using GC = hg::GenerationCheck;
+    // Clean answers in each language.
+    const GC de{json{{"lang", "de"}, {"match", "Kilimanjaro.*5[.,]?89\\d"}}};
+    const json okDe = de.evaluate("Der höchste Berg Afrikas ist der Kilimanjaro mit 5.895 Metern.");
+    EXPECT_TRUE(okDe["correct"].get<bool>());
+    EXPECT_EQ(okDe["lang"].get<std::string>(), std::string{"de"});
+    // English answer to a German instruction: language fails, the fact still holds.
+    const json en = de.evaluate("The tallest mountain in Africa is Kilimanjaro,\nat 5,895 meters.");
+    EXPECT_TRUE(!en["checks"]["lang"].get<bool>());
+    EXPECT_TRUE(en["checks"]["match"].get<bool>());   // newline is matched as a space
+    // Fact drift (attempt-2 canary).
+    const json drift = de.evaluate("Der höchste Berg Afrikas ist der Kilimanjaro mit 5.199 Metern.");
+    EXPECT_TRUE(drift["checks"]["lang"].get<bool>());
+    EXPECT_TRUE(!drift["checks"]["match"].get<bool>());
+    EXPECT_TRUE(!drift["correct"].get<bool>());
+    // Code-mixing in an English answer (the attempt-2 failure).
+    const GC enc{json{{"lang", "en"}, {"match", "Portug"}}};
+    const json mixed = enc.evaluate("In Brazil wird Portugiesisch gesprochen.");
+    EXPECT_TRUE(!mixed["checks"]["no_mixing"].get<bool>());
+    EXPECT_TRUE(!mixed["correct"].get<bool>());
+    const json clean = enc.evaluate("The official language of Brazil is Portuguese.");
+    EXPECT_TRUE(clean["correct"].get<bool>());
+    // A single foreign marker is tolerated by default, none with max_other_markers 0.
+    EXPECT_TRUE(enc.evaluate("The capital is called Brasília, and Portuguese is spoken there; "
+                             "the word is das.")["checks"]["no_mixing"].get<bool>());
+    const GC strict{json{{"lang", "en"}, {"max_other_markers", 0}}};
+    EXPECT_TRUE(!strict.evaluate("The language is Portuguese, das ist klar.")["checks"]["no_mixing"].get<bool>());
+    // no_match and case-insensitivity.
+    const GC nm{json{{"match", "ottawa"}, {"no_match", json::array({"toronto"})}}};
+    EXPECT_TRUE(nm.evaluate("The capital of Canada is Ottawa.")["correct"].get<bool>());
+    EXPECT_TRUE(!nm.evaluate("Ottawa, not Toronto.")["correct"].get<bool>());
+    // Bad specs are refused with the field name.
+    const auto refuses = [](json spec, const std::string& what) {
+        try {
+            (void)GC{spec};
+        } catch (const std::exception& ex) {
+            return std::string{ex.what()}.find(what) != std::string::npos;
+        }
+        return false;
+    };
+    EXPECT_TRUE(refuses({{"lang", "fr"}}, "lang"));
+    EXPECT_TRUE(refuses({{"match", "("}}, "bad regex"));
+    EXPECT_TRUE(refuses({{"max_tokens", 0}, {"lang", "de"}}, "max_tokens"));
+    EXPECT_TRUE(refuses(json::object(), "at least one"));
+    const GC dflt{json{{"lang", "de"}}};
+    EXPECT_EQ(dflt.maxTokens(), GC::kDefaultMaxTokens);
+}
+
+TEST(eval_badGenerateSpec_reportedBeforeAnyEngine) {
+    hg::McpServer    server{"hugin", "test"};
+    hg::ForwardTools fwd{[] { return hg::ForwardTools::Target{}; }};
+    fwd.registerOn(server);
+    const json r = (*server.handle({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                    {"params", {{"name", "eval"},
+                                                {"arguments", {{"items", {{{"prompt", "a"},
+                                                    {"generate", {{"lang", "de"}, {"match", "(["}}}}}}}}}}}))["result"];
+    EXPECT_TRUE(r["isError"].get<bool>());
+    const std::string text = r["content"][0]["text"].get<std::string>();
+    EXPECT_TRUE(text.find("goldset item 0") != std::string::npos);
+    EXPECT_TRUE(text.find("bad regex") != std::string::npos);
+    EXPECT_TRUE(text.find("open_model") == std::string::npos);
 }
 
 TEST(openModel_checkpointDir_forwardOnly) {

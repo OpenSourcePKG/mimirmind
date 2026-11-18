@@ -509,7 +509,11 @@ void RuneStaging::registerOn(McpServer& server) {
         "target accuracy does not drop and (accuracy or mean logprob) improves by more than "
         "'min_target_logprob_gain', control accuracy drops by at most 'max_control_accuracy_drop' "
         "(default 0) and control mean logprob by at most 'max_control_logprob_drop' (default 0.05), "
-        "and the rune adds no non-finite items. Red moves the rune to rejected/ unless "
+        "and the rune adds no non-finite items. Free-generation items ({prompt, generate:{...}}, "
+        "see eval) are checked per check: a check (answer language, no code-mixing, a fact "
+        "regex) that passed on the base and fails with the rune is a regression; more than "
+        "'max_check_regressions' (default 0) in a set is red, in the target set as well. "
+        "Red moves the rune to rejected/ unless "
         "'auto_reject' is false. Sets: {items:[...]} or {path:\".jsonl\"} (see eval).",
         schema({{"name", {{"type", "string"}}},
                 {"target", {{"type", "object"}}},
@@ -517,6 +521,7 @@ void RuneStaging::registerOn(McpServer& server) {
                 {"min_target_logprob_gain", {{"type", "number"}}},
                 {"max_control_accuracy_drop", {{"type", "number"}}},
                 {"max_control_logprob_drop", {{"type", "number"}}},
+                {"max_check_regressions", {{"type", "integer"}}},
                 {"auto_reject", {{"type", "boolean"}}},
                 {"add_bos", {{"type", "boolean"}}}},
                {"name", "target"}),
@@ -531,6 +536,10 @@ void RuneStaging::registerOn(McpServer& server) {
             const double minGain   = a.value("min_target_logprob_gain", 0.0);
             const double maxAccDrop = a.value("max_control_accuracy_drop", 0.0);
             const double maxLpDrop  = a.value("max_control_logprob_drop", 0.05);
+            const auto   maxCheckReg = a.value("max_check_regressions", std::int64_t{0});
+            if (maxCheckReg < 0) {
+                throw std::runtime_error("'max_check_regressions' must be >= 0");
+            }
 
             json reasons = json::array();
             json result{{"rune_hash", hash}, {"at", nowIso()}};
@@ -568,7 +577,15 @@ void RuneStaging::registerOn(McpServer& server) {
                              r["mean_logprob"].get<double>() - s.b["mean_logprob"].get<double>()},
                             {"new_non_finite", r["non_finite_items"].get<std::size_t>() >
                                                    s.b["non_finite_items"].get<std::size_t>()},
-                            {"flips", flips}};
+                            {"flips", flips},
+                            {"check_regressions", checkRegressions(s.rowsB, rowsR)}};
+            };
+            const auto checkBudget = [&](const json& set, const char* label) {
+                const auto n = set["check_regressions"].size();
+                if (n > static_cast<std::size_t>(maxCheckReg)) {
+                    reasons.push_back(std::string{label} + ": " + std::to_string(n) +
+                                      " free-generation check regression(s)");
+                }
             };
             _forward.dropVariant();   // never reuse an engine built from older bytes
             try {
@@ -584,6 +601,7 @@ void RuneStaging::registerOn(McpServer& server) {
                 if (dAcc < 0) reasons.push_back("target accuracy dropped");
                 if (!(dAcc > 0 || dLp > minGain)) reasons.push_back("target did not improve");
                 if (tgt["new_non_finite"].get<bool>()) reasons.push_back("target: new non-finite items");
+                checkBudget(tgt, "target");
                 if (ctlBase) {
                     const json ctl = evalRune(*ctlBase);
                     result["control"] = ctl;
@@ -592,6 +610,7 @@ void RuneStaging::registerOn(McpServer& server) {
                     if (-ctl["delta_mean_logprob"].get<double>() > maxLpDrop)
                         reasons.push_back("control mean logprob dropped beyond budget");
                     if (ctl["new_non_finite"].get<bool>()) reasons.push_back("control: new non-finite items");
+                    checkBudget(ctl, "control");
                 } else {
                     result["warning"] = "no control set — regressions outside the target are unchecked";
                 }
@@ -605,7 +624,8 @@ void RuneStaging::registerOn(McpServer& server) {
             result["reasons"] = reasons;
             result["thresholds"] = {{"min_target_logprob_gain", minGain},
                                     {"max_control_accuracy_drop", maxAccDrop},
-                                    {"max_control_logprob_drop", maxLpDrop}};
+                                    {"max_control_logprob_drop", maxLpDrop},
+                                    {"max_check_regressions", maxCheckReg}};
             json side = readSidecar(State::Staged, name);
             side["gate"]   = result;
             const bool autoReject = !green && a.value("auto_reject", true);

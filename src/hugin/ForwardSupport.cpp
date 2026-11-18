@@ -3,7 +3,9 @@
 
 #include "hugin/ForwardSupport.hpp"
 
+#include "hugin/GenerationCheck.hpp"
 #include "hugin/LogitMath.hpp"
+#include "model/ChatTemplate.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -177,10 +179,70 @@ ContinuationScore scoreContinuation(Engine& e, const std::vector<std::int32_t>& 
     return sc;
 }
 
+std::vector<std::int32_t> generateGreedy(Engine& e, const std::vector<std::int32_t>& prompt,
+                                         std::size_t maxTokens, const ProbeSetup* setup) {
+    if (prompt.empty()) {
+        throw std::runtime_error("generate item needs a non-empty prompt");
+    }
+    std::vector<std::int32_t> stops = model::ChatTemplate::stopIds(
+        model::ChatTemplate::detectFromArch(e.config().architecture), e.tokenizer());
+    stops.push_back(e.tokenizer().eosId());
+    const auto isStop = [&](std::int32_t t) { return std::find(stops.begin(), stops.end(), t) != stops.end(); };
+
+    std::vector<std::int32_t> out;
+    if (setup == nullptr || !*setup) {
+        runtime::GenerateParams p;
+        p.maxNewTokens = maxTokens;   // sampling default = temperature 0 = argmax
+        p.stopIds      = stops;
+        e.resetCache();               // no prefix reuse: every item starts cold, like forward()
+        out = e.generate(prompt, p);
+        e.resetCache();
+        while (!out.empty() && isStop(out.back())) {
+            out.pop_back();
+        }
+        return out;
+    }
+    std::vector<std::int32_t> ids = prompt;
+    for (std::size_t i = 0; i < maxTokens; ++i) {
+        Engine::ForwardProbe probe;
+        (*setup)(probe, ids.size());
+        const auto lg  = forward(e, ids, &probe);
+        const auto& last = lg.back();
+        const auto tok = static_cast<std::int32_t>(std::max_element(last.begin(), last.end()) - last.begin());
+        if (isStop(tok)) {
+            break;
+        }
+        out.push_back(tok);
+        ids.push_back(tok);
+    }
+    return out;
+}
+
 /// Goldset items: inline array or a .json (array) / .jsonl file.
+namespace {
+
+/// Free-generation specs are validated up front, so a bad regex or language
+/// fails the call before any engine is built or any forward runs.
+json validated(json items) {
+    if (items.is_array()) {
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            if (items[i].is_object() && items[i].contains("generate")) {
+                try {
+                    (void)GenerationCheck{items[i]["generate"]};
+                } catch (const std::exception& ex) {
+                    throw std::runtime_error("goldset item " + std::to_string(i) + ": " + ex.what());
+                }
+            }
+        }
+    }
+    return items;
+}
+
+} // namespace
+
 json loadGoldset(const json& a) {
     if (a.contains("items")) {
-        return a["items"];
+        return validated(a["items"]);
     }
     if (!a.contains("path")) {
         throw std::runtime_error("pass 'items' or 'path'");
@@ -195,7 +257,7 @@ json loadGoldset(const json& a) {
     const std::string text = ss.str();
     const auto first = text.find_first_not_of(" \t\r\n");
     if (first != std::string::npos && text[first] == '[') {
-        return json::parse(text);
+        return validated(json::parse(text));
     }
     json items = json::array();
     std::istringstream lines(text);
@@ -205,12 +267,23 @@ json loadGoldset(const json& a) {
             items.push_back(json::parse(line));
         }
     }
-    return items;
+    return validated(std::move(items));
 }
 
 /// One eval item on one engine: {"prompt", "expect"} (exact continuation) or
 /// {"prompt", "choices":[...], "answer": idx} (multiple choice by logprob).
 json evalItem(Engine& e, const json& item, bool addBos, const ProbeSetup* setup) {
+    if (item.contains("generate")) {
+        const GenerationCheck check{item["generate"]};   // validate before the forward
+        const auto prompt = encodeText(e, item.at("prompt").get<std::string>(), addBos);
+        const auto out    = generateGreedy(e, prompt, check.maxTokens(), setup);
+        const std::string text = e.tokenizer().decode(out);
+        json r = check.evaluate(text);
+        r["kind"]   = "generate";
+        r["text"]   = text;
+        r["tokens"] = out.size();
+        return r;
+    }
     const auto prompt = encodeText(e, item.at("prompt").get<std::string>(), addBos);
     const auto encodeCont = [&](const std::string& t) { return e.tokenizer().encode(t, false); };
     if (item.contains("choices")) {
@@ -234,13 +307,14 @@ json evalItem(Engine& e, const json& item, bool addBos, const ProbeSetup* setup)
 }
 
 json evalRun(Engine& e, const json& items, bool addBos, json& rows, const ProbeSetup* setup) {
-    std::size_t correct = 0, nonFinite = 0;
+    std::size_t correct = 0, nonFinite = 0, generated = 0;
     double      lpSum   = 0;
     for (std::size_t i = 0; i < items.size(); ++i) {
         json r = evalItem(e, items[i], addBos, setup);
         correct += r["correct"].get<bool>() ? 1U : 0U;
-        const double lp = r["logprob"].get<double>();
-        if (std::isfinite(lp)) {
+        if (!r.contains("logprob")) {
+            ++generated;   // free generation: checked, not scored
+        } else if (const double lp = r["logprob"].get<double>(); std::isfinite(lp)) {
             lpSum += lp;
         } else {
             ++nonFinite;   // NaN/Inf logits from the forward: report, don't poison the mean
@@ -251,9 +325,30 @@ json evalRun(Engine& e, const json& items, bool addBos, json& rows, const ProbeS
         rows[i]["base_or_run"] = std::move(r);
     }
     const double n = static_cast<double>(std::max<std::size_t>(1, items.size()));
-    const double finiteN = static_cast<double>(std::max<std::size_t>(1, items.size() - nonFinite));
+    const double finiteN =
+        static_cast<double>(std::max<std::size_t>(1, items.size() - nonFinite - generated));
     return json{{"items", items.size()}, {"accuracy", static_cast<double>(correct) / n},
-                {"mean_logprob", lpSum / finiteN}, {"non_finite_items", nonFinite}};
+                {"mean_logprob", lpSum / finiteN}, {"non_finite_items", nonFinite},
+                {"generate_items", generated}};
+}
+
+json checkRegressions(const json& baseRows, const json& runRows) {
+    json out = json::array();
+    for (std::size_t i = 0; i < baseRows.size() && i < runRows.size(); ++i) {
+        const json& b = baseRows[i]["base_or_run"];
+        const json& r = runRows[i]["base_or_run"];
+        if (!b.contains("checks") || !r.contains("checks")) {
+            continue;
+        }
+        for (const auto& [name, passed] : b["checks"].items()) {
+            if (passed.get<bool>() && !r["checks"].value(name, false)) {
+                out.push_back({{"index", i}, {"id", baseRows[i]["id"]}, {"check", name},
+                               {"base_text", b.value("text", std::string{})},
+                               {"text", r.value("text", std::string{})}});
+            }
+        }
+    }
+    return out;
 }
 
 } // namespace mimirmind::hugin::forward_support

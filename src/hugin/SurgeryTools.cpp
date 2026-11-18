@@ -636,6 +636,7 @@ void SurgeryTools::registerOn(McpServer& server) {
                 rows.push_back({{"index", i}, {"id", editRows[i]["id"]}, {"base", b}, {"edited", r}});
             }
             out["flips"] = flips;
+            out["check_regressions"] = checkRegressions(baseRows, editRows);
             if (a.value("detail", false)) {
                 out["per_item"] = rows;
             }
