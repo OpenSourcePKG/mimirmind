@@ -273,7 +273,10 @@ Workflow:
    `positions: "generated"` (default) uses the rows that generate the
    base model's first `max_tokens` answer tokens. Returns direction,
    threshold, train/val accuracy, per-class score ranges and per-prompt
-   fire rates.
+   fire rates. `calibrate_negatives: true` scores every row the gate will
+   see on the negative prompts (all prompt rows plus generated answer rows)
+   and raises the threshold above their maximum — required when the
+   direction is fitted on `last` rows, because the gate runs on every row.
 3. `steer_if_preview` — installs the overlay exactly as the Rune would
    (resolved through the real Rune applier) and reports base vs. edited
    text plus fire rates over prompt and answer rows. Optional goldset.
@@ -295,6 +298,12 @@ exactly (4/4 and 2/2).
   in `eval` use the KV-cached serving decode.
 - One GPU process at a time on GB10; Hugin sessions on a large model need a
   maintenance window.
+- Keep the prompts used to fit steer and condition vectors disjoint from
+  the gate goldsets, and use the same questions in both classes of a
+  condition (only the property under test may differ). On Kolibri-1 a
+  "German instruction present" condition looked perfectly separable
+  (val 1.00) until the fitting questions were made disjoint; then it fell
+  to chance (0.57).
 - Steering and head edits are cheap levers. Failures that need new
   knowledge or a different policy belong to adapter training (roadmap
   7.4/7.5), not to a Rune of this kind.

@@ -297,7 +297,11 @@ void SurgeryTools::registerConditionalOn(McpServer& server) {
         "per-token gate has to fire during the answer), 'last' or 'all'. Result: a unit "
         "direction + cosine threshold (rows with cos(h, direction) > threshold are 'on'), "
         "train/val accuracy, per-class score ranges and per-prompt fire rates. Stored in this "
-        "session under 'name'. 'threshold' overrides the fitted one.",
+        "session under 'name'. 'threshold' overrides the fitted one. 'calibrate_negatives': true "
+        "also scores EVERY row a per-row gate will see on the negative prompts (all prompt rows "
+        "plus 'max_tokens' generated answer rows) and raises the threshold to their maximum + "
+        "'calibrate_margin' (default 0.01), so no negative row fires — needed when the "
+        "direction is fitted on 'last' rows but the gate runs on every row.",
         schema({{"name", {{"type", "string"}}},
                 {"positive", {{"type", "array"}, {"items", {{"type", "string"}}}}},
                 {"negative", {{"type", "array"}, {"items", {{"type", "string"}}}}},
@@ -306,6 +310,8 @@ void SurgeryTools::registerConditionalOn(McpServer& server) {
                 {"max_tokens", {{"type", "integer"}}},
                 {"l2", {{"type", "number"}}},
                 {"threshold", {{"type", "number"}}},
+                {"calibrate_negatives", {{"type", "boolean"}}},
+                {"calibrate_margin", {{"type", "number"}}},
                 {"add_bos", {{"type", "boolean"}}}},
                {"name", "positive", "negative", "block"}),
         [this](const json& a) {
@@ -319,6 +325,17 @@ void SurgeryTools::registerConditionalOn(McpServer& server) {
             }
             const std::size_t gen = maxTokensArg(a, 16);
             const std::size_t d   = e.config().embeddingLength;
+            const bool   calibrate = a.value("calibrate_negatives", false);
+            const double margin    = a.value("calibrate_margin", 0.01);
+            if (calibrate && a.contains("threshold")) {
+                throw std::runtime_error("pass either 'threshold' or 'calibrate_negatives', not both");
+            }
+            if (!(margin >= 0.0 && margin < 1.0)) {
+                throw std::runtime_error("'calibrate_margin' must be in [0, 1)");
+            }
+            // Unit rows of the negative prompts over every gated position (calibration only).
+            std::vector<float>       calib;
+            std::vector<std::size_t> calibSpan;   // per negative prompt: [begin, end) row index
 
             std::vector<float>        feats;
             std::vector<std::int32_t> labels;
@@ -333,18 +350,35 @@ void SurgeryTools::registerConditionalOn(McpServer& server) {
                     auto              seq  = textTokens(e, text, addBos);
                     const std::size_t n    = seq.size();
                     std::size_t from = 0, to = n;
+                    const bool calibRows = calibrate && label == 0;
                     if (mode == "last") {
                         from = n - 1;
-                    } else if (mode == "generated") {
+                    }
+                    if (mode == "generated" || calibRows) {
                         const auto out = generateGreedy(e, seq, gen);
                         seq.insert(seq.end(), out.begin(), out.end());
-                        from = n - 1;
-                        to   = n - 1 + std::max<std::size_t>(out.size(), 1);
+                        if (mode == "generated") {
+                            from = n - 1;
+                            to   = n - 1 + std::max<std::size_t>(out.size(), 1);
+                        }
                     }
                     Probe probe;
                     probe.hiddenBlocks = {blk};
                     (void)forward(e, seq, &probe);
                     const auto& h = probe.hidden.at(blk);
+                    if (calibRows) {
+                        // The last generated token is never fed back, so its row is not gated.
+                        const std::size_t rows = seq.size() - (seq.size() > n ? 1 : 0);
+                        calibSpan.push_back(calib.size() / d);
+                        for (std::size_t r = 0; r < rows; ++r) {
+                            const std::span<const float> row{h.data() + r * d, d};
+                            const double nrm = l2(row);
+                            for (std::size_t i = 0; i < d; ++i) {
+                                calib.push_back(nrm > 0 ? static_cast<float>(static_cast<double>(row[i]) / nrm) : 0.0F);
+                            }
+                        }
+                        calibSpan.push_back(calib.size() / d);
+                    }
                     const std::size_t begin = labels.size();
                     for (std::size_t r = from; r < to; ++r) {
                         const std::span<const float> row{h.data() + r * d, d};
@@ -382,6 +416,34 @@ void SurgeryTools::registerConditionalOn(McpServer& server) {
             if (!(c.threshold > -1.0 && c.threshold < 1.0)) {
                 throw std::runtime_error("threshold " + std::to_string(c.threshold) +
                                          " is not a cosine in (-1, 1); pass 'threshold'");
+            }
+            json calibration;
+            if (calibrate) {
+                double      maxNeg = -1.0;
+                std::size_t rows   = calib.size() / d;
+                std::vector<float> cs(rows);
+                for (std::size_t r = 0; r < rows; ++r) {
+                    double s = 0;
+                    for (std::size_t i = 0; i < d; ++i) {
+                        s += static_cast<double>(calib[r * d + i]) * static_cast<double>(c.direction[i]);
+                    }
+                    cs[r]  = static_cast<float>(s);
+                    maxNeg = std::max(maxNeg, s);
+                }
+                const double fitted = c.threshold;
+                c.threshold = std::max(fitted, maxNeg + margin);
+                if (!(c.threshold < 1.0)) {
+                    throw std::runtime_error("calibrated threshold " + std::to_string(c.threshold) +
+                                             " >= 1: a negative row is (anti-)parallel to the "
+                                             "condition — the classes do not separate on every row");
+                }
+                json perPrompt = json::array();
+                for (std::size_t k = 0; k + 1 < calibSpan.size(); k += 2) {
+                    perPrompt.push_back(fireRate(cs, calibSpan[k], calibSpan[k + 1], fitted));
+                }
+                calibration = {{"rows", rows}, {"max_negative_score", maxNeg},
+                               {"fitted_threshold", fitted}, {"margin", margin},
+                               {"negative_fire_rate_at_fitted", perPrompt}};
             }
             c.positions     = mode;
             c.trainAccuracy = fit.trainAccuracy;
@@ -428,7 +490,8 @@ void SurgeryTools::registerConditionalOn(McpServer& server) {
                         {"train_accuracy", c.trainAccuracy}, {"val_accuracy", c.valAccuracy},
                         {"accuracy_at_threshold",
                          static_cast<double>(correct) / static_cast<double>(labels.size())},
-                        {"positive", cls(1)}, {"negative", cls(0)}, {"prompts", prompts}};
+                        {"positive", cls(1)}, {"negative", cls(0)}, {"prompts", prompts},
+                        {"calibration", calibration}};
         });
 
     server.addTool(

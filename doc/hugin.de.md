@@ -282,7 +282,11 @@ Ablauf:
    negative Prompts. `positions: "generated"` (Default) nimmt die Zeilen,
    die die ersten `max_tokens` Antwort-Tokens des Basismodells erzeugen.
    Liefert Richtung, Schwelle, Train-/Val-Accuracy, Score-Bereiche je
-   Klasse und Feuerraten je Prompt.
+   Klasse und Feuerraten je Prompt. `calibrate_negatives: true` bewertet
+   jede Zeile, die das Gate sehen wird, auf den Negativ-Prompts (alle
+   Prompt-Zeilen plus generierte Antwortzeilen) und hebt die Schwelle über
+   deren Maximum — nötig, wenn die Richtung auf `last`-Zeilen gefittet
+   wird, denn das Gate läuft auf jeder Zeile.
 3. `steer_if_preview` — installiert das Overlay genau wie die Rune
    (aufgelöst über den echten Rune-Applier) und zeigt Basis- gegen
    editierten Text plus Feuerraten über Prompt- und Antwortzeilen.
@@ -305,6 +309,12 @@ reproduzierten die Preview-Texte exakt (4/4 und 2/2).
   Generate-Items in `eval` nutzen den KV-gecachten Serving-Decode.
 - Auf GB10 immer nur ein GPU-Prozess; Hugin-Sessions auf einem großen
   Modell brauchen ein Wartungsfenster.
+- Die Prompts, aus denen Steer- und Bedingungsvektoren gefittet werden,
+  disjunkt zu den Gate-Goldsets halten, und in beiden Klassen einer
+  Bedingung dieselben Fragen nutzen (nur die geprüfte Eigenschaft darf
+  sich unterscheiden). Auf Kolibri-1 sah eine Bedingung „deutsche
+  Instruktion vorhanden“ perfekt trennbar aus (Val 1.00), bis die
+  Fitting-Fragen disjunkt waren; dann fiel sie auf Zufallsniveau (0.57).
 - Steering und Head-Edits sind günstige Hebel. Fehler, die neues Wissen
   oder eine andere Policy brauchen, gehören ins Adapter-Training
   (Roadmap 7.4/7.5), nicht in eine Rune dieser Art.
