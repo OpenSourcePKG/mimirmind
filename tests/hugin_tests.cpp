@@ -129,7 +129,7 @@ TEST(mcp_initialize_and_toolsList) {
         EXPECT_TRUE(t.contains("inputSchema"));
     }
     std::sort(names.begin(), names.end());
-    EXPECT_TRUE(names == (std::vector<std::string>{"ablate_preview", "activations", "attention_pattern", "causal_trace",
+    EXPECT_TRUE(names == (std::vector<std::string>{"ablate_preview", "activations", "attention_pattern", "causal_trace", "causality_check",
                                                    "condition_vector", "eval", "eval_preview", "expert_usage", "generate", "list_tensors", "logit_lens",
                                                    "model_info", "next_token", "open_model", "perplexity", "rune_check",
                                                    "rune_commit", "rune_compare", "rune_gate", "rune_inspect", "rune_list",
@@ -550,6 +550,19 @@ TEST(separationMath_meanDifference_null_vs_signal) {
     EXPECT_TRUE(std::fabs((SeparationMath::meanDifferenceAuc(sig, d2, lab2)) - (1.0)) < 1e-12);
     const auto null2 = SeparationMath::meanDifferenceNull(sig, d2, n2 / 2, 50, 3);
     EXPECT_TRUE(null2.p95 < 0.95);
+}
+
+TEST(surgery_causalityKeys_canonical) {
+    using hg = mimirmind::hugin::SurgeryTools;
+    // Order of edits, order and duplicates of heads do not matter; scale and block do.
+    const auto k1 = hg::headsKey({{12, {3, 1, 2}, 2.0}, {4, {7}, 0.0}});
+    const auto k2 = hg::headsKey({{4, {7, 7}, 0.0}, {12, {2, 3, 1}, 2.0}});
+    EXPECT_TRUE(k1 == k2);
+    EXPECT_TRUE(k1 != hg::headsKey({{12, {1, 2, 3}, 4.0}, {4, {7}, 0.0}}));
+    EXPECT_TRUE(k1 != hg::headsKey({{13, {1, 2, 3}, 2.0}, {4, {7}, 0.0}}));
+    EXPECT_TRUE(hg::vectorKey("fr", 1.0) == hg::vectorKey("fr", 1.0));
+    EXPECT_TRUE(hg::vectorKey("fr", 1.0) != hg::vectorKey("fr", 0.5));
+    EXPECT_TRUE(hg::vectorKey("fr", 1.0) != hg::vectorKey("de", 1.0));
 }
 
 int main() {

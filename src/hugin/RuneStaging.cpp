@@ -116,9 +116,13 @@ json evidenceGate(const json& a, const std::string& what,
         fails.push_back(what + " has no held-out evidence (fit it with holdout_positive / "
                         "holdout_negative)");
     } else {
-        if (holdout->positives < kMinHoldoutPerClass || holdout->negatives < kMinHoldoutPerClass) {
-            fails.push_back(what + " held-out set too small (" + std::to_string(holdout->positives) +
-                            " / " + std::to_string(holdout->negatives) + " rows, need >= " +
+        // Count prompts, not rows: one prompt with many generated rows is one sample.
+        const bool        grouped = holdout->positivePrompts + holdout->negativePrompts > 0;
+        const std::size_t hp = grouped ? holdout->positivePrompts : holdout->positives;
+        const std::size_t hn = grouped ? holdout->negativePrompts : holdout->negatives;
+        if (hp < kMinHoldoutPerClass || hn < kMinHoldoutPerClass) {
+            fails.push_back(what + " held-out set too small (" + std::to_string(hp) + " / " +
+                            std::to_string(hn) + " prompts, need >= " +
                             std::to_string(kMinHoldoutPerClass) + " per class)");
         }
         if (holdout->auc < minAuc) {
@@ -149,6 +153,39 @@ json evidenceGate(const json& a, const std::string& what,
         ev["override_reason"] = reason;
     }
     return ev;
+}
+
+/// 7.12 causality gate: the same edit must have a causality_check verdict of
+/// at least "weak"; with `checkDose` its measured dose must stay <= the floor.
+json causalityGate(const json& a, const std::string& what, const SurgeryTools::Causality* c,
+                   bool checkDose) {
+    std::vector<std::string> fails;
+    if (c == nullptr) {
+        fails.push_back(what + " has no causality_check verdict for exactly this edit");
+    } else {
+        if (c->verdict != "causal" && c->verdict != "weak") {
+            fails.push_back(what + " causality verdict is '" + c->verdict + "' (ratio " +
+                            std::to_string(c->ratio) + " vs random edits)");
+        }
+        if (checkDose && c->dose > RuneStaging::kSteerDoseReasonFloor) {
+            fails.push_back(what + " dose " + std::to_string(c->dose) + " of the residual norm > " +
+                            std::to_string(RuneStaging::kSteerDoseReasonFloor));
+        }
+    }
+    const std::string reason = overrideReason(a);
+    json rec{{"what", what}, {"causality", c ? SurgeryTools::toJson(*c) : json(nullptr)},
+             {"failed", fails}};
+    if (!fails.empty()) {
+        if (reason.empty()) {
+            std::string msg = "causality gate (7.12) failed:";
+            for (const auto& f : fails) msg += "\n  - " + f;
+            msg += "\nrun causality_check on this edit, or pass 'override_reason' (recorded in "
+                   "the provenance)";
+            throw std::runtime_error(msg);
+        }
+        rec["override_reason"] = reason;
+    }
+    return rec;
 }
 
 /// 7.12 dose / placement limits shared by every steer kind.
@@ -288,6 +325,9 @@ json RuneStaging::stageHeadScales(const json& a, const std::string& name, const 
 
     std::sort(specs.begin(), specs.end(),
               [](const HeadScale& x, const HeadScale& y) { return x.block < y.block; });
+    std::vector<SurgeryTools::HeadEditKey> keys;
+    for (const auto& sp : specs) keys.emplace_back(sp.block, sp.heads, sp.scale);
+    const json causal = causalityGate(a, "head edits", _surgery.causality(SurgeryTools::headsKey(keys)), true);
     rn::RuneManifest man;
     man.name            = name;
     man.baseFingerprint = base;
@@ -387,6 +427,7 @@ json RuneStaging::stageHeadScales(const json& a, const std::string& name, const 
         params["target"]        = edits[0]["target"];
         params["target_type"]   = edits[0]["target_type"];
     }
+    params["causality"] = causal;
     man.provenanceJson = json{{"tool", "hugin"}, {"hugin_version", _version},
                               {"kind", kind}, {"created_at", nowIso()},
                               {"note", a.value("note", std::string{})},
@@ -410,7 +451,8 @@ void RuneStaging::registerOn(McpServer& server) {
         "|alpha|·||v|| / mean residual norm must stay within 'max_relative_norm' (default 0.5, "
         "ceiling 2.0; above 0.5 only with 'override_reason'); block 0 is refused; the vector "
         "needs held-out evidence from steer_vector (>= 4 held-out prompts per class, held-out "
-        "AUC >= 'min_holdout_auc', default 0.8) or an 'override_reason' "
+        "AUC >= 'min_holdout_auc', default 0.8) and a causality_check verdict >= weak for this "
+        "vector at this alpha, or an 'override_reason' "
         "(roadmap 7.12, recorded in the provenance). Nothing is activated — run rune_gate next.",
         schema({{"name", {{"type", "string"}}},
                 {"vector", {{"type", "string"}}},
@@ -434,12 +476,15 @@ void RuneStaging::registerOn(McpServer& server) {
             steerLimits(a, v.block, rel, maxRel);
             const json evidence = evidenceGate(a, "steering vector '" + a["vector"].get<std::string>() + "'",
                                                v.holdout, v.null, v.inSampleAuc, "in_sample_auc", false);
+            const json causal = causalityGate(
+                a, "steer '" + a["vector"].get<std::string>() + "' at alpha " + std::to_string(alpha),
+                _surgery.causality(SurgeryTools::vectorKey(a["vector"].get<std::string>(), alpha)), false);
             const std::string block   = "blk." + std::to_string(v.block);
             const std::string payload = "steer." + block;
             json params{{"vector", a["vector"]}, {"block", v.block}, {"alpha", alpha},
                         {"vector_norm", v.norm}, {"mean_residual_norm", v.residualNorm},
                         {"relative_norm", rel}, {"positives", v.positives},
-                        {"negatives", v.negatives}, {"evidence", evidence}};
+                        {"negatives", v.negatives}, {"evidence", evidence}, {"causality", causal}};
             rn::RuneManifest man;
             man.name            = name;
             man.baseFingerprint = base;
@@ -472,7 +517,8 @@ void RuneStaging::registerOn(McpServer& server) {
         "(roadmap 7.12): a steer_if needs its condition's held-out evidence from "
         "condition_vector — held-out AUC >= 'min_holdout_auc' (default 0.8), fire rate over every "
         "gated row of the held-out negatives <= 'max_holdout_negative_fire' (default 0.05), >= 4 "
-        "held-out rows per class; a steer_project needs the vector's held-out "
+        "held-out rows per class; an add-mode steer also needs a causality_check verdict >= weak "
+        "for the vector at this alpha; a steer_project needs the vector's held-out "
         "evidence. Otherwise only with 'override_reason' (recorded in the provenance). Nothing is "
         "activated — run rune_gate next.",
         schema({{"name", {{"type", "string"}}},
@@ -503,6 +549,13 @@ void RuneStaging::registerOn(McpServer& server) {
             } else {
                 // Projection: dose is bounded by alpha <= 1 (checked in the spec).
                 steerLimits(a, steerBlock, 0.0, maxRel);
+            }
+            if (spec.op.steerMode == rn::RuneSteerMode::Add) {
+                const std::string vn    = a.at("vector").get<std::string>();
+                const double      alpha = a.at("alpha").get<double>();
+                spec.params["causality"] = causalityGate(
+                    a, "steer '" + vn + "' at alpha " + std::to_string(alpha),
+                    _surgery.causality(SurgeryTools::vectorKey(vn, alpha)), false);
             }
             if (spec.op.kind == rn::RuneOpKind::SteerIf) {
                 const std::string cn = a.at("condition").get<std::string>();
@@ -540,11 +593,14 @@ void RuneStaging::registerOn(McpServer& server) {
         "weight that zeroes the given heads' input columns of the O-projection (= the "
         "ablate_preview intervention baked into the weight). Same targets as rune_stage_heads "
         "(F32/F16/BF16, exact Q8_0 / FP8_E4M3 block masking; GGUF and NVFP4 checkpoints). "
-        "Guardrail: heads / block heads <= 'max_head_fraction' (default 0.25, ceiling 0.5).",
+        "Guardrails: heads / block heads <= 'max_head_fraction' (default 0.25, ceiling 0.5); "
+        "causality_check on exactly these heads (scale 0) must say causal or weak, with a dose "
+        "<= 0.5 of the residual norm (roadmap 7.12), else only with 'override_reason'.",
         schema({{"name", {{"type", "string"}}},
                 {"block", {{"type", "integer"}}},
                 {"heads", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
                 {"max_head_fraction", {{"type", "number"}}},
+                {"override_reason", {{"type", "string"}}},
                 {"note", {{"type", "string"}}}},
                {"name", "block", "heads"}),
         [this](const json& a) {
@@ -565,11 +621,13 @@ void RuneStaging::registerOn(McpServer& server) {
         "(rounded to the encoding), Q8_0 / FP8_E4M3 block scales (exact: 0 or power-of-two "
         "factors), GGUF and NVFP4 checkpoints. Guardrails: heads per block / block heads <= "
         "'max_head_fraction' (default 0.25, ceiling 0.5) and scale <= 'max_scale' (default 8, "
-        "ceiling 16).",
+        "ceiling 16); causality_check on exactly these head_edits must say causal or weak, with "
+        "a dose <= 0.5 of the residual norm (roadmap 7.12), else only with 'override_reason'.",
         schema({{"name", {{"type", "string"}}},
                 {"head_edits", {{"type", "array"}, {"items", {{"type", "object"}}}}},
                 {"max_head_fraction", {{"type", "number"}}},
                 {"max_scale", {{"type", "number"}}},
+                {"override_reason", {{"type", "string"}}},
                 {"note", {{"type", "string"}}}},
                {"name", "head_edits"}),
         [this](const json& a) {

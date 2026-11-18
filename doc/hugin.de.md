@@ -146,6 +146,21 @@ Preview-Tools ──► rune_stage_*  ──► staged/
   - die Shuffled-Label-Null wird berichtet, aber nicht gegatet: Bei
     d_model ≫ Prompts erreichen In-Sample-AUC und Val-Accuracy der Probe
     auch mit Zufallslabels 1.0 und sagen allein nichts aus;
+  - **Kausalität**: `causality_check` muss genau diesen Eingriff (Vektor bei
+    diesem α bzw. diesen Satz Head-Edits) mindestens als `weak` bewertet
+    haben — Effekt ≥ 1.5× das 95. Perzentil zufälliger Eingriffe gleicher
+    Größe (Zufallsrichtungen gleicher Norm bzw. zufällige andere Heads);
+    `causal` verlangt zusätzlich ≥ 3× und einen Effekt, der über 25 / 50 /
+    100 % Dosis wächst. Head-Edits brauchen außerdem eine gemessene Dosis
+    ≤ 0.5 (Residualänderung / Residualnorm am editierten Block);
+    die Baseline für einen Vektor ist die Mittelwert-Differenz seiner
+    eigenen Fitting-Prompts mit vertauschten Labels bei gleicher Norm —
+    Zufallsrichtungen im R^d sind zu leicht zu schlagen. Wo möglich mit
+    einem `target`-Token messen: Die KL zeigt nur, *dass* sich die Ausgabe
+    bewegt; ein echter Französisch-Steer auf Llama 3.2 1B war am Ziel-Token
+    `causal` (3.1×), über die KL aber nicht über der Baseline. Das Gate nutzt
+    die jeweils letzte Prüfung eines Eingriffs; ihre Messgröße steht in der
+    Provenienz;
   - jede gescheiterte Prüfung lässt sich mit einem `override_reason`
     übersteuern, der in die Provenienz geschrieben wird.
 - **`rune_gate`** fährt ein `target`-Set (was besser werden soll) und ein
@@ -220,6 +235,7 @@ Forward genau wie im Serving erreichen.
 | `attention_pattern` | Attention-Gewichte eines Blocks je Head, aus dem Post-RoPE-Q/K der Engine rekonstruiert |
 | `expert_usage` | Tatsächlich genommenes MoE-Routing (Stage-Tap an der Router-Auswahl) |
 | `causal_trace` | Activation Patching clean → corrupt je (Block, Position) |
+| `causality_check` | Bewirkt ein gefundener Eingriff (Steer-Vektor bei α oder Head-Edits) mehr als ein zufälliger gleicher Größe? Dosis-Sweep + Verdikt causal / weak / epiphenomenal / undetermined + gemessene Dosis (§4) |
 | `eval` | Goldset-Eval, optional gegen Runes (Deltas) |
 | `generate` | Greedy-Fortsetzung mit optionalem Steer / Head-Edits (langsam, zustandslos) |
 

@@ -141,6 +141,20 @@ preview tools ──► rune_stage_*  ──► staged/
   - the shuffled-label null is reported but not gated on: with
     d_model ≫ prompts, in-sample AUC and probe val accuracy reach 1.0 on
     random labels too, so they say nothing on their own;
+  - **causality**: `causality_check` must have judged exactly this edit
+    (vector at this α, or this set of head edits) at least `weak` — effect
+    ≥ 1.5× the 95th percentile of random edits of the same size (random
+    directions of equal norm, or random other heads); `causal` additionally
+    needs ≥ 3× and an effect that grows over 25 / 50 / 100 % dose. Head
+    edits also need a measured dose ≤ 0.5 (residual change / residual norm
+    at the edited block);
+    the baseline for a vector is the mean difference of its own fitting
+    prompts under shuffled labels at the same norm — random directions in
+    R^d are too easy to beat. Measure with a `target` token where possible:
+    KL only shows *that* the output moves, and a real French steer on
+    Llama 3.2 1B was `causal` (3.1×) on the target but not above the
+    baseline on KL. The latest check of an edit is the one the gate uses;
+    its metric is recorded in the provenance;
   - any failed check can be overridden with an `override_reason`, which is
     written into the provenance.
 - **`rune_gate`** runs a `target` set (what must improve) and a `control`
@@ -212,6 +226,7 @@ exactly as in serving.
 | `attention_pattern` | One block's attention weights per head, rebuilt from the engine's post-RoPE Q/K |
 | `expert_usage` | MoE routing actually taken (stage tap at the router selection) |
 | `causal_trace` | Activation patching clean → corrupt per (block, position) |
+| `causality_check` | Is a located edit (steer vector at α, or head edits) more than a random edit of the same size? Dose sweep + verdict causal / weak / epiphenomenal / undetermined + measured dose (§4) |
 | `eval` | Goldset eval, optionally against Runes (deltas) |
 | `generate` | Greedy continuation with optional steer / head edits (slow, stateless) |
 

@@ -20,6 +20,10 @@ struct SeparationReport {
     double      negativeFireRate{0.0};  ///< negatives above the threshold
     std::size_t positives{0};
     std::size_t negatives{0};
+    /// Prompts behind the scores when one prompt yields several rows
+    /// (0 = one score per prompt, i.e. positives / negatives).
+    std::size_t positivePrompts{0};
+    std::size_t negativePrompts{0};
 };
 
 /// Distribution of a separation metric under shuffled class labels.

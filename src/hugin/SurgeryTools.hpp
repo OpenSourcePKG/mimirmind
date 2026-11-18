@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <string>
 #include <vector>
@@ -72,6 +73,9 @@ public:
         double                          inSampleAuc{0.5};
         NullStats                       null;
         std::optional<SeparationReport> holdout;
+        /// Last-position residuals of the fitting prompts ([positives +
+        /// negatives, d], positives first): causality_check's baseline.
+        std::vector<float>              fitRows;
     };
 
     /// Session steering vector by name; throws when unknown / model changed.
@@ -108,6 +112,29 @@ public:
     };
     CondSteerSpec             condSteerSpec(const nlohmann::json& a);
 
+    /// 7.12 causality_check verdict for one edit (a steer vector at one alpha,
+    /// or one set of head edits): its effect against random edits of the same
+    /// size, and whether it grows with the dose.
+    struct Causality {
+        std::string verdict;          ///< causal | weak | epiphenomenal | undetermined
+        std::string metric;           ///< "target_logprob" | "kl"
+        double      effect{0};        ///< mean over prompts at full dose
+        double      randomP95{0};     ///< p95 of |effect| over random edits
+        double      ratio{0};         ///< effect / randomP95
+        bool        monotone{false};  ///< effect non-decreasing over 25 / 50 / 100 % dose
+        double      dose{0};          ///< max residual change / norm at an edited block
+        std::size_t prompts{0};
+        std::size_t randomEdits{0};
+        std::string baseline;         ///< what the random edits were
+    };
+    /// Session verdict for `key` (vectorKey / headsKey) or nullptr.
+    [[nodiscard]] const Causality* causality(const std::string& key) const;
+    [[nodiscard]] static std::string vectorKey(const std::string& vector, double alpha);
+    /// One head edit as (block, heads, scale); the key is order-independent.
+    using HeadEditKey = std::tuple<std::uint32_t, std::vector<std::size_t>, double>;
+    [[nodiscard]] static std::string headsKey(std::vector<HeadEditKey> edits);
+    [[nodiscard]] static nlohmann::json toJson(const Causality& c);
+
     /// 7.12 evidence as JSON (shared with RuneStaging's provenance).
     [[nodiscard]] static nlohmann::json toJson(const SeparationReport& r);
     [[nodiscard]] static nlohmann::json toJson(const NullStats& n);
@@ -115,6 +142,7 @@ public:
 
 private:
     void               registerConditionalOn(McpServer& server);
+    void               registerCausalityOn(McpServer& server);
     const SteerVector& vector(const std::string& name);
     void               dropStaleVectors();
 
@@ -122,6 +150,7 @@ private:
     std::string                          _vectorsKey;
     std::map<std::string, SteerVector>   _vectors;
     std::map<std::string, ConditionVector> _conditions;
+    std::map<std::string, Causality>       _causality;
     /// eval_preview base results per goldset path (dropped with the vectors).
     std::map<std::string, std::pair<nlohmann::json, nlohmann::json>> _baseEvals;
 };

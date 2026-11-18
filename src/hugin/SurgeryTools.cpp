@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -225,6 +226,7 @@ void SurgeryTools::dropStaleVectors() {
     if (key != _vectorsKey) {
         _vectors.clear();
         _conditions.clear();
+        _causality.clear();
         _baseEvals.clear();
         _vectorsKey = key;
     }
@@ -325,9 +327,14 @@ std::size_t permutationsArg(const json& a, std::size_t dflt, std::size_t cap) {
 } // namespace
 
 json SurgeryTools::toJson(const SeparationReport& r) {
-    return json{{"auc", r.auc}, {"accuracy", r.accuracy},
-                {"negative_fire_rate", r.negativeFireRate},
-                {"positives", r.positives}, {"negatives", r.negatives}};
+    json j{{"auc", r.auc}, {"accuracy", r.accuracy},
+           {"negative_fire_rate", r.negativeFireRate},
+           {"positives", r.positives}, {"negatives", r.negatives}};
+    if (r.positivePrompts + r.negativePrompts > 0) {
+        j["positive_prompts"] = r.positivePrompts;
+        j["negative_prompts"] = r.negativePrompts;
+    }
+    return j;
 }
 
 json SurgeryTools::toJson(const NullStats& n) {
@@ -607,6 +614,8 @@ void SurgeryTools::registerConditionalOn(McpServer& server) {
                 }
                 SeparationReport rep = SeparationMath::report(sp, sn, c.threshold);
                 rep.negativeFireRate = SeparationMath::report({}, snAll, c.threshold).negativeFireRate;
+                rep.positivePrompts  = hoPos.size();
+                rep.negativePrompts  = hoNeg.size();
                 c.holdout   = rep;
                 holdoutJson = toJson(rep);
                 holdoutJson["negative_rows_all"] = snAll.size();
@@ -813,6 +822,7 @@ core::rune::RuneCondSteer SurgeryTools::condSteerArg(const json& a) {
 
 void SurgeryTools::registerOn(McpServer& server) {
     registerConditionalOn(server);
+    registerCausalityOn(server);
     // steer {vector, alpha, positions} / ablate {block, heads, scale} /
     // head_edits [{block, heads, scale}] -> Interventions.
     const auto interventionsArg = [this](const json& a) {
@@ -1022,6 +1032,7 @@ void SurgeryTools::registerOn(McpServer& server) {
             v.residualNorm = residualSum / static_cast<double>(residualN);
             v.positives    = np;
             v.negatives    = nn;
+            v.fitRows      = rows;
 
             // 7.12 evidence. Projections onto the unit vector; the threshold is
             // the midpoint of the two class-mean projections.
@@ -1065,6 +1076,9 @@ void SurgeryTools::registerOn(McpServer& server) {
             const std::string name = a.at("name").get<std::string>();
             out["name"]    = name;
             _vectors[name] = v;
+            // A refitted vector invalidates its causality verdicts.
+            const std::string prefix = "vec:" + name + "@";
+            std::erase_if(_causality, [&](const auto& kv) { return kv.first.rfind(prefix, 0) == 0; });
             return out;
         });
 
@@ -1287,6 +1301,305 @@ void SurgeryTools::registerOn(McpServer& server) {
             out["check_regressions"] = checkRegressions(baseRows, editRows);
             if (a.value("detail", false)) {
                 out["per_item"] = rows;
+            }
+            return out;
+        });
+}
+
+const SurgeryTools::Causality* SurgeryTools::causality(const std::string& key) const {
+    const auto it = _causality.find(key);
+    return it == _causality.end() ? nullptr : &it->second;
+}
+
+std::string SurgeryTools::vectorKey(const std::string& vector, double alpha) {
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%.9g", alpha);
+    return "vec:" + vector + "@" + buf;
+}
+
+std::string SurgeryTools::headsKey(std::vector<HeadEditKey> edits) {
+    for (auto& [b, h, sc] : edits) {
+        std::sort(h.begin(), h.end());
+        h.erase(std::unique(h.begin(), h.end()), h.end());
+    }
+    std::sort(edits.begin(), edits.end());
+    std::string k = "heads:";
+    for (const auto& [b, h, sc] : edits) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%.9g", sc);
+        k += std::to_string(b) + "x" + buf + "[";
+        for (const auto x : h) k += std::to_string(x) + ",";
+        k += "];";
+    }
+    return k;
+}
+
+json SurgeryTools::toJson(const Causality& c) {
+    return json{{"verdict", c.verdict}, {"metric", c.metric}, {"effect", c.effect},
+                {"random_p95", c.randomP95}, {"ratio", c.ratio}, {"monotone", c.monotone},
+                {"dose", c.dose}, {"prompts", c.prompts}, {"random_edits", c.randomEdits},
+                {"baseline", c.baseline}};
+}
+
+namespace {
+
+/// Standard-normal sample (Box-Muller on splitmix64).
+double gaussian(std::uint64_t& s) {
+    const auto next = [&s] {
+        std::uint64_t z = (s += 0x9E3779B97F4A7C15ULL);
+        z = (z ^ (z >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27U)) * 0x94D049BB133111EBULL;
+        return static_cast<double>((z ^ (z >> 31U)) >> 11U) / 9007199254740992.0;
+    };
+    const double u1 = std::max(next(), 1e-300);
+    const double u2 = next();
+    return std::sqrt(-2.0 * std::log(u1)) * std::cos(6.283185307179586 * u2);
+}
+
+} // namespace
+
+/// 7.12: causality_check — is a located edit more than any edit of its size?
+void SurgeryTools::registerCausalityOn(McpServer& server) {
+    server.addTool(
+        "causality_check",
+        "Causality verdict for a located edit (roadmap 7.12): is it MORE than a random edit of "
+        "the same size? Edit = 'vector' (a steer_vector) + 'alpha' (+ 'positions' all | last), "
+        "or 'head_edits' [{block, heads, scale}]. Metric over 'prompts': with 'target' the "
+        "change of the target token's log-prob (signed — the edit must raise it), otherwise "
+        "KL(base || edited) of the next-token distribution. Baseline: 'random_edits' (default 8) "
+        "mean differences of the vector's own fitting prompts under shuffled labels, rescaled to "
+        "the same norm (a data-derived direction always beats a random one in R^d, so that "
+        "baseline would be too easy), or random other heads of the same count per block at the "
+        "same scale. Dose sweep at 25 / 50 / 100 %. Verdict: causal "
+        "(effect >= 3x the random p95 and growing with the dose), weak (>= 1.5x), epiphenomenal "
+        "(not above random, or the wrong sign), undetermined (no measurable effect). Also reports "
+        "the dose = residual change / residual norm at the edited block(s). Stored in the "
+        "session; rune_stage_steer / _steer_if / _heads / _ablate need >= weak for the same "
+        "edit (or an 'override_reason').",
+        schema({{"prompts", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"vector", {{"type", "string"}}},
+                {"alpha", {{"type", "number"}}},
+                {"positions", {{"type", "string"}, {"enum", {"all", "last"}}}},
+                {"head_edits", {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                {"target", {{"type", "string"}}},
+                {"random_edits", {{"type", "integer"}}},
+                {"add_bos", {{"type", "boolean"}}}},
+               {"prompts"}),
+        [this](const json& a) {
+            Engine& e = _forward.engine();
+            dropStaleVectors();
+            const bool addBos = a.value("add_bos", true);
+            const auto texts  = textsArg(a, "prompts");
+            if (texts.empty()) {
+                throw std::runtime_error("'prompts' must be a non-empty array");
+            }
+            const std::size_t R = a.value("random_edits", std::size_t{8});
+            if (R < 4 || R > 64) {
+                throw std::runtime_error("'random_edits' must be in [4, 64]");
+            }
+            const bool isVector = a.contains("vector");
+            if (isVector == a.contains("head_edits")) {
+                throw std::runtime_error("pass exactly one of 'vector' (+ 'alpha') or 'head_edits'");
+            }
+            const auto target = targetArg(e, a);
+            std::vector<std::vector<std::int32_t>> ids;
+            for (const auto& t : texts) ids.push_back(textTokens(e, t, addBos));
+            std::vector<std::vector<double>> base;
+            for (const auto& x : ids) base.push_back(lastLogProbs(e, x, Interventions{}));
+
+            // Mean metric of one intervention over all prompts.
+            const auto effectOf = [&](const Interventions& iv) {
+                double sum = 0;
+                for (std::size_t p = 0; p < ids.size(); ++p) {
+                    const auto lp = lastLogProbs(e, ids[p], iv);
+                    if (target) {
+                        const auto t = static_cast<std::size_t>(*target);
+                        sum += lp[t] - base[p][t];
+                    } else {
+                        sum += LogitMath::kl(base[p], lp);
+                    }
+                }
+                return sum / static_cast<double>(ids.size());
+            };
+
+            Causality c;
+            c.metric      = target ? "target_logprob" : "kl";
+            c.prompts     = ids.size();
+            c.randomEdits = R;
+            std::string key;
+            json        edit;
+            std::vector<double> sweep;
+            std::vector<double> randomAbs;
+            if (isVector) {
+                const std::string vname = a.at("vector").get<std::string>();
+                const SteerVector& v    = vector(vname);
+                if (!a.contains("alpha")) {
+                    throw std::runtime_error("'alpha' is required with 'vector'");
+                }
+                const double alpha = a.at("alpha").get<double>();
+                if (!std::isfinite(alpha) || alpha == 0.0) {
+                    throw std::runtime_error("'alpha' must be finite and non-zero");
+                }
+                Interventions iv;
+                iv.steer         = &v;
+                iv.steerLastOnly = lastOnlyArg(a);
+                for (const double f : {0.25, 0.5, 1.0}) {
+                    iv.alpha = alpha * f;
+                    sweep.push_back(effectOf(iv));
+                }
+                // Baseline: mean differences of the SAME fitting prompts under
+                // shuffled labels (any data-derived direction moves the model
+                // more than a random one in R^d), rescaled to the vector's norm.
+                // Gaussian directions only when there are too few prompts.
+                SteerVector rnd = v;
+                std::uint64_t seed = 0x7122ULL;
+                const std::size_t d     = v.values.size();
+                const std::size_t nFit  = d ? v.fitRows.size() / d : 0;
+                const bool        split = nFit >= 6 && v.positives >= 2 && v.negatives >= 2;
+                c.baseline = split ? "shuffled-label mean differences of the fitting prompts"
+                                   : "gaussian directions (fewer than 6 fitting prompts)";
+                for (std::size_t r = 0; r < R; ++r) {
+                    double n2 = 0;
+                    if (split) {
+                        // Redraw splits that reproduce the original labelling or its
+                        // mirror: they would measure the vector itself.
+                        std::uint64_t ps = 0x7124ULL + r * 1009;
+                        std::vector<std::size_t> perm;
+                        for (int tries = 0; tries < 64; ++tries) {
+                            perm = SeparationMath::permutation(nFit, ps++);
+                            std::size_t orig = 0;
+                            for (std::size_t k = 0; k < v.positives; ++k) orig += perm[k] < v.positives ? 1U : 0U;
+                            if (orig != v.positives && !(orig == 0 && v.positives == v.negatives)) {
+                                break;
+                            }
+                        }
+                        std::vector<double> mp(d, 0.0), mn(d, 0.0);
+                        for (std::size_t k = 0; k < nFit; ++k) {
+                            auto& m = k < v.positives ? mp : mn;
+                            const float* row = v.fitRows.data() + perm[k] * d;
+                            for (std::size_t i = 0; i < d; ++i) m[i] += static_cast<double>(row[i]);
+                        }
+                        for (std::size_t i = 0; i < d; ++i) {
+                            const double x = mp[i] / static_cast<double>(v.positives) -
+                                             mn[i] / static_cast<double>(v.negatives);
+                            rnd.values[i] = static_cast<float>(x);
+                            n2 += x * x;
+                        }
+                    } else {
+                        for (auto& x : rnd.values) {
+                            x = static_cast<float>(gaussian(seed));
+                            n2 += static_cast<double>(x) * static_cast<double>(x);
+                        }
+                    }
+                    const double k = n2 > 0 ? v.norm / std::sqrt(n2) : 0.0;
+                    for (auto& x : rnd.values) x = static_cast<float>(static_cast<double>(x) * k);
+                    Interventions ri = iv;
+                    ri.steer = &rnd;
+                    ri.alpha = alpha;
+                    randomAbs.push_back(std::fabs(effectOf(ri)));
+                }
+                c.dose = v.residualNorm > 0 ? std::fabs(alpha) * v.norm / v.residualNorm : 0.0;
+                key    = vectorKey(vname, alpha);
+                edit   = {{"vector", vname}, {"alpha", alpha}, {"block", v.block},
+                          {"positions", iv.steerLastOnly ? "last" : "all"}};
+            } else {
+                std::vector<HeadEdit>    edits;
+                std::vector<HeadEditKey> keys;
+                for (const auto& he : a.at("head_edits")) {
+                    edits.push_back(headEditArg(e, he));
+                    keys.emplace_back(edits.back().block, edits.back().heads, edits.back().scale);
+                }
+                if (edits.empty()) {
+                    throw std::runtime_error("'head_edits' must not be empty");
+                }
+                Interventions iv;
+                for (const double f : {0.25, 0.5, 1.0}) {
+                    iv.headEdits = edits;
+                    for (auto& he : iv.headEdits) he.scale = 1.0 + f * (he.scale - 1.0);
+                    sweep.push_back(effectOf(iv));
+                }
+                const std::size_t H = e.config().headCount;
+                for (std::size_t r = 0; r < R; ++r) {
+                    Interventions ri;
+                    for (std::size_t b = 0; b < edits.size(); ++b) {
+                        HeadEdit he = edits[b];
+                        std::vector<std::size_t> pool;
+                        for (std::size_t h = 0; h < H; ++h) {
+                            if (std::find(edits[b].heads.begin(), edits[b].heads.end(), h) == edits[b].heads.end()) {
+                                pool.push_back(h);
+                            }
+                        }
+                        if (pool.size() < he.heads.size()) {
+                            throw std::runtime_error("block " + std::to_string(he.block) +
+                                                     ": not enough other heads for a random baseline");
+                        }
+                        const auto perm = SeparationMath::permutation(pool.size(), 0x7123ULL + r * 131 + b);
+                        for (std::size_t k = 0; k < he.heads.size(); ++k) he.heads[k] = pool[perm[k]];
+                        ri.headEdits.push_back(std::move(he));
+                    }
+                    randomAbs.push_back(std::fabs(effectOf(ri)));
+                }
+                // Dose: residual change / norm at each edited block (last position).
+                std::vector<std::uint32_t> blocks;
+                for (const auto& he : edits) blocks.push_back(he.block);
+                Interventions full;
+                full.headEdits = edits;
+                double dose = 0;
+                for (const auto& x : ids) {
+                    Probe pb, pe;
+                    pb.hiddenBlocks = blocks;
+                    pe.hiddenBlocks = blocks;
+                    (void)forward(e, x, &pb);
+                    const auto reached = std::make_shared<std::vector<char>>(edits.size(), char{0});
+                    installInto(e, full, x.size(), pe, reached);
+                    (void)forward(e, x, &pe);
+                    requireReached(e, reached);
+                    const std::size_t d = e.config().embeddingLength;
+                    for (const auto b : blocks) {
+                        const auto& hb = pb.hidden.at(b);
+                        const auto& hx = pe.hidden.at(b);
+                        const std::size_t off = (x.size() - 1) * d;
+                        double dn = 0, bn = 0;
+                        for (std::size_t i = 0; i < d; ++i) {
+                            const double df = static_cast<double>(hx[off + i]) - static_cast<double>(hb[off + i]);
+                            dn += df * df;
+                            bn += static_cast<double>(hb[off + i]) * static_cast<double>(hb[off + i]);
+                        }
+                        if (bn > 0) dose = std::max(dose, std::sqrt(dn / bn));
+                    }
+                }
+                c.dose = dose;
+                key    = headsKey(keys);
+                c.baseline = "random other heads of the same count per block, same scale";
+                edit   = {{"head_edits", a["head_edits"]}};
+            }
+            c.effect = sweep.back();
+            const NullStats rs = SeparationMath::summarize(randomAbs);
+            c.randomP95 = rs.p95;
+            constexpr double kTiny = 1e-6;
+            c.monotone = sweep[0] <= sweep[1] * 1.05 + kTiny && sweep[1] <= sweep[2] * 1.05 + kTiny;
+            c.ratio    = c.effect / std::max(c.randomP95, kTiny);
+            if (!std::isfinite(c.effect) || !std::isfinite(c.randomP95)) {
+                c.verdict = "undetermined";
+            } else if (std::fabs(c.effect) < kTiny) {
+                c.verdict = "undetermined";
+            } else if (c.effect <= 0.0) {
+                c.verdict = "epiphenomenal";   // targeted metric moved the wrong way
+            } else if (c.ratio >= 3.0 && c.monotone) {
+                c.verdict = "causal";
+            } else if (c.ratio >= 1.5) {
+                c.verdict = "weak";
+            } else {
+                c.verdict = "epiphenomenal";
+            }
+            _causality[key] = c;
+            json out = toJson(c);
+            out["edit"]        = edit;
+            out["key"]         = key;
+            out["dose_sweep"]  = {{"fractions", {0.25, 0.5, 1.0}}, {"effects", sweep}};
+            out["random"]      = {{"mean", rs.mean}, {"p95", rs.p95}, {"max", rs.max}};
+            if (target) {
+                out["target"] = {{"id", *target}, {"piece", piece(e, *target)}};
             }
             return out;
         });
