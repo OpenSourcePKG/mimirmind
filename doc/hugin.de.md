@@ -132,7 +132,22 @@ Preview-Tools ──► rune_stage_*  ──► staged/
 
 - **`rune_stage_*`** schreibt die Rune und eine Sidecar-Datei mit
   Parametern und Historie. Leitplanken je Typ (relative Steer-Norm,
-  Head-Anteil, Scale-Obergrenze, α-Bereich der Projektion).
+  Head-Anteil, Scale-Obergrenze, α-Bereich der Projektion). Für
+  Steer-Typen zusätzlich (7.12):
+  - kein Steering nach Block 0; eine Dosis über 0.5 der Residualnorm
+    braucht einen `override_reason`;
+  - **Held-out-Evidenz**: Die Richtung (`steer`, `steer_project`) bzw. die
+    Bedingung (`steer_if`) muss mit `holdout_positive` /
+    `holdout_negative` gefittet sein — mindestens 4 je Klasse,
+    Held-out-AUC ≥ `min_holdout_auc` (0.8), und bei einer Bedingung
+    höchstens `max_holdout_negative_fire` (5 %) aller gegateten Zeilen der
+    Held-out-Negativen über der Schwelle. Held-out-Prompts, die einen
+    Fitting-Prompt wiederholen, werden abgelehnt;
+  - die Shuffled-Label-Null wird berichtet, aber nicht gegatet: Bei
+    d_model ≫ Prompts erreichen In-Sample-AUC und Val-Accuracy der Probe
+    auch mit Zufallslabels 1.0 und sagen allein nichts aus;
+  - jede gescheiterte Prüfung lässt sich mit einem `override_reason`
+    übersteuern, der in die Provenienz geschrieben wird.
 - **`rune_gate`** fährt ein `target`-Set (was besser werden soll) und ein
   `control`-Set (was nicht schlechter werden darf) auf der Basis und auf
   dem Modell mit Rune. Grün genau dann, wenn:

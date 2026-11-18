@@ -63,6 +63,9 @@ public:
 
     /// Hard ceilings the per-call budget arguments can never exceed.
     static constexpr double kMaxSteerRelativeNorm = 2.0;
+    /// 7.12: steer dose above this needs an 'override_reason' (related work:
+    /// every config that moved > ~50 % of a layer's residual broke the model).
+    static constexpr double kSteerDoseReasonFloor = 0.5;
     static constexpr double kMaxHeadFraction      = 0.5;
     static constexpr double kMaxExpertFraction    = 0.25;
     static constexpr double kMaxHeadScale         = 16.0;

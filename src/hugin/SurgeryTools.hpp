@@ -4,11 +4,13 @@
 #pragma once
 
 #include "hugin/McpServer.hpp"
+#include "hugin/SeparationMath.hpp"
 #include "core/rune/RuneApplier.hpp"
 #include "core/rune/RuneFile.hpp"
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <utility>
 #include <string>
 #include <vector>
@@ -65,6 +67,11 @@ public:
         double             residualNorm{0};   // mean ||h|| at that block over the inputs
         std::size_t        positives{0};
         std::size_t        negatives{0};
+        /// 7.12: separation of the fitting prompts along the vector, its
+        /// shuffled-label null, and (if given) held-out prompts.
+        double                          inSampleAuc{0.5};
+        NullStats                       null;
+        std::optional<SeparationReport> holdout;
     };
 
     /// Session steering vector by name; throws when unknown / model changed.
@@ -81,6 +88,12 @@ public:
         std::size_t        negativeRows{0};
         double             trainAccuracy{0};
         double             valAccuracy{0};
+        /// 7.12: val accuracy of probes refitted on prompt-shuffled labels.
+        NullStats          null;
+        /// 7.12: held-out prompts scored with the final direction + threshold
+        /// on the fitted positions; negativeFireRate is over EVERY gated row
+        /// (prompt + generated) of the held-out negative prompts.
+        std::optional<SeparationReport> holdout;
     };
     const ConditionVector& conditionVector(const std::string& name);
 
@@ -94,6 +107,10 @@ public:
         nlohmann::json                             params;
     };
     CondSteerSpec             condSteerSpec(const nlohmann::json& a);
+
+    /// 7.12 evidence as JSON (shared with RuneStaging's provenance).
+    [[nodiscard]] static nlohmann::json toJson(const SeparationReport& r);
+    [[nodiscard]] static nlohmann::json toJson(const NullStats& n);
     core::rune::RuneCondSteer condSteerArg(const nlohmann::json& a);
 
 private:

@@ -14,6 +14,7 @@
 #include "hugin/InspectTools.hpp"
 #include "hugin/LogitMath.hpp"
 #include "hugin/McpServer.hpp"
+#include "hugin/SeparationMath.hpp"
 #include "compute/IRuneSteerOps.hpp"
 #include "compute/cpu/GpuOps.hpp"
 #include "core/cpu/CpuContext.hpp"
@@ -485,6 +486,70 @@ TEST(runeSteerOps_cpu_rowDot_gate_and_projection) {
         EXPECT_TRUE(std::fabs(a) < 1e-6F);
     }
     EXPECT_TRUE(z[0] == 2.0F);   // row 0 had no component along u
+}
+
+TEST(separationMath_auc_report_null) {
+    using mimirmind::hugin::SeparationMath;
+    // Perfect, inverted, tied.
+    EXPECT_TRUE(std::fabs((SeparationMath::auc(std::vector<double>{3, 4}, std::vector<double>{1, 2})) - (1.0)) < 1e-12);
+    EXPECT_TRUE(std::fabs((SeparationMath::auc(std::vector<double>{1, 2}, std::vector<double>{3, 4})) - (0.0)) < 1e-12);
+    EXPECT_TRUE(std::fabs((SeparationMath::auc(std::vector<double>{1, 1}, std::vector<double>{1, 1})) - (0.5)) < 1e-12);
+    // pos {1,3}, neg {2}: one of two pairs ordered -> 0.5; empty class -> 0.5.
+    EXPECT_TRUE(std::fabs((SeparationMath::auc(std::vector<double>{1, 3}, std::vector<double>{2})) - (0.5)) < 1e-12);
+    EXPECT_TRUE(std::fabs((SeparationMath::auc(std::vector<double>{}, std::vector<double>{2})) - (0.5)) < 1e-12);
+
+    const auto r = SeparationMath::report(std::vector<double>{0.9, 0.2}, std::vector<double>{0.1, 0.6, 0.0, 0.0}, 0.5);
+    EXPECT_TRUE(std::fabs((r.accuracy) - (4.0 / 6.0)) < 1e-12);          // 0.9 on, 0.2 off; 0.6 wrongly on
+    EXPECT_TRUE(std::fabs((r.negativeFireRate) - (0.25)) < 1e-12);
+    EXPECT_EQ(r.positives, std::size_t{2});
+    EXPECT_EQ(r.negatives, std::size_t{4});
+
+    // Permutation is a deterministic bijection.
+    const auto p1 = SeparationMath::permutation(50, 7), p2 = SeparationMath::permutation(50, 7);
+    EXPECT_TRUE(p1 == p2);
+    auto sorted = p1;
+    std::sort(sorted.begin(), sorted.end());
+    for (std::size_t i = 0; i < sorted.size(); ++i) EXPECT_EQ(sorted[i], i);
+
+    const auto st = SeparationMath::summarize({0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,
+                                              0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0});
+    EXPECT_TRUE(std::fabs((st.mean) - (0.55)) < 1e-12);
+    EXPECT_TRUE(std::fabs((st.p95) - (1.0)) < 1e-12);
+    EXPECT_TRUE(std::fabs((st.max) - (1.0)) < 1e-12);
+    EXPECT_EQ(st.permutations, std::size_t{20});
+}
+
+TEST(separationMath_meanDifference_null_vs_signal) {
+    using mimirmind::hugin::SeparationMath;
+    // d >> n pure noise: the in-sample mean difference separates PERFECTLY even
+    // for random labels — exactly why the null is needed.
+    constexpr std::size_t d = 512, n = 16;
+    std::vector<float> noise(n * d);
+    std::uint64_t s = 1;
+    for (auto& x : noise) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        x = static_cast<float>(static_cast<double>(s >> 11U) / 9007199254740992.0 - 0.5);
+    }
+    std::vector<std::uint8_t> lab(n, 0);
+    for (std::size_t i = 0; i < n / 2; ++i) lab[i] = 1;
+    const double real = SeparationMath::meanDifferenceAuc(noise, d, lab);
+    const auto   null = SeparationMath::meanDifferenceNull(noise, d, n / 2, 20, 99);
+    EXPECT_TRUE(std::fabs((real) - (1.0)) < 1e-12);
+    EXPECT_TRUE(std::fabs((null.p95) - (1.0)) < 1e-12);       // noise: real is NOT above the null
+
+    // Real signal in a low dimension: real AUC 1, the null clearly below.
+    constexpr std::size_t d2 = 2, n2 = 40;
+    std::vector<float> sig(n2 * d2);
+    std::vector<std::uint8_t> lab2(n2, 0);
+    for (std::size_t i = 0; i < n2; ++i) {
+        lab2[i] = i < n2 / 2 ? 1 : 0;
+        sig[i * d2]     = (lab2[i] ? 1.0F : -1.0F) + 0.01F * static_cast<float>(i % 7);
+        sig[i * d2 + 1] = 0.3F * static_cast<float>((i * 37) % 11) - 1.5F;
+    }
+    // The positives are the first n2 / 2 rows, as meanDifferenceNull expects.
+    EXPECT_TRUE(std::fabs((SeparationMath::meanDifferenceAuc(sig, d2, lab2)) - (1.0)) < 1e-12);
+    const auto null2 = SeparationMath::meanDifferenceNull(sig, d2, n2 / 2, 50, 3);
+    EXPECT_TRUE(null2.p95 < 0.95);
 }
 
 int main() {

@@ -128,7 +128,21 @@ preview tools ──► rune_stage_*  ──► staged/
 
 - **`rune_stage_*`** writes the Rune and a sidecar with parameters and
   history. Guardrails per kind (relative steer norm, head fraction, scale
-  ceiling, projection α range).
+  ceiling, projection α range). Steer kinds additionally (7.12):
+  - no steering after block 0; a dose above 0.5 of the residual norm
+    needs an `override_reason`;
+  - **held-out evidence**: the direction (`steer`, `steer_project`) or the
+    condition (`steer_if`) must have been fitted with `holdout_positive` /
+    `holdout_negative` prompts — at least 4 per class, held-out AUC ≥
+    `min_holdout_auc` (0.8), and for a condition at most
+    `max_holdout_negative_fire` (5 %) of every gated row of the held-out
+    negatives above the threshold. Held-out prompts that repeat a fitting
+    prompt are refused;
+  - the shuffled-label null is reported but not gated on: with
+    d_model ≫ prompts, in-sample AUC and probe val accuracy reach 1.0 on
+    random labels too, so they say nothing on their own;
+  - any failed check can be overridden with an `override_reason`, which is
+    written into the provenance.
 - **`rune_gate`** runs a `target` set (what must improve) and a `control`
   set (what must not regress) on the base and on the Rune-applied model.
   Green iff:

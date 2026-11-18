@@ -88,6 +88,86 @@ double budgetArg(const json& a, const char* key, double dflt, double ceiling) {
     return v;
 }
 
+/// 'override_reason' (empty when absent).
+std::string overrideReason(const json& a) {
+    return a.contains("override_reason") ? a["override_reason"].get<std::string>() : std::string{};
+}
+
+/// 7.12 evidence gate for a steer edit: held-out separation of the direction
+/// (or condition) that decides where the edit acts. Throws unless the
+/// evidence passes or an 'override_reason' is given; returns the provenance
+/// record either way. The shuffled-label null is a diagnostic only: with
+/// d_model >> prompts the in-sample / val metric separates random labels as
+/// well (null p95 = 1), so only held-out prompts can show a real effect.
+json evidenceGate(const json& a, const std::string& what,
+                  const std::optional<SeparationReport>& holdout, const NullStats& null,
+                  double fitted, const char* fittedName, bool checkNegativeFire) {
+    const double minAuc  = a.value("min_holdout_auc", 0.8);
+    const double maxFire = a.value("max_holdout_negative_fire", 0.05);
+    if (!(minAuc >= 0.5 && minAuc <= 1.0)) {
+        throw std::runtime_error("'min_holdout_auc' must be in [0.5, 1]");
+    }
+    if (!(maxFire >= 0.0 && maxFire <= 1.0)) {
+        throw std::runtime_error("'max_holdout_negative_fire' must be in [0, 1]");
+    }
+    constexpr std::size_t kMinHoldoutPerClass = 4;
+    std::vector<std::string> fails;
+    if (!holdout) {
+        fails.push_back(what + " has no held-out evidence (fit it with holdout_positive / "
+                        "holdout_negative)");
+    } else {
+        if (holdout->positives < kMinHoldoutPerClass || holdout->negatives < kMinHoldoutPerClass) {
+            fails.push_back(what + " held-out set too small (" + std::to_string(holdout->positives) +
+                            " / " + std::to_string(holdout->negatives) + " rows, need >= " +
+                            std::to_string(kMinHoldoutPerClass) + " per class)");
+        }
+        if (holdout->auc < minAuc) {
+            fails.push_back(what + " held-out AUC " + std::to_string(holdout->auc) +
+                            " < min_holdout_auc " + std::to_string(minAuc));
+        }
+        if (checkNegativeFire && holdout->negativeFireRate > maxFire) {
+            fails.push_back(what + " fires on " + std::to_string(holdout->negativeFireRate) +
+                            " of the held-out negative rows > max_holdout_negative_fire " +
+                            std::to_string(maxFire));
+        }
+    }
+    const std::string reason = overrideReason(a);
+    json ev{{"what", what}, {"holdout", holdout ? SurgeryTools::toJson(*holdout) : json(nullptr)},
+            {"null", SurgeryTools::toJson(null)}, {fittedName, fitted},
+            {"fit_metric_informative", null.permutations > 0 && fitted > null.p95},
+            {"min_holdout_auc", minAuc}, {"failed", fails}};
+    if (checkNegativeFire) {
+        ev["max_holdout_negative_fire"] = maxFire;
+    }
+    if (!fails.empty()) {
+        if (reason.empty()) {
+            std::string msg = "evidence gate (7.12) failed:";
+            for (const auto& f : fails) msg += "\n  - " + f;
+            msg += "\npass 'override_reason' to stage anyway (recorded in the provenance)";
+            throw std::runtime_error(msg);
+        }
+        ev["override_reason"] = reason;
+    }
+    return ev;
+}
+
+/// 7.12 dose / placement limits shared by every steer kind.
+void steerLimits(const json& a, std::uint32_t block, double rel, double maxRel) {
+    if (block == 0) {
+        throw std::runtime_error("steering after block 0 is refused (7.12): it silences or "
+                                 "derails the model — pick a later block");
+    }
+    if (rel > RuneStaging::kSteerDoseReasonFloor && overrideReason(a).empty()) {
+        throw std::runtime_error("steer dose " + std::to_string(rel) + " of the residual norm > " +
+                                 std::to_string(RuneStaging::kSteerDoseReasonFloor) +
+                                 " needs an 'override_reason' (7.12)");
+    }
+    if (rel > maxRel) {
+        throw std::runtime_error("edit budget exceeded: relative norm " + std::to_string(rel) +
+                                 " > max_relative_norm " + std::to_string(maxRel));
+    }
+}
+
 const char* stateName(int s) {
     static const char* kNames[] = {"staged", "committed", "rejected"};
     return kNames[s];
@@ -328,11 +408,17 @@ void RuneStaging::registerOn(McpServer& server) {
         "Write a session steering vector (steer_vector) as a staged Rune: a Steer op that adds "
         "alpha x vector to the residual stream after its block on every forward path. Guardrail: "
         "|alpha|·||v|| / mean residual norm must stay within 'max_relative_norm' (default 0.5, "
-        "ceiling 2.0). Nothing is activated — run rune_gate next.",
+        "ceiling 2.0; above 0.5 only with 'override_reason'); block 0 is refused; the vector "
+        "needs held-out evidence from steer_vector (>= 4 held-out prompts per class, held-out "
+        "AUC >= 'min_holdout_auc', default 0.8) or an 'override_reason' "
+        "(roadmap 7.12, recorded in the provenance). Nothing is activated — run rune_gate next.",
         schema({{"name", {{"type", "string"}}},
                 {"vector", {{"type", "string"}}},
                 {"alpha", {{"type", "number"}}},
                 {"max_relative_norm", {{"type", "number"}}},
+                {"min_holdout_auc", {{"type", "number"}}},
+                {"max_holdout_negative_fire", {{"type", "number"}}},
+                {"override_reason", {{"type", "string"}}},
                 {"note", {{"type", "string"}, {"description", "why this edit (kept in provenance)"}}}},
                {"name", "vector", "alpha"}),
         [this](const json& a) {
@@ -345,16 +431,15 @@ void RuneStaging::registerOn(McpServer& server) {
                 throw std::runtime_error("'alpha' must be finite and non-zero");
             }
             const double rel = v.residualNorm > 0 ? std::fabs(alpha) * v.norm / v.residualNorm : 1e300;
-            if (rel > maxRel) {
-                throw std::runtime_error("edit budget exceeded: relative norm " + std::to_string(rel) +
-                                         " > max_relative_norm " + std::to_string(maxRel));
-            }
+            steerLimits(a, v.block, rel, maxRel);
+            const json evidence = evidenceGate(a, "steering vector '" + a["vector"].get<std::string>() + "'",
+                                               v.holdout, v.null, v.inSampleAuc, "in_sample_auc", false);
             const std::string block   = "blk." + std::to_string(v.block);
             const std::string payload = "steer." + block;
             json params{{"vector", a["vector"]}, {"block", v.block}, {"alpha", alpha},
                         {"vector_norm", v.norm}, {"mean_residual_norm", v.residualNorm},
                         {"relative_norm", rel}, {"positives", v.positives},
-                        {"negatives", v.negatives}};
+                        {"negatives", v.negatives}, {"evidence", evidence}};
             rn::RuneManifest man;
             man.name            = name;
             man.baseFingerprint = base;
@@ -383,7 +468,13 @@ void RuneStaging::registerOn(McpServer& server) {
         "(only rows with cos(h_condition_block, c) > threshold are changed, per token); "
         "without: a steer_project op (mode project only). Guardrails: projection alpha in "
         "(0, 1]; add mode |alpha|·||v|| / mean residual norm <= 'max_relative_norm' (default "
-        "0.5, ceiling 2.0). Nothing is activated — run rune_gate next.",
+        "0.5, ceiling 2.0; above 0.5 only with 'override_reason'); block 0 refused. Evidence "
+        "(roadmap 7.12): a steer_if needs its condition's held-out evidence from "
+        "condition_vector — held-out AUC >= 'min_holdout_auc' (default 0.8), fire rate over every "
+        "gated row of the held-out negatives <= 'max_holdout_negative_fire' (default 0.05), >= 4 "
+        "held-out rows per class; a steer_project needs the vector's held-out "
+        "evidence. Otherwise only with 'override_reason' (recorded in the provenance). Nothing is "
+        "activated — run rune_gate next.",
         schema({{"name", {{"type", "string"}}},
                 {"vector", {{"type", "string"}}},
                 {"alpha", {{"type", "number"}}},
@@ -391,6 +482,9 @@ void RuneStaging::registerOn(McpServer& server) {
                 {"condition", {{"type", "string"}}},
                 {"threshold", {{"type", "number"}}},
                 {"max_relative_norm", {{"type", "number"}}},
+                {"min_holdout_auc", {{"type", "number"}}},
+                {"max_holdout_negative_fire", {{"type", "number"}}},
+                {"override_reason", {{"type", "string"}}},
                 {"note", {{"type", "string"}, {"description", "why this edit (kept in provenance)"}}}},
                {"name", "vector", "alpha"}),
         [this](const json& a) {
@@ -398,14 +492,31 @@ void RuneStaging::registerOn(McpServer& server) {
             const std::string base = baseFingerprint();   // also: model loaded?
             auto spec = _surgery.condSteerSpec(a);
             const double maxRel = budgetArg(a, "max_relative_norm", 0.5, kMaxSteerRelativeNorm);
+            const auto steerBlock = spec.params["block"].get<std::uint32_t>();
             if (spec.op.steerMode == rn::RuneSteerMode::Add &&
                 spec.op.kind == rn::RuneOpKind::SteerIf) {
                 const double rel = spec.params["relative_norm"].get<double>();
-                if (!(rel > 0) || rel > maxRel) {
-                    throw std::runtime_error("edit budget exceeded: relative norm " +
-                                             std::to_string(rel) + " > max_relative_norm " +
-                                             std::to_string(maxRel));
+                if (!(rel > 0)) {
+                    throw std::runtime_error("relative norm must be > 0");
                 }
+                steerLimits(a, steerBlock, rel, maxRel);
+            } else {
+                // Projection: dose is bounded by alpha <= 1 (checked in the spec).
+                steerLimits(a, steerBlock, 0.0, maxRel);
+            }
+            if (spec.op.kind == rn::RuneOpKind::SteerIf) {
+                const std::string cn = a.at("condition").get<std::string>();
+                const auto& c = _surgery.conditionVector(cn);
+                if (a.contains("threshold") && c.holdout) {
+                    throw std::runtime_error("'threshold' would bypass the held-out evidence of "
+                                             "condition '" + cn + "' — refit the condition instead");
+                }
+                spec.params["evidence"] = evidenceGate(a, "condition '" + cn + "'", c.holdout, c.null,
+                                                       c.valAccuracy, "val_accuracy", true);
+            } else {
+                const auto& v = _surgery.steerVector(a.at("vector").get<std::string>());
+                spec.params["evidence"] = evidenceGate(a, "steering vector '" + a["vector"].get<std::string>() + "'",
+                                                       v.holdout, v.null, v.inSampleAuc, "in_sample_auc", false);
             }
             const std::string kind{rn::opKindName(spec.op.kind)};
             rn::RuneManifest man;

@@ -284,7 +284,56 @@ double fireRate(const std::vector<float>& scores, std::size_t from, std::size_t 
     return static_cast<double>(n) / static_cast<double>(to - from);
 }
 
+/// Optional string array argument ([] when absent).
+std::vector<std::string> textsArg(const json& a, const char* key) {
+    std::vector<std::string> out;
+    if (!a.contains(key)) {
+        return out;
+    }
+    if (!a[key].is_array()) {
+        throw std::runtime_error(std::string{"'"} + key + "' must be an array of strings");
+    }
+    for (const auto& t : a[key]) out.push_back(t.get<std::string>());
+    return out;
+}
+
+/// Held-out prompts must not repeat a fitting prompt verbatim (7.12).
+void requireDisjoint(const std::vector<std::string>& holdout, const json& a) {
+    for (const char* key : {"positive", "negative"}) {
+        for (const auto& t : a.at(key)) {
+            const auto& fit = t.get<std::string>();
+            if (std::find(holdout.begin(), holdout.end(), fit) != holdout.end()) {
+                throw std::runtime_error(std::string{"held-out prompt is also a fitting prompt ('"} +
+                                         key + "'): " + fit.substr(0, 80));
+            }
+        }
+    }
+}
+
+/// 'null_permutations' in [0, cap].
+std::size_t permutationsArg(const json& a, std::size_t dflt, std::size_t cap) {
+    if (!a.contains("null_permutations")) {
+        return dflt;
+    }
+    const auto n = a["null_permutations"].get<std::int64_t>();
+    if (n < 0 || static_cast<std::uint64_t>(n) > cap) {
+        throw std::runtime_error("'null_permutations' must be in [0, " + std::to_string(cap) + "]");
+    }
+    return static_cast<std::size_t>(n);
+}
+
 } // namespace
+
+json SurgeryTools::toJson(const SeparationReport& r) {
+    return json{{"auc", r.auc}, {"accuracy", r.accuracy},
+                {"negative_fire_rate", r.negativeFireRate},
+                {"positives", r.positives}, {"negatives", r.negatives}};
+}
+
+json SurgeryTools::toJson(const NullStats& n) {
+    return json{{"mean", n.mean}, {"p95", n.p95}, {"max", n.max},
+                {"permutations", n.permutations}};
+}
 
 /// 7.11: the conditional-steer tools (condition_vector, steer_if_preview).
 void SurgeryTools::registerConditionalOn(McpServer& server) {
@@ -301,7 +350,12 @@ void SurgeryTools::registerConditionalOn(McpServer& server) {
         "also scores EVERY row a per-row gate will see on the negative prompts (all prompt rows "
         "plus 'max_tokens' generated answer rows) and raises the threshold to their maximum + "
         "'calibrate_margin' (default 0.01), so no negative row fires — needed when the "
-        "direction is fitted on 'last' rows but the gate runs on every row.",
+        "direction is fitted on 'last' rows but the gate runs on every row. Evidence (roadmap "
+        "7.12): 'null_permutations' (default 3) refits on prompt-shuffled labels (null val "
+        "accuracy); 'holdout_positive' / 'holdout_negative' (prompts NOT used for fitting, with "
+        "the SAME questions in both classes so only the condition differs) are scored with the "
+        "final direction + threshold — AUC, accuracy, and the fire rate over EVERY gated row of "
+        "the held-out negatives. rune_stage_steer_if requires that held-out evidence.",
         schema({{"name", {{"type", "string"}}},
                 {"positive", {{"type", "array"}, {"items", {{"type", "string"}}}}},
                 {"negative", {{"type", "array"}, {"items", {{"type", "string"}}}}},
@@ -311,6 +365,9 @@ void SurgeryTools::registerConditionalOn(McpServer& server) {
                 {"l2", {{"type", "number"}}},
                 {"threshold", {{"type", "number"}}},
                 {"calibrate_negatives", {{"type", "boolean"}}},
+                {"holdout_positive", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"holdout_negative", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"null_permutations", {{"type", "integer"}}},
                 {"calibrate_margin", {{"type", "number"}}},
                 {"add_bos", {{"type", "boolean"}}}},
                {"name", "positive", "negative", "block"}),
@@ -325,6 +382,14 @@ void SurgeryTools::registerConditionalOn(McpServer& server) {
             }
             const std::size_t gen = maxTokensArg(a, 16);
             const std::size_t d   = e.config().embeddingLength;
+            const std::size_t perms = permutationsArg(a, 3, 20);
+            const auto hoPos = textsArg(a, "holdout_positive");
+            const auto hoNeg = textsArg(a, "holdout_negative");
+            if (hoPos.empty() != hoNeg.empty()) {
+                throw std::runtime_error("pass both 'holdout_positive' and 'holdout_negative'");
+            }
+            requireDisjoint(hoPos, a);
+            requireDisjoint(hoNeg, a);
             const bool   calibrate = a.value("calibrate_negatives", false);
             const double margin    = a.value("calibrate_margin", 0.01);
             if (calibrate && a.contains("threshold")) {
@@ -341,53 +406,61 @@ void SurgeryTools::registerConditionalOn(McpServer& server) {
             std::vector<std::int32_t> labels;
             struct Span { std::size_t begin; std::size_t end; int label; std::string text; };
             std::vector<Span> spans;
+            // Unit rows of one prompt at block `blk`: the fitted positions and,
+            // when `wantAll`, every row a per-row gate sees (all prompt rows +
+            // the generated answer rows; the last generated token is never fed
+            // back, so its row is not gated).
+            struct Rows { std::vector<float> fitted; std::vector<float> all; };
+            const auto unitRow = [&](std::vector<float>& dst, const std::vector<float>& h, std::size_t r) {
+                const std::span<const float> row{h.data() + r * d, d};
+                const double nrm = l2(row);
+                for (std::size_t i = 0; i < d; ++i) {
+                    dst.push_back(nrm > 0 ? static_cast<float>(static_cast<double>(row[i]) / nrm) : 0.0F);
+                }
+            };
+            const auto rowsOf = [&](const std::string& text, bool wantAll) {
+                auto              seq = textTokens(e, text, addBos);
+                const std::size_t n   = seq.size();
+                std::size_t from = 0, to = n;
+                if (mode == "last") {
+                    from = n - 1;
+                }
+                if (mode == "generated" || wantAll) {
+                    const auto out = generateGreedy(e, seq, gen);
+                    seq.insert(seq.end(), out.begin(), out.end());
+                    if (mode == "generated") {
+                        from = n - 1;
+                        to   = n - 1 + std::max<std::size_t>(out.size(), 1);
+                    }
+                }
+                Probe probe;
+                probe.hiddenBlocks = {blk};
+                (void)forward(e, seq, &probe);
+                const auto& h = probe.hidden.at(blk);
+                Rows rows;
+                for (std::size_t r = from; r < to; ++r) unitRow(rows.fitted, h, r);
+                if (wantAll) {
+                    const std::size_t gated = seq.size() - (seq.size() > n ? 1 : 0);
+                    for (std::size_t r = 0; r < gated; ++r) unitRow(rows.all, h, r);
+                }
+                return rows;
+            };
             const auto collect = [&](const json& texts, int label) {
                 if (!texts.is_array() || texts.empty()) {
                     throw std::runtime_error("'positive' and 'negative' must be non-empty arrays");
                 }
                 for (const auto& t : texts) {
-                    const std::string text = t.get<std::string>();
-                    auto              seq  = textTokens(e, text, addBos);
-                    const std::size_t n    = seq.size();
-                    std::size_t from = 0, to = n;
-                    const bool calibRows = calibrate && label == 0;
-                    if (mode == "last") {
-                        from = n - 1;
-                    }
-                    if (mode == "generated" || calibRows) {
-                        const auto out = generateGreedy(e, seq, gen);
-                        seq.insert(seq.end(), out.begin(), out.end());
-                        if (mode == "generated") {
-                            from = n - 1;
-                            to   = n - 1 + std::max<std::size_t>(out.size(), 1);
-                        }
-                    }
-                    Probe probe;
-                    probe.hiddenBlocks = {blk};
-                    (void)forward(e, seq, &probe);
-                    const auto& h = probe.hidden.at(blk);
+                    const std::string text      = t.get<std::string>();
+                    const bool        calibRows = calibrate && label == 0;
+                    auto rows = rowsOf(text, calibRows);
                     if (calibRows) {
-                        // The last generated token is never fed back, so its row is not gated.
-                        const std::size_t rows = seq.size() - (seq.size() > n ? 1 : 0);
                         calibSpan.push_back(calib.size() / d);
-                        for (std::size_t r = 0; r < rows; ++r) {
-                            const std::span<const float> row{h.data() + r * d, d};
-                            const double nrm = l2(row);
-                            for (std::size_t i = 0; i < d; ++i) {
-                                calib.push_back(nrm > 0 ? static_cast<float>(static_cast<double>(row[i]) / nrm) : 0.0F);
-                            }
-                        }
+                        calib.insert(calib.end(), rows.all.begin(), rows.all.end());
                         calibSpan.push_back(calib.size() / d);
                     }
                     const std::size_t begin = labels.size();
-                    for (std::size_t r = from; r < to; ++r) {
-                        const std::span<const float> row{h.data() + r * d, d};
-                        const double nrm = l2(row);
-                        for (std::size_t i = 0; i < d; ++i) {
-                            feats.push_back(nrm > 0 ? static_cast<float>(static_cast<double>(row[i]) / nrm) : 0.0F);
-                        }
-                        labels.push_back(label);
-                    }
+                    feats.insert(feats.end(), rows.fitted.begin(), rows.fitted.end());
+                    labels.insert(labels.end(), rows.fitted.size() / d, label);
                     spans.push_back({begin, labels.size(), label, text});
                 }
             };
@@ -483,15 +556,76 @@ void SurgeryTools::registerConditionalOn(McpServer& server) {
                 return json{{"rows", cnt[l]}, {"min", lo[l]}, {"max", hi[l]},
                             {"mean", cnt[l] ? sum[l] / static_cast<double>(cnt[l]) : 0.0}};
             };
+            // 7.12 null: refit on prompt-level shuffled labels (rows of one
+            // prompt keep one label), record the probe's val accuracy.
+            std::vector<double> nullVal;
+            for (std::size_t k = 0; k < perms; ++k) {
+                const auto perm = SeparationMath::permutation(spans.size(), 0x7121ULL + k);
+                std::vector<std::int32_t> shuffled(labels.size());
+                for (std::size_t si = 0; si < spans.size(); ++si) {
+                    const int l = spans[perm[si]].label;
+                    for (std::size_t r = spans[si].begin; r < spans[si].end; ++r) shuffled[r] = l;
+                }
+                nullVal.push_back(
+                    runtime::encoder::LinearProbeTrainer::train(feats, d, shuffled, 2, cfg).valAccuracy);
+            }
+            c.null = SeparationMath::summarize(std::move(nullVal));
+
+            // 7.12 held-out prompts: fitted positions for AUC / accuracy, every
+            // gated row of the negatives for the fire rate a rune would cause.
+            const auto cosine = [&](const std::vector<float>& rowsFlat, std::vector<double>& out) {
+                for (std::size_t r = 0; r * d < rowsFlat.size(); ++r) {
+                    double s = 0;
+                    for (std::size_t i = 0; i < d; ++i) {
+                        s += static_cast<double>(rowsFlat[r * d + i]) * static_cast<double>(c.direction[i]);
+                    }
+                    out.push_back(s);
+                }
+            };
+            json holdoutJson = nullptr;
+            if (!hoPos.empty()) {
+                std::vector<double> sp, sn, snAll;
+                json perPrompt = json::array();
+                for (const auto& t : hoPos) {
+                    std::vector<double> sc;
+                    cosine(rowsOf(t, false).fitted, sc);
+                    perPrompt.push_back({{"label", "positive"}, {"fire_rate", SeparationMath::report(sc, {}, c.threshold).accuracy},
+                                         {"text", t.substr(0, 80)}});
+                    sp.insert(sp.end(), sc.begin(), sc.end());
+                }
+                for (const auto& t : hoNeg) {
+                    const auto rows = rowsOf(t, true);
+                    std::vector<double> sc, all;
+                    cosine(rows.fitted, sc);
+                    cosine(rows.all, all);
+                    perPrompt.push_back({{"label", "negative"},
+                                         {"fire_rate", SeparationMath::report({}, sc, c.threshold).negativeFireRate},
+                                         {"fire_rate_all_rows", SeparationMath::report({}, all, c.threshold).negativeFireRate},
+                                         {"text", t.substr(0, 80)}});
+                    sn.insert(sn.end(), sc.begin(), sc.end());
+                    snAll.insert(snAll.end(), all.begin(), all.end());
+                }
+                SeparationReport rep = SeparationMath::report(sp, sn, c.threshold);
+                rep.negativeFireRate = SeparationMath::report({}, snAll, c.threshold).negativeFireRate;
+                c.holdout   = rep;
+                holdoutJson = toJson(rep);
+                holdoutJson["negative_rows_all"] = snAll.size();
+                holdoutJson["prompts"]           = perPrompt;
+            }
             const std::string name = a.at("name").get<std::string>();
             _conditions[name] = c;
-            return json{{"name", name}, {"block", blk}, {"positions", mode},
-                        {"threshold", c.threshold}, {"fitted_threshold", -b / nw},
-                        {"train_accuracy", c.trainAccuracy}, {"val_accuracy", c.valAccuracy},
-                        {"accuracy_at_threshold",
-                         static_cast<double>(correct) / static_cast<double>(labels.size())},
-                        {"positive", cls(1)}, {"negative", cls(0)}, {"prompts", prompts},
-                        {"calibration", calibration}};
+            json out{{"name", name}, {"block", blk}, {"positions", mode},
+                     {"threshold", c.threshold}, {"fitted_threshold", -b / nw},
+                     {"train_accuracy", c.trainAccuracy}, {"val_accuracy", c.valAccuracy},
+                     {"null_val_accuracy", toJson(c.null)},
+                     {"accuracy_at_threshold",
+                      static_cast<double>(correct) / static_cast<double>(labels.size())},
+                     {"positive", cls(1)}, {"negative", cls(0)}, {"prompts", prompts},
+                     {"calibration", calibration}, {"holdout", holdoutJson}};
+            if (holdoutJson.is_null()) {
+                out["warning"] = "no held-out prompts: rune_stage_steer_if will need 'override_reason'";
+            }
+            return out;
         });
 
     server.addTool(
@@ -803,10 +937,20 @@ void SurgeryTools::registerOn(McpServer& server) {
         "Build a steering direction at one block: mean residual (last position) over the "
         "'positive' prompts minus the mean over the 'negative' prompts. Stored in this session "
         "under 'name' (dropped when the model changes). Reports its norm next to the typical "
-        "residual norm at that block, which is the scale 'alpha' is relative to.",
+        "residual norm at that block, which is the scale 'alpha' is relative to. Evidence "
+        "(roadmap 7.12): the in-sample AUC of the fitting prompts along the vector, the same AUC "
+        "under 'null_permutations' (default 20) shuffled labellings — with d >> n even random "
+        "labels separate in-sample, so the in-sample AUC only counts above the null (usually "
+        "it is not: then only held-out prompts can show an effect) — and, with "
+        "'holdout_positive' / 'holdout_negative' (prompts NOT used for fitting, ideally other "
+        "questions), the held-out AUC and accuracy at the midpoint of the two class means. "
+        "rune_stage_steer / rune_stage_steer_if require held-out evidence.",
         schema({{"name", {{"type", "string"}}},
                 {"positive", {{"type", "array"}, {"items", {{"type", "string"}}}}},
                 {"negative", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"holdout_positive", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"holdout_negative", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"null_permutations", {{"type", "integer"}}},
                 {"block", {{"type", "integer"}}},
                 {"add_bos", {{"type", "boolean"}}}},
                {"name", "positive", "negative", "block"}),
@@ -816,50 +960,112 @@ void SurgeryTools::registerOn(McpServer& server) {
             const auto blk    = blockArg(e, a.at("block"));
             const bool addBos = a.value("add_bos", true);
             const std::size_t d = e.config().embeddingLength;
+            const std::size_t perms = permutationsArg(a, 20, 200);
+            const auto hoPos = textsArg(a, "holdout_positive");
+            const auto hoNeg = textsArg(a, "holdout_negative");
+            if (hoPos.empty() != hoNeg.empty()) {
+                throw std::runtime_error("pass both 'holdout_positive' and 'holdout_negative'");
+            }
+            requireDisjoint(hoPos, a);
+            requireDisjoint(hoNeg, a);
             double residualSum = 0;
             std::size_t residualN = 0;
-            const auto meanOf = [&](const json& texts) {
-                if (!texts.is_array() || texts.empty()) {
-                    throw std::runtime_error("'positive' and 'negative' must be non-empty arrays");
-                }
-                std::vector<double> m(d, 0.0);
+            // Last-position residual of each text, appended to `rows` ([n, d]).
+            const auto lastRows = [&](const std::vector<std::string>& texts, std::vector<float>& rows,
+                                      bool countResidual) {
                 for (const auto& t : texts) {
-                    const auto ids = textTokens(e, t.get<std::string>(), addBos);
+                    const auto ids = textTokens(e, t, addBos);
                     Probe probe;
                     probe.hiddenBlocks = {blk};
                     (void)forward(e, ids, &probe);
                     const auto& h = probe.hidden.at(blk);
                     const std::span<const float> last{h.data() + (ids.size() - 1) * d, d};
-                    residualSum += l2(last);
-                    ++residualN;
-                    for (std::size_t i = 0; i < d; ++i) m[i] += static_cast<double>(last[i]);
+                    if (countResidual) {
+                        residualSum += l2(last);
+                        ++residualN;
+                    }
+                    rows.insert(rows.end(), last.begin(), last.end());
                 }
-                for (auto& x : m) x /= static_cast<double>(texts.size());
-                return m;
             };
-            const auto pos = meanOf(a.at("positive"));
-            const auto neg = meanOf(a.at("negative"));
+            const auto texts = [](const json& j) {
+                if (!j.is_array() || j.empty()) {
+                    throw std::runtime_error("'positive' and 'negative' must be non-empty arrays");
+                }
+                std::vector<std::string> out;
+                for (const auto& t : j) out.push_back(t.get<std::string>());
+                return out;
+            };
+            const auto posTexts = texts(a.at("positive"));
+            const auto negTexts = texts(a.at("negative"));
+            std::vector<float> rows;
+            lastRows(posTexts, rows, true);
+            lastRows(negTexts, rows, true);
+            const std::size_t np = posTexts.size(), nn = negTexts.size();
+            std::vector<double> pos(d, 0.0), neg(d, 0.0);
+            for (std::size_t r = 0; r < np + nn; ++r) {
+                auto& m = r < np ? pos : neg;
+                for (std::size_t i = 0; i < d; ++i) m[i] += static_cast<double>(rows[r * d + i]);
+            }
+            for (auto& x : pos) x /= static_cast<double>(np);
+            for (auto& x : neg) x /= static_cast<double>(nn);
             SteerVector v;
             v.block = blk;
             v.values.resize(d);
-            double dot = 0, np = 0, nn = 0;
+            double dot = 0, npos = 0, nneg = 0;
             for (std::size_t i = 0; i < d; ++i) {
                 v.values[i] = static_cast<float>(pos[i] - neg[i]);
-                dot += pos[i] * neg[i];
-                np  += pos[i] * pos[i];
-                nn  += neg[i] * neg[i];
+                dot  += pos[i] * neg[i];
+                npos += pos[i] * pos[i];
+                nneg += neg[i] * neg[i];
             }
             v.norm         = l2(v.values);
             v.residualNorm = residualSum / static_cast<double>(residualN);
-            v.positives    = a["positive"].size();
-            v.negatives    = a["negative"].size();
+            v.positives    = np;
+            v.negatives    = nn;
+
+            // 7.12 evidence. Projections onto the unit vector; the threshold is
+            // the midpoint of the two class-mean projections.
+            const auto project = [&](std::span<const float> row) {
+                double s = 0;
+                for (std::size_t i = 0; i < d; ++i) {
+                    s += static_cast<double>(row[i]) * static_cast<double>(v.values[i]);
+                }
+                return v.norm > 0 ? s / v.norm : 0.0;
+            };
+            std::vector<std::uint8_t> isPos(np + nn, 0);
+            std::fill(isPos.begin(), isPos.begin() + static_cast<std::ptrdiff_t>(np), std::uint8_t{1});
+            v.inSampleAuc = SeparationMath::meanDifferenceAuc(rows, d, isPos);
+            v.null        = SeparationMath::meanDifferenceNull(rows, d, np, perms, 0x7120ULL);
+            double meanPosProj = 0, meanNegProj = 0;
+            for (std::size_t r = 0; r < np + nn; ++r) {
+                const double s = project({rows.data() + r * d, d});
+                (r < np ? meanPosProj : meanNegProj) += s;
+            }
+            const double midpoint = (meanPosProj / static_cast<double>(np) +
+                                     meanNegProj / static_cast<double>(nn)) / 2.0;
+            json out{{"block", blk}, {"norm", v.norm}, {"mean_residual_norm", v.residualNorm},
+                     {"relative_norm", v.residualNorm > 0 ? v.norm / v.residualNorm : 0.0},
+                     {"cosine_pos_neg", (npos > 0 && nneg > 0) ? dot / std::sqrt(npos * nneg) : 0.0},
+                     {"positives", v.positives}, {"negatives", v.negatives},
+                     {"in_sample_auc", v.inSampleAuc}, {"null_auc", toJson(v.null)},
+                     {"midpoint", midpoint}};
+            if (!hoPos.empty()) {
+                std::vector<float> hp, hn;
+                lastRows(hoPos, hp, false);
+                lastRows(hoNeg, hn, false);
+                std::vector<double> sp, sn;
+                for (std::size_t r = 0; r < hoPos.size(); ++r) sp.push_back(project({hp.data() + r * d, d}));
+                for (std::size_t r = 0; r < hoNeg.size(); ++r) sn.push_back(project({hn.data() + r * d, d}));
+                v.holdout       = SeparationMath::report(sp, sn, midpoint);
+                out["holdout"]  = toJson(*v.holdout);
+            } else {
+                out["holdout"] = nullptr;
+                out["warning"] = "no held-out prompts: rune_stage_steer will need 'override_reason'";
+            }
             const std::string name = a.at("name").get<std::string>();
+            out["name"]    = name;
             _vectors[name] = v;
-            return json{{"name", name}, {"block", blk}, {"norm", v.norm},
-                        {"mean_residual_norm", v.residualNorm},
-                        {"relative_norm", v.residualNorm > 0 ? v.norm / v.residualNorm : 0.0},
-                        {"cosine_pos_neg", (np > 0 && nn > 0) ? dot / std::sqrt(np * nn) : 0.0},
-                        {"positives", v.positives}, {"negatives", v.negatives}};
+            return out;
         });
 
     server.addTool(
