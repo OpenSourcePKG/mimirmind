@@ -7,6 +7,7 @@
 #include "compute/Dequant.hpp"
 #include "hugin/ForwardSupport.hpp"
 #include "hugin/ForwardTools.hpp"
+#include "hugin/GenerationCheck.hpp"
 #include "hugin/RuneStaging.hpp"
 #include "hugin/train/AdamW.hpp"
 #include "hugin/train/DenseBlock.hpp"
@@ -18,6 +19,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <numeric>
@@ -164,6 +167,7 @@ struct SftExample {
     std::size_t               responseTokens{0};
     bool                      truncated{false};
     std::string               response;
+    std::string               kind;
 };
 
 } // namespace
@@ -328,7 +332,9 @@ void TrainTools::registerOn(McpServer& server) {
         "frozen, only adapters learn. Data: 'items' or 'path' (.json / .jsonl) of {prompt, response} "
         "or {prompt, teacher_prompt}: with teacher_prompt the response is the BASE model's greedy "
         "answer to teacher_prompt (self-distillation, e.g. the same question asked in German), ended "
-        "by the template's stop token unless cut at 'max_teacher_tokens' (default 96). Loss = CE on "
+        "by the template's stop token unless cut at 'max_teacher_tokens' (default 96); an item's "
+        "'teacher_check' (eval generate spec: lang / match / ...) drops teacher answers that fail it. "
+        "'data_out' writes the final {kind, prompt, response} pairs as .jsonl for re-use. Loss = CE on "
         "the response tokens only. Adapters: 'targets' (default q k v o gate up down) on 'blocks' "
         "(default all), 'rank' (8), 'alpha' (16; scale alpha/rank), B = 0 at start. AdamW 'lr' "
         "(5e-4), 'epochs' (2), 'batch' (4, gradient accumulation), global grad-norm clip 'clip' "
@@ -337,6 +343,7 @@ void TrainTools::registerOn(McpServer& server) {
         "(Futhark load path) on the first example.",
         schema({{"name", {{"type", "string"}}},
                 {"items", {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                {"data_out", {{"type", "string"}}},
                 {"path", {{"type", "string"}}},
                 {"add_bos", {{"type", "boolean"}}},
                 {"targets", {{"type", "array"}, {"items", {{"type", "string"}}}}},
@@ -370,9 +377,11 @@ void TrainTools::registerOn(McpServer& server) {
             stops.push_back(e.tokenizer().eosId());
             const auto maxTeacher = a.value("max_teacher_tokens", std::size_t{96});
             std::vector<SftExample> data;
-            std::size_t truncatedN = 0;
+            std::size_t truncatedN = 0, droppedN = 0;
+            json dropped = json::array();
             for (const auto& it : items) {
                 SftExample ex;
+                ex.kind = it.value("kind", std::string{});
                 const auto prompt = encodeText(e, it.at("prompt").get<std::string>(), addBos);
                 std::vector<std::int32_t> resp;
                 if (it.contains("response")) {
@@ -381,6 +390,21 @@ void TrainTools::registerOn(McpServer& server) {
                     const auto tp = encodeText(e, it["teacher_prompt"].get<std::string>(), addBos);
                     resp = generateGreedy(e, tp, maxTeacher);
                     ex.truncated = resp.size() >= maxTeacher;
+                    if (it.contains("teacher_check")) {
+                        // Keep only teacher answers that pass the item's own check
+                        // (e.g. the right language): a wrong answer would be learned.
+                        const GenerationCheck check(it["teacher_check"]);
+                        const json r = check.evaluate(e.tokenizer().decode(resp, true));
+                        if (!r.at("correct").get<bool>()) {
+                            ++droppedN;
+                            if (dropped.size() < 8) {
+                                dropped.push_back({{"id", it.value("id", std::string{})},
+                                                   {"checks", r.at("checks")},
+                                                   {"text", e.tokenizer().decode(resp, true)}});
+                            }
+                            continue;
+                        }
+                    }
                     if (!ex.truncated) resp.push_back(stops.front());
                 } else {
                     throw std::runtime_error("every item needs 'response' or 'teacher_prompt'");
@@ -396,7 +420,23 @@ void TrainTools::registerOn(McpServer& server) {
                 ex.responseTokens = resp.size();
                 data.push_back(std::move(ex));
             }
-            std::cerr << "hugin train_lora_sft: " << data.size() << " examples ready after " << elapsed() << " s\n";
+            if (data.empty()) throw std::runtime_error("no example passed its teacher_check");
+            std::cerr << "hugin train_lora_sft: " << data.size() << " examples ready (" << droppedN
+                      << " dropped by teacher_check) after " << elapsed() << " s\n";
+            if (a.contains("data_out")) {
+                // Re-usable data: the exact prompt/response pairs trained on (the
+                // response text includes the stop token unless truncated).
+                const std::filesystem::path out = a["data_out"].get<std::string>();
+                std::ofstream f(out);
+                if (!f) throw std::runtime_error("cannot write data_out '" + out.string() + "'");
+                for (const auto& ex : data) {
+                    const std::vector<std::int32_t> pr(ex.ids.begin(),
+                                                       ex.ids.begin() + static_cast<std::ptrdiff_t>(ex.promptTokens));
+                    f << json{{"kind", ex.kind}, {"prompt", e.tokenizer().decode(pr, false)},
+                              {"response", ex.response}}.dump()
+                      << "\n";
+                }
+            }
 
             // 2. Model + fresh adapters.
             train::DenseModel& m = model();
@@ -509,7 +549,8 @@ void TrainTools::registerOn(McpServer& server) {
             json tnames = json::array();
             for (const auto p : projs) tnames.push_back(projName(p));
             json params{{"method", "lora_sft"}, {"examples", data.size()}, {"response_tokens", respTok},
-                        {"teacher_truncated", truncatedN}, {"targets", tnames}, {"blocks", blocks},
+                        {"teacher_truncated", truncatedN}, {"teacher_dropped", droppedN},
+                        {"targets", tnames}, {"blocks", blocks},
                         {"rank", rank}, {"alpha", alpha}, {"lr", oc.lr}, {"epochs", epochs},
                         {"batch", batch}, {"clip", clip}, {"seed", a.value("seed", 7403U)},
                         {"epoch_loss", epochLoss}, {"steps", steps},
@@ -559,6 +600,7 @@ void TrainTools::registerOn(McpServer& server) {
                              return n;
                          }()},
                         {"engine_parity", parity}, {"teacher_samples", samples},
+                        {"teacher_dropped", droppedN}, {"teacher_dropped_samples", dropped},
                         {"threads", train::Parallel::threads()}, {"seconds", elapsed()}};
         });
 }
