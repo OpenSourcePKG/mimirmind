@@ -140,9 +140,14 @@ public:
     [[nodiscard]] static nlohmann::json toJson(const NullStats& n);
     core::rune::RuneCondSteer condSteerArg(const nlohmann::json& a);
 
+    /// 7.10: one edit_search trial as provenance JSON {search, trial, seed,
+    /// space, params, objectives, feasible, edit}; throws if unknown.
+    [[nodiscard]] nlohmann::json searchTrial(const std::string& search, std::size_t trial) const;
+
 private:
     void               registerConditionalOn(McpServer& server);
     void               registerCausalityOn(McpServer& server);
+    void               registerEditSearchOn(McpServer& server);
     const SteerVector& vector(const std::string& name);
     void               dropStaleVectors();
 
@@ -151,6 +156,8 @@ private:
     std::map<std::string, SteerVector>   _vectors;
     std::map<std::string, ConditionVector> _conditions;
     std::map<std::string, Causality>       _causality;
+    /// edit_search results per search name (dropped with the vectors).
+    std::map<std::string, nlohmann::json>  _searches;
     /// eval_preview base results per goldset path (dropped with the vectors).
     std::map<std::string, std::pair<nlohmann::json, nlohmann::json>> _baseEvals;
 };

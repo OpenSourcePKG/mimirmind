@@ -2,6 +2,7 @@
 // Copyright 2026 Stefan Werfling
 
 #include "hugin/SurgeryTools.hpp"
+#include "hugin/TreeParzenEstimator.hpp"
 
 #include "hugin/ForwardSupport.hpp"
 #include "hugin/ForwardTools.hpp"
@@ -227,6 +228,7 @@ void SurgeryTools::dropStaleVectors() {
         _vectors.clear();
         _conditions.clear();
         _causality.clear();
+        _searches.clear();
         _baseEvals.clear();
         _vectorsKey = key;
     }
@@ -823,6 +825,7 @@ core::rune::RuneCondSteer SurgeryTools::condSteerArg(const json& a) {
 void SurgeryTools::registerOn(McpServer& server) {
     registerConditionalOn(server);
     registerCausalityOn(server);
+    registerEditSearchOn(server);
     // steer {vector, alpha, positions} / ablate {block, heads, scale} /
     // head_edits [{block, heads, scale}] -> Interventions.
     const auto interventionsArg = [this](const json& a) {
@@ -1602,6 +1605,253 @@ void SurgeryTools::registerCausalityOn(McpServer& server) {
                 out["target"] = {{"id", *target}, {"piece", piece(e, *target)}};
             }
             return out;
+        });
+}
+
+json SurgeryTools::searchTrial(const std::string& search, std::size_t trial) const {
+    const auto it = _searches.find(search);
+    if (it == _searches.end()) {
+        throw std::runtime_error("unknown edit_search '" + search + "' (searches live in this session)");
+    }
+    const json& s = it->second;
+    if (trial >= s["trials"].size()) {
+        throw std::runtime_error("edit_search '" + search + "' has no trial " + std::to_string(trial));
+    }
+    return json{{"search", search}, {"trial", trial}, {"seed", s["seed"]}, {"space", s["space"]},
+                {"objectives_def", s["objectives_def"]}, {"result", s["trials"][trial]}};
+}
+
+/// 7.10: edit_search — TPE over edit parameters, Pareto front of
+/// (target metric up, control KL down) under the free-generation constraint.
+void SurgeryTools::registerEditSearchOn(McpServer& server) {
+    server.addTool(
+        "edit_search",
+        "Multi-objective edit search (roadmap 7.10): an own Tree-structured Parzen Estimator "
+        "proposes edits, each is scored, and the Pareto front comes back. kind 'heads': "
+        "'ranked_heads' [[block, head, ...], ...] best first (e.g. from attention_pattern span "
+        "ranking); per trial the top k heads (k in 'k' [min, max], log-scaled; at most "
+        "'max_per_block' per block, default 12) are scaled by 'scale' [min, max]; with "
+        "'block_window' true a block window (center, half-width) is searched too. kind 'steer': "
+        "'vector' with alpha in 'alpha' [min, max] (+ 'positions'). Objectives (minimised): "
+        "1 = -target goldset score ('target_path' / 'target_items': mean logprob of scored items, "
+        "else -accuracy), 2 = mean next-token KL(base || edited) on 'control_prompts'. Hard "
+        "constraint: no per-check regression on the free-generation goldset ('constraint_path' / "
+        "'constraint_items'), evaluated every trial. 'trials' (default 30, max 200), "
+        "'startup_trials' (default 8), 'seed'. Stored under 'name'; stage a front point with "
+        "rune_stage_heads / rune_stage_steer plus 'search' + 'trial' (parameters and seed go into "
+        "the provenance; the 7.12 gates still apply).",
+        schema({{"name", {{"type", "string"}}},
+                {"kind", {{"type", "string"}, {"enum", {"heads", "steer"}}}},
+                {"ranked_heads", {{"type", "array"}, {"items", {}}}},
+                {"k", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
+                {"scale", {{"type", "array"}, {"items", {{"type", "number"}}}}},
+                {"max_per_block", {{"type", "integer"}}},
+                {"block_window", {{"type", "boolean"}}},
+                {"vector", {{"type", "string"}}},
+                {"alpha", {{"type", "array"}, {"items", {{"type", "number"}}}}},
+                {"positions", {{"type", "string"}, {"enum", {"all", "last"}}}},
+                {"target_path", {{"type", "string"}}},
+                {"target_items", {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                {"control_prompts", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"constraint_path", {{"type", "string"}}},
+                {"constraint_items", {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                {"trials", {{"type", "integer"}}},
+                {"startup_trials", {{"type", "integer"}}},
+                {"seed", {{"type", "integer"}}},
+                {"add_bos", {{"type", "boolean"}}}},
+               {"name", "kind", "control_prompts"}),
+        [this](const json& a) {
+            Engine& e = _forward.engine();
+            dropStaleVectors();
+            const std::string name = a.at("name").get<std::string>();
+            const std::string kind = a.at("kind").get<std::string>();
+            const bool addBos      = a.value("add_bos", true);
+            const std::size_t nTrials = a.value("trials", std::size_t{30});
+            const std::size_t startup = a.value("startup_trials", std::size_t{8});
+            const std::uint64_t seed  = a.value("seed", std::uint64_t{0x7100});
+            if (nTrials < 2 || nTrials > 200 || startup < 1 || startup > nTrials) {
+                throw std::runtime_error("'trials' must be in [2, 200] and 'startup_trials' in [1, trials]");
+            }
+            const auto goldset = [&](const char* path, const char* items) -> json {
+                json g;
+                if (a.contains(items)) g["items"] = a[items];
+                else if (a.contains(path)) g["path"] = a[path];
+                else return json::array();
+                return loadGoldset(g);
+            };
+            const json target     = goldset("target_path", "target_items");
+            const json constraint = goldset("constraint_path", "constraint_items");
+            if (target.empty()) {
+                throw std::runtime_error("pass 'target_path' or 'target_items'");
+            }
+            const auto controls = textsArg(a, "control_prompts");
+            if (controls.empty()) {
+                throw std::runtime_error("'control_prompts' must be a non-empty array");
+            }
+            const auto range = [&](const char* key) {
+                if (!a.contains(key) || a[key].size() != 2) {
+                    throw std::runtime_error(std::string{"'"} + key + "' must be [min, max]");
+                }
+                const double lo = a[key][0].get<double>(), hi = a[key][1].get<double>();
+                if (!(std::isfinite(lo) && std::isfinite(hi) && lo <= hi)) {
+                    throw std::runtime_error(std::string{"'"} + key + "' must be finite with min <= max");
+                }
+                return std::pair{lo, hi};
+            };
+
+            using TPE = TreeParzenEstimator;
+            using K   = TPE::Param::Kind;
+            std::vector<TPE::Param> space;
+            std::vector<std::pair<std::uint32_t, std::size_t>> pool;   // ranked (block, head)
+            std::size_t maxPerBlock = 12;
+            bool window = false;
+            const SteerVector* vec = nullptr;
+            bool lastOnly = false;
+            if (kind == "heads") {
+                if (!a.contains("ranked_heads") || a["ranked_heads"].empty()) {
+                    throw std::runtime_error("kind 'heads' needs 'ranked_heads'");
+                }
+                for (const auto& r : a["ranked_heads"]) {
+                    const json b = r.is_array() ? r.at(0) : r.at("block");
+                    const json h = r.is_array() ? r.at(1) : r.at("head");
+                    const std::uint32_t blk = blockArg(e, b);
+                    const std::size_t   hd  = headList(e, json::array({h})).front();
+                    if (std::find(pool.begin(), pool.end(), std::pair{blk, hd}) == pool.end()) {
+                        pool.emplace_back(blk, hd);
+                    }
+                }
+                maxPerBlock = a.value("max_per_block", std::size_t{12});
+                const auto [k0, k1] = range("k");
+                const auto [s0, s1] = range("scale");
+                if (k0 < 1 || k1 > static_cast<double>(pool.size())) {
+                    throw std::runtime_error("'k' must lie in [1, ranked_heads size]");
+                }
+                if (s0 < 0) {
+                    throw std::runtime_error("'scale' must be >= 0");
+                }
+                space.push_back({"k", K::Int, k0, k1, k0 >= 1 && k1 / k0 >= 4});
+                space.push_back({"scale", K::Float, s0, s1});
+                window = a.value("block_window", false);
+                if (window) {
+                    const double nb = static_cast<double>(e.config().blockCount);
+                    space.push_back({"block_center", K::Int, 0, nb - 1});
+                    space.push_back({"block_half_width", K::Int, 1, std::max(1.0, nb / 2)});
+                }
+            } else if (kind == "steer") {
+                vec      = &vector(a.at("vector").get<std::string>());
+                lastOnly = lastOnlyArg(a);
+                const auto [a0, a1] = range("alpha");
+                space.push_back({"alpha", K::Float, a0, a1});
+            } else {
+                throw std::runtime_error("'kind' must be \"heads\" or \"steer\"");
+            }
+
+            // Trial parameters -> interventions (+ the edit as JSON for staging).
+            const auto build = [&](const std::vector<double>& p, json& edit) {
+                Interventions iv;
+                if (kind == "steer") {
+                    iv.steer         = vec;
+                    iv.alpha         = p[0];
+                    iv.steerLastOnly = lastOnly;
+                    edit = {{"vector", a["vector"]}, {"alpha", p[0]},
+                            {"positions", lastOnly ? "last" : "all"}};
+                    return iv;
+                }
+                const auto k = static_cast<std::size_t>(p[0]);
+                std::map<std::uint32_t, std::vector<std::size_t>> per;
+                std::size_t taken = 0;
+                for (const auto& [b, h] : pool) {
+                    if (taken >= k) break;
+                    if (window && std::fabs(static_cast<double>(b) - p[2]) > p[3]) continue;
+                    auto& v = per[b];
+                    if (v.size() >= maxPerBlock) continue;
+                    v.push_back(h);
+                    ++taken;
+                }
+                edit = json::array();
+                for (auto& [b, hs] : per) {
+                    if (hs.empty()) continue;
+                    std::sort(hs.begin(), hs.end());
+                    iv.headEdits.push_back(HeadEdit{b, hs, p[1]});
+                    edit.push_back({{"block", b}, {"heads", hs}, {"scale", p[1]}});
+                }
+                return iv;
+            };
+
+            // Base references, computed once.
+            json tRowsBase = json::array(), cRowsBase = json::array();
+            const json tBase = evalRun(e, target, addBos, tRowsBase);
+            if (!constraint.empty()) (void)evalRun(e, constraint, addBos, cRowsBase);
+            std::vector<std::vector<std::int32_t>> cIds;
+            std::vector<std::vector<double>>       cBase;
+            for (const auto& t : controls) {
+                cIds.push_back(textTokens(e, t, addBos));
+                cBase.push_back(lastLogProbs(e, cIds.back(), Interventions{}));
+            }
+            const bool scored = tBase["items"].get<std::size_t>() > tBase["generate_items"].get<std::size_t>();
+            const auto targetScore = [&](const json& sum) {
+                return scored ? sum["mean_logprob"].get<double>() : sum["accuracy"].get<double>();
+            };
+
+            TPE tpe(space, 2, {startup, 0.25, 24, seed});
+            json trials = json::array();
+            for (std::size_t t = 0; t < nTrials; ++t) {
+                auto p = tpe.suggest();
+                json edit;
+                const Interventions iv = build(p, edit);
+                json row{{"trial", t}, {"params", json::object()}, {"edit", edit}};
+                for (std::size_t i = 0; i < space.size(); ++i) row["params"][space[i].name] = p[i];
+                if (iv.headEdits.empty() && iv.steer == nullptr) {
+                    row["feasible"] = false;
+                    row["skipped"]  = "no head left inside the block window";
+                    tpe.tell(p, {0.0, 1e9}, false);
+                    trials.push_back(std::move(row));
+                    continue;
+                }
+                const auto reached = std::make_shared<std::vector<char>>(iv.headEdits.size(), char{0});
+                const ProbeSetup setup = [&](Probe& probe, std::size_t n) { installInto(e, iv, n, probe, reached); };
+                json tRows = json::array();
+                const json tSum = evalRun(e, target, addBos, tRows, &setup);
+                requireReached(e, reached);
+                double kl = 0;
+                for (std::size_t c = 0; c < cIds.size(); ++c) {
+                    kl += LogitMath::kl(cBase[c], lastLogProbs(e, cIds[c], iv));
+                }
+                kl /= static_cast<double>(cIds.size());
+                std::size_t regressions = 0;
+                if (!constraint.empty()) {
+                    json rows = json::array();
+                    (void)evalRun(e, constraint, addBos, rows, &setup);
+                    regressions = checkRegressions(cRowsBase, rows).size();
+                }
+                const double score = targetScore(tSum);
+                const bool feasible = regressions == 0 && std::isfinite(score) && std::isfinite(kl);
+                row["target"]      = {{"score", score}, {"accuracy", tSum["accuracy"]},
+                                      {"delta", score - targetScore(tBase)}};
+                row["control_kl"]  = kl;
+                row["regressions"] = regressions;
+                row["feasible"]    = feasible;
+                row["objectives"]  = {-score, kl};
+                tpe.tell(p, {-score, kl}, feasible);
+                trials.push_back(std::move(row));
+            }
+            json front = json::array();
+            for (const auto i : TPE::paretoFront(tpe.trials())) front.push_back(trials[i]);
+            std::sort(front.begin(), front.end(), [](const json& x, const json& y) {
+                return x["control_kl"].get<double>() < y["control_kl"].get<double>();
+            });
+            json spaceJson = json::array();
+            for (const auto& sp : space) spaceJson.push_back({{"name", sp.name}, {"lo", sp.lo}, {"hi", sp.hi}, {"log", sp.log}});
+            const json objectivesDef = {scored ? "-target_mean_logprob" : "-target_accuracy", "control_kl"};
+            _searches[name] = {{"seed", seed}, {"space", spaceJson}, {"kind", kind},
+                               {"objectives_def", objectivesDef}, {"trials", trials}};
+            std::size_t feasibleN = 0;
+            for (const auto& t : trials) feasibleN += t["feasible"].get<bool>() ? 1U : 0U;
+            return json{{"name", name}, {"kind", kind}, {"seed", seed}, {"space", spaceJson},
+                        {"objectives", objectivesDef},
+                        {"base", {{"target_score", targetScore(tBase)}, {"target_accuracy", tBase["accuracy"]}}},
+                        {"trials_run", trials.size()}, {"feasible", feasibleN},
+                        {"constraint_items", constraint.size()}, {"pareto_front", front}};
         });
 }
 

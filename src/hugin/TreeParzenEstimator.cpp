@@ -140,6 +140,9 @@ double TreeParzenEstimator::sampleParam(std::size_t pi, const std::vector<std::s
         return pick;
     }
     const double lo = toInternal(p, p.lo), hi = toInternal(p, p.hi);
+    if (!(hi > lo)) {
+        return p.lo;   // fixed parameter (min == max)
+    }
     std::vector<double> cg, cb;
     for (const auto i : good) cg.push_back(toInternal(p, _trials[i].params[pi]));
     for (const auto i : bad) cb.push_back(toInternal(p, _trials[i].params[pi]));

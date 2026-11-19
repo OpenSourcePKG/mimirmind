@@ -155,6 +155,35 @@ json evidenceGate(const json& a, const std::string& what,
     return ev;
 }
 
+/// 7.10: provenance of an edit_search front point; the staged edit must be
+/// exactly the trial's edit (same headsKey / same vector and alpha).
+json searchProvenance(const json& a, const SurgeryTools& surgery, const std::string& stagedKey) {
+    if (!a.contains("search") && !a.contains("trial")) {
+        return nullptr;
+    }
+    if (!a.contains("search") || !a.contains("trial")) {
+        throw std::runtime_error("pass 'search' and 'trial' together");
+    }
+    json pr = surgery.searchTrial(a["search"].get<std::string>(), a["trial"].get<std::size_t>());
+    const json& edit = pr["result"]["edit"];
+    std::string trialKey;
+    if (edit.is_array()) {
+        std::vector<SurgeryTools::HeadEditKey> keys;
+        for (const auto& he : edit) {
+            keys.emplace_back(he["block"].get<std::uint32_t>(), he["heads"].get<std::vector<std::size_t>>(),
+                              he["scale"].get<double>());
+        }
+        trialKey = SurgeryTools::headsKey(keys);
+    } else {
+        trialKey = SurgeryTools::vectorKey(edit["vector"].get<std::string>(), edit["alpha"].get<double>());
+    }
+    if (trialKey != stagedKey) {
+        throw std::runtime_error("the staged edit differs from edit_search trial " +
+                                 std::to_string(a["trial"].get<std::size_t>()) + " (stage its 'edit' as returned)");
+    }
+    return pr;
+}
+
 /// 7.12 causality gate: the same edit must have a causality_check verdict of
 /// at least "weak"; with `checkDose` its measured dose must stay <= the floor.
 json causalityGate(const json& a, const std::string& what, const SurgeryTools::Causality* c,
@@ -428,6 +457,9 @@ json RuneStaging::stageHeadScales(const json& a, const std::string& name, const 
         params["target_type"]   = edits[0]["target_type"];
     }
     params["causality"] = causal;
+    if (const json sp = searchProvenance(a, _surgery, SurgeryTools::headsKey(keys)); !sp.is_null()) {
+        params["edit_search"] = sp;
+    }
     man.provenanceJson = json{{"tool", "hugin"}, {"hugin_version", _version},
                               {"kind", kind}, {"created_at", nowIso()},
                               {"note", a.value("note", std::string{})},
@@ -461,6 +493,8 @@ void RuneStaging::registerOn(McpServer& server) {
                 {"min_holdout_auc", {{"type", "number"}}},
                 {"max_holdout_negative_fire", {{"type", "number"}}},
                 {"override_reason", {{"type", "string"}}},
+                {"search", {{"type", "string"}}},
+                {"trial", {{"type", "integer"}}},
                 {"note", {{"type", "string"}, {"description", "why this edit (kept in provenance)"}}}},
                {"name", "vector", "alpha"}),
         [this](const json& a) {
@@ -485,6 +519,10 @@ void RuneStaging::registerOn(McpServer& server) {
                         {"vector_norm", v.norm}, {"mean_residual_norm", v.residualNorm},
                         {"relative_norm", rel}, {"positives", v.positives},
                         {"negatives", v.negatives}, {"evidence", evidence}, {"causality", causal}};
+            if (const json sp = searchProvenance(a, _surgery, SurgeryTools::vectorKey(a["vector"].get<std::string>(), alpha));
+                !sp.is_null()) {
+                params["edit_search"] = sp;
+            }
             rn::RuneManifest man;
             man.name            = name;
             man.baseFingerprint = base;
@@ -601,6 +639,8 @@ void RuneStaging::registerOn(McpServer& server) {
                 {"heads", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
                 {"max_head_fraction", {{"type", "number"}}},
                 {"override_reason", {{"type", "string"}}},
+                {"search", {{"type", "string"}}},
+                {"trial", {{"type", "integer"}}},
                 {"note", {{"type", "string"}}}},
                {"name", "block", "heads"}),
         [this](const json& a) {
@@ -628,6 +668,8 @@ void RuneStaging::registerOn(McpServer& server) {
                 {"max_head_fraction", {{"type", "number"}}},
                 {"max_scale", {{"type", "number"}}},
                 {"override_reason", {{"type", "string"}}},
+                {"search", {{"type", "string"}}},
+                {"trial", {{"type", "integer"}}},
                 {"note", {{"type", "string"}}}},
                {"name", "head_edits"}),
         [this](const json& a) {

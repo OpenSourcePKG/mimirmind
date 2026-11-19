@@ -227,6 +227,7 @@ exactly as in serving.
 | `expert_usage` | MoE routing actually taken (stage tap at the router selection) |
 | `causal_trace` | Activation patching clean → corrupt per (block, position) |
 | `causality_check` | Is a located edit (steer vector at α, or head edits) more than a random edit of the same size? Dose sweep + verdict causal / weak / epiphenomenal / undetermined + measured dose (§4) |
+| `edit_search` | Multi-objective edit search (own TPE, no Optuna): head count k / scale / block window, or steer α; target goldset up, control KL down, no free-generation regression; returns the Pareto front. Stage a front point with `rune_stage_heads` / `rune_stage_steer` + `search` + `trial` (parameters and seed in the provenance) |
 | `eval` | Goldset eval, optionally against Runes (deltas) |
 | `generate` | Greedy continuation with optional steer / head edits (slow, stateless) |
 

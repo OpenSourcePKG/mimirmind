@@ -131,7 +131,7 @@ TEST(mcp_initialize_and_toolsList) {
     }
     std::sort(names.begin(), names.end());
     EXPECT_TRUE(names == (std::vector<std::string>{"ablate_preview", "activations", "attention_pattern", "causal_trace", "causality_check",
-                                                   "condition_vector", "eval", "eval_preview", "expert_usage", "generate", "list_tensors", "logit_lens",
+                                                   "condition_vector", "edit_search", "eval", "eval_preview", "expert_usage", "generate", "list_tensors", "logit_lens",
                                                    "model_info", "next_token", "open_model", "perplexity", "rune_check",
                                                    "rune_commit", "rune_compare", "rune_gate", "rune_inspect", "rune_list",
                                                    "rune_rollback", "rune_stage_ablate", "rune_stage_experts", "rune_stage_heads",
@@ -609,6 +609,13 @@ TEST(tpe_minimises_quadratic_better_than_random) {
         EXPECT_TRUE(bt < 1.0);
     }
     EXPECT_TRUE(tpeBest < 0.5 * rndBest);   // summed over the five seeds
+    // A fixed parameter (min == max) stays fixed past the startup phase.
+    T fixed({{"a", K::Float, 0.5, 0.5}, {"x", K::Float, 0, 1}}, 1, {2, 0.25, 24, 7});
+    for (int i = 0; i < 8; ++i) {
+        const auto p = fixed.suggest();
+        EXPECT_TRUE(p[0] == 0.5 && std::isfinite(p[1]));
+        fixed.tell(p, {p[1]}, true);
+    }
     // Determinism: same seed, same suggestions.
     T a(space, 1, {2, 0.25, 24, 42}), b(space, 1, {2, 0.25, 24, 42});
     for (int i = 0; i < 6; ++i) {
