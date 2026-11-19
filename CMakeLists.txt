@@ -1884,6 +1884,15 @@ add_library(mimirmind_hugin OBJECT
     src/hugin/SeparationMath.cpp
     src/hugin/TreeParzenEstimator.cpp
     src/hugin/SurgeryTools.cpp
+    # 7.4 backward core (CPU reference ops)
+    src/hugin/train/AdamW.cpp
+    src/hugin/train/AttentionGrad.cpp
+    src/hugin/train/CrossEntropyGrad.cpp
+    src/hugin/train/LinearGrad.cpp
+    src/hugin/train/MoeCombineGrad.cpp
+    src/hugin/train/RmsNormGrad.cpp
+    src/hugin/train/RopeGrad.cpp
+    src/hugin/train/SwiGluGrad.cpp
 )
 target_link_libraries(mimirmind_hugin PUBLIC mimirmind_engine)
 
@@ -1893,6 +1902,11 @@ target_link_libraries(hugin PRIVATE mimirmind_hugin ${MIMIRMIND_ENGINE_LINK_LIBS
 add_executable(hugin_tests tests/hugin_tests.cpp)
 target_include_directories(hugin_tests PRIVATE tests)
 target_link_libraries(hugin_tests PRIVATE mimirmind_hugin ${MIMIRMIND_ENGINE_LINK_LIBS})
+
+# 7.4.1: train ops — forward parity with compute:: + finite-difference gradient checks.
+add_executable(hugin_train_tests tests/hugin_train_tests.cpp)
+target_include_directories(hugin_train_tests PRIVATE tests)
+target_link_libraries(hugin_train_tests PRIVATE mimirmind_hugin ${MIMIRMIND_ENGINE_LINK_LIBS})
 
 # ---- nvfp4_tests — NVFP4 runtime integration (format resolve + loader) ------
 #
