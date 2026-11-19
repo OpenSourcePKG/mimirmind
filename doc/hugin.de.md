@@ -269,6 +269,14 @@ Forward genau wie im Serving erreichen.
 | `rune_check` | Runes trocken gegen das geladene Modell prüfen, mit Futharks eigenen Checks |
 | `rune_compare` | Gleiche Eingabe auf Basis und Modell mit Rune: KL, Top-1-Übereinstimmung, Perplexity |
 
+### Trainingskern (7.4, in Arbeit)
+
+| Tool | Zweck |
+|---|---|
+| `train_block_check` | Baut einen dichten Block (llama / qwen2) aus Hugins eigenen Train-Ops mit den entpackten Gewichten der Engine; vergleicht seinen Forward mit dem Residual der Engine nach diesem Block und prüft den Backward (Block-Input + LoRA auf q/k/v/o/gate/up/down) mit Richtungs-Differenzen über eine Leiter von Schrittweiten |
+
+Die Train-Ops (`src/hugin/train/`) sind eine CPU-Referenz mit Forward und Backward für Linear + LoRA, RMSNorm, RoPE, GQA-Attention, SwiGLU, das Sigmoid-MoE-Combine, Cross-Entropy und AdamW; der Block-Backward rechnet den Forward aus dem Block-Input neu (nur der Input wird gehalten). Die Basisgewichte bekommen nie einen Gradienten.
+
 ---
 
 ## 7. Bedingtes und projizierendes Steering (7.11)

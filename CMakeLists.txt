@@ -1884,10 +1884,12 @@ add_library(mimirmind_hugin OBJECT
     src/hugin/SeparationMath.cpp
     src/hugin/TreeParzenEstimator.cpp
     src/hugin/SurgeryTools.cpp
+    src/hugin/TrainTools.cpp
     # 7.4 backward core (CPU reference ops)
     src/hugin/train/AdamW.cpp
     src/hugin/train/AttentionGrad.cpp
     src/hugin/train/CrossEntropyGrad.cpp
+    src/hugin/train/DenseBlock.cpp
     src/hugin/train/LinearGrad.cpp
     src/hugin/train/MoeCombineGrad.cpp
     src/hugin/train/RmsNormGrad.cpp

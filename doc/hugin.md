@@ -260,6 +260,14 @@ exactly as in serving.
 | `rune_check` | Dry-run Runes against the loaded model with Futhark's own checks |
 | `rune_compare` | Same input on base and on Rune-applied model: KL, top-1 agreement, perplexity |
 
+### Training core (7.4, in progress)
+
+| Tool | Purpose |
+|---|---|
+| `train_block_check` | Builds one dense block (llama / qwen2) from Hugin's own train ops with the engine's dequantised weights; compares its forward with the engine's residual after that block and checks the backward (block input + LoRA on q/k/v/o/gate/up/down) with directional finite differences over a ladder of steps |
+
+The train ops (`src/hugin/train/`) are a CPU reference with forward and backward for linear + LoRA, RMSNorm, RoPE, GQA attention, SwiGLU, the sigmoid MoE combine, cross-entropy and AdamW; the block backward recomputes the forward from the block input (only the input is kept). The base weights never get a gradient.
+
 ---
 
 ## 7. Conditional and projection steering (7.11)

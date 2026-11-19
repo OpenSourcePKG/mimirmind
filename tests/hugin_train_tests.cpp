@@ -12,6 +12,7 @@
 #include "hugin/train/AdamW.hpp"
 #include "hugin/train/AttentionGrad.hpp"
 #include "hugin/train/CrossEntropyGrad.hpp"
+#include "hugin/train/DenseBlock.hpp"
 #include "hugin/train/LinearGrad.hpp"
 #include "hugin/train/MoeCombineGrad.hpp"
 #include "hugin/train/RmsNormGrad.hpp"
@@ -256,6 +257,78 @@ TEST(lora_sft_toy_loss_decreases) {
     }
     std::printf("    loss %.4f -> %.4f\n", first, last);
     EXPECT_TRUE(last < 0.5 * first);
+}
+
+TEST(rope_freq_factors_parity_and_gradient) {
+    const std::size_t T = 3, H = 2, D = 8, start = 7;
+    const float base = 500000.0F;
+    const std::vector<float> ff{1.0F, 2.0F, 8.0F, 3.5F};
+    auto x = randn(T * H * D, 25);
+    auto ref = x, mine = x;
+    mimirmind::compute::applyRopeInPlaceInterleaved(ref.data(), ff.data(), T, H, D, start, base);
+    RopeGrad::forward(mine.data(), T, H, D, start, base, RopeGrad::Layout::Interleaved, ff.data());
+    for (std::size_t i = 0; i < x.size(); ++i) EXPECT_NEAR(mine[i], ref[i], 1e-6F);
+    const auto rr = randn(x.size(), 26);
+    auto fwd = [&] {
+        auto y = x;
+        RopeGrad::forward(y.data(), T, H, D, start, base, RopeGrad::Layout::Interleaved, ff.data());
+        return dotLoss(y, rr);
+    };
+    auto dx = rr;
+    RopeGrad::backward(dx.data(), T, H, D, start, base, RopeGrad::Layout::Interleaved, ff.data());
+    checkGrad("dx", x, dx, fwd);
+}
+
+TEST(dense_block_gradients_all_lora_targets) {
+    // Tiny llama-style block (GQA 4/2, biases on q/k/v, interleaved RoPE with
+    // factors), LoRA on all seven projections: every input and adapter
+    // element against finite differences, through the recompute backward.
+    DenseBlock::Config cfg;
+    cfg.dModel = 8; cfg.heads = 4; cfg.kvHeads = 2; cfg.headDim = 4; cfg.ff = 12;
+    cfg.eps = 1e-5F; cfg.ropeBase = 10000.0F;
+    cfg.ropeLayout  = RopeGrad::Layout::Interleaved;
+    cfg.ropeFactors = {1.0F, 4.0F};
+    const std::size_t d = 8, qd = 16, kd = 8, ff = 12, T = 4;
+    std::uint32_t seed = 100;
+    DenseBlock::Weights w;
+    w.attnNorm = randn(d, seed++); w.ffnNorm = randn(d, seed++);
+    w.wq = randn(qd * d, seed++, 0.4F); w.bq = randn(qd, seed++, 0.1F);
+    w.wk = randn(kd * d, seed++, 0.4F); w.bk = randn(kd, seed++, 0.1F);
+    w.wv = randn(kd * d, seed++, 0.4F); w.bv = randn(kd, seed++, 0.1F);
+    w.wo = randn(d * qd, seed++, 0.3F);
+    w.wGate = randn(ff * d, seed++, 0.4F); w.wUp = randn(ff * d, seed++, 0.4F);
+    w.wDown = randn(d * ff, seed++, 0.3F);
+    DenseBlock blk(cfg, w);
+    const std::size_t R = 2;
+    using P = DenseBlock::Proj;
+    for (const P p : {P::Q, P::K, P::V, P::O, P::Gate, P::Up, P::Down}) {
+        const auto [in, out] = blk.projShape(p);
+        auto a = randn(R * in, seed++, 0.3F);
+        auto b = randn(out * R, seed++, 0.3F);
+        blk.setLora(p, R, 0.5F, std::move(a), std::move(b));
+    }
+    auto x = randn(T * d, seed++);
+    const auto rr = randn(T * d, seed++);
+    auto fwd = [&] {
+        std::vector<float> y(T * d);
+        blk.forward(x.data(), T, y.data(), 3);
+        return dotLoss(y, rr);
+    };
+    std::vector<float> dx(T * d);
+    blk.backward(x.data(), T, rr.data(), dx.data(), 3);
+    checkGrad("block dx", x, dx, fwd, 3e-3);
+    for (const P p : {P::Q, P::K, P::V, P::O, P::Gate, P::Up, P::Down}) {
+        auto* l = blk.lora(p);
+        const auto dA = l->dA, dB = l->dB;
+        checkGrad("lora dA", l->a, dA, fwd, 3e-3);
+        checkGrad("lora dB", l->b, dB, fwd, 3e-3);
+    }
+    // Gradients accumulate across backward calls; zeroGrad resets them.
+    const float before = blk.lora(P::Q)->dA[0];
+    blk.backward(x.data(), T, rr.data(), dx.data(), 3);
+    EXPECT_NEAR(blk.lora(P::Q)->dA[0], 2.0F * before, 1e-5F + 1e-4F * std::fabs(before));
+    blk.zeroGrad();
+    EXPECT_TRUE(blk.lora(P::Q)->dA[0] == 0.0F);
 }
 
 int main() { return mm::test::run(); }

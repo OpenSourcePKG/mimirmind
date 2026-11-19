@@ -9,7 +9,8 @@
 namespace mimirmind::hugin::train {
 
 void RopeGrad::rotate(float* x, std::size_t T, std::size_t nHeads, std::size_t headDim,
-                      std::size_t startPos, float base, Layout layout, float sign) {
+                      std::size_t startPos, float base, Layout layout, const float* freqFactors,
+                      float sign) {
     if (headDim % 2 != 0) throw std::runtime_error("RopeGrad: headDim must be even");
     const std::size_t half   = headDim / 2;
     const float       invDim = 1.0F / static_cast<float>(headDim);
@@ -19,7 +20,11 @@ void RopeGrad::rotate(float* x, std::size_t T, std::size_t nHeads, std::size_t h
             float* head = x + (p * nHeads + h) * headDim;
             for (std::size_t i = 0; i < half; ++i) {
                 // Same float expression as compute/Rope.cpp, so forward is bit-equal.
-                const float freq  = std::pow(base, -static_cast<float>(2 * i) * invDim);
+                float freq = std::pow(base, -static_cast<float>(2 * i) * invDim);
+                if (freqFactors != nullptr) {
+                    if (freqFactors[i] == 0.0F) throw std::runtime_error("RopeGrad: zero freq factor");
+                    freq /= freqFactors[i];
+                }
                 const float theta = pos * freq;
                 const float c     = std::cos(theta);
                 const float s     = sign * std::sin(theta);
@@ -35,13 +40,13 @@ void RopeGrad::rotate(float* x, std::size_t T, std::size_t nHeads, std::size_t h
 }
 
 void RopeGrad::forward(float* x, std::size_t T, std::size_t nHeads, std::size_t headDim,
-                       std::size_t startPos, float base, Layout layout) {
-    rotate(x, T, nHeads, headDim, startPos, base, layout, 1.0F);
+                       std::size_t startPos, float base, Layout layout, const float* freqFactors) {
+    rotate(x, T, nHeads, headDim, startPos, base, layout, freqFactors, 1.0F);
 }
 
 void RopeGrad::backward(float* d, std::size_t T, std::size_t nHeads, std::size_t headDim,
-                        std::size_t startPos, float base, Layout layout) {
-    rotate(d, T, nHeads, headDim, startPos, base, layout, -1.0F);
+                        std::size_t startPos, float base, Layout layout, const float* freqFactors) {
+    rotate(d, T, nHeads, headDim, startPos, base, layout, freqFactors, -1.0F);
 }
 
 } // namespace mimirmind::hugin::train
