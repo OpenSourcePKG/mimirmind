@@ -48,11 +48,11 @@ std::optional<RuneOpKind> opKindFromName(std::string_view s) noexcept {
 
 bool opKindApplicable(RuneOpKind k) noexcept {
     return k == RuneOpKind::WriteSlice || k == RuneOpKind::Scale || opKindIsSteer(k) ||
-           k == RuneOpKind::Mask;
+           k == RuneOpKind::Mask || k == RuneOpKind::LowRank;
 }
 
 bool opKindIsOverlay(RuneOpKind k) noexcept {
-    return opKindIsSteer(k) || k == RuneOpKind::Mask;
+    return opKindIsSteer(k) || k == RuneOpKind::Mask || k == RuneOpKind::LowRank;
 }
 
 bool opKindIsSteer(RuneOpKind k) noexcept {

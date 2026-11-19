@@ -23,7 +23,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.6.0";
+constexpr const char* kVersion = "0.7.0";
 
 void usage() {
     std::cerr << "usage: hugin [--model <file.gguf | nvfp4-checkpoint-dir>] [--tokenizer-gguf <file.gguf>]\n"
@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
         forwardTools.setSingleEngine(singleEngine);
         mimirmind::hugin::SurgeryTools surgery{forwardTools};
         mimirmind::hugin::RuneStaging  staging{forwardTools, surgery, runeDir, kVersion};
-        mimirmind::hugin::TrainTools   training{forwardTools};
+        mimirmind::hugin::TrainTools   training{forwardTools, staging};
         inspect.registerOn(server);
         forwardTools.registerOn(server);
         surgery.registerOn(server);

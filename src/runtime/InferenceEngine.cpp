@@ -677,6 +677,7 @@ void InferenceEngine::finalizeLoad() {
     attachQwen4ExpPleTable();
     installRuneSteers();
     installRuneExpertMasks();
+    installRuneLowRanks();
     installConditionalSteers({});
 
     _modelLoaded = true;
@@ -880,6 +881,54 @@ void InferenceEngine::installRuneExpertMasks() {
     _runeMaskHost.clear();
 }
 
+void InferenceEngine::installRuneLowRanks() {
+    _runeLowRankDev.clear();
+    if (_runeLowRankHost.empty()) {
+        return;
+    }
+    if (!_backend || !_backend->supportsLowRank()) {
+        throw std::runtime_error("Futhark: lowrank runes are not implemented for architecture '" +
+                                 _config.architecture + "' yet");
+    }
+    std::vector<arch::ArchBackend::LowRankOverlay> overlays;
+    const auto upload = [this](const std::vector<float>& v) {
+        _runeLowRankDev.push_back(_ops->allocate(v.size() * sizeof(float)));
+        _ops->uploadHostBytes(_runeLowRankDev.back().as<float>(), v.data(), v.size() * sizeof(float));
+        return static_cast<const float*>(_runeLowRankDev.back().as<float>());
+    };
+    for (const auto& lr : _runeLowRankHost) {
+        // Target spelling: blk.<i>.<tensor>.
+        const std::string& t = lr.target;
+        const auto dot = t.find('.', 4);
+        std::size_t block = 0;
+        bool ok = t.rfind("blk.", 0) == 0 && dot != std::string::npos && dot > 4;
+        if (ok) {
+            try {
+                block = static_cast<std::size_t>(std::stoul(t.substr(4, dot - 4)));
+            } catch (const std::exception&) {
+                ok = false;
+            }
+        }
+        if (!ok || block >= _config.blockCount) {
+            throw std::runtime_error("Futhark: lowrank target '" + t +
+                                     "' is not a projection 'blk.<i>.<tensor>' of this model");
+        }
+        arch::ArchBackend::LowRankOverlay o;
+        o.block  = block;
+        o.tensor = t.substr(dot + 1);
+        o.rank   = lr.rank;
+        o.in     = lr.in;
+        o.out    = lr.out;
+        o.a      = upload(lr.a);
+        o.b      = upload(lr.b);
+        overlays.push_back(std::move(o));
+        MM_LOG_INFO("futhark", "model '{}': lowrank rank {} on {} [{} x {}]", _modelIdHint,
+                    lr.rank, t, lr.out, lr.in);
+    }
+    _backend->setLowRanks(*_ops, *_gmm, std::move(overlays));
+    _runeLowRankHost.clear();
+}
+
 void InferenceEngine::applyRunes() {
     if (_runePaths.empty()) {
         return;
@@ -910,6 +959,7 @@ void InferenceEngine::applyRunes() {
     _runeSteerHost.clear();
     _runeMaskHost.clear();
     _runeCondSteers.clear();
+    _runeLowRankHost.clear();
     for (const auto& rep : res->reports) {
         MM_LOG_INFO("futhark", "model '{}': rune '{}' applied — {} op(s), {} tensor(s), "
                     "{} steer overlay(s), {} projection/conditional steer(s), {} expert "
@@ -918,6 +968,8 @@ void InferenceEngine::applyRunes() {
                     rep.expertMasks.size());
         _runeCondSteers.insert(_runeCondSteers.end(), rep.condSteers.begin(),
                                rep.condSteers.end());
+        _runeLowRankHost.insert(_runeLowRankHost.end(), rep.lowRanks.begin(),
+                                rep.lowRanks.end());
         for (const auto& m : rep.expertMasks) {
             auto& acc = _runeMaskHost[m.block];
             if (acc.empty()) {

@@ -94,7 +94,8 @@ eine Liste von Ops.
 | `steer` | x += v nach Block L, jede Zeile, jeder Pfad | Residual-Overlay |
 | `steer_project` | x −= α (x·u) u, u Einheitsvektor, 0 < α ≤ 1 | Residual-Overlay |
 | `steer_if` | add oder project, nur Zeilen mit cos(h_Lc, c) > θ | Residual-Overlay + Device-Gate |
-| `lowrank`, `write_quant_blocks` | im Format definiert | beim Laden abgelehnt (noch nicht angewendet) |
+| `lowrank` | LoRA-Adapter auf einer Projektion: y += α·B(A x), A [rank, in], B [out, rank] | Projektions-Overlay (F32-Matmuls neben dem eingefrorenen Gewicht); nur qwen2-/llama-Backend, andere Architekturen lehnen ihn beim Laden ab |
+| `write_quant_blocks` | im Format definiert | beim Laden abgelehnt (noch nicht angewendet) |
 
 Futhark, der Applier in `mimirmind`:
 
@@ -274,8 +275,11 @@ Forward genau wie im Serving erreichen.
 | Tool | Zweck |
 |---|---|
 | `train_block_check` | Baut einen dichten Block (llama / qwen2) aus Hugins eigenen Train-Ops mit den entpackten Gewichten der Engine; vergleicht seinen Forward mit dem Residual der Engine nach diesem Block und prüft den Backward (Block-Input + LoRA auf q/k/v/o/gate/up/down) mit Richtungs-Differenzen über eine Leiter von Schrittweiten |
+| `train_lora_sft` | LoRA-SFT des ganzen dichten Modells (llama / qwen2): Items `{prompt, response}` oder `{prompt, teacher_prompt}` (die Antwort ist die eigene Greedy-Antwort des Basismodells auf den Teacher-Prompt — Selbst-Destillation), CE nur auf Antwort-Tokens, AdamW mit Gradient-Akkumulation und Global-Norm-Clipping; legt die Adapter als `lowrank`-Rune ab und vergleicht die Logits des Trainers mit der Engine, die diese Rune ausführt |
 
-Die Train-Ops (`src/hugin/train/`) sind eine CPU-Referenz mit Forward und Backward für Linear + LoRA, RMSNorm, RoPE, GQA-Attention, SwiGLU, das Sigmoid-MoE-Combine, Cross-Entropy und AdamW; der Block-Backward rechnet den Forward aus dem Block-Input neu (nur der Input wird gehalten). Die Basisgewichte bekommen nie einen Gradienten.
+Die Train-Ops (`src/hugin/train/`) sind eine CPU-Referenz mit Forward und Backward für Linear + LoRA, RMSNorm, RoPE, GQA-Attention, SwiGLU, das Sigmoid-MoE-Combine, Cross-Entropy und AdamW; der Block-Backward rechnet den Forward aus dem Block-Input neu (nur der Input wird gehalten). Die Basisgewichte bekommen nie einen Gradienten. Der Modell-Forward hält nur den Input jedes Blocks, baut den lm_head nur für Zeilen mit Ziel und beendet den Backward am untersten Block mit Adapter. Lineare Schichten laufen auf der Hälfte der Hardware-Threads (`threads` überschreibt das), damit ein Server auf derselben Maschine Luft behält.
+
+Ein trainierter Adapter durchläuft denselben Lebenszyklus wie jeder andere Eingriff: staged → `rune_gate` → `rune_commit`, aktiv erst durch Eintrag in die `runes`-Config eines Modells.
 
 ---
 

@@ -7,13 +7,20 @@
 #include "compute/Dequant.hpp"
 #include "hugin/ForwardSupport.hpp"
 #include "hugin/ForwardTools.hpp"
+#include "hugin/RuneStaging.hpp"
+#include "hugin/train/AdamW.hpp"
 #include "hugin/train/DenseBlock.hpp"
+#include "hugin/train/DenseModel.hpp"
+#include "hugin/train/Parallel.hpp"
+#include "model/ChatTemplate.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <iostream>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -115,6 +122,23 @@ const char* projName(DenseBlock::Proj p) {
     return "?";
 }
 
+const char* projTensor(DenseBlock::Proj p) {
+    switch (p) {
+        case DenseBlock::Proj::Q:    return "attn_q.weight";
+        case DenseBlock::Proj::K:    return "attn_k.weight";
+        case DenseBlock::Proj::V:    return "attn_v.weight";
+        case DenseBlock::Proj::O:    return "attn_output.weight";
+        case DenseBlock::Proj::Gate: return "ffn_gate.weight";
+        case DenseBlock::Proj::Up:   return "ffn_up.weight";
+        case DenseBlock::Proj::Down: return "ffn_down.weight";
+    }
+    return "?";
+}
+
+constexpr DenseBlock::Proj kAllProjs[] = {DenseBlock::Proj::Q, DenseBlock::Proj::K, DenseBlock::Proj::V,
+                                          DenseBlock::Proj::O, DenseBlock::Proj::Gate, DenseBlock::Proj::Up,
+                                          DenseBlock::Proj::Down};
+
 DenseBlock::Proj projArg(const std::string& s) {
     for (const auto p : {DenseBlock::Proj::Q, DenseBlock::Proj::K, DenseBlock::Proj::V, DenseBlock::Proj::O,
                          DenseBlock::Proj::Gate, DenseBlock::Proj::Up, DenseBlock::Proj::Down}) {
@@ -123,7 +147,49 @@ DenseBlock::Proj projArg(const std::string& s) {
     throw std::runtime_error("unknown LoRA target '" + s + "' (q, k, v, o, gate, up, down)");
 }
 
+std::vector<float> globalTensor(Engine& e, const char* name, bool required) {
+    const auto* t = e.weights().find(name);
+    if (t == nullptr || t->usmPtr == nullptr) {
+        if (required) throw std::runtime_error(std::string(name) + " not found");
+        return {};
+    }
+    return tensorF32(e, *t);
+}
+
+/// One SFT example: ids = prompt + response, targets on the response only.
+struct SftExample {
+    std::vector<std::int32_t> ids;
+    std::vector<std::int32_t> targets;
+    std::size_t               promptTokens{0};
+    std::size_t               responseTokens{0};
+    bool                      truncated{false};
+    std::string               response;
+};
+
 } // namespace
+
+TrainTools::TrainTools(ForwardTools& forward, RuneStaging& staging)
+    : _forward(forward), _staging(staging) {}
+
+TrainTools::~TrainTools() = default;
+
+train::DenseModel& TrainTools::model() {
+    const auto t = _forward.target();
+    if (_model && _modelKey == t.path) return *_model;
+    _model.reset();
+    Engine& e = _forward.engine();
+    std::vector<DenseBlock> blocks;
+    for (std::size_t L = 0; L < e.config().blockCount; ++L) blocks.push_back(loadDenseBlock(e, L));
+    train::DenseModel::Head head;
+    head.embed     = globalTensor(e, "token_embd.weight", true);
+    head.finalNorm = globalTensor(e, "output_norm.weight", true);
+    head.lmHead    = globalTensor(e, "output.weight", false);   // empty = tied
+    head.eps       = e.config().rmsNormEps;
+    head.vocab     = head.embed.size() / e.config().embeddingLength;
+    _model    = std::make_unique<train::DenseModel>(std::move(blocks), std::move(head));
+    _modelKey = t.path;
+    return *_model;
+}
 
 void TrainTools::registerOn(McpServer& server) {
     server.addTool(
@@ -254,6 +320,246 @@ void TrainTools::registerOn(McpServer& server) {
                         {"rope_factors", !blk.config().ropeFactors.empty()},
                         {"forward_parity", parity}, {"gradient_checks", checks},
                         {"all_gradients_ok", allOk}, {"seconds", secs}};
+        });
+
+    server.addTool(
+        "train_lora_sft",
+        "7.4.3 LoRA-SFT of the whole dense model (llama / qwen2) on CPU train ops; the base stays "
+        "frozen, only adapters learn. Data: 'items' or 'path' (.json / .jsonl) of {prompt, response} "
+        "or {prompt, teacher_prompt}: with teacher_prompt the response is the BASE model's greedy "
+        "answer to teacher_prompt (self-distillation, e.g. the same question asked in German), ended "
+        "by the template's stop token unless cut at 'max_teacher_tokens' (default 96). Loss = CE on "
+        "the response tokens only. Adapters: 'targets' (default q k v o gate up down) on 'blocks' "
+        "(default all), 'rank' (8), 'alpha' (16; scale alpha/rank), B = 0 at start. AdamW 'lr' "
+        "(5e-4), 'epochs' (2), 'batch' (4, gradient accumulation), global grad-norm clip 'clip' "
+        "(1.0), 'seed'. The result is staged as a LowRank Rune 'name' (then rune_gate / rune_commit "
+        "as usual), and the trainer's logits are compared with the engine running that Rune "
+        "(Futhark load path) on the first example.",
+        schema({{"name", {{"type", "string"}}},
+                {"items", {{"type", "array"}, {"items", {{"type", "object"}}}}},
+                {"path", {{"type", "string"}}},
+                {"add_bos", {{"type", "boolean"}}},
+                {"targets", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"blocks", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
+                {"rank", {{"type", "integer"}}},
+                {"alpha", {{"type", "number"}}},
+                {"lr", {{"type", "number"}}},
+                {"epochs", {{"type", "integer"}}},
+                {"batch", {{"type", "integer"}}},
+                {"clip", {{"type", "number"}}},
+                {"max_teacher_tokens", {{"type", "integer"}}},
+                {"seed", {{"type", "integer"}}},
+                {"threads", {{"type", "integer"}}},
+                {"note", {{"type", "string"}}}},
+               {"name"}),
+        [this](const json& a) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto elapsed = [&] {
+                return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            };
+            const std::string name = a.at("name").get<std::string>();
+            if (a.contains("threads")) train::Parallel::setThreads(a["threads"].get<std::size_t>());
+            const bool addBos = a.value("add_bos", false);
+            const json items  = loadGoldset(a);
+            if (items.empty()) throw std::runtime_error("no training items");
+            Engine& e = _forward.engine();
+
+            // 1. Examples (teacher responses from the base engine, before any adapter).
+            std::vector<std::int32_t> stops = model::ChatTemplate::stopIds(
+                model::ChatTemplate::detectFromArch(e.config().architecture), e.tokenizer());
+            stops.push_back(e.tokenizer().eosId());
+            const auto maxTeacher = a.value("max_teacher_tokens", std::size_t{96});
+            std::vector<SftExample> data;
+            std::size_t truncatedN = 0;
+            for (const auto& it : items) {
+                SftExample ex;
+                const auto prompt = encodeText(e, it.at("prompt").get<std::string>(), addBos);
+                std::vector<std::int32_t> resp;
+                if (it.contains("response")) {
+                    resp = encodeText(e, it["response"].get<std::string>(), false);
+                } else if (it.contains("teacher_prompt")) {
+                    const auto tp = encodeText(e, it["teacher_prompt"].get<std::string>(), addBos);
+                    resp = generateGreedy(e, tp, maxTeacher);
+                    ex.truncated = resp.size() >= maxTeacher;
+                    if (!ex.truncated) resp.push_back(stops.front());
+                } else {
+                    throw std::runtime_error("every item needs 'response' or 'teacher_prompt'");
+                }
+                if (resp.empty()) throw std::runtime_error("empty response for an item");
+                truncatedN += ex.truncated ? 1U : 0U;
+                ex.response = e.tokenizer().decode(resp, false);
+                ex.ids = prompt;
+                ex.ids.insert(ex.ids.end(), resp.begin(), resp.end());
+                ex.targets.assign(ex.ids.size(), -1);
+                for (std::size_t i = prompt.size() - 1; i + 1 < ex.ids.size(); ++i) ex.targets[i] = ex.ids[i + 1];
+                ex.promptTokens   = prompt.size();
+                ex.responseTokens = resp.size();
+                data.push_back(std::move(ex));
+            }
+            std::cerr << "hugin train_lora_sft: " << data.size() << " examples ready after " << elapsed() << " s\n";
+
+            // 2. Model + fresh adapters.
+            train::DenseModel& m = model();
+            for (std::size_t b = 0; b < m.blockCount(); ++b) m.block(b).clearLora();
+            std::vector<DenseBlock::Proj> projs;
+            if (a.contains("targets")) {
+                for (const auto& s : a["targets"]) projs.push_back(projArg(s.get<std::string>()));
+            } else {
+                projs.assign(std::begin(kAllProjs), std::end(kAllProjs));
+            }
+            std::vector<std::size_t> blocks;
+            if (a.contains("blocks")) {
+                for (const auto& b : a["blocks"]) {
+                    const auto v = b.get<std::size_t>();
+                    if (v >= m.blockCount()) throw std::runtime_error("block out of range");
+                    blocks.push_back(v);
+                }
+            } else {
+                blocks.resize(m.blockCount());
+                std::iota(blocks.begin(), blocks.end(), std::size_t{0});
+            }
+            const auto  rank  = a.value("rank", std::size_t{8});
+            const float alpha = a.value("alpha", 16.0F);
+            const float scale = alpha / static_cast<float>(rank);
+            std::mt19937 rng(a.value("seed", 7403U));
+            struct Slot {
+                std::size_t        block;
+                DenseBlock::Proj   proj;
+                train::AdamW       optA, optB;
+            };
+            const train::AdamW::Config oc{a.value("lr", 5e-4F), 0.9F, 0.999F, 1e-8F, 0.0F};
+            std::vector<Slot> slots;
+            for (const auto b : blocks) {
+                for (const auto p : projs) {
+                    const auto [in, out] = m.block(b).projShape(p);
+                    // Kaiming-uniform A (as PEFT), B = 0: the model starts exactly at the base.
+                    std::uniform_real_distribution<float> u(-1.0F / std::sqrt(static_cast<float>(in)),
+                                                            1.0F / std::sqrt(static_cast<float>(in)));
+                    std::vector<float> A(rank * in);
+                    for (auto& v : A) v = u(rng);
+                    m.block(b).setLora(p, rank, scale, std::move(A), std::vector<float>(out * rank, 0.0F));
+                    slots.push_back(Slot{b, p, train::AdamW(rank * in, oc), train::AdamW(out * rank, oc)});
+                }
+            }
+
+            // 3. Train.
+            const auto epochs = a.value("epochs", std::size_t{2});
+            const auto batch  = std::max<std::size_t>(1, a.value("batch", std::size_t{4}));
+            const float clip  = a.value("clip", 1.0F);
+            std::vector<std::size_t> order(data.size());
+            std::iota(order.begin(), order.end(), std::size_t{0});
+            json epochLoss = json::array(), stepLoss = json::array();
+            std::size_t steps = 0;
+            m.zeroGrad();
+            for (std::size_t ep = 0; ep < epochs; ++ep) {
+                std::shuffle(order.begin(), order.end(), rng);
+                double sum = 0;
+                double batchSum = 0;
+                std::size_t inBatch = 0;
+                for (std::size_t i = 0; i < order.size(); ++i) {
+                    const SftExample& ex = data[order[i]];
+                    const double l = m.lossAndGrad(ex.ids, ex.targets);
+                    sum += l;
+                    batchSum += l;
+                    ++inBatch;
+                    if (inBatch == batch || i + 1 == order.size()) {
+                        // Mean over the batch, global-norm clip, one AdamW step per buffer.
+                        const float inv = 1.0F / static_cast<float>(inBatch);
+                        double sq = 0;
+                        for (auto& s : slots) {
+                            auto* l2 = m.block(s.block).lora(s.proj);
+                            for (auto& g : l2->dA) { g *= inv; sq += static_cast<double>(g) * static_cast<double>(g); }
+                            for (auto& g : l2->dB) { g *= inv; sq += static_cast<double>(g) * static_cast<double>(g); }
+                        }
+                        const double gn = std::sqrt(sq);
+                        const float  cf = (clip > 0.0F && gn > static_cast<double>(clip))
+                                              ? static_cast<float>(static_cast<double>(clip) / gn) : 1.0F;
+                        for (auto& s : slots) {
+                            auto* l2 = m.block(s.block).lora(s.proj);
+                            if (cf != 1.0F) {
+                                for (auto& g : l2->dA) g *= cf;
+                                for (auto& g : l2->dB) g *= cf;
+                            }
+                            s.optA.step(l2->a, l2->dA);
+                            s.optB.step(l2->b, l2->dB);
+                        }
+                        m.zeroGrad();
+                        ++steps;
+                        stepLoss.push_back({{"step", steps}, {"loss", batchSum / static_cast<double>(inBatch)},
+                                            {"grad_norm", gn}});
+                        std::cerr << "hugin train_lora_sft: epoch " << ep + 1 << " step " << steps << " loss "
+                                  << batchSum / static_cast<double>(inBatch) << " |g| " << gn << " ("
+                                  << elapsed() << " s)\n";
+                        batchSum = 0;
+                        inBatch  = 0;
+                    }
+                }
+                epochLoss.push_back(sum / static_cast<double>(order.size()));
+            }
+
+            // 4. Stage as a LowRank rune.
+            std::vector<RuneStaging::LowRankSpec> specs;
+            for (const auto& s : slots) {
+                const auto* l2 = m.block(s.block).lora(s.proj);
+                specs.push_back({"blk." + std::to_string(s.block) + "." + projTensor(s.proj),
+                                 static_cast<std::uint32_t>(rank), static_cast<double>(scale), l2->a, l2->b});
+            }
+            std::size_t respTok = 0;
+            for (const auto& ex : data) respTok += ex.responseTokens;
+            json tnames = json::array();
+            for (const auto p : projs) tnames.push_back(projName(p));
+            json params{{"method", "lora_sft"}, {"examples", data.size()}, {"response_tokens", respTok},
+                        {"teacher_truncated", truncatedN}, {"targets", tnames}, {"blocks", blocks},
+                        {"rank", rank}, {"alpha", alpha}, {"lr", oc.lr}, {"epochs", epochs},
+                        {"batch", batch}, {"clip", clip}, {"seed", a.value("seed", 7403U)},
+                        {"epoch_loss", epochLoss}, {"steps", steps},
+                        {"note", a.value("note", std::string{})}};
+            if (a.contains("path")) params["data_path"] = a["path"];
+            json staged = _staging.stageLowRank(name, specs, params);
+
+            // 5. Parity: trainer (with adapters) vs engine + rune on example 0, last prompt row.
+            const SftExample& ex0 = data.front();
+            const std::vector<std::int32_t> promptIds(ex0.ids.begin(),
+                                                      ex0.ids.begin() + static_cast<std::ptrdiff_t>(ex0.promptTokens));
+            const std::size_t row = ex0.promptTokens - 1;
+            const std::vector<std::size_t> rows{row};
+            const auto mine = m.logits(promptIds, rows);
+            const auto base = forward(e, promptIds).at(row);
+            Engine& v = _forward.engineWithRunes({staged.at("path").get<std::string>()});
+            const auto ref = forward(v, promptIds).at(row);
+            double maxAbs = 0, refMax = 0, shift = 0;
+            for (std::size_t i = 0; i < ref.size(); ++i) {
+                maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(mine[i]) - static_cast<double>(ref[i])));
+                refMax = std::max(refMax, std::fabs(static_cast<double>(ref[i])));
+                shift  = std::max(shift, std::fabs(static_cast<double>(ref[i]) - static_cast<double>(base[i])));
+            }
+            const auto argmax = [](const std::vector<float>& x) {
+                return static_cast<std::size_t>(std::max_element(x.begin(), x.end()) - x.begin());
+            };
+            // shift = how far the rune moves the engine's logits off the base;
+            // the parity diff must be far below it to mean anything.
+            const json parity{{"max_abs_logit_diff", maxAbs}, {"ref_abs_max", refMax},
+                              {"rune_shift_vs_base", shift},
+                              {"argmax_equal", argmax(mine) == argmax(ref)}};
+
+            json samples = json::array();
+            for (std::size_t i = 0; i < std::min<std::size_t>(3, data.size()); ++i) {
+                samples.push_back({{"prompt_tokens", data[i].promptTokens}, {"response", data[i].response}});
+            }
+            return json{{"staged", staged}, {"epoch_loss", epochLoss},
+                        {"first_step_loss", stepLoss.empty() ? json() : stepLoss.front()["loss"]},
+                        {"last_step_loss", stepLoss.empty() ? json() : stepLoss.back()["loss"]},
+                        {"steps", steps}, {"adapters", slots.size()},
+                        {"trainable_params", [&] {
+                             std::size_t n = 0;
+                             for (const auto& s : slots) {
+                                 const auto* l2 = m.block(s.block).lora(s.proj);
+                                 n += l2->a.size() + l2->b.size();
+                             }
+                             return n;
+                         }()},
+                        {"engine_parity", parity}, {"teacher_samples", samples},
+                        {"threads", train::Parallel::threads()}, {"seconds", elapsed()}};
         });
 }
 

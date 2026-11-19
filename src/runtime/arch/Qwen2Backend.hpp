@@ -49,6 +49,8 @@ public:
                   bool          traceBlock0) override;
 
     [[nodiscard]] const char* name()            const noexcept override { return "qwen2"; }
+    /// 7.4.3: runBlock applies Rune LowRank overlays at every projection.
+    [[nodiscard]] bool supportsLowRank() const noexcept override { return true; }
 
     [[nodiscard]] std::vector<std::size_t>
         kvDimPerLayer() const override;

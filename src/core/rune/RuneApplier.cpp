@@ -327,6 +327,32 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
             }
             continue;   // activation overlay — no target tensor
         }
+        if (op.kind == RuneOpKind::LowRank) {
+            const std::optional<RuneTensorView> v = resolve(op.target);
+            if (!v) {
+                return std::unexpected(ctx + ": target tensor not found in the loaded model");
+            }
+            if (v->dims.empty() || v->dims[0] == 0) {
+                return std::unexpected(ctx + ": target has empty dims");
+            }
+            std::uint64_t n = 1;
+            for (const auto d : v->dims) n *= d;
+            const std::uint64_t in = v->dims[0], out = n / in;
+            const std::span<const float> pa = rune.payload(op.payload);
+            const std::span<const float> pb = rune.payload(op.payloadB);
+            if (pa.size() != op.rank * in || pb.size() != out * op.rank) {
+                return std::unexpected(ctx + ": A has " + std::to_string(pa.size()) + " and B " +
+                                       std::to_string(pb.size()) + " values; the target [" +
+                                       std::to_string(out) + " x " + std::to_string(in) +
+                                       "] at rank " + std::to_string(op.rank) + " needs " +
+                                       std::to_string(op.rank * in) + " and " +
+                                       std::to_string(out * op.rank));
+            }
+            if (!allFinite(pa) || !allFinite(pb) || !std::isfinite(op.alpha)) {
+                return std::unexpected(ctx + ": payload or alpha contains NaN/Inf");
+            }
+            continue;   // projection overlay — no weight changes
+        }
         if (op.kind == RuneOpKind::Mask) {
             if (std::string err = checkExpertMask(op, rune.payload(op.payload), resolve);
                 !err.empty()) {
@@ -395,6 +421,23 @@ RuneApplier::apply(const RuneFile& rune, std::string_view baseFingerprint,
                 m.keep[e] = p[e] != 0.0F ? 1 : 0;
             }
             report.expertMasks.push_back(std::move(m));
+            ++report.opsApplied;
+            continue;
+        }
+        if (op.kind == RuneOpKind::LowRank) {
+            const std::span<const float> pa = rune.payload(op.payload);
+            const std::span<const float> pb = rune.payload(op.payloadB);
+            RuneLowRank lr;
+            lr.target = op.target;
+            lr.rank   = op.rank;
+            lr.in     = pa.size() / op.rank;
+            lr.out    = pb.size() / op.rank;
+            lr.a.assign(pa.begin(), pa.end());
+            lr.b.resize(pb.size());
+            for (std::size_t k = 0; k < pb.size(); ++k) {
+                lr.b[k] = static_cast<float>(static_cast<double>(pb[k]) * op.alpha);
+            }
+            report.lowRanks.push_back(std::move(lr));
             ++report.opsApplied;
             continue;
         }

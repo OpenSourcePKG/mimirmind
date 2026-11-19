@@ -73,6 +73,19 @@ public:
     static constexpr double kMaxExpertFraction    = 0.25;
     static constexpr double kMaxHeadScale         = 16.0;
 
+    /// 7.4.3: one trained LoRA adapter on projection `target`
+    /// ("blk.<i>.<tensor>"): A [rank, in], B [out, rank], scale alpha.
+    struct LowRankSpec {
+        std::string        target;
+        std::uint32_t      rank{0};
+        double             alpha{1.0};
+        std::vector<float> a, b;
+    };
+    /// Writes the adapters as LowRank overlay ops into staged/<name>.rune
+    /// (bound to the base fingerprint); `params` = training provenance.
+    nlohmann::json stageLowRank(const std::string& name, const std::vector<LowRankSpec>& specs,
+                                nlohmann::json params) const;
+
 private:
     enum class State { Staged, Committed, Rejected };
 

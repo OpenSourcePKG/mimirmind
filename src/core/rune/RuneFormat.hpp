@@ -48,7 +48,8 @@ enum class RuneOpKind : std::uint8_t {
     Scale,             ///< multiply each row (or column) by a payload factor
     Mask,              ///< expert disable on a router (`blk.<i>.ffn_gate_inp.weight`): overlay,
                        ///< payload [n_experts] of 0 (disabled) / 1 (kept); other targets refused
-    LowRank,           ///< overlay y = Wx + s*B(Ax) (not yet applicable)
+    LowRank,           ///< 7.4.3 overlay on a projection weight: y = W x + alpha * B (A x),
+                       ///< payload A [rank, in], payload_b B [out, rank]
     Steer,             ///< residual-stream activation offset after one block (overlay, no weight change)
     WriteQuantBlocks,  ///< overwrite pre-quantised NVFP4 blocks (not yet applicable)
     SteerProject,      ///< 7.11 overlay: remove alpha x the component of the residual along a
@@ -83,6 +84,8 @@ struct RuneOp {
     std::string   condition;     ///< SteerIf only: payload name of the condition direction w
     std::uint32_t conditionBlock{0};   ///< SteerIf only: block whose output residual is scored
     double        threshold{0.0};      ///< SteerIf only: gate = cos(x, w) > threshold
+    std::string   payloadB;      ///< LowRank only: payload name of B [out, rank]
+    std::uint32_t rank{0};       ///< LowRank only
 };
 
 /// Steer target spelling (Steer / SteerProject / SteerIf): `blk.<i>` = the

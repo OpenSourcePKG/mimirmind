@@ -5,9 +5,16 @@
 
 #include "hugin/McpServer.hpp"
 
+#include <memory>
+#include <string>
+
 namespace mimirmind::hugin {
 
 class ForwardTools;
+class RuneStaging;
+namespace train {
+class DenseModel;
+}
 
 /**
  * Hugin training-core tools (roadmap 7.4). 7.4.2:
@@ -15,15 +22,30 @@ class ForwardTools;
  *    ops with the engine's own (dequantised) weights, compares its forward
  *    with the engine's residual after that block, and checks the recompute
  *    backward (input + LoRA gradients) with directional finite differences.
+ * 7.4.3:
+ *  - train_lora_sft     LoRA-SFT of the whole dense model (llama / qwen2) on
+ *    prompt/response pairs (responses may be self-distilled from a teacher
+ *    prompt by the base model), staged as a LowRank Rune, with a parity check
+ *    of trainer logits vs the engine with that Rune applied by Futhark.
  */
 class TrainTools {
 public:
-    explicit TrainTools(ForwardTools& forward) : _forward(forward) {}
+    TrainTools(ForwardTools& forward, RuneStaging& staging);
+    ~TrainTools();
+
+    TrainTools(const TrainTools&)            = delete;
+    TrainTools& operator=(const TrainTools&) = delete;
 
     void registerOn(McpServer& server);
 
 private:
-    ForwardTools& _forward;
+    /// The whole model as train ops (dequantised once, cached per target).
+    train::DenseModel& model();
+
+    ForwardTools&                      _forward;
+    RuneStaging&                       _staging;
+    std::unique_ptr<train::DenseModel> _model;
+    std::string                        _modelKey;
 };
 
 } // namespace mimirmind::hugin

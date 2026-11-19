@@ -1158,6 +1158,7 @@ private:
     void applyRunes();
     void installRuneSteers();        // after the arch backend exists
     void installRuneExpertMasks();   // after the arch backend exists
+    void installRuneLowRanks();      // after the arch backend exists
     /// 7.11: rune projection / conditional steers (+ optional preview set).
     void installConditionalSteers(const std::vector<core::rune::RuneCondSteer>& extra);
     /// Throws when runes are configured for a Munin-attached (shared) load.
@@ -1355,6 +1356,10 @@ private:
     /// then device router biases owned here for the backend's lifetime.
     std::map<std::uint32_t, std::vector<std::uint8_t>> _runeMaskHost;
     std::vector<compute::ComputeBuffer>                 _runeMaskDev;
+    /// 7.4.3 Rune LowRank (LoRA) overlays: host factors from Futhark, then
+    /// device copies owned here for the backend's lifetime.
+    std::vector<core::rune::RuneLowRank>                _runeLowRankHost;
+    std::vector<compute::ComputeBuffer>                 _runeLowRankDev;
     compute::ComputeBuffer             _normFinalH;
     compute::ComputeBuffer             _logitsH;
     compute::ComputeBuffer             _logitsScH;

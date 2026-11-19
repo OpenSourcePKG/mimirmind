@@ -13,6 +13,8 @@
 #include "hugin/train/AttentionGrad.hpp"
 #include "hugin/train/CrossEntropyGrad.hpp"
 #include "hugin/train/DenseBlock.hpp"
+#include "hugin/train/DenseModel.hpp"
+#include "hugin/train/Parallel.hpp"
 #include "hugin/train/LinearGrad.hpp"
 #include "hugin/train/MoeCombineGrad.hpp"
 #include "hugin/train/RmsNormGrad.hpp"
@@ -329,6 +331,101 @@ TEST(dense_block_gradients_all_lora_targets) {
     EXPECT_NEAR(blk.lora(P::Q)->dA[0], 2.0F * before, 1e-5F + 1e-4F * std::fabs(before));
     blk.zeroGrad();
     EXPECT_TRUE(blk.lora(P::Q)->dA[0] == 0.0F);
+}
+
+namespace {
+
+DenseBlock tinyBlock(std::uint32_t& seed) {
+    DenseBlock::Config cfg;
+    cfg.dModel = 8; cfg.heads = 4; cfg.kvHeads = 2; cfg.headDim = 4; cfg.ff = 12;
+    cfg.ropeLayout = RopeGrad::Layout::Interleaved;
+    DenseBlock::Weights w;
+    w.attnNorm = randn(8, seed++); w.ffnNorm = randn(8, seed++);
+    w.wq = randn(16 * 8, seed++, 0.4F); w.wk = randn(8 * 8, seed++, 0.4F);
+    w.wv = randn(8 * 8, seed++, 0.4F); w.wo = randn(8 * 16, seed++, 0.3F);
+    w.wGate = randn(12 * 8, seed++, 0.4F); w.wUp = randn(12 * 8, seed++, 0.4F);
+    w.wDown = randn(8 * 12, seed++, 0.3F);
+    return DenseBlock(cfg, w);
+}
+
+} // namespace
+
+TEST(dense_model_sft_gradients_through_ce) {
+    // Tiny 3-block model, vocab 11, untied head; adapters only from block 1
+    // (the backward must stop there), prompt rows ignored by the targets.
+    std::uint32_t seed = 300;
+    std::vector<DenseBlock> blocks;
+    for (int i = 0; i < 3; ++i) blocks.push_back(tinyBlock(seed));
+    DenseModel::Head head;
+    head.vocab = 11;
+    head.embed = randn(11 * 8, seed++);
+    head.finalNorm = randn(8, seed++);
+    head.lmHead = randn(11 * 8, seed++, 0.5F);
+    DenseModel m(std::move(blocks), std::move(head));
+    using P = DenseBlock::Proj;
+    for (const std::size_t b : {std::size_t{1}, std::size_t{2}}) {
+        for (const P p : {P::Q, P::V, P::Down}) {
+            const auto [in, out] = m.block(b).projShape(p);
+            auto a = randn(2 * in, seed++, 0.3F);
+            auto bb = randn(out * 2, seed++, 0.3F);
+            m.block(b).setLora(p, 2, 0.5F, std::move(a), std::move(bb));
+        }
+    }
+    const std::vector<std::int32_t> ids{1, 4, 7, 2, 9, 3};
+    const std::vector<std::int32_t> tgt{-1, -1, 2, 9, 3, 10};
+    auto fwd = [&] {
+        // Loss only (gradients of this probe call are discarded below).
+        const double l = m.lossAndGrad(ids, tgt);
+        return l;
+    };
+    m.zeroGrad();
+    (void)m.lossAndGrad(ids, tgt);
+    // Snapshot every gradient first: the FD probes call lossAndGrad again and
+    // keep accumulating into the adapters.
+    std::vector<std::pair<std::vector<float>, std::vector<float>>> grads;
+    for (const std::size_t b : {std::size_t{1}, std::size_t{2}}) {
+        for (const P p : {P::Q, P::V, P::Down}) grads.emplace_back(m.block(b).lora(p)->dA, m.block(b).lora(p)->dB);
+    }
+    std::size_t gi = 0;
+    for (const std::size_t b : {std::size_t{1}, std::size_t{2}}) {
+        for (const P p : {P::Q, P::V, P::Down}) {
+            auto* l = m.block(b).lora(p);
+            checkGrad("model dA", l->a, grads[gi].first, fwd, 3e-3);
+            checkGrad("model dB", l->b, grads[gi].second, fwd, 3e-3);
+            ++gi;
+        }
+    }
+    // Logits of the target rows equal a full forward's rows.
+    const std::vector<std::size_t> rows{2, 5};
+    const auto part = m.logits(ids, rows);
+    const auto all  = m.logits(ids);
+    for (std::size_t v = 0; v < 11; ++v) {
+        EXPECT_NEAR(part[v], all[2 * 11 + v], 1e-6F);
+        EXPECT_NEAR(part[11 + v], all[5 * 11 + v], 1e-6F);
+    }
+}
+
+TEST(parallel_linear_matches_serial) {
+    // Threaded LinearGrad == single-thread result (same chunk math per element).
+    const std::size_t M = 5, K = 300, N = 257, R = 3;
+    auto x = randn(M * K, 81), w = randn(N * K, 82), a = randn(R * K, 83), b = randn(N * R, 84);
+    const auto dy = randn(M * N, 85);
+    LoraParams lp{a.data(), b.data(), R, 0.7F};
+    auto run = [&](std::size_t threads, std::vector<float>& y, std::vector<float>& dx,
+                   std::vector<float>& dA, std::vector<float>& dB) {
+        Parallel::setThreads(threads);
+        y.assign(M * N, 0.0F); dx.assign(M * K, 0.0F); dA.assign(R * K, 0.0F); dB.assign(N * R, 0.0F);
+        LinearGrad::forward(x.data(), M, K, w.data(), N, &lp, y.data());
+        LinearGrad::backward(dy.data(), x.data(), M, K, w.data(), N, &lp, dx.data(), dA.data(), dB.data());
+    };
+    std::vector<float> y1, dx1, dA1, dB1, y8, dx8, dA8, dB8;
+    run(1, y1, dx1, dA1, dB1);
+    run(8, y8, dx8, dA8, dB8);
+    Parallel::setThreads(0);
+    for (std::size_t i = 0; i < y1.size(); ++i) EXPECT_NEAR(y1[i], y8[i], 0.0F);
+    for (std::size_t i = 0; i < dx1.size(); ++i) EXPECT_NEAR(dx1[i], dx8[i], 0.0F);
+    for (std::size_t i = 0; i < dA1.size(); ++i) EXPECT_NEAR(dA1[i], dA8[i], 0.0F);
+    for (std::size_t i = 0; i < dB1.size(); ++i) EXPECT_NEAR(dB1[i], dB8[i], 0.0F);
 }
 
 int main() { return mm::test::run(); }

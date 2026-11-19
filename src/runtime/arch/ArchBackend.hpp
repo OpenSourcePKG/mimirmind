@@ -330,6 +330,31 @@ public:
         return false;
     }
 
+    /// 7.4.3 Rune LowRank overlay (LoRA): on projection `tensor` (GGUF suffix,
+    /// e.g. "attn_q.weight") of `block`, out [rows, out] += B (A in), with A
+    /// [rank, in] and B [out, rank] F32 device buffers owned by the caller
+    /// (alpha already folded into B). Set once at load, before any capture.
+    struct LowRankOverlay {
+        std::size_t  block{0};
+        std::string  tensor;
+        std::size_t  rank{0};
+        std::size_t  in{0};
+        std::size_t  out{0};
+        const float* a{nullptr};
+        const float* b{nullptr};
+    };
+    /// True for backends whose block code calls applyLowRank at every
+    /// projection; the engine refuses lowrank runes otherwise.
+    [[nodiscard]] virtual bool supportsLowRank() const noexcept { return false; }
+    void setLowRanks(compute::ComputeOps& ops, compute::ComputeMatmul& gmm,
+                     std::vector<LowRankOverlay> overlays);
+    [[nodiscard]] bool hasLowRanks() const noexcept { return _lrOps != nullptr; }
+    [[nodiscard]] bool hasLowRank(std::size_t block, std::string_view tensor) const noexcept;
+    /// Enqueue out += B (A in) when (block, tensor) has an overlay; returns
+    /// whether it did. `matmulScratch` is the caller's matmul scratch.
+    bool applyLowRank(std::size_t block, std::string_view tensor, const float* in,
+                      std::size_t rows, float* out, float* matmulScratch);
+
 protected:
     ArchBackend() = default;
 
@@ -391,6 +416,12 @@ private:
     mutable std::vector<compute::ComputeBuffer>  _condScores;    ///< one per condition
     mutable compute::ComputeBuffer               _condProj;      ///< projection coefficients
     mutable std::vector<compute::ComputeBuffer>  _condRetired;   ///< outgrown, kept alive
+    compute::ComputeOps*                     _lrOps{nullptr};
+    compute::ComputeMatmul*                  _lrGmm{nullptr};
+    std::vector<std::vector<LowRankOverlay>> _lrByBlock;
+    compute::ComputeBuffer                   _lrTmp;    ///< [kLowRankChunk, max rank]
+    compute::ComputeBuffer                   _lrOut;    ///< [kLowRankChunk, max out]
+    static constexpr std::size_t             kLowRankChunk = 256;
     StageTap                 _stageTap{};
     mutable ArchCapabilities _caps{};
     mutable std::once_flag   _capsOnce;

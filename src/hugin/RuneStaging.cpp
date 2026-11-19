@@ -338,6 +338,38 @@ json RuneStaging::stage(const std::string& name, const std::string& kind,
                 {"rune_hash", hash}, {"next", "rune_gate"}};
 }
 
+json RuneStaging::stageLowRank(const std::string& name, const std::vector<LowRankSpec>& specs,
+                               json params) const {
+    (void)checkedName(json{{"name", name}});
+    if (specs.empty()) {
+        throw std::runtime_error("no adapters to stage");
+    }
+    const std::string base = baseFingerprint();
+    rn::RuneManifest man;
+    man.name            = name;
+    man.baseFingerprint = base;
+    man.provenanceJson  = json{{"tool", "hugin"}, {"hugin_version", _version}, {"kind", "lowrank"},
+                               {"created_at", nowIso()}, {"params", params}}.dump();
+    std::map<std::string, std::vector<float>> payloads;
+    for (const auto& s : specs) {
+        rn::RuneOp op;
+        op.kind     = rn::RuneOpKind::LowRank;
+        op.target   = s.target;
+        op.payload  = "lora." + s.target + ".a";
+        op.payloadB = "lora." + s.target + ".b";
+        op.rank     = s.rank;
+        op.alpha    = s.alpha;
+        payloads[op.payload]  = s.a;
+        payloads[op.payloadB] = s.b;
+        man.ops.push_back(std::move(op));
+    }
+    const rn::RuneFile rune{std::move(man), std::move(payloads)};
+    json out = stage(name, "lowrank", rune.serialize(), std::move(params));
+    out["base_fingerprint"] = base;
+    out["adapters"]         = specs.size();
+    return out;
+}
+
 RuneStaging::HeadRune RuneStaging::buildHeadRune(const json& a, std::vector<HeadScale>& specs) const {
     const auto t = _forward.target();
     if (t.path.empty()) {

@@ -1890,8 +1890,10 @@ add_library(mimirmind_hugin OBJECT
     src/hugin/train/AttentionGrad.cpp
     src/hugin/train/CrossEntropyGrad.cpp
     src/hugin/train/DenseBlock.cpp
+    src/hugin/train/DenseModel.cpp
     src/hugin/train/LinearGrad.cpp
     src/hugin/train/MoeCombineGrad.cpp
+    src/hugin/train/Parallel.cpp
     src/hugin/train/RmsNormGrad.cpp
     src/hugin/train/RopeGrad.cpp
     src/hugin/train/SwiGluGrad.cpp

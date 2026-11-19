@@ -90,7 +90,8 @@ a list of ops.
 | `steer` | x += v after block L, every row, every path | residual overlay |
 | `steer_project` | x −= α (x·u) u, u unit, 0 < α ≤ 1 | residual overlay |
 | `steer_if` | add or project, only rows with cos(h_Lc, c) > θ | residual overlay + device gate |
-| `lowrank`, `write_quant_blocks` | defined in the format | refused at load (not yet applied) |
+| `lowrank` | LoRA adapter on one projection: y += α·B(A x), A [rank, in], B [out, rank] | projection overlay (F32 matmuls next to the frozen weight); qwen2 / llama backend only, other architectures refuse it at load |
+| `write_quant_blocks` | defined in the format | refused at load (not yet applied) |
 
 Futhark, the applier inside `mimirmind`:
 
@@ -265,8 +266,11 @@ exactly as in serving.
 | Tool | Purpose |
 |---|---|
 | `train_block_check` | Builds one dense block (llama / qwen2) from Hugin's own train ops with the engine's dequantised weights; compares its forward with the engine's residual after that block and checks the backward (block input + LoRA on q/k/v/o/gate/up/down) with directional finite differences over a ladder of steps |
+| `train_lora_sft` | LoRA-SFT of the whole dense model (llama / qwen2): items `{prompt, response}` or `{prompt, teacher_prompt}` (the response is the base model's own greedy answer to the teacher prompt — self-distillation), CE on response tokens only, AdamW with gradient accumulation and global-norm clipping; stages the adapters as a `lowrank` Rune and compares the trainer's logits with the engine running that Rune |
 
-The train ops (`src/hugin/train/`) are a CPU reference with forward and backward for linear + LoRA, RMSNorm, RoPE, GQA attention, SwiGLU, the sigmoid MoE combine, cross-entropy and AdamW; the block backward recomputes the forward from the block input (only the input is kept). The base weights never get a gradient.
+The train ops (`src/hugin/train/`) are a CPU reference with forward and backward for linear + LoRA, RMSNorm, RoPE, GQA attention, SwiGLU, the sigmoid MoE combine, cross-entropy and AdamW; the block backward recomputes the forward from the block input (only the input is kept). The base weights never get a gradient. The model forward keeps only each block's input, builds the lm_head only for rows with a target, and stops the backward at the lowest block that carries an adapter. Linear layers run on half the hardware threads (`threads` overrides it), so a co-located server keeps headroom.
+
+A trained adapter goes through the same lifecycle as every other edit: staged → `rune_gate` → `rune_commit`, activated only by listing it in a model's `runes` config.
 
 ---
 

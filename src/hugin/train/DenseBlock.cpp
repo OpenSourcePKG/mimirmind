@@ -117,6 +117,10 @@ void DenseBlock::zeroGrad() {
     }
 }
 
+void DenseBlock::clearLora() {
+    for (auto& l : _lora) l.reset();
+}
+
 void DenseBlock::linear(Proj p, const float* in, std::size_t T, float* out) const {
     const auto [K, N] = projShape(p);
     const Lora* l = lora(p);

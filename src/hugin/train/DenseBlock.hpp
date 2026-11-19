@@ -60,6 +60,8 @@ public:
     [[nodiscard]] Lora*       lora(Proj p);
     [[nodiscard]] const Lora* lora(Proj p) const;
     void zeroGrad();
+    /// Removes every adapter (back to the frozen base block).
+    void clearLora();
 
     /// x, y [T, dModel]; the block input sits at absolute position startPos.
     void forward(const float* x, std::size_t T, float* y, std::size_t startPos = 0) const;

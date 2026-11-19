@@ -181,7 +181,8 @@ TEST(opKind_names_roundTrip) {
     EXPECT_TRUE(!rn::opKindFromName("explode").has_value());
     EXPECT_TRUE(rn::opKindApplicable(rn::RuneOpKind::WriteSlice));
     EXPECT_TRUE(rn::opKindApplicable(rn::RuneOpKind::Scale));
-    EXPECT_TRUE(!rn::opKindApplicable(rn::RuneOpKind::LowRank));
+    EXPECT_TRUE(rn::opKindApplicable(rn::RuneOpKind::LowRank));
+    EXPECT_TRUE(!rn::opKindApplicable(rn::RuneOpKind::WriteQuantBlocks));
     EXPECT_TRUE(rn::opKindApplicable(rn::RuneOpKind::Steer));
 }
 
@@ -395,10 +396,11 @@ TEST(apply_rejectsWithoutTouchingAnything) {
     // Not yet applicable op kind.
     {
         rn::RuneOp lr;
-        lr.kind       = rn::RuneOpKind::LowRank;
+        lr.kind       = rn::RuneOpKind::WriteQuantBlocks;
         lr.target     = "w";
         lr.tensorHash = h;
-        EXPECT_TRUE(!applier.apply(makeRune({lr}, {}), kBase, model.resolver()).has_value());
+        lr.payload    = "p";
+        EXPECT_TRUE(!applier.apply(makeRune({lr}, {{"p", {1.0f}}}), kBase, model.resolver()).has_value());
     }
     // Derived copies -> refuse (patch would be a silent no-op).
     model.tensors["w"].derived = true;
@@ -411,6 +413,52 @@ TEST(apply_rejectsWithoutTouchingAnything) {
 
     EXPECT_EQ(model.hash("w"), h);
     EXPECT_EQ(applier.appliedCount(), std::size_t{0});
+}
+
+TEST(lowrank_roundTrip_apply_and_refusals) {
+    // 7.4.3: LowRank overlay on a [out=3, in=2] projection, rank 1.
+    FakeModel model;
+    model.addF32("blk.0.attn_q.weight", 2, 3, {1, 2, 3, 4, 5, 6});
+    const std::string h = model.hash("blk.0.attn_q.weight");
+    rn::RuneOp lr;
+    lr.kind     = rn::RuneOpKind::LowRank;
+    lr.target   = "blk.0.attn_q.weight";
+    lr.payload  = "a";
+    lr.payloadB = "b";
+    lr.rank     = 1;
+    lr.alpha    = 2.0;
+    const auto rune = makeRune({lr}, {{"a", {0.5f, -1.0f}}, {"b", {1.0f, 2.0f, 3.0f}}});
+    const auto bytes = rune.serialize();
+    const auto back  = rn::RuneFile::parse(std::span<const std::uint8_t>(bytes));
+    EXPECT_EQ(back.manifest().ops[0].kind, rn::RuneOpKind::LowRank);
+    EXPECT_EQ(back.manifest().ops[0].payloadB, std::string{"b"});
+    EXPECT_EQ(back.manifest().ops[0].rank, std::uint32_t{1});
+
+    rn::RuneApplier applier;
+    const auto r = applier.apply(back, kBase, model.resolver());
+    EXPECT_TRUE(r.has_value());
+    EXPECT_EQ(r->lowRanks.size(), std::size_t{1});
+    EXPECT_EQ(r->lowRanks[0].in, std::uint64_t{2});
+    EXPECT_EQ(r->lowRanks[0].out, std::uint64_t{3});
+    EXPECT_NEAR(r->lowRanks[0].b[2], 6.0f, 0.0f);   // alpha folded into B
+    EXPECT_TRUE(r->touched.empty());
+    EXPECT_EQ(model.hash("blk.0.attn_q.weight"), h);  // overlay: weights untouched
+
+    // Shape mismatch (A for in=3) -> refused.
+    EXPECT_TRUE(!applier.apply(makeRune({lr}, {{"a", {1, 1, 1}}, {"b", {1, 2, 3}}}), kBase,
+                               model.resolver()).has_value());
+    // Missing B payload -> refused at container validation.
+    bool threw = false;
+    try {
+        (void)makeRune({lr}, {{"a", {0.5f, -1.0f}}});
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
+    // Unknown target -> refused.
+    lr.target = "blk.9.attn_q.weight";
+    EXPECT_TRUE(!applier.apply(makeRune({lr}, {{"a", {0.5f, -1.0f}}, {"b", {1, 2, 3}}}), kBase,
+                               model.resolver()).has_value());
 }
 
 TEST(apply_midwayFailure_restoresEarlierOps) {

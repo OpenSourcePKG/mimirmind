@@ -92,6 +92,18 @@ struct RuneExpertMask {
     std::vector<std::uint8_t>  keep;   ///< [n_experts], 1 = kept, 0 = disabled
 };
 
+/// A LowRank op resolved for the engine (7.4.3): on the projection `target`
+/// (weight [out, in]) the engine adds y += B (A x) after the base matmul;
+/// alpha is folded into b.
+struct RuneLowRank {
+    std::string         target;
+    std::uint32_t       rank{0};
+    std::uint64_t       in{0};
+    std::uint64_t       out{0};
+    std::vector<float>  a;   ///< [rank, in]
+    std::vector<float>  b;   ///< [out, rank], already x alpha
+};
+
 /// Result of a successful apply.
 struct RuneApplyReport {
     std::string                     runeName;
@@ -100,6 +112,7 @@ struct RuneApplyReport {
     std::vector<RuneSteer>          steers;   ///< activation overlays; no weight touched
     std::vector<RuneCondSteer>      condSteers;   ///< 7.11 projection / conditional overlays
     std::vector<RuneExpertMask>     expertMasks;   ///< router overlays; no weight touched
+    std::vector<RuneLowRank>        lowRanks;      ///< projection overlays; no weight touched
 };
 
 /**

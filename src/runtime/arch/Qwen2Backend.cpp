@@ -350,6 +350,24 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     // attn_k/v.bias so this branch is safe. Under Q8_0 the K/V bias
     // destinations point at the fp32 staging (kFp32Scratch/vFp32Scratch)
     // for the same defence-in-depth reason as the projection above.
+    // 7.4.3 Rune LowRank overlays on Q/K/V (before bias + RoPE, like the
+    // trainer's linear): K/V land in the F32 rows of this forward.
+    if (hasLowRanks()) {
+        float* const kRows = q8Path ? kFp32Scratch : static_cast<float*>(kSlot);
+        float* const vRows = q8Path ? vFp32Scratch : static_cast<float*>(vSlot);
+        const bool kvF32 = q8Path || kvDtype == KvDtype::F32;
+        applyLowRank(blockIdx, "attn_q.weight", normBuf, T, qBuf, matmulScratch);
+        if (!kvF32 && (hasLowRank(blockIdx, "attn_k.weight") ||
+                       hasLowRank(blockIdx, "attn_v.weight"))) {
+            throw std::runtime_error("Qwen2Backend: lowrank overlays on attn_k / attn_v need an "
+                                     "F32 or Q8_0 KV cache");
+        }
+        if (kvF32) {
+            applyLowRank(blockIdx, "attn_k.weight", normBuf, T, kRows, matmulScratch);
+            applyLowRank(blockIdx, "attn_v.weight", normBuf, T, vRows, matmulScratch);
+        }
+    }
+
     trace("QKV bias add (async, unordered)");
     {
         compute::UnorderedScope u{_ops};
@@ -476,6 +494,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     _gmm.matmulAsync(oW->type, oW->usmPtr, d_model, q_dim,
                      attnOutBuf, T,
                      projOutBuf, matmulScratch);
+    applyLowRank(blockIdx, "attn_output.weight", attnOutBuf, T, projOutBuf, matmulScratch);
     dumpStage("attn_out", blockIdx, projOutBuf, T, d_model);
 
     trace("attn residual + ffn rmsNorm (fused)");
@@ -496,6 +515,9 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
                          normBuf, T, upOutBuf, matmulScratch);
     }
 
+    applyLowRank(blockIdx, "ffn_gate.weight", normBuf, T, gateOutBuf, matmulScratch);
+    applyLowRank(blockIdx, "ffn_up.weight", normBuf, T, upOutBuf, matmulScratch);
+
     trace("FFN silu+mul (async, fused)");
     _ops.siluMulAsync(gateOutBuf, upOutBuf, T * ff_dim);
 
@@ -503,6 +525,7 @@ void Qwen2Backend::runBlock(std::size_t   blockIdx,
     _gmm.matmulAsync(ffnDown->type, ffnDown->usmPtr, d_model, ff_dim,
                      gateOutBuf, T,
                      projOutBuf, matmulScratch);
+    applyLowRank(blockIdx, "ffn_down.weight", gateOutBuf, T, projOutBuf, matmulScratch);
     dumpStage("ffn_mlp", blockIdx, projOutBuf, T, d_model);
 
     trace("ffn residual (async, exit)");

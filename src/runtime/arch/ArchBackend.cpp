@@ -139,6 +139,78 @@ void ArchBackend::setExpertMasks(
     }
 }
 
+void ArchBackend::setLowRanks(compute::ComputeOps& ops, compute::ComputeMatmul& gmm,
+                              std::vector<LowRankOverlay> overlays) {
+    _lrByBlock.clear();
+    _lrOps = nullptr;
+    _lrGmm = nullptr;
+    if (overlays.empty()) {
+        return;
+    }
+    std::size_t maxRank = 0, maxOut = 0;
+    for (auto& o : overlays) {
+        if (o.a == nullptr || o.b == nullptr || o.rank == 0 || o.in == 0 || o.out == 0) {
+            throw std::runtime_error("setLowRanks: incomplete overlay on block " +
+                                     std::to_string(o.block) + " '" + o.tensor + "'");
+        }
+        if (_lrByBlock.size() <= o.block) {
+            _lrByBlock.resize(o.block + 1);
+        }
+        for (const auto& prev : _lrByBlock[o.block]) {
+            if (prev.tensor == o.tensor) {
+                throw std::runtime_error("setLowRanks: two lowrank overlays on block " +
+                                         std::to_string(o.block) + " '" + o.tensor +
+                                         "' (stacking is not supported)");
+            }
+        }
+        maxRank = std::max(maxRank, o.rank);
+        maxOut  = std::max(maxOut, o.out);
+        _lrByBlock[o.block].push_back(std::move(o));
+    }
+    // Fixed scratch, allocated once here (never during a forward / capture);
+    // applyLowRank walks the rows in chunks of kLowRankChunk.
+    _lrTmp = ops.allocate(kLowRankChunk * maxRank * sizeof(float));
+    _lrOut = ops.allocate(kLowRankChunk * maxOut * sizeof(float));
+    _lrOps = &ops;
+    _lrGmm = &gmm;
+}
+
+bool ArchBackend::hasLowRank(std::size_t block, std::string_view tensor) const noexcept {
+    if (_lrOps == nullptr || block >= _lrByBlock.size()) {
+        return false;
+    }
+    for (const auto& o : _lrByBlock[block]) {
+        if (o.tensor == tensor) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ArchBackend::applyLowRank(std::size_t block, std::string_view tensor, const float* in,
+                               std::size_t rows, float* out, float* matmulScratch) {
+    if (_lrOps == nullptr || block >= _lrByBlock.size()) {
+        return false;
+    }
+    for (const auto& o : _lrByBlock[block]) {
+        if (o.tensor != tensor) {
+            continue;
+        }
+        float* tmp  = _lrTmp.as<float>();
+        float* outc = _lrOut.as<float>();
+        for (std::size_t r0 = 0; r0 < rows; r0 += kLowRankChunk) {
+            const std::size_t n = std::min(kLowRankChunk, rows - r0);
+            _lrGmm->matmulAsync(core::gguf::GgmlType::F32, o.a, o.rank, o.in, in + r0 * o.in, n,
+                                tmp, matmulScratch);
+            _lrGmm->matmulAsync(core::gguf::GgmlType::F32, o.b, o.out, o.rank, tmp, n, outc,
+                                matmulScratch);
+            _lrOps->addResidualAsync(out + r0 * o.out, outc, n * o.out);
+        }
+        return true;
+    }
+    return false;
+}
+
 void ArchBackend::addExpertMask(const float* bias, float* logits, std::size_t rows) const {
     // logits[r, e] += bias[e]: 0 for kept experts, kExpertMaskedLogit for disabled.
     _maskOps->addBiasAsync(logits, rows, _maskNExperts, bias);

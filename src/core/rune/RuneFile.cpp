@@ -71,7 +71,7 @@ RuneOp parseOp(const json& j, std::size_t idx) {
         if (j.contains("tensor_hash")) {
             op.tensorHash = requireString(j, "tensor_hash", ctx);
         }
-        if (opKindIsSteer(op.kind) && j.contains("alpha")) {
+        if ((opKindIsSteer(op.kind) || op.kind == RuneOpKind::LowRank) && j.contains("alpha")) {
             if (!j["alpha"].is_number()) {
                 fail(ctx + ": field 'alpha' is not a number");
             }
@@ -95,6 +95,14 @@ RuneOp parseOp(const json& j, std::size_t idx) {
                 fail(ctx + ": field 'threshold' is not a number");
             }
             op.threshold = th.get<double>();
+        }
+        if (op.kind == RuneOpKind::LowRank) {
+            op.payloadB = requireString(j, "payload_b", ctx);
+            const std::uint64_t r = requireUint(j, "rank", ctx);
+            if (r == 0 || r > 0xFFFFFFFFULL) {
+                fail(ctx + ": rank must be in [1, 2^32)");
+            }
+            op.rank = static_cast<std::uint32_t>(r);
         }
     } else {
         op.tensorHash = requireString(j, "tensor_hash", ctx);
@@ -125,8 +133,12 @@ json opToJson(const RuneOp& op) {
     if (!opKindIsOverlay(op.kind) || !op.tensorHash.empty()) {
         j["tensor_hash"] = op.tensorHash;
     }
-    if (opKindIsSteer(op.kind)) {
+    if (opKindIsSteer(op.kind) || op.kind == RuneOpKind::LowRank) {
         j["alpha"] = op.alpha;
+    }
+    if (op.kind == RuneOpKind::LowRank) {
+        j["payload_b"] = op.payloadB;
+        j["rank"]      = op.rank;
     }
     if (op.kind == RuneOpKind::SteerIf) {
         j["mode"]            = std::string{steerModeName(op.steerMode)};
@@ -229,8 +241,24 @@ void RuneFile::validate() const {
             fail(ctx + ": mask target must be a router 'blk.<i>.ffn_gate_inp.weight', got '" +
                  op.target + "'");
         }
-        const bool needsPayload = op.kind != RuneOpKind::LowRank &&
-                                  op.kind != RuneOpKind::WriteQuantBlocks;
+        if (op.kind == RuneOpKind::LowRank) {
+            if (!std::isfinite(op.alpha)) {
+                fail(ctx + ": alpha is not finite");
+            }
+            const auto a = _payloads.find(op.payload);
+            const auto b = _payloads.find(op.payloadB);
+            if (a == _payloads.end() || b == _payloads.end() || a->second.empty() ||
+                b->second.empty()) {
+                fail(ctx + ": lowrank needs non-empty payloads '" + op.payload + "' (A) and '" +
+                     op.payloadB + "' (B)");
+            }
+            if (op.rank == 0 || a->second.size() % op.rank != 0 ||
+                b->second.size() % op.rank != 0) {
+                fail(ctx + ": payload sizes are not multiples of rank " + std::to_string(op.rank));
+            }
+            continue;
+        }
+        const bool needsPayload = op.kind != RuneOpKind::WriteQuantBlocks;
         if (!needsPayload) {
             continue;
         }
