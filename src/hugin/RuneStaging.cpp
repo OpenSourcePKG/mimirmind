@@ -243,7 +243,15 @@ const char* stateName(int s) {
 
 RuneStaging::RuneStaging(ForwardTools& forward, SurgeryTools& surgery, fs::path dir,
                          std::string huginVersion)
-    : _forward(forward), _surgery(surgery), _dir(std::move(dir)), _version(std::move(huginVersion)) {}
+    : _forward(forward), _surgery(surgery), _dir(std::move(dir)), _version(std::move(huginVersion)) {
+    // 7.10: edit_search evaluates head trials as real runes (engine load path,
+    // KV-cached generation) instead of uncached probe forwards.
+    _surgery.setHeadRuneWriter([this](const std::vector<SurgeryTools::HeadEditKey>& edits, const std::string& tag) {
+        std::vector<HeadScale> specs;
+        for (const auto& [b, h, sc] : edits) specs.push_back(HeadScale{b, h, sc});
+        return writeSearchHeadRune(std::move(specs), tag);
+    });
+}
 
 fs::path RuneStaging::dirOf(State s) const {
     return _dir / stateName(static_cast<int>(s));
@@ -330,8 +338,7 @@ json RuneStaging::stage(const std::string& name, const std::string& kind,
                 {"rune_hash", hash}, {"next", "rune_gate"}};
 }
 
-json RuneStaging::stageHeadScales(const json& a, const std::string& name, const std::string& kind,
-                                  std::vector<HeadScale> specs) const {
+RuneStaging::HeadRune RuneStaging::buildHeadRune(const json& a, std::vector<HeadScale>& specs) const {
     const auto t = _forward.target();
     if (t.path.empty()) {
         throw std::runtime_error("no model loaded — call open_model first");
@@ -339,36 +346,50 @@ json RuneStaging::stageHeadScales(const json& a, const std::string& name, const 
     if (specs.empty()) {
         throw std::runtime_error("no head edits given");
     }
+    // Per-target cache of what a head rune binds to (fingerprint, head count,
+    // attn_output type / columns / content hash per block): edit_search builds
+    // one rune per trial, and re-reading the weights would reload the base
+    // engine under --single-engine every time.
+    const std::string key = t.path + "|" + t.tokenizerGguf;
+    if (_headCache.key != key) {
+        _headCache = HeadCache{};
+        _headCache.key = key;
+    }
     const bool checkpoint = fs::is_directory(t.path);
     // GGUF: the file bytes. Checkpoint: the bytes the engine holds after load
     // (e.g. FP8 attention requantised to 32-blocks) — what Futhark hashes.
     std::optional<ModelView> mv;
-    if (!checkpoint) {
-        mv.emplace(t.path);
+    const auto view = [&]() -> ModelView& {
+        if (!mv) mv.emplace(t.path);
+        return *mv;
+    };
+    if (_headCache.fingerprint.empty()) {
+        _headCache.fingerprint = checkpoint ? baseFingerprint() : view().fingerprint();
+        _headCache.heads       = _forward.engine().config().headCount;
+        _headCache.blocks      = _forward.engine().config().blockCount;
     }
-    const std::string base = checkpoint ? baseFingerprint() : mv->fingerprint();
-    Engine& e = _forward.engine();
-    const std::size_t H  = e.config().headCount;
+    const std::size_t H  = _headCache.heads;
     const double maxFrac  = budgetArg(a, "max_head_fraction", 0.25, kMaxHeadFraction);
     const double maxScale = budgetArg(a, "max_scale", 8.0, kMaxHeadScale);
 
     std::sort(specs.begin(), specs.end(),
               [](const HeadScale& x, const HeadScale& y) { return x.block < y.block; });
-    std::vector<SurgeryTools::HeadEditKey> keys;
-    for (const auto& sp : specs) keys.emplace_back(sp.block, sp.heads, sp.scale);
-    const json causal = causalityGate(a, "head edits", _surgery.causality(SurgeryTools::headsKey(keys)), true);
-    rn::RuneManifest man;
-    man.name            = name;
-    man.baseFingerprint = base;
-    std::vector<std::pair<std::string, std::vector<float>>> payloads;
-    json edits = json::array();
+    HeadRune out;
+    out.manifest.baseFingerprint = _headCache.fingerprint;
+    out.heads    = H;
+    out.maxFrac  = maxFrac;
+    out.maxScale = maxScale;
+    out.edits    = json::array();
     for (std::size_t i = 0; i < specs.size(); ++i) {
         HeadScale& sp = specs[i];
         if (i > 0 && specs[i - 1].block == sp.block) {
             throw std::runtime_error("block " + std::to_string(sp.block) +
                                      " appears twice — one head_edits entry per block");
         }
-        const auto blk = blockList(e, json{{"blocks", json::array({sp.block})}}).front();
+        if (sp.block >= _headCache.blocks) {
+            throw std::runtime_error("block " + std::to_string(sp.block) + " out of range");
+        }
+        const auto blk = sp.block;
         std::sort(sp.heads.begin(), sp.heads.end());
         sp.heads.erase(std::unique(sp.heads.begin(), sp.heads.end()), sp.heads.end());
         if (sp.heads.empty()) {
@@ -388,25 +409,32 @@ json RuneStaging::stageHeadScales(const json& a, const std::string& name, const 
                                      " > max_head_fraction " + std::to_string(maxFrac));
         }
         const std::string target = "blk." + std::to_string(blk) + ".attn_output.weight";
-        gg::GgmlType          type{};
-        std::uint64_t         cols = 0;
-        std::vector<std::uint8_t> bytes;
-        if (mv) {
-            const auto& tensor = mv->require(target);
-            type  = tensor.type;
-            cols  = ModelView::colsOf(tensor);
-            const auto b = mv->bytes(tensor);
-            bytes.assign(b.begin(), b.end());
-        } else {
-            const auto* tensor = e.weights().find(target);
-            if (tensor == nullptr || tensor->usmPtr == nullptr || tensor->dimensions.empty()) {
-                throw std::runtime_error("'" + target + "' not found in the loaded model");
+        auto it = _headCache.tensors.find(blk);
+        if (it == _headCache.tensors.end()) {
+            HeadCache::Tensor ct;
+            std::vector<std::uint8_t> bytes;
+            if (!checkpoint) {
+                const auto& tensor = view().require(target);
+                ct.type = tensor.type;
+                ct.cols = ModelView::colsOf(tensor);
+                const auto b = view().bytes(tensor);
+                bytes.assign(b.begin(), b.end());
+            } else {
+                Engine& e = _forward.engine();
+                const auto* tensor = e.weights().find(target);
+                if (tensor == nullptr || tensor->usmPtr == nullptr || tensor->dimensions.empty()) {
+                    throw std::runtime_error("'" + target + "' not found in the loaded model");
+                }
+                ct.type = tensor->type;
+                ct.cols = tensor->dimensions[0];
+                bytes.resize(tensor->nbytes);
+                e.ops()->readbackToHost(bytes.data(), tensor->usmPtr, bytes.size());
             }
-            type = tensor->type;
-            cols = tensor->dimensions[0];
-            bytes.resize(tensor->nbytes);
-            e.ops()->readbackToHost(bytes.data(), tensor->usmPtr, bytes.size());
+            ct.hash = rn::tensorContentHash(bytes.data(), bytes.size());
+            it = _headCache.tensors.emplace(blk, std::move(ct)).first;
         }
+        const gg::GgmlType  type = it->second.type;
+        const std::uint64_t cols = it->second.cols;
         const bool blockScaled = type == gg::GgmlType::Q8_0 || type == gg::GgmlType::FP8_E4M3;
         const bool okType = blockScaled || type == gg::GgmlType::F32 || type == gg::GgmlType::F16 ||
                             type == gg::GgmlType::BF16;
@@ -439,16 +467,43 @@ json RuneStaging::stageHeadScales(const json& a, const std::string& name, const 
         rn::RuneOp op;
         op.kind       = rn::RuneOpKind::Scale;
         op.target     = target;
-        op.tensorHash = rn::tensorContentHash(bytes.data(), bytes.size());
+        op.tensorHash = it->second.hash;
         op.payload    = "heads." + target;
         op.axis       = rn::RuneScaleAxis::Cols;
-        man.ops.push_back(op);
-        payloads.emplace_back(op.payload, std::move(factors));
-        edits.push_back({{"block", blk}, {"heads", sp.heads}, {"scale", sp.scale},
-                         {"head_fraction", frac}, {"target", target},
-                         {"target_type", std::string{gg::typeInfo(type).name}}});
+        out.manifest.ops.push_back(op);
+        out.payloads.emplace(op.payload, std::move(factors));
+        out.edits.push_back({{"block", blk}, {"heads", sp.heads}, {"scale", sp.scale},
+                             {"head_fraction", frac}, {"target", target},
+                             {"target_type", std::string{gg::typeInfo(type).name}}});
     }
-    json params{{"head_edits", edits}, {"block_heads", H}};
+    return out;
+}
+
+std::string RuneStaging::writeSearchHeadRune(std::vector<HeadScale> specs, const std::string& tag) const {
+    HeadRune hr = buildHeadRune(json::object(), specs);
+    hr.manifest.name           = tag;
+    hr.manifest.provenanceJson = json{{"tool", "hugin"}, {"hugin_version", _version},
+                                      {"kind", "edit_search_trial"}, {"created_at", nowIso()},
+                                      {"params", {{"head_edits", hr.edits}}}}.dump();
+    const rn::RuneFile rune{std::move(hr.manifest), std::move(hr.payloads)};
+    const auto bytes = rune.serialize();
+    const fs::path dir = _dir / "search";
+    fs::create_directories(dir);
+    const fs::path p = dir / (tag + ".rune");
+    writeFile(p, bytes.data(), bytes.size());
+    return fs::absolute(p).string();
+}
+
+json RuneStaging::stageHeadScales(const json& a, const std::string& name, const std::string& kind,
+                                  std::vector<HeadScale> specs) const {
+    HeadRune hr = buildHeadRune(a, specs);
+    std::vector<SurgeryTools::HeadEditKey> keys;
+    for (const auto& sp : specs) keys.emplace_back(sp.block, sp.heads, sp.scale);
+    const json causal = causalityGate(a, "head edits", _surgery.causality(SurgeryTools::headsKey(keys)), true);
+    rn::RuneManifest man = std::move(hr.manifest);
+    man.name = name;
+    const json& edits = hr.edits;
+    json params{{"head_edits", edits}, {"block_heads", hr.heads}};
     if (edits.size() == 1) {   // single-block summary (rune_stage_ablate compatibility)
         params["block"]         = edits[0]["block"];
         params["heads"]         = edits[0]["heads"];
@@ -464,12 +519,8 @@ json RuneStaging::stageHeadScales(const json& a, const std::string& name, const 
                               {"kind", kind}, {"created_at", nowIso()},
                               {"note", a.value("note", std::string{})},
                               {"params", params},
-                              {"budget", {{"max_head_fraction", maxFrac}, {"max_scale", maxScale}}}}.dump();
-    std::map<std::string, std::vector<float>> payloadMap;
-    for (auto& [k, v] : payloads) {
-        payloadMap.emplace(k, std::move(v));
-    }
-    const rn::RuneFile rune{std::move(man), std::move(payloadMap)};
+                              {"budget", {{"max_head_fraction", hr.maxFrac}, {"max_scale", hr.maxScale}}}}.dump();
+    const rn::RuneFile rune{std::move(man), std::move(hr.payloads)};
     json out = stage(name, kind, rune.serialize(), params);
     out["base_fingerprint"] = rune.manifest().baseFingerprint;
     return out;

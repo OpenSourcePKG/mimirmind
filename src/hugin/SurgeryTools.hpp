@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <map>
+#include <functional>
 #include <optional>
 #include <tuple>
 #include <utility>
@@ -143,6 +144,11 @@ public:
     /// 7.10: one edit_search trial as provenance JSON {search, trial, seed,
     /// space, params, objectives, feasible, edit}; throws if unknown.
     [[nodiscard]] nlohmann::json searchTrial(const std::string& search, std::size_t trial) const;
+    /// 7.10: writes a head-scale rune for an edit_search trial and returns its
+    /// path (installed by RuneStaging, which owns the rune format).
+    using HeadRuneWriter =
+        std::function<std::string(const std::vector<HeadEditKey>& edits, const std::string& tag)>;
+    void setHeadRuneWriter(HeadRuneWriter w) { _headRuneWriter = std::move(w); }
 
 private:
     void               registerConditionalOn(McpServer& server);
@@ -158,6 +164,7 @@ private:
     std::map<std::string, Causality>       _causality;
     /// edit_search results per search name (dropped with the vectors).
     std::map<std::string, nlohmann::json>  _searches;
+    HeadRuneWriter                         _headRuneWriter;
     /// eval_preview base results per goldset path (dropped with the vectors).
     std::map<std::string, std::pair<nlohmann::json, nlohmann::json>> _baseEvals;
 };

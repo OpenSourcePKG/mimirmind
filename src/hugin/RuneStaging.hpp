@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "core/gguf/GgufTypes.hpp"
+#include "core/rune/RuneFormat.hpp"
 #include "hugin/McpServer.hpp"
 
 #include <nlohmann/json.hpp>
@@ -10,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -95,6 +98,33 @@ private:
         std::vector<std::size_t> heads;
         double                   scale{0};
     };
+    /// A head-scale rune before naming / provenance (shared by staging and
+    /// edit_search trial runes); validates budgets from `a`, sorts `specs`.
+    struct HeadRune {
+        core::rune::RuneManifest                   manifest;
+        std::map<std::string, std::vector<float>>  payloads;
+        nlohmann::json                             edits;
+        std::size_t                                heads{0};
+        double                                     maxFrac{0};
+        double                                     maxScale{0};
+    };
+    HeadRune buildHeadRune(const nlohmann::json& a, std::vector<HeadScale>& specs) const;
+    /// Writes <dir>/search/<tag>.rune (no gates, no staging); returns its path.
+    std::string writeSearchHeadRune(std::vector<HeadScale> specs, const std::string& tag) const;
+    struct HeadCache {
+        struct Tensor {
+            core::gguf::GgmlType type{};
+            std::uint64_t  cols{0};
+            std::string    hash;
+        };
+        std::string                             key;
+        std::string                             fingerprint;
+        std::size_t                             heads{0};
+        std::uint32_t                           blocks{0};
+        std::map<std::uint32_t, Tensor>         tensors;
+    };
+    mutable HeadCache _headCache;
+
     /// Column-Scale rune over blk.N.attn_output.weight for every spec, bound
     /// to the target bytes the engine actually holds; budgets from `a`.
     nlohmann::json stageHeadScales(const nlohmann::json& a, const std::string& name,

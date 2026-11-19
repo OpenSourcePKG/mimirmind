@@ -236,7 +236,7 @@ Forward genau wie im Serving erreichen.
 | `expert_usage` | Tatsächlich genommenes MoE-Routing (Stage-Tap an der Router-Auswahl) |
 | `causal_trace` | Activation Patching clean → corrupt je (Block, Position) |
 | `causality_check` | Bewirkt ein gefundener Eingriff (Steer-Vektor bei α oder Head-Edits) mehr als ein zufälliger gleicher Größe? Dosis-Sweep + Verdikt causal / weak / epiphenomenal / undetermined + gemessene Dosis (§4) |
-| `edit_search` | Mehrziel-Suche nach Eingriffen (eigener TPE, kein Optuna): Head-Anzahl k / Scale / Block-Fenster oder Steer-α; Ziel-Goldset hoch, Kontroll-KL runter, keine Regression in freier Generierung; liefert die Pareto-Front. Einen Front-Punkt mit `rune_stage_heads` / `rune_stage_steer` + `search` + `trial` stagen (Parameter und Seed in der Provenienz) |
+| `edit_search` | Mehrziel-Suche nach Eingriffen (eigener TPE, kein Optuna): Head-Anzahl k / Scale / Block-Fenster oder Steer-α; Ziel-Goldset hoch, Kontroll-KL runter, keine Regression in freier Generierung; liefert die Pareto-Front und jeden Versuch in Kurzform. `scales` (z. B. `[2, 4]`) beschränkt die Scale auf eine diskrete Menge — auf FP8- / Q8_0-blockskalierten Gewichten Zweierpotenzen nehmen, damit die gestagte Rune exakt bleibt. Head-Versuche laufen als temporäre Runen über den Ladepfad (KV-gecacht, identisch zu einer gestagten Rune). Einen Front-Punkt mit `rune_stage_heads` / `rune_stage_steer` + `search` + `trial` stagen (Parameter und Seed in der Provenienz) |
 | `eval` | Goldset-Eval, optional gegen Runes (Deltas) |
 | `generate` | Greedy-Fortsetzung mit optionalem Steer / Head-Edits (langsam, zustandslos) |
 

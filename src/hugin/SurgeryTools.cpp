@@ -1630,7 +1630,10 @@ void SurgeryTools::registerEditSearchOn(McpServer& server) {
         "proposes edits, each is scored, and the Pareto front comes back. kind 'heads': "
         "'ranked_heads' [[block, head, ...], ...] best first (e.g. from attention_pattern span "
         "ranking); per trial the top k heads (k in 'k' [min, max], log-scaled; at most "
-        "'max_per_block' per block, default 12) are scaled by 'scale' [min, max]; with "
+        "'max_per_block' per block, default 12) are scaled by 'scale' [min, max] or one of 'scales' "
+        "(a list; block-scaled FP8 / Q8_0 weights need powers of two); each head trial is "
+        "evaluated as a real rune through the engine's load path (one model load per trial, "
+        "KV-cached generation; repeated edits are not re-evaluated); with "
         "'block_window' true a block window (center, half-width) is searched too. kind 'steer': "
         "'vector' with alpha in 'alpha' [min, max] (+ 'positions'). Objectives (minimised): "
         "1 = -target goldset score ('target_path' / 'target_items': mean logprob of scored items, "
@@ -1645,6 +1648,7 @@ void SurgeryTools::registerEditSearchOn(McpServer& server) {
                 {"ranked_heads", {{"type", "array"}, {"items", {}}}},
                 {"k", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
                 {"scale", {{"type", "array"}, {"items", {{"type", "number"}}}}},
+                {"scales", {{"type", "array"}, {"items", {{"type", "number"}}}}},
                 {"max_per_block", {{"type", "integer"}}},
                 {"block_window", {{"type", "boolean"}}},
                 {"vector", {{"type", "string"}}},
@@ -1704,6 +1708,7 @@ void SurgeryTools::registerEditSearchOn(McpServer& server) {
             std::vector<TPE::Param> space;
             std::vector<std::pair<std::uint32_t, std::size_t>> pool;   // ranked (block, head)
             std::size_t maxPerBlock = 12;
+            std::vector<double> scaleSet;   // non-empty: 'scale' is an index into it
             bool window = false;
             const SteerVector* vec = nullptr;
             bool lastOnly = false;
@@ -1722,15 +1727,27 @@ void SurgeryTools::registerEditSearchOn(McpServer& server) {
                 }
                 maxPerBlock = a.value("max_per_block", std::size_t{12});
                 const auto [k0, k1] = range("k");
-                const auto [s0, s1] = range("scale");
                 if (k0 < 1 || k1 > static_cast<double>(pool.size())) {
                     throw std::runtime_error("'k' must lie in [1, ranked_heads size]");
                 }
-                if (s0 < 0) {
-                    throw std::runtime_error("'scale' must be >= 0");
-                }
                 space.push_back({"k", K::Int, k0, k1, k0 >= 1 && k1 / k0 >= 4});
-                space.push_back({"scale", K::Float, s0, s1});
+                if (a.contains("scales")) {
+                    // Discrete scales, e.g. powers of two for block-scaled (FP8 / Q8_0) weights.
+                    scaleSet = a["scales"].get<std::vector<double>>();
+                    if (scaleSet.empty() || a.contains("scale")) {
+                        throw std::runtime_error("pass either 'scale' [min, max] or a non-empty 'scales' list");
+                    }
+                    for (const double x : scaleSet) {
+                        if (!std::isfinite(x) || x < 0) throw std::runtime_error("'scales' must be finite and >= 0");
+                    }
+                    space.push_back({"scale", K::Choice, 0, 0, false, scaleSet.size()});
+                } else {
+                    const auto [s0, s1] = range("scale");
+                    if (s0 < 0) {
+                        throw std::runtime_error("'scale' must be >= 0");
+                    }
+                    space.push_back({"scale", K::Float, s0, s1});
+                }
                 window = a.value("block_window", false);
                 if (window) {
                     const double nb = static_cast<double>(e.config().blockCount);
@@ -1757,7 +1774,8 @@ void SurgeryTools::registerEditSearchOn(McpServer& server) {
                             {"positions", lastOnly ? "last" : "all"}};
                     return iv;
                 }
-                const auto k = static_cast<std::size_t>(p[0]);
+                const auto   k     = static_cast<std::size_t>(p[0]);
+                const double scale = scaleSet.empty() ? p[1] : scaleSet[static_cast<std::size_t>(p[1])];
                 std::map<std::uint32_t, std::vector<std::size_t>> per;
                 std::size_t taken = 0;
                 for (const auto& [b, h] : pool) {
@@ -1772,8 +1790,8 @@ void SurgeryTools::registerEditSearchOn(McpServer& server) {
                 for (auto& [b, hs] : per) {
                     if (hs.empty()) continue;
                     std::sort(hs.begin(), hs.end());
-                    iv.headEdits.push_back(HeadEdit{b, hs, p[1]});
-                    edit.push_back({{"block", b}, {"heads", hs}, {"scale", p[1]}});
+                    iv.headEdits.push_back(HeadEdit{b, hs, scale});
+                    edit.push_back({{"block", b}, {"heads", hs}, {"scale", scale}});
                 }
                 return iv;
             };
@@ -1793,14 +1811,25 @@ void SurgeryTools::registerEditSearchOn(McpServer& server) {
                 return scored ? sum["mean_logprob"].get<double>() : sum["accuracy"].get<double>();
             };
 
+            // Bind every pool block's attn_output once while the base engine is
+            // resident (--single-engine would otherwise reload it per new block).
+            if (kind == "heads" && _headRuneWriter) {
+                std::map<std::uint32_t, std::vector<std::size_t>> first;
+                for (const auto& [b, h] : pool) first.emplace(b, std::vector<std::size_t>{h});
+                std::vector<HeadEditKey> prep;
+                for (const auto& [b, hs] : first) prep.emplace_back(b, hs, 1.0);
+                (void)_headRuneWriter(prep, name + "_prep");
+            }
             TPE tpe(space, 2, {startup, 0.25, 24, seed});
             json trials = json::array();
+            std::map<std::string, std::size_t> seen;   // headsKey -> first trial (no re-evaluation)
             for (std::size_t t = 0; t < nTrials; ++t) {
                 auto p = tpe.suggest();
                 json edit;
                 const Interventions iv = build(p, edit);
                 json row{{"trial", t}, {"params", json::object()}, {"edit", edit}};
                 for (std::size_t i = 0; i < space.size(); ++i) row["params"][space[i].name] = p[i];
+                if (!scaleSet.empty()) row["params"]["scale"] = scaleSet[static_cast<std::size_t>(p[1])];
                 if (iv.headEdits.empty() && iv.steer == nullptr) {
                     row["feasible"] = false;
                     row["skipped"]  = "no head left inside the block window";
@@ -1808,22 +1837,62 @@ void SurgeryTools::registerEditSearchOn(McpServer& server) {
                     trials.push_back(std::move(row));
                     continue;
                 }
-                const auto reached = std::make_shared<std::vector<char>>(iv.headEdits.size(), char{0});
-                const ProbeSetup setup = [&](Probe& probe, std::size_t n) { installInto(e, iv, n, probe, reached); };
-                json tRows = json::array();
-                const json tSum = evalRun(e, target, addBos, tRows, &setup);
-                requireReached(e, reached);
+                // Head trials run as real runes through the engine's load path
+                // (KV-cached generation, exactly what a staged rune does);
+                // probe forwards recompute the whole prefix per generated token.
+                std::string dupKey;
+                if (!iv.headEdits.empty()) {
+                    std::vector<HeadEditKey> keys;
+                    for (const auto& he : iv.headEdits) keys.emplace_back(he.block, he.heads, he.scale);
+                    dupKey = headsKey(keys);
+                    if (const auto d = seen.find(dupKey); d != seen.end()) {
+                        json prev = trials[d->second];
+                        prev["trial"]     = t;
+                        prev["params"]    = row["params"];
+                        prev["duplicate"] = d->second;
+                        tpe.tell(p, prev["objectives"].get<std::vector<double>>(), prev["feasible"].get<bool>());
+                        trials.push_back(std::move(prev));
+                        continue;
+                    }
+                }
+                json tSum;
                 double kl = 0;
-                for (std::size_t c = 0; c < cIds.size(); ++c) {
-                    kl += LogitMath::kl(cBase[c], lastLogProbs(e, cIds[c], iv));
+                std::size_t regressions = 0;
+                const bool viaRune = !iv.headEdits.empty() && _headRuneWriter;
+                if (viaRune) {
+                    std::vector<HeadEditKey> keys;
+                    for (const auto& he : iv.headEdits) keys.emplace_back(he.block, he.heads, he.scale);
+                    const std::string path = _headRuneWriter(keys, name + "_t" + std::to_string(t));
+                    Engine& v = _forward.engineWithRunes({path});
+                    json tRows = json::array();
+                    tSum = evalRun(v, target, addBos, tRows);
+                    for (std::size_t c = 0; c < cIds.size(); ++c) {
+                        kl += LogitMath::kl(cBase[c], lastLogProbs(v, cIds[c], Interventions{}));
+                    }
+                    if (!constraint.empty()) {
+                        json rows = json::array();
+                        (void)evalRun(v, constraint, addBos, rows);
+                        regressions = checkRegressions(cRowsBase, rows).size();
+                    }
+                    row["via"] = "rune";
+                } else {
+                    Engine& b = _forward.engine();
+                    const auto reached = std::make_shared<std::vector<char>>(iv.headEdits.size(), char{0});
+                    const ProbeSetup setup = [&](Probe& probe, std::size_t n) { installInto(b, iv, n, probe, reached); };
+                    json tRows = json::array();
+                    tSum = evalRun(b, target, addBos, tRows, &setup);
+                    requireReached(b, reached);
+                    for (std::size_t c = 0; c < cIds.size(); ++c) {
+                        kl += LogitMath::kl(cBase[c], lastLogProbs(b, cIds[c], iv));
+                    }
+                    if (!constraint.empty()) {
+                        json rows = json::array();
+                        (void)evalRun(b, constraint, addBos, rows, &setup);
+                        regressions = checkRegressions(cRowsBase, rows).size();
+                    }
+                    row["via"] = "probe";
                 }
                 kl /= static_cast<double>(cIds.size());
-                std::size_t regressions = 0;
-                if (!constraint.empty()) {
-                    json rows = json::array();
-                    (void)evalRun(e, constraint, addBos, rows, &setup);
-                    regressions = checkRegressions(cRowsBase, rows).size();
-                }
                 const double score = targetScore(tSum);
                 const bool feasible = regressions == 0 && std::isfinite(score) && std::isfinite(kl);
                 row["target"]      = {{"score", score}, {"accuracy", tSum["accuracy"]},
@@ -1833,25 +1902,45 @@ void SurgeryTools::registerEditSearchOn(McpServer& server) {
                 row["feasible"]    = feasible;
                 row["objectives"]  = {-score, kl};
                 tpe.tell(p, {-score, kl}, feasible);
+                if (!dupKey.empty()) seen.emplace(dupKey, trials.size());
                 trials.push_back(std::move(row));
             }
             json front = json::array();
-            for (const auto i : TPE::paretoFront(tpe.trials())) front.push_back(trials[i]);
+            for (const auto i : TPE::paretoFront(tpe.trials())) {
+                if (!trials[i].contains("duplicate")) front.push_back(trials[i]);
+            }
             std::sort(front.begin(), front.end(), [](const json& x, const json& y) {
                 return x["control_kl"].get<double>() < y["control_kl"].get<double>();
             });
             json spaceJson = json::array();
-            for (const auto& sp : space) spaceJson.push_back({{"name", sp.name}, {"lo", sp.lo}, {"hi", sp.hi}, {"log", sp.log}});
+            for (const auto& sp : space) {
+                json pj{{"name", sp.name}, {"lo", sp.lo}, {"hi", sp.hi}, {"log", sp.log}};
+                if (sp.choices > 0) {
+                    pj = {{"name", sp.name}, {"choices", sp.name == "scale" ? json(scaleSet) : json(sp.choices)}};
+                }
+                spaceJson.push_back(std::move(pj));
+            }
             const json objectivesDef = {scored ? "-target_mean_logprob" : "-target_accuracy", "control_kl"};
             _searches[name] = {{"seed", seed}, {"space", spaceJson}, {"kind", kind},
                                {"objectives_def", objectivesDef}, {"trials", trials}};
+            // Every trial in short form (the front alone hides why the rest failed).
             std::size_t feasibleN = 0;
-            for (const auto& t : trials) feasibleN += t["feasible"].get<bool>() ? 1U : 0U;
+            json trialSummary = json::array();
+            for (const auto& t : trials) {
+                feasibleN += t["feasible"].get<bool>() ? 1U : 0U;
+                json s{{"trial", t["trial"]}, {"params", t["params"]}, {"feasible", t["feasible"]}};
+                for (const char* key : {"control_kl", "regressions", "duplicate", "skipped"}) {
+                    if (t.contains(key)) s[key] = t[key];
+                }
+                if (t.contains("target")) s["target_accuracy"] = t["target"]["accuracy"];
+                trialSummary.push_back(std::move(s));
+            }
             return json{{"name", name}, {"kind", kind}, {"seed", seed}, {"space", spaceJson},
                         {"objectives", objectivesDef},
                         {"base", {{"target_score", targetScore(tBase)}, {"target_accuracy", tBase["accuracy"]}}},
                         {"trials_run", trials.size()}, {"feasible", feasibleN},
-                        {"constraint_items", constraint.size()}, {"pareto_front", front}};
+                        {"constraint_items", constraint.size()}, {"pareto_front", front},
+                        {"trials", trialSummary}};
         });
 }
 
