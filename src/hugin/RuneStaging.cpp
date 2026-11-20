@@ -20,7 +20,9 @@
 #include <iterator>
 #include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
+#include <string>
 
 namespace mimirmind::hugin {
 
@@ -840,6 +842,86 @@ void RuneStaging::registerOn(McpServer& server) {
             const rn::RuneFile rune{std::move(man), {{op.payload, std::move(keep)}}};
             json out = stage(name, "disable_experts", rune.serialize(), params);
             out["base_fingerprint"] = base;
+            return out;
+        });
+
+    server.addTool(
+        "rune_derive_lowrank",
+        "7.4.4 adapter ablation: write a new staged LowRank Rune 'name' from the adapters of an "
+        "existing LowRank Rune 'source' (staged or committed) — only blocks in 'blocks' (list) or "
+        "in ['block_min', 'block_max'], only projections in 'tensors' (e.g. \"attn_q.weight\", "
+        "\"ffn_up_shexp.weight\"; default all), each adapter's alpha x 'scale' (default 1). No "
+        "training, no model load; the source's base fingerprint must match the current model. The "
+        "provenance records the source, its hash and the filter. Nothing is activated — run "
+        "rune_gate next.",
+        schema({{"name", {{"type", "string"}}},
+                {"source", {{"type", "string"}}},
+                {"blocks", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
+                {"block_min", {{"type", "integer"}}},
+                {"block_max", {{"type", "integer"}}},
+                {"tensors", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"scale", {{"type", "number"}}}},
+               {"name", "source"}),
+        [this](const json& a) {
+            const std::string name   = checkedName(a);
+            const std::string source = checkedName(json{{"name", a.at("source")}});
+            const fs::path    srcPath = runePath(locate(source), source);
+            const auto        bytes   = readFile(srcPath);
+            const rn::RuneFile src    = rn::RuneFile::parse(bytes);
+            const std::string base   = baseFingerprint();
+            if (src.manifest().baseFingerprint != base) {
+                throw std::runtime_error("source rune '" + source + "' is bound to another base model");
+            }
+            std::set<std::uint32_t> blocks;
+            if (a.contains("blocks")) {
+                for (const auto& b : a["blocks"]) blocks.insert(b.get<std::uint32_t>());
+            }
+            const auto blockMin = a.value("block_min", std::int64_t{-1});
+            const auto blockMax = a.value("block_max", std::int64_t{-1});
+            std::set<std::string> tensors;
+            if (a.contains("tensors")) {
+                for (const auto& t : a["tensors"]) tensors.insert(t.get<std::string>());
+            }
+            const double scale = a.value("scale", 1.0);
+            if (!std::isfinite(scale) || scale <= 0.0) {
+                throw std::runtime_error("scale must be > 0");
+            }
+
+            std::vector<LowRankSpec> specs;
+            std::size_t sourceOps = 0;
+            for (const auto& op : src.manifest().ops) {
+                if (op.kind != rn::RuneOpKind::LowRank) {
+                    throw std::runtime_error("source rune '" + source + "' has a non-LowRank op on '" +
+                                             op.target + "'");
+                }
+                ++sourceOps;
+                // "blk.<i>.<tensor>"
+                const auto dot = op.target.find('.', 4);
+                if (op.target.rfind("blk.", 0) != 0 || dot == std::string::npos) {
+                    throw std::runtime_error("unexpected LowRank target '" + op.target + "'");
+                }
+                const auto block  = static_cast<std::uint32_t>(std::stoul(op.target.substr(4, dot - 4)));
+                const std::string tensor = op.target.substr(dot + 1);
+                if (!blocks.empty() && blocks.count(block) == 0) continue;
+                if (blockMin >= 0 && block < blockMin) continue;
+                if (blockMax >= 0 && block > blockMax) continue;
+                if (!tensors.empty() && tensors.count(tensor) == 0) continue;
+                const auto pa = src.payload(op.payload);
+                const auto pb = src.payload(op.payloadB);
+                specs.push_back({op.target, op.rank, op.alpha * scale, {pa.begin(), pa.end()},
+                                 {pb.begin(), pb.end()}});
+            }
+            if (specs.empty()) {
+                throw std::runtime_error("the filter keeps no adapter of '" + source + "'");
+            }
+            json params{{"derived_from", source},
+                        {"source_hash", rn::tensorContentHash(bytes.data(), bytes.size())},
+                        {"filter", {{"blocks", a.value("blocks", json::array())},
+                                    {"block_min", blockMin}, {"block_max", blockMax},
+                                    {"tensors", a.value("tensors", json::array())}, {"scale", scale}}},
+                        {"adapters_kept", specs.size()}, {"adapters_source", sourceOps}};
+            json out = stageLowRank(name, specs, params);
+            out["adapters_source"] = sourceOps;
             return out;
         });
 

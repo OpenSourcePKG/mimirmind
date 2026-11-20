@@ -253,6 +253,7 @@ exactly as in serving.
 | `rune_stage_ablate` | Head ablation → 0/1 column `scale` on `attn_output` |
 | `rune_stage_heads` | Head scaling → column `scale` (exact on Q8_0 / FP8 block scales for 0 or powers of two) |
 | `rune_stage_experts` | Expert disable → `mask` on the MoE router |
+| `rune_derive_lowrank` | New staged LowRank Rune from a subset of another one's adapters (blocks, projections) with alpha × `scale`; adapter ablation without retraining |
 | `rune_gate` | Target/control gate, base vs. Rune (§4) |
 | `rune_commit` | Green + byte-identical → `committed/`, returns the config line |
 | `rune_rollback` | committed → staged → rejected |

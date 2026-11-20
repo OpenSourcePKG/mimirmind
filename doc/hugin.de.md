@@ -262,6 +262,7 @@ Forward genau wie im Serving erreichen.
 | `rune_stage_ablate` | Head-Ablation → 0/1-Spalten-`scale` auf `attn_output` |
 | `rune_stage_heads` | Head-Skalierung → Spalten-`scale` (exakt auf Q8_0-/FP8-Block-Scales für 0 oder Zweierpotenzen) |
 | `rune_stage_experts` | Experten abschalten → `mask` auf dem MoE-Router |
+| `rune_derive_lowrank` | Neue gestagte LowRank-Rune aus einer Teilmenge der Adapter einer anderen (Blöcke, Projektionen), alpha × `scale`; Adapter-Ablation ohne Neutraining |
 | `rune_gate` | Target-/Control-Gate, Basis vs. Rune (§4) |
 | `rune_commit` | Grün + byte-gleich → `committed/`, liefert die Config-Zeile |
 | `rune_rollback` | committed → staged → rejected |

@@ -137,7 +137,7 @@ TEST(mcp_initialize_and_toolsList) {
     EXPECT_TRUE(names == (std::vector<std::string>{"ablate_preview", "activations", "attention_pattern", "causal_trace", "causality_check",
                                                    "condition_vector", "edit_search", "eval", "eval_preview", "expert_usage", "generate", "list_tensors", "logit_lens",
                                                    "model_info", "next_token", "open_model", "perplexity", "rune_check",
-                                                   "rune_commit", "rune_compare", "rune_gate", "rune_inspect", "rune_list",
+                                                   "rune_commit", "rune_compare", "rune_derive_lowrank", "rune_gate", "rune_inspect", "rune_list",
                                                    "rune_rollback", "rune_stage_ablate", "rune_stage_experts", "rune_stage_heads",
                                                    "rune_stage_steer", "rune_stage_steer_if",
                                                    "steer_if_preview", "steer_list", "steer_preview",
@@ -331,6 +331,35 @@ TEST(runeStaging_guards_withoutModel_andUnknownNames) {
     const json list = call("rune_list", json::object());
     EXPECT_TRUE(!list.value("isError", false));
     std::filesystem::remove_all(dir);
+}
+
+TEST(runeDeriveLowRank_filters_blocks_tensors_and_scales_alpha) {
+    Fixture f;
+    std::filesystem::remove_all(std::filesystem::temp_directory_path() / "hugin_tests_runes");
+    const auto spec = [](const char* target, float v) {
+        return hg::RuneStaging::LowRankSpec{target, 2, 4.0, std::vector<float>(6, v), std::vector<float>(8, -v)};
+    };
+    (void)f.staging.stageLowRank("src", {spec("blk.0.attn_q.weight", 1.0F), spec("blk.1.attn_q.weight", 2.0F),
+                                         spec("blk.1.ffn_up_shexp.weight", 3.0F), spec("blk.2.attn_q.weight", 4.0F)},
+                                 json::object());
+    const auto [err, r] = f.call("rune_derive_lowrank", {{"name", "d"}, {"source", "src"}, {"block_min", 1},
+                                                          {"tensors", {"attn_q.weight"}}, {"scale", 0.5}});
+    EXPECT_TRUE(!err);
+    EXPECT_EQ(r["adapters"].get<std::size_t>(), std::size_t{2});
+    EXPECT_EQ(r["adapters_source"].get<std::size_t>(), std::size_t{4});
+    const auto d = rn::RuneFile::load(r["path"].get<std::string>());
+    EXPECT_EQ(d.manifest().ops.size(), std::size_t{2});
+    EXPECT_TRUE(d.manifest().ops[0].target == "blk.1.attn_q.weight");
+    EXPECT_TRUE(d.manifest().ops[1].target == "blk.2.attn_q.weight");
+    EXPECT_TRUE(nearD(d.manifest().ops[0].alpha, 2.0));
+    EXPECT_TRUE(d.payload(d.manifest().ops[1].payloadB)[0] == -4.0F);
+    EXPECT_TRUE(json::parse(d.manifest().provenanceJson)["params"]["derived_from"] == "src");
+
+    const auto [err2, r2] = f.call("rune_derive_lowrank", {{"name", "e"}, {"source", "src"}, {"blocks", {7}}});
+    EXPECT_TRUE(err2 && r2.get<std::string>().find("keeps no adapter") != std::string::npos);
+    const auto [err3, r3] = f.call("rune_derive_lowrank", {{"name", "d"}, {"source", "src"}});
+    EXPECT_TRUE(err3 && r3.get<std::string>().find("already exists") != std::string::npos);
+    std::filesystem::remove_all(std::filesystem::temp_directory_path() / "hugin_tests_runes");
 }
 
 TEST(logitMath_logSoftmax_topK_rank_entropy_kl) {
