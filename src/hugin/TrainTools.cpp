@@ -101,60 +101,56 @@ DenseBlock loadDenseBlock(Engine& e, std::size_t L) {
 
 /// Loads one routed expert of a stacked bank ([experts, rows, in]) to F32.
 /// NVFP4_TC reads the expert's nibbles, swizzled scale slot and global; every
-/// other format is a per-expert byte slice of the main buffer.
+/// other format is a per-expert byte slice of the main buffer. The engine and
+/// the tensor are resolved on every load: under --single-engine the base can
+/// be released and reloaded (rune parity / gate) while a TrainModel is cached.
 class ExpertBank {
 public:
-    ExpertBank(Engine& e, const core::gguf::GgufTensor& t, std::size_t experts, std::size_t rows, std::size_t in)
-        : _e(&e), _t(&t), _experts(experts), _rows(rows), _in(in) {
-        if (t.type == core::gguf::GgmlType::NVFP4_TC) {
-            if (t.tcSfbPtr == nullptr || t.tcGlobalsPtr == nullptr) {
-                throw std::runtime_error(t.name + ": NVFP4_TC bank without scale / global side banks");
-            }
-            _globals.resize(experts);
-            e.ops()->readbackToHost(_globals.data(), t.tcGlobalsPtr, experts * sizeof(float));
-            _nibBytes = rows * in / 2;
-            _sfbBytes = core::modelopt::moeSwizzledScaleStride(rows, in / 16);
-        } else {
-            if (t.nbytes % experts != 0) throw std::runtime_error(t.name + ": bank size not divisible by experts");
-            _sliceBytes = t.nbytes / experts;
-        }
-    }
+    ExpertBank(ForwardTools& fw, std::size_t block, std::string name, std::size_t experts, std::size_t rows,
+               std::size_t in)
+        : _fw(&fw), _block(block), _name(std::move(name)), _experts(experts), _rows(rows), _in(in) {}
+
     void load(std::size_t ex, float* dst) const {
-        if (ex >= _experts) throw std::runtime_error(_t->name + ": expert out of range");
-        if (_t->type == core::gguf::GgmlType::NVFP4_TC) {
-            std::vector<std::uint8_t> nib(_nibBytes), sfb(_sfbBytes);
-            const void* nibSrc = _t->tcNibblePtr != nullptr ? _t->tcNibblePtr : _t->usmPtr;
-            _e->ops()->readbackToHost(nib.data(), static_cast<const std::uint8_t*>(nibSrc) + ex * _nibBytes, _nibBytes);
-            _e->ops()->readbackToHost(sfb.data(), static_cast<const std::uint8_t*>(_t->tcSfbPtr) + ex * _sfbBytes,
-                                      _sfbBytes);
-            HostDequant::nvfp4TcToF32(nib.data(), sfb.data(), _globals[ex], _rows, _in, dst);
+        if (ex >= _experts) throw std::runtime_error(_name + ": expert out of range");
+        Engine& e = _fw->engine();
+        const auto* t = e.weights().findBlock(_block, _name);
+        if (t == nullptr || (t->usmPtr == nullptr && t->tcNibblePtr == nullptr)) {
+            throw std::runtime_error("blk." + std::to_string(_block) + "." + _name + " not found");
+        }
+        if (t->type == core::gguf::GgmlType::NVFP4_TC) {
+            if (t->tcSfbPtr == nullptr || t->tcGlobalsPtr == nullptr) {
+                throw std::runtime_error(_name + ": NVFP4_TC bank without scale / global side banks");
+            }
+            const std::size_t nibBytes = _rows * _in / 2;
+            const std::size_t sfbBytes = core::modelopt::moeSwizzledScaleStride(_rows, _in / 16);
+            std::vector<std::uint8_t> nib(nibBytes), sfb(sfbBytes);
+            float global = 0.0F;
+            const void* nibSrc = t->tcNibblePtr != nullptr ? t->tcNibblePtr : t->usmPtr;
+            e.ops()->readbackToHost(nib.data(), static_cast<const std::uint8_t*>(nibSrc) + ex * nibBytes, nibBytes);
+            e.ops()->readbackToHost(sfb.data(), static_cast<const std::uint8_t*>(t->tcSfbPtr) + ex * sfbBytes,
+                                    sfbBytes);
+            e.ops()->readbackToHost(&global, static_cast<const float*>(t->tcGlobalsPtr) + ex, sizeof(float));
+            HostDequant::nvfp4TcToF32(nib.data(), sfb.data(), global, _rows, _in, dst);
             return;
         }
-        std::vector<std::uint8_t> bytes(_sliceBytes);
-        _e->ops()->readbackToHost(bytes.data(), static_cast<const std::uint8_t*>(_t->usmPtr) + ex * _sliceBytes,
-                                  _sliceBytes);
-        HostDequant::toF32(_t->type, bytes.data(), _rows * _in, dst);
+        if (t->nbytes % _experts != 0) throw std::runtime_error(_name + ": bank size not divisible by experts");
+        const std::size_t slice = t->nbytes / _experts;
+        std::vector<std::uint8_t> bytes(slice);
+        e.ops()->readbackToHost(bytes.data(), static_cast<const std::uint8_t*>(t->usmPtr) + ex * slice, slice);
+        HostDequant::toF32(t->type, bytes.data(), _rows * _in, dst);
     }
 
 private:
-    Engine*                        _e;
-    const core::gguf::GgufTensor*  _t;
-    std::size_t                    _experts, _rows, _in;
-    std::size_t                    _nibBytes{0}, _sfbBytes{0}, _sliceBytes{0};
-    std::vector<float>             _globals;
+    ForwardTools* _fw;
+    std::size_t   _block;
+    std::string   _name;
+    std::size_t   _experts, _rows, _in;
 };
-
-const core::gguf::GgufTensor& requireBlockTensor(Engine& e, std::size_t L, const char* name) {
-    const auto* t = e.weights().findBlock(L, name);
-    if (t == nullptr || (t->usmPtr == nullptr && t->tcNibblePtr == nullptr)) {
-        throw std::runtime_error("blk." + std::to_string(L) + "." + name + " not found");
-    }
-    return *t;
-}
 
 /// 7.4.4: one Kolibri-1 block (see Kolibri1Backend::runBlock) with its routed
 /// experts streamed from the engine's banks one expert at a time.
-train::MoeBlock loadKolibriBlock(Engine& e, std::size_t L) {
+train::MoeBlock loadKolibriBlock(ForwardTools& fw, std::size_t L) {
+    Engine& e = fw.engine();
     const auto& c = e.config();
     train::MoeBlock::Config cfg;
     cfg.dModel     = c.embeddingLength;
@@ -188,9 +184,11 @@ train::MoeBlock loadKolibriBlock(Engine& e, std::size_t L) {
     w.shUp         = blockTensor(e, L, "ffn_up_shexp.weight", true);
     w.shDown       = blockTensor(e, L, "ffn_down_shexp.weight", true);
     const std::size_t E = cfg.experts, ff = cfg.expertFf, d = cfg.dModel;
-    auto gate = std::make_shared<ExpertBank>(e, requireBlockTensor(e, L, "ffn_gate_exps.weight"), E, ff, d);
-    auto up   = std::make_shared<ExpertBank>(e, requireBlockTensor(e, L, "ffn_up_exps.weight"), E, ff, d);
-    auto down = std::make_shared<ExpertBank>(e, requireBlockTensor(e, L, "ffn_down_exps.weight"), E, d, ff);
+    auto gate = std::make_shared<ExpertBank>(fw, L, "ffn_gate_exps.weight", E, ff, d);
+    auto up   = std::make_shared<ExpertBank>(fw, L, "ffn_up_exps.weight", E, ff, d);
+    auto down = std::make_shared<ExpertBank>(fw, L, "ffn_down_exps.weight", E, d, ff);
+    std::vector<float> probe(ff * d);
+    gate->load(0, probe.data());   // fail at build time, not mid-training, on an unknown bank format
     auto loader = [gate, up, down](std::size_t ex, float* g, float* u, float* dn) {
         gate->load(ex, g);
         up->load(ex, u);
@@ -200,10 +198,11 @@ train::MoeBlock loadKolibriBlock(Engine& e, std::size_t L) {
 }
 
 /// The train block of layer L for the engine's architecture.
-std::unique_ptr<train::TrainBlock> loadBlock(Engine& e, std::size_t L) {
+std::unique_ptr<train::TrainBlock> loadBlock(ForwardTools& fw, std::size_t L) {
+    Engine& e = fw.engine();
     const std::string& arch = e.config().architecture;
     if (arch == "llama" || arch == "qwen2") return std::make_unique<DenseBlock>(loadDenseBlock(e, L));
-    if (arch == "kolibri1") return std::make_unique<train::MoeBlock>(loadKolibriBlock(e, L));
+    if (arch == "kolibri1") return std::make_unique<train::MoeBlock>(loadKolibriBlock(fw, L));
     throw std::runtime_error("the train ops support llama / qwen2 / kolibri1 blocks (model is '" + arch + "')");
 }
 
@@ -298,7 +297,7 @@ train::TrainModel& TrainTools::model() {
     _model.reset();
     Engine& e = _forward.engine();
     std::vector<std::unique_ptr<train::TrainBlock>> blocks;
-    for (std::size_t L = 0; L < e.config().blockCount; ++L) blocks.push_back(loadBlock(e, L));
+    for (std::size_t L = 0; L < e.config().blockCount; ++L) blocks.push_back(loadBlock(_forward, L));
     train::TrainModel::Head head;
     head.embed     = globalTensor(e, "token_embd.weight", true);
     head.finalNorm = globalTensor(e, "output_norm.weight", true);
@@ -343,7 +342,7 @@ void TrainTools::registerOn(McpServer& server) {
             const std::vector<float>& xin = probe.hidden.at(static_cast<std::uint32_t>(L - 1));
             const std::vector<float>& ref = probe.hidden.at(static_cast<std::uint32_t>(L));
 
-            const auto blkPtr = loadBlock(e, L);
+            const auto blkPtr = loadBlock(_forward, L);
             train::TrainBlock& blk = *blkPtr;
             const std::size_t T = ids.size(), d = blk.dModel();
             std::vector<float> y(T * d);
