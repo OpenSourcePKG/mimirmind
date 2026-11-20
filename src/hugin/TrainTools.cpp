@@ -4,13 +4,15 @@
 #include "hugin/TrainTools.hpp"
 
 #include "compute/ComputeOps.hpp"
-#include "compute/Dequant.hpp"
+#include "core/modelopt/BlockScaleSwizzle.hpp"
 #include "hugin/ForwardSupport.hpp"
 #include "hugin/ForwardTools.hpp"
 #include "hugin/GenerationCheck.hpp"
+#include "hugin/HostDequant.hpp"
 #include "hugin/RuneStaging.hpp"
 #include "hugin/train/AdamW.hpp"
 #include "hugin/train/DenseBlock.hpp"
+#include "hugin/train/MoeBlock.hpp"
 #include "hugin/train/TrainModel.hpp"
 #include "hugin/train/Parallel.hpp"
 #include "model/ChatTemplate.hpp"
@@ -44,7 +46,7 @@ std::vector<float> tensorF32(Engine& e, const core::gguf::GgufTensor& t) {
     std::vector<std::uint8_t> bytes(t.nbytes);
     e.ops()->readbackToHost(bytes.data(), t.usmPtr, bytes.size());
     std::vector<float> out(static_cast<std::size_t>(t.nelements));
-    compute::dequantToF32(t.type, bytes.data(), out.size(), out.data());
+    HostDequant::toF32(t.type, bytes.data(), out.size(), out.data());
     return out;
 }
 
@@ -62,10 +64,6 @@ std::vector<float> blockTensor(Engine& e, std::size_t L, const char* name, bool 
 DenseBlock loadDenseBlock(Engine& e, std::size_t L) {
     const auto& c = e.config();
     const std::string& arch = c.architecture;
-    if (arch != "llama" && arch != "qwen2") {
-        throw std::runtime_error("train_block_check supports the dense llama / qwen2 block only (model is '" +
-                                 arch + "'); other architectures follow in 7.4.4");
-    }
     if (!c.ropeScalingType.empty() && c.ropeScalingFactor > 1.0F) {
         throw std::runtime_error("rope_scaling '" + c.ropeScalingType + "' is not supported by the train ops yet");
     }
@@ -101,6 +99,114 @@ DenseBlock loadDenseBlock(Engine& e, std::size_t L) {
     return DenseBlock(std::move(cfg), std::move(w));
 }
 
+/// Loads one routed expert of a stacked bank ([experts, rows, in]) to F32.
+/// NVFP4_TC reads the expert's nibbles, swizzled scale slot and global; every
+/// other format is a per-expert byte slice of the main buffer.
+class ExpertBank {
+public:
+    ExpertBank(Engine& e, const core::gguf::GgufTensor& t, std::size_t experts, std::size_t rows, std::size_t in)
+        : _e(&e), _t(&t), _experts(experts), _rows(rows), _in(in) {
+        if (t.type == core::gguf::GgmlType::NVFP4_TC) {
+            if (t.tcSfbPtr == nullptr || t.tcGlobalsPtr == nullptr) {
+                throw std::runtime_error(t.name + ": NVFP4_TC bank without scale / global side banks");
+            }
+            _globals.resize(experts);
+            e.ops()->readbackToHost(_globals.data(), t.tcGlobalsPtr, experts * sizeof(float));
+            _nibBytes = rows * in / 2;
+            _sfbBytes = core::modelopt::moeSwizzledScaleStride(rows, in / 16);
+        } else {
+            if (t.nbytes % experts != 0) throw std::runtime_error(t.name + ": bank size not divisible by experts");
+            _sliceBytes = t.nbytes / experts;
+        }
+    }
+    void load(std::size_t ex, float* dst) const {
+        if (ex >= _experts) throw std::runtime_error(_t->name + ": expert out of range");
+        if (_t->type == core::gguf::GgmlType::NVFP4_TC) {
+            std::vector<std::uint8_t> nib(_nibBytes), sfb(_sfbBytes);
+            const void* nibSrc = _t->tcNibblePtr != nullptr ? _t->tcNibblePtr : _t->usmPtr;
+            _e->ops()->readbackToHost(nib.data(), static_cast<const std::uint8_t*>(nibSrc) + ex * _nibBytes, _nibBytes);
+            _e->ops()->readbackToHost(sfb.data(), static_cast<const std::uint8_t*>(_t->tcSfbPtr) + ex * _sfbBytes,
+                                      _sfbBytes);
+            HostDequant::nvfp4TcToF32(nib.data(), sfb.data(), _globals[ex], _rows, _in, dst);
+            return;
+        }
+        std::vector<std::uint8_t> bytes(_sliceBytes);
+        _e->ops()->readbackToHost(bytes.data(), static_cast<const std::uint8_t*>(_t->usmPtr) + ex * _sliceBytes,
+                                  _sliceBytes);
+        HostDequant::toF32(_t->type, bytes.data(), _rows * _in, dst);
+    }
+
+private:
+    Engine*                        _e;
+    const core::gguf::GgufTensor*  _t;
+    std::size_t                    _experts, _rows, _in;
+    std::size_t                    _nibBytes{0}, _sfbBytes{0}, _sliceBytes{0};
+    std::vector<float>             _globals;
+};
+
+const core::gguf::GgufTensor& requireBlockTensor(Engine& e, std::size_t L, const char* name) {
+    const auto* t = e.weights().findBlock(L, name);
+    if (t == nullptr || (t->usmPtr == nullptr && t->tcNibblePtr == nullptr)) {
+        throw std::runtime_error("blk." + std::to_string(L) + "." + name + " not found");
+    }
+    return *t;
+}
+
+/// 7.4.4: one Kolibri-1 block (see Kolibri1Backend::runBlock) with its routed
+/// experts streamed from the engine's banks one expert at a time.
+train::MoeBlock loadKolibriBlock(Engine& e, std::size_t L) {
+    const auto& c = e.config();
+    train::MoeBlock::Config cfg;
+    cfg.dModel     = c.embeddingLength;
+    cfg.heads      = c.headCount;
+    cfg.kvHeads    = c.headCountKvFor(L);
+    cfg.headDim    = c.headDim(L);
+    cfg.experts    = c.expertCount;
+    cfg.topK       = c.expertUsedCount;
+    cfg.expertFf   = c.expertFeedForwardLength;
+    cfg.sharedFf   = c.expertSharedFeedForwardLength;
+    cfg.eps        = c.rmsNormEps;
+    cfg.sliding    = L < c.slidingWindowPattern.size() && static_cast<bool>(c.slidingWindowPattern[L]);
+    cfg.window     = cfg.sliding ? c.slidingWindow : 0;
+    cfg.ropeBase   = c.ropeFreqBaseSwa;
+    cfg.ropeLayout = train::RopeGrad::Layout::Split;   // ropeInPlaceAsync = NEOX split
+    cfg.attnScale  = c.attentionScaleFor(cfg.headDim);
+    train::MoeBlock::Weights w;
+    w.attnNorm     = blockTensor(e, L, "attn_norm.weight", true);
+    w.wq           = blockTensor(e, L, "attn_q.weight", true);
+    w.wk           = blockTensor(e, L, "attn_k.weight", true);
+    w.wv           = blockTensor(e, L, "attn_v.weight", true);
+    w.wo           = blockTensor(e, L, "attn_output.weight", true);
+    w.qNorm        = blockTensor(e, L, "attn_q_norm.weight", true);
+    w.kNorm        = blockTensor(e, L, "attn_k_norm.weight", true);
+    w.postAttnNorm = blockTensor(e, L, "post_attn_norm.weight", true);
+    w.ffnNorm      = blockTensor(e, L, "post_attention_norm.weight", true);
+    w.postFfnNorm  = blockTensor(e, L, "post_ffn_norm.weight", true);
+    w.router       = blockTensor(e, L, "ffn_gate_inp.weight", true);
+    w.routerBias   = blockTensor(e, L, "exp_probs_b.weight", true);
+    w.shGate       = blockTensor(e, L, "ffn_gate_shexp.weight", true);
+    w.shUp         = blockTensor(e, L, "ffn_up_shexp.weight", true);
+    w.shDown       = blockTensor(e, L, "ffn_down_shexp.weight", true);
+    const std::size_t E = cfg.experts, ff = cfg.expertFf, d = cfg.dModel;
+    auto gate = std::make_shared<ExpertBank>(e, requireBlockTensor(e, L, "ffn_gate_exps.weight"), E, ff, d);
+    auto up   = std::make_shared<ExpertBank>(e, requireBlockTensor(e, L, "ffn_up_exps.weight"), E, ff, d);
+    auto down = std::make_shared<ExpertBank>(e, requireBlockTensor(e, L, "ffn_down_exps.weight"), E, d, ff);
+    auto loader = [gate, up, down](std::size_t ex, float* g, float* u, float* dn) {
+        gate->load(ex, g);
+        up->load(ex, u);
+        down->load(ex, dn);
+    };
+    return train::MoeBlock(cfg, std::move(w), std::move(loader));
+}
+
+/// The train block of layer L for the engine's architecture.
+std::unique_ptr<train::TrainBlock> loadBlock(Engine& e, std::size_t L) {
+    const std::string& arch = e.config().architecture;
+    if (arch == "llama" || arch == "qwen2") return std::make_unique<DenseBlock>(loadDenseBlock(e, L));
+    if (arch == "kolibri1") return std::make_unique<train::MoeBlock>(loadKolibriBlock(e, L));
+    throw std::runtime_error("the train ops support llama / qwen2 / kolibri1 blocks (model is '" + arch + "')");
+}
+
 std::vector<float> randn(std::size_t n, std::mt19937& rng, float sd) {
     std::normal_distribution<float> dist(0.0F, sd);
     std::vector<float> v(n);
@@ -127,7 +233,13 @@ const char* projName(DenseBlock::Proj p) {
     return "?";
 }
 
-const char* projTensor(DenseBlock::Proj p) {
+/// Engine tensor of a LoRA slot; on kolibri1 the MLP slots are the shared expert.
+const char* projTensor(const std::string& arch, DenseBlock::Proj p) {
+    if (arch == "kolibri1") {
+        if (p == DenseBlock::Proj::Gate) return "ffn_gate_shexp.weight";
+        if (p == DenseBlock::Proj::Up) return "ffn_up_shexp.weight";
+        if (p == DenseBlock::Proj::Down) return "ffn_down_shexp.weight";
+    }
     switch (p) {
         case DenseBlock::Proj::Q:    return "attn_q.weight";
         case DenseBlock::Proj::K:    return "attn_k.weight";
@@ -186,9 +298,7 @@ train::TrainModel& TrainTools::model() {
     _model.reset();
     Engine& e = _forward.engine();
     std::vector<std::unique_ptr<train::TrainBlock>> blocks;
-    for (std::size_t L = 0; L < e.config().blockCount; ++L) {
-        blocks.push_back(std::make_unique<DenseBlock>(loadDenseBlock(e, L)));
-    }
+    for (std::size_t L = 0; L < e.config().blockCount; ++L) blocks.push_back(loadBlock(e, L));
     train::TrainModel::Head head;
     head.embed     = globalTensor(e, "token_embd.weight", true);
     head.finalNorm = globalTensor(e, "output_norm.weight", true);
@@ -203,7 +313,7 @@ train::TrainModel& TrainTools::model() {
 void TrainTools::registerOn(McpServer& server) {
     server.addTool(
         "train_block_check",
-        "7.4.2 training-core check on real weights. Builds dense block 'block' (llama / qwen2; >= 1) "
+        "7.4.2 training-core check on real weights. Builds block 'block' (>= 1; dense llama / qwen2 or the kolibri1 MoE block, routed experts streamed per expert) "
         "from Hugin's train ops with the engine's dequantised weights, feeds it the engine's residual "
         "after block-1 for 'text', and compares the output with the engine's residual after 'block' "
         "(max abs / relative error). Then installs random LoRA adapters (rank 'lora_rank', default 4) "
@@ -233,8 +343,9 @@ void TrainTools::registerOn(McpServer& server) {
             const std::vector<float>& xin = probe.hidden.at(static_cast<std::uint32_t>(L - 1));
             const std::vector<float>& ref = probe.hidden.at(static_cast<std::uint32_t>(L));
 
-            DenseBlock blk = loadDenseBlock(e, L);
-            const std::size_t T = ids.size(), d = blk.config().dModel;
+            const auto blkPtr = loadBlock(e, L);
+            train::TrainBlock& blk = *blkPtr;
+            const std::size_t T = ids.size(), d = blk.dModel();
             std::vector<float> y(T * d);
             blk.forward(xin.data(), T, y.data());
             double maxAbs = 0, refMax = 0, sqErr = 0, sqRef = 0;
@@ -324,16 +435,27 @@ void TrainTools::registerOn(McpServer& server) {
             }
             const double secs =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            return json{{"block", L}, {"tokens", T}, {"arch", e.config().architecture},
-                        {"rope", blk.config().ropeLayout == train::RopeGrad::Layout::Interleaved ? "interleaved" : "split"},
-                        {"rope_factors", !blk.config().ropeFactors.empty()},
-                        {"forward_parity", parity}, {"gradient_checks", checks},
-                        {"all_gradients_ok", allOk}, {"seconds", secs}};
+            json out{{"block", L}, {"tokens", T}, {"arch", e.config().architecture},
+                     {"forward_parity", parity}, {"gradient_checks", checks},
+                     {"all_gradients_ok", allOk}, {"seconds", secs}};
+            if (const auto* db = dynamic_cast<const DenseBlock*>(&blk)) {
+                out["rope"] = db->config().ropeLayout == train::RopeGrad::Layout::Interleaved ? "interleaved" : "split";
+                out["rope_factors"] = !db->config().ropeFactors.empty();
+            }
+            if (const auto* mb = dynamic_cast<const train::MoeBlock*>(&blk)) {
+                const auto& sel = mb->lastSelection();
+                std::vector<std::int32_t> used(sel.begin(), sel.end());
+                std::sort(used.begin(), used.end());
+                used.erase(std::unique(used.begin(), used.end()), used.end());
+                out["sliding"] = mb->config().sliding;
+                out["experts_used"] = used.size();
+            }
+            return out;
         });
 
     server.addTool(
         "train_lora_sft",
-        "7.4.3 LoRA-SFT of the whole dense model (llama / qwen2) on CPU train ops; the base stays "
+        "7.4.3 LoRA-SFT of the whole model (llama / qwen2; kolibri1 since 7.4.4 with the MLP slots on the shared expert) on CPU train ops; the base stays "
         "frozen, only adapters learn. Data: 'items' or 'path' (.json / .jsonl) of {prompt, response} "
         "or {prompt, teacher_prompt}: with teacher_prompt the response is the BASE model's greedy "
         "answer to teacher_prompt (self-distillation, e.g. the same question asked in German), ended "
@@ -677,7 +799,7 @@ void TrainTools::registerOn(McpServer& server) {
             std::vector<RuneStaging::LowRankSpec> specs;
             for (const auto& s : slots) {
                 const auto* l2 = m.block(s.block).lora(s.proj);
-                specs.push_back({"blk." + std::to_string(s.block) + "." + projTensor(s.proj),
+                specs.push_back({"blk." + std::to_string(s.block) + "." + projTensor(e.config().architecture, s.proj),
                                  static_cast<std::uint32_t>(rank), static_cast<double>(scale), l2->a, l2->b});
             }
             std::size_t respTok = 0;

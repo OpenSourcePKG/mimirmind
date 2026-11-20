@@ -116,6 +116,11 @@ void Kolibri1Backend::runBlock(std::size_t   blockIdx,
         _gmm.matmulAsync(kW.type, kW.usmPtr, kvDim, d_model, normBuf, T, kSlot, scratch);
         _gmm.matmulAsync(vW.type, vW.usmPtr, kvDim, d_model, normBuf, T, vSlot, scratch);
     }
+    // 7.4.4 Rune LowRank overlays (no-op without a lowrank rune); K/V land in
+    // the F32 cache slot before the QK-norm, like the base projection.
+    applyLowRank(L, "attn_q.weight", normBuf, T, qBuf, scratch);
+    applyLowRank(L, "attn_k.weight", normBuf, T, kSlot, scratch);
+    applyLowRank(L, "attn_v.weight", normBuf, T, vSlot, scratch);
 
     // Per-head QK-RMSNorm (V passes through un-normed), writing the normed
     // K/V back into the cache at row curLen. Q normed in place in qBuf.
@@ -165,6 +170,7 @@ void Kolibri1Backend::runBlock(std::size_t   blockIdx,
 
     // Output projection, post-attn norm, residual add.
     _gmm.matmulAsync(oW.type, oW.usmPtr, d_model, qDim, attnOut, T, projOut, scratch);
+    applyLowRank(L, "attn_output.weight", attnOut, T, projOut, scratch);
     _ops.rmsNormAsync(projOut, T, d_model,
                       static_cast<const float*>(postAttn.usmPtr), eps, projOut);
     dumpStage("attn_out", L, projOut, T, d_model);
@@ -239,6 +245,7 @@ void Kolibri1Backend::runBlockBatched(std::size_t               blockIdx,
     _ops.rmsNormAsync(x, nSeq, d_model,
                       static_cast<const float*>(attnNorm.usmPtr), eps, normBuf);
     _gmm.matmulAsync(qW.type, qW.usmPtr, qDim, d_model, normBuf, nSeq, qBuf, scratch);
+    applyLowRank(L, "attn_q.weight", normBuf, nSeq, qBuf, scratch);
 
     // --- per-sequence K/V proj + fused QK-norm + RoPE + attention -------
     // Byte-identical to the single-session runBlock attention (T=1) per slot,
@@ -262,6 +269,8 @@ void Kolibri1Backend::runBlockBatched(std::size_t               blockIdx,
             _gmm.matmulAsync(kW.type, kW.usmPtr, kvDim, d_model, xRow, 1, kSlot, scratch);
             _gmm.matmulAsync(vW.type, vW.usmPtr, kvDim, d_model, xRow, 1, vSlot, scratch);
         }
+        applyLowRank(L, "attn_k.weight", xRow, 1, kSlot, scratch);
+        applyLowRank(L, "attn_v.weight", xRow, 1, vSlot, scratch);
         // Per-head QK-RMSNorm (Q in qRow, K written back into the cache at
         // curLen; V passes through), the same fused op the single-session path
         // uses.
@@ -288,6 +297,7 @@ void Kolibri1Backend::runBlockBatched(std::size_t               blockIdx,
 
     // --- batched O proj + post-attn norm + residual ---------------------
     _gmm.matmulAsync(oW.type, oW.usmPtr, d_model, qDim, attnOut, nSeq, projOut, scratch);
+    applyLowRank(L, "attn_output.weight", attnOut, nSeq, projOut, scratch);
     _ops.rmsNormAsync(projOut, nSeq, d_model,
                       static_cast<const float*>(postAttn.usmPtr), eps, projOut);
     _ops.addResidualAsync(x, projOut, nSeq * d_model);
@@ -453,8 +463,11 @@ void Kolibri1Backend::runKolibriMoe(std::size_t blockIdx, const float* din,
     const auto& dSh = requireBlk(_weights, blockIdx, "ffn_down_shexp.weight");
     _gmm.matmulAsync(gSh.type, gSh.usmPtr, nFfShexp, d_model, din, T, gateOut, scratch);
     _gmm.matmulAsync(uSh.type, uSh.usmPtr, nFfShexp, d_model, din, T, upOut,   scratch);
+    applyLowRank(blockIdx, "ffn_gate_shexp.weight", din, T, gateOut, scratch);
+    applyLowRank(blockIdx, "ffn_up_shexp.weight", din, T, upOut, scratch);
     _ops.siluMulAsync(gateOut, upOut, T * nFfShexp);
     _gmm.matmulAsync(dSh.type, dSh.usmPtr, d_model, nFfShexp, gateOut, T, expertOut, scratch);
+    applyLowRank(blockIdx, "ffn_down_shexp.weight", gateOut, T, expertOut, scratch);
     _ops.addResidualAsync(moeAccum, expertOut, T * d_model);
 }
 

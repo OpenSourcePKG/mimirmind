@@ -153,6 +153,10 @@ void ArchBackend::setLowRanks(compute::ComputeOps& ops, compute::ComputeMatmul& 
             throw std::runtime_error("setLowRanks: incomplete overlay on block " +
                                      std::to_string(o.block) + " '" + o.tensor + "'");
         }
+        if (!supportsLowRankOn(o.tensor)) {
+            throw std::runtime_error(std::string("setLowRanks: backend '") + name() +
+                                     "' applies no lowrank overlay on '" + o.tensor + "'");
+        }
         if (_lrByBlock.size() <= o.block) {
             _lrByBlock.resize(o.block + 1);
         }

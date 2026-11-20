@@ -85,6 +85,16 @@ public:
         return "kolibri1";
     }
 
+    /// 7.4.4: Rune LowRank overlays on the attention projections and the
+    /// always-on shared expert (runBlock, runBlockBatched, runKolibriMoe).
+    /// Routed experts and the router take none.
+    [[nodiscard]] bool supportsLowRank() const noexcept override { return true; }
+    [[nodiscard]] bool supportsLowRankOn(std::string_view tensor) const noexcept override {
+        return tensor == "attn_q.weight" || tensor == "attn_k.weight" || tensor == "attn_v.weight" ||
+               tensor == "attn_output.weight" || tensor == "ffn_gate_shexp.weight" ||
+               tensor == "ffn_up_shexp.weight" || tensor == "ffn_down_shexp.weight";
+    }
+
     /// Enable per-stage parity dumps (`<prefix>-blk{N}-<stage>.bin`), for
     /// layer-parity against the aleph-alpha-inference vLLM oracle (I-4/I-5
     /// acceptance). Empty prefix = disabled.

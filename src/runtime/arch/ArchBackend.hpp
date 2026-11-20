@@ -343,9 +343,16 @@ public:
         const float* a{nullptr};
         const float* b{nullptr};
     };
-    /// True for backends whose block code calls applyLowRank at every
-    /// projection; the engine refuses lowrank runes otherwise.
+    /// True for backends whose block code calls applyLowRank; the engine
+    /// refuses lowrank runes otherwise.
     [[nodiscard]] virtual bool supportsLowRank() const noexcept { return false; }
+    /// True iff the block code calls applyLowRank for `tensor` (e.g.
+    /// "attn_q.weight"); setLowRanks refuses every other target, so a rune
+    /// can never be a silent no-op.
+    [[nodiscard]] virtual bool supportsLowRankOn(std::string_view tensor) const noexcept {
+        (void)tensor;
+        return false;
+    }
     void setLowRanks(compute::ComputeOps& ops, compute::ComputeMatmul& gmm,
                      std::vector<LowRankOverlay> overlays);
     [[nodiscard]] bool hasLowRanks() const noexcept { return _lrOps != nullptr; }

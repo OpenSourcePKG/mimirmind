@@ -1877,6 +1877,7 @@ add_library(mimirmind_hugin OBJECT
     src/hugin/ForwardTools.cpp
     src/hugin/GenerationCheck.cpp
     src/hugin/InspectTools.cpp
+    src/hugin/HostDequant.cpp
     src/hugin/LogitMath.cpp
     src/hugin/McpServer.cpp
     src/hugin/ModelView.cpp

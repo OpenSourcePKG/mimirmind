@@ -51,6 +51,11 @@ public:
     [[nodiscard]] const char* name()            const noexcept override { return "qwen2"; }
     /// 7.4.3: runBlock applies Rune LowRank overlays at every projection.
     [[nodiscard]] bool supportsLowRank() const noexcept override { return true; }
+    [[nodiscard]] bool supportsLowRankOn(std::string_view tensor) const noexcept override {
+        return tensor == "attn_q.weight" || tensor == "attn_k.weight" || tensor == "attn_v.weight" ||
+               tensor == "attn_output.weight" || tensor == "ffn_gate.weight" ||
+               tensor == "ffn_up.weight" || tensor == "ffn_down.weight";
+    }
 
     [[nodiscard]] std::vector<std::size_t>
         kvDimPerLayer() const override;

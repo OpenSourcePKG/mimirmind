@@ -5,10 +5,12 @@
 
 #include "TestFramework.hpp"
 
+#include "core/rune/RuneApplier.hpp"
 #include "core/rune/RuneFile.hpp"
 #include "core/rune/RuneFormat.hpp"
 #include "hugin/ForwardTools.hpp"
 #include "hugin/GenerationCheck.hpp"
+#include "hugin/HostDequant.hpp"
 #include "hugin/RuneStaging.hpp"
 #include "hugin/SurgeryTools.hpp"
 #include "hugin/InspectTools.hpp"
@@ -19,6 +21,8 @@
 #include "compute/IRuneSteerOps.hpp"
 #include "compute/cpu/GpuOps.hpp"
 #include "core/cpu/CpuContext.hpp"
+#include "core/modelopt/BlockScaleSwizzle.hpp"
+#include "core/modelopt/NvFp4Reference.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -624,6 +628,60 @@ TEST(tpe_minimises_quadratic_better_than_random) {
         a.tell(pa, {f(pa)}, true);
         b.tell(pb, {f(pb)}, true);
     }
+}
+
+TEST(host_dequant_engine_formats_match_nvfp4_reference) {
+    namespace mo = mimirmind::core::modelopt;
+    // A [rows, in] NVFP4 weight in ModelOpt form: nibbles, row-major E4M3 scales, global.
+    const std::size_t rows = 130, in = 96;   // rows > 128 and ksf % 4 != 0: padding of the swizzle
+    std::vector<std::uint8_t> packed(rows * in / 2), scales(rows * in / 16);
+    std::uint32_t st = 12345;
+    const auto next = [&st] { st = st * 1664525U + 1013904223U; return st >> 8; };
+    for (auto& b : packed) b = static_cast<std::uint8_t>(next());
+    for (auto& b : scales) b = static_cast<std::uint8_t>(0x30 + next() % 0x30);   // finite, positive
+    const float global = 0.0375F;
+    std::vector<float> ref(rows * in), got(rows * in);
+    mo::dequantNvfp4(packed.data(), scales.data(), global, rows, in, ref.data());
+
+    // NVFP4_TC: same nibbles, swizzled scale slot, global.
+    std::vector<std::uint8_t> sw(mo::swizzledBlockScaleBytes(rows, in / 16));
+    mo::swizzleBlockScale(scales.data(), rows, in / 16, sw.data());
+    hg::HostDequant::nvfp4TcToF32(packed.data(), sw.data(), global, rows, in, got.data());
+    for (std::size_t i = 0; i < ref.size(); ++i) EXPECT_TRUE(got[i] == ref[i]);
+
+    // NVFP4_BLK: [fp16 global*s0][fp16 global*s1][16 nibble bytes] per 32 (repackage_nvfp4_to_blk).
+    std::vector<std::uint8_t> blk(rows * in / 32 * 20);
+    for (std::size_t r = 0; r < rows; ++r) {
+        for (std::size_t sb = 0; sb < in / 32; ++sb) {
+            std::uint8_t* p = blk.data() + (r * (in / 32) + sb) * 20;
+            for (std::size_t h = 0; h < 2; ++h) {
+                const float sc = global * mo::e4m3ToFloat(scales[r * (in / 16) + sb * 2 + h]);
+                const std::uint16_t f16 = mimirmind::core::rune::floatToHalfBits(sc);
+                std::memcpy(p + 2 * h, &f16, 2);
+            }
+            std::memcpy(p + 4, packed.data() + r * (in / 2) + sb * 16, 16);
+        }
+    }
+    hg::HostDequant::toF32(mimirmind::core::gguf::GgmlType::NVFP4_BLK, blk.data(), rows * in, got.data());
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        EXPECT_NEAR(got[i], ref[i], 1e-3F * std::fabs(ref[i]) + 1e-6F);   // fp16 scale rounding
+    }
+
+    // FP8_E4M3: [fp16 scale][32 E4M3] per block.
+    std::vector<std::uint8_t> fp8(2 * 34);
+    std::vector<float> fref(64), fgot(64);
+    for (std::size_t b = 0; b < 2; ++b) {
+        const float sc = b == 0 ? 0.5F : 0.0078125F;   // exact in fp16
+        const std::uint16_t f16 = mimirmind::core::rune::floatToHalfBits(sc);
+        std::memcpy(fp8.data() + b * 34, &f16, 2);
+        for (std::size_t i = 0; i < 32; ++i) {
+            const auto q = static_cast<std::uint8_t>(next() % 0x7E);   // no NaN
+            fp8[b * 34 + 2 + i] = q;
+            fref[b * 32 + i] = sc * mo::e4m3ToFloat(q);
+        }
+    }
+    hg::HostDequant::toF32(mimirmind::core::gguf::GgmlType::FP8_E4M3, fp8.data(), 64, fgot.data());
+    for (std::size_t i = 0; i < 64; ++i) EXPECT_TRUE(fgot[i] == fref[i]);
 }
 
 int main() {
