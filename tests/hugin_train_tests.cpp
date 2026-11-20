@@ -14,6 +14,7 @@
 #include "hugin/train/CrossEntropyGrad.hpp"
 #include "hugin/train/DenseBlock.hpp"
 #include "hugin/train/DenseModel.hpp"
+#include "hugin/train/KlDivGrad.hpp"
 #include "hugin/train/Parallel.hpp"
 #include "hugin/train/LinearGrad.hpp"
 #include "hugin/train/MoeCombineGrad.hpp"
@@ -212,6 +213,33 @@ TEST(cross_entropy_gradient_and_ignore) {
     EXPECT_TRUE(CrossEntropyGrad::lossAndGrad(logits.data(), none.data(), T, V, d.data()) == 0.0);
 }
 
+TEST(kl_div_topk_tail_gradient_and_zero_at_reference) {
+    const std::size_t V = 13, K = 4;
+    auto ref = randn(V, 71, 2.0F);
+    std::vector<std::int32_t> ids(K);
+    std::vector<float> p(K);
+    float tail = 0;
+    KlDivGrad::topK(ref.data(), V, K, ids.data(), p.data(), tail);
+    EXPECT_TRUE(p[0] >= p[1] && p[1] >= p[2] && p[2] >= p[3]);
+    double mass = static_cast<double>(tail);
+    for (const float x : p) mass += static_cast<double>(x);
+    EXPECT_TRUE(std::fabs(mass - 1.0) < 1e-6);
+    // At the reference itself: KL = 0 and the gradient vanishes.
+    std::vector<float> d0(V, 0.0F);
+    EXPECT_TRUE(std::fabs(KlDivGrad::rowLossAndGrad(ref.data(), V, K, ids.data(), p.data(), tail, 1.0F, d0.data())) < 1e-6);
+    for (const float g : d0) EXPECT_NEAR(g, 0.0F, 1e-6F);
+    // Elsewhere: KL > 0, analytic gradient (added, weighted) vs central differences.
+    auto z = randn(V, 72, 2.0F);
+    std::vector<float> d(V, 0.0F);
+    const float w = 0.7F;
+    EXPECT_TRUE(KlDivGrad::rowLossAndGrad(z.data(), V, K, ids.data(), p.data(), tail, w, d.data()) > 0.0);
+    auto fwd = [&] {
+        return static_cast<double>(w) *
+               KlDivGrad::rowLossAndGrad(z.data(), V, K, ids.data(), p.data(), tail, w, nullptr);
+    };
+    checkGrad("dLogits", z, d, fwd);
+}
+
 TEST(adamw_matches_hand_computed_steps) {
     AdamW::Config cfg{0.1F, 0.9F, 0.999F, 1e-8F, 0.01F};
     AdamW opt(2, cfg);
@@ -402,6 +430,48 @@ TEST(dense_model_sft_gradients_through_ce) {
     for (std::size_t v = 0; v < 11; ++v) {
         EXPECT_NEAR(part[v], all[2 * 11 + v], 1e-6F);
         EXPECT_NEAR(part[11 + v], all[5 * 11 + v], 1e-6F);
+    }
+}
+
+TEST(dense_model_kl_anchor_gradients) {
+    // CE on some rows + KL to an anchor taken from the model before the
+    // adapters moved (rows overlapping and anchor-only); FD over the total.
+    std::uint32_t seed = 500;
+    std::vector<DenseBlock> blocks;
+    for (int i = 0; i < 2; ++i) blocks.push_back(tinyBlock(seed));
+    DenseModel::Head head;
+    head.vocab = 11;
+    head.embed = randn(11 * 8, seed++);
+    head.finalNorm = randn(8, seed++);
+    DenseModel m(std::move(blocks), std::move(head));   // tied head
+    using P = DenseBlock::Proj;
+    const std::vector<std::int32_t> ids{1, 4, 7, 2, 9, 3};
+    const std::vector<std::int32_t> tgt{-1, -1, -1, 9, 3, 10};
+    const std::vector<std::size_t> arow{1, 2, 4};
+    for (const P p : {P::K, P::O, P::Up}) {
+        const auto [in, out] = m.block(1).projShape(p);
+        m.block(1).setLora(p, 2, 0.5F, randn(2 * in, seed++, 0.3F), std::vector<float>(out * 2, 0.0F));
+    }
+    const auto anc = m.anchor(ids, arow, 5);
+    // B = 0: the model IS the anchor, KL = 0.
+    m.zeroGrad();
+    EXPECT_TRUE(std::fabs(m.lossAndGrad(ids, tgt, &anc, 1.0).kl) < 1e-6);
+    for (const P p : {P::K, P::O, P::Up}) {
+        m.block(1).lora(p)->b = randn(m.block(1).lora(p)->b.size(), seed++, 0.3F);
+    }
+    const double lambda = 0.8;
+    m.zeroGrad();
+    const auto l = m.lossAndGrad(ids, tgt, &anc, lambda);
+    EXPECT_TRUE(l.kl > 0.0 && l.ce > 0.0 && l.ceRows == 3 && l.klRows == 3);
+    std::vector<std::pair<std::vector<float>, std::vector<float>>> grads;
+    for (const P p : {P::K, P::O, P::Up}) grads.emplace_back(m.block(1).lora(p)->dA, m.block(1).lora(p)->dB);
+    auto fwd = [&] { return m.lossAndGrad(ids, tgt, &anc, lambda).total(lambda); };
+    std::size_t gi = 0;
+    for (const P p : {P::K, P::O, P::Up}) {
+        auto* lr = m.block(1).lora(p);
+        checkGrad("kl model dA", lr->a, grads[gi].first, fwd, 3e-3);
+        checkGrad("kl model dB", lr->b, grads[gi].second, fwd, 3e-3);
+        ++gi;
     }
 }
 

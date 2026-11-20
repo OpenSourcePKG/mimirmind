@@ -24,6 +24,7 @@
 #include <functional>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -338,7 +339,11 @@ void TrainTools::registerOn(McpServer& server) {
         "the response tokens only. Adapters: 'targets' (default q k v o gate up down) on 'blocks' "
         "(default all), 'rank' (8), 'alpha' (16; scale alpha/rank), B = 0 at start. AdamW 'lr' "
         "(5e-4), 'epochs' (2), 'batch' (4, gradient accumulation), global grad-norm clip 'clip' "
-        "(1.0), 'seed'. The result is staged as a LowRank Rune 'name' (then rune_gate / rune_commit "
+        "(1.0), 'seed'. 7.4.5 KL anchor: 'kl_lambda' > 0 adds lambda * KL(base || adapted) on the "
+        "response rows of every item whose kind is in 'kl_kinds' (default: every kind except "
+        "'target'); the base distribution is cached before training as its top 'kl_topk' (64) tokens "
+        "plus one tail bucket. Those items then train on the KL only, plus their CE with 'kl_ce'. "
+        "The result is staged as a LowRank Rune 'name' (then rune_gate / rune_commit "
         "as usual), and the trainer's logits are compared with the engine running that Rune "
         "(Futhark load path) on the first example.",
         schema({{"name", {{"type", "string"}}},
@@ -357,6 +362,10 @@ void TrainTools::registerOn(McpServer& server) {
                 {"max_teacher_tokens", {{"type", "integer"}}},
                 {"seed", {{"type", "integer"}}},
                 {"threads", {{"type", "integer"}}},
+                {"kl_lambda", {{"type", "number"}}},
+                {"kl_topk", {{"type", "integer"}}},
+                {"kl_kinds", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"kl_ce", {{"type", "boolean"}}},
                 {"note", {{"type", "string"}}}},
                {"name"}),
         [this](const json& a) {
@@ -441,6 +450,41 @@ void TrainTools::registerOn(McpServer& server) {
             // 2. Model + fresh adapters.
             train::DenseModel& m = model();
             for (std::size_t b = 0; b < m.blockCount(); ++b) m.block(b).clearLora();
+
+            // 7.4.5 KL anchor: the base distribution (no adapters yet) on the
+            // response rows of every item whose kind is in 'kl_kinds', top-K sparse.
+            const double klLambda = a.value("kl_lambda", 0.0);
+            const auto   klTopK   = a.value("kl_topk", std::size_t{64});
+            const bool   klCe     = a.value("kl_ce", false);
+            std::vector<std::string> klKinds;
+            if (a.contains("kl_kinds")) {
+                for (const auto& k : a["kl_kinds"]) klKinds.push_back(k.get<std::string>());
+            }
+            const auto anchored = [&](const SftExample& ex) {
+                if (klLambda <= 0.0) return false;
+                if (klKinds.empty()) return ex.kind != "target";
+                return std::find(klKinds.begin(), klKinds.end(), ex.kind) != klKinds.end();
+            };
+            std::vector<std::optional<train::DenseModel::Anchor>> anchors(data.size());
+            std::size_t anchorItems = 0, anchorRows = 0;
+            double anchorTail = 0;
+            for (std::size_t i = 0; i < data.size(); ++i) {
+                if (!anchored(data[i])) continue;
+                std::vector<std::size_t> rows;
+                for (std::size_t t = 0; t < data[i].targets.size(); ++t) {
+                    if (data[i].targets[t] >= 0) rows.push_back(t);
+                }
+                anchors[i] = m.anchor(data[i].ids, rows, klTopK);
+                ++anchorItems;
+                anchorRows += rows.size();
+                for (const float tl : anchors[i]->tail) anchorTail += static_cast<double>(tl);
+            }
+            if (klLambda > 0.0) {
+                if (anchorItems == 0) throw std::runtime_error("kl_lambda > 0 but no item matches kl_kinds");
+                std::cerr << "hugin train_lora_sft: KL anchor on " << anchorItems << " items / " << anchorRows
+                          << " rows, top-" << klTopK << " mean tail mass "
+                          << anchorTail / static_cast<double>(anchorRows) << " (" << elapsed() << " s)\n";
+            }
             std::vector<DenseBlock::Proj> projs;
             if (a.contains("targets")) {
                 for (const auto& s : a["targets"]) projs.push_back(projArg(s.get<std::string>()));
@@ -488,17 +532,35 @@ void TrainTools::registerOn(McpServer& server) {
             const float clip  = a.value("clip", 1.0F);
             std::vector<std::size_t> order(data.size());
             std::iota(order.begin(), order.end(), std::size_t{0});
-            json epochLoss = json::array(), stepLoss = json::array();
+            json epochLoss = json::array(), stepLoss = json::array(), epochCe = json::array(),
+                 epochKl = json::array();
             std::size_t steps = 0;
             m.zeroGrad();
             for (std::size_t ep = 0; ep < epochs; ++ep) {
                 std::shuffle(order.begin(), order.end(), rng);
-                double sum = 0;
+                double sum = 0, ceSum = 0, klSum = 0;
+                std::size_t ceN = 0, klN = 0;
                 double batchSum = 0;
                 std::size_t inBatch = 0;
                 for (std::size_t i = 0; i < order.size(); ++i) {
                     const SftExample& ex = data[order[i]];
-                    const double l = m.lossAndGrad(ex.ids, ex.targets);
+                    double l = 0;
+                    if (const auto& anc = anchors[order[i]]; anc) {
+                        // Anchor items: KL to the base (+ CE only with kl_ce).
+                        const std::vector<std::int32_t> none(ex.targets.size(), -1);
+                        const auto r = m.lossAndGrad(ex.ids, klCe ? ex.targets : none, &*anc, klLambda);
+                        l = r.total(klLambda);
+                        klSum += r.kl;
+                        ++klN;
+                        if (klCe) {
+                            ceSum += r.ce;
+                            ++ceN;
+                        }
+                    } else {
+                        l = m.lossAndGrad(ex.ids, ex.targets);
+                        ceSum += l;
+                        ++ceN;
+                    }
                     sum += l;
                     batchSum += l;
                     ++inBatch;
@@ -535,6 +597,8 @@ void TrainTools::registerOn(McpServer& server) {
                     }
                 }
                 epochLoss.push_back(sum / static_cast<double>(order.size()));
+                epochCe.push_back(ceN > 0 ? ceSum / static_cast<double>(ceN) : 0.0);
+                epochKl.push_back(klN > 0 ? klSum / static_cast<double>(klN) : 0.0);
             }
 
             // 4. Stage as a LowRank rune.
@@ -553,8 +617,13 @@ void TrainTools::registerOn(McpServer& server) {
                         {"targets", tnames}, {"blocks", blocks},
                         {"rank", rank}, {"alpha", alpha}, {"lr", oc.lr}, {"epochs", epochs},
                         {"batch", batch}, {"clip", clip}, {"seed", a.value("seed", 7403U)},
-                        {"epoch_loss", epochLoss}, {"steps", steps},
+                        {"epoch_loss", epochLoss}, {"epoch_ce", epochCe}, {"steps", steps},
                         {"note", a.value("note", std::string{})}};
+            if (klLambda > 0.0) {
+                params["kl"] = {{"lambda", klLambda}, {"topk", klTopK}, {"ce_on_anchors", klCe},
+                                {"anchor_items", anchorItems}, {"anchor_rows", anchorRows},
+                                {"epoch_kl", epochKl}};
+            }
             if (a.contains("path")) params["data_path"] = a["path"];
             json staged = _staging.stageLowRank(name, specs, params);
 
@@ -587,7 +656,14 @@ void TrainTools::registerOn(McpServer& server) {
             for (std::size_t i = 0; i < std::min<std::size_t>(3, data.size()); ++i) {
                 samples.push_back({{"prompt_tokens", data[i].promptTokens}, {"response", data[i].response}});
             }
-            return json{{"staged", staged}, {"epoch_loss", epochLoss},
+            json klInfo;
+            if (klLambda > 0.0) {
+                klInfo = {{"lambda", klLambda}, {"topk", klTopK}, {"ce_on_anchors", klCe},
+                          {"anchor_items", anchorItems}, {"anchor_rows", anchorRows},
+                          {"mean_tail_mass", anchorTail / static_cast<double>(anchorRows)},
+                          {"epoch_kl", epochKl}};
+            }
+            return json{{"staged", staged}, {"epoch_loss", epochLoss}, {"epoch_ce", epochCe}, {"kl", klInfo},
                         {"first_step_loss", stepLoss.empty() ? json() : stepLoss.front()["loss"]},
                         {"last_step_loss", stepLoss.empty() ? json() : stepLoss.back()["loss"]},
                         {"steps", steps}, {"adapters", slots.size()},

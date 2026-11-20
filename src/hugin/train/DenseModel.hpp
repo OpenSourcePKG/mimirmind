@@ -51,6 +51,31 @@ public:
     /// position t); LoRA gradients accumulated. Returns 0 when nothing counts.
     double lossAndGrad(std::span<const std::int32_t> ids, std::span<const std::int32_t> targets);
 
+    /// 7.4.5: a frozen reference distribution on some rows of one sequence,
+    /// top-K sparse (KlDivGrad), taken from the model as it is now (B = 0
+    /// adapters = the base).
+    struct Anchor {
+        std::vector<std::size_t>  rows;
+        std::size_t               k{0};
+        std::vector<std::int32_t> ids;    ///< [rows, k]
+        std::vector<float>        p;      ///< [rows, k]
+        std::vector<float>        tail;   ///< [rows]
+    };
+    [[nodiscard]] Anchor anchor(std::span<const std::int32_t> ids, std::span<const std::size_t> rows,
+                                std::size_t k) const;
+
+    struct Loss {
+        double      ce{0};      ///< mean CE over the target rows
+        double      kl{0};      ///< mean KL(anchor || model) over the anchor rows
+        std::size_t ceRows{0};
+        std::size_t klRows{0};
+        [[nodiscard]] double total(double klWeight) const { return ce + klWeight * kl; }
+    };
+    /// Gradient of ce + klWeight * kl (either part may be absent): one forward,
+    /// the lm_head on the union of both row sets.
+    Loss lossAndGrad(std::span<const std::int32_t> ids, std::span<const std::int32_t> targets,
+                     const Anchor* anchor, double klWeight);
+
     void zeroGrad();
 
 private:

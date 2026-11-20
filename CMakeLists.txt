@@ -1891,6 +1891,7 @@ add_library(mimirmind_hugin OBJECT
     src/hugin/train/CrossEntropyGrad.cpp
     src/hugin/train/DenseBlock.cpp
     src/hugin/train/DenseModel.cpp
+    src/hugin/train/KlDivGrad.cpp
     src/hugin/train/LinearGrad.cpp
     src/hugin/train/MoeCombineGrad.cpp
     src/hugin/train/Parallel.cpp

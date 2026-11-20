@@ -4,6 +4,7 @@
 #include "hugin/train/DenseModel.hpp"
 
 #include "hugin/train/CrossEntropyGrad.hpp"
+#include "hugin/train/KlDivGrad.hpp"
 #include "hugin/train/LinearGrad.hpp"
 #include "hugin/train/RmsNormGrad.hpp"
 
@@ -60,17 +61,64 @@ std::vector<float> DenseModel::logits(std::span<const std::int32_t> ids,
 }
 
 double DenseModel::lossAndGrad(std::span<const std::int32_t> ids, std::span<const std::int32_t> targets) {
+    return lossAndGrad(ids, targets, nullptr, 0.0).ce;
+}
+
+DenseModel::Anchor DenseModel::anchor(std::span<const std::int32_t> ids, std::span<const std::size_t> rows,
+                                      std::size_t k) const {
+    if (rows.empty()) throw std::runtime_error("DenseModel: anchor needs rows");
+    Anchor a;
+    a.rows.assign(rows.begin(), rows.end());
+    a.k = k;
+    a.ids.resize(rows.size() * k);
+    a.p.resize(rows.size() * k);
+    a.tail.resize(rows.size());
+    const auto lg = logits(ids, rows);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        KlDivGrad::topK(lg.data() + i * _head.vocab, _head.vocab, k, a.ids.data() + i * k, a.p.data() + i * k,
+                        a.tail[i]);
+    }
+    return a;
+}
+
+DenseModel::Loss DenseModel::lossAndGrad(std::span<const std::int32_t> ids, std::span<const std::int32_t> targets,
+                                         const Anchor* anchor, double klWeight) {
     const std::size_t T = ids.size();
     if (targets.size() != T) throw std::runtime_error("DenseModel: targets must match ids");
-    std::vector<std::size_t> rows;
-    std::vector<std::int32_t> tgt;
+    // Union of CE rows and anchor rows; tgt = -1 on anchor-only rows.
+    std::vector<std::int32_t> rowTarget(T, -1);
+    std::vector<char> used(T, 0);
+    Loss out;
     for (std::size_t t = 0; t < T; ++t) {
         if (targets[t] >= 0) {
-            rows.push_back(t);
-            tgt.push_back(targets[t]);
+            used[t] = 1;
+            rowTarget[t] = targets[t];
+            ++out.ceRows;
         }
     }
-    if (rows.empty()) return 0.0;
+    const bool withKl = anchor != nullptr && klWeight != 0.0 && !anchor->rows.empty();
+    if (withKl) {
+        if (anchor->ids.size() != anchor->rows.size() * anchor->k || anchor->p.size() != anchor->ids.size() ||
+            anchor->tail.size() != anchor->rows.size()) {
+            throw std::runtime_error("DenseModel: malformed anchor");
+        }
+        for (const auto r : anchor->rows) {
+            if (r >= T) throw std::runtime_error("DenseModel: anchor row out of range");
+            used[r] = 1;
+        }
+        out.klRows = anchor->rows.size();
+    }
+    std::vector<std::size_t> rows;
+    std::vector<std::int32_t> tgt;
+    std::vector<std::size_t> slot(T, 0);   // sequence row -> union index
+    for (std::size_t t = 0; t < T; ++t) {
+        if (used[t] != 0) {
+            slot[t] = rows.size();
+            rows.push_back(t);
+            tgt.push_back(rowTarget[t]);
+        }
+    }
+    if (rows.empty()) return out;
 
     // Lowest block with an adapter: backward stops there.
     std::size_t lowest = _blocks.size();
@@ -94,7 +142,7 @@ double DenseModel::lossAndGrad(std::span<const std::int32_t> ids, std::span<cons
         x.swap(y);
     }
 
-    // Head on the target rows only.
+    // Head on the used rows only.
     const std::size_t R = rows.size(), V = _head.vocab;
     std::vector<float> xr(R * _d), n(R * _d), lg(R * V), dLg(R * V);
     for (std::size_t i = 0; i < R; ++i) {
@@ -103,8 +151,19 @@ double DenseModel::lossAndGrad(std::span<const std::int32_t> ids, std::span<cons
     }
     RmsNormGrad::forward(xr.data(), R, _d, _head.finalNorm.data(), _head.eps, n.data());
     LinearGrad::forward(n.data(), R, _d, lmHead().data(), V, nullptr, lg.data());
-    const double loss = CrossEntropyGrad::lossAndGrad(lg.data(), tgt.data(), R, V, dLg.data());
-    if (lowest == _blocks.size()) return loss;   // no adapters: loss only
+    out.ce = CrossEntropyGrad::lossAndGrad(lg.data(), tgt.data(), R, V, dLg.data());
+    if (withKl) {
+        const auto  K = anchor->k;
+        const float w = static_cast<float>(klWeight / static_cast<double>(anchor->rows.size()));
+        double sum = 0;
+        for (std::size_t i = 0; i < anchor->rows.size(); ++i) {
+            const std::size_t u = slot[anchor->rows[i]];
+            sum += KlDivGrad::rowLossAndGrad(lg.data() + u * V, V, K, anchor->ids.data() + i * K,
+                                             anchor->p.data() + i * K, anchor->tail[i], w, dLg.data() + u * V);
+        }
+        out.kl = sum / static_cast<double>(anchor->rows.size());
+    }
+    if (lowest == _blocks.size()) return out;   // no adapters: loss only
 
     std::vector<float> dN(R * _d), dXr(R * _d);
     LinearGrad::backward(dLg.data(), n.data(), R, _d, lmHead().data(), V, nullptr, dN.data(), nullptr, nullptr);
@@ -118,7 +177,7 @@ double DenseModel::lossAndGrad(std::span<const std::int32_t> ids, std::span<cons
         _blocks[b].backward(inputs[b].data(), T, dx.data(), dPrev.data());
         dx.swap(dPrev);
     }
-    return loss;
+    return out;
 }
 
 void DenseModel::zeroGrad() {
