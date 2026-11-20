@@ -2,6 +2,7 @@
 // Copyright 2026 Stefan Werfling
 
 #include "hugin/train/MoeBlock.hpp"
+#include "hugin/train/Parallel.hpp"
 
 #include "hugin/train/AttentionGrad.hpp"
 #include "hugin/train/LinearGrad.hpp"
@@ -168,24 +169,39 @@ void MoeBlock::run(const float* x, std::size_t T, std::size_t startPos, Acts& a)
     loraLinear(Proj::Down, _w.shDown.data(), nullptr, a.sAct.data(), T, a.f.data());
 
     // Routed experts, one at a time over the rows that picked them.
+    // Experts run in parallel (each one is a few rows, too small to split
+    // inside); every expert writes its own result slice, merged afterwards in
+    // the fixed expert order, so the sum is the same as a serial loop.
     a.routedOut.assign(T * d, 0.0F);
-    std::vector<float> wg(ff * d), wu(ff * d), wd(d * ff);
-    for (const Use& u : uses(a.sel)) {
-        _experts(u.expert, wg.data(), wu.data(), wd.data());
-        std::vector<std::size_t> rows;
-        for (const auto p : u.pairs) rows.push_back(p / K);
-        const std::size_t R = rows.size();
-        std::vector<float> mr(R * d), g(R * ff), up(R * ff), act(R * ff), xe(R * d), tmp(d);
-        gather(a.m.data(), rows, d, mr.data());
-        LinearGrad::forward(mr.data(), R, d, wg.data(), ff, nullptr, g.data());
-        LinearGrad::forward(mr.data(), R, d, wu.data(), ff, nullptr, up.data());
-        SwiGluGrad::forward(g.data(), up.data(), R * ff, act.data());
-        LinearGrad::forward(act.data(), R, ff, wd.data(), d, nullptr, xe.data());
-        for (std::size_t i = 0; i < R; ++i) {
-            const float zi = a.z[rows[i] * E + u.expert];
-            MoeCombineGrad::forward(&zi, xe.data() + i * d, 1, d, 1.0F, tmp.data());
-            float* dst = a.routedOut.data() + rows[i] * d;
-            for (std::size_t j = 0; j < d; ++j) dst[j] += tmp[j];
+    const std::vector<Use> used = uses(a.sel);
+    std::vector<std::vector<float>> part(used.size());
+    Parallel::forRange(used.size(), 1, [&](std::size_t u0, std::size_t u1) {
+        std::vector<float> wg(ff * d), wu(ff * d), wd(d * ff);
+        for (std::size_t ui = u0; ui < u1; ++ui) {
+            const Use& u = used[ui];
+            _experts(u.expert, wg.data(), wu.data(), wd.data());
+            std::vector<std::size_t> rows;
+            for (const auto p : u.pairs) rows.push_back(p / K);
+            const std::size_t R = rows.size();
+            std::vector<float> mr(R * d), g(R * ff), up(R * ff), act(R * ff), xe(R * d);
+            gather(a.m.data(), rows, d, mr.data());
+            LinearGrad::forward(mr.data(), R, d, wg.data(), ff, nullptr, g.data());
+            LinearGrad::forward(mr.data(), R, d, wu.data(), ff, nullptr, up.data());
+            SwiGluGrad::forward(g.data(), up.data(), R * ff, act.data());
+            LinearGrad::forward(act.data(), R, ff, wd.data(), d, nullptr, xe.data());
+            part[ui].resize(R * d);
+            for (std::size_t i = 0; i < R; ++i) {
+                const float zi = a.z[rows[i] * E + u.expert];
+                MoeCombineGrad::forward(&zi, xe.data() + i * d, 1, d, 1.0F, part[ui].data() + i * d);
+            }
+        }
+    });
+    for (std::size_t ui = 0; ui < used.size(); ++ui) {
+        const auto& pairs = used[ui].pairs;
+        for (std::size_t i = 0; i < pairs.size(); ++i) {
+            float*       dst = a.routedOut.data() + (pairs[i] / K) * d;
+            const float* src = part[ui].data() + i * d;
+            for (std::size_t j = 0; j < d; ++j) dst[j] += src[j];
         }
     }
     for (std::size_t i = 0; i < T * d; ++i) a.f[i] += a.routedOut[i];
@@ -221,34 +237,47 @@ void MoeBlock::backward(const float* x, std::size_t T, const float* dy, float* d
 
     // Routed experts: f += sigmoid(z_e) E_e(m) per selected pair; gradient into
     // the selected router logits and through each expert into m.
+    // Parallel over experts like run(); a (token, expert) pair occurs once, so
+    // dZ entries are disjoint, and dM is merged afterwards in expert order.
     std::vector<float> dZ(T * E, 0.0F);
-    std::vector<float> wg(ff * d), wu(ff * d), wd(d * ff);
-    for (const Use& u : uses(a.sel)) {
-        _experts(u.expert, wg.data(), wu.data(), wd.data());
-        std::vector<std::size_t> rows;
-        for (const auto p : u.pairs) rows.push_back(p / K);
-        const std::size_t R = rows.size();
-        std::vector<float> mr(R * d), g(R * ff), up(R * ff), act(R * ff), xe(R * d);
-        gather(a.m.data(), rows, d, mr.data());
-        LinearGrad::forward(mr.data(), R, d, wg.data(), ff, nullptr, g.data());
-        LinearGrad::forward(mr.data(), R, d, wu.data(), ff, nullptr, up.data());
-        SwiGluGrad::forward(g.data(), up.data(), R * ff, act.data());
-        LinearGrad::forward(act.data(), R, ff, wd.data(), d, nullptr, xe.data());
-        std::vector<float> dXe(R * d), dAct(R * ff), dG(R * ff), dU(R * ff), dMr(R * d), dMr2(R * d);
-        for (std::size_t i = 0; i < R; ++i) {
-            const float zi = a.z[rows[i] * E + u.expert];
-            float dz = 0.0F;
-            MoeCombineGrad::backward(dF.data() + rows[i] * d, &zi, xe.data() + i * d, 1, d, 1.0F, &dz,
-                                     dXe.data() + i * d);
-            dZ[rows[i] * E + u.expert] += dz;
+    const std::vector<Use> used = uses(a.sel);
+    std::vector<std::vector<float>> part(used.size());
+    Parallel::forRange(used.size(), 1, [&](std::size_t u0, std::size_t u1) {
+        std::vector<float> wg(ff * d), wu(ff * d), wd(d * ff);
+        for (std::size_t ui = u0; ui < u1; ++ui) {
+            const Use& u = used[ui];
+            _experts(u.expert, wg.data(), wu.data(), wd.data());
+            std::vector<std::size_t> rows;
+            for (const auto p : u.pairs) rows.push_back(p / K);
+            const std::size_t R = rows.size();
+            std::vector<float> mr(R * d), g(R * ff), up(R * ff), act(R * ff), xe(R * d);
+            gather(a.m.data(), rows, d, mr.data());
+            LinearGrad::forward(mr.data(), R, d, wg.data(), ff, nullptr, g.data());
+            LinearGrad::forward(mr.data(), R, d, wu.data(), ff, nullptr, up.data());
+            SwiGluGrad::forward(g.data(), up.data(), R * ff, act.data());
+            LinearGrad::forward(act.data(), R, ff, wd.data(), d, nullptr, xe.data());
+            std::vector<float> dXe(R * d), dAct(R * ff), dG(R * ff), dU(R * ff), dMr(R * d), dMr2(R * d);
+            for (std::size_t i = 0; i < R; ++i) {
+                const float zi = a.z[rows[i] * E + u.expert];
+                float dz = 0.0F;
+                MoeCombineGrad::backward(dF.data() + rows[i] * d, &zi, xe.data() + i * d, 1, d, 1.0F, &dz,
+                                         dXe.data() + i * d);
+                dZ[rows[i] * E + u.expert] += dz;
+            }
+            LinearGrad::backward(dXe.data(), act.data(), R, ff, wd.data(), d, nullptr, dAct.data(), nullptr, nullptr);
+            SwiGluGrad::backward(dAct.data(), g.data(), up.data(), R * ff, dG.data(), dU.data());
+            LinearGrad::backward(dG.data(), mr.data(), R, d, wg.data(), ff, nullptr, dMr.data(), nullptr, nullptr);
+            LinearGrad::backward(dU.data(), mr.data(), R, d, wu.data(), ff, nullptr, dMr2.data(), nullptr, nullptr);
+            part[ui].resize(R * d);
+            for (std::size_t i = 0; i < R * d; ++i) part[ui][i] = dMr[i] + dMr2[i];
         }
-        LinearGrad::backward(dXe.data(), act.data(), R, ff, wd.data(), d, nullptr, dAct.data(), nullptr, nullptr);
-        SwiGluGrad::backward(dAct.data(), g.data(), up.data(), R * ff, dG.data(), dU.data());
-        LinearGrad::backward(dG.data(), mr.data(), R, d, wg.data(), ff, nullptr, dMr.data(), nullptr, nullptr);
-        LinearGrad::backward(dU.data(), mr.data(), R, d, wu.data(), ff, nullptr, dMr2.data(), nullptr, nullptr);
-        for (std::size_t i = 0; i < R; ++i) {
-            float* dst = dM.data() + rows[i] * d;
-            for (std::size_t j = 0; j < d; ++j) dst[j] += dMr[i * d + j] + dMr2[i * d + j];
+    });
+    for (std::size_t ui = 0; ui < used.size(); ++ui) {
+        const auto& pairs = used[ui].pairs;
+        for (std::size_t i = 0; i < pairs.size(); ++i) {
+            float*       dst = dM.data() + (pairs[i] / K) * d;
+            const float* src = part[ui].data() + i * d;
+            for (std::size_t j = 0; j < d; ++j) dst[j] += src[j];
         }
     }
     {

@@ -57,6 +57,7 @@ public:
         std::vector<float> shGate, shUp, shDown;
     };
     /// Fills routed expert `e`: gate / up [expertFf, dModel], down [dModel, expertFf].
+    /// Called from several threads at once (experts run in parallel).
     using ExpertLoader = std::function<void(std::size_t e, float* gate, float* up, float* down)>;
 
     MoeBlock(Config cfg, Weights w, ExpertLoader experts);

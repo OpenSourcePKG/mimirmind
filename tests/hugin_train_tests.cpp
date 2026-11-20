@@ -24,6 +24,7 @@
 #include "hugin/train/SwiGluGrad.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -481,7 +482,7 @@ TEST(dense_model_kl_anchor_gradients) {
 namespace {
 
 /// Tiny Kolibri-shaped block: 6 experts / top-2, shared expert, QK-norm.
-MoeBlock tinyMoeBlock(std::uint32_t& seed, bool sliding, std::size_t* loads) {
+MoeBlock tinyMoeBlock(std::uint32_t& seed, bool sliding, std::atomic<std::size_t>* loads) {
     MoeBlock::Config cfg;
     cfg.dModel = 8; cfg.heads = 4; cfg.kvHeads = 2; cfg.headDim = 4;
     cfg.experts = 6; cfg.topK = 2; cfg.expertFf = 5; cfg.sharedFf = 3;
@@ -515,7 +516,7 @@ TEST(moe_block_gradients_sliding_and_full) {
     using P = TrainBlock::Proj;
     for (const bool sliding : {true, false}) {
         std::uint32_t seed = sliding ? 700 : 800;
-        std::size_t loads = 0;
+        std::atomic<std::size_t> loads{0};
         MoeBlock blk = tinyMoeBlock(seed, sliding, &loads);
         for (const P p : {P::Q, P::K, P::V, P::O, P::Gate, P::Up, P::Down}) {
             const auto [in, out] = blk.projShape(p);

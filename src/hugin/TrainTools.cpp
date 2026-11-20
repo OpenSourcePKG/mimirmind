@@ -18,6 +18,7 @@
 #include "model/ChatTemplate.hpp"
 
 #include <algorithm>
+#include <mutex>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -110,8 +111,11 @@ public:
                std::size_t in)
         : _fw(&fw), _block(block), _name(std::move(name)), _experts(experts), _rows(rows), _in(in) {}
 
+    /// Thread-safe (MoeBlock loads experts in parallel): the device reads are
+    /// serialised, the host decode runs on the calling thread.
     void load(std::size_t ex, float* dst) const {
         if (ex >= _experts) throw std::runtime_error(_name + ": expert out of range");
+        std::unique_lock<std::mutex> device(readMutex());
         Engine& e = _fw->engine();
         const auto* t = e.weights().findBlock(_block, _name);
         if (t == nullptr || (t->usmPtr == nullptr && t->tcNibblePtr == nullptr)) {
@@ -130,6 +134,7 @@ public:
             e.ops()->readbackToHost(sfb.data(), static_cast<const std::uint8_t*>(t->tcSfbPtr) + ex * sfbBytes,
                                     sfbBytes);
             e.ops()->readbackToHost(&global, static_cast<const float*>(t->tcGlobalsPtr) + ex, sizeof(float));
+            device.unlock();
             HostDequant::nvfp4TcToF32(nib.data(), sfb.data(), global, _rows, _in, dst);
             return;
         }
@@ -137,10 +142,16 @@ public:
         const std::size_t slice = t->nbytes / _experts;
         std::vector<std::uint8_t> bytes(slice);
         e.ops()->readbackToHost(bytes.data(), static_cast<const std::uint8_t*>(t->usmPtr) + ex * slice, slice);
+        device.unlock();
         HostDequant::toF32(t->type, bytes.data(), _rows * _in, dst);
     }
 
 private:
+    static std::mutex& readMutex() {
+        static std::mutex m;
+        return m;
+    }
+
     ForwardTools* _fw;
     std::size_t   _block;
     std::string   _name;
