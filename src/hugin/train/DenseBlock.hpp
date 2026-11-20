@@ -4,10 +4,9 @@
 #pragma once
 
 #include "hugin/train/RopeGrad.hpp"
+#include "hugin/train/TrainBlock.hpp"
 
-#include <array>
 #include <cstddef>
-#include <optional>
 #include <utility>
 #include <vector>
 
@@ -25,7 +24,7 @@ namespace mimirmind::hugin::train {
  * checkpointing: only x is kept between forward and backward) and
  * accumulates the LoRA gradients; the base weights never get a gradient.
  */
-class DenseBlock {
+class DenseBlock final : public TrainBlock {
 public:
     struct Config {
         std::size_t      dModel{0}, heads{0}, kvHeads{0}, headDim{0}, ff{0};
@@ -40,35 +39,15 @@ public:
         std::vector<float> attnNorm, wq, bq, wk, bk, wv, bv, wo;
         std::vector<float> ffnNorm, wGate, wUp, wDown;
     };
-    enum class Proj { Q, K, V, O, Gate, Up, Down };
-    static constexpr std::size_t kProjCount = 7;
-    struct Lora {
-        std::size_t        rank{0};
-        float              scale{1.0F};
-        std::vector<float> a, b;     ///< [rank, in], [out, rank]
-        std::vector<float> dA, dB;   ///< accumulated gradients, same shapes
-    };
-
     DenseBlock(Config cfg, Weights w);
 
     [[nodiscard]] const Config& config() const noexcept { return _cfg; }
-    /// (in, out) feature counts of a projection.
-    [[nodiscard]] std::pair<std::size_t, std::size_t> projShape(Proj p) const;
+    [[nodiscard]] std::size_t dModel() const noexcept override { return _cfg.dModel; }
+    [[nodiscard]] std::pair<std::size_t, std::size_t> projShape(Proj p) const override;
 
-    /// Installs a LoRA on `p` (a [rank, in], b [out, rank]); gradients zeroed.
-    void setLora(Proj p, std::size_t rank, float scale, std::vector<float> a, std::vector<float> b);
-    [[nodiscard]] Lora*       lora(Proj p);
-    [[nodiscard]] const Lora* lora(Proj p) const;
-    void zeroGrad();
-    /// Removes every adapter (back to the frozen base block).
-    void clearLora();
-
-    /// x, y [T, dModel]; the block input sits at absolute position startPos.
-    void forward(const float* x, std::size_t T, float* y, std::size_t startPos = 0) const;
-
-    /// dx [T, dModel] written; LoRA dA / dB accumulated.
+    void forward(const float* x, std::size_t T, float* y, std::size_t startPos = 0) const override;
     void backward(const float* x, std::size_t T, const float* dy, float* dx,
-                  std::size_t startPos = 0);
+                  std::size_t startPos = 0) override;
 
 private:
     struct Acts {
@@ -82,9 +61,8 @@ private:
     [[nodiscard]] const std::vector<float>& weight(Proj p) const;
     [[nodiscard]] const std::vector<float>* bias(Proj p) const;
 
-    Config                                     _cfg;
-    Weights                                    _w;
-    std::array<std::optional<Lora>, kProjCount> _lora;
+    Config  _cfg;
+    Weights _w;
 };
 
 } // namespace mimirmind::hugin::train

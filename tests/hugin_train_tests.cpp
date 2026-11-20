@@ -13,18 +13,21 @@
 #include "hugin/train/AttentionGrad.hpp"
 #include "hugin/train/CrossEntropyGrad.hpp"
 #include "hugin/train/DenseBlock.hpp"
-#include "hugin/train/DenseModel.hpp"
+#include "hugin/train/TrainModel.hpp"
 #include "hugin/train/KlDivGrad.hpp"
 #include "hugin/train/Parallel.hpp"
 #include "hugin/train/LinearGrad.hpp"
+#include "hugin/train/MoeBlock.hpp"
 #include "hugin/train/MoeCombineGrad.hpp"
 #include "hugin/train/RmsNormGrad.hpp"
 #include "hugin/train/RopeGrad.hpp"
 #include "hugin/train/SwiGluGrad.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -382,14 +385,14 @@ TEST(dense_model_sft_gradients_through_ce) {
     // Tiny 3-block model, vocab 11, untied head; adapters only from block 1
     // (the backward must stop there), prompt rows ignored by the targets.
     std::uint32_t seed = 300;
-    std::vector<DenseBlock> blocks;
-    for (int i = 0; i < 3; ++i) blocks.push_back(tinyBlock(seed));
-    DenseModel::Head head;
+    std::vector<std::unique_ptr<TrainBlock>> blocks;
+    for (int i = 0; i < 3; ++i) blocks.push_back(std::make_unique<DenseBlock>(tinyBlock(seed)));
+    TrainModel::Head head;
     head.vocab = 11;
     head.embed = randn(11 * 8, seed++);
     head.finalNorm = randn(8, seed++);
     head.lmHead = randn(11 * 8, seed++, 0.5F);
-    DenseModel m(std::move(blocks), std::move(head));
+    TrainModel m(std::move(blocks), std::move(head));
     using P = DenseBlock::Proj;
     for (const std::size_t b : {std::size_t{1}, std::size_t{2}}) {
         for (const P p : {P::Q, P::V, P::Down}) {
@@ -437,13 +440,13 @@ TEST(dense_model_kl_anchor_gradients) {
     // CE on some rows + KL to an anchor taken from the model before the
     // adapters moved (rows overlapping and anchor-only); FD over the total.
     std::uint32_t seed = 500;
-    std::vector<DenseBlock> blocks;
-    for (int i = 0; i < 2; ++i) blocks.push_back(tinyBlock(seed));
-    DenseModel::Head head;
+    std::vector<std::unique_ptr<TrainBlock>> blocks;
+    for (int i = 0; i < 2; ++i) blocks.push_back(std::make_unique<DenseBlock>(tinyBlock(seed)));
+    TrainModel::Head head;
     head.vocab = 11;
     head.embed = randn(11 * 8, seed++);
     head.finalNorm = randn(8, seed++);
-    DenseModel m(std::move(blocks), std::move(head));   // tied head
+    TrainModel m(std::move(blocks), std::move(head));   // tied head
     using P = DenseBlock::Proj;
     const std::vector<std::int32_t> ids{1, 4, 7, 2, 9, 3};
     const std::vector<std::int32_t> tgt{-1, -1, -1, 9, 3, 10};
@@ -473,6 +476,115 @@ TEST(dense_model_kl_anchor_gradients) {
         checkGrad("kl model dB", lr->b, grads[gi].second, fwd, 3e-3);
         ++gi;
     }
+}
+
+namespace {
+
+/// Tiny Kolibri-shaped block: 6 experts / top-2, shared expert, QK-norm.
+MoeBlock tinyMoeBlock(std::uint32_t& seed, bool sliding, std::size_t* loads) {
+    MoeBlock::Config cfg;
+    cfg.dModel = 8; cfg.heads = 4; cfg.kvHeads = 2; cfg.headDim = 4;
+    cfg.experts = 6; cfg.topK = 2; cfg.expertFf = 5; cfg.sharedFf = 3;
+    cfg.sliding = sliding; cfg.window = sliding ? 3 : 0; cfg.ropeBase = 100.0F;
+    MoeBlock::Weights w;
+    w.attnNorm = randn(8, seed++); w.postAttnNorm = randn(8, seed++);
+    w.ffnNorm = randn(8, seed++); w.postFfnNorm = randn(8, seed++);
+    w.qNorm = randn(4, seed++); w.kNorm = randn(4, seed++);
+    w.wq = randn(16 * 8, seed++, 0.4F); w.wk = randn(8 * 8, seed++, 0.4F);
+    w.wv = randn(8 * 8, seed++, 0.4F); w.wo = randn(8 * 16, seed++, 0.3F);
+    w.router = randn(6 * 8, seed++, 1.0F);
+    // Small bias: tokens pick different experts; the forward lambda asserts
+    // that no FD probe flips the (frozen) selection.
+    w.routerBias = {0.3F, -0.3F, 0.0F, 0.6F, -0.6F, 0.15F};
+    w.shGate = randn(3 * 8, seed++, 0.4F); w.shUp = randn(3 * 8, seed++, 0.4F);
+    w.shDown = randn(8 * 3, seed++, 0.3F);
+    auto bank = std::make_shared<std::vector<float>>(randn(6 * 3 * 5 * 8, seed++, 0.4F));
+    auto loader = [bank, loads](std::size_t e, float* g, float* u, float* d) {
+        const float* src = bank->data() + e * 3 * 40;
+        std::copy(src, src + 40, g);
+        std::copy(src + 40, src + 80, u);
+        std::copy(src + 80, src + 120, d);
+        if (loads != nullptr) ++*loads;
+    };
+    return MoeBlock(cfg, w, loader);
+}
+
+} // namespace
+
+TEST(moe_block_gradients_sliding_and_full) {
+    using P = TrainBlock::Proj;
+    for (const bool sliding : {true, false}) {
+        std::uint32_t seed = sliding ? 700 : 800;
+        std::size_t loads = 0;
+        MoeBlock blk = tinyMoeBlock(seed, sliding, &loads);
+        for (const P p : {P::Q, P::K, P::V, P::O, P::Gate, P::Up, P::Down}) {
+            const auto [in, out] = blk.projShape(p);
+            auto la = randn(2 * in, seed++, 0.3F);
+            auto lb = randn(out * 2, seed++, 0.3F);
+            blk.setLora(p, 2, 0.5F, std::move(la), std::move(lb));
+        }
+        const std::size_t T = 6, start = 2;
+        auto x = randn(T * 8, seed++);
+        const auto r = randn(T * 8, seed++);
+        std::vector<float> y(T * 8), dx(T * 8);
+        loads = 0;
+        blk.forward(x.data(), T, y.data(), start);
+        const auto sel = blk.lastSelection();
+        std::size_t distinct = 0;
+        for (std::size_t e = 0; e < 6; ++e) {
+            distinct += std::find(sel.begin(), sel.end(), static_cast<std::int32_t>(e)) != sel.end() ? 1U : 0U;
+        }
+        EXPECT_TRUE(loads == distinct);   // one load per used expert, never the whole bank
+        std::printf("    %s: %zu experts used\n", sliding ? "sliding" : "full/NoPE", distinct);
+        EXPECT_TRUE(distinct >= 2);
+        blk.zeroGrad();
+        blk.backward(x.data(), T, r.data(), dx.data(), start);
+        std::vector<std::pair<std::vector<float>, std::vector<float>>> grads;
+        for (const P p : {P::Q, P::K, P::V, P::O, P::Gate, P::Up, P::Down}) {
+            grads.emplace_back(blk.lora(p)->dA, blk.lora(p)->dB);
+        }
+        auto fwd = [&] {
+            std::vector<float> yy(T * 8);
+            blk.forward(x.data(), T, yy.data(), start);
+            EXPECT_TRUE(blk.lastSelection() == sel);
+            return dotLoss(yy, r);
+        };
+        checkGrad("moe dx", x, dx, fwd, 3e-3);
+        std::size_t gi = 0;
+        for (const P p : {P::Q, P::K, P::V, P::O, P::Gate, P::Up, P::Down}) {
+            checkGrad("moe dA", blk.lora(p)->a, grads[gi].first, fwd, 3e-3);
+            checkGrad("moe dB", blk.lora(p)->b, grads[gi].second, fwd, 3e-3);
+            ++gi;
+        }
+    }
+}
+
+TEST(train_model_mixes_moe_blocks) {
+    // A dense block under a MoE block in one TrainModel: CE gradient FD-checked.
+    std::uint32_t seed = 900;
+    std::vector<std::unique_ptr<TrainBlock>> blocks;
+    blocks.push_back(std::make_unique<DenseBlock>(tinyBlock(seed)));
+    blocks.push_back(std::make_unique<MoeBlock>(tinyMoeBlock(seed, true, nullptr)));
+    TrainModel::Head head;
+    head.vocab = 11;
+    head.embed = randn(11 * 8, seed++);
+    head.finalNorm = randn(8, seed++);
+    TrainModel m(std::move(blocks), std::move(head));
+    using P = TrainBlock::Proj;
+    for (const P p : {P::Q, P::Down}) {
+        const auto [in, out] = m.block(1).projShape(p);
+        auto la = randn(2 * in, seed++, 0.3F);
+        auto lb = randn(out * 2, seed++, 0.3F);
+        m.block(1).setLora(p, 2, 0.5F, std::move(la), std::move(lb));
+    }
+    const std::vector<std::int32_t> ids{1, 4, 7, 2, 9};
+    const std::vector<std::int32_t> tgt{-1, 2, 9, 3, 10};
+    m.zeroGrad();
+    (void)m.lossAndGrad(ids, tgt);
+    const auto gA = m.block(1).lora(P::Q)->dA, gB = m.block(1).lora(P::Down)->dB;
+    auto fwd = [&] { return m.lossAndGrad(ids, tgt); };
+    checkGrad("mixed dA(q)", m.block(1).lora(P::Q)->a, gA, fwd, 3e-3);
+    checkGrad("mixed dB(shared down)", m.block(1).lora(P::Down)->b, gB, fwd, 3e-3);
 }
 
 TEST(parallel_linear_matches_serial) {

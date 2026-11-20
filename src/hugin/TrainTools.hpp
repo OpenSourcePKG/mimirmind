@@ -13,7 +13,7 @@ namespace mimirmind::hugin {
 class ForwardTools;
 class RuneStaging;
 namespace train {
-class DenseModel;
+class TrainModel;
 }
 
 /**
@@ -40,11 +40,11 @@ public:
 
 private:
     /// The whole model as train ops (dequantised once, cached per target).
-    train::DenseModel& model();
+    train::TrainModel& model();
 
     ForwardTools&                      _forward;
     RuneStaging&                       _staging;
-    std::unique_ptr<train::DenseModel> _model;
+    std::unique_ptr<train::TrainModel> _model;
     std::string                        _modelKey;
 };
 

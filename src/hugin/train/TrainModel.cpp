@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Stefan Werfling
 
-#include "hugin/train/DenseModel.hpp"
+#include "hugin/train/TrainModel.hpp"
 
 #include "hugin/train/CrossEntropyGrad.hpp"
 #include "hugin/train/KlDivGrad.hpp"
@@ -14,36 +14,39 @@
 
 namespace mimirmind::hugin::train {
 
-DenseModel::DenseModel(std::vector<DenseBlock> blocks, Head head)
+TrainModel::TrainModel(std::vector<std::unique_ptr<TrainBlock>> blocks, Head head)
     : _blocks(std::move(blocks)), _head(std::move(head)) {
-    if (_blocks.empty()) throw std::runtime_error("DenseModel: no blocks");
-    _d = _blocks.front().config().dModel;
-    if (_head.vocab == 0 || _head.embed.size() != _head.vocab * _d) {
-        throw std::runtime_error("DenseModel: embedding must be [vocab, dModel]");
+    if (_blocks.empty()) throw std::runtime_error("TrainModel: no blocks");
+    for (const auto& b : _blocks) {
+        if (!b) throw std::runtime_error("TrainModel: null block");
     }
-    if (_head.finalNorm.size() != _d) throw std::runtime_error("DenseModel: final norm must be [dModel]");
+    _d = _blocks.front()->dModel();
+    if (_head.vocab == 0 || _head.embed.size() != _head.vocab * _d) {
+        throw std::runtime_error("TrainModel: embedding must be [vocab, dModel]");
+    }
+    if (_head.finalNorm.size() != _d) throw std::runtime_error("TrainModel: final norm must be [dModel]");
     if (!_head.lmHead.empty() && _head.lmHead.size() != _head.vocab * _d) {
-        throw std::runtime_error("DenseModel: lm_head must be [vocab, dModel]");
+        throw std::runtime_error("TrainModel: lm_head must be [vocab, dModel]");
     }
 }
 
-void DenseModel::embed(std::span<const std::int32_t> ids, float* x) const {
+void TrainModel::embed(std::span<const std::int32_t> ids, float* x) const {
     for (std::size_t t = 0; t < ids.size(); ++t) {
         if (ids[t] < 0 || static_cast<std::size_t>(ids[t]) >= _head.vocab) {
-            throw std::runtime_error("DenseModel: token id " + std::to_string(ids[t]) + " out of range");
+            throw std::runtime_error("TrainModel: token id " + std::to_string(ids[t]) + " out of range");
         }
         const float* row = _head.embed.data() + static_cast<std::size_t>(ids[t]) * _d;
         std::copy(row, row + _d, x + t * _d);
     }
 }
 
-std::vector<float> DenseModel::logits(std::span<const std::int32_t> ids,
+std::vector<float> TrainModel::logits(std::span<const std::int32_t> ids,
                                       std::span<const std::size_t> rows) const {
     const std::size_t T = ids.size();
     std::vector<float> x(T * _d), y(T * _d);
     embed(ids, x.data());
     for (const auto& b : _blocks) {
-        b.forward(x.data(), T, y.data());
+        b->forward(x.data(), T, y.data());
         x.swap(y);
     }
     std::vector<std::size_t> sel(rows.begin(), rows.end());
@@ -60,13 +63,13 @@ std::vector<float> DenseModel::logits(std::span<const std::int32_t> ids,
     return out;
 }
 
-double DenseModel::lossAndGrad(std::span<const std::int32_t> ids, std::span<const std::int32_t> targets) {
+double TrainModel::lossAndGrad(std::span<const std::int32_t> ids, std::span<const std::int32_t> targets) {
     return lossAndGrad(ids, targets, nullptr, 0.0).ce;
 }
 
-DenseModel::Anchor DenseModel::anchor(std::span<const std::int32_t> ids, std::span<const std::size_t> rows,
+TrainModel::Anchor TrainModel::anchor(std::span<const std::int32_t> ids, std::span<const std::size_t> rows,
                                       std::size_t k) const {
-    if (rows.empty()) throw std::runtime_error("DenseModel: anchor needs rows");
+    if (rows.empty()) throw std::runtime_error("TrainModel: anchor needs rows");
     Anchor a;
     a.rows.assign(rows.begin(), rows.end());
     a.k = k;
@@ -81,10 +84,10 @@ DenseModel::Anchor DenseModel::anchor(std::span<const std::int32_t> ids, std::sp
     return a;
 }
 
-DenseModel::Loss DenseModel::lossAndGrad(std::span<const std::int32_t> ids, std::span<const std::int32_t> targets,
+TrainModel::Loss TrainModel::lossAndGrad(std::span<const std::int32_t> ids, std::span<const std::int32_t> targets,
                                          const Anchor* anchor, double klWeight) {
     const std::size_t T = ids.size();
-    if (targets.size() != T) throw std::runtime_error("DenseModel: targets must match ids");
+    if (targets.size() != T) throw std::runtime_error("TrainModel: targets must match ids");
     // Union of CE rows and anchor rows; tgt = -1 on anchor-only rows.
     std::vector<std::int32_t> rowTarget(T, -1);
     std::vector<char> used(T, 0);
@@ -100,10 +103,10 @@ DenseModel::Loss DenseModel::lossAndGrad(std::span<const std::int32_t> ids, std:
     if (withKl) {
         if (anchor->ids.size() != anchor->rows.size() * anchor->k || anchor->p.size() != anchor->ids.size() ||
             anchor->tail.size() != anchor->rows.size()) {
-            throw std::runtime_error("DenseModel: malformed anchor");
+            throw std::runtime_error("TrainModel: malformed anchor");
         }
         for (const auto r : anchor->rows) {
-            if (r >= T) throw std::runtime_error("DenseModel: anchor row out of range");
+            if (r >= T) throw std::runtime_error("TrainModel: anchor row out of range");
             used[r] = 1;
         }
         out.klRows = anchor->rows.size();
@@ -122,13 +125,10 @@ DenseModel::Loss DenseModel::lossAndGrad(std::span<const std::int32_t> ids, std:
 
     // Lowest block with an adapter: backward stops there.
     std::size_t lowest = _blocks.size();
-    for (std::size_t b = 0; b < _blocks.size() && lowest == _blocks.size(); ++b) {
-        for (const auto p : {DenseBlock::Proj::Q, DenseBlock::Proj::K, DenseBlock::Proj::V, DenseBlock::Proj::O,
-                             DenseBlock::Proj::Gate, DenseBlock::Proj::Up, DenseBlock::Proj::Down}) {
-            if (_blocks[b].lora(p) != nullptr) {
-                lowest = b;
-                break;
-            }
+    for (std::size_t b = 0; b < _blocks.size(); ++b) {
+        if (_blocks[b]->hasLora()) {
+            lowest = b;
+            break;
         }
     }
 
@@ -138,7 +138,7 @@ DenseModel::Loss DenseModel::lossAndGrad(std::span<const std::int32_t> ids, std:
     embed(ids, x.data());
     for (std::size_t b = 0; b < _blocks.size(); ++b) {
         if (b >= lowest) inputs[b] = x;
-        _blocks[b].forward(x.data(), T, y.data());
+        _blocks[b]->forward(x.data(), T, y.data());
         x.swap(y);
     }
 
@@ -174,14 +174,14 @@ DenseModel::Loss DenseModel::lossAndGrad(std::span<const std::int32_t> ids, std:
                   dx.begin() + static_cast<std::ptrdiff_t>(rows[i] * _d));
     }
     for (std::size_t b = _blocks.size(); b-- > lowest;) {
-        _blocks[b].backward(inputs[b].data(), T, dx.data(), dPrev.data());
+        _blocks[b]->backward(inputs[b].data(), T, dx.data(), dPrev.data());
         dx.swap(dPrev);
     }
     return out;
 }
 
-void DenseModel::zeroGrad() {
-    for (auto& b : _blocks) b.zeroGrad();
+void TrainModel::zeroGrad() {
+    for (auto& b : _blocks) b->zeroGrad();
 }
 
 } // namespace mimirmind::hugin::train

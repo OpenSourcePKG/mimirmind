@@ -11,7 +11,7 @@
 #include "hugin/RuneStaging.hpp"
 #include "hugin/train/AdamW.hpp"
 #include "hugin/train/DenseBlock.hpp"
-#include "hugin/train/DenseModel.hpp"
+#include "hugin/train/TrainModel.hpp"
 #include "hugin/train/Parallel.hpp"
 #include "model/ChatTemplate.hpp"
 
@@ -23,6 +23,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -179,20 +180,22 @@ TrainTools::TrainTools(ForwardTools& forward, RuneStaging& staging)
 
 TrainTools::~TrainTools() = default;
 
-train::DenseModel& TrainTools::model() {
+train::TrainModel& TrainTools::model() {
     const auto t = _forward.target();
     if (_model && _modelKey == t.path) return *_model;
     _model.reset();
     Engine& e = _forward.engine();
-    std::vector<DenseBlock> blocks;
-    for (std::size_t L = 0; L < e.config().blockCount; ++L) blocks.push_back(loadDenseBlock(e, L));
-    train::DenseModel::Head head;
+    std::vector<std::unique_ptr<train::TrainBlock>> blocks;
+    for (std::size_t L = 0; L < e.config().blockCount; ++L) {
+        blocks.push_back(std::make_unique<DenseBlock>(loadDenseBlock(e, L)));
+    }
+    train::TrainModel::Head head;
     head.embed     = globalTensor(e, "token_embd.weight", true);
     head.finalNorm = globalTensor(e, "output_norm.weight", true);
     head.lmHead    = globalTensor(e, "output.weight", false);   // empty = tied
     head.eps       = e.config().rmsNormEps;
     head.vocab     = head.embed.size() / e.config().embeddingLength;
-    _model    = std::make_unique<train::DenseModel>(std::move(blocks), std::move(head));
+    _model    = std::make_unique<train::TrainModel>(std::move(blocks), std::move(head));
     _modelKey = t.path;
     return *_model;
 }
@@ -459,7 +462,7 @@ void TrainTools::registerOn(McpServer& server) {
             }
 
             // 2. Model + fresh adapters.
-            train::DenseModel& m = model();
+            train::TrainModel& m = model();
             for (std::size_t b = 0; b < m.blockCount(); ++b) m.block(b).clearLora();
 
             // 7.4.5 KL anchor: the base distribution (no adapters yet) on the
@@ -487,7 +490,7 @@ void TrainTools::registerOn(McpServer& server) {
                 distillKinds.clear();
                 for (const auto& k : a["distill_kinds"]) distillKinds.push_back(k.get<std::string>());
             }
-            std::vector<std::optional<train::DenseModel::Anchor>> anchors(data.size());
+            std::vector<std::optional<train::TrainModel::Anchor>> anchors(data.size());
             std::vector<double> anchorWeight(data.size(), 0.0);
             std::vector<char>   anchorCe(data.size(), 0);
             std::vector<char>   isDistill(data.size(), 0);

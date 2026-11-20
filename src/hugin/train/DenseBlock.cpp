@@ -4,7 +4,6 @@
 #include "hugin/train/DenseBlock.hpp"
 
 #include "hugin/train/AttentionGrad.hpp"
-#include "hugin/train/LinearGrad.hpp"
 #include "hugin/train/RmsNormGrad.hpp"
 #include "hugin/train/SwiGluGrad.hpp"
 
@@ -15,8 +14,6 @@
 namespace mimirmind::hugin::train {
 
 namespace {
-
-std::size_t idx(DenseBlock::Proj p) { return static_cast<std::size_t>(p); }
 
 void requireSize(const std::vector<float>& v, std::size_t n, const char* what) {
     if (v.size() != n) {
@@ -85,72 +82,14 @@ const std::vector<float>* DenseBlock::bias(Proj p) const {
     return (b != nullptr && !b->empty()) ? b : nullptr;
 }
 
-void DenseBlock::setLora(Proj p, std::size_t rank, float scale, std::vector<float> a,
-                         std::vector<float> b) {
-    const auto [in, out] = projShape(p);
-    if (rank == 0) throw std::runtime_error("DenseBlock: LoRA rank must be > 0");
-    requireSize(a, rank * in, "lora A");
-    requireSize(b, out * rank, "lora B");
-    Lora l;
-    l.rank  = rank;
-    l.scale = scale;
-    l.a     = std::move(a);
-    l.b     = std::move(b);
-    l.dA.assign(l.a.size(), 0.0F);
-    l.dB.assign(l.b.size(), 0.0F);
-    _lora[idx(p)] = std::move(l);
-}
-
-DenseBlock::Lora* DenseBlock::lora(Proj p) {
-    return _lora[idx(p)] ? &*_lora[idx(p)] : nullptr;
-}
-
-const DenseBlock::Lora* DenseBlock::lora(Proj p) const {
-    return _lora[idx(p)] ? &*_lora[idx(p)] : nullptr;
-}
-
-void DenseBlock::zeroGrad() {
-    for (auto& l : _lora) {
-        if (!l) continue;
-        std::fill(l->dA.begin(), l->dA.end(), 0.0F);
-        std::fill(l->dB.begin(), l->dB.end(), 0.0F);
-    }
-}
-
-void DenseBlock::clearLora() {
-    for (auto& l : _lora) l.reset();
-}
-
 void DenseBlock::linear(Proj p, const float* in, std::size_t T, float* out) const {
-    const auto [K, N] = projShape(p);
-    const Lora* l = lora(p);
-    LoraParams lp;
-    if (l != nullptr) lp = LoraParams{l->a.data(), l->b.data(), l->rank, l->scale};
-    LinearGrad::forward(in, T, K, weight(p).data(), N, l != nullptr ? &lp : nullptr, out);
-    if (const auto* b = bias(p)) {
-        for (std::size_t t = 0; t < T; ++t) {
-            for (std::size_t n = 0; n < N; ++n) out[t * N + n] += (*b)[n];
-        }
-    }
+    const auto* b = bias(p);
+    loraLinear(p, weight(p).data(), b != nullptr ? b->data() : nullptr, in, T, out);
 }
 
 void DenseBlock::linearBack(Proj p, const float* dOut, const float* in, std::size_t T, float* dIn,
                             bool accumulate) {
-    const auto [K, N] = projShape(p);
-    Lora* l = lora(p);
-    LoraParams lp;
-    if (l != nullptr) lp = LoraParams{l->a.data(), l->b.data(), l->rank, l->scale};
-    std::vector<float> tmp;
-    float* dst = dIn;
-    if (accumulate) {
-        tmp.resize(T * K);
-        dst = tmp.data();
-    }
-    LinearGrad::backward(dOut, in, T, K, weight(p).data(), N, l != nullptr ? &lp : nullptr, dst,
-                         l != nullptr ? l->dA.data() : nullptr, l != nullptr ? l->dB.data() : nullptr);
-    if (accumulate) {
-        for (std::size_t i = 0; i < T * K; ++i) dIn[i] += tmp[i];
-    }
+    loraLinearBack(p, weight(p).data(), dOut, in, T, dIn, accumulate);
 }
 
 void DenseBlock::run(const float* x, std::size_t T, std::size_t startPos, Acts& a) const {

@@ -3,19 +3,21 @@
 
 #pragma once
 
-#include "hugin/train/DenseBlock.hpp"
+#include "hugin/train/TrainBlock.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
 namespace mimirmind::hugin::train {
 
 /**
- * Whole dense decoder (llama / qwen2) for adapter training (roadmap 7.4.3):
- * token embedding -> DenseBlocks -> final RMSNorm -> lm_head, all frozen; only
- * the blocks' LoRA adapters learn.
+ * Whole decoder for adapter training (roadmap 7.4.3; MoE blocks 7.4.4):
+ * token embedding -> TrainBlocks (DenseBlock for llama / qwen2, MoeBlock for
+ * Kolibri-1) -> final RMSNorm -> lm_head, all frozen; only the blocks' LoRA
+ * adapters learn.
  *
  * lossAndGrad() runs the forward once keeping only each block's input
  * (checkpointing), computes the lm_head and cross-entropy ONLY on rows with a
@@ -24,7 +26,7 @@ namespace mimirmind::hugin::train {
  * (nothing below it can receive a gradient). Gradients accumulate in the
  * adapters until the caller steps the optimizer and zeroes them.
  */
-class DenseModel {
+class TrainModel {
 public:
     struct Head {
         std::size_t        vocab{0};
@@ -34,11 +36,11 @@ public:
         float              eps{1e-5F};
     };
 
-    DenseModel(std::vector<DenseBlock> blocks, Head head);
+    TrainModel(std::vector<std::unique_ptr<TrainBlock>> blocks, Head head);
 
     [[nodiscard]] std::size_t       blockCount() const noexcept { return _blocks.size(); }
-    [[nodiscard]] DenseBlock&       block(std::size_t i) { return _blocks.at(i); }
-    [[nodiscard]] const DenseBlock& block(std::size_t i) const { return _blocks.at(i); }
+    [[nodiscard]] TrainBlock&       block(std::size_t i) { return *_blocks.at(i); }
+    [[nodiscard]] const TrainBlock& block(std::size_t i) const { return *_blocks.at(i); }
     [[nodiscard]] std::size_t       dModel() const noexcept { return _d; }
     [[nodiscard]] std::size_t       vocab() const noexcept { return _head.vocab; }
 
@@ -84,7 +86,7 @@ private:
         return _head.lmHead.empty() ? _head.embed : _head.lmHead;
     }
 
-    std::vector<DenseBlock> _blocks;
+    std::vector<std::unique_ptr<TrainBlock>> _blocks;
     Head                    _head;
     std::size_t             _d{0};
 };
