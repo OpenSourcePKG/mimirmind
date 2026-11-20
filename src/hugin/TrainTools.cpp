@@ -169,6 +169,7 @@ struct SftExample {
     bool                      truncated{false};
     std::string               response;
     std::string               kind;
+    std::vector<std::int32_t> teacherPrompt;   ///< 7.4.5 distill: the teacher's prompt tokens
 };
 
 } // namespace
@@ -343,6 +344,10 @@ void TrainTools::registerOn(McpServer& server) {
         "response rows of every item whose kind is in 'kl_kinds' (default: every kind except "
         "'target'); the base distribution is cached before training as its top 'kl_topk' (64) tokens "
         "plus one tail bucket. Those items then train on the KL only, plus their CE with 'kl_ce'. "
+        "Context distillation: 'distill_lambda' > 0 makes items of 'distill_kinds' (default 'target') "
+        "whose teacher_prompt differs from their prompt also learn the base's full top-K distribution "
+        "under the teacher prompt on the same response tokens (KL(teacher || student)), next to "
+        "their CE unless 'distill_ce' is false; teacher_prompt is kept when a response is given. "
         "The result is staged as a LowRank Rune 'name' (then rune_gate / rune_commit "
         "as usual), and the trainer's logits are compared with the engine running that Rune "
         "(Futhark load path) on the first example.",
@@ -366,6 +371,9 @@ void TrainTools::registerOn(McpServer& server) {
                 {"kl_topk", {{"type", "integer"}}},
                 {"kl_kinds", {{"type", "array"}, {"items", {{"type", "string"}}}}},
                 {"kl_ce", {{"type", "boolean"}}},
+                {"distill_lambda", {{"type", "number"}}},
+                {"distill_kinds", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                {"distill_ce", {{"type", "boolean"}}},
                 {"note", {{"type", "string"}}}},
                {"name"}),
         [this](const json& a) {
@@ -392,6 +400,9 @@ void TrainTools::registerOn(McpServer& server) {
                 SftExample ex;
                 ex.kind = it.value("kind", std::string{});
                 const auto prompt = encodeText(e, it.at("prompt").get<std::string>(), addBos);
+                if (it.contains("teacher_prompt")) {
+                    ex.teacherPrompt = encodeText(e, it["teacher_prompt"].get<std::string>(), addBos);
+                }
                 std::vector<std::int32_t> resp;
                 if (it.contains("response")) {
                     resp = encodeText(e, it["response"].get<std::string>(), false);
@@ -465,16 +476,67 @@ void TrainTools::registerOn(McpServer& server) {
                 if (klKinds.empty()) return ex.kind != "target";
                 return std::find(klKinds.begin(), klKinds.end(), ex.kind) != klKinds.end();
             };
+            // Context distillation: items with a teacher_prompt other than their
+            // prompt (kinds in 'distill_kinds', default 'target') learn the base's
+            // full distribution under the teacher prompt on the same response
+            // tokens, weighted 'distill_lambda'; their CE stays unless distill_ce = false.
+            const double distillLambda = a.value("distill_lambda", 0.0);
+            const bool   distillCe     = a.value("distill_ce", true);
+            std::vector<std::string> distillKinds{"target"};
+            if (a.contains("distill_kinds")) {
+                distillKinds.clear();
+                for (const auto& k : a["distill_kinds"]) distillKinds.push_back(k.get<std::string>());
+            }
             std::vector<std::optional<train::DenseModel::Anchor>> anchors(data.size());
+            std::vector<double> anchorWeight(data.size(), 0.0);
+            std::vector<char>   anchorCe(data.size(), 0);
+            std::vector<char>   isDistill(data.size(), 0);
+            std::size_t distillItems = 0, distillRows = 0;
+            double distillTail = 0;
+            for (std::size_t i = 0; i < data.size(); ++i) {
+                const SftExample& ex = data[i];
+                if (distillLambda <= 0.0 || ex.teacherPrompt.empty() ||
+                    std::find(distillKinds.begin(), distillKinds.end(), ex.kind) == distillKinds.end()) {
+                    continue;
+                }
+                const std::vector<std::int32_t> prompt(ex.ids.begin(),
+                                                       ex.ids.begin() + static_cast<std::ptrdiff_t>(ex.promptTokens));
+                if (prompt == ex.teacherPrompt) continue;   // self-teacher: nothing to distil
+                // Teacher sequence = teacher prompt + the same response; row j of
+                // the response there maps to row promptTokens - 1 + j here.
+                std::vector<std::int32_t> tseq = ex.teacherPrompt;
+                tseq.insert(tseq.end(), ex.ids.begin() + static_cast<std::ptrdiff_t>(ex.promptTokens), ex.ids.end());
+                std::vector<std::size_t> trows, srows;
+                for (std::size_t j = 0; j < ex.responseTokens; ++j) {
+                    trows.push_back(ex.teacherPrompt.size() - 1 + j);
+                    srows.push_back(ex.promptTokens - 1 + j);
+                }
+                auto anc = m.anchor(tseq, trows, klTopK);
+                anc.rows = std::move(srows);
+                for (const float tl : anc.tail) distillTail += static_cast<double>(tl);
+                anchors[i]      = std::move(anc);
+                anchorWeight[i] = distillLambda;
+                anchorCe[i]     = distillCe ? 1 : 0;
+                isDistill[i]    = 1;
+                ++distillItems;
+                distillRows += ex.responseTokens;
+            }
+            if (distillLambda > 0.0) {
+                if (distillItems == 0) throw std::runtime_error("distill_lambda > 0 but no item has a distinct teacher_prompt");
+                std::cerr << "hugin train_lora_sft: distillation on " << distillItems << " items / " << distillRows
+                          << " rows, mean tail mass " << distillTail / static_cast<double>(distillRows) << "\n";
+            }
             std::size_t anchorItems = 0, anchorRows = 0;
             double anchorTail = 0;
             for (std::size_t i = 0; i < data.size(); ++i) {
-                if (!anchored(data[i])) continue;
+                if (anchors[i] || !anchored(data[i])) continue;
                 std::vector<std::size_t> rows;
                 for (std::size_t t = 0; t < data[i].targets.size(); ++t) {
                     if (data[i].targets[t] >= 0) rows.push_back(t);
                 }
-                anchors[i] = m.anchor(data[i].ids, rows, klTopK);
+                anchors[i]      = m.anchor(data[i].ids, rows, klTopK);
+                anchorWeight[i] = klLambda;
+                anchorCe[i]     = klCe ? 1 : 0;
                 ++anchorItems;
                 anchorRows += rows.size();
                 for (const float tl : anchors[i]->tail) anchorTail += static_cast<double>(tl);
@@ -499,8 +561,7 @@ void TrainTools::registerOn(McpServer& server) {
                     blocks.push_back(v);
                 }
             } else {
-                blocks.resize(m.blockCount());
-                std::iota(blocks.begin(), blocks.end(), std::size_t{0});
+                for (std::size_t b = 0; b < m.blockCount(); ++b) blocks.push_back(b);
             }
             const auto  rank  = a.value("rank", std::size_t{8});
             const float alpha = a.value("alpha", 16.0F);
@@ -533,13 +594,13 @@ void TrainTools::registerOn(McpServer& server) {
             std::vector<std::size_t> order(data.size());
             std::iota(order.begin(), order.end(), std::size_t{0});
             json epochLoss = json::array(), stepLoss = json::array(), epochCe = json::array(),
-                 epochKl = json::array();
+                 epochKl = json::array(), epochDistill = json::array();
             std::size_t steps = 0;
             m.zeroGrad();
             for (std::size_t ep = 0; ep < epochs; ++ep) {
                 std::shuffle(order.begin(), order.end(), rng);
-                double sum = 0, ceSum = 0, klSum = 0;
-                std::size_t ceN = 0, klN = 0;
+                double sum = 0, ceSum = 0, klSum = 0, distSum = 0;
+                std::size_t ceN = 0, klN = 0, distN = 0;
                 double batchSum = 0;
                 std::size_t inBatch = 0;
                 for (std::size_t i = 0; i < order.size(); ++i) {
@@ -548,11 +609,18 @@ void TrainTools::registerOn(McpServer& server) {
                     if (const auto& anc = anchors[order[i]]; anc) {
                         // Anchor items: KL to the base (+ CE only with kl_ce).
                         const std::vector<std::int32_t> none(ex.targets.size(), -1);
-                        const auto r = m.lossAndGrad(ex.ids, klCe ? ex.targets : none, &*anc, klLambda);
-                        l = r.total(klLambda);
-                        klSum += r.kl;
-                        ++klN;
-                        if (klCe) {
+                        const double w  = anchorWeight[order[i]];
+                        const bool   ce = anchorCe[order[i]] != 0;
+                        const auto r = m.lossAndGrad(ex.ids, ce ? ex.targets : none, &*anc, w);
+                        l = r.total(w);
+                        if (isDistill[order[i]] != 0) {
+                            distSum += r.kl;
+                            ++distN;
+                        } else {
+                            klSum += r.kl;
+                            ++klN;
+                        }
+                        if (ce) {
                             ceSum += r.ce;
                             ++ceN;
                         }
@@ -599,6 +667,7 @@ void TrainTools::registerOn(McpServer& server) {
                 epochLoss.push_back(sum / static_cast<double>(order.size()));
                 epochCe.push_back(ceN > 0 ? ceSum / static_cast<double>(ceN) : 0.0);
                 epochKl.push_back(klN > 0 ? klSum / static_cast<double>(klN) : 0.0);
+                epochDistill.push_back(distN > 0 ? distSum / static_cast<double>(distN) : 0.0);
             }
 
             // 4. Stage as a LowRank rune.
@@ -619,6 +688,10 @@ void TrainTools::registerOn(McpServer& server) {
                         {"batch", batch}, {"clip", clip}, {"seed", a.value("seed", 7403U)},
                         {"epoch_loss", epochLoss}, {"epoch_ce", epochCe}, {"steps", steps},
                         {"note", a.value("note", std::string{})}};
+            if (distillLambda > 0.0) {
+                params["distill"] = {{"lambda", distillLambda}, {"ce", distillCe}, {"items", distillItems},
+                                     {"rows", distillRows}, {"epoch_kl", epochDistill}};
+            }
             if (klLambda > 0.0) {
                 params["kl"] = {{"lambda", klLambda}, {"topk", klTopK}, {"ce_on_anchors", klCe},
                                 {"anchor_items", anchorItems}, {"anchor_rows", anchorRows},
@@ -663,7 +736,15 @@ void TrainTools::registerOn(McpServer& server) {
                           {"mean_tail_mass", anchorTail / static_cast<double>(anchorRows)},
                           {"epoch_kl", epochKl}};
             }
+            json distillInfo;
+            if (distillLambda > 0.0) {
+                distillInfo = {{"lambda", distillLambda}, {"ce", distillCe}, {"items", distillItems},
+                               {"rows", distillRows},
+                               {"mean_tail_mass", distillTail / static_cast<double>(distillRows)},
+                               {"epoch_kl", epochDistill}};
+            }
             return json{{"staged", staged}, {"epoch_loss", epochLoss}, {"epoch_ce", epochCe}, {"kl", klInfo},
+                        {"distill", distillInfo},
                         {"first_step_loss", stepLoss.empty() ? json() : stepLoss.front()["loss"]},
                         {"last_step_loss", stepLoss.empty() ? json() : stepLoss.back()["loss"]},
                         {"steps", steps}, {"adapters", slots.size()},
